@@ -16,9 +16,16 @@
 //! consumed limb is re-expanded through bool-checked unpack columns, so all
 //! constraints stay degree <= 3. The pipeline is UNIFORM: the same
 //! constraints hold on every row; schedule variation enters only through
-//! 27 periodic columns (period 128 — free for the verifier) and one
-//! preprocessed column (the iota round constant, period 24 rounds — not a
-//! power of two, hence not expressible as a periodic column).
+//! 35 periodic columns (period 128 — free for the verifier: the schedule
+//! flags, plus a block-boundary flag and 7 iota-position selectors).
+//!
+//! Iota round constants (M1.5c): RC[r] is nonzero only at the seven
+//! z-positions 2^k - 1, so each round's constant is a 7-bit pack. A ring
+//! of 24 in-trace registers R[0..24] rotates one step per 128-row block
+//! (gated by the periodic block-boundary flag), R[0]'s bits are exposed
+//! through 7 bool-checked columns, and the first row pins the ring to the
+//! RC table — sound with no preprocessed commitment, replacing M1.5b's
+//! 1-column preprocessed trace whose per-query openings cost ~740 B/query.
 //!
 //! Chaining: permutation p occupies blocks 24p..24p+24; the state
 //! materialized at block q is the round-q input, so state(q+1) =
@@ -50,7 +57,9 @@ const UV_OFF: usize = V_OFF + V_SLOTS; // 271: 25: unpack of V slot 1
 const U_OFF: usize = UV_OFF + 25; // 296: 65 slots (d = 1..=65)
 const U_SLOTS: usize = 65;
 const UU_OFF: usize = U_OFF + U_SLOTS; // 361: 10: unpack of U slot 1
-pub const NARROW_WIDTH: usize = UU_OFF + 10; // 371
+const R_OFF: usize = UU_OFF + 10; // 371: 24 rotating iota-RC registers
+const B_OFF: usize = R_OFF + 24; // 395: 7: bit-decomposition of R[0]
+pub const NARROW_WIDTH: usize = B_OFF + 7; // 402
 
 /// Rows per 24-round permutation: 24 rounds x 128 rows.
 pub const ROWS_PER_PERM: usize = 24 * 128;
@@ -95,8 +104,9 @@ pub struct NarrowKeccakAir {
 }
 
 impl NarrowKeccakAir {
-    /// Round-constant bit for the preprocessed column at row `t`:
-    /// block q materializes iota output of global round q-1.
+    /// Round-constant bit consumed at row `t` (block q materializes the
+    /// iota output of global round q-1). Trace-generation reference; the
+    /// AIR reconstructs the same value from the RC ring + selectors.
     fn rc_bit(t: usize) -> bool {
         let z = t % 64;
         let mrow = (t / 64) % 2 == 0;
@@ -106,6 +116,14 @@ impl NarrowKeccakAir {
         let q = t / 128;
         (RC[(q + 23) % 24] >> z) & 1 == 1
     }
+
+    /// 7-bit pack of RC[j]: bit k = RC[j] at z-position 2^k - 1. (Those are
+    /// the only nonzero positions of every Keccak round constant.)
+    fn rc_pack(j: usize) -> u32 {
+        (0..7)
+            .map(|k| (((RC[j] >> ((1u32 << k) - 1)) & 1) as u32) << k)
+            .sum()
+    }
 }
 
 impl<F: Field> BaseAir<F> for NarrowKeccakAir {
@@ -113,26 +131,16 @@ impl<F: Field> BaseAir<F> for NarrowKeccakAir {
         NARROW_WIDTH
     }
 
-    fn preprocessed_width(&self) -> usize {
-        1
-    }
-
-    fn preprocessed_trace(&self) -> Option<RowMajorMatrix<F>> {
-        let height = 1usize << self.log_height;
-        let values = (0..height)
-            .map(|t| F::from_bool(Self::rc_bit(t)))
-            .collect();
-        Some(RowMajorMatrix::new(values, 1))
-    }
-
     fn num_periodic_columns(&self) -> usize {
-        27
+        35
     }
 
-    /// 27 period-128 columns: [mrow, u63, e1_0..e1_24] where
-    /// e1_l = trow AND rho-wrap for lane l at this T row's slice.
+    /// 35 period-128 columns: [mrow, u63, e1_0..e1_24, blast, sel_0..sel_6]
+    /// where e1_l = trow AND rho-wrap for lane l at this T row's slice,
+    /// blast = 1 on the last row of each 128-row block (RC ring rotation),
+    /// sel_k = 1 on the M row with z = 2^k - 1 (iota bit positions).
     fn periodic_columns(&self) -> Vec<Vec<F>> {
-        let mut cols = vec![Vec::with_capacity(128); 27];
+        let mut cols = vec![Vec::with_capacity(128); 35];
         for t in 0..128usize {
             let mrow = t < 64;
             cols[0].push(F::from_bool(mrow));
@@ -140,6 +148,10 @@ impl<F: Field> BaseAir<F> for NarrowKeccakAir {
             for l in 0..25 {
                 let wrap = !mrow && (t - 64) + RHO[l] as usize >= 64;
                 cols[2 + l].push(F::from_bool(wrap));
+            }
+            cols[27].push(F::from_bool(t == 127));
+            for k in 0..7 {
+                cols[28 + k].push(F::from_bool(mrow && t == (1 << k) - 1));
             }
         }
         cols
@@ -166,8 +178,6 @@ where
         let local: Vec<AB::Expr> = main.current_slice().iter().map(|v| (*v).into()).collect();
         let next: Vec<AB::Expr> = main.next_slice().iter().map(|v| (*v).into()).collect();
 
-        let rc: AB::Expr = builder.preprocessed().current_slice()[0].into();
-
         let per: Vec<AB::Expr> = builder
             .periodic_values()
             .iter()
@@ -176,7 +186,15 @@ where
         let mrow = per[0].clone();
         let u63 = per[1].clone();
         let e1 = |l: usize| per[2 + l].clone();
+        let blast = per[27].clone();
+        let sel = |k: usize| per[28 + k].clone();
         let trow = AB::Expr::ONE - mrow.clone();
+
+        // Iota RC from the rotating ring: R[0]'s exposed bits, gated by the
+        // position selectors (degree 2; its use inside xor2 stays <= 3).
+        let rc = (0..7)
+            .map(|k| sel(k) * local[B_OFF + k].clone())
+            .fold(AB::Expr::ZERO, |acc, e| acc + e);
 
         let a = |l: usize| local[A_OFF + l].clone();
         let c = |x: usize| local[C_OFF + x].clone();
@@ -255,8 +273,30 @@ where
             }
         }
 
+        // RC ring: R[0]'s bit decomposition (bool + recompose), first-row
+        // pin to the RC table, and one-step rotation per block.
+        for k in 0..7 {
+            builder.assert_bool(local[B_OFF + k].clone());
+        }
+        builder.assert_eq(weighted(B_OFF, 7, &local), local[R_OFF].clone());
+        for i in 0..24 {
+            builder.when_first_row().assert_eq(
+                local[R_OFF + i].clone(),
+                AB::Expr::from_u32(Self::rc_pack((23 + i) % 24)),
+            );
+        }
+
         // --- Transition constraints: register shifts + gated entries ---
         let mut t = builder.when_transition();
+
+        // RC ring rotation at block boundaries.
+        for i in 0..24 {
+            t.assert_eq(
+                next[R_OFF + i].clone(),
+                (AB::Expr::ONE - blast.clone()) * local[R_OFF + i].clone()
+                    + blast.clone() * local[R_OFF + (i + 1) % 24].clone(),
+            );
+        }
 
         // S: theta births enter at slot rot (rho wrap, gate e1) or
         // 64 + rot (no wrap, gate trow - e1).
@@ -332,6 +372,8 @@ impl NarrowKeccakAir {
         let mut s = [0u32; S_SLOTS + 1];
         let mut v = [0u32; V_SLOTS + 1];
         let mut u = [0u32; U_SLOTS + 1];
+        // Iota RC ring: R[i] = 7-bit pack of round (q - 1 + i) mod 24.
+        let mut r: [u32; 24] = core::array::from_fn(|i| Self::rc_pack((23 + i) % 24));
 
         let bit = |w: u32, i: usize| (w >> i) & 1;
 
@@ -381,6 +423,12 @@ impl NarrowKeccakAir {
                 row[UU_OFF + i] = F::from_u32(uu[i]);
             }
             row[X00_COL] = F::from_u32(x00);
+            for (i, ri) in r.iter().enumerate() {
+                row[R_OFF + i] = F::from_u32(*ri);
+            }
+            for k in 0..7 {
+                row[B_OFF + k] = F::from_u32((r[0] >> k) & 1);
+            }
             for d in 1..=S_SLOTS {
                 row[s_col(d)] = F::from_u32(s[d]);
             }
@@ -413,6 +461,9 @@ impl NarrowKeccakAir {
                 u[d] = u[d + 1];
             }
             u[U_SLOTS] = 0;
+            if t % 128 == 127 {
+                r.rotate_left(1);
+            }
             if mrow {
                 let a_limb: u32 = (0..25).map(|l| a[l] << l).sum();
                 let lo: u32 = (0..5).map(|x| c[x] << x).sum();
