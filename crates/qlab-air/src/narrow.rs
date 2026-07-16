@@ -73,23 +73,45 @@ const B_OFF: usize = R_OFF + 24; // 395: 7: bit-decomposition of R[0]
 // --- M3 program machinery (phase-packed ring) + step-2 merkle wiring ---
 const PB_OFF: usize = B_OFF + 7; // 402: 24: perm-boundary ring [1,0,..,0]
 const PH_OFF: usize = PB_OFF + 24; // 426: 4: perm-phase ring (mod-4 counter)
-const PR_OFF: usize = PH_OFF + 4; // 430: 24: program ring, 4 slots x 3 bits/limb
-const D_OFF: usize = PR_OFF + 24; // 454: 12: bit-decomposition of PR[0]
-const RB_OFF: usize = D_OFF + 12; // 466: 3: current perm's role bits
-const SELM_COL: usize = RB_OFF + 3; // 469: 1: materialized merkle-role selector
-const INJM_COL: usize = SELM_COL + 1; // 470: 1: materialized merkle injection flag
-const G4_COL: usize = INJM_COL + 1; // 471: 1: materialized program-ring rotation gate
-const PBIT_COL: usize = G4_COL + 1; // 472: 1: merkle path bit (constant per perm)
-const SIB_OFF: usize = PBIT_COL + 1; // 473: 4: sibling digest lanes (witness bits)
-const EFF_OFF: usize = SIB_OFF + 4; // 477: 25: effective round input
-pub const NARROW_WIDTH: usize = EFF_OFF + 25; // 502
+const PR_OFF: usize = PH_OFF + 4; // 430: 24: program ring, 4 slots x 4 bits/limb
+const D_OFF: usize = PR_OFF + 24; // 454: 16: bit-decomposition of PR[0]
+const RB_OFF: usize = D_OFF + 16; // 470: 4: current perm's role bits
+const NSEL: usize = 6; // materialized role selectors, order below
+const SEL_OFF: usize = RB_OFF + 4; // 474: 6: [merkle, nf, ank, arkm, acm, acmout]
+const INJ_OFF: usize = SEL_OFF + NSEL; // 480: 5: injection flags [mrk+nf, ank, arkm, acm, acmout]
+const G4_COL: usize = INJ_OFF + 5; // 485: 1: program-ring rotation gate
+const PBIT_COL: usize = G4_COL + 1; // 486: 1: merkle path bit (constant per perm)
+const W_OFF: usize = PBIT_COL + 1; // 487: 13: witness lanes (role-multiplexed)
+const SIB_OFF: usize = W_OFF; // sibling digest lanes = W0..3 (merkle rows)
+const EQ_OFF: usize = W_OFF + 13; // 500: 32: two equality banks, 4 lanes x 4 chunks
+const EG_OFF: usize = EQ_OFF + 32; // 532: 6: eq gates [e1pos, e1neg, e1close, e2pos, e2neg, e2close]
+const EFF_OFF: usize = EG_OFF + 6; // 538: 25: effective round input
+pub const NARROW_WIDTH: usize = EFF_OFF + 25; // 563
 
 /// Program slots (= perm slots per program period).
 pub const PROGRAM_SLOTS: usize = 96;
-/// 3-bit role codes packed 4-per-limb into the program ring.
+/// 4-bit role codes packed 4-per-limb into the program ring.
 pub const ROLE_DUMMY: u32 = 0;
+/// Merkle step: msg = mux(path bit; digest a[0..4], sibling W[0..4]) + pad512.
 pub const ROLE_MERKLE: u32 = 1;
-// codes 2..8 reserved: absorb-fresh, bind-anchor, bind-nf, bind-cm (M3 step 3).
+/// Nullifier: identical wiring to MERKLE with path bit 0 and W[0..4] = rho
+/// (nf = H(nk || rho), nk arriving as the chained digest) — but a distinct
+/// code so the equality banks can gate on it.
+pub const ROLE_NF: u32 = 2;
+/// nk = H(sk || D_N): msg lanes 0..4 = W(sk), domain bit at lane 4 z0,
+/// pad10*1 at bit 320 (lane 5 z0) and bit 1087.
+pub const ROLE_ANK: u32 = 3;
+/// rkm = H(nk || D_R): same shape, domain bit at lane 4 z1, nk as witness
+/// W[0..4] (bound to the ank digest by equality bank 1).
+pub const ROLE_ARKM: u32 = 4;
+/// cm = H(value || rkm || rho || rseed): value = W4, rkm = chained digest
+/// a[0..4] at lanes 1..5, rho = W5..9 (bound to the NF perm's rho by
+/// equality bank 2), rseed = W9..13, pad at bit 832 (lane 13 z0).
+pub const ROLE_ACM: u32 = 5;
+/// Output cm' = H(value || rkm' || rho' || rseed'): all witness —
+/// value = W4, rkm' = W0..4, rho' = W5..9, rseed' = W9..13.
+pub const ROLE_ACMOUT: u32 = 6;
+// codes 7..16 reserved: bind-anchor / bind-nf / bind-cm / balance (step 3b).
 
 /// Rows per 24-round permutation: 24 rounds x 128 rows.
 pub const ROWS_PER_PERM: usize = 24 * 128;
@@ -129,13 +151,21 @@ const INV_PI: [usize; 25] = inv_pi();
 
 /// Narrow Keccak AIR at a fixed power-of-two height (needed so the
 /// preprocessed round-constant column can be built to match the trace).
+/// Per-perm-slot witness: 13 generic 64-bit lanes plus the merkle path
+/// bit; each role reads the lanes it needs (see the ROLE_* docs).
+#[derive(Clone, Copy, Default)]
+pub struct SlotWitness {
+    pub w: [u64; 13],
+    pub pbit: bool,
+}
+
 pub struct NarrowKeccakAir {
     pub log_height: usize,
-    /// 3-bit role code per program slot (period 96 perms).
+    /// 4-bit role code per program slot (period 96 perms).
     pub program: [u32; PROGRAM_SLOTS],
-    /// (sibling digest lanes, path bit) consumed in order by merkle-role
-    /// perm instances; cycled if the padded height replays the program.
-    pub merkle_witness: Vec<([u64; 4], bool)>,
+    /// Witness per program slot, cycled if the padded height replays the
+    /// program.
+    pub slot_witness: Vec<SlotWitness>,
 }
 
 impl NarrowKeccakAir {
@@ -144,14 +174,14 @@ impl NarrowKeccakAir {
         Self {
             log_height,
             program: [ROLE_DUMMY; PROGRAM_SLOTS],
-            merkle_witness: Vec::new(),
+            slot_witness: Vec::new(),
         }
     }
 
-    /// Program-ring limb i: slots 4i..4i+4, 3 bits each.
+    /// Program-ring limb i: slots 4i..4i+4, 4 bits each.
     fn pr_limb(&self, i: usize) -> u32 {
         (0..4)
-            .map(|j| self.program[(4 * i + j) % PROGRAM_SLOTS] << (3 * j))
+            .map(|j| self.program[(4 * i + j) % PROGRAM_SLOTS] << (4 * j))
             .sum()
     }
 }
@@ -185,7 +215,7 @@ impl<F: Field> BaseAir<F> for NarrowKeccakAir {
     }
 
     fn num_periodic_columns(&self) -> usize {
-        35
+        39
     }
 
     /// 35 period-128 columns: [mrow, u63, e1_0..e1_24, blast, sel_0..sel_6]
@@ -193,7 +223,7 @@ impl<F: Field> BaseAir<F> for NarrowKeccakAir {
     /// blast = 1 on the last row of each 128-row block (RC ring rotation),
     /// sel_k = 1 on the M row with z = 2^k - 1 (iota bit positions).
     fn periodic_columns(&self) -> Vec<Vec<F>> {
-        let mut cols = vec![Vec::with_capacity(128); 35];
+        let mut cols = vec![Vec::with_capacity(128); 39];
         for t in 0..128usize {
             let mrow = t < 64;
             cols[0].push(F::from_bool(mrow));
@@ -205,6 +235,17 @@ impl<F: Field> BaseAir<F> for NarrowKeccakAir {
             cols[27].push(F::from_bool(t == 127));
             for k in 0..7 {
                 cols[28 + k].push(F::from_bool(mrow && t == (1 << k) - 1));
+            }
+            // Chunk-weight columns for the accumulator banks:
+            // pwk_j = 2^(z mod 16) when z div 16 == j, else 0 (z = t mod 64).
+            let z = t % 64;
+            for j in 0..4 {
+                let v = if z / 16 == j {
+                    F::from_u32(1 << (z % 16))
+                } else {
+                    F::ZERO
+                };
+                cols[35 + j].push(v);
             }
         }
         cols
@@ -349,69 +390,151 @@ where
                 AB::Expr::from_u32(self.pr_limb(i)),
             );
         }
-        // PR[0] = 12 bool bits (4 slots x 3 bits).
-        for k in 0..12 {
+        // PR[0] = 16 bool bits (4 slots x 4 bits).
+        for k in 0..16 {
             builder.assert_bool(local[D_OFF + k].clone());
         }
-        builder.assert_eq(weighted(D_OFF, 12, &local), local[PR_OFF].clone());
+        builder.assert_eq(weighted(D_OFF, 16, &local), local[PR_OFF].clone());
         // Active role bits: phase phi of perm p is p mod 4; the left-rotating
-        // phase ring exposes phi via ph[(4 - phi) % 4], so the selector for
-        // quarter phi is ph[(4 - phi) % 4].
-        for k in 0..3 {
+        // phase ring exposes phi via ph[(4 - phi) % 4].
+        for k in 0..4 {
             let sel_quarter = (0..4)
                 .map(|phi| {
                     local[PH_OFF + (4 - phi) % 4].clone()
-                        * local[D_OFF + 3 * phi + k].clone()
+                        * local[D_OFF + 4 * phi + k].clone()
                 })
                 .fold(AB::Expr::ZERO, |acc, e| acc + e);
             builder.assert_eq(local[RB_OFF + k].clone(), sel_quarter);
         }
-        // Merkle-role selector: role code 1 = 0b001.
-        let r0 = local[RB_OFF].clone();
-        let r1 = local[RB_OFF + 1].clone();
-        let r2 = local[RB_OFF + 2].clone();
+        // Materialized role selectors, built from two-bit half-selectors so
+        // each equality stays deg <= 2 over the (already materialized) bits.
+        let r = |k: usize| local[RB_OFF + k].clone();
+        let pair = |b0: AB::Expr, b1: AB::Expr, j: u32| -> AB::Expr {
+            let t0 = if j & 1 == 1 { b0 } else { AB::Expr::ONE - b0 };
+            let t1 = if j & 2 == 2 { b1 } else { AB::Expr::ONE - b1 };
+            t0 * t1
+        };
+        let sel_codes: [u32; NSEL] = [
+            ROLE_MERKLE,
+            ROLE_NF,
+            ROLE_ANK,
+            ROLE_ARKM,
+            ROLE_ACM,
+            ROLE_ACMOUT,
+        ];
+        for (i, code) in sel_codes.iter().enumerate() {
+            let lo = pair(r(0), r(1), code & 3);
+            let hi = pair(r(2), r(3), (code >> 2) & 3);
+            builder.assert_eq(local[SEL_OFF + i].clone(), lo * hi);
+        }
+        let sel_role = |i: usize| local[SEL_OFF + i].clone();
+        // Injection flags: boundary M rows of each injecting role class.
+        // inj[0] covers merkle AND nf (identical wiring).
+        let bnd = mrow.clone() * local[PB_OFF].clone();
         builder.assert_eq(
-            local[SELM_COL].clone(),
-            r0 * (AB::Expr::ONE - r1) * (AB::Expr::ONE - r2),
+            local[INJ_OFF].clone(),
+            bnd.clone() * (sel_role(0) + sel_role(1)),
         );
-        // Merkle injection flag: boundary M rows of a merkle-role perm.
-        builder.assert_eq(
-            local[INJM_COL].clone(),
-            mrow.clone() * local[PB_OFF].clone() * local[SELM_COL].clone(),
-        );
-        // Program-ring rotation gate: perm boundary AND phase wrap (the
-        // phase ring shows ph[1] on perms with p mod 4 == 3).
+        for i in 1..5 {
+            builder.assert_eq(
+                local[INJ_OFF + i].clone(),
+                bnd.clone() * sel_role(i + 1),
+            );
+        }
+        // Program-ring rotation gate: perm boundary AND phase wrap.
         builder.assert_eq(
             local[G4_COL].clone(),
             blast.clone() * local[PB_OFF + 1].clone() * local[PH_OFF + 1].clone(),
         );
         // Witness bits.
         builder.assert_bool(local[PBIT_COL].clone());
-        for i in 0..4 {
-            builder.assert_bool(local[SIB_OFF + i].clone());
+        for i in 0..13 {
+            builder.assert_bool(local[W_OFF + i].clone());
         }
-        // eff = a + injm*(msg_merkle - a): the merkle message state is
-        // mux(path bit; digest = a lanes 0..3, sibling witness) in the
-        // first 8 lanes, pad10*1 bits (z=0 lane 8, z=63 lane 16 — original
-        // Keccak-256 padding, Ethereum-style, single 512-bit block), and
-        // zeros elsewhere including the capacity lanes.
+        // eff = a + sum_v inj_v * (msg_v - a): per-variant message states,
+        // each deg <= 2, each gated by its materialized injection flag.
         let pbit = local[PBIT_COL].clone();
-        let sib = |i: usize| local[SIB_OFF + i].clone();
-        let injm = local[INJM_COL].clone();
+        let w = |i: usize| local[W_OFF + i].clone();
+        let inj = |i: usize| local[INJ_OFF + i].clone();
         for l in 0..25 {
-            let msg: AB::Expr = match l {
-                0..=3 => {
-                    pbit.clone() * sib(l) + (AB::Expr::ONE - pbit.clone()) * a(l)
-                }
+            // merkle / nf: mux(pbit; sibling-or-rho W0..4, digest) + pad512.
+            let msg_mrk: AB::Expr = match l {
+                0..=3 => pbit.clone() * w(l) + (AB::Expr::ONE - pbit.clone()) * a(l),
                 4..=7 => {
-                    pbit.clone() * a(l - 4)
-                        + (AB::Expr::ONE - pbit.clone()) * sib(l - 4)
+                    pbit.clone() * a(l - 4) + (AB::Expr::ONE - pbit.clone()) * w(l - 4)
                 }
                 8 => sel(0),
                 16 => u63.clone(),
                 _ => AB::Expr::ZERO,
             };
-            builder.assert_eq(eff(l), a(l) + injm.clone() * (msg - a(l)));
+            // ank: sk = W0..4, domain-N bit at lane 4 z0, pad10*1 from bit
+            // 320 (lane 5 z0) to bit 1087.
+            let msg_ank: AB::Expr = match l {
+                0..=3 => w(l),
+                4 => sel(0),
+                5 => sel(0),
+                16 => u63.clone(),
+                _ => AB::Expr::ZERO,
+            };
+            // arkm: nk (witness, bank-1-bound) at lanes 0..4, domain-R bit
+            // at lane 4 z1, same padding shape.
+            let msg_arkm: AB::Expr = match l {
+                0..=3 => w(l),
+                4 => sel(1),
+                5 => sel(0),
+                16 => u63.clone(),
+                _ => AB::Expr::ZERO,
+            };
+            // acm: value W4 | rkm = chained digest a[0..4] at lanes 1..5 |
+            // rho = W5..9 (bank-2-bound) | rseed = W9..13 | pad from bit 832.
+            let msg_acm: AB::Expr = match l {
+                0 => w(4),
+                1..=4 => a(l - 1),
+                5..=8 => w(l),
+                9..=12 => w(l),
+                13 => sel(0),
+                16 => u63.clone(),
+                _ => AB::Expr::ZERO,
+            };
+            // acmout: fully witnessed output note, same lane layout as acm.
+            let msg_acmout: AB::Expr = match l {
+                0 => w(4),
+                1..=4 => w(l - 1),
+                5..=8 => w(l),
+                9..=12 => w(l),
+                13 => sel(0),
+                16 => u63.clone(),
+                _ => AB::Expr::ZERO,
+            };
+            let expr = a(l)
+                + inj(0) * (msg_mrk - a(l))
+                + inj(1) * (msg_ank - a(l))
+                + inj(2) * (msg_arkm - a(l))
+                + inj(3) * (msg_acm - a(l))
+                + inj(4) * (msg_acmout - a(l));
+            builder.assert_eq(eff(l), expr);
+        }
+        // Equality banks (4 lanes x 4 z-chunks each). Bank 1 binds arkm's
+        // witness nk (W0..4 on ARKM boundary rows, negative leg) to the ank
+        // digest (a[0..4] on NF boundary rows, positive leg). Bank 2 binds
+        // acm's witness rho (W5..9, negative) to the NF perm's rho (W0..4
+        // on its boundary rows, positive). Gates are materialized so the
+        // accumulator transitions stay deg <= 3; each bank must be zero
+        // when its window closes (last row of the consuming perm).
+        let gperm = blast.clone() * local[PB_OFF + 1].clone();
+        builder.assert_eq(local[EG_OFF].clone(), bnd.clone() * sel_role(1));
+        builder.assert_eq(local[EG_OFF + 1].clone(), bnd.clone() * sel_role(3));
+        builder.assert_eq(local[EG_OFF + 2].clone(), gperm.clone() * sel_role(3));
+        builder.assert_eq(local[EG_OFF + 3].clone(), bnd.clone() * sel_role(1));
+        builder.assert_eq(local[EG_OFF + 4].clone(), bnd.clone() * sel_role(4));
+        builder.assert_eq(local[EG_OFF + 5].clone(), gperm.clone() * sel_role(4));
+        for j in 0..16 {
+            builder.assert_zero(local[EG_OFF + 2].clone() * local[EQ_OFF + j].clone());
+            builder
+                .assert_zero(local[EG_OFF + 5].clone() * local[EQ_OFF + 16 + j].clone());
+        }
+        for j in 0..32 {
+            builder.when_first_row().assert_zero(local[EQ_OFF + j].clone());
         }
 
         // RC ring: R[0]'s bit decomposition (bool + recompose), first-row
@@ -522,6 +645,26 @@ where
             local[u_col(65)].clone() + mrow.clone() * lo_c,
         );
         t.assert_eq(next[u_col(65)].clone(), (mrow - u63) * hi_c);
+
+        // Equality-bank accumulation (deg 3: gate * chunk-weight * source).
+        let pwk = |j: usize| per[35 + j].clone();
+        for l in 0..4 {
+            for j in 0..4 {
+                let idx = 4 * l + j;
+                t.assert_eq(
+                    next[EQ_OFF + idx].clone(),
+                    local[EQ_OFF + idx].clone()
+                        + local[EG_OFF].clone() * pwk(j) * local[A_OFF + l].clone()
+                        - local[EG_OFF + 1].clone() * pwk(j) * local[W_OFF + l].clone(),
+                );
+                t.assert_eq(
+                    next[EQ_OFF + 16 + idx].clone(),
+                    local[EQ_OFF + 16 + idx].clone()
+                        + local[EG_OFF + 3].clone() * pwk(j) * local[W_OFF + l].clone()
+                        - local[EG_OFF + 4].clone() * pwk(j) * local[W_OFF + 5 + l].clone(),
+                );
+            }
+        }
     }
 }
 
@@ -554,21 +697,17 @@ impl NarrowKeccakAir {
         let mut pr: [u32; 24] = core::array::from_fn(|i| self.pr_limb(i));
         // Per-perm derived state, advanced at perm boundaries.
         let mut perm_idx = 0usize;
-        let mut merkle_count = 0usize;
         let role_of = |p: usize| self.program[p % PROGRAM_SLOTS];
-        let wit = |mc: usize| -> ([u64; 4], bool) {
-            if self.merkle_witness.is_empty() {
-                ([0; 4], false)
+        let wit = |p: usize| -> SlotWitness {
+            if self.slot_witness.is_empty() {
+                SlotWitness::default()
             } else {
-                self.merkle_witness[mc % self.merkle_witness.len()]
+                self.slot_witness[p % self.slot_witness.len()]
             }
         };
-        let (mut cur_sib, mut cur_bit) = if role_of(0) == ROLE_MERKLE {
-            merkle_count = 1;
-            wit(0)
-        } else {
-            ([0; 4], false)
-        };
+        let mut cur = wit(0);
+        // Equality banks: signed accumulators, 2 banks x 4 lanes x 4 chunks.
+        let mut eq = [0i64; 32];
 
         let bit = |w: u32, i: usize| (w >> i) & 1;
 
@@ -594,26 +733,63 @@ impl NarrowKeccakAir {
                     chi(l % 5, l / 5)
                 }
             });
-            // Effective round input: merkle injection replaces the state at
-            // boundary M rows of merkle-role perms (mirrors the eff mux).
+            // Effective round input per the role's message layout.
             let role_now = role_of(perm_idx);
-            let injm_now = (mrow as u32) * pb[0] * ((role_now == ROLE_MERKLE) as u32);
-            let sibbit: [u32; 4] =
-                core::array::from_fn(|i| ((cur_sib[i] >> z) & 1) as u32);
-            let pbv = cur_bit as u32;
+            let bnd_now = ((mrow as u32) * pb[0]) == 1;
+            let wbit: [u32; 13] =
+                core::array::from_fn(|i| ((cur.w[i] >> z) & 1) as u32);
+            let pbv = cur.pbit as u32;
+            let z0 = (z == 0) as u32;
+            let z1 = (z == 1) as u32;
+            let z63 = (z == 63) as u32;
             let eff: [u32; 25] = core::array::from_fn(|l| {
-                if injm_now == 1 {
-                    match l {
-                        0..=3 => pbv * sibbit[l] + (1 - pbv) * a[l],
-                        4..=7 => pbv * a[l - 4] + (1 - pbv) * sibbit[l - 4],
-                        8 => (z == 0) as u32,
-                        16 => (z == 63) as u32,
+                if !bnd_now {
+                    return a[l];
+                }
+                match role_now {
+                    ROLE_MERKLE | ROLE_NF => match l {
+                        0..=3 => pbv * wbit[l] + (1 - pbv) * a[l],
+                        4..=7 => pbv * a[l - 4] + (1 - pbv) * wbit[l - 4],
+                        8 => z0,
+                        16 => z63,
                         _ => 0,
-                    }
-                } else {
-                    a[l]
+                    },
+                    ROLE_ANK | ROLE_ARKM => match l {
+                        0..=3 => wbit[l],
+                        4 => {
+                            if role_now == ROLE_ANK {
+                                z0
+                            } else {
+                                z1
+                            }
+                        }
+                        5 => z0,
+                        16 => z63,
+                        _ => 0,
+                    },
+                    ROLE_ACM | ROLE_ACMOUT => match l {
+                        0 => wbit[4],
+                        1..=4 => {
+                            if role_now == ROLE_ACM {
+                                a[l - 1]
+                            } else {
+                                wbit[l - 1]
+                            }
+                        }
+                        5..=8 => wbit[l],
+                        9..=12 => wbit[l],
+                        13 => z0,
+                        16 => z63,
+                        _ => 0,
+                    },
+                    _ => a[l],
                 }
             });
+            // Equality-bank gates (mirror the materialized gate columns).
+            let g_e1pos = (bnd_now && role_now == ROLE_NF) as i64;
+            let g_e1neg = (bnd_now && role_now == ROLE_ARKM) as i64;
+            let g_e2pos = g_e1pos;
+            let g_e2neg = (bnd_now && role_now == ROLE_ACM) as i64;
             // Column parity of the EFFECTIVE input (the constraint's source).
             let c: [u32; 5] = core::array::from_fn(|x| {
                 eff[x] ^ eff[x + 5] ^ eff[x + 10] ^ eff[x + 15] ^ eff[x + 20]
@@ -655,25 +831,63 @@ impl NarrowKeccakAir {
             for (i, v) in pr.iter().enumerate() {
                 row[PR_OFF + i] = F::from_u32(*v);
             }
-            for k in 0..12 {
+            for k in 0..16 {
                 row[D_OFF + k] = F::from_u32((pr[0] >> k) & 1);
             }
-            let role = role_of(perm_idx);
-            for k in 0..3 {
-                row[RB_OFF + k] = F::from_u32((role >> k) & 1);
+            for k in 0..4 {
+                row[RB_OFF + k] = F::from_u32((role_now >> k) & 1);
             }
-            let selm = (role == ROLE_MERKLE) as u32;
-            row[SELM_COL] = F::from_u32(selm);
-            let injm = (mrow as u32) * pb[0] * selm;
-            row[INJM_COL] = F::from_u32(injm);
+            let sel_codes: [u32; NSEL] = [
+                ROLE_MERKLE,
+                ROLE_NF,
+                ROLE_ANK,
+                ROLE_ARKM,
+                ROLE_ACM,
+                ROLE_ACMOUT,
+            ];
+            let selv: [u32; NSEL] =
+                core::array::from_fn(|i| (role_now == sel_codes[i]) as u32);
+            for (i, v) in selv.iter().enumerate() {
+                row[SEL_OFF + i] = F::from_u32(*v);
+            }
+            let bndv = (mrow as u32) * pb[0];
+            row[INJ_OFF] = F::from_u32(bndv * (selv[0] + selv[1]));
+            for i in 1..5 {
+                row[INJ_OFF + i] = F::from_u32(bndv * selv[i + 1]);
+            }
             let g4 = ((t % 128 == 127) as u32) * pb[1] * ph[1];
             row[G4_COL] = F::from_u32(g4);
+            let gpermv = ((t % 128 == 127) as u32) * pb[1];
+            row[EG_OFF] = F::from_u32(bndv * selv[1]);
+            row[EG_OFF + 1] = F::from_u32(bndv * selv[3]);
+            row[EG_OFF + 2] = F::from_u32(gpermv * selv[3]);
+            row[EG_OFF + 3] = F::from_u32(bndv * selv[1]);
+            row[EG_OFF + 4] = F::from_u32(bndv * selv[4]);
+            row[EG_OFF + 5] = F::from_u32(gpermv * selv[4]);
             row[PBIT_COL] = F::from_u32(pbv);
-            for i in 0..4 {
-                row[SIB_OFF + i] = F::from_u32(sibbit[i]);
+            for i in 0..13 {
+                row[W_OFF + i] = F::from_u32(wbit[i]);
+            }
+            for (i, acc) in eq.iter().enumerate() {
+                row[EQ_OFF + i] = if *acc >= 0 {
+                    F::from_u32(*acc as u32)
+                } else {
+                    -F::from_u32((-*acc) as u32)
+                };
             }
             for l in 0..25 {
                 row[EFF_OFF + l] = F::from_u32(eff[l]);
+            }
+            // Advance the equality accumulators (constraint: next = local + legs).
+            if z < 64 {
+                let jc = z / 16;
+                let wgt = 1i64 << (z % 16);
+                for l in 0..4 {
+                    let idx = 4 * l + jc;
+                    eq[idx] += g_e1pos * wgt * a[l] as i64 - g_e1neg * wgt * wbit[l] as i64;
+                    eq[16 + idx] +=
+                        g_e2pos * wgt * wbit[l] as i64 - g_e2neg * wgt * wbit[5 + l] as i64;
+                }
             }
             for d in 1..=S_SLOTS {
                 row[s_col(d)] = F::from_u32(s[d]);
@@ -716,15 +930,7 @@ impl NarrowKeccakAir {
                     }
                     ph.rotate_left(1);
                     perm_idx += 1;
-                    if role_of(perm_idx) == ROLE_MERKLE {
-                        merkle_count += 1;
-                        let (sb, bt) = wit(merkle_count - 1);
-                        cur_sib = sb;
-                        cur_bit = bt;
-                    } else {
-                        cur_sib = [0; 4];
-                        cur_bit = false;
-                    }
+                    cur = wit(perm_idx);
                 }
                 pb.rotate_left(1);
             }
@@ -837,10 +1043,15 @@ mod tests {
                 (sib, bit)
             })
             .collect();
+        let mut slot_witness = vec![SlotWitness::default(); PROGRAM_SLOTS];
+        for (i, (sib, bit)) in witness.iter().enumerate() {
+            slot_witness[i + 1].w[..4].copy_from_slice(sib);
+            slot_witness[i + 1].pbit = *bit;
+        }
         let air = NarrowKeccakAir {
             log_height: 16, // 512 blocks = 21 full perms
             program,
-            merkle_witness: witness.clone(),
+            slot_witness,
         };
         let trace = air.generate_trace::<F>(0);
         check_constraints(&air, &trace, &[]);
@@ -865,10 +1076,13 @@ mod tests {
     fn corrupted_merkle_witness_detected() {
         let mut program = [ROLE_DUMMY; PROGRAM_SLOTS];
         program[1] = ROLE_MERKLE;
+        let mut slot_witness = vec![SlotWitness::default(); PROGRAM_SLOTS];
+        slot_witness[1].w[..4].copy_from_slice(&[7, 8, 9, 10]);
+        slot_witness[1].pbit = true;
         let air = NarrowKeccakAir {
             log_height: 13,
             program,
-            merkle_witness: vec![([7, 8, 9, 10], true)],
+            slot_witness,
         };
         let mut trace = air.generate_trace::<F>(0);
         // Flip a sibling bit on an injection row (perm 1 boundary block =
@@ -884,6 +1098,184 @@ mod tests {
         trace2.values[row2 * NARROW_WIDTH + PBIT_COL] += F::ONE;
         let report2 = check_all_constraints(&air, &trace2, &[], Some(10));
         assert!(!report2.is_ok(), "path-bit drift not caught");
+    }
+
+    /// Helpers for the input-chain tests: expected sponge input states.
+    fn st_ank(sk: &[u64; 4], domain_z: u32) -> [u64; 25] {
+        let mut st = [0u64; 25];
+        st[..4].copy_from_slice(sk);
+        st[4] = 1 << domain_z;
+        st[5] = 1; // pad10*1 at bit 320
+        st[16] = 1 << 63;
+        st
+    }
+    fn st_pair(left: &[u64; 4], right: &[u64; 4]) -> [u64; 25] {
+        let mut st = [0u64; 25];
+        st[..4].copy_from_slice(left);
+        st[4..8].copy_from_slice(right);
+        st[8] = 1;
+        st[16] = 1 << 63;
+        st
+    }
+    fn st_cm(value: u64, rkm: &[u64; 4], rho: &[u64; 4], rseed: &[u64; 4]) -> [u64; 25] {
+        let mut st = [0u64; 25];
+        st[0] = value;
+        st[1..5].copy_from_slice(rkm);
+        st[5..9].copy_from_slice(rho);
+        st[9..13].copy_from_slice(rseed);
+        st[13] = 1; // pad10*1 at bit 832
+        st[16] = 1 << 63;
+        st
+    }
+    fn digest(state: &[u64; 25]) -> [u64; 4] {
+        state[..4].try_into().unwrap()
+    }
+
+    /// M3 step 3a: the full input chain — ank -> nf -> arkm -> acm ->
+    /// merkle x32 — must advance exactly like the reference, with the
+    /// equality banks binding arkm's nk witness to the ank digest and
+    /// acm's rho witness to the nf perm's rho.
+    #[test]
+    fn input_chain_matches_reference() {
+        let mut x = 0x9e3779b97f4a7c15u64;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let sk: [u64; 4] = core::array::from_fn(|_| rnd());
+        let rho: [u64; 4] = core::array::from_fn(|_| rnd());
+        let rseed: [u64; 4] = core::array::from_fn(|_| rnd());
+        let value = rnd() & 0xffff_ffff;
+
+        // Reference walk.
+        let nk_state = reference::keccak_f(&st_ank(&sk, 0));
+        let nk = digest(&nk_state);
+        let nf_state = reference::keccak_f(&st_pair(&nk, &rho));
+        let rkm_state = reference::keccak_f(&st_ank_r(&nk));
+        let rkm = digest(&rkm_state);
+        let cm_state = reference::keccak_f(&st_cm(value, &rkm, &rho, &rseed));
+
+        let mut program = [ROLE_DUMMY; PROGRAM_SLOTS];
+        program[1] = ROLE_ANK;
+        program[2] = ROLE_NF;
+        program[3] = ROLE_ARKM;
+        program[4] = ROLE_ACM;
+        let n_merkle = 8usize;
+        for slot in 5..5 + n_merkle {
+            program[slot] = ROLE_MERKLE;
+        }
+        let mut sw = vec![SlotWitness::default(); PROGRAM_SLOTS];
+        sw[1].w[..4].copy_from_slice(&sk);
+        sw[2].w[..4].copy_from_slice(&rho); // nf: rho, pbit = 0
+        sw[3].w[..4].copy_from_slice(&nk); // arkm: nk witness (bank 1)
+        sw[4].w[4] = value;
+        sw[4].w[5..9].copy_from_slice(&rho); // acm: rho witness (bank 2)
+        sw[4].w[9..13].copy_from_slice(&rseed);
+        let sibs: Vec<([u64; 4], bool)> = (0..n_merkle)
+            .map(|_| {
+                let sib = [rnd(), rnd(), rnd(), rnd()];
+                (sib, rnd() & 1 == 1)
+            })
+            .collect();
+        for (i, (sib, bit)) in sibs.iter().enumerate() {
+            sw[5 + i].w[..4].copy_from_slice(sib);
+            sw[5 + i].pbit = *bit;
+        }
+        let air = NarrowKeccakAir {
+            log_height: 16, // 21 full perms >= 13 used
+            program,
+            slot_witness: sw,
+        };
+        let trace = air.generate_trace::<F>(0);
+        check_constraints(&air, &trace, &[]);
+
+        assert_eq!(NarrowKeccakAir::extract_state(&trace, 24 * 2), nk_state);
+        assert_eq!(NarrowKeccakAir::extract_state(&trace, 24 * 3), nf_state);
+        assert_eq!(NarrowKeccakAir::extract_state(&trace, 24 * 4), rkm_state);
+        assert_eq!(NarrowKeccakAir::extract_state(&trace, 24 * 5), cm_state);
+        // Merkle walk from cm.
+        let mut d = digest(&cm_state);
+        for (i, (sib, bit)) in sibs.iter().enumerate() {
+            let expect = if *bit {
+                reference::merkle_node_state(sib, &d)
+            } else {
+                reference::merkle_node_state(&d, sib)
+            };
+            let got = NarrowKeccakAir::extract_state(&trace, 24 * (6 + i));
+            assert_eq!(got, expect, "merkle step {i}");
+            d = digest(&expect);
+        }
+    }
+
+    fn st_ank_r(nk: &[u64; 4]) -> [u64; 25] {
+        let mut st = [0u64; 25];
+        st[..4].copy_from_slice(nk);
+        st[4] = 1 << 1; // domain R at z1
+        st[5] = 1;
+        st[16] = 1 << 63;
+        st
+    }
+
+    /// The equality banks are the soundness core: an inconsistent rho
+    /// (acm vs nf) or nk (arkm vs ank digest) must fail constraints.
+    #[test]
+    fn inconsistent_witness_detected_by_banks() {
+        let mut program = [ROLE_DUMMY; PROGRAM_SLOTS];
+        program[1] = ROLE_ANK;
+        program[2] = ROLE_NF;
+        program[3] = ROLE_ARKM;
+        program[4] = ROLE_ACM;
+        let sk = [11u64, 22, 33, 44];
+        let rho = [55u64, 66, 77, 88];
+        let nk = {
+            let st = reference::keccak_f(&st_ank(&sk, 0));
+            digest(&st)
+        };
+        let build = |tamper_rho: bool, tamper_nk: bool| {
+            let mut sw = vec![SlotWitness::default(); PROGRAM_SLOTS];
+            sw[1].w[..4].copy_from_slice(&sk);
+            sw[2].w[..4].copy_from_slice(&rho);
+            let mut nkw = nk;
+            if tamper_nk {
+                nkw[2] ^= 1 << 17;
+            }
+            sw[3].w[..4].copy_from_slice(&nkw);
+            let mut rhow = rho;
+            if tamper_rho {
+                rhow[0] ^= 1 << 5;
+            }
+            sw[4].w[5..9].copy_from_slice(&rhow);
+            NarrowKeccakAir {
+                log_height: 13, // 2.67 perms... need 5 perms -> 15360 rows
+                program,
+                slot_witness: sw,
+            }
+        };
+        // Sanity: untampered witness satisfies constraints at this height.
+        let ok_air = NarrowKeccakAir {
+            log_height: 14,
+            ..build(false, false)
+        };
+        let trace = ok_air.generate_trace::<F>(0);
+        check_constraints(&ok_air, &trace, &[]);
+        // Tampered rho: bank 2 close must fire.
+        let bad_rho = NarrowKeccakAir {
+            log_height: 14,
+            ..build(true, false)
+        };
+        let tr = bad_rho.generate_trace::<F>(0);
+        let report = check_all_constraints(&bad_rho, &tr, &[], Some(10));
+        assert!(!report.is_ok(), "rho inconsistency not caught");
+        // Tampered nk: bank 1 close must fire.
+        let bad_nk = NarrowKeccakAir {
+            log_height: 14,
+            ..build(false, true)
+        };
+        let tr = bad_nk.generate_trace::<F>(0);
+        let report = check_all_constraints(&bad_nk, &tr, &[], Some(10));
+        assert!(!report.is_ok(), "nk inconsistency not caught");
     }
 
     /// Full-permutation check across a 24-block group.
