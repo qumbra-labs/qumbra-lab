@@ -114,6 +114,17 @@ const L6: Layout = Layout {
     rows_per_perm: 1536,
 };
 
+/// M1.5b step-0 anchor: the realizable narrow-Keccak geometry per
+/// `docs/m15b-narrow-keccak-layout.md` §2 (packed carry 54 + rho in-flight
+/// store 23 + working bits at zpr=1 ≈ 162 cols, 64 rows/round). Measured
+/// here as a mock cell so the implementation has a size prediction to be
+/// gated against BEFORE the real AIR exists.
+const N160: Layout = Layout {
+    name: "N160",
+    width: 162,
+    rows_per_perm: 1536,
+};
+
 struct LeverRow {
     cfg_name: &'static str,
     cfg: FriCfg,
@@ -132,7 +143,11 @@ fn measure(cfg_name: &'static str, cfg: &FriCfg, layout: &Layout) -> LeverRow {
     let air = GeometryAir {
         width: layout.width,
         rows_per_perm: layout.rows_per_perm,
-        n_constraints: constraints_per_row(layout.rows_per_perm),
+        // At least one constraint per column (the mock's coverage invariant);
+        // the census scaling can fall below width for wide-but-tall layouts
+        // like N160, where the real AIR is denser than the census anyway
+        // (every state bit is unpacked twice per round — see the M1.5b doc).
+        n_constraints: constraints_per_row(layout.rows_per_perm).max(layout.width),
         max_degree: KECCAK_MAX_DEGREE,
     };
     let config = make_config_with(cfg);
@@ -175,7 +190,7 @@ pub(crate) fn run_levers(power: &str) {
     );
     println!();
 
-    let narrow: [&Layout; 4] = [&LADDER[2], &LADDER[3], &LADDER[4], &L6];
+    let narrow: [&Layout; 5] = [&LADDER[2], &LADDER[3], &LADDER[4], &L6, &N160];
     let keccak_air = KeccakAir {};
 
     let mut rows: Vec<LeverRow> = Vec::new();
