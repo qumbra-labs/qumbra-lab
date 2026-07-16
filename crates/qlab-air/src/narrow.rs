@@ -27,6 +27,17 @@
 //! RC table — sound with no preprocessed commitment, replacing M1.5b's
 //! 1-column preprocessed trace whose per-query openings cost ~740 B/query.
 //!
+//! M3 step 1 (program plumbing): a 24-slot perm-boundary ring (pinned
+//! [1,0,...,0], rotating per block) exposes where permutations start; a
+//! 96-slot program ring rotates once per permutation and exposes the
+//! current perm's packed role word through bool-checked bits. The round
+//! input consumed downstream (V entries, theta parity) is a materialized
+//! `eff` column: eff = a + inj·(msg − a), inj itself materialized so
+//! every constraint stays degree ≤ 3. With every program slot set to
+//! ROLE_DUMMY the injection is inert and the pipeline is byte-for-byte
+//! the M1.5c chain; steps 2-3 wire real roles (Merkle mux, fresh
+//! absorbs, public binding) into `msg`.
+//!
 //! Chaining: permutation p occupies blocks 24p..24p+24; the state
 //! materialized at block q is the round-q input, so state(q+1) =
 //! Round_{q mod 24}(state(q)) for every q, including padding rows — no
@@ -59,7 +70,26 @@ const U_SLOTS: usize = 65;
 const UU_OFF: usize = U_OFF + U_SLOTS; // 361: 10: unpack of U slot 1
 const R_OFF: usize = UU_OFF + 10; // 371: 24 rotating iota-RC registers
 const B_OFF: usize = R_OFF + 24; // 395: 7: bit-decomposition of R[0]
-pub const NARROW_WIDTH: usize = B_OFF + 7; // 402
+// --- M3 program machinery (phase-packed ring) + step-2 merkle wiring ---
+const PB_OFF: usize = B_OFF + 7; // 402: 24: perm-boundary ring [1,0,..,0]
+const PH_OFF: usize = PB_OFF + 24; // 426: 4: perm-phase ring (mod-4 counter)
+const PR_OFF: usize = PH_OFF + 4; // 430: 24: program ring, 4 slots x 3 bits/limb
+const D_OFF: usize = PR_OFF + 24; // 454: 12: bit-decomposition of PR[0]
+const RB_OFF: usize = D_OFF + 12; // 466: 3: current perm's role bits
+const SELM_COL: usize = RB_OFF + 3; // 469: 1: materialized merkle-role selector
+const INJM_COL: usize = SELM_COL + 1; // 470: 1: materialized merkle injection flag
+const G4_COL: usize = INJM_COL + 1; // 471: 1: materialized program-ring rotation gate
+const PBIT_COL: usize = G4_COL + 1; // 472: 1: merkle path bit (constant per perm)
+const SIB_OFF: usize = PBIT_COL + 1; // 473: 4: sibling digest lanes (witness bits)
+const EFF_OFF: usize = SIB_OFF + 4; // 477: 25: effective round input
+pub const NARROW_WIDTH: usize = EFF_OFF + 25; // 502
+
+/// Program slots (= perm slots per program period).
+pub const PROGRAM_SLOTS: usize = 96;
+/// 3-bit role codes packed 4-per-limb into the program ring.
+pub const ROLE_DUMMY: u32 = 0;
+pub const ROLE_MERKLE: u32 = 1;
+// codes 2..8 reserved: absorb-fresh, bind-anchor, bind-nf, bind-cm (M3 step 3).
 
 /// Rows per 24-round permutation: 24 rounds x 128 rows.
 pub const ROWS_PER_PERM: usize = 24 * 128;
@@ -101,6 +131,29 @@ const INV_PI: [usize; 25] = inv_pi();
 /// preprocessed round-constant column can be built to match the trace).
 pub struct NarrowKeccakAir {
     pub log_height: usize,
+    /// 3-bit role code per program slot (period 96 perms).
+    pub program: [u32; PROGRAM_SLOTS],
+    /// (sibling digest lanes, path bit) consumed in order by merkle-role
+    /// perm instances; cycled if the padded height replays the program.
+    pub merkle_witness: Vec<([u64; 4], bool)>,
+}
+
+impl NarrowKeccakAir {
+    /// M1.5c-equivalent instance: every perm slot dummy, pure chaining.
+    pub fn chain_only(log_height: usize) -> Self {
+        Self {
+            log_height,
+            program: [ROLE_DUMMY; PROGRAM_SLOTS],
+            merkle_witness: Vec::new(),
+        }
+    }
+
+    /// Program-ring limb i: slots 4i..4i+4, 3 bits each.
+    fn pr_limb(&self, i: usize) -> u32 {
+        (0..4)
+            .map(|j| self.program[(4 * i + j) % PROGRAM_SLOTS] << (3 * j))
+            .sum()
+    }
 }
 
 impl NarrowKeccakAir {
@@ -197,6 +250,7 @@ where
             .fold(AB::Expr::ZERO, |acc, e| acc + e);
 
         let a = |l: usize| local[A_OFF + l].clone();
+        let eff = |l: usize| local[EFF_OFF + l].clone();
         let c = |x: usize| local[C_OFF + x].clone();
         let us = |l: usize| local[US_OFF + l].clone();
         let ap = |l: usize| local[AP_OFF + l].clone();
@@ -249,9 +303,10 @@ where
         builder.assert_eq(a(0), xor2(x00, rc, two.clone()));
 
         // Column parity via the degree-3 trick: sum - c in {0, 2, 4}.
+        // Source is the EFFECTIVE round input (eff), not the chi output.
         for x in 0..5 {
             let s = (0..5)
-                .map(|y| a(x + 5 * y))
+                .map(|y| eff(x + 5 * y))
                 .fold(AB::Expr::ZERO, |acc, e| acc + e);
             let d = s - c(x);
             builder.assert_zero(
@@ -271,6 +326,92 @@ where
                     + two.clone() * two.clone() * p * q * r;
                 builder.assert_eq(ap(x + 5 * y), xor3);
             }
+        }
+
+        // M3 program machinery: perm-boundary ring pin, phase ring pin,
+        // phase-packed program ring pin, slot-0 decomposition, active-role
+        // extraction, materialized selectors/gates, and the eff mux.
+        for i in 0..24 {
+            builder.when_first_row().assert_eq(
+                local[PB_OFF + i].clone(),
+                if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO },
+            );
+        }
+        for i in 0..4 {
+            builder.when_first_row().assert_eq(
+                local[PH_OFF + i].clone(),
+                if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO },
+            );
+        }
+        for i in 0..24 {
+            builder.when_first_row().assert_eq(
+                local[PR_OFF + i].clone(),
+                AB::Expr::from_u32(self.pr_limb(i)),
+            );
+        }
+        // PR[0] = 12 bool bits (4 slots x 3 bits).
+        for k in 0..12 {
+            builder.assert_bool(local[D_OFF + k].clone());
+        }
+        builder.assert_eq(weighted(D_OFF, 12, &local), local[PR_OFF].clone());
+        // Active role bits: phase phi of perm p is p mod 4; the left-rotating
+        // phase ring exposes phi via ph[(4 - phi) % 4], so the selector for
+        // quarter phi is ph[(4 - phi) % 4].
+        for k in 0..3 {
+            let sel_quarter = (0..4)
+                .map(|phi| {
+                    local[PH_OFF + (4 - phi) % 4].clone()
+                        * local[D_OFF + 3 * phi + k].clone()
+                })
+                .fold(AB::Expr::ZERO, |acc, e| acc + e);
+            builder.assert_eq(local[RB_OFF + k].clone(), sel_quarter);
+        }
+        // Merkle-role selector: role code 1 = 0b001.
+        let r0 = local[RB_OFF].clone();
+        let r1 = local[RB_OFF + 1].clone();
+        let r2 = local[RB_OFF + 2].clone();
+        builder.assert_eq(
+            local[SELM_COL].clone(),
+            r0 * (AB::Expr::ONE - r1) * (AB::Expr::ONE - r2),
+        );
+        // Merkle injection flag: boundary M rows of a merkle-role perm.
+        builder.assert_eq(
+            local[INJM_COL].clone(),
+            mrow.clone() * local[PB_OFF].clone() * local[SELM_COL].clone(),
+        );
+        // Program-ring rotation gate: perm boundary AND phase wrap (the
+        // phase ring shows ph[1] on perms with p mod 4 == 3).
+        builder.assert_eq(
+            local[G4_COL].clone(),
+            blast.clone() * local[PB_OFF + 1].clone() * local[PH_OFF + 1].clone(),
+        );
+        // Witness bits.
+        builder.assert_bool(local[PBIT_COL].clone());
+        for i in 0..4 {
+            builder.assert_bool(local[SIB_OFF + i].clone());
+        }
+        // eff = a + injm*(msg_merkle - a): the merkle message state is
+        // mux(path bit; digest = a lanes 0..3, sibling witness) in the
+        // first 8 lanes, pad10*1 bits (z=0 lane 8, z=63 lane 16 — original
+        // Keccak-256 padding, Ethereum-style, single 512-bit block), and
+        // zeros elsewhere including the capacity lanes.
+        let pbit = local[PBIT_COL].clone();
+        let sib = |i: usize| local[SIB_OFF + i].clone();
+        let injm = local[INJM_COL].clone();
+        for l in 0..25 {
+            let msg: AB::Expr = match l {
+                0..=3 => {
+                    pbit.clone() * sib(l) + (AB::Expr::ONE - pbit.clone()) * a(l)
+                }
+                4..=7 => {
+                    pbit.clone() * a(l - 4)
+                        + (AB::Expr::ONE - pbit.clone()) * sib(l - 4)
+                }
+                8 => sel(0),
+                16 => u63.clone(),
+                _ => AB::Expr::ZERO,
+            };
+            builder.assert_eq(eff(l), a(l) + injm.clone() * (msg - a(l)));
         }
 
         // RC ring: R[0]'s bit decomposition (bool + recompose), first-row
@@ -297,6 +438,39 @@ where
                     + blast.clone() * local[R_OFF + (i + 1) % 24].clone(),
             );
         }
+        // Perm-boundary ring: same cadence as the RC ring.
+        for i in 0..24 {
+            t.assert_eq(
+                next[PB_OFF + i].clone(),
+                (AB::Expr::ONE - blast.clone()) * local[PB_OFF + i].clone()
+                    + blast.clone() * local[PB_OFF + (i + 1) % 24].clone(),
+            );
+        }
+        // Phase ring: rotates once per perm. Gate g = blast*pb[1] is
+        // degree 2; the rotation constraint lands at degree 3.
+        let g = blast.clone() * local[PB_OFF + 1].clone();
+        for i in 0..4 {
+            t.assert_eq(
+                next[PH_OFF + i].clone(),
+                (AB::Expr::ONE - g.clone()) * local[PH_OFF + i].clone()
+                    + g.clone() * local[PH_OFF + (i + 1) % 4].clone(),
+            );
+        }
+        // Program ring: rotates one limb every 4 perms, via the
+        // materialized gate (blast*pb[1]*ph[1], checked same-row).
+        let g4 = local[G4_COL].clone();
+        for i in 0..24 {
+            t.assert_eq(
+                next[PR_OFF + i].clone(),
+                (AB::Expr::ONE - g4.clone()) * local[PR_OFF + i].clone()
+                    + g4.clone() * local[PR_OFF + (i + 1) % 24].clone(),
+            );
+        }
+        // Path bit: constant within a perm, free at perm boundaries.
+        t.assert_zero(
+            (AB::Expr::ONE - g.clone())
+                * (next[PBIT_COL].clone() - local[PBIT_COL].clone()),
+        );
 
         // S: theta births enter at slot rot (rho wrap, gate e1) or
         // 64 + rot (no wrap, gate trow - e1).
@@ -324,7 +498,7 @@ where
         }
         t.assert_eq(
             next[v_col(V_SLOTS)].clone(),
-            mrow.clone() * weighted(A_OFF, 25, &local),
+            mrow.clone() * weighted(EFF_OFF, 25, &local),
         );
 
         // U: parity limbs enter twice — low half (weights 2^0..2^4) at
@@ -374,6 +548,27 @@ impl NarrowKeccakAir {
         let mut u = [0u32; U_SLOTS + 1];
         // Iota RC ring: R[i] = 7-bit pack of round (q - 1 + i) mod 24.
         let mut r: [u32; 24] = core::array::from_fn(|i| Self::rc_pack((23 + i) % 24));
+        // Perm-boundary, phase, and program rings.
+        let mut pb: [u32; 24] = core::array::from_fn(|i| (i == 0) as u32);
+        let mut ph: [u32; 4] = core::array::from_fn(|i| (i == 0) as u32);
+        let mut pr: [u32; 24] = core::array::from_fn(|i| self.pr_limb(i));
+        // Per-perm derived state, advanced at perm boundaries.
+        let mut perm_idx = 0usize;
+        let mut merkle_count = 0usize;
+        let role_of = |p: usize| self.program[p % PROGRAM_SLOTS];
+        let wit = |mc: usize| -> ([u64; 4], bool) {
+            if self.merkle_witness.is_empty() {
+                ([0; 4], false)
+            } else {
+                self.merkle_witness[mc % self.merkle_witness.len()]
+            }
+        };
+        let (mut cur_sib, mut cur_bit) = if role_of(0) == ROLE_MERKLE {
+            merkle_count = 1;
+            wit(0)
+        } else {
+            ([0; 4], false)
+        };
 
         let bit = |w: u32, i: usize| (w >> i) & 1;
 
@@ -399,8 +594,30 @@ impl NarrowKeccakAir {
                     chi(l % 5, l / 5)
                 }
             });
-            let c: [u32; 5] =
-                core::array::from_fn(|x| a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20]);
+            // Effective round input: merkle injection replaces the state at
+            // boundary M rows of merkle-role perms (mirrors the eff mux).
+            let role_now = role_of(perm_idx);
+            let injm_now = (mrow as u32) * pb[0] * ((role_now == ROLE_MERKLE) as u32);
+            let sibbit: [u32; 4] =
+                core::array::from_fn(|i| ((cur_sib[i] >> z) & 1) as u32);
+            let pbv = cur_bit as u32;
+            let eff: [u32; 25] = core::array::from_fn(|l| {
+                if injm_now == 1 {
+                    match l {
+                        0..=3 => pbv * sibbit[l] + (1 - pbv) * a[l],
+                        4..=7 => pbv * a[l - 4] + (1 - pbv) * sibbit[l - 4],
+                        8 => (z == 0) as u32,
+                        16 => (z == 63) as u32,
+                        _ => 0,
+                    }
+                } else {
+                    a[l]
+                }
+            });
+            // Column parity of the EFFECTIVE input (the constraint's source).
+            let c: [u32; 5] = core::array::from_fn(|x| {
+                eff[x] ^ eff[x + 5] ^ eff[x + 10] ^ eff[x + 15] ^ eff[x + 20]
+            });
             let ap: [u32; 25] = core::array::from_fn(|l| {
                 let x = l % 5;
                 uv[l] ^ uu[(x + 4) % 5] ^ uu[5 + (x + 1) % 5]
@@ -428,6 +645,35 @@ impl NarrowKeccakAir {
             }
             for k in 0..7 {
                 row[B_OFF + k] = F::from_u32((r[0] >> k) & 1);
+            }
+            for (i, v) in pb.iter().enumerate() {
+                row[PB_OFF + i] = F::from_u32(*v);
+            }
+            for (i, v) in ph.iter().enumerate() {
+                row[PH_OFF + i] = F::from_u32(*v);
+            }
+            for (i, v) in pr.iter().enumerate() {
+                row[PR_OFF + i] = F::from_u32(*v);
+            }
+            for k in 0..12 {
+                row[D_OFF + k] = F::from_u32((pr[0] >> k) & 1);
+            }
+            let role = role_of(perm_idx);
+            for k in 0..3 {
+                row[RB_OFF + k] = F::from_u32((role >> k) & 1);
+            }
+            let selm = (role == ROLE_MERKLE) as u32;
+            row[SELM_COL] = F::from_u32(selm);
+            let injm = (mrow as u32) * pb[0] * selm;
+            row[INJM_COL] = F::from_u32(injm);
+            let g4 = ((t % 128 == 127) as u32) * pb[1] * ph[1];
+            row[G4_COL] = F::from_u32(g4);
+            row[PBIT_COL] = F::from_u32(pbv);
+            for i in 0..4 {
+                row[SIB_OFF + i] = F::from_u32(sibbit[i]);
+            }
+            for l in 0..25 {
+                row[EFF_OFF + l] = F::from_u32(eff[l]);
             }
             for d in 1..=S_SLOTS {
                 row[s_col(d)] = F::from_u32(s[d]);
@@ -463,9 +709,27 @@ impl NarrowKeccakAir {
             u[U_SLOTS] = 0;
             if t % 128 == 127 {
                 r.rotate_left(1);
+                if pb[1] == 1 {
+                    // Perm boundary: advance phase; program limb every 4.
+                    if ph[1] == 1 {
+                        pr.rotate_left(1);
+                    }
+                    ph.rotate_left(1);
+                    perm_idx += 1;
+                    if role_of(perm_idx) == ROLE_MERKLE {
+                        merkle_count += 1;
+                        let (sb, bt) = wit(merkle_count - 1);
+                        cur_sib = sb;
+                        cur_bit = bt;
+                    } else {
+                        cur_sib = [0; 4];
+                        cur_bit = false;
+                    }
+                }
+                pb.rotate_left(1);
             }
             if mrow {
-                let a_limb: u32 = (0..25).map(|l| a[l] << l).sum();
+                let a_limb: u32 = (0..25).map(|l| eff[l] << l).sum();
                 let lo: u32 = (0..5).map(|x| c[x] << x).sum();
                 let hi: u32 = (0..5).map(|x| c[x] << (5 + x)).sum();
                 v[V_SLOTS] = a_limb;
@@ -516,14 +780,14 @@ mod tests {
 
     #[test]
     fn trace_satisfies_constraints() {
-        let air = NarrowKeccakAir { log_height: 10 };
+        let air = NarrowKeccakAir::chain_only(10);
         let trace = air.generate_trace::<F>(0);
         check_constraints(&air, &trace, &[]);
     }
 
     #[test]
     fn corrupted_trace_detected() {
-        let air = NarrowKeccakAir { log_height: 10 };
+        let air = NarrowKeccakAir::chain_only(10);
         let mut trace = air.generate_trace::<F>(0);
         // Flip one A' (theta output) bit on a T row.
         let row = 64 + 7;
@@ -537,7 +801,7 @@ mod tests {
     /// warmup and padding blocks.
     #[test]
     fn chain_matches_reference_rounds() {
-        let air = NarrowKeccakAir { log_height: 13 }; // 64 blocks
+        let air = NarrowKeccakAir::chain_only(13); // 64 blocks
         let trace = air.generate_trace::<F>(0);
         let blocks = (1usize << air.log_height) / 128;
         for q in 0..blocks - 1 {
@@ -548,10 +812,84 @@ mod tests {
         }
     }
 
+    /// M3 step 2: a 16-step Merkle chain driven by the program ring and
+    /// witness columns must advance exactly like reference Merkle-node
+    /// hashing — digest = lanes 0..4 of the previous perm's output,
+    /// muxed with the sibling by the path bit.
+    #[test]
+    fn merkle_chain_matches_reference() {
+        let mut program = [ROLE_DUMMY; PROGRAM_SLOTS];
+        for slot in program.iter_mut().take(17).skip(1) {
+            *slot = ROLE_MERKLE;
+        }
+        // Deterministic pseudo-random witness.
+        let mut x = 0x243f6a8885a308d3u64;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let witness: Vec<([u64; 4], bool)> = (0..16)
+            .map(|_| {
+                let sib = [rnd(), rnd(), rnd(), rnd()];
+                let bit = rnd() & 1 == 1;
+                (sib, bit)
+            })
+            .collect();
+        let air = NarrowKeccakAir {
+            log_height: 16, // 512 blocks = 21 full perms
+            program,
+            merkle_witness: witness.clone(),
+        };
+        let trace = air.generate_trace::<F>(0);
+        check_constraints(&air, &trace, &[]);
+
+        // Reference walk: perm p (1..=16) hashes mux(bit; digest, sib).
+        for (i, (sib, bit)) in witness.iter().enumerate() {
+            let p = i + 1;
+            let prev = NarrowKeccakAir::extract_state(&trace, 24 * p);
+            let digest: [u64; 4] = prev[..4].try_into().unwrap();
+            let expect = if *bit {
+                reference::merkle_node_state(sib, &digest)
+            } else {
+                reference::merkle_node_state(&digest, sib)
+            };
+            let got = NarrowKeccakAir::extract_state(&trace, 24 * (p + 1));
+            assert_eq!(got, expect, "merkle step {p}");
+        }
+    }
+
+    /// Corrupting a sibling witness bit or the path bit must be caught.
+    #[test]
+    fn corrupted_merkle_witness_detected() {
+        let mut program = [ROLE_DUMMY; PROGRAM_SLOTS];
+        program[1] = ROLE_MERKLE;
+        let air = NarrowKeccakAir {
+            log_height: 13,
+            program,
+            merkle_witness: vec![([7, 8, 9, 10], true)],
+        };
+        let mut trace = air.generate_trace::<F>(0);
+        // Flip a sibling bit on an injection row (perm 1 boundary block =
+        // block 24, row 24*128 + 5).
+        let row = 24 * 128 + 5;
+        trace.values[row * NARROW_WIDTH + SIB_OFF + 2] += F::ONE;
+        let report = check_all_constraints(&air, &trace, &[], Some(10));
+        assert!(!report.is_ok(), "sibling corruption not caught");
+
+        // Path bit drift mid-perm must be caught by the constancy rule.
+        let mut trace2 = air.generate_trace::<F>(0);
+        let row2 = 24 * 128 + 700; // inside perm 1, not a boundary
+        trace2.values[row2 * NARROW_WIDTH + PBIT_COL] += F::ONE;
+        let report2 = check_all_constraints(&air, &trace2, &[], Some(10));
+        assert!(!report2.is_ok(), "path-bit drift not caught");
+    }
+
     /// Full-permutation check across a 24-block group.
     #[test]
     fn chain_matches_reference_permutation() {
-        let air = NarrowKeccakAir { log_height: 13 }; // 64 blocks >= 2*24
+        let air = NarrowKeccakAir::chain_only(13); // 64 blocks >= 2*24
         let trace = air.generate_trace::<F>(0);
         let input = NarrowKeccakAir::extract_state(&trace, 0);
         let output = NarrowKeccakAir::extract_state(&trace, 24);

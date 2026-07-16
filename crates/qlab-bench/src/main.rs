@@ -880,7 +880,9 @@ fn main() {
             return;
         }
         "levers" => {
-            levers::run_levers(&power);
+            let only_pos = args.iter().position(|a| a == "--only");
+            let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
+            levers::run_levers(&power, only);
             return;
         }
         "narrow" => {

@@ -84,6 +84,19 @@ pub fn round(a: &[u64; 25], rc: u64) -> [u64; 25] {
     out
 }
 
+/// Merkle node hash as the narrow AIR instantiates it: Keccak-256 with
+/// the ORIGINAL pad10*1 (Ethereum-style), single 512-bit block of
+/// left(256) || right(256); digest = lanes 0..4 of the permuted state.
+/// Returns the full output state (the AIR chains states, not digests).
+pub fn merkle_node_state(left: &[u64; 4], right: &[u64; 4]) -> [u64; 25] {
+    let mut st = [0u64; 25];
+    st[..4].copy_from_slice(left);
+    st[4..8].copy_from_slice(right);
+    st[8] = 1; // pad10*1: bit 512
+    st[16] = 1 << 63; // pad10*1: bit 1087
+    keccak_f(&st)
+}
+
 /// Full Keccak-f[1600]: 24 rounds.
 pub fn keccak_f(a: &[u64; 25]) -> [u64; 25] {
     let mut s = *a;

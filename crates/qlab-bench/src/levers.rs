@@ -46,7 +46,7 @@ const G0: FriCfg = FriCfg {
 
 /// The lever matrix. Every config clears >= 100 bits conjectured
 /// (runtime-asserted in `make_config_with`).
-const LEVER_CFGS: [(&str, FriCfg); 7] = [
+const LEVER_CFGS: [(&str, FriCfg); 8] = [
     ("G0 (M1.5 anchor)", G0),
     // Lever (a): blowup 32, 18 queries (18 x 5 + 10 = 100 bits).
     (
@@ -79,6 +79,18 @@ const LEVER_CFGS: [(&str, FriCfg); 7] = [
         FriCfg {
             max_log_arity: 4,
             ..G0
+        },
+    ),
+    // The decided consensus config (2026-07-17, qumbra-design
+    // self-proving-vs-proof-size: branch (b)).
+    (
+        "C: consensus b16/q20/g20",
+        FriCfg {
+            log_blowup: 4,
+            num_queries: 20,
+            grind_bits: 20,
+            log_final_poly_len: 4,
+            max_log_arity: 4,
         },
     ),
     // Both levers combined.
@@ -132,6 +144,18 @@ const N160: Layout = Layout {
 /// its geometry so the real AIR has a like-for-like size anchor. (Named
 /// P-real: the width tracks qlab-air — 371 in M1.5b, 402 since M1.5c's
 /// in-trace RC ring.)
+/// M3 step-0 geometry estimate: the full 2x2-bucket circuit over the
+/// narrow-Keccak pipeline — current AIR (402) + perm-role program ring
+/// (~96) + boundary message register + witness lanes (siblings, path
+/// bits, note fields) + balance gadget (~60-70 combined). Projection
+/// cell; the M3 design doc carries the budget derivation.
+const M3E: Layout = Layout {
+    name: "M3-est",
+    width: 520, // step-2 realized 502 + step-3 budget (absorb wiring,
+    // note-field witness lanes, balance + binding accumulators ~18)
+    rows_per_perm: 3072,
+};
+
 const P371: Layout = Layout {
     name: "P-real",
     width: qlab_air::narrow::NARROW_WIDTH,
@@ -152,7 +176,31 @@ impl LeverRow {
     }
 }
 
-fn measure(cfg_name: &'static str, cfg: &FriCfg, layout: &Layout) -> LeverRow {
+/// LDE working sets beyond this are SIGKILL territory on the 36 GiB rig
+/// (the M3-est 560-col x 2^19 x b32 cell measured that the hard way) —
+/// catch_unwind cannot catch the OOM killer, so guard analytically.
+const MEM_GUARD_BYTES: usize = 30 << 30;
+
+fn lde_bytes(width: usize, rows_per_perm: usize, log_blowup: usize) -> usize {
+    let rows = (GEOMETRY_PERMS * rows_per_perm).next_power_of_two();
+    width * rows * (1 << log_blowup) * 4
+}
+
+fn measure(cfg_name: &'static str, cfg: &FriCfg, layout: &Layout) -> Option<LeverRow> {
+    if lde_bytes(layout.width, layout.rows_per_perm, cfg.log_blowup) > MEM_GUARD_BYTES {
+        eprintln!(
+            "  [{} {}] SKIPPED: estimated LDE {} GB exceeds the {} GB memory guard",
+            layout.name,
+            cfg.label(),
+            lde_bytes(layout.width, layout.rows_per_perm, cfg.log_blowup) >> 30,
+            MEM_GUARD_BYTES >> 30,
+        );
+        return None;
+    }
+    Some(measure_inner(cfg_name, cfg, layout))
+}
+
+fn measure_inner(cfg_name: &'static str, cfg: &FriCfg, layout: &Layout) -> LeverRow {
     let air = GeometryAir {
         width: layout.width,
         rows_per_perm: layout.rows_per_perm,
@@ -176,7 +224,7 @@ fn measure(cfg_name: &'static str, cfg: &FriCfg, layout: &Layout) -> LeverRow {
     }
 }
 
-pub(crate) fn run_levers(power: &str) {
+pub(crate) fn run_levers(power: &str, only: Option<&str>) {
     println!("# qumbra-lab M1.6 non-geometry levers (blowup 32, FRI arity)");
     println!();
     crate::print_env(power);
@@ -203,11 +251,16 @@ pub(crate) fn run_levers(power: &str) {
     );
     println!();
 
-    let narrow: [&Layout; 6] = [&LADDER[2], &LADDER[3], &LADDER[4], &L6, &N160, &P371];
+    let narrow: [&Layout; 7] = [&LADDER[2], &LADDER[3], &LADDER[4], &L6, &N160, &P371, &M3E];
     let keccak_air = KeccakAir {};
 
     let mut rows: Vec<LeverRow> = Vec::new();
     for (cfg_name, cfg) in &LEVER_CFGS {
+        if let Some(f) = only {
+            if !cfg_name.contains(f) {
+                continue;
+            }
+        }
         eprintln!("== levers: {cfg_name} ({}) ==", cfg.label());
         // Real-AIR sanity cell for this config.
         let config = make_config_with(cfg);
@@ -222,16 +275,17 @@ pub(crate) fn run_levers(power: &str) {
             cell: real_cell,
         });
         for layout in narrow {
-            rows.push(measure(cfg_name, cfg, layout));
+            if let Some(row) = measure(cfg_name, cfg, layout) {
+                rows.push(row);
+            }
         }
     }
 
     // Baseline (G0) proof size per layout, for the delta column.
-    let g0_kb = |layout: &str| -> f64 {
+    let g0_kb = |layout: &str| -> Option<f64> {
         rows.iter()
             .find(|r| r.cfg_name == LEVER_CFGS[0].0 && r.layout == layout)
-            .expect("G0 rows are measured first")
-            .proof_kb()
+            .map(|r| r.proof_kb())
     };
 
     println!(
@@ -241,14 +295,14 @@ pub(crate) fn run_levers(power: &str) {
     println!("|---|---|---|---|---|---|---|---|---|");
     for r in &rows {
         let bits = r.cfg.num_queries * r.cfg.log_blowup + r.cfg.grind_bits;
-        let delta = r.proof_kb() - g0_kb(r.layout);
+        let delta = g0_kb(r.layout).map(|g| r.proof_kb() - g);
         let verdict = if r.proof_kb() <= TARGET_KB {
             "PASS"
         } else {
             "FAIL"
         };
         println!(
-            "| {} ({}) | {} | {} | {} | {:.1} | {:.1} | {:.1} | {:+.1} | {} |",
+            "| {} ({}) | {} | {} | {} | {:.1} | {:.1} | {:.1} | {} | {} |",
             r.cfg_name,
             r.cfg.label(),
             bits,
@@ -257,7 +311,7 @@ pub(crate) fn run_levers(power: &str) {
             r.cell.prove_ms,
             r.cell.verify_ms,
             r.proof_kb(),
-            delta,
+            delta.map_or("n/a".to_string(), |d| format!("{d:+.1}")),
             verdict,
         );
     }
@@ -270,17 +324,26 @@ pub(crate) fn run_levers(power: &str) {
         .filter(|r| r.layout != "real")
         .min_by(|a, b| a.cell.proof_bytes.cmp(&b.cell.proof_bytes))
         .expect("matrix is non-empty");
-    let g0_floor = g0_kb("L4");
-    println!(
-        "Best cell: {} @ {} ({}) = {:.1} KB — {:+.1} KB vs the M1.5 floor \
-         ({:.1} KB @ L4).",
-        best.layout,
-        best.cfg_name,
-        best.cfg.label(),
-        best.proof_kb(),
-        best.proof_kb() - g0_floor,
-        g0_floor,
-    );
+    if let Some(g0_floor) = g0_kb("L4") {
+        println!(
+            "Best cell: {} @ {} ({}) = {:.1} KB — {:+.1} KB vs the M1.5 floor \
+             ({:.1} KB @ L4).",
+            best.layout,
+            best.cfg_name,
+            best.cfg.label(),
+            best.proof_kb(),
+            best.proof_kb() - g0_floor,
+            g0_floor,
+        );
+    } else {
+        println!(
+            "Best cell: {} @ {} ({}) = {:.1} KB.",
+            best.layout,
+            best.cfg_name,
+            best.cfg.label(),
+            best.proof_kb(),
+        );
+    }
     if best.proof_kb() <= TARGET_KB {
         println!(
             "Verdict: <= {TARGET_KB:.0} KB REACHED with non-geometry levers -> \
