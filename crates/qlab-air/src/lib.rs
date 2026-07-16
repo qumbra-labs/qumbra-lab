@@ -4,3 +4,10 @@
 //!
 //! M1 instantiates this over Poseidon2 (baseline) and the conservative
 //! candidates (Keccak-f, SHA-256, BLAKE3 raw-AIR). See repo README.
+//!
+//! M1.5b adds the first real primitive: `narrow::NarrowKeccakAir`, a
+//! correct-semantics Keccak-f[1600] at 371 columns (vs the published
+//! 2,633-column AIR), validated against `reference::keccak_f`.
+
+pub mod narrow;
+pub mod reference;

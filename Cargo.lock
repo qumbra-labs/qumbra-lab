@@ -573,6 +573,14 @@ dependencies = [
 [[package]]
 name = "qlab-air"
 version = "0.0.0"
+dependencies = [
+ "p3-air",
+ "p3-field",
+ "p3-keccak",
+ "p3-koala-bear",
+ "p3-matrix",
+ "p3-symmetric",
+]
 
 [[package]]
 name = "qlab-bench"
