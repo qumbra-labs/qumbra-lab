@@ -1,0 +1,8 @@
+[package]
+name = "qlab-bench"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+qlab-air = { path = "../qlab-air" }

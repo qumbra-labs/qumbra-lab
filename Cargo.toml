@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = ["crates/qlab-air", "crates/qlab-bench"]
+
+[workspace.package]
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+# Plonky3 deps intentionally NOT pinned yet — M1 starts by selecting and
+# pinning exact revs (bench numbers are meaningless against a moving prover).
