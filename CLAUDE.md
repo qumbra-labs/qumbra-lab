@@ -16,8 +16,8 @@ A 2026 greenfield design for a post-quantum privacy L1: note-based UTXO, one glo
 
 The eight design docs are the **binding spec** for this repo:
 
-- GitHub: [`lai3d/bidot-blockchains-design/qumbra/`](https://github.com/lai3d/bidot-blockchains-design/tree/main/qumbra)
-- Local clone: `~/develop/bidot-blochains/bidot-blockchains-design/qumbra/`
+- GitHub: [`lai3d/qumbra-design`](https://github.com/lai3d/qumbra-design) (extracted 2026-07 from the bidot-blockchains-design notebook, history preserved)
+- Local clone: `~/develop/qumbra/qumbra-design/`
 
 Before touching the AIR, read at minimum: `transaction-model-and-anonymity-set.md` (the circuit's statement) and `performance-budget.md` (targets + the hash-choice framework). `benchmark-survey-2026-07.md` holds the sourced third-party numbers M1 validates against. Docs are EN with `-zh` pairs; EN is authoritative on technical details.
 
@@ -34,7 +34,7 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
 
 ## Milestones
 
-- **M1** (current): circuit prototype + hash matrix. Deliverable: measured trace dims / proving wall-clock / peak memory / proof size per hash candidate, written back to the design repo as `qumbra/prototype-bench-M1.md` (EN+ZH pair, matching that repo's conventions).
+- **M1** (current): circuit prototype + hash matrix. Deliverable: measured trace dims / proving wall-clock / peak memory / proof size per hash candidate, written back to the design repo (qumbra-design) as `prototype-bench-M1.md` (EN+ZH pair, matching that repo's conventions).
 - **M2**: phone-class proving — go/no-go on the 15 s target; fallback ladder already defined in performance-budget §4.
 - Out of scope until the docs say otherwise: recursion/aggregation, note encryption, networking, consensus.
 
