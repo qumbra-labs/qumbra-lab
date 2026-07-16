@@ -152,7 +152,7 @@ pub(crate) fn run_narrow(power: &str, only: Option<&str>) {
                 continue;
             }
         }
-        let air = NarrowKeccakAir { log_height };
+        let air = NarrowKeccakAir::chain_only(log_height);
         let config = make_config_with(cfg);
         let bits = cfg.num_queries * cfg.log_blowup + cfg.grind_bits;
 
@@ -228,7 +228,7 @@ mod tests {
     /// builds also run check_constraints inside prove.
     #[test]
     fn narrow_air_prove_verify_roundtrip() {
-        let air = NarrowKeccakAir { log_height: 10 };
+        let air = NarrowKeccakAir::chain_only(10);
         let cfg = FriCfg {
             log_blowup: 2,
             num_queries: 45,
