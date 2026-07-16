@@ -97,6 +97,16 @@ already a single self-contained binary, which is the easy case.
 3. **Simulator** (`aarch64-apple-ios-sim`): runs at host-Mac speed —
    useless for numbers, fine for smoke-testing the harness.
 
+**Toolchain validated phone-free (2026-07-17, this Mac, Xcode 26.6 /
+iOS 26.3 SDK):** `aarch64-apple-ios` and `aarch64-apple-ios-sim` both
+cross-compile the whole workspace clean; the bench binary runs in the
+iPhone 17 Pro *simulator* via `xcrun simctl spawn` (`narrow --only
+b4/q40`) and produces a proof **byte-identical to native** (238.5 KB) —
+determinism holds across targets, and the b4 cell's 3.9 GB working set
+poses no host-side surprise. Simulator timing is host-speed and
+recorded as meaningless. Remaining device-only unknowns: jetsam
+ceiling with the entitlement, real prove time, thermals.
+
 **Methodology on device:** one config per launch (`--only`); log
 `ProcessInfo.thermalState` before/after each run; cold-start runs,
 airplane mode, charger attached and reported per the bench discipline
