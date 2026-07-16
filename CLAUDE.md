@@ -34,8 +34,9 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
 
 ## Milestones
 
-- **M1** (current): circuit prototype + hash matrix. Deliverable: measured trace dims / proving wall-clock / peak memory / proof size per hash candidate, written back to the design repo (qumbra-design) as `prototype-bench-M1.md` (EN+ZH pair, matching that repo's conventions).
-- **M2**: phone-class proving — go/no-go on the 15 s target; fallback ladder already defined in performance-budget §4.
+- **M1 — DONE (2026-07-16, PRs #1/#2/#3 + qumbra-design's `prototype-bench-M1.md`)**: proving time is a non-issue (49 ms Keccak, 10–60× margin); proof size is the binding constraint. Keccak = only live conservative candidate (BLAKE3 eliminated by 173 KB zeta floor; SHA-256 has no AIR); narrow-layout geometry floor **172.5 KB** (U-curve @ 164 cols, probe calibrated −0.005%) vs 55 KB Poseidon2 vs ≤150 KB target.
+- **M1.6 (next)**: close the last 22.5 KB with non-geometry levers, each a rig cell: (a) blowup 32 / 18 queries; (b) FRI arity > 2 (`max_log_arity` exists in 0.6.1) — attacks the fold-rounds/path term that created the U-curve; (c) truncated Merkle digest (needs its own security argument); (d) WHIR-class PCS (external maturity gate). Success → M1.5b (correct narrow-Keccak AIR implementation) becomes justified; failure → the 150 KB target or the conservative-hash decision goes back to qumbra-design for an explicit revision doc.
+- **M2**: phone-class proving — go/no-go on the 15 s target; heavily de-risked by M1's laptop numbers; fallback ladder in performance-budget §4.
 - Out of scope until the docs say otherwise: recursion/aggregation, note encryption, networking, consensus.
 
 ## Bench discipline (non-negotiable)
