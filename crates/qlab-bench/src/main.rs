@@ -10,6 +10,7 @@
 //! has no published Plonky3 crate at 0.6.1, so the matrix here is the three
 //! published AIRs; SHA-256 is a later task.
 
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
 
 use p3_air::{Air, DebugConstraintBuilder};
@@ -30,11 +31,12 @@ use p3_merkle_tree::MerkleTreeMmcs;
 use p3_poseidon2_air::{Poseidon2Air, RoundConstants};
 use p3_symmetric::{CompressionFunctionFromHasher, PaddingFreeSponge, SerializingHasher};
 use p3_uni_stark::{
-    prove, verify, ProverConstraintFolder, StarkConfig, SymbolicAirBuilder,
+    prove, verify, Proof, ProverConstraintFolder, StarkConfig, SymbolicAirBuilder,
     VerifierConstraintFolder,
 };
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
+use serde::Serialize;
 
 // ---------------------------------------------------------------------------
 // Shared prover configuration — identical for all three hash AIRs.
@@ -83,7 +85,92 @@ const LOG_BLOWUP: usize = 1;
 const NUM_QUERIES: usize = 90;
 const QUERY_POW_BITS: usize = 10;
 
-fn make_config() -> Config {
+/// One point in the FRI parameter sweep. Everything else (field, extension,
+/// DFT, Merkle hash) is held fixed — only FRI parameters vary.
+#[derive(Clone, Copy)]
+struct FriCfg {
+    log_blowup: usize,
+    num_queries: usize,
+    grind_bits: usize,
+    /// log2 of the final polynomial length — stops FRI folding early,
+    /// trading commit-phase Merkle paths for plaintext final-poly coeffs.
+    log_final_poly_len: usize,
+}
+
+impl FriCfg {
+    fn label(&self) -> String {
+        let mut s = format!(
+            "b{}/q{}/g{}",
+            1 << self.log_blowup,
+            self.num_queries,
+            self.grind_bits
+        );
+        if self.log_final_poly_len > 0 {
+            s.push_str(&format!("/fp{}", 1 << self.log_final_poly_len));
+        }
+        s
+    }
+}
+
+/// The PR #1 baseline configuration (what the default matrix mode uses).
+const BASELINE_CFG: FriCfg = FriCfg {
+    log_blowup: LOG_BLOWUP,
+    num_queries: NUM_QUERIES,
+    grind_bits: QUERY_POW_BITS,
+    log_final_poly_len: 0,
+};
+
+/// The sweep: every point satisfies >= 100 bits conjectured
+/// (num_queries * log2(blowup) + grind, asserted at runtime in
+/// `make_config_with`). Two `log_final_poly_len` variants probe the
+/// early-stop knob (available in 0.6.1 `FriParameters`).
+const SWEEP_CFGS: [FriCfg; 7] = [
+    // blowup 2, 90 queries, grind 10 — the PR #1 baseline (100 bits).
+    BASELINE_CFG,
+    // blowup 4, 45 queries, grind 10 (100 bits).
+    FriCfg {
+        log_blowup: 2,
+        num_queries: 45,
+        grind_bits: 10,
+        log_final_poly_len: 0,
+    },
+    // blowup 8, 30 queries, grind 10 (100 bits).
+    FriCfg {
+        log_blowup: 3,
+        num_queries: 30,
+        grind_bits: 10,
+        log_final_poly_len: 0,
+    },
+    // blowup 16, 23 queries, grind 10 (102 bits).
+    FriCfg {
+        log_blowup: 4,
+        num_queries: 23,
+        grind_bits: 10,
+        log_final_poly_len: 0,
+    },
+    // blowup 4, 40 queries, grind 20 (100 bits).
+    FriCfg {
+        log_blowup: 2,
+        num_queries: 40,
+        grind_bits: 20,
+        log_final_poly_len: 0,
+    },
+    // Early-stop variants: stop FRI folding at a 16-coefficient final poly.
+    FriCfg {
+        log_blowup: 2,
+        num_queries: 45,
+        grind_bits: 10,
+        log_final_poly_len: 4,
+    },
+    FriCfg {
+        log_blowup: 4,
+        num_queries: 23,
+        grind_bits: 10,
+        log_final_poly_len: 4,
+    },
+];
+
+fn make_config_with(cfg: &FriCfg) -> Config {
     let byte_hash = ByteHash {};
     let u64_hash = U64Hash::new(KeccakF {});
     let field_hash = FieldHash::new(u64_hash);
@@ -93,18 +180,28 @@ fn make_config() -> Config {
     let challenger = Challenger::from_hasher(vec![], byte_hash);
 
     let fri_params = FriParameters {
-        log_blowup: LOG_BLOWUP,
-        log_final_poly_len: 0,
+        log_blowup: cfg.log_blowup,
+        log_final_poly_len: cfg.log_final_poly_len,
         max_log_arity: 1,
-        num_queries: NUM_QUERIES,
+        num_queries: cfg.num_queries,
         commit_proof_of_work_bits: 0,
-        query_proof_of_work_bits: QUERY_POW_BITS,
+        query_proof_of_work_bits: cfg.grind_bits,
         mmcs: challenge_mmcs,
     };
-    assert_eq!(fri_params.conjectured_soundness_bits(), 100);
+    // Every config in this rig must clear ~100-bit conjectured security.
+    assert!(
+        fri_params.conjectured_soundness_bits() >= 100,
+        "config {} is only {} bits conjectured",
+        cfg.label(),
+        fri_params.conjectured_soundness_bits(),
+    );
 
     let pcs = Pcs::new(Dft::default(), val_mmcs, fri_params);
     Config::new(pcs, challenger)
+}
+
+fn make_config() -> Config {
+    make_config_with(&BASELINE_CFG)
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +283,355 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Sweep mode: FRI-config sweep at 128 permutations.
+// ---------------------------------------------------------------------------
+
+/// Number of permutations used by sweep + breakdown modes: the workload that
+/// approximates the design's ~90-hash 2x2-bucket circuit.
+const SWEEP_PERMS: usize = 128;
+
+struct SweepRow {
+    hash: &'static str,
+    cfg: FriCfg,
+    /// None => the config FAILED to prove (panic caught; reported honestly).
+    prove_ms: Option<f64>,
+    proof_bytes: Option<usize>,
+    note: String,
+}
+
+/// Prove one (hash, FRI-config) cell: best of `RUNS` in-process runs.
+/// A panic inside prove (memory, API limits) is caught and reported as a
+/// FAILED row rather than aborting the sweep.
+fn sweep_cell<A>(
+    air: &A,
+    hash: &'static str,
+    cfg: &FriCfg,
+    gen_trace: &dyn Fn(usize) -> RowMajorMatrix<Val>,
+) -> SweepRow
+where
+    A: Air<SymbolicAirBuilder<Val>>
+        + for<'a> Air<ProverConstraintFolder<'a, Config>>
+        + for<'a> Air<VerifierConstraintFolder<'a, Config>>
+        + for<'a> Air<DebugConstraintBuilder<'a, Val>>,
+{
+    let config = make_config_with(cfg);
+    let mut best_prove = f64::INFINITY;
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let mut proof_opt = None;
+        for _ in 0..RUNS {
+            let trace = gen_trace(cfg.log_blowup);
+            let t = Instant::now();
+            let proof = prove(&config, air, trace, &[]);
+            best_prove = best_prove.min(t.elapsed().as_secs_f64() * 1e3);
+            proof_opt = Some(proof);
+        }
+        proof_opt.expect("RUNS > 0")
+    }));
+
+    match result {
+        Ok(proof) => {
+            let proof_bytes = postcard::to_allocvec(&proof)
+                .expect("proof serialization failed")
+                .len();
+            let mut note = String::new();
+            if let Err(e) = verify(&config, air, &proof, &[]) {
+                note = format!("VERIFY FAILED: {e:?}");
+            } else if best_prove > 3000.0 {
+                note = "exceeds 3,000 ms laptop target".to_string();
+            }
+            eprintln!(
+                "  [{hash} {}] prove={best_prove:.1}ms proof={proof_bytes}B {note}",
+                cfg.label(),
+            );
+            SweepRow {
+                hash,
+                cfg: *cfg,
+                prove_ms: Some(best_prove),
+                proof_bytes: Some(proof_bytes),
+                note,
+            }
+        }
+        Err(_) => {
+            eprintln!("  [{hash} {}] FAILED (panic during prove)", cfg.label());
+            SweepRow {
+                hash,
+                cfg: *cfg,
+                prove_ms: None,
+                proof_bytes: None,
+                note: "FAILED: panic during prove (see stderr)".to_string(),
+            }
+        }
+    }
+}
+
+fn print_sweep_table(rows: &[SweepRow]) {
+    println!("| hash | blowup | queries | grind | final poly | conj. bits | prove ms | proof KB |");
+    println!("|---|---|---|---|---|---|---|---|");
+    for r in rows {
+        let bits = r.cfg.num_queries * r.cfg.log_blowup + r.cfg.grind_bits;
+        let (prove, size) = match (r.prove_ms, r.proof_bytes) {
+            (Some(ms), Some(b)) => (format!("{ms:.1}"), format!("{:.1}", b as f64 / 1024.0)),
+            _ => ("FAILED".to_string(), "FAILED".to_string()),
+        };
+        println!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            r.hash,
+            1 << r.cfg.log_blowup,
+            r.cfg.num_queries,
+            r.cfg.grind_bits,
+            1 << r.cfg.log_final_poly_len,
+            bits,
+            prove,
+            size,
+        );
+    }
+    println!();
+    let notes: Vec<&SweepRow> = rows.iter().filter(|r| !r.note.is_empty()).collect();
+    if !notes.is_empty() {
+        println!("Notes:");
+        for r in notes {
+            println!("- {} {}: {}", r.hash, r.cfg.label(), r.note);
+        }
+        println!();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Breakdown mode: serialize the proof's components separately.
+//
+// p3-uni-stark 0.6.1 `Proof` nesting (all fields public):
+//   commitments: { trace, quotient_chunks, random }          -- Merkle roots
+//   opened_values: trace/quotient evals at zeta, g*zeta      -- Challenge elems
+//   opening_proof: FriProof {
+//     commit_phase_commits: Vec<Com>,                        -- FRI fold roots
+//     commit_pow_witnesses: Vec<Val>,
+//     query_proofs: Vec<QueryProof {
+//       input_proof: Vec<BatchOpening {                      -- per batch
+//         opened_values: Vec<Vec<Val>>,                      --   full LDE rows
+//         opening_proof,                                     --   Merkle path
+//       }>,
+//       commit_phase_openings: Vec<CommitPhaseProofStep {
+//         log_arity, sibling_values, opening_proof           -- fold siblings+path
+//       }>,
+//     }>,
+//     final_poly: Vec<Challenge>,
+//     query_pow_witness: Val,
+//   }
+//   degree_bits: usize
+//
+// Components are measured by serializing each substructure with the same
+// postcard codec as the total; the small mismatch (outer Vec length varints
+// etc.) is reported honestly as a residual.
+// ---------------------------------------------------------------------------
+
+fn pc_len<T: Serialize + ?Sized>(v: &T) -> usize {
+    postcard::to_allocvec(v)
+        .expect("serialization failed")
+        .len()
+}
+
+struct Breakdown {
+    total: usize,
+    /// Trace + quotient (and optional random) Merkle roots.
+    commitments: usize,
+    /// Out-of-domain openings at zeta / g*zeta (trace + quotient chunks).
+    zeta_opened: usize,
+    /// Per-query opened LDE rows across all committed matrices.
+    query_input_values: usize,
+    /// Merkle paths authenticating the per-query input rows.
+    query_input_paths: usize,
+    /// FRI commit-phase Merkle roots (one per fold round).
+    fri_commits: usize,
+    /// FRI fold sibling values (+ 1 arity tag byte per step).
+    fri_sibling_values: usize,
+    /// Merkle paths for the FRI commit-phase openings.
+    fri_fold_paths: usize,
+    /// Final polynomial coefficients (Challenge elements, plaintext).
+    final_poly: usize,
+    /// Commit-phase + query PoW witnesses.
+    pow: usize,
+    /// degree_bits + serde framing not attributable to any component.
+    residual: usize,
+}
+
+fn breakdown_proof(proof: &Proof<Config>) -> Breakdown {
+    let total = pc_len(proof);
+    let commitments = pc_len(&proof.commitments);
+    let zeta_opened = pc_len(&proof.opened_values);
+    let fri = &proof.opening_proof;
+    let fri_commits = pc_len(&fri.commit_phase_commits);
+    let final_poly = pc_len(&fri.final_poly);
+    let pow = pc_len(&fri.commit_pow_witnesses) + pc_len(&fri.query_pow_witness);
+
+    let mut query_input_values = 0;
+    let mut query_input_paths = 0;
+    let mut fri_sibling_values = 0;
+    let mut fri_fold_paths = 0;
+    for q in &fri.query_proofs {
+        for batch in &q.input_proof {
+            query_input_values += pc_len(&batch.opened_values);
+            query_input_paths += pc_len(&batch.opening_proof);
+        }
+        for step in &q.commit_phase_openings {
+            // log_arity is a u8: 1 byte in postcard.
+            fri_sibling_values += 1 + pc_len(&step.sibling_values);
+            fri_fold_paths += pc_len(&step.opening_proof);
+        }
+    }
+
+    let accounted = commitments
+        + zeta_opened
+        + query_input_values
+        + query_input_paths
+        + fri_commits
+        + fri_sibling_values
+        + fri_fold_paths
+        + final_poly
+        + pow;
+    let residual = total.saturating_sub(accounted);
+
+    Breakdown {
+        total,
+        commitments,
+        zeta_opened,
+        query_input_values,
+        query_input_paths,
+        fri_commits,
+        fri_sibling_values,
+        fri_fold_paths,
+        final_poly,
+        pow,
+        residual,
+    }
+}
+
+fn print_breakdown_detail(hash: &str, cfg_label: &str, b: &Breakdown) {
+    let kb = |x: usize| x as f64 / 1024.0;
+    let pct = |x: usize| 100.0 * x as f64 / b.total as f64;
+    println!("### {hash} @ {cfg_label}");
+    println!();
+    println!("| component | KB | % |");
+    println!("|---|---|---|");
+    let rows: [(&str, usize); 10] = [
+        ("trace + quotient commitments (Merkle roots)", b.commitments),
+        (
+            "opened values at zeta (trace + quotient OOD evals)",
+            b.zeta_opened,
+        ),
+        (
+            "per-query input row openings (all committed matrices)",
+            b.query_input_values,
+        ),
+        ("per-query input Merkle paths", b.query_input_paths),
+        ("FRI commit-phase commitments", b.fri_commits),
+        ("FRI fold sibling values", b.fri_sibling_values),
+        ("FRI fold Merkle paths", b.fri_fold_paths),
+        ("FRI final poly", b.final_poly),
+        ("PoW witnesses", b.pow),
+        ("degree_bits + serde framing (residual)", b.residual),
+    ];
+    for (name, bytes) in rows {
+        println!("| {} | {:.1} | {:.1} |", name, kb(bytes), pct(bytes));
+    }
+    println!("| **total** | **{:.1}** | 100.0 |", kb(b.total));
+    println!();
+}
+
+/// Prove `air` once under `cfg` (no timing; breakdown only needs the proof).
+fn prove_for_breakdown<A>(
+    air: &A,
+    cfg: &FriCfg,
+    gen_trace: &dyn Fn(usize) -> RowMajorMatrix<Val>,
+) -> Option<Proof<Config>>
+where
+    A: Air<SymbolicAirBuilder<Val>>
+        + for<'a> Air<ProverConstraintFolder<'a, Config>>
+        + for<'a> Air<VerifierConstraintFolder<'a, Config>>
+        + for<'a> Air<DebugConstraintBuilder<'a, Val>>,
+{
+    let config = make_config_with(cfg);
+    catch_unwind(AssertUnwindSafe(|| {
+        let trace = gen_trace(cfg.log_blowup);
+        prove(&config, air, trace, &[])
+    }))
+    .ok()
+}
+
+/// Breakdown rows for one hash: the baseline config plus the best
+/// (smallest-proof) config among the sweep set.
+fn breakdown_air<A>(
+    air: &A,
+    hash: &'static str,
+    gen_trace: &dyn Fn(usize) -> RowMajorMatrix<Val>,
+) -> Vec<(String, Breakdown)>
+where
+    A: Air<SymbolicAirBuilder<Val>>
+        + for<'a> Air<ProverConstraintFolder<'a, Config>>
+        + for<'a> Air<VerifierConstraintFolder<'a, Config>>
+        + for<'a> Air<DebugConstraintBuilder<'a, Val>>,
+{
+    let mut out = Vec::new();
+
+    eprintln!("  [{hash}] proving baseline {}", BASELINE_CFG.label());
+    let baseline =
+        prove_for_breakdown(air, &BASELINE_CFG, gen_trace).expect("baseline config must prove");
+    out.push((
+        format!("{} (baseline)", BASELINE_CFG.label()),
+        breakdown_proof(&baseline),
+    ));
+
+    // Find the smallest-proof swept config by proving each candidate once.
+    let mut best: Option<(FriCfg, Proof<Config>, usize)> = None;
+    for cfg in SWEEP_CFGS.iter().skip(1) {
+        eprintln!("  [{hash}] proving candidate {}", cfg.label());
+        match prove_for_breakdown(air, cfg, gen_trace) {
+            Some(proof) => {
+                let bytes = pc_len(&proof);
+                if best.as_ref().is_none_or(|(_, _, b)| bytes < *b) {
+                    best = Some((*cfg, proof, bytes));
+                }
+            }
+            None => eprintln!("  [{hash}] candidate {} FAILED, skipping", cfg.label()),
+        }
+    }
+    let (cfg, proof, _) = best.expect("at least one swept config must prove");
+    out.push((
+        format!("{} (best swept)", cfg.label()),
+        breakdown_proof(&proof),
+    ));
+
+    out
+}
+
+fn print_breakdown_summary(rows: &[(&'static str, String, Breakdown)]) {
+    println!("| hash | config | total KB | opened-values KB | merkle-paths KB | fri-commits KB | other KB |");
+    println!("|---|---|---|---|---|---|---|");
+    for (hash, cfg, b) in rows {
+        let opened = b.zeta_opened + b.query_input_values;
+        let paths = b.query_input_paths + b.fri_fold_paths;
+        let other = b.total - opened - paths - b.fri_commits;
+        println!(
+            "| {} | {} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |",
+            hash,
+            cfg,
+            b.total as f64 / 1024.0,
+            opened as f64 / 1024.0,
+            paths as f64 / 1024.0,
+            b.fri_commits as f64 / 1024.0,
+            other as f64 / 1024.0,
+        );
+    }
+    println!();
+    println!(
+        "Column mapping: opened-values = OOD (zeta) openings + per-query input rows; \
+         merkle-paths = input-opening paths + FRI fold paths; fri-commits = FRI \
+         commit-phase Merkle roots; other = trace/quotient roots + FRI fold sibling \
+         values + final poly + PoW witnesses + serde framing."
+    );
+    println!();
+}
+
+// ---------------------------------------------------------------------------
 // Workloads
 //
 // (a) 128 permutations: smallest power of two >= 96, approximating the
@@ -233,7 +679,7 @@ fn cmd_out(cmd: &str, args: &[&str]) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn print_header(power: &str) {
+fn print_env(power: &str) {
     let cpu = cmd_out("sysctl", &["-n", "machdep.cpu.brand_string"]);
     let mem = cmd_out("sysctl", &["-n", "hw.memsize"]);
     let mem_gb = mem
@@ -251,14 +697,17 @@ fn print_header(power: &str) {
             "HEAD",
         ],
     );
-
-    println!("# qumbra-lab M1 hash-matrix bench");
-    println!();
     println!("- hardware: {cpu}, {mem_gb} RAM");
     println!("- OS: macOS {os}");
     println!("- qumbra-lab rev: {rev}");
     println!("- prover: Plonky3 0.6.1 (pinned in Cargo.lock)");
     println!("- power state: {power}");
+}
+
+fn print_header(power: &str) {
+    println!("# qumbra-lab M1 hash-matrix bench");
+    println!();
+    print_env(power);
     println!(
         "- shared config: KoalaBear + degree-4 extension, Keccak-256 FRI Merkle, \
          blowup {}, {} queries, {}-bit query grind => {} bits conjectured \
@@ -306,22 +755,112 @@ fn print_table(cells: &[Cell]) {
 
 fn main() {
     // --power <note>: manual power-state annotation (AC/battery, thermal).
+    // First positional arg selects the mode: (none) = hash matrix,
+    // `sweep` = FRI-config sweep, `breakdown` = proof-size breakdown.
     let args: Vec<String> = std::env::args().collect();
-    let power = args
-        .iter()
-        .position(|a| a == "--power")
+    let power_pos = args.iter().position(|a| a == "--power");
+    let power = power_pos
         .and_then(|i| args.get(i + 1))
         .map(String::as_str)
         .unwrap_or("unspecified (record manually: AC/battery, thermal)")
         .to_string();
-
-    let config = make_config();
+    let mode = args
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(i, a)| !a.starts_with("--") && power_pos.is_none_or(|p| *i != p + 1))
+        .map(|(_, a)| a.as_str())
+        .unwrap_or("matrix")
+        .to_string();
 
     // Poseidon2 round constants: fixed seed so every run proves the same AIR.
     let mut rng = SmallRng::seed_from_u64(42);
     let p2_air: QPoseidon2Air = Poseidon2Air::new(RoundConstants::from_rng(&mut rng));
     let keccak_air = KeccakAir {};
     let blake3_air = Blake3Air {};
+
+    // Per-hash trace generators at the sweep workload (128 permutations),
+    // parametrized on log_blowup (= extra_capacity_bits for the LDE).
+    let gen_keccak =
+        |lb: usize| p3_keccak_air::generate_trace_rows::<Val>(keccak_inputs(SWEEP_PERMS), lb);
+    let gen_blake3 = |lb: usize| blake3_air.generate_trace_rows::<Val>(SWEEP_PERMS, lb);
+    let gen_p2 = |lb: usize| p2_air.generate_trace_rows(SWEEP_PERMS, lb);
+
+    match mode.as_str() {
+        "sweep" => {
+            println!("# qumbra-lab M1 FRI-config sweep ({SWEEP_PERMS} permutations)");
+            println!();
+            print_env(&power);
+            println!(
+                "- fixed: KoalaBear + degree-4 extension, Keccak-256 FRI Merkle, \
+                 Radix2DitParallel DFT; only FRI parameters vary"
+            );
+            println!(
+                "- every config asserted >= 100 bits conjectured \
+                 (queries x log2(blowup) + grind)"
+            );
+            println!(
+                "- per cell: prove = best of {RUNS} in-process runs; proof size = postcard bytes"
+            );
+            println!();
+            let mut rows = Vec::new();
+            eprintln!("== sweep: Keccak-f[1600] ==");
+            for cfg in &SWEEP_CFGS {
+                rows.push(sweep_cell(&keccak_air, "Keccak-f[1600]", cfg, &gen_keccak));
+            }
+            eprintln!("== sweep: BLAKE3 ==");
+            for cfg in &SWEEP_CFGS {
+                rows.push(sweep_cell(&blake3_air, "BLAKE3", cfg, &gen_blake3));
+            }
+            eprintln!("== sweep: Poseidon2-w16 ==");
+            for cfg in &SWEEP_CFGS {
+                rows.push(sweep_cell(&p2_air, "Poseidon2-w16", cfg, &gen_p2));
+            }
+            print_sweep_table(&rows);
+            return;
+        }
+        "breakdown" => {
+            println!("# qumbra-lab M1 proof-size breakdown ({SWEEP_PERMS} permutations)");
+            println!();
+            print_env(&power);
+            println!(
+                "- per hash: baseline config {} plus the smallest-proof config from \
+                 the sweep set (each candidate proven once to find it)",
+                BASELINE_CFG.label()
+            );
+            println!("- component sizes = postcard bytes of each public substructure");
+            println!();
+            let mut summary: Vec<(&'static str, String, Breakdown)> = Vec::new();
+            eprintln!("== breakdown: Keccak-f[1600] ==");
+            for (cfg, b) in breakdown_air(&keccak_air, "Keccak-f[1600]", &gen_keccak) {
+                summary.push(("Keccak-f[1600]", cfg, b));
+            }
+            eprintln!("== breakdown: BLAKE3 ==");
+            for (cfg, b) in breakdown_air(&blake3_air, "BLAKE3", &gen_blake3) {
+                summary.push(("BLAKE3", cfg, b));
+            }
+            eprintln!("== breakdown: Poseidon2-w16 ==");
+            for (cfg, b) in breakdown_air(&p2_air, "Poseidon2-w16", &gen_p2) {
+                summary.push(("Poseidon2-w16", cfg, b));
+            }
+            println!("## Summary");
+            println!();
+            print_breakdown_summary(&summary);
+            println!("## Per-proof component detail");
+            println!();
+            for (hash, cfg, b) in &summary {
+                print_breakdown_detail(hash, cfg, b);
+            }
+            return;
+        }
+        "matrix" => {}
+        other => {
+            eprintln!("unknown mode `{other}`; expected `sweep`, `breakdown`, or no mode");
+            std::process::exit(2);
+        }
+    }
+
+    let config = make_config();
 
     print_header(&power);
 

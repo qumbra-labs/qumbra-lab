@@ -598,6 +598,7 @@ dependencies = [
  "postcard",
  "qlab-air",
  "rand",
+ "serde",
 ]
 
 [[package]]
