@@ -11,6 +11,7 @@
 //! published AIRs; SHA-256 is a later task.
 
 mod geometry;
+mod levers;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
@@ -97,6 +98,11 @@ struct FriCfg {
     /// log2 of the final polynomial length — stops FRI folding early,
     /// trading commit-phase Merkle paths for plaintext final-poly coeffs.
     log_final_poly_len: usize,
+    /// log2 of the maximum FRI fold arity (0.6.1 `FriParameters::max_log_arity`).
+    /// 1 = classic arity-2 folding (every config before M1.6); k folds up to
+    /// 2^k per round, trading fewer fold rounds (fewer commit roots + shorter
+    /// path total) for 2^k - 1 sibling values per round per query.
+    max_log_arity: usize,
 }
 
 impl FriCfg {
@@ -110,6 +116,9 @@ impl FriCfg {
         if self.log_final_poly_len > 0 {
             s.push_str(&format!("/fp{}", 1 << self.log_final_poly_len));
         }
+        if self.max_log_arity > 1 {
+            s.push_str(&format!("/a{}", 1 << self.max_log_arity));
+        }
         s
     }
 }
@@ -120,6 +129,7 @@ const BASELINE_CFG: FriCfg = FriCfg {
     num_queries: NUM_QUERIES,
     grind_bits: QUERY_POW_BITS,
     log_final_poly_len: 0,
+    max_log_arity: 1,
 };
 
 /// The sweep: every point satisfies >= 100 bits conjectured
@@ -135,6 +145,7 @@ const SWEEP_CFGS: [FriCfg; 7] = [
         num_queries: 45,
         grind_bits: 10,
         log_final_poly_len: 0,
+        max_log_arity: 1,
     },
     // blowup 8, 30 queries, grind 10 (100 bits).
     FriCfg {
@@ -142,6 +153,7 @@ const SWEEP_CFGS: [FriCfg; 7] = [
         num_queries: 30,
         grind_bits: 10,
         log_final_poly_len: 0,
+        max_log_arity: 1,
     },
     // blowup 16, 23 queries, grind 10 (102 bits).
     FriCfg {
@@ -149,6 +161,7 @@ const SWEEP_CFGS: [FriCfg; 7] = [
         num_queries: 23,
         grind_bits: 10,
         log_final_poly_len: 0,
+        max_log_arity: 1,
     },
     // blowup 4, 40 queries, grind 20 (100 bits).
     FriCfg {
@@ -156,6 +169,7 @@ const SWEEP_CFGS: [FriCfg; 7] = [
         num_queries: 40,
         grind_bits: 20,
         log_final_poly_len: 0,
+        max_log_arity: 1,
     },
     // Early-stop variants: stop FRI folding at a 16-coefficient final poly.
     FriCfg {
@@ -163,12 +177,14 @@ const SWEEP_CFGS: [FriCfg; 7] = [
         num_queries: 45,
         grind_bits: 10,
         log_final_poly_len: 4,
+        max_log_arity: 1,
     },
     FriCfg {
         log_blowup: 4,
         num_queries: 23,
         grind_bits: 10,
         log_final_poly_len: 4,
+        max_log_arity: 1,
     },
 ];
 
@@ -184,7 +200,7 @@ fn make_config_with(cfg: &FriCfg) -> Config {
     let fri_params = FriParameters {
         log_blowup: cfg.log_blowup,
         log_final_poly_len: cfg.log_final_poly_len,
-        max_log_arity: 1,
+        max_log_arity: cfg.max_log_arity,
         num_queries: cfg.num_queries,
         commit_proof_of_work_bits: 0,
         query_proof_of_work_bits: cfg.grind_bits,
@@ -759,7 +775,8 @@ fn main() {
     // --power <note>: manual power-state annotation (AC/battery, thermal).
     // First positional arg selects the mode: (none) = hash matrix,
     // `sweep` = FRI-config sweep, `breakdown` = proof-size breakdown,
-    // `geometry` = narrow-trace geometry probe (mock AIR ladder).
+    // `geometry` = narrow-trace geometry probe (mock AIR ladder),
+    // `levers` = M1.6 non-geometry levers (blowup 32, FRI arity > 2).
     let args: Vec<String> = std::env::args().collect();
     let power_pos = args.iter().position(|a| a == "--power");
     let power = power_pos
@@ -860,10 +877,15 @@ fn main() {
             geometry::run_geometry(&power);
             return;
         }
+        "levers" => {
+            levers::run_levers(&power);
+            return;
+        }
         "matrix" => {}
         other => {
             eprintln!(
-                "unknown mode `{other}`; expected `sweep`, `breakdown`, `geometry`, or no mode"
+                "unknown mode `{other}`; expected `sweep`, `breakdown`, `geometry`, \
+                 `levers`, or no mode"
             );
             std::process::exit(2);
         }

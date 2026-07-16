@@ -44,42 +44,43 @@ use crate::{keccak_inputs, make_config_with, run_cell, Cell, FriCfg, Val};
 /// The best 100-bit-conjectured config from the PR #2 sweep:
 /// blowup 16 / 23 queries / 10-bit grind / final-poly 16 (102 bits;
 /// `make_config_with` runtime-asserts >= 100).
-const GEOMETRY_CFG: FriCfg = FriCfg {
+pub(crate) const GEOMETRY_CFG: FriCfg = FriCfg {
     log_blowup: 4,
     num_queries: 23,
     grind_bits: 10,
     log_final_poly_len: 4,
+    max_log_arity: 1,
 };
 
 /// Hand-counted census of p3-keccak-air 0.6.1 (see module docs).
-const KECCAK_CONSTRAINTS_PER_ROW: usize = 3182;
-const KECCAK_ROWS_PER_PERM: usize = 24;
-const KECCAK_WIDTH: usize = 2633;
+pub(crate) const KECCAK_CONSTRAINTS_PER_ROW: usize = 3182;
+pub(crate) const KECCAK_ROWS_PER_PERM: usize = 24;
+pub(crate) const KECCAK_WIDTH: usize = 2633;
 /// Real Keccak AIR max constraint degree (xor3 / parity / chi).
-const KECCAK_MAX_DEGREE: usize = 3;
+pub(crate) const KECCAK_MAX_DEGREE: usize = 3;
 
 /// Workload: smallest power of two >= 96, approximating the design's
 /// ~90-hash 2x2-bucket circuit (same as sweep/breakdown modes).
-const GEOMETRY_PERMS: usize = 128;
+pub(crate) const GEOMETRY_PERMS: usize = 128;
 /// The design's actual ~90-hash bucket, rounded up.
 const DESIGN_PERMS: usize = 96;
 
 /// performance-budget SS3 transaction-size target.
-const TARGET_KB: f64 = 150.0;
+pub(crate) const TARGET_KB: f64 = 150.0;
 
 /// Calibration gate: L1 mock must land within this fraction of the real AIR.
 const CALIBRATION_TOL: f64 = 0.10;
 
-struct Layout {
-    name: &'static str,
-    width: usize,
-    rows_per_perm: usize,
+pub(crate) struct Layout {
+    pub name: &'static str,
+    pub width: usize,
+    pub rows_per_perm: usize,
 }
 
 /// The narrowing ladder. L1 reproduces the real Keccak geometry
 /// (calibration); each later rung trades ~4x width for ~4x rows at
 /// (roughly) constant total trace area.
-const LADDER: [Layout; 5] = [
+pub(crate) const LADDER: [Layout; 5] = [
     Layout {
         name: "L1",
         width: KECCAK_WIDTH,
@@ -109,7 +110,7 @@ const LADDER: [Layout; 5] = [
 
 /// Constraints/row that hold constraint-evaluation work per permutation
 /// constant relative to the real Keccak AIR.
-fn constraints_per_row(rows_per_perm: usize) -> usize {
+pub(crate) fn constraints_per_row(rows_per_perm: usize) -> usize {
     (KECCAK_CONSTRAINTS_PER_ROW * KECCAK_ROWS_PER_PERM).div_ceil(rows_per_perm)
 }
 
