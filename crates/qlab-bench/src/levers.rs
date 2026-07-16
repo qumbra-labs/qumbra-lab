@@ -125,6 +125,17 @@ const N160: Layout = Layout {
     rows_per_perm: 1536,
 };
 
+/// M1.5b step-0 anchor, v2 (supersedes N160 — see the layout doc's dated
+/// correction): the implemented pipeline (qlab-air `NarrowKeccakAir`)
+/// needs 128 rows/round (theta's z-1 parity tap and chi's rho taps both
+/// wrap across the round) and exactly 371 columns — this mock cell shares
+/// its geometry so the real AIR has a like-for-like size anchor.
+const P371: Layout = Layout {
+    name: "P371",
+    width: qlab_air::narrow::NARROW_WIDTH,
+    rows_per_perm: qlab_air::narrow::ROWS_PER_PERM,
+};
+
 struct LeverRow {
     cfg_name: &'static str,
     cfg: FriCfg,
@@ -190,7 +201,7 @@ pub(crate) fn run_levers(power: &str) {
     );
     println!();
 
-    let narrow: [&Layout; 5] = [&LADDER[2], &LADDER[3], &LADDER[4], &L6, &N160];
+    let narrow: [&Layout; 6] = [&LADDER[2], &LADDER[3], &LADDER[4], &L6, &N160, &P371];
     let keccak_air = KeccakAir {};
 
     let mut rows: Vec<LeverRow> = Vec::new();

@@ -5,3 +5,14 @@ edition.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Pinned exactly at 0.6.1, matching qlab-bench (bench discipline).
+p3-air = "=0.6.1"
+p3-field = "=0.6.1"
+p3-matrix = "=0.6.1"
+
+[dev-dependencies]
+# Published Keccak-f used as the authority the reference implementation
+# is cross-checked against.
+p3-keccak = "=0.6.1"
+p3-koala-bear = "=0.6.1"
+p3-symmetric = "=0.6.1"

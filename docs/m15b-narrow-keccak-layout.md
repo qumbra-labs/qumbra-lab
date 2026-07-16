@@ -1,5 +1,50 @@
 # M1.5b — narrow-Keccak AIR layout design (decision draft, 2026-07-16)
 
+> **Implementation-time correction (2026-07-16, v2 — supersedes §2–3 numbers
+> below; the implemented AIR in `crates/qlab-air/src/narrow.rs` is the
+> authority):** working the schedule row-by-row before coding exposed two
+> timing facts the v1 budget missed. (1) **Theta's z−1 parity tap wraps
+> across the round** — slice 0 needs C[·][63] of the *same* round, so theta
+> cannot start until the whole round input is materialized: a round takes
+> **two 64-row windows (128 rows/round, 3072 rows/perm)**, and the C parities
+> need their own dual-distance delay register (U, 65 slots + 10 unpack —
+> an
+> intermediate 296-col revision had wrongly optimized it away by recomputing
+> parities at consumption, which misses the z=63→0 seam). (2) **Register slots index by
+> remaining-rows-to-consumption**, which shifts every slot count by one vs
+> v1. Final geometry: **371 cols × 3072 rows/perm** (a 25 + c 5 + S-unpack
+> 25 + ap 25 + x00 1 + S 126 + V 64 + V-unpack 25 + U 65 + U-unpack 10).
+> Schedule flags ride **27 periodic columns** (period 128 — free: the
+> verifier evaluates them, no commitment, no openings); only the iota round
+> constant (period 24 rounds, not a power of two) needs a **1-column
+> preprocessed trace** whose per-query opening cost is measured, not
+> assumed. The step-0 mock anchor is **P371** in the `levers` mode; the
+> real AIR is measured by the `narrow` bench mode against the §4 gates
+> (size gate re-anchored to P371 ±10%).
+
+> **Measured outcome (2026-07-17, `narrow` bench mode; runs in
+> `docs/narrow-M15b-run*.md`, reproduced across two fresh processes):**
+> the implemented 371-col AIR **passes both targets**:
+> **141.2 KB / 2.0 s prove at b16/q19/g24/fp16/a16** (exactly 100 bits
+> conjectured; 147.7 KB / 1.9 s at the milder q20/g20). Gate verdicts:
+> **(1) correctness PASS** — materialized-state chain equals the reference
+> permutation (itself cross-checked against p3-keccak), corruption tests
+> negative-pass, real-prover roundtrip green. **(2) size MISS-by-1pt as a
+> finding**: real AIR = mock + 11.0–11.4% (gate said 10%); the entire gap
+> is the preprocessed iota-RC column's per-query opening (~740 B/query —
+> measured price of variant (a); the identified fix, an in-trace GF(2) LFSR
+> gadget for the RC bits (~+24 cols ≈ +2 KB vs −17 KB of openings), is the
+> next optimization, not blocking). **(3) density FINDING**: realized 379
+> constraints/row × 3072 rows/perm = 15× the census scaling — the mock's
+> density premise was wrong for buildable pipelines, but density affects
+> prove time only (1.9–2.1 s, still ≤ 3 s) and no proof-size number relied
+> on it. **(4) time PASS** at every b16 config; b32/a16 reaches 139.3 KB
+> but proves in 14–28 s on this 36 GiB rig (25 GB LDE swaps — a RAM bound,
+> not a compute bound; flagged for the M2 rig).
+> The query↔grind trade (q19/g24 at the same 100 bits) is what buys the
+> final margin — queries cost ~6.5 KB each at this geometry, grind is a
+> one-time prover cost.
+
 Goal: implement **correct** Keccak-f[1600] semantics at a narrow geometry and
 confirm measured proof size against the M1.6 mock predictions
 (`docs/levers-M1.6-run*.md`). This doc fixes the layout — and states the

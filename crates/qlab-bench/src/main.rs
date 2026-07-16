@@ -12,6 +12,7 @@
 
 mod geometry;
 mod levers;
+mod narrow_bench;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
@@ -776,7 +777,8 @@ fn main() {
     // First positional arg selects the mode: (none) = hash matrix,
     // `sweep` = FRI-config sweep, `breakdown` = proof-size breakdown,
     // `geometry` = narrow-trace geometry probe (mock AIR ladder),
-    // `levers` = M1.6 non-geometry levers (blowup 32, FRI arity > 2).
+    // `levers` = M1.6 non-geometry levers (blowup 32, FRI arity > 2),
+    // `narrow` = M1.5b real narrow-Keccak AIR.
     let args: Vec<String> = std::env::args().collect();
     let power_pos = args.iter().position(|a| a == "--power");
     let power = power_pos
@@ -881,11 +883,15 @@ fn main() {
             levers::run_levers(&power);
             return;
         }
+        "narrow" => {
+            narrow_bench::run_narrow(&power);
+            return;
+        }
         "matrix" => {}
         other => {
             eprintln!(
                 "unknown mode `{other}`; expected `sweep`, `breakdown`, `geometry`, \
-                 `levers`, or no mode"
+                 `levers`, `narrow`, or no mode"
             );
             std::process::exit(2);
         }
