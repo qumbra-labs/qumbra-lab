@@ -25,7 +25,51 @@ const BUCKET_PERMS: usize = 96;
 /// The lever configs the real AIR is measured under. b32 is included but
 /// may exceed this rig's RAM (371 cols x 2^19 rows x 32 blowup LDE ~ 25 GB)
 /// — a panic is caught and reported as FAILED, honestly.
-const NARROW_CFGS: [(&str, FriCfg); 4] = [
+const NARROW_CFGS: [(&str, FriCfg); 8] = [
+    // M2 step-0 memory ladder: blowup sets the LDE working set
+    // (402 cols x 2^19 rows x blowup x 4 B = 3.4 GB @ b4, 6.7 GB @ b8,
+    // 13.5 GB @ b16) — iPhone jetsam limits decide which are provable
+    // on-device; these cells price the proof-size cost of fitting.
+    (
+        "b4/q45/g10/a16",
+        FriCfg {
+            log_blowup: 2,
+            num_queries: 45,
+            grind_bits: 10,
+            log_final_poly_len: 4,
+            max_log_arity: 4,
+        },
+    ),
+    (
+        "b4/q40/g20/a16",
+        FriCfg {
+            log_blowup: 2,
+            num_queries: 40,
+            grind_bits: 20,
+            log_final_poly_len: 4,
+            max_log_arity: 4,
+        },
+    ),
+    (
+        "b8/q30/g10/a16",
+        FriCfg {
+            log_blowup: 3,
+            num_queries: 30,
+            grind_bits: 10,
+            log_final_poly_len: 4,
+            max_log_arity: 4,
+        },
+    ),
+    (
+        "b8/q27/g19/a16",
+        FriCfg {
+            log_blowup: 3,
+            num_queries: 27,
+            grind_bits: 19,
+            log_final_poly_len: 4,
+            max_log_arity: 4,
+        },
+    ),
     // Query count dominates byte cost (~6.5 KB/query at b16 incl. the
     // preprocessed opening); trade queries for grind at exactly 100 bits.
     (
@@ -70,7 +114,10 @@ const NARROW_CFGS: [(&str, FriCfg); 4] = [
     ),
 ];
 
-pub(crate) fn run_narrow(power: &str) {
+/// `only`: optional config-name filter (substring match) — one config per
+/// process, exactly what a per-launch phone harness needs, and what lets
+/// /usr/bin/time -l attribute peak RSS to a single config.
+pub(crate) fn run_narrow(power: &str, only: Option<&str>) {
     let rows = BUCKET_PERMS * ROWS_PER_PERM;
     let log_height = rows.next_power_of_two().trailing_zeros() as usize;
 
@@ -100,6 +147,11 @@ pub(crate) fn run_narrow(power: &str) {
     println!("|---|---|---|---|---|---|---|");
 
     for (name, cfg) in &NARROW_CFGS {
+        if let Some(f) = only {
+            if !name.contains(f) {
+                continue;
+            }
+        }
         let air = NarrowKeccakAir { log_height };
         let config = make_config_with(cfg);
         let bits = cfg.num_queries * cfg.log_blowup + cfg.grind_bits;
