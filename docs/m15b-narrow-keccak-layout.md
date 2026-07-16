@@ -1,5 +1,21 @@
 # M1.5b — narrow-Keccak AIR layout design (decision draft, 2026-07-16)
 
+> **M1.5c measured (2026-07-17, runs in `docs/narrow-M15c-run*.md`):** the
+> preprocessed iota-RC column is gone. RC[r] is nonzero only at the seven
+> z-positions 2^k−1, so each round's constant packs into 7 bits; a ring of
+> 24 in-trace registers rotates one step per 128-row block (gated by a
+> free periodic flag), R[0]'s bits are exposed through 7 bool-checked
+> columns, and the first row pins the ring to the RC table — fully
+> constrained, no preprocessed commitment, width 371 → 402. Measured:
+> **136.9 KB / 2.0 s at b16/q20/g20/fp16/a16 (reproduced identically —
+> the robust double-pass point)**; 130.8 KB at q19/g24 with prove
+> 2.2–3.3 s — the 2^24 query grind (~1 s expected, high variance) is
+> counted in prove time, so heavy-grind configs trade time variance for
+> bytes; 129.0 KB at b32/a16, still RAM-bound on this rig. Net effect of
+> M1.5c: **−10 to −13 KB vs M1.5b at every config**, matching the
+> predicted trade (+31 cols ≈ +3 KB vs −14 KB of per-query preprocessed
+> openings).
+
 > **Implementation-time correction (2026-07-16, v2 — supersedes §2–3 numbers
 > below; the implemented AIR in `crates/qlab-air/src/narrow.rs` is the
 > authority):** working the schedule row-by-row before coding exposed two

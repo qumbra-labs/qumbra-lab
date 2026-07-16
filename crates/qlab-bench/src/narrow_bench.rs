@@ -4,17 +4,17 @@
 //! P371 mock anchor and the acceptance gates in
 //! `docs/m15b-narrow-keccak-layout.md`.
 //!
-//! Preprocessed handling: the AIR carries one preprocessed column (the
-//! iota round constant — period 24 rounds, not a power of two, so it
-//! cannot ride the free periodic-column path). `setup_preprocessed` is
-//! vk-style one-time work and is NOT counted in prove time; its per-query
-//! opening cost IS counted in proof size — pricing exactly the variant-(a)
-//! selector question the layout doc left open.
+//! M1.5c: the iota round constant now rides an in-trace rotating ring of
+//! 24 registers + 7 exposed bits (see qlab-air narrow.rs) — there is no
+//! preprocessed trace anymore, so this mode uses the plain prove/verify
+//! path. M1.5b's preprocessed variant measured 141.2 KB at b16/q19/g24/a16
+//! (runs in docs/narrow-M15b-run*.md); the delta to this mode's numbers is
+//! the measured value of removing the per-query preprocessed openings.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
 
-use p3_uni_stark::{prove_with_preprocessed, setup_preprocessed, verify_with_preprocessed};
+use p3_uni_stark::{prove, verify};
 use qlab_air::narrow::{NarrowKeccakAir, NARROW_WIDTH, ROWS_PER_PERM};
 
 use crate::{make_config_with, pc_len, FriCfg, Val, RUNS};
@@ -106,14 +106,12 @@ pub(crate) fn run_narrow(power: &str) {
 
         eprintln!("== narrow: {name} ({}) ==", cfg.label());
         let result = catch_unwind(AssertUnwindSafe(|| {
-            let (pd, vk) =
-                setup_preprocessed(&config, &air, log_height).expect("AIR has preprocessed");
             let mut best_prove = f64::INFINITY;
             let mut proof_opt = None;
             for _ in 0..RUNS {
                 let trace = air.generate_trace::<Val>(cfg.log_blowup);
                 let t = Instant::now();
-                let proof = prove_with_preprocessed(&config, &air, trace, &[], Some(&pd));
+                let proof = prove(&config, &air, trace, &[]);
                 best_prove = best_prove.min(t.elapsed().as_secs_f64() * 1e3);
                 proof_opt = Some(proof);
             }
@@ -122,8 +120,7 @@ pub(crate) fn run_narrow(power: &str) {
             let mut best_verify = f64::INFINITY;
             for _ in 0..RUNS {
                 let t = Instant::now();
-                verify_with_preprocessed(&config, &air, &proof, &[], Some(&vk))
-                    .expect("verification failed");
+                verify(&config, &air, &proof, &[]).expect("verification failed");
                 best_verify = best_verify.min(t.elapsed().as_secs_f64() * 1e3);
             }
             (best_prove, best_verify, proof_bytes)
@@ -188,9 +185,8 @@ mod tests {
             max_log_arity: 3,
         };
         let config = make_config_with(&cfg);
-        let (pd, vk) = setup_preprocessed(&config, &air, air.log_height).expect("preprocessed");
         let trace = air.generate_trace::<Val>(cfg.log_blowup);
-        let proof = prove_with_preprocessed(&config, &air, trace, &[], Some(&pd));
-        verify_with_preprocessed(&config, &air, &proof, &[], Some(&vk)).expect("verify");
+        let proof = prove(&config, &air, trace, &[]);
+        verify(&config, &air, &proof, &[]).expect("verify");
     }
 }

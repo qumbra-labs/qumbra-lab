@@ -129,9 +129,11 @@ const N160: Layout = Layout {
 /// correction): the implemented pipeline (qlab-air `NarrowKeccakAir`)
 /// needs 128 rows/round (theta's z-1 parity tap and chi's rho taps both
 /// wrap across the round) and exactly 371 columns — this mock cell shares
-/// its geometry so the real AIR has a like-for-like size anchor.
+/// its geometry so the real AIR has a like-for-like size anchor. (Named
+/// P-real: the width tracks qlab-air — 371 in M1.5b, 402 since M1.5c's
+/// in-trace RC ring.)
 const P371: Layout = Layout {
-    name: "P371",
+    name: "P-real",
     width: qlab_air::narrow::NARROW_WIDTH,
     rows_per_perm: qlab_air::narrow::ROWS_PER_PERM,
 };
