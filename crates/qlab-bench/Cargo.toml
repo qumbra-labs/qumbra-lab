@@ -6,3 +6,29 @@ publish.workspace = true
 
 [dependencies]
 qlab-air = { path = "../qlab-air" }
+
+# Plonky3, pinned exactly at 0.6.1 (bench discipline: numbers against a
+# moving prover are meaningless). p3-maybe-rayon/parallel turns on the
+# multithreaded code paths in every p3 crate via feature unification.
+p3-air = "=0.6.1"
+p3-blake3-air = "=0.6.1"
+p3-challenger = "=0.6.1"
+p3-commit = "=0.6.1"
+p3-dft = "=0.6.1"
+p3-field = "=0.6.1"
+p3-fri = "=0.6.1"
+p3-keccak = "=0.6.1"
+p3-keccak-air = "=0.6.1"
+p3-koala-bear = "=0.6.1"
+p3-matrix = "=0.6.1"
+p3-maybe-rayon = { version = "=0.6.1", features = ["parallel"] }
+p3-merkle-tree = "=0.6.1"
+p3-poseidon2-air = "=0.6.1"
+p3-symmetric = "=0.6.1"
+p3-uni-stark = "=0.6.1"
+p3-util = "=0.6.1"
+
+# rand 0.10 matches what the p3 0.6.1 crates and their examples use.
+rand = "0.10"
+# Proof serialization for the proof-size column.
+postcard = { version = "1", features = ["alloc"] }
