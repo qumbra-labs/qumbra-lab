@@ -10,6 +10,8 @@
 //! has no published Plonky3 crate at 0.6.1, so the matrix here is the three
 //! published AIRs; SHA-256 is a later task.
 
+mod geometry;
+
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
 
@@ -756,7 +758,8 @@ fn print_table(cells: &[Cell]) {
 fn main() {
     // --power <note>: manual power-state annotation (AC/battery, thermal).
     // First positional arg selects the mode: (none) = hash matrix,
-    // `sweep` = FRI-config sweep, `breakdown` = proof-size breakdown.
+    // `sweep` = FRI-config sweep, `breakdown` = proof-size breakdown,
+    // `geometry` = narrow-trace geometry probe (mock AIR ladder).
     let args: Vec<String> = std::env::args().collect();
     let power_pos = args.iter().position(|a| a == "--power");
     let power = power_pos
@@ -853,9 +856,15 @@ fn main() {
             }
             return;
         }
+        "geometry" => {
+            geometry::run_geometry(&power);
+            return;
+        }
         "matrix" => {}
         other => {
-            eprintln!("unknown mode `{other}`; expected `sweep`, `breakdown`, or no mode");
+            eprintln!(
+                "unknown mode `{other}`; expected `sweep`, `breakdown`, `geometry`, or no mode"
+            );
             std::process::exit(2);
         }
     }
