@@ -1488,6 +1488,100 @@ mod tests {
         }
     }
 
+    /// TEMP probe: print the exact shape constants the gate lowering
+    /// hard-codes (per-query absorb/path structure, flush layout, draws).
+    #[test]
+    fn probe_shape() {
+        let (_, pvs, proof) = shared();
+        let sched = walk(proof, pvs);
+        eprintln!("log_arities = {:?}", sched.log_arities);
+        // Per-query absorb blocks + words, per batch.
+        let q0: Vec<&PermRec> = sched
+            .perms
+            .iter()
+            .filter(|p| {
+                matches!(
+                    p.role,
+                    Role::Absorb {
+                        leaf: LeafTag::Trace { q: 0 } | LeafTag::Quotient { q: 0 } | LeafTag::Fold { q: 0, .. },
+                        ..
+                    }
+                )
+            })
+            .collect();
+        let mut counts: Vec<(String, usize)> = vec![];
+        for p in &q0 {
+            if let Role::Absorb { leaf, words, .. } = &p.role {
+                let key = format!("{leaf:?}");
+                if let Some(last) = counts.last_mut() {
+                    if last.0 == key {
+                        last.1 += 1;
+                        eprintln!("  {key} block words {}", words.len());
+                        continue;
+                    }
+                }
+                eprintln!("  {key} block words {}", words.len());
+                counts.push((key, 1));
+            }
+        }
+        eprintln!("q0 absorb blocks per leaf: {counts:?}");
+        // Path levels per batch for q0 (native + capext).
+        let mut lv: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
+        for p in &sched.perms {
+            if let Role::Compress {
+                tag: CompressTag::Path { q: 0, batch, cap_ext, .. },
+            } = p.role
+            {
+                let e = lv.entry(format!("{batch:?}")).or_default();
+                if cap_ext {
+                    e.1 += 1;
+                } else {
+                    e.0 += 1;
+                }
+            }
+        }
+        eprintln!("q0 path levels (native, capext): {lv:?}");
+        // Flush structure.
+        for (i, f) in sched.flushes.iter().enumerate() {
+            eprintln!(
+                "flush {i}: msg {} B, {} blocks, first_perm {}",
+                f.msg.len(),
+                f.n_blocks,
+                f.first_perm
+            );
+        }
+        for o in &sched.obs {
+            eprintln!("obs {:?}: offset {}, {} B", o.label, o.offset, o.bytes.len());
+        }
+        // Draws by flush.
+        let mut cur = usize::MAX;
+        let mut line = String::new();
+        for d in &sched.draws {
+            if d.flush != cur {
+                if !line.is_empty() {
+                    eprintln!("{line}");
+                }
+                cur = d.flush;
+                line = format!("draws from flush {cur}:");
+            }
+            let k = match d.kind {
+                DrawKind::Field { accept, chal, coeff, .. } => {
+                    format!(" F({chal:?},{coeff},{})", if accept { "A" } else { "R" })
+                }
+                DrawKind::Bits { bits, purpose, .. } => format!(" B({purpose:?},{bits})"),
+            };
+            line.push_str(&k);
+        }
+        eprintln!("{line}");
+        eprintln!(
+            "total perms {}, chal {}, width {}, pvs {}",
+            sched.perms.len(),
+            sched.flushes.iter().map(|f| f.n_blocks).sum::<usize>(),
+            proof.opened_values.trace_local.len(),
+            pvs.len()
+        );
+    }
+
     /// Shape sanity: one collapsed root per commitment (the per-path
     /// root-landing asserts live inside `walk_path` and fire during
     /// every `walk`), all keccak perms internally consistent, and the

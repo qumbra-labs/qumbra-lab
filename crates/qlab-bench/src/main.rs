@@ -14,6 +14,7 @@ mod geometry;
 mod levers;
 mod m4anchor;
 mod m4census;
+mod m4gate;
 mod m4gaterec;
 mod m4price;
 mod m4route;
