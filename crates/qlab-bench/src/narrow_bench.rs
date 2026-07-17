@@ -12,10 +12,15 @@
 //! the measured value of removing the per-query preprocessed openings.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+
+use p3_field::PrimeCharacteristicRing;
 use std::time::Instant;
 
 use p3_uni_stark::{prove, verify};
-use qlab_air::narrow::{NarrowKeccakAir, NARROW_WIDTH, ROWS_PER_PERM};
+use qlab_air::narrow::{
+    build_bucket, NarrowKeccakAir, TxInput, TxOutput, BUCKET_PERMS as TX_PERMS, NARROW_WIDTH,
+    PV_LEN, ROWS_PER_PERM,
+};
 
 use crate::{make_config_with, pc_len, FriCfg, Val, RUNS};
 
@@ -175,7 +180,7 @@ pub(crate) fn run_narrow(power: &str, only: Option<&str>) {
             for _ in 0..RUNS {
                 let trace = air.generate_trace::<Val>(cfg.log_blowup);
                 let t = Instant::now();
-                let proof = prove(&config, &air, trace, &[]);
+                let proof = prove(&config, &air, trace, &vec![Val::ZERO; PV_LEN]);
                 best_prove = best_prove.min(t.elapsed().as_secs_f64() * 1e3);
                 proof_opt = Some(proof);
             }
@@ -184,7 +189,7 @@ pub(crate) fn run_narrow(power: &str, only: Option<&str>) {
             let mut best_verify = f64::INFINITY;
             for _ in 0..RUNS {
                 let t = Instant::now();
-                verify(&config, &air, &proof, &[]).expect("verification failed");
+                verify(&config, &air, &proof, &vec![Val::ZERO; PV_LEN]).expect("verification failed");
                 best_verify = best_verify.min(t.elapsed().as_secs_f64() * 1e3);
             }
             (best_prove, best_verify, proof_bytes)
@@ -231,6 +236,130 @@ pub(crate) fn run_narrow(power: &str, only: Option<&str>) {
     );
 }
 
+/// M3 bucket bench: the complete 2x2 transaction statement at 2^18 rows.
+pub(crate) fn run_bucket(power: &str, only: Option<&str>) {
+    println!("# qumbra-lab M3 full 2x2 bucket bench");
+    println!();
+    crate::print_env(power);
+    println!(
+        "- statement: 2 inputs (nk/rkm derivation, nullifier, commitment \
+         opening, depth-32 membership in one shared tree) + 2 outputs + \
+         in-circuit balance + public binding of anchor/nf/cm'/fee \
+         ({TX_PERMS} perms incl. warm-up, {NARROW_WIDTH} cols x 2^18 rows)"
+    );
+    println!(
+        "- semantics: qlab-air test suite (reference-checked chains, \
+         equality banks, negative tests for tampered witness and wrong \
+         public values)"
+    );
+    println!("- per cell: prove/verify = best of {RUNS} in-process runs; proof = postcard bytes");
+    println!();
+    println!(
+        "- proof KB reported twice: postcard (varint — the campaign codec, \
+         which under-counts dense values on dummy traces and over-counts \
+         them ~20% vs a fixed-width wire format) and bincode-fixed (4 B per \
+         field element, the production-format proxy; gate verdicts use it)"
+    );
+    println!();
+    println!("| config | conj. bits | prove ms | verify ms | postcard KB | fixed KB | vs gates |");
+    println!("|---|---|---|---|---|---|---|");
+
+    // Deterministic pseudo-random bucket instance.
+    let mut x = 0xfeed_face_cafe_beefu64;
+    let mut rnd = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mk_in = |value: u64, rnd: &mut dyn FnMut() -> u64| TxInput {
+        sk: [rnd(), rnd(), rnd(), rnd()],
+        value,
+        rho: [rnd(), rnd(), rnd(), rnd()],
+        rseed: [rnd(), rnd(), rnd(), rnd()],
+    };
+    let mk_out = |value: u64, rnd: &mut dyn FnMut() -> u64| TxOutput {
+        value,
+        rkm: [rnd(), rnd(), rnd(), rnd()],
+        rho: [rnd(), rnd(), rnd(), rnd()],
+        rseed: [rnd(), rnd(), rnd(), rnd()],
+    };
+    let inputs = [mk_in(50_000, &mut rnd), mk_in(30_000, &mut rnd)];
+    let outputs = [mk_out(60_000, &mut rnd), mk_out(19_000, &mut rnd)];
+    let inst = build_bucket(18, &inputs, &outputs, 1_000);
+    let pvs: Vec<Val> = inst.pvs.iter().map(|v| Val::from_u32(*v)).collect();
+
+    for (name, cfg) in &NARROW_CFGS {
+        if let Some(f) = only {
+            if !name.contains(f) {
+                continue;
+            }
+        }
+        let config = make_config_with(cfg);
+        let bits = cfg.num_queries * cfg.log_blowup + cfg.grind_bits;
+        eprintln!("== bucket: {name} ({}) ==", cfg.label());
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let mut best_prove = f64::INFINITY;
+            let mut proof_opt = None;
+            for _ in 0..RUNS {
+                let trace = inst.air.generate_trace::<Val>(cfg.log_blowup);
+                let t = Instant::now();
+                let proof = prove(&config, &inst.air, trace, &pvs);
+                best_prove = best_prove.min(t.elapsed().as_secs_f64() * 1e3);
+                proof_opt = Some(proof);
+            }
+            let proof = proof_opt.expect("RUNS > 0");
+            let proof_bytes = pc_len(&proof);
+            let fixed_bytes = bincode::serialize(&proof)
+                .expect("bincode serialization failed")
+                .len();
+            let mut best_verify = f64::INFINITY;
+            for _ in 0..RUNS {
+                let t = Instant::now();
+                verify(&config, &inst.air, &proof, &pvs).expect("verification failed");
+                best_verify = best_verify.min(t.elapsed().as_secs_f64() * 1e3);
+            }
+            (best_prove, best_verify, proof_bytes, fixed_bytes)
+        }));
+        match result {
+            Ok((prove_ms, verify_ms, bytes, fixed)) => {
+                let kb = bytes as f64 / 1024.0;
+                let fkb = fixed as f64 / 1024.0;
+                let verdict = if fkb <= 150.0 && prove_ms <= 3000.0 {
+                    "PASS"
+                } else {
+                    "FAIL"
+                };
+                eprintln!(
+                    "  [bucket {name}] prove={prove_ms:.1}ms verify={verify_ms:.1}ms \
+                     postcard={bytes}B fixed={fixed}B"
+                );
+                println!(
+                    "| {} ({}) | {} | {:.1} | {:.1} | {:.1} | {:.1} | {} |",
+                    name,
+                    cfg.label(),
+                    bits,
+                    prove_ms,
+                    verify_ms,
+                    kb,
+                    fkb,
+                    verdict,
+                );
+            }
+            Err(_) => {
+                println!(
+                    "| {} ({}) | {} | FAILED | FAILED | FAILED | FAILED | FAIL |",
+                    name,
+                    cfg.label(),
+                    bits,
+                );
+            }
+        }
+    }
+    println!();
+    println!("Gates: <= 150 KB and <= 3,000 ms at the consensus config b16/q20/g20/fp16/a16.");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,7 +379,7 @@ mod tests {
         };
         let config = make_config_with(&cfg);
         let trace = air.generate_trace::<Val>(cfg.log_blowup);
-        let proof = prove(&config, &air, trace, &[]);
-        verify(&config, &air, &proof, &[]).expect("verify");
+        let proof = prove(&config, &air, trace, &vec![Val::ZERO; PV_LEN]);
+        verify(&config, &air, &proof, &vec![Val::ZERO; PV_LEN]).expect("verify");
     }
 }

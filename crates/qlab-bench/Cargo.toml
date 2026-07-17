@@ -32,6 +32,9 @@ p3-util = "=0.6.1"
 rand = "0.10"
 # Proof serialization for the proof-size column.
 postcard = { version = "1", features = ["alloc"] }
+# Fixed-width codec: the honest wire-format proxy for dense field values
+# (postcard varints inflate uniform 31-bit values to ~5 B).
+bincode = "1"
 # Serialize trait bound for per-component proof accounting (breakdown mode);
 # already in the dependency tree via the p3 crates.
 serde = "1"

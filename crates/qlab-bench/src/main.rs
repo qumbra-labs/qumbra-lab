@@ -885,6 +885,12 @@ fn main() {
             levers::run_levers(&power, only);
             return;
         }
+        "bucket" => {
+            let only_pos = args.iter().position(|a| a == "--only");
+            let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
+            narrow_bench::run_bucket(&power, only);
+            return;
+        }
         "narrow" => {
             // Optional `--only <substr>` filters to matching config names.
             let only_pos = args.iter().position(|a| a == "--only");
