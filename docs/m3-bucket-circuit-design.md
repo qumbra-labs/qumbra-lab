@@ -109,6 +109,30 @@ witness/eff columns harder, (iii) only then a design-repo conversation
 3. **Time:** prove ≤ 3 s laptop.
 4. **Density:** report realized constraints/row honestly vs the mock.
 
+## 4b. The step-3b margin question (2026-07-17, after step 3a measured)
+
+Structural analysis says the remaining width is irreducible in this
+architecture: the two equality banks are a proven minimum (nf consumes two
+cross-perm values; their windows nest, so they cannot share a bank), the
+bind bank cannot ride the eq banks (windows overlap at arkm's boundary),
+and the same-row digest-check trick can eliminate at most one binding that
+the schedule already gets for free via chaining. Cards measured and spent:
+q19/g24 is dead (prove already 2.9 s; the 2^24 grind would breach the time
+gate), fp32 is worth only 0.6 KB. Options for the decision:
+
+1. **Finish 3b and amend the targets to measured reality** — e.g. tx
+   ≤ 160 KB, prove ≤ 3.5 s laptop. Both targets are **[assumption]**-flagged
+   in performance-budget; the honest arc is 477 KB (M1 stock) → ~151 KB
+   (full correct circuit) — a 3.2× real reduction, 1% over an assumed
+   round number.
+2. **Hunt another −30 cols** (register micro-packing, S/V/U restructuring):
+   uncertain payoff, ~2–4 session-hours, architecture risk.
+3. **WHIR gate** (already the endgame): rate-1/2 removes the whole
+   tension; nothing about this circuit changes.
+
+Recommendation: (1) — finish 3b, measure, and take a small dated
+amendment to qumbra-design if the measured full circuit lands over.
+
 ## 5. Plan
 
 | step | what | estimate |
@@ -116,5 +140,6 @@ witness/eff columns harder, (iii) only then a design-repo conversation
 | 0 | this doc + M3-est mock cell | **done (this PR)** |
 | 1 | program ring + `eff` injection + dummy-perm wiring (chain still garbage-correct, tests keep passing) | **done (this PR)** — plus the phase-packing diet after step-1 measured 152.5 KB |
 | 2 | Merkle mux + witness lanes + reference node hashing + semantic tests (16-step chain vs reference, corruption negatives) | **done (this PR)** — real AIR 145.4 KB / 2.3 s, both gates green |
-| 3 | key/nullifier/cm wiring + balance + public binding + negative tests | ~2–3 session-hours |
+| 3a | key/nullifier/cm wiring + the two equality banks + input-chain semantics + bank negative tests | **done (this PR)** — real AIR 563 cols, **148.1 KB / 2.9 s** at consensus (fp32 variant: 147.5) — both gates green with ~1.3% / 3.6% margin |
+| 3b | bind accumulators (+16), balance (+~8), outputs + full-tx reference + negatives | ~1–2 session-hours; **projected ~590 cols → ~151 KB / ~3.05 s: both gates hairline-BREACHED** — mitigation (iii) decision needed before or with this step (see below) |
 | 4 | bench mode `bucket`, measure vs gates, reproduce, docs + design-repo write-up (EN+ZH) | ~1–2 session-hours |

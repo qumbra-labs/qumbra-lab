@@ -25,7 +25,19 @@ const BUCKET_PERMS: usize = 96;
 /// The lever configs the real AIR is measured under. b32 is included but
 /// may exceed this rig's RAM (371 cols x 2^19 rows x 32 blowup LDE ~ 25 GB)
 /// — a panic is caught and reported as FAILED, honestly.
-const NARROW_CFGS: [(&str, FriCfg); 8] = [
+const NARROW_CFGS: [(&str, FriCfg); 9] = [
+    // Margin card: early-stop at a 32-coeff final poly (one fewer partial
+    // fold round per query) at the consensus point.
+    (
+        "b16/q20/g20/fp32/a16",
+        FriCfg {
+            log_blowup: 4,
+            num_queries: 20,
+            grind_bits: 20,
+            log_final_poly_len: 5,
+            max_log_arity: 4,
+        },
+    ),
     // M2 step-0 memory ladder: blowup sets the LDE working set
     // (402 cols x 2^19 rows x blowup x 4 B = 3.4 GB @ b4, 6.7 GB @ b8,
     // 13.5 GB @ b16) — iPhone jetsam limits decide which are provable
