@@ -226,11 +226,12 @@ pub(crate) fn shape_mosaic(shape: Shape) -> Vec<WordBind> {
         if f > 0 {
             w.extend([Chain; 8]);
         }
+        let mv = |x: u32| crate::Val::from_u32(x).to_unique_u32();
         match f {
             0 => {
-                w.push(Const(18)); // degree bits
-                w.push(Const(18)); // base degree bits
-                w.push(Const(0)); // preprocessed width
+                w.push(Const(mv(18))); // degree bits (transcript encoding)
+                w.push(Const(mv(18))); // base degree bits
+                w.push(Const(mv(0))); // preprocessed width
                 for d in 0..CAP_LEN {
                     for l in 0..8 {
                         w.push(Cap(cap_limb_opv(0, d, 2 * l)));
@@ -262,7 +263,7 @@ pub(crate) fn shape_mosaic(shape: Shape) -> Vec<WordBind> {
             7 => {
                 w.extend(std::iter::repeat(Val).take(64)); // final poly
                 for la in LOG_ARITIES {
-                    w.push(Const(la as u32));
+                    w.push(Const(mv(la as u32)));
                 }
                 w.push(Free); // pow witness
             }
@@ -348,6 +349,12 @@ pub(crate) fn shape_list() -> Vec<Shape> {
     }
     v.push(Shape::Refill);
     v
+}
+
+
+/// SHSEL slot of shape_list()[i] (Refill has its own column).
+fn shsel_index_of(i: usize) -> usize {
+    i
 }
 
 pub(crate) fn n_shapes() -> usize {
@@ -1040,7 +1047,254 @@ where
                 builder.assert_zero(sf(23) * cv(RSEL + *role as usize) * (cv(ocol(m)) - mux));
             }
         }
-        let _ = (cf, extmul, pv, nv, phc, c); // (consumed by later stages)
+        // =====================================================================
+        // Shape selectors: fully determined by the flush automaton (no
+        // prover choice = no ghost perms in the challenger phase).
+        // =====================================================================
+        let ringsel = |f: usize| cv(ring_at(FRING, 8, f));
+        let bidxsel = |b: usize| cv(BIDX + b);
+        let chal_live = phc.clone() * (AB::Expr::ONE - cv(REFSEL));
+        {
+            let shapes = shape_list();
+            for (si, sh) in shapes.iter().enumerate() {
+                let e = match sh {
+                    Shape::Obs { flush: 2, block: 0 } => ringsel(2) * bidxsel(0),
+                    Shape::F2Mid => {
+                        ringsel(2)
+                            * (AB::Expr::ONE - bidxsel(0))
+                            * (AB::Expr::ONE - cv(BLKLAST))
+                    }
+                    Shape::Obs { flush: 2, .. } => {
+                        // F2 last block.
+                        ringsel(2) * (AB::Expr::ONE - bidxsel(0)) * cv(BLKLAST)
+                    }
+                    Shape::Obs { flush, block } => ringsel(*flush) * bidxsel(*block),
+                    Shape::Refill => continue, // REFSEL is its own column
+                };
+                builder.assert_eq(cv(SHSEL + shsel_index_of(si)), chal_live.clone() * e);
+            }
+        }
+        builder.assert_bool(cv(REFSEL));
+        builder.assert_zero(cv(REFSEL) * (AB::Expr::ONE - phc.clone()));
+
+        // Flush-automaton comparators.
+        builder.assert_bool(cv(BLKLAST));
+        builder.assert_zero((cv(BLKCNT) - AB::Expr::ONE) * cv(BLKLAST));
+        builder.assert_eq(
+            cv(BLKLAST) + (cv(BLKCNT) - AB::Expr::ONE) * cv(BLKINV),
+            AB::Expr::ONE,
+        );
+        for (cmp, cinv, tgt) in [(CMPA, CMPAI, 76u32), (CMPB, CMPBI, 3), (CMPC, CMPCI, 148)] {
+            builder.assert_bool(cv(cmp));
+            builder.assert_zero((cv(BLKCNT) - c(tgt)) * cv(cmp));
+            builder.assert_eq(cv(cmp) + (cv(BLKCNT) - c(tgt)) * cv(cinv), AB::Expr::ONE);
+        }
+        // NEEDL = BLKLAST * (required group reached for the next obs flush).
+        {
+            let mut need = AB::Expr::ZERO;
+            for f in 0..8 {
+                need = need + ringsel(f) * cv(ring_at(GRP, N_GROUPS, GROUPREQ[f + 1]));
+            }
+            builder.assert_eq(cv(NEEDL), cv(BLKLAST) * need);
+        }
+
+        // First-row pins for the challenger phase.
+        builder.when_first_row().assert_one(cv(FRING));
+        for i in 1..8 {
+            builder.when_first_row().assert_zero(cv(FRING + i));
+        }
+        builder
+            .when_first_row()
+            .assert_eq(cv(BLKCNT), c(FLUSH_BLOCKS[0] as u32));
+        builder.when_first_row().assert_one(cv(BIDX));
+        for i in 1..6 {
+            builder.when_first_row().assert_zero(cv(BIDX + i));
+        }
+        builder.when_first_row().assert_zero(cv(REFSEL));
+        builder.when_first_row().assert_one(cv(GRP));
+        for i in 1..N_GROUPS {
+            builder.when_first_row().assert_zero(cv(GRP + i));
+        }
+        builder.when_first_row().assert_one(cv(COEF));
+        for i in 1..4 {
+            builder.when_first_row().assert_zero(cv(COEF + i));
+        }
+        builder.when_first_row().assert_zero(cv(PHD));
+        builder.when_first_row().assert_one(cv(POS));
+        builder.when_first_row().assert_zero(cv(POS + 1));
+        builder.when_first_row().assert_one(cv(VC));
+        for i in 1..16 {
+            builder.when_first_row().assert_zero(cv(VC + i));
+        }
+        for k in 0..4 {
+            builder.when_first_row().assert_zero(cv(PREG + k) - if k == 0 { AB::Expr::ONE } else { AB::Expr::ZERO });
+            builder.when_first_row().assert_zero(cv(PZACC + k));
+        }
+
+        // =====================================================================
+        // Boundary rules (perm transitions in the challenger/dup phases)
+        // =====================================================================
+        let consumersel = {
+            let mut e = cv(REFSEL);
+            for f in 1..8 {
+                e = e + cv(SHSEL + shsel_index(f, 0));
+            }
+            e
+        };
+        let b0next = {
+            let mut e = AB::Expr::ZERO;
+            for f in 1..8 {
+                e = e + nv(SHSEL + shsel_index(f, 0));
+            }
+            e
+        };
+        let xorsel = {
+            // Obs interior blocks except flush 2, plus dup interior blocks.
+            let mut e = cv(PHD) * (AB::Expr::ONE - cv(CMPC));
+            for f in 0..8 {
+                if f == 2 {
+                    continue;
+                }
+                for b in 1..FLUSH_BLOCKS[f] {
+                    e = e + cv(SHSEL + shsel_index(f, b));
+                }
+            }
+            e
+        };
+        let xorsel_next = {
+            let mut e = nv(PHD) * (AB::Expr::ONE - nv(CMPC));
+            for f in 0..8 {
+                if f == 2 {
+                    continue;
+                }
+                for b in 1..FLUSH_BLOCKS[f] {
+                    e = e + nv(SHSEL + shsel_index(f, b));
+                }
+            }
+            e
+        };
+        let grpdone = cv(ring_at(GRP, N_GROUPS, G_DONE));
+        let phasegate = sf(23) * cv(BLKLAST) * ringsel(7) * grpdone.clone() * phc.clone();
+        let phdend = sf(23) * cv(PHD) * cv(BLKLAST);
+        let endgate = sf(23) * phq.clone() * cv(QCW) * cv(ring_at(QSEL, NQ + 1, NQ - 1));
+        {
+            let mut t = builder.when_transition();
+            // Obs flush start: only the ring successor, only when the
+            // required draw group has completed.
+            for f in 1..8 {
+                let sel = nv(SHSEL + shsel_index(f, 0));
+                t.assert_zero(sf(23) * sel.clone() * (AB::Expr::ONE - ringsel(f - 1)));
+                t.assert_zero(sf(23) * sel * (cv(BLKLAST) - cv(NEEDL)));
+            }
+            // Mid-flush: no new flush, no refill.
+            t.assert_zero(
+                sf(23)
+                    * (AB::Expr::ONE - cv(BLKLAST))
+                    * phc.clone()
+                    * (b0next.clone() + nv(REFSEL)),
+            );
+            // Refill: only when the required group is incomplete, and only
+            // after a consumer that used its full window.
+            t.assert_zero(sf(23) * nv(REFSEL) * cv(NEEDL));
+            t.assert_zero(
+                sf(23) * nv(REFSEL) * consumersel.clone() * (AB::Expr::ONE - cv(FSFULL)),
+            );
+            // FRING rotation at obs starts.
+            let g = sf(23) * b0next.clone();
+            for i in 0..8 {
+                t.assert_eq(
+                    nv(FRING + i),
+                    cv(FRING + i) + g.clone() * (cv(FRING + (i + 1) % 8) - cv(FRING + i)),
+                );
+            }
+            // BIDX: reset on new flush/refill, saturating rotate on
+            // continuation, hold otherwise (query/dup phases).
+            let newf = sf(23) * (b0next.clone() + nv(REFSEL));
+            let cont = sf(23) * phc.clone() * (AB::Expr::ONE - cv(BLKLAST));
+            for i in 0..6 {
+                let rot = match i {
+                    0 => AB::Expr::ZERO,
+                    5 => cv(BIDX + 4) + cv(BIDX + 5),
+                    _ => cv(BIDX + i - 1),
+                };
+                t.assert_eq(
+                    nv(BIDX + i),
+                    cv(BIDX + i)
+                        + newf.clone()
+                            * (if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO } - cv(BIDX + i))
+                        + cont.clone() * (rot - cv(BIDX + i)),
+                );
+            }
+            // BLKCNT: reload at obs starts, 1 at refills, decrement on
+            // continuation (chal) and during the dup chain, 148 at dup entry.
+            let mut reload = AB::Expr::ZERO;
+            for f in 1..8 {
+                reload = reload
+                    + nv(SHSEL + shsel_index(f, 0)) * (c(FLUSH_BLOCKS[f] as u32) - cv(BLKCNT));
+            }
+            let dupdec = sf(23) * cv(PHD) * (AB::Expr::ONE - cv(BLKLAST));
+            t.assert_eq(
+                nv(BLKCNT),
+                cv(BLKCNT)
+                    + sf(23) * reload
+                    + sf(23) * nv(REFSEL) * (AB::Expr::ONE - cv(BLKCNT))
+                    + cont.clone() * (-AB::Expr::ONE)
+                    + dupdec * (-AB::Expr::ONE)
+                    + phasegate.clone() * (c(148) - cv(BLKCNT)),
+            );
+            // Phase evolution.
+            t.assert_eq(nv(PHC), phc.clone() - phasegate.clone());
+            t.assert_eq(nv(PHD), cv(PHD) + phasegate.clone() - phdend.clone());
+            t.assert_eq(nv(PHQ), phq.clone() + phdend.clone() - endgate.clone());
+            // Chain gate: a consumer perm's first 16 preimage limbs are the
+            // previous perm's digest.
+            let chainsel_next = {
+                let mut e = nv(REFSEL);
+                for f in 1..8 {
+                    e = e + nv(SHSEL + shsel_index(f, 0));
+                }
+                e
+            };
+            for m in 0..16 {
+                t.assert_zero(sf(23) * chainsel_next.clone() * (nv(pcol(m)) - cv(ocol(m))));
+            }
+            // XOR blocks: capacity carries + OREG capture of the previous
+            // output's rate limbs.
+            for i in 68..100 {
+                t.assert_zero(sf(23) * xorsel_next.clone() * (nv(pcol(i)) - cv(ocol(i))));
+            }
+            for i in 0..68 {
+                let g = sf(23) * xorsel_next.clone();
+                t.assert_eq(
+                    nv(OREG + i),
+                    cv(OREG + i) + g * (cv(ocol(i)) - cv(OREG + i)),
+                );
+            }
+            // F2 digest capture at flush 2's last block.
+            let f2last = sf(23) * cv(SHSEL + shsel_index(2, FLUSH_BLOCKS[2] - 1));
+            for m in 0..16 {
+                t.assert_eq(
+                    nv(F2DIG + m),
+                    cv(F2DIG + m) + f2last.clone() * (cv(ocol(m)) - cv(F2DIG + m)),
+                );
+            }
+            // Dup-chain digest binding at the duplicate's last block.
+            for m in 0..16 {
+                t.assert_zero(phdend.clone() * (cv(ocol(m)) - cv(F2DIG + m)));
+            }
+        }
+        // Dup first block: fresh keccak-256 state (capacity zero); B0 obs
+        // blocks likewise.
+        for i in 68..100 {
+            builder.assert_zero(cv(PHD) * cv(CMPC) * cv(pcol(i)));
+            let mut b0 = cv(SHSEL); // F0B0
+            for f in 1..8 {
+                b0 = b0 + cv(SHSEL + shsel_index(f, 0));
+            }
+            builder.assert_zero((b0 + cv(REFSEL)) * cv(pcol(i)));
+        }
+        // The last-row phase anchor is the QSEL check emitted above.
+        let _ = (cf, extmul, pv, nv, phc, c, xorsel, consumersel);
     }
 }
 
@@ -1108,7 +1362,10 @@ pub(crate) fn outer_pvs(sched: &Schedule, inner_pvs: &[Val]) -> Vec<Val> {
         }
     }
     assert_eq!(inner_pvs.len(), N_PVS);
-    opvs.extend_from_slice(inner_pvs);
+    // Inner public values ride the outer interface in their transcript
+    // encoding (Monty words), matching the absorbed bytes.
+    let rr = monty_rr();
+    opvs.extend(inner_pvs.iter().map(|v| *v * rr));
     assert_eq!(opvs.len(), N_OPVS);
     opvs
 }
@@ -1251,6 +1508,21 @@ fn lane_plan(sched: &Schedule) -> (Vec<[u64; 25]>, Vec<PInfo>) {
 // Row simulator: mirrors every constraint's transition rule exactly, and
 // self-checks captured values against the Stage-1 schedule.
 // ---------------------------------------------------------------------------
+
+/// The transcript's value encoding: `to_unique_u32` serializes the raw
+/// Monty word, so an observed/absorbed field value v appears in-circuit as
+/// the field element with canonical integer R*v mod p — i.e. v * RR where
+/// RR = from_u32(ONE.to_unique_u32()). The verification pipeline is
+/// R-homogeneous (all identities are linear in the opened values, with
+/// challenges and domain constants entering unscaled), so the rectangle
+/// operates on the scaled values throughout; only the recorder
+/// cross-checks need the explicit factor.
+pub(crate) fn monty_rr() -> Val {
+    Val::from_u32(Val::ONE.to_unique_u32())
+}
+fn scale(e: Ext) -> Ext {
+    e * ext_base(monty_rr())
+}
 
 fn ext_of(v: &[Val; 4]) -> Ext {
     Ext::from_basis_coefficients_fn(|i| v[i])
@@ -1723,6 +1995,29 @@ pub(crate) fn build_gate_trace(
         .collect();
     assert_eq!(fpoly.len(), 16);
     let fa = sched.fri_alpha;
+    // Oracle: the concatenated zeta-opening ext values from the obs stream.
+    let zvals: Vec<Ext> = {
+        let mut bytes = vec![];
+        for g in 0..3 {
+            bytes.extend_from_slice(
+                &sched
+                    .obs
+                    .iter()
+                    .find(|o| o.label == m4gaterec::ObsLabel::ZetaVals { group: g })
+                    .unwrap()
+                    .bytes,
+            );
+        }
+        bytes
+            .chunks(16)
+            .map(|c| {
+                Ext::from_basis_coefficients_fn(|i| {
+                    Val::from_u32(u32::from_le_bytes(c[4 * i..4 * i + 4].try_into().unwrap()))
+                })
+            })
+            .collect()
+    };
+    let mut zvi = 0usize;
 
     let mut regs = Regs::new();
     regs.fsfull = hosted.get(&0).map_or(false, |d| d.len() == 8);
@@ -1887,7 +2182,8 @@ pub(crate) fn build_gate_trace(
                     (72, 14) => {
                         regs.a0 = regs.pzacc;
                         regs.p0 = regs.preg;
-                        assert_eq!(regs.a0, sched.pz[0], "A0 capture = PZ0");
+                        assert_eq!(zvi, TW, "values consumed at A0 capture");
+                        assert_eq!(regs.a0, scale(sched.pz[0]), "A0 capture = PZ0");
                         assert_eq!(regs.p0, sched.alpha_off[0], "P0 capture");
                     }
                     (145, 7) => {
@@ -1895,7 +2191,7 @@ pub(crate) fn build_gate_trace(
                         regs.p1 = regs.preg;
                         assert_eq!(
                             regs.a1 - regs.a0,
-                            sched.alpha_off[0] * sched.pz[1],
+                            scale(sched.alpha_off[0] * sched.pz[1]),
                             "A1 span capture"
                         );
                         assert_eq!(regs.p1, sched.alpha_off[1], "P1 capture");
@@ -1904,7 +2200,7 @@ pub(crate) fn build_gate_trace(
                         regs.a2 = regs.pzacc;
                         assert_eq!(
                             regs.a2 - regs.a1,
-                            sched.alpha_off[1] * sched.pz[2],
+                            scale(sched.alpha_off[1] * sched.pz[2]),
                             "A2 span capture"
                         );
                     }
@@ -1930,6 +2226,8 @@ pub(crate) fn build_gate_trace(
                         _ => Val::from_u64(w1v as u64),
                     });
                     if czd {
+                        assert_eq!(v, zvals[zvi], "dup zeta value {zvi}");
+                        zvi += 1;
                         regs.pzacc += regs.preg * v;
                         regs.preg *= fa;
                     } else if cz7 {
@@ -1940,7 +2238,7 @@ pub(crate) fn build_gate_trace(
                         let rf = fold_r.unwrap();
                         let fold = &sched.queries[q_q].folds[rf];
                         let vc = regs.vc % 16;
-                        assert_eq!(v, fold.evals[vc], "fold leaf value");
+                        assert_eq!(v, scale(fold.evals[vc]), "fold leaf value");
                         if vc == fold.index_in_group {
                             assert_eq!(v, regs.runev, "running eval position");
                         }
@@ -2131,7 +2429,7 @@ pub(crate) fn build_gate_trace(
                         7 => regs.mchain = bank_add(&mut values, row, regs.scr[2], regs.scr[3]),
                         8 => {
                             let ro = bank_add(&mut values, row, regs.mchain, regs.scr[4]);
-                            assert_eq!(ro, qr.ro, "reduced opening");
+                            assert_eq!(ro, scale(qr.ro), "reduced opening");
                             regs.runev = ro;
                         }
                         _ => {}
@@ -2150,7 +2448,7 @@ pub(crate) fn build_gate_trace(
                             let outv = (lo + hi) * ext_base(consts.half)
                                 + regs.breg[l] * ext_base(consts.kf[rf][l][i]) * (lo - hi);
                             if r == pairs.len() - 1 {
-                                assert_eq!(outv, qr.folds[rf].folded, "fold output");
+                                assert_eq!(outv, scale(qr.folds[rf].folded), "fold output");
                                 regs.runev = outv;
                             } else {
                                 regs.scr[i] = outv;
@@ -2176,7 +2474,7 @@ pub(crate) fn build_gate_trace(
                             let c2 = bank_add(&mut values, row, c1, regs.fpreg[14 - r]);
                             regs.mchain = c2;
                             if r == 14 {
-                                assert_eq!(c2, qr.final_eval, "final-poly eval");
+                                assert_eq!(c2, scale(qr.final_eval), "final-poly eval");
                                 assert_eq!(c2, regs.runev, "final fold compare");
                             }
                         }
@@ -2295,11 +2593,19 @@ pub(crate) fn build_gate_trace(
     for q in 0..NQ {
         assert_eq!(regs.idxr[q] as usize, sched.queries[q].index, "index register {q}");
     }
-    assert_eq!(regs.a0, sched.pz[0], "A0 = PZ group 0");
+    assert_eq!(regs.a0, scale(sched.pz[0]), "A0 = PZ group 0");
     assert_eq!(regs.p0, sched.alpha_off[0], "P0 = fri_alpha^617");
-    assert_eq!(regs.a1 - regs.a0, sched.alpha_off[0] * sched.pz[1], "A1 span");
+    assert_eq!(
+        regs.a1 - regs.a0,
+        scale(sched.alpha_off[0] * sched.pz[1]),
+        "A1 span"
+    );
     assert_eq!(regs.p1, sched.alpha_off[1], "P1 = fri_alpha^1234");
-    assert_eq!(regs.a2 - regs.a1, sched.alpha_off[1] * sched.pz[2], "A2 span");
+    assert_eq!(
+        regs.a2 - regs.a1,
+        scale(sched.alpha_off[1] * sched.pz[2]),
+        "A2 span"
+    );
     assert_eq!(regs.fpi, 16, "final poly fully captured");
 
     (RowMajorMatrix::new(values, GATE_WIDTH), meta)
@@ -2318,13 +2624,51 @@ mod tests {
     use super::*;
     use crate::m4gaterec::{consensus_proof, walk};
 
-    pub(crate) fn shared() -> &'static (Schedule, Vec<Val>) {
-        static CELL: OnceLock<(Schedule, Vec<Val>)> = OnceLock::new();
+    pub(crate) fn shared() -> &'static (Schedule, Vec<Val>, Vec<Ext>) {
+        static CELL: OnceLock<(Schedule, Vec<Val>, Vec<Ext>)> = OnceLock::new();
         CELL.get_or_init(|| {
             let (_inst, pvs, proof) = consensus_proof();
             let sched = walk(&proof, &pvs);
-            (sched, pvs)
+            let tl = proof.opened_values.trace_local.clone();
+            (sched, pvs, tl)
         })
+    }
+
+    /// TEMP: byte-parse cross-check of the zeta-opening obs stream.
+    #[test]
+    fn probe_zval_parse() {
+        let (sched, _, tl) = shared();
+        let bytes = &sched
+            .obs
+            .iter()
+            .find(|o| o.label == m4gaterec::ObsLabel::ZetaVals { group: 0 })
+            .unwrap()
+            .bytes;
+        for k in 0..2 {
+            let c = &bytes[16 * k..16 * k + 16];
+            let raw: Vec<u32> = (0..4)
+                .map(|i| u32::from_le_bytes(c[4 * i..4 * i + 4].try_into().unwrap()))
+                .collect();
+            let tls: &[Val] = tl[k].as_basis_coefficients_slice();
+            let tlc: Vec<u32> = tls.iter().map(|x| x.to_unique_u32()).collect();
+            let rt: Vec<u32> = raw
+                .iter()
+                .map(|x| Val::from_u32(*x).to_unique_u32())
+                .collect();
+            eprintln!("value {k}: obs u32s {raw:?}");
+            eprintln!("value {k}: tl  u32s {tlc:?}");
+            eprintln!("value {k}: roundtrip {rt:?}");
+        }
+        // And the whole group-0 sum three ways.
+        let fa = sched.fri_alpha;
+        let mut acc = Ext::ZERO;
+        let mut pow = Ext::ONE;
+        for v in tl.iter() {
+            acc += pow * *v;
+            pow *= fa;
+        }
+        eprintln!("sum over trace_local == pz0: {}", acc == sched.pz[0]);
+        eprintln!("trace_local len {}", tl.len());
     }
 
     /// The lowering runs against the real schedule: every internal
@@ -2333,7 +2677,7 @@ mod tests {
     /// during the build.
     #[test]
     fn gate_lowering_builds() {
-        let (sched, pvs) = shared();
+        let (sched, pvs, _) = shared();
         let (trace, meta) = build_gate_trace(sched, pvs, 0);
         assert_eq!(trace.height(), 1 << 16);
         assert_eq!(meta.query_rows.len(), NQ);
@@ -2348,7 +2692,7 @@ mod tests {
     /// Positive: the rectangle accepts the genuine M3 consensus proof.
     #[test]
     fn gate_rectangle_satisfies() {
-        let (sched, pvs) = shared();
+        let (sched, pvs, _) = shared();
         let (trace, meta) = build_gate_trace(sched, pvs, 0);
         check_constraints(&VerifierGateAir::new(), &trace, &meta.opvs);
     }
