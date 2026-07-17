@@ -2,10 +2,13 @@
 
 Branch `claude/m4-0bii-inc4`. This session (Opus 4.8) picked up the Stage-1 +
 Stage-2 relay and executed `docs/m4gate-inc4-spec.md`. **STATUS: PARTIAL.**
-The positive gate passes and two of the four gate-exit negatives bind; the
-ext-arithmetic constraint pipeline (the bulk of spec §2.1–2.4) is the
-remainder. Everything below is reproduced from tests in
+The positive gate passes and **three of the four** gate-exit negatives bind
+(wrong-root, tampered-opening, wrong-challenge); only bad-fold awaits the
+ext-arithmetic fold pipeline. Everything below is reproduced from tests in
 `crates/qlab-bench/src/m4gate.rs`.
+
+**Update (Stage D):** the FS/challenge binding is built — see that section
+below. The coverage table and remainder are updated accordingly.
 
 ## What the first action found
 
@@ -47,27 +50,67 @@ not weakenings.
 |---|---|---|
 | 2 wrong root | flip an outer public value (cap limb) | **UNSAT (bound)** |
 | 1 tampered opening | flip a query leaf preimage limb | **UNSAT (bound)** |
-| 3 wrong challenge | flip an accepted field-draw / CHAL limb | SAT (unbound) |
+| 3 wrong challenge | flip an accepted field-draw FSACC / CHAL limb | **UNSAT (bound, Stage D)** |
 | 4 bad fold | flip a running-fold-eval (RUNEV) limb | SAT (unbound) |
 | (bank sanity) | flip a mul-bank output | UNSAT (bound) |
 
-Negatives 1 and 2 are permanent passing tests (`gate_neg_wrong_root`,
-`gate_neg_tampered_opening`). Negatives 3 and 4 are written but `#[ignore]`d
-with the exact remainder in the attribute — **not weakened to pass**. Un-ignore
-them when the pipeline lands.
+Negatives 1, 2, 3 are permanent passing tests (`gate_neg_wrong_root`,
+`gate_neg_tampered_opening`, `gate_neg_wrong_challenge_fs` +
+`gate_neg_wrong_challenge_chal`). Negative 4 is written but `#[ignore]`d with
+the exact remainder in the attribute — **not weakened to pass**. Un-ignore it
+when the fold pipeline lands.
 
-Root cause of the two remainders: `eval` leaves the entire ext-arithmetic
-pipeline as free witness — `extmul` is unused in `eval`. Free regions:
-challenge assembly (COEF/CURCH/CHAL), reduced openings (PZACC/PREG), fold
-ladders (SCR/BREG/RUNEV), final poly (FPREG), ext-inv (INV2S/INVZ/INVZN), and
-the FS draw gadget internals (FSBITS/FSACC/accept). The structural half —
-keccak lane, Merkle path/cap, scheduling rings, banks — *is* constrained, which
-is why negatives 1 and 2 already bind.
+Root cause of the *remaining* bad-fold gap: `eval` still leaves the ext-arith
+pipeline as free witness — `extmul` is unused in `eval`. Free regions: reduced
+openings (PZACC/PREG), fold ladders (SCR/BREG/RUNEV), final poly (FPREG),
+ext-inv (INV2S/INVZ/INVZN). The FS draw gadget and challenge assembly are now
+bound (Stage D).
+
+## Stage D — FS/challenge binding (closes wrong-challenge)
+
+The FS draw gadget and ext-challenge assembly are now constrained in `eval`,
+mirroring the proven inc-3 gadget in `m4route.rs`. The soundness chain:
+
+  sponge digest (preimage limbs, bound by keccak lane + chain gate)
+    → FSBITS  (limb consistency: `fs*(limb_mux - (b_hi + 2^8*b_lo))`)
+    → FSACC / masked  (even-row byte load; 31-bit masked value)
+    → FSACCEPT  (rejection comparator: reject iff bits 24..30 all one AND
+       low-24 nonzero — the native SerializingChallenger32 resample rule)
+    → CURCH  (accepted field draws load COEF-ring-selected limbs)
+    → CHAL[grp]  (every 4th accepted draw assembles the GRP-ring-selected
+       ext challenge; GRP-phase field groups 0..6 only — PoW/query-index
+       bits draws are gated out by `field_grp` and left for sample_bits).
+
+Two independent tampers are now caught (`gate_neg_wrong_challenge_fs`,
+`gate_neg_wrong_challenge_chal`): flipping an accepted draw's FSACC (byte
+gadget) and flipping an assembled CHAL limb (assembly binding). All deg ≤ 3.
+
+Residual (small) sub-item: **FSGATE position** is not yet schedule-bound — a
+prover may set FSGATE=1 on extra rows. This does not open the tested tampers
+(the digest→byte→masked→CHAL chain still pins each assembled challenge to the
+real transcript, and the comparator/limb-consistency hold on any FS row), but a
+full soundness proof wants FSGATE pinned to the draw-hosting schedule (part of
+spec §2.1's periodic-schedule binding). Noted for the fold-pipeline session.
+
+## Degree budget — PRE-EXISTING violation of the deg≤3 house rule
+
+`dump_constraint` reports **max degree 6** (histogram: deg1:36, deg2:2863,
+deg3:1378, deg4:185, deg5:17, deg6:1). The deg-6 argmax is constraint #4165 —
+the Stage-2 flush-automaton `BLKCNT` phase-evolution constraint
+(`phasegate*(148-BLKCNT)`, where `phasegate = sf(23)*BLKLAST*ringsel(7)*
+grpdone*phc` is a 5-factor product). The deg 4/5/6 constraints (203 total) are
+all pre-existing Stage-2 boundary/flush products, **not** introduced this
+session (the Stage-D FS/assembly constraints are all deg ≤ 3). Stage 2 never
+wired a prove path, so this never surfaced. It matters for the bench (§4): the
+quotient degree is 5, needing more quotient chunks than a deg≤3 sizing budgets,
+and a deg≤3-configured prover would misbehave. **Remainder item:** factor the
+phasegate chain (and the other deg≥4 boundary products) through materialized
+selector columns to restore deg ≤ 3 before benching.
 
 ## Column accounting (spec §2.7) — from `dump_cols`
 
-Total **3,532 cols × 2^16 rows, 2,382 lane perms** (unchanged by Stage A/B —
-the two fixes add no columns).
+Total **3,532 cols × 2^16 rows, 2,382 lane perms** (unchanged by Stage A/B/D —
+none add columns; Stage D reuses the pre-allocated FS/draw-scheduling cols).
 
 ```
 KECCAK lane                              2633
@@ -122,28 +165,34 @@ above (3,532 cols × 2^16, 2,382 perms).
 
 ## Remainder (for the next relay session)
 
-In rough dependency order:
+DONE this session: FS draw gadget binding + ext-challenge assembly (Stage D,
+spec §2.2 byte gadget + §2.3), closing `gate_neg_wrong_challenge`.
 
-1. **FS draw gadget binding** (spec §2.2 base) — bind FSBITS/FSACC/accept to
-   the sponge squeeze; reuse the inc-3 pattern in `m4route.rs`
-   (`fs_matches_native_challenger`). Also bind the GRP/COEF ring rotations to
-   the draw-complete signal (GROT/CROT columns already exist) — this is the
-   schedule-binding half of spec §2.1 for draws, and gives the GROUPREQ gate
-   real teeth.
+In rough dependency order, still open:
+
+1. **Degree reduction to ≤ 3** (pre-existing, blocks the bench) — factor the
+   Stage-2 flush-automaton deg 4/5/6 boundary products (phasegate chain etc.)
+   through materialized selector columns. See the degree-budget section.
 2. **sample_bits** (§2.2) — LE-bytes-from-digest-end, mask to log2(domain), no
-   rejection; native cross-check like inc-3.
-3. **Ext-challenge assembly** (§2.3) — 4 accepted base draws → 4-limb ext tuple
-   into CHAL; cross-check limb order vs `p3_field`.
-4. **Ext-arithmetic pipeline** (§2.1) — reduced openings (PZACC/PREG), fold
+   rejection; native cross-check like inc-3. The FS byte gadget is shared; add
+   the mask-only variant + query-index (bits-draw) assembly into IDXR. This is
+   also where the query-phase GROT / grp-advance for bits draws gets bound.
+3. **FSGATE schedule binding** (§2.1) — pin FSGATE to the draw-hosting rows so
+   the gadget can't be spuriously activated (see Stage-D residual note).
+4. **GRP/COEF ring rotation binding** (§2.1) — bind the GRP ring rotation to
+   GROT (COEF rotation to CROT is now implicit in the assembly, but the GRP
+   ring itself is still free witness), giving the GROUPREQ gate real teeth.
+5. **Ext-arithmetic pipeline** (§2.1) — reduced openings (PZACC/PREG), fold
    ladders (SCR/BREG/RUNEV), final poly Horner (FPREG); use the `extmul`
    helper already defined (but unused) in `eval`. Closes `gate_neg_bad_fold`.
-5. **Batched ext-inv** (§2.4) — 60 inversions via one mul-bank product chain +
+6. **Batched ext-inv** (§2.4) — 60 inversions via one mul-bank product chain +
    single witnessed inverse; layout-doc subsystem 5.
-6. **Canonicity** (§2.6) — constrain the `< p` comparator (above).
-7. **Public surface** (§2.5) — the outer PVs already expose caps + inner PVs;
+7. **Canonicity** (§2.6) — constrain the `< p` comparator (above).
+8. **Public surface** (§2.5) — the outer PVs already expose caps + inner PVs;
    add the running-digest / verified-flag upward binding for the tree node.
-8. **Bench** (§4) — wire an `m4gate` mode (copy `m4route`/`m4skel`), two configs
-   (b4/q40, b16/q20), two fresh runs → run1.md/run2.md.
+9. **Bench** (§4) — after degree reduction: wire an `m4gate` mode (copy
+   `m4route`/`m4skel`), two configs (b4/q40, b16/q20), two fresh runs →
+   run1.md/run2.md.
 
 Debug tooling left in place for the relay: `dump_constraint` (constraint index
 → referenced column regions, `colname` mapper), `dump_trace` (de-Monty'd

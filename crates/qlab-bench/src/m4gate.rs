@@ -1355,8 +1355,138 @@ where
             }
             builder.assert_zero((b0 + cv(REFSEL)) * cv(pcol(i)));
         }
+        // =====================================================================
+        // FS draw gadget (inc-4): byte-packing + rejection comparator, bound
+        // to the sponge digest via limb consistency. Mirrors the proven inc-3
+        // gadget in m4route.rs; active on every FS row (FSGATE = 1), which the
+        // witness places on the first 2*ndraws rows of a draw-hosting perm.
+        // Draw j occupies row offsets 2j (even) and 2j+1 (odd); it reads
+        // digest limbs 2g and 2g+1 for g = 7 - j (pop-from-end byte order).
+        // =====================================================================
+        {
+            let fs = cv(FSGATE);
+            builder.assert_bool(fs.clone());
+            let bit = |i: usize| -> AB::Expr { cv(FSBITS + i) };
+            for i in 0..16 {
+                builder.assert_bool(bit(i));
+            }
+            // Byte recompositions (bits 0..8 = draw-low byte = limb high byte;
+            // bits 8..16 = draw-high byte = limb low byte).
+            let mut b_lo = AB::Expr::ZERO;
+            let mut b_hi = AB::Expr::ZERO;
+            let mut b_hi_masked = AB::Expr::ZERO; // top byte with bit 7 dropped
+            for i in 0..8 {
+                let wgt = c(1 << i);
+                b_lo = b_lo + wgt.clone() * bit(i);
+                b_hi = b_hi + wgt.clone() * bit(8 + i);
+                if i < 7 {
+                    b_hi_masked = b_hi_masked + wgt * bit(8 + i);
+                }
+            }
+            // Limb consistency: on FS row r (draw j = r/2, g = 7-j), the read
+            // limb is preimage limb 2g+1 (even) or 2g (odd); both recompose to
+            // limb = b_hi + 2^8 * b_lo. This ties the draw to the real digest.
+            let mut limb_mux = AB::Expr::ZERO;
+            for r in 0..16 {
+                let j = r / 2;
+                let m = if r % 2 == 0 { 2 * (7 - j) + 1 } else { 2 * (7 - j) };
+                limb_mux = limb_mux + sf(r) * cv(pcol(m));
+            }
+            builder.assert_zero(fs.clone() * (limb_mux - (b_hi.clone() + c(1 << 8) * b_lo.clone())));
+            // Even/odd row selectors within the FS window.
+            let mut even_mux = AB::Expr::ZERO;
+            let mut odd_mux = AB::Expr::ZERO;
+            for j in 0..8 {
+                even_mux = even_mux + sf(2 * j);
+                odd_mux = odd_mux + sf(2 * j + 1);
+            }
+            // FSODD materialization (fs * odd row) and the even-row ACC load:
+            // the odd row's FSACC = the draw's low 16 bits, computed on the
+            // even row as b_lo + 2^8 * b_hi (even-row bytes = x3, x2).
+            builder.assert_eq(cv(FSODD), fs.clone() * odd_mux.clone());
+            builder.assert_zero(
+                fs.clone()
+                    * even_mux
+                    * (nv(FSACC) - (b_lo.clone() + c(1 << 8) * b_hi.clone())),
+            );
+            // Rejection comparator (materialized bit products, deg <= 3):
+            // reject iff bits 24..30 all one AND low-24 bits nonzero.
+            builder.assert_eq(cv(FSP3A), bit(8) * bit(9) * bit(10));
+            builder.assert_eq(cv(FSP3B), bit(11) * bit(12) * bit(13));
+            builder.assert_eq(cv(FST7), cv(FSP3A) * cv(FSP3B) * bit(14));
+            let low24 = cv(FSACC) + c(1 << 16) * b_lo.clone();
+            builder.assert_eq(cv(FSNZ), low24.clone() * cv(FSINV));
+            builder.assert_bool(cv(FSNZ));
+            builder.assert_zero((AB::Expr::ONE - cv(FSNZ)) * low24);
+            builder.assert_zero(fs.clone() * (cv(FSACCEPT) - (AB::Expr::ONE - cv(FST7) * cv(FSNZ))));
+
+            // =================================================================
+            // Ext-challenge assembly (inc-4): accepted field draws (challenger
+            // phase) feed the COEF ring / CURCH limbs; every 4th accepted draw
+            // assembles CHAL[grp] and advances the GRP ring. Query-index (bits)
+            // draws live in the query phase and are handled by sample_bits
+            // (spec 2.2, next); the phc gate keeps them out of here.
+            // =================================================================
+            let masked = cv(FSACC) + c(1 << 16) * b_lo + c(1 << 24) * b_hi_masked;
+            // A field-challenge group (0..6) is the ring head. Query-index and
+            // PoW (bits) draws sit at grp >= G_POW and must NOT drive the
+            // challenge assembly even though they run the same byte gadget.
+            let field_grp = (0..N_CHALS)
+                .map(|g| cv(ring_at(GRP, N_GROUPS, g)))
+                .fold(AB::Expr::ZERO, |a, e| a + e);
+            // CROT = accept, on an odd FS row whose active group is a field
+            // challenge. (bits draws set CROT = 0.)
+            builder.assert_bool(cv(CROT));
+            builder.assert_bool(cv(GROT));
+            builder.assert_eq(cv(CROT), field_grp.clone() * cv(FSODD) * cv(FSACCEPT));
+            // GROT = CROT & (coef == 3): the 4th accepted limb completes a
+            // challenge. Constrained only at field groups; query-phase GROT
+            // (sample_bits) is still free here.
+            let coef3 = cv(ring_at(COEF, 4, 3));
+            builder.assert_zero(field_grp * (cv(GROT) - cv(CROT) * coef3));
+            // First-row pins: no challenge assembled yet.
+            for k in 0..4 {
+                builder.when_first_row().assert_zero(cv(CURCH + k));
+            }
+            for k in 0..4 * N_CHALS {
+                builder.when_first_row().assert_zero(cv(CHAL + k));
+            }
+            {
+                let mut t = builder.when_transition();
+                // COEF ring: left-rotate (increment logical coef) on CROT.
+                for i in 0..4 {
+                    t.assert_eq(
+                        nv(COEF + i),
+                        cv(COEF + i) + cv(CROT) * (cv(COEF + (i + 1) % 4) - cv(COEF + i)),
+                    );
+                }
+                // CURCH: an accepted draw at coef c<3 loads CURCH[c] = masked;
+                // slot 3 is never loaded (the 4th limb goes straight to CHAL).
+                for cc in 0..3 {
+                    let gate = cv(CROT) * cv(ring_at(COEF, 4, cc));
+                    t.assert_eq(
+                        nv(CURCH + cc),
+                        cv(CURCH + cc) + gate * (masked.clone() - cv(CURCH + cc)),
+                    );
+                }
+                t.assert_eq(nv(CURCH + 3), cv(CURCH + 3));
+                // CHAL[grp] assembly on GROT: limbs (CURCH0..2, masked) into
+                // the GRP-ring-selected challenge register; carries otherwise.
+                for g in 0..N_CHALS {
+                    let gate = cv(GROT) * cv(ring_at(GRP, N_GROUPS, g));
+                    for k in 0..4 {
+                        let asm = if k < 3 { cv(CURCH + k) } else { masked.clone() };
+                        t.assert_eq(
+                            nv(CHAL + 4 * g + k),
+                            cv(CHAL + 4 * g + k) + gate.clone() * (asm - cv(CHAL + 4 * g + k)),
+                        );
+                    }
+                }
+            }
+        }
+
         // The last-row phase anchor is the QSEL check emitted above.
-        let _ = (cf, extmul, pv, nv, phc, c, xorsel, consumersel);
+        let _ = (cf, extmul, pv, xorsel, consumersel);
     }
 }
 
@@ -2763,7 +2893,19 @@ mod tests {
         let air = VerifierGateAir::new();
         let layout = AirLayout::from_air::<Val>(&air);
         let cs = get_symbolic_constraints::<Val, _>(&air, layout);
-        eprintln!("total constraints: {}", cs.len());
+        let (argmax, maxdeg) = cs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, c.degree_multiple()))
+            .max_by_key(|&(_, d)| d)
+            .unwrap();
+        eprintln!("total constraints: {} | max degree: {maxdeg} at #{argmax}", cs.len());
+        // Count constraints by degree.
+        let mut hist = std::collections::BTreeMap::new();
+        for c in &cs {
+            *hist.entry(c.degree_multiple()).or_insert(0usize) += 1;
+        }
+        eprintln!("degree histogram: {hist:?}");
         fn collect(
             e: &SymbolicExpression<Val>,
             cur: &mut BTreeSet<usize>,
@@ -3005,22 +3147,33 @@ mod tests {
         });
     }
 
-    /// Gate-exit negative 3 (wrong challenge). REMAINDER: not yet bound. The
-    /// FS draw gadget (FSBITS/FSACC/accept) and the challenge assembly
-    /// (COEF/CURCH/CHAL) are still free witness in `eval` (the ext-arith
-    /// pipeline is unconstrained), so a forged challenge is accepted. Closing
-    /// this needs the FS-gadget binding (inc-3 pattern, m4route.rs) plus the
-    /// sample_bits / ext-challenge-assembly work (spec 2.2/2.3). See the
-    /// `tamper_coverage` probe. Un-ignore once that pipeline lands.
+    /// Gate-exit negative 3 (wrong challenge). BOUND (inc-4): the FS draw
+    /// gadget ties FSBITS/FSACC to the sponge digest (limb consistency), the
+    /// comparator fixes accept/reject, and the COEF/CURCH ring assembles
+    /// CHAL[grp] from the accepted draws. Two independent tampers are caught:
+    ///   (a) flip an accepted field draw's FSACC (byte gadget), and
+    ///   (b) flip an assembled challenge limb CHAL[0] (assembly binding).
     #[test]
-    #[ignore = "remainder: FS/challenge binding not yet built (spec 2.2/2.3)"]
-    fn gate_neg_wrong_challenge() {
+    fn gate_neg_wrong_challenge_fs() {
         let w = GATE_WIDTH;
         assert_unsat(move |t, _o| {
             let (sched2, pvs2, _) = shared();
             let (_, m) = build_gate_trace(sched2, pvs2, 0);
             let (row, _) = m.field_draws[0];
             t.values[row * w + FSACC] += Val::ONE;
+        });
+    }
+
+    #[test]
+    fn gate_neg_wrong_challenge_chal() {
+        let w = GATE_WIDTH;
+        // Flip alpha's limb 0 at a query row (alpha is long since assembled
+        // there): breaks the CHAL carry / assembly binding.
+        assert_unsat(move |t, _o| {
+            let (sched2, pvs2, _) = shared();
+            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let row = m.query_rows[0];
+            t.values[row * w + CHAL] += Val::ONE;
         });
     }
 
