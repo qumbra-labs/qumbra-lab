@@ -68,9 +68,9 @@ build reports measured numbers.
 | increment | what | status |
 |---|---|---|
 | 1 — skeleton | LaneBuilder composition + three lanes coexisting at projected cost (b4 = 476–561 ms / 3.58 GB / 597.9 KB) | ✅ lab PR #15, `m4skel` mode |
-| 2 — injection routing | opened values -> keccak lane bytes + bank limbs (equality-bank precedent) | next |
-| 3 — FS byte-packing | lane digests -> challenge field elements (top unknown) | after 2 |
-| 4 — real schedule + binding + tests | verify a real M3 proof in-circuit; positive + negative tests; gate exit | after 3 |
+| 2 — injection routing | opened values -> keccak lane bytes + bank limbs; same-row via the perm-replicated preimage (no accumulator windows needed) | ✅ `m4route` mode, runs in `docs/m4route-step0bii-run{1,2}.md` |
+| 3 — FS byte-packing | lane digests -> challenge field elements; native mask-31-bits + reject-if-≥p convention, cross-checked against the real challenger | ✅ same PR; the ~16-col routing allowance realized at **28 cols** (16 = byte-range bits; total 2,685, +0.45% cells, b4 = 455–497 ms / 3.61 GB / 603.1 KB) |
+| 4 — real schedule + binding + tests | verify a real M3 proof in-circuit (program-ring-bound gates, sample_bits draws, ext-challenge assembly, public binding); positive + negative tests; gate exit | next |
 
 Prover-performance lessons already learned (do not relearn): narrow eval's
 Expr conversion to the columns actually used (a full-width collect runs per

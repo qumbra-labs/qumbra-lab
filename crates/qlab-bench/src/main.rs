@@ -15,6 +15,7 @@ mod levers;
 mod narrow_bench;
 mod m4census;
 mod m4price;
+mod m4route;
 mod m4skel;
 mod m4anchor;
 
@@ -897,6 +898,12 @@ fn main() {
             let only_pos = args.iter().position(|a| a == "--only");
             let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
             m4skel::run_m4skel(&power, only);
+            return;
+        }
+        "m4route" => {
+            let only_pos = args.iter().position(|a| a == "--only");
+            let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
+            m4route::run_m4route(&power, only);
             return;
         }
         "m4price" => {
