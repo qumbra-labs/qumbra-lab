@@ -1,5 +1,28 @@
 # M3 — full 2×2 bucket circuit over the narrow-Keccak pipeline (design draft, 2026-07-17)
 
+> **MEASURED OUTCOME (2026-07-17, `bucket` bench mode, reproduced twice —
+> runs in `docs/bucket-M3-run*.md`): the complete 2×2 bucket passes both
+> gates at the decided consensus config with margin — 136.4 KB / 1.6 s
+> (fixed-width wire format; 130.7 KB / 2.0 s at q19/g24).** Three findings
+> overturned §4b's hairline-breach projection:
+> 1. **The bucket fits 2^18 rows, not 2^19** — the real schedule is 83
+>    perms (2×38 input chains + 4 output + bal + end + warm-up), 254,976
+>    rows; the 96-perm/2^19 budget in §1 was conservative. Height halves,
+>    prove time halves (1.6 s), and the M2 memory ladder improves a full
+>    step (b8 LDE ≈ 5.2 GB at 2^18).
+> 2. **The campaign's postcard codec is a varint artifact**: dummy-trace
+>    zero columns compress (~1 B/value), dense 31-bit circuit values
+>    inflate (~5 B/value, ~+18% vs a production fixed-width format). The
+>    `bucket` mode reports both; gate verdicts use bincode-fixed (a
+>    conservative fixed-width proxy: 4 B/field element, 8 B lengths).
+>    Postcard numbers remain the campaign's internal comparator; the
+>    design repo gets the dual-metric note.
+> 3. Final circuit: **618 cols**, 11 tests green including the full-bucket
+>    positive (real public values) and wrong-nf/fee/anchor negatives;
+>    epoch one-shot column solves program replay in padding; balance =
+>    16-bit-limb borrow chain (exact integers).
+> The §4b options table is therefore moot — **no target amendment needed.**
+
 Statement source: qumbra-design `transaction-model-and-anonymity-set.md` §4–6/§8
 (binding spec). Target fixed by the branch-(b) decision: **consensus config
 b16/q20/g20/fp16/a16, ≤150 KB proof, ≤3 s laptop prove.** Estimate: 6–12
@@ -141,5 +164,6 @@ amendment to qumbra-design if the measured full circuit lands over.
 | 1 | program ring + `eff` injection + dummy-perm wiring (chain still garbage-correct, tests keep passing) | **done (this PR)** — plus the phase-packing diet after step-1 measured 152.5 KB |
 | 2 | Merkle mux + witness lanes + reference node hashing + semantic tests (16-step chain vs reference, corruption negatives) | **done (this PR)** — real AIR 145.4 KB / 2.3 s, both gates green |
 | 3a | key/nullifier/cm wiring + the two equality banks + input-chain semantics + bank negative tests | **done (this PR)** — real AIR 563 cols, **148.1 KB / 2.9 s** at consensus (fp32 variant: 147.5) — both gates green with ~1.3% / 3.6% margin |
-| 3b | bind accumulators (+16), balance (+~8), outputs + full-tx reference + negatives | ~1–2 session-hours; **projected ~590 cols → ~151 KB / ~3.05 s: both gates hairline-BREACHED** — mitigation (iii) decision needed before or with this step (see below) |
+| 3b | bind accumulators, balance, outputs, epoch one-shot, full-tx builder + negatives | **done (this PR)** — 618 cols; measured outcome block at the top of this doc |
+| 4 | `bucket` bench mode + reproduction + design-repo write-up | bench mode + runs **done (this PR)**; design-repo write-up next |
 | 4 | bench mode `bucket`, measure vs gates, reproduce, docs + design-repo write-up (EN+ZH) | ~1–2 session-hours |

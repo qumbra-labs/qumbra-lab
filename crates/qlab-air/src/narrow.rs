@@ -76,17 +76,30 @@ const PH_OFF: usize = PB_OFF + 24; // 426: 4: perm-phase ring (mod-4 counter)
 const PR_OFF: usize = PH_OFF + 4; // 430: 24: program ring, 4 slots x 4 bits/limb
 const D_OFF: usize = PR_OFF + 24; // 454: 16: bit-decomposition of PR[0]
 const RB_OFF: usize = D_OFF + 16; // 470: 4: current perm's role bits
-const NSEL: usize = 6; // materialized role selectors, order below
-const SEL_OFF: usize = RB_OFF + 4; // 474: 6: [merkle, nf, ank, arkm, acm, acmout]
-const INJ_OFF: usize = SEL_OFF + NSEL; // 480: 5: injection flags [mrk+nf, ank, arkm, acm, acmout]
-const G4_COL: usize = INJ_OFF + 5; // 485: 1: program-ring rotation gate
-const PBIT_COL: usize = G4_COL + 1; // 486: 1: merkle path bit (constant per perm)
-const W_OFF: usize = PBIT_COL + 1; // 487: 13: witness lanes (role-multiplexed)
+const NSEL: usize = 13; // materialized role selectors, order = SEL_CODES
+const SEL_OFF: usize = RB_OFF + 4; // [mrk, nf, ank, arkm, acm, acmout, banchor, bnf1, bnf2, bcm1, bcm2, bal, end]
+const INJ_OFF: usize = SEL_OFF + NSEL; // 5: injection flags [mrk+nf, ank, arkm, acm, acmout]
+const G4_COL: usize = INJ_OFF + 5; // 1: program-ring rotation gate
+const PBIT_COL: usize = G4_COL + 1; // 1: merkle path bit (constant per perm)
+const W_OFF: usize = PBIT_COL + 1; // 13: witness lanes (role-multiplexed)
 const SIB_OFF: usize = W_OFF; // sibling digest lanes = W0..3 (merkle rows)
-const EQ_OFF: usize = W_OFF + 13; // 500: 32: two equality banks, 4 lanes x 4 chunks
-const EG_OFF: usize = EQ_OFF + 32; // 532: 6: eq gates [e1pos, e1neg, e1close, e2pos, e2neg, e2close]
-const EFF_OFF: usize = EG_OFF + 6; // 538: 25: effective round input
-pub const NARROW_WIDTH: usize = EFF_OFF + 25; // 563
+const EQ_OFF: usize = W_OFF + 13; // 32: two equality banks, 4 lanes x 4 chunks
+const EG_OFF: usize = EQ_OFF + 32; // 6: eq gates [e1pos, e1neg, e1close, e2pos, e2neg, e2close]
+// --- step 3b: one-shot epoch, bind bank, balance ---
+const EP_COL: usize = EG_OFF + 6; // 1: epoch flag (1 during program pass 0, then 0)
+const GWRAP_COL: usize = EP_COL + 1; // 1: epoch-kill gate (gperm * sel_end)
+const SE_OFF: usize = GWRAP_COL + 1; // 6: ep-gated selectors [nf, arkm, acm, acmout, bindsum, bal]
+const BQ_OFF: usize = SE_OFF + 6; // 16: bind bank, 4 lanes x 4 chunks
+const BGCAP_COL: usize = BQ_OFF + 16; // 1: bind capture gate
+const BGRST_COL: usize = BGCAP_COL + 1; // 1: bind reset gate
+const BGC_OFF: usize = BGRST_COL + 1; // 5: bind close gates [banchor, bnf1, bnf2, bcm1, bcm2]
+const BL_OFF: usize = BGC_OFF + 5; // 4: balance accumulators (16-bit chunks)
+const BLC_OFF: usize = BL_OFF + 4; // 9: carry bit encodings (3 bools x 3 carries)
+const BLCLOSE_COL: usize = BLC_OFF + 9; // 1: balance close gate
+const INJ3E_COL: usize = BLCLOSE_COL + 1; // 1: inj(acm) * ep
+const INJ4E_COL: usize = INJ3E_COL + 1; // 1: inj(acmout) * ep
+const EFF_OFF: usize = INJ4E_COL + 1; // 25: effective round input
+pub const NARROW_WIDTH: usize = EFF_OFF + 25; // 618
 
 /// Program slots (= perm slots per program period).
 pub const PROGRAM_SLOTS: usize = 96;
@@ -111,7 +124,55 @@ pub const ROLE_ACM: u32 = 5;
 /// Output cm' = H(value || rkm' || rho' || rseed'): all witness —
 /// value = W4, rkm' = W0..4, rho' = W5..9, rseed' = W9..13.
 pub const ROLE_ACMOUT: u32 = 6;
-// codes 7..16 reserved: bind-anchor / bind-nf / bind-cm / balance (step 3b).
+/// Bind perms: no injection (they chain the producer's output state, so
+/// their boundary rows carry its digest); the bind bank captures a[0..4]
+/// there and closes against the public values at the perm's last row.
+pub const ROLE_BANCHOR: u32 = 7;
+pub const ROLE_BNF1: u32 = 8;
+pub const ROLE_BNF2: u32 = 9;
+pub const ROLE_BCM1: u32 = 10;
+pub const ROLE_BCM2: u32 = 11;
+/// Balance close: the fee comparison fires at this perm's last row.
+pub const ROLE_BAL: u32 = 12;
+/// Program end: kills the one-shot epoch flag so replayed program passes
+/// in the padding region capture and close nothing.
+pub const ROLE_END: u32 = 13;
+
+/// Public-value layout: anchor, nf1, nf2, cm1, cm2 as 16 chunks each
+/// (4 lanes x 4 sixteen-bit z-chunks, chunk-major within lane), then fee
+/// as 4 sixteen-bit chunks. Helpers in `pv_vec`.
+pub const PV_ANCHOR: usize = 0;
+pub const PV_NF1: usize = 16;
+pub const PV_NF2: usize = 32;
+pub const PV_CM1: usize = 48;
+pub const PV_CM2: usize = 64;
+pub const PV_FEE: usize = 80;
+pub const PV_LEN: usize = 84;
+
+/// Pack a 256-bit digest into its 16 public-value chunks
+/// (index 4*lane + chunk, value = bits [16*chunk .. 16*chunk+16) of lane).
+pub fn pv_chunks(d: &[u64; 4]) -> [u32; 16] {
+    core::array::from_fn(|i| ((d[i / 4] >> (16 * (i % 4))) & 0xffff) as u32)
+}
+
+/// Build the full public-value vector for a bucket instance.
+pub fn pv_vec(
+    anchor: &[u64; 4],
+    nf1: &[u64; 4],
+    nf2: &[u64; 4],
+    cm1: &[u64; 4],
+    cm2: &[u64; 4],
+    fee: u64,
+) -> Vec<u32> {
+    let mut out = Vec::with_capacity(PV_LEN);
+    for d in [anchor, nf1, nf2, cm1, cm2] {
+        out.extend_from_slice(&pv_chunks(d));
+    }
+    for j in 0..4 {
+        out.push(((fee >> (16 * j)) & 0xffff) as u32);
+    }
+    out
+}
 
 /// Rows per 24-round permutation: 24 rounds x 128 rows.
 pub const ROWS_PER_PERM: usize = 24 * 128;
@@ -166,6 +227,8 @@ pub struct NarrowKeccakAir {
     /// Witness per program slot, cycled if the padded height replays the
     /// program.
     pub slot_witness: Vec<SlotWitness>,
+    /// Public fee (needed to witness the balance carry encodings).
+    pub fee: u64,
 }
 
 impl NarrowKeccakAir {
@@ -175,6 +238,7 @@ impl NarrowKeccakAir {
             log_height,
             program: [ROLE_DUMMY; PROGRAM_SLOTS],
             slot_witness: Vec::new(),
+            fee: 0,
         }
     }
 
@@ -212,6 +276,10 @@ impl NarrowKeccakAir {
 impl<F: Field> BaseAir<F> for NarrowKeccakAir {
     fn width(&self) -> usize {
         NARROW_WIDTH
+    }
+
+    fn num_public_values(&self) -> usize {
+        PV_LEN
     }
 
     fn num_periodic_columns(&self) -> usize {
@@ -421,6 +489,13 @@ where
             ROLE_ARKM,
             ROLE_ACM,
             ROLE_ACMOUT,
+            ROLE_BANCHOR,
+            ROLE_BNF1,
+            ROLE_BNF2,
+            ROLE_BCM1,
+            ROLE_BCM2,
+            ROLE_BAL,
+            ROLE_END,
         ];
         for (i, code) in sel_codes.iter().enumerate() {
             let lo = pair(r(0), r(1), code & 3);
@@ -522,12 +597,26 @@ where
         // accumulator transitions stay deg <= 3; each bank must be zero
         // when its window closes (last row of the consuming perm).
         let gperm = blast.clone() * local[PB_OFF + 1].clone();
-        builder.assert_eq(local[EG_OFF].clone(), bnd.clone() * sel_role(1));
-        builder.assert_eq(local[EG_OFF + 1].clone(), bnd.clone() * sel_role(3));
-        builder.assert_eq(local[EG_OFF + 2].clone(), gperm.clone() * sel_role(3));
-        builder.assert_eq(local[EG_OFF + 3].clone(), bnd.clone() * sel_role(1));
-        builder.assert_eq(local[EG_OFF + 4].clone(), bnd.clone() * sel_role(4));
-        builder.assert_eq(local[EG_OFF + 5].clone(), gperm.clone() * sel_role(4));
+        // ep-gated: replayed program passes in the padding must neither
+        // accumulate nor close (SE_OFF holds sel*ep, defined below).
+        builder.assert_eq(local[EG_OFF].clone(), bnd.clone() * local[SE_OFF].clone());
+        builder.assert_eq(
+            local[EG_OFF + 1].clone(),
+            bnd.clone() * local[SE_OFF + 1].clone(),
+        );
+        builder.assert_eq(
+            local[EG_OFF + 2].clone(),
+            gperm.clone() * local[SE_OFF + 1].clone(),
+        );
+        builder.assert_eq(local[EG_OFF + 3].clone(), bnd.clone() * local[SE_OFF].clone());
+        builder.assert_eq(
+            local[EG_OFF + 4].clone(),
+            bnd.clone() * local[SE_OFF + 2].clone(),
+        );
+        builder.assert_eq(
+            local[EG_OFF + 5].clone(),
+            gperm.clone() * local[SE_OFF + 2].clone(),
+        );
         for j in 0..16 {
             builder.assert_zero(local[EG_OFF + 2].clone() * local[EQ_OFF + j].clone());
             builder
@@ -536,6 +625,100 @@ where
         for j in 0..32 {
             builder.when_first_row().assert_zero(local[EQ_OFF + j].clone());
         }
+
+        // --- Step 3b: epoch, bind bank, balance (same-row parts) ---
+        let ep = local[EP_COL].clone();
+        builder.when_first_row().assert_eq(ep.clone(), AB::Expr::ONE);
+        // Epoch-kill gate and ep-gated selectors (all materialized so
+        // downstream gate definitions stay deg <= 3).
+        builder.assert_eq(
+            local[GWRAP_COL].clone(),
+            gperm.clone() * sel_role(12),
+        );
+        let se_src: [usize; 4] = [1, 3, 4, 5]; // nf, arkm, acm, acmout
+        for (i, si) in se_src.iter().enumerate() {
+            builder.assert_eq(local[SE_OFF + i].clone(), sel_role(*si) * ep.clone());
+        }
+        let bindsum = sel_role(6) + sel_role(7) + sel_role(8) + sel_role(9) + sel_role(10);
+        builder.assert_eq(local[SE_OFF + 4].clone(), bindsum * ep.clone());
+        builder.assert_eq(local[SE_OFF + 5].clone(), sel_role(11) * ep.clone());
+        // Bind capture / reset / close gates.
+        builder.assert_eq(
+            local[BGCAP_COL].clone(),
+            bnd.clone() * local[SE_OFF + 4].clone(),
+        );
+        builder.assert_eq(
+            local[BGRST_COL].clone(),
+            gperm.clone() * local[SE_OFF + 4].clone(),
+        );
+        for (i, si) in [6usize, 7, 8, 9, 10].iter().enumerate() {
+            builder.assert_eq(
+                local[BGC_OFF + i].clone(),
+                gperm.clone() * sel_role(*si),
+            );
+        }
+        // Bind closes: acc must equal the target public chunk, ep-gated on
+        // the value side so padding-pass closes degenerate to acc = 0 = 0.
+        let pvs: Vec<AB::Expr> = builder
+            .public_values()
+            .iter()
+            .map(|v| (*v).into())
+            .collect();
+        let pv = |i: usize| -> AB::Expr { pvs[i].clone() };
+        let pv_base: [usize; 5] = [PV_ANCHOR, PV_NF1, PV_NF2, PV_CM1, PV_CM2];
+        for (x, base) in pv_base.iter().enumerate() {
+            for j in 0..16 {
+                builder.assert_zero(
+                    local[BGC_OFF + x].clone()
+                        * (local[BQ_OFF + j].clone() - pv(base + j) * ep.clone()),
+                );
+            }
+        }
+        for j in 0..16 {
+            builder.when_first_row().assert_zero(local[BQ_OFF + j].clone());
+        }
+        // Balance: ep-gated capture flags; carries as 3-bool encodings; the
+        // close row enforces the 16-bit-limb subtraction chain
+        // sum_in - sum_out = fee exactly (all magnitudes << p, so the field
+        // equations hold as integers).
+        builder.assert_eq(local[INJ3E_COL].clone(), inj(3) * ep.clone());
+        builder.assert_eq(local[INJ4E_COL].clone(), inj(4) * ep.clone());
+        builder.assert_eq(
+            local[BLCLOSE_COL].clone(),
+            gperm.clone() * local[SE_OFF + 5].clone(),
+        );
+        for k in 0..9 {
+            builder.assert_bool(local[BLC_OFF + k].clone());
+        }
+        for j in 0..4 {
+            builder.when_first_row().assert_zero(local[BL_OFF + j].clone());
+        }
+        // carry_j = enc_j - 2, enc_j = b0 + 2*b1 + 4*b2 (range [-2, 5]).
+        let carry = |j: usize| -> AB::Expr {
+            local[BLC_OFF + 3 * j].clone()
+                + local[BLC_OFF + 3 * j + 1].clone() * two.clone()
+                + local[BLC_OFF + 3 * j + 2].clone() * two.clone() * two.clone()
+                - two.clone()
+        };
+        let close = local[BLCLOSE_COL].clone();
+        let w16 = AB::Expr::from_u32(1 << 16);
+        builder.assert_zero(
+            close.clone()
+                * (local[BL_OFF].clone() - pv(PV_FEE) * ep.clone()
+                    - w16.clone() * carry(0)),
+        );
+        for j in 1..3 {
+            builder.assert_zero(
+                close.clone()
+                    * (local[BL_OFF + j].clone() + carry(j - 1)
+                        - pv(PV_FEE + j) * ep.clone()
+                        - w16.clone() * carry(j)),
+            );
+        }
+        builder.assert_zero(
+            close.clone()
+                * (local[BL_OFF + 3].clone() + carry(2) - pv(PV_FEE + 3) * ep.clone()),
+        );
 
         // RC ring: R[0]'s bit decomposition (bool + recompose), first-row
         // pin to the RC table, and one-step rotation per block.
@@ -646,6 +829,38 @@ where
         );
         t.assert_eq(next[u_col(65)].clone(), (mrow - u63) * hi_c);
 
+        // Epoch decay: one-shot, killed at the program-end perm boundary.
+        t.assert_eq(
+            next[EP_COL].clone(),
+            local[EP_COL].clone() * (AB::Expr::ONE - local[GWRAP_COL].clone()),
+        );
+        // Bind bank: reset after close, capture the chained digest lanes.
+        for l in 0..4 {
+            for j in 0..4 {
+                let idx = 4 * l + j;
+                t.assert_eq(
+                    next[BQ_OFF + idx].clone(),
+                    (AB::Expr::ONE - local[BGRST_COL].clone())
+                        * local[BQ_OFF + idx].clone()
+                        + local[BGCAP_COL].clone()
+                            * per[35 + j].clone()
+                            * local[A_OFF + l].clone(),
+                );
+            }
+        }
+        // Balance accumulation: +value bits at acm, -value bits at acmout.
+        for j in 0..4 {
+            t.assert_eq(
+                next[BL_OFF + j].clone(),
+                local[BL_OFF + j].clone()
+                    + local[INJ3E_COL].clone()
+                        * per[35 + j].clone()
+                        * local[W_OFF + 4].clone()
+                    - local[INJ4E_COL].clone()
+                        * per[35 + j].clone()
+                        * local[W_OFF + 4].clone(),
+            );
+        }
         // Equality-bank accumulation (deg 3: gate * chunk-weight * source).
         let pwk = |j: usize| per[35 + j].clone();
         for l in 0..4 {
@@ -665,6 +880,216 @@ where
                 );
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bucket instance builder: the full 2x2 transaction statement.
+// ---------------------------------------------------------------------------
+
+/// One transaction input: spend key, note fields, and a depth-32 path.
+#[derive(Clone)]
+pub struct TxInput {
+    pub sk: [u64; 4],
+    pub value: u64,
+    pub rho: [u64; 4],
+    pub rseed: [u64; 4],
+}
+
+/// One transaction output note (recipient key material is witness).
+#[derive(Clone, Copy)]
+pub struct TxOutput {
+    pub value: u64,
+    pub rkm: [u64; 4],
+    pub rho: [u64; 4],
+    pub rseed: [u64; 4],
+}
+
+/// Everything a prover/verifier pair needs for one 2x2 bucket instance.
+pub struct BucketInstance {
+    pub air: NarrowKeccakAir,
+    /// Public values (see PV_* layout) as u32 chunks.
+    pub pvs: Vec<u32>,
+    pub anchor: [u64; 4],
+    pub nf: [[u64; 4]; 2],
+    pub cm_out: [[u64; 4]; 2],
+}
+
+/// Merkle tree depth of the bucket statement.
+pub const MERKLE_DEPTH: usize = 32;
+/// Perm slots used by the full bucket program, INCLUDING the leading
+/// dummy warm-up slot (fits 2^18 rows: 83 x 3072 = 254,976).
+pub const BUCKET_PERMS: usize = 1 + 2 * (5 + MERKLE_DEPTH + 1) + 2 * 2 + 2;
+
+/// Build the full 2x2 bucket: both inputs are leaves 0 and 1 of the same
+/// depth-32 tree (siblings above level 0 shared), so both anchor binds
+/// close against one root. Balance must hold: sum(in) = sum(out) + fee.
+pub fn build_bucket(
+    log_height: usize,
+    inputs: &[TxInput; 2],
+    outputs: &[TxOutput; 2],
+    fee: u64,
+) -> BucketInstance {
+    use crate::reference;
+
+    let derive = |inp: &TxInput| {
+        let mut nk_in = [0u64; 25];
+        nk_in[..4].copy_from_slice(&inp.sk);
+        nk_in[4] = 1; // domain N (z0)
+        nk_in[5] = 1;
+        nk_in[16] = 1 << 63;
+        let nk_st = reference::keccak_f(&nk_in);
+        let nk: [u64; 4] = nk_st[..4].try_into().unwrap();
+        let mut nf_in = [0u64; 25];
+        nf_in[..4].copy_from_slice(&nk);
+        nf_in[4..8].copy_from_slice(&inp.rho);
+        nf_in[8] = 1;
+        nf_in[16] = 1 << 63;
+        let nf_st = reference::keccak_f(&nf_in);
+        let nf: [u64; 4] = nf_st[..4].try_into().unwrap();
+        let mut rkm_in = [0u64; 25];
+        rkm_in[..4].copy_from_slice(&nk);
+        rkm_in[4] = 1 << 1; // domain R (z1)
+        rkm_in[5] = 1;
+        rkm_in[16] = 1 << 63;
+        let rkm_st = reference::keccak_f(&rkm_in);
+        let rkm: [u64; 4] = rkm_st[..4].try_into().unwrap();
+        let mut cm_in = [0u64; 25];
+        cm_in[0] = inp.value;
+        cm_in[1..5].copy_from_slice(&rkm);
+        cm_in[5..9].copy_from_slice(&inp.rho);
+        cm_in[9..13].copy_from_slice(&inp.rseed);
+        cm_in[13] = 1;
+        cm_in[16] = 1 << 63;
+        let cm_st = reference::keccak_f(&cm_in);
+        let cm: [u64; 4] = cm_st[..4].try_into().unwrap();
+        (nk, nf, cm)
+    };
+    let (nk1, nf1, cm1) = derive(&inputs[0]);
+    let (nk2, nf2, cm2) = derive(&inputs[1]);
+
+    // Shared tree: leaves 0 and 1; deterministic pseudo-random upper
+    // siblings shared by both paths.
+    let mut x = 0xa5a5_5a5a_dead_beefu64;
+    let mut rnd = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let upper: Vec<[u64; 4]> = (1..MERKLE_DEPTH)
+        .map(|_| [rnd(), rnd(), rnd(), rnd()])
+        .collect();
+    // Level 0: leaf 0's sibling is leaf 1 (path bit 0), and vice versa.
+    let path = |leaf: usize, own: &[u64; 4], other: &[u64; 4]| {
+        let mut sibs = vec![(*other, leaf == 1)];
+        let mut d = if leaf == 0 {
+            reference::merkle_node_state(own, other)
+        } else {
+            reference::merkle_node_state(other, own)
+        };
+        for sib in &upper {
+            sibs.push((*sib, false));
+            let dd: [u64; 4] = d[..4].try_into().unwrap();
+            d = reference::merkle_node_state(&dd, sib);
+        }
+        let root: [u64; 4] = d[..4].try_into().unwrap();
+        (sibs, root)
+    };
+    let (path1, root1) = path(0, &cm1, &cm2);
+    let (path2, root2) = path(1, &cm2, &cm1);
+    assert_eq!(root1, root2, "shared tree must have one root");
+
+    let cmo1 = {
+        let o = &outputs[0];
+        let mut st = [0u64; 25];
+        st[0] = o.value;
+        st[1..5].copy_from_slice(&o.rkm);
+        st[5..9].copy_from_slice(&o.rho);
+        st[9..13].copy_from_slice(&o.rseed);
+        st[13] = 1;
+        st[16] = 1 << 63;
+        let d = reference::keccak_f(&st);
+        let dd: [u64; 4] = d[..4].try_into().unwrap();
+        dd
+    };
+    let cmo2 = {
+        let o = &outputs[1];
+        let mut st = [0u64; 25];
+        st[0] = o.value;
+        st[1..5].copy_from_slice(&o.rkm);
+        st[5..9].copy_from_slice(&o.rho);
+        st[9..13].copy_from_slice(&o.rseed);
+        st[13] = 1;
+        st[16] = 1 << 63;
+        let d = reference::keccak_f(&st);
+        let dd: [u64; 4] = d[..4].try_into().unwrap();
+        dd
+    };
+
+    // Program + witness.
+    let mut program = [ROLE_DUMMY; PROGRAM_SLOTS];
+    let mut sw = vec![SlotWitness::default(); PROGRAM_SLOTS];
+    let mut slot = 1usize;
+    let mut input_chain = |inp: &TxInput,
+                           nk: &[u64; 4],
+                           path: &[([u64; 4], bool)],
+                           bnf_role: u32| {
+        program[slot] = ROLE_ANK;
+        sw[slot].w[..4].copy_from_slice(&inp.sk);
+        slot += 1;
+        program[slot] = ROLE_NF;
+        sw[slot].w[..4].copy_from_slice(&inp.rho);
+        slot += 1;
+        program[slot] = bnf_role;
+        slot += 1;
+        program[slot] = ROLE_ARKM;
+        sw[slot].w[..4].copy_from_slice(nk);
+        slot += 1;
+        program[slot] = ROLE_ACM;
+        sw[slot].w[4] = inp.value;
+        sw[slot].w[5..9].copy_from_slice(&inp.rho);
+        sw[slot].w[9..13].copy_from_slice(&inp.rseed);
+        slot += 1;
+        for (sib, bit) in path {
+            program[slot] = ROLE_MERKLE;
+            sw[slot].w[..4].copy_from_slice(sib);
+            sw[slot].pbit = *bit;
+            slot += 1;
+        }
+        program[slot] = ROLE_BANCHOR;
+        slot += 1;
+    };
+    input_chain(&inputs[0], &nk1, &path1, ROLE_BNF1);
+    input_chain(&inputs[1], &nk2, &path2, ROLE_BNF2);
+    for (o, bcm) in outputs.iter().zip([ROLE_BCM1, ROLE_BCM2]) {
+        program[slot] = ROLE_ACMOUT;
+        sw[slot].w[4] = o.value;
+        sw[slot].w[..4].copy_from_slice(&o.rkm);
+        sw[slot].w[5..9].copy_from_slice(&o.rho);
+        sw[slot].w[9..13].copy_from_slice(&o.rseed);
+        slot += 1;
+        program[slot] = bcm;
+        slot += 1;
+    }
+    program[slot] = ROLE_BAL;
+    slot += 1;
+    program[slot] = ROLE_END;
+    slot += 1;
+    assert_eq!(slot, BUCKET_PERMS, "program layout drifted");
+
+    let pvs = pv_vec(&root1, &nf1, &nf2, &cmo1, &cmo2, fee);
+    BucketInstance {
+        air: NarrowKeccakAir {
+            log_height,
+            program,
+            slot_witness: sw,
+            fee,
+        },
+        pvs,
+        anchor: root1,
+        nf: [nf1, nf2],
+        cm_out: [cmo1, cmo2],
     }
 }
 
@@ -708,6 +1133,10 @@ impl NarrowKeccakAir {
         let mut cur = wit(0);
         // Equality banks: signed accumulators, 2 banks x 4 lanes x 4 chunks.
         let mut eq = [0i64; 32];
+        // Step 3b state: one-shot epoch, bind bank, balance accumulators.
+        let mut ep: u32 = 1;
+        let mut bq = [0i64; 16];
+        let mut bl = [0i64; 4];
 
         let bit = |w: u32, i: usize| (w >> i) & 1;
 
@@ -844,6 +1273,13 @@ impl NarrowKeccakAir {
                 ROLE_ARKM,
                 ROLE_ACM,
                 ROLE_ACMOUT,
+                ROLE_BANCHOR,
+                ROLE_BNF1,
+                ROLE_BNF2,
+                ROLE_BCM1,
+                ROLE_BCM2,
+                ROLE_BAL,
+                ROLE_END,
             ];
             let selv: [u32; NSEL] =
                 core::array::from_fn(|i| (role_now == sel_codes[i]) as u32);
@@ -858,12 +1294,71 @@ impl NarrowKeccakAir {
             let g4 = ((t % 128 == 127) as u32) * pb[1] * ph[1];
             row[G4_COL] = F::from_u32(g4);
             let gpermv = ((t % 128 == 127) as u32) * pb[1];
-            row[EG_OFF] = F::from_u32(bndv * selv[1]);
-            row[EG_OFF + 1] = F::from_u32(bndv * selv[3]);
-            row[EG_OFF + 2] = F::from_u32(gpermv * selv[3]);
-            row[EG_OFF + 3] = F::from_u32(bndv * selv[1]);
-            row[EG_OFF + 4] = F::from_u32(bndv * selv[4]);
-            row[EG_OFF + 5] = F::from_u32(gpermv * selv[4]);
+            // ep-gated selector products and all bank gates.
+            let bindsum = selv[6] + selv[7] + selv[8] + selv[9] + selv[10];
+            let se = [
+                selv[1] * ep,
+                selv[3] * ep,
+                selv[4] * ep,
+                selv[5] * ep,
+                bindsum * ep,
+                selv[11] * ep,
+            ];
+            for (i, v) in se.iter().enumerate() {
+                row[SE_OFF + i] = F::from_u32(*v);
+            }
+            row[EP_COL] = F::from_u32(ep);
+            let gwrap = gpermv * selv[12];
+            row[GWRAP_COL] = F::from_u32(gwrap);
+            row[EG_OFF] = F::from_u32(bndv * se[0]);
+            row[EG_OFF + 1] = F::from_u32(bndv * se[1]);
+            row[EG_OFF + 2] = F::from_u32(gpermv * se[1]);
+            row[EG_OFF + 3] = F::from_u32(bndv * se[0]);
+            row[EG_OFF + 4] = F::from_u32(bndv * se[2]);
+            row[EG_OFF + 5] = F::from_u32(gpermv * se[2]);
+            let bgcap = bndv * se[4];
+            let bgrst = gpermv * se[4];
+            row[BGCAP_COL] = F::from_u32(bgcap);
+            row[BGRST_COL] = F::from_u32(bgrst);
+            for i in 0..5 {
+                row[BGC_OFF + i] = F::from_u32(gpermv * selv[6 + i]);
+            }
+            let inj3e = bndv * se[2];
+            let inj4e = bndv * se[3];
+            row[INJ3E_COL] = F::from_u32(inj3e);
+            row[INJ4E_COL] = F::from_u32(inj4e);
+            row[BLCLOSE_COL] = F::from_u32(gpermv * se[5]);
+            let sgn = |v: i64| -> F {
+                if v >= 0 {
+                    F::from_u32(v as u32)
+                } else {
+                    -F::from_u32((-v) as u32)
+                }
+            };
+            for (i, acc) in bq.iter().enumerate() {
+                row[BQ_OFF + i] = sgn(*acc);
+            }
+            for (j, acc) in bl.iter().enumerate() {
+                row[BL_OFF + j] = sgn(*acc);
+            }
+            // Balance carry encodings: exact limb-chain carries (meaningful
+            // only where the close gate fires; harmless bools elsewhere).
+            {
+                let fee_j = |j: usize| ((self.fee >> (16 * j)) & 0xffff) as i64;
+                let mut c = [0i64; 3];
+                let mut prev = 0i64;
+                for j in 0..3 {
+                    let tj = bl[j] + prev - fee_j(j);
+                    c[j] = tj >> 16;
+                    prev = c[j];
+                }
+                for (j, cj) in c.iter().enumerate() {
+                    let enc = (cj + 2).clamp(0, 7) as u32;
+                    for b in 0..3 {
+                        row[BLC_OFF + 3 * j + b] = F::from_u32((enc >> b) & 1);
+                    }
+                }
+            }
             row[PBIT_COL] = F::from_u32(pbv);
             for i in 0..13 {
                 row[W_OFF + i] = F::from_u32(wbit[i]);
@@ -878,16 +1373,26 @@ impl NarrowKeccakAir {
             for l in 0..25 {
                 row[EFF_OFF + l] = F::from_u32(eff[l]);
             }
-            // Advance the equality accumulators (constraint: next = local + legs).
-            if z < 64 {
+            // Advance the accumulators (constraint: next = local + legs).
+            {
                 let jc = z / 16;
                 let wgt = 1i64 << (z % 16);
+                let epi = ep as i64;
                 for l in 0..4 {
                     let idx = 4 * l + jc;
-                    eq[idx] += g_e1pos * wgt * a[l] as i64 - g_e1neg * wgt * wbit[l] as i64;
-                    eq[16 + idx] +=
-                        g_e2pos * wgt * wbit[l] as i64 - g_e2neg * wgt * wbit[5 + l] as i64;
+                    eq[idx] += epi
+                        * (g_e1pos * wgt * a[l] as i64 - g_e1neg * wgt * wbit[l] as i64);
+                    eq[16 + idx] += epi
+                        * (g_e2pos * wgt * wbit[l] as i64
+                            - g_e2neg * wgt * wbit[5 + l] as i64);
+                    bq[idx] += (bgcap as i64) * wgt * a[l] as i64;
                 }
+                bl[jc] += (inj3e as i64) * wgt * wbit[4] as i64
+                    - (inj4e as i64) * wgt * wbit[4] as i64;
+                if bgrst == 1 {
+                    bq = [0i64; 16];
+                }
+                ep *= 1 - gwrap;
             }
             for d in 1..=S_SLOTS {
                 row[s_col(d)] = F::from_u32(s[d]);
@@ -988,7 +1493,7 @@ mod tests {
     fn trace_satisfies_constraints() {
         let air = NarrowKeccakAir::chain_only(10);
         let trace = air.generate_trace::<F>(0);
-        check_constraints(&air, &trace, &[]);
+        check_constraints(&air, &trace, &zero_pvs());
     }
 
     #[test]
@@ -998,7 +1503,7 @@ mod tests {
         // Flip one A' (theta output) bit on a T row.
         let row = 64 + 7;
         trace.values[row * NARROW_WIDTH + AP_OFF + 3] += F::ONE;
-        let report = check_all_constraints(&air, &trace, &[], Some(10));
+        let report = check_all_constraints(&air, &trace, &zero_pvs(), Some(10));
         assert!(!report.is_ok());
     }
 
@@ -1052,9 +1557,10 @@ mod tests {
             log_height: 16, // 512 blocks = 21 full perms
             program,
             slot_witness,
+            fee: 0,
         };
         let trace = air.generate_trace::<F>(0);
-        check_constraints(&air, &trace, &[]);
+        check_constraints(&air, &trace, &zero_pvs());
 
         // Reference walk: perm p (1..=16) hashes mux(bit; digest, sib).
         for (i, (sib, bit)) in witness.iter().enumerate() {
@@ -1083,20 +1589,21 @@ mod tests {
             log_height: 13,
             program,
             slot_witness,
+            fee: 0,
         };
         let mut trace = air.generate_trace::<F>(0);
         // Flip a sibling bit on an injection row (perm 1 boundary block =
         // block 24, row 24*128 + 5).
         let row = 24 * 128 + 5;
         trace.values[row * NARROW_WIDTH + SIB_OFF + 2] += F::ONE;
-        let report = check_all_constraints(&air, &trace, &[], Some(10));
+        let report = check_all_constraints(&air, &trace, &zero_pvs(), Some(10));
         assert!(!report.is_ok(), "sibling corruption not caught");
 
         // Path bit drift mid-perm must be caught by the constancy rule.
         let mut trace2 = air.generate_trace::<F>(0);
         let row2 = 24 * 128 + 700; // inside perm 1, not a boundary
         trace2.values[row2 * NARROW_WIDTH + PBIT_COL] += F::ONE;
-        let report2 = check_all_constraints(&air, &trace2, &[], Some(10));
+        let report2 = check_all_constraints(&air, &trace2, &zero_pvs(), Some(10));
         assert!(!report2.is_ok(), "path-bit drift not caught");
     }
 
@@ -1129,6 +1636,11 @@ mod tests {
     }
     fn digest(state: &[u64; 25]) -> [u64; 4] {
         state[..4].try_into().unwrap()
+    }
+    /// Zero public values: valid whenever no bind/balance close fires
+    /// during the epoch (programs without bind/bal roles).
+    fn zero_pvs() -> Vec<F> {
+        vec![F::ZERO; PV_LEN]
     }
 
     /// M3 step 3a: the full input chain — ank -> nf -> arkm -> acm ->
@@ -1187,9 +1699,10 @@ mod tests {
             log_height: 16, // 21 full perms >= 13 used
             program,
             slot_witness: sw,
+            fee: 0,
         };
         let trace = air.generate_trace::<F>(0);
-        check_constraints(&air, &trace, &[]);
+        check_constraints(&air, &trace, &zero_pvs());
 
         assert_eq!(NarrowKeccakAir::extract_state(&trace, 24 * 2), nk_state);
         assert_eq!(NarrowKeccakAir::extract_state(&trace, 24 * 3), nf_state);
@@ -1251,6 +1764,7 @@ mod tests {
                 log_height: 13, // 2.67 perms... need 5 perms -> 15360 rows
                 program,
                 slot_witness: sw,
+                fee: 0,
             }
         };
         // Sanity: untampered witness satisfies constraints at this height.
@@ -1259,14 +1773,14 @@ mod tests {
             ..build(false, false)
         };
         let trace = ok_air.generate_trace::<F>(0);
-        check_constraints(&ok_air, &trace, &[]);
+        check_constraints(&ok_air, &trace, &zero_pvs());
         // Tampered rho: bank 2 close must fire.
         let bad_rho = NarrowKeccakAir {
             log_height: 14,
             ..build(true, false)
         };
         let tr = bad_rho.generate_trace::<F>(0);
-        let report = check_all_constraints(&bad_rho, &tr, &[], Some(10));
+        let report = check_all_constraints(&bad_rho, &tr, &zero_pvs(), Some(10));
         assert!(!report.is_ok(), "rho inconsistency not caught");
         // Tampered nk: bank 1 close must fire.
         let bad_nk = NarrowKeccakAir {
@@ -1274,8 +1788,69 @@ mod tests {
             ..build(false, true)
         };
         let tr = bad_nk.generate_trace::<F>(0);
-        let report = check_all_constraints(&bad_nk, &tr, &[], Some(10));
+        let report = check_all_constraints(&bad_nk, &tr, &zero_pvs(), Some(10));
         assert!(!report.is_ok(), "nk inconsistency not caught");
+    }
+
+    /// M3 step 3b: the COMPLETE 2x2 bucket — two inputs (key derivation,
+    /// nullifier, commitment opening, depth-32 membership in one shared
+    /// tree), two outputs, balance, and every public binding — satisfies
+    /// the AIR with the real public values, and fits 2^18 rows.
+    #[test]
+    fn full_bucket_satisfies_constraints() {
+        let (inst, _) = test_bucket(7, 5, 3, 9); // 7+5 = 3+9+0? no: fee below
+        let pvs: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        let trace = inst.air.generate_trace::<F>(0);
+        check_constraints(&inst.air, &trace, &pvs);
+    }
+
+    fn test_bucket(v1: u64, v2: u64, o1: u64, o2: u64) -> (BucketInstance, u64) {
+        let fee = (v1 + v2) - (o1 + o2);
+        let mut x = 0x1234_5678_9abc_def0u64;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mk_in = |value: u64, rnd: &mut dyn FnMut() -> u64| TxInput {
+            sk: [rnd(), rnd(), rnd(), rnd()],
+            value,
+            rho: [rnd(), rnd(), rnd(), rnd()],
+            rseed: [rnd(), rnd(), rnd(), rnd()],
+        };
+        let mk_out = |value: u64, rnd: &mut dyn FnMut() -> u64| TxOutput {
+            value,
+            rkm: [rnd(), rnd(), rnd(), rnd()],
+            rho: [rnd(), rnd(), rnd(), rnd()],
+            rseed: [rnd(), rnd(), rnd(), rnd()],
+        };
+        let inputs = [mk_in(v1, &mut rnd), mk_in(v2, &mut rnd)];
+        let outputs = [mk_out(o1, &mut rnd), mk_out(o2, &mut rnd)];
+        (build_bucket(18, &inputs, &outputs, fee), fee)
+    }
+
+    /// Wrong public values and unbalanced values must be caught.
+    #[test]
+    fn bucket_negatives_detected() {
+        let (inst, fee) = test_bucket(10, 6, 4, 8);
+        assert_eq!(fee, 4);
+        let trace = inst.air.generate_trace::<F>(0);
+        // Wrong nf1 public value.
+        let mut pvs: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        pvs[PV_NF1 + 3] += F::ONE;
+        let report = check_all_constraints(&inst.air, &trace, &pvs, Some(10));
+        assert!(!report.is_ok(), "wrong nf1 pv not caught");
+        // Wrong fee (balance close must fail).
+        let mut pvs2: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        pvs2[PV_FEE] += F::ONE;
+        let report = check_all_constraints(&inst.air, &trace, &pvs2, Some(10));
+        assert!(!report.is_ok(), "wrong fee not caught");
+        // Wrong anchor.
+        let mut pvs3: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        pvs3[PV_ANCHOR] += F::ONE;
+        let report = check_all_constraints(&inst.air, &trace, &pvs3, Some(10));
+        assert!(!report.is_ok(), "wrong anchor not caught");
     }
 
     /// Full-permutation check across a 24-block group.
