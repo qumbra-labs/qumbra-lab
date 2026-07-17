@@ -44,7 +44,7 @@ use crate::{keccak_inputs, make_config_with, pc_len, FriCfg, Val, RUNS};
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-struct LaneWindow<W> {
+pub(crate) struct LaneWindow<W> {
     inner: W,
     off: usize,
     width: usize,
@@ -59,10 +59,10 @@ impl<T, W: WindowAccess<T>> WindowAccess<T> for LaneWindow<W> {
     }
 }
 
-struct LaneBuilder<'a, AB: AirBuilder> {
-    inner: &'a mut AB,
-    off: usize,
-    width: usize,
+pub(crate) struct LaneBuilder<'a, AB: AirBuilder> {
+    pub(crate) inner: &'a mut AB,
+    pub(crate) off: usize,
+    pub(crate) width: usize,
 }
 
 impl<'a, AB: AirBuilder> AirBuilder for LaneBuilder<'a, AB> {
