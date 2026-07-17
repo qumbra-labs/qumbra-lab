@@ -2872,11 +2872,143 @@ mod tests {
         }
     }
 
+    /// Coverage probe (relay): tamper representative witness cells and
+    /// report which are caught by the current constraint set. Not an
+    /// assertion — it prints an UNSAT/SAT map so the report can state
+    /// exactly which gate-exit negatives already bind and which await the
+    /// ext-arithmetic pipeline.
+    #[test]
+    fn tamper_coverage() {
+        let (sched, pvs, _) = shared();
+        let air = VerifierGateAir::new();
+        let one = Val::ONE;
+        // (label, mutate) -> returns whether check_constraints panics (UNSAT).
+        let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>, &mut Vec<Val>)| {
+            let (mut trace, mut meta) = build_gate_trace(sched, pvs, 0);
+            mutate(&mut trace, &mut meta.opvs);
+            let opvs = meta.opvs.clone();
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                check_constraints(&air, &trace, &opvs);
+            }));
+            eprintln!("  [{}] {label}", if r.is_err() { "UNSAT ok" } else { "SAT  MISS" });
+        };
+        let w = GATE_WIDTH;
+        eprintln!("tamper coverage (UNSAT = caught, SAT = not bound):");
+        // Neg2 wrong root: corrupt an outer public value (claimed inner cap).
+        probe("wrong-root: flip opvs[0] (cap limb)", &|_t, opvs| {
+            opvs[0] += one;
+        });
+        // Neg1 tampered opening: flip a query trace-absorb preimage limb.
+        probe("tampered-opening: flip query0 preimage limb 0", &|t, _o| {
+            let (sched2, pvs2, _) = shared();
+            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let row = m.query_rows[0];
+            t.values[row * w + pcol(0)] += one;
+        });
+        // Neg3 wrong challenge: flip a recorded accepted field draw cell.
+        probe("wrong-challenge: flip an accepted field-draw FSACC", &|t, _o| {
+            let (sched2, pvs2, _) = shared();
+            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let (row, _) = m.field_draws[0];
+            t.values[row * w + FSACC] += one;
+        });
+        // Challenge register directly.
+        probe("wrong-challenge: flip CHAL[0] (alpha limb0)", &|t, _o| {
+            t.values[23 * w + CHAL] += one;
+        });
+        // Neg4 bad fold: corrupt a running-fold-eval limb.
+        probe("bad-fold: flip RUNEV limb on a query row", &|t, _o| {
+            let (sched2, pvs2, _) = shared();
+            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let row = m.query_rows[0];
+            t.values[row * w + RUNEV] += one;
+        });
+        // Bank sanity: corrupt a mul-bank output (should be caught).
+        probe("bank: flip MUL_OFF+8 (mul output c0)", &|t, _o| {
+            t.values[23 * w + MUL_OFF + 8] += one;
+        });
+    }
+
     /// Positive: the rectangle accepts the genuine M3 consensus proof.
     #[test]
     fn gate_rectangle_satisfies() {
         let (sched, pvs, _) = shared();
         let (trace, meta) = build_gate_trace(sched, pvs, 0);
         check_constraints(&VerifierGateAir::new(), &trace, &meta.opvs);
+    }
+
+    /// Assert a mutated witness is UNSATISFIABLE (some constraint fires).
+    fn assert_unsat(mutate: impl Fn(&mut RowMajorMatrix<Val>, &mut Vec<Val>)) {
+        let (sched, pvs, _) = shared();
+        let (mut trace, mut meta) = build_gate_trace(sched, pvs, 0);
+        mutate(&mut trace, &mut meta.opvs);
+        let opvs = meta.opvs.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check_constraints(&VerifierGateAir::new(), &trace, &opvs);
+        }));
+        assert!(r.is_err(), "expected UNSAT but constraints were satisfied");
+    }
+
+    /// Gate-exit negative 2 (wrong root): a claimed inner Merkle cap that
+    /// disagrees with the recomputed path is rejected. BOUND today by the
+    /// cap comparison against the outer public values.
+    #[test]
+    fn gate_neg_wrong_root() {
+        let w = GATE_WIDTH;
+        let _ = w;
+        assert_unsat(|_t, opvs| {
+            opvs[0] += Val::ONE; // corrupt a cap-limb outer public value
+        });
+    }
+
+    /// Gate-exit negative 1 (tampered opening): flipping an opened leaf word
+    /// breaks the leaf sponge -> Merkle path -> cap chain. BOUND today by the
+    /// keccak lane + path-chaining + cap comparison.
+    #[test]
+    fn gate_neg_tampered_opening() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o| {
+            let (sched2, pvs2, _) = shared();
+            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let row = m.query_rows[0];
+            t.values[row * w + pcol(0)] += Val::ONE;
+        });
+    }
+
+    /// Gate-exit negative 3 (wrong challenge). REMAINDER: not yet bound. The
+    /// FS draw gadget (FSBITS/FSACC/accept) and the challenge assembly
+    /// (COEF/CURCH/CHAL) are still free witness in `eval` (the ext-arith
+    /// pipeline is unconstrained), so a forged challenge is accepted. Closing
+    /// this needs the FS-gadget binding (inc-3 pattern, m4route.rs) plus the
+    /// sample_bits / ext-challenge-assembly work (spec 2.2/2.3). See the
+    /// `tamper_coverage` probe. Un-ignore once that pipeline lands.
+    #[test]
+    #[ignore = "remainder: FS/challenge binding not yet built (spec 2.2/2.3)"]
+    fn gate_neg_wrong_challenge() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o| {
+            let (sched2, pvs2, _) = shared();
+            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let (row, _) = m.field_draws[0];
+            t.values[row * w + FSACC] += Val::ONE;
+        });
+    }
+
+    /// Gate-exit negative 4 (bad fold). REMAINDER: not yet bound. The FRI
+    /// fold ladders (SCR/BREG/RUNEV), reduced openings (PZACC/PREG), final
+    /// poly (FPREG) and ext-inv (INV2S/INVZ/INVZN) are free witness in `eval`
+    /// (`extmul` is unused there). Closing this needs the ext-arithmetic
+    /// constraint set (spec 2.1) + batched ext-inv (spec 2.4). See the
+    /// `tamper_coverage` probe. Un-ignore once that pipeline lands.
+    #[test]
+    #[ignore = "remainder: ext-arithmetic fold pipeline not yet built (spec 2.1/2.4)"]
+    fn gate_neg_bad_fold() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o| {
+            let (sched2, pvs2, _) = shared();
+            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let row = m.query_rows[0];
+            t.values[row * w + RUNEV] += Val::ONE;
+        });
     }
 }
