@@ -147,21 +147,31 @@ const N_GROUPS: usize = 29;
 /// Field-draw challenge count (alpha, zeta, fri_alpha, betas).
 const N_CHALS: usize = 7;
 
-/// GROUPREQ per flush-ring entry: the GROUP-ring position that must be
-/// reached before obs flush k may start (k = ring head = next unstarted
-/// obs flush). F0 starts at row 0 (never via the boundary rule).
-/// F1 needs alpha complete (head = zeta), ..., F7 needs beta3 complete
-/// (head = pow); the EXH entry (all obs done) needs DONE for the
-/// query-phase handoff.
+/// GROUPREQ per flush-ring entry: the GROUP-ring head that must be present
+/// at the last block of the *producing* obs flush F(k-1) before obs flush
+/// F(k) may start (k = ring head = next unstarted obs flush). F0 starts at
+/// row 0 (never via the boundary rule).
+///
+/// Timing note (the inc-4 correction): draws are hosted on the *consumer*
+/// flush's block 0 -- its chained preimage[0..16] == the producer's digest,
+/// so the FS gadget squeezes the producer's digest right there. The group
+/// that gates F(k) is therefore drawn *during* F(k)'s own block 0 and is
+/// never "complete" before F(k) starts. What is invariant is that exactly
+/// k-1 groups have been drawn by the last block of F(k-1): the head is at
+/// group k-1. Hence GROUPREQ[k] = k-1 for k = 1..7 (alpha .. beta3), which
+/// the honest witness reproduces (see `need`, ~line 1803). The EXH entry
+/// keeps G_DONE: it is read only at F7's last block, where the head == 7
+/// != DONE, so NEEDL == 0 there and the post-F7 refill gate (which requires
+/// NEEDL == 0) still holds.
 const GROUPREQ: [usize; 9] = [
     usize::MAX, // F0: unreachable via boundary
+    G_ALPHA,
     G_ZETA,
     G_FRIALPHA,
     G_BETA0,
     G_BETA0 + 1,
     G_BETA0 + 2,
     G_BETA0 + 3,
-    G_POW,
     G_DONE, // EXH
 ];
 const N_FLUSH_ENTRIES: usize = 9; // F0..F7 + EXH
@@ -526,6 +536,49 @@ const CZD: usize = CMPCI + 1; // dup value-carry rows
 
 const GATE_COLS: usize = CZD + 1 - GB;
 pub(crate) const GATE_WIDTH: usize = CZD + 1;
+
+/// Diagnostic helper (relay debugging): map a column index to its region
+/// name. Used by the `dump_constraint` / `dump_trace` tests to translate a
+/// failing constraint's referenced columns into human-readable regions.
+#[cfg(test)]
+pub(crate) fn colname(x: usize) -> &'static str {
+    if x < NUM_KECCAK_COLS {
+        return "KECCAK";
+    }
+    let table: &[(usize, &str)] = &[
+        (MUL_OFF, "MUL"), (ADD_OFF, "ADD"), (W0C, "W0C"), (W1C, "W1C"),
+        (HB0, "HB0"), (HB1, "HB1"), (TA0, "TA0"), (TOPA0, "TOPA0"), (TA1, "TA1"),
+        (TOPA1, "TOPA1"), (LBNZ0, "LBNZ0"), (LBI0, "LBI0"), (LONZ0, "LONZ0"),
+        (LOI0, "LOI0"), (LBNZ1, "LBNZ1"), (LBI1, "LBI1"), (LONZ1, "LONZ1"),
+        (LOI1, "LOI1"), (OREG, "OREG"), (PBIT, "PBIT"), (OBIT, "OBIT"),
+        (FSBITS, "FSBITS"), (FSACC, "FSACC"), (FSP3A, "FSP3A"), (FSP3B, "FSP3B"),
+        (FST7, "FST7"), (FSINV, "FSINV"), (FSNZ, "FSNZ"), (FSACCEPT, "FSACCEPT"),
+        (FSGATE, "FSGATE"), (FSODD, "FSODD"), (FSFULL, "FSFULL"),
+        (GRP, "GRP"), (COEF, "COEF"), (CURCH, "CURCH"), (CROT, "CROT"), (GROT, "GROT"),
+        (CHAL, "CHAL"), (FA2, "FA2"), (ZNREG, "ZNREG"), (IDXR, "IDXR"),
+        (FRING, "FRING"), (BLKCNT, "BLKCNT"), (BLKLAST, "BLKLAST"), (BLKINV, "BLKINV"),
+        (BIDX, "BIDX"), (CMPA, "CMPA"), (CMPAI, "CMPAI"), (CMPB, "CMPB"), (CMPBI, "CMPBI"),
+        (NEEDL, "NEEDL"), (REFSEL, "REFSEL"), (SHSEL, "SHSEL"), (PHC, "PHC"), (PHQ, "PHQ"),
+        (QSEL, "QSEL"), (QCNT, "QCNT"), (QCW, "QCW"), (QCWI, "QCWI"),
+        (PR, "PR"), (PD, "PD"), (RSEL, "RSEL"), (MLO, "MLO"), (MHI, "MHI"), (MSEL, "MSEL"),
+        (DLO, "DLO"), (DHI, "DHI"), (DRND, "DRND"), (DBIT, "DBIT"), (GLC, "GLC"), (GRC, "GRC"),
+        (CAPS8, "CAPS8"), (IDXB, "IDXB"), (CZ2, "CZ2"), (CZ7, "CZ7"), (CF, "CF"),
+        (CX0, "CX0"), (CX1, "CX1"), (POS, "POS"), (CONSZ, "CONSZ"), (CONSF, "CONSF"),
+        (ASM0, "ASM0"), (ASM1, "ASM1"), (VC, "VC"), (VCE, "VCE"), (PBUF, "PBUF"),
+        (HIT, "HIT"), (GPB, "GPB"), (LFS, "LFS"), (PREG, "PREG"), (PZACC, "PZACC"),
+        (A0R, "A0R"), (A1R, "A1R"), (A2R, "A2R"), (P0R, "P0R"), (P1R, "P1R"), (PX0R, "PX0R"),
+        (FPREG, "FPREG"), (SCR, "SCR"), (BREG, "BREG"), (INV2S, "INV2S"), (INVZ, "INVZ"),
+        (INVZN, "INVZN"), (XREG, "XREG"), (XFIN, "XFIN"), (RUNEV, "RUNEV"),
+        (F2DIG, "F2DIG"), (PHD, "PHD"), (CMPC, "CMPC"), (CMPCI, "CMPCI"), (CZD, "CZD"),
+    ];
+    let mut best = ("?", 0usize);
+    for &(off, nm) in table {
+        if off <= x && off >= best.1 {
+            best = (nm, off);
+        }
+    }
+    best.0
+}
 
 // -- query-program roles -------------------------------------------------------
 const R_NONE: u32 = 0;
@@ -1019,7 +1072,16 @@ where
                     sf(23) * nv(RSEL + R_ABS_C34 as usize) * (nv(pcol(i)) - cv(ocol(i))),
                 );
             }
-            for i in 10..100 {
+            // C5 (trace last block): 5 fresh u32 words = limbs 0..10. The
+            // overwrite-mode sponge packs 2 words per u64 lane, so word 4
+            // fills lane 2's low half (limbs 8,9) while its high half
+            // (limbs 10,11) is an unused zero pad; only limbs 12..100 carry
+            // the producer's output. Pin the pad half to zero (else a prover
+            // could smuggle a word there) and carry from limb 12.
+            for i in 10..12 {
+                t.assert_zero(sf(23) * nv(RSEL + R_ABS_C5 as usize) * nv(pcol(i)));
+            }
+            for i in 12..100 {
                 t.assert_zero(sf(23) * nv(RSEL + R_ABS_C5 as usize) * (nv(pcol(i)) - cv(ocol(i))));
             }
             for i in 60..100 {
@@ -2687,6 +2749,127 @@ mod tests {
             trace.height(),
             meta.n_perms
         );
+    }
+
+    /// Diagnostic (relay debugging): dump a constraint's referenced columns
+    /// by region name, and report the first gate-touching constraint index.
+    /// Set CIDX=<n> to target a specific constraint (default 4135).
+    #[test]
+    fn dump_constraint() {
+        use p3_air::symbolic::{
+            get_symbolic_constraints, AirLayout, BaseEntry, BaseLeaf, SymbolicExpression,
+        };
+        use std::collections::BTreeSet;
+        let air = VerifierGateAir::new();
+        let layout = AirLayout::from_air::<Val>(&air);
+        let cs = get_symbolic_constraints::<Val, _>(&air, layout);
+        eprintln!("total constraints: {}", cs.len());
+        fn collect(
+            e: &SymbolicExpression<Val>,
+            cur: &mut BTreeSet<usize>,
+            nxt: &mut BTreeSet<usize>,
+            flags: &mut BTreeSet<&'static str>,
+        ) {
+            use p3_air::symbolic::SymbolicExpr::*;
+            match e {
+                Leaf(l) => match l {
+                    BaseLeaf::Variable(v) => match v.entry {
+                        BaseEntry::Main { offset: 0 } => {
+                            cur.insert(v.index);
+                        }
+                        BaseEntry::Main { .. } => {
+                            nxt.insert(v.index);
+                        }
+                        BaseEntry::Public => {
+                            flags.insert("PUB");
+                        }
+                        _ => {}
+                    },
+                    BaseLeaf::IsFirstRow => {
+                        flags.insert("FIRST");
+                    }
+                    BaseLeaf::IsLastRow => {
+                        flags.insert("LAST");
+                    }
+                    BaseLeaf::IsTransition => {
+                        flags.insert("TRANS");
+                    }
+                    BaseLeaf::Constant(_) => {}
+                },
+                Add { x, y, .. } | Sub { x, y, .. } | Mul { x, y, .. } => {
+                    collect(x, cur, nxt, flags);
+                    collect(y, cur, nxt, flags);
+                }
+                Neg { x, .. } => collect(x, cur, nxt, flags),
+            }
+        }
+        let target: usize = std::env::var("CIDX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4135);
+        for (i, c) in cs.iter().enumerate() {
+            let (mut cur, mut nxt, mut fl) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+            collect(c, &mut cur, &mut nxt, &mut fl);
+            if cur.iter().chain(nxt.iter()).any(|&x| x >= NUM_KECCAK_COLS) {
+                eprintln!("first gate-touching constraint index: {i}");
+                break;
+            }
+        }
+        let c = &cs[target];
+        let (mut cur, mut nxt, mut fl) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+        collect(c, &mut cur, &mut nxt, &mut fl);
+        eprintln!(
+            "constraint #{target}: deg={} flags={:?}\n  cur cols={:?}\n  nxt cols={:?}",
+            c.degree_multiple(),
+            fl,
+            cur.iter().map(|&x| (x, colname(x))).collect::<Vec<_>>(),
+            nxt.iter().map(|&x| (x, colname(x))).collect::<Vec<_>>(),
+        );
+    }
+
+    /// Diagnostic (relay debugging): dump the flush/draw-schedule columns at
+    /// every challenger-phase last-block boundary, in logical (de-Monty'd)
+    /// units, to eyeball the group-ring / flush-ring timing.
+    #[test]
+    fn dump_trace() {
+        let (sched, pvs, _) = shared();
+        let (_ins, infos) = lane_plan(sched);
+        let (trace, _meta) = build_gate_trace(sched, pvs, 0);
+        let w = trace.width();
+        let val = trace.values;
+        let at = |perm: usize, col: usize| -> u32 { val[(perm * 24 + 23) * w + col].to_unique_u32() };
+        let one = Val::ONE.to_unique_u32();
+        let ring_head = |perm: usize, base: usize, n: usize| -> i64 {
+            (0..n).find(|&g| at(perm, base + g) == one).map(|g| g as i64).unwrap_or(-1)
+        };
+        let lb = |perm: usize, col: usize| -> u32 { (at(perm, col) == one) as u32 };
+        let grp_logical = |perm: usize| -> i64 {
+            let s = ring_head(perm, GRP, N_GROUPS);
+            if s < 0 { -1 } else { (N_GROUPS as i64 - s) % N_GROUPS as i64 }
+        };
+        let fring_logical = |perm: usize| -> i64 {
+            let s = ring_head(perm, FRING, 8);
+            if s < 0 { -1 } else { (8 - s) % 8 }
+        };
+        eprintln!("LAST-BLOCK perms (challenger): perm info | grpL fringL NEEDL GROUPREQ[fL+1]");
+        for perm in 0..340 {
+            if lb(perm, BLKLAST) == 1 && lb(perm, REFSEL) == 0 {
+                let fl = fring_logical(perm);
+                let req = if fl >= 0 && (fl as usize + 1) < GROUPREQ.len() {
+                    GROUPREQ[fl as usize + 1] as i64
+                } else {
+                    -99
+                };
+                eprintln!(
+                    " {perm:3} {:24} | grp={:3} fring={:2} NEEDL={} REQ={}",
+                    format!("{:?}", infos[perm]),
+                    grp_logical(perm),
+                    fl,
+                    lb(perm, NEEDL),
+                    req,
+                );
+            }
+        }
     }
 
     /// Positive: the rectangle accepts the genuine M3 consensus proof.
