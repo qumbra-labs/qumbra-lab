@@ -15,6 +15,7 @@ mod levers;
 mod narrow_bench;
 mod m4census;
 mod m4price;
+mod m4anchor;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
@@ -885,6 +886,10 @@ fn main() {
             let only_pos = args.iter().position(|a| a == "--only");
             let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
             levers::run_levers(&power, only);
+            return;
+        }
+        "m4anchor" => {
+            m4anchor::run_m4anchor(&power);
             return;
         }
         "m4price" => {
