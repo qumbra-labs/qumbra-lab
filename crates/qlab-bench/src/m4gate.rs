@@ -2929,6 +2929,36 @@ mod tests {
         });
     }
 
+    /// Diagnostic (relay): column-accounting breakdown by region.
+    #[test]
+    fn dump_cols() {
+        eprintln!("KECCAK lane: {NUM_KECCAK_COLS}");
+        eprintln!("MUL bank: 12  ADD bank: 12");
+        eprintln!("gate block (GB..GATE_WIDTH): {}", GATE_WIDTH - GB);
+        // Coarse buckets of the gate block.
+        let buckets: &[(&str, usize, usize)] = &[
+            ("routed-word + canonicity (W0C..OREG)", W0C, OREG),
+            ("XOR register file (OREG..FSBITS)", OREG, FSBITS),
+            ("FS draw gadget (FSBITS..GRP)", FSBITS, GRP),
+            ("draw scheduling (GRP..CHAL)", GRP, CHAL),
+            ("challenge/index regs (CHAL..FRING)", CHAL, FRING),
+            ("flush automaton (FRING..PHC)", FRING, PHC),
+            ("phase/query sched (PHC..PR)", PHC, PR),
+            ("query program ring (PR..IDXB)", PR, IDXB),
+            ("index bits (IDXB..CZ2)", IDXB, CZ2),
+            ("asm pipeline (CZ2..PREG)", CZ2, PREG),
+            ("running-sum/arith regs (PREG..F2DIG)", PREG, F2DIG),
+            ("dup transport (F2DIG..end)", F2DIG, GATE_WIDTH),
+        ];
+        let mut tot = 0;
+        for (nm, a, b) in buckets {
+            eprintln!("  {:42} {:4}", nm, b - a);
+            tot += b - a;
+        }
+        eprintln!("gate block sub-total (W0C..end): {tot}");
+        eprintln!("GATE_WIDTH total: {GATE_WIDTH}");
+    }
+
     /// Positive: the rectangle accepts the genuine M3 consensus proof.
     #[test]
     fn gate_rectangle_satisfies() {
