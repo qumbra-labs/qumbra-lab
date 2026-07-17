@@ -62,3 +62,17 @@ Full 0b(ii) build: ~8–15 Claude session-hours (the FS byte-packing gadget
 and the injection routing are the two real unknowns; banks and schedule
 are mechanical after M3). Tree prototype (step 1) follows only after the
 build reports measured numbers.
+
+## Build status (2026-07-17, updated at session handoff)
+
+| increment | what | status |
+|---|---|---|
+| 1 — skeleton | LaneBuilder composition + three lanes coexisting at projected cost (b4 = 476–561 ms / 3.58 GB / 597.9 KB) | ✅ lab PR #15, `m4skel` mode |
+| 2 — injection routing | opened values -> keccak lane bytes + bank limbs (equality-bank precedent) | next |
+| 3 — FS byte-packing | lane digests -> challenge field elements (top unknown) | after 2 |
+| 4 — real schedule + binding + tests | verify a real M3 proof in-circuit; positive + negative tests; gate exit | after 3 |
+
+Prover-performance lessons already learned (do not relearn): narrow eval's
+Expr conversion to the columns actually used (a full-width collect runs per
+LDE point, +70% prove); allocate trace buffers at full LDE capacity up front
+(late reserve realloc = 3x RSS).
