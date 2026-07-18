@@ -2357,6 +2357,88 @@ where
             }
         }
 
+        // =====================================================================
+        // M_RO reduced-opening assembly (endpoint pin, START completion). The
+        // 9-row bank schedule assembles `ro` (the round -1 RUNEV) from the
+        // pinned reduced-opening registers, tying the START of the fold chain
+        // to the accumulated openings. NOTE the witness uses `bank_add_c(C,B)`
+        // (subtractive: writes add_c=C, add_b=B, add_a=C-B, result = add_a) for
+        // rows 2..6 and standard `bank_add(A,B)` for rows 7,8. Bank arithmetic
+        // (mul_c=a·b, add_c=a+b) is already constrained; here we pin each row's
+        // known operands and thread the intermediates / SCR scratch. Dataflow:
+        //   r0 mul(P0R,PX0R)->SCR0      r1 mul(P1R,PZACC)->SCR1
+        //   r2 addc(A0R,PX0R)=g0; mul(g0,INVZ)->SCR2      [g0=add_a]
+        //   r3 addc(A1R,A0R)=m           [m=add_a -> add_c(r4)]
+        //   r4 addc(m,SCR0)=d1; mul(d1,INVZN)->SCR3       [d1=add_a]
+        //   r5 addc(A2R,A1R)=m           [m=add_a -> add_c(r6)]
+        //   r6 addc(m,SCR1)=d2; mul(d2,INVZ)->SCR4        [d2=add_a]
+        //   r7 add(SCR2,SCR3)=m          [m=add_c -> add_a(r8)]
+        //   r8 add(m,SCR4)=ro -> RUNEV   [ro=add_c]
+        // =====================================================================
+        {
+            let mr = cv(MSEL + M_RO as usize);
+            let mul_a = |k: usize| cv(MUL_OFF + k);
+            let mul_b = |k: usize| cv(MUL_OFF + 4 + k);
+            let add_a = |k: usize| cv(ADD_OFF + k);
+            let add_b = |k: usize| cv(ADD_OFF + 4 + k);
+            let add_c = |k: usize| cv(ADD_OFF + 8 + k);
+            let scr = |i: usize, k: usize| SCR + 4 * i + k;
+            for k in 0..4 {
+                // mul_b operands.
+                builder.assert_zero(mr.clone() * sf(0) * (mul_b(k) - cv(PX0R + k)));
+                builder.assert_zero(mr.clone() * sf(1) * (mul_b(k) - cv(PZACC + k)));
+                builder.assert_zero(mr.clone() * sf(2) * (mul_b(k) - cv(INVZ + k)));
+                builder.assert_zero(mr.clone() * sf(4) * (mul_b(k) - cv(INVZN + k)));
+                builder.assert_zero(mr.clone() * sf(6) * (mul_b(k) - cv(INVZ + k)));
+                // mul_a: registers (r0,r1); same-row add_a intermediate (r2,4,6).
+                builder.assert_zero(mr.clone() * sf(0) * (mul_a(k) - cv(P0R + k)));
+                builder.assert_zero(mr.clone() * sf(1) * (mul_a(k) - cv(P1R + k)));
+                builder.assert_zero(
+                    mr.clone() * (sf(2) + sf(4) + sf(6)) * (mul_a(k) - add_a(k)),
+                );
+                // add_c operands for the subtractive rows (bank_add_c first arg):
+                // r2=A0R, r3=A1R, r5=A2R. (r4,r6 add_c come via threading below.)
+                builder.assert_zero(mr.clone() * sf(2) * (add_c(k) - cv(A0R + k)));
+                builder.assert_zero(mr.clone() * sf(3) * (add_c(k) - cv(A1R + k)));
+                builder.assert_zero(mr.clone() * sf(5) * (add_c(k) - cv(A2R + k)));
+                // add_b operands.
+                builder.assert_zero(mr.clone() * sf(2) * (add_b(k) - cv(PX0R + k)));
+                builder.assert_zero(mr.clone() * sf(3) * (add_b(k) - cv(A0R + k)));
+                builder.assert_zero(mr.clone() * sf(4) * (add_b(k) - cv(scr(0, k))));
+                builder.assert_zero(mr.clone() * sf(5) * (add_b(k) - cv(A1R + k)));
+                builder.assert_zero(mr.clone() * sf(6) * (add_b(k) - cv(scr(1, k))));
+                builder.assert_zero(mr.clone() * sf(7) * (add_b(k) - cv(scr(3, k))));
+                builder.assert_zero(mr.clone() * sf(8) * (add_b(k) - cv(scr(4, k))));
+                // r7 is a standard bank_add(SCR2, SCR3): add_a = SCR2.
+                builder.assert_zero(mr.clone() * sf(7) * (add_a(k) - cv(scr(2, k))));
+            }
+            // SCR scratch carry + capture the bank output on its producing row
+            // (SCR0@0 SCR1@1 SCR2@2 SCR3@4 SCR4@6); intermediate threading; and
+            // RUNEV set are transition constraints.
+            let cap_rows = [0usize, 1, 2, 4, 6];
+            let mut t = builder.when_transition();
+            for k in 0..4 {
+                for (i, &cr) in cap_rows.iter().enumerate() {
+                    // Gated by mr: only the M_RO perm; folds own SCR elsewhere.
+                    t.assert_zero(
+                        mr.clone()
+                            * (nv(scr(i, k))
+                                - cv(scr(i, k))
+                                - sf(cr) * (cv(MUL_OFF + 8 + k) - cv(scr(i, k)))),
+                    );
+                }
+                // Subtractive-row result add_a threads into next row's add_c
+                // (r3->r4, r5->r6).
+                t.assert_zero(
+                    mr.clone() * (sf(3) + sf(5)) * (nv(ADD_OFF + 8 + k) - cv(ADD_OFF + k)),
+                );
+                // r7 result add_c threads into r8's add_a.
+                t.assert_zero(mr.clone() * sf(7) * (nv(ADD_OFF + k) - cv(ADD_OFF + 8 + k)));
+                // ro = add_c(r8) -> RUNEV.
+                t.assert_zero(mr.clone() * sf(8) * (nv(RUNEV + k) - cv(ADD_OFF + 8 + k)));
+            }
+        }
+
         // The last-row phase anchor is the QSEL check emitted above.
         let _ = (cf, pv, xorsel, consumersel);
     }
@@ -4051,6 +4133,15 @@ mod tests {
                 u(row, PZACC), u(row, PREG), u(row, PREGA),
             );
         }
+        eprintln!("row: MSEL_RO CF CONSF | SCR0 SCR1 SCR2 SCR3 SCR4 mulc0 addc0");
+        for row in target.saturating_sub(3)..=target + 8 {
+            eprintln!(
+                "{row}: {} {} {} | {} {} {} {} {} {} {}",
+                u(row, MSEL + M_RO as usize), u(row, CF), u(row, CONSF),
+                u(row, SCR), u(row, SCR + 4), u(row, SCR + 8), u(row, SCR + 12),
+                u(row, SCR + 16), u(row, MUL_OFF + 8), u(row, ADD_OFF + 8),
+            );
+        }
     }
 
     /// Diagnostic (relay debugging): dump the flush/draw-schedule columns at
@@ -4456,6 +4547,29 @@ mod tests {
         assert_unsat(move |t, _o, qr, _fd| {
             let row = qr[0];
             t.values[row * w + FPREG] += Val::ONE;
+        });
+    }
+
+    /// Endpoint-pin negative (START completion): tamper an M_RO reduced-opening
+    /// SCR intermediate. The 9-row assembly binding must reject the change.
+    #[test]
+    fn gate_neg_mro() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, _qr, _fd| {
+            // Find an M_RO perm (MSEL slot 3 set on its last row) and flip an
+            // SCR intermediate on its capture-carry span.
+            let n = t.values.len() / w;
+            let mro = MSEL + M_RO as usize;
+            let one = Val::ONE;
+            for perm in 0..(n / 24) {
+                let r23 = perm * 24 + 23;
+                if t.values[r23 * w + mro] == one {
+                    // Row 3 of this M_RO perm: SCR0 must still hold its capture.
+                    t.values[(perm * 24 + 3) * w + SCR] += one;
+                    return;
+                }
+            }
+            panic!("no M_RO perm found");
         });
     }
 }
