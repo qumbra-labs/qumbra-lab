@@ -555,9 +555,16 @@ const ENDG: usize = EG_A + 1; // endgate = sf(23) * EG_A
 const XSEL: usize = ENDG + 1; // xorsel (current row)
 const QADV: usize = XSEL + 1; // sf(23) * phq * QCW
 const CFULL: usize = QADV + 1; // sf(23) * consumersel * (1 - FSFULL)
+// Query-selector decode products (Phase 1a family 2): raw bit-products so the
+// phq-gated selector defs (RSEL/MLO/DBIT) stay deg <= 3.
+const M3: usize = CFULL + 1; // 8: 3-bit product PD10..12 (MLO without phq)
+const RLO: usize = M3 + 8; // 4: PD0/PD1 pair products (RSEL low)
+const RHI: usize = RLO + 4; // 4: PD2/PD3 pair products (RSEL high)
+const DMUX: usize = RHI + 4; // dparam-selected idx-bit mux (DBIT)
+const SNL: usize = DMUX + 1; // 4: M_S chain gate = msel * (1 - sf(lf)) per round
 
-const GATE_COLS: usize = CFULL + 1 - GB;
-pub(crate) const GATE_WIDTH: usize = CFULL + 1;
+const GATE_COLS: usize = SNL + 4 - GB;
+pub(crate) const GATE_WIDTH: usize = SNL + 4;
 
 /// Diagnostic helper (relay debugging): map a column index to its region
 /// name. Used by the `dump_constraint` / `dump_trace` tests to translate a
@@ -595,6 +602,7 @@ pub(crate) fn colname(x: usize) -> &'static str {
         (CHLIVE, "CHLIVE"), (F2SEL, "F2SEL"), (PG_A, "PG_A"), (PHG, "PHG"),
         (PHDEND, "PHDEND"), (CONT, "CONT"), (EG_A, "EG_A"), (ENDG, "ENDG"),
         (XSEL, "XSEL"), (QADV, "QADV"), (CFULL, "CFULL"),
+        (M3, "M3"), (RLO, "RLO"), (RHI, "RHI"), (DMUX, "DMUX"), (SNL, "SNL"),
     ];
     let mut best = ("?", 0usize);
     for &(off, nm) in table {
@@ -999,20 +1007,30 @@ where
                 AB::Expr::ONE - cv(col)
             }
         };
-        // Role selectors: RSEL_r = phq * pair(PD0,PD1) * pair(PD2,PD3).
-        for r in 0..N_ROLES {
-            let lo = lit(PD, r & 1 == 1) * lit(PD + 1, r & 2 == 2);
-            let hi = lit(PD + 2, r & 4 == 4) * lit(PD + 3, r & 8 == 8);
-            builder.assert_eq(cv(RSEL + r), phq.clone() * lo * hi);
+        // Degree-reduction (family 2): materialize the raw bit-products used by
+        // the phq-gated selector defs so those stay deg <= 3.
+        // RLO_j = pair(PD0,PD1); RHI_j = pair(PD2,PD3); M3_a = 3-bit(PD10..12).
+        for j in 0..4 {
+            builder.assert_eq(cv(RLO + j), lit(PD, j & 1 == 1) * lit(PD + 1, j & 2 == 2));
+            builder.assert_eq(cv(RHI + j), lit(PD + 2, j & 1 == 1) * lit(PD + 3, j & 2 == 2));
         }
-        // Micro selectors: MLO_a = phq * 3-bit product (PD10..12),
-        // MHI_b = 2-bit product (PD13..14), MSEL_m = MLO * MHI.
         for a in 0..8 {
-            let e = phq.clone()
-                * lit(PD + 10, a & 1 == 1)
-                * lit(PD + 11, a & 2 == 2)
-                * lit(PD + 12, a & 4 == 4);
-            builder.assert_eq(cv(MLO + a), e);
+            builder.assert_eq(
+                cv(M3 + a),
+                lit(PD + 10, a & 1 == 1) * lit(PD + 11, a & 2 == 2) * lit(PD + 12, a & 4 == 4),
+            );
+        }
+        // Role selectors: RSEL_r = phq * RLO[r&3] * RHI[(r>>2)&3]  (deg 3).
+        for r in 0..N_ROLES {
+            builder.assert_eq(
+                cv(RSEL + r),
+                phq.clone() * cv(RLO + (r & 3)) * cv(RHI + ((r >> 2) & 3)),
+            );
+        }
+        // Micro selectors: MLO_a = phq * M3[a]; MHI_b = 2-bit(PD13..14);
+        // MSEL_m = MLO * MHI  (all deg <= 3).
+        for a in 0..8 {
+            builder.assert_eq(cv(MLO + a), phq.clone() * cv(M3 + a));
         }
         for b in 0..4 {
             let e = lit(PD + 13, b & 1 == 1) * lit(PD + 14, b & 2 == 2);
@@ -1036,9 +1054,9 @@ where
             + cv(RSEL + R_ABS_C34 as usize)
             + cv(RSEL + R_ABS_C5 as usize)
             + cv(RSEL + R_ABS_C30 as usize);
+        // DRND_j = absany * DLO[j]  (DLO[j] is the same 3-bit product; deg 2).
         for j in 0..6 {
-            let e = lit(PD + 4, j & 1 == 1) * lit(PD + 5, j & 2 == 2) * lit(PD + 6, j & 4 == 4);
-            builder.assert_eq(cv(DRND + j), absany.clone() * e);
+            builder.assert_eq(cv(DRND + j), absany.clone() * cv(DLO + j));
         }
         // Leaf-start selector.
         builder.assert_eq(
@@ -1112,11 +1130,13 @@ where
         let pathish = cv(RSEL + R_PATH as usize)
             + (R_PLAST_T..=R_PLAST_F3).map(|r| cv(RSEL + r as usize)).fold(AB::Expr::ZERO, |a, e| a + e);
         {
+            // DMUX = sum_k DLO[k&7]*DHI[k>>3]*IDXB[k] (deg 3); DBIT = pathish*DMUX.
             let mut mux = AB::Expr::ZERO;
             for k in 0..19 {
                 mux = mux + cv(DLO + (k & 7)) * cv(DHI + (k >> 3)) * cv(IDXB + k);
             }
-            builder.assert_eq(cv(DBIT), pathish.clone() * mux);
+            builder.assert_eq(cv(DMUX), mux);
+            builder.assert_eq(cv(DBIT), pathish.clone() * cv(DMUX));
         }
         builder.assert_eq(cv(GLC), pathish.clone() * (AB::Expr::ONE - cv(DBIT)));
         builder.assert_eq(cv(GRC), pathish.clone() * cv(DBIT));
@@ -1865,6 +1885,10 @@ where
                 let lf = lfs[rf];
                 let msel = cv(MSEL + M_S0 as usize + rf);
                 let not_lf = AB::Expr::ONE - sf(lf);
+                // Materialized chain gate SNL_rf = msel * (1 - sf(lf)) keeps the
+                // b-mux binding below deg <= 3 (target is deg 2).
+                builder.assert_eq(cv(SNL + rf), msel.clone() * not_lf.clone());
+                let snl = cv(SNL + rf);
                 // mul_b limb0 = 1 + idx-bit·(sk-1) on chain rows (0 on row lf).
                 let mut target = AB::Expr::ZERO;
                 for r in 0..lf {
@@ -1873,9 +1897,9 @@ where
                             * (AB::Expr::ONE
                                 + cv(IDXB + CUM[rf + 1] + r) * (cn(self.consts.sk[rf][r]) - AB::Expr::ONE));
                 }
-                builder.assert_zero(msel.clone() * not_lf.clone() * (cv(MUL_OFF + 4) - target));
+                builder.assert_zero(snl.clone() * (cv(MUL_OFF + 4) - target));
                 for k in 1..4 {
-                    builder.assert_zero(msel.clone() * not_lf.clone() * cv(MUL_OFF + 4 + k));
+                    builder.assert_zero(snl.clone() * cv(MUL_OFF + 4 + k));
                 }
                 // mul_a at chain row 0 = ONE.
                 builder.assert_zero(msel.clone() * sf(0) * (cv(MUL_OFF) - AB::Expr::ONE));
@@ -3433,6 +3457,23 @@ fn fill_derived(values: &mut [Val]) {
         let base = r * w;
         let row = &values[base..base + w];
         let g = |col: usize| row[col];
+        // PD-bit literal: on ? bit : (1 - bit).
+        let pl = |col: usize, on: bool| if on { row[col] } else { one - row[col] };
+        // Family-2 raw bit-products.
+        let mut m3 = [Val::ZERO; 8];
+        for (a, slot) in m3.iter_mut().enumerate() {
+            *slot = pl(PD + 10, a & 1 == 1) * pl(PD + 11, a & 2 == 2) * pl(PD + 12, a & 4 == 4);
+        }
+        let mut rlo = [Val::ZERO; 4];
+        let mut rhi = [Val::ZERO; 4];
+        for j in 0..4 {
+            rlo[j] = pl(PD, j & 1 == 1) * pl(PD + 1, j & 2 == 2);
+            rhi[j] = pl(PD + 2, j & 1 == 1) * pl(PD + 3, j & 2 == 2);
+        }
+        let mut dmux = Val::ZERO;
+        for k in 0..19 {
+            dmux += g(DLO + (k & 7)) * g(DHI + (k >> 3)) * g(IDXB + k);
+        }
         let sf23 = g(23);
         let phc = g(PHC);
         let phq = g(PHQ);
@@ -3473,9 +3514,23 @@ fn fill_derived(values: &mut [Val]) {
             (XSEL, xsel),
             (QADV, qadv),
             (CFULL, cfull),
+            (DMUX, dmux),
         ];
         for (col, val) in derived {
             values[base + col] = val;
+        }
+        for a in 0..8 {
+            values[base + M3 + a] = m3[a];
+        }
+        for j in 0..4 {
+            values[base + RLO + j] = rlo[j];
+            values[base + RHI + j] = rhi[j];
+        }
+        // SNL_rf = MSEL[M_S0+rf] * (1 - sf(lfs[rf])).
+        let lfs = [18usize, 14, 10, 8];
+        for rf in 0..4 {
+            let msel = values[base + MSEL + M_S0 as usize + rf];
+            values[base + SNL + rf] = msel * (Val::ONE - values[base + lfs[rf]]);
         }
     }
 }
