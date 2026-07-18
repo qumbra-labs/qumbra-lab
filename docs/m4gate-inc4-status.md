@@ -82,17 +82,19 @@ not weakenings.
 
 | gate-exit negative | tamper point | status |
 |---|---|---|
-| 2 wrong root | flip an outer public value (cap limb) | **UNSAT (bound)** |
+| 2 wrong root | flip all batch-0 cap limbs | **UNSAT (bound)** |
 | 1 tampered opening | flip a query leaf preimage limb | **UNSAT (bound)** |
 | 3 wrong challenge | flip an accepted field-draw FSACC / CHAL limb | **UNSAT (bound, Stage D)** |
-| 4 bad fold | flip a running-fold-eval (RUNEV) limb | SAT (unbound) |
+| 4 bad fold | flip a running-fold-eval (RUNEV) limb | **UNSAT (bound, Stage L)** |
 | (bank sanity) | flip a mul-bank output | UNSAT (bound) |
 
-Negatives 1, 2, 3 are permanent passing tests (`gate_neg_wrong_root`,
-`gate_neg_tampered_opening`, `gate_neg_wrong_challenge_fs` +
-`gate_neg_wrong_challenge_chal`). Negative 4 is written but `#[ignore]`d with
-the exact remainder in the attribute — **not weakened to pass**. Un-ignore it
-when the fold pipeline lands.
+**All four bind** — all are permanent passing tests, none ignored:
+`gate_neg_wrong_root`, `gate_neg_tampered_opening`,
+`gate_neg_wrong_challenge_fs` + `_chal`, `gate_neg_bad_fold`. Plus the
+inc-4 schedule/arith bindings: `gate_neg_wrong_query_index`,
+`gate_neg_grp_schedule`, `gate_neg_value_schedule`, `gate_neg_xreg_chain`,
+`gate_neg_xfin_chain`, `gate_neg_invz`, `gate_neg_zn`, `gate_neg_inv2s`,
+`gate_neg_breg`. Suite: 21 passed, 0 ignored.
 
 Root cause of the *remaining* bad-fold gap: `eval` still leaves the ext-arith
 pipeline as free witness — `extmul` is unused in `eval`. Free regions: reduced
