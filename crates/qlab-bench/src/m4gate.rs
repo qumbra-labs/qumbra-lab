@@ -3082,14 +3082,12 @@ mod tests {
         let air = VerifierGateAir::new();
         let one = Val::ONE;
         // (label, mutate) -> returns whether check_constraints panics (UNSAT).
+        let _ = &air;
         let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>, &mut Vec<Val>)| {
             let (mut trace, mut meta) = build_gate_trace(sched, pvs, 0);
             mutate(&mut trace, &mut meta.opvs);
-            let opvs = meta.opvs.clone();
-            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                check_constraints(&air, &trace, &opvs);
-            }));
-            eprintln!("  [{}] {label}", if r.is_err() { "UNSAT ok" } else { "SAT  MISS" });
+            let unsat = is_unsat(trace, meta.opvs.clone());
+            eprintln!("  [{}] {label}", if unsat { "UNSAT ok" } else { "SAT  MISS" });
         };
         let w = GATE_WIDTH;
         eprintln!("tamper coverage (UNSAT = caught, SAT = not bound):");
@@ -3166,16 +3164,29 @@ mod tests {
         check_constraints(&VerifierGateAir::new(), &trace, &meta.opvs);
     }
 
+    /// Run `check_constraints` in a spawned thread and report whether it
+    /// panicked (UNSAT). A spawned thread's panic — including rayon worker
+    /// panics that propagate into it — is reliably captured by `join()`,
+    /// unlike `catch_unwind` on the calling thread, which intermittently lets
+    /// the panic escape when many checks run concurrently under `cargo test`.
+    fn is_unsat(trace: RowMajorMatrix<Val>, opvs: Vec<Val>) -> bool {
+        std::thread::spawn(move || {
+            check_constraints(&VerifierGateAir::new(), &trace, &opvs);
+        })
+        .join()
+        .is_err()
+    }
+
     /// Assert a mutated witness is UNSATISFIABLE (some constraint fires).
     fn assert_unsat(mutate: impl Fn(&mut RowMajorMatrix<Val>, &mut Vec<Val>)) {
         let (sched, pvs, _) = shared();
         let (mut trace, mut meta) = build_gate_trace(sched, pvs, 0);
         mutate(&mut trace, &mut meta.opvs);
         let opvs = meta.opvs.clone();
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            check_constraints(&VerifierGateAir::new(), &trace, &opvs);
-        }));
-        assert!(r.is_err(), "expected UNSAT but constraints were satisfied");
+        assert!(
+            is_unsat(trace, opvs),
+            "expected UNSAT but constraints were satisfied"
+        );
     }
 
     /// Gate-exit negative 2 (wrong root): a claimed inner Merkle cap that
