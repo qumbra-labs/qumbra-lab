@@ -12,12 +12,14 @@
 
 mod geometry;
 mod levers;
-mod narrow_bench;
+mod m4anchor;
 mod m4census;
+mod m4gate;
+mod m4gaterec;
 mod m4price;
 mod m4route;
 mod m4skel;
-mod m4anchor;
+mod narrow_bench;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
