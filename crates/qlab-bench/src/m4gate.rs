@@ -3954,16 +3954,16 @@ pub(crate) fn run_m4gate(power: &str, only: Option<&str>) {
     println!("# qumbra-lab M4 step 0b(ii): the calibration gate (verifier gate rectangle)");
     println!();
     crate::print_env(power);
-    println!(
-        "- rectangle: {GATE_WIDTH} cols x 2^16, {} lane perms; proves-in-circuit a \
-         REAL M3 consensus proof with every gate column bound (FS/draw schedule, \
-         query program, ext-arith fold pipeline, and both fold-chain endpoints \
-         value-pinned). Max constraint degree 3.",
-        n_shapes(),
-    );
     // Build the real M3 proof + recorder schedule once (shared across configs).
     let (_inst, pvs, proof) = m4gaterec::consensus_proof();
     let sched = m4gaterec::walk(&proof, &pvs);
+    let n_perms = lane_plan(&sched).0.len();
+    println!(
+        "- rectangle: {GATE_WIDTH} cols x 2^16, {n_perms} lane perms; proves-in-circuit \
+         a REAL M3 consensus proof with every gate column bound (FS/draw schedule, \
+         query program, ext-arith fold pipeline, and both fold-chain endpoints \
+         value-pinned). Max constraint degree 3."
+    );
     println!();
     println!("| lane config | rows | prove ms | verify ms | postcard KB | fixed KB |");
     println!("|---|---|---|---|---|---|");
