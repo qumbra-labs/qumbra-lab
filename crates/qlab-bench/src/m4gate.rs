@@ -1908,6 +1908,141 @@ where
             }
         }
 
+        // =====================================================================
+        // Fold arithmetic — round-0 leaf fold + HIT + fold-leaf consistency
+        // (inc-4). v = the fold leaf value ext(ASM0,ASM1,W0C,W1C). PBUF holds
+        // the even leaf; on the odd leaf SCR[i] = (pbuf+v)·half +
+        // breg[0]·kf[rf][0][i]·(pbuf-v). HIT = [VC == GPB] (one-hot dot with
+        // the GPB bit pattern, materialized deg 5 so the consistency stays
+        // deg 3): at the index-in-group leaf, v == RUNEV — the FRI fold
+        // consistency tying RUNEV to the sponge-bound openings.
+        // =====================================================================
+        {
+            let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
+            let vexpr = [cv(ASM0), cv(ASM1), cv(W0C), cv(W1C)];
+            // HIT = sum_s VC[s] · match(s, GPB bits).
+            let mut hit = AB::Expr::ZERO;
+            for s in 0..16usize {
+                let mut m = AB::Expr::ONE;
+                for k in 0..4 {
+                    m = m * if (s >> k) & 1 == 1 {
+                        cv(GPB + k)
+                    } else {
+                        AB::Expr::ONE - cv(GPB + k)
+                    };
+                }
+                hit = hit + cv(VC + s) * m;
+            }
+            builder.assert_eq(cv(HIT), hit);
+            // Fold-leaf consistency: at the index-in-group leaf, v == RUNEV.
+            for k in 0..4 {
+                builder.assert_zero(cv(CONSF) * cv(HIT) * (vexpr[k].clone() - cv(RUNEV + k)));
+            }
+            // ext-mul of a column-vector (a_off) and an expr-vector (be).
+            let extmul_ce = |a_off: usize, be: &[AB::Expr; 4], k: usize| -> AB::Expr {
+                let w = c(EXT_W);
+                let mut acc = AB::Expr::ZERO;
+                for i in 0..4 {
+                    for j in 0..4 {
+                        if i + j == k {
+                            acc = acc + cv(a_off + i) * be[j].clone();
+                        } else if i + j == k + 4 {
+                            acc = acc + w.clone() * cv(a_off + i) * be[j].clone();
+                        }
+                    }
+                }
+                acc
+            };
+            let pmv = [
+                cv(PBUF) - vexpr[0].clone(),
+                cv(PBUF + 1) - vexpr[1].clone(),
+                cv(PBUF + 2) - vexpr[2].clone(),
+                cv(PBUF + 3) - vexpr[3].clone(),
+            ];
+            let half = cn(self.consts.half);
+            let mut t = builder.when_transition();
+            // PBUF capture on even fold-value rows (CONSF·VCE); carry otherwise.
+            for k in 0..4 {
+                let cap = cv(CONSF) * cv(VCE);
+                t.assert_zero(
+                    cap.clone() * (nv(PBUF + k) - vexpr[k].clone())
+                        + (AB::Expr::ONE - cap) * (nv(PBUF + k) - cv(PBUF + k)),
+                );
+            }
+            // Round-0 SCR fold on odd fold-value rows (per round rf, pair i).
+            for rf in 0..4 {
+                let la = LOG_ARITIES[rf];
+                for i in 0..(1usize << (la - 1)) {
+                    let gate = cv(CONSF) * cv(VC + 2 * i + 1) * cv(DRND + 2 + rf);
+                    let kf = cn(self.consts.kf[rf][0][i]);
+                    for k in 0..4 {
+                        let computed = half.clone() * (cv(PBUF + k) + vexpr[k].clone())
+                            + kf.clone() * extmul_ce(BREG, &pmv, k);
+                        t.assert_zero(gate.clone() * (nv(SCR + 4 * i + k) - computed));
+                    }
+                }
+            }
+        }
+
+        // =====================================================================
+        // M_FHI higher-round folds + RUNEV threading (inc-4). Per round rf,
+        // fold levels 1..: outv = (scr[2i]+scr[2i+1])·half +
+        // breg[l]·kf[rf][l][i]·(scr[2i]−scr[2i+1]), written to SCR[i] (or RUNEV
+        // on the last pair). RUNEV is set at each M_FHI last row and at M_RO
+        // r=8 (below), and carries elsewhere — so a flip anywhere breaks the
+        // carry or a capture (closes bad_fold together with the leaf
+        // consistency and M_RO).
+        // =====================================================================
+        {
+            let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
+            let half = cn(self.consts.half);
+            let extmul_cc = |a_off: usize, lo: usize, hi: usize, k: usize| -> AB::Expr {
+                let w = c(EXT_W);
+                let mut acc = AB::Expr::ZERO;
+                for i in 0..4 {
+                    for j in 0..4 {
+                        let d = cv(lo + j) - cv(hi + j);
+                        if i + j == k {
+                            acc = acc + cv(a_off + i) * d;
+                        } else if i + j == k + 4 {
+                            acc = acc + w.clone() * cv(a_off + i) * d;
+                        }
+                    }
+                }
+                acc
+            };
+            let pairs3: [(usize, usize); 7] =
+                [(1, 0), (1, 1), (1, 2), (1, 3), (2, 0), (2, 1), (3, 0)];
+            let mut update = AB::Expr::ZERO; // rows where RUNEV is (re)written
+            let mut t = builder.when_transition();
+            for rf in 0..4 {
+                let msel = cv(MSEL + M_FHI0 as usize + rf);
+                let pairs: &[(usize, usize)] = if rf < 3 { &pairs3 } else { &[(1, 0)] };
+                let last = pairs.len() - 1;
+                for (r, &(l, i)) in pairs.iter().enumerate() {
+                    let gate = msel.clone() * sf(r);
+                    let lo = SCR + 4 * (2 * i);
+                    let hi = SCR + 4 * (2 * i + 1);
+                    let kf = cn(self.consts.kf[rf][l][i]);
+                    let target = if r == last { RUNEV } else { SCR + 4 * i };
+                    for k in 0..4 {
+                        let computed = half.clone() * (cv(lo + k) + cv(hi + k))
+                            + kf.clone() * extmul_cc(BREG + 4 * l, lo, hi, k);
+                        t.assert_zero(gate.clone() * (nv(target + k) - computed));
+                    }
+                    if r == last {
+                        update = update + gate;
+                    }
+                }
+            }
+            // RUNEV also updates at M_RO r=8 (its capture is in the M_RO block).
+            update = update + cv(MSEL + M_RO as usize) * sf(8);
+            // RUNEV carries on every non-update transition.
+            for k in 0..4 {
+                t.assert_zero((AB::Expr::ONE - update.clone()) * (nv(RUNEV + k) - cv(RUNEV + k)));
+            }
+        }
+
         // The last-row phase anchor is the QSEL check emitted above.
         let _ = (cf, pv, xorsel, consumersel);
     }
@@ -3741,14 +3876,12 @@ mod tests {
         });
     }
 
-    /// Gate-exit negative 4 (bad fold). REMAINDER: not yet bound. The FRI
-    /// fold ladders (SCR/BREG/RUNEV), reduced openings (PZACC/PREG), final
-    /// poly (FPREG) and ext-inv (INV2S/INVZ/INVZN) are free witness in `eval`
-    /// (`extmul` is unused there). Closing this needs the ext-arithmetic
-    /// constraint set (spec 2.1) + batched ext-inv (spec 2.4). See the
-    /// `tamper_coverage` probe. Un-ignore once that pipeline lands.
+    /// Gate-exit negative 4 (bad fold). BOUND (inc-4): the FRI fold ladders
+    /// (round-0 leaf fold + M_FHI) pin the fold values, the fold-leaf
+    /// consistency ties RUNEV to the sponge-bound openings at each round's
+    /// index-in-group, and RUNEV carries between the M_FHI / M_RO updates.
+    /// Flipping a RUNEV limb breaks the carry / consistency.
     #[test]
-    #[ignore = "remainder: ext-arithmetic fold pipeline not yet built (spec 2.1/2.4)"]
     fn gate_neg_bad_fold() {
         let w = GATE_WIDTH;
         assert_unsat(move |t, _o, qr, _fd| {

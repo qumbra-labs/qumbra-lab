@@ -1,11 +1,17 @@
 # M4 step 0b(ii) increment 4 — status (relay handoff)
 
 Branch `claude/m4-0bii-inc4`. This session (Opus 4.8) picked up the Stage-1 +
-Stage-2 relay and executed `docs/m4gate-inc4-spec.md`. **STATUS: PARTIAL.**
-The positive gate passes and **three of the four** gate-exit negatives bind
-(wrong-root, tampered-opening, wrong-challenge); only bad-fold awaits the
-ext-arithmetic fold pipeline. Everything below is reproduced from tests in
-`crates/qlab-bench/src/m4gate.rs`.
+Stage-2 relay and executed `docs/m4gate-inc4-spec.md`. The positive gate
+accepts the real M3 transcript and **all four gate-exit negatives bind**
+(wrong-root, tampered-opening, wrong-challenge, bad-fold) — no ignored tests.
+The full FS/challenge/draw-schedule subsystem and the ext-arithmetic fold
+pipeline (x/inverse/s/BREG chains + round-0 leaf fold + M_FHI folds + fold-leaf
+consistency + RUNEV threading) are bound. Remaining for a full DONE: the M_RO
+reduced-opening + PZACC endpoints and M_HORN final compare (RUNEV is
+threading-pinned and consistency-anchored, so bad-fold binds, but the chain
+endpoints aren't yet value-pinned), plus canonicity / public surface / FSGATE
+position / the pre-existing degree reduction / bench. Everything below is
+reproduced from tests in `crates/qlab-bench/src/m4gate.rs`.
 
 **Update (Stage D):** the FS/challenge binding is built — see that section
 below. **Update (Stage E):** `sample_bits` is built — every FRI query index is
