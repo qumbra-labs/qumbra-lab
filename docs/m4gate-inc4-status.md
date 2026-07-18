@@ -9,8 +9,11 @@ ext-arithmetic fold pipeline. Everything below is reproduced from tests in
 
 **Update (Stage D):** the FS/challenge binding is built — see that section
 below. **Update (Stage E):** `sample_bits` is built — every FRI query index is
-now tied to the FS-sampled digest bits. The coverage table and remainder are
-updated accordingly.
+now tied to the FS-sampled digest bits. **Update (Stage F):** the draw-group
+schedule (GRP ring + GROT + PoW value) is bound. The coverage table and
+remainder are updated accordingly. **Update (fold map):** the fold pipeline
+(the sole remaining negative, bad-fold) has been fully mapped — see the
+"Fold-pipeline execution map" appendix at the end for the next session.
 
 ## What the first action found
 
@@ -234,3 +237,83 @@ Note on encodings for the next session: the whole trace is R-homogeneous
 ONE prints as 33554430 (= R); divide by R / compare to `Val::ONE` to read
 logical values. Scheduling/selector columns are ordinary field elements
 (from_bool/from_u32), not extra-Monty'd.
+
+## Fold-pipeline execution map (for the next focused session)
+
+This is the last remaining gate-exit negative (`bad_fold`) and the largest
+piece. It is a deeply interconnected monolith — there is **no small sound
+partial** that closes bad-fold, because the fold-leaf consistency needs HIT
+bound, HIT needs the VC/GPB machinery, and the fold arithmetic needs BREG which
+needs the bank-routed s/b ladders + reduced opening + final Horn. Build it as
+one subsystem, bottom-up, testing the positive after each layer.
+
+### What the pipeline computes (per query), from the witness micro-code
+
+All arithmetic runs through the mul/add banks (`bank_mul`/`bank_add`, already
+constrained: MUL c=a×b, ADD c=a+b) **or** directly over ext columns. A
+sim-only `mchain` register (NOT a trace column) threads chains across
+consecutive bank rows. Micro-codes (MSEL, per-perm, query phase only):
+
+- **M_X1** (22 rows): `x = GEN·∏(kx[r] if idx-bit r else 1)` — chained bank_mul
+  → XREG. **M_FIN** (8 rows): same shape → XFIN.
+- **M_INV** (2 rows): witness `inv_z = 1/(zeta−x)`, `inv_zn = 1/(zeta_next−x)`;
+  bank_add_c then bank_mul, product must be ONE. → INVZ, INVZN.
+- **M_S0..S3**: `s = ∏(sk if bit else 1)` chained bank_mul; then witness
+  `inv_2s = 1/(2s)` (2s·inv_2s == 1). → INV2S.
+- **M_B0..B3** (BREG ladder): `breg[0] = beta·inv_2s` (bank_mul), then
+  `breg[l] = 2·breg[l-1]²` (bank_mul square, ×2). → BREG (4×4 cols).
+- **round-0 leaf fold** (value-capture, NOT a micro-code — runs on CONSF rows):
+  vc even → `PBUF = v`; vc odd → `SCR[i] = (PBUF+v)·half + BREG[0]·kf[rf][0][i]·
+  (PBUF−v)`, i = vc/2. **Column-based** (v = ext(ASM0,ASM1,W0C,W1C), PBUF, SCR,
+  BREG all cols) — deg 2, no bank needed.
+- **M_RO** (9 rows): assemble reduced opening `ro` from P0,P1,PX0,PZACC,A0,A1,A2,
+  INVZ,INVZN via banks (SCR[0..4] scratch) → RUNEV.
+- **M_FHI0..3** (higher fold rounds): `outv = (SCR[2i]+SCR[2i+1])·half +
+  BREG[l]·kf[rf][l][i]·(SCR[2i]−SCR[2i+1])` → SCR[i] or (last) RUNEV.
+  **Column-based** — deg 2.
+- **M_HORN** (15 rows): final-poly Horner `acc = FPREG[15]; acc = acc·XFIN +
+  FPREG[14−r]` via banks; at r=14 assert `acc == final_eval` **and
+  `acc == RUNEV`** (the final fold compare).
+
+### The soundness thread
+
+`RUNEV` is set by M_RO (= ro) then each M_FHI (= folded_r), and read at (a) each
+fold leaf's `index_in_group` position — `v == RUNEV` (the FRI consistency: the
+previous round's fold must reappear as this round's opening, bound to the
+sponge), and (b) the final Horn compare (`RUNEV == final_eval`). The reduced
+opening ties RUNEV to the trace/quotient openings (PZACC/PX accumulation:
+`pzacc += preg·v`, `preg *= fri_alpha`, over all opened values + the dup zeta
+values). Binding *all* of RUNEV, the ladders, and the openings is required —
+partial binding lets a prover pick free intermediates.
+
+### Suggested build order (each layer: positive stays green, add a negative)
+
+1. **VC value-counter ring** (16-slot one-hot) + **GPB** (index-in-group bits)
+   + **HIT** (= [VC == GPB]) — the fold-leaf indexing. Foundational; sound and
+   self-contained; mirrors the COEF/GRP ring pattern from Stages D–F.
+2. **PBUF/SCR round-0 leaf fold** (column, deg 2) — needs BREG[0].
+3. **BREG ladder + INV2S + s-chain** (M_B/M_S, banks) — needs beta (CHAL, bound)
+   and the bank operand routing (mchain threading).
+4. **M_FHI higher-round fold** (column, deg 2) + **RUNEV carry/update** + the
+   **fold-leaf consistency** `CONSF·HIT·(v − RUNEV) == 0`.
+5. **X/XFIN chains, INV_Z/INV_ZN, reduced opening (M_RO), PZACC/PX accumulation**
+   (banks + inline ext) → RUNEV.
+6. **Final-poly Horn** (M_HORN) + the `RUNEV == final_eval` compare. Un-ignore
+   `gate_neg_bad_fold`.
+
+### Degree note
+
+The header comment (module docstring) budgets **deg ≤ 5** for the fold pairs;
+the column-based folds above are deg 2, but the bank-routed ladders/openings and
+the phase automaton already put the rectangle at max degree 6 (see the
+degree-budget section). Decide degree strategy (materialize vs. accept deg-5/6
+quotient) together with the pre-existing degree-reduction item before benching.
+
+### Key columns (all currently free witness)
+
+VC (16), VCE, GPB (4), HIT, PBUF (4), SCR (8×4), BREG (4×4), PREG (4), PZACC (4),
+A0R/A1R/A2R, P0R/P1R/PX0R, FPREG (16×4), INV2S/INVZ/INVZN, XREG/XFIN, RUNEV (4),
+CONSZ/CONSF, ASM0/ASM1, CZ2/CZ7/CF/CX0/CX1/CZD (value-carry-row selectors),
+POS (2). Witness fill: `write_row` (per row, pre-draw regs) + the value-capture
+and micro-code blocks in the per-perm loop (`crates/qlab-bench/src/m4gate.rs`
+~2140–2745). `scale()` maps native values to the R-homogeneous trace.
