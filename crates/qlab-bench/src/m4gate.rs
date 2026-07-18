@@ -562,9 +562,25 @@ const RLO: usize = M3 + 8; // 4: PD0/PD1 pair products (RSEL low)
 const RHI: usize = RLO + 4; // 4: PD2/PD3 pair products (RSEL high)
 const DMUX: usize = RHI + 4; // dparam-selected idx-bit mux (DBIT)
 const SNL: usize = DMUX + 1; // 4: M_S chain gate = msel * (1 - sf(lf)) per round
+// Fold-pipeline decode/gate products (Phase 1a family 3).
+const GLO: usize = SNL + 4; // 4: GPB0/GPB1 pair products (HIT low)
+const GHI: usize = GLO + 4; // 4: GPB2/GPB3 pair products (HIT high)
+const GF: usize = GHI + 4; // 4: round-0 fold gate = CONSF * DRND[2+rf]
+const BPM: usize = GF + 4; // 4: extmul(BREG, PBUF - v) for the round-0 fold
+const N_FHG: usize = 22; // M_FHI fold gates (3 rounds x 7 pairs + 1)
+const FHG: usize = BPM + 4; // 22: M_FHI fold gate = msel_rf * sf(r)
 
-const GATE_COLS: usize = SNL + 4 - GB;
-pub(crate) const GATE_WIDTH: usize = SNL + 4;
+const GATE_COLS: usize = FHG + N_FHG - GB;
+pub(crate) const GATE_WIDTH: usize = FHG + N_FHG;
+
+/// Flat M_FHI gate index for round `rf`, pair row `r` (mirrors the eval loop).
+const fn fhg_index(rf: usize, r: usize) -> usize {
+    if rf < 3 {
+        rf * 7 + r
+    } else {
+        21
+    }
+}
 
 /// Diagnostic helper (relay debugging): map a column index to its region
 /// name. Used by the `dump_constraint` / `dump_trace` tests to translate a
@@ -603,6 +619,7 @@ pub(crate) fn colname(x: usize) -> &'static str {
         (PHDEND, "PHDEND"), (CONT, "CONT"), (EG_A, "EG_A"), (ENDG, "ENDG"),
         (XSEL, "XSEL"), (QADV, "QADV"), (CFULL, "CFULL"),
         (M3, "M3"), (RLO, "RLO"), (RHI, "RHI"), (DMUX, "DMUX"), (SNL, "SNL"),
+        (GLO, "GLO"), (GHI, "GHI"), (GF, "GF"), (BPM, "BPM"), (FHG, "FHG"),
     ];
     let mut best = ("?", 0usize);
     for &(off, nm) in table {
@@ -2002,18 +2019,24 @@ where
         {
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
             let vexpr = [cv(ASM0), cv(ASM1), cv(W0C), cv(W1C)];
-            // HIT = sum_s VC[s] · match(s, GPB bits).
+            // GPB one-hot decode split into 2-bit pair products so HIT stays
+            // deg 3: GLO[j] = pair(GPB0,GPB1); GHI[j] = pair(GPB2,GPB3).
+            let gbit = |col: usize, on: bool| -> AB::Expr {
+                if on {
+                    cv(col)
+                } else {
+                    AB::Expr::ONE - cv(col)
+                }
+            };
+            for j in 0..4 {
+                builder.assert_eq(cv(GLO + j), gbit(GPB, j & 1 == 1) * gbit(GPB + 1, j & 2 == 2));
+                builder
+                    .assert_eq(cv(GHI + j), gbit(GPB + 2, j & 1 == 1) * gbit(GPB + 3, j & 2 == 2));
+            }
+            // HIT = sum_s VC[s] · GLO[s&3] · GHI[(s>>2)&3]  (deg 3).
             let mut hit = AB::Expr::ZERO;
             for s in 0..16usize {
-                let mut m = AB::Expr::ONE;
-                for k in 0..4 {
-                    m = m * if (s >> k) & 1 == 1 {
-                        cv(GPB + k)
-                    } else {
-                        AB::Expr::ONE - cv(GPB + k)
-                    };
-                }
-                hit = hit + cv(VC + s) * m;
+                hit = hit + cv(VC + s) * cv(GLO + (s & 3)) * cv(GHI + ((s >> 2) & 3));
             }
             builder.assert_eq(cv(HIT), hit);
             // Fold-leaf consistency: at the index-in-group leaf, v == RUNEV.
@@ -2042,6 +2065,15 @@ where
                 cv(PBUF + 3) - vexpr[3].clone(),
             ];
             let half = cn(self.consts.half);
+            // BPM = extmul(BREG, PBUF - v): the round-0 fold's BREG·(pbuf-v) ext
+            // product, so `computed` below is deg 1 (kept out of the gate).
+            for k in 0..4 {
+                builder.assert_eq(cv(BPM + k), extmul_ce(BREG, &pmv, k));
+            }
+            // GF_rf = CONSF * DRND[2+rf]: round-0 gate prefix (gate = GF * VC).
+            for rf in 0..4 {
+                builder.assert_eq(cv(GF + rf), cv(CONSF) * cv(DRND + 2 + rf));
+            }
             let mut t = builder.when_transition();
             // PBUF capture on even fold-value rows (CONSF·VCE); carry otherwise.
             for k in 0..4 {
@@ -2052,14 +2084,15 @@ where
                 );
             }
             // Round-0 SCR fold on odd fold-value rows (per round rf, pair i).
+            // gate = GF[rf]*VC[2i+1] (deg 2); computed deg 1 via BPM -> deg 3.
             for rf in 0..4 {
                 let la = LOG_ARITIES[rf];
                 for i in 0..(1usize << (la - 1)) {
-                    let gate = cv(CONSF) * cv(VC + 2 * i + 1) * cv(DRND + 2 + rf);
+                    let gate = cv(GF + rf) * cv(VC + 2 * i + 1);
                     let kf = cn(self.consts.kf[rf][0][i]);
                     for k in 0..4 {
-                        let computed = half.clone() * (cv(PBUF + k) + vexpr[k].clone())
-                            + kf.clone() * extmul_ce(BREG, &pmv, k);
+                        let computed =
+                            half.clone() * (cv(PBUF + k) + vexpr[k].clone()) + kf.clone() * cv(BPM + k);
                         t.assert_zero(gate.clone() * (nv(SCR + 4 * i + k) - computed));
                     }
                 }
@@ -2095,6 +2128,16 @@ where
             };
             let pairs3: [(usize, usize); 7] =
                 [(1, 0), (1, 1), (1, 2), (1, 3), (2, 0), (2, 1), (3, 0)];
+            // Materialize the per-(round,row) M_FHI fold gate (global, deg 2).
+            for rf in 0..4 {
+                let npairs = if rf < 3 { 7 } else { 1 };
+                for r in 0..npairs {
+                    builder.assert_eq(
+                        cv(FHG + fhg_index(rf, r)),
+                        cv(MSEL + M_FHI0 as usize + rf) * sf(r),
+                    );
+                }
+            }
             let mut update = AB::Expr::ZERO; // rows where RUNEV is (re)written
             let mut t = builder.when_transition();
             for rf in 0..4 {
@@ -2102,7 +2145,10 @@ where
                 let pairs: &[(usize, usize)] = if rf < 3 { &pairs3 } else { &[(1, 0)] };
                 let last = pairs.len() - 1;
                 for (r, &(l, i)) in pairs.iter().enumerate() {
-                    let gate = msel.clone() * sf(r);
+                    // FHG = msel_rf * sf(r) (materialized above, deg 1) so
+                    // gate*computed (computed deg 2) stays deg 3.
+                    let gate = cv(FHG + fhg_index(rf, r));
+                    let _ = &msel;
                     let lo = SCR + 4 * (2 * i);
                     let hi = SCR + 4 * (2 * i + 1);
                     let kf = cn(self.consts.kf[rf][l][i]);
@@ -3474,6 +3520,42 @@ fn fill_derived(values: &mut [Val]) {
         for k in 0..19 {
             dmux += g(DLO + (k & 7)) * g(DHI + (k >> 3)) * g(IDXB + k);
         }
+        // Family-3 fold gates/products.
+        let mut glo = [Val::ZERO; 4];
+        let mut ghi = [Val::ZERO; 4];
+        for j in 0..4 {
+            glo[j] = pl(GPB, j & 1 == 1) * pl(GPB + 1, j & 2 == 2);
+            ghi[j] = pl(GPB + 2, j & 1 == 1) * pl(GPB + 3, j & 2 == 2);
+        }
+        let mut gf = [Val::ZERO; 4];
+        for rf in 0..4 {
+            gf[rf] = g(CONSF) * g(DRND + 2 + rf);
+        }
+        // BPM = extmul(BREG, PBUF - v), v = ext(ASM0,ASM1,W0C,W1C).
+        let w_ext = Val::from_u32(EXT_W);
+        let vv = [g(ASM0), g(ASM1), g(W0C), g(W1C)];
+        let pmv = [g(PBUF) - vv[0], g(PBUF + 1) - vv[1], g(PBUF + 2) - vv[2], g(PBUF + 3) - vv[3]];
+        let mut bpm = [Val::ZERO; 4];
+        for (k, slot) in bpm.iter_mut().enumerate() {
+            let mut acc = Val::ZERO;
+            for i in 0..4 {
+                for j in 0..4 {
+                    if i + j == k {
+                        acc += g(BREG + i) * pmv[j];
+                    } else if i + j == k + 4 {
+                        acc += w_ext * g(BREG + i) * pmv[j];
+                    }
+                }
+            }
+            *slot = acc;
+        }
+        let mut fhg = [Val::ZERO; N_FHG];
+        for rf in 0..4 {
+            let npairs = if rf < 3 { 7 } else { 1 };
+            for r in 0..npairs {
+                fhg[fhg_index(rf, r)] = g(MSEL + M_FHI0 as usize + rf) * g(r);
+            }
+        }
         let sf23 = g(23);
         let phc = g(PHC);
         let phq = g(PHQ);
@@ -3531,6 +3613,15 @@ fn fill_derived(values: &mut [Val]) {
         for rf in 0..4 {
             let msel = values[base + MSEL + M_S0 as usize + rf];
             values[base + SNL + rf] = msel * (Val::ONE - values[base + lfs[rf]]);
+        }
+        for j in 0..4 {
+            values[base + GLO + j] = glo[j];
+            values[base + GHI + j] = ghi[j];
+            values[base + GF + j] = gf[j];
+            values[base + BPM + j] = bpm[j];
+        }
+        for f in 0..N_FHG {
+            values[base + FHG + f] = fhg[f];
         }
     }
 }
