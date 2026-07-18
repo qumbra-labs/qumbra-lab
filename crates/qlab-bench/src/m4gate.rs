@@ -1421,11 +1421,12 @@ where
             builder.assert_zero(fs.clone() * (cv(FSACCEPT) - (AB::Expr::ONE - cv(FST7) * cv(FSNZ))));
 
             // =================================================================
-            // Ext-challenge assembly (inc-4): accepted field draws (challenger
-            // phase) feed the COEF ring / CURCH limbs; every 4th accepted draw
-            // assembles CHAL[grp] and advances the GRP ring. Query-index (bits)
-            // draws live in the query phase and are handled by sample_bits
-            // (spec 2.2, next); the phc gate keeps them out of here.
+            // Ext-challenge assembly (inc-4): accepted field draws feed the
+            // COEF ring / CURCH limbs; every 4th accepted draw assembles
+            // CHAL[grp] and advances the GRP ring. PoW/query-index (bits) draws
+            // run the same byte gadget but sit at grp >= G_POW; the field_grp
+            // gate keeps them out of the field assembly, and sample_bits (below)
+            // handles the query-index binding.
             // =================================================================
             let masked = cv(FSACC) + c(1 << 16) * b_lo + c(1 << 24) * b_hi_masked;
             // A field-challenge group (0..6) is the ring head. Query-index and
@@ -1451,6 +1452,19 @@ where
             for k in 0..4 * N_CHALS {
                 builder.when_first_row().assert_zero(cv(CHAL + k));
             }
+            for q in 0..NQ {
+                builder.when_first_row().assert_zero(cv(IDXR + q));
+            }
+            // sample_bits (query indices): value = low LOG_MAX (=22) bits of
+            // the draw = FSACC (bits 0..16) + FSBITS[0..6] << 16. No rejection.
+            // The draw sits at grp = G_IDX0 + q; bind IDXR[q] on its odd row.
+            let idx_val = {
+                let mut e = cv(FSACC);
+                for i in 0..(LOG_MAX - 16) {
+                    e = e + cv(FSBITS + i) * c(1 << (16 + i));
+                }
+                e
+            };
             {
                 let mut t = builder.when_transition();
                 // COEF ring: left-rotate (increment logical coef) on CROT.
@@ -1481,6 +1495,16 @@ where
                             cv(CHAL + 4 * g + k) + gate.clone() * (asm - cv(CHAL + 4 * g + k)),
                         );
                     }
+                }
+                // IDXR[q] = idx_val on the odd row of query q's bits draw
+                // (grp = G_IDX0 + q); carries otherwise. Ties every FRI query
+                // index to the FS-sampled digest bits — no free query choice.
+                for q in 0..NQ {
+                    let gate = cv(FSODD) * cv(ring_at(GRP, N_GROUPS, G_IDX0 + q));
+                    t.assert_eq(
+                        nv(IDXR + q),
+                        cv(IDXR + q) + gate * (idx_val.clone() - cv(IDXR + q)),
+                    );
                 }
             }
         }
@@ -3174,6 +3198,21 @@ mod tests {
             let (_, m) = build_gate_trace(sched2, pvs2, 0);
             let row = m.query_rows[0];
             t.values[row * w + CHAL] += Val::ONE;
+        });
+    }
+
+    /// Wrong query index (spec §2.2 sample_bits). BOUND (inc-4): each FRI
+    /// query index IDXR[q] is tied to the FS-sampled digest bits, so a prover
+    /// cannot choose favorable queries. Flipping IDXR[0] at a query row breaks
+    /// the sample_bits binding / carry.
+    #[test]
+    fn gate_neg_wrong_query_index() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o| {
+            let (sched2, pvs2, _) = shared();
+            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let row = m.query_rows[0];
+            t.values[row * w + IDXR] += Val::ONE;
         });
     }
 

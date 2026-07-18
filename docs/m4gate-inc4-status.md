@@ -8,7 +8,9 @@ ext-arithmetic fold pipeline. Everything below is reproduced from tests in
 `crates/qlab-bench/src/m4gate.rs`.
 
 **Update (Stage D):** the FS/challenge binding is built — see that section
-below. The coverage table and remainder are updated accordingly.
+below. **Update (Stage E):** `sample_bits` is built — every FRI query index is
+now tied to the FS-sampled digest bits. The coverage table and remainder are
+updated accordingly.
 
 ## What the first action found
 
@@ -92,6 +94,22 @@ real transcript, and the comparator/limb-consistency hold on any FS row), but a
 full soundness proof wants FSGATE pinned to the draw-hosting schedule (part of
 spec §2.1's periodic-schedule binding). Noted for the fold-pipeline session.
 
+## Stage E — sample_bits (query-index binding)
+
+The `sample_bits` variant (spec §2.2) reuses the Stage-D byte gadget: the
+native challenger masks a 4-byte pop to the low `log_max` (= 22) bits with no
+rejection. On a query-index draw's odd row the value is
+`IDXR[q] = FSACC (bits 0..16) + FSBITS[0..6] << 16`, bound into the GRP-ring-
+selected `IDXR[q]` (grp = G_IDX0 + q). Since the query-program routing already
+constrains `recompose(IDXB) == QSEL-selected IDXR[q]`, this closes the loop
+**digest bits → IDXR → IDXB → which leaf each query opens** — a prover can no
+longer choose favorable FRI queries. New passing test
+`gate_neg_wrong_query_index` (flip IDXR[0]); all Stage-E constraints deg ≤ 3
+(the 20 IDXR bindings are the only additions).
+
+Residual: the **PoW draw value** (grp = G_POW) is not yet constrained to 0
+(the grind check). Small, independent; belongs with the fold-pipeline session.
+
 ## Degree budget — PRE-EXISTING violation of the deg≤3 house rule
 
 `dump_constraint` reports **max degree 6** (histogram: deg1:36, deg2:2863,
@@ -165,24 +183,22 @@ above (3,532 cols × 2^16, 2,382 perms).
 
 ## Remainder (for the next relay session)
 
-DONE this session: FS draw gadget binding + ext-challenge assembly (Stage D,
-spec §2.2 byte gadget + §2.3), closing `gate_neg_wrong_challenge`.
+DONE this session: (Stage A) two constraint-timing fixes → positive green;
+(Stage B) negative scaffold + coverage; (Stage C) col accounting; (Stage D)
+FS draw gadget + ext-challenge assembly (spec §2.2 byte gadget + §2.3), closing
+`gate_neg_wrong_challenge`; (Stage E) `sample_bits` query-index binding (§2.2),
+adding `gate_neg_wrong_query_index`.
 
 In rough dependency order, still open:
 
 1. **Degree reduction to ≤ 3** (pre-existing, blocks the bench) — factor the
    Stage-2 flush-automaton deg 4/5/6 boundary products (phasegate chain etc.)
    through materialized selector columns. See the degree-budget section.
-2. **sample_bits** (§2.2) — LE-bytes-from-digest-end, mask to log2(domain), no
-   rejection; native cross-check like inc-3. The FS byte gadget is shared; add
-   the mask-only variant + query-index (bits-draw) assembly into IDXR. This is
-   also where the query-phase GROT / grp-advance for bits draws gets bound.
-3. **FSGATE schedule binding** (§2.1) — pin FSGATE to the draw-hosting rows so
-   the gadget can't be spuriously activated (see Stage-D residual note).
-4. **GRP/COEF ring rotation binding** (§2.1) — bind the GRP ring rotation to
-   GROT (COEF rotation to CROT is now implicit in the assembly, but the GRP
-   ring itself is still free witness), giving the GROUPREQ gate real teeth.
-5. **Ext-arithmetic pipeline** (§2.1) — reduced openings (PZACC/PREG), fold
+2. **PoW value + FSGATE + GRP-ring bindings** (§2.1) — small residuals from
+   Stages D/E: constrain the PoW draw value to 0 (grind), pin FSGATE to the
+   draw-hosting rows, and bind the GRP ring rotation to GROT (COEF rotation is
+   already implicit in the assembly). These give the GROUPREQ gate real teeth.
+3. **Ext-arithmetic pipeline** (§2.1) — reduced openings (PZACC/PREG), fold
    ladders (SCR/BREG/RUNEV), final poly Horner (FPREG); use the `extmul`
    helper already defined (but unused) in `eval`. Closes `gate_neg_bad_fold`.
 6. **Batched ext-inv** (§2.4) — 60 inversions via one mul-bank product chain +
