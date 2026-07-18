@@ -537,8 +537,27 @@ const CMPC: usize = PHD + 1; // BLKCNT == 148 comparator (dup first block)
 const CMPCI: usize = CMPC + 1;
 const CZD: usize = CMPCI + 1; // dup value-carry rows
 
-const GATE_COLS: usize = CZD + 1 - GB;
-pub(crate) const GATE_WIDTH: usize = CZD + 1;
+// -- degree-reduction materialized products (Phase 1a) -----------------------
+// Current-row materializations of high-degree gate products. Each is pinned by
+// a global deg<=3 defining constraint in `eval` and filled by the derived-
+// column pass in `build_gate_trace` (a pure function of already-filled current-
+// row columns). Introduced to bring every constraint to deg <= 3 (the house
+// rule since M1.5b) so the calibration bench runs at the consensus quotient
+// degree rather than the deg-6 the raw flush automaton would force.
+const CHLIVE: usize = CZD + 1; // phc * (1 - REFSEL)
+const F2SEL: usize = CHLIVE + 1; // ringsel(2) * (1 - bidxsel(0))
+const PG_A: usize = F2SEL + 1; // ringsel(7) * grpdone * phc
+const PHG: usize = PG_A + 1; // phasegate = sf(23) * BLKLAST * PG_A
+const PHDEND: usize = PHG + 1; // sf(23) * PHD * BLKLAST
+const CONT: usize = PHDEND + 1; // sf(23) * phc * (1 - BLKLAST)
+const EG_A: usize = CONT + 1; // phq * QCW * ring(QSEL, NQ-1)
+const ENDG: usize = EG_A + 1; // endgate = sf(23) * EG_A
+const XSEL: usize = ENDG + 1; // xorsel (current row)
+const QADV: usize = XSEL + 1; // sf(23) * phq * QCW
+const CFULL: usize = QADV + 1; // sf(23) * consumersel * (1 - FSFULL)
+
+const GATE_COLS: usize = CFULL + 1 - GB;
+pub(crate) const GATE_WIDTH: usize = CFULL + 1;
 
 /// Diagnostic helper (relay debugging): map a column index to its region
 /// name. Used by the `dump_constraint` / `dump_trace` tests to translate a
@@ -573,6 +592,9 @@ pub(crate) fn colname(x: usize) -> &'static str {
         (FPREG, "FPREG"), (SCR, "SCR"), (BREG, "BREG"), (INV2S, "INV2S"), (INVZ, "INVZ"),
         (INVZN, "INVZN"), (XREG, "XREG"), (XFIN, "XFIN"), (RUNEV, "RUNEV"),
         (F2DIG, "F2DIG"), (PHD, "PHD"), (CMPC, "CMPC"), (CMPCI, "CMPCI"), (CZD, "CZD"),
+        (CHLIVE, "CHLIVE"), (F2SEL, "F2SEL"), (PG_A, "PG_A"), (PHG, "PHG"),
+        (PHDEND, "PHDEND"), (CONT, "CONT"), (EG_A, "EG_A"), (ENDG, "ENDG"),
+        (XSEL, "XSEL"), (QADV, "QADV"), (CFULL, "CFULL"),
     ];
     let mut best = ("?", 0usize);
     for &(off, nm) in table {
@@ -888,6 +910,60 @@ where
         builder.assert_bool(phq.clone());
         builder.assert_bool(phc.clone());
 
+        // ---------------------------------------------------------------------
+        // Degree-reduction: pin the materialized gate products (deg <= 3 each).
+        // These replace the high-degree flush-automaton products below so every
+        // constraint stays within the house deg-3 budget. Filled by the derived
+        // pass in `build_gate_trace`.
+        // ---------------------------------------------------------------------
+        {
+            let ring_fring = |f: usize| cv(ring_at(FRING, 8, f));
+            // CHLIVE = phc * (1 - REFSEL)
+            builder.assert_eq(cv(CHLIVE), phc.clone() * (AB::Expr::ONE - cv(REFSEL)));
+            // F2SEL = ringsel(2) * (1 - bidxsel(0))
+            builder.assert_eq(cv(F2SEL), ring_fring(2) * (AB::Expr::ONE - cv(BIDX)));
+            // PG_A = ringsel(7) * grpdone * phc
+            builder.assert_eq(
+                cv(PG_A),
+                ring_fring(7) * cv(ring_at(GRP, N_GROUPS, G_DONE)) * phc.clone(),
+            );
+            // PHG (phasegate) = sf(23) * BLKLAST * PG_A
+            builder.assert_eq(cv(PHG), sf(23) * cv(BLKLAST) * cv(PG_A));
+            // PHDEND = sf(23) * PHD * BLKLAST
+            builder.assert_eq(cv(PHDEND), sf(23) * cv(PHD) * cv(BLKLAST));
+            // CONT = sf(23) * phc * (1 - BLKLAST)
+            builder.assert_eq(cv(CONT), sf(23) * phc.clone() * (AB::Expr::ONE - cv(BLKLAST)));
+            // EG_A = phq * QCW * ring(QSEL, NQ-1); ENDG (endgate) = sf(23) * EG_A
+            builder.assert_eq(
+                cv(EG_A),
+                phq.clone() * cv(QCW) * cv(ring_at(QSEL, NQ + 1, NQ - 1)),
+            );
+            builder.assert_eq(cv(ENDG), sf(23) * cv(EG_A));
+            // XSEL = phd*(1-CMPC) + sum of obs/dup interior SHSEL (xorsel).
+            {
+                let mut xs = cv(PHD) * (AB::Expr::ONE - cv(CMPC));
+                for f in 0..8 {
+                    if f == 2 {
+                        continue;
+                    }
+                    for b in 1..FLUSH_BLOCKS[f] {
+                        xs = xs + cv(SHSEL + shsel_index(f, b));
+                    }
+                }
+                builder.assert_eq(cv(XSEL), xs);
+            }
+            // QADV = sf(23) * phq * QCW
+            builder.assert_eq(cv(QADV), sf(23) * phq.clone() * cv(QCW));
+            // CFULL = sf(23) * consumersel * (1 - FSFULL)
+            {
+                let mut cs = cv(REFSEL);
+                for f in 1..8 {
+                    cs = cs + cv(SHSEL + shsel_index(f, 0));
+                }
+                builder.assert_eq(cv(CFULL), sf(23) * cs * (AB::Expr::ONE - cv(FSFULL)));
+            }
+        }
+
         // Ring pin + rotation (one limb per perm while in query phase).
         for i in 0..QSLOTS {
             builder
@@ -1004,8 +1080,8 @@ where
                         * ((AB::Expr::ONE - cv(QCW)) * (-AB::Expr::ONE)
                             + cv(QCW) * c(QSLOTS as u32 - 1)),
             );
-            // QSEL rotation on block wrap.
-            let g = dec.clone() * cv(QCW);
+            // QSEL rotation on block wrap. (QADV = sf(23)*phq*QCW = dec*QCW.)
+            let g = cv(QADV);
             for i in 0..=NQ {
                 t.assert_eq(
                     nv(QSEL + i),
@@ -1118,20 +1194,19 @@ where
         // =====================================================================
         let ringsel = |f: usize| cv(ring_at(FRING, 8, f));
         let bidxsel = |b: usize| cv(BIDX + b);
-        let chal_live = phc.clone() * (AB::Expr::ONE - cv(REFSEL));
+        let chal_live = cv(CHLIVE);
         {
             let shapes = shape_list();
             for (si, sh) in shapes.iter().enumerate() {
                 let e = match sh {
                     Shape::Obs { flush: 2, block: 0 } => ringsel(2) * bidxsel(0),
                     Shape::F2Mid => {
-                        ringsel(2)
-                            * (AB::Expr::ONE - bidxsel(0))
-                            * (AB::Expr::ONE - cv(BLKLAST))
+                        // F2SEL = ringsel(2) * (1 - bidxsel(0)); keeps deg <= 3.
+                        cv(F2SEL) * (AB::Expr::ONE - cv(BLKLAST))
                     }
                     Shape::Obs { flush: 2, .. } => {
                         // F2 last block.
-                        ringsel(2) * (AB::Expr::ONE - bidxsel(0)) * cv(BLKLAST)
+                        cv(F2SEL) * cv(BLKLAST)
                     }
                     Shape::Obs { flush, block } => ringsel(*flush) * bidxsel(*block),
                     Shape::Refill => continue, // REFSEL is its own column
@@ -1226,22 +1301,11 @@ where
             }
             e
         };
-        let xorsel_next = {
-            let mut e = nv(PHD) * (AB::Expr::ONE - nv(CMPC));
-            for f in 0..8 {
-                if f == 2 {
-                    continue;
-                }
-                for b in 1..FLUSH_BLOCKS[f] {
-                    e = e + nv(SHSEL + shsel_index(f, b));
-                }
-            }
-            e
-        };
-        let grpdone = cv(ring_at(GRP, N_GROUPS, G_DONE));
-        let phasegate = sf(23) * cv(BLKLAST) * ringsel(7) * grpdone.clone() * phc.clone();
-        let phdend = sf(23) * cv(PHD) * cv(BLKLAST);
-        let endgate = sf(23) * phq.clone() * cv(QCW) * cv(ring_at(QSEL, NQ + 1, NQ - 1));
+        // xorsel_next = nv(XSEL) (materialized current-row xorsel; deg 1).
+        let xorsel_next = nv(XSEL);
+        let phasegate = cv(PHG);
+        let phdend = cv(PHDEND);
+        let endgate = cv(ENDG);
         {
             let mut t = builder.when_transition();
             // Obs flush start: only the ring successor, only when the
@@ -1251,19 +1315,13 @@ where
                 t.assert_zero(sf(23) * sel.clone() * (AB::Expr::ONE - ringsel(f - 1)));
                 t.assert_zero(sf(23) * sel * (cv(BLKLAST) - cv(NEEDL)));
             }
-            // Mid-flush: no new flush, no refill.
-            t.assert_zero(
-                sf(23)
-                    * (AB::Expr::ONE - cv(BLKLAST))
-                    * phc.clone()
-                    * (b0next.clone() + nv(REFSEL)),
-            );
+            // Mid-flush: no new flush, no refill. (CONT = sf(23)*phc*(1-BLKLAST).)
+            t.assert_zero(cv(CONT) * (b0next.clone() + nv(REFSEL)));
             // Refill: only when the required group is incomplete, and only
             // after a consumer that used its full window.
             t.assert_zero(sf(23) * nv(REFSEL) * cv(NEEDL));
-            t.assert_zero(
-                sf(23) * nv(REFSEL) * consumersel.clone() * (AB::Expr::ONE - cv(FSFULL)),
-            );
+            // CFULL = sf(23) * consumersel * (1 - FSFULL); keeps deg <= 3.
+            t.assert_zero(nv(REFSEL) * cv(CFULL));
             // FRING rotation at obs starts.
             let g = sf(23) * b0next.clone();
             for i in 0..8 {
@@ -1275,7 +1333,7 @@ where
             // BIDX: reset on new flush/refill, saturating rotate on
             // continuation, hold otherwise (query/dup phases).
             let newf = sf(23) * (b0next.clone() + nv(REFSEL));
-            let cont = sf(23) * phc.clone() * (AB::Expr::ONE - cv(BLKLAST));
+            let cont = cv(CONT);
             for i in 0..6 {
                 let rot = match i {
                     0 => AB::Expr::ZERO,
@@ -3358,7 +3416,68 @@ pub(crate) fn build_gate_trace(
     );
     assert_eq!(regs.fpi, 16, "final poly fully captured");
 
+    fill_derived(&mut values);
+
     (RowMajorMatrix::new(values, GATE_WIDTH), meta)
+}
+
+/// Fill the Phase-1a degree-reduction columns: pure current-row functions of
+/// already-filled columns, mirroring the defining constraints in `eval`. Kept
+/// as a post-pass so the intricate per-perm witness logic above is untouched.
+fn fill_derived(values: &mut [Val]) {
+    let w = GATE_WIDTH;
+    let one = Val::ONE;
+    let rows = values.len() / w;
+    let ring = |base: usize, n: usize, g: usize| base + (n - g % n) % n;
+    for r in 0..rows {
+        let base = r * w;
+        let row = &values[base..base + w];
+        let g = |col: usize| row[col];
+        let sf23 = g(23);
+        let phc = g(PHC);
+        let phq = g(PHQ);
+        let blklast = g(BLKLAST);
+        let chlive = phc * (one - g(REFSEL));
+        let f2sel = g(ring(FRING, 8, 2)) * (one - g(BIDX));
+        let pg_a = g(ring(FRING, 8, 7)) * g(ring(GRP, N_GROUPS, G_DONE)) * phc;
+        let phg = sf23 * blklast * pg_a;
+        let phdend = sf23 * g(PHD) * blklast;
+        let cont = sf23 * phc * (one - blklast);
+        let eg_a = phq * g(QCW) * g(ring(QSEL, NQ + 1, NQ - 1));
+        let endg = sf23 * eg_a;
+        let mut xsel = g(PHD) * (one - g(CMPC));
+        for f in 0..8 {
+            if f == 2 {
+                continue;
+            }
+            for b in 1..FLUSH_BLOCKS[f] {
+                xsel += g(SHSEL + shsel_index(f, b));
+            }
+        }
+        let qadv = sf23 * phq * g(QCW);
+        let mut consumersel = g(REFSEL);
+        for f in 1..8 {
+            consumersel += g(SHSEL + shsel_index(f, 0));
+        }
+        let cfull = sf23 * consumersel * (one - g(FSFULL));
+        // row borrow ends; write the derived cells.
+        let derived = [
+            (CHLIVE, chlive),
+            (F2SEL, f2sel),
+            (PG_A, pg_a),
+            (PHG, phg),
+            (PHDEND, phdend),
+            (CONT, cont),
+            (EG_A, eg_a),
+            (ENDG, endg),
+            (XSEL, xsel),
+            (QADV, qadv),
+            (CFULL, cfull),
+        ];
+        for (col, val) in derived {
+            values[base + col] = val;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3526,6 +3645,33 @@ mod tests {
             cur.iter().map(|&x| (x, colname(x))).collect::<Vec<_>>(),
             nxt.iter().map(|&x| (x, colname(x))).collect::<Vec<_>>(),
         );
+
+        // Enumerate ALL deg>=4 constraints, collapsed by (deg, region-signature)
+        // so the ~200 instances group into their few source expressions.
+        let mut groups: std::collections::BTreeMap<(usize, String), (usize, usize)> =
+            std::collections::BTreeMap::new();
+        for (i, c) in cs.iter().enumerate() {
+            let d = c.degree_multiple();
+            if d < 4 {
+                continue;
+            }
+            let (mut cur, mut nxt, mut fl) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+            collect(c, &mut cur, &mut nxt, &mut fl);
+            let mut regs: BTreeSet<&'static str> = BTreeSet::new();
+            for &x in cur.iter() {
+                regs.insert(colname(x));
+            }
+            for &x in nxt.iter() {
+                regs.insert(colname(x));
+            }
+            let sig = format!("{:?} flags={:?}", regs, fl);
+            let e = groups.entry((d, sig)).or_insert((0, i));
+            e.0 += 1;
+        }
+        eprintln!("--- deg>=4 constraint groups (deg, count, first_idx, regions) ---");
+        for ((d, sig), (n, first)) in &groups {
+            eprintln!("deg={d} count={n} first=#{first} {sig}");
+        }
     }
 
     /// Diagnostic (relay debugging): dump the flush/draw-schedule columns at
