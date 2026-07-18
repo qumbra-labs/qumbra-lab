@@ -570,9 +570,14 @@ const BPM: usize = GF + 4; // 4: extmul(BREG, PBUF - v) for the round-0 fold
 const N_FHG: usize = 22; // M_FHI fold gates (3 rounds x 7 pairs + 1)
 const FHG: usize = BPM + 4; // 22: M_FHI fold gate = msel_rf * sf(r)
 const PREGA: usize = FHG + N_FHG; // 4: preg * fri_alpha (PX word-1 accumulation)
+// Reduced-opening capture-phase gates (endpoint pin START): PHD·comparator so
+// the A/P register captures (deg-1 use) stay deg <= 3.
+const CPA: usize = PREGA + 4; // PHD·CMPA  (A0/P0 capture: dup block 72)
+const CPB: usize = CPA + 1; // PHD·CMPB  (A1/P1 capture: dup block 145)
+const CPL: usize = CPB + 1; // PHD·BLKLAST (A2 capture: dup block 147)
 
-const GATE_COLS: usize = PREGA + 4 - GB;
-pub(crate) const GATE_WIDTH: usize = PREGA + 4;
+const GATE_COLS: usize = CPL + 1 - GB;
+pub(crate) const GATE_WIDTH: usize = CPL + 1;
 
 /// Flat M_FHI gate index for round `rf`, pair row `r` (mirrors the eval loop).
 const fn fhg_index(rf: usize, r: usize) -> usize {
@@ -621,7 +626,7 @@ pub(crate) fn colname(x: usize) -> &'static str {
         (XSEL, "XSEL"), (QADV, "QADV"), (CFULL, "CFULL"),
         (M3, "M3"), (RLO, "RLO"), (RHI, "RHI"), (DMUX, "DMUX"), (SNL, "SNL"),
         (GLO, "GLO"), (GHI, "GHI"), (GF, "GF"), (BPM, "BPM"), (FHG, "FHG"),
-        (PREGA, "PREGA"),
+        (PREGA, "PREGA"), (CPA, "CPA"), (CPB, "CPB"), (CPL, "CPL"),
     ];
     let mut best = ("?", 0usize);
     for &(off, nm) in table {
@@ -2239,6 +2244,35 @@ where
             }
         }
 
+        // =====================================================================
+        // Reduced-opening captures (endpoint pin, START). At fixed transcript
+        // positions the running pzacc/preg are snapshotted into the A/P/PX0
+        // registers that M_RO consumes; carry otherwise. Capture rows map to
+        // existing comparators (dup block 72 = CMPA, 145 = CMPB, 147 = BLKLAST;
+        // trace-leaf end = RSEL[R_ABS_C5]). CPA/CPB/CPL = PHD·comparator keep
+        // the gates deg 2. The captured value is the pre-consume pzacc = cv().
+        // =====================================================================
+        {
+            builder.assert_eq(cv(CPA), cv(PHD) * cv(CMPA));
+            builder.assert_eq(cv(CPB), cv(PHD) * cv(CMPB));
+            builder.assert_eq(cv(CPL), cv(PHD) * cv(BLKLAST));
+            let ga0 = cv(CPA) * sf(14);
+            let ga1 = cv(CPB) * sf(7);
+            let ga2 = cv(CPL) * sf(5);
+            let gpx = cv(RSEL + R_ABS_C5 as usize) * sf(3);
+            let mut t = builder.when_transition();
+            for k in 0..4 {
+                t.assert_zero(nv(A0R + k) - cv(A0R + k) - ga0.clone() * (cv(PZACC + k) - cv(A0R + k)));
+                t.assert_zero(nv(P0R + k) - cv(P0R + k) - ga0.clone() * (cv(PREG + k) - cv(P0R + k)));
+                t.assert_zero(nv(A1R + k) - cv(A1R + k) - ga1.clone() * (cv(PZACC + k) - cv(A1R + k)));
+                t.assert_zero(nv(P1R + k) - cv(P1R + k) - ga1.clone() * (cv(PREG + k) - cv(P1R + k)));
+                t.assert_zero(nv(A2R + k) - cv(A2R + k) - ga2.clone() * (cv(PZACC + k) - cv(A2R + k)));
+                t.assert_zero(
+                    nv(PX0R + k) - cv(PX0R + k) - gpx.clone() * (cv(PZACC + k) - cv(PX0R + k)),
+                );
+            }
+        }
+
         // The last-row phase anchor is the QSEL check emitted above.
         let _ = (cf, pv, xorsel, consumersel);
     }
@@ -3710,6 +3744,9 @@ fn fill_derived(values: &mut [Val]) {
         for k in 0..4 {
             values[base + PREGA + k] = prega[k];
         }
+        values[base + CPA] = values[base + PHD] * values[base + CMPA];
+        values[base + CPB] = values[base + PHD] * values[base + CMPB];
+        values[base + CPL] = values[base + PHD] * values[base + BLKLAST];
     }
 }
 
@@ -4311,6 +4348,17 @@ mod tests {
         assert_unsat(move |t, _o, qr, _fd| {
             let row = qr[0];
             t.values[row * w + PREG] += Val::ONE;
+        });
+    }
+
+    /// Endpoint-pin negative (START): tamper a captured reduced-opening
+    /// component. Its capture-or-carry recurrence must reject the change.
+    #[test]
+    fn gate_neg_capture() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
+            t.values[row * w + A0R] += Val::ONE;
         });
     }
 }
