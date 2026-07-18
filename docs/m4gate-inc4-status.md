@@ -336,18 +336,20 @@ partial binding lets a prover pick free intermediates.
 2. **PBUF/SCR round-0 leaf fold** (column, deg 2) — needs BREG[0]; add HIT here.
 3. **[DONE — Stages J/K]** s-chain/INV2S (Stage J) + BREG ladder (Stage K,
    M_B): `breg[0] = beta·inv2s`, `breg[l] = 2·breg[l-1]²`, all bound.
-4. **NEXT: round-0 leaf fold (PBUF/SCR) + M_FHI higher-round fold** (column,
-   deg 2, BREG now available) + **HIT** (= [VC == GPB]) + **RUNEV carry/update**
-   + the **fold-leaf consistency** `CONSF·HIT·(v − RUNEV) == 0`.
-5. **[X/XFIN DONE — Stage H; INVZ+INVZN DONE — Stages I/J]** reduced opening
-   (M_RO), PZACC/PX accumulation (banks + inline ext) → RUNEV. Both inverses are
-   now bound: INVZ (Stage I), and INVZN via the **ZN relation** `ZN = zeta·g_trace`
-   pinned on query rows (Stage J) — no trailer selector needed; FA2 = fri_alpha²
-   likewise. PZACC/PX is the big threaded accumulation `pzacc += preg·v;
-   preg *= fri_alpha` over the trace/quotient openings + dup zeta values (inline
-   ext-mul, deg 2) — still open.
-6. **Final-poly Horn** (M_HORN) + the `RUNEV == final_eval` compare. Un-ignore
-   `gate_neg_bad_fold`.
+4. **[DONE — Stage L]** round-0 leaf fold (PBUF/SCR) + M_FHI higher-round fold
+   + HIT (= [VC == GPB]) + RUNEV carry/update + fold-leaf consistency
+   `CONSF·HIT·(v − RUNEV) == 0`. **`gate_neg_bad_fold` un-ignored and passing.**
+5. **[X/XFIN DONE — H; INVZ+INVZN DONE — I/J]** REMAINING ENDPOINTS: reduced
+   opening (M_RO) + PZACC/PX accumulation → the round -1 RUNEV. The PZACC/PX is
+   the big threaded accumulation `pzacc += preg·v; preg *= fri_alpha` over the
+   trace/quotient openings + dup zeta values (inline ext-mul, deg 2), with the
+   a0/a1/a2/p0/p1/px0 captures at fixed dup rows; then M_RO's 9-row bank routing
+   assembles ro. This value-pins the *start* of the RUNEV chain (currently the
+   chain is threading-pinned + consistency-anchored, which suffices for the
+   negative but not full end-to-end value soundness).
+6. **Final-poly Horn** (M_HORN) + `RUNEV == final_eval`: value-pins the *end*.
+   Needs FPREG bound first (the final-poly coeffs captured on the F7/cz7 value
+   rows — needs an `fpi` counter column, analogous to VC).
 
 ### Degree note
 
