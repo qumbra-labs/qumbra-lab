@@ -303,17 +303,18 @@ partial binding lets a prover pick free intermediates.
    `scale(x)` (round-trips through the Monty limb), so the *native* x-chain
    uses `as_canonical_u32` instead — see the `cn` helper.
 2. **PBUF/SCR round-0 leaf fold** (column, deg 2) — needs BREG[0]; add HIT here.
-3. **BREG ladder + INV2S + s-chain** (M_B/M_S, banks) — needs beta (CHAL, bound)
-   and the bank operand routing (mchain threading).
+3. **[s-chain/INV2S DONE — Stage J]** BREG ladder (M_B): `breg[0] = beta·inv2s`,
+   `breg[l] = 2·breg[l-1]²`. Beta (CHAL) and INV2S are now both bound, so the
+   BREG ladder is the next piece (bank operand routing / mchain threading).
 4. **M_FHI higher-round fold** (column, deg 2) + **RUNEV carry/update** + the
    **fold-leaf consistency** `CONSF·HIT·(v − RUNEV) == 0`.
-5. **[X/XFIN DONE — Stage H; INVZ DONE — Stage I]** reduced opening (M_RO),
-   PZACC/PX accumulation (banks + inline ext) → RUNEV. INVZ = 1/(zeta−x) is
-   bound (Stage I); **INVZN = 1/(zeta_next−x)** has the correct inverse check
-   but its full soundness pends the **ZN/trailer binding** (ZNREG = zeta·g_trace
-   on the trailer M_GLOB rows is still free witness — bind it next). PZACC/PX
-   is the big threaded accumulation `pzacc += preg·v; preg *= fri_alpha` over
-   the trace/quotient openings + dup zeta values (inline ext-mul, deg 2).
+5. **[X/XFIN DONE — Stage H; INVZ+INVZN DONE — Stages I/J]** reduced opening
+   (M_RO), PZACC/PX accumulation (banks + inline ext) → RUNEV. Both inverses are
+   now bound: INVZ (Stage I), and INVZN via the **ZN relation** `ZN = zeta·g_trace`
+   pinned on query rows (Stage J) — no trailer selector needed; FA2 = fri_alpha²
+   likewise. PZACC/PX is the big threaded accumulation `pzacc += preg·v;
+   preg *= fri_alpha` over the trace/quotient openings + dup zeta values (inline
+   ext-mul, deg 2) — still open.
 6. **Final-poly Horn** (M_HORN) + the `RUNEV == final_eval` compare. Un-ignore
    `gate_neg_bad_fold`.
 

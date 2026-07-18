@@ -1769,8 +1769,95 @@ where
             }
         }
 
+        // =====================================================================
+        // ZN / FA2 global relations (inc-4): rather than locate the trailer
+        // perm where the witness computes them, pin them directly on every
+        // query row (phq) where they are consumed (M_INV, M_RO): ZN =
+        // zeta·g_trace (base scalar mult, deg 1) and FA2 = fri_alpha² (ext
+        // square, deg 2). Both challenges are bound (Stage D/F), so this also
+        // completes INVZN's soundness (M_INV r=1 now uses a pinned ZN).
+        // =====================================================================
+        {
+            let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
+            for k in 0..4 {
+                builder.assert_zero(
+                    phq.clone() * (cv(ZNREG + k) - cn(self.consts.g_trace) * cv(CHAL + 4 * G_ZETA + k)),
+                );
+                builder.assert_zero(
+                    phq.clone()
+                        * (cv(FA2 + k) - extmul(CHAL + 4 * G_FRIALPHA, CHAL + 4 * G_FRIALPHA, k)),
+                );
+            }
+        }
+
+        // =====================================================================
+        // M_S s-chains + INV2S (inc-4): per fold round rf, s = ∏_{r<lf}
+        // (sk[rf][r] if idx-bit (CUM[rf+1]+r) else 1) via a mul-bank chain
+        // (rows 0..lf-1, a starts at ONE); then row lf pins INV2S = 1/(2s) via
+        // mul(2s, inv2s) == 1, where mul_a(lf) = 2·mul_c(lf-1). lf per round =
+        // [18,14,10,8]. Native. The mul_b mux hits deg 4 (fold-arith budget).
+        // =====================================================================
+        {
+            let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
+            let lfs = [18usize, 14, 10, 8];
+            let capture: Vec<(AB::Expr, usize)> = (0..4)
+                .map(|rf| (cv(MSEL + M_S0 as usize + rf) * sf(lfs[rf]), lfs[rf]))
+                .collect();
+            for rf in 0..4 {
+                let lf = lfs[rf];
+                let msel = cv(MSEL + M_S0 as usize + rf);
+                let not_lf = AB::Expr::ONE - sf(lf);
+                // mul_b limb0 = 1 + idx-bit·(sk-1) on chain rows (0 on row lf).
+                let mut target = AB::Expr::ZERO;
+                for r in 0..lf {
+                    target = target
+                        + sf(r)
+                            * (AB::Expr::ONE
+                                + cv(IDXB + CUM[rf + 1] + r) * (cn(self.consts.sk[rf][r]) - AB::Expr::ONE));
+                }
+                builder.assert_zero(msel.clone() * not_lf.clone() * (cv(MUL_OFF + 4) - target));
+                for k in 1..4 {
+                    builder.assert_zero(msel.clone() * not_lf.clone() * cv(MUL_OFF + 4 + k));
+                }
+                // mul_a at chain row 0 = ONE.
+                builder.assert_zero(msel.clone() * sf(0) * (cv(MUL_OFF) - AB::Expr::ONE));
+                for k in 1..4 {
+                    builder.assert_zero(msel.clone() * sf(0) * cv(MUL_OFF + k));
+                }
+                // mul_c == ONE at row lf (2s · inv2s == 1).
+                builder.assert_zero(msel.clone() * sf(lf) * (cv(MUL_OFF + 8) - AB::Expr::ONE));
+                for k in 1..4 {
+                    builder.assert_zero(msel.clone() * sf(lf) * cv(MUL_OFF + 8 + k));
+                }
+            }
+            let mut t = builder.when_transition();
+            for rf in 0..4 {
+                let lf = lfs[rf];
+                let msel = cv(MSEL + M_S0 as usize + rf);
+                let chain = (0..lf.saturating_sub(1)).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
+                for k in 0..4 {
+                    // Plain chain rows 0..lf-2: next mul_a == this mul_c.
+                    t.assert_zero(msel.clone() * chain.clone() * (nv(MUL_OFF + k) - cv(MUL_OFF + 8 + k)));
+                    // Row lf-1 -> lf: mul_a(lf) == 2 · mul_c(lf-1).
+                    t.assert_zero(
+                        msel.clone()
+                            * sf(lf - 1)
+                            * (nv(MUL_OFF + k) - cv(MUL_OFF + 8 + k) * AB::Expr::from(AB::F::TWO)),
+                    );
+                }
+            }
+            // INV2S capture: mul_b at each round's row lf; carry otherwise.
+            let cap_any = capture.iter().fold(AB::Expr::ZERO, |a, (e, _)| a + e.clone());
+            for k in 0..4 {
+                for (sel, _) in &capture {
+                    t.assert_zero(sel.clone() * (nv(INV2S + k) - cv(MUL_OFF + 4 + k)));
+                }
+                t.assert_zero((AB::Expr::ONE - cap_any.clone()) * (nv(INV2S + k) - cv(INV2S + k)));
+            }
+        }
+
         // The last-row phase anchor is the QSEL check emitted above.
-        let _ = (extmul, pv, xorsel, consumersel);
+        let _ = (cf, pv, xorsel, consumersel);
     }
 }
 
@@ -3153,6 +3240,7 @@ mod tests {
     /// during the build.
     #[test]
     fn gate_lowering_builds() {
+        let _g = heavy_lock();
         let (sched, pvs, _) = shared();
         let (trace, meta) = build_gate_trace(sched, pvs, 0);
         assert_eq!(trace.height(), 1 << 16);
@@ -3258,6 +3346,7 @@ mod tests {
     /// units, to eyeball the group-ring / flush-ring timing.
     #[test]
     fn dump_trace() {
+        let _g = heavy_lock();
         let (sched, pvs, _) = shared();
         let (_ins, infos) = lane_plan(sched);
         let (trace, _meta) = build_gate_trace(sched, pvs, 0);
@@ -3305,6 +3394,7 @@ mod tests {
     /// ext-arithmetic pipeline.
     #[test]
     fn tamper_coverage() {
+        let _g = heavy_lock();
         let (sched, pvs, _) = shared();
         let air = VerifierGateAir::new();
         let one = Val::ONE;
@@ -3319,8 +3409,10 @@ mod tests {
         let w = GATE_WIDTH;
         eprintln!("tamper coverage (UNSAT = caught, SAT = not bound):");
         // Neg2 wrong root: corrupt an outer public value (claimed inner cap).
-        probe("wrong-root: flip opvs[0] (cap limb)", &|_t, opvs| {
-            opvs[0] += one;
+        probe("wrong-root: flip all batch-0 cap limbs", &|_t, opvs| {
+            for j in 0..CAP_LEN {
+                opvs[cap_limb_opv(0, j, 0)] += one;
+            }
         });
         // Neg1 tampered opening: flip a query trace-absorb preimage limb.
         probe("tampered-opening: flip query0 preimage limb 0", &|t, _o| {
@@ -3386,9 +3478,10 @@ mod tests {
     /// Positive: the rectangle accepts the genuine M3 consensus proof.
     #[test]
     fn gate_rectangle_satisfies() {
+        let _g = heavy_lock();
         let (sched, pvs, _) = shared();
         let (trace, meta) = build_gate_trace(sched, pvs, 0);
-        check_ok(&trace, &meta.opvs);
+        check_constraints(&VerifierGateAir::new(), &trace, &meta.opvs);
     }
 
     /// Run `check_constraints` in a spawned thread and report whether it
@@ -3397,7 +3490,6 @@ mod tests {
     /// unlike `catch_unwind` on the calling thread, which intermittently lets
     /// the panic escape when many checks run concurrently under `cargo test`.
     fn is_unsat(trace: RowMajorMatrix<Val>, opvs: Vec<Val>) -> bool {
-        let _g = check_lock();
         std::thread::spawn(move || {
             check_constraints(&VerifierGateAir::new(), &trace, &opvs);
         })
@@ -3405,18 +3497,14 @@ mod tests {
         .is_err()
     }
 
-    /// Serialize the heavy `check_constraints` runs. cargo test runs these
-    /// tests in parallel and `check_constraints` is itself rayon-parallel;
-    /// running several at once oversubscribes the machine and has produced
-    /// spurious rayon panics. One at a time keeps them deterministic.
-    fn check_lock() -> std::sync::MutexGuard<'static, ()> {
+    /// Serialize ALL heavy work (trace build + rayon-parallel check) across the
+    /// parallel test threads. Each build allocates a ~230 MB trace and
+    /// `check_constraints` is itself rayon-parallel; running several at once
+    /// oversubscribes memory/CPU and has produced spurious failures. Holding
+    /// this guard across the whole build+check body keeps them deterministic.
+    fn heavy_lock() -> std::sync::MutexGuard<'static, ()> {
         static LK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LK.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn check_ok(trace: &RowMajorMatrix<Val>, opvs: &[Val]) {
-        let _g = check_lock();
-        check_constraints(&VerifierGateAir::new(), trace, opvs);
     }
 
     /// Assert a mutated witness is UNSATISFIABLE (some constraint fires). The
@@ -3425,6 +3513,7 @@ mod tests {
     fn assert_unsat(
         mutate: impl Fn(&mut RowMajorMatrix<Val>, &mut Vec<Val>, &[usize], &[(usize, u32)]),
     ) {
+        let _g = heavy_lock();
         let (sched, pvs, _) = shared();
         let (mut trace, mut meta) = build_gate_trace(sched, pvs, 0);
         let qrows = meta.query_rows.clone();
@@ -3442,10 +3531,15 @@ mod tests {
     /// cap comparison against the outer public values.
     #[test]
     fn gate_neg_wrong_root() {
-        let w = GATE_WIDTH;
-        let _ = w;
         assert_unsat(|_t, opvs, _qr, _fd| {
-            opvs[0] += Val::ONE; // corrupt a cap-limb outer public value
+            // Corrupt limb 0 of ALL 8 cap elements of batch 0 (the trace tree):
+            // every query's trace-path cap comparison selects one of the 8
+            // elements, so whichever it picks is now wrong. Tampering a single
+            // element would be proof-index-dependent (the M3 witness, hence the
+            // query indices, varies per build) and flake.
+            for j in 0..CAP_LEN {
+                opvs[cap_limb_opv(0, j, 0)] += Val::ONE;
+            }
         });
     }
 
@@ -3509,6 +3603,26 @@ mod tests {
         assert_unsat(move |t, _o, qr, _fd| {
             let row = qr[0];
             t.values[row * w + INVZ] += Val::ONE;
+        });
+    }
+
+    /// ZN global relation. BOUND (inc-4): ZNREG = zeta·g_trace on query rows,
+    /// pinned to the bound zeta (this also completes INVZN). Flip ZNREG.
+    #[test]
+    fn gate_neg_zn() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            t.values[qr[0] * w + ZNREG] += Val::ONE;
+        });
+    }
+
+    /// M_S INV2S binding. BOUND (inc-4): INV2S = 1/(2s), s the round's
+    /// idx-selected product; pinned by the mul bank's product == 1. Flip INV2S.
+    #[test]
+    fn gate_neg_inv2s() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            t.values[qr[0] * w + INV2S] += Val::ONE;
         });
     }
 
