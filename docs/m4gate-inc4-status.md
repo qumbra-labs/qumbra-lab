@@ -296,6 +296,12 @@ partial binding lets a prover pick free intermediates.
    (index-in-group bits) is muxed from IDXB by the fold-round dparam. Remaining
    in this layer: **HIT** (= [VC == GPB]) — needs an equality gadget (one-hot
    dot-product is deg 5, or add an inverse witness); do it with the leaf fold.
+   **[DONE — Stage H]** the x/x_fin chains: XREG = GEN·∏(kx if idx-bit else 1)
+   and XFIN over the high bits, via the mul-bank chain (cross-row `mchain`
+   threading: `nv(mul_a) == cv(mul_c)`, capture into XREG/XFIN, carry
+   otherwise). NOTE the constant-injection gotcha: `cf(x)` in `eval` equals
+   `scale(x)` (round-trips through the Monty limb), so the *native* x-chain
+   uses `as_canonical_u32` instead — see the `cn` helper.
 2. **PBUF/SCR round-0 leaf fold** (column, deg 2) — needs BREG[0]; add HIT here.
 3. **BREG ladder + INV2S + s-chain** (M_B/M_S, banks) — needs beta (CHAL, bound)
    and the bank operand routing (mchain threading).

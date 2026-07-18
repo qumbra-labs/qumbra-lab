@@ -1650,8 +1650,88 @@ where
             }
         }
 
+        // =====================================================================
+        // M_X1 x-chain (fold-pipeline arithmetic, inc-4): XREG (query LDE
+        // point) = GEN · ∏_r (kx[r] if idx-bit r else 1), a 22-row mul-bank
+        // chain over the query index bits (rows 0..21). Since IDXB is bound to
+        // the sampled digest (Stage E), this pins the query point to the
+        // transcript. Native arithmetic (the x-chain is unscaled).
+        // =====================================================================
+        {
+            // Native (unscaled) Val -> constant. Note `cf` above equals
+            // `scale` (it round-trips through the Monty limb), so it is wrong
+            // for the native x-chain; use the canonical value here.
+            let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
+            let msel_x = cv(MSEL + M_X1 as usize);
+            // mul_b = ext_base(bit ? kx[r] : 1): limb0 row-muxed, limbs 1..3 = 0.
+            let mut bscalar = AB::Expr::ZERO;
+            for r in 0..22 {
+                bscalar = bscalar
+                    + sf(r) * (AB::Expr::ONE + cv(IDXB + r) * (cn(self.consts.kx[r]) - AB::Expr::ONE));
+            }
+            builder.assert_zero(msel_x.clone() * (cv(MUL_OFF + 4) - bscalar));
+            for k in 1..4 {
+                builder.assert_zero(msel_x.clone() * cv(MUL_OFF + 4 + k));
+            }
+            // mul_a at chain row 0 = ext_base(GEN).
+            builder.assert_zero(msel_x.clone() * sf(0) * (cv(MUL_OFF) - cn(self.consts.gen)));
+            for k in 1..4 {
+                builder.assert_zero(msel_x.clone() * sf(0) * cv(MUL_OFF + k));
+            }
+            // Chain rows 0..20: next row's mul_a == this row's mul_c.
+            let chain = (0..21).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
+            let cap = msel_x.clone() * sf(21);
+            let mut t = builder.when_transition();
+            for k in 0..4 {
+                t.assert_zero(
+                    msel_x.clone() * chain.clone() * (nv(MUL_OFF + k) - cv(MUL_OFF + 8 + k)),
+                );
+            }
+            // XREG captures the chain output at row 21, carries elsewhere.
+            for k in 0..4 {
+                t.assert_zero(cap.clone() * (nv(XREG + k) - cv(MUL_OFF + 8 + k)));
+                t.assert_zero((AB::Expr::ONE - cap.clone()) * (nv(XREG + k) - cv(XREG + k)));
+            }
+        }
+
+        // =====================================================================
+        // M_FIN x_fin-chain (inc-4): XFIN (final-poly evaluation point) =
+        // ∏_{r<8} (kx[r] if idx-bit (14+r) else 1), an 8-row mul-bank chain
+        // (rows 0..7, a starts at ONE). Same shape as M_X1. Native.
+        // =====================================================================
+        {
+            let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
+            let msel_f = cv(MSEL + M_FIN as usize);
+            let mut bscalar = AB::Expr::ZERO;
+            for r in 0..8 {
+                bscalar = bscalar
+                    + sf(r) * (AB::Expr::ONE + cv(IDXB + 14 + r) * (cn(self.consts.kx[r]) - AB::Expr::ONE));
+            }
+            builder.assert_zero(msel_f.clone() * (cv(MUL_OFF + 4) - bscalar));
+            for k in 1..4 {
+                builder.assert_zero(msel_f.clone() * cv(MUL_OFF + 4 + k));
+            }
+            // mul_a at chain row 0 = ext_base(ONE).
+            builder.assert_zero(msel_f.clone() * sf(0) * (cv(MUL_OFF) - AB::Expr::ONE));
+            for k in 1..4 {
+                builder.assert_zero(msel_f.clone() * sf(0) * cv(MUL_OFF + k));
+            }
+            let chain = (0..7).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
+            let cap = msel_f.clone() * sf(7);
+            let mut t = builder.when_transition();
+            for k in 0..4 {
+                t.assert_zero(
+                    msel_f.clone() * chain.clone() * (nv(MUL_OFF + k) - cv(MUL_OFF + 8 + k)),
+                );
+            }
+            for k in 0..4 {
+                t.assert_zero(cap.clone() * (nv(XFIN + k) - cv(MUL_OFF + 8 + k)));
+                t.assert_zero((AB::Expr::ONE - cap.clone()) * (nv(XFIN + k) - cv(XFIN + k)));
+            }
+        }
+
         // The last-row phase anchor is the QSEL check emitted above.
-        let _ = (cf, extmul, pv, xorsel, consumersel);
+        let _ = (extmul, pv, xorsel, consumersel);
     }
 }
 
@@ -3269,7 +3349,7 @@ mod tests {
     fn gate_rectangle_satisfies() {
         let (sched, pvs, _) = shared();
         let (trace, meta) = build_gate_trace(sched, pvs, 0);
-        check_constraints(&VerifierGateAir::new(), &trace, &meta.opvs);
+        check_ok(&trace, &meta.opvs);
     }
 
     /// Run `check_constraints` in a spawned thread and report whether it
@@ -3278,11 +3358,26 @@ mod tests {
     /// unlike `catch_unwind` on the calling thread, which intermittently lets
     /// the panic escape when many checks run concurrently under `cargo test`.
     fn is_unsat(trace: RowMajorMatrix<Val>, opvs: Vec<Val>) -> bool {
+        let _g = check_lock();
         std::thread::spawn(move || {
             check_constraints(&VerifierGateAir::new(), &trace, &opvs);
         })
         .join()
         .is_err()
+    }
+
+    /// Serialize the heavy `check_constraints` runs. cargo test runs these
+    /// tests in parallel and `check_constraints` is itself rayon-parallel;
+    /// running several at once oversubscribes the machine and has produced
+    /// spurious rayon panics. One at a time keeps them deterministic.
+    fn check_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn check_ok(trace: &RowMajorMatrix<Val>, opvs: &[Val]) {
+        let _g = check_lock();
+        check_constraints(&VerifierGateAir::new(), trace, opvs);
     }
 
     /// Assert a mutated witness is UNSATISFIABLE (some constraint fires).
@@ -3350,6 +3445,35 @@ mod tests {
             let (_, m) = build_gate_trace(sched2, pvs2, 0);
             let row = m.query_rows[0];
             t.values[row * w + CHAL] += Val::ONE;
+        });
+    }
+
+    /// M_X1 x-chain binding (fold-pipeline arithmetic layer 1). BOUND
+    /// (inc-4): XREG (the query LDE point) = GEN·∏(kx if idx-bit else 1) via
+    /// the mul-bank chain over the (digest-bound) query index bits. Flipping
+    /// XREG breaks the chain capture / carry.
+    #[test]
+    fn gate_neg_xreg_chain() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o| {
+            let (sched2, pvs2, _) = shared();
+            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let row = m.query_rows[0];
+            t.values[row * w + XREG] += Val::ONE;
+        });
+    }
+
+    /// M_FIN x_fin-chain binding. BOUND (inc-4): XFIN (final-poly eval point)
+    /// via the mul-bank chain over the high query index bits. Flipping XFIN
+    /// breaks the chain capture / carry.
+    #[test]
+    fn gate_neg_xfin_chain() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o| {
+            let (sched2, pvs2, _) = shared();
+            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let row = m.query_rows[0];
+            t.values[row * w + XFIN] += Val::ONE;
         });
     }
 
