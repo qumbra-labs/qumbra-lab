@@ -1856,6 +1856,58 @@ where
             }
         }
 
+        // =====================================================================
+        // M_B BREG ladder (inc-4): per fold round rf, breg[0] = beta·inv2s
+        // (r=0), then breg[l] = 2·breg[l-1]² (r=1..la-1). la = LOG_ARITIES =
+        // [4,4,4,2]. beta = CHAL[G_BETA0+rf] and INV2S are both bound, so the
+        // ladder is fully pinned. Native. mul_a/mul_b are the operands; the
+        // product mul_c is captured into BREG (with the ×2 for l>0).
+        // =====================================================================
+        {
+            // Same-row operand bindings.
+            for rf in 0..4 {
+                let la = LOG_ARITIES[rf];
+                let msel = cv(MSEL + M_B0 as usize + rf);
+                for k in 0..4 {
+                    // r=0: mul_a = beta_rf, mul_b = INV2S.
+                    builder.assert_zero(
+                        msel.clone() * sf(0) * (cv(MUL_OFF + k) - cv(CHAL + 4 * (G_BETA0 + rf) + k)),
+                    );
+                    builder.assert_zero(msel.clone() * sf(0) * (cv(MUL_OFF + 4 + k) - cv(INV2S + k)));
+                    // r=1..la-1: mul_a = mul_b = breg[r-1].
+                    for r in 1..la {
+                        builder.assert_zero(
+                            msel.clone() * sf(r) * (cv(MUL_OFF + k) - cv(BREG + 4 * (r - 1) + k)),
+                        );
+                        builder.assert_zero(
+                            msel.clone() * sf(r) * (cv(MUL_OFF + 4 + k) - cv(BREG + 4 * (r - 1) + k)),
+                        );
+                    }
+                }
+            }
+            // Captures: breg[0] = mul_c at r=0; breg[l>0] = 2·mul_c at r=l.
+            let two = AB::Expr::from(AB::F::TWO);
+            let mut t = builder.when_transition();
+            for l in 0..4 {
+                // Rounds that actually produce level l (l < la_rf).
+                let cap = (0..4)
+                    .filter(|&rf| l < LOG_ARITIES[rf])
+                    .map(|rf| cv(MSEL + M_B0 as usize + rf) * sf(l))
+                    .fold(AB::Expr::ZERO, |a, e| a + e);
+                for k in 0..4 {
+                    let want = if l == 0 {
+                        cv(MUL_OFF + 8 + k)
+                    } else {
+                        two.clone() * cv(MUL_OFF + 8 + k)
+                    };
+                    t.assert_zero(
+                        cap.clone() * (nv(BREG + 4 * l + k) - want.clone())
+                            + (AB::Expr::ONE - cap.clone()) * (nv(BREG + 4 * l + k) - cv(BREG + 4 * l + k)),
+                    );
+                }
+            }
+        }
+
         // The last-row phase anchor is the QSEL check emitted above.
         let _ = (cf, pv, xorsel, consumersel);
     }
@@ -3603,6 +3655,17 @@ mod tests {
         assert_unsat(move |t, _o, qr, _fd| {
             let row = qr[0];
             t.values[row * w + INVZ] += Val::ONE;
+        });
+    }
+
+    /// M_B BREG ladder binding. BOUND (inc-4): breg[0] = beta·inv2s, breg[l] =
+    /// 2·breg[l-1]², both inputs bound. Flipping a BREG limb breaks the ladder
+    /// capture / carry.
+    #[test]
+    fn gate_neg_breg() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            t.values[qr[0] * w + BREG] += Val::ONE;
         });
     }
 

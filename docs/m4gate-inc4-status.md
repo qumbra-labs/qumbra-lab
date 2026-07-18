@@ -15,6 +15,29 @@ remainder are updated accordingly. **Update (fold map):** the fold pipeline
 (the sole remaining negative, bad-fold) has been fully mapped — see the
 "Fold-pipeline execution map" appendix at the end for the next session.
 
+## ROADMAP line (milestone-level, for the coordinating session to sync)
+
+Drop-in replacement for the design-repo `ROADMAP.md` "increment 4 next" cell —
+milestone granularity, not the per-stage (A–J) breakdown, which is lab
+commit-level detail and belongs here, not in the roadmap. **Do not edit the
+design repo from the lab session** (spec §6); this is prepared text for the
+coordinating session:
+
+> **increment 4 IN PROGRESS (gate exit):** the verifier's structural + FS/draw
+> half is soundly bound — FS challenge gadget + ext-challenge assembly,
+> `sample_bits` query-index binding, draw-group schedule (GRP ring/GROT/PoW),
+> and the query-point/inverse/s-chain arithmetic (XREG/XFIN, INVZ/INVZN via the
+> `ZN = zeta·g_trace` relation, INV2S). **3 of the 4 gate-exit negatives bind**
+> (wrong-root, tampered-opening, wrong-challenge) plus query-index / GRP-schedule
+> / value-schedule bindings; positive accepts the real M3 transcript. The
+> ext-arithmetic **fold pipeline is being built bottom-up** (value-carry
+> schedule + VC/GPB done; remaining: BREG ladder → M_FHI folds → M_RO reduced
+> opening + PZACC → final-poly Horn → closes `bad_fold`). All added constraints
+> deg ≤ 3 except the M_S mux (deg 4, within the fold's deg-5 budget); rectangle
+> unchanged at 3,532 cols × 2^16. **Pre-existing deg-6 flush-automaton products
+> must be reduced before the bench** (Stage-2 legacy, not this increment). Lab
+> branch `claude/m4-0bii-inc4`, stages A–J.
+
 ## What the first action found
 
 Per spec §0, the flagged `gate_rectangle_satisfies` was run first. It
@@ -303,11 +326,11 @@ partial binding lets a prover pick free intermediates.
    `scale(x)` (round-trips through the Monty limb), so the *native* x-chain
    uses `as_canonical_u32` instead — see the `cn` helper.
 2. **PBUF/SCR round-0 leaf fold** (column, deg 2) — needs BREG[0]; add HIT here.
-3. **[s-chain/INV2S DONE — Stage J]** BREG ladder (M_B): `breg[0] = beta·inv2s`,
-   `breg[l] = 2·breg[l-1]²`. Beta (CHAL) and INV2S are now both bound, so the
-   BREG ladder is the next piece (bank operand routing / mchain threading).
-4. **M_FHI higher-round fold** (column, deg 2) + **RUNEV carry/update** + the
-   **fold-leaf consistency** `CONSF·HIT·(v − RUNEV) == 0`.
+3. **[DONE — Stages J/K]** s-chain/INV2S (Stage J) + BREG ladder (Stage K,
+   M_B): `breg[0] = beta·inv2s`, `breg[l] = 2·breg[l-1]²`, all bound.
+4. **NEXT: round-0 leaf fold (PBUF/SCR) + M_FHI higher-round fold** (column,
+   deg 2, BREG now available) + **HIT** (= [VC == GPB]) + **RUNEV carry/update**
+   + the **fold-leaf consistency** `CONSF·HIT·(v − RUNEV) == 0`.
 5. **[X/XFIN DONE — Stage H; INVZ+INVZN DONE — Stages I/J]** reduced opening
    (M_RO), PZACC/PX accumulation (banks + inline ext) → RUNEV. Both inverses are
    now bound: INVZ (Stage I), and INVZN via the **ZN relation** `ZN = zeta·g_trace`
