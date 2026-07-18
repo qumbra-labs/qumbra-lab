@@ -569,9 +569,10 @@ const GF: usize = GHI + 4; // 4: round-0 fold gate = CONSF * DRND[2+rf]
 const BPM: usize = GF + 4; // 4: extmul(BREG, PBUF - v) for the round-0 fold
 const N_FHG: usize = 22; // M_FHI fold gates (3 rounds x 7 pairs + 1)
 const FHG: usize = BPM + 4; // 22: M_FHI fold gate = msel_rf * sf(r)
+const PREGA: usize = FHG + N_FHG; // 4: preg * fri_alpha (PX word-1 accumulation)
 
-const GATE_COLS: usize = FHG + N_FHG - GB;
-pub(crate) const GATE_WIDTH: usize = FHG + N_FHG;
+const GATE_COLS: usize = PREGA + 4 - GB;
+pub(crate) const GATE_WIDTH: usize = PREGA + 4;
 
 /// Flat M_FHI gate index for round `rf`, pair row `r` (mirrors the eval loop).
 const fn fhg_index(rf: usize, r: usize) -> usize {
@@ -620,6 +621,7 @@ pub(crate) fn colname(x: usize) -> &'static str {
         (XSEL, "XSEL"), (QADV, "QADV"), (CFULL, "CFULL"),
         (M3, "M3"), (RLO, "RLO"), (RHI, "RHI"), (DMUX, "DMUX"), (SNL, "SNL"),
         (GLO, "GLO"), (GHI, "GHI"), (GF, "GF"), (BPM, "BPM"), (FHG, "FHG"),
+        (PREGA, "PREGA"),
     ];
     let mut best = ("?", 0usize);
     for &(off, nm) in table {
@@ -2171,6 +2173,72 @@ where
             }
         }
 
+        // =====================================================================
+        // PZACC / PREG accumulation (endpoint pin, START foundation). The
+        // reduced-opening numerator accumulates along two mutually-exclusive
+        // paths (dup vs query phase), both binding pzacc/preg to the opened
+        // values so M_RO's `ro` is value-pinned:
+        //   - dup zeta-value rows (CONSZ = CZD·POS1): pzacc += preg·v,
+        //     preg *= fri_alpha, with v = ext(ASM0,ASM1,W0C,W1C) (deg 3).
+        //   - query PX rows (CX0, optionally CX1): pzacc += preg·W0C (word 0)
+        //     and, when CX1 (implies CX0), += (preg·fri_alpha)·W1C (word 1);
+        //     preg *= fri_alpha (one word) or fri_alpha² (two words). PREGA =
+        //     preg·fri_alpha is materialized so the word-1 term stays deg 3.
+        // FA2 = fri_alpha² is already bound (Stage D/F). CX1 ⊆ CX0, so
+        // CX0·(1-CX1) = CX0 - CX1.
+        // =====================================================================
+        {
+            // ext-mul of the contiguous PREG vector with an explicit column list.
+            let extmul_cols = |a_off: usize, bcols: &[usize; 4], k: usize| -> AB::Expr {
+                let w = c(EXT_W);
+                let mut acc = AB::Expr::ZERO;
+                for i in 0..4 {
+                    for j in 0..4 {
+                        if i + j == k {
+                            acc = acc + cv(a_off + i) * cv(bcols[j]);
+                        } else if i + j == k + 4 {
+                            acc = acc + w.clone() * cv(a_off + i) * cv(bcols[j]);
+                        }
+                    }
+                }
+                acc
+            };
+            let vcols = [ASM0, ASM1, W0C, W1C];
+            let fa_off = CHAL + 4 * G_FRIALPHA;
+            // PREGA = preg·fri_alpha (materialized; filled in fill_derived).
+            for k in 0..4 {
+                builder.assert_eq(cv(PREGA + k), extmul(PREG, fa_off, k));
+            }
+            let consz = cv(CONSZ);
+            let cx0 = cv(CX0);
+            let cx1 = cv(CX1);
+            // preg update gate: *fri_alpha when (CONSZ or CX0&!CX1); *fri_alpha²
+            // when CX1; carry otherwise.
+            let gate_fa = consz.clone() + cx0.clone() - cx1.clone();
+            // Leaf-start reset (same signal as the VC counter): at sf(23)·nv(LFS)
+            // pzacc->0, preg->ONE, starting the next query's PX accumulation.
+            // The reset only fires on a perm's last row, where all accumulation
+            // gates are 0, so it composes as an additive deg-3 correction.
+            let mut t = builder.when_transition();
+            let reset = sf(23) * nv(LFS);
+            for k in 0..4 {
+                // pzacc += CONSZ·(preg·v) + CX0·preg·W0C + CX1·(preg·fa)·W1C.
+                let inc = consz.clone() * extmul_cols(PREG, &vcols, k)
+                    + cx0.clone() * cv(PREG + k) * cv(W0C)
+                    + cx1.clone() * cv(PREGA + k) * cv(W1C);
+                t.assert_zero(nv(PZACC + k) - cv(PZACC + k) - inc + reset.clone() * cv(PZACC + k));
+                // preg *= fri_alpha (gate_fa) or fri_alpha² (CX1); carry else.
+                let preg_reset = if k == 0 { AB::Expr::ONE } else { AB::Expr::ZERO };
+                t.assert_zero(
+                    nv(PREG + k)
+                        - cv(PREG + k)
+                        - gate_fa.clone() * (extmul(PREG, fa_off, k) - cv(PREG + k))
+                        - cx1.clone() * (extmul(PREG, FA2, k) - cv(PREG + k))
+                        + reset.clone() * (cv(PREG + k) - preg_reset),
+                );
+            }
+        }
+
         // The last-row phase anchor is the QSEL check emitted above.
         let _ = (cf, pv, xorsel, consumersel);
     }
@@ -3556,6 +3624,22 @@ fn fill_derived(values: &mut [Val]) {
                 fhg[fhg_index(rf, r)] = g(MSEL + M_FHI0 as usize + rf) * g(r);
             }
         }
+        // PREGA = extmul(PREG, fri_alpha) for the PX word-1 accumulation term.
+        let fa_off = CHAL + 4 * G_FRIALPHA;
+        let mut prega = [Val::ZERO; 4];
+        for (k, slot) in prega.iter_mut().enumerate() {
+            let mut acc = Val::ZERO;
+            for i in 0..4 {
+                for j in 0..4 {
+                    if i + j == k {
+                        acc += g(PREG + i) * g(fa_off + j);
+                    } else if i + j == k + 4 {
+                        acc += w_ext * g(PREG + i) * g(fa_off + j);
+                    }
+                }
+            }
+            *slot = acc;
+        }
         let sf23 = g(23);
         let phc = g(PHC);
         let phq = g(PHQ);
@@ -3622,6 +3706,9 @@ fn fill_derived(values: &mut [Val]) {
         }
         for f in 0..N_FHG {
             values[base + FHG + f] = fhg[f];
+        }
+        for k in 0..4 {
+            values[base + PREGA + k] = prega[k];
         }
     }
 }
@@ -3817,6 +3904,29 @@ mod tests {
         eprintln!("--- deg>=4 constraint groups (deg, count, first_idx, regions) ---");
         for ((d, sig), (n, first)) in &groups {
             eprintln!("deg={d} count={n} first=#{first} {sig}");
+        }
+    }
+
+    /// Diagnostic (relay debugging): dump the PZACC/PREG accumulator + its
+    /// value-carry selectors around a target row (default 7727) to debug the
+    /// endpoint-pin accumulation binding. Set DBGROW to move it.
+    #[test]
+    fn dump_accum() {
+        let _g = heavy_lock();
+        let (sched, pvs, _) = shared();
+        let (trace, _meta) = build_gate_trace(sched, pvs, 0);
+        let w = trace.width();
+        let val = &trace.values;
+        let u = |row: usize, col: usize| -> u32 { val[row * w + col].to_unique_u32() };
+        let target: usize = std::env::var("DBGROW").ok().and_then(|s| s.parse().ok()).unwrap_or(7727);
+        eprintln!("row: CONSZ CX0 CX1 CONSF POS0 POS1 W0C W1C | PZACC0 PREG0 PREGA0");
+        for row in target.saturating_sub(3)..=target + 2 {
+            eprintln!(
+                "{row}: {} {} {} {} {} {} {} {} | {} {} {}",
+                u(row, CONSZ), u(row, CX0), u(row, CX1), u(row, CONSF),
+                u(row, POS), u(row, POS + 1), u(row, W0C), u(row, W1C),
+                u(row, PZACC), u(row, PREG), u(row, PREGA),
+            );
         }
     }
 
@@ -4179,6 +4289,28 @@ mod tests {
         assert_unsat(move |t, _o, qr, _fd| {
             let row = qr[0];
             t.values[row * w + RUNEV] += Val::ONE;
+        });
+    }
+
+    /// Endpoint-pin negative (START): tamper the reduced-opening accumulator.
+    /// The PZACC accumulation recurrence (pzacc += preg·v, with the leaf-start
+    /// reset) must reject a single altered running-sum cell.
+    #[test]
+    fn gate_neg_pzacc() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
+            t.values[row * w + PZACC] += Val::ONE;
+        });
+    }
+
+    /// Endpoint-pin negative (START): tamper the running fri_alpha power.
+    #[test]
+    fn gate_neg_preg() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
+            t.values[row * w + PREG] += Val::ONE;
         });
     }
 }
