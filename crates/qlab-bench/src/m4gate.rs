@@ -1542,6 +1542,114 @@ where
             }
         }
 
+        // =====================================================================
+        // Value-carry-row schedule (fold-pipeline foundation, inc-4): bind the
+        // asm/PX value-carry selectors to the role/phase schedule + row ranges,
+        // then the POS half-position toggle and the CONSZ/CONSF completion
+        // flags. Everything derives from already-bound selectors (RSEL, DRND,
+        // SHSEL, PHD, CMPC, BLKLAST) + the keccak step-flag row one-hots. This
+        // is the bottom layer of the reduced-opening / fold machinery; the
+        // arithmetic layers (PZACC/SCR/BREG/RUNEV) build on these selectors.
+        // =====================================================================
+        {
+            let one = || AB::Expr::ONE;
+            // Row-range indicators from the step-flag one-hots (sf(r) = cv(r)).
+            let rle = |n: usize| (0..=n).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
+            let rge = |a: usize, b: usize| (a..=b).map(&sf).fold(AB::Expr::ZERO, |x, e| x + e);
+            let rsel = |r: u32| cv(RSEL + r as usize);
+            // Per-role asm value ranges (word-0 / word-1 half positions).
+            let role_range = |c5: usize| {
+                rsel(R_ABS_F34) * rle(16)
+                    + rsel(R_ABS_C34) * rle(16)
+                    + rsel(R_ABS_C5) * rle(c5)
+                    + rsel(R_ABS_C30) * rle(14)
+                    + rsel(R_ABS_F16) * rle(7)
+            };
+            let m0 = role_range(2);
+            let m1 = role_range(1);
+            // dparam split: fold leaves (D_F0..3) vs trace/quotient (D_T/D_Q).
+            let fold_dp = cv(DRND + 2) + cv(DRND + 3) + cv(DRND + 4) + cv(DRND + 5);
+            let nonfold_dp = cv(DRND) + cv(DRND + 1);
+            // Query-absorb carry selectors.
+            builder.assert_eq(cv(CF), fold_dp * m0.clone());
+            builder.assert_eq(cv(CX0), nonfold_dp.clone() * m0);
+            builder.assert_eq(cv(CX1), nonfold_dp * m1);
+            // F7 observation blocks (challenger phase): final-poly carry rows.
+            builder.assert_eq(
+                cv(CZ7),
+                cv(SHSEL + shsel_index(7, 0)) * rge(4, 16)
+                    + cv(SHSEL + shsel_index(7, 1)) * rle(16)
+                    + cv(SHSEL + shsel_index(7, 2)) * rle(1),
+            );
+            // Duplicate blocks (dup phase): zeta-value carry rows. First block
+            // (CMPC) rows 4..16, last block (BLKLAST) rows 0..4, middle 0..16.
+            builder.assert_eq(
+                cv(CZD),
+                cv(PHD) * cv(CMPC) * rge(4, 16)
+                    + cv(PHD) * cv(BLKLAST) * rle(4)
+                    + cv(PHD) * (one() - cv(CMPC) - cv(BLKLAST)) * rle(16),
+            );
+            for s in [CZD, CZ7, CF, CX0, CX1] {
+                builder.assert_bool(cv(s));
+            }
+            // POS: 2-slot half-position ring, toggles on every asm value-carry
+            // row (casm = CZD + CZ7 + CF); CX0/CX1 are PX rows and do not toggle.
+            let casm = cv(CZD) + cv(CZ7) + cv(CF);
+            builder.assert_bool(cv(POS));
+            builder.assert_bool(cv(POS + 1));
+            builder.assert_eq(cv(POS) + cv(POS + 1), one());
+            {
+                let mut t = builder.when_transition();
+                t.assert_eq(nv(POS), cv(POS) + casm.clone() * (cv(POS + 1) - cv(POS)));
+                t.assert_eq(nv(POS + 1), cv(POS + 1) + casm * (cv(POS) - cv(POS + 1)));
+            }
+            // Completion flags: value fully captured on the pos==1 (word-1) row.
+            builder.assert_eq(cv(CONSZ), cv(CZD) * cv(POS + 1));
+            builder.assert_eq(cv(CONSF), cv(CF) * cv(POS + 1));
+
+            // VC value-counter ring (16-slot one-hot): counts fold leaves
+            // within a round. Rotates +1 on CONSF (a completed fold-leaf
+            // value, now schedule-bound), resets to slot 0 at each leaf-start
+            // (LFS on the next perm). First row pinned to slot 0 above.
+            for i in 0..16 {
+                builder.assert_bool(cv(VC + i));
+            }
+            builder.assert_eq(
+                (0..16).map(|i| cv(VC + i)).fold(AB::Expr::ZERO, |a, e| a + e),
+                one(),
+            );
+            builder.assert_eq(
+                cv(VCE),
+                (0..16).step_by(2).map(|i| cv(VC + i)).fold(AB::Expr::ZERO, |a, e| a + e),
+            );
+            {
+                let mut t = builder.when_transition();
+                let reset = sf(23) * nv(LFS);
+                for i in 0..16 {
+                    let slot0 = if i == 0 { one() } else { AB::Expr::ZERO };
+                    t.assert_eq(
+                        nv(VC + i),
+                        cv(VC + i)
+                            + cv(CONSF) * (cv(VC + (i + 15) % 16) - cv(VC + i))
+                            + reset.clone() * (slot0 - cv(VC + i)),
+                    );
+                }
+            }
+            // GPB: the fold round's index-in-group bits, muxed from the query
+            // index bits IDXB by the fold-round dparam (D_F0..3 -> DRND 2..5).
+            // Zero on non-fold-absorb perms.
+            for k in 0..4 {
+                let mut e = AB::Expr::ZERO;
+                for rf in 0..4 {
+                    if k < LOG_ARITIES[rf] {
+                        e = e + cv(DRND + 2 + rf) * cv(IDXB + CUM[rf] + k);
+                    }
+                }
+                builder.assert_bool(cv(GPB + k));
+                builder.assert_eq(cv(GPB + k), e);
+            }
+        }
+
         // The last-row phase anchor is the QSEL check emitted above.
         let _ = (cf, extmul, pv, xorsel, consumersel);
     }
@@ -3242,6 +3350,22 @@ mod tests {
             let (_, m) = build_gate_trace(sched2, pvs2, 0);
             let row = m.query_rows[0];
             t.values[row * w + CHAL] += Val::ONE;
+        });
+    }
+
+    /// Value-carry-row / VC schedule binding (fold-pipeline foundation).
+    /// BOUND (inc-4): the asm/PX carry selectors (CZD/CZ7/CF/CX0/CX1), the POS
+    /// half-position toggle, CONSZ/CONSF, and the VC value-counter ring are
+    /// tied to the role/phase schedule. Flipping a VC cell breaks the one-hot;
+    /// this is the base the reduced-opening / fold arithmetic will build on.
+    #[test]
+    fn gate_neg_value_schedule() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o| {
+            let (sched2, pvs2, _) = shared();
+            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let row = m.query_rows[0];
+            t.values[row * w + VC + 3] += Val::ONE; // break VC one-hot
         });
     }
 

@@ -288,10 +288,15 @@ partial binding lets a prover pick free intermediates.
 
 ### Suggested build order (each layer: positive stays green, add a negative)
 
-1. **VC value-counter ring** (16-slot one-hot) + **GPB** (index-in-group bits)
-   + **HIT** (= [VC == GPB]) — the fold-leaf indexing. Foundational; sound and
-   self-contained; mirrors the COEF/GRP ring pattern from Stages D–F.
-2. **PBUF/SCR round-0 leaf fold** (column, deg 2) — needs BREG[0].
+1. **[DONE — Stage G]** Value-carry-row schedule + VC/GPB. The asm/PX carry
+   selectors (CZD/CZ7/CF/CX0/CX1) are bound to the role/phase schedule + row
+   ranges; the **POS** half-position ring toggles on `casm = CZD+CZ7+CF`;
+   **CONSZ/CONSF** are the pos==1 completion flags; the **VC** value-counter
+   ring (16-slot one-hot) rotates on CONSF and resets at leaf-start; **GPB**
+   (index-in-group bits) is muxed from IDXB by the fold-round dparam. Remaining
+   in this layer: **HIT** (= [VC == GPB]) — needs an equality gadget (one-hot
+   dot-product is deg 5, or add an inverse witness); do it with the leaf fold.
+2. **PBUF/SCR round-0 leaf fold** (column, deg 2) — needs BREG[0]; add HIT here.
 3. **BREG ladder + INV2S + s-chain** (M_B/M_S, banks) — needs beta (CHAL, bound)
    and the bank operand routing (mchain threading).
 4. **M_FHI higher-round fold** (column, deg 2) + **RUNEV carry/update** + the
