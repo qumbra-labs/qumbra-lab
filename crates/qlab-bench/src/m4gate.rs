@@ -119,6 +119,9 @@ const N_PVS: usize = 84;
 /// Queries and index bits.
 const NQ: usize = 20;
 const LOG_MAX: usize = 22;
+/// Query-PoW grind bits (CONSENSUS_CFG.grind_bits): the PoW draw's low
+/// GRIND_BITS bits must be zero.
+const GRIND_BITS: usize = 20;
 /// Fold rounds: log arities and cumulative shifts.
 const LOG_ARITIES: [usize; 4] = [4, 4, 4, 2];
 const CUM: [usize; 5] = [0, 4, 8, 12, 14];
@@ -1439,12 +1442,32 @@ where
             // challenge. (bits draws set CROT = 0.)
             builder.assert_bool(cv(CROT));
             builder.assert_bool(cv(GROT));
-            builder.assert_eq(cv(CROT), field_grp.clone() * cv(FSODD) * cv(FSACCEPT));
-            // GROT = CROT & (coef == 3): the 4th accepted limb completes a
-            // challenge. Constrained only at field groups; query-phase GROT
-            // (sample_bits) is still free here.
+            builder.assert_eq(cv(CROT), field_grp * cv(FSODD) * cv(FSACCEPT));
+            // A bits group (PoW or a query index): each is a single draw that
+            // completes on its odd row.
+            let bits_grp = {
+                let mut e = cv(ring_at(GRP, N_GROUPS, G_POW));
+                for q in 0..NQ {
+                    e = e + cv(ring_at(GRP, N_GROUPS, G_IDX0 + q));
+                }
+                e
+            };
+            // GROT (advance the group ring): a field challenge's 4th accepted
+            // limb (CROT & coef==3), OR any bits draw's odd row. This fully
+            // pins GROT, which now drives the GRP-ring rotation below.
             let coef3 = cv(ring_at(COEF, 4, 3));
-            builder.assert_zero(field_grp * (cv(GROT) - cv(CROT) * coef3));
+            builder.assert_eq(cv(GROT), cv(CROT) * coef3 + cv(FSODD) * bits_grp.clone());
+            // PoW draw (grp = G_POW): the low GRIND_BITS of the sampled value
+            // must be zero (the grind check). value = FSACC (bits 0..16) +
+            // FSBITS[0..GRIND_BITS-16] << 16.
+            {
+                let pow_gate = cv(FSODD) * cv(ring_at(GRP, N_GROUPS, G_POW));
+                let mut pow_val = cv(FSACC);
+                for i in 0..(GRIND_BITS - 16) {
+                    pow_val = pow_val + cv(FSBITS + i) * c(1 << (16 + i));
+                }
+                builder.assert_zero(pow_gate * pow_val);
+            }
             // First-row pins: no challenge assembled yet.
             for k in 0..4 {
                 builder.when_first_row().assert_zero(cv(CURCH + k));
@@ -1467,6 +1490,16 @@ where
             };
             {
                 let mut t = builder.when_transition();
+                // GRP ring: left-rotate (advance the logical group) on GROT.
+                // This binds the draw-group schedule to the FS gadget, giving
+                // the GROUPREQ flush-start gate (Stage A) real teeth.
+                for i in 0..N_GROUPS {
+                    t.assert_eq(
+                        nv(GRP + i),
+                        cv(GRP + i)
+                            + cv(GROT) * (cv(GRP + (i + 1) % N_GROUPS) - cv(GRP + i)),
+                    );
+                }
                 // COEF ring: left-rotate (increment logical coef) on CROT.
                 for i in 0..4 {
                     t.assert_eq(
@@ -3198,6 +3231,19 @@ mod tests {
             let (_, m) = build_gate_trace(sched2, pvs2, 0);
             let row = m.query_rows[0];
             t.values[row * w + CHAL] += Val::ONE;
+        });
+    }
+
+    /// Draw-group schedule binding (spec §2.1). BOUND (inc-4): the GRP ring
+    /// now rotates only on GROT (a completed challenge / bits draw), so a
+    /// prover cannot advance the group schedule out of step with the draws.
+    /// Flipping a GRP ring cell breaks the rotation carry.
+    #[test]
+    fn gate_neg_grp_schedule() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o| {
+            // Row 60 is mid-F2 (challenger phase); flip the head slot.
+            t.values[60 * w + GRP] += Val::ONE;
         });
     }
 

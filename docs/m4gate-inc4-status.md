@@ -107,8 +107,21 @@ longer choose favorable FRI queries. New passing test
 `gate_neg_wrong_query_index` (flip IDXR[0]); all Stage-E constraints deg ≤ 3
 (the 20 IDXR bindings are the only additions).
 
-Residual: the **PoW draw value** (grp = G_POW) is not yet constrained to 0
-(the grind check). Small, independent; belongs with the fold-pipeline session.
+## Stage F — schedule binding: GRP ring + full GROT + PoW value
+
+The draw-group schedule is now bound to the FS gadget:
+
+- **GROT** (group-advance signal) is fully constrained:
+  `GROT = CROT·(coef==3) + FSODD·bits_grp`, i.e. a field challenge's 4th
+  accepted limb OR any PoW/query-index (bits) draw's odd row.
+- **GRP ring** left-rotates only on GROT (was free witness) — a prover can no
+  longer advance the group schedule out of step with the draws. This gives the
+  GROUPREQ flush-start gate (Stage A) real teeth and locks the challenge/index
+  assembly to the correct groups. New test `gate_neg_grp_schedule`.
+- **PoW value** (grp = G_POW): the low GRIND_BITS (= 20) of the sampled value
+  are constrained to zero (`FSACC + FSBITS[0..4]<<16 == 0`) — the grind check.
+
+All Stage-F additions deg ≤ 3. Suite 13 passing tests + 1 ignored (`bad_fold`).
 
 ## Degree budget — PRE-EXISTING violation of the deg≤3 house rule
 
@@ -194,10 +207,11 @@ In rough dependency order, still open:
 1. **Degree reduction to ≤ 3** (pre-existing, blocks the bench) — factor the
    Stage-2 flush-automaton deg 4/5/6 boundary products (phasegate chain etc.)
    through materialized selector columns. See the degree-budget section.
-2. **PoW value + FSGATE + GRP-ring bindings** (§2.1) — small residuals from
-   Stages D/E: constrain the PoW draw value to 0 (grind), pin FSGATE to the
-   draw-hosting rows, and bind the GRP ring rotation to GROT (COEF rotation is
-   already implicit in the assembly). These give the GROUPREQ gate real teeth.
+2. **FSGATE schedule binding** (§2.1) — pin FSGATE to the draw-hosting rows so
+   the gadget cannot be spuriously activated on a non-digest perm. This is the
+   last piece of the draw-schedule binding (PoW value, GROT, and the GRP ring
+   are done in Stage F). Deeper because draw counts per perm vary; see the
+   Stage-D residual note.
 3. **Ext-arithmetic pipeline** (§2.1) — reduced openings (PZACC/PREG), fold
    ladders (SCR/BREG/RUNEV), final poly Horner (FPREG); use the `extmul`
    helper already defined (but unused) in `eval`. Closes `gate_neg_bad_fold`.
