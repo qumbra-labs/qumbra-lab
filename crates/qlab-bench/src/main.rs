@@ -913,6 +913,12 @@ fn main() {
             m4route::run_m4route(&power, only);
             return;
         }
+        "m4gate" => {
+            let only_pos = args.iter().position(|a| a == "--only");
+            let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
+            m4gate::run_m4gate(&power, only);
+            return;
+        }
         "m4price" => {
             m4price::run_m4price(&power);
             return;

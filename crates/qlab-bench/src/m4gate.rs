@@ -3919,6 +3919,102 @@ fn fill_derived(values: &mut [Val]) {
 }
 
 // ---------------------------------------------------------------------------
+// Bench mode: the calibration gate. Prove/verify the verifier gate rectangle
+// on a REAL M3 consensus proof at the two house lane configs and report the
+// leaf cost (prove ms / verify ms / proof KB) against aggregation-rung1 §6's
+// <= 10 s / <= 32 GB leaf envelope. Peak RSS via `--only <cfg>` under
+// /usr/bin/time -l (m4census RSS-attribution discipline).
+// ---------------------------------------------------------------------------
+
+const LANE_CFGS: [(&str, FriCfg); 2] = [
+    (
+        "b4/q40/g20/fp16/a16",
+        FriCfg {
+            log_blowup: 2,
+            num_queries: 40,
+            grind_bits: 20,
+            log_final_poly_len: 4,
+            max_log_arity: 4,
+        },
+    ),
+    (
+        "b16/q20/g20/fp16/a16",
+        FriCfg {
+            log_blowup: 4,
+            num_queries: 20,
+            grind_bits: 20,
+            log_final_poly_len: 4,
+            max_log_arity: 4,
+        },
+    ),
+];
+
+pub(crate) fn run_m4gate(power: &str, only: Option<&str>) {
+    use std::time::Instant;
+    println!("# qumbra-lab M4 step 0b(ii): the calibration gate (verifier gate rectangle)");
+    println!();
+    crate::print_env(power);
+    println!(
+        "- rectangle: {GATE_WIDTH} cols x 2^16, {} lane perms; proves-in-circuit a \
+         REAL M3 consensus proof with every gate column bound (FS/draw schedule, \
+         query program, ext-arith fold pipeline, and both fold-chain endpoints \
+         value-pinned). Max constraint degree 3.",
+        n_shapes(),
+    );
+    // Build the real M3 proof + recorder schedule once (shared across configs).
+    let (_inst, pvs, proof) = m4gaterec::consensus_proof();
+    let sched = m4gaterec::walk(&proof, &pvs);
+    println!();
+    println!("| lane config | rows | prove ms | verify ms | postcard KB | fixed KB |");
+    println!("|---|---|---|---|---|---|");
+    let air = VerifierGateAir::new();
+    for (name, cfg) in &LANE_CFGS {
+        if let Some(f) = only {
+            if !name.contains(f) {
+                continue;
+            }
+        }
+        let config = make_config_with(cfg);
+        eprintln!("== m4gate: {name} ==");
+        let mut rows = 0;
+        let mut best_prove = f64::INFINITY;
+        let mut proof_opt = None;
+        let mut opvs = Vec::new();
+        for _ in 0..RUNS {
+            let (trace, meta) = build_gate_trace(&sched, &pvs, cfg.log_blowup);
+            rows = trace.height();
+            opvs = meta.opvs.clone();
+            let t = Instant::now();
+            let p = prove(&config, &air, trace, &opvs);
+            best_prove = best_prove.min(t.elapsed().as_secs_f64() * 1e3);
+            proof_opt = Some(p);
+        }
+        let proof = proof_opt.expect("RUNS > 0");
+        let postcard_bytes = pc_len(&proof);
+        let fixed_bytes = bincode::serialize(&proof).expect("bincode").len();
+        let mut best_verify = f64::INFINITY;
+        for _ in 0..RUNS {
+            let t = Instant::now();
+            verify(&config, &air, &proof, &opvs).expect("verify");
+            best_verify = best_verify.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        println!(
+            "| {name} | {rows} | {best_prove:.0} | {best_verify:.1} | {:.1} | {:.1} |",
+            postcard_bytes as f64 / 1024.0,
+            fixed_bytes as f64 / 1024.0,
+        );
+    }
+    println!();
+    println!(
+        "Peak RSS: rerun one config under /usr/bin/time -l with --only <cfg>. \
+         The gate proves a real M3 transcript with all columns bound (corrupted \
+         witness fails -- see the m4gate unit tests, incl. 4 gate-exit negatives \
+         and the endpoint-pin negatives); compare prove ms / peak RSS to \
+         aggregation-rung1 §6's <= 10 s / <= 32 GB leaf envelope."
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
