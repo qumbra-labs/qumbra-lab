@@ -575,9 +575,13 @@ const PREGA: usize = FHG + N_FHG; // 4: preg * fri_alpha (PX word-1 accumulation
 const CPA: usize = PREGA + 4; // PHD·CMPA  (A0/P0 capture: dup block 72)
 const CPB: usize = CPA + 1; // PHD·CMPB  (A1/P1 capture: dup block 145)
 const CPL: usize = CPB + 1; // PHD·BLKLAST (A2 capture: dup block 147)
+// Final-poly capture (endpoint pin END): FPI = 16-slot one-hot counter over the
+// F7 final-poly coefficients; CONSZ7 = CZ7·POS1 its completion flag.
+const CONSZ7: usize = CPL + 1; // CZ7 · POS1 (final-poly value completion)
+const FPI: usize = CONSZ7 + 1; // 16: final-poly coefficient index one-hot
 
-const GATE_COLS: usize = CPL + 1 - GB;
-pub(crate) const GATE_WIDTH: usize = CPL + 1;
+const GATE_COLS: usize = FPI + 16 - GB;
+pub(crate) const GATE_WIDTH: usize = FPI + 16;
 
 /// Flat M_FHI gate index for round `rf`, pair row `r` (mirrors the eval loop).
 const fn fhg_index(rf: usize, r: usize) -> usize {
@@ -627,6 +631,7 @@ pub(crate) fn colname(x: usize) -> &'static str {
         (M3, "M3"), (RLO, "RLO"), (RHI, "RHI"), (DMUX, "DMUX"), (SNL, "SNL"),
         (GLO, "GLO"), (GHI, "GHI"), (GF, "GF"), (BPM, "BPM"), (FHG, "FHG"),
         (PREGA, "PREGA"), (CPA, "CPA"), (CPB, "CPB"), (CPL, "CPL"),
+        (CONSZ7, "CONSZ7"), (FPI, "FPI"),
     ];
     let mut best = ("?", 0usize);
     for &(off, nm) in table {
@@ -2273,6 +2278,85 @@ where
             }
         }
 
+        // =====================================================================
+        // Final-poly capture + M_HORN Horner (endpoint pin, END). FPREG holds
+        // the 16 final-poly coefficients, captured from the CZ7 value rows
+        // (transcript-bound), indexed by the FPI one-hot counter. M_HORN then
+        // evaluates the poly at XFIN by Horner and pins the result to RUNEV —
+        // tying the *end* of the fold chain to the transcript's final poly.
+        // =====================================================================
+        {
+            let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
+            let _ = cn;
+            // CONSZ7 = CZ7 · POS1.
+            builder.assert_eq(cv(CONSZ7), cv(CZ7) * cv(POS + 1));
+            // FPI one-hot: bool, sum==1, first-row slot 0, +1 rotate on CONSZ7.
+            for i in 0..16 {
+                builder.assert_bool(cv(FPI + i));
+            }
+            builder.assert_eq(
+                (0..16).map(|i| cv(FPI + i)).fold(AB::Expr::ZERO, |a, e| a + e),
+                AB::Expr::ONE,
+            );
+            builder.when_first_row().assert_one(cv(FPI));
+            for i in 1..16 {
+                builder.when_first_row().assert_zero(cv(FPI + i));
+            }
+            let vfp = [cv(ASM0), cv(ASM1), cv(W0C), cv(W1C)];
+            {
+                let mut t = builder.when_transition();
+                for i in 0..16 {
+                    t.assert_eq(
+                        nv(FPI + i),
+                        cv(FPI + i) + cv(CONSZ7) * (cv(FPI + (i + 15) % 16) - cv(FPI + i)),
+                    );
+                }
+                // FPREG[s] capture on the CONSZ7 row with FPI==s; carry else.
+                for s in 0..16 {
+                    let gate = cv(CONSZ7) * cv(FPI + s);
+                    for k in 0..4 {
+                        t.assert_zero(
+                            nv(FPREG + 4 * s + k)
+                                - cv(FPREG + 4 * s + k)
+                                - gate.clone() * (vfp[k].clone() - cv(FPREG + 4 * s + k)),
+                        );
+                    }
+                }
+            }
+            // M_HORN Horner: rows 0..14. mul_b = XFIN; mul_a = FPREG[15] (r0) or
+            // the previous row's add output (threaded); add_a = mul_c; add_b =
+            // FPREG[14-r]; final add output (r14) == RUNEV.
+            let mh = cv(MSEL + M_HORN as usize);
+            let rge = |a: usize, b: usize| (a..=b).map(&sf).fold(AB::Expr::ZERO, |x, e| x + e);
+            let rows_all = rge(0, 14);
+            for k in 0..4 {
+                // mul_b = XFIN on all Horner rows.
+                builder.assert_zero(mh.clone() * rows_all.clone() * (cv(MUL_OFF + 4 + k) - cv(XFIN + k)));
+                // mul_a at r0 = FPREG[15].
+                builder.assert_zero(mh.clone() * sf(0) * (cv(MUL_OFF + k) - cv(FPREG + 60 + k)));
+                // add_a = mul_c (same row).
+                builder
+                    .assert_zero(mh.clone() * rows_all.clone() * (cv(ADD_OFF + k) - cv(MUL_OFF + 8 + k)));
+                // add_b = FPREG[14-r] (per-row mux, deg 3).
+                for r in 0..15 {
+                    builder.assert_zero(
+                        mh.clone() * sf(r) * (cv(ADD_OFF + 4 + k) - cv(FPREG + 4 * (14 - r) + k)),
+                    );
+                }
+                // final Horner output == RUNEV.
+                builder.assert_zero(mh.clone() * sf(14) * (cv(ADD_OFF + 8 + k) - cv(RUNEV + k)));
+            }
+            {
+                // Thread the accumulator: next row's mul_a == this row's add_c.
+                let mut t = builder.when_transition();
+                for k in 0..4 {
+                    t.assert_zero(
+                        mh.clone() * rge(0, 13) * (nv(MUL_OFF + k) - cv(ADD_OFF + 8 + k)),
+                    );
+                }
+            }
+        }
+
         // The last-row phase anchor is the QSEL check emitted above.
         let _ = (cf, pv, xorsel, consumersel);
     }
@@ -2762,6 +2846,7 @@ fn write_row(
     }
     wb(v, POS + regs.pos, true);
     wb(v, VC + regs.vc % 16, true);
+    wb(v, FPI + regs.fpi % 16, true);
     let mut vce = false;
     if regs.vc % 2 == 0 {
         vce = true;
@@ -3747,6 +3832,7 @@ fn fill_derived(values: &mut [Val]) {
         values[base + CPA] = values[base + PHD] * values[base + CMPA];
         values[base + CPB] = values[base + PHD] * values[base + CMPB];
         values[base + CPL] = values[base + PHD] * values[base + BLKLAST];
+        values[base + CONSZ7] = values[base + CZ7] * values[base + POS + 1];
     }
 }
 
@@ -4359,6 +4445,17 @@ mod tests {
         assert_unsat(move |t, _o, qr, _fd| {
             let row = qr[0];
             t.values[row * w + A0R] += Val::ONE;
+        });
+    }
+
+    /// Endpoint-pin negative (END): tamper a captured final-poly coefficient.
+    /// The FPREG capture-or-carry recurrence + M_HORN Horner must reject it.
+    #[test]
+    fn gate_neg_fpreg() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
+            t.values[row * w + FPREG] += Val::ONE;
         });
     }
 }
