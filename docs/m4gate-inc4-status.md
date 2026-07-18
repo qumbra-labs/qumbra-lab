@@ -307,8 +307,13 @@ partial binding lets a prover pick free intermediates.
    and the bank operand routing (mchain threading).
 4. **M_FHI higher-round fold** (column, deg 2) + **RUNEV carry/update** + the
    **fold-leaf consistency** `CONSF·HIT·(v − RUNEV) == 0`.
-5. **X/XFIN chains, INV_Z/INV_ZN, reduced opening (M_RO), PZACC/PX accumulation**
-   (banks + inline ext) → RUNEV.
+5. **[X/XFIN DONE — Stage H; INVZ DONE — Stage I]** reduced opening (M_RO),
+   PZACC/PX accumulation (banks + inline ext) → RUNEV. INVZ = 1/(zeta−x) is
+   bound (Stage I); **INVZN = 1/(zeta_next−x)** has the correct inverse check
+   but its full soundness pends the **ZN/trailer binding** (ZNREG = zeta·g_trace
+   on the trailer M_GLOB rows is still free witness — bind it next). PZACC/PX
+   is the big threaded accumulation `pzacc += preg·v; preg *= fri_alpha` over
+   the trace/quotient openings + dup zeta values (inline ext-mul, deg 2).
 6. **Final-poly Horn** (M_HORN) + the `RUNEV == final_eval` compare. Un-ignore
    `gate_neg_bad_fold`.
 

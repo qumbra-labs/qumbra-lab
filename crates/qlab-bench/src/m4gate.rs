@@ -1730,6 +1730,45 @@ where
             }
         }
 
+        // =====================================================================
+        // M_INV (inc-4): witnessed inverses INVZ = 1/(zeta - x) [r=0] and
+        // INVZN = 1/(zeta_next - x) [r=1]. Add bank forms (operand - x) as a-c;
+        // mul bank pins the inverse via mul_c == 1. INVZ is fully sound (zeta =
+        // CHAL bound, x = XREG bound); INVZN's soundness pends the ZN/trailer
+        // binding (ZNREG is still free witness). Native arithmetic.
+        // =====================================================================
+        {
+            let msel_i = cv(MSEL + M_INV as usize);
+            let one_k = |k: usize| {
+                if k == 0 {
+                    AB::Expr::ONE
+                } else {
+                    AB::Expr::ZERO
+                }
+            };
+            // Same shape for both rows; the operand register differs.
+            let inv_row = |b: &mut AB, sel: AB::Expr, operand: usize| {
+                for k in 0..4 {
+                    b.assert_zero(sel.clone() * (cv(ADD_OFF + 8 + k) - cv(operand + k)));
+                    b.assert_zero(sel.clone() * (cv(ADD_OFF + 4 + k) - cv(XREG + k)));
+                    b.assert_zero(sel.clone() * (cv(MUL_OFF + k) - cv(ADD_OFF + k)));
+                    b.assert_zero(sel.clone() * (cv(MUL_OFF + 8 + k) - one_k(k)));
+                }
+            };
+            inv_row(builder, msel_i.clone() * sf(0), CHAL + 4 * G_ZETA);
+            inv_row(builder, msel_i.clone() * sf(1), ZNREG);
+            // Capture the inverse witnesses (mul_b) into INVZ / INVZN.
+            let cap_z = msel_i.clone() * sf(0);
+            let cap_zn = msel_i * sf(1);
+            let mut t = builder.when_transition();
+            for k in 0..4 {
+                t.assert_zero(cap_z.clone() * (nv(INVZ + k) - cv(MUL_OFF + 4 + k)));
+                t.assert_zero((AB::Expr::ONE - cap_z.clone()) * (nv(INVZ + k) - cv(INVZ + k)));
+                t.assert_zero(cap_zn.clone() * (nv(INVZN + k) - cv(MUL_OFF + 4 + k)));
+                t.assert_zero((AB::Expr::ONE - cap_zn.clone()) * (nv(INVZN + k) - cv(INVZN + k)));
+            }
+        }
+
         // The last-row phase anchor is the QSEL check emitted above.
         let _ = (extmul, pv, xorsel, consumersel);
     }
@@ -3380,11 +3419,17 @@ mod tests {
         check_constraints(&VerifierGateAir::new(), trace, opvs);
     }
 
-    /// Assert a mutated witness is UNSATISFIABLE (some constraint fires).
-    fn assert_unsat(mutate: impl Fn(&mut RowMajorMatrix<Val>, &mut Vec<Val>)) {
+    /// Assert a mutated witness is UNSATISFIABLE (some constraint fires). The
+    /// mutate closure gets the trace, the outer public values, and (to avoid a
+    /// second heavy trace build) the query-row starts and accepted field draws.
+    fn assert_unsat(
+        mutate: impl Fn(&mut RowMajorMatrix<Val>, &mut Vec<Val>, &[usize], &[(usize, u32)]),
+    ) {
         let (sched, pvs, _) = shared();
         let (mut trace, mut meta) = build_gate_trace(sched, pvs, 0);
-        mutate(&mut trace, &mut meta.opvs);
+        let qrows = meta.query_rows.clone();
+        let fdraws = meta.field_draws.clone();
+        mutate(&mut trace, &mut meta.opvs, &qrows, &fdraws);
         let opvs = meta.opvs.clone();
         assert!(
             is_unsat(trace, opvs),
@@ -3399,7 +3444,7 @@ mod tests {
     fn gate_neg_wrong_root() {
         let w = GATE_WIDTH;
         let _ = w;
-        assert_unsat(|_t, opvs| {
+        assert_unsat(|_t, opvs, _qr, _fd| {
             opvs[0] += Val::ONE; // corrupt a cap-limb outer public value
         });
     }
@@ -3410,10 +3455,8 @@ mod tests {
     #[test]
     fn gate_neg_tampered_opening() {
         let w = GATE_WIDTH;
-        assert_unsat(move |t, _o| {
-            let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
-            let row = m.query_rows[0];
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
             t.values[row * w + pcol(0)] += Val::ONE;
         });
     }
@@ -3427,10 +3470,8 @@ mod tests {
     #[test]
     fn gate_neg_wrong_challenge_fs() {
         let w = GATE_WIDTH;
-        assert_unsat(move |t, _o| {
-            let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
-            let (row, _) = m.field_draws[0];
+        assert_unsat(move |t, _o, _qr, fd| {
+            let (row, _) = fd[0];
             t.values[row * w + FSACC] += Val::ONE;
         });
     }
@@ -3440,10 +3481,8 @@ mod tests {
         let w = GATE_WIDTH;
         // Flip alpha's limb 0 at a query row (alpha is long since assembled
         // there): breaks the CHAL carry / assembly binding.
-        assert_unsat(move |t, _o| {
-            let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
-            let row = m.query_rows[0];
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
             t.values[row * w + CHAL] += Val::ONE;
         });
     }
@@ -3455,11 +3494,21 @@ mod tests {
     #[test]
     fn gate_neg_xreg_chain() {
         let w = GATE_WIDTH;
-        assert_unsat(move |t, _o| {
-            let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
-            let row = m.query_rows[0];
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
             t.values[row * w + XREG] += Val::ONE;
+        });
+    }
+
+    /// M_INV inverse binding. BOUND (inc-4): INVZ = 1/(zeta - x), pinned by
+    /// the mul bank's product == 1 with zeta (CHAL) and x (XREG) both bound.
+    /// Flipping INVZ breaks the inverse relation / capture / carry.
+    #[test]
+    fn gate_neg_invz() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
+            t.values[row * w + INVZ] += Val::ONE;
         });
     }
 
@@ -3469,10 +3518,8 @@ mod tests {
     #[test]
     fn gate_neg_xfin_chain() {
         let w = GATE_WIDTH;
-        assert_unsat(move |t, _o| {
-            let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
-            let row = m.query_rows[0];
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
             t.values[row * w + XFIN] += Val::ONE;
         });
     }
@@ -3485,10 +3532,8 @@ mod tests {
     #[test]
     fn gate_neg_value_schedule() {
         let w = GATE_WIDTH;
-        assert_unsat(move |t, _o| {
-            let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
-            let row = m.query_rows[0];
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
             t.values[row * w + VC + 3] += Val::ONE; // break VC one-hot
         });
     }
@@ -3500,7 +3545,7 @@ mod tests {
     #[test]
     fn gate_neg_grp_schedule() {
         let w = GATE_WIDTH;
-        assert_unsat(move |t, _o| {
+        assert_unsat(move |t, _o, _qr, _fd| {
             // Row 60 is mid-F2 (challenger phase); flip the head slot.
             t.values[60 * w + GRP] += Val::ONE;
         });
@@ -3513,10 +3558,8 @@ mod tests {
     #[test]
     fn gate_neg_wrong_query_index() {
         let w = GATE_WIDTH;
-        assert_unsat(move |t, _o| {
-            let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
-            let row = m.query_rows[0];
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
             t.values[row * w + IDXR] += Val::ONE;
         });
     }
@@ -3531,10 +3574,8 @@ mod tests {
     #[ignore = "remainder: ext-arithmetic fold pipeline not yet built (spec 2.1/2.4)"]
     fn gate_neg_bad_fold() {
         let w = GATE_WIDTH;
-        assert_unsat(move |t, _o| {
-            let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
-            let row = m.query_rows[0];
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
             t.values[row * w + RUNEV] += Val::ONE;
         });
     }
