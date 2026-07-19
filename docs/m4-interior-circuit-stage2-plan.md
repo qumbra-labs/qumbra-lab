@@ -350,7 +350,35 @@ fold-pipeline build in scope — NOT loop-bound tweaks:
   (onto the quotient/trace path or a dedicated tail perm) so the END pin has a
   host on the wide query program.
 
-Only after 1b-A + 1b-B does 1b-4 (`interior_single_child_satisfies` via
+**1b-A — DONE** (`c5109b7`, narrow 37 green / 432 s, byte-identical): leaf-sponge
+fresh-word counts generalized by shape (no new roles — `N_ROLES`/layout
+unchanged). `R_ABS_C5` carry `[2f+2·(f&1), 100)` with pad `[2f,2f+2)` iff f odd
+(`f = tw mod 34`, narrow 5 / wide 22); `R_ABS_F16` zero-region `(2·qw)..100`;
+`emit_leaf` picks the last-block role by leaf context (removed the
+remainder-literal panic); `role_range`/`write_row` `(m0,m1)` = `(ceil(f/2)-1,
+floor(f/2)-1)` per role (reproduces narrow: only C5's odd f differs m0≠m1); and
+the **PX0 trace-leaf-end capture** (eval `sf(3)` + trace `r==3`) generalized to
+`(f+1)/2` — it encoded f=5, would have been a latent wide bug. `qprogram_from_shape(&wide())`
+now returns len 165 without panic; the wide trace builds past the sponge blocker.
+
+**⚠ PEEL-THE-ONION: the wide build is a CHAIN of narrow-hardcoding removals.**
+After 1b-A the wide `build_gate_trace` advances and stops at the **next**
+blocker: `m4gate.rs:3645`, the challenger **observation-flush shape automaton**
+— `shape drift at flush 0 block 6 (derived 6 vs expected 5)`, driven by wide
+F0's block count (`n_pvs=852` → 28 blocks vs narrow 5). So the remaining wide
+work, discovered incrementally (each fix reveals the next narrow assumption):
+- **1b-B1 — flush-shape automaton for the wide obs stream.** Generalize the
+  flush block-count / shape-drift machinery (~m4gate.rs:3645 and the
+  `shsel_index`/`shape_list` obs-shape setup) to the wide `FLUSH_BLOCKS`
+  = [28,3,855,3,3,3,3] / `N_SHAPES_OBS`=46 the investigation report derived.
+- **1b-B2 — micro-op scheduling for the short last fold round.** Wide
+  `path_levels=[15,15,11,7,3]`: last round has 3 levels → 2 interior slots, too
+  short to host `M_HORN` (fold-chain END). Relocate `M_FIN`/`M_HORN`.
+- **… likely more** surface as each is cleared. Each is moderate circuit work
+  (narrow suite green + wide-build-advances-further as the per-slice gate); the
+  whole chain is the "≈ fold-pipeline build" scope the 1b-4 finding flagged.
+
+Only after the whole chain does 1b-4 (`interior_single_child_satisfies` via
 `check_constraints`) become attemptable, then 1b-5 (wide negatives), then 棒 2/3.
 
 **Original remaining-list (1b-2…1b-5), now partly superseded above** — spec'd by
