@@ -305,8 +305,39 @@ unchanged, all narrow tests green, independently re-verified):
   (unused). Gate: `cargo test -p qlab-bench m4gate` = 35 passed (incl. heavy
   `gate_rectangle_satisfies` + 19 negatives); whole crate 50 passed.
 
-**棒 1b — NEXT.** Make `wide()` actually build a SAT single-child rectangle.
-Three blockers surfaced by 1a-ii, in order:
+**棒 1b — IN PROGRESS.**
+- `5bd5a53` investigation `docs/m4-1b-wide-params-investigation.md`: derived +
+  empirically confirmed every wide transcript/layout param (QSLOTS 165,
+  N_SHAPES_OBS 46, N_CHALS 6, N_GROUPS 48, N_ROLES 12, N_MICROS 15, N_FHG 21,
+  DRND 5, flush geometry), the builder/trace refactor site list, and the
+  `build_gate_trace` shape-param sketch. **Correction:** N_CHALS/N_GROUPS/
+  N_ROLES/N_MICROS are shape-varying, not fixed.
+- `a58f754` slice 1b-1: `GateShape` now derives all those counts (each
+  reproduces its narrow const); `GateLayout::from_shape` is fully shape-driven →
+  `from_shape(wide())` yields correct wide *offsets*. Tests
+  `gate_shape_derived_counts_narrow` + `gate_shape_wide_values`.
+
+**棒 1b — REMAINING (1b-2 … 1b-5), spec'd by the investigation report's §3 site
+list + §4 sketch.** The AIR's `eval` and the trace builders still read the
+narrow module consts + narrow generators, so a wide trace can't be built yet:
+- **1b-2 (invasive):** convert the builder/trace compile-time arrays & loops
+  (`[u32; NQ]`, `[_; N_FHG]`, `0..4` fold rounds, `% QSLOTS`, `FLUSH_BLOCKS[f]`,
+  `for f in 0..8`, `betas[0..3]`, the group/chal/role/micro anchors `G_POW/
+  G_IDX0/G_DONE/N_FLUSH_ENTRIES` that eval still reads as consts) to runtime,
+  sized from `shape`/`layout`. `qprogram()`→`qprogram_from_shape`,
+  `gate_consts()`→`gate_consts_from_shape` (inner degree_bits = log_max −
+  log_blowup; per-round `lf`/`kf`), `fhg_index` shape-aware. Narrow suite stays
+  green as the gate.
+- **1b-3:** `build_gate_trace` gains a `shape: &GateShape` param; relax the
+  `assert_eq!(rows, 1<<16)` → shape-derived (wide interior ≈ 8,360 native perms
+  → **2^18**). `new_with_shape` uses the shape-parametrized generators.
+- **1b-4:** `interior_single_child_satisfies` — `check_constraints` on the 2^18
+  wide trace (~4 GB, cheap, no full prove) from `m4treerec::walk_leaf` + wide().
+- **1b-5:** re-derive the shape-tied negatives for the wide trace.
+Optional heavy canary: one b4 single-child `prove` + peak-RSS (forecasts the
+two-child breach).
+
+(historical) The three blockers as first surfaced by 1a-ii:
 1. **Const-array-size refactor (the real work).** Builder structs use compile-time
    sizes `[u32; NQ]`, `[Val::ZERO; N_FHG]`, and bare `0..4` fold-round literals.
    For wide, NQ 20→40, N_FHG 22→21, fold rounds 4→3. Convert these to runtime
