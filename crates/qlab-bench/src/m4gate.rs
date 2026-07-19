@@ -1310,20 +1310,45 @@ pub(crate) fn gate_consts() -> GateConsts {
 pub(crate) struct VerifierGateAir {
     pub program: [u32; QSLOTS],
     pub consts: GateConsts,
+    /// Inner-proof shape this circuit verifies (narrow leaf today; a future
+    /// slice instantiates `wide()` for the interior node).
+    pub(crate) shape: GateShape,
+    /// Column layout derived from `shape`; `eval` reads every column offset
+    /// from here instead of the top-of-file `const`s.
+    pub(crate) layout: GateLayout,
 }
 
 impl VerifierGateAir {
     pub(crate) fn new() -> Self {
+        let shape = GateShape::narrow();
+        let layout = GateLayout::from_shape(&shape);
         Self {
             program: qprogram(),
             consts: gate_consts(),
+            shape,
+            layout,
+        }
+    }
+
+    /// Build a verifier gate for an arbitrary inner-proof `shape`, deriving the
+    /// column layout from it. Wired for a later slice's `wide()` instance; the
+    /// program / consts are still the narrow generators (wide lowering lands in
+    /// slice 1b), so only `new()` (narrow) is exercised today.
+    #[allow(dead_code)]
+    pub(crate) fn new_with_shape(shape: GateShape) -> Self {
+        let layout = GateLayout::from_shape(&shape);
+        Self {
+            program: qprogram(),
+            consts: gate_consts(),
+            shape,
+            layout,
         }
     }
 }
 
 impl<F: Field> BaseAir<F> for VerifierGateAir {
     fn width(&self) -> usize {
-        GATE_WIDTH
+        self.layout.gate_width
     }
     fn num_public_values(&self) -> usize {
         N_OPVS
@@ -1361,9 +1386,9 @@ where
         // --- arithmetic banks (inc-1, unchanged) --------------------------
         {
             let w = c(EXT_W);
-            let a = |k: usize| cv(MUL_OFF + k);
-            let b = |k: usize| cv(MUL_OFF + 4 + k);
-            let cc = |k: usize| cv(MUL_OFF + 8 + k);
+            let a = |k: usize| cv(self.layout.mul_off + k);
+            let b = |k: usize| cv(self.layout.mul_off + 4 + k);
+            let cc = |k: usize| cv(self.layout.mul_off + 8 + k);
             for k in 0..4 {
                 let mut acc = AB::Expr::ZERO;
                 for i in 0..4 {
@@ -1378,7 +1403,7 @@ where
                 builder.assert_eq(acc, cc(k));
             }
             for k in 0..4 {
-                builder.assert_eq(cv(ADD_OFF + k) + cv(ADD_OFF + 4 + k), cv(ADD_OFF + 8 + k));
+                builder.assert_eq(cv(self.layout.add_off + k) + cv(self.layout.add_off + 4 + k), cv(self.layout.add_off + 8 + k));
             }
         }
 
@@ -1402,8 +1427,8 @@ where
         // =====================================================================
         // Query program ring + role/micro/dparam selectors
         // =====================================================================
-        let phq = cv(PHQ);
-        let phc = cv(PHC);
+        let phq = cv(self.layout.phq);
+        let phc = cv(self.layout.phc);
         builder.assert_bool(phq.clone());
         builder.assert_bool(phc.clone());
 
@@ -1414,50 +1439,50 @@ where
         // pass in `build_gate_trace`.
         // ---------------------------------------------------------------------
         {
-            let ring_fring = |f: usize| cv(ring_at(FRING, 8, f));
-            // CHLIVE = phc * (1 - REFSEL)
-            builder.assert_eq(cv(CHLIVE), phc.clone() * (AB::Expr::ONE - cv(REFSEL)));
-            // F2SEL = ringsel(2) * (1 - bidxsel(0))
-            builder.assert_eq(cv(F2SEL), ring_fring(2) * (AB::Expr::ONE - cv(BIDX)));
-            // PG_A = ringsel(7) * grpdone * phc
+            let ring_fring = |f: usize| cv(ring_at(self.layout.fring, 8, f));
+            // self.layout.chlive = phc * (1 - self.layout.refsel)
+            builder.assert_eq(cv(self.layout.chlive), phc.clone() * (AB::Expr::ONE - cv(self.layout.refsel)));
+            // self.layout.f2sel = ringsel(2) * (1 - bidxsel(0))
+            builder.assert_eq(cv(self.layout.f2sel), ring_fring(2) * (AB::Expr::ONE - cv(self.layout.bidx)));
+            // self.layout.pg_a = ringsel(7) * grpdone * phc
             builder.assert_eq(
-                cv(PG_A),
-                ring_fring(7) * cv(ring_at(GRP, N_GROUPS, G_DONE)) * phc.clone(),
+                cv(self.layout.pg_a),
+                ring_fring(7) * cv(ring_at(self.layout.grp, N_GROUPS, G_DONE)) * phc.clone(),
             );
-            // PHG (phasegate) = sf(23) * BLKLAST * PG_A
-            builder.assert_eq(cv(PHG), sf(23) * cv(BLKLAST) * cv(PG_A));
-            // PHDEND = sf(23) * PHD * BLKLAST
-            builder.assert_eq(cv(PHDEND), sf(23) * cv(PHD) * cv(BLKLAST));
-            // CONT = sf(23) * phc * (1 - BLKLAST)
-            builder.assert_eq(cv(CONT), sf(23) * phc.clone() * (AB::Expr::ONE - cv(BLKLAST)));
-            // EG_A = phq * QCW * ring(QSEL, NQ-1); ENDG (endgate) = sf(23) * EG_A
+            // self.layout.phg (phasegate) = sf(23) * self.layout.blklast * self.layout.pg_a
+            builder.assert_eq(cv(self.layout.phg), sf(23) * cv(self.layout.blklast) * cv(self.layout.pg_a));
+            // self.layout.phdend = sf(23) * self.layout.phd * self.layout.blklast
+            builder.assert_eq(cv(self.layout.phdend), sf(23) * cv(self.layout.phd) * cv(self.layout.blklast));
+            // self.layout.cont = sf(23) * phc * (1 - self.layout.blklast)
+            builder.assert_eq(cv(self.layout.cont), sf(23) * phc.clone() * (AB::Expr::ONE - cv(self.layout.blklast)));
+            // self.layout.eg_a = phq * self.layout.qcw * ring(self.layout.qsel, self.shape.nq-1); self.layout.endg (endgate) = sf(23) * self.layout.eg_a
             builder.assert_eq(
-                cv(EG_A),
-                phq.clone() * cv(QCW) * cv(ring_at(QSEL, NQ + 1, NQ - 1)),
+                cv(self.layout.eg_a),
+                phq.clone() * cv(self.layout.qcw) * cv(ring_at(self.layout.qsel, self.shape.nq + 1, self.shape.nq - 1)),
             );
-            builder.assert_eq(cv(ENDG), sf(23) * cv(EG_A));
-            // XSEL = phd*(1-CMPC) + sum of obs/dup interior SHSEL (xorsel).
+            builder.assert_eq(cv(self.layout.endg), sf(23) * cv(self.layout.eg_a));
+            // self.layout.xsel = phd*(1-self.layout.cmpc) + sum of obs/dup interior self.layout.shsel (xorsel).
             {
-                let mut xs = cv(PHD) * (AB::Expr::ONE - cv(CMPC));
+                let mut xs = cv(self.layout.phd) * (AB::Expr::ONE - cv(self.layout.cmpc));
                 for f in 0..8 {
                     if f == 2 {
                         continue;
                     }
                     for b in 1..FLUSH_BLOCKS[f] {
-                        xs = xs + cv(SHSEL + shsel_index(f, b));
+                        xs = xs + cv(self.layout.shsel + shsel_index(f, b));
                     }
                 }
-                builder.assert_eq(cv(XSEL), xs);
+                builder.assert_eq(cv(self.layout.xsel), xs);
             }
-            // QADV = sf(23) * phq * QCW
-            builder.assert_eq(cv(QADV), sf(23) * phq.clone() * cv(QCW));
-            // CFULL = sf(23) * consumersel * (1 - FSFULL)
+            // self.layout.qadv = sf(23) * phq * self.layout.qcw
+            builder.assert_eq(cv(self.layout.qadv), sf(23) * phq.clone() * cv(self.layout.qcw));
+            // self.layout.cfull = sf(23) * consumersel * (1 - self.layout.fsfull)
             {
-                let mut cs = cv(REFSEL);
+                let mut cs = cv(self.layout.refsel);
                 for f in 1..8 {
-                    cs = cs + cv(SHSEL + shsel_index(f, 0));
+                    cs = cs + cv(self.layout.shsel + shsel_index(f, 0));
                 }
-                builder.assert_eq(cv(CFULL), sf(23) * cs * (AB::Expr::ONE - cv(FSFULL)));
+                builder.assert_eq(cv(self.layout.cfull), sf(23) * cs * (AB::Expr::ONE - cv(self.layout.fsfull)));
             }
         }
 
@@ -1465,28 +1490,28 @@ where
         for i in 0..QSLOTS {
             builder
                 .when_first_row()
-                .assert_eq(cv(PR + i), c(self.program[i]));
+                .assert_eq(cv(self.layout.pr + i), c(self.program[i]));
         }
         {
             let g = sf(23) * phq.clone();
             let mut t = builder.when_transition();
             for i in 0..QSLOTS {
                 t.assert_eq(
-                    nv(PR + i),
-                    cv(PR + i) + g.clone() * (cv(PR + (i + 1) % QSLOTS) - cv(PR + i)),
+                    nv(self.layout.pr + i),
+                    cv(self.layout.pr + i) + g.clone() * (cv(self.layout.pr + (i + 1) % QSLOTS) - cv(self.layout.pr + i)),
                 );
             }
         }
-        // Head decomposition: 15 bool bits = PR[0].
+        // Head decomposition: 15 bool bits = self.layout.pr[0].
         for k in 0..15 {
-            builder.assert_bool(cv(PD + k));
+            builder.assert_bool(cv(self.layout.pd + k));
         }
         {
             let mut acc = AB::Expr::ZERO;
             for k in 0..15 {
-                acc = acc + cv(PD + k) * c(1 << k);
+                acc = acc + cv(self.layout.pd + k) * c(1 << k);
             }
-            builder.assert_eq(acc, cv(PR));
+            builder.assert_eq(acc, cv(self.layout.pr));
         }
         // Literal helper over a bit column: bit b of code j.
         let lit = |col: usize, on: bool| -> AB::Expr {
@@ -1500,99 +1525,99 @@ where
         // the phq-gated selector defs so those stay deg <= 3.
         // RLO_j = pair(PD0,PD1); RHI_j = pair(PD2,PD3); M3_a = 3-bit(PD10..12).
         for j in 0..4 {
-            builder.assert_eq(cv(RLO + j), lit(PD, j & 1 == 1) * lit(PD + 1, j & 2 == 2));
-            builder.assert_eq(cv(RHI + j), lit(PD + 2, j & 1 == 1) * lit(PD + 3, j & 2 == 2));
+            builder.assert_eq(cv(self.layout.rlo + j), lit(self.layout.pd, j & 1 == 1) * lit(self.layout.pd + 1, j & 2 == 2));
+            builder.assert_eq(cv(self.layout.rhi + j), lit(self.layout.pd + 2, j & 1 == 1) * lit(self.layout.pd + 3, j & 2 == 2));
         }
         for a in 0..8 {
             builder.assert_eq(
-                cv(M3 + a),
-                lit(PD + 10, a & 1 == 1) * lit(PD + 11, a & 2 == 2) * lit(PD + 12, a & 4 == 4),
+                cv(self.layout.m3 + a),
+                lit(self.layout.pd + 10, a & 1 == 1) * lit(self.layout.pd + 11, a & 2 == 2) * lit(self.layout.pd + 12, a & 4 == 4),
             );
         }
-        // Role selectors: RSEL_r = phq * RLO[r&3] * RHI[(r>>2)&3]  (deg 3).
+        // Role selectors: RSEL_r = phq * self.layout.rlo[r&3] * self.layout.rhi[(r>>2)&3]  (deg 3).
         for r in 0..N_ROLES {
             builder.assert_eq(
-                cv(RSEL + r),
-                phq.clone() * cv(RLO + (r & 3)) * cv(RHI + ((r >> 2) & 3)),
+                cv(self.layout.rsel + r),
+                phq.clone() * cv(self.layout.rlo + (r & 3)) * cv(self.layout.rhi + ((r >> 2) & 3)),
             );
         }
-        // Micro selectors: MLO_a = phq * M3[a]; MHI_b = 2-bit(PD13..14);
-        // MSEL_m = MLO * MHI  (all deg <= 3).
+        // Micro selectors: MLO_a = phq * self.layout.m3[a]; MHI_b = 2-bit(PD13..14);
+        // MSEL_m = self.layout.mlo * self.layout.mhi  (all deg <= 3).
         for a in 0..8 {
-            builder.assert_eq(cv(MLO + a), phq.clone() * cv(M3 + a));
+            builder.assert_eq(cv(self.layout.mlo + a), phq.clone() * cv(self.layout.m3 + a));
         }
         for b in 0..4 {
-            let e = lit(PD + 13, b & 1 == 1) * lit(PD + 14, b & 2 == 2);
-            builder.assert_eq(cv(MHI + b), e);
+            let e = lit(self.layout.pd + 13, b & 1 == 1) * lit(self.layout.pd + 14, b & 2 == 2);
+            builder.assert_eq(cv(self.layout.mhi + b), e);
         }
         for m in 0..N_MICROS {
-            builder.assert_eq(cv(MSEL + m), cv(MLO + (m & 7)) * cv(MHI + (m >> 3)));
+            builder.assert_eq(cv(self.layout.msel + m), cv(self.layout.mlo + (m & 7)) * cv(self.layout.mhi + (m >> 3)));
         }
         // dparam selectors: DLO_a (PD4..6), DHI_b (PD7..8, b < 3).
         for a in 0..8 {
-            let e = lit(PD + 4, a & 1 == 1) * lit(PD + 5, a & 2 == 2) * lit(PD + 6, a & 4 == 4);
-            builder.assert_eq(cv(DLO + a), e);
+            let e = lit(self.layout.pd + 4, a & 1 == 1) * lit(self.layout.pd + 5, a & 2 == 2) * lit(self.layout.pd + 6, a & 4 == 4);
+            builder.assert_eq(cv(self.layout.dlo + a), e);
         }
         for b in 0..3 {
-            let e = lit(PD + 7, b & 1 == 1) * lit(PD + 8, b & 2 == 2);
-            builder.assert_eq(cv(DHI + b), e);
+            let e = lit(self.layout.pd + 7, b & 1 == 1) * lit(self.layout.pd + 8, b & 2 == 2);
+            builder.assert_eq(cv(self.layout.dhi + b), e);
         }
         // Absorb-round selectors from dparam values 0..5.
-        let absany = cv(RSEL + R_ABS_F34 as usize)
-            + cv(RSEL + R_ABS_F16 as usize)
-            + cv(RSEL + R_ABS_C34 as usize)
-            + cv(RSEL + R_ABS_C5 as usize)
-            + cv(RSEL + R_ABS_C30 as usize);
-        // DRND_j = absany * DLO[j]  (DLO[j] is the same 3-bit product; deg 2).
+        let absany = cv(self.layout.rsel + R_ABS_F34 as usize)
+            + cv(self.layout.rsel + R_ABS_F16 as usize)
+            + cv(self.layout.rsel + R_ABS_C34 as usize)
+            + cv(self.layout.rsel + R_ABS_C5 as usize)
+            + cv(self.layout.rsel + R_ABS_C30 as usize);
+        // DRND_j = absany * self.layout.dlo[j]  (self.layout.dlo[j] is the same 3-bit product; deg 2).
         for j in 0..6 {
-            builder.assert_eq(cv(DRND + j), absany.clone() * cv(DLO + j));
+            builder.assert_eq(cv(self.layout.drnd + j), absany.clone() * cv(self.layout.dlo + j));
         }
         // Leaf-start selector.
         builder.assert_eq(
-            cv(LFS),
-            cv(RSEL + R_ABS_F34 as usize) + cv(RSEL + R_ABS_F16 as usize),
+            cv(self.layout.lfs),
+            cv(self.layout.rsel + R_ABS_F34 as usize) + cv(self.layout.rsel + R_ABS_F16 as usize),
         );
 
         // =====================================================================
-        // Query scheduling: QSEL ring, QCNT countdown, phase handoff/exit
+        // Query scheduling: self.layout.qsel ring, self.layout.qcnt countdown, phase handoff/exit
         // =====================================================================
-        for i in 0..=NQ {
+        for i in 0..=self.shape.nq {
             builder.when_first_row().assert_eq(
-                cv(QSEL + i),
+                cv(self.layout.qsel + i),
                 if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO },
             );
         }
-        builder.when_first_row().assert_eq(cv(QCNT), c(QSLOTS as u32));
-        builder.when_first_row().assert_one(cv(PHC));
-        builder.when_first_row().assert_zero(cv(PHQ));
-        // QCW comparator: QCNT == 1.
-        builder.assert_bool(cv(QCW));
-        builder.assert_zero((cv(QCNT) - AB::Expr::ONE) * cv(QCW));
+        builder.when_first_row().assert_eq(cv(self.layout.qcnt), c(QSLOTS as u32));
+        builder.when_first_row().assert_one(cv(self.layout.phc));
+        builder.when_first_row().assert_zero(cv(self.layout.phq));
+        // self.layout.qcw comparator: self.layout.qcnt == 1.
+        builder.assert_bool(cv(self.layout.qcw));
+        builder.assert_zero((cv(self.layout.qcnt) - AB::Expr::ONE) * cv(self.layout.qcw));
         builder.assert_eq(
-            cv(QCW) + (cv(QCNT) - AB::Expr::ONE) * cv(QCWI),
+            cv(self.layout.qcw) + (cv(self.layout.qcnt) - AB::Expr::ONE) * cv(self.layout.qcwi),
             AB::Expr::ONE,
         );
         // The last-row anchor: all 20 query blocks must have completed.
         builder
             .when_last_row()
-            .assert_one(cv(ring_at(QSEL, NQ + 1, NQ)));
+            .assert_one(cv(ring_at(self.layout.qsel, self.shape.nq + 1, self.shape.nq)));
         {
-            // QCNT: decrement per perm during query phase, reload on wrap.
+            // self.layout.qcnt: decrement per perm during query phase, reload on wrap.
             let dec = sf(23) * phq.clone();
             let mut t = builder.when_transition();
             t.assert_eq(
-                nv(QCNT),
-                cv(QCNT)
+                nv(self.layout.qcnt),
+                cv(self.layout.qcnt)
                     + dec.clone()
-                        * ((AB::Expr::ONE - cv(QCW)) * (-AB::Expr::ONE)
-                            + cv(QCW) * c(QSLOTS as u32 - 1)),
+                        * ((AB::Expr::ONE - cv(self.layout.qcw)) * (-AB::Expr::ONE)
+                            + cv(self.layout.qcw) * c(QSLOTS as u32 - 1)),
             );
-            // QSEL rotation on block wrap. (QADV = sf(23)*phq*QCW = dec*QCW.)
-            let g = cv(QADV);
-            for i in 0..=NQ {
+            // self.layout.qsel rotation on block wrap. (self.layout.qadv = sf(23)*phq*self.layout.qcw = dec*self.layout.qcw.)
+            let g = cv(self.layout.qadv);
+            for i in 0..=self.shape.nq {
                 t.assert_eq(
-                    nv(QSEL + i),
-                    cv(QSEL + i) + g.clone() * (cv(QSEL + (i + 1) % (NQ + 1)) - cv(QSEL + i)),
+                    nv(self.layout.qsel + i),
+                    cv(self.layout.qsel + i) + g.clone() * (cv(self.layout.qsel + (i + 1) % (self.shape.nq + 1)) - cv(self.layout.qsel + i)),
                 );
             }
         }
@@ -1601,40 +1626,40 @@ where
         // Per-query index bits: decomposition of the active query's index
         // register (continuous binding; no load events needed).
         // =====================================================================
-        for k in 0..LOG_MAX {
-            builder.assert_bool(cv(IDXB + k));
+        for k in 0..self.shape.log_max {
+            builder.assert_bool(cv(self.layout.idxb + k));
         }
         {
             let mut recompose = AB::Expr::ZERO;
-            for k in 0..LOG_MAX {
-                recompose = recompose + cv(IDXB + k) * c(1 << k);
+            for k in 0..self.shape.log_max {
+                recompose = recompose + cv(self.layout.idxb + k) * c(1 << k);
             }
             let mut sel = AB::Expr::ZERO;
-            for q in 0..NQ {
-                sel = sel + cv(ring_at(QSEL, NQ + 1, q)) * cv(IDXR + q);
+            for q in 0..self.shape.nq {
+                sel = sel + cv(ring_at(self.layout.qsel, self.shape.nq + 1, q)) * cv(self.layout.idxr + q);
             }
             builder.assert_zero(phq.clone() * (recompose - sel));
         }
-        // Path direction bit: DBIT = pathish * idx bit selected by dparam.
-        let pathish = cv(RSEL + R_PATH as usize)
-            + (R_PLAST_T..=R_PLAST_F3).map(|r| cv(RSEL + r as usize)).fold(AB::Expr::ZERO, |a, e| a + e);
+        // Path direction bit: self.layout.dbit = pathish * idx bit selected by dparam.
+        let pathish = cv(self.layout.rsel + R_PATH as usize)
+            + (R_PLAST_T..=R_PLAST_F3).map(|r| cv(self.layout.rsel + r as usize)).fold(AB::Expr::ZERO, |a, e| a + e);
         {
-            // DMUX = sum_k DLO[k&7]*DHI[k>>3]*IDXB[k] (deg 3); DBIT = pathish*DMUX.
+            // self.layout.dmux = sum_k self.layout.dlo[k&7]*self.layout.dhi[k>>3]*self.layout.idxb[k] (deg 3); self.layout.dbit = pathish*self.layout.dmux.
             let mut mux = AB::Expr::ZERO;
             for k in 0..19 {
-                mux = mux + cv(DLO + (k & 7)) * cv(DHI + (k >> 3)) * cv(IDXB + k);
+                mux = mux + cv(self.layout.dlo + (k & 7)) * cv(self.layout.dhi + (k >> 3)) * cv(self.layout.idxb + k);
             }
-            builder.assert_eq(cv(DMUX), mux);
-            builder.assert_eq(cv(DBIT), pathish.clone() * cv(DMUX));
+            builder.assert_eq(cv(self.layout.dmux), mux);
+            builder.assert_eq(cv(self.layout.dbit), pathish.clone() * cv(self.layout.dmux));
         }
-        builder.assert_eq(cv(GLC), pathish.clone() * (AB::Expr::ONE - cv(DBIT)));
-        builder.assert_eq(cv(GRC), pathish.clone() * cv(DBIT));
+        builder.assert_eq(cv(self.layout.glc), pathish.clone() * (AB::Expr::ONE - cv(self.layout.dbit)));
+        builder.assert_eq(cv(self.layout.grc), pathish.clone() * cv(self.layout.dbit));
         // Cap-element selectors from idx bits 19..21.
         for j in 0..8 {
-            let e = lit(IDXB + 19, j & 1 == 1)
-                * lit(IDXB + 20, j & 2 == 2)
-                * lit(IDXB + 21, j & 4 == 4);
-            builder.assert_eq(cv(CAPS8 + j), e);
+            let e = lit(self.layout.idxb + 19, j & 1 == 1)
+                * lit(self.layout.idxb + 20, j & 2 == 2)
+                * lit(self.layout.idxb + 21, j & 4 == 4);
+            builder.assert_eq(cv(self.layout.caps8 + j), e);
         }
 
         // =====================================================================
@@ -1643,10 +1668,10 @@ where
         // =====================================================================
         // First blocks: untouched rate + capacity limbs are zero.
         for i in 68..100 {
-            builder.assert_zero(cv(RSEL + R_ABS_F34 as usize) * cv(pcol(i)));
+            builder.assert_zero(cv(self.layout.rsel + R_ABS_F34 as usize) * cv(pcol(i)));
         }
         for i in 32..100 {
-            builder.assert_zero(cv(RSEL + R_ABS_F16 as usize) * cv(pcol(i)));
+            builder.assert_zero(cv(self.layout.rsel + R_ABS_F16 as usize) * cv(pcol(i)));
         }
         // Compression preimages: lanes 8..25 zero.
         for i in 32..100 {
@@ -1657,7 +1682,7 @@ where
             // Continuation carries (consumer-role keyed, producer's last row).
             for i in 68..100 {
                 t.assert_zero(
-                    sf(23) * nv(RSEL + R_ABS_C34 as usize) * (nv(pcol(i)) - cv(ocol(i))),
+                    sf(23) * nv(self.layout.rsel + R_ABS_C34 as usize) * (nv(pcol(i)) - cv(ocol(i))),
                 );
             }
             // C5 (trace last block): 5 fresh u32 words = limbs 0..10. The
@@ -1667,21 +1692,21 @@ where
             // the producer's output. Pin the pad half to zero (else a prover
             // could smuggle a word there) and carry from limb 12.
             for i in 10..12 {
-                t.assert_zero(sf(23) * nv(RSEL + R_ABS_C5 as usize) * nv(pcol(i)));
+                t.assert_zero(sf(23) * nv(self.layout.rsel + R_ABS_C5 as usize) * nv(pcol(i)));
             }
             for i in 12..100 {
-                t.assert_zero(sf(23) * nv(RSEL + R_ABS_C5 as usize) * (nv(pcol(i)) - cv(ocol(i))));
+                t.assert_zero(sf(23) * nv(self.layout.rsel + R_ABS_C5 as usize) * (nv(pcol(i)) - cv(ocol(i))));
             }
             for i in 60..100 {
                 t.assert_zero(
-                    sf(23) * nv(RSEL + R_ABS_C30 as usize) * (nv(pcol(i)) - cv(ocol(i))),
+                    sf(23) * nv(self.layout.rsel + R_ABS_C30 as usize) * (nv(pcol(i)) - cv(ocol(i))),
                 );
             }
             // Path chaining: the chained child mux (left when the consumed
             // index bit is 0, right when 1); sibling half is free witness.
             for m in 0..16 {
-                t.assert_zero(sf(23) * nv(GLC) * (nv(pcol(m)) - cv(ocol(m))));
-                t.assert_zero(sf(23) * nv(GRC) * (nv(pcol(16 + m)) - cv(ocol(m))));
+                t.assert_zero(sf(23) * nv(self.layout.glc) * (nv(pcol(m)) - cv(ocol(m))));
+                t.assert_zero(sf(23) * nv(self.layout.grc) * (nv(pcol(16 + m)) - cv(ocol(m))));
             }
         }
         // Cap comparison at the last path level of each batch.
@@ -1691,206 +1716,206 @@ where
         {
             for m in 0..16 {
                 let mut mux = AB::Expr::ZERO;
-                for j in 0..CAP_LEN {
-                    mux = mux + cv(CAPS8 + j) * pv(cap_limb_opv(bi, j, m));
+                for j in 0..self.shape.cap_len {
+                    mux = mux + cv(self.layout.caps8 + j) * pv(cap_limb_opv(bi, j, m));
                 }
-                builder.assert_zero(sf(23) * cv(RSEL + *role as usize) * (cv(ocol(m)) - mux));
+                builder.assert_zero(sf(23) * cv(self.layout.rsel + *role as usize) * (cv(ocol(m)) - mux));
             }
         }
         // =====================================================================
         // Shape selectors: fully determined by the flush automaton (no
         // prover choice = no ghost perms in the challenger phase).
         // =====================================================================
-        let ringsel = |f: usize| cv(ring_at(FRING, 8, f));
-        let bidxsel = |b: usize| cv(BIDX + b);
-        let chal_live = cv(CHLIVE);
+        let ringsel = |f: usize| cv(ring_at(self.layout.fring, 8, f));
+        let bidxsel = |b: usize| cv(self.layout.bidx + b);
+        let chal_live = cv(self.layout.chlive);
         {
             let shapes = shape_list();
             for (si, sh) in shapes.iter().enumerate() {
                 let e = match sh {
                     Shape::Obs { flush: 2, block: 0 } => ringsel(2) * bidxsel(0),
                     Shape::F2Mid => {
-                        // F2SEL = ringsel(2) * (1 - bidxsel(0)); keeps deg <= 3.
-                        cv(F2SEL) * (AB::Expr::ONE - cv(BLKLAST))
+                        // self.layout.f2sel = ringsel(2) * (1 - bidxsel(0)); keeps deg <= 3.
+                        cv(self.layout.f2sel) * (AB::Expr::ONE - cv(self.layout.blklast))
                     }
                     Shape::Obs { flush: 2, .. } => {
                         // F2 last block.
-                        cv(F2SEL) * cv(BLKLAST)
+                        cv(self.layout.f2sel) * cv(self.layout.blklast)
                     }
                     Shape::Obs { flush, block } => ringsel(*flush) * bidxsel(*block),
-                    Shape::Refill => continue, // REFSEL is its own column
+                    Shape::Refill => continue, // self.layout.refsel is its own column
                 };
-                builder.assert_eq(cv(SHSEL + shsel_index_of(si)), chal_live.clone() * e);
+                builder.assert_eq(cv(self.layout.shsel + shsel_index_of(si)), chal_live.clone() * e);
             }
         }
-        builder.assert_bool(cv(REFSEL));
-        builder.assert_zero(cv(REFSEL) * (AB::Expr::ONE - phc.clone()));
+        builder.assert_bool(cv(self.layout.refsel));
+        builder.assert_zero(cv(self.layout.refsel) * (AB::Expr::ONE - phc.clone()));
 
         // Flush-automaton comparators.
-        builder.assert_bool(cv(BLKLAST));
-        builder.assert_zero((cv(BLKCNT) - AB::Expr::ONE) * cv(BLKLAST));
+        builder.assert_bool(cv(self.layout.blklast));
+        builder.assert_zero((cv(self.layout.blkcnt) - AB::Expr::ONE) * cv(self.layout.blklast));
         builder.assert_eq(
-            cv(BLKLAST) + (cv(BLKCNT) - AB::Expr::ONE) * cv(BLKINV),
+            cv(self.layout.blklast) + (cv(self.layout.blkcnt) - AB::Expr::ONE) * cv(self.layout.blkinv),
             AB::Expr::ONE,
         );
-        for (cmp, cinv, tgt) in [(CMPA, CMPAI, 76u32), (CMPB, CMPBI, 3), (CMPC, CMPCI, 148)] {
+        for (cmp, cinv, tgt) in [(self.layout.cmpa, self.layout.cmpai, 76u32), (self.layout.cmpb, self.layout.cmpbi, 3), (self.layout.cmpc, self.layout.cmpci, 148)] {
             builder.assert_bool(cv(cmp));
-            builder.assert_zero((cv(BLKCNT) - c(tgt)) * cv(cmp));
-            builder.assert_eq(cv(cmp) + (cv(BLKCNT) - c(tgt)) * cv(cinv), AB::Expr::ONE);
+            builder.assert_zero((cv(self.layout.blkcnt) - c(tgt)) * cv(cmp));
+            builder.assert_eq(cv(cmp) + (cv(self.layout.blkcnt) - c(tgt)) * cv(cinv), AB::Expr::ONE);
         }
-        // NEEDL = BLKLAST * (required group reached for the next obs flush).
+        // self.layout.needl = self.layout.blklast * (required group reached for the next obs flush).
         {
             let mut need = AB::Expr::ZERO;
             for f in 0..8 {
-                need = need + ringsel(f) * cv(ring_at(GRP, N_GROUPS, GROUPREQ[f + 1]));
+                need = need + ringsel(f) * cv(ring_at(self.layout.grp, N_GROUPS, GROUPREQ[f + 1]));
             }
-            builder.assert_eq(cv(NEEDL), cv(BLKLAST) * need);
+            builder.assert_eq(cv(self.layout.needl), cv(self.layout.blklast) * need);
         }
 
         // First-row pins for the challenger phase.
-        builder.when_first_row().assert_one(cv(FRING));
+        builder.when_first_row().assert_one(cv(self.layout.fring));
         for i in 1..8 {
-            builder.when_first_row().assert_zero(cv(FRING + i));
+            builder.when_first_row().assert_zero(cv(self.layout.fring + i));
         }
         builder
             .when_first_row()
-            .assert_eq(cv(BLKCNT), c(FLUSH_BLOCKS[0] as u32));
-        builder.when_first_row().assert_one(cv(BIDX));
+            .assert_eq(cv(self.layout.blkcnt), c(FLUSH_BLOCKS[0] as u32));
+        builder.when_first_row().assert_one(cv(self.layout.bidx));
         for i in 1..6 {
-            builder.when_first_row().assert_zero(cv(BIDX + i));
+            builder.when_first_row().assert_zero(cv(self.layout.bidx + i));
         }
-        builder.when_first_row().assert_zero(cv(REFSEL));
-        builder.when_first_row().assert_one(cv(GRP));
+        builder.when_first_row().assert_zero(cv(self.layout.refsel));
+        builder.when_first_row().assert_one(cv(self.layout.grp));
         for i in 1..N_GROUPS {
-            builder.when_first_row().assert_zero(cv(GRP + i));
+            builder.when_first_row().assert_zero(cv(self.layout.grp + i));
         }
-        builder.when_first_row().assert_one(cv(COEF));
+        builder.when_first_row().assert_one(cv(self.layout.coef));
         for i in 1..4 {
-            builder.when_first_row().assert_zero(cv(COEF + i));
+            builder.when_first_row().assert_zero(cv(self.layout.coef + i));
         }
-        builder.when_first_row().assert_zero(cv(PHD));
-        builder.when_first_row().assert_one(cv(POS));
-        builder.when_first_row().assert_zero(cv(POS + 1));
-        builder.when_first_row().assert_one(cv(VC));
+        builder.when_first_row().assert_zero(cv(self.layout.phd));
+        builder.when_first_row().assert_one(cv(self.layout.pos));
+        builder.when_first_row().assert_zero(cv(self.layout.pos + 1));
+        builder.when_first_row().assert_one(cv(self.layout.vc));
         for i in 1..16 {
-            builder.when_first_row().assert_zero(cv(VC + i));
+            builder.when_first_row().assert_zero(cv(self.layout.vc + i));
         }
         for k in 0..4 {
-            builder.when_first_row().assert_zero(cv(PREG + k) - if k == 0 { AB::Expr::ONE } else { AB::Expr::ZERO });
-            builder.when_first_row().assert_zero(cv(PZACC + k));
+            builder.when_first_row().assert_zero(cv(self.layout.preg + k) - if k == 0 { AB::Expr::ONE } else { AB::Expr::ZERO });
+            builder.when_first_row().assert_zero(cv(self.layout.pzacc + k));
         }
 
         // =====================================================================
         // Boundary rules (perm transitions in the challenger/dup phases)
         // =====================================================================
         let consumersel = {
-            let mut e = cv(REFSEL);
+            let mut e = cv(self.layout.refsel);
             for f in 1..8 {
-                e = e + cv(SHSEL + shsel_index(f, 0));
+                e = e + cv(self.layout.shsel + shsel_index(f, 0));
             }
             e
         };
         let b0next = {
             let mut e = AB::Expr::ZERO;
             for f in 1..8 {
-                e = e + nv(SHSEL + shsel_index(f, 0));
+                e = e + nv(self.layout.shsel + shsel_index(f, 0));
             }
             e
         };
         let xorsel = {
             // Obs interior blocks except flush 2, plus dup interior blocks.
-            let mut e = cv(PHD) * (AB::Expr::ONE - cv(CMPC));
+            let mut e = cv(self.layout.phd) * (AB::Expr::ONE - cv(self.layout.cmpc));
             for f in 0..8 {
                 if f == 2 {
                     continue;
                 }
                 for b in 1..FLUSH_BLOCKS[f] {
-                    e = e + cv(SHSEL + shsel_index(f, b));
+                    e = e + cv(self.layout.shsel + shsel_index(f, b));
                 }
             }
             e
         };
-        // xorsel_next = nv(XSEL) (materialized current-row xorsel; deg 1).
-        let xorsel_next = nv(XSEL);
-        let phasegate = cv(PHG);
-        let phdend = cv(PHDEND);
-        let endgate = cv(ENDG);
+        // xorsel_next = nv(self.layout.xsel) (materialized current-row xorsel; deg 1).
+        let xorsel_next = nv(self.layout.xsel);
+        let phasegate = cv(self.layout.phg);
+        let phdend = cv(self.layout.phdend);
+        let endgate = cv(self.layout.endg);
         {
             let mut t = builder.when_transition();
             // Obs flush start: only the ring successor, only when the
             // required draw group has completed.
             for f in 1..8 {
-                let sel = nv(SHSEL + shsel_index(f, 0));
+                let sel = nv(self.layout.shsel + shsel_index(f, 0));
                 t.assert_zero(sf(23) * sel.clone() * (AB::Expr::ONE - ringsel(f - 1)));
-                t.assert_zero(sf(23) * sel * (cv(BLKLAST) - cv(NEEDL)));
+                t.assert_zero(sf(23) * sel * (cv(self.layout.blklast) - cv(self.layout.needl)));
             }
-            // Mid-flush: no new flush, no refill. (CONT = sf(23)*phc*(1-BLKLAST).)
-            t.assert_zero(cv(CONT) * (b0next.clone() + nv(REFSEL)));
+            // Mid-flush: no new flush, no refill. (self.layout.cont = sf(23)*phc*(1-self.layout.blklast).)
+            t.assert_zero(cv(self.layout.cont) * (b0next.clone() + nv(self.layout.refsel)));
             // Refill: only when the required group is incomplete, and only
             // after a consumer that used its full window.
-            t.assert_zero(sf(23) * nv(REFSEL) * cv(NEEDL));
-            // CFULL = sf(23) * consumersel * (1 - FSFULL); keeps deg <= 3.
-            t.assert_zero(nv(REFSEL) * cv(CFULL));
-            // FRING rotation at obs starts.
+            t.assert_zero(sf(23) * nv(self.layout.refsel) * cv(self.layout.needl));
+            // self.layout.cfull = sf(23) * consumersel * (1 - self.layout.fsfull); keeps deg <= 3.
+            t.assert_zero(nv(self.layout.refsel) * cv(self.layout.cfull));
+            // self.layout.fring rotation at obs starts.
             let g = sf(23) * b0next.clone();
             for i in 0..8 {
                 t.assert_eq(
-                    nv(FRING + i),
-                    cv(FRING + i) + g.clone() * (cv(FRING + (i + 1) % 8) - cv(FRING + i)),
+                    nv(self.layout.fring + i),
+                    cv(self.layout.fring + i) + g.clone() * (cv(self.layout.fring + (i + 1) % 8) - cv(self.layout.fring + i)),
                 );
             }
-            // BIDX: reset on new flush/refill, saturating rotate on
+            // self.layout.bidx: reset on new flush/refill, saturating rotate on
             // continuation, hold otherwise (query/dup phases).
-            let newf = sf(23) * (b0next.clone() + nv(REFSEL));
-            let cont = cv(CONT);
+            let newf = sf(23) * (b0next.clone() + nv(self.layout.refsel));
+            let cont = cv(self.layout.cont);
             for i in 0..6 {
                 let rot = match i {
                     0 => AB::Expr::ZERO,
-                    5 => cv(BIDX + 4) + cv(BIDX + 5),
-                    _ => cv(BIDX + i - 1),
+                    5 => cv(self.layout.bidx + 4) + cv(self.layout.bidx + 5),
+                    _ => cv(self.layout.bidx + i - 1),
                 };
                 t.assert_eq(
-                    nv(BIDX + i),
-                    cv(BIDX + i)
+                    nv(self.layout.bidx + i),
+                    cv(self.layout.bidx + i)
                         + newf.clone()
-                            * (if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO } - cv(BIDX + i))
-                        + cont.clone() * (rot - cv(BIDX + i)),
+                            * (if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO } - cv(self.layout.bidx + i))
+                        + cont.clone() * (rot - cv(self.layout.bidx + i)),
                 );
             }
-            // BLKCNT: reload at obs starts, 1 at refills, decrement on
+            // self.layout.blkcnt: reload at obs starts, 1 at refills, decrement on
             // continuation (chal) and during the dup chain, 148 at dup entry.
             let mut reload = AB::Expr::ZERO;
             for f in 1..8 {
                 reload = reload
-                    + nv(SHSEL + shsel_index(f, 0)) * (c(FLUSH_BLOCKS[f] as u32) - cv(BLKCNT));
+                    + nv(self.layout.shsel + shsel_index(f, 0)) * (c(FLUSH_BLOCKS[f] as u32) - cv(self.layout.blkcnt));
             }
-            let dupdec = sf(23) * cv(PHD) * (AB::Expr::ONE - cv(BLKLAST));
+            let dupdec = sf(23) * cv(self.layout.phd) * (AB::Expr::ONE - cv(self.layout.blklast));
             t.assert_eq(
-                nv(BLKCNT),
-                cv(BLKCNT)
+                nv(self.layout.blkcnt),
+                cv(self.layout.blkcnt)
                     + sf(23) * reload
-                    + sf(23) * nv(REFSEL) * (AB::Expr::ONE - cv(BLKCNT))
+                    + sf(23) * nv(self.layout.refsel) * (AB::Expr::ONE - cv(self.layout.blkcnt))
                     + cont.clone() * (-AB::Expr::ONE)
                     + dupdec * (-AB::Expr::ONE)
-                    + phasegate.clone() * (c(148) - cv(BLKCNT)),
+                    + phasegate.clone() * (c(148) - cv(self.layout.blkcnt)),
             );
             // Phase evolution.
-            t.assert_eq(nv(PHC), phc.clone() - phasegate.clone());
-            t.assert_eq(nv(PHD), cv(PHD) + phasegate.clone() - phdend.clone());
-            t.assert_eq(nv(PHQ), phq.clone() + phdend.clone() - endgate.clone());
+            t.assert_eq(nv(self.layout.phc), phc.clone() - phasegate.clone());
+            t.assert_eq(nv(self.layout.phd), cv(self.layout.phd) + phasegate.clone() - phdend.clone());
+            t.assert_eq(nv(self.layout.phq), phq.clone() + phdend.clone() - endgate.clone());
             // Chain gate: a consumer perm's first 16 preimage limbs are the
             // previous perm's digest.
             let chainsel_next = {
-                let mut e = nv(REFSEL);
+                let mut e = nv(self.layout.refsel);
                 for f in 1..8 {
-                    e = e + nv(SHSEL + shsel_index(f, 0));
+                    e = e + nv(self.layout.shsel + shsel_index(f, 0));
                 }
                 e
             };
             for m in 0..16 {
                 t.assert_zero(sf(23) * chainsel_next.clone() * (nv(pcol(m)) - cv(ocol(m))));
             }
-            // XOR blocks: capacity carries + OREG capture of the previous
+            // XOR blocks: capacity carries + self.layout.oreg capture of the previous
             // output's rate limbs.
             for i in 68..100 {
                 t.assert_zero(sf(23) * xorsel_next.clone() * (nv(pcol(i)) - cv(ocol(i))));
@@ -1898,45 +1923,45 @@ where
             for i in 0..68 {
                 let g = sf(23) * xorsel_next.clone();
                 t.assert_eq(
-                    nv(OREG + i),
-                    cv(OREG + i) + g * (cv(ocol(i)) - cv(OREG + i)),
+                    nv(self.layout.oreg + i),
+                    cv(self.layout.oreg + i) + g * (cv(ocol(i)) - cv(self.layout.oreg + i)),
                 );
             }
             // F2 digest capture at flush 2's last block.
-            let f2last = sf(23) * cv(SHSEL + shsel_index(2, FLUSH_BLOCKS[2] - 1));
+            let f2last = sf(23) * cv(self.layout.shsel + shsel_index(2, FLUSH_BLOCKS[2] - 1));
             for m in 0..16 {
                 t.assert_eq(
-                    nv(F2DIG + m),
-                    cv(F2DIG + m) + f2last.clone() * (cv(ocol(m)) - cv(F2DIG + m)),
+                    nv(self.layout.f2dig + m),
+                    cv(self.layout.f2dig + m) + f2last.clone() * (cv(ocol(m)) - cv(self.layout.f2dig + m)),
                 );
             }
             // Dup-chain digest binding at the duplicate's last block.
             for m in 0..16 {
-                t.assert_zero(phdend.clone() * (cv(ocol(m)) - cv(F2DIG + m)));
+                t.assert_zero(phdend.clone() * (cv(ocol(m)) - cv(self.layout.f2dig + m)));
             }
         }
         // Dup first block: fresh keccak-256 state (capacity zero); B0 obs
         // blocks likewise.
         for i in 68..100 {
-            builder.assert_zero(cv(PHD) * cv(CMPC) * cv(pcol(i)));
-            let mut b0 = cv(SHSEL); // F0B0
+            builder.assert_zero(cv(self.layout.phd) * cv(self.layout.cmpc) * cv(pcol(i)));
+            let mut b0 = cv(self.layout.shsel); // F0B0
             for f in 1..8 {
-                b0 = b0 + cv(SHSEL + shsel_index(f, 0));
+                b0 = b0 + cv(self.layout.shsel + shsel_index(f, 0));
             }
-            builder.assert_zero((b0 + cv(REFSEL)) * cv(pcol(i)));
+            builder.assert_zero((b0 + cv(self.layout.refsel)) * cv(pcol(i)));
         }
         // =====================================================================
         // FS draw gadget (inc-4): byte-packing + rejection comparator, bound
         // to the sponge digest via limb consistency. Mirrors the proven inc-3
-        // gadget in m4route.rs; active on every FS row (FSGATE = 1), which the
+        // gadget in m4route.rs; active on every FS row (self.layout.fsgate = 1), which the
         // witness places on the first 2*ndraws rows of a draw-hosting perm.
         // Draw j occupies row offsets 2j (even) and 2j+1 (odd); it reads
         // digest limbs 2g and 2g+1 for g = 7 - j (pop-from-end byte order).
         // =====================================================================
         {
-            let fs = cv(FSGATE);
+            let fs = cv(self.layout.fsgate);
             builder.assert_bool(fs.clone());
-            let bit = |i: usize| -> AB::Expr { cv(FSBITS + i) };
+            let bit = |i: usize| -> AB::Expr { cv(self.layout.fsbits + i) };
             for i in 0..16 {
                 builder.assert_bool(bit(i));
             }
@@ -1970,140 +1995,140 @@ where
                 even_mux = even_mux + sf(2 * j);
                 odd_mux = odd_mux + sf(2 * j + 1);
             }
-            // FSODD materialization (fs * odd row) and the even-row ACC load:
-            // the odd row's FSACC = the draw's low 16 bits, computed on the
+            // self.layout.fsodd materialization (fs * odd row) and the even-row ACC load:
+            // the odd row's self.layout.fsacc = the draw's low 16 bits, computed on the
             // even row as b_lo + 2^8 * b_hi (even-row bytes = x3, x2).
-            builder.assert_eq(cv(FSODD), fs.clone() * odd_mux.clone());
+            builder.assert_eq(cv(self.layout.fsodd), fs.clone() * odd_mux.clone());
             builder.assert_zero(
                 fs.clone()
                     * even_mux
-                    * (nv(FSACC) - (b_lo.clone() + c(1 << 8) * b_hi.clone())),
+                    * (nv(self.layout.fsacc) - (b_lo.clone() + c(1 << 8) * b_hi.clone())),
             );
             // Rejection comparator (materialized bit products, deg <= 3):
             // reject iff bits 24..30 all one AND low-24 bits nonzero.
-            builder.assert_eq(cv(FSP3A), bit(8) * bit(9) * bit(10));
-            builder.assert_eq(cv(FSP3B), bit(11) * bit(12) * bit(13));
-            builder.assert_eq(cv(FST7), cv(FSP3A) * cv(FSP3B) * bit(14));
-            let low24 = cv(FSACC) + c(1 << 16) * b_lo.clone();
-            builder.assert_eq(cv(FSNZ), low24.clone() * cv(FSINV));
-            builder.assert_bool(cv(FSNZ));
-            builder.assert_zero((AB::Expr::ONE - cv(FSNZ)) * low24);
-            builder.assert_zero(fs.clone() * (cv(FSACCEPT) - (AB::Expr::ONE - cv(FST7) * cv(FSNZ))));
+            builder.assert_eq(cv(self.layout.fsp3a), bit(8) * bit(9) * bit(10));
+            builder.assert_eq(cv(self.layout.fsp3b), bit(11) * bit(12) * bit(13));
+            builder.assert_eq(cv(self.layout.fst7), cv(self.layout.fsp3a) * cv(self.layout.fsp3b) * bit(14));
+            let low24 = cv(self.layout.fsacc) + c(1 << 16) * b_lo.clone();
+            builder.assert_eq(cv(self.layout.fsnz), low24.clone() * cv(self.layout.fsinv));
+            builder.assert_bool(cv(self.layout.fsnz));
+            builder.assert_zero((AB::Expr::ONE - cv(self.layout.fsnz)) * low24);
+            builder.assert_zero(fs.clone() * (cv(self.layout.fsaccept) - (AB::Expr::ONE - cv(self.layout.fst7) * cv(self.layout.fsnz))));
 
             // =================================================================
             // Ext-challenge assembly (inc-4): accepted field draws feed the
-            // COEF ring / CURCH limbs; every 4th accepted draw assembles
-            // CHAL[grp] and advances the GRP ring. PoW/query-index (bits) draws
+            // self.layout.coef ring / self.layout.curch limbs; every 4th accepted draw assembles
+            // self.layout.chal[grp] and advances the self.layout.grp ring. PoW/query-index (bits) draws
             // run the same byte gadget but sit at grp >= G_POW; the field_grp
             // gate keeps them out of the field assembly, and sample_bits (below)
             // handles the query-index binding.
             // =================================================================
-            let masked = cv(FSACC) + c(1 << 16) * b_lo + c(1 << 24) * b_hi_masked;
+            let masked = cv(self.layout.fsacc) + c(1 << 16) * b_lo + c(1 << 24) * b_hi_masked;
             // A field-challenge group (0..6) is the ring head. Query-index and
             // PoW (bits) draws sit at grp >= G_POW and must NOT drive the
             // challenge assembly even though they run the same byte gadget.
             let field_grp = (0..N_CHALS)
-                .map(|g| cv(ring_at(GRP, N_GROUPS, g)))
+                .map(|g| cv(ring_at(self.layout.grp, N_GROUPS, g)))
                 .fold(AB::Expr::ZERO, |a, e| a + e);
-            // CROT = accept, on an odd FS row whose active group is a field
-            // challenge. (bits draws set CROT = 0.)
-            builder.assert_bool(cv(CROT));
-            builder.assert_bool(cv(GROT));
-            builder.assert_eq(cv(CROT), field_grp * cv(FSODD) * cv(FSACCEPT));
+            // self.layout.crot = accept, on an odd FS row whose active group is a field
+            // challenge. (bits draws set self.layout.crot = 0.)
+            builder.assert_bool(cv(self.layout.crot));
+            builder.assert_bool(cv(self.layout.grot));
+            builder.assert_eq(cv(self.layout.crot), field_grp * cv(self.layout.fsodd) * cv(self.layout.fsaccept));
             // A bits group (PoW or a query index): each is a single draw that
             // completes on its odd row.
             let bits_grp = {
-                let mut e = cv(ring_at(GRP, N_GROUPS, G_POW));
-                for q in 0..NQ {
-                    e = e + cv(ring_at(GRP, N_GROUPS, G_IDX0 + q));
+                let mut e = cv(ring_at(self.layout.grp, N_GROUPS, G_POW));
+                for q in 0..self.shape.nq {
+                    e = e + cv(ring_at(self.layout.grp, N_GROUPS, G_IDX0 + q));
                 }
                 e
             };
-            // GROT (advance the group ring): a field challenge's 4th accepted
-            // limb (CROT & coef==3), OR any bits draw's odd row. This fully
-            // pins GROT, which now drives the GRP-ring rotation below.
-            let coef3 = cv(ring_at(COEF, 4, 3));
-            builder.assert_eq(cv(GROT), cv(CROT) * coef3 + cv(FSODD) * bits_grp.clone());
-            // PoW draw (grp = G_POW): the low GRIND_BITS of the sampled value
-            // must be zero (the grind check). value = FSACC (bits 0..16) +
-            // FSBITS[0..GRIND_BITS-16] << 16.
+            // self.layout.grot (advance the group ring): a field challenge's 4th accepted
+            // limb (self.layout.crot & coef==3), OR any bits draw's odd row. This fully
+            // pins self.layout.grot, which now drives the self.layout.grp-ring rotation below.
+            let coef3 = cv(ring_at(self.layout.coef, 4, 3));
+            builder.assert_eq(cv(self.layout.grot), cv(self.layout.crot) * coef3 + cv(self.layout.fsodd) * bits_grp.clone());
+            // PoW draw (grp = G_POW): the low self.shape.grind_bits of the sampled value
+            // must be zero (the grind check). value = self.layout.fsacc (bits 0..16) +
+            // self.layout.fsbits[0..self.shape.grind_bits-16] << 16.
             {
-                let pow_gate = cv(FSODD) * cv(ring_at(GRP, N_GROUPS, G_POW));
-                let mut pow_val = cv(FSACC);
-                for i in 0..(GRIND_BITS - 16) {
-                    pow_val = pow_val + cv(FSBITS + i) * c(1 << (16 + i));
+                let pow_gate = cv(self.layout.fsodd) * cv(ring_at(self.layout.grp, N_GROUPS, G_POW));
+                let mut pow_val = cv(self.layout.fsacc);
+                for i in 0..(self.shape.grind_bits - 16) {
+                    pow_val = pow_val + cv(self.layout.fsbits + i) * c(1 << (16 + i));
                 }
                 builder.assert_zero(pow_gate * pow_val);
             }
             // First-row pins: no challenge assembled yet.
             for k in 0..4 {
-                builder.when_first_row().assert_zero(cv(CURCH + k));
+                builder.when_first_row().assert_zero(cv(self.layout.curch + k));
             }
             for k in 0..4 * N_CHALS {
-                builder.when_first_row().assert_zero(cv(CHAL + k));
+                builder.when_first_row().assert_zero(cv(self.layout.chal + k));
             }
-            for q in 0..NQ {
-                builder.when_first_row().assert_zero(cv(IDXR + q));
+            for q in 0..self.shape.nq {
+                builder.when_first_row().assert_zero(cv(self.layout.idxr + q));
             }
-            // sample_bits (query indices): value = low LOG_MAX (=22) bits of
-            // the draw = FSACC (bits 0..16) + FSBITS[0..6] << 16. No rejection.
-            // The draw sits at grp = G_IDX0 + q; bind IDXR[q] on its odd row.
+            // sample_bits (query indices): value = low self.shape.log_max (=22) bits of
+            // the draw = self.layout.fsacc (bits 0..16) + self.layout.fsbits[0..6] << 16. No rejection.
+            // The draw sits at grp = G_IDX0 + q; bind self.layout.idxr[q] on its odd row.
             let idx_val = {
-                let mut e = cv(FSACC);
-                for i in 0..(LOG_MAX - 16) {
-                    e = e + cv(FSBITS + i) * c(1 << (16 + i));
+                let mut e = cv(self.layout.fsacc);
+                for i in 0..(self.shape.log_max - 16) {
+                    e = e + cv(self.layout.fsbits + i) * c(1 << (16 + i));
                 }
                 e
             };
             {
                 let mut t = builder.when_transition();
-                // GRP ring: left-rotate (advance the logical group) on GROT.
+                // self.layout.grp ring: left-rotate (advance the logical group) on self.layout.grot.
                 // This binds the draw-group schedule to the FS gadget, giving
                 // the GROUPREQ flush-start gate (Stage A) real teeth.
                 for i in 0..N_GROUPS {
                     t.assert_eq(
-                        nv(GRP + i),
-                        cv(GRP + i)
-                            + cv(GROT) * (cv(GRP + (i + 1) % N_GROUPS) - cv(GRP + i)),
+                        nv(self.layout.grp + i),
+                        cv(self.layout.grp + i)
+                            + cv(self.layout.grot) * (cv(self.layout.grp + (i + 1) % N_GROUPS) - cv(self.layout.grp + i)),
                     );
                 }
-                // COEF ring: left-rotate (increment logical coef) on CROT.
+                // self.layout.coef ring: left-rotate (increment logical coef) on self.layout.crot.
                 for i in 0..4 {
                     t.assert_eq(
-                        nv(COEF + i),
-                        cv(COEF + i) + cv(CROT) * (cv(COEF + (i + 1) % 4) - cv(COEF + i)),
+                        nv(self.layout.coef + i),
+                        cv(self.layout.coef + i) + cv(self.layout.crot) * (cv(self.layout.coef + (i + 1) % 4) - cv(self.layout.coef + i)),
                     );
                 }
-                // CURCH: an accepted draw at coef c<3 loads CURCH[c] = masked;
-                // slot 3 is never loaded (the 4th limb goes straight to CHAL).
+                // self.layout.curch: an accepted draw at coef c<3 loads self.layout.curch[c] = masked;
+                // slot 3 is never loaded (the 4th limb goes straight to self.layout.chal).
                 for cc in 0..3 {
-                    let gate = cv(CROT) * cv(ring_at(COEF, 4, cc));
+                    let gate = cv(self.layout.crot) * cv(ring_at(self.layout.coef, 4, cc));
                     t.assert_eq(
-                        nv(CURCH + cc),
-                        cv(CURCH + cc) + gate * (masked.clone() - cv(CURCH + cc)),
+                        nv(self.layout.curch + cc),
+                        cv(self.layout.curch + cc) + gate * (masked.clone() - cv(self.layout.curch + cc)),
                     );
                 }
-                t.assert_eq(nv(CURCH + 3), cv(CURCH + 3));
-                // CHAL[grp] assembly on GROT: limbs (CURCH0..2, masked) into
-                // the GRP-ring-selected challenge register; carries otherwise.
+                t.assert_eq(nv(self.layout.curch + 3), cv(self.layout.curch + 3));
+                // self.layout.chal[grp] assembly on self.layout.grot: limbs (CURCH0..2, masked) into
+                // the self.layout.grp-ring-selected challenge register; carries otherwise.
                 for g in 0..N_CHALS {
-                    let gate = cv(GROT) * cv(ring_at(GRP, N_GROUPS, g));
+                    let gate = cv(self.layout.grot) * cv(ring_at(self.layout.grp, N_GROUPS, g));
                     for k in 0..4 {
-                        let asm = if k < 3 { cv(CURCH + k) } else { masked.clone() };
+                        let asm = if k < 3 { cv(self.layout.curch + k) } else { masked.clone() };
                         t.assert_eq(
-                            nv(CHAL + 4 * g + k),
-                            cv(CHAL + 4 * g + k) + gate.clone() * (asm - cv(CHAL + 4 * g + k)),
+                            nv(self.layout.chal + 4 * g + k),
+                            cv(self.layout.chal + 4 * g + k) + gate.clone() * (asm - cv(self.layout.chal + 4 * g + k)),
                         );
                     }
                 }
-                // IDXR[q] = idx_val on the odd row of query q's bits draw
+                // self.layout.idxr[q] = idx_val on the odd row of query q's bits draw
                 // (grp = G_IDX0 + q); carries otherwise. Ties every FRI query
                 // index to the FS-sampled digest bits — no free query choice.
-                for q in 0..NQ {
-                    let gate = cv(FSODD) * cv(ring_at(GRP, N_GROUPS, G_IDX0 + q));
+                for q in 0..self.shape.nq {
+                    let gate = cv(self.layout.fsodd) * cv(ring_at(self.layout.grp, N_GROUPS, G_IDX0 + q));
                     t.assert_eq(
-                        nv(IDXR + q),
-                        cv(IDXR + q) + gate * (idx_val.clone() - cv(IDXR + q)),
+                        nv(self.layout.idxr + q),
+                        cv(self.layout.idxr + q) + gate * (idx_val.clone() - cv(self.layout.idxr + q)),
                     );
                 }
             }
@@ -2112,18 +2137,18 @@ where
         // =====================================================================
         // Value-carry-row schedule (fold-pipeline foundation, inc-4): bind the
         // asm/PX value-carry selectors to the role/phase schedule + row ranges,
-        // then the POS half-position toggle and the CONSZ/CONSF completion
-        // flags. Everything derives from already-bound selectors (RSEL, DRND,
-        // SHSEL, PHD, CMPC, BLKLAST) + the keccak step-flag row one-hots. This
+        // then the self.layout.pos half-position toggle and the self.layout.consz/self.layout.consf completion
+        // flags. Everything derives from already-bound selectors (self.layout.rsel, self.layout.drnd,
+        // self.layout.shsel, self.layout.phd, self.layout.cmpc, self.layout.blklast) + the keccak step-flag row one-hots. This
         // is the bottom layer of the reduced-opening / fold machinery; the
-        // arithmetic layers (PZACC/SCR/BREG/RUNEV) build on these selectors.
+        // arithmetic layers (self.layout.pzacc/self.layout.scr/self.layout.breg/self.layout.runev) build on these selectors.
         // =====================================================================
         {
             let one = || AB::Expr::ONE;
             // Row-range indicators from the step-flag one-hots (sf(r) = cv(r)).
             let rle = |n: usize| (0..=n).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
             let rge = |a: usize, b: usize| (a..=b).map(&sf).fold(AB::Expr::ZERO, |x, e| x + e);
-            let rsel = |r: u32| cv(RSEL + r as usize);
+            let rsel = |r: u32| cv(self.layout.rsel + r as usize);
             // Per-role asm value ranges (word-0 / word-1 half positions).
             let role_range = |c5: usize| {
                 rsel(R_ABS_F34) * rle(16)
@@ -2135,92 +2160,92 @@ where
             let m0 = role_range(2);
             let m1 = role_range(1);
             // dparam split: fold leaves (D_F0..3) vs trace/quotient (D_T/D_Q).
-            let fold_dp = cv(DRND + 2) + cv(DRND + 3) + cv(DRND + 4) + cv(DRND + 5);
-            let nonfold_dp = cv(DRND) + cv(DRND + 1);
+            let fold_dp = cv(self.layout.drnd + 2) + cv(self.layout.drnd + 3) + cv(self.layout.drnd + 4) + cv(self.layout.drnd + 5);
+            let nonfold_dp = cv(self.layout.drnd) + cv(self.layout.drnd + 1);
             // Query-absorb carry selectors.
-            builder.assert_eq(cv(CF), fold_dp * m0.clone());
-            builder.assert_eq(cv(CX0), nonfold_dp.clone() * m0);
-            builder.assert_eq(cv(CX1), nonfold_dp * m1);
+            builder.assert_eq(cv(self.layout.cf), fold_dp * m0.clone());
+            builder.assert_eq(cv(self.layout.cx0), nonfold_dp.clone() * m0);
+            builder.assert_eq(cv(self.layout.cx1), nonfold_dp * m1);
             // F7 observation blocks (challenger phase): final-poly carry rows.
             builder.assert_eq(
-                cv(CZ7),
-                cv(SHSEL + shsel_index(7, 0)) * rge(4, 16)
-                    + cv(SHSEL + shsel_index(7, 1)) * rle(16)
-                    + cv(SHSEL + shsel_index(7, 2)) * rle(1),
+                cv(self.layout.cz7),
+                cv(self.layout.shsel + shsel_index(7, 0)) * rge(4, 16)
+                    + cv(self.layout.shsel + shsel_index(7, 1)) * rle(16)
+                    + cv(self.layout.shsel + shsel_index(7, 2)) * rle(1),
             );
             // Duplicate blocks (dup phase): zeta-value carry rows. First block
-            // (CMPC) rows 4..16, last block (BLKLAST) rows 0..4, middle 0..16.
+            // (self.layout.cmpc) rows 4..16, last block (self.layout.blklast) rows 0..4, middle 0..16.
             builder.assert_eq(
-                cv(CZD),
-                cv(PHD) * cv(CMPC) * rge(4, 16)
-                    + cv(PHD) * cv(BLKLAST) * rle(4)
-                    + cv(PHD) * (one() - cv(CMPC) - cv(BLKLAST)) * rle(16),
+                cv(self.layout.czd),
+                cv(self.layout.phd) * cv(self.layout.cmpc) * rge(4, 16)
+                    + cv(self.layout.phd) * cv(self.layout.blklast) * rle(4)
+                    + cv(self.layout.phd) * (one() - cv(self.layout.cmpc) - cv(self.layout.blklast)) * rle(16),
             );
-            for s in [CZD, CZ7, CF, CX0, CX1] {
+            for s in [self.layout.czd, self.layout.cz7, self.layout.cf, self.layout.cx0, self.layout.cx1] {
                 builder.assert_bool(cv(s));
             }
-            // POS: 2-slot half-position ring, toggles on every asm value-carry
-            // row (casm = CZD + CZ7 + CF); CX0/CX1 are PX rows and do not toggle.
-            let casm = cv(CZD) + cv(CZ7) + cv(CF);
-            builder.assert_bool(cv(POS));
-            builder.assert_bool(cv(POS + 1));
-            builder.assert_eq(cv(POS) + cv(POS + 1), one());
+            // self.layout.pos: 2-slot half-position ring, toggles on every asm value-carry
+            // row (casm = self.layout.czd + self.layout.cz7 + self.layout.cf); self.layout.cx0/self.layout.cx1 are PX rows and do not toggle.
+            let casm = cv(self.layout.czd) + cv(self.layout.cz7) + cv(self.layout.cf);
+            builder.assert_bool(cv(self.layout.pos));
+            builder.assert_bool(cv(self.layout.pos + 1));
+            builder.assert_eq(cv(self.layout.pos) + cv(self.layout.pos + 1), one());
             {
                 let mut t = builder.when_transition();
-                t.assert_eq(nv(POS), cv(POS) + casm.clone() * (cv(POS + 1) - cv(POS)));
-                t.assert_eq(nv(POS + 1), cv(POS + 1) + casm * (cv(POS) - cv(POS + 1)));
+                t.assert_eq(nv(self.layout.pos), cv(self.layout.pos) + casm.clone() * (cv(self.layout.pos + 1) - cv(self.layout.pos)));
+                t.assert_eq(nv(self.layout.pos + 1), cv(self.layout.pos + 1) + casm * (cv(self.layout.pos) - cv(self.layout.pos + 1)));
             }
             // Completion flags: value fully captured on the pos==1 (word-1) row.
-            builder.assert_eq(cv(CONSZ), cv(CZD) * cv(POS + 1));
-            builder.assert_eq(cv(CONSF), cv(CF) * cv(POS + 1));
+            builder.assert_eq(cv(self.layout.consz), cv(self.layout.czd) * cv(self.layout.pos + 1));
+            builder.assert_eq(cv(self.layout.consf), cv(self.layout.cf) * cv(self.layout.pos + 1));
 
-            // VC value-counter ring (16-slot one-hot): counts fold leaves
-            // within a round. Rotates +1 on CONSF (a completed fold-leaf
+            // self.layout.vc value-counter ring (16-slot one-hot): counts fold leaves
+            // within a round. Rotates +1 on self.layout.consf (a completed fold-leaf
             // value, now schedule-bound), resets to slot 0 at each leaf-start
-            // (LFS on the next perm). First row pinned to slot 0 above.
+            // (self.layout.lfs on the next perm). First row pinned to slot 0 above.
             for i in 0..16 {
-                builder.assert_bool(cv(VC + i));
+                builder.assert_bool(cv(self.layout.vc + i));
             }
             builder.assert_eq(
-                (0..16).map(|i| cv(VC + i)).fold(AB::Expr::ZERO, |a, e| a + e),
+                (0..16).map(|i| cv(self.layout.vc + i)).fold(AB::Expr::ZERO, |a, e| a + e),
                 one(),
             );
             builder.assert_eq(
-                cv(VCE),
-                (0..16).step_by(2).map(|i| cv(VC + i)).fold(AB::Expr::ZERO, |a, e| a + e),
+                cv(self.layout.vce),
+                (0..16).step_by(2).map(|i| cv(self.layout.vc + i)).fold(AB::Expr::ZERO, |a, e| a + e),
             );
             {
                 let mut t = builder.when_transition();
-                let reset = sf(23) * nv(LFS);
+                let reset = sf(23) * nv(self.layout.lfs);
                 for i in 0..16 {
                     let slot0 = if i == 0 { one() } else { AB::Expr::ZERO };
                     t.assert_eq(
-                        nv(VC + i),
-                        cv(VC + i)
-                            + cv(CONSF) * (cv(VC + (i + 15) % 16) - cv(VC + i))
-                            + reset.clone() * (slot0 - cv(VC + i)),
+                        nv(self.layout.vc + i),
+                        cv(self.layout.vc + i)
+                            + cv(self.layout.consf) * (cv(self.layout.vc + (i + 15) % 16) - cv(self.layout.vc + i))
+                            + reset.clone() * (slot0 - cv(self.layout.vc + i)),
                     );
                 }
             }
-            // GPB: the fold round's index-in-group bits, muxed from the query
-            // index bits IDXB by the fold-round dparam (D_F0..3 -> DRND 2..5).
+            // self.layout.gpb: the fold round's index-in-group bits, muxed from the query
+            // index bits self.layout.idxb by the fold-round dparam (D_F0..3 -> self.layout.drnd 2..5).
             // Zero on non-fold-absorb perms.
             for k in 0..4 {
                 let mut e = AB::Expr::ZERO;
                 for rf in 0..4 {
-                    if k < LOG_ARITIES[rf] {
-                        e = e + cv(DRND + 2 + rf) * cv(IDXB + CUM[rf] + k);
+                    if k < self.shape.log_arities[rf] {
+                        e = e + cv(self.layout.drnd + 2 + rf) * cv(self.layout.idxb + self.shape.cum()[rf] + k);
                     }
                 }
-                builder.assert_bool(cv(GPB + k));
-                builder.assert_eq(cv(GPB + k), e);
+                builder.assert_bool(cv(self.layout.gpb + k));
+                builder.assert_eq(cv(self.layout.gpb + k), e);
             }
         }
 
         // =====================================================================
-        // M_X1 x-chain (fold-pipeline arithmetic, inc-4): XREG (query LDE
+        // M_X1 x-chain (fold-pipeline arithmetic, inc-4): self.layout.xreg (query LDE
         // point) = GEN · ∏_r (kx[r] if idx-bit r else 1), a 22-row mul-bank
-        // chain over the query index bits (rows 0..21). Since IDXB is bound to
+        // chain over the query index bits (rows 0..21). Since self.layout.idxb is bound to
         // the sampled digest (Stage E), this pins the query point to the
         // transcript. Native arithmetic (the x-chain is unscaled).
         // =====================================================================
@@ -2229,21 +2254,21 @@ where
             // `scale` (it round-trips through the Monty limb), so it is wrong
             // for the native x-chain; use the canonical value here.
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
-            let msel_x = cv(MSEL + M_X1 as usize);
+            let msel_x = cv(self.layout.msel + M_X1 as usize);
             // mul_b = ext_base(bit ? kx[r] : 1): limb0 row-muxed, limbs 1..3 = 0.
             let mut bscalar = AB::Expr::ZERO;
             for r in 0..22 {
                 bscalar = bscalar
-                    + sf(r) * (AB::Expr::ONE + cv(IDXB + r) * (cn(self.consts.kx[r]) - AB::Expr::ONE));
+                    + sf(r) * (AB::Expr::ONE + cv(self.layout.idxb + r) * (cn(self.consts.kx[r]) - AB::Expr::ONE));
             }
-            builder.assert_zero(msel_x.clone() * (cv(MUL_OFF + 4) - bscalar));
+            builder.assert_zero(msel_x.clone() * (cv(self.layout.mul_off + 4) - bscalar));
             for k in 1..4 {
-                builder.assert_zero(msel_x.clone() * cv(MUL_OFF + 4 + k));
+                builder.assert_zero(msel_x.clone() * cv(self.layout.mul_off + 4 + k));
             }
             // mul_a at chain row 0 = ext_base(GEN).
-            builder.assert_zero(msel_x.clone() * sf(0) * (cv(MUL_OFF) - cn(self.consts.gen)));
+            builder.assert_zero(msel_x.clone() * sf(0) * (cv(self.layout.mul_off) - cn(self.consts.gen)));
             for k in 1..4 {
-                builder.assert_zero(msel_x.clone() * sf(0) * cv(MUL_OFF + k));
+                builder.assert_zero(msel_x.clone() * sf(0) * cv(self.layout.mul_off + k));
             }
             // Chain rows 0..20: next row's mul_a == this row's mul_c.
             let chain = (0..21).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
@@ -2251,61 +2276,61 @@ where
             let mut t = builder.when_transition();
             for k in 0..4 {
                 t.assert_zero(
-                    msel_x.clone() * chain.clone() * (nv(MUL_OFF + k) - cv(MUL_OFF + 8 + k)),
+                    msel_x.clone() * chain.clone() * (nv(self.layout.mul_off + k) - cv(self.layout.mul_off + 8 + k)),
                 );
             }
-            // XREG captures the chain output at row 21, carries elsewhere.
+            // self.layout.xreg captures the chain output at row 21, carries elsewhere.
             for k in 0..4 {
-                t.assert_zero(cap.clone() * (nv(XREG + k) - cv(MUL_OFF + 8 + k)));
-                t.assert_zero((AB::Expr::ONE - cap.clone()) * (nv(XREG + k) - cv(XREG + k)));
+                t.assert_zero(cap.clone() * (nv(self.layout.xreg + k) - cv(self.layout.mul_off + 8 + k)));
+                t.assert_zero((AB::Expr::ONE - cap.clone()) * (nv(self.layout.xreg + k) - cv(self.layout.xreg + k)));
             }
         }
 
         // =====================================================================
-        // M_FIN x_fin-chain (inc-4): XFIN (final-poly evaluation point) =
+        // M_FIN x_fin-chain (inc-4): self.layout.xfin (final-poly evaluation point) =
         // ∏_{r<8} (kx[r] if idx-bit (14+r) else 1), an 8-row mul-bank chain
         // (rows 0..7, a starts at ONE). Same shape as M_X1. Native.
         // =====================================================================
         {
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
-            let msel_f = cv(MSEL + M_FIN as usize);
+            let msel_f = cv(self.layout.msel + M_FIN as usize);
             let mut bscalar = AB::Expr::ZERO;
             for r in 0..8 {
                 bscalar = bscalar
-                    + sf(r) * (AB::Expr::ONE + cv(IDXB + 14 + r) * (cn(self.consts.kx[r]) - AB::Expr::ONE));
+                    + sf(r) * (AB::Expr::ONE + cv(self.layout.idxb + 14 + r) * (cn(self.consts.kx[r]) - AB::Expr::ONE));
             }
-            builder.assert_zero(msel_f.clone() * (cv(MUL_OFF + 4) - bscalar));
+            builder.assert_zero(msel_f.clone() * (cv(self.layout.mul_off + 4) - bscalar));
             for k in 1..4 {
-                builder.assert_zero(msel_f.clone() * cv(MUL_OFF + 4 + k));
+                builder.assert_zero(msel_f.clone() * cv(self.layout.mul_off + 4 + k));
             }
             // mul_a at chain row 0 = ext_base(ONE).
-            builder.assert_zero(msel_f.clone() * sf(0) * (cv(MUL_OFF) - AB::Expr::ONE));
+            builder.assert_zero(msel_f.clone() * sf(0) * (cv(self.layout.mul_off) - AB::Expr::ONE));
             for k in 1..4 {
-                builder.assert_zero(msel_f.clone() * sf(0) * cv(MUL_OFF + k));
+                builder.assert_zero(msel_f.clone() * sf(0) * cv(self.layout.mul_off + k));
             }
             let chain = (0..7).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
             let cap = msel_f.clone() * sf(7);
             let mut t = builder.when_transition();
             for k in 0..4 {
                 t.assert_zero(
-                    msel_f.clone() * chain.clone() * (nv(MUL_OFF + k) - cv(MUL_OFF + 8 + k)),
+                    msel_f.clone() * chain.clone() * (nv(self.layout.mul_off + k) - cv(self.layout.mul_off + 8 + k)),
                 );
             }
             for k in 0..4 {
-                t.assert_zero(cap.clone() * (nv(XFIN + k) - cv(MUL_OFF + 8 + k)));
-                t.assert_zero((AB::Expr::ONE - cap.clone()) * (nv(XFIN + k) - cv(XFIN + k)));
+                t.assert_zero(cap.clone() * (nv(self.layout.xfin + k) - cv(self.layout.mul_off + 8 + k)));
+                t.assert_zero((AB::Expr::ONE - cap.clone()) * (nv(self.layout.xfin + k) - cv(self.layout.xfin + k)));
             }
         }
 
         // =====================================================================
-        // M_INV (inc-4): witnessed inverses INVZ = 1/(zeta - x) [r=0] and
-        // INVZN = 1/(zeta_next - x) [r=1]. Add bank forms (operand - x) as a-c;
-        // mul bank pins the inverse via mul_c == 1. INVZ is fully sound (zeta =
-        // CHAL bound, x = XREG bound); INVZN's soundness pends the ZN/trailer
-        // binding (ZNREG is still free witness). Native arithmetic.
+        // M_INV (inc-4): witnessed inverses self.layout.invz = 1/(zeta - x) [r=0] and
+        // self.layout.invzn = 1/(zeta_next - x) [r=1]. Add bank forms (operand - x) as a-c;
+        // mul bank pins the inverse via mul_c == 1. self.layout.invz is fully sound (zeta =
+        // self.layout.chal bound, x = self.layout.xreg bound); self.layout.invzn's soundness pends the ZN/trailer
+        // binding (self.layout.znreg is still free witness). Native arithmetic.
         // =====================================================================
         {
-            let msel_i = cv(MSEL + M_INV as usize);
+            let msel_i = cv(self.layout.msel + M_INV as usize);
             let one_k = |k: usize| {
                 if k == 0 {
                     AB::Expr::ONE
@@ -2316,51 +2341,51 @@ where
             // Same shape for both rows; the operand register differs.
             let inv_row = |b: &mut AB, sel: AB::Expr, operand: usize| {
                 for k in 0..4 {
-                    b.assert_zero(sel.clone() * (cv(ADD_OFF + 8 + k) - cv(operand + k)));
-                    b.assert_zero(sel.clone() * (cv(ADD_OFF + 4 + k) - cv(XREG + k)));
-                    b.assert_zero(sel.clone() * (cv(MUL_OFF + k) - cv(ADD_OFF + k)));
-                    b.assert_zero(sel.clone() * (cv(MUL_OFF + 8 + k) - one_k(k)));
+                    b.assert_zero(sel.clone() * (cv(self.layout.add_off + 8 + k) - cv(operand + k)));
+                    b.assert_zero(sel.clone() * (cv(self.layout.add_off + 4 + k) - cv(self.layout.xreg + k)));
+                    b.assert_zero(sel.clone() * (cv(self.layout.mul_off + k) - cv(self.layout.add_off + k)));
+                    b.assert_zero(sel.clone() * (cv(self.layout.mul_off + 8 + k) - one_k(k)));
                 }
             };
-            inv_row(builder, msel_i.clone() * sf(0), CHAL + 4 * G_ZETA);
-            inv_row(builder, msel_i.clone() * sf(1), ZNREG);
-            // Capture the inverse witnesses (mul_b) into INVZ / INVZN.
+            inv_row(builder, msel_i.clone() * sf(0), self.layout.chal + 4 * G_ZETA);
+            inv_row(builder, msel_i.clone() * sf(1), self.layout.znreg);
+            // Capture the inverse witnesses (mul_b) into self.layout.invz / self.layout.invzn.
             let cap_z = msel_i.clone() * sf(0);
             let cap_zn = msel_i * sf(1);
             let mut t = builder.when_transition();
             for k in 0..4 {
-                t.assert_zero(cap_z.clone() * (nv(INVZ + k) - cv(MUL_OFF + 4 + k)));
-                t.assert_zero((AB::Expr::ONE - cap_z.clone()) * (nv(INVZ + k) - cv(INVZ + k)));
-                t.assert_zero(cap_zn.clone() * (nv(INVZN + k) - cv(MUL_OFF + 4 + k)));
-                t.assert_zero((AB::Expr::ONE - cap_zn.clone()) * (nv(INVZN + k) - cv(INVZN + k)));
+                t.assert_zero(cap_z.clone() * (nv(self.layout.invz + k) - cv(self.layout.mul_off + 4 + k)));
+                t.assert_zero((AB::Expr::ONE - cap_z.clone()) * (nv(self.layout.invz + k) - cv(self.layout.invz + k)));
+                t.assert_zero(cap_zn.clone() * (nv(self.layout.invzn + k) - cv(self.layout.mul_off + 4 + k)));
+                t.assert_zero((AB::Expr::ONE - cap_zn.clone()) * (nv(self.layout.invzn + k) - cv(self.layout.invzn + k)));
             }
         }
 
         // =====================================================================
-        // ZN / FA2 global relations (inc-4): rather than locate the trailer
+        // ZN / self.layout.fa2 global relations (inc-4): rather than locate the trailer
         // perm where the witness computes them, pin them directly on every
         // query row (phq) where they are consumed (M_INV, M_RO): ZN =
-        // zeta·g_trace (base scalar mult, deg 1) and FA2 = fri_alpha² (ext
+        // zeta·g_trace (base scalar mult, deg 1) and self.layout.fa2 = fri_alpha² (ext
         // square, deg 2). Both challenges are bound (Stage D/F), so this also
-        // completes INVZN's soundness (M_INV r=1 now uses a pinned ZN).
+        // completes self.layout.invzn's soundness (M_INV r=1 now uses a pinned ZN).
         // =====================================================================
         {
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
             for k in 0..4 {
                 builder.assert_zero(
-                    phq.clone() * (cv(ZNREG + k) - cn(self.consts.g_trace) * cv(CHAL + 4 * G_ZETA + k)),
+                    phq.clone() * (cv(self.layout.znreg + k) - cn(self.consts.g_trace) * cv(self.layout.chal + 4 * G_ZETA + k)),
                 );
                 builder.assert_zero(
                     phq.clone()
-                        * (cv(FA2 + k) - extmul(CHAL + 4 * G_FRIALPHA, CHAL + 4 * G_FRIALPHA, k)),
+                        * (cv(self.layout.fa2 + k) - extmul(self.layout.chal + 4 * G_FRIALPHA, self.layout.chal + 4 * G_FRIALPHA, k)),
                 );
             }
         }
 
         // =====================================================================
-        // M_S s-chains + INV2S (inc-4): per fold round rf, s = ∏_{r<lf}
-        // (sk[rf][r] if idx-bit (CUM[rf+1]+r) else 1) via a mul-bank chain
-        // (rows 0..lf-1, a starts at ONE); then row lf pins INV2S = 1/(2s) via
+        // M_S s-chains + self.layout.inv2s (inc-4): per fold round rf, s = ∏_{r<lf}
+        // (sk[rf][r] if idx-bit (self.shape.cum()[rf+1]+r) else 1) via a mul-bank chain
+        // (rows 0..lf-1, a starts at ONE); then row lf pins self.layout.inv2s = 1/(2s) via
         // mul(2s, inv2s) == 1, where mul_a(lf) = 2·mul_c(lf-1). lf per round =
         // [18,14,10,8]. Native. The mul_b mux hits deg 4 (fold-arith budget).
         // =====================================================================
@@ -2368,90 +2393,90 @@ where
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
             let lfs = [18usize, 14, 10, 8];
             let capture: Vec<(AB::Expr, usize)> = (0..4)
-                .map(|rf| (cv(MSEL + M_S0 as usize + rf) * sf(lfs[rf]), lfs[rf]))
+                .map(|rf| (cv(self.layout.msel + M_S0 as usize + rf) * sf(lfs[rf]), lfs[rf]))
                 .collect();
             for rf in 0..4 {
                 let lf = lfs[rf];
-                let msel = cv(MSEL + M_S0 as usize + rf);
+                let msel = cv(self.layout.msel + M_S0 as usize + rf);
                 let not_lf = AB::Expr::ONE - sf(lf);
                 // Materialized chain gate SNL_rf = msel * (1 - sf(lf)) keeps the
                 // b-mux binding below deg <= 3 (target is deg 2).
-                builder.assert_eq(cv(SNL + rf), msel.clone() * not_lf.clone());
-                let snl = cv(SNL + rf);
+                builder.assert_eq(cv(self.layout.snl + rf), msel.clone() * not_lf.clone());
+                let snl = cv(self.layout.snl + rf);
                 // mul_b limb0 = 1 + idx-bit·(sk-1) on chain rows (0 on row lf).
                 let mut target = AB::Expr::ZERO;
                 for r in 0..lf {
                     target = target
                         + sf(r)
                             * (AB::Expr::ONE
-                                + cv(IDXB + CUM[rf + 1] + r) * (cn(self.consts.sk[rf][r]) - AB::Expr::ONE));
+                                + cv(self.layout.idxb + self.shape.cum()[rf + 1] + r) * (cn(self.consts.sk[rf][r]) - AB::Expr::ONE));
                 }
-                builder.assert_zero(snl.clone() * (cv(MUL_OFF + 4) - target));
+                builder.assert_zero(snl.clone() * (cv(self.layout.mul_off + 4) - target));
                 for k in 1..4 {
-                    builder.assert_zero(snl.clone() * cv(MUL_OFF + 4 + k));
+                    builder.assert_zero(snl.clone() * cv(self.layout.mul_off + 4 + k));
                 }
                 // mul_a at chain row 0 = ONE.
-                builder.assert_zero(msel.clone() * sf(0) * (cv(MUL_OFF) - AB::Expr::ONE));
+                builder.assert_zero(msel.clone() * sf(0) * (cv(self.layout.mul_off) - AB::Expr::ONE));
                 for k in 1..4 {
-                    builder.assert_zero(msel.clone() * sf(0) * cv(MUL_OFF + k));
+                    builder.assert_zero(msel.clone() * sf(0) * cv(self.layout.mul_off + k));
                 }
                 // mul_c == ONE at row lf (2s · inv2s == 1).
-                builder.assert_zero(msel.clone() * sf(lf) * (cv(MUL_OFF + 8) - AB::Expr::ONE));
+                builder.assert_zero(msel.clone() * sf(lf) * (cv(self.layout.mul_off + 8) - AB::Expr::ONE));
                 for k in 1..4 {
-                    builder.assert_zero(msel.clone() * sf(lf) * cv(MUL_OFF + 8 + k));
+                    builder.assert_zero(msel.clone() * sf(lf) * cv(self.layout.mul_off + 8 + k));
                 }
             }
             let mut t = builder.when_transition();
             for rf in 0..4 {
                 let lf = lfs[rf];
-                let msel = cv(MSEL + M_S0 as usize + rf);
+                let msel = cv(self.layout.msel + M_S0 as usize + rf);
                 let chain = (0..lf.saturating_sub(1)).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
                 for k in 0..4 {
                     // Plain chain rows 0..lf-2: next mul_a == this mul_c.
-                    t.assert_zero(msel.clone() * chain.clone() * (nv(MUL_OFF + k) - cv(MUL_OFF + 8 + k)));
+                    t.assert_zero(msel.clone() * chain.clone() * (nv(self.layout.mul_off + k) - cv(self.layout.mul_off + 8 + k)));
                     // Row lf-1 -> lf: mul_a(lf) == 2 · mul_c(lf-1).
                     t.assert_zero(
                         msel.clone()
                             * sf(lf - 1)
-                            * (nv(MUL_OFF + k) - cv(MUL_OFF + 8 + k) * AB::Expr::from(AB::F::TWO)),
+                            * (nv(self.layout.mul_off + k) - cv(self.layout.mul_off + 8 + k) * AB::Expr::from(AB::F::TWO)),
                     );
                 }
             }
-            // INV2S capture: mul_b at each round's row lf; carry otherwise.
+            // self.layout.inv2s capture: mul_b at each round's row lf; carry otherwise.
             let cap_any = capture.iter().fold(AB::Expr::ZERO, |a, (e, _)| a + e.clone());
             for k in 0..4 {
                 for (sel, _) in &capture {
-                    t.assert_zero(sel.clone() * (nv(INV2S + k) - cv(MUL_OFF + 4 + k)));
+                    t.assert_zero(sel.clone() * (nv(self.layout.inv2s + k) - cv(self.layout.mul_off + 4 + k)));
                 }
-                t.assert_zero((AB::Expr::ONE - cap_any.clone()) * (nv(INV2S + k) - cv(INV2S + k)));
+                t.assert_zero((AB::Expr::ONE - cap_any.clone()) * (nv(self.layout.inv2s + k) - cv(self.layout.inv2s + k)));
             }
         }
 
         // =====================================================================
-        // M_B BREG ladder (inc-4): per fold round rf, breg[0] = beta·inv2s
-        // (r=0), then breg[l] = 2·breg[l-1]² (r=1..la-1). la = LOG_ARITIES =
-        // [4,4,4,2]. beta = CHAL[G_BETA0+rf] and INV2S are both bound, so the
+        // M_B self.layout.breg ladder (inc-4): per fold round rf, breg[0] = beta·inv2s
+        // (r=0), then breg[l] = 2·breg[l-1]² (r=1..la-1). la = self.shape.log_arities =
+        // [4,4,4,2]. beta = self.layout.chal[G_BETA0+rf] and self.layout.inv2s are both bound, so the
         // ladder is fully pinned. Native. mul_a/mul_b are the operands; the
-        // product mul_c is captured into BREG (with the ×2 for l>0).
+        // product mul_c is captured into self.layout.breg (with the ×2 for l>0).
         // =====================================================================
         {
             // Same-row operand bindings.
             for rf in 0..4 {
-                let la = LOG_ARITIES[rf];
-                let msel = cv(MSEL + M_B0 as usize + rf);
+                let la = self.shape.log_arities[rf];
+                let msel = cv(self.layout.msel + M_B0 as usize + rf);
                 for k in 0..4 {
-                    // r=0: mul_a = beta_rf, mul_b = INV2S.
+                    // r=0: mul_a = beta_rf, mul_b = self.layout.inv2s.
                     builder.assert_zero(
-                        msel.clone() * sf(0) * (cv(MUL_OFF + k) - cv(CHAL + 4 * (G_BETA0 + rf) + k)),
+                        msel.clone() * sf(0) * (cv(self.layout.mul_off + k) - cv(self.layout.chal + 4 * (G_BETA0 + rf) + k)),
                     );
-                    builder.assert_zero(msel.clone() * sf(0) * (cv(MUL_OFF + 4 + k) - cv(INV2S + k)));
+                    builder.assert_zero(msel.clone() * sf(0) * (cv(self.layout.mul_off + 4 + k) - cv(self.layout.inv2s + k)));
                     // r=1..la-1: mul_a = mul_b = breg[r-1].
                     for r in 1..la {
                         builder.assert_zero(
-                            msel.clone() * sf(r) * (cv(MUL_OFF + k) - cv(BREG + 4 * (r - 1) + k)),
+                            msel.clone() * sf(r) * (cv(self.layout.mul_off + k) - cv(self.layout.breg + 4 * (r - 1) + k)),
                         );
                         builder.assert_zero(
-                            msel.clone() * sf(r) * (cv(MUL_OFF + 4 + k) - cv(BREG + 4 * (r - 1) + k)),
+                            msel.clone() * sf(r) * (cv(self.layout.mul_off + 4 + k) - cv(self.layout.breg + 4 * (r - 1) + k)),
                         );
                     }
                 }
@@ -2462,37 +2487,37 @@ where
             for l in 0..4 {
                 // Rounds that actually produce level l (l < la_rf).
                 let cap = (0..4)
-                    .filter(|&rf| l < LOG_ARITIES[rf])
-                    .map(|rf| cv(MSEL + M_B0 as usize + rf) * sf(l))
+                    .filter(|&rf| l < self.shape.log_arities[rf])
+                    .map(|rf| cv(self.layout.msel + M_B0 as usize + rf) * sf(l))
                     .fold(AB::Expr::ZERO, |a, e| a + e);
                 for k in 0..4 {
                     let want = if l == 0 {
-                        cv(MUL_OFF + 8 + k)
+                        cv(self.layout.mul_off + 8 + k)
                     } else {
-                        two.clone() * cv(MUL_OFF + 8 + k)
+                        two.clone() * cv(self.layout.mul_off + 8 + k)
                     };
                     t.assert_zero(
-                        cap.clone() * (nv(BREG + 4 * l + k) - want.clone())
-                            + (AB::Expr::ONE - cap.clone()) * (nv(BREG + 4 * l + k) - cv(BREG + 4 * l + k)),
+                        cap.clone() * (nv(self.layout.breg + 4 * l + k) - want.clone())
+                            + (AB::Expr::ONE - cap.clone()) * (nv(self.layout.breg + 4 * l + k) - cv(self.layout.breg + 4 * l + k)),
                     );
                 }
             }
         }
 
         // =====================================================================
-        // Fold arithmetic — round-0 leaf fold + HIT + fold-leaf consistency
-        // (inc-4). v = the fold leaf value ext(ASM0,ASM1,W0C,W1C). PBUF holds
-        // the even leaf; on the odd leaf SCR[i] = (pbuf+v)·half +
-        // breg[0]·kf[rf][0][i]·(pbuf-v). HIT = [VC == GPB] (one-hot dot with
-        // the GPB bit pattern, materialized deg 5 so the consistency stays
-        // deg 3): at the index-in-group leaf, v == RUNEV — the FRI fold
-        // consistency tying RUNEV to the sponge-bound openings.
+        // Fold arithmetic — round-0 leaf fold + self.layout.hit + fold-leaf consistency
+        // (inc-4). v = the fold leaf value ext(self.layout.asm0,self.layout.asm1,self.layout.w0c,self.layout.w1c). self.layout.pbuf holds
+        // the even leaf; on the odd leaf self.layout.scr[i] = (pbuf+v)·half +
+        // breg[0]·kf[rf][0][i]·(pbuf-v). self.layout.hit = [self.layout.vc == self.layout.gpb] (one-hot dot with
+        // the self.layout.gpb bit pattern, materialized deg 5 so the consistency stays
+        // deg 3): at the index-in-group leaf, v == self.layout.runev — the FRI fold
+        // consistency tying self.layout.runev to the sponge-bound openings.
         // =====================================================================
         {
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
-            let vexpr = [cv(ASM0), cv(ASM1), cv(W0C), cv(W1C)];
-            // GPB one-hot decode split into 2-bit pair products so HIT stays
-            // deg 3: GLO[j] = pair(GPB0,GPB1); GHI[j] = pair(GPB2,GPB3).
+            let vexpr = [cv(self.layout.asm0), cv(self.layout.asm1), cv(self.layout.w0c), cv(self.layout.w1c)];
+            // self.layout.gpb one-hot decode split into 2-bit pair products so self.layout.hit stays
+            // deg 3: self.layout.glo[j] = pair(GPB0,GPB1); self.layout.ghi[j] = pair(GPB2,GPB3).
             let gbit = |col: usize, on: bool| -> AB::Expr {
                 if on {
                     cv(col)
@@ -2501,19 +2526,19 @@ where
                 }
             };
             for j in 0..4 {
-                builder.assert_eq(cv(GLO + j), gbit(GPB, j & 1 == 1) * gbit(GPB + 1, j & 2 == 2));
+                builder.assert_eq(cv(self.layout.glo + j), gbit(self.layout.gpb, j & 1 == 1) * gbit(self.layout.gpb + 1, j & 2 == 2));
                 builder
-                    .assert_eq(cv(GHI + j), gbit(GPB + 2, j & 1 == 1) * gbit(GPB + 3, j & 2 == 2));
+                    .assert_eq(cv(self.layout.ghi + j), gbit(self.layout.gpb + 2, j & 1 == 1) * gbit(self.layout.gpb + 3, j & 2 == 2));
             }
-            // HIT = sum_s VC[s] · GLO[s&3] · GHI[(s>>2)&3]  (deg 3).
+            // self.layout.hit = sum_s self.layout.vc[s] · self.layout.glo[s&3] · self.layout.ghi[(s>>2)&3]  (deg 3).
             let mut hit = AB::Expr::ZERO;
             for s in 0..16usize {
-                hit = hit + cv(VC + s) * cv(GLO + (s & 3)) * cv(GHI + ((s >> 2) & 3));
+                hit = hit + cv(self.layout.vc + s) * cv(self.layout.glo + (s & 3)) * cv(self.layout.ghi + ((s >> 2) & 3));
             }
-            builder.assert_eq(cv(HIT), hit);
-            // Fold-leaf consistency: at the index-in-group leaf, v == RUNEV.
+            builder.assert_eq(cv(self.layout.hit), hit);
+            // Fold-leaf consistency: at the index-in-group leaf, v == self.layout.runev.
             for k in 0..4 {
-                builder.assert_zero(cv(CONSF) * cv(HIT) * (vexpr[k].clone() - cv(RUNEV + k)));
+                builder.assert_zero(cv(self.layout.consf) * cv(self.layout.hit) * (vexpr[k].clone() - cv(self.layout.runev + k)));
             }
             // ext-mul of a column-vector (a_off) and an expr-vector (be).
             let extmul_ce = |a_off: usize, be: &[AB::Expr; 4], k: usize| -> AB::Expr {
@@ -2531,51 +2556,51 @@ where
                 acc
             };
             let pmv = [
-                cv(PBUF) - vexpr[0].clone(),
-                cv(PBUF + 1) - vexpr[1].clone(),
-                cv(PBUF + 2) - vexpr[2].clone(),
-                cv(PBUF + 3) - vexpr[3].clone(),
+                cv(self.layout.pbuf) - vexpr[0].clone(),
+                cv(self.layout.pbuf + 1) - vexpr[1].clone(),
+                cv(self.layout.pbuf + 2) - vexpr[2].clone(),
+                cv(self.layout.pbuf + 3) - vexpr[3].clone(),
             ];
             let half = cn(self.consts.half);
-            // BPM = extmul(BREG, PBUF - v): the round-0 fold's BREG·(pbuf-v) ext
+            // self.layout.bpm = extmul(self.layout.breg, self.layout.pbuf - v): the round-0 fold's self.layout.breg·(pbuf-v) ext
             // product, so `computed` below is deg 1 (kept out of the gate).
             for k in 0..4 {
-                builder.assert_eq(cv(BPM + k), extmul_ce(BREG, &pmv, k));
+                builder.assert_eq(cv(self.layout.bpm + k), extmul_ce(self.layout.breg, &pmv, k));
             }
-            // GF_rf = CONSF * DRND[2+rf]: round-0 gate prefix (gate = GF * VC).
+            // GF_rf = self.layout.consf * self.layout.drnd[2+rf]: round-0 gate prefix (gate = self.layout.gf * self.layout.vc).
             for rf in 0..4 {
-                builder.assert_eq(cv(GF + rf), cv(CONSF) * cv(DRND + 2 + rf));
+                builder.assert_eq(cv(self.layout.gf + rf), cv(self.layout.consf) * cv(self.layout.drnd + 2 + rf));
             }
             let mut t = builder.when_transition();
-            // PBUF capture on even fold-value rows (CONSF·VCE); carry otherwise.
+            // self.layout.pbuf capture on even fold-value rows (self.layout.consf·self.layout.vce); carry otherwise.
             for k in 0..4 {
-                let cap = cv(CONSF) * cv(VCE);
+                let cap = cv(self.layout.consf) * cv(self.layout.vce);
                 t.assert_zero(
-                    cap.clone() * (nv(PBUF + k) - vexpr[k].clone())
-                        + (AB::Expr::ONE - cap) * (nv(PBUF + k) - cv(PBUF + k)),
+                    cap.clone() * (nv(self.layout.pbuf + k) - vexpr[k].clone())
+                        + (AB::Expr::ONE - cap) * (nv(self.layout.pbuf + k) - cv(self.layout.pbuf + k)),
                 );
             }
-            // Round-0 SCR fold on odd fold-value rows (per round rf, pair i).
-            // gate = GF[rf]*VC[2i+1] (deg 2); computed deg 1 via BPM -> deg 3.
+            // Round-0 self.layout.scr fold on odd fold-value rows (per round rf, pair i).
+            // gate = self.layout.gf[rf]*self.layout.vc[2i+1] (deg 2); computed deg 1 via self.layout.bpm -> deg 3.
             for rf in 0..4 {
-                let la = LOG_ARITIES[rf];
+                let la = self.shape.log_arities[rf];
                 for i in 0..(1usize << (la - 1)) {
-                    let gate = cv(GF + rf) * cv(VC + 2 * i + 1);
+                    let gate = cv(self.layout.gf + rf) * cv(self.layout.vc + 2 * i + 1);
                     let kf = cn(self.consts.kf[rf][0][i]);
                     for k in 0..4 {
                         let computed =
-                            half.clone() * (cv(PBUF + k) + vexpr[k].clone()) + kf.clone() * cv(BPM + k);
-                        t.assert_zero(gate.clone() * (nv(SCR + 4 * i + k) - computed));
+                            half.clone() * (cv(self.layout.pbuf + k) + vexpr[k].clone()) + kf.clone() * cv(self.layout.bpm + k);
+                        t.assert_zero(gate.clone() * (nv(self.layout.scr + 4 * i + k) - computed));
                     }
                 }
             }
         }
 
         // =====================================================================
-        // M_FHI higher-round folds + RUNEV threading (inc-4). Per round rf,
+        // M_FHI higher-round folds + self.layout.runev threading (inc-4). Per round rf,
         // fold levels 1..: outv = (scr[2i]+scr[2i+1])·half +
-        // breg[l]·kf[rf][l][i]·(scr[2i]−scr[2i+1]), written to SCR[i] (or RUNEV
-        // on the last pair). RUNEV is set at each M_FHI last row and at M_RO
+        // breg[l]·kf[rf][l][i]·(scr[2i]−scr[2i+1]), written to self.layout.scr[i] (or self.layout.runev
+        // on the last pair). self.layout.runev is set at each M_FHI last row and at M_RO
         // r=8 (below), and carries elsewhere — so a flip anywhere breaks the
         // carry or a capture (closes bad_fold together with the leaf
         // consistency and M_RO).
@@ -2605,29 +2630,29 @@ where
                 let npairs = if rf < 3 { 7 } else { 1 };
                 for r in 0..npairs {
                     builder.assert_eq(
-                        cv(FHG + fhg_index(rf, r)),
-                        cv(MSEL + M_FHI0 as usize + rf) * sf(r),
+                        cv(self.layout.fhg + fhg_index(rf, r)),
+                        cv(self.layout.msel + M_FHI0 as usize + rf) * sf(r),
                     );
                 }
             }
-            let mut update = AB::Expr::ZERO; // rows where RUNEV is (re)written
+            let mut update = AB::Expr::ZERO; // rows where self.layout.runev is (re)written
             let mut t = builder.when_transition();
             for rf in 0..4 {
-                let msel = cv(MSEL + M_FHI0 as usize + rf);
+                let msel = cv(self.layout.msel + M_FHI0 as usize + rf);
                 let pairs: &[(usize, usize)] = if rf < 3 { &pairs3 } else { &[(1, 0)] };
                 let last = pairs.len() - 1;
                 for (r, &(l, i)) in pairs.iter().enumerate() {
-                    // FHG = msel_rf * sf(r) (materialized above, deg 1) so
+                    // self.layout.fhg = msel_rf * sf(r) (materialized above, deg 1) so
                     // gate*computed (computed deg 2) stays deg 3.
-                    let gate = cv(FHG + fhg_index(rf, r));
+                    let gate = cv(self.layout.fhg + fhg_index(rf, r));
                     let _ = &msel;
-                    let lo = SCR + 4 * (2 * i);
-                    let hi = SCR + 4 * (2 * i + 1);
+                    let lo = self.layout.scr + 4 * (2 * i);
+                    let hi = self.layout.scr + 4 * (2 * i + 1);
                     let kf = cn(self.consts.kf[rf][l][i]);
-                    let target = if r == last { RUNEV } else { SCR + 4 * i };
+                    let target = if r == last { self.layout.runev } else { self.layout.scr + 4 * i };
                     for k in 0..4 {
                         let computed = half.clone() * (cv(lo + k) + cv(hi + k))
-                            + kf.clone() * extmul_cc(BREG + 4 * l, lo, hi, k);
+                            + kf.clone() * extmul_cc(self.layout.breg + 4 * l, lo, hi, k);
                         t.assert_zero(gate.clone() * (nv(target + k) - computed));
                     }
                     if r == last {
@@ -2635,30 +2660,30 @@ where
                     }
                 }
             }
-            // RUNEV also updates at M_RO r=8 (its capture is in the M_RO block).
-            update = update + cv(MSEL + M_RO as usize) * sf(8);
-            // RUNEV carries on every non-update transition.
+            // self.layout.runev also updates at M_RO r=8 (its capture is in the M_RO block).
+            update = update + cv(self.layout.msel + M_RO as usize) * sf(8);
+            // self.layout.runev carries on every non-update transition.
             for k in 0..4 {
-                t.assert_zero((AB::Expr::ONE - update.clone()) * (nv(RUNEV + k) - cv(RUNEV + k)));
+                t.assert_zero((AB::Expr::ONE - update.clone()) * (nv(self.layout.runev + k) - cv(self.layout.runev + k)));
             }
         }
 
         // =====================================================================
-        // PZACC / PREG accumulation (endpoint pin, START foundation). The
+        // self.layout.pzacc / self.layout.preg accumulation (endpoint pin, START foundation). The
         // reduced-opening numerator accumulates along two mutually-exclusive
         // paths (dup vs query phase), both binding pzacc/preg to the opened
         // values so M_RO's `ro` is value-pinned:
-        //   - dup zeta-value rows (CONSZ = CZD·POS1): pzacc += preg·v,
-        //     preg *= fri_alpha, with v = ext(ASM0,ASM1,W0C,W1C) (deg 3).
-        //   - query PX rows (CX0, optionally CX1): pzacc += preg·W0C (word 0)
-        //     and, when CX1 (implies CX0), += (preg·fri_alpha)·W1C (word 1);
-        //     preg *= fri_alpha (one word) or fri_alpha² (two words). PREGA =
+        //   - dup zeta-value rows (self.layout.consz = self.layout.czd·POS1): pzacc += preg·v,
+        //     preg *= fri_alpha, with v = ext(self.layout.asm0,self.layout.asm1,self.layout.w0c,self.layout.w1c) (deg 3).
+        //   - query PX rows (self.layout.cx0, optionally self.layout.cx1): pzacc += preg·self.layout.w0c (word 0)
+        //     and, when self.layout.cx1 (implies self.layout.cx0), += (preg·fri_alpha)·self.layout.w1c (word 1);
+        //     preg *= fri_alpha (one word) or fri_alpha² (two words). self.layout.prega =
         //     preg·fri_alpha is materialized so the word-1 term stays deg 3.
-        // FA2 = fri_alpha² is already bound (Stage D/F). CX1 ⊆ CX0, so
-        // CX0·(1-CX1) = CX0 - CX1.
+        // self.layout.fa2 = fri_alpha² is already bound (Stage D/F). self.layout.cx1 ⊆ self.layout.cx0, so
+        // self.layout.cx0·(1-self.layout.cx1) = self.layout.cx0 - self.layout.cx1.
         // =====================================================================
         {
-            // ext-mul of the contiguous PREG vector with an explicit column list.
+            // ext-mul of the contiguous self.layout.preg vector with an explicit column list.
             let extmul_cols = |a_off: usize, bcols: &[usize; 4], k: usize| -> AB::Expr {
                 let w = c(EXT_W);
                 let mut acc = AB::Expr::ZERO;
@@ -2673,38 +2698,38 @@ where
                 }
                 acc
             };
-            let vcols = [ASM0, ASM1, W0C, W1C];
-            let fa_off = CHAL + 4 * G_FRIALPHA;
-            // PREGA = preg·fri_alpha (materialized; filled in fill_derived).
+            let vcols = [self.layout.asm0, self.layout.asm1, self.layout.w0c, self.layout.w1c];
+            let fa_off = self.layout.chal + 4 * G_FRIALPHA;
+            // self.layout.prega = preg·fri_alpha (materialized; filled in fill_derived).
             for k in 0..4 {
-                builder.assert_eq(cv(PREGA + k), extmul(PREG, fa_off, k));
+                builder.assert_eq(cv(self.layout.prega + k), extmul(self.layout.preg, fa_off, k));
             }
-            let consz = cv(CONSZ);
-            let cx0 = cv(CX0);
-            let cx1 = cv(CX1);
-            // preg update gate: *fri_alpha when (CONSZ or CX0&!CX1); *fri_alpha²
-            // when CX1; carry otherwise.
+            let consz = cv(self.layout.consz);
+            let cx0 = cv(self.layout.cx0);
+            let cx1 = cv(self.layout.cx1);
+            // preg update gate: *fri_alpha when (self.layout.consz or self.layout.cx0&!self.layout.cx1); *fri_alpha²
+            // when self.layout.cx1; carry otherwise.
             let gate_fa = consz.clone() + cx0.clone() - cx1.clone();
-            // Leaf-start reset (same signal as the VC counter): at sf(23)·nv(LFS)
+            // Leaf-start reset (same signal as the self.layout.vc counter): at sf(23)·nv(self.layout.lfs)
             // pzacc->0, preg->ONE, starting the next query's PX accumulation.
             // The reset only fires on a perm's last row, where all accumulation
             // gates are 0, so it composes as an additive deg-3 correction.
             let mut t = builder.when_transition();
-            let reset = sf(23) * nv(LFS);
+            let reset = sf(23) * nv(self.layout.lfs);
             for k in 0..4 {
-                // pzacc += CONSZ·(preg·v) + CX0·preg·W0C + CX1·(preg·fa)·W1C.
-                let inc = consz.clone() * extmul_cols(PREG, &vcols, k)
-                    + cx0.clone() * cv(PREG + k) * cv(W0C)
-                    + cx1.clone() * cv(PREGA + k) * cv(W1C);
-                t.assert_zero(nv(PZACC + k) - cv(PZACC + k) - inc + reset.clone() * cv(PZACC + k));
-                // preg *= fri_alpha (gate_fa) or fri_alpha² (CX1); carry else.
+                // pzacc += self.layout.consz·(preg·v) + self.layout.cx0·preg·self.layout.w0c + self.layout.cx1·(preg·fa)·self.layout.w1c.
+                let inc = consz.clone() * extmul_cols(self.layout.preg, &vcols, k)
+                    + cx0.clone() * cv(self.layout.preg + k) * cv(self.layout.w0c)
+                    + cx1.clone() * cv(self.layout.prega + k) * cv(self.layout.w1c);
+                t.assert_zero(nv(self.layout.pzacc + k) - cv(self.layout.pzacc + k) - inc + reset.clone() * cv(self.layout.pzacc + k));
+                // preg *= fri_alpha (gate_fa) or fri_alpha² (self.layout.cx1); carry else.
                 let preg_reset = if k == 0 { AB::Expr::ONE } else { AB::Expr::ZERO };
                 t.assert_zero(
-                    nv(PREG + k)
-                        - cv(PREG + k)
-                        - gate_fa.clone() * (extmul(PREG, fa_off, k) - cv(PREG + k))
-                        - cx1.clone() * (extmul(PREG, FA2, k) - cv(PREG + k))
-                        + reset.clone() * (cv(PREG + k) - preg_reset),
+                    nv(self.layout.preg + k)
+                        - cv(self.layout.preg + k)
+                        - gate_fa.clone() * (extmul(self.layout.preg, fa_off, k) - cv(self.layout.preg + k))
+                        - cx1.clone() * (extmul(self.layout.preg, self.layout.fa2, k) - cv(self.layout.preg + k))
+                        + reset.clone() * (cv(self.layout.preg + k) - preg_reset),
                 );
             }
         }
@@ -2713,105 +2738,105 @@ where
         // Reduced-opening captures (endpoint pin, START). At fixed transcript
         // positions the running pzacc/preg are snapshotted into the A/P/PX0
         // registers that M_RO consumes; carry otherwise. Capture rows map to
-        // existing comparators (dup block 72 = CMPA, 145 = CMPB, 147 = BLKLAST;
-        // trace-leaf end = RSEL[R_ABS_C5]). CPA/CPB/CPL = PHD·comparator keep
+        // existing comparators (dup block 72 = self.layout.cmpa, 145 = self.layout.cmpb, 147 = self.layout.blklast;
+        // trace-leaf end = self.layout.rsel[R_ABS_C5]). self.layout.cpa/self.layout.cpb/self.layout.cpl = self.layout.phd·comparator keep
         // the gates deg 2. The captured value is the pre-consume pzacc = cv().
         // =====================================================================
         {
-            builder.assert_eq(cv(CPA), cv(PHD) * cv(CMPA));
-            builder.assert_eq(cv(CPB), cv(PHD) * cv(CMPB));
-            builder.assert_eq(cv(CPL), cv(PHD) * cv(BLKLAST));
-            let ga0 = cv(CPA) * sf(14);
-            let ga1 = cv(CPB) * sf(7);
-            let ga2 = cv(CPL) * sf(5);
-            let gpx = cv(RSEL + R_ABS_C5 as usize) * sf(3);
+            builder.assert_eq(cv(self.layout.cpa), cv(self.layout.phd) * cv(self.layout.cmpa));
+            builder.assert_eq(cv(self.layout.cpb), cv(self.layout.phd) * cv(self.layout.cmpb));
+            builder.assert_eq(cv(self.layout.cpl), cv(self.layout.phd) * cv(self.layout.blklast));
+            let ga0 = cv(self.layout.cpa) * sf(14);
+            let ga1 = cv(self.layout.cpb) * sf(7);
+            let ga2 = cv(self.layout.cpl) * sf(5);
+            let gpx = cv(self.layout.rsel + R_ABS_C5 as usize) * sf(3);
             let mut t = builder.when_transition();
             for k in 0..4 {
-                t.assert_zero(nv(A0R + k) - cv(A0R + k) - ga0.clone() * (cv(PZACC + k) - cv(A0R + k)));
-                t.assert_zero(nv(P0R + k) - cv(P0R + k) - ga0.clone() * (cv(PREG + k) - cv(P0R + k)));
-                t.assert_zero(nv(A1R + k) - cv(A1R + k) - ga1.clone() * (cv(PZACC + k) - cv(A1R + k)));
-                t.assert_zero(nv(P1R + k) - cv(P1R + k) - ga1.clone() * (cv(PREG + k) - cv(P1R + k)));
-                t.assert_zero(nv(A2R + k) - cv(A2R + k) - ga2.clone() * (cv(PZACC + k) - cv(A2R + k)));
+                t.assert_zero(nv(self.layout.a0r + k) - cv(self.layout.a0r + k) - ga0.clone() * (cv(self.layout.pzacc + k) - cv(self.layout.a0r + k)));
+                t.assert_zero(nv(self.layout.p0r + k) - cv(self.layout.p0r + k) - ga0.clone() * (cv(self.layout.preg + k) - cv(self.layout.p0r + k)));
+                t.assert_zero(nv(self.layout.a1r + k) - cv(self.layout.a1r + k) - ga1.clone() * (cv(self.layout.pzacc + k) - cv(self.layout.a1r + k)));
+                t.assert_zero(nv(self.layout.p1r + k) - cv(self.layout.p1r + k) - ga1.clone() * (cv(self.layout.preg + k) - cv(self.layout.p1r + k)));
+                t.assert_zero(nv(self.layout.a2r + k) - cv(self.layout.a2r + k) - ga2.clone() * (cv(self.layout.pzacc + k) - cv(self.layout.a2r + k)));
                 t.assert_zero(
-                    nv(PX0R + k) - cv(PX0R + k) - gpx.clone() * (cv(PZACC + k) - cv(PX0R + k)),
+                    nv(self.layout.px0r + k) - cv(self.layout.px0r + k) - gpx.clone() * (cv(self.layout.pzacc + k) - cv(self.layout.px0r + k)),
                 );
             }
         }
 
         // =====================================================================
-        // Final-poly capture + M_HORN Horner (endpoint pin, END). FPREG holds
-        // the 16 final-poly coefficients, captured from the CZ7 value rows
-        // (transcript-bound), indexed by the FPI one-hot counter. M_HORN then
-        // evaluates the poly at XFIN by Horner and pins the result to RUNEV —
+        // Final-poly capture + M_HORN Horner (endpoint pin, END). self.layout.fpreg holds
+        // the 16 final-poly coefficients, captured from the self.layout.cz7 value rows
+        // (transcript-bound), indexed by the self.layout.fpi one-hot counter. M_HORN then
+        // evaluates the poly at self.layout.xfin by Horner and pins the result to self.layout.runev —
         // tying the *end* of the fold chain to the transcript's final poly.
         // =====================================================================
         {
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
             let _ = cn;
-            // CONSZ7 = CZ7 · POS1.
-            builder.assert_eq(cv(CONSZ7), cv(CZ7) * cv(POS + 1));
-            // FPI one-hot: bool, sum==1, first-row slot 0, +1 rotate on CONSZ7.
+            // self.layout.consz7 = self.layout.cz7 · POS1.
+            builder.assert_eq(cv(self.layout.consz7), cv(self.layout.cz7) * cv(self.layout.pos + 1));
+            // self.layout.fpi one-hot: bool, sum==1, first-row slot 0, +1 rotate on self.layout.consz7.
             for i in 0..16 {
-                builder.assert_bool(cv(FPI + i));
+                builder.assert_bool(cv(self.layout.fpi + i));
             }
             builder.assert_eq(
-                (0..16).map(|i| cv(FPI + i)).fold(AB::Expr::ZERO, |a, e| a + e),
+                (0..16).map(|i| cv(self.layout.fpi + i)).fold(AB::Expr::ZERO, |a, e| a + e),
                 AB::Expr::ONE,
             );
-            builder.when_first_row().assert_one(cv(FPI));
+            builder.when_first_row().assert_one(cv(self.layout.fpi));
             for i in 1..16 {
-                builder.when_first_row().assert_zero(cv(FPI + i));
+                builder.when_first_row().assert_zero(cv(self.layout.fpi + i));
             }
-            let vfp = [cv(ASM0), cv(ASM1), cv(W0C), cv(W1C)];
+            let vfp = [cv(self.layout.asm0), cv(self.layout.asm1), cv(self.layout.w0c), cv(self.layout.w1c)];
             {
                 let mut t = builder.when_transition();
                 for i in 0..16 {
                     t.assert_eq(
-                        nv(FPI + i),
-                        cv(FPI + i) + cv(CONSZ7) * (cv(FPI + (i + 15) % 16) - cv(FPI + i)),
+                        nv(self.layout.fpi + i),
+                        cv(self.layout.fpi + i) + cv(self.layout.consz7) * (cv(self.layout.fpi + (i + 15) % 16) - cv(self.layout.fpi + i)),
                     );
                 }
-                // FPREG[s] capture on the CONSZ7 row with FPI==s; carry else.
+                // self.layout.fpreg[s] capture on the self.layout.consz7 row with self.layout.fpi==s; carry else.
                 for s in 0..16 {
-                    let gate = cv(CONSZ7) * cv(FPI + s);
+                    let gate = cv(self.layout.consz7) * cv(self.layout.fpi + s);
                     for k in 0..4 {
                         t.assert_zero(
-                            nv(FPREG + 4 * s + k)
-                                - cv(FPREG + 4 * s + k)
-                                - gate.clone() * (vfp[k].clone() - cv(FPREG + 4 * s + k)),
+                            nv(self.layout.fpreg + 4 * s + k)
+                                - cv(self.layout.fpreg + 4 * s + k)
+                                - gate.clone() * (vfp[k].clone() - cv(self.layout.fpreg + 4 * s + k)),
                         );
                     }
                 }
             }
-            // M_HORN Horner: rows 0..14. mul_b = XFIN; mul_a = FPREG[15] (r0) or
+            // M_HORN Horner: rows 0..14. mul_b = self.layout.xfin; mul_a = self.layout.fpreg[15] (r0) or
             // the previous row's add output (threaded); add_a = mul_c; add_b =
-            // FPREG[14-r]; final add output (r14) == RUNEV.
-            let mh = cv(MSEL + M_HORN as usize);
+            // self.layout.fpreg[14-r]; final add output (r14) == self.layout.runev.
+            let mh = cv(self.layout.msel + M_HORN as usize);
             let rge = |a: usize, b: usize| (a..=b).map(&sf).fold(AB::Expr::ZERO, |x, e| x + e);
             let rows_all = rge(0, 14);
             for k in 0..4 {
-                // mul_b = XFIN on all Horner rows.
-                builder.assert_zero(mh.clone() * rows_all.clone() * (cv(MUL_OFF + 4 + k) - cv(XFIN + k)));
-                // mul_a at r0 = FPREG[15].
-                builder.assert_zero(mh.clone() * sf(0) * (cv(MUL_OFF + k) - cv(FPREG + 60 + k)));
+                // mul_b = self.layout.xfin on all Horner rows.
+                builder.assert_zero(mh.clone() * rows_all.clone() * (cv(self.layout.mul_off + 4 + k) - cv(self.layout.xfin + k)));
+                // mul_a at r0 = self.layout.fpreg[15].
+                builder.assert_zero(mh.clone() * sf(0) * (cv(self.layout.mul_off + k) - cv(self.layout.fpreg + 60 + k)));
                 // add_a = mul_c (same row).
                 builder
-                    .assert_zero(mh.clone() * rows_all.clone() * (cv(ADD_OFF + k) - cv(MUL_OFF + 8 + k)));
-                // add_b = FPREG[14-r] (per-row mux, deg 3).
+                    .assert_zero(mh.clone() * rows_all.clone() * (cv(self.layout.add_off + k) - cv(self.layout.mul_off + 8 + k)));
+                // add_b = self.layout.fpreg[14-r] (per-row mux, deg 3).
                 for r in 0..15 {
                     builder.assert_zero(
-                        mh.clone() * sf(r) * (cv(ADD_OFF + 4 + k) - cv(FPREG + 4 * (14 - r) + k)),
+                        mh.clone() * sf(r) * (cv(self.layout.add_off + 4 + k) - cv(self.layout.fpreg + 4 * (14 - r) + k)),
                     );
                 }
-                // final Horner output == RUNEV.
-                builder.assert_zero(mh.clone() * sf(14) * (cv(ADD_OFF + 8 + k) - cv(RUNEV + k)));
+                // final Horner output == self.layout.runev.
+                builder.assert_zero(mh.clone() * sf(14) * (cv(self.layout.add_off + 8 + k) - cv(self.layout.runev + k)));
             }
             {
                 // Thread the accumulator: next row's mul_a == this row's add_c.
                 let mut t = builder.when_transition();
                 for k in 0..4 {
                     t.assert_zero(
-                        mh.clone() * rge(0, 13) * (nv(MUL_OFF + k) - cv(ADD_OFF + 8 + k)),
+                        mh.clone() * rge(0, 13) * (nv(self.layout.mul_off + k) - cv(self.layout.add_off + 8 + k)),
                     );
                 }
             }
@@ -2819,87 +2844,87 @@ where
 
         // =====================================================================
         // M_RO reduced-opening assembly (endpoint pin, START completion). The
-        // 9-row bank schedule assembles `ro` (the round -1 RUNEV) from the
+        // 9-row bank schedule assembles `ro` (the round -1 self.layout.runev) from the
         // pinned reduced-opening registers, tying the START of the fold chain
         // to the accumulated openings. NOTE the witness uses `bank_add_c(C,B)`
         // (subtractive: writes add_c=C, add_b=B, add_a=C-B, result = add_a) for
         // rows 2..6 and standard `bank_add(A,B)` for rows 7,8. Bank arithmetic
         // (mul_c=a·b, add_c=a+b) is already constrained; here we pin each row's
-        // known operands and thread the intermediates / SCR scratch. Dataflow:
-        //   r0 mul(P0R,PX0R)->SCR0      r1 mul(P1R,PZACC)->SCR1
-        //   r2 addc(A0R,PX0R)=g0; mul(g0,INVZ)->SCR2      [g0=add_a]
-        //   r3 addc(A1R,A0R)=m           [m=add_a -> add_c(r4)]
-        //   r4 addc(m,SCR0)=d1; mul(d1,INVZN)->SCR3       [d1=add_a]
-        //   r5 addc(A2R,A1R)=m           [m=add_a -> add_c(r6)]
-        //   r6 addc(m,SCR1)=d2; mul(d2,INVZ)->SCR4        [d2=add_a]
+        // known operands and thread the intermediates / self.layout.scr scratch. Dataflow:
+        //   r0 mul(self.layout.p0r,self.layout.px0r)->SCR0      r1 mul(self.layout.p1r,self.layout.pzacc)->SCR1
+        //   r2 addc(self.layout.a0r,self.layout.px0r)=g0; mul(g0,self.layout.invz)->SCR2      [g0=add_a]
+        //   r3 addc(self.layout.a1r,self.layout.a0r)=m           [m=add_a -> add_c(r4)]
+        //   r4 addc(m,SCR0)=d1; mul(d1,self.layout.invzn)->SCR3       [d1=add_a]
+        //   r5 addc(self.layout.a2r,self.layout.a1r)=m           [m=add_a -> add_c(r6)]
+        //   r6 addc(m,SCR1)=d2; mul(d2,self.layout.invz)->SCR4        [d2=add_a]
         //   r7 add(SCR2,SCR3)=m          [m=add_c -> add_a(r8)]
-        //   r8 add(m,SCR4)=ro -> RUNEV   [ro=add_c]
+        //   r8 add(m,SCR4)=ro -> self.layout.runev   [ro=add_c]
         // =====================================================================
         {
-            let mr = cv(MSEL + M_RO as usize);
-            let mul_a = |k: usize| cv(MUL_OFF + k);
-            let mul_b = |k: usize| cv(MUL_OFF + 4 + k);
-            let add_a = |k: usize| cv(ADD_OFF + k);
-            let add_b = |k: usize| cv(ADD_OFF + 4 + k);
-            let add_c = |k: usize| cv(ADD_OFF + 8 + k);
-            let scr = |i: usize, k: usize| SCR + 4 * i + k;
+            let mr = cv(self.layout.msel + M_RO as usize);
+            let mul_a = |k: usize| cv(self.layout.mul_off + k);
+            let mul_b = |k: usize| cv(self.layout.mul_off + 4 + k);
+            let add_a = |k: usize| cv(self.layout.add_off + k);
+            let add_b = |k: usize| cv(self.layout.add_off + 4 + k);
+            let add_c = |k: usize| cv(self.layout.add_off + 8 + k);
+            let scr = |i: usize, k: usize| self.layout.scr + 4 * i + k;
             for k in 0..4 {
                 // mul_b operands.
-                builder.assert_zero(mr.clone() * sf(0) * (mul_b(k) - cv(PX0R + k)));
-                builder.assert_zero(mr.clone() * sf(1) * (mul_b(k) - cv(PZACC + k)));
-                builder.assert_zero(mr.clone() * sf(2) * (mul_b(k) - cv(INVZ + k)));
-                builder.assert_zero(mr.clone() * sf(4) * (mul_b(k) - cv(INVZN + k)));
-                builder.assert_zero(mr.clone() * sf(6) * (mul_b(k) - cv(INVZ + k)));
+                builder.assert_zero(mr.clone() * sf(0) * (mul_b(k) - cv(self.layout.px0r + k)));
+                builder.assert_zero(mr.clone() * sf(1) * (mul_b(k) - cv(self.layout.pzacc + k)));
+                builder.assert_zero(mr.clone() * sf(2) * (mul_b(k) - cv(self.layout.invz + k)));
+                builder.assert_zero(mr.clone() * sf(4) * (mul_b(k) - cv(self.layout.invzn + k)));
+                builder.assert_zero(mr.clone() * sf(6) * (mul_b(k) - cv(self.layout.invz + k)));
                 // mul_a: registers (r0,r1); same-row add_a intermediate (r2,4,6).
-                builder.assert_zero(mr.clone() * sf(0) * (mul_a(k) - cv(P0R + k)));
-                builder.assert_zero(mr.clone() * sf(1) * (mul_a(k) - cv(P1R + k)));
+                builder.assert_zero(mr.clone() * sf(0) * (mul_a(k) - cv(self.layout.p0r + k)));
+                builder.assert_zero(mr.clone() * sf(1) * (mul_a(k) - cv(self.layout.p1r + k)));
                 builder.assert_zero(
                     mr.clone() * (sf(2) + sf(4) + sf(6)) * (mul_a(k) - add_a(k)),
                 );
                 // add_c operands for the subtractive rows (bank_add_c first arg):
-                // r2=A0R, r3=A1R, r5=A2R. (r4,r6 add_c come via threading below.)
-                builder.assert_zero(mr.clone() * sf(2) * (add_c(k) - cv(A0R + k)));
-                builder.assert_zero(mr.clone() * sf(3) * (add_c(k) - cv(A1R + k)));
-                builder.assert_zero(mr.clone() * sf(5) * (add_c(k) - cv(A2R + k)));
+                // r2=self.layout.a0r, r3=self.layout.a1r, r5=self.layout.a2r. (r4,r6 add_c come via threading below.)
+                builder.assert_zero(mr.clone() * sf(2) * (add_c(k) - cv(self.layout.a0r + k)));
+                builder.assert_zero(mr.clone() * sf(3) * (add_c(k) - cv(self.layout.a1r + k)));
+                builder.assert_zero(mr.clone() * sf(5) * (add_c(k) - cv(self.layout.a2r + k)));
                 // add_b operands.
-                builder.assert_zero(mr.clone() * sf(2) * (add_b(k) - cv(PX0R + k)));
-                builder.assert_zero(mr.clone() * sf(3) * (add_b(k) - cv(A0R + k)));
+                builder.assert_zero(mr.clone() * sf(2) * (add_b(k) - cv(self.layout.px0r + k)));
+                builder.assert_zero(mr.clone() * sf(3) * (add_b(k) - cv(self.layout.a0r + k)));
                 builder.assert_zero(mr.clone() * sf(4) * (add_b(k) - cv(scr(0, k))));
-                builder.assert_zero(mr.clone() * sf(5) * (add_b(k) - cv(A1R + k)));
+                builder.assert_zero(mr.clone() * sf(5) * (add_b(k) - cv(self.layout.a1r + k)));
                 builder.assert_zero(mr.clone() * sf(6) * (add_b(k) - cv(scr(1, k))));
                 builder.assert_zero(mr.clone() * sf(7) * (add_b(k) - cv(scr(3, k))));
                 builder.assert_zero(mr.clone() * sf(8) * (add_b(k) - cv(scr(4, k))));
                 // r7 is a standard bank_add(SCR2, SCR3): add_a = SCR2.
                 builder.assert_zero(mr.clone() * sf(7) * (add_a(k) - cv(scr(2, k))));
             }
-            // SCR scratch carry + capture the bank output on its producing row
+            // self.layout.scr scratch carry + capture the bank output on its producing row
             // (SCR0@0 SCR1@1 SCR2@2 SCR3@4 SCR4@6); intermediate threading; and
-            // RUNEV set are transition constraints.
+            // self.layout.runev set are transition constraints.
             let cap_rows = [0usize, 1, 2, 4, 6];
             let mut t = builder.when_transition();
             for k in 0..4 {
                 for (i, &cr) in cap_rows.iter().enumerate() {
-                    // Gated by mr: only the M_RO perm; folds own SCR elsewhere.
+                    // Gated by mr: only the M_RO perm; folds own self.layout.scr elsewhere.
                     t.assert_zero(
                         mr.clone()
                             * (nv(scr(i, k))
                                 - cv(scr(i, k))
-                                - sf(cr) * (cv(MUL_OFF + 8 + k) - cv(scr(i, k)))),
+                                - sf(cr) * (cv(self.layout.mul_off + 8 + k) - cv(scr(i, k)))),
                     );
                 }
                 // Subtractive-row result add_a threads into next row's add_c
                 // (r3->r4, r5->r6).
                 t.assert_zero(
-                    mr.clone() * (sf(3) + sf(5)) * (nv(ADD_OFF + 8 + k) - cv(ADD_OFF + k)),
+                    mr.clone() * (sf(3) + sf(5)) * (nv(self.layout.add_off + 8 + k) - cv(self.layout.add_off + k)),
                 );
                 // r7 result add_c threads into r8's add_a.
-                t.assert_zero(mr.clone() * sf(7) * (nv(ADD_OFF + k) - cv(ADD_OFF + 8 + k)));
-                // ro = add_c(r8) -> RUNEV.
-                t.assert_zero(mr.clone() * sf(8) * (nv(RUNEV + k) - cv(ADD_OFF + 8 + k)));
+                t.assert_zero(mr.clone() * sf(7) * (nv(self.layout.add_off + k) - cv(self.layout.add_off + 8 + k)));
+                // ro = add_c(r8) -> self.layout.runev.
+                t.assert_zero(mr.clone() * sf(8) * (nv(self.layout.runev + k) - cv(self.layout.add_off + 8 + k)));
             }
         }
 
-        // The last-row phase anchor is the QSEL check emitted above.
+        // The last-row phase anchor is the self.layout.qsel check emitted above.
         let _ = (cf, pv, xorsel, consumersel);
     }
 }
@@ -3257,8 +3282,9 @@ fn write_row(
     regs: &Regs,
     program: &[u32; QSLOTS],
     info: Option<&PInfo>,
+    layout: &GateLayout,
 ) {
-    let base = row * GATE_WIDTH;
+    let base = row * layout.gate_width;
     let w = |v: &mut [Val], col: usize, x: Val| v[base + col] = x;
     let wb = |v: &mut [Val], col: usize, x: bool| v[base + col] = Val::from_bool(x);
     let wu = |v: &mut [Val], col: usize, x: u32| v[base + col] = Val::from_u32(x);
@@ -3268,43 +3294,43 @@ fn write_row(
 
     // Program ring + head decode.
     for i in 0..QSLOTS {
-        wu(v, PR + i, program[(i + regs.pr_rot) % QSLOTS]);
+        wu(v, layout.pr + i, program[(i + regs.pr_rot) % QSLOTS]);
     }
     let head = program[regs.pr_rot % QSLOTS];
     for k in 0..15 {
-        wb(v, PD + k, (head >> k) & 1 == 1);
+        wb(v, layout.pd + k, (head >> k) & 1 == 1);
     }
     let role = head & 0xf;
     let dparam = (head >> 4) & 0x3f;
     let micro = (head >> 10) & 0x1f;
     // Role / micro / dparam selectors (all zero outside query phase).
     if regs.phq {
-        wb(v, RSEL + role as usize, true);
-        wb(v, MLO + (micro & 7) as usize, true);
-        wb(v, MSEL + micro as usize, true);
+        wb(v, layout.rsel + role as usize, true);
+        wb(v, layout.mlo + (micro & 7) as usize, true);
+        wb(v, layout.msel + micro as usize, true);
         let absany = (1..=5).contains(&role);
         if absany {
-            wb(v, DRND + dparam as usize, true);
+            wb(v, layout.drnd + dparam as usize, true);
         }
-        wb(v, LFS, role == R_ABS_F34 || role == R_ABS_F16);
+        wb(v, layout.lfs, role == R_ABS_F34 || role == R_ABS_F16);
     }
-    // MHI/DLO/DHI are pure bit products (no phase gate).
-    wb(v, MHI + ((micro >> 3) & 3) as usize, true);
-    wb(v, DLO + (dparam & 7) as usize, true);
+    // layout.mhi/layout.dlo/layout.dhi are pure bit products (no phase gate).
+    wb(v, layout.mhi + ((micro >> 3) & 3) as usize, true);
+    wb(v, layout.dlo + (dparam & 7) as usize, true);
     if (dparam >> 3) < 3 {
-        wb(v, DHI + (dparam >> 3) as usize, true);
+        wb(v, layout.dhi + (dparam >> 3) as usize, true);
     }
-    wb(v, PHC, regs.phc);
-    wb(v, PHQ, regs.phq);
-    // QSEL / QCNT.
-    wb(v, ring_at(QSEL, NQ + 1, regs.qsel) - QSEL + QSEL, true);
-    wu(v, QCNT, regs.qcnt);
+    wb(v, layout.phc, regs.phc);
+    wb(v, layout.phq, regs.phq);
+    // layout.qsel / layout.qcnt.
+    wb(v, ring_at(layout.qsel, NQ + 1, regs.qsel) - layout.qsel + layout.qsel, true);
+    wu(v, layout.qcnt, regs.qcnt);
     let qcw = regs.qcnt == 1;
-    wb(v, QCW, qcw);
+    wb(v, layout.qcw, qcw);
     if !qcw {
         w(
             v,
-            QCWI,
+            layout.qcwi,
             (Val::from_u32(regs.qcnt) - Val::ONE).inverse(),
         );
     }
@@ -3316,38 +3342,38 @@ fn write_row(
     };
     if regs.phq {
         for k in 0..LOG_MAX {
-            wb(v, IDXB + k, (idx >> k) & 1 == 1);
+            wb(v, layout.idxb + k, (idx >> k) & 1 == 1);
         }
     }
-    // CAPS8 from idx bits 19..21 (all-zero bits select element 0).
+    // layout.caps8 from idx bits 19..21 (all-zero bits select element 0).
     let capj = ((idx >> 19) & 7) as usize;
-    wb(v, CAPS8 + if regs.phq { capj } else { 0 }, true);
-    // DBIT / GLC / GRC.
+    wb(v, layout.caps8 + if regs.phq { capj } else { 0 }, true);
+    // layout.dbit / layout.glc / layout.grc.
     let pathish = regs.phq && (R_PATH..=R_PLAST_F3).contains(&role);
     if pathish {
         let dbit = (idx >> dparam) & 1 == 1;
-        wb(v, DBIT, dbit);
-        wb(v, GLC, !dbit);
-        wb(v, GRC, dbit);
+        wb(v, layout.dbit, dbit);
+        wb(v, layout.glc, !dbit);
+        wb(v, layout.grc, dbit);
     }
     // Flush automaton.
-    wb(v, ring_at(FRING, 8, regs.fring) - FRING + FRING, true);
-    wu(v, BLKCNT, regs.blkcnt);
+    wb(v, ring_at(layout.fring, 8, regs.fring) - layout.fring + layout.fring, true);
+    wu(v, layout.blkcnt, regs.blkcnt);
     let blklast = regs.blkcnt == 1;
-    wb(v, BLKLAST, blklast);
+    wb(v, layout.blklast, blklast);
     if !blklast {
-        w(v, BLKINV, (Val::from_u32(regs.blkcnt) - Val::ONE).inverse());
+        w(v, layout.blkinv, (Val::from_u32(regs.blkcnt) - Val::ONE).inverse());
     }
-    for (cmp, inv, tgt) in [(CMPA, CMPAI, 76u32), (CMPB, CMPBI, 3u32)] {
+    for (cmp, inv, tgt) in [(layout.cmpa, layout.cmpai, 76u32), (layout.cmpb, layout.cmpbi, 3u32)] {
         let hit = regs.blkcnt == tgt;
         wb(v, cmp, hit);
         if !hit {
             w(v, inv, (Val::from_u32(regs.blkcnt) - Val::from_u32(tgt)).inverse());
         }
     }
-    wb(v, BIDX + regs.bidx.min(5), true);
-    wb(v, REFSEL, regs.refsel);
-    // SHSEL (derived; assert against the plan).
+    wb(v, layout.bidx + regs.bidx.min(5), true);
+    wb(v, layout.refsel, regs.refsel);
+    // layout.shsel (derived; assert against the plan).
     if regs.phc && !regs.refsel {
         if let Some(PInfo::Obs { flush, block }) = info {
             let si = shsel_index(*flush, *block);
@@ -3359,77 +3385,77 @@ fn write_row(
                 (f, b, _) => shsel_index(f, b),
             };
             assert_eq!(si, derived, "shape drift at flush {flush} block {block}");
-            wb(v, SHSEL + si, true);
+            wb(v, layout.shsel + si, true);
         } else {
             panic!("chal perm without obs info");
         }
     }
-    // NEEDL.
+    // layout.needl.
     let need = blklast && regs.grp == GROUPREQ[regs.fring + 1];
-    wb(v, NEEDL, need);
+    wb(v, layout.needl, need);
     // Draw automaton state.
-    wb(v, ring_at(GRP, N_GROUPS, regs.grp) - GRP + GRP, true);
-    wb(v, ring_at(COEF, 4, regs.coef) - COEF + COEF, true);
+    wb(v, ring_at(layout.grp, N_GROUPS, regs.grp) - layout.grp + layout.grp, true);
+    wb(v, ring_at(layout.coef, 4, regs.coef) - layout.coef + layout.coef, true);
     for k in 0..4 {
-        wu(v, CURCH + k, regs.curch[k]);
+        wu(v, layout.curch + k, regs.curch[k]);
     }
-    wb(v, FSFULL, regs.fsfull);
+    wb(v, layout.fsfull, regs.fsfull);
     // Registers.
     for (i, e) in regs.chal.iter().enumerate() {
-        we(v, CHAL + 4 * i, *e);
+        we(v, layout.chal + 4 * i, *e);
     }
-    we(v, FA2, regs.fa2);
-    we(v, ZNREG, regs.zn);
+    we(v, layout.fa2, regs.fa2);
+    we(v, layout.znreg, regs.zn);
     for q in 0..NQ {
-        wu(v, IDXR + q, regs.idxr[q]);
+        wu(v, layout.idxr + q, regs.idxr[q]);
     }
     for i in 0..68 {
-        wu(v, OREG + i, regs.oreg[i] as u32);
+        wu(v, layout.oreg + i, regs.oreg[i] as u32);
     }
-    wb(v, POS + regs.pos, true);
-    wb(v, VC + regs.vc % 16, true);
-    wb(v, FPI + regs.fpi % 16, true);
+    wb(v, layout.pos + regs.pos, true);
+    wb(v, layout.vc + regs.vc % 16, true);
+    wb(v, layout.fpi + regs.fpi % 16, true);
     let mut vce = false;
     if regs.vc % 2 == 0 {
         vce = true;
     }
-    wb(v, VCE, vce);
-    w(v, ASM0, regs.asm0);
-    w(v, ASM1, regs.asm1);
-    we(v, PBUF, regs.pbuf);
-    we(v, PREG, regs.preg);
-    we(v, PZACC, regs.pzacc);
-    we(v, A0R, regs.a0);
-    we(v, A1R, regs.a1);
-    we(v, A2R, regs.a2);
-    we(v, P0R, regs.p0);
-    we(v, P1R, regs.p1);
-    we(v, PX0R, regs.px0);
+    wb(v, layout.vce, vce);
+    w(v, layout.asm0, regs.asm0);
+    w(v, layout.asm1, regs.asm1);
+    we(v, layout.pbuf, regs.pbuf);
+    we(v, layout.preg, regs.preg);
+    we(v, layout.pzacc, regs.pzacc);
+    we(v, layout.a0r, regs.a0);
+    we(v, layout.a1r, regs.a1);
+    we(v, layout.a2r, regs.a2);
+    we(v, layout.p0r, regs.p0);
+    we(v, layout.p1r, regs.p1);
+    we(v, layout.px0r, regs.px0);
     for i in 0..16 {
-        we(v, FPREG + 4 * i, regs.fpreg[i]);
+        we(v, layout.fpreg + 4 * i, regs.fpreg[i]);
     }
     for i in 0..8 {
-        we(v, SCR + 4 * i, regs.scr[i]);
+        we(v, layout.scr + 4 * i, regs.scr[i]);
     }
     for i in 0..4 {
-        we(v, BREG + 4 * i, regs.breg[i]);
+        we(v, layout.breg + 4 * i, regs.breg[i]);
     }
-    we(v, INV2S, regs.inv2s);
-    we(v, INVZ, regs.invz);
-    we(v, INVZN, regs.invzn);
-    we(v, XREG, regs.xreg);
-    we(v, XFIN, regs.xfin);
-    we(v, RUNEV, regs.runev);
+    we(v, layout.inv2s, regs.inv2s);
+    we(v, layout.invz, regs.invz);
+    we(v, layout.invzn, regs.invzn);
+    we(v, layout.xreg, regs.xreg);
+    we(v, layout.xfin, regs.xfin);
+    we(v, layout.runev, regs.runev);
     for m in 0..16 {
-        wu(v, F2DIG + m, regs.f2dig[m] as u32);
+        wu(v, layout.f2dig + m, regs.f2dig[m] as u32);
     }
-    wb(v, PHD, regs.phd);
+    wb(v, layout.phd, regs.phd);
     let cmpc = regs.blkcnt == 148;
-    wb(v, CMPC, cmpc);
+    wb(v, layout.cmpc, cmpc);
     if !cmpc {
         w(
             v,
-            CMPCI,
+            layout.cmpci,
             (Val::from_u32(regs.blkcnt) - Val::from_u32(148)).inverse(),
         );
     }
@@ -3440,29 +3466,29 @@ fn write_row(
 // The builder
 // ---------------------------------------------------------------------------
 
-fn bank_mul(v: &mut [Val], row: usize, a: Ext, b: Ext) -> Ext {
+fn bank_mul(v: &mut [Val], row: usize, a: Ext, b: Ext, layout: &GateLayout) -> Ext {
     let c = a * b;
-    let base = row * GATE_WIDTH;
-    v[base + MUL_OFF..base + MUL_OFF + 4].copy_from_slice(&ext_limbs(a));
-    v[base + MUL_OFF + 4..base + MUL_OFF + 8].copy_from_slice(&ext_limbs(b));
-    v[base + MUL_OFF + 8..base + MUL_OFF + 12].copy_from_slice(&ext_limbs(c));
+    let base = row * layout.gate_width;
+    v[base + layout.mul_off..base + layout.mul_off + 4].copy_from_slice(&ext_limbs(a));
+    v[base + layout.mul_off + 4..base + layout.mul_off + 8].copy_from_slice(&ext_limbs(b));
+    v[base + layout.mul_off + 8..base + layout.mul_off + 12].copy_from_slice(&ext_limbs(c));
     c
 }
-fn bank_add(v: &mut [Val], row: usize, a: Ext, b: Ext) -> Ext {
+fn bank_add(v: &mut [Val], row: usize, a: Ext, b: Ext, layout: &GateLayout) -> Ext {
     let c = a + b;
-    let base = row * GATE_WIDTH;
-    v[base + ADD_OFF..base + ADD_OFF + 4].copy_from_slice(&ext_limbs(a));
-    v[base + ADD_OFF + 4..base + ADD_OFF + 8].copy_from_slice(&ext_limbs(b));
-    v[base + ADD_OFF + 8..base + ADD_OFF + 12].copy_from_slice(&ext_limbs(c));
+    let base = row * layout.gate_width;
+    v[base + layout.add_off..base + layout.add_off + 4].copy_from_slice(&ext_limbs(a));
+    v[base + layout.add_off + 4..base + layout.add_off + 8].copy_from_slice(&ext_limbs(b));
+    v[base + layout.add_off + 8..base + layout.add_off + 12].copy_from_slice(&ext_limbs(c));
     c
 }
 /// Add row with a fixed sum: a = c - b (the bank's subtraction form).
-fn bank_add_c(v: &mut [Val], row: usize, c: Ext, b: Ext) -> Ext {
+fn bank_add_c(v: &mut [Val], row: usize, c: Ext, b: Ext, layout: &GateLayout) -> Ext {
     let a = c - b;
-    let base = row * GATE_WIDTH;
-    v[base + ADD_OFF..base + ADD_OFF + 4].copy_from_slice(&ext_limbs(a));
-    v[base + ADD_OFF + 4..base + ADD_OFF + 8].copy_from_slice(&ext_limbs(b));
-    v[base + ADD_OFF + 8..base + ADD_OFF + 12].copy_from_slice(&ext_limbs(c));
+    let base = row * layout.gate_width;
+    v[base + layout.add_off..base + layout.add_off + 4].copy_from_slice(&ext_limbs(a));
+    v[base + layout.add_off + 4..base + layout.add_off + 8].copy_from_slice(&ext_limbs(b));
+    v[base + layout.add_off + 8..base + layout.add_off + 12].copy_from_slice(&ext_limbs(c));
     a
 }
 
@@ -3477,40 +3503,41 @@ fn fill_fs_row(
     odd: bool,
     crot: bool,
     grot: bool,
+    layout: &GateLayout,
 ) {
-    let base = row * GATE_WIDTH;
+    let base = row * layout.gate_width;
     for i in 0..8 {
-        v[base + FSBITS + i] = Val::from_bool((lo_byte >> i) & 1 == 1);
-        v[base + FSBITS + 8 + i] = Val::from_bool((hi_byte >> i) & 1 == 1);
+        v[base + layout.fsbits + i] = Val::from_bool((lo_byte >> i) & 1 == 1);
+        v[base + layout.fsbits + 8 + i] = Val::from_bool((hi_byte >> i) & 1 == 1);
     }
-    v[base + FSACC] = Val::from_u32(acc);
-    v[base + FSGATE] = Val::ONE;
-    v[base + FSODD] = Val::from_bool(odd);
+    v[base + layout.fsacc] = Val::from_u32(acc);
+    v[base + layout.fsgate] = Val::ONE;
+    v[base + layout.fsodd] = Val::from_bool(odd);
     let p3a = (hi_byte & 0b111) == 0b111;
     let p3b = ((hi_byte >> 3) & 0b111) == 0b111;
     let t7 = p3a && p3b && ((hi_byte >> 6) & 1) == 1;
-    v[base + FSP3A] = Val::from_bool(p3a);
-    v[base + FSP3B] = Val::from_bool(p3b);
-    v[base + FST7] = Val::from_bool(t7);
+    v[base + layout.fsp3a] = Val::from_bool(p3a);
+    v[base + layout.fsp3b] = Val::from_bool(p3b);
+    v[base + layout.fst7] = Val::from_bool(t7);
     let low24 = acc + ((lo_byte as u32) << 16);
     let nz = low24 != 0;
-    v[base + FSNZ] = Val::from_bool(nz);
+    v[base + layout.fsnz] = Val::from_bool(nz);
     if nz {
-        v[base + FSINV] = Val::from_u32(low24).inverse();
+        v[base + layout.fsinv] = Val::from_u32(low24).inverse();
     }
-    v[base + FSACCEPT] = Val::from_bool(!(t7 && nz));
-    v[base + CROT] = Val::from_bool(crot);
-    v[base + GROT] = Val::from_bool(grot);
+    v[base + layout.fsaccept] = Val::from_bool(!(t7 && nz));
+    v[base + layout.crot] = Val::from_bool(crot);
+    v[base + layout.grot] = Val::from_bool(grot);
 }
 
 /// Word canonicity columns for one consumed word (idx 0 or 1).
-fn fill_canon(v: &mut [Val], row: usize, word: usize, w: u32) {
+fn fill_canon(v: &mut [Val], row: usize, word: usize, w: u32, layout: &GateLayout) {
     assert!(w < P, "honest witness words are canonical");
-    let base = row * GATE_WIDTH;
+    let base = row * layout.gate_width;
     let (hb, ta, topa, lbnz, lbi, lonz, loi) = if word == 0 {
-        (HB0, TA0, TOPA0, LBNZ0, LBI0, LONZ0, LOI0)
+        (layout.hb0, layout.ta0, layout.topa0, layout.lbnz0, layout.lbi0, layout.lonz0, layout.loi0)
     } else {
-        (HB1, TA1, TOPA1, LBNZ1, LBI1, LONZ1, LOI1)
+        (layout.hb1, layout.ta1, layout.topa1, layout.lbnz1, layout.lbi1, layout.lonz1, layout.loi1)
     };
     let hi = w >> 16;
     for i in 0..16 {
@@ -3547,6 +3574,8 @@ pub(crate) fn build_gate_trace(
 ) -> (RowMajorMatrix<Val>, GateMeta) {
     let consts = gate_consts();
     let program = qprogram();
+    let shape = GateShape::narrow();
+    let layout = GateLayout::from_shape(&shape);
     let opvs = outer_pvs(sched, inner_pvs);
     let (inputs, infos) = lane_plan(sched);
     let n_perms = inputs.len();
@@ -3555,10 +3584,10 @@ pub(crate) fn build_gate_trace(
     let keccak = p3_keccak_air::generate_trace_rows::<Val>(inputs.clone(), 0);
     let rows = keccak.height();
     assert_eq!(rows, 1 << 16, "gate rectangle height");
-    let mut values = Vec::with_capacity((rows << extra_capacity_bits) * GATE_WIDTH);
-    values.resize(rows * GATE_WIDTH, Val::ZERO);
+    let mut values = Vec::with_capacity((rows << extra_capacity_bits) * layout.gate_width);
+    values.resize(rows * layout.gate_width, Val::ZERO);
     for r in 0..rows {
-        values[r * GATE_WIDTH..r * GATE_WIDTH + NUM_KECCAK_COLS]
+        values[r * layout.gate_width..r * layout.gate_width + NUM_KECCAK_COLS]
             .copy_from_slice(&keccak.values[r * NUM_KECCAK_COLS..(r + 1) * NUM_KECCAK_COLS]);
     }
     drop(keccak);
@@ -3681,20 +3710,20 @@ pub(crate) fn build_gate_trace(
 
         for r in 0..24 {
             let row = base_row + r;
-            write_row(&mut values, row, r, &regs, &program, Some(info));
-            // GPB for fold-absorb perms (write over write_row's zeros).
+            write_row(&mut values, row, r, &regs, &program, Some(info), &layout);
+            // layout.gpb for fold-absorb perms (write over write_row's zeros).
             if let Some(rf) = fold_r {
                 let la = LOG_ARITIES[rf];
                 for k in 0..4 {
                     let b = k < la && (qidx >> (CUM[rf] + k)) & 1 == 1;
-                    values[row * GATE_WIDTH + GPB + k] = Val::from_bool(b);
+                    values[row * layout.gate_width + layout.gpb + k] = Val::from_bool(b);
                 }
                 let gp = (qidx >> CUM[rf]) & ((1 << la) - 1);
-                values[row * GATE_WIDTH + HIT] =
+                values[row * layout.gate_width + layout.hit] =
                     Val::from_bool(regs.vc % 16 == gp);
             } else {
-                // HIT defining constraint with GPB = 0: hit = [vc == 0].
-                values[row * GATE_WIDTH + HIT] = Val::from_bool(regs.vc % 16 == 0);
+                // layout.hit defining constraint with layout.gpb = 0: hit = [vc == 0].
+                values[row * layout.gate_width + layout.hit] = Val::from_bool(regs.vc % 16 == 0);
             }
 
             // --- W words + XOR bits -------------------------------------
@@ -3711,17 +3740,17 @@ pub(crate) fn build_gate_trace(
                 };
                 w0v = limb(0) as u32 | ((limb(1) as u32) << 16);
                 w1v = limb(2) as u32 | ((limb(3) as u32) << 16);
-                values[row * GATE_WIDTH + W0C] = Val::from_u64(w0v as u64);
-                values[row * GATE_WIDTH + W1C] = Val::from_u64(w1v as u64);
+                values[row * layout.gate_width + layout.w0c] = Val::from_u64(w0v as u64);
+                values[row * layout.gate_width + layout.w1c] = Val::from_u64(w1v as u64);
                 if is_xor {
                     for j in 0..4 {
                         let pl = st_limb(pre, 4 * r + j);
                         let ol = st_limb(prev_out.unwrap(), 4 * r + j);
                         assert_eq!(ol, regs.oreg[4 * r + j], "oreg capture");
                         for i in 0..16 {
-                            values[row * GATE_WIDTH + PBIT + 16 * j + i] =
+                            values[row * layout.gate_width + layout.pbit + 16 * j + i] =
                                 Val::from_bool((pl >> i) & 1 == 1);
-                            values[row * GATE_WIDTH + OBIT + 16 * j + i] =
+                            values[row * layout.gate_width + layout.obit + 16 * j + i] =
                                 Val::from_bool((ol >> i) & 1 == 1);
                         }
                     }
@@ -3769,18 +3798,18 @@ pub(crate) fn build_gate_trace(
                 }
                 (czd, cz7, cfl, cx0, cx1)
             };
-            let b = row * GATE_WIDTH;
-            values[b + CZD] = Val::from_bool(czd);
-            values[b + CZ7] = Val::from_bool(cz7);
-            values[b + CF] = Val::from_bool(cfl);
-            values[b + CX0] = Val::from_bool(cx0);
-            values[b + CX1] = Val::from_bool(cx1);
+            let b = row * layout.gate_width;
+            values[b + layout.czd] = Val::from_bool(czd);
+            values[b + layout.cz7] = Val::from_bool(cz7);
+            values[b + layout.cf] = Val::from_bool(cfl);
+            values[b + layout.cx0] = Val::from_bool(cx0);
+            values[b + layout.cx1] = Val::from_bool(cx1);
             let casm = czd || cz7 || cfl;
-            values[b + CONSZ] = Val::from_bool(czd && regs.pos == 1);
-            values[b + CONSF] = Val::from_bool(cfl && regs.pos == 1);
+            values[b + layout.consz] = Val::from_bool(czd && regs.pos == 1);
+            values[b + layout.consf] = Val::from_bool(cfl && regs.pos == 1);
             if casm {
-                fill_canon(&mut values, row, 0, w0v);
-                fill_canon(&mut values, row, 1, w1v);
+                fill_canon(&mut values, row, 0, w0v, &layout);
+                fill_canon(&mut values, row, 1, w1v, &layout);
             }
 
             // --- PZ captures (before this row's consume) ------------------
@@ -3891,7 +3920,7 @@ pub(crate) fn build_gate_trace(
                             (x2 as u16) | ((x3 as u16) << 8),
                             "draw limb (even)"
                         );
-                        fill_fs_row(&mut values, row, x3, x2, 0, false, false, false);
+                        fill_fs_row(&mut values, row, x3, x2, 0, false, false, false, &layout);
                     } else {
                         assert_eq!(
                             st_limb(pre, 2 * g),
@@ -3903,7 +3932,7 @@ pub(crate) fn build_gate_trace(
                             DrawKind::Field { accept, .. } => (accept, accept && regs.coef == 3),
                             DrawKind::Bits { .. } => (false, true),
                         };
-                        fill_fs_row(&mut values, row, x1, x0, acc, true, crot, grot);
+                        fill_fs_row(&mut values, row, x1, x0, acc, true, crot, grot, &layout);
                         // Register updates (the odd-row transition).
                         match d.kind {
                             DrawKind::Field {
@@ -3965,7 +3994,7 @@ pub(crate) fn build_gate_trace(
                             } else {
                                 regs.mchain
                             };
-                            regs.mchain = bank_mul(&mut values, row, a, bmux);
+                            regs.mchain = bank_mul(&mut values, row, a, bmux, &layout);
                             if r == 21 {
                                 assert_eq!(regs.mchain, qr.x, "x chain");
                                 regs.xreg = regs.mchain;
@@ -3974,13 +4003,13 @@ pub(crate) fn build_gate_trace(
                     }
                     M_INV => {
                         if r == 0 {
-                            let zx = bank_add_c(&mut values, row, regs.chal[G_ZETA], regs.xreg);
-                            let cp = bank_mul(&mut values, row, zx, qr.inv_z);
+                            let zx = bank_add_c(&mut values, row, regs.chal[G_ZETA], regs.xreg, &layout);
+                            let cp = bank_mul(&mut values, row, zx, qr.inv_z, &layout);
                             assert_eq!(cp, Ext::ONE, "inv_z witness");
                             regs.invz = qr.inv_z;
                         } else if r == 1 {
-                            let znx = bank_add_c(&mut values, row, regs.zn, regs.xreg);
-                            let cp = bank_mul(&mut values, row, znx, qr.inv_zn);
+                            let znx = bank_add_c(&mut values, row, regs.zn, regs.xreg, &layout);
+                            let cp = bank_mul(&mut values, row, znx, qr.inv_zn, &layout);
                             assert_eq!(cp, Ext::ONE, "inv_zn witness");
                             regs.invzn = qr.inv_zn;
                         }
@@ -3993,12 +4022,12 @@ pub(crate) fn build_gate_trace(
                             let bmux =
                                 ext_base(if bit { consts.sk[rf][r] } else { Val::ONE });
                             let a = if r == 0 { Ext::ONE } else { regs.mchain };
-                            regs.mchain = bank_mul(&mut values, row, a, bmux);
+                            regs.mchain = bank_mul(&mut values, row, a, bmux, &layout);
                         } else if r == lf {
                             let fold = &qr.folds[rf];
                             assert_eq!(regs.mchain, fold.s, "s chain");
                             let a = regs.mchain * ext_base(Val::from_u32(2));
-                            let cp = bank_mul(&mut values, row, a, fold.inv_2s);
+                            let cp = bank_mul(&mut values, row, a, fold.inv_2s, &layout);
                             assert_eq!(cp, Ext::ONE, "inv2s witness");
                             regs.inv2s = fold.inv_2s;
                         }
@@ -4008,34 +4037,34 @@ pub(crate) fn build_gate_trace(
                         let la = LOG_ARITIES[rf];
                         if r == 0 {
                             let cb =
-                                bank_mul(&mut values, row, regs.chal[G_BETA0 + rf], regs.inv2s);
+                                bank_mul(&mut values, row, regs.chal[G_BETA0 + rf], regs.inv2s, &layout);
                             regs.breg[0] = cb;
                         } else if r < la {
                             let bl = regs.breg[r - 1];
-                            let cb = bank_mul(&mut values, row, bl, bl);
+                            let cb = bank_mul(&mut values, row, bl, bl, &layout);
                             regs.breg[r] = cb * ext_base(Val::from_u32(2));
                         }
                     }
                     M_RO => match r {
-                        0 => regs.scr[0] = bank_mul(&mut values, row, regs.p0, regs.px0),
-                        1 => regs.scr[1] = bank_mul(&mut values, row, regs.p1, regs.pzacc),
+                        0 => regs.scr[0] = bank_mul(&mut values, row, regs.p0, regs.px0, &layout),
+                        1 => regs.scr[1] = bank_mul(&mut values, row, regs.p1, regs.pzacc, &layout),
                         2 => {
-                            let g0 = bank_add_c(&mut values, row, regs.a0, regs.px0);
-                            regs.scr[2] = bank_mul(&mut values, row, g0, regs.invz);
+                            let g0 = bank_add_c(&mut values, row, regs.a0, regs.px0, &layout);
+                            regs.scr[2] = bank_mul(&mut values, row, g0, regs.invz, &layout);
                         }
-                        3 => regs.mchain = bank_add_c(&mut values, row, regs.a1, regs.a0),
+                        3 => regs.mchain = bank_add_c(&mut values, row, regs.a1, regs.a0, &layout),
                         4 => {
-                            let d1 = bank_add_c(&mut values, row, regs.mchain, regs.scr[0]);
-                            regs.scr[3] = bank_mul(&mut values, row, d1, regs.invzn);
+                            let d1 = bank_add_c(&mut values, row, regs.mchain, regs.scr[0], &layout);
+                            regs.scr[3] = bank_mul(&mut values, row, d1, regs.invzn, &layout);
                         }
-                        5 => regs.mchain = bank_add_c(&mut values, row, regs.a2, regs.a1),
+                        5 => regs.mchain = bank_add_c(&mut values, row, regs.a2, regs.a1, &layout),
                         6 => {
-                            let d2 = bank_add_c(&mut values, row, regs.mchain, regs.scr[1]);
-                            regs.scr[4] = bank_mul(&mut values, row, d2, regs.invz);
+                            let d2 = bank_add_c(&mut values, row, regs.mchain, regs.scr[1], &layout);
+                            regs.scr[4] = bank_mul(&mut values, row, d2, regs.invz, &layout);
                         }
-                        7 => regs.mchain = bank_add(&mut values, row, regs.scr[2], regs.scr[3]),
+                        7 => regs.mchain = bank_add(&mut values, row, regs.scr[2], regs.scr[3], &layout),
                         8 => {
-                            let ro = bank_add(&mut values, row, regs.mchain, regs.scr[4]);
+                            let ro = bank_add(&mut values, row, regs.mchain, regs.scr[4], &layout);
                             assert_eq!(ro, scale(qr.ro), "reduced opening");
                             regs.runev = ro;
                         }
@@ -4067,7 +4096,7 @@ pub(crate) fn build_gate_trace(
                             let bit = (qidx >> (14 + r)) & 1 == 1;
                             let bmux = ext_base(if bit { consts.kx[r] } else { Val::ONE });
                             let a = if r == 0 { Ext::ONE } else { regs.mchain };
-                            regs.mchain = bank_mul(&mut values, row, a, bmux);
+                            regs.mchain = bank_mul(&mut values, row, a, bmux, &layout);
                             if r == 7 {
                                 assert_eq!(regs.mchain, qr.x_fin, "x_fin chain");
                                 regs.xfin = regs.mchain;
@@ -4077,8 +4106,8 @@ pub(crate) fn build_gate_trace(
                     M_HORN => {
                         if r < 15 {
                             let a = if r == 0 { regs.fpreg[15] } else { regs.mchain };
-                            let c1 = bank_mul(&mut values, row, a, regs.xfin);
-                            let c2 = bank_add(&mut values, row, c1, regs.fpreg[14 - r]);
+                            let c1 = bank_mul(&mut values, row, a, regs.xfin, &layout);
+                            let c2 = bank_add(&mut values, row, c1, regs.fpreg[14 - r], &layout);
                             regs.mchain = c2;
                             if r == 14 {
                                 assert_eq!(c2, scale(qr.final_eval), "final-poly eval");
@@ -4093,10 +4122,10 @@ pub(crate) fn build_gate_trace(
             if pi == trailer_pi {
                 if r == 12 {
                     regs.fa2 =
-                        bank_mul(&mut values, row, regs.chal[G_FRIALPHA], regs.chal[G_FRIALPHA]);
+                        bank_mul(&mut values, row, regs.chal[G_FRIALPHA], regs.chal[G_FRIALPHA], &layout);
                 } else if r == 13 {
                     regs.zn =
-                        bank_mul(&mut values, row, regs.chal[G_ZETA], ext_base(consts.g_trace));
+                        bank_mul(&mut values, row, regs.chal[G_ZETA], ext_base(consts.g_trace), &layout);
                 }
             }
 
@@ -4189,7 +4218,7 @@ pub(crate) fn build_gate_trace(
 
     // Pad rows: frozen registers.
     for row in 24 * n_perms..rows {
-        write_row(&mut values, row, row % 24, &regs, &program, None);
+        write_row(&mut values, row, row % 24, &regs, &program, None, &layout);
     }
     // Global self-checks against the recorder.
     assert_eq!(regs.qsel, NQ, "all query blocks completed");
@@ -4215,16 +4244,16 @@ pub(crate) fn build_gate_trace(
     );
     assert_eq!(regs.fpi, 16, "final poly fully captured");
 
-    fill_derived(&mut values);
+    fill_derived(&mut values, &layout);
 
-    (RowMajorMatrix::new(values, GATE_WIDTH), meta)
+    (RowMajorMatrix::new(values, layout.gate_width), meta)
 }
 
 /// Fill the Phase-1a degree-reduction columns: pure current-row functions of
 /// already-filled columns, mirroring the defining constraints in `eval`. Kept
 /// as a post-pass so the intricate per-perm witness logic above is untouched.
-fn fill_derived(values: &mut [Val]) {
-    let w = GATE_WIDTH;
+fn fill_derived(values: &mut [Val], layout: &GateLayout) {
+    let w = layout.gate_width;
     let one = Val::ONE;
     let rows = values.len() / w;
     let ring = |base: usize, n: usize, g: usize| base + (n - g % n) % n;
@@ -4232,47 +4261,47 @@ fn fill_derived(values: &mut [Val]) {
         let base = r * w;
         let row = &values[base..base + w];
         let g = |col: usize| row[col];
-        // PD-bit literal: on ? bit : (1 - bit).
+        // layout.pd-bit literal: on ? bit : (1 - bit).
         let pl = |col: usize, on: bool| if on { row[col] } else { one - row[col] };
         // Family-2 raw bit-products.
         let mut m3 = [Val::ZERO; 8];
         for (a, slot) in m3.iter_mut().enumerate() {
-            *slot = pl(PD + 10, a & 1 == 1) * pl(PD + 11, a & 2 == 2) * pl(PD + 12, a & 4 == 4);
+            *slot = pl(layout.pd + 10, a & 1 == 1) * pl(layout.pd + 11, a & 2 == 2) * pl(layout.pd + 12, a & 4 == 4);
         }
         let mut rlo = [Val::ZERO; 4];
         let mut rhi = [Val::ZERO; 4];
         for j in 0..4 {
-            rlo[j] = pl(PD, j & 1 == 1) * pl(PD + 1, j & 2 == 2);
-            rhi[j] = pl(PD + 2, j & 1 == 1) * pl(PD + 3, j & 2 == 2);
+            rlo[j] = pl(layout.pd, j & 1 == 1) * pl(layout.pd + 1, j & 2 == 2);
+            rhi[j] = pl(layout.pd + 2, j & 1 == 1) * pl(layout.pd + 3, j & 2 == 2);
         }
         let mut dmux = Val::ZERO;
         for k in 0..19 {
-            dmux += g(DLO + (k & 7)) * g(DHI + (k >> 3)) * g(IDXB + k);
+            dmux += g(layout.dlo + (k & 7)) * g(layout.dhi + (k >> 3)) * g(layout.idxb + k);
         }
         // Family-3 fold gates/products.
         let mut glo = [Val::ZERO; 4];
         let mut ghi = [Val::ZERO; 4];
         for j in 0..4 {
-            glo[j] = pl(GPB, j & 1 == 1) * pl(GPB + 1, j & 2 == 2);
-            ghi[j] = pl(GPB + 2, j & 1 == 1) * pl(GPB + 3, j & 2 == 2);
+            glo[j] = pl(layout.gpb, j & 1 == 1) * pl(layout.gpb + 1, j & 2 == 2);
+            ghi[j] = pl(layout.gpb + 2, j & 1 == 1) * pl(layout.gpb + 3, j & 2 == 2);
         }
         let mut gf = [Val::ZERO; 4];
         for rf in 0..4 {
-            gf[rf] = g(CONSF) * g(DRND + 2 + rf);
+            gf[rf] = g(layout.consf) * g(layout.drnd + 2 + rf);
         }
-        // BPM = extmul(BREG, PBUF - v), v = ext(ASM0,ASM1,W0C,W1C).
+        // layout.bpm = extmul(layout.breg, layout.pbuf - v), v = ext(layout.asm0,layout.asm1,layout.w0c,layout.w1c).
         let w_ext = Val::from_u32(EXT_W);
-        let vv = [g(ASM0), g(ASM1), g(W0C), g(W1C)];
-        let pmv = [g(PBUF) - vv[0], g(PBUF + 1) - vv[1], g(PBUF + 2) - vv[2], g(PBUF + 3) - vv[3]];
+        let vv = [g(layout.asm0), g(layout.asm1), g(layout.w0c), g(layout.w1c)];
+        let pmv = [g(layout.pbuf) - vv[0], g(layout.pbuf + 1) - vv[1], g(layout.pbuf + 2) - vv[2], g(layout.pbuf + 3) - vv[3]];
         let mut bpm = [Val::ZERO; 4];
         for (k, slot) in bpm.iter_mut().enumerate() {
             let mut acc = Val::ZERO;
             for i in 0..4 {
                 for j in 0..4 {
                     if i + j == k {
-                        acc += g(BREG + i) * pmv[j];
+                        acc += g(layout.breg + i) * pmv[j];
                     } else if i + j == k + 4 {
-                        acc += w_ext * g(BREG + i) * pmv[j];
+                        acc += w_ext * g(layout.breg + i) * pmv[j];
                     }
                 }
             }
@@ -4282,99 +4311,99 @@ fn fill_derived(values: &mut [Val]) {
         for rf in 0..4 {
             let npairs = if rf < 3 { 7 } else { 1 };
             for r in 0..npairs {
-                fhg[fhg_index(rf, r)] = g(MSEL + M_FHI0 as usize + rf) * g(r);
+                fhg[fhg_index(rf, r)] = g(layout.msel + M_FHI0 as usize + rf) * g(r);
             }
         }
-        // PREGA = extmul(PREG, fri_alpha) for the PX word-1 accumulation term.
-        let fa_off = CHAL + 4 * G_FRIALPHA;
+        // layout.prega = extmul(layout.preg, fri_alpha) for the PX word-1 accumulation term.
+        let fa_off = layout.chal + 4 * G_FRIALPHA;
         let mut prega = [Val::ZERO; 4];
         for (k, slot) in prega.iter_mut().enumerate() {
             let mut acc = Val::ZERO;
             for i in 0..4 {
                 for j in 0..4 {
                     if i + j == k {
-                        acc += g(PREG + i) * g(fa_off + j);
+                        acc += g(layout.preg + i) * g(fa_off + j);
                     } else if i + j == k + 4 {
-                        acc += w_ext * g(PREG + i) * g(fa_off + j);
+                        acc += w_ext * g(layout.preg + i) * g(fa_off + j);
                     }
                 }
             }
             *slot = acc;
         }
         let sf23 = g(23);
-        let phc = g(PHC);
-        let phq = g(PHQ);
-        let blklast = g(BLKLAST);
-        let chlive = phc * (one - g(REFSEL));
-        let f2sel = g(ring(FRING, 8, 2)) * (one - g(BIDX));
-        let pg_a = g(ring(FRING, 8, 7)) * g(ring(GRP, N_GROUPS, G_DONE)) * phc;
+        let phc = g(layout.phc);
+        let phq = g(layout.phq);
+        let blklast = g(layout.blklast);
+        let chlive = phc * (one - g(layout.refsel));
+        let f2sel = g(ring(layout.fring, 8, 2)) * (one - g(layout.bidx));
+        let pg_a = g(ring(layout.fring, 8, 7)) * g(ring(layout.grp, N_GROUPS, G_DONE)) * phc;
         let phg = sf23 * blklast * pg_a;
-        let phdend = sf23 * g(PHD) * blklast;
+        let phdend = sf23 * g(layout.phd) * blklast;
         let cont = sf23 * phc * (one - blklast);
-        let eg_a = phq * g(QCW) * g(ring(QSEL, NQ + 1, NQ - 1));
+        let eg_a = phq * g(layout.qcw) * g(ring(layout.qsel, NQ + 1, NQ - 1));
         let endg = sf23 * eg_a;
-        let mut xsel = g(PHD) * (one - g(CMPC));
+        let mut xsel = g(layout.phd) * (one - g(layout.cmpc));
         for f in 0..8 {
             if f == 2 {
                 continue;
             }
             for b in 1..FLUSH_BLOCKS[f] {
-                xsel += g(SHSEL + shsel_index(f, b));
+                xsel += g(layout.shsel + shsel_index(f, b));
             }
         }
-        let qadv = sf23 * phq * g(QCW);
-        let mut consumersel = g(REFSEL);
+        let qadv = sf23 * phq * g(layout.qcw);
+        let mut consumersel = g(layout.refsel);
         for f in 1..8 {
-            consumersel += g(SHSEL + shsel_index(f, 0));
+            consumersel += g(layout.shsel + shsel_index(f, 0));
         }
-        let cfull = sf23 * consumersel * (one - g(FSFULL));
+        let cfull = sf23 * consumersel * (one - g(layout.fsfull));
         // row borrow ends; write the derived cells.
         let derived = [
-            (CHLIVE, chlive),
-            (F2SEL, f2sel),
-            (PG_A, pg_a),
-            (PHG, phg),
-            (PHDEND, phdend),
-            (CONT, cont),
-            (EG_A, eg_a),
-            (ENDG, endg),
-            (XSEL, xsel),
-            (QADV, qadv),
-            (CFULL, cfull),
-            (DMUX, dmux),
+            (layout.chlive, chlive),
+            (layout.f2sel, f2sel),
+            (layout.pg_a, pg_a),
+            (layout.phg, phg),
+            (layout.phdend, phdend),
+            (layout.cont, cont),
+            (layout.eg_a, eg_a),
+            (layout.endg, endg),
+            (layout.xsel, xsel),
+            (layout.qadv, qadv),
+            (layout.cfull, cfull),
+            (layout.dmux, dmux),
         ];
         for (col, val) in derived {
             values[base + col] = val;
         }
         for a in 0..8 {
-            values[base + M3 + a] = m3[a];
+            values[base + layout.m3 + a] = m3[a];
         }
         for j in 0..4 {
-            values[base + RLO + j] = rlo[j];
-            values[base + RHI + j] = rhi[j];
+            values[base + layout.rlo + j] = rlo[j];
+            values[base + layout.rhi + j] = rhi[j];
         }
-        // SNL_rf = MSEL[M_S0+rf] * (1 - sf(lfs[rf])).
+        // SNL_rf = layout.msel[M_S0+rf] * (1 - sf(lfs[rf])).
         let lfs = [18usize, 14, 10, 8];
         for rf in 0..4 {
-            let msel = values[base + MSEL + M_S0 as usize + rf];
-            values[base + SNL + rf] = msel * (Val::ONE - values[base + lfs[rf]]);
+            let msel = values[base + layout.msel + M_S0 as usize + rf];
+            values[base + layout.snl + rf] = msel * (Val::ONE - values[base + lfs[rf]]);
         }
         for j in 0..4 {
-            values[base + GLO + j] = glo[j];
-            values[base + GHI + j] = ghi[j];
-            values[base + GF + j] = gf[j];
-            values[base + BPM + j] = bpm[j];
+            values[base + layout.glo + j] = glo[j];
+            values[base + layout.ghi + j] = ghi[j];
+            values[base + layout.gf + j] = gf[j];
+            values[base + layout.bpm + j] = bpm[j];
         }
         for f in 0..N_FHG {
-            values[base + FHG + f] = fhg[f];
+            values[base + layout.fhg + f] = fhg[f];
         }
         for k in 0..4 {
-            values[base + PREGA + k] = prega[k];
+            values[base + layout.prega + k] = prega[k];
         }
-        values[base + CPA] = values[base + PHD] * values[base + CMPA];
-        values[base + CPB] = values[base + PHD] * values[base + CMPB];
-        values[base + CPL] = values[base + PHD] * values[base + BLKLAST];
-        values[base + CONSZ7] = values[base + CZ7] * values[base + POS + 1];
+        values[base + layout.cpa] = values[base + layout.phd] * values[base + layout.cmpa];
+        values[base + layout.cpb] = values[base + layout.phd] * values[base + layout.cmpb];
+        values[base + layout.cpl] = values[base + layout.phd] * values[base + layout.blklast];
+        values[base + layout.consz7] = values[base + layout.cz7] * values[base + layout.pos + 1];
     }
 }
 
