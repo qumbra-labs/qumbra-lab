@@ -5839,4 +5839,35 @@ mod tests {
             panic!("no M_RO perm found");
         });
     }
+
+    /// Slice 1b-4 — the wide single-child interior verifier trace SATISFIES its
+    /// constraints. Builds a real leaf wide proof (b4/q40, ~12 GB), records its
+    /// verification schedule (`walk_leaf`), assembles the interior verifier
+    /// trace at `GateShape::wide()` (2^18 × wide width), and `check_constraints`
+    /// must pass — the first end-to-end wide correctness signal, and the check
+    /// that the Option A `M_HORN` END-pin (`RUNEV == Horner(final_poly, x_fin)`)
+    /// and the relocated `M_FIN`/`xfin` carry actually hold on real wide data.
+    /// `check_constraints` only (no full prove); the RSS gate is stage 3.
+    ///
+    /// IGNORED (2026-07-19): the wide trace now BUILDS (M_HORN END-pin scheduled
+    /// via 1b-B3 Option A), but `check_constraints` still fires — next peel-the-
+    /// onion layer is the **M_X1 x-chain** micro at `m4gate.rs:2609`: `for r in
+    /// 0..22` is hardcoded to narrow `LOG_MAX`, but wide `kx` len = `log_max`=18
+    /// → `index out of bounds: len 18 index 18`. Slice 1b-B4 generalizes the
+    /// `log_max`-keyed bounds (this `0..22`, the `21` chain cap, the `0..19`
+    /// dmux path-direction loops) to `self.shape.log_max`. Enable this test once
+    /// wide `check_constraints` passes.
+    #[test]
+    #[ignore = "1b-4: wide check_constraints blocked on the M_X1 x-chain log_max hardcoding (m4gate.rs:2609); enable after 1b-B4"]
+    fn interior_single_child_satisfies() {
+        let _g = heavy_lock();
+        let (leaf, opvs) = crate::m4treerec::leaf_proof();
+        let sched = crate::m4treerec::walk_leaf(&leaf, &opvs);
+        let (trace, meta) = build_gate_trace(&sched, &opvs, &GateShape::wide(), 0);
+        check_constraints(
+            &VerifierGateAir::new_with_shape(GateShape::wide()),
+            &trace,
+            &meta.opvs,
+        );
+    }
 }

@@ -424,6 +424,27 @@ work, discovered incrementally (each fix reveals the next narrow assumption):
   `gate_neg_fpreg`/`_xfin_chain`/`_bad_fold` negatives must bind (in 1b-5). Code:
   `qprogram_from_shape` last-round `m4gate.rs:1458-1488`; END-pin eval
   `m4gate.rs:3113-3167`.
+- **1b-B3 Part 2 — DONE** (implemented Option A; narrow byte-identical). Wide
+  now schedules `M_HORN` exactly once (was 0) via a shape-conditional last-round
+  emission: `last_has_fin = (path_levels[last]-1) >= 3` (narrow 4 → true, wide 2
+  → false); narrow keeps M_FHI@l0/M_FIN@l1/M_HORN@l2; wide puts M_HORN@l1 and
+  relocates `M_FIN` to round-0 l3 (`fin_reloc = Some((0,3))`). `M_FIN` has no
+  fold-chain dependency (x_fin = ∏ index bits, carried `xfin` register).
+- **1b-4 ATTEMPTED — wide `check_constraints` NOT yet SAT** (test
+  `interior_single_child_satisfies`, `#[ignore]`'d). The wide trace now BUILDS
+  fully (all peel-the-onion build blockers cleared through 1b-B3), but
+  `check_constraints` fires at the next layer:
+
+**1b-B4 — M_X1 x-chain + `log_max`-keyed bounds (NEW next blocker).** Panic
+`m4gate.rs:2609`: `for r in 0..22` (narrow `LOG_MAX`) indexes `self.consts.kx`
+whose wide len = `log_max`=18 → OOB at r=18. The M_X1 x-chain (query LDE eval
+point x = ∏ over index bits) and its neighbours hardcode narrow `log_max`/`log_max-1`:
+the `0..22` kx loop + `sf(21)` chain cap (this x-chain block ~2604-2626), plus
+the `0..19` dmux path-direction loops (eval ~1866 / fill ~3710) and the
+`idxb+19/20/21` cap-element selectors that 1b-B3 flagged as out-of-scope. Wide
+`log_max`=18, `log_max-cap_height`=15. Generalize all to `self.shape.log_max`
+(and `-1`/`-cap_height` as appropriate). Then re-attempt 1b-4 (enable the
+`#[ignore]`'d test) — likely reveals the next layer or reaches SAT.
 - **… likely more** surface as each is cleared. Each is moderate circuit work
   (narrow suite green + wide-build-advances-further as the per-slice gate); the
   whole chain is the "≈ fold-pipeline build" scope the 1b-4 finding flagged.
