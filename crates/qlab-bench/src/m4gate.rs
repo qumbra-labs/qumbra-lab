@@ -533,8 +533,20 @@ fn cap_limb_opv(cap: usize, digest: usize, limb: usize) -> usize {
 /// The word mosaic of one shape: 34 bindings (words 0..34).
 /// `content_words` = words carrying message content (the rest is padding
 /// already encoded as Const bindings).
-pub(crate) fn shape_mosaic(shape: Shape) -> Vec<WordBind> {
+pub(crate) fn shape_mosaic(shape: &GateShape, shape_kind: Shape) -> Vec<WordBind> {
     use WordBind::*;
+    let flush_bytes = shape.flush_bytes();
+    let flush_blocks = shape.flush_blocks();
+    let n_obs = shape.n_obs_flushes();
+    let final_f = n_obs - 1; // = 3 + n_fri_rounds (narrow 7, wide 6)
+    let cap = shape.cap_len;
+    let n_pvs = shape.n_pvs;
+    let tw = shape.tw;
+    let qw = shape.qw;
+    // Inner-proof degree bits = log_max - log_blowup (narrow 18, wide 16).
+    let deg_bits = (shape.log_max - shape.log_blowup) as u32;
+    // OPV base of the inner public values (after the cap limbs).
+    let opv_pvs = shape.n_caps() * cap * 16;
     // Build the full flush content-word streams once, then slice.
     // Flush content words (chain prefix included for f > 0).
     let flush_words = |f: usize| -> Vec<WordBind> {
@@ -543,49 +555,48 @@ pub(crate) fn shape_mosaic(shape: Shape) -> Vec<WordBind> {
             w.extend([Chain; 8]);
         }
         let mv = |x: u32| crate::Val::from_u32(x).to_unique_u32();
-        match f {
-            0 => {
-                w.push(Const(mv(18))); // degree bits (transcript encoding)
-                w.push(Const(mv(18))); // base degree bits
-                w.push(Const(mv(0))); // preprocessed width
-                for d in 0..CAP_LEN {
-                    for l in 0..8 {
-                        w.push(Cap(cap_limb_opv(0, d, 2 * l)));
-                    }
-                }
-                for i in 0..N_PVS {
-                    w.push(Pv(OPV_PVS + i));
+        if f == 0 {
+            w.push(Const(mv(deg_bits))); // degree bits (transcript encoding)
+            w.push(Const(mv(deg_bits))); // base degree bits
+            w.push(Const(mv(0))); // preprocessed width
+            for d in 0..cap {
+                for l in 0..8 {
+                    w.push(Cap(cap_limb_opv(0, d, 2 * l)));
                 }
             }
-            1 => {
-                for d in 0..CAP_LEN {
-                    for l in 0..8 {
-                        w.push(Cap(cap_limb_opv(1, d, 2 * l)));
-                    }
+            // All n_pvs inner public values ride F0's content stream and are
+            // distributed across F0's blocks by pad_words + block slicing
+            // below (narrow 84 over 5 blocks, wide 852 over 28).
+            for i in 0..n_pvs {
+                w.push(Pv(opv_pvs + i));
+            }
+        } else if f == 1 {
+            for d in 0..cap {
+                for l in 0..8 {
+                    w.push(Cap(cap_limb_opv(1, d, 2 * l)));
                 }
             }
-            2 => {
-                // 617 + 617 + 16 ext values, 4 words each.
-                w.extend(std::iter::repeat(Val).take(4 * (TW + TW + QW / 4 * 4)));
+        } else if f == 2 {
+            // Zeta openings: 2 opened rows (tw values each) + qw quotient
+            // values, 4 words per ext value: 4*(2*tw + qw) words.
+            w.extend(std::iter::repeat(Val).take(4 * (2 * tw + qw)));
+        } else if f == final_f {
+            w.extend(std::iter::repeat(Val).take(64)); // final poly (16 ext, fp16)
+            for &la in &shape.log_arities {
+                w.push(Const(mv(la as u32)));
             }
-            3..=6 => {
-                let c = 2 + (f - 3) + 0; // fri cap r -> commitment 2 + r
-                for d in 0..CAP_LEN {
-                    for l in 0..8 {
-                        w.push(Cap(cap_limb_opv(c, d, 2 * l)));
-                    }
+            w.push(Free); // pow witness
+        } else {
+            // FRI-round cap flushes (obs flush f in 3..final_f):
+            // commitment 2 + (f - 3).
+            let c = 2 + (f - 3);
+            for d in 0..cap {
+                for l in 0..8 {
+                    w.push(Cap(cap_limb_opv(c, d, 2 * l)));
                 }
             }
-            7 => {
-                w.extend(std::iter::repeat(Val).take(64)); // final poly
-                for la in LOG_ARITIES {
-                    w.push(Const(mv(la as u32)));
-                }
-                w.push(Free); // pow witness
-            }
-            _ => unreachable!(),
         }
-        assert_eq!(w.len() * 4, FLUSH_BYTES[f], "flush {f} byte count");
+        assert_eq!(w.len() * 4, flush_bytes[f], "flush {f} byte count");
         w
     };
     let pad_words = |content: &[WordBind], msg_bytes: usize, blocks: usize| -> Vec<WordBind> {
@@ -609,19 +620,19 @@ pub(crate) fn shape_mosaic(shape: Shape) -> Vec<WordBind> {
         }
         w
     };
-    match shape {
+    match shape_kind {
         Shape::Obs { flush, block } => {
             let content = flush_words(flush);
-            let padded = pad_words(&content, FLUSH_BYTES[flush], FLUSH_BLOCKS[flush]);
+            let padded = pad_words(&content, flush_bytes[flush], flush_blocks[flush]);
             padded[block * 34..(block + 1) * 34].to_vec()
         }
         Shape::F2Mid => {
             // words 34..68 of flush 2 == uniform Val x34 (any interior
             // block; asserted uniform below).
             let content = flush_words(2);
-            let padded = pad_words(&content, FLUSH_BYTES[2], FLUSH_BLOCKS[2]);
+            let padded = pad_words(&content, flush_bytes[2], flush_blocks[2]);
             let mid = padded[34..68].to_vec();
-            for b in 1..FLUSH_BLOCKS[2] - 1 {
+            for b in 1..flush_blocks[2] - 1 {
                 assert!(
                     padded[b * 34..(b + 1) * 34].iter().all(|x| *x == Val),
                     "F2 interior must be uniform"
@@ -644,22 +655,24 @@ pub(crate) fn shape_mosaic(shape: Shape) -> Vec<WordBind> {
 
 /// The distinct shapes that get selector columns: F0B0..B4, F1B0..B2,
 /// F2B0 + F2Mid + F2Blast, F3..F6 B0..B2, F7B0..B2, Refill.
-pub(crate) fn shape_list() -> Vec<Shape> {
+pub(crate) fn shape_list(shape: &GateShape) -> Vec<Shape> {
+    let fb = shape.flush_blocks();
+    let n_obs = shape.n_obs_flushes();
     let mut v = vec![];
-    for b in 0..5 {
+    for b in 0..fb[0] {
         v.push(Shape::Obs { flush: 0, block: b });
     }
-    for b in 0..3 {
+    for b in 0..fb[1] {
         v.push(Shape::Obs { flush: 1, block: b });
     }
     v.push(Shape::Obs { flush: 2, block: 0 });
     v.push(Shape::F2Mid);
     v.push(Shape::Obs {
         flush: 2,
-        block: FLUSH_BLOCKS[2] - 1,
+        block: fb[2] - 1,
     });
-    for f in 3..8 {
-        for b in 0..3 {
+    for f in 3..n_obs {
+        for b in 0..fb[f] {
             v.push(Shape::Obs { flush: f, block: b });
         }
     }
@@ -668,13 +681,14 @@ pub(crate) fn shape_list() -> Vec<Shape> {
 }
 
 
-/// SHSEL slot of shape_list()[i] (Refill has its own column).
+/// SHSEL slot of shape_list()[i] (Refill has its own column). Identity: the
+/// list is emitted in slot order, so no shape geometry is needed here.
 fn shsel_index_of(i: usize) -> usize {
     i
 }
 
-pub(crate) fn n_shapes() -> usize {
-    shape_list().len() // 27
+pub(crate) fn n_shapes(shape: &GateShape) -> usize {
+    shape_list(shape).len() // narrow 27
 }
 
 // ---------------------------------------------------------------------------
@@ -1669,10 +1683,13 @@ where
             builder.assert_eq(cv(self.layout.chlive), phc.clone() * (AB::Expr::ONE - cv(self.layout.refsel)));
             // self.layout.f2sel = ringsel(2) * (1 - bidxsel(0))
             builder.assert_eq(cv(self.layout.f2sel), ring_fring(2) * (AB::Expr::ONE - cv(self.layout.bidx)));
-            // self.layout.pg_a = ringsel(7) * grpdone * phc
+            // self.layout.pg_a = ringsel(final obs flush) * grpdone * phc
+            // (final obs flush index = 3 + n_fri_rounds; narrow 7, wide 6).
             builder.assert_eq(
                 cv(self.layout.pg_a),
-                ring_fring(7) * cv(ring_at(self.layout.grp, self.shape.n_groups(), self.shape.g_done())) * phc.clone(),
+                ring_fring(self.consts.flush_blocks.len() - 1)
+                    * cv(ring_at(self.layout.grp, self.shape.n_groups(), self.shape.g_done()))
+                    * phc.clone(),
             );
             // self.layout.phg (phasegate) = sf(23) * self.layout.blklast * self.layout.pg_a
             builder.assert_eq(cv(self.layout.phg), sf(23) * cv(self.layout.blklast) * cv(self.layout.pg_a));
@@ -1689,12 +1706,12 @@ where
             // self.layout.xsel = phd*(1-self.layout.cmpc) + sum of obs/dup interior self.layout.shsel (xorsel).
             {
                 let mut xs = cv(self.layout.phd) * (AB::Expr::ONE - cv(self.layout.cmpc));
-                for f in 0..8 {
+                for f in 0..self.consts.flush_blocks.len() {
                     if f == 2 {
                         continue;
                     }
-                    for b in 1..FLUSH_BLOCKS[f] {
-                        xs = xs + cv(self.layout.shsel + shsel_index(f, b));
+                    for b in 1..self.consts.flush_blocks[f] {
+                        xs = xs + cv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, b));
                     }
                 }
                 builder.assert_eq(cv(self.layout.xsel), xs);
@@ -1704,8 +1721,8 @@ where
             // self.layout.cfull = sf(23) * consumersel * (1 - self.layout.fsfull)
             {
                 let mut cs = cv(self.layout.refsel);
-                for f in 1..8 {
-                    cs = cs + cv(self.layout.shsel + shsel_index(f, 0));
+                for f in 1..self.consts.flush_blocks.len() {
+                    cs = cs + cv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0));
                 }
                 builder.assert_eq(cv(self.layout.cfull), sf(23) * cs * (AB::Expr::ONE - cv(self.layout.fsfull)));
             }
@@ -1963,7 +1980,7 @@ where
         let bidxsel = |b: usize| cv(self.layout.bidx + b);
         let chal_live = cv(self.layout.chlive);
         {
-            let shapes = shape_list();
+            let shapes = shape_list(&self.shape);
             for (si, sh) in shapes.iter().enumerate() {
                 let e = match sh {
                     Shape::Obs { flush: 2, block: 0 } => ringsel(2) * bidxsel(0),
@@ -2000,7 +2017,7 @@ where
         {
             let groupreq = self.shape.groupreq();
             let mut need = AB::Expr::ZERO;
-            for f in 0..8 {
+            for f in 0..self.consts.flush_blocks.len() {
                 need = need + ringsel(f) * cv(ring_at(self.layout.grp, self.shape.n_groups(), groupreq[f + 1]));
             }
             builder.assert_eq(cv(self.layout.needl), cv(self.layout.blklast) * need);
@@ -2013,7 +2030,7 @@ where
         }
         builder
             .when_first_row()
-            .assert_eq(cv(self.layout.blkcnt), c(FLUSH_BLOCKS[0] as u32));
+            .assert_eq(cv(self.layout.blkcnt), c(self.consts.flush_blocks[0] as u32));
         builder.when_first_row().assert_one(cv(self.layout.bidx));
         for i in 1..6 {
             builder.when_first_row().assert_zero(cv(self.layout.bidx + i));
@@ -2044,27 +2061,27 @@ where
         // =====================================================================
         let consumersel = {
             let mut e = cv(self.layout.refsel);
-            for f in 1..8 {
-                e = e + cv(self.layout.shsel + shsel_index(f, 0));
+            for f in 1..self.consts.flush_blocks.len() {
+                e = e + cv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0));
             }
             e
         };
         let b0next = {
             let mut e = AB::Expr::ZERO;
-            for f in 1..8 {
-                e = e + nv(self.layout.shsel + shsel_index(f, 0));
+            for f in 1..self.consts.flush_blocks.len() {
+                e = e + nv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0));
             }
             e
         };
         let xorsel = {
             // Obs interior blocks except flush 2, plus dup interior blocks.
             let mut e = cv(self.layout.phd) * (AB::Expr::ONE - cv(self.layout.cmpc));
-            for f in 0..8 {
+            for f in 0..self.consts.flush_blocks.len() {
                 if f == 2 {
                     continue;
                 }
-                for b in 1..FLUSH_BLOCKS[f] {
-                    e = e + cv(self.layout.shsel + shsel_index(f, b));
+                for b in 1..self.consts.flush_blocks[f] {
+                    e = e + cv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, b));
                 }
             }
             e
@@ -2078,8 +2095,8 @@ where
             let mut t = builder.when_transition();
             // Obs flush start: only the ring successor, only when the
             // required draw group has completed.
-            for f in 1..8 {
-                let sel = nv(self.layout.shsel + shsel_index(f, 0));
+            for f in 1..self.consts.flush_blocks.len() {
+                let sel = nv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0));
                 t.assert_zero(sf(23) * sel.clone() * (AB::Expr::ONE - ringsel(f - 1)));
                 t.assert_zero(sf(23) * sel * (cv(self.layout.blklast) - cv(self.layout.needl)));
             }
@@ -2119,9 +2136,10 @@ where
             // self.layout.blkcnt: reload at obs starts, 1 at refills, decrement on
             // continuation (chal) and during the dup chain, 148 at dup entry.
             let mut reload = AB::Expr::ZERO;
-            for f in 1..8 {
+            for f in 1..self.consts.flush_blocks.len() {
                 reload = reload
-                    + nv(self.layout.shsel + shsel_index(f, 0)) * (c(FLUSH_BLOCKS[f] as u32) - cv(self.layout.blkcnt));
+                    + nv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0))
+                        * (c(self.consts.flush_blocks[f] as u32) - cv(self.layout.blkcnt));
             }
             let dupdec = sf(23) * cv(self.layout.phd) * (AB::Expr::ONE - cv(self.layout.blklast));
             t.assert_eq(
@@ -2141,8 +2159,8 @@ where
             // previous perm's digest.
             let chainsel_next = {
                 let mut e = nv(self.layout.refsel);
-                for f in 1..8 {
-                    e = e + nv(self.layout.shsel + shsel_index(f, 0));
+                for f in 1..self.consts.flush_blocks.len() {
+                    e = e + nv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0));
                 }
                 e
             };
@@ -2162,7 +2180,9 @@ where
                 );
             }
             // F2 digest capture at flush 2's last block.
-            let f2last = sf(23) * cv(self.layout.shsel + shsel_index(2, FLUSH_BLOCKS[2] - 1));
+            let f2last = sf(23)
+                * cv(self.layout.shsel
+                    + shsel_index(&self.consts.flush_blocks, 2, self.consts.flush_blocks[2] - 1));
             for m in 0..16 {
                 t.assert_eq(
                     nv(self.layout.f2dig + m),
@@ -2179,8 +2199,8 @@ where
         for i in 68..100 {
             builder.assert_zero(cv(self.layout.phd) * cv(self.layout.cmpc) * cv(pcol(i)));
             let mut b0 = cv(self.layout.shsel); // F0B0
-            for f in 1..8 {
-                b0 = b0 + cv(self.layout.shsel + shsel_index(f, 0));
+            for f in 1..self.consts.flush_blocks.len() {
+                b0 = b0 + cv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0));
             }
             builder.assert_zero((b0 + cv(self.layout.refsel)) * cv(pcol(i)));
         }
@@ -2411,12 +2431,15 @@ where
             builder.assert_eq(cv(self.layout.cf), fold_dp * m0.clone());
             builder.assert_eq(cv(self.layout.cx0), nonfold_dp.clone() * m0);
             builder.assert_eq(cv(self.layout.cx1), nonfold_dp * m1);
-            // F7 observation blocks (challenger phase): final-poly carry rows.
+            // Final-flush observation blocks (challenger phase): final-poly
+            // carry rows. Final obs flush index = 3 + n_fri_rounds (narrow 7).
+            let ff = self.consts.flush_blocks.len() - 1;
+            let fb = &self.consts.flush_blocks;
             builder.assert_eq(
                 cv(self.layout.cz7),
-                cv(self.layout.shsel + shsel_index(7, 0)) * rge(4, 16)
-                    + cv(self.layout.shsel + shsel_index(7, 1)) * rle(16)
-                    + cv(self.layout.shsel + shsel_index(7, 2)) * rle(1),
+                cv(self.layout.shsel + shsel_index(fb, ff, 0)) * rge(4, 16)
+                    + cv(self.layout.shsel + shsel_index(fb, ff, 1)) * rle(16)
+                    + cv(self.layout.shsel + shsel_index(fb, ff, 2)) * rle(1),
             );
             // Duplicate blocks (dup phase): zeta-value carry rows. First block
             // (self.layout.cmpc) rows 4..16, last block (self.layout.blklast) rows 0..4, middle 0..16.
@@ -3197,21 +3220,28 @@ enum PInfo {
 }
 
 /// Shape-selector index of an obs block (must mirror `shape_list`).
-fn shsel_index(flush: usize, block: usize) -> usize {
-    match flush {
-        0 => block,
-        1 => 5 + block,
-        2 => {
-            if block == 0 {
-                8
-            } else if block == FLUSH_BLOCKS[2] - 1 {
-                10
-            } else {
-                9
-            }
+///
+/// Shape-driven: `flush_blocks` is the per-obs-flush block-count vector (the
+/// cached `GateConsts::flush_blocks` in `eval`, `shape.flush_blocks()` in the
+/// trace builder). F0 contributes `flush_blocks[0]` distinct slots, F1 its
+/// blocks, the zeta flush (index 2) collapses to 3 (block 0 / interior / last),
+/// and every later obs flush contributes its block count. Narrow reproduces the
+/// old hardcoded `[0,5,8..10,11+(f-3)*3+b]` layout verbatim.
+fn shsel_index(flush_blocks: &[usize], flush: usize, block: usize) -> usize {
+    let mut base = 0usize;
+    for (f, &blk) in flush_blocks.iter().enumerate().take(flush) {
+        base += if f == 2 && blk >= 3 { 3 } else { blk };
+    }
+    if flush == 2 && flush_blocks[2] >= 3 {
+        if block == 0 {
+            base
+        } else if block == flush_blocks[2] - 1 {
+            base + 2
+        } else {
+            base + 1
         }
-        f @ 3..=7 => 11 + (f - 3) * 3 + block,
-        _ => unreachable!(),
+    } else {
+        base + block
     }
 }
 
@@ -3634,14 +3664,14 @@ fn write_row(
     // layout.shsel (derived; assert against the plan).
     if regs.phc && !regs.refsel {
         if let Some(PInfo::Obs { flush, block }) = info {
-            let si = shsel_index(*flush, *block);
-            // Consistency of the automaton-derived shape with the plan.
-            let derived = match (regs.fring, regs.bidx.min(5), blklast) {
-                (2, 0, _) => 8,
-                (2, _, false) => 9,
-                (2, _, true) => 10,
-                (f, b, _) => shsel_index(f, b),
-            };
+            let fb = shape.flush_blocks();
+            let si = shsel_index(&fb, *flush, *block);
+            // Consistency of the automaton-derived shape with the plan. BLKCNT
+            // counts down from flush_blocks[fring] to 1, so the automaton's
+            // block index = flush_blocks[fring] - blkcnt (exact, non-saturating
+            // even for the wide F0's 28 blocks; the bidx one-hot saturates).
+            let auto_block = fb[regs.fring] - regs.blkcnt as usize;
+            let derived = shsel_index(&fb, regs.fring, auto_block);
             assert_eq!(si, derived, "shape drift at flush {flush} block {block}");
             wb(v, layout.shsel + si, true);
         } else {
@@ -4036,7 +4066,9 @@ pub(crate) fn build_gate_trace(
                             _ => r <= 16,
                         };
                     }
-                    PInfo::Obs { flush: 7, block } => {
+                    // Final obs flush (index 3 + n_fri_rounds; narrow 7, wide 6):
+                    // the final-poly value words.
+                    PInfo::Obs { flush, block } if *flush == shape.n_obs_flushes() - 1 => {
                         cz7 = match *block {
                             0 => (4..=16).contains(&r),
                             1 => r <= 16,
@@ -4411,7 +4443,7 @@ pub(crate) fn build_gate_trace(
                 let phasegate = regs.phc
                     && regs.refsel
                     && regs.blkcnt == 1
-                    && regs.fring == 7
+                    && regs.fring == shape.n_obs_flushes() - 1
                     && regs.grp == shape.g_done();
                 let phdend = regs.phd && regs.blkcnt == 1;
                 if regs.phq {
@@ -4615,25 +4647,29 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout, shape: &GateShape) {
         let blklast = g(layout.blklast);
         let chlive = phc * (one - g(layout.refsel));
         let f2sel = g(ring(layout.fring, 8, 2)) * (one - g(layout.bidx));
-        let pg_a = g(ring(layout.fring, 8, 7)) * g(ring(layout.grp, shape.n_groups(), shape.g_done())) * phc;
+        // Final obs flush index = 3 + n_fri_rounds (narrow 7, wide 6); the fring
+        // ring width stays 8.
+        let pg_a = g(ring(layout.fring, 8, flush_blocks.len() - 1))
+            * g(ring(layout.grp, shape.n_groups(), shape.g_done()))
+            * phc;
         let phg = sf23 * blklast * pg_a;
         let phdend = sf23 * g(layout.phd) * blklast;
         let cont = sf23 * phc * (one - blklast);
         let eg_a = phq * g(layout.qcw) * g(ring(layout.qsel, shape.nq + 1, shape.nq - 1));
         let endg = sf23 * eg_a;
         let mut xsel = g(layout.phd) * (one - g(layout.cmpc));
-        for f in 0..8 {
+        for f in 0..flush_blocks.len() {
             if f == 2 {
                 continue;
             }
             for b in 1..flush_blocks[f] {
-                xsel += g(layout.shsel + shsel_index(f, b));
+                xsel += g(layout.shsel + shsel_index(&flush_blocks, f, b));
             }
         }
         let qadv = sf23 * phq * g(layout.qcw);
         let mut consumersel = g(layout.refsel);
-        for f in 1..8 {
-            consumersel += g(layout.shsel + shsel_index(f, 0));
+        for f in 1..flush_blocks.len() {
+            consumersel += g(layout.shsel + shsel_index(&flush_blocks, f, 0));
         }
         let cfull = sf23 * consumersel * (one - g(layout.fsfull));
         // row borrow ends; write the derived cells.
