@@ -383,10 +383,25 @@ work, discovered incrementally (each fix reveals the next narrow assumption):
   is narrow-hardcoded and must be derived from the wide zeta-group widths
   `[3626,3626,8]` / `flush_blocks[2]`=855. (This is the M_RO / PZACC / capture
   machinery — the fold-chain START endpoint side.)
-- **1b-B3 — micro-op scheduling for the short last fold round.** Wide
-  `path_levels=[15,15,11,7,3]`: last round has 3 levels → 2 interior slots, too
-  short to host `M_HORN` (fold-chain END). Relocate `M_FIN`/`M_HORN`. (Surfaces
-  after 1b-B2 clears.)
+- **1b-B2 — reduced-opening dup-phase captures — DONE** (`f10c309`, narrow 37
+  green / 350 s, byte-identical). Added `GateShape::dup_captures() ->
+  [(block,row,blkcnt);3]` from the clean formula: value → 4 u32 words, block =
+  34 words = 17 value-rows, F2 opens with a 32-byte (8-word=4-row) digest
+  prefix, so after `v` values the row is `g = 4 + 2v`, block `g/17`, row `g%17`,
+  `BLKCNT = N − g/17` (`N = flush_blocks()[2]`). Reproduces every narrow literal:
+  A0 (v=tw=617) → (72,14)/CMPA=76; A1 (v=2tw) → (145,7)/CMPB=3; A2 (v=2tw+qw) →
+  (147,5)/BLKLAST=1; CMPC=N=148. Wide (tw=3626, N=855): A0 (426,14,429), A1
+  (853,7,2), A2 (854,6,1). Generalized CMPA/CMPB/CMPC targets, capture row
+  selectors, `zvi==tw`/`2tw`/`2tw+qw`, czd last-block `rle(row_A2−1)`, dup-entry
+  BLKCNT reload, dup-last-block digest binding. `P0R/P1R` exponents were already
+  dynamic (captured from `preg`, cross-checked vs `sched.alpha_off`) → wide-correct.
+- **1b-B3 — micro-op scheduling for the short last fold round (NEW next
+  blocker).** Wide build now clears 4129 and stops at **`m4gate.rs:~4385`**:
+  `shape.lf()[rf]` panics `index out of bounds: len 3 index 3` — the fold-round
+  micro-op scheduling (`M_S0..M_S3` family + `M_HORN`) is hardcoded to 4 rounds;
+  wide has 3, and its last round `path_levels`=3 → 2 interior slots can't host
+  `M_HORN` (fold-chain END endpoint). Generalize the fold-round micro loop to
+  `n_fri_rounds` and relocate `M_FIN`/`M_HORN` off the short last round.
 - **… likely more** surface as each is cleared. Each is moderate circuit work
   (narrow suite green + wide-build-advances-further as the per-slice gate); the
   whole chain is the "≈ fold-pipeline build" scope the 1b-4 finding flagged.
