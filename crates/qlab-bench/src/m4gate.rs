@@ -1458,6 +1458,25 @@ pub(crate) fn qprogram_from_shape(s: &GateShape) -> Vec<u32> {
     // fold rounds: leaf (4·2^la ext words) + path. Round r's path hosts the
     // higher-fold (l0), then the NEXT round's s-chain + B-ladder (l1/l2), except
     // the last round which hosts the final x_fin-chain + Horner.
+    //
+    // END-pin placement (Option A, slice 1b-B3 part 2): M_HORN pins the
+    // fold-chain END (`RUNEV == Horner(final_poly, x_fin)`) and MUST land after
+    // the last round's M_FHI so RUNEV is final. It needs an interior slot in the
+    // last round. The narrow last round has 4 interior slots (l=0..3), so
+    // M_FHI@l0 / M_FIN@l1 / M_HORN@l2 all fit. The wide last round is short
+    // (path_levels=3 → interior slots l=0,1 only): there is no room for both
+    // M_FIN and M_HORN after M_FHI. `M_FIN` (x_fin = ∏ over query index bits) has
+    // NO fold-chain dependency — its eval keys only on its own micro selector,
+    // reads the carried index bits, and writes the carried `xfin` register, which
+    // nothing overwrites before M_HORN consumes it — so we relocate it to a spare
+    // M_NONE interior slot in an earlier fold round (round 0, l=3) while keeping
+    // M_HORN at the last round's l1 (still after last-round M_FHI). Narrow keeps
+    // its `last_has_fin` room and is byte-identical (fin_reloc = None).
+    let last_slots = pl[2 + n - 1] - 1; // interior slots in the last fold round
+    let last_has_fin = last_slots >= 3;
+    // When the last round is too short for M_FIN, host it on an earlier round's
+    // spare interior slot (round 0, l=3 — the first M_NONE past M_FHI/M_S/M_B).
+    let fin_reloc: Option<(usize, usize)> = if last_has_fin { None } else { Some((0, 3)) };
     for r in 0..n {
         let la = s.log_arities[r];
         emit_leaf(&mut p, 4 * (1usize << la), D_F[r], R_ABS_C30);
@@ -1469,8 +1488,11 @@ pub(crate) fn qprogram_from_shape(s: &GateShape) -> Vec<u32> {
                 1 => {
                     if r < n - 1 {
                         s.m_s(r + 1)
-                    } else {
+                    } else if last_has_fin {
                         s.m_fin()
+                    } else {
+                        // Wide short last round: M_HORN directly after M_FHI.
+                        s.m_horn()
                     }
                 }
                 2 => {
@@ -1480,7 +1502,13 @@ pub(crate) fn qprogram_from_shape(s: &GateShape) -> Vec<u32> {
                         s.m_horn()
                     }
                 }
-                _ => M_NONE,
+                _ => {
+                    if fin_reloc == Some((r, l)) {
+                        s.m_fin()
+                    } else {
+                        M_NONE
+                    }
+                }
             };
             p.push(desc(R_PATH, sh + l as u32, micro));
         }
