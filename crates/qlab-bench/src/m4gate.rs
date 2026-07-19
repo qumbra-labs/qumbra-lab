@@ -183,6 +183,118 @@ const N_FLUSH_ENTRIES: usize = 9; // F0..F7 + EXH
 const QSLOTS: usize = 103;
 
 // ---------------------------------------------------------------------------
+// Inner-proof shape (M4 step 1 stage 2: narrow leaf vs wide interior)
+// ---------------------------------------------------------------------------
+
+/// The shape parameters of the *inner* proof this verifier circuit checks.
+///
+/// The uni-stark FRI verification algorithm is identical for the M3 *narrow*
+/// consensus proof (what the leaf gate verifies) and a leaf's *wide* proof
+/// (what an aggregation interior node verifies) — only these shape numbers
+/// differ. `narrow()` reproduces the const block above verbatim (the shipped
+/// leaf gate); `wide()` is the interior target, read from `m4treerec` /
+/// `docs/m4tree-step1a-run1.md`. Everything downstream (`GateLayout`, the
+/// column-offset chain, `eval`, `qprogram`, `lane_plan`) is being migrated to
+/// read this struct instead of the top-of-file `const`s — see
+/// `docs/m4-interior-circuit-stage2-plan.md`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GateShape {
+    /// Inner trace width = opened row length (`TW`).
+    pub(crate) tw: usize,
+    /// Quotient opened base values per query (`QW`).
+    pub(crate) qw: usize,
+    /// Inner public values (`N_PVS`).
+    pub(crate) n_pvs: usize,
+    /// FRI queries + index-bit count (`NQ`).
+    pub(crate) nq: usize,
+    /// Index bit width = log2(inner LDE domain) = inner degree_bits + log_blowup
+    /// (`LOG_MAX`).
+    pub(crate) log_max: usize,
+    /// Query-PoW grind bits (`GRIND_BITS`).
+    pub(crate) grind_bits: usize,
+    /// Per-round FRI fold log-arities (`LOG_ARITIES`).
+    pub(crate) log_arities: Vec<usize>,
+    /// Merkle cap size 2^cap_height (`CAP_LEN`).
+    pub(crate) cap_len: usize,
+}
+
+impl GateShape {
+    /// The M3 narrow consensus proof — the shipped leaf gate. Reproduces the
+    /// const block above verbatim.
+    pub(crate) fn narrow() -> Self {
+        Self {
+            tw: 617,
+            qw: 16,
+            n_pvs: 84,
+            nq: 20,
+            log_max: 22,
+            grind_bits: 20,
+            log_arities: vec![4, 4, 4, 2],
+            cap_len: 8,
+        }
+    }
+
+    /// A leaf's wide `VerifierGateAir` proof (2^16 x 3,626, committed at the
+    /// aggregation config b4/q40/g20/fp16/a16) — the interior node's inner
+    /// proof. Values from `m4treerec::AGG_CFG` + `docs/m4tree-step1a-run1.md`:
+    /// 3,626-col rows, 40 queries, 8 quotient words, 3 arity-16 FRI rounds,
+    /// inner LDE 2^(16+2)=2^18, and inner public values = the leaf gate's own
+    /// outer public-value count `N_OPVS` (852 = 6*8*16 + 84).
+    pub(crate) fn wide() -> Self {
+        Self {
+            tw: 3626,
+            qw: 8,
+            n_pvs: N_OPVS, // the leaf gate's opvs become the interior's inner PVs
+            nq: 40,
+            log_max: 18,
+            grind_bits: 20,
+            log_arities: vec![4, 4, 4],
+            cap_len: 8,
+        }
+    }
+
+    /// Number of FRI commit-phase rounds.
+    pub(crate) fn n_fri_rounds(&self) -> usize {
+        self.log_arities.len()
+    }
+
+    /// Commitment caps: trace + quotient + one per FRI round (`N_CAPS`).
+    pub(crate) fn n_caps(&self) -> usize {
+        2 + self.n_fri_rounds()
+    }
+
+    /// Merkle cap height = log2(cap_len).
+    pub(crate) fn cap_height(&self) -> usize {
+        self.cap_len.trailing_zeros() as usize
+    }
+
+    /// Cumulative fold shifts with a leading 0 (`CUM`): len = n_rounds + 1.
+    pub(crate) fn cum(&self) -> Vec<usize> {
+        let mut c = Vec::with_capacity(self.n_fri_rounds() + 1);
+        let mut acc = 0;
+        c.push(0);
+        for &a in &self.log_arities {
+            acc += a;
+            c.push(acc);
+        }
+        c
+    }
+
+    /// Native Merkle path levels per batch = tree height - cap height
+    /// (`PATH_LEVELS`): trace, quotient (both at the LDE domain), then one per
+    /// FRI round at its folded domain.
+    pub(crate) fn path_levels(&self) -> Vec<usize> {
+        let ch = self.cap_height();
+        let cum = self.cum();
+        let mut pl = vec![self.log_max - ch, self.log_max - ch];
+        for r in 0..self.n_fri_rounds() {
+            pl.push(self.log_max - cum[r + 1] - ch);
+        }
+        pl
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Word binding tables (transcript mosaics)
 // ---------------------------------------------------------------------------
 
@@ -4035,6 +4147,42 @@ mod tests {
             let tl = proof.opened_values.trace_local.clone();
             (sched, pvs, tl)
         })
+    }
+
+    /// M4 step 1 stage 2, slice 1a-i: `GateShape::narrow()` must reproduce the
+    /// shipped leaf gate's const block byte-for-byte, and `wide()` must carry
+    /// the interior target shape from `m4treerec` / the stage-1 run doc. This
+    /// pins the narrow->wide parameter mapping before any `eval` rewiring, so a
+    /// later slice can migrate the column-offset chain against a verified shape.
+    #[test]
+    fn gate_shape_narrow_reproduces_consts() {
+        let n = GateShape::narrow();
+        // Narrow scalars == the const block.
+        assert_eq!(n.tw, TW);
+        assert_eq!(n.qw, QW);
+        assert_eq!(n.n_pvs, N_PVS);
+        assert_eq!(n.nq, NQ);
+        assert_eq!(n.log_max, LOG_MAX);
+        assert_eq!(n.grind_bits, GRIND_BITS);
+        assert_eq!(n.cap_len, CAP_LEN);
+        assert_eq!(n.log_arities, LOG_ARITIES.to_vec());
+        // Narrow derived quantities == the const arrays/scalars.
+        assert_eq!(n.n_caps(), N_CAPS);
+        assert_eq!(n.cap_height(), 3);
+        assert_eq!(n.cum(), CUM.to_vec());
+        assert_eq!(n.path_levels(), PATH_LEVELS.to_vec());
+
+        // Wide interior target (from m4treerec::AGG_CFG + stage-1 run doc).
+        let w = GateShape::wide();
+        assert_eq!(w.tw, 3626, "leaf wide row width");
+        assert_eq!(w.qw, 8, "leaf wide quotient words/query");
+        assert_eq!(w.n_pvs, N_OPVS, "interior inner PVs = leaf gate opvs");
+        assert_eq!(w.n_pvs, 6 * 8 * 16 + 84, "= 852");
+        assert_eq!(w.nq, 40, "aggregation lane q40");
+        assert_eq!(w.log_max, 18, "leaf 2^16 committed at b4 -> LDE 2^18");
+        assert_eq!(w.log_arities, vec![4, 4, 4], "3 arity-16 FRI rounds");
+        assert_eq!(w.n_caps(), 5, "trace + quotient + 3 FRI");
+        assert_eq!(w.path_levels(), vec![15, 15, 11, 7, 3], "wide native path levels");
     }
 
     /// TEMP: byte-parse cross-check of the zeta-opening obs stream.
