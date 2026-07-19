@@ -451,6 +451,19 @@ impl GateShape {
         (9 + r) as u32
     }
 
+    /// Fresh u32 words in the trace leaf's LAST absorb block = `tw mod 34`,
+    /// with a full block (34) when `tw` is a rate multiple. Narrow 617 → 5
+    /// (odd → high-half pad), wide 3626 → 22 (even → no pad). Drives the
+    /// `R_ABS_C5` (trace-last) sponge-carry / asm-range machinery.
+    pub(crate) fn trace_last_fresh(&self) -> usize {
+        let m = self.tw % 34;
+        if m == 0 {
+            34
+        } else {
+            m
+        }
+    }
+
     /// Per-round fold-path source height `lf[r] = log_max - cum[r+1]` (the
     /// folded LDE domain log-height; narrow `[18,14,10,8]`).
     pub(crate) fn lf(&self) -> Vec<usize> {
@@ -1346,8 +1359,13 @@ pub(crate) fn qprogram_from_shape(s: &GateShape) -> Vec<u32> {
     let ceil34 = |x: usize| (x + 33) / 34;
     let mut p: Vec<u32> = vec![];
 
-    // Absorb blocks for a leaf of `nw` fresh words under dparam `dp`.
-    let emit_leaf = |p: &mut Vec<u32>, nw: usize, dp: u32| {
+    // Absorb blocks for a leaf of `nw` fresh words under dparam `dp`. The
+    // last-block role is chosen by LEAF CONTEXT (`last_role`), not by matching
+    // the remainder literal: the trace leaf's last block is R_ABS_C5 whatever
+    // its fresh count (narrow 5, wide 22), the fold leaf's last block is
+    // R_ABS_C30. A single-block leaf (nb <= 1: quotient, or a short fold round
+    // whose 4·2^la ≤ 34) is always R_ABS_F16.
+    let emit_leaf = |p: &mut Vec<u32>, nw: usize, dp: u32, last_role: u32| {
         let nb = ceil34(nw);
         if nb <= 1 {
             // Single (first+last) block.
@@ -1357,22 +1375,12 @@ pub(crate) fn qprogram_from_shape(s: &GateShape) -> Vec<u32> {
             for _ in 0..nb - 2 {
                 p.push(desc(R_ABS_C34, dp, M_NONE));
             }
-            // Last continuation block: role keyed to its fresh-word count.
-            let last_fresh = nw - (nb - 1) * 34;
-            let role = match last_fresh {
-                5 => R_ABS_C5,
-                30 => R_ABS_C30,
-                other => panic!(
-                    "qprogram: no absorb role for a last block with {other} fresh words \
-                     (the wide leaf-block vocabulary is not yet defined)"
-                ),
-            };
-            p.push(desc(role, dp, M_NONE));
+            p.push(desc(last_role, dp, M_NONE));
         }
     };
 
     // trace leaf + path (l0 = x-chain, l1 = inverses).
-    emit_leaf(&mut p, s.tw, D_T);
+    emit_leaf(&mut p, s.tw, D_T, R_ABS_C5);
     for l in 0..pl[0] - 1 {
         let micro = match l {
             0 => M_X1,
@@ -1384,7 +1392,7 @@ pub(crate) fn qprogram_from_shape(s: &GateShape) -> Vec<u32> {
     p.push(desc(R_PLAST_T, plast_dp, M_NONE));
 
     // quotient leaf + path (l0 = round-0 s-chain, l1 = B-ladder, l2 = M_RO).
-    emit_leaf(&mut p, s.qw, D_Q);
+    emit_leaf(&mut p, s.qw, D_Q, R_ABS_F16);
     for l in 0..pl[1] - 1 {
         let micro = match l {
             0 => s.m_s(0),
@@ -1401,7 +1409,7 @@ pub(crate) fn qprogram_from_shape(s: &GateShape) -> Vec<u32> {
     // the last round which hosts the final x_fin-chain + Horner.
     for r in 0..n {
         let la = s.log_arities[r];
-        emit_leaf(&mut p, 4 * (1usize << la), D_F[r]);
+        emit_leaf(&mut p, 4 * (1usize << la), D_F[r], R_ABS_C30);
         let levels = pl[2 + r];
         let sh = cum[r + 1] as u32;
         for l in 0..levels - 1 {
@@ -1887,7 +1895,10 @@ where
         for i in 68..100 {
             builder.assert_zero(cv(self.layout.rsel + R_ABS_F34 as usize) * cv(pcol(i)));
         }
-        for i in 32..100 {
+        // Single-block leaf (R_ABS_F16, qw fresh words): limbs 0..2·qw are the
+        // message, everything above is zero. Narrow qw=16 → 32..100, wide qw=8
+        // → 16..100.
+        for i in (2 * self.shape.qw)..100 {
             builder.assert_zero(cv(self.layout.rsel + R_ABS_F16 as usize) * cv(pcol(i)));
         }
         // Compression preimages: lanes 8..25 zero.
@@ -1902,16 +1913,21 @@ where
                     sf(23) * nv(self.layout.rsel + R_ABS_C34 as usize) * (nv(pcol(i)) - cv(ocol(i))),
                 );
             }
-            // C5 (trace last block): 5 fresh u32 words = limbs 0..10. The
-            // overwrite-mode sponge packs 2 words per u64 lane, so word 4
-            // fills lane 2's low half (limbs 8,9) while its high half
-            // (limbs 10,11) is an unused zero pad; only limbs 12..100 carry
-            // the producer's output. Pin the pad half to zero (else a prover
-            // could smuggle a word there) and carry from limb 12.
-            for i in 10..12 {
+            // C5 (trace last block): `f = trace_last_fresh` fresh u32 words =
+            // limbs 0..2f. The overwrite-mode sponge packs 2 words per u64
+            // lane, so when f is ODD the last word fills a lane's low half
+            // while its high half [2f, 2f+2) is an unused zero pad; only limbs
+            // [pad_hi, 100) carry the producer's output. Pin the pad half to
+            // zero (else a prover could smuggle a word there) and carry from
+            // pad_hi. Narrow f=5 (odd) → pad 10..12, carry 12..100; wide f=22
+            // (even) → no pad, carry 44..100.
+            let f = self.shape.trace_last_fresh();
+            let pad_lo = 2 * f;
+            let pad_hi = 2 * f + 2 * (f & 1);
+            for i in pad_lo..pad_hi {
                 t.assert_zero(sf(23) * nv(self.layout.rsel + R_ABS_C5 as usize) * nv(pcol(i)));
             }
-            for i in 12..100 {
+            for i in pad_hi..100 {
                 t.assert_zero(sf(23) * nv(self.layout.rsel + R_ABS_C5 as usize) * (nv(pcol(i)) - cv(ocol(i))));
             }
             for i in 60..100 {
@@ -2367,16 +2383,27 @@ where
             let rle = |n: usize| (0..=n).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
             let rge = |a: usize, b: usize| (a..=b).map(&sf).fold(AB::Expr::ZERO, |x, e| x + e);
             let rsel = |r: u32| cv(self.layout.rsel + r as usize);
-            // Per-role asm value ranges (word-0 / word-1 half positions).
-            let role_range = |c5: usize| {
-                rsel(R_ABS_F34) * rle(16)
-                    + rsel(R_ABS_C34) * rle(16)
-                    + rsel(R_ABS_C5) * rle(c5)
-                    + rsel(R_ABS_C30) * rle(14)
-                    + rsel(R_ABS_F16) * rle(7)
+            // Per-role asm value ranges (word-0 / word-1 half positions). A
+            // block of `f` fresh u32 words routes 2 words/row (word-0 even,
+            // word-1 odd), so word-0 fills ceil(f/2) rows → rle(ceil(f/2)-1)
+            // and word-1 fills floor(f/2) rows → rle(floor(f/2)-1). Per-role
+            // fresh count: F34/C34 = 34 (full rate), C5 = trace_last_fresh,
+            // C30 = 30 (fold-last), F16 = qw (single-block leaf). Narrow
+            // reproduces (F34/C34 rle16, C5 rle2/rle1, C30 rle14, F16 rle7);
+            // wide gets C5 f=22 → rle10/rle10 and F16 qw=8 → rle3/rle3.
+            let m0w = |f: usize| (f + 1) / 2 - 1;
+            let m1w = |f: usize| f / 2 - 1;
+            let tlf = self.shape.trace_last_fresh();
+            let qw = self.shape.qw;
+            let role_range = |wf: fn(usize) -> usize| {
+                rsel(R_ABS_F34) * rle(wf(34))
+                    + rsel(R_ABS_C34) * rle(wf(34))
+                    + rsel(R_ABS_C5) * rle(wf(tlf))
+                    + rsel(R_ABS_C30) * rle(wf(30))
+                    + rsel(R_ABS_F16) * rle(wf(qw))
             };
-            let m0 = role_range(2);
-            let m1 = role_range(1);
+            let m0 = role_range(m0w);
+            let m1 = role_range(m1w);
             // dparam split: fold leaves (D_F0..3) vs trace/quotient (D_T/D_Q).
             let fold_dp = cv(self.layout.drnd + 2) + cv(self.layout.drnd + 3) + cv(self.layout.drnd + 4) + cv(self.layout.drnd + 5);
             let nonfold_dp = cv(self.layout.drnd) + cv(self.layout.drnd + 1);
@@ -2967,7 +2994,12 @@ where
             let ga0 = cv(self.layout.cpa) * sf(14);
             let ga1 = cv(self.layout.cpb) * sf(7);
             let ga2 = cv(self.layout.cpl) * sf(5);
-            let gpx = cv(self.layout.rsel + R_ABS_C5 as usize) * sf(3);
+            // PX0 (trace-leaf end) capture: pzacc snapshotted the row AFTER the
+            // trace leaf's last fresh word is consumed. The C5 block consumes
+            // 2 words/row, so its last consume is row ceil(f/2)-1 and the
+            // capture sits at ceil(f/2) = (f+1)/2. Narrow f=5 → row 3 (as
+            // before); wide f=22 → row 11.
+            let gpx = cv(self.layout.rsel + R_ABS_C5 as usize) * sf((self.shape.trace_last_fresh() + 1) / 2);
             let mut t = builder.when_transition();
             for k in 0..4 {
                 t.assert_zero(nv(self.layout.a0r + k) - cv(self.layout.a0r + k) - ga0.clone() * (cv(self.layout.pzacc + k) - cv(self.layout.a0r + k)));
@@ -4012,12 +4044,23 @@ pub(crate) fn build_gate_trace(
                         };
                     }
                     PInfo::Query { .. } if (1..=5).contains(&q_role) => {
-                        let (m0, m1) = match q_role {
-                            R_ABS_F34 | R_ABS_C34 => (r <= 16, r <= 16),
-                            R_ABS_C5 => (r <= 2, r <= 1),
-                            R_ABS_C30 => (r <= 14, r <= 14),
-                            R_ABS_F16 => (r <= 7, r <= 7),
-                            _ => (false, false),
+                        // word-0 fills ceil(f/2) rows (r <= ceil(f/2)-1), word-1
+                        // fills floor(f/2) rows (r <= floor(f/2)-1). Mirrors the
+                        // eval-side `role_range`. Narrow: F34/C34 f=34→(16,16),
+                        // C5 f=5→(2,1), C30 f=30→(14,14), F16 f=16→(7,7).
+                        let m0w = |f: usize| (f + 1) / 2 - 1;
+                        let m1w = |f: usize| f / 2 - 1;
+                        let f = match q_role {
+                            R_ABS_F34 | R_ABS_C34 => 34,
+                            R_ABS_C5 => shape.trace_last_fresh(),
+                            R_ABS_C30 => 30,
+                            R_ABS_F16 => shape.qw,
+                            _ => 0,
+                        };
+                        let (m0, m1) = if f == 0 {
+                            (false, false)
+                        } else {
+                            (r <= m0w(f), r <= m1w(f))
                         };
                         if fold_r.is_some() {
                             cfl = m0;
@@ -4075,8 +4118,9 @@ pub(crate) fn build_gate_trace(
                     _ => {}
                 }
             }
-            // PX0 capture at trace-leaf end.
-            if q_role == R_ABS_C5 && q_dparam == D_T && r == 3 {
+            // PX0 capture at trace-leaf end: the row after the last fresh word
+            // is consumed = ceil(f/2) = (f+1)/2 (narrow 3, wide 11).
+            if q_role == R_ABS_C5 && q_dparam == D_T && r == (shape.trace_last_fresh() + 1) / 2 {
                 regs.px0 = regs.pzacc;
             }
 
