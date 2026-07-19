@@ -632,13 +632,23 @@ fn ext_to_u32s(e: &Ext) -> [u32; 4] {
     core::array::from_fn(|i| s[i].to_unique_u32())
 }
 
+/// Record the uni-stark FRI-verification transcript of the M3 consensus proof.
 pub(crate) fn walk(proof: &Proof<Config>, pvs: &[Val]) -> Schedule {
+    walk_with_cfg(proof, pvs, &CONSENSUS_CFG)
+}
+
+/// Record the uni-stark FRI-verification transcript of ANY `Proof<Config>` at
+/// the given FRI config. The body reads all shape from the proof itself
+/// (widths, arities, opened-value counts, query count from the config), so it
+/// is AIR-agnostic — used both for the M3 consensus proof (`walk`) and for the
+/// leaf's own wide `VerifierGateAir` proof (M4 step 1's interior-node input,
+/// via `m4treerec`). Only the four FRI parameters come from `cfg`.
+pub(crate) fn walk_with_cfg(proof: &Proof<Config>, pvs: &[Val], cfg: &FriCfg) -> Schedule {
     let degree_bits = proof.degree_bits;
-    assert_eq!(degree_bits, LOG_HEIGHT);
-    let log_blowup = CONSENSUS_CFG.log_blowup;
-    let n_queries = CONSENSUS_CFG.num_queries;
-    let grind_bits = CONSENSUS_CFG.grind_bits;
-    let log_fp = CONSENSUS_CFG.log_final_poly_len;
+    let log_blowup = cfg.log_blowup;
+    let n_queries = cfg.num_queries;
+    let grind_bits = cfg.grind_bits;
+    let log_fp = cfg.log_final_poly_len;
 
     let mut t = Transcript::new();
 
