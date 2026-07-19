@@ -1921,7 +1921,9 @@ where
         }
         // Path direction bit: self.layout.dbit = pathish * idx bit selected by dparam.
         let pathish = cv(self.layout.rsel + R_PATH as usize)
-            + (R_PLAST_T..=R_PLAST_F3).map(|r| cv(self.layout.rsel + r as usize)).fold(AB::Expr::ZERO, |a, e| a + e);
+            + (R_PLAST_T..=self.shape.r_plast_f(self.shape.n_fri_rounds() - 1))
+                .map(|r| cv(self.layout.rsel + r as usize))
+                .fold(AB::Expr::ZERO, |a, e| a + e);
         {
             // self.layout.dmux = sum_k self.layout.dlo[k&7]*self.layout.dhi[k>>3]*self.layout.idxb[k] (deg 3); self.layout.dbit = pathish*self.layout.dmux.
             let mut mux = AB::Expr::ZERO;
@@ -1996,11 +1998,13 @@ where
                 t.assert_zero(sf(23) * nv(self.layout.grc) * (nv(pcol(16 + m)) - cv(ocol(m))));
             }
         }
-        // Cap comparison at the last path level of each batch.
-        for (bi, role) in [R_PLAST_T, R_PLAST_Q, R_PLAST_F0, R_PLAST_F1, R_PLAST_F2, R_PLAST_F3]
-            .iter()
-            .enumerate()
-        {
+        // Cap comparison at the last path level of each batch (trace, quotient,
+        // then one per FRI round). Shape-driven so wide (3 rounds) skips F3.
+        let plast_roles: Vec<u32> = [R_PLAST_T, R_PLAST_Q]
+            .into_iter()
+            .chain((0..self.shape.n_fri_rounds()).map(|r| self.shape.r_plast_f(r)))
+            .collect();
+        for (bi, role) in plast_roles.iter().enumerate() {
             for m in 0..16 {
                 let mut mux = AB::Expr::ZERO;
                 for j in 0..self.shape.cap_len {
@@ -2547,7 +2551,7 @@ where
             // Zero on non-fold-absorb perms.
             for k in 0..4 {
                 let mut e = AB::Expr::ZERO;
-                for rf in 0..4 {
+                for rf in 0..self.shape.n_fri_rounds() {
                     if k < self.shape.log_arities[rf] {
                         e = e + cv(self.layout.drnd + 2 + rf) * cv(self.layout.idxb + self.shape.cum()[rf] + k);
                     }
@@ -2608,11 +2612,16 @@ where
         // =====================================================================
         {
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
-            let msel_f = cv(self.layout.msel + M_FIN as usize);
+            let msel_f = cv(self.layout.msel + self.shape.m_fin() as usize);
+            // x_fin chain over the final-poly domain index bits: `fin_bits`
+            // (= log_max - cum[n]) rows starting at bit `fin_lo` (= cum[n]).
+            // Narrow 8 rows from bit 14; wide 6 rows from bit 12.
+            let fin_lo = *self.shape.cum().last().unwrap();
+            let fin_bits = self.shape.log_max - fin_lo;
             let mut bscalar = AB::Expr::ZERO;
-            for r in 0..8 {
+            for r in 0..fin_bits {
                 bscalar = bscalar
-                    + sf(r) * (AB::Expr::ONE + cv(self.layout.idxb + 14 + r) * (cn(self.consts.kx[r]) - AB::Expr::ONE));
+                    + sf(r) * (AB::Expr::ONE + cv(self.layout.idxb + fin_lo + r) * (cn(self.consts.kx[r]) - AB::Expr::ONE));
             }
             builder.assert_zero(msel_f.clone() * (cv(self.layout.mul_off + 4) - bscalar));
             for k in 1..4 {
@@ -2623,8 +2632,8 @@ where
             for k in 1..4 {
                 builder.assert_zero(msel_f.clone() * sf(0) * cv(self.layout.mul_off + k));
             }
-            let chain = (0..7).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
-            let cap = msel_f.clone() * sf(7);
+            let chain = (0..fin_bits - 1).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
+            let cap = msel_f.clone() * sf(fin_bits - 1);
             let mut t = builder.when_transition();
             for k in 0..4 {
                 t.assert_zero(
@@ -2706,13 +2715,14 @@ where
         // =====================================================================
         {
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
-            let lfs = [18usize, 14, 10, 8];
-            let capture: Vec<(AB::Expr, usize)> = (0..4)
-                .map(|rf| (cv(self.layout.msel + M_S0 as usize + rf) * sf(lfs[rf]), lfs[rf]))
+            let n = self.shape.n_fri_rounds();
+            let lfs = self.shape.lf();
+            let capture: Vec<(AB::Expr, usize)> = (0..n)
+                .map(|rf| (cv(self.layout.msel + self.shape.m_s(rf) as usize) * sf(lfs[rf]), lfs[rf]))
                 .collect();
-            for rf in 0..4 {
+            for rf in 0..n {
                 let lf = lfs[rf];
-                let msel = cv(self.layout.msel + M_S0 as usize + rf);
+                let msel = cv(self.layout.msel + self.shape.m_s(rf) as usize);
                 let not_lf = AB::Expr::ONE - sf(lf);
                 // Materialized chain gate SNL_rf = msel * (1 - sf(lf)) keeps the
                 // b-mux binding below deg <= 3 (target is deg 2).
@@ -2742,9 +2752,9 @@ where
                 }
             }
             let mut t = builder.when_transition();
-            for rf in 0..4 {
+            for rf in 0..n {
                 let lf = lfs[rf];
-                let msel = cv(self.layout.msel + M_S0 as usize + rf);
+                let msel = cv(self.layout.msel + self.shape.m_s(rf) as usize);
                 let chain = (0..lf.saturating_sub(1)).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
                 for k in 0..4 {
                     // Plain chain rows 0..lf-2: next mul_a == this mul_c.
@@ -2775,10 +2785,11 @@ where
         // product mul_c is captured into self.layout.breg (with the ×2 for l>0).
         // =====================================================================
         {
+            let n = self.shape.n_fri_rounds();
             // Same-row operand bindings.
-            for rf in 0..4 {
+            for rf in 0..n {
                 let la = self.shape.log_arities[rf];
-                let msel = cv(self.layout.msel + M_B0 as usize + rf);
+                let msel = cv(self.layout.msel + self.shape.m_b(rf) as usize);
                 for k in 0..4 {
                     // r=0: mul_a = beta_rf, mul_b = self.layout.inv2s.
                     builder.assert_zero(
@@ -2801,9 +2812,9 @@ where
             let mut t = builder.when_transition();
             for l in 0..4 {
                 // Rounds that actually produce level l (l < la_rf).
-                let cap = (0..4)
+                let cap = (0..n)
                     .filter(|&rf| l < self.shape.log_arities[rf])
-                    .map(|rf| cv(self.layout.msel + M_B0 as usize + rf) * sf(l))
+                    .map(|rf| cv(self.layout.msel + self.shape.m_b(rf) as usize) * sf(l))
                     .fold(AB::Expr::ZERO, |a, e| a + e);
                 for k in 0..4 {
                     let want = if l == 0 {
@@ -2883,7 +2894,7 @@ where
                 builder.assert_eq(cv(self.layout.bpm + k), extmul_ce(self.layout.breg, &pmv, k));
             }
             // GF_rf = self.layout.consf * self.layout.drnd[2+rf]: round-0 gate prefix (gate = self.layout.gf * self.layout.vc).
-            for rf in 0..4 {
+            for rf in 0..self.shape.n_fri_rounds() {
                 builder.assert_eq(cv(self.layout.gf + rf), cv(self.layout.consf) * cv(self.layout.drnd + 2 + rf));
             }
             let mut t = builder.when_transition();
@@ -2897,7 +2908,7 @@ where
             }
             // Round-0 self.layout.scr fold on odd fold-value rows (per round rf, pair i).
             // gate = self.layout.gf[rf]*self.layout.vc[2i+1] (deg 2); computed deg 1 via self.layout.bpm -> deg 3.
-            for rf in 0..4 {
+            for rf in 0..self.shape.n_fri_rounds() {
                 let la = self.shape.log_arities[rf];
                 for i in 0..(1usize << (la - 1)) {
                     let gate = cv(self.layout.gf + rf) * cv(self.layout.vc + 2 * i + 1);
@@ -2938,23 +2949,34 @@ where
                 }
                 acc
             };
-            let pairs3: [(usize, usize); 7] =
-                [(1, 0), (1, 1), (1, 2), (1, 3), (2, 0), (2, 1), (3, 0)];
+            let n = self.shape.n_fri_rounds();
+            // The (level, pair) fold schedule of an arity-2^la round: level l has
+            // 2^(la-1-l) pairs, for l = 1..la (level 0 is the round-0 leaf fold).
+            // la=4 -> [(1,0..3),(2,0..1),(3,0)] (=pairs3); la=2 -> [(1,0)].
+            let fold_pairs = |la: usize| -> Vec<(usize, usize)> {
+                let mut v = vec![];
+                for l in 1..la {
+                    for i in 0..(1usize << (la - 1 - l)) {
+                        v.push((l, i));
+                    }
+                }
+                v
+            };
             // Materialize the per-(round,row) M_FHI fold gate (global, deg 2).
-            for rf in 0..4 {
-                let npairs = if rf < 3 { 7 } else { 1 };
+            for rf in 0..n {
+                let npairs = (1usize << (self.shape.log_arities[rf] - 1)) - 1;
                 for r in 0..npairs {
                     builder.assert_eq(
                         cv(self.layout.fhg + fhg_index(&self.shape.log_arities, rf, r)),
-                        cv(self.layout.msel + M_FHI0 as usize + rf) * sf(r),
+                        cv(self.layout.msel + self.shape.m_fhi(rf) as usize) * sf(r),
                     );
                 }
             }
             let mut update = AB::Expr::ZERO; // rows where self.layout.runev is (re)written
             let mut t = builder.when_transition();
-            for rf in 0..4 {
-                let msel = cv(self.layout.msel + M_FHI0 as usize + rf);
-                let pairs: &[(usize, usize)] = if rf < 3 { &pairs3 } else { &[(1, 0)] };
+            for rf in 0..n {
+                let msel = cv(self.layout.msel + self.shape.m_fhi(rf) as usize);
+                let pairs = fold_pairs(self.shape.log_arities[rf]);
                 let last = pairs.len() - 1;
                 for (r, &(l, i)) in pairs.iter().enumerate() {
                     // self.layout.fhg = msel_rf * sf(r) (materialized above, deg 1) so
@@ -3135,7 +3157,7 @@ where
             // M_HORN Horner: rows 0..14. mul_b = self.layout.xfin; mul_a = self.layout.fpreg[15] (r0) or
             // the previous row's add output (threaded); add_a = mul_c; add_b =
             // self.layout.fpreg[14-r]; final add output (r14) == self.layout.runev.
-            let mh = cv(self.layout.msel + M_HORN as usize);
+            let mh = cv(self.layout.msel + self.shape.m_horn() as usize);
             let rge = |a: usize, b: usize| (a..=b).map(&sf).fold(AB::Expr::ZERO, |x, e| x + e);
             let rows_all = rge(0, 14);
             for k in 0..4 {
@@ -3688,7 +3710,8 @@ fn write_row(
     let capj = ((idx >> 19) & 7) as usize;
     wb(v, layout.caps8 + if regs.phq { capj } else { 0 }, true);
     // layout.dbit / layout.glc / layout.grc.
-    let pathish = regs.phq && (R_PATH..=R_PLAST_F3).contains(&role);
+    let pathish =
+        regs.phq && (R_PATH..=shape.r_plast_f(shape.n_fri_rounds() - 1)).contains(&role);
     if pathish {
         let dbit = (idx >> dparam) & 1 == 1;
         wb(v, layout.dbit, dbit);
@@ -3923,6 +3946,7 @@ pub(crate) fn build_gate_trace(
     let nq = shape.nq;
     let qslots = shape.qslots();
     let cum = shape.cum();
+    let n_rounds = shape.n_fri_rounds();
     let opvs = outer_pvs(sched, inner_pvs, shape);
     let (inputs, infos) = lane_plan(sched, shape);
     let n_perms = inputs.len();
@@ -4380,8 +4404,8 @@ pub(crate) fn build_gate_trace(
                             regs.invzn = qr.inv_zn;
                         }
                     }
-                    m @ (M_S0 | M_S1 | M_S2 | M_S3) => {
-                        let rf = (m - M_S0) as usize;
+                    m if m >= shape.m_s(0) && m < shape.m_s(0) + n_rounds as u32 => {
+                        let rf = (m - shape.m_s(0)) as usize;
                         let lf = shape.lf()[rf];
                         if r < lf {
                             let bit = (qidx >> (cum[rf + 1] + r)) & 1 == 1;
@@ -4398,8 +4422,8 @@ pub(crate) fn build_gate_trace(
                             regs.inv2s = fold.inv_2s;
                         }
                     }
-                    m @ (M_B0 | M_B1 | M_B2 | M_B3) => {
-                        let rf = (m - M_B0) as usize;
+                    m if m >= shape.m_b(0) && m < shape.m_b(0) + n_rounds as u32 => {
+                        let rf = (m - shape.m_b(0)) as usize;
                         let la = shape.log_arities[rf];
                         if r == 0 {
                             let cb =
@@ -4436,13 +4460,17 @@ pub(crate) fn build_gate_trace(
                         }
                         _ => {}
                     },
-                    m @ (M_FHI0 | M_FHI1 | M_FHI2 | M_FHI3) => {
-                        let rf = (m - M_FHI0) as usize;
-                        let pairs: &[(usize, usize)] = if rf < 3 {
-                            &[(1, 0), (1, 1), (1, 2), (1, 3), (2, 0), (2, 1), (3, 0)]
-                        } else {
-                            &[(1, 0)]
-                        };
+                    m if m >= shape.m_fhi(0) && m < shape.m_fhi(0) + n_rounds as u32 => {
+                        let rf = (m - shape.m_fhi(0)) as usize;
+                        // (level, pair) fold schedule of an arity-2^la round:
+                        // level l has 2^(la-1-l) pairs for l = 1..la.
+                        let la = shape.log_arities[rf];
+                        let mut pairs: Vec<(usize, usize)> = vec![];
+                        for l in 1..la {
+                            for i in 0..(1usize << (la - 1 - l)) {
+                                pairs.push((l, i));
+                            }
+                        }
                         if r < pairs.len() {
                             let (l, i) = pairs[r];
                             let lo = regs.scr[2 * i];
@@ -4457,19 +4485,23 @@ pub(crate) fn build_gate_trace(
                             }
                         }
                     }
-                    M_FIN => {
-                        if r < 8 {
-                            let bit = (qidx >> (14 + r)) & 1 == 1;
+                    m if m == shape.m_fin() => {
+                        // x_fin chain over the final-poly domain index bits:
+                        // fin_bits (= log_max - cum[n]) rows from bit fin_lo (= cum[n]).
+                        let fin_lo = cum[n_rounds];
+                        let fin_bits = shape.log_max - fin_lo;
+                        if r < fin_bits {
+                            let bit = (qidx >> (fin_lo + r)) & 1 == 1;
                             let bmux = ext_base(if bit { consts.kx[r] } else { Val::ONE });
                             let a = if r == 0 { Ext::ONE } else { regs.mchain };
                             regs.mchain = bank_mul(&mut values, row, a, bmux, &layout);
-                            if r == 7 {
+                            if r == fin_bits - 1 {
                                 assert_eq!(regs.mchain, qr.x_fin, "x_fin chain");
                                 regs.xfin = regs.mchain;
                             }
                         }
                     }
-                    M_HORN => {
+                    m if m == shape.m_horn() => {
                         if r < 15 {
                             let a = if r == 0 { regs.fpreg[15] } else { regs.mchain };
                             let c1 = bank_mul(&mut values, row, a, regs.xfin, &layout);
@@ -4654,7 +4686,7 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout, shape: &GateShape) {
             ghi[j] = pl(layout.gpb + 2, j & 1 == 1) * pl(layout.gpb + 3, j & 2 == 2);
         }
         let mut gf = [Val::ZERO; 4];
-        for rf in 0..4 {
+        for rf in 0..shape.n_fri_rounds() {
             gf[rf] = g(layout.consf) * g(layout.drnd + 2 + rf);
         }
         // layout.bpm = extmul(layout.breg, layout.pbuf - v), v = ext(layout.asm0,layout.asm1,layout.w0c,layout.w1c).
@@ -4676,8 +4708,8 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout, shape: &GateShape) {
             *slot = acc;
         }
         let mut fhg = vec![Val::ZERO; shape.n_fhg()];
-        for rf in 0..4 {
-            let npairs = if rf < 3 { 7 } else { 1 };
+        for rf in 0..shape.n_fri_rounds() {
+            let npairs = (1usize << (shape.log_arities[rf] - 1)) - 1;
             for r in 0..npairs {
                 fhg[fhg_index(&shape.log_arities, rf, r)] =
                     g(layout.msel + shape.m_fhi(rf) as usize) * g(r);
