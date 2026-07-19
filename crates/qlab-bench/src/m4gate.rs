@@ -464,6 +464,42 @@ impl GateShape {
         }
     }
 
+    /// Reduced-opening dup-phase capture geometry (slice 1b-B2).
+    ///
+    /// The F2-duplicate hash chain re-runs flush-2's zeta-value pipeline
+    /// (`fri_alpha` is drawn from F2's digest, so the value accumulation must
+    /// be replayed). Each opened value serializes to 4 u32 words; a keccak
+    /// block absorbs the rate = 34 u32 words = 17 value-rows (the asm routes 2
+    /// words/row); and flush-2's message opens with a 32-byte digest prefix (8
+    /// words = 4 value-rows) that occupies dup block 0's rows 0..3, so values
+    /// start at row 4. Hence after `v` values have been consumed the running
+    /// index sits at global value-row `g = 4 + 2*v`, i.e. dup block `g/17`, row
+    /// `g%17`. BLKCNT starts at `N = flush_blocks[2]` on dup block 0 and
+    /// decrements one per block, so BLKCNT on that block reads `N - g/17`.
+    ///
+    /// Zeta openings = 3 groups: group 0 = trace_local (`tw` values), group 1 =
+    /// trace_next (`tw` values), group 2 = quotient (`qw` values). The three
+    /// group-boundary snapshots are therefore at cumulative value counts `tw`
+    /// (A0), `2*tw` (A1) and `2*tw+qw` (A2, the chain end = block `N-1`).
+    ///
+    /// Returns `[(block, row_in_perm, blkcnt); 3]` = `[A0, A1, A2]`. Narrow
+    /// (`tw=617,qw=16,N=148`) reproduces the old literals `A0=(72,14,76)`,
+    /// `A1=(145,7,3)`, `A2=(147,5,1)`; wide (`tw=3626,qw=8,N=855`) yields
+    /// `A0=(426,14,429)`, `A1=(853,7,2)`, `A2=(854,6,1)`.
+    pub(crate) fn dup_captures(&self) -> [(usize, usize, u32); 3] {
+        let n = self.flush_blocks()[2];
+        let rpb = 17usize; // value-rows per absorb block (34 rate words / 2 words per row)
+        let pre = 4usize; // flush-2's 32-byte digest prefix = 8 words = 4 value-rows
+        let at = |v: usize| {
+            let g = pre + 2 * v;
+            (g / rpb, g % rpb, (n - g / rpb) as u32)
+        };
+        let caps = [at(self.tw), at(2 * self.tw), at(2 * self.tw + self.qw)];
+        debug_assert_eq!(caps[2].0, n - 1, "A2 (end) capture must land on the last dup block");
+        debug_assert_eq!(caps[2].2, 1, "A2 (end) capture BLKCNT must equal BLKLAST target");
+        caps
+    }
+
     /// Per-round fold-path source height `lf[r] = log_max - cum[r+1]` (the
     /// folded LDE domain log-height; narrow `[18,14,10,8]`).
     pub(crate) fn lf(&self) -> Vec<usize> {
@@ -768,9 +804,9 @@ const BLKCNT: usize = FRING + 8;
 const BLKLAST: usize = BLKCNT + 1; // BLKCNT == 1 comparator + inverse
 const BLKINV: usize = BLKLAST + 1;
 const BIDX: usize = BLKINV + 1; // 6: block index one-hot, saturating
-const CMPA: usize = BIDX + 6; // BLKCNT == 76 (zeta-vals group-0 end)
+const CMPA: usize = BIDX + 6; // BLKCNT == N-block_A0 (zeta-vals group-0 end; narrow 76)
 const CMPAI: usize = CMPA + 1;
-const CMPB: usize = CMPAI + 1; // BLKCNT == 3 (group-1 end, F2-gated)
+const CMPB: usize = CMPAI + 1; // BLKCNT == N-block_A1 (group-1 end, F2-gated; narrow 3)
 const CMPBI: usize = CMPB + 1;
 const NEEDL: usize = CMPBI + 1; // BLKLAST * (required group reached)
 const REFSEL: usize = NEEDL + 1; // refill/trailer perm flag
@@ -827,8 +863,8 @@ const PZACC: usize = PREG + 4; // 4: running sum (PZ in chal, PX in query)
 const A0R: usize = PZACC + 4; // 4: running sum at group-0 end
 const A1R: usize = A0R + 4;
 const A2R: usize = A1R + 4;
-const P0R: usize = A2R + 4; // fri_alpha^617
-const P1R: usize = P0R + 4; // fri_alpha^1234
+const P0R: usize = A2R + 4; // preg at group-0 end = fri_alpha^tw (narrow ^617)
+const P1R: usize = P0R + 4; // preg at group-1 end = fri_alpha^(2*tw) (narrow ^1234)
 const PX0R: usize = P1R + 4; // trace-leaf PX
 const FPREG: usize = PX0R + 4; // 16 x 4: final poly coefficients
 const SCR: usize = FPREG + 64; // 8 x 4: fold scratch
@@ -842,7 +878,8 @@ const RUNEV: usize = XFIN + 4; // running fold evaluation
 
 // -- hash-transport duplicate of flush 2 (PZ pipeline host) --------------------
 /// fri_alpha is drawn from flush 2's digest, so the zeta-opening values
-/// cannot be consumed at flush 2's own rows. A 148-block duplicate hash
+/// cannot be consumed at flush 2's own rows. An N=flush_blocks[2]-block (narrow
+/// 148) duplicate hash
 /// chain placed after the trailer (once fri_alpha is registered) re-hashes
 /// a witness message; its digest must equal the captured flush-2 digest,
 /// which by collision resistance pins the message to the native one. The
@@ -850,7 +887,7 @@ const RUNEV: usize = XFIN + 4; // running fold evaluation
 /// duplicate; flush 2's own interior blocks need no binding at all.
 const F2DIG: usize = RUNEV + 4; // 16: flush-2 digest limbs
 const PHD: usize = F2DIG + 16; // duplicate-phase flag
-const CMPC: usize = PHD + 1; // BLKCNT == 148 comparator (dup first block)
+const CMPC: usize = PHD + 1; // BLKCNT == N=flush_blocks[2] comparator (dup first block; narrow 148)
 const CMPCI: usize = CMPC + 1;
 const CZD: usize = CMPCI + 1; // dup value-carry rows
 
@@ -889,9 +926,9 @@ const FHG: usize = BPM + 4; // 22: M_FHI fold gate = msel_rf * sf(r)
 const PREGA: usize = FHG + N_FHG; // 4: preg * fri_alpha (PX word-1 accumulation)
 // Reduced-opening capture-phase gates (endpoint pin START): PHD·comparator so
 // the A/P register captures (deg-1 use) stay deg <= 3.
-const CPA: usize = PREGA + 4; // PHD·CMPA  (A0/P0 capture: dup block 72)
-const CPB: usize = CPA + 1; // PHD·CMPB  (A1/P1 capture: dup block 145)
-const CPL: usize = CPB + 1; // PHD·BLKLAST (A2 capture: dup block 147)
+const CPA: usize = PREGA + 4; // PHD·CMPA  (A0/P0 capture: dup block_A0; narrow 72)
+const CPB: usize = CPA + 1; // PHD·CMPB  (A1/P1 capture: dup block_A1; narrow 145)
+const CPL: usize = CPB + 1; // PHD·BLKLAST (A2 capture: dup last block N-1; narrow 147)
 // Final-poly capture (endpoint pin END): FPI = 16-slot one-hot counter over the
 // F7 final-poly coefficients; CONSZ7 = CZ7·POS1 its completion flag.
 const CONSZ7: usize = CPL + 1; // CZ7 · POS1 (final-poly value completion)
@@ -2008,7 +2045,12 @@ where
             cv(self.layout.blklast) + (cv(self.layout.blkcnt) - AB::Expr::ONE) * cv(self.layout.blkinv),
             AB::Expr::ONE,
         );
-        for (cmp, cinv, tgt) in [(self.layout.cmpa, self.layout.cmpai, 76u32), (self.layout.cmpb, self.layout.cmpbi, 3), (self.layout.cmpc, self.layout.cmpci, 148)] {
+        // CMPA/CMPB fire at the dup-block BLKCNT of the group-0 / group-1
+        // reduced-opening boundary; CMPC at the dup-first-block BLKCNT = N.
+        // All shape-derived (narrow: 76, 3, 148).
+        let dcap = self.shape.dup_captures();
+        let n_dup = self.consts.flush_blocks[2] as u32;
+        for (cmp, cinv, tgt) in [(self.layout.cmpa, self.layout.cmpai, dcap[0].2), (self.layout.cmpb, self.layout.cmpbi, dcap[1].2), (self.layout.cmpc, self.layout.cmpci, n_dup)] {
             builder.assert_bool(cv(cmp));
             builder.assert_zero((cv(self.layout.blkcnt) - c(tgt)) * cv(cmp));
             builder.assert_eq(cv(cmp) + (cv(self.layout.blkcnt) - c(tgt)) * cv(cinv), AB::Expr::ONE);
@@ -2149,7 +2191,7 @@ where
                     + sf(23) * nv(self.layout.refsel) * (AB::Expr::ONE - cv(self.layout.blkcnt))
                     + cont.clone() * (-AB::Expr::ONE)
                     + dupdec * (-AB::Expr::ONE)
-                    + phasegate.clone() * (c(148) - cv(self.layout.blkcnt)),
+                    + phasegate.clone() * (c(self.consts.flush_blocks[2] as u32) - cv(self.layout.blkcnt)),
             );
             // Phase evolution.
             t.assert_eq(nv(self.layout.phc), phc.clone() - phasegate.clone());
@@ -2442,11 +2484,16 @@ where
                     + cv(self.layout.shsel + shsel_index(fb, ff, 2)) * rle(1),
             );
             // Duplicate blocks (dup phase): zeta-value carry rows. First block
-            // (self.layout.cmpc) rows 4..16, last block (self.layout.blklast) rows 0..4, middle 0..16.
+            // (self.layout.cmpc) rows 4..16 (32-byte digest prefix = 4 rows,
+            // then 13 value-rows), middle blocks rows 0..16 (full 17-row rate),
+            // last block (self.layout.blklast) rows 0..(row_a2-1) where the A2
+            // (end) capture at row_a2 lands one past the last consume. Narrow
+            // row_a2=5 → rle(4); wide row_a2=6 → rle(5).
+            let dup_last_top = self.shape.dup_captures()[2].1 - 1;
             builder.assert_eq(
                 cv(self.layout.czd),
                 cv(self.layout.phd) * cv(self.layout.cmpc) * rge(4, 16)
-                    + cv(self.layout.phd) * cv(self.layout.blklast) * rle(4)
+                    + cv(self.layout.phd) * cv(self.layout.blklast) * rle(dup_last_top)
                     + cv(self.layout.phd) * (one() - cv(self.layout.cmpc) - cv(self.layout.blklast)) * rle(16),
             );
             for s in [self.layout.czd, self.layout.cz7, self.layout.cf, self.layout.cx0, self.layout.cx1] {
@@ -3006,17 +3053,21 @@ where
         // Reduced-opening captures (endpoint pin, START). At fixed transcript
         // positions the running pzacc/preg are snapshotted into the A/P/PX0
         // registers that M_RO consumes; carry otherwise. Capture rows map to
-        // existing comparators (dup block 72 = self.layout.cmpa, 145 = self.layout.cmpb, 147 = self.layout.blklast;
-        // trace-leaf end = self.layout.rsel[R_ABS_C5]). self.layout.cpa/self.layout.cpb/self.layout.cpl = self.layout.phd·comparator keep
+        // existing comparators (dup block_A0 = self.layout.cmpa, block_A1 = self.layout.cmpb, last
+        // block N-1 = self.layout.blklast; narrow 72/145/147; trace-leaf end =
+        // self.layout.rsel[R_ABS_C5]). self.layout.cpa/self.layout.cpb/self.layout.cpl = self.layout.phd·comparator keep
         // the gates deg 2. The captured value is the pre-consume pzacc = cv().
         // =====================================================================
         {
             builder.assert_eq(cv(self.layout.cpa), cv(self.layout.phd) * cv(self.layout.cmpa));
             builder.assert_eq(cv(self.layout.cpb), cv(self.layout.phd) * cv(self.layout.cmpb));
             builder.assert_eq(cv(self.layout.cpl), cv(self.layout.phd) * cv(self.layout.blklast));
-            let ga0 = cv(self.layout.cpa) * sf(14);
-            let ga1 = cv(self.layout.cpb) * sf(7);
-            let ga2 = cv(self.layout.cpl) * sf(5);
+            // Capture rows: the row-in-perm of each group boundary (shape-
+            // derived). Narrow reproduces sf(14)/sf(7)/sf(5).
+            let dcap = self.shape.dup_captures();
+            let ga0 = cv(self.layout.cpa) * sf(dcap[0].1);
+            let ga1 = cv(self.layout.cpb) * sf(dcap[1].1);
+            let ga2 = cv(self.layout.cpl) * sf(dcap[2].1);
             // PX0 (trace-leaf end) capture: pzacc snapshotted the row AFTER the
             // trace leaf's last fresh word is consumed. The C5 block consumes
             // 2 words/row, so its last consume is row ceil(f/2)-1 and the
@@ -3652,7 +3703,8 @@ fn write_row(
     if !blklast {
         w(v, layout.blkinv, (Val::from_u32(regs.blkcnt) - Val::ONE).inverse());
     }
-    for (cmp, inv, tgt) in [(layout.cmpa, layout.cmpai, 76u32), (layout.cmpb, layout.cmpbi, 3u32)] {
+    let dcap = shape.dup_captures();
+    for (cmp, inv, tgt) in [(layout.cmpa, layout.cmpai, dcap[0].2), (layout.cmpb, layout.cmpbi, dcap[1].2)] {
         let hit = regs.blkcnt == tgt;
         wb(v, cmp, hit);
         if !hit {
@@ -3738,13 +3790,14 @@ fn write_row(
         wu(v, layout.f2dig + m, regs.f2dig[m] as u32);
     }
     wb(v, layout.phd, regs.phd);
-    let cmpc = regs.blkcnt == 148;
+    let n_dup = shape.flush_blocks()[2] as u32;
+    let cmpc = regs.blkcnt == n_dup;
     wb(v, layout.cmpc, cmpc);
     if !cmpc {
         w(
             v,
             layout.cmpci,
-            (Val::from_u32(regs.blkcnt) - Val::from_u32(148)).inverse(),
+            (Val::from_u32(regs.blkcnt) - Val::from_u32(n_dup)).inverse(),
         );
     }
     let _ = r;
@@ -3948,6 +4001,10 @@ pub(crate) fn build_gate_trace(
             .collect()
     };
     let mut zvi = 0usize;
+    // Reduced-opening dup-phase capture geometry (slice 1b-B2): (block,row,blkcnt)
+    // for the group-0/group-1/end boundaries, and the last dup block index.
+    let dcap = shape.dup_captures();
+    let n_dup = shape.flush_blocks()[2];
 
     let mut regs = Regs::new(shape);
     regs.fsfull = hosted.get(&0).map_or(false, |d| d.len() == 8);
@@ -4062,7 +4119,7 @@ pub(crate) fn build_gate_trace(
                     PInfo::Dup { block } => {
                         czd = match *block {
                             0 => (4..=16).contains(&r),
-                            147 => r <= 4,
+                            b if b == n_dup - 1 => r <= dcap[2].1 - 1,
                             _ => r <= 16,
                         };
                     }
@@ -4121,33 +4178,34 @@ pub(crate) fn build_gate_trace(
 
             // --- PZ captures (before this row's consume) ------------------
             if let PInfo::Dup { block } = info {
-                match (*block, r) {
-                    (72, 14) => {
-                        regs.a0 = regs.pzacc;
-                        regs.p0 = regs.preg;
-                        assert_eq!(zvi, TW, "values consumed at A0 capture");
-                        assert_eq!(regs.a0, scale(sched.pz[0]), "A0 capture = PZ0");
-                        assert_eq!(regs.p0, sched.alpha_off[0], "P0 capture");
-                    }
-                    (145, 7) => {
-                        regs.a1 = regs.pzacc;
-                        regs.p1 = regs.preg;
-                        assert_eq!(
-                            regs.a1 - regs.a0,
-                            scale(sched.alpha_off[0] * sched.pz[1]),
-                            "A1 span capture"
-                        );
-                        assert_eq!(regs.p1, sched.alpha_off[1], "P1 capture");
-                    }
-                    (147, 5) => {
-                        regs.a2 = regs.pzacc;
-                        assert_eq!(
-                            regs.a2 - regs.a1,
-                            scale(sched.alpha_off[1] * sched.pz[2]),
-                            "A2 span capture"
-                        );
-                    }
-                    _ => {}
+                // A0/A1/A2 = group-0-end / group-1-end / chain-end reduced-
+                // opening snapshots, at shape-derived (block,row). Narrow:
+                // (72,14)/(145,7)/(147,5); wide: (426,14)/(853,7)/(854,6).
+                let pos = (*block, r);
+                if pos == (dcap[0].0, dcap[0].1) {
+                    regs.a0 = regs.pzacc;
+                    regs.p0 = regs.preg;
+                    assert_eq!(zvi, shape.tw, "values consumed at A0 capture");
+                    assert_eq!(regs.a0, scale(sched.pz[0]), "A0 capture = PZ0");
+                    assert_eq!(regs.p0, sched.alpha_off[0], "P0 capture");
+                } else if pos == (dcap[1].0, dcap[1].1) {
+                    regs.a1 = regs.pzacc;
+                    regs.p1 = regs.preg;
+                    assert_eq!(zvi, 2 * shape.tw, "values consumed at A1 capture");
+                    assert_eq!(
+                        regs.a1 - regs.a0,
+                        scale(sched.alpha_off[0] * sched.pz[1]),
+                        "A1 span capture"
+                    );
+                    assert_eq!(regs.p1, sched.alpha_off[1], "P1 capture");
+                } else if pos == (dcap[2].0, dcap[2].1) {
+                    regs.a2 = regs.pzacc;
+                    assert_eq!(zvi, 2 * shape.tw + shape.qw, "values consumed at A2 capture");
+                    assert_eq!(
+                        regs.a2 - regs.a1,
+                        scale(sched.alpha_off[1] * sched.pz[2]),
+                        "A2 span capture"
+                    );
                 }
             }
             // PX0 capture at trace-leaf end: the row after the last fresh word
@@ -4470,7 +4528,7 @@ pub(crate) fn build_gate_trace(
                         regs.f2dig[m] = st_limb(out, m);
                     }
                 }
-                if matches!(info, PInfo::Dup { block: 147 }) {
+                if matches!(info, PInfo::Dup { block } if *block == n_dup - 1) {
                     for m in 0..16 {
                         assert_eq!(st_limb(out, m), regs.f2dig[m], "dup digest binding");
                     }
@@ -4497,7 +4555,7 @@ pub(crate) fn build_gate_trace(
                         regs.phc = false;
                         regs.phd = true;
                         regs.refsel = false;
-                        regs.blkcnt = 148;
+                        regs.blkcnt = n_dup as u32;
                     }
                     Some(PInfo::Dup { .. }) => {
                         regs.blkcnt -= 1;
@@ -4538,13 +4596,13 @@ pub(crate) fn build_gate_trace(
         assert_eq!(regs.idxr[q] as usize, sched.queries[q].index, "index register {q}");
     }
     assert_eq!(regs.a0, scale(sched.pz[0]), "A0 = PZ group 0");
-    assert_eq!(regs.p0, sched.alpha_off[0], "P0 = fri_alpha^617");
+    assert_eq!(regs.p0, sched.alpha_off[0], "P0 = fri_alpha^tw");
     assert_eq!(
         regs.a1 - regs.a0,
         scale(sched.alpha_off[0] * sched.pz[1]),
         "A1 span"
     );
-    assert_eq!(regs.p1, sched.alpha_off[1], "P1 = fri_alpha^1234");
+    assert_eq!(regs.p1, sched.alpha_off[1], "P1 = fri_alpha^(2*tw)");
     assert_eq!(
         regs.a2 - regs.a1,
         scale(sched.alpha_off[1] * sched.pz[2]),
