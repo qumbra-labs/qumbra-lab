@@ -317,9 +317,46 @@ unchanged, all narrow tests green, independently re-verified):
   `from_shape(wide())` yields correct wide *offsets*. Tests
   `gate_shape_derived_counts_narrow` + `gate_shape_wide_values`.
 
-**棒 1b — REMAINING (1b-2 … 1b-5), spec'd by the investigation report's §3 site
-list + §4 sketch.** The AIR's `eval` and the trace builders still read the
-narrow module consts + narrow generators, so a wide trace can't be built yet:
+**棒 1b — 1b-2 / 1b-3 DONE; wide build BLOCKED by two circuit-design gaps
+(1b-4 finding).**
+- `0e3f465` slice 1b-2: `qprogram_from_shape`/`gate_consts_from_shape` (Vec-based
+  GateConsts, `GateShape.log_blowup` added), `fhg_index` shape-aware, `Regs`
+  runtime-sized, `eval` reads the group/chal/role/micro anchors from `self.shape`.
+  Narrow byte-identical (37 pass, heavy suite green, 13.7 GB).
+- `a3322e0` slice 1b-3: `build_gate_trace(sched, inner_pvs, shape, extra_bits)`;
+  rectangle height = `(n_perms*24).next_power_of_two()` (narrow 2^16; wide 2^18);
+  `new_with_shape` uses the shape-parametrized generators. Narrow green.
+
+**⚠ 1b-4 FINDING — the wide single-child trace is UNCONSTRUCTABLE with today's
+machinery** (probed via `qprogram_from_shape(&wide())`, upstream of any
+`check_constraints`, so nothing "fires" — the trace can't be built). The
+re-parametrization (棒 1a + 1b-1..1b-3, all mechanical + green) is done; the
+*remaining* wide work is two genuine circuit EXTENSIONS, each ≈ the original
+fold-pipeline build in scope — NOT loop-bound tweaks:
+
+- **1b-A — generalize the leaf-sponge fresh-word roles.** Absorb roles hardcode
+  narrow fresh-word counts (`R_ABS_C5`=5 trace-last, `R_ABS_C30`=30 fold-last,
+  `R_ABS_F16`=16 quotient). Wide needs a **22-fresh** trace-last block and an
+  **8-fresh** quotient block (panic: "no absorb role for a last block with 22
+  fresh words", `m4gate.rs:1365`). The fresh count is baked into `eval`'s
+  sponge-carry constraints (C5→carry limbs 12..100 + pad; C30→60..100),
+  `role_range` (`rle(16)`/`rle(7)`/`rle(14)`), and `write_row`'s `(m0,m1)`
+  ranges. Fix: parametrize the fresh count (carry it in the descriptor / derive
+  the carry+pad ranges from it) so any last-block fresh count works.
+- **1b-B — micro-op scheduling for a short last fold round.** Wide
+  `path_levels=[15,15,11,7,3]`: the last fold round has only 3 path levels → 2
+  interior slots (l=0,1), but `M_HORN` (final-poly Horner, the fold-chain END
+  endpoint) needs l=2. Fix: relocate `M_FIN`/`M_HORN` off the last fold round
+  (onto the quotient/trace path or a dedicated tail perm) so the END pin has a
+  host on the wide query program.
+
+Only after 1b-A + 1b-B does 1b-4 (`interior_single_child_satisfies` via
+`check_constraints`) become attemptable, then 1b-5 (wide negatives), then 棒 2/3.
+
+**Original remaining-list (1b-2…1b-5), now partly superseded above** — spec'd by
+the investigation report's §3 site list + §4 sketch. The AIR's `eval` and the
+trace builders still read the narrow module consts + narrow generators, so a
+wide trace can't be built yet:
 - **1b-2 (invasive):** convert the builder/trace compile-time arrays & loops
   (`[u32; NQ]`, `[_; N_FHG]`, `0..4` fold rounds, `% QSLOTS`, `FLUSH_BLOCKS[f]`,
   `for f in 0..8`, `betas[0..3]`, the group/chal/role/micro anchors `G_POW/
