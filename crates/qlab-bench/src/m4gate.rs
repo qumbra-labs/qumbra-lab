@@ -292,6 +292,114 @@ impl GateShape {
         }
         pl
     }
+
+    // -- shape-varying transcript / draw-schedule counts (derived per
+    //    docs/m4-1b-wide-params-investigation.md; each reproduces its narrow
+    //    module const, verified by `gate_shape_derived_counts_narrow`). --
+
+    /// Field-draw challenges: alpha, zeta, fri_alpha, one beta per round
+    /// (`N_CHALS` = 3 + n_fri_rounds).
+    pub(crate) fn n_chals(&self) -> usize {
+        3 + self.n_fri_rounds()
+    }
+
+    /// Draw-group ring size: alpha, zeta, fri_alpha, betas, pow, then `nq` index
+    /// groups + DONE (`N_GROUPS` = 5 + n_fri_rounds + nq).
+    pub(crate) fn n_groups(&self) -> usize {
+        5 + self.n_fri_rounds() + self.nq
+    }
+
+    /// PoW draw-group index (`G_POW` = 3 + n_fri_rounds).
+    pub(crate) fn g_pow(&self) -> usize {
+        3 + self.n_fri_rounds()
+    }
+
+    /// First query-index draw-group (`G_IDX0` = 4 + n_fri_rounds).
+    pub(crate) fn g_idx0(&self) -> usize {
+        4 + self.n_fri_rounds()
+    }
+
+    /// DONE draw-group index (`G_DONE` = 4 + n_fri_rounds + nq).
+    pub(crate) fn g_done(&self) -> usize {
+        4 + self.n_fri_rounds() + self.nq
+    }
+
+    /// Query-program role selectors (`N_ROLES` = 9 + n_fri_rounds, from the
+    /// per-round R_PLAST_F* vocabulary).
+    pub(crate) fn n_roles(&self) -> usize {
+        9 + self.n_fri_rounds()
+    }
+
+    /// Micro-code selectors (`N_MICROS` = 6 + 3·n_fri_rounds, from the per-round
+    /// M_S / M_B / M_FHI families).
+    pub(crate) fn n_micros(&self) -> usize {
+        6 + 3 * self.n_fri_rounds()
+    }
+
+    /// Absorb-round selector width (`DRND` width = 2 + n_fri_rounds: T, Q,
+    /// F0..F(n-1)).
+    pub(crate) fn drnd_width(&self) -> usize {
+        2 + self.n_fri_rounds()
+    }
+
+    /// M_FHI higher-round fold gates (`N_FHG` = Σ(2^(la−1)−1)).
+    pub(crate) fn n_fhg(&self) -> usize {
+        self.log_arities.iter().map(|&la| (1usize << (la - 1)) - 1).sum()
+    }
+
+    /// Flush-entry count = observation flushes + 1 EXH (`N_FLUSH_ENTRIES`
+    /// = 5 + n_fri_rounds).
+    pub(crate) fn n_flush_entries(&self) -> usize {
+        (4 + self.n_fri_rounds()) + 1
+    }
+
+    /// Pre-padding challenger flush message byte lengths (`FLUSH_BYTES`), one
+    /// per observation flush = 4 + n_fri_rounds entries: F0 (deg/trace-cap/PVs),
+    /// F1 (quot cap), F2 (zeta openings), one per FRI-round cap, then the final
+    /// (final-poly + log-arities + PoW). fp_len = 16 (fp16, both shapes).
+    pub(crate) fn flush_bytes(&self) -> Vec<usize> {
+        let n = self.n_fri_rounds();
+        let cap = self.cap_len;
+        let mut v = Vec::with_capacity(4 + n);
+        v.push(12 + cap * 32 + self.n_pvs * 4); // F0
+        v.push(32 + cap * 32); // F1 (quotient cap)
+        v.push(32 + 16 * (2 * self.tw + self.qw)); // F2 zeta openings (16·opened/query)
+        for _ in 0..n {
+            v.push(32 + cap * 32); // FRI-round cap
+        }
+        v.push(32 + 16 * 16 + n * 4 + 4); // final
+        v
+    }
+
+    /// Challenger flush block counts (`FLUSH_BLOCKS`): bytes/136 + 1 (rate 136,
+    /// +1 for the always-present 10*1 pad).
+    pub(crate) fn flush_blocks(&self) -> Vec<usize> {
+        self.flush_bytes().iter().map(|&b| b / 136 + 1).collect()
+    }
+
+    /// Obs-shape selectors (`N_SHAPES_OBS`): one per distinct block mosaic —
+    /// each obs flush contributes its block count, except the zeta-opening flush
+    /// (index 2) whose uniform interior collapses first/mid/last → 3.
+    pub(crate) fn n_shapes_obs(&self) -> usize {
+        self.flush_blocks()
+            .iter()
+            .enumerate()
+            .map(|(f, &blk)| if f == 2 && blk >= 3 { 3 } else { blk })
+            .sum()
+    }
+
+    /// Per-query program length in perms (`QSLOTS`): trace leaf+path, quotient
+    /// leaf+path, and per fold round a leaf (4·2^la ext words) + path. Leaf
+    /// perms = ceil(words/34) (keccak rate 34 u32 words/block).
+    pub(crate) fn qslots(&self) -> usize {
+        let ceil34 = |n: usize| (n + 33) / 34;
+        let pl = self.path_levels();
+        let mut q = ceil34(self.tw) + pl[0] + ceil34(self.qw) + pl[1];
+        for (r, &la) in self.log_arities.iter().enumerate() {
+            q += ceil34(4 * (1usize << la)) + pl[2 + r];
+        }
+        q
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -703,14 +811,17 @@ pub(crate) const GATE_WIDTH: usize = FPI + 16;
 /// struct exists and is verified, but `eval`/builders are migrated to read it
 /// in slice 1a-ii (until then the fields are unused — hence `dead_code`).
 ///
-/// Shape drivers wired here: `nq` (→ IDXR/QSEL widths), `log_max` (→ IDXB
-/// width), and `n_fhg` derived from `log_arities` (→ FHG width). **TODO(slice
-/// 1b):** `N_SHAPES_OBS` (SHSEL width, 26) and `QSLOTS` (PR width, 103) are
-/// still the narrow `const`s — they are shape-dependent via the wide flush
-/// geometry / query program and get lifted into `GateShape` when the wide
-/// `qprogram` lands. Several fold-family widths (`BREG` = n_rounds×4, `DRND`,
-/// the GF/BPM/SNL families) are likewise narrow-literal here and confirmed for
-/// wide in 1b. So `from_shape(wide())` is NOT yet trustworthy — only narrow is.
+/// Every shape-varying offset is now driven by `GateShape` methods (slice
+/// 1b-1): `nq` (IDXR/QSEL), `log_max` (IDXB), `n_fhg` (FHG), and the derived
+/// counts `n_groups`/`n_chals`/`n_roles`/`n_micros`/`n_shapes_obs`/`qslots`/
+/// `drnd_width` (formulas + wide confirmation in
+/// `docs/m4-1b-wide-params-investigation.md`). `from_shape(narrow())`
+/// reproduces every const (test) and `from_shape(wide())` now produces the
+/// correct wide *offsets*. **Still narrow-only (slice 1b-2+):** the AIR's
+/// `eval` and the trace builders (`Regs`, `qprogram`, `gate_consts`,
+/// `lane_plan`, `write_row`, `build_gate_trace`) still read the narrow module
+/// consts and the narrow generators, so *building a wide trace* is not wired
+/// yet — only the layout arithmetic is wide-ready.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct GateLayout {
@@ -866,8 +977,7 @@ impl GateLayout {
     pub(crate) fn from_shape(s: &GateShape) -> GateLayout {
         let nq = s.nq;
         let log_max = s.log_max;
-        // FRI fold gates: (2^(la-1) - 1) pairs per round. narrow [4,4,4,2] -> 22.
-        let n_fhg: usize = s.log_arities.iter().map(|&la| (1usize << (la - 1)) - 1).sum();
+        let n_fhg = s.n_fhg();
 
         // -- keccak-adjacent banks + gate base --
         let mul_off = NUM_KECCAK_COLS;
@@ -908,17 +1018,17 @@ impl GateLayout {
         let fsfull = fsodd + 1;
         // -- draw scheduling --
         let grp = fsfull + 1;
-        let coef = grp + N_GROUPS;
+        let coef = grp + s.n_groups();
         let curch = coef + 4;
         let crot = curch + 4;
         let grot = crot + 1;
         // -- challenge / index registers --
         let chal = grot + 1;
-        let fa2 = chal + 4 * N_CHALS;
+        let fa2 = chal + 4 * s.n_chals();
         let znreg = fa2 + 4;
         let idxr = znreg + 4;
         // -- flush automaton --
-        let fring = idxr + nq;
+        let fring = idxr + nq; // IDXR width = nq
         let blkcnt = fring + 8;
         let blklast = blkcnt + 1;
         let blkinv = blklast + 1;
@@ -930,8 +1040,8 @@ impl GateLayout {
         let needl = cmpbi + 1;
         let refsel = needl + 1;
         let shsel = refsel + 1;
-        // -- phases / query scheduling --  (TODO(1b): N_SHAPES_OBS/QSLOTS narrow)
-        let phc = shsel + N_SHAPES_OBS;
+        // -- phases / query scheduling --
+        let phc = shsel + s.n_shapes_obs();
         let phq = phc + 1;
         let qsel = phq + 1;
         let qcnt = qsel + nq + 1;
@@ -939,15 +1049,15 @@ impl GateLayout {
         let qcwi = qcw + 1;
         // -- query program ring --
         let pr = qcwi + 1;
-        let pd = pr + QSLOTS;
+        let pd = pr + s.qslots();
         let rsel = pd + 15;
-        let mlo = rsel + N_ROLES;
+        let mlo = rsel + s.n_roles();
         let mhi = mlo + 8;
         let msel = mhi + 4;
-        let dlo = msel + N_MICROS;
+        let dlo = msel + s.n_micros();
         let dhi = dlo + 8;
         let drnd = dhi + 3;
-        let dbit = drnd + 6;
+        let dbit = drnd + s.drnd_width();
         let glc = dbit + 1;
         let grc = glc + 1;
         let caps8 = grc + 1;
@@ -4710,6 +4820,52 @@ mod tests {
         assert_eq!(l.fpi, FPI);
         assert_eq!(l.gate_cols, GATE_COLS);
         assert_eq!(l.gate_width, GATE_WIDTH);
+    }
+
+    /// Slice 1b-1: every shape-varying transcript/draw-schedule count derived by
+    /// `GateShape` must reproduce its narrow module const — including the four
+    /// (`N_CHALS`/`N_GROUPS`/`N_ROLES`/`N_MICROS`) that were wrongly assumed
+    /// fixed. Pins the formulas before `from_shape` and the builders consume them.
+    #[test]
+    fn gate_shape_derived_counts_narrow() {
+        let n = GateShape::narrow();
+        assert_eq!(n.n_chals(), N_CHALS);
+        assert_eq!(n.n_groups(), N_GROUPS);
+        assert_eq!(n.g_pow(), G_POW);
+        assert_eq!(n.g_idx0(), G_IDX0);
+        assert_eq!(n.g_done(), G_DONE);
+        assert_eq!(n.n_roles(), N_ROLES);
+        assert_eq!(n.n_micros(), N_MICROS);
+        assert_eq!(n.n_flush_entries(), N_FLUSH_ENTRIES);
+        assert_eq!(n.n_fhg(), N_FHG);
+        assert_eq!(n.drnd_width(), 6);
+        assert_eq!(n.flush_bytes(), FLUSH_BYTES.to_vec());
+        assert_eq!(n.flush_blocks(), FLUSH_BLOCKS.to_vec());
+        assert_eq!(n.n_shapes_obs(), N_SHAPES_OBS);
+        assert_eq!(n.qslots(), QSLOTS);
+    }
+
+    /// Slice 1b-1: the wide-shape counts match the derived + empirically
+    /// confirmed values in `docs/m4-1b-wide-params-investigation.md` (one leaf
+    /// prove, 11.88 GB). These drive the interior verifier's layout.
+    #[test]
+    fn gate_shape_wide_values() {
+        let w = GateShape::wide();
+        assert_eq!(w.n_fri_rounds(), 3);
+        assert_eq!(w.n_chals(), 6);
+        assert_eq!(w.n_groups(), 48); // 5 + 3 + 40 (nq index slots won't fit 29)
+        assert_eq!(w.g_pow(), 6);
+        assert_eq!(w.g_idx0(), 7);
+        assert_eq!(w.g_done(), 47);
+        assert_eq!(w.n_roles(), 12);
+        assert_eq!(w.n_micros(), 15);
+        assert_eq!(w.n_flush_entries(), 8);
+        assert_eq!(w.n_fhg(), 21);
+        assert_eq!(w.drnd_width(), 5);
+        assert_eq!(w.flush_bytes(), vec![3676, 288, 116192, 288, 288, 288, 304]);
+        assert_eq!(w.flush_blocks(), vec![28, 3, 855, 3, 3, 3, 3]);
+        assert_eq!(w.n_shapes_obs(), 46);
+        assert_eq!(w.qslots(), 165);
     }
 
     /// TEMP: byte-parse cross-check of the zeta-opening obs stream.
