@@ -216,6 +216,11 @@ pub(crate) struct GateShape {
     pub(crate) log_arities: Vec<usize>,
     /// Merkle cap size 2^cap_height (`CAP_LEN`).
     pub(crate) cap_len: usize,
+    /// Inner-proof FRI blowup bits: `log_max = inner_degree_bits + log_blowup`.
+    /// Narrow M3 commits at b16 (`log_blowup = 4`, inner deg bits 18); wide
+    /// leaf commits at b4 (`log_blowup = 2`, inner deg bits 16). Drives
+    /// `g_trace = two_adic_generator(log_max - log_blowup)`.
+    pub(crate) log_blowup: usize,
 }
 
 impl GateShape {
@@ -231,6 +236,7 @@ impl GateShape {
             grind_bits: 20,
             log_arities: vec![4, 4, 4, 2],
             cap_len: 8,
+            log_blowup: 4, // b16
         }
     }
 
@@ -250,6 +256,7 @@ impl GateShape {
             grind_bits: 20,
             log_arities: vec![4, 4, 4],
             cap_len: 8,
+            log_blowup: 2, // b4 (AGG_CFG)
         }
     }
 
@@ -386,6 +393,69 @@ impl GateShape {
             .enumerate()
             .map(|(f, &blk)| if f == 2 && blk >= 3 { 3 } else { blk })
             .sum()
+    }
+
+    /// Per-flush-entry required draw-group head (`GROUPREQ`): `groupreq[k] = k-1`
+    /// for obs flushes 1..n_obs, and `g_done` for the trailing EXH entry.
+    /// Length `n_flush_entries` (= n_obs + 1). Narrow `[MAX,0,1,2,3,4,5,6,G_DONE]`.
+    pub(crate) fn groupreq(&self) -> Vec<usize> {
+        let n_obs = self.n_obs_flushes();
+        let mut v = Vec::with_capacity(n_obs + 1);
+        v.push(usize::MAX);
+        for k in 1..n_obs {
+            v.push(k - 1);
+        }
+        v.push(self.g_done());
+        v
+    }
+
+    /// Outer public-value count: `n_caps · cap_len · 16` cap limbs + `n_pvs`
+    /// inner public values (`N_OPVS` for narrow = 852).
+    pub(crate) fn n_opvs(&self) -> usize {
+        self.n_caps() * self.cap_len * 16 + self.n_pvs
+    }
+
+    /// Observation flush count = `4 + n_fri_rounds` (alpha, zeta, fri_alpha,
+    /// one per FRI-round cap, and the final-poly/PoW flush). Narrow 8, wide 7.
+    pub(crate) fn n_obs_flushes(&self) -> usize {
+        4 + self.n_fri_rounds()
+    }
+
+    // -- shape-parametrized query-program micro / role codes (narrow reproduces
+    //    the M_* / R_* module consts). Numbering: 6 fixed micros
+    //    (NONE,X1,INV,RO,FIN,HORN) interleaved with the 3·n round-keyed families
+    //    S/B/FHI, so `m_fin`/`m_horn` land right after `m_fhi(n-1)`. --
+
+    /// Round `r` s-chain micro code (`M_S0..` = 4 + r).
+    pub(crate) fn m_s(&self, r: usize) -> u32 {
+        (4 + r) as u32
+    }
+    /// Round `r` B-ladder micro code (`M_B0..` = 4 + n + r).
+    pub(crate) fn m_b(&self, r: usize) -> u32 {
+        (4 + self.n_fri_rounds() + r) as u32
+    }
+    /// Round `r` higher-fold micro code (`M_FHI0..` = 4 + 2n + r).
+    pub(crate) fn m_fhi(&self, r: usize) -> u32 {
+        (4 + 2 * self.n_fri_rounds() + r) as u32
+    }
+    /// Final x_fin-chain micro code (`M_FIN` = 4 + 3n).
+    pub(crate) fn m_fin(&self) -> u32 {
+        (4 + 3 * self.n_fri_rounds()) as u32
+    }
+    /// Final-poly Horner micro code (`M_HORN` = 5 + 3n).
+    pub(crate) fn m_horn(&self) -> u32 {
+        (5 + 3 * self.n_fri_rounds()) as u32
+    }
+    /// Round `r` last-path role code (`R_PLAST_F0..` = 9 + r).
+    pub(crate) fn r_plast_f(&self, r: usize) -> u32 {
+        (9 + r) as u32
+    }
+
+    /// Per-round fold-path source height `lf[r] = log_max - cum[r+1]` (the
+    /// folded LDE domain log-height; narrow `[18,14,10,8]`).
+    pub(crate) fn lf(&self) -> Vec<usize> {
+        let cum = self.cum();
+        (0..self.n_fri_rounds()).map(|r| self.log_max - cum[r + 1]).collect()
     }
 
     /// Per-query program length in perms (`QSLOTS`): trace leaf+path, quotient
@@ -1153,13 +1223,16 @@ impl GateLayout {
     }
 }
 
-/// Flat M_FHI gate index for round `rf`, pair row `r` (mirrors the eval loop).
-const fn fhg_index(rf: usize, r: usize) -> usize {
-    if rf < 3 {
-        rf * 7 + r
-    } else {
-        21
-    }
+/// Flat M_FHI gate index for round `rf`, pair row `r`: the M_FHI family handles
+/// `2^(la-1)-1` binary-fold pairs per round (level 0 is the round-0 leaf fold).
+/// `= Σ_{r'<rf}(2^(la_{r'}-1)-1) + r`; the last index is `n_fhg - 1`. Narrow
+/// `[4,4,4,2]` gives `rf*7+r` for rf<3 and 21 for the final (la=2) round.
+fn fhg_index(log_arities: &[usize], rf: usize, r: usize) -> usize {
+    log_arities[..rf]
+        .iter()
+        .map(|&la| (1usize << (la - 1)) - 1)
+        .sum::<usize>()
+        + r
 }
 
 /// Diagnostic helper (relay debugging): map a column index to its region
@@ -1258,17 +1331,49 @@ const D_T: u32 = 0;
 const D_Q: u32 = 1;
 const D_F: [u32; 4] = [2, 3, 4, 5];
 
-/// The 103-slot query program.
-pub(crate) fn qprogram() -> [u32; QSLOTS] {
-    let mut p = vec![];
-    // trace leaf: F34 + 17 x C34 + C5.
-    p.push(desc(R_ABS_F34, D_T, M_NONE));
-    for _ in 0..17 {
-        p.push(desc(R_ABS_C34, D_T, M_NONE));
-    }
-    p.push(desc(R_ABS_C5, D_T, M_NONE));
-    // trace path: levels 0..18 (dbits 0..17) + last (dbit 18).
-    for l in 0..18 {
+/// The per-query program, shape-parametrized (slice 1b-2). Length `s.qslots()`.
+/// `qprogram_from_shape(&narrow())` reproduces the old 103-slot `[u32; QSLOTS]`
+/// byte-for-byte: the fold-round loop is driven by `n_fri_rounds`, path lengths
+/// by `path_levels`, leaf blocks by `ceil(words/34)`, and the round-keyed
+/// micro/role vocabulary by the `GateShape::m_*`/`r_plast_f` helpers.
+pub(crate) fn qprogram_from_shape(s: &GateShape) -> Vec<u32> {
+    let n = s.n_fri_rounds();
+    let pl = s.path_levels();
+    let cum = s.cum();
+    let cap_h = s.cap_height();
+    // Every batch's last native path level is the top non-cap index bit.
+    let plast_dp = (s.log_max - cap_h - 1) as u32;
+    let ceil34 = |x: usize| (x + 33) / 34;
+    let mut p: Vec<u32> = vec![];
+
+    // Absorb blocks for a leaf of `nw` fresh words under dparam `dp`.
+    let emit_leaf = |p: &mut Vec<u32>, nw: usize, dp: u32| {
+        let nb = ceil34(nw);
+        if nb <= 1 {
+            // Single (first+last) block.
+            p.push(desc(R_ABS_F16, dp, M_NONE));
+        } else {
+            p.push(desc(R_ABS_F34, dp, M_NONE));
+            for _ in 0..nb - 2 {
+                p.push(desc(R_ABS_C34, dp, M_NONE));
+            }
+            // Last continuation block: role keyed to its fresh-word count.
+            let last_fresh = nw - (nb - 1) * 34;
+            let role = match last_fresh {
+                5 => R_ABS_C5,
+                30 => R_ABS_C30,
+                other => panic!(
+                    "qprogram: no absorb role for a last block with {other} fresh words \
+                     (the wide leaf-block vocabulary is not yet defined)"
+                ),
+            };
+            p.push(desc(role, dp, M_NONE));
+        }
+    };
+
+    // trace leaf + path (l0 = x-chain, l1 = inverses).
+    emit_leaf(&mut p, s.tw, D_T);
+    for l in 0..pl[0] - 1 {
         let micro = match l {
             0 => M_X1,
             1 => M_INV,
@@ -1276,55 +1381,54 @@ pub(crate) fn qprogram() -> [u32; QSLOTS] {
         };
         p.push(desc(R_PATH, l as u32, micro));
     }
-    p.push(desc(R_PLAST_T, 18, M_NONE));
-    // quotient leaf + path.
-    p.push(desc(R_ABS_F16, D_Q, M_NONE));
-    for l in 0..18 {
+    p.push(desc(R_PLAST_T, plast_dp, M_NONE));
+
+    // quotient leaf + path (l0 = round-0 s-chain, l1 = B-ladder, l2 = M_RO).
+    emit_leaf(&mut p, s.qw, D_Q);
+    for l in 0..pl[1] - 1 {
         let micro = match l {
-            0 => M_S0,
-            1 => M_B0,
+            0 => s.m_s(0),
+            1 => s.m_b(0),
             2 => M_RO,
             _ => M_NONE,
         };
         p.push(desc(R_PATH, l as u32, micro));
     }
-    p.push(desc(R_PLAST_Q, 18, M_NONE));
-    // fold rounds.
-    for r in 0..4 {
-        if r < 3 {
-            p.push(desc(R_ABS_F34, D_F[r], M_NONE));
-            p.push(desc(R_ABS_C30, D_F[r], M_NONE));
-        } else {
-            p.push(desc(R_ABS_F16, D_F[r], M_NONE));
-        }
-        let levels = PATH_LEVELS[2 + r];
-        let base = CUM[r + 1];
+    p.push(desc(R_PLAST_Q, plast_dp, M_NONE));
+
+    // fold rounds: leaf (4·2^la ext words) + path. Round r's path hosts the
+    // higher-fold (l0), then the NEXT round's s-chain + B-ladder (l1/l2), except
+    // the last round which hosts the final x_fin-chain + Horner.
+    for r in 0..n {
+        let la = s.log_arities[r];
+        emit_leaf(&mut p, 4 * (1usize << la), D_F[r]);
+        let levels = pl[2 + r];
+        let sh = cum[r + 1] as u32;
         for l in 0..levels - 1 {
-            let micro = match (r, l) {
-                (0, 0) => M_FHI0,
-                (0, 1) => M_S1,
-                (0, 2) => M_B1,
-                (1, 0) => M_FHI1,
-                (1, 1) => M_S2,
-                (1, 2) => M_B2,
-                (2, 0) => M_FHI2,
-                (2, 1) => M_S3,
-                (2, 2) => M_B3,
-                (3, 0) => M_FHI3,
-                (3, 1) => M_FIN,
-                (3, 2) => M_HORN,
+            let micro = match l {
+                0 => s.m_fhi(r),
+                1 => {
+                    if r < n - 1 {
+                        s.m_s(r + 1)
+                    } else {
+                        s.m_fin()
+                    }
+                }
+                2 => {
+                    if r < n - 1 {
+                        s.m_b(r + 1)
+                    } else {
+                        s.m_horn()
+                    }
+                }
                 _ => M_NONE,
             };
-            p.push(desc(R_PATH, (base + l) as u32, micro));
+            p.push(desc(R_PATH, sh + l as u32, micro));
         }
-        p.push(desc(
-            [R_PLAST_F0, R_PLAST_F1, R_PLAST_F2, R_PLAST_F3][r],
-            18,
-            M_NONE,
-        ));
+        p.push(desc(s.r_plast_f(r), plast_dp, M_NONE));
     }
-    assert_eq!(p.len(), QSLOTS);
-    p.try_into().unwrap()
+    assert_eq!(p.len(), s.qslots(), "query program length");
+    p
 }
 
 // ---------------------------------------------------------------------------
@@ -1359,18 +1463,18 @@ const fn ring_at(base: usize, n: usize, g: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct GateConsts {
-    /// g22^(2^(21-k)) for k in 0..22 (x / x_fin chains).
-    pub kx: [Val; 22],
+    /// g_{log_max}^(2^(log_max-1-k)) for k in 0..log_max (x / x_fin chains).
+    pub kx: Vec<Val>,
     /// s-chain constants per round: sk[r][k] = g_(lf+la)^(2^(lf-1-k)).
-    pub sk: [Vec<Val>; 4],
+    pub sk: Vec<Vec<Val>>,
     /// Fold constants k_fold[r][l][i] = g_l^(-rev_(la-l-1)(i)),
     /// g_l = two_adic_generator(la_r)^(2^l).
-    pub kf: [Vec<Vec<Val>>; 4],
+    pub kf: Vec<Vec<Vec<Val>>>,
     pub gen: Val,
     pub g_trace: Val,
     pub half: Val,
-    /// Flush block counts for BLKCNT reloads.
-    pub flush_blocks: [usize; 8],
+    /// Flush block counts for BLKCNT reloads (one per obs flush).
+    pub flush_blocks: Vec<usize>,
 }
 
 fn rev_bits(x: usize, bits: usize) -> usize {
@@ -1381,35 +1485,44 @@ fn rev_bits(x: usize, bits: usize) -> usize {
     r
 }
 
-pub(crate) fn gate_consts() -> GateConsts {
-    let g22 = Val::two_adic_generator(LOG_MAX);
-    let kx = core::array::from_fn(|k| g22.exp_power_of_2(21 - k));
-    let lf: [usize; 4] = [18, 14, 10, 8];
-    let sk = core::array::from_fn(|r| {
-        let g = Val::two_adic_generator(lf[r] + LOG_ARITIES[r]);
-        (0..lf[r]).map(|k| g.exp_power_of_2(lf[r] - 1 - k)).collect()
-    });
-    let kf = core::array::from_fn(|r| {
-        let la = LOG_ARITIES[r];
-        let g_ar = Val::two_adic_generator(la);
-        (0..la)
-            .map(|l| {
-                let g_l = g_ar.exp_power_of_2(l);
-                let pairs = 1 << (la - l - 1);
-                (0..pairs)
-                    .map(|i| g_l.exp_u64(rev_bits(i, la - l - 1) as u64).inverse())
-                    .collect()
-            })
-            .collect()
-    });
+/// Shape-parametrized field constants (slice 1b-2). `gate_consts_from_shape(&narrow())`
+/// reproduces the shipped narrow generators byte-for-byte (`kx` length `log_max`,
+/// per-round `lf = log_max - cum[r+1]`, `g_trace = two_adic(log_max - log_blowup)`).
+pub(crate) fn gate_consts_from_shape(s: &GateShape) -> GateConsts {
+    let log_max = s.log_max;
+    let n = s.n_fri_rounds();
+    let lf = s.lf();
+    let g_lm = Val::two_adic_generator(log_max);
+    let kx = (0..log_max).map(|k| g_lm.exp_power_of_2(log_max - 1 - k)).collect();
+    let sk = (0..n)
+        .map(|r| {
+            let g = Val::two_adic_generator(lf[r] + s.log_arities[r]);
+            (0..lf[r]).map(|k| g.exp_power_of_2(lf[r] - 1 - k)).collect()
+        })
+        .collect();
+    let kf = (0..n)
+        .map(|r| {
+            let la = s.log_arities[r];
+            let g_ar = Val::two_adic_generator(la);
+            (0..la)
+                .map(|l| {
+                    let g_l = g_ar.exp_power_of_2(l);
+                    let pairs = 1 << (la - l - 1);
+                    (0..pairs)
+                        .map(|i| g_l.exp_u64(rev_bits(i, la - l - 1) as u64).inverse())
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
     GateConsts {
         kx,
         sk,
         kf,
         gen: Val::GENERATOR,
-        g_trace: Val::two_adic_generator(18),
+        g_trace: Val::two_adic_generator(log_max - s.log_blowup),
         half: Val::from_u32(2).inverse(),
-        flush_blocks: FLUSH_BLOCKS,
+        flush_blocks: s.flush_blocks(),
     }
 }
 
@@ -1418,7 +1531,7 @@ pub(crate) fn gate_consts() -> GateConsts {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct VerifierGateAir {
-    pub program: [u32; QSLOTS],
+    pub program: Vec<u32>,
     pub consts: GateConsts,
     /// Inner-proof shape this circuit verifies (narrow leaf today; a future
     /// slice instantiates `wide()` for the interior node).
@@ -1430,26 +1543,20 @@ pub(crate) struct VerifierGateAir {
 
 impl VerifierGateAir {
     pub(crate) fn new() -> Self {
-        let shape = GateShape::narrow();
-        let layout = GateLayout::from_shape(&shape);
-        Self {
-            program: qprogram(),
-            consts: gate_consts(),
-            shape,
-            layout,
-        }
+        Self::new_with_shape(GateShape::narrow())
     }
 
     /// Build a verifier gate for an arbitrary inner-proof `shape`, deriving the
-    /// column layout from it. Wired for a later slice's `wide()` instance; the
-    /// program / consts are still the narrow generators (wide lowering lands in
-    /// slice 1b), so only `new()` (narrow) is exercised today.
-    #[allow(dead_code)]
+    /// column layout, query program, and field constants from it (slice 1b-2:
+    /// all three are now shape-parametrized, so `new_with_shape(wide())` is
+    /// self-consistent).
     pub(crate) fn new_with_shape(shape: GateShape) -> Self {
         let layout = GateLayout::from_shape(&shape);
+        let program = qprogram_from_shape(&shape);
+        let consts = gate_consts_from_shape(&shape);
         Self {
-            program: qprogram(),
-            consts: gate_consts(),
+            program,
+            consts,
             shape,
             layout,
         }
@@ -1461,7 +1568,7 @@ impl<F: Field> BaseAir<F> for VerifierGateAir {
         self.layout.gate_width
     }
     fn num_public_values(&self) -> usize {
-        N_OPVS
+        self.shape.n_opvs()
     }
 }
 
@@ -1557,7 +1664,7 @@ where
             // self.layout.pg_a = ringsel(7) * grpdone * phc
             builder.assert_eq(
                 cv(self.layout.pg_a),
-                ring_fring(7) * cv(ring_at(self.layout.grp, N_GROUPS, G_DONE)) * phc.clone(),
+                ring_fring(7) * cv(ring_at(self.layout.grp, self.shape.n_groups(), self.shape.g_done())) * phc.clone(),
             );
             // self.layout.phg (phasegate) = sf(23) * self.layout.blklast * self.layout.pg_a
             builder.assert_eq(cv(self.layout.phg), sf(23) * cv(self.layout.blklast) * cv(self.layout.pg_a));
@@ -1597,7 +1704,7 @@ where
         }
 
         // Ring pin + rotation (one limb per perm while in query phase).
-        for i in 0..QSLOTS {
+        for i in 0..self.shape.qslots() {
             builder
                 .when_first_row()
                 .assert_eq(cv(self.layout.pr + i), c(self.program[i]));
@@ -1605,10 +1712,10 @@ where
         {
             let g = sf(23) * phq.clone();
             let mut t = builder.when_transition();
-            for i in 0..QSLOTS {
+            for i in 0..self.shape.qslots() {
                 t.assert_eq(
                     nv(self.layout.pr + i),
-                    cv(self.layout.pr + i) + g.clone() * (cv(self.layout.pr + (i + 1) % QSLOTS) - cv(self.layout.pr + i)),
+                    cv(self.layout.pr + i) + g.clone() * (cv(self.layout.pr + (i + 1) % self.shape.qslots()) - cv(self.layout.pr + i)),
                 );
             }
         }
@@ -1645,7 +1752,7 @@ where
             );
         }
         // Role selectors: RSEL_r = phq * self.layout.rlo[r&3] * self.layout.rhi[(r>>2)&3]  (deg 3).
-        for r in 0..N_ROLES {
+        for r in 0..self.shape.n_roles() {
             builder.assert_eq(
                 cv(self.layout.rsel + r),
                 phq.clone() * cv(self.layout.rlo + (r & 3)) * cv(self.layout.rhi + ((r >> 2) & 3)),
@@ -1660,7 +1767,7 @@ where
             let e = lit(self.layout.pd + 13, b & 1 == 1) * lit(self.layout.pd + 14, b & 2 == 2);
             builder.assert_eq(cv(self.layout.mhi + b), e);
         }
-        for m in 0..N_MICROS {
+        for m in 0..self.shape.n_micros() {
             builder.assert_eq(cv(self.layout.msel + m), cv(self.layout.mlo + (m & 7)) * cv(self.layout.mhi + (m >> 3)));
         }
         // dparam selectors: DLO_a (PD4..6), DHI_b (PD7..8, b < 3).
@@ -1697,7 +1804,7 @@ where
                 if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO },
             );
         }
-        builder.when_first_row().assert_eq(cv(self.layout.qcnt), c(QSLOTS as u32));
+        builder.when_first_row().assert_eq(cv(self.layout.qcnt), c(self.shape.qslots() as u32));
         builder.when_first_row().assert_one(cv(self.layout.phc));
         builder.when_first_row().assert_zero(cv(self.layout.phq));
         // self.layout.qcw comparator: self.layout.qcnt == 1.
@@ -1720,7 +1827,7 @@ where
                 cv(self.layout.qcnt)
                     + dec.clone()
                         * ((AB::Expr::ONE - cv(self.layout.qcw)) * (-AB::Expr::ONE)
-                            + cv(self.layout.qcw) * c(QSLOTS as u32 - 1)),
+                            + cv(self.layout.qcw) * c(self.shape.qslots() as u32 - 1)),
             );
             // self.layout.qsel rotation on block wrap. (self.layout.qadv = sf(23)*phq*self.layout.qcw = dec*self.layout.qcw.)
             let g = cv(self.layout.qadv);
@@ -1875,9 +1982,10 @@ where
         }
         // self.layout.needl = self.layout.blklast * (required group reached for the next obs flush).
         {
+            let groupreq = self.shape.groupreq();
             let mut need = AB::Expr::ZERO;
             for f in 0..8 {
-                need = need + ringsel(f) * cv(ring_at(self.layout.grp, N_GROUPS, GROUPREQ[f + 1]));
+                need = need + ringsel(f) * cv(ring_at(self.layout.grp, self.shape.n_groups(), groupreq[f + 1]));
             }
             builder.assert_eq(cv(self.layout.needl), cv(self.layout.blklast) * need);
         }
@@ -1896,7 +2004,7 @@ where
         }
         builder.when_first_row().assert_zero(cv(self.layout.refsel));
         builder.when_first_row().assert_one(cv(self.layout.grp));
-        for i in 1..N_GROUPS {
+        for i in 1..self.shape.n_groups() {
             builder.when_first_row().assert_zero(cv(self.layout.grp + i));
         }
         builder.when_first_row().assert_one(cv(self.layout.coef));
@@ -2129,16 +2237,16 @@ where
             // Ext-challenge assembly (inc-4): accepted field draws feed the
             // self.layout.coef ring / self.layout.curch limbs; every 4th accepted draw assembles
             // self.layout.chal[grp] and advances the self.layout.grp ring. PoW/query-index (bits) draws
-            // run the same byte gadget but sit at grp >= G_POW; the field_grp
+            // run the same byte gadget but sit at grp >= self.shape.g_pow(); the field_grp
             // gate keeps them out of the field assembly, and sample_bits (below)
             // handles the query-index binding.
             // =================================================================
             let masked = cv(self.layout.fsacc) + c(1 << 16) * b_lo + c(1 << 24) * b_hi_masked;
             // A field-challenge group (0..6) is the ring head. Query-index and
-            // PoW (bits) draws sit at grp >= G_POW and must NOT drive the
+            // PoW (bits) draws sit at grp >= self.shape.g_pow() and must NOT drive the
             // challenge assembly even though they run the same byte gadget.
-            let field_grp = (0..N_CHALS)
-                .map(|g| cv(ring_at(self.layout.grp, N_GROUPS, g)))
+            let field_grp = (0..self.shape.n_chals())
+                .map(|g| cv(ring_at(self.layout.grp, self.shape.n_groups(), g)))
                 .fold(AB::Expr::ZERO, |a, e| a + e);
             // self.layout.crot = accept, on an odd FS row whose active group is a field
             // challenge. (bits draws set self.layout.crot = 0.)
@@ -2148,9 +2256,9 @@ where
             // A bits group (PoW or a query index): each is a single draw that
             // completes on its odd row.
             let bits_grp = {
-                let mut e = cv(ring_at(self.layout.grp, N_GROUPS, G_POW));
+                let mut e = cv(ring_at(self.layout.grp, self.shape.n_groups(), self.shape.g_pow()));
                 for q in 0..self.shape.nq {
-                    e = e + cv(ring_at(self.layout.grp, N_GROUPS, G_IDX0 + q));
+                    e = e + cv(ring_at(self.layout.grp, self.shape.n_groups(), self.shape.g_idx0() + q));
                 }
                 e
             };
@@ -2159,11 +2267,11 @@ where
             // pins self.layout.grot, which now drives the self.layout.grp-ring rotation below.
             let coef3 = cv(ring_at(self.layout.coef, 4, 3));
             builder.assert_eq(cv(self.layout.grot), cv(self.layout.crot) * coef3 + cv(self.layout.fsodd) * bits_grp.clone());
-            // PoW draw (grp = G_POW): the low self.shape.grind_bits of the sampled value
+            // PoW draw (grp = self.shape.g_pow()): the low self.shape.grind_bits of the sampled value
             // must be zero (the grind check). value = self.layout.fsacc (bits 0..16) +
             // self.layout.fsbits[0..self.shape.grind_bits-16] << 16.
             {
-                let pow_gate = cv(self.layout.fsodd) * cv(ring_at(self.layout.grp, N_GROUPS, G_POW));
+                let pow_gate = cv(self.layout.fsodd) * cv(ring_at(self.layout.grp, self.shape.n_groups(), self.shape.g_pow()));
                 let mut pow_val = cv(self.layout.fsacc);
                 for i in 0..(self.shape.grind_bits - 16) {
                     pow_val = pow_val + cv(self.layout.fsbits + i) * c(1 << (16 + i));
@@ -2174,7 +2282,7 @@ where
             for k in 0..4 {
                 builder.when_first_row().assert_zero(cv(self.layout.curch + k));
             }
-            for k in 0..4 * N_CHALS {
+            for k in 0..4 * self.shape.n_chals() {
                 builder.when_first_row().assert_zero(cv(self.layout.chal + k));
             }
             for q in 0..self.shape.nq {
@@ -2182,7 +2290,7 @@ where
             }
             // sample_bits (query indices): value = low self.shape.log_max (=22) bits of
             // the draw = self.layout.fsacc (bits 0..16) + self.layout.fsbits[0..6] << 16. No rejection.
-            // The draw sits at grp = G_IDX0 + q; bind self.layout.idxr[q] on its odd row.
+            // The draw sits at grp = self.shape.g_idx0() + q; bind self.layout.idxr[q] on its odd row.
             let idx_val = {
                 let mut e = cv(self.layout.fsacc);
                 for i in 0..(self.shape.log_max - 16) {
@@ -2195,11 +2303,11 @@ where
                 // self.layout.grp ring: left-rotate (advance the logical group) on self.layout.grot.
                 // This binds the draw-group schedule to the FS gadget, giving
                 // the GROUPREQ flush-start gate (Stage A) real teeth.
-                for i in 0..N_GROUPS {
+                for i in 0..self.shape.n_groups() {
                     t.assert_eq(
                         nv(self.layout.grp + i),
                         cv(self.layout.grp + i)
-                            + cv(self.layout.grot) * (cv(self.layout.grp + (i + 1) % N_GROUPS) - cv(self.layout.grp + i)),
+                            + cv(self.layout.grot) * (cv(self.layout.grp + (i + 1) % self.shape.n_groups()) - cv(self.layout.grp + i)),
                     );
                 }
                 // self.layout.coef ring: left-rotate (increment logical coef) on self.layout.crot.
@@ -2221,8 +2329,8 @@ where
                 t.assert_eq(nv(self.layout.curch + 3), cv(self.layout.curch + 3));
                 // self.layout.chal[grp] assembly on self.layout.grot: limbs (CURCH0..2, masked) into
                 // the self.layout.grp-ring-selected challenge register; carries otherwise.
-                for g in 0..N_CHALS {
-                    let gate = cv(self.layout.grot) * cv(ring_at(self.layout.grp, N_GROUPS, g));
+                for g in 0..self.shape.n_chals() {
+                    let gate = cv(self.layout.grot) * cv(ring_at(self.layout.grp, self.shape.n_groups(), g));
                     for k in 0..4 {
                         let asm = if k < 3 { cv(self.layout.curch + k) } else { masked.clone() };
                         t.assert_eq(
@@ -2232,10 +2340,10 @@ where
                     }
                 }
                 // self.layout.idxr[q] = idx_val on the odd row of query q's bits draw
-                // (grp = G_IDX0 + q); carries otherwise. Ties every FRI query
+                // (grp = self.shape.g_idx0() + q); carries otherwise. Ties every FRI query
                 // index to the FS-sampled digest bits — no free query choice.
                 for q in 0..self.shape.nq {
-                    let gate = cv(self.layout.fsodd) * cv(ring_at(self.layout.grp, N_GROUPS, G_IDX0 + q));
+                    let gate = cv(self.layout.fsodd) * cv(ring_at(self.layout.grp, self.shape.n_groups(), self.shape.g_idx0() + q));
                     t.assert_eq(
                         nv(self.layout.idxr + q),
                         cv(self.layout.idxr + q) + gate * (idx_val.clone() - cv(self.layout.idxr + q)),
@@ -2740,7 +2848,7 @@ where
                 let npairs = if rf < 3 { 7 } else { 1 };
                 for r in 0..npairs {
                     builder.assert_eq(
-                        cv(self.layout.fhg + fhg_index(rf, r)),
+                        cv(self.layout.fhg + fhg_index(&self.shape.log_arities, rf, r)),
                         cv(self.layout.msel + M_FHI0 as usize + rf) * sf(r),
                     );
                 }
@@ -2754,7 +2862,7 @@ where
                 for (r, &(l, i)) in pairs.iter().enumerate() {
                     // self.layout.fhg = msel_rf * sf(r) (materialized above, deg 1) so
                     // gate*computed (computed deg 2) stays deg 3.
-                    let gate = cv(self.layout.fhg + fhg_index(rf, r));
+                    let gate = cv(self.layout.fhg + fhg_index(&self.shape.log_arities, rf, r));
                     let _ = &msel;
                     let lo = self.layout.scr + 4 * (2 * i);
                     let hi = self.layout.scr + 4 * (2 * i + 1);
@@ -3089,32 +3197,34 @@ pub(crate) struct GateMeta {
     pub opvs: Vec<Val>,
 }
 
-/// Build the outer public values: 6 caps x 8 digests x 16 limbs + the 84
-/// inner public values.
-pub(crate) fn outer_pvs(sched: &Schedule, inner_pvs: &[Val]) -> Vec<Val> {
-    let mut opvs = Vec::with_capacity(N_OPVS);
-    assert_eq!(sched.caps.len(), N_CAPS);
+/// Build the outer public values: n_caps caps x cap_len digests x 16 limbs +
+/// the inner public values (slice 1b-2: shape-driven; narrow = 6x8x16 + 84).
+pub(crate) fn outer_pvs(sched: &Schedule, inner_pvs: &[Val], shape: &GateShape) -> Vec<Val> {
+    let mut opvs = Vec::with_capacity(shape.n_opvs());
+    assert_eq!(sched.caps.len(), shape.n_caps());
     for cap in &sched.caps {
-        assert_eq!(cap.len(), CAP_LEN);
+        assert_eq!(cap.len(), shape.cap_len);
         for d in cap {
             for j in 0..16 {
                 opvs.push(Val::from_u32(((d[j / 4] >> (16 * (j % 4))) & 0xffff) as u32));
             }
         }
     }
-    assert_eq!(inner_pvs.len(), N_PVS);
+    assert_eq!(inner_pvs.len(), shape.n_pvs);
     // Inner public values ride the outer interface in their transcript
     // encoding (Monty words), matching the absorbed bytes.
     let rr = monty_rr();
     opvs.extend(inner_pvs.iter().map(|v| *v * rr));
-    assert_eq!(opvs.len(), N_OPVS);
+    assert_eq!(opvs.len(), shape.n_opvs());
     opvs
 }
 
 /// Assemble the lane plan: challenger blocks (native order) + trailer +
 /// per-query leaf/path perms (cap-extension and collapse perms dropped),
 /// with the perm inputs for the keccak generator.
-fn lane_plan(sched: &Schedule) -> (Vec<[u64; 25]>, Vec<PInfo>) {
+fn lane_plan(sched: &Schedule, shape: &GateShape) -> (Vec<[u64; 25]>, Vec<PInfo>) {
+    let flush_blocks = shape.flush_blocks();
+    let flush_bytes = shape.flush_bytes();
     let mut inputs = vec![];
     let mut infos = vec![];
 
@@ -3128,10 +3238,10 @@ fn lane_plan(sched: &Schedule) -> (Vec<[u64; 25]>, Vec<PInfo>) {
             assert_eq!(fl.n_blocks, 1);
         } else {
             assert_eq!(
-                fl.n_blocks, FLUSH_BLOCKS[obs_ord],
+                fl.n_blocks, flush_blocks[obs_ord],
                 "obs flush {obs_ord} block count"
             );
-            assert_eq!(fl.msg.len(), FLUSH_BYTES[obs_ord], "obs flush {obs_ord} bytes");
+            assert_eq!(fl.msg.len(), flush_bytes[obs_ord], "obs flush {obs_ord} bytes");
         }
         for b in 0..fl.n_blocks {
             let p = &sched.perms[fl.first_perm + b];
@@ -3153,7 +3263,7 @@ fn lane_plan(sched: &Schedule) -> (Vec<[u64; 25]>, Vec<PInfo>) {
             obs_ord += 1;
         }
     }
-    assert_eq!(obs_ord, 8, "eight obs flushes");
+    assert_eq!(obs_ord, shape.n_obs_flushes(), "obs flush count");
     // Trailer: pad32(last digest) so the final window is preimage-visible.
     let last_digest = sched.flushes.last().unwrap().digest;
     let mut tr = [0u8; 136];
@@ -3176,11 +3286,11 @@ fn lane_plan(sched: &Schedule) -> (Vec<[u64; 25]>, Vec<PInfo>) {
     }
 
     // Query region: per query, absorbs + native path levels in walk order.
-    let program = qprogram();
+    let program = qprogram_from_shape(shape);
     let n_chal: usize = sched.flushes.iter().map(|f| f.n_blocks).sum();
     let mut ptr = n_chal;
-    for q in 0..NQ {
-        for slot in 0..QSLOTS {
+    for q in 0..shape.nq {
+        for slot in 0..shape.qslots() {
             let d = program[slot];
             let role = d & 0xf;
             // Skip the schedule's cap-extension perms (dropped in-lane).
@@ -3301,11 +3411,13 @@ struct Regs {
     coef: usize,
     curch: [u32; 4],
     fsfull: bool,
-    // registers
-    chal: [Ext; N_CHALS],
+    // registers (chal len = n_chals, idxr len = nq; scr[8]/breg[4]/fpreg[16]/
+    // oreg[68] stay fixed — 2^(max_la-1) / max_la / fp16 / keccak rate — valid
+    // while a16 holds for both shapes; see slice 1b-2 notes).
+    chal: Vec<Ext>,
     fa2: Ext,
     zn: Ext,
-    idxr: [u32; NQ],
+    idxr: Vec<u32>,
     oreg: [u16; 68],
     pos: usize,
     vc: usize,
@@ -3333,15 +3445,15 @@ struct Regs {
 }
 
 impl Regs {
-    fn new() -> Self {
+    fn new(shape: &GateShape) -> Self {
         Regs {
             pr_rot: 0,
             phc: true,
             phq: false,
             qsel: 0,
-            qcnt: QSLOTS as u32,
+            qcnt: shape.qslots() as u32,
             fring: 0,
-            blkcnt: FLUSH_BLOCKS[0] as u32,
+            blkcnt: shape.flush_blocks()[0] as u32,
             bidx: 0,
             refsel: false,
             phd: false,
@@ -3351,10 +3463,10 @@ impl Regs {
             coef: 0,
             curch: [0; 4],
             fsfull: false,
-            chal: [Ext::ZERO; N_CHALS],
+            chal: vec![Ext::ZERO; shape.n_chals()],
             fa2: Ext::ZERO,
             zn: Ext::ZERO,
-            idxr: [0; NQ],
+            idxr: vec![0; shape.nq],
             oreg: [0; 68],
             pos: 0,
             vc: 0,
@@ -3390,10 +3502,14 @@ fn write_row(
     row: usize,
     r: usize,
     regs: &Regs,
-    program: &[u32; QSLOTS],
+    program: &[u32],
     info: Option<&PInfo>,
     layout: &GateLayout,
+    shape: &GateShape,
 ) {
+    let qslots = shape.qslots();
+    let nq = shape.nq;
+    let groupreq = shape.groupreq();
     let base = row * layout.gate_width;
     let w = |v: &mut [Val], col: usize, x: Val| v[base + col] = x;
     let wb = |v: &mut [Val], col: usize, x: bool| v[base + col] = Val::from_bool(x);
@@ -3403,10 +3519,10 @@ fn write_row(
     };
 
     // Program ring + head decode.
-    for i in 0..QSLOTS {
-        wu(v, layout.pr + i, program[(i + regs.pr_rot) % QSLOTS]);
+    for i in 0..qslots {
+        wu(v, layout.pr + i, program[(i + regs.pr_rot) % qslots]);
     }
-    let head = program[regs.pr_rot % QSLOTS];
+    let head = program[regs.pr_rot % qslots];
     for k in 0..15 {
         wb(v, layout.pd + k, (head >> k) & 1 == 1);
     }
@@ -3433,7 +3549,7 @@ fn write_row(
     wb(v, layout.phc, regs.phc);
     wb(v, layout.phq, regs.phq);
     // layout.qsel / layout.qcnt.
-    wb(v, ring_at(layout.qsel, NQ + 1, regs.qsel) - layout.qsel + layout.qsel, true);
+    wb(v, ring_at(layout.qsel, nq + 1, regs.qsel) - layout.qsel + layout.qsel, true);
     wu(v, layout.qcnt, regs.qcnt);
     let qcw = regs.qcnt == 1;
     wb(v, layout.qcw, qcw);
@@ -3445,13 +3561,13 @@ fn write_row(
         );
     }
     // Index bits of the active query.
-    let idx = if regs.phq && regs.qsel < NQ {
+    let idx = if regs.phq && regs.qsel < nq {
         regs.idxr[regs.qsel]
     } else {
         0
     };
     if regs.phq {
-        for k in 0..LOG_MAX {
+        for k in 0..shape.log_max {
             wb(v, layout.idxb + k, (idx >> k) & 1 == 1);
         }
     }
@@ -3501,10 +3617,10 @@ fn write_row(
         }
     }
     // layout.needl.
-    let need = blklast && regs.grp == GROUPREQ[regs.fring + 1];
+    let need = blklast && regs.grp == groupreq[regs.fring + 1];
     wb(v, layout.needl, need);
     // Draw automaton state.
-    wb(v, ring_at(layout.grp, N_GROUPS, regs.grp) - layout.grp + layout.grp, true);
+    wb(v, ring_at(layout.grp, shape.n_groups(), regs.grp) - layout.grp + layout.grp, true);
     wb(v, ring_at(layout.coef, 4, regs.coef) - layout.coef + layout.coef, true);
     for k in 0..4 {
         wu(v, layout.curch + k, regs.curch[k]);
@@ -3516,7 +3632,7 @@ fn write_row(
     }
     we(v, layout.fa2, regs.fa2);
     we(v, layout.znreg, regs.zn);
-    for q in 0..NQ {
+    for q in 0..nq {
         wu(v, layout.idxr + q, regs.idxr[q]);
     }
     for i in 0..68 {
@@ -3682,12 +3798,18 @@ pub(crate) fn build_gate_trace(
     inner_pvs: &[Val],
     extra_capacity_bits: usize,
 ) -> (RowMajorMatrix<Val>, GateMeta) {
-    let consts = gate_consts();
-    let program = qprogram();
+    // Slice 1b-2: the trace path is now shape-parametrized; slice 1b-3 will lift
+    // `shape` to a parameter. Narrow behavior is unchanged (this still builds the
+    // narrow leaf gate through the generic generators).
     let shape = GateShape::narrow();
+    let consts = gate_consts_from_shape(&shape);
+    let program = qprogram_from_shape(&shape);
     let layout = GateLayout::from_shape(&shape);
-    let opvs = outer_pvs(sched, inner_pvs);
-    let (inputs, infos) = lane_plan(sched);
+    let nq = shape.nq;
+    let qslots = shape.qslots();
+    let cum = shape.cum();
+    let opvs = outer_pvs(sched, inner_pvs, &shape);
+    let (inputs, infos) = lane_plan(sched, &shape);
     let n_perms = inputs.len();
     let outs: Vec<[u64; 25]> = inputs.iter().map(keccakf).collect();
 
@@ -3716,15 +3838,11 @@ pub(crate) fn build_gate_trace(
         };
         hosted.entry(cons).or_default().push(d.clone());
     }
-    let chal_expect: [Ext; N_CHALS] = [
-        sched.alpha,
-        sched.zeta,
-        sched.fri_alpha,
-        sched.betas[0],
-        sched.betas[1],
-        sched.betas[2],
-        sched.betas[3],
-    ];
+    let mut chal_expect: Vec<Ext> = vec![sched.alpha, sched.zeta, sched.fri_alpha];
+    for r in 0..shape.n_fri_rounds() {
+        chal_expect.push(sched.betas[r]);
+    }
+    assert_eq!(chal_expect.len(), shape.n_chals());
     // Final poly from the labeled obs stream.
     let fpoly: Vec<Ext> = sched
         .obs
@@ -3765,7 +3883,7 @@ pub(crate) fn build_gate_trace(
     };
     let mut zvi = 0usize;
 
-    let mut regs = Regs::new();
+    let mut regs = Regs::new(&shape);
     regs.fsfull = hosted.get(&0).map_or(false, |d| d.len() == 8);
     let mut meta = GateMeta {
         query_rows: vec![],
@@ -3794,7 +3912,7 @@ pub(crate) fn build_gate_trace(
         };
         let (q_role, q_dparam, q_micro, q_q) = match info {
             PInfo::Query { q, slot } => {
-                assert_eq!(*slot, regs.pr_rot % QSLOTS, "ring alignment");
+                assert_eq!(*slot, regs.pr_rot % qslots, "ring alignment");
                 let d = program[*slot];
                 (d & 0xf, (d >> 4) & 0x3f, (d >> 10) & 0x1f, *q)
             }
@@ -3820,15 +3938,15 @@ pub(crate) fn build_gate_trace(
 
         for r in 0..24 {
             let row = base_row + r;
-            write_row(&mut values, row, r, &regs, &program, Some(info), &layout);
+            write_row(&mut values, row, r, &regs, &program, Some(info), &layout, &shape);
             // layout.gpb for fold-absorb perms (write over write_row's zeros).
             if let Some(rf) = fold_r {
-                let la = LOG_ARITIES[rf];
+                let la = shape.log_arities[rf];
                 for k in 0..4 {
-                    let b = k < la && (qidx >> (CUM[rf] + k)) & 1 == 1;
+                    let b = k < la && (qidx >> (cum[rf] + k)) & 1 == 1;
                     values[row * layout.gate_width + layout.gpb + k] = Val::from_bool(b);
                 }
-                let gp = (qidx >> CUM[rf]) & ((1 << la) - 1);
+                let gp = (qidx >> cum[rf]) & ((1 << la) - 1);
                 values[row * layout.gate_width + layout.hit] =
                     Val::from_bool(regs.vc % 16 == gp);
             } else {
@@ -4076,11 +4194,11 @@ pub(crate) fn build_gate_trace(
                             DrawKind::Bits { value, purpose, .. } => {
                                 match purpose {
                                     m4gaterec::BitsTag::QueryPow => {
-                                        assert_eq!(regs.grp, G_POW);
+                                        assert_eq!(regs.grp, shape.g_pow());
                                         assert_eq!(value, 0, "query PoW");
                                     }
                                     m4gaterec::BitsTag::QueryIndex { q } => {
-                                        assert_eq!(regs.grp, G_IDX0 + q);
+                                        assert_eq!(regs.grp, shape.g_idx0() + q);
                                         regs.idxr[q] = value;
                                     }
                                 }
@@ -4126,9 +4244,9 @@ pub(crate) fn build_gate_trace(
                     }
                     m @ (M_S0 | M_S1 | M_S2 | M_S3) => {
                         let rf = (m - M_S0) as usize;
-                        let lf = [18usize, 14, 10, 8][rf];
+                        let lf = shape.lf()[rf];
                         if r < lf {
-                            let bit = (qidx >> (CUM[rf + 1] + r)) & 1 == 1;
+                            let bit = (qidx >> (cum[rf + 1] + r)) & 1 == 1;
                             let bmux =
                                 ext_base(if bit { consts.sk[rf][r] } else { Val::ONE });
                             let a = if r == 0 { Ext::ONE } else { regs.mchain };
@@ -4144,7 +4262,7 @@ pub(crate) fn build_gate_trace(
                     }
                     m @ (M_B0 | M_B1 | M_B2 | M_B3) => {
                         let rf = (m - M_B0) as usize;
-                        let la = LOG_ARITIES[rf];
+                        let la = shape.log_arities[rf];
                         if r == 0 {
                             let cb =
                                 bank_mul(&mut values, row, regs.chal[G_BETA0 + rf], regs.inv2s, &layout);
@@ -4246,14 +4364,14 @@ pub(crate) fn build_gate_trace(
                     && regs.refsel
                     && regs.blkcnt == 1
                     && regs.fring == 7
-                    && regs.grp == G_DONE;
+                    && regs.grp == shape.g_done();
                 let phdend = regs.phd && regs.blkcnt == 1;
                 if regs.phq {
-                    regs.pr_rot = (regs.pr_rot + 1) % QSLOTS;
+                    regs.pr_rot = (regs.pr_rot + 1) % qslots;
                     if regs.qcnt == 1 {
-                        regs.qcnt = QSLOTS as u32;
+                        regs.qcnt = qslots as u32;
                         regs.qsel += 1;
-                        if regs.qsel == NQ {
+                        if regs.qsel == nq {
                             regs.phq = false;
                         }
                     } else {
@@ -4267,7 +4385,7 @@ pub(crate) fn build_gate_trace(
                         regs.oreg[i] = st_limb(out, i);
                     }
                 }
-                if matches!(info, PInfo::Obs { flush: 2, block } if *block == FLUSH_BLOCKS[2] - 1) {
+                if matches!(info, PInfo::Obs { flush: 2, block } if *block == shape.flush_blocks()[2] - 1) {
                     for m in 0..16 {
                         regs.f2dig[m] = st_limb(out, m);
                     }
@@ -4281,7 +4399,7 @@ pub(crate) fn build_gate_trace(
                     Some(PInfo::Obs { flush, block: 0 }) => {
                         assert_eq!(*flush, regs.fring + 1, "obs flush order");
                         regs.fring = *flush;
-                        regs.blkcnt = FLUSH_BLOCKS[*flush] as u32;
+                        regs.blkcnt = shape.flush_blocks()[*flush] as u32;
                         regs.bidx = 0;
                         regs.refsel = false;
                     }
@@ -4328,15 +4446,15 @@ pub(crate) fn build_gate_trace(
 
     // Pad rows: frozen registers.
     for row in 24 * n_perms..rows {
-        write_row(&mut values, row, row % 24, &regs, &program, None, &layout);
+        write_row(&mut values, row, row % 24, &regs, &program, None, &layout, &shape);
     }
     // Global self-checks against the recorder.
-    assert_eq!(regs.qsel, NQ, "all query blocks completed");
+    assert_eq!(regs.qsel, nq, "all query blocks completed");
     assert!(!regs.phq && !regs.phc && !regs.phd, "phases exhausted");
     for (g, e) in chal_expect.iter().enumerate() {
         assert_eq!(regs.chal[g], *e, "challenge register {g}");
     }
-    for q in 0..NQ {
+    for q in 0..nq {
         assert_eq!(regs.idxr[q] as usize, sched.queries[q].index, "index register {q}");
     }
     assert_eq!(regs.a0, scale(sched.pz[0]), "A0 = PZ group 0");
@@ -4354,7 +4472,7 @@ pub(crate) fn build_gate_trace(
     );
     assert_eq!(regs.fpi, 16, "final poly fully captured");
 
-    fill_derived(&mut values, &layout);
+    fill_derived(&mut values, &layout, &shape);
 
     (RowMajorMatrix::new(values, layout.gate_width), meta)
 }
@@ -4362,11 +4480,13 @@ pub(crate) fn build_gate_trace(
 /// Fill the Phase-1a degree-reduction columns: pure current-row functions of
 /// already-filled columns, mirroring the defining constraints in `eval`. Kept
 /// as a post-pass so the intricate per-perm witness logic above is untouched.
-fn fill_derived(values: &mut [Val], layout: &GateLayout) {
+fn fill_derived(values: &mut [Val], layout: &GateLayout, shape: &GateShape) {
     let w = layout.gate_width;
     let one = Val::ONE;
     let rows = values.len() / w;
     let ring = |base: usize, n: usize, g: usize| base + (n - g % n) % n;
+    let flush_blocks = shape.flush_blocks();
+    let lfs = shape.lf();
     for r in 0..rows {
         let base = r * w;
         let row = &values[base..base + w];
@@ -4417,11 +4537,12 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout) {
             }
             *slot = acc;
         }
-        let mut fhg = [Val::ZERO; N_FHG];
+        let mut fhg = vec![Val::ZERO; shape.n_fhg()];
         for rf in 0..4 {
             let npairs = if rf < 3 { 7 } else { 1 };
             for r in 0..npairs {
-                fhg[fhg_index(rf, r)] = g(layout.msel + M_FHI0 as usize + rf) * g(r);
+                fhg[fhg_index(&shape.log_arities, rf, r)] =
+                    g(layout.msel + shape.m_fhi(rf) as usize) * g(r);
             }
         }
         // layout.prega = extmul(layout.preg, fri_alpha) for the PX word-1 accumulation term.
@@ -4446,18 +4567,18 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout) {
         let blklast = g(layout.blklast);
         let chlive = phc * (one - g(layout.refsel));
         let f2sel = g(ring(layout.fring, 8, 2)) * (one - g(layout.bidx));
-        let pg_a = g(ring(layout.fring, 8, 7)) * g(ring(layout.grp, N_GROUPS, G_DONE)) * phc;
+        let pg_a = g(ring(layout.fring, 8, 7)) * g(ring(layout.grp, shape.n_groups(), shape.g_done())) * phc;
         let phg = sf23 * blklast * pg_a;
         let phdend = sf23 * g(layout.phd) * blklast;
         let cont = sf23 * phc * (one - blklast);
-        let eg_a = phq * g(layout.qcw) * g(ring(layout.qsel, NQ + 1, NQ - 1));
+        let eg_a = phq * g(layout.qcw) * g(ring(layout.qsel, shape.nq + 1, shape.nq - 1));
         let endg = sf23 * eg_a;
         let mut xsel = g(layout.phd) * (one - g(layout.cmpc));
         for f in 0..8 {
             if f == 2 {
                 continue;
             }
-            for b in 1..FLUSH_BLOCKS[f] {
+            for b in 1..flush_blocks[f] {
                 xsel += g(layout.shsel + shsel_index(f, b));
             }
         }
@@ -4493,9 +4614,8 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout) {
             values[base + layout.rhi + j] = rhi[j];
         }
         // SNL_rf = layout.msel[M_S0+rf] * (1 - sf(lfs[rf])).
-        let lfs = [18usize, 14, 10, 8];
-        for rf in 0..4 {
-            let msel = values[base + layout.msel + M_S0 as usize + rf];
+        for rf in 0..shape.n_fri_rounds() {
+            let msel = values[base + layout.msel + shape.m_s(rf) as usize];
             values[base + layout.snl + rf] = msel * (Val::ONE - values[base + lfs[rf]]);
         }
         for j in 0..4 {
@@ -4504,8 +4624,8 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout) {
             values[base + layout.gf + j] = gf[j];
             values[base + layout.bpm + j] = bpm[j];
         }
-        for f in 0..N_FHG {
-            values[base + layout.fhg + f] = fhg[f];
+        for (f, &val) in fhg.iter().enumerate() {
+            values[base + layout.fhg + f] = val;
         }
         for k in 0..4 {
             values[base + layout.prega + k] = prega[k];
@@ -4556,7 +4676,7 @@ pub(crate) fn run_m4gate(power: &str, only: Option<&str>) {
     // Build the real M3 proof + recorder schedule once (shared across configs).
     let (_inst, pvs, proof) = m4gaterec::consensus_proof();
     let sched = m4gaterec::walk(&proof, &pvs);
-    let n_perms = lane_plan(&sched).0.len();
+    let n_perms = lane_plan(&sched, &GateShape::narrow()).0.len();
     println!(
         "- rectangle: {GATE_WIDTH} cols x 2^16, {n_perms} lane perms; proves-in-circuit \
          a REAL M3 consensus proof with every gate column bound (FS/draw schedule, \
@@ -5096,7 +5216,7 @@ mod tests {
     fn dump_trace() {
         let _g = heavy_lock();
         let (sched, pvs, _) = shared();
-        let (_ins, infos) = lane_plan(sched);
+        let (_ins, infos) = lane_plan(sched, &GateShape::narrow());
         let (trace, _meta) = build_gate_trace(sched, pvs, 0);
         let w = trace.width();
         let val = trace.values;
