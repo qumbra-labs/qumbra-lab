@@ -445,6 +445,25 @@ the `0..19` dmux path-direction loops (eval ~1866 / fill ~3710) and the
 `log_max`=18, `log_max-cap_height`=15. Generalize all to `self.shape.log_max`
 (and `-1`/`-cap_height` as appropriate). Then re-attempt 1b-4 (enable the
 `#[ignore]`'d test) — likely reveals the next layer or reaches SAT.
+
+  **1b-B4 — DONE** (`db63823`, narrow 37 green, byte-identical): generalized to
+  `self.shape.log_max` / `log_max-1` / `log_max-cap_height` (M_X1 x-chain kx loop
+  + chain + cap, dmux, cap-element `idxb+capb+{0,1,2}`); cleared the M_X1 OOB.
+
+  **BUILD-BLOCKER CHAIN CLEARED — the wide trace now BUILDS fully** (no panic/OOB
+  anywhere in build + the full symbolic `check_constraints` pass). Work shifts
+  from "make it build" to "make it satisfy":
+  - **1b-B5 — row-0 constraint mismatch (NEW next blocker).** Wide
+    `check_constraints` reports **row 0: constraints #4174, #4176, #4179 not
+    satisfied** (`p3-air check_constraints.rs:499`; narrow 37/37 still green) —
+    a first-row/boundary assertion that is narrow-specific. Diagnose by mapping
+    those constraint indices to `eval` source (the `dump_constraint` test
+    ~m4gate.rs:4118 enumerates by index; or count `builder.assert_*` in eval
+    order), then generalize for wide. Likely `when_first_row` asserts
+    (qsel/qcnt/phc/phq ~1801, blkcnt=flush_blocks[0], or M_X1/first-perm setup).
+    Fixing may reveal further unsatisfied rows (check_constraints reports only
+    the first failing row). Then enable the 1b-4 test → wide single-child SAT →
+    1b-5 wide negatives → 棒 2 / 棒 3 / stage 3.
 - **… likely more** surface as each is cleared. Each is moderate circuit work
   (narrow suite green + wide-build-advances-further as the per-slice gate); the
   whole chain is the "≈ fold-pipeline build" scope the 1b-4 finding flagged.
