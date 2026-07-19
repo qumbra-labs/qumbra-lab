@@ -4093,6 +4093,24 @@ mod tests {
         );
     }
 
+    /// Guard the deg-3 house rule (PR #18 review soft spot): the calibration
+    /// bench and quotient sizing assume every constraint is degree <= 3. A
+    /// silent regression above 3 would misconfigure the prover, so assert it
+    /// here permanently rather than only printing it in `dump_constraint`.
+    #[test]
+    fn constraint_degree_within_budget() {
+        use p3_air::symbolic::{get_symbolic_constraints, AirLayout};
+        let air = VerifierGateAir::new();
+        let layout = AirLayout::from_air::<Val>(&air);
+        let cs = get_symbolic_constraints::<Val, _>(&air, layout);
+        let max = cs.iter().map(|c| c.degree_multiple()).max().unwrap_or(0);
+        assert!(
+            max <= 3,
+            "verifier gate AIR max constraint degree {max} > 3 (deg-3 house rule \
+             — the bench quotient sizing assumes it; see dump_constraint)"
+        );
+    }
+
     /// Diagnostic (relay debugging): dump a constraint's referenced columns
     /// by region name, and report the first gate-touching constraint index.
     /// Set CIDX=<n> to target a specific constraint (default 4135).
