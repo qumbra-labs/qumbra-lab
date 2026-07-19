@@ -395,13 +395,35 @@ work, discovered incrementally (each fix reveals the next narrow assumption):
   selectors, `zvi==tw`/`2tw`/`2tw+qw`, czd last-block `rle(row_A2−1)`, dup-entry
   BLKCNT reload, dup-last-block digest binding. `P0R/P1R` exponents were already
   dynamic (captured from `preg`, cross-checked vs `sched.alpha_off`) → wide-correct.
-- **1b-B3 — micro-op scheduling for the short last fold round (NEW next
-  blocker).** Wide build now clears 4129 and stops at **`m4gate.rs:~4385`**:
-  `shape.lf()[rf]` panics `index out of bounds: len 3 index 3` — the fold-round
-  micro-op scheduling (`M_S0..M_S3` family + `M_HORN`) is hardcoded to 4 rounds;
-  wide has 3, and its last round `path_levels`=3 → 2 interior slots can't host
-  `M_HORN` (fold-chain END endpoint). Generalize the fold-round micro loop to
-  `n_fri_rounds` and relocate `M_FIN`/`M_HORN` off the short last round.
+- **1b-B3 Part 1 — fold-round micro loops → `n_fri_rounds` — DONE** (`2c24996`,
+  narrow 37 green, byte-identical). Root cause of the 4385 panic: `eval`/
+  `build_gate_trace`/`fill_derived` dispatched on the narrow micro constants
+  (`M_S0..M_S3`=4..7) while wide uses compressed numbering (`m_s`=4..6, `m_b`=7..9,
+  `m_fhi`=10..12, `m_fin`=13, `m_horn`=14) → wide `7`=`m_b(0)` matched narrow's
+  `M_S` arm → `rf=3` → `lf()[3]` OOB. Fixed: every fold-round loop/dispatch driven
+  by `shape.n_fri_rounds()`/`lf()`/`cum()`/`path_levels()`/`log_arities`/`m_s(r)`/
+  `m_b(r)`/`m_fhi(r)`/`r_plast_f(r)`; `M_FHI` pairs from `2^(la-1-l)`. Wide fold
+  pipeline now runs to completion on a real wide schedule (s-chain, inv2s, breg
+  ladder, fold output, reduced opening, x_fin chain all pass).
+- **1b-B3 Part 2 — `M_HORN`/`M_FIN` placement — DESIGN FORK, DECIDED = Option A.**
+  Part 1 made the wide build complete WITHOUT panicking, but `M_HORN` is silently
+  **never scheduled** in wide (`x0`) → the fold-chain END endpoint pin
+  (`RUNEV == Horner(final_poly, x_fin)`, guarded by `gate_neg_fpreg`) is ABSENT →
+  a soundness hole, not a build failure. Cause: wide last round `path_levels`=3 →
+  interior slots l=0,1 only; narrow hosts M_FHI@l0/M_FIN@l1/M_HORN@l2 but wide has
+  no l2. **Decision: Option A** — relocate `M_FIN` to a spare `M_NONE` interior
+  slot in an earlier wide round (rounds 0/1 have spares; `M_FIN` = x_fin product
+  over index bits, no fold-chain dependency, eval gate keys only on its micro
+  selector, `xfin` is a carried register) and place `M_HORN` at wide last-round
+  l1 (still after last-round M_FHI@l0, so RUNEV is final). No QSLOTS change,
+  shape-conditional so narrow stays byte-identical. (Rejected: Option B dedicated
+  tail perm → changes qslots()=165 + ring width; Option C M_HORN on R_PLAST_F
+  perm → untested bank-row interaction.) **Soundness diligence for the
+  implementer:** verify `XFIN` not clobbered between the relocated `M_FIN` and the
+  last-round `M_HORN`; the wide END-pin must be present and the wide
+  `gate_neg_fpreg`/`_xfin_chain`/`_bad_fold` negatives must bind (in 1b-5). Code:
+  `qprogram_from_shape` last-round `m4gate.rs:1458-1488`; END-pin eval
+  `m4gate.rs:3113-3167`.
 - **… likely more** surface as each is cleared. Each is moderate circuit work
   (narrow suite green + wide-build-advances-further as the per-slice gate); the
   whole chain is the "≈ fold-pipeline build" scope the 1b-4 finding flagged.
