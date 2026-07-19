@@ -367,13 +367,26 @@ blocker: `m4gate.rs:3645`, the challenger **observation-flush shape automaton**
 — `shape drift at flush 0 block 6 (derived 6 vs expected 5)`, driven by wide
 F0's block count (`n_pvs=852` → 28 blocks vs narrow 5). So the remaining wide
 work, discovered incrementally (each fix reveals the next narrow assumption):
-- **1b-B1 — flush-shape automaton for the wide obs stream.** Generalize the
-  flush block-count / shape-drift machinery (~m4gate.rs:3645 and the
-  `shsel_index`/`shape_list` obs-shape setup) to the wide `FLUSH_BLOCKS`
-  = [28,3,855,3,3,3,3] / `N_SHAPES_OBS`=46 the investigation report derived.
-- **1b-B2 — micro-op scheduling for the short last fold round.** Wide
+- **1b-B1 — flush-shape automaton — DONE** (`c033274`, narrow 37 green /
+  373 s, byte-identical). `shape_list`/`shape_mosaic`/`shsel_index` now take
+  `&GateShape` (shsel_index threads the cached `GateConsts::flush_blocks` slice
+  — zero-alloc in the eval hot path); final-flush index `7 → 3 + n_fri_rounds`
+  (= `flush_blocks.len()-1`), obs-flush count `8 → n_obs_flushes`, `FLUSH_BLOCKS[·]`
+  → `self.consts.flush_blocks[·]`, F0 `Pv` mosaic spread by `n_pvs` (852 over 28
+  blocks). fring ring width 8 / bidx one-hot width 6 kept (wide fits). Wide build
+  now walks all obs flushes (F0..F6 + refills, no shape drift) + phasegate.
+- **1b-B2 — reduced-opening / dup-phase asm (NEW next blocker).** After 1b-B1
+  the wide build enters the F2-duplicate replay (855 dup blocks) and stops at
+  **`m4gate.rs:~4129`** — `A0 capture = PZ0`, the F2-dup PZ-capture hardcoded at
+  dup-block position `(72,14)` with `zvi == TW` (617). The reduced-opening asm
+  (dup-block positions `148`/`147`/`(72,14)`/`(145,7)`, `TW`-tied capture rows)
+  is narrow-hardcoded and must be derived from the wide zeta-group widths
+  `[3626,3626,8]` / `flush_blocks[2]`=855. (This is the M_RO / PZACC / capture
+  machinery — the fold-chain START endpoint side.)
+- **1b-B3 — micro-op scheduling for the short last fold round.** Wide
   `path_levels=[15,15,11,7,3]`: last round has 3 levels → 2 interior slots, too
-  short to host `M_HORN` (fold-chain END). Relocate `M_FIN`/`M_HORN`.
+  short to host `M_HORN` (fold-chain END). Relocate `M_FIN`/`M_HORN`. (Surfaces
+  after 1b-B2 clears.)
 - **… likely more** surface as each is cleared. Each is moderate circuit work
   (narrow suite green + wide-build-advances-further as the per-slice gate); the
   whole chain is the "≈ fold-pipeline build" scope the 1b-4 finding flagged.
