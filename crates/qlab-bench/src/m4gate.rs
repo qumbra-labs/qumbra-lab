@@ -3796,26 +3796,30 @@ fn chal_group(tag: ChalTag) -> usize {
 pub(crate) fn build_gate_trace(
     sched: &Schedule,
     inner_pvs: &[Val],
+    shape: &GateShape,
     extra_capacity_bits: usize,
 ) -> (RowMajorMatrix<Val>, GateMeta) {
-    // Slice 1b-2: the trace path is now shape-parametrized; slice 1b-3 will lift
-    // `shape` to a parameter. Narrow behavior is unchanged (this still builds the
-    // narrow leaf gate through the generic generators).
-    let shape = GateShape::narrow();
-    let consts = gate_consts_from_shape(&shape);
-    let program = qprogram_from_shape(&shape);
-    let layout = GateLayout::from_shape(&shape);
+    // Slice 1b-3: the inner-proof `shape` is now an explicit parameter, so the
+    // interior node can pass `GateShape::wide()`. Narrow callers pass
+    // `&GateShape::narrow()` and are unchanged.
+    let consts = gate_consts_from_shape(shape);
+    let program = qprogram_from_shape(shape);
+    let layout = GateLayout::from_shape(shape);
     let nq = shape.nq;
     let qslots = shape.qslots();
     let cum = shape.cum();
-    let opvs = outer_pvs(sched, inner_pvs, &shape);
-    let (inputs, infos) = lane_plan(sched, &shape);
+    let opvs = outer_pvs(sched, inner_pvs, shape);
+    let (inputs, infos) = lane_plan(sched, shape);
     let n_perms = inputs.len();
     let outs: Vec<[u64; 25]> = inputs.iter().map(keccakf).collect();
 
     let keccak = p3_keccak_air::generate_trace_rows::<Val>(inputs.clone(), 0);
     let rows = keccak.height();
-    assert_eq!(rows, 1 << 16, "gate rectangle height");
+    // Shape/perm-driven rectangle height: the keccak lane pads n_perms·24 rows
+    // up to the next power of two. Narrow (2,382 perms) -> 2^16; wide
+    // single-child (~8,360 perms) -> 2^18.
+    let expected_rows = (n_perms * 24).next_power_of_two();
+    assert_eq!(rows, expected_rows, "gate rectangle height (n_perms={n_perms})");
     let mut values = Vec::with_capacity((rows << extra_capacity_bits) * layout.gate_width);
     values.resize(rows * layout.gate_width, Val::ZERO);
     for r in 0..rows {
@@ -3883,7 +3887,7 @@ pub(crate) fn build_gate_trace(
     };
     let mut zvi = 0usize;
 
-    let mut regs = Regs::new(&shape);
+    let mut regs = Regs::new(shape);
     regs.fsfull = hosted.get(&0).map_or(false, |d| d.len() == 8);
     let mut meta = GateMeta {
         query_rows: vec![],
@@ -3938,7 +3942,7 @@ pub(crate) fn build_gate_trace(
 
         for r in 0..24 {
             let row = base_row + r;
-            write_row(&mut values, row, r, &regs, &program, Some(info), &layout, &shape);
+            write_row(&mut values, row, r, &regs, &program, Some(info), &layout, shape);
             // layout.gpb for fold-absorb perms (write over write_row's zeros).
             if let Some(rf) = fold_r {
                 let la = shape.log_arities[rf];
@@ -4446,7 +4450,7 @@ pub(crate) fn build_gate_trace(
 
     // Pad rows: frozen registers.
     for row in 24 * n_perms..rows {
-        write_row(&mut values, row, row % 24, &regs, &program, None, &layout, &shape);
+        write_row(&mut values, row, row % 24, &regs, &program, None, &layout, shape);
     }
     // Global self-checks against the recorder.
     assert_eq!(regs.qsel, nq, "all query blocks completed");
@@ -4472,7 +4476,7 @@ pub(crate) fn build_gate_trace(
     );
     assert_eq!(regs.fpi, 16, "final poly fully captured");
 
-    fill_derived(&mut values, &layout, &shape);
+    fill_derived(&mut values, &layout, shape);
 
     (RowMajorMatrix::new(values, layout.gate_width), meta)
 }
@@ -4700,7 +4704,7 @@ pub(crate) fn run_m4gate(power: &str, only: Option<&str>) {
         let mut proof_opt = None;
         let mut opvs = Vec::new();
         for _ in 0..RUNS {
-            let (trace, meta) = build_gate_trace(&sched, &pvs, cfg.log_blowup);
+            let (trace, meta) = build_gate_trace(&sched, &pvs, &GateShape::narrow(), cfg.log_blowup);
             rows = trace.height();
             opvs = meta.opvs.clone();
             let t = Instant::now();
@@ -5033,7 +5037,7 @@ mod tests {
     fn gate_lowering_builds() {
         let _g = heavy_lock();
         let (sched, pvs, _) = shared();
-        let (trace, meta) = build_gate_trace(sched, pvs, 0);
+        let (trace, meta) = build_gate_trace(sched, pvs, &GateShape::narrow(), 0);
         assert_eq!(trace.height(), 1 << 16);
         assert_eq!(meta.query_rows.len(), NQ);
         eprintln!(
@@ -5184,7 +5188,7 @@ mod tests {
     fn dump_accum() {
         let _g = heavy_lock();
         let (sched, pvs, _) = shared();
-        let (trace, _meta) = build_gate_trace(sched, pvs, 0);
+        let (trace, _meta) = build_gate_trace(sched, pvs, &GateShape::narrow(), 0);
         let w = trace.width();
         let val = &trace.values;
         let u = |row: usize, col: usize| -> u32 { val[row * w + col].to_unique_u32() };
@@ -5217,7 +5221,7 @@ mod tests {
         let _g = heavy_lock();
         let (sched, pvs, _) = shared();
         let (_ins, infos) = lane_plan(sched, &GateShape::narrow());
-        let (trace, _meta) = build_gate_trace(sched, pvs, 0);
+        let (trace, _meta) = build_gate_trace(sched, pvs, &GateShape::narrow(), 0);
         let w = trace.width();
         let val = trace.values;
         let at = |perm: usize, col: usize| -> u32 { val[(perm * 24 + 23) * w + col].to_unique_u32() };
@@ -5269,7 +5273,7 @@ mod tests {
         // (label, mutate) -> returns whether check_constraints panics (UNSAT).
         let _ = &air;
         let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>, &mut Vec<Val>)| {
-            let (mut trace, mut meta) = build_gate_trace(sched, pvs, 0);
+            let (mut trace, mut meta) = build_gate_trace(sched, pvs, &GateShape::narrow(), 0);
             mutate(&mut trace, &mut meta.opvs);
             let unsat = is_unsat(trace, meta.opvs.clone());
             eprintln!("  [{}] {label}", if unsat { "UNSAT ok" } else { "SAT  MISS" });
@@ -5285,14 +5289,14 @@ mod tests {
         // Neg1 tampered opening: flip a query trace-absorb preimage limb.
         probe("tampered-opening: flip query0 preimage limb 0", &|t, _o| {
             let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let (_, m) = build_gate_trace(sched2, pvs2, &GateShape::narrow(), 0);
             let row = m.query_rows[0];
             t.values[row * w + pcol(0)] += one;
         });
         // Neg3 wrong challenge: flip a recorded accepted field draw cell.
         probe("wrong-challenge: flip an accepted field-draw FSACC", &|t, _o| {
             let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let (_, m) = build_gate_trace(sched2, pvs2, &GateShape::narrow(), 0);
             let (row, _) = m.field_draws[0];
             t.values[row * w + FSACC] += one;
         });
@@ -5303,7 +5307,7 @@ mod tests {
         // Neg4 bad fold: corrupt a running-fold-eval limb.
         probe("bad-fold: flip RUNEV limb on a query row", &|t, _o| {
             let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let (_, m) = build_gate_trace(sched2, pvs2, &GateShape::narrow(), 0);
             let row = m.query_rows[0];
             t.values[row * w + RUNEV] += one;
         });
@@ -5348,7 +5352,7 @@ mod tests {
     fn gate_rectangle_satisfies() {
         let _g = heavy_lock();
         let (sched, pvs, _) = shared();
-        let (trace, meta) = build_gate_trace(sched, pvs, 0);
+        let (trace, meta) = build_gate_trace(sched, pvs, &GateShape::narrow(), 0);
         check_constraints(&VerifierGateAir::new(), &trace, &meta.opvs);
     }
 
@@ -5383,7 +5387,7 @@ mod tests {
     ) {
         let _g = heavy_lock();
         let (sched, pvs, _) = shared();
-        let (mut trace, mut meta) = build_gate_trace(sched, pvs, 0);
+        let (mut trace, mut meta) = build_gate_trace(sched, pvs, &GateShape::narrow(), 0);
         let qrows = meta.query_rows.clone();
         let fdraws = meta.field_draws.clone();
         mutate(&mut trace, &mut meta.opvs, &qrows, &fdraws);

@@ -13,7 +13,7 @@
 
 use p3_uni_stark::{prove, verify, Proof};
 
-use crate::m4gate::{build_gate_trace, VerifierGateAir};
+use crate::m4gate::{build_gate_trace, GateShape, VerifierGateAir};
 use crate::m4gaterec::{self, Schedule};
 use crate::{make_config_with, Config, FriCfg, Val};
 
@@ -36,7 +36,7 @@ pub(crate) const AGG_CFG: FriCfg = FriCfg {
 pub(crate) fn leaf_proof() -> (Proof<Config>, Vec<Val>) {
     let (_inst, pvs, m3_proof) = m4gaterec::consensus_proof();
     let sched = m4gaterec::walk(&m3_proof, &pvs);
-    let (trace, meta) = build_gate_trace(&sched, &pvs, AGG_CFG.log_blowup);
+    let (trace, meta) = build_gate_trace(&sched, &pvs, &GateShape::narrow(), AGG_CFG.log_blowup);
     let config = make_config_with(&AGG_CFG);
     let air = VerifierGateAir::new();
     let leaf = prove(&config, &air, trace, &meta.opvs);
