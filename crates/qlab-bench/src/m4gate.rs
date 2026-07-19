@@ -695,6 +695,354 @@ const FPI: usize = CONSZ7 + 1; // 16: final-poly coefficient index one-hot
 const GATE_COLS: usize = FPI + 16 - GB;
 pub(crate) const GATE_WIDTH: usize = FPI + 16;
 
+/// Runtime mirror of the column-offset chain above, computed from a
+/// [`GateShape`] instead of the top-of-file `const`s. `from_shape(narrow())`
+/// reproduces every const above byte-for-byte (asserted by
+/// `gate_layout_narrow_reproduces_consts`); the eventual `wide()` layout drives
+/// the interior verifier. Slice 1a-i-b of the stage-2 re-parametrization: this
+/// struct exists and is verified, but `eval`/builders are migrated to read it
+/// in slice 1a-ii (until then the fields are unused — hence `dead_code`).
+///
+/// Shape drivers wired here: `nq` (→ IDXR/QSEL widths), `log_max` (→ IDXB
+/// width), and `n_fhg` derived from `log_arities` (→ FHG width). **TODO(slice
+/// 1b):** `N_SHAPES_OBS` (SHSEL width, 26) and `QSLOTS` (PR width, 103) are
+/// still the narrow `const`s — they are shape-dependent via the wide flush
+/// geometry / query program and get lifted into `GateShape` when the wide
+/// `qprogram` lands. Several fold-family widths (`BREG` = n_rounds×4, `DRND`,
+/// the GF/BPM/SNL families) are likewise narrow-literal here and confirmed for
+/// wide in 1b. So `from_shape(wide())` is NOT yet trustworthy — only narrow is.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct GateLayout {
+    pub(crate) mul_off: usize,
+    pub(crate) add_off: usize,
+    pub(crate) gb: usize,
+    pub(crate) w0c: usize,
+    pub(crate) w1c: usize,
+    pub(crate) hb0: usize,
+    pub(crate) hb1: usize,
+    pub(crate) ta0: usize,
+    pub(crate) topa0: usize,
+    pub(crate) ta1: usize,
+    pub(crate) topa1: usize,
+    pub(crate) lbnz0: usize,
+    pub(crate) lbi0: usize,
+    pub(crate) lonz0: usize,
+    pub(crate) loi0: usize,
+    pub(crate) lbnz1: usize,
+    pub(crate) lbi1: usize,
+    pub(crate) lonz1: usize,
+    pub(crate) loi1: usize,
+    pub(crate) oreg: usize,
+    pub(crate) pbit: usize,
+    pub(crate) obit: usize,
+    pub(crate) fsbits: usize,
+    pub(crate) fsacc: usize,
+    pub(crate) fsp3a: usize,
+    pub(crate) fsp3b: usize,
+    pub(crate) fst7: usize,
+    pub(crate) fsinv: usize,
+    pub(crate) fsnz: usize,
+    pub(crate) fsaccept: usize,
+    pub(crate) fsgate: usize,
+    pub(crate) fsodd: usize,
+    pub(crate) fsfull: usize,
+    pub(crate) grp: usize,
+    pub(crate) coef: usize,
+    pub(crate) curch: usize,
+    pub(crate) crot: usize,
+    pub(crate) grot: usize,
+    pub(crate) chal: usize,
+    pub(crate) fa2: usize,
+    pub(crate) znreg: usize,
+    pub(crate) idxr: usize,
+    pub(crate) fring: usize,
+    pub(crate) blkcnt: usize,
+    pub(crate) blklast: usize,
+    pub(crate) blkinv: usize,
+    pub(crate) bidx: usize,
+    pub(crate) cmpa: usize,
+    pub(crate) cmpai: usize,
+    pub(crate) cmpb: usize,
+    pub(crate) cmpbi: usize,
+    pub(crate) needl: usize,
+    pub(crate) refsel: usize,
+    pub(crate) shsel: usize,
+    pub(crate) phc: usize,
+    pub(crate) phq: usize,
+    pub(crate) qsel: usize,
+    pub(crate) qcnt: usize,
+    pub(crate) qcw: usize,
+    pub(crate) qcwi: usize,
+    pub(crate) pr: usize,
+    pub(crate) pd: usize,
+    pub(crate) rsel: usize,
+    pub(crate) mlo: usize,
+    pub(crate) mhi: usize,
+    pub(crate) msel: usize,
+    pub(crate) dlo: usize,
+    pub(crate) dhi: usize,
+    pub(crate) drnd: usize,
+    pub(crate) dbit: usize,
+    pub(crate) glc: usize,
+    pub(crate) grc: usize,
+    pub(crate) caps8: usize,
+    pub(crate) idxb: usize,
+    pub(crate) cz2: usize,
+    pub(crate) cz7: usize,
+    pub(crate) cf: usize,
+    pub(crate) cx0: usize,
+    pub(crate) cx1: usize,
+    pub(crate) pos: usize,
+    pub(crate) consz: usize,
+    pub(crate) consf: usize,
+    pub(crate) asm0: usize,
+    pub(crate) asm1: usize,
+    pub(crate) vc: usize,
+    pub(crate) vce: usize,
+    pub(crate) pbuf: usize,
+    pub(crate) hit: usize,
+    pub(crate) gpb: usize,
+    pub(crate) lfs: usize,
+    pub(crate) preg: usize,
+    pub(crate) pzacc: usize,
+    pub(crate) a0r: usize,
+    pub(crate) a1r: usize,
+    pub(crate) a2r: usize,
+    pub(crate) p0r: usize,
+    pub(crate) p1r: usize,
+    pub(crate) px0r: usize,
+    pub(crate) fpreg: usize,
+    pub(crate) scr: usize,
+    pub(crate) breg: usize,
+    pub(crate) inv2s: usize,
+    pub(crate) invz: usize,
+    pub(crate) invzn: usize,
+    pub(crate) xreg: usize,
+    pub(crate) xfin: usize,
+    pub(crate) runev: usize,
+    pub(crate) f2dig: usize,
+    pub(crate) phd: usize,
+    pub(crate) cmpc: usize,
+    pub(crate) cmpci: usize,
+    pub(crate) czd: usize,
+    pub(crate) chlive: usize,
+    pub(crate) f2sel: usize,
+    pub(crate) pg_a: usize,
+    pub(crate) phg: usize,
+    pub(crate) phdend: usize,
+    pub(crate) cont: usize,
+    pub(crate) eg_a: usize,
+    pub(crate) endg: usize,
+    pub(crate) xsel: usize,
+    pub(crate) qadv: usize,
+    pub(crate) cfull: usize,
+    pub(crate) m3: usize,
+    pub(crate) rlo: usize,
+    pub(crate) rhi: usize,
+    pub(crate) dmux: usize,
+    pub(crate) snl: usize,
+    pub(crate) glo: usize,
+    pub(crate) ghi: usize,
+    pub(crate) gf: usize,
+    pub(crate) bpm: usize,
+    pub(crate) n_fhg: usize,
+    pub(crate) fhg: usize,
+    pub(crate) prega: usize,
+    pub(crate) cpa: usize,
+    pub(crate) cpb: usize,
+    pub(crate) cpl: usize,
+    pub(crate) consz7: usize,
+    pub(crate) fpi: usize,
+    pub(crate) gate_cols: usize,
+    pub(crate) gate_width: usize,
+}
+
+#[allow(dead_code)]
+impl GateLayout {
+    /// Compute the column layout for a given inner-proof shape. Mirrors the
+    /// `const` chain (lines ~382–584) exactly; `from_shape(&GateShape::narrow())`
+    /// == every const above.
+    pub(crate) fn from_shape(s: &GateShape) -> GateLayout {
+        let nq = s.nq;
+        let log_max = s.log_max;
+        // FRI fold gates: (2^(la-1) - 1) pairs per round. narrow [4,4,4,2] -> 22.
+        let n_fhg: usize = s.log_arities.iter().map(|&la| (1usize << (la - 1)) - 1).sum();
+
+        // -- keccak-adjacent banks + gate base --
+        let mul_off = NUM_KECCAK_COLS;
+        let add_off = NUM_KECCAK_COLS + 12;
+        let gb = NUM_KECCAK_COLS + 24;
+        // -- routed words + canonicity --
+        let w0c = gb;
+        let w1c = w0c + 1;
+        let hb0 = w1c + 1;
+        let hb1 = hb0 + 16;
+        let ta0 = hb1 + 16;
+        let topa0 = ta0 + 1;
+        let ta1 = topa0 + 1;
+        let topa1 = ta1 + 1;
+        let lbnz0 = topa1 + 1;
+        let lbi0 = lbnz0 + 1;
+        let lonz0 = lbi0 + 1;
+        let loi0 = lonz0 + 1;
+        let lbnz1 = loi0 + 1;
+        let lbi1 = lbnz1 + 1;
+        let lonz1 = lbi1 + 1;
+        let loi1 = lonz1 + 1;
+        // -- XOR-absorb register file --
+        let oreg = loi1 + 1;
+        let pbit = oreg + 68;
+        let obit = pbit + 64;
+        // -- FS draw gadget --
+        let fsbits = obit + 64;
+        let fsacc = fsbits + 16;
+        let fsp3a = fsacc + 1;
+        let fsp3b = fsp3a + 1;
+        let fst7 = fsp3b + 1;
+        let fsinv = fst7 + 1;
+        let fsnz = fsinv + 1;
+        let fsaccept = fsnz + 1;
+        let fsgate = fsaccept + 1;
+        let fsodd = fsgate + 1;
+        let fsfull = fsodd + 1;
+        // -- draw scheduling --
+        let grp = fsfull + 1;
+        let coef = grp + N_GROUPS;
+        let curch = coef + 4;
+        let crot = curch + 4;
+        let grot = crot + 1;
+        // -- challenge / index registers --
+        let chal = grot + 1;
+        let fa2 = chal + 4 * N_CHALS;
+        let znreg = fa2 + 4;
+        let idxr = znreg + 4;
+        // -- flush automaton --
+        let fring = idxr + nq;
+        let blkcnt = fring + 8;
+        let blklast = blkcnt + 1;
+        let blkinv = blklast + 1;
+        let bidx = blkinv + 1;
+        let cmpa = bidx + 6;
+        let cmpai = cmpa + 1;
+        let cmpb = cmpai + 1;
+        let cmpbi = cmpb + 1;
+        let needl = cmpbi + 1;
+        let refsel = needl + 1;
+        let shsel = refsel + 1;
+        // -- phases / query scheduling --  (TODO(1b): N_SHAPES_OBS/QSLOTS narrow)
+        let phc = shsel + N_SHAPES_OBS;
+        let phq = phc + 1;
+        let qsel = phq + 1;
+        let qcnt = qsel + nq + 1;
+        let qcw = qcnt + 1;
+        let qcwi = qcw + 1;
+        // -- query program ring --
+        let pr = qcwi + 1;
+        let pd = pr + QSLOTS;
+        let rsel = pd + 15;
+        let mlo = rsel + N_ROLES;
+        let mhi = mlo + 8;
+        let msel = mhi + 4;
+        let dlo = msel + N_MICROS;
+        let dhi = dlo + 8;
+        let drnd = dhi + 3;
+        let dbit = drnd + 6;
+        let glc = dbit + 1;
+        let grc = glc + 1;
+        let caps8 = grc + 1;
+        // -- per-query index bits --
+        let idxb = caps8 + 8;
+        // -- asm pipeline --
+        let cz2 = idxb + log_max;
+        let cz7 = cz2 + 1;
+        let cf = cz7 + 1;
+        let cx0 = cf + 1;
+        let cx1 = cx0 + 1;
+        let pos = cx1 + 1;
+        let consz = pos + 2;
+        let consf = consz + 1;
+        let asm0 = consf + 1;
+        let asm1 = asm0 + 1;
+        let vc = asm1 + 1;
+        let vce = vc + 16;
+        let pbuf = vce + 1;
+        let hit = pbuf + 4;
+        let gpb = hit + 1;
+        let lfs = gpb + 4;
+        // -- running-sum / arithmetic registers --
+        let preg = lfs + 1;
+        let pzacc = preg + 4;
+        let a0r = pzacc + 4;
+        let a1r = a0r + 4;
+        let a2r = a1r + 4;
+        let p0r = a2r + 4;
+        let p1r = p0r + 4;
+        let px0r = p1r + 4;
+        let fpreg = px0r + 4;
+        let scr = fpreg + 64;
+        let breg = scr + 32;
+        let inv2s = breg + 16;
+        let invz = inv2s + 4;
+        let invzn = invz + 4;
+        let xreg = invzn + 4;
+        let xfin = xreg + 4;
+        let runev = xfin + 4;
+        // -- flush-2 duplicate --
+        let f2dig = runev + 4;
+        let phd = f2dig + 16;
+        let cmpc = phd + 1;
+        let cmpci = cmpc + 1;
+        let czd = cmpci + 1;
+        // -- degree-reduction materialized products --
+        let chlive = czd + 1;
+        let f2sel = chlive + 1;
+        let pg_a = f2sel + 1;
+        let phg = pg_a + 1;
+        let phdend = phg + 1;
+        let cont = phdend + 1;
+        let eg_a = cont + 1;
+        let endg = eg_a + 1;
+        let xsel = endg + 1;
+        let qadv = xsel + 1;
+        let cfull = qadv + 1;
+        let m3 = cfull + 1;
+        let rlo = m3 + 8;
+        let rhi = rlo + 4;
+        let dmux = rhi + 4;
+        let snl = dmux + 1;
+        let glo = snl + 4;
+        let ghi = glo + 4;
+        let gf = ghi + 4;
+        let bpm = gf + 4;
+        let fhg = bpm + 4;
+        let prega = fhg + n_fhg;
+        let cpa = prega + 4;
+        let cpb = cpa + 1;
+        let cpl = cpb + 1;
+        let consz7 = cpl + 1;
+        let fpi = consz7 + 1;
+        let gate_cols = fpi + 16 - gb;
+        let gate_width = fpi + 16;
+
+        GateLayout {
+            mul_off, add_off, gb, w0c, w1c, hb0, hb1, ta0, topa0, ta1, topa1,
+            lbnz0, lbi0, lonz0, loi0, lbnz1, lbi1, lonz1, loi1, oreg, pbit, obit,
+            fsbits, fsacc, fsp3a, fsp3b, fst7, fsinv, fsnz, fsaccept, fsgate,
+            fsodd, fsfull, grp, coef, curch, crot, grot, chal, fa2, znreg, idxr,
+            fring, blkcnt, blklast, blkinv, bidx, cmpa, cmpai, cmpb, cmpbi, needl,
+            refsel, shsel, phc, phq, qsel, qcnt, qcw, qcwi, pr, pd, rsel, mlo, mhi,
+            msel, dlo, dhi, drnd, dbit, glc, grc, caps8, idxb, cz2, cz7, cf, cx0,
+            cx1, pos, consz, consf, asm0, asm1, vc, vce, pbuf, hit, gpb, lfs, preg,
+            pzacc, a0r, a1r, a2r, p0r, p1r, px0r, fpreg, scr, breg, inv2s, invz,
+            invzn, xreg, xfin, runev, f2dig, phd, cmpc, cmpci, czd, chlive, f2sel,
+            pg_a, phg, phdend, cont, eg_a, endg, xsel, qadv, cfull, m3, rlo, rhi,
+            dmux, snl, glo, ghi, gf, bpm, n_fhg, fhg, prega, cpa, cpb, cpl, consz7,
+            fpi, gate_cols, gate_width,
+        }
+    }
+}
+
 /// Flat M_FHI gate index for round `rf`, pair row `r` (mirrors the eval loop).
 const fn fhg_index(rf: usize, r: usize) -> usize {
     if rf < 3 {
@@ -4183,6 +4531,156 @@ mod tests {
         assert_eq!(w.log_arities, vec![4, 4, 4], "3 arity-16 FRI rounds");
         assert_eq!(w.n_caps(), 5, "trace + quotient + 3 FRI");
         assert_eq!(w.path_levels(), vec![15, 15, 11, 7, 3], "wide native path levels");
+    }
+
+    /// Slice 1a-i-b: `GateLayout::from_shape(&narrow())` must reproduce every
+    /// column-offset `const` byte-for-byte, so slice 1a-ii can mechanically
+    /// replace `const X` reads in `eval` with `layout.x` with confidence.
+    #[test]
+    fn gate_layout_narrow_reproduces_consts() {
+        let l = GateLayout::from_shape(&GateShape::narrow());
+        assert_eq!(l.mul_off, MUL_OFF);
+        assert_eq!(l.add_off, ADD_OFF);
+        assert_eq!(l.gb, GB);
+        assert_eq!(l.w0c, W0C);
+        assert_eq!(l.w1c, W1C);
+        assert_eq!(l.hb0, HB0);
+        assert_eq!(l.hb1, HB1);
+        assert_eq!(l.ta0, TA0);
+        assert_eq!(l.topa0, TOPA0);
+        assert_eq!(l.ta1, TA1);
+        assert_eq!(l.topa1, TOPA1);
+        assert_eq!(l.lbnz0, LBNZ0);
+        assert_eq!(l.lbi0, LBI0);
+        assert_eq!(l.lonz0, LONZ0);
+        assert_eq!(l.loi0, LOI0);
+        assert_eq!(l.lbnz1, LBNZ1);
+        assert_eq!(l.lbi1, LBI1);
+        assert_eq!(l.lonz1, LONZ1);
+        assert_eq!(l.loi1, LOI1);
+        assert_eq!(l.oreg, OREG);
+        assert_eq!(l.pbit, PBIT);
+        assert_eq!(l.obit, OBIT);
+        assert_eq!(l.fsbits, FSBITS);
+        assert_eq!(l.fsacc, FSACC);
+        assert_eq!(l.fsp3a, FSP3A);
+        assert_eq!(l.fsp3b, FSP3B);
+        assert_eq!(l.fst7, FST7);
+        assert_eq!(l.fsinv, FSINV);
+        assert_eq!(l.fsnz, FSNZ);
+        assert_eq!(l.fsaccept, FSACCEPT);
+        assert_eq!(l.fsgate, FSGATE);
+        assert_eq!(l.fsodd, FSODD);
+        assert_eq!(l.fsfull, FSFULL);
+        assert_eq!(l.grp, GRP);
+        assert_eq!(l.coef, COEF);
+        assert_eq!(l.curch, CURCH);
+        assert_eq!(l.crot, CROT);
+        assert_eq!(l.grot, GROT);
+        assert_eq!(l.chal, CHAL);
+        assert_eq!(l.fa2, FA2);
+        assert_eq!(l.znreg, ZNREG);
+        assert_eq!(l.idxr, IDXR);
+        assert_eq!(l.fring, FRING);
+        assert_eq!(l.blkcnt, BLKCNT);
+        assert_eq!(l.blklast, BLKLAST);
+        assert_eq!(l.blkinv, BLKINV);
+        assert_eq!(l.bidx, BIDX);
+        assert_eq!(l.cmpa, CMPA);
+        assert_eq!(l.cmpai, CMPAI);
+        assert_eq!(l.cmpb, CMPB);
+        assert_eq!(l.cmpbi, CMPBI);
+        assert_eq!(l.needl, NEEDL);
+        assert_eq!(l.refsel, REFSEL);
+        assert_eq!(l.shsel, SHSEL);
+        assert_eq!(l.phc, PHC);
+        assert_eq!(l.phq, PHQ);
+        assert_eq!(l.qsel, QSEL);
+        assert_eq!(l.qcnt, QCNT);
+        assert_eq!(l.qcw, QCW);
+        assert_eq!(l.qcwi, QCWI);
+        assert_eq!(l.pr, PR);
+        assert_eq!(l.pd, PD);
+        assert_eq!(l.rsel, RSEL);
+        assert_eq!(l.mlo, MLO);
+        assert_eq!(l.mhi, MHI);
+        assert_eq!(l.msel, MSEL);
+        assert_eq!(l.dlo, DLO);
+        assert_eq!(l.dhi, DHI);
+        assert_eq!(l.drnd, DRND);
+        assert_eq!(l.dbit, DBIT);
+        assert_eq!(l.glc, GLC);
+        assert_eq!(l.grc, GRC);
+        assert_eq!(l.caps8, CAPS8);
+        assert_eq!(l.idxb, IDXB);
+        assert_eq!(l.cz2, CZ2);
+        assert_eq!(l.cz7, CZ7);
+        assert_eq!(l.cf, CF);
+        assert_eq!(l.cx0, CX0);
+        assert_eq!(l.cx1, CX1);
+        assert_eq!(l.pos, POS);
+        assert_eq!(l.consz, CONSZ);
+        assert_eq!(l.consf, CONSF);
+        assert_eq!(l.asm0, ASM0);
+        assert_eq!(l.asm1, ASM1);
+        assert_eq!(l.vc, VC);
+        assert_eq!(l.vce, VCE);
+        assert_eq!(l.pbuf, PBUF);
+        assert_eq!(l.hit, HIT);
+        assert_eq!(l.gpb, GPB);
+        assert_eq!(l.lfs, LFS);
+        assert_eq!(l.preg, PREG);
+        assert_eq!(l.pzacc, PZACC);
+        assert_eq!(l.a0r, A0R);
+        assert_eq!(l.a1r, A1R);
+        assert_eq!(l.a2r, A2R);
+        assert_eq!(l.p0r, P0R);
+        assert_eq!(l.p1r, P1R);
+        assert_eq!(l.px0r, PX0R);
+        assert_eq!(l.fpreg, FPREG);
+        assert_eq!(l.scr, SCR);
+        assert_eq!(l.breg, BREG);
+        assert_eq!(l.inv2s, INV2S);
+        assert_eq!(l.invz, INVZ);
+        assert_eq!(l.invzn, INVZN);
+        assert_eq!(l.xreg, XREG);
+        assert_eq!(l.xfin, XFIN);
+        assert_eq!(l.runev, RUNEV);
+        assert_eq!(l.f2dig, F2DIG);
+        assert_eq!(l.phd, PHD);
+        assert_eq!(l.cmpc, CMPC);
+        assert_eq!(l.cmpci, CMPCI);
+        assert_eq!(l.czd, CZD);
+        assert_eq!(l.chlive, CHLIVE);
+        assert_eq!(l.f2sel, F2SEL);
+        assert_eq!(l.pg_a, PG_A);
+        assert_eq!(l.phg, PHG);
+        assert_eq!(l.phdend, PHDEND);
+        assert_eq!(l.cont, CONT);
+        assert_eq!(l.eg_a, EG_A);
+        assert_eq!(l.endg, ENDG);
+        assert_eq!(l.xsel, XSEL);
+        assert_eq!(l.qadv, QADV);
+        assert_eq!(l.cfull, CFULL);
+        assert_eq!(l.m3, M3);
+        assert_eq!(l.rlo, RLO);
+        assert_eq!(l.rhi, RHI);
+        assert_eq!(l.dmux, DMUX);
+        assert_eq!(l.snl, SNL);
+        assert_eq!(l.glo, GLO);
+        assert_eq!(l.ghi, GHI);
+        assert_eq!(l.gf, GF);
+        assert_eq!(l.bpm, BPM);
+        assert_eq!(l.n_fhg, N_FHG);
+        assert_eq!(l.fhg, FHG);
+        assert_eq!(l.prega, PREGA);
+        assert_eq!(l.cpa, CPA);
+        assert_eq!(l.cpb, CPB);
+        assert_eq!(l.cpl, CPL);
+        assert_eq!(l.consz7, CONSZ7);
+        assert_eq!(l.fpi, FPI);
+        assert_eq!(l.gate_cols, GATE_COLS);
+        assert_eq!(l.gate_width, GATE_WIDTH);
     }
 
     /// TEMP: byte-parse cross-check of the zeta-opening obs stream.
