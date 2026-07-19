@@ -537,8 +537,60 @@ const CMPC: usize = PHD + 1; // BLKCNT == 148 comparator (dup first block)
 const CMPCI: usize = CMPC + 1;
 const CZD: usize = CMPCI + 1; // dup value-carry rows
 
-const GATE_COLS: usize = CZD + 1 - GB;
-pub(crate) const GATE_WIDTH: usize = CZD + 1;
+// -- degree-reduction materialized products (Phase 1a) -----------------------
+// Current-row materializations of high-degree gate products. Each is pinned by
+// a global deg<=3 defining constraint in `eval` and filled by the derived-
+// column pass in `build_gate_trace` (a pure function of already-filled current-
+// row columns). Introduced to bring every constraint to deg <= 3 (the house
+// rule since M1.5b) so the calibration bench runs at the consensus quotient
+// degree rather than the deg-6 the raw flush automaton would force.
+const CHLIVE: usize = CZD + 1; // phc * (1 - REFSEL)
+const F2SEL: usize = CHLIVE + 1; // ringsel(2) * (1 - bidxsel(0))
+const PG_A: usize = F2SEL + 1; // ringsel(7) * grpdone * phc
+const PHG: usize = PG_A + 1; // phasegate = sf(23) * BLKLAST * PG_A
+const PHDEND: usize = PHG + 1; // sf(23) * PHD * BLKLAST
+const CONT: usize = PHDEND + 1; // sf(23) * phc * (1 - BLKLAST)
+const EG_A: usize = CONT + 1; // phq * QCW * ring(QSEL, NQ-1)
+const ENDG: usize = EG_A + 1; // endgate = sf(23) * EG_A
+const XSEL: usize = ENDG + 1; // xorsel (current row)
+const QADV: usize = XSEL + 1; // sf(23) * phq * QCW
+const CFULL: usize = QADV + 1; // sf(23) * consumersel * (1 - FSFULL)
+// Query-selector decode products (Phase 1a family 2): raw bit-products so the
+// phq-gated selector defs (RSEL/MLO/DBIT) stay deg <= 3.
+const M3: usize = CFULL + 1; // 8: 3-bit product PD10..12 (MLO without phq)
+const RLO: usize = M3 + 8; // 4: PD0/PD1 pair products (RSEL low)
+const RHI: usize = RLO + 4; // 4: PD2/PD3 pair products (RSEL high)
+const DMUX: usize = RHI + 4; // dparam-selected idx-bit mux (DBIT)
+const SNL: usize = DMUX + 1; // 4: M_S chain gate = msel * (1 - sf(lf)) per round
+// Fold-pipeline decode/gate products (Phase 1a family 3).
+const GLO: usize = SNL + 4; // 4: GPB0/GPB1 pair products (HIT low)
+const GHI: usize = GLO + 4; // 4: GPB2/GPB3 pair products (HIT high)
+const GF: usize = GHI + 4; // 4: round-0 fold gate = CONSF * DRND[2+rf]
+const BPM: usize = GF + 4; // 4: extmul(BREG, PBUF - v) for the round-0 fold
+const N_FHG: usize = 22; // M_FHI fold gates (3 rounds x 7 pairs + 1)
+const FHG: usize = BPM + 4; // 22: M_FHI fold gate = msel_rf * sf(r)
+const PREGA: usize = FHG + N_FHG; // 4: preg * fri_alpha (PX word-1 accumulation)
+// Reduced-opening capture-phase gates (endpoint pin START): PHD·comparator so
+// the A/P register captures (deg-1 use) stay deg <= 3.
+const CPA: usize = PREGA + 4; // PHD·CMPA  (A0/P0 capture: dup block 72)
+const CPB: usize = CPA + 1; // PHD·CMPB  (A1/P1 capture: dup block 145)
+const CPL: usize = CPB + 1; // PHD·BLKLAST (A2 capture: dup block 147)
+// Final-poly capture (endpoint pin END): FPI = 16-slot one-hot counter over the
+// F7 final-poly coefficients; CONSZ7 = CZ7·POS1 its completion flag.
+const CONSZ7: usize = CPL + 1; // CZ7 · POS1 (final-poly value completion)
+const FPI: usize = CONSZ7 + 1; // 16: final-poly coefficient index one-hot
+
+const GATE_COLS: usize = FPI + 16 - GB;
+pub(crate) const GATE_WIDTH: usize = FPI + 16;
+
+/// Flat M_FHI gate index for round `rf`, pair row `r` (mirrors the eval loop).
+const fn fhg_index(rf: usize, r: usize) -> usize {
+    if rf < 3 {
+        rf * 7 + r
+    } else {
+        21
+    }
+}
 
 /// Diagnostic helper (relay debugging): map a column index to its region
 /// name. Used by the `dump_constraint` / `dump_trace` tests to translate a
@@ -573,6 +625,13 @@ pub(crate) fn colname(x: usize) -> &'static str {
         (FPREG, "FPREG"), (SCR, "SCR"), (BREG, "BREG"), (INV2S, "INV2S"), (INVZ, "INVZ"),
         (INVZN, "INVZN"), (XREG, "XREG"), (XFIN, "XFIN"), (RUNEV, "RUNEV"),
         (F2DIG, "F2DIG"), (PHD, "PHD"), (CMPC, "CMPC"), (CMPCI, "CMPCI"), (CZD, "CZD"),
+        (CHLIVE, "CHLIVE"), (F2SEL, "F2SEL"), (PG_A, "PG_A"), (PHG, "PHG"),
+        (PHDEND, "PHDEND"), (CONT, "CONT"), (EG_A, "EG_A"), (ENDG, "ENDG"),
+        (XSEL, "XSEL"), (QADV, "QADV"), (CFULL, "CFULL"),
+        (M3, "M3"), (RLO, "RLO"), (RHI, "RHI"), (DMUX, "DMUX"), (SNL, "SNL"),
+        (GLO, "GLO"), (GHI, "GHI"), (GF, "GF"), (BPM, "BPM"), (FHG, "FHG"),
+        (PREGA, "PREGA"), (CPA, "CPA"), (CPB, "CPB"), (CPL, "CPL"),
+        (CONSZ7, "CONSZ7"), (FPI, "FPI"),
     ];
     let mut best = ("?", 0usize);
     for &(off, nm) in table {
@@ -888,6 +947,60 @@ where
         builder.assert_bool(phq.clone());
         builder.assert_bool(phc.clone());
 
+        // ---------------------------------------------------------------------
+        // Degree-reduction: pin the materialized gate products (deg <= 3 each).
+        // These replace the high-degree flush-automaton products below so every
+        // constraint stays within the house deg-3 budget. Filled by the derived
+        // pass in `build_gate_trace`.
+        // ---------------------------------------------------------------------
+        {
+            let ring_fring = |f: usize| cv(ring_at(FRING, 8, f));
+            // CHLIVE = phc * (1 - REFSEL)
+            builder.assert_eq(cv(CHLIVE), phc.clone() * (AB::Expr::ONE - cv(REFSEL)));
+            // F2SEL = ringsel(2) * (1 - bidxsel(0))
+            builder.assert_eq(cv(F2SEL), ring_fring(2) * (AB::Expr::ONE - cv(BIDX)));
+            // PG_A = ringsel(7) * grpdone * phc
+            builder.assert_eq(
+                cv(PG_A),
+                ring_fring(7) * cv(ring_at(GRP, N_GROUPS, G_DONE)) * phc.clone(),
+            );
+            // PHG (phasegate) = sf(23) * BLKLAST * PG_A
+            builder.assert_eq(cv(PHG), sf(23) * cv(BLKLAST) * cv(PG_A));
+            // PHDEND = sf(23) * PHD * BLKLAST
+            builder.assert_eq(cv(PHDEND), sf(23) * cv(PHD) * cv(BLKLAST));
+            // CONT = sf(23) * phc * (1 - BLKLAST)
+            builder.assert_eq(cv(CONT), sf(23) * phc.clone() * (AB::Expr::ONE - cv(BLKLAST)));
+            // EG_A = phq * QCW * ring(QSEL, NQ-1); ENDG (endgate) = sf(23) * EG_A
+            builder.assert_eq(
+                cv(EG_A),
+                phq.clone() * cv(QCW) * cv(ring_at(QSEL, NQ + 1, NQ - 1)),
+            );
+            builder.assert_eq(cv(ENDG), sf(23) * cv(EG_A));
+            // XSEL = phd*(1-CMPC) + sum of obs/dup interior SHSEL (xorsel).
+            {
+                let mut xs = cv(PHD) * (AB::Expr::ONE - cv(CMPC));
+                for f in 0..8 {
+                    if f == 2 {
+                        continue;
+                    }
+                    for b in 1..FLUSH_BLOCKS[f] {
+                        xs = xs + cv(SHSEL + shsel_index(f, b));
+                    }
+                }
+                builder.assert_eq(cv(XSEL), xs);
+            }
+            // QADV = sf(23) * phq * QCW
+            builder.assert_eq(cv(QADV), sf(23) * phq.clone() * cv(QCW));
+            // CFULL = sf(23) * consumersel * (1 - FSFULL)
+            {
+                let mut cs = cv(REFSEL);
+                for f in 1..8 {
+                    cs = cs + cv(SHSEL + shsel_index(f, 0));
+                }
+                builder.assert_eq(cv(CFULL), sf(23) * cs * (AB::Expr::ONE - cv(FSFULL)));
+            }
+        }
+
         // Ring pin + rotation (one limb per perm while in query phase).
         for i in 0..QSLOTS {
             builder
@@ -923,20 +1036,30 @@ where
                 AB::Expr::ONE - cv(col)
             }
         };
-        // Role selectors: RSEL_r = phq * pair(PD0,PD1) * pair(PD2,PD3).
-        for r in 0..N_ROLES {
-            let lo = lit(PD, r & 1 == 1) * lit(PD + 1, r & 2 == 2);
-            let hi = lit(PD + 2, r & 4 == 4) * lit(PD + 3, r & 8 == 8);
-            builder.assert_eq(cv(RSEL + r), phq.clone() * lo * hi);
+        // Degree-reduction (family 2): materialize the raw bit-products used by
+        // the phq-gated selector defs so those stay deg <= 3.
+        // RLO_j = pair(PD0,PD1); RHI_j = pair(PD2,PD3); M3_a = 3-bit(PD10..12).
+        for j in 0..4 {
+            builder.assert_eq(cv(RLO + j), lit(PD, j & 1 == 1) * lit(PD + 1, j & 2 == 2));
+            builder.assert_eq(cv(RHI + j), lit(PD + 2, j & 1 == 1) * lit(PD + 3, j & 2 == 2));
         }
-        // Micro selectors: MLO_a = phq * 3-bit product (PD10..12),
-        // MHI_b = 2-bit product (PD13..14), MSEL_m = MLO * MHI.
         for a in 0..8 {
-            let e = phq.clone()
-                * lit(PD + 10, a & 1 == 1)
-                * lit(PD + 11, a & 2 == 2)
-                * lit(PD + 12, a & 4 == 4);
-            builder.assert_eq(cv(MLO + a), e);
+            builder.assert_eq(
+                cv(M3 + a),
+                lit(PD + 10, a & 1 == 1) * lit(PD + 11, a & 2 == 2) * lit(PD + 12, a & 4 == 4),
+            );
+        }
+        // Role selectors: RSEL_r = phq * RLO[r&3] * RHI[(r>>2)&3]  (deg 3).
+        for r in 0..N_ROLES {
+            builder.assert_eq(
+                cv(RSEL + r),
+                phq.clone() * cv(RLO + (r & 3)) * cv(RHI + ((r >> 2) & 3)),
+            );
+        }
+        // Micro selectors: MLO_a = phq * M3[a]; MHI_b = 2-bit(PD13..14);
+        // MSEL_m = MLO * MHI  (all deg <= 3).
+        for a in 0..8 {
+            builder.assert_eq(cv(MLO + a), phq.clone() * cv(M3 + a));
         }
         for b in 0..4 {
             let e = lit(PD + 13, b & 1 == 1) * lit(PD + 14, b & 2 == 2);
@@ -960,9 +1083,9 @@ where
             + cv(RSEL + R_ABS_C34 as usize)
             + cv(RSEL + R_ABS_C5 as usize)
             + cv(RSEL + R_ABS_C30 as usize);
+        // DRND_j = absany * DLO[j]  (DLO[j] is the same 3-bit product; deg 2).
         for j in 0..6 {
-            let e = lit(PD + 4, j & 1 == 1) * lit(PD + 5, j & 2 == 2) * lit(PD + 6, j & 4 == 4);
-            builder.assert_eq(cv(DRND + j), absany.clone() * e);
+            builder.assert_eq(cv(DRND + j), absany.clone() * cv(DLO + j));
         }
         // Leaf-start selector.
         builder.assert_eq(
@@ -1004,8 +1127,8 @@ where
                         * ((AB::Expr::ONE - cv(QCW)) * (-AB::Expr::ONE)
                             + cv(QCW) * c(QSLOTS as u32 - 1)),
             );
-            // QSEL rotation on block wrap.
-            let g = dec.clone() * cv(QCW);
+            // QSEL rotation on block wrap. (QADV = sf(23)*phq*QCW = dec*QCW.)
+            let g = cv(QADV);
             for i in 0..=NQ {
                 t.assert_eq(
                     nv(QSEL + i),
@@ -1036,11 +1159,13 @@ where
         let pathish = cv(RSEL + R_PATH as usize)
             + (R_PLAST_T..=R_PLAST_F3).map(|r| cv(RSEL + r as usize)).fold(AB::Expr::ZERO, |a, e| a + e);
         {
+            // DMUX = sum_k DLO[k&7]*DHI[k>>3]*IDXB[k] (deg 3); DBIT = pathish*DMUX.
             let mut mux = AB::Expr::ZERO;
             for k in 0..19 {
                 mux = mux + cv(DLO + (k & 7)) * cv(DHI + (k >> 3)) * cv(IDXB + k);
             }
-            builder.assert_eq(cv(DBIT), pathish.clone() * mux);
+            builder.assert_eq(cv(DMUX), mux);
+            builder.assert_eq(cv(DBIT), pathish.clone() * cv(DMUX));
         }
         builder.assert_eq(cv(GLC), pathish.clone() * (AB::Expr::ONE - cv(DBIT)));
         builder.assert_eq(cv(GRC), pathish.clone() * cv(DBIT));
@@ -1118,20 +1243,19 @@ where
         // =====================================================================
         let ringsel = |f: usize| cv(ring_at(FRING, 8, f));
         let bidxsel = |b: usize| cv(BIDX + b);
-        let chal_live = phc.clone() * (AB::Expr::ONE - cv(REFSEL));
+        let chal_live = cv(CHLIVE);
         {
             let shapes = shape_list();
             for (si, sh) in shapes.iter().enumerate() {
                 let e = match sh {
                     Shape::Obs { flush: 2, block: 0 } => ringsel(2) * bidxsel(0),
                     Shape::F2Mid => {
-                        ringsel(2)
-                            * (AB::Expr::ONE - bidxsel(0))
-                            * (AB::Expr::ONE - cv(BLKLAST))
+                        // F2SEL = ringsel(2) * (1 - bidxsel(0)); keeps deg <= 3.
+                        cv(F2SEL) * (AB::Expr::ONE - cv(BLKLAST))
                     }
                     Shape::Obs { flush: 2, .. } => {
                         // F2 last block.
-                        ringsel(2) * (AB::Expr::ONE - bidxsel(0)) * cv(BLKLAST)
+                        cv(F2SEL) * cv(BLKLAST)
                     }
                     Shape::Obs { flush, block } => ringsel(*flush) * bidxsel(*block),
                     Shape::Refill => continue, // REFSEL is its own column
@@ -1226,22 +1350,11 @@ where
             }
             e
         };
-        let xorsel_next = {
-            let mut e = nv(PHD) * (AB::Expr::ONE - nv(CMPC));
-            for f in 0..8 {
-                if f == 2 {
-                    continue;
-                }
-                for b in 1..FLUSH_BLOCKS[f] {
-                    e = e + nv(SHSEL + shsel_index(f, b));
-                }
-            }
-            e
-        };
-        let grpdone = cv(ring_at(GRP, N_GROUPS, G_DONE));
-        let phasegate = sf(23) * cv(BLKLAST) * ringsel(7) * grpdone.clone() * phc.clone();
-        let phdend = sf(23) * cv(PHD) * cv(BLKLAST);
-        let endgate = sf(23) * phq.clone() * cv(QCW) * cv(ring_at(QSEL, NQ + 1, NQ - 1));
+        // xorsel_next = nv(XSEL) (materialized current-row xorsel; deg 1).
+        let xorsel_next = nv(XSEL);
+        let phasegate = cv(PHG);
+        let phdend = cv(PHDEND);
+        let endgate = cv(ENDG);
         {
             let mut t = builder.when_transition();
             // Obs flush start: only the ring successor, only when the
@@ -1251,19 +1364,13 @@ where
                 t.assert_zero(sf(23) * sel.clone() * (AB::Expr::ONE - ringsel(f - 1)));
                 t.assert_zero(sf(23) * sel * (cv(BLKLAST) - cv(NEEDL)));
             }
-            // Mid-flush: no new flush, no refill.
-            t.assert_zero(
-                sf(23)
-                    * (AB::Expr::ONE - cv(BLKLAST))
-                    * phc.clone()
-                    * (b0next.clone() + nv(REFSEL)),
-            );
+            // Mid-flush: no new flush, no refill. (CONT = sf(23)*phc*(1-BLKLAST).)
+            t.assert_zero(cv(CONT) * (b0next.clone() + nv(REFSEL)));
             // Refill: only when the required group is incomplete, and only
             // after a consumer that used its full window.
             t.assert_zero(sf(23) * nv(REFSEL) * cv(NEEDL));
-            t.assert_zero(
-                sf(23) * nv(REFSEL) * consumersel.clone() * (AB::Expr::ONE - cv(FSFULL)),
-            );
+            // CFULL = sf(23) * consumersel * (1 - FSFULL); keeps deg <= 3.
+            t.assert_zero(nv(REFSEL) * cv(CFULL));
             // FRING rotation at obs starts.
             let g = sf(23) * b0next.clone();
             for i in 0..8 {
@@ -1275,7 +1382,7 @@ where
             // BIDX: reset on new flush/refill, saturating rotate on
             // continuation, hold otherwise (query/dup phases).
             let newf = sf(23) * (b0next.clone() + nv(REFSEL));
-            let cont = sf(23) * phc.clone() * (AB::Expr::ONE - cv(BLKLAST));
+            let cont = cv(CONT);
             for i in 0..6 {
                 let rot = match i {
                     0 => AB::Expr::ZERO,
@@ -1807,6 +1914,10 @@ where
                 let lf = lfs[rf];
                 let msel = cv(MSEL + M_S0 as usize + rf);
                 let not_lf = AB::Expr::ONE - sf(lf);
+                // Materialized chain gate SNL_rf = msel * (1 - sf(lf)) keeps the
+                // b-mux binding below deg <= 3 (target is deg 2).
+                builder.assert_eq(cv(SNL + rf), msel.clone() * not_lf.clone());
+                let snl = cv(SNL + rf);
                 // mul_b limb0 = 1 + idx-bit·(sk-1) on chain rows (0 on row lf).
                 let mut target = AB::Expr::ZERO;
                 for r in 0..lf {
@@ -1815,9 +1926,9 @@ where
                             * (AB::Expr::ONE
                                 + cv(IDXB + CUM[rf + 1] + r) * (cn(self.consts.sk[rf][r]) - AB::Expr::ONE));
                 }
-                builder.assert_zero(msel.clone() * not_lf.clone() * (cv(MUL_OFF + 4) - target));
+                builder.assert_zero(snl.clone() * (cv(MUL_OFF + 4) - target));
                 for k in 1..4 {
-                    builder.assert_zero(msel.clone() * not_lf.clone() * cv(MUL_OFF + 4 + k));
+                    builder.assert_zero(snl.clone() * cv(MUL_OFF + 4 + k));
                 }
                 // mul_a at chain row 0 = ONE.
                 builder.assert_zero(msel.clone() * sf(0) * (cv(MUL_OFF) - AB::Expr::ONE));
@@ -1920,18 +2031,24 @@ where
         {
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
             let vexpr = [cv(ASM0), cv(ASM1), cv(W0C), cv(W1C)];
-            // HIT = sum_s VC[s] · match(s, GPB bits).
+            // GPB one-hot decode split into 2-bit pair products so HIT stays
+            // deg 3: GLO[j] = pair(GPB0,GPB1); GHI[j] = pair(GPB2,GPB3).
+            let gbit = |col: usize, on: bool| -> AB::Expr {
+                if on {
+                    cv(col)
+                } else {
+                    AB::Expr::ONE - cv(col)
+                }
+            };
+            for j in 0..4 {
+                builder.assert_eq(cv(GLO + j), gbit(GPB, j & 1 == 1) * gbit(GPB + 1, j & 2 == 2));
+                builder
+                    .assert_eq(cv(GHI + j), gbit(GPB + 2, j & 1 == 1) * gbit(GPB + 3, j & 2 == 2));
+            }
+            // HIT = sum_s VC[s] · GLO[s&3] · GHI[(s>>2)&3]  (deg 3).
             let mut hit = AB::Expr::ZERO;
             for s in 0..16usize {
-                let mut m = AB::Expr::ONE;
-                for k in 0..4 {
-                    m = m * if (s >> k) & 1 == 1 {
-                        cv(GPB + k)
-                    } else {
-                        AB::Expr::ONE - cv(GPB + k)
-                    };
-                }
-                hit = hit + cv(VC + s) * m;
+                hit = hit + cv(VC + s) * cv(GLO + (s & 3)) * cv(GHI + ((s >> 2) & 3));
             }
             builder.assert_eq(cv(HIT), hit);
             // Fold-leaf consistency: at the index-in-group leaf, v == RUNEV.
@@ -1960,6 +2077,15 @@ where
                 cv(PBUF + 3) - vexpr[3].clone(),
             ];
             let half = cn(self.consts.half);
+            // BPM = extmul(BREG, PBUF - v): the round-0 fold's BREG·(pbuf-v) ext
+            // product, so `computed` below is deg 1 (kept out of the gate).
+            for k in 0..4 {
+                builder.assert_eq(cv(BPM + k), extmul_ce(BREG, &pmv, k));
+            }
+            // GF_rf = CONSF * DRND[2+rf]: round-0 gate prefix (gate = GF * VC).
+            for rf in 0..4 {
+                builder.assert_eq(cv(GF + rf), cv(CONSF) * cv(DRND + 2 + rf));
+            }
             let mut t = builder.when_transition();
             // PBUF capture on even fold-value rows (CONSF·VCE); carry otherwise.
             for k in 0..4 {
@@ -1970,14 +2096,15 @@ where
                 );
             }
             // Round-0 SCR fold on odd fold-value rows (per round rf, pair i).
+            // gate = GF[rf]*VC[2i+1] (deg 2); computed deg 1 via BPM -> deg 3.
             for rf in 0..4 {
                 let la = LOG_ARITIES[rf];
                 for i in 0..(1usize << (la - 1)) {
-                    let gate = cv(CONSF) * cv(VC + 2 * i + 1) * cv(DRND + 2 + rf);
+                    let gate = cv(GF + rf) * cv(VC + 2 * i + 1);
                     let kf = cn(self.consts.kf[rf][0][i]);
                     for k in 0..4 {
-                        let computed = half.clone() * (cv(PBUF + k) + vexpr[k].clone())
-                            + kf.clone() * extmul_ce(BREG, &pmv, k);
+                        let computed =
+                            half.clone() * (cv(PBUF + k) + vexpr[k].clone()) + kf.clone() * cv(BPM + k);
                         t.assert_zero(gate.clone() * (nv(SCR + 4 * i + k) - computed));
                     }
                 }
@@ -2013,6 +2140,16 @@ where
             };
             let pairs3: [(usize, usize); 7] =
                 [(1, 0), (1, 1), (1, 2), (1, 3), (2, 0), (2, 1), (3, 0)];
+            // Materialize the per-(round,row) M_FHI fold gate (global, deg 2).
+            for rf in 0..4 {
+                let npairs = if rf < 3 { 7 } else { 1 };
+                for r in 0..npairs {
+                    builder.assert_eq(
+                        cv(FHG + fhg_index(rf, r)),
+                        cv(MSEL + M_FHI0 as usize + rf) * sf(r),
+                    );
+                }
+            }
             let mut update = AB::Expr::ZERO; // rows where RUNEV is (re)written
             let mut t = builder.when_transition();
             for rf in 0..4 {
@@ -2020,7 +2157,10 @@ where
                 let pairs: &[(usize, usize)] = if rf < 3 { &pairs3 } else { &[(1, 0)] };
                 let last = pairs.len() - 1;
                 for (r, &(l, i)) in pairs.iter().enumerate() {
-                    let gate = msel.clone() * sf(r);
+                    // FHG = msel_rf * sf(r) (materialized above, deg 1) so
+                    // gate*computed (computed deg 2) stays deg 3.
+                    let gate = cv(FHG + fhg_index(rf, r));
+                    let _ = &msel;
                     let lo = SCR + 4 * (2 * i);
                     let hi = SCR + 4 * (2 * i + 1);
                     let kf = cn(self.consts.kf[rf][l][i]);
@@ -2040,6 +2180,262 @@ where
             // RUNEV carries on every non-update transition.
             for k in 0..4 {
                 t.assert_zero((AB::Expr::ONE - update.clone()) * (nv(RUNEV + k) - cv(RUNEV + k)));
+            }
+        }
+
+        // =====================================================================
+        // PZACC / PREG accumulation (endpoint pin, START foundation). The
+        // reduced-opening numerator accumulates along two mutually-exclusive
+        // paths (dup vs query phase), both binding pzacc/preg to the opened
+        // values so M_RO's `ro` is value-pinned:
+        //   - dup zeta-value rows (CONSZ = CZD·POS1): pzacc += preg·v,
+        //     preg *= fri_alpha, with v = ext(ASM0,ASM1,W0C,W1C) (deg 3).
+        //   - query PX rows (CX0, optionally CX1): pzacc += preg·W0C (word 0)
+        //     and, when CX1 (implies CX0), += (preg·fri_alpha)·W1C (word 1);
+        //     preg *= fri_alpha (one word) or fri_alpha² (two words). PREGA =
+        //     preg·fri_alpha is materialized so the word-1 term stays deg 3.
+        // FA2 = fri_alpha² is already bound (Stage D/F). CX1 ⊆ CX0, so
+        // CX0·(1-CX1) = CX0 - CX1.
+        // =====================================================================
+        {
+            // ext-mul of the contiguous PREG vector with an explicit column list.
+            let extmul_cols = |a_off: usize, bcols: &[usize; 4], k: usize| -> AB::Expr {
+                let w = c(EXT_W);
+                let mut acc = AB::Expr::ZERO;
+                for i in 0..4 {
+                    for j in 0..4 {
+                        if i + j == k {
+                            acc = acc + cv(a_off + i) * cv(bcols[j]);
+                        } else if i + j == k + 4 {
+                            acc = acc + w.clone() * cv(a_off + i) * cv(bcols[j]);
+                        }
+                    }
+                }
+                acc
+            };
+            let vcols = [ASM0, ASM1, W0C, W1C];
+            let fa_off = CHAL + 4 * G_FRIALPHA;
+            // PREGA = preg·fri_alpha (materialized; filled in fill_derived).
+            for k in 0..4 {
+                builder.assert_eq(cv(PREGA + k), extmul(PREG, fa_off, k));
+            }
+            let consz = cv(CONSZ);
+            let cx0 = cv(CX0);
+            let cx1 = cv(CX1);
+            // preg update gate: *fri_alpha when (CONSZ or CX0&!CX1); *fri_alpha²
+            // when CX1; carry otherwise.
+            let gate_fa = consz.clone() + cx0.clone() - cx1.clone();
+            // Leaf-start reset (same signal as the VC counter): at sf(23)·nv(LFS)
+            // pzacc->0, preg->ONE, starting the next query's PX accumulation.
+            // The reset only fires on a perm's last row, where all accumulation
+            // gates are 0, so it composes as an additive deg-3 correction.
+            let mut t = builder.when_transition();
+            let reset = sf(23) * nv(LFS);
+            for k in 0..4 {
+                // pzacc += CONSZ·(preg·v) + CX0·preg·W0C + CX1·(preg·fa)·W1C.
+                let inc = consz.clone() * extmul_cols(PREG, &vcols, k)
+                    + cx0.clone() * cv(PREG + k) * cv(W0C)
+                    + cx1.clone() * cv(PREGA + k) * cv(W1C);
+                t.assert_zero(nv(PZACC + k) - cv(PZACC + k) - inc + reset.clone() * cv(PZACC + k));
+                // preg *= fri_alpha (gate_fa) or fri_alpha² (CX1); carry else.
+                let preg_reset = if k == 0 { AB::Expr::ONE } else { AB::Expr::ZERO };
+                t.assert_zero(
+                    nv(PREG + k)
+                        - cv(PREG + k)
+                        - gate_fa.clone() * (extmul(PREG, fa_off, k) - cv(PREG + k))
+                        - cx1.clone() * (extmul(PREG, FA2, k) - cv(PREG + k))
+                        + reset.clone() * (cv(PREG + k) - preg_reset),
+                );
+            }
+        }
+
+        // =====================================================================
+        // Reduced-opening captures (endpoint pin, START). At fixed transcript
+        // positions the running pzacc/preg are snapshotted into the A/P/PX0
+        // registers that M_RO consumes; carry otherwise. Capture rows map to
+        // existing comparators (dup block 72 = CMPA, 145 = CMPB, 147 = BLKLAST;
+        // trace-leaf end = RSEL[R_ABS_C5]). CPA/CPB/CPL = PHD·comparator keep
+        // the gates deg 2. The captured value is the pre-consume pzacc = cv().
+        // =====================================================================
+        {
+            builder.assert_eq(cv(CPA), cv(PHD) * cv(CMPA));
+            builder.assert_eq(cv(CPB), cv(PHD) * cv(CMPB));
+            builder.assert_eq(cv(CPL), cv(PHD) * cv(BLKLAST));
+            let ga0 = cv(CPA) * sf(14);
+            let ga1 = cv(CPB) * sf(7);
+            let ga2 = cv(CPL) * sf(5);
+            let gpx = cv(RSEL + R_ABS_C5 as usize) * sf(3);
+            let mut t = builder.when_transition();
+            for k in 0..4 {
+                t.assert_zero(nv(A0R + k) - cv(A0R + k) - ga0.clone() * (cv(PZACC + k) - cv(A0R + k)));
+                t.assert_zero(nv(P0R + k) - cv(P0R + k) - ga0.clone() * (cv(PREG + k) - cv(P0R + k)));
+                t.assert_zero(nv(A1R + k) - cv(A1R + k) - ga1.clone() * (cv(PZACC + k) - cv(A1R + k)));
+                t.assert_zero(nv(P1R + k) - cv(P1R + k) - ga1.clone() * (cv(PREG + k) - cv(P1R + k)));
+                t.assert_zero(nv(A2R + k) - cv(A2R + k) - ga2.clone() * (cv(PZACC + k) - cv(A2R + k)));
+                t.assert_zero(
+                    nv(PX0R + k) - cv(PX0R + k) - gpx.clone() * (cv(PZACC + k) - cv(PX0R + k)),
+                );
+            }
+        }
+
+        // =====================================================================
+        // Final-poly capture + M_HORN Horner (endpoint pin, END). FPREG holds
+        // the 16 final-poly coefficients, captured from the CZ7 value rows
+        // (transcript-bound), indexed by the FPI one-hot counter. M_HORN then
+        // evaluates the poly at XFIN by Horner and pins the result to RUNEV —
+        // tying the *end* of the fold chain to the transcript's final poly.
+        // =====================================================================
+        {
+            let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
+            let _ = cn;
+            // CONSZ7 = CZ7 · POS1.
+            builder.assert_eq(cv(CONSZ7), cv(CZ7) * cv(POS + 1));
+            // FPI one-hot: bool, sum==1, first-row slot 0, +1 rotate on CONSZ7.
+            for i in 0..16 {
+                builder.assert_bool(cv(FPI + i));
+            }
+            builder.assert_eq(
+                (0..16).map(|i| cv(FPI + i)).fold(AB::Expr::ZERO, |a, e| a + e),
+                AB::Expr::ONE,
+            );
+            builder.when_first_row().assert_one(cv(FPI));
+            for i in 1..16 {
+                builder.when_first_row().assert_zero(cv(FPI + i));
+            }
+            let vfp = [cv(ASM0), cv(ASM1), cv(W0C), cv(W1C)];
+            {
+                let mut t = builder.when_transition();
+                for i in 0..16 {
+                    t.assert_eq(
+                        nv(FPI + i),
+                        cv(FPI + i) + cv(CONSZ7) * (cv(FPI + (i + 15) % 16) - cv(FPI + i)),
+                    );
+                }
+                // FPREG[s] capture on the CONSZ7 row with FPI==s; carry else.
+                for s in 0..16 {
+                    let gate = cv(CONSZ7) * cv(FPI + s);
+                    for k in 0..4 {
+                        t.assert_zero(
+                            nv(FPREG + 4 * s + k)
+                                - cv(FPREG + 4 * s + k)
+                                - gate.clone() * (vfp[k].clone() - cv(FPREG + 4 * s + k)),
+                        );
+                    }
+                }
+            }
+            // M_HORN Horner: rows 0..14. mul_b = XFIN; mul_a = FPREG[15] (r0) or
+            // the previous row's add output (threaded); add_a = mul_c; add_b =
+            // FPREG[14-r]; final add output (r14) == RUNEV.
+            let mh = cv(MSEL + M_HORN as usize);
+            let rge = |a: usize, b: usize| (a..=b).map(&sf).fold(AB::Expr::ZERO, |x, e| x + e);
+            let rows_all = rge(0, 14);
+            for k in 0..4 {
+                // mul_b = XFIN on all Horner rows.
+                builder.assert_zero(mh.clone() * rows_all.clone() * (cv(MUL_OFF + 4 + k) - cv(XFIN + k)));
+                // mul_a at r0 = FPREG[15].
+                builder.assert_zero(mh.clone() * sf(0) * (cv(MUL_OFF + k) - cv(FPREG + 60 + k)));
+                // add_a = mul_c (same row).
+                builder
+                    .assert_zero(mh.clone() * rows_all.clone() * (cv(ADD_OFF + k) - cv(MUL_OFF + 8 + k)));
+                // add_b = FPREG[14-r] (per-row mux, deg 3).
+                for r in 0..15 {
+                    builder.assert_zero(
+                        mh.clone() * sf(r) * (cv(ADD_OFF + 4 + k) - cv(FPREG + 4 * (14 - r) + k)),
+                    );
+                }
+                // final Horner output == RUNEV.
+                builder.assert_zero(mh.clone() * sf(14) * (cv(ADD_OFF + 8 + k) - cv(RUNEV + k)));
+            }
+            {
+                // Thread the accumulator: next row's mul_a == this row's add_c.
+                let mut t = builder.when_transition();
+                for k in 0..4 {
+                    t.assert_zero(
+                        mh.clone() * rge(0, 13) * (nv(MUL_OFF + k) - cv(ADD_OFF + 8 + k)),
+                    );
+                }
+            }
+        }
+
+        // =====================================================================
+        // M_RO reduced-opening assembly (endpoint pin, START completion). The
+        // 9-row bank schedule assembles `ro` (the round -1 RUNEV) from the
+        // pinned reduced-opening registers, tying the START of the fold chain
+        // to the accumulated openings. NOTE the witness uses `bank_add_c(C,B)`
+        // (subtractive: writes add_c=C, add_b=B, add_a=C-B, result = add_a) for
+        // rows 2..6 and standard `bank_add(A,B)` for rows 7,8. Bank arithmetic
+        // (mul_c=a·b, add_c=a+b) is already constrained; here we pin each row's
+        // known operands and thread the intermediates / SCR scratch. Dataflow:
+        //   r0 mul(P0R,PX0R)->SCR0      r1 mul(P1R,PZACC)->SCR1
+        //   r2 addc(A0R,PX0R)=g0; mul(g0,INVZ)->SCR2      [g0=add_a]
+        //   r3 addc(A1R,A0R)=m           [m=add_a -> add_c(r4)]
+        //   r4 addc(m,SCR0)=d1; mul(d1,INVZN)->SCR3       [d1=add_a]
+        //   r5 addc(A2R,A1R)=m           [m=add_a -> add_c(r6)]
+        //   r6 addc(m,SCR1)=d2; mul(d2,INVZ)->SCR4        [d2=add_a]
+        //   r7 add(SCR2,SCR3)=m          [m=add_c -> add_a(r8)]
+        //   r8 add(m,SCR4)=ro -> RUNEV   [ro=add_c]
+        // =====================================================================
+        {
+            let mr = cv(MSEL + M_RO as usize);
+            let mul_a = |k: usize| cv(MUL_OFF + k);
+            let mul_b = |k: usize| cv(MUL_OFF + 4 + k);
+            let add_a = |k: usize| cv(ADD_OFF + k);
+            let add_b = |k: usize| cv(ADD_OFF + 4 + k);
+            let add_c = |k: usize| cv(ADD_OFF + 8 + k);
+            let scr = |i: usize, k: usize| SCR + 4 * i + k;
+            for k in 0..4 {
+                // mul_b operands.
+                builder.assert_zero(mr.clone() * sf(0) * (mul_b(k) - cv(PX0R + k)));
+                builder.assert_zero(mr.clone() * sf(1) * (mul_b(k) - cv(PZACC + k)));
+                builder.assert_zero(mr.clone() * sf(2) * (mul_b(k) - cv(INVZ + k)));
+                builder.assert_zero(mr.clone() * sf(4) * (mul_b(k) - cv(INVZN + k)));
+                builder.assert_zero(mr.clone() * sf(6) * (mul_b(k) - cv(INVZ + k)));
+                // mul_a: registers (r0,r1); same-row add_a intermediate (r2,4,6).
+                builder.assert_zero(mr.clone() * sf(0) * (mul_a(k) - cv(P0R + k)));
+                builder.assert_zero(mr.clone() * sf(1) * (mul_a(k) - cv(P1R + k)));
+                builder.assert_zero(
+                    mr.clone() * (sf(2) + sf(4) + sf(6)) * (mul_a(k) - add_a(k)),
+                );
+                // add_c operands for the subtractive rows (bank_add_c first arg):
+                // r2=A0R, r3=A1R, r5=A2R. (r4,r6 add_c come via threading below.)
+                builder.assert_zero(mr.clone() * sf(2) * (add_c(k) - cv(A0R + k)));
+                builder.assert_zero(mr.clone() * sf(3) * (add_c(k) - cv(A1R + k)));
+                builder.assert_zero(mr.clone() * sf(5) * (add_c(k) - cv(A2R + k)));
+                // add_b operands.
+                builder.assert_zero(mr.clone() * sf(2) * (add_b(k) - cv(PX0R + k)));
+                builder.assert_zero(mr.clone() * sf(3) * (add_b(k) - cv(A0R + k)));
+                builder.assert_zero(mr.clone() * sf(4) * (add_b(k) - cv(scr(0, k))));
+                builder.assert_zero(mr.clone() * sf(5) * (add_b(k) - cv(A1R + k)));
+                builder.assert_zero(mr.clone() * sf(6) * (add_b(k) - cv(scr(1, k))));
+                builder.assert_zero(mr.clone() * sf(7) * (add_b(k) - cv(scr(3, k))));
+                builder.assert_zero(mr.clone() * sf(8) * (add_b(k) - cv(scr(4, k))));
+                // r7 is a standard bank_add(SCR2, SCR3): add_a = SCR2.
+                builder.assert_zero(mr.clone() * sf(7) * (add_a(k) - cv(scr(2, k))));
+            }
+            // SCR scratch carry + capture the bank output on its producing row
+            // (SCR0@0 SCR1@1 SCR2@2 SCR3@4 SCR4@6); intermediate threading; and
+            // RUNEV set are transition constraints.
+            let cap_rows = [0usize, 1, 2, 4, 6];
+            let mut t = builder.when_transition();
+            for k in 0..4 {
+                for (i, &cr) in cap_rows.iter().enumerate() {
+                    // Gated by mr: only the M_RO perm; folds own SCR elsewhere.
+                    t.assert_zero(
+                        mr.clone()
+                            * (nv(scr(i, k))
+                                - cv(scr(i, k))
+                                - sf(cr) * (cv(MUL_OFF + 8 + k) - cv(scr(i, k)))),
+                    );
+                }
+                // Subtractive-row result add_a threads into next row's add_c
+                // (r3->r4, r5->r6).
+                t.assert_zero(
+                    mr.clone() * (sf(3) + sf(5)) * (nv(ADD_OFF + 8 + k) - cv(ADD_OFF + k)),
+                );
+                // r7 result add_c threads into r8's add_a.
+                t.assert_zero(mr.clone() * sf(7) * (nv(ADD_OFF + k) - cv(ADD_OFF + 8 + k)));
+                // ro = add_c(r8) -> RUNEV.
+                t.assert_zero(mr.clone() * sf(8) * (nv(RUNEV + k) - cv(ADD_OFF + 8 + k)));
             }
         }
 
@@ -2532,6 +2928,7 @@ fn write_row(
     }
     wb(v, POS + regs.pos, true);
     wb(v, VC + regs.vc % 16, true);
+    wb(v, FPI + regs.fpi % 16, true);
     let mut vce = false;
     if regs.vc % 2 == 0 {
         vce = true;
@@ -3358,7 +3755,263 @@ pub(crate) fn build_gate_trace(
     );
     assert_eq!(regs.fpi, 16, "final poly fully captured");
 
+    fill_derived(&mut values);
+
     (RowMajorMatrix::new(values, GATE_WIDTH), meta)
+}
+
+/// Fill the Phase-1a degree-reduction columns: pure current-row functions of
+/// already-filled columns, mirroring the defining constraints in `eval`. Kept
+/// as a post-pass so the intricate per-perm witness logic above is untouched.
+fn fill_derived(values: &mut [Val]) {
+    let w = GATE_WIDTH;
+    let one = Val::ONE;
+    let rows = values.len() / w;
+    let ring = |base: usize, n: usize, g: usize| base + (n - g % n) % n;
+    for r in 0..rows {
+        let base = r * w;
+        let row = &values[base..base + w];
+        let g = |col: usize| row[col];
+        // PD-bit literal: on ? bit : (1 - bit).
+        let pl = |col: usize, on: bool| if on { row[col] } else { one - row[col] };
+        // Family-2 raw bit-products.
+        let mut m3 = [Val::ZERO; 8];
+        for (a, slot) in m3.iter_mut().enumerate() {
+            *slot = pl(PD + 10, a & 1 == 1) * pl(PD + 11, a & 2 == 2) * pl(PD + 12, a & 4 == 4);
+        }
+        let mut rlo = [Val::ZERO; 4];
+        let mut rhi = [Val::ZERO; 4];
+        for j in 0..4 {
+            rlo[j] = pl(PD, j & 1 == 1) * pl(PD + 1, j & 2 == 2);
+            rhi[j] = pl(PD + 2, j & 1 == 1) * pl(PD + 3, j & 2 == 2);
+        }
+        let mut dmux = Val::ZERO;
+        for k in 0..19 {
+            dmux += g(DLO + (k & 7)) * g(DHI + (k >> 3)) * g(IDXB + k);
+        }
+        // Family-3 fold gates/products.
+        let mut glo = [Val::ZERO; 4];
+        let mut ghi = [Val::ZERO; 4];
+        for j in 0..4 {
+            glo[j] = pl(GPB, j & 1 == 1) * pl(GPB + 1, j & 2 == 2);
+            ghi[j] = pl(GPB + 2, j & 1 == 1) * pl(GPB + 3, j & 2 == 2);
+        }
+        let mut gf = [Val::ZERO; 4];
+        for rf in 0..4 {
+            gf[rf] = g(CONSF) * g(DRND + 2 + rf);
+        }
+        // BPM = extmul(BREG, PBUF - v), v = ext(ASM0,ASM1,W0C,W1C).
+        let w_ext = Val::from_u32(EXT_W);
+        let vv = [g(ASM0), g(ASM1), g(W0C), g(W1C)];
+        let pmv = [g(PBUF) - vv[0], g(PBUF + 1) - vv[1], g(PBUF + 2) - vv[2], g(PBUF + 3) - vv[3]];
+        let mut bpm = [Val::ZERO; 4];
+        for (k, slot) in bpm.iter_mut().enumerate() {
+            let mut acc = Val::ZERO;
+            for i in 0..4 {
+                for j in 0..4 {
+                    if i + j == k {
+                        acc += g(BREG + i) * pmv[j];
+                    } else if i + j == k + 4 {
+                        acc += w_ext * g(BREG + i) * pmv[j];
+                    }
+                }
+            }
+            *slot = acc;
+        }
+        let mut fhg = [Val::ZERO; N_FHG];
+        for rf in 0..4 {
+            let npairs = if rf < 3 { 7 } else { 1 };
+            for r in 0..npairs {
+                fhg[fhg_index(rf, r)] = g(MSEL + M_FHI0 as usize + rf) * g(r);
+            }
+        }
+        // PREGA = extmul(PREG, fri_alpha) for the PX word-1 accumulation term.
+        let fa_off = CHAL + 4 * G_FRIALPHA;
+        let mut prega = [Val::ZERO; 4];
+        for (k, slot) in prega.iter_mut().enumerate() {
+            let mut acc = Val::ZERO;
+            for i in 0..4 {
+                for j in 0..4 {
+                    if i + j == k {
+                        acc += g(PREG + i) * g(fa_off + j);
+                    } else if i + j == k + 4 {
+                        acc += w_ext * g(PREG + i) * g(fa_off + j);
+                    }
+                }
+            }
+            *slot = acc;
+        }
+        let sf23 = g(23);
+        let phc = g(PHC);
+        let phq = g(PHQ);
+        let blklast = g(BLKLAST);
+        let chlive = phc * (one - g(REFSEL));
+        let f2sel = g(ring(FRING, 8, 2)) * (one - g(BIDX));
+        let pg_a = g(ring(FRING, 8, 7)) * g(ring(GRP, N_GROUPS, G_DONE)) * phc;
+        let phg = sf23 * blklast * pg_a;
+        let phdend = sf23 * g(PHD) * blklast;
+        let cont = sf23 * phc * (one - blklast);
+        let eg_a = phq * g(QCW) * g(ring(QSEL, NQ + 1, NQ - 1));
+        let endg = sf23 * eg_a;
+        let mut xsel = g(PHD) * (one - g(CMPC));
+        for f in 0..8 {
+            if f == 2 {
+                continue;
+            }
+            for b in 1..FLUSH_BLOCKS[f] {
+                xsel += g(SHSEL + shsel_index(f, b));
+            }
+        }
+        let qadv = sf23 * phq * g(QCW);
+        let mut consumersel = g(REFSEL);
+        for f in 1..8 {
+            consumersel += g(SHSEL + shsel_index(f, 0));
+        }
+        let cfull = sf23 * consumersel * (one - g(FSFULL));
+        // row borrow ends; write the derived cells.
+        let derived = [
+            (CHLIVE, chlive),
+            (F2SEL, f2sel),
+            (PG_A, pg_a),
+            (PHG, phg),
+            (PHDEND, phdend),
+            (CONT, cont),
+            (EG_A, eg_a),
+            (ENDG, endg),
+            (XSEL, xsel),
+            (QADV, qadv),
+            (CFULL, cfull),
+            (DMUX, dmux),
+        ];
+        for (col, val) in derived {
+            values[base + col] = val;
+        }
+        for a in 0..8 {
+            values[base + M3 + a] = m3[a];
+        }
+        for j in 0..4 {
+            values[base + RLO + j] = rlo[j];
+            values[base + RHI + j] = rhi[j];
+        }
+        // SNL_rf = MSEL[M_S0+rf] * (1 - sf(lfs[rf])).
+        let lfs = [18usize, 14, 10, 8];
+        for rf in 0..4 {
+            let msel = values[base + MSEL + M_S0 as usize + rf];
+            values[base + SNL + rf] = msel * (Val::ONE - values[base + lfs[rf]]);
+        }
+        for j in 0..4 {
+            values[base + GLO + j] = glo[j];
+            values[base + GHI + j] = ghi[j];
+            values[base + GF + j] = gf[j];
+            values[base + BPM + j] = bpm[j];
+        }
+        for f in 0..N_FHG {
+            values[base + FHG + f] = fhg[f];
+        }
+        for k in 0..4 {
+            values[base + PREGA + k] = prega[k];
+        }
+        values[base + CPA] = values[base + PHD] * values[base + CMPA];
+        values[base + CPB] = values[base + PHD] * values[base + CMPB];
+        values[base + CPL] = values[base + PHD] * values[base + BLKLAST];
+        values[base + CONSZ7] = values[base + CZ7] * values[base + POS + 1];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bench mode: the calibration gate. Prove/verify the verifier gate rectangle
+// on a REAL M3 consensus proof at the two house lane configs and report the
+// leaf cost (prove ms / verify ms / proof KB) against aggregation-rung1 §6's
+// <= 10 s / <= 32 GB leaf envelope. Peak RSS via `--only <cfg>` under
+// /usr/bin/time -l (m4census RSS-attribution discipline).
+// ---------------------------------------------------------------------------
+
+const LANE_CFGS: [(&str, FriCfg); 2] = [
+    (
+        "b4/q40/g20/fp16/a16",
+        FriCfg {
+            log_blowup: 2,
+            num_queries: 40,
+            grind_bits: 20,
+            log_final_poly_len: 4,
+            max_log_arity: 4,
+        },
+    ),
+    (
+        "b16/q20/g20/fp16/a16",
+        FriCfg {
+            log_blowup: 4,
+            num_queries: 20,
+            grind_bits: 20,
+            log_final_poly_len: 4,
+            max_log_arity: 4,
+        },
+    ),
+];
+
+pub(crate) fn run_m4gate(power: &str, only: Option<&str>) {
+    use std::time::Instant;
+    println!("# qumbra-lab M4 step 0b(ii): the calibration gate (verifier gate rectangle)");
+    println!();
+    crate::print_env(power);
+    // Build the real M3 proof + recorder schedule once (shared across configs).
+    let (_inst, pvs, proof) = m4gaterec::consensus_proof();
+    let sched = m4gaterec::walk(&proof, &pvs);
+    let n_perms = lane_plan(&sched).0.len();
+    println!(
+        "- rectangle: {GATE_WIDTH} cols x 2^16, {n_perms} lane perms; proves-in-circuit \
+         a REAL M3 consensus proof with every gate column bound (FS/draw schedule, \
+         query program, ext-arith fold pipeline, and both fold-chain endpoints \
+         value-pinned). Max constraint degree 3."
+    );
+    println!();
+    println!("| lane config | rows | prove ms | verify ms | postcard KB | fixed KB |");
+    println!("|---|---|---|---|---|---|");
+    let air = VerifierGateAir::new();
+    for (name, cfg) in &LANE_CFGS {
+        if let Some(f) = only {
+            if !name.contains(f) {
+                continue;
+            }
+        }
+        let config = make_config_with(cfg);
+        eprintln!("== m4gate: {name} ==");
+        let mut rows = 0;
+        let mut best_prove = f64::INFINITY;
+        let mut proof_opt = None;
+        let mut opvs = Vec::new();
+        for _ in 0..RUNS {
+            let (trace, meta) = build_gate_trace(&sched, &pvs, cfg.log_blowup);
+            rows = trace.height();
+            opvs = meta.opvs.clone();
+            let t = Instant::now();
+            let p = prove(&config, &air, trace, &opvs);
+            best_prove = best_prove.min(t.elapsed().as_secs_f64() * 1e3);
+            proof_opt = Some(p);
+        }
+        let proof = proof_opt.expect("RUNS > 0");
+        let postcard_bytes = pc_len(&proof);
+        let fixed_bytes = bincode::serialize(&proof).expect("bincode").len();
+        let mut best_verify = f64::INFINITY;
+        for _ in 0..RUNS {
+            let t = Instant::now();
+            verify(&config, &air, &proof, &opvs).expect("verify");
+            best_verify = best_verify.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        println!(
+            "| {name} | {rows} | {best_prove:.0} | {best_verify:.1} | {:.1} | {:.1} |",
+            postcard_bytes as f64 / 1024.0,
+            fixed_bytes as f64 / 1024.0,
+        );
+    }
+    println!();
+    println!(
+        "Peak RSS: rerun one config under /usr/bin/time -l with --only <cfg>. \
+         The gate proves a real M3 transcript with all columns bound (corrupted \
+         witness fails -- see the m4gate unit tests, incl. 4 gate-exit negatives \
+         and the endpoint-pin negatives); compare prove ms / peak RSS to \
+         aggregation-rung1 §6's <= 10 s / <= 32 GB leaf envelope."
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3526,6 +4179,65 @@ mod tests {
             cur.iter().map(|&x| (x, colname(x))).collect::<Vec<_>>(),
             nxt.iter().map(|&x| (x, colname(x))).collect::<Vec<_>>(),
         );
+
+        // Enumerate ALL deg>=4 constraints, collapsed by (deg, region-signature)
+        // so the ~200 instances group into their few source expressions.
+        let mut groups: std::collections::BTreeMap<(usize, String), (usize, usize)> =
+            std::collections::BTreeMap::new();
+        for (i, c) in cs.iter().enumerate() {
+            let d = c.degree_multiple();
+            if d < 4 {
+                continue;
+            }
+            let (mut cur, mut nxt, mut fl) = (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+            collect(c, &mut cur, &mut nxt, &mut fl);
+            let mut regs: BTreeSet<&'static str> = BTreeSet::new();
+            for &x in cur.iter() {
+                regs.insert(colname(x));
+            }
+            for &x in nxt.iter() {
+                regs.insert(colname(x));
+            }
+            let sig = format!("{:?} flags={:?}", regs, fl);
+            let e = groups.entry((d, sig)).or_insert((0, i));
+            e.0 += 1;
+        }
+        eprintln!("--- deg>=4 constraint groups (deg, count, first_idx, regions) ---");
+        for ((d, sig), (n, first)) in &groups {
+            eprintln!("deg={d} count={n} first=#{first} {sig}");
+        }
+    }
+
+    /// Diagnostic (relay debugging): dump the PZACC/PREG accumulator + its
+    /// value-carry selectors around a target row (default 7727) to debug the
+    /// endpoint-pin accumulation binding. Set DBGROW to move it.
+    #[test]
+    fn dump_accum() {
+        let _g = heavy_lock();
+        let (sched, pvs, _) = shared();
+        let (trace, _meta) = build_gate_trace(sched, pvs, 0);
+        let w = trace.width();
+        let val = &trace.values;
+        let u = |row: usize, col: usize| -> u32 { val[row * w + col].to_unique_u32() };
+        let target: usize = std::env::var("DBGROW").ok().and_then(|s| s.parse().ok()).unwrap_or(7727);
+        eprintln!("row: CONSZ CX0 CX1 CONSF POS0 POS1 W0C W1C | PZACC0 PREG0 PREGA0");
+        for row in target.saturating_sub(3)..=target + 2 {
+            eprintln!(
+                "{row}: {} {} {} {} {} {} {} {} | {} {} {}",
+                u(row, CONSZ), u(row, CX0), u(row, CX1), u(row, CONSF),
+                u(row, POS), u(row, POS + 1), u(row, W0C), u(row, W1C),
+                u(row, PZACC), u(row, PREG), u(row, PREGA),
+            );
+        }
+        eprintln!("row: MSEL_RO CF CONSF | SCR0 SCR1 SCR2 SCR3 SCR4 mulc0 addc0");
+        for row in target.saturating_sub(3)..=target + 8 {
+            eprintln!(
+                "{row}: {} {} {} | {} {} {} {} {} {} {}",
+                u(row, MSEL + M_RO as usize), u(row, CF), u(row, CONSF),
+                u(row, SCR), u(row, SCR + 4), u(row, SCR + 8), u(row, SCR + 12),
+                u(row, SCR + 16), u(row, MUL_OFF + 8), u(row, ADD_OFF + 8),
+            );
+        }
     }
 
     /// Diagnostic (relay debugging): dump the flush/draw-schedule columns at
@@ -3887,6 +4599,73 @@ mod tests {
         assert_unsat(move |t, _o, qr, _fd| {
             let row = qr[0];
             t.values[row * w + RUNEV] += Val::ONE;
+        });
+    }
+
+    /// Endpoint-pin negative (START): tamper the reduced-opening accumulator.
+    /// The PZACC accumulation recurrence (pzacc += preg·v, with the leaf-start
+    /// reset) must reject a single altered running-sum cell.
+    #[test]
+    fn gate_neg_pzacc() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
+            t.values[row * w + PZACC] += Val::ONE;
+        });
+    }
+
+    /// Endpoint-pin negative (START): tamper the running fri_alpha power.
+    #[test]
+    fn gate_neg_preg() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
+            t.values[row * w + PREG] += Val::ONE;
+        });
+    }
+
+    /// Endpoint-pin negative (START): tamper a captured reduced-opening
+    /// component. Its capture-or-carry recurrence must reject the change.
+    #[test]
+    fn gate_neg_capture() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
+            t.values[row * w + A0R] += Val::ONE;
+        });
+    }
+
+    /// Endpoint-pin negative (END): tamper a captured final-poly coefficient.
+    /// The FPREG capture-or-carry recurrence + M_HORN Horner must reject it.
+    #[test]
+    fn gate_neg_fpreg() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            let row = qr[0];
+            t.values[row * w + FPREG] += Val::ONE;
+        });
+    }
+
+    /// Endpoint-pin negative (START completion): tamper an M_RO reduced-opening
+    /// SCR intermediate. The 9-row assembly binding must reject the change.
+    #[test]
+    fn gate_neg_mro() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, _qr, _fd| {
+            // Find an M_RO perm (MSEL slot 3 set on its last row) and flip an
+            // SCR intermediate on its capture-carry span.
+            let n = t.values.len() / w;
+            let mro = MSEL + M_RO as usize;
+            let one = Val::ONE;
+            for perm in 0..(n / 24) {
+                let r23 = perm * 24 + 23;
+                if t.values[r23 * w + mro] == one {
+                    // Row 3 of this M_RO perm: SCR0 must still hold its capture.
+                    t.values[(perm * 24 + 3) * w + SCR] += one;
+                    return;
+                }
+            }
+            panic!("no M_RO perm found");
         });
     }
 }

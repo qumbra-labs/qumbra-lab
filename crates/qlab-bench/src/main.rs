@@ -10,6 +10,11 @@
 //! has no published Plonky3 crate at 0.6.1, so the matrix here is the three
 //! published AIRs; SHA-256 is a later task.
 
+// The m4gate verifier AIR builds a large symbolic constraint tree; its
+// monomorphization pushes rustc's default recursion limit (KeccakCols layout
+// query). Raise it so the gate rectangle compiles.
+#![recursion_limit = "512"]
+
 mod geometry;
 mod levers;
 mod m4anchor;
@@ -906,6 +911,12 @@ fn main() {
             let only_pos = args.iter().position(|a| a == "--only");
             let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
             m4route::run_m4route(&power, only);
+            return;
+        }
+        "m4gate" => {
+            let only_pos = args.iter().position(|a| a == "--only");
+            let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
+            m4gate::run_m4gate(&power, only);
             return;
         }
         "m4price" => {
