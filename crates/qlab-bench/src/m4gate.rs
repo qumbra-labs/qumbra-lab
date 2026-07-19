@@ -1955,7 +1955,7 @@ where
         {
             // self.layout.dmux = sum_k self.layout.dlo[k&7]*self.layout.dhi[k>>3]*self.layout.idxb[k] (deg 3); self.layout.dbit = pathish*self.layout.dmux.
             let mut mux = AB::Expr::ZERO;
-            for k in 0..19 {
+            for k in 0..(self.shape.log_max - self.shape.cap_height()) {
                 mux = mux + cv(self.layout.dlo + (k & 7)) * cv(self.layout.dhi + (k >> 3)) * cv(self.layout.idxb + k);
             }
             builder.assert_eq(cv(self.layout.dmux), mux);
@@ -1963,11 +1963,13 @@ where
         }
         builder.assert_eq(cv(self.layout.glc), pathish.clone() * (AB::Expr::ONE - cv(self.layout.dbit)));
         builder.assert_eq(cv(self.layout.grc), pathish.clone() * cv(self.layout.dbit));
-        // Cap-element selectors from idx bits 19..21.
+        // Cap-element selectors from the top cap_height idx bits (positions
+        // log_max-cap_height .. log_max; narrow 19..21, wide 15..17).
+        let capb = self.shape.log_max - self.shape.cap_height();
         for j in 0..8 {
-            let e = lit(self.layout.idxb + 19, j & 1 == 1)
-                * lit(self.layout.idxb + 20, j & 2 == 2)
-                * lit(self.layout.idxb + 21, j & 4 == 4);
+            let e = lit(self.layout.idxb + capb, j & 1 == 1)
+                * lit(self.layout.idxb + capb + 1, j & 2 == 2)
+                * lit(self.layout.idxb + capb + 2, j & 4 == 4);
             builder.assert_eq(cv(self.layout.caps8 + j), e);
         }
 
@@ -2604,7 +2606,7 @@ where
             let msel_x = cv(self.layout.msel + M_X1 as usize);
             // mul_b = ext_base(bit ? kx[r] : 1): limb0 row-muxed, limbs 1..3 = 0.
             let mut bscalar = AB::Expr::ZERO;
-            for r in 0..22 {
+            for r in 0..self.shape.log_max {
                 bscalar = bscalar
                     + sf(r) * (AB::Expr::ONE + cv(self.layout.idxb + r) * (cn(self.consts.kx[r]) - AB::Expr::ONE));
             }
@@ -2618,8 +2620,8 @@ where
                 builder.assert_zero(msel_x.clone() * sf(0) * cv(self.layout.mul_off + k));
             }
             // Chain rows 0..20: next row's mul_a == this row's mul_c.
-            let chain = (0..21).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
-            let cap = msel_x.clone() * sf(21);
+            let chain = (0..self.shape.log_max - 1).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
+            let cap = msel_x.clone() * sf(self.shape.log_max - 1);
             let mut t = builder.when_transition();
             for k in 0..4 {
                 t.assert_zero(
@@ -4404,7 +4406,7 @@ pub(crate) fn build_gate_trace(
                 let qr = &sched.queries[q_q];
                 match q_micro {
                     M_X1 => {
-                        if r < 22 {
+                        if r < shape.log_max {
                             let bit = (qidx >> r) & 1 == 1;
                             let bmux = ext_base(if bit { consts.kx[r] } else { Val::ONE });
                             let a = if r == 0 {
@@ -4413,7 +4415,7 @@ pub(crate) fn build_gate_trace(
                                 regs.mchain
                             };
                             regs.mchain = bank_mul(&mut values, row, a, bmux, &layout);
-                            if r == 21 {
+                            if r == shape.log_max - 1 {
                                 assert_eq!(regs.mchain, qr.x, "x chain");
                                 regs.xreg = regs.mchain;
                             }
@@ -4703,7 +4705,7 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout, shape: &GateShape) {
             rhi[j] = pl(layout.pd + 2, j & 1 == 1) * pl(layout.pd + 3, j & 2 == 2);
         }
         let mut dmux = Val::ZERO;
-        for k in 0..19 {
+        for k in 0..(shape.log_max - shape.cap_height()) {
             dmux += g(layout.dlo + (k & 7)) * g(layout.dhi + (k >> 3)) * g(layout.idxb + k);
         }
         // Family-3 fold gates/products.
@@ -5849,16 +5851,15 @@ mod tests {
     /// and the relocated `M_FIN`/`xfin` carry actually hold on real wide data.
     /// `check_constraints` only (no full prove); the RSS gate is stage 3.
     ///
-    /// IGNORED (2026-07-19): the wide trace now BUILDS (M_HORN END-pin scheduled
-    /// via 1b-B3 Option A), but `check_constraints` still fires — next peel-the-
-    /// onion layer is the **M_X1 x-chain** micro at `m4gate.rs:2609`: `for r in
-    /// 0..22` is hardcoded to narrow `LOG_MAX`, but wide `kx` len = `log_max`=18
-    /// → `index out of bounds: len 18 index 18`. Slice 1b-B4 generalizes the
-    /// `log_max`-keyed bounds (this `0..22`, the `21` chain cap, the `0..19`
-    /// dmux path-direction loops) to `self.shape.log_max`. Enable this test once
-    /// wide `check_constraints` passes.
+    /// IGNORED (2026-07-19): the wide trace BUILDS and (after 1b-B4's log_max
+    /// generalization) `check_constraints` now runs the full symbolic pass — no
+    /// more OOB. The remaining wide gap is a genuine constraint mismatch:
+    /// `check_constraints` reports **row 0 constraints #4174, #4176, #4179 not
+    /// satisfied** (a first-row / boundary assertion that is narrow-specific).
+    /// Slice 1b-B5 must map those constraint indices to their eval source and
+    /// generalize them for wide. Enable this test once wide check passes.
     #[test]
-    #[ignore = "1b-4: wide check_constraints blocked on the M_X1 x-chain log_max hardcoding (m4gate.rs:2609); enable after 1b-B4"]
+    #[ignore = "1b-4: wide check_constraints fails on row-0 constraints #4174/#4176/#4179 (first-row/boundary); needs slice 1b-B5"]
     fn interior_single_child_satisfies() {
         let _g = heavy_lock();
         let (leaf, opvs) = crate::m4treerec::leaf_proof();
