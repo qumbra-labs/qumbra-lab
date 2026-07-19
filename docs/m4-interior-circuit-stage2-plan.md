@@ -290,6 +290,45 @@ env-print + peak-RSS capture).
 - Coordinator rule 3 (no design repo) — stated in global constraints + stage 3. ✅
 - Stage-1 deferred item (byte-exact keccak cross-check) — Task 1c. ✅
 
+## Status & handoff (updated 2026-07-19)
+
+**棒 1a — DONE** (narrow→wide re-parametrization foundation; narrow behaviour
+unchanged, all narrow tests green, independently re-verified):
+- `7454a22` staged plan.
+- `49c9474` slice 1a-i: `GateShape` narrow/wide + `gate_shape_narrow_reproduces_consts`.
+- `383e17e` slice 1a-i-b: `GateLayout::from_shape` reproducing the ~130-entry
+  offset chain + `gate_layout_narrow_reproduces_consts`.
+- `45a3b73` slice 1a-ii: `VerifierGateAir` carries `shape`/`layout`; `eval`
+  (925 subs) + builders (`write_row`/`bank_*`/`fill_fs_row`/`fill_canon`/
+  `fill_derived` gained `&GateLayout`) read them; `build_gate_trace` public
+  signature unchanged (derives narrow internally); `new_with_shape(shape)` added
+  (unused). Gate: `cargo test -p qlab-bench m4gate` = 35 passed (incl. heavy
+  `gate_rectangle_satisfies` + 19 negatives); whole crate 50 passed.
+
+**棒 1b — NEXT.** Make `wide()` actually build a SAT single-child rectangle.
+Three blockers surfaced by 1a-ii, in order:
+1. **Const-array-size refactor (the real work).** Builder structs use compile-time
+   sizes `[u32; NQ]`, `[Val::ZERO; N_FHG]`, and bare `0..4` fold-round literals.
+   For wide, NQ 20→40, N_FHG 22→21, fold rounds 4→3. Convert these to runtime
+   (`Vec`/`SmallVec`, or size to `max(narrow,wide)` with a used-len) so one code
+   path serves both shapes. This is the invasive part — do it behind the green
+   narrow suite (must stay green).
+2. **Derive the wide transcript params** `QSLOTS` (per-query program length) and
+   `N_SHAPES_OBS` (obs-shape selectors), currently narrow consts (103 / 26).
+   Read them off the wide leaf `Schedule` (`m4treerec::walk_leaf` output) and
+   lift into `GateShape` + `GateLayout::from_shape`; also confirm the fold-family
+   widths (`breg` = n_rounds×4, `drnd`, GF/BPM/SNL). Update
+   `gate_layout_narrow_reproduces_consts` to still hold and add a wide-shape
+   layout sanity assert.
+3. **Parametrize `build_gate_trace` by shape** (or add `build_gate_trace_wide`)
+   so `new_with_shape(GateShape::wide())` gets a matching wide trace; then
+   `interior_single_child_satisfies` = `check_constraints` on the 2^18 wide
+   trace (~4 GB, rig-runnable, cheap — NOT a full prove). Re-derive the
+   shape-tied negatives (`gate_neg_mro/_pzacc/_preg/_capture/_fpreg/_tampered/
+   _wrong_root/_wrong_query_index`) for the wide trace.
+Optional heavy canary after SAT: one b4 single-child `prove` + peak-RSS read
+(forecasts the two-child breach — see the quantified-risk section).
+
 ## Open decisions for the executing session
 
 1. If Task 1a-ii's in-place refactor balloons past a session, the recorded
