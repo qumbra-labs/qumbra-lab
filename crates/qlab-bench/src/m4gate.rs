@@ -2452,15 +2452,19 @@ where
                 }
                 builder.assert_zero(pow_gate * pow_val);
             }
-            // First-row pins: no challenge assembled yet.
+            // First-row pins: no challenge assembled yet. These are DATA registers
+            // assembled/overwritten by each child's own FS draws before use, so they
+            // only need the true-row-0 pin (not a per-child csel re-anchor): child R
+            // INHERITS child L's final values (2b-iii fill-continuity) and its draws
+            // overwrite them — the freeze carries then hold with no gating.
             for k in 0..4 {
-                builder.assert_zero(cv(self.layout.csel) * cv(self.layout.curch + k));
+                builder.when_first_row().assert_zero(cv(self.layout.curch + k));
             }
             for k in 0..4 * self.shape.n_chals() {
-                builder.assert_zero(cv(self.layout.csel) * cv(self.layout.chal + k));
+                builder.when_first_row().assert_zero(cv(self.layout.chal + k));
             }
             for q in 0..self.shape.nq {
-                builder.assert_zero(cv(self.layout.csel) * cv(self.layout.idxr + q));
+                builder.when_first_row().assert_zero(cv(self.layout.idxr + q));
             }
             // sample_bits (query indices): value = low self.shape.log_max (=22) bits of
             // the draw = self.layout.fsacc (bits 0..16) + self.layout.fsbits[0..6] << 16. No rejection.
@@ -2477,18 +2481,23 @@ where
                 // self.layout.grp ring: left-rotate (advance the logical group) on self.layout.grot.
                 // This binds the draw-group schedule to the FS gadget, giving
                 // the GROUPREQ flush-start gate (Stage A) real teeth.
+                // 2b-iii: suppressed at the child boundary (grp reaches g_done at a
+                // child's end but child R must re-anchor slot 0).
                 for i in 0..self.shape.n_groups() {
-                    t.assert_eq(
-                        nv(self.layout.grp + i),
-                        cv(self.layout.grp + i)
-                            + cv(self.layout.grot) * (cv(self.layout.grp + (i + 1) % self.shape.n_groups()) - cv(self.layout.grp + i)),
+                    t.assert_zero(
+                        (AB::Expr::ONE - nv(self.layout.csel))
+                            * (nv(self.layout.grp + i)
+                                - cv(self.layout.grp + i)
+                                - cv(self.layout.grot) * (cv(self.layout.grp + (i + 1) % self.shape.n_groups()) - cv(self.layout.grp + i))),
                     );
                 }
                 // self.layout.coef ring: left-rotate (increment logical coef) on self.layout.crot.
                 for i in 0..4 {
-                    t.assert_eq(
-                        nv(self.layout.coef + i),
-                        cv(self.layout.coef + i) + cv(self.layout.crot) * (cv(self.layout.coef + (i + 1) % 4) - cv(self.layout.coef + i)),
+                    t.assert_zero(
+                        (AB::Expr::ONE - nv(self.layout.csel))
+                            * (nv(self.layout.coef + i)
+                                - cv(self.layout.coef + i)
+                                - cv(self.layout.crot) * (cv(self.layout.coef + (i + 1) % 4) - cv(self.layout.coef + i))),
                     );
                 }
                 // self.layout.curch: an accepted draw at coef c<3 loads self.layout.curch[c] = masked;
@@ -4094,6 +4103,11 @@ fn emit_child(
         regs.xfin = p.xfin;
         regs.runev = p.runev;
         regs.mchain = p.mchain;
+        // Challenge-assembly data registers: inherited (child R's draws reassemble
+        // them before the query phase consumes them), row-0-pinned not csel-pinned.
+        regs.chal = p.chal.clone();
+        regs.idxr = p.idxr.clone();
+        regs.curch = p.curch;
     }
     let mut zvi = 0usize;
     // Child-boundary re-anchor selector (2b): 1 on this child's first row.
