@@ -131,7 +131,30 @@ git commit -m "feat(m4gate): constraint-pinned csel child-boundary re-anchor + d
   `when_transition` block; deg-3 carries × (1-csel_next) → deg 4 → materialize a
   `(1-csel_next)`-product column. Gate: two-child check_constraints advances past
   200615 (peel further rows as needed) → SAT; narrow suite stays 40-green; degree
-  ≤ 3. NOTE the earlier general note:
+  ≤ 3.
+
+  **REFINEMENT (2026-07-20, from reading the carries): gate only the CONFLICTING
+  carries — the failing set — not all anchored-state carries.** A carry conflicts
+  only if its boundary value ≠ the fresh anchor value:
+  - `qsel` rotation (#3673) CONFLICTS: at child L's last r=23 it rotates the
+    one-hot to slot `nq` (done), but child R anchors slot 0 → gate it. Deg 2
+    (gate = materialized `qadv`) → gated deg 3, NO materialization.
+  - `qcnt` decrement (~1966) does NOT conflict: at the boundary `dec=sf23*phq=1`,
+    `qcw=1` reloads it to `qslots` = the fresh anchor value → agrees. SKIP (and
+    skipping avoids its deg-3→4 materialization, gate `sf23*phq` is deg 2).
+  - `pr` ring does NOT conflict: cycles mod `qslots` back to `program[0]` (fresh)
+    after the last query. SKIP.
+  Fresh-pass method: gate `qsel`, run the heavy two-child SAT once, read the
+  STILL-failing indices at 200615, `dump_constraint` each for family+degree, gate
+  deg-2 ones inline + materialize only deg-3 ones, repeat until 200615 clears.
+  Confirmed failing families to triage: qsel, oreg (#4450 deg 3 → materialize),
+  clusters #4361/#4398/#4714/#4766+/#4906/#4966+/#5164+/#5405+/#5498+. Materialized
+  columns grow GATE_WIDTH → update `gate_shape_wide_values` flush_bytes[2] +
+  `gate_layout_narrow_reproduces_consts`. (Subagent dispatch was 529-blocked
+  2026-07-20; do inline or retry when API stable. Tree clean at the 2c-scaffold
+  commit `7c38898`.)
+
+  Earlier general note:
   suppression `(1-csel_next)·carry` only *matters* where csel_next=1 (two children
   only), so it is untestable standalone. Plan: build 2c's `build_interior_trace`
   first; the two-child `check_constraints` will fail at exactly the carries that
