@@ -1971,11 +1971,15 @@ where
                             + cv(self.layout.qcw) * c(self.shape.qslots() as u32 - 1)),
             );
             // self.layout.qsel rotation on block wrap. (self.layout.qadv = sf(23)*phq*self.layout.qcw = dec*self.layout.qcw.)
+            // 2b-iii: suppressed at the child boundary (csel_next) — the one-hot
+            // reaches slot nq at a child's end but child R must re-anchor slot 0.
             let g = cv(self.layout.qadv);
             for i in 0..=self.shape.nq {
-                t.assert_eq(
-                    nv(self.layout.qsel + i),
-                    cv(self.layout.qsel + i) + g.clone() * (cv(self.layout.qsel + (i + 1) % (self.shape.nq + 1)) - cv(self.layout.qsel + i)),
+                t.assert_zero(
+                    (AB::Expr::ONE - nv(self.layout.csel))
+                        * (nv(self.layout.qsel + i)
+                            - cv(self.layout.qsel + i)
+                            - g.clone() * (cv(self.layout.qsel + (i + 1) % (self.shape.nq + 1)) - cv(self.layout.qsel + i))),
                 );
             }
         }
