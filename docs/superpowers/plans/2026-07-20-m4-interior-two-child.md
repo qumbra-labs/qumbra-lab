@@ -452,7 +452,32 @@ blueprint + the hard constraint discovered:
     `2·blocks(n_pvs·4) + 1` = 53 for wide — hashes each child's OWN opvs = the
     interior's inner PVs `n_pvs`=852, NOT the 1492 outer). narrow byte-identical
     (merge cols wide-only), deg ≤ 3, m4gate 45 green.
-  - **3-2b — capacity chain (makes the merge perms a genuine sponge).** ⭐ ESSENTIAL:
+  - **3-2b — DONE (`df79de3`). 3-2c — DONE (`fae82b0`). 棒 3 COMPLETE.** The
+    interior root is soundly bound to `keccak-merge(opvsL, opvsR)` (§2). Full
+    m4gate **47 passed**, narrow byte-identical (merge cols WIDE-ONLY), deg ≤ 3
+    (narrow + interior). Key implementation notes discovered in-build:
+    - **Height alignment:** a power-of-2 height (2^19) is NOT a multiple of the
+      24-row keccak perm → the trace's last perm is a truncated `h mod 24 = 8`-row
+      tail. So `merge_start = 24·(total_perms − nm)` (perm-aligned, NOT
+      `rows − 24·nm`), the AIR carries `log_height` to compute the mreg row-count
+      target `(h mod 24) + 24·nm` at last_row, and the mreg suffix runs through the
+      inert tail (its <24-row perm never fires step-flag 23 → inert for chain/reset).
+    - **Chain (3-2b):** keccak-f is a PERMUTATION (invertible) → without the chain
+      the root squeeze would be vacuous (invert to hit pv(root) for free). 4 mcnt
+      comparators `meq[4]/minv[4]`: 3 sub-sponge starts → `mrst` (capacity reset),
+      +1 root-end (`eq_end`=24·nm) suppressing the forward chain into the tail;
+      chain gate `mcont = sf(23)·mreg·(1 − mrst_next − eq_end)` (materialized).
+    - **Binding (3-2c):** root squeeze `meq3·(ocol − pv[2·n_opvs+m])`; dL carry
+      (16-limb `dlr`, captured childL→childR, freeze-held to root); dR adjacency
+      (root perm's rate[16..32] == childR-last output via the childR→root transition).
+    - Negatives: `interior_neg_merge_region` (3-2a), `interior_neg_merge_chain`
+      (3-2b machinery pinned), `interior_neg_merge_bind` (wrong-root + tampered-dL).
+    - **⚠ COORDINATOR SOUNDNESS REVIEW:** root-only relies on keccak preimage
+      resistance (standard hash-based bar), not a constraint-level per-block
+      message bind. Chain + root==pv(root) + cap comparison close the loop. If the
+      unconditional bind is wanted, add the ~89-col msh message binding.
+
+  - (superseded design detail — 3-2b as originally spec'd) capacity chain:** ⭐ ESSENTIAL:
     keccak-f is a PERMUTATION (invertible), so without the chain a prover inverts
     the root perm to hit `pv(root)` for free → the root binding is vacuous. The
     chain (input capacity limbs 68..100 == previous perm's output capacity) turns
@@ -525,7 +550,7 @@ blueprint + the hard constraint discovered:
   `merge_root` (currently tree `keccak(keccak(opvsL)‖keccak(opvsR))`) + updates
   `interior_merge_native`. Keep tree-merge unless the coordinator prefers flat.
 
-- [ ] **Step 2: Failing merge-binds test.**
+- [x] **Step 2: Failing merge-binds test (landed as interior_merge_native + interior_neg_merge_bind).**
 ```rust
 #[test]
 fn interior_merge_binds_root() {
@@ -538,9 +563,9 @@ fn interior_merge_binds_root() {
 }
 ```
 
-- [ ] **Step 3: Run, expect FAIL then implement** the merge sponge in eval (LaneBuilder perm + bind the exposed root against `meta.opvs`). Run: `cargo test --release -p qlab-bench interior_merge_binds_root -- --nocapture 2>&1 | tail -12`.
+- [x] **Step 3: Run, expect FAIL then implement** the merge sponge in eval (LaneBuilder perm + bind the exposed root against `meta.opvs`). Run: `cargo test --release -p qlab-bench interior_merge_binds_root -- --nocapture 2>&1 | tail -12`.
 
-- [ ] **Step 4: Failing wrong-merge negative.**
+- [x] **Step 4: Failing wrong-merge negative (interior_neg_merge_bind).**
 ```rust
 #[test]
 fn interior_neg_wrong_merge() {
@@ -555,9 +580,9 @@ fn interior_neg_wrong_merge() {
 }
 ```
 
-- [ ] **Step 5: Run negative, expect UNSAT (test ok).** Run: `cargo test --release -p qlab-bench interior_neg_wrong_merge -- --nocapture 2>&1 | tail -8`.
+- [x] **Step 5: Run negative, expect UNSAT (test ok).** Run: `cargo test --release -p qlab-bench interior_neg_wrong_merge -- --nocapture 2>&1 | tail -8`.
 
-- [ ] **Step 6: Full suite green + commit.**
+- [x] **Step 6: Full suite green + commit.**
 ```bash
 git add crates/qlab-bench/src/m4gate.rs crates/qlab-bench/src/m4interior.rs
 git commit -m "feat(m4interior): keccak merge sponge -> interior root (binds + wrong-merge negative)"
