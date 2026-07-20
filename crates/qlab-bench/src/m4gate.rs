@@ -3998,115 +3998,37 @@ fn chal_group(tag: ChalTag) -> usize {
     }
 }
 
-pub(crate) fn build_gate_trace(
-    sched: &Schedule,
-    inner_pvs: &[Val],
+#[allow(clippy::too_many_arguments)]
+fn emit_child(
+    mut values: &mut [Val],
+    row_offset: usize,
     shape: &GateShape,
-    extra_capacity_bits: usize,
-) -> (RowMajorMatrix<Val>, GateMeta) {
-    // Slice 1b-3: the inner-proof `shape` is now an explicit parameter, so the
-    // interior node can pass `GateShape::wide()`. Narrow callers pass
-    // `&GateShape::narrow()` and are unchanged.
-    let consts = gate_consts_from_shape(shape);
-    let program = qprogram_from_shape(shape);
-    let layout = GateLayout::from_shape(shape);
+    layout: &GateLayout,
+    consts: &GateConsts,
+    program: &[u32],
+    sched: &Schedule,
+    inputs: &[[u64; 25]],
+    outs: &[[u64; 25]],
+    infos: &[PInfo],
+    hosted: &std::collections::HashMap<usize, Vec<m4gaterec::DrawRec>>,
+    chal_expect: &[Ext],
+    fpoly: &[Ext],
+    fa: Ext,
+    zvals: &[Ext],
+    dcap: &[(usize, usize, u32); 3],
+    n_dup: usize,
+    trailer_pi: usize,
+    query_rows: &mut Vec<usize>,
+    field_draws: &mut Vec<(usize, u32)>,
+) -> Regs {
+    let n_perms = inputs.len();
     let nq = shape.nq;
     let qslots = shape.qslots();
     let cum = shape.cum();
     let n_rounds = shape.n_fri_rounds();
-    let opvs = outer_pvs(sched, inner_pvs, shape);
-    let (inputs, infos) = lane_plan(sched, shape);
-    let n_perms = inputs.len();
-    let outs: Vec<[u64; 25]> = inputs.iter().map(keccakf).collect();
-
-    let keccak = p3_keccak_air::generate_trace_rows::<Val>(inputs.clone(), 0);
-    let rows = keccak.height();
-    // Shape/perm-driven rectangle height: the keccak lane pads n_perms·24 rows
-    // up to the next power of two. Narrow (2,382 perms) -> 2^16; wide
-    // single-child (~8,360 perms) -> 2^18.
-    let expected_rows = (n_perms * 24).next_power_of_two();
-    assert_eq!(rows, expected_rows, "gate rectangle height (n_perms={n_perms})");
-    let mut values = Vec::with_capacity((rows << extra_capacity_bits) * layout.gate_width);
-    values.resize(rows * layout.gate_width, Val::ZERO);
-    for r in 0..rows {
-        values[r * layout.gate_width..r * layout.gate_width + NUM_KECCAK_COLS]
-            .copy_from_slice(&keccak.values[r * NUM_KECCAK_COLS..(r + 1) * NUM_KECCAK_COLS]);
-    }
-    drop(keccak);
-
-    // Draw hosting: flush f's digest draws live on flush f+1's block 0
-    // (or the trailer for the last flush).
-    let nf = sched.flushes.len();
-    let n_chal_blocks: usize = sched.flushes.iter().map(|f| f.n_blocks).sum();
-    let trailer_pi = n_chal_blocks;
-    let mut hosted: HashMap<usize, Vec<m4gaterec::DrawRec>> = HashMap::new();
-    for d in &sched.draws {
-        let cons = if d.flush + 1 < nf {
-            sched.flushes[d.flush + 1].first_perm
-        } else {
-            trailer_pi
-        };
-        hosted.entry(cons).or_default().push(d.clone());
-    }
-    let mut chal_expect: Vec<Ext> = vec![sched.alpha, sched.zeta, sched.fri_alpha];
-    for r in 0..shape.n_fri_rounds() {
-        chal_expect.push(sched.betas[r]);
-    }
-    assert_eq!(chal_expect.len(), shape.n_chals());
-    // Final poly from the labeled obs stream.
-    let fpoly: Vec<Ext> = sched
-        .obs
-        .iter()
-        .find(|o| o.label == m4gaterec::ObsLabel::FinalPoly)
-        .unwrap()
-        .bytes
-        .chunks(16)
-        .map(|c| {
-            Ext::from_basis_coefficients_fn(|i| {
-                Val::from_u32(u32::from_le_bytes(c[4 * i..4 * i + 4].try_into().unwrap()))
-            })
-        })
-        .collect();
-    assert_eq!(fpoly.len(), 16);
-    let fa = sched.fri_alpha;
-    // Oracle: the concatenated zeta-opening ext values from the obs stream.
-    let zvals: Vec<Ext> = {
-        let mut bytes = vec![];
-        for g in 0..3 {
-            bytes.extend_from_slice(
-                &sched
-                    .obs
-                    .iter()
-                    .find(|o| o.label == m4gaterec::ObsLabel::ZetaVals { group: g })
-                    .unwrap()
-                    .bytes,
-            );
-        }
-        bytes
-            .chunks(16)
-            .map(|c| {
-                Ext::from_basis_coefficients_fn(|i| {
-                    Val::from_u32(u32::from_le_bytes(c[4 * i..4 * i + 4].try_into().unwrap()))
-                })
-            })
-            .collect()
-    };
-    let mut zvi = 0usize;
-    // Reduced-opening dup-phase capture geometry (slice 1b-B2): (block,row,blkcnt)
-    // for the group-0/group-1/end boundaries, and the last dup block index.
-    let dcap = shape.dup_captures();
-    let n_dup = shape.flush_blocks()[2];
-
     let mut regs = Regs::new(shape);
     regs.fsfull = hosted.get(&0).map_or(false, |d| d.len() == 8);
-    let mut meta = GateMeta {
-        query_rows: vec![],
-        field_draws: vec![],
-        trailer_row: 24 * trailer_pi,
-        n_perms,
-        opvs: opvs.clone(),
-    };
-
+    let mut zvi = 0usize;
     for pi in 0..n_perms {
         let info = &infos[pi];
         let base_row = 24 * pi;
@@ -4135,7 +4057,7 @@ pub(crate) fn build_gate_trace(
         if let PInfo::Query { q, slot } = info {
             if *slot == 0 {
                 assert_eq!(regs.qsel, *q, "query counter alignment");
-                meta.query_rows.push(base_row);
+                query_rows.push(row_offset + base_row);
             }
         }
         // Fold round of an absorb slot (dparam 2..6), if any.
@@ -4151,7 +4073,7 @@ pub(crate) fn build_gate_trace(
         };
 
         for r in 0..24 {
-            let row = base_row + r;
+            let row = row_offset + base_row + r;
             write_row(&mut values, row, r, &regs, &program, Some(info), &layout, shape);
             // layout.gpb for fold-absorb perms (write over write_row's zeros).
             if let Some(rf) = fold_r {
@@ -4401,7 +4323,7 @@ pub(crate) fn build_gate_trace(
                                 assert_eq!(chal_group(chal), regs.grp, "draw group");
                                 if accept {
                                     assert_eq!(coeff, regs.coef, "draw coefficient");
-                                    meta.field_draws.push((row, masked));
+                                    field_draws.push((row, masked));
                                     if regs.coef < 3 {
                                         regs.curch[regs.coef] = masked;
                                         regs.coef += 1;
@@ -4681,18 +4603,6 @@ pub(crate) fn build_gate_trace(
         }
     }
 
-    // Pad rows: frozen registers.
-    for row in 24 * n_perms..rows {
-        write_row(&mut values, row, row % 24, &regs, &program, None, &layout, shape);
-        // layout.hit defining constraint on pad rows: gpb=0 (write_row zeros it)
-        // ⇒ glo=ghi=[1,0,0,0] ⇒ the global HIT constraint reduces to
-        // `hit == vc[0]`. write_row never fills hit, and the main perm loop's
-        // hit fill (the non-fold else-branch, `hit=[vc%16==0]`) does not run
-        // over pad rows — so mirror it here. Narrow's frozen vc lands off slot 0
-        // (last fold round has 4 leaves ⇒ vc=4), so this stays 0 = byte-identical;
-        // wide's last round has 16 leaves ⇒ vc wraps to 0, so hit must be 1.
-        values[row * layout.gate_width + layout.hit] = Val::from_bool(regs.vc % 16 == 0);
-    }
     // Global self-checks against the recorder.
     assert_eq!(regs.qsel, nq, "all query blocks completed");
     assert!(!regs.phq && !regs.phc && !regs.phd, "phases exhausted");
@@ -4716,6 +4626,134 @@ pub(crate) fn build_gate_trace(
         "A2 span"
     );
     assert_eq!(regs.fpi, 16, "final poly fully captured");
+    regs
+}
+
+pub(crate) fn build_gate_trace(
+    sched: &Schedule,
+    inner_pvs: &[Val],
+    shape: &GateShape,
+    extra_capacity_bits: usize,
+) -> (RowMajorMatrix<Val>, GateMeta) {
+    // Slice 1b-3: the inner-proof `shape` is now an explicit parameter, so the
+    // interior node can pass `GateShape::wide()`. Narrow callers pass
+    // `&GateShape::narrow()` and are unchanged.
+    let consts = gate_consts_from_shape(shape);
+    let program = qprogram_from_shape(shape);
+    let layout = GateLayout::from_shape(shape);
+    let nq = shape.nq;
+    let qslots = shape.qslots();
+    let cum = shape.cum();
+    let n_rounds = shape.n_fri_rounds();
+    let opvs = outer_pvs(sched, inner_pvs, shape);
+    let (inputs, infos) = lane_plan(sched, shape);
+    let n_perms = inputs.len();
+    let outs: Vec<[u64; 25]> = inputs.iter().map(keccakf).collect();
+
+    let keccak = p3_keccak_air::generate_trace_rows::<Val>(inputs.clone(), 0);
+    let rows = keccak.height();
+    // Shape/perm-driven rectangle height: the keccak lane pads n_perms·24 rows
+    // up to the next power of two. Narrow (2,382 perms) -> 2^16; wide
+    // single-child (~8,360 perms) -> 2^18.
+    let expected_rows = (n_perms * 24).next_power_of_two();
+    assert_eq!(rows, expected_rows, "gate rectangle height (n_perms={n_perms})");
+    let mut values = Vec::with_capacity((rows << extra_capacity_bits) * layout.gate_width);
+    values.resize(rows * layout.gate_width, Val::ZERO);
+    for r in 0..rows {
+        values[r * layout.gate_width..r * layout.gate_width + NUM_KECCAK_COLS]
+            .copy_from_slice(&keccak.values[r * NUM_KECCAK_COLS..(r + 1) * NUM_KECCAK_COLS]);
+    }
+    drop(keccak);
+
+    // Draw hosting: flush f's digest draws live on flush f+1's block 0
+    // (or the trailer for the last flush).
+    let nf = sched.flushes.len();
+    let n_chal_blocks: usize = sched.flushes.iter().map(|f| f.n_blocks).sum();
+    let trailer_pi = n_chal_blocks;
+    let mut hosted: HashMap<usize, Vec<m4gaterec::DrawRec>> = HashMap::new();
+    for d in &sched.draws {
+        let cons = if d.flush + 1 < nf {
+            sched.flushes[d.flush + 1].first_perm
+        } else {
+            trailer_pi
+        };
+        hosted.entry(cons).or_default().push(d.clone());
+    }
+    let mut chal_expect: Vec<Ext> = vec![sched.alpha, sched.zeta, sched.fri_alpha];
+    for r in 0..shape.n_fri_rounds() {
+        chal_expect.push(sched.betas[r]);
+    }
+    assert_eq!(chal_expect.len(), shape.n_chals());
+    // Final poly from the labeled obs stream.
+    let fpoly: Vec<Ext> = sched
+        .obs
+        .iter()
+        .find(|o| o.label == m4gaterec::ObsLabel::FinalPoly)
+        .unwrap()
+        .bytes
+        .chunks(16)
+        .map(|c| {
+            Ext::from_basis_coefficients_fn(|i| {
+                Val::from_u32(u32::from_le_bytes(c[4 * i..4 * i + 4].try_into().unwrap()))
+            })
+        })
+        .collect();
+    assert_eq!(fpoly.len(), 16);
+    let fa = sched.fri_alpha;
+    // Oracle: the concatenated zeta-opening ext values from the obs stream.
+    let zvals: Vec<Ext> = {
+        let mut bytes = vec![];
+        for g in 0..3 {
+            bytes.extend_from_slice(
+                &sched
+                    .obs
+                    .iter()
+                    .find(|o| o.label == m4gaterec::ObsLabel::ZetaVals { group: g })
+                    .unwrap()
+                    .bytes,
+            );
+        }
+        bytes
+            .chunks(16)
+            .map(|c| {
+                Ext::from_basis_coefficients_fn(|i| {
+                    Val::from_u32(u32::from_le_bytes(c[4 * i..4 * i + 4].try_into().unwrap()))
+                })
+            })
+            .collect()
+    };
+    // Reduced-opening dup-phase capture geometry (slice 1b-B2): (block,row,blkcnt)
+    // for the group-0/group-1/end boundaries, and the last dup block index.
+    let dcap = shape.dup_captures();
+    let n_dup = shape.flush_blocks()[2];
+
+    let mut meta = GateMeta {
+        query_rows: vec![],
+        field_draws: vec![],
+        trailer_row: 24 * trailer_pi,
+        n_perms,
+        opvs: opvs.clone(),
+    };
+
+    let regs = emit_child(
+        &mut values, 0, shape, &layout, &consts, &program, sched,
+        &inputs, &outs, &infos, &hosted, &chal_expect, &fpoly, fa,
+        &zvals, &dcap, n_dup, trailer_pi,
+        &mut meta.query_rows, &mut meta.field_draws,
+    );
+
+    // Pad rows: frozen registers.
+    for row in 24 * n_perms..rows {
+        write_row(&mut values, row, row % 24, &regs, &program, None, &layout, shape);
+        // layout.hit defining constraint on pad rows: gpb=0 (write_row zeros it)
+        // ⇒ glo=ghi=[1,0,0,0] ⇒ the global HIT constraint reduces to
+        // `hit == vc[0]`. write_row never fills hit, and the main perm loop's
+        // hit fill (the non-fold else-branch, `hit=[vc%16==0]`) does not run
+        // over pad rows — so mirror it here. Narrow's frozen vc lands off slot 0
+        // (last fold round has 4 leaves ⇒ vc=4), so this stays 0 = byte-identical;
+        // wide's last round has 16 leaves ⇒ vc wraps to 0, so hit must be 1.
+        values[row * layout.gate_width + layout.hit] = Val::from_bool(regs.vc % 16 == 0);
+    }
 
     fill_derived(&mut values, &layout, shape);
 
