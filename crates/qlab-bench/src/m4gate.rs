@@ -957,9 +957,11 @@ const CPL: usize = CPB + 1; // PHD·BLKLAST (A2 capture: dup last block N-1; nar
 const CONSZ7: usize = CPL + 1; // CZ7 · POS1 (final-poly value completion)
 const FPI: usize = CONSZ7 + 1; // 16: final-poly coefficient index one-hot
 const CSEL: usize = FPI + 16; // 1: child-boundary re-anchor selector (2b)
+const FRGM: usize = CSEL + 1; // 1: fring-rotation gate sf(23)·b0next (2b-iii)
+const BCBD: usize = FRGM + 1; // 1: blkcnt update delta (2b-iii)
 
-const GATE_COLS: usize = CSEL + 1 - GB;
-pub(crate) const GATE_WIDTH: usize = CSEL + 1;
+const GATE_COLS: usize = BCBD + 1 - GB;
+pub(crate) const GATE_WIDTH: usize = BCBD + 1;
 
 /// Runtime mirror of the column-offset chain above, computed from a
 /// [`GateShape`] instead of the top-of-file `const`s. `from_shape(narrow())`
@@ -1129,6 +1131,11 @@ pub(crate) struct GateLayout {
     /// interior). Constraint-pinned (option B, completion-gated) so a prover
     /// cannot re-anchor mid-child. Appended last → narrow offsets unchanged.
     pub(crate) csel: usize,
+    /// 2b-iii degree-reduction (deg-3 boundary carries): `frgm` = sf(23)·b0next
+    /// (the fring-rotation gate), `bcbd` = the blkcnt update delta. Materialized
+    /// so their `(1-csel_next)`-gated carries stay ≤ deg 3.
+    pub(crate) frgm: usize,
+    pub(crate) bcbd: usize,
     pub(crate) gate_cols: usize,
     pub(crate) gate_width: usize,
 }
@@ -1298,8 +1305,10 @@ impl GateLayout {
         let consz7 = cpl + 1;
         let fpi = consz7 + 1;
         let csel = fpi + 16;
-        let gate_cols = csel + 1 - gb;
-        let gate_width = csel + 1;
+        let frgm = csel + 1;
+        let bcbd = frgm + 1;
+        let gate_cols = bcbd + 1 - gb;
+        let gate_width = bcbd + 1;
 
         GateLayout {
             mul_off, add_off, gb, w0c, w1c, hb0, hb1, ta0, topa0, ta1, topa1,
@@ -1314,7 +1323,7 @@ impl GateLayout {
             invzn, xreg, xfin, runev, f2dig, phd, cmpc, cmpci, czd, chlive, f2sel,
             pg_a, phg, phdend, cont, eg_a, endg, xsel, qadv, cfull, m3, rlo, rhi,
             dmux, snl, glo, ghi, gf, bpm, n_fhg, fhg, prega, cpa, cpb, cpl, consz7,
-            fpi, csel, gate_cols, gate_width,
+            fpi, csel, frgm, bcbd, gate_cols, gate_width,
         }
     }
 }
@@ -2240,12 +2249,19 @@ where
             t.assert_zero(sf(23) * nv(self.layout.refsel) * cv(self.layout.needl));
             // self.layout.cfull = sf(23) * consumersel * (1 - self.layout.fsfull); keeps deg <= 3.
             t.assert_zero(nv(self.layout.refsel) * cv(self.layout.cfull));
-            // self.layout.fring rotation at obs starts.
-            let g = sf(23) * b0next.clone();
+            // self.layout.fring rotation at obs starts. 2b-iii: the gate
+            // sf(23)·b0next is materialized as self.layout.frgm (deg 2) so the
+            // rotation, suppressed at the child boundary via (1-csel_next), stays
+            // deg 3 (fring reaches the last obs flush at a child's end but child R
+            // must re-anchor slot 0). Narrow: (1-nv(csel))=1 in every single-child
+            // transition → byte-identical.
+            t.assert_eq(cv(self.layout.frgm), sf(23) * b0next.clone());
             for i in 0..8 {
-                t.assert_eq(
-                    nv(self.layout.fring + i),
-                    cv(self.layout.fring + i) + g.clone() * (cv(self.layout.fring + (i + 1) % 8) - cv(self.layout.fring + i)),
+                t.assert_zero(
+                    (AB::Expr::ONE - nv(self.layout.csel))
+                        * (nv(self.layout.fring + i)
+                            - cv(self.layout.fring + i)
+                            - cv(self.layout.frgm) * (cv(self.layout.fring + (i + 1) % 8) - cv(self.layout.fring + i))),
                 );
             }
             // self.layout.bidx: reset on new flush/refill, saturating rotate on
@@ -2280,19 +2296,30 @@ where
                         * (c(self.consts.flush_blocks[f] as u32) - cv(self.layout.blkcnt));
             }
             let dupdec = sf(23) * cv(self.layout.phd) * (AB::Expr::ONE - cv(self.layout.blklast));
+            // 2b-iii: the blkcnt update delta is deg 3 (sf(23)·reload, dupdec).
+            // Materialize it as self.layout.bcbd so the carry — suppressed at the
+            // child boundary via (1-csel_next) — stays deg 2 (blkcnt holds a stale
+            // query-phase value at a child's end but child R re-anchors
+            // flush_blocks[0]). Narrow byte-identical (gate factor 1 there).
             t.assert_eq(
-                nv(self.layout.blkcnt),
-                cv(self.layout.blkcnt)
-                    + sf(23) * reload
+                cv(self.layout.bcbd),
+                sf(23) * reload
                     + sf(23) * nv(self.layout.refsel) * (AB::Expr::ONE - cv(self.layout.blkcnt))
                     + cont.clone() * (-AB::Expr::ONE)
                     + dupdec * (-AB::Expr::ONE)
                     + phasegate.clone() * (c(self.consts.flush_blocks[2] as u32) - cv(self.layout.blkcnt)),
             );
-            // Phase evolution.
-            t.assert_eq(nv(self.layout.phc), phc.clone() - phasegate.clone());
-            t.assert_eq(nv(self.layout.phd), cv(self.layout.phd) + phasegate.clone() - phdend.clone());
-            t.assert_eq(nv(self.layout.phq), phq.clone() + phdend.clone() - endgate.clone());
+            t.assert_zero(
+                (AB::Expr::ONE - nv(self.layout.csel))
+                    * (nv(self.layout.blkcnt) - cv(self.layout.blkcnt) - cv(self.layout.bcbd)),
+            );
+            // Phase evolution. 2b-iii: suppressed at the child boundary — phc
+            // reaches 0 at a child's end (challenger done) but child R re-anchors
+            // phc=1; phd/phq reach 0 and agree, gated for robustness (deg 2).
+            let ncsel = AB::Expr::ONE - nv(self.layout.csel);
+            t.assert_zero(ncsel.clone() * (nv(self.layout.phc) - (phc.clone() - phasegate.clone())));
+            t.assert_zero(ncsel.clone() * (nv(self.layout.phd) - (cv(self.layout.phd) + phasegate.clone() - phdend.clone())));
+            t.assert_zero(ncsel * (nv(self.layout.phq) - (phq.clone() + phdend.clone() - endgate.clone())));
             // Chain gate: a consumer perm's first 16 preimage limbs are the
             // previous perm's digest.
             let chainsel_next = {
@@ -5161,6 +5188,33 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout, shape: &GateShape) {
         values[base + layout.cpl] = values[base + layout.phd] * values[base + layout.blklast];
         values[base + layout.consz7] = values[base + layout.cz7] * values[base + layout.pos + 1];
     }
+
+    // 2b-iii: materialize the fring-rotation gate (frgm = sf(23)·b0next) and the
+    // blkcnt update delta (bcbd) — both next-row-dependent (b0next / nv(shsel),
+    // nv(refsel)) — so their (1-csel_next)-gated carries stay ≤ deg 3. The last
+    // row has no successor (its transition constraints are inactive) → leave 0.
+    for r in 0..rows.saturating_sub(1) {
+        let cur = r * w;
+        let nxt = (r + 1) * w;
+        let sf23 = values[cur + 23];
+        let mut b0n = Val::ZERO;
+        for f in 1..flush_blocks.len() {
+            b0n += values[nxt + layout.shsel + shsel_index(&flush_blocks, f, 0)];
+        }
+        values[cur + layout.frgm] = sf23 * b0n;
+        let blkcnt = values[cur + layout.blkcnt];
+        let mut reload = Val::ZERO;
+        for f in 1..flush_blocks.len() {
+            reload += values[nxt + layout.shsel + shsel_index(&flush_blocks, f, 0)]
+                * (Val::from_u32(flush_blocks[f] as u32) - blkcnt);
+        }
+        let dupdec = sf23 * values[cur + layout.phd] * (one - values[cur + layout.blklast]);
+        values[cur + layout.bcbd] = sf23 * reload
+            + sf23 * values[nxt + layout.refsel] * (one - blkcnt)
+            - values[cur + layout.cont]
+            - dupdec
+            + values[cur + layout.phg] * (Val::from_u32(flush_blocks[2] as u32) - blkcnt);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5491,6 +5545,8 @@ mod tests {
         assert_eq!(l.consz7, CONSZ7);
         assert_eq!(l.fpi, FPI);
         assert_eq!(l.csel, CSEL);
+        assert_eq!(l.frgm, FRGM);
+        assert_eq!(l.bcbd, BCBD);
         assert_eq!(l.gate_cols, GATE_COLS);
         assert_eq!(l.gate_width, GATE_WIDTH);
     }
@@ -5535,10 +5591,12 @@ mod tests {
         assert_eq!(w.n_flush_entries(), 8);
         assert_eq!(w.n_fhg(), 21);
         assert_eq!(w.drnd_width(), 5);
-        // F2 = 32 + 16·(2·tw + qw); tw = GATE_WIDTH (3627 with csel) → 116224
-        // (was 116192 at tw=3626). All other flushes are tw-independent.
-        assert_eq!(w.flush_bytes(), vec![3676, 288, 116224, 288, 288, 288, 304]);
-        assert_eq!(w.flush_blocks(), vec![28, 3, 855, 3, 3, 3, 3]);
+        // F2 = 32 + 16·(2·tw + qw); tw = GATE_WIDTH (3629 with csel+frgm+bcbd) →
+        // 116288 (was 116192 at bare tw=3626). All other flushes are tw-independent.
+        assert_eq!(w.flush_bytes(), vec![3676, 288, 116288, 288, 288, 288, 304]);
+        // F2 blocks = 116288/136 + 1 = 856 (crossed the 136-byte boundary vs the
+        // bare-tw 855 as csel+frgm+bcbd widened the leaf).
+        assert_eq!(w.flush_blocks(), vec![28, 3, 856, 3, 3, 3, 3]);
         assert_eq!(w.n_shapes_obs(), 46);
         assert_eq!(w.qslots(), 165);
         assert_eq!(w.bidx_width(), 29, "wide F0=28 blocks → bidx must address all + 1 sink");
@@ -6351,18 +6409,14 @@ mod tests {
     /// signal; ~8 GB raw trace, no prove). Distinct children + per-lane tamper
     /// negatives are 2d.
     ///
-    /// IGNORED (2026-07-20): the two-child trace BUILDS and check_constraints
-    /// passes rows 0..200614 — BOTH children's obs+dup phases and the ring-based
-    /// re-anchor. It fails at **row 200615 = child L's last row** (nl=8359 lane
-    /// perms → child R starts at 24*8359=200616): the ~250 failing TRANS
-    /// constraints are the active query-phase-end carries (qsel rotation #3673,
-    /// XOR/OREG #4450, pr ring, blkcnt, chal, pzacc/preg, runev, …) that carry
-    /// child L's state into child R's csel-anchored first row. This is slice
-    /// 2b-iii: suppress each boundary carry with `(1 - csel_next)` and
-    /// degree-reduce (flush-automaton precedent). Diagnose the family of any
-    /// index n via `WIDE=1 CIDX=n cargo test dump_constraint -- --nocapture`.
+    /// SAT (2026-07-20, 2c + 2b-iii): the full 2^19 two-child rectangle passes
+    /// `check_constraints`. Child L (rows 0..24·8359) + child R re-anchor at the
+    /// csel boundary; the query-phase-end boundary carries are resolved two ways —
+    /// anchored automaton families (qsel/fring/grp/coef/blkcnt/phc/phd/phq) gated
+    /// with `(1-csel_next)` (fring/blkcnt via materialized frgm/bcbd for deg ≤3);
+    /// non-anchored fold/data registers (oreg, fold arith, chal/idxr/curch)
+    /// carried by fill-continuity (child R inherits child L's final values).
     #[test]
-    #[ignore = "2c: two-child trace builds; check_constraints peels at the child boundary (row 200615) — needs 2b-iii carry suppression"]
     fn interior_two_child_satisfies() {
         let _g = heavy_lock();
         let (sl, sr, ol, or) = crate::m4interior::two_child_schedule(false);
