@@ -5005,6 +5005,29 @@ mod tests {
         })
     }
 
+    /// Wide analogue of `shared()`: cache the interior child's leaf-proof
+    /// verification schedule + its opvs once (the ~12 GB leaf `prove` runs a
+    /// single time; only the small `Schedule` + opvs are retained). Used by the
+    /// wide SAT + negative tests so each re-uses one leaf proof.
+    pub(crate) fn wide_shared() -> &'static (Schedule, Vec<Val>) {
+        static CELL: OnceLock<(Schedule, Vec<Val>)> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let (leaf, opvs) = crate::m4treerec::leaf_proof();
+            let sched = crate::m4treerec::walk_leaf(&leaf, &opvs);
+            (sched, opvs)
+        })
+    }
+
+    /// Wide analogue of `is_unsat`: check the mutated wide trace against the
+    /// `wide()`-shaped AIR in a spawned thread (panic == UNSAT == caught).
+    fn is_unsat_wide(trace: RowMajorMatrix<Val>, opvs: Vec<Val>) -> bool {
+        std::thread::spawn(move || {
+            check_constraints(&VerifierGateAir::new_with_shape(GateShape::wide()), &trace, &opvs);
+        })
+        .join()
+        .is_err()
+    }
+
     /// M4 step 1 stage 2, slice 1a-i: `GateShape::narrow()` must reproduce the
     /// shipped leaf gate's const block byte-for-byte, and `wide()` must carry
     /// the interior target shape from `m4treerec` / the stage-1 run doc. This
@@ -5929,5 +5952,99 @@ mod tests {
             &trace,
             &meta.opvs,
         );
+    }
+
+    /// Slice 1b-5: the shape-tied tamper negatives, re-derived for the WIDE
+    /// single-child trace (2^18 × wide width). Mirrors the narrow `gate_neg_*`
+    /// set but reads the wide `GateLayout` offsets and asserts each single-cell
+    /// tamper is UNSAT under the `wide()` AIR — the soundness counterpart to the
+    /// 1b-4 SAT signal. Especially exercises the Option-A `M_HORN`/`RUNEV`
+    /// END-pin (bad-fold / fpreg / xfin) on real wide data, and the fold-leaf
+    /// VC one-hot (the 1b-B8 region). One wide trace is built and cloned per
+    /// probe (each `check_constraints` is a full 2^18 pass).
+    #[test]
+    fn interior_single_child_negatives() {
+        let _g = heavy_lock();
+        let (sched, opvs) = wide_shared();
+        let shape = GateShape::wide();
+        let l = GateLayout::from_shape(&shape);
+        let w = l.gate_width;
+        let one = Val::ONE;
+
+        let (base_trace, meta) = build_gate_trace(sched, opvs, &shape, 0);
+        let qrows = meta.query_rows.clone();
+        let fdraws = meta.field_draws.clone();
+        let base_opvs = meta.opvs.clone();
+        assert!(!qrows.is_empty() && !fdraws.is_empty(), "wide meta populated");
+        let q0 = qrows[0];
+
+        let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>, &mut Vec<Val>)| {
+            let mut trace = base_trace.clone();
+            let mut o = base_opvs.clone();
+            mutate(&mut trace, &mut o);
+            assert!(is_unsat_wide(trace, o), "expected UNSAT (wide): {label}");
+        };
+
+        // --- structural / gate-exit ------------------------------------------
+        // wrong-root: corrupt cap-0 (trace tree) limb0 across all 8 digests.
+        probe("wrong-root: cap0 all-digest limb0", &|_t, o| {
+            for j in 0..shape.cap_len {
+                o[cap_limb_opv(0, j, 0)] += one;
+            }
+        });
+        // tampered-opening: flip query-0 trace-leaf preimage limb.
+        probe("tampered-opening: q0 preimage limb0", &|t, _o| {
+            t.values[q0 * w + pcol(0)] += one;
+        });
+        // wrong-query-index: flip the FS-sampled index register.
+        probe("wrong-query-index: IDXR[0]@q0", &|t, _o| {
+            t.values[q0 * w + l.idxr] += one;
+        });
+        // wrong-challenge: flip an accepted field-draw's FSACC.
+        probe("wrong-challenge: FSACC@draw0", &|t, _o| {
+            t.values[fdraws[0].0 * w + l.fsacc] += one;
+        });
+
+        // --- fold-leaf VC schedule (the 1b-B8 region) ------------------------
+        probe("value-schedule: VC[3]@q0 (break one-hot)", &|t, _o| {
+            t.values[q0 * w + l.vc + 3] += one;
+        });
+
+        // --- START endpoint pins (reduced opening) ---------------------------
+        probe("pzacc@q0", &|t, _o| {
+            t.values[q0 * w + l.pzacc] += one;
+        });
+        probe("preg@q0", &|t, _o| {
+            t.values[q0 * w + l.preg] += one;
+        });
+        probe("capture A0R@q0", &|t, _o| {
+            t.values[q0 * w + l.a0r] += one;
+        });
+        // M_RO reduced-opening assembly: flip an SCR intermediate on an M_RO perm.
+        probe("mro: SCR@row3 of an M_RO perm", &|t, _o| {
+            let n = t.values.len() / w;
+            let mro = l.msel + M_RO as usize;
+            for perm in 0..(n / 24) {
+                if t.values[(perm * 24 + 23) * w + mro] == one {
+                    t.values[(perm * 24 + 3) * w + l.scr] += one;
+                    return;
+                }
+            }
+            panic!("no M_RO perm found (wide)");
+        });
+
+        // --- END endpoint pins (Option-A M_HORN / RUNEV soundness) -----------
+        probe("bad-fold: RUNEV@q0", &|t, _o| {
+            t.values[q0 * w + l.runev] += one;
+        });
+        probe("fpreg@q0", &|t, _o| {
+            t.values[q0 * w + l.fpreg] += one;
+        });
+        probe("xfin-chain: XFIN@q0", &|t, _o| {
+            t.values[q0 * w + l.xfin] += one;
+        });
+        probe("xreg-chain: XREG@q0", &|t, _o| {
+            t.values[q0 * w + l.xreg] += one;
+        });
     }
 }

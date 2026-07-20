@@ -514,14 +514,25 @@ the `0..19` dmux path-direction loops (eval ~1866 / fill ~3710) and the
       m4gate suite = **38 passed** (37 narrow byte-identical + this wide SAT test),
       0 failed.
 - **1b-4 DONE.** Wide single-child rectangle is `check_constraints`-SAT end to end.
+- **1b-5 DONE (2026-07-20).** Wide negatives: `interior_single_child_negatives`
+  builds one wide trace and clones-per-probe 13 single-cell tampers, each asserted
+  UNSAT under the `wide()` AIR — structural (wrong-root / tampered-opening /
+  wrong-query-index / wrong-challenge-FSACC), the fold-leaf VC one-hot (the 1b-B8
+  region), START pins (pzacc / preg / capture-A0R / mro-SCR), and the Option-A
+  END pins (bad-fold-RUNEV / fpreg / xfin-chain / xreg-chain — the M_HORN/RUNEV
+  soundness diligence, now bound on real wide data). Harness added: `wide_shared()`
+  (caches the ~12 GB leaf proof once) + `is_unsat_wide()`. Full m4gate suite = **39
+  passed** (37 narrow + wide SAT + wide negatives), release ~52 s. Test-only commit
+  → narrow byte-identical.
 
-**NEXT: 1b-5 — wide negatives** (re-derive the shape-tied tamper tests for the
-wide trace: `gate_neg_mro/_pzacc/_preg/_capture/_fpreg/_tampered_opening/
-_wrong_root/_wrong_query_index` — each must be UNSAT on the wide trace, mirroring
-the narrow negatives; especially exercise the wide M_HORN/RUNEV END-pin
-`gate_neg_fpreg`/`_xfin_chain`/`_bad_fold` per the Option A soundness diligence),
-then 棒 2 (two children in one 2^19 rectangle) → 棒 3 (merge digest) → stage 3
-(single-child `prove` canary + two-child peak-RSS vs 32 GB).
+**棒 1 COMPLETE** (single wide child: SAT + shape-tied negatives). Optional 1b-7
+canary (`prove` one wide child at b4, peak-RSS forecast) is deferred to stage 3;
+1c (byte-exact wide keccak cross-check) is an independent test-add.
+
+**NEXT: 棒 2 — two children in one 2^19 rectangle** (`m4interior.rs`:
+`two_child_schedule` + `build_interior_trace`; both children's lanes + opvs bound;
+`interior_two_child_satisfies` via `check_constraints` ~8 GB; per-child tamper
+negatives) → 棒 3 (merge digest) → stage 3 (two-child peak-RSS vs 32 GB gate).
 
 **Original remaining-list (1b-2…1b-5), now partly superseded above** — spec'd by
 the investigation report's §3 site list + §4 sketch. The AIR's `eval` and the
