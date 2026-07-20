@@ -507,6 +507,25 @@ impl GateShape {
         (0..self.n_fri_rounds()).map(|r| self.log_max - cum[r + 1]).collect()
     }
 
+    /// Block-index one-hot width (`BIDX` width): must give a distinct slot to
+    /// every block of the largest flush that uses per-block `bidxsel` — i.e.
+    /// every obs flush EXCEPT F2 (index 2), which is handled specially via
+    /// `f2sel`+`blklast`. `= max(non-F2 flush_blocks) + 1` (the +1 is the
+    /// saturation sink). Narrow: max(5,3,3,3,3,3,3)+1 = 6; wide F0=28 → 29.
+    /// (Wide F0's 28 distinct-Pv blocks each need their own shsel selector, so
+    /// bidx must address all of them — the 1b-B5 fix.)
+    pub(crate) fn bidx_width(&self) -> usize {
+        let fb = self.flush_blocks();
+        let m = fb
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != 2)
+            .map(|(_, &b)| b)
+            .max()
+            .unwrap_or(0);
+        m + 1
+    }
+
     /// Per-query program length in perms (`QSLOTS`): trace leaf+path, quotient
     /// leaf+path, and per fold round a leaf (4·2^la ext words) + path. Leaf
     /// perms = ceil(words/34) (keccak rate 34 u32 words/block).
@@ -1006,6 +1025,7 @@ pub(crate) struct GateLayout {
     pub(crate) blklast: usize,
     pub(crate) blkinv: usize,
     pub(crate) bidx: usize,
+    pub(crate) bidx_width: usize,
     pub(crate) cmpa: usize,
     pub(crate) cmpai: usize,
     pub(crate) cmpb: usize,
@@ -1167,7 +1187,8 @@ impl GateLayout {
         let blklast = blkcnt + 1;
         let blkinv = blklast + 1;
         let bidx = blkinv + 1;
-        let cmpa = bidx + 6;
+        let bidx_width = s.bidx_width();
+        let cmpa = bidx + bidx_width;
         let cmpai = cmpa + 1;
         let cmpb = cmpai + 1;
         let cmpbi = cmpb + 1;
@@ -1274,7 +1295,7 @@ impl GateLayout {
             lbnz0, lbi0, lonz0, loi0, lbnz1, lbi1, lonz1, loi1, oreg, pbit, obit,
             fsbits, fsacc, fsp3a, fsp3b, fst7, fsinv, fsnz, fsaccept, fsgate,
             fsodd, fsfull, grp, coef, curch, crot, grot, chal, fa2, znreg, idxr,
-            fring, blkcnt, blklast, blkinv, bidx, cmpa, cmpai, cmpb, cmpbi, needl,
+            fring, blkcnt, blklast, blkinv, bidx, bidx_width, cmpa, cmpai, cmpb, cmpbi, needl,
             refsel, shsel, phc, phq, qsel, qcnt, qcw, qcwi, pr, pd, rsel, mlo, mhi,
             msel, dlo, dhi, drnd, dbit, glc, grc, caps8, idxb, cz2, cz7, cf, cx0,
             cx1, pos, consz, consf, asm0, asm1, vc, vce, pbuf, hit, gpb, lfs, preg,
@@ -2108,7 +2129,7 @@ where
             .when_first_row()
             .assert_eq(cv(self.layout.blkcnt), c(self.consts.flush_blocks[0] as u32));
         builder.when_first_row().assert_one(cv(self.layout.bidx));
-        for i in 1..6 {
+        for i in 1..self.layout.bidx_width {
             builder.when_first_row().assert_zero(cv(self.layout.bidx + i));
         }
         builder.when_first_row().assert_zero(cv(self.layout.refsel));
@@ -2195,11 +2216,16 @@ where
             // continuation, hold otherwise (query/dup phases).
             let newf = sf(23) * (b0next.clone() + nv(self.layout.refsel));
             let cont = cv(self.layout.cont);
-            for i in 0..6 {
-                let rot = match i {
-                    0 => AB::Expr::ZERO,
-                    5 => cv(self.layout.bidx + 4) + cv(self.layout.bidx + 5),
-                    _ => cv(self.layout.bidx + i - 1),
+            let bw = self.layout.bidx_width;
+            for i in 0..bw {
+                // saturating shift: slot 0 <- 0, top slot accumulates (sticks),
+                // else slot i <- slot i-1. Narrow bw=6 reproduces the old match.
+                let rot = if i == 0 {
+                    AB::Expr::ZERO
+                } else if i == bw - 1 {
+                    cv(self.layout.bidx + bw - 2) + cv(self.layout.bidx + bw - 1)
+                } else {
+                    cv(self.layout.bidx + i - 1)
                 };
                 t.assert_eq(
                     nv(self.layout.bidx + i),
@@ -3566,7 +3592,7 @@ struct Regs {
     // flush automaton
     fring: usize,
     blkcnt: u32,
-    bidx: usize, // saturating at 5
+    bidx: usize, // saturating at bidx_width-1 (narrow 5, wide 28)
     refsel: bool,
     // draw automaton
     phd: bool,
@@ -3764,7 +3790,7 @@ fn write_row(
             w(v, inv, (Val::from_u32(regs.blkcnt) - Val::from_u32(tgt)).inverse());
         }
     }
-    wb(v, layout.bidx + regs.bidx.min(5), true);
+    wb(v, layout.bidx + regs.bidx.min(layout.bidx_width - 1), true);
     wb(v, layout.refsel, regs.refsel);
     // layout.shsel (derived; assert against the plan).
     if regs.phc && !regs.refsel {
@@ -3773,8 +3799,11 @@ fn write_row(
             let si = shsel_index(&fb, *flush, *block);
             // Consistency of the automaton-derived shape with the plan. BLKCNT
             // counts down from flush_blocks[fring] to 1, so the automaton's
-            // block index = flush_blocks[fring] - blkcnt (exact, non-saturating
-            // even for the wide F0's 28 blocks; the bidx one-hot saturates).
+            // block index = flush_blocks[fring] - blkcnt (exact). Post-1b-B5 the
+            // bidx one-hot addresses all non-F2 blocks (width = max non-F2
+            // flush_blocks + 1), so bidxsel(block) is a valid per-block selector
+            // for the wide F0's 28 blocks too (F2's 855 still saturate at the
+            // top slot — F2 uses f2sel/blklast, not per-block bidxsel).
             let auto_block = fb[regs.fring] - regs.blkcnt as usize;
             let derived = shsel_index(&fb, regs.fring, auto_block);
             assert_eq!(si, derived, "shape drift at flush {flush} block {block}");
@@ -4605,7 +4634,7 @@ pub(crate) fn build_gate_trace(
                     }
                     Some(PInfo::Obs { .. }) => {
                         regs.blkcnt -= 1;
-                        regs.bidx = (regs.bidx + 1).min(5);
+                        regs.bidx = (regs.bidx + 1).min(layout.bidx_width - 1);
                     }
                     Some(PInfo::Refill) => {
                         regs.refsel = true;
@@ -5049,6 +5078,7 @@ mod tests {
         assert_eq!(l.blklast, BLKLAST);
         assert_eq!(l.blkinv, BLKINV);
         assert_eq!(l.bidx, BIDX);
+        assert_eq!(l.bidx_width, 6, "narrow bidx one-hot width");
         assert_eq!(l.cmpa, CMPA);
         assert_eq!(l.cmpai, CMPAI);
         assert_eq!(l.cmpb, CMPB);
@@ -5190,6 +5220,7 @@ mod tests {
         assert_eq!(w.flush_blocks(), vec![28, 3, 855, 3, 3, 3, 3]);
         assert_eq!(w.n_shapes_obs(), 46);
         assert_eq!(w.qslots(), 165);
+        assert_eq!(w.bidx_width(), 29, "wide F0=28 blocks → bidx must address all + 1 sink");
     }
 
     /// TEMP: byte-parse cross-check of the zeta-opening obs stream.
@@ -5851,15 +5882,16 @@ mod tests {
     /// and the relocated `M_FIN`/`xfin` carry actually hold on real wide data.
     /// `check_constraints` only (no full prove); the RSS gate is stage 3.
     ///
-    /// IGNORED (2026-07-19): the wide trace BUILDS and (after 1b-B4's log_max
-    /// generalization) `check_constraints` now runs the full symbolic pass — no
-    /// more OOB. The remaining wide gap is a genuine constraint mismatch:
-    /// `check_constraints` reports **row 0 constraints #4174, #4176, #4179 not
-    /// satisfied** (a first-row / boundary assertion that is narrow-specific).
-    /// Slice 1b-B5 must map those constraint indices to their eval source and
-    /// generalize them for wide. Enable this test once wide check passes.
+    /// IGNORED (2026-07-19): the wide trace BUILDS and `check_constraints` runs
+    /// the full symbolic pass. Peel-the-onion within check_constraints:
+    /// 1b-B4 cleared the M_X1 OOB; 1b-B5 (bidx widening) cleared the row-0 F0
+    /// shsel failures (#4174/76/79). Now advances to **row 42216: constraints
+    /// #3735/#3739 not satisfied** (earlier eval region than the shsel-def; a
+    /// non-first-row general/transition constraint — next slice 1b-B6 diagnoses
+    /// via `get_symbolic_constraints(new_with_shape(wide()))`). Enable this test
+    /// once wide check passes.
     #[test]
-    #[ignore = "1b-4: wide check_constraints fails on row-0 constraints #4174/#4176/#4179 (first-row/boundary); needs slice 1b-B5"]
+    #[ignore = "1b-4: wide check_constraints advances to row 42216 constraints #3735/#3739; needs slice 1b-B6"]
     fn interior_single_child_satisfies() {
         let _g = heavy_lock();
         let (leaf, opvs) = crate::m4treerec::leaf_proof();
