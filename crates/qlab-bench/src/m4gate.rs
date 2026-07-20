@@ -959,9 +959,18 @@ const FPI: usize = CONSZ7 + 1; // 16: final-poly coefficient index one-hot
 const CSEL: usize = FPI + 16; // 1: child-boundary re-anchor selector (2b)
 const FRGM: usize = CSEL + 1; // 1: fring-rotation gate sf(23)·b0next (2b-iii)
 const BCBD: usize = FRGM + 1; // 1: blkcnt update delta (2b-iii)
+// -- interior per-child opvs routing (2d) ------------------------------------
+// `CHI` is the running child selector (0 across child L's rows, 1 across child
+// R's), derived from `csel` by a pinned transition (chi_next = chi + csel_next)
+// with chi[0]=0. `CC` (cap_len cols) materializes `chi·caps8` so the cap
+// comparison can select each child's OWN half of the doubled `opvsL ++ opvsR`
+// public values at deg ≤ 3. Both are INERT for narrow / single-wide
+// (n_children = 1): unpinned, unread, filled 0 — narrow byte-identical.
+const CHI: usize = BCBD + 1; // 1: running child selector (interior only)
+const CC: usize = CHI + 1; // CAP_LEN: materialized chi·caps8 (cap-half select)
 
-const GATE_COLS: usize = BCBD + 1 - GB;
-pub(crate) const GATE_WIDTH: usize = BCBD + 1;
+const GATE_COLS: usize = CC + CAP_LEN - GB;
+pub(crate) const GATE_WIDTH: usize = CC + CAP_LEN;
 
 /// Runtime mirror of the column-offset chain above, computed from a
 /// [`GateShape`] instead of the top-of-file `const`s. `from_shape(narrow())`
@@ -1136,6 +1145,11 @@ pub(crate) struct GateLayout {
     /// so their `(1-csel_next)`-gated carries stay ≤ deg 3.
     pub(crate) frgm: usize,
     pub(crate) bcbd: usize,
+    /// Interior per-child opvs routing (2d): `chi` = running child selector
+    /// (0 = child L rows, 1 = child R rows), `cc` (cap_len cols) = materialized
+    /// `chi·caps8` for the cap-half select. Inert for narrow / single-wide.
+    pub(crate) chi: usize,
+    pub(crate) cc: usize,
     pub(crate) gate_cols: usize,
     pub(crate) gate_width: usize,
 }
@@ -1307,8 +1321,10 @@ impl GateLayout {
         let csel = fpi + 16;
         let frgm = csel + 1;
         let bcbd = frgm + 1;
-        let gate_cols = bcbd + 1 - gb;
-        let gate_width = bcbd + 1;
+        let chi = bcbd + 1;
+        let cc = chi + 1;
+        let gate_cols = cc + s.cap_len - gb;
+        let gate_width = cc + s.cap_len;
 
         GateLayout {
             mul_off, add_off, gb, w0c, w1c, hb0, hb1, ta0, topa0, ta1, topa1,
@@ -1323,7 +1339,7 @@ impl GateLayout {
             invzn, xreg, xfin, runev, f2dig, phd, cmpc, cmpci, czd, chlive, f2sel,
             pg_a, phg, phdend, cont, eg_a, endg, xsel, qadv, cfull, m3, rlo, rhi,
             dmux, snl, glo, ghi, gf, bpm, n_fhg, fhg, prega, cpa, cpb, cpl, consz7,
-            fpi, csel, frgm, bcbd, gate_cols, gate_width,
+            fpi, csel, frgm, bcbd, chi, cc, gate_cols, gate_width,
         }
     }
 }
@@ -1667,11 +1683,22 @@ pub(crate) struct VerifierGateAir {
     /// Column layout derived from `shape`; `eval` reads every column offset
     /// from here instead of the top-of-file `const`s.
     pub(crate) layout: GateLayout,
+    /// Number of child proofs verified in one rectangle (2d). `1` = the leaf /
+    /// single-wide gate (byte-identical to pre-2d); `> 1` = the interior node,
+    /// which takes `n_children · n_opvs` public values (`opvsL ++ opvsR ++ …`)
+    /// and routes each child's cap comparison to its own half via `chi`/`cc`.
+    pub(crate) n_children: usize,
 }
 
 impl VerifierGateAir {
     pub(crate) fn new() -> Self {
         Self::new_with_shape(GateShape::narrow())
+    }
+
+    /// The M4 interior node: a `wide()`-shape verifier over TWO stacked children
+    /// with per-child opvs routing enabled (2d).
+    pub(crate) fn new_interior() -> Self {
+        Self { n_children: 2, ..Self::new_with_shape(GateShape::wide()) }
     }
 
     /// Build a verifier gate for an arbitrary inner-proof `shape`, deriving the
@@ -1687,6 +1714,7 @@ impl VerifierGateAir {
             consts,
             shape,
             layout,
+            n_children: 1,
         }
     }
 }
@@ -1696,7 +1724,7 @@ impl<F: Field> BaseAir<F> for VerifierGateAir {
         self.layout.gate_width
     }
     fn num_public_values(&self) -> usize {
-        self.shape.n_opvs()
+        self.shape.n_opvs() * self.n_children
     }
 }
 
@@ -2092,8 +2120,32 @@ where
                 t.assert_zero(sf(23) * nv(self.layout.grc) * (nv(pcol(16 + m)) - cv(ocol(m))));
             }
         }
+        // Interior per-child opvs routing (2d). `route` only for n_children > 1;
+        // narrow / single-wide are byte-identical (chi/cc unpinned + unread).
+        // `chi` is the running child selector: 0 across child L, 1 across child
+        // R. Pinned bool, chi[row 0] = 0, and a transition `chi_next = chi +
+        // csel_next` that rises exactly at the (soundness-pinned) child boundary
+        // — so chi is fully determined, not prover-chosen. `cc[j] = chi·caps8[j]`
+        // is materialized so the cap-half select below stays deg ≤ 3.
+        let route = self.n_children > 1;
+        let n_opvs = self.shape.n_opvs();
+        if route {
+            builder.assert_bool(cv(self.layout.chi));
+            builder.when_first_row().assert_zero(cv(self.layout.chi));
+            builder
+                .when_transition()
+                .assert_zero(nv(self.layout.chi) - cv(self.layout.chi) - nv(self.layout.csel));
+            for j in 0..self.shape.cap_len {
+                builder.assert_zero(
+                    cv(self.layout.cc + j) - cv(self.layout.chi) * cv(self.layout.caps8 + j),
+                );
+            }
+        }
         // Cap comparison at the last path level of each batch (trace, quotient,
-        // then one per FRI round). Shape-driven so wide (3 rounds) skips F3.
+        // then one per FRI round). Shape-driven so wide (3 rounds) skips F3. For
+        // the interior each child's caps must match ITS OWN half of the doubled
+        // `opvsL ++ opvsR` public values: `pvL + chi·(pvR - pvL)`, folded through
+        // the materialized `cc = chi·caps8` to keep the constraint deg ≤ 3.
         let plast_roles: Vec<u32> = [R_PLAST_T, R_PLAST_Q]
             .into_iter()
             .chain((0..self.shape.n_fri_rounds()).map(|r| self.shape.r_plast_f(r)))
@@ -2102,7 +2154,11 @@ where
             for m in 0..16 {
                 let mut mux = AB::Expr::ZERO;
                 for j in 0..self.shape.cap_len {
-                    mux = mux + cv(self.layout.caps8 + j) * pv(cap_limb_opv(bi, j, m));
+                    let idx = cap_limb_opv(bi, j, m);
+                    mux = mux + cv(self.layout.caps8 + j) * pv(idx);
+                    if route {
+                        mux = mux + cv(self.layout.cc + j) * (pv(n_opvs + idx) - pv(idx));
+                    }
                 }
                 builder.assert_zero(sf(23) * cv(self.layout.rsel + *role as usize) * (cv(ocol(m)) - mux));
             }
@@ -4991,10 +5047,13 @@ pub(crate) fn build_interior_trace(
     }
     drop(keccak);
 
-    // 2c handles same-leaf children (single opvs). Distinct children (2d) add
-    // per-child opvs routing; guard so a mismatched pair is caught here.
-    assert_eq!(opvs_l, opvs_r, "2c is same-leaf; distinct children land in 2d");
-    let opvs = outer_pvs(sched_l, opvs_l, shape);
+    // 2d per-child opvs: the interior's public values are `outer_pvs(L) ++
+    // outer_pvs(R)` (each = that child's caps + inner PVs). Child R's cap
+    // comparison selects the second half via the `chi`/`cc` routing in `eval`;
+    // same-leaf children just have identical halves. Verified against the
+    // `new_interior()` AIR (num_public_values = 2·n_opvs).
+    let mut opvs = outer_pvs(sched_l, opvs_l, shape);
+    opvs.extend(outer_pvs(sched_r, opvs_r, shape));
     let mut meta = GateMeta {
         query_rows: vec![],
         field_draws: vec![],
@@ -5021,6 +5080,14 @@ pub(crate) fn build_interior_trace(
     for row in 24 * (nl + nr)..rows {
         write_row(&mut values, row, row % 24, &regs, &program, None, &layout, shape);
         values[row * layout.gate_width + layout.hit] = Val::from_bool(regs.vc % 16 == 0);
+    }
+    // 2d: `chi` = running child selector. 0 across child L (rows 0..24·nL,
+    // already zero-initialized), 1 across child R and the pad tail (rows
+    // 24·nL..). The pinned transition `chi_next = chi + csel_next` rises exactly
+    // at the csel child boundary (row 24·nL). `cc = chi·caps8` is filled by
+    // fill_derived, so chi must be set first.
+    for row in (24 * nl)..rows {
+        values[row * layout.gate_width + layout.chi] = Val::ONE;
     }
     fill_derived(&mut values, &layout, shape);
     (RowMajorMatrix::new(values, layout.gate_width), meta)
@@ -5187,6 +5254,12 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout, shape: &GateShape) {
         values[base + layout.cpb] = values[base + layout.phd] * values[base + layout.cmpb];
         values[base + layout.cpl] = values[base + layout.phd] * values[base + layout.blklast];
         values[base + layout.consz7] = values[base + layout.cz7] * values[base + layout.pos + 1];
+        // 2d: cc[j] = chi·caps8[j] (cap-half select). chi is pre-filled by the
+        // trace builder (0 for single-child / child L, 1 for child R); narrow → 0.
+        let chi_v = values[base + layout.chi];
+        for j in 0..shape.cap_len {
+            values[base + layout.cc + j] = chi_v * values[base + layout.caps8 + j];
+        }
     }
 
     // 2b-iii: materialize the fring-rotation gate (frgm = sf(23)·b0next) and the
@@ -5547,6 +5620,8 @@ mod tests {
         assert_eq!(l.csel, CSEL);
         assert_eq!(l.frgm, FRGM);
         assert_eq!(l.bcbd, BCBD);
+        assert_eq!(l.chi, CHI);
+        assert_eq!(l.cc, CC);
         assert_eq!(l.gate_cols, GATE_COLS);
         assert_eq!(l.gate_width, GATE_WIDTH);
     }
@@ -5591,12 +5666,12 @@ mod tests {
         assert_eq!(w.n_flush_entries(), 8);
         assert_eq!(w.n_fhg(), 21);
         assert_eq!(w.drnd_width(), 5);
-        // F2 = 32 + 16·(2·tw + qw); tw = GATE_WIDTH (3629 with csel+frgm+bcbd) →
-        // 116288 (was 116192 at bare tw=3626). All other flushes are tw-independent.
-        assert_eq!(w.flush_bytes(), vec![3676, 288, 116288, 288, 288, 288, 304]);
-        // F2 blocks = 116288/136 + 1 = 856 (crossed the 136-byte boundary vs the
-        // bare-tw 855 as csel+frgm+bcbd widened the leaf).
-        assert_eq!(w.flush_blocks(), vec![28, 3, 856, 3, 3, 3, 3]);
+        // F2 = 32 + 16·(2·tw + qw); tw = GATE_WIDTH (3638 with csel+frgm+bcbd +
+        // 2d's chi+cc[8]) → 116576. All other flushes are tw-independent.
+        assert_eq!(w.flush_bytes(), vec![3676, 288, 116576, 288, 288, 288, 304]);
+        // F2 blocks = 116576/136 + 1 = 858 (two more than the 856 at tw=3629 as
+        // the 9 routing columns widened the leaf).
+        assert_eq!(w.flush_blocks(), vec![28, 3, 858, 3, 3, 3, 3]);
         assert_eq!(w.n_shapes_obs(), 46);
         assert_eq!(w.qslots(), 165);
         assert_eq!(w.bidx_width(), 29, "wide F0=28 blocks → bidx must address all + 1 sink");
@@ -5665,15 +5740,22 @@ mod tests {
     #[test]
     fn constraint_degree_within_budget() {
         use p3_air::symbolic::{get_symbolic_constraints, AirLayout};
-        let air = VerifierGateAir::new();
-        let layout = AirLayout::from_air::<Val>(&air);
-        let cs = get_symbolic_constraints::<Val, _>(&air, layout);
-        let max = cs.iter().map(|c| c.degree_multiple()).max().unwrap_or(0);
-        assert!(
-            max <= 3,
-            "verifier gate AIR max constraint degree {max} > 3 (deg-3 house rule \
-             — the bench quotient sizing assumes it; see dump_constraint)"
-        );
+        // Both the leaf/narrow AIR and the 2d interior AIR (per-child opvs
+        // routing enabled: the deg-3 cap-half mux + deg-2 chi/cc pins) must
+        // stay within the deg-3 house rule.
+        for (name, air) in [
+            ("narrow", VerifierGateAir::new()),
+            ("interior", VerifierGateAir::new_interior()),
+        ] {
+            let layout = AirLayout::from_air::<Val>(&air);
+            let cs = get_symbolic_constraints::<Val, _>(&air, layout);
+            let max = cs.iter().map(|c| c.degree_multiple()).max().unwrap_or(0);
+            assert!(
+                max <= 3,
+                "{name} verifier gate AIR max constraint degree {max} > 3 (deg-3 \
+                 house rule — the bench quotient sizing assumes it; see dump_constraint)"
+            );
+        }
     }
 
     /// Diagnostic (relay debugging): dump a constraint's referenced columns
@@ -6421,10 +6503,6 @@ mod tests {
         let _g = heavy_lock();
         let (sl, sr, ol, or) = crate::m4interior::two_child_schedule(false);
         let (trace, meta) = build_interior_trace(&sl, &sr, &ol, &or, &GateShape::wide(), 0);
-        check_constraints(
-            &VerifierGateAir::new_with_shape(GateShape::wide()),
-            &trace,
-            &meta.opvs,
-        );
+        check_constraints(&VerifierGateAir::new_interior(), &trace, &meta.opvs);
     }
 }
