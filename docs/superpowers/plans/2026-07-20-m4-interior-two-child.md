@@ -184,6 +184,17 @@ git commit -m "feat(m4gate): constraint-pinned csel child-boundary re-anchor + d
   degree ≤3 throughout; materialized columns update flush_bytes[2] + the layout
   reproduce-consts test.
 
+  **2b-iii + 2c DONE (2026-07-20, `f63c92a`→`a37d6be`). TWO-CHILD SAT.** The
+  boundary carries were resolved exactly per the two-pronged plan, and the full
+  2^19 two-child rectangle is `check_constraints`-SAT (`interior_two_child_satisfies`
+  un-ignored, passes). Peel history: 250 → (qsel gate) → (fill-continuity for
+  oreg/fold-arith) 73 → (chal/idxr/curch inherit + grp/coef gate) 4 → (phc/phd/phq
+  gate) 3 → (fring/blkcnt gate via materialized frgm/bcbd) 0. Degree ≤3 held
+  (frgm=sf(23)·b0next deg2, bcbd=blkcnt-delta deg3, filled next-row in
+  fill_derived). GATE_WIDTH 3626→3629; flush_blocks[2] 855→856. m4gate suite 41
+  passed, all narrow byte-identical. **NEXT: 2d (distinct children + per-lane
+  negatives, PR-gate) → 棒 3 (merge) → stage 3 (RSS).**
+
   Earlier general note:
   suppression `(1-csel_next)·carry` only *matters* where csel_next=1 (two children
   only), so it is untestable standalone. Plan: build 2c's `build_interior_trace`
