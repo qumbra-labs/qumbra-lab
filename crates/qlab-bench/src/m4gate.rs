@@ -5441,6 +5441,16 @@ mod tests {
         .is_err()
     }
 
+    /// `is_unsat_wide` against the interior AIR (`new_interior()`: doubled opvs
+    /// + per-child routing). Used by the two-child per-lane negatives (2d-4).
+    fn is_unsat_interior(trace: RowMajorMatrix<Val>, opvs: Vec<Val>) -> bool {
+        std::thread::spawn(move || {
+            check_constraints(&VerifierGateAir::new_interior(), &trace, &opvs);
+        })
+        .join()
+        .is_err()
+    }
+
     /// M4 step 1 stage 2, slice 1a-i: `GateShape::narrow()` must reproduce the
     /// shipped leaf gate's const block byte-for-byte, and `wide()` must carry
     /// the interior target shape from `m4treerec` / the stage-1 run doc. This
@@ -6527,5 +6537,54 @@ mod tests {
         let (sl, sr, ol, or) = wide_shared_distinct();
         let (trace, meta) = build_interior_trace(sl, sr, ol, or, &GateShape::wide(), 0);
         check_constraints(&VerifierGateAir::new_interior(), &trace, &meta.opvs);
+    }
+
+    /// 2d-4 (PR-gate): per-child + distinct tamper negatives. Build ONE interior
+    /// trace over DISTINCT children, clone-per-probe, and assert each single-cell
+    /// tamper is UNSAT under `new_interior()`. Together they prove BOTH lanes are
+    /// bound (not just child L) and that the 2d-2 routing binds child R to its
+    /// OWN opvs half (a misroute reading child L's half would leave the child-R
+    /// opvs tamper SAT):
+    ///  (a) child-L opening  — the L lane's query opening is bound;
+    ///  (b) child-R opening  — the R lane is bound independently (rows ≥ 24·nL);
+    ///  (c) child-R opvs      — child R reads the SECOND half of opvsL ++ opvsR.
+    #[test]
+    fn interior_two_child_negatives() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let l = GateLayout::from_shape(&shape);
+        let w = l.gate_width;
+        let one = Val::ONE;
+        let nq = shape.nq;
+        let n_opvs = shape.n_opvs();
+
+        let (base_trace, meta) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        let base_opvs = meta.opvs.clone();
+        // query_rows records child L's nq queries first (absolute rows < 24·nL),
+        // then child R's (rows ≥ 24·nL) — one push per query, in emit order.
+        assert_eq!(meta.query_rows.len(), 2 * nq, "both children's queries recorded");
+        let qr_l = meta.query_rows[0];
+        let qr_r = meta.query_rows[nq];
+        assert!(qr_l < qr_r, "child R queries live in the upper row-stacked region");
+
+        let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>, &mut Vec<Val>)| {
+            let mut trace = base_trace.clone();
+            let mut o = base_opvs.clone();
+            mutate(&mut trace, &mut o);
+            assert!(is_unsat_interior(trace, o), "expected UNSAT (interior): {label}");
+        };
+
+        probe("child-L opening: q0 preimage limb0", &|t, _o| {
+            t.values[qr_l * w + pcol(0)] += one;
+        });
+        probe("child-R opening: q0 preimage limb0", &|t, _o| {
+            t.values[qr_r * w + pcol(0)] += one;
+        });
+        probe("child-R opvs: cap0 all-digest limb0 (second half)", &|_t, o| {
+            for j in 0..shape.cap_len {
+                o[n_opvs + cap_limb_opv(0, j, 0)] += one;
+            }
+        });
     }
 }
