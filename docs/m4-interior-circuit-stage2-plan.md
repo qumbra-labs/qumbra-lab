@@ -453,17 +453,34 @@ the `0..19` dmux path-direction loops (eval ~1866 / fill ~3710) and the
   **BUILD-BLOCKER CHAIN CLEARED — the wide trace now BUILDS fully** (no panic/OOB
   anywhere in build + the full symbolic `check_constraints` pass). Work shifts
   from "make it build" to "make it satisfy":
-  - **1b-B5 — row-0 constraint mismatch (NEW next blocker).** Wide
-    `check_constraints` reports **row 0: constraints #4174, #4176, #4179 not
-    satisfied** (`p3-air check_constraints.rs:499`; narrow 37/37 still green) —
-    a first-row/boundary assertion that is narrow-specific. Diagnose by mapping
-    those constraint indices to `eval` source (the `dump_constraint` test
-    ~m4gate.rs:4118 enumerates by index; or count `builder.assert_*` in eval
-    order), then generalize for wide. Likely `when_first_row` asserts
-    (qsel/qcnt/phc/phq ~1801, blkcnt=flush_blocks[0], or M_X1/first-perm setup).
-    Fixing may reveal further unsatisfied rows (check_constraints reports only
-    the first failing row). Then enable the 1b-4 test → wide single-child SAT →
-    1b-5 wide negatives → 棒 2 / 棒 3 / stage 3.
+  - **1b-B5 — row-0 constraint mismatch: DIAGNOSED (root cause nailed,
+    symbolically, no prove).** Wide `check_constraints` reports **row 0:
+    constraints #4174/#4176/#4179 unsatisfied**. Diagnosed via
+    `get_symbolic_constraints` on `new_with_shape(wide())` (deg 3, no FIRST/TRANS
+    flag): they are the **shsel-definition constraints for F0 blocks 7 / 9 / 12**
+    — `shsel[F0_b] == chlive · ringsel(0) · bidxsel(b)` (eval ~2069), where
+    `bidxsel(b) = cv(self.layout.bidx + b)`. **Root cause: `bidx` is a width-6
+    saturating one-hot, but wide F0 has 28 blocks** (narrow F0 = 5, so narrow's
+    `bidxsel(b≤4)` stays inside bidx's 6 slots; F2's 148/855 blocks are handled
+    specially via `f2sel`+`blklast`, not per-block bidxsel). For wide,
+    `bidxsel(b≥6)` reads OOB into neighbouring columns: b=7→`cmpai`(3073),
+    b=9→`cmpbi`(3075), b=12→`shsel[0]`(3078) — all nonzero on row 0 → mismatch
+    (blocks 6/8/10/11 hit row-0-zero columns, so check_constraints only surfaced
+    7/9/12). This is the "positional-Pv" gap 1b-B1 flagged: F0's 28 blocks each
+    carry a distinct Pv mosaic → each needs a distinct shsel selector → bidx must
+    address all of them, but it caps at 6.
+    **FIX (structural, ≈1b-B1 scale):** make `bidx` width shape-derived to cover
+    the largest non-F2 flush's block count — `max over non-F2 flushes of
+    flush_blocks + 1` (narrow max=5 → 6, byte-identical; wide max(F0)=28 → 29) —
+    and de-saturate / shape-drive its block-index automaton (first-row,
+    transition rotation, saturation cap) so `bidxsel(b)` is a valid per-block
+    indicator for b up to 28. Layout note: widening bidx shifts all columns after
+    it *for wide only* (narrow bidx stays 6 → narrow byte-identical). Also audit
+    the `ring_at(fring, 8, ·)` sites (1746/2050/3752/4769/4772) — the `8` is the
+    fring rotation modulus (= n_obs_flushes; narrow 8, wide 7); confirm whether
+    the fill uses mod-8-physical (consistent, leave) or must be shape-derived.
+    Then re-run wide `check_constraints` (may reveal further rows), enable the
+    1b-4 test → wide single-child SAT → 1b-5 wide negatives → 棒 2 / 棒 3 / stage 3.
 - **… likely more** surface as each is cleared. Each is moderate circuit work
   (narrow suite green + wide-build-advances-further as the per-slice gate); the
   whole chain is the "≈ fold-pipeline build" scope the 1b-4 finding flagged.
