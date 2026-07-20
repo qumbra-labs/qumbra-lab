@@ -481,6 +481,29 @@ the `0..19` dmux path-direction loops (eval ~1866 / fill ~3710) and the
     the fill uses mod-8-physical (consistent, leave) or must be shape-derived.
     Then re-run wide `check_constraints` (may reveal further rows), enable the
     1b-4 test → wide single-child SAT → 1b-5 wide negatives → 棒 2 / 棒 3 / stage 3.
+
+    **check_constraints peel-the-onion progress (wide 1b-4, row it fails at →):**
+    - B5 (`90c3f48`) bidx one-hot width shape-derived (narrow 6 / wide 29) →
+      cleared row-0 F0 shsel (#4174/76/79). Diagnosis in `feb897f`.
+    - B6 (`0ee68e1`) caps8 fill `idx>>19` → `idx>>(log_max-cap_height)` (the
+      fill-side counterpart to B4's eval cap-element); + a `WIDE=1 CIDX=n
+      cargo test dump_constraint` toggle to inspect wide-AIR constraint indices.
+      Cleared row 42216 (#3735/39). **fring `ring_at(...,8,...)` `8` = physical
+      ring size, consistent fill+eval → LEAVE (confirmed).**
+    - B7 (`e45ea9d`) DRND selector loop `0..6` + `fold_dp` drnd+2..+5 →
+      `drnd_width()` / `0..n_fri_rounds` (wide drnd+5 = dbit OOB). Cleared row
+      44808 (#3620).
+    - Each B5–B7: narrow 37/37 byte-identical. Wide fail row advanced
+      **0 → 42216 → 44808 → 200616 (~76% of the 2^18 trace)**.
+    - **NEXT: 1b-B8 — row 200616, constraint #5187** = the fold-leaf **VC/HIT
+      value-counter** region (touches vc[0..15], hit, glo/ghi GPB pair products)
+      — a deeper fold-pipeline subsystem, likely NOT a width hardcoding; diagnose
+      *why* wide fails (read the VC/HIT eval + fold-leaf value-matching), not just
+      what it touches. **The M_HORN/RUNEV endpoint region (Option A, soundness-
+      critical) is past row 200616 and not yet check-validated** — expect more
+      fold-region layers before wide SAT. Diagnose: `WIDE=1 CIDX=5187 cargo test
+      dump_constraint -- --nocapture` (colname prints NARROW names — map raw
+      indices against the WIDE GateLayout the toggle dumps).
 - **… likely more** surface as each is cleared. Each is moderate circuit work
   (narrow suite green + wide-build-advances-further as the per-slice gate); the
   whole chain is the "≈ fold-pipeline build" scope the 1b-4 finding flagged.
