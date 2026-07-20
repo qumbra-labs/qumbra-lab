@@ -221,6 +221,12 @@ pub(crate) struct GateShape {
     /// leaf commits at b4 (`log_blowup = 2`, inner deg bits 16). Drives
     /// `g_trace = two_adic_generator(log_max - log_blowup)`.
     pub(crate) log_blowup: usize,
+    /// Whether this shape hosts the interior merge lane (棒 3): the `wide()`
+    /// interior appends a keccak merge sponge over the two children's opvs and
+    /// needs the merge region-pin / sponge-phase / digest-carry columns. The
+    /// shipped leaf `narrow()` never merges, so its layout omits them entirely →
+    /// narrow gate_width unchanged → byte-identical.
+    pub(crate) merge_lane: bool,
 }
 
 impl GateShape {
@@ -237,6 +243,7 @@ impl GateShape {
             log_arities: vec![4, 4, 4, 2],
             cap_len: 8,
             log_blowup: 4, // b16
+            merge_lane: false,
         }
     }
 
@@ -261,7 +268,22 @@ impl GateShape {
             log_arities: vec![4, 4, 4],
             cap_len: 8,
             log_blowup: 2, // b4 (AGG_CFG)
+            merge_lane: true,
         }
+    }
+
+    /// Merge-lane permutation count (棒 3): child-L opvs sponge + child-R opvs
+    /// sponge + one root perm. Each child sponge hashes that child's OWN opvs =
+    /// the interior's inner public values (`n_pvs` — e.g. the leaf's 852), NOT
+    /// the interior's outer `n_opvs`; `n_pvs·4` bytes at rate 136 (pad10*1 →
+    /// `bytes/136 + 1` blocks). 0 for shapes without a merge lane. Must equal
+    /// `m4interior::merge_perm_inputs(..).len()`.
+    pub(crate) fn merge_perms(&self) -> usize {
+        if !self.merge_lane {
+            return 0;
+        }
+        let blocks = self.n_pvs * 4 / 136 + 1;
+        2 * blocks + 1
     }
 
     /// Number of FRI commit-phase rounds.
@@ -1150,6 +1172,13 @@ pub(crate) struct GateLayout {
     /// `chi·caps8` for the cap-half select. Inert for narrow / single-wide.
     pub(crate) chi: usize,
     pub(crate) cc: usize,
+    /// Interior merge lane (棒 3-2), WIDE-ONLY (absent for narrow → gate_width
+    /// unchanged → byte-identical). `mreg` = monotone merge-region flag (1 on the
+    /// last `24·nm` rows, where the merge sponge perms sit); `mcnt` = running
+    /// count of `mreg` pinned `== 24·nm` at `last_row`, positively forcing the
+    /// region to be exactly those rows (so a prover cannot shrink/move it).
+    pub(crate) mreg: usize,
+    pub(crate) mcnt: usize,
     pub(crate) gate_cols: usize,
     pub(crate) gate_width: usize,
 }
@@ -1323,8 +1352,14 @@ impl GateLayout {
         let bcbd = frgm + 1;
         let chi = bcbd + 1;
         let cc = chi + 1;
-        let gate_cols = cc + s.cap_len - gb;
-        let gate_width = cc + s.cap_len;
+        // 棒 3-2 merge-lane region-pin columns, WIDE-ONLY: mreg + mcnt. narrow
+        // (merge_lane false) adds 0 width and leaves the offsets unused (eval /
+        // fill touch them only when n_children > 1, i.e. the wide interior).
+        let mreg = cc + s.cap_len;
+        let mcnt = mreg + 1;
+        let merge_cols = if s.merge_lane { 2 } else { 0 };
+        let gate_cols = cc + s.cap_len + merge_cols - gb;
+        let gate_width = cc + s.cap_len + merge_cols;
 
         GateLayout {
             mul_off, add_off, gb, w0c, w1c, hb0, hb1, ta0, topa0, ta1, topa1,
@@ -1339,7 +1374,7 @@ impl GateLayout {
             invzn, xreg, xfin, runev, f2dig, phd, cmpc, cmpci, czd, chlive, f2sel,
             pg_a, phg, phdend, cont, eg_a, endg, xsel, qadv, cfull, m3, rlo, rhi,
             dmux, snl, glo, ghi, gf, bpm, n_fhg, fhg, prega, cpa, cpb, cpl, consz7,
-            fpi, csel, frgm, bcbd, chi, cc, gate_cols, gate_width,
+            fpi, csel, frgm, bcbd, chi, cc, mreg, mcnt, gate_cols, gate_width,
         }
     }
 }
@@ -2142,6 +2177,22 @@ where
                 builder.assert_zero(
                     cv(self.layout.cc + j) - cv(self.layout.chi) * cv(self.layout.caps8 + j),
                 );
+            }
+            // 棒 3-2 merge-region pin (positively forces the last 24·nm rows to be
+            // the merge sponge, so the merge-binding constraints — 棒 3-2b/c —
+            // cannot be dodged by dropping the region). `mreg` monotone 0→1;
+            // `mcnt` running count of mreg, pinned == 24·nm at last_row.
+            let nmr = (24 * self.shape.merge_perms()) as u32;
+            builder.assert_bool(cv(self.layout.mreg));
+            builder.when_first_row().assert_zero(cv(self.layout.mreg));
+            builder.when_first_row().assert_eq(cv(self.layout.mcnt), cv(self.layout.mreg));
+            builder.when_last_row().assert_eq(cv(self.layout.mcnt), c(nmr));
+            {
+                let mut t = builder.when_transition();
+                // monotone: once mreg = 1 it stays 1 (merge region is a suffix).
+                t.assert_zero(cv(self.layout.mreg) * (AB::Expr::ONE - nv(self.layout.mreg)));
+                // running count: mcnt_next = mcnt + mreg_next.
+                t.assert_zero(nv(self.layout.mcnt) - cv(self.layout.mcnt) - nv(self.layout.mreg));
             }
         }
         // Cap comparison at the last path level of each batch (trace, quotient,
@@ -5037,17 +5088,26 @@ pub(crate) fn build_interior_trace(
 
     // One keccak lane over both children (child L then child R) then the merge
     // sponge (棒 3): child-L opvs digest, child-R opvs digest, root perm. The
+    // merge perms are placed at the TRACE END (child L | child R | zero-pad |
+    // merge) so the root perm's last row is the rectangle's `last_row` — the
+    // clean anchor for the merge-region pin (mreg/mcnt) in `eval` (棒 3-2). The
     // merge perms are valid keccak-f (KeccakAir checks them); their preimages
-    // are bound to the public values in 棒3-2 (eval binding).
+    // are bound to the public values in 棒 3-2 (eval binding).
     let merge_inputs = crate::m4interior::merge_perm_inputs(opvs_l, opvs_r);
     let nm = merge_inputs.len();
+    assert_eq!(nm, shape.merge_perms(), "merge perm count matches shape");
+    let real = nl + nr + nm;
+    let rows = (real * 24).next_power_of_two();
+    let total_perms = rows / 24;
+    let zero_pad = total_perms - real; // zero perms BETWEEN child R and merge
     let mut all_inputs = cd_l.inputs.clone();
     all_inputs.extend_from_slice(&cd_r.inputs);
+    all_inputs.extend(std::iter::repeat([0u64; 25]).take(zero_pad));
     all_inputs.extend_from_slice(&merge_inputs);
+    assert_eq!(all_inputs.len(), total_perms, "lane exactly fills the rectangle");
     let keccak = p3_keccak_air::generate_trace_rows::<Val>(all_inputs, 0);
-    let rows = keccak.height();
-    let expected_rows = ((nl + nr + nm) * 24).next_power_of_two();
-    assert_eq!(rows, expected_rows, "interior rectangle height (nl={nl} nr={nr} nm={nm})");
+    assert_eq!(keccak.height(), rows, "no implicit keccak padding (merge is last)");
+    let merge_start = rows - 24 * nm; // first row of the merge region
     let mut values = Vec::with_capacity((rows << extra_capacity_bits) * layout.gate_width);
     values.resize(rows * layout.gate_width, Val::ZERO);
     for r in 0..rows {
@@ -5100,6 +5160,22 @@ pub(crate) fn build_interior_trace(
     // fill_derived, so chi must be set first.
     for row in (24 * nl)..rows {
         values[row * layout.gate_width + layout.chi] = Val::ONE;
+    }
+    // 棒 3-2 merge-region pin: `mreg` = 1 on the last 24·nm rows (the merge
+    // sponge), `mcnt` = running count of mreg (so mcnt[last_row] == 24·nm). The
+    // eval pins mreg monotone + mcnt == 24·nm at last_row, positively forcing the
+    // region to be exactly the merge perms (a prover cannot drop/move it).
+    if shape.merge_lane {
+        let w = layout.gate_width;
+        let mut cnt = 0u32;
+        for row in 0..rows {
+            let m = row >= merge_start;
+            if m {
+                cnt += 1;
+                values[row * w + layout.mreg] = Val::ONE;
+            }
+            values[row * w + layout.mcnt] = Val::from_u32(cnt);
+        }
     }
     fill_derived(&mut values, &layout, shape);
     (RowMajorMatrix::new(values, layout.gate_width), meta)
@@ -6622,5 +6698,46 @@ mod tests {
             "interior root == keccak-merge(digest(opvsL), digest(opvsR))"
         );
         check_constraints(&VerifierGateAir::new_interior(), &trace, &meta.opvs);
+    }
+
+    /// 棒 3-2a: the merge-region pin (mreg monotone + mcnt == 24·nm at last_row)
+    /// positively forces the last 24·nm rows to BE the merge sponge. Tampering
+    /// the region (drop a mreg=1 / bump the counter) must be UNSAT — otherwise a
+    /// prover could shrink/relocate the region and dodge the merge binding
+    /// (棒 3-2b/c). Merge is at the trace end so the root perm's last row is
+    /// `last_row`.
+    #[test]
+    fn interior_neg_merge_region() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let l = GateLayout::from_shape(&shape);
+        let w = l.gate_width;
+        let one = Val::ONE;
+        let nm = shape.merge_perms();
+        let (base, _m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        let rows = base.values.len() / w;
+        let merge_start = rows - 24 * nm;
+
+        let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>)| {
+            let mut t = base.clone();
+            mutate(&mut t);
+            let o = _m.opvs.clone();
+            assert!(is_unsat_interior(t, o), "expected UNSAT (region): {label}");
+        };
+        // Drop the merge-region flag on its first row → running-count transition
+        // breaks (and mcnt no longer reaches 24·nm at last_row).
+        probe("drop mreg at region start", &|t| {
+            t.values[merge_start * w + l.mreg] -= one;
+        });
+        // Bump the region counter at the last row → mcnt != 24·nm.
+        probe("bump mcnt at last_row", &|t| {
+            t.values[(rows - 1) * w + l.mcnt] += one;
+        });
+        // Raise mreg early (before the region) → monotone says it must then stay
+        // 1, but it's 0 right after → UNSAT (also over-counts mcnt).
+        probe("spurious mreg before region", &|t| {
+            t.values[(merge_start - 48) * w + l.mreg] += one;
+        });
     }
 }
