@@ -248,7 +248,11 @@ impl GateShape {
     /// outer public-value count `N_OPVS` (852 = 6*8*16 + 84).
     pub(crate) fn wide() -> Self {
         Self {
-            tw: 3626,
+            // The interior verifies a LEAF proof whose committed trace width is
+            // the narrow gate rectangle width. Derive it (not hardcode 3626) so
+            // any gate-column addition — csel (2b), degree-reduction cols, merge
+            // cols (棒 3) — auto-tracks into the interior's opened-row width.
+            tw: GATE_WIDTH,
             qw: 8,
             n_pvs: N_OPVS, // the leaf gate's opvs become the interior's inner PVs
             nq: 40,
@@ -952,9 +956,10 @@ const CPL: usize = CPB + 1; // PHD·BLKLAST (A2 capture: dup last block N-1; nar
 // F7 final-poly coefficients; CONSZ7 = CZ7·POS1 its completion flag.
 const CONSZ7: usize = CPL + 1; // CZ7 · POS1 (final-poly value completion)
 const FPI: usize = CONSZ7 + 1; // 16: final-poly coefficient index one-hot
+const CSEL: usize = FPI + 16; // 1: child-boundary re-anchor selector (2b)
 
-const GATE_COLS: usize = FPI + 16 - GB;
-pub(crate) const GATE_WIDTH: usize = FPI + 16;
+const GATE_COLS: usize = CSEL + 1 - GB;
+pub(crate) const GATE_WIDTH: usize = CSEL + 1;
 
 /// Runtime mirror of the column-offset chain above, computed from a
 /// [`GateShape`] instead of the top-of-file `const`s. `from_shape(narrow())`
@@ -1119,6 +1124,11 @@ pub(crate) struct GateLayout {
     pub(crate) cpl: usize,
     pub(crate) consz7: usize,
     pub(crate) fpi: usize,
+    /// Child-boundary re-anchor selector (2b): 1 on the first row of each child's
+    /// first perm (row 0 for single-child; row 0 and 24*nL for the two-child
+    /// interior). Constraint-pinned (option B, completion-gated) so a prover
+    /// cannot re-anchor mid-child. Appended last → narrow offsets unchanged.
+    pub(crate) csel: usize,
     pub(crate) gate_cols: usize,
     pub(crate) gate_width: usize,
 }
@@ -1287,8 +1297,9 @@ impl GateLayout {
         let cpl = cpb + 1;
         let consz7 = cpl + 1;
         let fpi = consz7 + 1;
-        let gate_cols = fpi + 16 - gb;
-        let gate_width = fpi + 16;
+        let csel = fpi + 16;
+        let gate_cols = csel + 1 - gb;
+        let gate_width = csel + 1;
 
         GateLayout {
             mul_off, add_off, gb, w0c, w1c, hb0, hb1, ta0, topa0, ta1, topa1,
@@ -1303,7 +1314,7 @@ impl GateLayout {
             invzn, xreg, xfin, runev, f2dig, phd, cmpc, cmpci, czd, chlive, f2sel,
             pg_a, phg, phdend, cont, eg_a, endg, xsel, qadv, cfull, m3, rlo, rhi,
             dmux, snl, glo, ghi, gf, bpm, n_fhg, fhg, prega, cpa, cpb, cpl, consz7,
-            fpi, gate_cols, gate_width,
+            fpi, csel, gate_cols, gate_width,
         }
     }
 }
@@ -1920,6 +1931,28 @@ where
         builder.when_first_row().assert_eq(cv(self.layout.qcnt), c(self.shape.qslots() as u32));
         builder.when_first_row().assert_one(cv(self.layout.phc));
         builder.when_first_row().assert_zero(cv(self.layout.phq));
+        // =====================================================================
+        // Child-boundary re-anchor selector (2b, option B: completion-gated).
+        // self.layout.csel = 1 on the first row of each child's first perm (row 0
+        // for a single child; row 0 and 24*nL for the two-child interior). It
+        // DRIVES the per-child re-anchor of the automaton (the first-row anchors
+        // and the cross-perm carries key on it, added in 2b-ii/iii). Soundness:
+        // csel is boolean, pinned to 1 at trace row 0, and may only RISE where
+        // the previous perm completed a child's query phase (self.layout.endg =
+        // sf(23)*eg_a, which fires exactly once per child at the last query's
+        // last block r=23). A prover therefore cannot set csel=1 mid-child to
+        // truncate that child's verification: csel_next requires endg on the
+        // current row, and endg is 0 everywhere except the genuine child end.
+        // (The final qsel→nq rotation is the boundary transition itself and is
+        // suppressed there, so `qsel==nq` is NOT a usable signal — endg is.)
+        // Narrow (single child) has csel=1 only at row 0 (≡ first_row), so the
+        // existing constraint verdicts are unchanged.
+        builder.assert_bool(cv(self.layout.csel));
+        builder.when_first_row().assert_one(cv(self.layout.csel));
+        {
+            let mut t = builder.when_transition();
+            t.assert_zero(nv(self.layout.csel) * (AB::Expr::ONE - cv(self.layout.endg)));
+        }
         // self.layout.qcw comparator: self.layout.qcnt == 1.
         builder.assert_bool(cv(self.layout.qcw));
         builder.assert_zero((cv(self.layout.qcnt) - AB::Expr::ONE) * cv(self.layout.qcw));
@@ -4029,6 +4062,9 @@ fn emit_child(
     let mut regs = Regs::new(shape);
     regs.fsfull = hosted.get(&0).map_or(false, |d| d.len() == 8);
     let mut zvi = 0usize;
+    // Child-boundary re-anchor selector (2b): 1 on this child's first row.
+    // Single child → row 0; interior → row 0 (child L) and 24*nL (child R).
+    values[row_offset * layout.gate_width + layout.csel] = Val::ONE;
     for pi in 0..n_perms {
         let info = &infos[pi];
         let base_row = 24 * pi;
@@ -5090,8 +5126,10 @@ mod tests {
         assert_eq!(n.path_levels(), PATH_LEVELS.to_vec());
 
         // Wide interior target (from m4treerec::AGG_CFG + stage-1 run doc).
+        // tw = the leaf's committed width = GATE_WIDTH (3626 base + gate columns
+        // added since: csel etc.), derived so column additions auto-track.
         let w = GateShape::wide();
-        assert_eq!(w.tw, 3626, "leaf wide row width");
+        assert_eq!(w.tw, GATE_WIDTH, "leaf wide row width = leaf gate width");
         assert_eq!(w.qw, 8, "leaf wide quotient words/query");
         assert_eq!(w.n_pvs, N_OPVS, "interior inner PVs = leaf gate opvs");
         assert_eq!(w.n_pvs, 6 * 8 * 16 + 84, "= 852");
@@ -5249,6 +5287,7 @@ mod tests {
         assert_eq!(l.cpl, CPL);
         assert_eq!(l.consz7, CONSZ7);
         assert_eq!(l.fpi, FPI);
+        assert_eq!(l.csel, CSEL);
         assert_eq!(l.gate_cols, GATE_COLS);
         assert_eq!(l.gate_width, GATE_WIDTH);
     }
@@ -5293,7 +5332,9 @@ mod tests {
         assert_eq!(w.n_flush_entries(), 8);
         assert_eq!(w.n_fhg(), 21);
         assert_eq!(w.drnd_width(), 5);
-        assert_eq!(w.flush_bytes(), vec![3676, 288, 116192, 288, 288, 288, 304]);
+        // F2 = 32 + 16·(2·tw + qw); tw = GATE_WIDTH (3627 with csel) → 116224
+        // (was 116192 at tw=3626). All other flushes are tw-independent.
+        assert_eq!(w.flush_bytes(), vec![3676, 288, 116224, 288, 288, 288, 304]);
         assert_eq!(w.flush_blocks(), vec![28, 3, 855, 3, 3, 3, 3]);
         assert_eq!(w.n_shapes_obs(), 46);
         assert_eq!(w.qslots(), 165);
@@ -5876,6 +5917,21 @@ mod tests {
         assert_unsat(move |t, _o, qr, _fd| {
             let row = qr[0];
             t.values[row * w + IDXR] += Val::ONE;
+        });
+    }
+
+    /// csel child-boundary pin (2b, option B: completion-gated). On the
+    /// single-child narrow trace csel is 1 only at row 0; a prover must not be
+    /// able to re-anchor the automaton mid-child. Setting csel=1 on an interior
+    /// query row is UNSAT: the transition gate `csel_next·(1-endg)==0` fires
+    /// because `endg` (last-query end) is 0 on the row before a query start.
+    /// This is the soundness gate the coordinator flagged; it binds before any
+    /// two-child trace exists.
+    #[test]
+    fn gate_neg_csel_narrow() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            t.values[qr[0] * w + CSEL] += Val::ONE;
         });
     }
 
