@@ -465,6 +465,39 @@ blueprint + the hard constraint discovered:
   consensus-critical part) gets that adversarial review there; land 3-2a/3-2b on
   the branch with positive + tamper negatives, do not self-certify soundness.
 
+- **⭐⭐ SIMPLIFICATION (2026-07-20 analysis) — ROOT-BINDING-ONLY drops the ~89-col
+  message binding.** The per-block `msh` message binding (`preimage == pv(opvs)`)
+  gives *unconditional* (constraint-level) "sponge input == opvs". But merge
+  soundness is already achievable *computationally* (keccak preimage resistance —
+  the standard bar for a hash-based system) with FAR less machinery:
+  1. **Capacity chain** — each merge perm's input capacity (`pcol` 68..100) ==
+     the previous perm's output capacity (`ocol` 68..100), reset to 0 at each
+     sponge start (child-L b0, child-R b0, root). This makes the merge perms a
+     genuine iterated sponge rather than independent keccak-f blocks.
+  2. **`dL/dR → root perm`** — root perm preimage 0..16 == child-L sponge's last
+     `ocol` 0..16, 16..32 == child-R's; 32.. = pad consts.
+  3. **Root squeeze == `pv(root)`** — root perm `ocol` 0..16 == `pv(2·n_opvs+k)`.
+  Argument: (1)+(2)+(3) force the trace's sponge output == the fixed public
+  `pv(root)` = `merge_root(honest opvsL, opvsR)`. A valid keccak sponge hitting a
+  fixed digest ⇒ its message == the honest preimage (preimage resistance) ⇒ the
+  free rate messages == opvsL/opvsR. The cap comparison independently binds
+  `pv(opvsL/opvsR)` to the children, so `pv(root)` (block-body-supplied) being
+  `merge_root(pv(opvs))` closes the loop. **No `msh` per-block one-hot, no rate
+  binding.** Markers needed shrink from `nm≈89` to ~5 WIDE-ONLY columns: `mreg`
+  (region) + `mcnt` (pin) + a `sponge-start` flag (the 3 reset perms) + `dL/dR`
+  source-perm flags + a root-perm flag — all at FIXED offsets within the merge
+  region (derivable from `mcnt`).
+  **Tradeoff:** relies on keccak preimage resistance (already the system's
+  security foundation) rather than a constraint-level bind. **Flag for coordinator
+  soundness review** — if they want the unconditional bind, add the `msh` message
+  binding back (the ~89-col path above). Recommend root-binding-only: standard for
+  hash-based, far cheaper, keeps the tree-merge (spec C4) intact.
+  **Even simpler alt (if coordinator OK deviating from C4's tree-merge):** a FLAT
+  sponge over `opvsL ‖ opvsR` → root (one continuous chain, ONE reset, root = last
+  perm output) needs only `mreg` + root-perm flag (~3 cols) — but redefines 棒 3-1's
+  `merge_root` (currently tree `keccak(keccak(opvsL)‖keccak(opvsR))`) + updates
+  `interior_merge_native`. Keep tree-merge unless the coordinator prefers flat.
+
 - [ ] **Step 2: Failing merge-binds test.**
 ```rust
 #[test]
