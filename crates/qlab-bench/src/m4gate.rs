@@ -1827,9 +1827,7 @@ where
 
         // Ring pin + rotation (one limb per perm while in query phase).
         for i in 0..self.shape.qslots() {
-            builder
-                .when_first_row()
-                .assert_eq(cv(self.layout.pr + i), c(self.program[i]));
+            builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.pr + i) - (c(self.program[i]))));
         }
         {
             let g = sf(23) * phq.clone();
@@ -1923,14 +1921,11 @@ where
         // Query scheduling: self.layout.qsel ring, self.layout.qcnt countdown, phase handoff/exit
         // =====================================================================
         for i in 0..=self.shape.nq {
-            builder.when_first_row().assert_eq(
-                cv(self.layout.qsel + i),
-                if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO },
-            );
+            builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.qsel + i) - (if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO })));
         }
-        builder.when_first_row().assert_eq(cv(self.layout.qcnt), c(self.shape.qslots() as u32));
-        builder.when_first_row().assert_one(cv(self.layout.phc));
-        builder.when_first_row().assert_zero(cv(self.layout.phq));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.qcnt) - (c(self.shape.qslots() as u32))));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.phc) - AB::Expr::ONE));
+        builder.assert_zero(cv(self.layout.csel) * cv(self.layout.phq));
         // =====================================================================
         // Child-boundary re-anchor selector (2b, option B: completion-gated).
         // self.layout.csel = 1 on the first row of each child's first perm (row 0
@@ -2156,36 +2151,38 @@ where
         }
 
         // First-row pins for the challenger phase.
-        builder.when_first_row().assert_one(cv(self.layout.fring));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.fring) - AB::Expr::ONE));
         for i in 1..8 {
-            builder.when_first_row().assert_zero(cv(self.layout.fring + i));
+            builder.assert_zero(cv(self.layout.csel) * cv(self.layout.fring + i));
         }
-        builder
-            .when_first_row()
-            .assert_eq(cv(self.layout.blkcnt), c(self.consts.flush_blocks[0] as u32));
-        builder.when_first_row().assert_one(cv(self.layout.bidx));
+        // blkcnt (flush-automaton block counter) is per-transcript state → must
+        // re-anchor to flush_blocks[0] at each child start (csel), not only row 0.
+        builder.assert_zero(
+            cv(self.layout.csel) * (cv(self.layout.blkcnt) - c(self.consts.flush_blocks[0] as u32)),
+        );
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.bidx) - AB::Expr::ONE));
         for i in 1..self.layout.bidx_width {
-            builder.when_first_row().assert_zero(cv(self.layout.bidx + i));
+            builder.assert_zero(cv(self.layout.csel) * cv(self.layout.bidx + i));
         }
-        builder.when_first_row().assert_zero(cv(self.layout.refsel));
-        builder.when_first_row().assert_one(cv(self.layout.grp));
+        builder.assert_zero(cv(self.layout.csel) * cv(self.layout.refsel));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.grp) - AB::Expr::ONE));
         for i in 1..self.shape.n_groups() {
-            builder.when_first_row().assert_zero(cv(self.layout.grp + i));
+            builder.assert_zero(cv(self.layout.csel) * cv(self.layout.grp + i));
         }
-        builder.when_first_row().assert_one(cv(self.layout.coef));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.coef) - AB::Expr::ONE));
         for i in 1..4 {
-            builder.when_first_row().assert_zero(cv(self.layout.coef + i));
+            builder.assert_zero(cv(self.layout.csel) * cv(self.layout.coef + i));
         }
-        builder.when_first_row().assert_zero(cv(self.layout.phd));
-        builder.when_first_row().assert_one(cv(self.layout.pos));
-        builder.when_first_row().assert_zero(cv(self.layout.pos + 1));
-        builder.when_first_row().assert_one(cv(self.layout.vc));
+        builder.assert_zero(cv(self.layout.csel) * cv(self.layout.phd));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.pos) - AB::Expr::ONE));
+        builder.assert_zero(cv(self.layout.csel) * cv(self.layout.pos + 1));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.vc) - AB::Expr::ONE));
         for i in 1..16 {
-            builder.when_first_row().assert_zero(cv(self.layout.vc + i));
+            builder.assert_zero(cv(self.layout.csel) * cv(self.layout.vc + i));
         }
         for k in 0..4 {
-            builder.when_first_row().assert_zero(cv(self.layout.preg + k) - if k == 0 { AB::Expr::ONE } else { AB::Expr::ZERO });
-            builder.when_first_row().assert_zero(cv(self.layout.pzacc + k));
+            builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.preg + k) - if k == 0 { AB::Expr::ONE } else { AB::Expr::ZERO }));
+            builder.assert_zero(cv(self.layout.csel) * cv(self.layout.pzacc + k));
         }
 
         // =====================================================================
@@ -2453,13 +2450,13 @@ where
             }
             // First-row pins: no challenge assembled yet.
             for k in 0..4 {
-                builder.when_first_row().assert_zero(cv(self.layout.curch + k));
+                builder.assert_zero(cv(self.layout.csel) * cv(self.layout.curch + k));
             }
             for k in 0..4 * self.shape.n_chals() {
-                builder.when_first_row().assert_zero(cv(self.layout.chal + k));
+                builder.assert_zero(cv(self.layout.csel) * cv(self.layout.chal + k));
             }
             for q in 0..self.shape.nq {
-                builder.when_first_row().assert_zero(cv(self.layout.idxr + q));
+                builder.assert_zero(cv(self.layout.csel) * cv(self.layout.idxr + q));
             }
             // sample_bits (query indices): value = low self.shape.log_max (=22) bits of
             // the draw = self.layout.fsacc (bits 0..16) + self.layout.fsbits[0..6] << 16. No rejection.
@@ -3224,9 +3221,9 @@ where
                 (0..16).map(|i| cv(self.layout.fpi + i)).fold(AB::Expr::ZERO, |a, e| a + e),
                 AB::Expr::ONE,
             );
-            builder.when_first_row().assert_one(cv(self.layout.fpi));
+            builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.fpi) - AB::Expr::ONE));
             for i in 1..16 {
-                builder.when_first_row().assert_zero(cv(self.layout.fpi + i));
+                builder.assert_zero(cv(self.layout.csel) * cv(self.layout.fpi + i));
             }
             let vfp = [cv(self.layout.asm0), cv(self.layout.asm1), cv(self.layout.w0c), cv(self.layout.w1c)];
             {
