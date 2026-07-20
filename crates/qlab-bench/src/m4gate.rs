@@ -1724,7 +1724,10 @@ impl<F: Field> BaseAir<F> for VerifierGateAir {
         self.layout.gate_width
     }
     fn num_public_values(&self) -> usize {
-        self.shape.n_opvs() * self.n_children
+        // Interior (n_children > 1): the two consumed child opvs halves + the
+        // 棒 3 merge root (§2 exposed binding value).
+        let merge = if self.n_children > 1 { crate::m4interior::MERGE_ROOT_LIMBS } else { 0 };
+        self.shape.n_opvs() * self.n_children + merge
     }
 }
 
@@ -5032,13 +5035,19 @@ pub(crate) fn build_interior_trace(
     let nl = cd_l.inputs.len();
     let nr = cd_r.inputs.len();
 
-    // One keccak lane over both children (child L then child R).
+    // One keccak lane over both children (child L then child R) then the merge
+    // sponge (棒 3): child-L opvs digest, child-R opvs digest, root perm. The
+    // merge perms are valid keccak-f (KeccakAir checks them); their preimages
+    // are bound to the public values in 棒3-2 (eval binding).
+    let merge_inputs = crate::m4interior::merge_perm_inputs(opvs_l, opvs_r);
+    let nm = merge_inputs.len();
     let mut all_inputs = cd_l.inputs.clone();
     all_inputs.extend_from_slice(&cd_r.inputs);
+    all_inputs.extend_from_slice(&merge_inputs);
     let keccak = p3_keccak_air::generate_trace_rows::<Val>(all_inputs, 0);
     let rows = keccak.height();
-    let expected_rows = ((nl + nr) * 24).next_power_of_two();
-    assert_eq!(rows, expected_rows, "interior rectangle height (nl={nl} nr={nr})");
+    let expected_rows = ((nl + nr + nm) * 24).next_power_of_two();
+    assert_eq!(rows, expected_rows, "interior rectangle height (nl={nl} nr={nr} nm={nm})");
     let mut values = Vec::with_capacity((rows << extra_capacity_bits) * layout.gate_width);
     values.resize(rows * layout.gate_width, Val::ZERO);
     for r in 0..rows {
@@ -5054,11 +5063,14 @@ pub(crate) fn build_interior_trace(
     // `new_interior()` AIR (num_public_values = 2·n_opvs).
     let mut opvs = outer_pvs(sched_l, opvs_l, shape);
     opvs.extend(outer_pvs(sched_r, opvs_r, shape));
+    // 棒 3: the interior's exposed binding value = the merge root (§2), appended
+    // after the two consumed child opvs halves.
+    opvs.extend(crate::m4interior::merge_root(opvs_l, opvs_r));
     let mut meta = GateMeta {
         query_rows: vec![],
         field_draws: vec![],
         trailer_row: 24 * cd_l.trailer_pi,
-        n_perms: nl + nr,
+        n_perms: nl + nr + nm,
         opvs: opvs.clone(),
     };
 
@@ -6586,5 +6598,29 @@ mod tests {
                 o[n_opvs + cap_limb_opv(0, j, 0)] += one;
             }
         });
+    }
+
+    /// 棒 3-1: the interior's public values carry the merge root
+    /// `keccak(keccak(opvsL) ‖ keccak(opvsR))` (§2) appended after the two
+    /// consumed child-opvs halves, and the merge sponge perms are valid keccak-f
+    /// (check_constraints SAT). This slice lands the NATIVE merge + the exposed
+    /// root; the eval binding (merge preimage ↔ pv(opvs), output ↔ pv(root)) is
+    /// 棒 3-2, so the root is not yet constraint-bound to opvs here.
+    #[test]
+    fn interior_merge_native() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let n_opvs = shape.n_opvs();
+        let (trace, meta) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        // Public values are [opvsL | opvsR | merge_root]; the root tail matches
+        // the native merge, and the whole rectangle (incl. the merge perms) is SAT.
+        assert_eq!(meta.opvs.len(), 2 * n_opvs + crate::m4interior::MERGE_ROOT_LIMBS);
+        assert_eq!(
+            &meta.opvs[2 * n_opvs..],
+            &crate::m4interior::merge_root(ol, or)[..],
+            "interior root == keccak-merge(digest(opvsL), digest(opvsR))"
+        );
+        check_constraints(&VerifierGateAir::new_interior(), &trace, &meta.opvs);
     }
 }
