@@ -5422,6 +5422,15 @@ mod tests {
         })
     }
 
+    /// Cache the DISTINCT two-child pair (child L = leaf_proof, child R =
+    /// leaf_proof_variant) once — both ~12 GB leaf proves run a single time,
+    /// only the two small Schedules + opvs are retained. Shared by the distinct
+    /// SAT + per-child negative tests (2d-3/2d-4).
+    pub(crate) fn wide_shared_distinct() -> &'static (Schedule, Schedule, Vec<Val>, Vec<Val>) {
+        static CELL: OnceLock<(Schedule, Schedule, Vec<Val>, Vec<Val>)> = OnceLock::new();
+        CELL.get_or_init(|| crate::m4interior::two_child_schedule(true))
+    }
+
     /// Wide analogue of `is_unsat`: check the mutated wide trace against the
     /// `wide()`-shaped AIR in a spawned thread (panic == UNSAT == caught).
     fn is_unsat_wide(trace: RowMajorMatrix<Val>, opvs: Vec<Val>) -> bool {
@@ -6503,6 +6512,20 @@ mod tests {
         let _g = heavy_lock();
         let (sl, sr, ol, or) = crate::m4interior::two_child_schedule(false);
         let (trace, meta) = build_interior_trace(&sl, &sr, &ol, &or, &GateShape::wide(), 0);
+        check_constraints(&VerifierGateAir::new_interior(), &trace, &meta.opvs);
+    }
+
+    /// 2d-3 (HARD PR-gate): the two children are DISTINCT leaf proofs (child R
+    /// from `leaf_proof_variant` — a different M3 witness → different caps +
+    /// inner PVs). Identical children (L == R) can mask cross-wiring / symmetry
+    /// bugs; only a distinct pair proves the per-child opvs routing (2d-2)
+    /// actually binds child R to the SECOND half of `opvsL ++ opvsR`. Must be
+    /// `check_constraints`-SAT (~8 GB raw trace at 2^19; no full prove).
+    #[test]
+    fn interior_two_child_satisfies_distinct() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let (trace, meta) = build_interior_trace(sl, sr, ol, or, &GateShape::wide(), 0);
         check_constraints(&VerifierGateAir::new_interior(), &trace, &meta.opvs);
     }
 }
