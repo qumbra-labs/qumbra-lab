@@ -1897,7 +1897,9 @@ where
             + cv(self.layout.rsel + R_ABS_C5 as usize)
             + cv(self.layout.rsel + R_ABS_C30 as usize);
         // DRND_j = absany * self.layout.dlo[j]  (self.layout.dlo[j] is the same 3-bit product; deg 2).
-        for j in 0..6 {
+        // Loop bound = drnd_width (narrow 6, wide 5 = 2 + n_fri_rounds); j=6 on
+        // wide would write drnd+5 = dbit (OOB), corrupting dbit's own constraint.
+        for j in 0..self.shape.drnd_width() {
             builder.assert_eq(cv(self.layout.drnd + j), absany.clone() * cv(self.layout.dlo + j));
         }
         // Leaf-start selector.
@@ -2526,8 +2528,12 @@ where
             };
             let m0 = role_range(m0w);
             let m1 = role_range(m1w);
-            // dparam split: fold leaves (D_F0..3) vs trace/quotient (D_T/D_Q).
-            let fold_dp = cv(self.layout.drnd + 2) + cv(self.layout.drnd + 3) + cv(self.layout.drnd + 4) + cv(self.layout.drnd + 5);
+            // dparam split: fold leaves (D_F0..) vs trace/quotient (D_T/D_Q).
+            // D_F rounds = drnd[2 .. 2+n_fri_rounds] (narrow 2..6, wide 2..5;
+            // drnd+5 on wide = dbit OOB).
+            let fold_dp = (0..self.shape.n_fri_rounds())
+                .map(|rf| cv(self.layout.drnd + 2 + rf))
+                .fold(AB::Expr::ZERO, |a, e| a + e);
             let nonfold_dp = cv(self.layout.drnd) + cv(self.layout.drnd + 1);
             // Query-absorb carry selectors.
             builder.assert_eq(cv(self.layout.cf), fold_dp * m0.clone());
@@ -5896,14 +5902,15 @@ mod tests {
     ///
     /// IGNORED (2026-07-19): the wide trace BUILDS and `check_constraints` runs
     /// the full symbolic pass. Peel-the-onion within check_constraints:
-    /// Peel: 1b-B4 M_X1 OOB → 1b-B5 (bidx widening) row-0 F0 shsel (#4174/76/79)
-    /// → 1b-B6 (caps8 fill `idx>>capb`) row-42216 (#3735/39) → now **row 44808:
-    /// constraint #3620** = the DRND[j] selector def looping `0..6` (narrow
-    /// drnd_width) but wide drnd_width=5, so j=5 writes drnd+5 = dbit (OOB).
-    /// Fix in 1b-B7. Diagnose wide constraints via
+    /// Peel: B4 M_X1 OOB → B5 (bidx) row-0 shsel → B6 (caps8 fill) row-42216 →
+    /// B7 (DRND loop/fold_dp `0..6`/`drnd+5` vs wide drnd_width=5) row-44808
+    /// (#3620) → now **row 200616 (~76%): constraint #5187** = the fold-leaf
+    /// VC/HIT value-counter region (touches vc[0..15], hit, glo/ghi GPB pair
+    /// products) — a deeper fold-pipeline subsystem, not a width hardcoding.
+    /// Slice 1b-B8. Diagnose via
     /// `WIDE=1 CIDX=<n> cargo test dump_constraint -- --nocapture`.
     #[test]
-    #[ignore = "1b-4: wide check_constraints advances to row 44808 constraint #3620 (DRND loop 0..6 vs wide drnd_width=5); needs slice 1b-B7"]
+    #[ignore = "1b-4: wide check_constraints advances to row 200616 constraint #5187 (fold-leaf VC/HIT region); needs slice 1b-B8"]
     fn interior_single_child_satisfies() {
         let _g = heavy_lock();
         let (leaf, opvs) = crate::m4treerec::leaf_proof();
