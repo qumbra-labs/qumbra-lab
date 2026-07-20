@@ -195,6 +195,52 @@ git commit -m "feat(m4gate): constraint-pinned csel child-boundary re-anchor + d
   passed, all narrow byte-identical. **NEXT: 2d (distinct children + per-lane
   negatives, PR-gate) → 棒 3 (merge) → stage 3 (RSS).**
 
+  **2d DONE (2026-07-20, `df02253`→`3fffb74`, 4 clean commits). DISTINCT
+  TWO-CHILD SAT + per-lane negatives (the L≠R HARD PR-gate).** Full m4gate suite
+  **43 passed / 0 failed** (136 s), all 37 narrow byte-identical, degree ≤3 for
+  BOTH narrow and interior. Slices:
+  - **2d-1** (`df02253`): `m4gaterec::{bucket_instance_seeded,consensus_proof_seeded}`
+    + `m4treerec::leaf_proof_variant` (seed `0x1234…def0`, same 2-in/2-out balanced
+    shape → distinct caps + inner PVs); `two_child_schedule(true)` wired; test
+    `variant_child_has_distinct_opvs` (opvs_l ≠ opvs_r).
+  - **2d-2** (`6642ac1`): **per-child opvs routing.** Interior public values =
+    `outer_pvs(L) ++ outer_pvs(R)`; each child's cap comparison selects its OWN
+    half. New cols `chi` (running child selector: 0=L, 1=R; pinned bool /
+    chi[0]=0 / transition `chi_next = chi + csel_next` → rises exactly at the
+    soundness-pinned csel boundary → fully determined) + `cc[cap_len]` =
+    materialized `chi·caps8` so the mux `pvL + chi·(pvR−pvL)` stays **deg 3**.
+    `VerifierGateAir.n_children` (num_public_values = n_opvs·n_children);
+    `new_interior()` = wide + 2 + routing on. `build_interior_trace` emits doubled
+    opvs + fills chi; `opvs_l==opvs_r` guard removed. **Routing is gated on
+    n_children>1 — narrow AND single-wide keep the exact pre-2d constraint
+    (route=false), so byte-identical; only the layout widened: GATE_WIDTH 3629→
+    3638, wide leaf tw→3638 → F2 116576 B / 858 blocks (pinned tests updated).**
+    Degree guard extended to cover `new_interior()`.
+    ⚠ **KEY FINDING for 棒 3 / future:** in `eval`, `pv()` public values are
+    consumed at EXACTLY ONE site — the cap comparison (m4gate.rs ~line 2129,
+    `cap_limb_opv`, caps region only). The inner-PV half of opvs (indices ≥
+    n_caps·cap_len·16) is NOT read by any constraint (it rides the FS transcript
+    via trace bytes, which is already per-child/trace-local). So "per-child opvs
+    routing" = routing the caps comparison only; there is no separate F0-PV
+    absorb constraint to route. 棒 3's merge should digest each child's opvs
+    (`aggregation-rung1 §2`) and expose the root — the child caps are already
+    bound per-child by 2d-2.
+  - **2d-3** (`e36858d`): `interior_two_child_satisfies_distinct` — DISTINCT L≠R,
+    `check_constraints`-SAT under `new_interior` (30 s @ 2^19). `wide_shared_distinct()`
+    caches the pair (both ~12 GB proves once, shared with 2d-4).
+  - **2d-4** (`3fffb74`): `interior_two_child_negatives` — one distinct trace,
+    clone-per-probe, all UNSAT: (a) child-L opening (fails row ~42k, lower), (b)
+    child-R opening independently (fails row ~243k, upper — BOTH lanes bound), (c)
+    child-R opvs 2nd half (fails cap-comparison #4076 in child-R region — routing
+    binds R to its own half). `query_rows` splits nq|nq. `is_unsat_interior` helper.
+
+  **NEXT: 棒 3 (Task 3 — merge sponge → interior root) → stage 3 (Task S3 — RSS
+  vs 32 GB).** Entry: `build_interior_trace` in `m4gate.rs` (after `emit_child`
+  ×2, before `fill_derived`); add a keccak merge over dL=digest(opvsL) /
+  dR=digest(opvsR) → `meta.opvs` root; `m4interior::merge_root`. Both children's
+  caps are already per-child-bound (2d-2), so the merge is additive. Range stays
+  locked out of stage 3's measurement until 棒 3 lands (coordinator's guard).
+
   Earlier general note:
   suppression `(1-csel_next)·carry` only *matters* where csel_next=1 (two children
   only), so it is untestable standalone. Plan: build 2c's `build_interior_trace`
@@ -270,9 +316,9 @@ git commit -m "feat(m4interior): build_interior_trace two children row-stacked (
 - Consumes: `build_interior_trace`, `is_unsat_wide`, `wide_shared`-style caching.
 - Produces: `m4treerec::leaf_proof_variant() -> (Proof<Config>, Vec<Val>)` (a leaf proof of a DISTINCT M3 input, so the two children differ).
 
-- [ ] **Step 1: `leaf_proof_variant` (distinct child).** In `m4treerec.rs`, mirror `leaf_proof` but drive `consensus_proof` with a distinct instance (e.g. a second `BucketInstance` seed) so `opvs` differ. Verify `opvs_l != opvs_r`.
+- [x] **Step 1: `leaf_proof_variant` (distinct child).** In `m4treerec.rs`, mirror `leaf_proof` but drive `consensus_proof` with a distinct instance (e.g. a second `BucketInstance` seed) so `opvs` differ. Verify `opvs_l != opvs_r`.
 
-- [ ] **Step 2: Failing per-child + distinct negatives (TDD).** Add `interior_two_child_negatives` mirroring `interior_single_child_negatives`: build one interior trace (distinct children), clone-per-probe, assert UNSAT for: tamper child-L opening (`qrL[0]` region); independently tamper child-R opening (`qrR[0]` region, i.e. rows ≥ `24*nL`); tamper child-R opvs cap. Each proves the lane it targets is bound.
+- [x] **Step 2: Failing per-child + distinct negatives (TDD).** Add `interior_two_child_negatives` mirroring `interior_single_child_negatives`: build one interior trace (distinct children), clone-per-probe, assert UNSAT for: tamper child-L opening (`qrL[0]` region); independently tamper child-R opening (`qrR[0]` region, i.e. rows ≥ `24*nL`); tamper child-R opvs cap. Each proves the lane it targets is bound.
 ```rust
 #[test]
 fn interior_two_child_negatives() {
@@ -287,13 +333,13 @@ fn interior_two_child_negatives() {
 }
 ```
 
-- [ ] **Step 3: Run, expect FAIL then implement** (extend `GateMeta` if needed so per-child query rows are distinguishable, e.g. `query_rows` already carries absolute rows — child R's are ≥ `24*nL`). Run: `cargo test --release -p qlab-bench interior_two_child_negatives -- --nocapture 2>&1 | tail -15`. Expected: all probes UNSAT → test ok.
+- [x] **Step 3: Run, expect FAIL then implement** (extend `GateMeta` if needed so per-child query rows are distinguishable, e.g. `query_rows` already carries absolute rows — child R's are ≥ `24*nL`). Run: `cargo test --release -p qlab-bench interior_two_child_negatives -- --nocapture 2>&1 | tail -15`. Expected: all probes UNSAT → test ok.
 
-- [ ] **Step 4: distinct-child SAT (PR-gate).** Also assert `interior_two_child_satisfies` passes with `two_child_schedule(true)` (add a `_distinct` variant test or parametrize). Expected: SAT with distinct children.
+- [x] **Step 4: distinct-child SAT (PR-gate).** Also assert `interior_two_child_satisfies` passes with `two_child_schedule(true)` (add a `_distinct` variant test or parametrize). Expected: SAT with distinct children.
 
-- [ ] **Step 5: Full suite green.** Run: `cargo test --release -p qlab-bench m4gate 2>&1 | tail -8`.
+- [x] **Step 5: Full suite green.** Run: `cargo test --release -p qlab-bench m4gate 2>&1 | tail -8`.
 
-- [ ] **Step 6: Commit.**
+- [x] **Step 6: Commit.**
 ```bash
 git add crates/qlab-bench/src/m4gate.rs crates/qlab-bench/src/m4treerec.rs
 git commit -m "feat(m4interior): per-child + distinct-children negatives (PR-gate: L!=R)"
