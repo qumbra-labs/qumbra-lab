@@ -389,9 +389,37 @@ blueprint + the hard constraint discovered:
   counter. **Solution (flush-automaton `shsel` pattern): a per-merge-block one-hot
   selector column `msh[b]` (b in 0..nm), builder-filled to fire on exactly merge
   perm b's row.** Then `eval` does `for b in 0..nm { emit block-b binding gated by
-  msh[b], reading pv at the FIXED indices for block b }`. `nm` new selector
-  columns (~89 full-opvs, or fewer if you hash a smaller commitment) → **width
-  cascade** (update GATE_WIDTH + wide flush geometry pins, the 2d-2 precedent).
+  msh[b], reading pv at the FIXED indices for block b }`. `nm` selector columns
+  (~89 full-opvs) + `mreg`/`mcnt` (2, the pin below).
+- **⭐ WIDTH FINDING (measured 2026-07-20): the msh/mreg/mcnt columns are
+  WIDE-ONLY → NO narrow cascade, NO flush-geometry change, narrow trivially
+  byte-identical.** `narrow.gate_width = 3638` but `wide.gate_width = 3788`
+  ALREADY differ (dump_cols probe) — the aggregation tree converges only
+  approximately (~+150 cols/level; the prototype is 2-level so it never
+  compounds). `wide().tw = GATE_WIDTH = 3638` (the leaf width the interior
+  *verifies*) is INDEPENDENT of `wide.gate_width` (the interior's own rectangle).
+  So adding `~91` columns to the WIDE layout ONLY (via a shape flag / wide-only
+  tail region) grows `wide.gate_width` (3788 → ~3879, +2.4% cells, marginal for
+  the stage-3 RSS gate) while `narrow.gate_width`, `wide().tw`, and every wide
+  flush pin stay put. Add via a `merge_lane: bool` on `GateShape` (narrow false /
+  wide true) → `merge_perms()` returns 0 for narrow, `nm` for wide; layout tail
+  `msh = cc + cap_len` with `msh_width = merge_perms()`, `gate_width = msh +
+  msh_width + 2` (mreg, mcnt). narrow `msh_width=0` → `gate_width` unchanged.
+- **⭐ POSITIVE PIN (the real soundness difficulty — msh must be FORCED to fire,
+  unlike csel): merge-at-END + `mreg`/`mcnt`.** csel's absence self-destructs
+  (automaton conflict → UNSAT); msh's absence would just make the binding vanish
+  (root unconstrained). So msh needs POSITIVE enforcement. **Place the merge perms
+  at the trace END** (restructure `build_interior_trace`: `all_inputs = childL ++
+  childR ++ [zeros; R/24 − nl − nr − nm] ++ merge`, so the root perm's last row ==
+  `last_row`; `nm`/`R` are shape constants so the merge-region start row `R−24·nm`
+  is FIXED). Pin the region with a monotone boolean `mreg` (0→1 once) + a counter
+  `mcnt` asserted `== 24·nm` at `last_row` → forces exactly the last `24·nm` rows
+  to be the merge region. The `msh` one-hot ring lives inside `mreg` (anchored:
+  `last_row` ⇒ slot `nm−1` = root perm; rotate per perm boundary `sf(23)`; zero
+  outside `mreg`). A misplaced/absent msh then either breaks `mcnt==24nm` or
+  collides with a child/pad perm's keccak → UNSAT. Verify with a **msh-tamper
+  negative** (drop the boundary 1 / add a spurious 1 → UNSAT) — do NOT trust the
+  reasoning, let the negative prove the pin.
 - **Binding families (mirror the leaf-sponge overwrite absorb):**
   1. **Message → pv (rate).** For merge perm b (a child-L opvs block, b<44):
      preimage rate lane `l` (0..17), limbs `4l..4l+4` hold opvs values `2·(34b/2+…)`.
@@ -416,12 +444,26 @@ blueprint + the hard constraint discovered:
   root mismatch → UNSAT — proves the message binding is live). Both under
   `new_interior`. Keep degree ≤ 3 (msh-gated deg-2 binds; the pair-recompose is
   linear) and the narrow suite byte-identical (msh columns inert for n_children=1).
-- **Consideration for the implementer:** decide the merge preimage = full opvs
-  (89 blocks, binds everything, matches 棒 3-1's `merge_root`) vs a smaller
-  commitment (caps-only ≈ 21 blocks, fewer selectors/cols but you'd re-define
-  `merge_root`). 棒 3-1 shipped full-opvs; keep it unless the selector-column
-  cascade proves too wide for convergence. NOTE `interior_merge_native` already
-  pins the full-opvs `merge_root`, so a redefinition also updates that test.
+- **Sub-slicing 棒 3-2 (each its own commit, TDD):**
+  - **3-2a** merge-at-END restructure of `build_interior_trace` + `mreg`/`mcnt`
+    region pin + `msh` one-hot ring (wide-only) + fill; positive SAT
+    (`interior_merge_native` still green) + **msh-tamper negative** (proves the
+    pin). No binding yet — msh gated constraints are absent, so this is a clean
+    "selector is sound" slice.
+  - **3-2b** the 4 binding families above + `interior_merge_binds_root` +
+    `interior_neg_wrong_merge` + a tamper-opvs-changes-root negative.
+- **Consideration for the implementer:** 棒 3-1 shipped **full-opvs** `merge_root`
+  (89 blocks / 89 msh cols). A smaller commitment (e.g. inner-PVs only = the
+  covered-tx digests, offset `n_caps·cap_len·16`, ~53 blocks) would cut msh
+  columns and is arguably MORE §2-faithful ("covered digests" not caps) — but
+  requires re-defining `merge_root` (and updating `interior_merge_native`, which
+  pins the full-opvs value). Since msh is wide-only (no cascade / RSS impact is
+  marginal), full-opvs is fine to keep; shrink only if the ring width is
+  unwieldy.
+- **Coordinator soundness backstop:** the plan already requires coordinator
+  independent acceptance before merge — the merge-binding soundness (the
+  consensus-critical part) gets that adversarial review there; land 3-2a/3-2b on
+  the branch with positive + tamper negatives, do not self-certify soundness.
 
 - [ ] **Step 2: Failing merge-binds test.**
 ```rust
