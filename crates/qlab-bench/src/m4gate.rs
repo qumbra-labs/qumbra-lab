@@ -4793,6 +4793,158 @@ pub(crate) fn build_gate_trace(
     (RowMajorMatrix::new(values, layout.gate_width), meta)
 }
 
+/// Per-child transcript-derived data consumed by `emit_child` (the setup half of
+/// build_gate_trace, factored so the interior builder can derive it once per
+/// child). Deterministic in (sched, shape).
+struct ChildDerived {
+    inputs: Vec<[u64; 25]>,
+    infos: Vec<PInfo>,
+    outs: Vec<[u64; 25]>,
+    hosted: std::collections::HashMap<usize, Vec<m4gaterec::DrawRec>>,
+    chal_expect: Vec<Ext>,
+    fpoly: Vec<Ext>,
+    fa: Ext,
+    zvals: Vec<Ext>,
+    trailer_pi: usize,
+}
+
+fn child_derived(sched: &Schedule, shape: &GateShape) -> ChildDerived {
+    let (inputs, infos) = lane_plan(sched, shape);
+    let outs: Vec<[u64; 25]> = inputs.iter().map(keccakf).collect();
+    let nf = sched.flushes.len();
+    let n_chal_blocks: usize = sched.flushes.iter().map(|f| f.n_blocks).sum();
+    let trailer_pi = n_chal_blocks;
+    let mut hosted: std::collections::HashMap<usize, Vec<m4gaterec::DrawRec>> =
+        std::collections::HashMap::new();
+    for d in &sched.draws {
+        let cons = if d.flush + 1 < nf {
+            sched.flushes[d.flush + 1].first_perm
+        } else {
+            trailer_pi
+        };
+        hosted.entry(cons).or_default().push(d.clone());
+    }
+    let mut chal_expect: Vec<Ext> = vec![sched.alpha, sched.zeta, sched.fri_alpha];
+    for r in 0..shape.n_fri_rounds() {
+        chal_expect.push(sched.betas[r]);
+    }
+    let to_ext = |bytes: &[u8]| -> Vec<Ext> {
+        bytes
+            .chunks(16)
+            .map(|c| {
+                Ext::from_basis_coefficients_fn(|i| {
+                    Val::from_u32(u32::from_le_bytes(c[4 * i..4 * i + 4].try_into().unwrap()))
+                })
+            })
+            .collect()
+    };
+    let fpoly = to_ext(
+        &sched
+            .obs
+            .iter()
+            .find(|o| o.label == m4gaterec::ObsLabel::FinalPoly)
+            .unwrap()
+            .bytes,
+    );
+    let mut zbytes = vec![];
+    for g in 0..3 {
+        zbytes.extend_from_slice(
+            &sched
+                .obs
+                .iter()
+                .find(|o| o.label == m4gaterec::ObsLabel::ZetaVals { group: g })
+                .unwrap()
+                .bytes,
+        );
+    }
+    let zvals = to_ext(&zbytes);
+    ChildDerived {
+        inputs,
+        infos,
+        outs,
+        hosted,
+        chal_expect,
+        fpoly,
+        fa: sched.fri_alpha,
+        zvals,
+        trailer_pi,
+    }
+}
+
+/// M4 step 1 stage 2 棒 2: assemble the two-child interior verifier rectangle —
+/// child L in rows `0..24*nL`, child R in rows `24*nL..24*(nL+nR)`, one keccak
+/// lane over both, padded to 2^19. The `csel` re-anchor (2b) restarts the
+/// automaton at each child's first row. For SAME-LEAF children `opvs_l == opvs_r`
+/// so a single outer-PV set serves both cap comparisons + F0 PV absorptions
+/// (per-child opvs routing for DISTINCT children is 2d). Correctness is checked
+/// via `check_constraints`; the full `prove` (RSS gate) is stage 3.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_interior_trace(
+    sched_l: &Schedule,
+    sched_r: &Schedule,
+    opvs_l: &[Val],
+    opvs_r: &[Val],
+    shape: &GateShape,
+    extra_capacity_bits: usize,
+) -> (RowMajorMatrix<Val>, GateMeta) {
+    let consts = gate_consts_from_shape(shape);
+    let program = qprogram_from_shape(shape);
+    let layout = GateLayout::from_shape(shape);
+    let dcap = shape.dup_captures();
+    let n_dup = shape.flush_blocks()[2];
+
+    let cd_l = child_derived(sched_l, shape);
+    let cd_r = child_derived(sched_r, shape);
+    let nl = cd_l.inputs.len();
+    let nr = cd_r.inputs.len();
+
+    // One keccak lane over both children (child L then child R).
+    let mut all_inputs = cd_l.inputs.clone();
+    all_inputs.extend_from_slice(&cd_r.inputs);
+    let keccak = p3_keccak_air::generate_trace_rows::<Val>(all_inputs, 0);
+    let rows = keccak.height();
+    let expected_rows = ((nl + nr) * 24).next_power_of_two();
+    assert_eq!(rows, expected_rows, "interior rectangle height (nl={nl} nr={nr})");
+    let mut values = Vec::with_capacity((rows << extra_capacity_bits) * layout.gate_width);
+    values.resize(rows * layout.gate_width, Val::ZERO);
+    for r in 0..rows {
+        values[r * layout.gate_width..r * layout.gate_width + NUM_KECCAK_COLS]
+            .copy_from_slice(&keccak.values[r * NUM_KECCAK_COLS..(r + 1) * NUM_KECCAK_COLS]);
+    }
+    drop(keccak);
+
+    // 2c handles same-leaf children (single opvs). Distinct children (2d) add
+    // per-child opvs routing; guard so a mismatched pair is caught here.
+    assert_eq!(opvs_l, opvs_r, "2c is same-leaf; distinct children land in 2d");
+    let opvs = outer_pvs(sched_l, opvs_l, shape);
+    let mut meta = GateMeta {
+        query_rows: vec![],
+        field_draws: vec![],
+        trailer_row: 24 * cd_l.trailer_pi,
+        n_perms: nl + nr,
+        opvs: opvs.clone(),
+    };
+
+    emit_child(
+        &mut values, 0, shape, &layout, &consts, &program, sched_l, &cd_l.inputs, &cd_l.outs,
+        &cd_l.infos, &cd_l.hosted, &cd_l.chal_expect, &cd_l.fpoly, cd_l.fa, &cd_l.zvals, &dcap,
+        n_dup, cd_l.trailer_pi, &mut meta.query_rows, &mut meta.field_draws,
+    );
+    let regs = emit_child(
+        &mut values, 24 * nl, shape, &layout, &consts, &program, sched_r, &cd_r.inputs,
+        &cd_r.outs, &cd_r.infos, &cd_r.hosted, &cd_r.chal_expect, &cd_r.fpoly, cd_r.fa,
+        &cd_r.zvals, &dcap, n_dup, cd_r.trailer_pi, &mut meta.query_rows, &mut meta.field_draws,
+    );
+
+    // Pad rows: frozen registers of the last child (mirror build_gate_trace).
+    for row in 24 * (nl + nr)..rows {
+        write_row(&mut values, row, row % 24, &regs, &program, None, &layout, shape);
+        values[row * layout.gate_width + layout.hit] = Val::from_bool(regs.vc % 16 == 0);
+    }
+    fill_derived(&mut values, &layout, shape);
+    (RowMajorMatrix::new(values, layout.gate_width), meta)
+}
+
 /// Fill the Phase-1a degree-reduction columns: pure current-row functions of
 /// already-filled columns, mirroring the defining constraints in `eval`. Kept
 /// as a post-pass so the intricate per-perm witness logic above is untouched.
@@ -6137,5 +6289,34 @@ mod tests {
         probe("xreg-chain: XREG@q0", &|t, _o| {
             t.values[q0 * w + l.xreg] += one;
         });
+    }
+
+    /// 棒 2 (2c): two child leaf proofs verified in one 2^19 rectangle (row-
+    /// stacked, csel re-anchored at the child boundary). Same-leaf children →
+    /// single opvs. `check_constraints` must pass (the two-child correctness
+    /// signal; ~8 GB raw trace, no prove). Distinct children + per-lane tamper
+    /// negatives are 2d.
+    ///
+    /// IGNORED (2026-07-20): the two-child trace BUILDS and check_constraints
+    /// passes rows 0..200614 — BOTH children's obs+dup phases and the ring-based
+    /// re-anchor. It fails at **row 200615 = child L's last row** (nl=8359 lane
+    /// perms → child R starts at 24*8359=200616): the ~250 failing TRANS
+    /// constraints are the active query-phase-end carries (qsel rotation #3673,
+    /// XOR/OREG #4450, pr ring, blkcnt, chal, pzacc/preg, runev, …) that carry
+    /// child L's state into child R's csel-anchored first row. This is slice
+    /// 2b-iii: suppress each boundary carry with `(1 - csel_next)` and
+    /// degree-reduce (flush-automaton precedent). Diagnose the family of any
+    /// index n via `WIDE=1 CIDX=n cargo test dump_constraint -- --nocapture`.
+    #[test]
+    #[ignore = "2c: two-child trace builds; check_constraints peels at the child boundary (row 200615) — needs 2b-iii carry suppression"]
+    fn interior_two_child_satisfies() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = crate::m4interior::two_child_schedule(false);
+        let (trace, meta) = build_interior_trace(&sl, &sr, &ol, &or, &GateShape::wide(), 0);
+        check_constraints(
+            &VerifierGateAir::new_with_shape(GateShape::wide()),
+            &trace,
+            &meta.opvs,
+        );
     }
 }
