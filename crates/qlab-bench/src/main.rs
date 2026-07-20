@@ -925,6 +925,12 @@ fn main() {
             m4treerec::run_m4tree(&power);
             return;
         }
+        "m4interior" => {
+            let only_pos = args.iter().position(|a| a == "--only");
+            let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
+            m4interior::run_m4interior(&power, only);
+            return;
+        }
         "m4price" => {
             m4price::run_m4price(&power);
             return;
