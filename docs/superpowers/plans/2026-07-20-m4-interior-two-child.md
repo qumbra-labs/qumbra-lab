@@ -114,7 +114,24 @@ git commit -m "feat(m4gate): constraint-pinned csel child-boundary re-anchor + d
   (flush-automaton block counter — a subagent flag caught it; it was missing from
   the initial enumeration). Left the csel self-anchor + `when_last_row` as-is.
   Degree-neutral; narrow verdicts unchanged; 40 green.
-- **2b-iii PENDING — do it EVIDENCE-DRIVEN inside 2c, not blind.** The carry
+- **2c scaffolding DONE** (`7c38898`): `child_derived` + `build_interior_trace`
+  (row-stacked, 2^19, single opvs same-leaf) + `m4interior::two_child_schedule` +
+  `mod m4interior`. Two-child `check_constraints` BUILDS and passes rows
+  0..200614 (both children's obs+dup phases + ring-based re-anchor). **nl = 8359
+  lane perms** (898 obs + 5 refill + 1 trailer + 855 dup + 6600 query) → child R
+  starts at row 200616. `interior_two_child_satisfies` `#[ignore]`'d pending
+  2b-iii.
+- **2b-iii PENDING (pinpointed) — the boundary carries at row 200615.** Two-child
+  check_constraints fails at **row 200615 = child L's last row** with ~250 TRANS
+  constraints: the active query-phase-end carries that would bleed child L's
+  state into child R's csel-anchored first row (200616). Confirmed families (via
+  `dump_constraint`): qsel ring rotation (#3673: qsel/qadv), XOR/OREG carry
+  (#4450), plus pr ring, blkcnt, chal assembly, pzacc/preg, runev, and the
+  sponge/path continuation carries. Fix: gate each with `(1 - csel_next)` in its
+  `when_transition` block; deg-3 carries × (1-csel_next) → deg 4 → materialize a
+  `(1-csel_next)`-product column. Gate: two-child check_constraints advances past
+  200615 (peel further rows as needed) → SAT; narrow suite stays 40-green; degree
+  ≤ 3. NOTE the earlier general note:
   suppression `(1-csel_next)·carry` only *matters* where csel_next=1 (two children
   only), so it is untestable standalone. Plan: build 2c's `build_interior_trace`
   first; the two-child `check_constraints` will fail at exactly the carries that
