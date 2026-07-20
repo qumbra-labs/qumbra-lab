@@ -3762,8 +3762,10 @@ fn write_row(
             wb(v, layout.idxb + k, (idx >> k) & 1 == 1);
         }
     }
-    // layout.caps8 from idx bits 19..21 (all-zero bits select element 0).
-    let capj = ((idx >> 19) & 7) as usize;
+    // layout.caps8 from the top cap_height idx bits (narrow 19..21, wide 15..17;
+    // all-zero bits select element 0). Must match the eval capb = log_max -
+    // cap_height (the 1b-B4/B5 fill-side counterpart).
+    let capj = ((idx >> (shape.log_max - shape.cap_height())) & 7) as usize;
     wb(v, layout.caps8 + if regs.phq { capj } else { 0 }, true);
     // layout.dbit / layout.glc / layout.grc.
     let pathish =
@@ -5306,7 +5308,17 @@ mod tests {
             get_symbolic_constraints, AirLayout, BaseEntry, BaseLeaf, SymbolicExpression,
         };
         use std::collections::BTreeSet;
-        let air = VerifierGateAir::new();
+        // WIDE=1 inspects the interior (wide) AIR's constraints — indices differ
+        // from narrow because eval loop bounds are shape-driven; used to
+        // diagnose the 1b-B* peel-the-onion wide check_constraints failures.
+        let shape = if std::env::var("WIDE").is_ok() {
+            let s = GateShape::wide();
+            eprintln!("WIDE GateLayout = {:?}", GateLayout::from_shape(&s));
+            s
+        } else {
+            GateShape::narrow()
+        };
+        let air = VerifierGateAir::new_with_shape(shape);
         let layout = AirLayout::from_air::<Val>(&air);
         let cs = get_symbolic_constraints::<Val, _>(&air, layout);
         let (argmax, maxdeg) = cs
@@ -5884,14 +5896,14 @@ mod tests {
     ///
     /// IGNORED (2026-07-19): the wide trace BUILDS and `check_constraints` runs
     /// the full symbolic pass. Peel-the-onion within check_constraints:
-    /// 1b-B4 cleared the M_X1 OOB; 1b-B5 (bidx widening) cleared the row-0 F0
-    /// shsel failures (#4174/76/79). Now advances to **row 42216: constraints
-    /// #3735/#3739 not satisfied** (earlier eval region than the shsel-def; a
-    /// non-first-row general/transition constraint — next slice 1b-B6 diagnoses
-    /// via `get_symbolic_constraints(new_with_shape(wide()))`). Enable this test
-    /// once wide check passes.
+    /// Peel: 1b-B4 M_X1 OOB → 1b-B5 (bidx widening) row-0 F0 shsel (#4174/76/79)
+    /// → 1b-B6 (caps8 fill `idx>>capb`) row-42216 (#3735/39) → now **row 44808:
+    /// constraint #3620** = the DRND[j] selector def looping `0..6` (narrow
+    /// drnd_width) but wide drnd_width=5, so j=5 writes drnd+5 = dbit (OOB).
+    /// Fix in 1b-B7. Diagnose wide constraints via
+    /// `WIDE=1 CIDX=<n> cargo test dump_constraint -- --nocapture`.
     #[test]
-    #[ignore = "1b-4: wide check_constraints advances to row 42216 constraints #3735/#3739; needs slice 1b-B6"]
+    #[ignore = "1b-4: wide check_constraints advances to row 44808 constraint #3620 (DRND loop 0..6 vs wide drnd_width=5); needs slice 1b-B7"]
     fn interior_single_child_satisfies() {
         let _g = heavy_lock();
         let (leaf, opvs) = crate::m4treerec::leaf_proof();
