@@ -235,11 +235,12 @@ git commit -m "feat(m4gate): constraint-pinned csel child-boundary re-anchor + d
     binds R to its own half). `query_rows` splits nq|nq. `is_unsat_interior` helper.
 
   **NEXT: 棒 3 (Task 3 — merge sponge → interior root) → stage 3 (Task S3 — RSS
-  vs 32 GB).** Entry: `build_interior_trace` in `m4gate.rs` (after `emit_child`
-  ×2, before `fill_derived`); add a keccak merge over dL=digest(opvsL) /
-  dR=digest(opvsR) → `meta.opvs` root; `m4interior::merge_root`. Both children's
-  caps are already per-child-bound (2d-2), so the merge is additive. Range stays
-  locked out of stage 3's measurement until 棒 3 lands (coordinator's guard).
+  vs 32 GB).** 棒 3-1 (native merge + exposed root) is DONE (`560377d`); the
+  remaining 棒 3-2 (eval binding of the merge preimages to `pv(opvs)` + squeeze to
+  `pv(root)` + wrong-merge negative) is the real soundness slice — see the "棒 3
+  progress" block under Task 3 for the precise blueprint (the `pv`-index-must-be-
+  constant finding → per-block `msh` selector columns). Range stays locked out of
+  stage 3's measurement until 棒 3-2 lands (coordinator's guard).
 
   Earlier general note:
   suppression `(1-csel_next)·carry` only *matters* where csel_next=1 (two children
@@ -356,7 +357,71 @@ git commit -m "feat(m4interior): per-child + distinct-children negatives (PR-gat
 - Consumes: `LaneBuilder` keccak lane, both children's public digests (`d_i` from each child's opvs / public commitment).
 - Produces: interior outer PV = `keccak-merge(dL, dR)`; `build_interior_trace` `meta.opvs` = the root digest.
 
-- [ ] **Step 1: Compute the merge in the builder.** After both `emit_child` calls, append a keccak sponge perm (or few) absorbing `(dL, dR)` → root digest; store as `meta.opvs`. `dL/dR` = each child's covered-tx digest (define as the keccak of the child's opvs, matching aggregation-rung1 §2).
+- [x] **Step 1: Compute the merge in the builder.** After both `emit_child` calls, append a keccak sponge perm (or few) absorbing `(dL, dR)` → root digest; store as `meta.opvs`. `dL/dR` = each child's covered-tx digest (define as the keccak of the child's opvs, matching aggregation-rung1 §2).
+
+### 棒 3 progress (2026-07-20)
+
+**棒 3-1 DONE (`560377d`). Native merge + exposed root (UNBOUND).** `m4interior`:
+overwrite-mode `sponge_overwrite` (leaf-sponge convention: rate overwritten,
+capacity carried, pad10*1) + `merge_root(opvsL, opvsR)` / `merge_perm_inputs` /
+`MERGE_ROOT_LIMBS=16`. `root = keccak(keccak(opvsL) ‖ keccak(opvsR))`; `dL/dR`
+serialize each child's full opvs as **u32-LE per value** (KoalaBear < p < 2^31 →
+lossless) — commits caps + covered-tx inner PVs (⊇ §2's covered digests).
+`build_interior_trace` appends the merge perms to the keccak lane (**height stays
+2^19**: nm ≈ 89 perms — child-L sponge 44 blocks + child-R 44 + root 1, each opvs
+= 1492 vals × 4 B = 5968 B → 44 blocks — fit the pad headroom), sets
+`meta.opvs = opvsL ++ opvsR ++ root`; `new_interior` `num_public_values +=
+MERGE_ROOT_LIMBS`. `interior_merge_native` asserts the root tail == native merge +
+`check_constraints` SAT. **No new columns → narrow / single-wide byte-identical**
+(merge is `build_interior_trace`-only; KeccakAir checks the merge keccak-f, but
+the preimages are NOT yet bound to `pv` — soundness-vacuous until 棒 3-2). 6
+interior tests green.
+
+**⚠ 棒 3-2 (eval binding) — the real soundness work, DELIBERATELY NOT rushed at
+session end (consensus-critical: aggregation-rung1 §3 — an interior merge-binding
+bug = silent supply inflation for syncing nodes, detectable by no one).** Precise
+blueprint + the hard constraint discovered:
+
+- **THE KEY CONSTRAINT: `pv(i)` needs a compile-time-constant index `i`** — you
+  CANNOT index public values by a trace value. But the merge perms sit at
+  *data-dependent* rows (row `24·(nl+nr) + 24·b`, and `nl` is data-dependent). So
+  the binding cannot be "on the row holding block b, bind pv(34·b+j)" via a row
+  counter. **Solution (flush-automaton `shsel` pattern): a per-merge-block one-hot
+  selector column `msh[b]` (b in 0..nm), builder-filled to fire on exactly merge
+  perm b's row.** Then `eval` does `for b in 0..nm { emit block-b binding gated by
+  msh[b], reading pv at the FIXED indices for block b }`. `nm` new selector
+  columns (~89 full-opvs, or fewer if you hash a smaller commitment) → **width
+  cascade** (update GATE_WIDTH + wide flush geometry pins, the 2d-2 precedent).
+- **Binding families (mirror the leaf-sponge overwrite absorb):**
+  1. **Message → pv (rate).** For merge perm b (a child-L opvs block, b<44):
+     preimage rate lane `l` (0..17), limbs `4l..4l+4` hold opvs values `2·(34b/2+…)`.
+     Concretely value at block-position `j` (0..34): `lane=j/2`, `base=4·(j/2)+2·(j%2)`;
+     constraint `pcol(base) + pcol(base+1)·2^16 == pv(off + 34·b + j)` (off=0 child
+     L, `n_opvs` child R), gated `msh[b]`. **KeccakAir already range-bounds the u16
+     preimage limbs**, so this deg-1-in-cols pair-recompose is sound. Deg 2 with the
+     `msh[b]` gate. **Last block is padded**: positions past the real opvs bind to
+     the FIXED pad constants (`^0x01 … ^0x80`), not pv.
+  2. **Capacity chain.** perm p's preimage capacity (limbs 68..100) == perm (p−1)'s
+     output capacity (`ocol` 68..100) — a perm-boundary transition
+     `sf(23)·chain_sel·(nv(pcol(i)) − cv(ocol(i)))`, i in 68..100 (mirror the
+     existing `R_ABS_C34` carry at m4gate.rs:2060). First block of each sponge
+     (child-L b0, child-R b0, root): capacity == 0.
+  3. **dL/dR → root perm.** root preimage limbs 0..16 == child-L-last-perm `ocol`
+     0..16 (dL digest), 16..32 == child-R-last-perm `ocol` 0..16 (dR), 32.. = pad
+     consts. Cross-perm (chain the two sponge digests into the root perm's message).
+  4. **Squeeze → pv(root).** root perm output digest `ocol` 0..16 ==
+     `pv(2·n_opvs + k)`, k in 0..16, gated on the root perm's selector.
+- **Negatives:** `interior_neg_wrong_merge` (root tail tamper → UNSAT); a
+  tamper-opvs-changes-root negative (flip an opvs entry that feeds the sponge →
+  root mismatch → UNSAT — proves the message binding is live). Both under
+  `new_interior`. Keep degree ≤ 3 (msh-gated deg-2 binds; the pair-recompose is
+  linear) and the narrow suite byte-identical (msh columns inert for n_children=1).
+- **Consideration for the implementer:** decide the merge preimage = full opvs
+  (89 blocks, binds everything, matches 棒 3-1's `merge_root`) vs a smaller
+  commitment (caps-only ≈ 21 blocks, fewer selectors/cols but you'd re-define
+  `merge_root`). 棒 3-1 shipped full-opvs; keep it unless the selector-column
+  cascade proves too wide for convergence. NOTE `interior_merge_native` already
+  pins the full-opvs `merge_root`, so a redefinition also updates that test.
 
 - [ ] **Step 2: Failing merge-binds test.**
 ```rust
