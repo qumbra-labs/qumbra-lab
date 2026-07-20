@@ -70,6 +70,21 @@ pub(crate) fn merge_root(opvs_l: &[Val], opvs_r: &[Val]) -> Vec<Val> {
         .collect()
 }
 
+/// The child sub-sponge digests `(dL, dR)` as `MERGE_ROOT_LIMBS` u16 limbs each
+/// (LE), i.e. `keccak(opvsL)` / `keccak(opvsR)`. The interior circuit captures dL
+/// (child-L's last merge perm output) into a carry register and reads dR from
+/// child-R's last perm (adjacent to the root perm); both feed the root perm.
+pub(crate) fn child_digests(opvs_l: &[Val], opvs_r: &[Val]) -> (Vec<Val>, Vec<Val>) {
+    let to_limbs = |d: [u8; 32]| -> Vec<Val> {
+        d.chunks(2)
+            .map(|c| Val::from_u32(u16::from_le_bytes([c[0], c[1]]) as u32))
+            .collect()
+    };
+    let (_, dl) = sponge_overwrite(&opvs_bytes(opvs_l));
+    let (_, dr) = sponge_overwrite(&opvs_bytes(opvs_r));
+    (to_limbs(dl), to_limbs(dr))
+}
+
 /// The merge lane's permutation INPUT states, in lane order: child-L opvs sponge,
 /// child-R opvs sponge, then the root perm (absorbing `dL ‖ dR`). Appended after
 /// both children's perms in `build_interior_trace`; the KeccakAir verifies each

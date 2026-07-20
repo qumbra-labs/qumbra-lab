@@ -1189,6 +1189,11 @@ pub(crate) struct GateLayout {
     pub(crate) minv: usize,
     pub(crate) mrst: usize,
     pub(crate) mcont: usize,
+    /// 棒 3-2c dL carry (WIDE-ONLY, 16 limbs): the child-L sub-sponge digest is
+    /// produced ~kR perms before the root perm consumes it, so it is captured at
+    /// the childL→childR boundary and freeze-carried to the root perm. (dR is
+    /// adjacent to the root perm, bound directly by the boundary transition.)
+    pub(crate) dlr: usize,
     pub(crate) gate_cols: usize,
     pub(crate) gate_width: usize,
 }
@@ -1372,7 +1377,8 @@ impl GateLayout {
         let minv = meq + 4;
         let mrst = minv + 4;
         let mcont = mrst + 1;
-        let merge_cols = if s.merge_lane { 12 } else { 0 };
+        let dlr = mcont + 1;
+        let merge_cols = if s.merge_lane { 28 } else { 0 }; // mreg,mcnt,meq[4],minv[4],mrst,mcont,dlr[16]
         let gate_cols = cc + s.cap_len + merge_cols - gb;
         let gate_width = cc + s.cap_len + merge_cols;
 
@@ -1389,7 +1395,7 @@ impl GateLayout {
             invzn, xreg, xfin, runev, f2dig, phd, cmpc, cmpci, czd, chlive, f2sel,
             pg_a, phg, phdend, cont, eg_a, endg, xsel, qadv, cfull, m3, rlo, rhi,
             dmux, snl, glo, ghi, gf, bpm, n_fhg, fhg, prega, cpa, cpb, cpl, consz7,
-            fpi, csel, frgm, bcbd, chi, cc, mreg, mcnt, meq, minv, mrst, mcont, gate_cols, gate_width,
+            fpi, csel, frgm, bcbd, chi, cc, mreg, mcnt, meq, minv, mrst, mcont, dlr, gate_cols, gate_width,
         }
     }
 }
@@ -2272,6 +2278,44 @@ where
                 builder
                     .when_transition()
                     .assert_zero(cv(self.layout.mcont) * (nv(pcol(i)) - cv(ocol(i))));
+            }
+            // 棒 3-2c — tree-merge digest binding: root = keccak(dL ‖ dR), dL/dR =
+            // the child sub-sponge digests. `meq[1]`=childR-start, `meq[2]`=root-
+            // start, `meq[3]`=root-end (root perm's r=23). Digest limbs are the
+            // output/input rate limbs 0..16 (first 4 lanes = 32 bytes).
+            //
+            // dL carry: child L's last perm output (captured at the childL→childR
+            // boundary, gate sf(23)·meq1_next) is freeze-held in `dlr` to the root
+            // perm (child R sits between them).
+            for m in 0..16 {
+                let cap = sf(23) * nv(self.layout.meq + 1); // childL→childR boundary
+                builder
+                    .when_transition()
+                    .assert_zero(cap.clone() * (nv(self.layout.dlr + m) - cv(ocol(m))));
+                builder.when_transition().assert_zero(
+                    (AB::Expr::ONE - cap) * (nv(self.layout.dlr + m) - cv(self.layout.dlr + m)),
+                );
+            }
+            // Root perm input rate: [0..16] == dL (carried), [16..32] == dR (child
+            // R's last perm output, ADJACENT → bound by the childR→root boundary
+            // transition). Root start = meq[2].
+            for m in 0..16 {
+                builder.assert_zero(
+                    cv(self.layout.meq + 2) * (cv(pcol(m)) - cv(self.layout.dlr + m)),
+                );
+                builder.when_transition().assert_zero(
+                    sf(23) * nv(self.layout.meq + 2) * (nv(pcol(16 + m)) - cv(ocol(m))),
+                );
+            }
+            // Root squeeze: root perm output digest (limbs 0..16 at r=23 = eq_end =
+            // meq[3]) == the interior's exposed merge root pv[2·n_opvs + m]. This is
+            // the load-bearing bind: with the capacity chain (3-2b) making the merge
+            // a real sponge, hitting the fixed pv(root) forces (preimage resistance)
+            // the sponge inputs = the honest opvs.
+            for m in 0..16 {
+                builder.assert_zero(
+                    cv(self.layout.meq + 3) * (cv(ocol(m)) - pv(2 * n_opvs + m)),
+                );
             }
         }
         // Cap comparison at the last path level of each batch (trace, quotient,
@@ -5279,6 +5323,16 @@ pub(crate) fn build_interior_trace(
             }
             values[row * w + layout.mrst] = rst;
         }
+        // 棒 3-2c: dL carry. Captured at the childL→childR boundary (perm kl-1's
+        // output → perm kl's row 0), then freeze-held to the root perm. Fill dL
+        // for rows from child-R's start (merge_start + 24·kl) onward.
+        let (dl, _dr) = crate::m4interior::child_digests(opvs_l, opvs_r);
+        let dl_from = merge_start + 24 * kl;
+        for row in dl_from..rows {
+            for (m, &v) in dl.iter().enumerate() {
+                values[row * w + layout.dlr + m] = v;
+            }
+        }
     }
     fill_derived(&mut values, &layout, shape);
     (RowMajorMatrix::new(values, layout.gate_width), meta)
@@ -6886,5 +6940,39 @@ mod tests {
         probe("tamper mcont on a chain boundary", &|t| {
             t.values[(merge_start + 23) * w + l.mcont] += one;
         });
+    }
+
+    /// 棒 3-2c: the tree-merge digest binding. `interior_merge_native` is the
+    /// positive (root perm output == pv(root), with dL carried / dR adjacent).
+    /// Here the soundness negatives:
+    ///  - wrong-merge: a root public value ≠ keccak-merge(opvsL, opvsR) → the root
+    ///    squeeze bind fails → UNSAT (the §2 exposed digest is bound in-circuit);
+    ///  - tampered dL carry: perturbing the carried child-L digest breaks the
+    ///    root perm's input-rate bind → UNSAT (the dL→root link is live).
+    #[test]
+    fn interior_neg_merge_bind() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let l = GateLayout::from_shape(&shape);
+        let w = l.gate_width;
+        let one = Val::ONE;
+        let n_opvs = shape.n_opvs();
+        let (base, m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        let rows = base.values.len() / w;
+        let root_r0 = 24 * (rows / 24 - 1); // root perm = last full perm
+
+        // wrong-merge: tamper a root public value.
+        {
+            let mut o = m.opvs.clone();
+            o[2 * n_opvs] += one; // root[0] ≠ keccak-merge(dL, dR)
+            assert!(is_unsat_interior(base.clone(), o), "wrong merge root must be UNSAT");
+        }
+        // tampered dL carry at the root perm → input-rate bind fails.
+        {
+            let mut t = base.clone();
+            t.values[root_r0 * w + l.dlr] += one;
+            assert!(is_unsat_interior(t, m.opvs.clone()), "tampered dL carry must be UNSAT");
+        }
     }
 }
