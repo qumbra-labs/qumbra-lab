@@ -4684,6 +4684,14 @@ pub(crate) fn build_gate_trace(
     // Pad rows: frozen registers.
     for row in 24 * n_perms..rows {
         write_row(&mut values, row, row % 24, &regs, &program, None, &layout, shape);
+        // layout.hit defining constraint on pad rows: gpb=0 (write_row zeros it)
+        // ⇒ glo=ghi=[1,0,0,0] ⇒ the global HIT constraint reduces to
+        // `hit == vc[0]`. write_row never fills hit, and the main perm loop's
+        // hit fill (the non-fold else-branch, `hit=[vc%16==0]`) does not run
+        // over pad rows — so mirror it here. Narrow's frozen vc lands off slot 0
+        // (last fold round has 4 leaves ⇒ vc=4), so this stays 0 = byte-identical;
+        // wide's last round has 16 leaves ⇒ vc wraps to 0, so hit must be 1.
+        values[row * layout.gate_width + layout.hit] = Val::from_bool(regs.vc % 16 == 0);
     }
     // Global self-checks against the recorder.
     assert_eq!(regs.qsel, nq, "all query blocks completed");
@@ -5900,17 +5908,17 @@ mod tests {
     /// and the relocated `M_FIN`/`xfin` carry actually hold on real wide data.
     /// `check_constraints` only (no full prove); the RSS gate is stage 3.
     ///
-    /// IGNORED (2026-07-19): the wide trace BUILDS and `check_constraints` runs
-    /// the full symbolic pass. Peel-the-onion within check_constraints:
-    /// Peel: B4 M_X1 OOB → B5 (bidx) row-0 shsel → B6 (caps8 fill) row-42216 →
-    /// B7 (DRND loop/fold_dp `0..6`/`drnd+5` vs wide drnd_width=5) row-44808
-    /// (#3620) → now **row 200616 (~76%): constraint #5187** = the fold-leaf
-    /// VC/HIT value-counter region (touches vc[0..15], hit, glo/ghi GPB pair
-    /// products) — a deeper fold-pipeline subsystem, not a width hardcoding.
-    /// Slice 1b-B8. Diagnose via
-    /// `WIDE=1 CIDX=<n> cargo test dump_constraint -- --nocapture`.
+    /// SAT (2026-07-20, slice 1b-B8): the wide trace BUILDS and the full 2^18
+    /// `check_constraints` PASSES — the first end-to-end wide correctness signal.
+    /// Peel-the-onion history: B4 M_X1 OOB → B5 (bidx) row-0 shsel → B6 (caps8
+    /// fill) row-42216 → B7 (DRND loop/fold_dp) row-44808 → B8 **row 200616
+    /// (#5187 fold-leaf HIT-definition)**. B8 root cause: pad rows never filled
+    /// `hit` (the main perm loop's non-fold else-branch never runs over pad rows),
+    /// while the global HIT constraint reduces to `hit==vc[0]` there; wide's last
+    /// fold round has 16 leaves so the frozen `vc` wraps to slot 0 → mismatch
+    /// (narrow's 4-leaf last round left vc=4, masking it). Fixed in the pad loop.
+    /// `check_constraints` only (no full prove); the RSS gate is stage 3.
     #[test]
-    #[ignore = "1b-4: wide check_constraints advances to row 200616 constraint #5187 (fold-leaf VC/HIT region); needs slice 1b-B8"]
     fn interior_single_child_satisfies() {
         let _g = heavy_lock();
         let (leaf, opvs) = crate::m4treerec::leaf_proof();

@@ -495,21 +495,33 @@ the `0..19` dmux path-direction loops (eval ~1866 / fill ~3710) and the
       44808 (#3620).
     - Each B5–B7: narrow 37/37 byte-identical. Wide fail row advanced
       **0 → 42216 → 44808 → 200616 (~76% of the 2^18 trace)**.
-    - **NEXT: 1b-B8 — row 200616, constraint #5187** = the fold-leaf **VC/HIT
-      value-counter** region (touches vc[0..15], hit, glo/ghi GPB pair products)
-      — a deeper fold-pipeline subsystem, likely NOT a width hardcoding; diagnose
-      *why* wide fails (read the VC/HIT eval + fold-leaf value-matching), not just
-      what it touches. **The M_HORN/RUNEV endpoint region (Option A, soundness-
-      critical) is past row 200616 and not yet check-validated** — expect more
-      fold-region layers before wide SAT. Diagnose: `WIDE=1 CIDX=5187 cargo test
-      dump_constraint -- --nocapture` (colname prints NARROW names — map raw
-      indices against the WIDE GateLayout the toggle dumps).
-- **… likely more** surface as each is cleared. Each is moderate circuit work
-  (narrow suite green + wide-build-advances-further as the per-slice gate); the
-  whole chain is the "≈ fold-pipeline build" scope the 1b-4 finding flagged.
+    - **B8 — DONE (2026-07-20) → WIDE SINGLE-CHILD SAT (1b-4 reached).** Row
+      200616 / constraint #5187 = the global fold-leaf **HIT-definition**
+      (`hit == Σ_s vc[s]·glo[s&3]·ghi[(s>>2)&3]`). Root cause was NOT a further
+      fold-pipeline extension but a **pad-row fill gap**: row 200616 = perm 8359 is
+      a PAD perm (wide ~7503 native perms), and the pad loop calls only
+      `write_row`, which never fills `hit` — the main perm loop's non-fold
+      else-branch (`hit=[vc%16==0]`) does not run over pad rows. On pad rows gpb=0
+      ⇒ glo=ghi=[1,0,0,0] ⇒ the constraint reduces to `hit==vc[0]`. Wide's last
+      fold round has **16 leaves** so the frozen `regs.vc` wraps to slot 0 (vc[0]=1)
+      while hit=0 → mismatch; narrow's last round has **4 leaves** so vc=4 (vc[0]=0)
+      → hit=0 matched, masking the latent bug. **Fix:** mirror the else-branch in
+      the pad loop (`m4gate.rs:4685`, one line). Byte-identical for narrow
+      (`[4%16==0]=0`). The clear went straight through the M_HORN/RUNEV endpoint
+      region past 200616 — **it was already correct; 200616 was the last blocker.**
+    - `interior_single_child_satisfies` un-ignored and PASSES the full 2^18
+      `check_constraints` (release ~13 s incl. the ~12 GB leaf proof). Narrow
+      m4gate suite = **38 passed** (37 narrow byte-identical + this wide SAT test),
+      0 failed.
+- **1b-4 DONE.** Wide single-child rectangle is `check_constraints`-SAT end to end.
 
-Only after the whole chain does 1b-4 (`interior_single_child_satisfies` via
-`check_constraints`) become attemptable, then 1b-5 (wide negatives), then 棒 2/3.
+**NEXT: 1b-5 — wide negatives** (re-derive the shape-tied tamper tests for the
+wide trace: `gate_neg_mro/_pzacc/_preg/_capture/_fpreg/_tampered_opening/
+_wrong_root/_wrong_query_index` — each must be UNSAT on the wide trace, mirroring
+the narrow negatives; especially exercise the wide M_HORN/RUNEV END-pin
+`gate_neg_fpreg`/`_xfin_chain`/`_bad_fold` per the Option A soundness diligence),
+then 棒 2 (two children in one 2^19 rectangle) → 棒 3 (merge digest) → stage 3
+(single-child `prove` canary + two-child peak-RSS vs 32 GB).
 
 **Original remaining-list (1b-2…1b-5), now partly superseded above** — spec'd by
 the investigation report's §3 site list + §4 sketch. The AIR's `eval` and the
