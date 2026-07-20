@@ -444,14 +444,41 @@ blueprint + the hard constraint discovered:
   root mismatch → UNSAT — proves the message binding is live). Both under
   `new_interior`. Keep degree ≤ 3 (msh-gated deg-2 binds; the pair-recompose is
   linear) and the narrow suite byte-identical (msh columns inert for n_children=1).
-- **Sub-slicing 棒 3-2 (each its own commit, TDD):**
-  - **3-2a** merge-at-END restructure of `build_interior_trace` + `mreg`/`mcnt`
-    region pin + `msh` one-hot ring (wide-only) + fill; positive SAT
-    (`interior_merge_native` still green) + **msh-tamper negative** (proves the
-    pin). No binding yet — msh gated constraints are absent, so this is a clean
-    "selector is sound" slice.
-  - **3-2b** the 4 binding families above + `interior_merge_binds_root` +
-    `interior_neg_wrong_merge` + a tamper-opvs-changes-root negative.
+- **Sub-slicing 棒 3-2 (each its own commit, TDD) — DECIDED: root-only + tree-merge:**
+  - **3-2a — DONE (`126f258`).** merge-at-END restructure (childL | childR |
+    zero-pad | merge, so the root perm's last row == `last_row`) + `mreg`/`mcnt`
+    region pin (wide-only) + `interior_neg_merge_region` (drop mreg / bump mcnt /
+    spurious early mreg → UNSAT). `GateShape::merge_lane` + `merge_perms()` (=
+    `2·blocks(n_pvs·4) + 1` = 53 for wide — hashes each child's OWN opvs = the
+    interior's inner PVs `n_pvs`=852, NOT the 1492 outer). narrow byte-identical
+    (merge cols wide-only), deg ≤ 3, m4gate 45 green.
+  - **3-2b — capacity chain (makes the merge perms a genuine sponge).** ⭐ ESSENTIAL:
+    keccak-f is a PERMUTATION (invertible), so without the chain a prover inverts
+    the root perm to hit `pv(root)` for free → the root binding is vacuous. The
+    chain (input capacity limbs 68..100 == previous perm's output capacity) turns
+    it into a sponge → hitting `pv(root)` needs a full preimage (preimage
+    resistance) → rate == opvs. **tree-merge = 3 independent sub-sponges** (childL
+    kL=26 perms, childR kR=26, root 1), each starting capacity 0 → need cap-RESET
+    markers at the 3 sub-sponge-start perms (merge perms 0, kL, kL+kR). Pin via
+    `mcnt` thresholds: sub-sponge starts at `mcnt ∈ {1, 24·kL+1, 24·(kL+kR)+1}`
+    (perm row-0s) — equality-comparator columns (`eq/inv` pairs, the flush-automaton
+    `cmpa/cmpai` precedent) → a `mrst` reset flag; chain constraint
+    `mb·(1−nv(mrst))·(nv(pcol cap) − cv(ocol cap)) == 0` at perm boundaries
+    (`mb = mreg·sf(23)`), reset `mrst·pcol(cap) == 0`. Test: positive SAT +
+    capacity-tamper negative (perturb a merge perm's input capacity → UNSAT).
+  - **3-2c — dL carry + dR adjacency + root bind.** root perm (merge perm kL+kR)
+    absorbs `dL ‖ dR`: dR = childR's last perm output (kL+kR−1) is ADJACENT to the
+    root perm → bind `root-preimage[16..32] == prev ocol[0..16]` via the r=23→r=0
+    transition (no carry). dL = childL's last perm output (kL−1) is kR perms before
+    root → a `dlr` carry register (16 limbs) captured at childL-end (mrst-for-childR
+    row: prev-perm output) and freeze-held through childR to the root perm; bind
+    `root-preimage[0..16] == dlr`. Root squeeze: `root ocol[0..16] == pv(2·n_opvs+k)`.
+    Tests: `interior_merge_binds_root` (SAT) + `interior_neg_wrong_merge` (tamper
+    root pv → UNSAT) + tamper-a-child-opvs-feeding-the-sponge → root mismatch → UNSAT.
+  - Soundness note for coordinator review: root-only relies on keccak preimage
+    resistance (standard for hash-based); the capacity chain + `root==pv(root)` +
+    cap comparison (binds `pv(opvsL/R)` to children) close the loop WITHOUT the
+    ~89-col per-block message binding.
 - **Consideration for the implementer:** 棒 3-1 shipped **full-opvs** `merge_root`
   (89 blocks / 89 msh cols). A smaller commitment (e.g. inner-PVs only = the
   covered-tx digests, offset `n_caps·cap_len·16`, ~53 blocks) would cut msh
