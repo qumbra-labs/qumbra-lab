@@ -98,6 +98,33 @@ git add crates/qlab-bench/src/m4gate.rs
 git commit -m "feat(m4gate): constraint-pinned csel child-boundary re-anchor + degree reduction; narrow byte-identical"
 ```
 
+### 2b progress (2026-07-20)
+
+- **2b-i DONE** (`1bd8a3f`): csel column + completion-gated soundness pin
+  (`csel_next·(1-endg)==0`, option B) + `gate_neg_csel_narrow`. Findings:
+  (a) the completion signal is **`endg`** (last-query r=23), NOT `qsel==nq` — the
+  final qsel→nq rotation IS the suppressed boundary transition, so qsel is never
+  nq at row R-1; verified vs `lane_plan` (queries are the last region per child).
+  (b) csel grows the shared gate → leaf 3626→**3627** (odd) → `wide().tw` now
+  **derives from `GATE_WIDTH`** (so future gate-column adds auto-track); the odd-`f`
+  trace-last path is exercised and SATs (1b-A generalization holds);
+  `flush_bytes[2]` 116192→116224.
+- **2b-ii DONE** (`4eb4a81`): 27 per-transcript first-row anchors csel-gated
+  (`when_first_row().assert(col,v)` → `assert_zero(csel·(col-v))`), incl. **`blkcnt`**
+  (flush-automaton block counter — a subagent flag caught it; it was missing from
+  the initial enumeration). Left the csel self-anchor + `when_last_row` as-is.
+  Degree-neutral; narrow verdicts unchanged; 40 green.
+- **2b-iii PENDING — do it EVIDENCE-DRIVEN inside 2c, not blind.** The carry
+  suppression `(1-csel_next)·carry` only *matters* where csel_next=1 (two children
+  only), so it is untestable standalone. Plan: build 2c's `build_interior_trace`
+  first; the two-child `check_constraints` will fail at exactly the carries that
+  conflict with the re-anchor (peel-the-onion) — suppress + degree-reduce each as
+  a sub-commit, tested immediately. Carries to expect: program ring rotation,
+  qcnt/qsel rotation, blkcnt reload/decrement, fring rotation, grp/coef rotation,
+  chal assembly, pzacc/preg, fpreg, runev, and the sponge/path continuation
+  carries. Each deg-3 carry × (1-csel_next) → deg 4 → materialize a
+  `(1-csel_next)`-product column (flush-automaton precedent), counted in width.
+
 ---
 
 ## Task 2c: `build_interior_trace` + `two_child_schedule` + SAT
