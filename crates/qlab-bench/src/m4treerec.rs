@@ -43,6 +43,22 @@ pub(crate) fn leaf_proof() -> (Proof<Config>, Vec<Val>) {
     (leaf, meta.opvs)
 }
 
+/// A DISTINCT leaf proof: identical shape to `leaf_proof`, but the inner M3
+/// witness is driven from a different PRNG seed, so the verified proof's Merkle
+/// caps and public values differ. The M4 interior's two-child PR-gate uses this
+/// for child R (`two_child_schedule(true)`) — identical children (L == R) can
+/// mask cross-wiring / symmetry bugs the distinct pair exposes.
+pub(crate) fn leaf_proof_variant() -> (Proof<Config>, Vec<Val>) {
+    // A seed clearly distinct from `consensus_proof`'s default.
+    let (_inst, pvs, m3_proof) = m4gaterec::consensus_proof_seeded(0x1234_5678_9abc_def0);
+    let sched = m4gaterec::walk(&m3_proof, &pvs);
+    let (trace, meta) = build_gate_trace(&sched, &pvs, &GateShape::narrow(), AGG_CFG.log_blowup);
+    let config = make_config_with(&AGG_CFG);
+    let air = VerifierGateAir::new();
+    let leaf = prove(&config, &air, trace, &meta.opvs);
+    (leaf, meta.opvs)
+}
+
 /// Record the leaf wide proof's uni-stark verification transcript at the
 /// aggregation config — the interior node's input schedule.
 pub(crate) fn walk_leaf(proof: &Proof<Config>, opvs: &[Val]) -> Schedule {
@@ -165,6 +181,19 @@ mod tests {
         assert_eq!(tn, 3626, "trace-next = gate width (transition constraints)");
         assert!(quot > 0, "quotient chunks opened");
         assert!(!sched.perms.is_empty(), "native perms recorded");
+    }
+
+    /// 2d-1: the distinct child's leaf proof must have DIFFERENT outer public
+    /// values from the default child (else "distinct children" would be a no-op
+    /// and could not expose a symmetry / cross-wiring bug). Both are full b4
+    /// leaf proves (~12 GB each), serialized; only the small opvs are compared.
+    #[test]
+    fn variant_child_has_distinct_opvs() {
+        let _g = heavy_lock();
+        let (_leaf_l, opvs_l) = leaf_proof();
+        let (_leaf_r, opvs_r) = leaf_proof_variant();
+        assert_eq!(opvs_l.len(), opvs_r.len(), "same shape → same opvs length");
+        assert_ne!(opvs_l, opvs_r, "distinct M3 witness → distinct caps + inner PVs");
     }
 }
 

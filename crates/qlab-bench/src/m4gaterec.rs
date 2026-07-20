@@ -62,7 +62,18 @@ pub(crate) const CAP_LEN: usize = 1 << CAP_HEIGHT;
 // ---------------------------------------------------------------------------
 
 pub(crate) fn bucket_instance() -> (BucketInstance, Vec<Val>) {
-    let mut x = 0xfeed_face_cafe_beefu64;
+    bucket_instance_seeded(0xfeed_face_cafe_beef)
+}
+
+/// Build a bucket instance from a PRNG `seed`. The default `bucket_instance`
+/// (m4census's instance) uses `0xfeed_face_cafe_beef`; a distinct seed drives
+/// distinct note randomness (sk/rho/rseed/rkm) — hence distinct commitments,
+/// nullifiers, and public values — while keeping the same 2-in/2-out shape and
+/// a balanced ledger (80 000 in = 79 000 out + 1 000 fee). Used by the M4
+/// interior's DISTINCT second child so its leaf proof's opvs differ from the
+/// first's (a symmetry-bug guard the two-child PR-gate requires).
+pub(crate) fn bucket_instance_seeded(seed: u64) -> (BucketInstance, Vec<Val>) {
+    let mut x = seed;
     let mut rnd = || {
         x ^= x << 13;
         x ^= x >> 7;
@@ -92,7 +103,12 @@ pub(crate) fn bucket_instance() -> (BucketInstance, Vec<Val>) {
 /// the parallel-grind PoW witness (known since M1.6); the schedule adapts
 /// to whatever proof is produced, so grind jitter is harmless.
 pub(crate) fn consensus_proof() -> (BucketInstance, Vec<Val>, Proof<Config>) {
-    let (inst, pvs) = bucket_instance();
+    consensus_proof_seeded(0xfeed_face_cafe_beef)
+}
+
+/// `consensus_proof` from an explicit PRNG `seed` (see `bucket_instance_seeded`).
+pub(crate) fn consensus_proof_seeded(seed: u64) -> (BucketInstance, Vec<Val>, Proof<Config>) {
+    let (inst, pvs) = bucket_instance_seeded(seed);
     let config = make_config_with(&CONSENSUS_CFG);
     let trace = inst.air.generate_trace::<Val>(CONSENSUS_CFG.log_blowup);
     let proof = prove(&config, &inst.air, trace, &pvs);

@@ -25,9 +25,11 @@ pub(crate) fn two_child_schedule(distinct: bool) -> (Schedule, Schedule, Vec<Val
         let sched_r = crate::m4treerec::walk_leaf(&leaf_l, &opvs_l);
         return (sched_l, sched_r, opvs_l.clone(), opvs_l);
     }
-    // 2d: prove a distinct child (a different M3 witness) via
-    // `m4treerec::leaf_proof_variant` (added in that slice).
-    unimplemented!("distinct children land in slice 2d (leaf_proof_variant)")
+    // 2d: prove a distinct child (a different M3 witness) so `L != R`.
+    let (leaf_r, opvs_r) = crate::m4treerec::leaf_proof_variant();
+    let sched_r = crate::m4treerec::walk_leaf(&leaf_r, &opvs_r);
+    debug_assert_ne!(opvs_l, opvs_r, "distinct children must have distinct opvs");
+    (sched_l, sched_r, opvs_l, opvs_r)
 }
 
 /// `m4interior` bench mode (stage 3): prove the full two-child interior at b4 and
