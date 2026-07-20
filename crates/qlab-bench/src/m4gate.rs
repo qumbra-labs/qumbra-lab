@@ -4052,6 +4052,7 @@ fn emit_child(
     dcap: &[(usize, usize, u32); 3],
     n_dup: usize,
     trailer_pi: usize,
+    inherit: Option<&Regs>,
     query_rows: &mut Vec<usize>,
     field_draws: &mut Vec<(usize, u32)>,
 ) -> Regs {
@@ -4062,6 +4063,38 @@ fn emit_child(
     let n_rounds = shape.n_fri_rounds();
     let mut regs = Regs::new(shape);
     regs.fsfull = hosted.get(&0).map_or(false, |d| d.len() == 8);
+    // 2b-iii fill-continuity: the NON-ANCHORED fold/arith registers are
+    // freeze-carried (a `nv==cv` continuity constraint when their update gate is
+    // off). At a child boundary child R's csel re-anchor leaves them un-anchored,
+    // so a fresh (0) start would break the freeze. Inherit child L's final values
+    // instead — harmless (child R's queries overwrite them before use), and the
+    // freeze holds with no gating/columns. The ANCHORED fields (scheduling,
+    // phase, challenge, vc, preg/pzacc) stay fresh; csel + gated carries own them.
+    if let Some(p) = inherit {
+        regs.f2dig = p.f2dig;
+        regs.oreg = p.oreg;
+        regs.fa2 = p.fa2;
+        regs.zn = p.zn;
+        regs.asm0 = p.asm0;
+        regs.asm1 = p.asm1;
+        regs.pbuf = p.pbuf;
+        regs.a0 = p.a0;
+        regs.a1 = p.a1;
+        regs.a2 = p.a2;
+        regs.p0 = p.p0;
+        regs.p1 = p.p1;
+        regs.px0 = p.px0;
+        regs.fpreg = p.fpreg;
+        regs.scr = p.scr;
+        regs.breg = p.breg;
+        regs.inv2s = p.inv2s;
+        regs.invz = p.invz;
+        regs.invzn = p.invzn;
+        regs.xreg = p.xreg;
+        regs.xfin = p.xfin;
+        regs.runev = p.runev;
+        regs.mchain = p.mchain;
+    }
     let mut zvi = 0usize;
     // Child-boundary re-anchor selector (2b): 1 on this child's first row.
     // Single child → row 0; interior → row 0 (child L) and 24*nL (child R).
@@ -4775,7 +4808,7 @@ pub(crate) fn build_gate_trace(
     let regs = emit_child(
         &mut values, 0, shape, &layout, &consts, &program, sched,
         &inputs, &outs, &infos, &hosted, &chal_expect, &fpoly, fa,
-        &zvals, &dcap, n_dup, trailer_pi,
+        &zvals, &dcap, n_dup, trailer_pi, None,
         &mut meta.query_rows, &mut meta.field_draws,
     );
 
@@ -4929,15 +4962,18 @@ pub(crate) fn build_interior_trace(
         opvs: opvs.clone(),
     };
 
-    emit_child(
+    let regs_l = emit_child(
         &mut values, 0, shape, &layout, &consts, &program, sched_l, &cd_l.inputs, &cd_l.outs,
         &cd_l.infos, &cd_l.hosted, &cd_l.chal_expect, &cd_l.fpoly, cd_l.fa, &cd_l.zvals, &dcap,
-        n_dup, cd_l.trailer_pi, &mut meta.query_rows, &mut meta.field_draws,
+        n_dup, cd_l.trailer_pi, None, &mut meta.query_rows, &mut meta.field_draws,
     );
+    // Child R inherits child L's final non-anchored fold/arith registers so their
+    // freeze carries hold across the boundary (2b-iii fill-continuity).
     let regs = emit_child(
         &mut values, 24 * nl, shape, &layout, &consts, &program, sched_r, &cd_r.inputs,
         &cd_r.outs, &cd_r.infos, &cd_r.hosted, &cd_r.chal_expect, &cd_r.fpoly, cd_r.fa,
-        &cd_r.zvals, &dcap, n_dup, cd_r.trailer_pi, &mut meta.query_rows, &mut meta.field_draws,
+        &cd_r.zvals, &dcap, n_dup, cd_r.trailer_pi, Some(&regs_l),
+        &mut meta.query_rows, &mut meta.field_draws,
     );
 
     // Pad rows: frozen registers of the last child (mirror build_gate_trace).
