@@ -1179,6 +1179,16 @@ pub(crate) struct GateLayout {
     /// region to be exactly those rows (so a prover cannot shrink/move it).
     pub(crate) mreg: usize,
     pub(crate) mcnt: usize,
+    /// 棒 3-2b capacity chain (WIDE-ONLY). The merge is 3 independent sub-sponges
+    /// (childL / childR / root) whose input capacity resets to 0 at each start
+    /// and chains from the previous perm's output otherwise. `meq`/`minv` (3 pairs)
+    /// are equality comparators pinning the sub-sponge-start rows via `mcnt ∈
+    /// {1, 24·kL+1, 24·(kL+kR)+1}`; `mrst = Σ meq` (reset flag); `mcont` =
+    /// materialized chain gate `sf(23)·mreg·(1−next mrst)` (keeps the chain deg ≤3).
+    pub(crate) meq: usize,
+    pub(crate) minv: usize,
+    pub(crate) mrst: usize,
+    pub(crate) mcont: usize,
     pub(crate) gate_cols: usize,
     pub(crate) gate_width: usize,
 }
@@ -1352,12 +1362,17 @@ impl GateLayout {
         let bcbd = frgm + 1;
         let chi = bcbd + 1;
         let cc = chi + 1;
-        // 棒 3-2 merge-lane region-pin columns, WIDE-ONLY: mreg + mcnt. narrow
-        // (merge_lane false) adds 0 width and leaves the offsets unused (eval /
-        // fill touch them only when n_children > 1, i.e. the wide interior).
+        // 棒 3-2 merge-lane columns, WIDE-ONLY: mreg + mcnt (3-2a region pin) +
+        // meq[3]/minv[3]/mrst/mcont (3-2b capacity chain). narrow (merge_lane
+        // false) adds 0 width and leaves the offsets unused (eval / fill touch
+        // them only when n_children > 1, i.e. the wide interior).
         let mreg = cc + s.cap_len;
         let mcnt = mreg + 1;
-        let merge_cols = if s.merge_lane { 2 } else { 0 };
+        let meq = mcnt + 1;
+        let minv = meq + 4;
+        let mrst = minv + 4;
+        let mcont = mrst + 1;
+        let merge_cols = if s.merge_lane { 12 } else { 0 };
         let gate_cols = cc + s.cap_len + merge_cols - gb;
         let gate_width = cc + s.cap_len + merge_cols;
 
@@ -1374,7 +1389,7 @@ impl GateLayout {
             invzn, xreg, xfin, runev, f2dig, phd, cmpc, cmpci, czd, chlive, f2sel,
             pg_a, phg, phdend, cont, eg_a, endg, xsel, qadv, cfull, m3, rlo, rhi,
             dmux, snl, glo, ghi, gf, bpm, n_fhg, fhg, prega, cpa, cpb, cpl, consz7,
-            fpi, csel, frgm, bcbd, chi, cc, mreg, mcnt, gate_cols, gate_width,
+            fpi, csel, frgm, bcbd, chi, cc, mreg, mcnt, meq, minv, mrst, mcont, gate_cols, gate_width,
         }
     }
 }
@@ -1723,6 +1738,14 @@ pub(crate) struct VerifierGateAir {
     /// which takes `n_children · n_opvs` public values (`opvsL ++ opvsR ++ …`)
     /// and routes each child's cap comparison to its own half via `chi`/`cc`.
     pub(crate) n_children: usize,
+    /// log2(trace height) — used ONLY by the merge lane (棒 3-2) to pin the
+    /// merge-region row count at `last_row`. A power-of-2 height is not a
+    /// multiple of the 24-row keccak perm, so the trace's last perm is truncated
+    /// (an `h mod 24`-row tail after the last full perm); the merge region is the
+    /// suffix from the perm-aligned merge start, so its row count at last_row is
+    /// `(h mod 24) + 24·merge_perms()`. The two-child wide interior is height
+    /// 2^19. 0 for non-merge shapes (unused there).
+    pub(crate) log_height: usize,
 }
 
 impl VerifierGateAir {
@@ -1731,9 +1754,10 @@ impl VerifierGateAir {
     }
 
     /// The M4 interior node: a `wide()`-shape verifier over TWO stacked children
-    /// with per-child opvs routing enabled (2d).
+    /// with per-child opvs routing enabled (2d) + the 棒 3 merge lane. Height is
+    /// 2^19 (two ~8,360-perm children + the ~53-perm merge sponge, padded).
     pub(crate) fn new_interior() -> Self {
-        Self { n_children: 2, ..Self::new_with_shape(GateShape::wide()) }
+        Self { n_children: 2, log_height: 19, ..Self::new_with_shape(GateShape::wide()) }
     }
 
     /// Build a verifier gate for an arbitrary inner-proof `shape`, deriving the
@@ -1750,6 +1774,7 @@ impl VerifierGateAir {
             shape,
             layout,
             n_children: 1,
+            log_height: 0,
         }
     }
 }
@@ -2182,7 +2207,12 @@ where
             // the merge sponge, so the merge-binding constraints — 棒 3-2b/c —
             // cannot be dodged by dropping the region). `mreg` monotone 0→1;
             // `mcnt` running count of mreg, pinned == 24·nm at last_row.
-            let nmr = (24 * self.shape.merge_perms()) as u32;
+            // Region is the SUFFIX from the (perm-aligned) merge start to the
+            // trace end, so its row count at last_row is 24·nm plus the truncated
+            // tail `h mod 24` (a power-of-2 height is not a multiple of 24). The
+            // tail rows are inert for the chain/reset (step-flag 23 never fires in
+            // a <24-row perm), so folding them into mreg is harmless.
+            let nmr = ((1usize << self.log_height) % 24 + 24 * self.shape.merge_perms()) as u32;
             builder.assert_bool(cv(self.layout.mreg));
             builder.when_first_row().assert_zero(cv(self.layout.mreg));
             builder.when_first_row().assert_eq(cv(self.layout.mcnt), cv(self.layout.mreg));
@@ -2193,6 +2223,55 @@ where
                 t.assert_zero(cv(self.layout.mreg) * (AB::Expr::ONE - nv(self.layout.mreg)));
                 // running count: mcnt_next = mcnt + mreg_next.
                 t.assert_zero(nv(self.layout.mcnt) - cv(self.layout.mcnt) - nv(self.layout.mreg));
+            }
+            // 棒 3-2b capacity chain — the merge is 3 independent keccak sub-sponges
+            // (childL kL perms, childR kR, root 1). Each sub-sponge's input
+            // capacity (lanes 17..25 = limbs 68..100) resets to 0 at its start and
+            // chains from the previous perm's output otherwise. Since keccak-f is a
+            // PERMUTATION (invertible), the chain is what makes hitting pv(root) a
+            // sponge-preimage problem — without it the root binding (3-2c) would be
+            // vacuous. Comparator thresholds on mcnt (merge perm p's row 0 has
+            // mcnt = 24·p + 1): the 3 sub-sponge STARTS {1, 24·kL+1, 24·(kL+kR)+1}
+            // → the reset flag `mrst`, plus a 4th `24·nm` = the root perm's LAST
+            // row (`eq_end` = meq[3]) → suppresses the (nonexistent) forward chain
+            // from the last sub-sponge into the inert tail perm.
+            let nm = self.shape.merge_perms();
+            let kl = (nm - 1) / 2;
+            let thresholds =
+                [1u32, (24 * kl + 1) as u32, (24 * (nm - 1) + 1) as u32, (24 * nm) as u32];
+            let mut rst = AB::Expr::ZERO;
+            for (k, tk) in thresholds.iter().enumerate() {
+                let eq = cv(self.layout.meq + k);
+                let diff = cv(self.layout.mcnt) - c(*tk);
+                builder.assert_bool(eq.clone());
+                builder.assert_zero(eq.clone() * diff.clone()); // eq=1 ⇒ mcnt==tk
+                builder.assert_eq(eq.clone() + diff * cv(self.layout.minv + k), AB::Expr::ONE);
+                if k < 3 {
+                    rst = rst + eq; // sub-sponge starts only
+                }
+            }
+            builder.assert_eq(cv(self.layout.mrst), rst); // mrst = Σ (first 3 meq)
+            // Reset: input capacity == 0 at each sub-sponge start.
+            for i in 68..100 {
+                builder.assert_zero(cv(self.layout.mrst) * cv(pcol(i)));
+            }
+            // mcont = merge-continue gate = sf(23)·mreg·(1 − next-row mrst − eq_end):
+            // fires at a merge perm boundary INTERNAL to a multi-perm sub-sponge —
+            // suppressed where the next perm is a reset (mrst_next, sub-sponge
+            // boundary) or where this is the root perm's last row (eq_end, no
+            // forward chain into the tail). Materialized (next-row dependent) so the
+            // chain stays deg ≤ 3.
+            builder.when_transition().assert_eq(
+                cv(self.layout.mcont),
+                sf(23)
+                    * cv(self.layout.mreg)
+                    * (AB::Expr::ONE - nv(self.layout.mrst) - cv(self.layout.meq + 3)),
+            );
+            // Chain: next perm's input capacity == this perm's output capacity.
+            for i in 68..100 {
+                builder
+                    .when_transition()
+                    .assert_zero(cv(self.layout.mcont) * (nv(pcol(i)) - cv(ocol(i))));
             }
         }
         // Cap comparison at the last path level of each batch (trace, quotient,
@@ -5107,7 +5186,12 @@ pub(crate) fn build_interior_trace(
     assert_eq!(all_inputs.len(), total_perms, "lane exactly fills the rectangle");
     let keccak = p3_keccak_air::generate_trace_rows::<Val>(all_inputs, 0);
     assert_eq!(keccak.height(), rows, "no implicit keccak padding (merge is last)");
-    let merge_start = rows - 24 * nm; // first row of the merge region
+    // First row of the merge region = the perm-aligned start of the last nm
+    // perms. NOT `rows - 24·nm`: a power-of-2 height is not a multiple of 24, so
+    // the trace's last perm is truncated (`rows mod 24`-row tail); the merge
+    // perms sit at global perm boundaries `24·(total_perms - nm)`, and the mreg
+    // suffix extends through the inert tail to last_row.
+    let merge_start = 24 * (total_perms - nm);
     let mut values = Vec::with_capacity((rows << extra_capacity_bits) * layout.gate_width);
     values.resize(rows * layout.gate_width, Val::ZERO);
     for r in 0..rows {
@@ -5167,14 +5251,33 @@ pub(crate) fn build_interior_trace(
     // region to be exactly the merge perms (a prover cannot drop/move it).
     if shape.merge_lane {
         let w = layout.gate_width;
+        let nm2 = shape.merge_perms();
+        let kl = (nm2 - 1) / 2;
+        let thresholds =
+            [1u32, (24 * kl + 1) as u32, (24 * (nm2 - 1) + 1) as u32, (24 * nm2) as u32];
         let mut cnt = 0u32;
         for row in 0..rows {
-            let m = row >= merge_start;
-            if m {
+            if row >= merge_start {
                 cnt += 1;
                 values[row * w + layout.mreg] = Val::ONE;
             }
             values[row * w + layout.mcnt] = Val::from_u32(cnt);
+            // 棒 3-2b comparators (meq/minv) + reset flag (mrst = first 3 = sub-
+            // sponge starts; meq[3] = eq_end = root perm's last row).
+            let mcnt_v = Val::from_u32(cnt);
+            let mut rst = Val::ZERO;
+            for (k, tk) in thresholds.iter().enumerate() {
+                let diff = mcnt_v - Val::from_u32(*tk);
+                if diff == Val::ZERO {
+                    values[row * w + layout.meq + k] = Val::ONE;
+                    if k < 3 {
+                        rst = Val::ONE;
+                    }
+                } else {
+                    values[row * w + layout.minv + k] = diff.inverse();
+                }
+            }
+            values[row * w + layout.mrst] = rst;
         }
     }
     fill_derived(&mut values, &layout, shape);
@@ -5375,6 +5478,13 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout, shape: &GateShape) {
             - values[cur + layout.cont]
             - dupdec
             + values[cur + layout.phg] * (Val::from_u32(flush_blocks[2] as u32) - blkcnt);
+        // 棒 3-2b: mcont = merge-continue chain gate = sf(23)·mreg·(1 − next mrst
+        // − eq_end), where eq_end = meq[3] (root perm's last row → no forward chain).
+        if shape.merge_lane {
+            values[cur + layout.mcont] = sf23
+                * values[cur + layout.mreg]
+                * (one - values[nxt + layout.mrst] - values[cur + layout.meq + 3]);
+        }
     }
 }
 
@@ -6717,7 +6827,7 @@ mod tests {
         let nm = shape.merge_perms();
         let (base, _m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
         let rows = base.values.len() / w;
-        let merge_start = rows - 24 * nm;
+        let merge_start = 24 * (rows / 24 - nm); // perm-aligned (height not mult of 24)
 
         let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>)| {
             let mut t = base.clone();
@@ -6738,6 +6848,43 @@ mod tests {
         // 1, but it's 0 right after → UNSAT (also over-counts mcnt).
         probe("spurious mreg before region", &|t| {
             t.values[(merge_start - 48) * w + l.mreg] += one;
+        });
+    }
+
+    /// 棒 3-2b: the capacity-chain machinery — sub-sponge-start comparators
+    /// (meq/minv → mrst) + the materialized chain gate (mcont) — is constraint-
+    /// pinned, not free witness. Tampering it must be UNSAT. (The end-to-end
+    /// value soundness — chain actually forces root == keccak(opvs) — is exercised
+    /// by the opvs-tamper negative in 棒 3-2c, once the root squeeze is bound.)
+    #[test]
+    fn interior_neg_merge_chain() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let l = GateLayout::from_shape(&shape);
+        let w = l.gate_width;
+        let one = Val::ONE;
+        let nm = shape.merge_perms();
+        let kl = (nm - 1) / 2;
+        let t1 = 24 * kl + 1; // childR sub-sponge start (mcnt)
+        let (base, _m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        let rows = base.values.len() / w;
+        let merge_start = 24 * (rows / 24 - nm); // perm-aligned (height not mult of 24)
+
+        let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>)| {
+            let mut t = base.clone();
+            mutate(&mut t);
+            assert!(is_unsat_interior(t, _m.opvs.clone()), "expected UNSAT (chain): {label}");
+        };
+        // Drop the reset flag at the child-R sub-sponge start (mcnt == t1): breaks
+        // `mrst == Σ meq` (the comparator still fires meq1 = 1).
+        probe("drop mrst at childR sponge start", &|t| {
+            t.values[(merge_start + t1 - 1) * w + l.mrst] -= one;
+        });
+        // Tamper the materialized chain gate on a genuine chain boundary (merge
+        // perm 0 r=23, whose next perm is not a reset): breaks the mcont defn.
+        probe("tamper mcont on a chain boundary", &|t| {
+            t.values[(merge_start + 23) * w + l.mcont] += one;
         });
     }
 }
