@@ -596,20 +596,54 @@ git commit -m "feat(m4interior): keccak merge sponge -> interior root (binds + w
 - Modify: `crates/qlab-bench/src/m4interior.rs` (`run_m4interior` full-`prove` + RSS), `crates/qlab-bench/src/main.rs` (dispatch arm)
 - Docs: `docs/m4interior-stage3-run{1,2}.md`
 
-- [ ] **Step 1: `run_m4interior`** — mirror `m4gate`/`m4treerec` bench: build the two-child interior (distinct), `prove` at b4, capture prove time + peak RSS + fixed bytes. Print `print_env`.
+- [x] **Step 1: `run_m4interior`** (`b6f7246`) — mirrors `m4gate`/`m4treerec`: `--only`
+  filter, rows single-child/{b4,b2} (2^18 canary) + two-child/{b4,b2} (2^19). Prove
+  ONCE per process (two reproductions = two launches); child leaves proved serially
+  ONCE and dropped before the interior prove; `extra_capacity_bits = log_blowup` up
+  front (m4skel late-realloc lesson). Reports prove s + fixed MB; peak RSS from
+  external `/usr/bin/time -l` (NOT in-process); bench does not judge (§7.3 = coordinator).
 
-- [ ] **Step 2: Dispatch arm** in `main.rs` after `"m4tree"`. Run: `cargo check -p qlab-bench 2>&1 | tail -3`.
+- [x] **Step 2: Dispatch arm** in `main.rs` after `"m4tree"` (`b6f7246`). `cargo check` green.
 
-- [ ] **Step 3: Measure (heavy, foreground).** Run: `cargo run --release -p qlab-bench -- m4interior 2>&1 | tail -30`. Record prove time, **peak RSS**, bytes.
+- [x] **Step 3: Measure (heavy, foreground, `/usr/bin/time -l` on the release binary
+  directly — no cargo, no pipe on headline runs).** Done, per §7.1: canary first,
+  then two-child b4 (direct), then two-child b2 (wall-safe substitute).
 
-- [ ] **Step 4: Reproduce twice** (bench discipline). Write both runs to `docs/m4interior-stage3-run{1,2}.md` with git rev / prover revs / hardware / OS / power.
+- [x] **Step 4: Reproduce twice** — `docs/m4interior-stage3-run{1,2}.md` with rev /
+  prover / hardware / OS / power / swap state.
 
-- [ ] **Step 5: Compare vs §6** (≤ 30 s / ≤ 32 GB). Inside → report to coordinator (tests + bench + diff → merge). Over < 2× → fallback (i) b2 / (ii) k-tx. Over ≥ 2× → STOP, write numbers, flag design re-open + fallback (iii) Poseidon2-interior (labelled). Do NOT touch design repo.
+- [x] **Step 5: Compare vs §6/§7.3 — FACTS ONLY (no verdict; coordinator's §7.3 lookup).**
 
-- [ ] **Step 6: Commit.**
+- [ ] **Step 6: Commit** (measurement, separate from the `b6f7246` implementation commit).
+
+### Stage-3 progress (2026-07-20, rev `b6f7246`, Apple M5 Max / 36 GiB, AC)
+
+**Six runs, all `swaps 0` / `block I/O 0` (no disk swap → none §7.1.4-disqualified).**
+Headline (reproduced twice each):
+
+- **canary single-child/b4 @ 2^18: 15.22 GB max RSS** (±5 MB, clean, no compression),
+  prove ~6–7 s. Slope anchor with the 2^16 leaf (11.89 GB, PR #18).
+- **two-child/b4 @ 2^19: peak footprint 30.42 GB (reproduced EXACTLY, ±1.3 MB) —
+  the faithful demand.** max RSS is a NON-reproducible macOS-compressor artifact
+  (16.42 ↔ 23.38 GB) — the ~32 GB main-trace LDE (2^21 × ~3,879 × 4 B) demands
+  ~30 GB on a 36 GiB rig → in-RAM compression (no disk swap), so max RSS understates
+  and prove time (42.7–166 s) is compression noise (§7.1.4). This IS the §7.1.3
+  rig-wall case, surfaced by direct measurement (the max-RSS-based canary
+  extrapolation, ~17–20 GB, was misleadingly low for the same reason).
+- **two-child/b2/q80 @ 2^19 (the §7.1.3 substitute): 20.70 GB max RSS = 20.53 GB
+  footprint (reproduced ±1 MB, CLEAN, no compression), prove 4.7–4.9 s.**
+
+Facts vs §6/§7.3 (≤ 30 s / ≤ 32 GB): b4 peak footprint 30.42 GB is under 32 GB but
+close to the 36 GiB ceiling (compressor engages, no disk swap); b2 substitute
+20.53 GB has clear headroom; both clear the time axis absent compression. **Verdict
+deferred to the coordinator's §7.3 table lookup — NOT made here.** Reproduction
+discipline selects: peak footprint for b4 (max RSS fails the twice-reproduce bar),
+both metrics for b2.
+
 ```bash
-git add crates/qlab-bench/src/m4interior.rs crates/qlab-bench/src/main.rs docs/m4interior-stage3-run1.md docs/m4interior-stage3-run2.md
-git commit -m "feat(m4interior): stage-3 two-child prove peak-RSS measurement vs 32 GB"
+git add crates/qlab-bench/src/m4interior.rs crates/qlab-bench/src/main.rs docs/m4interior-stage3-run1.md docs/m4interior-stage3-run2.md docs/superpowers/plans/2026-07-20-m4-interior-two-child.md
+# implementation already in b6f7246; this commit = measurement docs only
+git commit -m "docs(m4interior): stage-3 two-child peak-RSS measurement (§7.1) — b4 fp 30.42 GB / b2 20.53 GB"
 ```
 
 ---
