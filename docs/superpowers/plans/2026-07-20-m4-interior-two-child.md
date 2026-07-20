@@ -154,6 +154,36 @@ git commit -m "feat(m4gate): constraint-pinned csel child-boundary re-anchor + d
   2026-07-20; do inline or retry when API stable. Tree clean at the 2c-scaffold
   commit `7c38898`.)
 
+  **TWO-PRONGED FIX (2026-07-20, from classifying every failing cluster at row
+  200615 via dump_constraint) — this makes 2b-iii tractable.** The ~250 failing
+  constraints split into two categories, NOT one uniform "gate everything":
+  - **Anchored families → GATE with `(1-csel_next)`** (they re-anchor fresh at
+    child R, so their carry must be suppressed): `qsel` rotation (#3673, DONE
+    `f63c92a`), `fring` rotation (#4361, deg-3 → materialize 8), `grp` rotation
+    (#4714, deg-2), `curch` assembly (#4766, deg-3), `chal` assembly, `blkcnt`
+    (deg-3), `preg`/`pzacc`, and the phase carries `phc`/`phd`/`phq` (deg ≤2).
+    Skip the AGREEING ones (`qcnt`→qslots, `pr`→program[0], `bidx`→slot0).
+  - **Non-anchored fold/arith registers → FILL-CONTINUITY (no gating, no columns).**
+    Clusters #4450 (`oreg`), #4906–#5405 (`xreg`/`xfin`/`runev`/`breg`/`inv2s`/
+    `invz`/`mchain` + msel), #5498 (`scr`/`f2dig`), and `fpreg`, `a0/a1/a2`,
+    `p0/p1`, `px0`, `fa2`, `zn`. These are freeze-carried (continuity constraint
+    `nv==cv` when their update gate is off); child R's fresh `Regs::new` (0)
+    breaks the freeze → conflict. They are NOT anchored and are harmless (child
+    R's queries overwrite them before use), so the cheap fix is to make child R
+    INHERIT child L's final values instead of resetting to 0 — the freeze then
+    holds. Implementation: `emit_child(L)` already returns its final `Regs`;
+    give `emit_child` an optional `inherit: Option<&Regs>` and, for child R, copy
+    the non-anchored fields from child L's final regs (keep the anchored fields
+    fresh — they are re-anchored by csel + gated carries). This AVOIDS the
+    infeasible per-constraint deg-3 materialization for the big loop families
+    (oreg=68, fold regs).
+  Order for the next pass: (1) implement fill-continuity for child R (clears the
+  fold/oreg/scr clusters); (2) gate the remaining anchored families (materialize
+  only fring/blkcnt/curch deg-3 ones — small); (3) run two-child SAT → clears
+  200615; (4) un-ignore `interior_two_child_satisfies`. Keep narrow 40-green +
+  degree ≤3 throughout; materialized columns update flush_bytes[2] + the layout
+  reproduce-consts test.
+
   Earlier general note:
   suppression `(1-csel_next)·carry` only *matters* where csel_next=1 (two children
   only), so it is untestable standalone. Plan: build 2c's `build_interior_trace`
