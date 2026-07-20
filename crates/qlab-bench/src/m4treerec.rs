@@ -13,7 +13,7 @@
 
 use p3_uni_stark::{prove, verify, Proof};
 
-use crate::m4gate::{build_gate_trace, GateShape, VerifierGateAir};
+use crate::m4gate::{build_gate_trace, GateShape, VerifierGateAir, GATE_WIDTH};
 use crate::m4gaterec::{self, Schedule};
 use crate::{make_config_with, Config, FriCfg, Val};
 
@@ -177,8 +177,14 @@ mod tests {
         let (nl, nc, nch) = sched.native_counts;
         assert!(nl > 0 && nc > 0 && nch > 0, "all three keccak roles present");
         let (tl, tn, quot) = opened_values_per_query(&leaf);
-        assert_eq!(tl, 3626, "trace-local = gate width");
-        assert_eq!(tn, 3626, "trace-next = gate width (transition constraints)");
+        // Leaf committed width = the NARROW gate width (leaf_proof uses
+        // GateShape::narrow() + VerifierGateAir::new()). Assert against the
+        // layout-derived GATE_WIDTH, not a literal — it grew 3626 → 3638 across
+        // 2b/2c/2d (csel/frgm/bcbd/chi/cc, all inert-for-narrow columns), and a
+        // hardcoded pin here (an m4treerec test, missed by `m4gate`-filtered runs)
+        // silently went stale. GATE_WIDTH tracks it permanently.
+        assert_eq!(tl, GATE_WIDTH, "trace-local = narrow gate width");
+        assert_eq!(tn, GATE_WIDTH, "trace-next = narrow gate width (transition constraints)");
         assert!(quot > 0, "quotient chunks opened");
         assert!(!sched.perms.is_empty(), "native perms recorded");
     }
