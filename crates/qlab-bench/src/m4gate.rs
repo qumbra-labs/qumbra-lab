@@ -2472,9 +2472,13 @@ where
             // limbs ARE the message block (no XOR recovery), and KeccakAir
             // range-bounds them to u16, so the pair-recompose is sound.
             //
-            // D1 binds inner PVs [0, np − fl); the fee TAIL [np − fl, np) is
-            // deliberately left to D2 (the Σfee rider binding) so this commit's
-            // suite — incl. `interior_epoch_fee_boundary` (SAT) — stays green.
+            // Issue #24 (D2): extend the message binding to the fee TAIL
+            // [np − EPOCH_FEE_LIMBS, np) — the Σfee rider's input summands (M3
+            // fee = PV_FEE..PV_LEN = the inner-PV tail). With this the PR #25
+            // boundary CLOSES: `interior_epoch_fee_boundary` inverts from
+            // documented-SAT to UNSAT (a consistent feeL+Σfee tamper now breaks
+            // the fee-tail binding). D1 bound [0, np); D2 removes the exclusion
+            // so ALL inner PVs — incl. the fee tail — are bound.
             {
                 // The plain field element rr = R (monty_rr): pv(inner) == v·R and
                 // the absorbed value recompose == canonical v, so recompose·rr ==
@@ -2483,7 +2487,6 @@ where
                 let rr = c(monty_rr().as_canonical_u32());
                 let opv_inner = self.shape.n_caps() * self.shape.cap_len * 16; // OPV_PVS
                 let np = self.shape.n_pvs;
-                let fee = crate::m4interior::EPOCH_FEE_LIMBS; // D2 handles [np-fee, np)
                 let msg_bytes = np * 4;
                 let padded_len = kl * 136; // per-child padded message length (kl blocks)
                 // child-L sponge = region perms 0..kl (block = p, pv half [0..n_opvs));
@@ -2497,11 +2500,12 @@ where
                         let lane = j / 2;
                         let lb = 4 * lane + 2 * (j % 2); // low limb; +1 = high limb (rate < 68)
                         let recompose = cv(pcol(lb)) + cv(pcol(lb + 1)) * c(1 << 16);
-                        if idx < np - fee {
+                        if idx < np {
                             // value == inner_pvs[idx]; pv slot == inner_pvs[idx]·rr.
+                            // (D1: idx < np−fee; D2: extended through the fee tail.)
                             let target = pv(half + opv_inner + idx);
                             builder.assert_zero(gate.clone() * (recompose * rr.clone() - target));
-                        } else if idx >= np {
+                        } else {
                             // padding position: pin the two limbs to the fixed
                             // pad10*1 constants over the child message tail.
                             let padval = |bi: usize| -> u32 {
@@ -2520,7 +2524,6 @@ where
                             builder.assert_zero(gate.clone() * (cv(pcol(lb)) - c(v & 0xffff)));
                             builder.assert_zero(gate.clone() * (cv(pcol(lb + 1)) - c(v >> 16)));
                         }
-                        // idx in [np - fee, np): the fee tail — bound by D2.
                     }
                 }
             }
@@ -7520,16 +7523,14 @@ mod tests {
         }
     }
 
-    /// 棒 3-3 issue #24 boundary, recorded as a TESTED FACT: the rider binds
-    /// `Σfee` only to the CARRIED fee slots in-circuit. The carried children opvs
-    /// are NOT independently constraint-bound to the child proofs in the interior
-    /// (the merge sponge absorbs them as witness — issue #24). So tampering a
-    /// child's fee AND the exposed sum CONSISTENTLY is **SAT** at the circuit
-    /// level: a faked child fee is caught not here but by the consumer-side
-    /// recompute from verified children (`m4assembly::consumer_fee_ok`, parallel
-    /// to issue #24's `root == keccak-merge(opvs)`). Closing this in-circuit is
-    /// issue #24's msh columns (same fix, same ~+2.4% cells). This test pins the
-    /// boundary so it cannot silently change into a false soundness claim.
+    /// 棒 3-3 issue #24 boundary — NOW CLOSED (D2). This test INVERTED: pre-#24
+    /// the rider bound `Σfee` only to the carried fee slots, and the carried opvs
+    /// were unbound witness, so a CONSISTENT (feeL, Σfee) tamper was SAT — pinned
+    /// here as a documented limitation, NOT a negative. D2 extends the D1 msh
+    /// message binding through the fee TAIL of each child's inner PVs, so feeL is
+    /// now bound to the merge preimage: the consistent tamper breaks the fee-tail
+    /// binding → UNSAT. The consumer-side recompute (`m4assembly::consumer_fee_ok`)
+    /// stays as belt-and-braces. This is the PR #25 boundary closing in-circuit.
     #[test]
     fn interior_epoch_fee_boundary() {
         let _g = heavy_lock();
@@ -7540,11 +7541,16 @@ mod tests {
         let fl = crate::m4interior::EPOCH_FEE_LIMBS;
         let sfee_base = 2 * n_opvs + crate::m4interior::MERGE_ROOT_LIMBS;
         let (base, m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
-        // Consistent tamper: feeL[0] and Σfee both +1 → sum still holds.
+        // Consistent tamper: feeL[0] and Σfee both +1 → the rider SUM still
+        // holds, but feeL[0] (= child-L inner PV np−fl) no longer matches the
+        // merge preimage → D2's fee-tail message binding fires.
         let mut o = m.opvs.clone();
         o[n_opvs - fl] += one;
         o[sfee_base] += one;
-        // SAT at the circuit level (must NOT panic) — the documented #24 boundary.
-        check_constraints(&VerifierGateAir::new_interior(), &base, &o);
+        // UNSAT now (was SAT pre-#24) — the boundary is closed in-circuit.
+        assert!(
+            is_unsat_interior(base, o),
+            "consistent feeL+Σfee tamper must be UNSAT after D2 (PR #25 boundary closed)"
+        );
     }
 }
