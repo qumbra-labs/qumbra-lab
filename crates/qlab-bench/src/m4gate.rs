@@ -2457,6 +2457,73 @@ where
             //     root slot (nm − 1). DROPPING the whole ring (all-zero) violates
             //     THIS → UNSAT — the ring's existence is forced, not optional.
             builder.when_last_row().assert_one(cv(self.layout.msh + (nm - 1)));
+
+            // =============================================================
+            // Issue #24 (D1): merge preimage → pv(opvs) MESSAGE BINDING.
+            // For each child sponge perm p, bind its absorbed rate block (34
+            // values × two u16 preimage limbs each) to the child's inner public
+            // values at the FIXED index for block p, gated by `msh[p]·sf(0)` (the
+            // perm's input row). This upgrades the interior root bind from
+            // computational — hitting pv(root) ⇒ honest inputs BY KECCAK PREIMAGE
+            // RESISTANCE, the PR #23/#25 caveat — to an UNCONDITIONAL
+            // constraint-level bind, and (binding every inner PV) closes the R2
+            // "inner PVs unbound" gap for the interior. The merge sponge is
+            // OVERWRITE-mode (m4interior::sponge_overwrite): the preimage rate
+            // limbs ARE the message block (no XOR recovery), and KeccakAir
+            // range-bounds them to u16, so the pair-recompose is sound.
+            //
+            // D1 binds inner PVs [0, np − fl); the fee TAIL [np − fl, np) is
+            // deliberately left to D2 (the Σfee rider binding) so this commit's
+            // suite — incl. `interior_epoch_fee_boundary` (SAT) — stays green.
+            {
+                // The plain field element rr = R (monty_rr): pv(inner) == v·R and
+                // the absorbed value recompose == canonical v, so recompose·rr ==
+                // pv. NB use `c(rr.as_canonical_u32())`, NOT `cf(rr)` — `cf` would
+                // re-encode rr into its Monty WORD (R²), the wrong factor.
+                let rr = c(monty_rr().as_canonical_u32());
+                let opv_inner = self.shape.n_caps() * self.shape.cap_len * 16; // OPV_PVS
+                let np = self.shape.n_pvs;
+                let fee = crate::m4interior::EPOCH_FEE_LIMBS; // D2 handles [np-fee, np)
+                let msg_bytes = np * 4;
+                let padded_len = kl * 136; // per-child padded message length (kl blocks)
+                // child-L sponge = region perms 0..kl (block = p, pv half [0..n_opvs));
+                // child-R sponge = kl..2kl (block = p-kl, pv half [n_opvs..2n_opvs)).
+                // The root perm (2kl) carries dL‖dR, bound by 棒 3-2c — not here.
+                for p in 0..(2 * kl) {
+                    let (half, block) = if p < kl { (0usize, p) } else { (n_opvs, p - kl) };
+                    let gate = cv(self.layout.msh + p) * sf(0);
+                    for j in 0..34 {
+                        let idx = 34 * block + j;
+                        let lane = j / 2;
+                        let lb = 4 * lane + 2 * (j % 2); // low limb; +1 = high limb (rate < 68)
+                        let recompose = cv(pcol(lb)) + cv(pcol(lb + 1)) * c(1 << 16);
+                        if idx < np - fee {
+                            // value == inner_pvs[idx]; pv slot == inner_pvs[idx]·rr.
+                            let target = pv(half + opv_inner + idx);
+                            builder.assert_zero(gate.clone() * (recompose * rr.clone() - target));
+                        } else if idx >= np {
+                            // padding position: pin the two limbs to the fixed
+                            // pad10*1 constants over the child message tail.
+                            let padval = |bi: usize| -> u32 {
+                                if bi == msg_bytes {
+                                    0x01
+                                } else if bi == padded_len - 1 {
+                                    0x80
+                                } else {
+                                    0
+                                }
+                            };
+                            let mut v = 0u32;
+                            for k in 0..4 {
+                                v |= padval(4 * idx + k) << (8 * k);
+                            }
+                            builder.assert_zero(gate.clone() * (cv(pcol(lb)) - c(v & 0xffff)));
+                            builder.assert_zero(gate.clone() * (cv(pcol(lb + 1)) - c(v >> 16)));
+                        }
+                        // idx in [np - fee, np): the fee tail — bound by D2.
+                    }
+                }
+            }
         }
         // Cap comparison at the last path level of each batch (trace, quotient,
         // then one per FRI round). Shape-driven so wide (3 rounds) skips F3. For
@@ -7362,6 +7429,41 @@ mod tests {
         probe("tamper mrot on a rotation boundary", &|t| {
             t.values[(merge_start + 23) * w + l.mrot] += one;
         });
+    }
+
+    /// Issue #24 (D1): the merge preimage → pv(opvs) MESSAGE binding is LIVE and
+    /// UNCONDITIONAL. Before D1 the interior's inner PVs were unbound (only the
+    /// root squeeze bound them, and only computationally via keccak preimage
+    /// resistance — the PR #23/#25 caveat). These probes are the analogue of PR
+    /// #29's leaf SAT-MISS probes for the interior: tampering an absorbed inner
+    /// PV (or its fill-side preimage limb) must now be UNSAT. The fee TAIL is
+    /// D2's boundary (`interior_epoch_fee_boundary`), so we tamper NON-fee slots.
+    #[test]
+    fn interior_neg_merge_msg() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let one = Val::ONE;
+        let n_opvs = shape.n_opvs();
+        let opv_inner = shape.n_caps() * shape.cap_len * 16; // OPV_PVS
+        let (base, m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+
+        // (1) tamper child-L inner PV 0 (anchor chunk 0) in the exposed opvs →
+        //     the msh recompose·rr == pv binding fires. The trace (keccak) is
+        //     untouched, so ONLY the D1 message binding can catch this. Was SAT
+        //     (SAT-MISS) before D1; must be UNSAT now.
+        {
+            let mut o = m.opvs.clone();
+            o[opv_inner] += one;
+            assert!(is_unsat_interior(base.clone(), o), "tamper child-L inner PV must be UNSAT");
+        }
+        // (2) same for a mid child-R inner PV (second half) — proves both halves
+        //     are bound, at a non-fee index (opv_inner + 40 = NF2 chunk 8).
+        {
+            let mut o = m.opvs.clone();
+            o[n_opvs + opv_inner + 40] += one;
+            assert!(is_unsat_interior(base.clone(), o), "tamper child-R inner PV must be UNSAT");
+        }
     }
 
     /// 棒 3-3 (M4 step 2): the epoch Σfee rider is exposed and correct — the
