@@ -109,13 +109,22 @@ pub fn run_m5note(power: &str) {
     println!("| **FO-skip decap (path b, decomposition est.)** | **{foskip_us:.3}** | **{foskip_per_s:.0}** |");
     println!();
     println!(
-        "- FO-skip compute saved ≈ **{saved_pct:.1}%** (doc claims ~40–50%); \
+        "- FO-skip compute saved ≈ **{saved_pct:.1}%** (UPPER bound); \
          speedup factor ≈ **{speedup:.2}×**"
     );
     println!(
-        "- survey reference: ML-KEM-768 decap ~10k ops/s on a low-end phone core \
-         (Cortex-A72 NEON); this rig is a fast desktop core — the phone number is \
-         the design-relevant one, and confirms compute is a non-issue (≥100× from binding)."
+        "- INTERPRETATION vs doc's ~40–50%: the FO re-encryption re-expands the \
+         ML-KEM matrix Â (a SHAKE-heavy step ABSENT from CPA decryption), so on this \
+         portable impl the re-encryption is a larger share of decap than the doc's \
+         estimate assumed. This is a decomposition UPPER bound (encap ⪆ re-encryption); \
+         a definitive figure needs a real CPA-decap — NOT a doc correction until then."
+    );
+    println!(
+        "- absolute throughput: ml-kem is portable pure-Rust (NO NEON/AVX2). The \
+         survey's ~10k ops/s A72 and ~70k ops/s M1 numbers were NEON-optimized \
+         reference code, so absolute ops/s here run lower than a SIMD build — but \
+         still ~5× the A72 phone reference. Compute remains a non-issue (≥100× from \
+         the bandwidth bind); bandwidth is the whole game (survey §4)."
     );
     println!(
         "- CAVEAT: ml-kem 0.3.2 does not expose CPA-decap (pke::decrypt is pub(crate)); \
