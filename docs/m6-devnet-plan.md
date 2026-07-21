@@ -245,10 +245,34 @@ Real wire transport (compact-block relay, Dandelion++, §7/§9) is out of devnet
 
 ### 棒 5 — real-proof integration + measured report
 Block bodies carry REAL M3 tx proofs (pre-generate a small pool once, reuse —
-proving is ~1.6 s each). Validation calls the existing verifier (sub-ms/proof).
-Measure per-block validation time vs the §7 sub-second budget. Reports:
-`docs/m6-devnet-run{1,2}.md` (block cadence, finality latency, validation time,
-degraded-mode behavior). Reproduce twice per bench discipline.
+proving is ~1.6 s each). Validation calls the existing verifier. Measure per-block
+validation time vs the §7 sub-second budget. Reports: `docs/m6-devnet-run{1,2}.md`.
+
+**Implemented:**
+- 5a `qlab-devnet/body.rs`: `BlockBody` + `TxVerifier` trait + `validate_body`
+  (proof-verify + anchor-finalized §6 + fee=posted_fee §8 + in-block nullifier
+  dedup), mock-tested, prover-free.
+- 5b `qlab-bench/m6devnet.rs` (additive bench mode; qlab-bench now deps
+  qlab-devnet): pre-generates a POOL=4 real M3 proof pool via
+  `m4gaterec::consensus_proof_seeded`, verifies via real `p3_uni_stark::verify`,
+  drives a `Node` with real-proof bodies, measures. Light mock #[test] in the
+  suite; heavy proving only in the bench mode (run via the binary).
+
+**Measured (reproduced twice, Apple M5 Max/36 GiB, AC, b16/q20/g22):**
+- single M3 proof verify **~20.0–20.1 ms**; per-block validation **~75–77 ms** for
+  4 real proofs (~19 ms/tx); RSS **11.9 GB**; proof 136 KB.
+- block cadence 2 s sim (real 60–75 s); finality latency ≈ cadence (8 blocks) ≈
+  **8–10 min** at real block time (minutes-class, §4); degraded→recover clean.
+- **KEY FINDING (design-repo update owed):** verify is **~20 ms, NOT sub-ms** —
+  §5's sub-ms is WHIR-class (unadopted). At the current conservative-hash verifier
+  §7's "sub-ms × hundreds = sub-second/block" is optimistic: **~50 txs/block**
+  fits a 1 s budget (still far above the 1–10 TPS envelope, so validation remains
+  off the critical path). Details in `m6-devnet-run1.md`.
+
+**Modelling caveats (honest):** block bodies reference pooled proofs by index
+(reuse, per mandate); the M3 test-proof internal fee (1000) is a separate
+placeholder from the posted-price table (both consensus-parameters-appendix-open);
+cross-block nullifier-set tracking is a documented extension.
 
 ---
 
@@ -261,7 +285,7 @@ degraded-mode behavior). Reproduce twice per bench discipline.
 | 2 | finality committee (⚠ ML-DSA stop-point) | **DONE** | ml-dsa 0.1.1 wired; committee + ⅔-quorum ML-DSA-65 votes + `FinalityTracker` + anchors-from-finalized-only API; +9 tests (devnet 39). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 39 / note 21 = 146, 0 fail) |
 | 3 | Ebb-and-Flow semantics | **DONE** | finality-aware fork choice (no-reorg-past-finality, load-bearing test), equivocation→tombstone+slash, jail-no-slash, stall→degraded→recover; +9 tests (devnet 48). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 48 / note 21 = 155, 0 fail) |
 | 4 | multi-node local sim | **DONE** | in-process `Network` (gossip, partition/heal) + posted-price fee table; scenarios: partition/rejoin, committee-minority offline, miner-only liveness; +6 tests (devnet 54). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 54 / note 21 = 161, 0 fail) |
-| 5 | real-proof integration + report | **in progress** | 5a DONE: `body.rs` (BlockBody + `TxVerifier` + `validate_body`: proof/anchor-final/fee/nullifier), mock-tested, +5 (devnet 59). 5b: `m6devnet` bench mode (real M3 proofs + measured report) — next |
+| 5 | real-proof integration + report | **DONE** | 5a: `body.rs` (validate_body, mock-tested, +5 → devnet 59). 5b: `m6devnet` bench mode (real M3 proof pool + measured report, +1 wiring test → devnet 60) + `docs/m6-devnet-run{1,2}.md`. **Measured: verify ~20 ms/proof (NOT sub-ms — WHIR-gated), per-block(4) ~75 ms, ~50 txs/block for 1 s budget, RSS 11.9 GB, clean finality + degraded→recover.** Full unfiltered `cargo test --release` green |
 
 ## Placeholder-constants inventory
 
