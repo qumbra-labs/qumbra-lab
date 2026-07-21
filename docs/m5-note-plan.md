@@ -128,17 +128,17 @@ Amortized bytes/note = `32 + 8 + 1 + ceil(1088 / k)` for `k` outputs to the reci
 
 ## Tasks (staged commits; suite green at each)
 
-- [ ] **T1 — Scaffold + plan.** New crate `qlab-note` (empty lib), workspace member, this plan doc. `cargo check` green. Commit.
-- [ ] **T2 — Keccak-256 sponge (`hash.rs`).** TDD: test `keccak256(b"")` == known vector `c5d2…a470`; test multi-block. Implement sponge over `qlab_air::reference::keccak_f`. Commit.
-- [ ] **T3 — Note + commitment (`note.rs`).** TDD: cross-check `note_commitment(v,rkm,rho,rseed)` == qlab-air packing (this test moves to qlab-bench in T9 for the acceptance run; keep a local one too). Plaintext codec round-trip. Commit.
-- [ ] **T4 — KEM wrapper (`kem.rs`).** TDD: encap→decap round-trip returns equal `K`; wrong-key decap returns different `K`; ACVP-shape sanity. Path-(b) CPA-decap: implement if crate exposes K-PKE.Decrypt, else record the measurement-decomposition fallback. Commit.
-- [ ] **T5 — Derivation (`derive.rs`).** TDD: tag determinism; distinct domains → distinct outputs; per-index key/nonce distinctness. Commit.
-- [ ] **T6 — Wire layout (`wire.rs`).** TDD: serialize/deserialize round-trip; byte-size accounting asserts 1129 (1-of-1) and 585 (2-of-1). Commit.
-- [ ] **T7 — Encrypt + scan both paths (`scan.rs`).** TDD: `encrypt_to_recipient` then `scan` FullFo + FoSkip both detect+decrypt the round-trip. Commit.
-- [ ] **T8 — Negative + amortization tests (in qlab-note).** wrong-key → no detection; tampered ct → no detection/AEAD fail; tampered cm → FoSkip recompute rejects; 2-output/one-ct amortization detects both. Commit.
-- [ ] **T9 — qlab-bench integration (`m5note.rs` + main.rs arm).** Port the enumerated round-trip/negative/amortization tests + qlab-air cm cross-check into qlab-bench so `cargo test --release -p qlab-bench` exercises them. Commit.
-- [ ] **T10 — Bench mode + measure twice.** decap/s single-core (both paths + FO-skip speedup factor vs doc's 40–50%), bytes/note (1-of-1, 2-of-1) vs doc ~600 B and survey's ~10k decap/s A72 ref. Write results to `docs/m5note-run{1,2}.md`. Commit.
-- [ ] **T11 — Full unfiltered suite green; open PR.** Body: test count, measured table vs doc numbers, crate-choice record, remainder (ANON-CCA argument stays OPEN and named; unaudited crate; CPA-decap API status). Do NOT merge.
+- [x] **T1 — Scaffold + plan.** New crate `qlab-note` (empty lib), workspace member, this plan doc. `cargo check` green. Commit.
+- [x] **T2 — Keccak-256 sponge (`hash.rs`).** TDD: test `keccak256(b"")` == known vector `c5d2…a470`; test multi-block. Implement sponge over `qlab_air::reference::keccak_f`. Commit.
+- [x] **T3 — Note + commitment (`note.rs`).** TDD: cross-check `note_commitment(v,rkm,rho,rseed)` == qlab-air packing (this test moves to qlab-bench in T9 for the acceptance run; keep a local one too). Plaintext codec round-trip. Commit.
+- [x] **T4 — KEM wrapper (`kem.rs`).** TDD: encap→decap round-trip returns equal `K`; wrong-key decap returns different `K`; ACVP-shape sanity. Path-(b) CPA-decap: implement if crate exposes K-PKE.Decrypt, else record the measurement-decomposition fallback. Commit.
+- [x] **T5 — Derivation (`derive.rs`).** TDD: tag determinism; distinct domains → distinct outputs; per-index key/nonce distinctness. Commit.
+- [x] **T6 — Wire layout (`wire.rs`).** TDD: serialize/deserialize round-trip; byte-size accounting asserts 1129 (1-of-1) and 585 (2-of-1). Commit.
+- [x] **T7 — Encrypt + scan both paths (`scan.rs`).** TDD: `encrypt_to_recipient` then `scan` FullFo + FoSkip both detect+decrypt the round-trip. Commit.
+- [x] **T8 — Negative + amortization tests (in qlab-note).** wrong-key → no detection; tampered ct → no detection/AEAD fail; tampered cm → FoSkip recompute rejects; 2-output/one-ct amortization detects both. Commit.
+- [x] **T9 — qlab-bench integration (`m5note.rs` + main.rs arm).** Port the enumerated round-trip/negative/amortization tests + qlab-air cm cross-check into qlab-bench so `cargo test --release -p qlab-bench` exercises them. Commit.
+- [x] **T10 — Bench mode + measure twice.** decap/s single-core (both paths + FO-skip speedup factor vs doc's 40–50%), bytes/note (1-of-1, 2-of-1) vs doc ~600 B and survey's ~10k decap/s A72 ref. Write results to `docs/m5note-run{1,2}.md`. Commit.
+- [x] **T11 — Full unfiltered suite green; open PR.** Body: test count, measured table vs doc numbers, crate-choice record, remainder (ANON-CCA argument stays OPEN and named; unaudited crate; CPA-decap API status). Do NOT merge.
 
 ## Remainder (stays open — named)
 
