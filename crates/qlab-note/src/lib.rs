@@ -16,4 +16,5 @@
 //! circuit binds) — never forked. See `note::note_commitment`.
 
 pub mod hash;
+pub mod kem;
 pub mod note;
