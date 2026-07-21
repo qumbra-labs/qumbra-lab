@@ -816,6 +816,7 @@ dependencies = [
  "p3-util",
  "postcard",
  "qlab-air",
+ "qlab-devnet",
  "qlab-note",
  "rand",
  "serde",

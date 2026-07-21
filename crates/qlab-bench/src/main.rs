@@ -28,6 +28,7 @@ mod m4price;
 mod m4route;
 mod m4skel;
 mod m5note;
+mod m6devnet;
 mod narrow_bench;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -961,6 +962,10 @@ fn main() {
         }
         "m5note" => {
             m5note::run_m5note(&power);
+            return;
+        }
+        "m6devnet" => {
+            m6devnet::run_m6devnet(&power);
             return;
         }
         "bucket" => {
