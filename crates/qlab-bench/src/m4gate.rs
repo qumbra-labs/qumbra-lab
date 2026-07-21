@@ -2695,6 +2695,35 @@ where
             builder.assert_zero(fs.clone() * (cv(self.layout.fsaccept) - (AB::Expr::ONE - cv(self.layout.fst7) * cv(self.layout.fsnz))));
 
             // =================================================================
+            // R3 (issue #21): FSGATE schedule-position pin. FS draws are hosted
+            // only on the consumer/trailer perms (`consumersel` = refsel +
+            // block-0 obs shsel; `lane_plan` classifies obs-flush block-0 perms
+            // as Obs{block:0} and the trailer/refills as Refill with refsel=1).
+            // Pinning FSGATE off every other perm stops the byte gadget being
+            // spuriously activated on a non-digest perm — relocating FS activity
+            // while staying locally consistent (the Stage-D residual). The
+            // row-WITHIN-a-perm is already pinned by the limb_mux above; the
+            // contiguity constraint forbids gapped / shifted draw rows within a
+            // hosting perm (draws honestly fill rows 0..2·ndraws as a prefix).
+            // =================================================================
+            {
+                let mut consumersel = cv(self.layout.refsel);
+                for f in 1..self.consts.flush_blocks.len() {
+                    consumersel = consumersel
+                        + cv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0));
+                }
+                builder.assert_zero(fs.clone() * (AB::Expr::ONE - consumersel));
+                // Contiguous prefix within a perm: FSGATE may not turn back on
+                // (0 -> 1) except across a perm boundary (gated out by 1-sf(23)).
+                let mut t = builder.when_transition();
+                t.assert_zero(
+                    (AB::Expr::ONE - sf(23))
+                        * nv(self.layout.fsgate)
+                        * (AB::Expr::ONE - cv(self.layout.fsgate)),
+                );
+            }
+
+            // =================================================================
             // Ext-challenge assembly (inc-4): accepted field draws feed the
             // self.layout.coef ring / self.layout.curch limbs; every 4th accepted draw assembles
             // self.layout.chal[grp] and advances the self.layout.grp ring. PoW/query-index (bits) draws
@@ -6439,6 +6468,28 @@ mod tests {
         assert_unsat(move |t, _o, _qr, fd| {
             let (row, _) = fd[0];
             t.values[row * w + FSACC] += Val::ONE;
+        });
+    }
+
+    /// R3 (issue #21): FSGATE schedule-position pin. A field draw sits on the
+    /// even/odd row pair (2j, 2j+1) of a draw-hosting (consumersel) perm, with
+    /// FSGATE=1 on both. De-activating the EVEN half (relocating/shifting the
+    /// draw pattern away from its scheduled contiguous prefix) leaves every FS
+    /// constraint satisfied on base (fs=0 only *removes* gated enforcement, and
+    /// the even row carries no crot/grot), so the witness is otherwise internally
+    /// consistent — but the new contiguity pin
+    /// `(1-sf(23))·fsgate(next)·(1-fsgate(cur))==0` fires on the induced 0->1
+    /// step. Also exercised: the row still reads a real digest limb, so this is a
+    /// genuine "moved FS row", not a corrupted one.
+    #[test]
+    fn gate_neg_fs_row_moved() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, _qr, fd| {
+            // fd holds accepted field draws at their ODD rows (2j+1); its even
+            // partner (2j) is the same draw's first FS row, FSGATE=1 honestly.
+            let odd = fd[0].0;
+            assert!(odd % 24 >= 1, "field draw not on an even/odd pair");
+            t.values[(odd - 1) * w + FSGATE] = Val::ZERO;
         });
     }
 
