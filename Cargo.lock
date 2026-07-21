@@ -800,6 +800,7 @@ dependencies = [
  "p3-util",
  "postcard",
  "qlab-air",
+ "qlab-note",
  "rand",
  "serde",
 ]
