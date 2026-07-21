@@ -19,3 +19,4 @@ pub mod derive;
 pub mod hash;
 pub mod kem;
 pub mod note;
+pub mod wire;
