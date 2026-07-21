@@ -806,6 +806,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "qlab-devnet"
+version = "0.0.0"
+dependencies = [
+ "qlab-air",
+ "tiny-keccak",
+]
+
+[[package]]
 name = "qlab-note"
 version = "0.0.0"
 dependencies = [
