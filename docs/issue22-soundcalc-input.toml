@@ -1,0 +1,69 @@
+# Qumbra — three lane configs at g22 (issue #22 / B′).
+#
+# Post-quantum privacy L1: raw fixed-shape narrow-Keccak STARK (DEEP-ALI + FRI),
+# KoalaBear degree-4 extension, no lookups (the narrow Keccak AIR is lookup-free,
+# M1.5b). Modeled on the Pico FRI_STARK template. Purpose: put the FULL proven-
+# regime soundness term inventory (query + commit + DEEP/ALI) on the record for
+# all three lanes at the adopted g22 grind — the design appendix hand-calc only
+# computed the query term (issue #22 item 2 / fri-soundness-accounting §3, §5.2).
+#
+# hash_size_bits = 256: Keccak-256-class MMCS digest (collision 128 > 100 → non-
+# binding). num_columns is documentation only (the loader uses batch_size = the
+# committed trace width). opening_points = 2 (local + next row window → max_combo).
+# num_constraints: leaf/interior = 5,549 (measured, m4gate `docs/m4gate-step0bii
+# -run1.md`); consensus = 900 is an ESTIMATE for the narrow-Keccak bucket AIR (not
+# separately measured) — it feeds only the ALI term, which is non-binding at 2^124.
+
+[zkevm]
+name = "Qumbra"
+protocol_family = "FRI_STARK"
+field = "KoalaBear^4"
+hash_size_bits = 256
+
+# --- Consensus lane: the M3 2×2 tx bucket (618 cols × 2^18), b16/q20/g22/fp16/a16
+[[circuits]]
+name = "consensus_b16_q20_g22"
+rho = 0.0625            # b16 = blowup 16
+trace_length = 262144   # 2^18
+air_max_degree = 3
+num_columns = 618
+num_constraints = 900   # ESTIMATE (narrow-Keccak bucket; non-binding ALI term)
+batch_size = 618        # committed main-trace width
+opening_points = 2      # local + next row
+power_batching = true
+num_queries = 20
+fri_folding_factors = [16, 16, 16, 4]   # 2^18 → 2^4, arities [a16,a16,a16,a4]
+fri_early_stop_degree = 256             # final domain = fp16 × b16 (soundcalc counts domain size)
+grinding_query_phase = 22               # g22 (B′)
+
+# --- Aggregation leaf lane: the m4gate verifier gate (3638 cols × 2^16), b4/q40/g22
+[[circuits]]
+name = "leaf_agg_b4_q40_g22"
+rho = 0.25              # b4 = blowup 4
+trace_length = 65536    # 2^16
+air_max_degree = 3
+num_columns = 3638
+num_constraints = 5549  # measured (m4gate, deg ≤ 3)
+batch_size = 3638
+opening_points = 2
+power_batching = true
+num_queries = 40
+fri_folding_factors = [16, 16, 16]      # 2^16 → 2^4
+fri_early_stop_degree = 64               # final domain = fp16 × b4
+grinding_query_phase = 22
+
+# --- Interior lane: the interior verifier node (3638 cols × 2^19), b2/q80/g22
+[[circuits]]
+name = "interior_b2_q80_g22"
+rho = 0.5               # b2 = blowup 2
+trace_length = 524288   # 2^19
+air_max_degree = 3
+num_columns = 3638
+num_constraints = 5549  # ≈ leaf gate + merge lane
+batch_size = 3638
+opening_points = 2
+power_batching = true
+num_queries = 80
+fri_folding_factors = [16, 16, 16, 8]   # 2^19 → 2^4
+fri_early_stop_degree = 32               # final domain = fp16 × b2
+grinding_query_phase = 22

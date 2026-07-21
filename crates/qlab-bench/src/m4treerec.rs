@@ -25,7 +25,7 @@ use crate::{make_config_with, Config, FriCfg, Val};
 pub(crate) const AGG_CFG: FriCfg = FriCfg {
     log_blowup: 2,      // b4
     num_queries: 40,    // q40
-    grind_bits: 20,     // g20
+    grind_bits: 22,     // g22 (B′, issue #22 — was g20; +2 restores 100.4 under DG25 repricing; sizes unchanged)
     log_final_poly_len: 4, // fp16
     max_log_arity: 4,   // a16
 };
@@ -85,7 +85,7 @@ pub(crate) fn run_m4tree(power: &str) {
     crate::print_env(power);
     println!(
         "- input: one leaf `VerifierGateAir` wide proof committed at \
-         b4/q40/g20/fp16/a16 (the aggregation lane). The interior node verifies \
+         b4/q40/g22/fp16/a16 (the aggregation lane). The interior node verifies \
          a proof of THIS shape (2^16 x 3,626), not the M3 narrow proof the leaf \
          itself verified — so a new recorder (this module) is required."
     );

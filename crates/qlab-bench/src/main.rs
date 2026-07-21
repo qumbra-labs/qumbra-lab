@@ -222,10 +222,20 @@ fn make_config_with(cfg: &FriCfg) -> Config {
         query_proof_of_work_bits: cfg.grind_bits,
         mmcs: challenge_mmcs,
     };
-    // Every config in this rig must clear ~100-bit conjectured security.
+    // Every config in this rig must clear the security bar. Label 口径 (design
+    // repo `fri-soundness-accounting-2026-07.md`, 2026-07-19): "~100-bit
+    // conjectured (list-decoding-capacity accounting, 2025-repriced); proven-
+    // Johnson ≈ 59/58 query-phase, field-capped ~80". The pinned Plonky3 0.6.x
+    // `conjectured_soundness_bits()` still computes the OLD capacity arithmetic
+    // (num_queries·log2(blowup) + grind) — the up-to-capacity conjecture behind
+    // it was disproved in late 2025 (DG25/CS25). We do NOT change the method
+    // (the DG25 re-anchor is a docs-layer relabel, not a code formula change);
+    // post-B′ (g22) it returns 102 for all three lanes (20·4+22 = 40·2+22 =
+    // 80·1+22), a conservative proxy for the honest DG25 conjectured ~100.4–100.8.
+    // So `>= 100` on the capacity value still gates correctly with ~2 bits to spare.
     assert!(
         fri_params.conjectured_soundness_bits() >= 100,
-        "config {} is only {} bits conjectured",
+        "config {} is only {} bits conjectured (capacity proxy)",
         cfg.label(),
         fri_params.conjectured_soundness_bits(),
     );

@@ -119,9 +119,13 @@ const N_PVS: usize = 84;
 /// Queries and index bits.
 const NQ: usize = 20;
 const LOG_MAX: usize = 22;
-/// Query-PoW grind bits (CONSENSUS_CFG.grind_bits): the PoW draw's low
-/// GRIND_BITS bits must be zero.
-const GRIND_BITS: usize = 20;
+/// Query-PoW grind bits: the PoW draw's low GRIND_BITS bits must be zero.
+/// DERIVED from `CONSENSUS_CFG.grind_bits` (not hardcoded) so the gate's
+/// in-circuit PoW replay can never silently drift from the config that
+/// actually grinds the inner M3 proof — B′ (issue #22) bumped it 20 → 22 and
+/// this tracks automatically. (The PoW byte-packing gadget loops
+/// `grind_bits - 16` times, so a mismatch would desync the recorded schedule.)
+const GRIND_BITS: usize = CONSENSUS_CFG.grind_bits;
 /// Fold rounds: log arities and cumulative shifts.
 const LOG_ARITIES: [usize; 4] = [4, 4, 4, 2];
 const CUM: [usize; 5] = [0, 4, 8, 12, 14];
@@ -239,7 +243,7 @@ impl GateShape {
             n_pvs: 84,
             nq: 20,
             log_max: 22,
-            grind_bits: 20,
+            grind_bits: GRIND_BITS, // = CONSENSUS_CFG.grind_bits (g22 post-B′)
             log_arities: vec![4, 4, 4, 2],
             cap_len: 8,
             log_blowup: 4, // b16
@@ -248,8 +252,8 @@ impl GateShape {
     }
 
     /// A leaf's wide `VerifierGateAir` proof (2^16 x 3,626, committed at the
-    /// aggregation config b4/q40/g20/fp16/a16) — the interior node's inner
-    /// proof. Values from `m4treerec::AGG_CFG` + `docs/m4tree-step1a-run1.md`:
+    /// aggregation config b4/q40/g22/fp16/a16 — g22 post-B′) — the interior
+    /// node's inner proof. Values from `m4treerec::AGG_CFG` + `docs/m4tree-step1a-run1.md`:
     /// 3,626-col rows, 40 queries, 8 quotient words, 3 arity-16 FRI rounds,
     /// inner LDE 2^(16+2)=2^18, and inner public values = the leaf gate's own
     /// outer public-value count `N_OPVS` (852 = 6*8*16 + 84).
@@ -264,7 +268,7 @@ impl GateShape {
             n_pvs: N_OPVS, // the leaf gate's opvs become the interior's inner PVs
             nq: 40,
             log_max: 18,
-            grind_bits: 20,
+            grind_bits: crate::m4treerec::AGG_CFG.grind_bits, // g22 post-B′ (derived from the leaf's config)
             log_arities: vec![4, 4, 4],
             cap_len: 8,
             log_blowup: 2, // b4 (AGG_CFG)
@@ -5587,27 +5591,13 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout, shape: &GateShape) {
 // /usr/bin/time -l (m4census RSS-attribution discipline).
 // ---------------------------------------------------------------------------
 
+// The two house lane configs, referenced directly from the shipping config
+// consts (derive-not-hardcode) so this leaf bench always measures exactly the
+// leaf-agg (AGG_CFG = b4/q40) and consensus (CONSENSUS_CFG = b16/q20) lanes —
+// both g22 post-B′ (issue #22). Labels are display-only.
 const LANE_CFGS: [(&str, FriCfg); 2] = [
-    (
-        "b4/q40/g20/fp16/a16",
-        FriCfg {
-            log_blowup: 2,
-            num_queries: 40,
-            grind_bits: 20,
-            log_final_poly_len: 4,
-            max_log_arity: 4,
-        },
-    ),
-    (
-        "b16/q20/g20/fp16/a16",
-        FriCfg {
-            log_blowup: 4,
-            num_queries: 20,
-            grind_bits: 20,
-            log_final_poly_len: 4,
-            max_log_arity: 4,
-        },
-    ),
+    ("b4/q40/g22/fp16/a16", crate::m4treerec::AGG_CFG),
+    ("b16/q20/g22/fp16/a16", CONSENSUS_CFG),
 ];
 
 pub(crate) fn run_m4gate(power: &str, only: Option<&str>) {

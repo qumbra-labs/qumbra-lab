@@ -43,11 +43,17 @@ use crate::{make_config_with, Config, FriCfg, Val};
 
 pub(crate) type Ext = BinomialExtensionField<Val, 4>;
 
-/// The decided consensus config (identical to m4census's).
+/// The decided consensus config. B′ (issue #22, adopted 2026-07-19): grind
+/// 20 → 22 to restore the "~100-bit conjectured" headline under the DG25
+/// list-decoding-capacity repricing (b16/q20 = 98.8 pre-grind → 100.8). Proof
+/// sizes are byte-identical — grinding is a PoW nonce, not openings. This now
+/// intentionally diverges from m4census's g20 (a historical step-0a census
+/// config the design doc records as b16/q20/g20; the keccak-f count it measured
+/// is grind-independent, so that number still stands).
 pub(crate) const CONSENSUS_CFG: FriCfg = FriCfg {
     log_blowup: 4,
     num_queries: 20,
-    grind_bits: 20,
+    grind_bits: 22,
     log_final_poly_len: 4,
     max_log_arity: 4,
 };
