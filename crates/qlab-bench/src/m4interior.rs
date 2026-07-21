@@ -14,6 +14,21 @@ use crate::Val;
 /// limbs, matching the cap-limb encoding in `outer_pvs`).
 pub(crate) const MERGE_ROOT_LIMBS: usize = 16;
 
+/// Epoch supply-attestation rider width (棒 3-3, M4 step 2): the M3 transaction
+/// `fee` is public values `PV_FEE..PV_LEN` = 4 sixteen-bit limbs. The interior
+/// exposes their per-child SUM as the root's `Σfee` rider (aggregation-rung1
+/// §2's epoch rider, prototype form — Σcoinbase is a block-level M6 concern, not
+/// an M3 PV). Fee is the TAIL of each child's opvs: the M3 inner PVs are the
+/// opvs tail (after the caps) and `fee` is the M3 PV tail, so the summands are
+/// the last `EPOCH_FEE_LIMBS` of each interior pv half.
+pub(crate) const EPOCH_FEE_LIMBS: usize = 4;
+// Stays glued to the M3 public-value layout (fee = PV_FEE..PV_LEN, the tail).
+const _: () = assert!(
+    EPOCH_FEE_LIMBS == qlab_air::narrow::PV_LEN - qlab_air::narrow::PV_FEE
+        && qlab_air::narrow::PV_LEN == qlab_air::narrow::PV_FEE + EPOCH_FEE_LIMBS,
+    "EPOCH_FEE_LIMBS must equal the M3 fee width, and fee must be the PV tail"
+);
+
 /// Overwrite-mode keccak sponge over `bytes` (the leaf-sponge convention: the
 /// rate lanes are OVERWRITTEN by each block's message, the capacity is carried;
 /// pad10*1). Returns each permutation's INPUT state (rate = message block,
@@ -68,6 +83,24 @@ pub(crate) fn merge_root(opvs_l: &[Val], opvs_r: &[Val]) -> Vec<Val> {
         .chunks(2)
         .map(|c| Val::from_u32(u16::from_le_bytes([c[0], c[1]]) as u32))
         .collect()
+}
+
+/// The epoch Σfee the interior root exposes, recomputed from the two children's
+/// (leaf) opvs — the consumer-side authenticity check for the rider, parallel to
+/// `merge_root` for issue #24. `fee` is the TAIL of each child's opvs (M3 fee =
+/// PV_FEE..PV_LEN, the inner-PV tail). The interior re-scales inner PVs by
+/// `monty_rr` in `outer_pvs`, so the value it binds is `(feeL + feeR)·rr`.
+///
+/// Honest scope (issue #24 boundary): the interior binds `Σfee` only to the
+/// CARRIED pv slots in-circuit — the carried opvs' authenticity is the issue #24
+/// consumer invariant (`root == keccak-merge(opvs)`; fee ⊂ opvs). A consumer who
+/// runs THIS check against its own verified children's opvs authenticates the
+/// exposed Σfee without trusting the prover's carried halves.
+pub(crate) fn epoch_fee_sum_expected(opvs_l: &[Val], opvs_r: &[Val]) -> Vec<Val> {
+    debug_assert_eq!(opvs_l.len(), opvs_r.len(), "children share the leaf opvs shape");
+    let rr = crate::m4gate::monty_rr();
+    let base = opvs_l.len() - EPOCH_FEE_LIMBS; // fee is the opvs tail
+    (0..EPOCH_FEE_LIMBS).map(|j| (opvs_l[base + j] + opvs_r[base + j]) * rr).collect()
 }
 
 /// The child sub-sponge digests `(dL, dR)` as `MERGE_ROOT_LIMBS` u16 limbs each

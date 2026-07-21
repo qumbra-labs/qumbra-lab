@@ -1791,8 +1791,12 @@ impl<F: Field> BaseAir<F> for VerifierGateAir {
     }
     fn num_public_values(&self) -> usize {
         // Interior (n_children > 1): the two consumed child opvs halves + the
-        // 棒 3 merge root (§2 exposed binding value).
-        let merge = if self.n_children > 1 { crate::m4interior::MERGE_ROOT_LIMBS } else { 0 };
+        // 棒 3 merge root (§2 exposed binding value) + the 棒 3-3 epoch Σfee rider.
+        let merge = if self.n_children > 1 {
+            crate::m4interior::MERGE_ROOT_LIMBS + crate::m4interior::EPOCH_FEE_LIMBS
+        } else {
+            0
+        };
         self.shape.n_opvs() * self.n_children + merge
     }
 }
@@ -2315,6 +2319,25 @@ where
             for m in 0..16 {
                 builder.assert_zero(
                     cv(self.layout.meq + 3) * (cv(ocol(m)) - pv(2 * n_opvs + m)),
+                );
+            }
+            // 棒 3-3 (M4 step 2): epoch Σfee rider. The exposed root pv
+            // `Σfee[j] = feeL[j] + feeR[j]`, where each child's fee limbs are the
+            // TAIL of its opvs half (M3 fee = PV_FEE..PV_LEN, the inner-PV tail →
+            // the opvs tail → the pv-half tail). feeL = pv(n_opvs - fl + j),
+            // feeR = pv(2·n_opvs - fl + j); the rider sits after the merge root at
+            // pv(2·n_opvs + MERGE_ROOT_LIMBS + j). Bound at the root perm's last
+            // row (meq[3]) alongside the root squeeze; deg 1 (a witness-flag times
+            // a pv-linear form). feeL/feeR are the interior's inner PVs, bound to
+            // the verified children via the child challenger absorption — so a
+            // faked child fee (or a tampered exposed sum) is UNSAT.
+            let fl = crate::m4interior::EPOCH_FEE_LIMBS;
+            let sfee_base = 2 * n_opvs + crate::m4interior::MERGE_ROOT_LIMBS;
+            for j in 0..fl {
+                let fee_l = pv(n_opvs - fl + j);
+                let fee_r = pv(2 * n_opvs - fl + j);
+                builder.assert_zero(
+                    cv(self.layout.meq + 3) * (pv(sfee_base + j) - fee_l - fee_r),
                 );
             }
         }
@@ -5254,6 +5277,20 @@ pub(crate) fn build_interior_trace(
     // 棒 3: the interior's exposed binding value = the merge root (§2), appended
     // after the two consumed child opvs halves.
     opvs.extend(crate::m4interior::merge_root(opvs_l, opvs_r));
+    // 棒 3-3 (M4 step 2): the epoch Σfee rider, appended after the merge root.
+    // Each child's fee limbs are the TAIL of that child's opvs half (M3 fee =
+    // PV_FEE..PV_LEN, the inner-PV tail). Computed from the ASSEMBLED halves
+    // (each already re-scaled by monty_rr in `outer_pvs`), so it matches what the
+    // eval binding reads as `pv(feeL) + pv(feeR)`. Wide/interior only.
+    if shape.merge_lane {
+        let n_opvs = shape.n_opvs();
+        let fl = crate::m4interior::EPOCH_FEE_LIMBS;
+        for j in 0..fl {
+            let fee_l = opvs[n_opvs - fl + j];
+            let fee_r = opvs[2 * n_opvs - fl + j];
+            opvs.push(fee_l + fee_r);
+        }
+    }
     let mut meta = GateMeta {
         query_rows: vec![],
         field_draws: vec![],
@@ -6853,11 +6890,15 @@ mod tests {
         let shape = GateShape::wide();
         let n_opvs = shape.n_opvs();
         let (trace, meta) = build_interior_trace(sl, sr, ol, or, &shape, 0);
-        // Public values are [opvsL | opvsR | merge_root]; the root tail matches
-        // the native merge, and the whole rectangle (incl. the merge perms) is SAT.
-        assert_eq!(meta.opvs.len(), 2 * n_opvs + crate::m4interior::MERGE_ROOT_LIMBS);
+        // Public values are [opvsL | opvsR | merge_root | Σfee]; the root slice
+        // matches the native merge, and the whole rectangle (incl. the merge
+        // perms) is SAT.
         assert_eq!(
-            &meta.opvs[2 * n_opvs..],
+            meta.opvs.len(),
+            2 * n_opvs + crate::m4interior::MERGE_ROOT_LIMBS + crate::m4interior::EPOCH_FEE_LIMBS
+        );
+        assert_eq!(
+            &meta.opvs[2 * n_opvs..2 * n_opvs + crate::m4interior::MERGE_ROOT_LIMBS],
             &crate::m4interior::merge_root(ol, or)[..],
             "interior root == keccak-merge(digest(opvsL), digest(opvsR))"
         );
@@ -6974,5 +7015,87 @@ mod tests {
             t.values[root_r0 * w + l.dlr] += one;
             assert!(is_unsat_interior(t, m.opvs.clone()), "tampered dL carry must be UNSAT");
         }
+    }
+
+    /// 棒 3-3 (M4 step 2): the epoch Σfee rider is exposed and correct — the
+    /// root public tail carries `Σfee[j] = feeL[j] + feeR[j]` (each child's fee
+    /// limbs are the tail of its opvs half), and the whole rectangle is SAT.
+    #[test]
+    fn interior_epoch_fee() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let n_opvs = shape.n_opvs();
+        let fl = crate::m4interior::EPOCH_FEE_LIMBS;
+        let sfee_base = 2 * n_opvs + crate::m4interior::MERGE_ROOT_LIMBS;
+        let (trace, meta) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        assert_eq!(meta.opvs.len(), sfee_base + fl, "opvs = halves | root | Σfee");
+        for j in 0..fl {
+            assert_eq!(
+                meta.opvs[sfee_base + j],
+                meta.opvs[n_opvs - fl + j] + meta.opvs[2 * n_opvs - fl + j],
+                "Σfee limb {j} == feeL + feeR"
+            );
+        }
+        check_constraints(&VerifierGateAir::new_interior(), &trace, &meta.opvs);
+    }
+
+    /// 棒 3-3 soundness negatives — the SUM binding the circuit provides
+    /// (`Σfee == feeL + feeR` over the carried fee slots):
+    ///  - tamper the exposed Σfee → the bind fails;
+    ///  - tamper a child's fee SOURCE slot alone → the sum no longer holds.
+    /// Both must be UNSAT. (Authenticity of the carried fees themselves is the
+    /// issue #24 consumer boundary — see `interior_epoch_fee_boundary`.)
+    #[test]
+    fn interior_neg_epoch_fee() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let one = Val::ONE;
+        let n_opvs = shape.n_opvs();
+        let fl = crate::m4interior::EPOCH_FEE_LIMBS;
+        let sfee_base = 2 * n_opvs + crate::m4interior::MERGE_ROOT_LIMBS;
+        let (base, m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+
+        // Tamper the exposed Σfee.
+        {
+            let mut o = m.opvs.clone();
+            o[sfee_base] += one;
+            assert!(is_unsat_interior(base.clone(), o), "tampered exposed Σfee must be UNSAT");
+        }
+        // Tamper a child fee source slot (feeL[0]) only → sum mismatch.
+        {
+            let mut o = m.opvs.clone();
+            o[n_opvs - fl] += one;
+            assert!(is_unsat_interior(base.clone(), o), "tampered child fee source must be UNSAT");
+        }
+    }
+
+    /// 棒 3-3 issue #24 boundary, recorded as a TESTED FACT: the rider binds
+    /// `Σfee` only to the CARRIED fee slots in-circuit. The carried children opvs
+    /// are NOT independently constraint-bound to the child proofs in the interior
+    /// (the merge sponge absorbs them as witness — issue #24). So tampering a
+    /// child's fee AND the exposed sum CONSISTENTLY is **SAT** at the circuit
+    /// level: a faked child fee is caught not here but by the consumer-side
+    /// recompute from verified children (`m4assembly::consumer_fee_ok`, parallel
+    /// to issue #24's `root == keccak-merge(opvs)`). Closing this in-circuit is
+    /// issue #24's msh columns (same fix, same ~+2.4% cells). This test pins the
+    /// boundary so it cannot silently change into a false soundness claim.
+    #[test]
+    fn interior_epoch_fee_boundary() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let one = Val::ONE;
+        let n_opvs = shape.n_opvs();
+        let fl = crate::m4interior::EPOCH_FEE_LIMBS;
+        let sfee_base = 2 * n_opvs + crate::m4interior::MERGE_ROOT_LIMBS;
+        let (base, m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        // Consistent tamper: feeL[0] and Σfee both +1 → sum still holds.
+        let mut o = m.opvs.clone();
+        o[n_opvs - fl] += one;
+        o[sfee_base] += one;
+        // SAT at the circuit level (must NOT panic) — the documented #24 boundary.
+        check_constraints(&VerifierGateAir::new_interior(), &base, &o);
     }
 }
