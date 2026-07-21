@@ -33,13 +33,35 @@ pub enum InsertError {
     BadHeight,
 }
 
-/// The devnet chain state: all known blocks keyed by header hash, plus the tip
-/// (heaviest-chain head).
+/// Why marking a block as finalized was rejected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FinalizeMarkError {
+    /// The block hash is not in the store.
+    Unknown,
+    /// The block does not descend from the current finalized head (would be a
+    /// reorg past finality — forbidden).
+    NotDescendantOfFinalized,
+    /// The block's height does not strictly advance the finalized head.
+    NotAdvancing,
+}
+
+/// A finalized point: the block hash and its height.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FinalPoint {
+    hash: Hash32,
+    height: u64,
+}
+
+/// The devnet chain state: all known blocks keyed by header hash, the tip
+/// (heaviest-chain head), and the finalized head (below which fork choice can
+/// never reorg — consensus §4/§6).
 #[derive(Clone, Debug)]
 pub struct ChainState {
     blocks: HashMap<Hash32, Entry>,
     genesis: Hash32,
     tip: Hash32,
+    /// The highest finalized block. Once set, every tip must descend from it.
+    finalized: Option<FinalPoint>,
 }
 
 impl ChainState {
@@ -58,12 +80,15 @@ impl ChainState {
             blocks,
             genesis: hash,
             tip: hash,
+            finalized: None,
         }
     }
 
     /// Insert a header, linking it to its parent and updating the tip if the new
-    /// block extends the heaviest chain. Does NOT yet check PoW validity — that
-    /// is 棒 1. Returns the new block's hash on success.
+    /// block extends the heaviest chain **and does not conflict with finality**.
+    /// Does NOT check PoW validity — that is the validation layer (棒 1). Returns
+    /// the new block's hash on success (a stored-but-not-adopted side block is
+    /// still `Ok`).
     pub fn insert_header(&mut self, header: BlockHeader) -> Result<Hash32, InsertError> {
         let hash = header.header_hash();
         if self.blocks.contains_key(&hash) {
@@ -76,12 +101,68 @@ impl ChainState {
         let cumulative_work = parent.cumulative_work + header.difficulty as u128;
         self.blocks.insert(hash, Entry { header, cumulative_work });
 
-        // Heaviest-chain rule: adopt the new block as tip iff it has strictly more
-        // cumulative work than the current tip. Ties keep the incumbent (first-seen).
-        if cumulative_work > self.tip_work() {
+        // Heaviest-chain rule, gated by finality: adopt the new block as tip iff
+        // it has strictly more cumulative work than the current tip AND it
+        // descends from the finalized head. The finality gate is the load-bearing
+        // safety property — no reorg past a finalized checkpoint, EVER, no matter
+        // how much work a competing branch carries. Ties keep the incumbent.
+        if cumulative_work > self.tip_work() && self.descends_from_finalized(&hash) {
             self.tip = hash;
         }
         Ok(hash)
+    }
+
+    /// Mark `hash` as the new finalized head. It must be known, strictly higher
+    /// than the current finalized head, and descend from it. On success, if the
+    /// current tip no longer descends from finality (only possible via out-of-band
+    /// misuse), the tip is re-anchored to the finalized block.
+    pub fn set_finalized(&mut self, hash: Hash32) -> Result<(), FinalizeMarkError> {
+        let height = self.blocks.get(&hash).ok_or(FinalizeMarkError::Unknown)?.header.height;
+        if let Some(cur) = self.finalized {
+            if height <= cur.height {
+                return Err(FinalizeMarkError::NotAdvancing);
+            }
+            // The new finalized block must descend from the old one.
+            if !self.is_descendant_of(&hash, &cur.hash, cur.height) {
+                return Err(FinalizeMarkError::NotDescendantOfFinalized);
+            }
+        }
+        self.finalized = Some(FinalPoint { hash, height });
+        if !self.descends_from_finalized(&self.tip) {
+            self.tip = hash;
+        }
+        Ok(())
+    }
+
+    /// The finalized head hash, if any.
+    pub fn finalized_hash(&self) -> Option<Hash32> {
+        self.finalized.map(|f| f.hash)
+    }
+
+    /// The finalized head height, if any.
+    pub fn finalized_height(&self) -> Option<u64> {
+        self.finalized.map(|f| f.height)
+    }
+
+    /// Whether `block_hash` descends from (or equals) the finalized head. Always
+    /// `true` when nothing is finalized yet.
+    pub fn descends_from_finalized(&self, block_hash: &Hash32) -> bool {
+        match self.finalized {
+            None => true,
+            Some(f) => self.is_descendant_of(block_hash, &f.hash, f.height),
+        }
+    }
+
+    /// Whether `descendant` is at or below `ancestor` on the same chain — i.e.
+    /// walking back from `descendant` to `ancestor_height` lands on `ancestor`.
+    pub fn is_descendant_of(&self, descendant: &Hash32, ancestor: &Hash32, ancestor_height: u64) -> bool {
+        let Some(entry) = self.blocks.get(descendant) else {
+            return false;
+        };
+        if entry.header.height < ancestor_height {
+            return false;
+        }
+        self.ancestor(descendant, entry.header.height - ancestor_height) == Some(*ancestor)
     }
 
     /// The genesis block hash.
@@ -275,5 +356,69 @@ mod tests {
         let b = BlockHeader::child_of(&gh, 2, 1_000, [0xBB; 32]);
         c.insert_header(b).unwrap();
         assert_eq!(c.tip_hash(), a_hash, "ties keep the first-seen tip");
+    }
+
+    /// THE load-bearing safety property (consensus §4/§6): once a checkpoint is
+    /// finalized, no competing branch — however much PoW work it carries — can
+    /// ever reorg the tip past it.
+    #[test]
+    fn no_reorg_past_finalized_checkpoint_ever() {
+        let mut c = ChainState::new(genesis()); // difficulty 1_000
+        let gh = *c.header(&c.genesis_hash()).unwrap();
+
+        // Main branch A: A1, A2, A3 (each difficulty 1_000).
+        let a1 = c.insert_header(BlockHeader::child_of(&gh, 2, 1_000, [0xA1; 32])).unwrap();
+        let a1h = *c.header(&a1).unwrap();
+        let a2 = c.insert_header(BlockHeader::child_of(&a1h, 4, 1_000, [0xA2; 32])).unwrap();
+        let a2h = *c.header(&a2).unwrap();
+        let a3 = c.insert_header(BlockHeader::child_of(&a2h, 6, 1_000, [0xA3; 32])).unwrap();
+        assert_eq!(c.tip_hash(), a3);
+
+        // Finalize A2 (height 2).
+        c.set_finalized(a2).unwrap();
+        assert_eq!(c.finalized_height(), Some(2));
+
+        // A competing fork B from GENESIS carrying astronomically more work, but
+        // NOT containing A2. It must never become the tip.
+        let b1 = c.insert_header(BlockHeader::child_of(&gh, 2, 10_000_000, [0xB1; 32])).unwrap();
+        assert!(!c.descends_from_finalized(&b1));
+        assert_eq!(c.tip_hash(), a3, "must NOT reorg past finalized A2, despite B1's work");
+
+        // Extend B further — still never adopted, at any work.
+        let b1h = *c.header(&b1).unwrap();
+        let b2 = c.insert_header(BlockHeader::child_of(&b1h, 4, 10_000_000, [0xB2; 32])).unwrap();
+        assert_eq!(c.tip_hash(), a3, "still no reorg past finality");
+        assert!(!c.descends_from_finalized(&b2));
+
+        // Meanwhile the finalized branch keeps growing normally.
+        let a3h = *c.header(&a3).unwrap();
+        let a4 = c.insert_header(BlockHeader::child_of(&a3h, 8, 1_000, [0xA4; 32])).unwrap();
+        assert_eq!(c.tip_hash(), a4);
+        assert!(c.descends_from_finalized(&a4));
+    }
+
+    #[test]
+    fn set_finalized_enforces_advance_and_descent() {
+        let mut c = ChainState::new(genesis());
+        let gh = *c.header(&c.genesis_hash()).unwrap();
+        // Unknown block.
+        assert_eq!(c.set_finalized([0xEE; 32]), Err(FinalizeMarkError::Unknown));
+
+        // Build A1, A2 and a competing B1, B2 (from genesis, distinct bodies).
+        let a1 = c.insert_header(BlockHeader::child_of(&gh, 2, 1_000, [0xA1; 32])).unwrap();
+        let a1h = *c.header(&a1).unwrap();
+        let a2 = c.insert_header(BlockHeader::child_of(&a1h, 4, 1_000, [0xA2; 32])).unwrap();
+        let b1 = c.insert_header(BlockHeader::child_of(&gh, 2, 1_000, [0xB1; 32])).unwrap();
+        let b1h = *c.header(&b1).unwrap();
+        let b2 = c.insert_header(BlockHeader::child_of(&b1h, 4, 1_000, [0xB2; 32])).unwrap();
+
+        c.set_finalized(a2).unwrap();
+        // Not advancing: A1 is below the finalized height.
+        assert_eq!(c.set_finalized(a1), Err(FinalizeMarkError::NotAdvancing));
+        // Advancing height but on a different branch (B2 at height 2 == finalized
+        // height, so NotAdvancing first); build B3 (height 3) to test descent.
+        let b2h = *c.header(&b2).unwrap();
+        let b3 = c.insert_header(BlockHeader::child_of(&b2h, 6, 1_000, [0xB3; 32])).unwrap();
+        assert_eq!(c.set_finalized(b3), Err(FinalizeMarkError::NotDescendantOfFinalized));
     }
 }

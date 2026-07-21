@@ -145,11 +145,120 @@ impl Checkpoint {
 }
 
 /// A single committee member's signed vote for a checkpoint.
+#[derive(Clone)]
 pub struct Vote {
     /// The signer's committee index.
     pub signer: usize,
     /// The signer's ML-DSA-65 signature over the checkpoint's signing message.
     pub signature: MemberSig,
+}
+
+/// A committee member's operational status. Membership is fixed within an epoch
+/// (committee-governance §2); status changes here model the §3 penalties within
+/// the devnet. (Real membership set changes only at epoch boundaries; the devnet
+/// applies status immediately for simplicity — noted in the plan doc.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemberStatus {
+    /// Signing normally.
+    Active,
+    /// Jailed for downtime until `until_height` (NO slash); auto-readmitted after.
+    Jailed { until_height: u64 },
+    /// Permanently removed for equivocation (tombstone). Never re-admitted.
+    Tombstoned,
+}
+
+/// The committee's mutable operational state: the (fixed) key set plus per-member
+/// status, self-bond, and cumulative slash (committee-governance §3). Placeholder
+/// bond/slash amounts live in `params_devnet`.
+#[derive(Clone)]
+pub struct CommitteeState {
+    committee: Committee,
+    status: Vec<MemberStatus>,
+    bond: Vec<u64>,
+    slashed: Vec<u64>,
+}
+
+impl CommitteeState {
+    /// All members Active, each with an equal placeholder self-bond `bond_each`.
+    pub fn new(committee: Committee, bond_each: u64) -> Self {
+        let n = committee.size();
+        Self {
+            status: vec![MemberStatus::Active; n],
+            bond: vec![bond_each; n],
+            slashed: vec![0; n],
+            committee,
+        }
+    }
+
+    /// The underlying (fixed) key set.
+    pub fn committee(&self) -> &Committee {
+        &self.committee
+    }
+
+    /// N (total membership; quorum is over N — membership is fixed within an epoch).
+    pub fn size(&self) -> usize {
+        self.committee.size()
+    }
+
+    /// The ⅔-quorum threshold over the full membership N.
+    pub fn quorum_threshold(&self) -> usize {
+        self.committee.quorum_threshold()
+    }
+
+    /// Status of member `idx`, if in range.
+    pub fn status(&self, idx: usize) -> Option<MemberStatus> {
+        self.status.get(idx).copied()
+    }
+
+    /// Remaining self-bond of member `idx`, if in range.
+    pub fn bond(&self, idx: usize) -> Option<u64> {
+        self.bond.get(idx).copied()
+    }
+
+    /// Cumulative amount slashed from member `idx`, if in range.
+    pub fn slashed(&self, idx: usize) -> Option<u64> {
+        self.slashed.get(idx).copied()
+    }
+
+    /// Whether member `idx` may sign at `height`: Active, or Jailed whose term has
+    /// elapsed (`height >= until_height`). Tombstoned is never active.
+    pub fn is_active(&self, idx: usize, height: u64) -> bool {
+        match self.status.get(idx) {
+            Some(MemberStatus::Active) => true,
+            Some(MemberStatus::Jailed { until_height }) => height >= *until_height,
+            _ => false,
+        }
+    }
+
+    /// Count of members that may sign at `height`.
+    pub fn active_count(&self, height: u64) -> usize {
+        (0..self.size()).filter(|&i| self.is_active(i, height)).count()
+    }
+
+    /// Tombstone member `idx` for equivocation: permanent removal + slash `amount`
+    /// from its bond (committee-governance §3). Idempotent; returns `true` if this
+    /// call newly tombstoned the member.
+    pub fn tombstone(&mut self, idx: usize, amount: u64) -> bool {
+        if idx >= self.size() || self.status[idx] == MemberStatus::Tombstoned {
+            return false;
+        }
+        let slash = amount.min(self.bond[idx]);
+        self.bond[idx] -= slash;
+        self.slashed[idx] += slash;
+        self.status[idx] = MemberStatus::Tombstoned;
+        true
+    }
+
+    /// Jail member `idx` for downtime until `until_height` — **no slash**
+    /// (committee-governance §3). A tombstoned member cannot be jailed. Returns
+    /// `true` if applied.
+    pub fn jail(&mut self, idx: usize, until_height: u64) -> bool {
+        if idx >= self.size() || self.status[idx] == MemberStatus::Tombstoned {
+            return false;
+        }
+        self.status[idx] = MemberStatus::Jailed { until_height };
+        true
+    }
 }
 
 /// Build a deterministic devnet committee of `n` validators plus their signing

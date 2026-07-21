@@ -29,6 +29,7 @@
 
 pub mod chain;
 pub mod committee;
+pub mod ebbflow;
 pub mod finality;
 pub mod hash;
 pub mod header;

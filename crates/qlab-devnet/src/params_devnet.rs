@@ -42,6 +42,21 @@ pub const COMMITTEE_SIZE: usize = 20;
 /// (consensus §4/§7); the exact value is open (consensus-parameters appendix).
 pub const CHECKPOINT_CADENCE_BLOCKS: u64 = 8;
 
-// Later stages (棒 3+) will add here, still as placeholders:
+/// Per-validator self-bond (native-token units). PLACEHOLDER — the bond
+/// minimum is open (committee-governance §3 / consensus-parameters appendix).
+pub const BOND_AMOUNT: u64 = 1_000_000;
+
+/// Bond slashed on equivocation (committee-governance §3: tombstone + slash).
+/// PLACEHOLDER — the slash constant is explicitly open. Downtime is jail-NO-slash.
+pub const EQUIVOCATION_SLASH_AMOUNT: u64 = 100_000;
+
+/// Downtime jail term, in blocks (jail-no-slash; auto-readmit after). PLACEHOLDER.
+pub const JAIL_BLOCKS: u64 = 32;
+
+/// Finality lag (tip height − finalized height) beyond which the node is in
+/// degraded probabilistic mode (Ebb-and-Flow, consensus §4). PLACEHOLDER —
+/// tied to the open checkpoint cadence.
+pub const DEGRADED_MODE_LAG_BLOCKS: u64 = 2 * CHECKPOINT_CADENCE_BLOCKS;
+
+// Later stages will add here, still as placeholders:
 //   - EPOCH_LENGTH_BLOCKS (membership boundary — committee-gov §2)
-//   - BOND_AMOUNT / EQUIVOCATION_SLASH_AMOUNT (committee-gov §3)

@@ -200,6 +200,24 @@ for downtime. **Negative tests:** forged vote rejected; equivocation detected fr
 evidence; **no reorg past a finalized checkpoint EVER** (the load-bearing safety
 test).
 
+**Implemented:**
+- `chain.rs`: finality pointer + **finality-aware fork choice** — `insert_header`
+  adopts a heavier tip only if it `descends_from_finalized`; `set_finalized`
+  enforces advance + descent. **Load-bearing test `no_reorg_past_finalized_checkpoint_ever`**:
+  a competing branch with 10 000× the work never reorgs past a finalized block.
+- `committee.rs`: `CommitteeState` (per-member status/bond/slash) + `MemberStatus`
+  {Active, Jailed{until}, Tombstoned}; `is_active`/`active_count`; `tombstone`
+  (slash), `jail` (no slash, auto-readmit).
+- `ebbflow.rs`: `finality_status` (Final vs Degraded by lag); `EquivocationEvidence`
+  + `verify_equivocation` (two sig checks: same signer, same slot, conflicting) +
+  `punish_equivocation` (→ tombstone + slash, no human vote).
+- `node.rs`: `Node` embeds `FinalityTracker`; `finalize` (checkpoint on main chain,
+  drops tombstoned/jailed votes before quorum, advances chain finality pointer);
+  `finality_status`, anchors API. Tests: stall→degraded→recover with the PoW chain
+  still growing; node-level no-reorg; tombstoned votes don't count toward quorum.
+- **Devnet simplification noted:** member status changes apply immediately;
+  real membership set changes only at epoch boundaries (committee-gov §2).
+
 ### 棒 4 — multi-node local sim
 N nodes, block gossip (in-process vs localhost — **decision + justification to be
 recorded here at 棒 4**), posted-price fee-tier table keyed on arity bucket.
@@ -221,7 +239,7 @@ degraded-mode behavior). Reproduce twice per bench discipline.
 | 0 | plan doc + crate skeleton | **DONE** | crate `qlab-devnet` (hash/header/pow/chain/params), 18 tests; full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 18 / note 21 = 125, 0 fail) |
 | 1 | single-node PoW chain | **DONE** | mining loop, header validation + sliding-window retarget, `Node` (mine_next/mine_on/submit), heaviest-chain reorg; +12 tests (devnet 30). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 30 / note 21 = 137, 0 fail) |
 | 2 | finality committee (⚠ ML-DSA stop-point) | **DONE** | ml-dsa 0.1.1 wired; committee + ⅔-quorum ML-DSA-65 votes + `FinalityTracker` + anchors-from-finalized-only API; +9 tests (devnet 39). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 39 / note 21 = 146, 0 fail) |
-| 3 | Ebb-and-Flow semantics | not started | — |
+| 3 | Ebb-and-Flow semantics | **DONE** | finality-aware fork choice (no-reorg-past-finality, load-bearing test), equivocation→tombstone+slash, jail-no-slash, stall→degraded→recover; +9 tests (devnet 48). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 48 / note 21 = 155, 0 fail) |
 | 4 | multi-node local sim | not started | — |
 | 5 | real-proof integration + report | not started | — |
 
@@ -237,6 +255,10 @@ Every placeholder lives in `params_devnet.rs`. Kept current as stages add them.
 | `MAX_DIFFICULTY_ADJUST_FACTOR` | `4` | retarget clamp — consensus-parameters appendix |
 | `COMMITTEE_SIZE` | `20` | N≈20–50 decided (consensus §4/§5); exact N open |
 | `CHECKPOINT_CADENCE_BLOCKS` | `8` | finality cadence (sets minutes-class latency) — open |
+| `BOND_AMOUNT` | `1_000_000` | validator self-bond minimum — committee-gov §3, open |
+| `EQUIVOCATION_SLASH_AMOUNT` | `100_000` | equivocation slash — committee-gov §3, open |
+| `JAIL_BLOCKS` | `32` | downtime jail term (no slash) — open |
+| `DEGRADED_MODE_LAG_BLOCKS` | `2×cadence=16` | finality-lag threshold for degraded mode — open |
 
 ## Open decisions deferred to design (not decided in code)
 

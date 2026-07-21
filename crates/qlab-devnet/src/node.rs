@@ -11,8 +11,12 @@
 
 use crate::chain::{ChainState, InsertError};
 use crate::header::{BlockHeader, Hash32};
+use crate::chain::FinalizeMarkError;
+use crate::committee::{Checkpoint, CommitteeState, Vote};
+use crate::ebbflow::{finality_status, FinalityStatus};
+use crate::finality::{FinalityTracker, FinalizeError};
 use crate::mining::mine;
-use crate::params_devnet::{GENESIS_DIFFICULTY, SIM_BLOCK_TIME_SECS};
+use crate::params_devnet::{DEGRADED_MODE_LAG_BLOCKS, GENESIS_DIFFICULTY, SIM_BLOCK_TIME_SECS};
 use crate::pow::PowEngine;
 use crate::validation::{expected_difficulty, validate_header, ValidationError};
 
@@ -48,6 +52,13 @@ pub enum NodeError {
     Invalid(ValidationError),
     /// The chain rejected the insert (duplicate / unknown parent / bad height).
     Insert(InsertError),
+    /// The checkpoint's block is not on this node's main chain (not an ancestor
+    /// of the tip) — a node only finalizes blocks on its own best chain.
+    NotOnMainChain,
+    /// The finality quorum/vote check rejected the checkpoint.
+    Finalize(FinalizeError),
+    /// Marking the block finalized in the chain was rejected.
+    FinalizeMark(FinalizeMarkError),
 }
 
 impl From<ValidationError> for NodeError {
@@ -68,6 +79,9 @@ pub struct Node<P: PowEngine> {
     config: SimConfig,
     /// The node's sim clock — advanced by `block_time_secs` each mined block.
     clock: u64,
+    /// The node's finalized-checkpoint view (drives the anchors API; the chain's
+    /// own finalized pointer drives fork choice, kept in sync by `finalize`).
+    finality: FinalityTracker,
 }
 
 impl<P: PowEngine> Node<P> {
@@ -79,6 +93,7 @@ impl<P: PowEngine> Node<P> {
             pow,
             config,
             clock: 0,
+            finality: FinalityTracker::new(),
         }
     }
 
@@ -132,6 +147,70 @@ impl<P: PowEngine> Node<P> {
     /// Read-only access to the chain state.
     pub fn chain(&self) -> &ChainState {
         &self.chain
+    }
+
+    // ── Finality (棒 2/3) ──────────────────────────────────────────────────
+
+    /// Build a checkpoint for the main-chain block at `height`, if it exists.
+    /// Devnet root stand-in = the block hash (棒 5 binds the real M3 anchor).
+    pub fn checkpoint_at(&self, height: u64) -> Option<Checkpoint> {
+        let chain = self.chain.main_chain();
+        chain
+            .get(height as usize)
+            .map(|&block_hash| Checkpoint::new(height, block_hash, block_hash))
+    }
+
+    /// Finalize `cp` given `votes` and the committee `cstate`. The checkpoint's
+    /// block must be on this node's main chain; votes from tombstoned/jailed
+    /// members are dropped before the ⅔-quorum check; on success the chain's
+    /// finalized pointer advances (enforcing "no reorg past finality").
+    pub fn finalize(
+        &mut self,
+        cp: &Checkpoint,
+        votes: &[Vote],
+        cstate: &CommitteeState,
+    ) -> Result<(), NodeError> {
+        // The checkpoint block must be an ancestor of (or equal to) the tip.
+        if !self.chain.is_descendant_of(&self.chain.tip_hash(), &cp.block_hash, cp.height) {
+            return Err(NodeError::NotOnMainChain);
+        }
+        // Only currently-active members count toward quorum.
+        let active: Vec<Vote> = votes
+            .iter()
+            .filter(|v| cstate.is_active(v.signer, cp.height))
+            .cloned()
+            .collect();
+        self.finality
+            .try_finalize(cp, &active, cstate.committee())
+            .map_err(NodeError::Finalize)?;
+        self.chain.set_finalized(cp.block_hash).map_err(NodeError::FinalizeMark)?;
+        Ok(())
+    }
+
+    /// The finalized height, if any.
+    pub fn finalized_height(&self) -> Option<u64> {
+        self.finality.finalized_height()
+    }
+
+    /// The newest finalized root — the newest usable anchor (§6).
+    pub fn newest_anchor(&self) -> Option<Hash32> {
+        self.finality.newest_anchor()
+    }
+
+    /// The anchors-from-finalized-only rule (§6): is `root` a finalized root?
+    pub fn is_anchor_final(&self, root: &Hash32) -> bool {
+        self.finality.is_root_final(root)
+    }
+
+    /// The node's finality regime (Final vs degraded probabilistic mode), from the
+    /// tip-vs-finalized lag against the placeholder [`DEGRADED_MODE_LAG_BLOCKS`].
+    pub fn finality_status(&self) -> FinalityStatus {
+        finality_status(self.tip_height(), self.finalized_height(), DEGRADED_MODE_LAG_BLOCKS)
+    }
+
+    /// Read-only access to the finalized-checkpoint tracker.
+    pub fn finality(&self) -> &FinalityTracker {
+        &self.finality
     }
 }
 
@@ -235,5 +314,125 @@ mod tests {
             Err(NodeError::Invalid(ValidationError::PowUnsatisfied))
         );
         assert_eq!(consumer2.tip_height(), 0);
+    }
+
+    // ── 棒 3: finality integration (Ebb-and-Flow at the node) ───────────────
+
+    use crate::committee::{devnet_committee, CommitteeState, Vote};
+    use crate::ebbflow::FinalityStatus;
+    use crate::params_devnet::{BOND_AMOUNT, DEGRADED_MODE_LAG_BLOCKS};
+
+    /// Committee stall → the chain keeps growing in degraded probabilistic mode;
+    /// finality resumes cleanly when the committee finalizes again (consensus §4).
+    #[test]
+    fn stall_degrades_then_recovers_while_chain_keeps_growing() {
+        let mut node = Node::new(KeccakPow, cfg());
+        let (committee, validators) = devnet_committee(7); // quorum 5
+        let cstate = CommitteeState::new(committee, BOND_AMOUNT);
+
+        for _ in 0..10 {
+            node.mine_next(ZERO_HASH).unwrap();
+        }
+        assert_eq!(node.tip_height(), 10);
+        // Never finalized ⇒ degraded probabilistic mode.
+        assert_eq!(node.finalized_height(), None);
+        assert_eq!(node.finality_status(), FinalityStatus::Degraded);
+
+        // Finalize height 8 with a ⅔ quorum.
+        let cp8 = node.checkpoint_at(8).unwrap();
+        let votes: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp8)).collect();
+        node.finalize(&cp8, &votes, &cstate).unwrap();
+        assert_eq!(node.finalized_height(), Some(8));
+        assert_eq!(node.finality_status(), FinalityStatus::Final);
+        assert!(node.is_anchor_final(&cp8.root));
+        assert_eq!(node.newest_anchor(), Some(cp8.root));
+
+        // Committee STALLS: keep mining (no finalization) past the degraded lag.
+        let before = node.tip_height();
+        while node.tip_height() - node.finalized_height().unwrap() <= DEGRADED_MODE_LAG_BLOCKS {
+            node.mine_next(ZERO_HASH).unwrap();
+        }
+        assert!(node.tip_height() > before, "PoW keeps producing blocks during stall");
+        assert_eq!(node.finality_status(), FinalityStatus::Degraded);
+
+        // RECOVERY: finalize a fresh checkpoint near the tip.
+        let h = node.tip_height() - 1;
+        let cp = node.checkpoint_at(h).unwrap();
+        let votes: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        node.finalize(&cp, &votes, &cstate).unwrap();
+        assert_eq!(node.finalized_height(), Some(h));
+        assert_eq!(node.finality_status(), FinalityStatus::Final, "finality resumes cleanly");
+    }
+
+    /// At the node level too: once a checkpoint is finalized, a longer/heavier
+    /// competing branch cannot reorg the tip past it.
+    #[test]
+    fn node_does_not_reorg_past_finalized_checkpoint() {
+        let mut node = Node::new(KeccakPow, cfg());
+        let (committee, validators) = devnet_committee(7);
+        let cstate = CommitteeState::new(committee, BOND_AMOUNT);
+        let genesis = node.tip_hash();
+
+        // Main branch A: 3 blocks.
+        let a1 = node.mine_on(genesis, [0xA1; 32]).unwrap();
+        let a2 = node.mine_on(a1, [0xA2; 32]).unwrap();
+        let a3 = node.mine_on(a2, [0xA3; 32]).unwrap();
+        assert_eq!(node.tip_hash(), a3);
+
+        // Finalize A2 (height 2).
+        let cp = Checkpoint::new(2, a2, a2);
+        let votes: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        node.finalize(&cp, &votes, &cstate).unwrap();
+        assert_eq!(node.finalized_height(), Some(2));
+
+        // Competing branch B from genesis, LONGER (4 blocks) ⇒ more work than A —
+        // but it does not contain finalized A2, so the tip must not switch.
+        let b1 = node.mine_on(genesis, [0xB1; 32]).unwrap();
+        let b2 = node.mine_on(b1, [0xB2; 32]).unwrap();
+        let b3 = node.mine_on(b2, [0xB3; 32]).unwrap();
+        let b4 = node.mine_on(b3, [0xB4; 32]).unwrap();
+
+        assert_eq!(node.tip_hash(), a3, "no reorg past finalized A2, even to a heavier branch");
+        assert!(!node.chain().descends_from_finalized(&b4));
+        assert!(node.chain().header(&b4).is_some(), "the B branch is still stored");
+    }
+
+    /// A node drops votes from tombstoned members, so equivocators can't help form
+    /// a quorum: if too many are tombstoned, finality stalls (degraded) rather than
+    /// finalizing on bad votes.
+    #[test]
+    fn tombstoned_votes_do_not_count_toward_quorum() {
+        use crate::ebbflow::{punish_equivocation, EquivocationEvidence};
+        use crate::params_devnet::EQUIVOCATION_SLASH_AMOUNT;
+
+        let mut node = Node::new(KeccakPow, cfg());
+        let (committee, validators) = devnet_committee(7); // quorum 5
+        let mut cstate = CommitteeState::new(committee, BOND_AMOUNT);
+        for _ in 0..3 {
+            node.mine_next(ZERO_HASH).unwrap();
+        }
+        let cp = node.checkpoint_at(2).unwrap();
+
+        // Tombstone three members for equivocation, leaving only 4 active < quorum 5.
+        for signer in [0usize, 1, 2] {
+            let a = Checkpoint::new(99, [0xAA; 32], [0xAA; 32]);
+            let b = Checkpoint::new(99, [0xBB; 32], [0xBB; 32]);
+            let ev = EquivocationEvidence {
+                vote_a: validators[signer].sign_checkpoint(&a),
+                cp_a: a,
+                vote_b: validators[signer].sign_checkpoint(&b),
+                cp_b: b,
+            };
+            punish_equivocation(&mut cstate, &ev, EQUIVOCATION_SLASH_AMOUNT).unwrap();
+        }
+        assert_eq!(cstate.active_count(cp.height), 4);
+
+        // All 7 vote, but the 3 tombstoned votes are dropped ⇒ only 4 count < 5.
+        let votes: Vec<Vote> = validators.iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        assert_eq!(
+            node.finalize(&cp, &votes, &cstate),
+            Err(NodeError::Finalize(crate::finality::FinalizeError::InsufficientQuorum { have: 4, need: 5 }))
+        );
+        assert_eq!(node.finalized_height(), None);
     }
 }
