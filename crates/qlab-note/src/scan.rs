@@ -174,4 +174,81 @@ mod tests {
         bad[0] ^= 0x01;
         assert!(!recompute_matches(&n, &bad), "tampered cm must fail recompute");
     }
+
+    #[test]
+    fn wrong_key_no_detection() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let kp = generate_keypair(&mut rng);
+        let attacker = generate_keypair(&mut rng);
+        let out = encrypt_to_recipient(&kp.ek, &[note(3), note(4)], &mut rng);
+        for mode in [ScanMode::FullFo, ScanMode::FoSkip] {
+            assert!(
+                scan(&attacker.dk, &out, mode).is_empty(),
+                "{mode:?}: wrong key must detect nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn tampered_mlkem_ct_no_detection() {
+        // Flipping the shared ML-KEM ct changes the decapsulated K → tag miss.
+        let mut rng = StdRng::seed_from_u64(12);
+        let kp = generate_keypair(&mut rng);
+        let mut out = encrypt_to_recipient(&kp.ek, &[note(5)], &mut rng);
+        out.bundle.ct[100] ^= 0x01;
+        for mode in [ScanMode::FullFo, ScanMode::FoSkip] {
+            assert!(scan(&kp.dk, &out, mode).is_empty(), "{mode:?}: tampered ct");
+        }
+    }
+
+    #[test]
+    fn tampered_aead_payload_fails() {
+        // Tag/cm untouched → detection proceeds, but the AEAD Poly1305 tag
+        // rejects the tampered payload → the note is dropped on BOTH paths.
+        let mut rng = StdRng::seed_from_u64(13);
+        let kp = generate_keypair(&mut rng);
+        let mut out = encrypt_to_recipient(&kp.ek, &[note(6)], &mut rng);
+        let last = out.payloads[0].len() - 1;
+        out.payloads[0][last] ^= 0x01;
+        for mode in [ScanMode::FullFo, ScanMode::FoSkip] {
+            assert!(scan(&kp.dk, &out, mode).is_empty(), "{mode:?}: tampered payload");
+        }
+    }
+
+    #[test]
+    fn tampered_cm_no_detection() {
+        // The tag binds cm, so a tampered on-wire cm misses at the pre-filter
+        // (the recompute gate itself is covered by recompute_gate_rejects_tampered_cm).
+        let mut rng = StdRng::seed_from_u64(14);
+        let kp = generate_keypair(&mut rng);
+        let mut out = encrypt_to_recipient(&kp.ek, &[note(7)], &mut rng);
+        out.bundle.entries[0].cm[0] ^= 0x01;
+        assert!(
+            scan(&kp.dk, &out, ScanMode::FoSkip).is_empty(),
+            "tampered cm must not yield an accepted note"
+        );
+    }
+
+    #[test]
+    fn amortization_two_outputs_one_ct() {
+        // A 2-output tx to one recipient shares ONE ML-KEM ct; both detect.
+        let mut rng = StdRng::seed_from_u64(15);
+        let kp = generate_keypair(&mut rng);
+        let n0 = note(20);
+        let n1 = note(21);
+        let out = encrypt_to_recipient(&kp.ek, &[n0, n1], &mut rng);
+        // One shared ciphertext, two entries.
+        assert_eq!(out.bundle.entries.len(), 2);
+        assert_eq!(out.bundle.ct.len(), 1088);
+        assert_eq!(
+            out.bundle.compact_stream_len(),
+            1088 + 2 * CompactEntry::LEN_EMPTY_CLUE
+        );
+        for mode in [ScanMode::FullFo, ScanMode::FoSkip] {
+            let found = scan(&kp.dk, &out, mode);
+            assert_eq!(found.len(), 2, "{mode:?}: both amortized notes detected");
+            assert_eq!(found[0].note, n0);
+            assert_eq!(found[1].note, n1);
+        }
+    }
 }
