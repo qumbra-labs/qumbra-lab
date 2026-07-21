@@ -61,6 +61,17 @@ pub fn digest_bytes(d: &[u64; 4]) -> [u8; 32] {
     out
 }
 
+/// Inverse of [`digest_bytes`]: 32 little-endian bytes → `[u64; 4]` lanes.
+/// The on-wire `cm` is bytes; scanning converts it back to qlab-air's lane
+/// form to recompute the tag / commitment.
+pub fn digest_from_bytes(b: &[u8; 32]) -> [u64; 4] {
+    core::array::from_fn(|i| {
+        let mut lane = [0u8; 8];
+        lane.copy_from_slice(&b[i * 8..i * 8 + 8]);
+        u64::from_le_bytes(lane)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
