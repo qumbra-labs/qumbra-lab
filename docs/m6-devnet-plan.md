@@ -219,9 +219,29 @@ test).
   real membership set changes only at epoch boundaries (committee-gov §2).
 
 ### 棒 4 — multi-node local sim
-N nodes, block gossip (in-process vs localhost — **decision + justification to be
-recorded here at 棒 4**), posted-price fee-tier table keyed on arity bucket.
+N nodes, block gossip, posted-price fee-tier table keyed on arity bucket.
 Scenario tests: partition/rejoin, committee-minority offline, miner-only liveness.
+
+**Decision — in-process (not localhost).** The sim runs N `Node`s in one process;
+"gossip" is a synchronous method call. The devnet's job is to exercise *consensus*
+behaviour (fork choice under partition, quorum finality, degraded mode); localhost
+TCP would test none of that more thoroughly — it would only add an async runtime,
+socket setup, and timing nondeterminism (flaky tests) for zero extra consensus
+coverage, and stays trivially inside the "no networking beyond localhost" line.
+Real wire transport (compact-block relay, Dandelion++, §7/§9) is out of devnet scope.
+
+**Implemented:**
+- `fees.rs`: `ArityBucket` {2×2,4×4,8×8} + `posted_fee` = `FEE_MARGINAL_UNITS ×
+  max(FEE_GRACE_ACTIONS, logical_actions)` (ZIP-317-shape, §8), deterministic /
+  public / single native asset. `for_arity` buckets a transaction.
+- `net.rs`: `Network<P>` — N nodes, `mine` (mine + synchronous same-group gossip),
+  `partition` / `heal` (redeliver in height order → converge on heaviest
+  finality-respecting chain), `finalize_on` (committee finality per node).
+- Scenario tests: **partition/rejoin** (two groups diverge above a finalized point,
+  heal → all converge on the heavier branch, none reorgs below finality);
+  **committee-minority offline** (below quorum → degraded everywhere, resumes when
+  enough come online); **miner-only liveness** (no finality → chain keeps growing,
+  all nodes stay in sync, degraded).
 
 ### 棒 5 — real-proof integration + measured report
 Block bodies carry REAL M3 tx proofs (pre-generate a small pool once, reuse —
@@ -240,7 +260,7 @@ degraded-mode behavior). Reproduce twice per bench discipline.
 | 1 | single-node PoW chain | **DONE** | mining loop, header validation + sliding-window retarget, `Node` (mine_next/mine_on/submit), heaviest-chain reorg; +12 tests (devnet 30). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 30 / note 21 = 137, 0 fail) |
 | 2 | finality committee (⚠ ML-DSA stop-point) | **DONE** | ml-dsa 0.1.1 wired; committee + ⅔-quorum ML-DSA-65 votes + `FinalityTracker` + anchors-from-finalized-only API; +9 tests (devnet 39). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 39 / note 21 = 146, 0 fail) |
 | 3 | Ebb-and-Flow semantics | **DONE** | finality-aware fork choice (no-reorg-past-finality, load-bearing test), equivocation→tombstone+slash, jail-no-slash, stall→degraded→recover; +9 tests (devnet 48). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 48 / note 21 = 155, 0 fail) |
-| 4 | multi-node local sim | not started | — |
+| 4 | multi-node local sim | **DONE** | in-process `Network` (gossip, partition/heal) + posted-price fee table; scenarios: partition/rejoin, committee-minority offline, miner-only liveness; +6 tests (devnet 54). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 54 / note 21 = 161, 0 fail) |
 | 5 | real-proof integration + report | not started | — |
 
 ## Placeholder-constants inventory
@@ -259,6 +279,8 @@ Every placeholder lives in `params_devnet.rs`. Kept current as stages add them.
 | `EQUIVOCATION_SLASH_AMOUNT` | `100_000` | equivocation slash — committee-gov §3, open |
 | `JAIL_BLOCKS` | `32` | downtime jail term (no slash) — open |
 | `DEGRADED_MODE_LAG_BLOCKS` | `2×cadence=16` | finality-lag threshold for degraded mode — open |
+| `FEE_MARGINAL_UNITS` | `5_000` | ZIP-317 marginal fee per action — consensus §8, open |
+| `FEE_GRACE_ACTIONS` | `2` | ZIP-317 grace actions (`max(grace, actions)`) — open |
 
 ## Open decisions deferred to design (not decided in code)
 

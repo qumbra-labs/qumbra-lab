@@ -30,10 +30,12 @@
 pub mod chain;
 pub mod committee;
 pub mod ebbflow;
+pub mod fees;
 pub mod finality;
 pub mod hash;
 pub mod header;
 pub mod mining;
+pub mod net;
 pub mod node;
 pub mod params_devnet;
 pub mod pow;

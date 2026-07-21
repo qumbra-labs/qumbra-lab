@@ -60,3 +60,14 @@ pub const DEGRADED_MODE_LAG_BLOCKS: u64 = 2 * CHECKPOINT_CADENCE_BLOCKS;
 
 // Later stages will add here, still as placeholders:
 //   - EPOCH_LENGTH_BLOCKS (membership boundary — committee-gov §2)
+
+// ─── Fees (棒 4) ─────────────────────────────────────────────────────────────
+
+/// Marginal fee per logical action (native-token units), ZIP-317-shape posted
+/// price (consensus §8). PLACEHOLDER — the fee-tier values are explicitly open
+/// (consensus §8 → consensus-parameters appendix). Single native fee asset.
+pub const FEE_MARGINAL_UNITS: u64 = 5_000;
+
+/// Grace action count: fee = marginal × max(grace, logical_actions), ZIP-317's
+/// `max(2, logical_actions)`. PLACEHOLDER.
+pub const FEE_GRACE_ACTIONS: u32 = 2;
