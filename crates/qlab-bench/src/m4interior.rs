@@ -1,0 +1,280 @@
+//! M4 step 1 stage 2 (棒 2/3): the interior aggregation node — verify TWO child
+//! leaf proofs in one rectangle and merge their public digests into the interior
+//! root. Circuit analogue of `m4treerec` (which only records one child). The
+//! two-child trace assembly lives in `m4gate::build_interior_trace`; this module
+//! sources the child schedules and (stage 3) drives the full `prove` for the
+//! peak-RSS-vs-32 GB gate.
+
+use p3_field::{PrimeCharacteristicRing, PrimeField32};
+
+use crate::m4gaterec::{keccakf, Schedule};
+use crate::Val;
+
+/// Merge-root digest length in field limbs (32-byte keccak digest = 16 u16
+/// limbs, matching the cap-limb encoding in `outer_pvs`).
+pub(crate) const MERGE_ROOT_LIMBS: usize = 16;
+
+/// Overwrite-mode keccak sponge over `bytes` (the leaf-sponge convention: the
+/// rate lanes are OVERWRITTEN by each block's message, the capacity is carried;
+/// pad10*1). Returns each permutation's INPUT state (rate = message block,
+/// capacity = previous output's capacity) plus the 32-byte digest. The
+/// in-circuit merge lane replays these exact perms; 棒3-2 binds each preimage's
+/// rate to the message and its capacity to the previous perm's output.
+fn sponge_overwrite(bytes: &[u8]) -> (Vec<[u64; 25]>, [u8; 32]) {
+    let mut msg = bytes.to_vec();
+    let pad = 136 - (msg.len() % 136); // 1..=136 (never 0 → always a pad block tail)
+    let start = msg.len();
+    msg.resize(msg.len() + pad, 0);
+    msg[start] ^= 0x01;
+    *msg.last_mut().unwrap() ^= 0x80;
+
+    let mut state = [0u64; 25];
+    let mut inputs = Vec::with_capacity(msg.len() / 136);
+    for block in msg.chunks(136) {
+        for (l, lane) in block.chunks(8).enumerate() {
+            state[l] = u64::from_le_bytes(lane.try_into().unwrap()); // OVERWRITE rate (17 lanes)
+        }
+        inputs.push(state);
+        state = keccakf(&state);
+    }
+    let mut dig = [0u8; 32];
+    for l in 0..4 {
+        dig[8 * l..8 * l + 8].copy_from_slice(&state[l].to_le_bytes());
+    }
+    (inputs, dig)
+}
+
+/// Serialize public values as u32-LE bytes (every KoalaBear value is < p < 2^31,
+/// so a u32 is lossless): the child's public surface (caps + covered-tx inner
+/// PVs) fed to the merge sponge.
+fn opvs_bytes(vals: &[Val]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(vals.len() * 4);
+    for v in vals {
+        b.extend_from_slice(&v.as_canonical_u32().to_le_bytes());
+    }
+    b
+}
+
+/// The interior root's 32-byte digest, as `MERGE_ROOT_LIMBS` u16 field limbs
+/// (LE), per aggregation-rung1 §2: `root = keccak( keccak(opvsL) ‖ keccak(opvsR) )`.
+/// `dL/dR` commit each child's full public surface (⊇ §2's covered-tx digests).
+pub(crate) fn merge_root(opvs_l: &[Val], opvs_r: &[Val]) -> Vec<Val> {
+    let (_, dl) = sponge_overwrite(&opvs_bytes(opvs_l));
+    let (_, dr) = sponge_overwrite(&opvs_bytes(opvs_r));
+    let mut m = dl.to_vec();
+    m.extend_from_slice(&dr); // 64 bytes → one merge block
+    let (_, root) = sponge_overwrite(&m);
+    root
+        .chunks(2)
+        .map(|c| Val::from_u32(u16::from_le_bytes([c[0], c[1]]) as u32))
+        .collect()
+}
+
+/// The child sub-sponge digests `(dL, dR)` as `MERGE_ROOT_LIMBS` u16 limbs each
+/// (LE), i.e. `keccak(opvsL)` / `keccak(opvsR)`. The interior circuit captures dL
+/// (child-L's last merge perm output) into a carry register and reads dR from
+/// child-R's last perm (adjacent to the root perm); both feed the root perm.
+pub(crate) fn child_digests(opvs_l: &[Val], opvs_r: &[Val]) -> (Vec<Val>, Vec<Val>) {
+    let to_limbs = |d: [u8; 32]| -> Vec<Val> {
+        d.chunks(2)
+            .map(|c| Val::from_u32(u16::from_le_bytes([c[0], c[1]]) as u32))
+            .collect()
+    };
+    let (_, dl) = sponge_overwrite(&opvs_bytes(opvs_l));
+    let (_, dr) = sponge_overwrite(&opvs_bytes(opvs_r));
+    (to_limbs(dl), to_limbs(dr))
+}
+
+/// The merge lane's permutation INPUT states, in lane order: child-L opvs sponge,
+/// child-R opvs sponge, then the root perm (absorbing `dL ‖ dR`). Appended after
+/// both children's perms in `build_interior_trace`; the KeccakAir verifies each
+/// permutation's keccak-f, and 棒3-2 binds the preimages to the public values.
+pub(crate) fn merge_perm_inputs(opvs_l: &[Val], opvs_r: &[Val]) -> Vec<[u64; 25]> {
+    let (mut inputs, dl) = sponge_overwrite(&opvs_bytes(opvs_l));
+    let (r_inputs, dr) = sponge_overwrite(&opvs_bytes(opvs_r));
+    inputs.extend(r_inputs);
+    let mut m = dl.to_vec();
+    m.extend_from_slice(&dr);
+    let (root_inputs, _) = sponge_overwrite(&m);
+    inputs.extend(root_inputs);
+    inputs
+}
+
+/// Two child verification schedules + their outer public values.
+///
+/// - `distinct == false` (2c): reuse ONE leaf proof for both children. Sufficient
+///   for two-child SAT, per-lane tamper binding, and the stage-3 RSS gate, and it
+///   halves the ~0.67 s / ~12 GB leaf prove. `opvs_l == opvs_r`, so a single
+///   outer-PV set serves both cap comparisons.
+/// - `distinct == true` (2d PR-gate): a second, different leaf proof so `L != R`
+///   — this catches symmetry / cross-wiring bugs that identical children mask.
+pub(crate) fn two_child_schedule(distinct: bool) -> (Schedule, Schedule, Vec<Val>, Vec<Val>) {
+    let (leaf_l, opvs_l) = crate::m4treerec::leaf_proof();
+    let sched_l = crate::m4treerec::walk_leaf(&leaf_l, &opvs_l);
+    if !distinct {
+        // Same leaf for both children: re-walk (cheap, ~ms) rather than require
+        // Schedule: Clone. The expensive part (the ~12 GB leaf prove) runs once.
+        let sched_r = crate::m4treerec::walk_leaf(&leaf_l, &opvs_l);
+        return (sched_l, sched_r, opvs_l.clone(), opvs_l);
+    }
+    // 2d: prove a distinct child (a different M3 witness) so `L != R`.
+    let (leaf_r, opvs_r) = crate::m4treerec::leaf_proof_variant();
+    let sched_r = crate::m4treerec::walk_leaf(&leaf_r, &opvs_r);
+    debug_assert_ne!(opvs_l, opvs_r, "distinct children must have distinct opvs");
+    (sched_l, sched_r, opvs_l, opvs_r)
+}
+
+/// Interior rectangle shape to prove.
+enum Shape {
+    /// ONE wide leaf verified at 2^18 — the §7.1 canary. Pins the height-scaling
+    /// slope on-axis (same width class + blowup as the 2^16 leaf).
+    Single,
+    /// TWO distinct wide leaves row-stacked + keccak-merge at 2^19 — the interior
+    /// node (the RSS gate's actual subject).
+    Two,
+}
+
+/// `m4interior` bench mode (M4 step 1 stage 3): the interior peak-RSS gate.
+///
+/// Proves ONE interior rectangle per invocation (filtered by `--only <name>`),
+/// so `/usr/bin/time -l` wrapping the whole process attributes peak RSS to a
+/// single config — the measurement protocol of aggregation-rung1 §7.1. The bench
+/// prints prove time + fixed proof bytes; **peak RSS is read from the external
+/// `/usr/bin/time -l` line**, not measured in-process. This bench does NOT judge
+/// against §7.3 — the coordinator does the table lookup on the reported numbers.
+///
+/// Rows (name = shape/lane-config):
+/// - `single-child/b4/q40/g20/fp16/a16` — the §7.1 canary (measure twice).
+/// - `single-child/b2/q80/g20/fp16/a16` — canary at the backup blowup (optional).
+/// - `two-child/b4/q40/g20/fp16/a16` — the interior at b4 (run only if the
+///   leaf→canary height slope extrapolates below the ~34 GB rig wall, §7.1.3).
+/// - `two-child/b2/q80/g20/fp16/a16` — the interior at the backup blowup (the
+///   b2/q80 substitute the rig wall forces; both configs are ~100 bits).
+///
+/// The child leaves (each ~12 GB peak / ~0.67 s at b4/q40) are proved SERIALLY
+/// and ONCE, then dropped — only their recorded `Schedule` + outer PVs survive
+/// into the interior prove, so the reported peak RSS is the interior's, never a
+/// leaf's (they never coexist in memory with the interior LDE).
+pub(crate) fn run_m4interior(power: &str, only: Option<&str>) {
+    use std::time::Instant;
+
+    use p3_matrix::Matrix;
+    use p3_uni_stark::prove;
+
+    use crate::m4gate::{build_gate_trace, build_interior_trace, GateShape, VerifierGateAir};
+    use crate::{make_config_with, FriCfg};
+
+    println!("# qumbra-lab M4 step 1 stage 3: interior peak-RSS gate (m4interior)");
+    println!();
+    crate::print_env(power);
+    println!(
+        "- shapes: `single-child` = ONE wide leaf verified at 2^18 (the §7.1 canary — \
+         pins the height-scaling slope on-axis); `two-child` = TWO DISTINCT wide leaves \
+         row-stacked + keccak-merge at 2^19 (the interior node). The lane config is the \
+         INTERIOR's own FRI config, independent of the fixed b4/q40 config each child \
+         leaf was committed at."
+    );
+    println!(
+        "- protocol: aggregation-rung1 §7.1. ONE row per process via `--only <name>`; \
+         peak RSS from `/usr/bin/time -l` wrapping the whole process (NOT measured \
+         in-process), foreground bare run. RSS is the gate; the ≤ 30 s time axis is \
+         expected to clear. This bench reports numbers only — the §7.3 verdict is the \
+         coordinator's table lookup."
+    );
+    println!();
+
+    // b4/q40/g20 primary, b2/q80/g20 backup — both clear ~100 bits (make_config_with
+    // asserts it: 40·2+20 = 80·1+20 = 100). fp16/a16 match the leaf/consensus lane.
+    let b4 = FriCfg {
+        log_blowup: 2,
+        num_queries: 40,
+        grind_bits: 20,
+        log_final_poly_len: 4,
+        max_log_arity: 4,
+    };
+    let b2 = FriCfg {
+        log_blowup: 1,
+        num_queries: 80,
+        grind_bits: 20,
+        log_final_poly_len: 4,
+        max_log_arity: 4,
+    };
+    let rows: [(&str, Shape, FriCfg); 4] = [
+        ("single-child/b4/q40/g20/fp16/a16", Shape::Single, b4),
+        ("single-child/b2/q80/g20/fp16/a16", Shape::Single, b2),
+        ("two-child/b4/q40/g20/fp16/a16", Shape::Two, b4),
+        ("two-child/b2/q80/g20/fp16/a16", Shape::Two, b2),
+    ];
+
+    // Cache the heavy child schedules within a process (each leaf prove has a
+    // ~12 GB transient — build once, reuse across any matching lane configs).
+    let mut single: Option<(Schedule, Vec<Val>)> = None;
+    let mut two: Option<(Schedule, Schedule, Vec<Val>, Vec<Val>)> = None;
+
+    println!("| row | rows | prove s | fixed MB |");
+    println!("|---|---|---|---|");
+    let mut any = false;
+    for (name, shape, cfg) in &rows {
+        if let Some(f) = only {
+            if !name.contains(f) {
+                continue;
+            }
+        }
+        any = true;
+        eprintln!("== m4interior: {name} ==");
+        let config = make_config_with(cfg);
+        // extra_capacity_bits = cfg.log_blowup: reserve LDE capacity up front so
+        // the prover's LDE alloc does not realloc mid-prove (m4skel's "late reserve
+        // = 3x RSS" lesson) — essential for an accurate peak-RSS reading.
+        let (trace, opvs, air) = match shape {
+            Shape::Single => {
+                if single.is_none() {
+                    eprintln!(
+                        "   proving ONE child leaf (b4/q40, ~12 GB transient, freed before \
+                         the interior prove)..."
+                    );
+                    let (leaf, opvs) = crate::m4treerec::leaf_proof();
+                    let sched = crate::m4treerec::walk_leaf(&leaf, &opvs);
+                    drop(leaf); // free the ~780 KB proof; the schedule is what the interior needs
+                    single = Some((sched, opvs));
+                }
+                let (sched, opvs) = single.as_ref().unwrap();
+                let (trace, meta) =
+                    build_gate_trace(sched, opvs, &GateShape::wide(), cfg.log_blowup);
+                (trace, meta.opvs, VerifierGateAir::new_with_shape(GateShape::wide()))
+            }
+            Shape::Two => {
+                if two.is_none() {
+                    eprintln!(
+                        "   proving TWO DISTINCT child leaves (serial, ~12 GB each, both \
+                         freed before the interior prove)..."
+                    );
+                    let (sl, sr, ol, or) = two_child_schedule(true);
+                    two = Some((sl, sr, ol, or));
+                }
+                let (sl, sr, ol, or) = two.as_ref().unwrap();
+                let (trace, meta) =
+                    build_interior_trace(sl, sr, ol, or, &GateShape::wide(), cfg.log_blowup);
+                (trace, meta.opvs, VerifierGateAir::new_interior())
+            }
+        };
+        let n_rows = trace.height();
+        let t = Instant::now();
+        let proof = prove(&config, &air, trace, &opvs);
+        let prove_s = t.elapsed().as_secs_f64();
+        let fixed_mb =
+            bincode::serialize(&proof).expect("bincode") .len() as f64 / (1024.0 * 1024.0);
+        println!("| {name} | {n_rows} (2^{}) | {prove_s:.2} | {fixed_mb:.2} |", n_rows.trailing_zeros());
+    }
+    if !any {
+        eprintln!("(no row matched --only; nothing proved)");
+    }
+    println!();
+    println!(
+        "Peak RSS: read `maximum resident set size` from the `/usr/bin/time -l` line \
+         wrapping THIS process (one `--only` row per launch). §7.1: any run with nonzero \
+         swap-ins / pageouts is disqualified — close idle memory tasks and rerun. \
+         Reproduce each headline row twice. Verdict = coordinator's §7.3 table lookup on \
+         the two-child b4 peak RSS (measured, or validated-extrapolated per §7.1.3)."
+    );
+}

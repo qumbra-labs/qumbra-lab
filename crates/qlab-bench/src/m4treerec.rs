@@ -13,7 +13,7 @@
 
 use p3_uni_stark::{prove, verify, Proof};
 
-use crate::m4gate::{build_gate_trace, VerifierGateAir};
+use crate::m4gate::{build_gate_trace, GateShape, VerifierGateAir, GATE_WIDTH};
 use crate::m4gaterec::{self, Schedule};
 use crate::{make_config_with, Config, FriCfg, Val};
 
@@ -36,7 +36,23 @@ pub(crate) const AGG_CFG: FriCfg = FriCfg {
 pub(crate) fn leaf_proof() -> (Proof<Config>, Vec<Val>) {
     let (_inst, pvs, m3_proof) = m4gaterec::consensus_proof();
     let sched = m4gaterec::walk(&m3_proof, &pvs);
-    let (trace, meta) = build_gate_trace(&sched, &pvs, AGG_CFG.log_blowup);
+    let (trace, meta) = build_gate_trace(&sched, &pvs, &GateShape::narrow(), AGG_CFG.log_blowup);
+    let config = make_config_with(&AGG_CFG);
+    let air = VerifierGateAir::new();
+    let leaf = prove(&config, &air, trace, &meta.opvs);
+    (leaf, meta.opvs)
+}
+
+/// A DISTINCT leaf proof: identical shape to `leaf_proof`, but the inner M3
+/// witness is driven from a different PRNG seed, so the verified proof's Merkle
+/// caps and public values differ. The M4 interior's two-child PR-gate uses this
+/// for child R (`two_child_schedule(true)`) — identical children (L == R) can
+/// mask cross-wiring / symmetry bugs the distinct pair exposes.
+pub(crate) fn leaf_proof_variant() -> (Proof<Config>, Vec<Val>) {
+    // A seed clearly distinct from `consensus_proof`'s default.
+    let (_inst, pvs, m3_proof) = m4gaterec::consensus_proof_seeded(0x1234_5678_9abc_def0);
+    let sched = m4gaterec::walk(&m3_proof, &pvs);
+    let (trace, meta) = build_gate_trace(&sched, &pvs, &GateShape::narrow(), AGG_CFG.log_blowup);
     let config = make_config_with(&AGG_CFG);
     let air = VerifierGateAir::new();
     let leaf = prove(&config, &air, trace, &meta.opvs);
@@ -161,10 +177,29 @@ mod tests {
         let (nl, nc, nch) = sched.native_counts;
         assert!(nl > 0 && nc > 0 && nch > 0, "all three keccak roles present");
         let (tl, tn, quot) = opened_values_per_query(&leaf);
-        assert_eq!(tl, 3626, "trace-local = gate width");
-        assert_eq!(tn, 3626, "trace-next = gate width (transition constraints)");
+        // Leaf committed width = the NARROW gate width (leaf_proof uses
+        // GateShape::narrow() + VerifierGateAir::new()). Assert against the
+        // layout-derived GATE_WIDTH, not a literal — it grew 3626 → 3638 across
+        // 2b/2c/2d (csel/frgm/bcbd/chi/cc, all inert-for-narrow columns), and a
+        // hardcoded pin here (an m4treerec test, missed by `m4gate`-filtered runs)
+        // silently went stale. GATE_WIDTH tracks it permanently.
+        assert_eq!(tl, GATE_WIDTH, "trace-local = narrow gate width");
+        assert_eq!(tn, GATE_WIDTH, "trace-next = narrow gate width (transition constraints)");
         assert!(quot > 0, "quotient chunks opened");
         assert!(!sched.perms.is_empty(), "native perms recorded");
+    }
+
+    /// 2d-1: the distinct child's leaf proof must have DIFFERENT outer public
+    /// values from the default child (else "distinct children" would be a no-op
+    /// and could not expose a symmetry / cross-wiring bug). Both are full b4
+    /// leaf proves (~12 GB each), serialized; only the small opvs are compared.
+    #[test]
+    fn variant_child_has_distinct_opvs() {
+        let _g = heavy_lock();
+        let (_leaf_l, opvs_l) = leaf_proof();
+        let (_leaf_r, opvs_r) = leaf_proof_variant();
+        assert_eq!(opvs_l.len(), opvs_r.len(), "same shape → same opvs length");
+        assert_ne!(opvs_l, opvs_r, "distinct M3 witness → distinct caps + inner PVs");
     }
 }
 

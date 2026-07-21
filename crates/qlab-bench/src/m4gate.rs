@@ -183,6 +183,390 @@ const N_FLUSH_ENTRIES: usize = 9; // F0..F7 + EXH
 const QSLOTS: usize = 103;
 
 // ---------------------------------------------------------------------------
+// Inner-proof shape (M4 step 1 stage 2: narrow leaf vs wide interior)
+// ---------------------------------------------------------------------------
+
+/// The shape parameters of the *inner* proof this verifier circuit checks.
+///
+/// The uni-stark FRI verification algorithm is identical for the M3 *narrow*
+/// consensus proof (what the leaf gate verifies) and a leaf's *wide* proof
+/// (what an aggregation interior node verifies) — only these shape numbers
+/// differ. `narrow()` reproduces the const block above verbatim (the shipped
+/// leaf gate); `wide()` is the interior target, read from `m4treerec` /
+/// `docs/m4tree-step1a-run1.md`. Everything downstream (`GateLayout`, the
+/// column-offset chain, `eval`, `qprogram`, `lane_plan`) is being migrated to
+/// read this struct instead of the top-of-file `const`s — see
+/// `docs/m4-interior-circuit-stage2-plan.md`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GateShape {
+    /// Inner trace width = opened row length (`TW`).
+    pub(crate) tw: usize,
+    /// Quotient opened base values per query (`QW`).
+    pub(crate) qw: usize,
+    /// Inner public values (`N_PVS`).
+    pub(crate) n_pvs: usize,
+    /// FRI queries + index-bit count (`NQ`).
+    pub(crate) nq: usize,
+    /// Index bit width = log2(inner LDE domain) = inner degree_bits + log_blowup
+    /// (`LOG_MAX`).
+    pub(crate) log_max: usize,
+    /// Query-PoW grind bits (`GRIND_BITS`).
+    pub(crate) grind_bits: usize,
+    /// Per-round FRI fold log-arities (`LOG_ARITIES`).
+    pub(crate) log_arities: Vec<usize>,
+    /// Merkle cap size 2^cap_height (`CAP_LEN`).
+    pub(crate) cap_len: usize,
+    /// Inner-proof FRI blowup bits: `log_max = inner_degree_bits + log_blowup`.
+    /// Narrow M3 commits at b16 (`log_blowup = 4`, inner deg bits 18); wide
+    /// leaf commits at b4 (`log_blowup = 2`, inner deg bits 16). Drives
+    /// `g_trace = two_adic_generator(log_max - log_blowup)`.
+    pub(crate) log_blowup: usize,
+    /// Whether this shape hosts the interior merge lane (棒 3): the `wide()`
+    /// interior appends a keccak merge sponge over the two children's opvs and
+    /// needs the merge region-pin / sponge-phase / digest-carry columns. The
+    /// shipped leaf `narrow()` never merges, so its layout omits them entirely →
+    /// narrow gate_width unchanged → byte-identical.
+    pub(crate) merge_lane: bool,
+}
+
+impl GateShape {
+    /// The M3 narrow consensus proof — the shipped leaf gate. Reproduces the
+    /// const block above verbatim.
+    pub(crate) fn narrow() -> Self {
+        Self {
+            tw: 617,
+            qw: 16,
+            n_pvs: 84,
+            nq: 20,
+            log_max: 22,
+            grind_bits: 20,
+            log_arities: vec![4, 4, 4, 2],
+            cap_len: 8,
+            log_blowup: 4, // b16
+            merge_lane: false,
+        }
+    }
+
+    /// A leaf's wide `VerifierGateAir` proof (2^16 x 3,626, committed at the
+    /// aggregation config b4/q40/g20/fp16/a16) — the interior node's inner
+    /// proof. Values from `m4treerec::AGG_CFG` + `docs/m4tree-step1a-run1.md`:
+    /// 3,626-col rows, 40 queries, 8 quotient words, 3 arity-16 FRI rounds,
+    /// inner LDE 2^(16+2)=2^18, and inner public values = the leaf gate's own
+    /// outer public-value count `N_OPVS` (852 = 6*8*16 + 84).
+    pub(crate) fn wide() -> Self {
+        Self {
+            // The interior verifies a LEAF proof whose committed trace width is
+            // the narrow gate rectangle width. Derive it (not hardcode 3626) so
+            // any gate-column addition — csel (2b), degree-reduction cols, merge
+            // cols (棒 3) — auto-tracks into the interior's opened-row width.
+            tw: GATE_WIDTH,
+            qw: 8,
+            n_pvs: N_OPVS, // the leaf gate's opvs become the interior's inner PVs
+            nq: 40,
+            log_max: 18,
+            grind_bits: 20,
+            log_arities: vec![4, 4, 4],
+            cap_len: 8,
+            log_blowup: 2, // b4 (AGG_CFG)
+            merge_lane: true,
+        }
+    }
+
+    /// Merge-lane permutation count (棒 3): child-L opvs sponge + child-R opvs
+    /// sponge + one root perm. Each child sponge hashes that child's OWN opvs =
+    /// the interior's inner public values (`n_pvs` — e.g. the leaf's 852), NOT
+    /// the interior's outer `n_opvs`; `n_pvs·4` bytes at rate 136 (pad10*1 →
+    /// `bytes/136 + 1` blocks). 0 for shapes without a merge lane. Must equal
+    /// `m4interior::merge_perm_inputs(..).len()`.
+    pub(crate) fn merge_perms(&self) -> usize {
+        if !self.merge_lane {
+            return 0;
+        }
+        let blocks = self.n_pvs * 4 / 136 + 1;
+        2 * blocks + 1
+    }
+
+    /// Number of FRI commit-phase rounds.
+    pub(crate) fn n_fri_rounds(&self) -> usize {
+        self.log_arities.len()
+    }
+
+    /// Commitment caps: trace + quotient + one per FRI round (`N_CAPS`).
+    pub(crate) fn n_caps(&self) -> usize {
+        2 + self.n_fri_rounds()
+    }
+
+    /// Merkle cap height = log2(cap_len).
+    pub(crate) fn cap_height(&self) -> usize {
+        self.cap_len.trailing_zeros() as usize
+    }
+
+    /// Cumulative fold shifts with a leading 0 (`CUM`): len = n_rounds + 1.
+    pub(crate) fn cum(&self) -> Vec<usize> {
+        let mut c = Vec::with_capacity(self.n_fri_rounds() + 1);
+        let mut acc = 0;
+        c.push(0);
+        for &a in &self.log_arities {
+            acc += a;
+            c.push(acc);
+        }
+        c
+    }
+
+    /// Native Merkle path levels per batch = tree height - cap height
+    /// (`PATH_LEVELS`): trace, quotient (both at the LDE domain), then one per
+    /// FRI round at its folded domain.
+    pub(crate) fn path_levels(&self) -> Vec<usize> {
+        let ch = self.cap_height();
+        let cum = self.cum();
+        let mut pl = vec![self.log_max - ch, self.log_max - ch];
+        for r in 0..self.n_fri_rounds() {
+            pl.push(self.log_max - cum[r + 1] - ch);
+        }
+        pl
+    }
+
+    // -- shape-varying transcript / draw-schedule counts (derived per
+    //    docs/m4-1b-wide-params-investigation.md; each reproduces its narrow
+    //    module const, verified by `gate_shape_derived_counts_narrow`). --
+
+    /// Field-draw challenges: alpha, zeta, fri_alpha, one beta per round
+    /// (`N_CHALS` = 3 + n_fri_rounds).
+    pub(crate) fn n_chals(&self) -> usize {
+        3 + self.n_fri_rounds()
+    }
+
+    /// Draw-group ring size: alpha, zeta, fri_alpha, betas, pow, then `nq` index
+    /// groups + DONE (`N_GROUPS` = 5 + n_fri_rounds + nq).
+    pub(crate) fn n_groups(&self) -> usize {
+        5 + self.n_fri_rounds() + self.nq
+    }
+
+    /// PoW draw-group index (`G_POW` = 3 + n_fri_rounds).
+    pub(crate) fn g_pow(&self) -> usize {
+        3 + self.n_fri_rounds()
+    }
+
+    /// First query-index draw-group (`G_IDX0` = 4 + n_fri_rounds).
+    pub(crate) fn g_idx0(&self) -> usize {
+        4 + self.n_fri_rounds()
+    }
+
+    /// DONE draw-group index (`G_DONE` = 4 + n_fri_rounds + nq).
+    pub(crate) fn g_done(&self) -> usize {
+        4 + self.n_fri_rounds() + self.nq
+    }
+
+    /// Query-program role selectors (`N_ROLES` = 9 + n_fri_rounds, from the
+    /// per-round R_PLAST_F* vocabulary).
+    pub(crate) fn n_roles(&self) -> usize {
+        9 + self.n_fri_rounds()
+    }
+
+    /// Micro-code selectors (`N_MICROS` = 6 + 3·n_fri_rounds, from the per-round
+    /// M_S / M_B / M_FHI families).
+    pub(crate) fn n_micros(&self) -> usize {
+        6 + 3 * self.n_fri_rounds()
+    }
+
+    /// Absorb-round selector width (`DRND` width = 2 + n_fri_rounds: T, Q,
+    /// F0..F(n-1)).
+    pub(crate) fn drnd_width(&self) -> usize {
+        2 + self.n_fri_rounds()
+    }
+
+    /// M_FHI higher-round fold gates (`N_FHG` = Σ(2^(la−1)−1)).
+    pub(crate) fn n_fhg(&self) -> usize {
+        self.log_arities.iter().map(|&la| (1usize << (la - 1)) - 1).sum()
+    }
+
+    /// Flush-entry count = observation flushes + 1 EXH (`N_FLUSH_ENTRIES`
+    /// = 5 + n_fri_rounds).
+    pub(crate) fn n_flush_entries(&self) -> usize {
+        (4 + self.n_fri_rounds()) + 1
+    }
+
+    /// Pre-padding challenger flush message byte lengths (`FLUSH_BYTES`), one
+    /// per observation flush = 4 + n_fri_rounds entries: F0 (deg/trace-cap/PVs),
+    /// F1 (quot cap), F2 (zeta openings), one per FRI-round cap, then the final
+    /// (final-poly + log-arities + PoW). fp_len = 16 (fp16, both shapes).
+    pub(crate) fn flush_bytes(&self) -> Vec<usize> {
+        let n = self.n_fri_rounds();
+        let cap = self.cap_len;
+        let mut v = Vec::with_capacity(4 + n);
+        v.push(12 + cap * 32 + self.n_pvs * 4); // F0
+        v.push(32 + cap * 32); // F1 (quotient cap)
+        v.push(32 + 16 * (2 * self.tw + self.qw)); // F2 zeta openings (16·opened/query)
+        for _ in 0..n {
+            v.push(32 + cap * 32); // FRI-round cap
+        }
+        v.push(32 + 16 * 16 + n * 4 + 4); // final
+        v
+    }
+
+    /// Challenger flush block counts (`FLUSH_BLOCKS`): bytes/136 + 1 (rate 136,
+    /// +1 for the always-present 10*1 pad).
+    pub(crate) fn flush_blocks(&self) -> Vec<usize> {
+        self.flush_bytes().iter().map(|&b| b / 136 + 1).collect()
+    }
+
+    /// Obs-shape selectors (`N_SHAPES_OBS`): one per distinct block mosaic —
+    /// each obs flush contributes its block count, except the zeta-opening flush
+    /// (index 2) whose uniform interior collapses first/mid/last → 3.
+    pub(crate) fn n_shapes_obs(&self) -> usize {
+        self.flush_blocks()
+            .iter()
+            .enumerate()
+            .map(|(f, &blk)| if f == 2 && blk >= 3 { 3 } else { blk })
+            .sum()
+    }
+
+    /// Per-flush-entry required draw-group head (`GROUPREQ`): `groupreq[k] = k-1`
+    /// for obs flushes 1..n_obs, and `g_done` for the trailing EXH entry.
+    /// Length `n_flush_entries` (= n_obs + 1). Narrow `[MAX,0,1,2,3,4,5,6,G_DONE]`.
+    pub(crate) fn groupreq(&self) -> Vec<usize> {
+        let n_obs = self.n_obs_flushes();
+        let mut v = Vec::with_capacity(n_obs + 1);
+        v.push(usize::MAX);
+        for k in 1..n_obs {
+            v.push(k - 1);
+        }
+        v.push(self.g_done());
+        v
+    }
+
+    /// Outer public-value count: `n_caps · cap_len · 16` cap limbs + `n_pvs`
+    /// inner public values (`N_OPVS` for narrow = 852).
+    pub(crate) fn n_opvs(&self) -> usize {
+        self.n_caps() * self.cap_len * 16 + self.n_pvs
+    }
+
+    /// Observation flush count = `4 + n_fri_rounds` (alpha, zeta, fri_alpha,
+    /// one per FRI-round cap, and the final-poly/PoW flush). Narrow 8, wide 7.
+    pub(crate) fn n_obs_flushes(&self) -> usize {
+        4 + self.n_fri_rounds()
+    }
+
+    // -- shape-parametrized query-program micro / role codes (narrow reproduces
+    //    the M_* / R_* module consts). Numbering: 6 fixed micros
+    //    (NONE,X1,INV,RO,FIN,HORN) interleaved with the 3·n round-keyed families
+    //    S/B/FHI, so `m_fin`/`m_horn` land right after `m_fhi(n-1)`. --
+
+    /// Round `r` s-chain micro code (`M_S0..` = 4 + r).
+    pub(crate) fn m_s(&self, r: usize) -> u32 {
+        (4 + r) as u32
+    }
+    /// Round `r` B-ladder micro code (`M_B0..` = 4 + n + r).
+    pub(crate) fn m_b(&self, r: usize) -> u32 {
+        (4 + self.n_fri_rounds() + r) as u32
+    }
+    /// Round `r` higher-fold micro code (`M_FHI0..` = 4 + 2n + r).
+    pub(crate) fn m_fhi(&self, r: usize) -> u32 {
+        (4 + 2 * self.n_fri_rounds() + r) as u32
+    }
+    /// Final x_fin-chain micro code (`M_FIN` = 4 + 3n).
+    pub(crate) fn m_fin(&self) -> u32 {
+        (4 + 3 * self.n_fri_rounds()) as u32
+    }
+    /// Final-poly Horner micro code (`M_HORN` = 5 + 3n).
+    pub(crate) fn m_horn(&self) -> u32 {
+        (5 + 3 * self.n_fri_rounds()) as u32
+    }
+    /// Round `r` last-path role code (`R_PLAST_F0..` = 9 + r).
+    pub(crate) fn r_plast_f(&self, r: usize) -> u32 {
+        (9 + r) as u32
+    }
+
+    /// Fresh u32 words in the trace leaf's LAST absorb block = `tw mod 34`,
+    /// with a full block (34) when `tw` is a rate multiple. Narrow 617 → 5
+    /// (odd → high-half pad), wide 3626 → 22 (even → no pad). Drives the
+    /// `R_ABS_C5` (trace-last) sponge-carry / asm-range machinery.
+    pub(crate) fn trace_last_fresh(&self) -> usize {
+        let m = self.tw % 34;
+        if m == 0 {
+            34
+        } else {
+            m
+        }
+    }
+
+    /// Reduced-opening dup-phase capture geometry (slice 1b-B2).
+    ///
+    /// The F2-duplicate hash chain re-runs flush-2's zeta-value pipeline
+    /// (`fri_alpha` is drawn from F2's digest, so the value accumulation must
+    /// be replayed). Each opened value serializes to 4 u32 words; a keccak
+    /// block absorbs the rate = 34 u32 words = 17 value-rows (the asm routes 2
+    /// words/row); and flush-2's message opens with a 32-byte digest prefix (8
+    /// words = 4 value-rows) that occupies dup block 0's rows 0..3, so values
+    /// start at row 4. Hence after `v` values have been consumed the running
+    /// index sits at global value-row `g = 4 + 2*v`, i.e. dup block `g/17`, row
+    /// `g%17`. BLKCNT starts at `N = flush_blocks[2]` on dup block 0 and
+    /// decrements one per block, so BLKCNT on that block reads `N - g/17`.
+    ///
+    /// Zeta openings = 3 groups: group 0 = trace_local (`tw` values), group 1 =
+    /// trace_next (`tw` values), group 2 = quotient (`qw` values). The three
+    /// group-boundary snapshots are therefore at cumulative value counts `tw`
+    /// (A0), `2*tw` (A1) and `2*tw+qw` (A2, the chain end = block `N-1`).
+    ///
+    /// Returns `[(block, row_in_perm, blkcnt); 3]` = `[A0, A1, A2]`. Narrow
+    /// (`tw=617,qw=16,N=148`) reproduces the old literals `A0=(72,14,76)`,
+    /// `A1=(145,7,3)`, `A2=(147,5,1)`; wide (`tw=3626,qw=8,N=855`) yields
+    /// `A0=(426,14,429)`, `A1=(853,7,2)`, `A2=(854,6,1)`.
+    pub(crate) fn dup_captures(&self) -> [(usize, usize, u32); 3] {
+        let n = self.flush_blocks()[2];
+        let rpb = 17usize; // value-rows per absorb block (34 rate words / 2 words per row)
+        let pre = 4usize; // flush-2's 32-byte digest prefix = 8 words = 4 value-rows
+        let at = |v: usize| {
+            let g = pre + 2 * v;
+            (g / rpb, g % rpb, (n - g / rpb) as u32)
+        };
+        let caps = [at(self.tw), at(2 * self.tw), at(2 * self.tw + self.qw)];
+        debug_assert_eq!(caps[2].0, n - 1, "A2 (end) capture must land on the last dup block");
+        debug_assert_eq!(caps[2].2, 1, "A2 (end) capture BLKCNT must equal BLKLAST target");
+        caps
+    }
+
+    /// Per-round fold-path source height `lf[r] = log_max - cum[r+1]` (the
+    /// folded LDE domain log-height; narrow `[18,14,10,8]`).
+    pub(crate) fn lf(&self) -> Vec<usize> {
+        let cum = self.cum();
+        (0..self.n_fri_rounds()).map(|r| self.log_max - cum[r + 1]).collect()
+    }
+
+    /// Block-index one-hot width (`BIDX` width): must give a distinct slot to
+    /// every block of the largest flush that uses per-block `bidxsel` — i.e.
+    /// every obs flush EXCEPT F2 (index 2), which is handled specially via
+    /// `f2sel`+`blklast`. `= max(non-F2 flush_blocks) + 1` (the +1 is the
+    /// saturation sink). Narrow: max(5,3,3,3,3,3,3)+1 = 6; wide F0=28 → 29.
+    /// (Wide F0's 28 distinct-Pv blocks each need their own shsel selector, so
+    /// bidx must address all of them — the 1b-B5 fix.)
+    pub(crate) fn bidx_width(&self) -> usize {
+        let fb = self.flush_blocks();
+        let m = fb
+            .iter()
+            .enumerate()
+            .filter(|&(i, _)| i != 2)
+            .map(|(_, &b)| b)
+            .max()
+            .unwrap_or(0);
+        m + 1
+    }
+
+    /// Per-query program length in perms (`QSLOTS`): trace leaf+path, quotient
+    /// leaf+path, and per fold round a leaf (4·2^la ext words) + path. Leaf
+    /// perms = ceil(words/34) (keccak rate 34 u32 words/block).
+    pub(crate) fn qslots(&self) -> usize {
+        let ceil34 = |n: usize| (n + 33) / 34;
+        let pl = self.path_levels();
+        let mut q = ceil34(self.tw) + pl[0] + ceil34(self.qw) + pl[1];
+        for (r, &la) in self.log_arities.iter().enumerate() {
+            q += ceil34(4 * (1usize << la)) + pl[2 + r];
+        }
+        q
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Word binding tables (transcript mosaics)
 // ---------------------------------------------------------------------------
 
@@ -230,8 +614,20 @@ fn cap_limb_opv(cap: usize, digest: usize, limb: usize) -> usize {
 /// The word mosaic of one shape: 34 bindings (words 0..34).
 /// `content_words` = words carrying message content (the rest is padding
 /// already encoded as Const bindings).
-pub(crate) fn shape_mosaic(shape: Shape) -> Vec<WordBind> {
+pub(crate) fn shape_mosaic(shape: &GateShape, shape_kind: Shape) -> Vec<WordBind> {
     use WordBind::*;
+    let flush_bytes = shape.flush_bytes();
+    let flush_blocks = shape.flush_blocks();
+    let n_obs = shape.n_obs_flushes();
+    let final_f = n_obs - 1; // = 3 + n_fri_rounds (narrow 7, wide 6)
+    let cap = shape.cap_len;
+    let n_pvs = shape.n_pvs;
+    let tw = shape.tw;
+    let qw = shape.qw;
+    // Inner-proof degree bits = log_max - log_blowup (narrow 18, wide 16).
+    let deg_bits = (shape.log_max - shape.log_blowup) as u32;
+    // OPV base of the inner public values (after the cap limbs).
+    let opv_pvs = shape.n_caps() * cap * 16;
     // Build the full flush content-word streams once, then slice.
     // Flush content words (chain prefix included for f > 0).
     let flush_words = |f: usize| -> Vec<WordBind> {
@@ -240,49 +636,48 @@ pub(crate) fn shape_mosaic(shape: Shape) -> Vec<WordBind> {
             w.extend([Chain; 8]);
         }
         let mv = |x: u32| crate::Val::from_u32(x).to_unique_u32();
-        match f {
-            0 => {
-                w.push(Const(mv(18))); // degree bits (transcript encoding)
-                w.push(Const(mv(18))); // base degree bits
-                w.push(Const(mv(0))); // preprocessed width
-                for d in 0..CAP_LEN {
-                    for l in 0..8 {
-                        w.push(Cap(cap_limb_opv(0, d, 2 * l)));
-                    }
-                }
-                for i in 0..N_PVS {
-                    w.push(Pv(OPV_PVS + i));
+        if f == 0 {
+            w.push(Const(mv(deg_bits))); // degree bits (transcript encoding)
+            w.push(Const(mv(deg_bits))); // base degree bits
+            w.push(Const(mv(0))); // preprocessed width
+            for d in 0..cap {
+                for l in 0..8 {
+                    w.push(Cap(cap_limb_opv(0, d, 2 * l)));
                 }
             }
-            1 => {
-                for d in 0..CAP_LEN {
-                    for l in 0..8 {
-                        w.push(Cap(cap_limb_opv(1, d, 2 * l)));
-                    }
+            // All n_pvs inner public values ride F0's content stream and are
+            // distributed across F0's blocks by pad_words + block slicing
+            // below (narrow 84 over 5 blocks, wide 852 over 28).
+            for i in 0..n_pvs {
+                w.push(Pv(opv_pvs + i));
+            }
+        } else if f == 1 {
+            for d in 0..cap {
+                for l in 0..8 {
+                    w.push(Cap(cap_limb_opv(1, d, 2 * l)));
                 }
             }
-            2 => {
-                // 617 + 617 + 16 ext values, 4 words each.
-                w.extend(std::iter::repeat(Val).take(4 * (TW + TW + QW / 4 * 4)));
+        } else if f == 2 {
+            // Zeta openings: 2 opened rows (tw values each) + qw quotient
+            // values, 4 words per ext value: 4*(2*tw + qw) words.
+            w.extend(std::iter::repeat(Val).take(4 * (2 * tw + qw)));
+        } else if f == final_f {
+            w.extend(std::iter::repeat(Val).take(64)); // final poly (16 ext, fp16)
+            for &la in &shape.log_arities {
+                w.push(Const(mv(la as u32)));
             }
-            3..=6 => {
-                let c = 2 + (f - 3) + 0; // fri cap r -> commitment 2 + r
-                for d in 0..CAP_LEN {
-                    for l in 0..8 {
-                        w.push(Cap(cap_limb_opv(c, d, 2 * l)));
-                    }
+            w.push(Free); // pow witness
+        } else {
+            // FRI-round cap flushes (obs flush f in 3..final_f):
+            // commitment 2 + (f - 3).
+            let c = 2 + (f - 3);
+            for d in 0..cap {
+                for l in 0..8 {
+                    w.push(Cap(cap_limb_opv(c, d, 2 * l)));
                 }
             }
-            7 => {
-                w.extend(std::iter::repeat(Val).take(64)); // final poly
-                for la in LOG_ARITIES {
-                    w.push(Const(mv(la as u32)));
-                }
-                w.push(Free); // pow witness
-            }
-            _ => unreachable!(),
         }
-        assert_eq!(w.len() * 4, FLUSH_BYTES[f], "flush {f} byte count");
+        assert_eq!(w.len() * 4, flush_bytes[f], "flush {f} byte count");
         w
     };
     let pad_words = |content: &[WordBind], msg_bytes: usize, blocks: usize| -> Vec<WordBind> {
@@ -306,19 +701,19 @@ pub(crate) fn shape_mosaic(shape: Shape) -> Vec<WordBind> {
         }
         w
     };
-    match shape {
+    match shape_kind {
         Shape::Obs { flush, block } => {
             let content = flush_words(flush);
-            let padded = pad_words(&content, FLUSH_BYTES[flush], FLUSH_BLOCKS[flush]);
+            let padded = pad_words(&content, flush_bytes[flush], flush_blocks[flush]);
             padded[block * 34..(block + 1) * 34].to_vec()
         }
         Shape::F2Mid => {
             // words 34..68 of flush 2 == uniform Val x34 (any interior
             // block; asserted uniform below).
             let content = flush_words(2);
-            let padded = pad_words(&content, FLUSH_BYTES[2], FLUSH_BLOCKS[2]);
+            let padded = pad_words(&content, flush_bytes[2], flush_blocks[2]);
             let mid = padded[34..68].to_vec();
-            for b in 1..FLUSH_BLOCKS[2] - 1 {
+            for b in 1..flush_blocks[2] - 1 {
                 assert!(
                     padded[b * 34..(b + 1) * 34].iter().all(|x| *x == Val),
                     "F2 interior must be uniform"
@@ -341,22 +736,24 @@ pub(crate) fn shape_mosaic(shape: Shape) -> Vec<WordBind> {
 
 /// The distinct shapes that get selector columns: F0B0..B4, F1B0..B2,
 /// F2B0 + F2Mid + F2Blast, F3..F6 B0..B2, F7B0..B2, Refill.
-pub(crate) fn shape_list() -> Vec<Shape> {
+pub(crate) fn shape_list(shape: &GateShape) -> Vec<Shape> {
+    let fb = shape.flush_blocks();
+    let n_obs = shape.n_obs_flushes();
     let mut v = vec![];
-    for b in 0..5 {
+    for b in 0..fb[0] {
         v.push(Shape::Obs { flush: 0, block: b });
     }
-    for b in 0..3 {
+    for b in 0..fb[1] {
         v.push(Shape::Obs { flush: 1, block: b });
     }
     v.push(Shape::Obs { flush: 2, block: 0 });
     v.push(Shape::F2Mid);
     v.push(Shape::Obs {
         flush: 2,
-        block: FLUSH_BLOCKS[2] - 1,
+        block: fb[2] - 1,
     });
-    for f in 3..8 {
-        for b in 0..3 {
+    for f in 3..n_obs {
+        for b in 0..fb[f] {
             v.push(Shape::Obs { flush: f, block: b });
         }
     }
@@ -365,13 +762,14 @@ pub(crate) fn shape_list() -> Vec<Shape> {
 }
 
 
-/// SHSEL slot of shape_list()[i] (Refill has its own column).
+/// SHSEL slot of shape_list()[i] (Refill has its own column). Identity: the
+/// list is emitted in slot order, so no shape geometry is needed here.
 fn shsel_index_of(i: usize) -> usize {
     i
 }
 
-pub(crate) fn n_shapes() -> usize {
-    shape_list().len() // 27
+pub(crate) fn n_shapes(shape: &GateShape) -> usize {
+    shape_list(shape).len() // narrow 27
 }
 
 // ---------------------------------------------------------------------------
@@ -451,9 +849,9 @@ const BLKCNT: usize = FRING + 8;
 const BLKLAST: usize = BLKCNT + 1; // BLKCNT == 1 comparator + inverse
 const BLKINV: usize = BLKLAST + 1;
 const BIDX: usize = BLKINV + 1; // 6: block index one-hot, saturating
-const CMPA: usize = BIDX + 6; // BLKCNT == 76 (zeta-vals group-0 end)
+const CMPA: usize = BIDX + 6; // BLKCNT == N-block_A0 (zeta-vals group-0 end; narrow 76)
 const CMPAI: usize = CMPA + 1;
-const CMPB: usize = CMPAI + 1; // BLKCNT == 3 (group-1 end, F2-gated)
+const CMPB: usize = CMPAI + 1; // BLKCNT == N-block_A1 (group-1 end, F2-gated; narrow 3)
 const CMPBI: usize = CMPB + 1;
 const NEEDL: usize = CMPBI + 1; // BLKLAST * (required group reached)
 const REFSEL: usize = NEEDL + 1; // refill/trailer perm flag
@@ -510,8 +908,8 @@ const PZACC: usize = PREG + 4; // 4: running sum (PZ in chal, PX in query)
 const A0R: usize = PZACC + 4; // 4: running sum at group-0 end
 const A1R: usize = A0R + 4;
 const A2R: usize = A1R + 4;
-const P0R: usize = A2R + 4; // fri_alpha^617
-const P1R: usize = P0R + 4; // fri_alpha^1234
+const P0R: usize = A2R + 4; // preg at group-0 end = fri_alpha^tw (narrow ^617)
+const P1R: usize = P0R + 4; // preg at group-1 end = fri_alpha^(2*tw) (narrow ^1234)
 const PX0R: usize = P1R + 4; // trace-leaf PX
 const FPREG: usize = PX0R + 4; // 16 x 4: final poly coefficients
 const SCR: usize = FPREG + 64; // 8 x 4: fold scratch
@@ -525,7 +923,8 @@ const RUNEV: usize = XFIN + 4; // running fold evaluation
 
 // -- hash-transport duplicate of flush 2 (PZ pipeline host) --------------------
 /// fri_alpha is drawn from flush 2's digest, so the zeta-opening values
-/// cannot be consumed at flush 2's own rows. A 148-block duplicate hash
+/// cannot be consumed at flush 2's own rows. An N=flush_blocks[2]-block (narrow
+/// 148) duplicate hash
 /// chain placed after the trailer (once fri_alpha is registered) re-hashes
 /// a witness message; its digest must equal the captured flush-2 digest,
 /// which by collision resistance pins the message to the native one. The
@@ -533,7 +932,7 @@ const RUNEV: usize = XFIN + 4; // running fold evaluation
 /// duplicate; flush 2's own interior blocks need no binding at all.
 const F2DIG: usize = RUNEV + 4; // 16: flush-2 digest limbs
 const PHD: usize = F2DIG + 16; // duplicate-phase flag
-const CMPC: usize = PHD + 1; // BLKCNT == 148 comparator (dup first block)
+const CMPC: usize = PHD + 1; // BLKCNT == N=flush_blocks[2] comparator (dup first block; narrow 148)
 const CMPCI: usize = CMPC + 1;
 const CZD: usize = CMPCI + 1; // dup value-carry rows
 
@@ -572,24 +971,445 @@ const FHG: usize = BPM + 4; // 22: M_FHI fold gate = msel_rf * sf(r)
 const PREGA: usize = FHG + N_FHG; // 4: preg * fri_alpha (PX word-1 accumulation)
 // Reduced-opening capture-phase gates (endpoint pin START): PHD·comparator so
 // the A/P register captures (deg-1 use) stay deg <= 3.
-const CPA: usize = PREGA + 4; // PHD·CMPA  (A0/P0 capture: dup block 72)
-const CPB: usize = CPA + 1; // PHD·CMPB  (A1/P1 capture: dup block 145)
-const CPL: usize = CPB + 1; // PHD·BLKLAST (A2 capture: dup block 147)
+const CPA: usize = PREGA + 4; // PHD·CMPA  (A0/P0 capture: dup block_A0; narrow 72)
+const CPB: usize = CPA + 1; // PHD·CMPB  (A1/P1 capture: dup block_A1; narrow 145)
+const CPL: usize = CPB + 1; // PHD·BLKLAST (A2 capture: dup last block N-1; narrow 147)
 // Final-poly capture (endpoint pin END): FPI = 16-slot one-hot counter over the
 // F7 final-poly coefficients; CONSZ7 = CZ7·POS1 its completion flag.
 const CONSZ7: usize = CPL + 1; // CZ7 · POS1 (final-poly value completion)
 const FPI: usize = CONSZ7 + 1; // 16: final-poly coefficient index one-hot
+const CSEL: usize = FPI + 16; // 1: child-boundary re-anchor selector (2b)
+const FRGM: usize = CSEL + 1; // 1: fring-rotation gate sf(23)·b0next (2b-iii)
+const BCBD: usize = FRGM + 1; // 1: blkcnt update delta (2b-iii)
+// -- interior per-child opvs routing (2d) ------------------------------------
+// `CHI` is the running child selector (0 across child L's rows, 1 across child
+// R's), derived from `csel` by a pinned transition (chi_next = chi + csel_next)
+// with chi[0]=0. `CC` (cap_len cols) materializes `chi·caps8` so the cap
+// comparison can select each child's OWN half of the doubled `opvsL ++ opvsR`
+// public values at deg ≤ 3. Both are INERT for narrow / single-wide
+// (n_children = 1): unpinned, unread, filled 0 — narrow byte-identical.
+const CHI: usize = BCBD + 1; // 1: running child selector (interior only)
+const CC: usize = CHI + 1; // CAP_LEN: materialized chi·caps8 (cap-half select)
 
-const GATE_COLS: usize = FPI + 16 - GB;
-pub(crate) const GATE_WIDTH: usize = FPI + 16;
+const GATE_COLS: usize = CC + CAP_LEN - GB;
+pub(crate) const GATE_WIDTH: usize = CC + CAP_LEN;
 
-/// Flat M_FHI gate index for round `rf`, pair row `r` (mirrors the eval loop).
-const fn fhg_index(rf: usize, r: usize) -> usize {
-    if rf < 3 {
-        rf * 7 + r
-    } else {
-        21
+/// Runtime mirror of the column-offset chain above, computed from a
+/// [`GateShape`] instead of the top-of-file `const`s. `from_shape(narrow())`
+/// reproduces every const above byte-for-byte (asserted by
+/// `gate_layout_narrow_reproduces_consts`); the eventual `wide()` layout drives
+/// the interior verifier. Slice 1a-i-b of the stage-2 re-parametrization: this
+/// struct exists and is verified, but `eval`/builders are migrated to read it
+/// in slice 1a-ii (until then the fields are unused — hence `dead_code`).
+///
+/// Every shape-varying offset is now driven by `GateShape` methods (slice
+/// 1b-1): `nq` (IDXR/QSEL), `log_max` (IDXB), `n_fhg` (FHG), and the derived
+/// counts `n_groups`/`n_chals`/`n_roles`/`n_micros`/`n_shapes_obs`/`qslots`/
+/// `drnd_width` (formulas + wide confirmation in
+/// `docs/m4-1b-wide-params-investigation.md`). `from_shape(narrow())`
+/// reproduces every const (test) and `from_shape(wide())` now produces the
+/// correct wide *offsets*. **Still narrow-only (slice 1b-2+):** the AIR's
+/// `eval` and the trace builders (`Regs`, `qprogram`, `gate_consts`,
+/// `lane_plan`, `write_row`, `build_gate_trace`) still read the narrow module
+/// consts and the narrow generators, so *building a wide trace* is not wired
+/// yet — only the layout arithmetic is wide-ready.
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) struct GateLayout {
+    pub(crate) mul_off: usize,
+    pub(crate) add_off: usize,
+    pub(crate) gb: usize,
+    pub(crate) w0c: usize,
+    pub(crate) w1c: usize,
+    pub(crate) hb0: usize,
+    pub(crate) hb1: usize,
+    pub(crate) ta0: usize,
+    pub(crate) topa0: usize,
+    pub(crate) ta1: usize,
+    pub(crate) topa1: usize,
+    pub(crate) lbnz0: usize,
+    pub(crate) lbi0: usize,
+    pub(crate) lonz0: usize,
+    pub(crate) loi0: usize,
+    pub(crate) lbnz1: usize,
+    pub(crate) lbi1: usize,
+    pub(crate) lonz1: usize,
+    pub(crate) loi1: usize,
+    pub(crate) oreg: usize,
+    pub(crate) pbit: usize,
+    pub(crate) obit: usize,
+    pub(crate) fsbits: usize,
+    pub(crate) fsacc: usize,
+    pub(crate) fsp3a: usize,
+    pub(crate) fsp3b: usize,
+    pub(crate) fst7: usize,
+    pub(crate) fsinv: usize,
+    pub(crate) fsnz: usize,
+    pub(crate) fsaccept: usize,
+    pub(crate) fsgate: usize,
+    pub(crate) fsodd: usize,
+    pub(crate) fsfull: usize,
+    pub(crate) grp: usize,
+    pub(crate) coef: usize,
+    pub(crate) curch: usize,
+    pub(crate) crot: usize,
+    pub(crate) grot: usize,
+    pub(crate) chal: usize,
+    pub(crate) fa2: usize,
+    pub(crate) znreg: usize,
+    pub(crate) idxr: usize,
+    pub(crate) fring: usize,
+    pub(crate) blkcnt: usize,
+    pub(crate) blklast: usize,
+    pub(crate) blkinv: usize,
+    pub(crate) bidx: usize,
+    pub(crate) bidx_width: usize,
+    pub(crate) cmpa: usize,
+    pub(crate) cmpai: usize,
+    pub(crate) cmpb: usize,
+    pub(crate) cmpbi: usize,
+    pub(crate) needl: usize,
+    pub(crate) refsel: usize,
+    pub(crate) shsel: usize,
+    pub(crate) phc: usize,
+    pub(crate) phq: usize,
+    pub(crate) qsel: usize,
+    pub(crate) qcnt: usize,
+    pub(crate) qcw: usize,
+    pub(crate) qcwi: usize,
+    pub(crate) pr: usize,
+    pub(crate) pd: usize,
+    pub(crate) rsel: usize,
+    pub(crate) mlo: usize,
+    pub(crate) mhi: usize,
+    pub(crate) msel: usize,
+    pub(crate) dlo: usize,
+    pub(crate) dhi: usize,
+    pub(crate) drnd: usize,
+    pub(crate) dbit: usize,
+    pub(crate) glc: usize,
+    pub(crate) grc: usize,
+    pub(crate) caps8: usize,
+    pub(crate) idxb: usize,
+    pub(crate) cz2: usize,
+    pub(crate) cz7: usize,
+    pub(crate) cf: usize,
+    pub(crate) cx0: usize,
+    pub(crate) cx1: usize,
+    pub(crate) pos: usize,
+    pub(crate) consz: usize,
+    pub(crate) consf: usize,
+    pub(crate) asm0: usize,
+    pub(crate) asm1: usize,
+    pub(crate) vc: usize,
+    pub(crate) vce: usize,
+    pub(crate) pbuf: usize,
+    pub(crate) hit: usize,
+    pub(crate) gpb: usize,
+    pub(crate) lfs: usize,
+    pub(crate) preg: usize,
+    pub(crate) pzacc: usize,
+    pub(crate) a0r: usize,
+    pub(crate) a1r: usize,
+    pub(crate) a2r: usize,
+    pub(crate) p0r: usize,
+    pub(crate) p1r: usize,
+    pub(crate) px0r: usize,
+    pub(crate) fpreg: usize,
+    pub(crate) scr: usize,
+    pub(crate) breg: usize,
+    pub(crate) inv2s: usize,
+    pub(crate) invz: usize,
+    pub(crate) invzn: usize,
+    pub(crate) xreg: usize,
+    pub(crate) xfin: usize,
+    pub(crate) runev: usize,
+    pub(crate) f2dig: usize,
+    pub(crate) phd: usize,
+    pub(crate) cmpc: usize,
+    pub(crate) cmpci: usize,
+    pub(crate) czd: usize,
+    pub(crate) chlive: usize,
+    pub(crate) f2sel: usize,
+    pub(crate) pg_a: usize,
+    pub(crate) phg: usize,
+    pub(crate) phdend: usize,
+    pub(crate) cont: usize,
+    pub(crate) eg_a: usize,
+    pub(crate) endg: usize,
+    pub(crate) xsel: usize,
+    pub(crate) qadv: usize,
+    pub(crate) cfull: usize,
+    pub(crate) m3: usize,
+    pub(crate) rlo: usize,
+    pub(crate) rhi: usize,
+    pub(crate) dmux: usize,
+    pub(crate) snl: usize,
+    pub(crate) glo: usize,
+    pub(crate) ghi: usize,
+    pub(crate) gf: usize,
+    pub(crate) bpm: usize,
+    pub(crate) n_fhg: usize,
+    pub(crate) fhg: usize,
+    pub(crate) prega: usize,
+    pub(crate) cpa: usize,
+    pub(crate) cpb: usize,
+    pub(crate) cpl: usize,
+    pub(crate) consz7: usize,
+    pub(crate) fpi: usize,
+    /// Child-boundary re-anchor selector (2b): 1 on the first row of each child's
+    /// first perm (row 0 for single-child; row 0 and 24*nL for the two-child
+    /// interior). Constraint-pinned (option B, completion-gated) so a prover
+    /// cannot re-anchor mid-child. Appended last → narrow offsets unchanged.
+    pub(crate) csel: usize,
+    /// 2b-iii degree-reduction (deg-3 boundary carries): `frgm` = sf(23)·b0next
+    /// (the fring-rotation gate), `bcbd` = the blkcnt update delta. Materialized
+    /// so their `(1-csel_next)`-gated carries stay ≤ deg 3.
+    pub(crate) frgm: usize,
+    pub(crate) bcbd: usize,
+    /// Interior per-child opvs routing (2d): `chi` = running child selector
+    /// (0 = child L rows, 1 = child R rows), `cc` (cap_len cols) = materialized
+    /// `chi·caps8` for the cap-half select. Inert for narrow / single-wide.
+    pub(crate) chi: usize,
+    pub(crate) cc: usize,
+    /// Interior merge lane (棒 3-2), WIDE-ONLY (absent for narrow → gate_width
+    /// unchanged → byte-identical). `mreg` = monotone merge-region flag (1 on the
+    /// last `24·nm` rows, where the merge sponge perms sit); `mcnt` = running
+    /// count of `mreg` pinned `== 24·nm` at `last_row`, positively forcing the
+    /// region to be exactly those rows (so a prover cannot shrink/move it).
+    pub(crate) mreg: usize,
+    pub(crate) mcnt: usize,
+    /// 棒 3-2b capacity chain (WIDE-ONLY). The merge is 3 independent sub-sponges
+    /// (childL / childR / root) whose input capacity resets to 0 at each start
+    /// and chains from the previous perm's output otherwise. `meq`/`minv` (3 pairs)
+    /// are equality comparators pinning the sub-sponge-start rows via `mcnt ∈
+    /// {1, 24·kL+1, 24·(kL+kR)+1}`; `mrst = Σ meq` (reset flag); `mcont` =
+    /// materialized chain gate `sf(23)·mreg·(1−next mrst)` (keeps the chain deg ≤3).
+    pub(crate) meq: usize,
+    pub(crate) minv: usize,
+    pub(crate) mrst: usize,
+    pub(crate) mcont: usize,
+    /// 棒 3-2c dL carry (WIDE-ONLY, 16 limbs): the child-L sub-sponge digest is
+    /// produced ~kR perms before the root perm consumes it, so it is captured at
+    /// the childL→childR boundary and freeze-carried to the root perm. (dR is
+    /// adjacent to the root perm, bound directly by the boundary transition.)
+    pub(crate) dlr: usize,
+    pub(crate) gate_cols: usize,
+    pub(crate) gate_width: usize,
+}
+
+#[allow(dead_code)]
+impl GateLayout {
+    /// Compute the column layout for a given inner-proof shape. Mirrors the
+    /// `const` chain (lines ~382–584) exactly; `from_shape(&GateShape::narrow())`
+    /// == every const above.
+    pub(crate) fn from_shape(s: &GateShape) -> GateLayout {
+        let nq = s.nq;
+        let log_max = s.log_max;
+        let n_fhg = s.n_fhg();
+
+        // -- keccak-adjacent banks + gate base --
+        let mul_off = NUM_KECCAK_COLS;
+        let add_off = NUM_KECCAK_COLS + 12;
+        let gb = NUM_KECCAK_COLS + 24;
+        // -- routed words + canonicity --
+        let w0c = gb;
+        let w1c = w0c + 1;
+        let hb0 = w1c + 1;
+        let hb1 = hb0 + 16;
+        let ta0 = hb1 + 16;
+        let topa0 = ta0 + 1;
+        let ta1 = topa0 + 1;
+        let topa1 = ta1 + 1;
+        let lbnz0 = topa1 + 1;
+        let lbi0 = lbnz0 + 1;
+        let lonz0 = lbi0 + 1;
+        let loi0 = lonz0 + 1;
+        let lbnz1 = loi0 + 1;
+        let lbi1 = lbnz1 + 1;
+        let lonz1 = lbi1 + 1;
+        let loi1 = lonz1 + 1;
+        // -- XOR-absorb register file --
+        let oreg = loi1 + 1;
+        let pbit = oreg + 68;
+        let obit = pbit + 64;
+        // -- FS draw gadget --
+        let fsbits = obit + 64;
+        let fsacc = fsbits + 16;
+        let fsp3a = fsacc + 1;
+        let fsp3b = fsp3a + 1;
+        let fst7 = fsp3b + 1;
+        let fsinv = fst7 + 1;
+        let fsnz = fsinv + 1;
+        let fsaccept = fsnz + 1;
+        let fsgate = fsaccept + 1;
+        let fsodd = fsgate + 1;
+        let fsfull = fsodd + 1;
+        // -- draw scheduling --
+        let grp = fsfull + 1;
+        let coef = grp + s.n_groups();
+        let curch = coef + 4;
+        let crot = curch + 4;
+        let grot = crot + 1;
+        // -- challenge / index registers --
+        let chal = grot + 1;
+        let fa2 = chal + 4 * s.n_chals();
+        let znreg = fa2 + 4;
+        let idxr = znreg + 4;
+        // -- flush automaton --
+        let fring = idxr + nq; // IDXR width = nq
+        let blkcnt = fring + 8;
+        let blklast = blkcnt + 1;
+        let blkinv = blklast + 1;
+        let bidx = blkinv + 1;
+        let bidx_width = s.bidx_width();
+        let cmpa = bidx + bidx_width;
+        let cmpai = cmpa + 1;
+        let cmpb = cmpai + 1;
+        let cmpbi = cmpb + 1;
+        let needl = cmpbi + 1;
+        let refsel = needl + 1;
+        let shsel = refsel + 1;
+        // -- phases / query scheduling --
+        let phc = shsel + s.n_shapes_obs();
+        let phq = phc + 1;
+        let qsel = phq + 1;
+        let qcnt = qsel + nq + 1;
+        let qcw = qcnt + 1;
+        let qcwi = qcw + 1;
+        // -- query program ring --
+        let pr = qcwi + 1;
+        let pd = pr + s.qslots();
+        let rsel = pd + 15;
+        let mlo = rsel + s.n_roles();
+        let mhi = mlo + 8;
+        let msel = mhi + 4;
+        let dlo = msel + s.n_micros();
+        let dhi = dlo + 8;
+        let drnd = dhi + 3;
+        let dbit = drnd + s.drnd_width();
+        let glc = dbit + 1;
+        let grc = glc + 1;
+        let caps8 = grc + 1;
+        // -- per-query index bits --
+        let idxb = caps8 + 8;
+        // -- asm pipeline --
+        let cz2 = idxb + log_max;
+        let cz7 = cz2 + 1;
+        let cf = cz7 + 1;
+        let cx0 = cf + 1;
+        let cx1 = cx0 + 1;
+        let pos = cx1 + 1;
+        let consz = pos + 2;
+        let consf = consz + 1;
+        let asm0 = consf + 1;
+        let asm1 = asm0 + 1;
+        let vc = asm1 + 1;
+        let vce = vc + 16;
+        let pbuf = vce + 1;
+        let hit = pbuf + 4;
+        let gpb = hit + 1;
+        let lfs = gpb + 4;
+        // -- running-sum / arithmetic registers --
+        let preg = lfs + 1;
+        let pzacc = preg + 4;
+        let a0r = pzacc + 4;
+        let a1r = a0r + 4;
+        let a2r = a1r + 4;
+        let p0r = a2r + 4;
+        let p1r = p0r + 4;
+        let px0r = p1r + 4;
+        let fpreg = px0r + 4;
+        let scr = fpreg + 64;
+        let breg = scr + 32;
+        let inv2s = breg + 16;
+        let invz = inv2s + 4;
+        let invzn = invz + 4;
+        let xreg = invzn + 4;
+        let xfin = xreg + 4;
+        let runev = xfin + 4;
+        // -- flush-2 duplicate --
+        let f2dig = runev + 4;
+        let phd = f2dig + 16;
+        let cmpc = phd + 1;
+        let cmpci = cmpc + 1;
+        let czd = cmpci + 1;
+        // -- degree-reduction materialized products --
+        let chlive = czd + 1;
+        let f2sel = chlive + 1;
+        let pg_a = f2sel + 1;
+        let phg = pg_a + 1;
+        let phdend = phg + 1;
+        let cont = phdend + 1;
+        let eg_a = cont + 1;
+        let endg = eg_a + 1;
+        let xsel = endg + 1;
+        let qadv = xsel + 1;
+        let cfull = qadv + 1;
+        let m3 = cfull + 1;
+        let rlo = m3 + 8;
+        let rhi = rlo + 4;
+        let dmux = rhi + 4;
+        let snl = dmux + 1;
+        let glo = snl + 4;
+        let ghi = glo + 4;
+        let gf = ghi + 4;
+        let bpm = gf + 4;
+        let fhg = bpm + 4;
+        let prega = fhg + n_fhg;
+        let cpa = prega + 4;
+        let cpb = cpa + 1;
+        let cpl = cpb + 1;
+        let consz7 = cpl + 1;
+        let fpi = consz7 + 1;
+        let csel = fpi + 16;
+        let frgm = csel + 1;
+        let bcbd = frgm + 1;
+        let chi = bcbd + 1;
+        let cc = chi + 1;
+        // 棒 3-2 merge-lane columns, WIDE-ONLY: mreg + mcnt (3-2a region pin) +
+        // meq[3]/minv[3]/mrst/mcont (3-2b capacity chain). narrow (merge_lane
+        // false) adds 0 width and leaves the offsets unused (eval / fill touch
+        // them only when n_children > 1, i.e. the wide interior).
+        let mreg = cc + s.cap_len;
+        let mcnt = mreg + 1;
+        let meq = mcnt + 1;
+        let minv = meq + 4;
+        let mrst = minv + 4;
+        let mcont = mrst + 1;
+        let dlr = mcont + 1;
+        let merge_cols = if s.merge_lane { 28 } else { 0 }; // mreg,mcnt,meq[4],minv[4],mrst,mcont,dlr[16]
+        let gate_cols = cc + s.cap_len + merge_cols - gb;
+        let gate_width = cc + s.cap_len + merge_cols;
+
+        GateLayout {
+            mul_off, add_off, gb, w0c, w1c, hb0, hb1, ta0, topa0, ta1, topa1,
+            lbnz0, lbi0, lonz0, loi0, lbnz1, lbi1, lonz1, loi1, oreg, pbit, obit,
+            fsbits, fsacc, fsp3a, fsp3b, fst7, fsinv, fsnz, fsaccept, fsgate,
+            fsodd, fsfull, grp, coef, curch, crot, grot, chal, fa2, znreg, idxr,
+            fring, blkcnt, blklast, blkinv, bidx, bidx_width, cmpa, cmpai, cmpb, cmpbi, needl,
+            refsel, shsel, phc, phq, qsel, qcnt, qcw, qcwi, pr, pd, rsel, mlo, mhi,
+            msel, dlo, dhi, drnd, dbit, glc, grc, caps8, idxb, cz2, cz7, cf, cx0,
+            cx1, pos, consz, consf, asm0, asm1, vc, vce, pbuf, hit, gpb, lfs, preg,
+            pzacc, a0r, a1r, a2r, p0r, p1r, px0r, fpreg, scr, breg, inv2s, invz,
+            invzn, xreg, xfin, runev, f2dig, phd, cmpc, cmpci, czd, chlive, f2sel,
+            pg_a, phg, phdend, cont, eg_a, endg, xsel, qadv, cfull, m3, rlo, rhi,
+            dmux, snl, glo, ghi, gf, bpm, n_fhg, fhg, prega, cpa, cpb, cpl, consz7,
+            fpi, csel, frgm, bcbd, chi, cc, mreg, mcnt, meq, minv, mrst, mcont, dlr, gate_cols, gate_width,
+        }
     }
+}
+
+/// Flat M_FHI gate index for round `rf`, pair row `r`: the M_FHI family handles
+/// `2^(la-1)-1` binary-fold pairs per round (level 0 is the round-0 leaf fold).
+/// `= Σ_{r'<rf}(2^(la_{r'}-1)-1) + r`; the last index is `n_fhg - 1`. Narrow
+/// `[4,4,4,2]` gives `rf*7+r` for rf<3 and 21 for the final (la=2) round.
+fn fhg_index(log_arities: &[usize], rf: usize, r: usize) -> usize {
+    log_arities[..rf]
+        .iter()
+        .map(|&la| (1usize << (la - 1)) - 1)
+        .sum::<usize>()
+        + r
 }
 
 /// Diagnostic helper (relay debugging): map a column index to its region
@@ -688,17 +1508,44 @@ const D_T: u32 = 0;
 const D_Q: u32 = 1;
 const D_F: [u32; 4] = [2, 3, 4, 5];
 
-/// The 103-slot query program.
-pub(crate) fn qprogram() -> [u32; QSLOTS] {
-    let mut p = vec![];
-    // trace leaf: F34 + 17 x C34 + C5.
-    p.push(desc(R_ABS_F34, D_T, M_NONE));
-    for _ in 0..17 {
-        p.push(desc(R_ABS_C34, D_T, M_NONE));
-    }
-    p.push(desc(R_ABS_C5, D_T, M_NONE));
-    // trace path: levels 0..18 (dbits 0..17) + last (dbit 18).
-    for l in 0..18 {
+/// The per-query program, shape-parametrized (slice 1b-2). Length `s.qslots()`.
+/// `qprogram_from_shape(&narrow())` reproduces the old 103-slot `[u32; QSLOTS]`
+/// byte-for-byte: the fold-round loop is driven by `n_fri_rounds`, path lengths
+/// by `path_levels`, leaf blocks by `ceil(words/34)`, and the round-keyed
+/// micro/role vocabulary by the `GateShape::m_*`/`r_plast_f` helpers.
+pub(crate) fn qprogram_from_shape(s: &GateShape) -> Vec<u32> {
+    let n = s.n_fri_rounds();
+    let pl = s.path_levels();
+    let cum = s.cum();
+    let cap_h = s.cap_height();
+    // Every batch's last native path level is the top non-cap index bit.
+    let plast_dp = (s.log_max - cap_h - 1) as u32;
+    let ceil34 = |x: usize| (x + 33) / 34;
+    let mut p: Vec<u32> = vec![];
+
+    // Absorb blocks for a leaf of `nw` fresh words under dparam `dp`. The
+    // last-block role is chosen by LEAF CONTEXT (`last_role`), not by matching
+    // the remainder literal: the trace leaf's last block is R_ABS_C5 whatever
+    // its fresh count (narrow 5, wide 22), the fold leaf's last block is
+    // R_ABS_C30. A single-block leaf (nb <= 1: quotient, or a short fold round
+    // whose 4·2^la ≤ 34) is always R_ABS_F16.
+    let emit_leaf = |p: &mut Vec<u32>, nw: usize, dp: u32, last_role: u32| {
+        let nb = ceil34(nw);
+        if nb <= 1 {
+            // Single (first+last) block.
+            p.push(desc(R_ABS_F16, dp, M_NONE));
+        } else {
+            p.push(desc(R_ABS_F34, dp, M_NONE));
+            for _ in 0..nb - 2 {
+                p.push(desc(R_ABS_C34, dp, M_NONE));
+            }
+            p.push(desc(last_role, dp, M_NONE));
+        }
+    };
+
+    // trace leaf + path (l0 = x-chain, l1 = inverses).
+    emit_leaf(&mut p, s.tw, D_T, R_ABS_C5);
+    for l in 0..pl[0] - 1 {
         let micro = match l {
             0 => M_X1,
             1 => M_INV,
@@ -706,55 +1553,82 @@ pub(crate) fn qprogram() -> [u32; QSLOTS] {
         };
         p.push(desc(R_PATH, l as u32, micro));
     }
-    p.push(desc(R_PLAST_T, 18, M_NONE));
-    // quotient leaf + path.
-    p.push(desc(R_ABS_F16, D_Q, M_NONE));
-    for l in 0..18 {
+    p.push(desc(R_PLAST_T, plast_dp, M_NONE));
+
+    // quotient leaf + path (l0 = round-0 s-chain, l1 = B-ladder, l2 = M_RO).
+    emit_leaf(&mut p, s.qw, D_Q, R_ABS_F16);
+    for l in 0..pl[1] - 1 {
         let micro = match l {
-            0 => M_S0,
-            1 => M_B0,
+            0 => s.m_s(0),
+            1 => s.m_b(0),
             2 => M_RO,
             _ => M_NONE,
         };
         p.push(desc(R_PATH, l as u32, micro));
     }
-    p.push(desc(R_PLAST_Q, 18, M_NONE));
-    // fold rounds.
-    for r in 0..4 {
-        if r < 3 {
-            p.push(desc(R_ABS_F34, D_F[r], M_NONE));
-            p.push(desc(R_ABS_C30, D_F[r], M_NONE));
-        } else {
-            p.push(desc(R_ABS_F16, D_F[r], M_NONE));
-        }
-        let levels = PATH_LEVELS[2 + r];
-        let base = CUM[r + 1];
+    p.push(desc(R_PLAST_Q, plast_dp, M_NONE));
+
+    // fold rounds: leaf (4·2^la ext words) + path. Round r's path hosts the
+    // higher-fold (l0), then the NEXT round's s-chain + B-ladder (l1/l2), except
+    // the last round which hosts the final x_fin-chain + Horner.
+    //
+    // END-pin placement (Option A, slice 1b-B3 part 2): M_HORN pins the
+    // fold-chain END (`RUNEV == Horner(final_poly, x_fin)`) and MUST land after
+    // the last round's M_FHI so RUNEV is final. It needs an interior slot in the
+    // last round. The narrow last round has 4 interior slots (l=0..3), so
+    // M_FHI@l0 / M_FIN@l1 / M_HORN@l2 all fit. The wide last round is short
+    // (path_levels=3 → interior slots l=0,1 only): there is no room for both
+    // M_FIN and M_HORN after M_FHI. `M_FIN` (x_fin = ∏ over query index bits) has
+    // NO fold-chain dependency — its eval keys only on its own micro selector,
+    // reads the carried index bits, and writes the carried `xfin` register, which
+    // nothing overwrites before M_HORN consumes it — so we relocate it to a spare
+    // M_NONE interior slot in an earlier fold round (round 0, l=3) while keeping
+    // M_HORN at the last round's l1 (still after last-round M_FHI). Narrow keeps
+    // its `last_has_fin` room and is byte-identical (fin_reloc = None).
+    let last_slots = pl[2 + n - 1] - 1; // interior slots in the last fold round
+    let last_has_fin = last_slots >= 3;
+    // When the last round is too short for M_FIN, host it on an earlier round's
+    // spare interior slot (round 0, l=3 — the first M_NONE past M_FHI/M_S/M_B).
+    let fin_reloc: Option<(usize, usize)> = if last_has_fin { None } else { Some((0, 3)) };
+    for r in 0..n {
+        let la = s.log_arities[r];
+        emit_leaf(&mut p, 4 * (1usize << la), D_F[r], R_ABS_C30);
+        let levels = pl[2 + r];
+        let sh = cum[r + 1] as u32;
         for l in 0..levels - 1 {
-            let micro = match (r, l) {
-                (0, 0) => M_FHI0,
-                (0, 1) => M_S1,
-                (0, 2) => M_B1,
-                (1, 0) => M_FHI1,
-                (1, 1) => M_S2,
-                (1, 2) => M_B2,
-                (2, 0) => M_FHI2,
-                (2, 1) => M_S3,
-                (2, 2) => M_B3,
-                (3, 0) => M_FHI3,
-                (3, 1) => M_FIN,
-                (3, 2) => M_HORN,
-                _ => M_NONE,
+            let micro = match l {
+                0 => s.m_fhi(r),
+                1 => {
+                    if r < n - 1 {
+                        s.m_s(r + 1)
+                    } else if last_has_fin {
+                        s.m_fin()
+                    } else {
+                        // Wide short last round: M_HORN directly after M_FHI.
+                        s.m_horn()
+                    }
+                }
+                2 => {
+                    if r < n - 1 {
+                        s.m_b(r + 1)
+                    } else {
+                        s.m_horn()
+                    }
+                }
+                _ => {
+                    if fin_reloc == Some((r, l)) {
+                        s.m_fin()
+                    } else {
+                        M_NONE
+                    }
+                }
             };
-            p.push(desc(R_PATH, (base + l) as u32, micro));
+            p.push(desc(R_PATH, sh + l as u32, micro));
         }
-        p.push(desc(
-            [R_PLAST_F0, R_PLAST_F1, R_PLAST_F2, R_PLAST_F3][r],
-            18,
-            M_NONE,
-        ));
+        p.push(desc(s.r_plast_f(r), plast_dp, M_NONE));
     }
-    assert_eq!(p.len(), QSLOTS);
-    p.try_into().unwrap()
+    assert_eq!(p.len(), s.qslots(), "query program length");
+    p
 }
 
 // ---------------------------------------------------------------------------
@@ -789,18 +1663,18 @@ const fn ring_at(base: usize, n: usize, g: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct GateConsts {
-    /// g22^(2^(21-k)) for k in 0..22 (x / x_fin chains).
-    pub kx: [Val; 22],
+    /// g_{log_max}^(2^(log_max-1-k)) for k in 0..log_max (x / x_fin chains).
+    pub kx: Vec<Val>,
     /// s-chain constants per round: sk[r][k] = g_(lf+la)^(2^(lf-1-k)).
-    pub sk: [Vec<Val>; 4],
+    pub sk: Vec<Vec<Val>>,
     /// Fold constants k_fold[r][l][i] = g_l^(-rev_(la-l-1)(i)),
     /// g_l = two_adic_generator(la_r)^(2^l).
-    pub kf: [Vec<Vec<Val>>; 4],
+    pub kf: Vec<Vec<Vec<Val>>>,
     pub gen: Val,
     pub g_trace: Val,
     pub half: Val,
-    /// Flush block counts for BLKCNT reloads.
-    pub flush_blocks: [usize; 8],
+    /// Flush block counts for BLKCNT reloads (one per obs flush).
+    pub flush_blocks: Vec<usize>,
 }
 
 fn rev_bits(x: usize, bits: usize) -> usize {
@@ -811,35 +1685,44 @@ fn rev_bits(x: usize, bits: usize) -> usize {
     r
 }
 
-pub(crate) fn gate_consts() -> GateConsts {
-    let g22 = Val::two_adic_generator(LOG_MAX);
-    let kx = core::array::from_fn(|k| g22.exp_power_of_2(21 - k));
-    let lf: [usize; 4] = [18, 14, 10, 8];
-    let sk = core::array::from_fn(|r| {
-        let g = Val::two_adic_generator(lf[r] + LOG_ARITIES[r]);
-        (0..lf[r]).map(|k| g.exp_power_of_2(lf[r] - 1 - k)).collect()
-    });
-    let kf = core::array::from_fn(|r| {
-        let la = LOG_ARITIES[r];
-        let g_ar = Val::two_adic_generator(la);
-        (0..la)
-            .map(|l| {
-                let g_l = g_ar.exp_power_of_2(l);
-                let pairs = 1 << (la - l - 1);
-                (0..pairs)
-                    .map(|i| g_l.exp_u64(rev_bits(i, la - l - 1) as u64).inverse())
-                    .collect()
-            })
-            .collect()
-    });
+/// Shape-parametrized field constants (slice 1b-2). `gate_consts_from_shape(&narrow())`
+/// reproduces the shipped narrow generators byte-for-byte (`kx` length `log_max`,
+/// per-round `lf = log_max - cum[r+1]`, `g_trace = two_adic(log_max - log_blowup)`).
+pub(crate) fn gate_consts_from_shape(s: &GateShape) -> GateConsts {
+    let log_max = s.log_max;
+    let n = s.n_fri_rounds();
+    let lf = s.lf();
+    let g_lm = Val::two_adic_generator(log_max);
+    let kx = (0..log_max).map(|k| g_lm.exp_power_of_2(log_max - 1 - k)).collect();
+    let sk = (0..n)
+        .map(|r| {
+            let g = Val::two_adic_generator(lf[r] + s.log_arities[r]);
+            (0..lf[r]).map(|k| g.exp_power_of_2(lf[r] - 1 - k)).collect()
+        })
+        .collect();
+    let kf = (0..n)
+        .map(|r| {
+            let la = s.log_arities[r];
+            let g_ar = Val::two_adic_generator(la);
+            (0..la)
+                .map(|l| {
+                    let g_l = g_ar.exp_power_of_2(l);
+                    let pairs = 1 << (la - l - 1);
+                    (0..pairs)
+                        .map(|i| g_l.exp_u64(rev_bits(i, la - l - 1) as u64).inverse())
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
     GateConsts {
         kx,
         sk,
         kf,
         gen: Val::GENERATOR,
-        g_trace: Val::two_adic_generator(18),
+        g_trace: Val::two_adic_generator(log_max - s.log_blowup),
         half: Val::from_u32(2).inverse(),
-        flush_blocks: FLUSH_BLOCKS,
+        flush_blocks: s.flush_blocks(),
     }
 }
 
@@ -848,25 +1731,69 @@ pub(crate) fn gate_consts() -> GateConsts {
 // ---------------------------------------------------------------------------
 
 pub(crate) struct VerifierGateAir {
-    pub program: [u32; QSLOTS],
+    pub program: Vec<u32>,
     pub consts: GateConsts,
+    /// Inner-proof shape this circuit verifies (narrow leaf today; a future
+    /// slice instantiates `wide()` for the interior node).
+    pub(crate) shape: GateShape,
+    /// Column layout derived from `shape`; `eval` reads every column offset
+    /// from here instead of the top-of-file `const`s.
+    pub(crate) layout: GateLayout,
+    /// Number of child proofs verified in one rectangle (2d). `1` = the leaf /
+    /// single-wide gate (byte-identical to pre-2d); `> 1` = the interior node,
+    /// which takes `n_children · n_opvs` public values (`opvsL ++ opvsR ++ …`)
+    /// and routes each child's cap comparison to its own half via `chi`/`cc`.
+    pub(crate) n_children: usize,
+    /// log2(trace height) — used ONLY by the merge lane (棒 3-2) to pin the
+    /// merge-region row count at `last_row`. A power-of-2 height is not a
+    /// multiple of the 24-row keccak perm, so the trace's last perm is truncated
+    /// (an `h mod 24`-row tail after the last full perm); the merge region is the
+    /// suffix from the perm-aligned merge start, so its row count at last_row is
+    /// `(h mod 24) + 24·merge_perms()`. The two-child wide interior is height
+    /// 2^19. 0 for non-merge shapes (unused there).
+    pub(crate) log_height: usize,
 }
 
 impl VerifierGateAir {
     pub(crate) fn new() -> Self {
+        Self::new_with_shape(GateShape::narrow())
+    }
+
+    /// The M4 interior node: a `wide()`-shape verifier over TWO stacked children
+    /// with per-child opvs routing enabled (2d) + the 棒 3 merge lane. Height is
+    /// 2^19 (two ~8,360-perm children + the ~53-perm merge sponge, padded).
+    pub(crate) fn new_interior() -> Self {
+        Self { n_children: 2, log_height: 19, ..Self::new_with_shape(GateShape::wide()) }
+    }
+
+    /// Build a verifier gate for an arbitrary inner-proof `shape`, deriving the
+    /// column layout, query program, and field constants from it (slice 1b-2:
+    /// all three are now shape-parametrized, so `new_with_shape(wide())` is
+    /// self-consistent).
+    pub(crate) fn new_with_shape(shape: GateShape) -> Self {
+        let layout = GateLayout::from_shape(&shape);
+        let program = qprogram_from_shape(&shape);
+        let consts = gate_consts_from_shape(&shape);
         Self {
-            program: qprogram(),
-            consts: gate_consts(),
+            program,
+            consts,
+            shape,
+            layout,
+            n_children: 1,
+            log_height: 0,
         }
     }
 }
 
 impl<F: Field> BaseAir<F> for VerifierGateAir {
     fn width(&self) -> usize {
-        GATE_WIDTH
+        self.layout.gate_width
     }
     fn num_public_values(&self) -> usize {
-        N_OPVS
+        // Interior (n_children > 1): the two consumed child opvs halves + the
+        // 棒 3 merge root (§2 exposed binding value).
+        let merge = if self.n_children > 1 { crate::m4interior::MERGE_ROOT_LIMBS } else { 0 };
+        self.shape.n_opvs() * self.n_children + merge
     }
 }
 
@@ -901,9 +1828,9 @@ where
         // --- arithmetic banks (inc-1, unchanged) --------------------------
         {
             let w = c(EXT_W);
-            let a = |k: usize| cv(MUL_OFF + k);
-            let b = |k: usize| cv(MUL_OFF + 4 + k);
-            let cc = |k: usize| cv(MUL_OFF + 8 + k);
+            let a = |k: usize| cv(self.layout.mul_off + k);
+            let b = |k: usize| cv(self.layout.mul_off + 4 + k);
+            let cc = |k: usize| cv(self.layout.mul_off + 8 + k);
             for k in 0..4 {
                 let mut acc = AB::Expr::ZERO;
                 for i in 0..4 {
@@ -918,7 +1845,7 @@ where
                 builder.assert_eq(acc, cc(k));
             }
             for k in 0..4 {
-                builder.assert_eq(cv(ADD_OFF + k) + cv(ADD_OFF + 4 + k), cv(ADD_OFF + 8 + k));
+                builder.assert_eq(cv(self.layout.add_off + k) + cv(self.layout.add_off + 4 + k), cv(self.layout.add_off + 8 + k));
             }
         }
 
@@ -942,8 +1869,8 @@ where
         // =====================================================================
         // Query program ring + role/micro/dparam selectors
         // =====================================================================
-        let phq = cv(PHQ);
-        let phc = cv(PHC);
+        let phq = cv(self.layout.phq);
+        let phc = cv(self.layout.phc);
         builder.assert_bool(phq.clone());
         builder.assert_bool(phc.clone());
 
@@ -954,79 +1881,80 @@ where
         // pass in `build_gate_trace`.
         // ---------------------------------------------------------------------
         {
-            let ring_fring = |f: usize| cv(ring_at(FRING, 8, f));
-            // CHLIVE = phc * (1 - REFSEL)
-            builder.assert_eq(cv(CHLIVE), phc.clone() * (AB::Expr::ONE - cv(REFSEL)));
-            // F2SEL = ringsel(2) * (1 - bidxsel(0))
-            builder.assert_eq(cv(F2SEL), ring_fring(2) * (AB::Expr::ONE - cv(BIDX)));
-            // PG_A = ringsel(7) * grpdone * phc
+            let ring_fring = |f: usize| cv(ring_at(self.layout.fring, 8, f));
+            // self.layout.chlive = phc * (1 - self.layout.refsel)
+            builder.assert_eq(cv(self.layout.chlive), phc.clone() * (AB::Expr::ONE - cv(self.layout.refsel)));
+            // self.layout.f2sel = ringsel(2) * (1 - bidxsel(0))
+            builder.assert_eq(cv(self.layout.f2sel), ring_fring(2) * (AB::Expr::ONE - cv(self.layout.bidx)));
+            // self.layout.pg_a = ringsel(final obs flush) * grpdone * phc
+            // (final obs flush index = 3 + n_fri_rounds; narrow 7, wide 6).
             builder.assert_eq(
-                cv(PG_A),
-                ring_fring(7) * cv(ring_at(GRP, N_GROUPS, G_DONE)) * phc.clone(),
+                cv(self.layout.pg_a),
+                ring_fring(self.consts.flush_blocks.len() - 1)
+                    * cv(ring_at(self.layout.grp, self.shape.n_groups(), self.shape.g_done()))
+                    * phc.clone(),
             );
-            // PHG (phasegate) = sf(23) * BLKLAST * PG_A
-            builder.assert_eq(cv(PHG), sf(23) * cv(BLKLAST) * cv(PG_A));
-            // PHDEND = sf(23) * PHD * BLKLAST
-            builder.assert_eq(cv(PHDEND), sf(23) * cv(PHD) * cv(BLKLAST));
-            // CONT = sf(23) * phc * (1 - BLKLAST)
-            builder.assert_eq(cv(CONT), sf(23) * phc.clone() * (AB::Expr::ONE - cv(BLKLAST)));
-            // EG_A = phq * QCW * ring(QSEL, NQ-1); ENDG (endgate) = sf(23) * EG_A
+            // self.layout.phg (phasegate) = sf(23) * self.layout.blklast * self.layout.pg_a
+            builder.assert_eq(cv(self.layout.phg), sf(23) * cv(self.layout.blklast) * cv(self.layout.pg_a));
+            // self.layout.phdend = sf(23) * self.layout.phd * self.layout.blklast
+            builder.assert_eq(cv(self.layout.phdend), sf(23) * cv(self.layout.phd) * cv(self.layout.blklast));
+            // self.layout.cont = sf(23) * phc * (1 - self.layout.blklast)
+            builder.assert_eq(cv(self.layout.cont), sf(23) * phc.clone() * (AB::Expr::ONE - cv(self.layout.blklast)));
+            // self.layout.eg_a = phq * self.layout.qcw * ring(self.layout.qsel, self.shape.nq-1); self.layout.endg (endgate) = sf(23) * self.layout.eg_a
             builder.assert_eq(
-                cv(EG_A),
-                phq.clone() * cv(QCW) * cv(ring_at(QSEL, NQ + 1, NQ - 1)),
+                cv(self.layout.eg_a),
+                phq.clone() * cv(self.layout.qcw) * cv(ring_at(self.layout.qsel, self.shape.nq + 1, self.shape.nq - 1)),
             );
-            builder.assert_eq(cv(ENDG), sf(23) * cv(EG_A));
-            // XSEL = phd*(1-CMPC) + sum of obs/dup interior SHSEL (xorsel).
+            builder.assert_eq(cv(self.layout.endg), sf(23) * cv(self.layout.eg_a));
+            // self.layout.xsel = phd*(1-self.layout.cmpc) + sum of obs/dup interior self.layout.shsel (xorsel).
             {
-                let mut xs = cv(PHD) * (AB::Expr::ONE - cv(CMPC));
-                for f in 0..8 {
+                let mut xs = cv(self.layout.phd) * (AB::Expr::ONE - cv(self.layout.cmpc));
+                for f in 0..self.consts.flush_blocks.len() {
                     if f == 2 {
                         continue;
                     }
-                    for b in 1..FLUSH_BLOCKS[f] {
-                        xs = xs + cv(SHSEL + shsel_index(f, b));
+                    for b in 1..self.consts.flush_blocks[f] {
+                        xs = xs + cv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, b));
                     }
                 }
-                builder.assert_eq(cv(XSEL), xs);
+                builder.assert_eq(cv(self.layout.xsel), xs);
             }
-            // QADV = sf(23) * phq * QCW
-            builder.assert_eq(cv(QADV), sf(23) * phq.clone() * cv(QCW));
-            // CFULL = sf(23) * consumersel * (1 - FSFULL)
+            // self.layout.qadv = sf(23) * phq * self.layout.qcw
+            builder.assert_eq(cv(self.layout.qadv), sf(23) * phq.clone() * cv(self.layout.qcw));
+            // self.layout.cfull = sf(23) * consumersel * (1 - self.layout.fsfull)
             {
-                let mut cs = cv(REFSEL);
-                for f in 1..8 {
-                    cs = cs + cv(SHSEL + shsel_index(f, 0));
+                let mut cs = cv(self.layout.refsel);
+                for f in 1..self.consts.flush_blocks.len() {
+                    cs = cs + cv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0));
                 }
-                builder.assert_eq(cv(CFULL), sf(23) * cs * (AB::Expr::ONE - cv(FSFULL)));
+                builder.assert_eq(cv(self.layout.cfull), sf(23) * cs * (AB::Expr::ONE - cv(self.layout.fsfull)));
             }
         }
 
         // Ring pin + rotation (one limb per perm while in query phase).
-        for i in 0..QSLOTS {
-            builder
-                .when_first_row()
-                .assert_eq(cv(PR + i), c(self.program[i]));
+        for i in 0..self.shape.qslots() {
+            builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.pr + i) - (c(self.program[i]))));
         }
         {
             let g = sf(23) * phq.clone();
             let mut t = builder.when_transition();
-            for i in 0..QSLOTS {
+            for i in 0..self.shape.qslots() {
                 t.assert_eq(
-                    nv(PR + i),
-                    cv(PR + i) + g.clone() * (cv(PR + (i + 1) % QSLOTS) - cv(PR + i)),
+                    nv(self.layout.pr + i),
+                    cv(self.layout.pr + i) + g.clone() * (cv(self.layout.pr + (i + 1) % self.shape.qslots()) - cv(self.layout.pr + i)),
                 );
             }
         }
-        // Head decomposition: 15 bool bits = PR[0].
+        // Head decomposition: 15 bool bits = self.layout.pr[0].
         for k in 0..15 {
-            builder.assert_bool(cv(PD + k));
+            builder.assert_bool(cv(self.layout.pd + k));
         }
         {
             let mut acc = AB::Expr::ZERO;
             for k in 0..15 {
-                acc = acc + cv(PD + k) * c(1 << k);
+                acc = acc + cv(self.layout.pd + k) * c(1 << k);
             }
-            builder.assert_eq(acc, cv(PR));
+            builder.assert_eq(acc, cv(self.layout.pr));
         }
         // Literal helper over a bit column: bit b of code j.
         let lit = |col: usize, on: bool| -> AB::Expr {
@@ -1040,99 +1968,124 @@ where
         // the phq-gated selector defs so those stay deg <= 3.
         // RLO_j = pair(PD0,PD1); RHI_j = pair(PD2,PD3); M3_a = 3-bit(PD10..12).
         for j in 0..4 {
-            builder.assert_eq(cv(RLO + j), lit(PD, j & 1 == 1) * lit(PD + 1, j & 2 == 2));
-            builder.assert_eq(cv(RHI + j), lit(PD + 2, j & 1 == 1) * lit(PD + 3, j & 2 == 2));
+            builder.assert_eq(cv(self.layout.rlo + j), lit(self.layout.pd, j & 1 == 1) * lit(self.layout.pd + 1, j & 2 == 2));
+            builder.assert_eq(cv(self.layout.rhi + j), lit(self.layout.pd + 2, j & 1 == 1) * lit(self.layout.pd + 3, j & 2 == 2));
         }
         for a in 0..8 {
             builder.assert_eq(
-                cv(M3 + a),
-                lit(PD + 10, a & 1 == 1) * lit(PD + 11, a & 2 == 2) * lit(PD + 12, a & 4 == 4),
+                cv(self.layout.m3 + a),
+                lit(self.layout.pd + 10, a & 1 == 1) * lit(self.layout.pd + 11, a & 2 == 2) * lit(self.layout.pd + 12, a & 4 == 4),
             );
         }
-        // Role selectors: RSEL_r = phq * RLO[r&3] * RHI[(r>>2)&3]  (deg 3).
-        for r in 0..N_ROLES {
+        // Role selectors: RSEL_r = phq * self.layout.rlo[r&3] * self.layout.rhi[(r>>2)&3]  (deg 3).
+        for r in 0..self.shape.n_roles() {
             builder.assert_eq(
-                cv(RSEL + r),
-                phq.clone() * cv(RLO + (r & 3)) * cv(RHI + ((r >> 2) & 3)),
+                cv(self.layout.rsel + r),
+                phq.clone() * cv(self.layout.rlo + (r & 3)) * cv(self.layout.rhi + ((r >> 2) & 3)),
             );
         }
-        // Micro selectors: MLO_a = phq * M3[a]; MHI_b = 2-bit(PD13..14);
-        // MSEL_m = MLO * MHI  (all deg <= 3).
+        // Micro selectors: MLO_a = phq * self.layout.m3[a]; MHI_b = 2-bit(PD13..14);
+        // MSEL_m = self.layout.mlo * self.layout.mhi  (all deg <= 3).
         for a in 0..8 {
-            builder.assert_eq(cv(MLO + a), phq.clone() * cv(M3 + a));
+            builder.assert_eq(cv(self.layout.mlo + a), phq.clone() * cv(self.layout.m3 + a));
         }
         for b in 0..4 {
-            let e = lit(PD + 13, b & 1 == 1) * lit(PD + 14, b & 2 == 2);
-            builder.assert_eq(cv(MHI + b), e);
+            let e = lit(self.layout.pd + 13, b & 1 == 1) * lit(self.layout.pd + 14, b & 2 == 2);
+            builder.assert_eq(cv(self.layout.mhi + b), e);
         }
-        for m in 0..N_MICROS {
-            builder.assert_eq(cv(MSEL + m), cv(MLO + (m & 7)) * cv(MHI + (m >> 3)));
+        for m in 0..self.shape.n_micros() {
+            builder.assert_eq(cv(self.layout.msel + m), cv(self.layout.mlo + (m & 7)) * cv(self.layout.mhi + (m >> 3)));
         }
         // dparam selectors: DLO_a (PD4..6), DHI_b (PD7..8, b < 3).
         for a in 0..8 {
-            let e = lit(PD + 4, a & 1 == 1) * lit(PD + 5, a & 2 == 2) * lit(PD + 6, a & 4 == 4);
-            builder.assert_eq(cv(DLO + a), e);
+            let e = lit(self.layout.pd + 4, a & 1 == 1) * lit(self.layout.pd + 5, a & 2 == 2) * lit(self.layout.pd + 6, a & 4 == 4);
+            builder.assert_eq(cv(self.layout.dlo + a), e);
         }
         for b in 0..3 {
-            let e = lit(PD + 7, b & 1 == 1) * lit(PD + 8, b & 2 == 2);
-            builder.assert_eq(cv(DHI + b), e);
+            let e = lit(self.layout.pd + 7, b & 1 == 1) * lit(self.layout.pd + 8, b & 2 == 2);
+            builder.assert_eq(cv(self.layout.dhi + b), e);
         }
         // Absorb-round selectors from dparam values 0..5.
-        let absany = cv(RSEL + R_ABS_F34 as usize)
-            + cv(RSEL + R_ABS_F16 as usize)
-            + cv(RSEL + R_ABS_C34 as usize)
-            + cv(RSEL + R_ABS_C5 as usize)
-            + cv(RSEL + R_ABS_C30 as usize);
-        // DRND_j = absany * DLO[j]  (DLO[j] is the same 3-bit product; deg 2).
-        for j in 0..6 {
-            builder.assert_eq(cv(DRND + j), absany.clone() * cv(DLO + j));
+        let absany = cv(self.layout.rsel + R_ABS_F34 as usize)
+            + cv(self.layout.rsel + R_ABS_F16 as usize)
+            + cv(self.layout.rsel + R_ABS_C34 as usize)
+            + cv(self.layout.rsel + R_ABS_C5 as usize)
+            + cv(self.layout.rsel + R_ABS_C30 as usize);
+        // DRND_j = absany * self.layout.dlo[j]  (self.layout.dlo[j] is the same 3-bit product; deg 2).
+        // Loop bound = drnd_width (narrow 6, wide 5 = 2 + n_fri_rounds); j=6 on
+        // wide would write drnd+5 = dbit (OOB), corrupting dbit's own constraint.
+        for j in 0..self.shape.drnd_width() {
+            builder.assert_eq(cv(self.layout.drnd + j), absany.clone() * cv(self.layout.dlo + j));
         }
         // Leaf-start selector.
         builder.assert_eq(
-            cv(LFS),
-            cv(RSEL + R_ABS_F34 as usize) + cv(RSEL + R_ABS_F16 as usize),
+            cv(self.layout.lfs),
+            cv(self.layout.rsel + R_ABS_F34 as usize) + cv(self.layout.rsel + R_ABS_F16 as usize),
         );
 
         // =====================================================================
-        // Query scheduling: QSEL ring, QCNT countdown, phase handoff/exit
+        // Query scheduling: self.layout.qsel ring, self.layout.qcnt countdown, phase handoff/exit
         // =====================================================================
-        for i in 0..=NQ {
-            builder.when_first_row().assert_eq(
-                cv(QSEL + i),
-                if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO },
-            );
+        for i in 0..=self.shape.nq {
+            builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.qsel + i) - (if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO })));
         }
-        builder.when_first_row().assert_eq(cv(QCNT), c(QSLOTS as u32));
-        builder.when_first_row().assert_one(cv(PHC));
-        builder.when_first_row().assert_zero(cv(PHQ));
-        // QCW comparator: QCNT == 1.
-        builder.assert_bool(cv(QCW));
-        builder.assert_zero((cv(QCNT) - AB::Expr::ONE) * cv(QCW));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.qcnt) - (c(self.shape.qslots() as u32))));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.phc) - AB::Expr::ONE));
+        builder.assert_zero(cv(self.layout.csel) * cv(self.layout.phq));
+        // =====================================================================
+        // Child-boundary re-anchor selector (2b, option B: completion-gated).
+        // self.layout.csel = 1 on the first row of each child's first perm (row 0
+        // for a single child; row 0 and 24*nL for the two-child interior). It
+        // DRIVES the per-child re-anchor of the automaton (the first-row anchors
+        // and the cross-perm carries key on it, added in 2b-ii/iii). Soundness:
+        // csel is boolean, pinned to 1 at trace row 0, and may only RISE where
+        // the previous perm completed a child's query phase (self.layout.endg =
+        // sf(23)*eg_a, which fires exactly once per child at the last query's
+        // last block r=23). A prover therefore cannot set csel=1 mid-child to
+        // truncate that child's verification: csel_next requires endg on the
+        // current row, and endg is 0 everywhere except the genuine child end.
+        // (The final qsel→nq rotation is the boundary transition itself and is
+        // suppressed there, so `qsel==nq` is NOT a usable signal — endg is.)
+        // Narrow (single child) has csel=1 only at row 0 (≡ first_row), so the
+        // existing constraint verdicts are unchanged.
+        builder.assert_bool(cv(self.layout.csel));
+        builder.when_first_row().assert_one(cv(self.layout.csel));
+        {
+            let mut t = builder.when_transition();
+            t.assert_zero(nv(self.layout.csel) * (AB::Expr::ONE - cv(self.layout.endg)));
+        }
+        // self.layout.qcw comparator: self.layout.qcnt == 1.
+        builder.assert_bool(cv(self.layout.qcw));
+        builder.assert_zero((cv(self.layout.qcnt) - AB::Expr::ONE) * cv(self.layout.qcw));
         builder.assert_eq(
-            cv(QCW) + (cv(QCNT) - AB::Expr::ONE) * cv(QCWI),
+            cv(self.layout.qcw) + (cv(self.layout.qcnt) - AB::Expr::ONE) * cv(self.layout.qcwi),
             AB::Expr::ONE,
         );
         // The last-row anchor: all 20 query blocks must have completed.
         builder
             .when_last_row()
-            .assert_one(cv(ring_at(QSEL, NQ + 1, NQ)));
+            .assert_one(cv(ring_at(self.layout.qsel, self.shape.nq + 1, self.shape.nq)));
         {
-            // QCNT: decrement per perm during query phase, reload on wrap.
+            // self.layout.qcnt: decrement per perm during query phase, reload on wrap.
             let dec = sf(23) * phq.clone();
             let mut t = builder.when_transition();
             t.assert_eq(
-                nv(QCNT),
-                cv(QCNT)
+                nv(self.layout.qcnt),
+                cv(self.layout.qcnt)
                     + dec.clone()
-                        * ((AB::Expr::ONE - cv(QCW)) * (-AB::Expr::ONE)
-                            + cv(QCW) * c(QSLOTS as u32 - 1)),
+                        * ((AB::Expr::ONE - cv(self.layout.qcw)) * (-AB::Expr::ONE)
+                            + cv(self.layout.qcw) * c(self.shape.qslots() as u32 - 1)),
             );
-            // QSEL rotation on block wrap. (QADV = sf(23)*phq*QCW = dec*QCW.)
-            let g = cv(QADV);
-            for i in 0..=NQ {
-                t.assert_eq(
-                    nv(QSEL + i),
-                    cv(QSEL + i) + g.clone() * (cv(QSEL + (i + 1) % (NQ + 1)) - cv(QSEL + i)),
+            // self.layout.qsel rotation on block wrap. (self.layout.qadv = sf(23)*phq*self.layout.qcw = dec*self.layout.qcw.)
+            // 2b-iii: suppressed at the child boundary (csel_next) — the one-hot
+            // reaches slot nq at a child's end but child R must re-anchor slot 0.
+            let g = cv(self.layout.qadv);
+            for i in 0..=self.shape.nq {
+                t.assert_zero(
+                    (AB::Expr::ONE - nv(self.layout.csel))
+                        * (nv(self.layout.qsel + i)
+                            - cv(self.layout.qsel + i)
+                            - g.clone() * (cv(self.layout.qsel + (i + 1) % (self.shape.nq + 1)) - cv(self.layout.qsel + i))),
                 );
             }
         }
@@ -1141,40 +2094,44 @@ where
         // Per-query index bits: decomposition of the active query's index
         // register (continuous binding; no load events needed).
         // =====================================================================
-        for k in 0..LOG_MAX {
-            builder.assert_bool(cv(IDXB + k));
+        for k in 0..self.shape.log_max {
+            builder.assert_bool(cv(self.layout.idxb + k));
         }
         {
             let mut recompose = AB::Expr::ZERO;
-            for k in 0..LOG_MAX {
-                recompose = recompose + cv(IDXB + k) * c(1 << k);
+            for k in 0..self.shape.log_max {
+                recompose = recompose + cv(self.layout.idxb + k) * c(1 << k);
             }
             let mut sel = AB::Expr::ZERO;
-            for q in 0..NQ {
-                sel = sel + cv(ring_at(QSEL, NQ + 1, q)) * cv(IDXR + q);
+            for q in 0..self.shape.nq {
+                sel = sel + cv(ring_at(self.layout.qsel, self.shape.nq + 1, q)) * cv(self.layout.idxr + q);
             }
             builder.assert_zero(phq.clone() * (recompose - sel));
         }
-        // Path direction bit: DBIT = pathish * idx bit selected by dparam.
-        let pathish = cv(RSEL + R_PATH as usize)
-            + (R_PLAST_T..=R_PLAST_F3).map(|r| cv(RSEL + r as usize)).fold(AB::Expr::ZERO, |a, e| a + e);
+        // Path direction bit: self.layout.dbit = pathish * idx bit selected by dparam.
+        let pathish = cv(self.layout.rsel + R_PATH as usize)
+            + (R_PLAST_T..=self.shape.r_plast_f(self.shape.n_fri_rounds() - 1))
+                .map(|r| cv(self.layout.rsel + r as usize))
+                .fold(AB::Expr::ZERO, |a, e| a + e);
         {
-            // DMUX = sum_k DLO[k&7]*DHI[k>>3]*IDXB[k] (deg 3); DBIT = pathish*DMUX.
+            // self.layout.dmux = sum_k self.layout.dlo[k&7]*self.layout.dhi[k>>3]*self.layout.idxb[k] (deg 3); self.layout.dbit = pathish*self.layout.dmux.
             let mut mux = AB::Expr::ZERO;
-            for k in 0..19 {
-                mux = mux + cv(DLO + (k & 7)) * cv(DHI + (k >> 3)) * cv(IDXB + k);
+            for k in 0..(self.shape.log_max - self.shape.cap_height()) {
+                mux = mux + cv(self.layout.dlo + (k & 7)) * cv(self.layout.dhi + (k >> 3)) * cv(self.layout.idxb + k);
             }
-            builder.assert_eq(cv(DMUX), mux);
-            builder.assert_eq(cv(DBIT), pathish.clone() * cv(DMUX));
+            builder.assert_eq(cv(self.layout.dmux), mux);
+            builder.assert_eq(cv(self.layout.dbit), pathish.clone() * cv(self.layout.dmux));
         }
-        builder.assert_eq(cv(GLC), pathish.clone() * (AB::Expr::ONE - cv(DBIT)));
-        builder.assert_eq(cv(GRC), pathish.clone() * cv(DBIT));
-        // Cap-element selectors from idx bits 19..21.
+        builder.assert_eq(cv(self.layout.glc), pathish.clone() * (AB::Expr::ONE - cv(self.layout.dbit)));
+        builder.assert_eq(cv(self.layout.grc), pathish.clone() * cv(self.layout.dbit));
+        // Cap-element selectors from the top cap_height idx bits (positions
+        // log_max-cap_height .. log_max; narrow 19..21, wide 15..17).
+        let capb = self.shape.log_max - self.shape.cap_height();
         for j in 0..8 {
-            let e = lit(IDXB + 19, j & 1 == 1)
-                * lit(IDXB + 20, j & 2 == 2)
-                * lit(IDXB + 21, j & 4 == 4);
-            builder.assert_eq(cv(CAPS8 + j), e);
+            let e = lit(self.layout.idxb + capb, j & 1 == 1)
+                * lit(self.layout.idxb + capb + 1, j & 2 == 2)
+                * lit(self.layout.idxb + capb + 2, j & 4 == 4);
+            builder.assert_eq(cv(self.layout.caps8 + j), e);
         }
 
         // =====================================================================
@@ -1183,10 +2140,13 @@ where
         // =====================================================================
         // First blocks: untouched rate + capacity limbs are zero.
         for i in 68..100 {
-            builder.assert_zero(cv(RSEL + R_ABS_F34 as usize) * cv(pcol(i)));
+            builder.assert_zero(cv(self.layout.rsel + R_ABS_F34 as usize) * cv(pcol(i)));
         }
-        for i in 32..100 {
-            builder.assert_zero(cv(RSEL + R_ABS_F16 as usize) * cv(pcol(i)));
+        // Single-block leaf (R_ABS_F16, qw fresh words): limbs 0..2·qw are the
+        // message, everything above is zero. Narrow qw=16 → 32..100, wide qw=8
+        // → 16..100.
+        for i in (2 * self.shape.qw)..100 {
+            builder.assert_zero(cv(self.layout.rsel + R_ABS_F16 as usize) * cv(pcol(i)));
         }
         // Compression preimages: lanes 8..25 zero.
         for i in 32..100 {
@@ -1197,240 +2157,415 @@ where
             // Continuation carries (consumer-role keyed, producer's last row).
             for i in 68..100 {
                 t.assert_zero(
-                    sf(23) * nv(RSEL + R_ABS_C34 as usize) * (nv(pcol(i)) - cv(ocol(i))),
+                    sf(23) * nv(self.layout.rsel + R_ABS_C34 as usize) * (nv(pcol(i)) - cv(ocol(i))),
                 );
             }
-            // C5 (trace last block): 5 fresh u32 words = limbs 0..10. The
-            // overwrite-mode sponge packs 2 words per u64 lane, so word 4
-            // fills lane 2's low half (limbs 8,9) while its high half
-            // (limbs 10,11) is an unused zero pad; only limbs 12..100 carry
-            // the producer's output. Pin the pad half to zero (else a prover
-            // could smuggle a word there) and carry from limb 12.
-            for i in 10..12 {
-                t.assert_zero(sf(23) * nv(RSEL + R_ABS_C5 as usize) * nv(pcol(i)));
+            // C5 (trace last block): `f = trace_last_fresh` fresh u32 words =
+            // limbs 0..2f. The overwrite-mode sponge packs 2 words per u64
+            // lane, so when f is ODD the last word fills a lane's low half
+            // while its high half [2f, 2f+2) is an unused zero pad; only limbs
+            // [pad_hi, 100) carry the producer's output. Pin the pad half to
+            // zero (else a prover could smuggle a word there) and carry from
+            // pad_hi. Narrow f=5 (odd) → pad 10..12, carry 12..100; wide f=22
+            // (even) → no pad, carry 44..100.
+            let f = self.shape.trace_last_fresh();
+            let pad_lo = 2 * f;
+            let pad_hi = 2 * f + 2 * (f & 1);
+            for i in pad_lo..pad_hi {
+                t.assert_zero(sf(23) * nv(self.layout.rsel + R_ABS_C5 as usize) * nv(pcol(i)));
             }
-            for i in 12..100 {
-                t.assert_zero(sf(23) * nv(RSEL + R_ABS_C5 as usize) * (nv(pcol(i)) - cv(ocol(i))));
+            for i in pad_hi..100 {
+                t.assert_zero(sf(23) * nv(self.layout.rsel + R_ABS_C5 as usize) * (nv(pcol(i)) - cv(ocol(i))));
             }
             for i in 60..100 {
                 t.assert_zero(
-                    sf(23) * nv(RSEL + R_ABS_C30 as usize) * (nv(pcol(i)) - cv(ocol(i))),
+                    sf(23) * nv(self.layout.rsel + R_ABS_C30 as usize) * (nv(pcol(i)) - cv(ocol(i))),
                 );
             }
             // Path chaining: the chained child mux (left when the consumed
             // index bit is 0, right when 1); sibling half is free witness.
             for m in 0..16 {
-                t.assert_zero(sf(23) * nv(GLC) * (nv(pcol(m)) - cv(ocol(m))));
-                t.assert_zero(sf(23) * nv(GRC) * (nv(pcol(16 + m)) - cv(ocol(m))));
+                t.assert_zero(sf(23) * nv(self.layout.glc) * (nv(pcol(m)) - cv(ocol(m))));
+                t.assert_zero(sf(23) * nv(self.layout.grc) * (nv(pcol(16 + m)) - cv(ocol(m))));
             }
         }
-        // Cap comparison at the last path level of each batch.
-        for (bi, role) in [R_PLAST_T, R_PLAST_Q, R_PLAST_F0, R_PLAST_F1, R_PLAST_F2, R_PLAST_F3]
-            .iter()
-            .enumerate()
-        {
+        // Interior per-child opvs routing (2d). `route` only for n_children > 1;
+        // narrow / single-wide are byte-identical (chi/cc unpinned + unread).
+        // `chi` is the running child selector: 0 across child L, 1 across child
+        // R. Pinned bool, chi[row 0] = 0, and a transition `chi_next = chi +
+        // csel_next` that rises exactly at the (soundness-pinned) child boundary
+        // — so chi is fully determined, not prover-chosen. `cc[j] = chi·caps8[j]`
+        // is materialized so the cap-half select below stays deg ≤ 3.
+        let route = self.n_children > 1;
+        let n_opvs = self.shape.n_opvs();
+        if route {
+            builder.assert_bool(cv(self.layout.chi));
+            builder.when_first_row().assert_zero(cv(self.layout.chi));
+            builder
+                .when_transition()
+                .assert_zero(nv(self.layout.chi) - cv(self.layout.chi) - nv(self.layout.csel));
+            for j in 0..self.shape.cap_len {
+                builder.assert_zero(
+                    cv(self.layout.cc + j) - cv(self.layout.chi) * cv(self.layout.caps8 + j),
+                );
+            }
+            // 棒 3-2 merge-region pin (positively forces the last 24·nm rows to be
+            // the merge sponge, so the merge-binding constraints — 棒 3-2b/c —
+            // cannot be dodged by dropping the region). `mreg` monotone 0→1;
+            // `mcnt` running count of mreg, pinned == 24·nm at last_row.
+            // Region is the SUFFIX from the (perm-aligned) merge start to the
+            // trace end, so its row count at last_row is 24·nm plus the truncated
+            // tail `h mod 24` (a power-of-2 height is not a multiple of 24). The
+            // tail rows are inert for the chain/reset (step-flag 23 never fires in
+            // a <24-row perm), so folding them into mreg is harmless.
+            let nmr = ((1usize << self.log_height) % 24 + 24 * self.shape.merge_perms()) as u32;
+            builder.assert_bool(cv(self.layout.mreg));
+            builder.when_first_row().assert_zero(cv(self.layout.mreg));
+            builder.when_first_row().assert_eq(cv(self.layout.mcnt), cv(self.layout.mreg));
+            builder.when_last_row().assert_eq(cv(self.layout.mcnt), c(nmr));
+            {
+                let mut t = builder.when_transition();
+                // monotone: once mreg = 1 it stays 1 (merge region is a suffix).
+                t.assert_zero(cv(self.layout.mreg) * (AB::Expr::ONE - nv(self.layout.mreg)));
+                // running count: mcnt_next = mcnt + mreg_next.
+                t.assert_zero(nv(self.layout.mcnt) - cv(self.layout.mcnt) - nv(self.layout.mreg));
+            }
+            // 棒 3-2b capacity chain — the merge is 3 independent keccak sub-sponges
+            // (childL kL perms, childR kR, root 1). Each sub-sponge's input
+            // capacity (lanes 17..25 = limbs 68..100) resets to 0 at its start and
+            // chains from the previous perm's output otherwise. Since keccak-f is a
+            // PERMUTATION (invertible), the chain is what makes hitting pv(root) a
+            // sponge-preimage problem — without it the root binding (3-2c) would be
+            // vacuous. Comparator thresholds on mcnt (merge perm p's row 0 has
+            // mcnt = 24·p + 1): the 3 sub-sponge STARTS {1, 24·kL+1, 24·(kL+kR)+1}
+            // → the reset flag `mrst`, plus a 4th `24·nm` = the root perm's LAST
+            // row (`eq_end` = meq[3]) → suppresses the (nonexistent) forward chain
+            // from the last sub-sponge into the inert tail perm.
+            let nm = self.shape.merge_perms();
+            let kl = (nm - 1) / 2;
+            let thresholds =
+                [1u32, (24 * kl + 1) as u32, (24 * (nm - 1) + 1) as u32, (24 * nm) as u32];
+            let mut rst = AB::Expr::ZERO;
+            for (k, tk) in thresholds.iter().enumerate() {
+                let eq = cv(self.layout.meq + k);
+                let diff = cv(self.layout.mcnt) - c(*tk);
+                builder.assert_bool(eq.clone());
+                builder.assert_zero(eq.clone() * diff.clone()); // eq=1 ⇒ mcnt==tk
+                builder.assert_eq(eq.clone() + diff * cv(self.layout.minv + k), AB::Expr::ONE);
+                if k < 3 {
+                    rst = rst + eq; // sub-sponge starts only
+                }
+            }
+            builder.assert_eq(cv(self.layout.mrst), rst); // mrst = Σ (first 3 meq)
+            // Reset: input capacity == 0 at each sub-sponge start.
+            for i in 68..100 {
+                builder.assert_zero(cv(self.layout.mrst) * cv(pcol(i)));
+            }
+            // mcont = merge-continue gate = sf(23)·mreg·(1 − next-row mrst − eq_end):
+            // fires at a merge perm boundary INTERNAL to a multi-perm sub-sponge —
+            // suppressed where the next perm is a reset (mrst_next, sub-sponge
+            // boundary) or where this is the root perm's last row (eq_end, no
+            // forward chain into the tail). Materialized (next-row dependent) so the
+            // chain stays deg ≤ 3.
+            builder.when_transition().assert_eq(
+                cv(self.layout.mcont),
+                sf(23)
+                    * cv(self.layout.mreg)
+                    * (AB::Expr::ONE - nv(self.layout.mrst) - cv(self.layout.meq + 3)),
+            );
+            // Chain: next perm's input capacity == this perm's output capacity.
+            for i in 68..100 {
+                builder
+                    .when_transition()
+                    .assert_zero(cv(self.layout.mcont) * (nv(pcol(i)) - cv(ocol(i))));
+            }
+            // 棒 3-2c — tree-merge digest binding: root = keccak(dL ‖ dR), dL/dR =
+            // the child sub-sponge digests. `meq[1]`=childR-start, `meq[2]`=root-
+            // start, `meq[3]`=root-end (root perm's r=23). Digest limbs are the
+            // output/input rate limbs 0..16 (first 4 lanes = 32 bytes).
+            //
+            // dL carry: child L's last perm output (captured at the childL→childR
+            // boundary, gate sf(23)·meq1_next) is freeze-held in `dlr` to the root
+            // perm (child R sits between them).
+            for m in 0..16 {
+                let cap = sf(23) * nv(self.layout.meq + 1); // childL→childR boundary
+                builder
+                    .when_transition()
+                    .assert_zero(cap.clone() * (nv(self.layout.dlr + m) - cv(ocol(m))));
+                builder.when_transition().assert_zero(
+                    (AB::Expr::ONE - cap) * (nv(self.layout.dlr + m) - cv(self.layout.dlr + m)),
+                );
+            }
+            // Root perm input rate: [0..16] == dL (carried), [16..32] == dR (child
+            // R's last perm output, ADJACENT → bound by the childR→root boundary
+            // transition). Root start = meq[2].
+            for m in 0..16 {
+                builder.assert_zero(
+                    cv(self.layout.meq + 2) * (cv(pcol(m)) - cv(self.layout.dlr + m)),
+                );
+                builder.when_transition().assert_zero(
+                    sf(23) * nv(self.layout.meq + 2) * (nv(pcol(16 + m)) - cv(ocol(m))),
+                );
+            }
+            // Root squeeze: root perm output digest (limbs 0..16 at r=23 = eq_end =
+            // meq[3]) == the interior's exposed merge root pv[2·n_opvs + m]. This is
+            // the load-bearing bind: with the capacity chain (3-2b) making the merge
+            // a real sponge, hitting the fixed pv(root) forces (preimage resistance)
+            // the sponge inputs = the honest opvs.
+            for m in 0..16 {
+                builder.assert_zero(
+                    cv(self.layout.meq + 3) * (cv(ocol(m)) - pv(2 * n_opvs + m)),
+                );
+            }
+        }
+        // Cap comparison at the last path level of each batch (trace, quotient,
+        // then one per FRI round). Shape-driven so wide (3 rounds) skips F3. For
+        // the interior each child's caps must match ITS OWN half of the doubled
+        // `opvsL ++ opvsR` public values: `pvL + chi·(pvR - pvL)`, folded through
+        // the materialized `cc = chi·caps8` to keep the constraint deg ≤ 3.
+        let plast_roles: Vec<u32> = [R_PLAST_T, R_PLAST_Q]
+            .into_iter()
+            .chain((0..self.shape.n_fri_rounds()).map(|r| self.shape.r_plast_f(r)))
+            .collect();
+        for (bi, role) in plast_roles.iter().enumerate() {
             for m in 0..16 {
                 let mut mux = AB::Expr::ZERO;
-                for j in 0..CAP_LEN {
-                    mux = mux + cv(CAPS8 + j) * pv(cap_limb_opv(bi, j, m));
+                for j in 0..self.shape.cap_len {
+                    let idx = cap_limb_opv(bi, j, m);
+                    mux = mux + cv(self.layout.caps8 + j) * pv(idx);
+                    if route {
+                        mux = mux + cv(self.layout.cc + j) * (pv(n_opvs + idx) - pv(idx));
+                    }
                 }
-                builder.assert_zero(sf(23) * cv(RSEL + *role as usize) * (cv(ocol(m)) - mux));
+                builder.assert_zero(sf(23) * cv(self.layout.rsel + *role as usize) * (cv(ocol(m)) - mux));
             }
         }
         // =====================================================================
         // Shape selectors: fully determined by the flush automaton (no
         // prover choice = no ghost perms in the challenger phase).
         // =====================================================================
-        let ringsel = |f: usize| cv(ring_at(FRING, 8, f));
-        let bidxsel = |b: usize| cv(BIDX + b);
-        let chal_live = cv(CHLIVE);
+        let ringsel = |f: usize| cv(ring_at(self.layout.fring, 8, f));
+        let bidxsel = |b: usize| cv(self.layout.bidx + b);
+        let chal_live = cv(self.layout.chlive);
         {
-            let shapes = shape_list();
+            let shapes = shape_list(&self.shape);
             for (si, sh) in shapes.iter().enumerate() {
                 let e = match sh {
                     Shape::Obs { flush: 2, block: 0 } => ringsel(2) * bidxsel(0),
                     Shape::F2Mid => {
-                        // F2SEL = ringsel(2) * (1 - bidxsel(0)); keeps deg <= 3.
-                        cv(F2SEL) * (AB::Expr::ONE - cv(BLKLAST))
+                        // self.layout.f2sel = ringsel(2) * (1 - bidxsel(0)); keeps deg <= 3.
+                        cv(self.layout.f2sel) * (AB::Expr::ONE - cv(self.layout.blklast))
                     }
                     Shape::Obs { flush: 2, .. } => {
                         // F2 last block.
-                        cv(F2SEL) * cv(BLKLAST)
+                        cv(self.layout.f2sel) * cv(self.layout.blklast)
                     }
                     Shape::Obs { flush, block } => ringsel(*flush) * bidxsel(*block),
-                    Shape::Refill => continue, // REFSEL is its own column
+                    Shape::Refill => continue, // self.layout.refsel is its own column
                 };
-                builder.assert_eq(cv(SHSEL + shsel_index_of(si)), chal_live.clone() * e);
+                builder.assert_eq(cv(self.layout.shsel + shsel_index_of(si)), chal_live.clone() * e);
             }
         }
-        builder.assert_bool(cv(REFSEL));
-        builder.assert_zero(cv(REFSEL) * (AB::Expr::ONE - phc.clone()));
+        builder.assert_bool(cv(self.layout.refsel));
+        builder.assert_zero(cv(self.layout.refsel) * (AB::Expr::ONE - phc.clone()));
 
         // Flush-automaton comparators.
-        builder.assert_bool(cv(BLKLAST));
-        builder.assert_zero((cv(BLKCNT) - AB::Expr::ONE) * cv(BLKLAST));
+        builder.assert_bool(cv(self.layout.blklast));
+        builder.assert_zero((cv(self.layout.blkcnt) - AB::Expr::ONE) * cv(self.layout.blklast));
         builder.assert_eq(
-            cv(BLKLAST) + (cv(BLKCNT) - AB::Expr::ONE) * cv(BLKINV),
+            cv(self.layout.blklast) + (cv(self.layout.blkcnt) - AB::Expr::ONE) * cv(self.layout.blkinv),
             AB::Expr::ONE,
         );
-        for (cmp, cinv, tgt) in [(CMPA, CMPAI, 76u32), (CMPB, CMPBI, 3), (CMPC, CMPCI, 148)] {
+        // CMPA/CMPB fire at the dup-block BLKCNT of the group-0 / group-1
+        // reduced-opening boundary; CMPC at the dup-first-block BLKCNT = N.
+        // All shape-derived (narrow: 76, 3, 148).
+        let dcap = self.shape.dup_captures();
+        let n_dup = self.consts.flush_blocks[2] as u32;
+        for (cmp, cinv, tgt) in [(self.layout.cmpa, self.layout.cmpai, dcap[0].2), (self.layout.cmpb, self.layout.cmpbi, dcap[1].2), (self.layout.cmpc, self.layout.cmpci, n_dup)] {
             builder.assert_bool(cv(cmp));
-            builder.assert_zero((cv(BLKCNT) - c(tgt)) * cv(cmp));
-            builder.assert_eq(cv(cmp) + (cv(BLKCNT) - c(tgt)) * cv(cinv), AB::Expr::ONE);
+            builder.assert_zero((cv(self.layout.blkcnt) - c(tgt)) * cv(cmp));
+            builder.assert_eq(cv(cmp) + (cv(self.layout.blkcnt) - c(tgt)) * cv(cinv), AB::Expr::ONE);
         }
-        // NEEDL = BLKLAST * (required group reached for the next obs flush).
+        // self.layout.needl = self.layout.blklast * (required group reached for the next obs flush).
         {
+            let groupreq = self.shape.groupreq();
             let mut need = AB::Expr::ZERO;
-            for f in 0..8 {
-                need = need + ringsel(f) * cv(ring_at(GRP, N_GROUPS, GROUPREQ[f + 1]));
+            for f in 0..self.consts.flush_blocks.len() {
+                need = need + ringsel(f) * cv(ring_at(self.layout.grp, self.shape.n_groups(), groupreq[f + 1]));
             }
-            builder.assert_eq(cv(NEEDL), cv(BLKLAST) * need);
+            builder.assert_eq(cv(self.layout.needl), cv(self.layout.blklast) * need);
         }
 
         // First-row pins for the challenger phase.
-        builder.when_first_row().assert_one(cv(FRING));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.fring) - AB::Expr::ONE));
         for i in 1..8 {
-            builder.when_first_row().assert_zero(cv(FRING + i));
+            builder.assert_zero(cv(self.layout.csel) * cv(self.layout.fring + i));
         }
-        builder
-            .when_first_row()
-            .assert_eq(cv(BLKCNT), c(FLUSH_BLOCKS[0] as u32));
-        builder.when_first_row().assert_one(cv(BIDX));
-        for i in 1..6 {
-            builder.when_first_row().assert_zero(cv(BIDX + i));
+        // blkcnt (flush-automaton block counter) is per-transcript state → must
+        // re-anchor to flush_blocks[0] at each child start (csel), not only row 0.
+        builder.assert_zero(
+            cv(self.layout.csel) * (cv(self.layout.blkcnt) - c(self.consts.flush_blocks[0] as u32)),
+        );
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.bidx) - AB::Expr::ONE));
+        for i in 1..self.layout.bidx_width {
+            builder.assert_zero(cv(self.layout.csel) * cv(self.layout.bidx + i));
         }
-        builder.when_first_row().assert_zero(cv(REFSEL));
-        builder.when_first_row().assert_one(cv(GRP));
-        for i in 1..N_GROUPS {
-            builder.when_first_row().assert_zero(cv(GRP + i));
+        builder.assert_zero(cv(self.layout.csel) * cv(self.layout.refsel));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.grp) - AB::Expr::ONE));
+        for i in 1..self.shape.n_groups() {
+            builder.assert_zero(cv(self.layout.csel) * cv(self.layout.grp + i));
         }
-        builder.when_first_row().assert_one(cv(COEF));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.coef) - AB::Expr::ONE));
         for i in 1..4 {
-            builder.when_first_row().assert_zero(cv(COEF + i));
+            builder.assert_zero(cv(self.layout.csel) * cv(self.layout.coef + i));
         }
-        builder.when_first_row().assert_zero(cv(PHD));
-        builder.when_first_row().assert_one(cv(POS));
-        builder.when_first_row().assert_zero(cv(POS + 1));
-        builder.when_first_row().assert_one(cv(VC));
+        builder.assert_zero(cv(self.layout.csel) * cv(self.layout.phd));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.pos) - AB::Expr::ONE));
+        builder.assert_zero(cv(self.layout.csel) * cv(self.layout.pos + 1));
+        builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.vc) - AB::Expr::ONE));
         for i in 1..16 {
-            builder.when_first_row().assert_zero(cv(VC + i));
+            builder.assert_zero(cv(self.layout.csel) * cv(self.layout.vc + i));
         }
         for k in 0..4 {
-            builder.when_first_row().assert_zero(cv(PREG + k) - if k == 0 { AB::Expr::ONE } else { AB::Expr::ZERO });
-            builder.when_first_row().assert_zero(cv(PZACC + k));
+            builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.preg + k) - if k == 0 { AB::Expr::ONE } else { AB::Expr::ZERO }));
+            builder.assert_zero(cv(self.layout.csel) * cv(self.layout.pzacc + k));
         }
 
         // =====================================================================
         // Boundary rules (perm transitions in the challenger/dup phases)
         // =====================================================================
         let consumersel = {
-            let mut e = cv(REFSEL);
-            for f in 1..8 {
-                e = e + cv(SHSEL + shsel_index(f, 0));
+            let mut e = cv(self.layout.refsel);
+            for f in 1..self.consts.flush_blocks.len() {
+                e = e + cv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0));
             }
             e
         };
         let b0next = {
             let mut e = AB::Expr::ZERO;
-            for f in 1..8 {
-                e = e + nv(SHSEL + shsel_index(f, 0));
+            for f in 1..self.consts.flush_blocks.len() {
+                e = e + nv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0));
             }
             e
         };
         let xorsel = {
             // Obs interior blocks except flush 2, plus dup interior blocks.
-            let mut e = cv(PHD) * (AB::Expr::ONE - cv(CMPC));
-            for f in 0..8 {
+            let mut e = cv(self.layout.phd) * (AB::Expr::ONE - cv(self.layout.cmpc));
+            for f in 0..self.consts.flush_blocks.len() {
                 if f == 2 {
                     continue;
                 }
-                for b in 1..FLUSH_BLOCKS[f] {
-                    e = e + cv(SHSEL + shsel_index(f, b));
+                for b in 1..self.consts.flush_blocks[f] {
+                    e = e + cv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, b));
                 }
             }
             e
         };
-        // xorsel_next = nv(XSEL) (materialized current-row xorsel; deg 1).
-        let xorsel_next = nv(XSEL);
-        let phasegate = cv(PHG);
-        let phdend = cv(PHDEND);
-        let endgate = cv(ENDG);
+        // xorsel_next = nv(self.layout.xsel) (materialized current-row xorsel; deg 1).
+        let xorsel_next = nv(self.layout.xsel);
+        let phasegate = cv(self.layout.phg);
+        let phdend = cv(self.layout.phdend);
+        let endgate = cv(self.layout.endg);
         {
             let mut t = builder.when_transition();
             // Obs flush start: only the ring successor, only when the
             // required draw group has completed.
-            for f in 1..8 {
-                let sel = nv(SHSEL + shsel_index(f, 0));
+            for f in 1..self.consts.flush_blocks.len() {
+                let sel = nv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0));
                 t.assert_zero(sf(23) * sel.clone() * (AB::Expr::ONE - ringsel(f - 1)));
-                t.assert_zero(sf(23) * sel * (cv(BLKLAST) - cv(NEEDL)));
+                t.assert_zero(sf(23) * sel * (cv(self.layout.blklast) - cv(self.layout.needl)));
             }
-            // Mid-flush: no new flush, no refill. (CONT = sf(23)*phc*(1-BLKLAST).)
-            t.assert_zero(cv(CONT) * (b0next.clone() + nv(REFSEL)));
+            // Mid-flush: no new flush, no refill. (self.layout.cont = sf(23)*phc*(1-self.layout.blklast).)
+            t.assert_zero(cv(self.layout.cont) * (b0next.clone() + nv(self.layout.refsel)));
             // Refill: only when the required group is incomplete, and only
             // after a consumer that used its full window.
-            t.assert_zero(sf(23) * nv(REFSEL) * cv(NEEDL));
-            // CFULL = sf(23) * consumersel * (1 - FSFULL); keeps deg <= 3.
-            t.assert_zero(nv(REFSEL) * cv(CFULL));
-            // FRING rotation at obs starts.
-            let g = sf(23) * b0next.clone();
+            t.assert_zero(sf(23) * nv(self.layout.refsel) * cv(self.layout.needl));
+            // self.layout.cfull = sf(23) * consumersel * (1 - self.layout.fsfull); keeps deg <= 3.
+            t.assert_zero(nv(self.layout.refsel) * cv(self.layout.cfull));
+            // self.layout.fring rotation at obs starts. 2b-iii: the gate
+            // sf(23)·b0next is materialized as self.layout.frgm (deg 2) so the
+            // rotation, suppressed at the child boundary via (1-csel_next), stays
+            // deg 3 (fring reaches the last obs flush at a child's end but child R
+            // must re-anchor slot 0). Narrow: (1-nv(csel))=1 in every single-child
+            // transition → byte-identical.
+            t.assert_eq(cv(self.layout.frgm), sf(23) * b0next.clone());
             for i in 0..8 {
-                t.assert_eq(
-                    nv(FRING + i),
-                    cv(FRING + i) + g.clone() * (cv(FRING + (i + 1) % 8) - cv(FRING + i)),
+                t.assert_zero(
+                    (AB::Expr::ONE - nv(self.layout.csel))
+                        * (nv(self.layout.fring + i)
+                            - cv(self.layout.fring + i)
+                            - cv(self.layout.frgm) * (cv(self.layout.fring + (i + 1) % 8) - cv(self.layout.fring + i))),
                 );
             }
-            // BIDX: reset on new flush/refill, saturating rotate on
+            // self.layout.bidx: reset on new flush/refill, saturating rotate on
             // continuation, hold otherwise (query/dup phases).
-            let newf = sf(23) * (b0next.clone() + nv(REFSEL));
-            let cont = cv(CONT);
-            for i in 0..6 {
-                let rot = match i {
-                    0 => AB::Expr::ZERO,
-                    5 => cv(BIDX + 4) + cv(BIDX + 5),
-                    _ => cv(BIDX + i - 1),
+            let newf = sf(23) * (b0next.clone() + nv(self.layout.refsel));
+            let cont = cv(self.layout.cont);
+            let bw = self.layout.bidx_width;
+            for i in 0..bw {
+                // saturating shift: slot 0 <- 0, top slot accumulates (sticks),
+                // else slot i <- slot i-1. Narrow bw=6 reproduces the old match.
+                let rot = if i == 0 {
+                    AB::Expr::ZERO
+                } else if i == bw - 1 {
+                    cv(self.layout.bidx + bw - 2) + cv(self.layout.bidx + bw - 1)
+                } else {
+                    cv(self.layout.bidx + i - 1)
                 };
                 t.assert_eq(
-                    nv(BIDX + i),
-                    cv(BIDX + i)
+                    nv(self.layout.bidx + i),
+                    cv(self.layout.bidx + i)
                         + newf.clone()
-                            * (if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO } - cv(BIDX + i))
-                        + cont.clone() * (rot - cv(BIDX + i)),
+                            * (if i == 0 { AB::Expr::ONE } else { AB::Expr::ZERO } - cv(self.layout.bidx + i))
+                        + cont.clone() * (rot - cv(self.layout.bidx + i)),
                 );
             }
-            // BLKCNT: reload at obs starts, 1 at refills, decrement on
+            // self.layout.blkcnt: reload at obs starts, 1 at refills, decrement on
             // continuation (chal) and during the dup chain, 148 at dup entry.
             let mut reload = AB::Expr::ZERO;
-            for f in 1..8 {
+            for f in 1..self.consts.flush_blocks.len() {
                 reload = reload
-                    + nv(SHSEL + shsel_index(f, 0)) * (c(FLUSH_BLOCKS[f] as u32) - cv(BLKCNT));
+                    + nv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0))
+                        * (c(self.consts.flush_blocks[f] as u32) - cv(self.layout.blkcnt));
             }
-            let dupdec = sf(23) * cv(PHD) * (AB::Expr::ONE - cv(BLKLAST));
+            let dupdec = sf(23) * cv(self.layout.phd) * (AB::Expr::ONE - cv(self.layout.blklast));
+            // 2b-iii: the blkcnt update delta is deg 3 (sf(23)·reload, dupdec).
+            // Materialize it as self.layout.bcbd so the carry — suppressed at the
+            // child boundary via (1-csel_next) — stays deg 2 (blkcnt holds a stale
+            // query-phase value at a child's end but child R re-anchors
+            // flush_blocks[0]). Narrow byte-identical (gate factor 1 there).
             t.assert_eq(
-                nv(BLKCNT),
-                cv(BLKCNT)
-                    + sf(23) * reload
-                    + sf(23) * nv(REFSEL) * (AB::Expr::ONE - cv(BLKCNT))
+                cv(self.layout.bcbd),
+                sf(23) * reload
+                    + sf(23) * nv(self.layout.refsel) * (AB::Expr::ONE - cv(self.layout.blkcnt))
                     + cont.clone() * (-AB::Expr::ONE)
                     + dupdec * (-AB::Expr::ONE)
-                    + phasegate.clone() * (c(148) - cv(BLKCNT)),
+                    + phasegate.clone() * (c(self.consts.flush_blocks[2] as u32) - cv(self.layout.blkcnt)),
             );
-            // Phase evolution.
-            t.assert_eq(nv(PHC), phc.clone() - phasegate.clone());
-            t.assert_eq(nv(PHD), cv(PHD) + phasegate.clone() - phdend.clone());
-            t.assert_eq(nv(PHQ), phq.clone() + phdend.clone() - endgate.clone());
+            t.assert_zero(
+                (AB::Expr::ONE - nv(self.layout.csel))
+                    * (nv(self.layout.blkcnt) - cv(self.layout.blkcnt) - cv(self.layout.bcbd)),
+            );
+            // Phase evolution. 2b-iii: suppressed at the child boundary — phc
+            // reaches 0 at a child's end (challenger done) but child R re-anchors
+            // phc=1; phd/phq reach 0 and agree, gated for robustness (deg 2).
+            let ncsel = AB::Expr::ONE - nv(self.layout.csel);
+            t.assert_zero(ncsel.clone() * (nv(self.layout.phc) - (phc.clone() - phasegate.clone())));
+            t.assert_zero(ncsel.clone() * (nv(self.layout.phd) - (cv(self.layout.phd) + phasegate.clone() - phdend.clone())));
+            t.assert_zero(ncsel * (nv(self.layout.phq) - (phq.clone() + phdend.clone() - endgate.clone())));
             // Chain gate: a consumer perm's first 16 preimage limbs are the
             // previous perm's digest.
             let chainsel_next = {
-                let mut e = nv(REFSEL);
-                for f in 1..8 {
-                    e = e + nv(SHSEL + shsel_index(f, 0));
+                let mut e = nv(self.layout.refsel);
+                for f in 1..self.consts.flush_blocks.len() {
+                    e = e + nv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0));
                 }
                 e
             };
             for m in 0..16 {
                 t.assert_zero(sf(23) * chainsel_next.clone() * (nv(pcol(m)) - cv(ocol(m))));
             }
-            // XOR blocks: capacity carries + OREG capture of the previous
+            // XOR blocks: capacity carries + self.layout.oreg capture of the previous
             // output's rate limbs.
             for i in 68..100 {
                 t.assert_zero(sf(23) * xorsel_next.clone() * (nv(pcol(i)) - cv(ocol(i))));
@@ -1438,45 +2573,47 @@ where
             for i in 0..68 {
                 let g = sf(23) * xorsel_next.clone();
                 t.assert_eq(
-                    nv(OREG + i),
-                    cv(OREG + i) + g * (cv(ocol(i)) - cv(OREG + i)),
+                    nv(self.layout.oreg + i),
+                    cv(self.layout.oreg + i) + g * (cv(ocol(i)) - cv(self.layout.oreg + i)),
                 );
             }
             // F2 digest capture at flush 2's last block.
-            let f2last = sf(23) * cv(SHSEL + shsel_index(2, FLUSH_BLOCKS[2] - 1));
+            let f2last = sf(23)
+                * cv(self.layout.shsel
+                    + shsel_index(&self.consts.flush_blocks, 2, self.consts.flush_blocks[2] - 1));
             for m in 0..16 {
                 t.assert_eq(
-                    nv(F2DIG + m),
-                    cv(F2DIG + m) + f2last.clone() * (cv(ocol(m)) - cv(F2DIG + m)),
+                    nv(self.layout.f2dig + m),
+                    cv(self.layout.f2dig + m) + f2last.clone() * (cv(ocol(m)) - cv(self.layout.f2dig + m)),
                 );
             }
             // Dup-chain digest binding at the duplicate's last block.
             for m in 0..16 {
-                t.assert_zero(phdend.clone() * (cv(ocol(m)) - cv(F2DIG + m)));
+                t.assert_zero(phdend.clone() * (cv(ocol(m)) - cv(self.layout.f2dig + m)));
             }
         }
         // Dup first block: fresh keccak-256 state (capacity zero); B0 obs
         // blocks likewise.
         for i in 68..100 {
-            builder.assert_zero(cv(PHD) * cv(CMPC) * cv(pcol(i)));
-            let mut b0 = cv(SHSEL); // F0B0
-            for f in 1..8 {
-                b0 = b0 + cv(SHSEL + shsel_index(f, 0));
+            builder.assert_zero(cv(self.layout.phd) * cv(self.layout.cmpc) * cv(pcol(i)));
+            let mut b0 = cv(self.layout.shsel); // F0B0
+            for f in 1..self.consts.flush_blocks.len() {
+                b0 = b0 + cv(self.layout.shsel + shsel_index(&self.consts.flush_blocks, f, 0));
             }
-            builder.assert_zero((b0 + cv(REFSEL)) * cv(pcol(i)));
+            builder.assert_zero((b0 + cv(self.layout.refsel)) * cv(pcol(i)));
         }
         // =====================================================================
         // FS draw gadget (inc-4): byte-packing + rejection comparator, bound
         // to the sponge digest via limb consistency. Mirrors the proven inc-3
-        // gadget in m4route.rs; active on every FS row (FSGATE = 1), which the
+        // gadget in m4route.rs; active on every FS row (self.layout.fsgate = 1), which the
         // witness places on the first 2*ndraws rows of a draw-hosting perm.
         // Draw j occupies row offsets 2j (even) and 2j+1 (odd); it reads
         // digest limbs 2g and 2g+1 for g = 7 - j (pop-from-end byte order).
         // =====================================================================
         {
-            let fs = cv(FSGATE);
+            let fs = cv(self.layout.fsgate);
             builder.assert_bool(fs.clone());
-            let bit = |i: usize| -> AB::Expr { cv(FSBITS + i) };
+            let bit = |i: usize| -> AB::Expr { cv(self.layout.fsbits + i) };
             for i in 0..16 {
                 builder.assert_bool(bit(i));
             }
@@ -1510,140 +2647,149 @@ where
                 even_mux = even_mux + sf(2 * j);
                 odd_mux = odd_mux + sf(2 * j + 1);
             }
-            // FSODD materialization (fs * odd row) and the even-row ACC load:
-            // the odd row's FSACC = the draw's low 16 bits, computed on the
+            // self.layout.fsodd materialization (fs * odd row) and the even-row ACC load:
+            // the odd row's self.layout.fsacc = the draw's low 16 bits, computed on the
             // even row as b_lo + 2^8 * b_hi (even-row bytes = x3, x2).
-            builder.assert_eq(cv(FSODD), fs.clone() * odd_mux.clone());
+            builder.assert_eq(cv(self.layout.fsodd), fs.clone() * odd_mux.clone());
             builder.assert_zero(
                 fs.clone()
                     * even_mux
-                    * (nv(FSACC) - (b_lo.clone() + c(1 << 8) * b_hi.clone())),
+                    * (nv(self.layout.fsacc) - (b_lo.clone() + c(1 << 8) * b_hi.clone())),
             );
             // Rejection comparator (materialized bit products, deg <= 3):
             // reject iff bits 24..30 all one AND low-24 bits nonzero.
-            builder.assert_eq(cv(FSP3A), bit(8) * bit(9) * bit(10));
-            builder.assert_eq(cv(FSP3B), bit(11) * bit(12) * bit(13));
-            builder.assert_eq(cv(FST7), cv(FSP3A) * cv(FSP3B) * bit(14));
-            let low24 = cv(FSACC) + c(1 << 16) * b_lo.clone();
-            builder.assert_eq(cv(FSNZ), low24.clone() * cv(FSINV));
-            builder.assert_bool(cv(FSNZ));
-            builder.assert_zero((AB::Expr::ONE - cv(FSNZ)) * low24);
-            builder.assert_zero(fs.clone() * (cv(FSACCEPT) - (AB::Expr::ONE - cv(FST7) * cv(FSNZ))));
+            builder.assert_eq(cv(self.layout.fsp3a), bit(8) * bit(9) * bit(10));
+            builder.assert_eq(cv(self.layout.fsp3b), bit(11) * bit(12) * bit(13));
+            builder.assert_eq(cv(self.layout.fst7), cv(self.layout.fsp3a) * cv(self.layout.fsp3b) * bit(14));
+            let low24 = cv(self.layout.fsacc) + c(1 << 16) * b_lo.clone();
+            builder.assert_eq(cv(self.layout.fsnz), low24.clone() * cv(self.layout.fsinv));
+            builder.assert_bool(cv(self.layout.fsnz));
+            builder.assert_zero((AB::Expr::ONE - cv(self.layout.fsnz)) * low24);
+            builder.assert_zero(fs.clone() * (cv(self.layout.fsaccept) - (AB::Expr::ONE - cv(self.layout.fst7) * cv(self.layout.fsnz))));
 
             // =================================================================
             // Ext-challenge assembly (inc-4): accepted field draws feed the
-            // COEF ring / CURCH limbs; every 4th accepted draw assembles
-            // CHAL[grp] and advances the GRP ring. PoW/query-index (bits) draws
-            // run the same byte gadget but sit at grp >= G_POW; the field_grp
+            // self.layout.coef ring / self.layout.curch limbs; every 4th accepted draw assembles
+            // self.layout.chal[grp] and advances the self.layout.grp ring. PoW/query-index (bits) draws
+            // run the same byte gadget but sit at grp >= self.shape.g_pow(); the field_grp
             // gate keeps them out of the field assembly, and sample_bits (below)
             // handles the query-index binding.
             // =================================================================
-            let masked = cv(FSACC) + c(1 << 16) * b_lo + c(1 << 24) * b_hi_masked;
+            let masked = cv(self.layout.fsacc) + c(1 << 16) * b_lo + c(1 << 24) * b_hi_masked;
             // A field-challenge group (0..6) is the ring head. Query-index and
-            // PoW (bits) draws sit at grp >= G_POW and must NOT drive the
+            // PoW (bits) draws sit at grp >= self.shape.g_pow() and must NOT drive the
             // challenge assembly even though they run the same byte gadget.
-            let field_grp = (0..N_CHALS)
-                .map(|g| cv(ring_at(GRP, N_GROUPS, g)))
+            let field_grp = (0..self.shape.n_chals())
+                .map(|g| cv(ring_at(self.layout.grp, self.shape.n_groups(), g)))
                 .fold(AB::Expr::ZERO, |a, e| a + e);
-            // CROT = accept, on an odd FS row whose active group is a field
-            // challenge. (bits draws set CROT = 0.)
-            builder.assert_bool(cv(CROT));
-            builder.assert_bool(cv(GROT));
-            builder.assert_eq(cv(CROT), field_grp * cv(FSODD) * cv(FSACCEPT));
+            // self.layout.crot = accept, on an odd FS row whose active group is a field
+            // challenge. (bits draws set self.layout.crot = 0.)
+            builder.assert_bool(cv(self.layout.crot));
+            builder.assert_bool(cv(self.layout.grot));
+            builder.assert_eq(cv(self.layout.crot), field_grp * cv(self.layout.fsodd) * cv(self.layout.fsaccept));
             // A bits group (PoW or a query index): each is a single draw that
             // completes on its odd row.
             let bits_grp = {
-                let mut e = cv(ring_at(GRP, N_GROUPS, G_POW));
-                for q in 0..NQ {
-                    e = e + cv(ring_at(GRP, N_GROUPS, G_IDX0 + q));
+                let mut e = cv(ring_at(self.layout.grp, self.shape.n_groups(), self.shape.g_pow()));
+                for q in 0..self.shape.nq {
+                    e = e + cv(ring_at(self.layout.grp, self.shape.n_groups(), self.shape.g_idx0() + q));
                 }
                 e
             };
-            // GROT (advance the group ring): a field challenge's 4th accepted
-            // limb (CROT & coef==3), OR any bits draw's odd row. This fully
-            // pins GROT, which now drives the GRP-ring rotation below.
-            let coef3 = cv(ring_at(COEF, 4, 3));
-            builder.assert_eq(cv(GROT), cv(CROT) * coef3 + cv(FSODD) * bits_grp.clone());
-            // PoW draw (grp = G_POW): the low GRIND_BITS of the sampled value
-            // must be zero (the grind check). value = FSACC (bits 0..16) +
-            // FSBITS[0..GRIND_BITS-16] << 16.
+            // self.layout.grot (advance the group ring): a field challenge's 4th accepted
+            // limb (self.layout.crot & coef==3), OR any bits draw's odd row. This fully
+            // pins self.layout.grot, which now drives the self.layout.grp-ring rotation below.
+            let coef3 = cv(ring_at(self.layout.coef, 4, 3));
+            builder.assert_eq(cv(self.layout.grot), cv(self.layout.crot) * coef3 + cv(self.layout.fsodd) * bits_grp.clone());
+            // PoW draw (grp = self.shape.g_pow()): the low self.shape.grind_bits of the sampled value
+            // must be zero (the grind check). value = self.layout.fsacc (bits 0..16) +
+            // self.layout.fsbits[0..self.shape.grind_bits-16] << 16.
             {
-                let pow_gate = cv(FSODD) * cv(ring_at(GRP, N_GROUPS, G_POW));
-                let mut pow_val = cv(FSACC);
-                for i in 0..(GRIND_BITS - 16) {
-                    pow_val = pow_val + cv(FSBITS + i) * c(1 << (16 + i));
+                let pow_gate = cv(self.layout.fsodd) * cv(ring_at(self.layout.grp, self.shape.n_groups(), self.shape.g_pow()));
+                let mut pow_val = cv(self.layout.fsacc);
+                for i in 0..(self.shape.grind_bits - 16) {
+                    pow_val = pow_val + cv(self.layout.fsbits + i) * c(1 << (16 + i));
                 }
                 builder.assert_zero(pow_gate * pow_val);
             }
-            // First-row pins: no challenge assembled yet.
+            // First-row pins: no challenge assembled yet. These are DATA registers
+            // assembled/overwritten by each child's own FS draws before use, so they
+            // only need the true-row-0 pin (not a per-child csel re-anchor): child R
+            // INHERITS child L's final values (2b-iii fill-continuity) and its draws
+            // overwrite them — the freeze carries then hold with no gating.
             for k in 0..4 {
-                builder.when_first_row().assert_zero(cv(CURCH + k));
+                builder.when_first_row().assert_zero(cv(self.layout.curch + k));
             }
-            for k in 0..4 * N_CHALS {
-                builder.when_first_row().assert_zero(cv(CHAL + k));
+            for k in 0..4 * self.shape.n_chals() {
+                builder.when_first_row().assert_zero(cv(self.layout.chal + k));
             }
-            for q in 0..NQ {
-                builder.when_first_row().assert_zero(cv(IDXR + q));
+            for q in 0..self.shape.nq {
+                builder.when_first_row().assert_zero(cv(self.layout.idxr + q));
             }
-            // sample_bits (query indices): value = low LOG_MAX (=22) bits of
-            // the draw = FSACC (bits 0..16) + FSBITS[0..6] << 16. No rejection.
-            // The draw sits at grp = G_IDX0 + q; bind IDXR[q] on its odd row.
+            // sample_bits (query indices): value = low self.shape.log_max (=22) bits of
+            // the draw = self.layout.fsacc (bits 0..16) + self.layout.fsbits[0..6] << 16. No rejection.
+            // The draw sits at grp = self.shape.g_idx0() + q; bind self.layout.idxr[q] on its odd row.
             let idx_val = {
-                let mut e = cv(FSACC);
-                for i in 0..(LOG_MAX - 16) {
-                    e = e + cv(FSBITS + i) * c(1 << (16 + i));
+                let mut e = cv(self.layout.fsacc);
+                for i in 0..(self.shape.log_max - 16) {
+                    e = e + cv(self.layout.fsbits + i) * c(1 << (16 + i));
                 }
                 e
             };
             {
                 let mut t = builder.when_transition();
-                // GRP ring: left-rotate (advance the logical group) on GROT.
+                // self.layout.grp ring: left-rotate (advance the logical group) on self.layout.grot.
                 // This binds the draw-group schedule to the FS gadget, giving
                 // the GROUPREQ flush-start gate (Stage A) real teeth.
-                for i in 0..N_GROUPS {
-                    t.assert_eq(
-                        nv(GRP + i),
-                        cv(GRP + i)
-                            + cv(GROT) * (cv(GRP + (i + 1) % N_GROUPS) - cv(GRP + i)),
+                // 2b-iii: suppressed at the child boundary (grp reaches g_done at a
+                // child's end but child R must re-anchor slot 0).
+                for i in 0..self.shape.n_groups() {
+                    t.assert_zero(
+                        (AB::Expr::ONE - nv(self.layout.csel))
+                            * (nv(self.layout.grp + i)
+                                - cv(self.layout.grp + i)
+                                - cv(self.layout.grot) * (cv(self.layout.grp + (i + 1) % self.shape.n_groups()) - cv(self.layout.grp + i))),
                     );
                 }
-                // COEF ring: left-rotate (increment logical coef) on CROT.
+                // self.layout.coef ring: left-rotate (increment logical coef) on self.layout.crot.
                 for i in 0..4 {
-                    t.assert_eq(
-                        nv(COEF + i),
-                        cv(COEF + i) + cv(CROT) * (cv(COEF + (i + 1) % 4) - cv(COEF + i)),
+                    t.assert_zero(
+                        (AB::Expr::ONE - nv(self.layout.csel))
+                            * (nv(self.layout.coef + i)
+                                - cv(self.layout.coef + i)
+                                - cv(self.layout.crot) * (cv(self.layout.coef + (i + 1) % 4) - cv(self.layout.coef + i))),
                     );
                 }
-                // CURCH: an accepted draw at coef c<3 loads CURCH[c] = masked;
-                // slot 3 is never loaded (the 4th limb goes straight to CHAL).
+                // self.layout.curch: an accepted draw at coef c<3 loads self.layout.curch[c] = masked;
+                // slot 3 is never loaded (the 4th limb goes straight to self.layout.chal).
                 for cc in 0..3 {
-                    let gate = cv(CROT) * cv(ring_at(COEF, 4, cc));
+                    let gate = cv(self.layout.crot) * cv(ring_at(self.layout.coef, 4, cc));
                     t.assert_eq(
-                        nv(CURCH + cc),
-                        cv(CURCH + cc) + gate * (masked.clone() - cv(CURCH + cc)),
+                        nv(self.layout.curch + cc),
+                        cv(self.layout.curch + cc) + gate * (masked.clone() - cv(self.layout.curch + cc)),
                     );
                 }
-                t.assert_eq(nv(CURCH + 3), cv(CURCH + 3));
-                // CHAL[grp] assembly on GROT: limbs (CURCH0..2, masked) into
-                // the GRP-ring-selected challenge register; carries otherwise.
-                for g in 0..N_CHALS {
-                    let gate = cv(GROT) * cv(ring_at(GRP, N_GROUPS, g));
+                t.assert_eq(nv(self.layout.curch + 3), cv(self.layout.curch + 3));
+                // self.layout.chal[grp] assembly on self.layout.grot: limbs (CURCH0..2, masked) into
+                // the self.layout.grp-ring-selected challenge register; carries otherwise.
+                for g in 0..self.shape.n_chals() {
+                    let gate = cv(self.layout.grot) * cv(ring_at(self.layout.grp, self.shape.n_groups(), g));
                     for k in 0..4 {
-                        let asm = if k < 3 { cv(CURCH + k) } else { masked.clone() };
+                        let asm = if k < 3 { cv(self.layout.curch + k) } else { masked.clone() };
                         t.assert_eq(
-                            nv(CHAL + 4 * g + k),
-                            cv(CHAL + 4 * g + k) + gate.clone() * (asm - cv(CHAL + 4 * g + k)),
+                            nv(self.layout.chal + 4 * g + k),
+                            cv(self.layout.chal + 4 * g + k) + gate.clone() * (asm - cv(self.layout.chal + 4 * g + k)),
                         );
                     }
                 }
-                // IDXR[q] = idx_val on the odd row of query q's bits draw
-                // (grp = G_IDX0 + q); carries otherwise. Ties every FRI query
+                // self.layout.idxr[q] = idx_val on the odd row of query q's bits draw
+                // (grp = self.shape.g_idx0() + q); carries otherwise. Ties every FRI query
                 // index to the FS-sampled digest bits — no free query choice.
-                for q in 0..NQ {
-                    let gate = cv(FSODD) * cv(ring_at(GRP, N_GROUPS, G_IDX0 + q));
+                for q in 0..self.shape.nq {
+                    let gate = cv(self.layout.fsodd) * cv(ring_at(self.layout.grp, self.shape.n_groups(), self.shape.g_idx0() + q));
                     t.assert_eq(
-                        nv(IDXR + q),
-                        cv(IDXR + q) + gate * (idx_val.clone() - cv(IDXR + q)),
+                        nv(self.layout.idxr + q),
+                        cv(self.layout.idxr + q) + gate * (idx_val.clone() - cv(self.layout.idxr + q)),
                     );
                 }
             }
@@ -1652,115 +2798,138 @@ where
         // =====================================================================
         // Value-carry-row schedule (fold-pipeline foundation, inc-4): bind the
         // asm/PX value-carry selectors to the role/phase schedule + row ranges,
-        // then the POS half-position toggle and the CONSZ/CONSF completion
-        // flags. Everything derives from already-bound selectors (RSEL, DRND,
-        // SHSEL, PHD, CMPC, BLKLAST) + the keccak step-flag row one-hots. This
+        // then the self.layout.pos half-position toggle and the self.layout.consz/self.layout.consf completion
+        // flags. Everything derives from already-bound selectors (self.layout.rsel, self.layout.drnd,
+        // self.layout.shsel, self.layout.phd, self.layout.cmpc, self.layout.blklast) + the keccak step-flag row one-hots. This
         // is the bottom layer of the reduced-opening / fold machinery; the
-        // arithmetic layers (PZACC/SCR/BREG/RUNEV) build on these selectors.
+        // arithmetic layers (self.layout.pzacc/self.layout.scr/self.layout.breg/self.layout.runev) build on these selectors.
         // =====================================================================
         {
             let one = || AB::Expr::ONE;
             // Row-range indicators from the step-flag one-hots (sf(r) = cv(r)).
             let rle = |n: usize| (0..=n).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
             let rge = |a: usize, b: usize| (a..=b).map(&sf).fold(AB::Expr::ZERO, |x, e| x + e);
-            let rsel = |r: u32| cv(RSEL + r as usize);
-            // Per-role asm value ranges (word-0 / word-1 half positions).
-            let role_range = |c5: usize| {
-                rsel(R_ABS_F34) * rle(16)
-                    + rsel(R_ABS_C34) * rle(16)
-                    + rsel(R_ABS_C5) * rle(c5)
-                    + rsel(R_ABS_C30) * rle(14)
-                    + rsel(R_ABS_F16) * rle(7)
+            let rsel = |r: u32| cv(self.layout.rsel + r as usize);
+            // Per-role asm value ranges (word-0 / word-1 half positions). A
+            // block of `f` fresh u32 words routes 2 words/row (word-0 even,
+            // word-1 odd), so word-0 fills ceil(f/2) rows → rle(ceil(f/2)-1)
+            // and word-1 fills floor(f/2) rows → rle(floor(f/2)-1). Per-role
+            // fresh count: F34/C34 = 34 (full rate), C5 = trace_last_fresh,
+            // C30 = 30 (fold-last), F16 = qw (single-block leaf). Narrow
+            // reproduces (F34/C34 rle16, C5 rle2/rle1, C30 rle14, F16 rle7);
+            // wide gets C5 f=22 → rle10/rle10 and F16 qw=8 → rle3/rle3.
+            let m0w = |f: usize| (f + 1) / 2 - 1;
+            let m1w = |f: usize| f / 2 - 1;
+            let tlf = self.shape.trace_last_fresh();
+            let qw = self.shape.qw;
+            let role_range = |wf: fn(usize) -> usize| {
+                rsel(R_ABS_F34) * rle(wf(34))
+                    + rsel(R_ABS_C34) * rle(wf(34))
+                    + rsel(R_ABS_C5) * rle(wf(tlf))
+                    + rsel(R_ABS_C30) * rle(wf(30))
+                    + rsel(R_ABS_F16) * rle(wf(qw))
             };
-            let m0 = role_range(2);
-            let m1 = role_range(1);
-            // dparam split: fold leaves (D_F0..3) vs trace/quotient (D_T/D_Q).
-            let fold_dp = cv(DRND + 2) + cv(DRND + 3) + cv(DRND + 4) + cv(DRND + 5);
-            let nonfold_dp = cv(DRND) + cv(DRND + 1);
+            let m0 = role_range(m0w);
+            let m1 = role_range(m1w);
+            // dparam split: fold leaves (D_F0..) vs trace/quotient (D_T/D_Q).
+            // D_F rounds = drnd[2 .. 2+n_fri_rounds] (narrow 2..6, wide 2..5;
+            // drnd+5 on wide = dbit OOB).
+            let fold_dp = (0..self.shape.n_fri_rounds())
+                .map(|rf| cv(self.layout.drnd + 2 + rf))
+                .fold(AB::Expr::ZERO, |a, e| a + e);
+            let nonfold_dp = cv(self.layout.drnd) + cv(self.layout.drnd + 1);
             // Query-absorb carry selectors.
-            builder.assert_eq(cv(CF), fold_dp * m0.clone());
-            builder.assert_eq(cv(CX0), nonfold_dp.clone() * m0);
-            builder.assert_eq(cv(CX1), nonfold_dp * m1);
-            // F7 observation blocks (challenger phase): final-poly carry rows.
+            builder.assert_eq(cv(self.layout.cf), fold_dp * m0.clone());
+            builder.assert_eq(cv(self.layout.cx0), nonfold_dp.clone() * m0);
+            builder.assert_eq(cv(self.layout.cx1), nonfold_dp * m1);
+            // Final-flush observation blocks (challenger phase): final-poly
+            // carry rows. Final obs flush index = 3 + n_fri_rounds (narrow 7).
+            let ff = self.consts.flush_blocks.len() - 1;
+            let fb = &self.consts.flush_blocks;
             builder.assert_eq(
-                cv(CZ7),
-                cv(SHSEL + shsel_index(7, 0)) * rge(4, 16)
-                    + cv(SHSEL + shsel_index(7, 1)) * rle(16)
-                    + cv(SHSEL + shsel_index(7, 2)) * rle(1),
+                cv(self.layout.cz7),
+                cv(self.layout.shsel + shsel_index(fb, ff, 0)) * rge(4, 16)
+                    + cv(self.layout.shsel + shsel_index(fb, ff, 1)) * rle(16)
+                    + cv(self.layout.shsel + shsel_index(fb, ff, 2)) * rle(1),
             );
             // Duplicate blocks (dup phase): zeta-value carry rows. First block
-            // (CMPC) rows 4..16, last block (BLKLAST) rows 0..4, middle 0..16.
+            // (self.layout.cmpc) rows 4..16 (32-byte digest prefix = 4 rows,
+            // then 13 value-rows), middle blocks rows 0..16 (full 17-row rate),
+            // last block (self.layout.blklast) rows 0..(row_a2-1) where the A2
+            // (end) capture at row_a2 lands one past the last consume. Narrow
+            // row_a2=5 → rle(4); wide row_a2=6 → rle(5).
+            let dup_last_top = self.shape.dup_captures()[2].1 - 1;
             builder.assert_eq(
-                cv(CZD),
-                cv(PHD) * cv(CMPC) * rge(4, 16)
-                    + cv(PHD) * cv(BLKLAST) * rle(4)
-                    + cv(PHD) * (one() - cv(CMPC) - cv(BLKLAST)) * rle(16),
+                cv(self.layout.czd),
+                cv(self.layout.phd) * cv(self.layout.cmpc) * rge(4, 16)
+                    + cv(self.layout.phd) * cv(self.layout.blklast) * rle(dup_last_top)
+                    + cv(self.layout.phd) * (one() - cv(self.layout.cmpc) - cv(self.layout.blklast)) * rle(16),
             );
-            for s in [CZD, CZ7, CF, CX0, CX1] {
+            for s in [self.layout.czd, self.layout.cz7, self.layout.cf, self.layout.cx0, self.layout.cx1] {
                 builder.assert_bool(cv(s));
             }
-            // POS: 2-slot half-position ring, toggles on every asm value-carry
-            // row (casm = CZD + CZ7 + CF); CX0/CX1 are PX rows and do not toggle.
-            let casm = cv(CZD) + cv(CZ7) + cv(CF);
-            builder.assert_bool(cv(POS));
-            builder.assert_bool(cv(POS + 1));
-            builder.assert_eq(cv(POS) + cv(POS + 1), one());
+            // self.layout.pos: 2-slot half-position ring, toggles on every asm value-carry
+            // row (casm = self.layout.czd + self.layout.cz7 + self.layout.cf); self.layout.cx0/self.layout.cx1 are PX rows and do not toggle.
+            let casm = cv(self.layout.czd) + cv(self.layout.cz7) + cv(self.layout.cf);
+            builder.assert_bool(cv(self.layout.pos));
+            builder.assert_bool(cv(self.layout.pos + 1));
+            builder.assert_eq(cv(self.layout.pos) + cv(self.layout.pos + 1), one());
             {
                 let mut t = builder.when_transition();
-                t.assert_eq(nv(POS), cv(POS) + casm.clone() * (cv(POS + 1) - cv(POS)));
-                t.assert_eq(nv(POS + 1), cv(POS + 1) + casm * (cv(POS) - cv(POS + 1)));
+                t.assert_eq(nv(self.layout.pos), cv(self.layout.pos) + casm.clone() * (cv(self.layout.pos + 1) - cv(self.layout.pos)));
+                t.assert_eq(nv(self.layout.pos + 1), cv(self.layout.pos + 1) + casm * (cv(self.layout.pos) - cv(self.layout.pos + 1)));
             }
             // Completion flags: value fully captured on the pos==1 (word-1) row.
-            builder.assert_eq(cv(CONSZ), cv(CZD) * cv(POS + 1));
-            builder.assert_eq(cv(CONSF), cv(CF) * cv(POS + 1));
+            builder.assert_eq(cv(self.layout.consz), cv(self.layout.czd) * cv(self.layout.pos + 1));
+            builder.assert_eq(cv(self.layout.consf), cv(self.layout.cf) * cv(self.layout.pos + 1));
 
-            // VC value-counter ring (16-slot one-hot): counts fold leaves
-            // within a round. Rotates +1 on CONSF (a completed fold-leaf
+            // self.layout.vc value-counter ring (16-slot one-hot): counts fold leaves
+            // within a round. Rotates +1 on self.layout.consf (a completed fold-leaf
             // value, now schedule-bound), resets to slot 0 at each leaf-start
-            // (LFS on the next perm). First row pinned to slot 0 above.
+            // (self.layout.lfs on the next perm). First row pinned to slot 0 above.
             for i in 0..16 {
-                builder.assert_bool(cv(VC + i));
+                builder.assert_bool(cv(self.layout.vc + i));
             }
             builder.assert_eq(
-                (0..16).map(|i| cv(VC + i)).fold(AB::Expr::ZERO, |a, e| a + e),
+                (0..16).map(|i| cv(self.layout.vc + i)).fold(AB::Expr::ZERO, |a, e| a + e),
                 one(),
             );
             builder.assert_eq(
-                cv(VCE),
-                (0..16).step_by(2).map(|i| cv(VC + i)).fold(AB::Expr::ZERO, |a, e| a + e),
+                cv(self.layout.vce),
+                (0..16).step_by(2).map(|i| cv(self.layout.vc + i)).fold(AB::Expr::ZERO, |a, e| a + e),
             );
             {
                 let mut t = builder.when_transition();
-                let reset = sf(23) * nv(LFS);
+                let reset = sf(23) * nv(self.layout.lfs);
                 for i in 0..16 {
                     let slot0 = if i == 0 { one() } else { AB::Expr::ZERO };
                     t.assert_eq(
-                        nv(VC + i),
-                        cv(VC + i)
-                            + cv(CONSF) * (cv(VC + (i + 15) % 16) - cv(VC + i))
-                            + reset.clone() * (slot0 - cv(VC + i)),
+                        nv(self.layout.vc + i),
+                        cv(self.layout.vc + i)
+                            + cv(self.layout.consf) * (cv(self.layout.vc + (i + 15) % 16) - cv(self.layout.vc + i))
+                            + reset.clone() * (slot0 - cv(self.layout.vc + i)),
                     );
                 }
             }
-            // GPB: the fold round's index-in-group bits, muxed from the query
-            // index bits IDXB by the fold-round dparam (D_F0..3 -> DRND 2..5).
+            // self.layout.gpb: the fold round's index-in-group bits, muxed from the query
+            // index bits self.layout.idxb by the fold-round dparam (D_F0..3 -> self.layout.drnd 2..5).
             // Zero on non-fold-absorb perms.
             for k in 0..4 {
                 let mut e = AB::Expr::ZERO;
-                for rf in 0..4 {
-                    if k < LOG_ARITIES[rf] {
-                        e = e + cv(DRND + 2 + rf) * cv(IDXB + CUM[rf] + k);
+                for rf in 0..self.shape.n_fri_rounds() {
+                    if k < self.shape.log_arities[rf] {
+                        e = e + cv(self.layout.drnd + 2 + rf) * cv(self.layout.idxb + self.shape.cum()[rf] + k);
                     }
                 }
-                builder.assert_bool(cv(GPB + k));
-                builder.assert_eq(cv(GPB + k), e);
+                builder.assert_bool(cv(self.layout.gpb + k));
+                builder.assert_eq(cv(self.layout.gpb + k), e);
             }
         }
 
         // =====================================================================
-        // M_X1 x-chain (fold-pipeline arithmetic, inc-4): XREG (query LDE
+        // M_X1 x-chain (fold-pipeline arithmetic, inc-4): self.layout.xreg (query LDE
         // point) = GEN · ∏_r (kx[r] if idx-bit r else 1), a 22-row mul-bank
-        // chain over the query index bits (rows 0..21). Since IDXB is bound to
+        // chain over the query index bits (rows 0..21). Since self.layout.idxb is bound to
         // the sampled digest (Stage E), this pins the query point to the
         // transcript. Native arithmetic (the x-chain is unscaled).
         // =====================================================================
@@ -1769,83 +2938,88 @@ where
             // `scale` (it round-trips through the Monty limb), so it is wrong
             // for the native x-chain; use the canonical value here.
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
-            let msel_x = cv(MSEL + M_X1 as usize);
+            let msel_x = cv(self.layout.msel + M_X1 as usize);
             // mul_b = ext_base(bit ? kx[r] : 1): limb0 row-muxed, limbs 1..3 = 0.
             let mut bscalar = AB::Expr::ZERO;
-            for r in 0..22 {
+            for r in 0..self.shape.log_max {
                 bscalar = bscalar
-                    + sf(r) * (AB::Expr::ONE + cv(IDXB + r) * (cn(self.consts.kx[r]) - AB::Expr::ONE));
+                    + sf(r) * (AB::Expr::ONE + cv(self.layout.idxb + r) * (cn(self.consts.kx[r]) - AB::Expr::ONE));
             }
-            builder.assert_zero(msel_x.clone() * (cv(MUL_OFF + 4) - bscalar));
+            builder.assert_zero(msel_x.clone() * (cv(self.layout.mul_off + 4) - bscalar));
             for k in 1..4 {
-                builder.assert_zero(msel_x.clone() * cv(MUL_OFF + 4 + k));
+                builder.assert_zero(msel_x.clone() * cv(self.layout.mul_off + 4 + k));
             }
             // mul_a at chain row 0 = ext_base(GEN).
-            builder.assert_zero(msel_x.clone() * sf(0) * (cv(MUL_OFF) - cn(self.consts.gen)));
+            builder.assert_zero(msel_x.clone() * sf(0) * (cv(self.layout.mul_off) - cn(self.consts.gen)));
             for k in 1..4 {
-                builder.assert_zero(msel_x.clone() * sf(0) * cv(MUL_OFF + k));
+                builder.assert_zero(msel_x.clone() * sf(0) * cv(self.layout.mul_off + k));
             }
             // Chain rows 0..20: next row's mul_a == this row's mul_c.
-            let chain = (0..21).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
-            let cap = msel_x.clone() * sf(21);
+            let chain = (0..self.shape.log_max - 1).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
+            let cap = msel_x.clone() * sf(self.shape.log_max - 1);
             let mut t = builder.when_transition();
             for k in 0..4 {
                 t.assert_zero(
-                    msel_x.clone() * chain.clone() * (nv(MUL_OFF + k) - cv(MUL_OFF + 8 + k)),
+                    msel_x.clone() * chain.clone() * (nv(self.layout.mul_off + k) - cv(self.layout.mul_off + 8 + k)),
                 );
             }
-            // XREG captures the chain output at row 21, carries elsewhere.
+            // self.layout.xreg captures the chain output at row 21, carries elsewhere.
             for k in 0..4 {
-                t.assert_zero(cap.clone() * (nv(XREG + k) - cv(MUL_OFF + 8 + k)));
-                t.assert_zero((AB::Expr::ONE - cap.clone()) * (nv(XREG + k) - cv(XREG + k)));
+                t.assert_zero(cap.clone() * (nv(self.layout.xreg + k) - cv(self.layout.mul_off + 8 + k)));
+                t.assert_zero((AB::Expr::ONE - cap.clone()) * (nv(self.layout.xreg + k) - cv(self.layout.xreg + k)));
             }
         }
 
         // =====================================================================
-        // M_FIN x_fin-chain (inc-4): XFIN (final-poly evaluation point) =
+        // M_FIN x_fin-chain (inc-4): self.layout.xfin (final-poly evaluation point) =
         // ∏_{r<8} (kx[r] if idx-bit (14+r) else 1), an 8-row mul-bank chain
         // (rows 0..7, a starts at ONE). Same shape as M_X1. Native.
         // =====================================================================
         {
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
-            let msel_f = cv(MSEL + M_FIN as usize);
+            let msel_f = cv(self.layout.msel + self.shape.m_fin() as usize);
+            // x_fin chain over the final-poly domain index bits: `fin_bits`
+            // (= log_max - cum[n]) rows starting at bit `fin_lo` (= cum[n]).
+            // Narrow 8 rows from bit 14; wide 6 rows from bit 12.
+            let fin_lo = *self.shape.cum().last().unwrap();
+            let fin_bits = self.shape.log_max - fin_lo;
             let mut bscalar = AB::Expr::ZERO;
-            for r in 0..8 {
+            for r in 0..fin_bits {
                 bscalar = bscalar
-                    + sf(r) * (AB::Expr::ONE + cv(IDXB + 14 + r) * (cn(self.consts.kx[r]) - AB::Expr::ONE));
+                    + sf(r) * (AB::Expr::ONE + cv(self.layout.idxb + fin_lo + r) * (cn(self.consts.kx[r]) - AB::Expr::ONE));
             }
-            builder.assert_zero(msel_f.clone() * (cv(MUL_OFF + 4) - bscalar));
+            builder.assert_zero(msel_f.clone() * (cv(self.layout.mul_off + 4) - bscalar));
             for k in 1..4 {
-                builder.assert_zero(msel_f.clone() * cv(MUL_OFF + 4 + k));
+                builder.assert_zero(msel_f.clone() * cv(self.layout.mul_off + 4 + k));
             }
             // mul_a at chain row 0 = ext_base(ONE).
-            builder.assert_zero(msel_f.clone() * sf(0) * (cv(MUL_OFF) - AB::Expr::ONE));
+            builder.assert_zero(msel_f.clone() * sf(0) * (cv(self.layout.mul_off) - AB::Expr::ONE));
             for k in 1..4 {
-                builder.assert_zero(msel_f.clone() * sf(0) * cv(MUL_OFF + k));
+                builder.assert_zero(msel_f.clone() * sf(0) * cv(self.layout.mul_off + k));
             }
-            let chain = (0..7).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
-            let cap = msel_f.clone() * sf(7);
+            let chain = (0..fin_bits - 1).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
+            let cap = msel_f.clone() * sf(fin_bits - 1);
             let mut t = builder.when_transition();
             for k in 0..4 {
                 t.assert_zero(
-                    msel_f.clone() * chain.clone() * (nv(MUL_OFF + k) - cv(MUL_OFF + 8 + k)),
+                    msel_f.clone() * chain.clone() * (nv(self.layout.mul_off + k) - cv(self.layout.mul_off + 8 + k)),
                 );
             }
             for k in 0..4 {
-                t.assert_zero(cap.clone() * (nv(XFIN + k) - cv(MUL_OFF + 8 + k)));
-                t.assert_zero((AB::Expr::ONE - cap.clone()) * (nv(XFIN + k) - cv(XFIN + k)));
+                t.assert_zero(cap.clone() * (nv(self.layout.xfin + k) - cv(self.layout.mul_off + 8 + k)));
+                t.assert_zero((AB::Expr::ONE - cap.clone()) * (nv(self.layout.xfin + k) - cv(self.layout.xfin + k)));
             }
         }
 
         // =====================================================================
-        // M_INV (inc-4): witnessed inverses INVZ = 1/(zeta - x) [r=0] and
-        // INVZN = 1/(zeta_next - x) [r=1]. Add bank forms (operand - x) as a-c;
-        // mul bank pins the inverse via mul_c == 1. INVZ is fully sound (zeta =
-        // CHAL bound, x = XREG bound); INVZN's soundness pends the ZN/trailer
-        // binding (ZNREG is still free witness). Native arithmetic.
+        // M_INV (inc-4): witnessed inverses self.layout.invz = 1/(zeta - x) [r=0] and
+        // self.layout.invzn = 1/(zeta_next - x) [r=1]. Add bank forms (operand - x) as a-c;
+        // mul bank pins the inverse via mul_c == 1. self.layout.invz is fully sound (zeta =
+        // self.layout.chal bound, x = self.layout.xreg bound); self.layout.invzn's soundness pends the ZN/trailer
+        // binding (self.layout.znreg is still free witness). Native arithmetic.
         // =====================================================================
         {
-            let msel_i = cv(MSEL + M_INV as usize);
+            let msel_i = cv(self.layout.msel + M_INV as usize);
             let one_k = |k: usize| {
                 if k == 0 {
                     AB::Expr::ONE
@@ -1856,142 +3030,144 @@ where
             // Same shape for both rows; the operand register differs.
             let inv_row = |b: &mut AB, sel: AB::Expr, operand: usize| {
                 for k in 0..4 {
-                    b.assert_zero(sel.clone() * (cv(ADD_OFF + 8 + k) - cv(operand + k)));
-                    b.assert_zero(sel.clone() * (cv(ADD_OFF + 4 + k) - cv(XREG + k)));
-                    b.assert_zero(sel.clone() * (cv(MUL_OFF + k) - cv(ADD_OFF + k)));
-                    b.assert_zero(sel.clone() * (cv(MUL_OFF + 8 + k) - one_k(k)));
+                    b.assert_zero(sel.clone() * (cv(self.layout.add_off + 8 + k) - cv(operand + k)));
+                    b.assert_zero(sel.clone() * (cv(self.layout.add_off + 4 + k) - cv(self.layout.xreg + k)));
+                    b.assert_zero(sel.clone() * (cv(self.layout.mul_off + k) - cv(self.layout.add_off + k)));
+                    b.assert_zero(sel.clone() * (cv(self.layout.mul_off + 8 + k) - one_k(k)));
                 }
             };
-            inv_row(builder, msel_i.clone() * sf(0), CHAL + 4 * G_ZETA);
-            inv_row(builder, msel_i.clone() * sf(1), ZNREG);
-            // Capture the inverse witnesses (mul_b) into INVZ / INVZN.
+            inv_row(builder, msel_i.clone() * sf(0), self.layout.chal + 4 * G_ZETA);
+            inv_row(builder, msel_i.clone() * sf(1), self.layout.znreg);
+            // Capture the inverse witnesses (mul_b) into self.layout.invz / self.layout.invzn.
             let cap_z = msel_i.clone() * sf(0);
             let cap_zn = msel_i * sf(1);
             let mut t = builder.when_transition();
             for k in 0..4 {
-                t.assert_zero(cap_z.clone() * (nv(INVZ + k) - cv(MUL_OFF + 4 + k)));
-                t.assert_zero((AB::Expr::ONE - cap_z.clone()) * (nv(INVZ + k) - cv(INVZ + k)));
-                t.assert_zero(cap_zn.clone() * (nv(INVZN + k) - cv(MUL_OFF + 4 + k)));
-                t.assert_zero((AB::Expr::ONE - cap_zn.clone()) * (nv(INVZN + k) - cv(INVZN + k)));
+                t.assert_zero(cap_z.clone() * (nv(self.layout.invz + k) - cv(self.layout.mul_off + 4 + k)));
+                t.assert_zero((AB::Expr::ONE - cap_z.clone()) * (nv(self.layout.invz + k) - cv(self.layout.invz + k)));
+                t.assert_zero(cap_zn.clone() * (nv(self.layout.invzn + k) - cv(self.layout.mul_off + 4 + k)));
+                t.assert_zero((AB::Expr::ONE - cap_zn.clone()) * (nv(self.layout.invzn + k) - cv(self.layout.invzn + k)));
             }
         }
 
         // =====================================================================
-        // ZN / FA2 global relations (inc-4): rather than locate the trailer
+        // ZN / self.layout.fa2 global relations (inc-4): rather than locate the trailer
         // perm where the witness computes them, pin them directly on every
         // query row (phq) where they are consumed (M_INV, M_RO): ZN =
-        // zeta·g_trace (base scalar mult, deg 1) and FA2 = fri_alpha² (ext
+        // zeta·g_trace (base scalar mult, deg 1) and self.layout.fa2 = fri_alpha² (ext
         // square, deg 2). Both challenges are bound (Stage D/F), so this also
-        // completes INVZN's soundness (M_INV r=1 now uses a pinned ZN).
+        // completes self.layout.invzn's soundness (M_INV r=1 now uses a pinned ZN).
         // =====================================================================
         {
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
             for k in 0..4 {
                 builder.assert_zero(
-                    phq.clone() * (cv(ZNREG + k) - cn(self.consts.g_trace) * cv(CHAL + 4 * G_ZETA + k)),
+                    phq.clone() * (cv(self.layout.znreg + k) - cn(self.consts.g_trace) * cv(self.layout.chal + 4 * G_ZETA + k)),
                 );
                 builder.assert_zero(
                     phq.clone()
-                        * (cv(FA2 + k) - extmul(CHAL + 4 * G_FRIALPHA, CHAL + 4 * G_FRIALPHA, k)),
+                        * (cv(self.layout.fa2 + k) - extmul(self.layout.chal + 4 * G_FRIALPHA, self.layout.chal + 4 * G_FRIALPHA, k)),
                 );
             }
         }
 
         // =====================================================================
-        // M_S s-chains + INV2S (inc-4): per fold round rf, s = ∏_{r<lf}
-        // (sk[rf][r] if idx-bit (CUM[rf+1]+r) else 1) via a mul-bank chain
-        // (rows 0..lf-1, a starts at ONE); then row lf pins INV2S = 1/(2s) via
+        // M_S s-chains + self.layout.inv2s (inc-4): per fold round rf, s = ∏_{r<lf}
+        // (sk[rf][r] if idx-bit (self.shape.cum()[rf+1]+r) else 1) via a mul-bank chain
+        // (rows 0..lf-1, a starts at ONE); then row lf pins self.layout.inv2s = 1/(2s) via
         // mul(2s, inv2s) == 1, where mul_a(lf) = 2·mul_c(lf-1). lf per round =
         // [18,14,10,8]. Native. The mul_b mux hits deg 4 (fold-arith budget).
         // =====================================================================
         {
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
-            let lfs = [18usize, 14, 10, 8];
-            let capture: Vec<(AB::Expr, usize)> = (0..4)
-                .map(|rf| (cv(MSEL + M_S0 as usize + rf) * sf(lfs[rf]), lfs[rf]))
+            let n = self.shape.n_fri_rounds();
+            let lfs = self.shape.lf();
+            let capture: Vec<(AB::Expr, usize)> = (0..n)
+                .map(|rf| (cv(self.layout.msel + self.shape.m_s(rf) as usize) * sf(lfs[rf]), lfs[rf]))
                 .collect();
-            for rf in 0..4 {
+            for rf in 0..n {
                 let lf = lfs[rf];
-                let msel = cv(MSEL + M_S0 as usize + rf);
+                let msel = cv(self.layout.msel + self.shape.m_s(rf) as usize);
                 let not_lf = AB::Expr::ONE - sf(lf);
                 // Materialized chain gate SNL_rf = msel * (1 - sf(lf)) keeps the
                 // b-mux binding below deg <= 3 (target is deg 2).
-                builder.assert_eq(cv(SNL + rf), msel.clone() * not_lf.clone());
-                let snl = cv(SNL + rf);
+                builder.assert_eq(cv(self.layout.snl + rf), msel.clone() * not_lf.clone());
+                let snl = cv(self.layout.snl + rf);
                 // mul_b limb0 = 1 + idx-bit·(sk-1) on chain rows (0 on row lf).
                 let mut target = AB::Expr::ZERO;
                 for r in 0..lf {
                     target = target
                         + sf(r)
                             * (AB::Expr::ONE
-                                + cv(IDXB + CUM[rf + 1] + r) * (cn(self.consts.sk[rf][r]) - AB::Expr::ONE));
+                                + cv(self.layout.idxb + self.shape.cum()[rf + 1] + r) * (cn(self.consts.sk[rf][r]) - AB::Expr::ONE));
                 }
-                builder.assert_zero(snl.clone() * (cv(MUL_OFF + 4) - target));
+                builder.assert_zero(snl.clone() * (cv(self.layout.mul_off + 4) - target));
                 for k in 1..4 {
-                    builder.assert_zero(snl.clone() * cv(MUL_OFF + 4 + k));
+                    builder.assert_zero(snl.clone() * cv(self.layout.mul_off + 4 + k));
                 }
                 // mul_a at chain row 0 = ONE.
-                builder.assert_zero(msel.clone() * sf(0) * (cv(MUL_OFF) - AB::Expr::ONE));
+                builder.assert_zero(msel.clone() * sf(0) * (cv(self.layout.mul_off) - AB::Expr::ONE));
                 for k in 1..4 {
-                    builder.assert_zero(msel.clone() * sf(0) * cv(MUL_OFF + k));
+                    builder.assert_zero(msel.clone() * sf(0) * cv(self.layout.mul_off + k));
                 }
                 // mul_c == ONE at row lf (2s · inv2s == 1).
-                builder.assert_zero(msel.clone() * sf(lf) * (cv(MUL_OFF + 8) - AB::Expr::ONE));
+                builder.assert_zero(msel.clone() * sf(lf) * (cv(self.layout.mul_off + 8) - AB::Expr::ONE));
                 for k in 1..4 {
-                    builder.assert_zero(msel.clone() * sf(lf) * cv(MUL_OFF + 8 + k));
+                    builder.assert_zero(msel.clone() * sf(lf) * cv(self.layout.mul_off + 8 + k));
                 }
             }
             let mut t = builder.when_transition();
-            for rf in 0..4 {
+            for rf in 0..n {
                 let lf = lfs[rf];
-                let msel = cv(MSEL + M_S0 as usize + rf);
+                let msel = cv(self.layout.msel + self.shape.m_s(rf) as usize);
                 let chain = (0..lf.saturating_sub(1)).map(&sf).fold(AB::Expr::ZERO, |a, e| a + e);
                 for k in 0..4 {
                     // Plain chain rows 0..lf-2: next mul_a == this mul_c.
-                    t.assert_zero(msel.clone() * chain.clone() * (nv(MUL_OFF + k) - cv(MUL_OFF + 8 + k)));
+                    t.assert_zero(msel.clone() * chain.clone() * (nv(self.layout.mul_off + k) - cv(self.layout.mul_off + 8 + k)));
                     // Row lf-1 -> lf: mul_a(lf) == 2 · mul_c(lf-1).
                     t.assert_zero(
                         msel.clone()
                             * sf(lf - 1)
-                            * (nv(MUL_OFF + k) - cv(MUL_OFF + 8 + k) * AB::Expr::from(AB::F::TWO)),
+                            * (nv(self.layout.mul_off + k) - cv(self.layout.mul_off + 8 + k) * AB::Expr::from(AB::F::TWO)),
                     );
                 }
             }
-            // INV2S capture: mul_b at each round's row lf; carry otherwise.
+            // self.layout.inv2s capture: mul_b at each round's row lf; carry otherwise.
             let cap_any = capture.iter().fold(AB::Expr::ZERO, |a, (e, _)| a + e.clone());
             for k in 0..4 {
                 for (sel, _) in &capture {
-                    t.assert_zero(sel.clone() * (nv(INV2S + k) - cv(MUL_OFF + 4 + k)));
+                    t.assert_zero(sel.clone() * (nv(self.layout.inv2s + k) - cv(self.layout.mul_off + 4 + k)));
                 }
-                t.assert_zero((AB::Expr::ONE - cap_any.clone()) * (nv(INV2S + k) - cv(INV2S + k)));
+                t.assert_zero((AB::Expr::ONE - cap_any.clone()) * (nv(self.layout.inv2s + k) - cv(self.layout.inv2s + k)));
             }
         }
 
         // =====================================================================
-        // M_B BREG ladder (inc-4): per fold round rf, breg[0] = beta·inv2s
-        // (r=0), then breg[l] = 2·breg[l-1]² (r=1..la-1). la = LOG_ARITIES =
-        // [4,4,4,2]. beta = CHAL[G_BETA0+rf] and INV2S are both bound, so the
+        // M_B self.layout.breg ladder (inc-4): per fold round rf, breg[0] = beta·inv2s
+        // (r=0), then breg[l] = 2·breg[l-1]² (r=1..la-1). la = self.shape.log_arities =
+        // [4,4,4,2]. beta = self.layout.chal[G_BETA0+rf] and self.layout.inv2s are both bound, so the
         // ladder is fully pinned. Native. mul_a/mul_b are the operands; the
-        // product mul_c is captured into BREG (with the ×2 for l>0).
+        // product mul_c is captured into self.layout.breg (with the ×2 for l>0).
         // =====================================================================
         {
+            let n = self.shape.n_fri_rounds();
             // Same-row operand bindings.
-            for rf in 0..4 {
-                let la = LOG_ARITIES[rf];
-                let msel = cv(MSEL + M_B0 as usize + rf);
+            for rf in 0..n {
+                let la = self.shape.log_arities[rf];
+                let msel = cv(self.layout.msel + self.shape.m_b(rf) as usize);
                 for k in 0..4 {
-                    // r=0: mul_a = beta_rf, mul_b = INV2S.
+                    // r=0: mul_a = beta_rf, mul_b = self.layout.inv2s.
                     builder.assert_zero(
-                        msel.clone() * sf(0) * (cv(MUL_OFF + k) - cv(CHAL + 4 * (G_BETA0 + rf) + k)),
+                        msel.clone() * sf(0) * (cv(self.layout.mul_off + k) - cv(self.layout.chal + 4 * (G_BETA0 + rf) + k)),
                     );
-                    builder.assert_zero(msel.clone() * sf(0) * (cv(MUL_OFF + 4 + k) - cv(INV2S + k)));
+                    builder.assert_zero(msel.clone() * sf(0) * (cv(self.layout.mul_off + 4 + k) - cv(self.layout.inv2s + k)));
                     // r=1..la-1: mul_a = mul_b = breg[r-1].
                     for r in 1..la {
                         builder.assert_zero(
-                            msel.clone() * sf(r) * (cv(MUL_OFF + k) - cv(BREG + 4 * (r - 1) + k)),
+                            msel.clone() * sf(r) * (cv(self.layout.mul_off + k) - cv(self.layout.breg + 4 * (r - 1) + k)),
                         );
                         builder.assert_zero(
-                            msel.clone() * sf(r) * (cv(MUL_OFF + 4 + k) - cv(BREG + 4 * (r - 1) + k)),
+                            msel.clone() * sf(r) * (cv(self.layout.mul_off + 4 + k) - cv(self.layout.breg + 4 * (r - 1) + k)),
                         );
                     }
                 }
@@ -2001,38 +3177,38 @@ where
             let mut t = builder.when_transition();
             for l in 0..4 {
                 // Rounds that actually produce level l (l < la_rf).
-                let cap = (0..4)
-                    .filter(|&rf| l < LOG_ARITIES[rf])
-                    .map(|rf| cv(MSEL + M_B0 as usize + rf) * sf(l))
+                let cap = (0..n)
+                    .filter(|&rf| l < self.shape.log_arities[rf])
+                    .map(|rf| cv(self.layout.msel + self.shape.m_b(rf) as usize) * sf(l))
                     .fold(AB::Expr::ZERO, |a, e| a + e);
                 for k in 0..4 {
                     let want = if l == 0 {
-                        cv(MUL_OFF + 8 + k)
+                        cv(self.layout.mul_off + 8 + k)
                     } else {
-                        two.clone() * cv(MUL_OFF + 8 + k)
+                        two.clone() * cv(self.layout.mul_off + 8 + k)
                     };
                     t.assert_zero(
-                        cap.clone() * (nv(BREG + 4 * l + k) - want.clone())
-                            + (AB::Expr::ONE - cap.clone()) * (nv(BREG + 4 * l + k) - cv(BREG + 4 * l + k)),
+                        cap.clone() * (nv(self.layout.breg + 4 * l + k) - want.clone())
+                            + (AB::Expr::ONE - cap.clone()) * (nv(self.layout.breg + 4 * l + k) - cv(self.layout.breg + 4 * l + k)),
                     );
                 }
             }
         }
 
         // =====================================================================
-        // Fold arithmetic — round-0 leaf fold + HIT + fold-leaf consistency
-        // (inc-4). v = the fold leaf value ext(ASM0,ASM1,W0C,W1C). PBUF holds
-        // the even leaf; on the odd leaf SCR[i] = (pbuf+v)·half +
-        // breg[0]·kf[rf][0][i]·(pbuf-v). HIT = [VC == GPB] (one-hot dot with
-        // the GPB bit pattern, materialized deg 5 so the consistency stays
-        // deg 3): at the index-in-group leaf, v == RUNEV — the FRI fold
-        // consistency tying RUNEV to the sponge-bound openings.
+        // Fold arithmetic — round-0 leaf fold + self.layout.hit + fold-leaf consistency
+        // (inc-4). v = the fold leaf value ext(self.layout.asm0,self.layout.asm1,self.layout.w0c,self.layout.w1c). self.layout.pbuf holds
+        // the even leaf; on the odd leaf self.layout.scr[i] = (pbuf+v)·half +
+        // breg[0]·kf[rf][0][i]·(pbuf-v). self.layout.hit = [self.layout.vc == self.layout.gpb] (one-hot dot with
+        // the self.layout.gpb bit pattern, materialized deg 5 so the consistency stays
+        // deg 3): at the index-in-group leaf, v == self.layout.runev — the FRI fold
+        // consistency tying self.layout.runev to the sponge-bound openings.
         // =====================================================================
         {
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
-            let vexpr = [cv(ASM0), cv(ASM1), cv(W0C), cv(W1C)];
-            // GPB one-hot decode split into 2-bit pair products so HIT stays
-            // deg 3: GLO[j] = pair(GPB0,GPB1); GHI[j] = pair(GPB2,GPB3).
+            let vexpr = [cv(self.layout.asm0), cv(self.layout.asm1), cv(self.layout.w0c), cv(self.layout.w1c)];
+            // self.layout.gpb one-hot decode split into 2-bit pair products so self.layout.hit stays
+            // deg 3: self.layout.glo[j] = pair(GPB0,GPB1); self.layout.ghi[j] = pair(GPB2,GPB3).
             let gbit = |col: usize, on: bool| -> AB::Expr {
                 if on {
                     cv(col)
@@ -2041,19 +3217,19 @@ where
                 }
             };
             for j in 0..4 {
-                builder.assert_eq(cv(GLO + j), gbit(GPB, j & 1 == 1) * gbit(GPB + 1, j & 2 == 2));
+                builder.assert_eq(cv(self.layout.glo + j), gbit(self.layout.gpb, j & 1 == 1) * gbit(self.layout.gpb + 1, j & 2 == 2));
                 builder
-                    .assert_eq(cv(GHI + j), gbit(GPB + 2, j & 1 == 1) * gbit(GPB + 3, j & 2 == 2));
+                    .assert_eq(cv(self.layout.ghi + j), gbit(self.layout.gpb + 2, j & 1 == 1) * gbit(self.layout.gpb + 3, j & 2 == 2));
             }
-            // HIT = sum_s VC[s] · GLO[s&3] · GHI[(s>>2)&3]  (deg 3).
+            // self.layout.hit = sum_s self.layout.vc[s] · self.layout.glo[s&3] · self.layout.ghi[(s>>2)&3]  (deg 3).
             let mut hit = AB::Expr::ZERO;
             for s in 0..16usize {
-                hit = hit + cv(VC + s) * cv(GLO + (s & 3)) * cv(GHI + ((s >> 2) & 3));
+                hit = hit + cv(self.layout.vc + s) * cv(self.layout.glo + (s & 3)) * cv(self.layout.ghi + ((s >> 2) & 3));
             }
-            builder.assert_eq(cv(HIT), hit);
-            // Fold-leaf consistency: at the index-in-group leaf, v == RUNEV.
+            builder.assert_eq(cv(self.layout.hit), hit);
+            // Fold-leaf consistency: at the index-in-group leaf, v == self.layout.runev.
             for k in 0..4 {
-                builder.assert_zero(cv(CONSF) * cv(HIT) * (vexpr[k].clone() - cv(RUNEV + k)));
+                builder.assert_zero(cv(self.layout.consf) * cv(self.layout.hit) * (vexpr[k].clone() - cv(self.layout.runev + k)));
             }
             // ext-mul of a column-vector (a_off) and an expr-vector (be).
             let extmul_ce = |a_off: usize, be: &[AB::Expr; 4], k: usize| -> AB::Expr {
@@ -2071,51 +3247,51 @@ where
                 acc
             };
             let pmv = [
-                cv(PBUF) - vexpr[0].clone(),
-                cv(PBUF + 1) - vexpr[1].clone(),
-                cv(PBUF + 2) - vexpr[2].clone(),
-                cv(PBUF + 3) - vexpr[3].clone(),
+                cv(self.layout.pbuf) - vexpr[0].clone(),
+                cv(self.layout.pbuf + 1) - vexpr[1].clone(),
+                cv(self.layout.pbuf + 2) - vexpr[2].clone(),
+                cv(self.layout.pbuf + 3) - vexpr[3].clone(),
             ];
             let half = cn(self.consts.half);
-            // BPM = extmul(BREG, PBUF - v): the round-0 fold's BREG·(pbuf-v) ext
+            // self.layout.bpm = extmul(self.layout.breg, self.layout.pbuf - v): the round-0 fold's self.layout.breg·(pbuf-v) ext
             // product, so `computed` below is deg 1 (kept out of the gate).
             for k in 0..4 {
-                builder.assert_eq(cv(BPM + k), extmul_ce(BREG, &pmv, k));
+                builder.assert_eq(cv(self.layout.bpm + k), extmul_ce(self.layout.breg, &pmv, k));
             }
-            // GF_rf = CONSF * DRND[2+rf]: round-0 gate prefix (gate = GF * VC).
-            for rf in 0..4 {
-                builder.assert_eq(cv(GF + rf), cv(CONSF) * cv(DRND + 2 + rf));
+            // GF_rf = self.layout.consf * self.layout.drnd[2+rf]: round-0 gate prefix (gate = self.layout.gf * self.layout.vc).
+            for rf in 0..self.shape.n_fri_rounds() {
+                builder.assert_eq(cv(self.layout.gf + rf), cv(self.layout.consf) * cv(self.layout.drnd + 2 + rf));
             }
             let mut t = builder.when_transition();
-            // PBUF capture on even fold-value rows (CONSF·VCE); carry otherwise.
+            // self.layout.pbuf capture on even fold-value rows (self.layout.consf·self.layout.vce); carry otherwise.
             for k in 0..4 {
-                let cap = cv(CONSF) * cv(VCE);
+                let cap = cv(self.layout.consf) * cv(self.layout.vce);
                 t.assert_zero(
-                    cap.clone() * (nv(PBUF + k) - vexpr[k].clone())
-                        + (AB::Expr::ONE - cap) * (nv(PBUF + k) - cv(PBUF + k)),
+                    cap.clone() * (nv(self.layout.pbuf + k) - vexpr[k].clone())
+                        + (AB::Expr::ONE - cap) * (nv(self.layout.pbuf + k) - cv(self.layout.pbuf + k)),
                 );
             }
-            // Round-0 SCR fold on odd fold-value rows (per round rf, pair i).
-            // gate = GF[rf]*VC[2i+1] (deg 2); computed deg 1 via BPM -> deg 3.
-            for rf in 0..4 {
-                let la = LOG_ARITIES[rf];
+            // Round-0 self.layout.scr fold on odd fold-value rows (per round rf, pair i).
+            // gate = self.layout.gf[rf]*self.layout.vc[2i+1] (deg 2); computed deg 1 via self.layout.bpm -> deg 3.
+            for rf in 0..self.shape.n_fri_rounds() {
+                let la = self.shape.log_arities[rf];
                 for i in 0..(1usize << (la - 1)) {
-                    let gate = cv(GF + rf) * cv(VC + 2 * i + 1);
+                    let gate = cv(self.layout.gf + rf) * cv(self.layout.vc + 2 * i + 1);
                     let kf = cn(self.consts.kf[rf][0][i]);
                     for k in 0..4 {
                         let computed =
-                            half.clone() * (cv(PBUF + k) + vexpr[k].clone()) + kf.clone() * cv(BPM + k);
-                        t.assert_zero(gate.clone() * (nv(SCR + 4 * i + k) - computed));
+                            half.clone() * (cv(self.layout.pbuf + k) + vexpr[k].clone()) + kf.clone() * cv(self.layout.bpm + k);
+                        t.assert_zero(gate.clone() * (nv(self.layout.scr + 4 * i + k) - computed));
                     }
                 }
             }
         }
 
         // =====================================================================
-        // M_FHI higher-round folds + RUNEV threading (inc-4). Per round rf,
+        // M_FHI higher-round folds + self.layout.runev threading (inc-4). Per round rf,
         // fold levels 1..: outv = (scr[2i]+scr[2i+1])·half +
-        // breg[l]·kf[rf][l][i]·(scr[2i]−scr[2i+1]), written to SCR[i] (or RUNEV
-        // on the last pair). RUNEV is set at each M_FHI last row and at M_RO
+        // breg[l]·kf[rf][l][i]·(scr[2i]−scr[2i+1]), written to self.layout.scr[i] (or self.layout.runev
+        // on the last pair). self.layout.runev is set at each M_FHI last row and at M_RO
         // r=8 (below), and carries elsewhere — so a flip anywhere breaks the
         // carry or a capture (closes bad_fold together with the leaf
         // consistency and M_RO).
@@ -2138,36 +3314,47 @@ where
                 }
                 acc
             };
-            let pairs3: [(usize, usize); 7] =
-                [(1, 0), (1, 1), (1, 2), (1, 3), (2, 0), (2, 1), (3, 0)];
+            let n = self.shape.n_fri_rounds();
+            // The (level, pair) fold schedule of an arity-2^la round: level l has
+            // 2^(la-1-l) pairs, for l = 1..la (level 0 is the round-0 leaf fold).
+            // la=4 -> [(1,0..3),(2,0..1),(3,0)] (=pairs3); la=2 -> [(1,0)].
+            let fold_pairs = |la: usize| -> Vec<(usize, usize)> {
+                let mut v = vec![];
+                for l in 1..la {
+                    for i in 0..(1usize << (la - 1 - l)) {
+                        v.push((l, i));
+                    }
+                }
+                v
+            };
             // Materialize the per-(round,row) M_FHI fold gate (global, deg 2).
-            for rf in 0..4 {
-                let npairs = if rf < 3 { 7 } else { 1 };
+            for rf in 0..n {
+                let npairs = (1usize << (self.shape.log_arities[rf] - 1)) - 1;
                 for r in 0..npairs {
                     builder.assert_eq(
-                        cv(FHG + fhg_index(rf, r)),
-                        cv(MSEL + M_FHI0 as usize + rf) * sf(r),
+                        cv(self.layout.fhg + fhg_index(&self.shape.log_arities, rf, r)),
+                        cv(self.layout.msel + self.shape.m_fhi(rf) as usize) * sf(r),
                     );
                 }
             }
-            let mut update = AB::Expr::ZERO; // rows where RUNEV is (re)written
+            let mut update = AB::Expr::ZERO; // rows where self.layout.runev is (re)written
             let mut t = builder.when_transition();
-            for rf in 0..4 {
-                let msel = cv(MSEL + M_FHI0 as usize + rf);
-                let pairs: &[(usize, usize)] = if rf < 3 { &pairs3 } else { &[(1, 0)] };
+            for rf in 0..n {
+                let msel = cv(self.layout.msel + self.shape.m_fhi(rf) as usize);
+                let pairs = fold_pairs(self.shape.log_arities[rf]);
                 let last = pairs.len() - 1;
                 for (r, &(l, i)) in pairs.iter().enumerate() {
-                    // FHG = msel_rf * sf(r) (materialized above, deg 1) so
+                    // self.layout.fhg = msel_rf * sf(r) (materialized above, deg 1) so
                     // gate*computed (computed deg 2) stays deg 3.
-                    let gate = cv(FHG + fhg_index(rf, r));
+                    let gate = cv(self.layout.fhg + fhg_index(&self.shape.log_arities, rf, r));
                     let _ = &msel;
-                    let lo = SCR + 4 * (2 * i);
-                    let hi = SCR + 4 * (2 * i + 1);
+                    let lo = self.layout.scr + 4 * (2 * i);
+                    let hi = self.layout.scr + 4 * (2 * i + 1);
                     let kf = cn(self.consts.kf[rf][l][i]);
-                    let target = if r == last { RUNEV } else { SCR + 4 * i };
+                    let target = if r == last { self.layout.runev } else { self.layout.scr + 4 * i };
                     for k in 0..4 {
                         let computed = half.clone() * (cv(lo + k) + cv(hi + k))
-                            + kf.clone() * extmul_cc(BREG + 4 * l, lo, hi, k);
+                            + kf.clone() * extmul_cc(self.layout.breg + 4 * l, lo, hi, k);
                         t.assert_zero(gate.clone() * (nv(target + k) - computed));
                     }
                     if r == last {
@@ -2175,30 +3362,30 @@ where
                     }
                 }
             }
-            // RUNEV also updates at M_RO r=8 (its capture is in the M_RO block).
-            update = update + cv(MSEL + M_RO as usize) * sf(8);
-            // RUNEV carries on every non-update transition.
+            // self.layout.runev also updates at M_RO r=8 (its capture is in the M_RO block).
+            update = update + cv(self.layout.msel + M_RO as usize) * sf(8);
+            // self.layout.runev carries on every non-update transition.
             for k in 0..4 {
-                t.assert_zero((AB::Expr::ONE - update.clone()) * (nv(RUNEV + k) - cv(RUNEV + k)));
+                t.assert_zero((AB::Expr::ONE - update.clone()) * (nv(self.layout.runev + k) - cv(self.layout.runev + k)));
             }
         }
 
         // =====================================================================
-        // PZACC / PREG accumulation (endpoint pin, START foundation). The
+        // self.layout.pzacc / self.layout.preg accumulation (endpoint pin, START foundation). The
         // reduced-opening numerator accumulates along two mutually-exclusive
         // paths (dup vs query phase), both binding pzacc/preg to the opened
         // values so M_RO's `ro` is value-pinned:
-        //   - dup zeta-value rows (CONSZ = CZD·POS1): pzacc += preg·v,
-        //     preg *= fri_alpha, with v = ext(ASM0,ASM1,W0C,W1C) (deg 3).
-        //   - query PX rows (CX0, optionally CX1): pzacc += preg·W0C (word 0)
-        //     and, when CX1 (implies CX0), += (preg·fri_alpha)·W1C (word 1);
-        //     preg *= fri_alpha (one word) or fri_alpha² (two words). PREGA =
+        //   - dup zeta-value rows (self.layout.consz = self.layout.czd·POS1): pzacc += preg·v,
+        //     preg *= fri_alpha, with v = ext(self.layout.asm0,self.layout.asm1,self.layout.w0c,self.layout.w1c) (deg 3).
+        //   - query PX rows (self.layout.cx0, optionally self.layout.cx1): pzacc += preg·self.layout.w0c (word 0)
+        //     and, when self.layout.cx1 (implies self.layout.cx0), += (preg·fri_alpha)·self.layout.w1c (word 1);
+        //     preg *= fri_alpha (one word) or fri_alpha² (two words). self.layout.prega =
         //     preg·fri_alpha is materialized so the word-1 term stays deg 3.
-        // FA2 = fri_alpha² is already bound (Stage D/F). CX1 ⊆ CX0, so
-        // CX0·(1-CX1) = CX0 - CX1.
+        // self.layout.fa2 = fri_alpha² is already bound (Stage D/F). self.layout.cx1 ⊆ self.layout.cx0, so
+        // self.layout.cx0·(1-self.layout.cx1) = self.layout.cx0 - self.layout.cx1.
         // =====================================================================
         {
-            // ext-mul of the contiguous PREG vector with an explicit column list.
+            // ext-mul of the contiguous self.layout.preg vector with an explicit column list.
             let extmul_cols = |a_off: usize, bcols: &[usize; 4], k: usize| -> AB::Expr {
                 let w = c(EXT_W);
                 let mut acc = AB::Expr::ZERO;
@@ -2213,38 +3400,38 @@ where
                 }
                 acc
             };
-            let vcols = [ASM0, ASM1, W0C, W1C];
-            let fa_off = CHAL + 4 * G_FRIALPHA;
-            // PREGA = preg·fri_alpha (materialized; filled in fill_derived).
+            let vcols = [self.layout.asm0, self.layout.asm1, self.layout.w0c, self.layout.w1c];
+            let fa_off = self.layout.chal + 4 * G_FRIALPHA;
+            // self.layout.prega = preg·fri_alpha (materialized; filled in fill_derived).
             for k in 0..4 {
-                builder.assert_eq(cv(PREGA + k), extmul(PREG, fa_off, k));
+                builder.assert_eq(cv(self.layout.prega + k), extmul(self.layout.preg, fa_off, k));
             }
-            let consz = cv(CONSZ);
-            let cx0 = cv(CX0);
-            let cx1 = cv(CX1);
-            // preg update gate: *fri_alpha when (CONSZ or CX0&!CX1); *fri_alpha²
-            // when CX1; carry otherwise.
+            let consz = cv(self.layout.consz);
+            let cx0 = cv(self.layout.cx0);
+            let cx1 = cv(self.layout.cx1);
+            // preg update gate: *fri_alpha when (self.layout.consz or self.layout.cx0&!self.layout.cx1); *fri_alpha²
+            // when self.layout.cx1; carry otherwise.
             let gate_fa = consz.clone() + cx0.clone() - cx1.clone();
-            // Leaf-start reset (same signal as the VC counter): at sf(23)·nv(LFS)
+            // Leaf-start reset (same signal as the self.layout.vc counter): at sf(23)·nv(self.layout.lfs)
             // pzacc->0, preg->ONE, starting the next query's PX accumulation.
             // The reset only fires on a perm's last row, where all accumulation
             // gates are 0, so it composes as an additive deg-3 correction.
             let mut t = builder.when_transition();
-            let reset = sf(23) * nv(LFS);
+            let reset = sf(23) * nv(self.layout.lfs);
             for k in 0..4 {
-                // pzacc += CONSZ·(preg·v) + CX0·preg·W0C + CX1·(preg·fa)·W1C.
-                let inc = consz.clone() * extmul_cols(PREG, &vcols, k)
-                    + cx0.clone() * cv(PREG + k) * cv(W0C)
-                    + cx1.clone() * cv(PREGA + k) * cv(W1C);
-                t.assert_zero(nv(PZACC + k) - cv(PZACC + k) - inc + reset.clone() * cv(PZACC + k));
-                // preg *= fri_alpha (gate_fa) or fri_alpha² (CX1); carry else.
+                // pzacc += self.layout.consz·(preg·v) + self.layout.cx0·preg·self.layout.w0c + self.layout.cx1·(preg·fa)·self.layout.w1c.
+                let inc = consz.clone() * extmul_cols(self.layout.preg, &vcols, k)
+                    + cx0.clone() * cv(self.layout.preg + k) * cv(self.layout.w0c)
+                    + cx1.clone() * cv(self.layout.prega + k) * cv(self.layout.w1c);
+                t.assert_zero(nv(self.layout.pzacc + k) - cv(self.layout.pzacc + k) - inc + reset.clone() * cv(self.layout.pzacc + k));
+                // preg *= fri_alpha (gate_fa) or fri_alpha² (self.layout.cx1); carry else.
                 let preg_reset = if k == 0 { AB::Expr::ONE } else { AB::Expr::ZERO };
                 t.assert_zero(
-                    nv(PREG + k)
-                        - cv(PREG + k)
-                        - gate_fa.clone() * (extmul(PREG, fa_off, k) - cv(PREG + k))
-                        - cx1.clone() * (extmul(PREG, FA2, k) - cv(PREG + k))
-                        + reset.clone() * (cv(PREG + k) - preg_reset),
+                    nv(self.layout.preg + k)
+                        - cv(self.layout.preg + k)
+                        - gate_fa.clone() * (extmul(self.layout.preg, fa_off, k) - cv(self.layout.preg + k))
+                        - cx1.clone() * (extmul(self.layout.preg, self.layout.fa2, k) - cv(self.layout.preg + k))
+                        + reset.clone() * (cv(self.layout.preg + k) - preg_reset),
                 );
             }
         }
@@ -2253,105 +3440,114 @@ where
         // Reduced-opening captures (endpoint pin, START). At fixed transcript
         // positions the running pzacc/preg are snapshotted into the A/P/PX0
         // registers that M_RO consumes; carry otherwise. Capture rows map to
-        // existing comparators (dup block 72 = CMPA, 145 = CMPB, 147 = BLKLAST;
-        // trace-leaf end = RSEL[R_ABS_C5]). CPA/CPB/CPL = PHD·comparator keep
+        // existing comparators (dup block_A0 = self.layout.cmpa, block_A1 = self.layout.cmpb, last
+        // block N-1 = self.layout.blklast; narrow 72/145/147; trace-leaf end =
+        // self.layout.rsel[R_ABS_C5]). self.layout.cpa/self.layout.cpb/self.layout.cpl = self.layout.phd·comparator keep
         // the gates deg 2. The captured value is the pre-consume pzacc = cv().
         // =====================================================================
         {
-            builder.assert_eq(cv(CPA), cv(PHD) * cv(CMPA));
-            builder.assert_eq(cv(CPB), cv(PHD) * cv(CMPB));
-            builder.assert_eq(cv(CPL), cv(PHD) * cv(BLKLAST));
-            let ga0 = cv(CPA) * sf(14);
-            let ga1 = cv(CPB) * sf(7);
-            let ga2 = cv(CPL) * sf(5);
-            let gpx = cv(RSEL + R_ABS_C5 as usize) * sf(3);
+            builder.assert_eq(cv(self.layout.cpa), cv(self.layout.phd) * cv(self.layout.cmpa));
+            builder.assert_eq(cv(self.layout.cpb), cv(self.layout.phd) * cv(self.layout.cmpb));
+            builder.assert_eq(cv(self.layout.cpl), cv(self.layout.phd) * cv(self.layout.blklast));
+            // Capture rows: the row-in-perm of each group boundary (shape-
+            // derived). Narrow reproduces sf(14)/sf(7)/sf(5).
+            let dcap = self.shape.dup_captures();
+            let ga0 = cv(self.layout.cpa) * sf(dcap[0].1);
+            let ga1 = cv(self.layout.cpb) * sf(dcap[1].1);
+            let ga2 = cv(self.layout.cpl) * sf(dcap[2].1);
+            // PX0 (trace-leaf end) capture: pzacc snapshotted the row AFTER the
+            // trace leaf's last fresh word is consumed. The C5 block consumes
+            // 2 words/row, so its last consume is row ceil(f/2)-1 and the
+            // capture sits at ceil(f/2) = (f+1)/2. Narrow f=5 → row 3 (as
+            // before); wide f=22 → row 11.
+            let gpx = cv(self.layout.rsel + R_ABS_C5 as usize) * sf((self.shape.trace_last_fresh() + 1) / 2);
             let mut t = builder.when_transition();
             for k in 0..4 {
-                t.assert_zero(nv(A0R + k) - cv(A0R + k) - ga0.clone() * (cv(PZACC + k) - cv(A0R + k)));
-                t.assert_zero(nv(P0R + k) - cv(P0R + k) - ga0.clone() * (cv(PREG + k) - cv(P0R + k)));
-                t.assert_zero(nv(A1R + k) - cv(A1R + k) - ga1.clone() * (cv(PZACC + k) - cv(A1R + k)));
-                t.assert_zero(nv(P1R + k) - cv(P1R + k) - ga1.clone() * (cv(PREG + k) - cv(P1R + k)));
-                t.assert_zero(nv(A2R + k) - cv(A2R + k) - ga2.clone() * (cv(PZACC + k) - cv(A2R + k)));
+                t.assert_zero(nv(self.layout.a0r + k) - cv(self.layout.a0r + k) - ga0.clone() * (cv(self.layout.pzacc + k) - cv(self.layout.a0r + k)));
+                t.assert_zero(nv(self.layout.p0r + k) - cv(self.layout.p0r + k) - ga0.clone() * (cv(self.layout.preg + k) - cv(self.layout.p0r + k)));
+                t.assert_zero(nv(self.layout.a1r + k) - cv(self.layout.a1r + k) - ga1.clone() * (cv(self.layout.pzacc + k) - cv(self.layout.a1r + k)));
+                t.assert_zero(nv(self.layout.p1r + k) - cv(self.layout.p1r + k) - ga1.clone() * (cv(self.layout.preg + k) - cv(self.layout.p1r + k)));
+                t.assert_zero(nv(self.layout.a2r + k) - cv(self.layout.a2r + k) - ga2.clone() * (cv(self.layout.pzacc + k) - cv(self.layout.a2r + k)));
                 t.assert_zero(
-                    nv(PX0R + k) - cv(PX0R + k) - gpx.clone() * (cv(PZACC + k) - cv(PX0R + k)),
+                    nv(self.layout.px0r + k) - cv(self.layout.px0r + k) - gpx.clone() * (cv(self.layout.pzacc + k) - cv(self.layout.px0r + k)),
                 );
             }
         }
 
         // =====================================================================
-        // Final-poly capture + M_HORN Horner (endpoint pin, END). FPREG holds
-        // the 16 final-poly coefficients, captured from the CZ7 value rows
-        // (transcript-bound), indexed by the FPI one-hot counter. M_HORN then
-        // evaluates the poly at XFIN by Horner and pins the result to RUNEV —
+        // Final-poly capture + M_HORN Horner (endpoint pin, END). self.layout.fpreg holds
+        // the 16 final-poly coefficients, captured from the self.layout.cz7 value rows
+        // (transcript-bound), indexed by the self.layout.fpi one-hot counter. M_HORN then
+        // evaluates the poly at self.layout.xfin by Horner and pins the result to self.layout.runev —
         // tying the *end* of the fold chain to the transcript's final poly.
         // =====================================================================
         {
             let cn = |x: Val| AB::Expr::from(AB::F::from_u32(x.as_canonical_u32()));
             let _ = cn;
-            // CONSZ7 = CZ7 · POS1.
-            builder.assert_eq(cv(CONSZ7), cv(CZ7) * cv(POS + 1));
-            // FPI one-hot: bool, sum==1, first-row slot 0, +1 rotate on CONSZ7.
+            // self.layout.consz7 = self.layout.cz7 · POS1.
+            builder.assert_eq(cv(self.layout.consz7), cv(self.layout.cz7) * cv(self.layout.pos + 1));
+            // self.layout.fpi one-hot: bool, sum==1, first-row slot 0, +1 rotate on self.layout.consz7.
             for i in 0..16 {
-                builder.assert_bool(cv(FPI + i));
+                builder.assert_bool(cv(self.layout.fpi + i));
             }
             builder.assert_eq(
-                (0..16).map(|i| cv(FPI + i)).fold(AB::Expr::ZERO, |a, e| a + e),
+                (0..16).map(|i| cv(self.layout.fpi + i)).fold(AB::Expr::ZERO, |a, e| a + e),
                 AB::Expr::ONE,
             );
-            builder.when_first_row().assert_one(cv(FPI));
+            builder.assert_zero(cv(self.layout.csel) * (cv(self.layout.fpi) - AB::Expr::ONE));
             for i in 1..16 {
-                builder.when_first_row().assert_zero(cv(FPI + i));
+                builder.assert_zero(cv(self.layout.csel) * cv(self.layout.fpi + i));
             }
-            let vfp = [cv(ASM0), cv(ASM1), cv(W0C), cv(W1C)];
+            let vfp = [cv(self.layout.asm0), cv(self.layout.asm1), cv(self.layout.w0c), cv(self.layout.w1c)];
             {
                 let mut t = builder.when_transition();
                 for i in 0..16 {
                     t.assert_eq(
-                        nv(FPI + i),
-                        cv(FPI + i) + cv(CONSZ7) * (cv(FPI + (i + 15) % 16) - cv(FPI + i)),
+                        nv(self.layout.fpi + i),
+                        cv(self.layout.fpi + i) + cv(self.layout.consz7) * (cv(self.layout.fpi + (i + 15) % 16) - cv(self.layout.fpi + i)),
                     );
                 }
-                // FPREG[s] capture on the CONSZ7 row with FPI==s; carry else.
+                // self.layout.fpreg[s] capture on the self.layout.consz7 row with self.layout.fpi==s; carry else.
                 for s in 0..16 {
-                    let gate = cv(CONSZ7) * cv(FPI + s);
+                    let gate = cv(self.layout.consz7) * cv(self.layout.fpi + s);
                     for k in 0..4 {
                         t.assert_zero(
-                            nv(FPREG + 4 * s + k)
-                                - cv(FPREG + 4 * s + k)
-                                - gate.clone() * (vfp[k].clone() - cv(FPREG + 4 * s + k)),
+                            nv(self.layout.fpreg + 4 * s + k)
+                                - cv(self.layout.fpreg + 4 * s + k)
+                                - gate.clone() * (vfp[k].clone() - cv(self.layout.fpreg + 4 * s + k)),
                         );
                     }
                 }
             }
-            // M_HORN Horner: rows 0..14. mul_b = XFIN; mul_a = FPREG[15] (r0) or
+            // M_HORN Horner: rows 0..14. mul_b = self.layout.xfin; mul_a = self.layout.fpreg[15] (r0) or
             // the previous row's add output (threaded); add_a = mul_c; add_b =
-            // FPREG[14-r]; final add output (r14) == RUNEV.
-            let mh = cv(MSEL + M_HORN as usize);
+            // self.layout.fpreg[14-r]; final add output (r14) == self.layout.runev.
+            let mh = cv(self.layout.msel + self.shape.m_horn() as usize);
             let rge = |a: usize, b: usize| (a..=b).map(&sf).fold(AB::Expr::ZERO, |x, e| x + e);
             let rows_all = rge(0, 14);
             for k in 0..4 {
-                // mul_b = XFIN on all Horner rows.
-                builder.assert_zero(mh.clone() * rows_all.clone() * (cv(MUL_OFF + 4 + k) - cv(XFIN + k)));
-                // mul_a at r0 = FPREG[15].
-                builder.assert_zero(mh.clone() * sf(0) * (cv(MUL_OFF + k) - cv(FPREG + 60 + k)));
+                // mul_b = self.layout.xfin on all Horner rows.
+                builder.assert_zero(mh.clone() * rows_all.clone() * (cv(self.layout.mul_off + 4 + k) - cv(self.layout.xfin + k)));
+                // mul_a at r0 = self.layout.fpreg[15].
+                builder.assert_zero(mh.clone() * sf(0) * (cv(self.layout.mul_off + k) - cv(self.layout.fpreg + 60 + k)));
                 // add_a = mul_c (same row).
                 builder
-                    .assert_zero(mh.clone() * rows_all.clone() * (cv(ADD_OFF + k) - cv(MUL_OFF + 8 + k)));
-                // add_b = FPREG[14-r] (per-row mux, deg 3).
+                    .assert_zero(mh.clone() * rows_all.clone() * (cv(self.layout.add_off + k) - cv(self.layout.mul_off + 8 + k)));
+                // add_b = self.layout.fpreg[14-r] (per-row mux, deg 3).
                 for r in 0..15 {
                     builder.assert_zero(
-                        mh.clone() * sf(r) * (cv(ADD_OFF + 4 + k) - cv(FPREG + 4 * (14 - r) + k)),
+                        mh.clone() * sf(r) * (cv(self.layout.add_off + 4 + k) - cv(self.layout.fpreg + 4 * (14 - r) + k)),
                     );
                 }
-                // final Horner output == RUNEV.
-                builder.assert_zero(mh.clone() * sf(14) * (cv(ADD_OFF + 8 + k) - cv(RUNEV + k)));
+                // final Horner output == self.layout.runev.
+                builder.assert_zero(mh.clone() * sf(14) * (cv(self.layout.add_off + 8 + k) - cv(self.layout.runev + k)));
             }
             {
                 // Thread the accumulator: next row's mul_a == this row's add_c.
                 let mut t = builder.when_transition();
                 for k in 0..4 {
                     t.assert_zero(
-                        mh.clone() * rge(0, 13) * (nv(MUL_OFF + k) - cv(ADD_OFF + 8 + k)),
+                        mh.clone() * rge(0, 13) * (nv(self.layout.mul_off + k) - cv(self.layout.add_off + 8 + k)),
                     );
                 }
             }
@@ -2359,87 +3555,87 @@ where
 
         // =====================================================================
         // M_RO reduced-opening assembly (endpoint pin, START completion). The
-        // 9-row bank schedule assembles `ro` (the round -1 RUNEV) from the
+        // 9-row bank schedule assembles `ro` (the round -1 self.layout.runev) from the
         // pinned reduced-opening registers, tying the START of the fold chain
         // to the accumulated openings. NOTE the witness uses `bank_add_c(C,B)`
         // (subtractive: writes add_c=C, add_b=B, add_a=C-B, result = add_a) for
         // rows 2..6 and standard `bank_add(A,B)` for rows 7,8. Bank arithmetic
         // (mul_c=a·b, add_c=a+b) is already constrained; here we pin each row's
-        // known operands and thread the intermediates / SCR scratch. Dataflow:
-        //   r0 mul(P0R,PX0R)->SCR0      r1 mul(P1R,PZACC)->SCR1
-        //   r2 addc(A0R,PX0R)=g0; mul(g0,INVZ)->SCR2      [g0=add_a]
-        //   r3 addc(A1R,A0R)=m           [m=add_a -> add_c(r4)]
-        //   r4 addc(m,SCR0)=d1; mul(d1,INVZN)->SCR3       [d1=add_a]
-        //   r5 addc(A2R,A1R)=m           [m=add_a -> add_c(r6)]
-        //   r6 addc(m,SCR1)=d2; mul(d2,INVZ)->SCR4        [d2=add_a]
+        // known operands and thread the intermediates / self.layout.scr scratch. Dataflow:
+        //   r0 mul(self.layout.p0r,self.layout.px0r)->SCR0      r1 mul(self.layout.p1r,self.layout.pzacc)->SCR1
+        //   r2 addc(self.layout.a0r,self.layout.px0r)=g0; mul(g0,self.layout.invz)->SCR2      [g0=add_a]
+        //   r3 addc(self.layout.a1r,self.layout.a0r)=m           [m=add_a -> add_c(r4)]
+        //   r4 addc(m,SCR0)=d1; mul(d1,self.layout.invzn)->SCR3       [d1=add_a]
+        //   r5 addc(self.layout.a2r,self.layout.a1r)=m           [m=add_a -> add_c(r6)]
+        //   r6 addc(m,SCR1)=d2; mul(d2,self.layout.invz)->SCR4        [d2=add_a]
         //   r7 add(SCR2,SCR3)=m          [m=add_c -> add_a(r8)]
-        //   r8 add(m,SCR4)=ro -> RUNEV   [ro=add_c]
+        //   r8 add(m,SCR4)=ro -> self.layout.runev   [ro=add_c]
         // =====================================================================
         {
-            let mr = cv(MSEL + M_RO as usize);
-            let mul_a = |k: usize| cv(MUL_OFF + k);
-            let mul_b = |k: usize| cv(MUL_OFF + 4 + k);
-            let add_a = |k: usize| cv(ADD_OFF + k);
-            let add_b = |k: usize| cv(ADD_OFF + 4 + k);
-            let add_c = |k: usize| cv(ADD_OFF + 8 + k);
-            let scr = |i: usize, k: usize| SCR + 4 * i + k;
+            let mr = cv(self.layout.msel + M_RO as usize);
+            let mul_a = |k: usize| cv(self.layout.mul_off + k);
+            let mul_b = |k: usize| cv(self.layout.mul_off + 4 + k);
+            let add_a = |k: usize| cv(self.layout.add_off + k);
+            let add_b = |k: usize| cv(self.layout.add_off + 4 + k);
+            let add_c = |k: usize| cv(self.layout.add_off + 8 + k);
+            let scr = |i: usize, k: usize| self.layout.scr + 4 * i + k;
             for k in 0..4 {
                 // mul_b operands.
-                builder.assert_zero(mr.clone() * sf(0) * (mul_b(k) - cv(PX0R + k)));
-                builder.assert_zero(mr.clone() * sf(1) * (mul_b(k) - cv(PZACC + k)));
-                builder.assert_zero(mr.clone() * sf(2) * (mul_b(k) - cv(INVZ + k)));
-                builder.assert_zero(mr.clone() * sf(4) * (mul_b(k) - cv(INVZN + k)));
-                builder.assert_zero(mr.clone() * sf(6) * (mul_b(k) - cv(INVZ + k)));
+                builder.assert_zero(mr.clone() * sf(0) * (mul_b(k) - cv(self.layout.px0r + k)));
+                builder.assert_zero(mr.clone() * sf(1) * (mul_b(k) - cv(self.layout.pzacc + k)));
+                builder.assert_zero(mr.clone() * sf(2) * (mul_b(k) - cv(self.layout.invz + k)));
+                builder.assert_zero(mr.clone() * sf(4) * (mul_b(k) - cv(self.layout.invzn + k)));
+                builder.assert_zero(mr.clone() * sf(6) * (mul_b(k) - cv(self.layout.invz + k)));
                 // mul_a: registers (r0,r1); same-row add_a intermediate (r2,4,6).
-                builder.assert_zero(mr.clone() * sf(0) * (mul_a(k) - cv(P0R + k)));
-                builder.assert_zero(mr.clone() * sf(1) * (mul_a(k) - cv(P1R + k)));
+                builder.assert_zero(mr.clone() * sf(0) * (mul_a(k) - cv(self.layout.p0r + k)));
+                builder.assert_zero(mr.clone() * sf(1) * (mul_a(k) - cv(self.layout.p1r + k)));
                 builder.assert_zero(
                     mr.clone() * (sf(2) + sf(4) + sf(6)) * (mul_a(k) - add_a(k)),
                 );
                 // add_c operands for the subtractive rows (bank_add_c first arg):
-                // r2=A0R, r3=A1R, r5=A2R. (r4,r6 add_c come via threading below.)
-                builder.assert_zero(mr.clone() * sf(2) * (add_c(k) - cv(A0R + k)));
-                builder.assert_zero(mr.clone() * sf(3) * (add_c(k) - cv(A1R + k)));
-                builder.assert_zero(mr.clone() * sf(5) * (add_c(k) - cv(A2R + k)));
+                // r2=self.layout.a0r, r3=self.layout.a1r, r5=self.layout.a2r. (r4,r6 add_c come via threading below.)
+                builder.assert_zero(mr.clone() * sf(2) * (add_c(k) - cv(self.layout.a0r + k)));
+                builder.assert_zero(mr.clone() * sf(3) * (add_c(k) - cv(self.layout.a1r + k)));
+                builder.assert_zero(mr.clone() * sf(5) * (add_c(k) - cv(self.layout.a2r + k)));
                 // add_b operands.
-                builder.assert_zero(mr.clone() * sf(2) * (add_b(k) - cv(PX0R + k)));
-                builder.assert_zero(mr.clone() * sf(3) * (add_b(k) - cv(A0R + k)));
+                builder.assert_zero(mr.clone() * sf(2) * (add_b(k) - cv(self.layout.px0r + k)));
+                builder.assert_zero(mr.clone() * sf(3) * (add_b(k) - cv(self.layout.a0r + k)));
                 builder.assert_zero(mr.clone() * sf(4) * (add_b(k) - cv(scr(0, k))));
-                builder.assert_zero(mr.clone() * sf(5) * (add_b(k) - cv(A1R + k)));
+                builder.assert_zero(mr.clone() * sf(5) * (add_b(k) - cv(self.layout.a1r + k)));
                 builder.assert_zero(mr.clone() * sf(6) * (add_b(k) - cv(scr(1, k))));
                 builder.assert_zero(mr.clone() * sf(7) * (add_b(k) - cv(scr(3, k))));
                 builder.assert_zero(mr.clone() * sf(8) * (add_b(k) - cv(scr(4, k))));
                 // r7 is a standard bank_add(SCR2, SCR3): add_a = SCR2.
                 builder.assert_zero(mr.clone() * sf(7) * (add_a(k) - cv(scr(2, k))));
             }
-            // SCR scratch carry + capture the bank output on its producing row
+            // self.layout.scr scratch carry + capture the bank output on its producing row
             // (SCR0@0 SCR1@1 SCR2@2 SCR3@4 SCR4@6); intermediate threading; and
-            // RUNEV set are transition constraints.
+            // self.layout.runev set are transition constraints.
             let cap_rows = [0usize, 1, 2, 4, 6];
             let mut t = builder.when_transition();
             for k in 0..4 {
                 for (i, &cr) in cap_rows.iter().enumerate() {
-                    // Gated by mr: only the M_RO perm; folds own SCR elsewhere.
+                    // Gated by mr: only the M_RO perm; folds own self.layout.scr elsewhere.
                     t.assert_zero(
                         mr.clone()
                             * (nv(scr(i, k))
                                 - cv(scr(i, k))
-                                - sf(cr) * (cv(MUL_OFF + 8 + k) - cv(scr(i, k)))),
+                                - sf(cr) * (cv(self.layout.mul_off + 8 + k) - cv(scr(i, k)))),
                     );
                 }
                 // Subtractive-row result add_a threads into next row's add_c
                 // (r3->r4, r5->r6).
                 t.assert_zero(
-                    mr.clone() * (sf(3) + sf(5)) * (nv(ADD_OFF + 8 + k) - cv(ADD_OFF + k)),
+                    mr.clone() * (sf(3) + sf(5)) * (nv(self.layout.add_off + 8 + k) - cv(self.layout.add_off + k)),
                 );
                 // r7 result add_c threads into r8's add_a.
-                t.assert_zero(mr.clone() * sf(7) * (nv(ADD_OFF + k) - cv(ADD_OFF + 8 + k)));
-                // ro = add_c(r8) -> RUNEV.
-                t.assert_zero(mr.clone() * sf(8) * (nv(RUNEV + k) - cv(ADD_OFF + 8 + k)));
+                t.assert_zero(mr.clone() * sf(7) * (nv(self.layout.add_off + k) - cv(self.layout.add_off + 8 + k)));
+                // ro = add_c(r8) -> self.layout.runev.
+                t.assert_zero(mr.clone() * sf(8) * (nv(self.layout.runev + k) - cv(self.layout.add_off + 8 + k)));
             }
         }
 
-        // The last-row phase anchor is the QSEL check emitted above.
+        // The last-row phase anchor is the self.layout.qsel check emitted above.
         let _ = (cf, pv, xorsel, consumersel);
     }
 }
@@ -2462,21 +3658,28 @@ enum PInfo {
 }
 
 /// Shape-selector index of an obs block (must mirror `shape_list`).
-fn shsel_index(flush: usize, block: usize) -> usize {
-    match flush {
-        0 => block,
-        1 => 5 + block,
-        2 => {
-            if block == 0 {
-                8
-            } else if block == FLUSH_BLOCKS[2] - 1 {
-                10
-            } else {
-                9
-            }
+///
+/// Shape-driven: `flush_blocks` is the per-obs-flush block-count vector (the
+/// cached `GateConsts::flush_blocks` in `eval`, `shape.flush_blocks()` in the
+/// trace builder). F0 contributes `flush_blocks[0]` distinct slots, F1 its
+/// blocks, the zeta flush (index 2) collapses to 3 (block 0 / interior / last),
+/// and every later obs flush contributes its block count. Narrow reproduces the
+/// old hardcoded `[0,5,8..10,11+(f-3)*3+b]` layout verbatim.
+fn shsel_index(flush_blocks: &[usize], flush: usize, block: usize) -> usize {
+    let mut base = 0usize;
+    for (f, &blk) in flush_blocks.iter().enumerate().take(flush) {
+        base += if f == 2 && blk >= 3 { 3 } else { blk };
+    }
+    if flush == 2 && flush_blocks[2] >= 3 {
+        if block == 0 {
+            base
+        } else if block == flush_blocks[2] - 1 {
+            base + 2
+        } else {
+            base + 1
         }
-        f @ 3..=7 => 11 + (f - 3) * 3 + block,
-        _ => unreachable!(),
+    } else {
+        base + block
     }
 }
 
@@ -2494,32 +3697,34 @@ pub(crate) struct GateMeta {
     pub opvs: Vec<Val>,
 }
 
-/// Build the outer public values: 6 caps x 8 digests x 16 limbs + the 84
-/// inner public values.
-pub(crate) fn outer_pvs(sched: &Schedule, inner_pvs: &[Val]) -> Vec<Val> {
-    let mut opvs = Vec::with_capacity(N_OPVS);
-    assert_eq!(sched.caps.len(), N_CAPS);
+/// Build the outer public values: n_caps caps x cap_len digests x 16 limbs +
+/// the inner public values (slice 1b-2: shape-driven; narrow = 6x8x16 + 84).
+pub(crate) fn outer_pvs(sched: &Schedule, inner_pvs: &[Val], shape: &GateShape) -> Vec<Val> {
+    let mut opvs = Vec::with_capacity(shape.n_opvs());
+    assert_eq!(sched.caps.len(), shape.n_caps());
     for cap in &sched.caps {
-        assert_eq!(cap.len(), CAP_LEN);
+        assert_eq!(cap.len(), shape.cap_len);
         for d in cap {
             for j in 0..16 {
                 opvs.push(Val::from_u32(((d[j / 4] >> (16 * (j % 4))) & 0xffff) as u32));
             }
         }
     }
-    assert_eq!(inner_pvs.len(), N_PVS);
+    assert_eq!(inner_pvs.len(), shape.n_pvs);
     // Inner public values ride the outer interface in their transcript
     // encoding (Monty words), matching the absorbed bytes.
     let rr = monty_rr();
     opvs.extend(inner_pvs.iter().map(|v| *v * rr));
-    assert_eq!(opvs.len(), N_OPVS);
+    assert_eq!(opvs.len(), shape.n_opvs());
     opvs
 }
 
 /// Assemble the lane plan: challenger blocks (native order) + trailer +
 /// per-query leaf/path perms (cap-extension and collapse perms dropped),
 /// with the perm inputs for the keccak generator.
-fn lane_plan(sched: &Schedule) -> (Vec<[u64; 25]>, Vec<PInfo>) {
+fn lane_plan(sched: &Schedule, shape: &GateShape) -> (Vec<[u64; 25]>, Vec<PInfo>) {
+    let flush_blocks = shape.flush_blocks();
+    let flush_bytes = shape.flush_bytes();
     let mut inputs = vec![];
     let mut infos = vec![];
 
@@ -2533,10 +3738,10 @@ fn lane_plan(sched: &Schedule) -> (Vec<[u64; 25]>, Vec<PInfo>) {
             assert_eq!(fl.n_blocks, 1);
         } else {
             assert_eq!(
-                fl.n_blocks, FLUSH_BLOCKS[obs_ord],
+                fl.n_blocks, flush_blocks[obs_ord],
                 "obs flush {obs_ord} block count"
             );
-            assert_eq!(fl.msg.len(), FLUSH_BYTES[obs_ord], "obs flush {obs_ord} bytes");
+            assert_eq!(fl.msg.len(), flush_bytes[obs_ord], "obs flush {obs_ord} bytes");
         }
         for b in 0..fl.n_blocks {
             let p = &sched.perms[fl.first_perm + b];
@@ -2558,7 +3763,7 @@ fn lane_plan(sched: &Schedule) -> (Vec<[u64; 25]>, Vec<PInfo>) {
             obs_ord += 1;
         }
     }
-    assert_eq!(obs_ord, 8, "eight obs flushes");
+    assert_eq!(obs_ord, shape.n_obs_flushes(), "obs flush count");
     // Trailer: pad32(last digest) so the final window is preimage-visible.
     let last_digest = sched.flushes.last().unwrap().digest;
     let mut tr = [0u8; 136];
@@ -2581,11 +3786,11 @@ fn lane_plan(sched: &Schedule) -> (Vec<[u64; 25]>, Vec<PInfo>) {
     }
 
     // Query region: per query, absorbs + native path levels in walk order.
-    let program = qprogram();
+    let program = qprogram_from_shape(shape);
     let n_chal: usize = sched.flushes.iter().map(|f| f.n_blocks).sum();
     let mut ptr = n_chal;
-    for q in 0..NQ {
-        for slot in 0..QSLOTS {
+    for q in 0..shape.nq {
+        for slot in 0..shape.qslots() {
             let d = program[slot];
             let role = d & 0xf;
             // Skip the schedule's cap-extension perms (dropped in-lane).
@@ -2696,7 +3901,7 @@ struct Regs {
     // flush automaton
     fring: usize,
     blkcnt: u32,
-    bidx: usize, // saturating at 5
+    bidx: usize, // saturating at bidx_width-1 (narrow 5, wide 28)
     refsel: bool,
     // draw automaton
     phd: bool,
@@ -2706,11 +3911,13 @@ struct Regs {
     coef: usize,
     curch: [u32; 4],
     fsfull: bool,
-    // registers
-    chal: [Ext; N_CHALS],
+    // registers (chal len = n_chals, idxr len = nq; scr[8]/breg[4]/fpreg[16]/
+    // oreg[68] stay fixed — 2^(max_la-1) / max_la / fp16 / keccak rate — valid
+    // while a16 holds for both shapes; see slice 1b-2 notes).
+    chal: Vec<Ext>,
     fa2: Ext,
     zn: Ext,
-    idxr: [u32; NQ],
+    idxr: Vec<u32>,
     oreg: [u16; 68],
     pos: usize,
     vc: usize,
@@ -2738,15 +3945,15 @@ struct Regs {
 }
 
 impl Regs {
-    fn new() -> Self {
+    fn new(shape: &GateShape) -> Self {
         Regs {
             pr_rot: 0,
             phc: true,
             phq: false,
             qsel: 0,
-            qcnt: QSLOTS as u32,
+            qcnt: shape.qslots() as u32,
             fring: 0,
-            blkcnt: FLUSH_BLOCKS[0] as u32,
+            blkcnt: shape.flush_blocks()[0] as u32,
             bidx: 0,
             refsel: false,
             phd: false,
@@ -2756,10 +3963,10 @@ impl Regs {
             coef: 0,
             curch: [0; 4],
             fsfull: false,
-            chal: [Ext::ZERO; N_CHALS],
+            chal: vec![Ext::ZERO; shape.n_chals()],
             fa2: Ext::ZERO,
             zn: Ext::ZERO,
-            idxr: [0; NQ],
+            idxr: vec![0; shape.nq],
             oreg: [0; 68],
             pos: 0,
             vc: 0,
@@ -2795,10 +4002,15 @@ fn write_row(
     row: usize,
     r: usize,
     regs: &Regs,
-    program: &[u32; QSLOTS],
+    program: &[u32],
     info: Option<&PInfo>,
+    layout: &GateLayout,
+    shape: &GateShape,
 ) {
-    let base = row * GATE_WIDTH;
+    let qslots = shape.qslots();
+    let nq = shape.nq;
+    let groupreq = shape.groupreq();
+    let base = row * layout.gate_width;
     let w = |v: &mut [Val], col: usize, x: Val| v[base + col] = x;
     let wb = |v: &mut [Val], col: usize, x: bool| v[base + col] = Val::from_bool(x);
     let wu = |v: &mut [Val], col: usize, x: u32| v[base + col] = Val::from_u32(x);
@@ -2807,170 +4019,178 @@ fn write_row(
     };
 
     // Program ring + head decode.
-    for i in 0..QSLOTS {
-        wu(v, PR + i, program[(i + regs.pr_rot) % QSLOTS]);
+    for i in 0..qslots {
+        wu(v, layout.pr + i, program[(i + regs.pr_rot) % qslots]);
     }
-    let head = program[regs.pr_rot % QSLOTS];
+    let head = program[regs.pr_rot % qslots];
     for k in 0..15 {
-        wb(v, PD + k, (head >> k) & 1 == 1);
+        wb(v, layout.pd + k, (head >> k) & 1 == 1);
     }
     let role = head & 0xf;
     let dparam = (head >> 4) & 0x3f;
     let micro = (head >> 10) & 0x1f;
     // Role / micro / dparam selectors (all zero outside query phase).
     if regs.phq {
-        wb(v, RSEL + role as usize, true);
-        wb(v, MLO + (micro & 7) as usize, true);
-        wb(v, MSEL + micro as usize, true);
+        wb(v, layout.rsel + role as usize, true);
+        wb(v, layout.mlo + (micro & 7) as usize, true);
+        wb(v, layout.msel + micro as usize, true);
         let absany = (1..=5).contains(&role);
         if absany {
-            wb(v, DRND + dparam as usize, true);
+            wb(v, layout.drnd + dparam as usize, true);
         }
-        wb(v, LFS, role == R_ABS_F34 || role == R_ABS_F16);
+        wb(v, layout.lfs, role == R_ABS_F34 || role == R_ABS_F16);
     }
-    // MHI/DLO/DHI are pure bit products (no phase gate).
-    wb(v, MHI + ((micro >> 3) & 3) as usize, true);
-    wb(v, DLO + (dparam & 7) as usize, true);
+    // layout.mhi/layout.dlo/layout.dhi are pure bit products (no phase gate).
+    wb(v, layout.mhi + ((micro >> 3) & 3) as usize, true);
+    wb(v, layout.dlo + (dparam & 7) as usize, true);
     if (dparam >> 3) < 3 {
-        wb(v, DHI + (dparam >> 3) as usize, true);
+        wb(v, layout.dhi + (dparam >> 3) as usize, true);
     }
-    wb(v, PHC, regs.phc);
-    wb(v, PHQ, regs.phq);
-    // QSEL / QCNT.
-    wb(v, ring_at(QSEL, NQ + 1, regs.qsel) - QSEL + QSEL, true);
-    wu(v, QCNT, regs.qcnt);
+    wb(v, layout.phc, regs.phc);
+    wb(v, layout.phq, regs.phq);
+    // layout.qsel / layout.qcnt.
+    wb(v, ring_at(layout.qsel, nq + 1, regs.qsel) - layout.qsel + layout.qsel, true);
+    wu(v, layout.qcnt, regs.qcnt);
     let qcw = regs.qcnt == 1;
-    wb(v, QCW, qcw);
+    wb(v, layout.qcw, qcw);
     if !qcw {
         w(
             v,
-            QCWI,
+            layout.qcwi,
             (Val::from_u32(regs.qcnt) - Val::ONE).inverse(),
         );
     }
     // Index bits of the active query.
-    let idx = if regs.phq && regs.qsel < NQ {
+    let idx = if regs.phq && regs.qsel < nq {
         regs.idxr[regs.qsel]
     } else {
         0
     };
     if regs.phq {
-        for k in 0..LOG_MAX {
-            wb(v, IDXB + k, (idx >> k) & 1 == 1);
+        for k in 0..shape.log_max {
+            wb(v, layout.idxb + k, (idx >> k) & 1 == 1);
         }
     }
-    // CAPS8 from idx bits 19..21 (all-zero bits select element 0).
-    let capj = ((idx >> 19) & 7) as usize;
-    wb(v, CAPS8 + if regs.phq { capj } else { 0 }, true);
-    // DBIT / GLC / GRC.
-    let pathish = regs.phq && (R_PATH..=R_PLAST_F3).contains(&role);
+    // layout.caps8 from the top cap_height idx bits (narrow 19..21, wide 15..17;
+    // all-zero bits select element 0). Must match the eval capb = log_max -
+    // cap_height (the 1b-B4/B5 fill-side counterpart).
+    let capj = ((idx >> (shape.log_max - shape.cap_height())) & 7) as usize;
+    wb(v, layout.caps8 + if regs.phq { capj } else { 0 }, true);
+    // layout.dbit / layout.glc / layout.grc.
+    let pathish =
+        regs.phq && (R_PATH..=shape.r_plast_f(shape.n_fri_rounds() - 1)).contains(&role);
     if pathish {
         let dbit = (idx >> dparam) & 1 == 1;
-        wb(v, DBIT, dbit);
-        wb(v, GLC, !dbit);
-        wb(v, GRC, dbit);
+        wb(v, layout.dbit, dbit);
+        wb(v, layout.glc, !dbit);
+        wb(v, layout.grc, dbit);
     }
     // Flush automaton.
-    wb(v, ring_at(FRING, 8, regs.fring) - FRING + FRING, true);
-    wu(v, BLKCNT, regs.blkcnt);
+    wb(v, ring_at(layout.fring, 8, regs.fring) - layout.fring + layout.fring, true);
+    wu(v, layout.blkcnt, regs.blkcnt);
     let blklast = regs.blkcnt == 1;
-    wb(v, BLKLAST, blklast);
+    wb(v, layout.blklast, blklast);
     if !blklast {
-        w(v, BLKINV, (Val::from_u32(regs.blkcnt) - Val::ONE).inverse());
+        w(v, layout.blkinv, (Val::from_u32(regs.blkcnt) - Val::ONE).inverse());
     }
-    for (cmp, inv, tgt) in [(CMPA, CMPAI, 76u32), (CMPB, CMPBI, 3u32)] {
+    let dcap = shape.dup_captures();
+    for (cmp, inv, tgt) in [(layout.cmpa, layout.cmpai, dcap[0].2), (layout.cmpb, layout.cmpbi, dcap[1].2)] {
         let hit = regs.blkcnt == tgt;
         wb(v, cmp, hit);
         if !hit {
             w(v, inv, (Val::from_u32(regs.blkcnt) - Val::from_u32(tgt)).inverse());
         }
     }
-    wb(v, BIDX + regs.bidx.min(5), true);
-    wb(v, REFSEL, regs.refsel);
-    // SHSEL (derived; assert against the plan).
+    wb(v, layout.bidx + regs.bidx.min(layout.bidx_width - 1), true);
+    wb(v, layout.refsel, regs.refsel);
+    // layout.shsel (derived; assert against the plan).
     if regs.phc && !regs.refsel {
         if let Some(PInfo::Obs { flush, block }) = info {
-            let si = shsel_index(*flush, *block);
-            // Consistency of the automaton-derived shape with the plan.
-            let derived = match (regs.fring, regs.bidx.min(5), blklast) {
-                (2, 0, _) => 8,
-                (2, _, false) => 9,
-                (2, _, true) => 10,
-                (f, b, _) => shsel_index(f, b),
-            };
+            let fb = shape.flush_blocks();
+            let si = shsel_index(&fb, *flush, *block);
+            // Consistency of the automaton-derived shape with the plan. BLKCNT
+            // counts down from flush_blocks[fring] to 1, so the automaton's
+            // block index = flush_blocks[fring] - blkcnt (exact). Post-1b-B5 the
+            // bidx one-hot addresses all non-F2 blocks (width = max non-F2
+            // flush_blocks + 1), so bidxsel(block) is a valid per-block selector
+            // for the wide F0's 28 blocks too (F2's 855 still saturate at the
+            // top slot — F2 uses f2sel/blklast, not per-block bidxsel).
+            let auto_block = fb[regs.fring] - regs.blkcnt as usize;
+            let derived = shsel_index(&fb, regs.fring, auto_block);
             assert_eq!(si, derived, "shape drift at flush {flush} block {block}");
-            wb(v, SHSEL + si, true);
+            wb(v, layout.shsel + si, true);
         } else {
             panic!("chal perm without obs info");
         }
     }
-    // NEEDL.
-    let need = blklast && regs.grp == GROUPREQ[regs.fring + 1];
-    wb(v, NEEDL, need);
+    // layout.needl.
+    let need = blklast && regs.grp == groupreq[regs.fring + 1];
+    wb(v, layout.needl, need);
     // Draw automaton state.
-    wb(v, ring_at(GRP, N_GROUPS, regs.grp) - GRP + GRP, true);
-    wb(v, ring_at(COEF, 4, regs.coef) - COEF + COEF, true);
+    wb(v, ring_at(layout.grp, shape.n_groups(), regs.grp) - layout.grp + layout.grp, true);
+    wb(v, ring_at(layout.coef, 4, regs.coef) - layout.coef + layout.coef, true);
     for k in 0..4 {
-        wu(v, CURCH + k, regs.curch[k]);
+        wu(v, layout.curch + k, regs.curch[k]);
     }
-    wb(v, FSFULL, regs.fsfull);
+    wb(v, layout.fsfull, regs.fsfull);
     // Registers.
     for (i, e) in regs.chal.iter().enumerate() {
-        we(v, CHAL + 4 * i, *e);
+        we(v, layout.chal + 4 * i, *e);
     }
-    we(v, FA2, regs.fa2);
-    we(v, ZNREG, regs.zn);
-    for q in 0..NQ {
-        wu(v, IDXR + q, regs.idxr[q]);
+    we(v, layout.fa2, regs.fa2);
+    we(v, layout.znreg, regs.zn);
+    for q in 0..nq {
+        wu(v, layout.idxr + q, regs.idxr[q]);
     }
     for i in 0..68 {
-        wu(v, OREG + i, regs.oreg[i] as u32);
+        wu(v, layout.oreg + i, regs.oreg[i] as u32);
     }
-    wb(v, POS + regs.pos, true);
-    wb(v, VC + regs.vc % 16, true);
-    wb(v, FPI + regs.fpi % 16, true);
+    wb(v, layout.pos + regs.pos, true);
+    wb(v, layout.vc + regs.vc % 16, true);
+    wb(v, layout.fpi + regs.fpi % 16, true);
     let mut vce = false;
     if regs.vc % 2 == 0 {
         vce = true;
     }
-    wb(v, VCE, vce);
-    w(v, ASM0, regs.asm0);
-    w(v, ASM1, regs.asm1);
-    we(v, PBUF, regs.pbuf);
-    we(v, PREG, regs.preg);
-    we(v, PZACC, regs.pzacc);
-    we(v, A0R, regs.a0);
-    we(v, A1R, regs.a1);
-    we(v, A2R, regs.a2);
-    we(v, P0R, regs.p0);
-    we(v, P1R, regs.p1);
-    we(v, PX0R, regs.px0);
+    wb(v, layout.vce, vce);
+    w(v, layout.asm0, regs.asm0);
+    w(v, layout.asm1, regs.asm1);
+    we(v, layout.pbuf, regs.pbuf);
+    we(v, layout.preg, regs.preg);
+    we(v, layout.pzacc, regs.pzacc);
+    we(v, layout.a0r, regs.a0);
+    we(v, layout.a1r, regs.a1);
+    we(v, layout.a2r, regs.a2);
+    we(v, layout.p0r, regs.p0);
+    we(v, layout.p1r, regs.p1);
+    we(v, layout.px0r, regs.px0);
     for i in 0..16 {
-        we(v, FPREG + 4 * i, regs.fpreg[i]);
+        we(v, layout.fpreg + 4 * i, regs.fpreg[i]);
     }
     for i in 0..8 {
-        we(v, SCR + 4 * i, regs.scr[i]);
+        we(v, layout.scr + 4 * i, regs.scr[i]);
     }
     for i in 0..4 {
-        we(v, BREG + 4 * i, regs.breg[i]);
+        we(v, layout.breg + 4 * i, regs.breg[i]);
     }
-    we(v, INV2S, regs.inv2s);
-    we(v, INVZ, regs.invz);
-    we(v, INVZN, regs.invzn);
-    we(v, XREG, regs.xreg);
-    we(v, XFIN, regs.xfin);
-    we(v, RUNEV, regs.runev);
+    we(v, layout.inv2s, regs.inv2s);
+    we(v, layout.invz, regs.invz);
+    we(v, layout.invzn, regs.invzn);
+    we(v, layout.xreg, regs.xreg);
+    we(v, layout.xfin, regs.xfin);
+    we(v, layout.runev, regs.runev);
     for m in 0..16 {
-        wu(v, F2DIG + m, regs.f2dig[m] as u32);
+        wu(v, layout.f2dig + m, regs.f2dig[m] as u32);
     }
-    wb(v, PHD, regs.phd);
-    let cmpc = regs.blkcnt == 148;
-    wb(v, CMPC, cmpc);
+    wb(v, layout.phd, regs.phd);
+    let n_dup = shape.flush_blocks()[2] as u32;
+    let cmpc = regs.blkcnt == n_dup;
+    wb(v, layout.cmpc, cmpc);
     if !cmpc {
         w(
             v,
-            CMPCI,
-            (Val::from_u32(regs.blkcnt) - Val::from_u32(148)).inverse(),
+            layout.cmpci,
+            (Val::from_u32(regs.blkcnt) - Val::from_u32(n_dup)).inverse(),
         );
     }
     let _ = r;
@@ -2980,29 +4200,29 @@ fn write_row(
 // The builder
 // ---------------------------------------------------------------------------
 
-fn bank_mul(v: &mut [Val], row: usize, a: Ext, b: Ext) -> Ext {
+fn bank_mul(v: &mut [Val], row: usize, a: Ext, b: Ext, layout: &GateLayout) -> Ext {
     let c = a * b;
-    let base = row * GATE_WIDTH;
-    v[base + MUL_OFF..base + MUL_OFF + 4].copy_from_slice(&ext_limbs(a));
-    v[base + MUL_OFF + 4..base + MUL_OFF + 8].copy_from_slice(&ext_limbs(b));
-    v[base + MUL_OFF + 8..base + MUL_OFF + 12].copy_from_slice(&ext_limbs(c));
+    let base = row * layout.gate_width;
+    v[base + layout.mul_off..base + layout.mul_off + 4].copy_from_slice(&ext_limbs(a));
+    v[base + layout.mul_off + 4..base + layout.mul_off + 8].copy_from_slice(&ext_limbs(b));
+    v[base + layout.mul_off + 8..base + layout.mul_off + 12].copy_from_slice(&ext_limbs(c));
     c
 }
-fn bank_add(v: &mut [Val], row: usize, a: Ext, b: Ext) -> Ext {
+fn bank_add(v: &mut [Val], row: usize, a: Ext, b: Ext, layout: &GateLayout) -> Ext {
     let c = a + b;
-    let base = row * GATE_WIDTH;
-    v[base + ADD_OFF..base + ADD_OFF + 4].copy_from_slice(&ext_limbs(a));
-    v[base + ADD_OFF + 4..base + ADD_OFF + 8].copy_from_slice(&ext_limbs(b));
-    v[base + ADD_OFF + 8..base + ADD_OFF + 12].copy_from_slice(&ext_limbs(c));
+    let base = row * layout.gate_width;
+    v[base + layout.add_off..base + layout.add_off + 4].copy_from_slice(&ext_limbs(a));
+    v[base + layout.add_off + 4..base + layout.add_off + 8].copy_from_slice(&ext_limbs(b));
+    v[base + layout.add_off + 8..base + layout.add_off + 12].copy_from_slice(&ext_limbs(c));
     c
 }
 /// Add row with a fixed sum: a = c - b (the bank's subtraction form).
-fn bank_add_c(v: &mut [Val], row: usize, c: Ext, b: Ext) -> Ext {
+fn bank_add_c(v: &mut [Val], row: usize, c: Ext, b: Ext, layout: &GateLayout) -> Ext {
     let a = c - b;
-    let base = row * GATE_WIDTH;
-    v[base + ADD_OFF..base + ADD_OFF + 4].copy_from_slice(&ext_limbs(a));
-    v[base + ADD_OFF + 4..base + ADD_OFF + 8].copy_from_slice(&ext_limbs(b));
-    v[base + ADD_OFF + 8..base + ADD_OFF + 12].copy_from_slice(&ext_limbs(c));
+    let base = row * layout.gate_width;
+    v[base + layout.add_off..base + layout.add_off + 4].copy_from_slice(&ext_limbs(a));
+    v[base + layout.add_off + 4..base + layout.add_off + 8].copy_from_slice(&ext_limbs(b));
+    v[base + layout.add_off + 8..base + layout.add_off + 12].copy_from_slice(&ext_limbs(c));
     a
 }
 
@@ -3017,40 +4237,41 @@ fn fill_fs_row(
     odd: bool,
     crot: bool,
     grot: bool,
+    layout: &GateLayout,
 ) {
-    let base = row * GATE_WIDTH;
+    let base = row * layout.gate_width;
     for i in 0..8 {
-        v[base + FSBITS + i] = Val::from_bool((lo_byte >> i) & 1 == 1);
-        v[base + FSBITS + 8 + i] = Val::from_bool((hi_byte >> i) & 1 == 1);
+        v[base + layout.fsbits + i] = Val::from_bool((lo_byte >> i) & 1 == 1);
+        v[base + layout.fsbits + 8 + i] = Val::from_bool((hi_byte >> i) & 1 == 1);
     }
-    v[base + FSACC] = Val::from_u32(acc);
-    v[base + FSGATE] = Val::ONE;
-    v[base + FSODD] = Val::from_bool(odd);
+    v[base + layout.fsacc] = Val::from_u32(acc);
+    v[base + layout.fsgate] = Val::ONE;
+    v[base + layout.fsodd] = Val::from_bool(odd);
     let p3a = (hi_byte & 0b111) == 0b111;
     let p3b = ((hi_byte >> 3) & 0b111) == 0b111;
     let t7 = p3a && p3b && ((hi_byte >> 6) & 1) == 1;
-    v[base + FSP3A] = Val::from_bool(p3a);
-    v[base + FSP3B] = Val::from_bool(p3b);
-    v[base + FST7] = Val::from_bool(t7);
+    v[base + layout.fsp3a] = Val::from_bool(p3a);
+    v[base + layout.fsp3b] = Val::from_bool(p3b);
+    v[base + layout.fst7] = Val::from_bool(t7);
     let low24 = acc + ((lo_byte as u32) << 16);
     let nz = low24 != 0;
-    v[base + FSNZ] = Val::from_bool(nz);
+    v[base + layout.fsnz] = Val::from_bool(nz);
     if nz {
-        v[base + FSINV] = Val::from_u32(low24).inverse();
+        v[base + layout.fsinv] = Val::from_u32(low24).inverse();
     }
-    v[base + FSACCEPT] = Val::from_bool(!(t7 && nz));
-    v[base + CROT] = Val::from_bool(crot);
-    v[base + GROT] = Val::from_bool(grot);
+    v[base + layout.fsaccept] = Val::from_bool(!(t7 && nz));
+    v[base + layout.crot] = Val::from_bool(crot);
+    v[base + layout.grot] = Val::from_bool(grot);
 }
 
 /// Word canonicity columns for one consumed word (idx 0 or 1).
-fn fill_canon(v: &mut [Val], row: usize, word: usize, w: u32) {
+fn fill_canon(v: &mut [Val], row: usize, word: usize, w: u32, layout: &GateLayout) {
     assert!(w < P, "honest witness words are canonical");
-    let base = row * GATE_WIDTH;
+    let base = row * layout.gate_width;
     let (hb, ta, topa, lbnz, lbi, lonz, loi) = if word == 0 {
-        (HB0, TA0, TOPA0, LBNZ0, LBI0, LONZ0, LOI0)
+        (layout.hb0, layout.ta0, layout.topa0, layout.lbnz0, layout.lbi0, layout.lonz0, layout.loi0)
     } else {
-        (HB1, TA1, TOPA1, LBNZ1, LBI1, LONZ1, LOI1)
+        (layout.hb1, layout.ta1, layout.topa1, layout.lbnz1, layout.lbi1, layout.lonz1, layout.loi1)
     };
     let hi = w >> 16;
     for i in 0..16 {
@@ -3080,102 +4301,78 @@ fn chal_group(tag: ChalTag) -> usize {
     }
 }
 
-pub(crate) fn build_gate_trace(
+#[allow(clippy::too_many_arguments)]
+fn emit_child(
+    mut values: &mut [Val],
+    row_offset: usize,
+    shape: &GateShape,
+    layout: &GateLayout,
+    consts: &GateConsts,
+    program: &[u32],
     sched: &Schedule,
-    inner_pvs: &[Val],
-    extra_capacity_bits: usize,
-) -> (RowMajorMatrix<Val>, GateMeta) {
-    let consts = gate_consts();
-    let program = qprogram();
-    let opvs = outer_pvs(sched, inner_pvs);
-    let (inputs, infos) = lane_plan(sched);
+    inputs: &[[u64; 25]],
+    outs: &[[u64; 25]],
+    infos: &[PInfo],
+    hosted: &std::collections::HashMap<usize, Vec<m4gaterec::DrawRec>>,
+    chal_expect: &[Ext],
+    fpoly: &[Ext],
+    fa: Ext,
+    zvals: &[Ext],
+    dcap: &[(usize, usize, u32); 3],
+    n_dup: usize,
+    trailer_pi: usize,
+    inherit: Option<&Regs>,
+    query_rows: &mut Vec<usize>,
+    field_draws: &mut Vec<(usize, u32)>,
+) -> Regs {
     let n_perms = inputs.len();
-    let outs: Vec<[u64; 25]> = inputs.iter().map(keccakf).collect();
-
-    let keccak = p3_keccak_air::generate_trace_rows::<Val>(inputs.clone(), 0);
-    let rows = keccak.height();
-    assert_eq!(rows, 1 << 16, "gate rectangle height");
-    let mut values = Vec::with_capacity((rows << extra_capacity_bits) * GATE_WIDTH);
-    values.resize(rows * GATE_WIDTH, Val::ZERO);
-    for r in 0..rows {
-        values[r * GATE_WIDTH..r * GATE_WIDTH + NUM_KECCAK_COLS]
-            .copy_from_slice(&keccak.values[r * NUM_KECCAK_COLS..(r + 1) * NUM_KECCAK_COLS]);
-    }
-    drop(keccak);
-
-    // Draw hosting: flush f's digest draws live on flush f+1's block 0
-    // (or the trailer for the last flush).
-    let nf = sched.flushes.len();
-    let n_chal_blocks: usize = sched.flushes.iter().map(|f| f.n_blocks).sum();
-    let trailer_pi = n_chal_blocks;
-    let mut hosted: HashMap<usize, Vec<m4gaterec::DrawRec>> = HashMap::new();
-    for d in &sched.draws {
-        let cons = if d.flush + 1 < nf {
-            sched.flushes[d.flush + 1].first_perm
-        } else {
-            trailer_pi
-        };
-        hosted.entry(cons).or_default().push(d.clone());
-    }
-    let chal_expect: [Ext; N_CHALS] = [
-        sched.alpha,
-        sched.zeta,
-        sched.fri_alpha,
-        sched.betas[0],
-        sched.betas[1],
-        sched.betas[2],
-        sched.betas[3],
-    ];
-    // Final poly from the labeled obs stream.
-    let fpoly: Vec<Ext> = sched
-        .obs
-        .iter()
-        .find(|o| o.label == m4gaterec::ObsLabel::FinalPoly)
-        .unwrap()
-        .bytes
-        .chunks(16)
-        .map(|c| {
-            Ext::from_basis_coefficients_fn(|i| {
-                Val::from_u32(u32::from_le_bytes(c[4 * i..4 * i + 4].try_into().unwrap()))
-            })
-        })
-        .collect();
-    assert_eq!(fpoly.len(), 16);
-    let fa = sched.fri_alpha;
-    // Oracle: the concatenated zeta-opening ext values from the obs stream.
-    let zvals: Vec<Ext> = {
-        let mut bytes = vec![];
-        for g in 0..3 {
-            bytes.extend_from_slice(
-                &sched
-                    .obs
-                    .iter()
-                    .find(|o| o.label == m4gaterec::ObsLabel::ZetaVals { group: g })
-                    .unwrap()
-                    .bytes,
-            );
-        }
-        bytes
-            .chunks(16)
-            .map(|c| {
-                Ext::from_basis_coefficients_fn(|i| {
-                    Val::from_u32(u32::from_le_bytes(c[4 * i..4 * i + 4].try_into().unwrap()))
-                })
-            })
-            .collect()
-    };
-    let mut zvi = 0usize;
-
-    let mut regs = Regs::new();
+    let nq = shape.nq;
+    let qslots = shape.qslots();
+    let cum = shape.cum();
+    let n_rounds = shape.n_fri_rounds();
+    let mut regs = Regs::new(shape);
     regs.fsfull = hosted.get(&0).map_or(false, |d| d.len() == 8);
-    let mut meta = GateMeta {
-        query_rows: vec![],
-        field_draws: vec![],
-        trailer_row: 24 * trailer_pi,
-        n_perms,
-        opvs: opvs.clone(),
-    };
-
+    // 2b-iii fill-continuity: the NON-ANCHORED fold/arith registers are
+    // freeze-carried (a `nv==cv` continuity constraint when their update gate is
+    // off). At a child boundary child R's csel re-anchor leaves them un-anchored,
+    // so a fresh (0) start would break the freeze. Inherit child L's final values
+    // instead — harmless (child R's queries overwrite them before use), and the
+    // freeze holds with no gating/columns. The ANCHORED fields (scheduling,
+    // phase, challenge, vc, preg/pzacc) stay fresh; csel + gated carries own them.
+    if let Some(p) = inherit {
+        regs.f2dig = p.f2dig;
+        regs.oreg = p.oreg;
+        regs.fa2 = p.fa2;
+        regs.zn = p.zn;
+        regs.asm0 = p.asm0;
+        regs.asm1 = p.asm1;
+        regs.pbuf = p.pbuf;
+        regs.a0 = p.a0;
+        regs.a1 = p.a1;
+        regs.a2 = p.a2;
+        regs.p0 = p.p0;
+        regs.p1 = p.p1;
+        regs.px0 = p.px0;
+        regs.fpreg = p.fpreg;
+        regs.scr = p.scr;
+        regs.breg = p.breg;
+        regs.inv2s = p.inv2s;
+        regs.invz = p.invz;
+        regs.invzn = p.invzn;
+        regs.xreg = p.xreg;
+        regs.xfin = p.xfin;
+        regs.runev = p.runev;
+        regs.mchain = p.mchain;
+        // Challenge-assembly data registers: inherited (child R's draws reassemble
+        // them before the query phase consumes them), row-0-pinned not csel-pinned.
+        regs.chal = p.chal.clone();
+        regs.idxr = p.idxr.clone();
+        regs.curch = p.curch;
+    }
+    let mut zvi = 0usize;
+    // Child-boundary re-anchor selector (2b): 1 on this child's first row.
+    // Single child → row 0; interior → row 0 (child L) and 24*nL (child R).
+    values[row_offset * layout.gate_width + layout.csel] = Val::ONE;
     for pi in 0..n_perms {
         let info = &infos[pi];
         let base_row = 24 * pi;
@@ -3195,7 +4392,7 @@ pub(crate) fn build_gate_trace(
         };
         let (q_role, q_dparam, q_micro, q_q) = match info {
             PInfo::Query { q, slot } => {
-                assert_eq!(*slot, regs.pr_rot % QSLOTS, "ring alignment");
+                assert_eq!(*slot, regs.pr_rot % qslots, "ring alignment");
                 let d = program[*slot];
                 (d & 0xf, (d >> 4) & 0x3f, (d >> 10) & 0x1f, *q)
             }
@@ -3204,7 +4401,7 @@ pub(crate) fn build_gate_trace(
         if let PInfo::Query { q, slot } = info {
             if *slot == 0 {
                 assert_eq!(regs.qsel, *q, "query counter alignment");
-                meta.query_rows.push(base_row);
+                query_rows.push(row_offset + base_row);
             }
         }
         // Fold round of an absorb slot (dparam 2..6), if any.
@@ -3220,21 +4417,21 @@ pub(crate) fn build_gate_trace(
         };
 
         for r in 0..24 {
-            let row = base_row + r;
-            write_row(&mut values, row, r, &regs, &program, Some(info));
-            // GPB for fold-absorb perms (write over write_row's zeros).
+            let row = row_offset + base_row + r;
+            write_row(&mut values, row, r, &regs, &program, Some(info), &layout, shape);
+            // layout.gpb for fold-absorb perms (write over write_row's zeros).
             if let Some(rf) = fold_r {
-                let la = LOG_ARITIES[rf];
+                let la = shape.log_arities[rf];
                 for k in 0..4 {
-                    let b = k < la && (qidx >> (CUM[rf] + k)) & 1 == 1;
-                    values[row * GATE_WIDTH + GPB + k] = Val::from_bool(b);
+                    let b = k < la && (qidx >> (cum[rf] + k)) & 1 == 1;
+                    values[row * layout.gate_width + layout.gpb + k] = Val::from_bool(b);
                 }
-                let gp = (qidx >> CUM[rf]) & ((1 << la) - 1);
-                values[row * GATE_WIDTH + HIT] =
+                let gp = (qidx >> cum[rf]) & ((1 << la) - 1);
+                values[row * layout.gate_width + layout.hit] =
                     Val::from_bool(regs.vc % 16 == gp);
             } else {
-                // HIT defining constraint with GPB = 0: hit = [vc == 0].
-                values[row * GATE_WIDTH + HIT] = Val::from_bool(regs.vc % 16 == 0);
+                // layout.hit defining constraint with layout.gpb = 0: hit = [vc == 0].
+                values[row * layout.gate_width + layout.hit] = Val::from_bool(regs.vc % 16 == 0);
             }
 
             // --- W words + XOR bits -------------------------------------
@@ -3251,17 +4448,17 @@ pub(crate) fn build_gate_trace(
                 };
                 w0v = limb(0) as u32 | ((limb(1) as u32) << 16);
                 w1v = limb(2) as u32 | ((limb(3) as u32) << 16);
-                values[row * GATE_WIDTH + W0C] = Val::from_u64(w0v as u64);
-                values[row * GATE_WIDTH + W1C] = Val::from_u64(w1v as u64);
+                values[row * layout.gate_width + layout.w0c] = Val::from_u64(w0v as u64);
+                values[row * layout.gate_width + layout.w1c] = Val::from_u64(w1v as u64);
                 if is_xor {
                     for j in 0..4 {
                         let pl = st_limb(pre, 4 * r + j);
                         let ol = st_limb(prev_out.unwrap(), 4 * r + j);
                         assert_eq!(ol, regs.oreg[4 * r + j], "oreg capture");
                         for i in 0..16 {
-                            values[row * GATE_WIDTH + PBIT + 16 * j + i] =
+                            values[row * layout.gate_width + layout.pbit + 16 * j + i] =
                                 Val::from_bool((pl >> i) & 1 == 1);
-                            values[row * GATE_WIDTH + OBIT + 16 * j + i] =
+                            values[row * layout.gate_width + layout.obit + 16 * j + i] =
                                 Val::from_bool((ol >> i) & 1 == 1);
                         }
                     }
@@ -3279,11 +4476,13 @@ pub(crate) fn build_gate_trace(
                     PInfo::Dup { block } => {
                         czd = match *block {
                             0 => (4..=16).contains(&r),
-                            147 => r <= 4,
+                            b if b == n_dup - 1 => r <= dcap[2].1 - 1,
                             _ => r <= 16,
                         };
                     }
-                    PInfo::Obs { flush: 7, block } => {
+                    // Final obs flush (index 3 + n_fri_rounds; narrow 7, wide 6):
+                    // the final-poly value words.
+                    PInfo::Obs { flush, block } if *flush == shape.n_obs_flushes() - 1 => {
                         cz7 = match *block {
                             0 => (4..=16).contains(&r),
                             1 => r <= 16,
@@ -3291,12 +4490,23 @@ pub(crate) fn build_gate_trace(
                         };
                     }
                     PInfo::Query { .. } if (1..=5).contains(&q_role) => {
-                        let (m0, m1) = match q_role {
-                            R_ABS_F34 | R_ABS_C34 => (r <= 16, r <= 16),
-                            R_ABS_C5 => (r <= 2, r <= 1),
-                            R_ABS_C30 => (r <= 14, r <= 14),
-                            R_ABS_F16 => (r <= 7, r <= 7),
-                            _ => (false, false),
+                        // word-0 fills ceil(f/2) rows (r <= ceil(f/2)-1), word-1
+                        // fills floor(f/2) rows (r <= floor(f/2)-1). Mirrors the
+                        // eval-side `role_range`. Narrow: F34/C34 f=34→(16,16),
+                        // C5 f=5→(2,1), C30 f=30→(14,14), F16 f=16→(7,7).
+                        let m0w = |f: usize| (f + 1) / 2 - 1;
+                        let m1w = |f: usize| f / 2 - 1;
+                        let f = match q_role {
+                            R_ABS_F34 | R_ABS_C34 => 34,
+                            R_ABS_C5 => shape.trace_last_fresh(),
+                            R_ABS_C30 => 30,
+                            R_ABS_F16 => shape.qw,
+                            _ => 0,
+                        };
+                        let (m0, m1) = if f == 0 {
+                            (false, false)
+                        } else {
+                            (r <= m0w(f), r <= m1w(f))
                         };
                         if fold_r.is_some() {
                             cfl = m0;
@@ -3309,53 +4519,55 @@ pub(crate) fn build_gate_trace(
                 }
                 (czd, cz7, cfl, cx0, cx1)
             };
-            let b = row * GATE_WIDTH;
-            values[b + CZD] = Val::from_bool(czd);
-            values[b + CZ7] = Val::from_bool(cz7);
-            values[b + CF] = Val::from_bool(cfl);
-            values[b + CX0] = Val::from_bool(cx0);
-            values[b + CX1] = Val::from_bool(cx1);
+            let b = row * layout.gate_width;
+            values[b + layout.czd] = Val::from_bool(czd);
+            values[b + layout.cz7] = Val::from_bool(cz7);
+            values[b + layout.cf] = Val::from_bool(cfl);
+            values[b + layout.cx0] = Val::from_bool(cx0);
+            values[b + layout.cx1] = Val::from_bool(cx1);
             let casm = czd || cz7 || cfl;
-            values[b + CONSZ] = Val::from_bool(czd && regs.pos == 1);
-            values[b + CONSF] = Val::from_bool(cfl && regs.pos == 1);
+            values[b + layout.consz] = Val::from_bool(czd && regs.pos == 1);
+            values[b + layout.consf] = Val::from_bool(cfl && regs.pos == 1);
             if casm {
-                fill_canon(&mut values, row, 0, w0v);
-                fill_canon(&mut values, row, 1, w1v);
+                fill_canon(&mut values, row, 0, w0v, &layout);
+                fill_canon(&mut values, row, 1, w1v, &layout);
             }
 
             // --- PZ captures (before this row's consume) ------------------
             if let PInfo::Dup { block } = info {
-                match (*block, r) {
-                    (72, 14) => {
-                        regs.a0 = regs.pzacc;
-                        regs.p0 = regs.preg;
-                        assert_eq!(zvi, TW, "values consumed at A0 capture");
-                        assert_eq!(regs.a0, scale(sched.pz[0]), "A0 capture = PZ0");
-                        assert_eq!(regs.p0, sched.alpha_off[0], "P0 capture");
-                    }
-                    (145, 7) => {
-                        regs.a1 = regs.pzacc;
-                        regs.p1 = regs.preg;
-                        assert_eq!(
-                            regs.a1 - regs.a0,
-                            scale(sched.alpha_off[0] * sched.pz[1]),
-                            "A1 span capture"
-                        );
-                        assert_eq!(regs.p1, sched.alpha_off[1], "P1 capture");
-                    }
-                    (147, 5) => {
-                        regs.a2 = regs.pzacc;
-                        assert_eq!(
-                            regs.a2 - regs.a1,
-                            scale(sched.alpha_off[1] * sched.pz[2]),
-                            "A2 span capture"
-                        );
-                    }
-                    _ => {}
+                // A0/A1/A2 = group-0-end / group-1-end / chain-end reduced-
+                // opening snapshots, at shape-derived (block,row). Narrow:
+                // (72,14)/(145,7)/(147,5); wide: (426,14)/(853,7)/(854,6).
+                let pos = (*block, r);
+                if pos == (dcap[0].0, dcap[0].1) {
+                    regs.a0 = regs.pzacc;
+                    regs.p0 = regs.preg;
+                    assert_eq!(zvi, shape.tw, "values consumed at A0 capture");
+                    assert_eq!(regs.a0, scale(sched.pz[0]), "A0 capture = PZ0");
+                    assert_eq!(regs.p0, sched.alpha_off[0], "P0 capture");
+                } else if pos == (dcap[1].0, dcap[1].1) {
+                    regs.a1 = regs.pzacc;
+                    regs.p1 = regs.preg;
+                    assert_eq!(zvi, 2 * shape.tw, "values consumed at A1 capture");
+                    assert_eq!(
+                        regs.a1 - regs.a0,
+                        scale(sched.alpha_off[0] * sched.pz[1]),
+                        "A1 span capture"
+                    );
+                    assert_eq!(regs.p1, sched.alpha_off[1], "P1 capture");
+                } else if pos == (dcap[2].0, dcap[2].1) {
+                    regs.a2 = regs.pzacc;
+                    assert_eq!(zvi, 2 * shape.tw + shape.qw, "values consumed at A2 capture");
+                    assert_eq!(
+                        regs.a2 - regs.a1,
+                        scale(sched.alpha_off[1] * sched.pz[2]),
+                        "A2 span capture"
+                    );
                 }
             }
-            // PX0 capture at trace-leaf end.
-            if q_role == R_ABS_C5 && q_dparam == D_T && r == 3 {
+            // PX0 capture at trace-leaf end: the row after the last fresh word
+            // is consumed = ceil(f/2) = (f+1)/2 (narrow 3, wide 11).
+            if q_role == R_ABS_C5 && q_dparam == D_T && r == (shape.trace_last_fresh() + 1) / 2 {
                 regs.px0 = regs.pzacc;
             }
 
@@ -3431,7 +4643,7 @@ pub(crate) fn build_gate_trace(
                             (x2 as u16) | ((x3 as u16) << 8),
                             "draw limb (even)"
                         );
-                        fill_fs_row(&mut values, row, x3, x2, 0, false, false, false);
+                        fill_fs_row(&mut values, row, x3, x2, 0, false, false, false, &layout);
                     } else {
                         assert_eq!(
                             st_limb(pre, 2 * g),
@@ -3443,7 +4655,7 @@ pub(crate) fn build_gate_trace(
                             DrawKind::Field { accept, .. } => (accept, accept && regs.coef == 3),
                             DrawKind::Bits { .. } => (false, true),
                         };
-                        fill_fs_row(&mut values, row, x1, x0, acc, true, crot, grot);
+                        fill_fs_row(&mut values, row, x1, x0, acc, true, crot, grot, &layout);
                         // Register updates (the odd-row transition).
                         match d.kind {
                             DrawKind::Field {
@@ -3455,7 +4667,7 @@ pub(crate) fn build_gate_trace(
                                 assert_eq!(chal_group(chal), regs.grp, "draw group");
                                 if accept {
                                     assert_eq!(coeff, regs.coef, "draw coefficient");
-                                    meta.field_draws.push((row, masked));
+                                    field_draws.push((row, masked));
                                     if regs.coef < 3 {
                                         regs.curch[regs.coef] = masked;
                                         regs.coef += 1;
@@ -3477,11 +4689,11 @@ pub(crate) fn build_gate_trace(
                             DrawKind::Bits { value, purpose, .. } => {
                                 match purpose {
                                     m4gaterec::BitsTag::QueryPow => {
-                                        assert_eq!(regs.grp, G_POW);
+                                        assert_eq!(regs.grp, shape.g_pow());
                                         assert_eq!(value, 0, "query PoW");
                                     }
                                     m4gaterec::BitsTag::QueryIndex { q } => {
-                                        assert_eq!(regs.grp, G_IDX0 + q);
+                                        assert_eq!(regs.grp, shape.g_idx0() + q);
                                         regs.idxr[q] = value;
                                     }
                                 }
@@ -3497,7 +4709,7 @@ pub(crate) fn build_gate_trace(
                 let qr = &sched.queries[q_q];
                 match q_micro {
                     M_X1 => {
-                        if r < 22 {
+                        if r < shape.log_max {
                             let bit = (qidx >> r) & 1 == 1;
                             let bmux = ext_base(if bit { consts.kx[r] } else { Val::ONE });
                             let a = if r == 0 {
@@ -3505,8 +4717,8 @@ pub(crate) fn build_gate_trace(
                             } else {
                                 regs.mchain
                             };
-                            regs.mchain = bank_mul(&mut values, row, a, bmux);
-                            if r == 21 {
+                            regs.mchain = bank_mul(&mut values, row, a, bmux, &layout);
+                            if r == shape.log_max - 1 {
                                 assert_eq!(regs.mchain, qr.x, "x chain");
                                 regs.xreg = regs.mchain;
                             }
@@ -3514,80 +4726,84 @@ pub(crate) fn build_gate_trace(
                     }
                     M_INV => {
                         if r == 0 {
-                            let zx = bank_add_c(&mut values, row, regs.chal[G_ZETA], regs.xreg);
-                            let cp = bank_mul(&mut values, row, zx, qr.inv_z);
+                            let zx = bank_add_c(&mut values, row, regs.chal[G_ZETA], regs.xreg, &layout);
+                            let cp = bank_mul(&mut values, row, zx, qr.inv_z, &layout);
                             assert_eq!(cp, Ext::ONE, "inv_z witness");
                             regs.invz = qr.inv_z;
                         } else if r == 1 {
-                            let znx = bank_add_c(&mut values, row, regs.zn, regs.xreg);
-                            let cp = bank_mul(&mut values, row, znx, qr.inv_zn);
+                            let znx = bank_add_c(&mut values, row, regs.zn, regs.xreg, &layout);
+                            let cp = bank_mul(&mut values, row, znx, qr.inv_zn, &layout);
                             assert_eq!(cp, Ext::ONE, "inv_zn witness");
                             regs.invzn = qr.inv_zn;
                         }
                     }
-                    m @ (M_S0 | M_S1 | M_S2 | M_S3) => {
-                        let rf = (m - M_S0) as usize;
-                        let lf = [18usize, 14, 10, 8][rf];
+                    m if m >= shape.m_s(0) && m < shape.m_s(0) + n_rounds as u32 => {
+                        let rf = (m - shape.m_s(0)) as usize;
+                        let lf = shape.lf()[rf];
                         if r < lf {
-                            let bit = (qidx >> (CUM[rf + 1] + r)) & 1 == 1;
+                            let bit = (qidx >> (cum[rf + 1] + r)) & 1 == 1;
                             let bmux =
                                 ext_base(if bit { consts.sk[rf][r] } else { Val::ONE });
                             let a = if r == 0 { Ext::ONE } else { regs.mchain };
-                            regs.mchain = bank_mul(&mut values, row, a, bmux);
+                            regs.mchain = bank_mul(&mut values, row, a, bmux, &layout);
                         } else if r == lf {
                             let fold = &qr.folds[rf];
                             assert_eq!(regs.mchain, fold.s, "s chain");
                             let a = regs.mchain * ext_base(Val::from_u32(2));
-                            let cp = bank_mul(&mut values, row, a, fold.inv_2s);
+                            let cp = bank_mul(&mut values, row, a, fold.inv_2s, &layout);
                             assert_eq!(cp, Ext::ONE, "inv2s witness");
                             regs.inv2s = fold.inv_2s;
                         }
                     }
-                    m @ (M_B0 | M_B1 | M_B2 | M_B3) => {
-                        let rf = (m - M_B0) as usize;
-                        let la = LOG_ARITIES[rf];
+                    m if m >= shape.m_b(0) && m < shape.m_b(0) + n_rounds as u32 => {
+                        let rf = (m - shape.m_b(0)) as usize;
+                        let la = shape.log_arities[rf];
                         if r == 0 {
                             let cb =
-                                bank_mul(&mut values, row, regs.chal[G_BETA0 + rf], regs.inv2s);
+                                bank_mul(&mut values, row, regs.chal[G_BETA0 + rf], regs.inv2s, &layout);
                             regs.breg[0] = cb;
                         } else if r < la {
                             let bl = regs.breg[r - 1];
-                            let cb = bank_mul(&mut values, row, bl, bl);
+                            let cb = bank_mul(&mut values, row, bl, bl, &layout);
                             regs.breg[r] = cb * ext_base(Val::from_u32(2));
                         }
                     }
                     M_RO => match r {
-                        0 => regs.scr[0] = bank_mul(&mut values, row, regs.p0, regs.px0),
-                        1 => regs.scr[1] = bank_mul(&mut values, row, regs.p1, regs.pzacc),
+                        0 => regs.scr[0] = bank_mul(&mut values, row, regs.p0, regs.px0, &layout),
+                        1 => regs.scr[1] = bank_mul(&mut values, row, regs.p1, regs.pzacc, &layout),
                         2 => {
-                            let g0 = bank_add_c(&mut values, row, regs.a0, regs.px0);
-                            regs.scr[2] = bank_mul(&mut values, row, g0, regs.invz);
+                            let g0 = bank_add_c(&mut values, row, regs.a0, regs.px0, &layout);
+                            regs.scr[2] = bank_mul(&mut values, row, g0, regs.invz, &layout);
                         }
-                        3 => regs.mchain = bank_add_c(&mut values, row, regs.a1, regs.a0),
+                        3 => regs.mchain = bank_add_c(&mut values, row, regs.a1, regs.a0, &layout),
                         4 => {
-                            let d1 = bank_add_c(&mut values, row, regs.mchain, regs.scr[0]);
-                            regs.scr[3] = bank_mul(&mut values, row, d1, regs.invzn);
+                            let d1 = bank_add_c(&mut values, row, regs.mchain, regs.scr[0], &layout);
+                            regs.scr[3] = bank_mul(&mut values, row, d1, regs.invzn, &layout);
                         }
-                        5 => regs.mchain = bank_add_c(&mut values, row, regs.a2, regs.a1),
+                        5 => regs.mchain = bank_add_c(&mut values, row, regs.a2, regs.a1, &layout),
                         6 => {
-                            let d2 = bank_add_c(&mut values, row, regs.mchain, regs.scr[1]);
-                            regs.scr[4] = bank_mul(&mut values, row, d2, regs.invz);
+                            let d2 = bank_add_c(&mut values, row, regs.mchain, regs.scr[1], &layout);
+                            regs.scr[4] = bank_mul(&mut values, row, d2, regs.invz, &layout);
                         }
-                        7 => regs.mchain = bank_add(&mut values, row, regs.scr[2], regs.scr[3]),
+                        7 => regs.mchain = bank_add(&mut values, row, regs.scr[2], regs.scr[3], &layout),
                         8 => {
-                            let ro = bank_add(&mut values, row, regs.mchain, regs.scr[4]);
+                            let ro = bank_add(&mut values, row, regs.mchain, regs.scr[4], &layout);
                             assert_eq!(ro, scale(qr.ro), "reduced opening");
                             regs.runev = ro;
                         }
                         _ => {}
                     },
-                    m @ (M_FHI0 | M_FHI1 | M_FHI2 | M_FHI3) => {
-                        let rf = (m - M_FHI0) as usize;
-                        let pairs: &[(usize, usize)] = if rf < 3 {
-                            &[(1, 0), (1, 1), (1, 2), (1, 3), (2, 0), (2, 1), (3, 0)]
-                        } else {
-                            &[(1, 0)]
-                        };
+                    m if m >= shape.m_fhi(0) && m < shape.m_fhi(0) + n_rounds as u32 => {
+                        let rf = (m - shape.m_fhi(0)) as usize;
+                        // (level, pair) fold schedule of an arity-2^la round:
+                        // level l has 2^(la-1-l) pairs for l = 1..la.
+                        let la = shape.log_arities[rf];
+                        let mut pairs: Vec<(usize, usize)> = vec![];
+                        for l in 1..la {
+                            for i in 0..(1usize << (la - 1 - l)) {
+                                pairs.push((l, i));
+                            }
+                        }
                         if r < pairs.len() {
                             let (l, i) = pairs[r];
                             let lo = regs.scr[2 * i];
@@ -3602,23 +4818,27 @@ pub(crate) fn build_gate_trace(
                             }
                         }
                     }
-                    M_FIN => {
-                        if r < 8 {
-                            let bit = (qidx >> (14 + r)) & 1 == 1;
+                    m if m == shape.m_fin() => {
+                        // x_fin chain over the final-poly domain index bits:
+                        // fin_bits (= log_max - cum[n]) rows from bit fin_lo (= cum[n]).
+                        let fin_lo = cum[n_rounds];
+                        let fin_bits = shape.log_max - fin_lo;
+                        if r < fin_bits {
+                            let bit = (qidx >> (fin_lo + r)) & 1 == 1;
                             let bmux = ext_base(if bit { consts.kx[r] } else { Val::ONE });
                             let a = if r == 0 { Ext::ONE } else { regs.mchain };
-                            regs.mchain = bank_mul(&mut values, row, a, bmux);
-                            if r == 7 {
+                            regs.mchain = bank_mul(&mut values, row, a, bmux, &layout);
+                            if r == fin_bits - 1 {
                                 assert_eq!(regs.mchain, qr.x_fin, "x_fin chain");
                                 regs.xfin = regs.mchain;
                             }
                         }
                     }
-                    M_HORN => {
+                    m if m == shape.m_horn() => {
                         if r < 15 {
                             let a = if r == 0 { regs.fpreg[15] } else { regs.mchain };
-                            let c1 = bank_mul(&mut values, row, a, regs.xfin);
-                            let c2 = bank_add(&mut values, row, c1, regs.fpreg[14 - r]);
+                            let c1 = bank_mul(&mut values, row, a, regs.xfin, &layout);
+                            let c2 = bank_add(&mut values, row, c1, regs.fpreg[14 - r], &layout);
                             regs.mchain = c2;
                             if r == 14 {
                                 assert_eq!(c2, scale(qr.final_eval), "final-poly eval");
@@ -3633,10 +4853,10 @@ pub(crate) fn build_gate_trace(
             if pi == trailer_pi {
                 if r == 12 {
                     regs.fa2 =
-                        bank_mul(&mut values, row, regs.chal[G_FRIALPHA], regs.chal[G_FRIALPHA]);
+                        bank_mul(&mut values, row, regs.chal[G_FRIALPHA], regs.chal[G_FRIALPHA], &layout);
                 } else if r == 13 {
                     regs.zn =
-                        bank_mul(&mut values, row, regs.chal[G_ZETA], ext_base(consts.g_trace));
+                        bank_mul(&mut values, row, regs.chal[G_ZETA], ext_base(consts.g_trace), &layout);
                 }
             }
 
@@ -3646,15 +4866,15 @@ pub(crate) fn build_gate_trace(
                 let phasegate = regs.phc
                     && regs.refsel
                     && regs.blkcnt == 1
-                    && regs.fring == 7
-                    && regs.grp == G_DONE;
+                    && regs.fring == shape.n_obs_flushes() - 1
+                    && regs.grp == shape.g_done();
                 let phdend = regs.phd && regs.blkcnt == 1;
                 if regs.phq {
-                    regs.pr_rot = (regs.pr_rot + 1) % QSLOTS;
+                    regs.pr_rot = (regs.pr_rot + 1) % qslots;
                     if regs.qcnt == 1 {
-                        regs.qcnt = QSLOTS as u32;
+                        regs.qcnt = qslots as u32;
                         regs.qsel += 1;
-                        if regs.qsel == NQ {
+                        if regs.qsel == nq {
                             regs.phq = false;
                         }
                     } else {
@@ -3668,12 +4888,12 @@ pub(crate) fn build_gate_trace(
                         regs.oreg[i] = st_limb(out, i);
                     }
                 }
-                if matches!(info, PInfo::Obs { flush: 2, block } if *block == FLUSH_BLOCKS[2] - 1) {
+                if matches!(info, PInfo::Obs { flush: 2, block } if *block == shape.flush_blocks()[2] - 1) {
                     for m in 0..16 {
                         regs.f2dig[m] = st_limb(out, m);
                     }
                 }
-                if matches!(info, PInfo::Dup { block: 147 }) {
+                if matches!(info, PInfo::Dup { block } if *block == n_dup - 1) {
                     for m in 0..16 {
                         assert_eq!(st_limb(out, m), regs.f2dig[m], "dup digest binding");
                     }
@@ -3682,13 +4902,13 @@ pub(crate) fn build_gate_trace(
                     Some(PInfo::Obs { flush, block: 0 }) => {
                         assert_eq!(*flush, regs.fring + 1, "obs flush order");
                         regs.fring = *flush;
-                        regs.blkcnt = FLUSH_BLOCKS[*flush] as u32;
+                        regs.blkcnt = shape.flush_blocks()[*flush] as u32;
                         regs.bidx = 0;
                         regs.refsel = false;
                     }
                     Some(PInfo::Obs { .. }) => {
                         regs.blkcnt -= 1;
-                        regs.bidx = (regs.bidx + 1).min(5);
+                        regs.bidx = (regs.bidx + 1).min(layout.bidx_width - 1);
                     }
                     Some(PInfo::Refill) => {
                         regs.refsel = true;
@@ -3700,7 +4920,7 @@ pub(crate) fn build_gate_trace(
                         regs.phc = false;
                         regs.phd = true;
                         regs.refsel = false;
-                        regs.blkcnt = 148;
+                        regs.blkcnt = n_dup as u32;
                     }
                     Some(PInfo::Dup { .. }) => {
                         regs.blkcnt -= 1;
@@ -3727,194 +4947,598 @@ pub(crate) fn build_gate_trace(
         }
     }
 
-    // Pad rows: frozen registers.
-    for row in 24 * n_perms..rows {
-        write_row(&mut values, row, row % 24, &regs, &program, None);
-    }
     // Global self-checks against the recorder.
-    assert_eq!(regs.qsel, NQ, "all query blocks completed");
+    assert_eq!(regs.qsel, nq, "all query blocks completed");
     assert!(!regs.phq && !regs.phc && !regs.phd, "phases exhausted");
     for (g, e) in chal_expect.iter().enumerate() {
         assert_eq!(regs.chal[g], *e, "challenge register {g}");
     }
-    for q in 0..NQ {
+    for q in 0..nq {
         assert_eq!(regs.idxr[q] as usize, sched.queries[q].index, "index register {q}");
     }
     assert_eq!(regs.a0, scale(sched.pz[0]), "A0 = PZ group 0");
-    assert_eq!(regs.p0, sched.alpha_off[0], "P0 = fri_alpha^617");
+    assert_eq!(regs.p0, sched.alpha_off[0], "P0 = fri_alpha^tw");
     assert_eq!(
         regs.a1 - regs.a0,
         scale(sched.alpha_off[0] * sched.pz[1]),
         "A1 span"
     );
-    assert_eq!(regs.p1, sched.alpha_off[1], "P1 = fri_alpha^1234");
+    assert_eq!(regs.p1, sched.alpha_off[1], "P1 = fri_alpha^(2*tw)");
     assert_eq!(
         regs.a2 - regs.a1,
         scale(sched.alpha_off[1] * sched.pz[2]),
         "A2 span"
     );
     assert_eq!(regs.fpi, 16, "final poly fully captured");
+    regs
+}
 
-    fill_derived(&mut values);
+pub(crate) fn build_gate_trace(
+    sched: &Schedule,
+    inner_pvs: &[Val],
+    shape: &GateShape,
+    extra_capacity_bits: usize,
+) -> (RowMajorMatrix<Val>, GateMeta) {
+    // Slice 1b-3: the inner-proof `shape` is now an explicit parameter, so the
+    // interior node can pass `GateShape::wide()`. Narrow callers pass
+    // `&GateShape::narrow()` and are unchanged.
+    let consts = gate_consts_from_shape(shape);
+    let program = qprogram_from_shape(shape);
+    let layout = GateLayout::from_shape(shape);
+    let nq = shape.nq;
+    let qslots = shape.qslots();
+    let cum = shape.cum();
+    let n_rounds = shape.n_fri_rounds();
+    let opvs = outer_pvs(sched, inner_pvs, shape);
+    let (inputs, infos) = lane_plan(sched, shape);
+    let n_perms = inputs.len();
+    let outs: Vec<[u64; 25]> = inputs.iter().map(keccakf).collect();
 
-    (RowMajorMatrix::new(values, GATE_WIDTH), meta)
+    let keccak = p3_keccak_air::generate_trace_rows::<Val>(inputs.clone(), 0);
+    let rows = keccak.height();
+    // Shape/perm-driven rectangle height: the keccak lane pads n_perms·24 rows
+    // up to the next power of two. Narrow (2,382 perms) -> 2^16; wide
+    // single-child (~8,360 perms) -> 2^18.
+    let expected_rows = (n_perms * 24).next_power_of_two();
+    assert_eq!(rows, expected_rows, "gate rectangle height (n_perms={n_perms})");
+    let mut values = Vec::with_capacity((rows << extra_capacity_bits) * layout.gate_width);
+    values.resize(rows * layout.gate_width, Val::ZERO);
+    for r in 0..rows {
+        values[r * layout.gate_width..r * layout.gate_width + NUM_KECCAK_COLS]
+            .copy_from_slice(&keccak.values[r * NUM_KECCAK_COLS..(r + 1) * NUM_KECCAK_COLS]);
+    }
+    drop(keccak);
+
+    // Draw hosting: flush f's digest draws live on flush f+1's block 0
+    // (or the trailer for the last flush).
+    let nf = sched.flushes.len();
+    let n_chal_blocks: usize = sched.flushes.iter().map(|f| f.n_blocks).sum();
+    let trailer_pi = n_chal_blocks;
+    let mut hosted: HashMap<usize, Vec<m4gaterec::DrawRec>> = HashMap::new();
+    for d in &sched.draws {
+        let cons = if d.flush + 1 < nf {
+            sched.flushes[d.flush + 1].first_perm
+        } else {
+            trailer_pi
+        };
+        hosted.entry(cons).or_default().push(d.clone());
+    }
+    let mut chal_expect: Vec<Ext> = vec![sched.alpha, sched.zeta, sched.fri_alpha];
+    for r in 0..shape.n_fri_rounds() {
+        chal_expect.push(sched.betas[r]);
+    }
+    assert_eq!(chal_expect.len(), shape.n_chals());
+    // Final poly from the labeled obs stream.
+    let fpoly: Vec<Ext> = sched
+        .obs
+        .iter()
+        .find(|o| o.label == m4gaterec::ObsLabel::FinalPoly)
+        .unwrap()
+        .bytes
+        .chunks(16)
+        .map(|c| {
+            Ext::from_basis_coefficients_fn(|i| {
+                Val::from_u32(u32::from_le_bytes(c[4 * i..4 * i + 4].try_into().unwrap()))
+            })
+        })
+        .collect();
+    assert_eq!(fpoly.len(), 16);
+    let fa = sched.fri_alpha;
+    // Oracle: the concatenated zeta-opening ext values from the obs stream.
+    let zvals: Vec<Ext> = {
+        let mut bytes = vec![];
+        for g in 0..3 {
+            bytes.extend_from_slice(
+                &sched
+                    .obs
+                    .iter()
+                    .find(|o| o.label == m4gaterec::ObsLabel::ZetaVals { group: g })
+                    .unwrap()
+                    .bytes,
+            );
+        }
+        bytes
+            .chunks(16)
+            .map(|c| {
+                Ext::from_basis_coefficients_fn(|i| {
+                    Val::from_u32(u32::from_le_bytes(c[4 * i..4 * i + 4].try_into().unwrap()))
+                })
+            })
+            .collect()
+    };
+    // Reduced-opening dup-phase capture geometry (slice 1b-B2): (block,row,blkcnt)
+    // for the group-0/group-1/end boundaries, and the last dup block index.
+    let dcap = shape.dup_captures();
+    let n_dup = shape.flush_blocks()[2];
+
+    let mut meta = GateMeta {
+        query_rows: vec![],
+        field_draws: vec![],
+        trailer_row: 24 * trailer_pi,
+        n_perms,
+        opvs: opvs.clone(),
+    };
+
+    let regs = emit_child(
+        &mut values, 0, shape, &layout, &consts, &program, sched,
+        &inputs, &outs, &infos, &hosted, &chal_expect, &fpoly, fa,
+        &zvals, &dcap, n_dup, trailer_pi, None,
+        &mut meta.query_rows, &mut meta.field_draws,
+    );
+
+    // Pad rows: frozen registers.
+    for row in 24 * n_perms..rows {
+        write_row(&mut values, row, row % 24, &regs, &program, None, &layout, shape);
+        // layout.hit defining constraint on pad rows: gpb=0 (write_row zeros it)
+        // ⇒ glo=ghi=[1,0,0,0] ⇒ the global HIT constraint reduces to
+        // `hit == vc[0]`. write_row never fills hit, and the main perm loop's
+        // hit fill (the non-fold else-branch, `hit=[vc%16==0]`) does not run
+        // over pad rows — so mirror it here. Narrow's frozen vc lands off slot 0
+        // (last fold round has 4 leaves ⇒ vc=4), so this stays 0 = byte-identical;
+        // wide's last round has 16 leaves ⇒ vc wraps to 0, so hit must be 1.
+        values[row * layout.gate_width + layout.hit] = Val::from_bool(regs.vc % 16 == 0);
+    }
+
+    fill_derived(&mut values, &layout, shape);
+
+    (RowMajorMatrix::new(values, layout.gate_width), meta)
+}
+
+/// Per-child transcript-derived data consumed by `emit_child` (the setup half of
+/// build_gate_trace, factored so the interior builder can derive it once per
+/// child). Deterministic in (sched, shape).
+struct ChildDerived {
+    inputs: Vec<[u64; 25]>,
+    infos: Vec<PInfo>,
+    outs: Vec<[u64; 25]>,
+    hosted: std::collections::HashMap<usize, Vec<m4gaterec::DrawRec>>,
+    chal_expect: Vec<Ext>,
+    fpoly: Vec<Ext>,
+    fa: Ext,
+    zvals: Vec<Ext>,
+    trailer_pi: usize,
+}
+
+fn child_derived(sched: &Schedule, shape: &GateShape) -> ChildDerived {
+    let (inputs, infos) = lane_plan(sched, shape);
+    let outs: Vec<[u64; 25]> = inputs.iter().map(keccakf).collect();
+    let nf = sched.flushes.len();
+    let n_chal_blocks: usize = sched.flushes.iter().map(|f| f.n_blocks).sum();
+    let trailer_pi = n_chal_blocks;
+    let mut hosted: std::collections::HashMap<usize, Vec<m4gaterec::DrawRec>> =
+        std::collections::HashMap::new();
+    for d in &sched.draws {
+        let cons = if d.flush + 1 < nf {
+            sched.flushes[d.flush + 1].first_perm
+        } else {
+            trailer_pi
+        };
+        hosted.entry(cons).or_default().push(d.clone());
+    }
+    let mut chal_expect: Vec<Ext> = vec![sched.alpha, sched.zeta, sched.fri_alpha];
+    for r in 0..shape.n_fri_rounds() {
+        chal_expect.push(sched.betas[r]);
+    }
+    let to_ext = |bytes: &[u8]| -> Vec<Ext> {
+        bytes
+            .chunks(16)
+            .map(|c| {
+                Ext::from_basis_coefficients_fn(|i| {
+                    Val::from_u32(u32::from_le_bytes(c[4 * i..4 * i + 4].try_into().unwrap()))
+                })
+            })
+            .collect()
+    };
+    let fpoly = to_ext(
+        &sched
+            .obs
+            .iter()
+            .find(|o| o.label == m4gaterec::ObsLabel::FinalPoly)
+            .unwrap()
+            .bytes,
+    );
+    let mut zbytes = vec![];
+    for g in 0..3 {
+        zbytes.extend_from_slice(
+            &sched
+                .obs
+                .iter()
+                .find(|o| o.label == m4gaterec::ObsLabel::ZetaVals { group: g })
+                .unwrap()
+                .bytes,
+        );
+    }
+    let zvals = to_ext(&zbytes);
+    ChildDerived {
+        inputs,
+        infos,
+        outs,
+        hosted,
+        chal_expect,
+        fpoly,
+        fa: sched.fri_alpha,
+        zvals,
+        trailer_pi,
+    }
+}
+
+/// M4 step 1 stage 2 棒 2: assemble the two-child interior verifier rectangle —
+/// child L in rows `0..24*nL`, child R in rows `24*nL..24*(nL+nR)`, one keccak
+/// lane over both, padded to 2^19. The `csel` re-anchor (2b) restarts the
+/// automaton at each child's first row. For SAME-LEAF children `opvs_l == opvs_r`
+/// so a single outer-PV set serves both cap comparisons + F0 PV absorptions
+/// (per-child opvs routing for DISTINCT children is 2d). Correctness is checked
+/// via `check_constraints`; the full `prove` (RSS gate) is stage 3.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_interior_trace(
+    sched_l: &Schedule,
+    sched_r: &Schedule,
+    opvs_l: &[Val],
+    opvs_r: &[Val],
+    shape: &GateShape,
+    extra_capacity_bits: usize,
+) -> (RowMajorMatrix<Val>, GateMeta) {
+    let consts = gate_consts_from_shape(shape);
+    let program = qprogram_from_shape(shape);
+    let layout = GateLayout::from_shape(shape);
+    let dcap = shape.dup_captures();
+    let n_dup = shape.flush_blocks()[2];
+
+    let cd_l = child_derived(sched_l, shape);
+    let cd_r = child_derived(sched_r, shape);
+    let nl = cd_l.inputs.len();
+    let nr = cd_r.inputs.len();
+
+    // One keccak lane over both children (child L then child R) then the merge
+    // sponge (棒 3): child-L opvs digest, child-R opvs digest, root perm. The
+    // merge perms are placed at the TRACE END (child L | child R | zero-pad |
+    // merge) so the root perm's last row is the rectangle's `last_row` — the
+    // clean anchor for the merge-region pin (mreg/mcnt) in `eval` (棒 3-2). The
+    // merge perms are valid keccak-f (KeccakAir checks them); their preimages
+    // are bound to the public values in 棒 3-2 (eval binding).
+    let merge_inputs = crate::m4interior::merge_perm_inputs(opvs_l, opvs_r);
+    let nm = merge_inputs.len();
+    assert_eq!(nm, shape.merge_perms(), "merge perm count matches shape");
+    let real = nl + nr + nm;
+    let rows = (real * 24).next_power_of_two();
+    let total_perms = rows / 24;
+    let zero_pad = total_perms - real; // zero perms BETWEEN child R and merge
+    let mut all_inputs = cd_l.inputs.clone();
+    all_inputs.extend_from_slice(&cd_r.inputs);
+    all_inputs.extend(std::iter::repeat([0u64; 25]).take(zero_pad));
+    all_inputs.extend_from_slice(&merge_inputs);
+    assert_eq!(all_inputs.len(), total_perms, "lane exactly fills the rectangle");
+    let keccak = p3_keccak_air::generate_trace_rows::<Val>(all_inputs, 0);
+    assert_eq!(keccak.height(), rows, "no implicit keccak padding (merge is last)");
+    // First row of the merge region = the perm-aligned start of the last nm
+    // perms. NOT `rows - 24·nm`: a power-of-2 height is not a multiple of 24, so
+    // the trace's last perm is truncated (`rows mod 24`-row tail); the merge
+    // perms sit at global perm boundaries `24·(total_perms - nm)`, and the mreg
+    // suffix extends through the inert tail to last_row.
+    let merge_start = 24 * (total_perms - nm);
+    let mut values = Vec::with_capacity((rows << extra_capacity_bits) * layout.gate_width);
+    values.resize(rows * layout.gate_width, Val::ZERO);
+    for r in 0..rows {
+        values[r * layout.gate_width..r * layout.gate_width + NUM_KECCAK_COLS]
+            .copy_from_slice(&keccak.values[r * NUM_KECCAK_COLS..(r + 1) * NUM_KECCAK_COLS]);
+    }
+    drop(keccak);
+
+    // 2d per-child opvs: the interior's public values are `outer_pvs(L) ++
+    // outer_pvs(R)` (each = that child's caps + inner PVs). Child R's cap
+    // comparison selects the second half via the `chi`/`cc` routing in `eval`;
+    // same-leaf children just have identical halves. Verified against the
+    // `new_interior()` AIR (num_public_values = 2·n_opvs).
+    let mut opvs = outer_pvs(sched_l, opvs_l, shape);
+    opvs.extend(outer_pvs(sched_r, opvs_r, shape));
+    // 棒 3: the interior's exposed binding value = the merge root (§2), appended
+    // after the two consumed child opvs halves.
+    opvs.extend(crate::m4interior::merge_root(opvs_l, opvs_r));
+    let mut meta = GateMeta {
+        query_rows: vec![],
+        field_draws: vec![],
+        trailer_row: 24 * cd_l.trailer_pi,
+        n_perms: nl + nr + nm,
+        opvs: opvs.clone(),
+    };
+
+    let regs_l = emit_child(
+        &mut values, 0, shape, &layout, &consts, &program, sched_l, &cd_l.inputs, &cd_l.outs,
+        &cd_l.infos, &cd_l.hosted, &cd_l.chal_expect, &cd_l.fpoly, cd_l.fa, &cd_l.zvals, &dcap,
+        n_dup, cd_l.trailer_pi, None, &mut meta.query_rows, &mut meta.field_draws,
+    );
+    // Child R inherits child L's final non-anchored fold/arith registers so their
+    // freeze carries hold across the boundary (2b-iii fill-continuity).
+    let regs = emit_child(
+        &mut values, 24 * nl, shape, &layout, &consts, &program, sched_r, &cd_r.inputs,
+        &cd_r.outs, &cd_r.infos, &cd_r.hosted, &cd_r.chal_expect, &cd_r.fpoly, cd_r.fa,
+        &cd_r.zvals, &dcap, n_dup, cd_r.trailer_pi, Some(&regs_l),
+        &mut meta.query_rows, &mut meta.field_draws,
+    );
+
+    // Pad rows: frozen registers of the last child (mirror build_gate_trace).
+    for row in 24 * (nl + nr)..rows {
+        write_row(&mut values, row, row % 24, &regs, &program, None, &layout, shape);
+        values[row * layout.gate_width + layout.hit] = Val::from_bool(regs.vc % 16 == 0);
+    }
+    // 2d: `chi` = running child selector. 0 across child L (rows 0..24·nL,
+    // already zero-initialized), 1 across child R and the pad tail (rows
+    // 24·nL..). The pinned transition `chi_next = chi + csel_next` rises exactly
+    // at the csel child boundary (row 24·nL). `cc = chi·caps8` is filled by
+    // fill_derived, so chi must be set first.
+    for row in (24 * nl)..rows {
+        values[row * layout.gate_width + layout.chi] = Val::ONE;
+    }
+    // 棒 3-2 merge-region pin: `mreg` = 1 on the last 24·nm rows (the merge
+    // sponge), `mcnt` = running count of mreg (so mcnt[last_row] == 24·nm). The
+    // eval pins mreg monotone + mcnt == 24·nm at last_row, positively forcing the
+    // region to be exactly the merge perms (a prover cannot drop/move it).
+    if shape.merge_lane {
+        let w = layout.gate_width;
+        let nm2 = shape.merge_perms();
+        let kl = (nm2 - 1) / 2;
+        let thresholds =
+            [1u32, (24 * kl + 1) as u32, (24 * (nm2 - 1) + 1) as u32, (24 * nm2) as u32];
+        let mut cnt = 0u32;
+        for row in 0..rows {
+            if row >= merge_start {
+                cnt += 1;
+                values[row * w + layout.mreg] = Val::ONE;
+            }
+            values[row * w + layout.mcnt] = Val::from_u32(cnt);
+            // 棒 3-2b comparators (meq/minv) + reset flag (mrst = first 3 = sub-
+            // sponge starts; meq[3] = eq_end = root perm's last row).
+            let mcnt_v = Val::from_u32(cnt);
+            let mut rst = Val::ZERO;
+            for (k, tk) in thresholds.iter().enumerate() {
+                let diff = mcnt_v - Val::from_u32(*tk);
+                if diff == Val::ZERO {
+                    values[row * w + layout.meq + k] = Val::ONE;
+                    if k < 3 {
+                        rst = Val::ONE;
+                    }
+                } else {
+                    values[row * w + layout.minv + k] = diff.inverse();
+                }
+            }
+            values[row * w + layout.mrst] = rst;
+        }
+        // 棒 3-2c: dL carry. Captured at the childL→childR boundary (perm kl-1's
+        // output → perm kl's row 0), then freeze-held to the root perm. Fill dL
+        // for rows from child-R's start (merge_start + 24·kl) onward.
+        let (dl, _dr) = crate::m4interior::child_digests(opvs_l, opvs_r);
+        let dl_from = merge_start + 24 * kl;
+        for row in dl_from..rows {
+            for (m, &v) in dl.iter().enumerate() {
+                values[row * w + layout.dlr + m] = v;
+            }
+        }
+    }
+    fill_derived(&mut values, &layout, shape);
+    (RowMajorMatrix::new(values, layout.gate_width), meta)
 }
 
 /// Fill the Phase-1a degree-reduction columns: pure current-row functions of
 /// already-filled columns, mirroring the defining constraints in `eval`. Kept
 /// as a post-pass so the intricate per-perm witness logic above is untouched.
-fn fill_derived(values: &mut [Val]) {
-    let w = GATE_WIDTH;
+fn fill_derived(values: &mut [Val], layout: &GateLayout, shape: &GateShape) {
+    let w = layout.gate_width;
     let one = Val::ONE;
     let rows = values.len() / w;
     let ring = |base: usize, n: usize, g: usize| base + (n - g % n) % n;
+    let flush_blocks = shape.flush_blocks();
+    let lfs = shape.lf();
     for r in 0..rows {
         let base = r * w;
         let row = &values[base..base + w];
         let g = |col: usize| row[col];
-        // PD-bit literal: on ? bit : (1 - bit).
+        // layout.pd-bit literal: on ? bit : (1 - bit).
         let pl = |col: usize, on: bool| if on { row[col] } else { one - row[col] };
         // Family-2 raw bit-products.
         let mut m3 = [Val::ZERO; 8];
         for (a, slot) in m3.iter_mut().enumerate() {
-            *slot = pl(PD + 10, a & 1 == 1) * pl(PD + 11, a & 2 == 2) * pl(PD + 12, a & 4 == 4);
+            *slot = pl(layout.pd + 10, a & 1 == 1) * pl(layout.pd + 11, a & 2 == 2) * pl(layout.pd + 12, a & 4 == 4);
         }
         let mut rlo = [Val::ZERO; 4];
         let mut rhi = [Val::ZERO; 4];
         for j in 0..4 {
-            rlo[j] = pl(PD, j & 1 == 1) * pl(PD + 1, j & 2 == 2);
-            rhi[j] = pl(PD + 2, j & 1 == 1) * pl(PD + 3, j & 2 == 2);
+            rlo[j] = pl(layout.pd, j & 1 == 1) * pl(layout.pd + 1, j & 2 == 2);
+            rhi[j] = pl(layout.pd + 2, j & 1 == 1) * pl(layout.pd + 3, j & 2 == 2);
         }
         let mut dmux = Val::ZERO;
-        for k in 0..19 {
-            dmux += g(DLO + (k & 7)) * g(DHI + (k >> 3)) * g(IDXB + k);
+        for k in 0..(shape.log_max - shape.cap_height()) {
+            dmux += g(layout.dlo + (k & 7)) * g(layout.dhi + (k >> 3)) * g(layout.idxb + k);
         }
         // Family-3 fold gates/products.
         let mut glo = [Val::ZERO; 4];
         let mut ghi = [Val::ZERO; 4];
         for j in 0..4 {
-            glo[j] = pl(GPB, j & 1 == 1) * pl(GPB + 1, j & 2 == 2);
-            ghi[j] = pl(GPB + 2, j & 1 == 1) * pl(GPB + 3, j & 2 == 2);
+            glo[j] = pl(layout.gpb, j & 1 == 1) * pl(layout.gpb + 1, j & 2 == 2);
+            ghi[j] = pl(layout.gpb + 2, j & 1 == 1) * pl(layout.gpb + 3, j & 2 == 2);
         }
         let mut gf = [Val::ZERO; 4];
-        for rf in 0..4 {
-            gf[rf] = g(CONSF) * g(DRND + 2 + rf);
+        for rf in 0..shape.n_fri_rounds() {
+            gf[rf] = g(layout.consf) * g(layout.drnd + 2 + rf);
         }
-        // BPM = extmul(BREG, PBUF - v), v = ext(ASM0,ASM1,W0C,W1C).
+        // layout.bpm = extmul(layout.breg, layout.pbuf - v), v = ext(layout.asm0,layout.asm1,layout.w0c,layout.w1c).
         let w_ext = Val::from_u32(EXT_W);
-        let vv = [g(ASM0), g(ASM1), g(W0C), g(W1C)];
-        let pmv = [g(PBUF) - vv[0], g(PBUF + 1) - vv[1], g(PBUF + 2) - vv[2], g(PBUF + 3) - vv[3]];
+        let vv = [g(layout.asm0), g(layout.asm1), g(layout.w0c), g(layout.w1c)];
+        let pmv = [g(layout.pbuf) - vv[0], g(layout.pbuf + 1) - vv[1], g(layout.pbuf + 2) - vv[2], g(layout.pbuf + 3) - vv[3]];
         let mut bpm = [Val::ZERO; 4];
         for (k, slot) in bpm.iter_mut().enumerate() {
             let mut acc = Val::ZERO;
             for i in 0..4 {
                 for j in 0..4 {
                     if i + j == k {
-                        acc += g(BREG + i) * pmv[j];
+                        acc += g(layout.breg + i) * pmv[j];
                     } else if i + j == k + 4 {
-                        acc += w_ext * g(BREG + i) * pmv[j];
+                        acc += w_ext * g(layout.breg + i) * pmv[j];
                     }
                 }
             }
             *slot = acc;
         }
-        let mut fhg = [Val::ZERO; N_FHG];
-        for rf in 0..4 {
-            let npairs = if rf < 3 { 7 } else { 1 };
+        let mut fhg = vec![Val::ZERO; shape.n_fhg()];
+        for rf in 0..shape.n_fri_rounds() {
+            let npairs = (1usize << (shape.log_arities[rf] - 1)) - 1;
             for r in 0..npairs {
-                fhg[fhg_index(rf, r)] = g(MSEL + M_FHI0 as usize + rf) * g(r);
+                fhg[fhg_index(&shape.log_arities, rf, r)] =
+                    g(layout.msel + shape.m_fhi(rf) as usize) * g(r);
             }
         }
-        // PREGA = extmul(PREG, fri_alpha) for the PX word-1 accumulation term.
-        let fa_off = CHAL + 4 * G_FRIALPHA;
+        // layout.prega = extmul(layout.preg, fri_alpha) for the PX word-1 accumulation term.
+        let fa_off = layout.chal + 4 * G_FRIALPHA;
         let mut prega = [Val::ZERO; 4];
         for (k, slot) in prega.iter_mut().enumerate() {
             let mut acc = Val::ZERO;
             for i in 0..4 {
                 for j in 0..4 {
                     if i + j == k {
-                        acc += g(PREG + i) * g(fa_off + j);
+                        acc += g(layout.preg + i) * g(fa_off + j);
                     } else if i + j == k + 4 {
-                        acc += w_ext * g(PREG + i) * g(fa_off + j);
+                        acc += w_ext * g(layout.preg + i) * g(fa_off + j);
                     }
                 }
             }
             *slot = acc;
         }
         let sf23 = g(23);
-        let phc = g(PHC);
-        let phq = g(PHQ);
-        let blklast = g(BLKLAST);
-        let chlive = phc * (one - g(REFSEL));
-        let f2sel = g(ring(FRING, 8, 2)) * (one - g(BIDX));
-        let pg_a = g(ring(FRING, 8, 7)) * g(ring(GRP, N_GROUPS, G_DONE)) * phc;
+        let phc = g(layout.phc);
+        let phq = g(layout.phq);
+        let blklast = g(layout.blklast);
+        let chlive = phc * (one - g(layout.refsel));
+        let f2sel = g(ring(layout.fring, 8, 2)) * (one - g(layout.bidx));
+        // Final obs flush index = 3 + n_fri_rounds (narrow 7, wide 6); the fring
+        // ring width stays 8.
+        let pg_a = g(ring(layout.fring, 8, flush_blocks.len() - 1))
+            * g(ring(layout.grp, shape.n_groups(), shape.g_done()))
+            * phc;
         let phg = sf23 * blklast * pg_a;
-        let phdend = sf23 * g(PHD) * blklast;
+        let phdend = sf23 * g(layout.phd) * blklast;
         let cont = sf23 * phc * (one - blklast);
-        let eg_a = phq * g(QCW) * g(ring(QSEL, NQ + 1, NQ - 1));
+        let eg_a = phq * g(layout.qcw) * g(ring(layout.qsel, shape.nq + 1, shape.nq - 1));
         let endg = sf23 * eg_a;
-        let mut xsel = g(PHD) * (one - g(CMPC));
-        for f in 0..8 {
+        let mut xsel = g(layout.phd) * (one - g(layout.cmpc));
+        for f in 0..flush_blocks.len() {
             if f == 2 {
                 continue;
             }
-            for b in 1..FLUSH_BLOCKS[f] {
-                xsel += g(SHSEL + shsel_index(f, b));
+            for b in 1..flush_blocks[f] {
+                xsel += g(layout.shsel + shsel_index(&flush_blocks, f, b));
             }
         }
-        let qadv = sf23 * phq * g(QCW);
-        let mut consumersel = g(REFSEL);
-        for f in 1..8 {
-            consumersel += g(SHSEL + shsel_index(f, 0));
+        let qadv = sf23 * phq * g(layout.qcw);
+        let mut consumersel = g(layout.refsel);
+        for f in 1..flush_blocks.len() {
+            consumersel += g(layout.shsel + shsel_index(&flush_blocks, f, 0));
         }
-        let cfull = sf23 * consumersel * (one - g(FSFULL));
+        let cfull = sf23 * consumersel * (one - g(layout.fsfull));
         // row borrow ends; write the derived cells.
         let derived = [
-            (CHLIVE, chlive),
-            (F2SEL, f2sel),
-            (PG_A, pg_a),
-            (PHG, phg),
-            (PHDEND, phdend),
-            (CONT, cont),
-            (EG_A, eg_a),
-            (ENDG, endg),
-            (XSEL, xsel),
-            (QADV, qadv),
-            (CFULL, cfull),
-            (DMUX, dmux),
+            (layout.chlive, chlive),
+            (layout.f2sel, f2sel),
+            (layout.pg_a, pg_a),
+            (layout.phg, phg),
+            (layout.phdend, phdend),
+            (layout.cont, cont),
+            (layout.eg_a, eg_a),
+            (layout.endg, endg),
+            (layout.xsel, xsel),
+            (layout.qadv, qadv),
+            (layout.cfull, cfull),
+            (layout.dmux, dmux),
         ];
         for (col, val) in derived {
             values[base + col] = val;
         }
         for a in 0..8 {
-            values[base + M3 + a] = m3[a];
+            values[base + layout.m3 + a] = m3[a];
         }
         for j in 0..4 {
-            values[base + RLO + j] = rlo[j];
-            values[base + RHI + j] = rhi[j];
+            values[base + layout.rlo + j] = rlo[j];
+            values[base + layout.rhi + j] = rhi[j];
         }
-        // SNL_rf = MSEL[M_S0+rf] * (1 - sf(lfs[rf])).
-        let lfs = [18usize, 14, 10, 8];
-        for rf in 0..4 {
-            let msel = values[base + MSEL + M_S0 as usize + rf];
-            values[base + SNL + rf] = msel * (Val::ONE - values[base + lfs[rf]]);
+        // SNL_rf = layout.msel[M_S0+rf] * (1 - sf(lfs[rf])).
+        for rf in 0..shape.n_fri_rounds() {
+            let msel = values[base + layout.msel + shape.m_s(rf) as usize];
+            values[base + layout.snl + rf] = msel * (Val::ONE - values[base + lfs[rf]]);
         }
         for j in 0..4 {
-            values[base + GLO + j] = glo[j];
-            values[base + GHI + j] = ghi[j];
-            values[base + GF + j] = gf[j];
-            values[base + BPM + j] = bpm[j];
+            values[base + layout.glo + j] = glo[j];
+            values[base + layout.ghi + j] = ghi[j];
+            values[base + layout.gf + j] = gf[j];
+            values[base + layout.bpm + j] = bpm[j];
         }
-        for f in 0..N_FHG {
-            values[base + FHG + f] = fhg[f];
+        for (f, &val) in fhg.iter().enumerate() {
+            values[base + layout.fhg + f] = val;
         }
         for k in 0..4 {
-            values[base + PREGA + k] = prega[k];
+            values[base + layout.prega + k] = prega[k];
         }
-        values[base + CPA] = values[base + PHD] * values[base + CMPA];
-        values[base + CPB] = values[base + PHD] * values[base + CMPB];
-        values[base + CPL] = values[base + PHD] * values[base + BLKLAST];
-        values[base + CONSZ7] = values[base + CZ7] * values[base + POS + 1];
+        values[base + layout.cpa] = values[base + layout.phd] * values[base + layout.cmpa];
+        values[base + layout.cpb] = values[base + layout.phd] * values[base + layout.cmpb];
+        values[base + layout.cpl] = values[base + layout.phd] * values[base + layout.blklast];
+        values[base + layout.consz7] = values[base + layout.cz7] * values[base + layout.pos + 1];
+        // 2d: cc[j] = chi·caps8[j] (cap-half select). chi is pre-filled by the
+        // trace builder (0 for single-child / child L, 1 for child R); narrow → 0.
+        let chi_v = values[base + layout.chi];
+        for j in 0..shape.cap_len {
+            values[base + layout.cc + j] = chi_v * values[base + layout.caps8 + j];
+        }
+    }
+
+    // 2b-iii: materialize the fring-rotation gate (frgm = sf(23)·b0next) and the
+    // blkcnt update delta (bcbd) — both next-row-dependent (b0next / nv(shsel),
+    // nv(refsel)) — so their (1-csel_next)-gated carries stay ≤ deg 3. The last
+    // row has no successor (its transition constraints are inactive) → leave 0.
+    for r in 0..rows.saturating_sub(1) {
+        let cur = r * w;
+        let nxt = (r + 1) * w;
+        let sf23 = values[cur + 23];
+        let mut b0n = Val::ZERO;
+        for f in 1..flush_blocks.len() {
+            b0n += values[nxt + layout.shsel + shsel_index(&flush_blocks, f, 0)];
+        }
+        values[cur + layout.frgm] = sf23 * b0n;
+        let blkcnt = values[cur + layout.blkcnt];
+        let mut reload = Val::ZERO;
+        for f in 1..flush_blocks.len() {
+            reload += values[nxt + layout.shsel + shsel_index(&flush_blocks, f, 0)]
+                * (Val::from_u32(flush_blocks[f] as u32) - blkcnt);
+        }
+        let dupdec = sf23 * values[cur + layout.phd] * (one - values[cur + layout.blklast]);
+        values[cur + layout.bcbd] = sf23 * reload
+            + sf23 * values[nxt + layout.refsel] * (one - blkcnt)
+            - values[cur + layout.cont]
+            - dupdec
+            + values[cur + layout.phg] * (Val::from_u32(flush_blocks[2] as u32) - blkcnt);
+        // 棒 3-2b: mcont = merge-continue chain gate = sf(23)·mreg·(1 − next mrst
+        // − eq_end), where eq_end = meq[3] (root perm's last row → no forward chain).
+        if shape.merge_lane {
+            values[cur + layout.mcont] = sf23
+                * values[cur + layout.mreg]
+                * (one - values[nxt + layout.mrst] - values[cur + layout.meq + 3]);
+        }
     }
 }
 
@@ -3957,7 +5581,7 @@ pub(crate) fn run_m4gate(power: &str, only: Option<&str>) {
     // Build the real M3 proof + recorder schedule once (shared across configs).
     let (_inst, pvs, proof) = m4gaterec::consensus_proof();
     let sched = m4gaterec::walk(&proof, &pvs);
-    let n_perms = lane_plan(&sched).0.len();
+    let n_perms = lane_plan(&sched, &GateShape::narrow()).0.len();
     println!(
         "- rectangle: {GATE_WIDTH} cols x 2^16, {n_perms} lane perms; proves-in-circuit \
          a REAL M3 consensus proof with every gate column bound (FS/draw schedule, \
@@ -3981,7 +5605,7 @@ pub(crate) fn run_m4gate(power: &str, only: Option<&str>) {
         let mut proof_opt = None;
         let mut opvs = Vec::new();
         for _ in 0..RUNS {
-            let (trace, meta) = build_gate_trace(&sched, &pvs, cfg.log_blowup);
+            let (trace, meta) = build_gate_trace(&sched, &pvs, &GateShape::narrow(), cfg.log_blowup);
             rows = trace.height();
             opvs = meta.opvs.clone();
             let t = Instant::now();
@@ -4037,6 +5661,293 @@ mod tests {
         })
     }
 
+    /// Wide analogue of `shared()`: cache the interior child's leaf-proof
+    /// verification schedule + its opvs once (the ~12 GB leaf `prove` runs a
+    /// single time; only the small `Schedule` + opvs are retained). Used by the
+    /// wide SAT + negative tests so each re-uses one leaf proof.
+    pub(crate) fn wide_shared() -> &'static (Schedule, Vec<Val>) {
+        static CELL: OnceLock<(Schedule, Vec<Val>)> = OnceLock::new();
+        CELL.get_or_init(|| {
+            let (leaf, opvs) = crate::m4treerec::leaf_proof();
+            let sched = crate::m4treerec::walk_leaf(&leaf, &opvs);
+            (sched, opvs)
+        })
+    }
+
+    /// Cache the DISTINCT two-child pair (child L = leaf_proof, child R =
+    /// leaf_proof_variant) once — both ~12 GB leaf proves run a single time,
+    /// only the two small Schedules + opvs are retained. Shared by the distinct
+    /// SAT + per-child negative tests (2d-3/2d-4).
+    pub(crate) fn wide_shared_distinct() -> &'static (Schedule, Schedule, Vec<Val>, Vec<Val>) {
+        static CELL: OnceLock<(Schedule, Schedule, Vec<Val>, Vec<Val>)> = OnceLock::new();
+        CELL.get_or_init(|| crate::m4interior::two_child_schedule(true))
+    }
+
+    /// Wide analogue of `is_unsat`: check the mutated wide trace against the
+    /// `wide()`-shaped AIR in a spawned thread (panic == UNSAT == caught).
+    fn is_unsat_wide(trace: RowMajorMatrix<Val>, opvs: Vec<Val>) -> bool {
+        std::thread::spawn(move || {
+            check_constraints(&VerifierGateAir::new_with_shape(GateShape::wide()), &trace, &opvs);
+        })
+        .join()
+        .is_err()
+    }
+
+    /// `is_unsat_wide` against the interior AIR (`new_interior()`: doubled opvs
+    /// + per-child routing). Used by the two-child per-lane negatives (2d-4).
+    fn is_unsat_interior(trace: RowMajorMatrix<Val>, opvs: Vec<Val>) -> bool {
+        std::thread::spawn(move || {
+            check_constraints(&VerifierGateAir::new_interior(), &trace, &opvs);
+        })
+        .join()
+        .is_err()
+    }
+
+    /// M4 step 1 stage 2, slice 1a-i: `GateShape::narrow()` must reproduce the
+    /// shipped leaf gate's const block byte-for-byte, and `wide()` must carry
+    /// the interior target shape from `m4treerec` / the stage-1 run doc. This
+    /// pins the narrow->wide parameter mapping before any `eval` rewiring, so a
+    /// later slice can migrate the column-offset chain against a verified shape.
+    #[test]
+    fn gate_shape_narrow_reproduces_consts() {
+        let n = GateShape::narrow();
+        // Narrow scalars == the const block.
+        assert_eq!(n.tw, TW);
+        assert_eq!(n.qw, QW);
+        assert_eq!(n.n_pvs, N_PVS);
+        assert_eq!(n.nq, NQ);
+        assert_eq!(n.log_max, LOG_MAX);
+        assert_eq!(n.grind_bits, GRIND_BITS);
+        assert_eq!(n.cap_len, CAP_LEN);
+        assert_eq!(n.log_arities, LOG_ARITIES.to_vec());
+        // Narrow derived quantities == the const arrays/scalars.
+        assert_eq!(n.n_caps(), N_CAPS);
+        assert_eq!(n.cap_height(), 3);
+        assert_eq!(n.cum(), CUM.to_vec());
+        assert_eq!(n.path_levels(), PATH_LEVELS.to_vec());
+
+        // Wide interior target (from m4treerec::AGG_CFG + stage-1 run doc).
+        // tw = the leaf's committed width = GATE_WIDTH (3626 base + gate columns
+        // added since: csel etc.), derived so column additions auto-track.
+        let w = GateShape::wide();
+        assert_eq!(w.tw, GATE_WIDTH, "leaf wide row width = leaf gate width");
+        assert_eq!(w.qw, 8, "leaf wide quotient words/query");
+        assert_eq!(w.n_pvs, N_OPVS, "interior inner PVs = leaf gate opvs");
+        assert_eq!(w.n_pvs, 6 * 8 * 16 + 84, "= 852");
+        assert_eq!(w.nq, 40, "aggregation lane q40");
+        assert_eq!(w.log_max, 18, "leaf 2^16 committed at b4 -> LDE 2^18");
+        assert_eq!(w.log_arities, vec![4, 4, 4], "3 arity-16 FRI rounds");
+        assert_eq!(w.n_caps(), 5, "trace + quotient + 3 FRI");
+        assert_eq!(w.path_levels(), vec![15, 15, 11, 7, 3], "wide native path levels");
+    }
+
+    /// Slice 1a-i-b: `GateLayout::from_shape(&narrow())` must reproduce every
+    /// column-offset `const` byte-for-byte, so slice 1a-ii can mechanically
+    /// replace `const X` reads in `eval` with `layout.x` with confidence.
+    #[test]
+    fn gate_layout_narrow_reproduces_consts() {
+        let l = GateLayout::from_shape(&GateShape::narrow());
+        assert_eq!(l.mul_off, MUL_OFF);
+        assert_eq!(l.add_off, ADD_OFF);
+        assert_eq!(l.gb, GB);
+        assert_eq!(l.w0c, W0C);
+        assert_eq!(l.w1c, W1C);
+        assert_eq!(l.hb0, HB0);
+        assert_eq!(l.hb1, HB1);
+        assert_eq!(l.ta0, TA0);
+        assert_eq!(l.topa0, TOPA0);
+        assert_eq!(l.ta1, TA1);
+        assert_eq!(l.topa1, TOPA1);
+        assert_eq!(l.lbnz0, LBNZ0);
+        assert_eq!(l.lbi0, LBI0);
+        assert_eq!(l.lonz0, LONZ0);
+        assert_eq!(l.loi0, LOI0);
+        assert_eq!(l.lbnz1, LBNZ1);
+        assert_eq!(l.lbi1, LBI1);
+        assert_eq!(l.lonz1, LONZ1);
+        assert_eq!(l.loi1, LOI1);
+        assert_eq!(l.oreg, OREG);
+        assert_eq!(l.pbit, PBIT);
+        assert_eq!(l.obit, OBIT);
+        assert_eq!(l.fsbits, FSBITS);
+        assert_eq!(l.fsacc, FSACC);
+        assert_eq!(l.fsp3a, FSP3A);
+        assert_eq!(l.fsp3b, FSP3B);
+        assert_eq!(l.fst7, FST7);
+        assert_eq!(l.fsinv, FSINV);
+        assert_eq!(l.fsnz, FSNZ);
+        assert_eq!(l.fsaccept, FSACCEPT);
+        assert_eq!(l.fsgate, FSGATE);
+        assert_eq!(l.fsodd, FSODD);
+        assert_eq!(l.fsfull, FSFULL);
+        assert_eq!(l.grp, GRP);
+        assert_eq!(l.coef, COEF);
+        assert_eq!(l.curch, CURCH);
+        assert_eq!(l.crot, CROT);
+        assert_eq!(l.grot, GROT);
+        assert_eq!(l.chal, CHAL);
+        assert_eq!(l.fa2, FA2);
+        assert_eq!(l.znreg, ZNREG);
+        assert_eq!(l.idxr, IDXR);
+        assert_eq!(l.fring, FRING);
+        assert_eq!(l.blkcnt, BLKCNT);
+        assert_eq!(l.blklast, BLKLAST);
+        assert_eq!(l.blkinv, BLKINV);
+        assert_eq!(l.bidx, BIDX);
+        assert_eq!(l.bidx_width, 6, "narrow bidx one-hot width");
+        assert_eq!(l.cmpa, CMPA);
+        assert_eq!(l.cmpai, CMPAI);
+        assert_eq!(l.cmpb, CMPB);
+        assert_eq!(l.cmpbi, CMPBI);
+        assert_eq!(l.needl, NEEDL);
+        assert_eq!(l.refsel, REFSEL);
+        assert_eq!(l.shsel, SHSEL);
+        assert_eq!(l.phc, PHC);
+        assert_eq!(l.phq, PHQ);
+        assert_eq!(l.qsel, QSEL);
+        assert_eq!(l.qcnt, QCNT);
+        assert_eq!(l.qcw, QCW);
+        assert_eq!(l.qcwi, QCWI);
+        assert_eq!(l.pr, PR);
+        assert_eq!(l.pd, PD);
+        assert_eq!(l.rsel, RSEL);
+        assert_eq!(l.mlo, MLO);
+        assert_eq!(l.mhi, MHI);
+        assert_eq!(l.msel, MSEL);
+        assert_eq!(l.dlo, DLO);
+        assert_eq!(l.dhi, DHI);
+        assert_eq!(l.drnd, DRND);
+        assert_eq!(l.dbit, DBIT);
+        assert_eq!(l.glc, GLC);
+        assert_eq!(l.grc, GRC);
+        assert_eq!(l.caps8, CAPS8);
+        assert_eq!(l.idxb, IDXB);
+        assert_eq!(l.cz2, CZ2);
+        assert_eq!(l.cz7, CZ7);
+        assert_eq!(l.cf, CF);
+        assert_eq!(l.cx0, CX0);
+        assert_eq!(l.cx1, CX1);
+        assert_eq!(l.pos, POS);
+        assert_eq!(l.consz, CONSZ);
+        assert_eq!(l.consf, CONSF);
+        assert_eq!(l.asm0, ASM0);
+        assert_eq!(l.asm1, ASM1);
+        assert_eq!(l.vc, VC);
+        assert_eq!(l.vce, VCE);
+        assert_eq!(l.pbuf, PBUF);
+        assert_eq!(l.hit, HIT);
+        assert_eq!(l.gpb, GPB);
+        assert_eq!(l.lfs, LFS);
+        assert_eq!(l.preg, PREG);
+        assert_eq!(l.pzacc, PZACC);
+        assert_eq!(l.a0r, A0R);
+        assert_eq!(l.a1r, A1R);
+        assert_eq!(l.a2r, A2R);
+        assert_eq!(l.p0r, P0R);
+        assert_eq!(l.p1r, P1R);
+        assert_eq!(l.px0r, PX0R);
+        assert_eq!(l.fpreg, FPREG);
+        assert_eq!(l.scr, SCR);
+        assert_eq!(l.breg, BREG);
+        assert_eq!(l.inv2s, INV2S);
+        assert_eq!(l.invz, INVZ);
+        assert_eq!(l.invzn, INVZN);
+        assert_eq!(l.xreg, XREG);
+        assert_eq!(l.xfin, XFIN);
+        assert_eq!(l.runev, RUNEV);
+        assert_eq!(l.f2dig, F2DIG);
+        assert_eq!(l.phd, PHD);
+        assert_eq!(l.cmpc, CMPC);
+        assert_eq!(l.cmpci, CMPCI);
+        assert_eq!(l.czd, CZD);
+        assert_eq!(l.chlive, CHLIVE);
+        assert_eq!(l.f2sel, F2SEL);
+        assert_eq!(l.pg_a, PG_A);
+        assert_eq!(l.phg, PHG);
+        assert_eq!(l.phdend, PHDEND);
+        assert_eq!(l.cont, CONT);
+        assert_eq!(l.eg_a, EG_A);
+        assert_eq!(l.endg, ENDG);
+        assert_eq!(l.xsel, XSEL);
+        assert_eq!(l.qadv, QADV);
+        assert_eq!(l.cfull, CFULL);
+        assert_eq!(l.m3, M3);
+        assert_eq!(l.rlo, RLO);
+        assert_eq!(l.rhi, RHI);
+        assert_eq!(l.dmux, DMUX);
+        assert_eq!(l.snl, SNL);
+        assert_eq!(l.glo, GLO);
+        assert_eq!(l.ghi, GHI);
+        assert_eq!(l.gf, GF);
+        assert_eq!(l.bpm, BPM);
+        assert_eq!(l.n_fhg, N_FHG);
+        assert_eq!(l.fhg, FHG);
+        assert_eq!(l.prega, PREGA);
+        assert_eq!(l.cpa, CPA);
+        assert_eq!(l.cpb, CPB);
+        assert_eq!(l.cpl, CPL);
+        assert_eq!(l.consz7, CONSZ7);
+        assert_eq!(l.fpi, FPI);
+        assert_eq!(l.csel, CSEL);
+        assert_eq!(l.frgm, FRGM);
+        assert_eq!(l.bcbd, BCBD);
+        assert_eq!(l.chi, CHI);
+        assert_eq!(l.cc, CC);
+        assert_eq!(l.gate_cols, GATE_COLS);
+        assert_eq!(l.gate_width, GATE_WIDTH);
+    }
+
+    /// Slice 1b-1: every shape-varying transcript/draw-schedule count derived by
+    /// `GateShape` must reproduce its narrow module const — including the four
+    /// (`N_CHALS`/`N_GROUPS`/`N_ROLES`/`N_MICROS`) that were wrongly assumed
+    /// fixed. Pins the formulas before `from_shape` and the builders consume them.
+    #[test]
+    fn gate_shape_derived_counts_narrow() {
+        let n = GateShape::narrow();
+        assert_eq!(n.n_chals(), N_CHALS);
+        assert_eq!(n.n_groups(), N_GROUPS);
+        assert_eq!(n.g_pow(), G_POW);
+        assert_eq!(n.g_idx0(), G_IDX0);
+        assert_eq!(n.g_done(), G_DONE);
+        assert_eq!(n.n_roles(), N_ROLES);
+        assert_eq!(n.n_micros(), N_MICROS);
+        assert_eq!(n.n_flush_entries(), N_FLUSH_ENTRIES);
+        assert_eq!(n.n_fhg(), N_FHG);
+        assert_eq!(n.drnd_width(), 6);
+        assert_eq!(n.flush_bytes(), FLUSH_BYTES.to_vec());
+        assert_eq!(n.flush_blocks(), FLUSH_BLOCKS.to_vec());
+        assert_eq!(n.n_shapes_obs(), N_SHAPES_OBS);
+        assert_eq!(n.qslots(), QSLOTS);
+    }
+
+    /// Slice 1b-1: the wide-shape counts match the derived + empirically
+    /// confirmed values in `docs/m4-1b-wide-params-investigation.md` (one leaf
+    /// prove, 11.88 GB). These drive the interior verifier's layout.
+    #[test]
+    fn gate_shape_wide_values() {
+        let w = GateShape::wide();
+        assert_eq!(w.n_fri_rounds(), 3);
+        assert_eq!(w.n_chals(), 6);
+        assert_eq!(w.n_groups(), 48); // 5 + 3 + 40 (nq index slots won't fit 29)
+        assert_eq!(w.g_pow(), 6);
+        assert_eq!(w.g_idx0(), 7);
+        assert_eq!(w.g_done(), 47);
+        assert_eq!(w.n_roles(), 12);
+        assert_eq!(w.n_micros(), 15);
+        assert_eq!(w.n_flush_entries(), 8);
+        assert_eq!(w.n_fhg(), 21);
+        assert_eq!(w.drnd_width(), 5);
+        // F2 = 32 + 16·(2·tw + qw); tw = GATE_WIDTH (3638 with csel+frgm+bcbd +
+        // 2d's chi+cc[8]) → 116576. All other flushes are tw-independent.
+        assert_eq!(w.flush_bytes(), vec![3676, 288, 116576, 288, 288, 288, 304]);
+        // F2 blocks = 116576/136 + 1 = 858 (two more than the 856 at tw=3629 as
+        // the 9 routing columns widened the leaf).
+        assert_eq!(w.flush_blocks(), vec![28, 3, 858, 3, 3, 3, 3]);
+        assert_eq!(w.n_shapes_obs(), 46);
+        assert_eq!(w.qslots(), 165);
+        assert_eq!(w.bidx_width(), 29, "wide F0=28 blocks → bidx must address all + 1 sink");
+    }
+
     /// TEMP: byte-parse cross-check of the zeta-opening obs stream.
     #[test]
     fn probe_zval_parse() {
@@ -4082,7 +5993,7 @@ mod tests {
     fn gate_lowering_builds() {
         let _g = heavy_lock();
         let (sched, pvs, _) = shared();
-        let (trace, meta) = build_gate_trace(sched, pvs, 0);
+        let (trace, meta) = build_gate_trace(sched, pvs, &GateShape::narrow(), 0);
         assert_eq!(trace.height(), 1 << 16);
         assert_eq!(meta.query_rows.len(), NQ);
         eprintln!(
@@ -4100,15 +6011,22 @@ mod tests {
     #[test]
     fn constraint_degree_within_budget() {
         use p3_air::symbolic::{get_symbolic_constraints, AirLayout};
-        let air = VerifierGateAir::new();
-        let layout = AirLayout::from_air::<Val>(&air);
-        let cs = get_symbolic_constraints::<Val, _>(&air, layout);
-        let max = cs.iter().map(|c| c.degree_multiple()).max().unwrap_or(0);
-        assert!(
-            max <= 3,
-            "verifier gate AIR max constraint degree {max} > 3 (deg-3 house rule \
-             — the bench quotient sizing assumes it; see dump_constraint)"
-        );
+        // Both the leaf/narrow AIR and the 2d interior AIR (per-child opvs
+        // routing enabled: the deg-3 cap-half mux + deg-2 chi/cc pins) must
+        // stay within the deg-3 house rule.
+        for (name, air) in [
+            ("narrow", VerifierGateAir::new()),
+            ("interior", VerifierGateAir::new_interior()),
+        ] {
+            let layout = AirLayout::from_air::<Val>(&air);
+            let cs = get_symbolic_constraints::<Val, _>(&air, layout);
+            let max = cs.iter().map(|c| c.degree_multiple()).max().unwrap_or(0);
+            assert!(
+                max <= 3,
+                "{name} verifier gate AIR max constraint degree {max} > 3 (deg-3 \
+                 house rule — the bench quotient sizing assumes it; see dump_constraint)"
+            );
+        }
     }
 
     /// Diagnostic (relay debugging): dump a constraint's referenced columns
@@ -4120,7 +6038,17 @@ mod tests {
             get_symbolic_constraints, AirLayout, BaseEntry, BaseLeaf, SymbolicExpression,
         };
         use std::collections::BTreeSet;
-        let air = VerifierGateAir::new();
+        // WIDE=1 inspects the interior (wide) AIR's constraints — indices differ
+        // from narrow because eval loop bounds are shape-driven; used to
+        // diagnose the 1b-B* peel-the-onion wide check_constraints failures.
+        let shape = if std::env::var("WIDE").is_ok() {
+            let s = GateShape::wide();
+            eprintln!("WIDE GateLayout = {:?}", GateLayout::from_shape(&s));
+            s
+        } else {
+            GateShape::narrow()
+        };
+        let air = VerifierGateAir::new_with_shape(shape);
         let layout = AirLayout::from_air::<Val>(&air);
         let cs = get_symbolic_constraints::<Val, _>(&air, layout);
         let (argmax, maxdeg) = cs
@@ -4233,7 +6161,7 @@ mod tests {
     fn dump_accum() {
         let _g = heavy_lock();
         let (sched, pvs, _) = shared();
-        let (trace, _meta) = build_gate_trace(sched, pvs, 0);
+        let (trace, _meta) = build_gate_trace(sched, pvs, &GateShape::narrow(), 0);
         let w = trace.width();
         let val = &trace.values;
         let u = |row: usize, col: usize| -> u32 { val[row * w + col].to_unique_u32() };
@@ -4265,8 +6193,8 @@ mod tests {
     fn dump_trace() {
         let _g = heavy_lock();
         let (sched, pvs, _) = shared();
-        let (_ins, infos) = lane_plan(sched);
-        let (trace, _meta) = build_gate_trace(sched, pvs, 0);
+        let (_ins, infos) = lane_plan(sched, &GateShape::narrow());
+        let (trace, _meta) = build_gate_trace(sched, pvs, &GateShape::narrow(), 0);
         let w = trace.width();
         let val = trace.values;
         let at = |perm: usize, col: usize| -> u32 { val[(perm * 24 + 23) * w + col].to_unique_u32() };
@@ -4318,7 +6246,7 @@ mod tests {
         // (label, mutate) -> returns whether check_constraints panics (UNSAT).
         let _ = &air;
         let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>, &mut Vec<Val>)| {
-            let (mut trace, mut meta) = build_gate_trace(sched, pvs, 0);
+            let (mut trace, mut meta) = build_gate_trace(sched, pvs, &GateShape::narrow(), 0);
             mutate(&mut trace, &mut meta.opvs);
             let unsat = is_unsat(trace, meta.opvs.clone());
             eprintln!("  [{}] {label}", if unsat { "UNSAT ok" } else { "SAT  MISS" });
@@ -4334,14 +6262,14 @@ mod tests {
         // Neg1 tampered opening: flip a query trace-absorb preimage limb.
         probe("tampered-opening: flip query0 preimage limb 0", &|t, _o| {
             let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let (_, m) = build_gate_trace(sched2, pvs2, &GateShape::narrow(), 0);
             let row = m.query_rows[0];
             t.values[row * w + pcol(0)] += one;
         });
         // Neg3 wrong challenge: flip a recorded accepted field draw cell.
         probe("wrong-challenge: flip an accepted field-draw FSACC", &|t, _o| {
             let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let (_, m) = build_gate_trace(sched2, pvs2, &GateShape::narrow(), 0);
             let (row, _) = m.field_draws[0];
             t.values[row * w + FSACC] += one;
         });
@@ -4352,7 +6280,7 @@ mod tests {
         // Neg4 bad fold: corrupt a running-fold-eval limb.
         probe("bad-fold: flip RUNEV limb on a query row", &|t, _o| {
             let (sched2, pvs2, _) = shared();
-            let (_, m) = build_gate_trace(sched2, pvs2, 0);
+            let (_, m) = build_gate_trace(sched2, pvs2, &GateShape::narrow(), 0);
             let row = m.query_rows[0];
             t.values[row * w + RUNEV] += one;
         });
@@ -4397,7 +6325,7 @@ mod tests {
     fn gate_rectangle_satisfies() {
         let _g = heavy_lock();
         let (sched, pvs, _) = shared();
-        let (trace, meta) = build_gate_trace(sched, pvs, 0);
+        let (trace, meta) = build_gate_trace(sched, pvs, &GateShape::narrow(), 0);
         check_constraints(&VerifierGateAir::new(), &trace, &meta.opvs);
     }
 
@@ -4432,7 +6360,7 @@ mod tests {
     ) {
         let _g = heavy_lock();
         let (sched, pvs, _) = shared();
-        let (mut trace, mut meta) = build_gate_trace(sched, pvs, 0);
+        let (mut trace, mut meta) = build_gate_trace(sched, pvs, &GateShape::narrow(), 0);
         let qrows = meta.query_rows.clone();
         let fdraws = meta.field_draws.clone();
         mutate(&mut trace, &mut meta.opvs, &qrows, &fdraws);
@@ -4606,6 +6534,21 @@ mod tests {
         });
     }
 
+    /// csel child-boundary pin (2b, option B: completion-gated). On the
+    /// single-child narrow trace csel is 1 only at row 0; a prover must not be
+    /// able to re-anchor the automaton mid-child. Setting csel=1 on an interior
+    /// query row is UNSAT: the transition gate `csel_next·(1-endg)==0` fires
+    /// because `endg` (last-query end) is 0 on the row before a query start.
+    /// This is the soundness gate the coordinator flagged; it binds before any
+    /// two-child trace exists.
+    #[test]
+    fn gate_neg_csel_narrow() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, qr, _fd| {
+            t.values[qr[0] * w + CSEL] += Val::ONE;
+        });
+    }
+
     /// Gate-exit negative 4 (bad fold). BOUND (inc-4): the FRI fold ladders
     /// (round-0 leaf fold + M_FHI) pin the fold values, the fold-leaf
     /// consistency ties RUNEV to the sponge-bound openings at each round's
@@ -4685,5 +6628,351 @@ mod tests {
             }
             panic!("no M_RO perm found");
         });
+    }
+
+    /// Slice 1b-4 — the wide single-child interior verifier trace SATISFIES its
+    /// constraints. Builds a real leaf wide proof (b4/q40, ~12 GB), records its
+    /// verification schedule (`walk_leaf`), assembles the interior verifier
+    /// trace at `GateShape::wide()` (2^18 × wide width), and `check_constraints`
+    /// must pass — the first end-to-end wide correctness signal, and the check
+    /// that the Option A `M_HORN` END-pin (`RUNEV == Horner(final_poly, x_fin)`)
+    /// and the relocated `M_FIN`/`xfin` carry actually hold on real wide data.
+    /// `check_constraints` only (no full prove); the RSS gate is stage 3.
+    ///
+    /// SAT (2026-07-20, slice 1b-B8): the wide trace BUILDS and the full 2^18
+    /// `check_constraints` PASSES — the first end-to-end wide correctness signal.
+    /// Peel-the-onion history: B4 M_X1 OOB → B5 (bidx) row-0 shsel → B6 (caps8
+    /// fill) row-42216 → B7 (DRND loop/fold_dp) row-44808 → B8 **row 200616
+    /// (#5187 fold-leaf HIT-definition)**. B8 root cause: pad rows never filled
+    /// `hit` (the main perm loop's non-fold else-branch never runs over pad rows),
+    /// while the global HIT constraint reduces to `hit==vc[0]` there; wide's last
+    /// fold round has 16 leaves so the frozen `vc` wraps to slot 0 → mismatch
+    /// (narrow's 4-leaf last round left vc=4, masking it). Fixed in the pad loop.
+    /// `check_constraints` only (no full prove); the RSS gate is stage 3.
+    #[test]
+    fn interior_single_child_satisfies() {
+        let _g = heavy_lock();
+        let (leaf, opvs) = crate::m4treerec::leaf_proof();
+        let sched = crate::m4treerec::walk_leaf(&leaf, &opvs);
+        let (trace, meta) = build_gate_trace(&sched, &opvs, &GateShape::wide(), 0);
+        check_constraints(
+            &VerifierGateAir::new_with_shape(GateShape::wide()),
+            &trace,
+            &meta.opvs,
+        );
+    }
+
+    /// Slice 1b-5: the shape-tied tamper negatives, re-derived for the WIDE
+    /// single-child trace (2^18 × wide width). Mirrors the narrow `gate_neg_*`
+    /// set but reads the wide `GateLayout` offsets and asserts each single-cell
+    /// tamper is UNSAT under the `wide()` AIR — the soundness counterpart to the
+    /// 1b-4 SAT signal. Especially exercises the Option-A `M_HORN`/`RUNEV`
+    /// END-pin (bad-fold / fpreg / xfin) on real wide data, and the fold-leaf
+    /// VC one-hot (the 1b-B8 region). One wide trace is built and cloned per
+    /// probe (each `check_constraints` is a full 2^18 pass).
+    #[test]
+    fn interior_single_child_negatives() {
+        let _g = heavy_lock();
+        let (sched, opvs) = wide_shared();
+        let shape = GateShape::wide();
+        let l = GateLayout::from_shape(&shape);
+        let w = l.gate_width;
+        let one = Val::ONE;
+
+        let (base_trace, meta) = build_gate_trace(sched, opvs, &shape, 0);
+        let qrows = meta.query_rows.clone();
+        let fdraws = meta.field_draws.clone();
+        let base_opvs = meta.opvs.clone();
+        assert!(!qrows.is_empty() && !fdraws.is_empty(), "wide meta populated");
+        let q0 = qrows[0];
+
+        let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>, &mut Vec<Val>)| {
+            let mut trace = base_trace.clone();
+            let mut o = base_opvs.clone();
+            mutate(&mut trace, &mut o);
+            assert!(is_unsat_wide(trace, o), "expected UNSAT (wide): {label}");
+        };
+
+        // --- structural / gate-exit ------------------------------------------
+        // wrong-root: corrupt cap-0 (trace tree) limb0 across all 8 digests.
+        probe("wrong-root: cap0 all-digest limb0", &|_t, o| {
+            for j in 0..shape.cap_len {
+                o[cap_limb_opv(0, j, 0)] += one;
+            }
+        });
+        // tampered-opening: flip query-0 trace-leaf preimage limb.
+        probe("tampered-opening: q0 preimage limb0", &|t, _o| {
+            t.values[q0 * w + pcol(0)] += one;
+        });
+        // wrong-query-index: flip the FS-sampled index register.
+        probe("wrong-query-index: IDXR[0]@q0", &|t, _o| {
+            t.values[q0 * w + l.idxr] += one;
+        });
+        // wrong-challenge: flip an accepted field-draw's FSACC.
+        probe("wrong-challenge: FSACC@draw0", &|t, _o| {
+            t.values[fdraws[0].0 * w + l.fsacc] += one;
+        });
+
+        // --- fold-leaf VC schedule (the 1b-B8 region) ------------------------
+        probe("value-schedule: VC[3]@q0 (break one-hot)", &|t, _o| {
+            t.values[q0 * w + l.vc + 3] += one;
+        });
+
+        // --- START endpoint pins (reduced opening) ---------------------------
+        probe("pzacc@q0", &|t, _o| {
+            t.values[q0 * w + l.pzacc] += one;
+        });
+        probe("preg@q0", &|t, _o| {
+            t.values[q0 * w + l.preg] += one;
+        });
+        probe("capture A0R@q0", &|t, _o| {
+            t.values[q0 * w + l.a0r] += one;
+        });
+        // M_RO reduced-opening assembly: flip an SCR intermediate on an M_RO perm.
+        probe("mro: SCR@row3 of an M_RO perm", &|t, _o| {
+            let n = t.values.len() / w;
+            let mro = l.msel + M_RO as usize;
+            for perm in 0..(n / 24) {
+                if t.values[(perm * 24 + 23) * w + mro] == one {
+                    t.values[(perm * 24 + 3) * w + l.scr] += one;
+                    return;
+                }
+            }
+            panic!("no M_RO perm found (wide)");
+        });
+
+        // --- END endpoint pins (Option-A M_HORN / RUNEV soundness) -----------
+        probe("bad-fold: RUNEV@q0", &|t, _o| {
+            t.values[q0 * w + l.runev] += one;
+        });
+        probe("fpreg@q0", &|t, _o| {
+            t.values[q0 * w + l.fpreg] += one;
+        });
+        probe("xfin-chain: XFIN@q0", &|t, _o| {
+            t.values[q0 * w + l.xfin] += one;
+        });
+        probe("xreg-chain: XREG@q0", &|t, _o| {
+            t.values[q0 * w + l.xreg] += one;
+        });
+    }
+
+    /// 棒 2 (2c): two child leaf proofs verified in one 2^19 rectangle (row-
+    /// stacked, csel re-anchored at the child boundary). Same-leaf children →
+    /// single opvs. `check_constraints` must pass (the two-child correctness
+    /// signal; ~8 GB raw trace, no prove). Distinct children + per-lane tamper
+    /// negatives are 2d.
+    ///
+    /// SAT (2026-07-20, 2c + 2b-iii): the full 2^19 two-child rectangle passes
+    /// `check_constraints`. Child L (rows 0..24·8359) + child R re-anchor at the
+    /// csel boundary; the query-phase-end boundary carries are resolved two ways —
+    /// anchored automaton families (qsel/fring/grp/coef/blkcnt/phc/phd/phq) gated
+    /// with `(1-csel_next)` (fring/blkcnt via materialized frgm/bcbd for deg ≤3);
+    /// non-anchored fold/data registers (oreg, fold arith, chal/idxr/curch)
+    /// carried by fill-continuity (child R inherits child L's final values).
+    #[test]
+    fn interior_two_child_satisfies() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = crate::m4interior::two_child_schedule(false);
+        let (trace, meta) = build_interior_trace(&sl, &sr, &ol, &or, &GateShape::wide(), 0);
+        check_constraints(&VerifierGateAir::new_interior(), &trace, &meta.opvs);
+    }
+
+    /// 2d-3 (HARD PR-gate): the two children are DISTINCT leaf proofs (child R
+    /// from `leaf_proof_variant` — a different M3 witness → different caps +
+    /// inner PVs). Identical children (L == R) can mask cross-wiring / symmetry
+    /// bugs; only a distinct pair proves the per-child opvs routing (2d-2)
+    /// actually binds child R to the SECOND half of `opvsL ++ opvsR`. Must be
+    /// `check_constraints`-SAT (~8 GB raw trace at 2^19; no full prove).
+    #[test]
+    fn interior_two_child_satisfies_distinct() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let (trace, meta) = build_interior_trace(sl, sr, ol, or, &GateShape::wide(), 0);
+        check_constraints(&VerifierGateAir::new_interior(), &trace, &meta.opvs);
+    }
+
+    /// 2d-4 (PR-gate): per-child + distinct tamper negatives. Build ONE interior
+    /// trace over DISTINCT children, clone-per-probe, and assert each single-cell
+    /// tamper is UNSAT under `new_interior()`. Together they prove BOTH lanes are
+    /// bound (not just child L) and that the 2d-2 routing binds child R to its
+    /// OWN opvs half (a misroute reading child L's half would leave the child-R
+    /// opvs tamper SAT):
+    ///  (a) child-L opening  — the L lane's query opening is bound;
+    ///  (b) child-R opening  — the R lane is bound independently (rows ≥ 24·nL);
+    ///  (c) child-R opvs      — child R reads the SECOND half of opvsL ++ opvsR.
+    #[test]
+    fn interior_two_child_negatives() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let l = GateLayout::from_shape(&shape);
+        let w = l.gate_width;
+        let one = Val::ONE;
+        let nq = shape.nq;
+        let n_opvs = shape.n_opvs();
+
+        let (base_trace, meta) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        let base_opvs = meta.opvs.clone();
+        // query_rows records child L's nq queries first (absolute rows < 24·nL),
+        // then child R's (rows ≥ 24·nL) — one push per query, in emit order.
+        assert_eq!(meta.query_rows.len(), 2 * nq, "both children's queries recorded");
+        let qr_l = meta.query_rows[0];
+        let qr_r = meta.query_rows[nq];
+        assert!(qr_l < qr_r, "child R queries live in the upper row-stacked region");
+
+        let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>, &mut Vec<Val>)| {
+            let mut trace = base_trace.clone();
+            let mut o = base_opvs.clone();
+            mutate(&mut trace, &mut o);
+            assert!(is_unsat_interior(trace, o), "expected UNSAT (interior): {label}");
+        };
+
+        probe("child-L opening: q0 preimage limb0", &|t, _o| {
+            t.values[qr_l * w + pcol(0)] += one;
+        });
+        probe("child-R opening: q0 preimage limb0", &|t, _o| {
+            t.values[qr_r * w + pcol(0)] += one;
+        });
+        probe("child-R opvs: cap0 all-digest limb0 (second half)", &|_t, o| {
+            for j in 0..shape.cap_len {
+                o[n_opvs + cap_limb_opv(0, j, 0)] += one;
+            }
+        });
+    }
+
+    /// 棒 3-1: the interior's public values carry the merge root
+    /// `keccak(keccak(opvsL) ‖ keccak(opvsR))` (§2) appended after the two
+    /// consumed child-opvs halves, and the merge sponge perms are valid keccak-f
+    /// (check_constraints SAT). This slice lands the NATIVE merge + the exposed
+    /// root; the eval binding (merge preimage ↔ pv(opvs), output ↔ pv(root)) is
+    /// 棒 3-2, so the root is not yet constraint-bound to opvs here.
+    #[test]
+    fn interior_merge_native() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let n_opvs = shape.n_opvs();
+        let (trace, meta) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        // Public values are [opvsL | opvsR | merge_root]; the root tail matches
+        // the native merge, and the whole rectangle (incl. the merge perms) is SAT.
+        assert_eq!(meta.opvs.len(), 2 * n_opvs + crate::m4interior::MERGE_ROOT_LIMBS);
+        assert_eq!(
+            &meta.opvs[2 * n_opvs..],
+            &crate::m4interior::merge_root(ol, or)[..],
+            "interior root == keccak-merge(digest(opvsL), digest(opvsR))"
+        );
+        check_constraints(&VerifierGateAir::new_interior(), &trace, &meta.opvs);
+    }
+
+    /// 棒 3-2a: the merge-region pin (mreg monotone + mcnt == 24·nm at last_row)
+    /// positively forces the last 24·nm rows to BE the merge sponge. Tampering
+    /// the region (drop a mreg=1 / bump the counter) must be UNSAT — otherwise a
+    /// prover could shrink/relocate the region and dodge the merge binding
+    /// (棒 3-2b/c). Merge is at the trace end so the root perm's last row is
+    /// `last_row`.
+    #[test]
+    fn interior_neg_merge_region() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let l = GateLayout::from_shape(&shape);
+        let w = l.gate_width;
+        let one = Val::ONE;
+        let nm = shape.merge_perms();
+        let (base, _m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        let rows = base.values.len() / w;
+        let merge_start = 24 * (rows / 24 - nm); // perm-aligned (height not mult of 24)
+
+        let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>)| {
+            let mut t = base.clone();
+            mutate(&mut t);
+            let o = _m.opvs.clone();
+            assert!(is_unsat_interior(t, o), "expected UNSAT (region): {label}");
+        };
+        // Drop the merge-region flag on its first row → running-count transition
+        // breaks (and mcnt no longer reaches 24·nm at last_row).
+        probe("drop mreg at region start", &|t| {
+            t.values[merge_start * w + l.mreg] -= one;
+        });
+        // Bump the region counter at the last row → mcnt != 24·nm.
+        probe("bump mcnt at last_row", &|t| {
+            t.values[(rows - 1) * w + l.mcnt] += one;
+        });
+        // Raise mreg early (before the region) → monotone says it must then stay
+        // 1, but it's 0 right after → UNSAT (also over-counts mcnt).
+        probe("spurious mreg before region", &|t| {
+            t.values[(merge_start - 48) * w + l.mreg] += one;
+        });
+    }
+
+    /// 棒 3-2b: the capacity-chain machinery — sub-sponge-start comparators
+    /// (meq/minv → mrst) + the materialized chain gate (mcont) — is constraint-
+    /// pinned, not free witness. Tampering it must be UNSAT. (The end-to-end
+    /// value soundness — chain actually forces root == keccak(opvs) — is exercised
+    /// by the opvs-tamper negative in 棒 3-2c, once the root squeeze is bound.)
+    #[test]
+    fn interior_neg_merge_chain() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let l = GateLayout::from_shape(&shape);
+        let w = l.gate_width;
+        let one = Val::ONE;
+        let nm = shape.merge_perms();
+        let kl = (nm - 1) / 2;
+        let t1 = 24 * kl + 1; // childR sub-sponge start (mcnt)
+        let (base, _m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        let rows = base.values.len() / w;
+        let merge_start = 24 * (rows / 24 - nm); // perm-aligned (height not mult of 24)
+
+        let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>)| {
+            let mut t = base.clone();
+            mutate(&mut t);
+            assert!(is_unsat_interior(t, _m.opvs.clone()), "expected UNSAT (chain): {label}");
+        };
+        // Drop the reset flag at the child-R sub-sponge start (mcnt == t1): breaks
+        // `mrst == Σ meq` (the comparator still fires meq1 = 1).
+        probe("drop mrst at childR sponge start", &|t| {
+            t.values[(merge_start + t1 - 1) * w + l.mrst] -= one;
+        });
+        // Tamper the materialized chain gate on a genuine chain boundary (merge
+        // perm 0 r=23, whose next perm is not a reset): breaks the mcont defn.
+        probe("tamper mcont on a chain boundary", &|t| {
+            t.values[(merge_start + 23) * w + l.mcont] += one;
+        });
+    }
+
+    /// 棒 3-2c: the tree-merge digest binding. `interior_merge_native` is the
+    /// positive (root perm output == pv(root), with dL carried / dR adjacent).
+    /// Here the soundness negatives:
+    ///  - wrong-merge: a root public value ≠ keccak-merge(opvsL, opvsR) → the root
+    ///    squeeze bind fails → UNSAT (the §2 exposed digest is bound in-circuit);
+    ///  - tampered dL carry: perturbing the carried child-L digest breaks the
+    ///    root perm's input-rate bind → UNSAT (the dL→root link is live).
+    #[test]
+    fn interior_neg_merge_bind() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let l = GateLayout::from_shape(&shape);
+        let w = l.gate_width;
+        let one = Val::ONE;
+        let n_opvs = shape.n_opvs();
+        let (base, m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        let rows = base.values.len() / w;
+        let root_r0 = 24 * (rows / 24 - 1); // root perm = last full perm
+
+        // wrong-merge: tamper a root public value.
+        {
+            let mut o = m.opvs.clone();
+            o[2 * n_opvs] += one; // root[0] ≠ keccak-merge(dL, dR)
+            assert!(is_unsat_interior(base.clone(), o), "wrong merge root must be UNSAT");
+        }
+        // tampered dL carry at the root perm → input-rate bind fails.
+        {
+            let mut t = base.clone();
+            t.values[root_r0 * w + l.dlr] += one;
+            assert!(is_unsat_interior(t, m.opvs.clone()), "tampered dL carry must be UNSAT");
+        }
     }
 }

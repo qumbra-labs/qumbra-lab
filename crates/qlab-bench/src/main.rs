@@ -21,6 +21,7 @@ mod m4anchor;
 mod m4census;
 mod m4gate;
 mod m4gaterec;
+mod m4interior;
 mod m4treerec;
 mod m4price;
 mod m4route;
@@ -922,6 +923,12 @@ fn main() {
         }
         "m4tree" => {
             m4treerec::run_m4tree(&power);
+            return;
+        }
+        "m4interior" => {
+            let only_pos = args.iter().position(|a| a == "--only");
+            let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
+            m4interior::run_m4interior(&power, only);
             return;
         }
         "m4price" => {
