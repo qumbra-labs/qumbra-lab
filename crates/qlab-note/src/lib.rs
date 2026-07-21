@@ -15,4 +15,4 @@
 //! (`qlab_air::reference::keccak_f` + the `value‖rkm‖rho‖rseed` packing the
 //! circuit binds) — never forked. See `note::note_commitment`.
 
-// Modules are added incrementally per docs/m5-note-plan.md (T2..T7).
+pub mod hash;
