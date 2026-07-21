@@ -261,7 +261,7 @@ degraded-mode behavior). Reproduce twice per bench discipline.
 | 2 | finality committee (⚠ ML-DSA stop-point) | **DONE** | ml-dsa 0.1.1 wired; committee + ⅔-quorum ML-DSA-65 votes + `FinalityTracker` + anchors-from-finalized-only API; +9 tests (devnet 39). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 39 / note 21 = 146, 0 fail) |
 | 3 | Ebb-and-Flow semantics | **DONE** | finality-aware fork choice (no-reorg-past-finality, load-bearing test), equivocation→tombstone+slash, jail-no-slash, stall→degraded→recover; +9 tests (devnet 48). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 48 / note 21 = 155, 0 fail) |
 | 4 | multi-node local sim | **DONE** | in-process `Network` (gossip, partition/heal) + posted-price fee table; scenarios: partition/rejoin, committee-minority offline, miner-only liveness; +6 tests (devnet 54). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 54 / note 21 = 161, 0 fail) |
-| 5 | real-proof integration + report | not started | — |
+| 5 | real-proof integration + report | **in progress** | 5a DONE: `body.rs` (BlockBody + `TxVerifier` + `validate_body`: proof/anchor-final/fee/nullifier), mock-tested, +5 (devnet 59). 5b: `m6devnet` bench mode (real M3 proofs + measured report) — next |
 
 ## Placeholder-constants inventory
 

@@ -27,6 +27,7 @@
 //! Conservative hash everywhere in consensus (performance-budget §2): the Keccak
 //! primitive is `qlab_air::reference::keccak_f`, wrapped by [`hash::keccak256`].
 
+pub mod body;
 pub mod chain;
 pub mod committee;
 pub mod ebbflow;
