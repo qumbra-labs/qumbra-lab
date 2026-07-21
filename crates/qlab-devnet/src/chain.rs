@@ -114,6 +114,39 @@ impl ChainState {
         self.blocks.get(hash).map(|e| e.cumulative_work)
     }
 
+    /// Walk back `depth` parent links from `hash`. `depth = 0` returns `hash`
+    /// itself; `depth = 1` its parent, etc. `None` if the walk runs off the end
+    /// of the known chain (e.g. past genesis) or `hash` is unknown.
+    pub fn ancestor(&self, hash: &Hash32, depth: u64) -> Option<Hash32> {
+        let mut cur = *hash;
+        for _ in 0..depth {
+            let entry = self.blocks.get(&cur)?;
+            if entry.header.height == 0 {
+                return None; // genesis has no parent
+            }
+            cur = entry.header.prev;
+        }
+        // Confirm the final hash is actually known.
+        self.blocks.contains_key(&cur).then_some(cur)
+    }
+
+    /// The main chain (heaviest), genesis → tip inclusive, as a Vec of hashes.
+    /// Walks back from the tip along parent links, then reverses.
+    pub fn main_chain(&self) -> Vec<Hash32> {
+        let mut chain = Vec::with_capacity(self.tip_height() as usize + 1);
+        let mut cur = self.tip;
+        loop {
+            chain.push(cur);
+            let entry = &self.blocks[&cur];
+            if entry.header.height == 0 {
+                break;
+            }
+            cur = entry.header.prev;
+        }
+        chain.reverse();
+        chain
+    }
+
     /// Number of blocks known to the store (across all forks).
     pub fn len(&self) -> usize {
         self.blocks.len()
@@ -204,6 +237,32 @@ mod tests {
         // A is still stored (a known side fork), just not the tip.
         assert!(c.header(&a_hash).is_some());
         assert_eq!(c.len(), 3);
+    }
+
+    #[test]
+    fn ancestor_walks_back_parent_links() {
+        let mut c = ChainState::new(genesis());
+        let g = c.genesis_hash();
+        let a = BlockHeader::child_of(c.header(&g).unwrap(), 2, 1_000, [1u8; 32]);
+        let a_hash = c.insert_header(a).unwrap();
+        let b = BlockHeader::child_of(c.header(&a_hash).unwrap(), 4, 1_000, [2u8; 32]);
+        let b_hash = c.insert_header(b).unwrap();
+
+        assert_eq!(c.ancestor(&b_hash, 0), Some(b_hash));
+        assert_eq!(c.ancestor(&b_hash, 1), Some(a_hash));
+        assert_eq!(c.ancestor(&b_hash, 2), Some(g));
+        assert_eq!(c.ancestor(&b_hash, 3), None); // past genesis
+    }
+
+    #[test]
+    fn main_chain_is_genesis_to_tip() {
+        let mut c = ChainState::new(genesis());
+        let g = c.genesis_hash();
+        let a = BlockHeader::child_of(c.header(&g).unwrap(), 2, 1_000, [1u8; 32]);
+        let a_hash = c.insert_header(a).unwrap();
+        let b = BlockHeader::child_of(c.header(&a_hash).unwrap(), 4, 1_000, [2u8; 32]);
+        let b_hash = c.insert_header(b).unwrap();
+        assert_eq!(c.main_chain(), vec![g, a_hash, b_hash]);
     }
 
     #[test]

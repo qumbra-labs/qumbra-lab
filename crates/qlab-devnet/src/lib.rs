@@ -30,5 +30,8 @@
 pub mod chain;
 pub mod hash;
 pub mod header;
+pub mod mining;
+pub mod node;
 pub mod params_devnet;
 pub mod pow;
+pub mod validation;

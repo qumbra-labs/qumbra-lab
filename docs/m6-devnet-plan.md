@@ -109,8 +109,10 @@ Built up stage-by-stage; this is the target layout, not all present at once.
 | `hash.rs` | Keccak-256 sponge over `qlab_air::reference::keccak_f` | 棒 0 |
 | `header.rs` | `BlockHeader` (PoW fields, tx-body commitment, RESERVED slots) | 棒 0 |
 | `pow.rs` | `PowEngine` trait + `KeccakPow` placeholder + difficulty adjust | 棒 0 |
-| `chain.rs` | `ChainState`: block store, tip, heaviest-chain fork choice | 棒 0→1 |
-| `mining.rs` | mining loop, block validation, accelerated block time | 棒 1 |
+| `chain.rs` | `ChainState`: block store, tip, heaviest-chain fork choice, ancestry | 棒 0→1 |
+| `mining.rs` | nonce-search mining loop | 棒 1 |
+| `validation.rs` | header validation + sliding-window difficulty-retarget rule | 棒 1 |
+| `node.rs` | `Node`: mine_next/mine_on/submit, configurable accelerated block time | 棒 1 |
 | `committee.rs` | genesis committee, ML-DSA-65 checkpoint votes, ⅔-quorum | 棒 2 |
 | `finality.rs` | finalized-root tracking, anchors-from-finalized-only API | 棒 2 |
 | `ebbflow.rs` | stall→degraded→recover, evidence/tombstone/slash, jail | 棒 3 |
@@ -143,6 +145,19 @@ placeholder-PoW trait + difficulty adjustment. Plan doc + progress table live.
 Mining loop, block validation, heaviest-chain fork choice (pre-finality),
 configurable accelerated block time for the sim.
 
+**Sim choices recorded (not design decisions):**
+- **Difficulty rule** = per-block sliding window: after a `DIFFICULTY_WINDOW_BLOCKS`
+  warmup, retarget each block from the trailing-window timespan vs
+  `window × block_time`, clamped by `MAX_DIFFICULTY_ADJUST_FACTOR`. The real
+  algorithm + params are OPEN (consensus §10 / consensus-parameters appendix).
+- **Fork choice** = heaviest cumulative work (Σ difficulty); ties keep first-seen.
+  A heavier competing branch reorgs the tip. Finality will later pin a prefix
+  fork choice can't abandon (棒 2–3).
+- **Timestamp rule** = non-decreasing vs parent only (no median-time-past / no
+  future bound) — enough to exercise retargeting; real-consensus concern deferred.
+- **Block time** configurable via `SimConfig::block_time_secs` (accelerated);
+  real decided value is 60–75 s (consensus §7), not simulated at wall scale.
+
 ### 棒 2 — the finality committee  ⚠ STOP-POINT (ML-DSA crate selection)
 Static genesis committee (N≈20 keys from config), ⅔-quorum checkpoints at a
 configurable cadence, finalized-root tracking, **anchors-from-finalized-only**
@@ -174,7 +189,7 @@ degraded-mode behavior). Reproduce twice per bench discipline.
 | 棒 | Description | Status | Commit / notes |
 |---|---|---|---|
 | 0 | plan doc + crate skeleton | **DONE** | crate `qlab-devnet` (hash/header/pow/chain/params), 18 tests; full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 18 / note 21 = 125, 0 fail) |
-| 1 | single-node PoW chain | not started | — |
+| 1 | single-node PoW chain | **DONE** | mining loop, header validation + sliding-window retarget, `Node` (mine_next/mine_on/submit), heaviest-chain reorg; +12 tests (devnet 30). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 30 / note 21 = 137, 0 fail) |
 | 2 | finality committee (⚠ ML-DSA stop-point) | not started | — |
 | 3 | Ebb-and-Flow semantics | not started | — |
 | 4 | multi-node local sim | not started | — |
