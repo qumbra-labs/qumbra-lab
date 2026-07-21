@@ -151,6 +151,39 @@ gate fires. `assert_unsat` (6385).
 
 ## R2 — public-surface running-digest
 
+### UPDATE: empirical scope discovery (R2 ⊇ issue #24)
+`tamper_coverage` gained two probes: tampering `opvs[OPV_PVS]` and
+`opvs[OPV_PVS+40]` (inner public values) is **SAT MISS** — the inner PVs are
+**currently unbound** to the verified M3 proof. (Caps ARE bound via the cap
+comparison; the `WordBind`/`shape_mosaic` machinery that would bind the inner PVs
+into F0 is dead code — unused-warnings confirm it.)
+
+Consequences for R2's acceptance ("tamper ANY single PV → UNSAT"):
+- Exposing a digest alone does NOT catch an inner-PV tamper: the in-lane F0/sponge
+  digest is computed from the trace preimage, which an inner-PV tamper (a change to
+  `pv(i)`, not the trace) does not touch. To catch it, the sponge INPUT must be
+  bound to `pv(opvs)`.
+- The inner PVs live in F0's XOR-absorb blocks (F0 = deg||caps||pvs over 5 narrow
+  blocks; block 0 is direct = deg + first caps, so the PVs land in blocks 1–4).
+  `p3-keccak-air` exposes `preimage` (the already-XORed perm input), not the raw
+  message, so recovering the absorbed message on an XOR block needs a per-bit XOR
+  of `preimage` against the previous perm's output — i.e. bit-level state columns.
+- That multi-block keccak-preimage-to-public-value binding IS issue #24's open
+  problem ("merge preimages are witness, not pv-bound"; REQUIRED before ≥3-level
+  trees). The issue #21 R2 note already flags coordinating with 棒 3 merge-digest
+  to avoid a double implementation.
+
+**Therefore a faithful R2 that meets its own acceptance is entangled with #24 and
+is a much larger, cross-cutting change than R1/R3** — beyond "expose a digest."
+Options for the coordinator: (a) fold R2 into the #24 msh-column work (bind the
+public surface there, expose the leaf digest as a by-product); (b) land the
+output-bound digest exposure now (capture F0's challenger digest via an `f0dig`
+register mirroring `f2dig`, expose as new PVs, assert equal — real fired-constraint
+binding on the digest side) and explicitly defer the inner-PV INPUT binding to #24;
+(c) route R2 entirely to the merge-digest builder per the issue note.
+
+### Original plan (assumed PVs already bound — they are not; see above)
+
 - Outer PVs today: `N_OPVS = n_caps·cap_len·16 + n_pvs` (444), bound individually.
 - Work: keccak-sponge the ordered PV list inside the lane and expose the digest as
   a public output. "Schedule slots exist — same mechanism as the existing digest

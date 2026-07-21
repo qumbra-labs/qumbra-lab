@@ -6460,6 +6460,14 @@ mod tests {
         probe("bank: flip MUL_OFF+8 (mul output c0)", &|t, _o| {
             t.values[23 * w + MUL_OFF + 8] += one;
         });
+        // R2 scope probe: tamper an INNER public value (first inner PV, after the
+        // cap limbs). UNSAT => already bound (F0 absorb); SAT => currently free.
+        probe("inner-pv: flip opvs[OPV_PVS] (first inner PV)", &|_t, opvs| {
+            opvs[OPV_PVS] += one;
+        });
+        probe("inner-pv: flip opvs[OPV_PVS+40] (mid inner PV)", &|_t, opvs| {
+            opvs[OPV_PVS + 40] += one;
+        });
     }
 
     /// Diagnostic (relay): column-accounting breakdown by region.
