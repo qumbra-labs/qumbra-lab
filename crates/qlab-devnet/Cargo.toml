@@ -1,0 +1,29 @@
+[package]
+name = "qlab-devnet"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# M6 consensus/network devnet: a local multi-node simulation of Qumbra's hybrid
+# consensus (PoW block production + BFT finality committee). Strictly additive —
+# never touches qlab-air / qlab-bench / qlab-note beyond depending on the shared
+# Keccak primitive. See docs/m6-devnet-plan.md for the staged plan + the contract.
+
+[dependencies]
+# The conservative-hash primitive shared across the whole consensus stack
+# ("conservative hash everywhere in consensus", performance-budget §2). The
+# Keccak-256 sponge is built on qlab-air's reference::keccak_f — never forked.
+qlab-air = { path = "../qlab-air" }
+
+# ML-DSA-65 finality-committee checkpoint votes (consensus §5). RustCrypto,
+# pure-Rust, FIPS-204-final, ACVP/Wycheproof KATs; UNAUDITED (self-declared),
+# production alternative = libcrux-ml-dsa (Cryspen). Pinned >=0.1.1 (never rc):
+# malleability advisory GHSA-5x2r-hc65-25f9 is fixed in rc.4/0.1.1. See
+# docs/m6-devnet-plan.md "ML-DSA crate selection". Mirrors M5's ml-kem choice.
+ml-dsa = "=0.1.1"
+
+[dev-dependencies]
+# Independent Keccak-256 authority to cross-check the local sponge (so a sponge
+# transcription bug can't self-validate) — same discipline as qlab-note.
+tiny-keccak = { version = "2", features = ["keccak"] }
