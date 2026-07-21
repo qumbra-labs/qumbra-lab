@@ -1211,6 +1211,20 @@ pub(crate) struct GateLayout {
     /// the childL→childR boundary and freeze-carried to the root perm. (dR is
     /// adjacent to the root perm, bound directly by the boundary transition.)
     pub(crate) dlr: usize,
+    /// Issue #24 (D0) merge-block one-hot selector ring (WIDE-ONLY, `merge_perms()`
+    /// columns). `msh + p` fires on exactly merge perm `p`'s rows (0-indexed from
+    /// the region start), so `eval` can bind merge perm `p`'s absorbed rate to
+    /// `pv(opvs)` at the FIXED indices for block `p` — the constraint-level message
+    /// binding (D1) that closes the PR #23/#25 keccak-preimage-resistance caveat.
+    /// POSITIVELY pinned (unlike a `csel`-style self-destructing anchor): a one-hot
+    /// `Σ msh == mreg` + start-edge anchor to slot 0 + forward rotation + a
+    /// `when_last_row` anchor to the root slot, so DROPPING the ring (all-zero) is
+    /// UNSAT (the last-row anchor fires), not a silent binding vanish.
+    pub(crate) msh: usize,
+    /// Materialized msh rotation gate `sf(23)·mreg·(1 − eq_end)` (WIDE-ONLY): fires
+    /// at every in-region perm boundary except the root perm's last row, advancing
+    /// the one-hot by one slot. Materialized so the rotation stays deg ≤ 3.
+    pub(crate) mrot: usize,
     /// R1 (issue #21) canonicity binding (all shapes; gate-block tail). `canon_lo0`
     /// / `canon_lo1` = the 16 low bits of the consumed words 0/1; `top7_0` /
     /// `top7_1` = materialized "word bits 24..30 all set" flags. See the const
@@ -1403,7 +1417,12 @@ impl GateLayout {
         let mrst = minv + 4;
         let mcont = mrst + 1;
         let dlr = mcont + 1;
-        let merge_cols = if s.merge_lane { 28 } else { 0 }; // mreg,mcnt,meq[4],minv[4],mrst,mcont,dlr[16]
+        // Issue #24 (D0): the merge-block one-hot ring (`msh`, one column per merge
+        // perm) + its materialized rotation gate (`mrot`). WIDE-ONLY.
+        let msh = dlr + 16;
+        let mrot = msh + s.merge_perms();
+        // mreg,mcnt,meq[4],minv[4],mrst,mcont,dlr[16] = 28; + msh[nm] + mrot.
+        let merge_cols = if s.merge_lane { 28 + s.merge_perms() + 1 } else { 0 };
         // -- R1 (issue #21) canonicity binding, gate-block tail --
         let canon_lo0 = cc + s.cap_len + merge_cols;
         let canon_lo1 = canon_lo0 + 16;
@@ -1426,6 +1445,7 @@ impl GateLayout {
             pg_a, phg, phdend, cont, eg_a, endg, xsel, qadv, cfull, m3, rlo, rhi,
             dmux, snl, glo, ghi, gf, bpm, n_fhg, fhg, prega, cpa, cpb, cpl, consz7,
             fpi, csel, frgm, bcbd, chi, cc, mreg, mcnt, meq, minv, mrst, mcont, dlr,
+            msh, mrot,
             canon_lo0, canon_lo1, top7_0, top7_1, gate_cols, gate_width,
         }
     }
@@ -2371,6 +2391,72 @@ where
                     cv(self.layout.meq + 3) * (pv(sfee_base + j) - fee_l - fee_r),
                 );
             }
+            // =============================================================
+            // Issue #24 (D0): the msh one-hot selector ring — the mechanism
+            // (designed once, applied by D1/D2/D3). `msh + p` fires on exactly
+            // merge perm p's 24 rows so a per-block message binding can read
+            // `pv` at the FIXED index for block p (a `pv(i)` index MUST be a
+            // compile-time constant — it cannot be indexed by a trace value, so
+            // the merge perms' data-dependent rows need a one-hot to carry the
+            // constant into `eval`). POSITIVELY PINNED (the csel-vs-msh
+            // difference the plan flags): csel's absence self-destructs the
+            // phase automaton, but msh's absence would merely make the binding
+            // VANISH silently → the ring must be FORCED to exist.
+            // (a) each slot boolean.
+            for p in 0..nm {
+                builder.assert_bool(cv(self.layout.msh + p));
+            }
+            // (b) in-region one-hot: exactly one active slot while mreg = 1 (and
+            //     zero outside). On the inert truncated tail past the root perm
+            //     the ring freezes at the root slot, so `Σ == mreg` holds there.
+            {
+                let mut s = AB::Expr::ZERO;
+                for p in 0..nm {
+                    s = s + cv(self.layout.msh + p);
+                }
+                builder.assert_eq(s, cv(self.layout.mreg));
+            }
+            // (c) start anchor: at the mreg 0→1 edge the ring points at slot 0
+            //     (the first merge perm = child-L block 0). `medge` ∈ {0,1} by
+            //     mreg monotonicity.
+            let medge = nv(self.layout.mreg) - cv(self.layout.mreg);
+            {
+                let mut t = builder.when_transition();
+                for p in 0..nm {
+                    let want = if p == 0 { AB::Expr::ONE } else { AB::Expr::ZERO };
+                    t.assert_zero(medge.clone() * (nv(self.layout.msh + p) - want));
+                }
+            }
+            // (d) rotation gate: mrot = sf(23)·mreg·(1 − eq_end), materialized so
+            //     the rotation stays deg ≤ 3. Fires at every in-region perm
+            //     boundary except the root perm's last row (eq_end = meq[3]) — so
+            //     the ring advances continuously across the sub-sponge boundaries
+            //     (unlike the capacity chain, which resets there) and does NOT
+            //     rotate forward into the inert tail.
+            builder.when_transition().assert_eq(
+                cv(self.layout.mrot),
+                sf(23) * cv(self.layout.mreg) * (AB::Expr::ONE - cv(self.layout.meq + 3)),
+            );
+            // (e) rotation: away from the start edge, hold the one-hot within a
+            //     perm and shift it forward one slot (active p → p+1) when mrot
+            //     fires. `(1 − medge)` cedes the edge transition to (c).
+            {
+                let mut t = builder.when_transition();
+                for q in 0..nm {
+                    let prev = (q + nm - 1) % nm;
+                    t.assert_zero(
+                        (AB::Expr::ONE - medge.clone())
+                            * (nv(self.layout.msh + q)
+                                - cv(self.layout.msh + q)
+                                - cv(self.layout.mrot)
+                                    * (cv(self.layout.msh + prev) - cv(self.layout.msh + q))),
+                    );
+                }
+            }
+            // (f) POSITIVE PIN (end anchor): at last_row the ring points at the
+            //     root slot (nm − 1). DROPPING the whole ring (all-zero) violates
+            //     THIS → UNSAT — the ring's existence is forced, not optional.
+            builder.when_last_row().assert_one(cv(self.layout.msh + (nm - 1)));
         }
         // Cap comparison at the last path level of each batch (trace, quotient,
         // then one per FRI round). Shape-driven so wide (3 rounds) skips F3. For
@@ -5512,6 +5598,22 @@ pub(crate) fn build_interior_trace(
                 values[row * w + layout.dlr + m] = v;
             }
         }
+        // Issue #24 (D0): the msh one-hot ring + its rotation gate mrot. Merge
+        // perm p (region-index 0..nm) is the active slot across its 24 rows; the
+        // truncated tail past the root perm freezes at the root slot (nm-1) so
+        // `Σ msh == mreg` holds there too. mrot fires on each region perm's last
+        // row except the root's (no forward rotation into the inert tail).
+        for row in merge_start..rows {
+            let off = row - merge_start;
+            let perm_idx = off / 24;
+            let active = if perm_idx < nm2 { perm_idx } else { nm2 - 1 };
+            values[row * w + layout.msh + active] = Val::ONE;
+            // Rotation boundary: perm's last row (off % 24 == 23) for a non-root
+            // region perm. The tail (perm_idx >= nm2) has no 24th row.
+            if off % 24 == 23 && perm_idx < nm2 - 1 {
+                values[row * w + layout.mrot] = Val::ONE;
+            }
+        }
     }
     fill_derived(&mut values, &layout, shape);
     (RowMajorMatrix::new(values, layout.gate_width), meta)
@@ -7210,6 +7312,56 @@ mod tests {
             t.values[root_r0 * w + l.dlr] += one;
             assert!(is_unsat_interior(t, m.opvs.clone()), "tampered dL carry must be UNSAT");
         }
+    }
+
+    /// Issue #24 (D0): the msh one-hot selector ring is POSITIVELY PINNED — its
+    /// absence is UNSAT, not a silent binding vanish (the csel-vs-msh difference).
+    /// This is the mechanism's soundness core: D1/D2/D3 read `msh[p]` to carry the
+    /// compile-time block index into `eval`, so if a prover could zero the ring
+    /// the message bindings would evaporate. Each probe must be UNSAT.
+    #[test]
+    fn interior_neg_msh_ring() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let l = GateLayout::from_shape(&shape);
+        let w = l.gate_width;
+        let one = Val::ONE;
+        let nm = shape.merge_perms();
+        let (base, m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        let rows = base.values.len() / w;
+        let merge_start = 24 * (rows / 24 - nm); // perm-aligned (height not mult of 24)
+
+        let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>)| {
+            let mut t = base.clone();
+            mutate(&mut t);
+            assert!(is_unsat_interior(t, m.opvs.clone()), "expected UNSAT (msh): {label}");
+        };
+        // (1) DROP THE WHOLE RING (absence). Zero every msh slot on every row →
+        //     the last-row root-slot anchor (f) fires AND the in-region one-hot
+        //     (b) breaks. THE positive pin: a vanished ring must be UNSAT.
+        probe("drop entire msh ring (absence)", &|t| {
+            for r in 0..rows {
+                for p in 0..nm {
+                    t.values[r * w + l.msh + p] = Val::ZERO;
+                }
+            }
+        });
+        // (2) Drop the ring on last_row only → the end anchor (f) fails.
+        probe("drop msh on last_row (end anchor)", &|t| {
+            for p in 0..nm {
+                t.values[(rows - 1) * w + l.msh + p] = Val::ZERO;
+            }
+        });
+        // (3) Spurious extra one-hot bit on a merge perm's row → Σ msh = 2 ≠ mreg.
+        probe("spurious extra msh bit", &|t| {
+            t.values[merge_start * w + l.msh + 5] += one; // slot 0 active + slot 5 spurious
+        });
+        // (4) Tamper the rotation gate on a genuine rotation boundary (perm 0's
+        //     last row, a child-L→child-L boundary) → the mrot definition (d) fails.
+        probe("tamper mrot on a rotation boundary", &|t| {
+            t.values[(merge_start + 23) * w + l.mrot] += one;
+        });
     }
 
     /// 棒 3-3 (M4 step 2): the epoch Σfee rider is exposed and correct — the
