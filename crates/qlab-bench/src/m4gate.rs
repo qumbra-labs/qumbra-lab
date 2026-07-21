@@ -1211,6 +1211,20 @@ pub(crate) struct GateLayout {
     /// the childL→childR boundary and freeze-carried to the root perm. (dR is
     /// adjacent to the root perm, bound directly by the boundary transition.)
     pub(crate) dlr: usize,
+    /// Issue #24 (D0) merge-block one-hot selector ring (WIDE-ONLY, `merge_perms()`
+    /// columns). `msh + p` fires on exactly merge perm `p`'s rows (0-indexed from
+    /// the region start), so `eval` can bind merge perm `p`'s absorbed rate to
+    /// `pv(opvs)` at the FIXED indices for block `p` — the constraint-level message
+    /// binding (D1) that closes the PR #23/#25 keccak-preimage-resistance caveat.
+    /// POSITIVELY pinned (unlike a `csel`-style self-destructing anchor): a one-hot
+    /// `Σ msh == mreg` + start-edge anchor to slot 0 + forward rotation + a
+    /// `when_last_row` anchor to the root slot, so DROPPING the ring (all-zero) is
+    /// UNSAT (the last-row anchor fires), not a silent binding vanish.
+    pub(crate) msh: usize,
+    /// Materialized msh rotation gate `sf(23)·mreg·(1 − eq_end)` (WIDE-ONLY): fires
+    /// at every in-region perm boundary except the root perm's last row, advancing
+    /// the one-hot by one slot. Materialized so the rotation stays deg ≤ 3.
+    pub(crate) mrot: usize,
     /// R1 (issue #21) canonicity binding (all shapes; gate-block tail). `canon_lo0`
     /// / `canon_lo1` = the 16 low bits of the consumed words 0/1; `top7_0` /
     /// `top7_1` = materialized "word bits 24..30 all set" flags. See the const
@@ -1403,7 +1417,12 @@ impl GateLayout {
         let mrst = minv + 4;
         let mcont = mrst + 1;
         let dlr = mcont + 1;
-        let merge_cols = if s.merge_lane { 28 } else { 0 }; // mreg,mcnt,meq[4],minv[4],mrst,mcont,dlr[16]
+        // Issue #24 (D0): the merge-block one-hot ring (`msh`, one column per merge
+        // perm) + its materialized rotation gate (`mrot`). WIDE-ONLY.
+        let msh = dlr + 16;
+        let mrot = msh + s.merge_perms();
+        // mreg,mcnt,meq[4],minv[4],mrst,mcont,dlr[16] = 28; + msh[nm] + mrot.
+        let merge_cols = if s.merge_lane { 28 + s.merge_perms() + 1 } else { 0 };
         // -- R1 (issue #21) canonicity binding, gate-block tail --
         let canon_lo0 = cc + s.cap_len + merge_cols;
         let canon_lo1 = canon_lo0 + 16;
@@ -1426,6 +1445,7 @@ impl GateLayout {
             pg_a, phg, phdend, cont, eg_a, endg, xsel, qadv, cfull, m3, rlo, rhi,
             dmux, snl, glo, ghi, gf, bpm, n_fhg, fhg, prega, cpa, cpb, cpl, consz7,
             fpi, csel, frgm, bcbd, chi, cc, mreg, mcnt, meq, minv, mrst, mcont, dlr,
+            msh, mrot,
             canon_lo0, canon_lo1, top7_0, top7_1, gate_cols, gate_width,
         }
     }
@@ -2370,6 +2390,142 @@ where
                 builder.assert_zero(
                     cv(self.layout.meq + 3) * (pv(sfee_base + j) - fee_l - fee_r),
                 );
+            }
+            // =============================================================
+            // Issue #24 (D0): the msh one-hot selector ring — the mechanism
+            // (designed once, applied by D1/D2/D3). `msh + p` fires on exactly
+            // merge perm p's 24 rows so a per-block message binding can read
+            // `pv` at the FIXED index for block p (a `pv(i)` index MUST be a
+            // compile-time constant — it cannot be indexed by a trace value, so
+            // the merge perms' data-dependent rows need a one-hot to carry the
+            // constant into `eval`). POSITIVELY PINNED (the csel-vs-msh
+            // difference the plan flags): csel's absence self-destructs the
+            // phase automaton, but msh's absence would merely make the binding
+            // VANISH silently → the ring must be FORCED to exist.
+            // (a) each slot boolean.
+            for p in 0..nm {
+                builder.assert_bool(cv(self.layout.msh + p));
+            }
+            // (b) in-region one-hot: exactly one active slot while mreg = 1 (and
+            //     zero outside). On the inert truncated tail past the root perm
+            //     the ring freezes at the root slot, so `Σ == mreg` holds there.
+            {
+                let mut s = AB::Expr::ZERO;
+                for p in 0..nm {
+                    s = s + cv(self.layout.msh + p);
+                }
+                builder.assert_eq(s, cv(self.layout.mreg));
+            }
+            // (c) start anchor: at the mreg 0→1 edge the ring points at slot 0
+            //     (the first merge perm = child-L block 0). `medge` ∈ {0,1} by
+            //     mreg monotonicity.
+            let medge = nv(self.layout.mreg) - cv(self.layout.mreg);
+            {
+                let mut t = builder.when_transition();
+                for p in 0..nm {
+                    let want = if p == 0 { AB::Expr::ONE } else { AB::Expr::ZERO };
+                    t.assert_zero(medge.clone() * (nv(self.layout.msh + p) - want));
+                }
+            }
+            // (d) rotation gate: mrot = sf(23)·mreg·(1 − eq_end), materialized so
+            //     the rotation stays deg ≤ 3. Fires at every in-region perm
+            //     boundary except the root perm's last row (eq_end = meq[3]) — so
+            //     the ring advances continuously across the sub-sponge boundaries
+            //     (unlike the capacity chain, which resets there) and does NOT
+            //     rotate forward into the inert tail.
+            builder.when_transition().assert_eq(
+                cv(self.layout.mrot),
+                sf(23) * cv(self.layout.mreg) * (AB::Expr::ONE - cv(self.layout.meq + 3)),
+            );
+            // (e) rotation: away from the start edge, hold the one-hot within a
+            //     perm and shift it forward one slot (active p → p+1) when mrot
+            //     fires. `(1 − medge)` cedes the edge transition to (c).
+            {
+                let mut t = builder.when_transition();
+                for q in 0..nm {
+                    let prev = (q + nm - 1) % nm;
+                    t.assert_zero(
+                        (AB::Expr::ONE - medge.clone())
+                            * (nv(self.layout.msh + q)
+                                - cv(self.layout.msh + q)
+                                - cv(self.layout.mrot)
+                                    * (cv(self.layout.msh + prev) - cv(self.layout.msh + q))),
+                    );
+                }
+            }
+            // (f) POSITIVE PIN (end anchor): at last_row the ring points at the
+            //     root slot (nm − 1). DROPPING the whole ring (all-zero) violates
+            //     THIS → UNSAT — the ring's existence is forced, not optional.
+            builder.when_last_row().assert_one(cv(self.layout.msh + (nm - 1)));
+
+            // =============================================================
+            // Issue #24 (D1): merge preimage → pv(opvs) MESSAGE BINDING.
+            // For each child sponge perm p, bind its absorbed rate block (34
+            // values × two u16 preimage limbs each) to the child's inner public
+            // values at the FIXED index for block p, gated by `msh[p]·sf(0)` (the
+            // perm's input row). This upgrades the interior root bind from
+            // computational — hitting pv(root) ⇒ honest inputs BY KECCAK PREIMAGE
+            // RESISTANCE, the PR #23/#25 caveat — to an UNCONDITIONAL
+            // constraint-level bind, and (binding every inner PV) closes the R2
+            // "inner PVs unbound" gap for the interior. The merge sponge is
+            // OVERWRITE-mode (m4interior::sponge_overwrite): the preimage rate
+            // limbs ARE the message block (no XOR recovery), and KeccakAir
+            // range-bounds them to u16, so the pair-recompose is sound.
+            //
+            // Issue #24 (D2): extend the message binding to the fee TAIL
+            // [np − EPOCH_FEE_LIMBS, np) — the Σfee rider's input summands (M3
+            // fee = PV_FEE..PV_LEN = the inner-PV tail). With this the PR #25
+            // boundary CLOSES: `interior_epoch_fee_boundary` inverts from
+            // documented-SAT to UNSAT (a consistent feeL+Σfee tamper now breaks
+            // the fee-tail binding). D1 bound [0, np); D2 removes the exclusion
+            // so ALL inner PVs — incl. the fee tail — are bound.
+            {
+                // The plain field element rr = R (monty_rr): pv(inner) == v·R and
+                // the absorbed value recompose == canonical v, so recompose·rr ==
+                // pv. NB use `c(rr.as_canonical_u32())`, NOT `cf(rr)` — `cf` would
+                // re-encode rr into its Monty WORD (R²), the wrong factor.
+                let rr = c(monty_rr().as_canonical_u32());
+                let opv_inner = self.shape.n_caps() * self.shape.cap_len * 16; // OPV_PVS
+                let np = self.shape.n_pvs;
+                let msg_bytes = np * 4;
+                let padded_len = kl * 136; // per-child padded message length (kl blocks)
+                // child-L sponge = region perms 0..kl (block = p, pv half [0..n_opvs));
+                // child-R sponge = kl..2kl (block = p-kl, pv half [n_opvs..2n_opvs)).
+                // The root perm (2kl) carries dL‖dR, bound by 棒 3-2c — not here.
+                for p in 0..(2 * kl) {
+                    let (half, block) = if p < kl { (0usize, p) } else { (n_opvs, p - kl) };
+                    let gate = cv(self.layout.msh + p) * sf(0);
+                    for j in 0..34 {
+                        let idx = 34 * block + j;
+                        let lane = j / 2;
+                        let lb = 4 * lane + 2 * (j % 2); // low limb; +1 = high limb (rate < 68)
+                        let recompose = cv(pcol(lb)) + cv(pcol(lb + 1)) * c(1 << 16);
+                        if idx < np {
+                            // value == inner_pvs[idx]; pv slot == inner_pvs[idx]·rr.
+                            // (D1: idx < np−fee; D2: extended through the fee tail.)
+                            let target = pv(half + opv_inner + idx);
+                            builder.assert_zero(gate.clone() * (recompose * rr.clone() - target));
+                        } else {
+                            // padding position: pin the two limbs to the fixed
+                            // pad10*1 constants over the child message tail.
+                            let padval = |bi: usize| -> u32 {
+                                if bi == msg_bytes {
+                                    0x01
+                                } else if bi == padded_len - 1 {
+                                    0x80
+                                } else {
+                                    0
+                                }
+                            };
+                            let mut v = 0u32;
+                            for k in 0..4 {
+                                v |= padval(4 * idx + k) << (8 * k);
+                            }
+                            builder.assert_zero(gate.clone() * (cv(pcol(lb)) - c(v & 0xffff)));
+                            builder.assert_zero(gate.clone() * (cv(pcol(lb + 1)) - c(v >> 16)));
+                        }
+                    }
+                }
             }
         }
         // Cap comparison at the last path level of each batch (trace, quotient,
@@ -5512,6 +5668,22 @@ pub(crate) fn build_interior_trace(
                 values[row * w + layout.dlr + m] = v;
             }
         }
+        // Issue #24 (D0): the msh one-hot ring + its rotation gate mrot. Merge
+        // perm p (region-index 0..nm) is the active slot across its 24 rows; the
+        // truncated tail past the root perm freezes at the root slot (nm-1) so
+        // `Σ msh == mreg` holds there too. mrot fires on each region perm's last
+        // row except the root's (no forward rotation into the inert tail).
+        for row in merge_start..rows {
+            let off = row - merge_start;
+            let perm_idx = off / 24;
+            let active = if perm_idx < nm2 { perm_idx } else { nm2 - 1 };
+            values[row * w + layout.msh + active] = Val::ONE;
+            // Rotation boundary: perm's last row (off % 24 == 23) for a non-root
+            // region perm. The tail (perm_idx >= nm2) has no 24th row.
+            if off % 24 == 23 && perm_idx < nm2 - 1 {
+                values[row * w + layout.mrot] = Val::ONE;
+            }
+        }
     }
     fill_derived(&mut values, &layout, shape);
     (RowMajorMatrix::new(values, layout.gate_width), meta)
@@ -7212,6 +7384,91 @@ mod tests {
         }
     }
 
+    /// Issue #24 (D0): the msh one-hot selector ring is POSITIVELY PINNED — its
+    /// absence is UNSAT, not a silent binding vanish (the csel-vs-msh difference).
+    /// This is the mechanism's soundness core: D1/D2/D3 read `msh[p]` to carry the
+    /// compile-time block index into `eval`, so if a prover could zero the ring
+    /// the message bindings would evaporate. Each probe must be UNSAT.
+    #[test]
+    fn interior_neg_msh_ring() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let l = GateLayout::from_shape(&shape);
+        let w = l.gate_width;
+        let one = Val::ONE;
+        let nm = shape.merge_perms();
+        let (base, m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+        let rows = base.values.len() / w;
+        let merge_start = 24 * (rows / 24 - nm); // perm-aligned (height not mult of 24)
+
+        let probe = |label: &str, mutate: &dyn Fn(&mut RowMajorMatrix<Val>)| {
+            let mut t = base.clone();
+            mutate(&mut t);
+            assert!(is_unsat_interior(t, m.opvs.clone()), "expected UNSAT (msh): {label}");
+        };
+        // (1) DROP THE WHOLE RING (absence). Zero every msh slot on every row →
+        //     the last-row root-slot anchor (f) fires AND the in-region one-hot
+        //     (b) breaks. THE positive pin: a vanished ring must be UNSAT.
+        probe("drop entire msh ring (absence)", &|t| {
+            for r in 0..rows {
+                for p in 0..nm {
+                    t.values[r * w + l.msh + p] = Val::ZERO;
+                }
+            }
+        });
+        // (2) Drop the ring on last_row only → the end anchor (f) fails.
+        probe("drop msh on last_row (end anchor)", &|t| {
+            for p in 0..nm {
+                t.values[(rows - 1) * w + l.msh + p] = Val::ZERO;
+            }
+        });
+        // (3) Spurious extra one-hot bit on a merge perm's row → Σ msh = 2 ≠ mreg.
+        probe("spurious extra msh bit", &|t| {
+            t.values[merge_start * w + l.msh + 5] += one; // slot 0 active + slot 5 spurious
+        });
+        // (4) Tamper the rotation gate on a genuine rotation boundary (perm 0's
+        //     last row, a child-L→child-L boundary) → the mrot definition (d) fails.
+        probe("tamper mrot on a rotation boundary", &|t| {
+            t.values[(merge_start + 23) * w + l.mrot] += one;
+        });
+    }
+
+    /// Issue #24 (D1): the merge preimage → pv(opvs) MESSAGE binding is LIVE and
+    /// UNCONDITIONAL. Before D1 the interior's inner PVs were unbound (only the
+    /// root squeeze bound them, and only computationally via keccak preimage
+    /// resistance — the PR #23/#25 caveat). These probes are the analogue of PR
+    /// #29's leaf SAT-MISS probes for the interior: tampering an absorbed inner
+    /// PV (or its fill-side preimage limb) must now be UNSAT. The fee TAIL is
+    /// D2's boundary (`interior_epoch_fee_boundary`), so we tamper NON-fee slots.
+    #[test]
+    fn interior_neg_merge_msg() {
+        let _g = heavy_lock();
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        let shape = GateShape::wide();
+        let one = Val::ONE;
+        let n_opvs = shape.n_opvs();
+        let opv_inner = shape.n_caps() * shape.cap_len * 16; // OPV_PVS
+        let (base, m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
+
+        // (1) tamper child-L inner PV 0 (anchor chunk 0) in the exposed opvs →
+        //     the msh recompose·rr == pv binding fires. The trace (keccak) is
+        //     untouched, so ONLY the D1 message binding can catch this. Was SAT
+        //     (SAT-MISS) before D1; must be UNSAT now.
+        {
+            let mut o = m.opvs.clone();
+            o[opv_inner] += one;
+            assert!(is_unsat_interior(base.clone(), o), "tamper child-L inner PV must be UNSAT");
+        }
+        // (2) same for a mid child-R inner PV (second half) — proves both halves
+        //     are bound, at a non-fee index (opv_inner + 40 = NF2 chunk 8).
+        {
+            let mut o = m.opvs.clone();
+            o[n_opvs + opv_inner + 40] += one;
+            assert!(is_unsat_interior(base.clone(), o), "tamper child-R inner PV must be UNSAT");
+        }
+    }
+
     /// 棒 3-3 (M4 step 2): the epoch Σfee rider is exposed and correct — the
     /// root public tail carries `Σfee[j] = feeL[j] + feeR[j]` (each child's fee
     /// limbs are the tail of its opvs half), and the whole rectangle is SAT.
@@ -7266,16 +7523,14 @@ mod tests {
         }
     }
 
-    /// 棒 3-3 issue #24 boundary, recorded as a TESTED FACT: the rider binds
-    /// `Σfee` only to the CARRIED fee slots in-circuit. The carried children opvs
-    /// are NOT independently constraint-bound to the child proofs in the interior
-    /// (the merge sponge absorbs them as witness — issue #24). So tampering a
-    /// child's fee AND the exposed sum CONSISTENTLY is **SAT** at the circuit
-    /// level: a faked child fee is caught not here but by the consumer-side
-    /// recompute from verified children (`m4assembly::consumer_fee_ok`, parallel
-    /// to issue #24's `root == keccak-merge(opvs)`). Closing this in-circuit is
-    /// issue #24's msh columns (same fix, same ~+2.4% cells). This test pins the
-    /// boundary so it cannot silently change into a false soundness claim.
+    /// 棒 3-3 issue #24 boundary — NOW CLOSED (D2). This test INVERTED: pre-#24
+    /// the rider bound `Σfee` only to the carried fee slots, and the carried opvs
+    /// were unbound witness, so a CONSISTENT (feeL, Σfee) tamper was SAT — pinned
+    /// here as a documented limitation, NOT a negative. D2 extends the D1 msh
+    /// message binding through the fee TAIL of each child's inner PVs, so feeL is
+    /// now bound to the merge preimage: the consistent tamper breaks the fee-tail
+    /// binding → UNSAT. The consumer-side recompute (`m4assembly::consumer_fee_ok`)
+    /// stays as belt-and-braces. This is the PR #25 boundary closing in-circuit.
     #[test]
     fn interior_epoch_fee_boundary() {
         let _g = heavy_lock();
@@ -7286,11 +7541,16 @@ mod tests {
         let fl = crate::m4interior::EPOCH_FEE_LIMBS;
         let sfee_base = 2 * n_opvs + crate::m4interior::MERGE_ROOT_LIMBS;
         let (base, m) = build_interior_trace(sl, sr, ol, or, &shape, 0);
-        // Consistent tamper: feeL[0] and Σfee both +1 → sum still holds.
+        // Consistent tamper: feeL[0] and Σfee both +1 → the rider SUM still
+        // holds, but feeL[0] (= child-L inner PV np−fl) no longer matches the
+        // merge preimage → D2's fee-tail message binding fires.
         let mut o = m.opvs.clone();
         o[n_opvs - fl] += one;
         o[sfee_base] += one;
-        // SAT at the circuit level (must NOT panic) — the documented #24 boundary.
-        check_constraints(&VerifierGateAir::new_interior(), &base, &o);
+        // UNSAT now (was SAT pre-#24) — the boundary is closed in-circuit.
+        assert!(
+            is_unsat_interior(base, o),
+            "consistent feeL+Σfee tamper must be UNSAT after D2 (PR #25 boundary closed)"
+        );
     }
 }
