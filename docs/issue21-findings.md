@@ -1,11 +1,21 @@
 # Issue #21 — leaf-gate residuals: builder findings + implementation spec
 
 Branch: `claude/issue21-leaf-residuals` (worktree `../qumbra-lab-issue21`).
-Status at handoff: **deep analysis complete, no code committed yet.** Baseline
-`cargo build --release -p qlab-bench` is green on the untouched branch. This doc
-records the exact mechanism each residual needs, the non-obvious traps, and a
-concrete deg≤3 constraint set, so the implementation session can go straight to
-editing.
+
+## STATUS (updated)
+- **R3 (FSGATE pin) — DONE** (commit 3a90aca). Full unfiltered suite green.
+- **R1 (canonicity comparator) — DONE** (commit 80b578b). Self-contained approach
+  (A) below: +34 gate-tail cols, GATE_WIDTH 3638→3672. Full unfiltered suite green
+  (70 tests), deg≤3 held. Leaf b4/q40/g22 measured ×2 (zero swap): fixed
+  **788.2 KB** (vs 781.8 KB baseline = **+6.4 KB / +0.82%**, all from R1's 34
+  cols), prove 695/890 ms (grind jitter, ≪10 s), peak RSS 11.89 GB (≪32 GB,
+  unchanged). 3672 cols × 2^16.
+- **R2 (public-surface digest) — REMAINING.** Spec below. It is the residual that
+  changes the public surface; coordinate with the stage-2 / 棒 3 merge-digest
+  builder before implementing to avoid a double implementation at the leaf.
+
+The rest of this doc is the original analysis (R1's non-obvious crux etc.), kept
+for the record and for the R2 implementation.
 
 All line numbers are against m4gate.rs at branch base (main @ 8298990).
 
