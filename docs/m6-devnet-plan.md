@@ -179,6 +179,20 @@ Static genesis committee (N≈20 keys from config), ⅔-quorum checkpoints at a
 configurable cadence, finalized-root tracking, **anchors-from-finalized-only**
 rule exposed as an API. Record ML-DSA crate decision above before coding votes.
 
+**Implemented (committee.rs + finality.rs):**
+- `Committee` (N ML-DSA-65 pubkeys) + `quorum_threshold(n) = floor(2n/3)+1`
+  (strictly >⅔, Byzantine-safe for f<n/3). `Validator::from_seed` = deterministic
+  devnet keygen (`ml-dsa` 0.1.1: `SigningKey::from_seed`, `Signer`/`Verifier`/
+  `Keypair` traits; sig = 3309 B). `Checkpoint{height,block_hash,root}` with a
+  domain-separated (`qumbra:devnet:checkpoint:v1`) signing message; `Vote{signer,sig}`.
+- `FinalityTracker::try_finalize` — strict: distinct in-range signers, every sig
+  verified, ≥ quorum, strictly-advancing height. Anchors API: `is_root_final` /
+  `newest_anchor` / `finalized_height` / `is_height_final`.
+- **root stand-in:** 棒 2 uses the finalized block hash as the checkpoint `root`;
+  棒 5 binds the real M3 commitment-tree anchor there.
+- **Deferred by design:** Node *enforcement* ("no reorg past finality") → 棒 3;
+  ≤24 h / 10-min-bucket anchor-age window (§8) is a policy layer on top → later.
+
 ### 棒 3 — Ebb-and-Flow semantics
 Committee stall → degraded probabilistic mode; clean finality resume on recovery.
 Equivocation evidence → automated tombstone + placeholder slash; jail-no-slash
@@ -206,7 +220,7 @@ degraded-mode behavior). Reproduce twice per bench discipline.
 |---|---|---|---|
 | 0 | plan doc + crate skeleton | **DONE** | crate `qlab-devnet` (hash/header/pow/chain/params), 18 tests; full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 18 / note 21 = 125, 0 fail) |
 | 1 | single-node PoW chain | **DONE** | mining loop, header validation + sliding-window retarget, `Node` (mine_next/mine_on/submit), heaviest-chain reorg; +12 tests (devnet 30). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 30 / note 21 = 137, 0 fail) |
-| 2 | finality committee (⚠ ML-DSA stop-point) | not started | — |
+| 2 | finality committee (⚠ ML-DSA stop-point) | **DONE** | ml-dsa 0.1.1 wired; committee + ⅔-quorum ML-DSA-65 votes + `FinalityTracker` + anchors-from-finalized-only API; +9 tests (devnet 39). Full unfiltered `cargo test --release` green (air 11 / bench 75 / devnet 39 / note 21 = 146, 0 fail) |
 | 3 | Ebb-and-Flow semantics | not started | — |
 | 4 | multi-node local sim | not started | — |
 | 5 | real-proof integration + report | not started | — |
@@ -221,6 +235,8 @@ Every placeholder lives in `params_devnet.rs`. Kept current as stages add them.
 | `SIM_BLOCK_TIME_SECS` | `2` | **not** the real block time; **real = 60–75 s decided** (consensus §7). Sim knob only — devnet does not run at wall-clock scale |
 | `DIFFICULTY_WINDOW_BLOCKS` | `16` | retarget window — consensus-parameters appendix |
 | `MAX_DIFFICULTY_ADJUST_FACTOR` | `4` | retarget clamp — consensus-parameters appendix |
+| `COMMITTEE_SIZE` | `20` | N≈20–50 decided (consensus §4/§5); exact N open |
+| `CHECKPOINT_CADENCE_BLOCKS` | `8` | finality cadence (sets minutes-class latency) — open |
 
 ## Open decisions deferred to design (not decided in code)
 

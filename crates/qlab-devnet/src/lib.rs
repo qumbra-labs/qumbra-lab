@@ -28,6 +28,8 @@
 //! primitive is `qlab_air::reference::keccak_f`, wrapped by [`hash::keccak256`].
 
 pub mod chain;
+pub mod committee;
+pub mod finality;
 pub mod hash;
 pub mod header;
 pub mod mining;

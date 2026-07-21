@@ -32,8 +32,16 @@ pub const DIFFICULTY_WINDOW_BLOCKS: u64 = 16;
 pub const MAX_DIFFICULTY_ADJUST_FACTOR: u64 = 4;
 
 // ─── Committee / finality (棒 2–3) ──────────────────────────────────────────
-// Populated when 棒 2 lands. Reminder of the shape the constants must cover:
-//   - COMMITTEE_SIZE (N≈20, consensus §4/§5; committee-and-governance §1)
-//   - CHECKPOINT_CADENCE_BLOCKS (finality cadence — open)
-//   - EPOCH_LENGTH_BLOCKS (membership boundary — open, committee-gov §2)
-//   - BOND_AMOUNT / EQUIVOCATION_SLASH_AMOUNT (open, committee-gov §3)
+
+/// Genesis committee size N. Design says N≈20–50 (consensus §4/§5;
+/// committee-and-governance §1 uses N≈20). PLACEHOLDER — exact N is open.
+pub const COMMITTEE_SIZE: usize = 20;
+
+/// Checkpoint cadence: propose a finality checkpoint every this many blocks.
+/// PLACEHOLDER — real cadence sets the "minutes-class" finality latency
+/// (consensus §4/§7); the exact value is open (consensus-parameters appendix).
+pub const CHECKPOINT_CADENCE_BLOCKS: u64 = 8;
+
+// Later stages (棒 3+) will add here, still as placeholders:
+//   - EPOCH_LENGTH_BLOCKS (membership boundary — committee-gov §2)
+//   - BOND_AMOUNT / EQUIVOCATION_SLASH_AMOUNT (committee-gov §3)
