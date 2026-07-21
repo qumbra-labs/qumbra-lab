@@ -119,4 +119,7 @@ can never silently become a false soundness claim. Closing it in-circuit = issue
 - Phase A + B: CODE COMPLETE. Cheap predicate tests green (67 tests total). Full unfiltered
   release acceptance gate RUNNING (validates the two heavy interior Σfee tests + deg ≤ 3 guard).
   Two commits queued (A, then B) once the gate is green; NOT yet committed.
-- Phase C (measurement) + D (PR, no merge) pending.
+- Phase A + B: DONE, committed (`2adcac1` circuit rider, `fbe44d9` driver). 68/68 unfiltered.
+- Phase C: DONE. 4 runs (b4×2, b2×2), all zero-swap, footprints reproduced — b4 30.42 GB,
+  b2 20.53 GB (== PR #23 stage-3; rider footprint-free). Runs in `docs/m4tree-step2-run{1,2}.md`.
+- Phase D: PR (no merge) next. Optional 1c side road SKIPPED (kept PR focused; noted in PR body).
