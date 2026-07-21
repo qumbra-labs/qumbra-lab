@@ -995,8 +995,21 @@ const BCBD: usize = FRGM + 1; // 1: blkcnt update delta (2b-iii)
 const CHI: usize = BCBD + 1; // 1: running child selector (interior only)
 const CC: usize = CHI + 1; // CAP_LEN: materialized chi·caps8 (cap-half select)
 
-const GATE_COLS: usize = CC + CAP_LEN - GB;
-pub(crate) const GATE_WIDTH: usize = CC + CAP_LEN;
+// -- R1 (issue #21) canonicity binding ---------------------------------------
+// Appended at the gate-block tail so no existing offset shifts. The consumed
+// word Wxc is a field-reduced KoalaBear element (v and v+p collapse), so the
+// `< p` comparator cannot act on Wxc directly; it acts on a range-FORCED 32-bit
+// digit split. `HBx` (16 hi bits) already exist; `CANON_LOx` are the 16 lo bits,
+// and `Wxc == Σ CANON_LOx·2^i + 2^16·Σ HBx·2^i` binds the split to the value.
+// `TOP7_x` materializes "word bits 24..30 all set" at deg 3 (TOPAx·hb13·hb14),
+// so the reject product `TOP7·lo_nonzero` stays deg 3. Active on casm value rows.
+const CANON_LO0: usize = CC + CAP_LEN; // 16: word-0 low 16 bits
+const CANON_LO1: usize = CANON_LO0 + 16; // 16: word-1 low 16 bits
+const TOP7_0: usize = CANON_LO1 + 16; // word-0 bits 24..30 all-set flag
+const TOP7_1: usize = TOP7_0 + 1; // word-1 bits 24..30 all-set flag
+
+const GATE_COLS: usize = TOP7_1 + 1 - GB;
+pub(crate) const GATE_WIDTH: usize = TOP7_1 + 1;
 
 /// Runtime mirror of the column-offset chain above, computed from a
 /// [`GateShape`] instead of the top-of-file `const`s. `from_shape(narrow())`
@@ -1198,6 +1211,14 @@ pub(crate) struct GateLayout {
     /// the childL→childR boundary and freeze-carried to the root perm. (dR is
     /// adjacent to the root perm, bound directly by the boundary transition.)
     pub(crate) dlr: usize,
+    /// R1 (issue #21) canonicity binding (all shapes; gate-block tail). `canon_lo0`
+    /// / `canon_lo1` = the 16 low bits of the consumed words 0/1; `top7_0` /
+    /// `top7_1` = materialized "word bits 24..30 all set" flags. See the const
+    /// chain above for the soundness argument.
+    pub(crate) canon_lo0: usize,
+    pub(crate) canon_lo1: usize,
+    pub(crate) top7_0: usize,
+    pub(crate) top7_1: usize,
     pub(crate) gate_cols: usize,
     pub(crate) gate_width: usize,
 }
@@ -1383,8 +1404,13 @@ impl GateLayout {
         let mcont = mrst + 1;
         let dlr = mcont + 1;
         let merge_cols = if s.merge_lane { 28 } else { 0 }; // mreg,mcnt,meq[4],minv[4],mrst,mcont,dlr[16]
-        let gate_cols = cc + s.cap_len + merge_cols - gb;
-        let gate_width = cc + s.cap_len + merge_cols;
+        // -- R1 (issue #21) canonicity binding, gate-block tail --
+        let canon_lo0 = cc + s.cap_len + merge_cols;
+        let canon_lo1 = canon_lo0 + 16;
+        let top7_0 = canon_lo1 + 16;
+        let top7_1 = top7_0 + 1;
+        let gate_cols = top7_1 + 1 - gb;
+        let gate_width = top7_1 + 1;
 
         GateLayout {
             mul_off, add_off, gb, w0c, w1c, hb0, hb1, ta0, topa0, ta1, topa1,
@@ -1399,7 +1425,8 @@ impl GateLayout {
             invzn, xreg, xfin, runev, f2dig, phd, cmpc, cmpci, czd, chlive, f2sel,
             pg_a, phg, phdend, cont, eg_a, endg, xsel, qadv, cfull, m3, rlo, rhi,
             dmux, snl, glo, ghi, gf, bpm, n_fhg, fhg, prega, cpa, cpb, cpl, consz7,
-            fpi, csel, frgm, bcbd, chi, cc, mreg, mcnt, meq, minv, mrst, mcont, dlr, gate_cols, gate_width,
+            fpi, csel, frgm, bcbd, chi, cc, mreg, mcnt, meq, minv, mrst, mcont, dlr,
+            canon_lo0, canon_lo1, top7_0, top7_1, gate_cols, gate_width,
         }
     }
 }
@@ -2983,6 +3010,69 @@ where
         }
 
         // =====================================================================
+        // R1 (issue #21): word canonicity comparator. On value-consuming asm
+        // rows (casm = czd+cz7+cf: dup zeta openings, final-poly, fold leaves)
+        // the consumed words W0C/W1C must be canonical KoalaBear representatives
+        // (< P = 0x7F000001). W0C is field-reduced (v and v+p collapse), so the
+        // check binds a range-FORCED 32-bit digit split — HBx (16 hi bits) +
+        // CANON_LOx (16 lo bits) — and rejects the split whose integer ≥ P:
+        //   Wxc == Σ CANON_LOx[i]·2^i + 2^16·Σ HBx[i]·2^i            (deg 2)
+        //   canonical ⟺ bit31 clear AND NOT(bits24..30 all set AND bits0..23≠0)
+        // TA/TOPA/TOP7 stage the 7-bit AND (word bits 24..30 = hi bits 8..14) so
+        // the reject products TOP7·lbnz, TOP7·lonz stay deg 3. Query trace/
+        // quotient openings (cx0/cx1) are Merkle-bound to the canonical public
+        // cap, so they need no explicit check. Off-casm rows the columns are 0
+        // (buffer is zero-init; only fill_canon writes them), so the
+        // unconditional bit-booleans and TA/TOPA/TOP7 defining constraints hold
+        // trivially there.
+        // =====================================================================
+        {
+            let casm = cv(self.layout.czd) + cv(self.layout.cz7) + cv(self.layout.cf);
+            let words = [
+                (self.layout.hb0, self.layout.canon_lo0, self.layout.ta0, self.layout.topa0, self.layout.top7_0, self.layout.lbnz0, self.layout.lbi0, self.layout.lonz0, self.layout.loi0, self.layout.w0c),
+                (self.layout.hb1, self.layout.canon_lo1, self.layout.ta1, self.layout.topa1, self.layout.top7_1, self.layout.lbnz1, self.layout.lbi1, self.layout.lonz1, self.layout.loi1, self.layout.w1c),
+            ];
+            for (hb, lo, ta, topa, top7, lbnz, lbi, lonz, loi, wc) in words {
+                // Bit booleans (unconditional; off-casm the columns are 0).
+                for i in 0..16 {
+                    builder.assert_bool(cv(hb + i));
+                    builder.assert_bool(cv(lo + i));
+                }
+                // Range-forced 32-bit digit split binds the consumed field value.
+                let mut recomp = AB::Expr::ZERO;
+                for i in 0..16 {
+                    recomp = recomp + cv(lo + i) * c(1 << i) + cv(hb + i) * c(1 << (16 + i));
+                }
+                builder.assert_zero(casm.clone() * (cv(wc) - recomp));
+                // Low-part nonzero witnesses. lb = word bits 16..23 = hi bits
+                // 0..7 (= hb0..7); lo-part = word bits 0..15 (= CANON_LO).
+                let mut lb = AB::Expr::ZERO;
+                for i in 0..8 {
+                    lb = lb + cv(hb + i) * c(1 << i);
+                }
+                builder.assert_bool(cv(lbnz));
+                builder.assert_eq(cv(lbnz), lb.clone() * cv(lbi));
+                builder.assert_zero((AB::Expr::ONE - cv(lbnz)) * lb);
+                let mut lov = AB::Expr::ZERO;
+                for i in 0..16 {
+                    lov = lov + cv(lo + i) * c(1 << i);
+                }
+                builder.assert_bool(cv(lonz));
+                builder.assert_eq(cv(lonz), lov.clone() * cv(loi));
+                builder.assert_zero((AB::Expr::ONE - cv(lonz)) * lov);
+                // Top-7-set flag (word bits 24..30 = hi bits 8..14), staged deg 3.
+                builder.assert_eq(cv(ta), cv(hb + 8) * cv(hb + 9) * cv(hb + 10));
+                builder.assert_eq(cv(topa), cv(ta) * cv(hb + 11) * cv(hb + 12));
+                builder.assert_eq(cv(top7), cv(topa) * cv(hb + 13) * cv(hb + 14));
+                // Canonicity reject (gated by casm): bit31 clear, and not
+                // (top-7 all set AND low-24 nonzero).
+                builder.assert_zero(casm.clone() * cv(hb + 15));
+                builder.assert_zero(casm.clone() * cv(top7) * cv(lbnz));
+                builder.assert_zero(casm.clone() * cv(top7) * cv(lonz));
+            }
+        }
+
+        // =====================================================================
         // M_X1 x-chain (fold-pipeline arithmetic, inc-4): self.layout.xreg (query LDE
         // point) = GEN · ∏_r (kx[r] if idx-bit r else 1), a 22-row mul-bank
         // chain over the query index bits (rows 0..21). Since self.layout.idxb is bound to
@@ -4320,28 +4410,47 @@ fn fill_fs_row(
     v[base + layout.grot] = Val::from_bool(grot);
 }
 
-/// Word canonicity columns for one consumed word (idx 0 or 1).
+/// Word canonicity columns for one consumed word (idx 0 or 1). R1 (issue #21):
+/// fills the full range-forced 32-bit digit split of `w` (16 hi bits `hb`, 16 lo
+/// bits `canon_lo`) plus the top-7-set flag chain (`ta` = hi bits 8..10, `topa`
+/// = hi bits 8..12, `top7` = hi bits 8..14, i.e. word bits 24..30) and the
+/// low-part nonzero witnesses. Honest words are canonical (`w < P`); the
+/// `neg_noncanonical_word` test fills the alias `w+p` directly (bypassing this
+/// assert) to exercise the `< p` comparator in `eval`.
 fn fill_canon(v: &mut [Val], row: usize, word: usize, w: u32, layout: &GateLayout) {
     assert!(w < P, "honest witness words are canonical");
+    fill_canon_raw(v, row, word, w, layout);
+}
+
+/// Assert-free core of [`fill_canon`] so negatives can inject a non-canonical
+/// representation (`w + p`) that still reduces to the same field element.
+fn fill_canon_raw(v: &mut [Val], row: usize, word: usize, w: u32, layout: &GateLayout) {
     let base = row * layout.gate_width;
-    let (hb, ta, topa, lbnz, lbi, lonz, loi) = if word == 0 {
-        (layout.hb0, layout.ta0, layout.topa0, layout.lbnz0, layout.lbi0, layout.lonz0, layout.loi0)
+    let (hb, canon_lo, ta, topa, top7, lbnz, lbi, lonz, loi) = if word == 0 {
+        (layout.hb0, layout.canon_lo0, layout.ta0, layout.topa0, layout.top7_0, layout.lbnz0, layout.lbi0, layout.lonz0, layout.loi0)
     } else {
-        (layout.hb1, layout.ta1, layout.topa1, layout.lbnz1, layout.lbi1, layout.lonz1, layout.loi1)
+        (layout.hb1, layout.canon_lo1, layout.ta1, layout.topa1, layout.top7_1, layout.lbnz1, layout.lbi1, layout.lonz1, layout.loi1)
     };
     let hi = w >> 16;
+    let lo = w & 0xffff;
     for i in 0..16 {
         v[base + hb + i] = Val::from_bool((hi >> i) & 1 == 1);
+        v[base + canon_lo + i] = Val::from_bool((lo >> i) & 1 == 1);
     }
-    let tav = (hi >> 8) & 0xf == 0xf;
-    v[base + ta] = Val::from_bool(tav);
-    v[base + topa] = Val::from_bool(tav && (hi >> 12) & 0x7 == 0x7);
+    // Top-7 flag chain (word bits 24..30 = hi bits 8..14), staged so each
+    // defining constraint stays deg ≤ 3.
+    let ta_v = (hi >> 8) & 0x7 == 0x7; // hi bits 8..10
+    let topa_v = (hi >> 8) & 0x1f == 0x1f; // hi bits 8..12
+    let top7_v = (hi >> 8) & 0x7f == 0x7f; // hi bits 8..14
+    v[base + ta] = Val::from_bool(ta_v);
+    v[base + topa] = Val::from_bool(topa_v);
+    v[base + top7] = Val::from_bool(top7_v);
+    // Low-part nonzero witnesses. lb = word bits 16..23 (= hi & 0xff = hb0..7).
     let lb = hi & 0xff;
     v[base + lbnz] = Val::from_bool(lb != 0);
     if lb != 0 {
         v[base + lbi] = Val::from_u32(lb).inverse();
     }
-    let lo = w & 0xffff;
     v[base + lonz] = Val::from_bool(lo != 0);
     if lo != 0 {
         v[base + loi] = Val::from_u32(lo).inverse();
@@ -5949,6 +6058,10 @@ mod tests {
         assert_eq!(l.bcbd, BCBD);
         assert_eq!(l.chi, CHI);
         assert_eq!(l.cc, CC);
+        assert_eq!(l.canon_lo0, CANON_LO0);
+        assert_eq!(l.canon_lo1, CANON_LO1);
+        assert_eq!(l.top7_0, TOP7_0);
+        assert_eq!(l.top7_1, TOP7_1);
         assert_eq!(l.gate_cols, GATE_COLS);
         assert_eq!(l.gate_width, GATE_WIDTH);
     }
@@ -5993,14 +6106,17 @@ mod tests {
         assert_eq!(w.n_flush_entries(), 8);
         assert_eq!(w.n_fhg(), 21);
         assert_eq!(w.drnd_width(), 5);
-        // F2 = 32 + 16·(2·tw + qw); tw = GATE_WIDTH (3638 with csel+frgm+bcbd +
-        // 2d's chi+cc[8]) → 116576. All other flushes are tw-independent.
-        assert_eq!(w.flush_bytes(), vec![3676, 288, 116576, 288, 288, 288, 304]);
-        // F2 blocks = 116576/136 + 1 = 858 (two more than the 856 at tw=3629 as
-        // the 9 routing columns widened the leaf).
-        assert_eq!(w.flush_blocks(), vec![28, 3, 858, 3, 3, 3, 3]);
+        // F2 = 32 + 16·(2·tw + qw); tw = GATE_WIDTH (3672 = 3638 + R1's 34
+        // canonicity cols: canon_lo0/1[16] + top7_0/1) → 117664. All other
+        // flushes are tw-independent.
+        assert_eq!(w.flush_bytes(), vec![3676, 288, 117664, 288, 288, 288, 304]);
+        // F2 blocks = 117664/136 + 1 = 866 (eight more than the 858 at tw=3638;
+        // R1's 34 leaf cols add 16·2·34 = 1088 F2 bytes = 8 keccak blocks).
+        assert_eq!(w.flush_blocks(), vec![28, 3, 866, 3, 3, 3, 3]);
         assert_eq!(w.n_shapes_obs(), 46);
-        assert_eq!(w.qslots(), 165);
+        // qslots = ceil34(tw) + pl0 + ceil34(qw) + pl1; tw=3672 makes
+        // ceil34(3672)=108 (was 107 at 3638) → one more trace-leaf absorb slot.
+        assert_eq!(w.qslots(), 166);
         assert_eq!(w.bidx_width(), 29, "wide F0=28 blocks → bidx must address all + 1 sink");
     }
 
@@ -6490,6 +6606,36 @@ mod tests {
             let odd = fd[0].0;
             assert!(odd % 24 >= 1, "field draw not on an even/odd pair");
             t.values[(odd - 1) * w + FSGATE] = Val::ZERO;
+        });
+    }
+
+    /// R1 (issue #21): word canonicity comparator. Replace one routed word on a
+    /// value-consuming (casm) row with its non-canonical alias `w + p` — the same
+    /// KoalaBear residue, so the field-reduced W0C column and the range-forced
+    /// digit-split binding are unchanged and every other constraint still holds —
+    /// but the `< p` comparator rejects the alias's bit pattern (bit 31 set, or
+    /// word bits 24..30 all set with bits 0..23 nonzero). A real fired-constraint
+    /// negative: on the base circuit the canon columns are unreferenced (SAT);
+    /// only the new comparator makes it UNSAT.
+    #[test]
+    fn gate_neg_noncanonical_word() {
+        let w = GATE_WIDTH;
+        let layout = GateLayout::from_shape(&GateShape::narrow());
+        assert_unsat(move |t, _o, _qr, _fd| {
+            let rows = t.values.len() / w;
+            let row = (0..rows)
+                .find(|&r| {
+                    t.values[r * w + CZD] != Val::ZERO
+                        || t.values[r * w + CZ7] != Val::ZERO
+                        || t.values[r * w + CF] != Val::ZERO
+                })
+                .expect("a casm value row exists");
+            let v = t.values[row * w + W0C].as_canonical_u32();
+            assert!(v < P, "honest routed word is canonical");
+            // Inject the alias v+p into word 0's canon columns (fill_canon_raw
+            // skips the canonicity assert). W0C stays = v (v+p ≡ v mod p), so the
+            // digit-split binding still holds and only the comparator fires.
+            fill_canon_raw(&mut t.values, row, 0, v + P, &layout);
         });
     }
 
