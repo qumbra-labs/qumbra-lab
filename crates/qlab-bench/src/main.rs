@@ -27,6 +27,7 @@ mod m4treerec;
 mod m4price;
 mod m4route;
 mod m4skel;
+mod m5note;
 mod narrow_bench;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -956,6 +957,10 @@ fn main() {
             let only_pos = args.iter().position(|a| a == "--only");
             let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
             m4census::run_m4census(&power, only);
+            return;
+        }
+        "m5note" => {
+            m5note::run_m5note(&power);
             return;
         }
         "bucket" => {

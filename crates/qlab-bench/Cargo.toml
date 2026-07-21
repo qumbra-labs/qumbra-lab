@@ -6,6 +6,8 @@ publish.workspace = true
 
 [dependencies]
 qlab-air = { path = "../qlab-air" }
+# M5 note-encryption prototype library (additive; see crates/qlab-note).
+qlab-note = { path = "../qlab-note" }
 
 # Plonky3, pinned exactly at 0.6.1 (bench discipline: numbers against a
 # moving prover are meaningless). p3-maybe-rayon/parallel turns on the

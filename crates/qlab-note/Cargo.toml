@@ -1,0 +1,28 @@
+[package]
+name = "qlab-note"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# M5 note-encryption prototype: ML-KEM-768 encap/decap + AEAD over the note
+# plaintext + the ratified compact-entry wire layout (note-discovery.md
+# Decision 1/2). See docs/m5-note-plan.md for the decision record.
+
+[dependencies]
+# cm recompute calls qlab-air's note-commitment hash layout — never forks it.
+qlab-air = { path = "../qlab-air" }
+
+# ML-KEM-768, FIPS 203 final (RustCrypto). Pinned exactly (bench discipline).
+# Tested vs NIST ACVP + Wycheproof upstream; unaudited (self-declared) — see plan.
+ml-kem = "=0.3.2"
+# AEAD over the note plaintext: ChaCha20-Poly1305 (RFC 8439, RUSTSEC-clean).
+chacha20poly1305 = "=0.11.0"
+# KEM traits (Encapsulate/Decapsulate) live in the `kem` re-export of ml-kem.
+# rand 0.10 matches the workspace (p3 0.6.1 ecosystem).
+rand = "0.10"
+
+[dev-dependencies]
+# Independent Keccak-256 authority to cross-check the sponge built on
+# qlab-air::reference::keccak_f (so a sponge transcription bug can't self-validate).
+tiny-keccak = { version = "2", features = ["keccak"] }

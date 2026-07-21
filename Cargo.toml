@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/qlab-air", "crates/qlab-bench"]
+members = ["crates/qlab-air", "crates/qlab-bench", "crates/qlab-note"]
 
 [workspace.package]
 edition = "2021"
