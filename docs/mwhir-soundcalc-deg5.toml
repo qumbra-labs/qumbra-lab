@@ -1,0 +1,33 @@
+# Qumbra M-WHIR step-0 — PARAMETER POINT (ii): degree-5 (quintic) extension.
+#
+# Same M3 consensus statement (2^18 × 618) but over KoalaBear^5 (X^5 + X^2 - 1,
+# |EF| ≈ 2^154.6) — the PSE / lean-Ethereum precedent for making 100 bits PROVEN
+# (Johnson) rather than conjectured. Ready in p3 0.6.2 as
+# QuinticTrinomialExtensionField<KoalaBear> (STOP-POINT C did NOT trigger).
+#
+# Goal: find query/grind so JohnsonBound (proven) ≥ 100 bits. Starting rate 1/16.
+
+[zkevm]
+name = "QumbraWHIR-deg5"
+protocol_family = "WHIR"
+field = "KoalaBear^5"
+hash_size_bits = 256
+
+[[circuits]]
+name = "consensus_whir_deg5_johnson100"
+log_inv_rate = 4
+num_iterations = 4
+folding_factors = [4, 4, 4, 4]
+log_degree = 18
+batch_size = 618
+power_batching = true
+constraint_degree = 3
+num_constraints = 900
+air_max_degree = 3
+opening_points = 2
+num_queries = [40, 32, 26, 23]  # minimal set clearing proven-Johnson 100 (JBR total = 101)
+num_ood_samples = [2, 2, 2]
+grinding_batching_phase = 22
+grinding_bits_folding = [[22, 22, 22, 22], [22, 22, 22, 22], [22, 22, 22, 22], [22, 22, 22, 22]]
+grinding_bits_queries = [22, 22, 22, 22]
+grinding_bits_ood = [0, 0, 0]

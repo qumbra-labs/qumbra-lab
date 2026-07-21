@@ -1,0 +1,41 @@
+# Qumbra M-WHIR step-0 — PARAMETER POINT (i): degree-4 extension.
+#
+# Models the REAL M3 consensus statement (the 2×2 tx bucket) as a WHIR PCS:
+#   log_degree = 18  (2^18 trace rows, from M3: 83 perms → 2^18)
+#   batch_size = 618 (committed main-trace width, M3 final width)
+#   air_max_degree = 3, opening_points = 2 (local + next-row window)
+#
+# Field KoalaBear^4 (challenge field ≈ 2^124) — like-for-like with today's FRI
+# consensus claim. soundcalc's CBR/capacity regime is REMOVED post-DG25/CS25, so
+# it reports the PROVEN regimes only (UniqueDecoding + JohnsonBound). The
+# DG25-*conjectured* ~100 number is a docs-layer hand-calc (see mwhir-soundcalc.md);
+# this run's job at deg-4 is to expose the PROVEN-Johnson ceiling (the ~80-bit cap).
+#
+# Starting rate 1/16 (log_inv_rate = 4) ⇒ initial LDE |L| = 2^(18+4) = 2^22 — the
+# exact 2^22-class domain the fri-soundness §3 cap claim is stated at. Queries are
+# pumped well past any sane operating point to probe whether JBR saturates.
+
+[zkevm]
+name = "QumbraWHIR-deg4"
+protocol_family = "WHIR"
+field = "KoalaBear^4"
+hash_size_bits = 256
+
+[[circuits]]
+name = "consensus_whir_deg4_probe"
+log_inv_rate = 4
+num_iterations = 4
+folding_factors = [4, 4, 4, 4]     # m: 18 → 2 over 4 iterations
+log_degree = 18
+batch_size = 618
+power_batching = true
+constraint_degree = 3
+num_constraints = 900              # narrow-Keccak bucket estimate (feeds ALI only; non-binding)
+air_max_degree = 3
+opening_points = 2
+num_queries = [40, 32, 26, 23]  # chosen operating point (JBR ceiling probe; JBR total = 80 regardless of query count)
+num_ood_samples = [2, 2, 2]
+grinding_batching_phase = 22
+grinding_bits_folding = [[22, 22, 22, 22], [22, 22, 22, 22], [22, 22, 22, 22], [22, 22, 22, 22]]
+grinding_bits_queries = [22, 22, 22, 22]
+grinding_bits_ood = [0, 0, 0]
