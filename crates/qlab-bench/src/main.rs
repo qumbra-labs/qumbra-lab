@@ -18,6 +18,7 @@
 mod geometry;
 mod levers;
 mod m4anchor;
+mod m4assembly;
 mod m4census;
 mod m4gate;
 mod m4gaterec;
@@ -929,6 +930,12 @@ fn main() {
             let only_pos = args.iter().position(|a| a == "--only");
             let only = only_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
             m4interior::run_m4interior(&power, only);
+            return;
+        }
+        "m4assembly" => {
+            let lane_pos = args.iter().position(|a| a == "--lane");
+            let lane = lane_pos.and_then(|i| args.get(i + 1)).map(String::as_str);
+            m4assembly::run_m4assembly(&power, lane);
             return;
         }
         "m4price" => {
