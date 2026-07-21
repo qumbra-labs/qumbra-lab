@@ -92,9 +92,25 @@ and report options** — do not hand-roll ML-DSA.
 
 - M5 chose RustCrypto `ml-kem =0.3.2` (FIPS-203-final, ACVP/Wycheproof KATs,
   self-declared **unaudited**; libcrux-ml-kem named as the production alternative).
-- The ML-DSA analog to evaluate at 棒 2: RustCrypto `ml-dsa` (FIPS-204). **Status:
-  TBD — to be recorded at 棒 2** (crate version, FIPS-204 KAT/ACVP status, audit
-  status, production alternative). Not selected yet.
+
+**Recorded (2026-07-21, research leg) — RECOMMENDED: `ml-dsa = "=0.1.1"` (RustCrypto).**
+The exact ML-DSA analog of the M5 `ml-kem` choice; adopt at 棒 2 unless coding turns
+up a blocker.
+
+| Crate | Verdict | Notes |
+|---|---|---|
+| **RustCrypto `ml-dsa` 0.1.1** | **RECOMMEND** | pure-Rust, FIPS-204-**final**, NIST **ACVP + Wycheproof** KATs, **unaudited**; `SigningKey::<MlDsa65>::from_seed(&seed)` (deterministic genesis keygen), hedged-default signing, sig = **3309 B** (matches FIPS-204), `no_std`, MSRV 1.85. Same org/posture as ml-kem. |
+| `fips204 = 0.4.6` | fallback | pure-Rust, FIPS-204-final, cleanest no_std API; but **~19 mo stale** (single maintainer) and lighter on external ACVP/Wycheproof vectors. |
+| `libcrux-ml-dsa` (Cryspen) | **production alternative** | formally verified (hax+F*); but **0.0.x, unstable API** — not a devnet pin. The ml-dsa analog of libcrux-ml-kem. |
+| `pqcrypto-mldsa` / `pqcrypto-dilithium` | disqualified | C-FFI (PQClean), not pure-Rust; dilithium also deprecated ([RUSTSEC-2024-0380](https://rustsec.org/advisories/RUSTSEC-2024-0380.html)) + round-3 (not final). |
+
+⚠ **Pin `>=0.1.1`, never an rc build.** Signature-malleability advisory
+[GHSA-5x2r-hc65-25f9](https://github.com/RustCrypto/signatures/security/advisories/GHSA-5x2r-hc65-25f9)
+(verification accepted repeated hint indices → multiple valid byte encodings of one
+logical signature) affects **rc.3 and earlier; fixed in rc.4 / 0.1.1**.
+**Design consequence for 棒 3:** the equivocation-evidence layer must dedup /
+replay-protect votes on **(signer, checkpoint-slot)**, NOT on raw signature bytes —
+non-malleability is enforced by 0.1.1 but the consensus layer should not depend on it.
 
 ---
 
