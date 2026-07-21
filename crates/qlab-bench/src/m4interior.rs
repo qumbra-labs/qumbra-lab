@@ -176,13 +176,13 @@ enum Shape {
 /// `/usr/bin/time -l` line**, not measured in-process. This bench does NOT judge
 /// against §7.3 — the coordinator does the table lookup on the reported numbers.
 ///
-/// Rows (name = shape/lane-config):
-/// - `single-child/b4/q40/g20/fp16/a16` — the §7.1 canary (measure twice).
-/// - `single-child/b2/q80/g20/fp16/a16` — canary at the backup blowup (optional).
-/// - `two-child/b4/q40/g20/fp16/a16` — the interior at b4 (run only if the
-///   leaf→canary height slope extrapolates below the ~34 GB rig wall, §7.1.3).
-/// - `two-child/b2/q80/g20/fp16/a16` — the interior at the backup blowup (the
-///   b2/q80 substitute the rig wall forces; both configs are ~100 bits).
+/// Rows (name = shape/lane-config; b2 is the decided interior lane, listed first):
+/// - `single-child/b2/q80/g22/fp16/a16` — the §7.1 canary at the decided lane (measure twice).
+/// - `single-child/b4/q40/g22/fp16/a16` — canary at the optional b4 blowup.
+/// - `two-child/b2/q80/g22/fp16/a16` — the interior at the DECIDED b2/q80 lane
+///   (2026-07-21; ~20.5 GB, clean ~4.8 s — the operating point).
+/// - `two-child/b4/q40/g22/fp16/a16` — the interior at the optional b4 config
+///   (30.42 GB, compression-noised — run only per §7.1.3; both configs are ~100 bits).
 ///
 /// The child leaves (each ~12 GB peak / ~0.67 s at b4/q40) are proved SERIALLY
 /// and ONCE, then dropped — only their recorded `Schedule` + outer PVs survive
@@ -216,27 +216,30 @@ pub(crate) fn run_m4interior(power: &str, only: Option<&str>) {
     );
     println!();
 
-    // b4/q40/g20 primary, b2/q80/g20 backup — both clear ~100 bits (make_config_with
-    // asserts it: 40·2+20 = 80·1+20 = 100). fp16/a16 match the leaf/consensus lane.
+    // b2/q80/g22 is the DECIDED interior lane (2026-07-21, Larry — aggregation-rung1
+    // §4); b4/q40/g22 stays available as the optional/fallback config. Both clear
+    // ~100 bits (make_config_with asserts it: 40·2+22 = 80·1+22 = 102, post-B′).
+    // fp16/a16 match the leaf/consensus lane; grind g22 per issue #22.
     let b4 = FriCfg {
         log_blowup: 2,
         num_queries: 40,
-        grind_bits: 20,
+        grind_bits: 22,
         log_final_poly_len: 4,
         max_log_arity: 4,
     };
     let b2 = FriCfg {
         log_blowup: 1,
         num_queries: 80,
-        grind_bits: 20,
+        grind_bits: 22,
         log_final_poly_len: 4,
         max_log_arity: 4,
     };
+    // b2 rows first (the decided primary lane); b4 rows kept as the optional fallback.
     let rows: [(&str, Shape, FriCfg); 4] = [
-        ("single-child/b4/q40/g20/fp16/a16", Shape::Single, b4),
-        ("single-child/b2/q80/g20/fp16/a16", Shape::Single, b2),
-        ("two-child/b4/q40/g20/fp16/a16", Shape::Two, b4),
-        ("two-child/b2/q80/g20/fp16/a16", Shape::Two, b2),
+        ("single-child/b2/q80/g22/fp16/a16", Shape::Single, b2),
+        ("single-child/b4/q40/g22/fp16/a16", Shape::Single, b4),
+        ("two-child/b2/q80/g22/fp16/a16", Shape::Two, b2),
+        ("two-child/b4/q40/g22/fp16/a16", Shape::Two, b4),
     ];
 
     // Cache the heavy child schedules within a process (each leaf prove has a

@@ -34,11 +34,11 @@ const NARROW_CFGS: [(&str, FriCfg); 9] = [
     // Margin card: early-stop at a 32-coeff final poly (one fewer partial
     // fold round per query) at the consensus point.
     (
-        "b16/q20/g20/fp32/a16",
+        "b16/q20/g22/fp32/a16",
         FriCfg {
             log_blowup: 4,
             num_queries: 20,
-            grind_bits: 20,
+            grind_bits: 22, // g22 (B′, issue #22) — consensus point; size grind-invariant, prove-time only
             log_final_poly_len: 5,
             max_log_arity: 4,
         },
@@ -90,11 +90,11 @@ const NARROW_CFGS: [(&str, FriCfg); 9] = [
     // Query count dominates byte cost (~6.5 KB/query at b16 incl. the
     // preprocessed opening); trade queries for grind at exactly 100 bits.
     (
-        "b16/q20/g20/a16",
+        "b16/q20/g22/a16",
         FriCfg {
             log_blowup: 4,
             num_queries: 20,
-            grind_bits: 20,
+            grind_bits: 22, // g22 (B′, issue #22) — THE consensus lane (fp16/a16); size == g20's 136.4 KB, prove-time only
             log_final_poly_len: 4,
             max_log_arity: 4,
         },
@@ -357,7 +357,7 @@ pub(crate) fn run_bucket(power: &str, only: Option<&str>) {
         }
     }
     println!();
-    println!("Gates: <= 150 KB and <= 3,000 ms at the consensus config b16/q20/g20/fp16/a16.");
+    println!("Gates: <= 150 KB and <= 3,000 ms at the consensus config b16/q20/g22/fp16/a16.");
 }
 
 #[cfg(test)]

@@ -92,20 +92,22 @@ fn prove_verify_walk_leaf(variant: bool) -> (Schedule, Vec<Val>, f64, usize) {
 /// aggregation-rung1 §7.1 (per deliverable 3, only the interior segment's peak
 /// is recorded; the leaf's is already in `docs/m4gate-step0bii-run*.md`).
 ///
-/// `--lane b4` (b4/q40) primary, `--lane b2` (b2/q80) backup — both ~100 bits
-/// (make_config_with asserts 40·2+20 = 80·1+20 = 100). Defaults to b4.
+/// `--lane b2` (b2/q80) is the default interior lane (DECIDED 2026-07-21, Larry
+/// — aggregation-rung1 §4: true-32 GB-box fit + issue #24 headroom + clean 4.8 s
+/// prove); `--lane b4` (b4/q40) stays available as an optional flag. Both ~100
+/// bits (make_config_with asserts 40·2+22 = 80·1+22 = 102, post-B′). Defaults to b2.
 pub(crate) fn run_m4assembly(power: &str, lane: Option<&str>) {
     use p3_matrix::Matrix;
     use std::time::Instant;
 
-    let (lane_name, cfg): (&str, FriCfg) = match lane.unwrap_or("b4") {
+    let (lane_name, cfg): (&str, FriCfg) = match lane.unwrap_or("b2") {
         "b2" => (
-            "b2/q80/g20/fp16/a16",
-            FriCfg { log_blowup: 1, num_queries: 80, grind_bits: 20, log_final_poly_len: 4, max_log_arity: 4 },
+            "b2/q80/g22/fp16/a16",
+            FriCfg { log_blowup: 1, num_queries: 80, grind_bits: 22, log_final_poly_len: 4, max_log_arity: 4 },
         ),
         "b4" => (
-            "b4/q40/g20/fp16/a16",
-            FriCfg { log_blowup: 2, num_queries: 40, grind_bits: 20, log_final_poly_len: 4, max_log_arity: 4 },
+            "b4/q40/g22/fp16/a16",
+            FriCfg { log_blowup: 2, num_queries: 40, grind_bits: 22, log_final_poly_len: 4, max_log_arity: 4 },
         ),
         other => panic!("unknown --lane `{other}` (expected b4 | b2)"),
     };
