@@ -843,6 +843,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qlab-wallet"
+version = "0.0.0"
+dependencies = [
+ "ml-kem",
+ "qlab-air",
+ "qlab-note",
+ "rand",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
