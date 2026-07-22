@@ -182,3 +182,22 @@ Type-level separation; spend capability lives ONLY in `SpendingKey`.
 5. End-to-end test + PR (no merge; coordinator accepts).
 
 Full unfiltered `cargo test --release` green at every commit.
+
+---
+
+## 8. Results (measured)
+
+- **Address sizes (CI-locked, `address::tests::measured_sizes`):** raw
+  **1,233 B** (~1.2 KB, dominated by the 1,184-B ML-KEM ek), bech32m-encoded
+  **1,985 chars** (~2 KB), short address **35 chars**. Matches tx-model §4's
+  "~1.3 KB raw, ~2 KB encoded"; short address beats Abelian's 136-char handle.
+- **Derivation locks:** `nk_nf_path_locked_to_build_bucket` (sk→nk→nf vs
+  circuit `nf[]`), `rkm_path_locked_via_anchor` (rkm→input-cm→root vs circuit
+  `anchor`), `rkm_packing_byte_identical`. All green.
+- **End-to-end:** `derive_address_encrypt_scan_recompute_and_spend` — full loop
+  incl. spending the received note (circuit `nf[0]` == wallet nullifier) and
+  `cm_out` == recomputed commitment. Green.
+- **Test count:** qlab-wallet 22 unit + 2 integration + 2 compile_fail
+  doc-tests; +1 additive qlab-note test (`ek_from_bytes`). Full unfiltered
+  workspace suite green (qlab-air 11, qlab-bench 80, qlab-devnet 59,
+  qlab-note 22, qlab-wallet 24 +2 doc).

@@ -239,6 +239,16 @@ mod tests {
         assert_eq!(a.to_raw_bytes().len(), 1233);
     }
 
+    /// Measured, CI-locked sizes (reported in the PR): raw ~1.2 KB, encoded
+    /// ~2 KB, short address ~35 chars — matches tx-model §4's ~1.3 KB / ~2 KB.
+    #[test]
+    fn measured_sizes() {
+        let a = sample_address(10, [4u8; DIV_LEN]);
+        assert_eq!(a.to_raw_bytes().len(), 1233, "raw address bytes");
+        assert_eq!(a.encode().len(), 1985, "bech32m-encoded address chars");
+        assert_eq!(a.short().encode().len(), 35, "short-address chars");
+    }
+
     #[test]
     fn raw_roundtrip() {
         let a = sample_address(2, [9u8; DIV_LEN]);
