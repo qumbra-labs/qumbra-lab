@@ -64,6 +64,7 @@
 
 pub mod address;
 pub mod bech32m;
+pub mod diversifier;
 pub mod keys;
 pub mod mnemonic;
 pub mod seed;
