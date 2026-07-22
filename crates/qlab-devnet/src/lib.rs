@@ -41,3 +41,4 @@ pub mod node;
 pub mod params_devnet;
 pub mod pow;
 pub mod validation;
+pub mod weight;
