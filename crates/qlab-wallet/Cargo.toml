@@ -1,0 +1,25 @@
+[package]
+name = "qlab-wallet"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# M7 wallet core: key hierarchy (sk -> nk/rkm/nf, byte-for-byte with the
+# qlab-air spend-key circuit), diversified ML-KEM addresses, and the fvk/ivk
+# standing-disclosure capability split. Key layer only — no proving, no
+# networking, no persistence. See docs/m7-wallet-plan.md for the decision record.
+
+[dependencies]
+# nk/rkm/nf/cm derivations call qlab-air's exact Keccak permutation — never fork.
+qlab-air = { path = "../qlab-air" }
+# Reuse the ratified KEM/AEAD/scan + note commitment — do NOT re-implement.
+qlab-note = { path = "../qlab-note" }
+# ML-KEM-768 keypair generation (from a deterministic seed for diversification).
+ml-kem = "=0.3.2"
+# Deterministic CSPRNG seeding of ML-KEM keygen from a Keccak-derived seed.
+rand = "0.10"
+
+[dev-dependencies]
+# Regression locks build real bucket instances to compare against public outputs.
+# (qlab-air is already a normal dep; build_bucket is public.)

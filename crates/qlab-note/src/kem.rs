@@ -85,6 +85,15 @@ pub fn ek_to_bytes(ek: &Ek) -> [u8; EK_LEN] {
     out
 }
 
+/// Parse a serialized ML-KEM-768 encapsulation key (the inverse of
+/// [`ek_to_bytes`]) back into an [`Ek`] usable for encapsulation. Returns
+/// `None` if the bytes are not a valid ML-KEM-768 ek. Added for M7: an address
+/// carries the ek as bytes, and the sender must reconstruct the `Ek` to encrypt.
+pub fn ek_from_bytes(b: &[u8; EK_LEN]) -> Option<Ek> {
+    let arr = ml_kem::array::Array::try_from(b.as_slice()).ok()?;
+    Ek::new(&arr).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,6 +121,20 @@ mod tests {
         // secret — different from the true K with overwhelming probability.
         let k_wrong = decapsulate(&kp_b.dk, &ct);
         assert_ne!(k_enc, k_wrong, "wrong-key decap must not recover K");
+    }
+
+    #[test]
+    fn ek_bytes_roundtrip_and_reject_garbage() {
+        let mut rng = StdRng::seed_from_u64(4);
+        let kp = generate_keypair(&mut rng);
+        let bytes = ek_to_bytes(&kp.ek);
+        let ek2 = ek_from_bytes(&bytes).expect("valid ek round-trips");
+        // Re-serializing the parsed ek reproduces the same bytes.
+        assert_eq!(ek_to_bytes(&ek2), bytes, "ek_from_bytes . ek_to_bytes == id");
+        assert_eq!(ek2, kp.ek, "parsed ek equals the original");
+        // An encapsulation to the parsed ek decapsulates under the original dk.
+        let (ct, k_enc) = encapsulate(&ek2, &mut rng);
+        assert_eq!(decapsulate(&kp.dk, &ct), k_enc, "parsed ek is functional");
     }
 
     #[test]
