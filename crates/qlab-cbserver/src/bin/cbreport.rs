@@ -129,6 +129,12 @@ fn main() {
     println!("| note-detection rate | {:.0} notes/s |", out.stats.notes_found as f64 / secs);
     println!("| server requests served | {} |", handle.requests_served());
     println!();
+    println!("Wall time is **connection-bound**: the reference client uses `Connection: close`");
+    println!("(one TCP round-trip per fetch) and the decoy hook is ON (≥1 decoy per matched");
+    println!("fetch), so ~{} localhost connections dominate — not the ML-KEM decap (54k/s,",
+        1 + out.stats.matched_fetches + out.stats.decoy_fetches);
+    println!("PR #28). It is an honest end-to-end localhost number for this reference, not a");
+    println!("tuned-transport ceiling (HTTP keep-alive / batched /full would raise it).\n");
     assert_eq!(out.stats.notes_found, devnet.expected_matches, "scan must find all planted notes");
 
     // ---- 3. Frontier round-trip against the devnet tree ----------------------
