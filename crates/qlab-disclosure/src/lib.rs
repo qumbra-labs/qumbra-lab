@@ -19,4 +19,6 @@
 //! [auditable-privacy]: qumbra-design/auditable-privacy.md
 
 pub mod air;
+pub mod envelope;
 pub mod packing;
+pub mod prove;

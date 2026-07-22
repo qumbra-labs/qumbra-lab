@@ -219,6 +219,37 @@ pub struct DisclosureAir {
 }
 
 impl DisclosureAir {
+    /// The canonical disclosure program (role schedule) — PUBLIC and fixed for
+    /// every disclosure of a 1,233-byte address (10 sponge blocks): CM, ADDR0,
+    /// 8×ADDRMID, ADDREND, ACLOSE, then DUMMY. The verifier reconstructs this
+    /// (it needs the schedule, not the witness).
+    pub fn disclosure_program() -> [u32; PROGRAM_SLOTS] {
+        let n_blocks = RAW_ADDR_LEN.div_ceil(RATE_LANES * 8); // 10
+        let mut program = [ROLE_DUMMY; PROGRAM_SLOTS];
+        program[0] = ROLE_CM;
+        for i in 0..n_blocks {
+            program[1 + i] = if i == 0 {
+                ROLE_ADDR0
+            } else if i == n_blocks - 1 {
+                ROLE_ADDREND
+            } else {
+                ROLE_ADDRMID
+            };
+        }
+        program[1 + n_blocks] = ROLE_ACLOSE;
+        program
+    }
+
+    /// The verifier-side AIR: the canonical schedule with NO witness (only
+    /// [`generate_trace`] needs `slot_witness`).
+    pub fn verifier(log_height: usize) -> Self {
+        Self {
+            log_height,
+            program: Self::disclosure_program(),
+            slot_witness: Vec::new(),
+        }
+    }
+
     /// All-DUMMY instance: pure Keccak chaining (used to validate the core port).
     pub fn chain_only(log_height: usize) -> Self {
         Self {
@@ -1005,11 +1036,11 @@ impl DisclosureAir {
     pub const PROGRAM_PERMS: usize = 12;
 
     /// The block index at which the CM permutation's output (= `cm`) is
-    /// materialized (start of perm 1).
-    const CM_OUT_BLOCK: usize = 24;
+    /// materialized (start of perm 1). See [`extract_state`].
+    pub const CM_OUT_BLOCK: usize = 24;
     /// The block at which the address sponge's final output (= `addr_commitment`)
     /// is materialized (start of perm 11, the ACLOSE perm).
-    const ADDR_OUT_BLOCK: usize = 24 * 11;
+    pub const ADDR_OUT_BLOCK: usize = 24 * 11;
 
     /// Extract the state materialized at block `q` (round-q input): bit z of
     /// lane l is the `a` cell at row 128q + z.
@@ -1098,32 +1129,22 @@ pub fn build_disclosure(
     let last = padded.len() - 1;
     padded[last] ^= 0x80;
 
-    // Program + witness.
-    let mut program = [ROLE_DUMMY; PROGRAM_SLOTS];
+    // Program is the canonical schedule (shared with the verifier); this
+    // builder only fills the witness.
+    let program = DisclosureAir::disclosure_program();
     let mut sw = vec![[0u64; NW]; PROGRAM_SLOTS];
 
-    // perm 0: CM.
-    program[0] = ROLE_CM;
+    // perm 0: CM witness = value ‖ rkm ‖ rho ‖ rseed.
     sw[0][0] = value;
     sw[0][1..5].copy_from_slice(rkm);
     sw[0][5..9].copy_from_slice(rho);
     sw[0][9..13].copy_from_slice(rseed);
 
-    // perms 1..1+n_blocks: address sponge (ADDR0, ADDRMID.., ADDREND).
+    // perms 1..1+n_blocks: address sponge rate blocks.
     for i in 0..n_blocks {
-        let slot = 1 + i;
         let block = &padded[i * RATE_LANES * 8..(i + 1) * RATE_LANES * 8];
-        sw[slot] = bytes_to_lanes(block);
-        program[slot] = if i == 0 {
-            ROLE_ADDR0
-        } else if i == n_blocks - 1 {
-            ROLE_ADDREND
-        } else {
-            ROLE_ADDRMID
-        };
+        sw[1 + i] = bytes_to_lanes(block);
     }
-    // perm 1+n_blocks: ACLOSE (exposes the address digest).
-    program[1 + n_blocks] = ROLE_ACLOSE;
 
     let pvs = pv_vec(&cm, &addr_commitment, value);
     DisclosureInstance {
