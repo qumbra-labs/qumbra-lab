@@ -176,8 +176,8 @@ mod tests {
         let fee = 7u64;
         let total = o0.value + o1.value + fee;
         let inputs = [
-            TxInput { sk: [1, 2, 3, 4], value: total - 40, rho: [5, 6, 7, 8], rseed: [9, 10, 11, 12] },
-            TxInput { sk: [13, 14, 15, 16], value: 40, rho: [17, 18, 19, 20], rseed: [21, 22, 23, 24] },
+            TxInput { sk: [1, 2, 3, 4], value: total - 40, rho: [5, 6, 7, 8], rseed: [9, 10, 11, 12], d: [0, 0] },
+            TxInput { sk: [13, 14, 15, 16], value: 40, rho: [17, 18, 19, 20], rseed: [21, 22, 23, 24], d: [0, 0] },
         ];
         let outputs = [
             TxOutput { value: o0.value, rkm: o0.rkm, rho: o0.rho, rseed: o0.rseed },

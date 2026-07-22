@@ -219,8 +219,8 @@ mod tests {
     fn m6_body_wiring_validates_with_mock_verifier() {
         // build_bucket is cheap (no prove): make one instance to source public data.
         let inputs = [
-            TxInput { sk: [1, 2, 3, 4], value: 50_000, rho: [5, 6, 7, 8], rseed: [9, 10, 11, 12] },
-            TxInput { sk: [13, 14, 15, 16], value: 30_000, rho: [17, 18, 19, 20], rseed: [21, 22, 23, 24] },
+            TxInput { sk: [1, 2, 3, 4], value: 50_000, rho: [5, 6, 7, 8], rseed: [9, 10, 11, 12], d: [0, 0] },
+            TxInput { sk: [13, 14, 15, 16], value: 30_000, rho: [17, 18, 19, 20], rseed: [21, 22, 23, 24], d: [0, 0] },
         ];
         let outputs = [
             TxOutput { value: 60_000, rkm: [1; 4], rho: [2; 4], rseed: [3; 4] },

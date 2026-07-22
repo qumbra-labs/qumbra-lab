@@ -114,8 +114,11 @@ pub const ROLE_NF: u32 = 2;
 /// nk = H(sk || D_N): msg lanes 0..4 = W(sk), domain bit at lane 4 z0,
 /// pad10*1 at bit 320 (lane 5 z0) and bit 1087.
 pub const ROLE_ANK: u32 = 3;
-/// rkm = H(nk || D_R): same shape, domain bit at lane 4 z1, nk as witness
-/// W[0..4] (bound to the ank digest by equality bank 1).
+/// rkm = H(nk || D_R || d): domain bit at lane 4 z1, nk as witness W[0..4]
+/// (bound to the ank digest by equality bank 1), the 128-bit diversifier `d`
+/// as witness W[5..7] at lanes 5..7, then pad10*1 from bit 448 (lane 7 z0).
+/// Absorbing `d` fills previously-zero rate lanes of the SAME single
+/// permutation — no extra perm, no height change (issue #32).
 pub const ROLE_ARKM: u32 = 4;
 /// cm = H(value || rkm || rho || rseed): value = W4, rkm = chained digest
 /// a[0..4] at lanes 1..5, rho = W5..9 (bound to the NF perm's rho by
@@ -552,11 +555,15 @@ where
                 _ => AB::Expr::ZERO,
             };
             // arkm: nk (witness, bank-1-bound) at lanes 0..4, domain-R bit
-            // at lane 4 z1, same padding shape.
+            // at lane 4 z1, diversifier d (witness W5..7) at lanes 5..7, then
+            // pad10*1 from lane 7 z0 (bit 448) — one extra absorb-block's worth
+            // of rate lanes in the SAME perm (issue #32).
             let msg_arkm: AB::Expr = match l {
                 0..=3 => w(l),
                 4 => sel(1),
-                5 => sel(0),
+                5 => w(5),
+                6 => w(6),
+                7 => sel(0),
                 16 => u63.clone(),
                 _ => AB::Expr::ZERO,
             };
@@ -894,6 +901,13 @@ pub struct TxInput {
     pub value: u64,
     pub rho: [u64; 4],
     pub rseed: [u64; 4],
+    /// The address diversifier `d` (128-bit, two little-endian words) bound
+    /// into `rkm = H(nk ‖ D_R ‖ d)`. Two addresses of one wallet differ in `d`
+    /// and therefore in `rkm`, so their notes are unlinkable (issue #32). `d`
+    /// enters the ARKM perm as witness (lanes 5..7); it is pinned to the public
+    /// surface through `rkm → cm → membership → anchor`, so the prover cannot
+    /// vary it independently of the note it is spending.
+    pub d: [u64; 2],
 }
 
 /// One transaction output note (recipient key material is witness).
@@ -950,7 +964,9 @@ pub fn build_bucket(
         let mut rkm_in = [0u64; 25];
         rkm_in[..4].copy_from_slice(&nk);
         rkm_in[4] = 1 << 1; // domain R (z1)
-        rkm_in[5] = 1;
+        rkm_in[5] = inp.d[0]; // diversifier word 0 (issue #32)
+        rkm_in[6] = inp.d[1]; // diversifier word 1
+        rkm_in[7] = 1; // pad10*1 start, moved from lane 5 to bit 448
         rkm_in[16] = 1 << 63;
         let rkm_st = reference::keccak_f(&rkm_in);
         let rkm: [u64; 4] = rkm_st[..4].try_into().unwrap();
@@ -1045,6 +1061,8 @@ pub fn build_bucket(
         slot += 1;
         program[slot] = ROLE_ARKM;
         sw[slot].w[..4].copy_from_slice(nk);
+        sw[slot].w[5] = inp.d[0]; // diversifier -> rkm = H(nk ‖ D_R ‖ d)
+        sw[slot].w[6] = inp.d[1];
         slot += 1;
         program[slot] = ROLE_ACM;
         sw[slot].w[4] = inp.value;
@@ -1183,16 +1201,20 @@ impl NarrowKeccakAir {
                         16 => z63,
                         _ => 0,
                     },
-                    ROLE_ANK | ROLE_ARKM => match l {
+                    ROLE_ANK => match l {
                         0..=3 => wbit[l],
-                        4 => {
-                            if role_now == ROLE_ANK {
-                                z0
-                            } else {
-                                z1
-                            }
-                        }
+                        4 => z0,
                         5 => z0,
+                        16 => z63,
+                        _ => 0,
+                    },
+                    ROLE_ARKM => match l {
+                        0..=3 => wbit[l],
+                        4 => z1,
+                        // diversifier d = W5..7 at lanes 5..6, pad from lane 7.
+                        5 => wbit[5],
+                        6 => wbit[6],
+                        7 => z0,
                         16 => z63,
                         _ => 0,
                     },
@@ -1660,12 +1682,13 @@ mod tests {
         let rho: [u64; 4] = core::array::from_fn(|_| rnd());
         let rseed: [u64; 4] = core::array::from_fn(|_| rnd());
         let value = rnd() & 0xffff_ffff;
+        let d: [u64; 2] = [rnd(), rnd()]; // nonzero diversifier (issue #32)
 
         // Reference walk.
         let nk_state = reference::keccak_f(&st_ank(&sk, 0));
         let nk = digest(&nk_state);
         let nf_state = reference::keccak_f(&st_pair(&nk, &rho));
-        let rkm_state = reference::keccak_f(&st_ank_r(&nk));
+        let rkm_state = reference::keccak_f(&st_ank_r(&nk, &d));
         let rkm = digest(&rkm_state);
         let cm_state = reference::keccak_f(&st_cm(value, &rkm, &rho, &rseed));
 
@@ -1682,6 +1705,8 @@ mod tests {
         sw[1].w[..4].copy_from_slice(&sk);
         sw[2].w[..4].copy_from_slice(&rho); // nf: rho, pbit = 0
         sw[3].w[..4].copy_from_slice(&nk); // arkm: nk witness (bank 1)
+        sw[3].w[5] = d[0]; // arkm: diversifier witness (issue #32)
+        sw[3].w[6] = d[1];
         sw[4].w[4] = value;
         sw[4].w[5..9].copy_from_slice(&rho); // acm: rho witness (bank 2)
         sw[4].w[9..13].copy_from_slice(&rseed);
@@ -1722,11 +1747,13 @@ mod tests {
         }
     }
 
-    fn st_ank_r(nk: &[u64; 4]) -> [u64; 25] {
+    fn st_ank_r(nk: &[u64; 4], d: &[u64; 2]) -> [u64; 25] {
         let mut st = [0u64; 25];
         st[..4].copy_from_slice(nk);
         st[4] = 1 << 1; // domain R at z1
-        st[5] = 1;
+        st[5] = d[0]; // diversifier word 0 (issue #32)
+        st[6] = d[1]; // diversifier word 1
+        st[7] = 1; // pad10*1 moved to bit 448
         st[16] = 1 << 63;
         st
     }
@@ -1804,6 +1831,57 @@ mod tests {
         check_constraints(&inst.air, &trace, &pvs);
     }
 
+    /// Issue #32: `rkm = H(nk ‖ D_R ‖ d)` genuinely absorbs the diversifier.
+    /// Two buckets identical except for input 0's diversifier must (a) both
+    /// satisfy constraints, (b) produce DIFFERENT anchors — the commitment tree
+    /// depends on `cm → rkm(d)`, so notes at different diversifiers are
+    /// unlinkable — while (c) the nullifiers stay identical, since `nf =
+    /// H(nk ‖ ρ)` never sees `d`. And the STOP-POINT invariants hold: the perm
+    /// count and height are unchanged (`d` fills spare rate lanes of the same
+    /// ARKM perm).
+    #[test]
+    fn rkm_diversifier_dependent() {
+        let mk = |d0: [u64; 2]| {
+            let inputs = [
+                TxInput {
+                    sk: [0xa, 0xb, 0xc, 0xd],
+                    value: 100,
+                    rho: [1, 2, 3, 4],
+                    rseed: [5, 6, 7, 8],
+                    d: d0,
+                },
+                TxInput {
+                    sk: [1, 1, 1, 1],
+                    value: 50,
+                    rho: [9, 10, 11, 12],
+                    rseed: [13, 14, 15, 16],
+                    d: [0, 0],
+                },
+            ];
+            let outputs = [
+                TxOutput { value: 90, rkm: [2; 4], rho: [3; 4], rseed: [4; 4] },
+                TxOutput { value: 55, rkm: [5; 4], rho: [6; 4], rseed: [7; 4] },
+            ];
+            build_bucket(18, &inputs, &outputs, 5) // 100+50 = 90+55+5
+        };
+        let a = mk([0, 0]);
+        let b = mk([0xdead_beef, 0xf00d]);
+
+        // (a) both prove.
+        for inst in [&a, &b] {
+            let pvs: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+            let trace = inst.air.generate_trace::<F>(0);
+            check_constraints(&inst.air, &trace, &pvs);
+        }
+        // (b) distinct diversifier => distinct anchor (unlinkability).
+        assert_ne!(a.anchor, b.anchor, "diversifier must change the anchor via rkm->cm");
+        // (c) but the nullifier is diversifier-independent (nf = H(nk ‖ ρ)).
+        assert_eq!(a.nf, b.nf, "nullifiers must not depend on the diversifier");
+        // STOP-POINT: perm count + height unchanged by absorbing d.
+        assert_eq!(a.air.program.len(), b.air.program.len());
+        assert_eq!(BUCKET_PERMS, 83, "perm count unchanged by the d-absorb");
+    }
+
     fn test_bucket(v1: u64, v2: u64, o1: u64, o2: u64) -> (BucketInstance, u64) {
         let fee = (v1 + v2) - (o1 + o2);
         let mut x = 0x1234_5678_9abc_def0u64;
@@ -1818,6 +1896,7 @@ mod tests {
             value,
             rho: [rnd(), rnd(), rnd(), rnd()],
             rseed: [rnd(), rnd(), rnd(), rnd()],
+            d: [rnd(), rnd()],
         };
         let mk_out = |value: u64, rnd: &mut dyn FnMut() -> u64| TxOutput {
             value,
