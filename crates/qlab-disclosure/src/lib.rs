@@ -18,4 +18,5 @@
 //! [wallet-interop-spec]: qumbra-design/wallet-interop-spec.md
 //! [auditable-privacy]: qumbra-design/auditable-privacy.md
 
+pub mod air;
 pub mod packing;
