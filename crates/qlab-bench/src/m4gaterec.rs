@@ -46,13 +46,23 @@ pub(crate) type Ext = BinomialExtensionField<Val, 4>;
 /// The decided consensus config. B′ (issue #22, adopted 2026-07-19): grind
 /// 20 → 22 to restore the "~100-bit conjectured" headline under the DG25
 /// list-decoding-capacity repricing (b16/q20 = 98.8 pre-grind → 100.8). Proof
-/// sizes are byte-identical — grinding is a PoW nonce, not openings. This now
-/// intentionally diverges from m4census's g20 (a historical step-0a census
+/// sizes are byte-identical — grinding is a PoW nonce, not openings.
+///
+/// B″ (issue #41, DECIDED 2026-07-22 — `fri-soundness-accounting-2026-07.md` §6):
+/// the 2025/2197 close-read reprices the conjectured ceiling to base-field
+/// list-decoding entropy, dropping b16/q20/g22 from 100.8 to a 96.9 corrected
+/// ceiling. To hold the ~100-bit standing invariant, query 20 → 21
+/// (b16/q21/g22 → 100.6 corrected). Unlike grind, +1 query DOES pay bytes and
+/// cascades into the leaf gate's schedule/shape (the #22/B′ lesson), which is
+/// why B″ lands as a whole batch, not a flip. This is the single source of
+/// truth for the consensus lane query count; `m4gate::NQ` derives from it.
+///
+/// This intentionally diverges from m4census's g20 (a historical step-0a census
 /// config the design doc records as b16/q20/g20; the keccak-f count it measured
-/// is grind-independent, so that number still stands).
+/// is grind- and query-independent per perm, so that census still stands).
 pub(crate) const CONSENSUS_CFG: FriCfg = FriCfg {
     log_blowup: 4,
-    num_queries: 20,
+    num_queries: 21,
     grind_bits: 22,
     log_final_poly_len: 4,
     max_log_arity: 4,
@@ -1432,13 +1442,16 @@ mod tests {
             assert_eq!(w, n, "compress perm {i}");
         }
 
-        // Census cross-check (step 0a recorded 2,233 total: 540 leaf +
-        // 1,520 compress + 173 challenger).
+        // Census cross-check. Step 0a (q20) recorded 2,233 total: 540 leaf +
+        // 1,520 compress + 173 challenger. B″ (issue #41) q20→q21 adds one
+        // query's verification work: +27 leaf-sponge + 76 path-compress perms
+        // (challenger UNCHANGED — the 21st index sample_bits draw fits the
+        // existing squeeze buffer, no new keccak block) → 2,336 total.
         let (leaf, compress, chal) = sched.native_counts;
-        assert_eq!(leaf + compress + chal, 2_233, "census total");
-        assert_eq!(leaf, 540, "census leaf");
-        assert_eq!(compress, 1_520, "census compress");
-        assert_eq!(chal, 173, "census challenger");
+        assert_eq!(leaf + compress + chal, 2_336, "census total (q21)");
+        assert_eq!(leaf, 567, "census leaf (q21: 540 + 27)");
+        assert_eq!(compress, 1_596, "census compress (q21: 1520 + 76)");
+        assert_eq!(chal, 173, "census challenger (q21: unchanged)");
     }
 
     /// The walk's draw model reproduces a real SerializingChallenger32
@@ -1628,17 +1641,24 @@ mod tests {
         for (i, p) in sched.perms.iter().enumerate() {
             assert_eq!(keccakf(&p.input), p.output, "perm {i} input/output");
         }
-        // Lane budget: native + collapse + cap extensions must fit the
-        // 2^16-row rectangle (2,730 perms max at 24 rows/perm).
+        // Authoritative lane budget: the recorded schedule must LOWER into the
+        // 2^16-row leaf rectangle, i.e. `lane_plan` perms × 24 ≤ 2^16 (2,730
+        // perms). NOTE: `sched.perms.len()` is the recorder's raw working set — a
+        // SUPERSET of the rectangle (cap-extension/collapse perms fold into the
+        // query program, and lane_plan adds trailer + flush-2-duplicate blocks),
+        // so it is NOT the fit metric. B″ (issue #41) q21: 2,756 recorder perms
+        // but 2,485 lane perms → 2^16 (was 2,382 lane perms at q20). Cross-checked
+        // by `m4gate::tests::b2prime_fitcheck_leaf_2p16` and build_gate_trace's own
+        // height assert.
+        let rect_perms = crate::m4gate::lane_plan(&sched, &crate::m4gate::GateShape::narrow()).0.len();
         assert!(
-            sched.perms.len() <= 65_536 / 24,
-            "lane overflow: {} perms",
-            sched.perms.len()
+            rect_perms * 24 <= 65_536,
+            "leaf rectangle overflow: {rect_perms} lane perms (2^16 cap = 2,730 perms)"
         );
         eprintln!(
-            "schedule: {} perms total ({} native: {:?}), {} flushes, {} draws",
+            "schedule: {} recorder perms → {} lane perms (native {:?}), {} flushes, {} draws",
             sched.perms.len(),
-            2_233,
+            rect_perms,
             sched.native_counts,
             sched.flushes.len(),
             sched.draws.len(),

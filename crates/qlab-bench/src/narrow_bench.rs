@@ -30,7 +30,7 @@ const BUCKET_PERMS: usize = 96;
 /// The lever configs the real AIR is measured under. b32 is included but
 /// may exceed this rig's RAM (371 cols x 2^19 rows x 32 blowup LDE ~ 25 GB)
 /// — a panic is caught and reported as FAILED, honestly.
-const NARROW_CFGS: [(&str, FriCfg); 9] = [
+const NARROW_CFGS: [(&str, FriCfg); 10] = [
     // Margin card: early-stop at a 32-coeff final poly (one fewer partial
     // fold round per query) at the consensus point.
     (
@@ -90,11 +90,27 @@ const NARROW_CFGS: [(&str, FriCfg); 9] = [
     // Query count dominates byte cost (~6.5 KB/query at b16 incl. the
     // preprocessed opening); trade queries for grind at exactly 100 bits.
     (
-        "b16/q20/g22/a16",
+        // THE consensus lane, post-B″ (issue #41): q20→q21 restores ~100-bit
+        // conjectured under the 2197-corrected ceiling. Unlike B′'s grind (bytes
+        // unchanged), the query bump DOES pay bytes — this row measures the cost.
+        "b16/q21/g22/a16",
+        FriCfg {
+            log_blowup: 4,
+            num_queries: 21, // q21 (B″, issue #41) — THE consensus lane (fp16/a16)
+            grind_bits: 22,
+            log_final_poly_len: 4,
+            max_log_arity: 4,
+        },
+    ),
+    (
+        // Pre-B″ consensus reference (q20) kept alongside q21 so the re-bench
+        // shows the q20→q21 byte delta directly (issue #22's twin-comparison
+        // discipline). Historical value: 139721 B (136.4 KB), g20≡g22.
+        "b16/q20/g22/a16 (pre-B″ ref)",
         FriCfg {
             log_blowup: 4,
             num_queries: 20,
-            grind_bits: 22, // g22 (B′, issue #22) — THE consensus lane (fp16/a16); size == g20's 136.4 KB, prove-time only
+            grind_bits: 22,
             log_final_poly_len: 4,
             max_log_arity: 4,
         },
