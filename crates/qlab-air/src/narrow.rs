@@ -935,57 +935,88 @@ pub const MERKLE_DEPTH: usize = 32;
 /// dummy warm-up slot (fits 2^18 rows: 83 x 3072 = 254,976).
 pub const BUCKET_PERMS: usize = 1 + 2 * (5 + MERKLE_DEPTH + 1) + 2 * 2 + 2;
 
-/// Build the full 2x2 bucket: both inputs are leaves 0 and 1 of the same
-/// depth-32 tree (siblings above level 0 shared), so both anchor binds
-/// close against one root. Balance must hold: sum(in) = sum(out) + fee.
-pub fn build_bucket(
-    log_height: usize,
-    inputs: &[TxInput; 2],
-    outputs: &[TxOutput; 2],
-    fee: u64,
-) -> BucketInstance {
+/// A caller-supplied depth-32 Merkle authentication path for one spent note
+/// (issue #39). `siblings[i]` / `path_bits[i]` describe level `i`, leaf level
+/// first. `path_bits[i] == true` means the running digest is the RIGHT child at
+/// level `i` (its sibling sits on the LEFT: `H(sibling ‖ digest)`); `false`
+/// means the digest is the LEFT child (`H(digest ‖ sibling)`). This is exactly
+/// the `pbit` convention the `ROLE_MERKLE` step consumes.
+///
+/// `build_bucket_with_witnesses` lays these straight into the membership slots;
+/// the circuit folds `leaf → … → root` and binds the result to the public
+/// anchor, so a witness that does not resolve to the supplied anchor produces an
+/// unprovable instance. The prover no longer fabricates the tree — the witness
+/// (and the finalized anchor it resolves to) come from the live commitment tree.
+#[derive(Clone, Copy)]
+pub struct MerkleWitness {
+    pub siblings: [[u64; 4]; MERKLE_DEPTH],
+    pub path_bits: [bool; MERKLE_DEPTH],
+}
+
+impl MerkleWitness {
+    /// Fold `leaf` up through the path and return the root this witness resolves
+    /// to. Mirrors the `ROLE_MERKLE` fold (`merkle_node_state` digest = lanes
+    /// 0..4) so callers can cross-check a witness against a live-tree root before
+    /// proving.
+    pub fn fold_root(&self, leaf: &[u64; 4]) -> [u64; 4] {
+        let mut d = *leaf;
+        for (sib, bit) in self.siblings.iter().zip(self.path_bits.iter()) {
+            let st = if *bit {
+                crate::reference::merkle_node_state(sib, &d)
+            } else {
+                crate::reference::merkle_node_state(&d, sib)
+            };
+            d = st[..4].try_into().unwrap();
+        }
+        d
+    }
+}
+
+/// Derive `(nk, nf, cm)` for one spend input — the host mirror of the
+/// `ROLE_ANK`/`ROLE_NF`/`ROLE_ARKM`/`ROLE_ACM` chain. `cm` is the tree leaf.
+pub fn derive_input(inp: &TxInput) -> ([u64; 4], [u64; 4], [u64; 4]) {
     use crate::reference;
+    let mut nk_in = [0u64; 25];
+    nk_in[..4].copy_from_slice(&inp.sk);
+    nk_in[4] = 1; // domain N (z0)
+    nk_in[5] = 1;
+    nk_in[16] = 1 << 63;
+    let nk_st = reference::keccak_f(&nk_in);
+    let nk: [u64; 4] = nk_st[..4].try_into().unwrap();
+    let mut nf_in = [0u64; 25];
+    nf_in[..4].copy_from_slice(&nk);
+    nf_in[4..8].copy_from_slice(&inp.rho);
+    nf_in[8] = 1;
+    nf_in[16] = 1 << 63;
+    let nf_st = reference::keccak_f(&nf_in);
+    let nf: [u64; 4] = nf_st[..4].try_into().unwrap();
+    let mut rkm_in = [0u64; 25];
+    rkm_in[..4].copy_from_slice(&nk);
+    rkm_in[4] = 1 << 1; // domain R (z1)
+    rkm_in[5] = inp.d[0]; // diversifier word 0 (issue #32)
+    rkm_in[6] = inp.d[1]; // diversifier word 1
+    rkm_in[7] = 1; // pad10*1 start, moved from lane 5 to bit 448
+    rkm_in[16] = 1 << 63;
+    let rkm_st = reference::keccak_f(&rkm_in);
+    let rkm: [u64; 4] = rkm_st[..4].try_into().unwrap();
+    let mut cm_in = [0u64; 25];
+    cm_in[0] = inp.value;
+    cm_in[1..5].copy_from_slice(&rkm);
+    cm_in[5..9].copy_from_slice(&inp.rho);
+    cm_in[9..13].copy_from_slice(&inp.rseed);
+    cm_in[13] = 1;
+    cm_in[16] = 1 << 63;
+    let cm_st = reference::keccak_f(&cm_in);
+    let cm: [u64; 4] = cm_st[..4].try_into().unwrap();
+    (nk, nf, cm)
+}
 
-    let derive = |inp: &TxInput| {
-        let mut nk_in = [0u64; 25];
-        nk_in[..4].copy_from_slice(&inp.sk);
-        nk_in[4] = 1; // domain N (z0)
-        nk_in[5] = 1;
-        nk_in[16] = 1 << 63;
-        let nk_st = reference::keccak_f(&nk_in);
-        let nk: [u64; 4] = nk_st[..4].try_into().unwrap();
-        let mut nf_in = [0u64; 25];
-        nf_in[..4].copy_from_slice(&nk);
-        nf_in[4..8].copy_from_slice(&inp.rho);
-        nf_in[8] = 1;
-        nf_in[16] = 1 << 63;
-        let nf_st = reference::keccak_f(&nf_in);
-        let nf: [u64; 4] = nf_st[..4].try_into().unwrap();
-        let mut rkm_in = [0u64; 25];
-        rkm_in[..4].copy_from_slice(&nk);
-        rkm_in[4] = 1 << 1; // domain R (z1)
-        rkm_in[5] = inp.d[0]; // diversifier word 0 (issue #32)
-        rkm_in[6] = inp.d[1]; // diversifier word 1
-        rkm_in[7] = 1; // pad10*1 start, moved from lane 5 to bit 448
-        rkm_in[16] = 1 << 63;
-        let rkm_st = reference::keccak_f(&rkm_in);
-        let rkm: [u64; 4] = rkm_st[..4].try_into().unwrap();
-        let mut cm_in = [0u64; 25];
-        cm_in[0] = inp.value;
-        cm_in[1..5].copy_from_slice(&rkm);
-        cm_in[5..9].copy_from_slice(&inp.rho);
-        cm_in[9..13].copy_from_slice(&inp.rseed);
-        cm_in[13] = 1;
-        cm_in[16] = 1 << 63;
-        let cm_st = reference::keccak_f(&cm_in);
-        let cm: [u64; 4] = cm_st[..4].try_into().unwrap();
-        (nk, nf, cm)
-    };
-    let (nk1, nf1, cm1) = derive(&inputs[0]);
-    let (nk2, nf2, cm2) = derive(&inputs[1]);
-
-    // Shared tree: leaves 0 and 1; deterministic pseudo-random upper
-    // siblings shared by both paths.
+/// Fabricate the demo/self-test shared tree: both leaves live at positions 0/1
+/// of one depth-32 tree with deterministic pseudo-random upper siblings shared
+/// by both paths. Returns `([witness0, witness1], root)`. This is the ONLY place
+/// that invents a tree — used by the legacy [`build_bucket`] convenience for
+/// benches and self-tests; the live-consensus path supplies real witnesses.
+pub fn fabricated_shared_tree(cm1: &[u64; 4], cm2: &[u64; 4]) -> ([MerkleWitness; 2], [u64; 4]) {
     let mut x = 0xa5a5_5a5a_dead_beefu64;
     let mut rnd = || {
         x ^= x << 13;
@@ -993,28 +1024,67 @@ pub fn build_bucket(
         x ^= x << 17;
         x
     };
+    // MERKLE_DEPTH - 1 shared upper siblings (level 0 sibling = the other leaf).
     let upper: Vec<[u64; 4]> = (1..MERKLE_DEPTH)
         .map(|_| [rnd(), rnd(), rnd(), rnd()])
         .collect();
-    // Level 0: leaf 0's sibling is leaf 1 (path bit 0), and vice versa.
-    let path = |leaf: usize, own: &[u64; 4], other: &[u64; 4]| {
-        let mut sibs = vec![(*other, leaf == 1)];
-        let mut d = if leaf == 0 {
-            reference::merkle_node_state(own, other)
-        } else {
-            reference::merkle_node_state(other, own)
-        };
-        for sib in &upper {
-            sibs.push((*sib, false));
-            let dd: [u64; 4] = d[..4].try_into().unwrap();
-            d = reference::merkle_node_state(&dd, sib);
+    let build = |leaf0: bool| {
+        let mut siblings = [[0u64; 4]; MERKLE_DEPTH];
+        let mut path_bits = [false; MERKLE_DEPTH];
+        // Level 0: leaf 0's sibling is leaf 1 (bit 0), leaf 1's is leaf 0 (bit 1).
+        siblings[0] = if leaf0 { *cm2 } else { *cm1 };
+        path_bits[0] = !leaf0;
+        for (i, sib) in upper.iter().enumerate() {
+            siblings[i + 1] = *sib;
         }
-        let root: [u64; 4] = d[..4].try_into().unwrap();
-        (sibs, root)
+        MerkleWitness { siblings, path_bits }
     };
-    let (path1, root1) = path(0, &cm1, &cm2);
-    let (path2, root2) = path(1, &cm2, &cm1);
-    assert_eq!(root1, root2, "shared tree must have one root");
+    let w0 = build(true);
+    let w1 = build(false);
+    let root = w0.fold_root(cm1);
+    debug_assert_eq!(root, w1.fold_root(cm2), "shared tree must have one root");
+    ([w0, w1], root)
+}
+
+/// Build the full 2x2 bucket against a **fabricated** shared tree (both inputs
+/// at leaves 0/1). Convenience wrapper for benches and self-tests: it invents
+/// the membership witnesses via [`fabricated_shared_tree`] and delegates to
+/// [`build_bucket_with_witnesses`]. Real consensus proving takes the
+/// live-tree path (issue #39). Balance must hold: sum(in) = sum(out) + fee.
+pub fn build_bucket(
+    log_height: usize,
+    inputs: &[TxInput; 2],
+    outputs: &[TxOutput; 2],
+    fee: u64,
+) -> BucketInstance {
+    let (_, _, cm1) = derive_input(&inputs[0]);
+    let (_, _, cm2) = derive_input(&inputs[1]);
+    let (witnesses, anchor) = fabricated_shared_tree(&cm1, &cm2);
+    build_bucket_with_witnesses(log_height, inputs, outputs, fee, &witnesses, anchor)
+}
+
+/// Build the full 2x2 bucket from **caller-supplied Merkle witnesses** and a
+/// caller-supplied `anchor` (issue #39). The builder no longer invents a tree:
+/// each input's membership slots are laid straight from `witnesses[i]`, and the
+/// public anchor is `anchor` verbatim. Both inputs bind to the SINGLE public
+/// anchor (consensus §6: one finalized root per spend), so both witnesses must
+/// resolve to `anchor` — the circuit folds `leaf → root` and binds it, so a
+/// witness/anchor mismatch yields an unprovable instance (that IS the
+/// non-finalized / wrong-root rejection). Callers fetch `witnesses` + `anchor`
+/// from the live commitment tree; use [`MerkleWitness::fold_root`] to check
+/// consistency before proving.
+pub fn build_bucket_with_witnesses(
+    log_height: usize,
+    inputs: &[TxInput; 2],
+    outputs: &[TxOutput; 2],
+    fee: u64,
+    witnesses: &[MerkleWitness; 2],
+    anchor: [u64; 4],
+) -> BucketInstance {
+    use crate::reference;
+
+    let (nk1, nf1, _cm1) = derive_input(&inputs[0]);
+    let (nk2, nf2, _cm2) = derive_input(&inputs[1]);
 
     let cmo1 = {
         let o = &outputs[0];
@@ -1049,7 +1119,7 @@ pub fn build_bucket(
     let mut slot = 1usize;
     let mut input_chain = |inp: &TxInput,
                            nk: &[u64; 4],
-                           path: &[([u64; 4], bool)],
+                           witness: &MerkleWitness,
                            bnf_role: u32| {
         program[slot] = ROLE_ANK;
         sw[slot].w[..4].copy_from_slice(&inp.sk);
@@ -1069,7 +1139,7 @@ pub fn build_bucket(
         sw[slot].w[5..9].copy_from_slice(&inp.rho);
         sw[slot].w[9..13].copy_from_slice(&inp.rseed);
         slot += 1;
-        for (sib, bit) in path {
+        for (sib, bit) in witness.siblings.iter().zip(witness.path_bits.iter()) {
             program[slot] = ROLE_MERKLE;
             sw[slot].w[..4].copy_from_slice(sib);
             sw[slot].pbit = *bit;
@@ -1078,8 +1148,8 @@ pub fn build_bucket(
         program[slot] = ROLE_BANCHOR;
         slot += 1;
     };
-    input_chain(&inputs[0], &nk1, &path1, ROLE_BNF1);
-    input_chain(&inputs[1], &nk2, &path2, ROLE_BNF2);
+    input_chain(&inputs[0], &nk1, &witnesses[0], ROLE_BNF1);
+    input_chain(&inputs[1], &nk2, &witnesses[1], ROLE_BNF2);
     for (o, bcm) in outputs.iter().zip([ROLE_BCM1, ROLE_BCM2]) {
         program[slot] = ROLE_ACMOUT;
         sw[slot].w[4] = o.value;
@@ -1096,7 +1166,7 @@ pub fn build_bucket(
     slot += 1;
     assert_eq!(slot, BUCKET_PERMS, "program layout drifted");
 
-    let pvs = pv_vec(&root1, &nf1, &nf2, &cmo1, &cmo2, fee);
+    let pvs = pv_vec(&anchor, &nf1, &nf2, &cmo1, &cmo2, fee);
     BucketInstance {
         air: NarrowKeccakAir {
             log_height,
@@ -1105,7 +1175,7 @@ pub fn build_bucket(
             fee,
         },
         pvs,
-        anchor: root1,
+        anchor,
         nf: [nf1, nf2],
         cm_out: [cmo1, cmo2],
     }
@@ -1930,6 +2000,106 @@ mod tests {
         pvs3[PV_ANCHOR] += F::ONE;
         let report = check_all_constraints(&inst.air, &trace, &pvs3, Some(10));
         assert!(!report.is_ok(), "wrong anchor not caught");
+    }
+
+    /// Issue #39: `build_bucket` is now a thin fabricating wrapper over
+    /// `build_bucket_with_witnesses`. The fabricated witnesses fold to the shared
+    /// anchor, and rebuilding from those explicit witnesses reproduces the
+    /// wrapper's program/witness/pvs/anchor exactly — and the witness-path
+    /// instance still proves.
+    #[test]
+    fn fabricated_wrapper_matches_explicit_witnesses() {
+        let (inst_wrapper, fee) = test_bucket(10, 6, 4, 8);
+        // Reconstruct the same inputs test_bucket used (deterministic rnd).
+        let mut x = 0x1234_5678_9abc_def0u64;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mk_in = |value: u64, rnd: &mut dyn FnMut() -> u64| TxInput {
+            sk: [rnd(), rnd(), rnd(), rnd()],
+            value,
+            rho: [rnd(), rnd(), rnd(), rnd()],
+            rseed: [rnd(), rnd(), rnd(), rnd()],
+            d: [rnd(), rnd()],
+        };
+        let mk_out = |value: u64, rnd: &mut dyn FnMut() -> u64| TxOutput {
+            value,
+            rkm: [rnd(), rnd(), rnd(), rnd()],
+            rho: [rnd(), rnd(), rnd(), rnd()],
+            rseed: [rnd(), rnd(), rnd(), rnd()],
+        };
+        let inputs = [mk_in(10, &mut rnd), mk_in(6, &mut rnd)];
+        let outputs = [mk_out(4, &mut rnd), mk_out(8, &mut rnd)];
+
+        let (_, _, cm1) = derive_input(&inputs[0]);
+        let (_, _, cm2) = derive_input(&inputs[1]);
+        let (witnesses, anchor) = fabricated_shared_tree(&cm1, &cm2);
+        // The fabricated witnesses genuinely resolve to the shared anchor.
+        assert_eq!(witnesses[0].fold_root(&cm1), anchor, "leaf 0 folds to anchor");
+        assert_eq!(witnesses[1].fold_root(&cm2), anchor, "leaf 1 folds to anchor");
+        assert_eq!(anchor, inst_wrapper.anchor, "wrapper anchor == fabricated root");
+
+        let inst_witness =
+            build_bucket_with_witnesses(18, &inputs, &outputs, fee, &witnesses, anchor);
+        assert_eq!(inst_witness.anchor, inst_wrapper.anchor);
+        assert_eq!(inst_witness.pvs, inst_wrapper.pvs);
+        assert_eq!(inst_witness.nf, inst_wrapper.nf);
+        assert_eq!(inst_witness.cm_out, inst_wrapper.cm_out);
+        assert_eq!(inst_witness.air.program, inst_wrapper.air.program);
+
+        // The explicit-witness instance still satisfies every constraint.
+        let pvs: Vec<F> = inst_witness.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        let trace = inst_witness.air.generate_trace::<F>(0);
+        check_constraints(&inst_witness.air, &trace, &pvs);
+    }
+
+    /// Issue #39: a caller-supplied witness that does NOT resolve to the supplied
+    /// anchor yields an UNPROVABLE instance. Both inputs bind to the single public
+    /// anchor; the circuit folds `leaf → root` and binds the fold, so a witness /
+    /// anchor mismatch (the shape of a non-finalized or wrong-root anchor) fails
+    /// at constraint level. This is what rejects a forged anchor.
+    #[test]
+    fn witness_anchor_mismatch_rejected() {
+        let (inst, fee) = test_bucket(10, 6, 4, 8);
+        let mut x = 0x1234_5678_9abc_def0u64;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mk_in = |value: u64, rnd: &mut dyn FnMut() -> u64| TxInput {
+            sk: [rnd(), rnd(), rnd(), rnd()],
+            value,
+            rho: [rnd(), rnd(), rnd(), rnd()],
+            rseed: [rnd(), rnd(), rnd(), rnd()],
+            d: [rnd(), rnd()],
+        };
+        let mk_out = |value: u64, rnd: &mut dyn FnMut() -> u64| TxOutput {
+            value,
+            rkm: [rnd(), rnd(), rnd(), rnd()],
+            rho: [rnd(), rnd(), rnd(), rnd()],
+            rseed: [rnd(), rnd(), rnd(), rnd()],
+        };
+        let inputs = [mk_in(10, &mut rnd), mk_in(6, &mut rnd)];
+        let outputs = [mk_out(4, &mut rnd), mk_out(8, &mut rnd)];
+        let _ = inst;
+
+        let (_, _, cm1) = derive_input(&inputs[0]);
+        let (_, _, cm2) = derive_input(&inputs[1]);
+        let (witnesses, anchor) = fabricated_shared_tree(&cm1, &cm2);
+        // A forged anchor that the witnesses do NOT fold to.
+        let mut wrong = anchor;
+        wrong[0] ^= 1;
+        assert_ne!(witnesses[0].fold_root(&cm1), wrong, "precondition: witness ≠ wrong anchor");
+        let bad = build_bucket_with_witnesses(18, &inputs, &outputs, fee, &witnesses, wrong);
+        let pvs: Vec<F> = bad.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        let trace = bad.air.generate_trace::<F>(0);
+        let report = check_all_constraints(&bad.air, &trace, &pvs, Some(10));
+        assert!(!report.is_ok(), "witness that does not fold to the anchor must be rejected");
     }
 
     /// Full-permutation check across a 24-block group.
