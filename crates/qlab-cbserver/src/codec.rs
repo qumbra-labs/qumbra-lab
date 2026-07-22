@@ -1,0 +1,532 @@
+//! §2 compact-group wire framing — the FROZEN reference bytes.
+//!
+//! Per-tx compact group (wallet-interop-spec §2, exact):
+//! ```text
+//! tx_index      : varint (unsigned LEB128, little-endian base-128)
+//! n_recipients  : u8
+//!   per recipient:
+//!     ml_kem_ct : 1088 bytes            (shared per (tx, recipient))
+//!     n_outputs : u8
+//!       per output:
+//!         cm       : 32 bytes
+//!         tag      : 8 bytes
+//!         clue_len : u8  (= 0 at v1)
+//!         clue     : clue_len bytes  (= 0 at v1)
+//! ```
+//! All integers little-endian; a format version byte leads every response
+//! ([`crate::WIRE_VERSION`]). The response wrapper `/v1/compact` returns:
+//! ```text
+//! version   : u8 (= 0x01)
+//! n_blocks  : varint
+//!   per block: height(varint) ‖ n_groups(varint) ‖ [group ...]
+//! ```
+//!
+//! The per-output encoding is byte-identical to qlab-note's
+//! [`CompactEntry::to_bytes`] for the empty (v1) clue — asserted in tests — so
+//! this framing composes with the ratified wire rather than forking it.
+
+use qlab_note::kem::CT_LEN;
+use qlab_note::wire::{ClueSlot, CompactEntry, RecipientBundle};
+
+use crate::WIRE_VERSION;
+
+/// A decode error with a byte offset for diagnosis.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CodecError {
+    /// Ran out of bytes while reading `what`.
+    Truncated { what: &'static str },
+    /// A format version byte that this reference does not implement.
+    BadVersion { got: u8 },
+    /// A `clue_len` this v1 reference does not support (only 0 at launch).
+    UnsupportedClue { clue_len: u8 },
+    /// A varint that does not terminate within 10 bytes (u64 overflow guard).
+    VarintOverflow,
+    /// Trailing bytes remained after a whole-buffer decode.
+    TrailingBytes { remaining: usize },
+}
+
+/// One transaction's compact group: its index within the block and the
+/// per-recipient bundles (each a shared ML-KEM ct + its output entries).
+///
+/// `Clone` only: `qlab_note::wire::RecipientBundle` derives `Clone` alone (it is
+/// ratified; we do not edit it), so structural `PartialEq`/`Debug` cannot be
+/// derived here. Field-wise comparison lives in tests (`bundle_eq`).
+#[derive(Clone)]
+pub struct CompactGroup {
+    pub tx_index: u64,
+    pub recipients: Vec<RecipientBundle>,
+}
+
+/// One block's compact groups (the unit `/v1/compact` streams).
+#[derive(Clone)]
+pub struct CompactBlock {
+    pub height: u64,
+    pub groups: Vec<CompactGroup>,
+}
+
+// ---- varint (unsigned LEB128) ------------------------------------------------
+
+/// Append `v` as unsigned LEB128 (little-endian base-128).
+pub fn write_varint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Read an unsigned LEB128 varint, advancing `pos`. Guards u64 overflow (≤10 bytes).
+pub fn read_varint(b: &[u8], pos: &mut usize) -> Result<u64, CodecError> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    loop {
+        let byte = *b.get(*pos).ok_or(CodecError::Truncated { what: "varint" })?;
+        *pos += 1;
+        if shift >= 64 || (shift == 63 && byte > 1) {
+            return Err(CodecError::VarintOverflow);
+        }
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+    }
+}
+
+// ---- per-output entry --------------------------------------------------------
+
+/// Encode one compact entry per §2: `cm(32) ‖ tag(8) ‖ clue_len(u8) ‖ clue`.
+/// For the launch (empty) clue this is exactly `cm ‖ tag ‖ 0x00`.
+fn write_entry(out: &mut Vec<u8>, e: &CompactEntry) {
+    out.extend_from_slice(&e.cm);
+    out.extend_from_slice(&e.tag);
+    match e.clue {
+        // clue_len = 0, no clue bytes.
+        ClueSlot::Empty => out.push(0),
+    }
+}
+
+fn read_entry(b: &[u8], pos: &mut usize) -> Result<CompactEntry, CodecError> {
+    let end = *pos + 32 + 8 + 1;
+    if b.len() < end {
+        return Err(CodecError::Truncated { what: "compact entry" });
+    }
+    let mut cm = [0u8; 32];
+    cm.copy_from_slice(&b[*pos..*pos + 32]);
+    let mut tag = [0u8; 8];
+    tag.copy_from_slice(&b[*pos + 32..*pos + 40]);
+    let clue_len = b[*pos + 40];
+    *pos = end;
+    if clue_len != 0 {
+        // v1 reserves the byte but activates no clue payload (Decision 2).
+        return Err(CodecError::UnsupportedClue { clue_len });
+    }
+    Ok(CompactEntry {
+        cm,
+        tag,
+        clue: ClueSlot::Empty,
+    })
+}
+
+// ---- recipient bundle --------------------------------------------------------
+
+fn write_bundle(out: &mut Vec<u8>, r: &RecipientBundle) {
+    out.extend_from_slice(&r.ct);
+    debug_assert!(r.entries.len() <= u8::MAX as usize, "n_outputs is a u8");
+    out.push(r.entries.len() as u8);
+    for e in &r.entries {
+        write_entry(out, e);
+    }
+}
+
+fn read_bundle(b: &[u8], pos: &mut usize) -> Result<RecipientBundle, CodecError> {
+    if b.len() < *pos + CT_LEN {
+        return Err(CodecError::Truncated { what: "ml_kem_ct" });
+    }
+    let mut ct = [0u8; CT_LEN];
+    ct.copy_from_slice(&b[*pos..*pos + CT_LEN]);
+    *pos += CT_LEN;
+    let n_outputs = *b.get(*pos).ok_or(CodecError::Truncated { what: "n_outputs" })?;
+    *pos += 1;
+    let mut entries = Vec::with_capacity(n_outputs as usize);
+    for _ in 0..n_outputs {
+        entries.push(read_entry(b, pos)?);
+    }
+    Ok(RecipientBundle { ct, entries })
+}
+
+// ---- compact group -----------------------------------------------------------
+
+/// Encode one per-tx compact group (no leading version byte — groups nest inside
+/// a versioned response).
+pub fn write_group(out: &mut Vec<u8>, g: &CompactGroup) {
+    write_varint(out, g.tx_index);
+    debug_assert!(g.recipients.len() <= u8::MAX as usize, "n_recipients is a u8");
+    out.push(g.recipients.len() as u8);
+    for r in &g.recipients {
+        write_bundle(out, r);
+    }
+}
+
+fn read_group(b: &[u8], pos: &mut usize) -> Result<CompactGroup, CodecError> {
+    let tx_index = read_varint(b, pos)?;
+    let n_recipients = *b
+        .get(*pos)
+        .ok_or(CodecError::Truncated { what: "n_recipients" })?;
+    *pos += 1;
+    let mut recipients = Vec::with_capacity(n_recipients as usize);
+    for _ in 0..n_recipients {
+        recipients.push(read_bundle(b, pos)?);
+    }
+    Ok(CompactGroup { tx_index, recipients })
+}
+
+// ---- /v1/compact response ----------------------------------------------------
+
+/// Encode a range-stream response: `version ‖ n_blocks ‖ [height ‖ n_groups ‖ groups]`.
+pub fn encode_compact_response(blocks: &[CompactBlock]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(WIRE_VERSION);
+    write_varint(&mut out, blocks.len() as u64);
+    for blk in blocks {
+        write_varint(&mut out, blk.height);
+        write_varint(&mut out, blk.groups.len() as u64);
+        for g in &blk.groups {
+            write_group(&mut out, g);
+        }
+    }
+    out
+}
+
+/// Decode a `/v1/compact` range-stream response. Rejects trailing bytes.
+pub fn decode_compact_response(b: &[u8]) -> Result<Vec<CompactBlock>, CodecError> {
+    let mut pos = 0usize;
+    let ver = *b.get(pos).ok_or(CodecError::Truncated { what: "version" })?;
+    pos += 1;
+    if ver != WIRE_VERSION {
+        return Err(CodecError::BadVersion { got: ver });
+    }
+    let n_blocks = read_varint(b, &mut pos)?;
+    let mut blocks = Vec::with_capacity(n_blocks as usize);
+    for _ in 0..n_blocks {
+        let height = read_varint(b, &mut pos)?;
+        let n_groups = read_varint(b, &mut pos)?;
+        let mut groups = Vec::with_capacity(n_groups as usize);
+        for _ in 0..n_groups {
+            groups.push(read_group(b, &mut pos)?);
+        }
+        blocks.push(CompactBlock { height, groups });
+    }
+    if pos != b.len() {
+        return Err(CodecError::TrailingBytes {
+            remaining: b.len() - pos,
+        });
+    }
+    Ok(blocks)
+}
+
+// ---- /v1/block/<h>/tx/<i>/full response --------------------------------------
+
+/// Encode the full-fetch payloads for one tx (the AEAD ciphertexts a wallet
+/// pulls only for matched notes): `version ‖ n_recipients ‖ [n_payloads ‖
+/// [payload_len(varint) ‖ payload_bytes]]`.
+pub fn encode_full_response(payloads_per_recipient: &[Vec<Vec<u8>>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(WIRE_VERSION);
+    debug_assert!(payloads_per_recipient.len() <= u8::MAX as usize);
+    out.push(payloads_per_recipient.len() as u8);
+    for payloads in payloads_per_recipient {
+        debug_assert!(payloads.len() <= u8::MAX as usize);
+        out.push(payloads.len() as u8);
+        for p in payloads {
+            write_varint(&mut out, p.len() as u64);
+            out.extend_from_slice(p);
+        }
+    }
+    out
+}
+
+/// Decode a `/full` response into per-recipient payload lists.
+pub fn decode_full_response(b: &[u8]) -> Result<Vec<Vec<Vec<u8>>>, CodecError> {
+    let mut pos = 0usize;
+    let ver = *b.get(pos).ok_or(CodecError::Truncated { what: "version" })?;
+    pos += 1;
+    if ver != WIRE_VERSION {
+        return Err(CodecError::BadVersion { got: ver });
+    }
+    let n_recipients = *b
+        .get(pos)
+        .ok_or(CodecError::Truncated { what: "n_recipients" })?;
+    pos += 1;
+    let mut out = Vec::with_capacity(n_recipients as usize);
+    for _ in 0..n_recipients {
+        let n_payloads = *b
+            .get(pos)
+            .ok_or(CodecError::Truncated { what: "n_payloads" })?;
+        pos += 1;
+        let mut payloads = Vec::with_capacity(n_payloads as usize);
+        for _ in 0..n_payloads {
+            let len = read_varint(b, &mut pos)? as usize;
+            if b.len() < pos + len {
+                return Err(CodecError::Truncated { what: "payload" });
+            }
+            payloads.push(b[pos..pos + len].to_vec());
+            pos += len;
+        }
+        out.push(payloads);
+    }
+    if pos != b.len() {
+        return Err(CodecError::TrailingBytes {
+            remaining: b.len() - pos,
+        });
+    }
+    Ok(out)
+}
+
+// ---- byte accounting ---------------------------------------------------------
+
+/// Exact serialized bytes of one compact group (for the measured report).
+pub fn group_len(g: &CompactGroup) -> usize {
+    let mut out = Vec::new();
+    write_group(&mut out, g);
+    out.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use qlab_air::reference::keccak_f;
+
+    // Field-wise bundle equality (RecipientBundle derives Clone only).
+    fn bundle_eq(a: &RecipientBundle, b: &RecipientBundle) -> bool {
+        a.ct == b.ct && a.entries == b.entries
+    }
+
+    fn entry(seed: u8) -> CompactEntry {
+        CompactEntry {
+            cm: [seed; 32],
+            tag: [seed ^ 0xa5; 8],
+            clue: ClueSlot::Empty,
+        }
+    }
+
+    fn ct_pattern(base: u8) -> [u8; CT_LEN] {
+        core::array::from_fn(|i| base.wrapping_add((i % 251) as u8))
+    }
+
+    // ---- varint ----
+    #[test]
+    fn varint_roundtrip_edge_values() {
+        for v in [0u64, 1, 127, 128, 300, 16384, u32::MAX as u64, u64::MAX] {
+            let mut out = Vec::new();
+            write_varint(&mut out, v);
+            let mut pos = 0;
+            assert_eq!(read_varint(&out, &mut pos).unwrap(), v);
+            assert_eq!(pos, out.len(), "varint consumes exactly its bytes for {v}");
+        }
+        // Known encodings.
+        let mut o = Vec::new();
+        write_varint(&mut o, 300);
+        assert_eq!(o, vec![0xac, 0x02], "LEB128(300) = ac 02");
+    }
+
+    #[test]
+    fn varint_overflow_rejected() {
+        // 11 continuation bytes cannot be a u64.
+        let bad = vec![0x80u8; 11];
+        let mut pos = 0;
+        assert_eq!(read_varint(&bad, &mut pos), Err(CodecError::VarintOverflow));
+    }
+
+    // ---- per-output equivalence to qlab-note ----
+    #[test]
+    fn entry_encoding_equals_qlab_note_compact_entry() {
+        // THE composition guarantee: §2's `cm ‖ tag ‖ clue_len=0` is exactly
+        // qlab-note's CompactEntry::to_bytes() for the empty clue.
+        let e = entry(0x3c);
+        let mut mine = Vec::new();
+        write_entry(&mut mine, &e);
+        assert_eq!(mine, e.to_bytes(), "§2 per-output == qlab-note CompactEntry bytes");
+        assert_eq!(mine.len(), CompactEntry::LEN_EMPTY_CLUE);
+    }
+
+    #[test]
+    fn unsupported_clue_rejected() {
+        let e = entry(1);
+        let mut b = Vec::new();
+        write_entry(&mut b, &e);
+        b[40] = 0x01; // non-empty clue version/len
+        let mut pos = 0;
+        assert_eq!(
+            read_entry(&b, &mut pos),
+            Err(CodecError::UnsupportedClue { clue_len: 1 })
+        );
+    }
+
+    // ---- group / response round-trip ----
+    fn sample_blocks() -> Vec<CompactBlock> {
+        let r_2of1 = RecipientBundle {
+            ct: ct_pattern(0x10),
+            entries: vec![entry(1), entry(2)],
+        };
+        let r_1of1 = RecipientBundle {
+            ct: ct_pattern(0x40),
+            entries: vec![entry(9)],
+        };
+        vec![
+            CompactBlock {
+                height: 5,
+                groups: vec![
+                    CompactGroup { tx_index: 0, recipients: vec![r_2of1.clone()] },
+                    CompactGroup { tx_index: 1, recipients: vec![r_1of1.clone(), r_2of1.clone()] },
+                ],
+            },
+            CompactBlock { height: 6, groups: vec![] }, // empty block
+            CompactBlock {
+                height: 300, // multi-byte varint height
+                groups: vec![CompactGroup { tx_index: 130, recipients: vec![r_1of1] }],
+            },
+        ]
+    }
+
+    #[test]
+    fn compact_response_roundtrip() {
+        let blocks = sample_blocks();
+        let bytes = encode_compact_response(&blocks);
+        let back = decode_compact_response(&bytes).unwrap();
+        assert_eq!(back.len(), blocks.len());
+        for (a, b) in back.iter().zip(&blocks) {
+            assert_eq!(a.height, b.height);
+            assert_eq!(a.groups.len(), b.groups.len());
+            for (ga, gb) in a.groups.iter().zip(&b.groups) {
+                assert_eq!(ga.tx_index, gb.tx_index);
+                assert_eq!(ga.recipients.len(), gb.recipients.len());
+                for (ra, rb) in ga.recipients.iter().zip(&gb.recipients) {
+                    assert!(bundle_eq(ra, rb), "recipient bundle round-trips");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_rejects_bad_version_and_trailing() {
+        let mut bytes = encode_compact_response(&sample_blocks());
+        let good = bytes.clone();
+        bytes[0] = 0x02;
+        assert!(matches!(
+            decode_compact_response(&bytes),
+            Err(CodecError::BadVersion { got: 2 })
+        ));
+        let mut extra = good.clone();
+        extra.push(0xff);
+        assert!(matches!(
+            decode_compact_response(&extra),
+            Err(CodecError::TrailingBytes { remaining: 1 })
+        ));
+        // Truncation anywhere is caught.
+        assert!(decode_compact_response(&good[..good.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn full_response_roundtrip() {
+        let payloads = vec![
+            vec![vec![1u8, 2, 3], vec![4, 5]],
+            vec![vec![9u8; 100]],
+        ];
+        let bytes = encode_full_response(&payloads);
+        assert_eq!(decode_full_response(&bytes).unwrap(), payloads);
+    }
+
+    /// GOLDEN BYTES — this crate is the reference; these bytes lock the §2
+    /// framing. A single known compact group with deterministic ct/cm/tag; we
+    /// assert the exact header framing bytes, the exact total length, and a
+    /// Keccak-256 digest over the whole serialization. Any framing drift breaks
+    /// this test (and thus the spec's meaning).
+    #[test]
+    fn golden_bytes_lock_the_framing() {
+        // One block (height 7), one tx (index 2), one recipient (2-of-1),
+        // deterministic ct filled 0x00,0x01,... and two fixed entries.
+        let ct: [u8; CT_LEN] = core::array::from_fn(|i| (i % 256) as u8);
+        let e0 = CompactEntry { cm: [0xAA; 32], tag: [0xBB; 8], clue: ClueSlot::Empty };
+        let e1 = CompactEntry { cm: [0xCC; 32], tag: [0xDD; 8], clue: ClueSlot::Empty };
+        let group = CompactGroup {
+            tx_index: 2,
+            recipients: vec![RecipientBundle { ct, entries: vec![e0, e1] }],
+        };
+        let block = CompactBlock { height: 7, groups: vec![group] };
+        let bytes = encode_compact_response(&[block]);
+
+        // Exact total length: version(1) + n_blocks(1) + height(1) + n_groups(1)
+        //   + tx_index(1) + n_recipients(1) + ct(1088) + n_outputs(1)
+        //   + 2 * (cm 32 + tag 8 + clue_len 1) = 4 + 2 + 1088 + 1 + 82 = 1177.
+        assert_eq!(bytes.len(), 1177, "golden total length");
+
+        // Exact framing header (everything up to the ct): version, n_blocks,
+        // height, n_groups, tx_index, n_recipients.
+        assert_eq!(&bytes[..6], &[0x01, 0x01, 0x07, 0x01, 0x02, 0x01], "golden header");
+        // ct occupies bytes 6..1094 and equals the known pattern.
+        assert_eq!(&bytes[6..6 + CT_LEN], &ct[..], "golden ct region");
+        // n_outputs then the two entries.
+        assert_eq!(bytes[6 + CT_LEN], 0x02, "golden n_outputs");
+        let off = 6 + CT_LEN + 1;
+        assert_eq!(&bytes[off..off + 32], &[0xAA; 32], "golden e0.cm");
+        assert_eq!(&bytes[off + 32..off + 40], &[0xBB; 8], "golden e0.tag");
+        assert_eq!(bytes[off + 40], 0x00, "golden e0.clue_len");
+        assert_eq!(&bytes[off + 41..off + 73], &[0xCC; 32], "golden e1.cm");
+        assert_eq!(&bytes[off + 73..off + 81], &[0xDD; 8], "golden e1.tag");
+        assert_eq!(bytes[off + 81], 0x00, "golden e1.clue_len");
+
+        // Whole-serialization Keccak-256 digest (via qlab-air's permutation) —
+        // the single value that locks every byte at once.
+        let digest = keccak256_bytes(&bytes);
+        assert_eq!(
+            hex(&digest),
+            "3ee2a5e66192bdba4d86e3f6283edbf8ed842f2ef854b724e60b071c9cf54017",
+            "GOLDEN digest — update ONLY with an intentional, documented framing change"
+        );
+
+        // Round-trips.
+        let back = decode_compact_response(&bytes).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].height, 7);
+        assert_eq!(back[0].groups[0].tx_index, 2);
+    }
+
+    // Local Keccak-256 (original pad10*1) over qlab-air's permutation, mirroring
+    // qlab_note::hash::keccak256 without depending on its privacy.
+    fn keccak256_bytes(input: &[u8]) -> [u8; 32] {
+        const RATE: usize = 136;
+        let mut state = [0u64; 25];
+        let mut chunks = input.chunks_exact(RATE);
+        for block in &mut chunks {
+            xor_rate(&mut state, block.try_into().unwrap());
+            state = keccak_f(&state);
+        }
+        let rem = chunks.remainder();
+        let mut last = [0u8; RATE];
+        last[..rem.len()].copy_from_slice(rem);
+        last[rem.len()] ^= 0x01;
+        last[RATE - 1] ^= 0x80;
+        xor_rate(&mut state, &last);
+        state = keccak_f(&state);
+        let mut out = [0u8; 32];
+        for i in 0..4 {
+            out[i * 8..i * 8 + 8].copy_from_slice(&state[i].to_le_bytes());
+        }
+        out
+    }
+    fn xor_rate(state: &mut [u64; 25], block: &[u8; 136]) {
+        for (i, lane) in state.iter_mut().take(17).enumerate() {
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&block[i * 8..i * 8 + 8]);
+            *lane ^= u64::from_le_bytes(b);
+        }
+    }
+    fn hex(b: &[u8; 32]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+}

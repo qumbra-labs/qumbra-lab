@@ -1,0 +1,201 @@
+//! The three §2 endpoints over localhost HTTP (`tiny_http`), in-memory.
+//!
+//! Endpoints (wallet-interop-spec §2):
+//! - `GET /v1/compact?from=<height>&to=<height>` — range-stream of compact
+//!   groups per block ([`crate::codec::encode_compact_response`]).
+//! - `GET /v1/block/<height>/tx/<index>/full` — full ciphertext fetch on a scan
+//!   match ([`crate::codec::encode_full_response`]).
+//! - `GET /v1/tree/frontier?at=<height>` — commitment-tree frontier for witness
+//!   maintenance ([`crate::tree::Frontier::to_bytes`]).
+//!
+//! **Trust posture / Tor OUT of scope.** This binds `127.0.0.1:0` and serves
+//! localhost only — no external network. Per §2 the server serves consensus
+//! data verbatim and can neither forge nor decrypt; it DOES observe requester
+//! IP / height ranges / full-fetch pattern (documented; the decoy over-fetch
+//! mitigation lives client-side, see [`crate::client`]). No persistence — a
+//! reference server serves, it does not store.
+
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread::JoinHandle;
+
+use tiny_http::{Method, Response, Server};
+
+use crate::codec::{encode_compact_response, encode_full_response};
+use crate::data::Devnet;
+
+/// A running server: bound address + the worker thread. Drop-safe via
+/// [`ServerHandle::shutdown`].
+pub struct ServerHandle {
+    addr: SocketAddr,
+    server: Arc<Server>,
+    thread: Option<JoinHandle<()>>,
+    /// Total requests served (for tests/reports).
+    served: Arc<AtomicU64>,
+}
+
+impl ServerHandle {
+    /// Base URL, e.g. `http://127.0.0.1:54321`.
+    pub fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub fn requests_served(&self) -> u64 {
+        self.served.load(Ordering::Relaxed)
+    }
+
+    /// Stop the server and join the worker thread.
+    pub fn shutdown(mut self) {
+        self.server.unblock();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Start the reference server on `127.0.0.1:0` (an ephemeral localhost port),
+/// serving `devnet`. Returns once the socket is bound.
+pub fn serve(devnet: Arc<Devnet>) -> ServerHandle {
+    let server = Arc::new(Server::http("127.0.0.1:0").expect("bind localhost ephemeral port"));
+    let addr = server
+        .server_addr()
+        .to_ip()
+        .expect("tcp listener has an ip address");
+    let served = Arc::new(AtomicU64::new(0));
+
+    let worker_server = Arc::clone(&server);
+    let worker_served = Arc::clone(&served);
+    let thread = std::thread::spawn(move || {
+        for request in worker_server.incoming_requests() {
+            worker_served.fetch_add(1, Ordering::Relaxed);
+            // GET only.
+            if *request.method() != Method::Get {
+                let _ = request.respond(Response::from_string("method not allowed").with_status_code(405));
+                continue;
+            }
+            let url = request.url().to_string();
+            let response = route(&devnet, &url);
+            let _ = match response {
+                Ok(bytes) => request.respond(Response::from_data(bytes)),
+                Err((code, msg)) => request.respond(Response::from_string(msg).with_status_code(code)),
+            };
+        }
+    });
+
+    ServerHandle { addr, server, thread: Some(thread), served }
+}
+
+type RouteResult = Result<Vec<u8>, (u16, &'static str)>;
+
+/// Pure routing/handler logic (URL → response bytes), exposed for direct unit
+/// testing without a socket.
+pub fn route(devnet: &Devnet, url: &str) -> RouteResult {
+    let (path, query) = match url.split_once('?') {
+        Some((p, q)) => (p, q),
+        None => (url, ""),
+    };
+    let segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+
+    match segs.as_slice() {
+        // /v1/compact?from=&to=
+        ["v1", "compact"] => {
+            let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'"))?;
+            let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'"))?;
+            if to < from {
+                return Err((400, "'to' < 'from'"));
+            }
+            Ok(encode_compact_response(&devnet.compact_range(from, to)))
+        }
+        // /v1/block/<height>/tx/<index>/full
+        ["v1", "block", h, "tx", i, "full"] => {
+            let height = h.parse::<u64>().map_err(|_| (400, "invalid height"))?;
+            let index = i.parse::<u64>().map_err(|_| (400, "invalid tx index"))?;
+            let payloads = devnet
+                .full_payloads(height, index)
+                .ok_or((404, "no such (height, tx)"))?;
+            Ok(encode_full_response(&payloads))
+        }
+        // /v1/tree/frontier?at=<height>
+        ["v1", "tree", "frontier"] => {
+            let at = query_u64(query, "at").ok_or((400, "missing/invalid 'at'"))?;
+            let count = devnet.leaves_at(at);
+            Ok(devnet.tree.frontier_at(count).to_bytes())
+        }
+        _ => Err((404, "unknown endpoint")),
+    }
+}
+
+/// Parse `key=<u64>` from a `&`-separated query string.
+fn query_u64(query: &str, key: &str) -> Option<u64> {
+    for kv in query.split('&') {
+        if let Some((k, v)) = kv.split_once('=') {
+            if k == key {
+                return v.parse::<u64>().ok();
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::{decode_compact_response, decode_full_response};
+    use crate::data::GenParams;
+    use crate::tree::Frontier;
+
+    fn devnet() -> Arc<Devnet> {
+        Arc::new(Devnet::generate(GenParams::default()))
+    }
+
+    #[test]
+    fn route_compact_range() {
+        let d = devnet();
+        let bytes = route(&d, "/v1/compact?from=1&to=3").unwrap();
+        let blocks = decode_compact_response(&bytes).unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].height, 1);
+        assert_eq!(blocks[0].groups.len(), GenParams::default().txs_per_block as usize);
+    }
+
+    #[test]
+    fn route_full_and_frontier() {
+        let d = devnet();
+        // tx 0 of block 1 is a 2-of-1 to our wallet → one recipient, two payloads.
+        let full = route(&d, "/v1/block/1/tx/0/full").unwrap();
+        let per_recipient = decode_full_response(&full).unwrap();
+        assert_eq!(per_recipient.len(), 1);
+        assert_eq!(per_recipient[0].len(), 2, "2-of-1 → two AEAD payloads");
+
+        let front = route(&d, "/v1/tree/frontier?at=2").unwrap();
+        let f = Frontier::from_bytes(&front).unwrap();
+        assert_eq!(f.root(), d.tree.root_at(d.leaves_at(2)), "served frontier reconstructs the tree root");
+    }
+
+    #[test]
+    fn route_errors() {
+        let d = devnet();
+        assert_eq!(route(&d, "/v1/compact?from=5&to=1"), Err((400, "'to' < 'from'")));
+        assert_eq!(route(&d, "/v1/compact?to=1"), Err((400, "missing/invalid 'from'")));
+        assert!(matches!(route(&d, "/v1/block/999/tx/0/full"), Err((404, _))));
+        assert!(matches!(route(&d, "/v1/nope"), Err((404, _))));
+    }
+
+    #[test]
+    fn end_to_end_over_localhost_socket() {
+        let d = devnet();
+        let handle = serve(Arc::clone(&d));
+        let base = handle.base_url();
+        assert!(base.starts_with("http://127.0.0.1:"));
+        let bytes = crate::client::http_get(&base, "/v1/compact?from=1&to=2").unwrap();
+        let blocks = decode_compact_response(&bytes).unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(handle.requests_served() >= 1);
+        handle.shutdown();
+    }
+}
