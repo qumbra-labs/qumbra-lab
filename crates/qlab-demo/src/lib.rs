@@ -13,3 +13,5 @@
 pub mod prover;
 pub mod ledger;
 pub mod scenario;
+
+pub use scenario::{run_loop, LoopReport};
