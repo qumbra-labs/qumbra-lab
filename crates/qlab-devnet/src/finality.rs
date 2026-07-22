@@ -118,9 +118,33 @@ impl FinalityTracker {
     }
 
     /// **The anchors-from-finalized-only rule (§6):** is `root` a finalized root?
-    /// Only `true` roots are valid anchors.
+    /// Only `true` roots are valid anchors. (Finalized-only, no age gate — the
+    /// ≤24 h window is [`Self::is_anchor_acceptable`].)
     pub fn is_root_final(&self, root: &Hash32) -> bool {
         self.finalized.iter().any(|c| &c.root == root)
+    }
+
+    /// Age (in blocks) of a finalized `root` = `finalized_head − root_height`,
+    /// or `None` if `root` was never finalized. If the same root was finalized at
+    /// more than one height (unusual), the freshest (smallest age) wins.
+    pub fn anchor_age(&self, root: &Hash32) -> Option<u64> {
+        let head = self.finalized.last()?.height;
+        self.finalized
+            .iter()
+            .filter(|c| &c.root == root)
+            .map(|c| head.saturating_sub(c.height))
+            .min()
+    }
+
+    /// **The full §6 + §8 anchor gate:** is `root` an acceptable anchor right
+    /// now — finalized AND within the ≤24 h window (`age ≤ max_age_blocks`)?
+    /// A never-finalized root is rejected (not final); a finalized-but-too-old
+    /// root is rejected as **expired**. Pass
+    /// [`crate::params_devnet::MAX_ANCHOR_AGE_BLOCKS`] for the real ceiling (or a
+    /// smaller window in the accelerated sim).
+    pub fn is_anchor_acceptable(&self, root: &Hash32, max_age_blocks: u64) -> bool {
+        self.anchor_age(root)
+            .is_some_and(|age| age <= max_age_blocks)
     }
 
     /// Whether everything up to `height` is finalized (height ≤ finalized head).
@@ -231,6 +255,38 @@ mod tests {
             fin.try_finalize(&cp, &bad, &committee),
             Err(FinalizeError::UnknownSigner { signer: 99 })
         );
+    }
+
+    /// Issue #39 / §8: the anchor-age window. A finalized root within the window
+    /// is acceptable; a never-finalized root is rejected (not final); a finalized
+    /// root older than the window is rejected as EXPIRED.
+    #[test]
+    fn anchor_age_window_accepts_fresh_rejects_expired_and_nonfinal() {
+        let (committee, validators) = devnet_committee(4); // quorum = 3
+        let mut fin = FinalityTracker::new();
+
+        // Finalize three commitment roots at heights 2, 5, 9 (root stands in for
+        // the commitment-tree root, as the demo wires it).
+        for (h, r) in [(2u64, [0x22u8; 32]), (5, [0x55; 32]), (9, [0x99; 32])] {
+            let cp = Checkpoint::new(h, [h as u8; 32], r);
+            let votes: Vec<Vote> = validators[..3].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+            fin.try_finalize(&cp, &votes, &committee).unwrap();
+        }
+        // Finalized head is height 9.
+        assert_eq!(fin.finalized_height(), Some(9));
+        assert_eq!(fin.anchor_age(&[0x99; 32]), Some(0)); // the head itself
+        assert_eq!(fin.anchor_age(&[0x55; 32]), Some(4)); // 9 - 5
+        assert_eq!(fin.anchor_age(&[0x22; 32]), Some(7)); // 9 - 2
+        assert_eq!(fin.anchor_age(&[0xAB; 32]), None); // never finalized
+
+        // Window = 5 blocks: heights 5 and 9 are fresh; height 2 (age 7) expired.
+        assert!(fin.is_anchor_acceptable(&[0x99; 32], 5), "head root is fresh");
+        assert!(fin.is_anchor_acceptable(&[0x55; 32], 5), "age 4 ≤ 5 is fresh");
+        assert!(!fin.is_anchor_acceptable(&[0x22; 32], 5), "age 7 > 5 is EXPIRED");
+        // Non-finalized root: rejected regardless of window.
+        assert!(!fin.is_anchor_acceptable(&[0xAB; 32], u64::MAX), "never-finalized rejected");
+        // A generous window keeps even the oldest finalized root.
+        assert!(fin.is_anchor_acceptable(&[0x22; 32], 100), "age 7 ≤ 100 accepted");
     }
 
     #[test]

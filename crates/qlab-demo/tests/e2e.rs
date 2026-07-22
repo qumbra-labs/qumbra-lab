@@ -23,6 +23,13 @@ fn end_to_end_payment_loop_holds_all_invariants() {
     // (4) Bob's spend block finalizes under the committee quorum.
     assert!(r.spend_finalized, "spend block finalized");
 
+    // (7) Issue #39: the spends anchored to a REAL finalized commitment-tree root
+    // (live membership witness), and both anchor negatives are rejected.
+    assert!(r.anchor_finalized, "send anchored to a finalized commitment root");
+    assert_ne!(r.real_anchor, [0u8; 32], "a concrete finalized anchor was used");
+    assert!(r.non_final_anchor_rejected, "a never-finalized anchor is rejected (§6)");
+    assert!(r.expired_anchor_rejected, "an expired finalized anchor is rejected (§8)");
+
     // (5) Supply invariant.
     assert!(r.supply_consistent, "supply/coinbase counter consistent across the loop");
 }

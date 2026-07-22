@@ -18,6 +18,7 @@
 //! and round-trip/root-correctness tested, but NOT golden-frozen like the
 //! compact-group framing.
 
+use qlab_air::narrow::MerkleWitness;
 use qlab_air::reference::merkle_node_state;
 use qlab_note::hash::{digest_bytes, digest_from_bytes};
 
@@ -104,6 +105,44 @@ impl CommitmentTree {
         let left = self.subtree_root(level - 1, offset * 2, count, z);
         let right = self.subtree_root(level - 1, offset * 2 + 1, count, z);
         hash_node(&left, &right)
+    }
+
+    /// The depth-32 Merkle authentication path for the leaf at `position`, over
+    /// the first `count` leaves (issue #39). Returns qlab-air's `MerkleWitness`
+    /// directly, so it feeds `build_bucket_with_witnesses` with no glue: level
+    /// `i`'s sibling is the subtree root adjacent to the node covering
+    /// `position`, and `path_bits[i] = bit i of position` (set ⇒ the running
+    /// digest is the RIGHT child, sibling on the left — the AIR's `pbit`).
+    ///
+    /// The path folds `leaves[position] → root_at(count)`; the wallet uses it as
+    /// the live-tree membership witness for a note it is spending. Panics if
+    /// `position >= count` (no membership witness exists for an unfilled leaf).
+    pub fn auth_path(&self, position: u64, count: u64) -> MerkleWitness {
+        let count = count.min(self.len());
+        assert!(position < count, "auth_path: position {position} not among {count} leaves");
+        let z = zeros();
+        let mut siblings = [[0u64; 4]; DEPTH];
+        let mut path_bits = [false; DEPTH];
+        for (i, sib) in siblings.iter_mut().enumerate() {
+            let node_offset = position >> i;
+            path_bits[i] = node_offset & 1 == 1;
+            *sib = self.subtree_root(i, node_offset ^ 1, count, &z);
+        }
+        MerkleWitness { siblings, path_bits }
+    }
+
+    /// The leaf commitment at `position` (the note commitment the auth path is
+    /// witnessing). Panics if out of range.
+    pub fn leaf(&self, position: u64) -> [u64; 4] {
+        self.leaves[position as usize]
+    }
+
+    /// The leaf position of note commitment `cm`, if present — the lookup the
+    /// prover uses to turn a wallet-derived leaf into an auth-path index
+    /// (issue #39). Returns the FIRST match (commitments are globally unique by
+    /// the ρ-uniqueness rule, so at most one is expected).
+    pub fn position_of(&self, cm: &[u64; 4]) -> Option<u64> {
+        self.leaves.iter().position(|l| l == cm).map(|p| p as u64)
     }
 
     /// Build the frontier over the first `count` leaves.
@@ -330,6 +369,46 @@ mod tests {
         let mut tr = good.clone();
         tr.push(0);
         assert!(matches!(Frontier::from_bytes(&tr), Err(CodecError::TrailingBytes { .. })));
+    }
+
+    /// Issue #39: `auth_path(position)` folds `leaf → root_at(count)` for EVERY
+    /// leaf at every tree size — the live-tree membership witness the prover
+    /// consumes. Crosses power-of-two and odd boundaries so every ommer / path
+    /// pattern is exercised.
+    #[test]
+    fn auth_path_folds_to_root_at_every_position() {
+        let mut t = CommitmentTree::new();
+        for n in 1..=18u64 {
+            t.append(cm(n));
+        }
+        for count in 1..=18u64 {
+            let root = t.root_at(count);
+            for pos in 0..count {
+                let w = t.auth_path(pos, count);
+                let leaf = t.leaf(pos);
+                assert_eq!(
+                    w.fold_root(&leaf),
+                    root,
+                    "auth_path({pos}) must fold to root_at({count})"
+                );
+            }
+        }
+    }
+
+    /// A tampered sibling in the witness folds to a DIFFERENT root — the witness
+    /// genuinely carries the path (not a trivially-satisfiable stub).
+    #[test]
+    fn tampered_auth_path_changes_root() {
+        let mut t = CommitmentTree::new();
+        for n in 1..=9u64 {
+            t.append(cm(n));
+        }
+        let count = t.len();
+        let mut w = t.auth_path(3, count);
+        let leaf = t.leaf(3);
+        assert_eq!(w.fold_root(&leaf), t.root_at(count));
+        w.siblings[0][0] ^= 1;
+        assert_ne!(w.fold_root(&leaf), t.root_at(count), "tampered sibling must break the fold");
     }
 
     #[test]
