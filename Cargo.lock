@@ -841,7 +841,9 @@ dependencies = [
  "postcard",
  "qlab-air",
  "qlab-devnet",
+ "qlab-disclosure",
  "qlab-note",
+ "qlab-wallet",
  "rand",
  "serde",
 ]

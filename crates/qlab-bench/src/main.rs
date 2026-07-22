@@ -15,6 +15,7 @@
 // query). Raise it so the gate rectangle compiles.
 #![recursion_limit = "512"]
 
+mod disclosure;
 mod geometry;
 mod levers;
 mod m4anchor;
@@ -966,6 +967,10 @@ fn main() {
         }
         "m6devnet" => {
             m6devnet::run_m6devnet(&power);
+            return;
+        }
+        "disclosure" => {
+            disclosure::run_disclosure(&power);
             return;
         }
         "bucket" => {
