@@ -29,5 +29,7 @@
 //! to bind `rkm = H(nk ‖ D_R ‖ d)` (a `qlab-air` change; proposed in the plan
 //! doc / PR, out of M7 scope).
 
+pub mod address;
+pub mod bech32m;
 pub mod keys;
 
