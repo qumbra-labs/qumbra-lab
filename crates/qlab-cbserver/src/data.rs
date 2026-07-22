@@ -193,6 +193,23 @@ impl Devnet {
         }
     }
 
+    /// Assemble a `Devnet` from externally-built REAL blocks/notes — the
+    /// composition entry point for a driver (e.g. qlab-demo) that produces its
+    /// own Alice→Bob transaction rather than the self-generated `generate` mix.
+    /// `leaves_at_end_of_height` is `(height, cumulative_tree_len)` per block in
+    /// ascending height (the same invariant `generate` maintains internally).
+    /// Additive: existing `generate`/serving behaviour is unchanged.
+    pub fn from_parts(
+        blocks: Vec<StoredBlock>,
+        tree: CommitmentTree,
+        chain: ChainState,
+        our: Keypair,
+        expected_matches: usize,
+        leaves_at_end_of_height: Vec<(u64, u64)>,
+    ) -> Self {
+        Devnet { blocks, tree, chain, our, leaves_at_end_of_height, expected_matches }
+    }
+
     /// The block stored at `height` (heights are 1..=n_blocks; genesis is 0).
     pub fn block(&self, height: u64) -> Option<&StoredBlock> {
         if height == 0 || height as usize > self.blocks.len() {
@@ -295,6 +312,24 @@ mod tests {
             }
         }
         assert_eq!(found, d.expected_matches, "scan finds exactly the planted notes");
+    }
+
+    #[test]
+    fn from_parts_reconstructs_equivalent_devnet() {
+        let g = Devnet::generate(GenParams::default());
+        // Re-derive leaves_at_end_of_height via the public leaves_at() over heights.
+        let leaves: Vec<(u64, u64)> = (1..=g.tip_height()).map(|h| (h, g.leaves_at(h))).collect();
+        let root = g.tree.root();
+        let tip = g.tip_height();
+        let expected = g.expected_matches;
+        // Move g's parts into a fresh Devnet.
+        let d = Devnet::from_parts(g.blocks, g.tree, g.chain, g.our, expected, leaves);
+        assert_eq!(d.tip_height(), tip);
+        assert_eq!(d.tree.root(), root);
+        assert_eq!(d.leaves_at(tip), d.tree.len());
+        assert_eq!(d.expected_matches, expected);
+        // Serving still works.
+        assert!(!d.compact_range(1, tip).is_empty());
     }
 
     #[test]
