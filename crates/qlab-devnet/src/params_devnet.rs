@@ -71,3 +71,35 @@ pub const FEE_MARGINAL_UNITS: u64 = 5_000;
 /// Grace action count: fee = marginal × max(grace, logical_actions), ZIP-317's
 /// `max(2, logical_actions)`. PLACEHOLDER.
 pub const FEE_GRACE_ACTIONS: u32 = 2;
+
+// ─── Block-weight anti-spam governor (issue #42) ─────────────────────────────
+//
+// Two-median + quadratic penalty (consensus-and-network §8; consensus-parameters
+// §6 `[open]`). EVERY constant below is an OPEN design question deferred to M6
+// devnet load-testing — these are placeholder DEFAULTS the load harness sweeps
+// candidate sets over. Monero's launched values are quoted for provenance; they
+// are NOT Qumbra proposals.
+
+/// Short-term median window, in blocks. PLACEHOLDER (Monero: 100).
+pub const WEIGHT_SHORT_WINDOW: usize = 100;
+
+/// Long-term median window, in blocks. PLACEHOLDER (Monero: 100_000). Kept far
+/// smaller here so a sweep run covers several long-windows in bounded time.
+pub const WEIGHT_LONG_WINDOW: usize = 5_000;
+
+/// Penalty-free-zone floor, in bytes. PLACEHOLDER (Monero: 300_000). Sized so a
+/// launch-realistic block (~1 TPS × 75 s ≈ 75 × 136 KB ≈ 10 MB) sits well inside
+/// the free zone; the exact floor is the swept `[open]` constant.
+pub const WEIGHT_MIN_BYTES: u64 = 10_000_000;
+
+/// Long-term weight cap factor = num/den. PLACEHOLDER (Monero: 1.4 = 7/5).
+pub const WEIGHT_LT_CAP_NUM: u64 = 7;
+pub const WEIGHT_LT_CAP_DEN: u64 = 5;
+
+/// Short-term median ceiling as a multiple of the long-term effective median.
+/// PLACEHOLDER (Monero: 50).
+pub const WEIGHT_ST_CAP: u64 = 50;
+
+/// Hard block-weight limit as a multiple of the effective median (blocks past
+/// this are invalid). PLACEHOLDER (Monero: 2).
+pub const WEIGHT_MAX_MULTIPLE: u64 = 2;
