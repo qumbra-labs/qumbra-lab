@@ -3956,7 +3956,7 @@ where
 
 /// Per-perm plan entry.
 #[derive(Clone, Debug, PartialEq)]
-enum PInfo {
+pub(crate) enum PInfo {
     /// Obs-flush block (flush = obs ordinal 0..8, block index within it).
     Obs { flush: usize, block: usize },
     /// Refill flush (single chained block) -- includes the trailer.
@@ -4032,7 +4032,7 @@ pub(crate) fn outer_pvs(sched: &Schedule, inner_pvs: &[Val], shape: &GateShape) 
 /// Assemble the lane plan: challenger blocks (native order) + trailer +
 /// per-query leaf/path perms (cap-extension and collapse perms dropped),
 /// with the perm inputs for the keccak generator.
-fn lane_plan(sched: &Schedule, shape: &GateShape) -> (Vec<[u64; 25]>, Vec<PInfo>) {
+pub(crate) fn lane_plan(sched: &Schedule, shape: &GateShape) -> (Vec<[u64; 25]>, Vec<PInfo>) {
     let flush_blocks = shape.flush_blocks();
     let flush_bytes = shape.flush_bytes();
     let mut inputs = vec![];

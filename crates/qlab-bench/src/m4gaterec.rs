@@ -1442,13 +1442,16 @@ mod tests {
             assert_eq!(w, n, "compress perm {i}");
         }
 
-        // Census cross-check (step 0a recorded 2,233 total: 540 leaf +
-        // 1,520 compress + 173 challenger).
+        // Census cross-check. Step 0a (q20) recorded 2,233 total: 540 leaf +
+        // 1,520 compress + 173 challenger. B″ (issue #41) q20→q21 adds one
+        // query's verification work: +27 leaf-sponge + 76 path-compress perms
+        // (challenger UNCHANGED — the 21st index sample_bits draw fits the
+        // existing squeeze buffer, no new keccak block) → 2,336 total.
         let (leaf, compress, chal) = sched.native_counts;
-        assert_eq!(leaf + compress + chal, 2_233, "census total");
-        assert_eq!(leaf, 540, "census leaf");
-        assert_eq!(compress, 1_520, "census compress");
-        assert_eq!(chal, 173, "census challenger");
+        assert_eq!(leaf + compress + chal, 2_336, "census total (q21)");
+        assert_eq!(leaf, 567, "census leaf (q21: 540 + 27)");
+        assert_eq!(compress, 1_596, "census compress (q21: 1520 + 76)");
+        assert_eq!(chal, 173, "census challenger (q21: unchanged)");
     }
 
     /// The walk's draw model reproduces a real SerializingChallenger32
@@ -1638,17 +1641,24 @@ mod tests {
         for (i, p) in sched.perms.iter().enumerate() {
             assert_eq!(keccakf(&p.input), p.output, "perm {i} input/output");
         }
-        // Lane budget: native + collapse + cap extensions must fit the
-        // 2^16-row rectangle (2,730 perms max at 24 rows/perm).
+        // Authoritative lane budget: the recorded schedule must LOWER into the
+        // 2^16-row leaf rectangle, i.e. `lane_plan` perms × 24 ≤ 2^16 (2,730
+        // perms). NOTE: `sched.perms.len()` is the recorder's raw working set — a
+        // SUPERSET of the rectangle (cap-extension/collapse perms fold into the
+        // query program, and lane_plan adds trailer + flush-2-duplicate blocks),
+        // so it is NOT the fit metric. B″ (issue #41) q21: 2,756 recorder perms
+        // but 2,485 lane perms → 2^16 (was 2,382 lane perms at q20). Cross-checked
+        // by `m4gate::tests::b2prime_fitcheck_leaf_2p16` and build_gate_trace's own
+        // height assert.
+        let rect_perms = crate::m4gate::lane_plan(&sched, &crate::m4gate::GateShape::narrow()).0.len();
         assert!(
-            sched.perms.len() <= 65_536 / 24,
-            "lane overflow: {} perms",
-            sched.perms.len()
+            rect_perms * 24 <= 65_536,
+            "leaf rectangle overflow: {rect_perms} lane perms (2^16 cap = 2,730 perms)"
         );
         eprintln!(
-            "schedule: {} perms total ({} native: {:?}), {} flushes, {} draws",
+            "schedule: {} recorder perms → {} lane perms (native {:?}), {} flushes, {} draws",
             sched.perms.len(),
-            2_233,
+            rect_perms,
             sched.native_counts,
             sched.flushes.len(),
             sched.draws.len(),
