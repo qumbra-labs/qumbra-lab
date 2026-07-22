@@ -274,7 +274,7 @@ impl GateShape {
             tw: GATE_WIDTH,
             qw: 8,
             n_pvs: N_OPVS, // the leaf gate's opvs become the interior's inner PVs
-            nq: 40,
+            nq: crate::m4treerec::AGG_CFG.num_queries, // = leaf lane queries (q43 post-B″, issue #41)
             log_max: 18,
             grind_bits: crate::m4treerec::AGG_CFG.grind_bits, // g22 post-B′ (derived from the leaf's config)
             log_arities: vec![4, 4, 4],
@@ -6070,27 +6070,38 @@ mod tests {
     #[test]
     fn b2prime_fitcheck_interior_2p19() {
         let (sl, sr, ol, or) = wide_shared_distinct();
-        // log_blowup only sizes the LDE buffer, not the logical height; pass the
-        // b2 interior lane value (1) for realism.
-        let (trace, _meta) = build_interior_trace(sl, sr, ol, or, &GateShape::wide(), 1);
-        let rows = trace.height();
+        let shape = GateShape::wide();
+        // Mirror build_interior_trace's real/rows computation exactly, but from
+        // child_derived + merge_perm_inputs directly — this gives the USED perm
+        // count (the true occupancy) without the ~7.7 GB full-trace allocation.
+        let nl = child_derived(sl, &shape).inputs.len();
+        let nr = child_derived(sr, &shape).inputs.len();
+        let nm = crate::m4interior::merge_perm_inputs(ol, or).len();
+        let real = nl + nr + nm;
+        let rows = (real * 24).next_power_of_two();
         let cap = 1usize << 19;
-        let occ = rows as f64 / cap as f64 * 100.0;
+        let occ = (real * 24) as f64 / cap as f64 * 100.0;
         eprintln!(
-            "FIT-CHECK 2 (interior @ leaf q{}, leaf width {} cols): interior rectangle {} rows = 2^{} \
+            "FIT-CHECK 2 (interior @ leaf q{}, leaf width {} cols): {} used perms \
+             (childL {} + childR {} + merge {}) → {} used rows → rectangle 2^{} \
              (cap 2^19 = {}); occupancy {:.1}% of 2^19",
-            GateShape::wide().nq,
+            shape.nq,
             GATE_WIDTH,
-            rows,
+            real,
+            nl,
+            nr,
+            nm,
+            real * 24,
             rows.trailing_zeros(),
             cap,
             occ
         );
         assert!(
             rows <= cap,
-            "FIT-CHECK 2 FAILED: interior overflows 2^19 ({} rows → 2^{}). \
+            "FIT-CHECK 2 FAILED: interior overflows 2^19 ({} perms × 24 = {} rows → 2^{}). \
              STOP — do not promote to 2^20; report to coordinator (design decision).",
-            rows,
+            real,
+            real * 24,
             rows.trailing_zeros()
         );
     }
@@ -6146,7 +6157,7 @@ mod tests {
         assert_eq!(w.qw, 8, "leaf wide quotient words/query");
         assert_eq!(w.n_pvs, N_OPVS, "interior inner PVs = leaf gate opvs");
         assert_eq!(w.n_pvs, 6 * 8 * 16 + 84, "= 852");
-        assert_eq!(w.nq, 40, "aggregation lane q40");
+        assert_eq!(w.nq, crate::m4treerec::AGG_CFG.num_queries, "aggregation lane queries (q43 post-B″)");
         assert_eq!(w.log_max, 18, "leaf 2^16 committed at b4 -> LDE 2^18");
         assert_eq!(w.log_arities, vec![4, 4, 4], "3 arity-16 FRI rounds");
         assert_eq!(w.n_caps(), 5, "trace + quotient + 3 FRI");
@@ -6344,26 +6355,27 @@ mod tests {
         let w = GateShape::wide();
         assert_eq!(w.n_fri_rounds(), 3);
         assert_eq!(w.n_chals(), 6);
-        assert_eq!(w.n_groups(), 48); // 5 + 3 + 40 (nq index slots won't fit 29)
+        assert_eq!(w.n_groups(), 51); // 5 + 3 + 43 (B″ q43; was 48 at q40)
         assert_eq!(w.g_pow(), 6);
         assert_eq!(w.g_idx0(), 7);
-        assert_eq!(w.g_done(), 47);
+        assert_eq!(w.g_done(), 50); // g_idx0 + nq = 7 + 43 (was 47 at q40)
         assert_eq!(w.n_roles(), 12);
         assert_eq!(w.n_micros(), 15);
         assert_eq!(w.n_flush_entries(), 8);
         assert_eq!(w.n_fhg(), 21);
         assert_eq!(w.drnd_width(), 5);
-        // F2 = 32 + 16·(2·tw + qw); tw = GATE_WIDTH (3672 = 3638 + R1's 34
-        // canonicity cols: canon_lo0/1[16] + top7_0/1) → 117664. All other
-        // flushes are tw-independent.
-        assert_eq!(w.flush_bytes(), vec![3676, 288, 117664, 288, 288, 288, 304]);
-        // F2 blocks = 117664/136 + 1 = 866 (eight more than the 858 at tw=3638;
-        // R1's 34 leaf cols add 16·2·34 = 1088 F2 bytes = 8 keccak blocks).
+        // F2 = 32 + 16·(2·tw + qw); tw = GATE_WIDTH (3675 = 3672 + B″'s +3 narrow
+        // cols from consensus q21: GRP/IDXR/QSEL each +1) → 32 + 16·(2·3675+8) =
+        // 117760. All other flushes are tw- and nq-independent (query index draws
+        // are sample_bits, not observations, so nq does not touch flush bytes).
+        assert_eq!(w.flush_bytes(), vec![3676, 288, 117760, 288, 288, 288, 304]);
+        // F2 blocks = 117760/136 + 1 = 866 (unchanged from tw=3672: +96 bytes is
+        // under one 136-byte keccak block).
         assert_eq!(w.flush_blocks(), vec![28, 3, 866, 3, 3, 3, 3]);
         assert_eq!(w.n_shapes_obs(), 46);
-        // qslots = ceil34(tw) + pl0 + ceil34(qw) + pl1; tw=3672 makes
-        // ceil34(3672)=108 (was 107 at 3638) → one more trace-leaf absorb slot.
-        assert_eq!(w.qslots(), 166);
+        // qslots = ceil34(tw) + pl0 + ceil34(qw) + pl1; tw=3675 makes
+        // ceil34(3675)=109 (was 108 at 3672) → one more trace-leaf absorb slot.
+        assert_eq!(w.qslots(), 167);
         assert_eq!(w.bidx_width(), 29, "wide F0=28 blocks → bidx must address all + 1 sink");
     }
 

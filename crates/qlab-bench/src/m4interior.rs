@@ -176,15 +176,18 @@ enum Shape {
 /// `/usr/bin/time -l` line**, not measured in-process. This bench does NOT judge
 /// against §7.3 — the coordinator does the table lookup on the reported numbers.
 ///
-/// Rows (name = shape/lane-config; b2 is the decided interior lane, listed first):
-/// - `single-child/b2/q80/g22/fp16/a16` — the §7.1 canary at the decided lane (measure twice).
-/// - `single-child/b4/q40/g22/fp16/a16` — canary at the optional b4 blowup.
-/// - `two-child/b2/q80/g22/fp16/a16` — the interior at the DECIDED b2/q80 lane
-///   (2026-07-21; ~20.5 GB, clean ~4.8 s — the operating point).
-/// - `two-child/b4/q40/g22/fp16/a16` — the interior at the optional b4 config
-///   (30.42 GB, compression-noised — run only per §7.1.3; both configs are ~100 bits).
+/// Rows (name = shape/lane-config; b2 is the decided interior lane, listed first).
+/// Query counts are B″ (issue #41): interior q80→q86, child leaves q40→q43.
+/// (Pre-B″ RSS figures noted below are the q80/q40 measurements; the B″ re-bench
+/// refreshes them — see docs/b2prime-run{1,2}.md.)
+/// - `single-child/b2/q86/g22/fp16/a16` — the §7.1 canary at the decided lane (measure twice).
+/// - `single-child/b4/q43/g22/fp16/a16` — canary at the optional b4 blowup.
+/// - `two-child/b2/q86/g22/fp16/a16` — the interior at the DECIDED b2 lane
+///   (pre-B″ q80: ~20.5 GB, clean ~4.8 s — the operating point).
+/// - `two-child/b4/q43/g22/fp16/a16` — the interior at the optional b4 config
+///   (pre-B″ q40: 30.42 GB, compression-noised — run only per §7.1.3; both ~100 bits).
 ///
-/// The child leaves (each ~12 GB peak / ~0.67 s at b4/q40) are proved SERIALLY
+/// The child leaves (each ~12 GB peak / ~0.7 s at b4/q43) are proved SERIALLY
 /// and ONCE, then dropped — only their recorded `Schedule` + outer PVs survive
 /// into the interior prove, so the reported peak RSS is the interior's, never a
 /// leaf's (they never coexist in memory with the interior LDE).
@@ -204,8 +207,8 @@ pub(crate) fn run_m4interior(power: &str, only: Option<&str>) {
         "- shapes: `single-child` = ONE wide leaf verified at 2^18 (the §7.1 canary — \
          pins the height-scaling slope on-axis); `two-child` = TWO DISTINCT wide leaves \
          row-stacked + keccak-merge at 2^19 (the interior node). The lane config is the \
-         INTERIOR's own FRI config, independent of the fixed b4/q40 config each child \
-         leaf was committed at."
+         INTERIOR's own FRI config, independent of the fixed b4/q43 config each child \
+         leaf was committed at (child queries q40→q43 per B″, issue #41)."
     );
     println!(
         "- protocol: aggregation-rung1 §7.1. ONE row per process via `--only <name>`; \
@@ -216,30 +219,32 @@ pub(crate) fn run_m4interior(power: &str, only: Option<&str>) {
     );
     println!();
 
-    // b2/q80/g22 is the DECIDED interior lane (2026-07-21, Larry — aggregation-rung1
-    // §4); b4/q40/g22 stays available as the optional/fallback config. Both clear
-    // ~100 bits (make_config_with asserts it: 40·2+22 = 80·1+22 = 102, post-B′).
-    // fp16/a16 match the leaf/consensus lane; grind g22 per issue #22.
+    // b2/q86/g22 is the DECIDED interior lane (2026-07-21, Larry — aggregation-rung1
+    // §4; query 80→86 per B″ issue #41); b4/q43/g22 stays available as the
+    // optional/fallback config (b4 100-bit point matches the leaf lane). Both clear
+    // ~100 bits conjectured (make_config_with asserts the capacity proxy: 43·2+22 =
+    // 86·1+22 = 108, post-B″/B′) AND the 2197-corrected ceiling (b2/q86 → 100.2,
+    // b4/q43 → 101.6). fp16/a16 match the leaf/consensus lane; grind g22 per B′.
     let b4 = FriCfg {
         log_blowup: 2,
-        num_queries: 40,
+        num_queries: 43, // q43 (B″, issue #41 — was q40)
         grind_bits: 22,
         log_final_poly_len: 4,
         max_log_arity: 4,
     };
     let b2 = FriCfg {
         log_blowup: 1,
-        num_queries: 80,
+        num_queries: 86, // q86 (B″, issue #41 — was q80; the decided interior lane)
         grind_bits: 22,
         log_final_poly_len: 4,
         max_log_arity: 4,
     };
     // b2 rows first (the decided primary lane); b4 rows kept as the optional fallback.
     let rows: [(&str, Shape, FriCfg); 4] = [
-        ("single-child/b2/q80/g22/fp16/a16", Shape::Single, b2),
-        ("single-child/b4/q40/g22/fp16/a16", Shape::Single, b4),
-        ("two-child/b2/q80/g22/fp16/a16", Shape::Two, b2),
-        ("two-child/b4/q40/g22/fp16/a16", Shape::Two, b4),
+        ("single-child/b2/q86/g22/fp16/a16", Shape::Single, b2),
+        ("single-child/b4/q43/g22/fp16/a16", Shape::Single, b4),
+        ("two-child/b2/q86/g22/fp16/a16", Shape::Two, b2),
+        ("two-child/b4/q43/g22/fp16/a16", Shape::Two, b4),
     ];
 
     // Cache the heavy child schedules within a process (each leaf prove has a
@@ -266,7 +271,7 @@ pub(crate) fn run_m4interior(power: &str, only: Option<&str>) {
             Shape::Single => {
                 if single.is_none() {
                     eprintln!(
-                        "   proving ONE child leaf (b4/q40, ~12 GB transient, freed before \
+                        "   proving ONE child leaf (b4/q43, ~12 GB transient, freed before \
                          the interior prove)..."
                     );
                     let (leaf, opvs) = crate::m4treerec::leaf_proof();

@@ -11,7 +11,7 @@
 //! acceptance path here, not a verbal promise (PR #23 residual).
 //!
 //! The interior lane (`--lane b4|b2`) is the interior's OWN FRI config, chosen
-//! independently of the fixed b4/q40 config each child leaf commits at (per
+//! independently of the fixed b4/q43 config each child leaf commits at (per
 //! aggregation-rung1 §7.3 the per-level config is still an open design item;
 //! this driver's measured data informs it — see `run_m4assembly`).
 
@@ -92,22 +92,23 @@ fn prove_verify_walk_leaf(variant: bool) -> (Schedule, Vec<Val>, f64, usize) {
 /// aggregation-rung1 §7.1 (per deliverable 3, only the interior segment's peak
 /// is recorded; the leaf's is already in `docs/m4gate-step0bii-run*.md`).
 ///
-/// `--lane b2` (b2/q80) is the default interior lane (DECIDED 2026-07-21, Larry
-/// — aggregation-rung1 §4: true-32 GB-box fit + issue #24 headroom + clean 4.8 s
-/// prove); `--lane b4` (b4/q40) stays available as an optional flag. Both ~100
-/// bits (make_config_with asserts 40·2+22 = 80·1+22 = 102, post-B′). Defaults to b2.
+/// `--lane b2` (b2/q86) is the default interior lane (DECIDED 2026-07-21, Larry
+/// — aggregation-rung1 §4: true-32 GB-box fit + issue #24 headroom + clean prove;
+/// query 80→86 per B″ issue #41); `--lane b4` (b4/q43) stays an optional flag.
+/// Both ~100 bits (make_config_with asserts 43·2+22 = 86·1+22 = 108, post-B″/B′).
+/// Defaults to b2.
 pub(crate) fn run_m4assembly(power: &str, lane: Option<&str>) {
     use p3_matrix::Matrix;
     use std::time::Instant;
 
     let (lane_name, cfg): (&str, FriCfg) = match lane.unwrap_or("b2") {
         "b2" => (
-            "b2/q80/g22/fp16/a16",
-            FriCfg { log_blowup: 1, num_queries: 80, grind_bits: 22, log_final_poly_len: 4, max_log_arity: 4 },
+            "b2/q86/g22/fp16/a16",
+            FriCfg { log_blowup: 1, num_queries: 86, grind_bits: 22, log_final_poly_len: 4, max_log_arity: 4 },
         ),
         "b4" => (
-            "b4/q40/g22/fp16/a16",
-            FriCfg { log_blowup: 2, num_queries: 40, grind_bits: 22, log_final_poly_len: 4, max_log_arity: 4 },
+            "b4/q43/g22/fp16/a16",
+            FriCfg { log_blowup: 2, num_queries: 43, grind_bits: 22, log_final_poly_len: 4, max_log_arity: 4 },
         ),
         other => panic!("unknown --lane `{other}` (expected b4 | b2)"),
     };
@@ -115,7 +116,7 @@ pub(crate) fn run_m4assembly(power: &str, lane: Option<&str>) {
     println!("# qumbra-lab M4 step 2: end-to-end tree/root assembly (m4assembly)");
     println!();
     crate::print_env(power);
-    println!("- interior lane: **{lane_name}** (the INTERIOR's own FRI config; each child leaf is committed at the fixed b4/q40 aggregation config independently).");
+    println!("- interior lane: **{lane_name}** (the INTERIOR's own FRI config; each child leaf is committed at the fixed b4/q43 aggregation config independently).");
     println!("- chain: 2 DISTINCT M3 tx proofs → 2 leaf wide proofs (proved serially, each native-verified then dropped) → 1 interior root proof → full native verification chain.");
     println!("- issue #24 HARD ASSERTION in this driver: `root_pv == keccak-merge(opvsL, opvsR)` (native recompute over public opvs) — the compositional soundness leg as a code fact, not a promise.");
     println!("- peak footprint (from external `/usr/bin/time -l`) is the INTERIOR segment's — the leaves are freed first. §7.1: any run with nonzero swap-ins/pageouts is disqualified.");
@@ -125,7 +126,7 @@ pub(crate) fn run_m4assembly(power: &str, lane: Option<&str>) {
 
     // 棒 1: two DISTINCT children, proved serially. Each leaf is proved,
     // native-verified, sized, walked, then dropped before the next allocation.
-    eprintln!("== m4assembly [{lane_name}]: proving child L (b4/q40 leaf, ~12 GB transient)... ==");
+    eprintln!("== m4assembly [{lane_name}]: proving child L (b4/q43 leaf, ~12 GB transient)... ==");
     let (sched_l, opvs_l, leaf_l_s, leaf_l_bytes) = prove_verify_walk_leaf(false);
     eprintln!("== m4assembly [{lane_name}]: proving child R (DISTINCT M3 witness, ~12 GB transient)... ==");
     let (sched_r, opvs_r, leaf_r_s, leaf_r_bytes) = prove_verify_walk_leaf(true);
@@ -171,8 +172,8 @@ pub(crate) fn run_m4assembly(power: &str, lane: Option<&str>) {
     println!();
     println!("| segment | wall s | fixed proof |");
     println!("|---|---|---|");
-    println!("| leaf L (b4/q40) | {leaf_l_s:.2} | {:.1} KB |", kb(leaf_l_bytes));
-    println!("| leaf R (b4/q40, distinct) | {leaf_r_s:.2} | {:.1} KB |", kb(leaf_r_bytes));
+    println!("| leaf L (b4/q43) | {leaf_l_s:.2} | {:.1} KB |", kb(leaf_l_bytes));
+    println!("| leaf R (b4/q43, distinct) | {leaf_r_s:.2} | {:.1} KB |", kb(leaf_r_bytes));
     println!("| interior root ({lane_name}) | {interior_s:.2} | {:.2} MB |", kb(interior_bytes) / 1024.0);
     println!("| **whole tree (2 leaf + 1 interior)** | **{tree_s:.2}** | — |");
     println!();

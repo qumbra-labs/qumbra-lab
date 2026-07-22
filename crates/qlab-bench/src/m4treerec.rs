@@ -18,13 +18,15 @@ use crate::m4gaterec::{self, Schedule};
 use crate::{make_config_with, Config, FriCfg, Val};
 
 /// The aggregation-lane config the leaf commits at. Per aggregation-rung1 §4,
-/// "at b4 the aggregation lane needs ~40–45 queries for 100 bits"; b4/q40 is
-/// the aggregation-lane default and the config m4census used for the interior
-/// fixed point (6,083 keccak-f/node). The interior verifies a proof of exactly
-/// this shape.
+/// "at b4 the aggregation lane needs ~40–45 queries for 100 bits". B″ (issue
+/// #41): query 40 → 43 — the 2197-corrected conjectured ceiling for b4/q40/g22
+/// is 96.1 (fri-soundness-accounting §6); q43 → 101.6 corrected, restoring the
+/// ~100-bit invariant. This is the single source of truth for the leaf lane
+/// query count; the interior gate's `GateShape::wide().nq` derives from it, so
+/// bumping here re-derives the interior verifier's schedule/shape (FIT-CHECK 2).
 pub(crate) const AGG_CFG: FriCfg = FriCfg {
     log_blowup: 2,      // b4
-    num_queries: 40,    // q40
+    num_queries: 43,    // q43 (B″, issue #41 — was q40; +3 restores 101.6 under the 2197-corrected ceiling)
     grind_bits: 22,     // g22 (B′, issue #22 — was g20; +2 restores 100.4 under DG25 repricing; sizes unchanged)
     log_final_poly_len: 4, // fp16
     max_log_arity: 4,   // a16
