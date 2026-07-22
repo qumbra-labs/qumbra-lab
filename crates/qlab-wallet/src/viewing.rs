@@ -146,10 +146,20 @@ pub struct Wallet {
 }
 
 impl Wallet {
-    /// Build a wallet from a raw 256-bit spending secret. (HD-seed / mnemonic
-    /// derivation of `sk` from a master seed is out of M7 scope — see the plan.)
+    /// Build a wallet from a raw 256-bit spending secret. Retained as the direct
+    /// constructor (used by demos/tests that pin `sk` explicitly). Wallets backed
+    /// by a recoverable seed phrase should use [`Wallet::from_master_seed`].
     pub fn from_seed_lanes(sk: Lanes) -> Self {
         Self::from_spending_key(SpendingKey::from_lanes(sk))
+    }
+
+    /// Build the wallet for account `account` of an HD master seed (issue #43).
+    /// The spending key is `seed.spending_key(account, Role::Spend)` — the leaf
+    /// of the documented `m / account / role` Keccak chain ([`crate::seed`]).
+    /// Every account of one seed is an independent sub-wallet (own `nk`, `fvk`,
+    /// `ivk`, `div_seed`).
+    pub fn from_master_seed(seed: &crate::seed::MasterSeed, account: u32) -> Self {
+        Self::from_spending_key(seed.spending_key(account, crate::seed::Role::Spend))
     }
 
     /// Build a wallet around an existing spending key.

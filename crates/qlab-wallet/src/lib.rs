@@ -65,6 +65,8 @@
 pub mod address;
 pub mod bech32m;
 pub mod keys;
+pub mod mnemonic;
+pub mod seed;
 pub mod viewing;
 
 pub use viewing::{Fvk, Ivk, Wallet};
