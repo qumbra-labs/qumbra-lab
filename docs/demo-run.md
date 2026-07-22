@@ -80,14 +80,20 @@ integrator would write — not a fork of crate logic — but it is a genuine
 composability gap. **Recommended follow-up:** extract a shared `qlab-consensus`
 library so `qlab-bench` and any consumer share one definition.
 
-**F2 — `build_bucket` fabricates its own membership tree.** It derives depth-32
-Merkle siblings pseudo-randomly and asserts a single root; it accepts no
-caller-supplied Merkle witness. So the proof's `anchor` is a *self-consistent
-invented* root, **not** the live commitment-tree root. The demo declares that
-anchor and marks it finalized so `validate_body`'s `is_anchor_final` passes. Tying
-the circuit's membership to the real note-commitment tree is future work — it
-would require changing `build_bucket` (beyond an additive helper, i.e. a real
-STOP-POINT), and was **not** needed for this demo.
+**F2 — `build_bucket` fabricated its own membership tree. RESOLVED
+([issue #39](https://github.com/lai3d/qumbra-lab/issues/39)).** It used to derive
+depth-32 Merkle siblings pseudo-randomly and assert a single self-consistent
+*invented* root, accepting no caller witness — so the proof's `anchor` was not
+the live commitment-tree root. Now `build_bucket_with_witnesses` takes a
+caller-supplied `MerkleWitness` per input plus the anchor; the legacy
+`build_bucket` is a thin fabricating wrapper for benches. The demo builds a
+global `anchor_tree`, **finalizes its root through the committee**
+(`finalize_root`), and the wallet/prover fetches a live membership witness
+(`prover::live_witness`, backed by `CommitmentTree::auth_path`) that resolves to
+that finalized root. Validation runs the full §6 + §8 gate
+(`FinalityTracker::is_anchor_acceptable` — finalized-only AND ≤24 h age window),
+and two negatives are exercised: a never-finalized anchor and an expired
+finalized anchor are both rejected.
 
 **F3 — `qlab-cbserver`'s serving/scan path was bolted to a self-generating
 `Devnet`.** `Devnet::generate(GenParams)` plants its *own* notes and is the only
@@ -108,6 +114,6 @@ coinbase tracker are `qlab-demo/src/ledger.rs`. These are placeholder accounting
 appropriate for a devnet.
 
 **Bottom line:** the stack composes. One gap (F1) is worth closing with a small
-shared crate; one (F2) is a known circuit-vs-chain binding deferred by design; the
-other two (F3/F4) were closed with additive, suite-green glue. No composed crate
-was forked, and no STOP-POINT fired.
+shared crate; F2 (circuit-vs-chain anchor binding) is now **closed** by issue #39
+— real finalized anchors with live membership witnesses; F3/F4 were closed with
+additive, suite-green glue. No composed crate was forked.
