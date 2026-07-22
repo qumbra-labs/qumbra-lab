@@ -35,6 +35,7 @@ pub mod fees;
 pub mod finality;
 pub mod hash;
 pub mod header;
+pub mod load;
 pub mod mining;
 pub mod net;
 pub mod node;
