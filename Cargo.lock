@@ -867,6 +867,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "qlab-econ"
+version = "0.0.0"
+
+[[package]]
 name = "qlab-note"
 version = "0.0.0"
 dependencies = [
