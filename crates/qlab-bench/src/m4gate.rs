@@ -5914,8 +5914,8 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout, shape: &GateShape) {
 // leaf-agg (AGG_CFG = b4/q40) and consensus (CONSENSUS_CFG = b16/q20) lanes —
 // both g22 post-B′ (issue #22). Labels are display-only.
 const LANE_CFGS: [(&str, FriCfg); 2] = [
-    ("b4/q40/g22/fp16/a16", crate::m4treerec::AGG_CFG),
-    ("b16/q20/g22/fp16/a16", CONSENSUS_CFG),
+    ("b4/q43/g22/fp16/a16", crate::m4treerec::AGG_CFG),
+    ("b16/q21/g22/fp16/a16", CONSENSUS_CFG),
 ];
 
 pub(crate) fn run_m4gate(power: &str, only: Option<&str>) {
