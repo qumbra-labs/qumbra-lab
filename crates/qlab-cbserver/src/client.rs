@@ -155,6 +155,79 @@ pub fn light_client_scan(
     Ok(ScanOutcome { notes, stats })
 }
 
+/// The light-client scan flow, run **fully in-process** against a `&Devnet`
+/// via `crate::server::route` — no socket, no `TcpStream`. Behaviourally
+/// identical to [`light_client_scan`] (same codec, same tag pre-filter, same
+/// `qlab_note::scan::scan`, same decoy over-fetch); this is the composition
+/// path for an in-process driver (qlab-demo) under a no-networking constraint.
+pub fn scan_local(
+    devnet: &crate::data::Devnet,
+    dk: &Dk,
+    from: u64,
+    to: u64,
+    config: ScanConfig,
+    rng: &mut StdRng,
+) -> ScanOutcome {
+    // `route` never errors for well-formed internal URLs; unwrap the bytes.
+    let route_get = |url: &str| -> Vec<u8> {
+        crate::server::route(devnet, url).expect("in-process route must succeed")
+    };
+
+    let compact = route_get(&format!("/v1/compact?from={from}&to={to}"));
+    let mut stats = ScanStats { compact_bytes: compact.len(), ..Default::default() };
+    let blocks = decode_compact_response(&compact).expect("internal compact response decodes");
+
+    let tx_space: Vec<(u64, u64)> = blocks
+        .iter()
+        .map(|b| (b.height, b.groups.len() as u64))
+        .filter(|(_, n)| *n > 0)
+        .collect();
+
+    let mut notes = Vec::new();
+    for block in &blocks {
+        for group in &block.groups {
+            let matched = group
+                .recipients
+                .iter()
+                .any(|bundle| bundle_has_tag_match(dk, bundle));
+            if !matched {
+                continue;
+            }
+            let full = route_get(&format!("/v1/block/{}/tx/{}/full", block.height, group.tx_index));
+            stats.matched_fetches += 1;
+            let payloads_per_recipient =
+                decode_full_response(&full).expect("internal full response decodes");
+            for (ri, bundle) in group.recipients.iter().enumerate() {
+                let Some(payloads) = payloads_per_recipient.get(ri) else { continue };
+                let enc = EncryptedOutputs { bundle: bundle.clone(), payloads: payloads.clone() };
+                for detected in scan(dk, &enc, config.mode) {
+                    notes.push(LocatedNote {
+                        height: block.height,
+                        tx_index: group.tx_index,
+                        recipient_index: ri,
+                        detected,
+                    });
+                }
+            }
+            if let DecoyPolicy::PerMatch { max } = config.decoy {
+                let max = max.max(1);
+                let n_decoys = 1 + (rng.next_u64() as usize % max);
+                for _ in 0..n_decoys {
+                    if tx_space.is_empty() {
+                        break;
+                    }
+                    let (h, n_tx) = tx_space[rng.next_u64() as usize % tx_space.len()];
+                    let ti = rng.next_u64() % n_tx;
+                    let _ = route_get(&format!("/v1/block/{h}/tx/{ti}/full"));
+                    stats.decoy_fetches += 1;
+                }
+            }
+        }
+    }
+    stats.notes_found = notes.len();
+    ScanOutcome { notes, stats }
+}
+
 /// Does any entry in `bundle` produce a detection-tag match under `dk`? (The
 /// cheap pre-filter that decides whether to full-fetch.)
 fn bundle_has_tag_match(dk: &Dk, bundle: &qlab_note::wire::RecipientBundle) -> bool {
@@ -321,6 +394,28 @@ mod tests {
         // Decoys must not change what is found.
         assert_eq!(on.stats.notes_found, off.stats.notes_found);
         handle.shutdown();
+    }
+
+    #[test]
+    fn scan_local_matches_socket_scan_and_finds_planted_notes() {
+        let d = Devnet::generate(GenParams::default());
+        let mut rng = StdRng::seed_from_u64(1);
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::Off };
+        let out = scan_local(&d, &d.our.dk, 1, d.tip_height(), cfg, &mut rng);
+        assert_eq!(out.notes.len(), d.expected_matches, "socket-free scan finds all planted notes");
+        assert_eq!(out.stats.notes_found, d.expected_matches);
+        assert!(out.stats.matched_fetches > 0);
+    }
+
+    #[test]
+    fn scan_local_wrong_key_finds_nothing() {
+        let d = Devnet::generate(GenParams::default());
+        let mut rng = StdRng::seed_from_u64(3);
+        let stranger = qlab_note::kem::generate_keypair(&mut StdRng::seed_from_u64(999));
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::Off };
+        let out = scan_local(&d, &stranger.dk, 1, d.tip_height(), cfg, &mut rng);
+        assert_eq!(out.notes.len(), 0);
+        assert_eq!(out.stats.matched_fetches, 0);
     }
 
     #[test]

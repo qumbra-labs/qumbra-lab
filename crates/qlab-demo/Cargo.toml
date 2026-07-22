@@ -1,0 +1,36 @@
+[package]
+name = "qlab-demo"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "qlab-demo"
+path = "src/bin/qlab-demo.rs"
+
+[dependencies]
+qlab-air = { path = "../qlab-air" }
+qlab-note = { path = "../qlab-note" }
+qlab-wallet = { path = "../qlab-wallet" }
+qlab-devnet = { path = "../qlab-devnet" }
+qlab-cbserver = { path = "../qlab-cbserver" }
+
+# Plonky3 pinned exactly at 0.6.1 (matches qlab-bench / Cargo.lock). The prover
+# config is reconstructed here because it is pub(crate) in the qlab-bench binary
+# (see docs friction F1). parallel feature turns on multithreaded prove.
+p3-air = "=0.6.1"
+p3-challenger = "=0.6.1"
+p3-commit = "=0.6.1"
+p3-dft = "=0.6.1"
+p3-field = "=0.6.1"
+p3-fri = "=0.6.1"
+p3-keccak = "=0.6.1"
+p3-koala-bear = "=0.6.1"
+p3-matrix = "=0.6.1"
+p3-maybe-rayon = { version = "=0.6.1", features = ["parallel"] }
+p3-merkle-tree = "=0.6.1"
+p3-symmetric = "=0.6.1"
+p3-uni-stark = "=0.6.1"
+
+rand = "0.10"
+bincode = "1"
