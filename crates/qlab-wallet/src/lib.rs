@@ -28,8 +28,30 @@
 //! share `rkm` and are LINKABLE via it. Full unlinkability requires the circuit
 //! to bind `rkm = H(nk ‖ D_R ‖ d)` (a `qlab-air` change; proposed in the plan
 //! doc / PR, out of M7 scope).
+//!
+//! ## Type-level spend separation
+//!
+//! Only [`Wallet`]/[`keys::SpendingKey`] can produce a spend witness. An `Fvk`
+//! has no `spend_input` method — this does NOT compile:
+//!
+//! ```compile_fail
+//! let w = qlab_wallet::Wallet::from_seed_lanes([1, 2, 3, 4]);
+//! let fvk = w.fvk();
+//! let _ = fvk.spend_input(100, [0; 4], [0; 4]); // no such method on Fvk
+//! ```
+//!
+//! An `Ivk` cannot even view spends — it has no `nullifier` method:
+//!
+//! ```compile_fail
+//! let w = qlab_wallet::Wallet::from_seed_lanes([1, 2, 3, 4]);
+//! let ivk = w.ivk();
+//! let _ = ivk.nullifier(&[0u64; 4]); // no such method on Ivk
+//! ```
 
 pub mod address;
 pub mod bech32m;
 pub mod keys;
+pub mod viewing;
+
+pub use viewing::{Fvk, Ivk, Wallet};
 
