@@ -867,6 +867,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "qlab-disclosure"
+version = "0.0.0"
+dependencies = [
+ "bincode",
+ "p3-air",
+ "p3-challenger",
+ "p3-commit",
+ "p3-dft",
+ "p3-field",
+ "p3-fri",
+ "p3-keccak",
+ "p3-koala-bear",
+ "p3-matrix",
+ "p3-merkle-tree",
+ "p3-symmetric",
+ "p3-uni-stark",
+ "postcard",
+ "qlab-air",
+ "qlab-note",
+ "qlab-wallet",
+ "rand",
+ "serde",
+]
+
+[[package]]
 name = "qlab-note"
 version = "0.0.0"
 dependencies = [
