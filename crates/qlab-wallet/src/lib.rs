@@ -29,5 +29,5 @@
 //! to bind `rkm = H(nk ‖ D_R ‖ d)` (a `qlab-air` change; proposed in the plan
 //! doc / PR, out of M7 scope).
 
-// Modules land in staged commits: keys -> address -> viewing -> (e2e tests).
+pub mod keys;
 
