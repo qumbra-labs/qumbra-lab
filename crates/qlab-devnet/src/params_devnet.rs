@@ -60,13 +60,17 @@ pub const DEGRADED_MODE_LAG_BLOCKS: u64 = 2 * CHECKPOINT_CADENCE_BLOCKS;
 
 /// §8 anchor-age ceiling (consensus §6 / performance-budget §8): a transaction
 /// may anchor only to a finalized commitment root no older than 24 h. Expressed
-/// in blocks at the REAL 60 s block time (24·3600/60 = 1440). Beyond this the
-/// anchor is *expired* and the tx is rejected — this is the window that lets a
-/// node retire old roots. PLACEHOLDER — the exact window, and the 10-min-bucket
-/// quantization that snaps *which* finalized roots are offered (a privacy knob
-/// layered on top of this ceiling), are consensus-parameters items. The tracker
-/// takes the window as a parameter so the accelerated sim can pass a smaller one.
-pub const MAX_ANCHOR_AGE_BLOCKS: u64 = 24 * 3600 / 60;
+/// in blocks at the DECIDED 75 s block time (consensus-parameters §2, B2 adopted
+/// 2026-07-22): 24·3600/75 = 1,152 — which is also exactly the epoch length.
+/// (Coordinator acceptance fix on PR #45: the original 24·3600/60 = 1,440 used
+/// the pre-decision 60 s end of the band and would be a 30 h window at 75 s,
+/// violating the ≤24 h policy.) Beyond this the anchor is *expired* and the tx
+/// is rejected — this is the window that lets a node retire old roots. The
+/// 10-min-bucket quantization that snaps *which* finalized roots are offered (a
+/// privacy knob layered on top of this ceiling) remains a consensus-parameters
+/// item. The tracker takes the window as a parameter so the accelerated sim can
+/// pass a smaller one.
+pub const MAX_ANCHOR_AGE_BLOCKS: u64 = 24 * 3600 / 75;
 
 // Later stages will add here, still as placeholders:
 //   - EPOCH_LENGTH_BLOCKS (membership boundary — committee-gov §2)
