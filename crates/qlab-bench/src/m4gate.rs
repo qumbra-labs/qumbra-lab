@@ -116,8 +116,14 @@ const TW: usize = 617;
 const QW: usize = 16;
 /// Inner public values.
 const N_PVS: usize = 84;
-/// Queries and index bits.
-const NQ: usize = 20;
+/// Queries and index bits. DERIVED from `CONSENSUS_CFG.num_queries` (not
+/// hardcoded), mirroring `GRIND_BITS` below — B″ (issue #41) bumped it 20 → 21
+/// to restore ~100-bit conjectured under the 2197-corrected accounting, and
+/// this tracks automatically so the narrow const chain (IDXR width, GRP ring,
+/// QSEL counter, and thus `GATE_WIDTH`) can never silently drift from the
+/// config that actually produces the M3 proof the leaf gate verifies. A query
+/// bump changes the FS transcript AND the rectangle shape (the #22/B′ lesson).
+const NQ: usize = CONSENSUS_CFG.num_queries;
 const LOG_MAX: usize = 22;
 /// Query-PoW grind bits: the PoW draw's low GRIND_BITS bits must be zero.
 /// DERIVED from `CONSENSUS_CFG.grind_bits` (not hardcoded) so the gate's
@@ -142,15 +148,17 @@ const FLUSH_BLOCKS: [usize; 8] = [5, 3, 148, 3, 3, 3, 3, 3];
 const FLUSH_BYTES: [usize; 8] = [604, 288, 20_032, 288, 288, 288, 288, 308];
 
 /// Draw groups: 0 alpha, 1 zeta, 2 fri_alpha, 3..7 beta0..3, 7 pow,
-/// 8..28 idx0..19, 28 DONE.
+/// 8..(8+NQ) idx0..(NQ-1), then DONE. G_DONE / N_GROUPS derive from NQ so a
+/// query bump (B″, issue #41) shifts the DONE slot and widens the GRP ring
+/// automatically (matches `GateShape::n_groups()` = 5 + n_fri_rounds + nq).
 const G_ALPHA: usize = 0;
 const G_ZETA: usize = 1;
 const G_FRIALPHA: usize = 2;
 const G_BETA0: usize = 3;
 const G_POW: usize = 7;
 const G_IDX0: usize = 8;
-const G_DONE: usize = 28;
-const N_GROUPS: usize = 29;
+const G_DONE: usize = G_IDX0 + NQ;
+const N_GROUPS: usize = G_DONE + 1;
 /// Field-draw challenge count (alpha, zeta, fri_alpha, betas).
 const N_CHALS: usize = 7;
 
@@ -241,7 +249,7 @@ impl GateShape {
             tw: 617,
             qw: 16,
             n_pvs: 84,
-            nq: 20,
+            nq: NQ, // = CONSENSUS_CFG.num_queries (q21 post-B″, issue #41)
             log_max: 22,
             grind_bits: GRIND_BITS, // = CONSENSUS_CFG.grind_bits (g22 post-B′)
             log_arities: vec![4, 4, 4, 2],
@@ -845,7 +853,7 @@ const GROT: usize = CROT + 1; // group rotation gate
 const CHAL: usize = GROT + 1; // 7 x 4 (alpha, zeta, fri_alpha, beta0..3)
 const FA2: usize = CHAL + 4 * N_CHALS; // fri_alpha^2
 const ZNREG: usize = FA2 + 4; // zeta * g_trace
-const IDXR: usize = ZNREG + 4; // 20 query indices
+const IDXR: usize = ZNREG + 4; // NQ query indices (q21 post-B″)
 
 // -- flush automaton ----------------------------------------------------------
 const FRING: usize = IDXR + NQ; // 8-slot one-hot: current obs flush
@@ -865,7 +873,7 @@ const SHSEL: usize = REFSEL + 1; // 26 obs-shape selectors
 const N_SHAPES_OBS: usize = 26;
 const PHC: usize = SHSEL + N_SHAPES_OBS;
 const PHQ: usize = PHC + 1;
-const QSEL: usize = PHQ + 1; // 21-slot one-hot query counter
+const QSEL: usize = PHQ + 1; // (NQ+1)-slot one-hot query counter (q21 → 22 slots)
 const QCNT: usize = QSEL + NQ + 1; // query-slot countdown 103..1
 const QCW: usize = QCNT + 1; // QCNT == 1 comparator + inverse
 const QCWI: usize = QCW + 1;
@@ -6018,6 +6026,73 @@ mod tests {
     pub(crate) fn wide_shared_distinct() -> &'static (Schedule, Schedule, Vec<Val>, Vec<Val>) {
         static CELL: OnceLock<(Schedule, Schedule, Vec<Val>, Vec<Val>)> = OnceLock::new();
         CELL.get_or_init(|| crate::m4interior::two_child_schedule(true))
+    }
+
+    /// B″ (issue #41) FIT-CHECK 1 — the leaf gate rectangle must still fit 2^16
+    /// after consensus q20 → q21 (the "+5% consensus-schedule growth"). Measures
+    /// the ACTUAL lane-perm count of the narrow gate verifying a q21 M3 proof and
+    /// asserts the rectangle stays 2^16. If this fails, STOP and report — do NOT
+    /// silently promote the leaf to 2^17 (that is a design-side decision).
+    /// Cheap: reuses `shared()`'s one consensus prove; no leaf prove.
+    #[test]
+    fn b2prime_fitcheck_leaf_2p16() {
+        let (sched, _pvs, _tl) = shared();
+        let n_perms = lane_plan(sched, &GateShape::narrow()).0.len();
+        let rows = (n_perms * 24).next_power_of_two();
+        let cap = 1usize << 16;
+        let occ = (n_perms * 24) as f64 / cap as f64 * 100.0;
+        eprintln!(
+            "FIT-CHECK 1 (leaf @ consensus q{}): {} lane perms → {} used rows → rectangle 2^{} \
+             (cap 2^16 = {}); occupancy {:.1}% of 2^16",
+            GateShape::narrow().nq,
+            n_perms,
+            n_perms * 24,
+            rows.trailing_zeros(),
+            cap,
+            occ
+        );
+        assert!(
+            rows <= cap,
+            "FIT-CHECK 1 FAILED: leaf overflows 2^16 ({} perms × 24 = {} rows → 2^{}). \
+             STOP — do not promote to 2^17; report to coordinator (design decision).",
+            n_perms,
+            n_perms * 24,
+            rows.trailing_zeros()
+        );
+    }
+
+    /// B″ (issue #41) FIT-CHECK 2 — the two-child interior rectangle must still
+    /// fit 2^19 after leaf q40 → q43 (the "+7.5% leaf-opening growth": q43 ×
+    /// 7,260-value rows + the leaf gate's +3 cols from consensus q21 widening
+    /// `wide().tw = GATE_WIDTH`). Measures the ACTUAL interior trace height from
+    /// two DISTINCT q43 leaf schedules. If it overflows 2^19, STOP and report —
+    /// do NOT silently promote to 2^20. Heavy: two ~12 GB leaf proves (cached).
+    #[test]
+    fn b2prime_fitcheck_interior_2p19() {
+        let (sl, sr, ol, or) = wide_shared_distinct();
+        // log_blowup only sizes the LDE buffer, not the logical height; pass the
+        // b2 interior lane value (1) for realism.
+        let (trace, _meta) = build_interior_trace(sl, sr, ol, or, &GateShape::wide(), 1);
+        let rows = trace.height();
+        let cap = 1usize << 19;
+        let occ = rows as f64 / cap as f64 * 100.0;
+        eprintln!(
+            "FIT-CHECK 2 (interior @ leaf q{}, leaf width {} cols): interior rectangle {} rows = 2^{} \
+             (cap 2^19 = {}); occupancy {:.1}% of 2^19",
+            GateShape::wide().nq,
+            GATE_WIDTH,
+            rows,
+            rows.trailing_zeros(),
+            cap,
+            occ
+        );
+        assert!(
+            rows <= cap,
+            "FIT-CHECK 2 FAILED: interior overflows 2^19 ({} rows → 2^{}). \
+             STOP — do not promote to 2^20; report to coordinator (design decision).",
+            rows,
+            rows.trailing_zeros()
+        );
     }
 
     /// Wide analogue of `is_unsat`: check the mutated wide trace against the

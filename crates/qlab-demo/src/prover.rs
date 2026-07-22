@@ -51,10 +51,14 @@ pub struct FriCfg {
     pub max_log_arity: usize,
 }
 
-/// The decided consensus config (issue #22 B′): b16/q20/g22/fp16/a16.
+/// The decided consensus config (issue #41 B″): b16/q21/g22/fp16/a16 — query
+/// 20 → 21 restores ~100-bit conjectured under the 2197-corrected accounting
+/// (`fri-soundness-accounting-2026-07.md` §6). Must stay equal to the lab's
+/// canonical `m4gaterec::CONSENSUS_CFG` (cross-crate copy — qlab-demo can't
+/// import from the qlab-bench bin crate; the value-lock test below pins it).
 pub const CONSENSUS_CFG: FriCfg = FriCfg {
     log_blowup: 4,
-    num_queries: 20,
+    num_queries: 21,
     grind_bits: 22,
     log_final_poly_len: 4,
     max_log_arity: 4,
@@ -113,9 +117,9 @@ mod tests {
 
     #[test]
     fn consensus_cfg_is_value_locked() {
-        // Locked to the documented decision (issue #22 B′): b16/q20/g22/fp16/a16.
+        // Locked to the documented decision (issue #41 B″): b16/q21/g22/fp16/a16.
         assert_eq!(CONSENSUS_CFG.log_blowup, 4);
-        assert_eq!(CONSENSUS_CFG.num_queries, 20);
+        assert_eq!(CONSENSUS_CFG.num_queries, 21);
         assert_eq!(CONSENSUS_CFG.grind_bits, 22);
         assert_eq!(CONSENSUS_CFG.log_final_poly_len, 4);
         assert_eq!(CONSENSUS_CFG.max_log_arity, 4);
