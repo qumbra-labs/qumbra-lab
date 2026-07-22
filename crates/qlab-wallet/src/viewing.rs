@@ -37,6 +37,7 @@ use qlab_note::scan::{scan, DetectedNote, EncryptedOutputs, ScanMode};
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::address::{Address, Diversifier};
+use crate::diversifier::{diversifier_at_index, DiversifierLedger};
 use crate::keys::{derive_nf, derive_rkm, Lanes, SpendingKey};
 
 /// Domain string: `div_seed = Keccak256(DS_DIV_SEED ‖ sk_bytes)`.
@@ -108,6 +109,24 @@ impl Fvk {
         let kp = diversified_keypair(&self.div_seed, d);
         scan(&kp.dk, outputs, mode)
     }
+
+    /// The managed diversifier for `index` (issue #43): `d = H(div_seed ‖ index)`.
+    pub fn diversifier_at_index(&self, index: u64) -> Diversifier {
+        diversifier_at_index(&self.div_seed, index)
+    }
+
+    /// The diversified address at managed `index`.
+    pub fn address_at_index(&self, index: u64) -> Address {
+        self.address(self.diversifier_at_index(index))
+    }
+
+    /// **Rotate:** allocate the next unused index from `ledger` and return its
+    /// fresh, unlinkable diversified address. Address generation is an `fvk`
+    /// capability (it needs `nk` to derive `rkm(d)`, issue #32).
+    pub fn next_address(&self, ledger: &mut DiversifierLedger) -> (u64, Address) {
+        let (index, d) = ledger.allocate(&self.div_seed);
+        (index, self.address(d))
+    }
 }
 
 /// Incoming viewing key — the standing hook handed to e.g. an exchange to credit
@@ -130,10 +149,20 @@ impl Ivk {
         scan(&kp.dk, outputs, mode)
     }
 
+    /// The managed diversifier for `index` (issue #43). This is a SCANNING-side
+    /// capability — it needs only `div_seed` (which the `ivk` holds), not `nk` —
+    /// so an `ivk` holder (e.g. an exchange) can enumerate its own diversifier
+    /// slots to scan without holding each full address. Reproducing `d` does NOT
+    /// let it GENERATE an address (that still needs `nk` to derive `rkm(d)`).
+    pub fn diversifier_at_index(&self, index: u64) -> Diversifier {
+        diversifier_at_index(&self.div_seed, index)
+    }
+
     // NOTE: there is deliberately NO `nullifier(...)`, NO `spend_input(...)`, and
     // (since issue #32) NO `rkm(...)`/`address(...)` on `Ivk` — it holds neither
     // `nk` nor `sk`. That absence IS the type-level capability boundary (see the
-    // crate-level compile_fail doc-tests).
+    // crate-level compile_fail doc-tests). `diversifier_at_index` above is
+    // div_seed-only and confers no address-generation power.
 }
 
 /// A Qumbra wallet — the root of the key hierarchy. Owns the [`SpendingKey`] and
@@ -146,10 +175,20 @@ pub struct Wallet {
 }
 
 impl Wallet {
-    /// Build a wallet from a raw 256-bit spending secret. (HD-seed / mnemonic
-    /// derivation of `sk` from a master seed is out of M7 scope — see the plan.)
+    /// Build a wallet from a raw 256-bit spending secret. Retained as the direct
+    /// constructor (used by demos/tests that pin `sk` explicitly). Wallets backed
+    /// by a recoverable seed phrase should use [`Wallet::from_master_seed`].
     pub fn from_seed_lanes(sk: Lanes) -> Self {
         Self::from_spending_key(SpendingKey::from_lanes(sk))
+    }
+
+    /// Build the wallet for account `account` of an HD master seed (issue #43).
+    /// The spending key is `seed.spending_key(account, Role::Spend)` — the leaf
+    /// of the documented `m / account / role` Keccak chain ([`crate::seed`]).
+    /// Every account of one seed is an independent sub-wallet (own `nk`, `fvk`,
+    /// `ivk`, `div_seed`).
+    pub fn from_master_seed(seed: &crate::seed::MasterSeed, account: u32) -> Self {
+        Self::from_spending_key(seed.spending_key(account, crate::seed::Role::Spend))
     }
 
     /// Build a wallet around an existing spending key.
@@ -192,6 +231,25 @@ impl Wallet {
     pub fn address(&self, d: Diversifier) -> Address {
         let kp = self.diversified_keypair(&d);
         Address::new(d, self.rkm(d), &kp.ek)
+    }
+
+    /// The managed diversifier for `index` (issue #43): `d = H(div_seed ‖ index)`.
+    /// Reproducible by the wallet's `fvk`/`ivk` (they share `div_seed`).
+    pub fn diversifier_at_index(&self, index: u64) -> Diversifier {
+        diversifier_at_index(&self.div_seed, index)
+    }
+
+    /// The wallet's diversified address at managed `index`.
+    pub fn address_at_index(&self, index: u64) -> Address {
+        self.address(self.diversifier_at_index(index))
+    }
+
+    /// **Rotate:** allocate the next unused index from `ledger` and return its
+    /// fresh, unlinkable diversified address. Advances the ledger's cursor and
+    /// records the slot for persistence.
+    pub fn next_address(&self, ledger: &mut DiversifierLedger) -> (u64, Address) {
+        let (index, d) = ledger.allocate(&self.div_seed);
+        (index, self.address(d))
     }
 
     /// The nullifier `nf = H(nk ‖ ρ)` (the wallet can also view its own spends).
@@ -283,6 +341,43 @@ mod tests {
         // Distinct diversifiers -> distinct ML-KEM keypairs (the diversification
         // that Option 1 DOES provide).
         assert_ne!(w.ek_bytes(&d0), w.ek_bytes(&d1));
+    }
+
+    #[test]
+    fn managed_index_addresses_agree_across_capabilities() {
+        // Wallet, fvk, and ivk all derive the SAME managed diversifier for an
+        // index (they share div_seed); wallet and fvk also produce byte-identical
+        // addresses (both hold nk). The ivk derives d but cannot make the address.
+        let w = Wallet::from_seed_lanes(SK);
+        let fvk = w.fvk();
+        let ivk = w.ivk();
+        for index in [0u64, 1, 42, 1_000_000] {
+            let d = w.diversifier_at_index(index);
+            assert_eq!(fvk.diversifier_at_index(index), d, "fvk agrees on d(index)");
+            assert_eq!(ivk.diversifier_at_index(index), d, "ivk agrees on d(index)");
+            assert_eq!(
+                w.address_at_index(index).to_raw_bytes(),
+                fvk.address_at_index(index).to_raw_bytes(),
+                "wallet and fvk make the same address at index"
+            );
+        }
+    }
+
+    #[test]
+    fn rotation_yields_fresh_unlinkable_addresses() {
+        // next_address rotates: each call advances the ledger and hands back a
+        // fresh address carrying a DISTINCT rkm (unlinkable, issue #32). fvk and
+        // wallet rotating the SAME ledger stay coherent.
+        let w = Wallet::from_seed_lanes(SK);
+        let mut ledger = DiversifierLedger::new();
+        let (i0, a0) = w.next_address(&mut ledger);
+        let (i1, a1) = w.fvk().next_address(&mut ledger);
+        assert_ne!(i0, i1, "rotation advances the index");
+        assert_ne!(a0.rkm_lanes(), a1.rkm_lanes(), "rotated addresses are unlinkable");
+        assert_eq!(ledger.allocated_count(), 2);
+        // The address at each rotated index re-derives identically.
+        assert_eq!(w.address_at_index(i0).to_raw_bytes(), a0.to_raw_bytes());
+        assert_eq!(w.address_at_index(i1).to_raw_bytes(), a1.to_raw_bytes());
     }
 
     #[test]

@@ -11,6 +11,8 @@ use qlab_air::narrow::{build_bucket, TxInput, TxOutput};
 use qlab_note::note::Note;
 use qlab_note::scan::{encrypt_to_recipient, ScanMode};
 use qlab_wallet::address::{Address, Diversifier};
+use qlab_wallet::diversifier::DiversifierLedger;
+use qlab_wallet::seed::MasterSeed;
 use qlab_wallet::Wallet;
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -178,6 +180,96 @@ fn two_diversified_addresses_are_unlinkable_and_both_spend() {
         n1.commitment(),
         qlab_note::note::note_commitment(n1.value, &wallet.rkm(d1), &n1.rho, &n1.rseed),
         "note 1 cm reconstructs from rkm(d1)"
+    );
+}
+
+/// Issue #43 end-to-end: seed phrase → HD wallet → a ROTATED (managed-index)
+/// diversified address → encrypt → scan → SPEND — proving a fully seed-derived
+/// key yields a genuinely spendable note against `qlab-air`'s `build_bucket`.
+/// This is the load-bearing regression lock for the HD layer: if HD derivation
+/// or diversifier management drifts, the circuit `nf`/`cm` closure below breaks.
+#[test]
+fn seed_to_mnemonic_to_rotated_address_encrypt_scan_spend() {
+    // 1. A master seed round-trips through its 24-word backup phrase, and the
+    //    recovered seed derives the identical wallet (account 0).
+    let seed = MasterSeed::from_entropy([0x2a; 32]);
+    let phrase = seed.to_mnemonic();
+    assert_eq!(phrase.split_whitespace().count(), 24);
+    let recovered = MasterSeed::from_mnemonic(&phrase).expect("phrase recovers seed");
+    assert_eq!(recovered.entropy(), seed.entropy());
+
+    let wallet = Wallet::from_master_seed(&recovered, 0);
+    // A different account of the same seed is an independent wallet.
+    let other_account = Wallet::from_master_seed(&recovered, 1);
+    assert_ne!(wallet.nk(), other_account.nk(), "accounts are independent");
+
+    // 2. Rotate a fresh managed diversified address from a ledger, then persist
+    //    and restore the ledger (the wallet's diversifier bookkeeping).
+    let mut ledger = DiversifierLedger::new();
+    let (index, addr0) = wallet.next_address(&mut ledger);
+    let restored = DiversifierLedger::from_bytes(&ledger.to_bytes()).expect("ledger persists");
+    assert_eq!(restored.next_index(), ledger.next_index());
+    assert!(restored.is_allocated(index));
+
+    // The rotated address round-trips through its bech32m string (as a sender
+    // receives it) and re-derives identically from the index.
+    let addr = Address::decode(&addr0.encode()).expect("address decodes");
+    let d = wallet.diversifier_at_index(index);
+    assert_eq!(addr.rkm_lanes(), wallet.rkm(d), "address carries wallet rkm(d)");
+    let ek = addr.encapsulation_key().expect("valid ek");
+
+    // 3. Sender pays the rotated address; recipient scans with its ivk (which
+    //    knows the managed diversifier for its own index — div_seed only).
+    let note = Note {
+        value: 9_999,
+        rkm: addr.rkm_lanes(),
+        rho: [0xa1, 0xa2, 0xa3, 0xa4],
+        rseed: [0xb1, 0xb2, 0xb3, 0xb4],
+    };
+    let mut rng = StdRng::seed_from_u64(4343);
+    let outputs = encrypt_to_recipient(&ek, &[note], &mut rng);
+    let scan_d = wallet.ivk().diversifier_at_index(index);
+    assert_eq!(scan_d, d, "ivk reproduces the managed diversifier for scanning");
+    let found = wallet.ivk().scan(&scan_d, &outputs, ScanMode::FullFo);
+    assert_eq!(found.len(), 1, "note detected at the rotated address");
+    let received = found[0].note;
+    assert_eq!(received, note);
+
+    // 4. SPEND the received note in a balanced 2x2 bucket — the seed-derived key
+    //    at the rotated diversifier must produce a valid nullifier and its cm
+    //    must reconstruct, byte-for-byte, against build_bucket.
+    let fee = 40u64;
+    let input1_value = 4_001u64;
+    let out0 = Note {
+        value: received.value,
+        rkm: wallet.rkm(d),
+        rho: [0xc1, 0xc2, 0xc3, 0xc4],
+        rseed: [0xd1, 0xd2, 0xd3, 0xd4],
+    };
+    let out1_value = received.value + input1_value - out0.value - fee;
+    let outputs_c = [
+        TxOutput { value: out0.value, rkm: out0.rkm, rho: out0.rho, rseed: out0.rseed },
+        TxOutput { value: out1_value, rkm: [2, 4, 6, 8], rho: [1, 3, 5, 7], rseed: [9, 8, 7, 6] },
+    ];
+    let spend0 = wallet.spend_input(received.value, received.rho, received.rseed, d);
+    let input1 =
+        Wallet::from_seed_lanes([3, 5, 7, 9]).spend_input(input1_value, [1; 4], [2; 4], Diversifier::default());
+    let inst = build_bucket(18, &[spend0, input1], &outputs_c, fee);
+
+    assert_eq!(
+        inst.nf[0],
+        wallet.nullifier(&received.rho),
+        "circuit nf[0] == seed-derived wallet nullifier (HD key is spendable)"
+    );
+    assert_eq!(
+        out0.commitment(),
+        inst.cm_out[0],
+        "recomputed output cm == circuit cm_out (packing intact under HD path)"
+    );
+    assert_eq!(
+        received.commitment(),
+        qlab_note::note::note_commitment(received.value, &wallet.rkm(d), &received.rho, &received.rseed),
+        "received note cm reconstructs from the seed-derived rkm(d)"
     );
 }
 

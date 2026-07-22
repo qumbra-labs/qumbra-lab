@@ -17,10 +17,19 @@
 //!   `auditable-privacy.md` §4. Type-level capability split: `Fvk` views spends
 //!   + incoming, `Ivk` views incoming only, NEITHER can spend (only
 //!   [`keys::SpendingKey`] yields the circuit spend witness).
+//! - **HD seed** (`seed`, `mnemonic`): versioned master seed → `sk` via a
+//!   domain-separated Keccak chain (`m / account / role`), plus an optional
+//!   BIP-39-style 24-word backup phrase (Keccak checksum, not BIP-39-portable —
+//!   see the module docs). [`Wallet::from_master_seed`] roots a wallet at an
+//!   account of a seed (issue #43, `docs/hd-seed-and-diversifier-notes.md`).
+//! - **Diversifier management** (`diversifier`): index→`d` PRF, a serializable
+//!   [`diversifier::DiversifierLedger`] with reuse/collision guards, and the
+//!   address-rotation API on [`Wallet`]/[`Fvk`] (issue #43).
 //!
-//! NOT in scope (see `docs/m7-wallet-plan.md`): proving integration, networking,
-//! persistence / HD-seed formats, and disclosure PROOFS (the selective-disclosure
-//! STARK is a future milestone — only the KEY layer lives here).
+//! NOT in scope: proving integration, networking, storage transport (the ledger
+//! and short-address book are persistence FORMATS + interfaces, not I/O), and
+//! disclosure PROOFS (the selective-disclosure STARK is a separate milestone —
+//! see `qlab-disclosure`).
 //!
 //! ## Address unlinkability (issue #32 — closed)
 //!
@@ -64,7 +73,10 @@
 
 pub mod address;
 pub mod bech32m;
+pub mod diversifier;
 pub mod keys;
+pub mod mnemonic;
+pub mod seed;
 pub mod viewing;
 
 pub use viewing::{Fvk, Ivk, Wallet};
