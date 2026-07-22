@@ -141,6 +141,16 @@ impl SpendingKey {
         }
     }
 
+    /// The note commitment `cm = H(value ‖ rkm ‖ ρ ‖ rseed)` that a note
+    /// received at diversifier `d` occupies as a leaf of the commitment tree
+    /// (issue #39). This is what the prover looks up in the live tree to fetch
+    /// the note's membership witness; it is byte-identical to the leaf
+    /// `build_bucket` derives for the matching spend input (regression-locked).
+    pub fn leaf_commitment(&self, value: u64, rho: Lanes, rseed: Lanes, d: [u64; 2]) -> Lanes {
+        let (_, _, cm) = qlab_air::narrow::derive_input(&self.spend_input(value, rho, rseed, d));
+        cm
+    }
+
     /// Raw `sk` lanes — only for callers that already hold the `SpendingKey`
     /// (e.g. seeding the wallet's ML-KEM keypair). Kept crate-visible so the
     /// secret does not leak through the public API by accident.
@@ -284,6 +294,36 @@ mod tests {
         let nf = derive_nf(&nk, &sk);
         assert_ne!(nf, rkm);
         assert_ne!(nf, nk);
+    }
+
+    /// Issue #39: the wallet's `leaf_commitment` is the exact tree leaf
+    /// `build_bucket` derives for the matching spend input — so a witness fetched
+    /// against this leaf resolves to the circuit's anchor. Rebuild the fabricated
+    /// shared tree from the wallet leaves and assert each folds to the bucket's
+    /// anchor.
+    #[test]
+    fn leaf_commitment_matches_build_bucket_leaf() {
+        use qlab_air::narrow::fabricated_shared_tree;
+        let (inputs, _out, _fee, inst) = balanced_bucket();
+        let leaf0 = SpendingKey::from_lanes(inputs[0].sk)
+            .leaf_commitment(inputs[0].value, inputs[0].rho, inputs[0].rseed, inputs[0].d);
+        let leaf1 = SpendingKey::from_lanes(inputs[1].sk)
+            .leaf_commitment(inputs[1].value, inputs[1].rho, inputs[1].rseed, inputs[1].d);
+        // The wallet leaf equals note_commitment (the qlab-note lock) too.
+        assert_eq!(
+            leaf0,
+            note_commitment(
+                inputs[0].value,
+                &SpendingKey::from_lanes(inputs[0].sk).rkm(&inputs[0].d),
+                &inputs[0].rho,
+                &inputs[0].rseed
+            )
+        );
+        // And it is the leaf build_bucket's fabricated tree folds to the anchor.
+        let (witnesses, root) = fabricated_shared_tree(&leaf0, &leaf1);
+        assert_eq!(root, inst.anchor, "fabricated root over wallet leaves == bucket anchor");
+        assert_eq!(witnesses[0].fold_root(&leaf0), inst.anchor);
+        assert_eq!(witnesses[1].fold_root(&leaf1), inst.anchor);
     }
 
     /// The spend witness carries `sk` and the diversifier verbatim into the

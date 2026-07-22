@@ -137,6 +137,14 @@ impl CommitmentTree {
         self.leaves[position as usize]
     }
 
+    /// The leaf position of note commitment `cm`, if present — the lookup the
+    /// prover uses to turn a wallet-derived leaf into an auth-path index
+    /// (issue #39). Returns the FIRST match (commitments are globally unique by
+    /// the ρ-uniqueness rule, so at most one is expected).
+    pub fn position_of(&self, cm: &[u64; 4]) -> Option<u64> {
+        self.leaves.iter().position(|l| l == cm).map(|p| p as u64)
+    }
+
     /// Build the frontier over the first `count` leaves.
     pub fn frontier_at(&self, count: u64) -> Frontier {
         let count = count.min(self.len());
