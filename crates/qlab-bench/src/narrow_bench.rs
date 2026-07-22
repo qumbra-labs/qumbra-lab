@@ -277,6 +277,7 @@ pub(crate) fn run_bucket(power: &str, only: Option<&str>) {
         value,
         rho: [rnd(), rnd(), rnd(), rnd()],
         rseed: [rnd(), rnd(), rnd(), rnd()],
+        d: [0, 0], // default diversifier (issue #32; keeps rnd stream stable)
     };
     let mk_out = |value: u64, rnd: &mut dyn FnMut() -> u64| TxOutput {
         value,

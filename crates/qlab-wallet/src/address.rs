@@ -4,9 +4,9 @@
 //!
 //! | field | bytes | role |
 //! |---|---|---|
-//! | version | 1 | format version (evolves when diversified-rkm lands) |
-//! | diversifier `d` | 16 | selects the per-address ML-KEM keypair |
-//! | `rkm` | 32 | recipient key material bound into the note commitment |
+//! | version | 1 | format version |
+//! | diversifier `d` | 16 | selects both the per-address ML-KEM keypair AND `rkm` |
+//! | `rkm` | 32 | recipient key material `H(nk ‖ D_R ‖ d)` — now `d`-dependent |
 //! | ML-KEM-768 ek | 1184 | note-encryption public key |
 //!
 //! Raw size = **1233 B ≈ 1.2 KB** (see [`Address::RAW_LEN`]) — dominated by the
@@ -14,12 +14,17 @@
 //! Encoded with **bech32m** (see [`crate::bech32m`]): versioned HRP + BCH
 //! checksum. The encoded string is ~2 KB — hence the short-address layer.
 //!
-//! ## Diversification caveat
+//! ## Diversification (issue #32)
 //!
-//! Per the coordinator-confirmed Option 1, the diversifier `d` varies ONLY the
-//! ML-KEM keypair; `rkm` is the shared circuit-bound `H(nk ‖ D_R)`. A wallet's
-//! addresses therefore share `rkm` and are linkable via it — full unlinkability
-//! needs a circuit change (`rkm = H(nk ‖ D_R ‖ d)`; see the plan doc / PR).
+//! The diversifier `d` now varies BOTH the ML-KEM keypair AND the recipient key
+//! material `rkm = H(nk ‖ D_R ‖ d)` (the circuit absorbs `d`, `qlab-air`). A
+//! wallet's addresses therefore carry DISTINCT `rkm` and are mutually
+//! unlinkable — the linkability limitation M7 flagged is closed.
+//!
+//! The byte layout is unchanged (same 32-B `rkm` slot). The format version is
+//! left at `1`; whether the semantic change (old shared-`rkm` v1 addresses are
+//! not interoperable with new `d`-dependent ones) warrants a version bump is an
+//! interop decision left to the coordinator — see the PR handoff note.
 
 use std::collections::HashMap;
 
@@ -28,7 +33,9 @@ use qlab_note::kem::{ek_from_bytes, ek_to_bytes, Ek, EK_LEN};
 
 use crate::keys::Lanes;
 
-/// Current raw-address format version.
+/// Current raw-address format version. Left at `1` through issue #32 (the
+/// byte layout is unchanged); a bump to mark the `d`-dependent-`rkm` semantic
+/// change is a coordinator interop call (see the module docs / PR handoff).
 pub const ADDRESS_VERSION: u8 = 1;
 /// Diversifier width in bytes (128-bit; ample headroom over Sapling's 88-bit).
 pub const DIV_LEN: usize = 16;
@@ -55,6 +62,18 @@ impl Diversifier {
     }
     pub fn as_bytes(&self) -> &[u8; DIV_LEN] {
         &self.0
+    }
+
+    /// The diversifier as the two little-endian 64-bit words the circuit
+    /// absorbs into `rkm = H(nk ‖ D_R ‖ d)` (issue #32). This is the single
+    /// canonical bytes↔lanes convention shared by address generation and the
+    /// spend witness, so a note is spendable at exactly the address it was sent
+    /// to.
+    pub fn lanes(&self) -> [u64; 2] {
+        [
+            u64::from_le_bytes(self.0[..8].try_into().unwrap()),
+            u64::from_le_bytes(self.0[8..].try_into().unwrap()),
+        ]
     }
 }
 

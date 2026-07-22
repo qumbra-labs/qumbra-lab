@@ -16,9 +16,17 @@
 //! exactly. (The wallet-only KDFs — ML-KEM seeds, short-address — use ASCII
 //! domain strings à la `qlab-note`; they live in `address`/`viewing`.)
 //!
-//! - `nk  = H(sk ‖ D_N)`  — msg lanes 0..3 = sk, marker `1<<0` at lane 4.
-//! - `rkm = H(nk ‖ D_R)`  — msg lanes 0..3 = nk, marker `1<<1` at lane 4.
-//! - `nf  = H(nk ‖ ρ)`    — msg lanes 0..3 = nk, 4..7 = ρ (512-bit message).
+//! - `nk  = H(sk ‖ D_N)`      — msg lanes 0..3 = sk, marker `1<<0` at lane 4.
+//! - `rkm = H(nk ‖ D_R ‖ d)`  — msg lanes 0..3 = nk, marker `1<<1` at lane 4,
+//!   the 128-bit diversifier `d` at lanes 5..7 (issue #32). Two addresses of one
+//!   wallet differ in `d`, hence in `rkm`, hence are unlinkable.
+//! - `nf  = H(nk ‖ ρ)`        — msg lanes 0..3 = nk, 4..7 = ρ (512-bit message).
+//!
+//! Because `rkm` binds `nk` DIRECTLY, anyone able to derive `rkm(d)` can also
+//! derive `nf = H(nk ‖ ρ)` — so only the spend key / full viewing key (which
+//! hold `nk`) can produce addresses; an incoming viewing key cannot (see
+//! `viewing`). The diversifier maps to two little-endian circuit words via
+//! [`crate::address::Diversifier::lanes`].
 
 use qlab_air::reference::keccak_f;
 
@@ -30,7 +38,7 @@ pub type Lanes = [u64; 4];
 /// `narrow.rs:938` (`nk_in[4] = 1`).
 pub const D_N_MARKER: u64 = 1 << 0;
 /// `rkm` domain marker: bit `z1` set at lane 4 (value `1<<1`). Matches
-/// `narrow.rs:952` (`rkm_in[4] = 1 << 1`).
+/// `build_bucket`'s `rkm_in[4] = 1 << 1`.
 pub const D_R_MARKER: u64 = 1 << 1;
 
 /// `nk = H(sk ‖ D_N)`. State: `st[0..4]=sk`, `st[4]=1<<0` (domain N), then
@@ -46,16 +54,20 @@ pub fn derive_nk(sk: &Lanes) -> Lanes {
     d[..4].try_into().expect("state has >= 4 lanes")
 }
 
-/// `rkm = H(nk ‖ D_R)`. State: `st[0..4]=nk`, `st[4]=1<<1` (domain R), same
-/// pad. Byte-identical to `build_bucket`'s `rkm_in` packing (narrow.rs:950-955).
-pub fn derive_rkm(nk: &Lanes) -> Lanes {
+/// `rkm = H(nk ‖ D_R ‖ d)`. State: `st[0..4]=nk`, `st[4]=1<<1` (domain R),
+/// `st[5..7]=d` (the 128-bit diversifier, two little-endian words), then
+/// pad10*1 from lane 7 (bit 448). Byte-identical to `build_bucket`'s `rkm_in`
+/// packing after issue #32.
+pub fn derive_rkm(nk: &Lanes, d: &[u64; 2]) -> Lanes {
     let mut st = [0u64; 25];
     st[..4].copy_from_slice(nk);
     st[4] = D_R_MARKER;
-    st[5] = 1;
+    st[5] = d[0];
+    st[6] = d[1];
+    st[7] = 1;
     st[16] = 1 << 63;
-    let d = keccak_f(&st);
-    d[..4].try_into().expect("state has >= 4 lanes")
+    let digest = keccak_f(&st);
+    digest[..4].try_into().expect("state has >= 4 lanes")
 }
 
 /// `nf = H(nk ‖ ρ)`. State: `st[0..4]=nk`, `st[4..8]=ρ`, pad10*1 at bit 512
@@ -92,10 +104,12 @@ impl SpendingKey {
         derive_nk(&self.sk)
     }
 
-    /// The recipient key material `rkm = H(nk ‖ D_R)` bound into every note's
-    /// commitment for this wallet.
-    pub fn rkm(&self) -> Lanes {
-        derive_rkm(&self.nk())
+    /// The recipient key material `rkm = H(nk ‖ D_R ‖ d)` bound into the
+    /// commitment of a note received at diversifier `d`. Per-address (issue
+    /// #32): distinct `d` ⇒ distinct `rkm`, so this wallet's addresses are
+    /// mutually unlinkable.
+    pub fn rkm(&self, d: &[u64; 2]) -> Lanes {
+        derive_rkm(&self.nk(), d)
     }
 
     /// The nullifier `nf = H(nk ‖ ρ)` for a note with uniqueness seed `ρ`.
@@ -107,12 +121,23 @@ impl SpendingKey {
     /// CAPABILITY. Only `SpendingKey` exposes this; a `Fvk`/`Ivk` holder has no
     /// `sk` and no path to a `TxInput`, so it cannot author a spend. (Proving
     /// the witness is out of scope; this is the key-layer boundary.)
-    pub fn spend_input(&self, value: u64, rho: Lanes, rseed: Lanes) -> qlab_air::narrow::TxInput {
+    ///
+    /// `d` is the diversifier of the address the spent note was received at; the
+    /// circuit re-derives `rkm = H(nk ‖ D_R ‖ d)` from it, so it MUST match the
+    /// diversifier whose `rkm` is baked into the note's commitment (issue #32).
+    pub fn spend_input(
+        &self,
+        value: u64,
+        rho: Lanes,
+        rseed: Lanes,
+        d: [u64; 2],
+    ) -> qlab_air::narrow::TxInput {
         qlab_air::narrow::TxInput {
             sk: self.sk,
             value,
             rho,
             rseed,
+            d,
         }
     }
 
@@ -145,18 +170,21 @@ mod tests {
         let rho1: Lanes = [55, 66, 77, 88];
         let rseed0: Lanes = [101, 102, 103, 104];
         let rseed1: Lanes = [201, 202, 203, 204];
+        // Distinct, nonzero diversifiers so the locks exercise the d-absorb.
+        let d0: [u64; 2] = [0x1111_2222, 0x3333_4444];
+        let d1: [u64; 2] = [0x5555_6666, 0x7777_8888];
         let fee = 7u64;
-        // Outputs: give output rkm the wallet-derived rkm of sk0 (exercises the
-        // output cm path with a real recipient key material too).
-        let out_rkm = SpendingKey::from_lanes(sk0).rkm();
+        // Outputs: give output rkm the wallet-derived rkm of sk0 at d0 (exercises
+        // the output cm path with a real, diversifier-dependent recipient key).
+        let out_rkm = SpendingKey::from_lanes(sk0).rkm(&d0);
         let outputs = [
             TxOutput { value: 300, rkm: out_rkm, rho: [9; 4], rseed: [8; 4] },
             TxOutput { value: 400, rkm: [7; 4], rho: [6; 4], rseed: [5; 4] },
         ];
         let total_out = 300 + 400 + fee;
         let inputs = [
-            TxInput { sk: sk0, value: total_out - 250, rho: rho0, rseed: rseed0 },
-            TxInput { sk: sk1, value: 250, rho: rho1, rseed: rseed1 },
+            TxInput { sk: sk0, value: total_out - 250, rho: rho0, rseed: rseed0, d: d0 },
+            TxInput { sk: sk1, value: 250, rho: rho1, rseed: rseed1, d: d1 },
         ];
         let inst = build_bucket(18, &inputs, &outputs, fee);
         (inputs, outputs, fee, inst)
@@ -181,19 +209,19 @@ mod tests {
 
     /// LOCK 2 (rkm path, external via anchor): rebuild the shared Merkle tree
     /// from wallet-derived input commitments (`cm = H(value ‖ rkm ‖ ρ ‖ rseed)`,
-    /// `rkm = H(nk ‖ D_R)`) using the SAME sibling schedule as `build_bucket`,
+    /// `rkm = H(nk ‖ D_R ‖ d)`) using the SAME sibling schedule as `build_bucket`,
     /// and assert the root equals the circuit's public `anchor`. The anchor
-    /// depends on the input cm -> rkm -> nk, so this locks the rkm derivation to
-    /// qlab-air. (Mirrors `build_bucket`'s tree; if that tree changes, this test
-    /// intentionally breaks to force re-verification.)
+    /// depends on the input cm -> rkm -> (nk, d), so this locks the diversifier-
+    /// dependent rkm derivation to qlab-air. (Mirrors `build_bucket`'s tree; if
+    /// that tree changes, this test intentionally breaks to force re-verification.)
     #[test]
     fn rkm_path_locked_via_anchor() {
         use qlab_air::narrow::MERKLE_DEPTH;
         let (inputs, _out, _fee, inst) = balanced_bucket();
 
-        // Wallet-derived input commitments (this is the rkm-dependent value).
+        // Wallet-derived input commitments: rkm depends on THIS input's d.
         let cm = |inp: &TxInput| {
-            let rkm = SpendingKey::from_lanes(inp.sk).rkm();
+            let rkm = SpendingKey::from_lanes(inp.sk).rkm(&inp.d);
             note_commitment(inp.value, &rkm, &inp.rho, &inp.rseed)
         };
         let cm0 = cm(&inputs[0]);
@@ -220,43 +248,53 @@ mod tests {
     }
 
     /// LOCK 3 (rkm packing, belt-and-suspenders): a byte-identical replication
-    /// of `narrow.rs:950-955`'s `rkm_in` packing must equal `derive_rkm`. Catches
-    /// a transcription slip in this crate even independently of the anchor lock.
+    /// of `build_bucket`'s `rkm_in` packing (diversifier at lanes 5..7, pad at
+    /// lane 7 — issue #32) must equal `derive_rkm`. Catches a transcription slip
+    /// in this crate even independently of the anchor lock.
     #[test]
     fn rkm_packing_byte_identical() {
         let nk: Lanes = [0x1111, 0x2222, 0x3333, 0x4444];
+        let d: [u64; 2] = [0xaaaa_bbbb, 0xcccc_dddd];
         let mut rkm_in = [0u64; 25];
         rkm_in[..4].copy_from_slice(&nk);
-        rkm_in[4] = 1 << 1; // domain R (z1) — literal, as in narrow.rs
-        rkm_in[5] = 1;
+        rkm_in[4] = 1 << 1; // domain R (z1) — literal, as in build_bucket
+        rkm_in[5] = d[0];
+        rkm_in[6] = d[1];
+        rkm_in[7] = 1; // pad10*1 moved to bit 448
         rkm_in[16] = 1 << 63;
         let expected: Lanes = keccak_f(&rkm_in)[..4].try_into().unwrap();
-        assert_eq!(derive_rkm(&nk), expected);
+        assert_eq!(derive_rkm(&nk, &d), expected);
     }
 
-    /// Determinism + domain non-collision of the three derivations.
+    /// Determinism, domain non-collision, and diversifier dependence.
     #[test]
     fn derivations_deterministic_and_separated() {
         let sk: Lanes = [5, 6, 7, 8];
+        let d: [u64; 2] = [42, 99];
         let nk = derive_nk(&sk);
         assert_eq!(derive_nk(&sk), nk, "nk deterministic");
-        let rkm = derive_rkm(&nk);
-        assert_eq!(derive_rkm(&nk), rkm, "rkm deterministic");
-        // nk and rkm differ only by the lane-4 marker; outputs must differ.
+        let rkm = derive_rkm(&nk, &d);
+        assert_eq!(derive_rkm(&nk, &d), rkm, "rkm deterministic");
+        // nk and rkm must differ (domain marker + diversifier).
         assert_ne!(nk, rkm, "nk and rkm must be domain-separated");
+        // Distinct diversifiers must give distinct rkm (issue #32 unlinkability).
+        assert_ne!(derive_rkm(&nk, &[0, 0]), derive_rkm(&nk, &d), "rkm must depend on d");
+        assert_ne!(derive_rkm(&nk, &[1, 0]), derive_rkm(&nk, &[0, 1]), "each d word matters");
         // nf over rho=nk-lanes must not collide with rkm (different pad length).
         let nf = derive_nf(&nk, &sk);
         assert_ne!(nf, rkm);
         assert_ne!(nf, nk);
     }
 
-    /// The spend witness carries `sk` verbatim into the circuit's `TxInput`.
+    /// The spend witness carries `sk` and the diversifier verbatim into the
+    /// circuit's `TxInput`.
     #[test]
     fn spend_input_carries_sk() {
         let sk: Lanes = [9, 10, 11, 12];
         let w = SpendingKey::from_lanes(sk);
-        let inp = w.spend_input(42, [1; 4], [2; 4]);
+        let inp = w.spend_input(42, [1; 4], [2; 4], [7, 8]);
         assert_eq!(inp.sk, sk);
         assert_eq!(inp.value, 42);
+        assert_eq!(inp.d, [7, 8], "diversifier flows into the spend witness");
     }
 }

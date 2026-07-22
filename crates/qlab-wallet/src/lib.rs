@@ -10,7 +10,8 @@
 //!   spendable, so any drift is caught by regression locks against
 //!   `build_bucket`'s public outputs.
 //! - **Addresses** (`address`): diversified address = `(diversifier, rkm,
-//!   ML-KEM-768 ek)`, bech32m-class versioned+checksummed encoding, plus a
+//!   ML-KEM-768 ek)` where `rkm = H(nk ‖ D_R ‖ d)` is now diversifier-dependent
+//!   (issue #32), bech32m-class versioned+checksummed encoding, plus a
 //!   short-address hash-commitment indirection (format only, no network).
 //! - **Disclosure hooks** (`viewing`): `Fvk`/`Ivk` — the standing layer of
 //!   `auditable-privacy.md` §4. Type-level capability split: `Fvk` views spends
@@ -21,13 +22,15 @@
 //! persistence / HD-seed formats, and disclosure PROOFS (the selective-disclosure
 //! STARK is a future milestone — only the KEY layer lives here).
 //!
-//! ## Diversification caveat (reported spec gap, coordinator-confirmed)
+//! ## Address unlinkability (issue #32 — closed)
 //!
-//! The circuit binds a single `rkm = H(nk ‖ D_R)` with no diversifier input, so
-//! the diversifier here varies only the ML-KEM keypair — a wallet's addresses
-//! share `rkm` and are LINKABLE via it. Full unlinkability requires the circuit
-//! to bind `rkm = H(nk ‖ D_R ‖ d)` (a `qlab-air` change; proposed in the plan
-//! doc / PR, out of M7 scope).
+//! The circuit now binds `rkm = H(nk ‖ D_R ‖ d)` (`qlab-air`), so a wallet's
+//! diversified addresses carry DISTINCT `rkm` and are mutually unlinkable — the
+//! shared-`rkm` linkability M7 flagged is gone. Because `rkm` binds `nk`
+//! directly, `rkm`-derivation and address GENERATION are full-viewing-key
+//! capabilities (an `Ivk` can no longer self-generate addresses; it retains
+//! detect+decrypt, which recompute `cm` from the decrypted note). See
+//! [`viewing`].
 //!
 //! ## Type-level spend separation
 //!
@@ -37,15 +40,26 @@
 //! ```compile_fail
 //! let w = qlab_wallet::Wallet::from_seed_lanes([1, 2, 3, 4]);
 //! let fvk = w.fvk();
-//! let _ = fvk.spend_input(100, [0; 4], [0; 4]); // no such method on Fvk
+//! let d = qlab_wallet::address::Diversifier::default();
+//! let _ = fvk.spend_input(100, [0; 4], [0; 4], d); // no such method on Fvk
 //! ```
 //!
-//! An `Ivk` cannot even view spends — it has no `nullifier` method:
+//! An `Ivk` cannot view spends — it has no `nullifier` method:
 //!
 //! ```compile_fail
 //! let w = qlab_wallet::Wallet::from_seed_lanes([1, 2, 3, 4]);
 //! let ivk = w.ivk();
 //! let _ = ivk.nullifier(&[0u64; 4]); // no such method on Ivk
+//! ```
+//!
+//! And since issue #32 an `Ivk` cannot derive `rkm` / generate addresses — it
+//! lacks `nk`, so neither method exists on it:
+//!
+//! ```compile_fail
+//! let w = qlab_wallet::Wallet::from_seed_lanes([1, 2, 3, 4]);
+//! let ivk = w.ivk();
+//! let d = qlab_wallet::address::Diversifier::default();
+//! let _ = ivk.address(d); // no such method on Ivk (needs nk to derive rkm(d))
 //! ```
 
 pub mod address;

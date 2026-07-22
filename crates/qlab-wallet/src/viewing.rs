@@ -8,15 +8,28 @@
 //! | Type | Holds | Can | Cannot |
 //! |---|---|---|---|
 //! | [`Wallet`] / `SpendingKey` | `sk` | everything, incl. produce a spend witness | — |
-//! | [`Fvk`] | `nk`, `div_seed` | derive `rkm`; **view spends** (`nf`); detect+decrypt incoming | spend |
-//! | [`Ivk`] | `rkm`, `div_seed` | detect+decrypt incoming; recompute `cm` | compute `nf`; spend |
+//! | [`Fvk`] | `nk`, `div_seed` | derive `rkm(d)`; **generate addresses**; **view spends** (`nf`); detect+decrypt incoming | spend |
+//! | [`Ivk`] | `div_seed` | detect+decrypt incoming; recompute `cm` (from the decrypted note) | derive `rkm`; generate addresses; compute `nf`; spend |
 //!
-//! `Fvk::to_ivk` is a one-way downgrade (derives `rkm` from `nk`, drops `nk`);
-//! preimage resistance means an `Ivk` cannot recover `nk`, so it cannot view
-//! spends. The ML-KEM keypair for a diversifier `d` is derived deterministically
-//! from `div_seed` (carried by both keys), so both can regenerate any `dk_d` to
-//! scan. `div_seed` and the keypair seed use ASCII domain strings (wallet-only
-//! KDFs — the circuit-bound `nk`/`rkm`/`nf` derivations live in `keys`).
+//! `Fvk::to_ivk` is a one-way downgrade (drops `nk`); preimage resistance means
+//! an `Ivk` cannot recover `nk`, so it cannot view spends.
+//!
+//! **Issue #32 capability consequence.** `rkm = H(nk ‖ D_R ‖ d)` now binds `nk`
+//! DIRECTLY. Anything able to derive `rkm(d)` therefore also holds enough to
+//! derive `nf = H(nk ‖ ρ)` — so `rkm`-derivation (and thus diversified-address
+//! GENERATION) is a full-viewing-key capability, not an incoming-viewing-key
+//! one. Under the old shared `rkm = H(nk ‖ D_R)` the `Ivk` could carry the one
+//! `rkm` and self-generate addresses; it no longer can. This is a strict, safe
+//! narrowing: the `Ivk` keeps exactly what it needs — scanning recomputes `cm`
+//! from the DECRYPTED note's `rkm`, never from the key (see `qlab-note::scan`),
+//! so detection/decryption are unaffected. The wallet owner (`Fvk`) generates
+//! diversified addresses and hands the full address to an `Ivk` holder (e.g. an
+//! exchange), which scans them.
+//!
+//! The ML-KEM keypair for a diversifier `d` is derived deterministically from
+//! `div_seed` (carried by both keys), so both can regenerate any `dk_d` to scan.
+//! `div_seed` and the keypair seed use ASCII domain strings (wallet-only KDFs —
+//! the circuit-bound `nk`/`rkm`/`nf` derivations live in `keys`).
 
 use qlab_note::hash::{digest_bytes, keccak256};
 use qlab_note::kem::{ek_to_bytes, generate_keypair, Keypair};
@@ -62,9 +75,10 @@ pub struct Fvk {
 }
 
 impl Fvk {
-    /// The recipient key material `rkm = H(nk ‖ D_R)`.
-    pub fn rkm(&self) -> Lanes {
-        derive_rkm(&self.nk)
+    /// The recipient key material `rkm = H(nk ‖ D_R ‖ d)` for diversifier `d`
+    /// (issue #32: per-address, so this wallet's addresses are unlinkable).
+    pub fn rkm(&self, d: Diversifier) -> Lanes {
+        derive_rkm(&self.nk, &d.lanes())
     }
 
     /// **View spends:** the nullifier `nf = H(nk ‖ ρ)` for a note seed `ρ`.
@@ -73,19 +87,20 @@ impl Fvk {
         derive_nf(&self.nk, rho)
     }
 
-    /// Downgrade to an incoming viewing key (one-way: `rkm` is derived, `nk`
-    /// dropped — an `Ivk` cannot recover `nk` and so cannot view spends).
+    /// Downgrade to an incoming viewing key (one-way: `nk` is dropped — an `Ivk`
+    /// cannot recover `nk`, so it can neither view spends nor, since issue #32,
+    /// derive `rkm(d)`; it retains only detect+decrypt).
     pub fn to_ivk(&self) -> Ivk {
         Ivk {
-            rkm: self.rkm(),
             div_seed: self.div_seed,
         }
     }
 
-    /// The diversified address for diversifier `d`.
+    /// The diversified address for diversifier `d`. Generating it needs `rkm(d)`
+    /// and hence `nk` — a full-viewing-key capability (issue #32).
     pub fn address(&self, d: Diversifier) -> Address {
         let kp = diversified_keypair(&self.div_seed, &d);
-        Address::new(d, self.rkm(), &kp.ek)
+        Address::new(d, self.rkm(d), &kp.ek)
     }
 
     /// Detect + decrypt incoming notes at diversifier `d`.
@@ -97,33 +112,28 @@ impl Fvk {
 
 /// Incoming viewing key — the standing hook handed to e.g. an exchange to credit
 /// deposits. Detects + decrypts incoming notes; cannot view spends, cannot spend.
+///
+/// Since issue #32 it holds ONLY `div_seed`: `rkm = H(nk ‖ D_R ‖ d)` binds `nk`,
+/// so `rkm`-derivation and address GENERATION are full-viewing-key capabilities.
+/// Scanning is unaffected — it recomputes `cm` from the decrypted note's `rkm`,
+/// not from the key (see [`qlab_note::scan`]).
 #[derive(Clone)]
 pub struct Ivk {
-    rkm: Lanes,
     div_seed: [u8; 32],
 }
 
 impl Ivk {
-    /// The recipient key material `rkm` (for recomputing note commitments).
-    pub fn rkm(&self) -> Lanes {
-        self.rkm
-    }
-
-    /// The diversified address for diversifier `d`.
-    pub fn address(&self, d: Diversifier) -> Address {
-        let kp = diversified_keypair(&self.div_seed, &d);
-        Address::new(d, self.rkm, &kp.ek)
-    }
-
-    /// Detect + decrypt incoming notes at diversifier `d`.
+    /// Detect + decrypt incoming notes at diversifier `d` (the ML-KEM keypair
+    /// `dk_d` is regenerated from `div_seed`).
     pub fn scan(&self, d: &Diversifier, outputs: &EncryptedOutputs, mode: ScanMode) -> Vec<DetectedNote> {
         let kp = diversified_keypair(&self.div_seed, d);
         scan(&kp.dk, outputs, mode)
     }
 
-    // NOTE: there is deliberately NO `nullifier(...)` and NO `spend_input(...)`
-    // on `Ivk` — it holds neither `nk` nor `sk`. That absence IS the type-level
-    // capability boundary (see the crate-level compile_fail doc-tests).
+    // NOTE: there is deliberately NO `nullifier(...)`, NO `spend_input(...)`, and
+    // (since issue #32) NO `rkm(...)`/`address(...)` on `Ivk` — it holds neither
+    // `nk` nor `sk`. That absence IS the type-level capability boundary (see the
+    // crate-level compile_fail doc-tests).
 }
 
 /// A Qumbra wallet — the root of the key hierarchy. Owns the [`SpendingKey`] and
@@ -153,9 +163,10 @@ impl Wallet {
         self.sk.nk()
     }
 
-    /// The recipient key material `rkm`.
-    pub fn rkm(&self) -> Lanes {
-        self.sk.rkm()
+    /// The recipient key material `rkm = H(nk ‖ D_R ‖ d)` for diversifier `d`
+    /// (issue #32: per-address).
+    pub fn rkm(&self, d: Diversifier) -> Lanes {
+        self.sk.rkm(&d.lanes())
     }
 
     /// The full viewing key (compliance hook: sees everything, cannot spend).
@@ -180,7 +191,7 @@ impl Wallet {
     /// The wallet's diversified address for diversifier `d`.
     pub fn address(&self, d: Diversifier) -> Address {
         let kp = self.diversified_keypair(&d);
-        Address::new(d, self.rkm(), &kp.ek)
+        Address::new(d, self.rkm(d), &kp.ek)
     }
 
     /// The nullifier `nf = H(nk ‖ ρ)` (the wallet can also view its own spends).
@@ -188,10 +199,18 @@ impl Wallet {
         self.sk.nullifier(rho)
     }
 
-    /// **Spend capability:** produce the circuit spend witness for a note. This
-    /// method exists ONLY here and on `SpendingKey`; `Fvk`/`Ivk` cannot.
-    pub fn spend_input(&self, value: u64, rho: Lanes, rseed: Lanes) -> qlab_air::narrow::TxInput {
-        self.sk.spend_input(value, rho, rseed)
+    /// **Spend capability:** produce the circuit spend witness for a note
+    /// received at diversifier `d` (the circuit re-derives `rkm(d)`, so `d` must
+    /// be the note's address diversifier — issue #32). This method exists ONLY
+    /// here and on `SpendingKey`; `Fvk`/`Ivk` cannot.
+    pub fn spend_input(
+        &self,
+        value: u64,
+        rho: Lanes,
+        rseed: Lanes,
+        d: Diversifier,
+    ) -> qlab_air::narrow::TxInput {
+        self.sk.spend_input(value, rho, rseed, d.lanes())
     }
 
     /// The serialized ek for diversifier `d` (convenience for tests/tools).
@@ -216,25 +235,42 @@ mod tests {
     }
 
     #[test]
-    fn fvk_to_ivk_downgrade_consistent() {
+    fn fvk_derives_rkm_matching_wallet() {
         let w = Wallet::from_seed_lanes(SK);
         let fvk = w.fvk();
-        let ivk = fvk.to_ivk();
-        // rkm agrees across wallet / fvk / ivk (the downgrade preserves it).
-        assert_eq!(fvk.rkm(), w.rkm());
-        assert_eq!(ivk.rkm(), w.rkm());
-        assert_eq!(w.ivk().rkm(), w.rkm());
+        // The fvk derives the SAME per-diversifier rkm the wallet does (it holds
+        // nk); the downgrade to ivk drops that capability (issue #32).
+        for d in [Diversifier::default(), Diversifier::from_bytes([3u8; 16])] {
+            assert_eq!(fvk.rkm(d), w.rkm(d), "fvk rkm(d) == wallet rkm(d)");
+        }
     }
 
     #[test]
-    fn fvk_and_ivk_produce_the_same_address() {
+    fn fvk_and_wallet_produce_the_same_address() {
+        // The wallet and its full viewing key produce byte-identical addresses;
+        // the ivk can no longer self-generate one (it lacks nk to derive rkm(d),
+        // issue #32) — it is handed the full address to scan.
         let w = Wallet::from_seed_lanes(SK);
         let d = Diversifier::from_bytes([3u8; 16]);
         let a_wallet = w.address(d).to_raw_bytes();
         let a_fvk = w.fvk().address(d).to_raw_bytes();
-        let a_ivk = w.ivk().address(d).to_raw_bytes();
         assert_eq!(a_wallet, a_fvk, "fvk address == wallet address");
-        assert_eq!(a_fvk, a_ivk, "ivk address == fvk address");
+    }
+
+    #[test]
+    fn addresses_of_one_wallet_are_unlinkable() {
+        // Issue #32 core guarantee at the key layer: two diversified addresses
+        // of ONE wallet carry DISTINCT rkm (the linkability M7 flagged is gone),
+        // while sharing the same underlying nk.
+        let w = Wallet::from_seed_lanes(SK);
+        let d0 = Diversifier::from_bytes([0u8; 16]);
+        let d1 = Diversifier::from_bytes([1u8; 16]);
+        assert_ne!(w.rkm(d0), w.rkm(d1), "distinct diversifiers -> distinct rkm");
+        assert_ne!(
+            w.address(d0).rkm_lanes(),
+            w.address(d1).rkm_lanes(),
+            "the two addresses carry distinct rkm on the wire"
+        );
     }
 
     #[test]
@@ -253,8 +289,9 @@ mod tests {
     fn different_wallets_have_different_keys() {
         let w1 = Wallet::from_seed_lanes(SK);
         let w2 = Wallet::from_seed_lanes([1, 1, 1, 1]);
+        let d = Diversifier::default();
         assert_ne!(w1.nk(), w2.nk());
-        assert_ne!(w1.rkm(), w2.rkm());
+        assert_ne!(w1.rkm(d), w2.rkm(d));
         assert_ne!(w1.fvk().div_seed, w2.fvk().div_seed);
     }
 }

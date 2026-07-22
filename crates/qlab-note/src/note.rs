@@ -141,12 +141,14 @@ mod tests {
                 value: total_out - 50,
                 rho: [5, 6, 7, 8],
                 rseed: [9, 10, 11, 12],
+                d: [0, 0],
             },
             TxInput {
                 sk: [13, 14, 15, 16],
                 value: 50,
                 rho: [17, 18, 19, 20],
                 rseed: [21, 22, 23, 24],
+                d: [0, 0],
             },
         ];
         let outputs = [
