@@ -33,8 +33,12 @@
 //! objects carry no serde, and neither does this crate, by design.
 
 pub mod codec;
+pub mod gossip;
 pub mod n1;
+pub mod peer;
+pub mod transport;
 pub mod varint;
 pub mod wire;
 
+pub use peer::PeerId;
 pub use wire::{Envelope, FrameHeader, MsgType, WireError, MAGIC, MAX_PAYLOAD, PROTOCOL_VERSION};
