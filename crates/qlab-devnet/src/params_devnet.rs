@@ -133,13 +133,22 @@ pub const MAX_ANCHOR_AGE_BLOCKS: u64 = 24 * 3600 / 75;
 
 // ─── Fees (棒 4) ─────────────────────────────────────────────────────────────
 
-/// Marginal fee per logical action (native-token units), ZIP-317-shape posted
-/// price (consensus §8). PLACEHOLDER — the fee-tier values are explicitly open
-/// (consensus §8 → consensus-parameters appendix). Single native fee asset.
-pub const FEE_MARGINAL_UNITS: u64 = 5_000;
+/// Marginal fee per logical action, in **bessel** (1 QMB = 10⁸ bessel, frozen
+/// §8), ZIP-317-shape posted price (consensus §8).
+///
+/// **CONVERGED to the FROZEN §5 fee table (consensus-parameters, decided
+/// 2026-07-22; wired 2026-07-23, M9-N4).** With `FEE_GRACE_ACTIONS = 2`,
+/// `posted_fee = marginal × max(2, logical_actions)` yields the frozen absolutes
+/// exactly: 2×2 → 0.01 QMB (10⁶), 4×4 → 0.02 QMB (2×10⁶), 8×8 → 0.04 QMB
+/// (4×10⁶) — the ratio 1/2/4 is unchanged from the M6 placeholder; only the
+/// absolute scale was pinned to §5. (CLAUDE.md: "params_devnet placeholders
+/// should converge to [the frozen table]" — same act as the anchor-window fix on
+/// PR #45.) The fee is a deterministic public function of the bucket, single
+/// native fee asset; the frozen table is a versioned consensus parameter.
+pub const FEE_MARGINAL_UNITS: u64 = 500_000;
 
 /// Grace action count: fee = marginal × max(grace, logical_actions), ZIP-317's
-/// `max(2, logical_actions)`. PLACEHOLDER.
+/// `max(2, logical_actions)` (frozen §5 shape).
 pub const FEE_GRACE_ACTIONS: u32 = 2;
 
 // ─── Block-weight anti-spam governor (issue #42) ─────────────────────────────
