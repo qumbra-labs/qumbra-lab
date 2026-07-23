@@ -16,6 +16,12 @@ publish.workspace = true
 # Keccak-256 sponge is built on qlab-air's reference::keccak_f — never forked.
 qlab-air = { path = "../qlab-air" }
 
+# The real CPU-friendly PoW primitive (RandomX) + the LWMA-120 retarget and the
+# key-block rotation schedule (M9-N3). The `PowEngine` adapter (`pow::RandomXPow`)
+# and the difficulty wiring (`validation`) live here; qlab-pow is the reusable,
+# dependency-light primitives crate underneath.
+qlab-pow = { path = "../qlab-pow" }
+
 # ML-DSA-65 finality-committee checkpoint votes (consensus §5). RustCrypto,
 # pure-Rust, FIPS-204-final, ACVP/Wycheproof KATs; UNAUDITED (self-declared),
 # production alternative = libcrux-ml-dsa (Cryspen). Pinned >=0.1.1 (never rc):

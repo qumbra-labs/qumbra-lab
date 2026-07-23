@@ -13,23 +13,43 @@
 //! This is the ONE place placeholder constants live. Never scatter magic numbers
 //! through the code; add them here with a note pointing at the open question.
 
-// ─── PoW / block production (棒 0–1) ────────────────────────────────────────
+// ─── PoW / block production (棒 0–1; real RandomX + LWMA-120 @ M9-N3) ─────────
+//
+// The PoW algorithm is now DECIDED in prototype form: real RandomX
+// (`pow::RandomXPow` over `qlab-pow`) with an LWMA-120 retarget. The **block time
+// (75 s) is FROZEN** (consensus-parameters §2). The retarget *algorithm*
+// parameters (LWMA window, key-block cadence) are **testnet-tunable and NOT
+// frozen** — protocol-spec §10 freezes them at v1.1 with full M8. Monero/Zawy
+// provenance is quoted; these are prototype choices, not Qumbra proposals.
 
 /// Genesis difficulty. PLACEHOLDER — chosen low so the sim mines quickly; the
 /// real launch difficulty is an open tokenomics/consensus question.
 pub const GENESIS_DIFFICULTY: u64 = 1_000;
 
-/// The **real** decided block time is **60–75 s** (consensus-and-network.md §7,
-/// Zcash ZIP-208 precedent). The devnet does NOT simulate at wall-clock scale;
-/// it uses an accelerated per-block time as a pure sim knob. PLACEHOLDER.
+/// The **FROZEN** target block time (consensus-parameters §2; Zcash ZIP-208
+/// precedent). This is the `T` LWMA-120 retargets toward on a real testnet. The
+/// devnet does NOT run at wall-clock scale — it drives LWMA with the accelerated
+/// [`SIM_BLOCK_TIME_SECS`] via `SimConfig::block_time_secs` — but the algorithm is
+/// identical; only `T` differs between the sim and a real net.
+pub const POW_TARGET_BLOCK_TIME_SECS: u64 = 75;
+
+/// The accelerated per-block time the sim clock advances by (and the LWMA `T` the
+/// sim retargets toward). PLACEHOLDER sim knob — NOT the real 75 s
+/// ([`POW_TARGET_BLOCK_TIME_SECS`]).
 pub const SIM_BLOCK_TIME_SECS: u64 = 2;
 
-/// Difficulty-retarget window, in blocks. PLACEHOLDER (Bitcoin uses 2016).
-pub const DIFFICULTY_WINDOW_BLOCKS: u64 = 16;
+/// LWMA difficulty-retarget window, in blocks (`N`). Testnet-tunable, NOT frozen
+/// (Zawy's LWMA-1 recommends N in the 60–120 band for CPU chains; we take 120).
+pub const LWMA_WINDOW_BLOCKS: usize = qlab_pow::lwma::LWMA_WINDOW;
 
-/// Max per-retarget difficulty change factor (Bitcoin-style clamp against
-/// timestamp manipulation / wild swings). PLACEHOLDER.
-pub const MAX_DIFFICULTY_ADJUST_FACTOR: u64 = 4;
+/// RandomX key-block epoch length, in blocks: the key rotates every this many
+/// blocks. Testnet-tunable, NOT frozen (Monero `RANDOMX_SEEDHASH_EPOCH_BLOCKS`).
+pub const SEEDHASH_EPOCH_BLOCKS: u64 = qlab_pow::keyblock::KeyBlockSchedule::MONERO_EPOCH_BLOCKS;
+
+/// RandomX key-block lag, in blocks: how deeply the seed block is buried before
+/// its key takes effect. Testnet-tunable, NOT frozen (Monero
+/// `RANDOMX_SEEDHASH_EPOCH_LAG`).
+pub const SEEDHASH_EPOCH_LAG: u64 = qlab_pow::keyblock::KeyBlockSchedule::MONERO_EPOCH_LAG;
 
 // ─── Committee / finality (棒 2–3) ──────────────────────────────────────────
 
