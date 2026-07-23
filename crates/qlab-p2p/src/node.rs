@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use qlab_devnet::committee::{Checkpoint, Vote};
-use qlab_devnet::body::TxEntry;
+use qlab_devnet::body::{BlockBody, TxEntry};
 use qlab_devnet::ebbflow::EquivocationEvidence;
 use qlab_devnet::header::{BlockHeader, Hash32};
 
@@ -45,8 +45,9 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     sync: SyncState,
     version_sent: HashSet<PeerId>,
     /// Full block bodies this node can serve (originated or fully reconstructed),
-    /// keyed by header hash — backs `GetBlockTxn` answering.
-    blocks: HashMap<Hash32, Vec<TxEntry>>,
+    /// keyed by header hash — backs `GetBlockTxn` answering. Stores the ordered
+    /// txs and the body's coinbase counter (needed to rebuild the exact body).
+    blocks: HashMap<Hash32, (Vec<TxEntry>, u64)>,
     /// Announcements awaiting missing transactions (block hash → announce).
     pending_blocks: HashMap<Hash32, BlockAnnounce>,
     /// Finalized checkpoints + their votes, keyed by checkpoint id — so a
@@ -158,14 +159,20 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// Announce a full block (header + ordered body) via compact relay: store the
     /// body, ingest the header, and push a `BlockAnnounce` to ready peers with a
     /// fresh salt nonce (slot 0 prefilled as the coinbase-position tx).
-    pub fn announce_block(&mut self, header: BlockHeader, txs: Vec<TxEntry>, nonce: u64) {
+    pub fn announce_block(
+        &mut self,
+        header: BlockHeader,
+        txs: Vec<TxEntry>,
+        coinbase: u64,
+        nonce: u64,
+    ) {
         let bh = header.header_hash();
-        self.blocks.insert(bh, txs.clone());
-        let _ = self.node.ingest_header(header);
+        self.blocks.insert(bh, (txs.clone(), coinbase));
+        let _ = self.node.ingest_block(header, BlockBody { txs: txs.clone(), coinbase });
         self.seen.insert(bh);
 
         let (prefilled, short_ids) = build_announce_parts(&txs, nonce);
-        let ann = BlockAnnounce { header, nonce, short_ids, prefilled };
+        let ann = BlockAnnounce { header, nonce, coinbase, short_ids, prefilled };
         let payload = encode_announce(&ann);
         for pid in self.peers.ready_peers() {
             self.send(pid, MsgType::BlockAnnounce, payload.clone());
@@ -588,7 +595,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return;
             }
         };
-        let Some(body) = self.blocks.get(&req.block_hash) else {
+        let Some((body, _coinbase)) = self.blocks.get(&req.block_hash) else {
             return; // we don't have that block's body
         };
         let txs: Vec<TxEntry> =
@@ -631,8 +638,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         txs: Vec<TxEntry>,
         except: Option<PeerId>,
     ) {
-        self.blocks.insert(bh, txs);
-        let _ = self.node.ingest_header(ann.header);
+        self.blocks.insert(bh, (txs.clone(), ann.coinbase));
+        let _ = self
+            .node
+            .ingest_block(ann.header, BlockBody { txs, coinbase: ann.coinbase });
         self.seen.insert(bh);
         let payload = encode_announce(&ann);
         for pid in self.peers.ready_peers() {
@@ -871,7 +880,7 @@ mod tests {
         }
         let header = BlockHeader::child_of(&genesis(), 75, 1000, [7; 32]);
         let bh = header.header_hash();
-        nodes[0].announce_block(header, vec![coinbase, t1, t2], 0xABCD);
+        nodes[0].announce_block(header, vec![coinbase, t1, t2], 0, 0xABCD);
         run(&mut nodes);
         // Node 1 reconstructed and ingested the header.
         assert!(nodes[1].node().has_header(&bh));
@@ -890,7 +899,7 @@ mod tests {
         nodes[1].node_mut().ingest_tx(t1.clone());
         let header = BlockHeader::child_of(&genesis(), 75, 1000, [8; 32]);
         let bh = header.header_hash();
-        nodes[0].announce_block(header, vec![coinbase, t1, t2.clone()], 0x1234);
+        nodes[0].announce_block(header, vec![coinbase, t1, t2.clone()], 0, 0x1234);
         run(&mut nodes);
         assert!(nodes[1].node().has_header(&bh), "header ingested after fetching missing tx");
         assert!(nodes[1].node().has_tx(&tx_id(&t2)), "missing tx fetched into mempool");

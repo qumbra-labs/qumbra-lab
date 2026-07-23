@@ -343,6 +343,18 @@ impl Mempool {
         self.txs.contains_key(id)
     }
 
+    /// All pooled transactions in deterministic (txid) order — the pending set a
+    /// block assembler / compact-block reconstruction (N7) draws from. Read-only;
+    /// does not mutate the pool.
+    pub fn entries(&self) -> Vec<TxEntry> {
+        self.txs.values().map(|m| m.entry.clone()).collect()
+    }
+
+    /// A pooled transaction by its body-commitment id ([`txid`]), if present.
+    pub fn get(&self, id: &TxId) -> Option<&TxEntry> {
+        self.txs.get(id).map(|m| &m.entry)
+    }
+
     /// Record a coinbase note minted at `height` (its maturity clock starts here).
     /// Called when a block is accepted; the coinbase note becomes spendable at
     /// `height + 144` (frozen §2).
@@ -624,6 +636,21 @@ mod tests {
         let id = mp.admit(good_tx(1), vec![], &st, &MockVerifier).expect("admit");
         assert_eq!(mp.len(), 1);
         assert!(mp.contains(&id));
+    }
+
+    #[test]
+    fn entries_and_get_expose_admitted_txs() {
+        // The N7 pending-pool read surface: `entries()` lists the pooled txs and
+        // `get(id)` resolves one by its body-commitment id.
+        let mut mp = Mempool::default();
+        let st = state_with_anchor();
+        let tx = good_tx(1);
+        let id = mp.admit(tx.clone(), vec![], &st, &MockVerifier).expect("admit");
+        let listed = mp.entries();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(txid(&listed[0]), id);
+        assert_eq!(txid(mp.get(&id).expect("present")), id);
+        assert!(mp.get(&[0xEE; 32]).is_none());
     }
 
     // ── admission negatives (the acceptance set) ─────────────────────────────

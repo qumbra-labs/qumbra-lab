@@ -997,7 +997,9 @@ dependencies = [
  "qlab-air",
  "qlab-cbserver",
  "qlab-devnet",
+ "qlab-node",
  "qlab-note",
+ "qlab-pow",
 ]
 
 [[package]]

@@ -35,6 +35,11 @@ qlab-air = { path = "../qlab-air" }
 # Decode ML-DSA-65 checkpoint-vote signatures off the wire (Signature::decode).
 # Exact pin mirrors qlab-devnet's committee crate — one ML-DSA rev in the tree.
 ml-dsa = "=0.1.1"
+# N7 integration: the real node-state (chain/commitment tree/nullifier set +
+# the N4 mempool) the `adapter` module wires the N1 traits onto, and the real
+# PoW engine (RandomX + LWMA + key-block schedule) for header validation.
+qlab-node = { path = "../qlab-node" }
+qlab-pow = { path = "../qlab-pow" }
 
 [dev-dependencies]
 # Deterministic committee keys + compact-block fixtures for gossip/relay tests.

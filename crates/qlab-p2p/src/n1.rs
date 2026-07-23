@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use qlab_devnet::body::TxEntry;
+use qlab_devnet::body::{BlockBody, TxEntry};
 use qlab_devnet::chain::{ChainState, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, Vote};
 use qlab_devnet::ebbflow::{
@@ -68,6 +68,17 @@ pub trait ChainView {
 /// Ingest headers received from peers.
 pub trait BlockIngest {
     fn ingest_header(&mut self, header: BlockHeader) -> IngestOutcome;
+
+    /// Ingest a full block (header + ordered body). Header-only node-states
+    /// (sync/gossip only, e.g. [`StubNode`]) inherit the default, which drops the
+    /// body and ingests just the header. A real full node (N7's `NodeAdapter`)
+    /// overrides this to validate the body and fold it into consensus state — so
+    /// a block whose body carries an invalid tx is rejected here, and restart
+    /// state reflects applied bodies. The body arrives via BIP-152 relay
+    /// (produced locally or reconstructed from the mempool).
+    fn ingest_block(&mut self, header: BlockHeader, _body: BlockBody) -> IngestOutcome {
+        self.ingest_header(header)
+    }
 }
 
 /// The transaction mempool, from the P2P layer's point of view.
@@ -415,6 +426,18 @@ mod tests {
         let unknown_parent = BlockHeader::child_of(&h1, 150, 1000, [2; 32]);
         let orphan_child = BlockHeader::child_of(&unknown_parent, 225, 1000, [3; 32]);
         assert_eq!(n.ingest_header(orphan_child), IngestOutcome::Orphan);
+    }
+
+    #[test]
+    fn stubnode_ingest_block_defaults_to_header_only() {
+        // A header-only node-state inherits the trait default: the body is
+        // dropped, the header is ingested, the tip advances.
+        let mut n = node();
+        let g = genesis();
+        let h1 = BlockHeader::child_of(&g, 75, 1000, [1; 32]);
+        let body = BlockBody { txs: vec![], coinbase: 0 };
+        assert_eq!(n.ingest_block(h1, body), IngestOutcome::Accepted);
+        assert_eq!(n.tip_height(), 1);
     }
 
     #[test]
