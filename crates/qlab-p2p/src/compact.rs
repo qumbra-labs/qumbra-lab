@@ -74,6 +74,10 @@ pub struct PrefilledTx {
 pub struct BlockAnnounce {
     pub header: BlockHeader,
     pub nonce: u64,
+    /// The block body's coinbase emission counter (`BlockBody::coinbase`). Carried
+    /// so a receiver can reconstruct the exact body (the coinbase is not a tx slot)
+    /// and validate/fold it. §7 relay is `[devnet-placeholder]`, not a frozen wire.
+    pub coinbase: u64,
     pub short_ids: Vec<[u8; SHORTID_LEN]>,
     pub prefilled: Vec<PrefilledTx>,
 }
@@ -99,6 +103,7 @@ pub fn encode_announce(a: &BlockAnnounce) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&encode_header(&a.header));
     out.extend_from_slice(&a.nonce.to_le_bytes());
+    out.extend_from_slice(&a.coinbase.to_le_bytes());
     write_varint(&mut out, a.short_ids.len() as u64);
     for s in &a.short_ids {
         out.extend_from_slice(s);
@@ -119,6 +124,7 @@ pub fn decode_announce(buf: &[u8]) -> Result<BlockAnnounce, DecodeError> {
     let hdr_bytes = r.rest(crate::codec::HEADER_WIRE_LEN, "announce.header")?;
     let header = decode_header(&hdr_bytes)?;
     let nonce = r.u64_le("announce.nonce")?;
+    let coinbase = r.u64_le("announce.coinbase")?;
     let n_short = r.varint()? as usize;
     let mut short_ids = Vec::with_capacity(n_short);
     for _ in 0..n_short {
@@ -134,7 +140,7 @@ pub fn decode_announce(buf: &[u8]) -> Result<BlockAnnounce, DecodeError> {
         prefilled.push(PrefilledTx { index, tx: crate::codec::decode_tx(&tx_bytes)? });
     }
     r.finish()?;
-    Ok(BlockAnnounce { header, nonce, short_ids, prefilled })
+    Ok(BlockAnnounce { header, nonce, coinbase, short_ids, prefilled })
 }
 
 // --- GetBlockTxn ---
@@ -300,6 +306,7 @@ mod tests {
         let a = BlockAnnounce {
             header: header(),
             nonce: 0xDEADBEEF,
+            coinbase: 0,
             short_ids: vec![short_id(0xDEADBEEF, &tx_id(&tx(2))), short_id(0xDEADBEEF, &tx_id(&tx(3)))],
             prefilled: vec![PrefilledTx { index: 0, tx: tx(1) }],
         };
@@ -333,6 +340,7 @@ mod tests {
         let a = BlockAnnounce {
             header: header(),
             nonce,
+            coinbase: 0,
             // slots 1,2 are short ids; slot 0 is prefilled coinbase.
             short_ids: vec![short_id(nonce, &tx_id(&t1)), short_id(nonce, &tx_id(&t2))],
             prefilled: vec![PrefilledTx { index: 0, tx: coinbase.clone() }],
@@ -356,6 +364,7 @@ mod tests {
         let a = BlockAnnounce {
             header: header(),
             nonce,
+            coinbase: 0,
             short_ids: vec![short_id(nonce, &tx_id(&t1)), short_id(nonce, &tx_id(&t2))],
             prefilled: vec![],
         };

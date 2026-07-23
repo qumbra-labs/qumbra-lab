@@ -57,13 +57,13 @@ use qlab_cbserver::codec::{
 };
 use qlab_cbserver::tree::Frontier;
 use qlab_devnet::body::{TxEntry, TxPublic, TxVerifier};
-use qlab_devnet::fees::posted_fee;
 use qlab_devnet::params_devnet::MAX_ANCHOR_AGE_BLOCKS;
 use qlab_note::hash::{digest_bytes, keccak256};
 use qlab_note::wire::RecipientBundle;
 
 use std::collections::HashMap;
 
+use crate::mempool::{Mempool, MempoolError};
 use crate::node::{Node, NodeState};
 use crate::store::{ChainStore, CommitmentStore, Hash32, NullifierStore, StoredBlock, StoredTx};
 
@@ -161,6 +161,8 @@ pub enum RejectReason {
     NullifierPending,
     /// The discovery artifacts' commitments do not match the tx's commitments.
     DiscoveryMismatch,
+    /// The tx spends a coinbase note that has not matured (frozen §2: 144 blocks).
+    ImmatureCoinbase,
     /// The proof failed to verify under the injected verifier.
     ProofInvalid,
 }
@@ -173,12 +175,14 @@ pub enum RejectReason {
 /// note-discovery store, and serves reads over live node state.
 pub struct NodeRpc<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     node: Node<C, N, T>,
-    /// Pending transactions by id (N6's thin holding area; real mempool = N4).
-    pending: HashMap<Hash32, TxEntry>,
-    /// Nullifiers reserved by pending transactions (a pending double-spend gate).
-    pending_nf: std::collections::HashSet<Hash32>,
-    /// Note-discovery artifacts by tx id — the source `/v1/compact` and
-    /// `/v1/…/full` join accepted-block transactions against.
+    /// The real N4 pending pool (M9-N7 rewire): admission runs the same
+    /// posted-fee / anchor / maturity / double-spend / injected-proof gates a
+    /// block assembler enforces, and holds txs by their body-commitment id.
+    mempool: Mempool,
+    /// Note-discovery artifacts by **statement** tx id ([`tx_id_of_public`]) — the
+    /// source `/v1/compact` and `/v1/…/full` join accepted-block transactions
+    /// against. Keyed by the statement id, NOT the mempool's body-commitment id:
+    /// the two encodings are deliberately distinct (see the module docs).
     discovery: HashMap<Hash32, TxDiscovery>,
 }
 
@@ -194,8 +198,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
     pub fn new(node: Node<C, N, T>) -> Self {
         Self {
             node,
-            pending: HashMap::new(),
-            pending_nf: std::collections::HashSet::new(),
+            mempool: Mempool::default(),
             discovery: HashMap::new(),
         }
     }
@@ -214,13 +217,18 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
 
     /// Number of pending (submitted, not-yet-embedded) transactions.
     pub fn pending_len(&self) -> usize {
-        self.pending.len()
+        self.mempool.len()
     }
 
     /// The pending transactions (submitted, awaiting inclusion) — what a block
     /// assembler (N4) / the N7 wiring draws from.
     pub fn pending_txs(&self) -> Vec<TxEntry> {
-        self.pending.values().cloned().collect()
+        self.mempool.entries()
+    }
+
+    /// The underlying pending pool (read-only) — block assembly / N7 harness.
+    pub fn mempool(&self) -> &Mempool {
+        &self.mempool
     }
 
     /// Record note-discovery artifacts for a tx id directly (composition entry
@@ -241,48 +249,49 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
         verifier: &V,
     ) -> SubmitOutcome {
         let p = &tx.public;
+        // The wallet-facing (statement) id — what discovery is keyed by and what a
+        // caller gets back. Distinct from the mempool's body-commitment id.
         let txid = tx_id_of_public(p);
 
-        if self.pending.contains_key(&txid) {
-            return SubmitOutcome::Duplicate;
-        }
-        // Anchor must be valid *now* (finalized + within the age window, §4/§7).
-        if !self.node.is_valid_anchor(&p.anchor) {
-            return SubmitOutcome::Rejected(RejectReason::AnchorNotValid);
-        }
-        // Posted-price fee (§4).
-        let expected = posted_fee(p.bucket);
-        if p.fee != expected {
-            return SubmitOutcome::Rejected(RejectReason::WrongFee { expected, got: p.fee });
-        }
-        // Nullifier gates: not already spent, not repeated in-tx, not pending.
+        // Two rpc-layer pre-checks the mempool contract does not cover:
+        // (1) a nullifier repeated within this single tx, and
         let mut in_tx = std::collections::HashSet::new();
         for nf in &p.nullifiers {
-            if self.node.is_spent(nf) {
-                return SubmitOutcome::Rejected(RejectReason::NullifierSpent);
-            }
             if !in_tx.insert(*nf) {
                 return SubmitOutcome::Rejected(RejectReason::NullifierRepeatedInTx);
             }
-            if self.pending_nf.contains(nf) {
-                return SubmitOutcome::Rejected(RejectReason::NullifierPending);
-            }
         }
-        // Discovery artifacts must describe exactly this tx's output commitments.
+        // (2) the note-discovery artifacts must describe exactly this tx's outputs.
         if discovery.commitments() != p.commitments {
             return SubmitOutcome::Rejected(RejectReason::DiscoveryMismatch);
         }
-        // Proof (the only non-trivial cost) last.
-        if !verifier.verify_tx(&tx) {
-            return SubmitOutcome::Rejected(RejectReason::ProofInvalid);
-        }
 
-        for nf in &p.nullifiers {
-            self.pending_nf.insert(*nf);
+        // The N4 mempool runs the real admission gates (posted fee → valid anchor →
+        // coinbase maturity → consensus double-spend → duplicate → in-pool nullifier
+        // conflict → injected proof) against live node state and holds the tx.
+        match self.mempool.admit(tx, vec![], &self.node, verifier) {
+            Ok(_body_id) => {
+                self.discovery.insert(txid, discovery);
+                SubmitOutcome::Accepted(txid)
+            }
+            Err(MempoolError::DuplicateTx) => SubmitOutcome::Duplicate,
+            Err(MempoolError::WrongFee { expected, got }) => {
+                SubmitOutcome::Rejected(RejectReason::WrongFee { expected, got })
+            }
+            Err(MempoolError::AnchorNotValid) => {
+                SubmitOutcome::Rejected(RejectReason::AnchorNotValid)
+            }
+            Err(MempoolError::AlreadySpent { .. }) => {
+                SubmitOutcome::Rejected(RejectReason::NullifierSpent)
+            }
+            Err(MempoolError::NullifierConflictInPool { .. }) => {
+                SubmitOutcome::Rejected(RejectReason::NullifierPending)
+            }
+            Err(MempoolError::ImmatureCoinbase { .. }) => {
+                SubmitOutcome::Rejected(RejectReason::ImmatureCoinbase)
+            }
+            Err(MempoolError::ProofInvalid) => SubmitOutcome::Rejected(RejectReason::ProofInvalid),
         }
-        self.discovery.insert(txid, discovery);
-        self.pending.insert(txid, tx);
-        SubmitOutcome::Accepted(txid)
     }
 
     // ---- live read views ---------------------------------------------------
@@ -296,7 +305,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             commitment_root: self.node.commitment_root(),
             commitment_count: self.node.commitment_count(),
             nullifier_count: self.node.nullifier_count() as u64,
-            pending_count: self.pending.len() as u64,
+            pending_count: self.mempool.len() as u64,
         }
     }
 
@@ -703,6 +712,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qlab_devnet::fees::posted_fee;
     use crate::node::{genesis_block, MemNode};
     use qlab_cbserver::codec::decode_compact_response;
     use qlab_devnet::body::{BlockBody, TxEntry, TxPublic};

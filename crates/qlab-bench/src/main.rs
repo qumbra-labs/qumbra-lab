@@ -30,6 +30,7 @@ mod m4route;
 mod m4skel;
 mod m5note;
 mod m6devnet;
+mod n7soak;
 mod narrow_bench;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -878,6 +879,10 @@ fn main() {
         }
         "m6devnet" => {
             m6devnet::run_m6devnet(&power);
+            return;
+        }
+        "n7soak" => {
+            n7soak::run_n7soak(&power, None);
             return;
         }
         "disclosure" => {

@@ -35,6 +35,7 @@
 pub mod codec;
 pub mod compact;
 pub mod gossip;
+pub mod adapter;
 pub mod n1;
 pub mod node;
 pub mod peer;
