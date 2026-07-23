@@ -18,7 +18,76 @@
 //!   at N≈20 known entities an offline validator already forfeits income while
 //!   jailed, so no monetary penalty is needed (committee-gov §3).
 
+use std::collections::{HashSet, VecDeque};
+
 use crate::committee::{Checkpoint, Committee, CommitteeState, Vote};
+
+/// A rolling record of committee signing participation, for **downtime-jail**
+/// detection (committee-governance §3; frozen §4: jail — no slash — a member that
+/// signed *fewer than 33 % of the trailing 100* finalized checkpoints). Each
+/// entry is the set of committee indices that signed one finalized checkpoint; the
+/// window keeps the trailing `window` rounds. Detection fires only once the window
+/// is full, so a fresh committee is never falsely jailed.
+///
+/// The comparison is exact integer arithmetic — `signed·100 < threshold_pct·rounds`
+/// — so no float ever enters consensus. The window is index-based, so a membership
+/// change (which reindexes the roster, [`crate::epoch`]) invalidates it; callers
+/// [`Self::reset`] it at an epoch boundary.
+#[derive(Clone, Debug)]
+pub struct SigningWindow {
+    window: usize,
+    threshold_pct: u64,
+    rounds: VecDeque<HashSet<usize>>,
+}
+
+impl SigningWindow {
+    /// A window of `window` rounds with a `threshold_pct`% participation floor
+    /// (frozen: 100, 33).
+    pub fn new(window: usize, threshold_pct: u64) -> Self {
+        Self { window: window.max(1), threshold_pct, rounds: VecDeque::new() }
+    }
+
+    /// Record one finalized checkpoint's signer set, evicting the oldest round
+    /// past the window.
+    pub fn record_round(&mut self, signers: &[usize]) {
+        self.rounds.push_back(signers.iter().copied().collect());
+        while self.rounds.len() > self.window {
+            self.rounds.pop_front();
+        }
+    }
+
+    /// Number of rounds currently held (≤ window).
+    pub fn len(&self) -> usize {
+        self.rounds.len()
+    }
+
+    /// Whether the trailing set is empty.
+    pub fn is_empty(&self) -> bool {
+        self.rounds.is_empty()
+    }
+
+    /// Whether the window is full (detection only fires when it is).
+    pub fn is_full(&self) -> bool {
+        self.rounds.len() >= self.window
+    }
+
+    /// How many of the held rounds `idx` signed.
+    pub fn signed_count(&self, idx: usize) -> usize {
+        self.rounds.iter().filter(|s| s.contains(&idx)).count()
+    }
+
+    /// Whether member `idx` is jailable for downtime: the window is full and it
+    /// signed strictly fewer than `threshold_pct`% of the rounds.
+    pub fn jailable(&self, idx: usize) -> bool {
+        self.is_full()
+            && (self.signed_count(idx) as u64) * 100 < self.threshold_pct * self.rounds.len() as u64
+    }
+
+    /// Clear the window (e.g. at an epoch boundary, where indices are reassigned).
+    pub fn reset(&mut self) {
+        self.rounds.clear();
+    }
+}
 
 /// Which finality regime the node is in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,6 +268,46 @@ mod tests {
         state.tombstone(5, EQUIVOCATION_SLASH_AMOUNT);
         assert!(!state.jail(5, 100));
         assert_eq!(state.status(5), Some(MemberStatus::Tombstoned));
+    }
+
+    #[test]
+    fn signing_window_jails_a_dark_validator_only_when_full() {
+        // Frozen shape at a small window: 33 % of a 10-round window (< 3.3 signed).
+        let mut w = SigningWindow::new(10, 33);
+        // Members 0,1 sign every round; member 2 signs nothing.
+        for _ in 0..9 {
+            w.record_round(&[0, 1]);
+            // Not jailable before the window is full, even at 0 % participation.
+            assert!(!w.jailable(2), "no false jail before the window fills");
+        }
+        w.record_round(&[0, 1]); // 10th round → full
+        assert!(w.is_full());
+        assert!(w.jailable(2), "0 % over a full window is jailable");
+        assert!(!w.jailable(0), "100 % signer is safe");
+        assert_eq!(w.signed_count(0), 10);
+        assert_eq!(w.signed_count(2), 0);
+    }
+
+    #[test]
+    fn signing_window_threshold_is_strict_and_integer() {
+        // Exactly 33 % is NOT below 33 % (strict). 3 of 10 = 30 % < 33 % ⇒ jail;
+        // 4 of 10 = 40 % ≥ 33 % ⇒ safe. (No float: 3·100 < 33·10 = 300 → 300<330.)
+        let mut w = SigningWindow::new(10, 33);
+        for i in 0..10 {
+            let mut signers = vec![0u8 as usize];
+            if i < 3 {
+                signers.push(1); // member 1 signs 3 of 10
+            }
+            if i < 4 {
+                signers.push(2); // member 2 signs 4 of 10
+            }
+            w.record_round(&signers);
+        }
+        assert!(w.jailable(1), "30 % < 33 % ⇒ jailable");
+        assert!(!w.jailable(2), "40 % ≥ 33 % ⇒ safe");
+        w.reset();
+        assert!(w.is_empty());
+        assert!(!w.jailable(1), "reset window never jails");
     }
 
     #[test]

@@ -22,6 +22,10 @@ qlab-devnet = { path = "../qlab-devnet" }
 qlab-cbserver = { path = "../qlab-cbserver" }
 # [u64;4] ↔ [u8;32] digest lane conversions (protocol-spec §1 lane-major LE).
 qlab-note = { path = "../qlab-note" }
+# The closed-form emission curve (frozen B2 constants) — the coinbase(h) =
+# S_atomic(h+1) − S_atomic(h) normative integer emission the block assembler
+# pays out (protocol-spec §6). Pure arithmetic, no chain/crypto deps.
+qlab-econ = { path = "../qlab-econ" }
 
 # Deterministic on-disk snapshot + block-log encoding.
 serde = { version = "1", features = ["derive"] }

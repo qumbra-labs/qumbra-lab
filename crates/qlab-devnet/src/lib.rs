@@ -31,6 +31,7 @@ pub mod body;
 pub mod chain;
 pub mod committee;
 pub mod ebbflow;
+pub mod epoch;
 pub mod fees;
 pub mod finality;
 pub mod hash;

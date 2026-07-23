@@ -23,6 +23,37 @@ use std::collections::HashSet;
 use crate::committee::{Checkpoint, Committee, Vote};
 use crate::header::Hash32;
 
+/// Whether `height` is a checkpoint slot under a given `cadence` — a non-genesis
+/// height on the cadence grid (protocol-spec §7 / consensus §4). The frozen
+/// prototype cadence is 8 blocks = **one 10-min anchor bucket** at 75 s
+/// ([`crate::params_devnet::CHECKPOINT_CADENCE_BLOCKS`]); **testnet-tunable, NOT
+/// frozen** (§7 flags the cadence `[full-M8]`).
+pub fn is_checkpoint_height(height: u64, cadence: u64) -> bool {
+    cadence != 0 && height != 0 && height % cadence == 0
+}
+
+/// The next checkpoint slot the committee should target: the **first cadence
+/// multiple strictly after `finalized`** (or the first slot `cadence` if nothing
+/// is finalized), provided it is `<= tip`; else `None`. Successive slots
+/// (…, 8, 16, 24, …) realize "propose a checkpoint every `cadence` blocks" — the
+/// scheduling that sets the minutes-class finality latency. A stalled committee
+/// simply stops calling this (Ebb-and-Flow degradation).
+pub fn next_checkpoint_height(finalized: Option<u64>, tip: u64, cadence: u64) -> Option<u64> {
+    if cadence == 0 {
+        return None;
+    }
+    // First slot strictly after the finalized head (or slot 1·cadence at genesis).
+    let next_slot = match finalized {
+        Some(f) => (f / cadence + 1) * cadence,
+        None => cadence,
+    };
+    if next_slot <= tip {
+        Some(next_slot)
+    } else {
+        None
+    }
+}
+
 /// Why a finalization attempt was rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FinalizeError {
@@ -287,6 +318,30 @@ mod tests {
         assert!(!fin.is_anchor_acceptable(&[0xAB; 32], u64::MAX), "never-finalized rejected");
         // A generous window keeps even the oldest finalized root.
         assert!(fin.is_anchor_acceptable(&[0x22; 32], 100), "age 7 ≤ 100 accepted");
+    }
+
+    #[test]
+    fn checkpoint_cadence_grid_and_next_slot() {
+        use crate::params_devnet::CHECKPOINT_CADENCE_BLOCKS as C; // 8
+
+        assert!(!is_checkpoint_height(0, C), "genesis is never a slot");
+        assert!(is_checkpoint_height(8, C) && is_checkpoint_height(16, C));
+        assert!(!is_checkpoint_height(7, C) && !is_checkpoint_height(9, C));
+
+        // Nothing finalized yet, tip at 10 → target slot 8.
+        assert_eq!(next_checkpoint_height(None, 10, C), Some(8));
+        // Tip below the first slot → nothing to do.
+        assert_eq!(next_checkpoint_height(None, 7, C), None);
+        // Already finalized 8, tip 15 → no fresh slot (next is 16).
+        assert_eq!(next_checkpoint_height(Some(8), 15, C), None);
+        // Tip reaches 16 → target 16.
+        assert_eq!(next_checkpoint_height(Some(8), 16, C), Some(16));
+        // Exactly on a slot with nothing finalized.
+        assert_eq!(next_checkpoint_height(None, 8, C), Some(8));
+        // Far behind: successive slots, not a jump to the latest (8 comes first).
+        assert_eq!(next_checkpoint_height(None, 20, C), Some(8));
+        assert_eq!(next_checkpoint_height(Some(8), 20, C), Some(16));
+        assert_eq!(next_checkpoint_height(Some(16), 20, C), None);
     }
 
     #[test]
