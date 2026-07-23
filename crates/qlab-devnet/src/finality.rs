@@ -32,23 +32,25 @@ pub fn is_checkpoint_height(height: u64, cadence: u64) -> bool {
     cadence != 0 && height != 0 && height % cadence == 0
 }
 
-/// The next checkpoint slot the committee should target: the greatest cadence
-/// multiple that is `> finalized` and `<= tip`, or `None` if the tip has not
-/// reached a fresh slot yet. Drives the "propose a checkpoint every `cadence`
-/// blocks" scheduling that sets the minutes-class finality latency; a stalled
-/// committee simply stops calling this (Ebb-and-Flow degradation).
+/// The next checkpoint slot the committee should target: the **first cadence
+/// multiple strictly after `finalized`** (or the first slot `cadence` if nothing
+/// is finalized), provided it is `<= tip`; else `None`. Successive slots
+/// (…, 8, 16, 24, …) realize "propose a checkpoint every `cadence` blocks" — the
+/// scheduling that sets the minutes-class finality latency. A stalled committee
+/// simply stops calling this (Ebb-and-Flow degradation).
 pub fn next_checkpoint_height(finalized: Option<u64>, tip: u64, cadence: u64) -> Option<u64> {
     if cadence == 0 {
         return None;
     }
-    // Largest cadence multiple ≤ tip.
-    let slot = (tip / cadence) * cadence;
-    if slot == 0 {
-        return None; // genesis is never a checkpoint slot
-    }
-    match finalized {
-        Some(f) if slot <= f => None, // nothing new to finalize
-        _ => Some(slot),
+    // First slot strictly after the finalized head (or slot 1·cadence at genesis).
+    let next_slot = match finalized {
+        Some(f) => (f / cadence + 1) * cadence,
+        None => cadence,
+    };
+    if next_slot <= tip {
+        Some(next_slot)
+    } else {
+        None
     }
 }
 
@@ -336,6 +338,10 @@ mod tests {
         assert_eq!(next_checkpoint_height(Some(8), 16, C), Some(16));
         // Exactly on a slot with nothing finalized.
         assert_eq!(next_checkpoint_height(None, 8, C), Some(8));
+        // Far behind: successive slots, not a jump to the latest (8 comes first).
+        assert_eq!(next_checkpoint_height(None, 20, C), Some(8));
+        assert_eq!(next_checkpoint_height(Some(8), 20, C), Some(16));
+        assert_eq!(next_checkpoint_height(Some(16), 20, C), None);
     }
 
     #[test]

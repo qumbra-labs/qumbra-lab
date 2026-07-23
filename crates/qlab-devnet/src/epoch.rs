@@ -240,6 +240,21 @@ mod tests {
     }
 
     #[test]
+    fn epoch_committee_seeded_at_frozen_n_has_frozen_quorum() {
+        // The genesis set the machinery replaces the static devnet set with is the
+        // frozen N=21 / quorum 15 (consensus-parameters §4), at the frozen epoch.
+        let (committee, _v) = devnet_committee(FROZEN_COMMITTEE_SIZE);
+        let ec = EpochCommittee::genesis(
+            EpochSchedule::new(EPOCH_LENGTH_BLOCKS),
+            CommitteeState::new(committee, BOND_AMOUNT),
+        );
+        assert_eq!(ec.current_epoch(), 0);
+        assert_eq!(ec.state().size(), 21);
+        assert_eq!(ec.state().quorum_threshold(), FROZEN_QUORUM);
+        assert_eq!(ec.schedule().epoch_length(), 1_152);
+    }
+
+    #[test]
     fn staged_change_is_invisible_until_the_boundary() {
         let (committee, validators) = devnet_committee(4);
         let mut ec = EpochCommittee::genesis(sched(), CommitteeState::new(committee, BOND_AMOUNT));
