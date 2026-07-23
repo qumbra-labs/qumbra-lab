@@ -19,6 +19,9 @@ qlab-devnet = { path = "../qlab-devnet" }
 # bench mode measures it; integration tests drive the end-to-end wallet flow.
 qlab-disclosure = { path = "../qlab-disclosure" }
 qlab-wallet = { path = "../qlab-wallet" }
+qlab-node = { path = "../qlab-node" }
+qlab-p2p = { path = "../qlab-p2p" }
+qlab-pow = { path = "../qlab-pow" }
 
 # Plonky3, pinned exactly at 0.6.1 (bench discipline: numbers against a
 # moving prover are meaningless). p3-maybe-rayon/parallel turns on the

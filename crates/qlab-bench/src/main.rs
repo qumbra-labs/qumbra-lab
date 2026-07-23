@@ -30,6 +30,7 @@ mod m4route;
 mod m4skel;
 mod m5note;
 mod m6devnet;
+mod n7soak;
 mod narrow_bench;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
