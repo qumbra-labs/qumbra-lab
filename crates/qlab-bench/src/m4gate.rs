@@ -5911,8 +5911,9 @@ fn fill_derived(values: &mut [Val], layout: &GateLayout, shape: &GateShape) {
 
 // The two house lane configs, referenced directly from the shipping config
 // consts (derive-not-hardcode) so this leaf bench always measures exactly the
-// leaf-agg (AGG_CFG = b4/q40) and consensus (CONSENSUS_CFG = b16/q20) lanes —
-// both g22 post-B′ (issue #22). Labels are display-only.
+// leaf-agg (AGG_CFG = b4/q43) and consensus (CONSENSUS_CFG = b16/q21) lanes —
+// both g22 post-B′ (issue #22), queries bumped by B″ (issue #41). Labels are
+// display-only.
 const LANE_CFGS: [(&str, FriCfg); 2] = [
     ("b4/q43/g22/fp16/a16", crate::m4treerec::AGG_CFG),
     ("b16/q21/g22/fp16/a16", CONSENSUS_CFG),

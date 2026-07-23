@@ -6,6 +6,10 @@ publish.workspace = true
 
 [dependencies]
 qlab-air = { path = "../qlab-air" }
+# Single source of truth for the consensus StarkConfig + CONSENSUS_CFG + wrappers
+# (issue #38). The plumbing formerly defined here is re-exported from it so the
+# bench modules' `crate::{Val, Config, FriCfg, make_config_with}` still resolve.
+qlab-consensus = { path = "../qlab-consensus" }
 # M5 note-encryption prototype library (additive; see crates/qlab-note).
 qlab-note = { path = "../qlab-note" }
 # M6 consensus/network devnet library (additive; see crates/qlab-devnet). The
