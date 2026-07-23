@@ -51,15 +51,40 @@ pub const SEEDHASH_EPOCH_BLOCKS: u64 = qlab_pow::keyblock::KeyBlockSchedule::MON
 /// `RANDOMX_SEEDHASH_EPOCH_LAG`).
 pub const SEEDHASH_EPOCH_LAG: u64 = qlab_pow::keyblock::KeyBlockSchedule::MONERO_EPOCH_LAG;
 
-// ─── Committee / finality (棒 2–3) ──────────────────────────────────────────
+// ─── Committee / finality (棒 2–3; M9-N5 committee-over-network) ─────────────
 
 /// Genesis committee size N. Design says N≈20–50 (consensus §4/§5;
-/// committee-and-governance §1 uses N≈20). PLACEHOLDER — exact N is open.
+/// committee-and-governance §1 uses N≈20). PLACEHOLDER — the M6 sim used 20; the
+/// **frozen** genesis size is [`FROZEN_COMMITTEE_SIZE`] = 21 (consensus-parameters
+/// §4). Kept for M6 back-compat; new committee-over-network code uses the frozen N.
 pub const COMMITTEE_SIZE: usize = 20;
 
-/// Checkpoint cadence: propose a finality checkpoint every this many blocks.
-/// PLACEHOLDER — real cadence sets the "minutes-class" finality latency
-/// (consensus §4/§7); the exact value is open (consensus-parameters appendix).
+/// **FROZEN** genesis committee size N = 21 (consensus-parameters §4; odd N eases
+/// ⅔ quorum arithmetic). The epoch-boundary membership machinery
+/// ([`crate::epoch`]) seeds the genesis set at this N.
+pub const FROZEN_COMMITTEE_SIZE: usize = 21;
+
+/// **FROZEN** ⅔ quorum at the frozen N = ⌊2·21/3⌋+1 = 15 (consensus-parameters
+/// §4). Asserted equal to [`crate::committee::quorum_threshold`] of the frozen N.
+pub const FROZEN_QUORUM: usize = 15;
+
+/// **FROZEN** epoch length: membership changes apply only at boundaries that are
+/// multiples of this (committee-and-governance §2; consensus-parameters §4 = 1,152
+/// blocks = 24 h at the frozen 75 s block time — also exactly the anchor window).
+/// The accelerated sim drives the machinery with [`SIM_EPOCH_LENGTH_BLOCKS`]; the
+/// boundary *rule* is identical, only the length differs.
+pub const EPOCH_LENGTH_BLOCKS: u64 = 1_152;
+
+/// Accelerated epoch length for the in-process sim/tests — small so a run crosses
+/// several epoch boundaries in bounded time. PLACEHOLDER sim knob, NOT the frozen
+/// 1,152 ([`EPOCH_LENGTH_BLOCKS`]).
+pub const SIM_EPOCH_LENGTH_BLOCKS: u64 = 16;
+
+/// Checkpoint cadence: propose a finality checkpoint every this many blocks =
+/// **one 10-min anchor bucket (8 blocks at 75 s)** (consensus §4/§7, protocol-spec
+/// §7 anchors row). **Testnet-tunable, NOT frozen** — protocol-spec §7 flags the
+/// cadence `[full-M8]`; N5 pins the 8-block bucket as the prototype cadence, to be
+/// frozen with the full-M8 P2P section. Sets the "minutes-class" finality latency.
 pub const CHECKPOINT_CADENCE_BLOCKS: u64 = 8;
 
 /// Per-validator self-bond (native-token units). PLACEHOLDER — the bond
@@ -72,6 +97,19 @@ pub const EQUIVOCATION_SLASH_AMOUNT: u64 = 100_000;
 
 /// Downtime jail term, in blocks (jail-no-slash; auto-readmit after). PLACEHOLDER.
 pub const JAIL_BLOCKS: u64 = 32;
+
+/// **FROZEN** downtime-jail detection window, in checkpoint rounds: a member is
+/// jailed if it signed fewer than [`DOWNTIME_JAIL_THRESHOLD_PCT`]% of the trailing
+/// this-many finalized checkpoints (consensus-parameters §4: "< 33 % signed of the
+/// trailing 100"). The window counts *checkpoint rounds*, not raw blocks — a round
+/// is one finalized checkpoint (cadence [`CHECKPOINT_CADENCE_BLOCKS`]).
+pub const DOWNTIME_JAIL_WINDOW: usize = 100;
+
+/// **FROZEN** downtime-jail participation threshold, in percent: signing strictly
+/// below this fraction of a full [`DOWNTIME_JAIL_WINDOW`] window jails the member
+/// (no slash). consensus-parameters §4 = 33 %. Compared in integer form
+/// (`signed·100 < 33·window`) so there is no float in consensus.
+pub const DOWNTIME_JAIL_THRESHOLD_PCT: u64 = 33;
 
 /// Finality lag (tip height − finalized height) beyond which the node is in
 /// degraded probabilistic mode (Ebb-and-Flow, consensus §4). PLACEHOLDER —
@@ -92,8 +130,6 @@ pub const DEGRADED_MODE_LAG_BLOCKS: u64 = 2 * CHECKPOINT_CADENCE_BLOCKS;
 /// pass a smaller one.
 pub const MAX_ANCHOR_AGE_BLOCKS: u64 = 24 * 3600 / 75;
 
-// Later stages will add here, still as placeholders:
-//   - EPOCH_LENGTH_BLOCKS (membership boundary — committee-gov §2)
 
 // ─── Fees (棒 4) ─────────────────────────────────────────────────────────────
 

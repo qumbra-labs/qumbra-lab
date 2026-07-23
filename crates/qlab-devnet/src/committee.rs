@@ -11,8 +11,12 @@
 //!     their own. No hand-rolled crypto — see the crate `ml-dsa` dependency.
 //!   - [`Checkpoint`] / [`Vote`] — what is finalized and a single signed vote.
 //!
-//! Membership is **static** here (genesis committee). Epoch-boundary membership
-//! changes (committee-governance §2) and equivocation/jail (§3) are 棒 3.
+//! This module owns the committee *keys, status, and vote crypto*. Membership
+//! *changes* — admission / exit / forced removal at epoch boundaries
+//! (committee-governance §2) — live in [`crate::epoch`] (M9-N5), which wraps a
+//! [`CommitteeState`] per epoch. Equivocation/jail penalties (§3) live in
+//! [`crate::ebbflow`]. Within an epoch, per-member status (jail/tombstone) applies
+//! immediately for quorum; the roster only shrinks at the next boundary.
 
 use ml_dsa::{B32, Keypair, MlDsa65, Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
@@ -25,7 +29,16 @@ pub type MemberSig = Signature<MlDsa65>;
 
 /// Domain-separation prefix bound into every checkpoint signing message, so a
 /// committee signature can never be replayed as any other ML-DSA message.
-pub const CHECKPOINT_DOMAIN: &[u8] = b"qumbra:devnet:checkpoint:v1";
+///
+/// **Production domain string** (M9-N5): `b"qumbra:checkpoint:v1"` — the
+/// `devnet:` segment is dropped. protocol-spec §7 carried the devnet placeholder
+/// `b"qumbra:devnet:checkpoint:v1"` with the production string flagged
+/// `[full-M8: production domain string + checkpoint cadence]`; N5 promotes the
+/// production form (committee-over-network is the section that binds it). The
+/// design-repo §7 correction is owed. Domain change ⇒ every pre-N5 vote/checkpoint
+/// signature is deliberately non-verifiable against a post-N5 committee (versioned
+/// break, §0 discipline).
+pub const CHECKPOINT_DOMAIN: &[u8] = b"qumbra:checkpoint:v1";
 
 /// The ⅔-quorum threshold for a committee of `n`: `floor(2n/3) + 1` — **strictly
 /// more than two thirds**, the Byzantine-safe quorum for a finality gadget
@@ -60,6 +73,12 @@ impl Committee {
     /// The member public key at committee index `idx`.
     pub fn member(&self, idx: usize) -> Option<&MemberKey> {
         self.members.get(idx)
+    }
+
+    /// The ordered member key list (used by the epoch machinery to reseal a roster
+    /// at a boundary — see [`crate::epoch`]).
+    pub fn keys(&self) -> &[MemberKey] {
+        &self.members
     }
 
     /// Verify that `vote` is a valid signature by its claimed signer over `cp`.
@@ -188,6 +207,24 @@ impl CommitteeState {
             slashed: vec![0; n],
             committee,
         }
+    }
+
+    /// Reassemble a committee state from explicit per-member parts. Used by the
+    /// epoch machinery ([`crate::epoch`]) to seal the next epoch's roster at a
+    /// boundary, carrying surviving members' status/bond/slash forward exactly.
+    /// Panics if the parts' lengths disagree with the committee size.
+    pub fn from_parts(
+        committee: Committee,
+        status: Vec<MemberStatus>,
+        bond: Vec<u64>,
+        slashed: Vec<u64>,
+    ) -> Self {
+        let n = committee.size();
+        assert!(
+            status.len() == n && bond.len() == n && slashed.len() == n,
+            "CommitteeState::from_parts length mismatch (n={n})"
+        );
+        Self { committee, status, bond, slashed }
     }
 
     /// The underlying (fixed) key set.
@@ -341,6 +378,16 @@ mod tests {
         // Signer index out of range fails cleanly (no panic).
         let oob = Vote { signer: 99, signature: validators[2].sign_checkpoint(&cp).signature };
         assert!(!committee.verify_vote(&cp, &oob));
+    }
+
+    #[test]
+    fn checkpoint_domain_is_production_string() {
+        // N5 promoted the domain to its production form; the `devnet:` segment is
+        // gone. Golden-lock the exact bytes so any future drift is a deliberate,
+        // versioned wire break (§0 discipline) — a silent change would invalidate
+        // every committee signature on the network.
+        assert_eq!(CHECKPOINT_DOMAIN, b"qumbra:checkpoint:v1");
+        assert!(!CHECKPOINT_DOMAIN.windows(7).any(|w| w == b"devnet:"));
     }
 
     #[test]
