@@ -987,6 +987,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "qlab-p2p"
+version = "0.0.0"
+dependencies = [
+ "ml-dsa",
+ "qlab-air",
+ "qlab-cbserver",
+ "qlab-devnet",
+ "qlab-note",
+]
+
+[[package]]
 name = "qlab-pow"
 version = "0.1.0"
 dependencies = [

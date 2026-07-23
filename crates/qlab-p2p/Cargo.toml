@@ -1,0 +1,41 @@
+[package]
+name = "qlab-p2p"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# M9-N2: P2P core — versioned message envelope, peer management, gossip
+# (blocks/txs/checkpoints), header-first sync state machine, and compact-block
+# relay, over a dual transport (in-process sim + real TCP). Prototype-grade:
+# protocol-spec §10 explicitly defers "P2P message formats" to full-M8, so the
+# *message shapes* here are [devnet-placeholder] — the hard wire constraints
+# honoured are §0 (versioning: version-tagged formats are reject-unknown) and
+# §5's framing discipline. Compact-block relay REUSES qlab-cbserver's public
+# §5 codec byte-for-byte (golden-locked to the spec digest), never re-rolls it.
+# See docs/m9-n2-p2p-plan.md.
+#
+# Programs against N1's node-state trait interfaces (issue #48), STUBBED here
+# (see the `n1` module) — integration to the real qlab-consensus/qlab-node is N7.
+# Conflict boundary: this new crate only (plus its one line in workspace members).
+# All wire is hand-rolled little-endian, matching the whole consensus stack's
+# zero-serde convention (qlab-devnet / qlab-cbserver carry no serde).
+
+[dependencies]
+# Real consensus objects that travel on the wire: BlockHeader/Hash32/Checkpoint/
+# Vote/Committee/TxEntry. Depended on, never modified (additive-only). N7 reroutes
+# these to qlab-consensus/qlab-node once N1 lands.
+qlab-devnet = { path = "../qlab-devnet" }
+# The RATIFIED §5 note-discovery / compact-block wire codec — reused verbatim for
+# compact-block relay (write_varint/read_varint + encode/decode_compact_response +
+# WIRE_VERSION). This is the "§5 framing" the issue cites, reused not re-rolled.
+qlab-cbserver = { path = "../qlab-cbserver" }
+# Keccak-256 for message-id / inventory hashing (the consensus hash; never forked).
+qlab-air = { path = "../qlab-air" }
+# Decode ML-DSA-65 checkpoint-vote signatures off the wire (Signature::decode).
+# Exact pin mirrors qlab-devnet's committee crate — one ML-DSA rev in the tree.
+ml-dsa = "=0.1.1"
+
+[dev-dependencies]
+# Deterministic committee keys + compact-block fixtures for gossip/relay tests.
+qlab-note = { path = "../qlab-note" }
