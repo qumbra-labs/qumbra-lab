@@ -972,7 +972,9 @@ dependencies = [
  "qlab-cbserver",
  "qlab-devnet",
  "qlab-note",
+ "rand",
  "serde",
+ "tiny_http",
 ]
 
 [[package]]

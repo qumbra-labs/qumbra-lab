@@ -26,3 +26,11 @@ qlab-note = { path = "../qlab-note" }
 # Deterministic on-disk snapshot + block-log encoding.
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
+# Minimal maintained blocking HTTP/1.1 server for the localhost node-RPC read
+# endpoints (M9-N6). Same pin as qlab-cbserver's reference server.
+tiny_http = "=0.12.0"
+
+[dev-dependencies]
+# Real ML-KEM note encryption + the cbserver light client, to prove the embedded
+# serving is byte-identical end-to-end (a reference wallet scans a live node).
+rand = "0.10"
