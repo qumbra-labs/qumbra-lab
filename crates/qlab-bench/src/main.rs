@@ -37,24 +37,19 @@ use std::time::Instant;
 
 use p3_air::{Air, DebugConstraintBuilder};
 use p3_blake3_air::Blake3Air;
-use p3_challenger::{HashChallenger, SerializingChallenger32};
-use p3_commit::ExtensionMmcs;
-use p3_field::extension::BinomialExtensionField;
-use p3_fri::{FriParameters, TwoAdicFriPcs};
-use p3_keccak::{Keccak256Hash, KeccakF};
 use p3_keccak_air::KeccakAir;
+// The consensus config plumbing (challenger / commit / fri / keccak / merkle /
+// symmetric types) moved to `qlab-consensus` (issue #38); only the Poseidon2
+// calibration-baseline constants remain a direct koala-bear import here.
 use p3_koala_bear::{
-    GenericPoseidon2LinearLayersKoalaBear, KoalaBear, KOALABEAR_POSEIDON2_HALF_FULL_ROUNDS,
+    GenericPoseidon2LinearLayersKoalaBear, KOALABEAR_POSEIDON2_HALF_FULL_ROUNDS,
     KOALABEAR_POSEIDON2_PARTIAL_ROUNDS_16, KOALABEAR_S_BOX_DEGREE,
 };
 use p3_matrix::dense::RowMajorMatrix;
 use p3_matrix::Matrix;
-use p3_merkle_tree::MerkleTreeMmcs;
 use p3_poseidon2_air::{Poseidon2Air, RoundConstants};
-use p3_symmetric::{CompressionFunctionFromHasher, PaddingFreeSponge, SerializingHasher};
 use p3_uni_stark::{
-    prove, verify, Proof, ProverConstraintFolder, StarkConfig, SymbolicAirBuilder,
-    VerifierConstraintFolder,
+    prove, verify, Proof, ProverConstraintFolder, SymbolicAirBuilder, VerifierConstraintFolder,
 };
 use rand::rngs::SmallRng;
 use rand::{RngExt, SeedableRng};
@@ -70,26 +65,12 @@ use serde::Serialize;
 // DFT:        Radix2DitParallel.
 // ---------------------------------------------------------------------------
 
-type Val = KoalaBear;
-type Challenge = BinomialExtensionField<Val, 4>;
-
-type ByteHash = Keccak256Hash;
-type U64Hash = PaddingFreeSponge<KeccakF, 25, 17, 4>;
-type FieldHash = SerializingHasher<U64Hash>;
-type MyCompress = CompressionFunctionFromHasher<U64Hash, 2, 4>;
-type ValMmcs = MerkleTreeMmcs<
-    [Val; p3_keccak::VECTOR_LEN],
-    [u64; p3_keccak::VECTOR_LEN],
-    FieldHash,
-    MyCompress,
-    2,
-    4,
->;
-type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
-type Challenger = SerializingChallenger32<Val, HashChallenger<u8, ByteHash, 32>>;
-type Dft = p3_dft::Radix2DitParallel<Val>;
-type Pcs = TwoAdicFriPcs<Val, Dft, ValMmcs, ChallengeMmcs>;
-type Config = StarkConfig<Pcs, Challenge, Challenger>;
+// The consensus config plumbing (field / hash / FRI types, the consensus
+// StarkConfig, `FriCfg`, and `make_config_with`) now lives in the shared
+// `qlab-consensus` crate (issue #38 — single source of truth). Re-export it so
+// every bench module's `crate::{Val, Challenge, Dft, Config, FriCfg,
+// make_config_with}` continues to resolve unchanged.
+pub use qlab_consensus::{make_config_with, Challenge, Config, Dft, FriCfg, Val};
 
 /// log2 of the FRI blowup factor. Also passed to trace generation as
 /// `extra_capacity_bits` so the trace buffer can hold the LDE in place.
@@ -107,40 +88,8 @@ const LOG_BLOWUP: usize = 1;
 const NUM_QUERIES: usize = 90;
 const QUERY_POW_BITS: usize = 10;
 
-/// One point in the FRI parameter sweep. Everything else (field, extension,
-/// DFT, Merkle hash) is held fixed — only FRI parameters vary.
-#[derive(Clone, Copy)]
-struct FriCfg {
-    log_blowup: usize,
-    num_queries: usize,
-    grind_bits: usize,
-    /// log2 of the final polynomial length — stops FRI folding early,
-    /// trading commit-phase Merkle paths for plaintext final-poly coeffs.
-    log_final_poly_len: usize,
-    /// log2 of the maximum FRI fold arity (0.6.1 `FriParameters::max_log_arity`).
-    /// 1 = classic arity-2 folding (every config before M1.6); k folds up to
-    /// 2^k per round, trading fewer fold rounds (fewer commit roots + shorter
-    /// path total) for 2^k - 1 sibling values per round per query.
-    max_log_arity: usize,
-}
-
-impl FriCfg {
-    fn label(&self) -> String {
-        let mut s = format!(
-            "b{}/q{}/g{}",
-            1 << self.log_blowup,
-            self.num_queries,
-            self.grind_bits
-        );
-        if self.log_final_poly_len > 0 {
-            s.push_str(&format!("/fp{}", 1 << self.log_final_poly_len));
-        }
-        if self.max_log_arity > 1 {
-            s.push_str(&format!("/a{}", 1 << self.max_log_arity));
-        }
-        s
-    }
-}
+// `FriCfg` (with pub fields + `label()`) is defined in `qlab-consensus` and
+// re-exported above; bench sweeps below construct their own points from it.
 
 /// The PR #1 baseline configuration (what the default matrix mode uses).
 const BASELINE_CFG: FriCfg = FriCfg {
@@ -207,45 +156,7 @@ const SWEEP_CFGS: [FriCfg; 7] = [
     },
 ];
 
-fn make_config_with(cfg: &FriCfg) -> Config {
-    let byte_hash = ByteHash {};
-    let u64_hash = U64Hash::new(KeccakF {});
-    let field_hash = FieldHash::new(u64_hash);
-    let compress = MyCompress::new(u64_hash);
-    let val_mmcs = ValMmcs::new(field_hash, compress, 3);
-    let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
-    let challenger = Challenger::from_hasher(vec![], byte_hash);
-
-    let fri_params = FriParameters {
-        log_blowup: cfg.log_blowup,
-        log_final_poly_len: cfg.log_final_poly_len,
-        max_log_arity: cfg.max_log_arity,
-        num_queries: cfg.num_queries,
-        commit_proof_of_work_bits: 0,
-        query_proof_of_work_bits: cfg.grind_bits,
-        mmcs: challenge_mmcs,
-    };
-    // Every config in this rig must clear the security bar. Label 口径 (design
-    // repo `fri-soundness-accounting-2026-07.md`, 2026-07-19): "~100-bit
-    // conjectured (list-decoding-capacity accounting, 2025-repriced); proven-
-    // Johnson ≈ 59/58 query-phase, field-capped ~80". The pinned Plonky3 0.6.x
-    // `conjectured_soundness_bits()` still computes the OLD capacity arithmetic
-    // (num_queries·log2(blowup) + grind) — the up-to-capacity conjecture behind
-    // it was disproved in late 2025 (DG25/CS25). We do NOT change the method
-    // (the DG25 re-anchor is a docs-layer relabel, not a code formula change);
-    // post-B′ (g22) it returns 102 for all three lanes (20·4+22 = 40·2+22 =
-    // 80·1+22), a conservative proxy for the honest DG25 conjectured ~100.4–100.8.
-    // So `>= 100` on the capacity value still gates correctly with ~2 bits to spare.
-    assert!(
-        fri_params.conjectured_soundness_bits() >= 100,
-        "config {} is only {} bits conjectured (capacity proxy)",
-        cfg.label(),
-        fri_params.conjectured_soundness_bits(),
-    );
-
-    let pcs = Pcs::new(Dft::default(), val_mmcs, fri_params);
-    Config::new(pcs, challenger)
-}
+// `make_config_with` is defined in `qlab-consensus` and re-exported above.
 
 fn make_config() -> Config {
     make_config_with(&BASELINE_CFG)

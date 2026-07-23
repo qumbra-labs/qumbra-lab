@@ -21,7 +21,7 @@
 
 use std::time::Instant;
 
-use p3_uni_stark::Proof;
+use qlab_consensus::Proof;
 
 use qlab_air::narrow::{build_bucket_with_witnesses, derive_input, BucketInstance, TxInput, TxOutput};
 use qlab_cbserver::client::{scan_local, DecoyPolicy, ScanConfig, ScanStats};

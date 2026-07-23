@@ -840,6 +840,7 @@ dependencies = [
  "p3-util",
  "postcard",
  "qlab-air",
+ "qlab-consensus",
  "qlab-devnet",
  "qlab-disclosure",
  "qlab-note",
@@ -860,7 +861,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "qlab-demo"
+name = "qlab-consensus"
 version = "0.0.0"
 dependencies = [
  "bincode",
@@ -878,7 +879,15 @@ dependencies = [
  "p3-symmetric",
  "p3-uni-stark",
  "qlab-air",
+]
+
+[[package]]
+name = "qlab-demo"
+version = "0.0.0"
+dependencies = [
+ "qlab-air",
  "qlab-cbserver",
+ "qlab-consensus",
  "qlab-devnet",
  "qlab-note",
  "qlab-wallet",
@@ -922,6 +931,17 @@ dependencies = [
 [[package]]
 name = "qlab-econ"
 version = "0.0.0"
+
+[[package]]
+name = "qlab-node"
+version = "0.0.0"
+dependencies = [
+ "bincode",
+ "qlab-cbserver",
+ "qlab-devnet",
+ "qlab-note",
+ "serde",
+]
 
 [[package]]
 name = "qlab-note"

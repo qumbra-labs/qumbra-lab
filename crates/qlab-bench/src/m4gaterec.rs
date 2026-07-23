@@ -43,34 +43,19 @@ use crate::{make_config_with, Config, FriCfg, Val};
 
 pub(crate) type Ext = BinomialExtensionField<Val, 4>;
 
-/// The decided consensus config. B′ (issue #22, adopted 2026-07-19): grind
-/// 20 → 22 to restore the "~100-bit conjectured" headline under the DG25
-/// list-decoding-capacity repricing (b16/q20 = 98.8 pre-grind → 100.8). Proof
-/// sizes are byte-identical — grinding is a PoW nonce, not openings.
-///
-/// B″ (issue #41, DECIDED 2026-07-22 — `fri-soundness-accounting-2026-07.md` §6):
-/// the 2025/2197 close-read reprices the conjectured ceiling to base-field
-/// list-decoding entropy, dropping b16/q20/g22 from 100.8 to a 96.9 corrected
-/// ceiling. To hold the ~100-bit standing invariant, query 20 → 21
-/// (b16/q21/g22 → 100.6 corrected). Unlike grind, +1 query DOES pay bytes and
-/// cascades into the leaf gate's schedule/shape (the #22/B′ lesson), which is
-/// why B″ lands as a whole batch, not a flip. This is the single source of
-/// truth for the consensus lane query count; `m4gate::NQ` derives from it.
-///
-/// This intentionally diverges from m4census's g20 (a historical step-0a census
-/// config the design doc records as b16/q20/g20; the keccak-f count it measured
-/// is grind- and query-independent per perm, so that census still stands).
-pub(crate) const CONSENSUS_CFG: FriCfg = FriCfg {
-    log_blowup: 4,
-    num_queries: 21,
-    grind_bits: 22,
-    log_final_poly_len: 4,
-    max_log_arity: 4,
-};
+// The consensus config, trace height, and Merkle cap height are now the
+// single-source values from `qlab-consensus` (issue #38). Re-exported here so
+// the many `crate::m4gaterec::{CONSENSUS_CFG, LOG_HEIGHT, CAP_HEIGHT}` consumers
+// (m4gate's `NQ`/`GRIND_BITS` derive from CONSENSUS_CFG; m6devnet; the recorder
+// config below) keep resolving unchanged — and every lane now agrees byte-for-
+// byte with what qlab-consensus (and thus qlab-demo / qlab-node) proves.
+//
+// This intentionally still diverges from m4census's g20 (a historical step-0a
+// census config the design doc records as b16/q20/g20; its keccak-f count is
+// grind- and query-independent per perm, so that census still stands — hence
+// m4census keeps its own local const).
+pub(crate) use qlab_consensus::{CAP_HEIGHT, CONSENSUS_CFG, LOG_HEIGHT};
 
-pub(crate) const LOG_HEIGHT: usize = 18;
-/// Merkle cap height baked into the consensus ValMmcs (`ValMmcs::new(.., 3)`).
-pub(crate) const CAP_HEIGHT: usize = 3;
 pub(crate) const CAP_LEN: usize = 1 << CAP_HEIGHT;
 
 // ---------------------------------------------------------------------------
