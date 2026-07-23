@@ -1,0 +1,22 @@
+[package]
+name = "qlab-pow"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# qlab-pow — the real CPU-friendly PoW primitive (RandomX) + the difficulty
+# algorithm (LWMA-120), as reusable, dependency-light building blocks.
+#
+# This crate deliberately depends on NOTHING inside the workspace: it holds only
+# the PoW *primitives* (RandomX hashing, the key-block rotation schedule, LWMA
+# retarget arithmetic). The consensus glue that adapts these to the devnet's
+# `PowEngine` trait lives in `qlab-devnet` (which depends on this crate), so
+# there is no dependency cycle.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[dependencies]
+# Rust FFI bindings to the reference RandomX implementation (tevador/RandomX).
+# Builds the C++ library at compile time (cmake + a C++ toolchain required).
+randomx-rs = "1.4.1"

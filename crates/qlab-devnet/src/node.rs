@@ -16,9 +16,13 @@ use crate::committee::{Checkpoint, CommitteeState, Vote};
 use crate::ebbflow::{finality_status, FinalityStatus};
 use crate::finality::{FinalityTracker, FinalizeError};
 use crate::mining::mine;
-use crate::params_devnet::{DEGRADED_MODE_LAG_BLOCKS, GENESIS_DIFFICULTY, SIM_BLOCK_TIME_SECS};
+use crate::params_devnet::{
+    DEGRADED_MODE_LAG_BLOCKS, GENESIS_DIFFICULTY, SEEDHASH_EPOCH_BLOCKS, SEEDHASH_EPOCH_LAG,
+    SIM_BLOCK_TIME_SECS,
+};
 use crate::pow::PowEngine;
-use crate::validation::{expected_difficulty, validate_header, ValidationError};
+use crate::validation::{expected_difficulty, pow_seed, validate_header, ValidationError};
+use qlab_pow::keyblock::KeyBlockSchedule;
 
 /// Sim knobs for a node. All placeholders / sim conveniences — none is a design
 /// decision (see `params_devnet`).
@@ -31,6 +35,11 @@ pub struct SimConfig {
     pub genesis_difficulty: u64,
     /// Max nonces the mining loop tries per block before giving up.
     pub mine_nonce_budget: u64,
+    /// RandomX key-block epoch length, in blocks (sim knob; default = the
+    /// `params_devnet` value). A small value exercises key rotation in tests.
+    pub key_epoch_blocks: u64,
+    /// RandomX key-block lag, in blocks (sim knob; default = `params_devnet`).
+    pub key_epoch_lag: u64,
 }
 
 impl Default for SimConfig {
@@ -39,6 +48,8 @@ impl Default for SimConfig {
             block_time_secs: SIM_BLOCK_TIME_SECS,
             genesis_difficulty: GENESIS_DIFFICULTY,
             mine_nonce_budget: 1 << 26,
+            key_epoch_blocks: SEEDHASH_EPOCH_BLOCKS,
+            key_epoch_lag: SEEDHASH_EPOCH_LAG,
         }
     }
 }
@@ -104,6 +115,11 @@ impl<P: PowEngine> Node<P> {
         self.mine_on(self.chain.tip_hash(), tx_body_commitment)
     }
 
+    /// The RandomX key-block schedule this node runs (from its sim config).
+    fn schedule(&self) -> KeyBlockSchedule {
+        KeyBlockSchedule::new(self.config.key_epoch_blocks, self.config.key_epoch_lag)
+    }
+
     /// Mine and accept a child of an arbitrary known `parent_hash` (lets a caller
     /// grow a competing fork; also what a miner does when extending a branch it
     /// just received). Returns the new block's hash.
@@ -118,17 +134,20 @@ impl<P: PowEngine> Node<P> {
         // timestamps are non-decreasing even when mining on an old branch.
         self.clock = (self.clock + self.config.block_time_secs).max(parent.timestamp + self.config.block_time_secs);
         let candidate = BlockHeader::child_of(&parent, self.clock, difficulty, tx_body_commitment);
-        let mined = mine(&self.pow, candidate, self.config.mine_nonce_budget)
+        // The RandomX key-block seed for this height on this branch.
+        let seed = pow_seed(&self.chain, &parent_hash, candidate.height, self.schedule())
+            .ok_or(NodeError::Insert(InsertError::UnknownParent))?;
+        let mined = mine(&self.pow, candidate, self.config.mine_nonce_budget, &seed)
             .ok_or(NodeError::MiningExhausted)?;
         // Self-check: a block we produced must pass our own validation.
-        validate_header(&self.chain, &self.pow, &mined, self.config.block_time_secs)?;
+        validate_header(&self.chain, &self.pow, &mined, self.config.block_time_secs, self.schedule())?;
         Ok(self.chain.insert_header(mined)?)
     }
 
     /// Validate and accept a header produced elsewhere. Heaviest-chain fork choice
     /// applies on insert — a heavier branch reorgs the tip. Returns the block hash.
     pub fn submit(&mut self, header: BlockHeader) -> Result<Hash32, NodeError> {
-        validate_header(&self.chain, &self.pow, &header, self.config.block_time_secs)?;
+        validate_header(&self.chain, &self.pow, &header, self.config.block_time_secs, self.schedule())?;
         Ok(self.chain.insert_header(header)?)
     }
 
@@ -226,6 +245,7 @@ mod tests {
             block_time_secs: 2,
             genesis_difficulty: 8,
             mine_nonce_budget: 5_000_000,
+            ..SimConfig::default()
         }
     }
 
@@ -251,8 +271,11 @@ mod tests {
         assert_eq!(node.tip_hash(), b);
     }
 
-    /// Heaviest-chain fork choice: a competing branch with more cumulative work
-    /// reorgs the tip, even though the first branch was seen first.
+    /// Heaviest-chain fork choice: a competing branch that accumulates MORE work
+    /// reorgs the tip, even though the first branch was seen first. (Under LWMA the
+    /// per-block difficulty varies with cadence, so "longer" no longer implies
+    /// "heavier" — we extend B until its cumulative work actually overtakes A, then
+    /// assert the reorg lands on the B branch.)
     #[test]
     fn heavier_fork_reorgs_the_tip() {
         let mut node = Node::new(KeccakPow, cfg());
@@ -263,19 +286,29 @@ mod tests {
         let a2 = node.mine_next([0xA2; 32]).unwrap();
         assert_eq!(node.tip_hash(), a2);
         assert_eq!(node.tip_height(), 2);
+        let a_work = node.tip_work();
 
-        // Branch B from genesis: three blocks ⇒ more total work ⇒ reorg.
-        let b1 = node.mine_on(genesis, [0xB1; 32]).unwrap();
-        // Tip is still A2 (B1 alone is lighter than A1+A2).
-        assert_eq!(node.tip_hash(), a2);
-        let b2 = node.mine_on(b1, [0xB2; 32]).unwrap();
-        let b3 = node.mine_on(b2, [0xB3; 32]).unwrap();
-
-        assert_eq!(node.tip_hash(), b3, "the longer/heavier B branch wins");
-        assert_eq!(node.tip_height(), 3);
+        // Branch B from genesis: extend until its cumulative work overtakes A. The
+        // tip flips to B exactly when B's work first exceeds A's.
+        let mut b_parent = genesis;
+        let mut last_b = genesis;
+        let mut reorged = false;
+        for i in 0..20u8 {
+            b_parent = node.mine_on(b_parent, [0xB0 + i; 32]).unwrap();
+            last_b = b_parent;
+            if node.tip_hash() == last_b {
+                reorged = true;
+                break;
+            }
+            // Until it overtakes A, the tip must remain A2 (finality-free tie/less).
+            assert_eq!(node.tip_hash(), a2, "must not reorg to a lighter B prefix");
+        }
+        assert!(reorged, "B must eventually accumulate more work than A and reorg");
+        assert_eq!(node.tip_hash(), last_b, "the heavier B branch wins");
+        assert!(node.tip_work() > a_work, "the new tip carries strictly more work");
         // A2 is still a known side block, just off the main chain.
         assert!(node.chain().header(&a2).is_some());
-        assert_eq!(node.chain().main_chain().last(), Some(&b3));
+        assert_eq!(node.chain().main_chain().last(), Some(&last_b));
     }
 
     /// A node accepts a valid block mined by a peer via `submit`, and rejects a
@@ -304,7 +337,7 @@ mod tests {
         for i in 0u8..=255 {
             tampered.tx_body_commitment = [i; 32];
             if tampered.tx_body_commitment != good.tx_body_commitment
-                && !satisfies_target(&KeccakPow.pow_hash(&tampered), tampered.difficulty)
+                && !satisfies_target(&KeccakPow.pow_hash(&tampered, &[]), tampered.difficulty)
             {
                 break;
             }
