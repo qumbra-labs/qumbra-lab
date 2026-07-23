@@ -10,6 +10,7 @@
 use ml_dsa::{EncodedSignature, MlDsa65, Signature};
 use qlab_devnet::body::{TxEntry, TxPublic};
 use qlab_devnet::committee::{Checkpoint, MemberSig, Vote};
+use qlab_devnet::ebbflow::EquivocationEvidence;
 use qlab_devnet::fees::ArityBucket;
 use qlab_devnet::hash::keccak256;
 use qlab_devnet::header::{
@@ -220,6 +221,42 @@ pub fn decode_checkpoint_msg(buf: &[u8]) -> Result<(Checkpoint, Vec<Vote>), Deco
 /// A checkpoint's inventory id — binds (height, block_hash, root) + domain.
 pub fn checkpoint_id(cp: &Checkpoint) -> Hash32 {
     keccak256(&cp.signing_message())
+}
+
+// --------------------------------------------------------------------------
+// Equivocation evidence (committee-gov §3 — gossiped so the whole network
+// applies the automated tombstone; M9-N5)
+// --------------------------------------------------------------------------
+
+/// Encode equivocation evidence: two (checkpoint, vote) pairs for the same slot.
+pub fn encode_evidence_msg(ev: &EquivocationEvidence) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_checkpoint(&mut out, &ev.cp_a);
+    write_vote(&mut out, &ev.vote_a);
+    write_checkpoint(&mut out, &ev.cp_b);
+    write_vote(&mut out, &ev.vote_b);
+    out
+}
+
+/// Decode an equivocation-evidence body (reject-trailing).
+pub fn decode_evidence_msg(buf: &[u8]) -> Result<EquivocationEvidence, DecodeError> {
+    let mut r = Reader::new(buf);
+    let cp_a = read_checkpoint(&mut r)?;
+    let vote_a = read_vote(&mut r)?;
+    let cp_b = read_checkpoint(&mut r)?;
+    let vote_b = read_vote(&mut r)?;
+    r.finish()?;
+    Ok(EquivocationEvidence { cp_a, vote_a, cp_b, vote_b })
+}
+
+/// An evidence object's inventory/dedup id — binds both signing messages and the
+/// offending signer, so re-gossip of the same evidence dedups to one relay.
+pub fn evidence_id(ev: &EquivocationEvidence) -> Hash32 {
+    let mut m = Vec::new();
+    m.extend_from_slice(&ev.cp_a.signing_message());
+    m.extend_from_slice(&ev.cp_b.signing_message());
+    m.extend_from_slice(&(ev.vote_a.signer as u64).to_le_bytes());
+    keccak256(&m)
 }
 
 // --------------------------------------------------------------------------
@@ -455,6 +492,32 @@ mod tests {
         for v in &votes2 {
             assert!(committee.verify_vote(&cp2, v));
         }
+    }
+
+    #[test]
+    fn evidence_round_trips_and_id_is_stable() {
+        use qlab_devnet::ebbflow::EquivocationEvidence;
+        let (committee, validators) = devnet_committee(7);
+        // Signer 3 signs two conflicting checkpoints at the same height.
+        let a = Checkpoint::new(8, [0xAA; 32], [0xAA; 32]);
+        let b = Checkpoint::new(8, [0xBB; 32], [0xBB; 32]);
+        let ev = EquivocationEvidence {
+            vote_a: validators[3].sign_checkpoint(&a),
+            cp_a: a,
+            vote_b: validators[3].sign_checkpoint(&b),
+            cp_b: b,
+        };
+        let bytes = encode_evidence_msg(&ev);
+        let back = decode_evidence_msg(&bytes).unwrap();
+        // Both decoded votes still verify against the committee.
+        assert!(committee.verify_vote(&back.cp_a, &back.vote_a));
+        assert!(committee.verify_vote(&back.cp_b, &back.vote_b));
+        assert_eq!(back.vote_a.signer, 3);
+        assert_eq!(evidence_id(&back), evidence_id(&ev));
+        // Trailing byte is rejected.
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert!(matches!(decode_evidence_msg(&extra), Err(DecodeError::Trailing { .. })));
     }
 
     #[test]

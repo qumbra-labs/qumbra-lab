@@ -9,12 +9,13 @@ use std::collections::{HashMap, HashSet};
 
 use qlab_devnet::committee::{Checkpoint, Vote};
 use qlab_devnet::body::TxEntry;
+use qlab_devnet::ebbflow::EquivocationEvidence;
 use qlab_devnet::header::{BlockHeader, Hash32};
 
 use crate::codec::{
-    checkpoint_id, decode_checkpoint_msg, decode_headers, decode_inv, decode_locator, decode_tx,
-    encode_checkpoint_msg, encode_headers, encode_inv, encode_locator, encode_tx, tx_id, InvItem,
-    InvKind,
+    checkpoint_id, decode_checkpoint_msg, decode_evidence_msg, decode_headers, decode_inv,
+    decode_locator, decode_tx, encode_checkpoint_msg, encode_evidence_msg, encode_headers,
+    encode_inv, encode_locator, encode_tx, evidence_id, tx_id, InvItem, InvKind,
 };
 use crate::compact::{
     decode_announce, decode_block_txn, decode_get_block_txn, encode_announce, encode_block_txn,
@@ -217,6 +218,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             MsgType::Tx => self.on_tx(from, &env.payload),
             MsgType::Header => self.on_header(from, &env.payload),
             MsgType::Checkpoint => self.on_checkpoint(from, &env.payload),
+            MsgType::Evidence => self.on_evidence(from, &env.payload),
             MsgType::GetHeaders => self.on_get_headers(from, &env.payload),
             MsgType::Headers => self.on_headers(from, &env.payload),
             MsgType::CmpctBlock => self.on_cmpct_block(from, &env.payload),
@@ -363,6 +365,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return;
             }
         };
+        // Committee-over-network equivocation path: a checkpoint's votes may reveal
+        // a signer that already signed a conflicting checkpoint at this slot. Detect
+        // it, apply the automated tombstone locally, and gossip the evidence so the
+        // whole network converges — BEFORE finalizing, so the tombstoned vote can no
+        // longer count toward this checkpoint's quorum.
+        for ev in self.node.observe_votes(&cp, &votes) {
+            self.punish_and_gossip_evidence(ev);
+        }
         let id = checkpoint_id(&cp);
         let stored = (cp, votes.clone());
         match self.node.ingest_checkpoint(cp, votes) {
@@ -376,6 +386,63 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             _ => {}
         }
+    }
+
+    // --- committee: equivocation evidence gossip (M9-N5) ---
+
+    /// Apply verified evidence locally and, if it was valid and not already seen,
+    /// gossip it to every ready peer so the whole network tombstones the signer.
+    fn punish_and_gossip_evidence(&mut self, ev: EquivocationEvidence) {
+        if self.node.apply_evidence(&ev).is_none() {
+            return; // did not verify — nothing to relay
+        }
+        let id = evidence_id(&ev);
+        if self.seen.insert(id) {
+            let payload = encode_evidence_msg(&ev);
+            for pid in self.peers.ready_peers() {
+                self.send(pid, MsgType::Evidence, payload.clone());
+            }
+        }
+    }
+
+    /// Gossip locally-held equivocation evidence (e.g. produced off-network).
+    pub fn announce_evidence(&mut self, ev: EquivocationEvidence) {
+        self.punish_and_gossip_evidence(ev);
+    }
+
+    fn on_evidence(&mut self, from: PeerId, payload: &[u8]) {
+        let ev = match decode_evidence_msg(payload) {
+            Ok(e) => e,
+            Err(_) => {
+                self.peers.penalize(from, PENALTY_MALFORMED);
+                return;
+            }
+        };
+        let id = evidence_id(&ev);
+        if !self.seen.insert(id) {
+            return; // already handled — dedup re-gossip
+        }
+        match self.node.apply_evidence(&ev) {
+            Some(_signer) => {
+                // Valid → relay onward to every ready peer except the sender.
+                let payload = encode_evidence_msg(&ev);
+                for pid in self.peers.ready_peers() {
+                    if pid != from {
+                        self.send(pid, MsgType::Evidence, payload.clone());
+                    }
+                }
+            }
+            None => {
+                // Evidence that does not verify is an invalid object.
+                self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+            }
+        }
+    }
+
+    /// This node's Ebb-and-Flow regime (Final vs degraded probabilistic PoW),
+    /// observed over the network.
+    pub fn finality_status(&self) -> qlab_devnet::ebbflow::FinalityStatus {
+        self.node.finality_status()
     }
 
     // --- header-first sync ---
@@ -594,13 +661,33 @@ fn build_announce_parts(txs: &[TxEntry], nonce: u64) -> (Vec<PrefilledTx>, Vec<[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::n1::{BlockIngest, ChainView, StubNode, TxPool};
+    use crate::n1::{BlockIngest, ChainView, CommitteeControl, StubNode, TxPool};
     use crate::transport::{InProcHub, InProcTransport};
     use qlab_devnet::body::TxPublic;
-    use qlab_devnet::committee::{devnet_committee, CommitteeState, Validator};
+    use qlab_devnet::committee::{devnet_committee, CommitteeState, MemberStatus, Validator};
+    use qlab_devnet::ebbflow::{EquivocationEvidence, FinalityStatus};
+    use qlab_devnet::epoch::{EpochCommittee, EpochSchedule};
     use qlab_devnet::fees::ArityBucket;
+    use qlab_devnet::finality::next_checkpoint_height;
     use qlab_devnet::params_devnet::BOND_AMOUNT;
     use std::sync::Arc;
+
+    /// Verified equivocation evidence: `signer` signed two conflicting checkpoints
+    /// at `height` (distinct block hashes ⇒ distinct signing messages).
+    fn conflicting_evidence(
+        validators: &[Validator],
+        signer: usize,
+        height: u64,
+    ) -> EquivocationEvidence {
+        let a = Checkpoint::new(height, [0xA0 + signer as u8; 32], [0xA0; 32]);
+        let b = Checkpoint::new(height, [0xB0 + signer as u8; 32], [0xB0; 32]);
+        EquivocationEvidence {
+            vote_a: validators[signer].sign_checkpoint(&a),
+            cp_a: a,
+            vote_b: validators[signer].sign_checkpoint(&b),
+            cp_b: b,
+        }
+    }
 
     type InProcP2p = P2pNode<InProcTransport, StubNode>;
 
@@ -821,5 +908,240 @@ mod tests {
         a.send(PeerId(2), &[0xFF; 20]).unwrap();
         node.tick();
         assert!(node.peers().get(PeerId(1)).unwrap().score < 0, "sender penalized");
+    }
+
+    // ── M9-N5: committee over network ───────────────────────────────────────
+
+    /// Equivocation evidence path: one node holds proof that a member double-signed
+    /// a slot; announcing it tombstones that member on EVERY node — the automated
+    /// slash executing across the network with no human in the path (committee-gov
+    /// §3).
+    #[test]
+    fn equivocation_evidence_gossip_tombstones_whole_network() {
+        // mesh() builds independent-but-deterministic committees → identical keys,
+        // so `validators` from a fresh build verify on every node.
+        let (_c, validators) = devnet_committee(7);
+        let (mut nodes, _hub) = mesh(3);
+        run(&mut nodes);
+
+        nodes[0].announce_evidence(conflicting_evidence(&validators, 3, 8));
+        run(&mut nodes);
+
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(n.node().is_tombstoned(3), "node {i} tombstoned the equivocator");
+        }
+    }
+
+    /// A node that receives two conflicting checkpoints for the same slot detects
+    /// the equivocation itself (no pre-packaged evidence) and gossips it, so the
+    /// whole network converges on the tombstone.
+    #[test]
+    fn conflicting_checkpoints_auto_detected_and_propagated() {
+        let (_c, validators) = devnet_committee(7); // quorum 5
+        let (mut nodes, _hub) = mesh(3);
+        run(&mut nodes);
+
+        // Two checkpoints at height 8 with different block hashes; signer 3 is in
+        // both vote sets (it equivocates). Node 1 originates one, node 2 the other;
+        // node 0 receives both and detects.
+        let cp_a = Checkpoint::new(8, [0xAA; 32], [0xAA; 32]);
+        let cp_b = Checkpoint::new(8, [0xBB; 32], [0xBB; 32]);
+        let votes_a: Vec<Vote> =
+            [0, 1, 2, 3, 4].iter().map(|&s| validators[s].sign_checkpoint(&cp_a)).collect();
+        let votes_b: Vec<Vote> =
+            [3, 5, 6, 0, 1].iter().map(|&s| validators[s].sign_checkpoint(&cp_b)).collect();
+        nodes[1].announce_checkpoint(cp_a, votes_a);
+        nodes[2].announce_checkpoint(cp_b, votes_b);
+        run(&mut nodes);
+
+        // Signer 3 (in both) is tombstoned everywhere via the auto-detected evidence.
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(n.node().is_tombstoned(3), "node {i} converged on the tombstone");
+        }
+    }
+
+    /// NEGATIVE — tombstoned votes MUST NOT count toward quorum, over the network
+    /// (frozen §4). With 3 of 7 tombstoned, a checkpoint carrying all 7 votes has
+    /// only 4 that count (< quorum 5) and finalizes nowhere.
+    #[test]
+    fn tombstoned_vote_excluded_from_quorum_over_network() {
+        let (_c, validators) = devnet_committee(7); // quorum 5
+        let (mut nodes, _hub) = mesh(2);
+        run(&mut nodes);
+
+        // Tombstone signers 0,1,2 network-wide via gossiped evidence.
+        for s in [0usize, 1, 2] {
+            nodes[0].announce_evidence(conflicting_evidence(&validators, s, 90 + s as u64));
+        }
+        run(&mut nodes);
+        for n in &nodes {
+            for s in [0, 1, 2] {
+                assert!(n.node().is_tombstoned(s));
+            }
+        }
+
+        // A checkpoint at height 2 signed by ALL 7: the 3 tombstoned are dropped,
+        // leaving 4 < 5. (announce_checkpoint won't relay a non-finalizing cp, so
+        // feed both nodes directly.)
+        let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
+        let votes: Vec<Vote> = validators.iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        nodes[0].announce_checkpoint(cp, votes.clone());
+        nodes[1].announce_checkpoint(cp, votes);
+        run(&mut nodes);
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(
+                n.node().finality().finalized_height(),
+                None,
+                "node {i}: tombstoned votes must not reach quorum"
+            );
+        }
+    }
+
+    /// NEGATIVE — a checkpoint that does not strictly advance the finalized height
+    /// is rejected over the network; finality stays where it was.
+    #[test]
+    fn non_advancing_checkpoint_rejected_over_network() {
+        let (_c, validators) = devnet_committee(7);
+        let (mut nodes, _hub) = mesh(3);
+        run(&mut nodes);
+
+        // Finalize height 8 across the network.
+        let cp8 = Checkpoint::new(8, [8; 32], [8; 32]);
+        let v8: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp8)).collect();
+        nodes[0].announce_checkpoint(cp8, v8);
+        run(&mut nodes);
+        for n in &nodes {
+            assert_eq!(n.node().finality().finalized_height(), Some(8));
+        }
+        let counts: Vec<usize> = nodes.iter().map(|n| n.node().finality().count()).collect();
+
+        // A lower checkpoint (height 4) with a valid quorum must NOT advance.
+        let cp4 = Checkpoint::new(4, [4; 32], [4; 32]);
+        let v4: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp4)).collect();
+        nodes[0].announce_checkpoint(cp4, v4.clone());
+        nodes[1].announce_checkpoint(cp4, v4);
+        run(&mut nodes);
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(n.node().finality().finalized_height(), Some(8), "node {i} unchanged");
+            assert_eq!(n.node().finality().count(), counts[i], "no extra checkpoint recorded");
+        }
+    }
+
+    /// Ebb-and-Flow over the network: with no committee finality the mesh runs in
+    /// degraded probabilistic mode; a checkpoint near the tip restores Final on
+    /// every node (consensus §4).
+    #[test]
+    fn finality_degrades_and_recovers_over_network() {
+        let (_c, validators) = devnet_committee(7);
+        let (mut nodes, _hub) = mesh(3);
+        run(&mut nodes);
+
+        // Grow a 20-block chain by gossip; nothing finalized ⇒ degraded everywhere.
+        let mut parent = genesis();
+        for i in 0..20u64 {
+            let child = BlockHeader::child_of(&parent, (i + 1) * 75, 1000, [(i as u8) + 1; 32]);
+            nodes[0].announce_header(child);
+            parent = child;
+        }
+        run(&mut nodes);
+        for n in &nodes {
+            assert_eq!(n.finality_status(), FinalityStatus::Degraded, "no finality ⇒ degraded");
+        }
+
+        // Finalize the tip → Final on every node.
+        let tip_h = nodes[0].node().tip_height();
+        let tip_hash = nodes[0].node().chain().tip_hash();
+        let cp = Checkpoint::new(tip_h, tip_hash, tip_hash);
+        let votes: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        nodes[0].announce_checkpoint(cp, votes);
+        run(&mut nodes);
+        for n in &nodes {
+            assert_eq!(n.finality_status(), FinalityStatus::Final, "finality resumes cleanly");
+        }
+    }
+
+    /// Checkpoint cadence over the network: driving finalization on the 8-block
+    /// grid (`next_checkpoint_height`) lands finality on the largest slot ≤ tip.
+    #[test]
+    fn checkpoints_follow_the_8_block_cadence() {
+        let (_c, validators) = devnet_committee(7);
+        let (mut nodes, _hub) = mesh(2);
+        run(&mut nodes);
+
+        let mut parent = genesis();
+        for i in 0..20u64 {
+            let child = BlockHeader::child_of(&parent, (i + 1) * 75, 1000, [(i as u8) + 1; 32]);
+            nodes[0].announce_header(child);
+            parent = child;
+        }
+        run(&mut nodes);
+
+        let cadence = qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS; // 8
+        let mut finalized: Option<u64> = None;
+        while let Some(h) = next_checkpoint_height(finalized, nodes[0].node().tip_height(), cadence) {
+            let bh = nodes[0].node().chain().main_chain()[h as usize];
+            let cp = Checkpoint::new(h, bh, bh);
+            let votes: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+            nodes[0].announce_checkpoint(cp, votes);
+            run(&mut nodes);
+            finalized = Some(h);
+        }
+        // Tip 20 → slots 8, 16 finalize; 24 is not reached.
+        assert_eq!(finalized, Some(16));
+        for n in &nodes {
+            assert_eq!(n.node().finality().finalized_height(), Some(16));
+        }
+    }
+
+    /// Epoch membership machinery over the network: the committee advances epochs
+    /// as the gossiped chain crosses boundaries (committee-gov §2). Uses a small
+    /// epoch so a short chain crosses one.
+    #[test]
+    fn epoch_advances_with_the_chain_over_network() {
+        let (committee, validators) = devnet_committee(7);
+        let sched = EpochSchedule::new(8); // small epoch: boundary at height 8
+        let hub = InProcHub::new();
+        let mut nodes: Vec<InProcP2p> = (0..2)
+            .map(|i| {
+                let t = InProcTransport::new(PeerId(i + 1), Arc::clone(&hub));
+                let ec = EpochCommittee::genesis(
+                    sched,
+                    CommitteeState::new(committee.clone(), BOND_AMOUNT),
+                );
+                P2pNode::new(t, StubNode::with_epoch(genesis(), ec), [i as u8 + 1; 32])
+            })
+            .collect();
+        hub.link(PeerId(1), PeerId(2));
+        nodes[0].add_peer(PeerId(2), None);
+        nodes[1].add_peer(PeerId(1), None);
+        run(&mut nodes);
+
+        // Grow the chain to height 10 (crosses the height-8 boundary) via gossip.
+        let mut parent = genesis();
+        for i in 0..10u64 {
+            let child = BlockHeader::child_of(&parent, (i + 1) * 75, 1000, [(i as u8) + 1; 32]);
+            nodes[0].announce_header(child);
+            parent = child;
+        }
+        run(&mut nodes);
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(n.node().committee().current_epoch(), 1, "node {i} sealed epoch 0");
+            // No membership change was staged, so the epoch-1 roster is the genesis
+            // set intact — all members Active.
+            let st = n.node().committee().state();
+            for idx in 0..st.size() {
+                assert_eq!(st.status(idx), Some(MemberStatus::Active));
+            }
+        }
+
+        // A checkpoint in epoch 1 still finalizes against the (unchanged) committee.
+        let bh = nodes[0].node().chain().main_chain()[8];
+        let cp = Checkpoint::new(8, bh, bh);
+        let votes: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        nodes[0].announce_checkpoint(cp, votes);
+        run(&mut nodes);
+        for n in &nodes {
+            assert_eq!(n.node().finality().finalized_height(), Some(8));
+        }
     }
 }

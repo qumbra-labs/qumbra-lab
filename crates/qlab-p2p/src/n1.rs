@@ -17,8 +17,16 @@ use std::collections::{HashMap, HashSet};
 use qlab_devnet::body::TxEntry;
 use qlab_devnet::chain::{ChainState, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, Vote};
+use qlab_devnet::ebbflow::{
+    finality_status, verify_equivocation, EquivocationEvidence, FinalityStatus, SigningWindow,
+};
+use qlab_devnet::epoch::{EpochCommittee, EpochSchedule};
 use qlab_devnet::finality::{FinalityTracker, FinalizeError};
 use qlab_devnet::header::{BlockHeader, Hash32};
+use qlab_devnet::params_devnet::{
+    DEGRADED_MODE_LAG_BLOCKS, DOWNTIME_JAIL_THRESHOLD_PCT, DOWNTIME_JAIL_WINDOW,
+    EPOCH_LENGTH_BLOCKS, EQUIVOCATION_SLASH_AMOUNT, JAIL_BLOCKS,
+};
 
 use crate::codec::{checkpoint_id, tx_id};
 
@@ -79,32 +87,85 @@ pub trait CheckpointIngest {
     fn has_checkpoint(&self, id: &Hash32) -> bool;
 }
 
-/// Convenience super-trait: a node the P2P layer can fully drive.
-pub trait NodeState: ChainView + BlockIngest + TxPool + CheckpointIngest {}
-impl<T: ChainView + BlockIngest + TxPool + CheckpointIngest> NodeState for T {}
+/// The committee-over-network control surface (M9-N5): equivocation detection +
+/// the automated-punishment path, and the Ebb-and-Flow regime. The P2P layer calls
+/// these when it relays checkpoint votes and evidence; N7 satisfies the same
+/// contract over the real node.
+pub trait CommitteeControl {
+    /// Record the votes carried by a gossiped checkpoint and return any **new**
+    /// equivocation evidence they reveal — the same signer having signed two
+    /// conflicting checkpoints at the same slot (committee-gov §3: "the pair of
+    /// signatures *is* the proof"). Only votes that verify against the epoch's
+    /// committee are recorded, so a peer cannot manufacture fake evidence.
+    fn observe_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> Vec<EquivocationEvidence>;
 
-/// An in-memory node-state stub for tests — a real (devnet) [`ChainState`] +
-/// finality tracker + a mempool + a seen-checkpoint set. Structural only: it does
-/// **not** re-run PoW / proof verification (that is N1/N4's job); it is enough to
-/// exercise gossip, sync, and relay end to end.
+    /// Apply verified equivocation evidence: permanent tombstone + bond slash, no
+    /// human in the path. Idempotent (tombstone is terminal). Returns the punished
+    /// signer index, or `None` if the evidence does not verify.
+    fn apply_evidence(&mut self, ev: &EquivocationEvidence) -> Option<usize>;
+
+    /// This node's finality regime (Final vs degraded probabilistic PoW) from the
+    /// tip-vs-finalized lag — the Ebb-and-Flow split (consensus §4), observed over
+    /// the network.
+    fn finality_status(&self) -> FinalityStatus;
+
+    /// Whether committee member `idx` is currently tombstoned (test/assert hook).
+    fn is_tombstoned(&self, idx: usize) -> bool;
+}
+
+/// Convenience super-trait: a node the P2P layer can fully drive.
+pub trait NodeState: ChainView + BlockIngest + TxPool + CheckpointIngest + CommitteeControl {}
+impl<T: ChainView + BlockIngest + TxPool + CheckpointIngest + CommitteeControl> NodeState for T {}
+
+/// An in-memory node-state stub for tests — a real (devnet) [`ChainState`] + an
+/// [`EpochCommittee`] (membership + status across epochs) + a finality tracker + a
+/// mempool + a seen-checkpoint set + a downtime [`SigningWindow`]. Structural only:
+/// it does **not** re-run PoW / proof verification (that is N1/N4's job); it is
+/// enough to exercise checkpoint gossip, committee finalization, epoch membership,
+/// downtime jail, equivocation-evidence, and Ebb-and-Flow — all over the network.
 pub struct StubNode {
     chain: ChainState,
     mempool: HashMap<Hash32, TxEntry>,
-    committee: CommitteeState,
+    /// The committee across epochs (M9-N5) — replaces the M6 static set.
+    committee: EpochCommittee,
     finality: FinalityTracker,
     seen_checkpoints: HashSet<Hash32>,
+    /// Trailing-window signer participation, for downtime-jail detection.
+    signing: SigningWindow,
+    /// Every (height, signer) → the checkpoint+vote first seen for it, so a second
+    /// conflicting vote at the same slot is detectable as equivocation.
+    votes_seen: HashMap<(u64, usize), (Checkpoint, Vote)>,
 }
 
 impl StubNode {
-    /// New node from a shared genesis header and committee.
+    /// New node from a shared genesis header and a **static genesis committee** —
+    /// wrapped in a genesis [`EpochCommittee`] at the frozen epoch length, so a
+    /// caller that does not exercise membership changes behaves exactly as the M6
+    /// static set did (no boundary is crossed under the frozen 1,152-block epoch in
+    /// these short sims). The downtime window is the frozen (100, 33 %).
     pub fn new(genesis: BlockHeader, committee: CommitteeState) -> Self {
+        let ec = EpochCommittee::genesis(EpochSchedule::new(EPOCH_LENGTH_BLOCKS), committee);
+        Self::with_epoch(genesis, ec)
+    }
+
+    /// New node from a shared genesis header and an explicit [`EpochCommittee`] —
+    /// used by membership/epoch tests that want a small epoch length so a run
+    /// crosses boundaries.
+    pub fn with_epoch(genesis: BlockHeader, committee: EpochCommittee) -> Self {
         StubNode {
             chain: ChainState::new(genesis),
             mempool: HashMap::new(),
             committee,
             finality: FinalityTracker::new(),
             seen_checkpoints: HashSet::new(),
+            signing: SigningWindow::new(DOWNTIME_JAIL_WINDOW, DOWNTIME_JAIL_THRESHOLD_PCT),
+            votes_seen: HashMap::new(),
         }
+    }
+
+    /// Override the downtime signing window (tests use a small window so it fills).
+    pub fn set_signing_window(&mut self, window: usize, threshold_pct: u64) {
+        self.signing = SigningWindow::new(window, threshold_pct);
     }
 
     /// Read-only chain access (tests / assertions).
@@ -118,6 +179,21 @@ impl StubNode {
     /// The finality tracker (tests / assertions).
     pub fn finality(&self) -> &FinalityTracker {
         &self.finality
+    }
+    /// The epoch committee (tests / assertions).
+    pub fn committee(&self) -> &EpochCommittee {
+        &self.committee
+    }
+
+    /// Apply any downtime jails the signing window now warrants at `height`
+    /// (jail-no-slash; auto-readmit after [`JAIL_BLOCKS`]). No-op on tombstoned.
+    fn apply_downtime_jails(&mut self, height: u64) {
+        let n = self.committee.state().size();
+        for idx in 0..n {
+            if self.signing.jailable(idx) {
+                self.committee.state_mut().jail(idx, height + JAIL_BLOCKS);
+            }
+        }
     }
 }
 
@@ -151,7 +227,18 @@ impl ChainView for StubNode {
 impl BlockIngest for StubNode {
     fn ingest_header(&mut self, header: BlockHeader) -> IngestOutcome {
         match self.chain.insert_header(header) {
-            Ok(_) => IngestOutcome::Accepted,
+            Ok(_) => {
+                // Advance the epoch machinery to the new tip: membership changes
+                // seal at any boundary crossed (committee-gov §2). Reset the
+                // downtime window on an epoch change — indices are reassigned at a
+                // boundary (prototype simplification, annotated in `epoch`).
+                let before = self.committee.current_epoch();
+                self.committee.advance_to(self.chain.tip_height());
+                if self.committee.current_epoch() != before {
+                    self.signing.reset();
+                }
+                IngestOutcome::Accepted
+            }
             Err(InsertError::Duplicate) => IngestOutcome::Duplicate,
             Err(InsertError::UnknownParent) => IngestOutcome::Orphan,
             Err(InsertError::BadHeight) => IngestOutcome::Rejected("bad height"),
@@ -185,13 +272,36 @@ impl CheckpointIngest for StubNode {
         if self.seen_checkpoints.contains(&id) {
             return IngestOutcome::Duplicate;
         }
-        match self.finality.try_finalize(&cp, &votes, self.committee.committee()) {
+        // Filter to signers that may sign at this height: tombstoned and jailed
+        // members are excluded from quorum BEFORE the count (frozen §4: tombstoned
+        // votes MUST NOT count toward quorum). "Who may sign" is the committee of
+        // this checkpoint's epoch ([`EpochCommittee::state_for_height`]).
+        let active_signers: Vec<usize> = {
+            let cstate = self.committee.state_for_height(cp.height);
+            votes
+                .iter()
+                .filter(|v| cstate.is_active(v.signer, cp.height))
+                .map(|v| v.signer)
+                .collect()
+        };
+        let active_votes: Vec<Vote> =
+            votes.iter().filter(|v| active_signers.contains(&v.signer)).cloned().collect();
+
+        let result = {
+            let committee = self.committee.state_for_height(cp.height).committee();
+            self.finality.try_finalize(&cp, &active_votes, committee)
+        };
+        match result {
             Ok(()) => {
                 self.seen_checkpoints.insert(id);
                 // Mark the finalized block in the chain store (best-effort: the
                 // block may not be known yet on this node, which is fine — the
                 // checkpoint is still recorded for anchor/age queries).
                 let _ = self.chain.set_finalized(cp.block_hash);
+                // Record signing participation for downtime detection, then jail
+                // any member the trailing window now shows dark.
+                self.signing.record_round(&active_signers);
+                self.apply_downtime_jails(cp.height);
                 IngestOutcome::Accepted
             }
             Err(FinalizeError::NotAdvancing { .. }) => {
@@ -213,10 +323,76 @@ impl CheckpointIngest for StubNode {
     }
 }
 
+impl CommitteeControl for StubNode {
+    fn observe_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> Vec<EquivocationEvidence> {
+        let mut evidence = Vec::new();
+        for v in votes {
+            // Only record votes that actually verify against this epoch's
+            // committee — a forged vote cannot seed fake equivocation.
+            {
+                let committee = self.committee.state_for_height(cp.height).committee();
+                if !committee.verify_vote(cp, v) {
+                    continue;
+                }
+            }
+            let key = (cp.height, v.signer);
+            match self.votes_seen.get(&key) {
+                Some((prev_cp, prev_vote)) if prev_cp != cp => {
+                    // Two valid votes, same slot, different checkpoint = equivocation.
+                    let ev = EquivocationEvidence {
+                        cp_a: *prev_cp,
+                        vote_a: prev_vote.clone(),
+                        cp_b: *cp,
+                        vote_b: v.clone(),
+                    };
+                    let committee = self.committee.state_for_height(cp.height).committee();
+                    if verify_equivocation(&ev, committee).is_ok() {
+                        evidence.push(ev);
+                    }
+                }
+                Some(_) => { /* same checkpoint again — a duplicate vote, not a conflict */ }
+                None => {
+                    self.votes_seen.insert(key, (*cp, v.clone()));
+                }
+            }
+        }
+        evidence
+    }
+
+    fn apply_evidence(&mut self, ev: &EquivocationEvidence) -> Option<usize> {
+        // Verify against the committee that owned the equivocated slot; the borrow
+        // ends before we take the mutable one to tombstone.
+        let verified =
+            verify_equivocation(ev, self.committee.state_for_height(ev.cp_a.height).committee());
+        match verified {
+            Ok(signer) => {
+                self.committee.state_mut().tombstone(signer, EQUIVOCATION_SLASH_AMOUNT);
+                Some(signer)
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn finality_status(&self) -> FinalityStatus {
+        finality_status(
+            self.chain.tip_height(),
+            self.finality.finalized_height(),
+            DEGRADED_MODE_LAG_BLOCKS,
+        )
+    }
+
+    fn is_tombstoned(&self, idx: usize) -> bool {
+        matches!(
+            self.committee.state().status(idx),
+            Some(qlab_devnet::committee::MemberStatus::Tombstoned)
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qlab_devnet::committee::devnet_committee;
+    use qlab_devnet::committee::{devnet_committee, Validator};
     use qlab_devnet::params_devnet::BOND_AMOUNT;
 
     fn genesis() -> BlockHeader {
@@ -277,5 +453,77 @@ mod tests {
         assert_eq!(n.finalized_height(), Some(2));
         // Re-delivery is a dup.
         assert_eq!(n.ingest_checkpoint(cp, votes5), IngestOutcome::Duplicate);
+    }
+
+    fn conflicting_evidence(validators: &[Validator], signer: usize, height: u64) -> EquivocationEvidence {
+        let a = Checkpoint::new(height, [0xA0 + signer as u8; 32], [0xA0; 32]);
+        let b = Checkpoint::new(height, [0xB0 + signer as u8; 32], [0xB0; 32]);
+        EquivocationEvidence {
+            vote_a: validators[signer].sign_checkpoint(&a),
+            cp_a: a,
+            vote_b: validators[signer].sign_checkpoint(&b),
+            cp_b: b,
+        }
+    }
+
+    #[test]
+    fn ingest_checkpoint_drops_tombstoned_votes_from_quorum() {
+        // frozen §4: tombstoned votes MUST NOT count toward quorum.
+        let (committee, validators) = devnet_committee(7); // quorum 5
+        let mut n = StubNode::new(genesis(), CommitteeState::new(committee, BOND_AMOUNT));
+        // Tombstone signers 0,1,2 via verified equivocation evidence → 4 active.
+        for s in [0usize, 1, 2] {
+            assert_eq!(n.apply_evidence(&conflicting_evidence(&validators, s, 90 + s as u64)), Some(s));
+            assert!(n.is_tombstoned(s));
+        }
+        // All 7 sign a fresh checkpoint, but only the 4 non-tombstoned count < 5.
+        let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
+        let votes: Vec<Vote> = validators.iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        assert_eq!(n.ingest_checkpoint(cp, votes), IngestOutcome::Rejected("insufficient quorum"));
+        assert_eq!(n.finalized_height(), None);
+    }
+
+    #[test]
+    fn observe_votes_detects_conflict_but_not_duplicates_or_forgeries() {
+        let (committee, validators) = devnet_committee(7);
+        let mut n = StubNode::new(genesis(), CommitteeState::new(committee, BOND_AMOUNT));
+        let cp_a = Checkpoint::new(8, [0xAA; 32], [0xAA; 32]);
+        let cp_b = Checkpoint::new(8, [0xBB; 32], [0xBB; 32]); // conflicting, same slot
+
+        // First sighting: nothing to report.
+        let v_a = vec![validators[3].sign_checkpoint(&cp_a)];
+        assert!(n.observe_votes(&cp_a, &v_a).is_empty());
+        // Same checkpoint again = a duplicate vote, not a conflict.
+        assert!(n.observe_votes(&cp_a, &v_a).is_empty());
+        // A conflicting checkpoint by the same signer = equivocation.
+        let v_b = vec![validators[3].sign_checkpoint(&cp_b)];
+        let ev = n.observe_votes(&cp_b, &v_b);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].vote_a.signer, 3);
+        // A forged vote (valid signature but wrong signer index) is ignored — it
+        // does not verify against the committee, so it can't seed fake evidence.
+        let forged = Vote { signer: 5, signature: validators[3].sign_checkpoint(&cp_a).signature };
+        assert!(n.observe_votes(&cp_a, &[forged]).is_empty());
+    }
+
+    #[test]
+    fn downtime_jail_fires_over_the_ingest_path() {
+        // A member that never signs across a full window is jailed (no slash).
+        let (committee, validators) = devnet_committee(7); // quorum 5
+        let mut n = StubNode::new(genesis(), CommitteeState::new(committee, BOND_AMOUNT));
+        n.set_signing_window(4, 33); // small window so it fills quickly
+        // Four advancing checkpoints, each signed by 0..4 only (5,6 stay dark).
+        for h in 1..=4u64 {
+            let cp = Checkpoint::new(h, [h as u8; 32], [h as u8; 32]);
+            let votes: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+            assert_eq!(n.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+        }
+        // Signer 6 signed 0 of 4 (0 % < 33 %) → jailed; a full signer is not.
+        assert!(matches!(
+            n.committee().state().status(6),
+            Some(qlab_devnet::committee::MemberStatus::Jailed { .. })
+        ));
+        assert_eq!(n.committee().state().status(0), Some(qlab_devnet::committee::MemberStatus::Active));
+        assert_eq!(n.committee().state().slashed(6), Some(0), "downtime is jail, NOT slash");
     }
 }
