@@ -1,0 +1,28 @@
+[package]
+name = "qlab-node"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# M9-N1 node skeleton: the persistent, restart-safe consensus state a Qumbra
+# full node maintains — the chain store, the depth-32 commitment tree, and the
+# permanent nullifier set (protocol-spec §3/§6) — behind swappable store traits
+# (the N2–N6 consumption surface), with atomic disk snapshots and sync-from-
+# genesis replay. Prover-free: transaction-proof verification is injected via
+# qlab-devnet's `TxVerifier`, so the real M3 verifier (qlab-consensus) plugs in
+# without this crate depending on the prover.
+
+[dependencies]
+# Chain state / fork choice / finality, block header + body types, and the
+# body-validation rule (anchor-final + posted-fee + in-block double-spend).
+qlab-devnet = { path = "../qlab-devnet" }
+# The depth-32 incremental commitment tree (the exact consensus tree the M3
+# bucket proves membership against).
+qlab-cbserver = { path = "../qlab-cbserver" }
+# [u64;4] ↔ [u8;32] digest lane conversions (protocol-spec §1 lane-major LE).
+qlab-note = { path = "../qlab-note" }
+
+# Deterministic on-disk snapshot + block-log encoding.
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
