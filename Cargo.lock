@@ -973,7 +973,9 @@ dependencies = [
  "qlab-devnet",
  "qlab-econ",
  "qlab-note",
+ "rand",
  "serde",
+ "tiny_http",
 ]
 
 [[package]]

@@ -47,6 +47,7 @@ pub mod emission;
 pub mod mempool;
 mod node;
 mod persist;
+pub mod rpc;
 mod store;
 
 pub use emission::{coinbase, s_atomic, RewardSplit, COINBASE_MATURITY_BLOCKS};
@@ -55,6 +56,10 @@ pub use mempool::{
     BlockTemplate, Mempool, MempoolError, MempoolParams, MempoolTx, TxId,
 };
 pub use node::{genesis_block, MemNode, Node, NodeError, NodeState};
+pub use rpc::{
+    serve, AnchorSet, MemNodeRpc, NodeRpc, NodeStatus, RecipientDiscovery, RejectReason,
+    RouteResult, RpcServerHandle, SubmitOutcome, TxDiscovery,
+};
 pub use persist::{Snapshot, BLOCK_LOG, FORMAT_VERSION, SNAPSHOT};
 pub use store::{
     ChainStore, CommitmentStore, Hash32, MemChainStore, MemCommitmentStore, MemNullifierStore,
