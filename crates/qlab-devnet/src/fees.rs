@@ -6,9 +6,10 @@
 //! Monero nonstandard-fee fingerprinting result), so the fee is a deterministic
 //! function of public transaction structure. Single native fee asset.
 //!
-//! The concrete tier values are **placeholders** (`params_devnet`) — §8 defers
-//! them to the consensus-parameters appendix. The anti-spam block-weight penalty
-//! (§8) is out of devnet scope.
+//! The concrete tier values are the **FROZEN §5 fee table** (consensus-parameters,
+//! decided 2026-07-22): 0.01 / 0.02 / 0.04 QMB for 2×2 / 4×4 / 8×8 (10⁶ / 2×10⁶
+//! / 4×10⁶ bessel) — `params_devnet::FEE_MARGINAL_UNITS` converged to them at
+//! M9-N4. The anti-spam block-weight penalty (§8) lives in `weight.rs`.
 
 use crate::params_devnet::{FEE_GRACE_ACTIONS, FEE_MARGINAL_UNITS};
 
@@ -76,6 +77,15 @@ mod tests {
         // 2×2 = marginal × max(grace=2, 2) = marginal × 2.
         assert_eq!(f2, FEE_MARGINAL_UNITS * 2);
         assert_eq!(f8, FEE_MARGINAL_UNITS * 8);
+    }
+
+    #[test]
+    fn posted_fees_are_the_frozen_absolutes() {
+        // FROZEN §5 (consensus-parameters, decided 2026-07-22): 0.01 / 0.02 /
+        // 0.04 QMB = 10⁶ / 2×10⁶ / 4×10⁶ bessel (1 QMB = 10⁸ bessel, frozen §8).
+        assert_eq!(posted_fee(ArityBucket::TwoByTwo), 1_000_000);
+        assert_eq!(posted_fee(ArityBucket::FourByFour), 2_000_000);
+        assert_eq!(posted_fee(ArityBucket::EightByEight), 4_000_000);
     }
 
     #[test]
