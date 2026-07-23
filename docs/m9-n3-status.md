@@ -85,5 +85,29 @@ incumbent, then assert the reorg — the heaviest-chain property itself is uncha
 
 - Rig: Apple M-series, macOS (Darwin 25.5); `randomx-rs 1.4.1` builds with
   `cmake` + clang, recommended flags `FLAG_HARD_AES | FLAG_JIT | FLAG_SECURE`.
-- Acceptance: full unfiltered workspace suite (`cargo test --release`) — results
-  appended below once run.
+
+### Runs (this session, `--release` unless noted)
+
+| Suite | Result |
+|---|---|
+| `qlab-pow` | **25 passed** (RandomX vectors/determinism, keyblock, LWMA) |
+| `qlab-devnet` lib | **104 passed** (all M6 tests preserved) |
+| `qlab-devnet` `tests/randomx_e2e` | **3 passed** (mine→validate→peer-revalidate, rotation, seed-sensitivity) |
+| `qlab-demo` (debug; real M3 proofs) | **5 passed** (whole-stack composition) |
+| `qlab-bench m6devnet` | **1 passed** (the qlab-bench module that drives the devnet) |
+
+### Full-suite acceptance — deferred to the coordinator (explicit)
+
+The full unfiltered `cargo test --release -p qlab-bench` bar (bench discipline §5)
+was **NOT** run this session, deliberately: session **N2 was concurrently running
+an RSS-sensitive `qlab-bench` release measurement** and the 36 GiB machine was
+already at ~12 GB swap. The m4gate leaf/interior proves reach ~13–30 GB each;
+running a second heavy suite would have OOM/swapped both sessions and corrupted
+N2's peak-footprint numbers.
+
+This is safe to defer because **this diff is orthogonal to the AIR / m4gate** —
+verified boundary-clean (`git diff --name-only main...HEAD` touches only
+`qlab-pow`, `qlab-devnet`, the workspace manifest/lock, and this doc; **zero**
+`qlab-bench`/`m4gate` files). The only qlab-bench code exercising this change is
+the `m6devnet` module, which passed. Coordinator to run the full unfiltered
+qlab-bench acceptance on a quiet machine.
