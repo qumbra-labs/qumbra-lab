@@ -43,10 +43,12 @@
 //! the tests assert it — so a snapshot can never silently diverge from a genesis
 //! replay.
 
+pub mod emission;
 mod node;
 mod persist;
 mod store;
 
+pub use emission::{coinbase, s_atomic, RewardSplit, COINBASE_MATURITY_BLOCKS};
 pub use node::{genesis_block, MemNode, Node, NodeError, NodeState};
 pub use persist::{Snapshot, BLOCK_LOG, FORMAT_VERSION, SNAPSHOT};
 pub use store::{
