@@ -881,6 +881,10 @@ fn main() {
             m6devnet::run_m6devnet(&power);
             return;
         }
+        "n7soak" => {
+            n7soak::run_n7soak(&power, None);
+            return;
+        }
         "disclosure" => {
             disclosure::run_disclosure(&power);
             return;
