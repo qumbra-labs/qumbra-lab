@@ -32,6 +32,8 @@
 //! All wire (de)serialization is hand-rolled little-endian — the devnet consensus
 //! objects carry no serde, and neither does this crate, by design.
 
+pub mod codec;
+pub mod n1;
 pub mod varint;
 pub mod wire;
 
