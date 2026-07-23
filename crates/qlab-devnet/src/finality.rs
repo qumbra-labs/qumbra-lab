@@ -167,7 +167,7 @@ mod tests {
     use crate::pow::KeccakPow;
 
     fn easy_cfg() -> SimConfig {
-        SimConfig { block_time_secs: 2, genesis_difficulty: 8, mine_nonce_budget: 5_000_000 }
+        SimConfig { block_time_secs: 2, genesis_difficulty: 8, mine_nonce_budget: 5_000_000, ..SimConfig::default() }
     }
 
     /// End-to-end: mine a PoW chain, then a ⅔ quorum of the committee finalizes a

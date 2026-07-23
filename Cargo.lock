@@ -49,6 +49,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitflags"
+version = "1.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
+
+[[package]]
 name = "block-buffer"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -62,6 +68,16 @@ name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
+name = "cc"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c89588d05638b5b4594a3348a2d6c20277e43a7f5c5202b05cc56888475a47b8"
+dependencies = [
+ "find-msvc-tools",
+ "shlex",
+]
 
 [[package]]
 name = "cfg-if"
@@ -111,6 +127,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -122,7 +147,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
- "thiserror",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
@@ -234,6 +259,12 @@ name = "embedded-io"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "edd0f118536f44f5ccd48bcb8b111bdc3de888b58c74639dfb034a357d0f206d"
+
+[[package]]
+name = "find-msvc-tools"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "getrandom"
@@ -524,7 +555,7 @@ dependencies = [
  "rand",
  "serde",
  "spin 0.12.2",
- "thiserror",
+ "thiserror 2.0.19",
  "tracing",
 ]
 
@@ -623,7 +654,7 @@ dependencies = [
  "rand",
  "serde",
  "spin 0.12.2",
- "thiserror",
+ "thiserror 2.0.19",
  "tracing",
 ]
 
@@ -736,7 +767,7 @@ dependencies = [
  "p3-maybe-rayon",
  "p3-util",
  "serde",
- "thiserror",
+ "thiserror 2.0.19",
  "tracing",
 ]
 
@@ -840,6 +871,7 @@ dependencies = [
  "p3-util",
  "postcard",
  "qlab-air",
+ "qlab-consensus",
  "qlab-devnet",
  "qlab-disclosure",
  "qlab-note",
@@ -860,7 +892,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "qlab-demo"
+name = "qlab-consensus"
 version = "0.0.0"
 dependencies = [
  "bincode",
@@ -878,7 +910,15 @@ dependencies = [
  "p3-symmetric",
  "p3-uni-stark",
  "qlab-air",
+]
+
+[[package]]
+name = "qlab-demo"
+version = "0.0.0"
+dependencies = [
+ "qlab-air",
  "qlab-cbserver",
+ "qlab-consensus",
  "qlab-devnet",
  "qlab-note",
  "qlab-wallet",
@@ -891,6 +931,7 @@ version = "0.0.0"
 dependencies = [
  "ml-dsa",
  "qlab-air",
+ "qlab-pow",
  "tiny-keccak",
 ]
 
@@ -924,6 +965,17 @@ name = "qlab-econ"
 version = "0.0.0"
 
 [[package]]
+name = "qlab-node"
+version = "0.0.0"
+dependencies = [
+ "bincode",
+ "qlab-cbserver",
+ "qlab-devnet",
+ "qlab-note",
+ "serde",
+]
+
+[[package]]
 name = "qlab-note"
 version = "0.0.0"
 dependencies = [
@@ -932,6 +984,24 @@ dependencies = [
  "qlab-air",
  "rand",
  "tiny-keccak",
+]
+
+[[package]]
+name = "qlab-p2p"
+version = "0.0.0"
+dependencies = [
+ "ml-dsa",
+ "qlab-air",
+ "qlab-cbserver",
+ "qlab-devnet",
+ "qlab-note",
+]
+
+[[package]]
+name = "qlab-pow"
+version = "0.1.0"
+dependencies = [
+ "randomx-rs",
 ]
 
 [[package]]
@@ -975,6 +1045,18 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "randomx-rs"
+version = "1.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d108ec2b3f83ea06f8290685fa4a20c8f0803b1de43c2301639d7a0592474554"
+dependencies = [
+ "bitflags",
+ "cmake",
+ "libc",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "rayon"
@@ -1069,6 +1151,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
 name = "signature"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1148,11 +1236,31 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
+dependencies = [
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
 version = "2.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 2.0.19",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "1.0.69"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

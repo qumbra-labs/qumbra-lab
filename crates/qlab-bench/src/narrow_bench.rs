@@ -374,7 +374,7 @@ pub(crate) fn run_bucket(power: &str, only: Option<&str>) {
         }
     }
     println!();
-    println!("Gates: <= 150 KB and <= 3,000 ms at the consensus config b16/q20/g22/fp16/a16.");
+    println!("Gates: <= 150 KB and <= 3,000 ms at the consensus config b16/q21/g22/fp16/a16.");
 }
 
 #[cfg(test)]

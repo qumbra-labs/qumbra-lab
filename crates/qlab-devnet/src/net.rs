@@ -127,7 +127,7 @@ mod tests {
     use crate::pow::KeccakPow;
 
     fn cfg() -> SimConfig {
-        SimConfig { block_time_secs: 2, genesis_difficulty: 8, mine_nonce_budget: 5_000_000 }
+        SimConfig { block_time_secs: 2, genesis_difficulty: 8, mine_nonce_budget: 5_000_000, ..SimConfig::default() }
     }
 
     /// Partition then rejoin: two groups diverge above a finalized point; on heal
