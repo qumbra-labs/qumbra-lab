@@ -72,6 +72,10 @@ pub enum MsgType {
     Header = 0x0021,
     /// A finalized checkpoint together with its committee votes.
     Checkpoint = 0x0022,
+    /// Equivocation evidence: two conflicting signed votes by one committee member
+    /// for the same slot (committee-gov §3). Gossiped so the whole network applies
+    /// the automated tombstone + slash.
+    Evidence = 0x0023,
 
     // --- header-first sync ---
     /// Locator → request a batch of headers building on it.
@@ -107,6 +111,7 @@ impl MsgType {
             0x0020 => Tx,
             0x0021 => Header,
             0x0022 => Checkpoint,
+            0x0023 => Evidence,
             0x0030 => GetHeaders,
             0x0031 => Headers,
             0x0040 => CmpctBlock,
@@ -255,7 +260,7 @@ mod tests {
     fn round_trip_all_msg_types() {
         for raw in [
             0x0001u16, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0010, 0x0011, 0x0012, 0x0020,
-            0x0021, 0x0022, 0x0030, 0x0031, 0x0040, 0x0041, 0x0042, 0x0043,
+            0x0021, 0x0022, 0x0023, 0x0030, 0x0031, 0x0040, 0x0041, 0x0042, 0x0043,
         ] {
             let mt = MsgType::from_u16(raw).expect("known type");
             assert_eq!(mt.as_u16(), raw);
