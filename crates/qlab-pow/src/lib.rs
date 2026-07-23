@@ -30,6 +30,8 @@
 //! §10). Defaults here quote Monero/Zawy provenance; they are prototype choices,
 //! not Qumbra proposals.
 
+pub mod keyblock;
 pub mod randomx;
 
+pub use keyblock::{key_seed_height, KeyBlockSchedule};
 pub use randomx::RandomXHasher;
