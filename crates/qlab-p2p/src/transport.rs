@@ -236,6 +236,10 @@ impl TcpTransport {
     /// and return the local peer handle.
     fn register_stream(shared: &Arc<TcpShared>, stream: TcpStream) -> PeerId {
         let id = shared.alloc_id();
+        // On macOS/BSD an accepted socket inherits the listener's non-blocking
+        // flag; force blocking so the reader thread's `read_exact` waits for the
+        // next frame instead of erroring `WouldBlock` and exiting the thread.
+        let _ = stream.set_nonblocking(false);
         let _ = stream.set_nodelay(true);
         let writer = stream.try_clone().expect("clone tcp stream for writing");
         shared.writers.lock().unwrap().insert(id, writer);
