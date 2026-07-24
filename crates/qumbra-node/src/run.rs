@@ -10,12 +10,16 @@
 //!
 //! ## Frozen 75 s block time + real RandomX (item 3)
 //! The run uses the FROZEN 75 s block time (consensus-parameters §2 — NOT the
-//! `SIM_BLOCK_TIME_SECS` knob) and real RandomX. **Remaining sim-only path
-//! (annotated):** block timestamps advance by exactly the frozen 75 s per block
-//! (the adapter's mining clock), rather than real wall-clock time, so LWMA sees a
-//! constant solvetime and difficulty holds at the genesis value. Wall-clock
-//! timestamps + natural PoW pacing are a `[full-M8]` item; for the T0 rehearsal a
-//! constant-cadence real-RandomX net is the honest, correct behaviour.
+//! `SIM_BLOCK_TIME_SECS` knob) and real RandomX.
+//!
+//! ## Wall-clock header timestamps (M10-T0-3 precondition item 0)
+//! The binary sets the adapter's mining clock to [`MiningClock::WallClock`] so a
+//! mined block's header timestamp is real wall-clock time (clamped non-decreasing
+//! against the parent), NOT the constant 75 s counter. LWMA then sees real,
+//! variable solvetimes and difficulty retargets to actual block-production pace —
+//! the precondition for T0's item-4 difficulty-trace measurement. Header
+//! validation tolerates the jitter (non-decreasing rule + LWMA 6T / out-of-sequence
+//! clamps). In-process sims/tests keep the deterministic clock (the default).
 //!
 //! ## Verifier seam
 //! The transaction verifier is injected. [`DevnetRehearsalVerifier`] is a
@@ -32,7 +36,7 @@ use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
 use qlab_devnet::pow::PowEngine;
 
-use qlab_p2p::adapter::NodeAdapter;
+use qlab_p2p::adapter::{MiningClock, NodeAdapter};
 use qlab_p2p::n1::ChainView;
 use qlab_p2p::transport::TcpTransport;
 use qlab_p2p::P2pNode;
@@ -85,6 +89,47 @@ impl From<qlab_node::NodeError> for RunError {
     fn from(e: qlab_node::NodeError) -> Self {
         RunError::Node(e)
     }
+}
+
+/// A read-only pre-flight summary of a node's deployment: the genesis + config +
+/// held keys validated exactly as [`RunningNode::start`] would, but WITHOUT
+/// binding a socket, opening the data dir, or mining. The deploy dry-run runs this
+/// against every staged node to prove the laid-down layout is startable (item 1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preflight {
+    /// The hex keccak256 of the loaded genesis file.
+    pub genesis_hash: String,
+    /// Frozen committee size (must be 21 for T0).
+    pub committee_size: u32,
+    /// Frozen quorum (must be 15 for T0).
+    pub quorum: u32,
+    /// How many of the 21 committee signing keys this node holds.
+    pub keys_held: usize,
+    /// The TCP address this node would bind.
+    pub listen_addr: String,
+    /// How many peers this node would dial.
+    pub dial_peers: usize,
+    /// Whether this node would produce blocks.
+    pub mining: bool,
+}
+
+/// Validate a node's `config` against its `genesis` exactly as startup would — the
+/// genesis byte-verify + optional hash pin (item 2) and every held key
+/// cross-checked against committee₀ — but bind nothing and touch no disk state.
+/// Returns an operator/dry-run summary. Errors identically to [`RunningNode::start`]'s
+/// pre-listener phase (wrong hash, tampered committee, a key for the wrong index).
+pub fn preflight(config: &NodeConfig, genesis: &GenesisFile) -> Result<Preflight, RunError> {
+    genesis.verify_startup(config.expected_genesis_hash.as_deref())?;
+    let validators = genesis.load_validators(&config.committee_key_paths)?;
+    Ok(Preflight {
+        genesis_hash: genesis.hash_hex(),
+        committee_size: genesis.frozen.committee_size,
+        quorum: genesis.frozen.quorum,
+        keys_held: validators.len(),
+        listen_addr: config.listen_addr.clone(),
+        dial_peers: config.dial_peers.len(),
+        mining: config.mining,
+    })
 }
 
 /// A composed, running full node: P2P + real node-state + PoW + committee, over
@@ -196,6 +241,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// Override the mining cadence (tests set 0 to mine every step).
     pub fn set_mine_interval(&mut self, d: Duration) {
         self.mine_interval = d;
+    }
+
+    /// Select the header-timestamp mining clock (item 0). The binary opts into
+    /// [`MiningClock::WallClock`]; the deterministic default is kept by the
+    /// in-process tests below.
+    pub fn set_mining_clock(&mut self, clock: MiningClock) {
+        self.p2p.node_mut().set_mining_clock(clock);
     }
 
     /// One message-pump step; returns frames handled.
@@ -339,6 +391,40 @@ mod tests {
         node.run_until(&shutdown);
         // The snapshot file now exists in the data dir (graceful flush ran).
         assert!(config.data_dir.join(qlab_node::SNAPSHOT).exists(), "snapshot flushed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preflight_validates_a_staged_node_without_binding() {
+        // The deploy dry-run's per-node assertion: a laid-down config + genesis +
+        // key subset validate through the real startup checks, no socket bound.
+        let (config, genesis, base) = rig("preflight", true);
+        let pf = preflight(&config, &genesis).expect("preflight ok");
+        assert_eq!(pf.genesis_hash, genesis.hash_hex());
+        assert_eq!(pf.committee_size, 21);
+        assert_eq!(pf.quorum, 15);
+        assert_eq!(pf.keys_held, 21, "the rig holds all 21 keys");
+        assert!(pf.mining);
+
+        // A wrong hash pin fails preflight exactly as startup would (item 2).
+        let mut bad = config.clone();
+        bad.expected_genesis_hash = Some("00".repeat(32));
+        assert!(matches!(
+            preflight(&bad, &genesis),
+            Err(RunError::Genesis(GenesisError::WrongGenesisHash { .. }))
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preflight_reports_a_key_subset() {
+        // A node holding only a subset of the 21 keys (the ~5-6/node T0 split)
+        // preflights fine and reports its subset size.
+        let (mut config, genesis, base) = rig("preflight_subset", false);
+        config.committee_key_paths.truncate(6); // node0's 6-key slice
+        let pf = preflight(&config, &genesis).expect("subset preflight ok");
+        assert_eq!(pf.keys_held, 6);
+        assert!(!pf.mining);
         let _ = std::fs::remove_dir_all(&base);
     }
 

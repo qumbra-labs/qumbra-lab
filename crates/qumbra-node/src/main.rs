@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use qlab_devnet::pow::RandomXPow;
+use qlab_p2p::adapter::MiningClock;
 
 use qumbra_node::config::NodeConfig;
 use qumbra_node::genesis::GenesisFile;
@@ -44,6 +45,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
             }
         },
         Some("run") => run_node(&args[1..]),
+        Some("check") => check_config(&args[1..]),
         Some("audit") => audit(&args[1..]),
         Some("-h") | Some("--help") | None => {
             usage();
@@ -62,6 +64,7 @@ fn usage() {
          USAGE:\n  \
          qumbra-node genesis init [--out DIR]   build the T0 genesis file + 21 committee key files\n  \
          qumbra-node run --config FILE          run a full node (TCP + RandomX + disk persistence)\n  \
+         qumbra-node check --config FILE        pre-flight a deployed config (genesis + keys), bind nothing\n  \
          qumbra-node audit [--out FILE]         emit the params_devnet ⟷ FROZEN v1.0 convergence audit"
     );
 }
@@ -109,6 +112,11 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // labelled rehearsal stand-in (real seam = qlab_consensus::verify_proof).
     let mut node = RunningNode::start(&config, &genesis, RandomXPow::new(), DevnetRehearsalVerifier)?;
 
+    // Item 0: the binary mines on real wall-clock header timestamps (NOT the
+    // deterministic 75 s counter the in-process sims/tests use), so LWMA sees real
+    // variable solvetimes over the soak.
+    node.set_mining_clock(MiningClock::WallClock);
+
     println!("qumbra-node running");
     println!("  listen:       {}", node.listen_addr());
     println!("  data dir:     {}", config.data_dir.display());
@@ -123,6 +131,21 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     node.run_until(&shutdown);
     println!("shutdown complete (snapshot flushed)");
+    Ok(())
+}
+
+fn check_config(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let cfg_path = flag(args, "--config").ok_or("check requires --config FILE")?;
+    let config = NodeConfig::load(cfg_path)?;
+    let genesis = GenesisFile::load(&config.genesis_file)?;
+    let pf = qumbra_node::run::preflight(&config, &genesis)?;
+    println!("qumbra-node check: OK ({cfg_path})");
+    println!("  genesis hash: {}", pf.genesis_hash);
+    println!("  committee:    N={} quorum={}", pf.committee_size, pf.quorum);
+    println!("  keys held:    {}", pf.keys_held);
+    println!("  listen:       {}", pf.listen_addr);
+    println!("  dial peers:   {}", pf.dial_peers);
+    println!("  mining:       {}", pf.mining);
     Ok(())
 }
 
