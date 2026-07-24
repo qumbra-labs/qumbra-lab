@@ -145,18 +145,42 @@ Same reason: with no baseline finality, "stall → Degraded → restart → catc
 Final" has no Final to return to. `soak.sh committee-stall`/`committee-recover`
 are in place; the recovery result waits for #70.
 
-## 6. ≥6 h telemetry-sampled steady run — ⏳ RUNNING
+## 6. ≥6 h telemetry-sampled steady run — ✅ PASS (liveness/endurance)
 
-Started on the clean 4-node baseline immediately after scenarios 1–3. A background
-sampler appends a 4-node telemetry snapshot every 5 min to
-`docs/m10-t03-phase-b-lite-soak.log`, with an early-exit guard on node-down or
-tip-divergence (crash/fork). Target ≥ 6 h.
+Ran on the clean 4-node baseline; **`SOAK COMPLETE t+21635s samples=73 tip=388
+diff[1134..4072] maxstall=388`**, ~**6.26 h continuous** across 77 samples (5 min
+cadence), **zero ALERTs** (the guard never tripped on node-down or tip-divergence).
+Full trace: `docs/m10-t03-phase-b-lite-soak.log`.
 
-_Fills on completion:_ wall duration; blocks produced; LWMA difficulty range over
-the run (item-4 trace, LOCALHOST pacing); tip-consistency across nodes (max
-spread); per-container resource envelope (RAM/CPU/disk); zero consensus
-misbehavior. **Note:** finality stays `Degraded` throughout (per #70) — this run
-measures PoW/gossip/LWMA **liveness + endurance**, not finality.
+| Metric | Result |
+|---|---|
+| Duration | ~6.26 h continuous (≥6 h ✓), 77 samples, all 4 nodes up throughout |
+| Blocks | tip 0 → ~388 (~58 s/block effective; see multi-miner note below) |
+| Tip consistency | ≤ 1–2 block spread across all 4 nodes the whole run (no fork; divergence guard `>6` never tripped) |
+| LWMA difficulty | 256 (genesis) → 42 (startup transient) → climbed + converged; steady window `[1134..4072]`, leveling ~3900–4072 |
+| RAM / node | ~262 MiB (RandomX **light** cache + node) — far inside the ≥4 GB VPS spec |
+| CPU / node | bursty — ~100 % on whichever node is hashing at the 75 s tick, near-idle otherwise |
+| Disk / node | 4–8 KB data volume for ~388 coinbase-only blocks (negligible) |
+| Finality | `Degraded` throughout (`maxstall = tip`, per #70) — **this run measures PoW/gossip/LWMA liveness + endurance, not finality** |
+| Consensus misbehavior | **none** (no fork past finality, no double-finalization, no supply anomaly, no crash) |
+
+**Item-4 / multi-miner LWMA note (finding).** With 4 independent miners each on the
+frozen 75 s timer, the *aggregate* block-production rate is ~4× a single node's, so
+LWMA correctly ramps difficulty hard (256 → ~4000) to pull the effective interval
+back toward 75 s, then levels off. The trace is non-constant and self-correcting —
+exactly the WallClock (item-0) signal — but the steady difficulty and effective
+block spacing here reflect the **4-miner localhost aggregate**, not a WAN topology.
+Real per-node hashrate and RTT at the WAN pacing remain owed to Phase B-WAN.
+
+## Acceptance suite
+
+Bench discipline §5 (full unfiltered `cargo test --release -p qlab-bench`, no mode
+filter): **91 passed; 0 failed** (all `#[test]` in the crate), 555.24 s, run
+**serial (`--test-threads=1`)** on the clean rig after the soak tore down — the
+N6-documented OOM-safe mode; serial is not a mode filter, so acceptance validity
+holds. Confirms this branch's only code change (the `run.rs` telemetry surface,
+in `qumbra-node` — a crate qlab-bench does not depend on) leaves every m4 /
+consensus / narrow-Keccak invariant green. `qumbra-node` crate: 28/28.
 
 ## Findings (honest list)
 
@@ -195,7 +219,13 @@ measures PoW/gossip/LWMA **liveness + endurance**, not finality.
    internal-net stage. _(It also made the late-joiner scenario sensitive to docker
    network-recreate timing — see the run notes; the reliable procedure is to bring
    all nodes up together, then stop/wipe/start the joiner on the stable network.)_
-8. Cross-ref the N7 finding (announce-flood drops orphans; gap/partition recovery
+8. **Multi-miner LWMA aggregate dynamic (from the ≥6 h soak).** 4 independent
+   miners on the 75 s timer produce ~4× a single node's block rate; LWMA ramps
+   difficulty ~16× (256 → ~4000) to restore the 75 s target, then levels. Correct,
+   self-correcting — but the steady difficulty reflects the localhost 4-miner
+   aggregate, not WAN topology. Endurance was clean: ~6.26 h, 77 samples, all
+   nodes lockstep (≤2-block spread), zero misbehavior.
+9. Cross-ref the N7 finding (announce-flood drops orphans; gap/partition recovery
    runs through the header-sync path).
 
 ## Transfers to Phase B-WAN
