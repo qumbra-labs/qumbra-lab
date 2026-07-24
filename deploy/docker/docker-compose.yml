@@ -1,0 +1,84 @@
+# Qumbra T0 internal-net — Phase B-lite localhost/docker net (issue #64 amendment 3).
+#
+# 4 real node containers on real TCP over a docker bridge network, real RandomX
+# light, wall-clock header timestamps, frozen 75 s block time, distinct on-disk
+# data-dir volumes. A one-shot `genesis-init` mints the shared genesis + 21
+# committee keys (split 6/5/5/5) exactly once into the `shared` volume; the nodes
+# depend on it, byte-verify the genesis, and pin its hash.
+#
+#   docker compose -f deploy/docker/docker-compose.yml up --build         # all 4
+#   docker compose -f deploy/docker/docker-compose.yml up -d --build node0 node1 node2
+#   deploy/docker/soak.sh                                                 # scenarios
+#
+# RIG DISCIPLINE: do NOT `up`/`build` while the b4 bench is running
+# (`pgrep -f qlab_bench`) — 4 RandomX light caches on the Docker-Desktop Linux VM
+# on top of the ~30 GB bench will OOM. Wait it out.
+
+name: qumbra-t0-lite
+
+x-node-common: &node-common
+  build:
+    context: ../..
+    dockerfile: deploy/docker/Dockerfile
+  image: qumbra-node:t0-lite
+  restart: "no"            # manual control — the restart/partition scenarios stop nodes
+  networks: [qumbra]
+  depends_on:
+    genesis-init:
+      condition: service_completed_successfully
+
+volumes:
+  shared:                   # the ONE shared genesis + 21 keys (init writes, nodes read)
+  data0:
+  data1:
+  data2:
+  data3:
+
+networks:
+  qumbra:
+    name: qumbra_t0         # the normal full-mesh network
+  sideb:
+    name: qumbra_t0_sideb   # used only by soak.sh to keep the B-side pair talking
+                            # during a true 2+2 `docker network disconnect` partition
+
+services:
+  genesis-init:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: qumbra-node:t0-lite
+    command: ["init"]
+    volumes:
+      - shared:/shared
+
+  node0:                    # de-facto bootstrap (all nodes full-mesh dial each other)
+    <<: *node-common
+    hostname: node0
+    command: ["run", "0"]   # holds committee keys 00..05 (6)
+    volumes:
+      - shared:/shared
+      - data0:/data
+
+  node1:
+    <<: *node-common
+    hostname: node1
+    command: ["run", "1"]   # holds committee keys 06..10 (5)
+    volumes:
+      - shared:/shared
+      - data1:/data
+
+  node2:
+    <<: *node-common
+    hostname: node2
+    command: ["run", "2"]   # holds committee keys 11..15 (5)
+    volumes:
+      - shared:/shared
+      - data2:/data
+
+  node3:                    # the late-joiner in the sync-from-genesis scenario
+    <<: *node-common
+    hostname: node3
+    command: ["run", "3"]   # holds committee keys 16..20 (5)
+    volumes:
+      - shared:/shared
+      - data3:/data

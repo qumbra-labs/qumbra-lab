@@ -1,0 +1,72 @@
+# Phase B-lite finding evidence — distributed committee finality never forms
+# captured 2026-07-24T09:58:01Z — LOCALHOST/DOCKER, 4 nodes, keys 6/5/5/5
+# containers PRESERVED (not torn down) for inspection.
+
+=== node0 telemetry trace ===
+TELEMETRY tip=0 final=- stall=0 age_s=0 diff=256 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=0 final=- stall=0 age_s=0 diff=256 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=0 final=- stall=0 age_s=0 diff=256 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=1 final=- stall=1 age_s=1784886710 diff=256 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=1 final=- stall=1 age_s=1784886710 diff=256 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=1 final=- stall=1 age_s=1784886710 diff=256 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=2 final=- stall=2 age_s=1784886785 diff=42 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=2 final=- stall=2 age_s=1784886785 diff=42 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=3 final=- stall=3 age_s=1784886861 diff=55 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=3 final=- stall=3 age_s=1784886861 diff=55 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=3 final=- stall=3 age_s=1784886861 diff=55 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=4 final=- stall=4 age_s=1784886937 diff=63 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=4 final=- stall=4 age_s=1784886937 diff=63 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=5 final=- stall=5 age_s=1784887013 diff=68 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=5 final=- stall=5 age_s=1784887013 diff=68 peers=3 mempool=0 epoch=0 regime=Degraded
+
+=== node1 telemetry trace ===
+TELEMETRY tip=0 final=- stall=0 age_s=0 diff=256 peers=1 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=0 final=- stall=0 age_s=0 diff=256 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=0 final=- stall=0 age_s=0 diff=256 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=1 final=- stall=1 age_s=1784886710 diff=256 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=1 final=- stall=1 age_s=1784886710 diff=256 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=1 final=- stall=1 age_s=1784886710 diff=256 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=2 final=- stall=2 age_s=1784886785 diff=42 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=2 final=- stall=2 age_s=1784886785 diff=42 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=3 final=- stall=3 age_s=1784886861 diff=55 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=3 final=- stall=3 age_s=1784886861 diff=55 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=3 final=- stall=3 age_s=1784886861 diff=55 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=4 final=- stall=4 age_s=1784886937 diff=63 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=4 final=- stall=4 age_s=1784886937 diff=63 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=5 final=- stall=5 age_s=1784887013 diff=68 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=5 final=- stall=5 age_s=1784887013 diff=68 peers=4 mempool=0 epoch=0 regime=Degraded
+
+=== node2 telemetry trace ===
+TELEMETRY tip=0 final=- stall=0 age_s=0 diff=256 peers=2 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=0 final=- stall=0 age_s=0 diff=256 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=0 final=- stall=0 age_s=0 diff=256 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=1 final=- stall=1 age_s=1784886710 diff=256 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=1 final=- stall=1 age_s=1784886710 diff=256 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=1 final=- stall=1 age_s=1784886710 diff=256 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=2 final=- stall=2 age_s=1784886785 diff=42 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=2 final=- stall=2 age_s=1784886785 diff=42 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=3 final=- stall=3 age_s=1784886861 diff=55 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=3 final=- stall=3 age_s=1784886861 diff=55 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=3 final=- stall=3 age_s=1784886861 diff=55 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=4 final=- stall=4 age_s=1784886937 diff=63 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=4 final=- stall=4 age_s=1784886937 diff=63 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=5 final=- stall=5 age_s=1784887013 diff=68 peers=3 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=5 final=- stall=5 age_s=1784887013 diff=68 peers=3 mempool=0 epoch=0 regime=Degraded
+
+=== node3 telemetry trace ===
+TELEMETRY tip=0 final=- stall=0 age_s=0 diff=256 peers=1 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=0 final=- stall=0 age_s=0 diff=256 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=0 final=- stall=0 age_s=0 diff=256 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=1 final=- stall=1 age_s=1784886710 diff=256 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=1 final=- stall=1 age_s=1784886710 diff=256 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=1 final=- stall=1 age_s=1784886710 diff=256 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=2 final=- stall=2 age_s=1784886785 diff=42 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=2 final=- stall=2 age_s=1784886785 diff=42 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=3 final=- stall=3 age_s=1784886861 diff=55 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=3 final=- stall=3 age_s=1784886861 diff=55 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=3 final=- stall=3 age_s=1784886861 diff=55 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=4 final=- stall=4 age_s=1784886937 diff=63 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=4 final=- stall=4 age_s=1784886937 diff=63 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=5 final=- stall=5 age_s=1784887013 diff=68 peers=4 mempool=0 epoch=0 regime=Degraded
+TELEMETRY tip=5 final=- stall=5 age_s=1784887013 diff=68 peers=4 mempool=0 epoch=0 regime=Degraded
+
