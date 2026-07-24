@@ -41,7 +41,7 @@ use qlab_devnet::mining::mine;
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::{
     DEGRADED_MODE_LAG_BLOCKS, DOWNTIME_JAIL_THRESHOLD_PCT, DOWNTIME_JAIL_WINDOW,
-    EPOCH_LENGTH_BLOCKS, EQUIVOCATION_SLASH_AMOUNT, JAIL_BLOCKS,
+    EPOCH_LENGTH_BLOCKS, JAIL_BLOCKS,
 };
 use qlab_devnet::pow::PowEngine;
 use qlab_devnet::validation::{expected_difficulty, pow_seed, validate_header};
@@ -104,14 +104,61 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         Self::with_epoch(ec, pow, verifier, sim)
     }
 
-    /// New adapter from an explicit [`EpochCommittee`] (membership/epoch tests use a
-    /// small epoch length to cross boundaries).
+    /// New (in-memory) adapter from an explicit [`EpochCommittee`] (membership/epoch
+    /// tests use a small epoch length to cross boundaries).
     pub fn with_epoch(committee: EpochCommittee, pow: P, verifier: V, sim: SimConfig) -> Self {
+        let state = MemNode::in_memory(genesis_block(sim.genesis_difficulty, 0));
+        Self::assemble(committee, pow, verifier, sim, state)
+    }
+
+    /// New **disk-backed** adapter (M10-T0-1, `qumbra-node` binary): the state
+    /// machine is opened at `dir` and resumes restart-safely (atomic snapshot +
+    /// block-log tail), so accepted blocks and finalizations persist across
+    /// restarts. Wraps `committee` at the frozen epoch length (like [`Self::new`]).
+    /// [`Self::save_snapshot`] flushes the derived state on graceful shutdown.
+    pub fn open(
+        dir: impl AsRef<std::path::Path>,
+        committee: CommitteeState,
+        pow: P,
+        verifier: V,
+        sim: SimConfig,
+    ) -> Result<Self, NodeError> {
+        let ec = EpochCommittee::genesis(EpochSchedule::new(EPOCH_LENGTH_BLOCKS), committee);
+        let state = MemNode::open(dir, genesis_block(sim.genesis_difficulty, 0))?;
+        let mut me = Self::assemble(ec, pow, verifier, sim, state);
+        // Restart-resume the in-memory fork-choice header chain from the persisted
+        // block log: the state machine is the durable source of truth, so on open
+        // the adapter adopts its restored ChainState (headers + finalized head),
+        // trusting the log exactly as `MemNode::replay` does (no PoW re-run).
+        // Otherwise a restarted node would start with an empty header view and have
+        // to re-sync everything it already had on disk.
+        let resumed = me.state.chain().chain().clone();
+        me.chain = resumed;
+        me.advance_epoch();
+        Ok(me)
+    }
+
+    /// Flush the state machine's derived state to an atomic on-disk snapshot
+    /// (no-op for an in-memory adapter). Called on graceful shutdown = snapshot
+    /// flush (issue #62 item 1).
+    pub fn save_snapshot(&self) -> Result<(), NodeError> {
+        self.state.save_snapshot()
+    }
+
+    /// Assemble the adapter around an already-built state machine (shared by the
+    /// in-memory and disk-backed constructors).
+    fn assemble(
+        committee: EpochCommittee,
+        pow: P,
+        verifier: V,
+        sim: SimConfig,
+        state: MemNode,
+    ) -> Self {
         let genesis = BlockHeader::genesis(sim.genesis_difficulty, 0);
         NodeAdapter {
             chain: ChainState::new(genesis),
             pow,
-            state: MemNode::in_memory(genesis_block(sim.genesis_difficulty, 0)),
+            state,
             mempool: Mempool::default(),
             committee,
             finality: FinalityTracker::new(),
@@ -406,7 +453,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> CommitteeControl for NodeAdapter<P, V>
             verify_equivocation(ev, self.committee.state_for_height(ev.cp_a.height).committee());
         match verified {
             Ok(signer) => {
-                self.committee.state_mut().tombstone(signer, EQUIVOCATION_SLASH_AMOUNT);
+                // Equivocation slash = **10 % of the member's bond** + permanent
+                // tombstone (consensus-parameters §4 FROZEN; issue #62 item 5
+                // convergence — replaces the flat `EQUIVOCATION_SLASH_AMOUNT`
+                // placeholder now that the bond is a genesis constant). Integer
+                // floor; a ramped bond of 0 slashes 0 (still tombstones).
+                let bond = self.committee.state().bond(signer).unwrap_or(0);
+                let slash = bond / 10;
+                self.committee.state_mut().tombstone(signer, slash);
                 Some(signer)
             }
             Err(_) => None,
@@ -554,6 +608,27 @@ mod tests {
         let votes: Vec<Vote> = validators.iter().map(|v| v.sign_checkpoint(&cp)).collect();
         assert_eq!(a.ingest_checkpoint(cp, votes), IngestOutcome::Rejected("insufficient quorum"));
         assert_eq!(a.finalized_height(), None);
+    }
+
+    /// M10-T0-1 item 5 convergence: the equivocation slash is 10 % of the
+    /// member's bond (not the old flat placeholder). At the standard bond this is
+    /// the same 100,000 the placeholder used, but it is now derived from the bond.
+    #[test]
+    fn equivocation_slash_is_ten_percent_of_bond() {
+        let (cstate, validators) = committee7();
+        let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+        let ca = Checkpoint::new(8, [0xA5; 32], [0xA0; 32]);
+        let cb = Checkpoint::new(8, [0xB5; 32], [0xB0; 32]);
+        let ev = EquivocationEvidence {
+            vote_a: validators[2].sign_checkpoint(&ca),
+            cp_a: ca,
+            vote_b: validators[2].sign_checkpoint(&cb),
+            cp_b: cb,
+        };
+        assert_eq!(a.apply_evidence(&ev), Some(2));
+        assert!(a.is_tombstoned(2));
+        assert_eq!(a.committee().state().slashed(2), Some(BOND_AMOUNT / 10), "slash = 10% of bond");
+        assert_eq!(a.committee().state().bond(2), Some(BOND_AMOUNT - BOND_AMOUNT / 10));
     }
 
     #[test]
