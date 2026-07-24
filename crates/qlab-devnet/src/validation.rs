@@ -356,6 +356,50 @@ mod tests {
         assert_ne!(pow_seed(chain, &tip, child_height, small).unwrap(), genesis.to_vec());
     }
 
+    /// M10-T0-3 item 0 (wall-clock timestamps): the LWMA difficulty trace is FLAT
+    /// under a constant mining clock (the exact T0-1 defect — every solvetime == T
+    /// ⇒ difficulty never leaves genesis) and NON-CONSTANT under wall-clock-like
+    /// variable solvetimes (what makes T0's item-4 difficulty-trace measurement
+    /// meaningful). This is the retarget half of the wall-clock change; the seam
+    /// itself is covered in `qlab-p2p`'s `mining_clock_*` test.
+    #[test]
+    fn lwma_trace_is_flat_under_a_constant_clock_and_moves_under_variable_solvetimes() {
+        // Pure LWMA-trace walk: record the mandated difficulty at each height over a
+        // chain built with the given inter-block spacings. `expected_difficulty` and
+        // `insert_header` read only timestamp/difficulty/linkage, so no PoW is needed.
+        fn trace(spacings: &[u64], t: u64) -> Vec<u64> {
+            let mut c = ChainState::new(BlockHeader::genesis(1_000_000, 0));
+            let mut ts = 0u64;
+            let mut out = Vec::new();
+            for &s in spacings {
+                let tip = c.tip_hash();
+                let parent = *c.header(&tip).unwrap();
+                let diff = expected_difficulty(&c, &tip, t).unwrap();
+                out.push(diff);
+                ts += s;
+                c.insert_header(BlockHeader::child_of(&parent, ts, diff, ZERO_HASH)).unwrap();
+            }
+            out
+        }
+
+        let t = 75; // the frozen 75 s cadence
+        // Constant clock ⇒ every solvetime == T ⇒ the trace never leaves genesis.
+        let constant = vec![t; 150];
+        let flat: std::collections::BTreeSet<u64> = trace(&constant, t).into_iter().collect();
+        assert_eq!(flat.len(), 1, "constant clock ⇒ flat LWMA trace (got {flat:?})");
+        assert!(flat.contains(&1_000_000), "flat at the genesis difficulty");
+
+        // Wall-clock-like jittered solvetimes ⇒ the trace is non-constant.
+        let jitter = [40u64, 120, 30, 200, 60, 75, 15, 300, 90, 50];
+        let variable: Vec<u64> = (0..150).map(|i| jitter[i % jitter.len()]).collect();
+        let moved: std::collections::BTreeSet<u64> = trace(&variable, t).into_iter().collect();
+        assert!(
+            moved.len() > 1,
+            "variable solvetimes ⇒ non-constant LWMA trace (got {} distinct)",
+            moved.len()
+        );
+    }
+
     /// Helper: a linear mined chain of `n` blocks after genesis, each spaced
     /// `spacing` seconds apart, all mined at the LWMA-mandated difficulty seeded
     /// from `start_diff` genesis. (KeccakPow ignores the seed, so `&[]` suffices.)

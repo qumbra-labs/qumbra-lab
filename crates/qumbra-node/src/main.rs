@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use qlab_devnet::pow::RandomXPow;
+use qlab_p2p::adapter::MiningClock;
 
 use qumbra_node::config::NodeConfig;
 use qumbra_node::genesis::GenesisFile;
@@ -108,6 +109,11 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // Real RandomX (N3) is the default engine; the injected verifier is the
     // labelled rehearsal stand-in (real seam = qlab_consensus::verify_proof).
     let mut node = RunningNode::start(&config, &genesis, RandomXPow::new(), DevnetRehearsalVerifier)?;
+
+    // Item 0: the binary mines on real wall-clock header timestamps (NOT the
+    // deterministic 75 s counter the in-process sims/tests use), so LWMA sees real
+    // variable solvetimes over the soak.
+    node.set_mining_clock(MiningClock::WallClock);
 
     println!("qumbra-node running");
     println!("  listen:       {}", node.listen_addr());

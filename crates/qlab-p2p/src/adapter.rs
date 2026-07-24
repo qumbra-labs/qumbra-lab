@@ -58,6 +58,41 @@ use crate::n1::{BlockIngest, ChainView, CheckpointIngest, CommitteeControl, Inge
 /// penalty-free zone accepts every pending tx (no gigantism at prototype scale).
 const SOAK_EFFECTIVE_MEDIAN: u64 = 4_000_000;
 
+/// How a mined block's header timestamp is chosen at the **mining-clock seam**
+/// ([`NodeAdapter::mine_block`]).
+///
+/// The two modes are the whole of M10-T0-3 precondition item 0. In-process sims
+/// and tests use [`MiningClock::Deterministic`] so runs stay reproducible and LWMA
+/// sees a constant on-target solvetime; the `qumbra-node` binary switches to
+/// [`MiningClock::WallClock`] so LWMA sees real, variable solvetimes at the frozen
+/// 75 s cadence (T0's item-4 difficulty-trace measurement needs a non-constant
+/// solvetime signal — a constant mining clock holds difficulty at the genesis
+/// value forever).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MiningClock {
+    /// A deterministic monotone counter: each mined block's timestamp is the
+    /// parent's timestamp + the target block time. Reproducible; the default, so
+    /// every in-process sim/test path is unchanged. LWMA sees a constant solvetime.
+    #[default]
+    Deterministic,
+    /// Real wall-clock seconds (`SystemTime::now`), clamped non-decreasing against
+    /// the parent so header validation's monotonic rule ([`validate_header`]) always
+    /// holds. The binary path. Difficulty then retargets to real block-production
+    /// pace; the jitter is exactly what LWMA's 6T / out-of-sequence clamps tolerate.
+    WallClock,
+}
+
+/// Real wall-clock time in whole seconds since the Unix epoch (the
+/// [`MiningClock::WallClock`] source). A clock reading before the epoch (never on a
+/// sane host) reads as 0 — the parent-clamp in [`NodeAdapter::next_timestamp`] then
+/// keeps the header non-decreasing regardless.
+fn wall_clock_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// A real full-node node-state: consensus header chain + PoW, the qlab-node state
 /// machine, the N4 mempool, and the N5 committee machinery. Generic over the PoW
 /// engine `P` (KeccakPow for fast deterministic soaks, RandomXPow for the real-PoW
@@ -91,8 +126,11 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     block_time: u64,
     /// Mining nonce budget per block.
     nonce_budget: u64,
-    /// Monotone mining clock (sim seconds).
+    /// Monotone mining clock (sim seconds) — used only by [`MiningClock::Deterministic`].
     clock: u64,
+    /// How a mined block's header timestamp is chosen (item 0). Defaults to
+    /// [`MiningClock::Deterministic`]; the binary opts into [`MiningClock::WallClock`].
+    mining_clock: MiningClock,
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
@@ -172,7 +210,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             block_time: sim.block_time_secs,
             nonce_budget: sim.mine_nonce_budget,
             clock: 0,
+            mining_clock: MiningClock::default(),
         }
+    }
+
+    /// Select the header-timestamp [`MiningClock`]. The binary (`qumbra-node`)
+    /// calls this with [`MiningClock::WallClock`] after `open`; sims/tests leave
+    /// the deterministic default.
+    pub fn set_mining_clock(&mut self, clock: MiningClock) {
+        self.mining_clock = clock;
     }
 
     /// Override the downtime signing window (tests use a small window so it fills).
@@ -244,6 +290,23 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         }
     }
 
+    /// Choose the header timestamp for a block mined over `parent`, per the
+    /// configured [`MiningClock`] (the mining-clock seam, item 0). Deterministic
+    /// advances the monotone counter by the target block time (reproducible,
+    /// constant solvetime); WallClock reads real wall-clock seconds clamped
+    /// non-decreasing against the parent (so [`validate_header`]'s monotonic rule
+    /// holds, and LWMA sees the real, variable solvetime).
+    fn next_timestamp(&mut self, parent: &BlockHeader) -> u64 {
+        match self.mining_clock {
+            MiningClock::Deterministic => {
+                self.clock =
+                    (self.clock + self.block_time).max(parent.timestamp + self.block_time);
+                self.clock
+            }
+            MiningClock::WallClock => wall_clock_secs().max(parent.timestamp),
+        }
+    }
+
     /// Assemble + mine (but do NOT insert) the next block over the current tip.
     /// Returns `(mined_header, body)`; the caller ingests it via `announce_block`
     /// → `ingest_block`, which is the single insert/apply path. `None` if there is
@@ -255,8 +318,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         let parent_hash = self.chain.tip_hash();
         let parent = *self.chain.header(&parent_hash)?;
         let difficulty = expected_difficulty(&self.chain, &parent_hash, self.block_time)?;
-        self.clock = (self.clock + self.block_time).max(parent.timestamp + self.block_time);
-        let candidate = BlockHeader::child_of(&parent, self.clock, difficulty, bc);
+        let timestamp = self.next_timestamp(&parent);
+        let candidate = BlockHeader::child_of(&parent, timestamp, difficulty, bc);
         let seed = pow_seed(&self.chain, &parent_hash, candidate.height, self.schedule)?;
         let mined = mine(&self.pow, candidate, self.nonce_budget, &seed)?;
         Some((mined, body))
@@ -565,6 +628,39 @@ mod tests {
         assert_eq!(a.mempool().len(), 1);
         // Re-submitting the good tx is a duplicate.
         assert_eq!(a.ingest_tx(good), IngestOutcome::Duplicate);
+    }
+
+    #[test]
+    fn mining_clock_default_is_deterministic_binary_uses_wall_clock() {
+        use qlab_devnet::params_devnet::SIM_BLOCK_TIME_SECS;
+
+        // Default (in-process sims/tests): the header timestamp is the deterministic
+        // monotone counter — genesis(0) + one block ⇒ exactly the target block time.
+        let (mut det, _a) = adapter_with_finalized_genesis();
+        assert_eq!(det.mining_clock, MiningClock::Deterministic, "default is deterministic");
+        let (h_det, _b) = det.mine_block().expect("mine (deterministic)");
+        assert_eq!(
+            h_det.timestamp, SIM_BLOCK_TIME_SECS,
+            "deterministic clock ⇒ parent(0) + block_time, not wall-clock"
+        );
+
+        // Binary path: WallClock ⇒ the timestamp is real wall-clock seconds, bracketed
+        // by now() around the call and far larger than the constant-clock value.
+        let (mut wc, _a) = adapter_with_finalized_genesis();
+        wc.set_mining_clock(MiningClock::WallClock);
+        let before = wall_clock_secs();
+        let (h_wc, _b) = wc.mine_block().expect("mine (wall-clock)");
+        let after = wall_clock_secs();
+        assert!(
+            before <= h_wc.timestamp && h_wc.timestamp <= after,
+            "wall-clock timestamp {} must fall in [{before}, {after}]",
+            h_wc.timestamp
+        );
+        assert!(
+            h_wc.timestamp > SIM_BLOCK_TIME_SECS,
+            "wall-clock timestamp {} is real time, not the constant {SIM_BLOCK_TIME_SECS} s clock",
+            h_wc.timestamp
+        );
     }
 
     #[test]

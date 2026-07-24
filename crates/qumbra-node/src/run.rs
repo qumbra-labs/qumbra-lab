@@ -10,12 +10,16 @@
 //!
 //! ## Frozen 75 s block time + real RandomX (item 3)
 //! The run uses the FROZEN 75 s block time (consensus-parameters §2 — NOT the
-//! `SIM_BLOCK_TIME_SECS` knob) and real RandomX. **Remaining sim-only path
-//! (annotated):** block timestamps advance by exactly the frozen 75 s per block
-//! (the adapter's mining clock), rather than real wall-clock time, so LWMA sees a
-//! constant solvetime and difficulty holds at the genesis value. Wall-clock
-//! timestamps + natural PoW pacing are a `[full-M8]` item; for the T0 rehearsal a
-//! constant-cadence real-RandomX net is the honest, correct behaviour.
+//! `SIM_BLOCK_TIME_SECS` knob) and real RandomX.
+//!
+//! ## Wall-clock header timestamps (M10-T0-3 precondition item 0)
+//! The binary sets the adapter's mining clock to [`MiningClock::WallClock`] so a
+//! mined block's header timestamp is real wall-clock time (clamped non-decreasing
+//! against the parent), NOT the constant 75 s counter. LWMA then sees real,
+//! variable solvetimes and difficulty retargets to actual block-production pace —
+//! the precondition for T0's item-4 difficulty-trace measurement. Header
+//! validation tolerates the jitter (non-decreasing rule + LWMA 6T / out-of-sequence
+//! clamps). In-process sims/tests keep the deterministic clock (the default).
 //!
 //! ## Verifier seam
 //! The transaction verifier is injected. [`DevnetRehearsalVerifier`] is a
@@ -32,7 +36,7 @@ use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
 use qlab_devnet::pow::PowEngine;
 
-use qlab_p2p::adapter::NodeAdapter;
+use qlab_p2p::adapter::{MiningClock, NodeAdapter};
 use qlab_p2p::n1::ChainView;
 use qlab_p2p::transport::TcpTransport;
 use qlab_p2p::P2pNode;
@@ -196,6 +200,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// Override the mining cadence (tests set 0 to mine every step).
     pub fn set_mine_interval(&mut self, d: Duration) {
         self.mine_interval = d;
+    }
+
+    /// Select the header-timestamp mining clock (item 0). The binary opts into
+    /// [`MiningClock::WallClock`]; the deterministic default is kept by the
+    /// in-process tests below.
+    pub fn set_mining_clock(&mut self, clock: MiningClock) {
+        self.p2p.node_mut().set_mining_clock(clock);
     }
 
     /// One message-pump step; returns frames handled.
