@@ -638,10 +638,22 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         txs: Vec<TxEntry>,
         except: Option<PeerId>,
     ) {
-        self.blocks.insert(bh, (txs.clone(), ann.coinbase));
-        let _ = self
+        let outcome = self
             .node
-            .ingest_block(ann.header, BlockBody { txs, coinbase: ann.coinbase });
+            .ingest_block(ann.header, BlockBody { txs: txs.clone(), coinbase: ann.coinbase });
+        // Orphan-triggered sync kick (M10-T0-1, issue #62 item 6 — the N7 finding):
+        // an announced block whose parent is unknown was previously dropped, and
+        // gap recovery relied solely on the taller-peer handshake. Instead, kick
+        // header-first sync toward the announcer to fill the gap — mirroring the
+        // orphan path in `on_header`. Do NOT cache or relay an orphan; a re-announce
+        // after catch-up re-drives application.
+        if outcome == IngestOutcome::Orphan {
+            if let Some(peer) = except {
+                self.start_sync_with(peer);
+            }
+            return;
+        }
+        self.blocks.insert(bh, (txs, ann.coinbase));
         self.seen.insert(bh);
         let payload = encode_announce(&ann);
         for pid in self.peers.ready_peers() {
@@ -903,6 +915,34 @@ mod tests {
         run(&mut nodes);
         assert!(nodes[1].node().has_header(&bh), "header ingested after fetching missing tx");
         assert!(nodes[1].node().has_tx(&tx_id(&t2)), "missing tx fetched into mempool");
+    }
+
+    /// M10-T0-1 item 6: a block announced whose parent is unknown must trigger
+    /// header-first sync toward the announcer (it was previously dropped).
+    #[test]
+    fn orphan_block_announce_kicks_header_sync() {
+        let (mut nodes, _hub) = mesh(2);
+        run(&mut nodes); // handshake both ways to ready
+        assert_eq!(*nodes[1].sync_phase(), SyncPhase::Synced);
+
+        // A block two above genesis: its parent (one above genesis) is unknown to
+        // node 1, so ingesting it orphans.
+        let unknown_parent = BlockHeader::child_of(&genesis(), 75, 1000, [200; 32]);
+        let orphan_block = BlockHeader::child_of(&unknown_parent, 150, 1000, [201; 32]);
+        // Node 0 announces it (prefilled coinbase, no short ids → node 1
+        // reconstructs immediately and runs complete_block).
+        nodes[0].announce_block(orphan_block, vec![tx(0)], 0, 0xABCD);
+        nodes[1].tick();
+
+        // Node 1 kicked header-first sync toward the announcer (PeerId 1), rather
+        // than silently dropping the orphan.
+        assert!(
+            matches!(nodes[1].sync_phase(), SyncPhase::AwaitingHeaders { peer, .. } if *peer == PeerId(1)),
+            "orphan announce must kick sync toward the announcer, got {:?}",
+            nodes[1].sync_phase()
+        );
+        // And it did not adopt the orphan as a known header.
+        assert!(!nodes[1].node().has_header(&orphan_block.header_hash()));
     }
 
     #[test]

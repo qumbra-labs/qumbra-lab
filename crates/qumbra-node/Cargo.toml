@@ -1,0 +1,54 @@
+[package]
+name = "qumbra-node"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# M10-T0-1: the `qumbra-node` binary + genesis tooling. Makes N7's in-process
+# FullNode composition (qlab-p2p `adapter::NodeAdapter` + `P2pNode`) a REAL
+# deployable binary: a TOML-configured full node over the real TCP transport
+# (qlab-p2p `TcpTransport`) with RandomXPow (N3) as the default engine and the
+# qlab-node disk stores for persistence, plus `genesis init` — a versioned
+# genesis file baking the FROZEN v1.0 constant table + committee₀ verifying keys
+# + the genesis block, byte-verified by every node on startup.
+#
+# Conflict boundary (issue #62): this new crate + its members line, the one
+# orphan-sync-kick fix + the equivocation-slash convergence in qlab-p2p. Zero
+# contact with qlab-bench/m4gate and T0-2's ops/telemetry surfaces.
+#
+# The transaction verifier is INJECTED (the N7 stack is verifier-agnostic): the
+# default is a clearly-labelled devnet-rehearsal verifier; the real M3 verifier
+# (`qlab_consensus::verify_proof`) is the production drop-in at the same seam.
+
+[[bin]]
+name = "qumbra-node"
+path = "src/main.rs"
+
+[dependencies]
+# The N7 full-node composition: NodeAdapter (real chain/PoW/state/mempool/
+# committee over the five N1 traits), P2pNode (gossip/sync/relay), the real TCP
+# transport, and the peer/sync types.
+qlab-p2p = { path = "../qlab-p2p" }
+# The disk-backed node-state stores + genesis block + committee/emission wiring.
+qlab-node = { path = "../qlab-node" }
+# Real PoW: RandomX (light mode) + LWMA + key-block schedule (N3).
+qlab-pow = { path = "../qlab-pow" }
+# Consensus objects (BlockHeader/Committee/Validator/CommitteeState), the frozen
+# params surface, the SimConfig parameter carrier, and posted-fee table.
+qlab-devnet = { path = "../qlab-devnet" }
+# The single-source frozen consensus config (CONSENSUS_CFG label, LOG_HEIGHT,
+# wire byte count) baked into the genesis constant table.
+qlab-consensus = { path = "../qlab-consensus" }
+# ML-DSA-65 verifying-key encode/decode for committee₀ in the genesis file.
+ml-dsa = "=0.1.1"
+
+# Deterministic on-disk genesis-file encoding (same serde/bincode posture as the
+# qlab-node snapshot/log). The genesis hash is keccak256 over the bincode.
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+# TOML node config (data dir, listen addr, dial peers, committee-key paths,
+# mining on/off) — the issue's specified config format.
+toml = "0.8"
+# Ctrl-C handling for graceful shutdown = snapshot flush.
+ctrlc = "3.4"
