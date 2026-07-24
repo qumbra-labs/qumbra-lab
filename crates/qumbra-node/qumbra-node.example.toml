@@ -1,0 +1,34 @@
+# Example qumbra-node config (M10-T0-1).
+#
+# Build the shared genesis first:  qumbra-node genesis init --out ./net
+# then point every node's config at ./net/genesis.qmb and distribute the
+# ./net/keys/committee-NN.key files across the operator's nodes (item 4 — the
+# honestly-labelled T0 rehearsal "federation-of-one").
+
+# Where the append-only block log + atomic snapshot live (created if absent).
+data_dir = "./data"
+
+# TCP address this node binds and listens on. Use "127.0.0.1:0" for an
+# ephemeral port (the bound port is printed on startup).
+listen_addr = "127.0.0.1:9333"
+
+# Peers to dial on startup (the bootstrap node leaves this empty).
+dial_peers = ["127.0.0.1:9334", "127.0.0.1:9335"]
+
+# The shared, versioned genesis file (byte-verified on startup).
+genesis_file = "./net/genesis.qmb"
+
+# Committee signing-key files THIS node holds. For a single-operator rehearsal
+# that must finalize, one node holds >= quorum (15) of the 21 keys; the keys can
+# also be split across nodes. Empty = a verify-only (non-signing) node.
+committee_key_paths = [
+  "./net/keys/committee-00.key",
+  "./net/keys/committee-01.key",
+]
+
+# Produce blocks (real RandomX PoW) when true.
+mining = true
+
+# OPTIONAL safety pin: refuse to start unless the loaded genesis hashes to this
+# (the value `qumbra-node genesis init` prints). Uncomment to enforce.
+# expected_genesis_hash = "4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3"
