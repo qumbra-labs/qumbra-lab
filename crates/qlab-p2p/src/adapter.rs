@@ -47,6 +47,7 @@ use qlab_devnet::pow::PowEngine;
 use qlab_devnet::validation::{expected_difficulty, pow_seed, validate_header};
 
 use qlab_node::mempool::TxId;
+use qlab_node::recovery::Finalizer;
 use qlab_node::{genesis_block, MemNode, Mempool, MempoolError, NodeError, NodeState as _};
 use qlab_devnet::body::TxVerifier;
 
@@ -274,6 +275,26 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         Some((cp, votes))
     }
 
+    /// The **recovery-aware** proposer path (M10-T0-2): build the checkpoint for
+    /// `height` and collect votes from `finalizers` under each finalizer's
+    /// never-re-sign-a-conflicting-checkpoint guard ([`Finalizer`]). A finalizer
+    /// that would equivocate against its own past vote for this slot simply
+    /// contributes no vote — so a committee restarting after a stall can never emit
+    /// the second half of an equivocation pair, no matter what it signed before the
+    /// crash. Each finalizer's [`Finalizer::state`] should be persisted after this
+    /// call (the caller owns durability). Callers that want the count of honest
+    /// votes can inspect the returned `Vec` length against the quorum.
+    pub fn make_checkpoint_guarded(
+        &self,
+        height: u64,
+        finalizers: &mut [Finalizer],
+    ) -> Option<(Checkpoint, Vec<Vote>)> {
+        let block_hash = *self.chain.main_chain().get(height as usize)?;
+        let cp = Checkpoint::new(height, block_hash, block_hash);
+        let votes = finalizers.iter_mut().filter_map(|f| f.sign(&cp).ok()).collect();
+        Some((cp, votes))
+    }
+
     fn reject_reason(err: &MempoolError) -> &'static str {
         match err {
             MempoolError::WrongFee { .. } => "wrong fee",
@@ -483,6 +504,7 @@ mod tests {
     use qlab_devnet::fees::{posted_fee, ArityBucket};
     use qlab_devnet::params_devnet::BOND_AMOUNT;
     use qlab_devnet::pow::KeccakPow;
+    use qlab_node::telemetry::Telemetry;
 
     /// Mock M3 verifier: a proof is valid iff its bytes are exactly `b"ok"`.
     #[derive(Clone)]
@@ -644,5 +666,156 @@ mod tests {
         // Forged vote (valid sig, wrong signer index) does not seed evidence.
         let forged = Vote { signer: 5, signature: validators[3].sign_checkpoint(&cp_a).signature };
         assert!(a.observe_votes(&cp_a, &[forged]).is_empty());
+    }
+
+    // ---- M10-T0-2: finality-stall recovery e2e --------------------------------
+
+    /// A fast-mining sim so the e2e can cross the degraded-mode lag threshold
+    /// (`DEGRADED_MODE_LAG_BLOCKS` = 16) in a couple dozen cheap blocks.
+    fn easy_sim() -> SimConfig {
+        SimConfig {
+            block_time_secs: 2,
+            genesis_difficulty: 8,
+            mine_nonce_budget: 5_000_000,
+            ..SimConfig::default()
+        }
+    }
+
+    /// Reproduce `devnet_committee`'s deterministic seed for validator `i`, so a
+    /// simulated crash-restart can rebuild the same signing key from its keystore.
+    fn devnet_seed(i: usize) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        s[0] = 0x9c;
+        s[1..9].copy_from_slice(&(i as u64).to_le_bytes());
+        s
+    }
+
+    /// Mine one block on `proposer` and relay it to `follower` — a two-node
+    /// in-process mesh sharing one genesis. Both accept the same block.
+    fn mine_and_relay(
+        proposer: &mut NodeAdapter<KeccakPow, MockVerifier>,
+        follower: &mut NodeAdapter<KeccakPow, MockVerifier>,
+    ) {
+        let (h, body) = proposer.mine_block().expect("mine");
+        assert_eq!(proposer.ingest_block(h, body.clone()), IngestOutcome::Accepted);
+        assert_eq!(follower.ingest_block(h, body), IngestOutcome::Accepted);
+    }
+
+    /// Assemble a telemetry snapshot from a live adapter + an injected peer count
+    /// (age is chain-time from block timestamps — deterministic).
+    fn telemetry_of(a: &NodeAdapter<KeccakPow, MockVerifier>, peer_count: u64) -> Telemetry {
+        let tip = a.chain().tip_height();
+        let finalized = a.finalized_height();
+        let main = a.chain().main_chain();
+        let ts_at = |h: u64| a.chain().header(&main[h as usize]).map(|hd| hd.timestamp).unwrap_or(0);
+        let age = ts_at(tip).saturating_sub(ts_at(finalized.unwrap_or(0)));
+        Telemetry::assemble(
+            tip,
+            finalized,
+            age,
+            a.mempool().len() as u64,
+            peer_count,
+            a.committee().current_epoch(),
+            DEGRADED_MODE_LAG_BLOCKS,
+        )
+    }
+
+    /// The full recovery arc over a two-node mesh: normal finality → committee
+    /// goes dark → node flags Degraded (stall depth + age rise, committee earns
+    /// nothing) → the committee process restarts from persisted finalizer state →
+    /// catch-up finalization jumps past the stalled span → both nodes recover to
+    /// Final. This is the half Crosslink left undesigned (design §4 status).
+    #[test]
+    fn finality_stall_degrade_committee_restart_recovery() {
+        use qlab_node::recovery::{catch_up_slot, committee_accrual_finalized, FinalizerState};
+        use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS as CADENCE;
+
+        // Two-node mesh, one committee (quorum 5), five finalizers hold the keys.
+        let mut a = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let mut b = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let mut finalizers: Vec<Finalizer> =
+            (0..5).map(|i| Finalizer::new(Validator::from_seed(i, devnet_seed(i)))).collect();
+        const PEERS: u64 = 1; // each node sees one peer in this mesh
+
+        // --- 1. Normal operation: mine a cadence span and finalize slot 8. ---
+        for _ in 0..CADENCE {
+            mine_and_relay(&mut a, &mut b);
+        }
+        let (cp8, votes8) = a.make_checkpoint_guarded(CADENCE, &mut finalizers).unwrap();
+        assert_eq!(votes8.len(), 5, "all five finalizers vote on a fresh slot");
+        assert_eq!(a.ingest_checkpoint(cp8, votes8.clone()), IngestOutcome::Accepted);
+        assert_eq!(b.ingest_checkpoint(cp8, votes8), IngestOutcome::Accepted);
+        assert_eq!(a.finalized_height(), Some(CADENCE));
+        assert_eq!(a.finality_status(), FinalityStatus::Final);
+        assert_eq!(telemetry_of(&a, PEERS).finality_status, FinalityStatus::Final);
+        let income_before = committee_accrual_finalized(a.finalized_height());
+        assert!(income_before > 0);
+
+        // --- 2. Committee goes dark: chain keeps producing, finality does not. ---
+        // Mine past the degraded threshold (lag = tip − 8 > 16).
+        for _ in 0..(DEGRADED_MODE_LAG_BLOCKS + 1) {
+            mine_and_relay(&mut a, &mut b);
+        }
+        let stalled_tip = a.chain().tip_height();
+        assert!(stalled_tip - CADENCE > DEGRADED_MODE_LAG_BLOCKS);
+        assert_eq!(a.finality_status(), FinalityStatus::Degraded, "committee stall ⇒ Degraded");
+        assert_eq!(b.finality_status(), FinalityStatus::Degraded);
+
+        let t_stall = telemetry_of(&a, PEERS);
+        assert_eq!(t_stall.finality_status, FinalityStatus::Degraded);
+        assert_eq!(t_stall.stall_depth, stalled_tip - CADENCE, "stall depth = tip − finalized");
+        assert!(t_stall.last_finalized_age_secs > 0, "chain-time age of the stall is visible");
+        // The stalled span earns the committee nothing (finalized-only accrual):
+        // income is unchanged from before the stall despite ~17 new blocks.
+        assert_eq!(
+            committee_accrual_finalized(a.finalized_height()),
+            income_before,
+            "no committee income accrues for the unfinalized span"
+        );
+
+        // --- 3. Committee restart: persist finalizer state, crash, rejoin. ---
+        let saved: Vec<Vec<u8>> = finalizers.iter().map(|f| f.state().to_bytes()).collect();
+        drop(finalizers); // the finalizer processes die
+        let mut finalizers: Vec<Finalizer> = (0..5)
+            .map(|i| {
+                let st = FinalizerState::from_bytes(&saved[i]).expect("reload ledger");
+                Finalizer::restore(Validator::from_seed(i, devnet_seed(i)), st)
+            })
+            .collect();
+        // They resume knowing exactly where they left off — no operator surgery.
+        assert!(finalizers.iter().all(|f| f.last_voted_slot() == Some(CADENCE)));
+
+        // --- 4. Catch-up finalization: jump straight to the newest slot ≤ tip,
+        //         skipping the stalled intermediate slots (strictly-advancing). ---
+        let recover = catch_up_slot(stalled_tip, CADENCE).expect("a slot to catch up to");
+        assert!(recover > CADENCE && recover <= stalled_tip);
+        let (cpr, votesr) = a.make_checkpoint_guarded(recover, &mut finalizers).unwrap();
+        assert_eq!(votesr.len(), 5, "restarted finalizers all vote on the fresh recovery slot");
+        assert_eq!(a.ingest_checkpoint(cpr, votesr.clone()), IngestOutcome::Accepted);
+        assert_eq!(b.ingest_checkpoint(cpr, votesr), IngestOutcome::Accepted);
+
+        // --- 5. Both nodes recover to Final; finality jumped 8 → recover directly. ---
+        assert_eq!(a.finalized_height(), Some(recover), "finality advanced past the stall");
+        assert!(recover - CADENCE > 1, "the recovery skipped intermediate stalled slots");
+        assert_eq!(a.finality_status(), FinalityStatus::Final, "node a recovered");
+        assert_eq!(b.finality_status(), FinalityStatus::Final, "node b recovered (mesh converged)");
+        let t_recovered = telemetry_of(&a, PEERS);
+        assert_eq!(t_recovered.finality_status, FinalityStatus::Final);
+        assert!(t_recovered.stall_depth < t_stall.stall_depth, "stall depth dropped on recovery");
+        // Recovery accrues the newly-finalized span's committee income.
+        assert!(
+            committee_accrual_finalized(a.finalized_height()) > income_before,
+            "the recovered span now accrues committee income"
+        );
+
+        // --- 6. The never-double-sign invariant held across the restart. ---
+        // A restarted finalizer refuses to sign a CONFLICTING checkpoint for slot 8
+        // (which it signed before the crash) — it can never emit the second half of
+        // an equivocation pair.
+        let conflicting_slot8 = Checkpoint::new(CADENCE, [0xEE; 32], [0xEE; 32]);
+        assert!(
+            finalizers[0].sign(&conflicting_slot8).is_err(),
+            "restarted finalizer must not equivocate against its pre-crash slot-8 vote"
+        );
     }
 }
