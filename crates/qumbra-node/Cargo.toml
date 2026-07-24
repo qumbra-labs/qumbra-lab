@@ -17,9 +17,10 @@ publish.workspace = true
 # orphan-sync-kick fix + the equivocation-slash convergence in qlab-p2p. Zero
 # contact with qlab-bench/m4gate and T0-2's ops/telemetry surfaces.
 #
-# The transaction verifier is INJECTED (the N7 stack is verifier-agnostic): the
-# default is a clearly-labelled devnet-rehearsal verifier; the real M3 verifier
-# (`qlab_consensus::verify_proof`) is the production drop-in at the same seam.
+# The transaction verifier is INJECTED (the N7 stack is verifier-agnostic). Since
+# M10-T0-4 (issue #68) the DEFAULT is the real M3 verifier
+# (`qlab_consensus::verify_proof`, frozen CONSENSUS_CFG); the NO-OP rehearsal
+# stand-in is an explicit `--rehearsal-verifier` opt-in, logged loudly at startup.
 
 [[bin]]
 name = "qumbra-node"
@@ -38,8 +39,14 @@ qlab-pow = { path = "../qlab-pow" }
 # params surface, the SimConfig parameter carrier, and posted-fee table.
 qlab-devnet = { path = "../qlab-devnet" }
 # The single-source frozen consensus config (CONSENSUS_CFG label, LOG_HEIGHT,
-# wire byte count) baked into the genesis constant table.
+# wire byte count) baked into the genesis constant table, and the real M3
+# prove/verify wrappers the default tx verifier calls (M10-T0-4).
 qlab-consensus = { path = "../qlab-consensus" }
+# The fixed-shape 2×2 bucket AIR + public-value packing (`build_bucket`, `pv_vec`),
+# used by the real tx verifier to reconstruct the canonical verifier instance and
+# the declared public surface (M10-T0-4, issue #68). Already built transitively
+# via qlab-consensus; named directly here for the verifier's reconstruction path.
+qlab-air = { path = "../qlab-air" }
 # ML-DSA-65 verifying-key encode/decode for committee₀ in the genesis file.
 ml-dsa = "=0.1.1"
 

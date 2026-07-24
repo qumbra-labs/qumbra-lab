@@ -13,13 +13,17 @@
 //!   (the docs/ table's data, test-locked here).
 //! - [`run`] — composes the N7 stack over the REAL TCP transport + RandomXPow +
 //!   on-disk qlab-node stores, and runs it with graceful-shutdown snapshot flush.
+//! - [`verifier`] — the injected transaction verifier. The **default is the real
+//!   M3 verifier** ([`verifier::ConsensusVerifier`] → `qlab_consensus::verify_proof`,
+//!   frozen `CONSENSUS_CFG`); the rehearsal stand-in
+//!   ([`run::DevnetRehearsalVerifier`]) is an explicit `--rehearsal-verifier`
+//!   opt-in, logged loudly at startup (M10-T0-4, issue #68 — the named M11 gate).
 //!
-//! The transaction-proof verifier is injected (the N7 stack is verifier-agnostic).
-//! The default [`run::DevnetRehearsalVerifier`] is a clearly-labelled rehearsal
-//! stand-in; the real M3 verifier (`qlab_consensus::verify_proof`) is the
-//! production drop-in at the exact same `TxVerifier` seam.
+//! The transaction-proof verifier is injected at the same `TxVerifier` seam the
+//! N7 stack has always exposed; T0-4 just makes the real verifier the default.
 
 pub mod config;
 pub mod genesis;
 pub mod params_audit;
 pub mod run;
+pub mod verifier;

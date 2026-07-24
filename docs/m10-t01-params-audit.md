@@ -6,15 +6,15 @@ Every `qlab_devnet::params_devnet` placeholder against the FROZEN v1.0 genesis v
 |---|---|---|---|---|---|
 | §2 | block time (s) | POW_TARGET_BLOCK_TIME_SECS = 75 | 75 | ✅ converged | T0 runs the FROZEN 75 s (item 3); SIM_BLOCK_TIME_SECS is a separate sim knob |
 | §2 | sim block time (s) | SIM_BLOCK_TIME_SECS = 2 | n/a | 🧪 sim-only | accelerated in-process sim only; the binary uses the frozen 75 s |
-| §2 | genesis difficulty | GENESIS_DIFFICULTY = 1000 | genesis file T0_GENESIS_DIFFICULTY = 256 | 📌 debt (genesis is source) | [devnet-placeholder] — not frozen; the real launch difficulty is open |
+| §2 | genesis difficulty | GENESIS_DIFFICULTY = 1000 (sim knob) | genesis file T0_GENESIS_DIFFICULTY = 256 [devnet-placeholder] | 🧪 sim-only | binary bakes the genesis file's T0 difficulty (not this constant); real launch difficulty is open — NOT invented (T0-4, issue #68) |
 | §2 | bessel / QMB | — | 100000000 | ✅ converged | emission::BESSEL_PER_QMB = 10⁸ (frozen §8) |
 | §2 | coinbase maturity (blocks) | — | 144 | ✅ converged | emission::COINBASE_MATURITY_BLOCKS = 144 (frozen §2) |
 | §3 | reward split % | — | 65/15/20 | ✅ converged | emission::SPLIT_* = 65/15/20 (frozen §3) |
 | §4 | committee size N | FROZEN_COMMITTEE_SIZE = 21 (COMMITTEE_SIZE = 20 is M6 back-compat) | 21 | ✅ converged | genesis committee₀ is the frozen N=21; COMMITTEE_SIZE=20 is superseded |
 | §4 | quorum | FROZEN_QUORUM = 15 | 15 | ✅ converged | ⌊2·21/3⌋+1 = 15 (frozen §4) |
 | §4 | epoch length (blocks) | EPOCH_LENGTH_BLOCKS = 1152 (SIM_EPOCH_LENGTH_BLOCKS = 16 is sim) | 1152 | ✅ converged | 1,152 = 24 h at 75 s (frozen §4); SIM_EPOCH_LENGTH_BLOCKS is a sim knob |
-| §4 | self-bond (QMB) | BOND_AMOUNT = 1000000 (bessel, placeholder) | 10000 steady + ramp [(0, 0), (90, 100), (180, 1000), (360, 10000)] | 📌 debt (genesis is source) | genesis bakes 10⁴ QMB + ramp; BOND_AMOUNT (qlab-devnet) absolute scale owed |
-| §4 | equivocation slash | EQUIVOCATION_SLASH_AMOUNT = 100000 (= BOND_AMOUNT/10) | 10 % of bond | ✅ converged | adapter now slashes 10 % of the member's bond (item 5); flat constant superseded |
+| §4 | self-bond (bessel) | BOND_AMOUNT = 1000000000000 (10⁴ QMB × 10⁸) | 10000 QMB steady × 100000000 = 1000000000000 bessel; ramp [(0, 0), (90, 100), (180, 1000), (360, 10000)] | ✅ converged | converged to the frozen 10⁴-QMB steady bond (T0-4, issue #68); the epoch ramp lives in the genesis file (the source of truth) |
+| §4 | equivocation slash | EQUIVOCATION_SLASH_AMOUNT = 100000000000 (= BOND_AMOUNT/10) | 10 % of bond | ✅ converged | derived = BOND_AMOUNT/10 (tracks the converged bond); the real path (qlab-p2p adapter) slashes 10 % of each member's own bond |
 | §4 | downtime jail threshold % | DOWNTIME_JAIL_THRESHOLD_PCT = 33 | 33 | ✅ converged | < 33 % signed (frozen §4) |
 | §4 | downtime jail window | DOWNTIME_JAIL_WINDOW = 100 | 100 | ✅ converged | trailing 100 checkpoint rounds (frozen §4) |
 | §4 | jail term (blocks) | JAIL_BLOCKS = 32 | n/a (auto-readmit) | 🧊 not-frozen (full-M8) | jail-no-slash timeout; testnet-tunable |
@@ -28,4 +28,4 @@ Every `qlab_devnet::params_devnet` placeholder against the FROZEN v1.0 genesis v
 | §7 | degraded-mode lag (blocks) | DEGRADED_MODE_LAG_BLOCKS = 16 | n/a (derived from cadence) | 🧊 not-frozen (full-M8) | Ebb-and-Flow lag; tied to the not-frozen cadence |
 | PoW | LWMA window / key epoch / lag | LWMA_WINDOW_BLOCKS = 120 , SEEDHASH_EPOCH_BLOCKS = 2048 , SEEDHASH_EPOCH_LAG = 64 | n/a | 🧊 not-frozen (full-M8) | real RandomX + LWMA-120 prototyped (N3); retarget params freeze at full-M8 v1.1 |
 
-**Boundary note.** Rows marked *debt* SHOULD converge but their constant lives in `qlab-devnet/params_devnet.rs`, outside this task's conflict boundary (qlab-node bin/genesis + the qlab-p2p sync-kick). The **genesis file is the frozen source of truth** the binary reads; the residual absolute-scale convergence in `params_devnet.rs` (`BOND_AMOUNT`, `GENESIS_DIFFICULTY`) is left to the qlab-devnet owner to avoid colliding with parallel T0-2 work. The equivocation slash IS converged at the real path (the qlab-p2p `NodeAdapter` now slashes 10 % of bond).
+**Convergence note (M10-T0-4, issue #68).** The last two *debt* rows are resolved: `BOND_AMOUNT` converged to the frozen 10⁴-QMB steady self-bond (10⁴ × 10⁸ = 10¹² bessel), with `EQUIVOCATION_SLASH_AMOUNT` derived as 10 % of it so the frozen-§4 slash relation holds by construction; and `GENESIS_DIFFICULTY` is annotated as the **sim-only `[devnet-placeholder]`** it is — the deployable binary bakes the genesis file's own T0 difficulty (itself a placeholder), and the **real launch difficulty stays open and was NOT invented**. The **genesis file remains the frozen source of truth** the binary reads; the epoch bond ramp lives there. No row is *debt* anymore.

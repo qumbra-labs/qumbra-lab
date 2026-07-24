@@ -1128,6 +1128,7 @@ dependencies = [
  "bincode",
  "ctrlc",
  "ml-dsa",
+ "qlab-air",
  "qlab-consensus",
  "qlab-devnet",
  "qlab-node",
