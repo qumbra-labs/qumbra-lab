@@ -57,7 +57,7 @@ use qlab_cbserver::codec::{
 };
 use qlab_cbserver::tree::Frontier;
 use qlab_devnet::body::{TxEntry, TxPublic, TxVerifier};
-use qlab_devnet::params_devnet::MAX_ANCHOR_AGE_BLOCKS;
+use qlab_devnet::params_devnet::{DEGRADED_MODE_LAG_BLOCKS, MAX_ANCHOR_AGE_BLOCKS};
 use qlab_note::hash::{digest_bytes, keccak256};
 use qlab_note::wire::RecipientBundle;
 
@@ -66,6 +66,7 @@ use std::collections::HashMap;
 use crate::mempool::{Mempool, MempoolError};
 use crate::node::{Node, NodeState};
 use crate::store::{ChainStore, CommitmentStore, Hash32, NullifierStore, StoredBlock, StoredTx};
+use crate::telemetry::Telemetry;
 
 /// The RPC wire-format version byte. Shares the value of the ratified
 /// compact-block wire ([`qlab_cbserver::WIRE_VERSION`] = `0x01`); the two are
@@ -184,6 +185,19 @@ pub struct NodeRpc<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// against. Keyed by the statement id, NOT the mempool's body-commitment id:
     /// the two encodings are deliberately distinct (see the module docs).
     discovery: HashMap<Hash32, TxDiscovery>,
+    /// Network-layer facts the node itself cannot observe (peer count, committee
+    /// epoch): the N1 traits do not carry them, so the P2P glue stamps them in via
+    /// [`Self::set_net_facts`] for `/v1/telemetry`. Zero on a standalone node.
+    net: NetFacts,
+}
+
+/// The network-layer half of [`Telemetry`], injected by the P2P layer (M10-T0-2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NetFacts {
+    /// Connected peer count.
+    pub peer_count: u64,
+    /// Current committee epoch.
+    pub epoch: u64,
 }
 
 /// The default all-in-memory RPC composition.
@@ -200,6 +214,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             node,
             mempool: Mempool::default(),
             discovery: HashMap::new(),
+            net: NetFacts::default(),
         }
     }
 
@@ -330,6 +345,49 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
         }
     }
 
+    /// Stamp in the network-layer facts the node cannot observe itself (peer
+    /// count, committee epoch). The P2P glue calls this so `/v1/telemetry` reports
+    /// the full picture; a standalone node leaves them at zero.
+    pub fn set_net_facts(&mut self, peer_count: u64, epoch: u64) {
+        self.net = NetFacts { peer_count, epoch };
+    }
+
+    /// A live finality-health snapshot (`/v1/telemetry`, M10-T0-2). The node-owned
+    /// half (regime, stall depth, last-finalized age, heights, mempool) is derived
+    /// from live state; peer count and epoch come from the injected [`NetFacts`].
+    ///
+    /// `last_finalized_age_secs` is chain-time (block timestamps), not wall clock,
+    /// so telemetry is deterministic given the chain: the gap between the tip
+    /// block's timestamp and the finalized block's (or genesis, if nothing is
+    /// finalized).
+    pub fn telemetry(&self) -> Telemetry {
+        let tip_height = self.node.tip_height();
+        let finalized_height = self.node.finalized_height();
+        let age = self.last_finalized_age_secs();
+        Telemetry::assemble(
+            tip_height,
+            finalized_height,
+            age,
+            self.mempool.len() as u64,
+            self.net.peer_count,
+            self.net.epoch,
+            DEGRADED_MODE_LAG_BLOCKS,
+        )
+    }
+
+    /// Chain-time seconds between the tip block and the finalized block (or genesis
+    /// when nothing is finalized). Uses only the public chain store.
+    fn last_finalized_age_secs(&self) -> u64 {
+        let chain = self.node.chain();
+        let tip_ts = chain
+            .block(&chain.tip_hash())
+            .map(|b| b.header.timestamp)
+            .unwrap_or(0);
+        let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_hash());
+        let base_ts = chain.block(&base_hash).map(|b| b.header.timestamp).unwrap_or(0);
+        tip_ts.saturating_sub(base_ts)
+    }
+
     // ---- main-chain helpers (public API only) ------------------------------
 
     /// The main chain, genesis-first, as stored blocks (walks tip→genesis via
@@ -447,6 +505,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
         match segs.as_slice() {
             ["v1", "status"] => Ok(self.status().to_bytes()),
             ["v1", "anchors"] => Ok(self.anchors().to_bytes()),
+            ["v1", "telemetry"] => Ok(self.telemetry().to_bytes()),
             ["v1", "compact"] => {
                 let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'"))?;
                 let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'"))?;
@@ -597,16 +656,16 @@ impl AnchorSet {
 /// A tiny cursor reusing cbserver's `CodecError` vocabulary + varint, so the N6
 /// wires reject exactly like the ratified ones (unknown version, truncation,
 /// trailing bytes).
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     b: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(b: &'a [u8]) -> Self {
+    pub(crate) fn new(b: &'a [u8]) -> Self {
         Self { b, pos: 0 }
     }
-    fn version(&mut self) -> Result<(), CodecError> {
+    pub(crate) fn version(&mut self) -> Result<(), CodecError> {
         let v = *self.b.get(self.pos).ok_or(CodecError::Truncated { what: "version" })?;
         self.pos += 1;
         if v != RPC_VERSION {
@@ -614,27 +673,28 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
-    fn u8(&mut self) -> Result<u8, CodecError> {
+    pub(crate) fn u8(&mut self) -> Result<u8, CodecError> {
         let v = *self.b.get(self.pos).ok_or(CodecError::Truncated { what: "u8" })?;
         self.pos += 1;
         Ok(v)
     }
-    fn u64(&mut self) -> Result<u64, CodecError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, CodecError> {
         let end = self.pos + 8;
         let slice = self.b.get(self.pos..end).ok_or(CodecError::Truncated { what: "u64" })?;
         self.pos = end;
         Ok(u64::from_le_bytes(slice.try_into().unwrap()))
     }
-    fn hash32(&mut self) -> Result<Hash32, CodecError> {
+    pub(crate) fn hash32(&mut self) -> Result<Hash32, CodecError> {
         let end = self.pos + 32;
         let slice = self.b.get(self.pos..end).ok_or(CodecError::Truncated { what: "hash32" })?;
         self.pos = end;
         Ok(slice.try_into().unwrap())
     }
-    fn varint(&mut self) -> Result<u64, CodecError> {
+    #[allow(dead_code)]
+    pub(crate) fn varint(&mut self) -> Result<u64, CodecError> {
         read_varint(self.b, &mut self.pos)
     }
-    fn finish(&self) -> Result<(), CodecError> {
+    pub(crate) fn finish(&self) -> Result<(), CodecError> {
         if self.pos != self.b.len() {
             return Err(CodecError::TrailingBytes { remaining: self.b.len() - self.pos });
         }
@@ -864,6 +924,31 @@ mod tests {
         assert!(a.roots.contains(&anchor), "finalized genesis root is a valid anchor");
         assert_eq!(a.max_age_blocks, MAX_ANCHOR_AGE_BLOCKS);
         assert_eq!(AnchorSet::from_bytes(&a.to_bytes()).unwrap(), a, "anchors round-trip");
+    }
+
+    #[test]
+    fn telemetry_endpoint_reflects_state_and_injected_net_facts() {
+        let (mut rpc, anchor) = rpc_with_finalized_genesis();
+        // Inject the network half (peers, epoch) the node cannot observe itself.
+        rpc.set_net_facts(4, 2);
+        let tx = tx_with(anchor, &[1, 2], &[10, 11], posted_fee(ArityBucket::TwoByTwo));
+        rpc.submit_tx(tx, TxDiscovery { recipients: vec![recip(0x10, &[10, 11])] }, &OkVerifier);
+
+        let t = rpc.telemetry();
+        // Genesis finalized at height 0, tip 0 ⇒ Final, no stall.
+        assert_eq!(t.finality_status, qlab_devnet::ebbflow::FinalityStatus::Final);
+        assert_eq!(t.tip_height, 0);
+        assert_eq!(t.finalized_height, Some(0));
+        assert_eq!(t.stall_depth, 0);
+        assert_eq!(t.peer_count, 4, "injected peer count surfaces");
+        assert_eq!(t.epoch, 2, "injected epoch surfaces");
+        assert_eq!(t.mempool_size, 1, "one pending tx");
+        assert_eq!(Telemetry::from_bytes(&t.to_bytes()).unwrap(), t, "telemetry round-trips");
+
+        // The `/v1/telemetry` route serves exactly those bytes.
+        let served = rpc.route("/v1/telemetry").unwrap();
+        assert_eq!(served, t.to_bytes());
+        assert_eq!(Telemetry::from_bytes(&served).unwrap(), t);
     }
 
     #[test]
