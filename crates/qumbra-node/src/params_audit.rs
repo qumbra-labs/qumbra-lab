@@ -6,14 +6,15 @@
 //! - **Converged** — the placeholder now equals the frozen value; the constant is
 //!   test-locked below (a drift is a test failure).
 //! - **SimOnly** — an accelerated-sim/test knob that never enters a real net (its
-//!   real counterpart is a separate, frozen constant). Annotated, not converged.
+//!   real counterpart is a separate, frozen constant, or the deployable binary
+//!   reads the genesis file instead). Annotated, not converged.
 //! - **NotFrozen** — testnet-tunable, freezes at full-M8 v1.1 (recorded).
-//! - **Debt** — should converge but the constant lives in `qlab-devnet`, which is
-//!   **outside this task's conflict boundary** (qlab-node bin/genesis + the
-//!   qlab-p2p sync-kick). The genesis file is the frozen source of truth; the
-//!   remaining absolute-scale convergence in `params_devnet.rs` is left to the
-//!   qlab-devnet owner to avoid colliding with parallel T0-2 work. Flagged, not
-//!   silently changed.
+//! - **Debt** — was: "should converge but lives outside the T0-1 conflict boundary."
+//!   **M10-T0-4 (issue #68) retired the last two debt rows** — `BOND_AMOUNT`
+//!   converged to the frozen 10⁴-QMB steady bond (10¹² bessel), and
+//!   `GENESIS_DIFFICULTY` annotated as the sim-only `[devnet-placeholder]` it is
+//!   (the binary bakes the genesis file's T0 difficulty; the real launch value
+//!   stays open). No row is *Debt* anymore; the variant is kept for future use.
 //!
 //! [`render_markdown`] emits the docs/ table; the unit tests are the test-lock.
 
@@ -30,8 +31,9 @@ pub enum Status {
     SimOnly,
     /// Testnet-tunable, freezes at full-M8 v1.1.
     NotFrozen,
-    /// Should converge; lives in qlab-devnet (outside the boundary) — genesis file
-    /// is the source of truth, params_devnet convergence owed.
+    /// Was: convergence owed but the constant lived outside the T0-1 boundary.
+    /// **No row uses this after M10-T0-4** (issue #68 converged both former debt
+    /// rows). Kept for future flagging.
     Debt,
 }
 
@@ -80,10 +82,11 @@ pub fn rows() -> Vec<AuditRow> {
         AuditRow {
             section: "§2",
             name: "genesis difficulty",
-            params_devnet: format!("GENESIS_DIFFICULTY = {}", pd::GENESIS_DIFFICULTY),
-            frozen_genesis: format!("genesis file T0_GENESIS_DIFFICULTY = {}", crate::genesis::T0_GENESIS_DIFFICULTY),
-            status: Status::Debt,
-            note: "[devnet-placeholder] — not frozen; the real launch difficulty is open",
+            params_devnet: format!("GENESIS_DIFFICULTY = {} (sim knob)", pd::GENESIS_DIFFICULTY),
+            frozen_genesis: format!("genesis file T0_GENESIS_DIFFICULTY = {} [devnet-placeholder]", crate::genesis::T0_GENESIS_DIFFICULTY),
+            status: Status::SimOnly,
+            note: "binary bakes the genesis file's T0 difficulty (not this constant); \
+                   real launch difficulty is open — NOT invented (T0-4, issue #68)",
         },
         AuditRow {
             section: "§2",
@@ -148,14 +151,18 @@ pub fn rows() -> Vec<AuditRow> {
         },
         AuditRow {
             section: "§4",
-            name: "self-bond (QMB)",
-            params_devnet: format!("BOND_AMOUNT = {} (bessel, placeholder)", pd::BOND_AMOUNT),
+            name: "self-bond (bessel)",
+            params_devnet: format!("BOND_AMOUNT = {} (10⁴ QMB × 10⁸)", pd::BOND_AMOUNT),
             frozen_genesis: format!(
-                "{} steady + ramp {:?}",
-                f.self_bond_qmb_steady, f.bond_ramp_qmb
+                "{} QMB steady × {} = {} bessel; ramp {:?}",
+                f.self_bond_qmb_steady,
+                f.bessel_per_qmb,
+                f.self_bond_qmb_steady * f.bessel_per_qmb,
+                f.bond_ramp_qmb
             ),
-            status: Status::Debt,
-            note: "genesis bakes 10⁴ QMB + ramp; BOND_AMOUNT (qlab-devnet) absolute scale owed",
+            status: Status::Converged,
+            note: "converged to the frozen 10⁴-QMB steady bond (T0-4, issue #68); \
+                   the epoch ramp lives in the genesis file (the source of truth)",
         },
         AuditRow {
             section: "§4",
@@ -166,7 +173,8 @@ pub fn rows() -> Vec<AuditRow> {
             ),
             frozen_genesis: format!("{} % of bond", f.equivocation_slash_pct),
             status: Status::Converged,
-            note: "adapter now slashes 10 % of the member's bond (item 5); flat constant superseded",
+            note: "derived = BOND_AMOUNT/10 (tracks the converged bond); the real path \
+                   (qlab-p2p adapter) slashes 10 % of each member's own bond",
         },
         AuditRow {
             section: "§4",
@@ -314,13 +322,14 @@ pub fn render_markdown() -> String {
         ));
     }
     s.push_str(
-        "\n**Boundary note.** Rows marked *debt* SHOULD converge but their constant lives in \
-         `qlab-devnet/params_devnet.rs`, outside this task's conflict boundary (qlab-node \
-         bin/genesis + the qlab-p2p sync-kick). The **genesis file is the frozen source of \
-         truth** the binary reads; the residual absolute-scale convergence in `params_devnet.rs` \
-         (`BOND_AMOUNT`, `GENESIS_DIFFICULTY`) is left to the qlab-devnet owner to avoid \
-         colliding with parallel T0-2 work. The equivocation slash IS converged at the real path \
-         (the qlab-p2p `NodeAdapter` now slashes 10 % of bond).\n",
+        "\n**Convergence note (M10-T0-4, issue #68).** The last two *debt* rows are resolved: \
+         `BOND_AMOUNT` converged to the frozen 10⁴-QMB steady self-bond (10⁴ × 10⁸ = 10¹² \
+         bessel), with `EQUIVOCATION_SLASH_AMOUNT` derived as 10 % of it so the frozen-§4 \
+         slash relation holds by construction; and `GENESIS_DIFFICULTY` is annotated as the \
+         **sim-only `[devnet-placeholder]`** it is — the deployable binary bakes the genesis \
+         file's own T0 difficulty (itself a placeholder), and the **real launch difficulty \
+         stays open and was NOT invented**. The **genesis file remains the frozen source of \
+         truth** the binary reads; the epoch bond ramp lives there. No row is *debt* anymore.\n",
     );
     s
 }
@@ -352,6 +361,10 @@ mod tests {
         assert_eq!(f.quorum, 15);
         assert_eq!(pd::EPOCH_LENGTH_BLOCKS, 1_152);
         assert_eq!(f.epoch_length_blocks, 1_152);
+        // Self-bond converged to the frozen 10⁴-QMB steady bond in bessel (T0-4).
+        assert_eq!(pd::BOND_AMOUNT, 10_000 * 100_000_000);
+        assert_eq!(pd::BOND_AMOUNT, f.self_bond_qmb_steady * f.bessel_per_qmb);
+        assert_eq!(f.self_bond_qmb_steady, 10_000);
         assert_eq!(pd::DOWNTIME_JAIL_THRESHOLD_PCT, 33);
         assert_eq!(pd::DOWNTIME_JAIL_WINDOW, 100);
         // §5
@@ -369,12 +382,14 @@ mod tests {
         assert_eq!(f.anchor_max_age_blocks, 1_152);
     }
 
-    /// The equivocation-slash convergence relationship: 10 % of the standard bond
-    /// equals the former flat placeholder — so the converged derived value is a
-    /// clean supersession, not a behaviour change at the standard bond.
+    /// The equivocation-slash relationship (frozen §4 = "10 % of bond"): the slash
+    /// constant is *derived* as `BOND_AMOUNT / 10`, so the relation holds by
+    /// construction at the converged 10¹²-bessel bond (T0-4). The frozen genesis
+    /// expresses the same rule as a percentage over each member's own bond.
     #[test]
     fn equivocation_slash_is_ten_percent_of_bond() {
         assert_eq!(pd::EQUIVOCATION_SLASH_AMOUNT, pd::BOND_AMOUNT / 10);
+        assert_eq!(pd::EQUIVOCATION_SLASH_AMOUNT, 100_000_000_000); // 10¹¹ bessel = 10³ QMB
         assert_eq!(FrozenParams::v1_0().equivocation_slash_pct, 10);
         assert_eq!(FrozenParams::v1_0().equivocation_slash_qmb(10_000), 1_000);
         assert_eq!(FrozenParams::v1_0().equivocation_slash_qmb(0), 0); // ramp start
@@ -397,10 +412,11 @@ mod tests {
         for r in rows() {
             assert!(md.contains(r.name), "row missing from markdown: {}", r.name);
         }
-        // all four statuses are represented in the audit
+        // The three live statuses are represented. (Debt was retired by T0-4 —
+        // issue #68 converged the last two debt rows; no row is Debt anymore.)
         assert!(rows().iter().any(|r| r.status == Status::Converged));
         assert!(rows().iter().any(|r| r.status == Status::SimOnly));
         assert!(rows().iter().any(|r| r.status == Status::NotFrozen));
-        assert!(rows().iter().any(|r| r.status == Status::Debt));
+        assert!(!rows().iter().any(|r| r.status == Status::Debt), "T0-4 retired all debt rows");
     }
 }

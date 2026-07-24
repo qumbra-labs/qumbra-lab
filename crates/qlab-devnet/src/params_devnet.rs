@@ -22,8 +22,14 @@
 // frozen** — protocol-spec §10 freezes them at v1.1 with full M8. Monero/Zawy
 // provenance is quoted; these are prototype choices, not Qumbra proposals.
 
-/// Genesis difficulty. PLACEHOLDER — chosen low so the sim mines quickly; the
-/// real launch difficulty is an open tokenomics/consensus question.
+/// Genesis difficulty for the accelerated in-process sim. **[devnet-placeholder]
+/// — NOT frozen.** Chosen low so the sim/tests mine quickly. This constant is a
+/// *sim knob*: the deployable `qumbra-node` binary does NOT read it — it bakes
+/// the genesis file's own T0 difficulty (`qumbra_node::genesis::T0_GENESIS_DIFFICULTY`,
+/// itself a `[devnet-placeholder]`) into the genesis block, and that is the
+/// authoritative T0 value every node agrees on. The **real launch difficulty is
+/// an open consensus/tokenomics question and is deliberately NOT chosen here**
+/// (M10-T0-4, issue #68: "launch difficulty stays open — do NOT invent one").
 pub const GENESIS_DIFFICULTY: u64 = 1_000;
 
 /// The **FROZEN** target block time (consensus-parameters §2; Zcash ZIP-208
@@ -87,13 +93,27 @@ pub const SIM_EPOCH_LENGTH_BLOCKS: u64 = 16;
 /// frozen with the full-M8 P2P section. Sets the "minutes-class" finality latency.
 pub const CHECKPOINT_CADENCE_BLOCKS: u64 = 8;
 
-/// Per-validator self-bond (native-token units). PLACEHOLDER — the bond
-/// minimum is open (committee-governance §3 / consensus-parameters appendix).
-pub const BOND_AMOUNT: u64 = 1_000_000;
+/// Per-validator self-bond, in **bessel** (1 QMB = 10⁸ bessel, frozen §8).
+///
+/// **CONVERGED to the FROZEN v1.0 genesis steady-state self-bond (M10-T0-4,
+/// issue #68).** The genesis file bakes a 10⁴ QMB steady-state minimum
+/// (`FrozenParams::self_bond_qmb_steady`) reached via the epoch ramp
+/// `BOND_RAMP_QMB = [(0,0),(90,100),(180,1_000),(360,10_000)]` QMB; in bessel the
+/// steady bond is 10⁴ × 10⁸ = 10¹² (this value). Same convergence act as the
+/// PR #45 anchor-window / M9-N4 fee-scale fixes — only the absolute scale was
+/// pinned; the M6-sim behaviour (bond initialised at this amount) is unchanged in
+/// shape. **The ramp itself lives in the genesis file** (the frozen source of
+/// truth); this flat constant is the steady-state endpoint the accelerated sim
+/// and committee code initialise bonds to.
+pub const BOND_AMOUNT: u64 = 10_000 * 100_000_000; // 10⁴ QMB × 10⁸ bessel/QMB = 10¹²
 
 /// Bond slashed on equivocation (committee-governance §3: tombstone + slash).
-/// PLACEHOLDER — the slash constant is explicitly open. Downtime is jail-NO-slash.
-pub const EQUIVOCATION_SLASH_AMOUNT: u64 = 100_000;
+/// **CONVERGED: 10 % of the standard bond** (frozen §4 = "10 % of bond"), derived
+/// from [`BOND_AMOUNT`] so the invariant holds by construction. The real path (the
+/// qlab-p2p `NodeAdapter`) already slashes 10 % of each member's *own* bond; this
+/// flat constant is the M6-sim equivalent at the standard bond. Downtime is
+/// jail-NO-slash.
+pub const EQUIVOCATION_SLASH_AMOUNT: u64 = BOND_AMOUNT / 10;
 
 /// Downtime jail term, in blocks (jail-no-slash; auto-readmit after). PLACEHOLDER.
 pub const JAIL_BLOCKS: u64 = 32;
