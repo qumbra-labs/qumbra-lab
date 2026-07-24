@@ -91,6 +91,47 @@ impl From<qlab_node::NodeError> for RunError {
     }
 }
 
+/// A read-only pre-flight summary of a node's deployment: the genesis + config +
+/// held keys validated exactly as [`RunningNode::start`] would, but WITHOUT
+/// binding a socket, opening the data dir, or mining. The deploy dry-run runs this
+/// against every staged node to prove the laid-down layout is startable (item 1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preflight {
+    /// The hex keccak256 of the loaded genesis file.
+    pub genesis_hash: String,
+    /// Frozen committee size (must be 21 for T0).
+    pub committee_size: u32,
+    /// Frozen quorum (must be 15 for T0).
+    pub quorum: u32,
+    /// How many of the 21 committee signing keys this node holds.
+    pub keys_held: usize,
+    /// The TCP address this node would bind.
+    pub listen_addr: String,
+    /// How many peers this node would dial.
+    pub dial_peers: usize,
+    /// Whether this node would produce blocks.
+    pub mining: bool,
+}
+
+/// Validate a node's `config` against its `genesis` exactly as startup would — the
+/// genesis byte-verify + optional hash pin (item 2) and every held key
+/// cross-checked against committee₀ — but bind nothing and touch no disk state.
+/// Returns an operator/dry-run summary. Errors identically to [`RunningNode::start`]'s
+/// pre-listener phase (wrong hash, tampered committee, a key for the wrong index).
+pub fn preflight(config: &NodeConfig, genesis: &GenesisFile) -> Result<Preflight, RunError> {
+    genesis.verify_startup(config.expected_genesis_hash.as_deref())?;
+    let validators = genesis.load_validators(&config.committee_key_paths)?;
+    Ok(Preflight {
+        genesis_hash: genesis.hash_hex(),
+        committee_size: genesis.frozen.committee_size,
+        quorum: genesis.frozen.quorum,
+        keys_held: validators.len(),
+        listen_addr: config.listen_addr.clone(),
+        dial_peers: config.dial_peers.len(),
+        mining: config.mining,
+    })
+}
+
 /// A composed, running full node: P2P + real node-state + PoW + committee, over
 /// TCP with disk persistence. Generic over the PoW engine `P` (KeccakPow in
 /// tests, RandomXPow in the binary) and the injected verifier `V`.
@@ -350,6 +391,40 @@ mod tests {
         node.run_until(&shutdown);
         // The snapshot file now exists in the data dir (graceful flush ran).
         assert!(config.data_dir.join(qlab_node::SNAPSHOT).exists(), "snapshot flushed");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preflight_validates_a_staged_node_without_binding() {
+        // The deploy dry-run's per-node assertion: a laid-down config + genesis +
+        // key subset validate through the real startup checks, no socket bound.
+        let (config, genesis, base) = rig("preflight", true);
+        let pf = preflight(&config, &genesis).expect("preflight ok");
+        assert_eq!(pf.genesis_hash, genesis.hash_hex());
+        assert_eq!(pf.committee_size, 21);
+        assert_eq!(pf.quorum, 15);
+        assert_eq!(pf.keys_held, 21, "the rig holds all 21 keys");
+        assert!(pf.mining);
+
+        // A wrong hash pin fails preflight exactly as startup would (item 2).
+        let mut bad = config.clone();
+        bad.expected_genesis_hash = Some("00".repeat(32));
+        assert!(matches!(
+            preflight(&bad, &genesis),
+            Err(RunError::Genesis(GenesisError::WrongGenesisHash { .. }))
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn preflight_reports_a_key_subset() {
+        // A node holding only a subset of the 21 keys (the ~5-6/node T0 split)
+        // preflights fine and reports its subset size.
+        let (mut config, genesis, base) = rig("preflight_subset", false);
+        config.committee_key_paths.truncate(6); // node0's 6-key slice
+        let pf = preflight(&config, &genesis).expect("subset preflight ok");
+        assert_eq!(pf.keys_held, 6);
+        assert!(!pf.mining);
         let _ = std::fs::remove_dir_all(&base);
     }
 

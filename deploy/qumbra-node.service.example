@@ -1,0 +1,22 @@
+# systemd unit for a deployed Qumbra T0 node (optional convenience for Phase B).
+# Install as /etc/systemd/system/qumbra-node.service on each VPS AFTER deploy.sh
+# has laid down <remote-root> (default /opt/qumbra). Then:
+#   systemctl daemon-reload && systemctl enable --now qumbra-node
+#
+# Ctrl-C / systemctl stop triggers the graceful-shutdown snapshot flush.
+[Unit]
+Description=Qumbra T0 full node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/qumbra
+ExecStart=/opt/qumbra/qumbra-node run --config /opt/qumbra/node.toml
+Restart=on-failure
+RestartSec=5
+# RandomX light mode fits the ≥4 GB VPS spec; no huge-pages requirement.
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
