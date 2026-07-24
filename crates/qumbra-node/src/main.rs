@@ -22,7 +22,8 @@ use qlab_p2p::adapter::MiningClock;
 use qumbra_node::config::NodeConfig;
 use qumbra_node::genesis::GenesisFile;
 use qumbra_node::params_audit;
-use qumbra_node::run::{DevnetRehearsalVerifier, RunningNode};
+use qumbra_node::run::RunningNode;
+use qumbra_node::verifier::select_verifier;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -63,7 +64,8 @@ fn usage() {
         "qumbra-node — Qumbra full node (M10-T0-1)\n\n\
          USAGE:\n  \
          qumbra-node genesis init [--out DIR]   build the T0 genesis file + 21 committee key files\n  \
-         qumbra-node run --config FILE          run a full node (TCP + RandomX + disk persistence)\n  \
+         qumbra-node run --config FILE          run a full node (TCP + RandomX + disk persistence)\n      \
+           [--rehearsal-verifier]               opt in to the NO-OP rehearsal tx verifier (devnet only)\n  \
          qumbra-node check --config FILE        pre-flight a deployed config (genesis + keys), bind nothing\n  \
          qumbra-node audit [--out FILE]         emit the params_devnet ⟷ FROZEN v1.0 convergence audit"
     );
@@ -72,6 +74,11 @@ fn usage() {
 /// `--name VALUE` flag lookup.
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
+}
+
+/// Presence-only flag lookup (`--name`).
+fn has_flag(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
 }
 
 fn genesis_init(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -108,9 +115,12 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     let config = NodeConfig::load(cfg_path)?;
     let genesis = GenesisFile::load(&config.genesis_file)?;
 
-    // Real RandomX (N3) is the default engine; the injected verifier is the
-    // labelled rehearsal stand-in (real seam = qlab_consensus::verify_proof).
-    let mut node = RunningNode::start(&config, &genesis, RandomXPow::new(), DevnetRehearsalVerifier)?;
+    // Real RandomX (N3) is the default engine. The tx verifier defaults to the
+    // REAL M3 verifier (qlab_consensus::verify_proof, frozen CONSENSUS_CFG);
+    // `--rehearsal-verifier` opts into the NO-OP stand-in and logs loudly
+    // (M10-T0-4, issue #68 — the named M11 gate, closed early).
+    let (verifier, verifier_log) = select_verifier(has_flag(args, "--rehearsal-verifier"));
+    let mut node = RunningNode::start(&config, &genesis, RandomXPow::new(), verifier)?;
 
     // Item 0: the binary mines on real wall-clock header timestamps (NOT the
     // deterministic 75 s counter the in-process sims/tests use), so LWMA sees real
@@ -123,6 +133,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  genesis hash: {}", genesis.hash_hex());
     println!("  mining:       {}", config.mining);
     println!("  committee keys held: {}", config.committee_key_paths.len());
+    println!("  {verifier_log}");
     println!("(Ctrl-C to shut down — snapshot is flushed on exit)");
 
     let shutdown = Arc::new(AtomicBool::new(false));

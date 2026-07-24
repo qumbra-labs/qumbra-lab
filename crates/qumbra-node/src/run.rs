@@ -22,10 +22,15 @@
 //! clamps). In-process sims/tests keep the deterministic clock (the default).
 //!
 //! ## Verifier seam
-//! The transaction verifier is injected. [`DevnetRehearsalVerifier`] is a
-//! clearly-labelled rehearsal stand-in (a T0 net produces coinbase-only blocks, so
-//! it is never exercised); the real M3 verifier (`qlab_consensus::verify_proof`) is
-//! the production drop-in at the exact same `TxVerifier` seam.
+//! The transaction verifier is injected. As of M10-T0-4 (issue #68) the binary's
+//! **default is the real M3 verifier** ([`crate::verifier::ConsensusVerifier`] →
+//! `qlab_consensus::verify_proof`, frozen `CONSENSUS_CFG`); [`DevnetRehearsalVerifier`]
+//! is the clearly-labelled NO-OP stand-in, now an explicit `--rehearsal-verifier`
+//! opt-in logged loudly at startup ([`crate::verifier::select_verifier`]). A T0 net
+//! mines coinbase-only blocks, so the verifier is never actually exercised on T0 —
+//! but the default is now real, closing the named M11 gate early. `RunningNode`
+//! stays generic over the injected `V` ([`crate::verifier::NodeVerifier`] dispatches
+//! the two at runtime); the tests below drive it with the rehearsal stand-in.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -44,18 +49,20 @@ use qlab_p2p::P2pNode;
 use crate::config::NodeConfig;
 use crate::genesis::{GenesisError, GenesisFile};
 
-/// The injected transaction verifier for the T0 rehearsal. **NOT the real M3
-/// verifier** — it accepts (a T0 net mines coinbase-only blocks, so no tx proof
-/// is ever presented). The production drop-in at this exact `TxVerifier` seam is
-/// `qlab_consensus::verify_proof` (built on the frozen `CONSENSUS_CFG`); swapping
-/// it in needs no change to the `NodeAdapter` / `P2pNode` composition.
+/// The NO-OP rehearsal transaction verifier. **NOT the real M3 verifier** — it
+/// accepts every tx unconditionally. Since M10-T0-4 (issue #68) it is no longer
+/// the default: the binary defaults to [`crate::verifier::ConsensusVerifier`]
+/// (`qlab_consensus::verify_proof`, frozen `CONSENSUS_CFG`), and this stand-in is
+/// an explicit `--rehearsal-verifier` opt-in that logs a loud warning at startup.
+/// A T0 net mines coinbase-only blocks, so no tx proof is ever presented anyway;
+/// this remains a convenience for devnet/rehearsal runs that want to skip verify.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DevnetRehearsalVerifier;
 
 impl TxVerifier for DevnetRehearsalVerifier {
     fn verify_tx(&self, _entry: &TxEntry) -> bool {
-        // Rehearsal stand-in — see the type doc. Real verification = the injected
-        // qlab-consensus M3 verifier.
+        // NO-OP rehearsal stand-in — see the type doc. Real verification is the
+        // default `crate::verifier::ConsensusVerifier`.
         true
     }
 }
