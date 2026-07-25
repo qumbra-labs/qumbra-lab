@@ -55,10 +55,15 @@ pub const TALLY_TIP_SLACK: u64 = crate::params_devnet::CHECKPOINT_CADENCE_BLOCKS
 
 /// Whether `height` is inside the tally window `(finalized, tip + slack]`. A height
 /// at or below the finalized head is stale; one beyond `tip + slack` is rejected so
-/// junk-high heights cannot evict legitimate near-tip slots.
+/// junk-high heights cannot evict legitimate near-tip slots. When nothing is finalized
+/// yet, even genesis (height 0) is a valid first checkpoint — the finality tracker
+/// permits any height as the first finalize.
 fn in_window(height: u64, finalized: Option<u64>, tip: u64) -> bool {
-    let low = finalized.unwrap_or(0);
-    height > low && height <= tip.saturating_add(TALLY_TIP_SLACK)
+    let above_floor = match finalized {
+        Some(f) => height > f,
+        None => true,
+    };
+    above_floor && height <= tip.saturating_add(TALLY_TIP_SLACK)
 }
 
 /// One checkpoint variant's accumulated votes: the checkpoint itself plus the votes
@@ -159,9 +164,14 @@ impl VoteTally {
     /// `tip + slack` (heights that can no longer become the next finalized slot, or
     /// junk-ahead heights).
     pub fn prune(&mut self, finalized: Option<u64>, tip: u64) {
-        let low = finalized.unwrap_or(0);
         let high = tip.saturating_add(TALLY_TIP_SLACK);
-        self.slots.retain(|&h, _| h > low && h <= high);
+        self.slots.retain(|&h, _| {
+            let above = match finalized {
+                Some(f) => h > f,
+                None => true,
+            };
+            above && h <= high
+        });
     }
 
     /// Distinct variants tracked at `height` (test/observability hook).
@@ -239,6 +249,17 @@ mod tests {
         assert!(!t.add(&future, &votes(&vals, &future, &[0]), Some(8), 16).grew);
         let ok = cp(16, 16);
         assert!(t.add(&ok, &votes(&vals, &ok, &[0]), Some(8), 16).grew);
+    }
+
+    #[test]
+    fn genesis_height_zero_is_in_window_when_nothing_finalized() {
+        let (_c, vals) = devnet_committee(21);
+        let mut t = VoteTally::new();
+        let g = cp(0, 0);
+        // The binary finalizes genesis (height 0) as its first checkpoint.
+        assert!(t.add(&g, &votes(&vals, &g, &[0]), None, 0).grew, "genesis is finalizable first");
+        // Once height 0 is the finalized head, it is stale.
+        assert!(!t.add(&g, &votes(&vals, &g, &[1]), Some(0), 8).grew);
     }
 
     #[test]
