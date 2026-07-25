@@ -35,6 +35,49 @@ It writes a local hosts spec (`127.0.0.1:9401..9404`, ssh target `-`), invokes
 `qumbra-node check` passing on every node with a single shared pinned genesis
 hash. Exits non-zero on the first failed assertion.
 
+## Phase B-WAN — VPS provisioning requirements **[manual — Larry]**
+
+Written by the coordinator 2026-07-25 against the issue #64 `[manual]` clause, what
+this tooling actually needs from a host, and the **measured** Phase B-lite resource
+envelope (`docs/m10-t03-phase-b-lite-run.md` §6). Hard requirements are marked; the
+rest is recommendation with its grounds.
+
+**Architecture — pick arm64 unless there's a reason not to.** Phase B-lite proved
+the whole RandomX build/link/mine path on **aarch64 Debian bookworm**, and that
+Dockerfile (`deploy/docker/`) is a reusable VPS image. x86_64 works in principle but
+that path is *unvalidated here*, and the dev rig is arm — so an x86 target means
+either emulated builds or building on the VPS itself. **HARD: a macOS-built binary
+cannot run on the VPS** (the `randomx-rs` C dependency) — build on Linux of the same
+architecture.
+
+| Item | Requirement | Why |
+|---|---|---|
+| Machines | **exactly 4** (hard) | issue #64 topology stamp: allows the 2+2 partition scenario; 21 committee keys split 6/5/5/5 |
+| RAM | ≥ 4 GB (**measured use: ~262 MiB/node**) | RandomX *light* cache (256 MB) + node; the spec is deliberately generous — do not pay extra here |
+| vCPU | **2** (not 1) | one core saturates while hashing at the 75 s tick; the second keeps P2P + telemetry from starving |
+| Disk | 20–40 GB | measured: 4–8 KB of chain data for ~388 coinbase-only blocks. Disk is for logs/telemetry, not the chain |
+| OS | Debian 12 / Ubuntu 22.04+, **arm64 preferred** | matches the proven B-lite image |
+| Public address | **routable public IP + one inbound TCP port open** (default `9444`, see `hosts.example`) — hard | peers dial each other directly; **NAT traversal is an M11 item, out of scope for T0** |
+| Geography | **≥ 3 regions, intercontinental** (e.g. SG / EU / US-E / US-W) | real RTT is the *only* new variable Phase B-WAN adds over B-lite. Four hosts in one DC measure nothing new: the owed items are checkpoint cadence 8 at real RTT and LWMA at real 75 s pacing |
+| Privileges | root / sudo | the 2+2 partition is produced with host firewall rules (iptables/nftables), not a provider console |
+| Host tooling | `rsync`, ssh key access, systemd | `deploy.sh` is rsync/ssh-grade; `qumbra-node.service.example` is a systemd unit |
+
+**Larry's manual steps** (duration outside Claude's control): provision the 4 hosts;
+open the port and confirm they are **not** behind NAT; install ssh keys and hand the
+access to the executing session; choose arm64 vs x86_64.
+
+**Sequencing.** Provision any time, but the *full* run belongs **after the [#70]
+vote-aggregation baton (M10-T0-5) merges** — for the same reason B-lite deferred its
+partition and committee-stall scenarios: with no distributed finality there is
+nothing to observe in scenarios (c)/(d), and the run would only reproduce B-lite's
+`Degraded` result. Runnable before T0-5: genesis rehearsal, (a) late-joiner sync,
+(b) mining-node restart, and a real-RTT baseline telemetry sample.
+
+**Duration/cost shape**: the soak is **≥ 48 h continuous**, plus the scenario passes
+and a re-run after T0-5 — budget roughly a week of uptime on four small instances.
+
+[#70]: https://github.com/lai3d/qumbra-lab/issues/70
+
 ## Phase B — the real 4-VPS deploy (gated on Larry's VPSes)
 
 1. Edit `hosts.example` → `hosts` with the 4 VPS public addresses + ssh targets.
