@@ -48,6 +48,18 @@ Poll the versioned telemetry endpoint (`qlab_node::telemetry::Telemetry`):
 operator reasons in — "how many blocks behind" and "how long stuck." Age is derived
 from block timestamps (chain-time), so it is deterministic, not wall-clock.
 
+> **Cold-start caveat (added 2026-07-25, M10-T0-5 / PR #72).** The two units agree
+> only once something has been finalized. On a node that has **never** finalized a
+> checkpoint — a fresh net, or a node reopened from disk before the first re-gossip
+> (the finality tracker is not persisted, by design) — `last_finalized_age_secs`
+> reports **0**, because there is no finalized head to measure an age from. It does
+> not mean "healthy and current." Before the T0-5 fix this field fell back to genesis
+> and printed an absolute epoch (Phase B-lite logged `age_s=1784917791`), which was
+> worse: nonsense rather than honest. **Key the cold-start alarm on `finalized_height
+> == None` (`final=-` in the telemetry line) together with a climbing `stall_depth`,
+> not on age.** Once a first checkpoint finalizes, the two units track each other
+> again and everything below applies unchanged.
+
 ## 3. Triage — is it the committee or the network?
 
 1. **`peer_count` near zero** → this node is partitioned. Fix connectivity first;
