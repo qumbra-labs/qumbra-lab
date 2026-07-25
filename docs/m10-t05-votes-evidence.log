@@ -1,0 +1,202 @@
+# M10-T0-5 docker evidence (LOCALHOST/DOCKER) — 2026-07-25, Apple M5 Max 36 GiB, Docker 29.6.2
+# See docs/m10-t05-votes-run.md for the narrative. Block time 75s FROZEN, RandomX light, WallClock.
+
+===== §0 GENESIS REHEARSAL =====
+   in-container genesis hash: 4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3
+   pinned T0 genesis hash:    4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3
+   ✓ in-container genesis == pinned T0 genesis (4a75b3b8…c2c3)
+
+===== §4 PARTITION =====
+== 2+2 partition (A={node0,node1} 11 keys | B={node2,node3} 10 keys) ==
+   both sides < 15 quorum ⇒ finality MUST stall on both sides (expected, not a bug)
+   partitioned. sample both sides:
+  node0  tip=9    final=8    stall=1   diff=75     peers=6  regime=Final
+  node1  tip=9    final=8    stall=1   diff=75     peers=6  regime=Final
+  node2  tip=9    final=8    stall=1   diff=75     peers=6  regime=Final
+  node3  tip=9    final=8    stall=1   diff=75     peers=6  regime=Final
+   watch finality: stall should GROW and regime flip to Degraded on both sides
+
+===== §4 HEAL =====
+== heal the partition ==
+   reconnected to qumbra_t0. periodic re-dial (M10-T0-5 / S9) reconnects the split
+   peers WITHOUT a restart; fork-choice converges and cross-node vote aggregation
+   resumes → finality (final=) should advance again on both sides within ~1–2 cadences.
+  node0  tip=22   final=8    stall=14  diff=77     peers=6  regime=Final
+  node1  tip=22   final=8    stall=14  diff=77     peers=6  regime=Final
+  node2  tip=22   final=8    stall=14  diff=77     peers=6  regime=Final
+  node3  tip=22   final=8    stall=14  diff=77     peers=6  regime=Final
+
+===== §5 COMMITTEE-STALL =====
+== committee stall: stop node1+node2+node3 (16 keys offline; node0's 6 < 15) ==
+ Container qumbra-t0-lite-node3-1 Stopping 
+ Container qumbra-t0-lite-node1-1 Stopping 
+ Container qumbra-t0-lite-node2-1 Stopping 
+ Container qumbra-t0-lite-node1-1 Stopped 
+ Container qumbra-t0-lite-node2-1 Stopped 
+ Container qumbra-t0-lite-node3-1 Stopped 
+   node0 keeps mining (PoW) but cannot finalize — regime → Degraded, stall grows.
+  node0  tip=26   final=24   stall=2   diff=77     peers=10 regime=Final
+  node1  tip=26   final=24   stall=2   diff=77     peers=10 regime=Final
+  node2  tip=26   final=24   stall=2   diff=77     peers=12 regime=Final
+  node3  tip=26   final=24   stall=2   diff=77     peers=12 regime=Final
+
+===== §5 COMMITTEE-RECOVER =====
+== T0-2 recovery: restart the finalizers → committee re-forms → catch-up ==
+ Container qumbra-t0-lite-genesis-init-1 Starting 
+ Container qumbra-t0-lite-genesis-init-1 Started 
+ Container qumbra-t0-lite-genesis-init-1 Waiting 
+ Container qumbra-t0-lite-genesis-init-1 Waiting 
+ Container qumbra-t0-lite-genesis-init-1 Waiting 
+ Container qumbra-t0-lite-genesis-init-1 Exited 
+ Container qumbra-t0-lite-genesis-init-1 Exited 
+ Container qumbra-t0-lite-node1-1 Starting 
+ Container qumbra-t0-lite-node3-1 Starting 
+ Container qumbra-t0-lite-genesis-init-1 Exited 
+ Container qumbra-t0-lite-node2-1 Starting 
+ Container qumbra-t0-lite-node3-1 Started 
+ Container qumbra-t0-lite-node2-1 Started 
+ Container qumbra-t0-lite-node1-1 Started 
+   21 keys reachable again; checkpoints should resume and finalize the backlog.
+  node0  tip=32   final=24   stall=8   diff=82     peers=10 regime=Final
+  node1  tip=26   final=-    stall=26  diff=77     peers=3  regime=Degraded
+  node2  tip=26   final=-    stall=26  diff=77     peers=2  regime=Degraded
+  node3  tip=24   final=-    stall=24  diff=77     peers=1  regime=Degraded
+
+===== §6 ≥2h STEADY SOAK (27 samples @ 5min) =====
+SOAK START 2026-07-25T20:43:50 baseline final=32 tip=34
+=== soak t+5min 20:43:51 ===
+node0  tip=35   final=32   stall=3   diff=84     peers=16 regime=Final
+node1  tip=35   final=32   stall=3   diff=84     peers=6  regime=Final
+node2  tip=35   final=32   stall=3   diff=84     peers=6  regime=Final
+node3  tip=35   final=32   stall=3   diff=84     peers=6  regime=Final
+=== soak t+10min 20:48:51 ===
+node0  tip=45   final=40   stall=5   diff=114    peers=16 regime=Final
+node1  tip=45   final=40   stall=5   diff=114    peers=6  regime=Final
+node2  tip=45   final=40   stall=5   diff=114    peers=6  regime=Final
+node3  tip=45   final=40   stall=5   diff=114    peers=6  regime=Final
+=== soak t+15min 20:53:52 ===
+node0  tip=55   final=48   stall=7   diff=147    peers=16 regime=Final
+node1  tip=55   final=48   stall=7   diff=147    peers=6  regime=Final
+node2  tip=55   final=48   stall=7   diff=147    peers=6  regime=Final
+node3  tip=55   final=48   stall=7   diff=147    peers=6  regime=Final
+=== soak t+20min 20:58:52 ===
+node0  tip=67   final=64   stall=3   diff=198    peers=16 regime=Final
+node1  tip=67   final=64   stall=3   diff=198    peers=6  regime=Final
+node2  tip=67   final=64   stall=3   diff=198    peers=6  regime=Final
+node3  tip=67   final=64   stall=3   diff=198    peers=6  regime=Final
+=== soak t+25min 21:03:53 ===
+node0  tip=79   final=72   stall=7   diff=260    peers=16 regime=Final
+node1  tip=80   final=72   stall=8   diff=266    peers=6  regime=Final
+node2  tip=80   final=72   stall=8   diff=266    peers=6  regime=Final
+node3  tip=79   final=72   stall=7   diff=260    peers=6  regime=Final
+=== soak t+30min 21:08:53 ===
+node0  tip=93   final=88   stall=5   diff=363    peers=16 regime=Final
+node1  tip=93   final=88   stall=5   diff=363    peers=6  regime=Final
+node2  tip=94   final=88   stall=6   diff=367    peers=6  regime=Final
+node3  tip=94   final=88   stall=6   diff=367    peers=6  regime=Final
+=== soak t+35min 21:13:54 ===
+node0  tip=105  final=96   stall=9   diff=450    peers=16 regime=Final
+node1  tip=105  final=96   stall=9   diff=450    peers=6  regime=Final
+node2  tip=105  final=96   stall=9   diff=450    peers=6  regime=Final
+node3  tip=106  final=104  stall=2   diff=463    peers=6  regime=Final
+=== soak t+40min 21:18:54 ===
+node0  tip=114  final=112  stall=2   diff=491    peers=16 regime=Final
+node1  tip=114  final=112  stall=2   diff=491    peers=6  regime=Final
+node2  tip=114  final=112  stall=2   diff=491    peers=6  regime=Final
+node3  tip=114  final=112  stall=2   diff=491    peers=6  regime=Final
+=== soak t+45min 21:23:55 ===
+node0  tip=125  final=120  stall=5   diff=594    peers=16 regime=Final
+node1  tip=126  final=120  stall=6   diff=618    peers=6  regime=Final
+node2  tip=126  final=120  stall=6   diff=618    peers=6  regime=Final
+node3  tip=126  final=120  stall=6   diff=618    peers=6  regime=Final
+=== soak t+50min 21:28:56 ===
+node0  tip=135  final=120  stall=15  diff=757    peers=16 regime=Final
+node1  tip=135  final=120  stall=15  diff=757    peers=6  regime=Final
+node2  tip=136  final=120  stall=16  diff=784    peers=6  regime=Final
+node3  tip=137  final=120  stall=17  diff=802    peers=6  regime=Degraded
+=== soak t+55min 21:33:56 ===
+node0  tip=143  final=136  stall=7   diff=902    peers=16 regime=Final
+node1  tip=144  final=136  stall=8   diff=912    peers=6  regime=Final
+node2  tip=145  final=136  stall=9   diff=926    peers=6  regime=Final
+node3  tip=144  final=136  stall=8   diff=912    peers=6  regime=Final
+=== soak t+60min 21:38:57 ===
+node0  tip=151  final=136  stall=15  diff=1013   peers=16 regime=Final
+node1  tip=151  final=136  stall=15  diff=1013   peers=6  regime=Final
+node2  tip=151  final=136  stall=15  diff=1013   peers=6  regime=Final
+node3  tip=151  final=136  stall=15  diff=1013   peers=6  regime=Final
+=== soak t+65min 21:43:57 ===
+node0  tip=159  final=152  stall=7   diff=1083   peers=16 regime=Final
+node1  tip=158  final=152  stall=6   diff=1075   peers=6  regime=Final
+node2  tip=158  final=152  stall=6   diff=1075   peers=6  regime=Final
+node3  tip=158  final=152  stall=6   diff=1075   peers=6  regime=Final
+=== soak t+70min 21:48:58 ===
+node0  tip=165  final=160  stall=5   diff=1187   peers=16 regime=Final
+node1  tip=165  final=160  stall=5   diff=1187   peers=6  regime=Final
+node2  tip=165  final=160  stall=5   diff=1187   peers=6  regime=Final
+node3  tip=165  final=160  stall=5   diff=1187   peers=6  regime=Final
+=== soak t+75min 21:53:59 ===
+node0  tip=173  final=168  stall=5   diff=1279   peers=16 regime=Final
+node1  tip=173  final=168  stall=5   diff=1279   peers=6  regime=Final
+node2  tip=173  final=168  stall=5   diff=1279   peers=6  regime=Final
+node3  tip=173  final=168  stall=5   diff=1279   peers=6  regime=Final
+=== soak t+80min 21:59:00 ===
+node0  tip=180  final=176  stall=4   diff=1377   peers=16 regime=Final
+node1  tip=181  final=176  stall=5   diff=1412   peers=6  regime=Final
+node2  tip=181  final=176  stall=5   diff=1412   peers=6  regime=Final
+node3  tip=181  final=176  stall=5   diff=1412   peers=6  regime=Final
+=== soak t+85min 22:04:01 ===
+node0  tip=188  final=184  stall=4   diff=1512   peers=16 regime=Final
+node1  tip=188  final=184  stall=4   diff=1512   peers=6  regime=Final
+node2  tip=188  final=184  stall=4   diff=1512   peers=6  regime=Final
+node3  tip=188  final=184  stall=4   diff=1512   peers=6  regime=Final
+=== soak t+90min 22:09:01 ===
+node0  tip=194  final=184  stall=10  diff=1631   peers=16 regime=Final
+node1  tip=194  final=192  stall=2   diff=1631   peers=6  regime=Final
+node2  tip=194  final=192  stall=2   diff=1631   peers=6  regime=Final
+node3  tip=194  final=192  stall=2   diff=1631   peers=6  regime=Final
+=== soak t+95min 22:14:02 ===
+node0  tip=200  final=192  stall=8   diff=1660   peers=16 regime=Final
+node1  tip=200  final=192  stall=8   diff=1660   peers=6  regime=Final
+node2  tip=200  final=192  stall=8   diff=1660   peers=6  regime=Final
+node3  tip=200  final=192  stall=8   diff=1660   peers=6  regime=Final
+=== soak t+100min 22:19:02 ===
+node0  tip=204  final=200  stall=4   diff=1732   peers=16 regime=Final
+node1  tip=206  final=200  stall=6   diff=1772   peers=6  regime=Final
+node2  tip=206  final=200  stall=6   diff=1772   peers=6  regime=Final
+node3  tip=205  final=200  stall=5   diff=1740   peers=6  regime=Final
+=== soak t+105min 22:24:03 ===
+node0  tip=212  final=208  stall=4   diff=1835   peers=16 regime=Final
+node1  tip=213  final=208  stall=5   diff=1830   peers=6  regime=Final
+node2  tip=213  final=208  stall=5   diff=1830   peers=6  regime=Final
+node3  tip=213  final=208  stall=5   diff=1830   peers=6  regime=Final
+=== soak t+110min 22:29:03 ===
+node0  tip=216  final=208  stall=8   diff=1876   peers=16 regime=Final
+node1  tip=216  final=208  stall=8   diff=1876   peers=6  regime=Final
+node2  tip=216  final=208  stall=8   diff=1876   peers=6  regime=Final
+node3  tip=216  final=208  stall=8   diff=1876   peers=6  regime=Final
+=== soak t+115min 22:34:04 ===
+node0  tip=224  final=216  stall=8   diff=1976   peers=16 regime=Final
+node1  tip=223  final=216  stall=7   diff=1949   peers=6  regime=Final
+node2  tip=223  final=216  stall=7   diff=1949   peers=6  regime=Final
+node3  tip=224  final=216  stall=8   diff=1976   peers=6  regime=Final
+=== soak t+120min 22:39:04 ===
+node0  tip=229  final=216  stall=13  diff=1998   peers=16 regime=Final
+node1  tip=228  final=216  stall=12  diff=2015   peers=6  regime=Final
+node2  tip=228  final=216  stall=12  diff=2015   peers=6  regime=Final
+node3  tip=229  final=216  stall=13  diff=1998   peers=6  regime=Final
+=== soak t+125min 22:44:05 ===
+node0  tip=235  final=232  stall=3   diff=2112   peers=16 regime=Final
+node1  tip=235  final=232  stall=3   diff=2112   peers=6  regime=Final
+node2  tip=235  final=232  stall=3   diff=2112   peers=6  regime=Final
+node3  tip=234  final=232  stall=2   diff=2068   peers=6  regime=Final
+=== soak t+130min 22:49:06 ===
+node0  tip=239  final=232  stall=7   diff=2114   peers=16 regime=Final
+node1  tip=239  final=232  stall=7   diff=2114   peers=6  regime=Final
+node2  tip=239  final=232  stall=7   diff=2114   peers=6  regime=Final
+node3  tip=239  final=232  stall=7   diff=2114   peers=6  regime=Final
+=== soak t+135min 22:54:06 ===
+node0  tip=245  final=232  stall=13  diff=2156   peers=16 regime=Final
+node1  tip=244  final=232  stall=12  diff=2141   peers=6  regime=Final
+node2  tip=244  final=232  stall=12  diff=2141   peers=6  regime=Final
+node3  tip=245  final=232  stall=13  diff=2156   peers=6  regime=Final
+SOAK END 2026-07-25T22:59:06 elapsed=135min final=232

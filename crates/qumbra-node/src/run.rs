@@ -32,6 +32,7 @@
 //! stays generic over the injected `V` ([`crate::verifier::NodeVerifier`] dispatches
 //! the two at runtime); the tests below drive it with the rehearsal stand-in.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -42,12 +43,34 @@ use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::{CHECKPOINT_CADENCE_BLOCKS, DEGRADED_MODE_LAG_BLOCKS};
 use qlab_devnet::pow::PowEngine;
 
+use qlab_node::recovery::{Finalizer, FinalizerState};
 use qlab_node::Telemetry;
 
 use qlab_p2p::adapter::{MiningClock, NodeAdapter};
 use qlab_p2p::n1::ChainView;
-use qlab_p2p::transport::TcpTransport;
+use qlab_p2p::peer::PeerId;
+use qlab_p2p::transport::{TcpTransport, Transport};
 use qlab_p2p::P2pNode;
+
+/// How often [`RunningNode::run_until`] re-checks configured peers for re-dial (S9).
+const REDIAL_INTERVAL: Duration = Duration::from_secs(5);
+/// First backoff after a failed dial; doubles up to [`REDIAL_BACKOFF_MAX`].
+const REDIAL_BACKOFF_START: Duration = Duration::from_secs(1);
+/// Cap on the re-dial backoff, so a long partition still retries regularly.
+const REDIAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Per-configured-peer re-dial state (S9): the handle of the last connection dialed
+/// to this address (if any) and when the next retry is due.
+struct RedialSlot {
+    /// The transport handle of the last dial to this addr; `None` if never dialed or
+    /// the dial failed. A slot is "connected" iff this pid is still live in the
+    /// transport's peer set.
+    pid: Option<PeerId>,
+    /// Earliest instant a fresh dial to this addr may be attempted.
+    next_retry: Instant,
+    /// Current backoff after consecutive failures.
+    backoff: Duration,
+}
 
 use crate::config::NodeConfig;
 use crate::genesis::{GenesisError, GenesisFile};
@@ -147,8 +170,12 @@ pub fn preflight(config: &NodeConfig, genesis: &GenesisFile) -> Result<Preflight
 /// tests, RandomXPow in the binary) and the injected verifier `V`.
 pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     p2p: P2pNode<TcpTransport, NodeAdapter<P, V>>,
-    /// Committee signing keys this node holds (may be empty — a verify-only node).
-    validators: Vec<qlab_devnet::committee::Validator>,
+    /// Committee finalizers this node drives (one per held key; may be empty — a
+    /// verify-only node). Each pairs a signing key with the persistent never-double-
+    /// sign ledger (M10-T0-2), restored from disk on start (M10-T0-5 / S7).
+    finalizers: Vec<Finalizer>,
+    /// Node data dir — also where each finalizer's ledger is persisted.
+    data_dir: std::path::PathBuf,
     /// Whether to produce blocks.
     mining: bool,
     /// Wall-clock spacing between mining attempts (the frozen 75 s in the binary;
@@ -166,6 +193,12 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     sample_interval: Duration,
     /// When the last telemetry sample was emitted.
     last_sample: Instant,
+    /// Configured peer addresses this node keeps a connection to (S9).
+    dial_peers: Vec<String>,
+    /// Per-peer re-dial state, keyed by configured address.
+    redial: HashMap<String, RedialSlot>,
+    /// When re-dial was last checked.
+    last_redial: Instant,
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
@@ -190,8 +223,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             genesis.frozen.self_bond_qmb_steady.saturating_mul(genesis.frozen.bessel_per_qmb);
         let committee = CommitteeState::new(committee_keys, bond_bessel);
 
-        // (3) This node's signing keys (cross-checked against committee₀).
+        // (3) This node's signing keys (cross-checked against committee₀), each wrapped
+        //     in a Finalizer whose never-double-sign ledger is RESTORED from disk if a
+        //     prior run persisted it — so a restarted proposer can never emit the second
+        //     half of an equivocation pair (S7). A fresh key starts with an empty ledger.
         let validators = genesis.load_validators(&config.committee_key_paths)?;
+        let finalizers: Vec<Finalizer> = validators
+            .into_iter()
+            .map(|v| {
+                let path = finalizer_state_path(&config.data_dir, v.index);
+                match std::fs::read(&path).ok().and_then(|b| FinalizerState::from_bytes(&b).ok()) {
+                    Some(state) => Finalizer::restore(v, state),
+                    None => Finalizer::new(v),
+                }
+            })
+            .collect();
 
         // (4) Real params: FROZEN 75 s block time (item 3, NOT SIM_BLOCK_TIME_SECS)
         //     + the genesis PoW difficulty; RandomX key schedule from defaults.
@@ -209,12 +255,22 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         let mut p2p = P2pNode::new(transport, adapter, node_id);
 
         // (6) Dial configured peers (connect, then register — connect borrows the
-        //     transport immutably, add_peer borrows p2p mutably).
+        //     transport immutably, add_peer borrows p2p mutably). Each configured addr
+        //     also seeds a re-dial slot so a dropped/failed peer is reconnected without
+        //     a process restart (S9).
+        let now = Instant::now();
+        let mut redial: HashMap<String, RedialSlot> = HashMap::new();
         let mut dialed = Vec::new();
         for addr in &config.dial_peers {
             match p2p.transport().connect(addr) {
-                Ok(pid) => dialed.push((pid, addr.clone())),
-                Err(e) => eprintln!("dial {addr} failed: {e}"),
+                Ok(pid) => {
+                    dialed.push((pid, addr.clone()));
+                    redial.insert(addr.clone(), RedialSlot { pid: Some(pid), next_retry: now, backoff: REDIAL_BACKOFF_START });
+                }
+                Err(e) => {
+                    eprintln!("dial {addr} failed: {e}");
+                    redial.insert(addr.clone(), RedialSlot { pid: None, next_retry: now, backoff: REDIAL_BACKOFF_START });
+                }
             }
         }
         for (pid, addr) in dialed {
@@ -223,7 +279,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
 
         Ok(RunningNode {
             p2p,
-            validators,
+            finalizers,
+            data_dir: config.data_dir.clone(),
             mining: config.mining,
             mine_interval: Duration::from_secs(genesis.frozen.block_time_secs),
             last_mine: Instant::now(),
@@ -235,6 +292,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             // `docker compose logs -t` to wall-clock-stamp each line).
             sample_interval: Duration::from_secs(30),
             last_sample: Instant::now(),
+            dial_peers: config.dial_peers.clone(),
+            redial,
+            last_redial: Instant::now(),
         })
     }
 
@@ -290,9 +350,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             .header(&tip_hash)
             .map(|h| (h.timestamp, h.difficulty))
             .unwrap_or((0, 0));
-        let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_hash());
-        let base_ts = chain.header(&base_hash).map(|h| h.timestamp).unwrap_or(0);
-        let age = tip_ts.saturating_sub(base_ts);
+        // Age is chain-time from the finalized block; 0 when nothing is finalized
+        // (S8: no finalized head ⇒ no finalized-age, not a genesis-fallback absolute).
+        let age = if node.finalized_height().is_none() {
+            0
+        } else {
+            let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_hash());
+            let base_ts = chain.header(&base_hash).map(|h| h.timestamp).unwrap_or(0);
+            tip_ts.saturating_sub(base_ts)
+        };
 
         let t = Telemetry::assemble(
             node.tip_height(),
@@ -308,9 +374,16 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             FinalityStatus::Degraded => "Degraded",
         };
         let final_str = t.finalized_height.map(|h| h.to_string()).unwrap_or_else(|| "-".to_string());
+        // S8: print `age_s=-` (not `age_s=0`) whenever there is no finalized head, so
+        // the runbook's stall alarm never mistakes "never finalized" for a real age.
+        let age_str = if t.finalized_height.is_none() {
+            "-".to_string()
+        } else {
+            t.last_finalized_age_secs.to_string()
+        };
         format!(
             "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={}",
-            t.tip_height, final_str, t.stall_depth, t.last_finalized_age_secs, tip_diff,
+            t.tip_height, final_str, t.stall_depth, age_str, tip_diff,
             t.peer_count, t.mempool_size, t.epoch, regime,
         )
     }
@@ -335,16 +408,22 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     }
 
     /// Propose + announce checkpoints for every cadence slot now reached, signing
-    /// with the keys this node holds (no-op for a verify-only node).
+    /// through each finalizer's never-double-sign guard (M10-T0-2/S7) and persisting
+    /// the finalizer ledgers BEFORE broadcasting (write-ahead, so a crash after the
+    /// vote is on the wire can never let a restart equivocate). No-op for a verify-only
+    /// node. The (partial) vote set now enters the cross-node tally + gossip (M10-T0-5).
     pub fn try_checkpoint(&mut self) {
-        if self.validators.is_empty() {
+        if self.finalizers.is_empty() {
             return;
         }
         let tip = self.tip_height();
         while self.next_checkpoint <= tip {
-            if let Some((cp, votes)) =
-                self.p2p.node().make_checkpoint(self.next_checkpoint, &self.validators)
-            {
+            let made = self
+                .p2p
+                .node()
+                .make_checkpoint_guarded(self.next_checkpoint, &mut self.finalizers);
+            if let Some((cp, votes)) = made {
+                self.persist_finalizers(); // durable BEFORE the vote leaves the node
                 self.p2p.announce_checkpoint(cp, votes);
             }
             // Genesis (0) then the cadence grid (8, 16, …).
@@ -353,6 +432,75 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             } else {
                 self.next_checkpoint + CHECKPOINT_CADENCE_BLOCKS
             };
+        }
+    }
+
+    /// Persist every finalizer's ledger to its per-index file, fsync'd. Best-effort:
+    /// a write failure is logged (the run continues; the honest persist-before-
+    /// broadcast window is documented in `recovery.rs`).
+    fn persist_finalizers(&self) {
+        for f in &self.finalizers {
+            let path = finalizer_state_path(&self.data_dir, f.index());
+            if let Err(e) = write_finalizer_state(&path, &f.state().to_bytes()) {
+                eprintln!("persist finalizer {} failed: {e}", f.index());
+            }
+        }
+    }
+
+    /// The finalizers this node drives (test/ops hook — e.g. to assert the restored
+    /// never-double-sign guard after a restart).
+    pub fn finalizers_mut(&mut self) -> &mut [Finalizer] {
+        &mut self.finalizers
+    }
+
+    /// Re-dial any configured peer that is not currently connected, with backoff (S9).
+    /// A configured peer whose last dial handle is still live in the transport is
+    /// skipped (no duplicate connection); a dropped or never-established one is dialed
+    /// again once its backoff elapses — so a healed partition reconnects WITHOUT a
+    /// process restart.
+    pub fn try_redial(&mut self) {
+        let now = Instant::now();
+        let live: std::collections::HashSet<PeerId> =
+            self.p2p.transport().peers().into_iter().collect();
+        // Decide which addrs to dial first (read-only borrow), then dial (mut borrow).
+        let to_dial: Vec<String> = self
+            .dial_peers
+            .iter()
+            .filter(|addr| {
+                let slot = self.redial.get(*addr);
+                let connected = slot.and_then(|s| s.pid).is_some_and(|pid| live.contains(&pid));
+                let due = slot.map_or(true, |s| now >= s.next_retry);
+                !connected && due
+            })
+            .cloned()
+            .collect();
+        for addr in to_dial {
+            match self.p2p.transport().connect(&addr) {
+                Ok(pid) => {
+                    self.p2p.add_peer(pid, Some(addr.clone()));
+                    self.redial.insert(
+                        addr,
+                        RedialSlot { pid: Some(pid), next_retry: now, backoff: REDIAL_BACKOFF_START },
+                    );
+                }
+                Err(_) => {
+                    let backoff = self
+                        .redial
+                        .get(&addr)
+                        .map_or(REDIAL_BACKOFF_START, |s| (s.backoff * 2).min(REDIAL_BACKOFF_MAX));
+                    self.redial
+                        .insert(addr, RedialSlot { pid: None, next_retry: now + backoff, backoff });
+                }
+            }
+        }
+    }
+
+    /// Test hook: clear all re-dial backoffs so the next [`Self::try_redial`] attempts
+    /// immediately (used to exercise partition-heal without wall-clock waits).
+    pub fn force_redial_ready(&mut self) {
+        let now = Instant::now();
+        for slot in self.redial.values_mut() {
+            slot.next_retry = now;
         }
     }
 
@@ -379,6 +527,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 println!("{}", self.telemetry_sample());
                 self.last_sample = Instant::now();
             }
+            if self.last_redial.elapsed() >= REDIAL_INTERVAL {
+                self.try_redial(); // reconnect any dropped configured peer (S9)
+                self.last_redial = Instant::now();
+            }
             if n == 0 {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -394,6 +546,22 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
 /// is stable across restarts on the same address.
 fn node_id_from_addr(addr: &str) -> [u8; 32] {
     qlab_devnet::hash::keccak256(addr.as_bytes())
+}
+
+/// Path of committee member `index`'s persistent finalizer ledger under `data_dir`.
+fn finalizer_state_path(data_dir: &std::path::Path, index: usize) -> std::path::PathBuf {
+    data_dir.join(format!("finalizer-{index}.state"))
+}
+
+/// Write a finalizer ledger durably (create the data dir if needed, fsync the file).
+fn write_finalizer_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
 }
 
 #[cfg(test)]
@@ -451,6 +619,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// ACCEPTANCE #7 — the never-double-sign guard survives a restart through the
+    /// real run path: checkpoint slot 8 (persisting each finalizer ledger before
+    /// broadcast), restart from the same data dir, and the restored finalizer refuses
+    /// a CONFLICTING slot-8 checkpoint. Without persisted state a rebooted proposer
+    /// would happily equivocate (the Crosslink-class hazard).
+    #[test]
+    fn restart_never_equivocates_through_the_run_path() {
+        let (config, genesis, base) = rig("noequiv", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint(); // finalize genesis (slot 0)
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+            assert!(node.try_mine());
+        }
+        node.try_checkpoint(); // slot 8
+        assert_eq!(node.finalized_height(), Some(CHECKPOINT_CADENCE_BLOCKS), "slot 8 finalized");
+        // Ledgers were persisted (write-ahead, before broadcast).
+        assert!(config.data_dir.join("finalizer-0.state").exists(), "finalizer 0 ledger on disk");
+        node.save_snapshot().unwrap();
+        drop(node);
+
+        // Restart: finalizers restore their ledgers from disk. NOTE: the finality
+        // TRACKER is intentionally NOT persisted (S7 — the vote tally / finalized head
+        // rebuilds from re-gossip), so a solo reopened node with no peers reports no
+        // finalized height until a checkpoint is re-gossiped. What #7 requires is that
+        // the never-double-sign LEDGER survives:
+        let mut reopened =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        assert_eq!(
+            reopened.finalizers_mut()[0].last_voted_slot(),
+            Some(CHECKPOINT_CADENCE_BLOCKS),
+            "the finalizer ledger (slot 8) was restored from disk"
+        );
+        // The restored finalizer already committed to slot 8, so it refuses a
+        // CONFLICTING slot-8 checkpoint — the guard survived the restart.
+        let conflicting = qlab_devnet::committee::Checkpoint::new(
+            CHECKPOINT_CADENCE_BLOCKS,
+            [0xEE; 32],
+            [0xEE; 32],
+        );
+        assert!(
+            reopened.finalizers_mut()[0].sign(&conflicting).is_err(),
+            "restarted finalizer must not equivocate against its persisted slot-8 vote"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn telemetry_sample_reports_live_state() {
         // The Phase B-lite soak-monitor surface (M10-T0-3): after finalizing
@@ -474,6 +690,21 @@ mod tests {
         // tip−final=2 ≤ DEGRADED_MODE_LAG_BLOCKS(16) ⇒ Final (not Degraded).
         assert!(line.contains("regime=Final"), "regime derived from frozen rule: {line}");
         assert!(line.contains("diff="), "difficulty field present: {line}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn telemetry_age_is_dash_when_nothing_finalized() {
+        // S8: a node that has mined but never finalized prints `final=-` AND `age_s=-`
+        // (not a genesis-fallback absolute), so the runbook's stall alarm is honest.
+        let (config, genesis, base) = rig("age_dash", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_mine(); // a block, but no checkpoint ⇒ nothing finalized
+        let line = node.telemetry_sample();
+        assert!(line.contains("final=-"), "nothing finalized: {line}");
+        assert!(line.contains("age_s=-"), "age must be '-' when unfinalized: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -551,6 +782,46 @@ mod tests {
         assert!(node.try_mine(), "RandomX mines at the genesis difficulty");
         assert_eq!(node.tip_height(), 1, "RandomX-mined block accepted");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ACCEPTANCE (S9) — a configured peer unreachable at boot is reconnected by
+    /// periodic re-dial once it comes up, WITHOUT a process restart; and a peer already
+    /// connected is never dialed twice. (Partition-heal, the deferred B-lite §4 gate.)
+    #[test]
+    fn redial_reconnects_a_configured_peer_without_restart() {
+        // Reserve a free port, then release it so nothing is listening yet.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        let b_addr = format!("127.0.0.1:{port}");
+
+        // Node A boots configured to dial B, but B is DOWN → no connection yet.
+        let (mut acfg, agen, abase) = rig("redial_a", false);
+        acfg.dial_peers = vec![b_addr.clone()];
+        let mut a = RunningNode::start(&acfg, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        assert_eq!(a.p2p().transport().peers().len(), 0, "B is down at boot → no peer");
+
+        // B comes up on the same address.
+        let (mut bcfg, bgen, bbase) = rig("redial_b", false);
+        bcfg.listen_addr = b_addr.clone();
+        let b = RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+
+        // Re-dial reconnects A to B with no restart.
+        a.force_redial_ready();
+        a.try_redial();
+        assert_eq!(a.p2p().transport().peers().len(), 1, "re-dial reconnected the healed peer");
+
+        // A second re-dial does NOT open a duplicate connection to the live peer.
+        a.force_redial_ready();
+        a.try_redial();
+        assert_eq!(a.p2p().transport().peers().len(), 1, "no duplicate dial to a connected peer");
+
+        drop(b);
+        let _ = std::fs::remove_dir_all(&abase);
+        let _ = std::fs::remove_dir_all(&bbase);
     }
 
     #[test]

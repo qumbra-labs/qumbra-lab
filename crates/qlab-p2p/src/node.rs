@@ -13,9 +13,10 @@ use qlab_devnet::ebbflow::EquivocationEvidence;
 use qlab_devnet::header::{BlockHeader, Hash32};
 
 use crate::codec::{
-    checkpoint_id, decode_checkpoint_msg, decode_evidence_msg, decode_headers, decode_inv,
-    decode_locator, decode_tx, encode_checkpoint_msg, encode_evidence_msg, encode_headers,
-    encode_inv, encode_locator, encode_tx, evidence_id, tx_id, InvItem, InvKind,
+    checkpoint_id, decode_checkpoint_msg, decode_checkpoint_votes, decode_evidence_msg,
+    decode_headers, decode_inv, decode_locator, decode_tx, encode_checkpoint_msg,
+    encode_checkpoint_votes, encode_evidence_msg, encode_headers, encode_inv, encode_locator,
+    encode_tx, evidence_id, tx_id, InvItem, InvKind,
 };
 use crate::compact::{
     decode_announce, decode_block_txn, decode_get_block_txn, encode_announce, encode_block_txn,
@@ -25,7 +26,7 @@ use crate::compact::{
 use crate::gossip::{
     SeenCache, PENALTY_INVALID_OBJECT, PENALTY_MALFORMED, PENALTY_WELSHED_INV,
 };
-use crate::n1::{IngestOutcome, NodeState};
+use crate::n1::{IngestOutcome, NodeState, VotesOutcome};
 use crate::peer::{NodeId, PeerId, PeerTable, VersionMsg};
 use crate::sync::{build_locator, answer_get_headers, SyncPhase, SyncState, MAX_HEADERS_PER_BATCH};
 use crate::transport::Transport;
@@ -145,15 +146,43 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
     }
 
-    /// Ingest a locally-finalized checkpoint and announce it.
+    /// Ingest this node's own (partial) checkpoint votes and gossip them (M10-T0-5).
+    ///
+    /// The committee is split across nodes, so a proposer's own set is normally far
+    /// below quorum; it MUST still enter the tally and be push-gossiped so the network
+    /// can accumulate to a quorum (task-book §2.4 — the old code dropped it on the
+    /// floor). If accumulating this node's votes with what it has already heard reaches
+    /// quorum, the finalized full set is also announced for re-serving.
     pub fn announce_checkpoint(&mut self, cp: Checkpoint, votes: Vec<Vote>) {
-        let id = checkpoint_id(&cp);
-        let stored = (cp, votes.clone());
-        if self.node.ingest_checkpoint(cp, votes).should_relay() {
-            self.checkpoints.insert(id, stored);
-            self.seen.insert(id);
-            self.relay_inv(InvItem { kind: InvKind::Checkpoint, id }, None);
+        match self.node.ingest_checkpoint_votes(&cp, &votes) {
+            VotesOutcome::Learned { finalized, accumulated } => {
+                self.push_checkpoint_votes(&cp, &accumulated, None);
+                if finalized {
+                    self.store_and_announce_finalized(cp, accumulated, None);
+                }
+            }
+            VotesOutcome::Stale | VotesOutcome::Invalid => {}
         }
+    }
+
+    /// Push a `CheckpointVotes` (0x0024) set to every ready peer except `except`
+    /// (direct-push relay — the accumulated set converges the mesh to a quorum).
+    fn push_checkpoint_votes(&self, cp: &Checkpoint, votes: &[Vote], except: Option<PeerId>) {
+        let payload = encode_checkpoint_votes(cp, votes);
+        for pid in self.peers.ready_peers() {
+            if Some(pid) != except {
+                self.send(pid, MsgType::CheckpointVotes, payload.clone());
+            }
+        }
+    }
+
+    /// Record a now-finalized checkpoint's full vote set for re-serving and announce
+    /// it via the `Checkpoint` inv path (so late joiners can `getdata` the full set).
+    fn store_and_announce_finalized(&mut self, cp: Checkpoint, votes: Vec<Vote>, except: Option<PeerId>) {
+        let id = checkpoint_id(&cp);
+        self.checkpoints.insert(id, (cp, votes));
+        self.seen.insert(id);
+        self.relay_inv(InvItem { kind: InvKind::Checkpoint, id }, except);
     }
 
     /// Announce a full block (header + ordered body) via compact relay: store the
@@ -225,6 +254,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             MsgType::Tx => self.on_tx(from, &env.payload),
             MsgType::Header => self.on_header(from, &env.payload),
             MsgType::Checkpoint => self.on_checkpoint(from, &env.payload),
+            MsgType::CheckpointVotes => self.on_checkpoint_votes(from, &env.payload),
             MsgType::Evidence => self.on_evidence(from, &env.payload),
             MsgType::GetHeaders => self.on_get_headers(from, &env.payload),
             MsgType::Headers => self.on_headers(from, &env.payload),
@@ -364,6 +394,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
     }
 
+    /// Handle a `Checkpoint` (0x0022) object — the finalized-set serving path
+    /// (getdata re-serve / late-joiner catch-up). Routed through the same tally as
+    /// `CheckpointVotes` so scoring is uniform: a well-formed below-quorum set is NOT
+    /// penalised (task-book S5), only a forged/unknown/dup set is.
     fn on_checkpoint(&mut self, from: PeerId, payload: &[u8]) {
         let (cp, votes) = match decode_checkpoint_msg(payload) {
             Ok(cv) => cv,
@@ -372,26 +406,45 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return;
             }
         };
-        // Committee-over-network equivocation path: a checkpoint's votes may reveal
-        // a signer that already signed a conflicting checkpoint at this slot. Detect
-        // it, apply the automated tombstone locally, and gossip the evidence so the
-        // whole network converges — BEFORE finalizing, so the tombstoned vote can no
-        // longer count toward this checkpoint's quorum.
+        self.absorb_votes(from, cp, votes);
+    }
+
+    /// Handle a `CheckpointVotes` (0x0024) partial set — the accumulation path
+    /// (M10-T0-5). Verifies + accumulates; relays newly-learned votes onward (sender
+    /// excluded) so the mesh converges to a quorum.
+    fn on_checkpoint_votes(&mut self, from: PeerId, payload: &[u8]) {
+        let (cp, votes) = match decode_checkpoint_votes(payload) {
+            Ok(cv) => cv,
+            Err(_) => {
+                self.peers.penalize(from, PENALTY_MALFORMED);
+                return;
+            }
+        };
+        self.absorb_votes(from, cp, votes);
+    }
+
+    /// Shared body for both checkpoint-vote message types: run equivocation
+    /// observation, feed the tally, then relay/score by [`VotesOutcome`].
+    fn absorb_votes(&mut self, from: PeerId, cp: Checkpoint, votes: Vec<Vote>) {
+        // Equivocation path: a set's votes may reveal a signer that already signed a
+        // conflicting checkpoint at this slot. Detect it, tombstone locally, and gossip
+        // the evidence BEFORE the tally counts, so a tombstoned vote cannot reach quorum.
         for ev in self.node.observe_votes(&cp, &votes) {
             self.punish_and_gossip_evidence(ev);
         }
-        let id = checkpoint_id(&cp);
-        let stored = (cp, votes.clone());
-        match self.node.ingest_checkpoint(cp, votes) {
-            IngestOutcome::Accepted => {
-                self.checkpoints.insert(id, stored);
-                self.seen.insert(id);
-                self.relay_inv(InvItem { kind: InvKind::Checkpoint, id }, Some(from));
+        match self.node.ingest_checkpoint_votes(&cp, &votes) {
+            VotesOutcome::Learned { finalized, accumulated } => {
+                // Relay the accumulated set onward (sender excluded) — direct-push
+                // gossip converges the mesh; a well-formed partial is never penalised.
+                self.push_checkpoint_votes(&cp, &accumulated, Some(from));
+                if finalized {
+                    self.store_and_announce_finalized(cp, accumulated, Some(from));
+                }
             }
-            IngestOutcome::Rejected(_) => {
+            VotesOutcome::Stale => {} // already known / finalized — no relay, no penalty
+            VotesOutcome::Invalid => {
                 self.peers.penalize(from, PENALTY_INVALID_OBJECT);
             }
-            _ => {}
         }
     }
 
@@ -773,6 +826,37 @@ mod tests {
         (nodes, hub)
     }
 
+    /// A fully-connected mesh of `n` nodes that all share one `committee` (so votes
+    /// verify on every node even when each node holds only a slice of the signing
+    /// keys — the T0 6/5/5/5 topology).
+    fn mesh_sharing(
+        n: u64,
+        committee: &qlab_devnet::committee::Committee,
+    ) -> (Vec<InProcP2p>, Arc<InProcHub>) {
+        let hub = InProcHub::new();
+        let mut nodes = Vec::new();
+        for i in 0..n {
+            let t = InProcTransport::new(PeerId(i + 1), Arc::clone(&hub));
+            let node = StubNode::new(genesis(), CommitteeState::new(committee.clone(), BOND_AMOUNT));
+            nodes.push(P2pNode::new(t, node, [i as u8 + 1; 32]));
+        }
+        for i in 0..n {
+            for j in 0..n {
+                if i != j {
+                    hub.link(PeerId(i + 1), PeerId(j + 1));
+                }
+            }
+        }
+        for i in 0..n {
+            for j in 0..n {
+                if i != j {
+                    nodes[i as usize].add_peer(PeerId(j + 1), None);
+                }
+            }
+        }
+        (nodes, hub)
+    }
+
     #[test]
     fn handshake_reaches_ready_both_ways() {
         let (mut nodes, _hub) = mesh(2);
@@ -846,6 +930,117 @@ mod tests {
         for n in &nodes {
             assert_eq!(n.node().finality().finalized_height(), Some(2));
         }
+    }
+
+    // ---- M10-T0-5: distributed vote aggregation (6/5/5/5) ---------------------
+
+    /// ACCEPTANCE #1 — a 4-node net whose 21 committee keys are split 6/5/5/5
+    /// finalizes a checkpoint, though NO node holds a quorum (15): each node announces
+    /// only its own slice, and the mesh accumulates the partial sets across gossip to
+    /// a quorum. (This is the exact gap Phase B-lite found.)
+    #[test]
+    fn six_five_five_five_reaches_quorum() {
+        let (committee, validators) = devnet_committee(21); // quorum 15
+        let (mut nodes, _hub) = mesh_sharing(4, &committee);
+        run(&mut nodes); // handshakes
+
+        let cp = Checkpoint::new(2, [0xAB; 32], [0xAB; 32]);
+        let slices = [0..6usize, 6..11, 11..16, 16..21]; // 6/5/5/5, none ≥ 15
+        for (i, sl) in slices.iter().enumerate() {
+            let votes: Vec<Vote> =
+                validators[sl.clone()].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+            assert!(votes.len() < 15, "node {i} holds {} < quorum keys", votes.len());
+            nodes[i].announce_checkpoint(cp, votes);
+        }
+        run(&mut nodes);
+
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(
+                n.node().finality().finalized_height(),
+                Some(2),
+                "node {i} must finalize via cross-node accumulation"
+            );
+        }
+    }
+
+    /// ACCEPTANCE #2 — a peer that sends honest below-quorum partial vote sets is
+    /// NEVER penalised (task-book S5 / blocker 2). Five partials would have banned it
+    /// under the old `Rejected → PENALTY_INVALID_OBJECT` scoring.
+    #[test]
+    fn partial_sets_do_not_penalise() {
+        let (committee, validators) = devnet_committee(21); // quorum 15
+        let (mut nodes, _hub) = mesh_sharing(2, &committee);
+        run(&mut nodes);
+
+        let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
+        // Five distinct honest partial sets (10 votes total, always < quorum 15).
+        let slices = [0..2usize, 2..4, 4..6, 6..8, 8..10];
+        for sl in slices {
+            let votes: Vec<Vote> = validators[sl].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+            nodes[0].announce_checkpoint(cp, votes);
+            run(&mut nodes);
+        }
+        // Node 1 saw five honest partials from node 0 and did not score it at all.
+        let score = nodes[1].peers().get(PeerId(1)).unwrap().score;
+        assert_eq!(score, 0, "honest partial sets must not be penalised");
+        assert!(!nodes[1].peers().is_banned(PeerId(1)), "the honest peer is not banned");
+        // And nothing wrongly finalized (10 < 15).
+        for n in &nodes {
+            assert_eq!(n.node().finality().finalized_height(), None);
+        }
+    }
+
+    /// ACCEPTANCE #3 — late votes for a checkpoint already known are still learnable
+    /// (blocker 3 regression lock): a first set {0..5} then a SECOND set {6..10} of
+    /// DIFFERENT votes for the SAME checkpoint accumulate to 11 across the mesh. With
+    /// a 15-member committee (quorum 11), reaching 11 finalizes — proving the second
+    /// set was not dedup-suppressed by the checkpoint-id `seen` cache.
+    #[test]
+    fn late_votes_for_a_known_checkpoint_are_learnable() {
+        let (committee, validators) = devnet_committee(15); // quorum 11
+        assert_eq!(committee.quorum_threshold(), 11);
+        let (mut nodes, _hub) = mesh_sharing(3, &committee);
+        run(&mut nodes);
+
+        let cp = Checkpoint::new(2, [0xCC; 32], [0xCC; 32]);
+        let first: Vec<Vote> = validators[0..6].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        let second: Vec<Vote> = validators[6..11].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+
+        nodes[0].announce_checkpoint(cp, first); // {0..5} — 6 < 11, no finality
+        run(&mut nodes);
+        assert!(nodes.iter().all(|n| n.node().finality().finalized_height().is_none()));
+
+        nodes[1].announce_checkpoint(cp, second); // {6..10} — same cp, different votes
+        run(&mut nodes);
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(
+                n.node().finality().finalized_height(),
+                Some(2),
+                "node {i}: 6 + 5 = 11 distinct votes for the SAME cp reached quorum"
+            );
+        }
+    }
+
+    /// ACCEPTANCE #4 (wire half) — a `CheckpointVotes` frame carrying a forged vote is
+    /// penalised over the wire (a valid signature attributed to the wrong signer).
+    #[test]
+    fn forged_votes_penalised_over_the_wire() {
+        let (committee, validators) = devnet_committee(21);
+        let (mut nodes, _hub) = mesh_sharing(2, &committee);
+        run(&mut nodes);
+
+        let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
+        // Valid signature by validator 1, attributed to signer 0 → does not verify.
+        let forged = Vote { signer: 0, signature: validators[1].sign_checkpoint(&cp).signature };
+        let frame =
+            Envelope::new(MsgType::CheckpointVotes, encode_checkpoint_votes(&cp, &[forged])).encode();
+        // Node 0 (PeerId 1) injects the forged frame to node 1 (PeerId 2).
+        nodes[0].transport().send(PeerId(2), &frame).unwrap();
+        nodes[1].tick();
+
+        let score = nodes[1].peers().get(PeerId(1)).unwrap().score;
+        assert!(score < 0, "a forged vote set is penalised: score {score}");
+        assert_eq!(nodes[1].node().finality().finalized_height(), None, "forged set moved nothing");
     }
 
     #[test]
@@ -1030,8 +1225,8 @@ mod tests {
         }
 
         // A checkpoint at height 2 signed by ALL 7: the 3 tombstoned are dropped,
-        // leaving 4 < 5. (announce_checkpoint won't relay a non-finalizing cp, so
-        // feed both nodes directly.)
+        // leaving 4 active < 5. The partial set now gossips (M10-T0-5), but the four
+        // active votes can never reach quorum, so nothing finalizes anywhere.
         let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
         let votes: Vec<Vote> = validators.iter().map(|v| v.sign_checkpoint(&cp)).collect();
         nodes[0].announce_checkpoint(cp, votes.clone());

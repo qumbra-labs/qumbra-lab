@@ -223,6 +223,20 @@ pub fn checkpoint_id(cp: &Checkpoint) -> Hash32 {
     keccak256(&cp.signing_message())
 }
 
+/// Encode a `CheckpointVotes` (0x0024) body — a checkpoint plus a **partial** vote
+/// set that nodes accumulate to a quorum (M10-T0-5). The body is byte-identical to
+/// the [`MsgType::Checkpoint`] body ([`encode_checkpoint_msg`]); only the envelope
+/// type differs. Reuses `write_checkpoint`/`write_vote`/varint — the codec is NOT
+/// forked (task-book S2).
+pub fn encode_checkpoint_votes(cp: &Checkpoint, votes: &[Vote]) -> Vec<u8> {
+    encode_checkpoint_msg(cp, votes)
+}
+
+/// Decode a `CheckpointVotes` body (reject-trailing/truncated as the shared codec).
+pub fn decode_checkpoint_votes(buf: &[u8]) -> Result<(Checkpoint, Vec<Vote>), DecodeError> {
+    decode_checkpoint_msg(buf)
+}
+
 // --------------------------------------------------------------------------
 // Equivocation evidence (committee-gov §3 — gossiped so the whole network
 // applies the automated tombstone; M9-N5)
@@ -334,11 +348,17 @@ pub fn tx_id(tx: &TxEntry) -> Hash32 {
 // --------------------------------------------------------------------------
 
 /// The kind of an inventory item. Reject-unknown on decode.
+///
+/// `CheckpointVotes = 4` is reserved by the coordinator (task-book S3) for an
+/// inv/getdata vote-set path; M10-T0-5 relays partial vote sets by **direct push**
+/// ([`crate::wire::MsgType::CheckpointVotes`]) rather than inv/getdata, so code 4 is
+/// intentionally left unallocated here — reserved, not used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum InvKind {
     Tx = 1,
     Block = 2,
     Checkpoint = 3,
+    // 4 = CheckpointVotes — reserved (direct-push relay; see the type doc).
 }
 
 impl InvKind {
@@ -492,6 +512,54 @@ mod tests {
         for v in &votes2 {
             assert!(committee.verify_vote(&cp2, v));
         }
+    }
+
+    /// Golden byte-vector for the `CheckpointVotes` (0x0024) body (task-book §4 #9).
+    /// The deterministic prefix — `write_checkpoint(72) ‖ varint(n_votes)` — is locked
+    /// exactly; the vote bodies (3,309-B ML-DSA sigs) are exercised by round-trip.
+    #[test]
+    fn checkpoint_votes_body_golden_and_roundtrip() {
+        let (committee, validators) = devnet_committee(7);
+        let cp = Checkpoint::new(2, [0xAB; 32], [0xCD; 32]);
+
+        // Empty-set body is fully golden-able: height(8 LE)=02.. ‖ block_hash(32)=AB.. ‖
+        // root(32)=CD.. ‖ varint(0)=00. Exactly 73 bytes.
+        let empty = encode_checkpoint_votes(&cp, &[]);
+        let mut want = Vec::new();
+        want.extend_from_slice(&2u64.to_le_bytes());
+        want.extend_from_slice(&[0xAB; 32]);
+        want.extend_from_slice(&[0xCD; 32]);
+        want.push(0x00); // varint(0) votes
+        assert_eq!(empty, want, "CheckpointVotes body field order is locked");
+        assert_eq!(empty.len(), 73);
+        assert_eq!(decode_checkpoint_votes(&empty).unwrap().1.len(), 0);
+
+        // With real votes, the alias is byte-identical to the Checkpoint body and
+        // round-trips with verifying signatures.
+        let votes: Vec<Vote> = validators[..3].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        let bytes = encode_checkpoint_votes(&cp, &votes);
+        assert_eq!(bytes, encode_checkpoint_msg(&cp, &votes), "same body as Checkpoint 0x0022");
+        let (cp2, votes2) = decode_checkpoint_votes(&bytes).unwrap();
+        assert_eq!(cp2, cp);
+        assert_eq!(votes2.len(), 3);
+        for v in &votes2 {
+            assert!(committee.verify_vote(&cp2, v));
+        }
+    }
+
+    #[test]
+    fn checkpoint_votes_reject_trailing_and_truncated() {
+        let (_c, validators) = devnet_committee(7);
+        let cp = Checkpoint::new(2, [0xAB; 32], [0xCD; 32]);
+        let votes: Vec<Vote> = validators[..2].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        let bytes = encode_checkpoint_votes(&cp, &votes);
+
+        let mut trailing = bytes.clone();
+        trailing.push(0x00);
+        assert!(matches!(decode_checkpoint_votes(&trailing), Err(DecodeError::Trailing { .. })));
+
+        assert!(decode_checkpoint_votes(&bytes[..bytes.len() - 1]).is_err(), "truncated rejected");
+        assert!(decode_checkpoint_votes(&[]).is_err(), "empty rejected");
     }
 
     #[test]

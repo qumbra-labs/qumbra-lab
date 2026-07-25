@@ -23,6 +23,7 @@ use qlab_devnet::ebbflow::{
 use qlab_devnet::epoch::{EpochCommittee, EpochSchedule};
 use qlab_devnet::finality::{FinalityTracker, FinalizeError};
 use qlab_devnet::header::{BlockHeader, Hash32};
+use qlab_devnet::tally::VoteTally;
 use qlab_devnet::params_devnet::{
     DEGRADED_MODE_LAG_BLOCKS, DOWNTIME_JAIL_THRESHOLD_PCT, DOWNTIME_JAIL_WINDOW,
     EPOCH_LENGTH_BLOCKS, EQUIVOCATION_SLASH_AMOUNT, JAIL_BLOCKS,
@@ -48,6 +49,27 @@ impl IngestOutcome {
     pub fn should_relay(&self) -> bool {
         matches!(self, IngestOutcome::Accepted)
     }
+}
+
+/// The outcome of feeding a **partial** checkpoint-vote set into the accumulator
+/// ([`CheckpointIngest::ingest_checkpoint_votes`], M10-T0-5). Distinct from
+/// [`IngestOutcome`] because a well-formed below-quorum set is neither "accepted +
+/// finalized" nor a penalisable reject — it is progress toward a quorum that must be
+/// relayed but never scored against the sender (task-book S5).
+#[derive(Clone)]
+pub enum VotesOutcome {
+    /// This message added ≥1 previously-unseen active vote. `finalized` = the
+    /// accumulated distinct-active count reached quorum and the checkpoint finalized
+    /// on this call. `accumulated` = the full active vote set for this variant, to be
+    /// relayed onward (sender excluded).
+    Learned { finalized: bool, accumulated: Vec<Vote> },
+    /// No new information — already tallied, already finalized, or out of the tally
+    /// window. Do NOT relay, do NOT penalise.
+    Stale,
+    /// The set carried a forged signature, an unknown signer index, or duplicate-
+    /// signer padding — penalise the sender (task-book S5). A well-formed partial set
+    /// (valid sigs, distinct in-committee signers, merely below quorum) is never this.
+    Invalid,
 }
 
 /// Read-only view of the chain — the primitives sync/relay/serving need.
@@ -92,9 +114,32 @@ pub trait TxPool {
     fn all_txs(&self) -> Vec<TxEntry>;
 }
 
-/// Ingest finalized-checkpoint gossip (checkpoint + committee votes).
+/// Ingest checkpoint-vote gossip (checkpoint + committee votes).
 pub trait CheckpointIngest {
-    fn ingest_checkpoint(&mut self, cp: Checkpoint, votes: Vec<Vote>) -> IngestOutcome;
+    /// Accumulate a (possibly partial) vote set for `cp` across messages (M10-T0-5).
+    /// Verifies each vote against `cp`'s epoch roster, excludes tombstoned/jailed
+    /// signers, de-duplicates by signer into the bounded tally, and finalizes through
+    /// the unchanged `try_finalize` the moment the distinct-active count reaches
+    /// quorum. This is THE accumulation path — [`Self::ingest_checkpoint`] delegates to
+    /// it. See [`VotesOutcome`].
+    fn ingest_checkpoint_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> VotesOutcome;
+
+    /// Ingest a full checkpoint object (the finalized-set serving path). Delegates to
+    /// [`Self::ingest_checkpoint_votes`]: a full quorum set finalizes in one call, a
+    /// partial set accumulates and reports `insufficient quorum` (without penalty at
+    /// the caller). Kept for the `Checkpoint` (0x0022) object + re-serve path and its
+    /// direct callers/tests.
+    fn ingest_checkpoint(&mut self, cp: Checkpoint, votes: Vec<Vote>) -> IngestOutcome {
+        match self.ingest_checkpoint_votes(&cp, &votes) {
+            VotesOutcome::Learned { finalized: true, .. } => IngestOutcome::Accepted,
+            VotesOutcome::Learned { finalized: false, .. } => {
+                IngestOutcome::Rejected("insufficient quorum")
+            }
+            VotesOutcome::Stale => IngestOutcome::Duplicate,
+            VotesOutcome::Invalid => IngestOutcome::Rejected("invalid vote"),
+        }
+    }
+
     fn has_checkpoint(&self, id: &Hash32) -> bool;
 }
 
@@ -146,6 +191,9 @@ pub struct StubNode {
     /// Every (height, signer) → the checkpoint+vote first seen for it, so a second
     /// conflicting vote at the same slot is detectable as equivocation.
     votes_seen: HashMap<(u64, usize), (Checkpoint, Vote)>,
+    /// Cross-message vote accumulator: distinct verified active votes per checkpoint
+    /// variant, until a quorum can be handed to `try_finalize` (M10-T0-5).
+    tally: VoteTally,
 }
 
 impl StubNode {
@@ -171,6 +219,7 @@ impl StubNode {
             seen_checkpoints: HashSet::new(),
             signing: SigningWindow::new(DOWNTIME_JAIL_WINDOW, DOWNTIME_JAIL_THRESHOLD_PCT),
             votes_seen: HashMap::new(),
+            tally: VoteTally::new(),
         }
     }
 
@@ -278,56 +327,74 @@ impl TxPool for StubNode {
 }
 
 impl CheckpointIngest for StubNode {
-    fn ingest_checkpoint(&mut self, cp: Checkpoint, votes: Vec<Vote>) -> IngestOutcome {
-        let id = checkpoint_id(&cp);
+    fn ingest_checkpoint_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> VotesOutcome {
+        let id = checkpoint_id(cp);
         if self.seen_checkpoints.contains(&id) {
-            return IngestOutcome::Duplicate;
+            return VotesOutcome::Stale; // already finalized this variant
         }
-        // Filter to signers that may sign at this height: tombstoned and jailed
-        // members are excluded from quorum BEFORE the count (frozen §4: tombstoned
-        // votes MUST NOT count toward quorum). "Who may sign" is the committee of
-        // this checkpoint's epoch ([`EpochCommittee::state_for_height`]).
-        let active_signers: Vec<usize> = {
-            let cstate = self.committee.state_for_height(cp.height);
-            votes
-                .iter()
-                .filter(|v| cstate.is_active(v.signer, cp.height))
-                .map(|v| v.signer)
-                .collect()
-        };
-        let active_votes: Vec<Vote> =
-            votes.iter().filter(|v| active_signers.contains(&v.signer)).cloned().collect();
+        let finalized = self.finality.finalized_height();
+        let tip = self.chain.tip_height();
 
-        let result = {
-            let committee = self.committee.state_for_height(cp.height).committee();
-            self.finality.try_finalize(&cp, &active_votes, committee)
+        // Verify + active-filter against THIS height's epoch roster (frozen §4:
+        // tombstoned/jailed excluded BEFORE the count; forged/unknown/dup penalised).
+        // `committee` is cloned so the immutable borrow of `self.committee` ends before
+        // the mutable finalization ops.
+        let (committee, quorum, active_kept) = {
+            let cstate = self.committee.state_for_height(cp.height);
+            let committee = cstate.committee().clone();
+            let mut seen_signer = HashSet::new();
+            let mut active_kept: Vec<Vote> = Vec::new();
+            for v in votes {
+                if committee.member(v.signer).is_none() {
+                    return VotesOutcome::Invalid; // unknown signer index
+                }
+                if !seen_signer.insert(v.signer) {
+                    return VotesOutcome::Invalid; // duplicate-signer padding
+                }
+                if !committee.verify_vote(cp, v) {
+                    return VotesOutcome::Invalid; // forged signature
+                }
+                if cstate.is_active(v.signer, cp.height) {
+                    active_kept.push(v.clone());
+                }
+                // else: valid but jailed/tombstoned — excluded, NOT penalised.
+            }
+            (committee, cstate.quorum_threshold(), active_kept)
         };
-        match result {
-            Ok(()) => {
-                self.seen_checkpoints.insert(id);
-                // Mark the finalized block in the chain store (best-effort: the
-                // block may not be known yet on this node, which is fine — the
-                // checkpoint is still recorded for anchor/age queries).
-                let _ = self.chain.set_finalized(cp.block_hash);
-                // Record signing participation for downtime detection, then jail
-                // any member the trailing window now shows dark.
-                self.signing.record_round(&active_signers);
-                self.apply_downtime_jails(cp.height);
-                IngestOutcome::Accepted
-            }
-            Err(FinalizeError::NotAdvancing { .. }) => {
-                self.seen_checkpoints.insert(id);
-                IngestOutcome::Duplicate
-            }
-            Err(FinalizeError::InsufficientQuorum { .. }) => {
-                IngestOutcome::Rejected("insufficient quorum")
-            }
-            Err(FinalizeError::InvalidVote { .. }) => IngestOutcome::Rejected("invalid vote"),
-            Err(FinalizeError::UnknownSigner { .. }) => IngestOutcome::Rejected("unknown signer"),
-            Err(FinalizeError::DuplicateSigner { .. }) => {
-                IngestOutcome::Rejected("duplicate signer")
+
+        let added = self.tally.add(cp, &active_kept, finalized, tip);
+        if !added.grew {
+            return VotesOutcome::Stale;
+        }
+
+        // Re-filter the accumulated set by CURRENT active status (a since-jailed
+        // signer's stale vote must not count), then let the AUTHORITATIVE try_finalize
+        // gate decide — the tally never lowers the bar (S4).
+        let active_now: Vec<Vote> = {
+            let cstate = self.committee.state_for_height(cp.height);
+            added.accumulated.iter().filter(|v| cstate.is_active(v.signer, cp.height)).cloned().collect()
+        };
+        if active_now.len() >= quorum {
+            match self.finality.try_finalize(cp, &active_now, &committee) {
+                Ok(()) => {
+                    self.seen_checkpoints.insert(id);
+                    let _ = self.chain.set_finalized(cp.block_hash);
+                    let signers: Vec<usize> = active_now.iter().map(|v| v.signer).collect();
+                    self.signing.record_round(&signers);
+                    self.apply_downtime_jails(cp.height);
+                    self.tally.on_finalized(cp.height);
+                    return VotesOutcome::Learned { finalized: true, accumulated: added.accumulated };
+                }
+                Err(FinalizeError::NotAdvancing { .. }) => {
+                    // A higher (or another variant already past this height) finalized
+                    // first — record so we don't re-try, treat as no-progress.
+                    self.seen_checkpoints.insert(id);
+                    return VotesOutcome::Stale;
+                }
+                Err(_) => return VotesOutcome::Invalid, // pre-verified; defensive
             }
         }
+        VotesOutcome::Learned { finalized: false, accumulated: added.accumulated }
     }
     fn has_checkpoint(&self, id: &Hash32) -> bool {
         self.seen_checkpoints.contains(id)

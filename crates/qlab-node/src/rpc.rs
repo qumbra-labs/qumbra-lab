@@ -375,9 +375,15 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
         )
     }
 
-    /// Chain-time seconds between the tip block and the finalized block (or genesis
-    /// when nothing is finalized). Uses only the public chain store.
+    /// Chain-time seconds between the tip block and the finalized block. Reports
+    /// **0 when nothing is finalized** (M10-T0-5 / S8): the T0-2 runbook keys its
+    /// stall alarm on this field, and a genesis fallback made "no finality yet" read
+    /// as a huge absolute age (Phase B-lite logged `age_s=1784917791`). Uses only the
+    /// public chain store.
     fn last_finalized_age_secs(&self) -> u64 {
+        if self.node.finalized_height().is_none() {
+            return 0; // nothing finalized ⇒ there is no finalized-age to report
+        }
         let chain = self.node.chain();
         let tip_ts = chain
             .block(&chain.tip_hash())
@@ -828,6 +834,17 @@ mod tests {
         let anchor = node.commitment_root(); // empty-tree root, finalized at height 0
         assert!(node.is_valid_anchor(&anchor), "genesis root is a valid anchor once finalized");
         (NodeRpc::new(node), anchor)
+    }
+
+    /// S8: with nothing finalized, the finalized-age telemetry field is 0, NOT the
+    /// tip−genesis fallback (which read as a huge absolute value in Phase B-lite).
+    #[test]
+    fn telemetry_age_is_zero_when_nothing_finalized() {
+        let node = MemNode::in_memory(genesis_block(1_000, 0));
+        let rpc = NodeRpc::new(node);
+        let t = rpc.telemetry();
+        assert_eq!(t.finalized_height, None, "fresh node has no finalized head");
+        assert_eq!(t.last_finalized_age_secs, 0, "age is 0 when nothing is finalized");
     }
 
     #[test]

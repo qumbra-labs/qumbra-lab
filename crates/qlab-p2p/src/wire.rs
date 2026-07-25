@@ -76,6 +76,11 @@ pub enum MsgType {
     /// for the same slot (committee-gov §3). Gossiped so the whole network applies
     /// the automated tombstone + slash.
     Evidence = 0x0023,
+    /// A **partial** committee vote set for a checkpoint (M10-T0-5): `(Checkpoint,
+    /// Vec<Vote>)`, same body as [`MsgType::Checkpoint`] but push-gossiped so nodes
+    /// accumulate votes across messages to a quorum (the committee is split across
+    /// nodes, so no one message carries a quorum). Body reuses the checkpoint codec.
+    CheckpointVotes = 0x0024,
 
     // --- header-first sync ---
     /// Locator → request a batch of headers building on it.
@@ -112,6 +117,7 @@ impl MsgType {
             0x0021 => Header,
             0x0022 => Checkpoint,
             0x0023 => Evidence,
+            0x0024 => CheckpointVotes,
             0x0030 => GetHeaders,
             0x0031 => Headers,
             0x0040 => CmpctBlock,
@@ -260,7 +266,7 @@ mod tests {
     fn round_trip_all_msg_types() {
         for raw in [
             0x0001u16, 0x0002, 0x0003, 0x0004, 0x0005, 0x0006, 0x0010, 0x0011, 0x0012, 0x0020,
-            0x0021, 0x0022, 0x0023, 0x0030, 0x0031, 0x0040, 0x0041, 0x0042, 0x0043,
+            0x0021, 0x0022, 0x0023, 0x0024, 0x0030, 0x0031, 0x0040, 0x0041, 0x0042, 0x0043,
         ] {
             let mt = MsgType::from_u16(raw).expect("known type");
             assert_eq!(mt.as_u16(), raw);
@@ -282,6 +288,21 @@ mod tests {
             &[0x51, 0x4D, 0x42, 0x50, 0x01, 0x00, 0x01, 0x00, 0x05, 0x00, 0x00, 0x00]
         );
         assert_eq!(bytes.len(), HEADER_LEN + 5);
+    }
+
+    #[test]
+    fn golden_checkpoint_votes_header_bytes() {
+        // Lock the exact 12-byte header for a CheckpointVotes(0x0024) frame with a
+        // 5-byte body: MAGIC "QMBP" ‖ ver=1 LE ‖ type=0x0024 LE ‖ len=5 LE. The wire
+        // code is coordinator-allocated (task-book S2); drift here is a wire break.
+        let env = Envelope::new(MsgType::CheckpointVotes, vec![0xAA; 5]);
+        let bytes = env.encode();
+        assert_eq!(
+            &bytes[..HEADER_LEN],
+            &[0x51, 0x4D, 0x42, 0x50, 0x01, 0x00, 0x24, 0x00, 0x05, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(MsgType::from_u16(0x0024), Some(MsgType::CheckpointVotes));
+        assert_eq!(MsgType::CheckpointVotes.as_u16(), 0x0024);
     }
 
     #[test]
