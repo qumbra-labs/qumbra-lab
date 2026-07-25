@@ -37,9 +37,12 @@ use std::time::{Duration, Instant};
 
 use qlab_devnet::body::{TxEntry, TxVerifier};
 use qlab_devnet::committee::CommitteeState;
+use qlab_devnet::ebbflow::FinalityStatus;
 use qlab_devnet::node::SimConfig;
-use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
+use qlab_devnet::params_devnet::{CHECKPOINT_CADENCE_BLOCKS, DEGRADED_MODE_LAG_BLOCKS};
 use qlab_devnet::pow::PowEngine;
+
+use qlab_node::Telemetry;
 
 use qlab_p2p::adapter::{MiningClock, NodeAdapter};
 use qlab_p2p::n1::ChainView;
@@ -158,6 +161,11 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     next_checkpoint: u64,
     /// Local listen address (for logs).
     listen_addr: String,
+    /// How often [`Self::run_until`] emits a `TELEMETRY` stdout sample line (the
+    /// T0-3 Phase B-lite soak monitor reads these via `docker compose logs`).
+    sample_interval: Duration,
+    /// When the last telemetry sample was emitted.
+    last_sample: Instant,
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
@@ -222,6 +230,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             nonce: 0,
             next_checkpoint: 0, // finalize genesis first, then the cadence grid
             listen_addr: bound,
+            // Sample telemetry roughly every 30 s (well under the 75 s block time,
+            // so every block shows up in the trace; the soak monitor also runs
+            // `docker compose logs -t` to wall-clock-stamp each line).
+            sample_interval: Duration::from_secs(30),
+            last_sample: Instant::now(),
         })
     }
 
@@ -255,6 +268,51 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// in-process tests below.
     pub fn set_mining_clock(&mut self, clock: MiningClock) {
         self.p2p.node_mut().set_mining_clock(clock);
+    }
+
+    /// Override the telemetry sampling cadence (tests / faster soaks).
+    pub fn set_sample_interval(&mut self, d: Duration) {
+        self.sample_interval = d;
+    }
+
+    /// A single observability sample line for the soak monitor (M10-T0-3 Phase
+    /// B-lite). Reuses the canonical [`Telemetry::assemble`] rule — it never
+    /// re-derives the frozen Ebb-and-Flow finality semantics — and adds the tip
+    /// block's PoW `difficulty` so the LWMA retarget trace is visible over the
+    /// soak (amendment-1 item 4). Age is chain-time (block timestamps), so this
+    /// half is deterministic given the chain; the network half (peers/epoch) is
+    /// read live. Emitted to stdout, captured via `docker compose logs`.
+    pub fn telemetry_sample(&self) -> String {
+        let node = self.p2p.node();
+        let chain = node.chain();
+        let tip_hash = chain.tip_hash();
+        let (tip_ts, tip_diff) = chain
+            .header(&tip_hash)
+            .map(|h| (h.timestamp, h.difficulty))
+            .unwrap_or((0, 0));
+        let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_hash());
+        let base_ts = chain.header(&base_hash).map(|h| h.timestamp).unwrap_or(0);
+        let age = tip_ts.saturating_sub(base_ts);
+
+        let t = Telemetry::assemble(
+            node.tip_height(),
+            node.finalized_height(),
+            age,
+            node.mempool().len() as u64,
+            self.p2p.peers().len() as u64,
+            node.committee().current_epoch(),
+            DEGRADED_MODE_LAG_BLOCKS,
+        );
+        let regime = match t.finality_status {
+            FinalityStatus::Final => "Final",
+            FinalityStatus::Degraded => "Degraded",
+        };
+        let final_str = t.finalized_height.map(|h| h.to_string()).unwrap_or_else(|| "-".to_string());
+        format!(
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={}",
+            t.tip_height, final_str, t.stall_depth, t.last_finalized_age_secs, tip_diff,
+            t.peer_count, t.mempool_size, t.epoch, regime,
+        )
     }
 
     /// One message-pump step; returns frames handled.
@@ -307,12 +365,19 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// checkpoints, until `shutdown` is set. On exit performs the graceful-shutdown
     /// **snapshot flush** (item 1).
     pub fn run_until(&mut self, shutdown: &AtomicBool) {
+        // An initial sample at startup (height/finality as opened from disk).
+        println!("{}", self.telemetry_sample());
+        self.last_sample = Instant::now();
         while !shutdown.load(Ordering::Relaxed) {
             let n = self.step_once();
             if self.mining && self.last_mine.elapsed() >= self.mine_interval {
                 if self.try_mine() {
                     self.try_checkpoint();
                 }
+            }
+            if self.last_sample.elapsed() >= self.sample_interval {
+                println!("{}", self.telemetry_sample());
+                self.last_sample = Instant::now();
             }
             if n == 0 {
                 std::thread::sleep(Duration::from_millis(20));
@@ -383,6 +448,32 @@ mod tests {
         let reopened =
             RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
         assert_eq!(reopened.tip_height(), 3, "state persisted across restart");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn telemetry_sample_reports_live_state() {
+        // The Phase B-lite soak-monitor surface (M10-T0-3): after finalizing
+        // genesis and mining two blocks, a sample line carries the live heights,
+        // the derived finality regime, and the tip difficulty (LWMA trace).
+        let (config, genesis, base) = rig("telemetry", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint(); // finalize genesis (height 0)
+        node.try_mine();
+        node.try_checkpoint();
+        node.try_mine();
+        node.try_checkpoint();
+
+        let line = node.telemetry_sample();
+        assert!(line.starts_with("TELEMETRY "), "prefix: {line}");
+        assert!(line.contains("tip=2"), "tip height: {line}");
+        assert!(line.contains("final=0"), "genesis finalized, cadence 8 not reached: {line}");
+        assert!(line.contains("stall=2"), "stall depth tip−final: {line}");
+        // tip−final=2 ≤ DEGRADED_MODE_LAG_BLOCKS(16) ⇒ Final (not Degraded).
+        assert!(line.contains("regime=Final"), "regime derived from frozen rule: {line}");
+        assert!(line.contains("diff="), "difficulty field present: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

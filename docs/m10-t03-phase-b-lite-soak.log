@@ -1,0 +1,388 @@
+# Phase B-lite >=6h steady soak (LOCALHOST/DOCKER) — start 2026-07-24T13:26:09Z, target 21600s
+=== t+0s 2026-07-24T13:26:09Z ===
+node0 TELEMETRY tip=8 final=- stall=8 age_s=1784899520 diff=120 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=9 final=- stall=9 age_s=1784899558 diff=141 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=8 final=- stall=8 age_s=1784899520 diff=120 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=8 final=- stall=8 age_s=1784899520 diff=120 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+301s 2026-07-24T13:31:10Z ===
+node0 TELEMETRY tip=19 final=- stall=19 age_s=1784899798 diff=433 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=19 final=- stall=19 age_s=1784899798 diff=433 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=19 final=- stall=19 age_s=1784899798 diff=433 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=19 final=- stall=19 age_s=1784899798 diff=433 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+601s 2026-07-24T13:36:11Z ===
+node0 TELEMETRY tip=27 final=- stall=27 age_s=1784900110 diff=722 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=28 final=- stall=28 age_s=1784900139 diff=686 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=28 final=- stall=28 age_s=1784900139 diff=686 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=28 final=- stall=28 age_s=1784900139 diff=686 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+902s 2026-07-24T13:41:12Z ===
+node0 TELEMETRY tip=36 final=- stall=36 age_s=1784900414 diff=912 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=38 final=- stall=38 age_s=1784900451 diff=1009 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=38 final=- stall=38 age_s=1784900451 diff=1009 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=36 final=- stall=36 age_s=1784900414 diff=912 peers=4 mempool=0 epoch=0 regime=Degraded
+# --- soak sampler (re)started 2026-07-24T13:44:43Z, target 21600s from here ---
+=== t+0s 2026-07-24T13:44:44Z ===
+node0 TELEMETRY tip=42 final=- stall=42 age_s=1784900612 diff=1134 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=43 final=- stall=43 age_s=1784900663 diff=1176 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=44 final=- stall=44 age_s=1784900667 diff=1182 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=42 final=- stall=42 age_s=1784900612 diff=1134 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+301s 2026-07-24T13:49:44Z ===
+node0 TELEMETRY tip=51 final=- stall=51 age_s=1784900903 diff=1441 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=52 final=- stall=52 age_s=1784900938 diff=1504 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=52 final=- stall=52 age_s=1784900938 diff=1504 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=52 final=- stall=52 age_s=1784900964 diff=1504 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+601s 2026-07-24T13:54:45Z ===
+node0 TELEMETRY tip=58 final=- stall=58 age_s=1784901245 diff=1554 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=58 final=- stall=58 age_s=1784901245 diff=1554 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=58 final=- stall=58 age_s=1784901245 diff=1554 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=58 final=- stall=58 age_s=1784901245 diff=1554 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+902s 2026-07-24T13:59:45Z ===
+node0 TELEMETRY tip=63 final=- stall=63 age_s=1784901511 diff=1526 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=63 final=- stall=63 age_s=1784901511 diff=1526 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=63 final=- stall=63 age_s=1784901511 diff=1526 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=63 final=- stall=63 age_s=1784901511 diff=1526 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+1203s 2026-07-24T14:04:46Z ===
+node0 TELEMETRY tip=69 final=- stall=69 age_s=1784901842 diff=1577 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=68 final=- stall=68 age_s=1784901816 diff=1542 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=68 final=- stall=68 age_s=1784901816 diff=1542 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=68 final=- stall=68 age_s=1784901816 diff=1542 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+1503s 2026-07-24T14:09:47Z ===
+node0 TELEMETRY tip=75 final=- stall=75 age_s=1784902128 diff=1685 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=75 final=- stall=75 age_s=1784902153 diff=1685 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=75 final=- stall=75 age_s=1784902128 diff=1685 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=76 final=- stall=76 age_s=1784902161 diff=1684 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+1804s 2026-07-24T14:14:47Z ===
+node0 TELEMETRY tip=79 final=- stall=79 age_s=1784902280 diff=1755 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=80 final=- stall=80 age_s=1784902372 diff=1771 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=80 final=- stall=80 age_s=1784902343 diff=1771 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=80 final=- stall=80 age_s=1784902372 diff=1771 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+2104s 2026-07-24T14:19:48Z ===
+node0 TELEMETRY tip=87 final=- stall=87 age_s=1784902671 diff=1797 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=88 final=- stall=88 age_s=1784902735 diff=1848 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=88 final=- stall=88 age_s=1784902742 diff=1848 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=88 final=- stall=88 age_s=1784902735 diff=1848 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+2405s 2026-07-24T14:24:48Z ===
+node0 TELEMETRY tip=94 final=- stall=94 age_s=1784903058 diff=1843 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=94 final=- stall=94 age_s=1784903058 diff=1843 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=94 final=- stall=94 age_s=1784903058 diff=1843 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=94 final=- stall=94 age_s=1784903058 diff=1843 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+2705s 2026-07-24T14:29:49Z ===
+node0 TELEMETRY tip=100 final=- stall=100 age_s=1784903299 diff=1950 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=101 final=- stall=101 age_s=1784903350 diff=1978 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=101 final=- stall=101 age_s=1784903350 diff=1978 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=101 final=- stall=101 age_s=1784903350 diff=1978 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+3006s 2026-07-24T14:34:49Z ===
+node0 TELEMETRY tip=107 final=- stall=107 age_s=1784903667 diff=2025 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=107 final=- stall=107 age_s=1784903667 diff=2025 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=106 final=- stall=106 age_s=1784903604 diff=2020 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=106 final=- stall=106 age_s=1784903601 diff=2020 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+3307s 2026-07-24T14:39:50Z ===
+node0 TELEMETRY tip=114 final=- stall=114 age_s=1784903922 diff=2160 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=114 final=- stall=114 age_s=1784903922 diff=2160 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=114 final=- stall=114 age_s=1784903922 diff=2160 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=114 final=- stall=114 age_s=1784903922 diff=2160 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+3607s 2026-07-24T14:44:51Z ===
+node0 TELEMETRY tip=118 final=- stall=118 age_s=1784904223 diff=2158 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=118 final=- stall=118 age_s=1784904223 diff=2158 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=117 final=- stall=117 age_s=1784904126 diff=2169 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=118 final=- stall=118 age_s=1784904236 diff=2126 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+3908s 2026-07-24T14:49:52Z ===
+node0 TELEMETRY tip=124 final=- stall=124 age_s=1784904531 diff=2186 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=123 final=- stall=123 age_s=1784904489 diff=2149 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=124 final=- stall=124 age_s=1784904531 diff=2186 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=121 final=- stall=121 age_s=1784904446 diff=2091 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+4209s 2026-07-24T14:54:53Z ===
+node0 TELEMETRY tip=129 final=- stall=129 age_s=1784904805 diff=2332 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=129 final=- stall=129 age_s=1784904819 diff=2331 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=129 final=- stall=129 age_s=1784904762 diff=2332 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=129 final=- stall=129 age_s=1784904769 diff=2332 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+4510s 2026-07-24T14:59:53Z ===
+node0 TELEMETRY tip=134 final=- stall=134 age_s=1784905157 diff=2305 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=134 final=- stall=134 age_s=1784905162 diff=2305 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=134 final=- stall=134 age_s=1784905162 diff=2305 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=134 final=- stall=134 age_s=1784905162 diff=2305 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+4811s 2026-07-24T15:04:54Z ===
+node0 TELEMETRY tip=141 final=- stall=141 age_s=1784905455 diff=2483 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=141 final=- stall=141 age_s=1784905455 diff=2483 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=142 final=- stall=142 age_s=1784905471 diff=2539 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=142 final=- stall=142 age_s=1784905471 diff=2539 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+5111s 2026-07-24T15:09:55Z ===
+node0 TELEMETRY tip=147 final=- stall=147 age_s=1784905715 diff=2680 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=147 final=- stall=147 age_s=1784905747 diff=2680 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=146 final=- stall=146 age_s=1784905669 diff=2629 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=147 final=- stall=147 age_s=1784905738 diff=2680 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+5412s 2026-07-24T15:14:56Z ===
+node0 TELEMETRY tip=151 final=- stall=151 age_s=1784906007 diff=2685 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=152 final=- stall=152 age_s=1784906050 diff=2711 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=152 final=- stall=152 age_s=1784906050 diff=2711 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=152 final=- stall=152 age_s=1784906050 diff=2711 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+5713s 2026-07-24T15:19:57Z ===
+node0 TELEMETRY tip=156 final=- stall=156 age_s=1784906296 diff=2863 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=154 final=- stall=154 age_s=1784906113 diff=2761 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=156 final=- stall=156 age_s=1784906296 diff=2863 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=156 final=- stall=156 age_s=1784906296 diff=2863 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+6014s 2026-07-24T15:24:57Z ===
+node0 TELEMETRY tip=161 final=- stall=161 age_s=1784906650 diff=2793 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=161 final=- stall=161 age_s=1784906650 diff=2793 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=161 final=- stall=161 age_s=1784906650 diff=2793 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=159 final=- stall=159 age_s=1784906542 diff=2737 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+6315s 2026-07-24T15:29:58Z ===
+node0 TELEMETRY tip=165 final=- stall=165 age_s=1784906857 diff=2819 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=167 final=- stall=167 age_s=1784906951 diff=2866 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=166 final=- stall=166 age_s=1784906931 diff=2868 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=167 final=- stall=167 age_s=1784906951 diff=2866 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+6615s 2026-07-24T15:34:59Z ===
+node0 TELEMETRY tip=172 final=- stall=172 age_s=1784907259 diff=2921 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=170 final=- stall=170 age_s=1784907149 diff=2922 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=172 final=- stall=172 age_s=1784907259 diff=2921 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=172 final=- stall=172 age_s=1784907259 diff=2921 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+6916s 2026-07-24T15:40:00Z ===
+node0 TELEMETRY tip=178 final=- stall=178 age_s=1784907545 diff=3049 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=178 final=- stall=178 age_s=1784907545 diff=3049 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=177 final=- stall=177 age_s=1784907513 diff=3051 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=177 final=- stall=177 age_s=1784907478 diff=3051 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+7217s 2026-07-24T15:45:00Z ===
+node0 TELEMETRY tip=179 final=- stall=179 age_s=1784907613 diff=3085 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=180 final=- stall=180 age_s=1784907761 diff=3039 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=180 final=- stall=180 age_s=1784907735 diff=3039 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=179 final=- stall=179 age_s=1784907647 diff=3085 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+7518s 2026-07-24T15:50:01Z ===
+node0 TELEMETRY tip=185 final=- stall=185 age_s=1784908142 diff=2998 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=186 final=- stall=186 age_s=1784908178 diff=2998 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=186 final=- stall=186 age_s=1784908178 diff=2998 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=186 final=- stall=186 age_s=1784908178 diff=2998 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+7818s 2026-07-24T15:55:01Z ===
+node0 TELEMETRY tip=191 final=- stall=191 age_s=1784908402 diff=3199 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=189 final=- stall=189 age_s=1784908261 diff=3101 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=189 final=- stall=189 age_s=1784908261 diff=3101 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=191 final=- stall=191 age_s=1784908424 diff=3199 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+8118s 2026-07-24T16:00:01Z ===
+node0 TELEMETRY tip=194 final=- stall=194 age_s=1784908644 diff=3122 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=195 final=- stall=195 age_s=1784908707 diff=3128 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=195 final=- stall=195 age_s=1784908707 diff=3128 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=194 final=- stall=194 age_s=1784908644 diff=3122 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+8419s 2026-07-24T16:05:02Z ===
+node0 TELEMETRY tip=200 final=- stall=200 age_s=1784909049 diff=3101 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=200 final=- stall=200 age_s=1784909049 diff=3101 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=200 final=- stall=200 age_s=1784909049 diff=3101 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=198 final=- stall=198 age_s=1784908912 diff=3126 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+8719s 2026-07-24T16:10:02Z ===
+node0 TELEMETRY tip=205 final=- stall=205 age_s=1784909327 diff=3180 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=205 final=- stall=205 age_s=1784909336 diff=3180 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=205 final=- stall=205 age_s=1784909322 diff=3180 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=205 final=- stall=205 age_s=1784909336 diff=3180 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+9019s 2026-07-24T16:15:02Z ===
+node0 TELEMETRY tip=212 final=- stall=212 age_s=1784909641 diff=3378 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=211 final=- stall=211 age_s=1784909605 diff=3379 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=212 final=- stall=212 age_s=1784909641 diff=3378 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=212 final=- stall=212 age_s=1784909641 diff=3378 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+9319s 2026-07-24T16:20:02Z ===
+node0 TELEMETRY tip=218 final=- stall=218 age_s=1784909928 diff=3555 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=218 final=- stall=218 age_s=1784909928 diff=3555 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=218 final=- stall=218 age_s=1784909928 diff=3555 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=218 final=- stall=218 age_s=1784909928 diff=3555 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+9620s 2026-07-24T16:25:03Z ===
+node0 TELEMETRY tip=221 final=- stall=221 age_s=1784910091 diff=3609 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=221 final=- stall=221 age_s=1784910093 diff=3609 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=221 final=- stall=221 age_s=1784910142 diff=3609 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=221 final=- stall=221 age_s=1784910091 diff=3609 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+9920s 2026-07-24T16:30:03Z ===
+node0 TELEMETRY tip=225 final=- stall=225 age_s=1784910515 diff=3453 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=225 final=- stall=225 age_s=1784910515 diff=3453 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=224 final=- stall=224 age_s=1784910483 diff=3432 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=225 final=- stall=225 age_s=1784910515 diff=3453 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+10220s 2026-07-24T16:35:03Z ===
+node0 TELEMETRY tip=228 final=- stall=228 age_s=1784910713 diff=3534 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=230 final=- stall=230 age_s=1784910808 diff=3531 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=231 final=- stall=231 age_s=1784910869 diff=3568 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=230 final=- stall=230 age_s=1784910808 diff=3531 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+10521s 2026-07-24T16:40:04Z ===
+node0 TELEMETRY tip=236 final=- stall=236 age_s=1784911155 diff=3665 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=235 final=- stall=235 age_s=1784911083 diff=3637 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=235 final=- stall=235 age_s=1784911083 diff=3637 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=234 final=- stall=234 age_s=1784911066 diff=3620 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+10821s 2026-07-24T16:45:04Z ===
+node0 TELEMETRY tip=242 final=- stall=242 age_s=1784911457 diff=3750 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=242 final=- stall=242 age_s=1784911457 diff=3750 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=242 final=- stall=242 age_s=1784911457 diff=3750 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=242 final=- stall=242 age_s=1784911457 diff=3750 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+11121s 2026-07-24T16:50:05Z ===
+node0 TELEMETRY tip=247 final=- stall=247 age_s=1784911710 diff=3944 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=247 final=- stall=247 age_s=1784911723 diff=3944 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=247 final=- stall=247 age_s=1784911710 diff=3944 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=246 final=- stall=246 age_s=1784911642 diff=3925 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+11422s 2026-07-24T16:55:05Z ===
+node0 TELEMETRY tip=251 final=- stall=251 age_s=1784912040 diff=3879 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=251 final=- stall=251 age_s=1784912040 diff=3879 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=250 final=- stall=250 age_s=1784912001 diff=3848 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=250 final=- stall=250 age_s=1784912001 diff=3848 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+11722s 2026-07-24T17:00:06Z ===
+node0 TELEMETRY tip=253 final=- stall=253 age_s=1784912212 diff=3932 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=255 final=- stall=255 age_s=1784912376 diff=3829 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=254 final=- stall=254 age_s=1784912347 diff=3924 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=255 final=- stall=255 age_s=1784912376 diff=3829 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+12023s 2026-07-24T17:05:06Z ===
+node0 TELEMETRY tip=253 final=- stall=253 age_s=1784912212 diff=3932 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=258 final=- stall=258 age_s=1784912652 diff=3828 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=258 final=- stall=258 age_s=1784912650 diff=3828 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=258 final=- stall=258 age_s=1784912652 diff=3828 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+12323s 2026-07-24T17:10:06Z ===
+node0 TELEMETRY tip=263 final=- stall=263 age_s=1784912891 diff=3937 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=263 final=- stall=263 age_s=1784912891 diff=3937 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=263 final=- stall=263 age_s=1784912891 diff=3937 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=264 final=- stall=264 age_s=1784912983 diff=3959 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+12624s 2026-07-24T17:15:07Z ===
+node0 TELEMETRY tip=266 final=- stall=266 age_s=1784913223 diff=3901 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=266 final=- stall=266 age_s=1784913223 diff=3901 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=265 final=- stall=265 age_s=1784913014 diff=3941 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=266 final=- stall=266 age_s=1784913263 diff=3901 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+12924s 2026-07-24T17:20:07Z ===
+node0 TELEMETRY tip=272 final=- stall=272 age_s=1784913511 diff=3973 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=270 final=- stall=270 age_s=1784913419 diff=3939 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=272 final=- stall=272 age_s=1784913539 diff=3973 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=272 final=- stall=272 age_s=1784913556 diff=3973 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+13224s 2026-07-24T17:25:07Z ===
+node0 TELEMETRY tip=276 final=- stall=276 age_s=1784913838 diff=3993 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=276 final=- stall=276 age_s=1784913838 diff=3993 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=276 final=- stall=276 age_s=1784913790 diff=3993 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=276 final=- stall=276 age_s=1784913812 diff=3993 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+13525s 2026-07-24T17:30:08Z ===
+node0 TELEMETRY tip=276 final=- stall=276 age_s=1784913838 diff=3993 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=280 final=- stall=280 age_s=1784914146 diff=4003 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=280 final=- stall=280 age_s=1784914146 diff=4003 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=279 final=- stall=279 age_s=1784914049 diff=3998 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+13825s 2026-07-24T17:35:08Z ===
+node0 TELEMETRY tip=285 final=- stall=285 age_s=1784914453 diff=3995 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=285 final=- stall=285 age_s=1784914453 diff=3995 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=284 final=- stall=284 age_s=1784914414 diff=3989 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=285 final=- stall=285 age_s=1784914453 diff=3995 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+14125s 2026-07-24T17:40:08Z ===
+node0 TELEMETRY tip=288 final=- stall=288 age_s=1784914685 diff=4072 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=288 final=- stall=288 age_s=1784914680 diff=4072 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=288 final=- stall=288 age_s=1784914657 diff=4072 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=287 final=- stall=287 age_s=1784914602 diff=4066 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+14426s 2026-07-24T17:45:09Z ===
+node0 TELEMETRY tip=292 final=- stall=292 age_s=1784915034 diff=3990 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=292 final=- stall=292 age_s=1784914978 diff=3990 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=291 final=- stall=291 age_s=1784914939 diff=3962 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=292 final=- stall=292 age_s=1784915017 diff=3990 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+14726s 2026-07-24T17:50:09Z ===
+node0 TELEMETRY tip=294 final=- stall=294 age_s=1784915242 diff=3936 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=295 final=- stall=295 age_s=1784915336 diff=3935 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=295 final=- stall=295 age_s=1784915313 diff=3935 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=295 final=- stall=295 age_s=1784915313 diff=3935 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+15026s 2026-07-24T17:55:09Z ===
+node0 TELEMETRY tip=297 final=- stall=297 age_s=1784915457 diff=3892 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=299 final=- stall=299 age_s=1784915599 diff=3970 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=298 final=- stall=298 age_s=1784915481 diff=3924 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=299 final=- stall=299 age_s=1784915599 diff=3970 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+15327s 2026-07-24T18:00:10Z ===
+node0 TELEMETRY tip=305 final=- stall=305 age_s=1784915985 diff=3933 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=304 final=- stall=304 age_s=1784915968 diff=3931 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=304 final=- stall=304 age_s=1784915968 diff=3931 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=303 final=- stall=303 age_s=1784915896 diff=3882 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+15627s 2026-07-24T18:05:10Z ===
+node0 TELEMETRY tip=307 final=- stall=307 age_s=1784916164 diff=3996 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=308 final=- stall=308 age_s=1784916173 diff=3987 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=308 final=- stall=308 age_s=1784916173 diff=3987 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=308 final=- stall=308 age_s=1784916242 diff=3960 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+15927s 2026-07-24T18:10:10Z ===
+node0 TELEMETRY tip=310 final=- stall=310 age_s=1784916523 diff=3974 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=310 final=- stall=310 age_s=1784916523 diff=3974 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=310 final=- stall=310 age_s=1784916523 diff=3974 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=310 final=- stall=310 age_s=1784916523 diff=3974 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+16228s 2026-07-24T18:15:11Z ===
+node0 TELEMETRY tip=315 final=- stall=315 age_s=1784916859 diff=3830 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=315 final=- stall=315 age_s=1784916859 diff=3830 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=315 final=- stall=315 age_s=1784916859 diff=3830 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=313 final=- stall=313 age_s=1784916758 diff=3769 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+16528s 2026-07-24T18:20:11Z ===
+node0 TELEMETRY tip=316 final=- stall=316 age_s=1784916900 diff=3873 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=318 final=- stall=318 age_s=1784917186 diff=3758 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=318 final=- stall=318 age_s=1784917186 diff=3758 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=317 final=- stall=317 age_s=1784917144 diff=3903 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+16828s 2026-07-24T18:25:11Z ===
+node0 TELEMETRY tip=321 final=- stall=321 age_s=1784917450 diff=3764 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=321 final=- stall=321 age_s=1784917377 diff=3764 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=320 final=- stall=320 age_s=1784917363 diff=3788 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=321 final=- stall=321 age_s=1784917450 diff=3764 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+17129s 2026-07-24T18:30:12Z ===
+node0 TELEMETRY tip=326 final=- stall=326 age_s=1784917791 diff=3744 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=323 final=- stall=323 age_s=1784917582 diff=3745 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=326 final=- stall=326 age_s=1784917791 diff=3744 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=326 final=- stall=326 age_s=1784917791 diff=3744 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+17429s 2026-07-24T18:35:12Z ===
+node0 TELEMETRY tip=330 final=- stall=330 age_s=1784918040 diff=3801 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=330 final=- stall=330 age_s=1784918040 diff=3801 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=330 final=- stall=330 age_s=1784918040 diff=3801 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=330 final=- stall=330 age_s=1784918040 diff=3801 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+17730s 2026-07-24T18:40:13Z ===
+node0 TELEMETRY tip=333 final=- stall=333 age_s=1784918337 diff=3789 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=333 final=- stall=333 age_s=1784918337 diff=3789 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=333 final=- stall=333 age_s=1784918337 diff=3789 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=333 final=- stall=333 age_s=1784918351 diff=3789 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+18030s 2026-07-24T18:45:13Z ===
+node0 TELEMETRY tip=337 final=- stall=337 age_s=1784918648 diff=3769 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=337 final=- stall=337 age_s=1784918606 diff=3769 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=336 final=- stall=336 age_s=1784918563 diff=3735 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=337 final=- stall=337 age_s=1784918648 diff=3769 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+18330s 2026-07-24T18:50:13Z ===
+node0 TELEMETRY tip=342 final=- stall=342 age_s=1784918934 diff=3847 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=342 final=- stall=342 age_s=1784918934 diff=3847 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=340 final=- stall=340 age_s=1784918816 diff=3785 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=342 final=- stall=342 age_s=1784918934 diff=3847 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+18631s 2026-07-24T18:55:14Z ===
+node0 TELEMETRY tip=346 final=- stall=346 age_s=1784919252 diff=3787 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=346 final=- stall=346 age_s=1784919240 diff=3787 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=346 final=- stall=346 age_s=1784919240 diff=3787 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=346 final=- stall=346 age_s=1784919240 diff=3787 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+18931s 2026-07-24T19:00:14Z ===
+node0 TELEMETRY tip=349 final=- stall=349 age_s=1784919346 diff=3881 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=350 final=- stall=350 age_s=1784919414 diff=3936 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=350 final=- stall=350 age_s=1784919414 diff=3936 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=350 final=- stall=350 age_s=1784919414 diff=3936 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+19231s 2026-07-24T19:05:14Z ===
+node0 TELEMETRY tip=354 final=- stall=354 age_s=1784919880 diff=3788 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=353 final=- stall=353 age_s=1784919822 diff=3774 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=353 final=- stall=353 age_s=1784919822 diff=3774 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=351 final=- stall=351 age_s=1784919619 diff=3943 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+19531s 2026-07-24T19:10:15Z ===
+node0 TELEMETRY tip=355 final=- stall=355 age_s=1784919941 diff=3802 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=355 final=- stall=355 age_s=1784919941 diff=3802 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=357 final=- stall=357 age_s=1784920121 diff=3811 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=357 final=- stall=357 age_s=1784920135 diff=3811 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+19832s 2026-07-24T19:15:15Z ===
+node0 TELEMETRY tip=362 final=- stall=362 age_s=1784920459 diff=3827 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=362 final=- stall=362 age_s=1784920423 diff=3827 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=362 final=- stall=362 age_s=1784920446 diff=3827 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=361 final=- stall=361 age_s=1784920377 diff=3778 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+20132s 2026-07-24T19:20:15Z ===
+node0 TELEMETRY tip=365 final=- stall=365 age_s=1784920791 diff=3775 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=363 final=- stall=363 age_s=1784920536 diff=3852 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=364 final=- stall=364 age_s=1784920710 diff=3820 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=364 final=- stall=364 age_s=1784920666 diff=3820 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+20432s 2026-07-24T19:25:16Z ===
+node0 TELEMETRY tip=370 final=- stall=370 age_s=1784921014 diff=3852 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=370 final=- stall=370 age_s=1784921056 diff=3852 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=370 final=- stall=370 age_s=1784921038 diff=3852 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=370 final=- stall=370 age_s=1784921014 diff=3852 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+20733s 2026-07-24T19:30:16Z ===
+node0 TELEMETRY tip=374 final=- stall=374 age_s=1784921303 diff=3871 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=374 final=- stall=374 age_s=1784921303 diff=3871 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=374 final=- stall=374 age_s=1784921303 diff=3871 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=373 final=- stall=373 age_s=1784921224 diff=3864 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+21034s 2026-07-24T19:35:17Z ===
+node0 TELEMETRY tip=375 final=- stall=375 age_s=1784921371 diff=3867 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=376 final=- stall=376 age_s=1784921582 diff=3904 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=376 final=- stall=376 age_s=1784921582 diff=3904 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=374 final=- stall=374 age_s=1784921279 diff=3871 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+21334s 2026-07-24T19:40:18Z ===
+node0 TELEMETRY tip=380 final=- stall=380 age_s=1784921874 diff=3744 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=380 final=- stall=380 age_s=1784921874 diff=3744 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=381 final=- stall=381 age_s=1784921944 diff=3767 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=381 final=- stall=381 age_s=1784921944 diff=3767 peers=4 mempool=0 epoch=0 regime=Degraded
+=== t+21635s 2026-07-24T19:45:18Z ===
+node0 TELEMETRY tip=388 final=- stall=388 age_s=1784922250 diff=3896 peers=5 mempool=0 epoch=0 regime=Degraded
+node1 TELEMETRY tip=388 final=- stall=388 age_s=1784922250 diff=3896 peers=3 mempool=0 epoch=0 regime=Degraded
+node2 TELEMETRY tip=388 final=- stall=388 age_s=1784922250 diff=3896 peers=5 mempool=0 epoch=0 regime=Degraded
+node3 TELEMETRY tip=388 final=- stall=388 age_s=1784922250 diff=3896 peers=4 mempool=0 epoch=0 regime=Degraded
+SOAK COMPLETE t+21635s samples=73 tip=388 diff[1134..4072] maxstall=388
