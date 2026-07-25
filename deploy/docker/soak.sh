@@ -166,9 +166,9 @@ case "$cmd" in
     docker network connect "$NET_MAIN" "$(cid node3)" || true
     docker network disconnect "$NET_SIDEB" "$(cid node2)" 2>/dev/null || true
     docker network disconnect "$NET_SIDEB" "$(cid node3)" 2>/dev/null || true
-    echo "   reconnected to $NET_MAIN. fork-choice should converge; finality should resume."
-    echo "   (finding to watch) if peers do not re-dial after reconnect, heal relies on the"
-    echo "   header-sync path — record whether finality resumes and how long it takes."
+    echo "   reconnected to $NET_MAIN. periodic re-dial (M10-T0-5 / S9) reconnects the split"
+    echo "   peers WITHOUT a restart; fork-choice converges and cross-node vote aggregation"
+    echo "   resumes → finality (final=) should advance again on both sides within ~1–2 cadences."
     snapshot
     ;;
 

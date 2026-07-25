@@ -375,14 +375,35 @@ pub fn scenario_adversarial_peers() -> SoakResult {
     ok &= c_ok;
     notes.push(format!("bad-block not-applied:{c_ok}"));
 
-    // (d) sub-quorum checkpoint (2 of quorum-3 votes) → not finalized + penalized.
+    // (d) well-formed sub-quorum checkpoint (2 of quorum-3 votes) → NOT finalized and
+    //     NOT penalized. Since M10-T0-5 (task-book S5), a well-formed partial vote set
+    //     is honest progress toward a quorum, not an invalid object — it enters the
+    //     cross-node tally and is relayed, never scored against the sender. (Pre-#70
+    //     this was penalized; that scoring bug is exactly what banned honest 6/5/5/5
+    //     peers and blocked distributed finality.)
     let score_d = peer_score(&nodes[1], PeerId(1));
     let cp = qlab_devnet::committee::Checkpoint::new(1, [0x11; 32], [0x11; 32]);
     let votes: Vec<_> = nodes[0].validators[..2].iter().map(|v| v.sign_checkpoint(&cp)).collect();
     inject!(MsgType::Checkpoint, encode_checkpoint_msg(&cp, &votes));
-    let d_ok = nodes[1].finalized_height() == base_final && peer_score(&nodes[1], PeerId(1)) < score_d;
+    let d_ok = nodes[1].finalized_height() == base_final
+        && peer_score(&nodes[1], PeerId(1)) == score_d;
     ok &= d_ok;
-    notes.push(format!("subquorum-cp rejected+penalized:{d_ok}"));
+    notes.push(format!("subquorum-cp not-finalized+not-penalized:{d_ok}"));
+
+    // (d2) FORGED checkpoint — a valid signature attributed to the wrong signer index
+    //      → NOT finalized AND penalized (task-book S5: forged/unknown/dup sets stay
+    //      penalized; this preserves the adversarial-checkpoint coverage).
+    let score_d2 = peer_score(&nodes[1], PeerId(1));
+    let cp2 = qlab_devnet::committee::Checkpoint::new(2, [0x12; 32], [0x12; 32]);
+    let forged_vote = qlab_devnet::committee::Vote {
+        signer: 0,
+        signature: nodes[0].validators[1].sign_checkpoint(&cp2).signature,
+    };
+    inject!(MsgType::Checkpoint, encode_checkpoint_msg(&cp2, &[forged_vote]));
+    let d2_ok = nodes[1].finalized_height() == base_final
+        && peer_score(&nodes[1], PeerId(1)) < score_d2;
+    ok &= d2_ok;
+    notes.push(format!("forged-cp rejected+penalized:{d2_ok}"));
 
     // (e) forged evidence (cp_a == cp_b → not conflicting) → not applied + penalized.
     let score_e = peer_score(&nodes[1], PeerId(1));
