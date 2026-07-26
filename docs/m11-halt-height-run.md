@@ -116,6 +116,22 @@ v1.0 constant table (`FrozenParams`), pinned at
   against undocumented rule changes is the halt itself — a rule change must ship as
   an upgrade with its own halt height.
 
+  **🔴 That exclusion is a constraint to defend, not a gap to close.** The same
+  property does two jobs: it is a scoping limit (the digest cannot catch an
+  undocumented rule change) *and* the enabling property that makes the gate usable
+  (a release changing only code digests identically, so it starts with no
+  ceremony). Extending the digest over the consuming logic would read as a
+  strengthening; what it would actually do is make every release produce a
+  different digest, so every release would demand a declared transition, and the
+  declaration would stop meaning "the parameter set moved" and start meaning "a
+  release happened". That is the same death this doc already refuses on the other
+  side — the cadence is excluded because demanding a revision document for a
+  tunable knob teaches operators the ceremony is empty. Widening kills it from the
+  opposite direction. The burden on anyone adding to the digest is therefore not
+  "does this close a gap" but "does this value move **only** when the frozen
+  parameter set moves". Written into `crates/qumbra-node/src/revision.rs` at the
+  function a widener would edit, since that is where they will be standing.
+
 **Coverage cannot drift silently.** The digest preimage destructures
 `FrozenParams` with no `..` rest pattern, so adding a field to the frozen table
 fails to compile until an author decides, explicitly, whether it belongs in the

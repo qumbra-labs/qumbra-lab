@@ -53,6 +53,37 @@
 //!   rule-change guard is the halt itself (a rule change must ship as an upgrade
 //!   with its own halt height), not the digest.
 //!
+//! # 🔴 The code exclusion is a CONSTRAINT TO DEFEND, not a gap to close later
+//!
+//! The bullet above reads like a weakness waiting to be fixed. It is not. That same
+//! property is what makes the gate usable, and the two jobs are inseparable:
+//!
+//! - as a **scoping limit** — the digest cannot catch an undocumented rule change;
+//! - as an **enabling property** — a release that changes only code produces an
+//!   *identical* digest, so it starts with no ceremony at all.
+//!
+//! Extending the digest over the consuming logic would look like a strengthening.
+//! What it would actually do is make **every** release produce a different digest,
+//! so every release would demand a declared transition — and the declaration would
+//! stop meaning "the frozen parameter set moved" and start meaning "a release
+//! happened". At that point an operator bumps the revision as routine paperwork, and
+//! learns that bumping it means nothing.
+//!
+//! That is the same death this module already refuses on the other side: the
+//! checkpoint cadence is excluded precisely because demanding a revision document
+//! for a legitimately tunable knob teaches operators the ceremony is empty.
+//! **Widening the digest kills it the same way, from the opposite direction.**
+//!
+//! So: if you are here to make the digest cover more, the burden is not "does this
+//! close a gap" — it is "does the thing I am adding move *only* when the frozen
+//! parameter set moves". If it moves on ordinary releases, it does not belong,
+//! however much it looks like extra safety.
+//!
+//! (Coordinator decision, 2026-07-26, issue #74 review; carried into
+//! [#81](https://github.com/lai3d/qumbra-lab/issues/81), which makes the resume gate
+//! key on digest equality — a change that depends on exactly this property, because
+//! it is what lets an ordinary bug-fix release start without a declared transition.)
+//!
 //! # Why the encoder is exhaustive-by-construction
 //!
 //! [`frozen_digest`] destructures `FrozenParams` with **no `..` rest pattern**, so
@@ -130,6 +161,12 @@ impl Preimage {
 /// The destructuring below has **no `..`**: adding a field to [`FrozenParams`]
 /// breaks this function's compilation until someone decides whether the new field
 /// is frozen (add a line) or not (bind it to an `_excluded_*` name and say why).
+///
+/// **Before adding anything here, read the "constraint to defend" section in the
+/// module doc.** The test is not "would covering this catch more"; it is "does this
+/// value move *only* when the frozen parameter set moves". Anything that also moves
+/// on an ordinary release turns the revision declaration into paperwork, and
+/// paperwork is how this gate stops being a gate.
 fn preimage(p: &FrozenParams) -> Preimage {
     let FrozenParams {
         // §1 proof / consensus
