@@ -706,19 +706,6 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             return;
         }
-        // A rejected block must not be cached or re-announced, and whoever handed
-        // it to us pays for it (issue #77 P2). This is the compact-reconstruction
-        // seam: the announcer controls the prefilled txs and the short-id salt, so
-        // "reconstruction succeeded" is no evidence the body is the header's body —
-        // that verdict comes from `ingest_block`, and until this commit it was
-        // being computed and then discarded, so a mismatched body would have been
-        // stored and relayed onward.
-        if let IngestOutcome::Rejected(_) = outcome {
-            if let Some(peer) = except {
-                self.peers.penalize(peer, PENALTY_INVALID_OBJECT);
-            }
-            return;
-        }
         self.blocks.insert(bh, (txs, ann.coinbase));
         self.seen.insert(bh);
         let payload = encode_announce(&ann);
@@ -785,6 +772,14 @@ mod tests {
     fn stub() -> StubNode {
         let (committee, _v) = devnet_committee(7);
         StubNode::new(genesis(), CommitteeState::new(committee, BOND_AMOUNT))
+    }
+
+    /// The header for a block over `parent` announcing `txs` + `coinbase` — it
+    /// commits to exactly that body, which since issue #77 is what makes the
+    /// announce ingestable at all.
+    fn header_over(parent: &BlockHeader, ts: u64, txs: &[TxEntry], coinbase: u64) -> BlockHeader {
+        let body = BlockBody { txs: txs.to_vec(), coinbase };
+        BlockHeader::child_of(parent, ts, 1000, body.commitment())
     }
 
     fn tx(seed: u8) -> TxEntry {
@@ -1098,9 +1093,10 @@ mod tests {
             n.node_mut().ingest_tx(t1.clone());
             n.node_mut().ingest_tx(t2.clone());
         }
-        let header = BlockHeader::child_of(&genesis(), 75, 1000, [7; 32]);
+        let body_txs = vec![coinbase, t1, t2];
+        let header = header_over(&genesis(), 75, &body_txs, 0);
         let bh = header.header_hash();
-        nodes[0].announce_block(header, vec![coinbase, t1, t2], 0, 0xABCD);
+        nodes[0].announce_block(header, body_txs, 0, 0xABCD);
         run(&mut nodes);
         // Node 1 reconstructed and ingested the header.
         assert!(nodes[1].node().has_header(&bh));
@@ -1117,9 +1113,10 @@ mod tests {
         nodes[0].node_mut().ingest_tx(t1.clone());
         nodes[0].node_mut().ingest_tx(t2.clone());
         nodes[1].node_mut().ingest_tx(t1.clone());
-        let header = BlockHeader::child_of(&genesis(), 75, 1000, [8; 32]);
+        let body_txs = vec![coinbase, t1, t2.clone()];
+        let header = header_over(&genesis(), 75, &body_txs, 0);
         let bh = header.header_hash();
-        nodes[0].announce_block(header, vec![coinbase, t1, t2.clone()], 0, 0x1234);
+        nodes[0].announce_block(header, body_txs, 0, 0x1234);
         run(&mut nodes);
         assert!(nodes[1].node().has_header(&bh), "header ingested after fetching missing tx");
         assert!(nodes[1].node().has_tx(&tx_id(&t2)), "missing tx fetched into mempool");
@@ -1136,7 +1133,7 @@ mod tests {
         // A block two above genesis: its parent (one above genesis) is unknown to
         // node 1, so ingesting it orphans.
         let unknown_parent = BlockHeader::child_of(&genesis(), 75, 1000, [200; 32]);
-        let orphan_block = BlockHeader::child_of(&unknown_parent, 150, 1000, [201; 32]);
+        let orphan_block = header_over(&unknown_parent, 150, &[tx(0)], 0);
         // Node 0 announces it (prefilled coinbase, no short ids → node 1
         // reconstructs immediately and runs complete_block).
         nodes[0].announce_block(orphan_block, vec![tx(0)], 0, 0xABCD);

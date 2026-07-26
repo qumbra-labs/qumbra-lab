@@ -439,3 +439,188 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeState for Node<C,
 pub fn genesis_block(difficulty: u64, timestamp: u64) -> StoredBlock {
     StoredBlock::from_parts(&BlockHeader::genesis(difficulty, timestamp), &BlockBody::default())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Issue #77 — the header/body binding at this crate's two seams: the
+    //! `apply_block` entry point and the `apply_state` state-mutation funnel
+    //! (which disk-log replay also passes through).
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use qlab_devnet::body::{BodyError, TxEntry, TxPublic};
+    use qlab_devnet::fees::{posted_fee, ArityBucket};
+    use qlab_devnet::params_devnet::GENESIS_DIFFICULTY;
+
+    use super::*;
+    use crate::store::StoredHeader;
+
+    /// A proof is "valid" iff its bytes are `b"ok"` (the node is prover-free).
+    struct MockVerifier;
+    impl TxVerifier for MockVerifier {
+        fn verify_tx(&self, entry: &TxEntry) -> bool {
+            entry.proof == b"ok"
+        }
+    }
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        p.push(format!("qlab-node-i77-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn tx(anchor: Hash32, nf: u8) -> TxEntry {
+        TxEntry {
+            proof: b"ok".to_vec(),
+            public: TxPublic {
+                anchor,
+                nullifiers: vec![[nf; 32]],
+                commitments: vec![[nf.wrapping_add(80); 32]],
+                bucket: ArityBucket::TwoByTwo,
+                fee: posted_fee(ArityBucket::TwoByTwo),
+            },
+        }
+    }
+
+    /// A node whose genesis root is finalized, so an ordinary tx anchored to it
+    /// passes the anchor gate and only the binding can reject it.
+    fn node_with_finalized_genesis() -> (MemNode, BlockHeader, Hash32) {
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let g_header = genesis.header();
+        let mut node = MemNode::in_memory(genesis);
+        assert!(node.finalize(g_header.header_hash()).unwrap());
+        let root = node.commitment_root();
+        (node, g_header, root)
+    }
+
+    fn child_committing_to(parent: &BlockHeader, body: &BlockBody) -> BlockHeader {
+        BlockHeader::child_of(parent, parent.timestamp + 75, GENESIS_DIFFICULTY, body.commitment())
+    }
+
+    #[test]
+    fn apply_block_rejects_a_body_the_header_did_not_commit_to() {
+        let (mut node, g, root) = node_with_finalized_genesis();
+        let honest = BlockBody { txs: vec![tx(root, 1)], coinbase: 0 };
+        let header = child_committing_to(&g, &honest);
+        let swapped = BlockBody { txs: vec![tx(root, 2)], coinbase: 0 };
+        let err = node.apply_block(header, swapped.clone(), &MockVerifier).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NodeError::Body(BodyError::CommitmentMismatch { expected, got })
+                    if expected == honest.commitment() && got == swapped.commitment()
+            ),
+            "got {err}"
+        );
+        assert_eq!(node.tip_height(), 0, "state untouched");
+        assert_eq!(node.commitment_count(), 0);
+    }
+
+    /// The cheapest exploit at the state machine: an honest header, an empty body.
+    #[test]
+    fn apply_block_rejects_an_honest_header_with_an_empty_body() {
+        let (mut node, g, root) = node_with_finalized_genesis();
+        let honest = BlockBody { txs: vec![tx(root, 3)], coinbase: 0 };
+        let header = child_committing_to(&g, &honest);
+        let err = node.apply_block(header, BlockBody::default(), &MockVerifier).unwrap_err();
+        assert!(
+            matches!(err, NodeError::Body(BodyError::CommitmentMismatch { .. })),
+            "got {err}"
+        );
+        assert_eq!(node.tip_height(), 0, "no empty body was applied under an honest header");
+    }
+
+    /// The funnel guard: a log record whose body no longer matches its header —
+    /// on-disk corruption, or a tampered log — is refused by replay. The entry
+    /// check structurally cannot see this: replay deserializes `LogRecord::Block`
+    /// straight into `apply_state`, never through `StoredBlock::from_parts`.
+    #[test]
+    fn replay_rejects_a_log_record_whose_body_no_longer_matches_its_header() {
+        let dir = temp_dir("replay-tamper");
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let g_header = genesis.header();
+
+        // A block whose header honestly commits to `honest`…
+        let honest = BlockBody { txs: vec![tx([9u8; 32], 4)], coinbase: 0 };
+        let header = child_committing_to(&g_header, &honest);
+        // …but whose persisted body is not that body.
+        let tampered = StoredBlock {
+            header: StoredHeader::from(&header),
+            txs: Vec::new(),
+            coinbase: 0,
+        };
+        persist::append_record(&dir, &LogRecord::Block(tampered)).unwrap();
+
+        let err = match MemNode::replay(&dir, genesis.clone()) {
+            Err(e) => e,
+            Ok(_) => panic!("replay must refuse a tampered log record"),
+        };
+        assert!(
+            matches!(err, NodeError::BodyCommitmentMismatch { height: 1, .. }),
+            "got {err}"
+        );
+        // `open` (no snapshot ⇒ same path) refuses it too.
+        assert!(matches!(
+            MemNode::open(&dir, genesis),
+            Err(NodeError::BodyCommitmentMismatch { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The snapshot fast path in `open` skips `apply_state` for log-prefix blocks
+    /// (it only rebuilds the chain store) — so it carries the guard explicitly.
+    #[test]
+    fn open_snapshot_fast_path_also_rejects_a_tampered_record() {
+        let dir = temp_dir("fastpath-tamper");
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let g_header = genesis.header();
+        let mut node = MemNode::open(&dir, genesis.clone()).unwrap();
+        node.finalize(g_header.header_hash()).unwrap();
+        let root = node.commitment_root();
+
+        // One honest block, then a snapshot covering it.
+        let body = BlockBody { txs: vec![tx(root, 5)], coinbase: 0 };
+        let header = child_committing_to(&g_header, &body);
+        node.apply_block(header, body, &MockVerifier).unwrap();
+        node.save_snapshot().unwrap();
+        assert_eq!(node.tip_height(), 1);
+        drop(node);
+
+        // Append a tampered record at the same height: `open` restores the
+        // snapshot (applied_height = 1) and takes the fast path for it.
+        let honest2 = BlockBody { txs: vec![tx(root, 6)], coinbase: 0 };
+        let h2 = child_committing_to(&g_header, &honest2);
+        let tampered =
+            StoredBlock { header: StoredHeader::from(&h2), txs: Vec::new(), coinbase: 0 };
+        persist::append_record(&dir, &LogRecord::Block(tampered)).unwrap();
+
+        assert!(matches!(
+            MemNode::open(&dir, genesis),
+            Err(NodeError::BodyCommitmentMismatch { height: 1, .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Genesis is the one exemption, and it is exercised on every single startup:
+    /// its header pins `ZERO_HASH` while an empty body hashes to
+    /// `keccak256(coinbase_le)`. Locked so the exemption cannot be deleted without
+    /// this failing loudly.
+    #[test]
+    fn genesis_is_exempt_from_the_binding_guard() {
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        assert_ne!(
+            genesis.header.tx_body_commitment,
+            genesis.body().commitment(),
+            "genesis really does not satisfy the invariant"
+        );
+        assert!(check_stored_binding(&genesis).is_ok(), "…and is exempt by height");
+        // Nothing above height 0 inherits the exemption.
+        let mut not_genesis = genesis.clone();
+        not_genesis.header.height = 1;
+        assert!(check_stored_binding(&not_genesis).is_err());
+    }
+}
