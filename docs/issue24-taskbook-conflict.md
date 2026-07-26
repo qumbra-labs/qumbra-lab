@@ -1,7 +1,9 @@
 # Issue #24 task-book conflict report (builder, 2026-07-26)
 
-**Status: STOPPED BEFORE IMPLEMENTING. No scope-item edits made.** This document is
-the evidence for a redirect request back to the coordinator.
+**Status: RESOLVED — task-book withdrawn in full by the coordinator (2026-07-26).**
+The builder stopped before implementing; no scope-item edits were made. This
+document is the evidence record for why, kept in-repo so the stale premise cannot
+be picked up again. See §Resolution.
 
 Branch `claude/i24-merge-binding`, worktree `../qumbra-lab-i24`, base `5a24e49` (main).
 
@@ -132,20 +134,35 @@ the task-book's stop-point clause ("if closing the binding turns out to require
 changing the interior AIR's public-value layout … stop and report"). Flagging now
 rather than after starting.
 
-## Requested redirect (coordinator's call)
+## Resolution (coordinator, 2026-07-26)
 
-1. **Confirm the decision is moot as written** — path 1 is shipped; there is nothing
-   to decline and no contingency to measure.
-2. **Re-word scope item 1.** If §2 should still carry a consumer obligation, it must
-   be stated as defense-in-depth over an already-unconditional in-circuit binding,
-   not as the thing that makes the interior meaningful. Proposed wording is in the
-   report to the coordinator; it is not landed here (design repo is yours).
-3. **Decide what this baton actually is:** (a) close #24's remaining D3, (b) a
-   documentation-only pass reconciling issue #24's stale body with the landed state,
-   or (c) something else. D3 is a substantially larger, consensus-critical change
-   than the task-book scoped.
+All three findings independently re-verified by the coordinator (`m4gate.rs:2469`
+live and un-gated; issue #24 comment 3; `aggregation-rung1.md:67`;
+`m4assembly.rs:152`/`:159` hard assertions + `:199` negative test;
+`m4interior.rs:222` decided lane). Rulings:
+
+1. **The task-book is withdrawn in full.** Path 1 is shipped; there was nothing to
+   decline and no contingency to measure. Stopping at the report rather than
+   implementing also prevented a regression being written into the design repo.
+2. **`aggregation-rung1.md` §2 is NOT changed.** It already records the correct
+   state — §2's PR #23 measured-update carries the parenthetical *"(CLOSED for the
+   interior 2026-07-22, PR #30: msh ring landed, +54 cols, root binding now
+   unconditional; leaf-digest binding (D3) remains open in the issue.)"*. The
+   sentence the task-book would have added is false, so there is no
+   "re-word as defense-in-depth" need either — **no new text at all**.
+3. **This baton ends here.** Its only deliverable is this evidence document.
+   No scope changes accompany it.
+
+**D3 is not started and is not this baton.** It remains the one open item on #24,
+and because it changes the leaf public-value layout by construction, the original
+task-book's stop-point would have fired on its first commit — correctly. It will get
+its own task-book written against `docs/issue24-findings.md` rather than the stale
+issue body, and does not begin before that exists.
+
+## Method note
 
 No heavy runs were started: `m4gate` / b4 interior bench and the full
 `--release --workspace` suite were **not** invoked (4-node docker soak holding the
-rig). All findings above are static — code, git history, and already-recorded
-measurements.
+rig). Every finding above is static — code, git history, and already-recorded
+measurements — which is why the conflict was resolvable without touching the rig at
+all.
