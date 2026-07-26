@@ -62,13 +62,29 @@ Maximum observed **33**. The shape is oscillation, not drift: stall climbs into 
 
 **This matters beyond this run.** T-ops reported the same hold-then-jump pattern on the WAN net and asked whether it was a WAN effect. It is not: it appears here, on localhost, with sub-millisecond RTT. The mechanism is in the protocol, not the network — several checkpoint slots accumulate votes concurrently (`try_checkpoint` proposes every pending grid height in one pass), whichever crosses quorum first finalizes, and lower slots then die by `NotAdvancing`. Nothing is lost, because `set_finalized` requires the new head to descend from the old one: **the finalized head is a high-water mark, so finalizing 1120 finalizes everything below it.** WAN widens the race; it does not create it.
 
-### What is still owed by this run
+## 🎯 The crossing — 2026-07-26 22:29:27 +0800, sample 266
 
-- **the crossing itself** — at tip 1152, ~6 blocks away at the time of writing;
-- confirmation that all four nodes advance `epoch` **identically** across it;
-- whether finality survives the boundary — note the run is entering it **while finality is held** (`final=1120`, stall 26), which is more informative than a quiet crossing: the roster reseal and the vote accumulation overlap, which is where a boundary-timing defect would show.
+**The 1,152-block committee epoch boundary was crossed, and no live multi-node net had done it before.**
 
-The sampler stops at tip ≥ 1200, so roughly 48 blocks of post-boundary behaviour will be recorded rather than stopping at the line.
+```
+node0  tip=1155  final=1144  stall=11  diff=3244  epoch=1  regime=Final
+node1  tip=1155  final=1144  stall=11  diff=3244  epoch=1  regime=Final
+node2  tip=1154  final=1144  stall=10  diff=3230  epoch=1  regime=Final
+node3  tip=1154  final=1144  stall=10  diff=3230  epoch=1  regime=Final
+```
+
+**All four checks pass:**
+
+1. **All four nodes advanced `epoch` 0 → 1 in the same sample, identically.** No split roster view — that was one of the armed STOP-checks, and it did not fire.
+2. **Finality survived the boundary.** `final=1144` on all four, `regime=Final`, and `final` continued to advance after the line.
+3. **Zero alerts across the whole run** — 267 samples, no STOP-check triggered at any of them.
+4. **The crossing was not quiet, which is the useful part.** Two samples earlier the net was at `final=1120, stall=24–26` — finality had been held for ~35 minutes. It then advanced to 1144 and crossed the boundary at stall 10–11. **So the roster reseal happened in the same window as an active vote accumulation and did not disturb it.** Had the run entered the boundary during a quiet stretch, that overlap would not have been exercised at all.
+
+That last point was predicted in this document before the crossing, and it is the reason the run is worth more than a green tick: a boundary-timing defect would show precisely where reseal and accumulation overlap, and that is the case that got tested.
+
+### Still owed by this run
+
+Post-boundary behaviour to tip ≥ 1200 — roughly 45 blocks — so the record does not stop at the line it was built to cross. The sampler continues automatically.
 
 ## Evidence
 
