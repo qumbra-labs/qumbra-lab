@@ -82,10 +82,12 @@ node3  tip=1154  final=1144  stall=10  diff=3230  epoch=1  regime=Final
 
 That last point was predicted in this document before the crossing, and it is the reason the run is worth more than a green tick: a boundary-timing defect would show precisely where reseal and accumulation overlap, and that is the case that got tested.
 
-### Still owed by this run
+### Post-boundary behaviour — recorded, and the run is complete
 
-Post-boundary behaviour to tip ≥ 1200 — roughly 45 blocks — so the record does not stop at the line it was built to cross. The sampler continues automatically.
+The sampler ran on to **tip 1201** and stopped itself at 23:24:28, **277 samples, zero alerts across the whole run**. `epoch=1` held on all four nodes for the twelve samples after the crossing, and finality kept advancing through them — final state `tip=1201 final=1192 stall=9 regime=Final`, identical on all four.
+
+Notably `stall` was **lower** after the boundary than before it (single digits, against the 24–26 the net carried into the crossing). The reseal did not leave finality worse off.
 
 ## Evidence
 
-`~/qumbra-ops/`-style raw log for this run lives in the coordinator session's scratchpad as `epoch-soak.log` (264 samples, four nodes each). It is committed with this doc when the run ends.
+`docs/m10-epoch-boundary-soak.log` — the complete sampler record, 277 samples × four nodes, committed with this doc.
