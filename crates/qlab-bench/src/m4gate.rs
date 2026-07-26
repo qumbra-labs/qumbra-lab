@@ -2643,6 +2643,31 @@ where
             let fb = &self.consts.flush_blocks;
             let n_f0 = fb[0];
             let f0sel = |b: usize| cv(self.layout.shsel + shsel_index(fb, 0, b));
+            // 🔴 SCOPE — READ THIS BEFORE TRUSTING `w0c`/`w1c` ANYWHERE ELSE.
+            //
+            // The two gates below are F0's `shsel` columns and NOTHING ELSE, so
+            // the word-recovery constraints in this block pin `w0c`/`w1c` on
+            // F0's absorbing perms ONLY. On every other absorbing perm those
+            // columns remain exactly as they were before D3 — READ by the asm
+            // pipeline (e.g. `pzacc += preg·w0c`) but pinned to the sponge input
+            // by nothing:
+            //   * the F2 duplicate chain (the zeta openings the fold pipeline
+            //     consumes),
+            //   * the final-poly flush,
+            //   * the per-query leaf absorb blocks.
+            //
+            // This is deliberate (D3's spec is the F0 binding; issue #24) and it
+            // is the trap that comes with a partial fix: after D3 a reader greps
+            // `w0c`, finds constraints, and concludes it is pinned — generally.
+            // It is not. Unconstrained-everywhere is a gap; constrained-in-one-
+            // place-and-looking-general is worse, because the reader stops
+            // looking.
+            //
+            // The gap is issue #78's class (2) ("referenced but under-
+            // determined"), including the verified gate-widening correspondence
+            // and the counter-pressure that makes single-word tampering already
+            // UNSAT. Whether a COORDINATED tamper is caught is open and
+            // deliberately unclaimed here — that is #78's reachability triage.
             let gdir = f0sel(0);
             let gxor = (1..n_f0).map(&f0sel).fold(AB::Expr::ZERO, |a, e| a + e);
             // 17 rows x 4 u16 limbs cover the whole 68-limb keccak rate; row r
