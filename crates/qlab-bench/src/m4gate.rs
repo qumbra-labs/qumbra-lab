@@ -7287,6 +7287,14 @@ mod tests {
             qlab_air::narrow::PV_FEE + fl,
             "M3 fee is the inner-PV tail"
         );
+        // …and the guard is not vacuous: under an APPEND layout the tail check
+        // would be comparing the first f0dig limbs against the fee, and those
+        // are actually distinguishable — so it would fire rather than pass.
+        assert!(
+            (0..fl)
+                .any(|j| opvs[shape.opv_f0dig() + j] != pvs[qlab_air::narrow::PV_FEE + j] * rr),
+            "f0dig limbs coincide with the fee values — the tail guard would be vacuous"
+        );
     }
 
     /// Diagnostic (relay): column-accounting breakdown by region.
