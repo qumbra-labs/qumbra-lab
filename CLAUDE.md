@@ -95,6 +95,11 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
 
 ## Working conventions
 
+- **Language pairing — run docs and findings ship EN + `-zh`; build notes do not.** The design repo pairs everything; this repo paired nothing (88 docs, zero `-zh`) — which was never a decision, just an unstated default that drifted. The test is **who acts on it**:
+  - **Paired**: run docs and evidence packs, findings/defect analyses, runbooks and operator procedures — anything Larry reads to make a call, or an operator reads under time pressure.
+  - **Not paired**: build plans, per-baton working notes, scratch. Written by a session for a session; a translation is pure cost.
+  - EN stays **authoritative** on technical detail (design-repo convention); the `-zh` is a translation, not a fork. Cross-link both ways at the top.
+  - **Not retroactive.** Pair new docs and pair an old one when someone actually needs it. Back-filling 88 files would produce 88 translations nobody asked for and 88 more things to keep in sync.
 - Non-trivial work: `git worktree add ../qumbra-lab-<slug> -b claude/<slug>`, land via PR to `main`, post the full PR URL, clean up the worktree after merge. Trivial single-file fixes may go direct to `main`.
 - Layout: `crates/qlab-air` (the fixed-shape AIR), `crates/qlab-bench` (harness). `docs/` is scratch — polished results go to the design repo, not here.
 - Rust 2021, workspace-managed. Keep `cargo check` green on every commit.
