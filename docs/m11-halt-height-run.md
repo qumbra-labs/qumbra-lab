@@ -240,12 +240,29 @@ at `halt-arm` and prints the before/after pair in drill (a), so the comparison i
 against a recorded number rather than a remembered one. Raw evidence is appended to
 `docs/m11-halt-height-evidence.log`.
 
-**One artefact that must not be misread as a regression:** a freshly-swapped node
-reports `final=-` for a while. The finality *tracker* is not persisted (M10-T0-5 /
-S7 — it rebuilds from re-gossip); the chain's finalized head is intact on disk.
-Drill (b)'s assertion is therefore one-sided and numeric — "finality never advances
-**above H** below quorum" — not "`final` is unchanged", which would fire a false
-stop-point on every restart.
+#### Observed: `final=-` immediately after a swap, then `final=16`
+
+Not a caveat — a recorded sighting, from the pre-drill resume smoke on the real
+binary (`docs/m11-halt-height-evidence.log`):
+
+```
+TELEMETRY tip=16 final=-  stall=16 age_s=-    diff=77 … regime=Degraded halt=- hignore=0 powrej=0
+TELEMETRY tip=17 final=16 stall=1  age_s=4995 diff=77 … regime=Final    halt=- hignore=0 powrej=0
+```
+
+The freshly-swapped node reported **no finalized head at all** for its first three
+telemetry samples, then reported 16. The finality *tracker* is deliberately not
+persisted (M10-T0-5 / S7 — it rebuilds from re-gossip); the chain's finalized head
+was intact on disk the whole time and nothing was un-finalized.
+
+It is written up as an observation because an operator who has read the prose is
+still going to feel it during an upgrade, at the moment they are least able to
+afford a wrong reading. One recorded sighting of the exact lines is worth more than
+a paragraph of reassurance.
+
+The mechanical consequence: drill (b)'s assertion is one-sided and numeric —
+"finality never advances **above H** below quorum" — not "`final` is unchanged",
+which would have fired a false stop-point on every single run.
 
 **Note for §4.** §4 currently describes the second kind of outcome — blocks that
 are *accepted but can never finalize*, with the committee as the thing that keeps
@@ -412,6 +429,16 @@ The four stop-points from the task-book, and what the tooling does about each:
    marker's; or require each release to carry the boundary history. Flagged for the
    coordinator, deliberately not fixed here — choosing wrong would be worse than
    naming it.
+
+   **DECIDED by the coordinator, filed as
+   [#81](https://github.com/lai3d/qumbra-lab/issues/81), and explicitly not this
+   baton's to build:** the marker will record the frozen digest in force and the
+   gate will key on **digest equality**, with height kept as the audit record. The
+   gate's real question was never "which height did this node halt at" but "is this
+   binary's frozen parameter set the one this chain is running" — and since most
+   releases move no frozen constant, an ordinary bug-fix release digests identically
+   and simply starts. #81 is gated to land before any real halt-height upgrade after
+   the drill.
 9. **A node that voted on the old branch cannot vote for the new one at the same
    slot.** The never-double-sign ledger is doing its job, but it means a committee
    member who mined past H on the old binary and voted there has burned those slots

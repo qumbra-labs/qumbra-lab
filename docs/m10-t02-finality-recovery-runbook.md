@@ -212,12 +212,19 @@ release constant; the only way to move it is to deploy a different binary.
 
 **Two things a freshly-swapped node reports that look alarming and are not:**
 
-- **`final=-` for a while after the swap.** The finality *tracker* is deliberately
-  not persisted (M10-T0-5 / S7 — it rebuilds from re-gossip), so a just-restarted
-  node reports no finalized head until a checkpoint reaches it again. The chain's
-  finalized head is intact on disk; nothing was un-finalized. Judge the ⅔ gate by
-  whether finality ever advances **above H**, never by whether `final` momentarily
-  reads `-`.
+- **`final=-` for a while after the swap.** This is what it actually looks like,
+  from a real run:
+
+  ```
+  TELEMETRY tip=16 final=-  stall=16 age_s=-    … regime=Degraded halt=- …
+  TELEMETRY tip=17 final=16 stall=1  age_s=4995 … regime=Final    halt=- …
+  ```
+
+  The finality *tracker* is deliberately not persisted (M10-T0-5 / S7 — it rebuilds
+  from re-gossip), so a just-restarted node reports no finalized head until a
+  checkpoint reaches it again. The chain's finalized head is intact on disk;
+  nothing was un-finalized. Judge the ⅔ gate by whether finality ever advances
+  **above H**, never by whether `final` momentarily reads `-`.
 - **`hignore=` back to 0.** The refusal counters are per-process and reset with the
   container. A post-swap `hignore=0` means "new process", not "nothing was ever
   ignored". Compare against the value you recorded before the swap.
