@@ -372,6 +372,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         let regime = match t.finality_status {
             FinalityStatus::Final => "Final",
             FinalityStatus::Degraded => "Degraded",
+            FinalityStatus::Halting => "Halting",
+            FinalityStatus::Halted => "Halted",
         };
         let final_str = t.finalized_height.map(|h| h.to_string()).unwrap_or_else(|| "-".to_string());
         // S8: print `age_s=-` (not `age_s=0`) whenever there is no finalized head, so
