@@ -6986,13 +6986,133 @@ mod tests {
             t.values[23 * w + MUL_OFF + 8] += one;
         });
         // R2 scope probe: tamper an INNER public value (first inner PV, after the
-        // cap limbs). UNSAT => already bound (F0 absorb); SAT => currently free.
+        // cap limbs and the D3 f0dig block). SAT-MISS here was issue #21's R2
+        // finding and issue #24 D3's reason to exist; both now read UNSAT and
+        // are additionally locked as asserting negatives (`gate_neg_inner_pv_*`).
         probe("inner-pv: flip opvs[OPV_PVS] (first inner PV)", &|_t, opvs| {
             opvs[OPV_PVS] += one;
         });
         probe("inner-pv: flip opvs[OPV_PVS+40] (mid inner PV)", &|_t, opvs| {
             opvs[OPV_PVS + 40] += one;
         });
+    }
+
+    /// Independent keccak-256 (rate 136, pad10*1). Deliberately NOT the
+    /// recorder's `Flusher::flush`, so the `f0dig` honesty check below does not
+    /// end up verifying the recorder against itself.
+    fn keccak256(bytes: &[u8]) -> [u8; 32] {
+        let n_blocks = bytes.len() / 136 + 1;
+        let mut msg = bytes.to_vec();
+        msg.resize(n_blocks * 136, 0);
+        msg[bytes.len()] ^= 0x01;
+        msg[n_blocks * 136 - 1] ^= 0x80;
+        let mut st = [0u64; 25];
+        for blk in msg.chunks(136) {
+            for (l, lane) in blk.chunks(8).enumerate() {
+                st[l] ^= u64::from_le_bytes(lane.try_into().unwrap());
+            }
+            st = keccakf(&st);
+        }
+        let mut d = [0u8; 32];
+        for l in 0..4 {
+            d[8 * l..8 * l + 8].copy_from_slice(&st[l].to_le_bytes());
+        }
+        d
+    }
+
+    /// D3 PREMISE (issue #24): `shape_mosaic` — the `WordBind` spec written at
+    /// inc-4, never called, never validated — must actually describe the
+    /// challenger's F0 flush. Every D3 constraint reads this table, so a
+    /// one-word disagreement would pin the WRONG public value while still
+    /// looking green. Reconstructs F0's padded word stream from the mosaic + the
+    /// outer public values and compares it to the recorder's real message,
+    /// word for word, as RAW u32s (a stronger statement than the circuit's own
+    /// field-reduced form).
+    #[test]
+    fn d3_f0_mosaic_matches_the_recorded_transcript() {
+        let (sched, pvs, _) = shared();
+        let shape = GateShape::narrow();
+        let opvs = outer_pvs(sched, pvs, &shape);
+        let fb = shape.flush_blocks();
+        let msg = &sched.flushes[0].msg;
+        assert_eq!(msg.len(), shape.flush_bytes()[0], "F0 message length");
+        // pad10*1, exactly as the recorder (and the native challenger) do.
+        let mut padded = msg.clone();
+        padded.resize(fb[0] * 136, 0);
+        padded[msg.len()] ^= 0x01;
+        padded[fb[0] * 136 - 1] ^= 0x80;
+        let mut kinds = (0, 0, 0);
+        for b in 0..fb[0] {
+            let mosaic = shape_mosaic(&shape, Shape::Obs { flush: 0, block: b });
+            assert_eq!(mosaic.len(), 34, "one mosaic entry per rate word");
+            for (j, bind) in mosaic.iter().enumerate() {
+                let off = (34 * b + j) * 4;
+                let word = u32::from_le_bytes(padded[off..off + 4].try_into().unwrap());
+                let want = match bind {
+                    WordBind::Const(v) => {
+                        kinds.0 += 1;
+                        *v
+                    }
+                    // A u32 transcript word = two u16 cap limbs (LE).
+                    WordBind::Cap(i) => {
+                        kinds.1 += 1;
+                        opvs[*i].as_canonical_u32() | (opvs[*i + 1].as_canonical_u32() << 16)
+                    }
+                    // The inner PVs ride the outer interface in their transcript
+                    // (Monty-word) encoding, so the canonical representative of
+                    // the public value IS the absorbed word — no `rr` factor,
+                    // unlike the D1 merge binding over canonical u32s.
+                    WordBind::Pv(i) => {
+                        kinds.2 += 1;
+                        opvs[*i].as_canonical_u32()
+                    }
+                    other => panic!("F0 block {b} word {j}: unbindable {other:?}"),
+                };
+                assert_eq!(word, want, "F0 block {b} word {j} ({bind:?})");
+            }
+        }
+        // Narrow F0 = 3 header consts + 8·8 trace-cap words + 84 PVs + 19 pad.
+        assert_eq!(kinds, (22, 64, 84), "(Const, Cap, Pv) word counts");
+    }
+
+    /// D3 acceptance (2): the exposed `f0dig` is the honest digest of the
+    /// ordered public-value list. The message is re-serialized HERE from the
+    /// public values alone — not copied out of the recorder's flush record — so
+    /// this pins the semantics a consumer would rely on: "f0dig commits to the
+    /// caps and inner PVs this leaf claims".
+    #[test]
+    fn d3_f0dig_is_the_digest_of_the_public_surface() {
+        let (sched, pvs, _) = shared();
+        let shape = GateShape::narrow();
+        let opvs = outer_pvs(sched, pvs, &shape);
+        let deg_bits = shape.log_max - shape.log_blowup;
+        let mut bytes = Vec::with_capacity(shape.flush_bytes()[0]);
+        // deg_bits ‖ base_deg_bits ‖ preprocessed_width (transcript encoding).
+        for v in [deg_bits, deg_bits, 0] {
+            bytes.extend_from_slice(&Val::from_usize(v).to_unique_u32().to_le_bytes());
+        }
+        // trace cap (cap 0): u16 limbs, LE.
+        for i in 0..shape.cap_len * 16 {
+            bytes.extend_from_slice(&(opvs[i].as_canonical_u32() as u16).to_le_bytes());
+        }
+        // inner public values, already Monty-encoded in the opvs.
+        for i in 0..shape.n_pvs {
+            bytes.extend_from_slice(&opvs[shape.opv_pvs() + i].as_canonical_u32().to_le_bytes());
+        }
+        assert_eq!(bytes.len(), shape.flush_bytes()[0], "re-serialized F0 length");
+        let dig = keccak256(&bytes);
+        let want: Vec<Val> = dig
+            .chunks(2)
+            .map(|c| Val::from_u32(u16::from_le_bytes([c[0], c[1]]) as u32))
+            .collect();
+        assert_eq!(
+            &opvs[shape.opv_f0dig()..shape.opv_pvs()],
+            &want[..],
+            "exposed f0dig != keccak256(public surface)"
+        );
+        // …and the same digest the recorder's challenger actually produced (so
+        // the circuit's flush-output pin and this native recompute agree).
+        assert_eq!(dig, sched.flushes[0].digest, "f0dig != the F0 flush digest");
     }
 
     /// Diagnostic (relay): column-accounting breakdown by region.
@@ -7102,6 +7222,91 @@ mod tests {
         assert_unsat(move |t, _o, qr, _fd| {
             let row = qr[0];
             t.values[row * w + pcol(0)] += Val::ONE;
+        });
+    }
+
+    // -- D3 (issue #24): the leaf F0 input binding -------------------------
+    // Everything below was SAT before D3. The first two are literally the
+    // issue #21 R2 SAT-MISS probes (`tamper_coverage`), promoted from a printed
+    // map to asserting negatives — they are D3's whole point: a leaf may no
+    // longer claim a transaction surface it did not verify.
+
+    /// The first inner public value (M3's anchor limb 0).
+    #[test]
+    fn gate_neg_inner_pv_first() {
+        assert_unsat(|_t, opvs, _qr, _fd| {
+            opvs[OPV_PVS] += Val::ONE;
+        });
+    }
+
+    /// A mid-list inner public value (the same probe issue #21 committed).
+    #[test]
+    fn gate_neg_inner_pv_mid() {
+        assert_unsat(|_t, opvs, _qr, _fd| {
+            opvs[OPV_PVS + 40] += Val::ONE;
+        });
+    }
+
+    /// The LAST inner public value = the M3 fee tail, i.e. the summand the
+    /// 棒 3-3 epoch Σfee rider adds up one level higher.
+    #[test]
+    fn gate_neg_inner_pv_fee_tail() {
+        assert_unsat(|_t, opvs, _qr, _fd| {
+            opvs[N_OPVS - 1] += Val::ONE;
+        });
+    }
+
+    /// A SINGLE trace-cap limb. `gate_neg_wrong_root` had to corrupt limb 0 of
+    /// all 8 cap elements because the query-phase comparison only checks the
+    /// element that proof's query indices happen to select; F0 absorbs every
+    /// element of the trace cap unconditionally, so one limb now suffices —
+    /// and the transcript can no longer be built over a different cap than the
+    /// one the queries are checked against.
+    #[test]
+    fn gate_neg_f0_single_cap_limb() {
+        assert_unsat(|_t, opvs, _qr, _fd| {
+            opvs[cap_limb_opv(0, 3, 5)] += Val::ONE;
+        });
+    }
+
+    /// The exposed public-surface digest (issue #21 R2) is pinned to F0's
+    /// actual flush output — first limb…
+    #[test]
+    fn gate_neg_f0dig_first() {
+        assert_unsat(|_t, opvs, _qr, _fd| {
+            opvs[OPV_F0DIG] += Val::ONE;
+        });
+    }
+
+    /// …and last limb.
+    #[test]
+    fn gate_neg_f0dig_last() {
+        assert_unsat(|_t, opvs, _qr, _fd| {
+            opvs[OPV_PVS - 1] += Val::ONE;
+        });
+    }
+
+    /// The routed-word columns themselves. `w0c`/`w1c` have been FILLED since
+    /// inc-4 and constrained by nothing until D3; row 0 of F0 block 0 (lane perm
+    /// 0) carries the degree-bits header word.
+    #[test]
+    fn gate_neg_f0_recovered_word() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, _qr, _fd| {
+            t.values[W0C] += Val::ONE;
+            let _ = w;
+        });
+    }
+
+    /// The XOR-mode recovery witness. F0 block 1 (lane perm 1, row 24) is the
+    /// first XOR block: its message is `preimage XOR oreg`, recovered bit by
+    /// bit. A lying bit witness is caught either by the bit boolean or by the
+    /// 16-bit recomposition of the preimage limb.
+    #[test]
+    fn gate_neg_f0_xor_bit() {
+        let w = GATE_WIDTH;
+        assert_unsat(move |t, _o, _qr, _fd| {
+            t.values[24 * w + PBIT] += Val::ONE;
         });
     }
 
