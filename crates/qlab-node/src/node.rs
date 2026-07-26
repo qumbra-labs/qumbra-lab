@@ -44,9 +44,18 @@ pub enum NodeError {
     /// The block does not extend the current tip (`header.prev != tip_hash`).
     /// This skeleton applies to the tip only; fork/reorg handling is N-later.
     NotExtendingTip { expected: Hash32, got: Hash32 },
-    /// Block-body validation failed (anchor not final / wrong fee / in-block
-    /// double-spend / invalid proof).
+    /// Block-body validation failed (header/body commitment mismatch, anchor not
+    /// final, wrong fee, in-block double-spend, or invalid proof).
     Body(BodyError),
+    /// A [`StoredBlock`] reaching the state-mutation funnel does not match its own
+    /// header's `tx_body_commitment` (issue #77).
+    ///
+    /// Deliberately **distinct** from `Body(BodyError::CommitmentMismatch)`: that
+    /// one is an adversarial object rejected at an entry point, this one means a
+    /// block was assembled internally without the binding, or a replayed log
+    /// record was corrupted or tampered with on disk. Same invariant, different
+    /// culprit — do not merge the two.
+    BodyCommitmentMismatch { height: u64, expected: Hash32, got: Hash32 },
     /// A nullifier is already in the permanent set (a cross-block double-spend).
     NullifierSpent { tx: usize },
     /// The chain store rejected the header (bad parent / height / duplicate).
@@ -65,6 +74,13 @@ impl std::fmt::Display for NodeError {
                 hex8(got)
             ),
             NodeError::Body(e) => write!(f, "block body invalid: {e:?}"),
+            NodeError::BodyCommitmentMismatch { height, expected, got } => write!(
+                f,
+                "block at height {height} does not match its header's body commitment: \
+                 header says {}, body hashes to {}",
+                hex8(expected),
+                hex8(got)
+            ),
             NodeError::NullifierSpent { tx } => {
                 write!(f, "tx {tx} double-spends an already-nullified note")
             }
@@ -78,6 +94,46 @@ impl std::error::Error for NodeError {}
 
 fn hex8(h: &Hash32) -> String {
     h[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The header/body binding re-checked at the **state-mutation funnel**
+/// (issue #77 P3, Addendum A1/A2).
+///
+/// [`Node::apply_state`] is the single door into node state — `apply_block` and
+/// disk-log replay both pass through it — so checking here covers what the
+/// entry-point check in [`validate_body`] structurally cannot: a future caller
+/// that assembles a [`StoredBlock`] by hand, and a replayed log record whose
+/// bytes were corrupted or tampered with on disk (replay deserializes
+/// `LogRecord::Block` straight into `apply_state`, never through
+/// `StoredBlock::from_parts`).
+///
+/// This is a **different job** from the entry check, not a substitute for it:
+/// entry points reject adversarial input first and cheapest (P1); this catches
+/// internal construction errors and replay damage. Both are kept.
+///
+/// Cost on replay is one Keccak pass over each block's bytes — bytes replay has
+/// already paid to read off disk and deserialize, which costs strictly more.
+///
+/// **Genesis (height 0) is the single, deliberate exemption.** The devnet genesis
+/// header pins `tx_body_commitment = ZERO_HASH` (`header.rs:107`) while an empty
+/// body commits to `keccak256(coinbase_le)`, so genesis has never satisfied the
+/// invariant; its hash is the frozen, operator-supplied network identity
+/// (`4a75b3b8…c2c3`) and it is never sourced from the network. Changing it would
+/// mean a new network, which is out of this fix's scope — see issue #77 finding
+/// F1 and `qlab_devnet::body::tests::genesis_header_does_not_bind_its_empty_body`.
+fn check_stored_binding(block: &StoredBlock) -> Result<(), NodeError> {
+    if block.header.height == 0 {
+        return Ok(()); // genesis — the documented exemption above
+    }
+    let got = block.body().commitment();
+    if block.header.tx_body_commitment != got {
+        return Err(NodeError::BodyCommitmentMismatch {
+            height: block.header.height,
+            expected: block.header.tx_body_commitment,
+            got,
+        });
+    }
+    Ok(())
 }
 
 /// Read-only view of the node's consensus state — the interface tx admission
@@ -155,6 +211,10 @@ impl MemNode {
             match rec {
                 LogRecord::Block(b) if b.header.height <= applied_height => {
                     // Derived state already restored — just rebuild the chain store.
+                    // The binding is still checked (issue #77): this path skips
+                    // `apply_state`, so it would otherwise be the one way a
+                    // corrupted log record enters the node unchallenged.
+                    check_stored_binding(b)?;
                     node.chain.put_block(b.clone()).map_err(NodeError::Chain)?;
                 }
                 LogRecord::Block(b) => {
@@ -238,10 +298,12 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
                 got: header.prev,
             });
         }
-        // Read-only body validation (anchor closure borrows self immutably).
+        // Read-only body validation (anchor closure borrows self immutably). The
+        // header goes in too (issue #77): the body must be the one this header
+        // committed to, checked before any other body work.
         {
             let anchor_ok = |root: &Hash32| self.is_valid_anchor(root);
-            validate_body(&body, verifier, anchor_ok).map_err(NodeError::Body)?;
+            validate_body(&header, &body, verifier, anchor_ok).map_err(NodeError::Body)?;
         }
         let block = StoredBlock::from_parts(&header, &body);
         let hash = self.apply_state(&block)?;
@@ -256,6 +318,10 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// commitments, insert its nullifiers, and record the resulting root at this
     /// height. Used by both [`Self::apply_block`] and replay.
     fn apply_state(&mut self, block: &StoredBlock) -> Result<Hash32, NodeError> {
+        // The funnel guard (issue #77): every state mutation — fresh application
+        // and disk-log replay alike — passes through here, so the header/body
+        // binding is re-established before anything is folded into state.
+        check_stored_binding(block)?;
         // Reject any nullifier already spent, or repeated within this block,
         // BEFORE mutating — so a rejected block leaves state untouched.
         let mut seen: Vec<Hash32> = Vec::new();

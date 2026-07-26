@@ -27,7 +27,7 @@ use qlab_air::narrow::BucketInstance;
 use qlab_devnet::body::{validate_body, BlockBody, TxEntry, TxPublic, TxVerifier};
 use qlab_devnet::committee::{devnet_committee, CommitteeState, Vote};
 use qlab_devnet::fees::{posted_fee, ArityBucket};
-use qlab_devnet::header::Hash32;
+use qlab_devnet::header::{BlockHeader, Hash32};
 use qlab_devnet::node::{Node, SimConfig};
 use qlab_devnet::params_devnet::{BOND_AMOUNT, CHECKPOINT_CADENCE_BLOCKS, COMMITTEE_SIZE, SIM_BLOCK_TIME_SECS};
 use qlab_devnet::pow::KeccakPow;
@@ -137,10 +137,15 @@ pub fn run_m6devnet(power: &str) {
     let final_anchors: Vec<Hash32> = pool.iter().map(|(inst, _, _)| h32(&inst.anchor)).collect();
     let is_final = |r: &Hash32| final_anchors.contains(r);
 
+    // The header this body belongs to (issue #77): validation is header-aware, so
+    // the measured figure now includes the O(block bytes) binding hash as well as
+    // the proof verifies — which is the point, that is what a node actually pays.
+    let header = BlockHeader::child_of(&BlockHeader::genesis(1, 0), 0, 1, body.commitment());
+
     let mut best_block_ms = f64::INFINITY;
     for _ in 0..RUNS {
         let t = Instant::now();
-        validate_body(&body, &verifier, is_final).expect("block body must validate");
+        validate_body(&header, &body, &verifier, is_final).expect("block body must validate");
         best_block_ms = best_block_ms.min(t.elapsed().as_secs_f64() * 1e3);
     }
     let per_tx = best_block_ms / POOL as f64;
@@ -240,7 +245,8 @@ mod tests {
         };
         let anchor = h32(&inst.anchor);
         let body = BlockBody { txs: vec![entry], coinbase: 0 };
-        assert!(validate_body(&body, &MockOk, |r: &Hash32| *r == anchor).is_ok());
+        let header = BlockHeader::child_of(&BlockHeader::genesis(1, 0), 0, 1, body.commitment());
+        assert!(validate_body(&header, &body, &MockOk, |r: &Hash32| *r == anchor).is_ok());
         // h32 round-trips a digest into 32 bytes.
         assert_eq!(h32(&[0, 0, 0, 0]), [0u8; 32]);
     }

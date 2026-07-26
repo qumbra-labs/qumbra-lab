@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use qlab_devnet::body::{validate_body, BlockBody, TxEntry};
+use qlab_devnet::body::{validate_body, BlockBody, BodyError, TxEntry};
 use qlab_devnet::chain::{ChainState, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, MemberStatus, Validator, Vote};
 use qlab_devnet::ebbflow::{
@@ -409,12 +409,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
     }
 
     fn ingest_block(&mut self, header: BlockHeader, body: BlockBody) -> IngestOutcome {
-        // 1. Body validity is independent of tip-extension: an invalid tx proof /
-        //    fee / in-block double-spend / non-final anchor is adversarial and must
-        //    be rejected + penalized regardless of fork position.
+        // 1. Body validity is independent of tip-extension: a body that is not the
+        //    one this header committed to (issue #77), or an invalid tx proof /
+        //    fee / in-block double-spend / non-final anchor, is adversarial and must
+        //    be rejected + penalized regardless of fork position. `validate_body`
+        //    checks the header/body binding first — it is the cheapest rejection
+        //    and, for the empty-body relay, the only one that fires.
         let anchor_ok = |root: &Hash32| self.state.is_valid_anchor(root);
-        if validate_body(&body, &self.verifier, anchor_ok).is_err() {
-            return IngestOutcome::Rejected("bad body");
+        match validate_body(&header, &body, &self.verifier, anchor_ok) {
+            Ok(()) => {}
+            // Distinct reason string: a mismatch is unambiguous misbehaviour by
+            // whoever handed us the pair, not a merely invalid transaction.
+            Err(BodyError::CommitmentMismatch { .. }) => {
+                return IngestOutcome::Rejected("body does not match header commitment")
+            }
+            Err(_) => return IngestOutcome::Rejected("bad body"),
         }
         // 2. Header into the consensus chain (PoW / fork-choice).
         let outcome = self.submit_header(header);

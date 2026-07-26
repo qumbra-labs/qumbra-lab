@@ -706,6 +706,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             return;
         }
+        // A rejected block must not be cached or re-announced, and whoever handed
+        // it to us pays for it (issue #77 P2). This is the compact-reconstruction
+        // seam: the announcer controls the prefilled txs and the short-id salt, so
+        // "reconstruction succeeded" is no evidence the body is the header's body —
+        // that verdict comes from `ingest_block`, and until this commit it was
+        // being computed and then discarded, so a mismatched body would have been
+        // stored and relayed onward.
+        if let IngestOutcome::Rejected(_) = outcome {
+            if let Some(peer) = except {
+                self.peers.penalize(peer, PENALTY_INVALID_OBJECT);
+            }
+            return;
+        }
         self.blocks.insert(bh, (txs, ann.coinbase));
         self.seen.insert(bh);
         let payload = encode_announce(&ann);
