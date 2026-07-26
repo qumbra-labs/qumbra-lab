@@ -32,7 +32,6 @@
 //! stays generic over the injected `V` ([`crate::verifier::NodeVerifier`] dispatches
 //! the two at runtime); the tests below drive it with the rehearsal stand-in.
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -46,31 +45,18 @@ use qlab_devnet::pow::PowEngine;
 use qlab_node::recovery::{Finalizer, FinalizerState};
 use qlab_node::Telemetry;
 
+use qlab_p2p::addrman::{AddrManager, DIAL_RETRY_INTERVAL_MS};
 use qlab_p2p::adapter::{MiningClock, NodeAdapter};
 use qlab_p2p::n1::ChainView;
-use qlab_p2p::peer::PeerId;
-use qlab_p2p::transport::{TcpTransport, Transport};
+use qlab_p2p::transport::TcpTransport;
 use qlab_p2p::P2pNode;
 
-/// How often [`RunningNode::run_until`] re-checks configured peers for re-dial (S9).
-const REDIAL_INTERVAL: Duration = Duration::from_secs(5);
-/// First backoff after a failed dial; doubles up to [`REDIAL_BACKOFF_MAX`].
-const REDIAL_BACKOFF_START: Duration = Duration::from_secs(1);
-/// Cap on the re-dial backoff, so a long partition still retries regularly.
-const REDIAL_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// How often [`RunningNode::run_until`] runs a discovery maintenance pass —
+/// re-dial, auto-connect, ask for addresses (issue #83; was `REDIAL_INTERVAL`).
+const MAINTAIN_INTERVAL: Duration = Duration::from_millis(DIAL_RETRY_INTERVAL_MS);
 
-/// Per-configured-peer re-dial state (S9): the handle of the last connection dialed
-/// to this address (if any) and when the next retry is due.
-struct RedialSlot {
-    /// The transport handle of the last dial to this addr; `None` if never dialed or
-    /// the dial failed. A slot is "connected" iff this pid is still live in the
-    /// transport's peer set.
-    pid: Option<PeerId>,
-    /// Earliest instant a fresh dial to this addr may be attempted.
-    next_retry: Instant,
-    /// Current backoff after consecutive failures.
-    backoff: Duration,
-}
+/// The persisted address book, under the node's data dir (issue #83 scope 7).
+const ADDRBOOK_FILE: &str = "peers.dat";
 
 use crate::config::NodeConfig;
 use crate::genesis::{GenesisError, GenesisFile};
@@ -203,12 +189,11 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     sample_interval: Duration,
     /// When the last telemetry sample was emitted.
     last_sample: Instant,
-    /// Configured peer addresses this node keeps a connection to (S9).
-    dial_peers: Vec<String>,
-    /// Per-peer re-dial state, keyed by configured address.
-    redial: HashMap<String, RedialSlot>,
-    /// When re-dial was last checked.
-    last_redial: Instant,
+    /// When the last discovery maintenance pass ran.
+    last_maintain: Instant,
+    /// Process start, the origin of the monotonic millisecond clock the discovery
+    /// policy is driven by.
+    started: Instant,
     /// This process's release constants (issue #74) — the compile-time [`RELEASE`]
     /// in the binary; tests may drive [`RunningNode::start_with_release`] directly.
     release: Release,
@@ -301,28 +286,32 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         let node_id = node_id_from_addr(&bound);
         let mut p2p = P2pNode::new(transport, adapter, node_id);
 
-        // (6) Dial configured peers (connect, then register — connect borrows the
-        //     transport immutably, add_peer borrows p2p mutably). Each configured addr
-        //     also seeds a re-dial slot so a dropped/failed peer is reconnected without
-        //     a process restart (S9).
-        let now = Instant::now();
-        let mut redial: HashMap<String, RedialSlot> = HashMap::new();
-        let mut dialed = Vec::new();
+        // (6) Peer discovery (issue #83). The address book is restored from disk if a
+        //     previous run persisted one, the configured `dial_peers` are (re-)applied
+        //     as never-evicted SEEDS, and our own address is advertised only if the
+        //     operator declared us reachable. Connecting is then the ordinary
+        //     maintenance pass — the same single dial path used for the rest of the
+        //     process's life, so seeds and learned addresses share one cap and one
+        //     backoff ladder (the S9 re-dial behaviour moved there unchanged).
+        let mut addrs = match std::fs::read(config.data_dir.join(ADDRBOOK_FILE)) {
+            Ok(bytes) => AddrManager::from_bytes(&bytes).unwrap_or_else(|e| {
+                eprintln!("address book unreadable ({e}); starting from seeds");
+                AddrManager::new()
+            }),
+            Err(_) => AddrManager::new(),
+        };
         for addr in &config.dial_peers {
-            match p2p.transport().connect(addr) {
-                Ok(pid) => {
-                    dialed.push((pid, addr.clone()));
-                    redial.insert(addr.clone(), RedialSlot { pid: Some(pid), next_retry: now, backoff: REDIAL_BACKOFF_START });
-                }
-                Err(e) => {
-                    eprintln!("dial {addr} failed: {e}");
-                    redial.insert(addr.clone(), RedialSlot { pid: None, next_retry: now, backoff: REDIAL_BACKOFF_START });
-                }
-            }
+            addrs.add_seed(addr.clone());
         }
-        for (pid, addr) in dialed {
-            p2p.add_peer(pid, Some(addr));
+        addrs.set_self_advertise(config.advertise_addr.clone());
+        if config.advertise_addr.is_none() {
+            println!(
+                "no advertise_addr: this node will sync, mine and transact but will \
+                 not be gossiped to other peers (expected behind a router)"
+            );
         }
+        *p2p.addrs_mut() = addrs;
+        p2p.maintain(0); // dial the seeds now
 
         Ok(RunningNode {
             p2p,
@@ -339,9 +328,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             // `docker compose logs -t` to wall-clock-stamp each line).
             sample_interval: Duration::from_secs(30),
             last_sample: Instant::now(),
-            dial_peers: config.dial_peers.clone(),
-            redial,
-            last_redial: Instant::now(),
+            last_maintain: Instant::now(),
+            started: Instant::now(),
             release,
             halt_at: release.halt_at(),
             marker_final_written: marker.is_some_and(|m| m.boundary_finalized),
@@ -445,11 +433,16 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // "which layer rejected the old branch?" question is answered from these two
         // numbers in the logs, not from a narrative.
         let ic = node.ingest_counters();
+        // `dialable/known` is the NAT re-open trigger, condition 3 of Larry's
+        // decision: it must fire on a MEASUREMENT, not on someone's memory that the
+        // question was deferred. If this ratio collapses toward "only the seeds are
+        // dialable", that is the signal to build NAT traversal.
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{}",
             t.tip_height, final_str, t.stall_depth, age_str, tip_diff,
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
+            self.p2p.addrs().dialable_count(), self.p2p.addrs().known_count(),
         )
     }
 
@@ -513,7 +506,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     fn persist_finalizers(&self) {
         for f in &self.finalizers {
             let path = finalizer_state_path(&self.data_dir, f.index());
-            if let Err(e) = write_finalizer_state(&path, &f.state().to_bytes()) {
+            if let Err(e) = write_file_durably(&path, &f.state().to_bytes()) {
                 eprintln!("persist finalizer {} failed: {e}", f.index());
             }
         }
@@ -525,54 +518,33 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         &mut self.finalizers
     }
 
-    /// Re-dial any configured peer that is not currently connected, with backoff (S9).
-    /// A configured peer whose last dial handle is still live in the transport is
-    /// skipped (no duplicate connection); a dropped or never-established one is dialed
-    /// again once its backoff elapses — so a healed partition reconnects WITHOUT a
-    /// process restart.
-    pub fn try_redial(&mut self) {
-        let now = Instant::now();
-        let live: std::collections::HashSet<PeerId> =
-            self.p2p.transport().peers().into_iter().collect();
-        // Decide which addrs to dial first (read-only borrow), then dial (mut borrow).
-        let to_dial: Vec<String> = self
-            .dial_peers
-            .iter()
-            .filter(|addr| {
-                let slot = self.redial.get(*addr);
-                let connected = slot.and_then(|s| s.pid).is_some_and(|pid| live.contains(&pid));
-                let due = slot.map_or(true, |s| now >= s.next_retry);
-                !connected && due
-            })
-            .cloned()
-            .collect();
-        for addr in to_dial {
-            match self.p2p.transport().connect(&addr) {
-                Ok(pid) => {
-                    self.p2p.add_peer(pid, Some(addr.clone()));
-                    self.redial.insert(
-                        addr,
-                        RedialSlot { pid: Some(pid), next_retry: now, backoff: REDIAL_BACKOFF_START },
-                    );
-                }
-                Err(_) => {
-                    let backoff = self
-                        .redial
-                        .get(&addr)
-                        .map_or(REDIAL_BACKOFF_START, |s| (s.backoff * 2).min(REDIAL_BACKOFF_MAX));
-                    self.redial
-                        .insert(addr, RedialSlot { pid: None, next_retry: now + backoff, backoff });
-                }
-            }
-        }
+    /// One discovery maintenance pass (issue #83): reconnect anything dropped
+    /// (the S9 property — a healed partition reconnects with NO process restart),
+    /// auto-connect to learned addresses under the outbound cap, and ask peers for
+    /// more addresses on the per-peer rate limit. Returns dials made.
+    ///
+    /// This replaced the old `try_redial`: seeds and learned addresses now share
+    /// one dial path, one cap and one backoff ladder, because two dial paths with
+    /// different caps is how a node exceeds a limit it believes it is enforcing.
+    pub fn maintain_peers(&mut self) -> usize {
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        self.p2p.maintain(now_ms)
     }
 
-    /// Test hook: clear all re-dial backoffs so the next [`Self::try_redial`] attempts
-    /// immediately (used to exercise partition-heal without wall-clock waits).
+    /// Test/ops hook: clear every dial backoff so the next maintenance pass
+    /// attempts immediately (partition-heal without wall-clock waits).
     pub fn force_redial_ready(&mut self) {
-        let now = Instant::now();
-        for slot in self.redial.values_mut() {
-            slot.next_retry = now;
+        self.p2p.addrs_mut().force_retry_ready();
+    }
+
+    /// Persist the address book (dialable entries only) under the data dir, so a
+    /// restart does not collapse back to "seeds only" — which is precisely the
+    /// state the NAT re-open trigger watches for, and manufacturing it would make
+    /// that measurement lie. Best-effort: a write failure is logged, not fatal.
+    pub fn save_addr_book(&self) {
+        let path = self.data_dir.join(ADDRBOOK_FILE);
+        if let Err(e) = write_file_durably(&path, &self.p2p.addrs().to_bytes()) {
+            eprintln!("persist address book failed: {e}");
         }
     }
 
@@ -654,18 +626,19 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 // nothing on a net that never halts.
                 self.maintain_halt_marker();
             }
-            if self.last_redial.elapsed() >= REDIAL_INTERVAL {
-                self.try_redial(); // reconnect any dropped configured peer (S9)
-                self.last_redial = Instant::now();
+            if self.last_maintain.elapsed() >= MAINTAIN_INTERVAL {
+                self.maintain_peers(); // re-dial, auto-connect, ask for addresses (#83)
+                self.last_maintain = Instant::now();
             }
             if n == 0 {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-        // Graceful shutdown = snapshot flush.
+        // Graceful shutdown = snapshot flush + the learned address book.
         if let Err(e) = self.save_snapshot() {
             eprintln!("snapshot flush on shutdown failed: {e}");
         }
+        self.save_addr_book();
     }
 }
 
@@ -680,8 +653,8 @@ fn finalizer_state_path(data_dir: &std::path::Path, index: usize) -> std::path::
     data_dir.join(format!("finalizer-{index}.state"))
 }
 
-/// Write a finalizer ledger durably (create the data dir if needed, fsync the file).
-fn write_finalizer_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Write a file durably (create the parent dir if needed, fsync the file).
+fn write_file_durably(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -696,6 +669,7 @@ mod tests {
     use super::*;
     use crate::genesis::GenesisFile;
     use qlab_devnet::pow::KeccakPow;
+    use qlab_p2p::transport::Transport;
     use std::path::PathBuf;
 
     /// A test rig: temp data dir + genesis file + all-21 committee key files, and a
@@ -712,6 +686,7 @@ mod tests {
             data_dir: base.join("data"),
             listen_addr: "127.0.0.1:0".to_string(),
             dial_peers: vec![],
+            advertise_addr: None,
             genesis_file: gpath,
             committee_key_paths: keys, // hold all 21 → this node can finalize
             mining,
@@ -938,17 +913,147 @@ mod tests {
 
         // Re-dial reconnects A to B with no restart.
         a.force_redial_ready();
-        a.try_redial();
+        a.maintain_peers();
         assert_eq!(a.p2p().transport().peers().len(), 1, "re-dial reconnected the healed peer");
 
         // A second re-dial does NOT open a duplicate connection to the live peer.
         a.force_redial_ready();
-        a.try_redial();
+        a.maintain_peers();
         assert_eq!(a.p2p().transport().peers().len(), 1, "no duplicate dial to a connected peer");
 
         drop(b);
         let _ = std::fs::remove_dir_all(&abase);
         let _ = std::fs::remove_dir_all(&bbase);
+    }
+
+    // ================= peer discovery over real TCP (issue #83) =================
+
+    /// Reserve a free loopback port and release it (the address is then free to
+    /// bind by a node we start next).
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let p = l.local_addr().unwrap().port();
+        drop(l);
+        p
+    }
+
+    /// Pump every node's message loop a few times so handshakes/replies land.
+    fn pump(nodes: &mut [&mut RunningNode<KeccakPow, DevnetRehearsalVerifier>], rounds: usize) {
+        for _ in 0..rounds {
+            for n in nodes.iter_mut() {
+                n.step_once();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// ACCEPTANCE item 1 over the real socket — a node that knows ONE address ends
+    /// up connected to the whole net; and ACCEPTANCE item 2's serving direction:
+    /// the joiner has no `advertise_addr` (it is behind a router), so it is never
+    /// gossiped and never enters anyone's book.
+    #[test]
+    fn seed_only_node_learns_the_net_and_an_undialable_one_is_never_gossiped() {
+        let (b_port, c_port) = (free_port(), free_port());
+        let (b_addr, c_addr) = (format!("127.0.0.1:{b_port}"), format!("127.0.0.1:{c_port}"));
+
+        // C listens and advertises; B listens, advertises, and seeds C.
+        let (mut ccfg, cgen, cbase) = rig("disc_c", false);
+        ccfg.listen_addr = c_addr.clone();
+        ccfg.advertise_addr = Some(c_addr.clone());
+        let mut c = RunningNode::start(&ccfg, &cgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+
+        let (mut bcfg, bgen, bbase) = rig("disc_b", false);
+        bcfg.listen_addr = b_addr.clone();
+        bcfg.advertise_addr = Some(b_addr.clone());
+        bcfg.dial_peers = vec![c_addr.clone()];
+        let mut b = RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+
+        // A knows only B, and declares no address of its own (outbound-only).
+        let (mut acfg, agen, abase) = rig("disc_a", false);
+        acfg.dial_peers = vec![b_addr.clone()];
+        acfg.advertise_addr = None;
+        let mut a = RunningNode::start(&acfg, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        assert_eq!(a.p2p().addrs().known(), vec![b_addr.clone()], "one seed, nothing else");
+
+        pump(&mut [&mut a, &mut b, &mut c], 5);
+        a.maintain_peers(); // ask B for addresses
+        pump(&mut [&mut a, &mut b, &mut c], 5);
+        a.maintain_peers(); // dial what we learned
+        pump(&mut [&mut a, &mut b, &mut c], 5);
+
+        assert!(
+            a.p2p().addrs().known().contains(&c_addr),
+            "A learned C from B: {:?}",
+            a.p2p().addrs().known()
+        );
+        assert_eq!(a.p2p().addrs().dialable_count(), 2, "and connected to both");
+        assert_eq!(a.p2p().transport().peers().len(), 2, "two live sockets");
+
+        // The joiner is never gossiped: B's book holds C and nothing of A's, even
+        // though A is connected to B right now.
+        assert_eq!(b.p2p().addrs().known(), vec![c_addr.clone()], "A is in nobody's book");
+        assert!(b.p2p().transport().peers().len() >= 1, "…while A is genuinely connected to B");
+
+        // The re-open trigger is a measurement, and it is in the telemetry line.
+        let sample = a.telemetry_sample();
+        assert!(sample.contains("dialable=2/2"), "telemetry carries the ratio: {sample}");
+
+        drop(a);
+        drop(b);
+        drop(c);
+        for base in [abase, bbase, cbase] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// ACCEPTANCE item 4 — learned addresses survive a restart. The restarted node
+    /// is configured with NO seeds at all, so everything it knows came off disk.
+    #[test]
+    fn the_address_book_survives_a_restart() {
+        let b_port = free_port();
+        let b_addr = format!("127.0.0.1:{b_port}");
+        let (mut bcfg, bgen, bbase) = rig("book_b", false);
+        bcfg.listen_addr = b_addr.clone();
+        bcfg.advertise_addr = Some(b_addr.clone());
+        let b = RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+
+        let (mut acfg, agen, abase) = rig("book_a", false);
+        acfg.dial_peers = vec![b_addr.clone()];
+        let mut a = RunningNode::start(&acfg, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        a.maintain_peers();
+        assert_eq!(a.p2p().addrs().dialable_count(), 1);
+        a.save_addr_book();
+        drop(a);
+
+        // Restart with an EMPTY seed list: whatever it knows was restored from disk.
+        let mut acfg2 = acfg.clone();
+        acfg2.dial_peers = vec![];
+        let a2 = RunningNode::start(&acfg2, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        assert_eq!(a2.p2p().addrs().known(), vec![b_addr.clone()], "restored from peers.dat");
+        assert_eq!(a2.p2p().addrs().dialable_count(), 1);
+        assert_eq!(
+            a2.p2p().transport().peers().len(),
+            1,
+            "and it reconnects from the restored book alone"
+        );
+
+        drop(a2);
+        drop(b);
+        let _ = std::fs::remove_dir_all(&abase);
+        let _ = std::fs::remove_dir_all(&bbase);
+    }
+
+    /// A corrupt or unknown-version `peers.dat` must not stop a node from starting —
+    /// the book is a cache, the seeds are the authority (S4).
+    #[test]
+    fn a_corrupt_address_book_is_ignored_at_startup() {
+        let (config, genesis, base) = rig("book_bad", false);
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        std::fs::write(config.data_dir.join(ADDRBOOK_FILE), [0xFF, 0x00, 0x00]).unwrap();
+        let node = RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier)
+            .expect("an unreadable book is not fatal");
+        assert_eq!(node.p2p().addrs().known_count(), 0);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
