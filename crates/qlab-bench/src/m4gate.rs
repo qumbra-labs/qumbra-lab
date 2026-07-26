@@ -6614,6 +6614,17 @@ mod tests {
         //   after:  868·4 = 3472 bytes → 3472/136 = 25 → 26 blocks   (25.53 → 25)
         // merge_perms = 2·blocks + 1 → 2·26 + 1 = 53, unchanged. The next
         // boundary is at 3536 bytes (884 values); D3 lands 16 values short of it.
+        // The interior's own rectangle width: n_pvs reaches the layout only via
+        // `flush_blocks` (→ n_shapes_obs, bidx_width) and `merge_perms`, and all
+        // three are unchanged, so the interior rectangle does NOT widen — the
+        // load-bearing fact for the b2/q86 32 GB envelope (memory scales with
+        // width × height; D3's cost is constraint-eval time, not footprint).
+        // (Unchanged by inspection of `from_shape`: its only n_pvs-sensitive
+        // inputs are exactly the three quantities asserted here, and all three
+        // hold their pre-D3 values.)
+        assert_eq!(GateLayout::from_shape(&w).gate_width, 3915, "interior width unchanged");
+        assert_eq!(w.n_shapes_obs(), 46, "wide obs-shape count unchanged");
+        assert_eq!(w.bidx_width(), 29, "wide block one-hot width unchanged");
         assert_eq!(w.n_pvs * 4, 3472, "merge message bytes per child");
         assert_eq!(w.n_pvs * 4 / 136 + 1, 26, "merge blocks per child (was 26)");
         assert_eq!(w.merge_perms(), 53, "msh ring width unchanged");
@@ -6995,6 +7006,49 @@ mod tests {
         probe("inner-pv: flip opvs[OPV_PVS+40] (mid inner PV)", &|_t, opvs| {
             opvs[OPV_PVS + 40] += one;
         });
+    }
+
+    /// D3: the F0 mosaic must be TOTAL for both shapes — every rate word of
+    /// every F0 block classified as Const / Cap / Pv, i.e. bindable. `eval`
+    /// panics on anything else (an unbound word would be a silent hole), and
+    /// the interior's F0 is 28 blocks over 868 inner PVs, so this covers the
+    /// wide side without paying for a leaf prove.
+    #[test]
+    fn d3_f0_mosaic_is_total_for_both_shapes() {
+        for (name, shape) in [("narrow", GateShape::narrow()), ("wide", GateShape::wide())] {
+            let fb = shape.flush_blocks();
+            let (mut consts, mut caps, mut pvs) = (0usize, 0usize, 0usize);
+            let mut seen_pv = vec![false; shape.n_pvs];
+            let mut seen_cap = vec![false; shape.cap_len * 16];
+            for b in 0..fb[0] {
+                let mosaic = shape_mosaic(&shape, Shape::Obs { flush: 0, block: b });
+                assert_eq!(mosaic.len(), 34, "{name} F0 block {b}");
+                for (j, bind) in mosaic.iter().enumerate() {
+                    match bind {
+                        WordBind::Const(_) => consts += 1,
+                        WordBind::Cap(i) => {
+                            caps += 1;
+                            // Only the TRACE cap (cap 0) rides F0.
+                            assert!(*i + 1 < shape.cap_len * 16, "{name}: F0 cap word {j} of {b}");
+                            seen_cap[*i] = true;
+                            seen_cap[*i + 1] = true;
+                        }
+                        WordBind::Pv(i) => {
+                            pvs += 1;
+                            let k = *i - shape.opv_pvs();
+                            assert!(!seen_pv[k], "{name}: inner PV {k} bound twice");
+                            seen_pv[k] = true;
+                        }
+                        other => panic!("{name}: F0 block {b} word {j} is {other:?} — unbindable"),
+                    }
+                }
+            }
+            assert_eq!(consts + caps + pvs, 34 * fb[0], "{name}: every F0 word classified");
+            assert_eq!(pvs, shape.n_pvs, "{name}: every inner PV absorbed exactly once");
+            assert!(seen_pv.iter().all(|x| *x), "{name}: an inner PV is never absorbed");
+            assert!(seen_cap.iter().all(|x| *x), "{name}: a trace-cap limb is never absorbed");
+            assert_eq!(caps, shape.cap_len * 8, "{name}: 8 words per cap digest");
+        }
     }
 
     /// Independent keccak-256 (rate 136, pad10*1). Deliberately NOT the
