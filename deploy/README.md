@@ -35,7 +35,14 @@ It writes a local hosts spec (`127.0.0.1:9401..9404`, ssh target `-`), invokes
 `qumbra-node check` passing on every node with a single shared pinned genesis
 hash. Exits non-zero on the first failed assertion.
 
-## Phase B-WAN — VPS provisioning requirements **[manual — Larry]**
+## Phase B-WAN — VPS provisioning requirements **[manual — Larry]** ✅ DISCHARGED 2026-07-26
+
+> **The gate is closed and the net is live since 2026-07-26 15:43.** Provisioning is no longer manual: it is
+> Terraform in the private [`qumbra-deploy`](https://github.com/lai3d/qumbra-deploy) repo — 4 × `t4g.small`
+> (Graviton/arm64, Debian 12) across us-east-1 · eu-west-1 · ap-southeast-1 · ap-northeast-1, measured
+> inter-node RTT **68–223 ms**. Operations run as **T-ops**; the live state lives in `qumbra-deploy/OPERATOR.md`.
+> The requirements below are preserved as the record of what was asked for and why — several of them were
+> confirmed by the build, and one was **wrong in a way worth keeping visible**: see the NAT note at the end.
 
 Written by the coordinator 2026-07-25 against the issue #64 `[manual]` clause, what
 this tooling actually needs from a host, and the **measured** Phase B-lite resource
@@ -78,7 +85,7 @@ and a re-run after T0-5 — budget roughly a week of uptime on four small instan
 
 [#70]: https://github.com/lai3d/qumbra-lab/issues/70
 
-## Phase B — the real 4-VPS deploy (gated on Larry's VPSes)
+## Phase B — the real 4-VPS deploy ✅ executed 2026-07-26 (see `qumbra-deploy`)
 
 1. Edit `hosts.example` → `hosts` with the 4 VPS public addresses + ssh targets.
 2. Build a **Linux** binary (see the cross-compile caveat below).
@@ -123,3 +130,19 @@ uses) fits the ≥ 4 GB / 2 vCPU VPS spec.
 Genesis rehearsal, the four WAN soak scenarios, the ≥ 48 h telemetry-sampled run,
 and the T0 evidence pack resume on this branch once the 4 VPSes exist. This
 directory only provisions; it does not orchestrate the soak.
+
+
+## Correction: "no NAT" was the wrong phrasing
+
+The requirements table above lists *"routable public IP, no NAT"* as hard. Read literally that would have
+disqualified EC2, whose public IPv4 is a 1:1 mapping onto an interface the instance never sees — and EC2 is
+what the net actually runs on.
+
+**What the requirement means is that no NAT *traversal* is implemented** (hole punching is an M11 item), not
+that address translation anywhere in the path is fatal. Nodes bind `listen_addr` and dial an explicit
+`dial_peers` list; nothing self-discovers or self-advertises an address, so a security group allowing inbound
+on the P2P port is sufficient. `deploy.sh` already sets `listen = 0.0.0.0:<port>` for real hosts, which is why
+this was a wording defect and not a deployment one.
+
+Kept rather than silently reworded: a requirement that would have excluded the platform the project went on to
+use is worth leaving visible, because the next hard-sounding constraint in that table may be equally imprecise.
