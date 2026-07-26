@@ -210,6 +210,18 @@ release constant; the only way to move it is to deploy a different binary.
    upgraded binary opens the persisted chain at tip H and continues. There is no
    re-sync from genesis and block H is not re-mined.
 
+**Two things a freshly-swapped node reports that look alarming and are not:**
+
+- **`final=-` for a while after the swap.** The finality *tracker* is deliberately
+  not persisted (M10-T0-5 / S7 — it rebuilds from re-gossip), so a just-restarted
+  node reports no finalized head until a checkpoint reaches it again. The chain's
+  finalized head is intact on disk; nothing was un-finalized. Judge the ⅔ gate by
+  whether finality ever advances **above H**, never by whether `final` momentarily
+  reads `-`.
+- **`hignore=` back to 0.** The refusal counters are per-process and reset with the
+  container. A post-swap `hignore=0` means "new process", not "nothing was ever
+  ignored". Compare against the value you recorded before the swap.
+
 ### 7.5 If the new binary refuses to start
 
 This is the mechanism working. Read the error:

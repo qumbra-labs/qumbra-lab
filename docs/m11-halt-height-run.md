@@ -231,6 +231,22 @@ because §4's update will be written from these logs.
 The two counters are on every telemetry line (`hignore=` / `powrej=`), so the
 docker drill answers "which layer?" from the logs rather than from a narrative.
 
+**Reading the counters across a swap.** They are per-process and reset when a
+container is recreated — which a binary swap necessarily does. That is what makes
+the post-swap signature meaningful rather than an artefact to explain away: a
+resumed release carries no halt, so `hignore` *should* stay at 0 for the life of
+that process, while `powrej` climbs. `soak.sh` records the pre-swap values to disk
+at `halt-arm` and prints the before/after pair in drill (a), so the comparison is
+against a recorded number rather than a remembered one. Raw evidence is appended to
+`docs/m11-halt-height-evidence.log`.
+
+**One artefact that must not be misread as a regression:** a freshly-swapped node
+reports `final=-` for a while. The finality *tracker* is not persisted (M10-T0-5 /
+S7 — it rebuilds from re-gossip); the chain's finalized head is intact on disk.
+Drill (b)'s assertion is therefore one-sided and numeric — "finality never advances
+**above H** below quorum" — not "`final` is unchanged", which would fire a false
+stop-point on every restart.
+
 **Note for §4.** §4 currently describes the second kind of outcome — blocks that
 are *accepted but can never finalize*, with the committee as the thing that keeps
 the upgrade clean. What the domain separation produces post-swap is **stronger**:

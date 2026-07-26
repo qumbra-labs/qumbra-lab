@@ -34,6 +34,8 @@
 #   soak.sh halt-drill-d         (d) N1: fresh net, all nodes on the CANCELLED
 #                                binary → mines straight through H, never halts
 #   soak.sh halt-status          per-node halt view (tip / final / regime / halt)
+#   soak.sh halt-evidence        append full telemetry + raw refusal reasons to
+#                                docs/m11-halt-height-evidence.log
 #
 # LOCALHOST/DOCKER ONLY — no WAN-latency claims. Real RandomX light, WallClock,
 # frozen 75 s block time.
@@ -144,6 +146,38 @@ halt_assert_no_conflicting_finality() {
 #             and never reaches fork choice (header-validation layer).
 # §4 as written describes the second kind of outcome. Report what the logs actually
 # show; do NOT paraphrase one as the other.
+# Where the drill parks its evidence. The counters are PER-PROCESS and reset when a
+# container is recreated (which a binary swap necessarily does), so the before/after
+# pair has to be captured to disk — a post-swap process legitimately reports
+# hignore=0 because it is a new process, not because nothing was ignored.
+EVID_DIR="$SCRIPT_DIR/../../docs"
+EVID="$EVID_DIR/m11-halt-height-evidence.log"
+
+# Append a labelled snapshot of every node's raw telemetry line to the evidence log.
+halt_record() {
+  local label="$1"
+  { echo "=== $label ==="
+    for n in "${NODES[@]}"; do printf '%s %s\n' "$n" "$(latest "$n")"; done
+  } >> "$EVID"
+  echo "   (evidence appended: $label → ${EVID#"$SCRIPT_DIR/../../"})"
+}
+
+# Save the pre-swap counter values so the post-swap comparison is against a real
+# recorded number rather than a remembered one.
+halt_save_counters() {
+  : > "$SCRIPT_DIR/.halt-preswap"
+  for n in "${NODES[@]}"; do
+    local line; line="$(latest "$n")"
+    printf '%s %s %s\n' "$n" "$(field "$line" hignore)" "$(field "$line" powrej)" \
+      >> "$SCRIPT_DIR/.halt-preswap"
+  done
+}
+halt_preswap() {  # halt_preswap <node> <hignore|powrej>
+  local n="$1" which="$2"
+  local col=2; [[ "$which" == "powrej" ]] && col=3
+  awk -v n="$n" -v c="$col" '$1 == n { print $c }' "$SCRIPT_DIR/.halt-preswap" 2>/dev/null
+}
+
 halt_report_layers() {
   echo "   -- refusal layers (hignore = release layer · powrej = header-validation layer) --"
   for n in "${NODES[@]}"; do
@@ -313,6 +347,25 @@ case "$cmd" in
     "$0" halt-status
     halt_assert_halted node0 node1 node2
     halt_report_layers
+    halt_record "phase 1 — armed nodes halted at H=$HALT_H"
+
+    # LAYER SIGNATURE while halted: nothing may have been rejected at the
+    # header-validation layer. A halted node has not judged anything invalid — it
+    # has stopped. powrej > 0 here would mean a node is running rules it should not
+    # have yet, i.e. the wrong binary.
+    for n in node0 node1 node2; do
+      pr="$(field "$(latest "$n")" powrej)"
+      [[ "$pr" == "0" ]] \
+        || die "$n reports powrej=$pr while HALTED — a halted node judges nothing invalid.
+   That means it is running post-halt rules already. Wrong binary. STOP."
+    done
+    echo "   ✓ powrej=0 on every halted node — refusals are at the RELEASE layer only"
+    # node3 never halts, so it must show no release-layer refusals at all.
+    h3="$(field "$(latest node3)" hignore)"
+    [[ "$h3" == "0" ]] \
+      || die "node3 reports hignore=$h3 but it carries NO halt — wrong binary on node3. STOP."
+    echo "   ✓ node3 hignore=0 — it is the un-armed old-binary miner, as intended"
+    halt_save_counters
     echo "   ✓ phase 1 complete: the armed nodes are HALTED at a finalized boundary."
     echo "   next: $0 halt-drill-b"
     ;;
@@ -321,18 +374,28 @@ case "$cmd" in
     echo "== DRILL (b) — N2, the ⅔ gate =="
     echo "   Upgrading ONLY node0 (6 keys) + node1 (5 keys) = 11 keys < quorum 15."
     echo "   Finality MUST NOT resume: a minority committee does not limp forward."
-    before="$(field "$(latest node0)" final)"
     NODE0_BIN=qumbra-node-resume NODE1_BIN=qumbra-node-resume \
     NODE2_BIN=qumbra-node-armed  NODE3_BIN=qumbra-node \
       dc up -d node0 node1
     echo "   observing for 4 minutes (≈3 block times + a cadence)…"
     sleep 240
     "$0" halt-status
-    after="$(field "$(latest node0)" final)"
-    if [[ "$after" != "$before" ]]; then
-      die "FINALITY ADVANCED ($before → $after) BELOW QUORUM — N2 VIOLATED. STOP, preserve state."
-    fi
-    echo "   ✓ finality stayed at $before with 11/21 keys upgraded — the ⅔ gate holds."
+    halt_record "drill (b) — 11/21 keys upgraded"
+    # N2's assertion is that finality does not advance ABOVE THE BOUNDARY. It is
+    # deliberately NOT "final is unchanged": the finality TRACKER is not persisted
+    # (M10-T0-5 / S7 — it rebuilds from re-gossip), so a just-restarted node
+    # legitimately reports final=- for a while. That is a restart artefact, not lost
+    # finality; the chain's finalized head is intact on disk. Reading it as a
+    # regression would be the wrong alarm, so the check is numeric and one-sided.
+    for n in node0 node1; do
+      f="$(field "$(latest "$n")" final)"
+      if [[ "$f" =~ ^[0-9]+$ ]] && (( f > HALT_H )); then
+        die "$n FINALIZED $f > H=$HALT_H with only 11/21 keys upgraded — N2 VIOLATED.
+   STOP EVERYTHING and preserve state."
+      fi
+      printf '     %-6s final=%-4s (- = tracker rebuilding after restart, expected)\n' "$n" "$f"
+    done
+    echo "   ✓ finality did not advance past H=$HALT_H with 11/21 keys upgraded — the ⅔ gate holds."
     echo "   next: $0 halt-drill-a"
     ;;
 
@@ -377,6 +440,35 @@ case "$cmd" in
     echo "   ✓ the old-binary branch never finalized above H (node3 final=$f3)"
     halt_assert_no_conflicting_finality
     halt_report_layers
+    halt_record "drill (a) — after the swap"
+
+    # LAYER SIGNATURE after the swap, at the precision the in-process drill asserts:
+    #   pre-swap  (halted process):  hignore > 0, powrej = 0   → RELEASE layer
+    #   post-swap (new process):     hignore = 0, powrej > 0   → HEADER-VALIDATION layer
+    # The counters reset with the container, which is what makes the post-swap
+    # hignore=0 meaningful rather than an artefact to explain away.
+    echo "   -- layer transition (pre-swap values recorded at halt-arm) --"
+    swap_evidence=0
+    for n in node0 node1 node2; do
+      pre_h="$(halt_preswap "$n" hignore)"; pre_p="$(halt_preswap "$n" powrej)"
+      now_h="$(field "$(latest "$n")" hignore)"; now_p="$(field "$(latest "$n")" powrej)"
+      printf '     %-6s pre: hignore=%-4s powrej=%-4s  →  post: hignore=%-4s powrej=%-4s\n' \
+        "$n" "${pre_h:-?}" "${pre_p:-?}" "${now_h:-?}" "${now_p:-?}"
+      [[ "$now_p" =~ ^[0-9]+$ ]] || continue
+      if (( now_p > 0 )); then
+        swap_evidence=1
+        [[ "$now_h" == "0" ]] || echo "     (finding) $n powrej>0 AND hignore=$now_h — a resumed
+     release carries no halt, so hignore must not climb after the swap. Investigate."
+      fi
+    done
+    if (( swap_evidence == 1 )); then
+      echo "   ✓ post-swap refusals are at the HEADER-VALIDATION layer (post-halt PoW domain)"
+    else
+      echo "   (finding) no upgraded node recorded powrej>0. Either node3's post-H blocks never"
+      echo "             reached them, or the old branch was refused at some other layer."
+      echo "             Record this honestly — the layer claim is NOT evidenced without it."
+      echo "             Check: dc logs node0 | grep -E 'invalid header|above halt height'"
+    fi
     echo "   next: $0 halt-drill-c"
     ;;
 
@@ -435,6 +527,20 @@ case "$cmd" in
     [[ -n "$f" && "$f" != "-" ]] && (( f > HALT_H )) \
       || die "finality did not advance past the cancelled height (final=$f). STOP."
     echo "   ✓ the stand-down held: mined and finalized through H, never a halt regime."
+    ;;
+
+  halt-evidence)
+    echo "== dumping halt-drill evidence to $EVID =="
+    { echo "=== full telemetry history + refusal reasons, $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
+      for n in "${NODES[@]}"; do
+        echo "--- $n telemetry ---"
+        dc logs --no-log-prefix "$n" 2>/dev/null | grep '^TELEMETRY' || true
+        echo "--- $n halt/refusal lines ---"
+        dc logs --no-log-prefix "$n" 2>/dev/null \
+          | grep -E 'halt-height|HALT|halt plan|revision:|refus|above halt height|invalid header' || true
+      done
+    } >> "$EVID"
+    echo "   appended. Raw reasons are what the run doc's layer claim rests on."
     ;;
 
   teardown)

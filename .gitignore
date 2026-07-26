@@ -2,3 +2,6 @@
 **/*.rs.bk
 .DS_Store
 docs/scratch/
+
+# soak.sh halt-drill scratch state (pre-swap counter snapshot)
+deploy/docker/.halt-preswap
