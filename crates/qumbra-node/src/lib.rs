@@ -25,6 +25,7 @@
 pub mod config;
 pub mod genesis;
 pub mod params_audit;
+pub mod release;
 pub mod revision;
 pub mod run;
 pub mod verifier;

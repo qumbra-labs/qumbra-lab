@@ -294,7 +294,33 @@ impl std::fmt::Display for RevisionError {
 }
 impl std::error::Error for RevisionError {}
 
+/// Domain tag for [`Revision::digest`].
+pub const REVISION_TAG: &[u8] = b"qumbra:revision:v1";
+
 impl Revision {
+    /// The **revision digest**: this revision's identity as a 32-byte value,
+    /// binding *both* the identifier and the frozen-parameter digest it claims.
+    ///
+    /// This — not the bare frozen digest — is what a resumed release uses as its
+    /// post-halt rule domain ([`qlab_devnet::halt::PostHaltRules`]). The reason is
+    /// H5: an *inert* revision changes no frozen value, so consecutive inert
+    /// revisions share a frozen digest. Binding the identifier as well guarantees
+    /// distinct revisions are distinct rule sets, which is what the upgrade
+    /// boundary needs in order to be a boundary at all.
+    pub fn digest(&self) -> Hash32 {
+        let mut buf = Vec::with_capacity(REVISION_TAG.len() + 8 + self.id.len() + 64);
+        buf.extend_from_slice(REVISION_TAG);
+        buf.extend_from_slice(&(self.id.len() as u64).to_le_bytes());
+        buf.extend_from_slice(self.id.as_bytes());
+        buf.extend_from_slice(self.frozen_digest_hex.to_ascii_lowercase().as_bytes());
+        keccak256(&buf)
+    }
+
+    /// Hex form of [`Self::digest`].
+    pub fn digest_hex(&self) -> String {
+        hex_encode(&self.digest())
+    }
+
     /// The gate: this revision must describe *this* binary's frozen constants.
     pub fn verify(&self) -> Result<(), RevisionError> {
         if self.id.is_empty() {
@@ -439,6 +465,23 @@ mod tests {
         let mut q = base.clone();
         std::mem::swap(&mut q.split_miner_pct, &mut q.split_treasury_pct);
         assert_ne!(frozen_digest(&q), frozen_digest(&base));
+    }
+
+    /// The rule-domain property H5 depends on: two **inert** revisions (same frozen
+    /// digest, different identifier) must still be distinct rule sets, or a second
+    /// no-op upgrade would have no boundary at all.
+    #[test]
+    fn distinct_identifiers_are_distinct_rule_domains_even_when_inert() {
+        let frozen: &'static str = Box::leak(own_frozen_digest_hex().into_boxed_str());
+        let a = Revision { id: "v1.0", frozen_digest_hex: frozen };
+        let b = Revision { id: "v1.0.1-drill", frozen_digest_hex: frozen };
+        assert_eq!(a.frozen_digest_hex, b.frozen_digest_hex, "inert: no frozen value moved");
+        assert_ne!(a.digest(), b.digest(), "…but the revisions are still distinct rule sets");
+        assert_eq!(a.digest(), a.digest(), "deterministic");
+        // A frozen change moves the revision digest too, at a fixed identifier.
+        let zeros: &'static str = Box::leak("00".repeat(32).into_boxed_str());
+        let c = Revision { id: "v1.0", frozen_digest_hex: zeros };
+        assert_ne!(a.digest(), c.digest());
     }
 
     #[test]

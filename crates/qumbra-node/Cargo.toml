@@ -26,6 +26,31 @@ publish.workspace = true
 name = "qumbra-node"
 path = "src/main.rs"
 
+# ── halt-height upgrade drill binaries (issue #74) ──────────────────────────
+#
+# H1: the halt height is a BINARY RELEASE CONSTANT with no runtime override — not
+# config, not CLI, not env. The only way to change where a node pauses is to build
+# a different binary, which is exactly what a real upgrade is. These features are
+# how the drill builds those binaries; `src/release.rs` holds the one `RELEASE`
+# const each of them selects. Default (no feature) = the un-armed v1.0 release, so
+# every ordinary build and every test in the workspace is unaffected.
+#
+#   drill-arm           halts at DRILL_HALT_HEIGHT (the pre-upgrade release)
+#   drill-resume        the upgrade: inert revision v1.0.1-drill, resumes past H
+#   drill-resume-norev  drill (c)'s negative: resumes past H with NO revision;
+#                       MUST refuse to start
+#   drill-cancel        drill (d): the stand-down — the upgrade at H is cancelled,
+#                       so this binary does not halt there
+#
+# They are mutually exclusive by construction (the cfg arms in release.rs); a build
+# enabling two is rejected by the compiler as a duplicate `RELEASE` definition.
+[features]
+default = []
+drill-arm = []
+drill-resume = []
+drill-resume-norev = []
+drill-cancel = []
+
 [dependencies]
 # The N7 full-node composition: NodeAdapter (real chain/PoW/state/mempool/
 # committee over the five N1 traits), P2pNode (gossip/sync/relay), the real TCP
