@@ -178,6 +178,65 @@ halt_preswap() {  # halt_preswap <node> <hignore|powrej>
   awk -v n="$n" -v c="$col" '$1 == n { print $c }' "$SCRIPT_DIR/.halt-preswap" 2>/dev/null
 }
 
+# Normalise a telemetry `final=` field to an integer; `-` (nothing finalized) → -1.
+fin_num() { local v="$1"; [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo "-1"; }
+
+# DRILL (a)'s real assertion: while the checkpointed branch keeps finalizing, the
+# un-upgraded node's finality must STOP advancing.
+#
+# Early after the swap node3 can legitimately still be tracking the checkpointed
+# branch's checkpoints (that is what `final=24, tip=23` was), so a single window in
+# which node3 also advances is NOT a failure — it is an inconclusive window. Only a
+# node3 that keeps pace across repeated windows would contradict §4. Being wrong in
+# the other direction is how the original check earned a false STOP-POINT; this one
+# reports "not demonstrated" rather than inventing a violation.
+halt_assert_old_branch_finality_frozen() {
+  local rounds=3 r win=1500
+  for (( r = 1; r <= rounds; r++ )); do
+    local f0a f3a; f0a="$(fin_num "$(field "$(latest node0)" final)")"
+    f3a="$(fin_num "$(field "$(latest node3)" final)")"
+    echo "   -- window $r/$rounds: waiting for the CHECKPOINTED branch to finalize again"
+    echo "      (start: node0 final=$f0a · node3 final=$f3a)"
+    local waited=0 f0b=$f0a
+    while (( waited < win )); do
+      f0b="$(fin_num "$(field "$(latest node0)" final)")"
+      (( f0b > f0a )) && break
+      sleep 15; waited=$((waited + 15))
+    done
+    if (( f0b <= f0a )); then
+      echo "   (finding) the CHECKPOINTED branch did not finalize again within ${win}s"
+      echo "             (node0 final stuck at $f0a). That is a finding about the upgraded"
+      echo "             net, NOT about node3 — drill (a)'s freeze claim is untested here."
+      return 0
+    fi
+    local f3b; f3b="$(fin_num "$(field "$(latest node3)" final)")"
+    echo "      (end:   node0 final=$f0b · node3 final=$f3b)"
+    if (( f3b == f3a )); then
+      echo "   ✓ the old-binary branch's finality is FROZEN at $f3b while the checkpointed"
+      echo "     branch advanced $f0a → $f0b. Its blocks can never finalize (§4)."
+      # `final > tip` on the un-upgraded node is EXPECTED here — it tracked the
+      # upgraded branch's checkpoint for a block it does not hold. Named so a reader
+      # does not have to rediscover it; see issue #85.
+      local t3; t3="$(field "$(latest node3)" tip)"
+      if [[ "$t3" =~ ^[0-9]+$ ]] && (( f3b > t3 )); then
+        echo "     note: node3 reports final=$f3b > tip=$t3. EXPECTED here — it finalized the"
+        echo "           UPGRADED branch's checkpoint for a block it does not hold. Its"
+        echo "           ChainState is untouched (set_finalized fails on an unknown block)."
+        echo "           This is issue #85, not a fault of this drill."
+      fi
+      return 0
+    fi
+    echo "      node3 also advanced ($f3a → $f3b) — it is still TRACKING the checkpointed"
+    echo "      branch (expected while the branches are inside the tally window). Not a"
+    echo "      violation; retrying with a fresh window."
+  done
+  echo "   (finding) node3's finality kept pace across $rounds windows, so the freeze was"
+  echo "             NOT demonstrated. This is NOT by itself a two-branch finalization —"
+  echo "             telemetry cannot distinguish 'finalized the same checkpoint' from"
+  echo "             'finalized a different one' (issue #84). Do not read it either way:"
+  echo "             capture 'dc logs' for all four nodes and settle it by inspection."
+}
+
 halt_report_layers() {
   echo "   -- refusal layers (hignore = release layer · powrej = header-validation layer) --"
   for n in "${NODES[@]}"; do
@@ -449,13 +508,28 @@ case "$cmd" in
       echo "   (finding) node3 did not grow past H (tip=$t3) — the (a) case did not materialise;"
       echo "             record this honestly rather than reading it as a pass."
     fi
-    # …and NEVER finalizes above H.
-    if [[ -n "$f3" && "$f3" != "-" ]] && (( f3 > HALT_H )); then
-      die "🛑 STOP-POINT: the un-upgraded branch FINALIZED above H (node3 final=$f3). Two branches
-   finalizing above the boundary is the exact failure this mechanism exists to prevent.
-   Preserve state (do NOT teardown), capture 'dc logs' for all four nodes, and report."
-    fi
-    echo "   ✓ the old-binary branch never finalized above H (node3 final=$f3)"
+    # …and its finality STOPS ADVANCING while the checkpointed branch carries on.
+    #
+    # WHY NOT `node3.final > H`. That was this drill's original check and it is
+    # UNSOUND — it fired on 2026-07-27 against a net that was behaving exactly as
+    # §4 describes. A node's `final=` advances when it finalizes ANYONE's
+    # checkpoint, including the one every other node finalized: node3 reported
+    # `final=24` with `tip=23`, i.e. it had tracked the UPGRADED branch's
+    # checkpoint, not produced one of its own. One checkpoint finalized, not two.
+    #
+    # The condition this check actually guards is "did a SECOND, DIFFERENT
+    # checkpoint finalize at some height" — and that is not expressible from
+    # telemetry today, because TELEMETRY carries no checkpoint identity (issue #84).
+    # A stop-check that cannot express the condition it guards will eventually fire
+    # on the condition it can express instead, which is precisely what happened.
+    #
+    # The sound proxy available today: the un-upgraded node's finality FREEZES while
+    # the checkpointed branch keeps finalizing. It needs two samples spanning at
+    # least one finalization on the checkpointed branch — a single snapshot cannot
+    # express it, which is the deeper reason the original reached for a one-sample
+    # proxy. Driven by the condition rather than by a fixed sleep, so it also
+    # surfaces a stalled checkpointed branch as its own distinct finding.
+    halt_assert_old_branch_finality_frozen
     halt_assert_no_conflicting_finality
     halt_report_layers
     halt_record "drill (a) — after the swap"

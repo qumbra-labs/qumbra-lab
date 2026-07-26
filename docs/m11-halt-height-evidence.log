@@ -170,3 +170,29 @@ TELEMETRY tip=17 final=16 stall=1 age_s=4995 diff=77 peers=0 mempool=0 epoch=0 r
   shutdown: 'shutdown complete (snapshot flushed)'
 
 === END PRE-DRILL RESUME SMOKE ===
+
+=== DRILL (a) ASSERTION FIX — verified against the standing net (2026-07-27) ===
+The net from the overnight run was left standing per the ruling. The replacement
+assertion was executed against it directly, so the fix is evidenced rather than
+reasoned about. Raw output:
+
+   -- window 1/3: waiting for the CHECKPOINTED branch to finalize again
+      (start: node0 final=448 · node3 final=32)
+      (end:   node0 final=472 · node3 final=32)
+   ✓ the old-binary branch's finality is FROZEN at 32 while the checkpointed
+     branch advanced 448 → 472. Its blocks can never finalize (§4).
+
+Net state at the time of the run:
+  node0  tip=473  final=448→472  regime=Degraded  halt=-  powrej=2644
+  node1  tip=473  final=448      regime=Degraded  halt=-  powrej=2649
+  node2  tip=473  final=448      regime=Degraded  halt=-  powrej=2019
+  node3  tip=337  final=32       regime=Degraded  halt=-  powrej=3569
+
+The old assertion (node3.final > H) would still fire here: 32 > 16. The new one
+passes, on the same net, in one window.
+
+NOT exercised in this run: the #85 note (final > tip on the un-upgraded node).
+That condition is transient — node3's tip has since grown past its frozen final
+(337 vs 32), so the branches have separated too far for it to reappear. It held
+in the overnight snapshot (tip=23, final=24) and the note path is written for it.
+=== END DRILL (a) ASSERTION FIX ===
