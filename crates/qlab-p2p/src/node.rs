@@ -196,8 +196,15 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         nonce: u64,
     ) {
         let bh = header.header_hash();
+        // Ingest first, and do not put on the wire what our own node rejects
+        // (issue #77, the own-announce seam): a locally-produced header/body pair
+        // that fails the binding is a local bug, and announcing it would make this
+        // node the origin of the very object every peer must penalise.
+        let outcome = self.node.ingest_block(header, BlockBody { txs: txs.clone(), coinbase });
+        if let IngestOutcome::Rejected(_) = outcome {
+            return;
+        }
         self.blocks.insert(bh, (txs.clone(), coinbase));
-        let _ = self.node.ingest_block(header, BlockBody { txs: txs.clone(), coinbase });
         self.seen.insert(bh);
 
         let (prefilled, short_ids) = build_announce_parts(&txs, nonce);
@@ -706,6 +713,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             return;
         }
+        // A rejected block must not be cached or re-announced, and whoever handed
+        // it to us pays for it (issue #77 P2). This is the compact-reconstruction
+        // seam: the announcer controls the prefilled txs and the short-id salt, so
+        // "reconstruction succeeded" is no evidence the body is the header's body —
+        // that verdict comes from `ingest_block`, and until this commit it was
+        // being computed and then discarded, so a mismatched body would have been
+        // stored and relayed onward.
+        if let IngestOutcome::Rejected(_) = outcome {
+            if let Some(peer) = except {
+                self.peers.penalize(peer, PENALTY_INVALID_OBJECT);
+            }
+            return;
+        }
         self.blocks.insert(bh, (txs, ann.coinbase));
         self.seen.insert(bh);
         let payload = encode_announce(&ann);
@@ -1148,6 +1168,52 @@ mod tests {
         );
         // And it did not adopt the orphan as a known header.
         assert!(!nodes[1].node().has_header(&orphan_block.header_hash()));
+    }
+
+    /// **Issue #77 at the relay seam: the honest header announced with an EMPTY
+    /// body.** The announcer controls the prefilled txs and the salt, so
+    /// "reconstruction succeeded" is no evidence the body is the header's body.
+    /// The receiver must reject it, penalise the announcer (P2), and — the part
+    /// that makes it a *propagating* exploit — neither cache nor re-announce it.
+    #[test]
+    fn announced_body_that_is_not_the_headers_body_is_rejected_and_penalised() {
+        let (mut nodes, _hub) = mesh(3);
+        run(&mut nodes); // handshake
+        // A header committing to a real one-tx body…
+        let honest = vec![tx(1)];
+        let header = header_over(&genesis(), 75, &honest, 0);
+        let bh = header.header_hash();
+        // …announced with no transactions at all (fully-prefilled, empty).
+        let (prefilled, short_ids) = build_announce_parts(&[], 0xBEEF);
+        let ann = BlockAnnounce { header, nonce: 0xBEEF, coinbase: 0, short_ids, prefilled };
+        // Node 0 (PeerId 1) pushes it straight at node 1 (PeerId 2).
+        nodes[0].send(PeerId(2), MsgType::BlockAnnounce, encode_announce(&ann));
+        nodes[1].tick();
+
+        assert!(
+            nodes[1].peers().get(PeerId(1)).unwrap().score < 0,
+            "the announcer of an unbound body is penalised"
+        );
+        assert!(!nodes[1].node().has_header(&bh), "the header was not adopted");
+        assert!(!nodes[1].blocks.contains_key(&bh), "the body was not cached for serving");
+        // …and it was not re-announced onward to node 2.
+        nodes[2].tick();
+        assert!(!nodes[2].node().has_header(&bh), "a rejected block is not relayed");
+    }
+
+    /// The own-announce seam (`announce_block`): a locally-produced block whose
+    /// body its own node rejects is never put on the wire.
+    #[test]
+    fn own_announce_of_an_unbound_body_is_not_relayed() {
+        let (mut nodes, _hub) = mesh(2);
+        run(&mut nodes);
+        // Header commits to a one-tx body; we hand announce_block a different one.
+        let header = header_over(&genesis(), 75, &[tx(1)], 0);
+        let bh = header.header_hash();
+        nodes[0].announce_block(header, vec![tx(2)], 0, 0xFEED);
+        run(&mut nodes);
+        assert!(!nodes[0].blocks.contains_key(&bh), "not cached locally");
+        assert!(!nodes[1].node().has_header(&bh), "never announced to the peer");
     }
 
     #[test]
