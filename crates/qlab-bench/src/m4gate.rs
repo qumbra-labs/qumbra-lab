@@ -447,10 +447,22 @@ impl GateShape {
         v
     }
 
-    /// Outer public-value count: `n_caps · cap_len · 16` cap limbs + `n_pvs`
-    /// inner public values (`N_OPVS` for narrow = 852).
+    /// Outer-PV offset of the D3 F0 digest = the cap-limb block's length.
+    pub(crate) fn opv_f0dig(&self) -> usize {
+        self.n_caps() * self.cap_len * 16
+    }
+
+    /// Outer-PV offset of the inner public values (`OPV_PVS` for narrow = 784):
+    /// after the cap limbs AND the D3 F0 digest.
+    pub(crate) fn opv_pvs(&self) -> usize {
+        self.opv_f0dig() + F0DIG_LIMBS
+    }
+
+    /// Outer public-value count: `n_caps · cap_len · 16` cap limbs + the
+    /// `F0DIG_LIMBS` F0 digest (D3) + `n_pvs` inner public values
+    /// (`N_OPVS` for narrow = 768 + 16 + 84 = 868).
     pub(crate) fn n_opvs(&self) -> usize {
-        self.n_caps() * self.cap_len * 16 + self.n_pvs
+        self.opv_pvs() + self.n_pvs
     }
 
     /// Observation flush count = `4 + n_fri_rounds` (alpha, zeta, fri_alpha,
@@ -613,10 +625,27 @@ pub(crate) enum Shape {
     Refill,
 }
 
-/// Outer public value layout: 6 caps x 8 digests x 16 limbs, then the 84
-/// inner public values.
+/// Issue #24 (D3): the exposed F0-digest width, in u16 field limbs (a 32-byte
+/// keccak digest, same encoding as the cap limbs and the 棒 3 merge root).
+///
+/// F0 is the challenger's FIRST observation flush — `deg_bits ‖ base_deg_bits ‖
+/// preprocessed_width ‖ trace cap ‖ inner public values` — so its digest is a
+/// commitment to the whole claimed public surface. It is exposed as public
+/// values (issue #21's R2) and is non-hollow only because D3 also binds F0's
+/// absorbed INPUT words to those same public values (see `eval`).
+pub(crate) const F0DIG_LIMBS: usize = 16;
+
+/// Outer public value layout: 6 caps x 8 digests x 16 limbs, the 16-limb F0
+/// digest (D3), then the 84 inner public values.
+///
+/// The digest sits BETWEEN the caps and the inner PVs, not at the tail: the
+/// 棒 3-3 epoch Σfee rider reads each child's fee as the LAST `EPOCH_FEE_LIMBS`
+/// of its opvs half (M3 fee = the inner-PV tail = the opvs tail), an invariant
+/// `m4interior`'s const-assert glues to the M3 layout. Appending f0dig would
+/// have silently moved the fee off the tail.
 pub(crate) const OPV_CAPS: usize = 0;
-pub(crate) const OPV_PVS: usize = N_CAPS * CAP_LEN * 16;
+pub(crate) const OPV_F0DIG: usize = N_CAPS * CAP_LEN * 16;
+pub(crate) const OPV_PVS: usize = OPV_F0DIG + F0DIG_LIMBS;
 pub(crate) const N_OPVS: usize = OPV_PVS + N_PVS;
 
 fn cap_limb_opv(cap: usize, digest: usize, limb: usize) -> usize {
@@ -638,8 +667,9 @@ pub(crate) fn shape_mosaic(shape: &GateShape, shape_kind: Shape) -> Vec<WordBind
     let qw = shape.qw;
     // Inner-proof degree bits = log_max - log_blowup (narrow 18, wide 16).
     let deg_bits = (shape.log_max - shape.log_blowup) as u32;
-    // OPV base of the inner public values (after the cap limbs).
-    let opv_pvs = shape.n_caps() * cap * 16;
+    // OPV base of the inner public values (after the cap limbs and, since D3,
+    // the exposed F0 digest).
+    let opv_pvs = shape.opv_pvs();
     // Build the full flush content-word streams once, then slice.
     // Flush content words (chain prefix included for f > 0).
     let flush_words = |f: usize| -> Vec<WordBind> {
@@ -2493,7 +2523,7 @@ where
                 // pv. NB use `c(rr.as_canonical_u32())`, NOT `cf(rr)` — `cf` would
                 // re-encode rr into its Monty WORD (R²), the wrong factor.
                 let rr = c(monty_rr().as_canonical_u32());
-                let opv_inner = self.shape.n_caps() * self.shape.cap_len * 16; // OPV_PVS
+                let opv_inner = self.shape.opv_pvs(); // OPV_PVS (past caps + D3 f0dig)
                 let np = self.shape.n_pvs;
                 let msg_bytes = np * 4;
                 let padded_len = kl * 136; // per-child padded message length (kl blocks)
@@ -2556,6 +2586,143 @@ where
                     }
                 }
                 builder.assert_zero(sf(23) * cv(self.layout.rsel + *role as usize) * (cv(ocol(m)) - mux));
+            }
+        }
+        // =====================================================================
+        // Issue #24 (D3): leaf F0 digest INPUT binding + the exposed `f0dig`.
+        //
+        // F0 is the challenger's FIRST observation flush and its message is
+        // exactly the claimed public surface:
+        //     deg_bits ‖ base_deg_bits ‖ preprocessed_width ‖ trace cap ‖ PVs
+        // Until D3 NOTHING tied its absorbed words to anything. Two consequences,
+        // both closed here: (1) the inner public values rode the outer interface
+        // unbound — issue #21's R2, empirically pinned as the `tamper_coverage`
+        // SAT-MISS probes, so an aggregator could not trust a leaf's claimed
+        // transaction surface; (2) the whole Fiat-Shamir transcript started from
+        // a message the prover could choose freely, so the trace cap the queries
+        // are checked against and the cap the challenges are derived from were
+        // never forced to be the same object.
+        //
+        // The binding is the resurrected `shape_mosaic` (`WordBind`), one
+        // constraint per F0 word, gated by that block's `shsel` and the word's
+        // row-in-perm step flag (word j of a block lives at row j/2, `w0c` for
+        // even j and `w1c` for odd — the state's u16 limbs pack 2 words/row):
+        //   Const(v) -> the fixed transcript constant / the pad10*1 word,
+        //   Cap(i)   -> pv(i) + 2^16·pv(i+1)   (a u32 word = two u16 cap limbs),
+        //   Pv(i)    -> pv(i) DIRECTLY. Unlike the D1 merge binding there is NO
+        //              `rr` factor: `outer_pvs` already carries the inner PVs in
+        //              their transcript (Monty-word) encoding, which is exactly
+        //              what the challenger absorbed, whereas the merge sponge
+        //              hashes canonical u32s.
+        //
+        // The words come from `w0c`/`w1c`, which D3 pins for the FIRST time —
+        // they (and the OREG/PBIT/OBIT XOR register file) were built in inc-4,
+        // filled ever since, and never constrained. No new register file and no
+        // new columns were needed: `oreg` was already constraint-captured from
+        // the previous perm's output rate, and the bit columns were already
+        // filled; only these constraints were missing.
+        //   - F0 block 0 absorbs into the ZERO state, so its preimage rate IS
+        //     the message: `w` recomposes the two u16 preimage limbs directly.
+        //   - F0 blocks 1.. are XOR-mode (standard keccak challenger): the AIR's
+        //     `preimage` is msg XOR prev-output, so the message is recovered
+        //     bit-by-bit as `p + o − 2·p·o` against `oreg`. The 16-bit
+        //     decompositions double as range checks, so the recompositions are
+        //     sound without leaning on KeccakAir's own limb bounds.
+        //
+        // Finally the flush's DIGEST (the last F0 block's output rate) is bound
+        // to the exposed `f0dig` public values — issue #21's R2, non-hollow only
+        // now that the input side is bound. It needs no carry register: producer
+        // and consumer are the same row.
+        // =====================================================================
+        {
+            let fb = &self.consts.flush_blocks;
+            let n_f0 = fb[0];
+            let f0sel = |b: usize| cv(self.layout.shsel + shsel_index(fb, 0, b));
+            let gdir = f0sel(0);
+            let gxor = (1..n_f0).map(&f0sel).fold(AB::Expr::ZERO, |a, e| a + e);
+            // 17 rows x 4 u16 limbs cover the whole 68-limb keccak rate; row r
+            // hosts limbs 4r..4r+4 = u32 words 2r (limbs 0,1) and 2r+1 (2,3).
+            const RATE_ROWS: usize = 17;
+            let rowmux = |base: usize, j: usize| -> AB::Expr {
+                (0..RATE_ROWS)
+                    .map(|r| sf(r) * cv(base + 4 * r + j))
+                    .fold(AB::Expr::ZERO, |a, e| a + e)
+            };
+            let pmux = |j: usize| rowmux(pcol(0), j);
+            let omux = |j: usize| rowmux(self.layout.oreg, j);
+            let recomp = |base: usize, j: usize| -> AB::Expr {
+                (0..16)
+                    .map(|i| cv(base + 16 * j + i) * c(1 << i))
+                    .fold(AB::Expr::ZERO, |a, e| a + e)
+            };
+            // XOR-recovered message limb (deg 2): Σ (p + o − 2·p·o)·2^i.
+            let xor_limb = |j: usize| -> AB::Expr {
+                (0..16)
+                    .map(|i| {
+                        let p = cv(self.layout.pbit + 16 * j + i);
+                        let o = cv(self.layout.obit + 16 * j + i);
+                        (p.clone() + o.clone() - p * o * c(2)) * c(1 << i)
+                    })
+                    .fold(AB::Expr::ZERO, |a, e| a + e)
+            };
+            for j in 0..4 {
+                // Unconditional booleans: off the XOR rows the fill leaves these
+                // columns zero (trap 3 — new/at-last-constrained columns must be
+                // zeroed outside their region), so these hold trivially there.
+                for i in 0..16 {
+                    builder.assert_bool(cv(self.layout.pbit + 16 * j + i));
+                    builder.assert_bool(cv(self.layout.obit + 16 * j + i));
+                }
+                builder.assert_zero(gxor.clone() * (pmux(j) - recomp(self.layout.pbit, j)));
+                builder.assert_zero(gxor.clone() * (omux(j) - recomp(self.layout.obit, j)));
+            }
+            for (wc, lo) in [(self.layout.w0c, 0usize), (self.layout.w1c, 2usize)] {
+                builder.assert_zero(
+                    gxor.clone() * (cv(wc) - xor_limb(lo) - xor_limb(lo + 1) * c(1 << 16)),
+                );
+                builder.assert_zero(
+                    gdir.clone() * (cv(wc) - pmux(lo) - pmux(lo + 1) * c(1 << 16)),
+                );
+            }
+            // Per-child pv half select for the interior (`chi` = 0 across child
+            // L's rows, 1 across child R's — the same running selector the cap
+            // comparison uses). Inert (unread) for narrow / single-wide.
+            let half = |i: usize| -> AB::Expr {
+                if route {
+                    pv(i) + cv(self.layout.chi) * (pv(n_opvs + i) - pv(i))
+                } else {
+                    pv(i)
+                }
+            };
+            for b in 0..n_f0 {
+                for (j, bind) in shape_mosaic(&self.shape, Shape::Obs { flush: 0, block: b })
+                    .iter()
+                    .enumerate()
+                {
+                    let gate = f0sel(b) * sf(j / 2);
+                    let w = cv(if j % 2 == 0 { self.layout.w0c } else { self.layout.w1c });
+                    match bind {
+                        WordBind::Const(v) => builder.assert_zero(gate * (w - c(*v))),
+                        WordBind::Cap(i) => {
+                            builder.assert_zero(gate * (w - half(*i) - half(*i + 1) * c(1 << 16)))
+                        }
+                        WordBind::Pv(i) => builder.assert_zero(gate * (w - half(*i))),
+                        // F0 carries no chain prefix, no opened values and no PoW
+                        // witness — every word is Const/Cap/Pv. Anything else here
+                        // would be an unbound word, so fail loudly rather than
+                        // silently skipping it.
+                        other => panic!("F0 mosaic word {j} of block {b} is {other:?} — unbindable"),
+                    }
+                }
+            }
+            // R2 (issue #21): the exposed public-surface digest. F0's digest is
+            // the last F0 block's output rate limbs 0..16.
+            for m in 0..16 {
+                builder.assert_zero(
+                    sf(23)
+                        * f0sel(n_f0 - 1)
+                        * (cv(ocol(m)) - half(self.shape.opv_f0dig() + m)),
+                );
             }
         }
         // =====================================================================
@@ -4008,7 +4175,8 @@ pub(crate) struct GateMeta {
 }
 
 /// Build the outer public values: n_caps caps x cap_len digests x 16 limbs +
-/// the inner public values (slice 1b-2: shape-driven; narrow = 6x8x16 + 84).
+/// the D3 F0 digest + the inner public values (slice 1b-2: shape-driven;
+/// narrow = 6x8x16 + 16 + 84).
 pub(crate) fn outer_pvs(sched: &Schedule, inner_pvs: &[Val], shape: &GateShape) -> Vec<Val> {
     let mut opvs = Vec::with_capacity(shape.n_opvs());
     assert_eq!(sched.caps.len(), shape.n_caps());
@@ -4020,6 +4188,16 @@ pub(crate) fn outer_pvs(sched: &Schedule, inner_pvs: &[Val], shape: &GateShape) 
             }
         }
     }
+    assert_eq!(opvs.len(), shape.opv_f0dig());
+    // Issue #24 (D3): the F0 digest — keccak-256 of the first observation flush
+    // (deg bits ‖ trace cap ‖ inner PVs). Same u16-limb encoding as the caps.
+    // The circuit pins it to the last F0 block's output rate limbs, and pins
+    // that block's absorbed INPUT words to these same public values — so the
+    // exposed digest is a real commitment, not an unbound witness (issue #21 R2).
+    for c in sched.flushes[0].digest.chunks(2) {
+        opvs.push(Val::from_u32(u16::from_le_bytes([c[0], c[1]]) as u32));
+    }
+    assert_eq!(opvs.len(), shape.opv_pvs());
     assert_eq!(inner_pvs.len(), shape.n_pvs);
     // Inner public values ride the outer interface in their transcript
     // encoding (Monty words), matching the absorbed bytes.
@@ -6157,7 +6335,10 @@ mod tests {
         assert_eq!(w.tw, GATE_WIDTH, "leaf wide row width = leaf gate width");
         assert_eq!(w.qw, 8, "leaf wide quotient words/query");
         assert_eq!(w.n_pvs, N_OPVS, "interior inner PVs = leaf gate opvs");
-        assert_eq!(w.n_pvs, 6 * 8 * 16 + 84, "= 852");
+        // D3 (issue #24): the leaf's public surface gained the 16-limb F0 digest
+        // between the caps and the inner PVs → 852 → 868. This is the ONE place
+        // the narrow-byte-identical invariant is deliberately broken.
+        assert_eq!(w.n_pvs, 6 * 8 * 16 + F0DIG_LIMBS + 84, "= 868 (was 852 pre-D3)");
         assert_eq!(w.nq, crate::m4treerec::AGG_CFG.num_queries, "aggregation lane queries (q43 post-B″)");
         assert_eq!(w.log_max, 18, "leaf 2^16 committed at b4 -> LDE 2^18");
         assert_eq!(w.log_arities, vec![4, 4, 4], "3 arity-16 FRI rounds");
@@ -6369,15 +6550,99 @@ mod tests {
         // cols from consensus q21: GRP/IDXR/QSEL each +1) → 32 + 16·(2·3675+8) =
         // 117760. All other flushes are tw- and nq-independent (query index draws
         // are sample_bits, not observations, so nq does not touch flush bytes).
-        assert_eq!(w.flush_bytes(), vec![3676, 288, 117760, 288, 288, 288, 304]);
+        // F0 = 12 + cap·32 + n_pvs·4; D3 (issue #24) raised the interior's inner
+        // PV count 852 → 868 (the child leaf's opvs gained the 16-limb f0dig), so
+        // F0 grows 3676 → 3740 bytes. F2 is UNCHANGED because D3 added no gate
+        // columns (tw = GATE_WIDTH = 3675 either side).
+        assert_eq!(w.flush_bytes(), vec![3740, 288, 117760, 288, 288, 288, 304]);
         // F2 blocks = 117760/136 + 1 = 866 (unchanged from tw=3672: +96 bytes is
-        // under one 136-byte keccak block).
+        // under one 136-byte keccak block). F0 blocks stay 28 as well: 3740/136
+        // = 27.5 → 27+1, same as 3676/136 = 27.03 → 27+1 (the +64 bytes do not
+        // cross the 27→28 boundary at 3672 bytes).
         assert_eq!(w.flush_blocks(), vec![28, 3, 866, 3, 3, 3, 3]);
         assert_eq!(w.n_shapes_obs(), 46);
         // qslots = ceil34(tw) + pl0 + ceil34(qw) + pl1; tw=3675 makes
         // ceil34(3675)=109 (was 108 at 3672) → one more trace-leaf absorb slot.
         assert_eq!(w.qslots(), 167);
         assert_eq!(w.bidx_width(), 29, "wide F0=28 blocks → bidx must address all + 1 sink");
+    }
+
+    /// Issue #24 (D3): the public-surface cascade, test-locked end to end.
+    ///
+    /// Exposing `f0dig` grows the leaf's outer PVs, which ARE the interior's
+    /// inner PVs (`m4gate.rs`'s `wide()`: `n_pvs: N_OPVS`), so the change walks
+    /// leaf → interior → merge lane. This test pins every link of that chain
+    /// (and, just as importantly, the links that did NOT move) so a later shape
+    /// change cannot silently re-cross a keccak-block boundary.
+    ///
+    /// before → after:
+    ///   N_PVS (M3 inner PVs)      84   →   84   (D3 does not touch the M3 proof)
+    ///   OPV_F0DIG (narrow)         –   →  768   (new: caps end)
+    ///   OPV_PVS (narrow)         768   →  784   (+F0DIG_LIMBS)
+    ///   N_OPVS (narrow)          852   →  868
+    ///   GATE_WIDTH              3675   → 3675   (no new columns)
+    ///   interior n_pvs           852   →  868   (= the leaf's N_OPVS)
+    ///   interior n_opvs         1492   → 1524   (5·8·16 + 16 + 868)
+    ///   merge_perms()             53   →   53   (see the arithmetic below)
+    ///   msh ring width            53   →   53
+    ///   interior num_public_values 3004 → 3068  (2·n_opvs + 16 root + 4 Σfee)
+    #[test]
+    fn d3_public_surface_cascade() {
+        let n = GateShape::narrow();
+        let w = GateShape::wide();
+        // -- leaf --
+        assert_eq!(n.n_pvs, 84, "M3 inner PV count is untouched by D3");
+        assert_eq!(n.opv_f0dig(), 6 * 8 * 16, "f0dig sits at the end of the caps: 768");
+        assert_eq!(n.opv_pvs(), 768 + 16, "inner PVs start after the f0dig block: 784");
+        assert_eq!(n.n_opvs(), 868, "leaf public surface 852 → 868");
+        assert_eq!((OPV_F0DIG, OPV_PVS, N_OPVS), (768, 784, 868), "consts track the shape");
+        assert_eq!(GATE_WIDTH, 3675, "D3 adds NO gate columns (f0dig needs no register)");
+        // The Σfee rider's invariant: fee is still the opvs TAIL (this is why
+        // f0dig was inserted before the inner PVs, not appended).
+        assert_eq!(
+            n.n_opvs() - crate::m4interior::EPOCH_FEE_LIMBS,
+            n.opv_pvs() + n.n_pvs - crate::m4interior::EPOCH_FEE_LIMBS,
+            "M3 fee tail == opvs tail"
+        );
+        // -- interior --
+        assert_eq!(w.n_pvs, n.n_opvs(), "interior inner PVs = the leaf's opvs");
+        assert_eq!(w.opv_f0dig(), 5 * 8 * 16, "wide has 5 caps → 640");
+        assert_eq!(w.n_opvs(), 5 * 8 * 16 + 16 + 868, "= 1524 (was 1492)");
+        // -- merge lane: the block count is the boundary worth stating --
+        // blocks = n_pvs·4/136 + 1 (overwrite sponge, pad10*1 always adds a byte)
+        //   before: 852·4 = 3408 bytes → 3408/136 = 25 → 26 blocks
+        //   after:  868·4 = 3472 bytes → 3472/136 = 25 → 26 blocks   (25.53 → 25)
+        // merge_perms = 2·blocks + 1 → 2·26 + 1 = 53, unchanged. The next
+        // boundary is at 3536 bytes (884 values); D3 lands 16 values short of it.
+        assert_eq!(w.n_pvs * 4, 3472, "merge message bytes per child");
+        assert_eq!(w.n_pvs * 4 / 136 + 1, 26, "merge blocks per child (was 26)");
+        assert_eq!(w.merge_perms(), 53, "msh ring width unchanged");
+        assert_eq!(
+            w.merge_perms(),
+            crate::m4interior::merge_perm_inputs(
+                &vec![Val::ZERO; w.n_pvs],
+                &vec![Val::ZERO; w.n_pvs]
+            )
+            .len(),
+            "circuit merge_perms() == the native merge perm count"
+        );
+        // -- the interior AIR's public-value count --
+        assert_eq!(
+            <VerifierGateAir as BaseAir<Val>>::num_public_values(&VerifierGateAir::new_interior()),
+            2 * w.n_opvs()
+                + crate::m4interior::MERGE_ROOT_LIMBS
+                + crate::m4interior::EPOCH_FEE_LIMBS,
+        );
+        assert_eq!(
+            <VerifierGateAir as BaseAir<Val>>::num_public_values(&VerifierGateAir::new_interior()),
+            3068,
+            "interior public values 3004 → 3068"
+        );
+        assert_eq!(
+            <VerifierGateAir as BaseAir<Val>>::num_public_values(&VerifierGateAir::new()),
+            868,
+            "leaf public values 852 → 868"
+        );
     }
 
     /// TEMP: byte-parse cross-check of the zeta-opening obs stream.
