@@ -32,12 +32,35 @@ COPY . .
 RUN cargo build --release --locked -p qumbra-node \
     && cp target/release/qumbra-node /usr/local/bin/qumbra-node
 
+# ── halt-height drill binaries (issue #74) ──────────────────────────────────
+#
+# H1: the halt height is a BINARY RELEASE CONSTANT with no runtime override, so the
+# drill needs genuinely different binaries — which is also what a real upgrade is.
+# Each of these differs from the one above ONLY in the compile-time `RELEASE` const
+# selected by a cargo feature (crates/qumbra-node/src/release.rs).
+#
+# Cost note: the features gate code inside the leaf crate only, so the heavy
+# dependency graph (plonky3, randomx-rs) is built once and each variant is a leaf
+# recompile — four cheap rebuilds, not four full builds.
+RUN cargo build --release --locked -p qumbra-node --features drill-arm \
+    && cp target/release/qumbra-node /usr/local/bin/qumbra-node-armed
+RUN cargo build --release --locked -p qumbra-node --features drill-resume \
+    && cp target/release/qumbra-node /usr/local/bin/qumbra-node-resume
+RUN cargo build --release --locked -p qumbra-node --features drill-resume-norev \
+    && cp target/release/qumbra-node /usr/local/bin/qumbra-node-norev
+RUN cargo build --release --locked -p qumbra-node --features drill-cancel \
+    && cp target/release/qumbra-node /usr/local/bin/qumbra-node-cancel
+
 # ---- runtime ---------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bash ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/qumbra-node /usr/local/bin/qumbra-node
+COPY --from=builder /usr/local/bin/qumbra-node-armed /usr/local/bin/qumbra-node-armed
+COPY --from=builder /usr/local/bin/qumbra-node-resume /usr/local/bin/qumbra-node-resume
+COPY --from=builder /usr/local/bin/qumbra-node-norev /usr/local/bin/qumbra-node-norev
+COPY --from=builder /usr/local/bin/qumbra-node-cancel /usr/local/bin/qumbra-node-cancel
 COPY deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

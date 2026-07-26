@@ -17,6 +17,24 @@
 #   soak.sh committee-recover    restart them → T0-2 catch-up → Final
 #   soak.sh teardown             docker compose down -v (destroys volumes)
 #
+# HALT-HEIGHT UPGRADE DRILL (issue #74). Run in order; each prints its own
+# assertions and STOPS on a violation. H = 16 (on the cadence grid of 8).
+#
+#   soak.sh halt-arm             fresh net: node0/1/2 on the ARMED binary, node3 on
+#                                the plain v1.0 binary (the §4 old-binary miner —
+#                                it never deployed the halt, so it never halts).
+#                                Runs to H and asserts the halt.
+#   soak.sh halt-drill-b         (b) N2: upgrade only node0+node1 (11 keys < 15)
+#                                → finality must NOT resume
+#   soak.sh halt-drill-a         (a) H3: upgrade node2 too (16 keys ≥ 15) → finality
+#                                resumes past H while node3's old-rule branch grows
+#                                and NEVER finalizes
+#   soak.sh halt-drill-c         (c) H4: start node2 on the no-revision binary →
+#                                must REFUSE to start
+#   soak.sh halt-drill-d         (d) N1: fresh net, all nodes on the CANCELLED
+#                                binary → mines straight through H, never halts
+#   soak.sh halt-status          per-node halt view (tip / final / regime / halt)
+#
 # LOCALHOST/DOCKER ONLY — no WAN-latency claims. Real RandomX light, WallClock,
 # frozen 75 s block time.
 
@@ -28,6 +46,10 @@ NET_MAIN=qumbra_t0
 NET_SIDEB=qumbra_t0_sideb
 PINNED_GENESIS=4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3
 NODES=(node0 node1 node2 node3)
+# The halt height compiled into the drill binaries (release.rs DRILL_HALT_HEIGHT).
+# On the checkpoint-cadence grid (16 = 2 x 8), deliberately low so each drill is
+# minutes. Keep in step with the Rust constant.
+HALT_H=16
 
 dc()  { docker compose -f "$COMPOSE" "$@"; }
 cid() { dc ps -q "$1"; }
@@ -72,6 +94,45 @@ wait_tip() {
     sleep 5; waited=$((waited + 5))
   done
   return 1
+}
+
+# Assert every named node is halted at the boundary, with an IDENTICAL finalized
+# tip. Any disagreement here is a stop-point, not a retry.
+halt_assert_halted() {
+  local ref_tip="" ref_final=""
+  for n in "$@"; do
+    local line; line="$(latest "$n")"
+    [[ -n "$line" ]] || die "$n produced no telemetry — capture logs, STOP"
+    local tip final regime halt
+    tip="$(field "$line" tip)"; final="$(field "$line" final)"
+    regime="$(field "$line" regime)"; halt="$(field "$line" halt)"
+    [[ "$halt" == "$HALT_H" ]] || die "$n reports halt=$halt, expected $HALT_H — wrong binary? STOP."
+    [[ "$tip" == "$HALT_H" ]]       || die "$n tip=$tip but the halt height is $HALT_H — an armed node must not pass it. STOP."
+    [[ "$regime" == "Halted" ]]       || die "$n regime=$regime, expected Halted. If it is 'Halting', H's checkpoint has not
+   finalized — that is the honest signal NOT to swap binaries yet. Wait, then re-check."
+    if [[ -z "$ref_tip" ]]; then ref_tip="$tip"; ref_final="$final"; fi
+    [[ "$tip" == "$ref_tip" && "$final" == "$ref_final" ]]       || die "$n disagrees about the boundary (tip=$tip final=$final vs $ref_tip/$ref_final). STOP."
+  done
+  echo "   ✓ all armed nodes report regime=Halted at an IDENTICAL finalized tip $ref_tip/$ref_final"
+}
+
+# The invariant the whole mechanism exists to protect: no two nodes may report
+# different finalized blocks at the same height. Telemetry carries heights, not
+# hashes, so this checks the strongest thing it can — that no node's finalized head
+# is ahead of a peer's on a branch the peer rejected — and points at the deeper
+# check when heights alone cannot settle it.
+halt_assert_no_conflicting_finality() {
+  local upgraded=(node0 node1 node2)
+  local ref=""
+  for n in "${upgraded[@]}"; do
+    local f; f="$(field "$(latest "$n")" final)"
+    [[ -n "$f" && "$f" != "-" ]] || continue
+    if [[ -z "$ref" ]]; then ref="$f"; continue; fi
+    local lo=$(( f < ref ? f : ref ))
+    (( lo >= HALT_H )) || die "an upgraded node finalized BELOW the boundary — reorg past
+   finality. STOP EVERYTHING and preserve state."
+  done
+  echo "   ✓ no upgraded node finalized below the boundary (no reorg past a finalized checkpoint)"
 }
 
 cmd="${1:-}"; shift || true
@@ -186,13 +247,179 @@ case "$cmd" in
     snapshot
     ;;
 
+
+  # ── halt-height upgrade drill (issue #74) ─────────────────────────────────
+  #
+  # H is the DRILL_HALT_HEIGHT compiled into the drill binaries
+  # (crates/qumbra-node/src/release.rs). Keep these in step.
+
+  halt-status)
+    echo "== halt view =="
+    for n in "${NODES[@]}"; do
+      line="$(latest "$n")"
+      if [[ -z "$line" ]]; then
+        printf '  %-6s (no telemetry yet / down)\n' "$n"
+      else
+        printf '  %-6s tip=%-4s final=%-4s regime=%-8s halt=%-4s peers=%s\n' \
+          "$n" "$(field "$line" tip)" "$(field "$line" final)" \
+          "$(field "$line" regime)" "$(field "$line" halt)" "$(field "$line" peers)"
+      fi
+    done
+    ;;
+
+  halt-arm)
+    guard_rig
+    echo "== halt-height drill, phase 1: ARM =="
+    echo "   node0/1/2 → qumbra-node-armed (halts at H=$HALT_H)"
+    echo "   node3     → qumbra-node        (the §4 old-binary miner: it never"
+    echo "               deployed the halt, so it will keep mining past H)"
+    echo "   Destroying any previous net so the drill starts from genesis."
+    dc down -v >/dev/null 2>&1 || true
+    docker network rm "$NET_SIDEB" 2>/dev/null || true
+    dc build
+    NODE0_BIN=qumbra-node-armed NODE1_BIN=qumbra-node-armed \
+    NODE2_BIN=qumbra-node-armed NODE3_BIN=qumbra-node \
+      dc up -d node0 node1 node2 node3
+    got="$(dc logs --no-log-prefix genesis-init 2>/dev/null \
+            | sed -n 's/^init: genesis hash //p' | tail -1 | tr -d '\r')"
+    [[ "$got" == "$PINNED_GENESIS" ]] \
+      || die "GENESIS HASH MISMATCH — the drill must run on the frozen T0 genesis. STOP."
+    echo "   ✓ genesis == pinned T0 genesis; the drill changes NO frozen value (H5)"
+    echo "   waiting for tip $HALT_H (75 s blocks — roughly $((HALT_H * 75 / 60)) min)…"
+    wait_tip node0 "$HALT_H" 2400 || die "node0 never reached H=$HALT_H — capture logs, STOP"
+    sleep 90   # let H's checkpoint finalize and telemetry catch up
+    "$0" halt-status
+    halt_assert_halted node0 node1 node2
+    echo "   ✓ phase 1 complete: the armed nodes are HALTED at a finalized boundary."
+    echo "   next: $0 halt-drill-b"
+    ;;
+
+  halt-drill-b)
+    echo "== DRILL (b) — N2, the ⅔ gate =="
+    echo "   Upgrading ONLY node0 (6 keys) + node1 (5 keys) = 11 keys < quorum 15."
+    echo "   Finality MUST NOT resume: a minority committee does not limp forward."
+    before="$(field "$(latest node0)" final)"
+    NODE0_BIN=qumbra-node-resume NODE1_BIN=qumbra-node-resume \
+    NODE2_BIN=qumbra-node-armed  NODE3_BIN=qumbra-node \
+      dc up -d node0 node1
+    echo "   observing for 4 minutes (≈3 block times + a cadence)…"
+    sleep 240
+    "$0" halt-status
+    after="$(field "$(latest node0)" final)"
+    if [[ "$after" != "$before" ]]; then
+      die "FINALITY ADVANCED ($before → $after) BELOW QUORUM — N2 VIOLATED. STOP, preserve state."
+    fi
+    echo "   ✓ finality stayed at $before with 11/21 keys upgraded — the ⅔ gate holds."
+    echo "   next: $0 halt-drill-a"
+    ;;
+
+  halt-drill-a)
+    echo "== DRILL (a) — H3, the hybrid honesty case =="
+    echo "   Upgrading node2 as well → 16 keys ≥ quorum 15, so finality may resume."
+    echo "   node3 stays on the OLD binary and keeps mining past H. Per"
+    echo "   committee-and-governance §4 that is EXPECTED, not a defect: its blocks"
+    echo "   can never finalize, and the fork resolves to the checkpointed branch."
+    old_tip_before="$(field "$(latest node3)" tip)"
+    NODE0_BIN=qumbra-node-resume NODE1_BIN=qumbra-node-resume \
+    NODE2_BIN=qumbra-node-resume NODE3_BIN=qumbra-node \
+      dc up -d node2
+    echo "   waiting for the upgraded net to finalize past H=$HALT_H (up to 15 min)…"
+    waited=0
+    while (( waited < 900 )); do
+      f="$(field "$(latest node0)" final)"
+      [[ -n "$f" && "$f" != "-" ]] && (( f > HALT_H )) && break
+      sleep 15; waited=$((waited + 15))
+    done
+    "$0" halt-status
+    f0="$(field "$(latest node0)" final)"
+    f3="$(field "$(latest node3)" final)"
+    t3="$(field "$(latest node3)" tip)"
+    [[ -n "$f0" && "$f0" != "-" ]] || die "node0 reports no finalized head — capture logs, STOP"
+    (( f0 > HALT_H )) \
+      || die "finality did NOT resume past H with 16/21 keys upgraded — investigate before continuing"
+    echo "   ✓ the checkpointed branch finalized past H (node0 final=$f0)"
+    # The old miner: its branch GROWS…
+    if [[ -n "$t3" ]] && (( t3 > HALT_H )); then
+      echo "   ✓ the old-binary miner grew past H (node3 tip=$t3, was $old_tip_before) — §4 expected"
+    else
+      echo "   (finding) node3 did not grow past H (tip=$t3) — the (a) case did not materialise;"
+      echo "             record this honestly rather than reading it as a pass."
+    fi
+    # …and NEVER finalizes above H.
+    if [[ -n "$f3" && "$f3" != "-" ]] && (( f3 > HALT_H )); then
+      die "🛑 STOP-POINT: the un-upgraded branch FINALIZED above H (node3 final=$f3). Two branches
+   finalizing above the boundary is the exact failure this mechanism exists to prevent.
+   Preserve state (do NOT teardown), capture 'dc logs' for all four nodes, and report."
+    fi
+    echo "   ✓ the old-binary branch never finalized above H (node3 final=$f3)"
+    halt_assert_no_conflicting_finality
+    echo "   next: $0 halt-drill-c"
+    ;;
+
+  halt-drill-c)
+    echo "== DRILL (c) — H4, resume without a revision digest =="
+    echo "   Starting node2 on qumbra-node-norev (resumes past H, carries NO revision)."
+    echo "   It MUST refuse to start."
+    dc stop node2 >/dev/null
+    NODE0_BIN=qumbra-node-resume NODE1_BIN=qumbra-node-resume \
+    NODE2_BIN=qumbra-node-norev  NODE3_BIN=qumbra-node \
+      dc up -d node2 || true
+    sleep 20
+    out="$(dc logs --no-log-prefix --tail 40 node2 2>/dev/null || true)"
+    echo "--- node2 output ---"; echo "$out"; echo "--------------------"
+    if grep -q "carries NO revision" <<<"$out"; then
+      echo "   ✓ the no-revision binary REFUSED to resume (H4)."
+    else
+      die "the no-revision binary did NOT refuse — H4 VIOLATED. STOP, preserve state."
+    fi
+    if docker inspect -f '{{.State.Running}}' "$(cid node2)" 2>/dev/null | grep -q true; then
+      die "node2 is still RUNNING on the no-revision binary — H4 VIOLATED. STOP."
+    fi
+    echo "   restoring node2 to the proper upgrade binary…"
+    NODE0_BIN=qumbra-node-resume NODE1_BIN=qumbra-node-resume \
+    NODE2_BIN=qumbra-node-resume NODE3_BIN=qumbra-node \
+      dc up -d node2
+    echo "   next: $0 halt-drill-d   (destroys this net — capture evidence first)"
+    ;;
+
+  halt-drill-d)
+    guard_rig
+    echo "== DRILL (d) — N1, the stand-down =="
+    echo "   Fresh net, ALL nodes on qumbra-node-cancel: the upgrade at H=$HALT_H was"
+    echo "   stood down, so the net must mine and finalize straight through it."
+    dc down -v >/dev/null 2>&1 || true
+    docker network rm "$NET_SIDEB" 2>/dev/null || true
+    NODE0_BIN=qumbra-node-cancel NODE1_BIN=qumbra-node-cancel \
+    NODE2_BIN=qumbra-node-cancel NODE3_BIN=qumbra-node-cancel \
+      dc up -d node0 node1 node2 node3
+    want=$((HALT_H + 8))
+    echo "   waiting for tip $want (past the cancelled height)…"
+    wait_tip node0 "$want" 2400 || die "the cancelled net never reached $want — capture logs, STOP"
+    sleep 60
+    "$0" halt-status
+    for n in "${NODES[@]}"; do
+      line="$(latest "$n")"
+      r="$(field "$line" regime)"; h="$(field "$line" halt)"; t="$(field "$line" tip)"
+      [[ -n "$t" ]] || die "$n produced no telemetry — capture logs, STOP"
+      [[ "$h" == "-" ]] || die "$n reports halt=$h — a CANCELLED upgrade must schedule no halt. STOP."
+      if [[ "$r" == "Halting" || "$r" == "Halted" ]]; then
+        die "$n reports regime=$r — a CANCELLED upgrade must never halt. STOP."
+      fi
+      (( t > HALT_H )) || die "$n tip=$t did not pass the cancelled height $HALT_H. STOP."
+    done
+    f="$(field "$(latest node0)" final)"
+    [[ -n "$f" && "$f" != "-" ]] && (( f > HALT_H )) \
+      || die "finality did not advance past the cancelled height (final=$f). STOP."
+    echo "   ✓ the stand-down held: mined and finalized through H, never a halt regime."
+    ;;
+
   teardown)
     dc down -v
     docker network rm "$NET_SIDEB" 2>/dev/null || true
     ;;
 
   *)
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
     exit 2
     ;;
 esac

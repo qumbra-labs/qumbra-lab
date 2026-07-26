@@ -164,6 +164,13 @@ fn check_config(args: &[String]) -> Result<(), Box<dyn Error>> {
     let config = NodeConfig::load(cfg_path)?;
     let genesis = GenesisFile::load(&config.genesis_file)?;
     let pf = qumbra_node::run::preflight(&config, &genesis)?;
+    // Halt-height release gates (#74), exactly as `run` would apply them: the
+    // cadence-grid + revision-digest checks, and — if this data dir has already
+    // halted — the resume gate. A pre-flight that skipped these would tell an
+    // operator a swap is safe when startup is about to refuse it.
+    let marker = HaltMarker::load(&config.data_dir)?;
+    RELEASE.validate()?;
+    RELEASE.check_against_marker(marker.as_ref())?;
     println!("qumbra-node check: OK ({cfg_path})");
     println!("  genesis hash: {}", pf.genesis_hash);
     println!("  committee:    N={} quorum={}", pf.committee_size, pf.quorum);
@@ -171,6 +178,7 @@ fn check_config(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  listen:       {}", pf.listen_addr);
     println!("  dial peers:   {}", pf.dial_peers);
     println!("  mining:       {}", pf.mining);
+    println!("  halt plan:    {}", RELEASE.plan.describe());
     Ok(())
 }
 
