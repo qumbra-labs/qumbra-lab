@@ -22,6 +22,8 @@ use qlab_p2p::adapter::MiningClock;
 use qumbra_node::config::NodeConfig;
 use qumbra_node::genesis::GenesisFile;
 use qumbra_node::params_audit;
+use qumbra_node::release::{HaltMarker, RELEASE};
+use qumbra_node::revision::own_frozen_digest_hex;
 use qumbra_node::run::RunningNode;
 use qumbra_node::verifier::select_verifier;
 
@@ -47,6 +49,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         },
         Some("run") => run_node(&args[1..]),
         Some("check") => check_config(&args[1..]),
+        Some("halt-status") => halt_status(&args[1..]),
         Some("audit") => audit(&args[1..]),
         Some("-h") | Some("--help") | None => {
             usage();
@@ -67,6 +70,7 @@ fn usage() {
          qumbra-node run --config FILE          run a full node (TCP + RandomX + disk persistence)\n      \
            [--rehearsal-verifier]               opt in to the NO-OP rehearsal tx verifier (devnet only)\n  \
          qumbra-node check --config FILE        pre-flight a deployed config (genesis + keys), bind nothing\n  \
+         qumbra-node halt-status [--config F]   print this binary's halt schedule + revision digest (#74)\n  \
          qumbra-node audit [--out FILE]         emit the params_devnet ⟷ FROZEN v1.0 convergence audit"
     );
 }
@@ -134,6 +138,16 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  mining:       {}", config.mining);
     println!("  committee keys held: {}", config.committee_key_paths.len());
     println!("  {verifier_log}");
+    // H4: the revision identifier + frozen-parameter digest are logged LOUDLY at
+    // every startup — that is what makes an undocumented parameter change show up
+    // in every log rather than only in a review someone remembers to do.
+    println!("-- halt-height upgrade status (issue #74) --");
+    print!("{}", RELEASE.banner(HaltMarker::load(&config.data_dir).ok().flatten().as_ref()));
+    if let Some(h) = node.halt_at() {
+        println!("  ⚠️  THIS RELEASE HALTS AT HEIGHT {h} — it will stop mining, stop accepting");
+        println!("      blocks, and stop signing checkpoints above it. regime=Halting until the");
+        println!("      boundary finalizes, then regime=Halted.");
+    }
     println!("(Ctrl-C to shut down — snapshot is flushed on exit)");
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -157,6 +171,38 @@ fn check_config(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  listen:       {}", pf.listen_addr);
     println!("  dial peers:   {}", pf.dial_peers);
     println!("  mining:       {}", pf.mining);
+    Ok(())
+}
+
+/// `halt-status` — the operator's read of this binary's upgrade schedule (#74).
+/// Works with or without a `--config`; with one it also reports the node's on-disk
+/// halt marker, i.e. whether this data dir has actually halted.
+fn halt_status(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let marker = match flag(args, "--config") {
+        Some(p) => {
+            let config = NodeConfig::load(p)?;
+            HaltMarker::load(&config.data_dir)?
+        }
+        None => None,
+    };
+    println!("qumbra-node halt-status (issue #74)");
+    print!("{}", RELEASE.banner(marker.as_ref()));
+    println!("  frozen digest (recomputed from THIS binary's constants):");
+    println!("    {}", own_frozen_digest_hex());
+    match RELEASE.validate() {
+        Ok(()) => println!("  validate:     OK — this release is startable"),
+        Err(e) => {
+            println!("  validate:     REFUSES TO START — {e}");
+            return Err(Box::new(e));
+        }
+    }
+    if let Some(m) = &marker {
+        if let Err(e) = RELEASE.check_against_marker(Some(m)) {
+            println!("  resume gate:  REFUSES TO START — {e}");
+            return Err(Box::new(e));
+        }
+        println!("  resume gate:  OK for this data dir");
+    }
     Ok(())
 }
 
