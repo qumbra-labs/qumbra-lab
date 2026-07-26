@@ -15,6 +15,21 @@ https://github.com/lai3d/qumbra-lab/issues/83
 
 **给出去的会给,收进来的直接丢。** 动手前先把 issue 里那张"已存在"表逐项在 `main` 上核一遍(coordinator 在 `93fb944` 上核过,但你自己再核一遍,行号可能漂)。
 
+## 🔴 这根棒跨两个 crate,别在一个里建完才发现
+
+已建好的那半在 `qlab-p2p`。**没建的那半不全在同一个 crate 里**,而"发现机制是 P2P 功能"这个自然读法会把整件事放错地方:
+
+- **入站**:TCP accept 循环在 `qlab-p2p/src/transport.rs:207` → 入站上限归 `qlab-p2p`
+- **出站**:**`qlab-p2p` 里根本没有拨号循环**——在 `node.rs` 里 `grep 'fn dial'` 无结果。真正的拨号器是 `qumbra-node/src/run.rs`(`RedialSlot` `:64`、`redial` map `:199`、`REDIAL_INTERVAL`/`REDIAL_BACKOFF_*` `:56–60`),T0-5 的 S9 落地的,而且**按"配置里的地址"做 key**
+
+所以范围第 4 项(seed bootstrap)和第 5 项(auto-connect + 上限)**必然要动 `qumbra-node`**。学到的地址要么进那套既有的 redial 结构,要么另起一套——**另起一套必须说明理由**,因为两条退避策略和上限各不相同的拨号路径,正是"节点超出了它自以为在执行的上限"的成因。
+
+另外:`dial_peers` 是 TOML 配置字段(`config.rs:42`,由 `deploy/deploy.sh` 逐节点写入),**不是硬编码常量**。把它泛化会牵到 `qumbra-node` 的配置 schema,以及与部署工具的约定。
+
+## 一条 rebase 预告(不是出错)
+
+PR #76 和 PR #79 都在改 `qlab-p2p/src/node.rs`。它们的 hunk 在约 `@196` 和 `@357+`,**不碰 `Addr` stub 所在的 244–248**,所以不会硬冲突;但 #79 那个 hunk 会把下方行号整体下移。**从今天的 `main` 切出去的分支,在它们合并后需要 rebase**——预期之内,不是哪里坏了。
+
 ## 两条最要紧的钉死项
 
 **S2——只 gossip 可拨通的地址。** 这是 NAT 决定的直接后果:T1 接受"只出不入"的参与者,所以地址簿里会有大量连得出去、拨不进来的节点。**把它们 gossip 出去,新加入者会把全部连接预算浪费在拨不通的条目上——那比没有发现机制更糟,因为它看起来像在正常工作。**
