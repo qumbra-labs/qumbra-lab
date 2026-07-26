@@ -1541,6 +1541,11 @@ pub(crate) fn colname(x: usize) -> &'static str {
         (GLO, "GLO"), (GHI, "GHI"), (GF, "GF"), (BPM, "BPM"), (FHG, "FHG"),
         (PREGA, "PREGA"), (CPA, "CPA"), (CPB, "CPB"), (CPL, "CPL"),
         (CONSZ7, "CONSZ7"), (FPI, "FPI"),
+        // The table used to stop at FPI, so every column past it reported
+        // "FPI" — which mislabelled the whole 2b/2d/R1 tail. Kept current.
+        (CSEL, "CSEL"), (FRGM, "FRGM"), (BCBD, "BCBD"), (CHI, "CHI"), (CC, "CC"),
+        (CANON_LO0, "CANON_LO0"), (CANON_LO1, "CANON_LO1"),
+        (TOP7_0, "TOP7_0"), (TOP7_1, "TOP7_1"),
     ];
     let mut best = ("?", 0usize);
     for &(off, nm) in table {
@@ -6597,13 +6602,19 @@ mod tests {
         assert_eq!(n.n_opvs(), 868, "leaf public surface 852 → 868");
         assert_eq!((OPV_F0DIG, OPV_PVS, N_OPVS), (768, 784, 868), "consts track the shape");
         assert_eq!(GATE_WIDTH, 3675, "D3 adds NO gate columns (f0dig needs no register)");
-        // The Σfee rider's invariant: fee is still the opvs TAIL (this is why
-        // f0dig was inserted before the inner PVs, not appended).
-        assert_eq!(
-            n.n_opvs() - crate::m4interior::EPOCH_FEE_LIMBS,
-            n.opv_pvs() + n.n_pvs - crate::m4interior::EPOCH_FEE_LIMBS,
-            "M3 fee tail == opvs tail"
+        // The Σfee rider's invariant: fee is still the opvs TAIL. This is why
+        // f0dig is INSERTED before the inner PVs rather than appended — the
+        // rider reads `opvs[n_opvs-EPOCH_FEE_LIMBS..]` and `m4interior`'s
+        // const-assert only glues EPOCH_FEE_LIMBS to the M3 PV layout; it
+        // cannot see the opvs tail, so an append would have moved the rider's
+        // summands onto digest limbs silently. Structural half of the guard
+        // (the value-level half is in `d3_f0dig_is_the_digest_of_the_public_surface`).
+        let fl = crate::m4interior::EPOCH_FEE_LIMBS;
+        assert!(
+            n.n_opvs() - fl >= n.opv_pvs() && n.n_opvs() <= n.opv_pvs() + n.n_pvs,
+            "the opvs tail must lie inside the inner-PV block, not on f0dig limbs"
         );
+        assert_eq!(n.opv_f0dig() + F0DIG_LIMBS, n.opv_pvs(), "f0dig precedes the inner PVs");
         // -- interior --
         assert_eq!(w.n_pvs, n.n_opvs(), "interior inner PVs = the leaf's opvs");
         assert_eq!(w.opv_f0dig(), 5 * 8 * 16, "wide has 5 caps → 640");
@@ -6735,6 +6746,92 @@ mod tests {
                  house rule — the bench quotient sizing assumes it; see dump_constraint)"
             );
         }
+    }
+
+    /// AUDIT (issue #24 D3 side-find, coordinator-requested): enumerate the
+    /// "soft surface" — columns the trace builder WRITES but no constraint ever
+    /// READS. Those are exactly the cells a malicious prover is free to choose,
+    /// so a filled-but-unreferenced column is either dead weight or a hole.
+    ///
+    /// D3 exists because four of them (`w0c`/`w1c`/`pbit`/`obit`) had been
+    /// filled since inc-4 and referenced by nothing. This test answers "are
+    /// there others?" cheaply and permanently:
+    ///   - READ set: walk every symbolic constraint's expression DAG and collect
+    ///     every main-trace column index (current- and next-row entries).
+    ///   - WRITTEN set: build the honest narrow trace and mark every column with
+    ///     a nonzero cell. (A column written only zeros is indistinguishable
+    ///     from an untouched one and is not a degree of freedom in practice —
+    ///     noted as the one gap in this method.)
+    /// Diagnostic, not a gate: it PRINTS the list. Turning it into an assertion
+    /// is the follow-up audit issue's call, not D3's.
+    #[test]
+    fn d3_audit_filled_but_unconstrained_columns() {
+        use p3_air::symbolic::{
+            get_symbolic_constraints, AirLayout, BaseEntry, BaseLeaf, SymbolicExpression,
+        };
+        use std::collections::BTreeSet;
+        fn walk(e: &SymbolicExpression<Val>, seen: &mut BTreeSet<usize>) {
+            use p3_air::symbolic::SymbolicExpr::*;
+            match e {
+                Leaf(BaseLeaf::Variable(v)) => {
+                    if matches!(v.entry, BaseEntry::Main { .. }) {
+                        seen.insert(v.index);
+                    }
+                }
+                Leaf(_) => {}
+                Add { x, y, .. } | Sub { x, y, .. } | Mul { x, y, .. } => {
+                    walk(x, seen);
+                    walk(y, seen);
+                }
+                Neg { x, .. } => walk(x, seen),
+            }
+        }
+        let air = VerifierGateAir::new();
+        let layout = AirLayout::from_air::<Val>(&air);
+        let mut read = BTreeSet::new();
+        for c in get_symbolic_constraints::<Val, _>(&air, layout) {
+            walk(&c, &mut read);
+        }
+        let (sched, pvs, _) = shared();
+        let (trace, _meta) = {
+            let _g = heavy_lock();
+            build_gate_trace(sched, pvs, &GateShape::narrow(), 0)
+        };
+        let w = GATE_WIDTH;
+        let mut written = vec![false; w];
+        for row in 0..trace.height() {
+            for cidx in 0..w {
+                if trace.values[row * w + cidx] != Val::ZERO {
+                    written[cidx] = true;
+                }
+            }
+        }
+        let soft: Vec<usize> = (0..w).filter(|c| written[*c] && !read.contains(c)).collect();
+        let dead: Vec<usize> = (0..w).filter(|c| !written[*c] && !read.contains(c)).collect();
+        eprintln!(
+            "column audit (narrow, {w} cols): {} read by constraints, {} written nonzero",
+            read.len(),
+            written.iter().filter(|x| **x).count()
+        );
+        eprintln!("FILLED BUT UNCONSTRAINED ({}): ", soft.len());
+        let mut runs: Vec<(usize, usize, &str)> = vec![];
+        for &cidx in &soft {
+            match runs.last_mut() {
+                Some(last) if last.1 + 1 == cidx && last.2 == colname(cidx) => last.1 = cidx,
+                _ => runs.push((cidx, cidx, colname(cidx))),
+            }
+        }
+        for (a, b, nm) in &runs {
+            eprintln!("  {a}..={b} ({}) in region {nm}", b - a + 1);
+        }
+        eprintln!("neither written nor read ({}):", dead.len());
+        for &cidx in &dead {
+            eprintln!("  {cidx} in region {}", colname(cidx));
+        }
+        // Written-all-zero columns: read by a constraint but never carrying
+        // data. Listed for completeness — they are not a degree of freedom.
+        let zeroed: Vec<usize> = (0..w).filter(|c| !written[*c] && read.contains(c)).collect();
+        eprintln!("written-all-zero but constrained ({}): {zeroed:?}", zeroed.len());
     }
 
     /// Diagnostic (relay debugging): dump a constraint's referenced columns
@@ -7167,6 +7264,29 @@ mod tests {
         // …and the same digest the recorder's challenger actually produced (so
         // the circuit's flush-output pin and this native recompute agree).
         assert_eq!(dig, sched.flushes[0].digest, "f0dig != the F0 flush digest");
+
+        // VALUE-LEVEL guard for f0dig's PLACEMENT (coordinator §4). The 棒 3-3
+        // epoch Σfee rider adds up `opvs[n_opvs - EPOCH_FEE_LIMBS ..]`, trusting
+        // that the opvs tail is the M3 fee. Nothing in `m4interior`'s
+        // const-assert can see that — it only ties EPOCH_FEE_LIMBS to the M3 PV
+        // layout — so had f0dig been APPENDED, the rider would have started
+        // summing digest limbs with every test still green. This asserts the
+        // tail is the fee by VALUE, so the next person to append to the opvs
+        // is stopped by a test rather than by a commit message.
+        let fl = crate::m4interior::EPOCH_FEE_LIMBS;
+        let rr = monty_rr();
+        for j in 0..fl {
+            assert_eq!(
+                opvs[shape.n_opvs() - fl + j],
+                pvs[qlab_air::narrow::PV_FEE + j] * rr,
+                "opvs tail limb {j} must be the M3 fee, not a digest limb"
+            );
+        }
+        assert_eq!(
+            qlab_air::narrow::PV_LEN,
+            qlab_air::narrow::PV_FEE + fl,
+            "M3 fee is the inner-PV tail"
+        );
     }
 
     /// Diagnostic (relay): column-accounting breakdown by region.
