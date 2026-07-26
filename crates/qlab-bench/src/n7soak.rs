@@ -358,13 +358,18 @@ pub fn scenario_adversarial_peers() -> SoakResult {
         use qlab_node::NodeState as _;
         nodes[1].p2p.node().state().tip_height()
     };
-    let bad_block_header = BlockHeader::child_of(&BlockHeader::genesis(256, 0), 75, 256, [7; 32]);
+    // The header must commit to the body it announces (issue #77) — otherwise the
+    // binding rejects it first and this case would no longer test what it claims.
+    let bad_tx = soak_tx(anchor, 3, false);
+    let bad_body = qlab_devnet::body::BlockBody { txs: vec![bad_tx.clone()], coinbase: 0 };
+    let bad_block_header =
+        BlockHeader::child_of(&BlockHeader::genesis(256, 0), 75, 256, bad_body.commitment());
     let ann = BlockAnnounce {
         header: bad_block_header,
         nonce: 0,
         coinbase: 0,
         short_ids: Vec::new(),
-        prefilled: vec![PrefilledTx { index: 0, tx: soak_tx(anchor, 3, false) }],
+        prefilled: vec![PrefilledTx { index: 0, tx: bad_tx }],
     };
     inject!(MsgType::BlockAnnounce, encode_announce(&ann));
     run(&mut nodes);
@@ -374,6 +379,36 @@ pub fn scenario_adversarial_peers() -> SoakResult {
     };
     ok &= c_ok;
     notes.push(format!("bad-block not-applied:{c_ok}"));
+
+    // (c2) issue #77 — an HONEST header announced with an EMPTY body. Every other
+    //      body rule passes trivially on an empty body, so before the binding
+    //      landed this was applied to state under a valid header. Must be rejected,
+    //      penalized, and never applied.
+    let score_c2 = peer_score(&nodes[1], PeerId(1));
+    let honest_body =
+        qlab_devnet::body::BlockBody { txs: vec![soak_tx(anchor, 4, true)], coinbase: 0 };
+    let honest_header =
+        BlockHeader::child_of(&BlockHeader::genesis(256, 0), 75, 256, honest_body.commitment());
+    let ann_empty = BlockAnnounce {
+        header: honest_header,
+        nonce: 0,
+        coinbase: 0,
+        short_ids: Vec::new(),
+        prefilled: Vec::new(),
+    };
+    inject!(MsgType::BlockAnnounce, encode_announce(&ann_empty));
+    run(&mut nodes);
+    let c2_ok = {
+        use qlab_node::NodeState as _;
+        nodes[1].p2p.node().state().tip_height() == state_tip_before
+            && {
+                use qlab_p2p::n1::ChainView as _;
+                !nodes[1].p2p.node().has_header(&honest_header.header_hash())
+            }
+            && peer_score(&nodes[1], PeerId(1)) < score_c2
+    };
+    ok &= c2_ok;
+    notes.push(format!("empty-body-under-honest-header rejected+penalized:{c2_ok}"));
 
     // (d) well-formed sub-quorum checkpoint (2 of quorum-3 votes) → NOT finalized and
     //     NOT penalized. Since M10-T0-5 (task-book S5), a well-formed partial vote set
