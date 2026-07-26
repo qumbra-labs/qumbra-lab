@@ -28,9 +28,9 @@
 //!   final by construction rather than by convention.
 //! - [`halt_regime`] — the `Halting` → `Halted` regime derivation (H2).
 //! - [`PostHaltRules`] — the post-halt rule domain. The **inert** rule change the
-//!   drill exercises is a PoW-seed domain separation above the boundary
-//!   ([`seed_for_height`]): old-binary blocks above H are mined against the
-//!   pre-halt seed, so under the post-halt rules their PoW does not verify. That
+//!   drill exercises is a PoW-value domain separation above the boundary
+//!   ([`pow_value`]): old-binary blocks above H are mined against the pre-halt
+//!   value, so under the post-halt rules their PoW does not meet the target. That
 //!   is what makes "those blocks can never finalize" structural rather than
 //!   accidental — see the module note below.
 //!
@@ -44,7 +44,7 @@
 //! must therefore also change *some* rule, or it proves nothing.
 //!
 //! The smallest such change that touches **no** FROZEN v1.0 value (H5) is to
-//! domain-separate the PoW seed above the boundary with the revision's own digest:
+//! domain-separate the PoW value above the boundary with the revision's own digest:
 //! the revision identifier itself becomes the rule delta. Nothing else moves — no
 //! header layout, no genesis, no frozen constant, no emission, no fee.
 //!
@@ -61,9 +61,9 @@ use crate::hash::keccak256;
 use crate::header::Hash32;
 use crate::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
 
-/// Domain tag mixed into a post-halt PoW seed, so a post-halt seed can never
-/// collide with a raw key-block hash.
-pub const POST_HALT_SEED_TAG: &[u8] = b"qumbra:post-halt-seed:v1";
+/// Domain tag mixed into a post-halt PoW value, so a post-halt value can never
+/// collide with a raw engine hash.
+pub const POST_HALT_POW_TAG: &[u8] = b"qumbra:post-halt-pow:v1";
 
 /// Why a release's halt schedule is not startable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -173,7 +173,7 @@ impl HaltPlan {
 /// The post-halt rule set a resumed release runs above the upgrade boundary.
 ///
 /// `domain` is the resuming revision's digest; above `from_height` it is mixed
-/// into the PoW seed ([`seed_for_height`]). Blocks mined under the pre-halt rules
+/// into the PoW value ([`pow_value`]). Blocks mined under the pre-halt rules
 /// above the boundary therefore fail PoW under the post-halt rules, and vice
 /// versa — a clean bilateral fork at exactly the announced height, arbitrated by
 /// finality rather than by luck.
@@ -247,20 +247,34 @@ impl RuleSchedule {
     }
 }
 
-/// The PoW seed a block at `height` is mined and validated against, under `rules`.
+/// The **PoW value** a block at `height` is mined against and validated against,
+/// under `rules` — i.e. the value compared to the difficulty target.
 ///
-/// Below/at the upgrade boundary this is the raw key-block seed, byte-identical to
-/// the pre-halt rules — so **no pre-halt block changes meaning**, ever. Above the
-/// boundary it is domain-separated by the active revision's digest.
-pub fn seed_for_height(raw_seed: Vec<u8>, height: u64, rules: &RuleSchedule) -> Vec<u8> {
+/// At and below the upgrade boundary this is the engine's raw PoW hash,
+/// byte-identical to the pre-halt rules — so **no pre-halt block changes meaning**,
+/// ever. Above the boundary it is `keccak256(tag ‖ revision-digest ‖ raw)`.
+///
+/// **Why the domain is mixed into the PoW *value* and not the RandomX key seed.**
+/// Mixing it into the seed was the first design, and it is wrong: the
+/// [`crate::pow::KeccakPow`] placeholder engine documents that it *ignores* the
+/// seed, so a seed-level domain would be a rule change under RandomX and a no-op
+/// under Keccak. A consensus rule whose force depends on which PoW engine is
+/// compiled in is not a consensus rule. Mixing the output keeps the rule at the
+/// consensus layer, identical for every engine behind the [`crate::pow::PowEngine`]
+/// trait — including any future one.
+///
+/// The work cost is unchanged (one extra Keccak per nonce trial), and the
+/// difficulty target is untouched: this changes *which* hashes count, not how many
+/// are needed.
+pub fn pow_value(raw: Hash32, height: u64, rules: &RuleSchedule) -> Hash32 {
     match rules.domain_at(height) {
-        None => raw_seed,
+        None => raw,
         Some(domain) => {
-            let mut buf = Vec::with_capacity(POST_HALT_SEED_TAG.len() + 32 + raw_seed.len());
-            buf.extend_from_slice(POST_HALT_SEED_TAG);
+            let mut buf = Vec::with_capacity(POST_HALT_POW_TAG.len() + 64);
+            buf.extend_from_slice(POST_HALT_POW_TAG);
             buf.extend_from_slice(domain);
-            buf.extend_from_slice(&raw_seed);
-            keccak256(&buf).to_vec()
+            buf.extend_from_slice(&raw);
+            keccak256(&buf)
         }
     }
 }
@@ -351,37 +365,36 @@ mod tests {
     }
 
     #[test]
-    fn v1_0_rules_accept_every_height_and_never_change_a_seed() {
+    fn v1_0_rules_accept_every_height_and_never_change_a_pow_value() {
         let r = RuleSchedule::V1_0;
         for h in [0, 1, H, H + 1, 1_000_000] {
             assert!(r.accepts_height(h));
             assert_eq!(r.domain_at(h), None);
-            assert_eq!(seed_for_height(vec![7; 32], h, &r), vec![7; 32]);
+            assert_eq!(pow_value([7; 32], h, &r), [7; 32]);
         }
     }
 
     #[test]
-    fn post_halt_domain_changes_seeds_only_strictly_above_the_boundary() {
+    fn post_halt_domain_changes_pow_values_only_strictly_above_the_boundary() {
         let rules = RuleSchedule {
             halt: HaltPlan::None,
             post_halt: Some(PostHaltRules { from_height: H, domain: [0xAB; 32] }),
         };
-        let raw = vec![9u8; 32];
-        // At and below the boundary the seed is byte-identical to the pre-halt
+        let raw: Hash32 = [9u8; 32];
+        // At and below the boundary the PoW value is byte-identical to the pre-halt
         // rules — no pre-halt block ever changes meaning.
-        assert_eq!(seed_for_height(raw.clone(), H - 1, &rules), raw);
-        assert_eq!(seed_for_height(raw.clone(), H, &rules), raw);
-        // Above it, the seed is domain-separated.
-        let post = seed_for_height(raw.clone(), H + 1, &rules);
-        assert_ne!(post, raw, "post-halt seed must differ — this is the rule change");
-        assert_eq!(post.len(), 32);
+        assert_eq!(pow_value(raw, H - 1, &rules), raw);
+        assert_eq!(pow_value(raw, H, &rules), raw);
+        // Above it, the value is domain-separated.
+        let post = pow_value(raw, H + 1, &rules);
+        assert_ne!(post, raw, "post-halt PoW value must differ — this is the rule change");
         // Deterministic, and distinct per revision domain.
-        assert_eq!(post, seed_for_height(raw.clone(), H + 1, &rules));
+        assert_eq!(post, pow_value(raw, H + 1, &rules));
         let other = RuleSchedule {
             halt: HaltPlan::None,
             post_halt: Some(PostHaltRules { from_height: H, domain: [0xCD; 32] }),
         };
-        assert_ne!(post, seed_for_height(raw, H + 1, &other), "distinct revisions ⇒ distinct rules");
+        assert_ne!(post, pow_value(raw, H + 1, &other), "distinct revisions ⇒ distinct rules");
     }
 
     #[test]
