@@ -232,10 +232,22 @@ and inspect a halted node.
   a fault.
 - **Old-binary miners will keep producing blocks past H, and that is expected.**
   `committee-and-governance.md` §4 is explicit about it: unlike pure BFT, the
-  hybrid chain does not simply stop. Those blocks can never finalize; the fork
-  resolves to the checkpointed branch once miners follow the finality signal. Do
-  not treat a growing un-upgraded branch as an incident. **Do** treat it as an
-  incident if that branch ever *finalizes* above H — see §7.8.
+  hybrid chain does not simply stop. Do not treat a growing un-upgraded branch as
+  an incident. **Do** treat it as an incident if that branch ever *finalizes* above
+  H — see §7.8.
+
+  Two telemetry counters say which layer is refusing those blocks, and they mean
+  different things:
+
+  | Counter | Layer | Meaning |
+  |---|---|---|
+  | `hignore=` climbing | release | **you are halted.** The block was not judged invalid — this node has simply stopped and will not act on it. The sender is *not* penalized: a peer still mining above the halt height is on a different release, not misbehaving. |
+  | `powrej=` climbing | header validation | **the post-halt rules are in force.** The block's PoW does not meet the target under the new revision's domain, so it is invalid on this net and never reaches fork choice. |
+
+  Before the swap you should see `hignore` rising and `powrej` flat. After the
+  swap, the reverse. `powrej` rising *before* the swap, or `hignore` rising after
+  it, means a node is running a binary you did not think it was running — check
+  `halt-status` on every node.
 - A committee member that mined past H on the old binary and **voted** there has
   burned those slots: its never-double-sign ledger will refuse to vote for the
   upgraded branch at the same heights, and the member simply contributes nothing
@@ -279,4 +291,7 @@ in this section is operations; this is an incident.
 | New binary exits at startup | read the error (§7.5) | usually the wrong build — the gate is working |
 | `final` flat after the swap | how many keys upgraded? | below quorum 15 → expected; upgrade more |
 | A peer's tip climbing past `halt` | an old-binary miner | expected (§4); watch that it never *finalizes* |
+| `hignore=` climbing | you are halted; peers still mining | expected during the upgrade window; no peer is at fault |
+| `powrej=` climbing | post-halt rules refusing old-rule blocks | expected after the swap |
+| `powrej=` climbing *before* the swap | wrong binary somewhere | run `halt-status` on every node |
 | An un-upgraded branch finalizes above H | — | 🛑 stop everything, preserve state |

@@ -46,7 +46,9 @@ use qlab_devnet::params_devnet::{
 };
 use qlab_devnet::pow::PowEngine;
 use qlab_devnet::halt::{regime as halt_regime, RuleSchedule};
-use qlab_devnet::validation::{expected_difficulty, pow_seed, validate_header_under};
+use qlab_devnet::validation::{
+    expected_difficulty, pow_seed, validate_header_under, ValidationError,
+};
 
 use qlab_node::mempool::TxId;
 use qlab_node::recovery::Finalizer;
@@ -144,6 +146,27 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// its compile-time release schedule once at startup via
     /// [`Self::set_rule_schedule`]; there is no config/CLI/env path to it (H1).
     rules: RuleSchedule,
+    /// Counters that attribute ingest refusals to a layer (issue #74 drill
+    /// evidence). Surfaced in the binary's telemetry line so the docker drill can
+    /// answer "which layer rejected the old branch?" from the logs rather than from
+    /// a narrative.
+    ingest_counters: IngestCounters,
+}
+
+/// Layer-attributed ingest refusal counts (issue #74).
+///
+/// The two are deliberately separate because they are different claims about the
+/// upgrade. `halt_ignored` is the **release** layer: this node has stopped, so it
+/// will not act on the block (and does not blame the sender). `pow_rejected` is the
+/// **header-validation** layer: under the post-halt rule domain the block's PoW does
+/// not meet the target, so it is invalid, not merely unwanted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IngestCounters {
+    /// Headers/blocks not acted on because this release is halted (release layer).
+    pub halt_ignored: u64,
+    /// Headers rejected because the PoW value did not meet the target
+    /// (header-validation layer).
+    pub pow_rejected: u64,
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
@@ -226,6 +249,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             clock: 0,
             mining_clock: MiningClock::default(),
             rules: RuleSchedule::V1_0,
+            ingest_counters: IngestCounters::default(),
         }
     }
 
@@ -254,6 +278,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// The installed rule schedule.
     pub fn rules(&self) -> &RuleSchedule {
         &self.rules
+    }
+
+    /// Layer-attributed ingest refusal counts (issue #74 drill evidence).
+    pub fn ingest_counters(&self) -> IngestCounters {
+        self.ingest_counters
     }
 
     /// The height this node halts at, if its release carries one.
@@ -317,27 +346,36 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // NOT penalised: a node still on the old binary offering post-H blocks is on
         // a different release, not misbehaving (the S5 discipline from #70).
         if !self.rules.accepts_height(header.height) {
-            return IngestOutcome::Rejected("above halt height");
+            self.ingest_counters.halt_ignored += 1;
+            return IngestOutcome::Ignored("above halt height");
         }
         // Real PoW + LWMA difficulty + key-seed validation (N3), under this
-        // release's rules (the PoW seed is domain-separated above an upgrade
+        // release's rules (the PoW VALUE is domain-separated above an upgrade
         // boundary; at and below it, byte-identical to the v1.0 rules).
-        if validate_header_under(
+        if let Err(e) = validate_header_under(
             &self.chain,
             &self.pow,
             &header,
             self.block_time,
             self.schedule,
             &self.rules,
-        )
-        .is_err()
-        {
+        ) {
             // Unknown parent → orphan (drives header-first sync); anything else is
-            // an invalid header (bad PoW / difficulty / timestamp / height).
-            return match self.chain.header(&header.prev) {
-                None if header.height > 0 => IngestOutcome::Orphan,
-                _ => IngestOutcome::Rejected("invalid header"),
-            };
+            // an invalid header. The reason string names the FAILING CHECK, not just
+            // "invalid header": issue #74's drill has to be able to say which layer
+            // rejected an old-binary block — the release layer (halt) or the
+            // header-validation layer (the post-halt PoW domain) — and a single
+            // catch-all string cannot answer that.
+            if matches!(e, ValidationError::UnknownParent) && header.height > 0 {
+                return IngestOutcome::Orphan;
+            }
+            if self.chain.header(&header.prev).is_none() && header.height > 0 {
+                return IngestOutcome::Orphan;
+            }
+            if matches!(e, ValidationError::PowUnsatisfied) {
+                self.ingest_counters.pow_rejected += 1;
+            }
+            return IngestOutcome::Rejected(Self::header_reject_reason(&e));
         }
         match self.chain.insert_header(header) {
             Ok(_) => {
@@ -435,6 +473,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         let cp = Checkpoint::new(height, block_hash, block_hash);
         let votes = finalizers.iter_mut().filter_map(|f| f.sign(&cp).ok()).collect();
         Some((cp, votes))
+    }
+
+    /// Name the header check that failed, so a rejection is attributable to a
+    /// layer rather than to "something was wrong" (issue #74 drill evidence).
+    fn header_reject_reason(err: &ValidationError) -> &'static str {
+        match err {
+            ValidationError::UnknownParent => "invalid header: unknown parent",
+            ValidationError::BadHeight => "invalid header: height",
+            ValidationError::NonMonotonicTimestamp => "invalid header: timestamp",
+            ValidationError::WrongDifficulty { .. } => "invalid header: difficulty",
+            // Under a post-halt rule domain this is the domain separation biting:
+            // a block mined for the pre-halt rules does not meet the target here.
+            ValidationError::PowUnsatisfied => "invalid header: pow",
+            ValidationError::UnknownSeed => "invalid header: seed",
+        }
     }
 
     fn reject_reason(err: &MempoolError) -> &'static str {
@@ -1128,6 +1181,7 @@ mod tests {
     // ---- issue #74: halt-height upgrade mechanism -----------------------------
 
     use qlab_devnet::halt::{HaltPlan, PostHaltRules};
+    use qlab_devnet::validation::{validate_header_under, ValidationError};
 
     /// The drill's halt height, on the cadence grid.
     const DRILL_H: u64 = 16;
@@ -1196,7 +1250,14 @@ mod tests {
         // (2) rejects blocks above H — and does NOT penalise the sender: the peer is
         //     on a different release, not misbehaving.
         let (_, verdict) = mine_then_offer(&mut old, &mut up);
-        assert_eq!(verdict, IngestOutcome::Rejected("above halt height"));
+        assert_eq!(
+            verdict,
+            IngestOutcome::Ignored("above halt height"),
+            "Ignored, NOT Rejected — an old-binary peer is on a different release, not \
+             misbehaving, and must not be scored as an invalid-object sender"
+        );
+        assert_eq!(up.ingest_counters().halt_ignored, 1, "attributed to the RELEASE layer");
+        assert_eq!(up.ingest_counters().pow_rejected, 0, "…not to header validation");
         assert_eq!(up.tip_height(), DRILL_H, "tip pinned at the boundary");
         // (3) regime: Halting until H's checkpoint finalizes…
         assert_eq!(up.finality_status(), FinalityStatus::Halting);
@@ -1275,8 +1336,12 @@ mod tests {
         // --- 1. The old binary keeps mining past H. It GROWS. ---
         for _ in 0..5 {
             let (_, verdict) = mine_then_offer(&mut old, &mut up);
-            assert_eq!(verdict, IngestOutcome::Rejected("above halt height"));
+            assert_eq!(verdict, IngestOutcome::Ignored("above halt height"));
         }
+        // WHILE HALTED the refusal is at the RELEASE layer: nothing was judged
+        // invalid, we simply stopped. No penalty is owed to the old miner.
+        assert_eq!(up.ingest_counters().halt_ignored, 5);
+        assert_eq!(up.ingest_counters().pow_rejected, 0);
         assert_eq!(old.tip_height(), DRILL_H + 5, "the old branch grows — expected, not a defect");
         assert_eq!(up.tip_height(), DRILL_H, "the halted node stays at the boundary");
 
@@ -1298,10 +1363,30 @@ mod tests {
                 // The first old-rule block above the boundary attaches to a parent
                 // the upgraded node HAS, so it is fully validated — and its PoW does
                 // not meet the target under the post-halt rules.
+                //
+                // WHICH LAYER: this is the HEADER-VALIDATION layer, not the release
+                // layer. After the swap the node has no halt at all; the block is
+                // refused because the post-halt rule domain makes it invalid. The
+                // exact failing check is asserted directly below, against
+                // `validate_header_under`, so the claim is about `PowUnsatisfied`
+                // and not about a coincidental difficulty/timestamp mismatch.
                 assert_eq!(
                     verdict,
-                    IngestOutcome::Rejected("invalid header"),
-                    "the first post-H block built under PRE-halt rules must not verify"
+                    IngestOutcome::Rejected("invalid header: pow"),
+                    "the first post-H block built under PRE-halt rules must fail PoW"
+                );
+                assert_eq!(
+                    validate_header_under(
+                        up.chain(),
+                        &KeccakPow,
+                        &hdr,
+                        easy_sim().block_time_secs,
+                        KeyBlockSchedule::new(easy_sim().key_epoch_blocks, easy_sim().key_epoch_lag),
+                        up.rules(),
+                    ),
+                    Err(ValidationError::PowUnsatisfied),
+                    "the failing check is the PoW target under the post-halt domain — \
+                     the rejection is attributable to the header-validation layer"
                 );
             } else {
                 // Everything above it hangs off a block the upgraded node refused,
@@ -1311,13 +1396,26 @@ mod tests {
             assert_ne!(up.tip_height(), h, "no old-rule block ever becomes the upgraded tip");
         }
         assert_eq!(up.tip_height(), DRILL_H, "the upgraded node is still at the boundary");
+        // AFTER the swap the refusal moved layers: no further halt-ignores (this
+        // release has no halt), and the PoW counter took the hit instead. That
+        // difference is exactly what the run doc must report.
+        assert_eq!(up.ingest_counters().halt_ignored, 5, "unchanged since the swap");
+        assert_eq!(
+            up.ingest_counters().pow_rejected,
+            1,
+            "post-swap refusal is at the header-validation layer (domain separation)"
+        );
 
         // --- 4. …and the fork is bilateral: the upgraded branch does not verify
         //        under the old rules either. Neither side can silently absorb the
         //        other; only finality arbitrates. ---
         let (new_hdr, verdict) = mine_then_offer(&mut up, &mut old);
         assert_eq!(new_hdr.height, DRILL_H + 1, "the upgraded net resumes AT the boundary");
-        assert_eq!(verdict, IngestOutcome::Rejected("invalid header"));
+        assert_eq!(
+            verdict,
+            IngestOutcome::Rejected("invalid header: pow"),
+            "…and the old binary rejects the NEW block at the same layer, for the same reason"
+        );
 
         // --- 5. The checkpointed branch wins: the upgraded committee finalizes
         //        past H; the old branch's finality is frozen at H forever. ---

@@ -438,10 +438,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // release has none, the height when it does. Combined with `regime=`, the
         // soak monitor can tell "paused at the announced boundary" from "stuck".
         let halt_str = self.halt_at.map(|h| h.to_string()).unwrap_or_else(|| "-".to_string());
+        // Layer-attributed refusal counts (#74). `hignore` = this release is halted
+        // and did not act on a peer's block (RELEASE layer, no fault attributed);
+        // `powrej` = a header failed the PoW target, which above an upgrade boundary
+        // is the post-halt rule domain biting (HEADER-VALIDATION layer). The drill's
+        // "which layer rejected the old branch?" question is answered from these two
+        // numbers in the logs, not from a narrative.
+        let ic = node.ingest_counters();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={}",
             t.tip_height, final_str, t.stall_depth, age_str, tip_diff,
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
+            ic.halt_ignored, ic.pow_rejected,
         )
     }
 
@@ -1020,6 +1028,9 @@ mod tests {
         let line = node.telemetry_sample();
         assert!(line.contains("regime=Halting"), "at H, unfinalized ⇒ Halting: {line}");
         assert!(line.contains(&format!("halt={DH}")), "the schedule is on the wire: {line}");
+        // The layer-attribution counters ride the same line (#74 drill evidence).
+        assert!(line.contains("hignore="), "release-layer refusals on the wire: {line}");
+        assert!(line.contains("powrej="), "header-layer refusals on the wire: {line}");
         node.maintain_halt_marker();
         let m = HaltMarker::load(&config.data_dir).unwrap().expect("marker written on reaching H");
         assert_eq!(m.height, DH);

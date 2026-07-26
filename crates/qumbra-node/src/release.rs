@@ -452,6 +452,40 @@ mod tests {
         );
     }
 
+    /// **The domain separation is a property of the MECHANISM, not a drill prop**
+    /// (coordinator ratification, 2026-07-26). Any release that resumes past an
+    /// upgrade boundary necessarily carries a post-halt rule domain — there is no
+    /// constructible release that resumes with the pre-halt rules still in force.
+    /// Without this, a real upgrade would lack the very property the drill proves,
+    /// which would make the drill evidence about a path production never takes.
+    #[test]
+    fn resuming_always_carries_a_post_halt_rule_domain() {
+        for h in [8u64, 16, 1_152] {
+            let r = Release {
+                name: "test",
+                plan: HaltPlan::None,
+                revision: Some(REVISION_V1_0_1_DRILL),
+                resumes_from: Some(h),
+            };
+            let s = r.rule_schedule().expect("a declared resume is startable");
+            let p = s.post_halt.expect("resuming ⇒ post-halt rules, always");
+            assert_eq!(p.from_height, h, "the domain starts at exactly the boundary");
+            assert_eq!(p.domain, REVISION_V1_0_1_DRILL.digest());
+            // Rules are unchanged at and below the boundary, changed above it.
+            assert_eq!(s.domain_at(h), None);
+            assert_eq!(s.domain_at(h + 1), Some(&p.domain));
+        }
+        // The only way to resume WITHOUT a domain is to carry no revision — which
+        // is refused outright (H4), so the escape hatch does not exist.
+        let no_rev = Release {
+            name: "test",
+            plan: HaltPlan::None,
+            revision: None,
+            resumes_from: Some(16),
+        };
+        assert!(no_rev.rule_schedule().is_err());
+    }
+
     /// **DRILL (c)** — a binary that would resume past a halt but carries no
     /// revision digest refuses to start. Both at plain validation…
     #[test]

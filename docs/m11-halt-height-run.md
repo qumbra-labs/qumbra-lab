@@ -165,45 +165,80 @@ for exactly H1's reason. It keeps the cancelled height rather than reverting to
    cancellation for H is obviously the wrong binary, and the resume gate says so
    instead of silently resuming.
 
-### The inert change the drill runs on (H5)
+### The post-halt rule domain — a property of the mechanism (ratified 2026-07-26)
 
 The drill upgrades from revision `v1.0` to `v1.0.1-drill`. It moves **no** FROZEN
 v1.0 value — the two revisions' frozen digests are byte-identical — and changes
-only the revision identifier.
+only the revision identifier (H5).
 
 For that to be an *upgrade* rather than a no-op, the identifier has to be visible
-to consensus above the boundary, and here is the reasoning, stated because it is
-the one design call in this baton that is not directly dictated by §4:
+to consensus above the boundary. §4's honesty note ("old-binary miners can keep
+producing blocks past the halt-height, but those blocks can never finalize") only
+holds if the upgraded population can *tell* a pre-halt block from a post-halt one.
+If the post-halt rules were byte-identical to the pre-halt rules, an old miner's
+branch above H would be perfectly valid to the upgraded net, heaviest-chain would
+arbitrate, and the upgraded committee could *legitimately* finalize it — the
+opposite of what §4 promises, and drill (a) would pass while proving nothing.
 
-§4's honesty note ("old-binary miners can keep producing blocks past the
-halt-height, but those blocks can never finalize") only holds if the upgraded
-population can *tell* a pre-halt block from a post-halt one. If the post-halt rules
-were byte-identical to the pre-halt rules, an old miner's branch above H would be
-perfectly valid to the upgraded net, heaviest-chain would arbitrate, and the old
-branch could finalize — the opposite of what §4 promises. So the drill must change
-some rule, or drill (a) proves nothing.
+**Coordinator ratification (2026-07-26): adopted, and deliberately not confined to
+the drill.** Without domain separation, "those blocks can never finalize" is a
+statement about what the committee chooses to do; with it, it is a statement about
+what the protocol permits. A drill that proved a property the real upgrade path
+does not have would be its own kind of dishonesty, so the rule domain is a property
+of **every** resuming release, not a drill prop. `Release::rule_schedule` makes it
+unconstructible to resume past a boundary without one — the only release that could
+is one carrying no revision, which H4 refuses outright
+(`resuming_always_carries_a_post_halt_rule_domain`).
 
-The smallest change that touches no frozen value is a **PoW-value domain
-separation** above the boundary: for heights > H the value compared to the
-difficulty target is `keccak256(tag ‖ revision-digest ‖ engine-hash)` instead of
-the raw engine hash. Work cost is unchanged (one extra Keccak per nonce trial) and
-the difficulty target is untouched — it changes *which* hashes count, not how many
-are needed. Below and at the boundary it is byte-identical to the v1.0 rules, so no
-pre-halt block ever changes meaning.
+The mechanism: for heights **> H** the value compared to the difficulty target is
+`keccak256(tag ‖ revision-digest ‖ engine-hash)` instead of the raw engine hash.
+Work cost is unchanged (one extra Keccak per nonce trial), the difficulty target is
+untouched — it changes *which* hashes count, not how many are needed. At and below
+the boundary it is byte-identical to the v1.0 rules, so no pre-halt block ever
+changes meaning.
 
-> **Design note, recorded honestly:** the first implementation domain-separated the
-> RandomX *key seed* instead, and the in-process drill caught that it was wrong.
-> `KeccakPow` documents that it ignores the seed, so a seed-level domain would have
-> been a real rule change under RandomX and a silent no-op under Keccak. A
-> consensus rule whose force depends on which PoW engine is compiled in is not a
-> consensus rule. Mixing the PoW *value* keeps the rule at the consensus layer,
-> identical for every engine behind the `PowEngine` trait including future ones.
-> This choice is flagged for coordinator ratification: it is a mechanism decision,
-> not one the ratified H1–H5 dictate.
+**H5 is not violated.** The revision moves no FROZEN v1.0 value; the PoW
+instantiation is a `[full-M8]` open item in protocol-spec, not a frozen constant.
+The precedent is §4's own Monero citation — Monero changes the PoW *algorithm* at
+each scheduled fork; domain separation is the mildest form of the same move.
+
+> **Design note, recorded rather than erased:** the first implementation
+> domain-separated the RandomX *key seed*, and the in-process drill caught that it
+> was wrong. `KeccakPow` documents that it ignores the seed, so a seed-level domain
+> would have been a real rule change under RandomX and a silent no-op under Keccak.
+> A consensus rule whose force depends on which PoW engine is compiled in is not a
+> consensus rule. The fix wraps the engine's *output* —
+> `pow_value(pow.pow_hash(header, seed), …)` — which makes engine-independence
+> **structural** rather than something each engine must be checked for: "KeccakPow
+> ignores the seed" stops being a fact needing compensation and becomes an
+> irrelevant one. No engine behind the `PowEngine` trait, present or future, can
+> opt out.
 
 `Revision::digest` binds the identifier *and* the frozen digest, so two inert
 revisions (same frozen set, different name) are still distinct rule sets. Without
 that, a second no-op upgrade would have no boundary at all.
+
+### 🔴 Which layer refuses an old-binary block — and why the distinction matters
+
+This changed what drill (a) proves, and the run doc has to be precise about it
+because §4's update will be written from these logs.
+
+| Phase | Layer | What happens | Evidence |
+|---|---|---|---|
+| **While halted** (tip = H, before the swap) | **Release** | The node has stopped. The block is *not judged invalid* — it is `Ignored("above halt height")`, not relayed, not synced toward, and **the sender is not penalized**. | telemetry `hignore=` climbs, `powrej=` flat |
+| **After the swap** (post-halt rules in force) | **Header validation** | The block's PoW value does not meet the target under the post-halt domain: `ValidationError::PowUnsatisfied` → `Rejected("invalid header: pow")`. It never enters `ChainState` at all. | telemetry `powrej=` climbs, `hignore=` flat |
+
+The two counters are on every telemetry line (`hignore=` / `powrej=`), so the
+docker drill answers "which layer?" from the logs rather than from a narrative.
+
+**Note for §4.** §4 currently describes the second kind of outcome — blocks that
+are *accepted but can never finalize*, with the committee as the thing that keeps
+the upgrade clean. What the domain separation produces post-swap is **stronger**:
+the old branch is not merely unfinalizable, it is *invalid* on the upgraded net and
+never reaches fork choice. Before the swap, during the halt window, the old branch
+is neither — it is simply not acted on, and the peer is not blamed. Whether and how
+to reflect that in §4 is the coordinator's call and the coordinator's wording; this
+doc reports the observation, not the amendment.
 
 ## Drill topology
 
@@ -249,15 +284,26 @@ expected to be a confirmation rather than a discovery.
 | (c) H4 no revision | `qumbra_node::release::drill_c_resume_without_a_revision_refuses_to_start`, `qumbra_node::run::drill_c_no_revision_refuses_to_resume_a_halted_data_dir` | ✅ |
 | (d) N1 stand-down | `qumbra_node::release::drill_d_a_cancelled_release_does_not_halt`, `qlab_p2p::adapter::drill_d_a_cancelled_upgrade_does_not_halt`, `qumbra_node::run::drill_d_cancelled_release_mines_through_the_cancelled_height` | ✅ |
 | Halt semantics (H2) | `qlab_p2p::adapter::halt_stops_mining_accepting_and_signing_above_h`, `…halt_committee_refuses_to_sign_or_finalize_above_h` | ✅ |
+| Domain separation is a mechanism property | `qumbra_node::release::resuming_always_carries_a_post_halt_rule_domain` | ✅ |
+| An old-release peer is not penalized | `qlab_p2p::n1::only_rejected_is_a_peer_fault` | ✅ |
 | Resume path (scope 5) | `qumbra_node::run::the_upgraded_release_resumes_at_h_without_a_resync` | ✅ |
 
 Drill (a) in process asserts all four halves of §4's claim: the old branch
 **grows**; it **never finalizes** however long it grows; the fork is **bilateral**
 (neither side can silently absorb the other, so only finality arbitrates); and the
 invariant holds — **no reorg past a finalized checkpoint**, with both sides still
-agreeing on the finalized boundary block. Critically, the old branch is rejected
-*after* the halt is cleared too, structurally by the post-halt rules rather than by
-the halt.
+agreeing on the finalized boundary block.
+
+It also asserts the **layer attribution** directly. While halted, the five
+old-binary blocks are `Ignored("above halt height")` with `halt_ignored = 5,
+pow_rejected = 0` — the release layer, no fault attributed to the sender. After the
+swap, the first old-rule block is `Rejected("invalid header: pow")` with
+`halt_ignored` unchanged and `pow_rejected = 1`, and the test asserts the failing
+check is exactly `ValidationError::PowUnsatisfied` by calling
+`validate_header_under` directly — so the claim is about the post-halt domain and
+not about a coincidental difficulty or timestamp mismatch. The bilateral half is
+asserted at the same precision: the old binary rejects the upgraded net's block
+with the same error, at the same layer.
 
 ### 0. Genesis rehearsal — ⏳ PENDING
 
@@ -292,12 +338,9 @@ The four stop-points from the task-book, and what the tooling does about each:
 1. **The docker drills have not been run.** Everything above the "Drill results"
    section is mechanism + deterministic in-process evidence. The wall-clock,
    multi-process, real-RandomX confirmation is owed.
-2. **The post-halt rule change is a design call, not a ratified decision.** H5 says
-   the drill runs on "a no-op revision that changes only the revision identifier";
-   making that identifier consensus-visible above the boundary is our reading of
-   what it takes for the drill to prove anything, and the PoW-value domain
-   separation is our choice of the smallest such change. Flagged for coordinator
-   ratification.
+2. ~~The post-halt rule change is a design call awaiting ratification.~~
+   **RATIFIED 2026-07-26**, and widened: it is a property of the mechanism, not of
+   the drill. See "The post-halt rule domain" above.
 3. **The digest cannot see code.** Stated above and worth repeating: undocumented
    *parameter* changes are now impossible by construction; undocumented *rule*
    changes are not, and never can be by this route.
@@ -306,12 +349,21 @@ The four stop-points from the task-book, and what the tooling does about each:
    pre-existing (not introduced here) and out of this baton's scope, but it means a
    block body is not cryptographically bound to its header on the ingest path.
    Recorded for a follow-up issue.
-5. **H = 16 is a drill value.** Production halt heights are chosen per upgrade and
+5. **Peer-scoring defect found and fixed during this pass, not in the original
+   submission.** The adapter's comment claimed an old-release peer offering post-H
+   blocks was not penalized, but the p2p layer penalized every `Rejected` outcome
+   uniformly, so a halted node would in fact have banned honest peers still mining
+   — partitioning the net during the upgrade window. Fixed by adding
+   `IngestOutcome::Ignored` (well-formed, not acted on, sender not at fault) and
+   routing every penalty decision through one `is_peer_fault` predicate. The
+   coordinator's diff read credited the property to the comment; the behaviour did
+   not match it until now.
+6. **H = 16 is a drill value.** Production halt heights are chosen per upgrade and
    announced in advance; nothing here proposes 16 as policy.
-6. **Multi-epoch behaviour is untested.** The drill halts at height 16, far inside
+7. **Multi-epoch behaviour is untested.** The drill halts at height 16, far inside
    the first epoch (1,152). A halt on an epoch boundary, where the committee roster
    changes at the same height, is a case worth its own drill and is not covered.
-7. **A node that voted on the old branch cannot vote for the new one at the same
+8. **A node that voted on the old branch cannot vote for the new one at the same
    slot.** The never-double-sign ledger is doing its job, but it means a committee
    member who mined past H on the old binary and voted there has burned those slots
    for the upgraded branch. This is correct behaviour and an argument for halting

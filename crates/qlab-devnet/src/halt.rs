@@ -27,26 +27,41 @@
 //!   — the upgrade boundary is a *finalized* boundary, so everything pre-halt is
 //!   final by construction rather than by convention.
 //! - [`halt_regime`] — the `Halting` → `Halted` regime derivation (H2).
-//! - [`PostHaltRules`] — the post-halt rule domain. The **inert** rule change the
-//!   drill exercises is a PoW-value domain separation above the boundary
-//!   ([`pow_value`]): old-binary blocks above H are mined against the pre-halt
-//!   value, so under the post-halt rules their PoW does not meet the target. That
-//!   is what makes "those blocks can never finalize" structural rather than
-//!   accidental — see the module note below.
+//! - [`PostHaltRules`] — the post-halt rule domain: **every** release that resumes
+//!   past an upgrade boundary domain-separates its PoW value above that boundary
+//!   with its own revision digest ([`pow_value`]). Blocks mined under the pre-halt
+//!   rules above H therefore do not meet the target under the post-halt rules. That
+//!   is what makes §4's "those blocks can never finalize" a property of the
+//!   protocol rather than a promise about committee behaviour.
 //!
-//! ## Why the post-halt rule domain exists (and why it is the *inert* change)
+//! ## Why the post-halt rule domain is part of the MECHANISM
+//!
+//! (Coordinator ratification, 2026-07-26: adopted, and deliberately *not* confined
+//! to the drill.)
 //!
 //! §4's honesty note only holds if the upgraded population can tell a pre-halt
 //! block from a post-halt one. If the post-halt rules were byte-identical to the
 //! pre-halt rules, an old miner's branch above H would be perfectly valid to the
-//! upgraded net, heaviest-chain would arbitrate, and the old branch could finalize
-//! — the opposite of what §4 promises. A real upgrade changes some rule; the drill
-//! must therefore also change *some* rule, or it proves nothing.
+//! upgraded net, heaviest-chain would arbitrate, and the upgraded committee could
+//! legitimately finalize it — the opposite of what §4 promises.
 //!
-//! The smallest such change that touches **no** FROZEN v1.0 value (H5) is to
-//! domain-separate the PoW value above the boundary with the revision's own digest:
-//! the revision identifier itself becomes the rule delta. Nothing else moves — no
-//! header layout, no genesis, no frozen constant, no emission, no fee.
+//! Without domain separation, "those blocks can never finalize" is a statement
+//! about what the committee chooses to do. With it, it is a statement about what
+//! the protocol permits. The cost is zero: work is unchanged (one extra Keccak per
+//! nonce trial), the difficulty target is untouched, and at and below the boundary
+//! the rules are byte-identical — so no pre-halt block ever changes meaning.
+//!
+//! It is confined to the mechanism rather than the drill for a second reason: a
+//! drill that proved a property the real upgrade path does not have would be its
+//! own kind of dishonesty. `Release::rule_schedule` therefore makes it
+//! unconstructible to resume past a boundary *without* a rule domain — the only
+//! release that could is one carrying no revision, which H4 refuses outright.
+//!
+//! **H5 is not violated.** The revision this rides on moves no FROZEN v1.0 value;
+//! the PoW instantiation is a `[full-M8]` open item in protocol-spec, not a frozen
+//! constant. The precedent is §4's own Monero citation — Monero changes the PoW
+//! *algorithm* at each scheduled fork; domain separation is the mildest form of the
+//! same move.
 //!
 //! ## What is NOT here
 //!
@@ -259,9 +274,14 @@ impl RuleSchedule {
 /// [`crate::pow::KeccakPow`] placeholder engine documents that it *ignores* the
 /// seed, so a seed-level domain would be a rule change under RandomX and a no-op
 /// under Keccak. A consensus rule whose force depends on which PoW engine is
-/// compiled in is not a consensus rule. Mixing the output keeps the rule at the
-/// consensus layer, identical for every engine behind the [`crate::pow::PowEngine`]
-/// trait — including any future one.
+/// compiled in is not a consensus rule.
+///
+/// Wrapping the engine's *output* — `pow_value(pow.pow_hash(header, seed), …)` —
+/// makes engine-independence **structural** rather than something each engine has
+/// to be checked for: "KeccakPow ignores the seed" stops being a fact that needs
+/// compensating for and becomes an irrelevant one. Every engine behind the
+/// [`crate::pow::PowEngine`] trait, including any future one, gets the rule for
+/// free and cannot opt out of it.
 ///
 /// The work cost is unchanged (one extra Keccak per nonce trial), and the
 /// difficulty target is untouched: this changes *which* hashes count, not how many

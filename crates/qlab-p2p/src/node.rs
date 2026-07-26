@@ -357,15 +357,16 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         let id = tx_id(&tx);
-        match self.node.ingest_tx(tx) {
-            IngestOutcome::Accepted => {
-                self.seen.insert(id);
-                self.relay_inv(InvItem { kind: InvKind::Tx, id }, Some(from));
-            }
-            IngestOutcome::Rejected(_) => {
-                self.peers.penalize(from, PENALTY_INVALID_OBJECT);
-            }
-            _ => {}
+        let outcome = self.node.ingest_tx(tx);
+        // ONE place decides whether the sender is at fault (`is_peer_fault`), so the
+        // "an unusable object is not a misbehaving peer" rule cannot drift between
+        // the tx, header and block paths (#70 S5; #74 extends it to the halt).
+        if outcome.is_peer_fault() {
+            self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+        }
+        if outcome.should_relay() {
+            self.seen.insert(id);
+            self.relay_inv(InvItem { kind: InvKind::Tx, id }, Some(from));
         }
     }
 
@@ -378,7 +379,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         let id = header.header_hash();
-        match self.node.ingest_header(header) {
+        let outcome = self.node.ingest_header(header);
+        if outcome.is_peer_fault() {
+            self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+        }
+        match outcome {
             IngestOutcome::Accepted => {
                 self.seen.insert(id);
                 self.relay_inv(InvItem { kind: InvKind::Block, id }, Some(from));
@@ -387,10 +392,12 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 // Missing ancestors → kick off header-first sync from this peer.
                 self.start_sync_with(from);
             }
-            IngestOutcome::Rejected(_) => {
-                self.peers.penalize(from, PENALTY_INVALID_OBJECT);
-            }
-            IngestOutcome::Duplicate => {}
+            // Above our halt height (#74). NOT a misbehaving peer — it is on a
+            // different release, exactly as §4 says it may be. No relay, and no sync
+            // kick either: syncing toward it would be asking for more of what we
+            // have decided not to accept.
+            IngestOutcome::Ignored(_) => {}
+            IngestOutcome::Rejected(_) | IngestOutcome::Duplicate => {}
         }
     }
 
@@ -575,6 +582,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 // An orphan mid-batch means the batch didn't connect; stop and let
                 // the next locator round re-anchor.
                 IngestOutcome::Orphan | IngestOutcome::Rejected(_) => break,
+                // A halted node stops consuming the batch at the boundary: the
+                // rest of it is above our halt height and will never be accepted.
+                // Stopping here is what pins a halted node's tip at exactly H even
+                // while peers keep serving it taller header batches (#74).
+                IngestOutcome::Ignored(_) => break,
             }
         }
 
@@ -704,6 +716,12 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             if let Some(peer) = except {
                 self.start_sync_with(peer);
             }
+            return;
+        }
+        // Above our halt height (#74): do not cache it, do not relay it, do not
+        // penalise the announcer. A halted node is a quiet observer of the blocks
+        // it will not take.
+        if matches!(outcome, IngestOutcome::Ignored(_)) {
             return;
         }
         self.blocks.insert(bh, (txs, ann.coinbase));

@@ -135,6 +135,27 @@ halt_assert_no_conflicting_finality() {
   echo "   ✓ no upgraded node finalized below the boundary (no reorg past a finalized checkpoint)"
 }
 
+# WHICH LAYER refused an old-binary block (issue #74). The two counters are on
+# every telemetry line and mean different things about the upgrade:
+#   hignore — this release is HALTED and did not act on the block. The block was not
+#             judged invalid and the sender is NOT penalised (release layer).
+#   powrej  — the header failed the PoW target. Above an upgrade boundary that is the
+#             post-halt rule domain biting: the block is invalid on the upgraded net
+#             and never reaches fork choice (header-validation layer).
+# §4 as written describes the second kind of outcome. Report what the logs actually
+# show; do NOT paraphrase one as the other.
+halt_report_layers() {
+  echo "   -- refusal layers (hignore = release layer · powrej = header-validation layer) --"
+  for n in "${NODES[@]}"; do
+    local line; line="$(latest "$n")"
+    [[ -n "$line" ]] || continue
+    printf '     %-6s hignore=%-5s powrej=%-5s   %s\n' \
+      "$n" "$(field "$line" hignore)" "$(field "$line" powrej)" \
+      "$(field "$line" regime)"
+  done
+  echo "     (raw rejection reasons: dc logs <node> | grep -E 'above halt height|invalid header')"
+}
+
 cmd="${1:-}"; shift || true
 case "$cmd" in
 
@@ -260,9 +281,10 @@ case "$cmd" in
       if [[ -z "$line" ]]; then
         printf '  %-6s (no telemetry yet / down)\n' "$n"
       else
-        printf '  %-6s tip=%-4s final=%-4s regime=%-8s halt=%-4s peers=%s\n' \
+        printf '  %-6s tip=%-4s final=%-4s regime=%-8s halt=%-4s hignore=%-4s powrej=%-4s peers=%s\n' \
           "$n" "$(field "$line" tip)" "$(field "$line" final)" \
-          "$(field "$line" regime)" "$(field "$line" halt)" "$(field "$line" peers)"
+          "$(field "$line" regime)" "$(field "$line" halt)" \
+          "$(field "$line" hignore)" "$(field "$line" powrej)" "$(field "$line" peers)"
       fi
     done
     ;;
@@ -290,6 +312,7 @@ case "$cmd" in
     sleep 90   # let H's checkpoint finalize and telemetry catch up
     "$0" halt-status
     halt_assert_halted node0 node1 node2
+    halt_report_layers
     echo "   ✓ phase 1 complete: the armed nodes are HALTED at a finalized boundary."
     echo "   next: $0 halt-drill-b"
     ;;
@@ -353,6 +376,7 @@ case "$cmd" in
     fi
     echo "   ✓ the old-binary branch never finalized above H (node3 final=$f3)"
     halt_assert_no_conflicting_finality
+    halt_report_layers
     echo "   next: $0 halt-drill-c"
     ;;
 
