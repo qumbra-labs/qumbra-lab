@@ -13,6 +13,18 @@
 //! rehearsal fields ([`GenesisFile::network`], [`GenesisFile::genesis_difficulty`])
 //! are `[devnet-placeholder]`, not consensus.
 //!
+//! ## 🔴 Owed at the next genesis mint (T1) — issue #77 F1
+//! The genesis header pins `tx_body_commitment = ZERO_HASH` while its empty body
+//! commits to `keccak256(coinbase_le)`, so **genesis is the one block that does
+//! not satisfy the header/body binding** every other block is now held to. It is
+//! safe today only because a *stronger* check covers the same ground: every node
+//! pins `expected_genesis_hash` and refuses to start against a different genesis
+//! — the binding protects blocks that arrive from the network, and genesis never
+//! does. Fixing it changes the genesis hash and therefore the network, so it was
+//! deferred rather than dismissed. **Minting a new genesis is the moment it is
+//! free: set the header's commitment to the real body commitment and delete the
+//! height-0 exemption in `qlab_node::node::check_stored_binding`.**
+//!
 //! ## Committee keys — the T0 rehearsal arrangement (item 4)
 //! Genesis committee₀ is the frozen N=21 / quorum 15. For the T0 rehearsal the
 //! 21 ML-DSA signing keys are derived from deterministic seeds (byte-identical to
