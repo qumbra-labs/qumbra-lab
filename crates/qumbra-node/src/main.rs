@@ -68,7 +68,8 @@ fn usage() {
          USAGE:\n  \
          qumbra-node genesis init [--out DIR]   build the T0 genesis file + 21 committee key files\n  \
          qumbra-node run --config FILE          run a full node (TCP + RandomX + disk persistence)\n      \
-           [--rehearsal-verifier]               opt in to the NO-OP rehearsal tx verifier (devnet only)\n  \
+           [--rehearsal-verifier]               opt in to the NO-OP rehearsal tx verifier (devnet only)\n      \
+           [--sample-interval-secs N]           telemetry sampling cadence (default 30; observability only)\n  \
          qumbra-node check --config FILE        pre-flight a deployed config (genesis + keys), bind nothing\n  \
          qumbra-node halt-status [--config F]   print this binary's halt schedule + revision digest (#74)\n  \
          qumbra-node audit [--out FILE]         emit the params_devnet ⟷ FROZEN v1.0 convergence audit"
@@ -130,6 +131,23 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // deterministic 75 s counter the in-process sims/tests use), so LWMA sees real
     // variable solvetimes over the soak.
     node.set_mining_clock(MiningClock::WallClock);
+
+    // Telemetry sampling cadence — OBSERVABILITY ONLY. This changes how often a
+    // TELEMETRY line is printed and nothing else: not consensus, not the halt
+    // height, not any frozen value. It exists because `regime=Halting` is a real
+    // but SHORT interval (tip reaches H, then the committee's vote round closes),
+    // and at the 30 s default a fast vote round can open and close between two
+    // samples — leaving a state the code defines with no run that has ever shown
+    // it. Distinct from the halt height, which has no runtime path by design (H1).
+    if let Some(v) = flag(args, "--sample-interval-secs") {
+        match v.parse::<u64>() {
+            Ok(secs) if secs > 0 => {
+                node.set_sample_interval(std::time::Duration::from_secs(secs));
+                println!("  telemetry sampling: every {secs} s (observability only)");
+            }
+            _ => return Err(format!("--sample-interval-secs needs a positive integer, got `{v}`").into()),
+        }
+    }
 
     println!("qumbra-node running");
     println!("  listen:       {}", node.listen_addr());

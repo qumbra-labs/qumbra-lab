@@ -59,6 +59,7 @@ services:
     # per-scenario; see deploy/docker/entrypoint.sh for the binary names.
     environment:
       QUMBRA_BIN: ${NODE0_BIN:-qumbra-node}
+      QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
     command: ["run", "0"]   # holds committee keys 00..05 (6)
     volumes:
       - shared:/shared
@@ -72,6 +73,7 @@ services:
     # per-scenario; see deploy/docker/entrypoint.sh for the binary names.
     environment:
       QUMBRA_BIN: ${NODE1_BIN:-qumbra-node}
+      QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
     command: ["run", "1"]   # holds committee keys 06..10 (5)
     volumes:
       - shared:/shared
@@ -85,6 +87,7 @@ services:
     # per-scenario; see deploy/docker/entrypoint.sh for the binary names.
     environment:
       QUMBRA_BIN: ${NODE2_BIN:-qumbra-node}
+      QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
     command: ["run", "2"]   # holds committee keys 11..15 (5)
     volumes:
       - shared:/shared
@@ -98,6 +101,7 @@ services:
     # per-scenario; see deploy/docker/entrypoint.sh for the binary names.
     environment:
       QUMBRA_BIN: ${NODE3_BIN:-qumbra-node}
+      QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
     command: ["run", "3"]   # holds committee keys 16..20 (5)
     volumes:
       - shared:/shared

@@ -104,3 +104,69 @@ boundary_finalized = true
 
 === END PRE-DRILL SMOKE ===
 
+
+=== PRE-DRILL RESUME SMOKE (both halves) — NOT the drill, NOT acceptance ===
+Approved by the coordinator on the reasoning that the halted data dir is the
+expensive artefact and it already existed. Raw output only; no conclusions.
+
+Per instruction, the halted data dir was copied BEFORE anything resumed:
+  data-PRISTINE-HALTED  kept untouched (tip 16, blocks.log 2040 B)
+  data-neg              copy used for the negative half
+  data-resume           copy used for the positive half
+
+Wall clock:
+  NEG START local 2026-07-26 18:40:19 +08  UTC 2026-07-26T10:40:19Z
+  NEG END   local 2026-07-26 18:40:30 +08  UTC 2026-07-26T10:40:30Z
+  POS START local 2026-07-26 18:40:39 +08  UTC 2026-07-26T10:40:39Z
+  POS END   local 2026-07-26 18:45:28 +08  UTC 2026-07-26T10:45:28Z
+
+--- NEGATIVE half: qumbra-node-norev (resumes past H, carries NO revision) ---
+Three entry paths, all against the halted data dir. All exit 1.
+
+  $ qumbra-node-norev halt-status --config <cfg>          exit=1
+    halt marker:  height 16 written under revision `v1.0` (frozen digest 19564eca…534571)
+    validate:     REFUSES TO START — this release resumes past the halt at height 16
+                  but carries NO revision identifier or frozen-parameter digest —
+                  refusing to start (H4: the revision document is part of the
+                  mechanism, not paperwork around it)
+
+  $ qumbra-node-norev check --config <cfg>                exit=1
+    qumbra-node error: this release resumes past the halt at height 16 but carries NO
+    revision identifier or frozen-parameter digest — refusing to start (H4: …)
+
+  $ qumbra-node-norev run --config <cfg>                  exit=1
+    qumbra-node error: release: this release resumes past the halt at height 16 but
+    carries NO revision identifier or frozen-parameter digest — refusing to start (H4: …)
+
+  data-neg after all three refusals: byte-identical to data-PRISTINE-HALTED
+  (`diff -r` clean; blocks.log 2040 B both).
+
+--- POSITIVE half: qumbra-node-resume on the halted copy ---
+startup banner:
+-- halt-height upgrade status (issue #74) --
+  release:      qumbra-node v1.0.1 [DRILL: resume]
+  halt plan:    no halt scheduled
+  revision:     v1.0.1-drill
+  frozen digest: 19564ecaffd8f78e69b31840cf465b3b34553968813f7fcaff83194077534571
+  rule domain:  a20fe53118e6fc52624a98a604f1be878563ca23625ed55efe63cd1eb7df71f6
+  resumes past: height 16 (post-halt rules apply above it)
+  halt marker:  height 16 written under revision `v1.0` (frozen digest 19564ecaffd8f78e69b31840cf465b3b34553968813f7fcaff83194077534571)
+(Ctrl-C to shut down — snapshot is flushed on exit)
+
+telemetry:
+TELEMETRY tip=16 final=- stall=16 age_s=- diff=77 peers=0 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0
+TELEMETRY tip=16 final=- stall=16 age_s=- diff=77 peers=0 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0
+TELEMETRY tip=16 final=- stall=16 age_s=- diff=77 peers=0 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0
+TELEMETRY tip=17 final=16 stall=1 age_s=4995 diff=77 peers=0 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0
+TELEMETRY tip=17 final=16 stall=1 age_s=4995 diff=77 peers=0 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0
+TELEMETRY tip=17 final=16 stall=1 age_s=4995 diff=77 peers=0 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0
+
+  data-resume/blocks.log after the run: 2280 B (tip 17) vs pristine 2040 B (tip 16)
+  data-resume/halt.marker after resuming past H — UNCHANGED:
+    height = 16
+    revision_id = "v1.0"
+    frozen_digest_hex = "19564ecaffd8f78e69b31840cf465b3b34553968813f7fcaff83194077534571"
+    boundary_finalized = true
+  shutdown: 'shutdown complete (snapshot flushed)'
+
+=== END PRE-DRILL RESUME SMOKE ===

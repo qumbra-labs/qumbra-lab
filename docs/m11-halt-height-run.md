@@ -301,6 +301,7 @@ expected to be a confirmation rather than a discovery.
 | (d) N1 stand-down | `qumbra_node::release::drill_d_a_cancelled_release_does_not_halt`, `qlab_p2p::adapter::drill_d_a_cancelled_upgrade_does_not_halt`, `qumbra_node::run::drill_d_cancelled_release_mines_through_the_cancelled_height` | ✅ |
 | Halt semantics (H2) | `qlab_p2p::adapter::halt_stops_mining_accepting_and_signing_above_h`, `…halt_committee_refuses_to_sign_or_finalize_above_h` | ✅ |
 | Domain separation is a mechanism property | `qumbra_node::release::resuming_always_carries_a_post_halt_rule_domain` | ✅ |
+| Resume path on the REAL binary (both halves) | pre-drill smoke, `docs/m11-halt-height-evidence.log` | ✅ raw evidence, no conclusions drawn |
 | An old-release peer is not penalized | `qlab_p2p::n1::only_rejected_is_a_peer_fault` | ✅ |
 | Resume path (scope 5) | `qumbra_node::run::the_upgraded_release_resumes_at_h_without_a_resync` | ✅ |
 
@@ -393,7 +394,25 @@ The four stop-points from the task-book, and what the tooling does about each:
 7. **Multi-epoch behaviour is untested.** The drill halts at height 16, far inside
    the first epoch (1,152). A halt on an epoch boundary, where the committee roster
    changes at the same height, is a case worth its own drill and is not covered.
-8. **A node that voted on the old branch cannot vote for the new one at the same
+8. **🔴 The halt marker is never advanced after a successful resume, so every
+   LATER release must keep declaring `resumes_from = 16` forever.** Found in the
+   approved resume smoke: after `qumbra-node-resume` carried the node past H, the
+   on-disk marker still reads `height = 16, boundary_finalized = true`. The gate
+   asks "does this binary declare `resumes_from == marker.height`?", so the *next*
+   release after the upgrade — one with no halt of its own and no relation to the
+   height-16 boundary — is refused with `UndeclaredResume { marked: 16 }`.
+   Verified by running the plain v1.0 binary against the resumed data dir.
+
+   For **this** baton that is correct and even desirable: refusing to downgrade a
+   resumed node past its upgrade boundary is exactly what the marker is for. It
+   becomes a problem the **second** time the mechanism is used, i.e. on a chain of
+   upgrades. Options, none of which this baton should pick unilaterally: rewrite
+   the marker on a successful resume to record "resumed past 16 under v1.0.1" and
+   match on that instead; accept any release whose revision differs from the
+   marker's; or require each release to carry the boundary history. Flagged for the
+   coordinator, deliberately not fixed here — choosing wrong would be worse than
+   naming it.
+9. **A node that voted on the old branch cannot vote for the new one at the same
    slot.** The never-double-sign ledger is doing its job, but it means a committee
    member who mined past H on the old binary and voted there has burned those slots
    for the upgraded branch. This is correct behaviour and an argument for halting

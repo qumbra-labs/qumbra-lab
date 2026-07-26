@@ -333,8 +333,11 @@ case "$cmd" in
     dc down -v >/dev/null 2>&1 || true
     docker network rm "$NET_SIDEB" 2>/dev/null || true
     dc build
+    # Sample every 5 s for the arming phase: `regime=Halting` is a real but SHORT
+    # interval (tip reaches H, then the 6/5/5/5 vote round closes), and at the 30 s
+    # default it can open and close between two prints. Observability only.
     NODE0_BIN=qumbra-node-armed NODE1_BIN=qumbra-node-armed \
-    NODE2_BIN=qumbra-node-armed NODE3_BIN=qumbra-node \
+    NODE2_BIN=qumbra-node-armed NODE3_BIN=qumbra-node QUMBRA_SAMPLE_SECS=5 \
       dc up -d node0 node1 node2 node3
     got="$(dc logs --no-log-prefix genesis-init 2>/dev/null \
             | sed -n 's/^init: genesis hash //p' | tail -1 | tr -d '\r')"
@@ -365,6 +368,21 @@ case "$cmd" in
     [[ "$h3" == "0" ]] \
       || die "node3 reports hignore=$h3 but it carries NO halt — wrong binary on node3. STOP."
     echo "   ✓ node3 hignore=0 — it is the un-armed old-binary miner, as intended"
+
+    # H2 defines Halting as a real interval — reached H, boundary not yet final.
+    # On the 6/5/5/5 net no node can finalize H alone, so the vote round MUST
+    # happen; at a 5 s sampling cadence it should be caught. Report the finding
+    # either way: a state the code defines and no run has ever shown is a claim,
+    # not a behaviour.
+    if dc logs --no-log-prefix node0 node1 node2 2>/dev/null | grep -q 'regime=Halting'; then
+      echo "   ✓ regime=Halting OBSERVED during the boundary vote round:"
+      dc logs --no-log-prefix node0 node1 node2 2>/dev/null | grep 'regime=Halting' | head -4 | sed 's/^/       /'
+    else
+      echo "   (finding) regime=Halting was NOT observed even at a 5 s sampling cadence."
+      echo "             Record it as not-observed, with the vote-round duration, rather than"
+      echo "             asserting the transition. Halting is covered in-process; this run"
+      echo "             does not evidence it."
+    fi
     halt_save_counters
     echo "   ✓ phase 1 complete: the armed nodes are HALTED at a finalized boundary."
     echo "   next: $0 halt-drill-b"

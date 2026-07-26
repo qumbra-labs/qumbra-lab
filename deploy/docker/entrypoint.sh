@@ -99,7 +99,11 @@ EOF
     "$BIN" halt-status --config "$cfg"
     # Pre-flight (byte-verify genesis + cross-check keys + halt gates), then run.
     "$BIN" check --config "$cfg"
-    exec "$BIN" run --config "$cfg"
+    # QUMBRA_SAMPLE_SECS is OBSERVABILITY ONLY (telemetry print cadence). The halt
+    # drill sets it low so the short `regime=Halting` interval — tip at H, waiting
+    # for H's checkpoint to close — is actually sampled rather than falling between
+    # two 30 s prints. It touches nothing consensus-side.
+    exec "$BIN" run --config "$cfg" --sample-interval-secs "${QUMBRA_SAMPLE_SECS:-30}"
     ;;
 
   *)
