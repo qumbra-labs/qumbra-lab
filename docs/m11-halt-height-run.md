@@ -319,8 +319,22 @@ with the same error, at the same layer.
 
 ## Acceptance suite
 
-⏳ PENDING — full unfiltered `cargo test --release --workspace`, to be run when the
-rig is clear. Baseline 569 as of 2026-07-26 (re-check: #24 may land first).
+**⏳ PENDING — the acceptance bar is a single unfiltered
+`cargo test --release --workspace` run, and it has not been run.** The rig is held
+by the cross-epoch soak until ~22:00; this baton is first in the release queue.
+Baseline 569 as of 2026-07-26 (re-check: #24 may land first).
+
+What *has* been run, explicitly **not** acceptance (bench discipline §5: a filtered
+run structurally cannot see other modules' cross-checks):
+
+| Scope | Result |
+|---|---|
+| `cargo check --workspace --all-targets` | clean, 0 errors |
+| `cargo test --release -p qlab-devnet -p qlab-p2p -p qlab-node -p qumbra-node` | **all green** — qlab-devnet 134, qlab-p2p 93, qlab-node 39 (+13 across its other targets), qumbra-node 62 (incl. the `verifier::` real-STARK cases and the RandomX composition) |
+
+The four crates above are the ones this baton touches. The workspace suite is still
+owed because the parts it does *not* touch — `qlab-bench`'s m4 lanes above all —
+are exactly where a cross-module drift would surface.
 
 ## STOP-POINT watch
 
