@@ -1,0 +1,106 @@
+=== PRE-DRILL SINGLE-PROCESS SMOKE — NOT the drill, NOT acceptance ===
+Purpose: validate the real armed binary's wiring (marker write, regime,
+telemetry fields) before spending the contended docker window. Raw output only;
+no conclusions are drawn from this run.
+
+Binary:   qumbra-node --features drill-arm (release), RandomX LIGHT (cache only,
+          no dataset — crates/qlab-pow/src/randomx.rs)
+Topology: ONE process, no peers, all 21 committee keys held, mining=true
+Host:     Apple M5 Max, 36 GiB, macOS (Darwin 25.5.0), AC power
+Peak RSS: 270 MB
+Genesis:  4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3 (pinned)
+
+Wall clock (for reconciliation against the concurrent local epoch soak):
+  START        local 2026-07-26 16:58:17 +08   UTC 2026-07-26T08:58:17Z
+  HALT REACHED local 2026-07-26 17:19:08 +08   UTC 2026-07-26T09:19:08Z
+  END          local 2026-07-26 17:23:06 +08   UTC 2026-07-26T09:23:06Z
+NOTE: the scratch TIMESTAMPS.txt also holds a spurious 16:58:59 'HALT REACHED'
+line. That was a false positive from a wait-condition of mine that matched the
+startup banner's explanatory text rather than a TELEMETRY line. Ignore it; the
+real halt is 17:19:08 local / 09:19:08Z.
+
+NOT observed in this run: regime=Halting. Block 16 was mined and checkpoint 16
+finalized within one loop iteration, crossing no 30 s telemetry sample boundary,
+so the sampled regime went straight to Halted. Halting is covered by the
+in-process tests, not by this log.
+
+--- full stdout ---
+qumbra-node running
+  listen:       127.0.0.1:57207
+  data dir:     /private/tmp/claude-501/-Users-larry-develop-qumbra/1b4b3024-ed85-4823-9de3-462a426e5b7c/scratchpad/smoke/data
+  genesis hash: 4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3
+  mining:       true
+  committee keys held: 21
+  verifier: real M3 consensus verifier active (qlab_consensus::verify_proof, frozen CONSENSUS_CFG b16/q21/g22/fp16/a16).
+-- halt-height upgrade status (issue #74) --
+  release:      qumbra-node v1.0 [DRILL: armed]
+  halt plan:    ARMED — halts at height 16
+  revision:     v1.0
+  frozen digest: 19564ecaffd8f78e69b31840cf465b3b34553968813f7fcaff83194077534571
+  rule domain:  04c51538fc5d6ff0463130d1e30bc73f7a04ca3fe9678546377f1d8ca5ba2a21
+  halt marker:  none on disk (this node has never halted)
+  ⚠️  THIS RELEASE HALTS AT HEIGHT 16 — it will stop mining, stop accepting
+      blocks, and stop signing checkpoints above it. regime=Halting until the
+      boundary finalizes, then regime=Halted.
+(Ctrl-C to shut down — snapshot is flushed on exit)
+TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=0 mempool=0 epoch=0 regime=Degraded halt=16 hignore=0 powrej=0
+TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=0 mempool=0 epoch=0 regime=Degraded halt=16 hignore=0 powrej=0
+TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=0 mempool=0 epoch=0 regime=Degraded halt=16 hignore=0 powrej=0
+TELEMETRY tip=1 final=0 stall=1 age_s=1785056378 diff=256 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=1 final=0 stall=1 age_s=1785056378 diff=256 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=1 final=0 stall=1 age_s=1785056378 diff=256 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=2 final=0 stall=2 age_s=1785056458 diff=42 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=2 final=0 stall=2 age_s=1785056458 diff=42 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=3 final=0 stall=3 age_s=1785056535 diff=54 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=3 final=0 stall=3 age_s=1785056535 diff=54 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=3 final=0 stall=3 age_s=1785056535 diff=54 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=4 final=0 stall=4 age_s=1785056610 diff=62 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=4 final=0 stall=4 age_s=1785056610 diff=62 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=5 final=0 stall=5 age_s=1785056689 diff=68 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=5 final=0 stall=5 age_s=1785056689 diff=68 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=5 final=0 stall=5 age_s=1785056689 diff=68 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=6 final=0 stall=6 age_s=1785056765 diff=70 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=6 final=0 stall=6 age_s=1785056765 diff=70 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=6 final=0 stall=6 age_s=1785056765 diff=70 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=7 final=0 stall=7 age_s=1785056843 diff=72 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=7 final=0 stall=7 age_s=1785056843 diff=72 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=73 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=73 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=73 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=9 final=8 stall=1 age_s=76 diff=74 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=9 final=8 stall=1 age_s=76 diff=74 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=10 final=8 stall=2 age_s=152 diff=75 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=10 final=8 stall=2 age_s=152 diff=75 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=10 final=8 stall=2 age_s=152 diff=75 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=11 final=8 stall=3 age_s=227 diff=76 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=11 final=8 stall=3 age_s=227 diff=76 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=12 final=8 stall=4 age_s=303 diff=76 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=12 final=8 stall=4 age_s=303 diff=76 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=12 final=8 stall=4 age_s=303 diff=76 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=13 final=8 stall=5 age_s=380 diff=76 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=13 final=8 stall=5 age_s=380 diff=76 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=14 final=8 stall=6 age_s=455 diff=76 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=14 final=8 stall=6 age_s=455 diff=76 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=14 final=8 stall=6 age_s=455 diff=76 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=15 final=8 stall=7 age_s=533 diff=77 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=15 final=8 stall=7 age_s=533 diff=77 peers=0 mempool=0 epoch=0 regime=Final halt=16 hignore=0 powrej=0
+TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=0 mempool=0 epoch=0 regime=Halted halt=16 hignore=0 powrej=0
+HALT boundary height 16 is FINALIZED — regime=Halted, revision `v1.0`. It is now safe to swap binaries.
+TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=0 mempool=0 epoch=0 regime=Halted halt=16 hignore=0 powrej=0
+TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=0 mempool=0 epoch=0 regime=Halted halt=16 hignore=0 powrej=0
+TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=0 mempool=0 epoch=0 regime=Halted halt=16 hignore=0 powrej=0
+TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=0 mempool=0 epoch=0 regime=Halted halt=16 hignore=0 powrej=0
+TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=0 mempool=0 epoch=0 regime=Halted halt=16 hignore=0 powrej=0
+TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=0 mempool=0 epoch=0 regime=Halted halt=16 hignore=0 powrej=0
+TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=0 mempool=0 epoch=0 regime=Halted halt=16 hignore=0 powrej=0
+TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=0 mempool=0 epoch=0 regime=Halted halt=16 hignore=0 powrej=0
+shutdown complete (snapshot flushed)
+
+--- data/halt.marker after graceful shutdown ---
+height = 16
+revision_id = "v1.0"
+frozen_digest_hex = "19564ecaffd8f78e69b31840cf465b3b34553968813f7fcaff83194077534571"
+boundary_finalized = true
+
+=== END PRE-DRILL SMOKE ===
+
