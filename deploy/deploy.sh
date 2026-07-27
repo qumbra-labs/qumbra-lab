@@ -191,7 +191,14 @@ EOF
   else
     echo "-- $name -> $ssh:$node_root ($n_keys keys, listen $listen)"
     ssh "$ssh" "mkdir -p '$node_root'"
-    rsync -a --delete-excluded "$stage/" "$ssh:$node_root/"
+    # --delete, NOT --delete-excluded. macOS now ships openrsync (protocol 29) as
+    # `rsync`, while a Debian host runs GNU rsync 3.2.7 (protocol 32); with
+    # --delete-excluded openrsync emits an exclude-rules stream that GNU 3.2.7
+    # mis-parses and dies on ("buffer overflow: recv_rules", exclude.c:1683), leaving
+    # the payload undelivered. This script declares no --exclude rules, so
+    # --delete-excluded only ever meant --delete here — the semantics are unchanged
+    # and the mac-to-Linux path now works.
+    rsync -a --delete "$stage/" "$ssh:$node_root/"
   fi
 done
 
