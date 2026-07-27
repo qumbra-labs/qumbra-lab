@@ -7,6 +7,17 @@
 #   entrypoint.sh run <idx>     generate node<idx>'s config from the fixed 4-node
 #                               topology and run it (real TCP + RandomX + disk)
 #
+# QUMBRA_BIN selects WHICH node binary runs (issue #74). The halt height is a
+# compile-time release constant with no runtime override (H1), so a "binary swap"
+# in the drill is literally a different executable in this image:
+#   qumbra-node          the un-armed v1.0 release (default)
+#   qumbra-node-armed    halts at DRILL_HALT_HEIGHT (16)
+#   qumbra-node-resume   the upgrade: inert revision v1.0.1-drill, resumes past 16
+#   qumbra-node-norev    drill (c): resumes with NO revision — must refuse to start
+#   qumbra-node-cancel   drill (d): the stand-down — does not halt at 16
+# The genesis is ALWAYS minted by the plain binary: the genesis file is identical
+# across releases, and the drill would be worthless if it were not.
+#
 # The topology mirrors deploy/deploy.sh's inline stamps: N=4, keys split 6/5/5/5,
 # full mesh (each node dials the other three by compose service name). The genesis
 # is generated once by the `init` service into a shared volume; every node byte-
@@ -43,6 +54,8 @@ case "$cmd" in
 
   run)
     idx="${1:?run needs a node index 0..3}"
+    BIN="${QUMBRA_BIN:-qumbra-node}"
+    command -v "$BIN" >/dev/null || { echo "run: unknown binary '$BIN'" >&2; exit 2; }
     # The init service completes first (compose depends_on), but be robust to races.
     for _ in $(seq 1 120); do [[ -f "$HASH_FILE" && -f "$GENESIS_FILE" ]] && break; sleep 1; done
     [[ -f "$HASH_FILE" ]] || { echo "run: shared genesis never appeared" >&2; exit 1; }
@@ -78,11 +91,19 @@ committee_key_paths = [$keys]
 mining = true
 expected_genesis_hash = "$ghash"
 EOF
-    echo "== node$idx config =="
+    echo "== node$idx config (binary: $BIN) =="
     cat "$cfg"
-    # Pre-flight (byte-verify genesis + cross-check keys), then run.
-    qumbra-node check --config "$cfg"
-    exec qumbra-node run --config "$cfg"
+    # The halt-height release status of THIS binary, before anything else (#74).
+    # `halt-status` exits non-zero if this release refuses to start — which is
+    # exactly what drill (c) is supposed to demonstrate, so let it fail loudly here.
+    "$BIN" halt-status --config "$cfg"
+    # Pre-flight (byte-verify genesis + cross-check keys + halt gates), then run.
+    "$BIN" check --config "$cfg"
+    # QUMBRA_SAMPLE_SECS is OBSERVABILITY ONLY (telemetry print cadence). The halt
+    # drill sets it low so the short `regime=Halting` interval — tip at H, waiting
+    # for H's checkpoint to close — is actually sampled rather than falling between
+    # two 30 s prints. It touches nothing consensus-side.
+    exec "$BIN" run --config "$cfg" --sample-interval-secs "${QUMBRA_SAMPLE_SECS:-30}"
     ;;
 
   *)

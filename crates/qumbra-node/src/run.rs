@@ -74,6 +74,7 @@ struct RedialSlot {
 
 use crate::config::NodeConfig;
 use crate::genesis::{GenesisError, GenesisFile};
+use crate::release::{HaltMarker, Release, ReleaseError, RELEASE};
 
 /// The NO-OP rehearsal transaction verifier. **NOT the real M3 verifier** — it
 /// accepts every tx unconditionally. Since M10-T0-4 (issue #68) it is no longer
@@ -100,6 +101,9 @@ pub enum RunError {
     Genesis(GenesisError),
     Node(qlab_node::NodeError),
     Io(std::io::Error),
+    /// The binary's halt-height release constants are not startable, or this
+    /// binary must not resume past the halt this node already performed (#74).
+    Release(ReleaseError),
 }
 
 impl std::fmt::Display for RunError {
@@ -109,6 +113,7 @@ impl std::fmt::Display for RunError {
             RunError::Genesis(e) => write!(f, "{e}"),
             RunError::Node(e) => write!(f, "node: {e}"),
             RunError::Io(e) => write!(f, "io: {e}"),
+            RunError::Release(e) => write!(f, "release: {e}"),
         }
     }
 }
@@ -121,6 +126,11 @@ impl From<GenesisError> for RunError {
 impl From<qlab_node::NodeError> for RunError {
     fn from(e: qlab_node::NodeError) -> Self {
         RunError::Node(e)
+    }
+}
+impl From<ReleaseError> for RunError {
+    fn from(e: ReleaseError) -> Self {
+        RunError::Release(e)
     }
 }
 
@@ -199,6 +209,14 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     redial: HashMap<String, RedialSlot>,
     /// When re-dial was last checked.
     last_redial: Instant,
+    /// This process's release constants (issue #74) — the compile-time [`RELEASE`]
+    /// in the binary; tests may drive [`RunningNode::start_with_release`] directly.
+    release: Release,
+    /// The halt height this release stops at, cached from `release`.
+    halt_at: Option<u64>,
+    /// Whether the durable halt marker for this halt has been written with
+    /// `boundary_finalized = true` yet (it is rewritten once when H finalizes).
+    marker_final_written: bool,
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
@@ -212,6 +230,33 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         pow: P,
         verifier: V,
     ) -> Result<Self, RunError> {
+        Self::start_with_release(config, genesis, pow, verifier, RELEASE)
+    }
+
+    /// [`Self::start`] against an explicit [`Release`] (issue #74).
+    ///
+    /// This is a **Rust API for tests**, not a runtime override: the binary calls
+    /// [`Self::start`], which passes the compile-time [`RELEASE`] constant, and
+    /// nothing in the config file, the CLI, or the environment can reach this
+    /// parameter (H1). It exists so the halt semantics can be exercised through the
+    /// real run path — same seam, same posture, as `set_mining_clock`.
+    pub fn start_with_release(
+        config: &NodeConfig,
+        genesis: &GenesisFile,
+        pow: P,
+        verifier: V,
+        release: Release,
+    ) -> Result<Self, RunError> {
+        // (0) HALT GATES (issue #74), BEFORE anything else touches state:
+        //     (a) the release's own constants must be startable — the cadence-grid
+        //         rule (H2) and the revision digest describing this binary (H4);
+        //     (b) if this node already halted, this binary must be the release that
+        //         is entitled to carry it past that boundary (H4's resume gate).
+        release.validate()?;
+        let marker = HaltMarker::load(&config.data_dir)?;
+        release.check_against_marker(marker.as_ref())?;
+        let rules = release.rule_schedule()?;
+
         // (1) Byte-verify the genesis file + optional hash pin BEFORE any state.
         genesis.verify_startup(config.expected_genesis_hash.as_deref())?;
 
@@ -248,7 +293,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         };
 
         // (5) Disk-backed adapter (restart-safe) + TCP transport + P2P node.
-        let adapter = NodeAdapter::open(&config.data_dir, committee, pow, verifier, sim)?;
+        let mut adapter = NodeAdapter::open(&config.data_dir, committee, pow, verifier, sim)?;
+        // The release's halt/rule schedule, installed once. No runtime path (H1).
+        adapter.set_rule_schedule(rules);
         let transport = TcpTransport::bind(&config.listen_addr).map_err(RunError::Io)?;
         let bound = transport.local_addr().to_string();
         let node_id = node_id_from_addr(&bound);
@@ -295,6 +342,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             dial_peers: config.dial_peers.clone(),
             redial,
             last_redial: Instant::now(),
+            release,
+            halt_at: release.halt_at(),
+            marker_final_written: marker.is_some_and(|m| m.boundary_finalized),
         })
     }
 
@@ -360,7 +410,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             tip_ts.saturating_sub(base_ts)
         };
 
-        let t = Telemetry::assemble(
+        let t = Telemetry::assemble_with_halt(
             node.tip_height(),
             node.finalized_height(),
             age,
@@ -368,10 +418,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             self.p2p.peers().len() as u64,
             node.committee().current_epoch(),
             DEGRADED_MODE_LAG_BLOCKS,
+            self.halt_at,
         );
         let regime = match t.finality_status {
             FinalityStatus::Final => "Final",
             FinalityStatus::Degraded => "Degraded",
+            FinalityStatus::Halting => "Halting",
+            FinalityStatus::Halted => "Halted",
         };
         let final_str = t.finalized_height.map(|h| h.to_string()).unwrap_or_else(|| "-".to_string());
         // S8: print `age_s=-` (not `age_s=0`) whenever there is no finalized head, so
@@ -381,10 +434,22 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         } else {
             t.last_finalized_age_secs.to_string()
         };
+        // `halt=` is the operator's read of the upgrade schedule: `-` when this
+        // release has none, the height when it does. Combined with `regime=`, the
+        // soak monitor can tell "paused at the announced boundary" from "stuck".
+        let halt_str = self.halt_at.map(|h| h.to_string()).unwrap_or_else(|| "-".to_string());
+        // Layer-attributed refusal counts (#74). `hignore` = this release is halted
+        // and did not act on a peer's block (RELEASE layer, no fault attributed);
+        // `powrej` = a header failed the PoW target, which above an upgrade boundary
+        // is the post-halt rule domain biting (HEADER-VALIDATION layer). The drill's
+        // "which layer rejected the old branch?" question is answered from these two
+        // numbers in the logs, not from a narrative.
+        let ic = node.ingest_counters();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={}",
             t.tip_height, final_str, t.stall_depth, age_str, tip_diff,
-            t.peer_count, t.mempool_size, t.epoch, regime,
+            t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
+            ic.halt_ignored, ic.pow_rejected,
         )
     }
 
@@ -418,6 +483,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         }
         let tip = self.tip_height();
         while self.next_checkpoint <= tip {
+            // HALT (issue #74, H2): the committee stops checkpointing ABOVE H. The
+            // adapter refuses to sign there in any case (the load-bearing gate); the
+            // loop stops advancing too, so a halted node does not spin proposing
+            // slots it will never sign.
+            if self.halt_at.is_some_and(|h| self.next_checkpoint > h) {
+                break;
+            }
             let made = self
                 .p2p
                 .node()
@@ -504,6 +576,58 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         }
     }
 
+    /// This release's constants (issue #74).
+    pub fn release(&self) -> &Release {
+        &self.release
+    }
+
+    /// The height this node halts at, if its release carries one.
+    pub fn halt_at(&self) -> Option<u64> {
+        self.halt_at
+    }
+
+    /// Whether this node has reached its halt height.
+    pub fn is_halted(&self) -> bool {
+        self.p2p.node().is_halted_at_tip()
+    }
+
+    /// Maintain the durable halt marker (issue #74, H4).
+    ///
+    /// Written the first time the tip reaches H, and rewritten exactly once more
+    /// when H's checkpoint finalizes (`Halting` → `Halted`). This is the record a
+    /// later binary's resume gate is checked against — it is written by the binary
+    /// that actually halted, which is what makes the gate impossible to dodge by
+    /// simply declaring nothing.
+    ///
+    /// Best-effort on I/O error (logged, run continues): a node that cannot write
+    /// its marker is still halted — refusing to halt because the disk is full would
+    /// be strictly worse.
+    pub fn maintain_halt_marker(&mut self) {
+        let Some(h) = self.halt_at else { return };
+        if !self.is_halted() {
+            return;
+        }
+        let finalized = self.finalized_height().is_some_and(|f| f >= h);
+        // Write once on reaching H, then once more when the boundary finalizes.
+        if self.marker_final_written {
+            return;
+        }
+        let marker = HaltMarker::for_release(&self.release, h, finalized);
+        match marker.write(&self.data_dir) {
+            Ok(()) => {
+                if finalized {
+                    self.marker_final_written = true;
+                    println!(
+                        "HALT boundary height {h} is FINALIZED — regime=Halted, revision `{}`. \
+                         It is now safe to swap binaries.",
+                        marker.revision_id
+                    );
+                }
+            }
+            Err(e) => eprintln!("halt marker write failed: {e}"),
+        }
+    }
+
     /// Flush the state machine's derived state to an atomic on-disk snapshot.
     pub fn save_snapshot(&self) -> Result<(), RunError> {
         self.p2p.node().save_snapshot().map_err(RunError::Node)
@@ -526,6 +650,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             if self.last_sample.elapsed() >= self.sample_interval {
                 println!("{}", self.telemetry_sample());
                 self.last_sample = Instant::now();
+                // Cheap and idempotent; sampled on the telemetry cadence so it costs
+                // nothing on a net that never halts.
+                self.maintain_halt_marker();
             }
             if self.last_redial.elapsed() >= REDIAL_INTERVAL {
                 self.try_redial(); // reconnect any dropped configured peer (S9)
@@ -833,6 +960,224 @@ mod tests {
         // No keys → checkpoint proposal is a no-op; nothing finalizes locally.
         node.try_checkpoint();
         assert_eq!(node.finalized_height(), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- issue #74: the halt-height upgrade, through the real run path ---------
+
+    use crate::release::{Release, ReleaseError, DRILL_HALT_HEIGHT as DH, REVISION_V1_0,
+                         REVISION_V1_0_1_DRILL};
+    use qlab_devnet::halt::HaltPlan;
+
+    fn armed_release() -> Release {
+        Release {
+            name: "test [armed]",
+            plan: HaltPlan::Armed { height: DH },
+            revision: Some(REVISION_V1_0),
+            resumes_from: None,
+        }
+    }
+    fn resume_release() -> Release {
+        Release {
+            name: "test [resume]",
+            plan: HaltPlan::None,
+            revision: Some(REVISION_V1_0_1_DRILL),
+            resumes_from: Some(DH),
+        }
+    }
+
+    /// Mine `n` blocks and checkpoint after each, on a node holding all 21 keys.
+    fn mine_and_checkpoint(
+        node: &mut RunningNode<KeccakPow, DevnetRehearsalVerifier>,
+        n: u64,
+    ) -> u64 {
+        let mut mined = 0;
+        for _ in 0..n {
+            if !node.try_mine() {
+                break;
+            }
+            mined += 1;
+            node.try_checkpoint();
+        }
+        mined
+    }
+
+    /// H2 through the binary's own run loop: an armed release applies block H, then
+    /// stops; the regime walks Halting → Halted; and the durable halt marker lands
+    /// on disk with the revision that produced it.
+    #[test]
+    fn armed_release_halts_at_h_and_writes_a_durable_marker() {
+        let (config, genesis, base) = rig("halt_armed", true);
+        let mut node = RunningNode::start_with_release(
+            &config, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+        )
+        .unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        assert_eq!(node.halt_at(), Some(DH));
+
+        node.try_checkpoint(); // finalize genesis
+        // Mine toward H, but do NOT checkpoint yet — so H is reached unfinalized.
+        for _ in 0..DH {
+            assert!(node.try_mine(), "mines below the halt height");
+        }
+        assert_eq!(node.tip_height(), DH, "block H is applied");
+        assert!(!node.try_mine(), "…and nothing above it is mined");
+        assert!(node.is_halted());
+
+        // Halting: at the boundary, boundary not yet final.
+        let line = node.telemetry_sample();
+        assert!(line.contains("regime=Halting"), "at H, unfinalized ⇒ Halting: {line}");
+        assert!(line.contains(&format!("halt={DH}")), "the schedule is on the wire: {line}");
+        // The layer-attribution counters ride the same line (#74 drill evidence).
+        assert!(line.contains("hignore="), "release-layer refusals on the wire: {line}");
+        assert!(line.contains("powrej="), "header-layer refusals on the wire: {line}");
+        node.maintain_halt_marker();
+        let m = HaltMarker::load(&config.data_dir).unwrap().expect("marker written on reaching H");
+        assert_eq!(m.height, DH);
+        assert_eq!(m.revision_id, "v1.0");
+        assert!(!m.boundary_finalized, "not final yet");
+
+        // Finalize the boundary ⇒ Halted, and the marker is upgraded once.
+        node.try_checkpoint();
+        assert_eq!(node.finalized_height(), Some(DH), "the boundary is a FINALIZED boundary");
+        let line = node.telemetry_sample();
+        assert!(line.contains("regime=Halted"), "H finalized ⇒ Halted: {line}");
+        node.maintain_halt_marker();
+        let m = HaltMarker::load(&config.data_dir).unwrap().unwrap();
+        assert!(m.boundary_finalized, "marker records that the boundary finalized");
+
+        // The committee proposed no slot above H.
+        assert!(node.next_checkpoint <= DH + CHECKPOINT_CADENCE_BLOCKS);
+        node.save_snapshot().unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **DRILL (c) through the run path.** A binary that would resume past the halt
+    /// but carries no revision refuses to start on a halted node's data dir — and
+    /// the refusal comes from the on-disk marker, so it cannot be dodged.
+    #[test]
+    fn drill_c_no_revision_refuses_to_resume_a_halted_data_dir() {
+        let (config, genesis, base) = rig("halt_norev", true);
+        {
+            let mut node = RunningNode::start_with_release(
+                &config, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+            )
+            .unwrap();
+            node.set_mine_interval(Duration::ZERO);
+            node.try_checkpoint();
+            mine_and_checkpoint(&mut node, DH);
+            assert_eq!(node.tip_height(), DH);
+            node.maintain_halt_marker();
+            node.save_snapshot().unwrap();
+        }
+
+        // (c) — resumes past H, carries no revision at all.
+        let norev = Release {
+            name: "test [resume, no revision]",
+            plan: HaltPlan::None,
+            revision: None,
+            resumes_from: Some(DH),
+        };
+        let err = RunningNode::start_with_release(
+            &config, &genesis, KeccakPow, DevnetRehearsalVerifier, norev,
+        );
+        assert!(matches!(
+            err,
+            Err(RunError::Release(ReleaseError::ResumeWithoutRevision { height })) if height == DH
+        ));
+
+        // And the subtler dodge: a perfectly valid later release that carries a
+        // revision but simply does not DECLARE the boundary. The marker refuses it.
+        let undeclared = Release {
+            name: "test [some later binary]",
+            plan: HaltPlan::None,
+            revision: Some(REVISION_V1_0),
+            resumes_from: None,
+        };
+        let err2 = RunningNode::start_with_release(
+            &config, &genesis, KeccakPow, DevnetRehearsalVerifier, undeclared,
+        );
+        assert!(matches!(
+            err2,
+            Err(RunError::Release(ReleaseError::UndeclaredResume { marked, .. })) if marked == DH
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **The resume path (scope item 5).** The upgraded binary opens the SAME data
+    /// dir at tip H and continues: no re-sync from genesis, no re-mining of H.
+    #[test]
+    fn the_upgraded_release_resumes_at_h_without_a_resync() {
+        let (config, genesis, base) = rig("halt_resume", true);
+        let boundary_hash;
+        {
+            let mut node = RunningNode::start_with_release(
+                &config, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+            )
+            .unwrap();
+            node.set_mine_interval(Duration::ZERO);
+            node.try_checkpoint();
+            mine_and_checkpoint(&mut node, DH);
+            assert_eq!(node.tip_height(), DH);
+            assert_eq!(node.finalized_height(), Some(DH));
+            boundary_hash = node.p2p().node().main_chain_hash_at(DH).unwrap();
+            node.maintain_halt_marker();
+            node.save_snapshot().unwrap();
+        }
+
+        // Swap the binary: same data dir, new release.
+        let mut up = RunningNode::start_with_release(
+            &config, &genesis, KeccakPow, DevnetRehearsalVerifier, resume_release(),
+        )
+        .expect("the declared resume release starts on a halted data dir");
+        up.set_mine_interval(Duration::ZERO);
+        assert_eq!(up.tip_height(), DH, "opened AT the boundary — no re-sync from genesis");
+        assert_eq!(
+            up.p2p().node().main_chain_hash_at(DH),
+            Some(boundary_hash),
+            "…and block H was not re-mined: it is byte-identical to the pre-halt block"
+        );
+        assert_eq!(up.halt_at(), None, "the resumed release halts nowhere");
+
+        // It mines past the boundary, under the post-halt rules.
+        assert!(up.try_mine(), "the resumed release produces block H+1");
+        assert_eq!(up.tip_height(), DH + 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **DRILL (d) through the run path.** A cancelled upgrade does not halt at the
+    /// cancelled height — the node mines straight through it and writes no marker.
+    #[test]
+    fn drill_d_cancelled_release_mines_through_the_cancelled_height() {
+        let (config, genesis, base) = rig("halt_cancel", true);
+        let cancelled = Release {
+            name: "test [cancelled]",
+            plan: HaltPlan::Cancelled { height: DH, reason: "review stood it down" },
+            revision: Some(REVISION_V1_0),
+            resumes_from: None,
+        };
+        let mut node = RunningNode::start_with_release(
+            &config, &genesis, KeccakPow, DevnetRehearsalVerifier, cancelled,
+        )
+        .unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        assert_eq!(node.halt_at(), None, "a cancelled upgrade stops nowhere");
+        node.try_checkpoint();
+        assert_eq!(mine_and_checkpoint(&mut node, DH + 8), DH + 8, "mined through it");
+        assert_eq!(node.tip_height(), DH + 8);
+        assert!(!node.is_halted());
+        assert_eq!(node.finalized_height(), Some(DH + 8), "finality never paused");
+        let line = node.telemetry_sample();
+        assert!(line.contains("regime=Final"), "never a halt regime: {line}");
+        assert!(line.contains("halt=-"), "no halt height on the wire: {line}");
+        node.maintain_halt_marker();
+        assert_eq!(
+            HaltMarker::load(&config.data_dir).unwrap(),
+            None,
+            "a cancelled upgrade leaves no halt marker — nothing halted"
+        );
+        // …but the stand-down is still visible to an operator.
+        assert!(node.release().banner(None).contains("CANCELLED"));
         let _ = std::fs::remove_dir_all(&base);
     }
 }

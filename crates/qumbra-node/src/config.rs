@@ -31,7 +31,16 @@ use serde::{Deserialize, Serialize};
 
 /// A parsed node configuration. Deployment/process settings only; consensus
 /// constants are in the genesis file, never here.
+///
+/// `deny_unknown_fields` is deliberate (issue #74, H1). The halt-height upgrade
+/// mechanism has **no runtime override**: the halt height is a release constant,
+/// reachable from nothing but a rebuild. An unknown key that parsed and was then
+/// silently ignored would let an operator write `halt_height = 999`, watch the node
+/// start cleanly, and believe they had moved where consensus pauses. Rejecting the
+/// key outright is the difference between "you cannot do that" and "that did
+/// nothing" — and the same protection covers every other typo'd key here.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     /// Directory backing the append-only block log + atomic snapshot.
     pub data_dir: PathBuf,
@@ -144,6 +153,21 @@ mod tests {
         let c = NodeConfig::from_toml(SAMPLE).unwrap();
         let back = NodeConfig::from_toml(&c.to_toml()).unwrap();
         assert_eq!(c, back);
+    }
+
+    /// H1 at the config surface: an unknown key is a hard error, never a silent
+    /// no-op. In particular there is no config path to a halt height.
+    #[test]
+    fn an_unknown_key_is_rejected_not_ignored() {
+        let err = NodeConfig::from_toml(
+            r#"
+            data_dir = "d"
+            listen_addr = "127.0.0.1:0"
+            genesis_file = "g"
+            halt_height = 999
+            "#,
+        );
+        assert!(matches!(err, Err(ConfigError::Parse(_))), "unknown key must not parse");
     }
 
     #[test]

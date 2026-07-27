@@ -7,6 +7,7 @@
 //! a handful of iterations; a real RandomX-class engine slots in behind the same
 //! trait with no change here.
 
+use crate::halt::{pow_value, RuleSchedule};
 use crate::header::BlockHeader;
 use crate::pow::{satisfies_target, PowEngine};
 
@@ -21,13 +22,29 @@ use crate::pow::{satisfies_target, PowEngine};
 /// `nonce`.
 pub fn mine<P: PowEngine>(
     pow: &P,
-    mut header: BlockHeader,
+    header: BlockHeader,
     nonce_budget: u64,
     seed: &[u8],
 ) -> Option<BlockHeader> {
+    mine_under(pow, header, nonce_budget, seed, &RuleSchedule::V1_0)
+}
+
+/// [`mine`] under an explicit [`RuleSchedule`] (issue #74). Above an upgrade
+/// boundary the miner searches for a nonce satisfying the **post-halt** PoW value
+/// ([`pow_value`]) — the same value the validator checks, so miner and validator
+/// can never disagree about which rules a height is under. At and below the
+/// boundary the two functions are byte-identical.
+pub fn mine_under<P: PowEngine>(
+    pow: &P,
+    mut header: BlockHeader,
+    nonce_budget: u64,
+    seed: &[u8],
+    rules: &RuleSchedule,
+) -> Option<BlockHeader> {
     for nonce in 0..nonce_budget {
         header.nonce = nonce;
-        if satisfies_target(&pow.pow_hash(&header, seed), header.difficulty) {
+        let value = pow_value(pow.pow_hash(&header, seed), header.height, rules);
+        if satisfies_target(&value, header.difficulty) {
             return Some(header);
         }
     }

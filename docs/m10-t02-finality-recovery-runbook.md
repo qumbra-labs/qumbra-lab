@@ -137,3 +137,180 @@ canonical choice.
 | Degraded, active set < quorum from tombstones | roster | stage new members at next epoch boundary (governance) |
 | A restarted finalizer refuses to vote a slot | `SignRefusal::WouldEquivocate` | expected — it already committed a different checkpoint there; do **not** override |
 | Committee income flat during stall | by design | accrues on recovery once the span finalizes |
+
+## 7. Halt-height upgrade — the operator procedure (issue #74)
+
+An upgrade is not a stall, and the two must never be confused: a stall is
+`Degraded`, an upgrade is `Halting` then `Halted`. This section is the procedure an
+operator executes from this document alone.
+
+### 7.1 What a halted node looks like
+
+A halted node is **alive**. It serves RPC and telemetry, it just stops advancing:
+
+```
+TELEMETRY tip=16 final=8  stall=8 age_s=600 diff=… peers=3 mempool=0 epoch=0 regime=Halting halt=16
+TELEMETRY tip=16 final=16 stall=0 age_s=0   diff=… peers=3 mempool=0 epoch=0 regime=Halted  halt=16
+```
+
+- `halt=<H>` — this release is scheduled to stop at height H. `halt=-` means it has
+  no upgrade scheduled.
+- `regime=Halting` — the tip has reached H, but **H's checkpoint has not finalized
+  yet**. Do **not** swap binaries.
+- `regime=Halted` — H is finalized. The upgrade boundary is a finalized boundary;
+  everything pre-halt is final by construction. It is now safe to swap.
+- `tip` stops moving at exactly H and never passes it.
+
+### 7.2 Telling `Halting` from stuck
+
+This is the distinction that matters most, because they look similar from a
+distance and the responses are opposite.
+
+| | `Halting` | Stuck (`Degraded`) |
+|---|---|---|
+| `halt=` | the scheduled height | `-` |
+| `tip` | pinned at exactly `halt` | still climbing |
+| What it means | the net is waiting for the boundary to finalize | the committee is not finalizing at all |
+| What to do | wait; if it does not clear in ~2 cadences, treat it as a committee-liveness problem (§3–§4) and **do not upgrade** | §3 triage |
+
+A net that sits in `Halting` is telling you something true: fewer than quorum
+members are able to sign the boundary checkpoint. That is a reason not to upgrade
+yet, not a reason to force the upgrade through. Swapping binaries out of `Halting`
+means swapping across an **unfinalized** boundary, which is exactly the property
+the halt height exists to guarantee you never have to do.
+
+### 7.3 Before the height — check every node
+
+```
+qumbra-node halt-status --config <node.toml>
+```
+
+prints the release name, the halt plan, the revision identifier, the
+frozen-parameter digest, the post-halt rule domain, and any on-disk halt marker. It
+**exits non-zero** if this binary would refuse to start. Run it on every node
+before the upgrade window, and confirm:
+
+- every node reports the **same** `halt plan` height;
+- every node reports the **same** frozen digest (a node reporting a different one
+  is running different consensus constants — stop and investigate);
+- the revision identifier matches the announced revision document.
+
+There is no way to change the halt height on a running node. It is a compile-time
+release constant; the only way to move it is to deploy a different binary.
+
+### 7.4 At the height
+
+1. Watch until **every** node you control reports `regime=Halted` at an
+   **identical** `tip` and `final`. Any disagreement about the boundary is a stop —
+   do not proceed.
+2. Each halted node writes `halt.marker` into its data dir recording the height,
+   the revision that halted it, and that revision's frozen digest. This is your
+   evidence the halt happened, and it is what the new binary is checked against.
+3. Stop the node, swap the executable, start it. The data dir is **not** wiped: the
+   upgraded binary opens the persisted chain at tip H and continues. There is no
+   re-sync from genesis and block H is not re-mined.
+
+**Two things a freshly-swapped node reports that look alarming and are not:**
+
+- **`final=-` for a while after the swap.** This is what it actually looks like,
+  from a real run:
+
+  ```
+  TELEMETRY tip=16 final=-  stall=16 age_s=-    … regime=Degraded halt=- …
+  TELEMETRY tip=17 final=16 stall=1  age_s=4995 … regime=Final    halt=- …
+  ```
+
+  The finality *tracker* is deliberately not persisted (M10-T0-5 / S7 — it rebuilds
+  from re-gossip), so a just-restarted node reports no finalized head until a
+  checkpoint reaches it again. The chain's finalized head is intact on disk;
+  nothing was un-finalized. Judge the ⅔ gate by whether finality ever advances
+  **above H**, never by whether `final` momentarily reads `-`.
+- **`hignore=` back to 0.** The refusal counters are per-process and reset with the
+  container. A post-swap `hignore=0` means "new process", not "nothing was ever
+  ignored". Compare against the value you recorded before the swap.
+
+### 7.5 If the new binary refuses to start
+
+This is the mechanism working. Read the error:
+
+| Error | Meaning | Action |
+|---|---|---|
+| `resumes past the halt at height H but carries NO revision` | the binary would resume without a revision document (H4) | you have the wrong build; get the release that carries the revision |
+| `this node halted at height H … but it declares resumes_from=None` | this binary is not the release that follows this halt — including the case of downgrading to the pre-upgrade binary | deploy the release that follows the halt at H |
+| `revision \`X\` declares digest A but this binary's frozen constants digest to B` | a FROZEN v1.0 value moved without a revision describing it, or a revision was copied across a change it does not describe | **stop.** Do not deploy. This is the undocumented-parameter-change alarm |
+| `halt height H is not a multiple of the checkpoint cadence 8` | the release's halt height is off the grid | wrong build; the boundary would not be a finalized boundary |
+
+Restarting the **same** halted binary is always allowed — you must be able to stop
+and inspect a halted node.
+
+### 7.6 After the swap
+
+- Finality resumes only when **≥⅔ of the committee** (quorum 15 of 21) is on the
+  new binary. Below that, the net stays where it was rather than limping forward on
+  a minority committee. `final` not advancing with 11 keys upgraded is correct, not
+  a fault.
+- **Old-binary miners will keep producing blocks past H, and that is expected.**
+  `committee-and-governance.md` §4 is explicit about it: unlike pure BFT, the
+  hybrid chain does not simply stop. Do not treat a growing un-upgraded branch as
+  an incident. **Do** treat it as an incident if that branch ever *finalizes* above
+  H — see §7.8.
+
+  Two telemetry counters say which layer is refusing those blocks, and they mean
+  different things:
+
+  | Counter | Layer | Meaning |
+  |---|---|---|
+  | `hignore=` climbing | release | **you are halted.** The block was not judged invalid — this node has simply stopped and will not act on it. The sender is *not* penalized: a peer still mining above the halt height is on a different release, not misbehaving. |
+  | `powrej=` climbing | header validation | **the post-halt rules are in force.** The block's PoW does not meet the target under the new revision's domain, so it is invalid on this net and never reaches fork choice. |
+
+  Before the swap you should see `hignore` rising and `powrej` flat. After the
+  swap, the reverse. `powrej` rising *before* the swap, or `hignore` rising after
+  it, means a node is running a binary you did not think it was running — check
+  `halt-status` on every node.
+- A committee member that mined past H on the old binary and **voted** there has
+  burned those slots: its never-double-sign ledger will refuse to vote for the
+  upgraded branch at the same heights, and the member simply contributes nothing
+  until the branch passes them. This is correct, and it is an argument for halting
+  cleanly rather than mining through.
+
+### 7.7 Standing an upgrade down
+
+A scheduled upgrade is cancelled by deploying a release whose halt plan is
+`CANCELLED`, before the height is reached. It is a binary swap like any other —
+there is deliberately no runtime switch. A cancelled release reports
+
+```
+halt plan:    CANCELLED — the upgrade at height 16 was stood down (<reason>)
+```
+
+on its startup banner and `halt=-` in telemetry, and it mines and finalizes
+straight through the cancelled height. The cancelled height stays on the banner on
+purpose, so you can tell "I deployed the stand-down" from "I forgot to deploy the
+arming".
+
+### 7.8 🛑 Stop-everything conditions
+
+Preserve state, capture logs from every node, do not patch and continue:
+
+- two conflicting checkpoints finalized at the same height;
+- any reorg past a finalized checkpoint;
+- an un-upgraded branch finalizing above H;
+- nodes disagreeing about the boundary block at H.
+
+These are the failures the halt-height mechanism exists to prevent. Everything else
+in this section is operations; this is an incident.
+
+### 7.9 Quick reference
+
+| Symptom | Check | Action |
+|---|---|---|
+| `regime=Halting`, tip pinned at `halt` | boundary not final yet | wait; do **not** swap binaries |
+| `regime=Halting` for > ~2 cadences | committee liveness (§3) | triage as a stall; do **not** upgrade |
+| `regime=Halted`, identical tip/final everywhere | boundary finalized | swap binaries |
+| New binary exits at startup | read the error (§7.5) | usually the wrong build — the gate is working |
+| `final` flat after the swap | how many keys upgraded? | below quorum 15 → expected; upgrade more |
+| A peer's tip climbing past `halt` | an old-binary miner | expected (§4); watch that it never *finalizes* |
+| `hignore=` climbing | you are halted; peers still mining | expected during the upgrade window; no peer is at fault |
+| `powrej=` climbing | post-halt rules refusing old-rule blocks | expected after the swap |
+| `powrej=` climbing *before* the swap | wrong binary somewhere | run `halt-status` on every node |
+| An un-upgraded branch finalizes above H | — | 🛑 stop everything, preserve state |

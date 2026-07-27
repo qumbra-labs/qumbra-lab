@@ -90,6 +90,11 @@ impl SigningWindow {
 }
 
 /// Which finality regime the node is in.
+///
+/// `Final`/`Degraded` are the Ebb-and-Flow pair. `Halting`/`Halted` are the
+/// halt-height upgrade pair (issue #74, committee-and-governance §4) — they extend
+/// this same surface deliberately, rather than forking a parallel status field, so
+/// there is exactly one thing an operator (and the telemetry wire) has to read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FinalityStatus {
     /// Recent checkpoints are finalizing; the tip is within `max_lag` of finality.
@@ -97,6 +102,14 @@ pub enum FinalityStatus {
     /// The committee has stalled (or never finalized): the chain continues under
     /// probabilistic PoW confirmation until finality resumes.
     Degraded,
+    /// The tip has reached the scheduled halt height H, but H's checkpoint has not
+    /// finalized yet ([`crate::halt`]). The node is paused at the boundary and
+    /// waiting for it to become final; a net stuck here has NOT completed its halt
+    /// and must not be upgraded yet.
+    Halting,
+    /// H is finalized. The upgrade boundary is a finalized boundary — everything
+    /// pre-halt is final by construction, and the binaries may now be swapped.
+    Halted,
 }
 
 /// Assess the finality regime from the tip and finalized heights.
