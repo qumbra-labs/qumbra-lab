@@ -149,7 +149,9 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
 
     /// Admit addresses learned from a peer (scope 1). A peer's claim about a third
     /// party is a **candidate only** (S6): it is never a scoring input in either
-    /// direction, so no peer can use it to get another peer penalised.
+    /// direction, so no peer can use it to get another peer penalised. This is the
+    /// same rule [`crate::n1::IngestOutcome::is_peer_fault`] encodes for objects —
+    /// a well-formed thing we cannot use is not a misbehaving peer (#70 S5).
     fn on_addr(&mut self, from: PeerId, payload: &[u8]) {
         match crate::peer::decode_addrs(payload) {
             Ok(addrs) => {
