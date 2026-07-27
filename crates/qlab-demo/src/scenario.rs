@@ -88,8 +88,10 @@ fn tx_entry(inst: &BucketInstance) -> TxEntry {
 }
 
 /// A structurally-valid `TxEntry` carrying an arbitrary `anchor` — for the
-/// anchor-rejection negatives. `validate_body` checks the anchor gate FIRST, so
-/// the nullifier/commitment/fee fields are inert here (never reached).
+/// anchor-rejection negatives. `validate_body` checks the header/body binding
+/// first (issue #77) and the anchor gate next, so these bodies are always paired
+/// with [`header_committing_to`] and the nullifier/commitment/fee fields stay
+/// inert (never reached).
 fn entry_with_anchor(anchor: Hash32) -> TxEntry {
     TxEntry {
         proof: 0u64.to_le_bytes().to_vec(),
@@ -101,6 +103,21 @@ fn entry_with_anchor(anchor: Hash32) -> TxEntry {
             fee: posted_fee(ArityBucket::TwoByTwo),
         },
     }
+}
+
+/// The header this body belongs to, for the demo's `validate_body` calls
+/// (issue #77 — validation now takes the header, so the body it is handed must be
+/// the body the header committed to).
+///
+/// The demo mines through `qlab_devnet::Node::mine_next(commitment)`, the
+/// header-only lane that is handed a commitment *value* rather than a body
+/// (Addendum A4), so the header does not exist yet at validation time and this
+/// stands one in with the same commitment `mine_next` is about to be given. The
+/// binding is therefore satisfied by construction here — the demo shows the
+/// happy path; the seams that must *reject* a mismatch are test-locked in
+/// `qlab-p2p` and `qlab-node`, plus the empty-body negative asserted below.
+fn header_committing_to(body: &BlockBody) -> BlockHeader {
+    BlockHeader::child_of(&BlockHeader::genesis(1, 0), 0, 1, body.commitment())
 }
 
 /// Structural stand-in header for the discovery-layer StoredBlock. The compact
@@ -142,6 +159,9 @@ pub struct LoopReport {
     pub bob_nullifier: [u8; 32],
     pub double_spend_rejected: bool,
     pub within_block_double_spend_rejected: bool,
+    /// Issue #77: an honest header relayed with an EMPTY body is rejected by the
+    /// header/body binding — the cheapest state-divergence exploit.
+    pub unbound_body_rejected: bool,
     /// Issue #39: the send anchored to a REAL finalized commitment-tree root
     /// (not a fabricated one), and the live membership witness resolved to it.
     pub anchor_finalized: bool,
@@ -259,10 +279,21 @@ pub fn run_loop(seed: u64) -> LoopReport {
     // cm_out surfaces bound into the send proof; keep them for the tree append.
     let send_out_cms = send_inst.cm_out;
     let verifier = PoolVerifier { pool: vec![(send_inst, send_pvs, send_proof)] };
-    validate_body(&send_body, &verifier, |r: &Hash32| {
+    let send_header = header_committing_to(&send_body);
+    validate_body(&send_header, &send_body, &verifier, |r: &Hash32| {
         node.finality().is_anchor_acceptable(r, DEMO_ANCHOR_WINDOW_BLOCKS)
     })
     .expect("send block validates (REAL proof + finalized fresh anchor)");
+    // Issue #77, the cheapest exploit: the same honest header relayed with an
+    // EMPTY body. Every other body rule passes trivially on an empty body — the
+    // binding is the only thing that rejects it.
+    let empty_body_rejected = matches!(
+        validate_body(&send_header, &BlockBody::default(), &verifier, |r: &Hash32| {
+            node.finality().is_anchor_acceptable(r, DEMO_ANCHOR_WINDOW_BLOCKS)
+        }),
+        Err(BodyError::CommitmentMismatch { .. })
+    );
+    say!("Honest send header + EMPTY body rejected (issue #77): {empty_body_rejected}");
     node.mine_next(send_body.commitment()).expect("mine send block");
     supply.record_fee(1_000);
     // The send's outputs join the commitment tree; finalize the new root R1.
@@ -328,7 +359,7 @@ pub fn run_loop(seed: u64) -> LoopReport {
 
     let verifier2 = PoolVerifier { pool: vec![(spend_inst, spend_pvs, spend_proof)] };
     let spend_body = BlockBody { txs: vec![spend_entry.clone()], coinbase: 0 };
-    validate_body(&spend_body, &verifier2, |r: &Hash32| {
+    validate_body(&header_committing_to(&spend_body), &spend_body, &verifier2, |r: &Hash32| {
         node.finality().is_anchor_acceptable(r, DEMO_ANCHOR_WINDOW_BLOCKS)
     })
     .expect("spend block validates");
@@ -342,7 +373,7 @@ pub fn run_loop(seed: u64) -> LoopReport {
     // Double-spend #2 (within-block): two entries with the same nullifier.
     let two_same = BlockBody { txs: vec![spend_entry.clone(), spend_entry], coinbase: 0 };
     let within_block_double_spend_rejected = matches!(
-        validate_body(&two_same, &verifier2, |r: &Hash32| {
+        validate_body(&header_committing_to(&two_same), &two_same, &verifier2, |r: &Hash32| {
             node.finality().is_anchor_acceptable(r, DEMO_ANCHOR_WINDOW_BLOCKS)
         }),
         Err(BodyError::DoubleSpendInBlock { .. })
@@ -357,7 +388,7 @@ pub fn run_loop(seed: u64) -> LoopReport {
     assert!(!node.finality().is_root_final(&never_final), "root_at(4) was never finalized");
     let nf_body = BlockBody { txs: vec![entry_with_anchor(never_final)], coinbase: 0 };
     let non_final_anchor_rejected = matches!(
-        validate_body(&nf_body, &verifier2, |r: &Hash32| {
+        validate_body(&header_committing_to(&nf_body), &nf_body, &verifier2, |r: &Hash32| {
             node.finality().is_anchor_acceptable(r, DEMO_ANCHOR_WINDOW_BLOCKS)
         }),
         Err(BodyError::AnchorNotFinal { .. })
@@ -388,7 +419,7 @@ pub fn run_loop(seed: u64) -> LoopReport {
     let expired_anchor_rejected = r0_still_final
         && r0_expired
         && matches!(
-            validate_body(&exp_body, &verifier2, |r: &Hash32| {
+            validate_body(&header_committing_to(&exp_body), &exp_body, &verifier2, |r: &Hash32| {
                 node.finality().is_anchor_acceptable(r, DEMO_ANCHOR_WINDOW_BLOCKS)
             }),
             Err(BodyError::AnchorNotFinal { .. })
@@ -412,6 +443,7 @@ pub fn run_loop(seed: u64) -> LoopReport {
         bob_nullifier,
         double_spend_rejected,
         within_block_double_spend_rejected,
+        unbound_body_rejected: empty_body_rejected,
         anchor_finalized,
         real_anchor: r0,
         non_final_anchor_rejected,

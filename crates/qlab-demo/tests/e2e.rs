@@ -19,6 +19,10 @@ fn end_to_end_payment_loop_holds_all_invariants() {
     // (3) Double-spend: persistent-set rejection + native within-block rejection.
     assert!(r.double_spend_rejected, "cross-block double-spend rejected");
     assert!(r.within_block_double_spend_rejected, "within-block double-spend rejected");
+    assert!(
+        r.unbound_body_rejected,
+        "an honest header relayed with an empty body is rejected (issue #77)"
+    );
 
     // (4) Bob's spend block finalizes under the committee quorum.
     assert!(r.spend_finalized, "spend block finalized");

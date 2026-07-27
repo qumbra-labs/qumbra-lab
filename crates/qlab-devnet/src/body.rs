@@ -25,7 +25,7 @@ use std::collections::HashSet;
 
 use crate::fees::{posted_fee, ArityBucket};
 use crate::hash::keccak256;
-use crate::header::Hash32;
+use crate::header::{BlockHeader, Hash32};
 
 /// The public surface of a shielded transaction — everything consensus checks
 /// without opening the proof.
@@ -101,6 +101,14 @@ pub trait TxVerifier {
 /// Why a block body was rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BodyError {
+    /// The body is not the body the header committed to: `body.commitment()` does
+    /// not equal the header's `tx_body_commitment` (issue #77).
+    ///
+    /// **This is misbehaviour, not an honest error.** There is no honest way to
+    /// produce a header/body pair that fails this — the producer either mutated
+    /// the body or relayed something it never checked. Callers on the p2p path
+    /// must penalise the sender, not merely drop the object.
+    CommitmentMismatch { expected: Hash32, got: Hash32 },
     /// The tx at `index` references an anchor that is not a finalized root (§6).
     AnchorNotFinal { index: usize },
     /// The tx at `index` pays the wrong fee for its arity bucket (§8).
@@ -111,17 +119,57 @@ pub enum BodyError {
     ProofInvalid { index: usize },
 }
 
-/// Validate a block body: every anchor finalized, every fee = posted price, no
-/// nullifier repeated in-block, and every proof verifies. Cheap public checks run
-/// first; the proof verify (the only non-trivial cost) runs last per tx.
+/// Check that `body` is the body `header` committed to (issue #77).
+///
+/// `tx_body_commitment` is part of the header's hash preimage
+/// ([`BlockHeader::preimage`]), so a header is cryptographically bound to *a*
+/// body — this is the function that establishes it is bound to *this* one.
+/// Without it a header no longer determines the state it produces: an honest
+/// header relayed with a foreign (or empty) body applies foreign state under a
+/// valid PoW header, and two honest nodes diverge under an identical header
+/// chain.
+///
+/// Called first by [`validate_body`], so no caller has to remember it.
+pub fn check_body_binding(header: &BlockHeader, body: &BlockBody) -> Result<(), BodyError> {
+    let got = body.commitment();
+    if header.tx_body_commitment != got {
+        return Err(BodyError::CommitmentMismatch {
+            expected: header.tx_body_commitment,
+            got,
+        });
+    }
+    Ok(())
+}
+
+/// Validate a block body **against its header**: the body is the one the header
+/// committed to, every anchor is finalized, every fee = posted price, no
+/// nullifier is repeated in-block, and every proof verifies.
+///
+/// Ordering is load-bearing (issue #77 P1): the header/body binding
+/// ([`check_body_binding`]) runs **before any other body work**. It is the
+/// cheapest possible rejection and the most fundamental — if the body is not the
+/// header's body, nothing else about it is worth computing. Its cost is
+/// O(block bytes) hashing, which the STARK verification immediately after it
+/// dwarfs by orders of magnitude, so it is **not** cached, deferred or made
+/// conditional on the code path.
+///
+/// Taking the header is the structural half of the fix: a caller that holds a
+/// body cannot validate it without also producing the header it claims to belong
+/// to, so a future seam cannot silently skip the binding check.
 ///
 /// `is_anchor_final` is the anchors-from-finalized-only gate (§6) — pass
 /// `|r| tracker.is_root_final(r)` from the 棒 2 [`crate::finality::FinalityTracker`].
-pub fn validate_body<V, F>(body: &BlockBody, verifier: &V, is_anchor_final: F) -> Result<(), BodyError>
+pub fn validate_body<V, F>(
+    header: &BlockHeader,
+    body: &BlockBody,
+    verifier: &V,
+    is_anchor_final: F,
+) -> Result<(), BodyError>
 where
     V: TxVerifier,
     F: Fn(&Hash32) -> bool,
 {
+    check_body_binding(header, body)?;
     let mut seen_nf: HashSet<Hash32> = HashSet::new();
     for (i, tx) in body.txs.iter().enumerate() {
         if !is_anchor_final(&tx.public.anchor) {
@@ -162,6 +210,13 @@ mod tests {
         *r == FINAL_ANCHOR
     }
 
+    /// An honest header for `body` — one that commits to exactly this body. Every
+    /// positive test must produce one; that is the point of the signature.
+    fn header_for(body: &BlockBody) -> BlockHeader {
+        let genesis = BlockHeader::genesis(1, 0);
+        BlockHeader::child_of(&genesis, 75, 1, body.commitment())
+    }
+
     fn good_tx(nf: u8) -> TxEntry {
         TxEntry {
             proof: b"ok".to_vec(),
@@ -178,7 +233,8 @@ mod tests {
     #[test]
     fn valid_body_passes_and_commitment_is_deterministic() {
         let body = BlockBody { txs: vec![good_tx(1), good_tx(2)], coinbase: 42 };
-        assert_eq!(validate_body(&body, &MockVerifier, is_final), Ok(()));
+        let header = header_for(&body);
+        assert_eq!(validate_body(&header, &body, &MockVerifier, is_final), Ok(()));
         assert_eq!(body.commitment(), body.commitment());
         assert_eq!(body.total_fees(), 2 * posted_fee(ArityBucket::TwoByTwo));
         // A different body ⇒ different commitment.
@@ -192,7 +248,7 @@ mod tests {
         tx.public.anchor = [0xEE; 32]; // not the finalized root
         let body = BlockBody { txs: vec![tx], coinbase: 0 };
         assert_eq!(
-            validate_body(&body, &MockVerifier, is_final),
+            validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::AnchorNotFinal { index: 0 })
         );
     }
@@ -203,7 +259,7 @@ mod tests {
         tx.public.fee += 1;
         let body = BlockBody { txs: vec![tx], coinbase: 0 };
         assert_eq!(
-            validate_body(&body, &MockVerifier, is_final),
+            validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::WrongFee {
                 index: 0,
                 expected: posted_fee(ArityBucket::TwoByTwo),
@@ -220,7 +276,7 @@ mod tests {
         b.public.nullifiers = a.public.nullifiers.clone();
         let body = BlockBody { txs: vec![a, b], coinbase: 0 };
         assert_eq!(
-            validate_body(&body, &MockVerifier, is_final),
+            validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::DoubleSpendInBlock { index: 1 })
         );
     }
@@ -231,8 +287,82 @@ mod tests {
         tx.proof = b"forged".to_vec();
         let body = BlockBody { txs: vec![tx], coinbase: 0 };
         assert_eq!(
-            validate_body(&body, &MockVerifier, is_final),
+            validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::ProofInvalid { index: 0 })
+        );
+    }
+
+    // --- issue #77: the header/body binding ---------------------------------
+
+    /// A body that is not the one the header committed to is rejected — the
+    /// invariant itself, at the validation seam.
+    #[test]
+    fn body_not_matching_the_header_commitment_is_rejected() {
+        let honest = BlockBody { txs: vec![good_tx(1), good_tx(2)], coinbase: 42 };
+        let header = header_for(&honest); // commits to `honest`…
+        let swapped = BlockBody { txs: vec![good_tx(3)], coinbase: 42 }; // …but we hand it this
+        assert_eq!(
+            validate_body(&header, &swapped, &MockVerifier, is_final),
+            Err(BodyError::CommitmentMismatch {
+                expected: honest.commitment(),
+                got: swapped.commitment(),
+            })
+        );
+    }
+
+    /// **The cheapest exploit (issue #77): an honest header relayed with an empty
+    /// body.** Every other body rule passes trivially on an empty body — no tx to
+    /// have a bad anchor, a wrong fee, a repeated nullifier or an invalid proof —
+    /// so the binding check is the *only* thing that rejects it.
+    #[test]
+    fn empty_body_under_an_honest_header_is_rejected() {
+        let honest = BlockBody { txs: vec![good_tx(1), good_tx(2)], coinbase: 42 };
+        let header = header_for(&honest);
+        let empty = BlockBody::default();
+        // Everything except the binding is happy with the empty body:
+        assert_eq!(validate_body(&header_for(&empty), &empty, &MockVerifier, is_final), Ok(()));
+        // …under the honest header it must not be:
+        assert_eq!(
+            validate_body(&header, &empty, &MockVerifier, is_final),
+            Err(BodyError::CommitmentMismatch {
+                expected: honest.commitment(),
+                got: empty.commitment(),
+            })
+        );
+    }
+
+    /// P1: the binding runs **before** any other body work. A body that is both
+    /// unbound *and* internally invalid reports the mismatch — proving nothing
+    /// expensive (proof verification) ran first.
+    #[test]
+    fn binding_is_checked_before_any_other_body_work() {
+        let mut tx = good_tx(1);
+        tx.proof = b"forged".to_vec(); // would be ProofInvalid…
+        tx.public.anchor = [0xEE; 32]; // …and AnchorNotFinal
+        let body = BlockBody { txs: vec![tx], coinbase: 0 };
+        let foreign = header_for(&BlockBody::default());
+        assert_eq!(
+            validate_body(&foreign, &body, &MockVerifier, is_final),
+            Err(BodyError::CommitmentMismatch {
+                expected: BlockBody::default().commitment(),
+                got: body.commitment(),
+            })
+        );
+    }
+
+    /// The devnet genesis header pins `tx_body_commitment = ZERO_HASH` while an
+    /// empty body commits to `keccak256(coinbase_le)` — so **genesis does not
+    /// satisfy the invariant**. Locked here so the exemption stays a deliberate,
+    /// visible fact rather than something a later reader "fixes" by editing the
+    /// frozen genesis header (issue #77 finding F1).
+    #[test]
+    fn genesis_header_does_not_bind_its_empty_body() {
+        let g = BlockHeader::genesis(1_000, 0);
+        assert_eq!(g.tx_body_commitment, crate::header::ZERO_HASH);
+        assert_ne!(
+            g.tx_body_commitment,
+            BlockBody::default().commitment(),
+            "if this ever becomes equal the genesis exemption can be dropped"
         );
     }
 }

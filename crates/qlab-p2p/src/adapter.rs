@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use qlab_devnet::body::{validate_body, BlockBody, TxEntry};
+use qlab_devnet::body::{validate_body, BlockBody, BodyError, TxEntry};
 use qlab_devnet::chain::{ChainState, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, MemberStatus, Validator, Vote};
 use qlab_devnet::ebbflow::{
@@ -534,12 +534,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
     }
 
     fn ingest_block(&mut self, header: BlockHeader, body: BlockBody) -> IngestOutcome {
-        // 1. Body validity is independent of tip-extension: an invalid tx proof /
-        //    fee / in-block double-spend / non-final anchor is adversarial and must
-        //    be rejected + penalized regardless of fork position.
+        // 1. Body validity is independent of tip-extension: a body that is not the
+        //    one this header committed to (issue #77), or an invalid tx proof /
+        //    fee / in-block double-spend / non-final anchor, is adversarial and must
+        //    be rejected + penalized regardless of fork position. `validate_body`
+        //    checks the header/body binding first — it is the cheapest rejection
+        //    and, for the empty-body relay, the only one that fires.
         let anchor_ok = |root: &Hash32| self.state.is_valid_anchor(root);
-        if validate_body(&body, &self.verifier, anchor_ok).is_err() {
-            return IngestOutcome::Rejected("bad body");
+        match validate_body(&header, &body, &self.verifier, anchor_ok) {
+            Ok(()) => {}
+            // Distinct reason string: a mismatch is unambiguous misbehaviour by
+            // whoever handed us the pair, not a merely invalid transaction.
+            Err(BodyError::CommitmentMismatch { .. }) => {
+                return IngestOutcome::Rejected("body does not match header commitment")
+            }
+            Err(_) => return IngestOutcome::Rejected("bad body"),
         }
         // 2. Header into the consensus chain (PoW / fork-choice).
         let outcome = self.submit_header(header);
@@ -844,11 +853,56 @@ mod tests {
         assert_eq!(a.state().tip_height(), 1, "real state applied the body");
 
         // A block whose body carries a verifier-failing tx is rejected up front —
-        // no crash, tip unchanged. (Body validity is independent of the header.)
-        let (h2, _b2) = a.mine_block().expect("mine 2");
+        // no crash, tip unchanged. Body validity is independent of *tip extension*,
+        // but NOT of the header: the header must commit to the body being judged
+        // (issue #77), so the bad body gets a header that honestly commits to it.
+        // Before #77 this case paired a mined header with an unrelated body and
+        // asserted "bad body" — a pairing no honest producer can emit.
         let bad_body = BlockBody { txs: vec![tx_with(anchor, 9, b"bad")], coinbase: 0 };
+        let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
+        let h2 = BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, bad_body.commitment());
         assert_eq!(a.ingest_block(h2, bad_body), IngestOutcome::Rejected("bad body"));
         assert_eq!(a.chain().tip_height(), 1, "tip did not move on a bad block");
+    }
+
+    // --- issue #77: the p2p ingest seam ------------------------------------
+
+    /// The p2p seam rejects a body that is not the one the header committed to,
+    /// with its own reason (it is misbehaviour, not merely an invalid tx).
+    #[test]
+    fn ingest_block_rejects_a_body_that_is_not_the_headers_body() {
+        let (mut a, anchor) = adapter_with_finalized_genesis();
+        // An honest header over the tip, committing to a real one-tx body.
+        let honest_body = BlockBody { txs: vec![tx_with(anchor, 3, b"ok")], coinbase: 0 };
+        let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
+        let header =
+            BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, honest_body.commitment());
+        // …handed a different, also-internally-valid body.
+        let swapped = BlockBody { txs: vec![tx_with(anchor, 4, b"ok")], coinbase: 0 };
+        assert_eq!(
+            a.ingest_block(header, swapped),
+            IngestOutcome::Rejected("body does not match header commitment")
+        );
+        assert_eq!(a.chain().tip_height(), 0, "nothing was accepted");
+    }
+
+    /// **The cheapest exploit (issue #77): the honest header relayed with an EMPTY
+    /// body.** Nothing else rejects it — an empty body has no bad anchor, no wrong
+    /// fee, no repeated nullifier and no invalid proof — so before this fix the
+    /// header was accepted and empty state applied under it.
+    #[test]
+    fn ingest_block_rejects_an_honest_header_with_an_empty_body() {
+        let (mut a, anchor) = adapter_with_finalized_genesis();
+        let honest_body = BlockBody { txs: vec![tx_with(anchor, 5, b"ok")], coinbase: 0 };
+        let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
+        let header =
+            BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, honest_body.commitment());
+        assert_eq!(
+            a.ingest_block(header, BlockBody::default()),
+            IngestOutcome::Rejected("body does not match header commitment")
+        );
+        assert_eq!(a.chain().tip_height(), 0, "the header was not accepted either");
+        assert_eq!(a.state().tip_height(), 0, "no empty body was applied to state");
     }
 
     #[test]

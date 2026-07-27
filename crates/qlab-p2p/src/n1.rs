@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use qlab_devnet::body::{BlockBody, TxEntry};
+use qlab_devnet::body::{check_body_binding, BlockBody, TxEntry};
 use qlab_devnet::chain::{ChainState, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, Vote};
 use qlab_devnet::ebbflow::{
@@ -116,13 +116,22 @@ pub trait BlockIngest {
     fn ingest_header(&mut self, header: BlockHeader) -> IngestOutcome;
 
     /// Ingest a full block (header + ordered body). Header-only node-states
-    /// (sync/gossip only, e.g. [`StubNode`]) inherit the default, which drops the
-    /// body and ingests just the header. A real full node (N7's `NodeAdapter`)
-    /// overrides this to validate the body and fold it into consensus state — so
-    /// a block whose body carries an invalid tx is rejected here, and restart
-    /// state reflects applied bodies. The body arrives via BIP-152 relay
-    /// (produced locally or reconstructed from the mempool).
-    fn ingest_block(&mut self, header: BlockHeader, _body: BlockBody) -> IngestOutcome {
+    /// (sync/gossip only, e.g. [`StubNode`]) inherit the default, which checks the
+    /// header/body binding and then ingests just the header. A real full node
+    /// (N7's `NodeAdapter`) overrides this to validate the body in full and fold it
+    /// into consensus state — so a block whose body carries an invalid tx is
+    /// rejected there, and restart state reflects applied bodies. The body arrives
+    /// via BIP-152 relay (produced locally or reconstructed from the mempool).
+    ///
+    /// The binding check is in the **default** deliberately (issue #77): a
+    /// header-only node still caches and re-announces the body it was handed, so
+    /// dropping the body unexamined would make it a relay for a body no one ever
+    /// checked. Verifying a body it does not otherwise interpret is the one body
+    /// obligation such a node cannot decline.
+    fn ingest_block(&mut self, header: BlockHeader, body: BlockBody) -> IngestOutcome {
+        if check_body_binding(&header, &body).is_err() {
+            return IngestOutcome::Rejected("body does not match header commitment");
+        }
         self.ingest_header(header)
     }
 }
@@ -521,14 +530,30 @@ mod tests {
 
     #[test]
     fn stubnode_ingest_block_defaults_to_header_only() {
-        // A header-only node-state inherits the trait default: the body is
-        // dropped, the header is ingested, the tip advances.
+        // A header-only node-state inherits the trait default: the body is checked
+        // against the header (issue #77) and then dropped, the header is ingested,
+        // the tip advances.
         let mut n = node();
         let g = genesis();
-        let h1 = BlockHeader::child_of(&g, 75, 1000, [1; 32]);
         let body = BlockBody { txs: vec![], coinbase: 0 };
+        let h1 = BlockHeader::child_of(&g, 75, 1000, body.commitment());
         assert_eq!(n.ingest_block(h1, body), IngestOutcome::Accepted);
         assert_eq!(n.tip_height(), 1);
+    }
+
+    /// Issue #77: even a header-only node-state — which never interprets the body —
+    /// must refuse a body that is not the header's body, because it caches and
+    /// re-announces what it was handed.
+    #[test]
+    fn stubnode_ingest_block_rejects_a_body_the_header_did_not_commit_to() {
+        let mut n = node();
+        let honest = BlockBody { txs: vec![], coinbase: 7 };
+        let h1 = BlockHeader::child_of(&genesis(), 75, 1000, honest.commitment());
+        assert_eq!(
+            n.ingest_block(h1, BlockBody { txs: vec![], coinbase: 9 }),
+            IngestOutcome::Rejected("body does not match header commitment")
+        );
+        assert_eq!(n.tip_height(), 0, "the header was not ingested either");
     }
 
     #[test]

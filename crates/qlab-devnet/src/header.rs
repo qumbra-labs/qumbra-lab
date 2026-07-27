@@ -97,6 +97,28 @@ impl BlockHeader {
 
     /// Construct the genesis header at the given difficulty. `prev = ZERO_HASH`,
     /// `height = 0`, `nonce = 0` (genesis carries no PoW), empty body commitment.
+    ///
+    /// # 🔴 T1: the next genesis mint must commit to its body (issue #77 F1)
+    ///
+    /// `tx_body_commitment` is pinned to [`ZERO_HASH`] here, but an empty body
+    /// commits to `keccak256(coinbase_le)` — so **the genesis block is the one
+    /// block that does not satisfy the header/body binding**, and it is the one
+    /// explicit exemption in `qlab_node`'s state-mutation guard.
+    ///
+    /// *Why the exemption is safe:* not because "it is only genesis", but because
+    /// genesis is covered by a **stronger** check — every node pins
+    /// `expected_genesis_hash` in its config and refuses to start against any
+    /// other genesis (`deploy/README.md`, `qumbra-node check`). The binding
+    /// protects blocks that arrive from the network; genesis never does.
+    ///
+    /// *Why it was not fixed:* setting this to `BlockBody::default().commitment()`
+    /// changes the genesis hash, hence the network identity — the T0 net is pinned
+    /// to `4a75b3b8…c2c3`. That is a new-network decision, and Larry's alone.
+    ///
+    /// *The requirement:* **when T1's genesis is minted, set this to the real
+    /// commitment of the genesis body and delete the height-0 exemption in
+    /// `qlab_node::node::check_stored_binding`.** A new network is exactly the
+    /// moment the change is free.
     pub fn genesis(difficulty: u64, timestamp: u64) -> Self {
         Self {
             prev: ZERO_HASH,
@@ -104,6 +126,8 @@ impl BlockHeader {
             timestamp,
             difficulty,
             nonce: 0,
+            // 🔴 T1: see the doc comment above — must become the real body
+            // commitment at the next genesis mint (issue #77 F1).
             tx_body_commitment: ZERO_HASH,
             aggregate_proof: AggregateProofSlot,
             epoch_supply_attestation: EpochSupplyAttestation,
