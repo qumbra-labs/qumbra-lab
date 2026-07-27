@@ -364,15 +364,16 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         let id = tx_id(&tx);
-        match self.node.ingest_tx(tx) {
-            IngestOutcome::Accepted => {
-                self.seen.insert(id);
-                self.relay_inv(InvItem { kind: InvKind::Tx, id }, Some(from));
-            }
-            IngestOutcome::Rejected(_) => {
-                self.peers.penalize(from, PENALTY_INVALID_OBJECT);
-            }
-            _ => {}
+        let outcome = self.node.ingest_tx(tx);
+        // ONE place decides whether the sender is at fault (`is_peer_fault`), so the
+        // "an unusable object is not a misbehaving peer" rule cannot drift between
+        // the tx, header and block paths (#70 S5; #74 extends it to the halt).
+        if outcome.is_peer_fault() {
+            self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+        }
+        if outcome.should_relay() {
+            self.seen.insert(id);
+            self.relay_inv(InvItem { kind: InvKind::Tx, id }, Some(from));
         }
     }
 
@@ -385,7 +386,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         let id = header.header_hash();
-        match self.node.ingest_header(header) {
+        let outcome = self.node.ingest_header(header);
+        if outcome.is_peer_fault() {
+            self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+        }
+        match outcome {
             IngestOutcome::Accepted => {
                 self.seen.insert(id);
                 self.relay_inv(InvItem { kind: InvKind::Block, id }, Some(from));
@@ -394,10 +399,12 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 // Missing ancestors → kick off header-first sync from this peer.
                 self.start_sync_with(from);
             }
-            IngestOutcome::Rejected(_) => {
-                self.peers.penalize(from, PENALTY_INVALID_OBJECT);
-            }
-            IngestOutcome::Duplicate => {}
+            // Above our halt height (#74). NOT a misbehaving peer — it is on a
+            // different release, exactly as §4 says it may be. No relay, and no sync
+            // kick either: syncing toward it would be asking for more of what we
+            // have decided not to accept.
+            IngestOutcome::Ignored(_) => {}
+            IngestOutcome::Rejected(_) | IngestOutcome::Duplicate => {}
         }
     }
 
@@ -582,6 +589,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 // An orphan mid-batch means the batch didn't connect; stop and let
                 // the next locator round re-anchor.
                 IngestOutcome::Orphan | IngestOutcome::Rejected(_) => break,
+                // A halted node stops consuming the batch at the boundary: the
+                // rest of it is above our halt height and will never be accepted.
+                // Stopping here is what pins a halted node's tip at exactly H even
+                // while peers keep serving it taller header batches (#74).
+                IngestOutcome::Ignored(_) => break,
             }
         }
 
@@ -713,16 +725,27 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             return;
         }
-        // A rejected block must not be cached or re-announced, and whoever handed
-        // it to us pays for it (issue #77 P2). This is the compact-reconstruction
-        // seam: the announcer controls the prefilled txs and the short-id salt, so
-        // "reconstruction succeeded" is no evidence the body is the header's body —
-        // that verdict comes from `ingest_block`, and until this commit it was
-        // being computed and then discarded, so a mismatched body would have been
-        // stored and relayed onward.
-        if let IngestOutcome::Rejected(_) = outcome {
-            if let Some(peer) = except {
-                self.peers.penalize(peer, PENALTY_INVALID_OBJECT);
+        // Anything we did not accept is neither cached nor re-announced — putting
+        // on the wire what our own node refused would make this node the origin of
+        // the very object every peer must judge for itself.
+        //
+        // Whether the ANNOUNCER pays for it is a separate question, and it is asked
+        // in exactly one place: `is_peer_fault()` (#74). `Rejected` is a fault;
+        // `Ignored` — a block above our halt height — is not, because a peer still
+        // mining is on a different release, which `committee-and-governance` §4 says
+        // explicitly it may be. Penalising there would ban honest miners inside the
+        // upgrade window.
+        //
+        // This is the compact-reconstruction seam (#77 P2): the announcer controls
+        // the prefilled txs and the short-id salt, so "reconstruction succeeded" is
+        // no evidence the body is the header's body. That verdict comes from
+        // `ingest_block`, and it was being computed and then discarded, so a
+        // mismatched body would have been stored and relayed onward.
+        if !matches!(outcome, IngestOutcome::Accepted) {
+            if outcome.is_peer_fault() {
+                if let Some(peer) = except {
+                    self.peers.penalize(peer, PENALTY_INVALID_OBJECT);
+                }
             }
             return;
         }

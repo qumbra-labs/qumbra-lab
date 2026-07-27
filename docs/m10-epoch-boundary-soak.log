@@ -1,0 +1,1400 @@
+=== EPOCH SOAK START 2026-07-26 00:24:00 — watching for the 1,152-block committee epoch boundary
+[2026-07-26 00:24:00] iter=1
+  node0 TELEMETRY tip=1 final=0 stall=1 age_s=1784996616 diff=256 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1 final=0 stall=1 age_s=1784996616 diff=256 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1 final=0 stall=1 age_s=1784996616 diff=256 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1 final=0 stall=1 age_s=1784996616 diff=256 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 00:29:00] iter=2
+  node0 TELEMETRY tip=6 final=0 stall=6 age_s=1784996921 diff=95 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=6 final=0 stall=6 age_s=1784996922 diff=95 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=6 final=0 stall=6 age_s=1784996921 diff=95 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=6 final=0 stall=6 age_s=1784996921 diff=95 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 00:34:01] iter=3
+  node0 TELEMETRY tip=12 final=8 stall=4 age_s=228 diff=138 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=12 final=8 stall=4 age_s=228 diff=138 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=12 final=8 stall=4 age_s=228 diff=138 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=12 final=8 stall=4 age_s=228 diff=138 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 00:39:01] iter=4
+  node0 TELEMETRY tip=19 final=16 stall=3 age_s=102 diff=195 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=19 final=16 stall=3 age_s=102 diff=195 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=19 final=16 stall=3 age_s=102 diff=195 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=19 final=16 stall=3 age_s=102 diff=195 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 00:44:01] iter=5
+  node0 TELEMETRY tip=27 final=24 stall=3 age_s=110 diff=274 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=27 final=24 stall=3 age_s=110 diff=274 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=27 final=24 stall=3 age_s=110 diff=274 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=27 final=24 stall=3 age_s=110 diff=274 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 00:49:01] iter=6
+  node0 TELEMETRY tip=34 final=32 stall=2 age_s=75 diff=334 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=34 final=32 stall=2 age_s=75 diff=334 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=34 final=32 stall=2 age_s=75 diff=334 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=34 final=32 stall=2 age_s=75 diff=334 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 00:54:01] iter=7
+  node0 TELEMETRY tip=42 final=40 stall=2 age_s=80 diff=406 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=42 final=40 stall=2 age_s=80 diff=406 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=42 final=40 stall=2 age_s=80 diff=406 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=42 final=40 stall=2 age_s=80 diff=406 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 00:59:01] iter=8
+  node0 TELEMETRY tip=49 final=40 stall=9 age_s=368 diff=456 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=49 final=40 stall=9 age_s=368 diff=456 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=49 final=40 stall=9 age_s=368 diff=456 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=49 final=40 stall=9 age_s=368 diff=456 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 01:04:01] iter=9
+  node0 TELEMETRY tip=59 final=56 stall=3 age_s=82 diff=579 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=59 final=56 stall=3 age_s=82 diff=579 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=58 final=56 stall=2 age_s=54 diff=558 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=58 final=56 stall=2 age_s=54 diff=558 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 01:09:01] iter=10
+  node0 TELEMETRY tip=68 final=64 stall=4 age_s=153 diff=702 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=68 final=64 stall=4 age_s=153 diff=702 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=68 final=64 stall=4 age_s=150 diff=702 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=68 final=64 stall=4 age_s=153 diff=702 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 01:14:01] iter=11
+  node0 TELEMETRY tip=80 final=72 stall=8 age_s=202 diff=887 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=79 final=72 stall=7 age_s=180 diff=857 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=79 final=72 stall=7 age_s=180 diff=857 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=78 final=72 stall=6 age_s=173 diff=843 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 01:19:02] iter=12
+  node0 TELEMETRY tip=90 final=88 stall=2 age_s=73 diff=1083 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=89 final=88 stall=1 age_s=12 diff=1053 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=89 final=88 stall=1 age_s=12 diff=1053 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=89 final=80 stall=9 age_s=259 diff=1053 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 01:24:02] iter=13
+  node0 TELEMETRY tip=97 final=88 stall=9 age_s=347 diff=1141 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=96 final=88 stall=8 age_s=311 diff=1138 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=97 final=88 stall=9 age_s=347 diff=1141 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=97 final=88 stall=9 age_s=347 diff=1141 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 01:29:02] iter=14
+  node0 TELEMETRY tip=104 final=96 stall=8 age_s=274 diff=1236 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=105 final=96 stall=9 age_s=337 diff=1256 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=104 final=96 stall=8 age_s=289 diff=1236 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=105 final=96 stall=9 age_s=337 diff=1256 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 01:34:02] iter=15
+  node0 TELEMETRY tip=112 final=96 stall=16 age_s=602 diff=1311 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=112 final=96 stall=16 age_s=626 diff=1311 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=111 final=96 stall=15 age_s=572 diff=1304 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=112 final=96 stall=16 age_s=647 diff=1311 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 01:39:02] iter=16
+  node0 TELEMETRY tip=116 final=96 stall=20 age_s=916 diff=1299 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=116 final=96 stall=20 age_s=904 diff=1293 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=117 final=96 stall=21 age_s=940 diff=1278 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=117 final=96 stall=21 age_s=940 diff=1278 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 01:44:02] iter=17
+  node0 TELEMETRY tip=126 final=120 stall=6 age_s=176 diff=1445 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=126 final=120 stall=6 age_s=176 diff=1445 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=126 final=120 stall=6 age_s=176 diff=1445 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=126 final=120 stall=6 age_s=176 diff=1445 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 01:49:02] iter=18
+  node0 TELEMETRY tip=134 final=120 stall=14 age_s=455 diff=1640 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=134 final=120 stall=14 age_s=455 diff=1640 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=131 final=120 stall=11 age_s=371 diff=1551 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=134 final=120 stall=14 age_s=455 diff=1640 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 01:54:02] iter=19
+  node0 TELEMETRY tip=143 final=136 stall=7 age_s=214 diff=1955 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=143 final=136 stall=7 age_s=214 diff=1955 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=142 final=136 stall=6 age_s=163 diff=1908 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=143 final=136 stall=7 age_s=214 diff=1955 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 01:59:02] iter=20
+  node0 TELEMETRY tip=148 final=136 stall=12 age_s=517 diff=1995 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=149 final=136 stall=13 age_s=558 diff=2009 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=149 final=136 stall=13 age_s=558 diff=2009 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=148 final=136 stall=12 age_s=517 diff=1995 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 02:04:02] iter=21
+  node0 TELEMETRY tip=155 final=136 stall=19 age_s=815 diff=2157 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=155 final=136 stall=19 age_s=815 diff=2157 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=155 final=136 stall=19 age_s=815 diff=2157 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=155 final=136 stall=19 age_s=815 diff=2157 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 02:09:02] iter=22
+  node0 TELEMETRY tip=158 final=136 stall=22 age_s=1114 diff=2128 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=158 final=136 stall=22 age_s=1114 diff=2128 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=158 final=136 stall=22 age_s=1114 diff=2128 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=158 final=136 stall=22 age_s=1103 diff=2112 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 02:14:03] iter=23
+  node0 TELEMETRY tip=163 final=160 stall=3 age_s=183 diff=2184 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=164 final=160 stall=4 age_s=193 diff=2211 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=164 final=160 stall=4 age_s=214 diff=2211 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=163 final=160 stall=3 age_s=118 diff=2184 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 02:19:03] iter=24
+  node0 TELEMETRY tip=171 final=168 stall=3 age_s=118 diff=2311 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=171 final=168 stall=3 age_s=118 diff=2311 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=170 final=160 stall=10 age_s=486 diff=2307 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=171 final=168 stall=3 age_s=118 diff=2311 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 02:24:03] iter=25
+  node0 TELEMETRY tip=178 final=168 stall=10 age_s=441 diff=2441 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=178 final=168 stall=10 age_s=441 diff=2441 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=178 final=168 stall=10 age_s=441 diff=2441 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=178 final=168 stall=10 age_s=441 diff=2441 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 02:29:03] iter=26
+  node0 TELEMETRY tip=186 final=184 stall=2 age_s=60 diff=2745 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=186 final=184 stall=2 age_s=82 diff=2745 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=186 final=184 stall=2 age_s=60 diff=2745 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=186 final=184 stall=2 age_s=60 diff=2745 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 02:34:03] iter=27
+  node0 TELEMETRY tip=191 final=184 stall=7 age_s=394 diff=2848 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=190 final=184 stall=6 age_s=311 diff=2852 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=191 final=184 stall=7 age_s=394 diff=2848 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=190 final=184 stall=6 age_s=266 diff=2852 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 02:39:03] iter=28
+  node0 TELEMETRY tip=196 final=192 stall=4 age_s=250 diff=2841 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=195 final=192 stall=3 age_s=171 diff=2808 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=195 final=192 stall=3 age_s=171 diff=2808 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=196 final=192 stall=4 age_s=210 diff=2841 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 02:44:03] iter=29
+  node0 TELEMETRY tip=199 final=192 stall=7 age_s=430 diff=2859 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=200 final=192 stall=8 age_s=448 diff=2861 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=200 final=192 stall=8 age_s=448 diff=2861 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=198 final=192 stall=6 age_s=362 diff=2842 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 02:49:03] iter=30
+  node0 TELEMETRY tip=204 final=200 stall=4 age_s=376 diff=2819 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=203 final=200 stall=3 age_s=241 diff=2832 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=204 final=200 stall=4 age_s=346 diff=2819 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=203 final=200 stall=3 age_s=308 diff=2832 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 02:54:03] iter=31
+  node0 TELEMETRY tip=206 final=200 stall=6 age_s=572 diff=2801 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=206 final=200 stall=6 age_s=624 diff=2801 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=206 final=200 stall=6 age_s=611 diff=2801 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=206 final=200 stall=6 age_s=624 diff=2801 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 02:59:03] iter=32
+  node0 TELEMETRY tip=209 final=208 stall=1 age_s=46 diff=2666 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=208 final=200 stall=8 age_s=821 diff=2699 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=209 final=200 stall=9 age_s=870 diff=2666 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=209 final=208 stall=1 age_s=90 diff=2666 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 03:04:03] iter=33
+  node0 TELEMETRY tip=213 final=208 stall=5 age_s=432 diff=2612 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=213 final=208 stall=5 age_s=432 diff=2612 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=213 final=208 stall=5 age_s=432 diff=2612 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=213 final=208 stall=5 age_s=432 diff=2612 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 03:09:04] iter=34
+  node0 TELEMETRY tip=217 final=208 stall=9 age_s=648 diff=2670 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=217 final=208 stall=9 age_s=636 diff=2670 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=217 final=208 stall=9 age_s=579 diff=2670 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=217 final=208 stall=9 age_s=636 diff=2670 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 03:14:04] iter=35
+  node0 TELEMETRY tip=224 final=216 stall=8 age_s=513 diff=2677 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=224 final=216 stall=8 age_s=513 diff=2677 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=223 final=216 stall=7 age_s=504 diff=2670 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=222 final=216 stall=6 age_s=439 diff=2619 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 03:19:04] iter=36
+  node0 TELEMETRY tip=227 final=224 stall=3 age_s=129 diff=2786 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=229 final=224 stall=5 age_s=221 diff=2786 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=229 final=224 stall=5 age_s=221 diff=2786 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=229 final=224 stall=5 age_s=221 diff=2786 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 03:24:04] iter=37
+  node0 TELEMETRY tip=233 final=224 stall=9 age_s=528 diff=2861 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=233 final=224 stall=9 age_s=491 diff=2861 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=233 final=224 stall=9 age_s=547 diff=2861 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=233 final=224 stall=9 age_s=547 diff=2861 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 03:29:04] iter=38
+  node0 TELEMETRY tip=237 final=232 stall=5 age_s=359 diff=2839 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=239 final=232 stall=7 age_s=454 diff=2887 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=237 final=232 stall=5 age_s=359 diff=2839 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=239 final=232 stall=7 age_s=454 diff=2887 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 03:34:04] iter=39
+  node0 TELEMETRY tip=243 final=240 stall=3 age_s=173 diff=2964 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=244 final=240 stall=4 age_s=222 diff=2972 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=242 final=240 stall=2 age_s=107 diff=2919 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=244 final=240 stall=4 age_s=222 diff=2972 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 03:39:04] iter=40
+  node0 TELEMETRY tip=248 final=240 stall=8 age_s=503 diff=2989 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=247 final=240 stall=7 age_s=408 diff=3011 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=249 final=240 stall=9 age_s=544 diff=2985 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=248 final=240 stall=8 age_s=532 diff=2989 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 03:44:04] iter=41
+  node0 TELEMETRY tip=254 final=248 stall=6 age_s=261 diff=3111 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=254 final=248 stall=6 age_s=261 diff=3111 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=254 final=248 stall=6 age_s=261 diff=3111 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=254 final=248 stall=6 age_s=261 diff=3111 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 03:49:04] iter=42
+  node0 TELEMETRY tip=258 final=248 stall=10 age_s=609 diff=3099 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=258 final=248 stall=10 age_s=595 diff=3099 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=258 final=248 stall=10 age_s=609 diff=3099 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=258 final=256 stall=2 age_s=56 diff=3099 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 03:54:04] iter=43
+  node0 TELEMETRY tip=262 final=256 stall=6 age_s=271 diff=3196 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=262 final=256 stall=6 age_s=321 diff=3196 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=262 final=256 stall=6 age_s=262 diff=3196 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=262 final=256 stall=6 age_s=271 diff=3196 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 03:59:04] iter=44
+  node0 TELEMETRY tip=265 final=264 stall=1 age_s=15 diff=3112 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=265 final=264 stall=1 age_s=15 diff=3112 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=267 final=264 stall=3 age_s=195 diff=3118 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=266 final=264 stall=2 age_s=142 diff=3154 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 04:04:05] iter=45
+  node0 TELEMETRY tip=269 final=264 stall=5 age_s=325 diff=3169 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=270 final=264 stall=6 age_s=375 diff=3160 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=270 final=264 stall=6 age_s=448 diff=3187 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=270 final=264 stall=6 age_s=448 diff=3187 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 04:09:05] iter=46
+  node0 TELEMETRY tip=276 final=272 stall=4 age_s=181 diff=3201 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=276 final=272 stall=4 age_s=218 diff=3201 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=275 final=272 stall=3 age_s=150 diff=3182 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=276 final=272 stall=4 age_s=213 diff=3201 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 04:14:05] iter=47
+  node0 TELEMETRY tip=279 final=272 stall=7 age_s=324 diff=3266 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=282 final=272 stall=10 age_s=496 diff=3311 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=282 final=272 stall=10 age_s=496 diff=3311 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=282 final=272 stall=10 age_s=496 diff=3311 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 04:19:05] iter=48
+  node0 TELEMETRY tip=283 final=272 stall=11 age_s=648 diff=3349 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=284 final=272 stall=12 age_s=803 diff=3363 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=284 final=272 stall=12 age_s=773 diff=3318 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=282 final=272 stall=10 age_s=496 diff=3311 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 04:24:05] iter=49
+  node0 TELEMETRY tip=287 final=272 stall=15 age_s=1012 diff=3250 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=287 final=272 stall=15 age_s=1034 diff=3259 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=287 final=272 stall=15 age_s=1034 diff=3259 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=287 final=272 stall=15 age_s=1034 diff=3259 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 04:29:05] iter=50
+  node0 TELEMETRY tip=290 final=272 stall=18 age_s=1353 diff=3140 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=290 final=272 stall=18 age_s=1280 diff=3140 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=288 final=272 stall=16 age_s=1135 diff=3212 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=289 final=272 stall=17 age_s=1276 diff=3204 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 04:34:05] iter=51
+  node0 TELEMETRY tip=293 final=272 stall=21 age_s=1673 diff=3109 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=292 final=272 stall=20 age_s=1506 diff=3091 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=293 final=272 stall=21 age_s=1673 diff=3109 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=293 final=272 stall=21 age_s=1673 diff=3109 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 04:39:05] iter=52
+  node0 TELEMETRY tip=300 final=296 stall=4 age_s=148 diff=3197 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=301 final=296 stall=5 age_s=193 diff=3233 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=300 final=296 stall=4 age_s=148 diff=3197 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=300 final=296 stall=4 age_s=153 diff=3197 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 04:44:05] iter=53
+  node0 TELEMETRY tip=304 final=296 stall=8 age_s=402 diff=3231 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=305 final=296 stall=9 age_s=471 diff=3267 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=304 final=296 stall=8 age_s=402 diff=3231 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=304 final=296 stall=8 age_s=402 diff=3231 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 04:49:05] iter=54
+  node0 TELEMETRY tip=310 final=304 stall=6 age_s=390 diff=3291 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=310 final=304 stall=6 age_s=390 diff=3291 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=308 final=304 stall=4 age_s=302 diff=3260 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=310 final=304 stall=6 age_s=390 diff=3291 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 04:54:05] iter=55
+  node0 TELEMETRY tip=313 final=304 stall=9 age_s=638 diff=3373 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=312 final=304 stall=8 age_s=508 diff=3337 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=313 final=304 stall=9 age_s=593 diff=3354 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=312 final=304 stall=8 age_s=483 diff=3337 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 04:59:06] iter=56
+  node0 TELEMETRY tip=318 final=304 stall=14 age_s=941 diff=3294 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=318 final=304 stall=14 age_s=941 diff=3294 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=318 final=304 stall=14 age_s=941 diff=3294 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=318 final=304 stall=14 age_s=941 diff=3294 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 05:04:06] iter=57
+  node0 TELEMETRY tip=323 final=320 stall=3 age_s=175 diff=3413 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=323 final=304 stall=19 age_s=1222 diff=3413 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=323 final=320 stall=3 age_s=170 diff=3413 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=321 final=304 stall=17 age_s=1112 diff=3376 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 05:09:06] iter=58
+  node0 TELEMETRY tip=326 final=320 stall=6 age_s=451 diff=3361 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=325 final=320 stall=5 age_s=391 diff=3446 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=326 final=320 stall=6 age_s=451 diff=3361 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=326 final=320 stall=6 age_s=451 diff=3361 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 05:14:06] iter=59
+  node0 TELEMETRY tip=333 final=328 stall=5 age_s=215 diff=3505 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=331 final=328 stall=3 age_s=134 diff=3455 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=333 final=328 stall=5 age_s=248 diff=3505 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=333 final=328 stall=5 age_s=215 diff=3505 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 05:19:06] iter=60
+  node0 TELEMETRY tip=338 final=336 stall=2 age_s=105 diff=3534 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=338 final=336 stall=2 age_s=105 diff=3534 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=338 final=336 stall=2 age_s=105 diff=3534 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=338 final=336 stall=2 age_s=105 diff=3534 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 05:24:06] iter=61
+  node0 TELEMETRY tip=344 final=336 stall=8 age_s=438 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=344 final=336 stall=8 age_s=428 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=344 final=336 stall=8 age_s=396 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=344 final=336 stall=8 age_s=373 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 05:29:06] iter=62
+  node0 TELEMETRY tip=347 final=336 stall=11 age_s=651 diff=3662 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=346 final=336 stall=10 age_s=618 diff=3689 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=346 final=336 stall=10 age_s=618 diff=3689 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=347 final=336 stall=11 age_s=651 diff=3662 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 05:34:06] iter=63
+  node0 TELEMETRY tip=350 final=336 stall=14 age_s=949 diff=3596 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=350 final=336 stall=14 age_s=949 diff=3596 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=346 final=336 stall=10 age_s=618 diff=3689 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=351 final=336 stall=15 age_s=1043 diff=3633 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 05:39:06] iter=64
+  node0 TELEMETRY tip=356 final=336 stall=20 age_s=1322 diff=3659 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=356 final=336 stall=20 age_s=1322 diff=3659 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=355 final=336 stall=19 age_s=1294 diff=3633 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=355 final=336 stall=19 age_s=1294 diff=3633 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 05:44:06] iter=65
+  node0 TELEMETRY tip=359 final=352 stall=7 age_s=371 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=359 final=352 stall=7 age_s=371 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=358 final=352 stall=6 age_s=329 diff=3686 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=359 final=352 stall=7 age_s=406 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 05:49:07] iter=66
+  node0 TELEMETRY tip=364 final=352 stall=12 age_s=724 diff=3721 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=364 final=352 stall=12 age_s=718 diff=3721 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=364 final=352 stall=12 age_s=718 diff=3721 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=364 final=352 stall=12 age_s=718 diff=3721 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 05:54:07] iter=67
+  node0 TELEMETRY tip=369 final=360 stall=9 age_s=465 diff=3761 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=368 final=360 stall=8 age_s=460 diff=3746 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=368 final=360 stall=8 age_s=464 diff=3746 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=369 final=360 stall=9 age_s=465 diff=3761 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 05:59:07] iter=68
+  node0 TELEMETRY tip=373 final=368 stall=5 age_s=353 diff=3722 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=373 final=368 stall=5 age_s=353 diff=3722 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=373 final=368 stall=5 age_s=353 diff=3722 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=373 final=368 stall=5 age_s=353 diff=3722 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 06:04:07] iter=69
+  node0 TELEMETRY tip=376 final=368 stall=8 age_s=529 diff=3835 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=377 final=368 stall=9 age_s=662 diff=3777 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=376 final=368 stall=8 age_s=574 diff=3835 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=376 final=368 stall=8 age_s=516 diff=3835 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 06:09:07] iter=70
+  node0 TELEMETRY tip=380 final=368 stall=12 age_s=901 diff=3723 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=380 final=368 stall=12 age_s=901 diff=3723 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=378 final=368 stall=10 age_s=672 diff=3771 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=380 final=368 stall=12 age_s=901 diff=3723 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 06:14:07] iter=71
+  node0 TELEMETRY tip=384 final=368 stall=16 age_s=1296 diff=3735 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=383 final=368 stall=15 age_s=1134 diff=3714 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=383 final=368 stall=15 age_s=1179 diff=3714 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=383 final=368 stall=15 age_s=1151 diff=3714 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 06:19:07] iter=72
+  node0 TELEMETRY tip=387 final=368 stall=19 age_s=1540 diff=3612 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=386 final=368 stall=18 age_s=1518 diff=3595 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=387 final=368 stall=19 age_s=1540 diff=3612 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=387 final=368 stall=19 age_s=1540 diff=3612 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 06:24:07] iter=73
+  node0 TELEMETRY tip=389 final=368 stall=21 age_s=1658 diff=3672 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=389 final=368 stall=21 age_s=1768 diff=3672 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=387 final=368 stall=19 age_s=1540 diff=3612 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=389 final=368 stall=21 age_s=1695 diff=3672 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 06:29:07] iter=74
+  node0 TELEMETRY tip=392 final=368 stall=24 age_s=2112 diff=3479 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=391 final=368 stall=23 age_s=2034 diff=3516 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=390 final=368 stall=22 age_s=1885 diff=3591 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=392 final=368 stall=24 age_s=2136 diff=3479 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 06:34:07] iter=75
+  node0 TELEMETRY tip=396 final=368 stall=28 age_s=2444 diff=3442 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=396 final=368 stall=28 age_s=2444 diff=3442 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=395 final=392 stall=3 age_s=271 diff=3418 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=393 final=368 stall=25 age_s=2277 diff=3478 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 06:39:07] iter=76
+  node0 TELEMETRY tip=401 final=392 stall=9 age_s=637 diff=3489 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=400 final=392 stall=8 age_s=610 diff=3543 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=401 final=392 stall=9 age_s=637 diff=3489 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=401 final=392 stall=9 age_s=637 diff=3489 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 06:44:08] iter=77
+  node0 TELEMETRY tip=405 final=400 stall=5 age_s=290 diff=3506 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=405 final=400 stall=5 age_s=290 diff=3506 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=405 final=400 stall=5 age_s=290 diff=3506 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=405 final=400 stall=5 age_s=290 diff=3506 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 06:49:08] iter=78
+  node0 TELEMETRY tip=407 final=400 stall=7 age_s=532 diff=3545 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=408 final=400 stall=8 age_s=565 diff=3484 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=408 final=400 stall=8 age_s=562 diff=3484 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=408 final=400 stall=8 age_s=562 diff=3484 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 06:54:08] iter=79
+  node0 TELEMETRY tip=412 final=408 stall=4 age_s=369 diff=3469 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=412 final=408 stall=4 age_s=369 diff=3469 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=412 final=408 stall=4 age_s=369 diff=3469 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=412 final=408 stall=4 age_s=369 diff=3469 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 06:59:08] iter=80
+  node0 TELEMETRY tip=417 final=416 stall=1 age_s=87 diff=3525 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=416 final=408 stall=8 age_s=593 diff=3476 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=417 final=416 stall=1 age_s=74 diff=3525 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=416 final=408 stall=8 age_s=594 diff=3476 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 07:04:08] iter=81
+  node0 TELEMETRY tip=420 final=416 stall=4 age_s=314 diff=3497 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=420 final=416 stall=4 age_s=346 diff=3497 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=420 final=416 stall=4 age_s=314 diff=3497 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=420 final=416 stall=4 age_s=314 diff=3497 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 07:09:08] iter=82
+  node0 TELEMETRY tip=422 final=416 stall=6 age_s=548 diff=3510 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=423 final=416 stall=7 age_s=628 diff=3451 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=423 final=416 stall=7 age_s=635 diff=3451 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=423 final=416 stall=7 age_s=635 diff=3451 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 07:14:08] iter=83
+  node0 TELEMETRY tip=427 final=416 stall=11 age_s=996 diff=3478 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=427 final=416 stall=11 age_s=979 diff=3436 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=426 final=416 stall=10 age_s=903 diff=3437 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=426 final=416 stall=10 age_s=891 diff=3437 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 07:19:08] iter=84
+  node0 TELEMETRY tip=432 final=416 stall=16 age_s=1294 diff=3412 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=431 final=416 stall=15 age_s=1279 diff=3413 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=430 final=416 stall=14 age_s=1202 diff=3378 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=428 final=416 stall=12 age_s=1108 diff=3399 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 07:24:08] iter=85
+  node0 TELEMETRY tip=435 final=432 stall=3 age_s=148 diff=3475 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=435 final=432 stall=3 age_s=148 diff=3475 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=435 final=432 stall=3 age_s=208 diff=3475 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=435 final=432 stall=3 age_s=148 diff=3475 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 07:29:08] iter=86
+  node0 TELEMETRY tip=440 final=432 stall=8 age_s=568 diff=3451 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=440 final=432 stall=8 age_s=568 diff=3451 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=440 final=432 stall=8 age_s=568 diff=3451 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=436 final=432 stall=4 age_s=343 diff=3514 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 07:34:08] iter=87
+  node0 TELEMETRY tip=443 final=432 stall=11 age_s=733 diff=3530 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=444 final=440 stall=4 age_s=253 diff=3532 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=444 final=440 stall=4 age_s=253 diff=3532 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=443 final=432 stall=11 age_s=727 diff=3530 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 07:39:09] iter=88
+  node0 TELEMETRY tip=447 final=440 stall=7 age_s=574 diff=3467 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=448 final=440 stall=8 age_s=592 diff=3446 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=448 final=440 stall=8 age_s=592 diff=3446 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=448 final=440 stall=8 age_s=592 diff=3446 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 07:44:09] iter=89
+  node0 TELEMETRY tip=452 final=448 stall=4 age_s=289 diff=3474 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=452 final=448 stall=4 age_s=289 diff=3474 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=451 final=448 stall=3 age_s=246 diff=3460 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=452 final=448 stall=4 age_s=289 diff=3474 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 07:49:09] iter=90
+  node0 TELEMETRY tip=458 final=448 stall=10 age_s=640 diff=3559 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=458 final=448 stall=10 age_s=640 diff=3559 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=458 final=448 stall=10 age_s=640 diff=3559 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=458 final=448 stall=10 age_s=640 diff=3559 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 07:54:09] iter=91
+  node0 TELEMETRY tip=463 final=448 stall=15 age_s=911 diff=3660 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=463 final=448 stall=15 age_s=889 diff=3660 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=462 final=448 stall=14 age_s=828 diff=3660 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=463 final=448 stall=15 age_s=911 diff=3660 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 07:59:09] iter=92
+  node0 TELEMETRY tip=465 final=448 stall=17 age_s=1233 diff=3647 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=464 final=448 stall=16 age_s=1000 diff=3677 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=465 final=448 stall=17 age_s=1117 diff=3647 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=465 final=448 stall=17 age_s=1117 diff=3647 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 08:04:09] iter=93
+  node0 TELEMETRY tip=470 final=448 stall=22 age_s=1509 diff=3567 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=470 final=448 stall=22 age_s=1509 diff=3567 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=470 final=448 stall=22 age_s=1509 diff=3567 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=470 final=448 stall=22 age_s=1516 diff=3567 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 08:09:09] iter=94
+  node0 TELEMETRY tip=475 final=472 stall=3 age_s=110 diff=3670 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=475 final=472 stall=3 age_s=154 diff=3670 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=475 final=472 stall=3 age_s=154 diff=3670 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=475 final=472 stall=3 age_s=154 diff=3670 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 08:14:09] iter=95
+  node0 TELEMETRY tip=480 final=472 stall=8 age_s=453 diff=3750 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=480 final=472 stall=8 age_s=430 diff=3750 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=480 final=472 stall=8 age_s=413 diff=3750 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=481 final=472 stall=9 age_s=535 diff=3770 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 08:19:09] iter=96
+  node0 TELEMETRY tip=484 final=472 stall=12 age_s=746 diff=3713 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=484 final=472 stall=12 age_s=746 diff=3713 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=484 final=472 stall=12 age_s=746 diff=3713 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=483 final=472 stall=11 age_s=722 diff=3769 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 08:24:09] iter=97
+  node0 TELEMETRY tip=488 final=472 stall=16 age_s=1065 diff=3741 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=489 final=472 stall=17 age_s=1093 diff=3733 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=489 final=472 stall=17 age_s=1093 diff=3733 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=488 final=472 stall=16 age_s=1047 diff=3741 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 08:29:10] iter=98
+  node0 TELEMETRY tip=491 final=488 stall=3 age_s=219 diff=3745 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=492 final=488 stall=4 age_s=221 diff=3738 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=492 final=488 stall=4 age_s=221 diff=3738 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=492 final=488 stall=4 age_s=221 diff=3738 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 08:34:10] iter=99
+  node0 TELEMETRY tip=492 final=488 stall=4 age_s=238 diff=3738 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=494 final=488 stall=6 age_s=533 diff=3804 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=495 final=488 stall=7 age_s=618 diff=3663 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=495 final=488 stall=7 age_s=630 diff=3663 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 08:39:10] iter=100
+  node0 TELEMETRY tip=497 final=488 stall=9 age_s=771 diff=3624 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=498 final=488 stall=10 age_s=886 diff=3652 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=498 final=488 stall=10 age_s=882 diff=3652 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=498 final=488 stall=10 age_s=817 diff=3652 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 08:44:10] iter=101
+  node0 TELEMETRY tip=503 final=488 stall=15 age_s=1202 diff=3673 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=502 final=488 stall=14 age_s=1121 diff=3639 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=502 final=488 stall=14 age_s=1121 diff=3639 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=503 final=488 stall=15 age_s=1184 diff=3673 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 08:49:10] iter=102
+  node0 TELEMETRY tip=505 final=488 stall=17 age_s=1342 diff=3663 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=506 final=504 stall=2 age_s=153 diff=3676 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=506 final=504 stall=2 age_s=153 diff=3676 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=506 final=504 stall=2 age_s=153 diff=3676 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 08:54:10] iter=103
+  node0 TELEMETRY tip=505 final=488 stall=17 age_s=1342 diff=3663 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=510 final=504 stall=6 age_s=582 diff=3628 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=509 final=504 stall=5 age_s=380 diff=3646 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=510 final=504 stall=6 age_s=582 diff=3628 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 08:59:10] iter=104
+  node0 TELEMETRY tip=516 final=512 stall=4 age_s=138 diff=3691 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=516 final=512 stall=4 age_s=158 diff=3691 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=516 final=512 stall=4 age_s=158 diff=3691 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=515 final=512 stall=3 age_s=89 diff=3685 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 09:04:10] iter=105
+  node0 TELEMETRY tip=520 final=512 stall=8 age_s=489 diff=3699 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=519 final=512 stall=7 age_s=411 diff=3674 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=517 final=512 stall=5 age_s=271 diff=3723 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=519 final=512 stall=7 age_s=411 diff=3674 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 09:09:10] iter=106
+  node0 TELEMETRY tip=522 final=512 stall=10 age_s=732 diff=3649 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=522 final=512 stall=10 age_s=732 diff=3649 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=521 final=512 stall=9 age_s=592 diff=3696 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=522 final=512 stall=10 age_s=722 diff=3649 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 09:14:10] iter=107
+  node0 TELEMETRY tip=529 final=512 stall=17 age_s=1053 diff=3740 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=529 final=512 stall=17 age_s=1053 diff=3740 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=529 final=512 stall=17 age_s=1053 diff=3740 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=529 final=512 stall=17 age_s=1053 diff=3740 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 09:19:10] iter=108
+  node0 TELEMETRY tip=531 final=512 stall=19 age_s=1245 diff=3787 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=531 final=512 stall=19 age_s=1238 diff=3792 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=531 final=512 stall=19 age_s=1238 diff=3792 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=531 final=512 stall=19 age_s=1238 diff=3792 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 09:24:11] iter=109
+  node0 TELEMETRY tip=534 final=512 stall=22 age_s=1613 diff=3611 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=534 final=512 stall=22 age_s=1613 diff=3611 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=534 final=512 stall=22 age_s=1613 diff=3611 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=534 final=512 stall=22 age_s=1613 diff=3611 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 09:29:11] iter=110
+  node0 TELEMETRY tip=538 final=536 stall=2 age_s=227 diff=3612 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=538 final=536 stall=2 age_s=235 diff=3640 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=538 final=536 stall=2 age_s=218 diff=3661 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=538 final=536 stall=2 age_s=235 diff=3640 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 09:34:11] iter=111
+  node0 TELEMETRY tip=543 final=536 stall=7 age_s=545 diff=3646 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=542 final=536 stall=6 age_s=461 diff=3638 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=542 final=536 stall=6 age_s=461 diff=3638 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=538 final=536 stall=2 age_s=218 diff=3661 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 09:39:11] iter=112
+  node0 TELEMETRY tip=545 final=536 stall=9 age_s=773 diff=3595 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=546 final=536 stall=10 age_s=866 diff=3577 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=546 final=536 stall=10 age_s=866 diff=3577 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=545 final=536 stall=9 age_s=773 diff=3595 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 09:44:11] iter=113
+  node0 TELEMETRY tip=550 final=536 stall=14 age_s=1102 diff=3562 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=548 final=536 stall=12 age_s=1014 diff=3594 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=549 final=536 stall=13 age_s=1092 diff=3569 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=550 final=536 stall=14 age_s=1102 diff=3562 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 09:49:11] iter=114
+  node0 TELEMETRY tip=554 final=536 stall=18 age_s=1338 diff=3624 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=554 final=536 stall=18 age_s=1338 diff=3624 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=551 final=536 stall=15 age_s=1171 diff=3613 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=554 final=552 stall=2 age_s=106 diff=3624 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 09:54:11] iter=115
+  node0 TELEMETRY tip=559 final=552 stall=7 age_s=483 diff=3599 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=559 final=552 stall=7 age_s=483 diff=3599 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=559 final=552 stall=7 age_s=483 diff=3599 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=559 final=552 stall=7 age_s=483 diff=3599 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 09:59:11] iter=116
+  node0 TELEMETRY tip=563 final=552 stall=11 age_s=703 diff=3670 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=564 final=552 stall=12 age_s=767 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=564 final=552 stall=12 age_s=767 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=564 final=552 stall=12 age_s=767 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 10:04:11] iter=117
+  node0 TELEMETRY tip=568 final=552 stall=16 age_s=1045 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=568 final=552 stall=16 age_s=1045 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=568 final=552 stall=16 age_s=1045 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=568 final=552 stall=16 age_s=1046 diff=3709 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 10:09:11] iter=118
+  node0 TELEMETRY tip=573 final=568 stall=5 age_s=303 diff=3752 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=573 final=568 stall=5 age_s=303 diff=3752 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=573 final=568 stall=5 age_s=303 diff=3752 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=573 final=568 stall=5 age_s=303 diff=3752 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 10:14:11] iter=119
+  node0 TELEMETRY tip=575 final=568 stall=7 age_s=621 diff=3806 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=575 final=568 stall=7 age_s=621 diff=3806 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=575 final=568 stall=7 age_s=621 diff=3806 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=575 final=568 stall=7 age_s=621 diff=3806 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 10:19:12] iter=120
+  node0 TELEMETRY tip=577 final=568 stall=9 age_s=826 diff=3653 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=578 final=568 stall=10 age_s=956 diff=3614 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=578 final=568 stall=10 age_s=956 diff=3614 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=577 final=568 stall=9 age_s=826 diff=3653 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 10:24:12] iter=121
+  node0 TELEMETRY tip=582 final=568 stall=14 age_s=1173 diff=3594 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=582 final=568 stall=14 age_s=1166 diff=3594 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=583 final=568 stall=15 age_s=1240 diff=3642 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=582 final=568 stall=14 age_s=1166 diff=3594 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 10:29:12] iter=122
+  node0 TELEMETRY tip=585 final=568 stall=17 age_s=1461 diff=3614 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=585 final=568 stall=17 age_s=1461 diff=3614 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=586 final=568 stall=18 age_s=1510 diff=3587 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=586 final=568 stall=18 age_s=1483 diff=3587 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 10:34:12] iter=123
+  node0 TELEMETRY tip=590 final=568 stall=22 age_s=1726 diff=3626 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=591 final=568 stall=23 age_s=1795 diff=3674 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=591 final=568 stall=23 age_s=1758 diff=3674 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=591 final=568 stall=23 age_s=1831 diff=3674 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 10:39:12] iter=124
+  node0 TELEMETRY tip=596 final=568 stall=28 age_s=2147 diff=3675 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=596 final=568 stall=28 age_s=2147 diff=3675 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=597 final=568 stall=29 age_s=2171 diff=3698 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=594 final=568 stall=26 age_s=2062 diff=3631 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 10:44:12] iter=125
+  node0 TELEMETRY tip=601 final=568 stall=33 age_s=2389 diff=3823 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=602 final=600 stall=2 age_s=117 diff=3810 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=599 final=568 stall=31 age_s=2262 diff=3765 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=602 final=600 stall=2 age_s=117 diff=3810 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 10:49:12] iter=126
+  node0 TELEMETRY tip=605 final=600 stall=5 age_s=362 diff=3836 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=605 final=600 stall=5 age_s=325 diff=3836 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=606 final=600 stall=6 age_s=474 diff=3808 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=605 final=600 stall=5 age_s=393 diff=3836 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 10:54:12] iter=127
+  node0 TELEMETRY tip=610 final=600 stall=10 age_s=675 diff=3851 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=610 final=600 stall=10 age_s=656 diff=3851 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=610 final=600 stall=10 age_s=656 diff=3851 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=610 final=600 stall=10 age_s=656 diff=3851 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 10:59:12] iter=128
+  node0 TELEMETRY tip=613 final=600 stall=13 age_s=1023 diff=3802 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=611 final=600 stall=11 age_s=752 diff=3908 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=612 final=600 stall=12 age_s=925 diff=3914 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=613 final=600 stall=13 age_s=1023 diff=3802 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 11:04:13] iter=129
+  node0 TELEMETRY tip=618 final=616 stall=2 age_s=49 diff=3780 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=618 final=616 stall=2 age_s=49 diff=3780 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=618 final=616 stall=2 age_s=49 diff=3780 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=618 final=616 stall=2 age_s=49 diff=3780 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 11:09:13] iter=130
+  node0 TELEMETRY tip=624 final=616 stall=8 age_s=362 diff=3920 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=623 final=616 stall=7 age_s=328 diff=3934 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=624 final=616 stall=8 age_s=362 diff=3920 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=622 final=616 stall=6 age_s=229 diff=3887 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 11:14:13] iter=131
+  node0 TELEMETRY tip=626 final=624 stall=2 age_s=189 diff=3978 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=626 final=624 stall=2 age_s=189 diff=3978 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=626 final=624 stall=2 age_s=189 diff=3978 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=626 final=624 stall=2 age_s=195 diff=3978 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 11:19:13] iter=132
+  node0 TELEMETRY tip=628 final=624 stall=4 age_s=406 diff=3862 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=626 final=624 stall=2 age_s=189 diff=3978 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=630 final=624 stall=6 age_s=596 diff=3825 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=630 final=624 stall=6 age_s=596 diff=3825 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 11:24:13] iter=133
+  node0 TELEMETRY tip=633 final=624 stall=9 age_s=869 diff=3803 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=632 final=624 stall=8 age_s=716 diff=3847 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=633 final=624 stall=9 age_s=869 diff=3803 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=631 final=624 stall=7 age_s=675 diff=3819 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 11:29:13] iter=134
+  node0 TELEMETRY tip=636 final=624 stall=12 age_s=1180 diff=3737 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=636 final=624 stall=12 age_s=1180 diff=3737 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=636 final=624 stall=12 age_s=1180 diff=3737 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=635 final=624 stall=11 age_s=1086 diff=3826 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 11:34:13] iter=135
+  node0 TELEMETRY tip=637 final=624 stall=13 age_s=1264 diff=3706 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=636 final=624 stall=12 age_s=1180 diff=3737 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=637 final=624 stall=13 age_s=1242 diff=3706 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=638 final=624 stall=14 age_s=1434 diff=3673 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 11:39:13] iter=136
+  node0 TELEMETRY tip=643 final=624 stall=19 age_s=1803 diff=3627 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=639 final=624 stall=15 age_s=1450 diff=3624 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=643 final=624 stall=19 age_s=1803 diff=3627 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=643 final=624 stall=19 age_s=1803 diff=3627 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 11:44:13] iter=137
+  node0 TELEMETRY tip=646 final=624 stall=22 age_s=1988 diff=3646 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=645 final=624 stall=21 age_s=1931 diff=3654 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=646 final=624 stall=22 age_s=2054 diff=3646 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=645 final=624 stall=21 age_s=1931 diff=3654 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 11:49:13] iter=138
+  node0 TELEMETRY tip=650 final=648 stall=2 age_s=184 diff=3573 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=649 final=624 stall=25 age_s=2293 diff=3597 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=649 final=624 stall=25 age_s=2292 diff=3597 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=650 final=624 stall=26 age_s=2403 diff=3573 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 11:54:13] iter=139
+  node0 TELEMETRY tip=653 final=648 stall=5 age_s=322 diff=3611 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=653 final=648 stall=5 age_s=357 diff=3611 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=652 final=648 stall=4 age_s=281 diff=3592 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=654 final=648 stall=6 age_s=432 diff=3663 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 11:59:14] iter=140
+  node0 TELEMETRY tip=657 final=648 stall=9 age_s=724 diff=3544 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=656 final=648 stall=8 age_s=642 diff=3555 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=657 final=648 stall=9 age_s=724 diff=3544 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=657 final=648 stall=9 age_s=724 diff=3544 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 12:04:14] iter=141
+  node0 TELEMETRY tip=661 final=648 stall=13 age_s=961 diff=3589 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=662 final=648 stall=14 age_s=1067 diff=3608 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=661 final=648 stall=13 age_s=961 diff=3589 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=661 final=648 stall=13 age_s=961 diff=3589 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 12:09:14] iter=142
+  node0 TELEMETRY tip=664 final=648 stall=16 age_s=1262 diff=3572 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=664 final=648 stall=16 age_s=1299 diff=3572 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=665 final=648 stall=17 age_s=1386 diff=3550 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=665 final=648 stall=17 age_s=1386 diff=3550 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 12:14:14] iter=143
+  node0 TELEMETRY tip=667 final=648 stall=19 age_s=1562 diff=3512 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=667 final=648 stall=19 age_s=1562 diff=3512 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=667 final=648 stall=19 age_s=1562 diff=3512 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=667 final=648 stall=19 age_s=1562 diff=3512 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 12:19:14] iter=144
+  node0 TELEMETRY tip=674 final=672 stall=2 age_s=52 diff=3548 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=674 final=672 stall=2 age_s=52 diff=3548 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=674 final=672 stall=2 age_s=52 diff=3548 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=674 final=672 stall=2 age_s=52 diff=3548 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 12:24:14] iter=145
+  node0 TELEMETRY tip=679 final=672 stall=7 age_s=331 diff=3630 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=679 final=672 stall=7 age_s=333 diff=3630 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=679 final=672 stall=7 age_s=331 diff=3630 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=679 final=672 stall=7 age_s=331 diff=3630 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 12:29:14] iter=146
+  node0 TELEMETRY tip=683 final=680 stall=3 age_s=184 diff=3758 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=683 final=680 stall=3 age_s=184 diff=3758 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=684 final=680 stall=4 age_s=208 diff=3704 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=683 final=680 stall=3 age_s=184 diff=3758 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 12:34:14] iter=147
+  node0 TELEMETRY tip=688 final=680 stall=8 age_s=495 diff=3710 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=688 final=680 stall=8 age_s=521 diff=3710 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=688 final=680 stall=8 age_s=495 diff=3710 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=688 final=680 stall=8 age_s=495 diff=3710 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 12:39:14] iter=148
+  node0 TELEMETRY tip=690 final=680 stall=10 age_s=778 diff=3767 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=690 final=680 stall=10 age_s=758 diff=3767 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=688 final=680 stall=8 age_s=495 diff=3710 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=690 final=680 stall=10 age_s=778 diff=3767 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 12:44:14] iter=149
+  node0 TELEMETRY tip=694 final=688 stall=6 age_s=592 diff=3604 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=693 final=688 stall=5 age_s=529 diff=3585 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=694 final=688 stall=6 age_s=592 diff=3604 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=693 final=688 stall=5 age_s=565 diff=3585 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 12:49:14] iter=150
+  node0 TELEMETRY tip=698 final=688 stall=10 age_s=965 diff=3556 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=698 final=688 stall=10 age_s=965 diff=3556 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=698 final=688 stall=10 age_s=965 diff=3556 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=695 final=688 stall=7 age_s=701 diff=3641 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 12:54:15] iter=151
+  node0 TELEMETRY tip=704 final=688 stall=16 age_s=1256 diff=3730 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=703 final=688 stall=15 age_s=1158 diff=3705 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=704 final=688 stall=16 age_s=1184 diff=3730 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=695 final=688 stall=7 age_s=701 diff=3641 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 12:59:15] iter=152
+  node0 TELEMETRY tip=706 final=688 stall=18 age_s=1481 diff=3689 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=706 final=688 stall=18 age_s=1480 diff=3689 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=706 final=688 stall=18 age_s=1456 diff=3689 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=706 final=688 stall=18 age_s=1460 diff=3689 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 13:04:15] iter=153
+  node0 TELEMETRY tip=709 final=688 stall=21 age_s=1759 diff=3633 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=710 final=688 stall=22 age_s=1882 diff=3609 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=711 final=688 stall=23 age_s=1884 diff=3572 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=710 final=688 stall=22 age_s=1882 diff=3609 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 13:09:15] iter=154
+  node0 TELEMETRY tip=715 final=712 stall=3 age_s=257 diff=3666 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=714 final=712 stall=2 age_s=123 diff=3691 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=713 final=712 stall=1 age_s=33 diff=3645 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=715 final=712 stall=3 age_s=245 diff=3666 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 13:14:15] iter=155
+  node0 TELEMETRY tip=718 final=712 stall=6 age_s=523 diff=3594 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=717 final=712 stall=5 age_s=440 diff=3668 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=717 final=712 stall=5 age_s=377 diff=3615 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=715 final=712 stall=3 age_s=245 diff=3666 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 13:19:15] iter=156
+  node0 TELEMETRY tip=722 final=712 stall=10 age_s=808 diff=3593 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=722 final=712 stall=10 age_s=808 diff=3593 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=721 final=712 stall=9 age_s=741 diff=3562 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=721 final=712 stall=9 age_s=741 diff=3562 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 13:24:15] iter=157
+  node0 TELEMETRY tip=724 final=712 stall=12 age_s=1052 diff=3583 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=723 final=712 stall=11 age_s=857 diff=3600 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=724 final=712 stall=12 age_s=1052 diff=3583 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=724 final=712 stall=12 age_s=1052 diff=3583 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 13:29:15] iter=158
+  node0 TELEMETRY tip=726 final=712 stall=14 age_s=1326 diff=3486 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=728 final=712 stall=16 age_s=1428 diff=3455 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=728 final=712 stall=16 age_s=1428 diff=3455 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=728 final=712 stall=16 age_s=1428 diff=3455 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 13:34:15] iter=159
+  node0 TELEMETRY tip=732 final=728 stall=4 age_s=276 diff=3485 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=730 final=728 stall=2 age_s=124 diff=3497 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=732 final=728 stall=4 age_s=276 diff=3485 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=732 final=728 stall=4 age_s=276 diff=3485 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 13:39:15] iter=160
+  node0 TELEMETRY tip=735 final=728 stall=7 age_s=528 diff=3480 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=735 final=728 stall=7 age_s=510 diff=3480 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=735 final=728 stall=7 age_s=455 diff=3480 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=735 final=728 stall=7 age_s=486 diff=3480 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 13:44:15] iter=161
+  node0 TELEMETRY tip=740 final=728 stall=12 age_s=903 diff=3465 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=740 final=728 stall=12 age_s=917 diff=3465 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=740 final=728 stall=12 age_s=917 diff=3465 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=739 final=728 stall=11 age_s=837 diff=3424 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 13:49:16] iter=162
+  node0 TELEMETRY tip=744 final=728 stall=16 age_s=1207 diff=3455 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=744 final=728 stall=16 age_s=1207 diff=3455 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=743 final=728 stall=15 age_s=1147 diff=3422 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=743 final=728 stall=15 age_s=1147 diff=3422 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 13:54:16] iter=163
+  node0 TELEMETRY tip=745 final=728 stall=17 age_s=1314 diff=3465 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=746 final=728 stall=18 age_s=1422 diff=3485 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=747 final=728 stall=19 age_s=1484 diff=3413 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=746 final=728 stall=18 age_s=1429 diff=3485 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 13:59:16] iter=164
+  node0 TELEMETRY tip=749 final=728 stall=21 age_s=1729 diff=3428 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=749 final=728 stall=21 age_s=1698 diff=3419 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=748 final=728 stall=20 age_s=1623 diff=3427 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=749 final=728 stall=21 age_s=1729 diff=3428 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 14:04:16] iter=165
+  node0 TELEMETRY tip=752 final=728 stall=24 age_s=2071 diff=3280 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=753 final=728 stall=25 age_s=2102 diff=3280 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=753 final=728 stall=25 age_s=2102 diff=3280 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=753 final=728 stall=25 age_s=2102 diff=3280 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 14:09:16] iter=166
+  node0 TELEMETRY tip=757 final=752 stall=5 age_s=325 diff=3295 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=758 final=752 stall=6 age_s=358 diff=3337 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=757 final=752 stall=5 age_s=290 diff=3295 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=758 final=752 stall=6 age_s=358 diff=3337 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 14:14:16] iter=167
+  node0 TELEMETRY tip=762 final=752 stall=10 age_s=651 diff=3356 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=762 final=752 stall=10 age_s=651 diff=3356 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=761 final=752 stall=9 age_s=538 diff=3397 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=762 final=752 stall=10 age_s=651 diff=3356 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 14:19:16] iter=168
+  node0 TELEMETRY tip=770 final=768 stall=2 age_s=112 diff=3573 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=770 final=768 stall=2 age_s=112 diff=3573 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=769 final=752 stall=17 age_s=903 diff=3540 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=768 final=752 stall=16 age_s=838 diff=3515 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 14:24:16] iter=169
+  node0 TELEMETRY tip=775 final=768 stall=7 age_s=369 diff=3658 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=775 final=768 stall=7 age_s=369 diff=3658 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=775 final=768 stall=7 age_s=369 diff=3658 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=775 final=768 stall=7 age_s=369 diff=3658 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 14:29:16] iter=170
+  node0 TELEMETRY tip=778 final=768 stall=10 age_s=653 diff=3632 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=778 final=768 stall=10 age_s=653 diff=3632 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=778 final=768 stall=10 age_s=653 diff=3632 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=779 final=768 stall=11 age_s=690 diff=3618 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 14:34:17] iter=171
+  node0 TELEMETRY tip=779 final=768 stall=11 age_s=731 diff=3618 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=782 final=768 stall=14 age_s=954 diff=3589 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=782 final=768 stall=14 age_s=954 diff=3589 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=782 final=768 stall=14 age_s=954 diff=3589 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 14:39:17] iter=172
+  node0 TELEMETRY tip=785 final=768 stall=17 age_s=1227 diff=3549 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=785 final=768 stall=17 age_s=1227 diff=3549 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=785 final=768 stall=17 age_s=1227 diff=3549 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=785 final=768 stall=17 age_s=1227 diff=3549 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 14:44:17] iter=173
+  node0 TELEMETRY tip=788 final=784 stall=4 age_s=314 diff=3521 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=789 final=784 stall=5 age_s=340 diff=3538 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=789 final=784 stall=5 age_s=340 diff=3538 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=789 final=784 stall=5 age_s=340 diff=3538 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 14:49:17] iter=174
+  node0 TELEMETRY tip=794 final=784 stall=10 age_s=717 diff=3560 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=794 final=784 stall=10 age_s=717 diff=3560 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=794 final=784 stall=10 age_s=717 diff=3560 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=791 final=784 stall=7 age_s=549 diff=3561 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 14:54:17] iter=175
+  node0 TELEMETRY tip=798 final=784 stall=14 age_s=973 diff=3608 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=798 final=784 stall=14 age_s=973 diff=3608 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=797 final=784 stall=13 age_s=902 diff=3595 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=798 final=784 stall=14 age_s=931 diff=3608 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 14:59:17] iter=176
+  node0 TELEMETRY tip=802 final=800 stall=2 age_s=93 diff=3655 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=803 final=800 stall=3 age_s=213 diff=3655 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=802 final=800 stall=2 age_s=63 diff=3655 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=801 final=784 stall=17 age_s=1144 diff=3641 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 15:04:17] iter=177
+  node0 TELEMETRY tip=804 final=800 stall=4 age_s=464 diff=3655 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=804 final=800 stall=4 age_s=329 diff=3655 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=804 final=800 stall=4 age_s=355 diff=3655 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=804 final=800 stall=4 age_s=329 diff=3655 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 15:09:17] iter=178
+  node0 TELEMETRY tip=808 final=800 stall=8 age_s=753 diff=3505 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=808 final=800 stall=8 age_s=753 diff=3505 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=807 final=800 stall=7 age_s=697 diff=3540 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=808 final=800 stall=8 age_s=753 diff=3505 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 15:14:17] iter=179
+  node0 TELEMETRY tip=813 final=808 stall=5 age_s=367 diff=3532 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=812 final=808 stall=4 age_s=251 diff=3549 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=813 final=808 stall=5 age_s=367 diff=3532 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=812 final=808 stall=4 age_s=214 diff=3549 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 15:19:17] iter=180
+  node0 TELEMETRY tip=818 final=808 stall=10 age_s=634 diff=3602 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=818 final=808 stall=10 age_s=652 diff=3602 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=818 final=808 stall=10 age_s=652 diff=3602 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=818 final=808 stall=10 age_s=652 diff=3602 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 15:24:18] iter=181
+  node0 TELEMETRY tip=824 final=808 stall=16 age_s=945 diff=3698 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=824 final=808 stall=16 age_s=945 diff=3698 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=822 final=808 stall=14 age_s=864 diff=3648 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=824 final=808 stall=16 age_s=945 diff=3698 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 15:29:18] iter=182
+  node0 TELEMETRY tip=828 final=824 stall=4 age_s=288 diff=3707 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=828 final=824 stall=4 age_s=306 diff=3707 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=828 final=824 stall=4 age_s=288 diff=3707 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=828 final=824 stall=4 age_s=289 diff=3707 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 15:34:18] iter=183
+  node0 TELEMETRY tip=835 final=832 stall=3 age_s=151 diff=3938 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=835 final=832 stall=3 age_s=151 diff=3938 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=835 final=832 stall=3 age_s=151 diff=3938 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=835 final=832 stall=3 age_s=151 diff=3938 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 15:39:18] iter=184
+  node0 TELEMETRY tip=840 final=832 stall=8 age_s=498 diff=3995 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=840 final=832 stall=8 age_s=498 diff=3995 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=839 final=832 stall=7 age_s=359 diff=3992 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=840 final=832 stall=8 age_s=498 diff=3995 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 15:44:18] iter=185
+  node0 TELEMETRY tip=843 final=840 stall=3 age_s=267 diff=3953 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=843 final=840 stall=3 age_s=267 diff=3953 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=843 final=840 stall=3 age_s=267 diff=3953 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=842 final=840 stall=2 age_s=169 diff=3964 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 15:49:18] iter=186
+  node0 TELEMETRY tip=845 final=840 stall=5 age_s=453 diff=3920 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=845 final=840 stall=5 age_s=499 diff=3925 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=844 final=840 stall=4 age_s=362 diff=3931 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=845 final=840 stall=5 age_s=471 diff=3920 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 15:54:18] iter=187
+  node0 TELEMETRY tip=848 final=840 stall=8 age_s=807 diff=3735 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=845 final=840 stall=5 age_s=499 diff=3925 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=848 final=840 stall=8 age_s=807 diff=3735 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=848 final=840 stall=8 age_s=807 diff=3735 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 15:59:18] iter=188
+  node0 TELEMETRY tip=851 final=848 stall=3 age_s=285 diff=3731 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=853 final=848 stall=5 age_s=390 diff=3730 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=851 final=848 stall=3 age_s=285 diff=3731 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=852 final=848 stall=4 age_s=358 diff=3728 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 16:04:18] iter=189
+  node0 TELEMETRY tip=858 final=848 stall=10 age_s=687 diff=3791 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=856 final=848 stall=8 age_s=596 diff=3740 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=858 final=848 stall=10 age_s=687 diff=3791 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=858 final=848 stall=10 age_s=687 diff=3791 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 16:09:18] iter=190
+  node0 TELEMETRY tip=858 final=848 stall=10 age_s=687 diff=3791 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=860 final=856 stall=4 age_s=344 diff=3841 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=858 final=848 stall=10 age_s=687 diff=3791 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=860 final=856 stall=4 age_s=344 diff=3841 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 16:14:19] iter=191
+  node0 TELEMETRY tip=864 final=856 stall=8 age_s=633 diff=3754 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=864 final=856 stall=8 age_s=647 diff=3754 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=864 final=856 stall=8 age_s=633 diff=3754 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=864 final=856 stall=8 age_s=639 diff=3754 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 16:19:19] iter=192
+  node0 TELEMETRY tip=868 final=856 stall=12 age_s=910 diff=3763 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=869 final=856 stall=13 age_s=994 diff=3775 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=869 final=856 stall=13 age_s=994 diff=3775 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=866 final=856 stall=10 age_s=792 diff=3740 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 16:24:19] iter=193
+  node0 TELEMETRY tip=873 final=856 stall=17 age_s=1268 diff=3856 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=873 final=856 stall=17 age_s=1273 diff=3856 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=873 final=856 stall=17 age_s=1268 diff=3856 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=873 final=856 stall=17 age_s=1268 diff=3856 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 16:29:19] iter=194
+  node0 TELEMETRY tip=877 final=856 stall=21 age_s=1525 diff=3823 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=875 final=856 stall=19 age_s=1359 diff=3806 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=877 final=856 stall=21 age_s=1525 diff=3823 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=877 final=856 stall=21 age_s=1525 diff=3823 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 16:34:19] iter=195
+  node0 TELEMETRY tip=880 final=856 stall=24 age_s=1716 diff=3846 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=880 final=856 stall=24 age_s=1716 diff=3846 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=881 final=856 stall=25 age_s=1868 diff=3854 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=881 final=856 stall=25 age_s=1868 diff=3854 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 16:39:19] iter=196
+  node0 TELEMETRY tip=884 final=880 stall=4 age_s=377 diff=3750 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=884 final=880 stall=4 age_s=399 diff=3750 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=884 final=880 stall=4 age_s=377 diff=3750 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=884 final=880 stall=4 age_s=377 diff=3750 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 16:44:19] iter=197
+  node0 TELEMETRY tip=887 final=880 stall=7 age_s=756 diff=3680 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=885 final=880 stall=5 age_s=556 diff=3768 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=887 final=880 stall=7 age_s=756 diff=3680 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=887 final=880 stall=7 age_s=756 diff=3680 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 16:49:19] iter=198
+  node0 TELEMETRY tip=890 final=888 stall=2 age_s=124 diff=3703 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=890 final=888 stall=2 age_s=61 diff=3703 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=890 final=888 stall=2 age_s=124 diff=3703 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=891 final=888 stall=3 age_s=240 diff=3725 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 16:54:19] iter=199
+  node0 TELEMETRY tip=894 final=888 stall=6 age_s=520 diff=3601 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=894 final=888 stall=6 age_s=560 diff=3601 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=895 final=888 stall=7 age_s=567 diff=3615 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=892 final=888 stall=4 age_s=322 diff=3658 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 16:59:19] iter=200
+  node0 TELEMETRY tip=899 final=896 stall=3 age_s=100 diff=3688 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=900 final=888 stall=12 age_s=810 diff=3737 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=899 final=888 stall=11 age_s=744 diff=3688 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=899 final=896 stall=3 age_s=103 diff=3688 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 17:04:19] iter=201
+  node0 TELEMETRY tip=904 final=896 stall=8 age_s=446 diff=3729 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=904 final=896 stall=8 age_s=446 diff=3729 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=904 final=896 stall=8 age_s=446 diff=3729 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=904 final=896 stall=8 age_s=446 diff=3729 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 17:09:20] iter=202
+  node0 TELEMETRY tip=908 final=904 stall=4 age_s=242 diff=3785 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=909 final=904 stall=5 age_s=305 diff=3794 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=909 final=904 stall=5 age_s=301 diff=3794 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=909 final=904 stall=5 age_s=305 diff=3794 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 17:14:20] iter=203
+  node0 TELEMETRY tip=912 final=904 stall=8 age_s=607 diff=3825 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=911 final=904 stall=7 age_s=485 diff=3814 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=911 final=904 stall=7 age_s=507 diff=3814 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=912 final=904 stall=8 age_s=612 diff=3795 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 17:19:20] iter=204
+  node0 TELEMETRY tip=913 final=904 stall=9 age_s=770 diff=3755 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=914 final=904 stall=10 age_s=920 diff=3696 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=914 final=904 stall=10 age_s=920 diff=3696 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=913 final=904 stall=9 age_s=693 diff=3751 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 17:24:20] iter=205
+  node0 TELEMETRY tip=918 final=904 stall=14 age_s=1254 diff=3588 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=917 final=904 stall=13 age_s=1192 diff=3552 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=918 final=904 stall=14 age_s=1272 diff=3588 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=918 final=904 stall=14 age_s=1272 diff=3588 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 17:29:20] iter=206
+  node0 TELEMETRY tip=924 final=920 stall=4 age_s=180 diff=3716 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=923 final=920 stall=3 age_s=107 diff=3662 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=924 final=920 stall=4 age_s=180 diff=3716 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=924 final=920 stall=4 age_s=180 diff=3716 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 17:34:20] iter=207
+  node0 TELEMETRY tip=930 final=928 stall=2 age_s=79 diff=3847 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=930 final=928 stall=2 age_s=79 diff=3847 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=930 final=928 stall=2 age_s=79 diff=3847 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=930 final=928 stall=2 age_s=84 diff=3847 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 17:39:20] iter=208
+  node0 TELEMETRY tip=933 final=928 stall=5 age_s=375 diff=3841 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=933 final=928 stall=5 age_s=388 diff=3841 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=933 final=928 stall=5 age_s=386 diff=3841 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=932 final=928 stall=4 age_s=281 diff=3903 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 17:44:20] iter=209
+  node0 TELEMETRY tip=937 final=936 stall=1 age_s=31 diff=3831 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=937 final=936 stall=1 age_s=82 diff=3831 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=937 final=936 stall=1 age_s=77 diff=3831 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=937 final=936 stall=1 age_s=83 diff=3831 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 17:49:20] iter=210
+  node0 TELEMETRY tip=939 final=936 stall=3 age_s=203 diff=3804 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=941 final=936 stall=5 age_s=426 diff=3820 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=941 final=936 stall=5 age_s=426 diff=3820 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=941 final=936 stall=5 age_s=426 diff=3820 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 17:54:20] iter=211
+  node0 TELEMETRY tip=944 final=936 stall=8 age_s=670 diff=3743 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=944 final=936 stall=8 age_s=738 diff=3743 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=944 final=936 stall=8 age_s=670 diff=3743 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=942 final=936 stall=6 age_s=534 diff=3788 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 17:59:21] iter=212
+  node0 TELEMETRY tip=947 final=944 stall=3 age_s=264 diff=3724 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=947 final=944 stall=3 age_s=308 diff=3724 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=948 final=944 stall=4 age_s=325 diff=3705 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=948 final=944 stall=4 age_s=325 diff=3705 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 18:04:21] iter=213
+  node0 TELEMETRY tip=951 final=944 stall=7 age_s=522 diff=3746 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=949 final=944 stall=5 age_s=425 diff=3752 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=949 final=944 stall=5 age_s=425 diff=3752 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=951 final=944 stall=7 age_s=594 diff=3746 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 18:09:21] iter=214
+  node0 TELEMETRY tip=956 final=952 stall=4 age_s=265 diff=3693 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=954 final=952 stall=2 age_s=154 diff=3637 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=956 final=952 stall=4 age_s=265 diff=3693 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=953 final=944 stall=9 age_s=845 diff=3695 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 18:14:21] iter=215
+  node0 TELEMETRY tip=957 final=952 stall=5 age_s=341 diff=3723 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=958 final=952 stall=6 age_s=456 diff=3722 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=958 final=952 stall=6 age_s=456 diff=3722 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=959 final=952 stall=7 age_s=493 diff=3689 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 18:19:21] iter=216
+  node0 TELEMETRY tip=960 final=952 stall=8 age_s=633 diff=3720 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=962 final=952 stall=10 age_s=884 diff=3587 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=961 final=952 stall=9 age_s=812 diff=3668 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=962 final=952 stall=10 age_s=884 diff=3587 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 18:24:21] iter=217
+  node0 TELEMETRY tip=965 final=960 stall=5 age_s=438 diff=3644 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=966 final=960 stall=6 age_s=543 diff=3641 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=966 final=960 stall=6 age_s=543 diff=3641 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=965 final=960 stall=5 age_s=408 diff=3644 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 18:29:21] iter=218
+  node0 TELEMETRY tip=969 final=960 stall=9 age_s=764 diff=3579 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=969 final=960 stall=9 age_s=764 diff=3579 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=969 final=960 stall=9 age_s=764 diff=3579 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=968 final=960 stall=8 age_s=713 diff=3567 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 18:34:21] iter=219
+  node0 TELEMETRY tip=971 final=968 stall=3 age_s=361 diff=3553 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=971 final=968 stall=3 age_s=299 diff=3535 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=971 final=968 stall=3 age_s=361 diff=3553 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=971 final=968 stall=3 age_s=361 diff=3553 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 18:39:22] iter=220
+  node0 TELEMETRY tip=975 final=968 stall=7 age_s=725 diff=3454 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=975 final=968 stall=7 age_s=725 diff=3454 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=975 final=968 stall=7 age_s=725 diff=3454 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=975 final=968 stall=7 age_s=725 diff=3454 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 18:44:22] iter=221
+  node0 TELEMETRY tip=980 final=968 stall=12 age_s=955 diff=3532 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=981 final=968 stall=13 age_s=964 diff=3538 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=981 final=968 stall=13 age_s=964 diff=3538 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=981 final=968 stall=13 age_s=964 diff=3538 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 18:49:22] iter=222
+  node0 TELEMETRY tip=984 final=968 stall=16 age_s=1207 diff=3549 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=983 final=968 stall=15 age_s=1166 diff=3589 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=985 final=968 stall=17 age_s=1325 diff=3575 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=984 final=968 stall=16 age_s=1207 diff=3549 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 18:54:22] iter=223
+  node0 TELEMETRY tip=988 final=984 stall=4 age_s=344 diff=3527 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=987 final=984 stall=3 age_s=289 diff=3517 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=989 final=984 stall=5 age_s=375 diff=3541 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=989 final=984 stall=5 age_s=375 diff=3541 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 18:59:22] iter=224
+  node0 TELEMETRY tip=993 final=984 stall=9 age_s=684 diff=3593 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=993 final=984 stall=9 age_s=684 diff=3593 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=993 final=984 stall=9 age_s=678 diff=3581 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=993 final=984 stall=9 age_s=673 diff=3593 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 19:04:23] iter=225
+  node0 TELEMETRY tip=998 final=984 stall=14 age_s=1018 diff=3572 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=998 final=984 stall=14 age_s=1018 diff=3572 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=998 final=984 stall=14 age_s=1018 diff=3572 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=998 final=984 stall=14 age_s=1018 diff=3572 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 19:09:23] iter=226
+  node0 TELEMETRY tip=1000 final=984 stall=16 age_s=1255 diff=3601 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1000 final=984 stall=16 age_s=1189 diff=3650 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1000 final=984 stall=16 age_s=1189 diff=3650 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1000 final=984 stall=16 age_s=1189 diff=3650 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 19:14:23] iter=227
+  node0 TELEMETRY tip=1002 final=984 stall=18 age_s=1567 diff=3464 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=1000 final=984 stall=16 age_s=1189 diff=3650 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1001 final=984 stall=17 age_s=1387 diff=3583 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=1001 final=984 stall=17 age_s=1387 diff=3583 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 19:19:23] iter=228
+  node0 TELEMETRY tip=1006 final=1000 stall=6 age_s=733 diff=3374 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1005 final=1000 stall=5 age_s=662 diff=3338 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1006 final=1000 stall=6 age_s=733 diff=3374 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1006 final=1000 stall=6 age_s=733 diff=3374 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 19:24:23] iter=229
+  node0 TELEMETRY tip=1009 final=1008 stall=1 age_s=112 diff=3429 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1008 final=1000 stall=8 age_s=809 diff=3427 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1009 final=1008 stall=1 age_s=103 diff=3429 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1009 final=1008 stall=1 age_s=103 diff=3429 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 19:29:23] iter=230
+  node0 TELEMETRY tip=1013 final=1008 stall=5 age_s=533 diff=3290 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1012 final=1008 stall=4 age_s=504 diff=3297 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1010 final=1008 stall=2 age_s=244 diff=3409 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1010 final=1008 stall=2 age_s=244 diff=3409 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 19:34:23] iter=231
+  node0 TELEMETRY tip=1016 final=1008 stall=8 age_s=776 diff=3283 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1016 final=1008 stall=8 age_s=776 diff=3283 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1015 final=1008 stall=7 age_s=739 diff=3339 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1015 final=1008 stall=7 age_s=739 diff=3339 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 19:39:23] iter=232
+  node0 TELEMETRY tip=1019 final=1008 stall=11 age_s=980 diff=3279 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1020 final=1008 stall=12 age_s=1127 diff=3322 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1019 final=1008 stall=11 age_s=980 diff=3279 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1019 final=1008 stall=11 age_s=980 diff=3279 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 19:44:23] iter=233
+  node0 TELEMETRY tip=1024 final=1008 stall=16 age_s=1303 diff=3320 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1025 final=1008 stall=17 age_s=1373 diff=3358 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=1025 final=1024 stall=1 age_s=51 diff=3358 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1025 final=1024 stall=1 age_s=51 diff=3358 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 19:49:23] iter=234
+  node0 TELEMETRY tip=1025 final=1024 stall=1 age_s=91 diff=3358 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1027 final=1024 stall=3 age_s=320 diff=3318 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1028 final=1024 stall=4 age_s=329 diff=3294 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1028 final=1024 stall=4 age_s=329 diff=3294 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 19:54:24] iter=235
+  node0 TELEMETRY tip=1031 final=1024 stall=7 age_s=685 diff=3256 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1031 final=1024 stall=7 age_s=732 diff=3275 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1030 final=1024 stall=6 age_s=601 diff=3341 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1030 final=1024 stall=6 age_s=601 diff=3341 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 19:59:24] iter=236
+  node0 TELEMETRY tip=1034 final=1024 stall=10 age_s=995 diff=3194 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1034 final=1024 stall=10 age_s=1004 diff=3194 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1034 final=1024 stall=10 age_s=1004 diff=3194 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1034 final=1024 stall=10 age_s=1004 diff=3194 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 20:04:24] iter=237
+  node0 TELEMETRY tip=1039 final=1024 stall=15 age_s=1324 diff=3221 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1036 final=1024 stall=12 age_s=1131 diff=3215 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1039 final=1024 stall=15 age_s=1324 diff=3221 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1039 final=1024 stall=15 age_s=1324 diff=3221 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 20:09:24] iter=238
+  node0 TELEMETRY tip=1043 final=1040 stall=3 age_s=179 diff=3281 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1042 final=1040 stall=2 age_s=64 diff=3276 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1043 final=1040 stall=3 age_s=109 diff=3281 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1040 final=1024 stall=16 age_s=1384 diff=3225 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 20:14:24] iter=239
+  node0 TELEMETRY tip=1046 final=1040 stall=6 age_s=476 diff=3231 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1046 final=1040 stall=6 age_s=476 diff=3231 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1046 final=1040 stall=6 age_s=501 diff=3231 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1046 final=1040 stall=6 age_s=423 diff=3231 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 20:19:24] iter=240
+  node0 TELEMETRY tip=1050 final=1048 stall=2 age_s=162 diff=3254 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1050 final=1048 stall=2 age_s=160 diff=3254 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1050 final=1048 stall=2 age_s=85 diff=3254 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1050 final=1048 stall=2 age_s=160 diff=3254 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 20:24:24] iter=241
+  node0 TELEMETRY tip=1055 final=1048 stall=7 age_s=441 diff=3273 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1056 final=1048 stall=8 age_s=463 diff=3280 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1051 final=1048 stall=3 age_s=253 diff=3267 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1055 final=1048 stall=7 age_s=441 diff=3273 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 20:29:24] iter=242
+  node0 TELEMETRY tip=1062 final=1056 stall=6 age_s=381 diff=3357 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1060 final=1056 stall=4 age_s=247 diff=3345 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1061 final=1056 stall=5 age_s=316 diff=3353 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1059 final=1056 stall=3 age_s=183 diff=3333 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 20:34:24] iter=243
+  node0 TELEMETRY tip=1065 final=1056 stall=9 age_s=585 diff=3335 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1065 final=1056 stall=9 age_s=585 diff=3335 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1064 final=1056 stall=8 age_s=572 diff=3336 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1063 final=1056 stall=7 age_s=496 diff=3364 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 20:39:25] iter=244
+  node0 TELEMETRY tip=1068 final=1064 stall=4 age_s=323 diff=3324 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1069 final=1064 stall=5 age_s=390 diff=3318 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1068 final=1064 stall=4 age_s=323 diff=3324 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1069 final=1064 stall=5 age_s=390 diff=3318 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 20:44:25] iter=245
+  node0 TELEMETRY tip=1074 final=1072 stall=2 age_s=85 diff=3427 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1074 final=1072 stall=2 age_s=125 diff=3427 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1074 final=1072 stall=2 age_s=69 diff=3427 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1074 final=1064 stall=10 age_s=640 diff=3427 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 20:49:25] iter=246
+  node0 TELEMETRY tip=1074 final=1072 stall=2 age_s=85 diff=3427 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1077 final=1072 stall=5 age_s=357 diff=3403 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1077 final=1072 stall=5 age_s=355 diff=3403 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1077 final=1072 stall=5 age_s=344 diff=3403 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 20:54:25] iter=247
+  node0 TELEMETRY tip=1083 final=1080 stall=3 age_s=97 diff=3458 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1081 final=1072 stall=9 age_s=612 diff=3395 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1083 final=1080 stall=3 age_s=147 diff=3458 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1083 final=1080 stall=3 age_s=128 diff=3458 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 20:59:25] iter=248
+  node0 TELEMETRY tip=1085 final=1080 stall=5 age_s=365 diff=3439 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1086 final=1080 stall=6 age_s=483 diff=3382 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1085 final=1080 stall=5 age_s=359 diff=3439 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1085 final=1080 stall=5 age_s=379 diff=3439 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 21:04:25] iter=249
+  node0 TELEMETRY tip=1090 final=1088 stall=2 age_s=169 diff=3404 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1090 final=1088 stall=2 age_s=169 diff=3404 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1090 final=1088 stall=2 age_s=169 diff=3404 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1088 final=1080 stall=8 age_s=592 diff=3354 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 21:09:25] iter=250
+  node0 TELEMETRY tip=1095 final=1088 stall=7 age_s=427 diff=3455 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1094 final=1088 stall=6 age_s=382 diff=3452 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1095 final=1088 stall=7 age_s=427 diff=3455 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1095 final=1088 stall=7 age_s=427 diff=3455 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 21:14:25] iter=251
+  node0 TELEMETRY tip=1099 final=1088 stall=11 age_s=748 diff=3442 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1099 final=1088 stall=11 age_s=736 diff=3442 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1099 final=1088 stall=11 age_s=748 diff=3442 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1099 final=1088 stall=11 age_s=729 diff=3442 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 21:19:25] iter=252
+  node0 TELEMETRY tip=1101 final=1088 stall=13 age_s=974 diff=3409 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1099 final=1088 stall=11 age_s=736 diff=3442 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1099 final=1088 stall=11 age_s=748 diff=3442 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1101 final=1088 stall=13 age_s=974 diff=3409 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 21:24:25] iter=253
+  node0 TELEMETRY tip=1105 final=1104 stall=1 age_s=32 diff=3374 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1105 final=1104 stall=1 age_s=59 diff=3374 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1105 final=1104 stall=1 age_s=59 diff=3374 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1105 final=1088 stall=17 age_s=1316 diff=3374 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 21:29:25] iter=254
+  node0 TELEMETRY tip=1108 final=1104 stall=4 age_s=439 diff=3247 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1106 final=1104 stall=2 age_s=227 diff=3386 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1106 final=1104 stall=2 age_s=207 diff=3407 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1108 final=1104 stall=4 age_s=439 diff=3247 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 21:34:26] iter=255
+  node0 TELEMETRY tip=1112 final=1104 stall=8 age_s=667 diff=3321 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1113 final=1104 stall=9 age_s=711 diff=3326 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1113 final=1104 stall=9 age_s=711 diff=3326 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1112 final=1104 stall=8 age_s=667 diff=3321 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 21:39:26] iter=256
+  node0 TELEMETRY tip=1116 final=1112 stall=4 age_s=315 diff=3342 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1116 final=1112 stall=4 age_s=315 diff=3342 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1116 final=1112 stall=4 age_s=315 diff=3342 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1116 final=1112 stall=4 age_s=315 diff=3342 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 21:44:26] iter=257
+  node0 TELEMETRY tip=1121 final=1112 stall=9 age_s=631 diff=3314 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1122 final=1112 stall=10 age_s=692 diff=3359 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1119 final=1112 stall=7 age_s=609 diff=3284 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1121 final=1112 stall=9 age_s=631 diff=3314 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 21:49:26] iter=258
+  node0 TELEMETRY tip=1124 final=1120 stall=4 age_s=261 diff=3346 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1125 final=1120 stall=5 age_s=313 diff=3343 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1125 final=1120 stall=5 age_s=313 diff=3343 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1125 final=1120 stall=5 age_s=313 diff=3343 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 21:54:26] iter=259
+  node0 TELEMETRY tip=1128 final=1120 stall=8 age_s=650 diff=3394 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1128 final=1120 stall=8 age_s=650 diff=3394 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1128 final=1120 stall=8 age_s=650 diff=3394 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1127 final=1120 stall=7 age_s=419 diff=3372 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 21:59:26] iter=260
+  node0 TELEMETRY tip=1132 final=1120 stall=12 age_s=855 diff=3325 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1131 final=1120 stall=11 age_s=811 diff=3318 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1132 final=1120 stall=12 age_s=888 diff=3325 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1131 final=1120 stall=11 age_s=811 diff=3318 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 22:04:26] iter=261
+  node0 TELEMETRY tip=1135 final=1120 stall=15 age_s=1092 diff=3341 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1137 final=1120 stall=17 age_s=1281 diff=3338 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=1135 final=1120 stall=15 age_s=1086 diff=3341 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1136 final=1120 stall=16 age_s=1167 diff=3339 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 22:09:26] iter=262
+  node0 TELEMETRY tip=1139 final=1120 stall=19 age_s=1482 diff=3306 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=1139 final=1120 stall=19 age_s=1455 diff=3306 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=1139 final=1120 stall=19 age_s=1549 diff=3306 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=1138 final=1120 stall=18 age_s=1361 diff=3310 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 22:14:27] iter=263
+  node0 TELEMETRY tip=1142 final=1120 stall=22 age_s=1849 diff=3218 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=1141 final=1120 stall=21 age_s=1756 diff=3215 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=1140 final=1120 stall=20 age_s=1641 diff=3293 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=1142 final=1120 stall=22 age_s=1869 diff=3218 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 22:19:27] iter=264
+  node0 TELEMETRY tip=1146 final=1120 stall=26 age_s=2149 diff=3200 peers=6 mempool=0 epoch=0 regime=Degraded
+  node1 TELEMETRY tip=1146 final=1120 stall=26 age_s=2149 diff=3200 peers=6 mempool=0 epoch=0 regime=Degraded
+  node2 TELEMETRY tip=1144 final=1120 stall=24 age_s=1963 diff=3199 peers=6 mempool=0 epoch=0 regime=Degraded
+  node3 TELEMETRY tip=1144 final=1120 stall=24 age_s=1959 diff=3199 peers=6 mempool=0 epoch=0 regime=Degraded
+[2026-07-26 22:24:27] iter=265
+  node0 TELEMETRY tip=1150 final=1144 stall=6 age_s=457 diff=3169 peers=6 mempool=0 epoch=0 regime=Final
+  node1 TELEMETRY tip=1151 final=1144 stall=7 age_s=502 diff=3195 peers=6 mempool=0 epoch=0 regime=Final
+  node2 TELEMETRY tip=1147 final=1144 stall=3 age_s=288 diff=3176 peers=6 mempool=0 epoch=0 regime=Final
+  node3 TELEMETRY tip=1149 final=1144 stall=5 age_s=422 diff=3147 peers=6 mempool=0 epoch=0 regime=Final
+[2026-07-26 22:29:27] iter=266
+  node0 TELEMETRY tip=1155 final=1144 stall=11 age_s=798 diff=3244 peers=6 mempool=0 epoch=1 regime=Final
+  node1 TELEMETRY tip=1155 final=1144 stall=11 age_s=789 diff=3244 peers=6 mempool=0 epoch=1 regime=Final
+  node2 TELEMETRY tip=1154 final=1144 stall=10 age_s=708 diff=3230 peers=6 mempool=0 epoch=1 regime=Final
+  node3 TELEMETRY tip=1154 final=1144 stall=10 age_s=686 diff=3230 peers=6 mempool=0 epoch=1 regime=Final
+[2026-07-26 22:29:27] 🎯 EPOCH BOUNDARY CROSSED — epoch view now: 1 
+[2026-07-26 22:34:27] iter=267
+  node0 TELEMETRY tip=1159 final=1152 stall=7 age_s=439 diff=3248 peers=6 mempool=0 epoch=1 regime=Final
+  node1 TELEMETRY tip=1158 final=1152 stall=6 age_s=379 diff=3264 peers=6 mempool=0 epoch=1 regime=Final
+  node2 TELEMETRY tip=1159 final=1152 stall=7 age_s=439 diff=3248 peers=6 mempool=0 epoch=1 regime=Final
+  node3 TELEMETRY tip=1157 final=1152 stall=5 age_s=281 diff=3262 peers=6 mempool=0 epoch=1 regime=Final
+[2026-07-26 22:34:27] 🎯 EPOCH BOUNDARY CROSSED — epoch view now: 1 
+[2026-07-26 22:39:27] iter=268
+  node0 TELEMETRY tip=1162 final=1152 stall=10 age_s=749 diff=3199 peers=6 mempool=0 epoch=1 regime=Final
+  node1 TELEMETRY tip=1163 final=1152 stall=11 age_s=765 diff=3200 peers=6 mempool=0 epoch=1 regime=Final
+  node2 TELEMETRY tip=1163 final=1152 stall=11 age_s=765 diff=3200 peers=6 mempool=0 epoch=1 regime=Final
+  node3 TELEMETRY tip=1163 final=1160 stall=3 age_s=168 diff=3200 peers=6 mempool=0 epoch=1 regime=Final
+[2026-07-26 22:39:27] 🎯 EPOCH BOUNDARY CROSSED — epoch view now: 1 
+[2026-07-26 22:44:27] iter=269
+  node0 TELEMETRY tip=1167 final=1160 stall=7 age_s=424 diff=3236 peers=6 mempool=0 epoch=1 regime=Final
+  node1 TELEMETRY tip=1167 final=1160 stall=7 age_s=424 diff=3236 peers=6 mempool=0 epoch=1 regime=Final
+  node2 TELEMETRY tip=1167 final=1160 stall=7 age_s=424 diff=3236 peers=6 mempool=0 epoch=1 regime=Final
+  node3 TELEMETRY tip=1167 final=1160 stall=7 age_s=424 diff=3236 peers=6 mempool=0 epoch=1 regime=Final
+[2026-07-26 22:44:27] 🎯 EPOCH BOUNDARY CROSSED — epoch view now: 1 
+[2026-07-26 22:49:27] iter=270
+  node0 TELEMETRY tip=1172 final=1160 stall=12 age_s=781 diff=3249 peers=6 mempool=0 epoch=1 regime=Final
+  node1 TELEMETRY tip=1171 final=1160 stall=11 age_s=767 diff=3250 peers=6 mempool=0 epoch=1 regime=Final
+  node2 TELEMETRY tip=1172 final=1160 stall=12 age_s=781 diff=3249 peers=6 mempool=0 epoch=1 regime=Final
+  node3 TELEMETRY tip=1172 final=1160 stall=12 age_s=810 diff=3249 peers=6 mempool=0 epoch=1 regime=Final
+[2026-07-26 22:49:27] 🎯 EPOCH BOUNDARY CROSSED — epoch view now: 1 
+[2026-07-26 22:54:28] iter=271
+  node0 TELEMETRY tip=1177 final=1160 stall=17 age_s=1010 diff=3392 peers=6 mempool=0 epoch=1 regime=Degraded
+  node1 TELEMETRY tip=1178 final=1176 stall=2 age_s=96 diff=3402 peers=6 mempool=0 epoch=1 regime=Final
+  node2 TELEMETRY tip=1177 final=1160 stall=17 age_s=1010 diff=3392 peers=6 mempool=0 epoch=1 regime=Degraded
+  node3 TELEMETRY tip=1177 final=1160 stall=17 age_s=1010 diff=3392 peers=6 mempool=0 epoch=1 regime=Degraded
+[2026-07-26 22:54:28] 🎯 EPOCH BOUNDARY CROSSED — epoch view now: 1 
+[2026-07-26 22:59:28] iter=272
+  node0 TELEMETRY tip=1182 final=1176 stall=6 age_s=402 diff=3422 peers=6 mempool=0 epoch=1 regime=Final
+  node1 TELEMETRY tip=1182 final=1176 stall=6 age_s=396 diff=3422 peers=6 mempool=0 epoch=1 regime=Final
+  node2 TELEMETRY tip=1180 final=1176 stall=4 age_s=301 diff=3368 peers=6 mempool=0 epoch=1 regime=Final
+  node3 TELEMETRY tip=1182 final=1176 stall=6 age_s=396 diff=3422 peers=6 mempool=0 epoch=1 regime=Final
+[2026-07-26 22:59:28] 🎯 EPOCH BOUNDARY CROSSED — epoch view now: 1 
+[2026-07-26 23:04:28] iter=273
+  node0 TELEMETRY tip=1188 final=1184 stall=4 age_s=213 diff=3514 peers=6 mempool=0 epoch=1 regime=Final
+  node1 TELEMETRY tip=1188 final=1184 stall=4 age_s=213 diff=3514 peers=6 mempool=0 epoch=1 regime=Final
+  node2 TELEMETRY tip=1187 final=1184 stall=3 age_s=140 diff=3482 peers=6 mempool=0 epoch=1 regime=Final
+  node3 TELEMETRY tip=1188 final=1184 stall=4 age_s=213 diff=3514 peers=6 mempool=0 epoch=1 regime=Final
+[2026-07-26 23:04:28] 🎯 EPOCH BOUNDARY CROSSED — epoch view now: 1 
+[2026-07-26 23:09:28] iter=274
+  node0 TELEMETRY tip=1190 final=1184 stall=6 age_s=462 diff=3497 peers=6 mempool=0 epoch=1 regime=Final
+  node1 TELEMETRY tip=1190 final=1184 stall=6 age_s=453 diff=3497 peers=6 mempool=0 epoch=1 regime=Final
+  node2 TELEMETRY tip=1190 final=1184 stall=6 age_s=462 diff=3497 peers=6 mempool=0 epoch=1 regime=Final
+  node3 TELEMETRY tip=1190 final=1184 stall=6 age_s=462 diff=3497 peers=6 mempool=0 epoch=1 regime=Final
+[2026-07-26 23:09:28] 🎯 EPOCH BOUNDARY CROSSED — epoch view now: 1 
+[2026-07-26 23:14:28] iter=275
+  node0 TELEMETRY tip=1194 final=1192 stall=2 age_s=128 diff=3398 peers=6 mempool=0 epoch=1 regime=Final
+  node1 TELEMETRY tip=1193 final=1184 stall=9 age_s=789 diff=3396 peers=6 mempool=0 epoch=1 regime=Final
+  node2 TELEMETRY tip=1193 final=1184 stall=9 age_s=737 diff=3396 peers=6 mempool=0 epoch=1 regime=Final
+  node3 TELEMETRY tip=1194 final=1184 stall=10 age_s=814 diff=3398 peers=6 mempool=0 epoch=1 regime=Final
+[2026-07-26 23:14:28] 🎯 EPOCH BOUNDARY CROSSED — epoch view now: 1 
+[2026-07-26 23:19:28] iter=276
+  node0 TELEMETRY tip=1199 final=1192 stall=7 age_s=499 diff=3415 peers=6 mempool=0 epoch=1 regime=Final
+  node1 TELEMETRY tip=1198 final=1192 stall=6 age_s=426 diff=3423 peers=6 mempool=0 epoch=1 regime=Final
+  node2 TELEMETRY tip=1199 final=1192 stall=7 age_s=499 diff=3415 peers=6 mempool=0 epoch=1 regime=Final
+  node3 TELEMETRY tip=1196 final=1192 stall=4 age_s=272 diff=3367 peers=6 mempool=0 epoch=1 regime=Final
+[2026-07-26 23:19:28] 🎯 EPOCH BOUNDARY CROSSED — epoch view now: 1 
+[2026-07-26 23:24:28] iter=277
+  node0 TELEMETRY tip=1200 final=1192 stall=8 age_s=579 diff=3416 peers=6 mempool=0 epoch=1 regime=Final
+  node1 TELEMETRY tip=1201 final=1192 stall=9 age_s=732 diff=3453 peers=6 mempool=0 epoch=1 regime=Final
+  node2 TELEMETRY tip=1201 final=1192 stall=9 age_s=732 diff=3453 peers=6 mempool=0 epoch=1 regime=Final
+  node3 TELEMETRY tip=1201 final=1192 stall=9 age_s=732 diff=3453 peers=6 mempool=0 epoch=1 regime=Final
+[2026-07-26 23:24:28] 🎯 EPOCH BOUNDARY CROSSED — epoch view now: 1 
+=== EPOCH SOAK DONE 2026-07-26 23:24:28 — tip=1201 reached target 1200 after 277 samples
+=== final epoch view: 1 

@@ -34,6 +34,7 @@ pub mod ebbflow;
 pub mod epoch;
 pub mod fees;
 pub mod finality;
+pub mod halt;
 pub mod hash;
 pub mod header;
 pub mod load;

@@ -15,7 +15,8 @@
 //! by the p2p glue via [`crate::rpc::NodeRpc::set_net_facts`].
 
 use qlab_cbserver::codec::CodecError;
-use qlab_devnet::ebbflow::{finality_status, FinalityStatus};
+use qlab_devnet::ebbflow::FinalityStatus;
+use qlab_devnet::halt::regime as halt_regime;
 
 use crate::rpc::{Reader, RPC_VERSION};
 
@@ -23,6 +24,10 @@ use crate::rpc::{Reader, RPC_VERSION};
 const STATUS_FINAL: u8 = 0;
 /// Wire discriminant for [`FinalityStatus::Degraded`].
 const STATUS_DEGRADED: u8 = 1;
+/// Wire discriminant for [`FinalityStatus::Halting`] (halt-height upgrade, #74).
+const STATUS_HALTING: u8 = 2;
+/// Wire discriminant for [`FinalityStatus::Halted`].
+const STATUS_HALTED: u8 = 3;
 
 /// A single observability snapshot of a node's finality health.
 ///
@@ -68,7 +73,34 @@ impl Telemetry {
         epoch: u64,
         max_lag: u64,
     ) -> Self {
-        let finality_status = finality_status(tip_height, finalized_height, max_lag);
+        Self::assemble_with_halt(
+            tip_height,
+            finalized_height,
+            last_finalized_age_secs,
+            mempool_size,
+            peer_count,
+            epoch,
+            max_lag,
+            None,
+        )
+    }
+
+    /// [`Self::assemble`], halt-aware (issue #74). `halt_at` is the running
+    /// release's halt height, if it carries one; when a halt governs, the regime is
+    /// `Halting`/`Halted` instead of the ordinary Ebb-and-Flow pair. The rule comes
+    /// from [`qlab_devnet::halt::regime`] — this module never re-defines it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_with_halt(
+        tip_height: u64,
+        finalized_height: Option<u64>,
+        last_finalized_age_secs: u64,
+        mempool_size: u64,
+        peer_count: u64,
+        epoch: u64,
+        max_lag: u64,
+        halt_at: Option<u64>,
+    ) -> Self {
+        let finality_status = halt_regime(tip_height, finalized_height, max_lag, halt_at);
         let stall_depth = match finalized_height {
             Some(fh) => tip_height.saturating_sub(fh),
             None => tip_height,
@@ -94,6 +126,8 @@ impl Telemetry {
         out.push(match self.finality_status {
             FinalityStatus::Final => STATUS_FINAL,
             FinalityStatus::Degraded => STATUS_DEGRADED,
+            FinalityStatus::Halting => STATUS_HALTING,
+            FinalityStatus::Halted => STATUS_HALTED,
         });
         out.extend_from_slice(&self.tip_height.to_le_bytes());
         match self.finalized_height {
@@ -117,6 +151,8 @@ impl Telemetry {
         let finality_status = match r.u8()? {
             STATUS_FINAL => FinalityStatus::Final,
             STATUS_DEGRADED => FinalityStatus::Degraded,
+            STATUS_HALTING => FinalityStatus::Halting,
+            STATUS_HALTED => FinalityStatus::Halted,
             // Unknown finality discriminant: reject rather than silently coerce
             // (§0 reject-unknown, applied to the status byte as well).
             got => return Err(CodecError::BadVersion { got }),
@@ -167,6 +203,36 @@ mod tests {
         assert_eq!(n.stall_depth, 5);
         assert_eq!(n.finalized_height, None);
         assert_eq!(Telemetry::from_bytes(&n.to_bytes()).unwrap(), n);
+    }
+
+    /// Issue #74: the halt regimes ride the SAME status field (extended, not
+    /// forked), round-trip on the wire, and are derived from the halt rule rather
+    /// than re-defined here.
+    #[test]
+    fn telemetry_roundtrips_halting_and_halted() {
+        const H: u64 = 16;
+        // Tip at H, H not finalized yet ⇒ Halting.
+        let halting = Telemetry::assemble_with_halt(H, Some(8), 600, 0, 3, 0, MAX_LAG, Some(H));
+        assert_eq!(halting.finality_status, FinalityStatus::Halting);
+        assert_eq!(Telemetry::from_bytes(&halting.to_bytes()).unwrap(), halting);
+        assert_eq!(halting.to_bytes()[1], STATUS_HALTING);
+
+        // H finalized ⇒ Halted, stall depth 0 (the boundary IS the tip).
+        let halted = Telemetry::assemble_with_halt(H, Some(H), 0, 0, 3, 0, MAX_LAG, Some(H));
+        assert_eq!(halted.finality_status, FinalityStatus::Halted);
+        assert_eq!(halted.stall_depth, 0);
+        assert_eq!(Telemetry::from_bytes(&halted.to_bytes()).unwrap(), halted);
+        assert_eq!(halted.to_bytes()[1], STATUS_HALTED);
+
+        // Below H the halt does not govern — ordinary Ebb-and-Flow.
+        let pre = Telemetry::assemble_with_halt(10, Some(8), 150, 0, 3, 0, MAX_LAG, Some(H));
+        assert_eq!(pre.finality_status, FinalityStatus::Final);
+
+        // A node with no halt scheduled is byte-identical to the pre-#74 surface.
+        let a = Telemetry::assemble(20, Some(16), 300, 3, 7, 1, MAX_LAG);
+        let b = Telemetry::assemble_with_halt(20, Some(16), 300, 3, 7, 1, MAX_LAG, None);
+        assert_eq!(a, b);
+        assert_eq!(a.to_bytes(), b.to_bytes());
     }
 
     #[test]

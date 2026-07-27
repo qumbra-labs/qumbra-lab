@@ -54,6 +54,12 @@ services:
   node0:                    # de-facto bootstrap (all nodes full-mesh dial each other)
     <<: *node-common
     hostname: node0
+    # Which release this node runs (issue #74 drill). Default = the un-armed v1.0
+    # binary, so an ordinary soak is byte-for-byte what it was. soak.sh sets these
+    # per-scenario; see deploy/docker/entrypoint.sh for the binary names.
+    environment:
+      QUMBRA_BIN: ${NODE0_BIN:-qumbra-node}
+      QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
     command: ["run", "0"]   # holds committee keys 00..05 (6)
     volumes:
       - shared:/shared
@@ -62,6 +68,12 @@ services:
   node1:
     <<: *node-common
     hostname: node1
+    # Which release this node runs (issue #74 drill). Default = the un-armed v1.0
+    # binary, so an ordinary soak is byte-for-byte what it was. soak.sh sets these
+    # per-scenario; see deploy/docker/entrypoint.sh for the binary names.
+    environment:
+      QUMBRA_BIN: ${NODE1_BIN:-qumbra-node}
+      QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
     command: ["run", "1"]   # holds committee keys 06..10 (5)
     volumes:
       - shared:/shared
@@ -70,6 +82,12 @@ services:
   node2:
     <<: *node-common
     hostname: node2
+    # Which release this node runs (issue #74 drill). Default = the un-armed v1.0
+    # binary, so an ordinary soak is byte-for-byte what it was. soak.sh sets these
+    # per-scenario; see deploy/docker/entrypoint.sh for the binary names.
+    environment:
+      QUMBRA_BIN: ${NODE2_BIN:-qumbra-node}
+      QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
     command: ["run", "2"]   # holds committee keys 11..15 (5)
     volumes:
       - shared:/shared
@@ -78,6 +96,12 @@ services:
   node3:                    # the late-joiner in the sync-from-genesis scenario
     <<: *node-common
     hostname: node3
+    # Which release this node runs (issue #74 drill). Default = the un-armed v1.0
+    # binary, so an ordinary soak is byte-for-byte what it was. soak.sh sets these
+    # per-scenario; see deploy/docker/entrypoint.sh for the binary names.
+    environment:
+      QUMBRA_BIN: ${NODE3_BIN:-qumbra-node}
+      QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
     command: ["run", "3"]   # holds committee keys 16..20 (5)
     volumes:
       - shared:/shared

@@ -26,4 +26,5 @@ None of that was recoverable from anywhere but a chat transcript. Now each revis
 | `d3-builder-prompt.md` | #24 D3 leaf F0 digest binding | in flight |
 | `halt-height-builder-prompt.md` | #74 halt-height mechanism | in flight, PR #76 |
 | `i77-builder-prompt.md` | #77 header↔body binding | ready to dispatch |
+| `m11-discovery-builder-prompt.md` | [#83](https://github.com/lai3d/qumbra-lab/issues/83) M11 peer discovery | ready to dispatch — the first M11 baton |
 | `halt-height-taskbook-DRAFT.md` | #74 | **superseded** by the issue #74 task-book. Kept deliberately: its §1 H3 is the version the coordinator later **rejected as contradicting `committee-and-governance` §4**, and a draft that was overruled is worth more on the record than one quietly deleted |

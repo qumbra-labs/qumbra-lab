@@ -28,6 +28,7 @@ use qlab_pow::keyblock::KeyBlockSchedule;
 use qlab_pow::lwma_next_difficulty;
 
 use crate::chain::ChainState;
+use crate::halt::{pow_value, RuleSchedule};
 use crate::header::{BlockHeader, Hash32};
 use crate::params_devnet::LWMA_WINDOW_BLOCKS;
 use crate::pow::{satisfies_target, PowEngine};
@@ -111,15 +112,42 @@ pub fn expected_difficulty(
     Some(lwma_next_difficulty(&timestamps, &difficulties, target_block_time))
 }
 
-/// Run the full header validation for `header` against `chain`: parent present,
-/// height, timestamp monotonicity, mandated difficulty (LWMA), and PoW under the
-/// resolved RandomX key-block seed.
+/// Run the full header validation for `header` against `chain` under the **v1.0
+/// rules**: parent present, height, timestamp monotonicity, mandated difficulty
+/// (LWMA), and PoW under the resolved RandomX key-block seed.
+///
+/// This is the pre-halt rule set and is byte-for-byte what it always was. A node
+/// running a release that resumes past an upgrade boundary calls
+/// [`validate_header_under`] instead (issue #74).
 pub fn validate_header<P: PowEngine>(
     chain: &ChainState,
     pow: &P,
     header: &BlockHeader,
     target_block_time: u64,
     schedule: KeyBlockSchedule,
+) -> Result<(), ValidationError> {
+    validate_header_under(chain, pow, header, target_block_time, schedule, &RuleSchedule::V1_0)
+}
+
+/// [`validate_header`] under an explicit [`RuleSchedule`] (issue #74).
+///
+/// The only difference from the v1.0 rules is the PoW **value**: above an upgrade
+/// boundary the engine's PoW hash is domain-separated by the active revision
+/// before the target check ([`crate::halt::pow_value`]). At and below the boundary
+/// the two functions are identical, so no pre-halt block ever changes meaning.
+///
+/// Note what this function deliberately does **not** do: it does not reject blocks
+/// above a halt height. Halting is a property of the *release*, enforced where a
+/// node decides to mine or ingest; header validation stays a pure statement about
+/// the chain, so a halted node can still be asked "would this header have been
+/// valid?" while refusing to act on it.
+pub fn validate_header_under<P: PowEngine>(
+    chain: &ChainState,
+    pow: &P,
+    header: &BlockHeader,
+    target_block_time: u64,
+    schedule: KeyBlockSchedule,
+    rules: &RuleSchedule,
 ) -> Result<(), ValidationError> {
     let parent = chain
         .header(&header.prev)
@@ -141,9 +169,12 @@ pub fn validate_header<P: PowEngine>(
         });
     }
 
-    let seed = pow_seed(chain, &header.prev, header.height, schedule)
-        .ok_or(ValidationError::UnknownSeed)?;
-    if !satisfies_target(&pow.pow_hash(header, &seed), header.difficulty) {
+    let seed =
+        pow_seed(chain, &header.prev, header.height, schedule).ok_or(ValidationError::UnknownSeed)?;
+    // Issue #74: above an upgrade boundary the PoW value is domain-separated by the
+    // active revision. At and below it, this is byte-identical to the v1.0 rule.
+    let value = pow_value(pow.pow_hash(header, &seed), header.height, rules);
+    if !satisfies_target(&value, header.difficulty) {
         return Err(ValidationError::PowUnsatisfied);
     }
     Ok(())

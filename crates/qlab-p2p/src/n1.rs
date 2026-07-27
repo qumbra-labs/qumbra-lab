@@ -42,12 +42,36 @@ pub enum IngestOutcome {
     Orphan,
     /// Rejected as invalid; the peer that sent it may be penalized.
     Rejected(&'static str),
+    /// Well-formed as far as this node can tell, but **this release will not act
+    /// on it** (issue #74: the object is above our halt height). Not relayed, not
+    /// synced toward, and — the load-bearing part — **the sender is not penalized**.
+    ///
+    /// Distinct from [`Self::Rejected`] on purpose. A peer still mining above a
+    /// halt height is on a different release, not misbehaving; §4 says explicitly
+    /// that old-binary miners *can* keep producing blocks past the halt height.
+    /// Scoring them as invalid-object senders would ban honest peers during the
+    /// upgrade window — partitioning the net at exactly the moment an operator
+    /// needs it whole. This is the #70 S5 rule ("a well-formed thing we cannot use
+    /// is not a misbehaving peer") applied to the halt.
+    Ignored(&'static str),
 }
 
 impl IngestOutcome {
     /// Whether this object is worth relaying onward (only genuinely-new objects).
     pub fn should_relay(&self) -> bool {
         matches!(self, IngestOutcome::Accepted)
+    }
+
+    /// Whether the **sender** is at fault and should be penalized.
+    ///
+    /// Only [`Self::Rejected`]. In particular [`Self::Ignored`] is NOT a fault: a
+    /// peer producing blocks above our halt height is on a different release, which
+    /// `committee-and-governance.md` §4 says explicitly it may be. Penalizing it
+    /// would ban honest peers during the upgrade window — partitioning the net at
+    /// exactly the moment an operator needs it whole (issue #74; the #70 S5 rule
+    /// applied to the halt).
+    pub fn is_peer_fault(&self) -> bool {
+        matches!(self, IngestOutcome::Rejected(_))
     }
 }
 
@@ -640,5 +664,21 @@ mod tests {
         ));
         assert_eq!(n.committee().state().status(0), Some(qlab_devnet::committee::MemberStatus::Active));
         assert_eq!(n.committee().state().slashed(6), Some(0), "downtime is jail, NOT slash");
+    }
+
+    /// #74 + #70 S5: exactly one outcome is the sender's fault. In particular a
+    /// block above our halt height is NOT — penalizing it would ban honest peers
+    /// still on the old release, during the upgrade window, which is the worst
+    /// possible moment to shed peers.
+    #[test]
+    fn only_rejected_is_a_peer_fault() {
+        assert!(IngestOutcome::Rejected("bad pow").is_peer_fault());
+        assert!(!IngestOutcome::Ignored("above halt height").is_peer_fault());
+        assert!(!IngestOutcome::Accepted.is_peer_fault());
+        assert!(!IngestOutcome::Orphan.is_peer_fault());
+        assert!(!IngestOutcome::Duplicate.is_peer_fault());
+        // …and only a genuinely new object is relayed.
+        assert!(IngestOutcome::Accepted.should_relay());
+        assert!(!IngestOutcome::Ignored("above halt height").should_relay());
     }
 }

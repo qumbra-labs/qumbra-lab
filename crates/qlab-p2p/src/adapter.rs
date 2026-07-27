@@ -6,7 +6,7 @@
 //!
 //! - **header chain + PoW + fork-choice**: a devnet [`ChainState`] validated on
 //!   ingest with real PoW + LWMA-120 difficulty + key-block seed
-//!   ([`validate_header`] / [`expected_difficulty`] / [`pow_seed`], N3);
+//!   ([`validate_header_under`] / [`expected_difficulty`] / [`pow_seed`], N3);
 //! - **real state machine**: a [`qlab_node::MemNode`] (depth-32 commitment tree +
 //!   permanent nullifier set + anchor set + restart-safe snapshots, N1);
 //! - **pending pool**: the N4 [`Mempool`] — admission runs the injected M3
@@ -31,21 +31,24 @@ use qlab_devnet::body::{validate_body, BlockBody, BodyError, TxEntry};
 use qlab_devnet::chain::{ChainState, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, MemberStatus, Validator, Vote};
 use qlab_devnet::ebbflow::{
-    finality_status, verify_equivocation, EquivocationEvidence, FinalityStatus, SigningWindow,
+    verify_equivocation, EquivocationEvidence, FinalityStatus, SigningWindow,
 };
 use qlab_devnet::epoch::{EpochCommittee, EpochSchedule};
 use qlab_devnet::finality::{FinalityTracker, FinalizeError};
 use qlab_devnet::header::{BlockHeader, Hash32};
 use qlab_devnet::tally::VoteTally;
 use qlab_pow::keyblock::KeyBlockSchedule;
-use qlab_devnet::mining::mine;
+use qlab_devnet::mining::mine_under;
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::{
     DEGRADED_MODE_LAG_BLOCKS, DOWNTIME_JAIL_THRESHOLD_PCT, DOWNTIME_JAIL_WINDOW,
     EPOCH_LENGTH_BLOCKS, JAIL_BLOCKS,
 };
 use qlab_devnet::pow::PowEngine;
-use qlab_devnet::validation::{expected_difficulty, pow_seed, validate_header};
+use qlab_devnet::halt::{regime as halt_regime, RuleSchedule};
+use qlab_devnet::validation::{
+    expected_difficulty, pow_seed, validate_header_under, ValidationError,
+};
 
 use qlab_node::mempool::TxId;
 use qlab_node::recovery::Finalizer;
@@ -79,7 +82,7 @@ pub enum MiningClock {
     #[default]
     Deterministic,
     /// Real wall-clock seconds (`SystemTime::now`), clamped non-decreasing against
-    /// the parent so header validation's monotonic rule ([`validate_header`]) always
+    /// the parent so header validation's monotonic rule ([`validate_header_under`]) always
     /// holds. The binary path. Difficulty then retargets to real block-production
     /// pace; the jitter is exactly what LWMA's 6T / out-of-sequence clamps tolerate.
     WallClock,
@@ -137,6 +140,33 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// How a mined block's header timestamp is chosen (item 0). Defaults to
     /// [`MiningClock::Deterministic`]; the binary opts into [`MiningClock::WallClock`].
     mining_clock: MiningClock,
+    /// The running release's halt/rule schedule (issue #74). Defaults to
+    /// [`RuleSchedule::V1_0`] — no halt, no post-halt rule domain — so every
+    /// in-process sim, soak and test behaves exactly as before. The binary installs
+    /// its compile-time release schedule once at startup via
+    /// [`Self::set_rule_schedule`]; there is no config/CLI/env path to it (H1).
+    rules: RuleSchedule,
+    /// Counters that attribute ingest refusals to a layer (issue #74 drill
+    /// evidence). Surfaced in the binary's telemetry line so the docker drill can
+    /// answer "which layer rejected the old branch?" from the logs rather than from
+    /// a narrative.
+    ingest_counters: IngestCounters,
+}
+
+/// Layer-attributed ingest refusal counts (issue #74).
+///
+/// The two are deliberately separate because they are different claims about the
+/// upgrade. `halt_ignored` is the **release** layer: this node has stopped, so it
+/// will not act on the block (and does not blame the sender). `pow_rejected` is the
+/// **header-validation** layer: under the post-halt rule domain the block's PoW does
+/// not meet the target, so it is invalid, not merely unwanted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IngestCounters {
+    /// Headers/blocks not acted on because this release is halted (release layer).
+    pub halt_ignored: u64,
+    /// Headers rejected because the PoW value did not meet the target
+    /// (header-validation layer).
+    pub pow_rejected: u64,
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
@@ -218,6 +248,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             nonce_budget: sim.mine_nonce_budget,
             clock: 0,
             mining_clock: MiningClock::default(),
+            rules: RuleSchedule::V1_0,
+            ingest_counters: IngestCounters::default(),
         }
     }
 
@@ -231,6 +263,38 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// Override the downtime signing window (tests use a small window so it fills).
     pub fn set_signing_window(&mut self, window: usize, threshold_pct: u64) {
         self.signing = SigningWindow::new(window, threshold_pct);
+    }
+
+    /// Install the running release's halt/rule schedule (issue #74).
+    ///
+    /// Called once, at startup, with the value derived from the binary's
+    /// compile-time `RELEASE` constant. This is plumbing, not a knob: nothing in
+    /// the config file, the CLI, or the environment can reach it (H1), and the
+    /// default is [`RuleSchedule::V1_0`].
+    pub fn set_rule_schedule(&mut self, rules: RuleSchedule) {
+        self.rules = rules;
+    }
+
+    /// The installed rule schedule.
+    pub fn rules(&self) -> &RuleSchedule {
+        &self.rules
+    }
+
+    /// Layer-attributed ingest refusal counts (issue #74 drill evidence).
+    pub fn ingest_counters(&self) -> IngestCounters {
+        self.ingest_counters
+    }
+
+    /// The height this node halts at, if its release carries one.
+    pub fn halt_at(&self) -> Option<u64> {
+        self.rules.halt_at()
+    }
+
+    /// Whether this node is at or past its halt height — i.e. whether the halt has
+    /// actually engaged, as opposed to merely being scheduled. The run loop uses
+    /// this to write the durable halt marker.
+    pub fn is_halted_at_tip(&self) -> bool {
+        self.rules.halt_at().is_some_and(|h| self.chain.tip_height() >= h)
     }
 
     // --- read-only accessors (harness / assertions) ---
@@ -276,15 +340,42 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// Map a header-insert result to an [`IngestOutcome`], advancing the epoch on
     /// acceptance.
     fn submit_header(&mut self, header: BlockHeader) -> IngestOutcome {
-        // Real PoW + LWMA difficulty + key-seed validation (N3).
-        if validate_header(&self.chain, &self.pow, &header, self.block_time, self.schedule).is_err()
-        {
+        // HALT (issue #74, H2). An armed node applies block H and accepts nothing
+        // above it. This is a property of the running RELEASE, not of the chain, so
+        // it is enforced here rather than inside `validate_header` — and the peer is
+        // NOT penalised: a node still on the old binary offering post-H blocks is on
+        // a different release, not misbehaving (the S5 discipline from #70).
+        if !self.rules.accepts_height(header.height) {
+            self.ingest_counters.halt_ignored += 1;
+            return IngestOutcome::Ignored("above halt height");
+        }
+        // Real PoW + LWMA difficulty + key-seed validation (N3), under this
+        // release's rules (the PoW VALUE is domain-separated above an upgrade
+        // boundary; at and below it, byte-identical to the v1.0 rules).
+        if let Err(e) = validate_header_under(
+            &self.chain,
+            &self.pow,
+            &header,
+            self.block_time,
+            self.schedule,
+            &self.rules,
+        ) {
             // Unknown parent → orphan (drives header-first sync); anything else is
-            // an invalid header (bad PoW / difficulty / timestamp / height).
-            return match self.chain.header(&header.prev) {
-                None if header.height > 0 => IngestOutcome::Orphan,
-                _ => IngestOutcome::Rejected("invalid header"),
-            };
+            // an invalid header. The reason string names the FAILING CHECK, not just
+            // "invalid header": issue #74's drill has to be able to say which layer
+            // rejected an old-binary block — the release layer (halt) or the
+            // header-validation layer (the post-halt PoW domain) — and a single
+            // catch-all string cannot answer that.
+            if matches!(e, ValidationError::UnknownParent) && header.height > 0 {
+                return IngestOutcome::Orphan;
+            }
+            if self.chain.header(&header.prev).is_none() && header.height > 0 {
+                return IngestOutcome::Orphan;
+            }
+            if matches!(e, ValidationError::PowUnsatisfied) {
+                self.ingest_counters.pow_rejected += 1;
+            }
+            return IngestOutcome::Rejected(Self::header_reject_reason(&e));
         }
         match self.chain.insert_header(header) {
             Ok(_) => {
@@ -319,6 +410,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// → `ingest_block`, which is the single insert/apply path. `None` if there is
     /// no known parent or the nonce budget is exhausted.
     pub fn mine_block(&mut self) -> Option<(BlockHeader, BlockBody)> {
+        // HALT (H2): an upgraded node stops mining above H. Un-upgraded miners will
+        // not, and that is fine — §4's hybrid honesty note; the committee, not miner
+        // unanimity, is what makes the upgrade clean.
+        if !self.rules.accepts_height(self.chain.tip_height() + 1) {
+            return None;
+        }
         let template = self.mempool.assemble(&self.state, SOAK_EFFECTIVE_MEDIAN);
         let body = template.body;
         let bc = body.commitment();
@@ -328,7 +425,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         let timestamp = self.next_timestamp(&parent);
         let candidate = BlockHeader::child_of(&parent, timestamp, difficulty, bc);
         let seed = pow_seed(&self.chain, &parent_hash, candidate.height, self.schedule)?;
-        let mined = mine(&self.pow, candidate, self.nonce_budget, &seed)?;
+        let mined =
+            mine_under(&self.pow, candidate, self.nonce_budget, &seed, &self.rules)?;
         Some((mined, body))
     }
 
@@ -339,6 +437,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         height: u64,
         validators: &[Validator],
     ) -> Option<(Checkpoint, Vec<Vote>)> {
+        if !self.rules.may_checkpoint(height) {
+            return None; // H2 — see `make_checkpoint_guarded`
+        }
         let block_hash = *self.chain.main_chain().get(height as usize)?;
         let cp = Checkpoint::new(height, block_hash, block_hash);
         let votes = validators.iter().map(|v| v.sign_checkpoint(&cp)).collect();
@@ -359,10 +460,34 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         height: u64,
         finalizers: &mut [Finalizer],
     ) -> Option<(Checkpoint, Vec<Vote>)> {
+        // HALT (issue #74, H2) — **the load-bearing act**. §4: "the finality
+        // committee stops checkpointing at exactly that height." The gate sits here,
+        // as close to the signature as it can be: a halted committee member does not
+        // produce the vote at all, rather than producing one that is later filtered.
+        // The checkpoint *at* H is deliberately still produced — it is what makes the
+        // upgrade boundary a finalized boundary.
+        if !self.rules.may_checkpoint(height) {
+            return None;
+        }
         let block_hash = *self.chain.main_chain().get(height as usize)?;
         let cp = Checkpoint::new(height, block_hash, block_hash);
         let votes = finalizers.iter_mut().filter_map(|f| f.sign(&cp).ok()).collect();
         Some((cp, votes))
+    }
+
+    /// Name the header check that failed, so a rejection is attributable to a
+    /// layer rather than to "something was wrong" (issue #74 drill evidence).
+    fn header_reject_reason(err: &ValidationError) -> &'static str {
+        match err {
+            ValidationError::UnknownParent => "invalid header: unknown parent",
+            ValidationError::BadHeight => "invalid header: height",
+            ValidationError::NonMonotonicTimestamp => "invalid header: timestamp",
+            ValidationError::WrongDifficulty { .. } => "invalid header: difficulty",
+            // Under a post-halt rule domain this is the domain separation biting:
+            // a block mined for the pre-halt rules does not meet the target here.
+            ValidationError::PowUnsatisfied => "invalid header: pow",
+            ValidationError::UnknownSeed => "invalid header: seed",
+        }
     }
 
     fn reject_reason(err: &MempoolError) -> &'static str {
@@ -471,6 +596,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
         let id = checkpoint_id(cp);
         if self.seen_checkpoints.contains(&id) {
             return VotesOutcome::Stale; // already finalized this variant
+        }
+        // HALT (issue #74, H2): a halted node must not FINALIZE above H either — it
+        // would be finalizing a chain it refuses to accept. `Stale`, not `Invalid`:
+        // the sender is on a different release, not misbehaving (S5).
+        if !self.rules.may_checkpoint(cp.height) {
+            return VotesOutcome::Stale;
         }
         let finalized = self.finality.finalized_height();
         let tip = self.chain.tip_height();
@@ -594,7 +725,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> CommitteeControl for NodeAdapter<P, V>
     }
 
     fn finality_status(&self) -> FinalityStatus {
-        finality_status(self.chain.tip_height(), self.finality.finalized_height(), DEGRADED_MODE_LAG_BLOCKS)
+        // Halt-aware (issue #74): `Halting`/`Halted` when a halt governs, the
+        // ordinary Ebb-and-Flow pair otherwise. Single derivation, in qlab-devnet.
+        halt_regime(
+            self.chain.tip_height(),
+            self.finality.finalized_height(),
+            DEGRADED_MODE_LAG_BLOCKS,
+            self.rules.halt_at(),
+        )
     }
 
     fn is_tombstoned(&self, idx: usize) -> bool {
@@ -1092,5 +1230,338 @@ mod tests {
         assert!(matches!(a.ingest_checkpoint_votes(&cp, &dup), VotesOutcome::Invalid));
 
         assert_eq!(a.finalized_height(), None, "no invalid set moved finality");
+    }
+
+    // ---- issue #74: halt-height upgrade mechanism -----------------------------
+
+    use qlab_devnet::halt::{HaltPlan, PostHaltRules};
+    use qlab_devnet::validation::{validate_header_under, ValidationError};
+
+    /// The drill's halt height, on the cadence grid.
+    const DRILL_H: u64 = 16;
+    /// The resuming revision's rule domain (stands in for `Revision::digest()`,
+    /// which lives in the binary crate — this crate must not depend on it).
+    const DRILL_DOMAIN: Hash32 = [0x74; 32];
+
+    fn armed_at(h: u64) -> RuleSchedule {
+        RuleSchedule { halt: HaltPlan::Armed { height: h }, post_halt: None }
+    }
+    fn resumed_past(h: u64) -> RuleSchedule {
+        RuleSchedule {
+            halt: HaltPlan::None,
+            post_halt: Some(PostHaltRules { from_height: h, domain: DRILL_DOMAIN }),
+        }
+    }
+    fn node_with(rules: RuleSchedule) -> NodeAdapter<KeccakPow, MockVerifier> {
+        let mut n = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        n.set_rule_schedule(rules);
+        n
+    }
+    fn finalizers5() -> Vec<Finalizer> {
+        (0..5).map(|i| Finalizer::new(Validator::from_seed(i, devnet_seed(i)))).collect()
+    }
+    /// Mine one block on `proposer` and offer it to `to`, returning `to`'s verdict.
+    fn mine_then_offer(
+        proposer: &mut NodeAdapter<KeccakPow, MockVerifier>,
+        to: &mut NodeAdapter<KeccakPow, MockVerifier>,
+    ) -> (BlockHeader, IngestOutcome) {
+        let (h, body) = proposer.mine_block().expect("proposer mines");
+        assert_eq!(proposer.ingest_block(h, body.clone()), IngestOutcome::Accepted);
+        (h, to.ingest_block(h, body))
+    }
+
+    /// A node with no halt scheduled behaves EXACTLY as it did before #74 — the
+    /// default rule schedule changes nothing anywhere.
+    #[test]
+    fn halt_default_schedule_is_a_no_op() {
+        let mut n = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        assert_eq!(*n.rules(), RuleSchedule::V1_0);
+        assert_eq!(n.halt_at(), None);
+        assert!(!n.is_halted_at_tip());
+        for _ in 0..4 {
+            let (h, body) = n.mine_block().expect("mines");
+            assert_eq!(n.ingest_block(h, body), IngestOutcome::Accepted);
+        }
+        assert_eq!(n.tip_height(), 4);
+        assert_eq!(n.finality_status(), FinalityStatus::Degraded, "nothing finalized yet");
+    }
+
+    /// H2, the three halt acts, on one armed node: it applies block H, then stops
+    /// mining above it, rejects blocks above it, and — the load-bearing act — stops
+    /// signing checkpoints above it. Plus the Halting → Halted regime walk.
+    #[test]
+    fn halt_stops_mining_accepting_and_signing_above_h() {
+        let mut up = node_with(armed_at(DRILL_H));
+        let mut old = node_with(RuleSchedule::V1_0);
+        for _ in 0..DRILL_H {
+            mine_and_relay(&mut old, &mut up);
+        }
+        assert_eq!(up.tip_height(), DRILL_H, "block H itself is applied");
+
+        // (1) stops mining above H
+        assert!(up.mine_block().is_none(), "an armed node does not mine above H");
+        assert!(up.is_halted_at_tip());
+        // (2) rejects blocks above H — and does NOT penalise the sender: the peer is
+        //     on a different release, not misbehaving.
+        let (_, verdict) = mine_then_offer(&mut old, &mut up);
+        assert_eq!(
+            verdict,
+            IngestOutcome::Ignored("above halt height"),
+            "Ignored, NOT Rejected — an old-binary peer is on a different release, not \
+             misbehaving, and must not be scored as an invalid-object sender"
+        );
+        assert_eq!(up.ingest_counters().halt_ignored, 1, "attributed to the RELEASE layer");
+        assert_eq!(up.ingest_counters().pow_rejected, 0, "…not to header validation");
+        assert_eq!(up.tip_height(), DRILL_H, "tip pinned at the boundary");
+        // (3) regime: Halting until H's checkpoint finalizes…
+        assert_eq!(up.finality_status(), FinalityStatus::Halting);
+        let mut fz = finalizers5();
+        let (cp, votes) = up.make_checkpoint_guarded(DRILL_H, &mut fz).expect("checkpoint AT H");
+        assert_eq!(votes.len(), 5, "the checkpoint AT H is exactly the one that must be signed");
+        assert_eq!(up.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+        // …then Halted. The upgrade boundary is a FINALIZED boundary.
+        assert_eq!(up.finalized_height(), Some(DRILL_H));
+        assert_eq!(up.finality_status(), FinalityStatus::Halted);
+    }
+
+    /// The committee-signing gate in isolation: an armed node refuses to sign any
+    /// checkpoint above H even when it holds the block, and refuses to FINALIZE one
+    /// offered by a peer (it must not finalize a chain it will not accept).
+    #[test]
+    fn halt_committee_refuses_to_sign_or_finalize_above_h() {
+        // Build the chain first, THEN arm at a height below the tip — the only way
+        // to hold a block above H on an armed node, and exactly the isolation the
+        // assertion needs.
+        let mut n = node_with(RuleSchedule::V1_0);
+        for _ in 0..DRILL_H {
+            let (h, body) = n.mine_block().unwrap();
+            assert_eq!(n.ingest_block(h, body), IngestOutcome::Accepted);
+        }
+        let mut fz = finalizers5();
+        // Un-armed, slot 16 signs fine.
+        assert!(n.make_checkpoint_guarded(16, &mut fz).is_some());
+        // Armed at 8: slot 8 still signs, slot 16 does not.
+        let mut n2 = node_with(RuleSchedule::V1_0);
+        for _ in 0..DRILL_H {
+            let (h, body) = n2.mine_block().unwrap();
+            assert_eq!(n2.ingest_block(h, body), IngestOutcome::Accepted);
+        }
+        n2.set_rule_schedule(armed_at(8));
+        let mut fz2 = finalizers5();
+        assert!(n2.make_checkpoint_guarded(8, &mut fz2).is_some(), "the checkpoint AT H is signed");
+        assert!(
+            n2.make_checkpoint_guarded(16, &mut fz2).is_none(),
+            "the committee stops signing ABOVE H — the load-bearing act"
+        );
+        // And a quorum-carrying checkpoint above H offered by a peer does not
+        // finalize on the halted node (Duplicate/Stale, not Invalid — no penalty).
+        let (cp16, votes16) = n.make_checkpoint_guarded(16, &mut fz).unwrap();
+        assert_eq!(n2.ingest_checkpoint(cp16, votes16), IngestOutcome::Duplicate);
+        assert_eq!(n2.finalized_height(), None, "a halted node finalizes nothing above H");
+    }
+
+    /// **DRILL (a) — the hybrid honesty case (H3), in process.**
+    ///
+    /// committee-and-governance §4: old-binary PoW miners *can* keep producing
+    /// blocks past the halt height; those blocks can never finalize, and the fork
+    /// resolves to the checkpointed branch. This is the drill that proves the
+    /// mechanism, so it asserts all four halves: the old branch GROWS, it never
+    /// finalizes, the checkpointed branch wins, and nothing reorgs past a finalized
+    /// checkpoint.
+    ///
+    /// (The binary swap is modelled here by installing the resumed rule schedule on
+    /// the same node — same state, new release. The real process-restart path is
+    /// what the docker drill covers.)
+    #[test]
+    fn drill_a_old_miner_grows_past_h_and_never_finalizes() {
+        let mut up = node_with(armed_at(DRILL_H));
+        let mut old = node_with(RuleSchedule::V1_0);
+        for _ in 0..DRILL_H {
+            mine_and_relay(&mut old, &mut up);
+        }
+        // The boundary is finalized before any swap (H2).
+        let mut fz = finalizers5();
+        let (cp, votes) = up.make_checkpoint_guarded(DRILL_H, &mut fz).unwrap();
+        assert_eq!(up.ingest_checkpoint(cp, votes.clone()), IngestOutcome::Accepted);
+        assert_eq!(old.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+        assert_eq!(up.finality_status(), FinalityStatus::Halted);
+        let boundary_hash = up.main_chain_hash_at(DRILL_H).unwrap();
+
+        // --- 1. The old binary keeps mining past H. It GROWS. ---
+        for _ in 0..5 {
+            let (_, verdict) = mine_then_offer(&mut old, &mut up);
+            assert_eq!(verdict, IngestOutcome::Ignored("above halt height"));
+        }
+        // WHILE HALTED the refusal is at the RELEASE layer: nothing was judged
+        // invalid, we simply stopped. No penalty is owed to the old miner.
+        assert_eq!(up.ingest_counters().halt_ignored, 5);
+        assert_eq!(up.ingest_counters().pow_rejected, 0);
+        assert_eq!(old.tip_height(), DRILL_H + 5, "the old branch grows — expected, not a defect");
+        assert_eq!(up.tip_height(), DRILL_H, "the halted node stays at the boundary");
+
+        // --- 2. The swap: the upgraded release resumes past H. ---
+        up.set_rule_schedule(resumed_past(DRILL_H));
+        assert_eq!(
+            up.finality_status(),
+            FinalityStatus::Final,
+            "no longer a halt regime — tip == finalized == H, so the ordinary rule applies again"
+        );
+
+        // --- 3. The old branch is STILL rejected — now structurally, by the
+        //        post-halt rules, not by the halt. This is what makes "those blocks
+        //        can never finalize" a property rather than an accident. ---
+        for h in (DRILL_H + 1)..=(DRILL_H + 5) {
+            let hdr = *old.chain().header(&old.main_chain_hash_at(h).unwrap()).unwrap();
+            let verdict = up.ingest_header(hdr);
+            if h == DRILL_H + 1 {
+                // The first old-rule block above the boundary attaches to a parent
+                // the upgraded node HAS, so it is fully validated — and its PoW does
+                // not meet the target under the post-halt rules.
+                //
+                // WHICH LAYER: this is the HEADER-VALIDATION layer, not the release
+                // layer. After the swap the node has no halt at all; the block is
+                // refused because the post-halt rule domain makes it invalid. The
+                // exact failing check is asserted directly below, against
+                // `validate_header_under`, so the claim is about `PowUnsatisfied`
+                // and not about a coincidental difficulty/timestamp mismatch.
+                assert_eq!(
+                    verdict,
+                    IngestOutcome::Rejected("invalid header: pow"),
+                    "the first post-H block built under PRE-halt rules must fail PoW"
+                );
+                assert_eq!(
+                    validate_header_under(
+                        up.chain(),
+                        &KeccakPow,
+                        &hdr,
+                        easy_sim().block_time_secs,
+                        KeyBlockSchedule::new(easy_sim().key_epoch_blocks, easy_sim().key_epoch_lag),
+                        up.rules(),
+                    ),
+                    Err(ValidationError::PowUnsatisfied),
+                    "the failing check is the PoW target under the post-halt domain — \
+                     the rejection is attributable to the header-validation layer"
+                );
+            } else {
+                // Everything above it hangs off a block the upgraded node refused,
+                // so it is an orphan — never accepted, and never reachable.
+                assert_eq!(verdict, IngestOutcome::Orphan, "old-branch block {h} is unreachable");
+            }
+            assert_ne!(up.tip_height(), h, "no old-rule block ever becomes the upgraded tip");
+        }
+        assert_eq!(up.tip_height(), DRILL_H, "the upgraded node is still at the boundary");
+        // AFTER the swap the refusal moved layers: no further halt-ignores (this
+        // release has no halt), and the PoW counter took the hit instead. That
+        // difference is exactly what the run doc must report.
+        assert_eq!(up.ingest_counters().halt_ignored, 5, "unchanged since the swap");
+        assert_eq!(
+            up.ingest_counters().pow_rejected,
+            1,
+            "post-swap refusal is at the header-validation layer (domain separation)"
+        );
+
+        // --- 4. …and the fork is bilateral: the upgraded branch does not verify
+        //        under the old rules either. Neither side can silently absorb the
+        //        other; only finality arbitrates. ---
+        let (new_hdr, verdict) = mine_then_offer(&mut up, &mut old);
+        assert_eq!(new_hdr.height, DRILL_H + 1, "the upgraded net resumes AT the boundary");
+        assert_eq!(
+            verdict,
+            IngestOutcome::Rejected("invalid header: pow"),
+            "…and the old binary rejects the NEW block at the same layer, for the same reason"
+        );
+
+        // --- 5. The checkpointed branch wins: the upgraded committee finalizes
+        //        past H; the old branch's finality is frozen at H forever. ---
+        while up.tip_height() < DRILL_H + 8 {
+            let (h, body) = up.mine_block().expect("the resumed net mines");
+            assert_eq!(up.ingest_block(h, body), IngestOutcome::Accepted);
+        }
+        let (cp2, votes2) = up.make_checkpoint_guarded(DRILL_H + 8, &mut fz).unwrap();
+        assert_eq!(up.ingest_checkpoint(cp2, votes2), IngestOutcome::Accepted);
+        assert_eq!(up.finalized_height(), Some(DRILL_H + 8), "finality resumed on the new rules");
+        assert_eq!(
+            old.finalized_height(),
+            Some(DRILL_H),
+            "the un-upgraded branch NEVER finalizes above H, however long it grows"
+        );
+        assert!(old.tip_height() > DRILL_H, "…while still growing");
+
+        // --- 6. THE INVARIANT: no reorg past a finalized checkpoint, on either
+        //        side, and both still agree on the finalized boundary block. ---
+        assert_eq!(up.main_chain_hash_at(DRILL_H), Some(boundary_hash));
+        assert_eq!(old.main_chain_hash_at(DRILL_H), Some(boundary_hash));
+        assert!(up.finalized_height().unwrap() >= DRILL_H);
+        assert!(old.finalized_height().unwrap() >= DRILL_H);
+    }
+
+    /// **DRILL (b) — the ⅔ gate (N2), in process.** With fewer than quorum keys on
+    /// the upgraded binary, finality does NOT resume: the net stays where it was
+    /// rather than limping forward on a minority committee.
+    #[test]
+    fn drill_b_finality_does_not_resume_below_quorum() {
+        let mut up = node_with(armed_at(DRILL_H));
+        for _ in 0..DRILL_H {
+            let (h, body) = up.mine_block().unwrap();
+            assert_eq!(up.ingest_block(h, body), IngestOutcome::Accepted);
+        }
+        let mut fz = finalizers5(); // quorum for committee7 is 5
+        let (cp, votes) = up.make_checkpoint_guarded(DRILL_H, &mut fz).unwrap();
+        assert_eq!(up.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+        assert_eq!(up.finalized_height(), Some(DRILL_H));
+
+        // Swap in the upgraded release, but only 4 of the 5 quorum keys come back.
+        up.set_rule_schedule(resumed_past(DRILL_H));
+        let mut minority: Vec<Finalizer> =
+            (0..4).map(|i| Finalizer::new(Validator::from_seed(i, devnet_seed(i)))).collect();
+        while up.tip_height() < DRILL_H + 8 {
+            let (h, body) = up.mine_block().unwrap();
+            assert_eq!(up.ingest_block(h, body), IngestOutcome::Accepted);
+        }
+        let (cp2, votes2) = up.make_checkpoint_guarded(DRILL_H + 8, &mut minority).unwrap();
+        assert_eq!(votes2.len(), 4, "a minority of the committee is on the new binary");
+        assert_eq!(
+            up.ingest_checkpoint(cp2, votes2),
+            IngestOutcome::Rejected("insufficient quorum"),
+            "below ⅔ ⇒ no finalization"
+        );
+        assert_eq!(
+            up.finalized_height(),
+            Some(DRILL_H),
+            "finality stays at the boundary — the net does not limp forward on a minority"
+        );
+
+        // The fifth key returns → quorum → finality resumes on the new rules.
+        let mut fz5 = finalizers5();
+        let (cp3, votes3) = up.make_checkpoint_guarded(DRILL_H + 8, &mut fz5).unwrap();
+        assert_eq!(votes3.len(), 5);
+        assert_eq!(up.ingest_checkpoint(cp3, votes3), IngestOutcome::Accepted);
+        assert_eq!(up.finalized_height(), Some(DRILL_H + 8));
+    }
+
+    /// **DRILL (d) — the stand-down (N1), in process.** A cancelled upgrade does not
+    /// halt at the cancelled height: the net mines and finalizes straight through it.
+    #[test]
+    fn drill_d_a_cancelled_upgrade_does_not_halt() {
+        let cancelled = RuleSchedule {
+            halt: HaltPlan::Cancelled { height: DRILL_H, reason: "review stood it down" },
+            post_halt: None,
+        };
+        let mut n = node_with(cancelled);
+        assert_eq!(n.halt_at(), None);
+        while n.tip_height() < DRILL_H + 8 {
+            let (h, body) = n.mine_block().expect("a cancelled upgrade never stops mining");
+            assert_eq!(n.ingest_block(h, body), IngestOutcome::Accepted);
+        }
+        assert_eq!(n.tip_height(), DRILL_H + 8, "mined straight through the cancelled height");
+        assert!(!n.is_halted_at_tip());
+        // …and the committee keeps checkpointing across it.
+        let mut fz = finalizers5();
+        for slot in [DRILL_H, DRILL_H + 8] {
+            let (cp, votes) = n.make_checkpoint_guarded(slot, &mut fz).expect("signs across it");
+            assert_eq!(n.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+        }
+        assert_eq!(n.finalized_height(), Some(DRILL_H + 8), "finality never paused");
+        assert_eq!(n.finality_status(), FinalityStatus::Final, "never reports a halt regime");
     }
 }
