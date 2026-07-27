@@ -11,11 +11,28 @@ Design: ONE msh mechanism (D0), three same-root applications (D1/D2/D3).
   unconditional / constraint-level).
 - **D2 (Σfee rider inputs) — DONE** (`acc9c3c`). The PR #25 boundary CLOSES;
   `interior_epoch_fee_boundary` inverted SAT → UNSAT.
-- **D3 (leaf F0 digest input binding + f0dig) — REMAINING.** Spec below. This is
-  a substantially larger, consensus-critical change (XOR-mode sponge recovery +
-  a leaf public-surface cascade) — deliberately scoped as a follow-on rather than
-  rushed at the tail of D0–D2 (the stage-2 plan's own guidance for the
-  merge-binding soundness slice: "consensus-critical, deliberately NOT rushed").
+- **D3 (leaf F0 digest input binding + f0dig) — BUILT (2026-07-26,
+  `claude/i24-d3-leaf-digest`).** Spec below; it was followed, and it was
+  correct. Three notes from the build, for whoever reads this next:
+  1. The spec's guess that the OREG/pbit/obit register file is "the likely
+     vehicle" was right, and no new register file was needed. The real find is
+     that `w0c`/`w1c`/`pbit`/`obit` had been FILLED since inc-4 and constrained
+     by nothing — D3 pins them for the first time. A column audit
+     (`d3_audit_filled_but_unconstrained_columns`) now reports zero
+     filled-but-unconstrained columns in the narrow gate; see its doc comment
+     for the method and for the category it CANNOT see.
+  2. The dead `shape_mosaic`/`WordBind` table was correct word-for-word,
+     including its implicit encoding claim: F0's Pv words need NO `rr` factor
+     (the inner PVs ride the outer interface already Monty-encoded), the
+     opposite of the D1 merge binding, which hashes canonical u32s. Validated
+     against the recorder before anything was built on it
+     (`d3_f0_mosaic_matches_the_recorded_transcript`).
+  3. `f0dig` needs no carry register — producer and consumer are the same row —
+     so the cascade is narrower than the spec feared: `GATE_WIDTH` is unchanged
+     (3675), `merge_perms()` is unchanged (53), and the interior rectangle does
+     not widen. What moves is only the public-value count: `N_OPVS` 852 → 868.
+     The digest is INSERTED between the caps and the inner PVs, not appended,
+     so the M3 fee stays the opvs tail (the 棒 3-3 Σfee rider reads it there).
 
 Full unfiltered suite **79/79 green** at every commit; deg ≤ 3 held throughout
 (`constraint_degree_within_budget`). Narrow + leaf **byte-identical** (D0–D2 are
@@ -98,3 +115,13 @@ re-measure leaf size (WILL change — the public surface grew).
 - deg ≤ 3 is the hard bar (`constraint_degree_within_budget`), not the doc's "deg 5".
 - The Monty factor: `c(rr.as_canonical_u32())`, never `cf(rr)`.
 - Off-region rows must have new columns zeroed (fill) or `assert_bool`/one-hot fail.
+- (D3 addition) The Monty factor is a MERGE-lane fact, not a universal one. The
+  merge sponge hashes canonical u32s, so D1/D2 multiply by `rr`; the challenger
+  absorbs `to_unique_u32()`, i.e. the Monty word itself, and `outer_pvs` already
+  stores the inner PVs that way — so the F0 binding compares to `pv(i)` with NO
+  factor. Applying D1's habit here would have made every honest trace UNSAT.
+- (D3 addition) Appending to the outer public values is not free: the 棒 3-3
+  Σfee rider reads the opvs TAIL, and `m4interior`'s const-assert only glues
+  `EPOCH_FEE_LIMBS` to the M3 PV layout — it cannot see the tail. An append
+  would have moved the rider's summands onto other data with every test green.
+  There is now a value-level assertion on the tail.
