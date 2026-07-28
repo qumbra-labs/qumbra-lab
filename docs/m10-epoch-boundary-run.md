@@ -49,16 +49,20 @@ Two things made it worth doing on localhost rather than waiting for the WAN run 
 
 ### Finality holds, then jumps — bounded, not runaway
 
-`stall` (= tip − final) distribution across the run (node0's reading at each sample; corrected 2026-07-28 — the original table undercounted the two middle rows by 4 each and summed to 256, not 264):
+`stall` (= tip − final) distribution across the run — **node0's reading at each of the run's 277 samples**:
 
 | stall | samples |
 |---|---|
-| 1–8 | 146 |
-| 9–16 | 80 |
-| 17–24 | 34 |
+| 1–8 | 155 |
+| 9–16 | 83 |
+| 17–24 | 35 |
 | 26–33 | 4 |
 
-Maximum observed **33**. The shape is oscillation, not drift: stall climbs into the teens or twenties, one finality advance lands, and it drops back to single digits. `regime` was `Final` on **226 of 264** samples; the 38 `Degraded` readings are all `stall > 16`, which is `DEGRADED_MODE_LAG_BLOCKS = 2 × cadence`, **while `final` continued to advance**.
+> **Corrected twice, 2026-07-28 — and the second correction is the instructive one.** The original table read 146/76/30/4 (sum 256) and was simply wrong: no node, no prefix and no four-node total produces it. The first fix read 146/80/34/4 (sum 264) — internally consistent, and consistent with the "38 `Degraded`" figure it cited as corroboration, because **both were counted over the run's first 264 samples rather than all 277**. A recount over the whole committed `m10-epoch-boundary-soak.log` gives the table above; 264 is the *only* prefix length that reproduces the intermediate values, which is what identified the scope error. `stall` never reads 0 or 25, so the buckets lose nothing.
+>
+> The general lesson, the same one that nearly charged D3 with B″'s +51 KB: **a number carries its counting basis, and the basis does not grow when the data does.** State the basis next to the number — that is why this table now says "277 samples" in its own caption.
+
+Maximum observed **33**. The shape is oscillation, not drift: stall climbs into the teens or twenties, one finality advance lands, and it drops back to single digits. `regime` was `Final` on **238 of 277** samples, and the **39** `Degraded` readings are **exactly** the samples with `stall > 16` — `DEGRADED_MODE_LAG_BLOCKS = 2 × cadence`. Checked both directions across all 277: **zero samples disagree**, so on this run the reported regime is not merely consistent with the threshold, it is a faithful function of it. And `final` kept advancing throughout.
 
 **This matters beyond this run.** T-ops reported the same hold-then-jump pattern on the WAN net and asked whether it was a WAN effect. It is not: it appears here, on localhost, with sub-millisecond RTT. The mechanism is in the protocol, not the network — several checkpoint slots accumulate votes concurrently (`try_checkpoint` proposes every pending grid height in one pass), whichever crosses quorum first finalizes, and lower slots then die by `NotAdvancing`. Nothing is lost, because `set_finalized` requires the new head to descend from the old one: **the finalized head is a high-water mark, so finalizing 1120 finalizes everything below it.** WAN widens the race; it does not create it.
 
