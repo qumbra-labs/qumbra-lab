@@ -23,8 +23,9 @@ None of that was recoverable from anywhere but a chat transcript. Now each revis
 |---|---|---|
 | `t05-builder-prompt.md` | M10-T0-5 cross-node vote aggregation (#70) | merged, PR #72 |
 | `i24-builder-prompt.md` | #24 merge-binding | **withdrawn** — its task-book was written from a stale issue body; path 1 had shipped four days earlier |
-| `d3-builder-prompt.md` | #24 D3 leaf F0 digest binding | in flight |
-| `halt-height-builder-prompt.md` | #74 halt-height mechanism | in flight, PR #76 |
-| `i77-builder-prompt.md` | #77 header↔body binding | ready to dispatch |
-| `m11-discovery-builder-prompt.md` | [#83](https://github.com/lai3d/qumbra-lab/issues/83) M11 peer discovery | ready to dispatch — the first M11 baton |
+| `d3-builder-prompt.md` | #24 D3 leaf F0 digest binding | **merged, PR #82** — closed the last item of #24 |
+| `halt-height-builder-prompt.md` | #74 halt-height mechanism | **merged, PR #76** |
+| `i77-builder-prompt.md` | #77 header↔body binding | **merged, PR #79** |
+| `m11-discovery-builder-prompt.md` | [#83](https://github.com/lai3d/qumbra-lab/issues/83) M11 peer discovery | **merged, PR #86** — the first M11 baton |
+| `i87-builder-prompt.md` | [#87](https://github.com/lai3d/qumbra-lab/issues/87) committee round diagnostics + structured metrics | **ready to dispatch** — the long pole: it gates the `DEGRADED_MODE_LAG_BLOCKS` question *and* rides the single redeploy that unblocks the four B-WAN drills |
 | `halt-height-taskbook-DRAFT.md` | #74 | **superseded** by the issue #74 task-book. Kept deliberately: its §1 H3 is the version the coordinator later **rejected as contradicting `committee-and-governance` §4**, and a draft that was overruled is worth more on the record than one quietly deleted |
