@@ -398,6 +398,18 @@ pub struct SlotContext {
     pub need: usize,
 }
 
+/// What one ingested vote-set message added to a round.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NewVotes {
+    /// Signers that were not already counted for this round. Exact under either
+    /// clock.
+    pub newly: usize,
+    /// Arrival offsets (ms from round open) for those signers — one entry each.
+    /// Empty under [`ObsClock::Deterministic`], which records counts but never
+    /// invents timings.
+    pub arrivals: Vec<u64>,
+}
+
 /// The per-slot ledger. Opens a record on the first thing learned about a slot,
 /// accumulates, and emits the record when the slot closes.
 ///
@@ -517,12 +529,16 @@ impl RoundLedger {
     ///
     /// * `counted` — the **full accumulated** distinct counting signers after this
     ///   message (the same set handed to `try_finalize`), not just this message's.
+    ///   Merged into the round, never replacing it, so a message that added nothing
+    ///   (a duplicate, or one the tally window refused) can be recorded truthfully
+    ///   with an empty `counted` without erasing what is already known.
     /// * `excluded` — in-roster signers in this message excluded as inactive.
     /// * `variants` — distinct checkpoint variants now tracked at this height.
     ///
-    /// Returns the arrival offsets (ms from round open) of the signers that were
-    /// **new in this message**, so a caller can feed a real histogram at the source
-    /// rather than sampling a gauge later. Empty when the clock is deterministic.
+    /// Returns how many signers were **new** and their arrival offsets (ms from
+    /// round open), so a caller can feed a real histogram at the source rather than
+    /// sampling a gauge later. `arrivals` is empty when the clock is deterministic;
+    /// `newly` is exact either way.
     pub fn note_votes(
         &mut self,
         ctx: &SlotContext,
@@ -530,7 +546,7 @@ impl RoundLedger {
         excluded: &[usize],
         rejects: VoteRejects,
         variants: usize,
-    ) -> Vec<u64> {
+    ) -> NewVotes {
         self.ensure_open(ctx);
         let now = self.now();
         let rec = self.open.get_mut(&ctx.height).expect("just opened");
@@ -538,10 +554,11 @@ impl RoundLedger {
         rec.rejects.add(rejects);
         rec.variants = rec.variants.max(variants);
 
-        let before: BTreeSet<usize> = rec.voted.iter().copied().collect();
-        let after: BTreeSet<usize> = counted.iter().copied().collect();
-        let newly = after.len().saturating_sub(before.len());
-        rec.voted = after.iter().copied().collect();
+        let mut merged: BTreeSet<usize> = rec.voted.iter().copied().collect();
+        let before = merged.len();
+        merged.extend(counted.iter().copied());
+        let newly = merged.len() - before;
+        rec.voted = merged.into_iter().collect();
 
         let mut ex: BTreeSet<usize> = rec.excluded.iter().copied().collect();
         ex.extend(excluded.iter().copied());
@@ -557,10 +574,11 @@ impl RoundLedger {
         if rec.quorum_ms.is_none() && rec.voted.len() >= rec.need {
             rec.quorum_ms = offset;
         }
-        match offset {
+        let arrivals = match offset {
             Some(o) if newly > 0 => vec![o; newly],
             _ => Vec::new(),
-        }
+        };
+        NewVotes { newly, arrivals }
     }
 
     /// Close `height` as finalized, and close every **lower** open round as
@@ -692,8 +710,9 @@ mod tests {
         let mut l = RoundLedger::new(ObsClock::Deterministic);
         let c = ctx(8, 21, 21, 15);
         l.note_slot_reached(&c);
-        let offs = l.note_votes(&c, &[0, 1, 2, 3, 4, 5], &[], VoteRejects::default(), 1);
-        assert!(offs.is_empty(), "no clock ⇒ no arrival offsets");
+        let added = l.note_votes(&c, &[0, 1, 2, 3, 4, 5], &[], VoteRejects::default(), 1);
+        assert_eq!(added.newly, 6, "the count is exact under either clock");
+        assert!(added.arrivals.is_empty(), "no clock ⇒ no arrival offsets");
         l.note_finalized(16);
         let r = &l.take_emitted()[0];
         assert_eq!(r.have(), 6);
