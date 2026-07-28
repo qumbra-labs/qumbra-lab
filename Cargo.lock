@@ -1135,6 +1135,7 @@ dependencies = [
  "qlab-p2p",
  "qlab-pow",
  "serde",
+ "tiny_http",
  "toml",
 ]
 

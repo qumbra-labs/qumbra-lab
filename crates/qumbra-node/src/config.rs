@@ -86,6 +86,22 @@ pub struct NodeConfig {
     /// (item 2 negative: "wrong-genesis-hash node refuses to start").
     #[serde(default)]
     pub expected_genesis_hash: Option<String>,
+    /// OPTIONAL — bind address for the `/metrics` scrape endpoint (issue #87).
+    ///
+    /// **Unset = no listener at all**, which is the default and the right one for
+    /// any node that is not being scraped: an endpoint that exists only where
+    /// somebody asked for it is an endpoint that cannot be forgotten open.
+    /// `127.0.0.1:9090` keeps it host-local; `0.0.0.0:9090` exposes it to whatever
+    /// the host firewall admits, and on the T0 hosts that means pairing it with a
+    /// **source-restricted** inbound security-group rule (standalone
+    /// `aws_security_group_rule` resources only — the inline-rule incident of
+    /// 2026-07-26 is why).
+    ///
+    /// Deployment ordering caveat: `deny_unknown_fields` is deliberate here, so a
+    /// config carrying this key will be REFUSED by a binary built before this
+    /// change. Ship the binary first, then the config — never the other way round.
+    #[serde(default)]
+    pub metrics_addr: Option<String>,
 }
 
 /// Why a config failed to load.

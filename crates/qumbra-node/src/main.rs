@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use qlab_devnet::pow::RandomXPow;
+use qlab_node::round::ObsClock;
 use qlab_p2p::adapter::MiningClock;
 
 use qumbra_node::config::NodeConfig;
@@ -131,6 +132,29 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // deterministic 75 s counter the in-process sims/tests use), so LWMA sees real
     // variable solvetimes over the soak.
     node.set_mining_clock(MiningClock::WallClock);
+
+    // Issue #87: the same seam for round diagnostics. "Were votes still arriving
+    // when this round was cut off?" is a wall-clock question — chain time cannot
+    // express it — so the binary opts in here, exactly as it does for the mining
+    // clock, and the in-process sims keep their deterministic default.
+    node.set_obs_clock(ObsClock::WallClock);
+
+    // Issue #87 decision 1 — PULL. The scrape endpoint exists only where the
+    // operator asked for it: no `metrics_addr`, no listener. Failure to bind is
+    // fatal, because a node that believes it is observable and is not is the exact
+    // failure this instrumentation exists to remove.
+    if let Some(addr) = config.metrics_addr.as_deref() {
+        let bound = node.start_metrics_endpoint(addr)?;
+        println!("  metrics:      http://{bound}/metrics (Prometheus scrape target)");
+        if !bound.ip().is_loopback() {
+            println!(
+                "  ⚠️  metrics is bound to a non-loopback address — it must be paired with a \
+                 SOURCE-RESTRICTED inbound rule to the collector, not an open one."
+            );
+        }
+    } else {
+        println!("  metrics:      not served (set metrics_addr in the config to enable)");
+    }
 
     // Telemetry sampling cadence — OBSERVABILITY ONLY. This changes how often a
     // TELEMETRY line is printed and nothing else: not consensus, not the halt
