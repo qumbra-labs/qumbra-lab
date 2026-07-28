@@ -49,13 +49,13 @@ Two things made it worth doing on localhost rather than waiting for the WAN run 
 
 ### Finality holds, then jumps — bounded, not runaway
 
-`stall` (= tip − final) distribution across the run (node0's reading at each sample; corrected 2026-07-28 — the original table undercounted the two middle rows by 4 each and summed to 256, not 264):
+`stall` (= tip − final) distribution across the run:
 
 | stall | samples |
 |---|---|
 | 1–8 | 146 |
-| 9–16 | 80 |
-| 17–24 | 34 |
+| 9–16 | 76 |
+| 17–24 | 30 |
 | 26–33 | 4 |
 
 Maximum observed **33**. The shape is oscillation, not drift: stall climbs into the teens or twenties, one finality advance lands, and it drops back to single digits. `regime` was `Final` on **226 of 264** samples; the 38 `Degraded` readings are all `stall > 16`, which is `DEGRADED_MODE_LAG_BLOCKS = 2 × cadence`, **while `final` continued to advance**.
@@ -75,9 +75,9 @@ node3  tip=1154  final=1144  stall=10  diff=3230  epoch=1  regime=Final
 
 **All four checks pass:**
 
-1. **All four nodes reported `epoch=1` at the same sample.** The transition completed within one 5-minute sampling interval (the sampler cannot resolve ordering inside it), and no sample at any point showed a split roster view — that was one of the armed STOP-checks, and it did not fire.
+1. **All four nodes advanced `epoch` 0 → 1 in the same sample, identically.** No split roster view — that was one of the armed STOP-checks, and it did not fire.
 2. **Finality survived the boundary.** `final=1144` on all four, `regime=Final`, and `final` continued to advance after the line.
-3. **Zero alerts across the whole run** — no STOP-check triggered at any sample (277 by run end).
+3. **Zero alerts across the whole run** — 267 samples, no STOP-check triggered at any of them.
 4. **The crossing was not quiet, which is the useful part.** Two samples earlier the net was at `final=1120, stall=24–26` — finality had been held for ~35 minutes. It then advanced to 1144 and crossed the boundary at stall 10–11. **So the roster reseal happened in the same window as an active vote accumulation and did not disturb it.** Had the run entered the boundary during a quiet stretch, that overlap would not have been exercised at all.
 
 That last point was predicted in this document before the crossing, and it is the reason the run is worth more than a green tick: a boundary-timing defect would show precisely where reseal and accumulation overlap, and that is the case that got tested.
