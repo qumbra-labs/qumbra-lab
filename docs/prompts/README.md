@@ -28,4 +28,5 @@ None of that was recoverable from anywhere but a chat transcript. Now each revis
 | `i77-builder-prompt.md` | #77 header↔body binding | **merged, PR #79** |
 | `m11-discovery-builder-prompt.md` | [#83](https://github.com/lai3d/qumbra-lab/issues/83) M11 peer discovery | **merged, PR #86** — the first M11 baton |
 | `i87-builder-prompt.md` | [#87](https://github.com/lai3d/qumbra-lab/issues/87) committee round diagnostics + structured metrics | **ready to dispatch** — the long pole: it gates the `DEGRADED_MODE_LAG_BLOCKS` question *and* rides the single redeploy that unblocks the four B-WAN drills |
+| `i91-builder-prompt.md` | [#91](https://github.com/lai3d/qumbra-lab/issues/91) M11 peer hardening | **ready to dispatch** — independent of #87 in content, but competes with it for the rig; ships in the same redeploy |
 | `halt-height-taskbook-DRAFT.md` | #74 | **superseded** by the issue #74 task-book. Kept deliberately: its §1 H3 is the version the coordinator later **rejected as contradicting `committee-and-governance` §4**, and a draft that was overruled is worth more on the record than one quietly deleted |
