@@ -136,9 +136,15 @@ impl PeerInfo {
 
 /// The set of peers this node knows, with handshake state and scores.
 #[derive(Clone, Debug, Default)]
+/// The peer table tracks **connections**. The address **book** is
+/// [`crate::addrman::AddrManager`] — deliberately not here (issue #83): a table
+/// of live connections cannot distinguish "connected to us" from "we can dial
+/// it", and only the latter may be gossiped (S2). The old `addr_book`/
+/// `remember_addr` pair, which recorded every peer that completed a handshake,
+/// was removed rather than left in place: a second book that admits
+/// merely-connected addresses is exactly the thing S2 forbids serving.
 pub struct PeerTable {
     peers: HashMap<PeerId, PeerInfo>,
-    addr_book: Vec<String>,
 }
 
 impl PeerTable {
@@ -187,9 +193,6 @@ impl PeerTable {
             if p.state == PeerState::Connected {
                 p.state = PeerState::VersionSent;
             }
-        }
-        if let Some(a) = self.peers.get(&id).and_then(|p| p.addr.clone()) {
-            self.remember_addr(a);
         }
     }
 
@@ -248,15 +251,11 @@ impl PeerTable {
         }
     }
 
-    fn remember_addr(&mut self, addr: String) {
-        if !self.addr_book.contains(&addr) {
-            self.addr_book.push(addr);
-        }
-    }
-
-    /// The known address book (for `Addr` responses / bootstrapping).
-    pub fn addr_book(&self) -> &[String] {
-        &self.addr_book
+    /// Every peer handle currently in the table, ready or not.
+    pub fn all_peers(&self) -> Vec<PeerId> {
+        let mut v: Vec<PeerId> = self.peers.keys().copied().collect();
+        v.sort();
+        v
     }
 }
 

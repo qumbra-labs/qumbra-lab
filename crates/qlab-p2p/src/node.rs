@@ -23,6 +23,7 @@ use crate::compact::{
     encode_get_block_txn, reconstruct, short_id, BlockAnnounce, BlockTxn, GetBlockTxn, PrefilledTx,
     Reconstruct,
 };
+use crate::addrman::AddrManager;
 use crate::gossip::{
     SeenCache, PENALTY_INVALID_OBJECT, PENALTY_MALFORMED, PENALTY_WELSHED_INV,
 };
@@ -55,6 +56,9 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// `GetData(Checkpoint)` can be re-served (checkpoints, unlike headers/txs,
     /// are not reconstructable from other state).
     checkpoints: HashMap<Hash32, (Checkpoint, Vec<Vote>)>,
+    /// Peer discovery: the address book + dial policy (issue #83). Seeds are fed
+    /// in by the operator; learned addresses arrive over `Addr`.
+    addrs: AddrManager,
 }
 
 impl<T: Transport, N: NodeState> P2pNode<T, N> {
@@ -72,6 +76,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             blocks: HashMap::new(),
             pending_blocks: HashMap::new(),
             checkpoints: HashMap::new(),
+            addrs: AddrManager::new(),
         }
     }
 
@@ -90,6 +95,74 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     }
     pub fn sync_phase(&self) -> &SyncPhase {
         &self.sync.phase
+    }
+    /// The address book / dial policy (issue #83).
+    pub fn addrs(&self) -> &AddrManager {
+        &self.addrs
+    }
+    pub fn addrs_mut(&mut self) -> &mut AddrManager {
+        &mut self.addrs
+    }
+
+    // --- peer discovery (issue #83) ---
+
+    /// One discovery maintenance pass, driven by the caller's monotonic clock in
+    /// milliseconds (the binary's run loop; tests pass explicit values). It:
+    ///
+    /// 1. reconciles the book against the transport's live handles,
+    /// 2. **auto-connects** to the addresses the policy picks — seeds first, each
+    ///    inside its backoff, never above [`crate::addrman::MAX_OUTBOUND`],
+    /// 3. asks ready peers for addresses, rate-limited per peer.
+    ///
+    /// This is the *only* dial path in the stack: configured seeds and learned
+    /// addresses share one cap and one backoff ladder (see [`crate::addrman`]).
+    /// Returns how many dials succeeded.
+    pub fn maintain(&mut self, now_ms: u64) -> usize {
+        let live: HashSet<PeerId> = self.transport.peers().into_iter().collect();
+        self.addrs.sync_live(&live);
+        for pid in self.peers.all_peers() {
+            if !live.contains(&pid) {
+                self.addrs.on_disconnect(pid);
+            }
+        }
+
+        let mut connected = 0;
+        for addr in self.addrs.next_dials(now_ms) {
+            match self.transport.dial(&addr) {
+                Ok(pid) => {
+                    self.addrs.on_dial_success(&addr, pid);
+                    self.add_peer(pid, Some(addr));
+                    connected += 1;
+                }
+                Err(_) => self.addrs.on_dial_failure(&addr, now_ms),
+            }
+        }
+
+        for pid in self.peers.ready_peers() {
+            if self.addrs.may_ask(pid, now_ms) {
+                self.send(pid, MsgType::GetAddr, Vec::new());
+                self.addrs.mark_asked(pid, now_ms);
+            }
+        }
+        connected
+    }
+
+    /// Admit addresses learned from a peer (scope 1). A peer's claim about a third
+    /// party is a **candidate only** (S6): it is never a scoring input in either
+    /// direction, so no peer can use it to get another peer penalised. This is the
+    /// same rule [`crate::n1::IngestOutcome::is_peer_fault`] encodes for objects —
+    /// a well-formed thing we cannot use is not a misbehaving peer (#70 S5).
+    fn on_addr(&mut self, from: PeerId, payload: &[u8]) {
+        match crate::peer::decode_addrs(payload) {
+            Ok(addrs) => {
+                self.addrs.learn(addrs);
+            }
+            // A frame we cannot decode is this peer's own malformed message —
+            // that IS a scoring event, and it is about the sender, not a third party.
+            Err(_) => {
+                self.peers.penalize(from, PENALTY_MALFORMED);
+            }
+        }
     }
 
     // --- outbound framing helpers ---
@@ -249,10 +322,15 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             MsgType::Ping => self.send(from, MsgType::Pong, env.payload),
             MsgType::Pong => {}
             MsgType::GetAddr => {
-                let addrs: Vec<String> = self.peers.addr_book().to_vec();
+                // S2: only **dialable** addresses are served — ones we have
+                // ourselves connected to, plus our own iff the operator declared
+                // us reachable. Handing out merely-connected peers would fill a
+                // joiner's book with entries nobody can reach, which is worse than
+                // no discovery because it looks like it is working.
+                let addrs = self.addrs.gossipable();
                 self.send(from, MsgType::Addr, crate::peer::encode_addrs(&addrs));
             }
-            MsgType::Addr => { /* prototype: no auto-connect */ }
+            MsgType::Addr => self.on_addr(from, &env.payload),
             MsgType::Inv => self.on_inv(from, &env.payload),
             MsgType::GetData => self.on_getdata(from, &env.payload),
             MsgType::NotFound => {
@@ -1486,5 +1564,217 @@ mod tests {
         for n in &nodes {
             assert_eq!(n.node().finality().finalized_height(), Some(8));
         }
+    }
+
+    // ================= peer discovery (issue #83) =================
+
+    fn addr_of(i: u64) -> String {
+        format!("n{i}:9333")
+    }
+
+    /// A discovery net: `n` nodes, each **bound** at `n{i}:9333` and declaring that
+    /// address reachable, but with NO links and NO peers — everything about who
+    /// reaches whom comes from seeds and gossip, as on a real net.
+    fn disc_net(n: u64) -> (Vec<InProcP2p>, Arc<InProcHub>) {
+        let hub = InProcHub::new();
+        let mut nodes = Vec::new();
+        for i in 0..n {
+            let t = InProcTransport::new(PeerId(i + 1), Arc::clone(&hub));
+            hub.bind_addr(&addr_of(i), PeerId(i + 1));
+            let mut node = P2pNode::new(t, stub(), [i as u8 + 1; 32]);
+            node.addrs_mut().set_self_advertise(Some(addr_of(i)));
+            nodes.push(node);
+        }
+        (nodes, hub)
+    }
+
+    /// Alternate maintenance passes with message pumping, stepping the logical
+    /// clock past the per-peer `GetAddr` rate limit each round.
+    fn run_discovery(nodes: &mut [InProcP2p], rounds: usize) {
+        let mut now = 0u64;
+        for _ in 0..rounds {
+            for n in nodes.iter_mut() {
+                n.maintain(now);
+            }
+            run(nodes);
+            now += crate::addrman::GETADDR_INTERVAL_MS;
+        }
+    }
+
+    #[test]
+    fn seed_only_node_learns_the_mesh_and_connects() {
+        // Acceptance item 1. Nodes 1..3 are seeded with each other; node 0 knows
+        // ONE address and must discover the rest.
+        let (mut nodes, _hub) = disc_net(4);
+        for i in 1..4u64 {
+            for j in 1..4u64 {
+                if i != j {
+                    nodes[i as usize].addrs_mut().add_seed(addr_of(j));
+                }
+            }
+        }
+        nodes[0].addrs_mut().add_seed(addr_of(1));
+        assert_eq!(nodes[0].addrs().known_count(), 1, "one seed, nothing else");
+
+        run_discovery(&mut nodes, 4);
+
+        let known = nodes[0].addrs().known();
+        assert!(known.contains(&addr_of(2)), "learned n2 from the seed's book: {known:?}");
+        assert!(known.contains(&addr_of(3)), "learned n3 from the seed's book: {known:?}");
+        assert_eq!(nodes[0].addrs().dialable_count(), 3, "and dialed all three");
+        for j in 1..4u64 {
+            assert!(
+                nodes[0].peers().is_ready(PeerId(j + 1)),
+                "handshake completed with n{j}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_node_that_is_not_dialable_is_never_gossiped() {
+        // Acceptance item 2, both directions. Node 0 is outbound-only: it is not
+        // bound to any address and declares none (a home node behind a router).
+        let hub = InProcHub::new();
+        let t0 = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let mut n0 = P2pNode::new(t0, stub(), [1; 32]);
+        let t1 = InProcTransport::new(PeerId(2), Arc::clone(&hub));
+        hub.bind_addr(&addr_of(1), PeerId(2));
+        let mut n1 = P2pNode::new(t1, stub(), [2; 32]);
+        n1.addrs_mut().set_self_advertise(Some(addr_of(1)));
+        // n1 also hears about an address that never answers.
+        n1.addrs_mut().learn(vec!["unreachable:9333".to_string()]);
+
+        n0.addrs_mut().add_seed(addr_of(1));
+        let mut nodes = vec![n0, n1];
+        run_discovery(&mut nodes, 3);
+
+        // Direction 1 — it IS connected, and both sides know it.
+        assert!(nodes[0].peers().is_ready(PeerId(2)), "the outbound-only node is connected");
+        assert!(
+            nodes[1].peers().all_peers().contains(&PeerId(1)),
+            "the serving side has it as a live peer"
+        );
+        // Direction 2 — and it appears in nothing we serve.
+        let served = nodes[1].addrs().gossipable();
+        assert_eq!(served, vec![addr_of(1)], "only n1's own declared address: {served:?}");
+        assert!(
+            nodes[1].addrs().known().contains(&"unreachable:9333".to_string()),
+            "a never-reached candidate stays known…"
+        );
+        assert!(
+            !served.contains(&"unreachable:9333".to_string()),
+            "…but is never handed out (S2)"
+        );
+        // The outbound-only node learned nothing unreachable from the exchange.
+        assert_eq!(nodes[0].addrs().known(), vec![addr_of(1)]);
+    }
+
+    #[test]
+    fn auto_connect_stops_at_the_outbound_cap() {
+        // Scope 5+6: the cap ships WITH auto-connect. Five reachable seeds, cap 2.
+        let (mut nodes, _hub) = disc_net(6);
+        nodes[0].addrs_mut().set_max_outbound(2);
+        for j in 1..6u64 {
+            nodes[0].addrs_mut().add_seed(addr_of(j));
+        }
+        run_discovery(&mut nodes, 3);
+        assert_eq!(nodes[0].addrs().outbound_live(), 2, "never above the cap");
+        assert_eq!(nodes[0].addrs().dialable_count(), 2, "and only what it dialed");
+    }
+
+    /// A bare transport that is not a node — lets a test observe the exact frames
+    /// a node emits.
+    fn sniffer(hub: &Arc<InProcHub>, id: PeerId, addr: &str) -> InProcTransport {
+        let t = InProcTransport::new(id, Arc::clone(hub));
+        hub.bind_addr(addr, id);
+        t
+    }
+
+    fn count_msgs(frames: &[(PeerId, Vec<u8>)], want: MsgType) -> usize {
+        frames
+            .iter()
+            .filter(|(_, f)| Envelope::decode(f).map(|e| e.msg_type == want).unwrap_or(false))
+            .count()
+    }
+
+    #[test]
+    fn getaddr_is_asked_once_per_peer_per_interval() {
+        // Scope 2: the book grows without a flood.
+        let hub = InProcHub::new();
+        let t0 = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let mut n0 = P2pNode::new(t0, stub(), [1; 32]);
+        let sniff = sniffer(&hub, PeerId(2), "sniff:9333");
+        n0.addrs_mut().add_seed("sniff:9333".to_string());
+
+        // Dial + handshake: the sniffer answers the Version so n0's peer goes Ready.
+        n0.maintain(0);
+        let v = VersionMsg { node_id: [2; 32], services: 1, tip_height: 0, user_agent: "s".into() };
+        sniff.send(PeerId(1), &Envelope::new(MsgType::Version, v.encode()).encode()).unwrap();
+        sniff.send(PeerId(1), &Envelope::new(MsgType::VerAck, vec![]).encode()).unwrap();
+        n0.tick();
+        let _ = sniff.poll();
+
+        n0.maintain(1);
+        n0.maintain(2);
+        n0.maintain(crate::addrman::GETADDR_INTERVAL_MS - 1);
+        assert_eq!(
+            count_msgs(&sniff.poll(), MsgType::GetAddr),
+            1,
+            "three passes inside the interval ask once"
+        );
+        // The first ask was recorded at t=1 (the pass at t=0 preceded the
+        // handshake), so the interval elapses at INTERVAL+1.
+        n0.maintain(crate::addrman::GETADDR_INTERVAL_MS + 1);
+        assert_eq!(count_msgs(&sniff.poll(), MsgType::GetAddr), 1, "and again after it elapses");
+    }
+
+    #[test]
+    fn a_malformed_addr_frame_is_scored_but_a_bogus_address_is_not() {
+        // S6: a peer's claim about a third party is a candidate at best. If a bad
+        // *address* were a scoring event, any peer could get another penalised.
+        let hub = InProcHub::new();
+        let t0 = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let mut n0 = P2pNode::new(t0, stub(), [1; 32]);
+        let sniff = sniffer(&hub, PeerId(2), "sniff:9333");
+        hub.link(PeerId(2), PeerId(1));
+
+        // Well-formed frame carrying unusable addresses → no penalty, nothing learned.
+        let payload = crate::peer::encode_addrs(&[
+            "not-an-address".to_string(),
+            "host:0".to_string(),
+            "good:9333".to_string(),
+        ]);
+        sniff.send(PeerId(1), &Envelope::new(MsgType::Addr, payload).encode()).unwrap();
+        n0.tick();
+        assert_eq!(n0.peers().get(PeerId(2)).unwrap().score, 0, "no score for a third party");
+        assert_eq!(n0.addrs().known(), vec!["good:9333".to_string()], "only the usable one");
+
+        // A frame we cannot decode is the *sender's* own malformed message.
+        sniff.send(PeerId(1), &Envelope::new(MsgType::Addr, vec![9, 9, 9]).encode()).unwrap();
+        n0.tick();
+        assert_eq!(n0.peers().get(PeerId(2)).unwrap().score, -PENALTY_MALFORMED);
+    }
+
+    #[test]
+    fn a_dropped_peer_is_redialed_after_backoff() {
+        // The S9 property, now on the single dial path: a healed partition
+        // reconnects with no process restart.
+        let (mut nodes, hub) = disc_net(2);
+        nodes[0].addrs_mut().add_seed(addr_of(1));
+        run_discovery(&mut nodes, 2);
+        assert_eq!(nodes[0].addrs().outbound_live(), 1);
+
+        // Partition: the link is cut and the handle goes away.
+        hub.unlink(PeerId(1), PeerId(2));
+        nodes[0].addrs_mut().on_disconnect(PeerId(2));
+        assert_eq!(nodes[0].addrs().outbound_live(), 0);
+        assert!(
+            nodes[0].addrs().gossipable().contains(&addr_of(1)),
+            "a partition is not proof of unreachability"
+        );
+
+        // Heal: the next maintenance pass re-dials.
+        nodes[0].maintain(crate::addrman::DIAL_BACKOFF_MAX_MS * 2);
+        assert_eq!(nodes[0].addrs().outbound_live(), 1, "reconnected without a restart");
     }
 }

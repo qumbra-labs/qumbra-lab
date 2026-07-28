@@ -7,8 +7,14 @@
 //! data_dir = "./data"
 //! # the TCP address this node listens on
 //! listen_addr = "127.0.0.1:9333"
-//! # peers to dial on startup (may be empty for the bootstrap node)
+//! # SEED peers: dialed at startup and never evicted from the address book.
+//! # Discovery (issue #83) fills the rest of the book from Addr gossip.
 //! dial_peers = ["127.0.0.1:9334", "127.0.0.1:9335"]
+//! # OPTIONAL — this node's own publicly dialable address. Set it ONLY if
+//! # inbound connections really reach here; it is the only way peers are told
+//! # about us. Behind a router without a forwarded port, leave it unset: you
+//! # will sync, mine and transact but will not serve peers, and that is expected.
+//! # advertise_addr = "203.0.113.10:9333"
 //! # the versioned genesis file every node in the net shares
 //! genesis_file = "./genesis.qmb"
 //! # committee signing-key files THIS node holds (0..21 of the 21 T0 keys —
@@ -46,9 +52,24 @@ pub struct NodeConfig {
     pub data_dir: PathBuf,
     /// TCP address this node binds and listens on (`host:port`).
     pub listen_addr: String,
-    /// Peer addresses to dial on startup.
+    /// **Seed** peer addresses (issue #83 scope 4). Dialed at startup and kept as
+    /// the never-evicted recovery path when everything learned has gone stale:
+    /// once discovery is on, the address book also fills from `Addr` gossip, and
+    /// these are simply the entries that can never be dropped. The field name is
+    /// unchanged so every deployed config and `deploy/deploy.sh` keep working.
     #[serde(default)]
     pub dial_peers: Vec<String>,
+    /// This node's own **publicly dialable** address, if it has one (issue #83
+    /// scope 3). Set it only when inbound connections actually reach this node —
+    /// it is the sole basis on which peers are told about us, because a node
+    /// cannot discover its own public address without being told, and being told
+    /// is a wire change (S1).
+    ///
+    /// Leaving it unset is the **normal, expected** case for a participant behind
+    /// a router: that node syncs, mines and transacts, but is never gossiped and
+    /// serves no peers. T1 accepts this (Larry's NAT decision, 2026-07-26).
+    #[serde(default)]
+    pub advertise_addr: Option<String>,
     /// The shared, versioned genesis file (baked frozen constants + committee₀ +
     /// genesis block). Byte-verified on startup.
     pub genesis_file: PathBuf,

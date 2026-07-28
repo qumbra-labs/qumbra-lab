@@ -45,6 +45,18 @@ pub trait Transport {
     fn poll(&self) -> Vec<(PeerId, Vec<u8>)>;
     /// Peers currently reachable through this transport.
     fn peers(&self) -> Vec<PeerId>;
+
+    /// Open an **outbound** connection to `addr`, returning the local handle
+    /// (issue #83). This is the mechanism half of auto-connect — the policy
+    /// (whom to dial, how often, under which cap) is [`crate::addrman`].
+    ///
+    /// Both shipped transports implement it, so the discovery loop in
+    /// [`crate::node::P2pNode::maintain`] is the *same code* in deterministic
+    /// in-process tests and over real sockets. The default is a refusal, for any
+    /// future frame-mover that cannot originate connections.
+    fn dial(&self, addr: &str) -> Result<PeerId, TransportError> {
+        Err(TransportError::Io(format!("transport cannot dial {addr}")))
+    }
 }
 
 // ==========================================================================
@@ -58,6 +70,10 @@ pub trait Transport {
 pub struct InProcHub {
     inboxes: Mutex<HashMap<PeerId, Vec<(PeerId, Vec<u8>)>>>,
     links: Mutex<HashSet<(PeerId, PeerId)>>,
+    /// Address → node handle, for [`Transport::dial`] (issue #83). A node that
+    /// never calls [`InProcHub::bind_addr`] is **undialable** — the in-process
+    /// model of the outbound-only participant T1 accepts.
+    addrs: Mutex<HashMap<String, PeerId>>,
 }
 
 impl InProcHub {
@@ -68,6 +84,17 @@ impl InProcHub {
     /// Register a node's inbox.
     pub fn register(&self, id: PeerId) {
         self.inboxes.lock().unwrap().entry(id).or_default();
+    }
+
+    /// Declare `id` reachable at `addr` — the in-process equivalent of binding a
+    /// listener. Only bound nodes can be dialed.
+    pub fn bind_addr(&self, addr: &str, id: PeerId) {
+        self.addrs.lock().unwrap().insert(addr.to_string(), id);
+    }
+
+    /// Resolve a bound address, if any.
+    fn resolve(&self, addr: &str) -> Option<PeerId> {
+        self.addrs.lock().unwrap().get(addr).copied()
     }
 
     /// Connect `a` and `b` bidirectionally (both can send to each other).
@@ -140,6 +167,18 @@ impl Transport for InProcTransport {
     fn peers(&self) -> Vec<PeerId> {
         self.hub.neighbours(self.id)
     }
+    /// Dial = resolve the bound address and link both ways. An address nobody
+    /// bound is unreachable, exactly as a node behind a router is.
+    fn dial(&self, addr: &str) -> Result<PeerId, TransportError> {
+        match self.hub.resolve(addr) {
+            Some(target) if target != self.id => {
+                self.hub.link(self.id, target);
+                Ok(target)
+            }
+            Some(_) => Err(TransportError::Io("refusing to dial self".to_string())),
+            None => Err(TransportError::Io(format!("no route to {addr}"))),
+        }
+    }
 }
 
 // ==========================================================================
@@ -167,11 +206,23 @@ struct TcpShared {
     writers: Mutex<HashMap<PeerId, TcpStream>>,
     running: AtomicBool,
     next_id: AtomicU64,
+    /// Handles of connections we **accepted** (as opposed to dialed), so the
+    /// inbound cap counts the right half (issue #83, scope 6).
+    inbound: Mutex<HashSet<PeerId>>,
+    /// Maximum simultaneous inbound connections; over it, a connection is closed
+    /// at accept rather than absorbed.
+    inbound_cap: AtomicU64,
 }
 
 impl TcpShared {
     fn alloc_id(&self) -> PeerId {
         PeerId(self.next_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Live inbound connections (an entry is dropped when its reader thread exits).
+    fn inbound_live(&self) -> usize {
+        let writers = self.writers.lock().unwrap();
+        self.inbound.lock().unwrap().iter().filter(|id| writers.contains_key(id)).count()
     }
 }
 
@@ -195,6 +246,8 @@ impl TcpTransport {
             writers: Mutex::new(HashMap::new()),
             running: AtomicBool::new(true),
             next_id: AtomicU64::new(1),
+            inbound: Mutex::new(HashSet::new()),
+            inbound_cap: AtomicU64::new(crate::addrman::MAX_INBOUND as u64),
         });
         let mut threads = Vec::new();
 
@@ -206,7 +259,16 @@ impl TcpTransport {
                 while shared.running.load(Ordering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _peer_addr)) => {
-                            TcpTransport::register_stream(&shared, stream);
+                            // Inbound cap (scope 6): at the limit the connection is
+                            // CLOSED here — refused, not absorbed. No reader thread,
+                            // no writer entry, no peer-table row.
+                            let cap = shared.inbound_cap.load(Ordering::SeqCst) as usize;
+                            if shared.inbound_live() >= cap {
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                drop(stream);
+                                continue;
+                            }
+                            TcpTransport::register_stream(&shared, stream, true);
                         }
                         Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                             std::thread::sleep(std::time::Duration::from_millis(2));
@@ -229,12 +291,24 @@ impl TcpTransport {
     /// Dial a peer; returns the local handle for the new connection.
     pub fn connect(&self, addr: &str) -> io::Result<PeerId> {
         let stream = TcpStream::connect(addr)?;
-        Ok(TcpTransport::register_stream(&self.shared, stream))
+        Ok(TcpTransport::register_stream(&self.shared, stream, false))
+    }
+
+    /// Set the maximum simultaneous **inbound** connections (issue #83, scope 6).
+    /// Defaults to [`crate::addrman::MAX_INBOUND`]. Testnet-tunable, NOT frozen.
+    pub fn set_inbound_cap(&self, cap: usize) {
+        self.shared.inbound_cap.store(cap as u64, Ordering::SeqCst);
+    }
+
+    /// Live inbound connections (ops / tests).
+    pub fn inbound_count(&self) -> usize {
+        self.shared.inbound_live()
     }
 
     /// Register a connected stream: store its write half, spawn a reader thread,
-    /// and return the local peer handle.
-    fn register_stream(shared: &Arc<TcpShared>, stream: TcpStream) -> PeerId {
+    /// and return the local peer handle. `inbound` records which half of the
+    /// connection budget it consumes.
+    fn register_stream(shared: &Arc<TcpShared>, stream: TcpStream, inbound: bool) -> PeerId {
         let id = shared.alloc_id();
         // On macOS/BSD an accepted socket inherits the listener's non-blocking
         // flag; force blocking so the reader thread's `read_exact` waits for the
@@ -243,6 +317,9 @@ impl TcpTransport {
         let _ = stream.set_nodelay(true);
         let writer = stream.try_clone().expect("clone tcp stream for writing");
         shared.writers.lock().unwrap().insert(id, writer);
+        if inbound {
+            shared.inbound.lock().unwrap().insert(id);
+        }
 
         let reader_shared = Arc::clone(shared);
         let mut read_stream = stream;
@@ -258,8 +335,10 @@ impl TcpTransport {
                     Err(_) => break, // EOF, shutdown, or malformed frame
                 }
             }
-            // Connection gone: drop the write half so sends fail fast.
+            // Connection gone: drop the write half so sends fail fast, and free
+            // the inbound slot it held.
             reader_shared.writers.lock().unwrap().remove(&id);
+            reader_shared.inbound.lock().unwrap().remove(&id);
         });
         // The reader-thread handle is intentionally detached from `threads`: it
         // exits when the socket is shut down (see `shutdown`).
@@ -295,6 +374,9 @@ impl Transport for TcpTransport {
         let mut v: Vec<PeerId> = self.shared.writers.lock().unwrap().keys().copied().collect();
         v.sort();
         v
+    }
+    fn dial(&self, addr: &str) -> Result<PeerId, TransportError> {
+        self.connect(addr).map_err(|e| TransportError::Io(e.to_string()))
     }
 }
 
@@ -340,6 +422,63 @@ mod tests {
         hub.link(PeerId(1), PeerId(2));
         a.send(PeerId(2), &f).unwrap();
         assert_eq!(b.poll().len(), 1);
+    }
+
+    #[test]
+    fn inproc_dial_resolves_bound_addresses_only() {
+        let hub = InProcHub::new();
+        let a = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let _b = InProcTransport::new(PeerId(2), Arc::clone(&hub));
+        hub.bind_addr("b:9333", PeerId(2));
+
+        assert_eq!(a.dial("b:9333"), Ok(PeerId(2)));
+        assert!(a.send(PeerId(2), &Envelope::new(MsgType::Ping, vec![]).encode()).is_ok());
+        // An address nobody bound is unreachable — the outbound-only participant.
+        assert!(a.dial("nat:9333").is_err());
+        assert!(a.dial("a-self:9333").is_err(), "unbound self address is not dialable");
+    }
+
+    #[test]
+    fn tcp_inbound_cap_refuses_a_flood_rather_than_absorbing_it() {
+        // Acceptance item 3: over the cap the listener CLOSES the connection at
+        // accept — no reader thread, no writer entry, nothing to absorb.
+        let server = TcpTransport::bind("127.0.0.1:0").unwrap();
+        server.set_inbound_cap(2);
+        let addr = server.local_addr().to_string();
+
+        let mut accepted_streams = Vec::new();
+        for _ in 0..12 {
+            if let Ok(s) = TcpStream::connect(&addr) {
+                accepted_streams.push(s);
+            }
+        }
+        // Give the acceptor time to process the burst.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(server.inbound_count(), 2, "only the cap is held");
+        assert!(server.peers().len() <= 2, "refused sockets never become peers");
+
+        // A slot freed by a disconnect is reusable.
+        drop(accepted_streams);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let fresh = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let _ = fresh.dial(&addr).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(server.inbound_count() >= 1, "the cap is a live count, not a lifetime total");
+
+        server.shutdown();
+        fresh.shutdown();
+    }
+
+    #[test]
+    fn tcp_dial_counts_as_outbound_not_inbound() {
+        let server = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let client = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let _pid = client.dial(&server.local_addr().to_string()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(client.inbound_count(), 0, "the dialer's own connection is outbound");
+        assert_eq!(server.inbound_count(), 1);
+        server.shutdown();
+        client.shutdown();
     }
 
     #[test]

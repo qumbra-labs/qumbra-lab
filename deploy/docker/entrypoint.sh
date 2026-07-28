@@ -85,6 +85,9 @@ case "$cmd" in
 # generated in-container by entrypoint.sh for node$idx (do not hand-edit)
 data_dir = "$DATA_DIR"
 listen_addr = "0.0.0.0:$LISTEN_PORT"
+# Each container is reachable at its compose service name, so it declares
+# itself dialable (issue #83). A node with no advertise_addr is never gossiped.
+advertise_addr = "node$idx:$LISTEN_PORT"
 dial_peers = [$peers]
 genesis_file = "$GENESIS_FILE"
 committee_key_paths = [$keys]
