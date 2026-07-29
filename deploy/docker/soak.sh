@@ -119,10 +119,14 @@ halt_assert_halted() {
 }
 
 # The invariant the whole mechanism exists to protect: no two nodes may report
-# different finalized blocks at the same height. Telemetry carries heights, not
-# hashes, so this checks the strongest thing it can — that no node's finalized head
-# is ahead of a peer's on a branch the peer rejected — and points at the deeper
-# check when heights alone cannot settle it.
+# different finalized blocks at the same height.
+#
+# UNTIL 2026-07-29 this was checked by proxy, because telemetry carried heights and
+# no hashes — two nodes finalizing DIFFERENT checkpoints at the same height printed
+# identical lines. Issue #84 put the finalized checkpoint's identity on the line
+# (`fid`), so the condition is now expressible directly and this checks it directly.
+# The height-based guard below is kept: it catches a reorg past finality, which is a
+# different failure and still worth its own assertion.
 halt_assert_no_conflicting_finality() {
   local upgraded=(node0 node1 node2)
   local ref=""
@@ -135,6 +139,78 @@ halt_assert_no_conflicting_finality() {
    finality. STOP EVERYTHING and preserve state."
   done
   echo "   ✓ no upgraded node finalized below the boundary (no reorg past a finalized checkpoint)"
+
+  # THE CONDITION THIS FUNCTION IS NAMED AFTER. Same finalized height, different
+  # identity, on two nodes = two checkpoints finalized at one height. That is the
+  # most severe STOP-POINT this project has, and before #84 it was invisible.
+  local i j missing=0 checked=0
+  for (( i = 0; i < ${#upgraded[@]}; i++ )); do
+    local ni="${upgraded[$i]}" li fi_h fi_d
+    li="$(latest "$ni")"; fi_h="$(field "$li" final)"; fi_d="$(field "$li" fid)"
+    [[ -n "$fi_h" && "$fi_h" != "-" ]] || continue
+    if [[ -z "$fi_d" ]]; then missing=1; continue; fi
+    for (( j = i + 1; j < ${#upgraded[@]}; j++ )); do
+      local nj="${upgraded[$j]}" lj fj_h fj_d
+      lj="$(latest "$nj")"; fj_h="$(field "$lj" final)"; fj_d="$(field "$lj" fid)"
+      [[ -n "$fj_h" && "$fj_h" != "-" ]] || continue
+      if [[ -z "$fj_d" ]]; then missing=1; continue; fi
+      [[ "$fi_h" == "$fj_h" ]] || continue
+      checked=$(( checked + 1 ))
+      [[ "$fi_d" == "$fj_d" ]] || die "TWO DIFFERENT CHECKPOINTS FINALIZED AT HEIGHT $fi_h —
+   $ni fid=$fi_d vs $nj fid=$fj_d. This is the R2 STOP-POINT. STOP EVERYTHING,
+   preserve every container's logs and /opt/qumbra/data before touching anything."
+    done
+  done
+
+  # An image without #84 prints no `fid`. Say that the check did not run rather than
+  # printing a tick — a silent pass here is exactly the failure this whole comment
+  # block exists to describe, arriving from the other direction.
+  if (( missing == 1 )); then
+    echo "   (finding) at least one node prints no fid= — this image predates issue #84,"
+    echo "             so the same-height/different-identity check DID NOT RUN. Heights"
+    echo "             agreeing is not evidence that the checkpoints agree."
+  elif (( checked == 0 )); then
+    echo "   (finding) no two upgraded nodes shared a finalized height at this sample, so"
+    echo "             there was nothing to compare. Not a pass — re-sample."
+  else
+    echo "   ✓ every pair at a shared finalized height reports the same fid ($checked pair(s))"
+  fi
+}
+
+# What this node's OWN keys signed, which is a different question from what it
+# finalized — and the one that catches a split the finalized view cannot see.
+#
+# Observed live on 2026-07-29 at slot 3776: sixteen keys signed one variant and five
+# signed another, yet all four nodes finalized the SAME checkpoint, because the
+# minority finalizes the majority's. `fid` was identical everywhere; only `sid`
+# differed. So a divergence here is NOT a stop condition — it is the normal cost of
+# signing when the tip first touches a slot, and it is reported as a finding.
+halt_report_signed_divergence() {
+  local nodes=("$@") i j split=0 missing=0
+  for (( i = 0; i < ${#nodes[@]}; i++ )); do
+    local ni="${nodes[$i]}" li si_s si_d
+    li="$(latest "$ni")"; si_s="$(field "$li" sslot)"; si_d="$(field "$li" sid)"
+    if [[ -z "$si_s" || -z "$si_d" ]]; then missing=1; continue; fi
+    [[ "$si_d" != "-" ]] || continue
+    for (( j = i + 1; j < ${#nodes[@]}; j++ )); do
+      local nj="${nodes[$j]}" lj sj_s sj_d
+      lj="$(latest "$nj")"; sj_s="$(field "$lj" sslot)"; sj_d="$(field "$lj" sid)"
+      [[ -n "$sj_s" && -n "$sj_d" && "$sj_d" != "-" ]] || continue
+      [[ "$si_s" == "$sj_s" ]] || continue
+      if [[ "$si_d" != "$sj_d" ]]; then
+        split=1
+        echo "   (finding) signed-variant split at slot $si_s: $ni sid=$si_d vs $nj sid=$sj_d"
+      fi
+    done
+  done
+  if (( missing == 1 )); then
+    echo "   (finding) at least one node prints no sslot=/sid= — image predates issue #84;"
+    echo "             the signed-variant check did not run."
+  elif (( split == 0 )); then
+    echo "   ✓ no signed-variant split among the sampled nodes"
+  else
+    echo "             ^ not a stop condition. Record it; it is the per-key burn shape."
+  fi
 }
 
 # WHICH LAYER refused an old-binary block (issue #74). The two counters are on
@@ -518,19 +594,28 @@ case "$cmd" in
     # checkpoint, not produced one of its own. One checkpoint finalized, not two.
     #
     # The condition this check actually guards is "did a SECOND, DIFFERENT
-    # checkpoint finalize at some height" — and that is not expressible from
-    # telemetry today, because TELEMETRY carries no checkpoint identity (issue #84).
-    # A stop-check that cannot express the condition it guards will eventually fire
-    # on the condition it can express instead, which is precisely what happened.
+    # checkpoint finalize at some height". Until 2026-07-29 that was NOT expressible
+    # from telemetry, because TELEMETRY carried no checkpoint identity — and a
+    # stop-check that cannot express the condition it guards will eventually fire on
+    # the condition it can express instead, which is precisely what happened.
     #
-    # The sound proxy available today: the un-upgraded node's finality FREEZES while
+    # Issue #84 (lab PR #110) closed that: `fid` is the finalized checkpoint's
+    # identity, so `halt_assert_no_conflicting_finality` now compares identities at a
+    # shared height and dies on the real condition instead of a proxy for it. It
+    # says so explicitly when the running image is too old to carry the field, since
+    # a silent pass is the same defect arriving from the other direction.
+    #
+    # The freeze check below is KEPT, and is no longer a proxy for the above — it
+    # tests a different §4 expectation: the un-upgraded node's finality FREEZES while
     # the checkpointed branch keeps finalizing. It needs two samples spanning at
-    # least one finalization on the checkpointed branch — a single snapshot cannot
-    # express it, which is the deeper reason the original reached for a one-sample
-    # proxy. Driven by the condition rather than by a fixed sleep, so it also
-    # surfaces a stalled checkpointed branch as its own distinct finding.
+    # least one finalization on the checkpointed branch, driven by the condition
+    # rather than by a fixed sleep, so it also surfaces a stalled checkpointed
+    # branch as its own distinct finding.
     halt_assert_old_branch_finality_frozen
     halt_assert_no_conflicting_finality
+    # Non-fatal, and node3 is included on purpose: it is the un-upgraded miner, so a
+    # signed-variant split against it is expected here rather than alarming.
+    halt_report_signed_divergence node0 node1 node2 node3
     halt_report_layers
     halt_record "drill (a) — after the swap"
 
