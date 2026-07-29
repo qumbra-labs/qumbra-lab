@@ -22,6 +22,22 @@
 # full mesh (each node dials the other three by compose service name). The genesis
 # is generated once by the `init` service into a shared volume; every node byte-
 # verifies it and pins its hash (expected_genesis_hash) on startup.
+#
+# QUMBRA_ADVERTISE_ADDR selects whether this node declares itself dialable at all
+# (issue #107 step 1c). It exists because the harness and the four T0 hosts differed
+# here and the harness could not express the hosts' side:
+#
+#   auto   (default)  advertise_addr = "node<idx>:9401" — unchanged behaviour, what
+#                     every run before 2026-07-30 did.
+#   none              the key is OMITTED from the generated node.toml. This is the
+#                     configuration the four T0 hosts actually run: their
+#                     /opt/qumbra/node.toml predates the field (#86, 2026-07-28;
+#                     hosts provisioned 2026-07-26) and an image roll does not
+#                     regenerate it. Such a node dials out and is never gossiped.
+#
+# Anything else is a hard failure rather than a fallback: a typo here silently
+# inverts the experiment, and the whole point of the toggle is to be sure which
+# side of it a run was on.
 
 set -euo pipefail
 
@@ -86,6 +102,28 @@ case "$cmd" in
     done
     peers="${peers%, }"
 
+    # Advertised address: present (default) or deliberately absent — see the header.
+    # The `advertise_addr` line is assembled here rather than inside the heredoc so
+    # that "absent" means the key is genuinely not in the file, not commented-out-but-
+    # parsed or set to an empty string (both of which the node would read differently).
+    adv_mode="${QUMBRA_ADVERTISE_ADDR:-auto}"
+    case "$adv_mode" in
+      auto)
+        adv_line="advertise_addr = \"node$idx:$LISTEN_PORT\""
+        adv_note="advertise_addr = \"node$idx:$LISTEN_PORT\""
+        ;;
+      none)
+        adv_line="# advertise_addr: ABSENT ON PURPOSE (QUMBRA_ADVERTISE_ADDR=none, issue #107"
+        adv_line+=$'\n'"#   step 1c) — models /opt/qumbra/node.toml on the four T0 hosts, which has"
+        adv_line+=$'\n'"#   never carried this field. This node is never gossiped."
+        adv_note="ABSENT from node.toml (never gossiped)"
+        ;;
+      *)
+        echo "run: QUMBRA_ADVERTISE_ADDR must be 'auto' or 'none', got '$adv_mode'" >&2
+        exit 2
+        ;;
+    esac
+
     mkdir -p "$DATA_DIR"
     cfg=/tmp/node.toml
     cat > "$cfg" <<EOF
@@ -94,7 +132,7 @@ data_dir = "$DATA_DIR"
 listen_addr = "0.0.0.0:$LISTEN_PORT"
 # Each container is reachable at its compose service name, so it declares
 # itself dialable (issue #83). A node with no advertise_addr is never gossiped.
-advertise_addr = "node$idx:$LISTEN_PORT"
+$adv_line
 dial_peers = [$peers]
 genesis_file = "$GENESIS_FILE"
 committee_key_paths = [$keys]
@@ -102,7 +140,12 @@ mining = true
 expected_genesis_hash = "$ghash"
 telemetry_addr = "0.0.0.0:$TELEMETRY_PORT"
 EOF
-    echo "== node$idx config (binary: $BIN) =="
+    # A run whose configuration is not in its own output cannot be trusted
+    # afterwards, so stamp the advertise mode on one greppable line of its own
+    # BEFORE the config dump — `docker compose logs node$idx | grep ADVERTISE_MODE`
+    # answers "which side of the experiment was this node on" with no inference.
+    echo "ADVERTISE_MODE node$idx=$adv_mode ($adv_note)"
+    echo "== node$idx config (binary: $BIN, advertise=$adv_mode) =="
     cat "$cfg"
     # The halt-height release status of THIS binary, before anything else (#74).
     # `halt-status` exits non-zero if this release refuses to start — which is
