@@ -11,7 +11,12 @@ use qlab_devnet::fees::{posted_fee, ArityBucket};
 use qlab_devnet::header::{BlockHeader, Hash32};
 use qlab_devnet::params_devnet::GENESIS_DIFFICULTY;
 
-use qlab_node::{coinbase, genesis_block, MemNode, Mempool, MempoolError, NodeState};
+use qlab_node::{coinbase, genesis_block, CommitmentStore, MemNode, Mempool, MempoolError, NodeState};
+use qlab_note::hash::digest_from_bytes;
+
+/// The miner's payout key for these fixtures (issue #101) — a minting body must
+/// name a payee or the node rejects it.
+const MINER_RKM: [u64; 4] = [0xC0FFEE, 2, 3, 4];
 
 struct MockVerifier;
 impl qlab_devnet::body::TxVerifier for MockVerifier {
@@ -57,7 +62,7 @@ fn admitted_txs_assemble_into_a_block_the_node_accepts() {
     // so both small txs fit the free zone.
     let m = mp.effective_median(&[]);
     assert_eq!(m, 10_000_000);
-    let template = mp.assemble(&node, m);
+    let template = mp.assemble(&node, m, MINER_RKM);
 
     assert_eq!(template.height, 1);
     assert_eq!(template.txs.len(), 2);
@@ -70,13 +75,20 @@ fn admitted_txs_assemble_into_a_block_the_node_accepts() {
     let header = BlockHeader::child_of(&g_header, 1, GENESIS_DIFFICULTY, template.body.commitment());
     let hash = node.apply_block(header, template.body.clone(), &MockVerifier).expect("node accepts");
     assert_eq!(node.tip_hash(), hash);
-    assert_eq!(node.commitment_count(), 2, "both txs' output commitments landed");
+    assert_eq!(
+        node.commitment_count(),
+        3,
+        "both txs' output commitments landed, plus the block's coinbase-note leaf (issue #101)"
+    );
 
     // Reconcile the pool: the mined txs are evicted, the coinbase note recorded.
     mp.on_block_connected(1, &template.body, &node);
     assert!(mp.is_empty(), "mined txs leave the pool");
-    let cb = qlab_node::coinbase_note_commitment(1, coinbase(1));
+    let cb = template.coinbase_note.expect("a minting template mints a note");
     assert_eq!(mp.coinbase_note_height(&cb), Some(1));
+    // The registry and the commitment tree name the SAME object now: the leaf the
+    // node appended is the note commitment the maturity gate is keyed on.
+    assert!(node.commitments().tree().position_of(&digest_from_bytes(&cb)).is_some());
 }
 
 #[test]
@@ -100,7 +112,8 @@ fn mempool_rejects_a_tx_double_spending_an_already_applied_nullifier() {
 
     // Apply a block spending nullifier [7;32].
     let spent_tx = tx(g_root, 7);
-    let body = BlockBody { txs: vec![spent_tx], coinbase: coinbase(1) };
+    let body =
+        BlockBody { txs: vec![spent_tx], coinbase: coinbase(1), coinbase_rkm: MINER_RKM };
     let header = BlockHeader::child_of(&g_header, 1, GENESIS_DIFFICULTY, body.commitment());
     node.apply_block(header, body, &MockVerifier).unwrap();
     assert!(node.is_spent(&[7; 32]));

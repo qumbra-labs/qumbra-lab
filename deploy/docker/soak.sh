@@ -46,7 +46,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE="$SCRIPT_DIR/docker-compose.yml"
 NET_MAIN=qumbra_t0
 NET_SIDEB=qumbra_t0_sideb
-PINNED_GENESIS=4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3
+# The genesis identity MOVED in issue #101: the genesis file embeds the genesis
+# block, which gained `coinbase_rkm`. The T0 net on t0-wan-2 is still pinned to the
+# pre-#101 value 4a75b3b8…c2c3 and a
+# binary from this revision will refuse to start against it — deliberately, since
+# the block-body format changed and the two could not agree anyway.
+PINNED_GENESIS=8811d4e0ccdee702bafd4c92afad768495dc43360778072338aa140d87a73cff
 NODES=(node0 node1 node2 node3)
 # The halt height compiled into the drill binaries (release.rs DRILL_HALT_HEIGHT).
 # On the checkpoint-cadence grid (16 = 2 x 8), deliberately low so each drill is
@@ -343,7 +348,7 @@ case "$cmd" in
     echo "   pinned T0 genesis hash:    $PINNED_GENESIS"
     [[ "$got" == "$PINNED_GENESIS" ]] \
       || die "GENESIS HASH MISMATCH — in-container genesis is not the frozen T0 genesis. STOP."
-    echo "   ✓ in-container genesis == pinned T0 genesis (4a75b3b8…c2c3)"
+    echo "   ✓ in-container genesis == pinned T0 genesis (8811d4e0…3cff)"
     echo "   nodes up; watch blocks with: $0 sample 200"
     ;;
 

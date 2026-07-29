@@ -66,7 +66,8 @@ fn real_tx(ek: &Ek, k: usize, nf_seed: u8, anchor: Hash32, rng: &mut StdRng) -> 
 fn apply_block(node: &mut MemNode, txs: Vec<TxEntry>) {
     let tip = node.tip_hash();
     let parent = node.chain().block(&tip).expect("tip stored").header();
-    let body = BlockBody { txs, coinbase: parent.height + 1 };
+    let coinbase = parent.height + 1;
+    let body = BlockBody { txs, coinbase, coinbase_rkm: [coinbase, 2, 3, 4] };
     let header = BlockHeader::child_of(&parent, parent.height + 1, 1_000, body.commitment());
     node.apply_block(header, body, &AcceptAll).expect("block applies");
 }

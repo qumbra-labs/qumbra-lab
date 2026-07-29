@@ -131,6 +131,7 @@ pub fn run_m6devnet(power: &str) {
     let body = BlockBody {
         txs: (0..POOL).map(|i| entry_for(&pool, i)).collect(),
         coinbase: 0,
+        coinbase_rkm: [0; 4],
     };
     // Finalized anchors = every pooled proof's anchor (they are the roots the
     // txs prove against; in the sim these are treated as finalized).
@@ -244,7 +245,7 @@ mod tests {
             },
         };
         let anchor = h32(&inst.anchor);
-        let body = BlockBody { txs: vec![entry], coinbase: 0 };
+        let body = BlockBody { txs: vec![entry], coinbase: 0, coinbase_rkm: [0; 4] };
         let header = BlockHeader::child_of(&BlockHeader::genesis(1, 0), 0, 1, body.commitment());
         assert!(validate_body(&header, &body, &MockOk, |r: &Hash32| *r == anchor).is_ok());
         // h32 round-trips a digest into 32 bytes.

@@ -49,8 +49,10 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     version_sent: HashSet<PeerId>,
     /// Full block bodies this node can serve (originated or fully reconstructed),
     /// keyed by header hash — backs `GetBlockTxn` answering. Stores the ordered
-    /// txs and the body's coinbase counter (needed to rebuild the exact body).
-    blocks: HashMap<Hash32, (Vec<TxEntry>, u64)>,
+    /// txs, the body's coinbase counter and its payout key (all three are needed
+    /// to rebuild the *exact* body — issue #101 added the third; without it the
+    /// rebuilt body commits to a different value than the header).
+    blocks: HashMap<Hash32, (Vec<TxEntry>, u64, [u64; 4])>,
     /// Announcements awaiting missing transactions (block hash → announce).
     pending_blocks: HashMap<Hash32, BlockAnnounce>,
     /// Finalized checkpoints + their votes, keyed by checkpoint id — so a
@@ -292,6 +294,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         header: BlockHeader,
         txs: Vec<TxEntry>,
         coinbase: u64,
+        coinbase_rkm: [u64; 4],
         nonce: u64,
     ) {
         let bh = header.header_hash();
@@ -299,15 +302,18 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // (issue #77, the own-announce seam): a locally-produced header/body pair
         // that fails the binding is a local bug, and announcing it would make this
         // node the origin of the very object every peer must penalise.
-        let outcome = self.node.ingest_block(header, BlockBody { txs: txs.clone(), coinbase });
+        let outcome = self
+            .node
+            .ingest_block(header, BlockBody { txs: txs.clone(), coinbase, coinbase_rkm });
         if let IngestOutcome::Rejected(_) = outcome {
             return;
         }
-        self.blocks.insert(bh, (txs.clone(), coinbase));
+        self.blocks.insert(bh, (txs.clone(), coinbase, coinbase_rkm));
         self.seen.insert(bh);
 
         let (prefilled, short_ids) = build_announce_parts(&txs, nonce);
-        let ann = BlockAnnounce { header, nonce, coinbase, short_ids, prefilled };
+        let ann =
+            BlockAnnounce { header, nonce, coinbase, coinbase_rkm, short_ids, prefilled };
         let payload = encode_announce(&ann);
         for pid in self.peers.ready_peers() {
             self.send(pid, MsgType::BlockAnnounce, payload.clone());
@@ -804,7 +810,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return;
             }
         };
-        let Some((body, _coinbase)) = self.blocks.get(&req.block_hash) else {
+        let Some((body, _coinbase, _rkm)) = self.blocks.get(&req.block_hash) else {
             return; // we don't have that block's body
         };
         let txs: Vec<TxEntry> =
@@ -849,7 +855,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     ) {
         let outcome = self
             .node
-            .ingest_block(ann.header, BlockBody { txs: txs.clone(), coinbase: ann.coinbase });
+            .ingest_block(
+                ann.header,
+                BlockBody {
+                    txs: txs.clone(),
+                    coinbase: ann.coinbase,
+                    coinbase_rkm: ann.coinbase_rkm,
+                },
+            );
         // Orphan-triggered sync kick (M10-T0-1, issue #62 item 6 — the N7 finding):
         // an announced block whose parent is unknown was previously dropped, and
         // gap recovery relied solely on the taller-peer handshake. Instead, kick
@@ -886,7 +899,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             return;
         }
-        self.blocks.insert(bh, (txs, ann.coinbase));
+        self.blocks.insert(bh, (txs, ann.coinbase, ann.coinbase_rkm));
         self.seen.insert(bh);
         let payload = encode_announce(&ann);
         for pid in self.peers.ready_peers() {
@@ -958,7 +971,7 @@ mod tests {
     /// commits to exactly that body, which since issue #77 is what makes the
     /// announce ingestable at all.
     fn header_over(parent: &BlockHeader, ts: u64, txs: &[TxEntry], coinbase: u64) -> BlockHeader {
-        let body = BlockBody { txs: txs.to_vec(), coinbase };
+        let body = BlockBody { txs: txs.to_vec(), coinbase, coinbase_rkm: [0; 4] };
         BlockHeader::child_of(parent, ts, 1000, body.commitment())
     }
 
@@ -1289,7 +1302,7 @@ mod tests {
         let body_txs = vec![coinbase, t1, t2];
         let header = header_over(&genesis(), 75, &body_txs, 0);
         let bh = header.header_hash();
-        nodes[0].announce_block(header, body_txs, 0, 0xABCD);
+        nodes[0].announce_block(header, body_txs, 0, [0; 4], 0xABCD);
         run(&mut nodes);
         // Node 1 reconstructed and ingested the header.
         assert!(nodes[1].node().has_header(&bh));
@@ -1309,7 +1322,7 @@ mod tests {
         let body_txs = vec![coinbase, t1, t2.clone()];
         let header = header_over(&genesis(), 75, &body_txs, 0);
         let bh = header.header_hash();
-        nodes[0].announce_block(header, body_txs, 0, 0x1234);
+        nodes[0].announce_block(header, body_txs, 0, [0; 4], 0x1234);
         run(&mut nodes);
         assert!(nodes[1].node().has_header(&bh), "header ingested after fetching missing tx");
         assert!(nodes[1].node().has_tx(&tx_id(&t2)), "missing tx fetched into mempool");
@@ -1329,7 +1342,7 @@ mod tests {
         let orphan_block = header_over(&unknown_parent, 150, &[tx(0)], 0);
         // Node 0 announces it (prefilled coinbase, no short ids → node 1
         // reconstructs immediately and runs complete_block).
-        nodes[0].announce_block(orphan_block, vec![tx(0)], 0, 0xABCD);
+        nodes[0].announce_block(orphan_block, vec![tx(0)], 0, [0; 4], 0xABCD);
         nodes[1].tick(0);
 
         // Node 1 kicked header-first sync toward the announcer (PeerId 1), rather
@@ -1358,7 +1371,14 @@ mod tests {
         let bh = header.header_hash();
         // …announced with no transactions at all (fully-prefilled, empty).
         let (prefilled, short_ids) = build_announce_parts(&[], 0xBEEF);
-        let ann = BlockAnnounce { header, nonce: 0xBEEF, coinbase: 0, short_ids, prefilled };
+        let ann = BlockAnnounce {
+            header,
+            nonce: 0xBEEF,
+            coinbase: 0,
+            coinbase_rkm: [0; 4],
+            short_ids,
+            prefilled,
+        };
         // Node 0 (PeerId 1) pushes it straight at node 1 (PeerId 2).
         nodes[0].send(PeerId(2), MsgType::BlockAnnounce, encode_announce(&ann));
         nodes[1].tick(0);
@@ -1383,7 +1403,7 @@ mod tests {
         // Header commits to a one-tx body; we hand announce_block a different one.
         let header = header_over(&genesis(), 75, &[tx(1)], 0);
         let bh = header.header_hash();
-        nodes[0].announce_block(header, vec![tx(2)], 0, 0xFEED);
+        nodes[0].announce_block(header, vec![tx(2)], 0, [0; 4], 0xFEED);
         run(&mut nodes);
         assert!(!nodes[0].blocks.contains_key(&bh), "not cached locally");
         assert!(!nodes[1].node().has_header(&bh), "never announced to the peer");

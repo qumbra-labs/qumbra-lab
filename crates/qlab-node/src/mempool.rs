@@ -31,18 +31,31 @@
 //! assembles into a body the node accepts (the fee source is the *same*
 //! `posted_fee`; the anchor gate is the *same* `is_valid_anchor`).
 //!
-//! ## Coinbase-maturity model (prototype boundary, documented)
+//! ## Coinbase-maturity model (issue #101 moved half of this into reality)
 //!
 //! A coinbase note "carries public value at creation and enters the pool as an
 //! ordinary note after a maturity delay" (tokenomics §6, one-hop transparency).
-//! This crate models that at the node-policy layer it can actually enforce: block
-//! assembly mints a deterministic coinbase-note commitment
-//! ([`coinbase_note_commitment`]) and the node records it with its creation
-//! height ([`Mempool::record_coinbase_note`]); a candidate tx **declares** the
-//! coinbase notes it consumes (`spends_coinbase`), and admission requires each to
-//! be ≥ 144 blocks deep at the prospective block height. The full in-tree /
-//! in-circuit enforcement of maturity is a later node-state concern; N4 binds the
-//! *policy* and the *constant*, not the circuit.
+//!
+//! Block assembly now mints a **real note** — [`crate::coinbase::coinbase_note`],
+//! openable by the 2×2 circuit — and `Node::apply_state` appends its commitment
+//! to the depth-32 tree, so a mined coin has a leaf and a membership witness and
+//! can actually be spent. What was here before was a domain-separated digest that
+//! no circuit could open, deliberately incapable of being a note; it is deleted.
+//!
+//! **Maturity itself is still policy, not structure.** The node records the note
+//! with its creation height ([`Mempool::record_coinbase_note`]); a candidate tx
+//! **declares** the coinbase notes it consumes (`spends_coinbase`), and admission
+//! requires each to be ≥ 144 blocks deep at the prospective block height. That
+//! declaration is only as good as the submitter — see
+//! [#102](https://github.com/lai3d/qumbra-lab/issues/102), which this baton turns
+//! from an unreachable seam into a live hole and which is sequenced next.
+//!
+//! A **structural** alternative exists and needs no circuit change: append the
+//! coinbase leaf at `h + 144` rather than at `h`, so no anchor contains the leaf
+//! until it has matured and an immature spend is *unprovable* rather than
+//! refused-by-policy. Not taken here (it is a further consensus-layer decision,
+//! and it would leave `record_coinbase_note` with nothing to do), but recorded as
+//! the option on the table when #102 is written.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -180,17 +193,13 @@ pub fn tx_weight(entry: &TxEntry) -> u64 {
     (entry.proof.len() + public) as u64
 }
 
-/// The deterministic coinbase-note commitment minted at `height` for a coinbase
-/// of `coinbase_total` bessel ([devnet-placeholder] shape; the real coinbase note
-/// is a `H(note)` over a tx-position-derived ρ, tokenomics §6 / tx-model §5).
-/// Domain-separated so it can never collide with a real note commitment.
-pub fn coinbase_note_commitment(height: u64, coinbase_total: u64) -> Hash32 {
-    let mut buf = Vec::with_capacity(32);
-    buf.extend_from_slice(b"qumbra:devnet:coinbase-note:v1");
-    buf.extend_from_slice(&height.to_le_bytes());
-    buf.extend_from_slice(&coinbase_total.to_le_bytes());
-    keccak256(&buf)
-}
+// `coinbase_note_commitment` was DELETED by issue #101, not deprecated. It
+// computed `keccak256(b"qumbra:devnet:coinbase-note:v1" ‖ height ‖ total)` — a
+// digest under its own domain, deliberately incapable of colliding with a real
+// note commitment, and therefore an object the 2×2 circuit could never open.
+// Appending it to the commitment tree would have produced a leaf that was still
+// unspendable. The real coinbase note lives in [`crate::coinbase`]; there is one
+// kind of coinbase note now, and it is an ordinary note.
 
 // ---------------------------------------------------------------------------
 // The block template assembly produces.
@@ -223,9 +232,26 @@ pub struct BlockTemplate {
     /// backstop that only bites blocks past the effective median).
     pub weight_penalty: u64,
     /// The miner's realized take: 65 % share − weight penalty + all fees.
+    ///
+    /// ⚠️ **Not the coinbase note's value.** [`crate::coinbase::coinbase_note_value`]
+    /// is `65 % share + fees` with the §6 weight penalty **omitted**, because the
+    /// penalty depends on the governor's effective median — node state the block
+    /// *applier* does not reconstruct. The two agree everywhere inside the 10 MB
+    /// free zone (penalty 0), which is every block on any net we run; they are
+    /// still different expressions, and [`Self::coinbase_note`] is the one that
+    /// is actually minted.
     pub miner_take: u64,
-    /// The coinbase-note commitment minted this block (recorded for maturity).
-    pub coinbase_note: Hash32,
+    /// The miner's raw `rkm` this template pays (issue #101) — the value that
+    /// goes into `BlockBody::coinbase_rkm` and therefore into the note preimage.
+    pub coinbase_rkm: [u64; 4],
+    /// The **real** note commitment this block mints, as
+    /// [`crate::coinbase::coinbase_note_leaf`] derives it — the leaf
+    /// `Node::apply_state` will append and the value the maturity registry is
+    /// keyed on. `None` only for a non-minting body (`coinbase == 0`).
+    ///
+    /// Derived from the assembled body by the same function the applier uses, so
+    /// the assembler and the applier cannot disagree about the leaf.
+    pub coinbase_note: Option<Hash32>,
     /// The block body ready to hand to [`crate::Node::apply_block`]. The coinbase
     /// counter carries the scheduled emission `coinbase_total`.
     pub body: BlockBody,
@@ -256,6 +282,7 @@ impl BlockTemplate {
         total_weight: u64,
         effective_median: u64,
         params: &MempoolParams,
+        coinbase_rkm: [u64; 4],
     ) -> Result<Self, AssemblyError> {
         let hard_cap = weight_limit(effective_median, &params.weight);
         if !is_weight_admissible(total_weight, effective_median, &params.weight) {
@@ -267,8 +294,9 @@ impl BlockTemplate {
         let weight_penalty =
             quadratic_penalty(coinbase_total, total_weight, effective_median, &params.weight);
         let miner_take = reward_split.miner.saturating_sub(weight_penalty) + total_fees;
-        let coinbase_note = coinbase_note_commitment(height, coinbase_total);
-        let body = BlockBody { txs: chosen.clone(), coinbase: coinbase_total };
+        let body =
+            BlockBody { txs: chosen.clone(), coinbase: coinbase_total, coinbase_rkm };
+        let coinbase_note = crate::coinbase::coinbase_note_leaf(height, &body);
         Ok(Self {
             height,
             txs: chosen,
@@ -279,6 +307,7 @@ impl BlockTemplate {
             total_fees,
             weight_penalty,
             miner_take,
+            coinbase_rkm,
             coinbase_note,
             body,
         })
@@ -358,6 +387,12 @@ impl Mempool {
     /// Record a coinbase note minted at `height` (its maturity clock starts here).
     /// Called when a block is accepted; the coinbase note becomes spendable at
     /// `height + 144` (frozen §2).
+    ///
+    /// Issue #101 narrowed this to **maturity bookkeeping only** and re-keyed it
+    /// on the real note commitment. Remaining callers: [`Self::on_block_connected`]
+    /// (the production path — every accepted block), and the mempool/assembly and
+    /// faucet tests that seed a matured note. Nothing computes a coinbase
+    /// "commitment" here any more; the leaf comes from [`crate::coinbase`].
     pub fn record_coinbase_note(&mut self, commitment: Hash32, height: u64) {
         self.coinbase_notes.insert(commitment, height);
     }
@@ -461,8 +496,12 @@ impl Mempool {
     /// that can still be mined next.
     pub fn on_block_connected<S: NodeState>(&mut self, height: u64, body: &BlockBody, state: &S) {
         // Record the coinbase note (its maturity clock starts at this height).
-        let cb = coinbase_note_commitment(height, body.coinbase);
-        self.record_coinbase_note(cb, height);
+        // Keyed on the REAL note commitment now (issue #101) — the same leaf
+        // `Node::apply_state` appended, so the maturity registry and the
+        // commitment tree name the same object.
+        if let Some(cb) = crate::coinbase::coinbase_note_leaf(height, body) {
+            self.record_coinbase_note(cb, height);
+        }
 
         // Collect the nullifiers the block spent.
         let spent: HashSet<Hash32> =
@@ -499,6 +538,7 @@ impl Mempool {
         &self,
         state: &S,
         effective_median: u64,
+        coinbase_rkm: [u64; 4],
     ) -> BlockTemplate {
         let height = state.tip_height() + 1;
         let mut candidates: Vec<&MempoolTx> = self.txs.values().collect();
@@ -516,7 +556,7 @@ impl Mempool {
         }
         // The fill guarantees `weight ≤ effective_median ≤ hard_cap`, so build
         // never errors here.
-        BlockTemplate::build(height, chosen, weight, effective_median, &self.params)
+        BlockTemplate::build(height, chosen, weight, effective_median, &self.params, coinbase_rkm)
             .expect("free-zone fill is always within the hard cap")
     }
 
@@ -529,6 +569,7 @@ impl Mempool {
         state: &S,
         effective_median: u64,
         txids: &[TxId],
+        coinbase_rkm: [u64; 4],
     ) -> Result<BlockTemplate, AssemblyError> {
         let height = state.tip_height() + 1;
         let mut chosen = Vec::with_capacity(txids.len());
@@ -538,7 +579,7 @@ impl Mempool {
             chosen.push(tx.entry.clone());
             weight += tx.weight;
         }
-        BlockTemplate::build(height, chosen, weight, effective_median, &self.params)
+        BlockTemplate::build(height, chosen, weight, effective_median, &self.params, coinbase_rkm)
     }
 
     /// Compute the current §6 effective median `M` from a chain of recent block
@@ -557,6 +598,9 @@ impl Mempool {
 mod tests {
     use super::*;
     use qlab_devnet::fees::ArityBucket;
+
+    /// A non-zero payout key for test bodies that mint (issue #101).
+    const TEST_RKM: [u64; 4] = [0xC0, 0xFF, 0xEE, 0x01];
 
     // ── A minimal NodeState for focused admission tests ──────────────────────
 
@@ -701,8 +745,12 @@ mod tests {
     fn rejects_immature_coinbase_spend_then_admits_after_maturity() {
         let mut mp = Mempool::default();
 
-        // A coinbase note minted at height 100.
-        let cb = coinbase_note_commitment(100, coinbase(100));
+        // A coinbase note minted at height 100 — the REAL note commitment now.
+        let cb = crate::coinbase::coinbase_note_leaf(
+            100,
+            &BlockBody { txs: vec![], coinbase: coinbase(100), coinbase_rkm: TEST_RKM },
+        )
+        .expect("a minting body has a coinbase leaf");
         mp.record_coinbase_note(cb, 100);
 
         // Tip 200 ⇒ prospective height 201; matures at 100 + 144 = 244 > 201.
@@ -795,7 +843,7 @@ mod tests {
         }
         // A tiny effective median so only a couple of ~135-byte mock txs fit free.
         let m = 2 * tx_weight(&good_tx(0)); // exactly two txs fit the free zone
-        let t = mp.assemble(&st, m);
+        let t = mp.assemble(&st, m, TEST_RKM);
         assert_eq!(t.height, 201);
         assert_eq!(t.txs.len(), 2, "free-zone fill selects exactly two");
         assert!(t.total_weight <= m && t.weight_penalty == 0, "no penalty in the free zone");
@@ -805,6 +853,12 @@ mod tests {
         // Miner take = 65 % of coinbase (no penalty) + fees.
         assert_eq!(t.miner_take, t.reward_split.miner + t.total_fees);
         assert_eq!(t.body.coinbase, t.coinbase_total);
+        // The template carries the payee and the real leaf the applier will
+        // append — derived from the same function, so the two cannot disagree.
+        assert_eq!(t.coinbase_rkm, TEST_RKM);
+        assert_eq!(t.body.coinbase_rkm, TEST_RKM);
+        assert_eq!(t.coinbase_note, crate::coinbase::coinbase_note_leaf(201, &t.body));
+        assert!(t.coinbase_note.is_some(), "a minting template mints a note");
     }
 
     #[test]
@@ -819,13 +873,13 @@ mod tests {
         // Effective median so the hard cap (2·M) admits only 3 of the 5 txs.
         let m = one; // hard cap = 2·one ⇒ at most 2 fit; 5 exceeds it
         let hard_cap = mp.hard_cap(m);
-        let err = mp.assemble_selection(&st, m, &ids).unwrap_err();
+        let err = mp.assemble_selection(&st, m, &ids, TEST_RKM).unwrap_err();
         assert_eq!(
             err,
             AssemblyError::TemplateOverWeight { weight: 5 * one, hard_cap }
         );
         // A subset within the cap is accepted (and pays a penalty above the median).
-        let ok = mp.assemble_selection(&st, m, &ids[..2]).expect("subset within cap");
+        let ok = mp.assemble_selection(&st, m, &ids[..2], TEST_RKM).expect("subset within cap");
         assert_eq!(ok.total_weight, 2 * one);
         assert!(ok.weight_penalty > 0, "at 2M the block is fully penalized");
     }
@@ -836,7 +890,7 @@ mod tests {
         let st = state_with_anchor();
         let bogus = [0xAB; 32];
         assert_eq!(
-            mp.assemble_selection(&st, 1_000_000, &[bogus]).unwrap_err(),
+            mp.assemble_selection(&st, 1_000_000, &[bogus], TEST_RKM).unwrap_err(),
             AssemblyError::UnknownTx { txid: bogus }
         );
     }
@@ -851,13 +905,14 @@ mod tests {
 
         // A block at height 201 mines tx `a` (spends nullifier [1;32]).
         let mined = mp.txs.get(&a).unwrap().entry.clone();
-        let body = BlockBody { txs: vec![mined], coinbase: coinbase(201) };
+        let body =
+            BlockBody { txs: vec![mined], coinbase: coinbase(201), coinbase_rkm: TEST_RKM };
         mp.on_block_connected(201, &body, &st);
 
         // `a` is gone; `b` remains; the coinbase note is registered at 201.
         assert!(!mp.contains(&a));
         assert_eq!(mp.len(), 1);
-        let cb = coinbase_note_commitment(201, coinbase(201));
+        let cb = crate::coinbase::coinbase_note_leaf(201, &body).expect("minting body");
         assert_eq!(mp.coinbase_note_height(&cb), Some(201));
     }
 }

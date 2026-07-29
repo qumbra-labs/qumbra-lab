@@ -117,7 +117,7 @@ impl Rig {
         let tip = node.tip_hash();
         let parent = node.chain().block(&tip).expect("tip stored").header();
         let height = parent.height + 1;
-        let body = BlockBody { txs, coinbase: 0 };
+        let body = BlockBody { txs, coinbase: 0, coinbase_rkm: [0; 4] };
         let header = BlockHeader::child_of(&parent, height, 1_000, body.commitment());
         node.apply_block(header, body, verifier).expect("block applies");
         height
@@ -682,8 +682,22 @@ fn a_coinbase_funded_grant_declares_its_maturity_obligation() {
     // Seed two notes and then mark them coinbase-derived, as a mining faucet's own
     // notes would be.
     let plain = rig.seed_notes(&wallet, d, &[COINBASE_0, COINBASE_0]);
-    let cb0 = qlab_node::coinbase_note_commitment(1, qlab_node::coinbase(1));
-    let cb1 = qlab_node::coinbase_note_commitment(2, qlab_node::coinbase(2));
+    // Real coinbase-note leaves now (issue #101 deleted the placeholder digest):
+    // the same commitments `Node::apply_state` would have appended for a block at
+    // each height paying this faucet's own rkm.
+    let miner_rkm = wallet.rkm(d);
+    let cb_at = |h: u64| {
+        qlab_node::coinbase_note_leaf(
+            h,
+            &qlab_devnet::body::BlockBody {
+                txs: Vec::new(),
+                coinbase: qlab_node::coinbase(h),
+                coinbase_rkm: miner_rkm,
+            },
+        )
+        .expect("a minting body has a coinbase leaf")
+    };
+    let (cb0, cb1) = (cb_at(1), cb_at(2));
     let mut faucet = Faucet::new(
         wallet,
         d,

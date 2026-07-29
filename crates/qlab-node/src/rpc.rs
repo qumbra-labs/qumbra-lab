@@ -418,11 +418,20 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
     }
 
     /// `(height, commitment-count-after-this-block)` for each main-chain height.
+    ///
+    /// Must count exactly what `Node::apply_state` appends, in the same order, or
+    /// every root this module reconstructs is wrong. Since issue #101 that is the
+    /// block's **coinbase-note leaf first** (one, when the block mints), then its
+    /// transaction commitments. Miscounting here would not fail loudly: it would
+    /// publish anchors nobody can build a witness against.
     fn main_chain_counts(&self) -> Vec<(u64, u64)> {
         let mut count = 0u64;
         self.main_chain()
             .iter()
             .map(|b| {
+                if crate::coinbase::coinbase_note_leaf(b.header.height, &b.body()).is_some() {
+                    count += 1;
+                }
                 count += b.txs.iter().map(|t| t.commitments.len() as u64).sum::<u64>();
                 (b.header.height, count)
             })
@@ -994,7 +1003,9 @@ mod tests {
         let tip_hash = node.tip_hash();
         let parent = node.chain().block(&tip_hash).expect("tip block stored").header();
         let height = parent.height + 1;
-        let body = BlockBody { txs, coinbase: height };
+        // A minting body needs a payee (issue #101).
+        let body =
+            BlockBody { txs, coinbase: height, coinbase_rkm: [height, 2, 3, 4] };
         // child_of's 2nd arg is the timestamp; height is derived from the parent.
         let header = BlockHeader::child_of(&parent, height, 1_000, body.commitment());
         node.apply_block(header, body, &OkVerifier).expect("block applies");

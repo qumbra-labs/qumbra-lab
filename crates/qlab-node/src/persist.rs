@@ -29,7 +29,15 @@ use crate::store::{Hash32, StoredBlock};
 
 /// On-disk format version for both the block log and the snapshot. Bump on any
 /// incompatible change to [`StoredBlock`] or [`Snapshot`].
-pub const FORMAT_VERSION: u32 = 1;
+///
+/// **2** since issue #101: [`StoredBlock`] gained `coinbase_rkm`, without which a
+/// replay cannot re-derive the block's coinbase note and therefore cannot rebuild
+/// the commitment tree. A version-1 snapshot is ignored (forcing a full replay),
+/// but a version-1 *block log* cannot be replayed at all — its records decode
+/// short. That is a data-directory break, not just a slow start: see the operator
+/// note in the PR. Nothing in-tree carries a v1 datadir; the T0 hosts are not
+/// being upgraded by this baton.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The append-only log file name (source of truth: blocks + finalizations).
 pub const BLOCK_LOG: &str = "blocks.log";
@@ -87,14 +95,31 @@ pub fn append_record(dir: &Path, rec: &LogRecord) -> io::Result<()> {
 }
 
 /// Read every record from the log in order. Missing log ⇒ empty vec. A truncated
-/// or corrupt trailing record (e.g. a crash mid-append) is dropped, not an error
-/// — the log stays usable up to the last complete record.
+/// or corrupt **trailing** record (a crash mid-append) is dropped, not an error —
+/// the log stays usable up to the last complete record.
+///
+/// # A record that fails to decode with bytes still after it is an ERROR
+///
+/// The tolerance above used to apply to *any* failing record, which was safe only
+/// while the record type never changed. Issue #101 added `coinbase_rkm` to
+/// [`StoredBlock`], so every record written by a pre-#101 binary now decodes
+/// short — and under the old rule a whole populated block log would have been
+/// read as "zero records" and the node would have resumed **silently from
+/// genesis**, discarding its chain without a word. Silent data loss on a format
+/// change is a worse failure than refusing to start.
+///
+/// So the tolerance is narrowed to what it was actually for: a torn record is by
+/// construction the *last* thing in the file. If bytes follow a record that will
+/// not decode, or if a non-empty log yields no records at all, this returns
+/// [`io::ErrorKind::InvalidData`] and the caller refuses to open. Recovery is to
+/// re-sync the datadir, not to bump a constant.
 pub fn read_records(dir: &Path) -> io::Result<Vec<LogRecord>> {
     let path = dir.join(BLOCK_LOG);
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let mut r = BufReader::new(File::open(path)?);
+    let file_len = fs::metadata(&path)?.len();
+    let mut r = BufReader::new(File::open(&path)?);
     let mut out = Vec::new();
     loop {
         let mut len_buf = [0u8; 4];
@@ -110,8 +135,35 @@ pub fn read_records(dir: &Path) -> io::Result<Vec<LogRecord>> {
         }
         match bincode::deserialize::<LogRecord>(&buf) {
             Ok(rec) => out.push(rec),
-            Err(_) => break, // corrupt trailing record — stop at the last good one
+            Err(e) => {
+                // Tolerated only if nothing follows it (a crash mid-append).
+                let mut probe = [0u8; 1];
+                let has_more = r.read(&mut probe)? > 0;
+                if has_more {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "{BLOCK_LOG}: record {} does not decode and is not the last record \
+                             ({e}). This block log was written by an incompatible build — the \
+                             current on-disk format is version {FORMAT_VERSION}. Re-sync this \
+                             datadir; do not start against it.",
+                            out.len(),
+                        ),
+                    ));
+                }
+                break;
+            }
         }
+    }
+    if out.is_empty() && file_len > 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "{BLOCK_LOG}: {file_len} bytes on disk but not one record decodes. This block \
+                 log was written by an incompatible build — the current on-disk format is \
+                 version {FORMAT_VERSION}. Re-sync this datadir; do not start against it."
+            ),
+        ));
     }
     Ok(out)
 }

@@ -161,7 +161,28 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// Source-side counters + histograms (issue #87). Fed at the event, so a
     /// distribution is never reconstructed from printed gauges.
     metrics: Metrics,
+    /// Where this node's mined coinbase notes are paid (issue #101) — the raw
+    /// `rkm` written into `BlockBody::coinbase_rkm`. Defaults to
+    /// [`UNCONFIGURED_MINER_RKM`]; the binary installs the operator's key via
+    /// [`Self::set_miner_rkm`].
+    miner_rkm: [u64; 4],
 }
+
+/// The payout key a node mines to when no wallet has been configured (issue #101).
+///
+/// It is deliberately **non-zero**, because `[0; 4]` is rejected outright
+/// (`BodyError::MissingCoinbasePayee`) and every in-process sim, soak and docker
+/// rehearsal in this repo mines without a wallet; a zero default would make them
+/// all produce invalid blocks. It is equally deliberately **unspendable in
+/// practice**: it is a fixed constant, not derived from any `(sk, d)`, so nobody
+/// holds a spend key for it and coins mined to it are burned.
+///
+/// That is the honest state of affairs for a node that was never told where to
+/// pay itself, and it is loud rather than silent: [`Self::set_miner_rkm`] is what
+/// a real miner calls, and `qumbra-node` warns at startup when it has nothing to
+/// call it with.
+pub const UNCONFIGURED_MINER_RKM: [u64; 4] =
+    [0x1101_1101_1101_1101, 0x1101_1101_1101_1101, 0x1101_1101_1101_1101, 0x1101_1101_1101_1101];
 
 /// Layer-attributed ingest refusal counts (issue #74).
 ///
@@ -262,7 +283,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             ingest_counters: IngestCounters::default(),
             rounds: RoundLedger::default(),
             metrics: Metrics::new(),
+            miner_rkm: UNCONFIGURED_MINER_RKM,
         }
+    }
+
+    /// Set where this node's mined coinbase notes are paid (issue #101): the raw
+    /// `rkm` of a miner-controlled address, as `qlab_wallet::Wallet::rkm(d)`
+    /// computes it. Until this is called the node mines to
+    /// [`UNCONFIGURED_MINER_RKM`], which nobody can spend.
+    pub fn set_miner_rkm(&mut self, rkm: [u64; 4]) {
+        self.miner_rkm = rkm;
+    }
+
+    /// The payout key this node currently mines to.
+    pub fn miner_rkm(&self) -> [u64; 4] {
+        self.miner_rkm
     }
 
     /// Select the header-timestamp [`MiningClock`]. The binary (`qumbra-node`)
@@ -537,7 +572,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         if !self.rules.accepts_height(self.chain.tip_height() + 1) {
             return None;
         }
-        let template = self.mempool.assemble(&self.state, SOAK_EFFECTIVE_MEDIAN);
+        let template =
+            self.mempool.assemble(&self.state, SOAK_EFFECTIVE_MEDIAN, self.miner_rkm);
         let body = template.body;
         let bc = body.commitment();
         let parent_hash = self.chain.tip_hash();
@@ -1028,7 +1064,7 @@ mod tests {
         // (issue #77), so the bad body gets a header that honestly commits to it.
         // Before #77 this case paired a mined header with an unrelated body and
         // asserted "bad body" — a pairing no honest producer can emit.
-        let bad_body = BlockBody { txs: vec![tx_with(anchor, 9, b"bad")], coinbase: 0 };
+        let bad_body = BlockBody { txs: vec![tx_with(anchor, 9, b"bad")], coinbase: 0, coinbase_rkm: [0; 4] };
         let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
         let h2 = BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, bad_body.commitment());
         assert_eq!(a.ingest_block(h2, bad_body), IngestOutcome::Rejected("bad body"));
@@ -1043,12 +1079,12 @@ mod tests {
     fn ingest_block_rejects_a_body_that_is_not_the_headers_body() {
         let (mut a, anchor) = adapter_with_finalized_genesis();
         // An honest header over the tip, committing to a real one-tx body.
-        let honest_body = BlockBody { txs: vec![tx_with(anchor, 3, b"ok")], coinbase: 0 };
+        let honest_body = BlockBody { txs: vec![tx_with(anchor, 3, b"ok")], coinbase: 0, coinbase_rkm: [0; 4] };
         let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
         let header =
             BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, honest_body.commitment());
         // …handed a different, also-internally-valid body.
-        let swapped = BlockBody { txs: vec![tx_with(anchor, 4, b"ok")], coinbase: 0 };
+        let swapped = BlockBody { txs: vec![tx_with(anchor, 4, b"ok")], coinbase: 0, coinbase_rkm: [0; 4] };
         assert_eq!(
             a.ingest_block(header, swapped),
             IngestOutcome::Rejected("body does not match header commitment")
@@ -1063,7 +1099,7 @@ mod tests {
     #[test]
     fn ingest_block_rejects_an_honest_header_with_an_empty_body() {
         let (mut a, anchor) = adapter_with_finalized_genesis();
-        let honest_body = BlockBody { txs: vec![tx_with(anchor, 5, b"ok")], coinbase: 0 };
+        let honest_body = BlockBody { txs: vec![tx_with(anchor, 5, b"ok")], coinbase: 0, coinbase_rkm: [0; 4] };
         let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
         let header =
             BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, honest_body.commitment());
