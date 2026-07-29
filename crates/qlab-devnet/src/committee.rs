@@ -40,6 +40,45 @@ pub type MemberSig = Signature<MlDsa65>;
 /// break, §0 discipline).
 pub const CHECKPOINT_DOMAIN: &[u8] = b"qumbra:checkpoint:v1";
 
+/// How many leading digest bytes make up a printed checkpoint **identity**
+/// (issue #84). Six — 48 bits — chosen for a reason that is not collision
+/// resistance:
+///
+/// * **Collision is a non-argument here.** The identity separates the handful of
+///   checkpoint variants that can exist at one height on one net. Even counting
+///   every checkpoint a devnet produces in a year (~5×10⁴ at an 8-block cadence),
+///   the birthday probability of *any* accidental pair matching at 48 bits is
+///   ~10⁻⁵, and of two variants at the *same height* matching, ~10⁻¹⁴. Thirty-two
+///   bits would also have sufficed.
+/// * **48 bits is the widest prefix that survives a Prometheus round trip.**
+///   Exposition values are float64, whose mantissa is 53 bits, so a 48-bit integer
+///   is carried *exactly* by a scrape while a 64-bit one is silently rounded. That
+///   makes [`Checkpoint::id_hex`] and the `qumbra_*_checkpoint_id` gauges two
+///   spellings of one number: `printf '%012x'` converts the gauge into the log
+///   field. A wider identity would have broken that correspondence, and an
+///   operator who cannot line up the log with the scrape has two instruments that
+///   disagree for no reason.
+///
+/// **Devnet-grade, tunable, NOT frozen** — nothing in consensus reads it. It is a
+/// display width for an observability field, and widening it changes only what a
+/// log line prints (and would cost the float64 correspondence above).
+pub const CHECKPOINT_ID_BYTES: usize = 6;
+
+/// The printed form of "no checkpoint" — the same sentinel the `TELEMETRY` line
+/// already uses for `final=`, `age_s=` and `halt=`. **Absence is printed, never
+/// omitted**: a positional `key=value` line whose keys come and go forces every
+/// parser to special-case it, and that special case is what gets skipped.
+pub const CHECKPOINT_ID_ABSENT: &str = "-";
+
+/// Render a [`Checkpoint::identity`] value as the canonical zero-padded lowercase
+/// hex field, or [`CHECKPOINT_ID_ABSENT`] for `None`.
+pub fn checkpoint_id_hex(id: Option<u64>) -> String {
+    match id {
+        Some(v) => format!("{v:0width$x}", width = CHECKPOINT_ID_BYTES * 2),
+        None => CHECKPOINT_ID_ABSENT.to_string(),
+    }
+}
+
 /// The ⅔-quorum threshold for a committee of `n`: `floor(2n/3) + 1` — **strictly
 /// more than two thirds**, the Byzantine-safe quorum for a finality gadget
 /// tolerating `f < n/3` faults (consensus §4/§5). E.g. n=20 → 14, n=21 → 15.
@@ -160,6 +199,36 @@ impl Checkpoint {
         m.extend_from_slice(&self.block_hash);
         m.extend_from_slice(&self.root);
         m
+    }
+
+    /// **The checkpoint's identity** (issue #84): the first [`CHECKPOINT_ID_BYTES`]
+    /// bytes of `keccak256(signing_message())`, big-endian, as an integer.
+    ///
+    /// It is taken over [`Self::signing_message`] and *not* over the struct fields,
+    /// which is the whole point: the signing message is the exact byte string the
+    /// committee's ML-DSA keys commit to, so two nodes reporting the same identity
+    /// have provably been asked to sign the same thing. Hashing the fields
+    /// separately would create a second serialization of `(height, block_hash,
+    /// root)` that could drift from the signed one — and a divergence between the
+    /// two encodings would present as "the identities match" while the signatures
+    /// were over different bytes, i.e. exactly the failure this field exists to
+    /// make visible, made invisible again.
+    ///
+    /// The hash is [`crate::hash::keccak256`], the consensus hash (performance-
+    /// budget §2), cross-checked against an independent implementation there. No
+    /// new primitive and no second encoding are introduced by this field.
+    ///
+    /// This is **observability only**. Nothing in consensus reads it: the quorum
+    /// rule, `try_finalize` and vote verification all continue to work on the
+    /// signing message itself.
+    pub fn identity(&self) -> u64 {
+        let d = crate::hash::keccak256(&self.signing_message());
+        d[..CHECKPOINT_ID_BYTES].iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
+    }
+
+    /// [`Self::identity`] as the canonical 12-char lowercase hex log field.
+    pub fn id_hex(&self) -> String {
+        checkpoint_id_hex(Some(self.identity()))
     }
 }
 
@@ -399,5 +468,68 @@ mod tests {
         assert_ne!(m, Checkpoint::new(9, [0x11; 32], [0x22; 32]).signing_message());
         assert_ne!(m, Checkpoint::new(8, [0x33; 32], [0x22; 32]).signing_message());
         assert_ne!(m, Checkpoint::new(8, [0x11; 32], [0x44; 32]).signing_message());
+    }
+
+    // ---- issue #84: the checkpoint's identity --------------------------------
+
+    /// **The identity is a function of the signed bytes and nothing else.**
+    /// Recomputed here from `keccak256(signing_message())` by hand, so a future
+    /// refactor that quietly starts hashing the struct fields (or a different
+    /// digest) fails rather than producing a plausible number.
+    #[test]
+    fn identity_is_the_digest_prefix_of_the_signing_message() {
+        let cp = sample_checkpoint();
+        let d = crate::hash::keccak256(&cp.signing_message());
+        let expect =
+            d[..CHECKPOINT_ID_BYTES].iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b));
+        assert_eq!(cp.identity(), expect);
+        // …and the printed field is that integer, zero-padded, nothing else.
+        assert_eq!(cp.id_hex(), format!("{expect:012x}"));
+    }
+
+    /// **The acceptance property, at the level of the value itself**: equal
+    /// checkpoints are byte-identical identities, and a change in *any* of the
+    /// three signed fields moves it. `block_hash` is the one that matters — two
+    /// nodes finalizing different blocks at the same height is the split.
+    #[test]
+    fn identity_separates_variants_and_agrees_on_equals() {
+        let cp = Checkpoint::new(3776, [0x11; 32], [0x22; 32]);
+        // Same (height, block_hash, root) built independently ⇒ same identity.
+        assert_eq!(cp.identity(), Checkpoint::new(3776, [0x11; 32], [0x22; 32]).identity());
+        assert_eq!(cp.id_hex(), Checkpoint::new(3776, [0x11; 32], [0x22; 32]).id_hex());
+        // The 3776-shaped case: same height, different block ⇒ different identity.
+        assert_ne!(cp.identity(), Checkpoint::new(3776, [0x33; 32], [0x22; 32]).identity());
+        // And the other two fields bind too.
+        assert_ne!(cp.identity(), Checkpoint::new(3777, [0x11; 32], [0x22; 32]).identity());
+        assert_ne!(cp.identity(), Checkpoint::new(3776, [0x11; 32], [0x44; 32]).identity());
+    }
+
+    /// The printed field is **fixed-width lowercase hex or the `-` sentinel** — a
+    /// parser may rely on exactly those two shapes. The zero-padding case is the
+    /// one that silently breaks a fixed-width reader if `{:x}` is ever used raw.
+    #[test]
+    fn id_hex_is_fixed_width_or_the_absent_sentinel() {
+        for id in [0u64, 1, 0xff, 0x0000_4cc8_904e, (1u64 << 48) - 1] {
+            let s = checkpoint_id_hex(Some(id));
+            assert_eq!(s.len(), CHECKPOINT_ID_BYTES * 2, "fixed width: {s}");
+            assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()), "{s}");
+            assert_eq!(u64::from_str_radix(&s, 16).unwrap(), id, "round-trips: {s}");
+        }
+        assert_eq!(checkpoint_id_hex(None), CHECKPOINT_ID_ABSENT);
+        assert_eq!(CHECKPOINT_ID_ABSENT, "-", "same sentinel as final=/age_s=/halt=");
+    }
+
+    /// The identity fits in 48 bits, which is what makes it survive a Prometheus
+    /// float64 exposition value unrounded — the property that lets the log field
+    /// and the `/metrics` gauge be the same number in two spellings.
+    #[test]
+    fn identity_is_exact_in_a_float64_exposition_value() {
+        assert!(CHECKPOINT_ID_BYTES * 8 <= 53, "float64 mantissa is 53 bits");
+        for h in 0u64..64 {
+            let id = Checkpoint::new(h, [h as u8; 32], [0x22; 32]).identity();
+            assert!(id < (1u64 << (CHECKPOINT_ID_BYTES * 8)));
+            // The scrape round trip: u64 → f64 → u64 must be lossless.
+            assert_eq!(id as f64 as u64, id, "gauge value must not round");
+        }
     }
 }

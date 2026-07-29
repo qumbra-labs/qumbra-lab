@@ -49,6 +49,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use qlab_devnet::committee::checkpoint_id_hex;
+
 /// How many closed rounds are retained for in-process inspection (`/metrics` reads
 /// aggregates, the journal line is emitted at close, so this ring only backs
 /// operator/test queries). **Devnet-grade, tunable, NOT frozen.**
@@ -258,6 +260,21 @@ pub struct RoundRecord {
     pub msgs: u32,
     /// Votes this node itself contributed (its own held committee keys).
     pub local_votes: usize,
+    /// **What this node's own keys committed to for this slot** (issue #84):
+    /// [`qlab_devnet::committee::Checkpoint::identity`] of the checkpoint held in
+    /// this node's never-double-sign ledger, or `None` when it holds no committee
+    /// keys, or holds keys but has committed to nothing for this slot.
+    ///
+    /// This is the field that makes a *split* legible. A minority that signed a
+    /// different variant still **finalizes the majority's** once the quorum
+    /// reaches it, so every node's finalized identity agrees and the disagreement
+    /// leaves no trace on the winning side of the record. What each node's keys
+    /// were asked to sign does not agree, and that is here.
+    ///
+    /// It is the same fact as the last record in that node's `finalizer-*.state`
+    /// file — the file an operator otherwise has to copy off the host and hash by
+    /// hand — recorded per slot, in the journal, at the moment it happens.
+    pub local_cpid: Option<u64>,
     /// Whether this node proposed this slot.
     pub proposed_locally: bool,
     /// Votes that reached the node and could not count.
@@ -290,6 +307,7 @@ impl RoundRecord {
             variants: 0,
             msgs: 0,
             local_votes: 0,
+            local_cpid: None,
             proposed_locally: false,
             rejects: VoteRejects::default(),
             opened_at_ms: now,
@@ -379,7 +397,8 @@ impl RoundRecord {
         format!(
             "ROUND slot={} epoch={} why={} close={} by={} have={} need={} active={} roster={} \
              voted={} absent={} excluded={} variants={} msgs={} local={} \
-             rej=f{}/u{}/d{}/i{} open_ms={} first_ms={} last_ms={} quorum_ms={} closed_ms={}",
+             rej=f{}/u{}/d{}/i{} open_ms={} first_ms={} last_ms={} quorum_ms={} closed_ms={} \
+             cpid={}",
             self.height,
             self.epoch,
             self.diagnose().as_str(),
@@ -404,6 +423,11 @@ impl RoundRecord {
             ms(self.last_ms),
             ms(self.quorum_ms),
             ms(self.closed_ms),
+            // Issue #84 — **appended at the end**, same discipline as the
+            // `TELEMETRY` line: existing fields keep their name and position.
+            // Absent is printed (`-`), never omitted, so a fixed reader never has
+            // to special-case the "this node holds no keys" node.
+            checkpoint_id_hex(self.local_cpid),
         )
     }
 }
@@ -555,11 +579,29 @@ impl RoundLedger {
     /// Record that this node proposed the slot and contributed `local_votes` of its
     /// own held keys (the proposer path; `local_votes` may be 0 when every held key
     /// was refused by the never-double-sign guard — itself a finding).
-    pub fn note_local_proposal(&mut self, ctx: &SlotContext, local_votes: usize) {
+    ///
+    /// `local_cpid` (issue #84) is the identity of the checkpoint this node's keys
+    /// are *committed to* for the slot, read from the never-double-sign ledger
+    /// rather than from the vote just produced. The distinction is the whole value
+    /// of the field: when `local_votes == 0` because the guard refused, the node
+    /// still holds a prior commitment for that slot, and **that** commitment — not
+    /// the absence of a fresh vote — is what a split forensic needs.
+    pub fn note_local_proposal(
+        &mut self,
+        ctx: &SlotContext,
+        local_votes: usize,
+        local_cpid: Option<u64>,
+    ) {
         self.ensure_open(ctx);
         let Some(rec) = self.open.get_mut(&ctx.height) else { return };
         rec.proposed_locally = true;
         rec.local_votes = local_votes;
+        // Never un-set a known commitment: the ledger is append-only per slot and a
+        // later observation that reads `None` (e.g. a key file removed at restart)
+        // must not erase what this node is on record as having signed.
+        if local_cpid.is_some() {
+            rec.local_cpid = local_cpid;
+        }
     }
 
     /// Record a vote-set message that could not count at all (forged / unknown
@@ -817,7 +859,7 @@ mod tests {
         let c8 = ctx(8, 21, 21, 15);
         let c16 = ctx(16, 21, 21, 15);
 
-        l.note_local_proposal(&c8, 6);
+        l.note_local_proposal(&c8, 6, Some(0xabc));
         l.note_votes(&c8, &[0, 1, 2, 3, 4, 5], &[], VoteRejects::default(), 1);
         l.note_votes(&c8, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10], &[], VoteRejects::default(), 1);
         assert_eq!(l.open_round(8).unwrap().have(), 11);
@@ -863,7 +905,7 @@ mod tests {
         let mut l = RoundLedger::new(ObsClock::Deterministic);
         let g = ctx(0, 21, 21, 15);
         l.note_slot_reached(&g);
-        l.note_local_proposal(&g, 21);
+        l.note_local_proposal(&g, 21, Some(0xabc));
         assert_eq!(l.note_votes(&g, &(0..21).collect::<Vec<_>>(), &[], VoteRejects::default(), 1), NewVotes::default());
         l.note_rejected_message(&g, VoteRejects { forged: 1, ..Default::default() });
         l.note_finalized(0);
@@ -995,6 +1037,7 @@ mod tests {
         r.last_ms = Some(598_402);
         r.closed_ms = Some(600_113);
         r.close = Some(RoundClose::Superseded { by_height: 1_392 });
+        r.local_cpid = Some(0x4cc8_904e_1f2a); // issue #84 — the widest this field gets
         let line = r.to_line();
         assert!(
             line.len() <= BUDGET_BYTES,
@@ -1005,5 +1048,113 @@ mod tests {
         for key in ["why=timeout", "have=11", "need=15", "active=21", "absent=", "last_ms=", "closed_ms="] {
             assert!(line.contains(key), "journal line is missing {key}: {line}");
         }
+    }
+
+    // ---- issue #84: the identity in the per-slot journal ----------------------
+
+    /// `cpid` is **appended at the end** and every pre-#84 key keeps its name and
+    /// its position. Same contract the `TELEMETRY` line holds itself to, for the
+    /// same reason: `qumbra-ops/` parses these lines out of archived container
+    /// logs, and a reader that counts fields must not be shifted under.
+    #[test]
+    fn round_line_gains_cpid_at_the_end_and_nowhere_else() {
+        let mut r = RoundRecord::new(3_776, 12, 21, 21, 15, None);
+        r.voted = (0..16).collect();
+        r.close = Some(RoundClose::Finalized);
+        let line = r.to_line();
+        let keys: Vec<&str> = line
+            .split_whitespace()
+            .skip(1) // the "ROUND" tag
+            .map(|kv| kv.split('=').next().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                // ── the pre-#84 fields, in their original order ──
+                "slot", "epoch", "why", "close", "by", "have", "need", "active", "roster",
+                "voted", "absent", "excluded", "variants", "msgs", "local", "rej", "open_ms",
+                "first_ms", "last_ms", "quorum_ms", "closed_ms",
+                // ── appended by #84, at the end ──
+                "cpid",
+            ],
+            "existing ROUND fields must not move or be renamed"
+        );
+    }
+
+    /// **Slot 3776, reconstructed.** Three nodes' keys signed one variant and one
+    /// node's signed another; all four then finalize the majority variant, so the
+    /// round closes `finalized` on every host and nothing but `cpid` distinguishes
+    /// them. One `grep 'ROUND slot=3776'` across four hosts is the whole forensic.
+    #[test]
+    fn a_split_round_is_one_grep_across_the_hosts() {
+        let majority = 0x4cc8_904e_1f2a;
+        let minority = 0xee8e_07e9_5b31;
+        let host = |cpid: u64| {
+            let mut l = RoundLedger::new(ObsClock::Deterministic);
+            let c = ctx(3_776, 21, 21, 15);
+            l.note_local_proposal(&c, 5, Some(cpid));
+            // Every host accumulates the same 16 counting signers and finalizes the
+            // same majority checkpoint — the split leaves no mark on `have`.
+            l.note_votes(&c, &(0..16).collect::<Vec<_>>(), &[], VoteRejects::default(), 2);
+            l.note_finalized(3_776);
+            l.take_emitted().remove(0).to_line()
+        };
+        let lines: Vec<String> =
+            [majority, majority, majority, minority].iter().map(|c| host(*c)).collect();
+
+        // Every host reports the same round, the same counts, the same outcome…
+        for l in &lines {
+            assert!(l.contains("have=16 need=15"), "{l}");
+            assert!(l.contains("close=finalized"), "{l}");
+            assert!(l.contains("variants=2"), "{l}");
+        }
+        // …and `variants=2` says only that *a* split existed locally, which is what
+        // the T0 net could already see and could not act on.
+        assert_eq!(lines[0], lines[1], "the three agreeing hosts are byte-identical");
+        assert_eq!(lines[0], lines[2]);
+        // `cpid` is the one field that names which side each host was on.
+        assert_ne!(lines[0], lines[3], "the minority host's line differs");
+        assert!(lines[0].contains("cpid=4cc8904e1f2a"), "{}", lines[0]);
+        assert!(lines[3].contains("cpid=ee8e07e95b31"), "{}", lines[3]);
+    }
+
+    /// A node holding **no committee keys** still emits the field, as `-`. The
+    /// alternative — omitting the key — makes every parser special-case the
+    /// verify-only nodes, and that special case is the one that gets skipped.
+    #[test]
+    fn a_node_with_no_keys_prints_the_absent_sentinel() {
+        let mut l = RoundLedger::new(ObsClock::Deterministic);
+        let c = ctx(8, 21, 21, 15);
+        l.note_slot_reached(&c);
+        l.note_votes(&c, &(0..15).collect::<Vec<_>>(), &[], VoteRejects::default(), 1);
+        l.note_finalized(8);
+        let line = l.take_emitted().remove(0).to_line();
+        assert!(line.contains(" cpid=-"), "absence is printed, not omitted: {line}");
+    }
+
+    /// The guard-refused case, which is why `cpid` is read from the ledger and not
+    /// from the vote just produced: `local=0` (every held key refused to re-sign)
+    /// and yet the node **is** on record as committed to a variant for this slot.
+    /// Reading the fresh vote would print `-` here and lose exactly the commitment
+    /// a restart-equivocation forensic is looking for.
+    #[test]
+    fn a_guard_refused_slot_still_names_what_this_node_is_committed_to() {
+        let mut l = RoundLedger::new(ObsClock::Deterministic);
+        let c = ctx(8, 21, 21, 15);
+        l.note_local_proposal(&c, 0, Some(0x0000_0000_00ff));
+        l.note_finalized(16); // superseded, never finalized here
+        let line = l.take_emitted().remove(0).to_line();
+        assert!(line.contains(" local=0 "), "{line}");
+        assert!(line.contains(" cpid=0000000000ff"), "the commitment survives: {line}");
+    }
+
+    /// A later observation that reads `None` must not erase a recorded commitment.
+    #[test]
+    fn a_recorded_commitment_is_never_un_set() {
+        let mut l = RoundLedger::new(ObsClock::Deterministic);
+        let c = ctx(8, 21, 21, 15);
+        l.note_local_proposal(&c, 5, Some(0xabc));
+        l.note_local_proposal(&c, 0, None);
+        assert_eq!(l.open_round(8).unwrap().local_cpid, Some(0xabc));
     }
 }

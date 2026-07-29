@@ -212,6 +212,18 @@ pub struct LiveGauges {
     pub open_rounds: u64,
     /// The scheduled halt height, if this release carries one (issue #74).
     pub halt_at: Option<u64>,
+    /// **Identity of the finalized checkpoint** (issue #84) — the 48-bit
+    /// [`qlab_devnet::committee::Checkpoint::identity`] of the finalized head, or
+    /// `None` when nothing is finalized.
+    pub finalized_checkpoint_id: Option<u64>,
+    /// **Identity of what this node's own keys are committed to** (issue #84), at
+    /// [`Self::signed_checkpoint_slot`]. `None` on a node holding no committee
+    /// keys, or one that has committed to nothing yet.
+    pub signed_checkpoint_id: Option<u64>,
+    /// The slot [`Self::signed_checkpoint_id`] refers to — the highest slot this
+    /// node's keys have committed to. Meaningless without it, so the two are
+    /// emitted and absent together.
+    pub signed_checkpoint_slot: Option<u64>,
     /// Inbound frames dropped by the per-peer rate limits (issue #91). Reported so
     /// an operator can *see* a peer misbehaving; deliberately **never** fed back
     /// into peer scoring, because "too fast" is not "wrong".
@@ -617,6 +629,60 @@ this release carries no halt.\n# TYPE qumbra_halt_height gauge\n");
     if let Some(h) = g.halt_at {
         o.push_str(&format!("qumbra_halt_height {h}\n"));
     }
+    // ---- issue #84: checkpoint identity, as a value and not as a label -------
+    //
+    // The obvious shape for an identity is an info metric —
+    // `qumbra_finalized_checkpoint_info{cpid="4cc8904e1f2a"} 1`. It is rejected
+    // here. The usual defence ("the label only changes once per checkpoint") does
+    // not survive arithmetic: one slot is 8 blocks × 75 s, so the label turns over
+    // 144 times a day per node, ≈2×10⁵ series a year across a four-node net. That
+    // is churn of the same order as a request-id label, arriving slowly.
+    //
+    // A plain numeric gauge has cardinality 1 forever and answers the actual
+    // question better. The alert an operator wants is "do the nodes agree", and on
+    // a value that is one line:
+    //
+    //     count(count_values("id", qumbra_finalized_checkpoint_id)) > 1
+    //
+    // which has no clean equivalent over a label. Humans read the hex out of the
+    // `TELEMETRY`/`ROUND` lines; `/metrics` is for the machine. The two are the
+    // same number — `printf '%012x'` of this gauge is the log field, exactly,
+    // which is why the identity is 48 bits (a float64 exposition value carries it
+    // unrounded; 64 bits would silently round and the correspondence would be a
+    // lie).
+    //
+    // Absence follows `qumbra_finalized_height`'s established rule rather than the
+    // log lines': **no series**, never a zero. A log line is positional and must
+    // hold a place for a missing value; a metric series is present-or-absent, and
+    // a placeholder there is a fabricated reading.
+    o.push_str(
+        "# HELP qumbra_finalized_checkpoint_id Identity of the finalized checkpoint (issue #84): the first \
+6 bytes of keccak256 over the exact bytes the committee signs, big-endian. Deliberately a value and not a \
+label — cardinality 1, and `count(count_values(\"id\", qumbra_finalized_checkpoint_id)) > 1` across a net is \
+the two-different-checkpoints-at-one-height alarm. printf '%012x' gives the `fid=` field in the logs. No \
+series when nothing is finalized.\n# TYPE qumbra_finalized_checkpoint_id gauge\n",
+    );
+    if let Some(id) = g.finalized_checkpoint_id {
+        o.push_str(&format!("qumbra_finalized_checkpoint_id {id}\n"));
+    }
+    o.push_str(
+        "# HELP qumbra_signed_checkpoint_id Identity of the checkpoint THIS node's own committee keys are \
+committed to (issue #84), at qumbra_signed_checkpoint_slot. Differs from qumbra_finalized_checkpoint_id \
+exactly when this node was on the losing side of a split — the minority still finalizes the majority's \
+checkpoint, so the finalized identity alone cannot show it. No series on a node holding no committee keys.\n\
+# TYPE qumbra_signed_checkpoint_id gauge\n",
+    );
+    if let Some(id) = g.signed_checkpoint_id {
+        o.push_str(&format!("qumbra_signed_checkpoint_id {id}\n"));
+    }
+    o.push_str(
+        "# HELP qumbra_signed_checkpoint_slot The slot qumbra_signed_checkpoint_id refers to. An identity \
+without its slot is not comparable across nodes, so the two appear and disappear together.\n\
+# TYPE qumbra_signed_checkpoint_slot gauge\n",
+    );
+    if let Some(slot) = g.signed_checkpoint_slot {
+        o.push_str(&format!("qumbra_signed_checkpoint_slot {slot}\n"));
+    }
     o.push_str(
         "# HELP qumbra_finality_regime Current regime, one-hot: the series with value 1 is the live one.\n\
 # TYPE qumbra_finality_regime gauge\n",
@@ -668,6 +734,9 @@ mod tests {
             throttled_getaddr: 2,
             outbound_netgroups: 3,
             halt_at: None,
+            finalized_checkpoint_id: Some(0x4cc8_904e_1f2a),
+            signed_checkpoint_id: Some(0x4cc8_904e_1f2a),
+            signed_checkpoint_slot: Some(1_352),
             process_start_secs: 1_769_000_000,
             rendered_at_secs: 1_769_150_000,
         }
@@ -771,6 +840,79 @@ mod tests {
             !text.lines().any(|l| l.starts_with("qumbra_finalized_height ")),
             "a never-finalized node must not report height 0 as finalized"
         );
+    }
+
+    // ---- issue #84: the identity gauges --------------------------------------
+
+    /// The gauge is the **same number** as the log field, and it survives a
+    /// float64 exposition value unrounded. This is the property that lets an
+    /// operator line up a scrape with an archived log line; if it ever stops
+    /// holding, the two instruments disagree and neither can be trusted.
+    #[test]
+    fn identity_gauge_is_the_log_field_in_decimal() {
+        let m = Metrics::new();
+        let g = gauges();
+        let text = render(&m, &g);
+        let id = g.finalized_checkpoint_id.unwrap();
+        assert!(text.contains(&format!("qumbra_finalized_checkpoint_id {id}\n")), "{text}");
+        // The value a Prometheus client parses is a float64; recovering the log
+        // field from it must be exact.
+        let scraped: f64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("qumbra_finalized_checkpoint_id "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            format!("{:012x}", scraped as u64),
+            qlab_devnet::committee::checkpoint_id_hex(Some(id)),
+            "printf '%012x' of the gauge must reproduce the fid= log field"
+        );
+    }
+
+    /// **Cardinality 1, by construction.** The rejected alternative was an info
+    /// metric carrying the identity as a label; this asserts we did not quietly
+    /// grow one, on any of the three new families.
+    #[test]
+    fn identity_families_carry_no_labels() {
+        let m = Metrics::new();
+        let text = render(&m, &gauges());
+        for fam in [
+            "qumbra_finalized_checkpoint_id",
+            "qumbra_signed_checkpoint_id",
+            "qumbra_signed_checkpoint_slot",
+        ] {
+            let series: Vec<&str> =
+                text.lines().filter(|l| l.starts_with(fam) && !l.starts_with('#')).collect();
+            assert_eq!(series.len(), 1, "exactly one series for {fam}: {series:?}");
+            assert!(!series[0].contains('{'), "{fam} must carry no labels: {}", series[0]);
+        }
+    }
+
+    /// Absence follows `qumbra_finalized_height`'s rule — declared but no series —
+    /// which is deliberately **not** the log lines' rule (`-`). A metric has no
+    /// position to hold open, so a placeholder there is a fabricated reading.
+    /// `signed_*` disappear as a pair: an identity without its slot is not
+    /// comparable across nodes.
+    #[test]
+    fn a_node_with_nothing_to_report_emits_declarations_but_no_series() {
+        let m = Metrics::new();
+        let mut g = gauges();
+        g.finalized_checkpoint_id = None;
+        g.signed_checkpoint_id = None;
+        g.signed_checkpoint_slot = None;
+        let text = render(&m, &g);
+        for fam in [
+            "qumbra_finalized_checkpoint_id",
+            "qumbra_signed_checkpoint_id",
+            "qumbra_signed_checkpoint_slot",
+        ] {
+            assert!(text.contains(&format!("# TYPE {fam} gauge")), "{fam} stays declared");
+            assert!(
+                !text.lines().any(|l| l.starts_with(&format!("{fam} "))),
+                "{fam} must emit no series when there is nothing to report"
+            );
+        }
     }
 
     /// A closed round folds into the aggregates exactly once, and per-member

@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use qlab_devnet::body::{TxEntry, TxVerifier};
-use qlab_devnet::committee::CommitteeState;
+use qlab_devnet::committee::{checkpoint_id_hex, CommitteeState};
 use qlab_devnet::ebbflow::FinalityStatus;
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::{CHECKPOINT_CADENCE_BLOCKS, DEGRADED_MODE_LAG_BLOCKS};
@@ -55,6 +55,21 @@ use qlab_p2p::adapter::{MiningClock, NodeAdapter};
 use qlab_p2p::n1::{ChainView, CommitteeControl};
 use qlab_p2p::transport::TcpTransport;
 use qlab_p2p::P2pNode;
+
+/// The `sid=` value when this node's own held keys are committed to *different*
+/// checkpoints at the same slot (issue #84). Distinguishable from an identity by
+/// length and by not being hex; see [`RunningNode::signed_id_field`].
+pub const LOCAL_COMMITMENT_SPLIT: &str = "split";
+
+/// What this node's own committee keys are committed to at one slot (issue #84).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalCommitment {
+    /// The highest slot any held key has committed to.
+    pub slot: u64,
+    /// The identity every held key that committed to `slot` agrees on, or `None`
+    /// when they disagree — this node's key set is split across two variants.
+    pub id: Option<u64>,
+}
 
 /// How often [`RunningNode::run_until`] runs a discovery maintenance pass —
 /// re-dial, auto-connect, ask for addresses (issue #83; was `REDIAL_INTERVAL`).
@@ -424,6 +439,57 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         self.sample_interval = d;
     }
 
+    /// **The identity of the finalized checkpoint** (issue #84), or `None` when
+    /// nothing is finalized. Read from the finality tracker's own head — this is
+    /// the checkpoint the quorum was verified against, not a re-derivation.
+    pub fn finalized_checkpoint_id(&self) -> Option<u64> {
+        self.p2p.node().finality().latest().map(|cp| cp.identity())
+    }
+
+    /// **What this node's own committee keys are committed to** (issue #84).
+    ///
+    /// Read from the never-double-sign ledgers — the same records that live in
+    /// `finalizer-*.state`, which until now could only be inspected by copying
+    /// those files off the host and hashing them.
+    ///
+    /// The slot reported is the highest any held key has committed to, which is
+    /// deliberately **not** the finalized height: at a split, the minority still
+    /// finalizes the majority's checkpoint, so the two agree on `final` and differ
+    /// only here.
+    pub fn local_commitment(&self) -> Option<LocalCommitment> {
+        let slot = self.finalizers.iter().filter_map(|f| f.last_voted_slot()).max()?;
+        let mut id: Option<u64> = None;
+        let mut agreed = true;
+        for f in &self.finalizers {
+            let Some(cp) = f.state().signed_at(slot) else { continue };
+            match id {
+                None => id = Some(cp.identity()),
+                Some(seen) if seen != cp.identity() => agreed = false,
+                Some(_) => {}
+            }
+        }
+        Some(LocalCommitment { slot, id: if agreed { id } else { None } })
+    }
+
+    /// The `sid=` field: the identity hex, `-` when this node holds no committee
+    /// keys or has committed to nothing, or `split` when its own held keys are
+    /// committed to *different* checkpoints for the same slot.
+    ///
+    /// `split` is reachable — a key restored from a ledger written on one history
+    /// refuses to re-sign while a key with no ledger signs the new one — and it is
+    /// this node equivocating against itself across its own key set. Picking one
+    /// of the two to print would be the exact failure this issue exists to remove:
+    /// a line that looks healthy while the thing it describes is not.
+    fn signed_id_field(&self) -> String {
+        match self.local_commitment() {
+            None => checkpoint_id_hex(None),
+            Some(c) => match c.id {
+                Some(id) => checkpoint_id_hex(Some(id)),
+                None => LOCAL_COMMITMENT_SPLIT.to_string(),
+            },
+        }
+    }
+
     /// A single observability sample line for the soak monitor (M10-T0-3 Phase
     /// B-lite). Reuses the canonical [`Telemetry::assemble`] rule — it never
     /// re-derives the frozen Ebb-and-Flow finality semantics — and adds the tip
@@ -498,13 +564,37 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // closed; a restart resets them.
         let rounds_closed = node.rounds().closed_total();
         let rounds_failed = node.rounds().failed_total();
+        // Issue #84: `fid` / `sslot` / `sid` are **appended at the end**, and every
+        // pre-existing field keeps its name, position and meaning (the #87 rule,
+        // unchanged). They are the pair the drills need:
+        //
+        //   `fid` — WHAT this node finalized. `final=3776` agreeing across four
+        //     hosts while `fid=` differs is two different checkpoints at one
+        //     height: the R2 stop condition, previously undetectable because both
+        //     nodes printed the identical `final=`.
+        //   `sslot`/`sid` — what this node's own KEYS are committed to, and at
+        //     which slot. This is the half that catches a split, because a
+        //     minority that signed a different variant still finalizes the
+        //     majority's: at slot 3776 all four hosts would print the same `fid`
+        //     and one would print a different `sid`.
+        //
+        // Absence prints `-`, matching `final=`/`age_s=`/`halt=`: the line is
+        // positional and a key that comes and goes forces a special case on every
+        // parser. A verify-only node holding no committee keys prints
+        // `sslot=- sid=-` and is still parsed by the same reader.
+        let commitment = self.local_commitment();
+        let sslot_str =
+            commitment.map(|c| c.slot.to_string()).unwrap_or_else(|| "-".to_string());
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={}",
             t.tip_height, final_str, t.stall_depth, age_str, tip_diff,
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
             self.p2p.addrs().dialable_count(), self.p2p.addrs().known_count(),
             rounds_closed, rounds_failed,
+            checkpoint_id_hex(self.finalized_checkpoint_id()),
+            sslot_str,
+            self.signed_id_field(),
         )
     }
 
@@ -539,6 +629,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
 
     /// Live levels for the exposition, read from node state at render time.
     fn live_gauges(&self) -> LiveGauges {
+        // Issue #84. Note the `split` case has no gauge representation and is
+        // reported as *absent*: a scrape must not carry a number that is one of two
+        // disagreeing values. The `TELEMETRY`/`ROUND` lines say `split` in words,
+        // and `qumbra_signed_checkpoint_slot` is still emitted, so the
+        // identity-missing-while-slot-present shape is itself the scrape-side
+        // signal.
+        let commitment = self.local_commitment();
         let node = self.p2p.node();
         let chain = node.chain();
         let tip = node.tip_height();
@@ -571,6 +668,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             quorum: ctx.need as u64,
             open_rounds: node.rounds().open_len() as u64,
             halt_at: self.halt_at,
+            finalized_checkpoint_id: node.finality().latest().map(|cp| cp.identity()),
+            signed_checkpoint_id: commitment.and_then(|c| c.id),
+            signed_checkpoint_slot: commitment.map(|c| c.slot),
             throttled_frames: {
                 let s = self.p2p.rate_stats();
                 s.throttled_frames + s.throttled_bytes
@@ -723,10 +823,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             // ("genesis is never a slot"), and a journal that opened with a round
             // nobody ever voted in would put a fictional row at the top of every
             // node's record.
+            //
+            // Issue #84: the slot's `cpid` is read from the never-double-sign
+            // LEDGER, not from `made` — when the guard refused every held key,
+            // `local=0` and there is no fresh vote, yet the node is still on record
+            // as committed to a variant for this slot, and that commitment is
+            // precisely what a split forensic is looking for.
             if self.next_checkpoint > 0 {
-                let ctx = self.p2p.node().slot_context(self.next_checkpoint);
+                let slot = self.next_checkpoint;
+                let ctx = self.p2p.node().slot_context(slot);
                 let local = made.as_ref().map(|(_, v)| v.len()).unwrap_or(0);
-                self.p2p.node_mut().rounds_mut().note_local_proposal(&ctx, local);
+                let cpid = self
+                    .finalizers
+                    .iter()
+                    .find_map(|f| f.state().signed_at(slot).map(|cp| cp.identity()));
+                self.p2p.node_mut().rounds_mut().note_local_proposal(&ctx, local, cpid);
             }
             if let Some((cp, votes)) = made {
                 self.persist_finalizers(); // durable BEFORE the vote leaves the node
@@ -1575,6 +1686,8 @@ mod tests {
                 "halt", "hignore", "powrej", "dialable",
                 // ── appended by #87, at the end ──
                 "rounds", "rfail",
+                // ── appended by #84, at the end ──
+                "fid", "sslot", "sid",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -1582,6 +1695,275 @@ mod tests {
         // Genesis finalized as slot 0 without a round, so nothing has closed yet.
         assert!(line.contains(" rounds=0 rfail=0"), "{line}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The compatibility contract, stated so that **it survives the next append**.
+    ///
+    /// `telemetry_line_is_extended_at_the_end_and_nowhere_else` asserts the whole
+    /// key vector, so every baton that appends a field must edit it — #87 did, and
+    /// #84 did. That makes the "unmodified" half of an acceptance bar impossible to
+    /// satisfy honestly, and worse, it means the assertion that pre-existing fields
+    /// have not moved is re-typed (and could be re-typed *wrongly*) each time.
+    ///
+    /// This one pins the pre-#84 prefix as a constant. A future append cannot
+    /// require touching it; a rename, a reorder, or a deletion breaks it.
+    #[test]
+    fn the_pre_i84_telemetry_prefix_is_frozen_against_future_appends() {
+        /// Every `TELEMETRY` field that existed before issue #84, in order. This
+        /// list is **append-only history, not a wish**: nothing may be added here.
+        const PRE_I84_FIELDS: [&str; 15] = [
+            "tip", "final", "stall", "age_s", "diff", "peers", "mempool", "epoch", "regime",
+            "halt", "hignore", "powrej", "dialable", "rounds", "rfail",
+        ];
+        let (config, genesis, base) = rig("telemetry_prefix", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint();
+        assert!(node.try_mine());
+
+        let line = node.telemetry_sample();
+        let keys: Vec<&str> = line
+            .split_whitespace()
+            .skip(1)
+            .map(|kv| kv.split('=').next().unwrap())
+            .collect();
+        assert!(keys.len() >= PRE_I84_FIELDS.len(), "fields were deleted: {line}");
+        assert_eq!(
+            &keys[..PRE_I84_FIELDS.len()],
+            &PRE_I84_FIELDS,
+            "every pre-#84 field keeps its name and its position: {line}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- issue #84: the finalized checkpoint's identity ----------------------
+
+    /// Read one `key=value` field out of a `TELEMETRY`/`ROUND` line.
+    fn field<'a>(line: &'a str, key: &str) -> &'a str {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("no {key}= in: {line}"))
+    }
+
+    /// Mine to the first cadence slot and finalize it, returning the sample line.
+    /// `wall` selects the header-timestamp clock: two nodes on different clocks
+    /// mine *different blocks* at the same height, which is how a real net's nodes
+    /// diverge (timestamps and nonces are the only per-node inputs) and is what
+    /// puts two different checkpoints on one height here.
+    fn node_finalizing_slot_8(tag: &str, wall: bool) -> (String, PathBuf) {
+        let (config, genesis, base) = rig(tag, true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        if wall {
+            node.set_mining_clock(MiningClock::WallClock);
+        }
+        node.try_checkpoint(); // genesis (slot 0)
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+            assert!(node.try_mine(), "{tag}: mines at the genesis difficulty");
+        }
+        node.try_checkpoint(); // slot 8
+        assert_eq!(
+            node.finalized_height(),
+            Some(CHECKPOINT_CADENCE_BLOCKS),
+            "{tag}: slot 8 finalized"
+        );
+        (node.telemetry_sample(), base)
+    }
+
+    /// **ACCEPTANCE #1 — the whole point of the issue.**
+    ///
+    /// Two nodes finalize a checkpoint at the *same height* over *different*
+    /// blocks: this is R2, "two different checkpoints finalized at the same
+    /// height", the single most serious consensus failure and — before this field
+    /// — completely invisible, because both nodes print the identical `final=8`.
+    /// The third node repeats the first exactly, so the test also pins the other
+    /// half: agreement must be byte-identical, or the field cries wolf on every
+    /// healthy net and gets ignored.
+    #[test]
+    fn nodes_that_finalized_different_checkpoints_at_one_height_print_different_identities() {
+        let (a, abase) = node_finalizing_slot_8("id_a", false);
+        let (b, bbase) = node_finalizing_slot_8("id_b", true);
+        let (c, cbase) = node_finalizing_slot_8("id_c", false);
+
+        // All three agree on the height, which is exactly the problem: `final=`
+        // alone cannot tell the fork from the healthy pair.
+        for l in [&a, &b, &c] {
+            assert_eq!(field(l, "final"), "8", "{l}");
+        }
+
+        // A and B finalized different blocks at height 8 ⇒ different identities.
+        assert_ne!(
+            field(&a, "fid"),
+            field(&b, "fid"),
+            "two checkpoints at one height MUST NOT print the same identity\nA: {a}\nB: {b}"
+        );
+        // A and C finalized the same checkpoint ⇒ byte-identical identities.
+        assert_eq!(
+            field(&a, "fid"),
+            field(&c, "fid"),
+            "agreeing nodes MUST be byte-identical\nA: {a}\nC: {c}"
+        );
+        // The identity is well-formed on all three, not merely different.
+        for l in [&a, &b, &c] {
+            let fid = field(l, "fid");
+            assert_eq!(fid.len(), 12, "{l}");
+            assert!(u64::from_str_radix(fid, 16).is_ok(), "{l}");
+        }
+
+        // The same divergence is visible in what each node's KEYS signed — the
+        // slot-3776 half. A and B hold the whole committee here, so each finalized
+        // its own variant and `sid == fid`; on the T0 topology (6/5/5/5) a minority
+        // finalizes the majority's checkpoint and only `sid` separates them.
+        assert_eq!(field(&a, "sslot"), "8");
+        assert_eq!(field(&a, "sid"), field(&a, "fid"), "this node signed what it finalized");
+        assert_ne!(field(&a, "sid"), field(&b, "sid"), "the two key sets signed different things");
+
+        for base in [abase, bbase, cbase] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// **ACCEPTANCE #2 — absence is printed, not omitted.** Before anything is
+    /// finalized all three fields are present and carry the same `-` sentinel the
+    /// line already uses for `final=`/`age_s=`/`halt=`. A field that simply
+    /// disappears forces every parser to special-case the cold-start window, and
+    /// that special case is the one nobody writes.
+    #[test]
+    fn identity_fields_are_present_and_well_formed_before_anything_finalizes() {
+        let (config, genesis, base) = rig("id_cold", true);
+        let node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        assert_eq!(node.finalized_height(), None, "nothing finalized yet");
+
+        let line = node.telemetry_sample();
+        assert_eq!(field(&line, "final"), "-", "the precedent this follows: {line}");
+        assert_eq!(field(&line, "fid"), "-", "{line}");
+        assert_eq!(field(&line, "sslot"), "-", "{line}");
+        assert_eq!(field(&line, "sid"), "-", "{line}");
+        // Same for the scrape — but there the rule is the opposite and deliberate:
+        // no series at all, following `qumbra_finalized_height`. A log line has a
+        // position to hold open; a metric series does not, and a placeholder there
+        // would be a reading that was never taken.
+        let text = node.metrics_text();
+        for fam in ["qumbra_finalized_checkpoint_id", "qumbra_signed_checkpoint_id"] {
+            assert!(text.contains(&format!("# TYPE {fam} gauge")), "{fam} declared");
+            assert!(
+                !text.lines().any(|l| l.starts_with(&format!("{fam} "))),
+                "{fam} must emit no series before anything is finalized"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The log field and the scrape are **the same number in two spellings**, on a
+    /// live node. If this ever drifts an operator has two instruments that
+    /// disagree, which is worse than having one.
+    #[test]
+    fn the_scrape_and_the_log_line_report_one_identity() {
+        let (config, genesis, base) = rig("id_scrape", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint();
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+            assert!(node.try_mine());
+        }
+        node.try_checkpoint();
+
+        let line = node.telemetry_sample();
+        let text = node.metrics_text();
+        let scraped: u64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("qumbra_finalized_checkpoint_id "))
+            .expect("the gauge is emitted once something is finalized")
+            .parse()
+            .unwrap();
+        assert_eq!(format!("{scraped:012x}"), field(&line, "fid"), "{line}\n{text}");
+        assert!(text.contains(&format!("qumbra_signed_checkpoint_slot {CHECKPOINT_CADENCE_BLOCKS}")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The per-slot journal carries the identity too, and it is the *durable* copy:
+    /// `TELEMETRY` is sampled on a cadence, so a finality catch-up that jumps
+    /// several slots leaves no sample for the slots it skipped. `ROUND` has a line
+    /// for every one of them.
+    #[test]
+    fn the_round_journal_names_what_this_node_signed_for_each_slot() {
+        let (config, genesis, base) = rig("id_journal", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint();
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+            assert!(node.try_mine());
+            node.note_slots_reached();
+            node.try_checkpoint();
+        }
+        let lines = node.emit_rounds();
+        let slot8 = lines
+            .iter()
+            .find(|l| l.starts_with(&format!("ROUND slot={CHECKPOINT_CADENCE_BLOCKS} ")))
+            .unwrap_or_else(|| panic!("slot 8 must be journalled; got {lines:?}"));
+        let cpid = field(slot8, "cpid");
+        assert_eq!(cpid.len(), 12, "{slot8}");
+        // …and it is the same checkpoint the sample line reports as finalized.
+        assert_eq!(cpid, field(&node.telemetry_sample(), "fid"), "{slot8}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **A node whose own key set is split against itself says so.**
+    ///
+    /// Reachable after a restart on a diverged history: a key whose ledger was
+    /// restored refuses to re-sign the new variant while a key with no ledger
+    /// signs it, leaving one node holding two commitments for one slot. Printing
+    /// either one would produce a line that looks healthy, which is the failure
+    /// mode this whole issue is about — so the field says `split` instead, and the
+    /// scrape drops the identity while keeping the slot (an identity-missing-but-
+    /// slot-present scrape is the machine-side form of the same alarm).
+    #[test]
+    fn a_node_whose_own_keys_disagree_prints_split_rather_than_picking_one() {
+        use qlab_devnet::committee::Checkpoint;
+
+        let (config, genesis, base) = rig("id_split", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let slot = CHECKPOINT_CADENCE_BLOCKS;
+        let x = Checkpoint::new(slot, [0x11; 32], [0x11; 32]);
+        let y = Checkpoint::new(slot, [0x22; 32], [0x22; 32]);
+        node.finalizers_mut()[0].sign(&x).expect("a fresh ledger signs");
+        node.finalizers_mut()[1].sign(&y).expect("a fresh ledger signs");
+
+        let c = node.local_commitment().expect("keys are committed");
+        assert_eq!(c.slot, slot);
+        assert_eq!(c.id, None, "disagreeing keys have no single identity");
+
+        let line = node.telemetry_sample();
+        assert_eq!(field(&line, "sslot"), slot.to_string(), "{line}");
+        assert_eq!(field(&line, "sid"), LOCAL_COMMITMENT_SPLIT, "{line}");
+
+        let text = node.metrics_text();
+        assert!(
+            text.contains(&format!("qumbra_signed_checkpoint_slot {slot}")),
+            "the slot is still reported: {text}"
+        );
+        assert!(
+            !text.lines().any(|l| l.starts_with("qumbra_signed_checkpoint_id ")),
+            "a scrape must not carry one of two disagreeing values"
+        );
+
+        // Agreement is the ordinary case and still prints an identity.
+        let (config2, genesis2, base2) = rig("id_agree", true);
+        let mut n2 =
+            RunningNode::start(&config2, &genesis2, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        n2.finalizers_mut()[0].sign(&x).unwrap();
+        n2.finalizers_mut()[1].sign(&x).unwrap();
+        assert_eq!(n2.local_commitment().unwrap().id, Some(x.identity()));
+        assert_eq!(field(&n2.telemetry_sample(), "sid"), x.id_hex());
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base2);
     }
 
     /// The journal on the real run path: a node holding the whole committee closes
