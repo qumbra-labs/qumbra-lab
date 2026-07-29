@@ -60,7 +60,17 @@ pub struct FullNode {
     pub id: PeerId,
     /// Committee signing keys this node holds (only the designated proposer does).
     pub validators: Vec<Validator>,
+    /// Deterministic simulation clock in milliseconds, advanced one step per
+    /// [`FullNode::tick`] (issue #91). `tick` needs a clock for the inbound rate
+    /// limits; feeding it a wall clock here would make this soak's byte-identical
+    /// reproducibility depend on how fast the machine is, and feeding it a frozen
+    /// clock would leave the buckets unable to refill. A per-node monotone counter
+    /// is both deterministic and honest about elapsed time.
+    sim_ms: u64,
 }
+
+/// Simulated milliseconds one `tick` represents.
+const SIM_TICK_MS: u64 = 10;
 
 impl FullNode {
     /// Build a full node with a fresh adapter over `committee`. `validators` is
@@ -74,12 +84,22 @@ impl FullNode {
     ) -> Self {
         let transport = InProcTransport::new(id, Arc::clone(hub));
         let adapter = NodeAdapter::new(committee, KeccakPow, MarkerVerifier, soak_sim());
-        FullNode { p2p: P2pNode::new(transport, adapter, node_id), id, validators }
+        FullNode { p2p: P2pNode::new(transport, adapter, node_id), id, validators, sim_ms: 0 }
     }
 
-    /// One message-pump step.
+    /// One message-pump step, advancing this node's deterministic sim clock.
     pub fn tick(&mut self) -> usize {
-        self.p2p.tick()
+        self.sim_ms += SIM_TICK_MS;
+        self.p2p.tick(self.sim_ms)
+    }
+
+    /// Inbound frames this node's rate limiter dropped (issue #91). Asserted to be
+    /// zero across the soak: honest traffic must not be throttled, and a soak that
+    /// silently discarded frames would be measuring a different network than the
+    /// one it reports on.
+    pub fn throttled(&self) -> u64 {
+        let s = self.p2p.rate_stats();
+        s.throttled_frames + s.throttled_bytes
     }
 
     pub fn tip_height(&self) -> u64 {
@@ -208,6 +228,11 @@ pub struct LeakResult {
     pub samples: Vec<(u64, usize)>,
     pub bounded: bool,
     pub final_tip: u64,
+    /// Inbound frames the rate limiter dropped across all nodes (issue #91).
+    /// **Expected zero**: the caps exist to bound a flood, and a soak in which
+    /// honest traffic is being silently discarded is describing a different
+    /// network from the one it reports on.
+    pub throttled: u64,
 }
 
 /// The genesis (finalized) commitment root of a node — a valid tx anchor.
@@ -643,7 +668,13 @@ pub fn scenario_long_run_leak_check(seed: u64, blocks: u64) -> LeakResult {
             }
         }
     }
-    LeakResult { rounds: blocks, samples, bounded, final_tip: nodes[0].tip_height() }
+    LeakResult {
+        rounds: blocks,
+        samples,
+        bounded,
+        final_tip: nodes[0].tip_height(),
+        throttled: nodes.iter().map(|n| n.throttled()).sum(),
+    }
 }
 
 /// Bench-mode entry: run all four scenarios and print the T0 soak report.
@@ -671,8 +702,9 @@ pub fn run_n7soak(power: &str, _only: Option<&str>) {
         .collect::<Vec<_>>()
         .join(" ");
     println!(
-        "| long-run leak check | 3 | {} | {} | — | max-mempool samples [{}] |",
-        s4.final_tip, s4.bounded, s4_samples
+        "| long-run leak check | 3 | {} | {} | — | max-mempool samples [{}]; \
+         rate-limited frames {} over {} rounds x 3 nodes |",
+        s4.final_tip, s4.bounded, s4_samples, s4.throttled, s4.rounds
     );
     println!("\n## Reproduction\n");
     println!("Deterministic (KeccakPow + seeded SplitMix64). Seeds: S1=1, S3=2, S4=3 (1000 rounds).");
@@ -728,6 +760,11 @@ mod tests {
         let r = scenario_long_run_leak_check(3, 300);
         assert!(r.bounded, "mempool stays bounded across the run: {:?}", r.samples);
         assert!(r.final_tip >= 300, "the chain made progress: tip {}", r.final_tip);
+        // Issue #91: the in-limit half of the acceptance bar, at integration scale.
+        // 300 rounds of honest mesh traffic — mining, tx flow, checkpoint gossip —
+        // must not trip a single inbound budget. If this ever fails, the limits are
+        // too tight for honest traffic and it is the limits that are wrong.
+        assert_eq!(r.throttled, 0, "honest soak traffic is never rate-limited");
     }
 
     #[test]
