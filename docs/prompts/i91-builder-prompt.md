@@ -52,7 +52,7 @@ issue 的决定 1 和 2 里各埋了一个,明说给你,因为绕过去比答错
 
 2. **REPEAT-GOTCHA(本项目已有两次实测事故)**:曾有 builder subagent 误改**主工作树**。**每一批编辑前先确认 cwd 是你自己的 worktree**;派任何 subagent 都要把这条警告原样转发进它的 prompt。
 
-3. **重活要问。** 定向测试随便跑(`-p qlab-p2p`,不吃内存);**全量 `cargo test --release --workspace` 开跑前先问 coordinator**——rig 是共享的,并发两个 release 套件会 OOM。**[#87](https://github.com/lai3d/qumbra-lab/issues/87) 可能同时在跑,它和你抢同一台机器。** rig 状态见 issue #64 的置顶评论。
+3. **重活要问。** 定向测试随便跑(`-p qlab-p2p`,不吃内存);**全量 `cargo test --release --workspace` 开跑前先问 coordinator**——rig 是共享的,并发两个 release 套件会 OOM。**[#87](https://github.com/lai3d/qumbra-lab/issues/87) 已于 2026-07-29 合并(PR #96),所以机器现在大概率是空的——但仍然先问,因为占机的可能是 coordinator 在跑验收套件。** rig 状态见 issue #64 的置顶评论。
 
 4. **分阶段提交。** 本项目 builder 多次在 usage limit 中途被打断——**未提交的大改动 = 丢失的工作。**
 
