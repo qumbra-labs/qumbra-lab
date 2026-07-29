@@ -33,6 +33,7 @@
 //! the two at runtime); the tests below drive it with the rehearsal stand-in.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use qlab_devnet::body::{TxEntry, TxVerifier};
@@ -42,12 +43,16 @@ use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::{CHECKPOINT_CADENCE_BLOCKS, DEGRADED_MODE_LAG_BLOCKS};
 use qlab_devnet::pow::PowEngine;
 
+use qlab_node::metrics::{render as render_metrics, LiveGauges};
 use qlab_node::recovery::{Finalizer, FinalizerState};
+use qlab_node::round::ObsClock;
 use qlab_node::Telemetry;
+
+use crate::metrics_server::MetricsServer;
 
 use qlab_p2p::addrman::{AddrManager, DIAL_RETRY_INTERVAL_MS};
 use qlab_p2p::adapter::{MiningClock, NodeAdapter};
-use qlab_p2p::n1::ChainView;
+use qlab_p2p::n1::{ChainView, CommitteeControl};
 use qlab_p2p::transport::TcpTransport;
 use qlab_p2p::P2pNode;
 
@@ -57,6 +62,22 @@ const MAINTAIN_INTERVAL: Duration = Duration::from_millis(DIAL_RETRY_INTERVAL_MS
 
 /// The persisted address book, under the node's data dir (issue #83 scope 7).
 const ADDRBOOK_FILE: &str = "peers.dat";
+
+/// How often the `/metrics` snapshot is re-rendered (issue #87). Chosen under a
+/// typical 15 s Prometheus scrape interval so a scrape is never more than one
+/// refresh stale, while the node — not the scraper — sets the cost. Rendering is a
+/// few dozen string appends over integer state; the run loop pays it, never a
+/// request handler. Observability only: it changes nothing but snapshot freshness.
+const METRICS_REFRESH: Duration = Duration::from_secs(5);
+
+/// Unix seconds now (wall clock). Used for the metric surface's `process_start` and
+/// `rendered_at` stamps only — never for consensus, which reads header timestamps.
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 use crate::config::NodeConfig;
 use crate::genesis::{GenesisError, GenesisFile};
@@ -182,6 +203,28 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     nonce: u64,
     /// Next checkpoint height to propose (cadence grid; only if we hold keys).
     next_checkpoint: u64,
+    /// Next cadence slot the **diagnostics ledger** has not yet opened (issue #87).
+    ///
+    /// Deliberately separate from `next_checkpoint`: that cursor only moves on a
+    /// node that holds committee keys, and a slot nobody here proposed is exactly
+    /// the slot most worth having a record of. A verify-only node journals every
+    /// round it lived through.
+    next_round_slot: u64,
+    /// When regime residency was last accumulated, so `Degraded` share is measured
+    /// as *seconds spent*, not as a fraction of printed samples (issue #87).
+    last_regime_tick: Instant,
+    /// The last rendered `/metrics` exposition, shared with the scrape server.
+    /// The run loop renders on its own cadence and the server thread serves the
+    /// snapshot: a scraper can never contend with the consensus loop for node
+    /// state, which matters on a 2 vCPU host.
+    metrics_snapshot: Arc<Mutex<String>>,
+    /// When the metrics snapshot was last rendered.
+    last_metrics_render: Instant,
+    /// The scrape server, when `metrics_addr` is configured. `None` = the node
+    /// listens on nothing extra, which is the default.
+    metrics_server: Option<MetricsServer>,
+    /// Unix seconds this process started (exported so a restart is a visible fact).
+    process_start_secs: u64,
     /// Local listen address (for logs).
     listen_addr: String,
     /// How often [`Self::run_until`] emits a `TELEMETRY` stdout sample line (the
@@ -322,6 +365,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             last_mine: Instant::now(),
             nonce: 0,
             next_checkpoint: 0, // finalize genesis first, then the cadence grid
+            // The ledger's cursor starts at the first cadence slot: genesis is
+            // finalized without a round, so there is no round 0 to journal.
+            next_round_slot: CHECKPOINT_CADENCE_BLOCKS,
+            last_regime_tick: Instant::now(),
+            metrics_snapshot: Arc::new(Mutex::new(String::new())),
+            last_metrics_render: Instant::now(),
+            metrics_server: None,
+            process_start_secs: unix_secs(),
             listen_addr: bound,
             // Sample telemetry roughly every 30 s (well under the 75 s block time,
             // so every block shows up in the trace; the soak monitor also runs
@@ -437,13 +488,171 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // decision: it must fire on a MEASUREMENT, not on someone's memory that the
         // question was deferred. If this ratio collapses toward "only the seeds are
         // dialable", that is the signal to build NAT traversal.
+        // Issue #87: `rounds=` / `rfail=` are **appended at the end**, and every
+        // pre-existing field keeps its name, position and meaning. The T0 sampler and
+        // the sealed evidence pack (PR #93) parse `key=value` pairs, so a consumer
+        // that does not know these two simply does not read them. They exist so a
+        // consumer watching only this line still sees checkpoint rounds failing —
+        // the `ROUND` journal carries the detail, this carries the alarm.
+        // Caliper: both are cumulative since PROCESS START, over rounds this node
+        // closed; a restart resets them.
+        let rounds_closed = node.rounds().closed_total();
+        let rounds_failed = node.rounds().failed_total();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={}",
             t.tip_height, final_str, t.stall_depth, age_str, tip_diff,
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
             self.p2p.addrs().dialable_count(), self.p2p.addrs().known_count(),
+            rounds_closed, rounds_failed,
         )
+    }
+
+    // ---- issue #87: round diagnostics + structured metrics -------------------
+
+    /// Select the round-diagnostics clock. The binary opts into
+    /// [`ObsClock::WallClock`] alongside [`Self::set_mining_clock`]; tests keep the
+    /// deterministic default, which records counts but never invents timings.
+    pub fn set_obs_clock(&mut self, clock: ObsClock) {
+        self.p2p.node_mut().set_obs_clock(clock);
+    }
+
+    /// Bind the `/metrics` scrape endpoint. Returns the bound address.
+    ///
+    /// Called only when `metrics_addr` is set in the config: a node nobody scrapes
+    /// listens on nothing extra. An unbindable address is an **error**, never a
+    /// silent no-op — a node that believes it is observable and is not is the exact
+    /// failure this issue exists to remove.
+    pub fn start_metrics_endpoint(&mut self, addr: &str) -> std::io::Result<std::net::SocketAddr> {
+        self.refresh_metrics(); // serve a real snapshot from the first scrape on
+        let srv = MetricsServer::start(addr, Arc::clone(&self.metrics_snapshot))?;
+        let bound = srv.addr();
+        self.metrics_server = Some(srv);
+        Ok(bound)
+    }
+
+    /// The current exposition text (also what a scrape would receive after the next
+    /// refresh). Rendering is a few dozen string appends over integer state.
+    pub fn metrics_text(&self) -> String {
+        render_metrics(self.p2p.node().metrics(), &self.live_gauges())
+    }
+
+    /// Live levels for the exposition, read from node state at render time.
+    fn live_gauges(&self) -> LiveGauges {
+        let node = self.p2p.node();
+        let chain = node.chain();
+        let tip = node.tip_height();
+        let tip_diff = chain.header(&chain.tip_hash()).map(|h| h.difficulty).unwrap_or(0);
+        let finalized = node.finalized_height();
+        let ctx = node.slot_context(tip);
+        let regime = match node.finality_status() {
+            FinalityStatus::Final => "final",
+            FinalityStatus::Degraded => "degraded",
+            FinalityStatus::Halting => "halting",
+            FinalityStatus::Halted => "halted",
+        };
+        LiveGauges {
+            tip_height: tip,
+            finalized_height: finalized,
+            // Same rule as the telemetry wire, read from it rather than re-derived.
+            stall_depth: match finalized {
+                Some(f) => tip.saturating_sub(f),
+                None => tip,
+            },
+            regime,
+            difficulty: tip_diff,
+            peers: self.p2p.peers().len() as u64,
+            dialable: self.p2p.addrs().dialable_count() as u64,
+            known: self.p2p.addrs().known_count() as u64,
+            mempool: node.mempool().len() as u64,
+            epoch: node.committee().current_epoch(),
+            committee_size: ctx.roster as u64,
+            committee_active: ctx.active as u64,
+            quorum: ctx.need as u64,
+            open_rounds: node.rounds().open_len() as u64,
+            halt_at: self.halt_at,
+            process_start_secs: self.process_start_secs,
+            rendered_at_secs: unix_secs(),
+        }
+    }
+
+    /// Re-render the snapshot the scrape server serves.
+    fn refresh_metrics(&mut self) {
+        let text = self.metrics_text();
+        if let Ok(mut slot) = self.metrics_snapshot.lock() {
+            *slot = text;
+        }
+    }
+
+    /// Accumulate wall time into the current finality regime.
+    ///
+    /// This is what makes "`Degraded` 15.9 %" a measured residency rather than a
+    /// count of the samples that happened to print while degraded. Called on every
+    /// loop pass, so the resolution is the loop's, not the sampler's.
+    pub fn accumulate_regime(&mut self) {
+        let elapsed = self.last_regime_tick.elapsed();
+        self.last_regime_tick = Instant::now();
+        let regime = match self.p2p.node().finality_status() {
+            FinalityStatus::Final => "final",
+            FinalityStatus::Degraded => "degraded",
+            FinalityStatus::Halting => "halting",
+            FinalityStatus::Halted => "halted",
+        };
+        self.p2p.node_mut().metrics_mut().observe_regime(regime, elapsed.as_millis() as u64);
+    }
+
+    /// **The slot cursor.** Open a diagnostics record for every cadence slot the
+    /// chain has reached, whether or not this node proposes or holds a key.
+    ///
+    /// Without this, a slot that nobody proposed — or whose proposal never reached
+    /// us — would leave no trace, and "no trace" is indistinguishable from "nothing
+    /// happened". That indistinguishability is the 42 h silence.
+    pub fn note_slots_reached(&mut self) {
+        let tip = self.p2p.node().tip_height();
+        while self.next_round_slot <= tip {
+            // HALT (issue #74, H2): the committee stops checkpointing above H, so
+            // there is no round above H to journal either.
+            if self.halt_at.is_some_and(|h| self.next_round_slot > h) {
+                break;
+            }
+            let ctx = self.p2p.node().slot_context(self.next_round_slot);
+            self.p2p.node_mut().rounds_mut().note_slot_reached(&ctx);
+            self.next_round_slot += CHECKPOINT_CADENCE_BLOCKS;
+        }
+    }
+
+    /// Emit one `ROUND` journal line per round that closed since the last call, and
+    /// fold each into the metric aggregates. Returns the lines emitted.
+    ///
+    /// The journal goes to **stdout, beside the `TELEMETRY` line** — deliberately.
+    /// The container log is what is archived and cited as evidence, and (unlike a
+    /// scrape target on 7-day retention) it needs no inbound rule to reach. Metrics
+    /// answer "how often"; only the journal can answer "who was missing in round
+    /// 1,384", and that question is asked after the fact.
+    pub fn emit_rounds(&mut self) -> Vec<String> {
+        let closed = self.p2p.node_mut().drain_rounds();
+        let lines: Vec<String> = closed.iter().map(|r| r.to_line()).collect();
+        for line in &lines {
+            println!("{line}");
+        }
+        lines
+    }
+
+    /// Emit a `close=open` line for any round that has been open too long — so a
+    /// **stall is visible while it is happening**, not only once it ends.
+    ///
+    /// Without this the journal is silent for the whole duration of the thing it
+    /// exists to explain: a round only closes when a later slot finalizes past it, so
+    /// during a stall the detail arrives exactly when it stops being urgent. Reports
+    /// repeat when the vote count moves and otherwise stay quiet, so a round stuck at
+    /// `have=11/15` says so and then does not spam the log. Sampled on the telemetry
+    /// cadence. Returns the lines emitted.
+    pub fn emit_overdue_rounds(&mut self) -> Vec<String> {
+        let lines = self.p2p.node_mut().rounds_mut().overdue_reports();
+        for line in &lines {
+            println!("{line}");
+        }
+        lines
     }
 
     /// One message-pump step; returns frames handled.
@@ -487,6 +696,20 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 .p2p
                 .node()
                 .make_checkpoint_guarded(self.next_checkpoint, &mut self.finalizers);
+            // Issue #87: record that THIS node proposed the slot and how many of its
+            // own keys signed. `local=0` on a slot we proposed is itself a finding —
+            // it means every held key was refused by the never-double-sign guard.
+            //
+            // Height 0 is excluded on purpose: finalizing genesis is a bootstrap act,
+            // not a checkpoint round. `is_checkpoint_height` says the same thing
+            // ("genesis is never a slot"), and a journal that opened with a round
+            // nobody ever voted in would put a fictional row at the top of every
+            // node's record.
+            if self.next_checkpoint > 0 {
+                let ctx = self.p2p.node().slot_context(self.next_checkpoint);
+                let local = made.as_ref().map(|(_, v)| v.len()).unwrap_or(0);
+                self.p2p.node_mut().rounds_mut().note_local_proposal(&ctx, local);
+            }
             if let Some((cp, votes)) = made {
                 self.persist_finalizers(); // durable BEFORE the vote leaves the node
                 self.p2p.announce_checkpoint(cp, votes);
@@ -614,13 +837,28 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         self.last_sample = Instant::now();
         while !shutdown.load(Ordering::Relaxed) {
             let n = self.step_once();
+            // Issue #87, in the order that keeps the record honest: accumulate the
+            // regime residency first (so the seconds land in the regime that was
+            // actually in force), then open any newly-reached slot, then emit the
+            // rounds that closed while we were away. All three are cheap and none
+            // touches consensus.
+            self.accumulate_regime();
+            self.note_slots_reached();
+            self.emit_rounds();
             if self.mining && self.last_mine.elapsed() >= self.mine_interval {
                 if self.try_mine() {
                     self.try_checkpoint();
                 }
             }
+            if self.metrics_server.is_some() && self.last_metrics_render.elapsed() >= METRICS_REFRESH {
+                self.refresh_metrics();
+                self.last_metrics_render = Instant::now();
+            }
             if self.last_sample.elapsed() >= self.sample_interval {
                 println!("{}", self.telemetry_sample());
+                // A stall's open rounds report themselves on the same cadence as the
+                // telemetry line they explain.
+                self.emit_overdue_rounds();
                 self.last_sample = Instant::now();
                 // Cheap and idempotent; sampled on the telemetry cadence so it costs
                 // nothing on a net that never halts.
@@ -634,6 +872,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
+        // Any round still open at shutdown stays open: it is genuinely unfinished,
+        // and inventing a close for it would put a fabricated verdict in the record.
+        // The rounds that DID close are flushed, so nothing already decided is lost.
+        self.emit_rounds();
         // Graceful shutdown = snapshot flush + the learned address book.
         if let Err(e) = self.save_snapshot() {
             eprintln!("snapshot flush on shutdown failed: {e}");
@@ -691,6 +933,7 @@ mod tests {
             committee_key_paths: keys, // hold all 21 → this node can finalize
             mining,
             expected_genesis_hash: Some(genesis.hash_hex()),
+            metrics_addr: None,
         };
         (config, genesis, base)
     }
@@ -1284,5 +1527,182 @@ mod tests {
         // …but the stand-down is still visible to an operator.
         assert!(node.release().banner(None).contains("CANCELLED"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+    // ---- issue #87: the journal, the caliper, and the scrape endpoint --------
+
+    /// The `TELEMETRY` line's **compatibility contract**: every pre-#87 field keeps
+    /// its name, its value and its position, and the two new counters are appended
+    /// at the end. The T0 sampler and the sealed evidence pack (PR #93) read this
+    /// line; nothing in it may shift under them.
+    #[test]
+    fn telemetry_line_is_extended_at_the_end_and_nowhere_else() {
+        let (config, genesis, base) = rig("telemetry_shape", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint();
+        assert!(node.try_mine());
+
+        let line = node.telemetry_sample();
+        let keys: Vec<&str> = line
+            .split_whitespace()
+            .skip(1) // the "TELEMETRY" tag
+            .map(|kv| kv.split('=').next().unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                // ── the pre-#87 fields, in their original order ──
+                "tip", "final", "stall", "age_s", "diff", "peers", "mempool", "epoch", "regime",
+                "halt", "hignore", "powrej", "dialable",
+                // ── appended by #87, at the end ──
+                "rounds", "rfail",
+            ],
+            "existing TELEMETRY fields must not move or be renamed: {line}"
+        );
+        assert!(line.starts_with("TELEMETRY tip="));
+        // Genesis finalized as slot 0 without a round, so nothing has closed yet.
+        assert!(line.contains(" rounds=0 rfail=0"), "{line}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The journal on the real run path: a node holding the whole committee closes
+    /// its rounds, and each one leaves a `ROUND` line carrying the counts, the roster
+    /// context and the timing basis.
+    #[test]
+    fn closed_rounds_are_journalled_on_the_run_path() {
+        let (config, genesis, base) = rig("journal", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint(); // genesis (slot 0) — finalized without a round
+
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+            assert!(node.try_mine());
+            node.note_slots_reached();
+            node.try_checkpoint();
+        }
+        assert_eq!(node.finalized_height(), Some(CHECKPOINT_CADENCE_BLOCKS), "slot 8 finalized");
+
+        let lines = node.emit_rounds();
+        let slot8 = lines
+            .iter()
+            .find(|l| l.starts_with(&format!("ROUND slot={CHECKPOINT_CADENCE_BLOCKS} ")))
+            .unwrap_or_else(|| panic!("slot 8 must be journalled; got {lines:?}"));
+        assert!(slot8.contains("why=finalized"), "{slot8}");
+        assert!(slot8.contains("close=finalized"), "{slot8}");
+        assert!(slot8.contains("have=21 need=15 active=21 roster=21"), "{slot8}");
+        assert!(slot8.contains("absent=-"), "a full committee has no absentees: {slot8}");
+        assert!(slot8.contains("local=21"), "this node proposed with all 21 held keys: {slot8}");
+        // Deterministic clock in tests ⇒ no timings, and none are invented.
+        assert!(slot8.contains("open_ms=- first_ms=- last_ms=-"), "{slot8}");
+
+        // Draining is idempotent: a record is journalled exactly once.
+        assert!(node.emit_rounds().is_empty(), "records are emitted once, not twice");
+        // …and the same round is now in the aggregates.
+        assert!(node
+            .metrics_text()
+            .contains("qumbra_checkpoint_rounds_total{verdict=\"finalized\"} 1"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A node holding a MINORITY of the committee — the T0 6/5/5/5 shape — cannot
+    /// finalize alone, and the open round says so **by name**. This is the 42 h
+    /// silence, replaced by a record.
+    #[test]
+    fn a_minority_key_holder_names_the_members_it_never_heard_from() {
+        let (mut config, genesis, base) = rig("minority", true);
+        config.committee_key_paths.truncate(6); // the T0 node holding 6 of 21
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint();
+        assert_eq!(node.finalized_height(), None, "6 < quorum 15: not even genesis finalizes");
+
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+            assert!(node.try_mine());
+            node.note_slots_reached();
+            node.try_checkpoint();
+        }
+        assert_eq!(node.finalized_height(), None, "still short of quorum");
+
+        let r = node
+            .p2p()
+            .node()
+            .rounds()
+            .open_round(CHECKPOINT_CADENCE_BLOCKS)
+            .expect("the slot has a record even though it never finalized");
+        assert_eq!((r.have(), r.need, r.active, r.roster), (6, 15, 21, 21));
+        assert_eq!(r.absent(), (6..21).collect::<Vec<_>>(), "the fifteen never heard from");
+        assert!(r.proposed_locally && r.local_votes == 6);
+        assert_eq!(r.rejects.total(), 0, "a shortage, not a stream of junk");
+
+        // And the stall is visible WHILE IT IS HAPPENING: the round never closes on
+        // its own (nothing can finalize past it at 11 of 21 keys), so without the
+        // overdue report the journal would say nothing for the whole stall. Under the
+        // deterministic clock there is no age to judge, so nothing is reported and
+        // nothing is invented — the wall-clock behaviour is pinned in
+        // `qlab_node::round`'s own test.
+        assert!(node.emit_overdue_rounds().is_empty(), "no clock basis ⇒ no age, no report");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The scrape endpoint, end to end over a real socket, serving live node state.
+    #[test]
+    fn metrics_endpoint_serves_live_state_and_is_off_by_default() {
+        let (config, genesis, base) = rig("metrics", true);
+        assert!(config.metrics_addr.is_none(), "no listener unless the operator asks");
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint();
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+            assert!(node.try_mine());
+            node.note_slots_reached();
+            node.try_checkpoint();
+        }
+        node.emit_rounds();
+        node.accumulate_regime();
+
+        let bound = node.start_metrics_endpoint("127.0.0.1:0").expect("bind ephemeral");
+        let body = {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(bound).unwrap();
+            write!(s, "GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).unwrap();
+            out
+        };
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+        assert!(body.contains("text/plain; version=0.0.4"));
+        // Live levels…
+        assert!(body.contains(&format!("qumbra_tip_height {CHECKPOINT_CADENCE_BLOCKS}")), "{body}");
+        assert!(body.contains("qumbra_committee_quorum 15"));
+        assert!(body.contains("qumbra_committee_size 21"));
+        assert!(body.contains("qumbra_finality_regime{regime=\"final\"} 1"));
+        // …and the accumulated, source-side aggregates.
+        assert!(body.contains("qumbra_checkpoint_rounds_total{verdict=\"finalized\"} 1"));
+        assert!(body.contains("qumbra_blocks_connected_total 8"));
+        assert!(body.contains("qumbra_finality_advance_blocks_bucket"));
+        assert!(body.contains("qumbra_process_start_time_seconds "));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **The always-on write-volume caliper, derived rather than asserted by hand.**
+    /// The round rate is set by the CHECKPOINT CADENCE, not by the block rate — the
+    /// number that makes "always on" affordable on a 2 vCPU host.
+    #[test]
+    fn round_journal_volume_is_set_by_the_cadence_not_the_block_rate() {
+        let block_time = GenesisFile::new_devnet_t0().frozen.block_time_secs; // 75 s, FROZEN
+        let round_period_secs = CHECKPOINT_CADENCE_BLOCKS * block_time;
+        assert_eq!(round_period_secs, 600, "cadence 8 × 75 s = one round per 10 minutes");
+        let rounds_per_day = 86_400 / round_period_secs;
+        assert_eq!(rounds_per_day, 144);
+        // One line per closed round, at the byte budget pinned in
+        // `qlab_node::round`'s own test (≤ 400 B for a fully-populated 21-member
+        // round). The quoted daily figure follows from those two numbers alone.
+        const LINE_BUDGET_BYTES: u64 = 400;
+        let bytes_per_day = rounds_per_day * LINE_BUDGET_BYTES;
+        assert!(bytes_per_day <= 60_000, "round journal is {bytes_per_day} B/day");
     }
 }

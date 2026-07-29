@@ -51,7 +51,9 @@ use qlab_devnet::validation::{
 };
 
 use qlab_node::mempool::TxId;
+use qlab_node::metrics::Metrics;
 use qlab_node::recovery::Finalizer;
+use qlab_node::round::{ObsClock, RoundLedger, SlotContext, VoteRejects};
 use qlab_node::{genesis_block, MemNode, Mempool, MempoolError, NodeError, NodeState as _};
 use qlab_devnet::body::TxVerifier;
 
@@ -151,6 +153,14 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// answer "which layer rejected the old branch?" from the logs rather than from
     /// a narrative.
     ingest_counters: IngestCounters,
+    /// Per-round committee diagnostics (issue #87): one record per checkpoint slot,
+    /// **whether or not it finalizes**. Observation only — no method on it can
+    /// change what finalizes, and every quorum/roster value it holds is *read* from
+    /// the committee state rather than re-derived.
+    rounds: RoundLedger,
+    /// Source-side counters + histograms (issue #87). Fed at the event, so a
+    /// distribution is never reconstructed from printed gauges.
+    metrics: Metrics,
 }
 
 /// Layer-attributed ingest refusal counts (issue #74).
@@ -250,6 +260,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             mining_clock: MiningClock::default(),
             rules: RuleSchedule::V1_0,
             ingest_counters: IngestCounters::default(),
+            rounds: RoundLedger::default(),
+            metrics: Metrics::new(),
         }
     }
 
@@ -258,6 +270,96 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// the deterministic default.
     pub fn set_mining_clock(&mut self, clock: MiningClock) {
         self.mining_clock = clock;
+    }
+
+    /// Select the round-diagnostics clock (issue #87). Same seam and same default
+    /// as [`Self::set_mining_clock`]: sims/tests keep [`ObsClock::Deterministic`],
+    /// so round records carry counts and rosters but no fabricated timings and the
+    /// N7 soak stays reproducible; the binary opts into [`ObsClock::WallClock`],
+    /// which is the only basis on which "were votes still arriving?" can be asked.
+    pub fn set_obs_clock(&mut self, clock: ObsClock) {
+        self.rounds = RoundLedger::new(clock);
+        self.metrics.declare_roster(self.committee.state().size());
+    }
+
+    /// The per-round diagnostics ledger (issue #87).
+    pub fn rounds(&self) -> &RoundLedger {
+        &self.rounds
+    }
+
+    /// Mutable ledger — the run loop drains closed records from it, and the
+    /// proposer path notes the slots this node proposed.
+    pub fn rounds_mut(&mut self) -> &mut RoundLedger {
+        &mut self.rounds
+    }
+
+    /// The source-side metric registry (issue #87).
+    pub fn metrics(&self) -> &Metrics {
+        &self.metrics
+    }
+
+    /// Mutable registry — the run loop accumulates regime residency into it.
+    pub fn metrics_mut(&mut self) -> &mut Metrics {
+        &mut self.metrics
+    }
+
+    /// Drain the rounds that have closed since the last call: each is folded into
+    /// the metric aggregates **once** and then handed back for the journal.
+    ///
+    /// One drain point on purpose. Two consumers of the same queue is how a record
+    /// gets counted twice or emitted zero times, and a diagnostics surface that
+    /// miscounts is worse than none.
+    pub fn drain_rounds(&mut self) -> Vec<qlab_node::round::RoundRecord> {
+        let closed = self.rounds.take_emitted();
+        for r in &closed {
+            self.metrics.observe_round(r);
+        }
+        closed
+    }
+
+    /// Record a finality advance: how far it jumped in height, how far in chain
+    /// time, and the stall depth it was carrying when it cleared.
+    ///
+    /// Chain time is observed only when **both** checkpoint blocks are known
+    /// locally — a node that finalized against a block it has not downloaded yet has
+    /// no basis for the interval, and a fabricated one would poison the histogram.
+    fn observe_finality_advance(&mut self, cp: &Checkpoint, prev: Option<Checkpoint>, tip: u64) {
+        // Finalizing genesis is the bootstrap act, not an advance: it would record a
+        // zero-block jump and a stall depth equal to the tip, in a histogram whose
+        // whole job is to show how far finality fell behind. Same rule, and the same
+        // reason, as `RoundLedger::tracked` refusing to journal height 0 as a round.
+        if cp.height == 0 {
+            return;
+        }
+        let prev_height = prev.map(|p| p.height);
+        let blocks = cp.height.saturating_sub(prev_height.unwrap_or(0));
+        let secs = match (prev, self.chain.header(&cp.block_hash)) {
+            (Some(p), Some(now_hdr)) => self
+                .chain
+                .header(&p.block_hash)
+                .map(|prev_hdr| now_hdr.timestamp.saturating_sub(prev_hdr.timestamp)),
+            _ => None,
+        };
+        let stall = match prev_height {
+            Some(h) => tip.saturating_sub(h),
+            None => tip,
+        };
+        self.metrics.observe_finality_advance(blocks, secs, stall);
+    }
+
+    /// The roster context for a checkpoint slot, **read** from the committee state
+    /// for that height (never re-derived here): roster size, active members, and the
+    /// quorum threshold in force. This is what makes a round record answerable —
+    /// `have=11 need=15 active=21` is a diagnosis, `have=11` alone is not.
+    pub fn slot_context(&self, height: u64) -> SlotContext {
+        let cstate = self.committee.state_for_height(height);
+        SlotContext {
+            height,
+            epoch: self.committee.schedule().epoch_of(height),
+            roster: cstate.size(),
+            active: cstate.active_count(height),
+            need: cstate.quorum_threshold(),
+        }
     }
 
     /// Override the downtime signing window (tests use a small window so it fills).
@@ -377,9 +479,28 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             }
             return IngestOutcome::Rejected(Self::header_reject_reason(&e));
         }
+        // Chain-time gap to the parent, captured BEFORE the insert while the parent
+        // is unambiguous (issue #87). Observed only when this header becomes the tip,
+        // so the histogram describes the main chain the issue measured, not every
+        // side branch that was ever offered.
+        let parent_ts = self.chain.header(&header.prev).map(|p| p.timestamp);
+        let header_hash = header.header_hash();
+        let header_ts = header.timestamp;
         match self.chain.insert_header(header) {
             Ok(_) => {
                 self.advance_epoch();
+                if self.chain.tip_hash() == header_hash {
+                    // A parent timestamp of 0 is the GENESIS PLACEHOLDER, not a time.
+                    // Differencing against it yields the whole Unix epoch (~1.78e9 s)
+                    // and poisons the histogram's sum and tail with one sample. The
+                    // genesis→first-block gap is not an interval; it is skipped, and
+                    // the guard is on the placeholder value rather than on the height
+                    // so a genesis that ever carries a real timestamp contributes
+                    // normally. (Same root cause as issue #73's `age_s`.)
+                    let interval =
+                        parent_ts.filter(|&t| t > 0).map(|pts| header_ts.saturating_sub(pts));
+                    self.metrics.observe_block(interval);
+                }
                 IngestOutcome::Accepted
             }
             Err(InsertError::Duplicate) => IngestOutcome::Duplicate,
@@ -605,35 +726,63 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
         }
         let finalized = self.finality.finalized_height();
         let tip = self.chain.tip_height();
+        // The round's roster context, read once from the committee state for this
+        // height (issue #87). Every diagnostic number below is relative to it.
+        let ctx = self.slot_context(cp.height);
 
         // Verify + active-filter against THIS height's epoch roster (frozen §4:
         // tombstoned/jailed excluded BEFORE the count; forged/unknown/dup penalised).
         // `committee` is cloned so the immutable borrow ends before the mutable ops.
-        let (committee, quorum, active_kept) = {
+        //
+        // Issue #87: each refusal is *recorded before it returns*. The 42 h soak's
+        // silence was not only about rounds that ended short — a round being fed
+        // junk looks identical, in the old logs, to a round nobody spoke about.
+        let (committee, quorum, active_kept, excluded_idx, rejects) = {
             let cstate = self.committee.state_for_height(cp.height);
             let committee = cstate.committee().clone();
             let mut seen_signer = HashSet::new();
             let mut active_kept: Vec<Vote> = Vec::new();
+            let mut excluded_idx: Vec<usize> = Vec::new();
+            let mut rejects = VoteRejects::default();
             for v in votes {
                 if committee.member(v.signer).is_none() {
+                    rejects.unknown_signer += 1;
+                    self.rounds.note_rejected_message(&ctx, rejects);
+                    self.metrics.observe_votes(0, rejects);
                     return VotesOutcome::Invalid; // unknown signer index
                 }
                 if !seen_signer.insert(v.signer) {
+                    rejects.duplicate += 1;
+                    self.rounds.note_rejected_message(&ctx, rejects);
+                    self.metrics.observe_votes(0, rejects);
                     return VotesOutcome::Invalid; // duplicate-signer padding
                 }
                 if !committee.verify_vote(cp, v) {
+                    rejects.forged += 1;
+                    self.rounds.note_rejected_message(&ctx, rejects);
+                    self.metrics.observe_votes(0, rejects);
                     return VotesOutcome::Invalid; // forged signature
                 }
                 if cstate.is_active(v.signer, cp.height) {
                     active_kept.push(v.clone());
+                } else {
+                    // Valid but jailed/tombstoned — excluded, NOT penalised. Recorded
+                    // separately from `absent` so an operator never goes looking for a
+                    // host that the rule itself removed.
+                    excluded_idx.push(v.signer);
+                    rejects.inactive += 1;
                 }
-                // else: valid but jailed/tombstoned — excluded, NOT penalised.
             }
-            (committee, cstate.quorum_threshold(), active_kept)
+            (committee, cstate.quorum_threshold(), active_kept, excluded_idx, rejects)
         };
 
         let added = self.tally.add(cp, &active_kept, finalized, tip);
+        let variants = self.tally.variant_count(cp.height);
         if !added.grew {
+            // Nothing new — still a message this round received, and the roster
+            // context may have moved; record it without disturbing what is known.
+            let new = self.rounds.note_votes(&ctx, &[], &excluded_idx, rejects, variants);
+            self.metrics.observe_votes(new.newly as u64, rejects);
             return VotesOutcome::Stale;
         }
 
@@ -643,10 +792,25 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
             let cstate = self.committee.state_for_height(cp.height);
             added.accumulated.iter().filter(|v| cstate.is_active(v.signer, cp.height)).cloned().collect()
         };
+        // Issue #87: the accumulated set is the round's `have`, and the offsets of the
+        // signers new in this message are real arrival observations — fed straight
+        // into a histogram, because they cannot be recovered later from a printed count.
+        {
+            let counted: Vec<usize> = active_now.iter().map(|v| v.signer).collect();
+            let new = self.rounds.note_votes(&ctx, &counted, &excluded_idx, rejects, variants);
+            self.metrics.observe_votes(new.newly as u64, rejects);
+            for offset in new.arrivals {
+                self.metrics.observe_vote_arrival(offset);
+            }
+        }
         if active_now.len() >= quorum {
+            // Captured before the finalize so the advance can be measured against the
+            // head it actually replaced (issue #87).
+            let prev_cp = self.finality.latest().copied();
             match self.finality.try_finalize(cp, &active_now, &committee) {
                 Ok(()) => {
                     self.seen_checkpoints.insert(id);
+                    self.observe_finality_advance(cp, prev_cp, tip);
                     // Advance the consensus finalized pointer (no reorg past finality)
                     // and the state-machine finalized height — both best-effort: the
                     // block may not be known locally yet, which anchor queries tolerate.
@@ -656,6 +820,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
                     self.signing.record_round(&signers);
                     self.apply_downtime_jails(cp.height);
                     self.tally.on_finalized(cp.height);
+                    // Close this round, and every lower open round with it: a
+                    // strictly-advancing finalize is exactly what makes those slots
+                    // unfinalizable, so this is where a catch-up jump becomes one
+                    // journal line per skipped slot instead of one silent gap.
+                    self.rounds.note_finalized(cp.height);
                     return VotesOutcome::Learned { finalized: true, accumulated: added.accumulated };
                 }
                 Err(FinalizeError::NotAdvancing { .. }) => {
@@ -747,6 +916,7 @@ mod tests {
     use qlab_devnet::fees::{posted_fee, ArityBucket};
     use qlab_devnet::params_devnet::BOND_AMOUNT;
     use qlab_devnet::pow::KeccakPow;
+    use qlab_node::round::{RoundClose, RoundDiagnosis};
     use qlab_node::telemetry::Telemetry;
 
     /// Mock M3 verifier: a proof is valid iff its bytes are exactly `b"ok"`.
@@ -1230,6 +1400,226 @@ mod tests {
         assert!(matches!(a.ingest_checkpoint_votes(&cp, &dup), VotesOutcome::Invalid));
 
         assert_eq!(a.finalized_height(), None, "no invalid set moved finality");
+    }
+
+    // ---- issue #87: round-level diagnostics on the real ingest path -----------
+
+    /// **The headline acceptance.** The T0 shape — 21 keys split across four nodes,
+    /// no message carrying a quorum — with a round that dies short and is caught up
+    /// past. The record of the dead round names the number, the counts, the roster
+    /// context and the members whose votes never arrived; before this, that round
+    /// produced no output of any kind.
+    #[test]
+    fn a_stalled_round_names_its_number_its_counts_and_its_absentees() {
+        let (committee, validators) = devnet_committee(21); // quorum 15
+        let mut a =
+            NodeAdapter::new(CommitteeState::new(committee, BOND_AMOUNT), KeccakPow, MockVerifier, sim());
+
+        // Mine a real two-cadence span, so the checkpoints name real blocks and the
+        // finality advance has a real chain-time interval to measure.
+        for _ in 0..16 {
+            let (h, body) = a.mine_block().expect("mine");
+            assert_eq!(a.ingest_block(h, body), IngestOutcome::Accepted);
+        }
+
+        // Slot 8: the nodes holding 6 and 5 keys are heard from, then the net
+        // partitions — 11 of 21, four short of quorum 15.
+        let (cp8, all8) = a.make_checkpoint(8, &validators).expect("slot 8");
+        a.ingest_checkpoint_votes(&cp8, &all8[0..6]);
+        a.ingest_checkpoint_votes(&cp8, &all8[6..11]);
+        assert_eq!(a.finalized_height(), None, "11 < 15: the round is short");
+        assert_eq!(a.rounds().open_round(8).map(|r| r.have()), Some(11));
+
+        // The partition heals and slot 16 finalizes, overtaking slot 8 — the exact
+        // catch-up shape behind the soak's 61-of-165 multi-slot advances.
+        let (cp16, all16) = a.make_checkpoint(16, &validators).expect("slot 16");
+        a.ingest_checkpoint_votes(&cp16, &all16[0..15]);
+        assert_eq!(a.finalized_height(), Some(16));
+
+        let closed = a.drain_rounds();
+        assert_eq!(closed.len(), 2, "the dead slot and the finalized slot both produce a record");
+
+        let dead = closed.iter().find(|r| r.height == 8).expect("slot 8 has a record");
+        assert_eq!(dead.close, Some(RoundClose::Superseded { by_height: 16 }));
+        assert_eq!((dead.have(), dead.need, dead.active, dead.roster), (11, 15, 21, 21));
+        assert_eq!(dead.absent(), (11..21).collect::<Vec<_>>(), "the ten who never reached us");
+        assert_eq!(dead.msgs, 2, "both partial messages are accounted for");
+        assert_eq!(dead.rejects.total(), 0, "nothing was thrown away — this was a shortage");
+        // The journal line an operator would actually read.
+        let line = dead.to_line();
+        assert!(line.starts_with("ROUND slot=8 "), "{line}");
+        assert!(line.contains("have=11 need=15 active=21"), "{line}");
+        assert!(line.contains("absent=11,12,13,14,15,16,17,18,19,20"), "{line}");
+
+        let ok = closed.iter().find(|r| r.height == 16).expect("slot 16 has a record");
+        assert_eq!(ok.close, Some(RoundClose::Finalized));
+        assert_eq!(ok.diagnose(), RoundDiagnosis::Finalized);
+
+        // Aggregates: one finalized round, one that did not, and per-member
+        // participation split the same way.
+        assert_eq!(a.metrics().rounds_by_verdict(RoundDiagnosis::Finalized), 1);
+        assert_eq!(a.metrics().votes_by_result("counted"), 11 + 15);
+        let text = qlab_node::metrics::render(a.metrics(), &qlab_node::metrics::LiveGauges::default());
+        assert!(text.contains("qumbra_committee_absent_rounds_total{signer=\"20\"} 2"), "absent in both");
+        assert!(text.contains("qumbra_committee_signed_rounds_total{signer=\"0\"} 2"), "signed in both");
+        // The catch-up jump is a real histogram observation, not a differenced gauge.
+        assert!(text.contains("qumbra_finality_advance_blocks_bucket{le=\"16\"} 1"), "{text}");
+    }
+
+    /// A round being fed junk must not look like a round nobody spoke about. Forged,
+    /// unknown-signer and duplicate sets are recorded against the slot with their
+    /// reason — and still never touch what counts.
+    #[test]
+    fn rejected_vote_sets_are_recorded_against_the_round_they_targeted() {
+        let (cstate, validators) = committee7();
+        let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+        let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
+
+        let forged = Vote { signer: 0, signature: validators[1].sign_checkpoint(&cp).signature };
+        assert!(matches!(a.ingest_checkpoint_votes(&cp, &[forged]), VotesOutcome::Invalid));
+        let outsider = qlab_devnet::committee::Validator::from_seed(99, [0xEE; 32]);
+        assert!(matches!(
+            a.ingest_checkpoint_votes(&cp, &[outsider.sign_checkpoint(&cp)]),
+            VotesOutcome::Invalid
+        ));
+        let dup = vec![validators[3].sign_checkpoint(&cp), validators[3].sign_checkpoint(&cp)];
+        assert!(matches!(a.ingest_checkpoint_votes(&cp, &dup), VotesOutcome::Invalid));
+
+        let r = a.rounds().open_round(2).expect("the targeted slot has a record");
+        assert_eq!(r.have(), 0, "no rejected vote ever counted");
+        assert_eq!((r.rejects.forged, r.rejects.unknown_signer, r.rejects.duplicate), (1, 1, 1));
+        assert_eq!(r.msgs, 3);
+        assert_eq!(a.finalized_height(), None);
+        assert_eq!(a.metrics().votes_by_result("forged"), 1);
+        assert_eq!(a.metrics().votes_by_result("counted"), 0);
+    }
+
+    /// A tombstoned member is `excluded`, never `absent` — the operator must not be
+    /// sent to look at a host that the frozen §4 rule itself removed. And the round
+    /// that this makes unwinnable is diagnosed as *quorum impossible*, not as a
+    /// participation failure.
+    #[test]
+    fn tombstoned_members_are_excluded_not_reported_absent() {
+        let (cstate, validators) = committee7(); // quorum 5
+        let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+        // Tombstone signers 0, 1 and 2 → 4 active < quorum 5.
+        for i in 0..3usize {
+            let ca = Checkpoint::new(90, [0xA0 + i as u8; 32], [0xA0; 32]);
+            let cb = Checkpoint::new(90, [0xB0 + i as u8; 32], [0xB0; 32]);
+            let ev = EquivocationEvidence {
+                vote_a: validators[i].sign_checkpoint(&ca),
+                cp_a: ca,
+                vote_b: validators[i].sign_checkpoint(&cb),
+                cp_b: cb,
+            };
+            assert_eq!(a.apply_evidence(&ev), Some(i));
+        }
+
+        let cp = Checkpoint::new(8, [0x08; 32], [0x08; 32]);
+        let set: Vec<Vote> = [0usize, 1, 3, 4].iter().map(|&i| validators[i].sign_checkpoint(&cp)).collect();
+        a.ingest_checkpoint_votes(&cp, &set);
+
+        let r = a.rounds().open_round(8).expect("slot 8 recorded");
+        assert_eq!(r.voted, vec![3, 4], "only active signers count");
+        assert_eq!(r.excluded, vec![0, 1], "tombstoned voters are excluded, by name");
+        assert_eq!(r.absent(), vec![2, 5, 6], "signer 2 is tombstoned but silent — still absent");
+        assert_eq!(r.active, 4, "roster 7 minus three tombstones");
+        assert!(
+            r.active < r.need,
+            "the roster could not have produced a quorum — the fields say so before any \
+             verdict does, which is why the raw fields are always on the line"
+        );
+        // Still open, so it has no verdict yet — a round that has not ended has no
+        // cause. The `active < need ⇒ quorum_impossible` step is exercised on a CLOSED
+        // record in `qlab_node::round`'s classifier test.
+        assert_eq!(r.diagnose(), RoundDiagnosis::Open);
+    }
+
+    /// **Caught on the lab net, not in a unit test.** Genesis carries a placeholder
+    /// timestamp of 0 and is finalized as a bootstrap act, so two event observations
+    /// had a wrong basis at the source: the genesis→block-1 gap entered the block
+    /// interval histogram as ~1.78e9 seconds (the whole Unix epoch, wrecking the sum
+    /// and the tail from one sample), and finalizing genesis entered the advance
+    /// histograms as a 0-block jump carrying a stall depth equal to the tip.
+    #[test]
+    fn genesis_placeholders_never_enter_the_event_histograms() {
+        let (committee, validators) = devnet_committee(21);
+        let mut a =
+            NodeAdapter::new(CommitteeState::new(committee, BOND_AMOUNT), KeccakPow, MockVerifier, sim());
+
+        // Finalize genesis (height 0) exactly as the binary does at startup.
+        let (cp0, votes0) = a.make_checkpoint(0, &validators).expect("genesis checkpoint");
+        a.ingest_checkpoint_votes(&cp0, &votes0);
+        assert_eq!(a.finalized_height(), Some(0));
+
+        for _ in 0..8 {
+            let (h, body) = a.mine_block().expect("mine");
+            assert_eq!(a.ingest_block(h, body), IngestOutcome::Accepted);
+        }
+        let text = qlab_node::metrics::render(a.metrics(), &qlab_node::metrics::LiveGauges::default());
+
+        // 8 blocks connected, but only 7 intervals — the genesis gap is not one.
+        assert!(text.contains("qumbra_blocks_connected_total 8"), "{text}");
+        assert!(text.contains("qumbra_block_interval_seconds_count 7"), "{text}");
+        let sum: u64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("qumbra_block_interval_seconds_sum "))
+            .and_then(|v| v.parse().ok())
+            .expect("sum series present");
+        assert!(sum < 10_000, "a placeholder timestamp leaked into the histogram: sum={sum}");
+
+        // Finalizing genesis is not a finality advance.
+        assert!(text.contains("qumbra_finality_advances_total 0"), "{text}");
+        assert!(text.contains("qumbra_finality_advance_blocks_count 0"), "{text}");
+
+        // …and a real finalize afterwards IS counted.
+        let (cp8, votes8) = a.make_checkpoint(8, &validators).expect("slot 8");
+        a.ingest_checkpoint_votes(&cp8, &votes8);
+        assert_eq!(a.finalized_height(), Some(8));
+        let after = qlab_node::metrics::render(a.metrics(), &qlab_node::metrics::LiveGauges::default());
+        assert!(after.contains("qumbra_finality_advances_total 1"), "{after}");
+        assert!(after.contains("qumbra_finality_advance_blocks_bucket{le=\"8\"} 1"), "{after}");
+    }
+
+    /// The observation surface must not change consensus. Same inputs, same
+    /// finalized head, same outcomes — with the ledger fully wired.
+    #[test]
+    fn diagnostics_do_not_change_what_finalizes() {
+        let (committee, validators) = devnet_committee(21);
+        let mk = || {
+            NodeAdapter::new(
+                CommitteeState::new(committee.clone(), BOND_AMOUNT),
+                KeccakPow,
+                MockVerifier,
+                sim(),
+            )
+        };
+        let cp = Checkpoint::new(8, [0x08; 32], [0x08; 32]);
+        let sign = |idxs: &[usize]| -> Vec<Vote> {
+            idxs.iter().map(|&i| validators[i].sign_checkpoint(&cp)).collect()
+        };
+
+        // Fourteen distinct signers is one short and must not finalize; the
+        // fifteenth must. The ledger observes both and changes neither.
+        let mut a = mk();
+        a.ingest_checkpoint_votes(&cp, &sign(&(0..14).collect::<Vec<_>>()));
+        assert_eq!(a.finalized_height(), None, "14 < 15 stays short with diagnostics on");
+        assert_eq!(a.rounds().open_round(8).map(|r| r.have()), Some(14));
+        a.ingest_checkpoint_votes(&cp, &sign(&[14]));
+        assert_eq!(a.finalized_height(), Some(8), "the fifteenth finalizes, as before");
+
+        // The ledger is bounded: a spray of junk heights cannot grow it without end.
+        let mut b = mk();
+        for h in 1..200u64 {
+            let junk = Checkpoint::new(h * 8, [h as u8; 32], [h as u8; 32]);
+            let v = vec![validators[0].sign_checkpoint(&junk)];
+            b.ingest_checkpoint_votes(&junk, &v);
+        }
+        assert!(
+            b.rounds().open_len() <= qlab_node::round::MAX_OPEN_ROUNDS,
+            "open-round cap holds under a height spray"
+        );
+        assert_eq!(b.finalized_height(), None, "nothing in the spray finalized");
     }
 
     // ---- issue #74: halt-height upgrade mechanism -----------------------------

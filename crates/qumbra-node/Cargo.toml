@@ -84,3 +84,7 @@ bincode = "1"
 toml = "0.8"
 # Ctrl-C handling for graceful shutdown = snapshot flush.
 ctrlc = "3.4"
+# The /metrics scrape endpoint (issue #87). Same minimal blocking HTTP/1.1 server,
+# and the same `=` pin, as qlab-node's RPC surface and qlab-cbserver's reference
+# server — one HTTP implementation in the tree, not three.
+tiny_http = "=0.12.0"

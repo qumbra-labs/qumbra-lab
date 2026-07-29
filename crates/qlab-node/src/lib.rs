@@ -45,9 +45,11 @@
 
 pub mod emission;
 pub mod mempool;
+pub mod metrics;
 mod node;
 mod persist;
 pub mod recovery;
+pub mod round;
 pub mod rpc;
 mod store;
 pub mod telemetry;
