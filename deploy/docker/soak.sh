@@ -20,7 +20,10 @@
 # LATENCY INJECTION (issue #107 step 1b). Run against a net that is already up.
 #
 #   soak.sh netem <delay_ms> [jit_ms]  install `tc netem` on every node's eth0,
-#                                      then PROVE it took (qdisc + measured RTT)
+#                                      then PROVE it took (qdisc + measured RTT).
+#                                      The delay is ONE-WAY, so RTT is ~twice it.
+#   soak.sh netem d0,d1,d2,d3 [jit]    per-node one-way delays — the asymmetric case,
+#                                      where pair RTT = d_i + d_j (e.g. 30,60,90,110)
 #   soak.sh netem-show                 the qdisc + the measured RTT matrix
 #   soak.sh netem-clear                remove it, and prove it is gone
 #
@@ -124,12 +127,15 @@ netem_qdisc() { dc exec -T "$1" tc qdisc show dev "$NETEM_DEV" 2>&1 | tr -d '\r'
 
 # Print every node's qdisc verbatim, and return non-zero if ANY node disagrees with
 # what was asked for.
-#   netem_check_qdisc <delay_ms>   expect netem at that delay
-#   netem_check_qdisc ""           expect NO netem at all
+#   netem_check_qdisc <d0,d1,d2,d3>   expect netem at that per-node delay
+#   netem_check_qdisc ""              expect NO netem at all
 netem_check_qdisc() {
-  local want="$1" bad=0 q
+  local want="$1" bad=0 q i n d
+  local wants=()
+  [[ -n "$want" ]] && { IFS=, read -r -a wants <<<"$want"; }
   echo "   -- tc qdisc show dev $NETEM_DEV, per container --"
-  for n in "${NODES[@]}"; do
+  for i in $(seq 0 $(( ${#NODES[@]} - 1 ))); do
+    n="${NODES[$i]}"
     q="$(netem_qdisc "$n")"
     printf '     %-6s %s\n' "$n" "${q:-<no output>}"
     if [[ -z "$want" ]]; then
@@ -137,10 +143,11 @@ netem_check_qdisc() {
         echo "     ^ $n STILL carries a netem qdisc"; bad=1
       fi
     else
+      d="${wants[$i]}"
       if ! grep -q 'netem' <<<"$q"; then
         echo "     ^ $n has NO netem qdisc"; bad=1
-      elif ! grep -Eq "delay ${want}(\.0+)?ms" <<<"$q"; then
-        echo "     ^ $n netem is present but its delay is not ${want}ms"; bad=1
+      elif ! grep -Eq "delay ${d}(\.0+)?ms" <<<"$q"; then
+        echo "     ^ $n netem is present but its delay is not ${d}ms"; bad=1
       fi
     fi
   done
@@ -166,11 +173,20 @@ netem_rtt_matrix() {
   done
 }
 
-netem_report() {   # netem_report <delay_ms|""> <label>
-  local want="$1" label="$2"
+netem_report() {   # netem_report <d0,d1,d2,d3|""> <label>
+  local want="$1" label="$2" i j
+  local wants=()
   echo "== netem: $label =="
   if [[ -n "$want" ]]; then
-    echo "   one-way delay ${want}ms on every node  =>  expected pairwise RTT ~$((want * 2))ms"
+    IFS=, read -r -a wants <<<"$want"
+    echo "   expected pairwise RTT = one-way(A) + one-way(B):"
+    for i in $(seq 0 $(( ${#NODES[@]} - 1 ))); do
+      for j in $(seq $(( i + 1 )) $(( ${#NODES[@]} - 1 ))); do
+        printf '     %s<->%s  %sms + %sms = ~%sms\n' \
+          "${NODES[$i]}" "${NODES[$j]}" "${wants[$i]}" "${wants[$j]}" \
+          "$(( wants[i] + wants[j] ))"
+      done
+    done
   fi
   netem_check_qdisc "$want" \
     || die "the qdisc is NOT what was asked for (above). A run under a silently-absent
@@ -452,13 +468,25 @@ case "$cmd" in
   # ── latency injection (issue #107 step 1b) ────────────────────────────────
 
   netem)
-    delay="${1:?netem needs a ONE-WAY delay in ms, e.g. 'netem 100' for a ~200 ms RTT}"
+    arg="${1:?netem needs a ONE-WAY delay in ms: 'netem 100' (uniform) or 'netem 30,60,90,110' (per node)}"
     jit="${2:-0}"
-    [[ "$delay" =~ ^[0-9]+$ ]] || die "delay must be a whole number of ms, got '$delay'"
-    [[ "$jit"   =~ ^[0-9]+$ ]] || die "jitter must be a whole number of ms, got '$jit'"
-    spec="delay ${delay}ms"
-    (( jit > 0 )) && spec="delay ${delay}ms ${jit}ms distribution normal"
-    for n in "${NODES[@]}"; do
+    [[ "$jit" =~ ^[0-9]+$ ]] || die "jitter must be a whole number of ms, got '$jit'"
+    IFS=, read -r -a delays <<<"$arg"
+    # A bare number means the same delay everywhere; four means one per node, in
+    # NODES order. Per-node delays are how the real topology's ASYMMETRY is modelled:
+    # node_i -> node_j pays delay_i and the reply pays delay_j, so each pair gets its
+    # own RTT and each direction its own one-way — which uniform delay cannot express.
+    if [[ "${#delays[@]}" -eq 1 ]]; then
+      for i in $(seq 1 $(( ${#NODES[@]} - 1 ))); do delays[$i]="${delays[0]}"; done
+    elif [[ "${#delays[@]}" -ne "${#NODES[@]}" ]]; then
+      die "netem takes 1 delay (uniform) or ${#NODES[@]} (one per node), got ${#delays[@]}"
+    fi
+    want=""
+    for i in $(seq 0 $(( ${#NODES[@]} - 1 ))); do
+      n="${NODES[$i]}"; d="${delays[$i]}"
+      [[ "$d" =~ ^[0-9]+$ ]] || die "delay must be a whole number of ms, got '$d'"
+      spec="delay ${d}ms"
+      (( jit > 0 )) && spec="delay ${d}ms ${jit}ms distribution normal"
       # `replace` rather than `add`: idempotent, so re-running at a new delay does not
       # need a clear first and cannot leave two runs' qdiscs stacked.
       dc exec -T "$n" tc qdisc replace dev "$NETEM_DEV" root netem $spec \
@@ -466,8 +494,10 @@ case "$cmd" in
    is this image new enough to carry iproute2 (Dockerfile)? A net brought up from an
    older image has neither, and every command here would then be a no-op."
       echo "   applied on $n: netem $spec"
+      want+="${d},"
     done
-    netem_report "$delay" "applied (${spec})"
+    want="${want%,}"
+    netem_report "$want" "applied (one-way ${arg}ms, jitter ${jit}ms)"
     echo
     echo "   The nodes were NOT restarted, so existing TCP connections keep running;"
     echo "   the delay applies from now on. Give the net a few telemetry cadences"
