@@ -462,9 +462,25 @@ impl RoundLedger {
         }
     }
 
+    /// Whether `height` is a slot this ledger keeps a round for.
+    ///
+    /// **Genesis is never a slot.** `finality::is_checkpoint_height` says so for the
+    /// cadence grid, and the same must hold here: the binary finalizes height 0 at
+    /// startup as a bootstrap act, with no proposal, no round and nobody to be
+    /// absent from it. Journalling it would put a fictional row at the top of every
+    /// node's record and inflate the finalized-round count by one on every restart —
+    /// which is exactly the kind of quietly-wrong denominator this issue exists to
+    /// stop producing.
+    fn tracked(height: u64) -> bool {
+        height != 0
+    }
+
     /// Open the record for `ctx.height` if this node has not seen the slot yet.
     /// Returns nothing — it is the entry point every other method funnels through.
     fn ensure_open(&mut self, ctx: &SlotContext) {
+        if !Self::tracked(ctx.height) {
+            return;
+        }
         if self.open.contains_key(&ctx.height) {
             // Refresh the roster context: tombstones/jails can change mid-round, and
             // the *closing* roster is what the verdict must be judged against.
@@ -510,7 +526,7 @@ impl RoundLedger {
     /// was refused by the never-double-sign guard — itself a finding).
     pub fn note_local_proposal(&mut self, ctx: &SlotContext, local_votes: usize) {
         self.ensure_open(ctx);
-        let rec = self.open.get_mut(&ctx.height).expect("just opened");
+        let Some(rec) = self.open.get_mut(&ctx.height) else { return };
         rec.proposed_locally = true;
         rec.local_votes = local_votes;
     }
@@ -520,7 +536,7 @@ impl RoundLedger {
     /// received junk is a round with a story.
     pub fn note_rejected_message(&mut self, ctx: &SlotContext, rejects: VoteRejects) {
         self.ensure_open(ctx);
-        let rec = self.open.get_mut(&ctx.height).expect("just opened");
+        let Some(rec) = self.open.get_mut(&ctx.height) else { return };
         rec.msgs += 1;
         rec.rejects.add(rejects);
     }
@@ -549,7 +565,9 @@ impl RoundLedger {
     ) -> NewVotes {
         self.ensure_open(ctx);
         let now = self.now();
-        let rec = self.open.get_mut(&ctx.height).expect("just opened");
+        let Some(rec) = self.open.get_mut(&ctx.height) else {
+            return NewVotes::default(); // genesis is never a round — see `tracked`
+        };
         rec.msgs += 1;
         rec.rejects.add(rejects);
         rec.variants = rec.variants.max(variants);
@@ -764,6 +782,29 @@ mod tests {
         assert_eq!(r.excluded, vec![3, 4]);
         assert_eq!(r.absent(), vec![5, 6], "only the silent members are absent");
         assert_eq!(r.rejects.inactive, 2);
+    }
+
+    /// Genesis is never a round: the binary finalizes height 0 at startup with no
+    /// proposal and nobody to be absent from it, and journalling that would inflate
+    /// every node's finalized-round count by one on every restart.
+    #[test]
+    fn genesis_is_never_journalled_as_a_round() {
+        let mut l = RoundLedger::new(ObsClock::Deterministic);
+        let g = ctx(0, 21, 21, 15);
+        l.note_slot_reached(&g);
+        l.note_local_proposal(&g, 21);
+        assert_eq!(l.note_votes(&g, &(0..21).collect::<Vec<_>>(), &[], VoteRejects::default(), 1), NewVotes::default());
+        l.note_rejected_message(&g, VoteRejects { forged: 1, ..Default::default() });
+        l.note_finalized(0);
+        assert_eq!(l.open_len(), 0);
+        assert_eq!(l.closed_total(), 0, "height 0 leaves no record at all");
+        assert!(l.take_emitted().is_empty());
+
+        // …and a real slot right after it is unaffected.
+        let c8 = ctx(8, 21, 21, 15);
+        l.note_votes(&c8, &(0..15).collect::<Vec<_>>(), &[], VoteRejects::default(), 1);
+        l.note_finalized(8);
+        assert_eq!(l.closed_total(), 1);
     }
 
     /// A round that received only junk is still a round with a story: `have=0` plus

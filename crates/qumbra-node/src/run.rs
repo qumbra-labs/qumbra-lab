@@ -682,7 +682,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             // Issue #87: record that THIS node proposed the slot and how many of its
             // own keys signed. `local=0` on a slot we proposed is itself a finding —
             // it means every held key was refused by the never-double-sign guard.
-            {
+            //
+            // Height 0 is excluded on purpose: finalizing genesis is a bootstrap act,
+            // not a checkpoint round. `is_checkpoint_height` says the same thing
+            // ("genesis is never a slot"), and a journal that opened with a round
+            // nobody ever voted in would put a fictional row at the top of every
+            // node's record.
+            if self.next_checkpoint > 0 {
                 let ctx = self.p2p.node().slot_context(self.next_checkpoint);
                 let local = made.as_ref().map(|(_, v)| v.len()).unwrap_or(0);
                 self.p2p.node_mut().rounds_mut().note_local_proposal(&ctx, local);
