@@ -1828,6 +1828,90 @@ mod tests {
     }
 
     #[test]
+    fn a_message_flood_is_dropped_at_the_limit_and_never_scores_the_peer() {
+        // Gap 1 wired end to end: the GetAddr limit covers the amplifier, this is
+        // the general one that stops ANY message type being poured in at any rate.
+        // Small explicit limits so the test states the bound instead of the
+        // default's size.
+        let hub = InProcHub::new();
+        let t0 = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let mut n0 = P2pNode::new(t0, stub(), [1; 32]);
+        let sniff = sniffer(&hub, PeerId(2), "sniff:9333");
+        hub.link(PeerId(2), PeerId(1));
+        n0.set_rate_limits(RateLimits {
+            msg_burst: 8,
+            msg_refill_per_sec: 1,
+            ..RateLimits::default()
+        });
+
+        let ping = Envelope::new(MsgType::Ping, vec![]).encode();
+        // Exactly at the burst: every one is processed (a Ping answers with a Pong).
+        for _ in 0..8 {
+            sniff.send(PeerId(1), &ping).unwrap();
+        }
+        n0.tick(0);
+        assert_eq!(count_msgs(&sniff.poll(), MsgType::Pong), 8, "at the burst, all served");
+        assert_eq!(n0.rate_stats().throttled_frames, 0);
+
+        // Past it: dropped, silently, and with no score.
+        for _ in 0..5 {
+            sniff.send(PeerId(1), &ping).unwrap();
+        }
+        n0.tick(0);
+        assert_eq!(count_msgs(&sniff.poll(), MsgType::Pong), 0, "over the burst, dropped");
+        assert_eq!(n0.rate_stats().throttled_frames, 5, "and counted");
+        assert_eq!(
+            n0.peers().get(PeerId(2)).unwrap().score,
+            0,
+            "decision 2: too fast is not wrong — throttling never scores"
+        );
+        assert!(!n0.peers().is_banned(PeerId(2)));
+
+        // A throttle, not a verdict: one second on, the budget has refilled and the
+        // peer is served again without anyone having had to forgive it.
+        sniff.send(PeerId(1), &ping).unwrap();
+        n0.tick(1_000);
+        assert_eq!(count_msgs(&sniff.poll(), MsgType::Pong), 1, "refilled, still a peer");
+    }
+
+    #[test]
+    fn an_oversized_stream_is_dropped_at_the_byte_budget() {
+        // The other half of gap 2, at the node layer: MAX_PAYLOAD bounds one frame,
+        // the byte budget bounds the stream. Frame count is left generous so it is
+        // unambiguously the BYTE budget doing the work.
+        let hub = InProcHub::new();
+        let t0 = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let mut n0 = P2pNode::new(t0, stub(), [1; 32]);
+        let sniff = sniffer(&hub, PeerId(2), "sniff:9333");
+        hub.link(PeerId(2), PeerId(1));
+
+        let body = vec![7u8; 1_000];
+        let frame = Envelope::new(MsgType::Ping, body).encode();
+        let frame_len = frame.len() as u64;
+        n0.set_rate_limits(RateLimits {
+            byte_burst: frame_len * 3,
+            byte_refill_per_sec: 1,
+            ..RateLimits::default()
+        });
+
+        // Exactly at the byte budget: all three accepted.
+        for _ in 0..3 {
+            sniff.send(PeerId(1), &frame).unwrap();
+        }
+        n0.tick(0);
+        assert_eq!(count_msgs(&sniff.poll(), MsgType::Pong), 3, "exactly at the byte budget");
+        assert_eq!(n0.rate_stats().throttled_bytes, 0);
+
+        // The fourth is over it, and it is the byte budget that says so.
+        sniff.send(PeerId(1), &frame).unwrap();
+        n0.tick(0);
+        assert_eq!(count_msgs(&sniff.poll(), MsgType::Pong), 0);
+        assert_eq!(n0.rate_stats().throttled_bytes, 1);
+        assert_eq!(n0.rate_stats().throttled_frames, 0, "the frame budget was not the binding one");
+        assert_eq!(n0.peers().get(PeerId(2)).unwrap().score, 0);
+    }
+
+    #[test]
     fn a_gossiped_flood_of_one_netgroup_cannot_eclipse_the_outbound_set() {
         // Issue #91 gap 3, end to end through the path that actually matters: an
         // attacker hands us a big `Addr` message full of addresses it controls, all
