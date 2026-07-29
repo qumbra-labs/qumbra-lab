@@ -1,0 +1,44 @@
+[package]
+name = "qlab-faucet"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The fixed-shape 2×2 bucket the faucet proves: TxInput/TxOutput/MerkleWitness,
+# build_bucket_with_witnesses, derive_input. The faucet is a WALLET, so this is
+# the load-bearing dependency — a disbursement is a STARK statement.
+qlab-air = { path = "../qlab-air" }
+# The single source of the consensus prover config + prove/verify wrappers
+# (issue #38). Never reconstructed here — the demo already paid for that lesson.
+qlab-consensus = { path = "../qlab-consensus" }
+# Key hierarchy, diversified addresses, and the ONLY spend-witness constructor
+# (`Wallet::spend_input`). The faucet's hot key is a `qlab_wallet::Wallet`.
+qlab-wallet = { path = "../qlab-wallet" }
+# ML-KEM note encryption: the grant note is encrypted to the requester's address
+# and the change note to the faucet's own, so both outputs are recoverable.
+qlab-note = { path = "../qlab-note" }
+# The depth-32 commitment tree the faucet fetches live membership witnesses from.
+qlab-cbserver = { path = "../qlab-cbserver" }
+# Consensus objects on the submit path: TxEntry/TxPublic, the frozen posted-fee
+# table, Hash32, and MAX_ANCHOR_AGE_BLOCKS.
+qlab-devnet = { path = "../qlab-devnet" }
+# Live node state: the NodeState read view + NodeRpc (submit + anchors + the
+# commitment tree) the faucet plans against.
+qlab-node = { path = "../qlab-node" }
+# The refilling `TokenBucket` primitive (#91). Reused rather than re-rolled — the
+# rate-limit *policy* here is the faucet's own, but "a second token bucket would
+# be a second thing to get wrong" (ratelimit.rs's own words).
+qlab-p2p = { path = "../qlab-p2p" }
+
+# The consensus proof wire (protocol-spec §4): bincode fixint, the same encoding
+# qlab-consensus pins at 145,609 B and qumbra-node's real verifier decodes.
+bincode = "1"
+# CSPRNG for note ρ/rseed and the ML-KEM encapsulation. Workspace rev.
+rand = "0.10"
+
+[dev-dependencies]
+# The acceptance tests verify grants through the node's REAL production verifier
+# (`ConsensusVerifier`, M10-T0-4) rather than a local stand-in, so the e2e claim
+# is "the shipping verifier accepts this", not "a test double accepted this".
+qumbra-node = { path = "../qumbra-node" }

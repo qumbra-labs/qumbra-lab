@@ -9,7 +9,7 @@ Prototype lab for **Qumbra** — the post-quantum privacy-chain design exercise.
 ## Layout
 
 ```
-crates/         # 14 crates
+crates/         # 15 crates
   qlab-air/           # the fixed-shape AIR: Merkle path, PRF, commitment, balance
   qlab-bench/         # bench harness: hash matrix × hardware, criterion-based
   qlab-consensus/     # the frozen CONSENSUS_CFG + prove/verify wrappers (single source)
@@ -23,6 +23,7 @@ crates/         # 14 crates
   qlab-disclosure/    # selective-disclosure STARK
   qlab-econ/          # emission simulator
   qlab-demo/          # whole-stack composition
+  qlab-faucet/        # the M11 faucet: a proof-generating wallet + off-chain anti-abuse
   qumbra-node/        # the shipping binary: config, genesis, run
 docs/           # lab notes; polished results go to the design repo, not here
 ```

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/qlab-air", "crates/qlab-bench", "crates/qlab-consensus", "crates/qlab-node", "crates/qlab-note", "crates/qlab-devnet", "crates/qlab-wallet", "crates/qlab-cbserver", "crates/qlab-econ", "crates/qlab-demo", "crates/qlab-disclosure", "crates/qlab-pow", "crates/qlab-p2p", "crates/qumbra-node"]
+members = ["crates/qlab-air", "crates/qlab-bench", "crates/qlab-consensus", "crates/qlab-node", "crates/qlab-note", "crates/qlab-devnet", "crates/qlab-wallet", "crates/qlab-cbserver", "crates/qlab-econ", "crates/qlab-demo", "crates/qlab-faucet", "crates/qlab-disclosure", "crates/qlab-pow", "crates/qlab-p2p", "crates/qumbra-node"]
 
 [workspace.package]
 edition = "2021"
