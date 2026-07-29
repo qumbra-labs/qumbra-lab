@@ -1524,12 +1524,15 @@ mod tests {
         assert_eq!(r.excluded, vec![0, 1], "tombstoned voters are excluded, by name");
         assert_eq!(r.absent(), vec![2, 5, 6], "signer 2 is tombstoned but silent — still absent");
         assert_eq!(r.active, 4, "roster 7 minus three tombstones");
-        assert!(r.active < r.need);
-        assert_eq!(
-            r.diagnose(),
-            RoundDiagnosis::QuorumImpossible,
-            "the roster could not have produced a quorum — this is not a latency story"
+        assert!(
+            r.active < r.need,
+            "the roster could not have produced a quorum — the fields say so before any \
+             verdict does, which is why the raw fields are always on the line"
         );
+        // Still open, so it has no verdict yet — a round that has not ended has no
+        // cause. The `active < need ⇒ quorum_impossible` step is exercised on a CLOSED
+        // record in `qlab_node::round`'s classifier test.
+        assert_eq!(r.diagnose(), RoundDiagnosis::Open);
     }
 
     /// **Caught on the lab net, not in a unit test.** Genesis carries a placeholder

@@ -638,6 +638,23 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         lines
     }
 
+    /// Emit a `close=open` line for any round that has been open too long — so a
+    /// **stall is visible while it is happening**, not only once it ends.
+    ///
+    /// Without this the journal is silent for the whole duration of the thing it
+    /// exists to explain: a round only closes when a later slot finalizes past it, so
+    /// during a stall the detail arrives exactly when it stops being urgent. Reports
+    /// repeat when the vote count moves and otherwise stay quiet, so a round stuck at
+    /// `have=11/15` says so and then does not spam the log. Sampled on the telemetry
+    /// cadence. Returns the lines emitted.
+    pub fn emit_overdue_rounds(&mut self) -> Vec<String> {
+        let lines = self.p2p.node_mut().rounds_mut().overdue_reports();
+        for line in &lines {
+            println!("{line}");
+        }
+        lines
+    }
+
     /// One message-pump step; returns frames handled.
     pub fn step_once(&mut self) -> usize {
         self.p2p.tick()
@@ -839,6 +856,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             }
             if self.last_sample.elapsed() >= self.sample_interval {
                 println!("{}", self.telemetry_sample());
+                // A stall's open rounds report themselves on the same cadence as the
+                // telemetry line they explain.
+                self.emit_overdue_rounds();
                 self.last_sample = Instant::now();
                 // Cheap and idempotent; sampled on the telemetry cadence so it costs
                 // nothing on a net that never halts.
@@ -1616,6 +1636,14 @@ mod tests {
         assert_eq!(r.absent(), (6..21).collect::<Vec<_>>(), "the fifteen never heard from");
         assert!(r.proposed_locally && r.local_votes == 6);
         assert_eq!(r.rejects.total(), 0, "a shortage, not a stream of junk");
+
+        // And the stall is visible WHILE IT IS HAPPENING: the round never closes on
+        // its own (nothing can finalize past it at 11 of 21 keys), so without the
+        // overdue report the journal would say nothing for the whole stall. Under the
+        // deterministic clock there is no age to judge, so nothing is reported and
+        // nothing is invented — the wall-clock behaviour is pinned in
+        // `qlab_node::round`'s own test.
+        assert!(node.emit_overdue_rounds().is_empty(), "no clock basis ⇒ no age, no report");
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -61,6 +61,22 @@ pub const RETAINED_ROUNDS: usize = 64;
 /// is *reported*, not silently dropped. **Devnet-grade, tunable, NOT frozen.**
 pub const MAX_OPEN_ROUNDS: usize = 16;
 
+/// How long a round may stay open before it is **reported while still open**.
+///
+/// A stall used to produce no journal output at all until it *ended* — the detail
+/// landed only once a later slot finalized past it, which is precisely the moment an
+/// operator no longer urgently needs it. One round period (cadence 8 × 75 s) is the
+/// natural threshold: a round still open after a full period has already missed its
+/// slot. **Devnet-grade, tunable, NOT frozen.**
+pub const OVERDUE_AFTER_MS: u64 = 600_000;
+
+/// Minimum spacing between repeat reports of the *same* still-open round when
+/// nothing about it has changed. A round stuck at `have=11/15` should say so, and
+/// then stop repeating itself: a new line is emitted when the vote count moves, or
+/// once per this interval, whichever comes first. **Devnet-grade, tunable, NOT
+/// frozen.**
+pub const OVERDUE_REPEAT_MS: u64 = 600_000;
+
 /// The timeout/votes-short discriminant: a round whose most recent **new** vote
 /// arrived within this many milliseconds of its close was still accumulating when it
 /// was cut off.
@@ -183,6 +199,10 @@ pub enum RoundDiagnosis {
     /// No timing basis (deterministic clock) and the count-only tests did not
     /// settle it. Never asserted as a cause.
     Unclassified,
+    /// **Still open.** Not a verdict — a round that has not ended has no cause yet.
+    /// Reported so a stall is visible *while it is happening*; the counts on the line
+    /// are real, only the outcome is undecided. Never counted as a closed verdict.
+    Open,
 }
 
 impl RoundDiagnosis {
@@ -195,12 +215,14 @@ impl RoundDiagnosis {
             RoundDiagnosis::VotesShort => "votes_short",
             RoundDiagnosis::Timeout => "timeout",
             RoundDiagnosis::Unclassified => "unclassified",
+            RoundDiagnosis::Open => "open",
         }
     }
 
-    /// Every diagnosis label, so a metrics family can pre-declare its series (a
-    /// counter that only appears after the first failure is a counter an alert
-    /// cannot be written against).
+    /// Every **closed-round** verdict, so a metrics family can pre-declare its series
+    /// (a counter that only appears after the first failure is a counter an alert
+    /// cannot be written against). [`RoundDiagnosis::Open`] is deliberately absent:
+    /// it is not an outcome and must never be counted as one.
     pub const ALL: [RoundDiagnosis; 6] = [
         RoundDiagnosis::Finalized,
         RoundDiagnosis::QuorumImpossible,
@@ -307,6 +329,11 @@ impl RoundRecord {
     /// recorded fields alone** — `closed_ms`, `last_ms`, `have`, `need`, `active` —
     /// which is the property the round journal exists to have.
     pub fn diagnose(&self) -> RoundDiagnosis {
+        if self.close.is_none() {
+            // Still open: the counts are real, the outcome is not yet decided, and
+            // guessing one would be the fabrication this module exists to avoid.
+            return RoundDiagnosis::Open;
+        }
         if self.close == Some(RoundClose::Finalized) {
             return RoundDiagnosis::Finalized;
         }
@@ -422,6 +449,9 @@ pub struct RoundLedger {
     emit: VecDeque<RoundRecord>,
     /// Bounded ring of the most recent closed records (operator/test queries).
     recent: VecDeque<RoundRecord>,
+    /// height → (vote count, instant) at that round's last still-open report, so a
+    /// stuck round says so once and then stops repeating itself.
+    reported: BTreeMap<u64, (usize, Option<u64>)>,
     closed_total: u64,
     failed_total: u64,
 }
@@ -440,6 +470,7 @@ impl RoundLedger {
             open: BTreeMap::new(),
             emit: VecDeque::new(),
             recent: VecDeque::new(),
+            reported: BTreeMap::new(),
             closed_total: 0,
             failed_total: 0,
         }
@@ -624,6 +655,7 @@ impl RoundLedger {
         if how != RoundClose::Finalized {
             self.failed_total += 1;
         }
+        self.reported.remove(&height);
         self.emit.push_back(rec.clone());
         self.recent.push_back(rec);
         while self.recent.len() > RETAINED_ROUNDS {
@@ -634,6 +666,45 @@ impl RoundLedger {
         while self.emit.len() > RETAINED_ROUNDS {
             self.emit.pop_front();
         }
+    }
+
+    /// Rounds that are **still open** and overdue enough to be worth saying out loud
+    /// again, returned as journal lines.
+    ///
+    /// A stall used to be silent until it ended. This is the fix: a round open longer
+    /// than [`OVERDUE_AFTER_MS`] is reported, and reported again whenever its vote
+    /// count moves or [`OVERDUE_REPEAT_MS`] passes — so "stuck at 11 of 15, and these
+    /// ten have not been heard from" reaches the log *during* the incident, while
+    /// staying quiet about a round that is merely repeating itself.
+    ///
+    /// Requires a timing basis: under [`ObsClock::Deterministic`] there is no age to
+    /// compare, so nothing is reported and nothing is invented.
+    pub fn overdue_reports(&mut self) -> Vec<String> {
+        let now = self.now();
+        let Some(now) = now else { return Vec::new() };
+        let mut out = Vec::new();
+        for (height, rec) in &self.open {
+            let Some(opened) = rec.opened_at_ms else { continue };
+            let age = now.saturating_sub(opened);
+            if age < OVERDUE_AFTER_MS {
+                continue;
+            }
+            let have = rec.have();
+            let due = match self.reported.get(height) {
+                None => true,
+                Some((last_have, last_at)) => {
+                    *last_have != have
+                        || last_at.is_none_or(|t| now.saturating_sub(t) >= OVERDUE_REPEAT_MS)
+                }
+            };
+            if due {
+                out.push(rec.to_line());
+                self.reported.insert(*height, (have, Some(now)));
+            }
+        }
+        // A round that closed is no longer worth remembering a report for.
+        self.reported.retain(|h, _| self.open.contains_key(h));
+        out
     }
 
     /// Take the closed records awaiting journal emission.
@@ -821,7 +892,14 @@ mod tests {
         assert_eq!(r.rejects.unknown_signer, 1);
         assert_eq!(r.rejects.total(), 4);
         assert_eq!(r.msgs, 2);
-        assert_eq!(r.diagnose(), RoundDiagnosis::Silent);
+        // While open it has no verdict; once it closes, "nothing counted ever reached
+        // us" is the finding — and the reject counts say the traffic was not absent,
+        // only unusable.
+        assert_eq!(r.diagnose(), RoundDiagnosis::Open);
+        l.note_finalized(16);
+        let closed = l.take_emitted();
+        assert_eq!(closed[0].diagnose(), RoundDiagnosis::Silent);
+        assert_eq!(closed[0].rejects.total(), 4);
     }
 
     /// A height spray cannot grow the ledger without bound, and an evicted round is
@@ -837,6 +915,65 @@ mod tests {
         assert_eq!(emitted.len(), 5, "every evicted round is emitted");
         assert!(emitted.iter().all(|r| r.close == Some(RoundClose::Evicted)));
         assert!(l.open_round(8).is_none(), "oldest evicted");
+    }
+
+    /// **A stall must be visible WHILE IT IS HAPPENING.** Before this, a round that
+    /// never finalized produced no journal output until a later slot superseded it —
+    /// which on a long stall is exactly when the operator no longer urgently needs
+    /// it. An overdue open round reports itself, repeats when its vote count moves,
+    /// and otherwise stays quiet.
+    #[test]
+    fn a_stuck_round_reports_itself_while_still_open_and_then_stops_repeating() {
+        // A ledger on a controllable clock: the wall-clock variant cannot be stepped,
+        // so this drives the ledger's own fields directly, the way the classifier
+        // tests do.
+        let mut l = RoundLedger::new(ObsClock::Deterministic);
+        let c = ctx(8, 21, 21, 15);
+        l.note_votes(&c, &(0..11).collect::<Vec<_>>(), &[], VoteRejects::default(), 1);
+        // No timing basis ⇒ nothing reported, nothing invented.
+        assert!(l.overdue_reports().is_empty(), "a deterministic run has no age to judge");
+
+        // Now with timings, driven through the record the ledger holds.
+        let mut l = RoundLedger::new(ObsClock::WallClock);
+        l.note_votes(&c, &(0..11).collect::<Vec<_>>(), &[], VoteRejects::default(), 1);
+        // Fresh round: not overdue yet.
+        assert!(l.overdue_reports().is_empty(), "a round that just opened is not overdue");
+
+        // Backdate the open instant past the threshold — the same thing the passage
+        // of a round period does.
+        let now = ObsClock::WallClock.now_ms().expect("wall clock");
+        l.open.get_mut(&8).unwrap().opened_at_ms = Some(now - OVERDUE_AFTER_MS - 1);
+        let first = l.overdue_reports();
+        assert_eq!(first.len(), 1, "an overdue open round says so");
+        assert!(first[0].contains("why=open"), "an open round has no verdict yet: {}", first[0]);
+        assert!(first[0].contains("close=open"), "{}", first[0]);
+        assert!(first[0].contains("have=11 need=15 active=21"), "{}", first[0]);
+        assert!(first[0].contains("absent=11,12,13,14,15,16,17,18,19,20"), "{}", first[0]);
+
+        // Nothing changed ⇒ it does not repeat itself.
+        assert!(l.overdue_reports().is_empty(), "a stuck round must not spam the log");
+
+        // The vote count moves ⇒ worth saying again.
+        l.note_votes(&c, &(0..13).collect::<Vec<_>>(), &[], VoteRejects::default(), 1);
+        let second = l.overdue_reports();
+        assert_eq!(second.len(), 1);
+        assert!(second[0].contains("have=13"), "{}", second[0]);
+        assert!(l.overdue_reports().is_empty());
+
+        // Once it closes it is journalled normally and never reported open again.
+        l.note_finalized(16);
+        assert!(l.overdue_reports().is_empty());
+        let closed = l.take_emitted();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].close, Some(RoundClose::Superseded { by_height: 16 }));
+        assert_ne!(closed[0].diagnose(), RoundDiagnosis::Open, "a closed round has a verdict");
+    }
+
+    /// `Open` is not an outcome and must never be pre-declared or counted as one.
+    #[test]
+    fn open_is_not_a_closed_verdict() {
+        assert!(!RoundDiagnosis::ALL.contains(&RoundDiagnosis::Open));
+        assert_eq!(RoundDiagnosis::ALL.len(), 6);
     }
 
     /// **The write-volume caliper, machine-checked.** The always-on decision rests on

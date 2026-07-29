@@ -22,8 +22,10 @@ round; a journal line cannot give you a p99. Neither is the other's backup.
 
 ## 1. The `ROUND` line
 
-One line per round, emitted when the round **closes**. Same `key=value` shape as
-`TELEMETRY`, so the same grep and awk habits work.
+One line per round, emitted when the round **closes** — and, for a round that has
+been open too long, while it is still open (`close=open`, `why=open`), so a stall is
+visible *while it is happening* rather than only once it ends. Same `key=value` shape
+as `TELEMETRY`, so the same grep and awk habits work.
 
 ```
 ROUND slot=1384 epoch=12 why=votes_short close=superseded by=1392 have=11 need=15 active=21 roster=21 \
@@ -79,6 +81,13 @@ the N7 soak). That is deliberate: the node records counts and rosters truthfully
    finding.**
 6. **`unclassified`** — no timing basis (deterministic clock). Never asserted as a
    cause.
+
+`why=open` is **not** a verdict: a round that has not ended has no cause yet. The
+counts on such a line are real; only the outcome is undecided, and it is never
+counted as a closed outcome. A round is reported open once it has been open longer
+than `OVERDUE_AFTER_MS` (600 s = one round period), and reported again when its vote
+count moves or `OVERDUE_REPEAT_MS` passes — so a round stuck at `have=11/15` says so
+and then stops repeating itself.
 
 **The judgement issue #87 asks for is step 4 vs step 5**, and it is decidable from the
 recorded fields alone — `closed_ms`, `last_ms`, `have`, `need`, `active`. That is the
@@ -189,6 +198,12 @@ cadence 8 × 75 s  = 600 s per round  =  144 rounds/day
 144 rounds/day × ≤ 400 B/line        ≈  ≤ 58 KB/day
 ```
 
+Plus the still-open reports, which are zero in normal operation (rounds close in
+milliseconds — the lab net's first round closed at 315 ms). They appear only during a
+stall, at most one line per open round per vote-count change or per 600 s, and open
+rounds are capped at `MAX_OPEN_ROUNDS = 16`. A 40-block stall — the worst the 42 h
+soak saw — holds ~5 open rounds and adds well under 100 lines for its whole duration.
+
 Both halves are machine-checked:
 `round::tests::journal_line_stays_within_the_quoted_budget` pins the line length for a
 fully-populated 21-member round, and
@@ -206,7 +221,13 @@ exposition per scrape and a 5 s render.
 Find every round that did not finalize, with its cause:
 
 ```sh
-grep '^ROUND ' node.log | grep -v 'why=finalized'
+grep '^ROUND ' node.log | grep -vE 'why=(finalized|open)'
+```
+
+Watch a stall as it happens (the still-open reports):
+
+```sh
+grep '^ROUND ' node.log | grep 'why=open'
 ```
 
 Which members are missing most often (over the archived log, all rounds):

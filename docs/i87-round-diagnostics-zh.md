@@ -20,7 +20,9 @@
 
 ## 1. `ROUND` 行
 
-一轮一行，在轮次**关闭**时输出。与 `TELEMETRY` 同为 `key=value` 形状，原有的 grep / awk 习惯直接可用。
+一轮一行，在轮次**关闭**时输出；另外，开着太久的轮次在**仍然开着**的时候也会输出一行
+（`close=open`、`why=open`），这样停滞是**在发生的过程中**可见，而不是等它结束才可见。
+与 `TELEMETRY` 同为 `key=value` 形状，原有的 grep / awk 习惯直接可用。
 
 ```
 ROUND slot=1384 epoch=12 why=votes_short close=superseded by=1392 have=11 need=15 active=21 roster=21 \
@@ -70,6 +72,11 @@ roster，**不会编造一个它并不具备的时间基准**。
 5. **`votes_short`** —— 票到过，然后在关闭前很久就停了。委员会给出了它能给的全部，仍然不够。
    **`absent` 列表就是那条发现。**
 6. **`unclassified`** —— 没有时间基准（确定性时钟）。绝不作为原因断言。
+
+`why=open` **不是**一种判定：还没结束的轮次没有原因。这种行上的计数是真的，只有结果未定，
+并且它永远不会被计入「已关闭轮次」的任何计数器。一轮在开启超过 `OVERDUE_AFTER_MS`
+（600 s = 一个轮次周期）后被报告一次，此后在票数变化时、或每过 `OVERDUE_REPEAT_MS` 再报一次 ——
+所以卡在 `have=11/15` 的轮次会说一声，然后不再刷屏。
 
 **issue #87 要的那条判据就是第 4 步与第 5 步之分**，而它**仅凭记录下来的字段**即可判定 ——
 `closed_ms`、`last_ms`、`have`、`need`、`active`。这正是这份日志存在的意义，并由
@@ -164,6 +171,11 @@ cadence 8 × 75 s  = 每轮 600 s  =  144 轮/天
 144 轮/天 × ≤ 400 B/行          ≈  ≤ 58 KB/天
 ```
 
+再加上「仍然开着」的报告：正常运行时为 0（轮次在毫秒级关闭 —— lab 网第一条实测轮次在 315 ms 关闭）。
+它们只在停滞期间出现，每个开启轮次至多在票数变化时或每 600 s 输出一行，而开启轮次数上限是
+`MAX_OPEN_ROUNDS = 16`。42 h soak 见过的最坏停滞（40 块）大约对应 5 个开启轮次，
+整段停滞加起来远不到 100 行。
+
 两半都由测试钉住：`round::tests::journal_line_stays_within_the_quoted_budget` 钉住一个
 21 人满员轮次的行长上界，`run::tests::round_journal_volume_is_set_by_the_cadence_not_the_block_rate`
 把日写入量**推导**出来，而不是手写一个数字。
@@ -178,7 +190,13 @@ cadence 8 × 75 s  = 每轮 600 s  =  144 轮/天
 找出所有没 finalize 的轮次及其原因：
 
 ```sh
-grep '^ROUND ' node.log | grep -v 'why=finalized'
+grep '^ROUND ' node.log | grep -vE 'why=(finalized|open)'
+```
+
+在停滞发生的过程中盯着它（仍然开着的报告）：
+
+```sh
+grep '^ROUND ' node.log | grep 'why=open'
 ```
 
 哪些成员缺席最多（对归档日志，全部轮次）：
