@@ -57,6 +57,23 @@ pub trait Transport {
     fn dial(&self, addr: &str) -> Result<PeerId, TransportError> {
         Err(TransportError::Io(format!("transport cannot dial {addr}")))
     }
+
+    /// The remote endpoint behind a local handle, if this transport knows one
+    /// (issue #91). Read-only, additive, and **not** a reachability claim — a
+    /// dialable address is still only earned by a successful outbound dial (#86).
+    ///
+    /// This exists so [`crate::ratelimit`] can key a budget on something an
+    /// attacker cannot change by reconnecting. Returning `None` is always safe:
+    /// the limiter falls back to the handle.
+    fn peer_addr(&self, _id: PeerId) -> Option<String> {
+        None
+    }
+
+    /// Frames the transport dropped because its receive queue was full
+    /// (issue #91, gap 2). Zero on a transport that cannot drop.
+    fn dropped_frames(&self) -> u64 {
+        0
+    }
 }
 
 // ==========================================================================
@@ -130,6 +147,19 @@ impl InProcHub {
         boxes.get_mut(&id).map(std::mem::take).unwrap_or_default()
     }
 
+    /// The address `id` bound itself at, if any — the in-process analogue of a
+    /// remote socket address. A node that never called [`InProcHub::bind_addr`]
+    /// (the outbound-only participant) has none, exactly as it has no address on a
+    /// real net.
+    fn addr_of(&self, id: PeerId) -> Option<String> {
+        self.addrs
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, &p)| p == id)
+            .map(|(a, _)| a.clone())
+    }
+
     fn neighbours(&self, id: PeerId) -> Vec<PeerId> {
         let l = self.links.lock().unwrap();
         let mut v: Vec<PeerId> = l.iter().filter(|(a, _)| *a == id).map(|(_, b)| *b).collect();
@@ -167,6 +197,9 @@ impl Transport for InProcTransport {
     fn peers(&self) -> Vec<PeerId> {
         self.hub.neighbours(self.id)
     }
+    fn peer_addr(&self, id: PeerId) -> Option<String> {
+        self.hub.addr_of(id)
+    }
     /// Dial = resolve the bound address and link both ways. An address nobody
     /// bound is unreachable, exactly as a node behind a router is.
     fn dial(&self, addr: &str) -> Result<PeerId, TransportError> {
@@ -201,8 +234,33 @@ fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
     Ok(frame)
 }
 
+/// Maximum bytes held in the receive queue across **all** peers (issue #91,
+/// gap 2). `[devnet-placeholder]` testnet-tunable, NOT frozen.
+///
+/// [`crate::wire::MAX_PAYLOAD`] bounds one frame; nothing bounded the *pile*. The
+/// reader threads push as fast as the sockets deliver while `poll` only drains on
+/// the node's tick, so a peer that sends faster than we process grew this queue
+/// without limit — a per-message cap says nothing about concurrent or cumulative
+/// use. 64 MiB is 8 maximum-size frames, against a measured ~262 MiB steady RSS
+/// per node on the 2 GB T0 hosts (Phase B-WAN).
+pub const MAX_INBOX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Maximum queued bytes attributable to any **one** peer. `[devnet-placeholder]`
+/// testnet-tunable, NOT frozen. Fixed at 2 × [`crate::wire::MAX_PAYLOAD`] so a
+/// single legal maximum-size frame can never be refused by its own arrival, and so
+/// one peer cannot consume the whole global budget and starve the rest.
+pub const MAX_INBOX_BYTES_PER_PEER: u64 = 16 * 1024 * 1024;
+
+/// The receive queue, with the byte accounting that bounds it.
+#[derive(Default)]
+struct Inbox {
+    frames: Vec<(PeerId, Vec<u8>)>,
+    bytes: u64,
+    per_peer: HashMap<PeerId, u64>,
+}
+
 struct TcpShared {
-    inbox: Mutex<Vec<(PeerId, Vec<u8>)>>,
+    inbox: Mutex<Inbox>,
     writers: Mutex<HashMap<PeerId, TcpStream>>,
     running: AtomicBool,
     next_id: AtomicU64,
@@ -212,11 +270,35 @@ struct TcpShared {
     /// Maximum simultaneous inbound connections; over it, a connection is closed
     /// at accept rather than absorbed.
     inbound_cap: AtomicU64,
+    /// Remote endpoint per handle (issue #91) — the accept path used to discard
+    /// this, which left an inbound connection with no stable identity to key a
+    /// rate budget on.
+    remote_addrs: Mutex<HashMap<PeerId, String>>,
+    /// Frames refused because the receive queue was full.
+    dropped: AtomicU64,
 }
 
 impl TcpShared {
     fn alloc_id(&self) -> PeerId {
         PeerId(self.next_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Queue one received frame, or drop it if either byte bound is reached.
+    /// Dropping is the whole response: the connection stays up (a full queue is
+    /// congestion, not proof of malice — the same boundary [`crate::ratelimit`]
+    /// draws), and the sender will find out through the protocol, not a ban.
+    fn queue_frame(&self, id: PeerId, frame: Vec<u8>) {
+        let len = frame.len() as u64;
+        let mut inbox = self.inbox.lock().unwrap();
+        let mine = inbox.per_peer.get(&id).copied().unwrap_or(0);
+        if inbox.bytes + len > MAX_INBOX_BYTES || mine + len > MAX_INBOX_BYTES_PER_PEER {
+            drop(inbox);
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
+        inbox.bytes += len;
+        *inbox.per_peer.entry(id).or_insert(0) += len;
+        inbox.frames.push((id, frame));
     }
 
     /// Live inbound connections (an entry is dropped when its reader thread exits).
@@ -242,12 +324,14 @@ impl TcpTransport {
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
         let shared = Arc::new(TcpShared {
-            inbox: Mutex::new(Vec::new()),
+            inbox: Mutex::new(Inbox::default()),
             writers: Mutex::new(HashMap::new()),
             running: AtomicBool::new(true),
             next_id: AtomicU64::new(1),
             inbound: Mutex::new(HashSet::new()),
             inbound_cap: AtomicU64::new(crate::addrman::MAX_INBOUND as u64),
+            remote_addrs: Mutex::new(HashMap::new()),
+            dropped: AtomicU64::new(0),
         });
         let mut threads = Vec::new();
 
@@ -305,6 +389,11 @@ impl TcpTransport {
         self.shared.inbound_live()
     }
 
+    /// Bytes currently sitting in the receive queue (ops / tests).
+    pub fn queued_bytes(&self) -> u64 {
+        self.shared.inbox.lock().unwrap().bytes
+    }
+
     /// Register a connected stream: store its write half, spawn a reader thread,
     /// and return the local peer handle. `inbound` records which half of the
     /// connection budget it consumes.
@@ -320,6 +409,13 @@ impl TcpTransport {
         if inbound {
             shared.inbound.lock().unwrap().insert(id);
         }
+        // Remember who this is (issue #91). The accept path previously dropped the
+        // peer address on the floor, so an inbound peer had no identity that
+        // survived its socket — and a rate budget keyed on something that does not
+        // survive the socket is reset by reconnecting.
+        if let Ok(peer) = stream.peer_addr() {
+            shared.remote_addrs.lock().unwrap().insert(id, peer.to_string());
+        }
 
         let reader_shared = Arc::clone(shared);
         let mut read_stream = stream;
@@ -330,7 +426,7 @@ impl TcpTransport {
                         if !reader_shared.running.load(Ordering::SeqCst) {
                             break;
                         }
-                        reader_shared.inbox.lock().unwrap().push((id, frame));
+                        reader_shared.queue_frame(id, frame);
                     }
                     Err(_) => break, // EOF, shutdown, or malformed frame
                 }
@@ -339,6 +435,7 @@ impl TcpTransport {
             // the inbound slot it held.
             reader_shared.writers.lock().unwrap().remove(&id);
             reader_shared.inbound.lock().unwrap().remove(&id);
+            reader_shared.remote_addrs.lock().unwrap().remove(&id);
         });
         // The reader-thread handle is intentionally detached from `threads`: it
         // exits when the socket is shut down (see `shutdown`).
@@ -368,7 +465,9 @@ impl Transport for TcpTransport {
         stream.flush().map_err(|e| TransportError::Io(e.to_string()))
     }
     fn poll(&self) -> Vec<(PeerId, Vec<u8>)> {
-        std::mem::take(&mut *self.shared.inbox.lock().unwrap())
+        // Draining releases the whole byte budget in one step, so the accounting
+        // measures what is *queued*, never a lifetime total.
+        std::mem::take(&mut *self.shared.inbox.lock().unwrap()).frames
     }
     fn peers(&self) -> Vec<PeerId> {
         let mut v: Vec<PeerId> = self.shared.writers.lock().unwrap().keys().copied().collect();
@@ -377,6 +476,12 @@ impl Transport for TcpTransport {
     }
     fn dial(&self, addr: &str) -> Result<PeerId, TransportError> {
         self.connect(addr).map_err(|e| TransportError::Io(e.to_string()))
+    }
+    fn peer_addr(&self, id: PeerId) -> Option<String> {
+        self.shared.remote_addrs.lock().unwrap().get(&id).cloned()
+    }
+    fn dropped_frames(&self) -> u64 {
+        self.shared.dropped.load(Ordering::SeqCst)
     }
 }
 
@@ -479,6 +584,98 @@ mod tests {
         assert_eq!(server.inbound_count(), 1);
         server.shutdown();
         client.shutdown();
+    }
+
+    /// A bare `TcpShared` with no sockets, so the queue accounting can be driven
+    /// directly instead of by pushing 64 MiB through loopback.
+    fn bare_shared() -> Arc<TcpShared> {
+        Arc::new(TcpShared {
+            inbox: Mutex::new(Inbox::default()),
+            writers: Mutex::new(HashMap::new()),
+            running: AtomicBool::new(true),
+            next_id: AtomicU64::new(1),
+            inbound: Mutex::new(HashSet::new()),
+            inbound_cap: AtomicU64::new(crate::addrman::MAX_INBOUND as u64),
+            remote_addrs: Mutex::new(HashMap::new()),
+            dropped: AtomicU64::new(0),
+        })
+    }
+
+    #[test]
+    fn the_receive_queue_accepts_up_to_its_global_bound_and_refuses_past_it() {
+        // Issue #91 gap 2: MAX_PAYLOAD bounds one frame, nothing bounded the pile.
+        let shared = bare_shared();
+        let chunk = 1024 * 1024usize; // 1 MiB per frame
+        let fit = (MAX_INBOX_BYTES / chunk as u64) as usize;
+        // Spread across enough peers that the per-peer bound is not what binds.
+        for i in 0..fit {
+            shared.queue_frame(PeerId(i as u64), vec![0u8; chunk]);
+        }
+        assert_eq!(shared.inbox.lock().unwrap().bytes, MAX_INBOX_BYTES, "exactly at the bound");
+        assert_eq!(shared.dropped.load(Ordering::SeqCst), 0, "nothing refused up to the bound");
+
+        shared.queue_frame(PeerId(9999), vec![0u8; 1]);
+        assert_eq!(shared.dropped.load(Ordering::SeqCst), 1, "one byte past it is refused");
+        assert_eq!(shared.inbox.lock().unwrap().bytes, MAX_INBOX_BYTES, "and nothing was queued");
+
+        // Draining releases the whole budget — the bound is on what is queued, not
+        // on a lifetime total.
+        let drained = std::mem::take(&mut *shared.inbox.lock().unwrap()).frames;
+        assert_eq!(drained.len(), fit);
+        shared.queue_frame(PeerId(1), vec![0u8; chunk]);
+        assert_eq!(shared.inbox.lock().unwrap().bytes, chunk as u64);
+    }
+
+    #[test]
+    fn one_peer_cannot_consume_the_whole_receive_queue() {
+        // The fairness half: without a per-peer bound, one sender fills the global
+        // budget and every other peer's frames are refused as collateral.
+        let shared = bare_shared();
+        let chunk = 1024 * 1024usize;
+        let fit = (MAX_INBOX_BYTES_PER_PEER / chunk as u64) as usize;
+        for _ in 0..fit {
+            shared.queue_frame(PeerId(1), vec![0u8; chunk]);
+        }
+        assert_eq!(shared.dropped.load(Ordering::SeqCst), 0, "at the per-peer bound, all accepted");
+        shared.queue_frame(PeerId(1), vec![0u8; 1]);
+        assert_eq!(shared.dropped.load(Ordering::SeqCst), 1, "past it, refused");
+
+        // A different peer is unaffected — its own budget is untouched.
+        shared.queue_frame(PeerId(2), vec![0u8; chunk]);
+        assert_eq!(shared.dropped.load(Ordering::SeqCst), 1, "the neighbour still gets through");
+        assert!(shared.inbox.lock().unwrap().per_peer[&PeerId(2)] == chunk as u64);
+    }
+
+    #[test]
+    fn tcp_reports_the_remote_address_of_an_accepted_connection() {
+        // Issue #91: accept used to discard this, leaving an inbound peer with no
+        // identity that outlives its socket.
+        let server = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let client = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let cid = client.dial(&server.local_addr().to_string()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        let accepted = server.peers();
+        assert_eq!(accepted.len(), 1);
+        let remote = server.peer_addr(accepted[0]).expect("the accept path kept the address");
+        assert!(remote.starts_with("127.0.0.1:"), "got {remote}");
+        assert!(client.peer_addr(cid).is_some(), "and the dialer knows its side too");
+
+        server.shutdown();
+        client.shutdown();
+    }
+
+    #[test]
+    fn inproc_reports_a_bound_peers_address_and_none_for_an_unbound_one() {
+        let hub = InProcHub::new();
+        let a = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let _b = InProcTransport::new(PeerId(2), Arc::clone(&hub));
+        let _c = InProcTransport::new(PeerId(3), Arc::clone(&hub));
+        hub.bind_addr("b:9333", PeerId(2));
+        assert_eq!(a.peer_addr(PeerId(2)), Some("b:9333".to_string()));
+        // The outbound-only participant has no address, on this transport as on a
+        // real net — the rate limiter falls back to the handle.
+        assert_eq!(a.peer_addr(PeerId(3)), None);
     }
 
     #[test]
