@@ -31,4 +31,12 @@ mining = true
 
 # OPTIONAL safety pin: refuse to start unless the loaded genesis hashes to this
 # (the value `qumbra-node genesis init` prints). Uncomment to enforce.
-# expected_genesis_hash = "4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3"
+# expected_genesis_hash = "8811d4e0ccdee702bafd4c92afad768495dc43360778072338aa140d87a73cff"
+
+# OPTIONAL — where mined coinbase notes are paid (issue #101): your wallet's rkm,
+# 64 hex characters (32 bytes, lane-major little-endian).
+#
+# LEAVING THIS UNSET BURNS EVERYTHING YOU MINE. The node still produces valid
+# blocks, but their coinbase notes are paid to a fixed placeholder key that nobody
+# holds a spend key for. The node says so loudly at startup when mining = true.
+# miner_rkm = "0000000000000000000000000000000000000000000000000000000000000000"

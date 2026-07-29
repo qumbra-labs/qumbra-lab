@@ -47,7 +47,12 @@ use qlab_node::{genesis_block, StoredBlock};
 /// Genesis-file format version. **NOT frozen** — protocol-spec §9 marks the
 /// genesis byte format `[full-M8]`; this is the T0 `[devnet-placeholder]` shape.
 /// Bumped on any incompatible change to [`GenesisFile`] / [`FrozenParams`].
-pub const GENESIS_FORMAT_VERSION: u32 = 1;
+///
+/// **2** since issue #101. The bump is not cosmetic: [`GenesisFile`] embeds the
+/// genesis block as a [`StoredBlock`], which gained `coinbase_rkm`, so the file's
+/// bytes — and therefore **the genesis hash, which is the network identity** —
+/// changed. See [`GenesisFile`]'s docs.
+pub const GENESIS_FORMAT_VERSION: u32 = 2;
 
 /// The FROZEN v1.0 consensus wire size in bytes (qlab-consensus
 /// `consensus_wire_is_145609_bytes`; consensus-parameters §1). Baked so the
@@ -278,6 +283,40 @@ impl KeyFile {
 /// format is `[full-M8]`, NOT frozen); the [`frozen`](Self::frozen) table it
 /// carries IS the binding FROZEN v1.0 consensus set.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// (issue #101) **This file's hash changed, so the network identity changed.**
+///
+/// The genesis hash is `keccak256` over this file's bincode, and the file embeds
+/// the genesis block as a [`StoredBlock`], which gained `coinbase_rkm`. So:
+///
+/// ```text
+///   pre-#101:  4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3
+///   post-#101: 8811d4e0ccdee702bafd4c92afad768495dc43360778072338aa140d87a73cff
+/// ```
+///
+/// (Both `coinbase_rkm` and the `format_version` bump below feed that value; the
+/// intermediate `44f7d464…` — the field alone, before the version bump — is not
+/// an identity any build produces and is named here only so the two causes are
+/// not mistaken for one.)
+///
+/// **This is a consequence, not a decision.** A node built from this revision
+/// cannot join the T0 net whatever the genesis hash says: the block-body
+/// commitment preimage changed (`qlab_devnet::body`), so #79's header/body binding
+/// rejects every block across the boundary in both directions. The identity change
+/// does not create that incompatibility — it makes it fail at **startup**, with
+/// `WrongGenesisHash`, instead of silently at the first block.
+///
+/// A running net crosses this the way `committee-and-governance` §4 says: the
+/// halt-height mechanism (#74/PR #76), which is drilled but has never been used in
+/// anger. That is a deployment question, and it is not this baton's.
+///
+/// **Not done here, deliberately:** `qlab_devnet::header`'s F1 note says the next
+/// genesis mint is the free moment to set `tx_body_commitment` to the real body
+/// commitment and delete the height-0 exemption in
+/// `qlab_node::node::check_stored_binding`. The identity is moving anyway, so the
+/// moment is arguably here — but "the hash moved as a side effect of a body-format
+/// change" is not the same event as "we deliberately minted T1's genesis", and
+/// bundling a second consensus decision into a side effect is how the first one
+/// stops being reviewable. Flagged for the coordinator instead.
 pub struct GenesisFile {
     /// Genesis-file format version (NOT frozen).
     pub format_version: u32,
@@ -585,11 +624,25 @@ mod tests {
     /// + genesis block + the bincode layout — so any drift in a frozen constant,
     /// the key encoding, or the file shape is caught here (a deliberate change bumps
     /// this pin and `GENESIS_FORMAT_VERSION`). Every node computes this same value.
+    ///
+    /// 🔴 **Changed by issue #101** — the file embeds the genesis block as a
+    /// `StoredBlock`, which gained `coinbase_rkm`. The pre-#101 value
+    /// `4a75b3b8…c2c3` is the identity of the T0 net now running on `t0-wan-2`;
+    /// a node built from this revision refuses to start against it, which is the
+    /// intended, loud outcome (see [`GenesisFile`]'s docs for why the two nets
+    /// were already incompatible before the hash moved).
     #[test]
     fn genesis_hash_is_pinned() {
         assert_eq!(
             GenesisFile::new_devnet_t0().hash_hex(),
+            "8811d4e0ccdee702bafd4c92afad768495dc43360778072338aa140d87a73cff",
+        );
+        // The identity the T0 net is pinned to, kept visible so the break is a
+        // fact in the tree rather than a deleted line in a diff.
+        assert_ne!(
+            GenesisFile::new_devnet_t0().hash_hex(),
             "4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3",
+            "pre-#101 T0 identity — see this test's doc comment"
         );
     }
 
