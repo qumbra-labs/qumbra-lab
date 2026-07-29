@@ -571,6 +571,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             quorum: ctx.need as u64,
             open_rounds: node.rounds().open_len() as u64,
             halt_at: self.halt_at,
+            throttled_frames: {
+                let s = self.p2p.rate_stats();
+                s.throttled_frames + s.throttled_bytes
+            },
+            throttled_getaddr: self.p2p.rate_stats().throttled_getaddr,
+            outbound_netgroups: self.p2p.addrs().outbound_groups().len() as u64,
             process_start_secs: self.process_start_secs,
             rendered_at_secs: unix_secs(),
         }
