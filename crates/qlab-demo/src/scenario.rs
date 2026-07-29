@@ -275,7 +275,7 @@ pub fn run_loop(seed: u64) -> LoopReport {
 
     // ── 4. Node validates the send against the full §6 + §8 anchor gate ──────
     let send_entry = tx_entry(&send_inst);
-    let send_body = BlockBody { txs: vec![send_entry], coinbase: 0 };
+    let send_body = BlockBody { txs: vec![send_entry], coinbase: 0, coinbase_rkm: [0; 4] };
     // cm_out surfaces bound into the send proof; keep them for the tree append.
     let send_out_cms = send_inst.cm_out;
     let verifier = PoolVerifier { pool: vec![(send_inst, send_pvs, send_proof)] };
@@ -358,7 +358,7 @@ pub fn run_loop(seed: u64) -> LoopReport {
     say!("Real M3 proof #2 (spend, anchored to finalized R1): {:.2} s", prove_secs[1]);
 
     let verifier2 = PoolVerifier { pool: vec![(spend_inst, spend_pvs, spend_proof)] };
-    let spend_body = BlockBody { txs: vec![spend_entry.clone()], coinbase: 0 };
+    let spend_body = BlockBody { txs: vec![spend_entry.clone()], coinbase: 0, coinbase_rkm: [0; 4] };
     validate_body(&header_committing_to(&spend_body), &spend_body, &verifier2, |r: &Hash32| {
         node.finality().is_anchor_acceptable(r, DEMO_ANCHOR_WINDOW_BLOCKS)
     })
@@ -371,7 +371,7 @@ pub fn run_loop(seed: u64) -> LoopReport {
     // Double-spend #1 (cross-block): re-submit the same nullifier → rejected by set.
     let double_spend_rejected = !nullifiers.insert(bob_nullifier);
     // Double-spend #2 (within-block): two entries with the same nullifier.
-    let two_same = BlockBody { txs: vec![spend_entry.clone(), spend_entry], coinbase: 0 };
+    let two_same = BlockBody { txs: vec![spend_entry.clone(), spend_entry], coinbase: 0, coinbase_rkm: [0; 4] };
     let within_block_double_spend_rejected = matches!(
         validate_body(&header_committing_to(&two_same), &two_same, &verifier2, |r: &Hash32| {
             node.finality().is_anchor_acceptable(r, DEMO_ANCHOR_WINDOW_BLOCKS)
@@ -386,7 +386,7 @@ pub fn run_loop(seed: u64) -> LoopReport {
     // root_at(4) is a real intermediate tree state that was never checkpointed.
     let never_final = h32(&anchor_tree.root_at(4));
     assert!(!node.finality().is_root_final(&never_final), "root_at(4) was never finalized");
-    let nf_body = BlockBody { txs: vec![entry_with_anchor(never_final)], coinbase: 0 };
+    let nf_body = BlockBody { txs: vec![entry_with_anchor(never_final)], coinbase: 0, coinbase_rkm: [0; 4] };
     let non_final_anchor_rejected = matches!(
         validate_body(&header_committing_to(&nf_body), &nf_body, &verifier2, |r: &Hash32| {
             node.finality().is_anchor_acceptable(r, DEMO_ANCHOR_WINDOW_BLOCKS)
@@ -415,7 +415,7 @@ pub fn run_loop(seed: u64) -> LoopReport {
     let r0_still_final = node.finality().is_root_final(&r0);
     let r0_age = node.finality().anchor_age(&r0);
     let r0_expired = !node.finality().is_anchor_acceptable(&r0, DEMO_ANCHOR_WINDOW_BLOCKS);
-    let exp_body = BlockBody { txs: vec![entry_with_anchor(r0)], coinbase: 0 };
+    let exp_body = BlockBody { txs: vec![entry_with_anchor(r0)], coinbase: 0, coinbase_rkm: [0; 4] };
     let expired_anchor_rejected = r0_still_final
         && r0_expired
         && matches!(

@@ -172,7 +172,11 @@ impl Devnet {
                 stored_txs.push(StoredTx { recipients });
             }
 
-            let body = BlockBody { txs: body_txs, coinbase: height };
+            // A synthetic minting block needs a payee (issue #101): a body with
+            // `coinbase > 0` and `coinbase_rkm == [0; 4]` is rejected, and this
+            // fixture's headers must commit to bodies a node would accept.
+            let coinbase_rkm = [height, height ^ 0xA5, height ^ 0x5A, height ^ 0xFF];
+            let body = BlockBody { txs: body_txs, coinbase: height, coinbase_rkm };
             let header = BlockHeader::child_of(&parent, height, params.difficulty, body.commitment());
             chain
                 .insert_header(header)

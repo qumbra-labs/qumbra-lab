@@ -55,7 +55,7 @@ fn apply_one_tx_block(
     parent: &BlockHeader,
     tx: TxEntry,
 ) -> Result<(BlockHeader, Hash32), NodeError> {
-    let body = BlockBody { txs: vec![tx], coinbase: 0 };
+    let body = BlockBody { txs: vec![tx], coinbase: 0, coinbase_rkm: [0; 4] };
     let header = BlockHeader::child_of(parent, parent.height + 1, GENESIS_DIFFICULTY, body.commitment());
     let hash = node.apply_block(header, body, &MockVerifier)?;
     Ok((header, hash))

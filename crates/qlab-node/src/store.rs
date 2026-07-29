@@ -131,6 +131,13 @@ pub struct StoredBlock {
     pub header: StoredHeader,
     pub txs: Vec<StoredTx>,
     pub coinbase: u64,
+    /// The miner's raw `rkm` for this block's coinbase note (issue #101).
+    ///
+    /// Persisted because the coinbase note is derived from `(height, body)` at
+    /// apply time and replay must reproduce the identical leaf — a log without
+    /// this field cannot rebuild the commitment tree. Adding it is an
+    /// incompatible on-disk change, hence `persist::FORMAT_VERSION = 2`.
+    pub coinbase_rkm: [u64; 4],
 }
 
 impl StoredBlock {
@@ -140,6 +147,7 @@ impl StoredBlock {
             header: header.into(),
             txs: body.txs.iter().map(StoredTx::from).collect(),
             coinbase: body.coinbase,
+            coinbase_rkm: body.coinbase_rkm,
         }
     }
 
@@ -153,6 +161,7 @@ impl StoredBlock {
         BlockBody {
             txs: self.txs.iter().map(TxEntry::from).collect(),
             coinbase: self.coinbase,
+            coinbase_rkm: self.coinbase_rkm,
         }
     }
 }

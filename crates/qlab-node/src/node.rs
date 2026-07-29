@@ -337,6 +337,28 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             .chain
             .put_block(block.clone())
             .map_err(NodeError::Chain)?;
+        // The coinbase note's leaf goes in FIRST, before this block's transaction
+        // commitments (issue #101).
+        //
+        // *That a leaf goes in at all* is what this issue is about: before it, a
+        // mined coin had no commitment-tree leaf, so no Merkle witness, so no real
+        // 2×2 proof could spend it — "mine → mature → spend" did not exist. The
+        // old `coinbase_note_commitment` could not have been used for this: it was
+        // a digest under its own domain that the circuit cannot open, so appending
+        // it would have produced a leaf that was still unspendable.
+        //
+        // *That it goes in first* is an arbitrary but fixed choice — the coinbase
+        // is the block's first output, and the compact-relay wire already treats
+        // slot 0 as the coinbase position. It only has to be the same everywhere,
+        // and it is: this is the single funnel both fresh application and log
+        // replay pass through, so `open == replay` holds by construction.
+        //
+        // Derived from `(height, body)` alone — no node state, no clock, no
+        // randomness — see [`crate::coinbase`].
+        if let Some(cb) = crate::coinbase::coinbase_note_leaf(block.header.height, &block.body()) {
+            self.commitments.append(cb);
+            self.commitments_ordered.push(cb);
+        }
         for tx in &block.txs {
             for cm in &tx.commitments {
                 self.commitments.append(*cm);
@@ -504,9 +526,9 @@ mod tests {
     #[test]
     fn apply_block_rejects_a_body_the_header_did_not_commit_to() {
         let (mut node, g, root) = node_with_finalized_genesis();
-        let honest = BlockBody { txs: vec![tx(root, 1)], coinbase: 0 };
+        let honest = BlockBody { txs: vec![tx(root, 1)], coinbase: 0, coinbase_rkm: [0; 4] };
         let header = child_committing_to(&g, &honest);
-        let swapped = BlockBody { txs: vec![tx(root, 2)], coinbase: 0 };
+        let swapped = BlockBody { txs: vec![tx(root, 2)], coinbase: 0, coinbase_rkm: [0; 4] };
         let err = node.apply_block(header, swapped.clone(), &MockVerifier).unwrap_err();
         assert!(
             matches!(
@@ -524,7 +546,7 @@ mod tests {
     #[test]
     fn apply_block_rejects_an_honest_header_with_an_empty_body() {
         let (mut node, g, root) = node_with_finalized_genesis();
-        let honest = BlockBody { txs: vec![tx(root, 3)], coinbase: 0 };
+        let honest = BlockBody { txs: vec![tx(root, 3)], coinbase: 0, coinbase_rkm: [0; 4] };
         let header = child_committing_to(&g, &honest);
         let err = node.apply_block(header, BlockBody::default(), &MockVerifier).unwrap_err();
         assert!(
@@ -545,13 +567,14 @@ mod tests {
         let g_header = genesis.header();
 
         // A block whose header honestly commits to `honest`…
-        let honest = BlockBody { txs: vec![tx([9u8; 32], 4)], coinbase: 0 };
+        let honest = BlockBody { txs: vec![tx([9u8; 32], 4)], coinbase: 0, coinbase_rkm: [0; 4] };
         let header = child_committing_to(&g_header, &honest);
         // …but whose persisted body is not that body.
         let tampered = StoredBlock {
             header: StoredHeader::from(&header),
             txs: Vec::new(),
             coinbase: 0,
+            coinbase_rkm: [0; 4],
         };
         persist::append_record(&dir, &LogRecord::Block(tampered)).unwrap();
 
@@ -583,7 +606,7 @@ mod tests {
         let root = node.commitment_root();
 
         // One honest block, then a snapshot covering it.
-        let body = BlockBody { txs: vec![tx(root, 5)], coinbase: 0 };
+        let body = BlockBody { txs: vec![tx(root, 5)], coinbase: 0, coinbase_rkm: [0; 4] };
         let header = child_committing_to(&g_header, &body);
         node.apply_block(header, body, &MockVerifier).unwrap();
         node.save_snapshot().unwrap();
@@ -592,10 +615,15 @@ mod tests {
 
         // Append a tampered record at the same height: `open` restores the
         // snapshot (applied_height = 1) and takes the fast path for it.
-        let honest2 = BlockBody { txs: vec![tx(root, 6)], coinbase: 0 };
+        let honest2 = BlockBody { txs: vec![tx(root, 6)], coinbase: 0, coinbase_rkm: [0; 4] };
         let h2 = child_committing_to(&g_header, &honest2);
         let tampered =
-            StoredBlock { header: StoredHeader::from(&h2), txs: Vec::new(), coinbase: 0 };
+            StoredBlock {
+                header: StoredHeader::from(&h2),
+                txs: Vec::new(),
+                coinbase: 0,
+                coinbase_rkm: [0; 4],
+            };
         persist::append_record(&dir, &LogRecord::Block(tampered)).unwrap();
 
         assert!(matches!(

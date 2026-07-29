@@ -78,6 +78,16 @@ pub struct BlockAnnounce {
     /// so a receiver can reconstruct the exact body (the coinbase is not a tx slot)
     /// and validate/fold it. §7 relay is `[devnet-placeholder]`, not a frozen wire.
     pub coinbase: u64,
+    /// The block body's coinbase payout key (`BlockBody::coinbase_rkm`, issue
+    /// #101) — 32 bytes, four little-endian lanes, immediately after `coinbase`.
+    ///
+    /// Carried for the same reason `coinbase` is: it is part of the body, it is
+    /// not a tx slot, and without it the receiver reconstructs a *different* body
+    /// whose commitment does not match the header — so every announced block
+    /// would be rejected as a binding mismatch (#79) and, worse, its announcer
+    /// penalised for a fault that is ours. **This is a wire break**: a pre-#101
+    /// peer's announce is 32 bytes short and fails to decode.
+    pub coinbase_rkm: [u64; 4],
     pub short_ids: Vec<[u8; SHORTID_LEN]>,
     pub prefilled: Vec<PrefilledTx>,
 }
@@ -104,6 +114,9 @@ pub fn encode_announce(a: &BlockAnnounce) -> Vec<u8> {
     out.extend_from_slice(&encode_header(&a.header));
     out.extend_from_slice(&a.nonce.to_le_bytes());
     out.extend_from_slice(&a.coinbase.to_le_bytes());
+    for lane in &a.coinbase_rkm {
+        out.extend_from_slice(&lane.to_le_bytes());
+    }
     write_varint(&mut out, a.short_ids.len() as u64);
     for s in &a.short_ids {
         out.extend_from_slice(s);
@@ -125,6 +138,10 @@ pub fn decode_announce(buf: &[u8]) -> Result<BlockAnnounce, DecodeError> {
     let header = decode_header(&hdr_bytes)?;
     let nonce = r.u64_le("announce.nonce")?;
     let coinbase = r.u64_le("announce.coinbase")?;
+    let mut coinbase_rkm = [0u64; 4];
+    for lane in coinbase_rkm.iter_mut() {
+        *lane = r.u64_le("announce.coinbase_rkm")?;
+    }
     let n_short = r.varint()? as usize;
     let mut short_ids = Vec::with_capacity(n_short);
     for _ in 0..n_short {
@@ -140,7 +157,7 @@ pub fn decode_announce(buf: &[u8]) -> Result<BlockAnnounce, DecodeError> {
         prefilled.push(PrefilledTx { index, tx: crate::codec::decode_tx(&tx_bytes)? });
     }
     r.finish()?;
-    Ok(BlockAnnounce { header, nonce, coinbase, short_ids, prefilled })
+    Ok(BlockAnnounce { header, nonce, coinbase, coinbase_rkm, short_ids, prefilled })
 }
 
 // --- GetBlockTxn ---
@@ -307,6 +324,7 @@ mod tests {
             header: header(),
             nonce: 0xDEADBEEF,
             coinbase: 0,
+            coinbase_rkm: [0; 4],
             short_ids: vec![short_id(0xDEADBEEF, &tx_id(&tx(2))), short_id(0xDEADBEEF, &tx_id(&tx(3)))],
             prefilled: vec![PrefilledTx { index: 0, tx: tx(1) }],
         };
@@ -341,6 +359,7 @@ mod tests {
             header: header(),
             nonce,
             coinbase: 0,
+            coinbase_rkm: [0; 4],
             // slots 1,2 are short ids; slot 0 is prefilled coinbase.
             short_ids: vec![short_id(nonce, &tx_id(&t1)), short_id(nonce, &tx_id(&t2))],
             prefilled: vec![PrefilledTx { index: 0, tx: coinbase.clone() }],
@@ -365,6 +384,7 @@ mod tests {
             header: header(),
             nonce,
             coinbase: 0,
+            coinbase_rkm: [0; 4],
             short_ids: vec![short_id(nonce, &tx_id(&t1)), short_id(nonce, &tx_id(&t2))],
             prefilled: vec![],
         };

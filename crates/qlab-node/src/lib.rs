@@ -43,6 +43,7 @@
 //! the tests assert it — so a snapshot can never silently diverge from a genesis
 //! replay.
 
+pub mod coinbase;
 pub mod emission;
 pub mod mempool;
 pub mod metrics;
@@ -54,10 +55,14 @@ pub mod rpc;
 mod store;
 pub mod telemetry;
 
+pub use coinbase::{
+    coinbase_note, coinbase_note_leaf, coinbase_note_value, coinbase_rho, coinbase_rseed,
+    COINBASE_RHO_DOMAIN, COINBASE_RSEED_DOMAIN,
+};
 pub use emission::{coinbase, s_atomic, RewardSplit, COINBASE_MATURITY_BLOCKS};
 pub use mempool::{
-    coinbase_note_commitment, consensus_weight_params, tx_weight, txid, AssemblyError,
-    BlockTemplate, Mempool, MempoolError, MempoolParams, MempoolTx, TxId,
+    consensus_weight_params, tx_weight, txid, AssemblyError, BlockTemplate, Mempool, MempoolError,
+    MempoolParams, MempoolTx, TxId,
 };
 pub use node::{genesis_block, MemNode, Node, NodeError, NodeState};
 pub use recovery::{

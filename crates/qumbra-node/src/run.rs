@@ -784,7 +784,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         match self.p2p.node_mut().mine_block() {
             Some((header, body)) => {
                 self.nonce = self.nonce.wrapping_add(1);
-                self.p2p.announce_block(header, body.txs, body.coinbase, self.nonce);
+                self.p2p.announce_block(header, body.txs, body.coinbase, body.coinbase_rkm, self.nonce);
                 self.last_mine = Instant::now();
                 true
             }
