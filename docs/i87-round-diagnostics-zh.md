@@ -40,7 +40,7 @@ ROUND slot=1384 epoch=12 why=votes_short close=superseded by=1392 have=11 need=1
 | `active` | 该高度上 roster 减去 tombstone/jail | `active < need` ⇒ 无论网络多好这轮都赢不了 |
 | `roster` | 该高度的委员会规模 | |
 | `voted` | 谁有计数票，按委员会下标 | 升序 |
-| `absent` | 在 roster 内、未被 tombstone/jail、且**其票没有到达本节点** | 是「触达」，**不是**该成员宕机的证明 |
+| `absent` | 在 roster 内、未被 tombstone/jail、且**其票没有到达本节点** | 是「触达」，**不是**该成员宕机的证明。在 `finalized` 轮次上它还偏向最慢的节点 —— 见 §7 |
 | `excluded` | 票有效但因非活跃被排除的成员 | 由 FROZEN §4 规则排除 —— **不要**去查这些主机 |
 | `variants` | 该高度上见到的不同 checkpoint 变体数 | `>1` 表示委员会分裂 —— 这与「票不够」是不同的故障 |
 | `msgs` | 本轮摄入的票集消息数 | |
@@ -224,6 +224,14 @@ rate(qumbra_finality_advance_blocks_bucket{le="8"}[1h])
 * **`absent` 不是成员宕机的证明。** 它是「在本轮关闭前，该成员的票没有到达本节点」。
   一个活着但与*本节点*分区的成员，在这里缺席、在别处在场。把同一 slot 的 `absent` 在四个节点之间
   对照，才能区分这两者 —— 而这个对照现在才成为可能。
+* **在 `finalized` 轮次上，`absent` 偏向最慢的节点。** 一轮在 quorum 达成的**那一刻**就关闭，
+  所以比第 15 票晚 50 ms 的成员会被记成缺席。lab 网第一条实测行正是这个样子：它在
+  `quorum_ms=315` 以 `have=16` 关闭，而最远那个节点持有的 5 把钥匙落在 `absent` 里 ——
+  它们是慢，不是死。`qumbra_committee_absent_rounds_total` 继承这个偏差。
+  **无偏的读法在失败轮次上**，因为失败轮次开着的时间长得多：日志按 `why!=finalized` 过滤，
+  或者把该指标对着 `qumbra_checkpoint_rounds_total{verdict!="finalized"}` 读。
+  这样用，这个计数器回答的是「关键时刻谁不在」；直接用，它回答的是「谁离得最远」——
+  那也是一件值得知道的事，但不是同一件事。
 * **时间是节点本地且不同步的。** `first_ms`/`last_ms`/`quorum_ms` 都是相对*本节点*打开时刻、
   按*本节点*墙钟的偏移。绝不可跨主机相减。
 * **`have` 是本节点的视角。** 权威的 quorum 闸门未作任何改动，并且位于所有这些记录的上游；

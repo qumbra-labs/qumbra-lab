@@ -43,7 +43,7 @@ ROUND slot=1384 epoch=12 why=votes_short close=superseded by=1392 have=11 need=1
 | `active` | Roster minus tombstoned/jailed at this height | `active < need` ⇒ the round was unwinnable regardless of the network |
 | `roster` | Committee size at this height | |
 | `voted` | Who had a counting vote, by committee index | Ascending |
-| `absent` | In the roster, not tombstoned/jailed, and **no vote of theirs reached this node** | Reach, **not** proof the member was down |
+| `absent` | In the roster, not tombstoned/jailed, and **no vote of theirs reached this node** | Reach, **not** proof the member was down. On a `finalized` round it is also biased toward the slowest peers — see §7 |
 | `excluded` | Members whose valid votes were excluded as inactive | Excluded by the frozen §4 rule — do **not** go looking for these hosts |
 | `variants` | Distinct checkpoint variants seen at this height | `>1` means a split committee — a different failure from being short of votes |
 | `msgs` | Vote-set messages ingested for this round | |
@@ -254,6 +254,16 @@ Stated so nobody reads more into a record than it holds.
   is absent here and present elsewhere. Comparing the same slot's `absent` across the
   four nodes is how you tell those apart — and that comparison is now possible, which
   it was not before.
+* **On a `finalized` round, `absent` is biased toward the slowest peers.** A round
+  closes the *instant* quorum is reached, so members whose votes were 50 ms behind the
+  15th are recorded absent. The first lab-net round shows exactly this: it closed at
+  `quorum_ms=315` with `have=16`, and the five keys held by the most distant node are
+  in `absent` — they were late, not down. `qumbra_committee_absent_rounds_total`
+  inherits the bias. **The unbiased read is on failed rounds**, which stay open far
+  longer: filter the journal on `why!=finalized`, or read the metric against
+  `qumbra_checkpoint_rounds_total{verdict!="finalized"}`. Used this way the counter
+  answers "who is missing when it matters"; used naively it answers "who is furthest
+  away", which is a real thing to know but a different one.
 * **Timings are node-local and unsynchronized.** `first_ms`/`last_ms`/`quorum_ms` are
   offsets from *this node's* open instant on *this node's* wall clock. Never
   difference them between hosts.

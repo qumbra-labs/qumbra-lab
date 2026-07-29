@@ -457,7 +457,10 @@ tombstoned/jailed (excluded by frozen rule, not misbehaviour); forged/unknown_si
     o.push_str(
         "# HELP qumbra_committee_absent_rounds_total Rounds CLOSED at this node in which member `signer` was \
 in the roster, not tombstoned/jailed, and no vote of theirs had reached THIS node. Reach, not proof of \
-downtime: a different node may record a different absentee set for the same round.\n\
+downtime: a different node may record a different absentee set for the same round. BIASED ON FINALIZED \
+ROUNDS — a round closes the instant quorum is reached, so the slowest members are recorded absent even \
+when their votes land moments later; read this against qumbra_checkpoint_rounds_total{verdict!=finalized} \
+or from the ROUND journal, where failed rounds stay open far longer.\n\
 # TYPE qumbra_committee_absent_rounds_total counter\n",
     );
     for (i, c) in &m.signer_absent {
