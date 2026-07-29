@@ -88,3 +88,12 @@ ctrlc = "3.4"
 # and the same `=` pin, as qlab-node's RPC surface and qlab-cbserver's reference
 # server — one HTTP implementation in the tree, not three.
 tiny_http = "=0.12.0"
+
+[dev-dependencies]
+# Issue #101 acceptance (`tests/coinbase_spend.rs`): the miner's key hierarchy —
+# `Wallet::rkm(d)` is what a block's `coinbase_rkm` carries, and `spend_input` is
+# the only spend-witness constructor, so this is what proves the minted note is
+# spendable by its payee and by nobody else.
+qlab-wallet = { path = "../qlab-wallet" }
+# `[u64;4]` ↔ `[u8;32]` lane conversions on the note-commitment/anchor boundary.
+qlab-note = { path = "../qlab-note" }

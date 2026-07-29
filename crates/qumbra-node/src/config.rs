@@ -102,6 +102,24 @@ pub struct NodeConfig {
     /// change. Ship the binary first, then the config — never the other way round.
     #[serde(default)]
     pub metrics_addr: Option<String>,
+    /// OPTIONAL — where this node's mined coinbase notes are paid (issue #101):
+    /// the miner's raw `rkm`, hex-encoded as **64 hex characters** = 32 bytes,
+    /// lane-major little-endian (`qlab_wallet::Wallet::rkm(d)` under the node's
+    /// own `Hash32` convention).
+    ///
+    /// **Unset means mined coins are burned.** With no payout key the node mines
+    /// to `qlab_p2p::adapter::UNCONFIGURED_MINER_RKM`, a fixed constant nobody
+    /// holds a spend key for; the blocks are valid and the issuance is
+    /// unrecoverable. That is the honest behaviour for a node that was never told
+    /// where to pay itself — a zero key would be rejected outright and a
+    /// self-invented one would be a lie — and [`crate::run`] says so loudly at
+    /// startup whenever `mining = true` and this is unset.
+    ///
+    /// Deployment ordering caveat, same as `metrics_addr`: `deny_unknown_fields`
+    /// is deliberate, so a config carrying this key is REFUSED by a binary built
+    /// before this change. Ship the binary first, then the config.
+    #[serde(default)]
+    pub miner_rkm: Option<String>,
 }
 
 /// Why a config failed to load.
@@ -133,6 +151,37 @@ impl NodeConfig {
     pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
         Self::from_toml(&text)
+    }
+
+    /// The configured payout key as circuit lanes, or an error describing why the
+    /// string is not one. `Ok(None)` = not configured (see [`Self::miner_rkm`]).
+    pub fn miner_rkm_lanes(&self) -> Result<Option<[u64; 4]>, ConfigError> {
+        let Some(hex) = self.miner_rkm.as_deref() else { return Ok(None) };
+        let hex = hex.trim();
+        if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(ConfigError::Parse(format!(
+                "miner_rkm must be 64 hex characters (32 bytes, lane-major LE); got {} chars",
+                hex.len()
+            )));
+        }
+        let mut lanes = [0u64; 4];
+        for (i, lane) in lanes.iter_mut().enumerate() {
+            let mut bytes = [0u8; 8];
+            for (j, b) in bytes.iter_mut().enumerate() {
+                let at = (i * 8 + j) * 2;
+                *b = u8::from_str_radix(&hex[at..at + 2], 16).expect("checked ascii hex");
+            }
+            *lane = u64::from_le_bytes(bytes);
+        }
+        if lanes == [0u64; 4] {
+            return Err(ConfigError::Parse(
+                "miner_rkm is all zero, which no wallet can derive and which every node \
+                 rejects (BodyError::MissingCoinbasePayee). Omit the key to mine to the \
+                 unconfigured burn address, or set a real one."
+                    .to_string(),
+            ));
+        }
+        Ok(Some(lanes))
     }
 
     /// Serialize back to TOML (used by tooling / tests).
@@ -183,6 +232,30 @@ mod tests {
         assert!(c.committee_key_paths.is_empty());
         assert!(!c.mining);
         assert_eq!(c.expected_genesis_hash, None);
+        assert_eq!(c.miner_rkm, None);
+        assert_eq!(c.miner_rkm_lanes().expect("unset is fine"), None);
+    }
+
+    /// The payout key round-trips through the node's lane-major LE convention,
+    /// and the two ways to get it wrong are refused rather than mined against.
+    #[test]
+    fn miner_rkm_parses_and_rejects_the_two_wrong_shapes() {
+        let with = |v: &str| {
+            NodeConfig::from_toml(&format!(
+                "data_dir = \"d\"\nlisten_addr = \"127.0.0.1:0\"\ngenesis_file = \"g\"\nminer_rkm = \"{v}\"\n"
+            ))
+            .expect("parse")
+        };
+        // Lane-major little-endian: byte 0 is the low byte of lane 0.
+        let hex = "0100000000000000020000000000000003000000000000000400000000000000";
+        assert_eq!(with(hex).miner_rkm_lanes().expect("valid"), Some([1, 2, 3, 4]));
+
+        // Too short — a truncated paste is the likely operator error.
+        assert!(with("dead").miner_rkm_lanes().is_err());
+        // All zero — the shape a forgotten/placeholder value takes, and the one
+        // value every node rejects at block validation. Refuse it here, where the
+        // operator can still see the message.
+        assert!(with(&"0".repeat(64)).miner_rkm_lanes().is_err());
     }
 
     #[test]

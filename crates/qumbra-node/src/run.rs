@@ -368,6 +368,24 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                  not be gossiped to other peers (expected behind a router)"
             );
         }
+        // Where mined coinbase notes are paid (issue #101). Unset is legal and
+        // loud, not legal and quiet: the node still mines valid blocks, but to a
+        // key nobody holds, so the issuance is burned. Silence here would let a
+        // node mine for days before anyone noticed the coins were gone.
+        match config.miner_rkm_lanes().map_err(RunError::Config)? {
+            Some(rkm) => {
+                p2p.node_mut().set_miner_rkm(rkm);
+                println!("miner payout: coinbase notes paid to the configured miner_rkm");
+            }
+            None if config.mining => println!(
+                "⚠️  NO miner_rkm CONFIGURED: this node mines valid blocks whose coinbase \
+                 notes are paid to a fixed placeholder key that NOBODY can spend. Every \
+                 coin this node mines is BURNED. Set `miner_rkm` (64 hex chars, your \
+                 wallet's rkm) to keep what you mine."
+            ),
+            None => {}
+        }
+
         *p2p.addrs_mut() = addrs;
         p2p.maintain(0); // dial the seeds now
 
@@ -1063,6 +1081,7 @@ mod tests {
             mining,
             expected_genesis_hash: Some(genesis.hash_hex()),
             metrics_addr: None,
+            miner_rkm: None,
         };
         (config, genesis, base)
     }
