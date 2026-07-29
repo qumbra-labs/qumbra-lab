@@ -17,6 +17,13 @@
 #   soak.sh committee-recover    restart them → T0-2 catch-up → Final
 #   soak.sh teardown             docker compose down -v (destroys volumes)
 #
+# LATENCY INJECTION (issue #107 step 1b). Run against a net that is already up.
+#
+#   soak.sh netem <delay_ms> [jit_ms]  install `tc netem` on every node's eth0,
+#                                      then PROVE it took (qdisc + measured RTT)
+#   soak.sh netem-show                 the qdisc + the measured RTT matrix
+#   soak.sh netem-clear                remove it, and prove it is gone
+#
 # HALT-HEIGHT UPGRADE DRILL (issue #74). Run in order; each prints its own
 # assertions and STOPS on a violation. H = 16 (on the cadence grid of 8).
 #
@@ -37,8 +44,24 @@
 #   soak.sh halt-evidence        append full telemetry + raw refusal reasons to
 #                                docs/m11-halt-height-evidence.log
 #
-# LOCALHOST/DOCKER ONLY — no WAN-latency claims. Real RandomX light, WallClock,
-# frozen 75 s block time.
+# LOCALHOST/DOCKER. Real RandomX light, WallClock, frozen 75 s block time.
+#
+# LATENCY: the bridge is loopback-fast (sub-millisecond RTT) unless you inject delay
+# with `netem` above. This used to read "no WAN-latency claims", which was true of the
+# harness but became the reason a WAN-vs-local question could not be settled here
+# (#107 step 1). What is true now:
+#
+#   * A run with NO netem is a ZERO-LATENCY run. Do not quote its numbers as WAN
+#     numbers, and do not quote them as evidence ABOUT latency either — that was the
+#     old disclaimer's real content and it still holds.
+#   * A run WITH netem models an emulated, UNIFORM, symmetric delay. State it as
+#     "<delay> ms one-way netem on every node (RTT ~<2*delay> ms)", never as "WAN".
+#     The real T0 WAN is none of those things: its measured 68-223 ms RTT baseline is
+#     per-pair and asymmetric, it carries jitter and loss this does not, and its hosts
+#     are t4g.small Graviton VMs rather than containers on one machine.
+#   * `netem` therefore answers "is this effect latency-SHAPED", not "does this match
+#     the T0 net". A negative result under netem rules out delay-as-such; it does not
+#     rule out the WAN.
 
 set -euo pipefail
 
@@ -85,6 +108,75 @@ snapshot() {
         "$(field "$line" peers)" "$(field "$line" regime)"
     fi
   done
+}
+
+# ── latency injection (issue #107 step 1b) ──────────────────────────────────
+#
+# THE ARGUMENT IS ONE-WAY DELAY, NOT RTT. `tc netem delay` delays a container's
+# EGRESS, and every node carries the same qdisc, so a packet and its reply each pay
+# it once: RTT ~= 2 x delay. `netem 100` models the ~200 ms end of the measured
+# 68-223 ms T0 WAN RTT baseline, not the 100 ms end. Every command here prints both
+# the one-way figure and the implied RTT, and then MEASURES the RTT, so nobody has
+# to hold that factor of two in their head.
+NETEM_DEV=eth0
+
+netem_qdisc() { dc exec -T "$1" tc qdisc show dev "$NETEM_DEV" 2>&1 | tr -d '\r' | tr '\n' ' '; }
+
+# Print every node's qdisc verbatim, and return non-zero if ANY node disagrees with
+# what was asked for.
+#   netem_check_qdisc <delay_ms>   expect netem at that delay
+#   netem_check_qdisc ""           expect NO netem at all
+netem_check_qdisc() {
+  local want="$1" bad=0 q
+  echo "   -- tc qdisc show dev $NETEM_DEV, per container --"
+  for n in "${NODES[@]}"; do
+    q="$(netem_qdisc "$n")"
+    printf '     %-6s %s\n' "$n" "${q:-<no output>}"
+    if [[ -z "$want" ]]; then
+      if grep -q 'netem' <<<"$q"; then
+        echo "     ^ $n STILL carries a netem qdisc"; bad=1
+      fi
+    else
+      if ! grep -q 'netem' <<<"$q"; then
+        echo "     ^ $n has NO netem qdisc"; bad=1
+      elif ! grep -Eq "delay ${want}(\.0+)?ms" <<<"$q"; then
+        echo "     ^ $n netem is present but its delay is not ${want}ms"; bad=1
+      fi
+    fi
+  done
+  return "$bad"
+}
+
+# The check that matters more than the qdisc: is the delay actually ON THE PATH?
+# An installed qdisc on the wrong device, or on a device the container's traffic does
+# not leave by, shows up green in `tc qdisc show` and changes nothing. Full 12-pair
+# matrix, because a per-pair asymmetry would otherwise hide behind one node's average.
+netem_rtt_matrix() {
+  local out avg
+  echo "   -- measured ICMP RTT, every ordered pair (5 pings, avg ms) --"
+  for n in "${NODES[@]}"; do
+    local row="     $n ->"
+    for p in "${NODES[@]}"; do
+      [[ "$n" == "$p" ]] && continue
+      out="$(dc exec -T "$n" ping -q -c 5 -i 0.3 -W 5 "$p" 2>/dev/null || true)"
+      avg="$(sed -n 's|.*= [0-9.]*/\([0-9.]*\)/.*|\1|p' <<<"$out" | tail -1)"
+      row+=" $p=${avg:-FAIL}"
+    done
+    echo "$row"
+  done
+}
+
+netem_report() {   # netem_report <delay_ms|""> <label>
+  local want="$1" label="$2"
+  echo "== netem: $label =="
+  if [[ -n "$want" ]]; then
+    echo "   one-way delay ${want}ms on every node  =>  expected pairwise RTT ~$((want * 2))ms"
+  fi
+  netem_check_qdisc "$want" \
+    || die "the qdisc is NOT what was asked for (above). A run under a silently-absent
+   netem produces a clean, confident answer that means nothing. STOP."
+  echo "   ✓ every node's qdisc matches what was requested"
+  netem_rtt_matrix
 }
 
 # Wait until a node's tip reaches at least H (or timeout secs). Returns 0/1.
@@ -355,6 +447,60 @@ case "$cmd" in
       echo "== t+${waited}s =="; snapshot; echo
       sleep "$ivl"; waited=$((waited + ivl))
     done
+    ;;
+
+  # ── latency injection (issue #107 step 1b) ────────────────────────────────
+
+  netem)
+    delay="${1:?netem needs a ONE-WAY delay in ms, e.g. 'netem 100' for a ~200 ms RTT}"
+    jit="${2:-0}"
+    [[ "$delay" =~ ^[0-9]+$ ]] || die "delay must be a whole number of ms, got '$delay'"
+    [[ "$jit"   =~ ^[0-9]+$ ]] || die "jitter must be a whole number of ms, got '$jit'"
+    spec="delay ${delay}ms"
+    (( jit > 0 )) && spec="delay ${delay}ms ${jit}ms distribution normal"
+    for n in "${NODES[@]}"; do
+      # `replace` rather than `add`: idempotent, so re-running at a new delay does not
+      # need a clear first and cannot leave two runs' qdiscs stacked.
+      dc exec -T "$n" tc qdisc replace dev "$NETEM_DEV" root netem $spec \
+        || die "tc failed on $n. Is NET_ADMIN granted (docker-compose.yml cap_add) and
+   is this image new enough to carry iproute2 (Dockerfile)? A net brought up from an
+   older image has neither, and every command here would then be a no-op."
+      echo "   applied on $n: netem $spec"
+    done
+    netem_report "$delay" "applied (${spec})"
+    echo
+    echo "   The nodes were NOT restarted, so existing TCP connections keep running;"
+    echo "   the delay applies from now on. Give the net a few telemetry cadences"
+    echo "   before you start the window you intend to report."
+    ;;
+
+  netem-show)
+    # Reports, never asserts: this is the command you run when you do not already know
+    # what is installed, so "no netem" is an answer here rather than a failure.
+    echo "== netem: current state =="
+    any=0
+    echo "   -- tc qdisc show dev $NETEM_DEV, per container --"
+    for n in "${NODES[@]}"; do
+      q="$(netem_qdisc "$n")"
+      printf '     %-6s %s\n' "$n" "${q:-<no output>}"
+      grep -q 'netem' <<<"$q" && any=1
+    done
+    if (( any == 0 )); then
+      echo "   => no netem qdisc on any node: this is a ZERO-LATENCY run."
+    else
+      echo "   => netem is installed. The figure above is ONE-WAY; RTT is ~twice it."
+    fi
+    netem_rtt_matrix
+    ;;
+
+  netem-clear)
+    for n in "${NODES[@]}"; do
+      # `|| true`: deleting a root qdisc that was never added is not an error worth
+      # aborting on — the post-condition below is what decides whether this worked.
+      dc exec -T "$n" tc qdisc del dev "$NETEM_DEV" root 2>/dev/null || true
+      echo "   cleared on $n"
+    done
+    netem_report "" "cleared"
     ;;
 
   latejoiner)
@@ -726,7 +872,10 @@ case "$cmd" in
     ;;
 
   *)
-    sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
+    # The whole leading comment block, not a fixed line range: `sed -n '2,60p'` was
+    # already cutting the help off mid-drill before this file grew a netem section,
+    # so the usage text silently stopped documenting the newest subcommands.
+    awk 'NR > 1 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"
     exit 2
     ;;
 esac

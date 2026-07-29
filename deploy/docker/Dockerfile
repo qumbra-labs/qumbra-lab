@@ -53,8 +53,21 @@ RUN cargo build --release --locked -p qumbra-node --features drill-cancel \
 
 # ---- runtime ---------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
+# iproute2 (`tc`) and iputils-ping exist for ONE reason: `soak.sh netem` injects a
+# `tc netem` qdisc into each node container so the harness can ask latency questions
+# (issue #107 step 1b), and `ping` is how a run proves the qdisc is actually on the
+# path rather than merely installed. Neither is used by `qumbra-node`, which never
+# reads or configures the network stack; both are inert unless the container is also
+# granted NET_ADMIN (docker-compose.yml does; a plain `docker run` does not).
+#
+# Cost: ~3 MB on an image that is also the artifact pushed to GHCR for the four T0
+# hosts, so `tc` lands on those hosts too. If that is unwanted, split a
+# `FROM runtime AS runtime-netem` stage and point docker-compose.yml's build at it —
+# but note that makes the LAST stage the default target, so any release build would
+# then have to pass `--target runtime` explicitly, and a forgotten flag fails silently
+# in the direction of shipping more, not less.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        bash ca-certificates \
+        bash ca-certificates iproute2 iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/qumbra-node /usr/local/bin/qumbra-node
 COPY --from=builder /usr/local/bin/qumbra-node-armed /usr/local/bin/qumbra-node-armed

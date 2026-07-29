@@ -23,6 +23,12 @@ x-node-common: &node-common
   image: qumbra-node:t0-lite
   restart: "no"            # manual control — the restart/partition scenarios stop nodes
   networks: [qumbra]
+  # NET_ADMIN is what lets `soak.sh netem <delay_ms>` install a `tc netem` qdisc on
+  # this container's eth0 (issue #107 step 1b). It is granted to the CONTAINER, not
+  # used by the node process — `qumbra-node` never touches the network stack's
+  # configuration. Without it `tc qdisc add` fails with RTNETLINK "Operation not
+  # permitted" and the harness cannot express a latency question at all.
+  cap_add: [NET_ADMIN]
   depends_on:
     genesis-init:
       condition: service_completed_successfully
