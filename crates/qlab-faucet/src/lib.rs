@@ -1,10 +1,11 @@
 //! M11 faucet — **a wallet that generates proofs**, plus off-chain anti-abuse.
 //!
 //! On a shielded chain a faucet is not a web form. Every disbursement is a
-//! transaction carrying a real STARK proof (~1.7 s on the rig that measured this
-//! crate; see `docs/m11-faucet-run.md` for the caliper), so this crate is
-//! **wallet work**: key custody, note inventory, membership witnesses, anchor
-//! freshness, and a request gate whose scarce resource is not on-chain.
+//! transaction carrying a real STARK proof — **2.28 s mean** (n = 4 grants,
+//! reproduced over two runs, release, one process; see `docs/m11-faucet-run.md`
+//! for the full caliper) — so this crate is **wallet work**: key custody, note
+//! inventory, membership witnesses, anchor freshness, and a request gate whose
+//! scarce resource is not on-chain.
 //!
 //! ## The four things that bite, and where each one lives
 //!
@@ -44,11 +45,11 @@
 //!   proof) and buy **zero** extra grants.
 //!
 //! So the faucet's sustainable grant rate equals its **note inflow**, whose only
-//! source is one coinbase note per block it wins: **≤ 1 grant per 75 s block**.
-//! At ~1.7 s/proof the prover is ~97 % idle at 1 grant/min — proof speed is
-//! ~15× away from being the binding constraint even at 10 grants/min. [`inventory`]
-//! implements the budget this implies, and reports running out as a *named state*
-//! rather than a silent stall.
+//! source is one coinbase note per block it wins: **≤ 1 grant per 75 s block =
+//! 0.8 grants/min**. At the measured 2.28 s/proof the prover could sustain
+//! **26.3 grants/min**, so proof speed is **33× away** from being the binding
+//! constraint. [`inventory`] implements the budget this implies, and reports
+//! running out as a *named state* rather than a silent stall.
 //!
 //! ### 3. There is nothing to pre-generate
 //!
@@ -96,6 +97,9 @@ pub mod view;
 pub use grant::{AnchorLease, GrantError, GrantPlan, PROOF_LEASE_BLOCKS};
 pub use inventory::{Inventory, InventoryError, OwnedNote};
 pub use policy::{AbuseGate, FaucetLimits, Refusal, Ticket, TicketPolicy, TicketSecret};
-pub use queue::{PendingRequest, QueueError, RequestQueue, MAX_QUEUE_DEPTH};
-pub use service::{DispenseOutcome, Faucet, FaucetConfig, FaucetStats, DEFAULT_GRANT_BESSEL};
+pub use queue::{PendingRequest, QueueError, RequestQueue, MAX_ATTEMPTS, MAX_QUEUE_DEPTH};
+pub use service::{
+    AcceptError, DispenseOutcome, Faucet, FaucetConfig, FaucetStats, StallReason,
+    DEFAULT_GRANT_BESSEL,
+};
 pub use view::ChainView;

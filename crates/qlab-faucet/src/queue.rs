@@ -1,19 +1,19 @@
 //! The admitted-request queue — bounded, FIFO, and honest about the wait.
 //!
 //! A faucet on this chain serves at most **one grant per 75 s block** (the
-//! note-inflow law in [`crate::inventory`]) and each grant costs ~1.7 s of
-//! proving. Those two rates are two orders of magnitude apart, which makes the
-//! queue depth a statement about which of them the operator is promising:
+//! note-inflow law in [`crate::inventory`]) and each grant costs a measured 2.28 s
+//! of proving. Those two rates are ~33× apart, which makes the queue depth a
+//! statement about which of them the operator is promising:
 //!
-//! | regime | per-grant cost | 64-deep tail wait |
+//! | regime | per-grant cost | 32-deep tail wait |
 //! |---|---|---|
-//! | note-rich (a funded buffer) | ~1.7 s of proving | ~109 s, just over one block |
-//! | note-starved (steady state) | one coinbase note | 64 blocks ≈ 80 min |
+//! | note-rich (a funded buffer) | 2.28 s of proving | 73 s ≈ one block interval |
+//! | note-starved (steady state) | one coinbase note | 32 blocks ≈ 40 min |
 //!
-//! [`MAX_QUEUE_DEPTH`] is set to the note-rich figure, and
-//! [`RequestQueue::estimated_wait_blocks`] reports the *starved* figure alongside
-//! it, so the number the requester sees is the one that is true when the faucet is
-//! poor rather than the one that flatters it when it is rich.
+//! [`MAX_QUEUE_DEPTH`] is set from the note-rich figure, and
+//! [`RequestQueue::estimated_wait_blocks`] reports the *starved* figure, so the
+//! number the requester sees is the one that is true when the faucet is poor rather
+//! than the one that flatters it when it is rich.
 //!
 //! **Full means refuse, not evict.** Dropping the oldest entry would punish the
 //! requester who waited longest and let a burst evict the honest arrivals in front
@@ -26,10 +26,12 @@ use qlab_wallet::address::Address;
 
 /// Requests held at once. `[devnet-placeholder]` testnet-tunable, NOT frozen.
 ///
-/// 64 × ~1.7 s ≈ 109 s of proving — one block interval of backlog, the point past
-/// which a queue is advertising a wait it will not honour. See the module docs for
-/// the note-starved reading of the same number.
-pub const MAX_QUEUE_DEPTH: usize = 64;
+/// **Derived from the measurement**: 75 s (the frozen block interval) ÷ 2.28 s (the
+/// measured grant-proof mean) = 32.9 grants, rounded down to 32 — one block interval
+/// of proof-bound backlog, which is the point past which a queue advertises a wait
+/// it will not honour. See the module docs for the note-starved reading of the same
+/// number, which is 40 minutes and is the one a requester is quoted.
+pub const MAX_QUEUE_DEPTH: usize = 32;
 
 /// Attempts one admitted request gets before the faucet gives up on it.
 /// `[devnet-placeholder]`.
@@ -176,8 +178,8 @@ impl RequestQueue {
 
     /// Blocks a request queued *now* would wait for in the **note-starved** regime
     /// — one grant per block, the sustainable rate. This is the pessimistic figure
-    /// and it is the one to show a requester: the optimistic one (proof-bound,
-    /// ~1.7 s each) is only true while a funded note buffer lasts.
+    /// and it is the one to show a requester: the optimistic one (proof-bound, a
+    /// measured 2.28 s each) is only true while a funded note buffer lasts.
     pub fn estimated_wait_blocks(&self) -> usize {
         self.q.len() + 1
     }
@@ -253,7 +255,7 @@ mod tests {
     fn the_estimated_wait_is_the_pessimistic_one() {
         // A requester is quoted the note-starved rate (one grant per block), not
         // the proof-bound rate that only holds while a buffer lasts.
-        let mut q = RequestQueue::new(64);
+        let mut q = RequestQueue::new(MAX_QUEUE_DEPTH);
         assert_eq!(q.estimated_wait_blocks(), 1, "an empty queue still costs a block");
         for i in 0..9 {
             q.push(req(i)).unwrap();
@@ -265,7 +267,8 @@ mod tests {
     fn the_default_depth_is_the_documented_one() {
         let q = RequestQueue::default();
         assert_eq!(q.capacity(), MAX_QUEUE_DEPTH);
-        assert_eq!(MAX_QUEUE_DEPTH, 64);
+        // 75 s block interval / 2.28 s measured grant proof = 32.9, floored.
+        assert_eq!(MAX_QUEUE_DEPTH, 32);
         assert_eq!(MAX_ATTEMPTS, 3);
     }
 }

@@ -12,7 +12,7 @@
 //!
 //! So the 24 h window (`MAX_ANCHOR_AGE_BLOCKS` = 1,152 blocks × 75 s) is not a
 //! shelf life for a queue that does not exist. It is a **submission deadline** on a
-//! proof already built: bind an anchor, spend ~1.7 s proving, and the transaction
+//! proof already built: bind an anchor, spend ~2.3 s proving, and the transaction
 //! must reach a block before that anchor ages out of the window or it is refused.
 //!
 //! There *is* one pre-generation design that works, and it is a different product:
@@ -32,7 +32,7 @@
 //! a short self-imposed lease ([`PROOF_LEASE_BLOCKS`]) measured from the tip at
 //! acquisition, **plus** a live `is_valid_anchor` re-check immediately before
 //! submission. The re-check is the load-bearing half; the lease is what stops the
-//! faucet spending 1.7 s of proving on a plan it should already have abandoned.
+//! faucet spending 2.3 s of proving on a plan it should already have abandoned.
 
 use std::time::Instant;
 
@@ -203,7 +203,7 @@ impl GrantPlan {
     /// out **and** the chain still accepts the anchor.
     ///
     /// A faucet that skips this check does not fail safely — it spends a slot, a fee
-    /// and 1.7 s of proving on a transaction the mempool will refuse, and (worse)
+    /// and 2.3 s of proving on a transaction the mempool will refuse, and (worse)
     /// learns nothing about why. Checking here is what makes an aged-out anchor a
     /// *reported* refusal rather than a silent stall.
     pub fn is_submittable<V: ChainView>(&self, view: &V) -> bool {

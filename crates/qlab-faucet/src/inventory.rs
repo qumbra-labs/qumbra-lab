@@ -41,7 +41,7 @@
 //! ## Anchored vs held — the distinction an operator actually needs
 //!
 //! A note is spendable only when it is a leaf of the **prefix the anchor pins**.
-//! A change note from the grant three seconds ago is *held* but not yet *anchored*:
+//! A change note from the grant two seconds ago is *held* but not yet *anchored*:
 //! its block may be unmined, unfinalized, or finalized after the anchor in hand.
 //! Conflating the two is how a faucet reports "funded" while being unable to pay,
 //! so every query here takes the tree and the anchor's leaf count, and
