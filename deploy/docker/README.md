@@ -6,11 +6,13 @@ amendment 3). Four real `qumbra-node` containers on a real TCP bridge network,
 block time, and **distinct on-disk data-dir volumes** — the full soak without
 waiting on the 4 VPSes.
 
-> **LOCALHOST/DOCKER only.** This net makes **no WAN-latency claims.** The
-> latency-sensitive measurements (checkpoint cadence under real RTT, LWMA trace
-> at WAN pacing, the ≥48 h duration bar) stay owed to Phase B-WAN. Everything
-> reusable here — the image, the genesis-bake, the scenario driver — transfers to
-> the VPS deploy (VPSes are Linux too).
+> **LOCALHOST/DOCKER.** The bridge is loopback-fast (sub-millisecond RTT) unless
+> you inject delay — see [Latency injection](#latency-injection-soaksh-netem)
+> below. A run with no `netem` is a **zero-latency** run and its numbers are not
+> WAN numbers; a run with `netem` is an **emulated uniform symmetric delay** and
+> must be stated as such, never as "WAN". Everything reusable here — the image,
+> the genesis-bake, the scenario driver — transfers to the VPS deploy (VPSes are
+> Linux too).
 
 ## Why docker (over 4 bare local processes)
 
@@ -97,6 +99,44 @@ deploy/docker/soak.sh teardown            # down -v
 **STOP-POINT:** any consensus misbehavior (fork past finality, supply mismatch,
 double-finalization) ⇒ stop, preserve state (`docker compose logs`, the volumes),
 report — never patch-and-continue.
+
+## Latency injection (`soak.sh netem`)
+
+Added for [#107](https://github.com/lai3d/qumbra-lab/issues/107) step 1b, where a
+loop-period regression visible on the WAN net did not reproduce locally and
+**latency was the only remaining difference** — a question this harness could not
+express. Run these against a net that is already up; no restart is needed.
+
+```sh
+deploy/docker/soak.sh netem 100        # 100 ms one-way on every node → ~200 ms RTT
+deploy/docker/soak.sh netem 100 20     # …with 20 ms normal-distributed jitter
+deploy/docker/soak.sh netem-show       # what is installed + the measured RTT matrix
+deploy/docker/soak.sh netem-clear      # remove it, and prove it is gone
+```
+
+**The argument is ONE-WAY delay, not RTT.** `tc netem delay` delays egress, and
+every node carries the same qdisc, so a packet and its reply each pay it once:
+**RTT ≈ 2 × delay**. To model the T0 WAN's measured **68–223 ms RTT** baseline,
+use `netem 35` and `netem 110`, not `netem 68` and `netem 223`. Every command
+prints both figures so the factor of two never has to be remembered.
+
+**Both checks run, and the second is the one that matters.** `netem` asserts the
+qdisc is installed at the requested delay on every node (`tc qdisc show`, printed
+verbatim, `die` on any mismatch) **and then measures ICMP RTT across all twelve
+ordered pairs**. The qdisc check alone is not enough: a qdisc on the wrong device
+— or on a device the container's traffic does not leave by — reads green and
+changes nothing, and a soak under a silently-inert netem produces a clean,
+confident answer that means nothing at all.
+
+Requires `cap_add: [NET_ADMIN]` (docker-compose.yml) and `iproute2` +
+`iputils-ping` in the runtime image (Dockerfile). A net brought up from an image
+built before those landed will fail loudly at `tc`, not silently.
+
+**What a netem run is and is not.** It is an emulated, **uniform, symmetric**
+delay with no loss and no reordering. The real T0 WAN is per-pair, asymmetric,
+jittery and lossy, on `t4g.small` Graviton VMs rather than containers sharing one
+machine. So netem answers *"is this effect latency-shaped?"* — a negative result
+rules out delay-as-such; it does **not** rule out the WAN.
 
 ## Fallback (if RandomX won't build on Linux)
 
