@@ -212,6 +212,17 @@ pub struct LiveGauges {
     pub open_rounds: u64,
     /// The scheduled halt height, if this release carries one (issue #74).
     pub halt_at: Option<u64>,
+    /// Inbound frames dropped by the per-peer rate limits (issue #91). Reported so
+    /// an operator can *see* a peer misbehaving; deliberately **never** fed back
+    /// into peer scoring, because "too fast" is not "wrong".
+    pub throttled_frames: u64,
+    /// Inbound `GetAddr` requests received but not answered (issue #91) — the
+    /// amplifier's muzzle, counted.
+    pub throttled_getaddr: u64,
+    /// Distinct netgroups this node currently holds outbound connections to
+    /// (issue #91). **The eclipse gauge**: a node whose outbound set collapses to
+    /// one netgroup is one network's prisoner however many peers it reports.
+    pub outbound_netgroups: u64,
     /// Unix seconds when the process started.
     pub process_start_secs: u64,
     /// Unix seconds this snapshot was rendered — a scraper reads staleness from it
@@ -547,7 +558,7 @@ since process start. This is the measured Degraded share; it is NOT a fraction o
     }
 
     // ---- live gauges ------------------------------------------------------
-    let gauges: [(&str, &str, u64); 12] = [
+    let gauges: [(&str, &str, u64); 15] = [
         ("qumbra_tip_height", "Fork-choice tip height.", g.tip_height),
         (
             "qumbra_finalized_height",
@@ -564,6 +575,23 @@ DEGRADED_MODE_LAG_BLOCKS = 16 (FROZEN, read only).",
         ("qumbra_peers", "Connected peers.", g.peers),
         ("qumbra_addrs_dialable", "Addresses in the book believed dialable (issue #83 NAT trigger).", g.dialable),
         ("qumbra_addrs_known", "Addresses in the book.", g.known),
+        (
+            "qumbra_outbound_netgroups",
+            "Distinct netgroups (IPv4 /16, IPv6 /32) among current outbound peers (issue #91). \
+The eclipse gauge: 1 means every outbound connection is inside one network.",
+            g.outbound_netgroups,
+        ),
+        (
+            "qumbra_throttled_frames_total",
+            "Inbound frames dropped by the per-peer rate limits (issue #91). NOT a misbehaviour \
+count — throttling never scores or bans a peer; it is reported so an operator can decide.",
+            g.throttled_frames,
+        ),
+        (
+            "qumbra_throttled_getaddr_total",
+            "Inbound GetAddr requests received but not answered (issue #91 amplifier limit).",
+            g.throttled_getaddr,
+        ),
         ("qumbra_mempool_size", "Transactions in the mempool.", g.mempool),
         ("qumbra_committee_epoch", "Current committee epoch.", g.epoch),
         ("qumbra_committee_size", "Roster size of the current committee.", g.committee_size),
@@ -636,6 +664,9 @@ mod tests {
             committee_active: 21,
             quorum: 15,
             open_rounds: 2,
+            throttled_frames: 5,
+            throttled_getaddr: 2,
+            outbound_netgroups: 3,
             halt_at: None,
             process_start_secs: 1_769_000_000,
             rendered_at_secs: 1_769_150_000,

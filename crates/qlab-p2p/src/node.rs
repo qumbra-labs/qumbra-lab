@@ -29,6 +29,7 @@ use crate::gossip::{
 };
 use crate::n1::{IngestOutcome, NodeState, VotesOutcome};
 use crate::peer::{NodeId, PeerId, PeerTable, VersionMsg};
+use crate::ratelimit::{RateKey, RateLimiter, RateLimits, RateStats};
 use crate::sync::{build_locator, answer_get_headers, SyncPhase, SyncState, MAX_HEADERS_PER_BATCH};
 use crate::transport::Transport;
 use crate::wire::{Envelope, MsgType};
@@ -59,6 +60,9 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// Peer discovery: the address book + dial policy (issue #83). Seeds are fed
     /// in by the operator; learned addresses arrive over `Addr`.
     addrs: AddrManager,
+    /// Per-peer inbound budgets (issue #91). Keyed on the remote **host**, not the
+    /// connection, so dropping and redialling does not hand out a fresh budget.
+    limiter: RateLimiter,
 }
 
 impl<T: Transport, N: NodeState> P2pNode<T, N> {
@@ -77,6 +81,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             pending_blocks: HashMap::new(),
             checkpoints: HashMap::new(),
             addrs: AddrManager::new(),
+            limiter: RateLimiter::default(),
         }
     }
 
@@ -102,6 +107,27 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     }
     pub fn addrs_mut(&mut self) -> &mut AddrManager {
         &mut self.addrs
+    }
+
+    // --- peer hardening (issue #91) ---
+
+    /// Throttle counters — what was dropped, and how many rate keys are live.
+    /// Read by operators; **never** fed back into scoring (see [`crate::ratelimit`]).
+    pub fn rate_stats(&self) -> RateStats {
+        self.limiter.stats()
+    }
+
+    /// Re-tune the inbound budgets (tests / testnet). Deliberately programmatic
+    /// rather than a config-file key: these numbers should move because a
+    /// measurement said so.
+    pub fn set_rate_limits(&mut self, limits: RateLimits) {
+        self.limiter.set_limits(limits);
+    }
+
+    /// The rate key a peer's traffic is charged against — the remote host when the
+    /// transport knows one, else the handle.
+    fn rate_key(&self, pid: PeerId) -> RateKey {
+        RateKey::new(self.transport.peer_addr(pid).as_deref(), pid)
     }
 
     // --- peer discovery (issue #83) ---
@@ -290,13 +316,30 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
 
     // --- the driver ---
 
-    /// Process everything that has arrived since the last call. Returns the
-    /// number of frames handled (0 ⇒ quiescent, for test loops).
-    pub fn tick(&mut self) -> usize {
+    /// Process everything that has arrived since the last call. `now_ms` is the
+    /// caller's **monotonic** clock in milliseconds — the same one
+    /// [`P2pNode::maintain`] takes, and the reason it is a parameter rather than a
+    /// wall-clock read inside is that the in-process sims must stay reproducible
+    /// byte-for-byte (the M9-N7 soak property). The binary passes a real monotonic
+    /// clock; sims pass a deterministic one.
+    ///
+    /// Returns the number of frames handled (0 ⇒ quiescent, for test loops) —
+    /// including frames dropped by the rate limiter, which *were* handled: they
+    /// arrived, were charged, and were discarded.
+    pub fn tick(&mut self, now_ms: u64) -> usize {
         let frames = self.transport.poll();
         let n = frames.len();
         for (from, frame) in frames {
             if self.peers.is_banned(from) {
+                continue;
+            }
+            // Rate limiting comes BEFORE anything that costs us: before the peer
+            // table row, before decode, before dispatch. A throttled frame is
+            // dropped and NOT scored — volume is not a protocol fault, and a peer
+            // whose only sin is being fast is not a peer worth banning (#91
+            // decision 2). The existing malformed/invalid penalties are untouched.
+            let key = self.rate_key(from);
+            if !self.limiter.charge_frame(key.clone(), frame.len(), now_ms).allowed() {
                 continue;
             }
             if !self.peers.contains(from) {
@@ -304,7 +347,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 self.peers.add(from, None);
             }
             match Envelope::decode(&frame) {
-                Ok(env) => self.dispatch(from, env),
+                Ok(env) => self.dispatch(from, env, key, now_ms),
                 Err(_) => {
                     // Malformed frame at the wire layer → strong penalty.
                     self.peers.penalize(from, PENALTY_MALFORMED);
@@ -315,13 +358,29 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         n
     }
 
-    fn dispatch(&mut self, from: PeerId, env: Envelope) {
+    fn dispatch(&mut self, from: PeerId, env: Envelope, key: RateKey, now_ms: u64) {
         match env.msg_type {
             MsgType::Version => self.on_version(from, &env.payload),
             MsgType::VerAck => self.on_verack(from),
             MsgType::Ping => self.send(from, MsgType::Pong, env.payload),
             MsgType::Pong => {}
             MsgType::GetAddr => {
+                // Issue #91's amplifier. A 12 B header-only request used to be
+                // answered unconditionally with up to 13,013 B — measured 1084x at
+                // the cap, and FLAT in the request rate, which is what made this
+                // node a usable reflector rather than merely a chatty one.
+                //
+                // The fix is to not answer. Amplification is a response-BYTES
+                // problem, so the cheapest correct response is no response; a token
+                // bucket with room for a burst would still let that burst out, and
+                // the burst is itself the amplifier. The allowance is one reply per
+                // GETADDR_SERVE_INTERVAL_MS per RATE KEY — a host, not a socket, so
+                // an attacker who disconnects and redials comes back to the same
+                // spent allowance. Over-rate requests are dropped in silence and
+                // NOT scored: asking twice is not misbehaviour.
+                if !self.limiter.may_serve_getaddr(key, now_ms) {
+                    return;
+                }
                 // S2: only **dialable** addresses are served — ones we have
                 // ourselves connected to, plus our own iff the operator declared
                 // us reachable. Handing out merely-connected peers would fill a
@@ -916,12 +975,25 @@ mod tests {
         }
     }
 
+    /// Milliseconds a simulated round advances the deterministic clock the tests
+    /// drive `tick` with (issue #91). A sim clock, not a wall clock: reproducibility
+    /// is the point, and a frozen clock would leave the rate limiter's buckets
+    /// unable to refill, which models nothing.
+    const SIM_TICK_MS: u64 = 10;
+
     /// Drive a set of nodes to quiescence (no frames moved in a full round).
     fn run(nodes: &mut [InProcP2p]) {
-        for _ in 0..1000 {
+        run_at(nodes, 0)
+    }
+
+    /// As [`run`], but starting the deterministic clock at `base_ms` so a caller
+    /// that advances a logical clock across rounds keeps it **monotone** — a clock
+    /// that jumps backwards would make the rate limiter's refill meaningless.
+    fn run_at(nodes: &mut [InProcP2p], base_ms: u64) {
+        for round in 0..1000u64 {
             let mut moved = 0;
             for n in nodes.iter_mut() {
-                moved += n.tick();
+                moved += n.tick(base_ms + round * SIM_TICK_MS);
             }
             if moved == 0 {
                 break;
@@ -1165,7 +1237,7 @@ mod tests {
             Envelope::new(MsgType::CheckpointVotes, encode_checkpoint_votes(&cp, &[forged])).encode();
         // Node 0 (PeerId 1) injects the forged frame to node 1 (PeerId 2).
         nodes[0].transport().send(PeerId(2), &frame).unwrap();
-        nodes[1].tick();
+        nodes[1].tick(0);
 
         let score = nodes[1].peers().get(PeerId(1)).unwrap().score;
         assert!(score < 0, "a forged vote set is penalised: score {score}");
@@ -1258,7 +1330,7 @@ mod tests {
         // Node 0 announces it (prefilled coinbase, no short ids → node 1
         // reconstructs immediately and runs complete_block).
         nodes[0].announce_block(orphan_block, vec![tx(0)], 0, 0xABCD);
-        nodes[1].tick();
+        nodes[1].tick(0);
 
         // Node 1 kicked header-first sync toward the announcer (PeerId 1), rather
         // than silently dropping the orphan.
@@ -1289,7 +1361,7 @@ mod tests {
         let ann = BlockAnnounce { header, nonce: 0xBEEF, coinbase: 0, short_ids, prefilled };
         // Node 0 (PeerId 1) pushes it straight at node 1 (PeerId 2).
         nodes[0].send(PeerId(2), MsgType::BlockAnnounce, encode_announce(&ann));
-        nodes[1].tick();
+        nodes[1].tick(0);
 
         assert!(
             nodes[1].peers().get(PeerId(1)).unwrap().score < 0,
@@ -1298,7 +1370,7 @@ mod tests {
         assert!(!nodes[1].node().has_header(&bh), "the header was not adopted");
         assert!(!nodes[1].blocks.contains_key(&bh), "the body was not cached for serving");
         // …and it was not re-announced onward to node 2.
-        nodes[2].tick();
+        nodes[2].tick(0);
         assert!(!nodes[2].node().has_header(&bh), "a rejected block is not relayed");
     }
 
@@ -1327,7 +1399,7 @@ mod tests {
         node.add_peer(PeerId(1), None);
         // Send junk that is not a valid envelope.
         a.send(PeerId(2), &[0xFF; 20]).unwrap();
-        node.tick();
+        node.tick(0);
         assert!(node.peers().get(PeerId(1)).unwrap().score < 0, "sender penalized");
     }
 
@@ -1596,7 +1668,7 @@ mod tests {
             for n in nodes.iter_mut() {
                 n.maintain(now);
             }
-            run(nodes);
+            run_at(nodes, now);
             now += crate::addrman::GETADDR_INTERVAL_MS;
         }
     }
@@ -1711,7 +1783,7 @@ mod tests {
         let v = VersionMsg { node_id: [2; 32], services: 1, tip_height: 0, user_agent: "s".into() };
         sniff.send(PeerId(1), &Envelope::new(MsgType::Version, v.encode()).encode()).unwrap();
         sniff.send(PeerId(1), &Envelope::new(MsgType::VerAck, vec![]).encode()).unwrap();
-        n0.tick();
+        n0.tick(0);
         let _ = sniff.poll();
 
         n0.maintain(1);
@@ -1745,14 +1817,167 @@ mod tests {
             "good:9333".to_string(),
         ]);
         sniff.send(PeerId(1), &Envelope::new(MsgType::Addr, payload).encode()).unwrap();
-        n0.tick();
+        n0.tick(0);
         assert_eq!(n0.peers().get(PeerId(2)).unwrap().score, 0, "no score for a third party");
         assert_eq!(n0.addrs().known(), vec!["good:9333".to_string()], "only the usable one");
 
         // A frame we cannot decode is the *sender's* own malformed message.
         sniff.send(PeerId(1), &Envelope::new(MsgType::Addr, vec![9, 9, 9]).encode()).unwrap();
-        n0.tick();
+        n0.tick(0);
         assert_eq!(n0.peers().get(PeerId(2)).unwrap().score, -PENALTY_MALFORMED);
+    }
+
+    #[test]
+    fn a_message_flood_is_dropped_at_the_limit_and_never_scores_the_peer() {
+        // Gap 1 wired end to end: the GetAddr limit covers the amplifier, this is
+        // the general one that stops ANY message type being poured in at any rate.
+        // Small explicit limits so the test states the bound instead of the
+        // default's size.
+        let hub = InProcHub::new();
+        let t0 = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let mut n0 = P2pNode::new(t0, stub(), [1; 32]);
+        let sniff = sniffer(&hub, PeerId(2), "sniff:9333");
+        hub.link(PeerId(2), PeerId(1));
+        n0.set_rate_limits(RateLimits {
+            msg_burst: 8,
+            msg_refill_per_sec: 1,
+            ..RateLimits::default()
+        });
+
+        let ping = Envelope::new(MsgType::Ping, vec![]).encode();
+        // Exactly at the burst: every one is processed (a Ping answers with a Pong).
+        for _ in 0..8 {
+            sniff.send(PeerId(1), &ping).unwrap();
+        }
+        n0.tick(0);
+        assert_eq!(count_msgs(&sniff.poll(), MsgType::Pong), 8, "at the burst, all served");
+        assert_eq!(n0.rate_stats().throttled_frames, 0);
+
+        // Past it: dropped, silently, and with no score.
+        for _ in 0..5 {
+            sniff.send(PeerId(1), &ping).unwrap();
+        }
+        n0.tick(0);
+        assert_eq!(count_msgs(&sniff.poll(), MsgType::Pong), 0, "over the burst, dropped");
+        assert_eq!(n0.rate_stats().throttled_frames, 5, "and counted");
+        assert_eq!(
+            n0.peers().get(PeerId(2)).unwrap().score,
+            0,
+            "decision 2: too fast is not wrong — throttling never scores"
+        );
+        assert!(!n0.peers().is_banned(PeerId(2)));
+
+        // A throttle, not a verdict: one second on, the budget has refilled and the
+        // peer is served again without anyone having had to forgive it.
+        sniff.send(PeerId(1), &ping).unwrap();
+        n0.tick(1_000);
+        assert_eq!(count_msgs(&sniff.poll(), MsgType::Pong), 1, "refilled, still a peer");
+    }
+
+    #[test]
+    fn an_oversized_stream_is_dropped_at_the_byte_budget() {
+        // The other half of gap 2, at the node layer: MAX_PAYLOAD bounds one frame,
+        // the byte budget bounds the stream. Frame count is left generous so it is
+        // unambiguously the BYTE budget doing the work.
+        let hub = InProcHub::new();
+        let t0 = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let mut n0 = P2pNode::new(t0, stub(), [1; 32]);
+        let sniff = sniffer(&hub, PeerId(2), "sniff:9333");
+        hub.link(PeerId(2), PeerId(1));
+
+        let body = vec![7u8; 1_000];
+        let frame = Envelope::new(MsgType::Ping, body).encode();
+        let frame_len = frame.len() as u64;
+        n0.set_rate_limits(RateLimits {
+            byte_burst: frame_len * 3,
+            byte_refill_per_sec: 1,
+            ..RateLimits::default()
+        });
+
+        // Exactly at the byte budget: all three accepted.
+        for _ in 0..3 {
+            sniff.send(PeerId(1), &frame).unwrap();
+        }
+        n0.tick(0);
+        assert_eq!(count_msgs(&sniff.poll(), MsgType::Pong), 3, "exactly at the byte budget");
+        assert_eq!(n0.rate_stats().throttled_bytes, 0);
+
+        // The fourth is over it, and it is the byte budget that says so.
+        sniff.send(PeerId(1), &frame).unwrap();
+        n0.tick(0);
+        assert_eq!(count_msgs(&sniff.poll(), MsgType::Pong), 0);
+        assert_eq!(n0.rate_stats().throttled_bytes, 1);
+        assert_eq!(n0.rate_stats().throttled_frames, 0, "the frame budget was not the binding one");
+        assert_eq!(n0.peers().get(PeerId(2)).unwrap().score, 0);
+    }
+
+    #[test]
+    fn a_gossiped_flood_of_one_netgroup_cannot_eclipse_the_outbound_set() {
+        // Issue #91 gap 3, end to end through the path that actually matters: an
+        // attacker hands us a big `Addr` message full of addresses it controls, all
+        // of them genuinely dialable, and we auto-connect. Without a diversity rule
+        // every outbound slot ends up inside the attacker's network — which is the
+        // eclipse, and it needs no invalid message anywhere.
+        let hub = InProcHub::new();
+        let t0 = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let mut n0 = P2pNode::new(t0, stub(), [1; 32]);
+
+        // Bind reachable endpoints: 60 attacker addresses inside ONE /16, and three
+        // honest networks of 3 each.
+        let mut handle = 100u64;
+        let mut bind = |addr: &str, h: &mut u64| {
+            let _t = InProcTransport::new(PeerId(*h), Arc::clone(&hub));
+            hub.bind_addr(addr, PeerId(*h));
+            *h += 1;
+        };
+        let attacker: Vec<String> =
+            (0..60).map(|i| format!("10.7.{}.{}:9333", i / 256, i % 256)).collect();
+        for a in &attacker {
+            bind(a, &mut handle);
+        }
+        let honest: Vec<String> = (0..3)
+            .flat_map(|g| (0..3).map(move |i| format!("198.5{g}.100.{i}:9333")))
+            .collect();
+        for a in &honest {
+            bind(a, &mut handle);
+        }
+
+        // The attacker peer gossips all 60 of its addresses in one legal `Addr`
+        // message (MAX_ADDRS_PER_MSG = 100, so this is well-formed and free).
+        let sniff = sniffer(&hub, PeerId(2), "10.7.255.255:9333");
+        hub.link(PeerId(2), PeerId(1));
+        let mut all = attacker.clone();
+        all.extend(honest.clone());
+        assert!(all.len() <= crate::addrman::MAX_ADDRS_PER_MSG);
+        sniff
+            .send(PeerId(1), &Envelope::new(MsgType::Addr, crate::peer::encode_addrs(&all)).encode())
+            .unwrap();
+        n0.tick(0);
+
+        // Auto-connect under the caps.
+        n0.maintain(0);
+        let groups = n0.addrs().outbound_groups();
+
+        assert_eq!(
+            n0.addrs().outbound_live(),
+            crate::addrman::MAX_OUTBOUND,
+            "the budget still fills — diversity must not cost liveness: {groups:?}"
+        );
+        assert!(
+            groups.get("v4:10.7").copied().unwrap_or(0) <= crate::addrman::MAX_OUTBOUND_PER_GROUP,
+            "60 gossiped addresses from one /16 took {:?} of {} slots",
+            groups.get("v4:10.7"),
+            crate::addrman::MAX_OUTBOUND
+        );
+        assert!(
+            groups.len() >= 4,
+            "the outbound set spans at least 4 networks, so no single one owns it: {groups:?}"
+        );
+        assert_eq!(
+            n0.peers().get(PeerId(2)).unwrap().score,
+            0,
+            "and the gossiper was not penalised — flooding addresses is not a protocol fault"
+        );
     }
 
     #[test]

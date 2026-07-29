@@ -62,6 +62,60 @@ pub const DIAL_BACKOFF_MAX_MS: u64 = 30_000;
 /// Longest address string accepted (a cheap bound before any parsing).
 pub const MAX_ADDR_LEN: usize = 128;
 
+/// Maximum **outbound connections** this node will hold to any one netgroup
+/// (issue #91, gap 3). `[devnet-placeholder]` testnet-tunable, NOT frozen.
+///
+/// With [`MAX_OUTBOUND`] = 8 this forces at least **4 distinct netgroups** to fill
+/// the outbound budget, so an attacker who floods the book with addresses out of
+/// one network cannot own every slot — which is the whole eclipse move.
+pub const MAX_OUTBOUND_PER_GROUP: usize = 2;
+
+/// Maximum **address-book entries** admitted from any one netgroup (issue #91,
+/// gap 3). `[devnet-placeholder]` testnet-tunable, NOT frozen. One eighth of
+/// [`MAX_ADDR_BOOK`]: without it a single network can occupy the book and, through
+/// ordinary eviction, push out every candidate that came from anywhere else.
+pub const MAX_ADDRS_PER_GROUP: usize = MAX_ADDR_BOOK / 8;
+
+/// The diversity bucket an address falls in — the unit an attacker must *buy more
+/// of* to widen their footprint (issue #91, decision 3).
+///
+/// - **IPv4 → `/16`.** `/24` is too fine: a single rented `/16`, or one contiguous
+///   cloud allocation, spans 256 of them, so a `/24` rule costs an attacker
+///   nothing. `/16` is the coarsest unit that still makes buying diversity cost
+///   real address space, and it is the same choice Bitcoin's netgroup makes.
+/// - **IPv6 → `/32`**, the routable-allocation analogue. Grouping IPv6 any finer
+///   is meaningless when a single end site is routinely handed a `/48` or `/56`.
+/// - **ASN — deliberately NOT used.** It is the *right* unit and the wrong trade:
+///   it needs an external GeoIP-class dataset, which is a new dependency, needs
+///   periodic refreshing, and is stale the moment it is not. At T1 the security it
+///   buys over `/16` does not pay for a data-freshness obligation.
+/// - **Anything else (a DNS name) → the whole host string.** Honest residual: names
+///   can be minted in bulk, so a name-only attacker is not bounded by this rule.
+///   Two things blunt it today — an address must have been *successfully dialed by
+///   us* before it can be gossiped onward (#86 S2), and the T0 seed set is all
+///   literal IPs — but it is a real remainder, recorded rather than papered over.
+///
+/// Both caps apply to [`AddrSource::Learned`] entries **only**. A configured seed
+/// is the operator's own choice, not an attacker's gossip, and exempting seeds is
+/// what keeps a same-subnet deployment (the four docker nodes on one bridge
+/// network) from throttling itself with an anti-eclipse rule aimed at strangers.
+pub fn netgroup(addr: &str) -> String {
+    let host = match addr.rsplit_once(':') {
+        Some((h, _)) if !h.is_empty() => h,
+        _ => addr,
+    };
+    let unbracketed = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    if let Ok(v4) = unbracketed.parse::<std::net::Ipv4Addr>() {
+        let o = v4.octets();
+        return format!("v4:{}.{}", o[0], o[1]);
+    }
+    if let Ok(v6) = unbracketed.parse::<std::net::Ipv6Addr>() {
+        let o = v6.octets();
+        return format!("v6:{:02x}{:02x}:{:02x}{:02x}", o[0], o[1], o[2], o[3]);
+    }
+    format!("dns:{}", host.to_ascii_lowercase())
+}
+
 /// Where an address came from. Seeds are **never evicted** (S4): they are the
 /// recovery path when everything learned has gone stale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +172,10 @@ pub struct AddrManager {
     last_getaddr: BTreeMap<PeerId, u64>,
     max_outbound: usize,
     max_book: usize,
+    /// Anti-eclipse: outbound slots any one netgroup may hold (issue #91).
+    max_outbound_per_group: usize,
+    /// Anti-eclipse: book entries any one netgroup may occupy (issue #91).
+    max_addrs_per_group: usize,
     seq: u64,
 }
 
@@ -129,6 +187,8 @@ impl Default for AddrManager {
             last_getaddr: BTreeMap::new(),
             max_outbound: MAX_OUTBOUND,
             max_book: MAX_ADDR_BOOK,
+            max_outbound_per_group: MAX_OUTBOUND_PER_GROUP,
+            max_addrs_per_group: MAX_ADDRS_PER_GROUP,
             seq: 0,
         }
     }
@@ -168,6 +228,26 @@ impl AddrManager {
         self.max_book = n;
     }
 
+    /// Override the per-netgroup outbound cap (tests / testnet tuning).
+    pub fn set_max_outbound_per_group(&mut self, n: usize) {
+        self.max_outbound_per_group = n;
+    }
+
+    /// Override the per-netgroup book cap (tests / testnet tuning).
+    pub fn set_max_addrs_per_group(&mut self, n: usize) {
+        self.max_addrs_per_group = n;
+    }
+
+    /// How many **learned** entries the book holds in `group`. Seeds are excluded:
+    /// the diversity caps constrain what strangers can push into the book, not what
+    /// the operator configured.
+    pub fn learned_in_group(&self, group: &str) -> usize {
+        self.entries
+            .values()
+            .filter(|e| e.source == AddrSource::Learned && netgroup(&e.addr) == group)
+            .count()
+    }
+
     /// Add a configured seed. Idempotent; upgrades a previously-learned entry to
     /// `Seed` so it can no longer be evicted.
     pub fn add_seed(&mut self, addr: String) {
@@ -190,6 +270,14 @@ impl AddrManager {
     /// candidate at best (S6), so a bad one is never a scoring event — it would
     /// let any peer get a third party penalised.
     pub fn learn<I: IntoIterator<Item = String>>(&mut self, addrs: I) -> usize {
+        // Netgroup occupancy is computed once and updated as we go: recounting per
+        // address would make one Addr message O(entries x addresses).
+        let mut per_group: BTreeMap<String, usize> = BTreeMap::new();
+        for e in self.entries.values() {
+            if e.source == AddrSource::Learned {
+                *per_group.entry(netgroup(&e.addr)).or_insert(0) += 1;
+            }
+        }
         let mut admitted = 0;
         for a in addrs.into_iter().take(MAX_ADDRS_PER_MSG) {
             if !valid_addr(&a) || self.entries.contains_key(&a) {
@@ -198,9 +286,26 @@ impl AddrManager {
             if self.self_advertise.as_deref() == Some(a.as_str()) {
                 continue; // never dial ourselves
             }
-            if self.entries.len() >= self.max_book && !self.evict_one() {
-                break; // book full of seeds/dialable entries — refuse, never evict those
+            // Anti-eclipse (issue #91): one netgroup may not occupy the book. Like
+            // an unusable address, an over-quota one is silently dropped and is NOT
+            // a scoring event — a peer's claim about a third party never is (S6).
+            let group = netgroup(&a);
+            if per_group.get(&group).copied().unwrap_or(0) >= self.max_addrs_per_group {
+                continue;
             }
+            if self.entries.len() >= self.max_book {
+                match self.evict_one() {
+                    // Keep the running tally honest: the victim vacated its group.
+                    Some(gone) => {
+                        if let Some(n) = per_group.get_mut(&netgroup(&gone)) {
+                            *n = n.saturating_sub(1);
+                        }
+                    }
+                    // Book full of seeds/dialable entries — refuse, never evict those.
+                    None => break,
+                }
+            }
+            *per_group.entry(group).or_insert(0) += 1;
             let seq = self.next_seq();
             self.entries.insert(a.clone(), AddrEntry::new(a, AddrSource::Learned, seq));
             admitted += 1;
@@ -210,8 +315,8 @@ impl AddrManager {
 
     /// Evict the oldest **learned, not-dialable, not-connected** entry. Seeds (S4)
     /// and demonstrably dialable addresses are never evicted — they are the only
-    /// things of value in the book. Returns whether something was evicted.
-    fn evict_one(&mut self) -> bool {
+    /// things of value in the book. Returns the evicted address, if any.
+    fn evict_one(&mut self) -> Option<String> {
         let victim = self
             .entries
             .values()
@@ -220,13 +325,10 @@ impl AddrManager {
             })
             .min_by_key(|e| e.seq)
             .map(|e| e.addr.clone());
-        match victim {
-            Some(a) => {
-                self.entries.remove(&a);
-                true
-            }
-            None => false,
+        if let Some(a) = &victim {
+            self.entries.remove(a);
         }
+        victim
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -283,12 +385,28 @@ impl AddrManager {
     ///
     /// Seeds are tried before learned candidates — when everything else is stale
     /// they are the recovery path (S4) — and among equals the least-failed first.
+    ///
+    /// **Anti-eclipse (issue #91):** among learned candidates no netgroup may take
+    /// more than [`MAX_OUTBOUND_PER_GROUP`] of the budget, counting connections
+    /// already held. This is the half that actually stops an eclipse: capping the
+    /// *book* alone would still let one network own every outbound slot as long as
+    /// its addresses were the ones tried first.
     pub fn next_dials(&self, now_ms: u64) -> Vec<String> {
         let live = self.outbound_live();
         if live >= self.max_outbound {
             return Vec::new();
         }
         let budget = self.max_outbound - live;
+
+        // Netgroups already occupied by live learned connections. Seeds do not
+        // count and are not capped — see [`netgroup`] for why.
+        let mut per_group: BTreeMap<String, usize> = BTreeMap::new();
+        for e in self.entries.values() {
+            if e.connected.is_some() && e.source == AddrSource::Learned {
+                *per_group.entry(netgroup(&e.addr)).or_insert(0) += 1;
+            }
+        }
+
         let mut cands: Vec<&AddrEntry> = self
             .entries
             .values()
@@ -298,7 +416,36 @@ impl AddrManager {
             let seed_rank = if e.source == AddrSource::Seed { 0 } else { 1 };
             (seed_rank, e.failures, e.seq)
         });
-        cands.into_iter().take(budget).map(|e| e.addr.clone()).collect()
+
+        let mut out = Vec::new();
+        for e in cands {
+            if out.len() >= budget {
+                break;
+            }
+            if e.source == AddrSource::Learned {
+                let g = netgroup(&e.addr);
+                let n = per_group.entry(g).or_insert(0);
+                if *n >= self.max_outbound_per_group {
+                    continue; // this network already has its share
+                }
+                *n += 1;
+            }
+            out.push(e.addr.clone());
+        }
+        out
+    }
+
+    /// Netgroups this node currently holds outbound connections to (ops / tests) —
+    /// the measurable form of "am I eclipsed?". A node whose outbound set collapses
+    /// to one group is one network's prisoner regardless of how many peers it has.
+    pub fn outbound_groups(&self) -> BTreeMap<String, usize> {
+        let mut g = BTreeMap::new();
+        for e in self.entries.values() {
+            if e.connected.is_some() {
+                *g.entry(netgroup(&e.addr)).or_insert(0) += 1;
+            }
+        }
+        g
     }
 
     /// How many outbound connections we currently hold.
@@ -688,6 +835,110 @@ mod tests {
         trailing.push(0);
         assert_eq!(AddrManager::from_bytes(&trailing).unwrap_err(), AddrBookError::Trailing(1));
         assert_eq!(AddrManager::from_bytes(&[]).unwrap_err(), AddrBookError::Truncated);
+    }
+
+    // --- anti-eclipse diversity (issue #91, gap 3) ---
+
+    #[test]
+    fn netgroup_buckets_ipv4_by_16_ipv6_by_32_and_names_whole() {
+        assert_eq!(netgroup("10.7.0.1:9333"), "v4:10.7");
+        assert_eq!(netgroup("10.7.255.254:1"), "v4:10.7", "a whole /16 is one group");
+        assert_ne!(netgroup("10.7.0.1:9333"), netgroup("10.8.0.1:9333"));
+        // A /24 rule would call these four different networks; a /16 rule does not,
+        // which is the point — 256 /24s is one cheap purchase.
+        let g: std::collections::BTreeSet<String> =
+            (0..4).map(|i| netgroup(&format!("10.7.{i}.1:9333"))).collect();
+        assert_eq!(g.len(), 1);
+
+        assert_eq!(netgroup("[2001:db8::1]:9333"), "v6:2001:0db8");
+        assert_eq!(netgroup("[2001:db8:ffff::9]:9333"), "v6:2001:0db8", "grouped at /32");
+        assert_ne!(netgroup("[2001:db8::1]:9333"), netgroup("[2001:db9::1]:9333"));
+
+        assert_eq!(netgroup("Seed.Example.ORG:9333"), "dns:seed.example.org", "case-folded");
+        assert_ne!(netgroup("a.example:1"), netgroup("b.example:1"));
+    }
+
+    #[test]
+    fn one_netgroup_cannot_fill_the_outbound_budget() {
+        // The acceptance item: a large number of addresses from one network must
+        // not be able to own the outbound set. 200 addresses, all in 10.7.0.0/16.
+        let mut m = AddrManager::new();
+        m.set_max_addrs_per_group(1024); // the BOOK cap is not what is under test here
+        for chunk in 0..4u8 {
+            m.learn((0..50).map(|i| format!("10.7.{chunk}.{i}:9333")).collect::<Vec<_>>());
+        }
+        assert_eq!(m.known_count(), 200, "all 200 are known…");
+
+        // …and exactly MAX_OUTBOUND_PER_GROUP of them may be dialed.
+        let dials = m.next_dials(0);
+        assert_eq!(
+            dials.len(),
+            MAX_OUTBOUND_PER_GROUP,
+            "200 addresses in one /16 win {MAX_OUTBOUND_PER_GROUP} of {MAX_OUTBOUND} slots"
+        );
+        for (i, d) in dials.iter().enumerate() {
+            m.on_dial_success(d, PeerId(i as u64 + 1));
+        }
+        assert!(m.next_dials(0).is_empty(), "the group's share is spent; no third slot");
+        assert_eq!(m.outbound_live(), 2, "and 6 of the 8 slots stay free for other networks");
+
+        // A different network is still welcome — this is a diversity rule, not a
+        // connection cap wearing a disguise.
+        m.learn(vec![a("203.0.113.9:9333")]);
+        assert_eq!(m.next_dials(0), vec![a("203.0.113.9:9333")]);
+    }
+
+    #[test]
+    fn the_outbound_budget_fills_completely_from_distinct_netgroups() {
+        // The in-limit half: diversity must not cost liveness. Four networks, plenty
+        // of addresses each ⇒ the budget fills, 2 per network.
+        let mut m = AddrManager::new();
+        m.set_max_addrs_per_group(1024);
+        for g in 0..4u8 {
+            m.learn((0..10).map(|i| format!("10.{g}.0.{i}:9333")).collect::<Vec<_>>());
+        }
+        let dials = m.next_dials(0);
+        assert_eq!(dials.len(), MAX_OUTBOUND, "every outbound slot is used");
+        let mut per: BTreeMap<String, usize> = BTreeMap::new();
+        for d in &dials {
+            *per.entry(netgroup(d)).or_insert(0) += 1;
+        }
+        assert_eq!(per.len(), 4, "spread across all four networks");
+        assert!(per.values().all(|&n| n == MAX_OUTBOUND_PER_GROUP), "{per:?}");
+    }
+
+    #[test]
+    fn a_single_netgroup_cannot_occupy_the_address_book() {
+        let mut m = AddrManager::new();
+        m.set_max_addrs_per_group(5);
+        assert_eq!(
+            m.learn((0..5).map(|i| format!("198.18.0.{i}:9333")).collect::<Vec<_>>()),
+            5,
+            "exactly at the per-group cap: all admitted"
+        );
+        assert_eq!(
+            m.learn((5..20).map(|i| format!("198.18.0.{i}:9333")).collect::<Vec<_>>()),
+            0,
+            "past it: refused, and silently — a third-party address is never a scoring event"
+        );
+        assert_eq!(m.learned_in_group("v4:198.18"), 5);
+        // Refusing one network does not refuse the next.
+        assert_eq!(m.learn((0..5).map(|i| format!("198.19.0.{i}:9333")).collect::<Vec<_>>()), 5);
+        assert_eq!(m.known_count(), 10);
+    }
+
+    #[test]
+    fn seeds_are_exempt_from_the_diversity_caps() {
+        // The four T0 nodes share a docker bridge network, i.e. one /16. An
+        // anti-eclipse rule aimed at what strangers gossip at us must not make an
+        // operator's own deployment throttle itself.
+        let mut m = AddrManager::new();
+        m.set_max_addrs_per_group(1);
+        for i in 1..=8u8 {
+            m.add_seed(format!("172.20.0.{i}:9333"));
+        }
+        assert_eq!(m.next_dials(0).len(), MAX_OUTBOUND, "configured seeds fill the budget");
+        assert_eq!(m.known_count(), 8, "and none was refused admission to the book");
     }
 
     #[test]

@@ -18,7 +18,7 @@ use qlab_devnet::params_devnet::BOND_AMOUNT;
 use qlab_p2p::codec::tx_id;
 use qlab_p2p::n1::{BlockIngest, ChainView, StubNode, TxPool};
 use qlab_p2p::sync::SyncPhase;
-use qlab_p2p::transport::TcpTransport;
+use qlab_p2p::transport::{TcpTransport, Transport};
 use qlab_p2p::P2pNode;
 
 type TcpP2p = P2pNode<TcpTransport, StubNode>;
@@ -59,9 +59,13 @@ fn tx(seed: u8) -> TxEntry {
 
 /// Drive two nodes until `done` holds or the budget is exhausted.
 fn pump(a: &mut TcpP2p, b: &mut TcpP2p, mut done: impl FnMut(&TcpP2p, &TcpP2p) -> bool) -> bool {
+    let start = std::time::Instant::now();
     for _ in 0..400 {
-        a.tick();
-        b.tick();
+        // Real elapsed milliseconds: over a real transport the honest clock is the
+        // wall clock, which is also what `qumbra-node` feeds `tick` (issue #91).
+        let now_ms = start.elapsed().as_millis() as u64;
+        a.tick(now_ms);
+        b.tick(now_ms);
         if done(a, b) {
             return true;
         }
@@ -112,6 +116,101 @@ fn tcp_handshake_gossip_and_header_first_sync() {
 
     a.transport().shutdown();
     b.transport().shutdown();
+}
+
+/// Poll `t` for up to ~1 s, returning every frame of type `want` that arrived.
+fn collect(t: &TcpTransport, want: qlab_p2p::MsgType) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for _ in 0..100 {
+        for (_, f) in t.poll() {
+            if qlab_p2p::Envelope::decode(&f).map(|e| e.msg_type == want).unwrap_or(false) {
+                out.push(f);
+            }
+        }
+        if !out.is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    out
+}
+
+#[test]
+fn getaddr_throttling_survives_a_reconnect() {
+    // Issue #91, decision 1 — the trap. A rate limit hung on the connection is a
+    // rate limit an attacker resets with a TCP handshake, i.e. no rate limit at
+    // all. The budget is keyed on the remote HOST, so the second connection —
+    // fresh socket, fresh ephemeral port, fresh PeerId — lands on the same
+    // already-spent allowance.
+    use qlab_p2p::MsgType;
+
+    let ts = TcpTransport::bind("127.0.0.1:0").unwrap();
+    let server_addr = ts.local_addr().to_string();
+    let mut server = P2pNode::new(ts, stub(), [1u8; 32]);
+    // Give the server something worth asking for.
+    for i in 0..3u8 {
+        let a = format!("198.51.100.{i}:9333");
+        server.addrs_mut().add_seed(a.clone());
+        server.addrs_mut().on_dial_success(&a, qlab_p2p::PeerId(900 + i as u64));
+    }
+    assert_eq!(server.addrs().gossipable().len(), 3);
+
+    let getaddr = qlab_p2p::Envelope::new(MsgType::GetAddr, Vec::new()).encode();
+
+    // --- first connection: served ---
+    let c1 = TcpTransport::bind("127.0.0.1:0").unwrap();
+    let p1 = c1.dial(&server_addr).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    c1.send(p1, &getaddr).unwrap();
+    for _ in 0..50 {
+        server.tick(0);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(collect(&c1, MsgType::Addr).len(), 1, "the first ask is answered");
+    let spent = server.rate_stats();
+    let handle_1 = server.peers().all_peers();
+    assert_eq!(handle_1.len(), 1);
+    c1.shutdown();
+    drop(c1);
+    std::thread::sleep(Duration::from_millis(150));
+
+    // --- reconnect from the same host: a brand-new socket and PeerId ---
+    let c2 = TcpTransport::bind("127.0.0.1:0").unwrap();
+    let p2 = c2.dial(&server_addr).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    c2.send(p2, &getaddr).unwrap();
+    for _ in 0..50 {
+        server.tick(1_000); // 1 s later — far inside the 30 s serve interval
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let handles_now = server.peers().all_peers();
+    assert!(
+        handles_now.len() > handle_1.len() || handles_now != handle_1,
+        "the reconnect really is a new connection on the server side: {handle_1:?} -> {handles_now:?}"
+    );
+    assert!(
+        collect(&c2, MsgType::Addr).is_empty(),
+        "reconnecting must not hand out a fresh allowance"
+    );
+    assert_eq!(
+        server.rate_stats().throttled_getaddr,
+        spent.throttled_getaddr + 1,
+        "and the refusal is counted, not silently lost"
+    );
+
+    // --- past the interval, the same host is served again: a throttle, not a ban ---
+    c2.send(p2, &getaddr).unwrap();
+    for _ in 0..50 {
+        server.tick(qlab_p2p::ratelimit::GETADDR_SERVE_INTERVAL_MS + 1);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(collect(&c2, MsgType::Addr).len(), 1, "the allowance refills; nobody was banned");
+    for pid in server.peers().all_peers() {
+        assert_eq!(server.peers().get(pid).unwrap().score, 0, "throttling never scores");
+    }
+
+    server.transport().shutdown();
+    c2.shutdown();
 }
 
 #[test]

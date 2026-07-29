@@ -571,6 +571,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             quorum: ctx.need as u64,
             open_rounds: node.rounds().open_len() as u64,
             halt_at: self.halt_at,
+            throttled_frames: {
+                let s = self.p2p.rate_stats();
+                s.throttled_frames + s.throttled_bytes
+            },
+            throttled_getaddr: self.p2p.rate_stats().throttled_getaddr,
+            outbound_netgroups: self.p2p.addrs().outbound_groups().len() as u64,
             process_start_secs: self.process_start_secs,
             rendered_at_secs: unix_secs(),
         }
@@ -656,8 +662,20 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     }
 
     /// One message-pump step; returns frames handled.
+    ///
+    /// The binary is the one caller that feeds `tick` a real monotonic clock —
+    /// the same source `maintain_peers` uses — so the inbound rate limits
+    /// (issue #91) measure real time here while every in-process sim keeps its
+    /// deterministic one.
     pub fn step_once(&mut self) -> usize {
-        self.p2p.tick()
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        self.p2p.tick(now_ms)
+    }
+
+    /// Inbound throttle counters (issue #91) — for the metrics surface. These are
+    /// reported, never fed back into peer scoring.
+    pub fn rate_stats(&self) -> qlab_p2p::ratelimit::RateStats {
+        self.p2p.rate_stats()
     }
 
     /// Attempt to mine + announce the next block over the tip. Returns whether a

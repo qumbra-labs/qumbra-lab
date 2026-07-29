@@ -40,6 +40,7 @@ pub mod adapter;
 pub mod n1;
 pub mod node;
 pub mod peer;
+pub mod ratelimit;
 pub mod sync;
 pub mod transport;
 pub mod varint;
