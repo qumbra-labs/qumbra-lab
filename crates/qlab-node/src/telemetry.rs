@@ -21,13 +21,18 @@
 //! finalized different checkpoints at one height printed identical telemetry.
 //! #110 put the identity on the `TELEMETRY` log line and on `/metrics`; this wire
 //! carries it too, because it is the operator surface and checkpoint identity is
-//! the operator's most severe question. Three fields, mirroring the log line:
+//! the operator's most severe question. Mirroring the log line:
 //!
 //! - [`Telemetry::finalized_id`] (`fid`) — **what** this node finalized.
 //! - [`Telemetry::signed`] (`sslot`/`sid`) — what this node's own committee keys
 //!   are committed to, and at which slot. A minority that signed a different
 //!   variant still finalizes the majority's, so a split shows up *here* while
 //!   `final` and `fid` still agree everywhere.
+//! - [`Telemetry::tip_difficulty`] (`diff`) — a **fourth** field beyond the three
+//!   the #117 decision named, added because the operator view that decision exists
+//!   to serve is required to render difficulty per node and no wire carried it.
+//!   Riding the same version bump costs nothing extra; shipping a column that
+//!   could only say `-` would.
 //!
 //! Like peer count and epoch, they are **injected**: they live in the committee
 //! finality tracker and the never-double-sign ledgers, not in [`crate::Node`].
@@ -134,6 +139,16 @@ pub struct Telemetry {
     /// issue #117), or `None` when it holds no committee keys, has committed to
     /// nothing, or the composition does not inject it.
     pub signed: Option<LocalCommitment>,
+    /// The tip block's PoW difficulty (issue #117), or `None` when the tip header
+    /// is not available to the composition serving this snapshot.
+    ///
+    /// Already on the `TELEMETRY` log line as `diff=` (Phase B-lite amendment-1
+    /// item 4, so the LWMA retarget trace is visible over a soak) and on
+    /// `/metrics`, but on no wire — and #117's operator view is required to render
+    /// it per node. Carried here inside the same `0x02` bump rather than shipping a
+    /// column that could only ever say `-`; see the PR for why this is a fourth
+    /// field beside the three the decision named.
+    pub tip_difficulty: Option<u64>,
 }
 
 impl Telemetry {
@@ -195,6 +210,7 @@ impl Telemetry {
             epoch,
             finalized_id: None,
             signed: None,
+            tip_difficulty: None,
         }
     }
 
@@ -214,6 +230,19 @@ impl Telemetry {
         self.finalized_id = finalized_id;
         self.signed = signed;
         self
+    }
+
+    /// Stamp in the tip block's PoW difficulty (issue #117) — the `diff=` field of
+    /// the `TELEMETRY` line, which lives in the header chain rather than in the
+    /// finality state.
+    pub fn with_tip_difficulty(mut self, difficulty: Option<u64>) -> Self {
+        self.tip_difficulty = difficulty;
+        self
+    }
+
+    /// The `diff=` field: the tip block's difficulty, or `-` when unavailable.
+    pub fn diff_field(&self) -> String {
+        self.tip_difficulty.map(|d| d.to_string()).unwrap_or_else(|| "-".to_string())
     }
 
     /// The `fid=` field: the finalized checkpoint's identity as the canonical
@@ -242,7 +271,8 @@ impl Telemetry {
     /// [final_height(8 LE) if has] ‖ stall_depth(8) ‖ age_secs(8) ‖
     /// peer_count(8) ‖ mempool_size(8) ‖ epoch(8) ‖`
     /// `has_fid(u8) ‖ [finalized_id(8 LE) if has] ‖ has_signed(u8) ‖`
-    /// `[signed_slot(8 LE) ‖ has_signed_id(u8) ‖ [signed_id(8 LE) if has] if has]`.
+    /// `[signed_slot(8 LE) ‖ has_signed_id(u8) ‖ [signed_id(8 LE) if has] if has] ‖`
+    /// `has_diff(u8) ‖ [tip_difficulty(8 LE) if has]`.
     ///
     /// The `0x02` tail (issue #117) nests `sid` **inside** `sslot`'s presence, so
     /// "an identity with no slot" is not representable on the wire: a signed
@@ -294,6 +324,13 @@ impl Telemetry {
             }
             None => out.push(0),
         }
+        match self.tip_difficulty {
+            Some(d) => {
+                out.push(1);
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+            None => out.push(0),
+        }
         out
     }
 
@@ -325,6 +362,7 @@ impl Telemetry {
         } else {
             None
         };
+        let tip_difficulty = if r.u8()? == 1 { Some(r.u64()?) } else { None };
         r.finish()?;
         Ok(Telemetry {
             finality_status,
@@ -337,6 +375,7 @@ impl Telemetry {
             epoch,
             finalized_id,
             signed,
+            tip_difficulty,
         })
     }
 }
@@ -482,7 +521,10 @@ mod tests {
         // Fully populated: finalized identity + this node's own signed variant.
         let full = base
             .clone()
-            .with_checkpoint(Some(0x3f1a_9c2b_0d41), Some(LocalCommitment { slot: 3776, id: Some(0x3f1a_9c2b_0d41) }));
+            .with_checkpoint(Some(0x3f1a_9c2b_0d41), Some(LocalCommitment { slot: 3776, id: Some(0x3f1a_9c2b_0d41) }))
+            .with_tip_difficulty(Some(1_048_576));
+        assert_eq!(full.diff_field(), "1048576");
+        assert_eq!(base.diff_field(), "-", "absent until injected");
         assert_eq!(full.fid_field(), "3f1a9c2b0d41");
         assert_eq!(full.sslot_field(), "3776");
         assert_eq!(full.sid_field(), "3f1a9c2b0d41");

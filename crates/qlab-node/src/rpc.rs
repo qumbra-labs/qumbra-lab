@@ -421,6 +421,11 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             DEGRADED_MODE_LAG_BLOCKS,
         )
         .with_checkpoint(self.checkpoint.finalized_id, self.checkpoint.signed)
+        // Unlike the identity half, this one IS node state: the tip header is in
+        // the chain store, so it is read rather than injected (issue #117).
+        .with_tip_difficulty(
+            self.node.chain().block(&self.node.tip_hash()).map(|b| b.header.difficulty),
+        )
     }
 
     /// Chain-time seconds between the tip block and the finalized block. Reports

@@ -549,6 +549,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             self.halt_at,
         )
         .with_checkpoint(self.finalized_checkpoint_id(), self.local_commitment())
+        .with_tip_difficulty(chain.header(&chain.tip_hash()).map(|h| h.difficulty))
     }
 
     /// A single observability sample line for the soak monitor (M10-T0-3 Phase
@@ -560,9 +561,6 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// read live. Emitted to stdout, captured via `docker compose logs`.
     pub fn telemetry_sample(&self) -> String {
         let node = self.p2p.node();
-        let chain = node.chain();
-        let tip_diff = chain.header(&chain.tip_hash()).map(|h| h.difficulty).unwrap_or(0);
-
         // Issue #117: assembled once, in `telemetry()`, and shared with the
         // `/v1/telemetry` wire — the line and the wire report the same snapshot by
         // construction rather than by two copies of the same arithmetic.
@@ -628,7 +626,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // any reader of the wire cannot disagree about what `-` or `split` means.
         format!(
             "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={}",
-            t.tip_height, final_str, t.stall_depth, age_str, tip_diff,
+            t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
             self.p2p.addrs().dialable_count(), self.p2p.addrs().known_count(),
