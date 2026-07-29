@@ -116,11 +116,18 @@ snapshot() {
 # ── latency injection (issue #107 step 1b) ──────────────────────────────────
 #
 # THE ARGUMENT IS ONE-WAY DELAY, NOT RTT. `tc netem delay` delays a container's
-# EGRESS, and every node carries the same qdisc, so a packet and its reply each pay
-# it once: RTT ~= 2 x delay. `netem 100` models the ~200 ms end of the measured
-# 68-223 ms T0 WAN RTT baseline, not the 100 ms end. Every command here prints both
-# the one-way figure and the implied RTT, and then MEASURES the RTT, so nobody has
-# to hold that factor of two in their head.
+# EGRESS, so a packet pays the sender's delay and its reply pays the replier's:
+#
+#   RTT(i,j) = delay_i + delay_j        (uniform delay d  =>  RTT ~= 2d)
+#
+# So `netem 100` models the ~200 ms end of the measured 68-223 ms T0 WAN RTT
+# baseline, not the 100 ms end. Every command prints the expected RTT for all six
+# pairs and then MEASURES all twelve ordered pairs, so nobody has to hold that
+# factor of two in their head — or trust it.
+#
+# Note `seq` is NOT used to walk NODES here: BSD seq counts DOWN when first > last
+# (`seq 4 3` prints "4 3"), so the empty-range idiom that works under GNU seq walks
+# off the end of the array on macOS. C-style loops instead.
 NETEM_DEV=eth0
 
 netem_qdisc() { dc exec -T "$1" tc qdisc show dev "$NETEM_DEV" 2>&1 | tr -d '\r' | tr '\n' ' '; }
@@ -134,7 +141,7 @@ netem_check_qdisc() {
   local wants=()
   [[ -n "$want" ]] && { IFS=, read -r -a wants <<<"$want"; }
   echo "   -- tc qdisc show dev $NETEM_DEV, per container --"
-  for i in $(seq 0 $(( ${#NODES[@]} - 1 ))); do
+  for (( i = 0; i < ${#NODES[@]}; i++ )); do
     n="${NODES[$i]}"
     q="$(netem_qdisc "$n")"
     printf '     %-6s %s\n' "$n" "${q:-<no output>}"
@@ -180,8 +187,8 @@ netem_report() {   # netem_report <d0,d1,d2,d3|""> <label>
   if [[ -n "$want" ]]; then
     IFS=, read -r -a wants <<<"$want"
     echo "   expected pairwise RTT = one-way(A) + one-way(B):"
-    for i in $(seq 0 $(( ${#NODES[@]} - 1 ))); do
-      for j in $(seq $(( i + 1 )) $(( ${#NODES[@]} - 1 ))); do
+    for (( i = 0; i < ${#NODES[@]}; i++ )); do
+      for (( j = i + 1; j < ${#NODES[@]}; j++ )); do
         printf '     %s<->%s  %sms + %sms = ~%sms\n' \
           "${NODES[$i]}" "${NODES[$j]}" "${wants[$i]}" "${wants[$j]}" \
           "$(( wants[i] + wants[j] ))"
@@ -477,12 +484,12 @@ case "$cmd" in
     # node_i -> node_j pays delay_i and the reply pays delay_j, so each pair gets its
     # own RTT and each direction its own one-way — which uniform delay cannot express.
     if [[ "${#delays[@]}" -eq 1 ]]; then
-      for i in $(seq 1 $(( ${#NODES[@]} - 1 ))); do delays[$i]="${delays[0]}"; done
+      for (( i = 1; i < ${#NODES[@]}; i++ )); do delays[$i]="${delays[0]}"; done
     elif [[ "${#delays[@]}" -ne "${#NODES[@]}" ]]; then
       die "netem takes 1 delay (uniform) or ${#NODES[@]} (one per node), got ${#delays[@]}"
     fi
     want=""
-    for i in $(seq 0 $(( ${#NODES[@]} - 1 ))); do
+    for (( i = 0; i < ${#NODES[@]}; i++ )); do
       n="${NODES[$i]}"; d="${delays[$i]}"
       [[ "$d" =~ ^[0-9]+$ ]] || die "delay must be a whole number of ms, got '$d'"
       spec="delay ${d}ms"
