@@ -79,6 +79,45 @@ deploy/docker/soak.sh status                                          # one snap
 deploy/docker/soak.sh sample 3600 60                                  # sample for an hour
 ```
 
+### The cross-node agreement view (`qumbra-opview`, issue #117)
+
+Each node also serves the **versioned `/v1/telemetry` wire** — the same
+`Telemetry` snapshot the stdout line renders, carrying the finalized checkpoint's
+identity (`fid`) and what that node's own keys signed (`sslot`/`sid`). It is bound
+in-container by `entrypoint.sh` (`telemetry_addr = 0.0.0.0:9410`) and published to
+**localhost only** on the host as 9410–9413 for node0–node3.
+
+```sh
+cargo run -p qumbra-opview -- \
+  node0=http://127.0.0.1:9410 node1=http://127.0.0.1:9411 \
+  node2=http://127.0.0.1:9412 node3=http://127.0.0.1:9413
+```
+
+It prints one row per node and then two verdicts, kept deliberately apart:
+
+- **`fid` divergence** — two nodes reporting the *same* `final` with *different*
+  identities, i.e. two checkpoints finalized at one height. **The R2 STOP.** It is
+  the only condition that exits non-zero (exit `2`).
+- **`sid` divergence** — nodes whose own keys signed different variants at one
+  slot. A **finding**, not a stop, and exit `0`: the minority still finalizes the
+  majority's checkpoint, so `fid` can agree while this does not.
+
+A node that does not answer is rendered `UNREACHABLE` with its reason and is
+excluded from both verdicts — a timeout is missing evidence, not a disagreement,
+and exits `0`. Endpoint list is operational config: with one entry it is a
+single-node health page, with four it is the agreement view, over one code path.
+
+> **This is the T0 operator view, not `testnet-plan` §6's T1 explorer.** "These
+> four nodes agree" is the whole truth here, because these four hosts *are* the
+> network. It does not generalise to a public net, where the same output would be
+> the operator's own nodes vouching for themselves.
+
+**A node built before #117 is refused, not best-effort parsed**: its wire is
+`0x01`, this build speaks `0x02`, and a `fid=-` rendered from an unreadable body
+would look exactly like a node that had finalized nothing. The image must be
+rebuilt for the view to read anything (`deny_unknown_fields` also means an old
+binary refuses the new config outright — ship the binary first).
+
 ## Running the protocol
 
 ```sh

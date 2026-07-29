@@ -28,6 +28,13 @@ set -euo pipefail
 GENESIS_DIR=/shared
 DATA_DIR=/data
 LISTEN_PORT=9401
+# The /v1/telemetry read endpoint (issue #117) — the wire `qumbra-opview` polls.
+# In-container it is the same port on every node; docker-compose publishes each to
+# a distinct HOST port (9410..9413) so the view can be run from the host.
+# `0.0.0.0` here is inside a container namespace on a private bridge, not a host
+# exposure decision; on a real host the same key is paired with a
+# source-restricted inbound rule (see config.rs's doc for `telemetry_addr`).
+TELEMETRY_PORT=9410
 GENESIS_FILE="$GENESIS_DIR/genesis.qmb"
 INIT_LOG="$GENESIS_DIR/genesis-init.log"
 HASH_FILE="$GENESIS_DIR/genesis.hash"
@@ -93,6 +100,7 @@ genesis_file = "$GENESIS_FILE"
 committee_key_paths = [$keys]
 mining = true
 expected_genesis_hash = "$ghash"
+telemetry_addr = "0.0.0.0:$TELEMETRY_PORT"
 EOF
     echo "== node$idx config (binary: $BIN) =="
     cat "$cfg"
