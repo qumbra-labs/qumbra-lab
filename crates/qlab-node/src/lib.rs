@@ -70,10 +70,11 @@ pub use recovery::{
     FinalizerState, SignRefusal, FINALIZER_FORMAT_VERSION,
 };
 pub use rpc::{
-    serve, AnchorSet, MemNodeRpc, NetFacts, NodeRpc, NodeStatus, RecipientDiscovery, RejectReason,
-    RouteResult, RpcServerHandle, SubmitOutcome, TxDiscovery,
+    serve, AnchorSet, CheckpointFacts, MemNodeRpc, NetFacts, NodeRpc, NodeStatus,
+    RecipientDiscovery, RejectReason, RouteResult, RpcServerHandle, SubmitOutcome, TxDiscovery,
+    RPC_VERSION,
 };
-pub use telemetry::Telemetry;
+pub use telemetry::{LocalCommitment, Telemetry, LOCAL_COMMITMENT_SPLIT};
 pub use persist::{Snapshot, BLOCK_LOG, FORMAT_VERSION, SNAPSHOT};
 pub use store::{
     ChainStore, CommitmentStore, Hash32, MemChainStore, MemCommitmentStore, MemNullifierStore,

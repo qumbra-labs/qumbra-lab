@@ -102,6 +102,28 @@ pub struct NodeConfig {
     /// change. Ship the binary first, then the config — never the other way round.
     #[serde(default)]
     pub metrics_addr: Option<String>,
+    /// OPTIONAL — bind address for the `/v1/telemetry` read endpoint (issue #117).
+    ///
+    /// **Unset = no listener at all**, the default and the right one for any node
+    /// nobody is polling. Set it and the node serves exactly one route,
+    /// `GET /v1/telemetry`, returning [`qlab_node::Telemetry`]'s versioned bytes —
+    /// the wire the T0 operator agreement view reads. See
+    /// [`crate::telemetry_server`] for why it is a separate, single-route surface
+    /// rather than the wallet-facing RPC (and therefore not called `rpc_addr`).
+    ///
+    /// Same exposure rule as `metrics_addr`: `127.0.0.1:9410` keeps it host-local,
+    /// `0.0.0.0:9410` exposes it to whatever the host firewall admits, and on the
+    /// T0 hosts that means pairing it with a **source-restricted** inbound
+    /// security-group rule (standalone `aws_security_group_rule` resources only —
+    /// the inline-rule incident of 2026-07-26 is why). Nothing here authenticates;
+    /// the wire carries no key material, no transaction contents and no peer
+    /// addresses, but it is node-operational data.
+    ///
+    /// Deployment ordering caveat, same as `metrics_addr`: `deny_unknown_fields` is
+    /// deliberate, so a config carrying this key is REFUSED by a binary built
+    /// before this change. Ship the binary first, then the config.
+    #[serde(default)]
+    pub telemetry_addr: Option<String>,
     /// OPTIONAL — where this node's mined coinbase notes are paid (issue #101):
     /// the miner's raw `rkm`, hex-encoded as **64 hex characters** = 32 bytes,
     /// lane-major little-endian (`qlab_wallet::Wallet::rkm(d)` under the node's
