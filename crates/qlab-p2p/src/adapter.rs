@@ -324,6 +324,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// locally — a node that finalized against a block it has not downloaded yet has
     /// no basis for the interval, and a fabricated one would poison the histogram.
     fn observe_finality_advance(&mut self, cp: &Checkpoint, prev: Option<Checkpoint>, tip: u64) {
+        // Finalizing genesis is the bootstrap act, not an advance: it would record a
+        // zero-block jump and a stall depth equal to the tip, in a histogram whose
+        // whole job is to show how far finality fell behind. Same rule, and the same
+        // reason, as `RoundLedger::tracked` refusing to journal height 0 as a round.
+        if cp.height == 0 {
+            return;
+        }
         let prev_height = prev.map(|p| p.height);
         let blocks = cp.height.saturating_sub(prev_height.unwrap_or(0));
         let secs = match (prev, self.chain.header(&cp.block_hash)) {
@@ -483,9 +490,16 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             Ok(_) => {
                 self.advance_epoch();
                 if self.chain.tip_hash() == header_hash {
-                    if let Some(pts) = parent_ts {
-                        self.metrics.observe_block(header_ts.saturating_sub(pts));
-                    }
+                    // A parent timestamp of 0 is the GENESIS PLACEHOLDER, not a time.
+                    // Differencing against it yields the whole Unix epoch (~1.78e9 s)
+                    // and poisons the histogram's sum and tail with one sample. The
+                    // genesis→first-block gap is not an interval; it is skipped, and
+                    // the guard is on the placeholder value rather than on the height
+                    // so a genesis that ever carries a real timestamp contributes
+                    // normally. (Same root cause as issue #73's `age_s`.)
+                    let interval =
+                        parent_ts.filter(|&t| t > 0).map(|pts| header_ts.saturating_sub(pts));
+                    self.metrics.observe_block(interval);
                 }
                 IngestOutcome::Accepted
             }
@@ -1516,6 +1530,52 @@ mod tests {
             RoundDiagnosis::QuorumImpossible,
             "the roster could not have produced a quorum — this is not a latency story"
         );
+    }
+
+    /// **Caught on the lab net, not in a unit test.** Genesis carries a placeholder
+    /// timestamp of 0 and is finalized as a bootstrap act, so two event observations
+    /// had a wrong basis at the source: the genesis→block-1 gap entered the block
+    /// interval histogram as ~1.78e9 seconds (the whole Unix epoch, wrecking the sum
+    /// and the tail from one sample), and finalizing genesis entered the advance
+    /// histograms as a 0-block jump carrying a stall depth equal to the tip.
+    #[test]
+    fn genesis_placeholders_never_enter_the_event_histograms() {
+        let (committee, validators) = devnet_committee(21);
+        let mut a =
+            NodeAdapter::new(CommitteeState::new(committee, BOND_AMOUNT), KeccakPow, MockVerifier, sim());
+
+        // Finalize genesis (height 0) exactly as the binary does at startup.
+        let (cp0, votes0) = a.make_checkpoint(0, &validators).expect("genesis checkpoint");
+        a.ingest_checkpoint_votes(&cp0, &votes0);
+        assert_eq!(a.finalized_height(), Some(0));
+
+        for _ in 0..8 {
+            let (h, body) = a.mine_block().expect("mine");
+            assert_eq!(a.ingest_block(h, body), IngestOutcome::Accepted);
+        }
+        let text = qlab_node::metrics::render(a.metrics(), &qlab_node::metrics::LiveGauges::default());
+
+        // 8 blocks connected, but only 7 intervals — the genesis gap is not one.
+        assert!(text.contains("qumbra_blocks_connected_total 8"), "{text}");
+        assert!(text.contains("qumbra_block_interval_seconds_count 7"), "{text}");
+        let sum: u64 = text
+            .lines()
+            .find_map(|l| l.strip_prefix("qumbra_block_interval_seconds_sum "))
+            .and_then(|v| v.parse().ok())
+            .expect("sum series present");
+        assert!(sum < 10_000, "a placeholder timestamp leaked into the histogram: sum={sum}");
+
+        // Finalizing genesis is not a finality advance.
+        assert!(text.contains("qumbra_finality_advances_total 0"), "{text}");
+        assert!(text.contains("qumbra_finality_advance_blocks_count 0"), "{text}");
+
+        // …and a real finalize afterwards IS counted.
+        let (cp8, votes8) = a.make_checkpoint(8, &validators).expect("slot 8");
+        a.ingest_checkpoint_votes(&cp8, &votes8);
+        assert_eq!(a.finalized_height(), Some(8));
+        let after = qlab_node::metrics::render(a.metrics(), &qlab_node::metrics::LiveGauges::default());
+        assert!(after.contains("qumbra_finality_advances_total 1"), "{after}");
+        assert!(after.contains("qumbra_finality_advance_blocks_bucket{le=\"8\"} 1"), "{after}");
     }
 
     /// The observation surface must not change consensus. Same inputs, same

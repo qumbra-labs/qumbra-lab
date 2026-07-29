@@ -356,10 +356,17 @@ impl Metrics {
         }
     }
 
-    /// Record a connected block and the chain-time gap to its parent.
-    pub fn observe_block(&mut self, interval_secs: u64) {
+    /// Record a connected block, and its chain-time gap to the parent **when that
+    /// gap is meaningful**.
+    ///
+    /// The two are separate on purpose: a block connecting is a fact regardless, but
+    /// an interval measured against a placeholder timestamp is not an interval. Fold
+    /// them together and either the count lies or the histogram does.
+    pub fn observe_block(&mut self, interval_secs: Option<u64>) {
         self.blocks_connected.inc();
-        self.block_interval.observe(interval_secs);
+        if let Some(s) = interval_secs {
+            self.block_interval.observe(s);
+        }
     }
 
     /// Record a finality advance: `blocks` of height, `secs` of chain time (when the
@@ -758,7 +765,7 @@ mod tests {
     fn event_fed_histograms_carry_the_soak_quantities() {
         let mut m = Metrics::new();
         for secs in [60, 60, 75, 86, 312, 60, 90] {
-            m.observe_block(secs);
+            m.observe_block(Some(secs));
         }
         assert_eq!(m.block_interval().count(), 7);
         assert_eq!(m.block_interval().cumulative_at(60), 3, "the three at-median blocks");
