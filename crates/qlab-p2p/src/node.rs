@@ -983,10 +983,17 @@ mod tests {
 
     /// Drive a set of nodes to quiescence (no frames moved in a full round).
     fn run(nodes: &mut [InProcP2p]) {
+        run_at(nodes, 0)
+    }
+
+    /// As [`run`], but starting the deterministic clock at `base_ms` so a caller
+    /// that advances a logical clock across rounds keeps it **monotone** — a clock
+    /// that jumps backwards would make the rate limiter's refill meaningless.
+    fn run_at(nodes: &mut [InProcP2p], base_ms: u64) {
         for round in 0..1000u64 {
             let mut moved = 0;
             for n in nodes.iter_mut() {
-                moved += n.tick(round * SIM_TICK_MS);
+                moved += n.tick(base_ms + round * SIM_TICK_MS);
             }
             if moved == 0 {
                 break;
@@ -1661,7 +1668,7 @@ mod tests {
             for n in nodes.iter_mut() {
                 n.maintain(now);
             }
-            run(nodes);
+            run_at(nodes, now);
             now += crate::addrman::GETADDR_INTERVAL_MS;
         }
     }
@@ -1818,6 +1825,75 @@ mod tests {
         sniff.send(PeerId(1), &Envelope::new(MsgType::Addr, vec![9, 9, 9]).encode()).unwrap();
         n0.tick(0);
         assert_eq!(n0.peers().get(PeerId(2)).unwrap().score, -PENALTY_MALFORMED);
+    }
+
+    #[test]
+    fn a_gossiped_flood_of_one_netgroup_cannot_eclipse_the_outbound_set() {
+        // Issue #91 gap 3, end to end through the path that actually matters: an
+        // attacker hands us a big `Addr` message full of addresses it controls, all
+        // of them genuinely dialable, and we auto-connect. Without a diversity rule
+        // every outbound slot ends up inside the attacker's network — which is the
+        // eclipse, and it needs no invalid message anywhere.
+        let hub = InProcHub::new();
+        let t0 = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let mut n0 = P2pNode::new(t0, stub(), [1; 32]);
+
+        // Bind reachable endpoints: 60 attacker addresses inside ONE /16, and three
+        // honest networks of 3 each.
+        let mut handle = 100u64;
+        let mut bind = |addr: &str, h: &mut u64| {
+            let _t = InProcTransport::new(PeerId(*h), Arc::clone(&hub));
+            hub.bind_addr(addr, PeerId(*h));
+            *h += 1;
+        };
+        let attacker: Vec<String> =
+            (0..60).map(|i| format!("10.7.{}.{}:9333", i / 256, i % 256)).collect();
+        for a in &attacker {
+            bind(a, &mut handle);
+        }
+        let honest: Vec<String> = (0..3)
+            .flat_map(|g| (0..3).map(move |i| format!("198.5{g}.100.{i}:9333")))
+            .collect();
+        for a in &honest {
+            bind(a, &mut handle);
+        }
+
+        // The attacker peer gossips all 60 of its addresses in one legal `Addr`
+        // message (MAX_ADDRS_PER_MSG = 100, so this is well-formed and free).
+        let sniff = sniffer(&hub, PeerId(2), "10.7.255.255:9333");
+        hub.link(PeerId(2), PeerId(1));
+        let mut all = attacker.clone();
+        all.extend(honest.clone());
+        assert!(all.len() <= crate::addrman::MAX_ADDRS_PER_MSG);
+        sniff
+            .send(PeerId(1), &Envelope::new(MsgType::Addr, crate::peer::encode_addrs(&all)).encode())
+            .unwrap();
+        n0.tick(0);
+
+        // Auto-connect under the caps.
+        n0.maintain(0);
+        let groups = n0.addrs().outbound_groups();
+
+        assert_eq!(
+            n0.addrs().outbound_live(),
+            crate::addrman::MAX_OUTBOUND,
+            "the budget still fills — diversity must not cost liveness: {groups:?}"
+        );
+        assert!(
+            groups.get("v4:10.7").copied().unwrap_or(0) <= crate::addrman::MAX_OUTBOUND_PER_GROUP,
+            "60 gossiped addresses from one /16 took {:?} of {} slots",
+            groups.get("v4:10.7"),
+            crate::addrman::MAX_OUTBOUND
+        );
+        assert!(
+            groups.len() >= 4,
+            "the outbound set spans at least 4 networks, so no single one owns it: {groups:?}"
+        );
+        assert_eq!(
+            n0.peers().get(PeerId(2)).unwrap().score,
+            0,
+            "and the gossiper was not penalised — flooding addresses is not a protocol fault"
+        );
     }
 
     #[test]
