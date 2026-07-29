@@ -52,20 +52,49 @@ pub struct TxEntry {
     pub public: TxPublic,
 }
 
-/// A block body: the transaction set plus a placeholder coinbase counter.
+/// A block body: the transaction set, the coinbase counter, and the miner's
+/// payout key material.
 ///
-/// The coinbase is a bare counter — **not** emission logic (no tokenomics in the
-/// devnet); the epoch supply-attestation header field stays RESERVED (§9).
+/// The coinbase counter is the scheduled emission for the height — **not**
+/// emission logic in this crate (the curve lives in `qlab_node::emission`); the
+/// epoch supply-attestation header field stays RESERVED (§9).
+///
+/// ## `coinbase_rkm` (issue #101)
+///
+/// Raw recipient key material for the block's coinbase note, as the miner's
+/// wallet computes it (`rkm = H(nk ‖ D_R ‖ d)`, `qlab_wallet`). It is **raw
+/// `rkm`, not an address**: an address needs a derivation step, and a derivation
+/// that is subtly wrong yields a syntactically valid note nobody can spend —
+/// silently burning the block's whole issuance, undetected until someone tries
+/// to spend, possibly thousands of blocks later. Raw `rkm` has no step to get
+/// wrong: the value in the block is the value in the commitment preimage.
+/// Address ergonomics belong to the wallet layer, where a mistake is recoverable.
+///
+/// This field is what makes a mined coin spendable at all. Before it, a block
+/// named an *amount* and no recipient, so no real note could be minted, so the
+/// coinbase had no commitment-tree leaf and no membership witness — see
+/// `qlab_node::coinbase`.
 #[derive(Clone, Default)]
 pub struct BlockBody {
     pub txs: Vec<TxEntry>,
     pub coinbase: u64,
+    /// The miner's raw `rkm` for this block's coinbase note (issue #101).
+    /// `[0; 4]` means "no payee" and is rejected for any block that mints
+    /// (`coinbase > 0`) — see [`BodyError::MissingCoinbasePayee`].
+    pub coinbase_rkm: [u64; 4],
 }
 
 impl BlockBody {
     /// A deterministic Keccak-256 commitment to the body, for binding into the
     /// header's `tx_body_commitment`. Encodes each tx's public surface and proof
-    /// bytes in order, then the coinbase.
+    /// bytes in order, then the coinbase counter, then the coinbase payout key.
+    ///
+    /// 🔴 **This preimage changed in issue #101** — `coinbase_rkm` was appended
+    /// after the coinbase counter, so every block body commits to a different
+    /// value than it did before. That is a wire/consensus break, bound into the
+    /// header through `tx_body_commitment` (#79). It is locked by
+    /// `golden_body_commitment_bytes` below; a later change to this preimage MUST
+    /// break that test.
     pub fn commitment(&self) -> Hash32 {
         let mut buf = Vec::new();
         for tx in &self.txs {
@@ -82,12 +111,22 @@ impl BlockBody {
             buf.extend_from_slice(&tx.proof);
         }
         buf.extend_from_slice(&self.coinbase.to_le_bytes());
+        for lane in &self.coinbase_rkm {
+            buf.extend_from_slice(&lane.to_le_bytes());
+        }
         keccak256(&buf)
     }
 
     /// Total fees in the body (posted prices; the miner earns these + coinbase).
     pub fn total_fees(&self) -> u64 {
         self.txs.iter().map(|t| t.public.fee).sum()
+    }
+
+    /// Whether this body mints issuance without naming a payee — a block that
+    /// pays `coinbase > 0` to `rkm = [0; 4]`. See
+    /// [`BodyError::MissingCoinbasePayee`].
+    pub fn mints_without_payee(&self) -> bool {
+        self.coinbase > 0 && self.coinbase_rkm == [0u64; 4]
     }
 }
 
@@ -109,6 +148,18 @@ pub enum BodyError {
     /// the body or relayed something it never checked. Callers on the p2p path
     /// must penalise the sender, not merely drop the object.
     CommitmentMismatch { expected: Hash32, got: Hash32 },
+    /// The body mints issuance (`coinbase > 0`) but names no payee
+    /// (`coinbase_rkm == [0; 4]`) — issue #101.
+    ///
+    /// **Why this is a rule and not a shrug.** The whole reason the payout field
+    /// carries raw `rkm` rather than an address is that a wrong derivation
+    /// produces a syntactically valid note nobody can spend, burning the block's
+    /// issuance with nothing to detect it. Raw `rkm` removes the derivation but
+    /// not that failure mode: `[0; 4]` is what a `..Default::default()`, a
+    /// forgotten field, or an un-upgraded assembler produces, and no `(sk, d)`
+    /// yields `rkm = 0`, so the coins are gone. If a block mints, it must name
+    /// someone. Genesis is exempt for free — it carries `coinbase == 0`.
+    MissingCoinbasePayee,
     /// The tx at `index` references an anchor that is not a finalized root (§6).
     AnchorNotFinal { index: usize },
     /// The tx at `index` pays the wrong fee for its arity bucket (§8).
@@ -170,6 +221,11 @@ where
     F: Fn(&Hash32) -> bool,
 {
     check_body_binding(header, body)?;
+    // A minting block must name a payee (issue #101). Second-cheapest check
+    // after the binding, and it guards the block's whole issuance.
+    if body.mints_without_payee() {
+        return Err(BodyError::MissingCoinbasePayee);
+    }
     let mut seen_nf: HashSet<Hash32> = HashSet::new();
     for (i, tx) in body.txs.iter().enumerate() {
         if !is_anchor_final(&tx.public.anchor) {
@@ -206,6 +262,9 @@ mod tests {
 
     const FINAL_ANCHOR: Hash32 = [0x0F; 32];
 
+    /// A non-zero payout key for bodies that mint (issue #101).
+    const MINER_RKM: [u64; 4] = [0xA1, 0xA2, 0xA3, 0xA4];
+
     fn is_final(r: &Hash32) -> bool {
         *r == FINAL_ANCHOR
     }
@@ -232,13 +291,13 @@ mod tests {
 
     #[test]
     fn valid_body_passes_and_commitment_is_deterministic() {
-        let body = BlockBody { txs: vec![good_tx(1), good_tx(2)], coinbase: 42 };
+        let body = BlockBody { txs: vec![good_tx(1), good_tx(2)], coinbase: 42, coinbase_rkm: MINER_RKM };
         let header = header_for(&body);
         assert_eq!(validate_body(&header, &body, &MockVerifier, is_final), Ok(()));
         assert_eq!(body.commitment(), body.commitment());
         assert_eq!(body.total_fees(), 2 * posted_fee(ArityBucket::TwoByTwo));
         // A different body ⇒ different commitment.
-        let other = BlockBody { txs: vec![good_tx(1)], coinbase: 42 };
+        let other = BlockBody { txs: vec![good_tx(1)], coinbase: 42, coinbase_rkm: MINER_RKM };
         assert_ne!(body.commitment(), other.commitment());
     }
 
@@ -246,7 +305,7 @@ mod tests {
     fn non_finalized_anchor_is_rejected() {
         let mut tx = good_tx(1);
         tx.public.anchor = [0xEE; 32]; // not the finalized root
-        let body = BlockBody { txs: vec![tx], coinbase: 0 };
+        let body = BlockBody { txs: vec![tx], coinbase: 0, coinbase_rkm: [0; 4] };
         assert_eq!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::AnchorNotFinal { index: 0 })
@@ -257,7 +316,7 @@ mod tests {
     fn wrong_fee_is_rejected() {
         let mut tx = good_tx(1);
         tx.public.fee += 1;
-        let body = BlockBody { txs: vec![tx], coinbase: 0 };
+        let body = BlockBody { txs: vec![tx], coinbase: 0, coinbase_rkm: [0; 4] };
         assert_eq!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::WrongFee {
@@ -274,7 +333,7 @@ mod tests {
         let a = good_tx(7);
         let mut b = good_tx(9);
         b.public.nullifiers = a.public.nullifiers.clone();
-        let body = BlockBody { txs: vec![a, b], coinbase: 0 };
+        let body = BlockBody { txs: vec![a, b], coinbase: 0, coinbase_rkm: [0; 4] };
         assert_eq!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::DoubleSpendInBlock { index: 1 })
@@ -285,7 +344,7 @@ mod tests {
     fn invalid_proof_is_rejected() {
         let mut tx = good_tx(1);
         tx.proof = b"forged".to_vec();
-        let body = BlockBody { txs: vec![tx], coinbase: 0 };
+        let body = BlockBody { txs: vec![tx], coinbase: 0, coinbase_rkm: [0; 4] };
         assert_eq!(
             validate_body(&header_for(&body), &body, &MockVerifier, is_final),
             Err(BodyError::ProofInvalid { index: 0 })
@@ -298,9 +357,9 @@ mod tests {
     /// invariant itself, at the validation seam.
     #[test]
     fn body_not_matching_the_header_commitment_is_rejected() {
-        let honest = BlockBody { txs: vec![good_tx(1), good_tx(2)], coinbase: 42 };
+        let honest = BlockBody { txs: vec![good_tx(1), good_tx(2)], coinbase: 42, coinbase_rkm: MINER_RKM };
         let header = header_for(&honest); // commits to `honest`…
-        let swapped = BlockBody { txs: vec![good_tx(3)], coinbase: 42 }; // …but we hand it this
+        let swapped = BlockBody { txs: vec![good_tx(3)], coinbase: 42, coinbase_rkm: MINER_RKM }; // …but we hand it this
         assert_eq!(
             validate_body(&header, &swapped, &MockVerifier, is_final),
             Err(BodyError::CommitmentMismatch {
@@ -316,7 +375,7 @@ mod tests {
     /// so the binding check is the *only* thing that rejects it.
     #[test]
     fn empty_body_under_an_honest_header_is_rejected() {
-        let honest = BlockBody { txs: vec![good_tx(1), good_tx(2)], coinbase: 42 };
+        let honest = BlockBody { txs: vec![good_tx(1), good_tx(2)], coinbase: 42, coinbase_rkm: MINER_RKM };
         let header = header_for(&honest);
         let empty = BlockBody::default();
         // Everything except the binding is happy with the empty body:
@@ -339,7 +398,7 @@ mod tests {
         let mut tx = good_tx(1);
         tx.proof = b"forged".to_vec(); // would be ProofInvalid…
         tx.public.anchor = [0xEE; 32]; // …and AnchorNotFinal
-        let body = BlockBody { txs: vec![tx], coinbase: 0 };
+        let body = BlockBody { txs: vec![tx], coinbase: 0, coinbase_rkm: [0; 4] };
         let foreign = header_for(&BlockBody::default());
         assert_eq!(
             validate_body(&foreign, &body, &MockVerifier, is_final),
@@ -347,6 +406,118 @@ mod tests {
                 expected: BlockBody::default().commitment(),
                 got: body.commitment(),
             })
+        );
+    }
+
+    // --- issue #101: the coinbase payout field ------------------------------
+
+    /// A block that mints issuance but names no payee is rejected. `[0; 4]` is
+    /// the shape a `..Default::default()`, a dropped field, or an un-upgraded
+    /// assembler produces, and no `(sk, d)` derives `rkm = 0` — so accepting it
+    /// burns the block's whole issuance with nothing to detect it.
+    #[test]
+    fn a_minting_block_with_no_payee_is_rejected() {
+        let body = BlockBody { txs: vec![good_tx(1)], coinbase: 5_000, coinbase_rkm: [0; 4] };
+        assert_eq!(
+            validate_body(&header_for(&body), &body, &MockVerifier, is_final),
+            Err(BodyError::MissingCoinbasePayee)
+        );
+        // Naming a payee is the only difference, and it passes.
+        let paid = BlockBody { coinbase_rkm: MINER_RKM, ..body.clone() };
+        assert_eq!(validate_body(&header_for(&paid), &paid, &MockVerifier, is_final), Ok(()));
+        // A non-minting block needs no payee — this is what exempts genesis,
+        // which carries `coinbase == 0`.
+        let no_mint = BlockBody { coinbase: 0, ..body };
+        assert_eq!(
+            validate_body(&header_for(&no_mint), &no_mint, &MockVerifier, is_final),
+            Ok(())
+        );
+    }
+
+    /// The payout key is *inside* the header binding: swapping only `coinbase_rkm`
+    /// under an otherwise honest header is caught. Without this the field would be
+    /// unauthenticated and any relay could redirect a block's issuance.
+    #[test]
+    fn redirecting_the_payout_key_breaks_the_header_binding() {
+        let honest =
+            BlockBody { txs: vec![good_tx(1)], coinbase: 5_000, coinbase_rkm: MINER_RKM };
+        let header = header_for(&honest);
+        let stolen = BlockBody { coinbase_rkm: [0xBAD; 4], ..honest.clone() };
+        assert_ne!(honest.commitment(), stolen.commitment(), "rkm must enter the preimage");
+        assert_eq!(
+            validate_body(&header, &stolen, &MockVerifier, is_final),
+            Err(BodyError::CommitmentMismatch {
+                expected: honest.commitment(),
+                got: stolen.commitment(),
+            })
+        );
+    }
+
+    /// A fixed body with every field pinned — the input to the golden vector.
+    fn golden_body() -> BlockBody {
+        BlockBody {
+            txs: vec![TxEntry {
+                proof: vec![0xAB, 0xCD, 0xEF],
+                public: TxPublic {
+                    anchor: [0x11; 32],
+                    nullifiers: vec![[0x22; 32], [0x33; 32]],
+                    commitments: vec![[0x44; 32], [0x55; 32]],
+                    bucket: ArityBucket::TwoByTwo,
+                    fee: 0x0102_0304_0506_0708,
+                },
+            }],
+            coinbase: 0x1234_5678_9ABC_DEF0,
+            coinbase_rkm: [
+                0x0011_2233_4455_6677,
+                0x8899_AABB_CCDD_EEFF,
+                0x0F0E_0D0C_0B0A_0908,
+                0x0706_0504_0302_0100,
+            ],
+        }
+    }
+
+    /// 🔴 **The golden vector for `BlockBody::commitment()`** — the thing that did
+    /// not exist before issue #101, and whose absence is why the block-body format
+    /// could be changed with the whole suite staying green.
+    ///
+    /// `wire.rs`'s `golden_header_bytes` locks the **p2p envelope header**, not the
+    /// block body. `valid_body_passes_and_commitment_is_deterministic` asserts only
+    /// `commitment() == commitment()` — determinism, not a fixed value. So nothing
+    /// held this preimage, and a body-format change (which is a consensus break,
+    /// because #79 binds this value into the header) produced no failing test.
+    ///
+    /// **This value was deliberately changed by issue #101.** Adding `coinbase_rkm`
+    /// to the preimage moved it:
+    ///
+    /// ```text
+    ///   before #101: 02566c7473c06db6c281fe2b90d264956bccd5a4c75c5fa4828a9d1644bf67cf
+    ///   after  #101: (the constant below)
+    /// ```
+    ///
+    /// The "before" value is recorded so the break is legible, not so it can be
+    /// restored. If you are here because this test failed: you changed the block
+    /// body format. That is a consensus break and it needs the halt-height upgrade
+    /// path (#74), not a new constant.
+    #[test]
+    fn golden_body_commitment_bytes() {
+        let hex: String =
+            golden_body().commitment().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex, "0ac5b4641291df8cbf328ab2c82a83cbb03da8b60a888177791f4ce04a78b613",
+            "block-body commitment preimage changed — see this test's doc comment"
+        );
+    }
+
+    /// The empty body's commitment, pinned for the same reason: it is the value
+    /// the genesis exemption is stated against, and it is the cheapest body an
+    /// attacker can substitute (`empty_body_under_an_honest_header_is_rejected`).
+    #[test]
+    fn golden_empty_body_commitment_bytes() {
+        let hex: String =
+            BlockBody::default().commitment().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex, "daa77426c30c02a43d9fba4e841a6556c524d47030762eb14dc4af897e605d9b",
+            "empty-body commitment changed — see golden_body_commitment_bytes"
         );
     }
 
@@ -366,3 +537,4 @@ mod tests {
         );
     }
 }
+
