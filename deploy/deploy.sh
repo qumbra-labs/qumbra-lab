@@ -32,6 +32,10 @@
 #   --binary PATH       Use a pre-built binary instead of building.
 #   --no-build          Do not build; expect the binary at the default path.
 #   --no-mining         Generate configs with mining = false (verify-only rehearsal).
+#   --metrics-port N    Serve the /metrics scrape endpoint on 0.0.0.0:N (issue #87).
+#                       OMITTED BY DEFAULT: no flag, no listener. Passing it also
+#                       requires an inbound security-group rule SOURCE-RESTRICTED to
+#                       the collector — see the note in the generated config.
 #   --keep-stage        Keep the staging directory (default: removed on success).
 #   -h | --help         This help.
 #
@@ -52,6 +56,7 @@ TARGET=""
 BINARY=""
 NO_BUILD=0
 MINING="true"
+METRICS_PORT=""
 KEEP_STAGE=0
 
 die() { echo "deploy: $*" >&2; exit 1; }
@@ -65,8 +70,9 @@ while [[ $# -gt 0 ]]; do
     --binary)      BINARY="${2:?}"; shift 2 ;;
     --no-build)    NO_BUILD=1; shift ;;
     --no-mining)   MINING="false"; shift ;;
+    --metrics-port) METRICS_PORT="${2:?}"; shift 2 ;;
     --keep-stage)  KEEP_STAGE=1; shift ;;
-    -h|--help)     sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)     sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)             die "unknown option: $1 (see --help)" ;;
   esac
 done
@@ -184,6 +190,30 @@ committee_key_paths = [$keys_csv]
 mining = $MINING
 expected_genesis_hash = "$GENESIS_HASH"
 EOF
+
+  # /metrics scrape endpoint (issue #87). Absent unless --metrics-port was passed:
+  # a node nobody scrapes listens on nothing extra, so this can never be left open
+  # by forgetting to turn it off.
+  if [[ -n "$METRICS_PORT" ]]; then
+    # LOCAL mode stands four "hosts" up on ONE machine, so a single shared port
+    # would collide and — since a failed bind is fatal by design — take three of
+    # the four nodes down. Offset by node index there; on real hosts each node has
+    # the port to itself, so it is used exactly as given (one SG rule, not four).
+    if [[ "$ssh" == "-" ]]; then
+      metrics_bind="127.0.0.1:$((METRICS_PORT + i))"
+    else
+      metrics_bind="0.0.0.0:$METRICS_PORT"
+    fi
+    cat >> "$stage/node.toml" <<EOF
+# Prometheus scrape target (issue #87). Bound on all interfaces, so it is reachable
+# ONLY as far as the host firewall allows: pair it with an inbound rule whose SOURCE
+# is the collector's fixed address or security group — never 0.0.0.0/0, and never a
+# roaming operator IP (a roaming source re-creates the 10.15 h blind spot of the 42 h
+# soak, in a new place). Standalone aws_security_group_rule resources only: inline
+# rules once silently deleted twelve peer P2P rules.
+metrics_addr = "$metrics_bind"
+EOF
+  fi
 
   # rest of the payload
   cp "$BINARY" "$stage/qumbra-node"

@@ -62,9 +62,13 @@ node3   127.0.0.1:9404     -
 EOF
 
 echo "== running deploy.sh (local mode) =="
+# --metrics-port exercises issue #87's scrape opt-in through the REAL config path:
+# NodeConfig uses deny_unknown_fields, so a config carrying metrics_addr that the
+# binary did not understand would fail `check` rather than be ignored.
 "$SCRIPT_DIR/deploy.sh" \
   --hosts "$HOSTS" \
   --local-base "$BASE/nodes" \
+  --metrics-port 9090 \
   --binary "$BINARY"
 
 echo "== assertions =="
@@ -99,7 +103,17 @@ for i in "${!NODES[@]}"; do
       || fail "$name: genesis.qmb differs from node0"
   fi
 
-  # 4. real preflight via the deployed binary (bind nothing)
+  # 4. issue #87: the scrape opt-in reached the config, bound to all interfaces
+  #    (the operator's SG rule is what restricts it), and is annotated.
+  # Local mode offsets the port per node so four stand-in "hosts" on one machine
+  # do not collide on a bind that is fatal by design.
+  grep -q "^metrics_addr = \"127.0.0.1:$((9090 + i))\"\$" "$root/node.toml" \
+    || fail "$name: --metrics-port did not reach node.toml with the local offset"
+  grep -q 'SOURCE-RESTRICTED\|SOURCE' "$root/node.toml" \
+    || fail "$name: metrics_addr is not annotated with its security-group requirement"
+  pass "$name: /metrics opt-in present and annotated"
+
+  # 5. real preflight via the deployed binary (bind nothing)
   out="$("$root/qumbra-node" check --config "$root/node.toml")"
   echo "$out" | grep -q 'check: OK' || fail "$name: preflight did not pass"
   h="$(echo "$out" | awk '/genesis hash:/{print $NF}')"
