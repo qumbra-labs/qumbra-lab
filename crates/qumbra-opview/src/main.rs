@@ -23,7 +23,10 @@
 //! output, not in the exit status.** A consumer that needs to know greps the
 //! supply block for `UNAVAILABLE`, which is a **stable token alerting may depend
 //! on** and is pinned by a test on both sides (present under partial coverage,
-//! absent under complete coverage).
+//! absent under complete coverage). A node rendered `UNREACHABLE` is uncovered
+//! too — it contributed no supply evidence at all — so a consumer asking "was
+//! everything checked?" reads both tokens; that one is pinned by
+//! `unreachable_renders_as_unreachable_and_never_as_a_dissent`.
 //!
 //! Deliberately **not** a third exit code, and deliberately not promoted to `2`:
 //! every joining or briefly-lagging node reports `Unavailable`, so a non-zero
@@ -65,9 +68,11 @@ fork choice reports coverage UNAVAILABLE and its supply figures are refused, whi
 also exits 0 — so the exit status alone cannot tell `checked across the whole
 canonical chain and agreed` from `never checked`. Coverage is reported in the
 output, not in the exit status: grep the supply block for UNAVAILABLE. That token
-is stable and alerting may depend on it. It is deliberately not a third exit code
-— every joining or briefly-lagging node is UNAVAILABLE, so paging on it would
-train operators to ignore the one code that means STOP.
+is stable and alerting may depend on it. A node rendered UNREACHABLE contributed
+no supply evidence either, so `was everything checked?` reads both tokens.
+UNAVAILABLE is deliberately not a third exit code — every joining or briefly
+lagging node is UNAVAILABLE, so paging on it would train operators to ignore the
+one code that means STOP.
 
 This view exposes only public chain facts. It deliberately has no address,
 balance, or traceable-transfer pages because Qumbra has no transparent tier.
