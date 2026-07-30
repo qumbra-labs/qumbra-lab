@@ -1139,6 +1139,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "qumbra-faucet"
+version = "0.0.0"
+dependencies = [
+ "ctrlc",
+ "qlab-cbserver",
+ "qlab-devnet",
+ "qlab-faucet",
+ "qlab-node",
+ "qlab-note",
+ "qlab-p2p",
+ "qlab-wallet",
+ "qumbra-node",
+ "rand",
+ "serde",
+ "tiny_http",
+ "toml",
+]
+
+[[package]]
 name = "qumbra-node"
 version = "0.0.0"
 dependencies = [
