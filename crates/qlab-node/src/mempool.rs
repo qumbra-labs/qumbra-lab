@@ -264,12 +264,18 @@ pub struct BlockTemplate {
     /// goes into `BlockBody::coinbase_rkm` and therefore into the note preimage.
     pub coinbase_rkm: [u64; 4],
     /// The **real** note commitment this block mints, as
-    /// [`crate::coinbase::coinbase_note_leaf`] derives it — the leaf
-    /// `Node::apply_state` will append and the value the maturity registry is
-    /// keyed on. `None` only for a non-minting body (`coinbase == 0`).
+    /// [`crate::coinbase::coinbase_note_leaf`] derives it. `None` only for a
+    /// non-minting body (`coinbase == 0`).
     ///
     /// Derived from the assembled body by the same function the applier uses, so
-    /// the assembler and the applier cannot disagree about the leaf.
+    /// the assembler and the applier cannot disagree about the leaf's *identity*.
+    ///
+    /// **It is not a tree leaf yet, and there is no registry keyed on it** (issue
+    /// #102 — this doc used to say both). `Node::apply_state` will append it 144
+    /// blocks from now, when the block at
+    /// [`crate::coinbase::coinbase_leaf_appears_at`] of this height is applied; until
+    /// then it is in no anchor and has no membership witness. Nothing in the tree
+    /// reflects this field at assembly time.
     pub coinbase_note: Option<Hash32>,
     /// The block body ready to hand to [`crate::Node::apply_block`]. The coinbase
     /// counter carries the scheduled emission `coinbase_total`.
