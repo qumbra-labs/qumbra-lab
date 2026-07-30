@@ -69,6 +69,70 @@ pgrep -f qlab_bench     # must print nothing
   even if they shared a genesis. Crossing that on a running net is the halt-height
   mechanism's job (#74), not a redeploy.
 
+## CPU budget (issue #107 step 1d)
+
+The harness can now be held to **the T0 hosts' CPU budget**, which until 2026-07-30
+it could not — and that gap was the reason three previous local runs were
+structurally unable to answer the question they were asked.
+
+```
+T0 hosts        2 vCPU each      (t4g.small)
+this harness    no limit at all  → four containers sharing every core the Docker VM
+                                   has (18 on the dev rig)
+```
+
+The node mines RandomX **synchronously on the main loop** — the same loop that pumps
+the transport and emits telemetry (`run.rs`, `run_until` → `try_mine`). Per-frame work
+in `tick` therefore competes with mining **only when CPU is scarce**, and every
+earlier local run was measured where it was abundant.
+
+```sh
+# a FRESH net under a limit (the durable path — compose sets it)
+QUMBRA_CPUS=2 NODE0_CPUSET=0-1 NODE1_CPUSET=2-3 NODE2_CPUSET=4-5 NODE3_CPUSET=6-7 \
+  deploy/docker/soak.sh rehearsal
+
+# or apply to a net that is already up, live, with no restart
+deploy/docker/soak.sh cpu-budget 2              # quota 2 + a dedicated pair per node
+deploy/docker/soak.sh cpu-budget 2 quota-only   # quota only; nproc stays at 18
+deploy/docker/soak.sh cpu-budget none           # raise the ceiling to the whole VM
+deploy/docker/soak.sh cpu-show 2                # read it back, and assert it
+```
+
+- **Default is unconstrained.** At the defaults compose omits `cpus:`/`cpuset:` from
+  the resolved config entirely (`docker compose config` shows neither key), so an
+  ordinary soak is byte-for-byte what it was and `NanoCpus=0`.
+- **Quota and cpuset are different experiments.** `cpus: 2` is a CFS quota — 2
+  CPU-seconds per second, throttled at 100 ms period boundaries, and the container
+  still *sees* all 18 cores (`nproc` = 18). `cpuset: "0-1"` is affinity — `nproc` = 2,
+  which is what the hosts' own `nproc` reports. Only cpuset reproduces the topology.
+  **Use a distinct block per node**: four containers pinned to the same pair are a 4:1
+  oversubscription of one pair, not four 2-vCPU hosts.
+- **Every node records its own budget.** `entrypoint.sh` prints one greppable line
+  before the config dump, read from the container's **cgroup** rather than from the
+  environment it was passed — the environment says what was requested, the cgroup says
+  what the kernel will enforce:
+
+  ```
+  CPU_BUDGET node0 quota=2.00cpu cpuset=0-1 nproc=2
+  CPU_BUDGET node0 quota=unconstrained cpuset=0-17 nproc=18
+  ```
+
+  `soak.sh cpu-show` prints that startup line **beside** the live cgroup, because
+  `cpu-budget` changes the cgroup without restarting the process and cannot rewrite a
+  log line already emitted. When the two disagree, the budget was applied live.
+- **`docker update --cpus 0` is a silent no-op** — it exits 0, prints the container
+  name and changes nothing, because docker reads `0`/`""` as "leave this field alone".
+  So `cpu-budget none` *raises* the ceiling to every core on the machine and says so;
+  only a fresh `up` at the compose defaults gives a genuinely limit-free container.
+
+**The limitation, stated rather than left to be discovered: `cpus: 2` on four
+containers sharing one host machine is not four hosts with 2 vCPU each.** They share
+one kernel scheduler, one memory-bandwidth budget and one last-level cache; the four
+hosts share none of those. There is also no memory limit here — the hosts have 2 GB
+and Phase B-lite measured ~262 MiB/node, so memory is not the scarce axis, but the
+Docker VM's own ceiling on this rig is 8.3 GB across all four. **A limit answers "is
+this effect CPU-scarcity-shaped", not "does this match the T0 net".**
+
 ## Observability
 
 `qumbra-node run` emits a `TELEMETRY …` line to stdout on a ~30 s cadence (tip,

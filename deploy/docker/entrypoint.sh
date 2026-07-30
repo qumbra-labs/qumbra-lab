@@ -22,6 +22,23 @@
 # full mesh (each node dials the other three by compose service name). The genesis
 # is generated once by the `init` service into a shared volume; every node byte-
 # verifies it and pins its hash (expected_genesis_hash) on startup.
+#
+# CPU BUDGET (issue #107 step 1d). This script does not SET the budget — docker-
+# compose.yml does, via `cpus:` / `cpuset:` — but it REPORTS it, on one greppable
+# `CPU_BUDGET` line before the config dump, and it reports it by reading this
+# container's own cgroup rather than the environment that was passed in. That
+# distinction is the whole point: the environment says what was *requested*, the
+# cgroup says what the kernel will actually enforce, and only the second one belongs
+# in a run's record. A run whose resource envelope is not in its own output cannot be
+# trusted afterwards, which is the same rule the config dump itself follows.
+#
+#   docker compose logs node0 | grep CPU_BUDGET     # what this node actually got
+#
+# The line carries three separate facts because they can disagree and the difference
+# matters: the CFS quota (CPU-seconds per second), the effective cpuset (which cores
+# the container may run on) and `nproc` (how many the process can SEE). `cpus: 2`
+# alone leaves `nproc` at the host's count; only a 2-core `cpuset` makes a container
+# look like the 2 vCPU t4g.small the T0 hosts are.
 
 set -euo pipefail
 
@@ -42,6 +59,41 @@ HASH_FILE="$GENESIS_DIR/genesis.hash"
 # Key split 6/5/5/5 across node0..node3 (task-book inline stamp; a 2+2 partition
 # leaves 11 keys | 10 keys, both below the 15 quorum → finality correctly stalls).
 KEY_SPLIT=(6 5 5 5)
+
+# ── the effective CPU budget, read from the cgroup (issue #107 step 1d) ───────
+#
+# cgroup v2 is what Docker Desktop and Debian 12 both use; the v1 branch is here
+# because a wrong-but-confident "unconstrained" on an older host would be worse than
+# no line at all. Anything unreadable prints `unknown`, never a guess — this line is
+# evidence, so it is allowed to say it does not know.
+#
+# The arithmetic is bash-only on purpose: the runtime image is debian:bookworm-slim
+# plus four packages, and reaching for `awk`/`bc` here would make the run's own
+# evidence line depend on a package nobody declared.
+cpu_budget_line() {
+  local idx="$1" quota="unknown" cpuset="unknown" q p nproc_n
+  if [[ -r /sys/fs/cgroup/cpu.max ]]; then                       # cgroup v2
+    read -r q p < /sys/fs/cgroup/cpu.max || true
+  elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]]; then        # cgroup v1
+    q="$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"               # -1 = no quota
+    p="$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
+    [[ "$q" == "-1" ]] && q=max
+  fi
+  if [[ "${q:-}" == "max" ]]; then
+    quota="unconstrained"
+  elif [[ "${q:-}" =~ ^[0-9]+$ && "${p:-0}" =~ ^[1-9][0-9]*$ ]]; then
+    # Two decimals without a float: hundredths of a CPU, then split.
+    local h=$(( q * 100 / p ))
+    quota="$(( h / 100 )).$(printf '%02d' $(( h % 100 )))cpu"
+  fi
+  for f in /sys/fs/cgroup/cpuset.cpus.effective /sys/fs/cgroup/cpuset/cpuset.cpus; do
+    [[ -r "$f" ]] && { cpuset="$(cat "$f")"; break; }
+  done
+  # `nproc` is what the PROCESS sees (sched_getaffinity), so it tracks the cpuset and
+  # is blind to the quota. Printing both is how a reader tells the two apart.
+  nproc_n="$(nproc 2>/dev/null || echo unknown)"
+  echo "CPU_BUDGET node$idx quota=$quota cpuset=$cpuset nproc=$nproc_n"
+}
 
 cmd="${1:-}"
 shift || true
@@ -102,6 +154,10 @@ mining = true
 expected_genesis_hash = "$ghash"
 telemetry_addr = "0.0.0.0:$TELEMETRY_PORT"
 EOF
+    # The resource envelope BEFORE the config dump, on its own greppable line — a run
+    # that does not record what CPU it had cannot be compared with one that had more
+    # (issue #107 step 1d). Read from the cgroup, not from the environment.
+    cpu_budget_line "$idx"
     echo "== node$idx config (binary: $BIN) =="
     cat "$cfg"
     # The halt-height release status of THIS binary, before anything else (#74).

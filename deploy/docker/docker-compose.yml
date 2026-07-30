@@ -10,6 +10,23 @@
 #   docker compose -f deploy/docker/docker-compose.yml up -d --build node0 node1 node2
 #   deploy/docker/soak.sh                                                 # scenarios
 #
+# CPU BUDGET (issue #107 step 1d). The harness can now be held to the T0 hosts'
+# CPU budget, which until 2026-07-30 it could not: the four hosts are t4g.small with
+# 2 vCPU each, while these four containers shared every core the Docker VM has (18 on
+# the dev rig). Two knobs, BOTH DEFAULTING TO UNCONSTRAINED so an ordinary soak is
+# byte-for-byte what it was — at the defaults compose drops both keys from the
+# resolved config entirely, so there is nothing left to behave differently:
+#
+#   QUMBRA_CPUS=2       CFS quota: 2 CPU-seconds per second. `nproc` still says 18.
+#   QUMBRA_CPUSET=0-1   affinity: the container sees exactly 2 CPUs, `nproc` says 2.
+#   NODE<i>_CPUS / NODE<i>_CPUSET   per node — and the per-node form is the one that
+#                       matters for cpuset, because four containers pinned to the
+#                       SAME pair oversubscribe it 4:1 instead of modelling 4 hosts.
+#
+# `soak.sh cpu-budget 2` sets quota 2 + a distinct core pair per node and is the
+# recipe to use; `soak.sh cpu-show` reads back what each running node actually got.
+# A run WITHOUT a limit says nothing about CPU-scarce behaviour — see soak.sh's header.
+#
 # RIG DISCIPLINE: do NOT `up`/`build` while the b4 bench is running
 # (`pgrep -f qlab_bench`) — 4 RandomX light caches on the Docker-Desktop Linux VM
 # on top of the ~30 GB bench will OOM. Wait it out.
@@ -66,6 +83,12 @@ services:
     environment:
       QUMBRA_BIN: ${NODE0_BIN:-qumbra-node}
       QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
+    # CPU budget (issue #107 step 1d) — see the header. `0` / empty are how compose
+    # is told to omit the key altogether, so the DEFAULT container is unconstrained
+    # and identical to every run before 2026-07-30. Per node here; QUMBRA_CPUS /
+    # QUMBRA_CPUSET set all four at once.
+    cpus: ${NODE0_CPUS:-${QUMBRA_CPUS:-0}}
+    cpuset: ${NODE0_CPUSET:-${QUMBRA_CPUSET:-}}
     # /v1/telemetry (issue #117), published so `qumbra-opview` can be run from the
     # host: `qumbra-opview node0=http://127.0.0.1:9410 …`. Read-only, GET only,
     # bound to localhost on the host side — nothing here is reachable off-machine.
@@ -85,6 +108,12 @@ services:
     environment:
       QUMBRA_BIN: ${NODE1_BIN:-qumbra-node}
       QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
+    # CPU budget (issue #107 step 1d) — see the header. `0` / empty are how compose
+    # is told to omit the key altogether, so the DEFAULT container is unconstrained
+    # and identical to every run before 2026-07-30. Per node here; QUMBRA_CPUS /
+    # QUMBRA_CPUSET set all four at once.
+    cpus: ${NODE1_CPUS:-${QUMBRA_CPUS:-0}}
+    cpuset: ${NODE1_CPUSET:-${QUMBRA_CPUSET:-}}
     # /v1/telemetry (issue #117), published so `qumbra-opview` can be run from the
     # host: `qumbra-opview node0=http://127.0.0.1:9410 …`. Read-only, GET only,
     # bound to localhost on the host side — nothing here is reachable off-machine.
@@ -104,6 +133,12 @@ services:
     environment:
       QUMBRA_BIN: ${NODE2_BIN:-qumbra-node}
       QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
+    # CPU budget (issue #107 step 1d) — see the header. `0` / empty are how compose
+    # is told to omit the key altogether, so the DEFAULT container is unconstrained
+    # and identical to every run before 2026-07-30. Per node here; QUMBRA_CPUS /
+    # QUMBRA_CPUSET set all four at once.
+    cpus: ${NODE2_CPUS:-${QUMBRA_CPUS:-0}}
+    cpuset: ${NODE2_CPUSET:-${QUMBRA_CPUSET:-}}
     # /v1/telemetry (issue #117), published so `qumbra-opview` can be run from the
     # host: `qumbra-opview node0=http://127.0.0.1:9410 …`. Read-only, GET only,
     # bound to localhost on the host side — nothing here is reachable off-machine.
@@ -123,6 +158,12 @@ services:
     environment:
       QUMBRA_BIN: ${NODE3_BIN:-qumbra-node}
       QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
+    # CPU budget (issue #107 step 1d) — see the header. `0` / empty are how compose
+    # is told to omit the key altogether, so the DEFAULT container is unconstrained
+    # and identical to every run before 2026-07-30. Per node here; QUMBRA_CPUS /
+    # QUMBRA_CPUSET set all four at once.
+    cpus: ${NODE3_CPUS:-${QUMBRA_CPUS:-0}}
+    cpuset: ${NODE3_CPUSET:-${QUMBRA_CPUSET:-}}
     # /v1/telemetry (issue #117), published so `qumbra-opview` can be run from the
     # host: `qumbra-opview node0=http://127.0.0.1:9410 …`. Read-only, GET only,
     # bound to localhost on the host side — nothing here is reachable off-machine.
