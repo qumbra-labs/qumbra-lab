@@ -10,6 +10,12 @@
 #   docker compose -f deploy/docker/docker-compose.yml up -d --build node0 node1 node2
 #   deploy/docker/soak.sh                                                 # scenarios
 #
+# QUMBRA_ADVERTISE_ADDR=none brings the net up with NO advertised address on any
+# node — the configuration the four T0 hosts actually run (issue #107 step 1c).
+# Default `auto` is what every run before 2026-07-30 did, so an ordinary soak is
+# unchanged. Per node: NODE<i>_ADVERTISE. `soak.sh advertise-show` reads back which
+# mode each running node is in, from inside the container.
+#
 # RIG DISCIPLINE: do NOT `up`/`build` while the b4 bench is running
 # (`pgrep -f qlab_bench`) — 4 RandomX light caches on the Docker-Desktop Linux VM
 # on top of the ~30 GB bench will OOM. Wait it out.
@@ -66,6 +72,10 @@ services:
     environment:
       QUMBRA_BIN: ${NODE0_BIN:-qumbra-node}
       QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
+      # auto (default) = this node advertises itself dialable, as every run before
+      # 2026-07-30 did. none = the field is absent from its node.toml, which is what
+      # the four T0 hosts run. Global for all four, or NODE0_ADVERTISE per node.
+      QUMBRA_ADVERTISE_ADDR: ${NODE0_ADVERTISE:-${QUMBRA_ADVERTISE_ADDR:-auto}}
     # /v1/telemetry (issue #117), published so `qumbra-opview` can be run from the
     # host: `qumbra-opview node0=http://127.0.0.1:9410 …`. Read-only, GET only,
     # bound to localhost on the host side — nothing here is reachable off-machine.
@@ -85,6 +95,10 @@ services:
     environment:
       QUMBRA_BIN: ${NODE1_BIN:-qumbra-node}
       QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
+      # auto (default) = this node advertises itself dialable, as every run before
+      # 2026-07-30 did. none = the field is absent from its node.toml, which is what
+      # the four T0 hosts run. Global for all four, or NODE1_ADVERTISE per node.
+      QUMBRA_ADVERTISE_ADDR: ${NODE1_ADVERTISE:-${QUMBRA_ADVERTISE_ADDR:-auto}}
     # /v1/telemetry (issue #117), published so `qumbra-opview` can be run from the
     # host: `qumbra-opview node0=http://127.0.0.1:9410 …`. Read-only, GET only,
     # bound to localhost on the host side — nothing here is reachable off-machine.
@@ -104,6 +118,10 @@ services:
     environment:
       QUMBRA_BIN: ${NODE2_BIN:-qumbra-node}
       QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
+      # auto (default) = this node advertises itself dialable, as every run before
+      # 2026-07-30 did. none = the field is absent from its node.toml, which is what
+      # the four T0 hosts run. Global for all four, or NODE2_ADVERTISE per node.
+      QUMBRA_ADVERTISE_ADDR: ${NODE2_ADVERTISE:-${QUMBRA_ADVERTISE_ADDR:-auto}}
     # /v1/telemetry (issue #117), published so `qumbra-opview` can be run from the
     # host: `qumbra-opview node0=http://127.0.0.1:9410 …`. Read-only, GET only,
     # bound to localhost on the host side — nothing here is reachable off-machine.
@@ -123,6 +141,10 @@ services:
     environment:
       QUMBRA_BIN: ${NODE3_BIN:-qumbra-node}
       QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
+      # auto (default) = this node advertises itself dialable, as every run before
+      # 2026-07-30 did. none = the field is absent from its node.toml, which is what
+      # the four T0 hosts run. Global for all four, or NODE3_ADVERTISE per node.
+      QUMBRA_ADVERTISE_ADDR: ${NODE3_ADVERTISE:-${QUMBRA_ADVERTISE_ADDR:-auto}}
     # /v1/telemetry (issue #117), published so `qumbra-opview` can be run from the
     # host: `qumbra-opview node0=http://127.0.0.1:9410 …`. Read-only, GET only,
     # bound to localhost on the host side — nothing here is reachable off-machine.

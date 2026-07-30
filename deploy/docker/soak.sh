@@ -27,6 +27,18 @@
 #   soak.sh netem-show                 the qdisc + the measured RTT matrix
 #   soak.sh netem-clear                remove it, and prove it is gone
 #
+# ADVERTISED-ADDRESS MODE (issue #107 step 1c). Set on the compose service, read
+# back from the running containers:
+#
+#   QUMBRA_ADVERTISE_ADDR=none soak.sh rehearsal   bring the net up with NO node
+#                                      advertising itself — the four T0 hosts' own
+#                                      configuration. Default (unset) = advertised,
+#                                      i.e. every run before 2026-07-30.
+#   soak.sh advertise-show [auto|none] which mode each node is ACTUALLY in, read from
+#                                      the generated node.toml inside each container
+#                                      and from the node's own startup output. With
+#                                      an argument it asserts and dies on a mismatch.
+#
 # HALT-HEIGHT UPGRADE DRILL (issue #74). Run in order; each prints its own
 # assertions and STOPS on a violation. H = 16 (on the cadence grid of 8).
 #
@@ -65,6 +77,28 @@
 #   * `netem` therefore answers "is this effect latency-SHAPED", not "does this match
 #     the T0 net". A negative result under netem rules out delay-as-such; it does not
 #     rule out the WAN.
+#
+# CONFIGURATION FIDELITY: the harness can now model a node with NO advertised
+# address, which until 2026-07-30 it could not. This is not a convenience knob.
+# `entrypoint.sh` has always written `advertise_addr`, while /opt/qumbra/node.toml on
+# all four T0 hosts has never carried it — the field arrived with issue #86 on
+# 2026-07-28, the hosts were provisioned 2026-07-26, and rolling the image does not
+# regenerate node.toml. So every local run was structurally incapable of reproducing
+# a T0 condition that depends on the field being absent, and issue #107's first two
+# local negatives could not have been anything else. What is true now:
+#
+#   * A default run (`auto`) has every node advertising itself dialable. That is a
+#     LOCAL configuration; do not present its numbers as the hosts' behaviour.
+#   * `QUMBRA_ADVERTISE_ADDR=none` is the hosts' configuration on this axis, and only
+#     on this axis. The hosts still differ in kernel, arch, RTT, tip height and
+#     uptime, so `none` narrows the gap rather than closing it.
+#   * A node with no `advertise_addr` still dials out, syncs, mines and votes; it is
+#     never GOSSIPED, so nobody learns it who was not configured with it. On this
+#     full-mesh net every node is a configured seed of every other, which is why the
+#     mesh still forms in `none` mode — and why `dialable=`/`peers=` are the fields to
+#     watch when comparing the two modes.
+#   * State the mode with the numbers, every time. Two runs of this harness that
+#     differ only here are two different experiments.
 
 set -euo pipefail
 
@@ -205,6 +239,86 @@ netem_report() {   # netem_report <d0,d1,d2,d3|""> <label>
    netem produces a clean, confident answer that means nothing. STOP."
   echo "   ✓ every node's qdisc matches what was requested"
   netem_rtt_matrix
+}
+
+# ── advertised-address mode (issue #107 step 1c) ─────────────────────────────
+#
+# Which mode a node is in is NOT read from the environment of whoever runs this
+# script — that would only prove what was requested. It is read back from the running
+# container, two independent ways, the same discipline the netem commands use:
+#
+#   (1) the generated /tmp/node.toml: does an `advertise_addr =` key exist at all
+#   (2) the node's OWN startup output: the binary prints "no advertise_addr: ..."
+#       (qumbra-node/src/run.rs) when the field is missing, so mode `none` is
+#       confirmed by the code under test rather than by the file we wrote for it
+#
+# A disagreement between (1) and (2) means the running process is not using the
+# config file we are reading, which is a reason to stop rather than to interpret.
+advertise_mode_of() {
+  local n="$1" toml=""
+  # `|| true`: a stopped node makes exec fail, which would abort under pipefail.
+  toml="$(dc exec -T "$n" sh -c 'grep -c "^advertise_addr[[:space:]]*=" /tmp/node.toml || true' 2>/dev/null | tr -d '\r' | tail -1)"
+  case "$toml" in
+    0) echo none ;;
+    ''|*[!0-9]*) echo unknown ;;
+    *) echo auto ;;
+  esac
+}
+
+# Did the node itself say it has no advertised address? (Absence of this line is only
+# evidence when the node has produced output at all, so report the two apart.)
+#
+# `grep -c`, never `grep -q`, and the reason is not style: -q exits on the FIRST match,
+# which SIGPIPEs `docker compose logs`, and under `set -o pipefail` the pipeline then
+# reports 141 — so a matched line reads as "no match" whenever the log is long enough
+# that the writer is still going. That inverts this answer on exactly the nodes that
+# have been running longest, and it is a race, so it passes on a short log.
+advertise_node_said_none() {
+  local hits
+  hits="$(dc logs --no-log-prefix "$1" 2>/dev/null | grep -c '^no advertise_addr:' || true)"
+  [[ "${hits:-0}" -gt 0 ]] && echo yes || echo no
+}
+
+# Print each node's mode; with an expected mode, assert it. Fatal on a disagreement
+# between the two readbacks (always) or on a mode that is not the expected one; a
+# node that is simply down is reported, not fatal — the partition and committee
+# scenarios stop nodes on purpose.
+advertise_show() {
+  local want="${1:-}" n mode said inconsistent=0 wrong=0 down=0 line dial prs
+  echo "   -- advertised-address mode, read back per container --"
+  for n in "${NODES[@]}"; do
+    mode="$(advertise_mode_of "$n")"
+    said="$(advertise_node_said_none "$n")"
+    line="$(latest "$n")"
+    dial="$(field "$line" dialable)"; prs="$(field "$line" peers)"
+    printf '     %-6s node.toml=%-7s binary-said-none=%-3s dialable=%-5s peers=%s\n' \
+      "$n" "$mode" "$said" "${dial:-?}" "${prs:-?}"
+    if [[ "$mode" == unknown ]]; then
+      echo "     ^ $n did not answer (down, or no /tmp/node.toml) — mode unread"
+      down=1
+    elif [[ "$mode" == none && "$said" == no ]]; then
+      echo "     ^ $n has no advertise_addr in its config but never printed the"
+      echo "       'no advertise_addr' line — the process may not be using this file."
+      inconsistent=1
+    elif [[ "$mode" == auto && "$said" == yes ]]; then
+      echo "     ^ $n HAS an advertise_addr but printed 'no advertise_addr' — same"
+      echo "       problem from the other direction."
+      inconsistent=1
+    fi
+    if [[ -n "$want" && "$mode" != unknown && "$mode" != "$want" ]]; then
+      echo "     ^ $n is in mode '$mode', expected '$want'"; wrong=1
+    fi
+  done
+  (( inconsistent )) && die "a node's config file and its own output disagree about the
+   advertised address. The running process may not be reading the file this check
+   reads. STOP — do not attribute this run to either condition."
+  (( wrong )) && die "advertised-address mode is not '$want' on every node — do not
+   attribute this run to either condition until that is resolved."
+  if [[ -n "$want" ]]; then
+    (( down )) && { echo "   (partial) every node that answered is in mode '$want'"; return 0; }
+    echo "   ✓ every node is in advertise mode '$want'"
+  fi
+  return 0
 }
 
 # Wait until a node's tip reaches at least H (or timeout secs). Returns 0/1.
@@ -464,10 +578,22 @@ case "$cmd" in
     [[ "$got" == "$PINNED_GENESIS" ]] \
       || die "GENESIS HASH MISMATCH — in-container genesis is not the frozen T0 genesis. STOP."
     echo "   ✓ in-container genesis == pinned T0 genesis (8811d4e0…3cff)"
+    # Which advertised-address condition this net came up in, in the net's own output
+    # (issue #107 step 1c). Asserted when the caller named a mode, printed either way:
+    # a per-node NODE<i>_ADVERTISE override means the global env is not authoritative,
+    # so the readback is, and it is what gets printed.
+    advertise_show "${QUMBRA_ADVERTISE_ADDR:-}" || true
     echo "   nodes up; watch blocks with: $0 sample 200"
     ;;
 
   status)  snapshot ;;
+
+  advertise-show)
+    want="${1:-}"
+    [[ -z "$want" || "$want" == auto || "$want" == none ]] \
+      || die "advertise-show takes 'auto', 'none', or nothing (got '$want')"
+    advertise_show "$want"
+    ;;
 
   sample)
     secs="${1:-180}"; ivl="${2:-30}"; waited=0

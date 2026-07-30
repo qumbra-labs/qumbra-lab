@@ -69,6 +69,43 @@ pgrep -f qlab_bench     # must print nothing
   even if they shared a genesis. Crossing that on a running net is the halt-height
   mechanism's job (#74), not a redeploy.
 
+## Advertised-address mode (issue #107 step 1c)
+
+The harness can model **a node with no advertised address**, which until 2026-07-30
+it could not — and that gap was not cosmetic. `entrypoint.sh` has always written
+`advertise_addr`; `/opt/qumbra/node.toml` on all four T0 hosts has **never** carried
+it. The field arrived with issue [#86](https://github.com/lai3d/qumbra-lab/issues/86)
+on 2026-07-28, the hosts were provisioned 2026-07-26, and **rolling the image does
+not regenerate `node.toml`** (recorded as a dated correction in `qumbra-deploy`
+OPERATOR §3). So every local run before this one was structurally incapable of
+reproducing any T0 condition that depends on the field being absent.
+
+```sh
+QUMBRA_ADVERTISE_ADDR=none deploy/docker/soak.sh rehearsal   # the hosts' configuration
+deploy/docker/soak.sh rehearsal                              # default: advertised
+NODE2_ADVERTISE=none deploy/docker/soak.sh rehearsal          # mixed net, per node
+deploy/docker/soak.sh advertise-show          # which mode each node is ACTUALLY in
+deploy/docker/soak.sh advertise-show none     # …and assert it; dies on a mismatch
+```
+
+- **`auto` (default)** — `advertise_addr = "node<i>:9401"`. Unchanged behaviour;
+  an ordinary soak is byte-for-byte what it was.
+- **`none`** — the key is **absent** from the generated `node.toml`, not empty and
+  not commented-into-a-parsed-value. The node still dials out, syncs, mines and
+  votes; it is simply **never gossiped** (`entrypoint.sh`'s own note, and
+  `qumbra-node`'s startup line `no advertise_addr: …`).
+- Anything else is a **hard failure** at startup, not a silent fallback to `auto` —
+  a typo in this variable inverts the experiment.
+- `advertise-show` does **not** read the operator's environment (that would only
+  prove what was *requested*). It reads the generated `node.toml` from inside each
+  running container **and** the node's own startup output, and treats a disagreement
+  between the two as a stop rather than something to interpret.
+
+`none` is the hosts' configuration **on this axis only**. The hosts still differ in
+kernel, architecture, RTT, tip height and uptime, so it narrows the gap rather than
+closing it. State the mode alongside any number this harness produces: two runs that
+differ only here are two different experiments.
+
 ## Observability
 
 `qumbra-node run` emits a `TELEMETRY …` line to stdout on a ~30 s cadence (tip,
