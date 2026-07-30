@@ -59,9 +59,15 @@
 //! So maturity is now **structural**, enforced by the commitment tree's shape:
 //! [`crate::coinbase::matures_coinbase_minted_at`] delays the coinbase leaf's
 //! append by 144 blocks, so until it matures **no valid anchor contains the leaf**
-//! and an immature spend is *unprovable* rather than refused-by-policy. There is
-//! nothing to declare, so nothing to lie about, and the rule binds a submitter
-//! who lies, a peer that bypasses this mempool, and a node that just restarted.
+//! and an immature spend has no witness against one, so no spend of it verifies.
+//! There is nothing to declare, so nothing to lie about, and the rule binds a
+//! submitter who lies, a peer that bypasses this mempool, and a node that just
+//! restarted.
+//!
+//! Note the precise claim: **not** "an immature spend is unprovable" — an attacker
+//! can prove a true statement about a tree of their own making, and the production
+//! verifier accepts it. Their anchor is what is false, and anchors are consensus
+//! state. See `matures_coinbase_minted_at` and the forged-anchor test it names.
 //!
 //! `COINBASE_MATURITY_BLOCKS` is unchanged at 144 and means the same thing; only
 //! the place it is enforced moved. A holder asking *why* a note has no witness

@@ -2,7 +2,7 @@
 //!
 //! Option (b) enforces the frozen §2 maturity delay structurally — a block appends
 //! the coinbase leaf minted 144 blocks earlier, so until a coinbase matures no anchor
-//! contains its leaf and an immature spend is *unprovable* rather than refused. That
+//! contains its leaf and an immature spend has no witness against one. That
 //! moves a rule out of `Mempool::admit` and into the state transition, which buys
 //! real enforcement and takes on a real risk: **the tree now depends on a block other
 //! than the one being applied.**

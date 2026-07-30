@@ -189,8 +189,8 @@ pub enum RejectReason {
     /// The proof failed to verify under the injected verifier.
     ProofInvalid,
     // NOTE (issue #102): `ImmatureCoinbase` is gone. Maturity is enforced by the
-    // commitment tree's append schedule, so an immature spend is unprovable rather
-    // than refused — it cannot reach a refusal reason at all. A wallet that wants
+    // commitment tree's append schedule, so an immature spend has no witness against
+    // any acceptable anchor and cannot reach a refusal reason at all. A wallet that wants
     // to know *why* a coinbase note has no witness yet asks
     // [`NodeRpc::coinbase_maturity`], which answers from public chain facts.
 }

@@ -361,10 +361,13 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // fires when the spender chooses to let it — and, worse, a gate whose
         // honest use publishes "this tx spends that coinbase", collapsing the
         // anonymity set on a chain with no transparent tier. Appending the leaf
-        // late instead makes an immature spend **unprovable**: the leaf is in no
-        // anchor, so there is no membership witness to prove against. Nothing is
-        // declared, so nothing can be lied about, and the rule holds identically
-        // on the P2P path and on a node that has just restarted.
+        // late instead means an immature spend has **no witness against any anchor
+        // this chain accepts**: the leaf is in no root the node ever computed. Nothing
+        // is declared, so nothing can be lied about, and the rule holds identically on
+        // the P2P path and on a node that has just restarted.
+        //
+        // Not "unprovable" — an attacker can prove membership in a tree of their own;
+        // what fails is the anchor, at `validate_body`. See `crate::coinbase`.
         //
         // *Why it is derived and not queued.* A leaf owed at `h + 144` is the
         // obvious candidate for a pending-insert map, and that would be a bug.

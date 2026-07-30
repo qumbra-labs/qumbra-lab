@@ -182,16 +182,30 @@ pub fn coinbase_note_leaf(height: u64, body: &BlockBody) -> Option<Hash32> {
 /// declaration, which was bypassable three separate ways (an honest-but-silent
 /// `vec![]`, the hardcoded `vec![]` on the P2P path, and an in-memory registry
 /// that is empty after every restart). None of those is a hole any more, because
-/// there is nothing left to declare: an immature coinbase note **has no leaf**,
-/// therefore no membership witness, therefore no provable spend. `unprovable`
-/// beats `refused-by-policy` because it holds against a submitter who lies, a
-/// peer who bypasses the mempool, and a node that just restarted.
+/// there is nothing left to declare: an immature coinbase note **has no leaf in
+/// any anchor this chain will accept**, therefore no membership witness against
+/// one, therefore no spend that verifies. That beats `refused-by-policy` because it
+/// holds against a submitter who lies, a peer that bypasses the mempool, and a node
+/// that just restarted — none of which is being asked anything.
 ///
-/// Every consumer of the schedule calls this rather than restating `height − 144`
-/// — [`crate::node::Node::apply_state`] to append, and
-/// [`crate::rpc::NodeRpc`]'s anchor reconstruction to count. Two independent
-/// restatements of a *sliding* rule is exactly the shape issue #116 was filed
-/// about, and it is worse than two restatements of a fixed one.
+/// **Stated that way on purpose, because the short version is false.** "An immature
+/// spend is unprovable" is not true in general: an attacker can append the leaf to a
+/// tree of their own, take a genuine witness against it, and produce a perfectly
+/// valid proof of a true statement about *that* tree — and the production verifier
+/// accepts it. `qumbra-node`'s
+/// `a_forged_anchor_carrying_a_real_proof_is_rejected_at_the_block_path` does exactly
+/// this and asserts the acceptance. What is actually true is narrower and stronger:
+/// **their proof is fine and their anchor is the lie**, and the anchor is checked by
+/// `validate_body` on every block from every peer, with no mempool involved. Anyone
+/// reading "unprovable rather than refused-by-policy" anywhere in this tree should
+/// read that test — it is the difference between the slogan and the property.
+///
+/// Every consumer of the schedule calls this rather than restating `height − 144`:
+/// [`crate::node::Node::apply_state`] to append, [`crate::rpc::NodeRpc`]'s anchor
+/// reconstruction to count, and `qumbra_faucet::NodeView`'s to do the same for a
+/// node that composes no RPC. That third one was a live off-by-144 until the full
+/// suite caught it — restating a *sliding* rule is the shape issue #116 was filed
+/// about, and #116 named only the first two because it was written about the RPC.
 pub fn matures_coinbase_minted_at(height: u64) -> Option<u64> {
     height.checked_sub(crate::emission::COINBASE_MATURITY_BLOCKS)
 }

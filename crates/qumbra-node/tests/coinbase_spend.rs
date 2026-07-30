@@ -344,7 +344,16 @@ fn only_the_payout_key_derives_the_minted_note() {
     assert!(tree.position_of(&wrong_d).is_none());
 }
 
-/// 🔴 **THE #102 CLAIM: an immature coinbase spend is *unprovable*, not refused.**
+/// 🔴 **THE #102 CLAIM: an immature coinbase spend has no witness against any anchor
+/// this chain accepts — it is not merely refused.**
+///
+/// The name says "unprovable" and that word is imprecise on purpose-of-brevity, so
+/// the limit is stated here: an attacker *can* prove a true statement about a tree of
+/// their own making, and the production verifier accepts it. See
+/// [`a_forged_anchor_carrying_a_real_proof_is_rejected_at_the_block_path`], which
+/// asserts that acceptance and then shows the block rejected anyway. What this test
+/// establishes is the other half — that against the real chain there is nothing to
+/// build a witness from.
 ///
 /// This is the test that distinguishes "we moved the policy" from "it is now
 /// consensus", and it replaces `the_maturity_depth_is_enforced_on_the_real_note`,
