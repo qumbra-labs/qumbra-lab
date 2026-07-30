@@ -6,10 +6,11 @@
 //! qumbra-opview --endpoints ./nodes.txt --timeout-ms 5000
 //! ```
 //!
-//! Exit codes: `0` = no `fid` divergence (including when nodes are down or an
-//! `sid` split was found), `2` = 🔴 `fid` divergence, `1` = bad usage. Only the
-//! STOP is non-zero — an operator wiring this into an alert must not be paged
-//! because a node is down or because a routine signed-variant split was recorded.
+//! Exit codes: `0` = no critical divergence (including when nodes are down or an
+//! `sid` split was found), `2` = 🔴 `fid` or exact supply divergence, `1` = bad
+//! usage. Only a STOP-grade finding is non-zero — an operator wiring this into an
+//! alert must not be paged because a node is down or because a routine
+//! signed-variant split was recorded.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -19,7 +20,7 @@ use qumbra_opview::poll::{poll_all, Endpoint, PollOptions, DEFAULT_TIMEOUT};
 use qumbra_opview::render;
 
 const USAGE: &str = "\
-qumbra-opview — T0 operator view: cross-node checkpoint agreement (issue #117)
+qumbra-opview — read-only chain health + supply attestation (issues #117/#121)
 
 USAGE:
     qumbra-opview [OPTIONS] <ENDPOINT>...
@@ -35,13 +36,13 @@ OPTIONS:
     -h, --help           this text
 
 EXIT:
-    0  no fid divergence (nodes may be down; an sid split is a finding, not a stop)
-    2  fid divergence — two checkpoints finalized at one height (R2 STOP)
+    0  no critical divergence (nodes may be down; an sid split is a finding)
+    2  fid divergence (R2 STOP) or non-zero scheduled-supply divergence
     1  usage error
 
-This is the T0 operator view over YOUR OWN nodes. It is not a transaction
-explorer, and `these N nodes agree` is not the same claim as `the chain is
-healthy` on any net where the list is not the whole network.
+This view exposes only public chain facts. It deliberately has no address,
+balance, or traceable-transfer pages because Qumbra has no transparent tier.
+`These N nodes agree` is not the same claim as `the whole network agrees`.
 ";
 
 fn main() -> ExitCode {
@@ -97,5 +98,6 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     let readings = poll_all(&endpoints, PollOptions { timeout });
     let agreement = Agreement::of(&readings);
     print!("{}", render::view(&readings, &agreement));
-    Ok(ExitCode::from(agreement.exit_code() as u8))
+    let critical = agreement.exit_code() != 0 || render::supply_diverged(&readings);
+    Ok(ExitCode::from(if critical { 2 } else { 0 }))
 }

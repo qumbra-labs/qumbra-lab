@@ -13,23 +13,23 @@
 use crate::agree::{Agreement, IdGroup, SignedVerdict, Verdict};
 use crate::poll::{NodeReading, Reading};
 
-use qlab_node::telemetry::LOCAL_COMMITMENT_SPLIT;
+use qlab_node::telemetry::{SupplyCoverage, LOCAL_COMMITMENT_SPLIT};
 
 /// Render the per-node table.
 pub fn table(readings: &[NodeReading]) -> String {
     let label_w = readings.iter().map(|r| r.endpoint.label.len()).max().unwrap_or(4).max(4);
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<label_w$}  {:>8} {:>8} {:>13} {:>9} {:>6} {:>6} {:>5} {:>5} {:>10} {:>8} {:>13}\n",
-        "NODE", "TIP", "FINAL", "FID", "REGIME", "STALL", "AGE_S", "PEERS", "EPOCH", "DIFF",
-        "SSLOT", "SID",
+        "{:<label_w$}  {:>8} {:>8} {:>13} {:>9} {:>6} {:>6} {:>5} {:>5} {:>6} {:>6} {:>6} {:>10} {:>8} {:>13}\n",
+        "NODE", "TIP", "FINAL", "FID", "REGIME", "STALL", "AGE_S", "PEERS", "EPOCH", "C_SIZE",
+        "C_ACT", "C_QRM", "DIFF", "SSLOT", "SID",
     ));
     for r in readings {
         match &r.reading {
             Reading::Ok(t) => {
                 let regime = format!("{:?}", t.finality_status);
                 out.push_str(&format!(
-                    "{:<label_w$}  {:>8} {:>8} {:>13} {:>9} {:>6} {:>6} {:>5} {:>5} {:>10} {:>8} {:>13}\n",
+                    "{:<label_w$}  {:>8} {:>8} {:>13} {:>9} {:>6} {:>6} {:>5} {:>5} {:>6} {:>6} {:>6} {:>10} {:>8} {:>13}\n",
                     r.endpoint.label,
                     t.tip_height,
                     t.finalized_height.map(|h| h.to_string()).unwrap_or_else(|| "-".into()),
@@ -42,6 +42,9 @@ pub fn table(readings: &[NodeReading]) -> String {
                     t.age_field(),
                     t.peer_count,
                     t.epoch,
+                    t.committee_size,
+                    t.committee_active,
+                    t.committee_quorum,
                     t.diff_field(),
                     t.sslot_field(),
                     t.sid_field(),
@@ -58,6 +61,99 @@ pub fn table(readings: &[NodeReading]) -> String {
                 ));
             }
         }
+    }
+    out
+}
+
+/// Whether any reachable node with complete state coverage reports an exact
+/// scheduled-issuance mismatch.
+///
+/// A partial state ledger is unavailable, not divergent: the operator may infer
+/// neither supply agreement nor a supply violation until it catches fork choice.
+pub fn supply_diverged(readings: &[NodeReading]) -> bool {
+    readings.iter().any(|reading| {
+        reading
+            .reading
+            .telemetry()
+            .is_some_and(|t| {
+                t.supply_coverage() == SupplyCoverage::Complete
+                    && t.supply.iter().any(|row| !row.agrees())
+            })
+    })
+}
+
+/// Render the scheduled-issuance attestation carried by each reachable node.
+///
+/// Fees are a separate column because they are transfers and `body.coinbase`
+/// already excludes them. Pass/fail is the exact integer `DIV_BSL == 0`; the
+/// relative column is context for humans, never a floating-point tolerance.
+pub fn supply(readings: &[NodeReading]) -> String {
+    let label_w = readings
+        .iter()
+        .map(|r| r.endpoint.label.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let mut out = String::from(
+        "\nsupply attestation: scheduled body.coinbase; fees are transfers and are not subtracted; tolerance=0 bessel\n",
+    );
+    out.push_str(&format!(
+        "{:<label_w$}  {:>7} {:>17} {:>20} {:>20} {:>14} {:>11} {:>14} {:>8}\n",
+        "NODE", "EPOCH", "HEIGHTS", "MEASURED_BSL", "EXPECTED_BSL", "DIV_BSL", "RELATIVE",
+        "FEES_BSL", "STATUS",
+    ));
+    let mut rows = 0usize;
+    let mut unavailable = 0usize;
+    for reading in readings {
+        let Reading::Ok(t) = &reading.reading else {
+            continue;
+        };
+        if let SupplyCoverage::Unavailable {
+            state_tip,
+            fork_choice_tip,
+        } = t.supply_coverage()
+        {
+            unavailable += 1;
+            let state_tip = state_tip.map(|h| h.to_string()).unwrap_or_else(|| "-".to_string());
+            out.push_str(&format!(
+                "{:<label_w$}  UNAVAILABLE — state ledger tip {} does not match fork-choice tip {}; refusing partial supply figures\n",
+                reading.endpoint.label, state_tip, fork_choice_tip,
+            ));
+            continue;
+        }
+        for row in &t.supply {
+            rows += 1;
+            let relative = if row.relative_divergence().is_finite() {
+                format!("{:+.3e}", row.relative_divergence())
+            } else {
+                "+inf".to_string()
+            };
+            out.push_str(&format!(
+                "{:<label_w$}  {:>7} {:>17} {:>20} {:>20} {:>+14} {:>11} {:>14} {:>8}\n",
+                reading.endpoint.label,
+                row.epoch,
+                format!("{}..={}", row.start_height, row.end_height),
+                row.measured_coinbase,
+                row.expected_coinbase,
+                row.divergence_bessel(),
+                relative,
+                row.fees,
+                if row.agrees() { "AGREED" } else { "DIVERGED" },
+            ));
+        }
+    }
+    if rows == 0 && unavailable == 0 {
+        out.push_str("no reachable node reported a supply epoch\n");
+    }
+    if unavailable != 0 {
+        out.push_str(
+            "An unavailable supply view means the state ledger is behind or otherwise disagrees with fork choice; conclude neither supply agreement nor a supply violation until the tips match.\n",
+        );
+    }
+    if supply_diverged(readings) {
+        out.push_str(
+            "🔴 A non-zero divergence means a canonical block committed scheduled issuance outside the frozen curve; first preserve the node data and identify the first divergent epoch/block before restarting or rolling.\n",
+        );
     }
     out
 }
@@ -176,7 +272,7 @@ pub fn verdicts(a: &Agreement) -> String {
 
 /// The whole view: table, then verdicts.
 pub fn view(readings: &[NodeReading], a: &Agreement) -> String {
-    format!("{}{}", table(readings), verdicts(a))
+    format!("{}{}{}", table(readings), supply(readings), verdicts(a))
 }
 
 #[cfg(test)]
@@ -184,13 +280,23 @@ mod tests {
     use super::*;
     use crate::poll::Endpoint;
     use qlab_node::telemetry::LocalCommitment;
-    use qlab_node::Telemetry;
+    use qlab_node::{SupplyEpoch, Telemetry};
     use std::time::Duration;
 
-    fn t(fin: Option<u64>, fid: Option<u64>, signed: Option<(u64, Option<u64>)>) -> Telemetry {
-        Telemetry::assemble(3800, fin, 75, 0, 3, 0, 16)
+    fn t_at(
+        tip: u64,
+        fin: Option<u64>,
+        fid: Option<u64>,
+        signed: Option<(u64, Option<u64>)>,
+    ) -> Telemetry {
+        Telemetry::assemble(tip, fin, 75, 0, 3, 0, 16)
+            .with_committee(21, 19, 15)
             .with_checkpoint(fid, signed.map(|(slot, id)| LocalCommitment { slot, id }))
             .with_tip_difficulty(Some(1_048_576))
+    }
+
+    fn t(fin: Option<u64>, fid: Option<u64>, signed: Option<(u64, Option<u64>)>) -> Telemetry {
+        t_at(3800, fin, fid, signed)
     }
 
     fn ok(label: &str, tel: Telemetry) -> NodeReading {
@@ -295,5 +401,96 @@ mod tests {
         assert!(text.contains("signed variant (sslot/sid): AGREED"), "{text}");
         assert!(text.contains("010203040506"), "{text}");
         assert!(text.contains("1048576"), "difficulty renders:\n{text}");
+        assert!(text.contains("C_SIZE"), "committee header renders:\n{text}");
+        assert!(text.contains("    21     19     15"), "committee aggregates render:\n{text}");
+    }
+
+    /// **Acceptance (#121): the public view has no per-signer participation
+    /// family.** Aggregates are useful; a roster availability map is an attacker's
+    /// checklist. Keep the exact private metric/journal tokens out so a future
+    /// well-meaning renderer addition breaks this test.
+    #[test]
+    fn public_view_cannot_render_per_signer_participation() {
+        let readings =
+            vec![ok("node0", t(Some(384), Some(0x0102_0304_0506), Some((384, Some(0x0102_0304_0506)))))];
+        let text = view(&readings, &Agreement::of(&readings));
+        for forbidden in [
+            "qumbra_committee_signed",
+            "qumbra_committee_absent",
+            "voted=",
+            "absent=",
+        ] {
+            assert!(!text.contains(forbidden), "public view leaked `{forbidden}`:\n{text}");
+        }
+    }
+
+    /// The rendered view carries both halves of the supply acceptance: an honest
+    /// epoch passes at exact zero, while a one-bessel error is visibly divergent
+    /// and produces an operator action.
+    #[test]
+    fn supply_view_distinguishes_exact_match_from_one_bessel_error() {
+        let honest = SupplyEpoch {
+            epoch: 0,
+            start_height: 0,
+            end_height: 1151,
+            measured_coinbase: 5_000_000_000,
+            expected_coinbase: 5_000_000_000,
+            fees: 456,
+        };
+        let wrong = SupplyEpoch {
+            epoch: 1,
+            start_height: 1152,
+            end_height: 2303,
+            measured_coinbase: 4_000_000_001,
+            expected_coinbase: 4_000_000_000,
+            fees: 789,
+        };
+        let readings = vec![ok(
+            "node0",
+            t_at(2303, Some(2303), Some(0x0102_0304_0506), None)
+                .with_supply(vec![honest, wrong]),
+        )];
+        let text = view(&readings, &Agreement::of(&readings));
+        assert!(text.contains("tolerance=0 bessel"), "{text}");
+        assert!(text.contains("          +0"), "honest absolute divergence:\n{text}");
+        assert!(text.contains("          +1"), "wrong absolute divergence:\n{text}");
+        assert!(text.contains("DIVERGED"), "{text}");
+        assert!(text.contains("first preserve the node data"), "{text}");
+        assert!(supply_diverged(&readings));
+    }
+
+    /// Issue #130: the state machine can permanently trail fork choice because
+    /// historical bodies are not transferred. A partial row is not rendered as
+    /// `AGREED` (and cannot trigger the divergence exit); the operator gets one
+    /// explicit refusal and the only conclusion the evidence supports.
+    #[test]
+    fn supply_view_refuses_when_state_machine_lags_fork_choice() {
+        let partial = SupplyEpoch {
+            epoch: 0,
+            start_height: 0,
+            end_height: 4,
+            measured_coinbase: 123_456_789,
+            expected_coinbase: 123_456_789,
+            fees: 17,
+        };
+        let readings = vec![ok(
+            "late-joiner",
+            t_at(14, Some(8), Some(0x0102_0304_0506), None).with_supply(vec![partial]),
+        )];
+
+        let text = supply(&readings);
+        assert!(
+            text.contains(
+                "late-joiner  UNAVAILABLE — state ledger tip 4 does not match fork-choice tip 14"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("conclude neither supply agreement nor a supply violation"),
+            "{text}"
+        );
+        assert!(!text.contains("123456789"), "partial figures must not render:\n{text}");
+        assert!(!text.contains("AGREED"), "partial coverage must not claim agreement:\n{text}");
+        assert!(!supply_diverged(&readings), "unavailable is not a supply violation");
     }
 }

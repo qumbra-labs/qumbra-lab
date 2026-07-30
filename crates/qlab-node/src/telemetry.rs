@@ -41,15 +41,18 @@
 //!
 //! Appending them is a breaking change on a reject-unknown-version wire — that is
 //! deliberate (§0: a truncated or stale read fails loudly instead of misparsing),
-//! and it is why [`RPC_VERSION`] went `0x01` → `0x02`. An old reader is *supposed*
-//! to fail against a new node.
+//! and it is why [`RPC_VERSION`] went `0x01` → `0x02`. Issue #121 adds only the
+//! publishable committee aggregates (never signer identities) and the supply
+//! attestation, moving the wire to `0x03`. An old reader is *supposed* to fail
+//! against a new node.
 
-use qlab_cbserver::codec::CodecError;
+use qlab_cbserver::codec::{write_varint, CodecError};
 use qlab_devnet::committee::checkpoint_id_hex;
 use qlab_devnet::ebbflow::FinalityStatus;
 use qlab_devnet::halt::regime as halt_regime;
 
 use crate::rpc::{Reader, RPC_VERSION};
+use crate::supply::SupplyEpoch;
 
 /// Wire discriminant for [`FinalityStatus::Final`].
 const STATUS_FINAL: u8 = 0;
@@ -100,6 +103,24 @@ impl LocalCommitment {
     }
 }
 
+/// Whether the supply ledger covers the same tip as fork choice.
+///
+/// The supply rows are derived from bodies the state machine has applied, while
+/// [`Telemetry::tip_height`] is fork choice. Issue #130 established that those
+/// views can disagree permanently on a late joiner. A partial ledger must
+/// therefore be rendered as unavailable, never as supply agreement or a supply
+/// violation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupplyCoverage {
+    /// The last applied supply row reaches the fork-choice tip.
+    Complete,
+    /// The views disagree, or this composition supplied no ledger rows.
+    Unavailable {
+        state_tip: Option<u64>,
+        fork_choice_tip: u64,
+    },
+}
+
 /// A single observability snapshot of a node's finality health.
 ///
 /// `stall_depth` and `last_finalized_age_secs` are the two the runbook keys on:
@@ -134,6 +155,23 @@ pub struct Telemetry {
     pub mempool_size: u64,
     /// Current committee epoch (injected from the P2P/committee layer).
     pub epoch: u64,
+    /// Roster size of the current committee.
+    ///
+    /// This is deliberately an aggregate. Per-signer participation belongs on the
+    /// operator's loopback `/metrics` and in the `ROUND` journal, never on this
+    /// public wire (issue #121).
+    pub committee_size: u64,
+    /// Active committee members (roster minus tombstoned/jailed).
+    pub committee_active: u64,
+    /// Quorum threshold currently in force, read from committee state.
+    pub committee_quorum: u64,
+    /// Scheduled-issuance attestation grouped by epoch, from genesis through the
+    /// state machine's applied tip. Each row compares integer bessel at zero
+    /// tolerance.
+    ///
+    /// Consumers must use [`Self::supply_coverage`] before rendering or acting on
+    /// these rows: the state tip may trail the fork-choice `tip_height`.
+    pub supply: Vec<SupplyEpoch>,
     /// **The identity of the finalized checkpoint** (`fid`, issue #117), or `None`
     /// when nothing is finalized *or* when the composition serving this snapshot
     /// does not carry a committee finality tracker to read it from.
@@ -216,9 +254,54 @@ impl Telemetry {
             peer_count,
             mempool_size,
             epoch,
+            committee_size: 0,
+            committee_active: 0,
+            committee_quorum: 0,
+            supply: Vec::new(),
             finalized_id: None,
             signed: None,
             tip_difficulty: None,
+        }
+    }
+
+    /// Stamp in the public committee aggregates (issue #121).
+    ///
+    /// There is intentionally no signer list in this type, so neither the wire nor
+    /// any consumer can accidentally turn it into an availability map.
+    pub fn with_committee(
+        mut self,
+        committee_size: u64,
+        committee_active: u64,
+        committee_quorum: u64,
+    ) -> Self {
+        self.committee_size = committee_size;
+        self.committee_active = committee_active;
+        self.committee_quorum = committee_quorum;
+        self
+    }
+
+    /// Stamp in the public per-epoch supply attestation (issue #121).
+    pub fn with_supply(mut self, supply: Vec<SupplyEpoch>) -> Self {
+        self.supply = supply;
+        self
+    }
+
+    /// The one availability rule for supply figures.
+    ///
+    /// This mirrors [`Self::age_field`]'s refusal discipline: figures are
+    /// publishable only when the applied state ledger and fork choice name the
+    /// same tip height. The existing `0x03` payload already carries both heights
+    /// (`tip_height` and the last supply row's `end_height`), so this rule needs
+    /// no wire change.
+    pub fn supply_coverage(&self) -> SupplyCoverage {
+        let state_tip = self.supply.last().map(|row| row.end_height);
+        if state_tip == Some(self.tip_height) {
+            SupplyCoverage::Complete
+        } else {
+            SupplyCoverage::Unavailable {
+                state_tip,
+                fork_choice_tip: self.tip_height,
+            }
         }
     }
 
@@ -293,12 +376,15 @@ impl Telemetry {
         }
     }
 
-    /// `version(0x02) ‖ finality(u8) ‖ tip(8 LE) ‖ has_final(u8) ‖
+    /// `version(0x03) ‖ finality(u8) ‖ tip(8 LE) ‖ has_final(u8) ‖
     /// [final_height(8 LE) if has] ‖ stall_depth(8) ‖ age_secs(8) ‖
     /// peer_count(8) ‖ mempool_size(8) ‖ epoch(8) ‖`
     /// `has_fid(u8) ‖ [finalized_id(8 LE) if has] ‖ has_signed(u8) ‖`
     /// `[signed_slot(8 LE) ‖ has_signed_id(u8) ‖ [signed_id(8 LE) if has] if has] ‖`
-    /// `has_diff(u8) ‖ [tip_difficulty(8 LE) if has]`.
+    /// `has_diff(u8) ‖ [tip_difficulty(8 LE) if has] ‖`
+    /// `committee_size(8 LE) ‖ committee_active(8 LE) ‖ committee_quorum(8 LE) ‖`
+    /// `n_supply(varint) ‖ n × (epoch ‖ start_height ‖ end_height ‖`
+    /// `measured_coinbase ‖ expected_coinbase ‖ fees)` (all entry fields u64 LE).
     ///
     /// The `0x02` tail (issue #117) nests `sid` **inside** `sslot`'s presence, so
     /// "an identity with no slot" is not representable on the wire: a signed
@@ -357,6 +443,19 @@ impl Telemetry {
             }
             None => out.push(0),
         }
+        // ---- issue #121: publishable committee aggregates only --------------
+        out.extend_from_slice(&self.committee_size.to_le_bytes());
+        out.extend_from_slice(&self.committee_active.to_le_bytes());
+        out.extend_from_slice(&self.committee_quorum.to_le_bytes());
+        write_varint(&mut out, self.supply.len() as u64);
+        for row in &self.supply {
+            out.extend_from_slice(&row.epoch.to_le_bytes());
+            out.extend_from_slice(&row.start_height.to_le_bytes());
+            out.extend_from_slice(&row.end_height.to_le_bytes());
+            out.extend_from_slice(&row.measured_coinbase.to_le_bytes());
+            out.extend_from_slice(&row.expected_coinbase.to_le_bytes());
+            out.extend_from_slice(&row.fees.to_le_bytes());
+        }
         out
     }
 
@@ -389,6 +488,24 @@ impl Telemetry {
             None
         };
         let tip_difficulty = if r.u8()? == 1 { Some(r.u64()?) } else { None };
+        let committee_size = r.u64()?;
+        let committee_active = r.u64()?;
+        let committee_quorum = r.u64()?;
+        let n_supply = r.varint()?;
+        // Do not preallocate from an untrusted count. A truncated/malicious body
+        // fails on the first absent field without turning its varint into a memory
+        // allocation request.
+        let mut supply = Vec::new();
+        for _ in 0..n_supply {
+            supply.push(SupplyEpoch {
+                epoch: r.u64()?,
+                start_height: r.u64()?,
+                end_height: r.u64()?,
+                measured_coinbase: r.u64()?,
+                expected_coinbase: r.u64()?,
+                fees: r.u64()?,
+            });
+        }
         r.finish()?;
         Ok(Telemetry {
             finality_status,
@@ -399,6 +516,10 @@ impl Telemetry {
             peer_count,
             mempool_size,
             epoch,
+            committee_size,
+            committee_active,
+            committee_quorum,
+            supply,
             finalized_id,
             signed,
             tip_difficulty,
@@ -548,11 +669,11 @@ mod tests {
         out
     }
 
-    /// **Acceptance (#117): `Telemetry` round-trips at `0x02`** across every state
-    /// the identity half can be in — absent, present, and the `split` case where a
-    /// node's own keys are committed to two variants at one slot.
+    /// `Telemetry` keeps the #117 identity states intact at `0x03`: absent,
+    /// present, and the `split` case where a node's own keys are committed to two
+    /// variants at one slot.
     #[test]
-    fn telemetry_roundtrips_checkpoint_identity_at_0x02() {
+    fn telemetry_roundtrips_checkpoint_identity_at_0x03() {
         let base = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 2, MAX_LAG);
 
         // Nothing injected: the composition cannot see the identity. Fields render
@@ -564,7 +685,7 @@ mod tests {
         assert_eq!(base.sid_field(), "-");
         assert_eq!(Telemetry::from_bytes(&base.to_bytes()).unwrap(), base);
         assert_eq!(base.to_bytes()[0], RPC_VERSION);
-        assert_eq!(RPC_VERSION, 0x02, "the ratified bump");
+        assert_eq!(RPC_VERSION, 0x03, "the ratified issue #121 bump");
 
         // Fully populated: finalized identity + this node's own signed variant.
         let full = base
@@ -599,6 +720,63 @@ mod tests {
         );
     }
 
+    /// **Acceptance (#121): committee aggregates round-trip at `0x03`, while the
+    /// immediately preceding `0x02` wire is rejected on its version byte.**
+    #[test]
+    fn committee_aggregates_roundtrip_at_0x03_and_0x02_is_rejected() {
+        let t = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 3, MAX_LAG)
+            .with_committee(21, 19, 15)
+            .with_supply(vec![SupplyEpoch {
+                epoch: 3,
+                start_height: 3456,
+                end_height: 3776,
+                measured_coinbase: 1_234_567,
+                expected_coinbase: 1_234_567,
+                fees: 890,
+            }]);
+        let bytes = t.to_bytes();
+        assert_eq!(bytes[0], 0x03);
+        assert_eq!(Telemetry::from_bytes(&bytes).unwrap(), t);
+        assert_eq!(
+            (t.epoch, t.committee_size, t.committee_active, t.committee_quorum),
+            (3, 21, 19, 15),
+        );
+        assert_eq!(t.supply.len(), 1);
+        assert_eq!(t.supply[0].divergence_bessel(), 0);
+        assert_eq!(t.supply_coverage(), SupplyCoverage::Complete);
+
+        let mut old = bytes;
+        old[0] = 0x02;
+        assert!(matches!(
+            Telemetry::from_bytes(&old),
+            Err(CodecError::BadVersion { got: 2 })
+        ));
+    }
+
+    #[test]
+    fn supply_coverage_refuses_a_state_tip_behind_fork_choice_without_a_wire_change() {
+        let partial = Telemetry::assemble(14, Some(8), 75, 0, 3, 0, MAX_LAG)
+            .with_supply(vec![SupplyEpoch {
+                epoch: 0,
+                start_height: 0,
+                end_height: 4,
+                measured_coinbase: 123,
+                expected_coinbase: 123,
+                fees: 0,
+            }]);
+        assert_eq!(
+            partial.supply_coverage(),
+            SupplyCoverage::Unavailable {
+                state_tip: Some(4),
+                fork_choice_tip: 14,
+            }
+        );
+
+        let decoded = Telemetry::from_bytes(&partial.to_bytes()).unwrap();
+        assert_eq!(decoded.supply_coverage(), partial.supply_coverage());
+        assert_eq!(decoded.to_bytes()[0], 0x03, "coverage uses fields already on v3");
+    }
+
     /// **Acceptance (#117): a `0x01` payload is REJECTED, not best-effort parsed.**
     ///
     /// This is the property the version byte exists for. A stale reader against a
@@ -621,13 +799,13 @@ mod tests {
             "a 0x01 payload must be rejected on the version byte"
         );
 
-        // And the tail is not optional: a v2-stamped payload that stops where v1
-        // stopped is truncated, not "v2 with the identity absent".
+        // And the tail is not optional: a current-version-stamped payload that
+        // stops where v1 stopped is truncated, not "current with the tail absent".
         let mut stamped = old.clone();
         stamped[0] = RPC_VERSION;
         assert!(
             matches!(Telemetry::from_bytes(&stamped), Err(CodecError::Truncated { .. })),
-            "the identity tail is mandatory at 0x02"
+            "the versioned tails are mandatory at 0x03"
         );
     }
 }

@@ -40,13 +40,15 @@ use qlab_devnet::body::{TxEntry, TxVerifier};
 use qlab_devnet::committee::CommitteeState;
 use qlab_devnet::ebbflow::FinalityStatus;
 use qlab_devnet::node::SimConfig;
-use qlab_devnet::params_devnet::{CHECKPOINT_CADENCE_BLOCKS, DEGRADED_MODE_LAG_BLOCKS};
+use qlab_devnet::params_devnet::{
+    CHECKPOINT_CADENCE_BLOCKS, DEGRADED_MODE_LAG_BLOCKS, EPOCH_LENGTH_BLOCKS,
+};
 use qlab_devnet::pow::PowEngine;
 
 use qlab_node::metrics::{render as render_metrics, LiveGauges};
 use qlab_node::recovery::{Finalizer, FinalizerState};
 use qlab_node::round::ObsClock;
-use qlab_node::Telemetry;
+use qlab_node::{ChainStore, SupplyBlock, SupplyLedger, Telemetry};
 
 use crate::metrics_server::MetricsServer;
 use crate::telemetry_server::TelemetryServer;
@@ -82,9 +84,12 @@ const METRICS_REFRESH: Duration = Duration::from_secs(5);
 /// How often the `/v1/telemetry` snapshot is re-rendered (issue #117).
 ///
 /// Same argument as [`METRICS_REFRESH`], same number: the node — not whoever is
-/// polling it — decides how often it pays, and rendering is a handful of integer
-/// reads into ~90 bytes. The cost is bounded staleness of at most this interval,
-/// which against a FROZEN 75 s block time and a
+/// polling it — decides how often it pays. Issue #121 adds one 48-byte supply row
+/// per epoch: the ledger rebuilds from canonical stored bodies once at startup,
+/// then advances only over new heights. At the frozen one-day epoch this remains
+/// small daily payload growth rather than a per-block history or a repeated chain
+/// scan. The cost is bounded staleness of at most this interval, which against a
+/// FROZEN 75 s block time and a
 /// [`CHECKPOINT_CADENCE_BLOCKS`]-block checkpoint grid cannot change any answer
 /// the operator view gives: a finalized checkpoint is never reverted, so a node's
 /// `fid` at a given `finalized_height` reads the same whenever it is read, and a
@@ -133,6 +138,9 @@ pub enum RunError {
     /// The binary's halt-height release constants are not startable, or this
     /// binary must not resume past the halt this node already performed (#74).
     Release(ReleaseError),
+    /// Persisted canonical bodies could not be reduced to a contiguous supply
+    /// ledger. Starting without an audit basis would make the public view lie.
+    Supply(qlab_node::SupplyError),
 }
 
 impl std::fmt::Display for RunError {
@@ -143,6 +151,7 @@ impl std::fmt::Display for RunError {
             RunError::Node(e) => write!(f, "node: {e}"),
             RunError::Io(e) => write!(f, "io: {e}"),
             RunError::Release(e) => write!(f, "release: {e}"),
+            RunError::Supply(e) => write!(f, "supply attestation: {e:?}"),
         }
     }
 }
@@ -160,6 +169,11 @@ impl From<qlab_node::NodeError> for RunError {
 impl From<ReleaseError> for RunError {
     fn from(e: ReleaseError) -> Self {
         RunError::Release(e)
+    }
+}
+impl From<qlab_node::SupplyError> for RunError {
+    fn from(e: qlab_node::SupplyError) -> Self {
+        RunError::Supply(e)
     }
 }
 
@@ -255,6 +269,9 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// The `/v1/telemetry` server, when `telemetry_addr` is configured. `None` =
     /// the node listens on nothing extra, which is the default.
     telemetry_server: Option<TelemetryServer>,
+    /// Incremental scheduled-issuance accounting. Rebuilt once from the persisted
+    /// canonical bodies at startup, then advanced only for new heights.
+    supply_ledger: Mutex<SupplyLedger>,
     /// Unix seconds this process started (exported so a restart is a visible fact).
     process_start_secs: u64,
     /// Local listen address (for logs).
@@ -414,6 +431,24 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         *p2p.addrs_mut() = addrs;
         p2p.maintain(0); // dial the seeds now
 
+        let supply_ledger = {
+            let node = p2p.node();
+            let state_chain = node.state().chain();
+            SupplyLedger::from_blocks(
+                state_chain.chain().main_chain().iter().map(|hash| {
+                    let block = state_chain
+                        .block(hash)
+                        .expect("every canonical state-chain hash has its stored body");
+                    SupplyBlock {
+                        height: block.header.height,
+                        coinbase: block.coinbase,
+                        fees: block.txs.iter().map(|tx| tx.fee).sum(),
+                    }
+                }),
+                EPOCH_LENGTH_BLOCKS,
+            )?
+        };
+
         Ok(RunningNode {
             p2p,
             finalizers,
@@ -433,6 +468,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             telemetry_snapshot: Arc::new(Mutex::new(Vec::new())),
             last_telemetry_render: Instant::now(),
             telemetry_server: None,
+            supply_ledger: Mutex::new(supply_ledger),
             process_start_secs: unix_secs(),
             listen_addr: bound,
             // Sample telemetry roughly every 30 s (well under the 75 s block time,
@@ -571,6 +607,30 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     pub fn telemetry(&self) -> Telemetry {
         let node = self.p2p.node();
         let chain = node.chain();
+        let state_chain = node.state().chain();
+        let supply = {
+            let mut ledger = self
+                .supply_ledger
+                .lock()
+                .expect("the supply ledger mutex is not poisoned");
+            let main_chain = state_chain.chain().main_chain();
+            for height in ledger.next_height()..=state_chain.tip_height() {
+                let hash = main_chain
+                    .get(height as usize)
+                    .expect("every canonical height has a hash");
+                let block = state_chain
+                    .block(hash)
+                    .expect("every canonical state-chain hash has its stored body");
+                ledger
+                    .push(SupplyBlock {
+                        height: block.header.height,
+                        coinbase: block.coinbase,
+                        fees: block.txs.iter().map(|tx| tx.fee).sum(),
+                    })
+                    .expect("new canonical heights extend the supply ledger contiguously");
+            }
+            ledger.rows().to_vec()
+        };
         // Age is chain-time from the finalized block; 0 when there is no finalized
         // CHECKPOINT to measure from — nothing finalized (S8: no finalized head ⇒
         // no finalized-age, not a genesis-fallback absolute) or the finalized head
@@ -586,6 +646,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 tip_ts.saturating_sub(base_ts)
             }
         };
+        let committee = node.slot_context(node.tip_height());
         Telemetry::assemble_with_halt(
             node.tip_height(),
             node.finalized_height(),
@@ -596,6 +657,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             DEGRADED_MODE_LAG_BLOCKS,
             self.halt_at,
         )
+        .with_committee(
+            committee.roster as u64,
+            committee.active as u64,
+            committee.need as u64,
+        )
+        .with_supply(supply)
         .with_checkpoint(self.finalized_checkpoint_id(), self.local_commitment())
         .with_tip_difficulty(chain.header(&chain.tip_hash()).map(|h| h.difficulty))
     }
@@ -2548,17 +2615,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// **Issue #117, the precondition end to end**: the `/v1/telemetry` endpoint,
-    /// over a real socket, serving a real node's live snapshot — and the snapshot
-    /// carries the finalized checkpoint's identity, which is the whole point.
+    /// **Issues #117/#121, end to end**: the `/v1/telemetry` endpoint over a real
+    /// socket, serving a real node's live checkpoint, committee and supply state.
     ///
     /// This is the surface that did not exist before this change: the binary bound
     /// no RPC listener at all, so an operator view had nothing to poll. The test
-    /// asserts the same three things the view depends on — the endpoint is off
-    /// unless configured, the bytes decode as `Telemetry` at `0x02`, and `fid`
-    /// equals the identity the node's own finality tracker holds.
+    /// asserts the endpoint is off unless configured, the bytes decode at `0x03`,
+    /// `fid` equals the finality tracker's own identity, the committee aggregates
+    /// are read from live state, and the incrementally accumulated scheduled
+    /// issuance agrees exactly with the integer audit anchor.
     #[test]
-    fn telemetry_endpoint_serves_the_wire_with_fid_and_is_off_by_default() {
+    fn telemetry_endpoint_serves_v3_checkpoint_committee_and_supply() {
         let (config, genesis, base) = rig("telemetry-endpoint", true);
         assert!(config.telemetry_addr.is_none(), "no listener unless the operator asks");
         let mut node =
@@ -2589,7 +2656,20 @@ mod tests {
         assert_eq!(served.tip_height, CHECKPOINT_CADENCE_BLOCKS);
         assert_eq!(served.finalized_height, node.finalized_height());
         assert_eq!(served.finalized_id, Some(fid), "fid is on the wire, not just in the log line");
+        assert_eq!(
+            (served.committee_size, served.committee_active, served.committee_quorum),
+            (21, 21, 15),
+        );
+        assert_eq!(served.supply.len(), 1, "eight mined blocks remain in epoch 0");
+        assert_eq!((served.supply[0].start_height, served.supply[0].end_height), (0, 8));
+        assert_eq!(served.supply[0].divergence_bessel(), 0);
+        assert!(served.supply[0].measured_coinbase > 0, "the test covers real issuance");
         assert_eq!(served.fid_field(), node.telemetry().fid_field());
+        assert_eq!(
+            node.telemetry().supply,
+            served.supply,
+            "a second snapshot appends no duplicate heights"
+        );
         // The endpoint and the stdout sample line report the SAME snapshot — they
         // read one `telemetry()`, so they cannot drift.
         let line = node.telemetry_sample();
