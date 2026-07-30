@@ -2476,17 +2476,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// **Issue #117, the precondition end to end**: the `/v1/telemetry` endpoint,
-    /// over a real socket, serving a real node's live snapshot — and the snapshot
-    /// carries the finalized checkpoint's identity, which is the whole point.
+    /// **Issues #117/#121, end to end**: the `/v1/telemetry` endpoint over a real
+    /// socket, serving a real node's live checkpoint, committee and supply state.
     ///
     /// This is the surface that did not exist before this change: the binary bound
     /// no RPC listener at all, so an operator view had nothing to poll. The test
-    /// asserts the same three things the view depends on — the endpoint is off
-    /// unless configured, the bytes decode as `Telemetry` at `0x02`, and `fid`
-    /// equals the identity the node's own finality tracker holds.
+    /// asserts the endpoint is off unless configured, the bytes decode at `0x03`,
+    /// `fid` equals the finality tracker's own identity, the committee aggregates
+    /// are read from live state, and the incrementally accumulated scheduled
+    /// issuance agrees exactly with the integer audit anchor.
     #[test]
-    fn telemetry_endpoint_serves_the_wire_with_fid_and_is_off_by_default() {
+    fn telemetry_endpoint_serves_v3_checkpoint_committee_and_supply() {
         let (config, genesis, base) = rig("telemetry-endpoint", true);
         assert!(config.telemetry_addr.is_none(), "no listener unless the operator asks");
         let mut node =
@@ -2517,7 +2517,20 @@ mod tests {
         assert_eq!(served.tip_height, CHECKPOINT_CADENCE_BLOCKS);
         assert_eq!(served.finalized_height, node.finalized_height());
         assert_eq!(served.finalized_id, Some(fid), "fid is on the wire, not just in the log line");
+        assert_eq!(
+            (served.committee_size, served.committee_active, served.committee_quorum),
+            (21, 21, 15),
+        );
+        assert_eq!(served.supply.len(), 1, "eight mined blocks remain in epoch 0");
+        assert_eq!((served.supply[0].start_height, served.supply[0].end_height), (0, 8));
+        assert_eq!(served.supply[0].divergence_bessel(), 0);
+        assert!(served.supply[0].measured_coinbase > 0, "the test covers real issuance");
         assert_eq!(served.fid_field(), node.telemetry().fid_field());
+        assert_eq!(
+            node.telemetry().supply,
+            served.supply,
+            "a second snapshot appends no duplicate heights"
+        );
         // The endpoint and the stdout sample line report the SAME snapshot — they
         // read one `telemetry()`, so they cannot drift.
         let line = node.telemetry_sample();
