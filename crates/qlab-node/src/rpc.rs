@@ -1092,17 +1092,62 @@ mod tests {
         assert_eq!(rpc.route("/v1/tree/frontier?at=0").unwrap()[0], qlab_cbserver::WIRE_VERSION);
     }
 
-    // Apply one real block carrying `tx` to the node (so it becomes serveable).
-    fn apply_block_with(node: &mut MemNode, txs: Vec<TxEntry>) {
+    // Apply one real block with the requested minting/transaction shape.
+    fn apply_block_with_shape(node: &mut MemNode, txs: Vec<TxEntry>, minting: bool) {
         let tip_hash = node.tip_hash();
         let parent = node.chain().block(&tip_hash).expect("tip block stored").header();
         let height = parent.height + 1;
-        // A minting body needs a payee (issue #101).
-        let body =
-            BlockBody { txs, coinbase: height, coinbase_rkm: [height, 2, 3, 4] };
+        let (coinbase, coinbase_rkm) =
+            if minting { (height, [height, 2, 3, 4]) } else { (0, [0; 4]) };
+        let body = BlockBody { txs, coinbase, coinbase_rkm };
         // child_of's 2nd arg is the timestamp; height is derived from the parent.
         let header = BlockHeader::child_of(&parent, height, 1_000, body.commitment());
         node.apply_block(header, body, &OkVerifier).expect("block applies");
+    }
+
+    // Apply one real minting block carrying `tx` to the node (so it becomes
+    // serveable).
+    fn apply_block_with(node: &mut MemNode, txs: Vec<TxEntry>) {
+        apply_block_with_shape(node, txs, true);
+    }
+
+    #[test]
+    fn main_chain_counts_matches_apply_state_sequence_for_mixed_blocks() {
+        let (mut rpc, anchor) = rpc_with_finalized_genesis();
+        let fee = posted_fee(ArityBucket::TwoByTwo);
+        let mut applied = vec![(rpc.node().tip_height(), rpc.node().commitment_count())];
+
+        // Exercise all four minting/transaction combinations. The expected
+        // sequence is observed after the real state-transition funnel; it does
+        // not encode how either kind of output is scheduled or ordered.
+        apply_block_with_shape(rpc.node_mut(), vec![], true);
+        applied.push((rpc.node().tip_height(), rpc.node().commitment_count()));
+
+        apply_block_with_shape(
+            rpc.node_mut(),
+            vec![tx_with(anchor, &[1, 2], &[10, 11], fee)],
+            false,
+        );
+        applied.push((rpc.node().tip_height(), rpc.node().commitment_count()));
+
+        apply_block_with_shape(
+            rpc.node_mut(),
+            vec![
+                tx_with(anchor, &[3, 4], &[12, 13], fee),
+                tx_with(anchor, &[5, 6], &[14, 15], fee),
+            ],
+            true,
+        );
+        applied.push((rpc.node().tip_height(), rpc.node().commitment_count()));
+
+        apply_block_with_shape(rpc.node_mut(), vec![], false);
+        applied.push((rpc.node().tip_height(), rpc.node().commitment_count()));
+
+        assert_eq!(
+            rpc.main_chain_counts(),
+            applied,
+            "the RPC count sequence must be derived from exactly what state application appended"
+        );
     }
 
     #[test]
