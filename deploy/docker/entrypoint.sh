@@ -26,6 +26,22 @@
 # is generated once by the `init` service into a shared volume; every node byte-
 # verifies it and pins its hash (expected_genesis_hash) on startup.
 #
+# WHAT THIS HARNESS MODELS — three host properties, three independent knobs. The
+# canonical list, with the caveat that belongs to each, is soak.sh's header; this file
+# implements only the ones decided when a node's config is generated:
+#
+#   WAN latency                  `soak.sh netem <ms>` — a tc qdisc on the container's
+#                                eth0. This script has no part in it at all.
+#   advertised-address absence   QUMBRA_ADVERTISE_ADDR (below) — this script DECIDES
+#                                it, by writing or omitting the key.
+#   CPU budget                   docker-compose.yml's `cpus:`/`cpuset:` (or `soak.sh
+#                                cpu-budget` live) DECIDES it; this script only
+#                                REPORTS it, from the cgroup (see cpu_budget_line).
+#
+# The three are orthogonal — none of them reads either of the others — and each is
+# stamped on its own greppable line, so every combination of the three is a legible
+# run rather than something to be inferred afterwards.
+#
 # QUMBRA_ADVERTISE_ADDR selects whether this node declares itself dialable at all
 # (issue #107 step 1c). It exists because the harness and the four T0 hosts differed
 # here and the harness could not express the hosts' side:
@@ -41,6 +57,24 @@
 # Anything else is a hard failure rather than a fallback: a typo here silently
 # inverts the experiment, and the whole point of the toggle is to be sure which
 # side of it a run was on.
+#
+# CPU BUDGET (issue #107 step 1d). This script does not SET the budget — docker-
+# compose.yml does, via `cpus:` / `cpuset:` — but it REPORTS it, on one greppable
+# `CPU_BUDGET` line before the config dump, and it reports it by reading this
+# container's own cgroup rather than the environment that was passed in. That
+# distinction is the whole point: the environment says what was *requested*, the
+# cgroup says what the kernel will actually enforce, and only the second one belongs
+# in a run's record. A run whose resource envelope is not in its own output cannot be
+# trusted afterwards, which is the same rule the config dump itself follows.
+#
+#   docker compose logs node0 | grep CPU_BUDGET     # what this node actually got
+#   docker compose logs faucet | grep CPU_BUDGET    # the fifth node reports too
+#
+# The line carries three separate facts because they can disagree and the difference
+# matters: the CFS quota (CPU-seconds per second), the effective cpuset (which cores
+# the container may run on) and `nproc` (how many the process can SEE). `cpus: 2`
+# alone leaves `nproc` at the host's count; only a 2-core `cpuset` makes a container
+# look like the 2 vCPU t4g.small the T0 hosts are.
 
 set -euo pipefail
 
@@ -64,6 +98,45 @@ HASH_FILE="$GENESIS_DIR/genesis.hash"
 # Key split 6/5/5/5 across node0..node3 (task-book inline stamp; a 2+2 partition
 # leaves 11 keys | 10 keys, both below the 15 quorum → finality correctly stalls).
 KEY_SPLIT=(6 5 5 5)
+
+# ── the effective CPU budget, read from the cgroup (issue #107 step 1d) ───────
+#
+# cgroup v2 is what Docker Desktop and Debian 12 both use; the v1 branch is here
+# because a wrong-but-confident "unconstrained" on an older host would be worse than
+# no line at all. Anything unreadable prints `unknown`, never a guess — this line is
+# evidence, so it is allowed to say it does not know.
+#
+# The arithmetic is bash-only on purpose: the runtime image is debian:bookworm-slim
+# plus four packages, and reaching for `awk`/`bc` here would make the run's own
+# evidence line depend on a package nobody declared.
+#
+# The argument is the container's NAME, not a node index, because the faucet (#128) is
+# a fifth container with a cgroup like any other and its run record needs the same
+# line. `soak.sh cpu-show` greps `^CPU_BUDGET` and reads field 2 as the name.
+cpu_budget_line() {   # cpu_budget_line <name>
+  local who="$1" quota="unknown" cpuset="unknown" q p nproc_n
+  if [[ -r /sys/fs/cgroup/cpu.max ]]; then                       # cgroup v2
+    read -r q p < /sys/fs/cgroup/cpu.max || true
+  elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]]; then        # cgroup v1
+    q="$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"               # -1 = no quota
+    p="$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
+    [[ "$q" == "-1" ]] && q=max
+  fi
+  if [[ "${q:-}" == "max" ]]; then
+    quota="unconstrained"
+  elif [[ "${q:-}" =~ ^[0-9]+$ && "${p:-0}" =~ ^[1-9][0-9]*$ ]]; then
+    # Two decimals without a float: hundredths of a CPU, then split.
+    local h=$(( q * 100 / p ))
+    quota="$(( h / 100 )).$(printf '%02d' $(( h % 100 )))cpu"
+  fi
+  for f in /sys/fs/cgroup/cpuset.cpus.effective /sys/fs/cgroup/cpuset/cpuset.cpus; do
+    [[ -r "$f" ]] && { cpuset="$(cat "$f")"; break; }
+  done
+  # `nproc` is what the PROCESS sees (sched_getaffinity), so it tracks the cpuset and
+  # is blind to the quota. Printing both is how a reader tells the two apart.
+  nproc_n="$(nproc 2>/dev/null || echo unknown)"
+  echo "CPU_BUDGET $who quota=$quota cpuset=$cpuset nproc=$nproc_n"
+}
 
 cmd="${1:-}"
 shift || true
@@ -147,10 +220,20 @@ expected_genesis_hash = "$ghash"
 telemetry_addr = "0.0.0.0:$TELEMETRY_PORT"
 EOF
     # A run whose configuration is not in its own output cannot be trusted
-    # afterwards, so stamp the advertise mode on one greppable line of its own
-    # BEFORE the config dump — `docker compose logs node$idx | grep ADVERTISE_MODE`
-    # answers "which side of the experiment was this node on" with no inference.
+    # afterwards, so stamp BOTH modelled host properties this script knows about on
+    # their own greppable lines BEFORE the config dump — one per property, never
+    # merged, because they are independent axes and a reader is usually asking about
+    # exactly one of them:
+    #
+    #   docker compose logs node0 | grep ADVERTISE_MODE   # which side of step 1c
+    #   docker compose logs node0 | grep CPU_BUDGET       # which side of step 1d
+    #
+    # (The third property, latency, is a qdisc applied from outside after the node is
+    # up, so it cannot be stamped here — `soak.sh netem-show` is its readback.)
     echo "ADVERTISE_MODE node$idx=$adv_mode ($adv_note)"
+    # Read from the cgroup, not from the environment: a run that does not record what
+    # CPU it actually had cannot be compared with one that had more.
+    cpu_budget_line "node$idx"
     echo "== node$idx config (binary: $BIN, advertise=$adv_mode) =="
     cat "$cfg"
     # The halt-height release status of THIS binary, before anything else (#74).
@@ -241,6 +324,12 @@ expected_genesis_hash = "$ghash"
 telemetry_addr = "0.0.0.0:$TELEMETRY_PORT"
 $rkm_line
 EOF
+    # The faucet MINES (see `mining = true` above), on the same synchronous main loop
+    # the four nodes use, so it is a real competitor for the machine's cores and its
+    # own budget belongs in its own record for exactly the reason theirs does. It is a
+    # FIFTH container, not one of the four T0 hosts — `soak.sh cpu-show` reports it
+    # apart from them for that reason.
+    cpu_budget_line faucet
     echo "== faucet config =="
     cat "$svc_cfg"
     echo "== faucet node config =="

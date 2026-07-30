@@ -69,6 +69,31 @@ pgrep -f qlab_bench     # must print nothing
   even if they shared a genesis. Crossing that on a running net is the halt-height
   mechanism's job (#74), not a redeploy.
 
+## What this harness models about the T0 hosts
+
+Three host properties, added one at a time by issue #107's steps 1b–1d, each with its
+own knob, its own readback and its own caveat. `deploy/docker/soak.sh`'s header is the
+canonical list; the two sections below are the detail for the two that are
+configuration rather than a qdisc.
+
+| property | set with | read back with |
+|---|---|---|
+| WAN latency (1b) | `soak.sh netem <ms>` | `soak.sh netem-show` |
+| advertised-address absence (1c) | `QUMBRA_ADVERTISE_ADDR=none` | `soak.sh advertise-show` |
+| CPU budget (1d) | `QUMBRA_CPUS` / `QUMBRA_CPUSET`, or `soak.sh cpu-budget <n>` | `soak.sh cpu-show` |
+
+They are **independent**, and all three default to what every run before 2026-07-30
+was — no qdisc, advertised, unconstrained — so an ordinary soak is unchanged and each
+of the eight combinations is reachable. Orthogonal to all three, and not a host
+property at all: whether the **`faucet`** container (#123/#128) is in the run. It is a
+fifth node no T0 host corresponds to, so it is excluded from every four-node
+assertion — but it *mines*, so `cpu-budget` deliberately does **not** exclude it (see
+`cpu_targets` in `soak.sh`). Leaving it unbudgeted next to four budgeted nodes puts an
+unlimited competitor on the very cores a dedicated cpuset was meant to reserve.
+
+**State the condition with the number, every time.** Two runs of this harness that
+differ on any one of these axes are two different experiments.
+
 ## Advertised-address mode (issue #107 step 1c)
 
 The harness can model **a node with no advertised address**, which until 2026-07-30
@@ -105,6 +130,94 @@ deploy/docker/soak.sh advertise-show none     # …and assert it; dies on a mism
 kernel, architecture, RTT, tip height and uptime, so it narrows the gap rather than
 closing it. State the mode alongside any number this harness produces: two runs that
 differ only here are two different experiments.
+
+## CPU budget (issue #107 step 1d)
+
+The harness can now be held to **the T0 hosts' CPU budget**, which until 2026-07-30
+it could not — and that gap was the reason three previous local runs were
+structurally unable to answer the question they were asked.
+
+```
+T0 hosts        2 vCPU each      (t4g.small)
+this harness    no limit at all  → four containers sharing every core the Docker VM
+                                   has (18 on the dev rig)
+```
+
+The node mines RandomX **synchronously on the main loop** — the same loop that pumps
+the transport and emits telemetry (`run.rs`, `run_until` → `try_mine`). Per-frame work
+in `tick` therefore competes with mining **only when CPU is scarce**, and every
+earlier local run was measured where it was abundant.
+
+```sh
+# a FRESH net under a limit (the durable path — compose sets it)
+QUMBRA_CPUS=2 NODE0_CPUSET=0-1 NODE1_CPUSET=2-3 NODE2_CPUSET=4-5 NODE3_CPUSET=6-7 \
+  deploy/docker/soak.sh rehearsal
+
+# …and if the faucet is in the run, give it a budget and a block of its own
+FAUCET_CPUS=2 FAUCET_CPUSET=8-9 \
+  docker compose -f deploy/docker/docker-compose.yml up -d faucet
+
+# or apply to a net that is already up, live, with no restart
+deploy/docker/soak.sh cpu-budget 2              # quota 2 + a dedicated block each
+deploy/docker/soak.sh cpu-budget 2 quota-only   # quota only; nproc stays at 18
+deploy/docker/soak.sh cpu-budget none           # raise the ceiling to the whole VM
+deploy/docker/soak.sh cpu-show 2                # read it back, and assert it
+
+# all three axes at once — this composes, and each one reports itself
+QUMBRA_ADVERTISE_ADDR=none QUMBRA_CPUS=2 NODE0_CPUSET=0-1 NODE1_CPUSET=2-3 \
+  NODE2_CPUSET=4-5 NODE3_CPUSET=6-7 deploy/docker/soak.sh rehearsal
+deploy/docker/soak.sh netem 100                 # then add ~200 ms RTT on top
+```
+
+- **Default is unconstrained.** At the defaults compose omits `cpus:`/`cpuset:` from
+  the resolved config entirely (`docker compose config` shows neither key), so an
+  ordinary soak is byte-for-byte what it was and `NanoCpus=0`.
+- **Quota and cpuset are different experiments.** `cpus: 2` is a CFS quota — 2
+  CPU-seconds per second, throttled at 100 ms period boundaries, and the container
+  still *sees* all 18 cores (`nproc` = 18). `cpuset: "0-1"` is affinity — `nproc` = 2,
+  which is what the hosts' own `nproc` reports. Only cpuset reproduces the topology.
+  **Use a distinct block per node**: four containers pinned to the same pair are a 4:1
+  oversubscription of one pair, not four 2-vCPU hosts.
+- **Every container records its own budget.** `entrypoint.sh` prints one greppable line
+  before the config dump, read from the container's **cgroup** rather than from the
+  environment it was passed — the environment says what was requested, the cgroup says
+  what the kernel will enforce:
+
+  ```
+  CPU_BUDGET node0  quota=2.00cpu       cpuset=0-1  nproc=2
+  CPU_BUDGET node0  quota=unconstrained cpuset=0-17 nproc=18
+  CPU_BUDGET faucet quota=2.00cpu       cpuset=8-9  nproc=2
+  ```
+
+  `soak.sh cpu-show` prints that startup line **beside** the live cgroup, because
+  `cpu-budget` changes the cgroup without restarting the process and cannot rewrite a
+  log line already emitted. When the two disagree, the budget was applied live.
+- **The faucet is in scope for this axis and only this one.** `soak.sh cpu-budget`
+  applies to the four nodes **plus `faucet` when it is running** (`cpu_targets`), and
+  it appends the faucet last so `node0`…`node3` keep the same blocks either way. Every
+  *other* command here — scenarios, telemetry snapshots, the netem matrix,
+  `advertise-show` — excludes it, because it is a fifth node no T0 host corresponds to.
+  The asymmetry is the point: a CPU budget is a claim about the machine, not about the
+  topology, and the faucet mines on the same synchronous main loop the others do.
+  A `cpu-budget 2 dedicated` therefore needs 10 cores rather than 8 with the faucet up,
+  and says so instead of silently overlapping blocks.
+- **`docker update --cpus 0` is a silent no-op** — it exits 0, prints the container
+  name and changes nothing, because docker reads `0`/`""` as "leave this field alone".
+  So `cpu-budget none` *raises* the ceiling to every core on the machine and says so;
+  only a fresh `up` at the compose defaults gives a genuinely limit-free container.
+
+**The limitation, stated rather than left to be discovered: `cpus: 2` on four
+containers sharing one host machine is not four hosts with 2 vCPU each.** They share
+one kernel scheduler, one memory-bandwidth budget and one last-level cache; the four
+hosts share none of those. There is also no memory limit here — the hosts have 2 GB
+and Phase B-lite measured ~262 MiB/node, so memory is not the scarce axis, but the
+Docker VM's own ceiling on this rig is 8.3 GB across all four. **A limit answers "is
+this effect CPU-scarcity-shaped", not "does this match the T0 net".**
+
+The same holds for combining axes: `QUMBRA_ADVERTISE_ADDR=none` + a CPU budget + netem
+is three emulations at once, not a T0 host. Each narrows the gap on its own axis and
+none of them closes it, so a negative under all three still rules out only the three
+shapes it tested.
 
 ## Observability
 

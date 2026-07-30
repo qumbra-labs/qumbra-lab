@@ -1,0 +1,196 @@
+issue #107 step 1d — post-rebase verification of the harness (QUM-14)
+=====================================================================
+
+WHY THIS FILE EXISTS.  PR #129 went DIRTY against main after #120, #124 (step 1c) and
+#128 (the faucet listener) landed; the conflicts were in the four files that CARRY the
+CPU-budget machinery, including the one that applies the constraint.  A resolution that
+merges cleanly and quietly stops applying the limit would look exactly like a pass, so
+the merge was re-verified against the kernel's own counters rather than by reading the
+diff.  This is a working note, not an evidence pack — the run docs convention does not
+pair it.
+
+This file does NOT restate step 1d's finding.  The verdict, the nr_throttled = 0 result
+at 2 CPU and the 0.40 CPU positive control live in docs/i107-step1d-cpu-evidence.log and
+are unchanged by the rebase.  What is recorded here is only "does the merged harness
+still do what it says".
+
+RIG AND BASIS
+-------------
+  docker            29.6.2, cgroup v2, NCPU = 18, MemTotal = 8,319,213,568 B (8.32 GB)
+  host shell        GNU bash 3.2.57(1) arm64-apple-darwin25   <-- see MAPFILE below
+  lab rev           1c2db59 (the merge commit), branch claude/i107-step1d-cpu-budget
+  image             qumbra-node:t0-lite, built PRE-merge (carries no ADVERTISE_MODE and
+                    no qumbra-faucet binary).  The MERGED entrypoint.sh was bind-mounted
+                    over the image's copy via a scratch compose override, deleted after
+                    the run.  NO release rebuild was done — see NOT VERIFIED below.
+  concurrency       rig confirmed clear first: `pgrep -f qlab_bench` empty, no
+                    qumbra-t0-lite container present.  Torn down with `down -v` after.
+  samples           4 nodes; one net; ~6 min total.  Every number below carries its own
+                    window.  This is NOT a steady-state soak and no loop-period figure
+                    is claimed from it.
+
+CONDITION UNDER TEST — all three modelled properties engaged at once
+--------------------------------------------------------------------
+  QUMBRA_ADVERTISE_ADDR=none                                       (step 1c)
+  QUMBRA_CPUS=2  NODE0_CPUSET=0-1 NODE1_CPUSET=2-3
+                 NODE2_CPUSET=4-5 NODE3_CPUSET=6-7                 (step 1d)
+  (netem not installed in this window — the axis was exercised only at the config
+   level, `docker compose config`.  See NOT VERIFIED.)
+
+1. BOTH STAMPS PRESENT, ONE PER PROPERTY, ON ALL FOUR NODES
+-----------------------------------------------------------
+  ADVERTISE_MODE node0=none (ABSENT from node.toml (never gossiped))
+  CPU_BUDGET node0 quota=2.00cpu cpuset=0-1 nproc=2
+  ADVERTISE_MODE node1=none (...)   CPU_BUDGET node1 quota=2.00cpu cpuset=2-3 nproc=2
+  ADVERTISE_MODE node2=none (...)   CPU_BUDGET node2 quota=2.00cpu cpuset=4-5 nproc=2
+  ADVERTISE_MODE node3=none (...)   CPU_BUDGET node3 quota=2.00cpu cpuset=6-7 nproc=2
+
+  node0's generated /tmp/node.toml: `grep -c "^advertise_addr" ` = 0.  The key is
+  genuinely absent, not empty and not commented-into-a-parsed-value.
+
+  => the two config-time axes compose.  Neither stamp displaced the other; each node
+     got its OWN core pair rather than all four sharing one.
+
+2. BOTH ASSERTION PATHS PASS
+-----------------------------
+  soak.sh advertise-show none
+     node0..node3  node.toml=none  binary-said-none=yes  dialable=4/4  peers=8
+     OK every node is in advertise mode 'none'
+     (the mesh still forms in `none` mode — every node is a configured seed of every
+      other on this full-mesh net, which is step 1c's recorded expectation)
+
+  soak.sh cpu-show 2
+     cgroup      node0..node3  quota=200000/100000  cpuset=0-1|2-3|4-5|6-7  nproc=2
+     HostConfig  NanoCpus=2000000000  CpusetCpus="0-1"|"2-3"|"4-5"|"6-7"
+     OK every in-scope container's cgroup matches what was requested
+
+3. AT THE HOSTS' 2 CPU THE LIMIT DOES NOT BIND  (reproduces the recorded finding)
+---------------------------------------------------------------------------------
+  window: 614-620 periods x 100 ms = ~61.5 s from container start, 4 nodes
+     node0  usage_usec=680381  nr_periods=615  nr_throttled=0  throttled_usec=0
+     node1  usage_usec=664206  nr_periods=614  nr_throttled=0  throttled_usec=0
+     node2  usage_usec=658527  nr_periods=614  nr_throttled=0  throttled_usec=0
+     node3  usage_usec=664067  nr_periods=620  nr_throttled=0  throttled_usec=0
+
+  nr_throttled = 0 on all four.  Installed, verified, inert — exactly as step 1d
+  recorded.  ON ITS OWN THIS PROVES NOTHING ABOUT THE MERGE: "applied but never binds"
+  and "silently not applied any more" produce the identical line.  Hence step 4.
+
+4. THE POSITIVE CONTROL — THE CONSTRAINT IS GENUINELY APPLIED
+--------------------------------------------------------------
+  `soak.sh cpu-budget 0.25` applied LIVE, no restart.  Same processes, same build.
+     cgroup after:  quota=25000/100000  cpuset=0|1|2|3  nproc=1   (all four)
+     HostConfig:    NanoCpus=250000000  CpusetCpus="0-0"|"1-1"|"2-2"|"3-3"
+
+  Counters over ONE 90.6 s window (906 periods x 100 ms), measured as a delta between
+  two reads, 4 nodes, 1 window:
+
+     node    CPU used     share of 1 core   periods throttled    time cut off
+     node0   4.650 s      5.13 %            157 / 906 = 17.3 %   11.711 s
+     node1   4.639 s      5.12 %            157 / 906 = 17.3 %   11.688 s
+     node2   4.604 s      5.09 %            156 / 905 = 17.2 %   11.618 s
+     node3   3.733 s      4.14 %            118 / 901 = 13.1 %    8.816 s
+
+  nr_throttled went 0 -> 158..163 -> 281..317 cumulative across the run.  THE KERNEL IS
+  CUTTING THESE CONTAINERS OFF.  The merged resolution still applies the constraint end
+  to end: compose/`docker update` -> daemon -> cgroup -> enforcement.
+
+  Worth recording, and NOT claimed as a #107 result: average demand (4-5 % of one core)
+  is far below the 25 % cap, yet 13-17 % of enforcement windows throttle.  The loop's
+  demand is therefore BURSTY at 100 ms granularity.  At the hosts' 2 CPU the same
+  bursts did not reach the cap (step 3: nr_throttled = 0), so this says nothing about
+  T0 — it is a property of the instrument's granularity, noted so nobody re-derives it.
+
+  Also confirms the live-vs-startup distinction the merge had to preserve: the cgroup
+  block read 0.25 CPU while every CPU_BUDGET startup line still read 2.00cpu, because
+  `cpu-budget` cannot rewrite a log line already emitted.
+
+5. THE FAUCET IS IN SCOPE FOR THE CPU AXIS AND ONLY THAT AXIS
+--------------------------------------------------------------
+  With the faucet container running (FAUCET_CPUS=2 FAUCET_CPUSET=8-9):
+
+  a) its own stamp, from the merged cpu_budget_line, in-container:
+        CPU_BUDGET faucet quota=2.00cpu cpuset=8-9 nproc=2
+
+  b) `cpu-show` reports 5 containers in scope: node0 node1 node2 node3 faucet
+     — and `advertise-show`, `status`, the netem matrix and every scenario still see
+     only the four, because NODES is unchanged.
+
+  c) `cpu-budget 2` with the faucet up:
+        applied on node0: dedicated cores 0-1      <-- UNCHANGED from the 4-node case
+        applied on node1: dedicated cores 2-3      <-- UNCHANGED
+        applied on node2: dedicated cores 4-5      <-- UNCHANGED
+        applied on node3: dedicated cores 6-7      <-- UNCHANGED
+        applied on faucet: dedicated cores 8-9     <-- appended last
+     A with-faucet run stays comparable to a without-faucet one on the four nodes'
+     own terms.  That is the whole reason the faucet is appended rather than sorted in.
+
+  d) `cpu-budget 4` with the faucet up REFUSES rather than overlapping blocks:
+        "a dedicated 4-core block for each of 5 containers (node0 node1 node2 node3
+         faucet) needs 20 cores; docker reports only 18 on this machine."
+
+  e) `cpu-budget none` raises all FIVE to quota 18 CPU / cpuset 0-17 and says plainly
+     that this is effectively, not literally, unconstrained.
+
+6. THE THREE AXES ARE INDEPENDENT AT THE CONFIG LAYER
+------------------------------------------------------
+  `docker compose config`, no containers involved:
+     defaults                     -> NO cpus:/cpuset: key on ANY of the 5 services,
+                                     advertise=auto x4.  An ordinary soak is unchanged.
+     advertise=none only          -> 0 cpus/cpuset keys, 4x advertise=none
+     QUMBRA_CPUS=2 only           -> 4x cpus:2, 4x advertise=auto
+                                     (faucet NOT swept in — it has FAUCET_CPUS)
+     all three axes set           -> 5 distinct cpusets (0-1,2-3,4-5,6-7,8-9),
+                                     4x advertise=none
+     per-node beats global        -> QUMBRA_CPUS=2 NODE2_CPUS=1
+                                     QUMBRA_ADVERTISE_ADDR=none NODE1_ADVERTISE=auto
+                                     gives node2 cpus:1 and node1 advertise=auto, with
+                                     the other three on the globals.  Both axes
+                                     override independently of each other.
+
+7. MAPFILE — A TRAP CAUGHT BEFORE IT SHIPPED
+---------------------------------------------
+  The first draft of `cpu_targets`'s four call sites used `mapfile -t`.  soak.sh's
+  shebang is `env bash`; on this rig that resolves to bash 3.2.57, which has NEITHER
+  mapfile NOR readarray.  The script would have died on the machine it is most often
+  run from.  Replaced with `targets=( $(cpu_targets) )` — container names are single
+  words with no glob characters.  Same class of constraint the file already records for
+  BSD `seq`.  Verified: `bash -n` clean, and the helpers exercised under 3.2.57 —
+    cpu_hundredths  2->200  1->100  0.5->50  0.25->25  1.5->150  0.05->5  3->300
+    cpu_block w=2   0-1 2-3 4-5 6-7 8-9      cpu_block w=1  0-0 1-1 2-2 3-3 4-4
+    cpu_targets     faucet down -> 4 targets ; faucet up -> 5 targets
+
+  cpu_budget_line also checked directly against five real cgroups (docker run, no node):
+    unconstrained                  -> quota=unconstrained cpuset=0-17 nproc=18
+    --cpus 2                       -> quota=2.00cpu       cpuset=0-17 nproc=18
+    --cpus 2 --cpuset-cpus 0-1     -> quota=2.00cpu       cpuset=0-1  nproc=2
+    --cpus 0.25 --cpuset-cpus 4    -> quota=0.25cpu       cpuset=4    nproc=1
+    --cpus 2 --cpuset-cpus 8-9     -> quota=2.00cpu       cpuset=8-9  nproc=2
+
+NOT VERIFIED — read this before quoting anything above
+-------------------------------------------------------
+  * NO RELEASE REBUILD.  The Rust binaries came from a pre-merge qumbra-node:t0-lite and
+    the merged entrypoint.sh was bind-mounted in.  The merge touches no Rust, and
+    `deploy/docker/Dockerfile` came from main unmodified, so nothing in the diff should
+    need one — but THE DOCKERFILE PATH IS THE THING MOST LIKELY TO BREAK AND I HAVE NOT
+    SEEN IT PASS.  A `soak.sh rehearsal` (which does `up --build`) is the check, and it
+    would compile the plonky3 + RandomX stack plus the new qumbra-faucet target on a rig
+    the coordinator was running acceptance suites on back to back.  I did not start one.
+  * THE REAL FAUCET SERVICE NEVER RAN.  The faucet container in step 5 executed a stub
+    (cpu_budget_line, then sleep) because the pre-merge image has no qumbra-faucet
+    binary.  So `entrypoint.sh faucet`'s CPU_BUDGET call is verified only in the sense
+    that the function it calls was proven against a real cgroup in that same container;
+    the surrounding faucet startup path (keygen -> address -> check -> run) was not
+    executed after the merge.  It is #128's code and the merge did not change it, but I
+    did not watch it start.
+  * NETEM WAS NOT INSTALLED in this window.  The latency axis was verified only through
+    `docker compose config` (NET_ADMIN present on all five services, unchanged from
+    main).  The claim "all three compose" is measured for 1c x 1d and inferred for 1b.
+  * NO CHAIN PROGRESS OBSERVED.  tip stayed 0, regime=Degraded, diff=256 throughout —
+    a fresh net whose 2-CPU window was ~1 min and whose remainder ran under the 0.25 CPU
+    positive control, which deliberately starves mining.  This run says NOTHING about
+    liveness, block production or loop period, and no such number should be taken from
+    it.  Phase B-lite's own soak is the instrument for that.
+  * NO WORKSPACE TEST RUN.  `cargo test --release --workspace` was explicitly forbidden
+    for this baton and was not run.  The merge touches only deploy/docker/, so no Rust
+    test exercises it either way.
