@@ -103,6 +103,51 @@ impl LocalCommitment {
     }
 }
 
+/// **The one comparison of the two chain views this node holds** (issue #130): the
+/// height the *state machine* has applied bodies up to, against the height *fork
+/// choice* has headers up to.
+///
+/// It exists as a type because three surfaces need the same verdict and this repo
+/// has ruled three times in one week that a second copy of a derivation is the
+/// defect, not the convenience (#116, #102, #125):
+///
+/// - [`SupplyCoverage`] — a supply figure is publishable only at zero lag (#126);
+/// - the `TELEMETRY` line's `stip=` / `slag=` fields and the `/metrics` gauges,
+///   which is how an operator sees the lag at all;
+/// - `qlab_p2p::adapter::NodeAdapter::state_lag`, which is the **duty gate**: while
+///   this is nonzero the node refuses to mine or to admit a transaction, because
+///   both would be acting on a view it knows is stale.
+///
+/// `fork_choice_tip` is always ≥ `state_tip` in a healthy node — headers land in
+/// fork choice first and the body follows — so the difference is measured
+/// saturating and a nonsensical pair reads as zero rather than underflowing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StateLag {
+    /// Highest height whose **body** this node has applied to state.
+    pub state_tip: u64,
+    /// Highest height whose **header** fork choice holds.
+    pub fork_choice_tip: u64,
+}
+
+impl StateLag {
+    pub fn new(state_tip: u64, fork_choice_tip: u64) -> Self {
+        Self { state_tip, fork_choice_tip }
+    }
+
+    /// How many blocks the state machine trails fork choice by; 0 when the two
+    /// views agree.
+    pub fn blocks(&self) -> u64 {
+        self.fork_choice_tip.saturating_sub(self.state_tip)
+    }
+
+    /// Whether the state machine is behind its own chain — the predicate every
+    /// duty refusal keys on. One definition, so a duty cannot be refused on one
+    /// reading while a figure is published on another.
+    pub fn is_lagging(&self) -> bool {
+        self.blocks() > 0
+    }
+}
+
 /// Whether the supply ledger covers the same tip as fork choice.
 ///
 /// The supply rows are derived from bodies the state machine has applied, while
@@ -110,6 +155,8 @@ impl LocalCommitment {
 /// views can disagree permanently on a late joiner. A partial ledger must
 /// therefore be rendered as unavailable, never as supply agreement or a supply
 /// violation.
+///
+/// The verdict is [`StateLag::is_lagging`] — see [`Telemetry::supply_lag`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SupplyCoverage {
     /// The last applied supply row reaches the fork-choice tip.
@@ -294,15 +341,26 @@ impl Telemetry {
     /// (`tip_height` and the last supply row's `end_height`), so this rule needs
     /// no wire change.
     pub fn supply_coverage(&self) -> SupplyCoverage {
-        let state_tip = self.supply.last().map(|row| row.end_height);
-        if state_tip == Some(self.tip_height) {
-            SupplyCoverage::Complete
-        } else {
-            SupplyCoverage::Unavailable {
-                state_tip,
+        match self.supply_lag() {
+            Some(lag) if !lag.is_lagging() => SupplyCoverage::Complete,
+            // Either the ledger trails fork choice, or this composition supplied no
+            // rows at all — `state_tip` keeps those two apart for the reader.
+            other => SupplyCoverage::Unavailable {
+                state_tip: other.map(|lag| lag.state_tip),
                 fork_choice_tip: self.tip_height,
-            }
+            },
         }
+    }
+
+    /// The [`StateLag`] this snapshot can see, or `None` when it carries no supply
+    /// rows to read an applied height from.
+    ///
+    /// The last supply row's `end_height` **is** the state machine's applied tip:
+    /// the ledger is fed from applied bodies (`qumbra_node::run::RunningNode::telemetry`
+    /// walks it to `state_chain.tip_height()`), so the `0x03` payload already carries
+    /// both heights of the comparison and no wire bump is needed to publish it.
+    pub fn supply_lag(&self) -> Option<StateLag> {
+        self.supply.last().map(|row| StateLag::new(row.end_height, self.tip_height))
     }
 
     /// Stamp in the checkpoint-identity half (issue #117), the way
@@ -775,6 +833,74 @@ mod tests {
         let decoded = Telemetry::from_bytes(&partial.to_bytes()).unwrap();
         assert_eq!(decoded.supply_coverage(), partial.supply_coverage());
         assert_eq!(decoded.to_bytes()[0], 0x03, "coverage uses fields already on v3");
+    }
+
+    /// **Acceptance (#130 (a)): `SupplyCoverage` and the state-lag figures are one
+    /// comparison, not two.**
+    ///
+    /// #126 already derived "the applied ledger does not reach fork choice" here.
+    /// (a) needs the same comparison as a number on `TELEMETRY` and `/metrics`, and
+    /// this repo has ruled derive-don't-restate three times in one week (#116, #102,
+    /// #125). So [`StateLag`] is the single definition and `supply_coverage` is
+    /// expressed in terms of it — this test fails if either grows its own copy.
+    #[test]
+    fn supply_coverage_and_state_lag_are_the_same_comparison() {
+        let partial = Telemetry::assemble(14, Some(8), 75, 0, 3, 0, MAX_LAG).with_supply(vec![
+            SupplyEpoch {
+                epoch: 0,
+                start_height: 0,
+                end_height: 4,
+                measured_coinbase: 123,
+                expected_coinbase: 123,
+                fees: 0,
+            },
+        ]);
+        let lag = StateLag::new(4, 14);
+        assert_eq!(lag.blocks(), 10);
+        assert!(lag.is_lagging());
+        // The coverage verdict is the lag verdict, on the same two heights.
+        assert_eq!(partial.supply_lag(), Some(lag));
+        assert_eq!(
+            partial.supply_coverage(),
+            SupplyCoverage::Unavailable { state_tip: Some(4), fork_choice_tip: 14 }
+        );
+
+        // Agreement is a zero lag, and vice versa — one predicate, both readings.
+        let complete = Telemetry::assemble(14, Some(8), 75, 0, 3, 0, MAX_LAG).with_supply(vec![
+            SupplyEpoch {
+                epoch: 0,
+                start_height: 0,
+                end_height: 14,
+                measured_coinbase: 123,
+                expected_coinbase: 123,
+                fees: 0,
+            },
+        ]);
+        assert_eq!(complete.supply_lag(), Some(StateLag::new(14, 14)));
+        assert!(!complete.supply_lag().unwrap().is_lagging());
+        assert_eq!(complete.supply_coverage(), SupplyCoverage::Complete);
+
+        // No ledger rows ⇒ no lag can be computed, and coverage is Unavailable for
+        // that reason rather than for a disagreement. The two are different facts.
+        let no_rows = Telemetry::assemble(14, Some(8), 75, 0, 3, 0, MAX_LAG);
+        assert_eq!(no_rows.supply_lag(), None);
+        assert_eq!(
+            no_rows.supply_coverage(),
+            SupplyCoverage::Unavailable { state_tip: None, fork_choice_tip: 14 }
+        );
+    }
+
+    /// A state tip can never exceed fork choice (fork choice is where headers land
+    /// first), and if arithmetic ever says otherwise the answer is zero rather than
+    /// an underflow — the `saturating_sub` discipline #73/#87 already apply to every
+    /// other derived gap on this surface.
+    #[test]
+    fn state_lag_never_underflows_and_zero_is_not_lagging() {
+        assert_eq!(StateLag::new(14, 4).blocks(), 0);
+        assert!(!StateLag::new(14, 4).is_lagging());
+        assert_eq!(StateLag::new(0, 0).blocks(), 0);
+        assert!(!StateLag::new(0, 0).is_lagging());
+        assert!(StateLag::new(0, 1).is_lagging());
     }
 
     /// **Acceptance (#117): a `0x01` payload is REJECTED, not best-effort parsed.**
