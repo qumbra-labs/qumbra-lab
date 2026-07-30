@@ -155,6 +155,9 @@ pub struct AddrEntry {
     pub dialable: bool,
     /// Live transport handle while connected.
     pub connected: Option<PeerId>,
+    /// A connector is currently trying this address. Pending attempts reserve an
+    /// outbound slot and are never selected twice.
+    pending: bool,
     /// Consecutive failed dials (reset on success).
     pub failures: u32,
     next_retry_ms: u64,
@@ -170,6 +173,7 @@ impl AddrEntry {
             source,
             dialable: false,
             connected: None,
+            pending: false,
             failures: 0,
             next_retry_ms: 0,
             backoff_ms: DIAL_BACKOFF_START_MS,
@@ -381,7 +385,10 @@ impl AddrManager {
             .entries
             .values()
             .filter(|e| {
-                e.source == AddrSource::Learned && !e.dialable && e.connected.is_none()
+                e.source == AddrSource::Learned
+                    && !e.dialable
+                    && e.connected.is_none()
+                    && !e.pending
             })
             .min_by_key(|e| e.seq)
             .map(|e| e.addr.clone());
@@ -399,6 +406,7 @@ impl AddrManager {
     /// Record a successful dial: the address is now **dialable** and gossipable.
     pub fn on_dial_success(&mut self, addr: &str, pid: PeerId) {
         if let Some(e) = self.entries.get_mut(addr) {
+            e.pending = false;
             e.dialable = true;
             e.connected = Some(pid);
             e.failures = 0;
@@ -409,11 +417,25 @@ impl AddrManager {
     /// Record a failed dial: exponential backoff, capped.
     pub fn on_dial_failure(&mut self, addr: &str, now_ms: u64) {
         if let Some(e) = self.entries.get_mut(addr) {
+            e.pending = false;
             e.connected = None;
             e.failures = e.failures.saturating_add(1);
             e.backoff_ms = (e.backoff_ms * 2).min(DIAL_BACKOFF_MAX_MS);
             e.next_retry_ms = now_ms + e.backoff_ms;
         }
+    }
+
+    /// Reserve this address while its connector waits outside the main loop.
+    /// Returns false if it disappeared or is already connected/pending.
+    pub fn on_dial_started(&mut self, addr: &str) -> bool {
+        let Some(e) = self.entries.get_mut(addr) else {
+            return false;
+        };
+        if e.connected.is_some() || e.pending {
+            return false;
+        }
+        e.pending = true;
+        true
     }
 
     /// Forget a dropped connection handle. `dialable` is intentionally sticky —
@@ -452,17 +474,18 @@ impl AddrManager {
     /// *book* alone would still let one network own every outbound slot as long as
     /// its addresses were the ones tried first.
     pub fn next_dials(&self, now_ms: u64) -> Vec<String> {
-        let live = self.outbound_live();
-        if live >= self.max_outbound {
+        let reserved =
+            self.entries.values().filter(|e| e.connected.is_some() || e.pending).count();
+        if reserved >= self.max_outbound {
             return Vec::new();
         }
-        let budget = self.max_outbound - live;
+        let budget = self.max_outbound - reserved;
 
         // Netgroups already occupied by live learned connections. Seeds do not
         // count and are not capped — see [`netgroup`] for why.
         let mut per_group: BTreeMap<String, usize> = BTreeMap::new();
         for e in self.entries.values() {
-            if e.connected.is_some() && e.source == AddrSource::Learned {
+            if (e.connected.is_some() || e.pending) && e.source == AddrSource::Learned {
                 *per_group.entry(netgroup(&e.addr)).or_insert(0) += 1;
             }
         }
@@ -472,6 +495,7 @@ impl AddrManager {
             .values()
             .filter(|e| {
                 e.connected.is_none()
+                    && !e.pending
                     && now_ms >= e.next_retry_ms
                     && !self.is_self(&e.addr) // belt: self must not be dialed even if in book
             })
@@ -843,6 +867,25 @@ mod tests {
         assert!(m.next_dials(0).is_empty(), "at cap ⇒ no further dials");
         m.on_disconnect(PeerId(1));
         assert_eq!(m.next_dials(0).len(), 1, "a freed slot is refilled");
+    }
+
+    #[test]
+    fn pending_dials_reserve_slots_and_are_not_started_twice() {
+        let mut m = AddrManager::with_seeds(vec![a("s1:1"), a("s2:2"), a("s3:3")]);
+        m.set_max_outbound(2);
+        let first = m.next_dials(0);
+        assert_eq!(first, vec![a("s1:1"), a("s2:2")]);
+        assert!(m.on_dial_started(&first[0]));
+        assert!(m.on_dial_started(&first[1]));
+        assert!(!m.on_dial_started(&first[0]), "one address gets one connector");
+        assert!(m.next_dials(0).is_empty(), "pending connectors consume the cap");
+
+        m.on_dial_failure(&first[0], 0);
+        assert_eq!(
+            m.next_dials(0),
+            vec![a("s3:3")],
+            "a completed failure frees one slot without reselecting its backed-off address"
+        );
     }
 
     #[test]

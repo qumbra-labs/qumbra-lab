@@ -31,7 +31,7 @@ use crate::n1::{IngestOutcome, NodeState, VotesOutcome};
 use crate::peer::{NodeId, PeerId, PeerTable, VersionMsg};
 use crate::ratelimit::{RateKey, RateLimiter, RateLimits, RateStats};
 use crate::sync::{build_locator, answer_get_headers, SyncPhase, SyncState, MAX_HEADERS_PER_BATCH};
-use crate::transport::Transport;
+use crate::transport::{DialCompletion, DialStart, Transport};
 use crate::wire::{Envelope, MsgType};
 
 /// Service-bits placeholder advertised in the handshake (`[devnet-placeholder]`).
@@ -146,6 +146,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// addresses share one cap and one backoff ladder (see [`crate::addrman`]).
     /// Returns how many dials succeeded.
     pub fn maintain(&mut self, now_ms: u64) -> usize {
+        let mut connected = self.finish_dials(now_ms);
         let live: HashSet<PeerId> = self.transport.peers().into_iter().collect();
         self.addrs.sync_live(&live);
         for pid in self.peers.all_peers() {
@@ -154,15 +155,18 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         }
 
-        let mut connected = 0;
         for addr in self.addrs.next_dials(now_ms) {
+            if !self.addrs.on_dial_started(&addr) {
+                continue;
+            }
             match self.transport.dial(&addr) {
-                Ok(pid) => {
+                DialStart::Connected(pid) => {
                     self.addrs.on_dial_success(&addr, pid);
                     self.add_peer(pid, Some(addr));
                     connected += 1;
                 }
-                Err(_) => self.addrs.on_dial_failure(&addr, now_ms),
+                DialStart::Pending => {}
+                DialStart::Failed(_) => self.addrs.on_dial_failure(&addr, now_ms),
             }
         }
 
@@ -170,6 +174,25 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             if self.addrs.may_ask(pid, now_ms) {
                 self.send(pid, MsgType::GetAddr, Vec::new());
                 self.addrs.mark_asked(pid, now_ms);
+            }
+        }
+        connected
+    }
+
+    /// Apply connector-thread results on the main loop. The completion timestamp
+    /// supplied by the caller starts failure backoff *after* the wait ended; #107
+    /// previously started it before a blocking connect, so a long SYN timeout
+    /// silently consumed the whole backoff.
+    fn finish_dials(&mut self, now_ms: u64) -> usize {
+        let mut connected = 0;
+        for DialCompletion { addr, elapsed_ms: _, result } in self.transport.poll_dials() {
+            match result {
+                Ok(pid) => {
+                    self.addrs.on_dial_success(&addr, pid);
+                    self.add_peer(pid, Some(addr));
+                    connected += 1;
+                }
+                Err(_) => self.addrs.on_dial_failure(&addr, now_ms),
             }
         }
         connected
@@ -333,6 +356,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// including frames dropped by the rate limiter, which *were* handled: they
     /// arrived, were charged, and were discarded.
     pub fn tick(&mut self, now_ms: u64) -> usize {
+        self.finish_dials(now_ms);
         let frames = self.transport.poll();
         let n = frames.len();
         for (from, frame) in frames {
@@ -929,7 +953,7 @@ fn build_announce_parts(txs: &[TxEntry], nonce: u64) -> (Vec<PrefilledTx>, Vec<[
 mod tests {
     use super::*;
     use crate::n1::{BlockIngest, ChainView, CommitteeControl, StubNode, TxPool};
-    use crate::transport::{InProcHub, InProcTransport};
+    use crate::transport::{InProcHub, InProcTransport, TcpTransport};
     use qlab_devnet::body::TxPublic;
     use qlab_devnet::committee::{devnet_committee, CommitteeState, MemberStatus, Validator};
     use qlab_devnet::ebbflow::{EquivocationEvidence, FinalityStatus};
@@ -1720,6 +1744,35 @@ mod tests {
                 "handshake completed with n{j}"
             );
         }
+    }
+
+    #[test]
+    fn tcp_maintenance_collects_an_async_dial_without_restarting_it() {
+        use std::time::{Duration, Instant};
+
+        let server = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let target = server.local_addr().to_string();
+        let client = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let mut node = P2pNode::new(client, stub(), [1; 32]);
+        node.addrs_mut().add_seed(target.clone());
+
+        assert_eq!(node.maintain(0), 0, "TCP connect is pending, never completed inline");
+        assert!(
+            node.addrs().next_dials(0).is_empty(),
+            "the pending connector reserves its slot and cannot be started twice"
+        );
+
+        let started = Instant::now();
+        while node.addrs().outbound_live() == 0 {
+            node.tick(started.elapsed().as_millis() as u64);
+            assert!(started.elapsed() < Duration::from_secs(1), "loopback dial never completed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(node.addrs().dialable_count(), 1);
+        assert_eq!(node.addrs().entry(&target).unwrap().failures, 0);
+
+        server.shutdown();
+        node.transport().shutdown();
     }
 
     #[test]
