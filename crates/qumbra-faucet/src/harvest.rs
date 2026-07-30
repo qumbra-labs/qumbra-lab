@@ -47,7 +47,7 @@
 use std::collections::HashSet;
 
 use qlab_faucet::{Faucet, OwnedNote};
-use qlab_node::{coinbase_note, coinbase_note_leaf, ChainStore, CommitmentStore, MemNode, NodeState};
+use qlab_node::{coinbase_note, coinbase_note_leaf, ChainStore, MemNode, NodeState};
 use qlab_wallet::address::Diversifier;
 use qlab_wallet::Wallet;
 
@@ -139,7 +139,7 @@ mod tests {
     use qlab_devnet::header::BlockHeader;
     use qlab_devnet::params_devnet::GENESIS_DIFFICULTY;
     use qlab_faucet::{FaucetConfig, FaucetLimits, TicketPolicy, TicketSecret};
-    use qlab_node::{coinbase, genesis_block, COINBASE_MATURITY_BLOCKS};
+    use qlab_node::{coinbase, genesis_block, CommitmentStore, COINBASE_MATURITY_BLOCKS};
 
     struct NoTx;
     impl TxVerifier for NoTx {

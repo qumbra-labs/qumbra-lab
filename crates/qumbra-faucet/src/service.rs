@@ -32,7 +32,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use qlab_devnet::body::TxEntry;
 use qlab_faucet::{
     AcceptError, DispenseOutcome, Faucet, GrantPlan, PendingRequest, StallReason, Ticket,
 };
@@ -54,9 +53,20 @@ use crate::view::NodeView;
 pub trait FaucetNode {
     /// Live consensus state: the commitment tree, the anchor set, the chain.
     fn chain_state(&self) -> &MemNode;
-    /// Admit a locally-originated transaction and gossip it. `true` = the node took
-    /// it.
-    fn submit_local(&mut self, tx: TxEntry) -> bool;
+
+    /// Submit a proved grant. `true` = the node took it.
+    ///
+    /// **It takes the whole [`GrantPlan`], not just `plan.entry`, and that is a
+    /// finding rather than an interface preference.** A grant has two halves: the
+    /// consensus transaction, and the ML-KEM note-discovery artifacts
+    /// (`plan.discovery`) that tell the recipient the `(value, ρ, rseed)` of the
+    /// output paid to them. Only the first half fits through the seam the deployed
+    /// node has — see the `RunningNode` impl below — so the recipient of a grant on
+    /// a `qumbra-node` net owns a real note they cannot find. The signature carries
+    /// what a submission *should* carry so that the loss is visible at the call site
+    /// instead of only in a report.
+    fn submit_local(&mut self, plan: &GrantPlan) -> bool;
+
     /// Connected peers — service state, not chain state (a faucet with no peers is a
     /// faucet on its own fork).
     fn peers(&self) -> u64;
@@ -68,8 +78,27 @@ impl<P: qlab_devnet::pow::PowEngine, V: qlab_devnet::body::TxVerifier + Clone> F
     fn chain_state(&self) -> &MemNode {
         self.state()
     }
-    fn submit_local(&mut self, tx: TxEntry) -> bool {
-        self.submit_local_tx(tx)
+    /// 🔴 `plan.discovery` is **dropped here**, because there is nowhere to put it.
+    ///
+    /// `RunningNode::submit_local_tx` is `P2pNode::announce_tx` → `ingest_tx`, which
+    /// takes a bare `TxEntry`. Discovery artifacts live only in
+    /// `qlab_node::rpc::NodeRpc`'s own side table, served by `/v1/compact` — and
+    /// `qumbra-node` composes no `NodeRpc` at all, so there is no such table and no
+    /// such route on any node in the deployed topology. `StoredTx` has no discovery
+    /// field either, so they are not in the block log, not in the snapshot, and not
+    /// on the P2P tx wire.
+    ///
+    /// Consequence, stated plainly: the grant transaction is real, its `cm` is a real
+    /// leaf, and the recipient really owns the note — but a transaction output's
+    /// ρ/rseed are not derivable from public data (unlike a coinbase note's, which
+    /// #101 made deterministic), so **the recipient cannot detect or spend it**.
+    ///
+    /// Both repairs are stop points: putting discovery on the wire is a payload
+    /// change, and having the node serve the wallet-facing RPC is a new public
+    /// listener on a node — the §6 decision this baton was told not to take as a side
+    /// effect. Reported on issue #123 rather than worked around.
+    fn submit_local(&mut self, plan: &GrantPlan) -> bool {
+        self.submit_local_tx(plan.entry.clone())
     }
     fn peers(&self) -> u64 {
         self.p2p().peers().len() as u64
@@ -332,7 +361,7 @@ impl FaucetService {
             let view = NodeView(node.chain_state());
             plan.is_submittable(&view)
         };
-        let accepted = submittable && node.submit_local(plan.entry.clone());
+        let accepted = submittable && node.submit_local(&plan);
         let tip = node.chain_state().tip_height();
 
         let mut gate = self.lock_gate();

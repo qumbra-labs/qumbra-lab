@@ -32,6 +32,13 @@ COPY . .
 RUN cargo build --release --locked -p qumbra-node \
     && cp target/release/qumbra-node /usr/local/bin/qumbra-node
 
+# The T1 faucet listener (issue #123). It is a LEAF crate over the same dependency
+# graph — plonky3 and randomx-rs are already built for qumbra-node above — so this is
+# a cheap incremental build, not a second full one. `entrypoint.sh faucet` runs it
+# alongside the four nodes on a KEYLESS node of its own (testnet-plan.md §6.2).
+RUN cargo build --release --locked -p qumbra-faucet \
+    && cp target/release/qumbra-faucet /usr/local/bin/qumbra-faucet
+
 # ── halt-height drill binaries (issue #74) ──────────────────────────────────
 #
 # H1: the halt height is a BINARY RELEASE CONSTANT with no runtime override, so the
@@ -70,6 +77,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         bash ca-certificates iproute2 iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/qumbra-node /usr/local/bin/qumbra-node
+COPY --from=builder /usr/local/bin/qumbra-faucet /usr/local/bin/qumbra-faucet
 COPY --from=builder /usr/local/bin/qumbra-node-armed /usr/local/bin/qumbra-node-armed
 COPY --from=builder /usr/local/bin/qumbra-node-resume /usr/local/bin/qumbra-node-resume
 COPY --from=builder /usr/local/bin/qumbra-node-norev /usr/local/bin/qumbra-node-norev
@@ -77,5 +85,6 @@ COPY --from=builder /usr/local/bin/qumbra-node-cancel /usr/local/bin/qumbra-node
 COPY deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# `init` mints the shared genesis + 21 keys once; `run <idx>` starts a node.
+# `init` mints the shared genesis + 21 keys once; `run <idx>` starts a node;
+# `faucet` starts the T1 faucet on a keyless node (#123).
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

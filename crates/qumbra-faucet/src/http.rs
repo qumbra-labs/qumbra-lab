@@ -131,6 +131,19 @@ pub struct FaucetServer {
     journal: Arc<Mutex<Vec<String>>>,
 }
 
+impl std::fmt::Debug for FaucetServer {
+    /// Hand-written, and it shows the bound address and a count. Nothing here reaches
+    /// the faucet, so no derived `Debug` on this type can ever print a request, a
+    /// recipient address or a ticket — the redaction is structural rather than
+    /// remembered.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FaucetServer")
+            .field("addr", &self.addr)
+            .field("requests_served", &self.requests_served())
+            .finish()
+    }
+}
+
 impl FaucetServer {
     /// Bind `addr` and serve until [`Self::shutdown`].
     ///
@@ -224,6 +237,20 @@ impl FaucetServer {
                             retry.map(|s| ("Retry-After".to_string(), s.to_string())),
                         )
                     }
+                    // `/request` exists but takes only POST — 405 with `Allow`, not
+                    // 404, because "this route is not for GET" and "there is no such
+                    // route" are different facts and a 404 here would send an
+                    // operator looking for a routing bug.
+                    (tiny_http::Method::Get, "/request") => (
+                        405,
+                        page(
+                            "method not allowed",
+                            "<p><code>/request</code> takes <code>POST</code>. It is a POST so \
+                             that the address you submit never lands in a URL, and therefore \
+                             never in an access log.</p>",
+                        ),
+                        Some(("Allow".to_string(), "POST".to_string())),
+                    ),
                     (tiny_http::Method::Get, _) => (
                         404,
                         page("not found", "<p>This faucet serves <code>/</code> only.</p>"),
