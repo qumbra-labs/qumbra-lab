@@ -528,15 +528,20 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     pub fn telemetry(&self) -> Telemetry {
         let node = self.p2p.node();
         let chain = node.chain();
-        // Age is chain-time from the finalized block; 0 when nothing is finalized
-        // (S8: no finalized head ⇒ no finalized-age, not a genesis-fallback absolute).
-        let age = if node.finalized_height().is_none() {
-            0
-        } else {
-            let tip_ts = chain.header(&chain.tip_hash()).map(|h| h.timestamp).unwrap_or(0);
-            let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_hash());
-            let base_ts = chain.header(&base_hash).map(|h| h.timestamp).unwrap_or(0);
-            tip_ts.saturating_sub(base_ts)
+        // Age is chain-time from the finalized block; 0 when there is no finalized
+        // CHECKPOINT to measure from — nothing finalized (S8: no finalized head ⇒
+        // no finalized-age, not a genesis-fallback absolute) or the finalized head
+        // still genesis (#73: the bootstrap finalization is not a checkpoint round,
+        // and its ts=0 placeholder differenced against a WallClock tip printed the
+        // wall clock itself on every fresh net).
+        let age = match node.finalized_height() {
+            None | Some(0) => 0,
+            Some(_) => {
+                let tip_ts = chain.header(&chain.tip_hash()).map(|h| h.timestamp).unwrap_or(0);
+                let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_hash());
+                let base_ts = chain.header(&base_hash).map(|h| h.timestamp).unwrap_or(0);
+                tip_ts.saturating_sub(base_ts)
+            }
         };
         Telemetry::assemble_with_halt(
             node.tip_height(),
@@ -572,13 +577,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             FinalityStatus::Halted => "Halted",
         };
         let final_str = t.finalized_height.map(|h| h.to_string()).unwrap_or_else(|| "-".to_string());
-        // S8: print `age_s=-` (not `age_s=0`) whenever there is no finalized head, so
-        // the runbook's stall alarm never mistakes "never finalized" for a real age.
-        let age_str = if t.finalized_height.is_none() {
-            "-".to_string()
-        } else {
-            t.last_finalized_age_secs.to_string()
-        };
+        // `age_s=-` whenever there is no finalized checkpoint to measure from — no
+        // finalized head (S8) or a finalized head still at genesis (#73) — so the
+        // runbook's stall alarm never mistakes either for a real age. The rule
+        // lives on `Telemetry` (the #117 discipline), shared with `qumbra-opview`.
+        let age_str = t.age_field();
         // `halt=` is the operator's read of the upgrade schedule: `-` when this
         // release has none, the height when it does. Combined with `regime=`, the
         // soak monitor can tell "paused at the announced boundary" from "stuck".
@@ -1249,6 +1252,54 @@ mod tests {
         let line = node.telemetry_sample();
         assert!(line.contains("final=-"), "nothing finalized: {line}");
         assert!(line.contains("age_s=-"), "age must be '-' when unfinalized: {line}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #73 — the boundary S8 left open. A fresh net bootstrap-finalizes
+    /// GENESIS (`final=0`), and differencing the WallClock tip against genesis's
+    /// `timestamp = 0` placeholder printed the wall clock itself (`age_s=1785352360`
+    /// on all four nodes of the #119 run, for the whole start→slot-8 window).
+    /// While the finalized head is genesis the line says `age_s=-` and the wire
+    /// value is 0; the FIRST non-genesis checkpoint flips it to a real chain-time
+    /// age. The transition is the property, not either side alone.
+    #[test]
+    fn telemetry_age_is_dash_at_genesis_then_real_after_first_checkpoint() {
+        let (config, genesis, base) = rig("age_genesis", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+
+        // Bootstrap: finalize genesis, put the tip past it — the live defect's shape.
+        node.try_checkpoint();
+        assert_eq!(node.finalized_height(), Some(0), "genesis finalized");
+        assert!(node.try_mine());
+        let line = node.telemetry_sample();
+        assert!(line.contains("final=0"), "finalized head is genesis: {line}");
+        assert!(line.contains("age_s=-"), "no finalized checkpoint ⇒ no age: {line}");
+        assert_eq!(
+            node.telemetry().last_finalized_age_secs,
+            0,
+            "the wire carries 0, never tip_ts − genesis placeholder"
+        );
+
+        // Cross the boundary: reach slot 8, finalize it, move the tip one past it.
+        for _ in 1..CHECKPOINT_CADENCE_BLOCKS {
+            assert!(node.try_mine());
+        }
+        node.try_checkpoint();
+        assert_eq!(
+            node.finalized_height(),
+            Some(CHECKPOINT_CADENCE_BLOCKS),
+            "the first non-genesis checkpoint finalized"
+        );
+        assert!(node.try_mine());
+        let t = node.telemetry();
+        assert!(t.last_finalized_age_secs > 0, "a real chain-time age, both timestamps real");
+        let line = node.telemetry_sample();
+        assert!(
+            line.contains(&format!("age_s={} ", t.last_finalized_age_secs)),
+            "the line speaks once a checkpoint exists to measure from: {line}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -431,11 +431,17 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
     /// Chain-time seconds between the tip block and the finalized block. Reports
     /// **0 when nothing is finalized** (M10-T0-5 / S8): the T0-2 runbook keys its
     /// stall alarm on this field, and a genesis fallback made "no finality yet" read
-    /// as a huge absolute age (Phase B-lite logged `age_s=1784917791`). Uses only the
-    /// public chain store.
+    /// as a huge absolute age (Phase B-lite logged `age_s=1784917791`). Reports **0
+    /// while the finalized head is still genesis too** (issue #73) — the same door:
+    /// genesis is finalized as a bootstrap act, not by a checkpoint round, and its
+    /// `timestamp = 0` placeholder differenced against a `WallClock` tip is the wall
+    /// clock itself. Uses only the public chain store.
     fn last_finalized_age_secs(&self) -> u64 {
-        if self.node.finalized_height().is_none() {
-            return 0; // nothing finalized ⇒ there is no finalized-age to report
+        match self.node.finalized_height() {
+            // Nothing finalized, or only the genesis bootstrap ⇒ no finalized
+            // CHECKPOINT exists, so there is no finalized-age to report.
+            None | Some(0) => return 0,
+            Some(_) => {}
         }
         let chain = self.node.chain();
         let tip_ts = chain
@@ -907,6 +913,50 @@ mod tests {
         let t = rpc.telemetry();
         assert_eq!(t.finalized_height, None, "fresh node has no finalized head");
         assert_eq!(t.last_finalized_age_secs, 0, "age is 0 when nothing is finalized");
+    }
+
+    // Apply one coinbase-only block with an explicit timestamp; returns its hash.
+    // Issue #73's shape needs a wall-clock-magnitude tip over the ts=0 genesis.
+    fn apply_block_at(node: &mut MemNode, timestamp: u64) -> Hash32 {
+        let tip_hash = node.tip_hash();
+        let parent = node.chain().block(&tip_hash).expect("tip block stored").header();
+        let height = parent.height + 1;
+        let body = BlockBody { txs: vec![], coinbase: height, coinbase_rkm: [height, 2, 3, 4] };
+        let header = BlockHeader::child_of(&parent, timestamp, 1_000, body.commitment());
+        let hash = header.header_hash();
+        node.apply_block(header, body, &OkVerifier).expect("block applies");
+        hash
+    }
+
+    /// Issue #73: while the finalized head is still GENESIS (the bootstrap
+    /// finalization every fresh net starts from), the age must not difference the
+    /// tip against genesis's `timestamp = 0` placeholder — on a WallClock net that
+    /// read as the wall clock itself (`age_s=1785352360` on all four nodes of the
+    /// #119 run, for the ~7 minutes before slot 8 finalized). The value is 0 and
+    /// the rendering `-`; the field starts speaking at the first non-genesis
+    /// finalization. S8 closed the `None` case; this closes `Some(0)`.
+    #[test]
+    fn telemetry_age_is_zero_while_the_finalized_head_is_genesis() {
+        let (mut rpc, _anchor) = rpc_with_finalized_genesis();
+        // A wall-clock-magnitude tip timestamp over the ts=0 genesis — the exact
+        // shape of the live defect.
+        let h1 = apply_block_at(rpc.node_mut(), 1_785_352_360);
+        let t = rpc.telemetry();
+        assert_eq!(t.finalized_height, Some(0), "the finalized head is genesis");
+        assert_eq!(
+            t.last_finalized_age_secs, 0,
+            "age must never be tip_ts − genesis placeholder"
+        );
+        assert_eq!(t.age_field(), "-", "rendered as refusal, not as a confident number");
+
+        // The boundary: the first non-genesis block finalizes ⇒ a real age, from
+        // real timestamps on both ends of the subtraction.
+        let _h2 = apply_block_at(rpc.node_mut(), 1_785_352_435); // 75 s later
+        assert!(rpc.node_mut().finalize(h1).unwrap(), "height 1 finalizes");
+        let t = rpc.telemetry();
+        assert_eq!(t.finalized_height, Some(1));
+        assert_eq!(t.last_finalized_age_secs, 75, "tip_ts − finalized_ts, both real");
+        assert_eq!(t.age_field(), "75");
     }
 
     #[test]
