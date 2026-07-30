@@ -1343,4 +1343,185 @@ mod tests {
         l.note_local_proposal(&c, 0, None);
         assert_eq!(l.open_round(8).unwrap().local_cpid, Some(0xabc));
     }
+
+    // ---- issue #105: the alarm counts live rounds, and only live rounds --------
+
+    /// **ACCEPTANCE #1 — the reported shape, reproduced and then not reproduced.**
+    ///
+    /// node3 resynced 3,597 blocks and printed `rounds=1316 rfail=1315` while its
+    /// `final=` matched its three peers. The mechanism is here in miniature: the
+    /// slot cursor is handed 449 cadence slots that the chain had already run past,
+    /// because a header batch moves the tip in one step and the ledger is told
+    /// afterwards.
+    ///
+    /// The bar is **both halves**: the alarm pair must not be inflated, and every
+    /// one of those slots must still have a record — a crossed slot leaving no
+    /// trace is the mistake #87 exists to have fixed.
+    #[test]
+    fn a_resync_does_not_manufacture_failed_rounds_but_still_journals_every_slot() {
+        const SYNCED_TO: u64 = 3_592; // 449 cadence slots, the reported resync
+        let mut l = RoundLedger::new(ObsClock::Deterministic);
+
+        // The tip is already at SYNCED_TO when the cursor is told about the slots:
+        // that is what a header batch does, and it is the whole of the defect.
+        let mut slots = 0;
+        let mut h = LIVE_SLOT_SLACK;
+        while h <= SYNCED_TO {
+            l.note_slot_reached(&ctx_at_tip(h, SYNCED_TO, 21, 21, 15));
+            slots += 1;
+            h += LIVE_SLOT_SLACK;
+        }
+        assert_eq!(slots, 449, "the resync crossed 449 cadence slots");
+
+        // Then the node catches up and the live slot finalizes, closing the rest.
+        l.note_finalized(SYNCED_TO);
+
+        // THE NUMBER. Before this change both counters read ~449 here (one closed
+        // record per crossed slot, all but one of them a "failure").
+        assert_eq!(l.failed_total(), 0, "a healthy resync fails no live round");
+        assert_eq!(l.closed_total(), 1, "exactly one round happened here: the one it caught up to");
+        assert_eq!(l.backfill_total(), 448, "…and the rest are history, counted as history");
+        assert_eq!(
+            l.closed_total() + l.backfill_total(),
+            slots,
+            "every crossed slot is accounted for in exactly one place"
+        );
+
+        // THE TRACE. Every crossed slot still has a record and a verdict that names
+        // what it was. (`take_emitted` is bounded by RETAINED_ROUNDS, so the journal
+        // itself is read through `recent`, which is the same bound — see the PR's
+        // "what I did not verify".)
+        let seen: Vec<&RoundRecord> = l.recent().collect();
+        assert_eq!(seen.len(), RETAINED_ROUNDS, "the retained ring is full of them");
+        let backfilled = seen.iter().filter(|r| r.diagnose() == RoundDiagnosis::Backfill).count();
+        assert_eq!(backfilled, RETAINED_ROUNDS - 1, "all but the caught-up slot read `backfill`");
+        let line = seen[0].to_line();
+        assert!(line.contains("why=backfill"), "the journal says what it was: {line}");
+        assert!(!line.contains("why=silent"), "`silent` is a diagnosis, and nothing failed: {line}");
+
+        // And the slot it caught up to is a real, finalized round.
+        let caught_up = seen.last().expect("non-empty");
+        assert_eq!(caught_up.height, SYNCED_TO);
+        assert_eq!(caught_up.diagnose(), RoundDiagnosis::Finalized);
+    }
+
+    /// **ACCEPTANCE #2 — the half that matters more.** A fix that only silences is
+    /// indistinguishable from deleting the counter, so every way a *live* round can
+    /// fail must still increment `rfail`: heard nothing, heard some and stopped,
+    /// was still hearing votes when it was cut off, and could never have reached
+    /// quorum at all.
+    #[test]
+    fn a_live_round_that_genuinely_fails_still_increments_the_alarm() {
+        for (name, have, active, tip_at_close) in [
+            ("silent", 0usize, 21usize, 16u64),
+            ("votes_short", 11, 21, 16),
+            ("quorum_impossible", 11, 14, 16),
+            // A node MINING THROUGH A STALL runs its tip a long way past a round it
+            // genuinely lost. The classification is taken at OPEN precisely so this
+            // still counts: re-deciding it at close would read `tip=3592` here and
+            // call a committee outage "backfill", which is the alarm switching
+            // itself off again by a different route.
+            ("silent, tip far past it", 0, 21, 3_592),
+        ] {
+            let mut l = RoundLedger::new(ObsClock::Deterministic);
+            let c = ctx(8, 21, active, 15); // opened AT the frontier: tip == slot
+            l.note_slot_reached(&c);
+            if have > 0 {
+                l.note_votes(&c, &(0..have).collect::<Vec<_>>(), &[], VoteRejects::default(), 1);
+            }
+            // A later slot finalizes past it — the ordinary way a failed round ends.
+            l.note_slot_reached(&ctx_at_tip(tip_at_close, tip_at_close, 21, active, 15));
+            l.note_finalized(tip_at_close);
+
+            assert_eq!(l.failed_total(), 1, "{name}: a live round that failed must be counted");
+            assert_eq!(l.backfill_total(), 0, "{name}: nothing here was history");
+            let r = l.recent().find(|r| r.height == 8).expect("{name}: journalled");
+            assert!(r.live, "{name}: opened at the frontier ⇒ live");
+            assert_ne!(r.diagnose(), RoundDiagnosis::Backfill, "{name}");
+        }
+    }
+
+    /// The predicate itself, at its two edges. One cadence either side of our own
+    /// tip: the lower bound is "the next round had already opened before we got
+    /// here", the upper is the vote tally's own admission window.
+    #[test]
+    fn the_live_window_is_one_cadence_either_side_of_our_own_tip() {
+        let tip = 1_000;
+        assert!(RoundLedger::is_live_slot(tip, tip), "the slot we are standing on");
+        assert!(RoundLedger::is_live_slot(tip - LIVE_SLOT_SLACK + 1, tip), "just inside, below");
+        assert!(!RoundLedger::is_live_slot(tip - LIVE_SLOT_SLACK, tip), "a full cadence behind");
+        assert!(RoundLedger::is_live_slot(tip + LIVE_SLOT_SLACK, tip), "one cadence ahead is votable");
+        assert!(!RoundLedger::is_live_slot(tip + LIVE_SLOT_SLACK + 1, tip), "beyond what the tally admits");
+        // The reported incident, both ends of it: slots crossed during the resync,
+        // and the far-ahead slots whose vote sets arrived while we were still behind.
+        assert!(!RoundLedger::is_live_slot(1_368, 3_592), "a slot the resync walked past");
+        assert!(!RoundLedger::is_live_slot(3_600, 100), "live votes for a slot we are 3,500 behind");
+        // …and no underflow at the bottom of the chain.
+        assert!(RoundLedger::is_live_slot(8, 0));
+    }
+
+    /// **A slot that is far above our tip is not a round either**, and this is the
+    /// second inflation path the issue body does not name: a vote set the tally
+    /// refuses as out-of-window still reaches `note_votes`, which opens a record for
+    /// it. Repeat gossip then re-opens and the open-round cap re-closes the same
+    /// slot, so one height could be counted as a failure many times over.
+    #[test]
+    fn out_of_window_vote_sets_cannot_pump_the_alarm() {
+        let mut l = RoundLedger::new(ObsClock::Deterministic);
+        // We are at tip 100; the net is gossiping slot 3600. The tally grows nothing
+        // (out of window), so `counted` is empty — exactly the adapter's call.
+        for _ in 0..40 {
+            let far = ctx_at_tip(3_600, 100, 21, 21, 15);
+            l.note_votes(&far, &[], &[], VoteRejects::default(), 1);
+            // Our own cursor keeps crossing slots and evicting it, over and over.
+            for k in 1..=(MAX_OPEN_ROUNDS as u64 + 1) {
+                l.note_slot_reached(&ctx_at_tip(k * LIVE_SLOT_SLACK, 100, 21, 21, 15));
+            }
+        }
+        assert_eq!(l.failed_total(), 0, "our own distance from the chain is not a committee fault");
+        assert_eq!(l.closed_total(), 0);
+        assert!(l.backfill_total() > 0, "the records exist; they are just not failures");
+    }
+
+    /// Candidate B, kept for the one thing it buys: a slot at or below the finalized
+    /// head is **settled**, and a re-gossiped vote set for it must not re-open the
+    /// record that already closed. Nothing else in the ledger remembers what has
+    /// closed, so without this the same round can be counted twice.
+    #[test]
+    fn a_settled_slot_is_never_re_opened_by_a_late_vote() {
+        let mut l = RoundLedger::new(ObsClock::Deterministic);
+        let c = ctx(8, 21, 21, 15);
+        l.note_votes(&c, &(0..15).collect::<Vec<_>>(), &[], VoteRejects::default(), 1);
+        l.note_finalized(8);
+        assert_eq!((l.closed_total(), l.failed_total()), (1, 0));
+
+        // The same vote set arrives again from another peer, twenty times over.
+        for _ in 0..20 {
+            l.note_votes(&c, &(0..15).collect::<Vec<_>>(), &[], VoteRejects::default(), 1);
+            l.note_slot_reached(&c);
+            l.note_rejected_message(&c, VoteRejects { forged: 1, ..Default::default() });
+        }
+        assert_eq!(l.open_len(), 0, "a settled slot has no open round");
+        assert_eq!(
+            (l.closed_total(), l.failed_total(), l.backfill_total()),
+            (1, 0, 0),
+            "the finalized round is counted exactly once, ever"
+        );
+    }
+
+    /// A backfilled slot that nevertheless reached quorum **here** did happen as a
+    /// round, and the filter must never hide a success — `Finalized` stays above
+    /// `Backfill` in the ladder for exactly this case.
+    #[test]
+    fn a_backfilled_slot_that_finalizes_here_still_counts_as_a_round() {
+        let mut l = RoundLedger::new(ObsClock::Deterministic);
+        let c = ctx_at_tip(800, 3_592, 21, 21, 15); // reached as history…
+        l.note_slot_reached(&c);
+        assert!(!l.open_round(800).unwrap().live);
+        l.note_votes(&c, &(0..15).collect::<Vec<_>>(), &[], VoteRejects::default(), 1);
+        l.note_finalized(800); // …but it finalized at this node anyway
+        let r = l.recent().next().expect("journalled");
+        assert_eq!(r.diagnose(), RoundDiagnosis::Finalized);
+        assert_eq!((l.closed_total(), l.failed_total(), l.backfill_total()), (1, 0, 0));
+    }
 }

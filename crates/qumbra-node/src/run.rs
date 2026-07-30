@@ -1783,12 +1783,15 @@ mod tests {
                 "rounds", "rfail",
                 // ── appended by #84, at the end ──
                 "fid", "sslot", "sid",
+                // ── appended by #105, at the end ──
+                "rback",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
         assert!(line.starts_with("TELEMETRY tip="));
         // Genesis finalized as slot 0 without a round, so nothing has closed yet.
         assert!(line.contains(" rounds=0 rfail=0"), "{line}");
+        assert!(line.contains(" rback=0"), "nothing was walked past either: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2139,6 +2142,116 @@ mod tests {
         // nothing is invented — the wall-clock behaviour is pinned in
         // `qlab_node::round`'s own test.
         assert!(node.emit_overdue_rounds().is_empty(), "no clock basis ⇒ no age, no report");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- issue #105: the alarm counts live rounds, and only live rounds ------
+
+    /// **ACCEPTANCE, on the real run path: the two classes on one node.**
+    ///
+    /// First half — a tip that moved a long way while the ledger was not looking is
+    /// exactly what a `Headers` batch does to a resyncing node, and it is what
+    /// produced `rounds=1316 rfail=1315` on a node whose `final=` matched its three
+    /// peers. Those slots must reach `rback=`, not `rfail=`, and must still be
+    /// journalled.
+    ///
+    /// Second half — the same node then crosses slots **at the frontier**, one block
+    /// at a time, and loses them (it holds no committee keys, so nothing finalizes
+    /// and the open-round cap closes them). Those are live rounds that failed and
+    /// they must still increment `rfail`. A fix that only silences would leave this
+    /// half at zero and be indistinguishable from deleting the counter.
+    #[test]
+    fn a_catch_up_lands_in_rback_while_a_lost_live_round_still_lands_in_rfail() {
+        let (mut config, genesis, base) = rig("i105_catchup", true);
+        // Verify-only: no committee keys, so this node never proposes and never
+        // finalizes — the position a joiner or a just-restarted node is in.
+        config.committee_key_paths.clear();
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        assert_eq!(node.finalized_height(), None, "no keys ⇒ nothing finalizes here");
+
+        // ---- half 1: the tip jumps, THEN the ledger is told ------------------
+        const CAUGHT_UP_TO: u64 = 200; // 25 cadence slots crossed in one step
+        for _ in 0..CAUGHT_UP_TO {
+            assert!(node.try_mine());
+        }
+        assert_eq!(node.tip_height(), CAUGHT_UP_TO);
+        node.note_slots_reached();
+
+        let line = node.telemetry_sample();
+        assert_eq!(field(&line, "rounds"), "0", "no round happened at this node: {line}");
+        assert_eq!(
+            field(&line, "rfail"),
+            "0",
+            "the history it crossed is not a committee failure: {line}"
+        );
+        let backfilled: u64 = field(&line, "rback").parse().unwrap();
+        assert!(backfilled > 0, "the slots it walked past are counted, as history: {line}");
+
+        // …and every one of them left a trace with a verdict that names what it was.
+        let lines = node.emit_rounds();
+        assert_eq!(lines.len() as u64, backfilled, "one journal line per closed slot");
+        assert!(
+            lines.iter().all(|l| l.contains("why=backfill")),
+            "a crossed slot says `backfill`, not `silent`: {lines:?}"
+        );
+
+        // ---- half 2: slots crossed AT the frontier, and lost ------------------
+        // One block at a time with the cursor following it, which is what ordinary
+        // operation looks like: the tip is on the slot when the ledger meets it.
+        let live_slots = qlab_node::round::MAX_OPEN_ROUNDS as u64 + 2;
+        for _ in 0..(live_slots * CHECKPOINT_CADENCE_BLOCKS) {
+            assert!(node.try_mine());
+            node.note_slots_reached();
+        }
+        let line = node.telemetry_sample();
+        let failed: u64 = field(&line, "rfail").parse().unwrap();
+        let closed: u64 = field(&line, "rounds").parse().unwrap();
+        let backfilled_now: u64 = field(&line, "rback").parse().unwrap();
+        assert!(failed > 0, "a live round this node lost MUST still raise the alarm: {line}");
+        assert_eq!(closed, failed, "this node holds no keys, so none of them finalized: {line}");
+        assert!(
+            backfilled_now > backfilled,
+            "the rounds the catch-up left open close as what they were, not as failures: {line}"
+        );
+
+        // **The accounting closes.** Every cadence slot the node ever crossed is in
+        // exactly one of three places — a live round, history, or still open — and
+        // the sum is the slot count. Before #105 the first bucket held all of them.
+        let still_open = node.p2p().node().rounds().open_len() as u64;
+        let crossed = node.tip_height() / CHECKPOINT_CADENCE_BLOCKS;
+        assert_eq!(
+            closed + backfilled_now + still_open,
+            crossed,
+            "slots crossed = {crossed}, accounted = {closed} live + {backfilled_now} history \
+             + {still_open} open: {line}"
+        );
+
+        let live_lines = node.emit_rounds();
+        assert!(
+            live_lines.iter().any(|l| l.contains("why=silent")),
+            "a live round with no votes is `silent` — that diagnosis is not deleted: {live_lines:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The scrape carries the same split, with its caliper in the `HELP` text — the
+    /// two instruments must not be able to disagree about what `rfail` covers.
+    #[test]
+    fn the_scrape_declares_the_backfill_verdict_and_states_the_caliper() {
+        let (config, genesis, base) = rig("i105_scrape", true);
+        let node = RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let text = node.metrics_text();
+        assert!(
+            text.contains("qumbra_checkpoint_rounds_total{verdict=\"backfill\"} 0"),
+            "the series is pre-declared, so an alert can be written against it: {text}"
+        );
+        assert!(
+            text.contains("EXCLUDES backfill"),
+            "the caliper travels with the number, not in a runbook: {text}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
