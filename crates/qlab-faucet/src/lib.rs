@@ -60,19 +60,25 @@
 //! queue. It is a **submission deadline** on a proof already built, and [`grant`]
 //! models it as an [`grant::AnchorLease`] with a pre-submit re-check.
 //!
-//! ### 4. New money cannot be spent for three hours — and in this prototype, not
-//! ###    at all
+//! ### 4. New money cannot be spent for three hours
 //!
-//! `COINBASE_MATURITY_BLOCKS` = 144 × 75 s = 3.0 h gates spending fresh coinbase.
-//! Underneath it sits a prototype boundary this crate had to work around and
-//! reports rather than fixes: **a coinbase note never enters the commitment tree**
-//! (`qlab_node::Node::apply_state` appends only `tx.commitments`; the mempool
-//! records the coinbase note into a *registry*), so it has no leaf, no witness,
-//! and cannot be spent by a real 2×2 proof today. The lab therefore funds the
-//! faucet from a seeded note set, exactly as `qlab-demo` seeds its pre-existing
-//! UTXOs, and the maturity constraint is bound at the seam that does exist —
-//! [`service::Faucet`] declares the coinbase notes a grant consumes so
-//! `Mempool::admit`'s frozen §2 gate runs on the real code path.
+//! `COINBASE_MATURITY_BLOCKS` = 144 × 75 s = 3.0 h delays spending fresh coinbase.
+//!
+//! **Both halves of what this section used to say are now obsolete, in opposite
+//! directions.** PR #103 recorded that a coinbase note never enters the commitment
+//! tree, so it had no leaf and no witness and could not be spent at all — issue #101
+//! fixed that; a mined coin is an ordinary note with a real leaf and a real 2×2
+//! spend. And it recorded that the maturity constraint was bound by *declaring* the
+//! coinbase notes a grant consumes, to reach `Mempool::admit`'s gate — issue #102
+//! deleted that declaration, because the declaration was itself the defect: naming
+//! them links the spend to the coinbase, collapsing the anonymity set on a chain with
+//! one global shielded pool and no transparent tier.
+//!
+//! The delay is now enforced by the tree's shape rather than by anyone's word: the
+//! coinbase leaf is appended 144 blocks after the block that earned it, so an immature
+//! note has no leaf, hence no membership witness, hence no provable spend. This crate
+//! carries no maturity logic as a result — an [`OwnedNote`] records the height it was
+//! minted at (so a holder can ask *why* a witness is missing), and nothing more.
 //!
 //! ## What this crate is not
 //!

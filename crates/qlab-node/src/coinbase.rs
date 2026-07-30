@@ -161,8 +161,124 @@ pub fn coinbase_note(height: u64, body: &BlockBody) -> Option<Note> {
 /// The commitment-tree leaf for `body`'s coinbase note at `height` — the real
 /// `note_commitment`, on-wire lane-major bytes, ready for
 /// `CommitmentStore::append`. `None` exactly when [`coinbase_note`] is `None`.
+///
+/// **This is the leaf `height` *mints*, not the leaf `height` *appends*.** Since
+/// issue #102 those are different heights: see [`matures_coinbase_minted_at`].
 pub fn coinbase_note_leaf(height: u64, body: &BlockBody) -> Option<Hash32> {
     coinbase_note(height, body).map(|n| digest_bytes(&n.commitment()))
+}
+
+// ---------------------------------------------------------------------------
+// The maturity append schedule (issue #102, option (b))
+// ---------------------------------------------------------------------------
+
+/// The height whose coinbase note a block at `height` appends to the commitment
+/// tree, or `None` when the block is younger than the maturity delay and so
+/// matures nothing.
+///
+/// **This is the single statement of the frozen §2 rule's enforcement.** Before
+/// issue #102 the schedule was the identity — a block appended its *own*
+/// coinbase leaf — and maturity was a mempool policy check against a submitter's
+/// declaration, which was bypassable three separate ways (an honest-but-silent
+/// `vec![]`, the hardcoded `vec![]` on the P2P path, and an in-memory registry
+/// that is empty after every restart). None of those is a hole any more, because
+/// there is nothing left to declare: an immature coinbase note **has no leaf in
+/// any anchor this chain will accept**, therefore no membership witness against
+/// one, therefore no spend that verifies. That beats `refused-by-policy` because it
+/// holds against a submitter who lies, a peer that bypasses the mempool, and a node
+/// that just restarted — none of which is being asked anything.
+///
+/// **Stated that way on purpose, because the short version is false.** "An immature
+/// spend is unprovable" is not true in general: an attacker can append the leaf to a
+/// tree of their own, take a genuine witness against it, and produce a perfectly
+/// valid proof of a true statement about *that* tree — and the production verifier
+/// accepts it. `qumbra-node`'s
+/// `a_forged_anchor_carrying_a_real_proof_is_rejected_at_the_block_path` does exactly
+/// this and asserts the acceptance. What is actually true is narrower and stronger:
+/// **their proof is fine and their anchor is the lie**, and the anchor is checked by
+/// `validate_body` on every block from every peer, with no mempool involved. Anyone
+/// reading "unprovable rather than refused-by-policy" anywhere in this tree should
+/// read that test — it is the difference between the slogan and the property.
+///
+/// Every consumer of the schedule calls this rather than restating `height − 144`:
+/// [`crate::node::Node::apply_state`] to append, [`crate::rpc::NodeRpc`]'s anchor
+/// reconstruction to count, and `qumbra_faucet::NodeView`'s to do the same for a
+/// node that composes no RPC. That third one was a live off-by-144 until the full
+/// suite caught it — restating a *sliding* rule is the shape issue #116 was filed
+/// about, and #116 named only the first two because it was written about the RPC.
+pub fn matures_coinbase_minted_at(height: u64) -> Option<u64> {
+    height.checked_sub(crate::emission::COINBASE_MATURITY_BLOCKS)
+}
+
+/// The height at whose application the coinbase minted at `minted_height` enters
+/// the commitment tree — the inverse of [`matures_coinbase_minted_at`], and the
+/// first height whose root can serve as an anchor for spending it.
+pub fn coinbase_leaf_appears_at(minted_height: u64) -> u64 {
+    minted_height + crate::emission::COINBASE_MATURITY_BLOCKS
+}
+
+/// The coinbase leaf a block at `height` appends, given a lookup for the body of
+/// its own ancestor at a given height. `None` when the block matures nothing —
+/// it is below the delay, its ancestor is unreachable, or that ancestor minted
+/// nothing (genesis).
+///
+/// The `ancestor_body` closure is what keeps this replay-identical: it must
+/// resolve heights against **this block's own ancestry**, never against a
+/// height-indexed side table, so the answer follows whichever chain the block is
+/// on. See `Node::apply_state` for why nothing may be persisted here.
+pub fn matured_coinbase_leaf<F>(height: u64, ancestor_body: F) -> Option<Hash32>
+where
+    F: FnOnce(u64) -> Option<BlockBody>,
+{
+    let minted_at = matures_coinbase_minted_at(height)?;
+    coinbase_note_leaf(minted_at, &ancestor_body(minted_at)?)
+}
+
+/// Whether a coinbase note minted at a given height has entered the commitment
+/// tree yet — and if not, when it will.
+///
+/// **This type exists because option (b) would otherwise make an immature
+/// coinbase indistinguishable from a note that never existed.** Before #102 a
+/// holder got `MempoolError::ImmatureCoinbase` — a wrong answer, but a legible
+/// one. Under (b) the leaf is simply absent, and "absent" is the same signal a
+/// wallet gets for a commitment that was never minted at all. An absence that
+/// reads as a healthy empty state is this repository's most-repeated defect
+/// (#104, #106, #113, #130, and #102's own fail-open), so the absence is given a
+/// reason at the one place a holder can ask.
+///
+/// Asking costs nothing in privacy, and that is the whole difference from the
+/// declaration this replaces. The declaration leaked because it bound a *spend*
+/// to a *coinbase*; this names only a block height, which every node already has
+/// in plaintext along with the payee's `coinbase_rkm`. Nothing about a spend is
+/// stated, or even implied — the question is identical whether or not the asker
+/// intends to spend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoinbaseMaturity {
+    /// The leaf entered the tree when `leaf_at` was applied, so every root from
+    /// that height onward contains it and a membership witness exists. If a
+    /// witness still cannot be built, the note genuinely does not exist.
+    Matured {
+        /// The height whose application appended the leaf.
+        leaf_at: u64,
+    },
+    /// The leaf does not exist yet. Its absence is the maturity rule, not a
+    /// missing note, and it will be appended when `leaf_at` is applied.
+    Immature {
+        /// The height whose application will append the leaf.
+        leaf_at: u64,
+        /// Blocks the tip must still advance before then.
+        blocks_remaining: u64,
+    },
+}
+
+/// Answer [`CoinbaseMaturity`] for a coinbase minted at `minted_height` against
+/// a chain whose tip is `tip_height`. Pure — both inputs are public chain facts.
+pub fn coinbase_maturity(minted_height: u64, tip_height: u64) -> CoinbaseMaturity {
+    let leaf_at = coinbase_leaf_appears_at(minted_height);
+    match leaf_at.checked_sub(tip_height) {
+        None | Some(0) => CoinbaseMaturity::Matured { leaf_at },
+        Some(blocks_remaining) => CoinbaseMaturity::Immature { leaf_at, blocks_remaining },
+    }
 }
 
 #[cfg(test)]

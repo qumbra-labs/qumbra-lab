@@ -210,11 +210,15 @@ impl GrantPlan {
         !self.lease.is_expired(view)
     }
 
-    /// The coinbase-note commitments this grant's inputs declare — what
-    /// `Mempool::admit` needs for the frozen §2 maturity gate.
-    pub fn spends_coinbase(&self) -> Vec<Hash32> {
-        self.spent.iter().filter_map(|n| n.coinbase_note).collect()
-    }
+    // `spends_coinbase()` is deleted (issue #102). It computed the list of
+    // coinbase-note commitments a grant consumes, for `Mempool::admit`'s maturity
+    // gate — and that list *is* the §6 privacy leak the gate was retired over: on a
+    // chain with one global shielded pool and no transparent tier, naming the
+    // coinbase notes a transaction spends links the spend to the coinbase and
+    // collapses the anonymity set of exactly the first transaction a new user makes.
+    // Maturity is now structural (an immature note has no leaf, so no witness), so
+    // there is nothing to declare. Keeping a helper that computes a declaration
+    // nobody consumes would leave the leak one call site away from returning.
 }
 
 impl std::fmt::Debug for GrantPlan {
@@ -384,7 +388,7 @@ pub fn build_grant<R: CryptoRng>(
         cm: inst.cm_out[1],
         // Change is never coinbase-derived: it is the output of an ordinary spend,
         // so it carries no maturity obligation of its own.
-        coinbase_note: None,
+        coinbase_minted_at: None,
     };
 
     let plan = GrantPlan {

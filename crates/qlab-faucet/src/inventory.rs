@@ -72,17 +72,18 @@ pub struct OwnedNote {
     pub d: Diversifier,
     /// The leaf commitment `cm = H(value ‖ rkm ‖ ρ ‖ rseed)`.
     pub cm: [u64; 4],
-    /// If this note came from a coinbase, the **coinbase-note commitment** the node
-    /// registered for the block that minted it
-    /// (`qlab_node::coinbase_note_commitment`).
+    /// If this note came from a coinbase, the **height of the block that minted
+    /// it**; `None` for an ordinary note.
     ///
-    /// Carried so a grant can *declare* the coinbase notes it consumes, which is
-    /// what `Mempool::admit` needs to run the frozen §2 144-block maturity gate. The
-    /// faucet's real funding is coinbase, so this is the field that binds constraint
-    /// four to the code path that enforces it — and it is `Option` because the lab
-    /// funds the faucet from a seeded note set (a coinbase note is not a tree leaf in
-    /// this prototype; see the crate docs).
-    pub coinbase_note: Option<[u8; 32]>,
+    /// This used to be the coinbase-note *commitment*, carried so a grant could
+    /// declare the coinbase notes it consumes for `Mempool::admit`'s maturity gate.
+    /// Issue #102 deleted that declaration — it was the §6 privacy leak — and made
+    /// maturity structural, so a commitment has nothing left to feed. The height
+    /// does: maturity is a function of height, so this is what lets a holder ask
+    /// [`qlab_node::coinbase_maturity`] whether a note with no membership witness is
+    /// immature or nonexistent, and it is what the faucet's funding threshold is
+    /// computed from.
+    pub coinbase_minted_at: Option<u64>,
 }
 
 impl OwnedNote {
@@ -94,21 +95,22 @@ impl OwnedNote {
     pub fn new(wallet: &Wallet, value: u64, rho: [u64; 4], rseed: [u64; 4], d: Diversifier) -> Self {
         let input = wallet.spend_input(value, rho, rseed, d);
         let (_nk, _nf, cm) = derive_input(&input);
-        Self { value, rho, rseed, d, cm, coinbase_note: None }
+        Self { value, rho, rseed, d, cm, coinbase_minted_at: None }
     }
 
-    /// The same, for a note whose origin is the coinbase of the block whose
-    /// coinbase-note commitment is `coinbase_note`. Spending it must clear the
-    /// 144-block maturity gate.
+    /// The same, for a note minted as the coinbase of the block at
+    /// `coinbase_minted_at`. Its leaf enters the commitment tree 144 blocks later
+    /// (frozen §2, enforced by the append schedule since issue #102), so it has no
+    /// membership witness and cannot be spent before then.
     pub fn from_coinbase(
         wallet: &Wallet,
         value: u64,
         rho: [u64; 4],
         rseed: [u64; 4],
         d: Diversifier,
-        coinbase_note: [u8; 32],
+        coinbase_minted_at: u64,
     ) -> Self {
-        Self { coinbase_note: Some(coinbase_note), ..Self::new(wallet, value, rho, rseed, d) }
+        Self { coinbase_minted_at: Some(coinbase_minted_at), ..Self::new(wallet, value, rho, rseed, d) }
     }
 
     /// The circuit spend witness for this note (the spend capability lives only on

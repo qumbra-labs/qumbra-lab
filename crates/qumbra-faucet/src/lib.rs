@@ -61,28 +61,33 @@
 //! it would also put a second surface on the one host in the topology that holds a
 //! hot spending key, which is the concentration §6.2 exists to break up.
 //!
-//! ## The maturity gate lives at the funding boundary, and why it had to
+//! ## The maturity delay, and why this crate no longer carries it
 //!
-//! `COINBASE_MATURITY_BLOCKS` = 144 (frozen §2) gates spending fresh coinbase, and
+//! `COINBASE_MATURITY_BLOCKS` = 144 (frozen §2) delays spending fresh coinbase, and
 //! since issue #101 the faucet's real funding *is* coinbase — its own node's
-//! `coinbase_rkm` payout. But the declaration
-//! [`qlab_faucet::GrantPlan::spends_coinbase`] computes has **nowhere to go**: both
-//! submission seams in the tree hardcode an empty declaration
-//! (`qlab_node::rpc::NodeRpc::submit_tx` and `qlab_p2p::adapter::NodeAdapter::ingest_tx`),
-//! so the mempool's frozen §2 gate is unreachable from the wallet RPC *and* from
-//! the wire. That is issue #102, widened by one seam, and it is reported rather
-//! than worked around.
+//! `coinbase_rkm` payout.
 //!
-//! Nor can the core enforce it itself: [`qlab_faucet::OwnedNote::coinbase_note`]
-//! carries the note's *commitment* but not the *height* it was minted at, and
-//! maturity is a function of the height.
+//! **PR #103's version of this section described this crate as the frozen rule's only
+//! live enforcement. Issue #102 fixed that, so the description is obsolete and the
+//! responsibility has moved.** The mempool's gate needed a submitter-supplied
+//! declaration of the coinbase notes a transaction spent, and both submission seams
+//! hardcoded an empty one (`NodeRpc::submit_tx` and `NodeAdapter::ingest_tx`), so the
+//! rule was unreachable from the wallet RPC *and* from the wire — the finding this
+//! crate reported. The declaration is now deleted rather than plumbed, because
+//! computing it honestly is what leaked: naming the coinbase notes a transaction
+//! spends links the spend to the coinbase, on a chain whose privacy rests on one
+//! global shielded pool with no transparent tier.
 //!
-//! So [`harvest`] honours it at the **funding boundary**: a coinbase note this
-//! node mined is handed to [`qlab_faucet::Faucet::fund`] only once
-//! `tip ≥ minted_height + 144`. Every note in the inventory is then mature by
-//! construction, and no immature spend is ever built, let alone submitted. The
-//! alternative — submitting undeclared — would make a demo work *today* by riding
-//! #102, and is not taken.
+//! Enforcement is structural now: the coinbase leaf is appended 144 blocks late
+//! ([`qlab_node::matures_coinbase_minted_at`]), so an immature note has no leaf, no
+//! membership witness, and no provable spend — binding a lying submitter, a peer that
+//! bypasses the mempool, and a restarted node alike.
+//!
+//! [`harvest`] still checks [`harvest::spendable_at_tip`] before funding, but for a
+//! smaller reason: a grant proof costs ~2.3 s and a fee, and building one that cannot
+//! be proved would burn both and report nothing. The refusal carries a height (§6.2).
+//! Note the threshold moved by one block — it is now `minted + 144`, the height the
+//! leaf actually lands at, not the policy gate's `minted + 143`.
 //!
 //! ## Loss bound (PR #103's, unchanged)
 //!

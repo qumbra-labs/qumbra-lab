@@ -603,7 +603,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // makes a buffered-then-applied body durable (issue #104).
             match self.state.apply_block(header, body.clone(), &self.verifier) {
                 Ok(_) => {
-                    self.mempool.on_block_connected(header.height, &body, &self.state);
+                    self.mempool.on_block_connected(&body, &self.state);
                 }
                 // GUARANTEED HERE, and this is not the old "expected" annotation: a
                 // body that fails at the funnel has mutated nothing (`apply_state`
@@ -878,7 +878,6 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         match err {
             MempoolError::WrongFee { .. } => "wrong fee",
             MempoolError::AnchorNotValid => "anchor not valid",
-            MempoolError::ImmatureCoinbase { .. } => "immature coinbase",
             MempoolError::AlreadySpent { .. } => "nullifier spent",
             MempoolError::NullifierConflictInPool { .. } => "nullifier in-pool conflict",
             MempoolError::DuplicateTx => "duplicate",
@@ -980,7 +979,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> TxPool for NodeAdapter<P, V> {
             return IngestOutcome::Ignored(STATE_LAG_REASON);
         }
         let wid = wire_tx_id(&tx);
-        match self.mempool.admit(tx, vec![], &self.state, &self.verifier) {
+        // Issue #102: this line used to read `admit(tx, vec![], …)`. The hardcoded
+        // empty declaration meant every transaction arriving from a peer claimed to
+        // spend no coinbase note, so the frozen §2 maturity loop iterated zero times
+        // on the *only* path that carries other people's transactions — the rule had
+        // no enforcement here at all. There is no declaration to hardcode now: an
+        // immature coinbase has no leaf in any valid anchor, so a spend of one has no
+        // witness, fails `verify_tx`, and is refused as `proof invalid` — by the same
+        // check that refuses every other unprovable claim.
+        match self.mempool.admit(tx, &self.state, &self.verifier) {
             Ok(id) => {
                 self.wire_ids.insert(wid, id);
                 IngestOutcome::Accepted
@@ -1207,6 +1214,7 @@ mod tests {
     use qlab_devnet::params_devnet::BOND_AMOUNT;
     use qlab_devnet::pow::KeccakPow;
     use qlab_node::round::{RoundClose, RoundDiagnosis};
+    use qlab_node::ChainStore as _;
     use qlab_node::telemetry::Telemetry;
 
     /// Mock M3 verifier: a proof is valid iff its bytes are exactly `b"ok"`.
@@ -1268,6 +1276,58 @@ mod tests {
         assert_eq!(a.mempool().len(), 1);
         // Re-submitting the good tx is a duplicate.
         assert_eq!(a.ingest_tx(good), IngestOutcome::Duplicate);
+    }
+
+    /// 🔴 **The wire path can no longer admit an immature coinbase spend — issue
+    /// #102's second seam, tested through `ingest_tx` rather than through the mempool
+    /// API.**
+    ///
+    /// This is the line that used to read `admit(tx, vec![], …)`. The hardcoded empty
+    /// declaration meant the frozen §2 maturity loop iterated **zero times for every
+    /// transaction that ever arrived from a peer** — the rule had no enforcement at
+    /// all on the only path carrying other people's transactions, and no test could
+    /// have caught it by driving `Mempool::admit` directly, because the declaration
+    /// production omitted was the very argument such a test supplies by hand.
+    ///
+    /// There is nothing to hardcode now, and that is what makes this testable here:
+    /// the enforcement is that the immature coinbase's leaf is in no anchor, so a
+    /// spend of it has no witness, so its proof cannot verify. What arrives from a
+    /// peer is refused by the proof gate — the same gate that refuses every other
+    /// unprovable claim, reached without anyone being asked to declare anything.
+    ///
+    /// `MockVerifier` here accepts `b"ok"` and rejects everything else, standing in
+    /// for "a proof against an anchor containing the leaf" versus "any proof an
+    /// immature spender could actually construct". The cryptographic half — that no
+    /// such proof exists to bring — is `qumbra-node/tests/coinbase_spend.rs`
+    /// (`an_immature_coinbase_spend_is_unprovable_not_refused`), against the real
+    /// production verifier.
+    #[test]
+    fn the_wire_path_cannot_admit_an_immature_coinbase_spend() {
+        let (mut a, anchor) = adapter_with_finalized_genesis();
+
+        // A peer's transaction claiming to spend a coinbase note that has not matured.
+        // It declares nothing about coinbase origin — there is no field for it — so
+        // this is exactly the shape a hostile or careless submitter sends.
+        let immature = tx_with(anchor, 7, b"unprovable");
+        assert!(
+            matches!(a.ingest_tx(immature.clone()), IngestOutcome::Rejected("proof invalid")),
+            "an immature spend off the wire is refused as unprovable"
+        );
+        assert!(!a.has_tx(&wire_tx_id(&immature)), "and is not pooled");
+        assert_eq!(a.mempool().len(), 0);
+
+        // The refusal is the proof gate, not a maturity policy: `MempoolError` has no
+        // maturity variant left to return, so `reject_reason` cannot name one.
+        assert_eq!(
+            NodeAdapter::<KeccakPow, MockVerifier>::reject_reason(&MempoolError::ProofInvalid),
+            "proof invalid"
+        );
+
+        // And a provable spend on the same path is still admitted — the gate refuses
+        // what cannot be proved, not everything.
+        let provable = tx_with(anchor, 8, b"ok");
+        assert_eq!(a.ingest_tx(provable.clone()), IngestOutcome::Accepted);
+        assert!(a.has_tx(&wire_tx_id(&provable)));
     }
 
     #[test]
@@ -1430,11 +1490,30 @@ mod tests {
         let (header, body) = f.mine_block().expect("mines once its state machine is its chain");
         assert_eq!(f.ingest_block(header, body), IngestOutcome::Accepted);
         assert_eq!(f.state().tip_height(), 3, "its own block is in its own state");
-        assert_eq!(
-            f.state().commitment_count(),
-            leaves + 1,
-            "the coinbase note it just mined has a commitment-tree leaf"
+
+        // Issue #102 moved this test's observable, and the substitution is deliberate.
+        // It asserted `leaves + 1` — the coinbase leaf appearing the moment the block
+        // was applied, which was #101's semantics. The leaf now lands 144 blocks later,
+        // so at height 3 there is nothing to count, and asserting `leaves + 0` would be
+        // *vacuous*: it holds just as well if the block was never applied at all, which
+        // is the silent-loss failure this test exists to catch.
+        //
+        // So "did not lose its coinbase" is checked as: the block is in this node's own
+        // state, the note it minted is derivable from that stored body, and the leaf is
+        // scheduled rather than missing. That a scheduled leaf really does land is
+        // `qlab-node/tests/maturity_schedule.rs`, which spans the delay; here the point
+        // is that the miner recorded its own block, which is what #130 (a) fixed.
+        assert_eq!(f.state().commitment_count(), leaves, "not yet — it matures at 147");
+        let stored = f
+            .state()
+            .chain()
+            .block(&f.state().tip_hash())
+            .expect("its own mined block is in its own chain store");
+        assert!(
+            qlab_node::coinbase_note_leaf(3, &stored.body()).is_some(),
+            "the note it mined is derivable from the body it recorded — nothing is lost"
         );
+        assert_eq!(qlab_node::coinbase_leaf_appears_at(3), 3 + qlab_node::COINBASE_MATURITY_BLOCKS);
     }
 
     /// **#134's boundary, checked rather than assumed: a body that is held, retried
@@ -1688,10 +1767,34 @@ mod tests {
         assert_eq!(replayed.tip_height(), 3);
         assert_eq!(reopened.tip_hash(), replayed.tip_hash());
         assert_eq!(reopened.commitment_root(), replayed.commitment_root());
+        // Issue #102 moved this assertion's observable too, and for the same reason as
+        // in `a_miner_ahead_of_its_own_state_tip_does_not_silently_lose_its_coinbase`.
+        // It counted three coinbase leaves as proof the bodies "really were folded in,
+        // not just logged"; three blocks now append no leaves, and `== 0` would be true
+        // of a header-only log as well, which is precisely the distinction this line
+        // exists to draw.
+        //
+        // The replacement is strictly stronger: every height's *body* came back off
+        // disk, byte-identical to what was mined. A log that recorded only headers
+        // cannot produce that, and neither can one whose bodies were buffered and
+        // dropped.
+        for (height, (_, mined)) in (1..=3u64).zip(blocks.iter()) {
+            let hash = reopened.chain().chain().main_chain()[height as usize];
+            let stored = reopened.chain().block(&hash).expect("the body replayed from disk");
+            assert_eq!(
+                stored.body().commitment(),
+                mined.commitment(),
+                "height {height}: the body itself replayed, not just its header"
+            );
+            assert!(
+                qlab_node::coinbase_note_leaf(height, &stored.body()).is_some(),
+                "height {height}: and it is a minting body, so a leaf is owed for it"
+            );
+        }
         assert_eq!(
             reopened.commitment_count(),
-            3,
-            "three coinbase leaves — the bodies really were folded in, not just logged"
+            0,
+            "and none of the three has matured yet — the first lands at 145"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
