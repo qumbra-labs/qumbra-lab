@@ -1,0 +1,362 @@
+================================================================================
+issue #107 step 1d — RAW EVIDENCE
+does the loop-period regression appear when the harness is held to the hosts'
+2 vCPU?  VERDICT: NO — and the 2 vCPU limit never once bound.
+================================================================================
+
+RIG / BASIS
+  lab rev            claude/i107-step1d-cpu-budget, off main 7c7c33d
+  host machine       macOS 25.5.0 (Darwin), 18 cores / 36 GB, AC power
+  docker             Server 29.6.2, Compose v5.3.1, Docker Desktop
+  docker VM          NCPU=18, MemTotal=8319213568 (7.748 GiB)  <-- docker info
+  image              qumbra-node:t0-lite, built from this branch
+  genesis            8811d4e0ccdee702bafd4c92afad768495dc43360778072338aa140d87a73cff
+                     (asserted == PINNED_GENESIS by soak.sh rehearsal, both nets)
+  telemetry cadence  QUMBRA_SAMPLE_SECS unset => --sample-interval-secs 30
+  netem              NONE installed in any condition (zero-latency runs throughout)
+
+MEASUREMENT METHOD (unchanged from steps 1 / 1b / 1c)
+  docker compose logs -t --no-log-prefix <node>  ->  EVERY line matching TELEMETRY
+  -> all docker CAPTURE timestamps -> sorted -> adjacent pairs differenced.
+  No --since. No first-line-of-a-kind. No de-duplication by content. A gap is
+  counted only when BOTH endpoints fall inside the cut window, so a cut can
+  neither manufacture a gap nor hide one. Percentiles are nearest-rank, the same
+  rule in every table. Timestamps are docker's capture stamps, not stamps inside
+  the telemetry line.
+
+  Conditions A/C/B ran on ONE net with NO restarts between them — the budget was
+  changed live with `docker update`, so build, tip range, difficulty regime and
+  process lifetime are shared across those three and cannot explain a difference
+  between them. Condition D is a separate FRESH net (a limit cannot be removed
+  from a running container; see the docker-update note below), so D differs from
+  A/C/B in tip range and process age as well as in budget.
+
+THE FOUR CONDITIONS
+  A  quota 2.00 CPU, dedicated core PAIR per node (0-1/2-3/4-5/6-7), nproc=2
+     ... the condition the dispatch asked for: the hosts' 2 vCPU
+  C  quota 0.40 CPU, ONE dedicated core per node, nproc=1
+     ... a budget BELOW measured demand. Positive control, NOT a host model.
+  B  quota raised to 18.00 CPU, cpuset 0-17, nproc=18   (same net as A and C)
+     ... within-net unconstrained control
+  D  compose DEFAULTS: NanoCpus=0, CpusetCpus="", cgroup quota=max, nproc=18
+     ... proof that the default path is genuinely limit-free, plus a second
+         unconstrained control on a fresh net
+
+WHY nr_throttled IS THE NUMBER THAT DECIDES THIS RUN
+  A CPU limit that is never reached is installed, verified, and inert. cgroup v2's
+  cpu.stat reports how many 100 ms enforcement periods the cgroup was actually cut
+  off in. In condition A that count is ZERO on every node across ~19,000 periods:
+  the budget the dispatch asked for was correctly applied and was never the binding
+  constraint. So A's negative is a statement about the WORKLOAD'S DEMAND, not about
+  CPU scarcity — which is why condition C exists.
+
+A TRAP, FOUND BY TESTING RATHER THAN BY READING
+  `docker update --cpus 0 --cpuset-cpus ""` exits 0 and prints the container name
+  and CHANGES NOTHING — docker reads 0/"" as "leave this field alone", not as
+  "remove the limit". Verified directly:
+      BEFORE cpu.max=200000 100000 cpuset=0-1 nproc=2
+      (docker update --cpus 0 --cpuset-cpus "" ; exit 0, prints name)
+      AFTER  cpu.max=200000 100000 cpuset=0-1 nproc=2      <-- unchanged
+  Raising works (--cpus 18 --cpuset-cpus 0-17 -> cpu.max=1800000 100000, nproc=18).
+  So `soak.sh cpu-budget none` RAISES the ceiling and says so, and only a fresh
+  `up` at the compose defaults gives NanoCpus=0 (condition D).
+
+MEASURED CPU DEMAND (cgroup usage_usec deltas — unambiguous, unlike docker stats%)
+  A  quota 2.00  03:24:1x -> 03:59:48   56.07 CPU-s over ~2130 s wall = 2.6% of ONE core
+  C  quota 0.40  03:59:59 -> 04:19:51   27.37 CPU-s over  1192 s wall = 2.3% of ONE core
+  B  quota 18.0  04:20:40 -> 04:35:21   40.84 CPU-s over   881 s wall = 4.6% of ONE core
+  D  no quota    04:43:5x -> 04:59:44   27.30 CPU-s over  ~950 s wall = 2.9% of ONE core
+  (node0 figures; the other three are within ~10% on every line — see cpu-show dumps.)
+
+  docker stats, 60 s samples, all four nodes pooled per condition:
+    A quota 2.00   n=140  mean 1.32%  min 0.45%  max  27.44%   (% of the container's own cores)
+    C quota 0.40   n= 76  mean 2.08%  min 0.28%  max  40.55%
+    B quota 18.0   n= 56  mean 9.42%  min 0.29%  max 100.44%
+    D no quota     n= 60  mean 1.84%  min 0.42%  max  81.73%
+  The maxima matter more than the means: a mine attempt bursts to ~ONE core. Average
+  demand is ~3% of a core; INSTANTANEOUS demand during mining is ~100% of one core.
+  That is why 0.40 CPU throttles and 2.00 CPU cannot: CFS decides throttling inside
+  each 100 ms period, and a single-threaded burst wanting one core is cut off by any
+  quota below 1.00 CPU and by no quota at or above it.
+
+KERNEL THROTTLING COUNTERS (cgroup v2 cpu.stat) — the check that decides this run
+  A, end of window (quota 2.00 CPU per node):
+     node0  usage_usec=56068379 nr_periods=19377 nr_throttled=0 throttled_usec=0 
+     node1  usage_usec=55826828 nr_periods=18998 nr_throttled=0 throttled_usec=0 
+     node2  usage_usec=55888196 nr_periods=19125 nr_throttled=0 throttled_usec=0 
+     node3  usage_usec=55795749 nr_periods=19043 nr_throttled=0 throttled_usec=0 
+   -- the budget each node BOOTED under (its own startup line) --
+  C, end of window (quota 0.40 CPU per node) — THE LIMIT BINDS:
+     node0  usage_usec=83515761 nr_periods=30409 nr_throttled=514 throttled_usec=30251115 
+     node1  usage_usec=83108232 nr_periods=29838 nr_throttled=520 throttled_usec=30542593 
+     node2  usage_usec=83276408 nr_periods=30075 nr_throttled=520 throttled_usec=30567481 
+     node3  usage_usec=88200819 nr_periods=30024 nr_throttled=645 throttled_usec=38289460 
+   -- the budget each node BOOTED under (its own startup line) --
+  B, raised to 18.00 CPU — cumulative counters still carry C's tail, so this was
+     re-checked as a DELTA over 80 s under the raised ceiling instead:
+       T1  node0 nr_periods 38210 nr_throttled 646   node1 37524 / 623
+           node2 nr_periods 37821 nr_throttled 532   node3 37781 / 661
+       T2  node0 nr_periods 38968 nr_throttled 646   node1 38282 / 623
+           node2 nr_periods 38561 nr_throttled 532   node3 38550 / 661
+       => ~758 periods elapsed per node, nr_throttled UNCHANGED on all four.
+  D, compose defaults — nr_periods=0: there is no quota to enforce at all.
+     node0  usage_usec=27297260 nr_periods=0 nr_throttled=0 throttled_usec=0 
+     node1  usage_usec=27391119 nr_periods=0 nr_throttled=0 throttled_usec=0 
+     node2  usage_usec=27378774 nr_periods=0 nr_throttled=0 throttled_usec=0 
+     node3  usage_usec=27435386 nr_periods=0 nr_throttled=0 throttled_usec=0 
+   -- the budget each node BOOTED under (its own startup line) --
+
+THE CONDITION ESTABLISHED THREE INDEPENDENT WAYS, PER CONDITION
+--- A: quota 2.00 CPU, dedicated core pair, nproc=2 ---
+== CPU budget: current state ==
+   docker sees 18 cores on this machine. The four T0 hosts have 2 vCPU EACH,
+   on four separate machines — this is one VM's scheduler either way.
+   -- cgroup (the kernel's view, read inside each container) --
+     node0  quota=200000/100000 cpuset=0-1 nproc=2
+     node1  quota=200000/100000 cpuset=2-3 nproc=2
+     node2  quota=200000/100000 cpuset=4-5 nproc=2
+     node3  quota=200000/100000 cpuset=6-7 nproc=2
+   -- HostConfig (what was REQUESTED of the daemon) --
+     node0  NanoCpus=2000000000 CpusetCpus="0-1"
+     node1  NanoCpus=2000000000 CpusetCpus="2-3"
+     node2  NanoCpus=2000000000 CpusetCpus="4-5"
+     node3  NanoCpus=2000000000 CpusetCpus="6-7"
+   -- did the budget ever BIND? (kernel throttling counters) --
+     node0  usage_usec=56068379 nr_periods=19377 nr_throttled=0 throttled_usec=0 
+     node1  usage_usec=55826828 nr_periods=18998 nr_throttled=0 throttled_usec=0 
+     node2  usage_usec=55888196 nr_periods=19125 nr_throttled=0 throttled_usec=0 
+     node3  usage_usec=55795749 nr_periods=19043 nr_throttled=0 throttled_usec=0 
+   -- the budget each node BOOTED under (its own startup line) --
+     node0  CPU_BUDGET node0 quota=2.00cpu cpuset=0-1 nproc=2
+     node1  CPU_BUDGET node1 quota=2.00cpu cpuset=2-3 nproc=2
+     node2  CPU_BUDGET node2 quota=2.00cpu cpuset=4-5 nproc=2
+     node3  CPU_BUDGET node3 quota=2.00cpu cpuset=6-7 nproc=2
+   -- asserting every node is at: 2 --
+     node0  ok  (quota=200000/100000 cpuset=0-1 nproc=2)
+     node1  ok  (quota=200000/100000 cpuset=2-3 nproc=2)
+     node2  ok  (quota=200000/100000 cpuset=4-5 nproc=2)
+     node3  ok  (quota=200000/100000 cpuset=6-7 nproc=2)
+   ✓ every node's cgroup matches what was requested
+
+--- C: quota 0.40 CPU, one dedicated core, nproc=1 ---
+== CPU budget: current state ==
+   docker sees 18 cores on this machine. The four T0 hosts have 2 vCPU EACH,
+   on four separate machines — this is one VM's scheduler either way.
+   -- cgroup (the kernel's view, read inside each container) --
+     node0  quota=40000/100000 cpuset=0 nproc=1
+     node1  quota=40000/100000 cpuset=1 nproc=1
+     node2  quota=40000/100000 cpuset=2 nproc=1
+     node3  quota=40000/100000 cpuset=3 nproc=1
+   -- HostConfig (what was REQUESTED of the daemon) --
+     node0  NanoCpus=400000000 CpusetCpus="0-0"
+     node1  NanoCpus=400000000 CpusetCpus="1-1"
+     node2  NanoCpus=400000000 CpusetCpus="2-2"
+     node3  NanoCpus=400000000 CpusetCpus="3-3"
+   -- did the budget ever BIND? (kernel throttling counters) --
+     node0  usage_usec=83515761 nr_periods=30409 nr_throttled=514 throttled_usec=30251115 
+     node1  usage_usec=83108232 nr_periods=29838 nr_throttled=520 throttled_usec=30542593 
+     node2  usage_usec=83276408 nr_periods=30075 nr_throttled=520 throttled_usec=30567481 
+     node3  usage_usec=88200819 nr_periods=30024 nr_throttled=645 throttled_usec=38289460 
+   -- the budget each node BOOTED under (its own startup line) --
+     node0  CPU_BUDGET node0 quota=2.00cpu cpuset=0-1 nproc=2
+     node1  CPU_BUDGET node1 quota=2.00cpu cpuset=2-3 nproc=2
+     node2  CPU_BUDGET node2 quota=2.00cpu cpuset=4-5 nproc=2
+     node3  CPU_BUDGET node3 quota=2.00cpu cpuset=6-7 nproc=2
+   -- asserting every node is at: 0.4 --
+     node0  ok  (quota=40000/100000 cpuset=0 nproc=1)
+     node1  ok  (quota=40000/100000 cpuset=1 nproc=1)
+     node2  ok  (quota=40000/100000 cpuset=2 nproc=1)
+     node3  ok  (quota=40000/100000 cpuset=3 nproc=1)
+   ✓ every node's cgroup matches what was requested
+
+--- B: raised to the whole machine ---
+== CPU budget: current state ==
+   docker sees 18 cores on this machine. The four T0 hosts have 2 vCPU EACH,
+   on four separate machines — this is one VM's scheduler either way.
+   -- cgroup (the kernel's view, read inside each container) --
+     node0  quota=1800000/100000 cpuset=0-17 nproc=18
+     node1  quota=1800000/100000 cpuset=0-17 nproc=18
+     node2  quota=1800000/100000 cpuset=0-17 nproc=18
+     node3  quota=1800000/100000 cpuset=0-17 nproc=18
+   -- HostConfig (what was REQUESTED of the daemon) --
+     node0  NanoCpus=18000000000 CpusetCpus="0-17"
+     node1  NanoCpus=18000000000 CpusetCpus="0-17"
+     node2  NanoCpus=18000000000 CpusetCpus="0-17"
+     node3  NanoCpus=18000000000 CpusetCpus="0-17"
+   -- did the budget ever BIND? (kernel throttling counters) --
+     node0  usage_usec=124361653 nr_periods=38041 nr_throttled=646 throttled_usec=38123131 
+     node1  usage_usec=122071636 nr_periods=37388 nr_throttled=623 throttled_usec=36698874 
+     node2  usage_usec=121956227 nr_periods=37665 nr_throttled=532 throttled_usec=31296301 
+     node3  usage_usec=131269952 nr_periods=37650 nr_throttled=661 throttled_usec=39226816 
+   -- the budget each node BOOTED under (its own startup line) --
+     node0  CPU_BUDGET node0 quota=2.00cpu cpuset=0-1 nproc=2
+     node1  CPU_BUDGET node1 quota=2.00cpu cpuset=2-3 nproc=2
+     node2  CPU_BUDGET node2 quota=2.00cpu cpuset=4-5 nproc=2
+     node3  CPU_BUDGET node3 quota=2.00cpu cpuset=6-7 nproc=2
+   -- asserting every node is at: none --
+     node0  ok  (quota >= the whole machine: quota=1800000/100000 cpuset=0-17 nproc=18)
+     node1  ok  (quota >= the whole machine: quota=1800000/100000 cpuset=0-17 nproc=18)
+     node2  ok  (quota >= the whole machine: quota=1800000/100000 cpuset=0-17 nproc=18)
+     node3  ok  (quota >= the whole machine: quota=1800000/100000 cpuset=0-17 nproc=18)
+   ✓ every node's cgroup matches what was requested
+
+--- D: compose DEFAULTS (NanoCpus=0, quota=max, nr_periods=0) ---
+== CPU budget: current state ==
+   docker sees 18 cores on this machine. The four T0 hosts have 2 vCPU EACH,
+   on four separate machines — this is one VM's scheduler either way.
+   -- cgroup (the kernel's view, read inside each container) --
+     node0  quota=max/100000 cpuset=0-17 nproc=18
+     node1  quota=max/100000 cpuset=0-17 nproc=18
+     node2  quota=max/100000 cpuset=0-17 nproc=18
+     node3  quota=max/100000 cpuset=0-17 nproc=18
+   -- HostConfig (what was REQUESTED of the daemon) --
+     node0  NanoCpus=0 CpusetCpus=""
+     node1  NanoCpus=0 CpusetCpus=""
+     node2  NanoCpus=0 CpusetCpus=""
+     node3  NanoCpus=0 CpusetCpus=""
+   -- did the budget ever BIND? (kernel throttling counters) --
+     node0  usage_usec=27297260 nr_periods=0 nr_throttled=0 throttled_usec=0 
+     node1  usage_usec=27391119 nr_periods=0 nr_throttled=0 throttled_usec=0 
+     node2  usage_usec=27378774 nr_periods=0 nr_throttled=0 throttled_usec=0 
+     node3  usage_usec=27435386 nr_periods=0 nr_throttled=0 throttled_usec=0 
+   -- the budget each node BOOTED under (its own startup line) --
+     node0  CPU_BUDGET node0 quota=unconstrained cpuset=0-17 nproc=18
+     node1  CPU_BUDGET node1 quota=unconstrained cpuset=0-17 nproc=18
+     node2  CPU_BUDGET node2 quota=unconstrained cpuset=0-17 nproc=18
+     node3  CPU_BUDGET node3 quota=unconstrained cpuset=0-17 nproc=18
+   (no expectation given — nothing asserted. Pass '2' or 'none' to assert.)
+
+LOOP-PERIOD GAP TABLES (all TELEMETRY captures, sorted, adjacent pairs differenced)
+################################################################################
+# NET 1 (conditions A, C, B — one net, no restarts, budget changed live)
+################################################################################
+boundaries (UTC): A 03:24:33 -> 03:59:48 | C 03:59:59 -> 04:19:51 | B 04:20:40 -> 04:35:21
+
+---- whole net, NO CUT AT ALL (all three conditions mixed) ----
+basis: first TELEMETRY capture 2026-07-30T03:24:32.917599+00:00
+       last  TELEMETRY capture 2026-07-30T04:35:21.455838+00:00
+       span 70.8 min, 566 TELEMETRY lines over 4 nodes
+
+=== cut: gaps whose BOTH endpoints are at or after t0+0 min ===
+  node0                  n=140   min=   30.00  median=   30.01  p90=   30.02  max=   50.11   <60s=140/140  <130s=140/140
+  node1                  n=141   min=   30.00  median=   30.01  p90=   30.02  max=   36.41   <60s=141/141  <130s=141/141
+  node2                  n=140   min=   30.00  median=   30.01  p90=   30.02  max=   40.42   <60s=140/140  <130s=140/140
+  node3                  n=141   min=   30.00  median=   30.01  p90=   30.02  max=   36.42   <60s=141/141  <130s=141/141
+  ALL NODES POOLED       n=562   min=   30.00  median=   30.01  p90=   30.02  max=   50.11   <60s=562/562  <130s=562/562
+
+---- CONDITION A: quota 2.00 CPU, dedicated pair, nproc=2 ----
+basis: first TELEMETRY capture 2026-07-30T03:24:32.917599+00:00
+       last  TELEMETRY capture 2026-07-30T04:35:21.455838+00:00
+       span 70.8 min, 566 TELEMETRY lines over 4 nodes
+
+=== window: both endpoints inside 2026-07-30T03:26:00Z..2026-07-30T03:59:48Z ===
+  node0                  n=67    min=   30.00  median=   30.01  p90=   30.02  max=   36.37   <60s=67/67  <130s=67/67
+  node1                  n=67    min=   30.00  median=   30.01  p90=   30.02  max=   36.41   <60s=67/67  <130s=67/67
+  node2                  n=67    min=   30.00  median=   30.01  p90=   30.02  max=   36.38   <60s=67/67  <130s=67/67
+  node3                  n=67    min=   30.00  median=   30.01  p90=   30.02  max=   36.42   <60s=67/67  <130s=67/67
+  ALL NODES POOLED       n=268   min=   30.00  median=   30.01  p90=   30.02  max=   36.42   <60s=268/268  <130s=268/268
+
+=== window: both endpoints inside 2026-07-30T03:35:00Z..2026-07-30T03:59:48Z ===
+  node0                  n=49    min=   30.00  median=   30.01  p90=   30.02  max=   36.37   <60s=49/49  <130s=49/49
+  node1                  n=49    min=   30.00  median=   30.01  p90=   30.02  max=   36.41   <60s=49/49  <130s=49/49
+  node2                  n=49    min=   30.00  median=   30.01  p90=   30.02  max=   36.38   <60s=49/49  <130s=49/49
+  node3                  n=49    min=   30.00  median=   30.01  p90=   30.02  max=   36.42   <60s=49/49  <130s=49/49
+  ALL NODES POOLED       n=196   min=   30.00  median=   30.01  p90=   30.02  max=   36.42   <60s=196/196  <130s=196/196
+
+=== window: both endpoints inside 2026-07-30T03:45:00Z..2026-07-30T03:59:48Z ===
+  node0                  n=29    min=   30.00  median=   30.01  p90=   30.02  max=   32.04   <60s=29/29  <130s=29/29
+  node1                  n=29    min=   30.00  median=   30.01  p90=   30.02  max=   32.01   <60s=29/29  <130s=29/29
+  node2                  n=29    min=   30.00  median=   30.01  p90=   30.02  max=   31.98   <60s=29/29  <130s=29/29
+  node3                  n=29    min=   30.00  median=   30.01  p90=   30.02  max=   32.04   <60s=29/29  <130s=29/29
+  ALL NODES POOLED       n=116   min=   30.00  median=   30.01  p90=   30.02  max=   32.04   <60s=116/116  <130s=116/116
+
+---- CONDITION C: quota 0.40 CPU, one core, nproc=1 (THE LIMIT BINDS) ----
+basis: first TELEMETRY capture 2026-07-30T03:24:32.917599+00:00
+       last  TELEMETRY capture 2026-07-30T04:35:21.455838+00:00
+       span 70.8 min, 566 TELEMETRY lines over 4 nodes
+
+=== window: both endpoints inside 2026-07-30T04:02:00Z..2026-07-30T04:19:51Z ===
+  node0                  n=34    min=   30.00  median=   30.01  p90=   30.02  max=   31.95   <60s=34/34  <130s=34/34
+  node1                  n=35    min=   30.00  median=   30.01  p90=   30.02  max=   32.66   <60s=35/35  <130s=35/35
+  node2                  n=34    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=34/34  <130s=34/34
+  node3                  n=34    min=   30.00  median=   30.01  p90=   30.02  max=   34.69   <60s=34/34  <130s=34/34
+  ALL NODES POOLED       n=137   min=   30.00  median=   30.01  p90=   30.02  max=   34.69   <60s=137/137  <130s=137/137
+
+=== window: both endpoints inside 2026-07-30T04:08:00Z..2026-07-30T04:19:51Z ===
+  node0                  n=22    min=   30.00  median=   30.01  p90=   30.02  max=   31.95   <60s=22/22  <130s=22/22
+  node1                  n=23    min=   30.00  median=   30.00  p90=   30.02  max=   32.66   <60s=23/23  <130s=23/23
+  node2                  n=22    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=22/22  <130s=22/22
+  node3                  n=22    min=   30.00  median=   30.01  p90=   30.02  max=   34.69   <60s=22/22  <130s=22/22
+  ALL NODES POOLED       n=89    min=   30.00  median=   30.01  p90=   30.02  max=   34.69   <60s=89/89  <130s=89/89
+
+---- CONDITION B: quota raised to 18.00 CPU, nproc=18 (within-net control) ----
+basis: first TELEMETRY capture 2026-07-30T03:24:32.917599+00:00
+       last  TELEMETRY capture 2026-07-30T04:35:21.455838+00:00
+       span 70.8 min, 566 TELEMETRY lines over 4 nodes
+
+=== window: both endpoints inside 2026-07-30T04:23:00Z..2026-07-30T04:35:00Z ===
+  node0                  n=23    min=   30.00  median=   30.01  p90=   30.02  max=   34.65   <60s=23/23  <130s=23/23
+  node1                  n=23    min=   30.00  median=   30.02  p90=   30.03  max=   31.24   <60s=23/23  <130s=23/23
+  node2                  n=23    min=   30.00  median=   30.01  p90=   30.02  max=   30.03   <60s=23/23  <130s=23/23
+  node3                  n=23    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=23/23  <130s=23/23
+  ALL NODES POOLED       n=92    min=   30.00  median=   30.01  p90=   30.02  max=   34.65   <60s=92/92  <130s=92/92
+
+=== window: both endpoints inside 2026-07-30T04:26:00Z..2026-07-30T04:35:00Z ===
+  node0                  n=17    min=   30.00  median=   30.02  p90=   30.02  max=   34.65   <60s=17/17  <130s=17/17
+  node1                  n=17    min=   30.01  median=   30.02  p90=   30.03  max=   31.24   <60s=17/17  <130s=17/17
+  node2                  n=17    min=   30.00  median=   30.01  p90=   30.02  max=   30.03   <60s=17/17  <130s=17/17
+  node3                  n=17    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=17/17  <130s=17/17
+  ALL NODES POOLED       n=68    min=   30.00  median=   30.01  p90=   30.02  max=   34.65   <60s=68/68  <130s=68/68
+
+################################################################################
+# NET 2 (condition D — fresh net at the compose DEFAULTS)
+################################################################################
+basis: first TELEMETRY capture 2026-07-30T04:43:51.117734+00:00
+       last  TELEMETRY capture 2026-07-30T04:59:21.506539+00:00
+       span 15.5 min, 128 TELEMETRY lines over 4 nodes
+
+=== cut: gaps whose BOTH endpoints are at or after t0+0 min ===
+  node0                  n=31    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=31/31  <130s=31/31
+  node1                  n=31    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=31/31  <130s=31/31
+  node2                  n=31    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=31/31  <130s=31/31
+  node3                  n=31    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=31/31  <130s=31/31
+  ALL NODES POOLED       n=124   min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=124/124  <130s=124/124
+
+=== cut: gaps whose BOTH endpoints are at or after t0+3 min ===
+  node0                  n=25    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=25/25  <130s=25/25
+  node1                  n=25    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=25/25  <130s=25/25
+  node2                  n=25    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=25/25  <130s=25/25
+  node3                  n=25    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=25/25  <130s=25/25
+  ALL NODES POOLED       n=100   min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=100/100  <130s=100/100
+
+=== cut: gaps whose BOTH endpoints are at or after t0+8 min ===
+  node0                  n=15    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=15/15  <130s=15/15
+  node1                  n=15    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=15/15  <130s=15/15
+  node2                  n=15    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=15/15  <130s=15/15
+  node3                  n=15    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=15/15  <130s=15/15
+  ALL NODES POOLED       n=60    min=   30.00  median=   30.01  p90=   30.02  max=   30.02   <60s=60/60  <130s=60/60
+
+THE LARGEST GAPS AND WHERE THEY CAME FROM (net 1, per node, top 3)
+  node0    50.11s   04:19:16 -> 04:20:06
+  node0    36.37s   03:38:03 -> 03:38:39
+  node0    34.65s   04:28:36 -> 04:29:11
+  node1    36.41s   03:38:03 -> 03:38:39
+  node1    32.66s   04:12:43 -> 04:13:16
+  node1    32.01s   03:52:10 -> 03:52:42
+  node2    40.42s   04:19:14 -> 04:19:54
+  node2    36.38s   03:38:03 -> 03:38:39
+  node2    31.98s   03:52:10 -> 03:52:42
+  node3    36.42s   03:38:03 -> 03:38:39
+  node3    34.69s   04:12:42 -> 04:13:17
+  node3    33.87s   04:18:17 -> 04:18:51
+
+  MEASUREMENT BACK-ACTION, stated rather than left to be found. The two largest
+  excursions (50.11 s / 40.42 s, 04:19:14-04:20:06) sit exactly where I ran
+  `cpu-show 0.4` — which `docker exec`s bash into each container THREE times.
+  Under a 0.40 CPU quota those exec'd processes draw on the SAME quota as the node,
+  so my own read-back briefly stole the loop's budget. The 36.4 s gap at 03:38:03
+  appears on ALL FOUR nodes in the same second, which no per-node cause explains;
+  it coincides with a host-side `docker compose logs` + `docker stats` sweep.
+  These are artifacts of instrumenting the run, not node behaviour — and every one
+  of them is still FAR under the 60 s 'does not reproduce' threshold, so nothing in
+  the verdict rests on how they are classified.
