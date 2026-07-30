@@ -494,6 +494,17 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         &self.p2p
     }
 
+    /// Mutable access to the composed P2P node — **this crate's own tests only**.
+    ///
+    /// `#[cfg(test)]` deliberately: issue #130 (a) needs a node whose header view has
+    /// run ahead of its applied bodies, which on a real net is produced by a `Headers`
+    /// batch arriving before a body announce and cannot be produced through any of the
+    /// public seams. It is not a new capability for any caller outside these tests.
+    #[cfg(test)]
+    fn p2p_mut(&mut self) -> &mut P2pNode<TcpTransport, NodeAdapter<P, V>> {
+        &mut self.p2p
+    }
+
     /// Read-only access to the node's consensus state — the chain store, the
     /// depth-32 commitment tree and the nullifier set.
     ///
@@ -754,8 +765,26 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // `sslot=- sid=-` and is still parsed by the same reader.
         // The three renderings live on `Telemetry` since #117, so the log line and
         // any reader of the wire cannot disagree about what `-` or `split` means.
+        // Issue #130 (a): `stip=` / `slag=` are **appended at the end**, under the
+        // same rule as #87's and #84's additions — every pre-existing field keeps its
+        // name, position and meaning, and `run.rs`'s field-order test passes
+        // unmodified.
+        //
+        // `tip=` has always been FORK CHOICE. `stip=` is the height whose **body** the
+        // state machine has applied, and `slag=` is the difference. Until this line
+        // carried them, every field on it came from the view that works: the four T0
+        // hosts, the 48 h WAN soak, the halt drills and Phase B-lite's late-joiner
+        // scenario would all have passed with the state machine arbitrarily far
+        // behind, and #130 was found by a faucet page rather than by an instrument.
+        //
+        // **Both are always printed, zero included.** `final=-`/`age_s=-`/#125's
+        // `age_field` refuse to state a figure they cannot stand behind, and these two
+        // never have that problem: a node always knows both of its own tip heights, so
+        // an omitted field would only force a special case on every parser in
+        // `qumbra-ops/`. `slag=0` is the healthy reading and it is a fact.
+        let lag = node.state_lag();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -765,6 +794,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             t.sslot_field(),
             t.sid_field(),
             rounds_backfill,
+            lag.state_tip,
+            lag.blocks(),
         )
     }
 
@@ -818,8 +849,16 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             FinalityStatus::Halting => "halting",
             FinalityStatus::Halted => "halted",
         };
+        // Issue #130 (a): both views, and the buffer between them, read from the
+        // adapter's single `state_lag()` rather than re-differenced here.
+        let lag = node.state_lag();
+        let (pending, pending_bytes) = node.pending_bodies();
         LiveGauges {
             tip_height: tip,
+            state_tip: lag.state_tip,
+            state_lag: lag.blocks(),
+            pending_bodies: pending as u64,
+            pending_body_bytes: pending_bytes as u64,
             finalized_height: finalized,
             // Same rule as the telemetry wire, read from it rather than re-derived.
             stall_depth: match finalized {
@@ -1482,6 +1521,144 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// **Issue #130 (a): the `TELEMETRY` line, the `/metrics` scrape and the
+    /// `/v1/telemetry` wire report ONE state-vs-fork-choice comparison.**
+    ///
+    /// Three surfaces need the same verdict, and this repo has ruled derive-don't-
+    /// restate three times in one week (#116, #102, #125). #126's `SupplyCoverage`
+    /// was already deriving it, so the shared concept is
+    /// [`qlab_node::StateLag`] and this test pins the readings together: the log
+    /// line's `stip=`, the gauges, and `Telemetry::supply_lag()` (which reads the
+    /// applied height off the supply ledger, already on the `0x03` payload) must all
+    /// name the same two heights. A fourth independent copy fails here.
+    #[test]
+    fn the_line_the_scrape_and_the_wire_agree_on_the_state_lag() {
+        let (config, genesis, base) = rig("state_lag_agrees", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint();
+        assert!(node.try_mine());
+        assert!(node.try_mine());
+
+        let lag = node.p2p().node().state_lag();
+        assert_eq!(lag.state_tip, 2, "this node applied every body it mined");
+        assert_eq!(lag.fork_choice_tip, 2);
+        assert!(!lag.is_lagging());
+
+        // The line.
+        let line = node.telemetry_sample();
+        assert!(line.contains(" tip=2 "), "{line}");
+        assert!(line.contains(" stip=2 slag=0"), "{line}");
+
+        // The wire, which derives the applied height from the supply ledger.
+        let t = node.telemetry();
+        assert_eq!(t.supply_lag(), Some(lag), "the wire's comparison is the same pair");
+        assert_eq!(t.supply_coverage(), qlab_node::SupplyCoverage::Complete);
+
+        // The scrape.
+        let text = node.metrics_text();
+        assert!(text.contains("\nqumbra_tip_height 2\n"), "{text}");
+        assert!(text.contains("\nqumbra_state_tip_height 2\n"), "{text}");
+        assert!(text.contains("\nqumbra_state_lag_blocks 0\n"), "{text}");
+        assert!(text.contains("\nqumbra_pending_bodies 0\n"), "{text}");
+        assert!(
+            text.contains("qumbra_state_lag_refusals_total{duty=\"mine\"} 0\n"),
+            "a healthy node declares the refusal series at zero: {text}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Issue #130 (a), end to end through the binary: a node whose state machine is
+    /// behind its own chain SAYS SO on the line an operator reads, refuses to mine
+    /// while it is, and both stop once its bodies arrive.**
+    ///
+    /// This is the shape #130 was found in — the faucet's node reported
+    /// `regime=Final final=8 fid=b6823616213f`, byte-identical to a healthy peer, with
+    /// its state tip pinned at 4 against a fork-choice tip of 14. The same node now
+    /// prints `stip=` and `slag=`, and the two `TELEMETRY` lines this test emits are
+    /// the ones quoted in the PR.
+    #[test]
+    fn a_node_behind_its_own_chain_says_so_on_the_telemetry_line_and_refuses_to_mine() {
+        use qlab_p2p::n1::{BlockIngest, IngestOutcome};
+
+        // Node A mines a real three-block chain.
+        let (config_a, genesis, base_a) = rig("lag_source", true);
+        let mut a =
+            RunningNode::start(&config_a, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        a.set_mine_interval(Duration::ZERO);
+        a.try_checkpoint(); // finalize genesis, so `final=`/`fid=` carry values
+        for _ in 0..3 {
+            assert!(a.try_mine());
+        }
+        let chain = a.p2p().node().chain();
+        let mined: Vec<_> = (1..=3)
+            .map(|h| *chain.header(&chain.main_chain()[h]).expect("mined header"))
+            .collect();
+        let healthy = a.telemetry_sample();
+
+        // Node B shares the genesis (`new_devnet_t0` is byte-identical across runs) and
+        // learns HEADERS only — the state every joiner is in, and the state header-first
+        // sync puts any node in the moment a `Headers` batch outruns a body announce.
+        let (config_b, _same_genesis, base_b) = rig("lag_joiner", true);
+        let mut b =
+            RunningNode::start(&config_b, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        b.set_mine_interval(Duration::ZERO);
+        b.try_checkpoint();
+        for header in &mined {
+            assert_eq!(b.p2p_mut().node_mut().ingest_header(*header), IngestOutcome::Accepted);
+        }
+
+        let lagging = b.telemetry_sample();
+        // 🔴 The finding, as an assertion: before `stip`/`slag`, this line was
+        // byte-identical to the healthy node's. Every pre-existing field on it comes
+        // from fork choice — the view that works.
+        let strip = |line: &str| {
+            line.split_whitespace()
+                .filter(|kv| !kv.starts_with("stip=") && !kv.starts_with("slag="))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(
+            strip(&lagging),
+            strip(&healthy),
+            "without the two new fields, a node whose state machine is 3 blocks behind \
+             its own chain is indistinguishable from a healthy one"
+        );
+        assert!(lagging.contains(" tip=3 "), "fork choice reached 3: {lagging}");
+        assert!(lagging.contains(" stip=0 slag=3"), "and the state machine did not: {lagging}");
+        assert!(!b.try_mine(), "a node that cannot record its own block refuses to mine one");
+        let text = b.metrics_text();
+        assert!(text.contains("\nqumbra_state_lag_blocks 3\n"), "{text}");
+        assert!(
+            text.contains("qumbra_state_lag_refusals_total{duty=\"mine\"} 1\n"),
+            "the refusal is counted: {text}"
+        );
+
+        // The bodies arrive. Everything converges and the refusals stop.
+        for header in &mined {
+            let hash = header.header_hash();
+            let stored = a.state().chain().block(&hash).expect("A has the body").clone();
+            let body = stored.body();
+            assert_eq!(
+                b.p2p_mut().node_mut().ingest_block(*header, body),
+                IngestOutcome::Duplicate,
+                "the header was already held — which is exactly the case that used to \
+                 throw the body away"
+            );
+        }
+        let recovered = b.telemetry_sample();
+        assert!(recovered.contains(" tip=3 "), "{recovered}");
+        assert!(recovered.contains(" stip=3 slag=0"), "caught up: {recovered}");
+        assert!(b.try_mine(), "and mining resumes");
+
+        println!("PR-SAMPLE healthy : {healthy}");
+        println!("PR-SAMPLE lagging : {lagging}");
+        println!("PR-SAMPLE recovered: {recovered}");
+        let _ = std::fs::remove_dir_all(&base_a);
+        let _ = std::fs::remove_dir_all(&base_b);
+    }
+
     #[test]
     fn telemetry_age_is_dash_when_nothing_finalized() {
         // S8: a node that has mined but never finalized prints `final=-` AND `age_s=-`
@@ -2114,6 +2291,8 @@ mod tests {
                 "fid", "sslot", "sid",
                 // ── appended by #105, at the end ──
                 "rback",
+                // ── appended by #130 (a), at the end ──
+                "stip", "slag",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -2121,6 +2300,9 @@ mod tests {
         // Genesis finalized as slot 0 without a round, so nothing has closed yet.
         assert!(line.contains(" rounds=0 rfail=0"), "{line}");
         assert!(line.contains(" rback=0"), "nothing was walked past either: {line}");
+        // A healthy node states the zero rather than omitting the field (#130 (a)):
+        // this node mined its own tip, so its two views agree.
+        assert!(line.contains(" stip=1 slag=0"), "both views, and the zero gap: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
