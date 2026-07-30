@@ -63,27 +63,82 @@ roster，**不会编造一个它并不具备的时间基准**。
 `why=` 按以下顺序判定，第一个命中者胜出。
 
 1. **`finalized`** —— 达到 quorum。
-2. **`quorum_impossible`** —— `active < need`。无论网络多好，这个 roster 都产生不了 quorum。
+2. **`backfill`**（issue #105）—— 本节点是把这个槽位当作**历史**走过去的：它第一次得知这个槽位时，
+   自己的 tip 已经领先了一个以上的 cadence，所以从来不存在它能投票的那一刻。resync 走过的每个槽位
+   都是这个读数。**它不是失败，也不被计成失败** —— 什么都没有失败，是这个节点当时不在场。见 §2a。
+3. **`quorum_impossible`** —— `active < need`。无论网络多好，这个 roster 都产生不了 quorum。
    去看 tombstone、jail 和 epoch 边界；**不要**去看延迟。
-3. **`silent`** —— `have == 0`。什么都没到达本节点。问题在上游 —— 提议方，或到它的路径 ——
+4. **`silent`** —— `have == 0`。什么都没到达本节点。问题在上游 —— 提议方，或到它的路径 ——
    不是参与度。看一眼 `rej`：有垃圾到达和什么都没到达是两回事。
-4. **`timeout`** —— 最后一张*新*票落在关闭前 `STILL_ARRIVING_MS`（60 s）以内。这轮被切断时
+5. **`timeout`** —— 最后一张*新*票落在关闭前 `STILL_ARRIVING_MS`（60 s）以内。这轮被切断时
    **仍在累积**。更多时间、或更早提议，很可能就关上了。
-5. **`votes_short`** —— 票到过，然后在关闭前很久就停了。委员会给出了它能给的全部，仍然不够。
+6. **`votes_short`** —— 票到过，然后在关闭前很久就停了。委员会给出了它能给的全部，仍然不够。
    **`absent` 列表就是那条发现。**
-6. **`unclassified`** —— 没有时间基准（确定性时钟）。绝不作为原因断言。
+7. **`unclassified`** —— 没有时间基准（确定性时钟）。绝不作为原因断言。
 
 `why=open` **不是**一种判定：还没结束的轮次没有原因。这种行上的计数是真的，只有结果未定，
 并且它永远不会被计入「已关闭轮次」的任何计数器。一轮在开启超过 `OVERDUE_AFTER_MS`
 （600 s = 一个轮次周期）后被报告一次，此后在票数变化时、或每过 `OVERDUE_REPEAT_MS` 再报一次 ——
 所以卡在 `have=11/15` 的轮次会说一声，然后不再刷屏。
 
-**issue #87 要的那条判据就是第 4 步与第 5 步之分**，而它**仅凭记录下来的字段**即可判定 ——
+**issue #87 要的那条判据就是第 5 步与第 6 步之分**，而它**仅凭记录下来的字段**即可判定 ——
 `closed_ms`、`last_ms`、`have`、`need`、`active`。这正是这份日志存在的意义，并由
 `round::tests::diagnosis_separates_timeout_from_votes_short` 双向钉住，含边界值。
 
 `STILL_ARRIVING_MS = 60 s` 属于 **devnet 级、可调、非 FROZEN**。依据：T0 网实测 RTT 68–223 ms，
 因此健康轮次在约一秒的网络时间内完成；60 s 高出最差实测 RTT 约 270 倍，又低于 600 s 轮次周期约一个数量级。
+
+---
+
+## 2a. `rounds=` 与 `rfail=` 到底在数什么（issue #105）
+
+`TELEMETRY` 为此带三个计数器，全部**自进程启动起累计** —— 重启会清零，这是刻意的，
+因为这个项目要数重启：
+
+```
+… rounds=144 rfail=2 … rback=449
+```
+
+| 字段 | 读作 |
+|---|---|
+| `rounds=` | 本节点关闭的**活**轮次 —— 它作为参与者在场的那些轮次 |
+| `rfail=` | 其中**没有 finalize** 就关闭的那些。这就是告警 |
+| `rback=` | 它当作**历史**关闭的 cadence 槽位，即 `why=backfill` |
+
+**把 `rfail` 读作：本节点在场、并且输掉的轮次。** 不是「它走过的槽位」—— 那是它过去的含义，
+也正是它变得毫无用处的原因。
+
+一轮是**活**的，当且仅当它的槽位在本节点第一次得知它时，落在**本节点自己的 tip** 前后一个
+checkpoint cadence 之内：
+
+```
+tip − 8  <  slot  ≤  tip + 8
+```
+
+两个边界都取自本节点自己的链。这里既不看同步状态机（那是因为**对端声称**自己更高才进入的 ——
+一个宣称荒谬高度的对端否则就能替所有人关掉这个告警），也不看 finalized head
+（它在每次进程启动时被重建为空，并且在整个追赶过程中一直是 `None`，撑不起这个判定）。
+
+判定在**轮次开启的那一刻取一次**，此后不再重算。这一点在一个方向上尤其重要：一个在委员会
+中断期间继续挖矿的节点，会把自己的 tip 推到它真正输掉的那一轮很远的前面，而一个「关闭时再判」
+的做法会把那也叫成 `backfill` —— 那就是告警换一条路把自己关掉。
+
+### 为什么要改
+
+一台刚 resync 了 3,597 块的**健康**节点报出：
+
+```
+rounds=1316 rfail=1315        ← 1,316 轮里有 1,315 轮「失败」
+```
+
+……而同时 `peers=6`、`regime=Final`、`variants=1`，它 finalize 的 checkpoint 与另外三台完全一致。
+计数没有谎报它数了什么；它数错了东西。**一台健康节点上读数 99.9 % 的告警，已经被自己的数值关掉了**，
+而任何重启过的节点都处在这个状态里。
+
+### 没有改的部分
+
+`ROUND` 日志仍然记录**每一个**跨过的槽位 —— 这次改的是什么东西给计数器加一，不是记录什么。
+跨过的槽位不留痕迹是反方向的错误，而那正是 issue #87 存在的理由。
 
 ---
 
@@ -219,8 +274,12 @@ grep '^ROUND ' node.log | grep -c 'why=votes_short'  # 参与度型
 # 最近一天的 Degraded 占比 —— 实测驻留，不是采样比例
 rate(qumbra_finality_regime_seconds_total{regime="degraded"}[1d])
 
-# 按原因分的轮次失败率
-rate(qumbra_checkpoint_rounds_total{verdict!="finalized"}[1h])
+# 按原因分的轮次失败率。`backfill` 被刻意排除（issue #105）：它是本节点走过的历史，
+# 不是它输掉的轮次；把它留在里面，正是这个数字在健康节点上读到 99.9 % 的原因。
+rate(qumbra_checkpoint_rounds_total{verdict!="finalized",verdict!="backfill"}[1h])
+
+# 本节点走过多少历史 —— 重启/resync 的特征值，值得知道，但永远不是告警。
+rate(qumbra_checkpoint_rounds_total{verdict="backfill"}[1h])
 
 # 谁在拖后腿：按签名者的缺席率
 rate(qumbra_committee_absent_rounds_total[1h])
@@ -247,7 +306,8 @@ rate(qumbra_finality_advance_blocks_bucket{le="8"}[1h])
   `quorum_ms=315` 以 `have=16` 关闭，而最远那个节点持有的 5 把钥匙落在 `absent` 里 ——
   它们是慢，不是死。`qumbra_committee_absent_rounds_total` 继承这个偏差。
   **无偏的读法在失败轮次上**，因为失败轮次开着的时间长得多：日志按 `why!=finalized` 过滤，
-  或者把该指标对着 `qumbra_checkpoint_rounds_total{verdict!="finalized"}` 读。
+  或者把该指标对着 `qumbra_checkpoint_rounds_total{verdict!="finalized",verdict!="backfill"}`
+  读 —— 一个 `backfill` 轮次根本没有在场的人可供缺席。
   这样用，这个计数器回答的是「关键时刻谁不在」；直接用，它回答的是「谁离得最远」——
   那也是一件值得知道的事，但不是同一件事。
 * **时间是节点本地且不同步的。** `first_ms`/`last_ms`/`quorum_ms` 都是相对*本节点*打开时刻、

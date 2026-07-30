@@ -67,19 +67,24 @@ the N7 soak). That is deliberate: the node records counts and rosters truthfully
 `why=` is decided in this order. The first match wins.
 
 1. **`finalized`** — reached quorum.
-2. **`quorum_impossible`** — `active < need`. The roster could not have produced a
+2. **`backfill`** *(issue #105)* — this node reached the slot as **history**: its own
+   tip was already more than one cadence away when it first learned of the slot, so
+   there was never a moment at which it could have voted. Every slot a resync walks
+   past reads this. **It is not a failure and it is not counted as one** — nothing
+   failed, the node was not there. See §2a.
+3. **`quorum_impossible`** — `active < need`. The roster could not have produced a
    quorum however well the network behaved. Look at tombstones, jails and the epoch
    boundary; **do not** look at latency.
-3. **`silent`** — `have == 0`. Nothing reached this node at all. The problem is
+4. **`silent`** — `have == 0`. Nothing reached this node at all. The problem is
    upstream — the proposer, or the path to it — not participation. Check `rej`: junk
    arriving is a different story from nothing arriving.
-4. **`timeout`** — the last *new* vote landed within `STILL_ARRIVING_MS` (60 s) of the
+5. **`timeout`** — the last *new* vote landed within `STILL_ARRIVING_MS` (60 s) of the
    close. The round was **still accumulating** when it was cut off. More time, or an
    earlier proposal, would plausibly have closed it.
-5. **`votes_short`** — votes arrived and then stopped, well before the close. The
+6. **`votes_short`** — votes arrived and then stopped, well before the close. The
    committee gave everything it had and it was not enough. **The `absent` list is the
    finding.**
-6. **`unclassified`** — no timing basis (deterministic clock). Never asserted as a
+7. **`unclassified`** — no timing basis (deterministic clock). Never asserted as a
    cause.
 
 `why=open` is **not** a verdict: a round that has not ended has no cause yet. The
@@ -89,7 +94,7 @@ than `OVERDUE_AFTER_MS` (600 s = one round period), and reported again when its 
 count moves or `OVERDUE_REPEAT_MS` passes — so a round stuck at `have=11/15` says so
 and then stops repeating itself.
 
-**The judgement issue #87 asks for is step 4 vs step 5**, and it is decidable from the
+**The judgement issue #87 asks for is step 5 vs step 6**, and it is decidable from the
 recorded fields alone — `closed_ms`, `last_ms`, `have`, `need`, `active`. That is the
 property the journal exists to have, and it is pinned by
 `round::tests::diagnosis_separates_timeout_from_votes_short` in both directions,
@@ -99,6 +104,64 @@ including the boundary.
 net's measured RTT is 68–223 ms, so a healthy round completes within about a second
 of network time; 60 s sits ~270× above the worst measured RTT and ~1/10 below the
 600 s round period.
+
+---
+
+## 2a. What `rounds=` and `rfail=` count (issue #105)
+
+`TELEMETRY` carries three counters for this, all **cumulative since process start** —
+a restart resets them, deliberately, because this project counts restarts:
+
+```
+… rounds=144 rfail=2 … rback=449
+```
+
+| field | reads as |
+|---|---|
+| `rounds=` | **live** rounds this node closed — rounds it was a participant in |
+| `rfail=` | of those, the ones that closed **without finalizing**. This is the alarm |
+| `rback=` | cadence slots it closed as **history**, i.e. `why=backfill` |
+
+**Read `rfail` as: rounds this node was present for and lost.** Not "slots it walked
+past", which is what it used to mean and why it was useless.
+
+A round is **live** iff its slot was within one checkpoint cadence of *this node's
+own tip* at the moment the node first learned of the slot:
+
+```
+tip − 8  <  slot  ≤  tip + 8
+```
+
+Both bounds are the node's own chain. Nothing here consults the sync state machine
+(which is entered because a *peer* claims to be taller — a peer advertising an absurd
+height would otherwise switch this alarm off for everyone) and nothing consults the
+finalized head (which is rebuilt empty at every process start and stays `None` for
+the whole of a catch-up, so it cannot carry the judgement).
+
+The verdict is taken **once, when the round opens**, and never revisited. That matters
+in one direction specifically: a node mining through a committee outage runs its tip a
+long way past a round it genuinely lost, and a close-time test would call that
+`backfill` — the alarm switching itself off again by a different route.
+
+### Why it changed
+
+A healthy node that had just resynced 3,597 blocks reported:
+
+```
+rounds=1316 rfail=1315        ← 1,315 of 1,316 rounds "failed"
+```
+
+…while `peers=6`, `regime=Final`, `variants=1`, and its finalized checkpoint matched
+its three peers exactly. The counter was not lying about what it counted; it was
+counting the wrong things. **An alarm reading 99.9 % on a healthy node has been
+switched off by its own value**, and every node that has ever restarted was in that
+state.
+
+### What did NOT change
+
+The `ROUND` journal still records **every** crossed slot — this changed what
+increments the counters, not what is recorded. A crossed slot leaving no trace is the
+opposite mistake, and it is the one issue #87 exists to have fixed.
 
 ---
 
@@ -250,8 +313,14 @@ PromQL, once a collector is in place:
 # The Degraded share over the last day — measured residency, not sampled
 rate(qumbra_finality_regime_seconds_total{regime="degraded"}[1d])
 
-# Round failure rate by cause
-rate(qumbra_checkpoint_rounds_total{verdict!="finalized"}[1h])
+# Round failure rate by cause. `backfill` is excluded on purpose (issue #105):
+# it is history this node walked through, not a round it lost, and leaving it in
+# is what made this number read 99.9 % on a healthy node.
+rate(qumbra_checkpoint_rounds_total{verdict!="finalized",verdict!="backfill"}[1h])
+
+# How much history this node has crossed — the restart/resync signature, and a
+# fact worth having, but never an alarm.
+rate(qumbra_checkpoint_rounds_total{verdict="backfill"}[1h])
 
 # Which member is dragging: absence rate per signer
 rate(qumbra_committee_absent_rounds_total[1h])
@@ -282,7 +351,8 @@ Stated so nobody reads more into a record than it holds.
   in `absent` — they were late, not down. `qumbra_committee_absent_rounds_total`
   inherits the bias. **The unbiased read is on failed rounds**, which stay open far
   longer: filter the journal on `why!=finalized`, or read the metric against
-  `qumbra_checkpoint_rounds_total{verdict!="finalized"}`. Used this way the counter
+  `qumbra_checkpoint_rounds_total{verdict!="finalized",verdict!="backfill"}` — a
+  `backfill` round has nobody present to be absent from. Used this way the counter
   answers "who is missing when it matters"; used naively it answers "who is furthest
   away", which is a real thing to know but a different one.
 * **Timings are node-local and unsynchronized.** `first_ms`/`last_ms`/`quorum_ms` are
