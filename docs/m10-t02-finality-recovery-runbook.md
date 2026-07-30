@@ -59,6 +59,20 @@ from block timestamps (chain-time), so it is deterministic, not wall-clock.
 > == None` (`final=-` in the telemetry line) together with a climbing `stall_depth`,
 > not on age.** Once a first checkpoint finalizes, the two units track each other
 > again and everything below applies unchanged.
+>
+> **Finalized-at-genesis window (added 2026-07-30, issue #73).** The same refusal
+> covers the state every fresh net actually boots into: genesis is finalized as a
+> **bootstrap act**, not by a checkpoint round, so from start until the first
+> non-genesis checkpoint (slot 8, ≈10 min at 75 s) every node shows `final=0` and
+> `age_s=-` (`last_finalized_age_secs` = 0 on the wire). Before this fix the field
+> differenced the WallClock tip against genesis's `timestamp = 0` placeholder and
+> printed the wall clock itself (`age_s=1785352360` on all four nodes of the #119
+> run) — garbage precisely when a new net is watched hardest. **During this window
+> the alarm runs on the block-unit half alone: `final` stuck at `0` while `tip`
+> climbs, i.e. a climbing `stall_depth` — and if the head is still genesis past
+> `stall_depth` 16 (2× cadence), `finality_status` flips to Degraded on its own,
+> with no age input needed.** `age_s` joins at the first non-genesis checkpoint,
+> which is also how you confirm the window ended.
 
 ## 3. Triage — is it the committee or the network?
 

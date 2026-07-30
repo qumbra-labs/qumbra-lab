@@ -36,7 +36,10 @@ pub fn table(readings: &[NodeReading]) -> String {
                     t.fid_field(),
                     regime,
                     t.stall_depth,
-                    if t.finalized_height.is_none() { "-".into() } else { t.last_finalized_age_secs.to_string() },
+                    // `-` while there is no finalized checkpoint to measure from —
+                    // nothing finalized (S8) or finalized-at-genesis (#73). The rule
+                    // is `Telemetry`'s, shared with the node's own TELEMETRY line.
+                    t.age_field(),
                     t.peer_count,
                     t.epoch,
                     t.diff_field(),
@@ -243,6 +246,31 @@ mod tests {
         // say what it saw cannot be acted on.
         assert!(text.contains("aaaaaaaaaaaa [node0]"), "{text}");
         assert!(text.contains("bbbbbbbbbbbb [node1]"), "{text}");
+    }
+
+    /// Issue #73: a node whose finalized head is still genesis (`FINAL` 0 — every
+    /// fresh net, between start and its first non-genesis checkpoint) renders
+    /// `AGE_S` as `-`, exactly like the node's own TELEMETRY line — never the
+    /// tip−genesis subtraction that read as the wall clock on the #119 run.
+    #[test]
+    fn age_renders_as_dash_while_the_finalized_head_is_genesis() {
+        let readings = vec![
+            ok("node0", t(Some(0), Some(0xaaaa_aaaa_aaaa), None)),
+            ok("node1", t(Some(3776), Some(0xaaaa_aaaa_aaaa), None)),
+        ];
+        let text = table(&readings);
+        // AGE_S is the 7th column: NODE TIP FINAL FID REGIME STALL AGE_S …
+        let age_of = |label: &str| {
+            text.lines()
+                .find(|l| l.starts_with(label))
+                .unwrap()
+                .split_whitespace()
+                .nth(6)
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(age_of("node0"), "-", "finalized-at-genesis has no age to state:\n{text}");
+        assert_eq!(age_of("node1"), "75", "a real finalized checkpoint reports its age:\n{text}");
     }
 
     /// Same readings ⇒ same bytes, whatever order they arrived in. The view is

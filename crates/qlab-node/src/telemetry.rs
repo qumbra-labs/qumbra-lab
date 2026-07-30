@@ -117,8 +117,16 @@ pub struct Telemetry {
     /// Stall depth = `tip − finalized` (or `tip` if nothing is finalized).
     pub stall_depth: u64,
     /// Chain-time seconds since the last finalized checkpoint (tip block timestamp
-    /// − finalized block timestamp; measured from genesis if nothing is finalized).
-    /// Derived from block timestamps, so it is deterministic — no wall clock.
+    /// − finalized block timestamp). Derived from block timestamps, so it is
+    /// deterministic — no wall clock.
+    ///
+    /// **0, and rendered `-`, while there is no finalized checkpoint to measure
+    /// from** — nothing finalized (S8) *or* the finalized head still genesis
+    /// (issue #73). Genesis is finalized as a bootstrap act, not by a checkpoint
+    /// round (`is_checkpoint_height`: genesis is never a slot), and its timestamp
+    /// is the `0` placeholder — differencing a `WallClock` tip against it printed
+    /// the whole Unix epoch (`age_s=1785352360` on every node of a fresh net).
+    /// See [`Self::age_field`], the one rendering rule for this field.
     pub last_finalized_age_secs: u64,
     /// Connected peer count (injected from the P2P layer).
     pub peer_count: u64,
@@ -243,6 +251,24 @@ impl Telemetry {
     /// The `diff=` field: the tip block's difficulty, or `-` when unavailable.
     pub fn diff_field(&self) -> String {
         self.tip_difficulty.map(|d| d.to_string()).unwrap_or_else(|| "-".to_string())
+    }
+
+    /// The `age_s=` field: `-` while there is no finalized **checkpoint** to
+    /// measure an age from, else [`Self::last_finalized_age_secs`].
+    ///
+    /// `-` covers two states an operator must not read a number in: nothing
+    /// finalized at all (S8, PR #72), and the finalized head still genesis
+    /// (issue #73) — the bootstrap finalization every fresh net starts from, which
+    /// is not a checkpoint round and whose `timestamp = 0` placeholder is not a
+    /// time. The rule keys on `finalized_height == Some(0)` rather than on the
+    /// timestamp because height 0 IS genesis on every net, and height is what this
+    /// wire carries — so the log line, `qumbra-opview` and any other reader derive
+    /// the same `-` from the same snapshot (the #117 discipline).
+    pub fn age_field(&self) -> String {
+        match self.finalized_height {
+            None | Some(0) => "-".to_string(),
+            Some(_) => self.last_finalized_age_secs.to_string(),
+        }
     }
 
     /// The `fid=` field: the finalized checkpoint's identity as the canonical
@@ -405,6 +431,28 @@ mod tests {
         assert_eq!(n.stall_depth, 5);
         assert_eq!(n.finalized_height, None);
         assert_eq!(Telemetry::from_bytes(&n.to_bytes()).unwrap(), n);
+    }
+
+    /// Issue #73: `age_field` is the one rendering rule for `age_s=`, and it
+    /// refuses to state an age in BOTH no-checkpoint states — nothing finalized
+    /// (S8) and finalized-at-genesis — while a real finalized height renders the
+    /// number. The wire encoding is untouched: the same fields round-trip, only
+    /// the value carried while the head is genesis changes.
+    #[test]
+    fn age_field_is_dash_until_a_real_checkpoint_finalizes() {
+        // Nothing finalized (S8): `-`.
+        let none = Telemetry::assemble(5, None, 0, 0, 1, 0, MAX_LAG);
+        assert_eq!(none.age_field(), "-");
+
+        // Finalized head still genesis (#73): `-`, never a number — this is the
+        // state every fresh net boots into (`final=0` until slot 8 finalizes).
+        let genesis = Telemetry::assemble(1, Some(0), 0, 0, 1, 0, MAX_LAG);
+        assert_eq!(genesis.age_field(), "-");
+        assert_eq!(Telemetry::from_bytes(&genesis.to_bytes()).unwrap(), genesis);
+
+        // First non-genesis checkpoint: the field speaks, in chain-time seconds.
+        let real = Telemetry::assemble(10, Some(8), 150, 0, 1, 0, MAX_LAG);
+        assert_eq!(real.age_field(), "150");
     }
 
     /// Issue #74: the halt regimes ride the SAME status field (extended, not
