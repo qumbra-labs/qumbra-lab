@@ -231,6 +231,18 @@ pub struct LiveGauges {
     /// Inbound `GetAddr` requests received but not answered (issue #91) — the
     /// amplifier's muzzle, counted.
     pub throttled_getaddr: u64,
+    /// **Highest height whose body the state machine has applied** (issue #130). The
+    /// gauge `qumbra_tip_height` is fork choice; this is the other view, and the pair
+    /// is the only way a scrape can see them disagree.
+    pub state_tip: u64,
+    /// `fork_choice_tip − state_tip` (issue #130). Nonzero means this node is
+    /// refusing to mine and to admit transactions, on purpose.
+    pub state_lag: u64,
+    /// Bodies held awaiting the applied tip, and their weight in bytes (issue #130
+    /// (a)). Buffer occupancy as a measurement rather than an inference.
+    pub pending_bodies: u64,
+    /// Bytes held in the pending-body window.
+    pub pending_body_bytes: u64,
     /// Distinct netgroups this node currently holds outbound connections to
     /// (issue #91). **The eclipse gauge**: a node whose outbound set collapses to
     /// one netgroup is one network's prisoner however many peers it reports.
@@ -249,6 +261,12 @@ pub const REGIMES: [&str; 4] = ["final", "degraded", "halting", "halted"];
 
 /// Vote-outcome tokens for `qumbra_checkpoint_votes_total`.
 pub const VOTE_RESULTS: [&str; 5] = ["counted", "inactive", "forged", "unknown_signer", "duplicate"];
+
+/// Duties a node refuses while its state machine lags behind its own chain
+/// (issue #130 (a) part 3), pre-declared so both series exist from the first scrape:
+/// an alert cannot be written against a counter that only appears once the node is
+/// already in trouble.
+pub const LAG_REFUSAL_DUTIES: [&str; 2] = ["mine", "admit_tx"];
 
 /// The node's accumulated metric state. Owned by the node adapter (which is where
 /// the events happen) and rendered on demand.
@@ -272,6 +290,8 @@ pub struct Metrics {
     stall_depth_at_advance: Histogram,
     // ---- regime residency --------------------------------------------------
     regime_ms: BTreeMap<&'static str, u64>,
+    // ---- state lag (issue #130 (a)) ----------------------------------------
+    lag_refusals: BTreeMap<&'static str, Counter>,
 }
 
 impl Default for Metrics {
@@ -295,7 +315,12 @@ impl Metrics {
         for r in REGIMES {
             regime_ms.insert(r, 0u64);
         }
+        let mut lag_refusals = BTreeMap::new();
+        for d in LAG_REFUSAL_DUTIES {
+            lag_refusals.insert(d, Counter::default());
+        }
         Self {
+            lag_refusals,
             rounds_total,
             votes_total,
             signer_signed: BTreeMap::new(),
@@ -350,6 +375,24 @@ impl Metrics {
                 }
             }
         }
+    }
+
+    /// Record one duty refused because the state machine was behind its own chain
+    /// (issue #130 (a) part 3).
+    ///
+    /// It lives here, with the other event counters, rather than in a ledger of its
+    /// own on the adapter: the events happen there, the registry is rendered here, and
+    /// a second counter ledger beside this one is the shape this repo has ruled
+    /// against three times in a week.
+    pub fn observe_lag_refusal(&mut self, duty: &'static str) {
+        if let Some(c) = self.lag_refusals.get_mut(duty) {
+            c.inc();
+        }
+    }
+
+    /// How many times `duty` was refused for state lag.
+    pub fn lag_refusals(&self, duty: &str) -> u64 {
+        self.lag_refusals.get(duty).map(|c| c.get()).unwrap_or(0)
     }
 
     /// Record the arrival offset (ms from round open) of one newly-counting vote.
@@ -573,9 +616,49 @@ since process start. This is the measured Degraded share; it is NOT a fraction o
         ));
     }
 
+    // ---- issue #130 (a): duties refused because the state machine is behind ----
+    o.push_str(
+        "# HELP qumbra_state_lag_refusals_total Duties this node refused because its state machine \
+was behind its own chain (issue #130). NOT a peer fault and not an error: a node declining to act \
+on a view it knows is stale. Both series exist from the first scrape.\n\
+# TYPE qumbra_state_lag_refusals_total counter\n",
+    );
+    for d in LAG_REFUSAL_DUTIES {
+        o.push_str(&format!(
+            "qumbra_state_lag_refusals_total{{duty=\"{d}\"}} {}\n",
+            m.lag_refusals(d)
+        ));
+    }
+
     // ---- live gauges ------------------------------------------------------
-    let gauges: [(&str, &str, u64); 15] = [
+    let gauges: [(&str, &str, u64); 19] = [
         ("qumbra_tip_height", "Fork-choice tip height.", g.tip_height),
+        (
+            "qumbra_state_tip_height",
+            "Highest height whose BODY the state machine has applied (issue #130). \
+qumbra_tip_height is fork choice; these two disagreeing is the defect #130 was filed for, and \
+before this pair no instrument on this net could see it.",
+            g.state_tip,
+        ),
+        (
+            "qumbra_state_lag_blocks",
+            "qumbra_tip_height − qumbra_state_tip_height (issue #130). Nonzero means this node is \
+refusing to mine and to admit transactions, deliberately — alert on it being nonzero at all, and \
+on it not returning to zero.",
+            g.state_lag,
+        ),
+        (
+            "qumbra_pending_bodies",
+            "Bodies held awaiting the applied tip (issue #130 (a)). Bounded by entry count, byte \
+budget and a height window; a value pinned at the cap means the gap is not closing.",
+            g.pending_bodies,
+        ),
+        (
+            "qumbra_pending_body_bytes",
+            "Bytes held in the pending-body window (issue #130 (a)). The cap that binds when \
+bodies carry proofs (~145 kB each) rather than a coinbase alone.",
+            g.pending_body_bytes,
+        ),
         (
             "qumbra_finalized_height",
             "Finalized head height. Absent (no series) when nothing is finalized — never 0-as-unknown.",
@@ -721,6 +804,10 @@ mod tests {
     fn gauges() -> LiveGauges {
         LiveGauges {
             tip_height: 1_392,
+            state_tip: 1_392,
+            state_lag: 0,
+            pending_bodies: 0,
+            pending_body_bytes: 0,
             finalized_height: Some(1_352),
             stall_depth: 40,
             regime: "degraded",
@@ -844,6 +931,51 @@ mod tests {
             !text.lines().any(|l| l.starts_with("qumbra_finalized_height ")),
             "a never-finalized node must not report height 0 as finalized"
         );
+    }
+
+    // ---- issue #130 (a): the two chain views, and the refusals ----------------
+
+    /// **Both views are on the scrape, their difference is on the scrape, and both
+    /// refusal series exist before anything is ever refused.**
+    ///
+    /// The last clause is the one worth a test: an operator cannot write
+    /// `rate(qumbra_state_lag_refusals_total[5m]) > 0` against a series that only
+    /// materialises once the node is already refusing.
+    #[test]
+    fn both_chain_views_and_the_lag_refusals_are_on_the_scrape_from_the_first_sample() {
+        let m = Metrics::new();
+        let mut g = gauges();
+        g.state_tip = 1_380;
+        g.state_lag = 12;
+        g.pending_bodies = 7;
+        g.pending_body_bytes = 1_019_904;
+        let text = render(&m, &g);
+
+        assert!(text.contains("\nqumbra_tip_height 1392\n"), "fork choice");
+        assert!(text.contains("\nqumbra_state_tip_height 1380\n"), "the applied view");
+        assert!(text.contains("\nqumbra_state_lag_blocks 12\n"), "and the gap between them");
+        assert!(text.contains("\nqumbra_pending_bodies 7\n"));
+        assert!(text.contains("\nqumbra_pending_body_bytes 1019904\n"));
+
+        // Declared at zero before any refusal has happened.
+        assert!(text.contains("# TYPE qumbra_state_lag_refusals_total counter"));
+        for duty in LAG_REFUSAL_DUTIES {
+            assert!(
+                text.contains(&format!("qumbra_state_lag_refusals_total{{duty=\"{duty}\"}} 0\n")),
+                "{duty} must be declared at zero: {text}"
+            );
+        }
+
+        // And they count.
+        let mut m2 = Metrics::new();
+        m2.observe_lag_refusal("mine");
+        m2.observe_lag_refusal("mine");
+        m2.observe_lag_refusal("admit_tx");
+        assert_eq!(m2.lag_refusals("mine"), 2);
+        assert_eq!(m2.lag_refusals("admit_tx"), 1);
+        let text2 = render(&m2, &gauges());
+        assert!(text2.contains("qumbra_state_lag_refusals_total{duty=\"mine\"} 2\n"));
+        assert!(text2.contains("qumbra_state_lag_refusals_total{duty=\"admit_tx\"} 1\n"));
     }
 
     // ---- issue #84: the identity gauges --------------------------------------

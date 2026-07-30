@@ -25,7 +25,7 @@
 //! `wire_id → mempool_txid` index so `has_tx`/`get_tx` answer in the P2P id-space
 //! while the pool stays keyed by its own id.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use qlab_devnet::body::{validate_body, BlockBody, BodyError, TxEntry};
 use qlab_devnet::chain::{ChainState, InsertError};
@@ -54,6 +54,7 @@ use qlab_node::mempool::TxId;
 use qlab_node::metrics::Metrics;
 use qlab_node::recovery::Finalizer;
 use qlab_node::round::{ObsClock, RoundLedger, SlotContext, VoteRejects};
+use qlab_node::telemetry::StateLag;
 use qlab_node::{genesis_block, MemNode, Mempool, MempoolError, NodeError, NodeState as _};
 use qlab_devnet::body::TxVerifier;
 
@@ -166,6 +167,67 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// [`UNCONFIGURED_MINER_RKM`]; the binary installs the operator's key via
     /// [`Self::set_miner_rkm`].
     miner_rkm: [u64; 4],
+    /// **Bodies held for headers this node already has, awaiting the state tip**
+    /// (issue #130 (a)), keyed `(height, header hash)` so the map iterates in
+    /// ascending height and two branches at one height can both be held.
+    ///
+    /// This is an **out-of-order window, not a sync mechanism**: a body reaches it
+    /// only by arriving live, and the gap it closes is the one header-first sync
+    /// opens when a `Headers` batch runs ahead of a body announce. Obtaining a body
+    /// nobody offered needs a wire message that does not exist — #130 (c).
+    ///
+    /// Relationship to `P2pNode::blocks` (issue #135), stated because the two must
+    /// not be confused: that map is a **serving** cache, keyed by hash with no
+    /// ordering, holding bodies to answer `GetBlockTxn` with; it lives above the
+    /// `NodeState` trait boundary and a body enters it only when the header was new.
+    /// This map is an **application** queue: ordered by height, bounded, and emptied
+    /// by the state machine advancing. They are two lifetimes for two jobs, so this
+    /// is a second buffer on purpose rather than a reuse — and nothing here grows,
+    /// prunes or reads that map. Bounding it is #135's, and is not done here.
+    pending_bodies: BTreeMap<(u64, Hash32), (BlockHeader, BlockBody)>,
+    /// Running weight of [`Self::pending_bodies`] in bytes, so the byte budget is a
+    /// subtraction rather than a walk of the map on every insert.
+    pending_bytes: usize,
+}
+
+/// How far above the state machine's applied tip a body is worth holding
+/// (issue #130 (a)). Bitcoin's in-flight download window, reused as the shape rather
+/// than the number: past this, a body cannot become applicable without material this
+/// node has no way to request.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_PENDING_BODY_HEIGHTS: u64 = 1024;
+
+/// Hard entry cap on the pending-body window (issue #130 (a)).
+pub const MAX_PENDING_BODIES: usize = 512;
+
+/// Byte budget for the pending-body window (issue #130 (a)).
+///
+/// **Two caps, because either alone is wrong**, and #135 is the reason it is stated
+/// rather than assumed: a coinbase-only body is tens of bytes, so a byte budget alone
+/// would admit millions of entries; a proof-carrying body is ~145 kB (#135's
+/// measurement), so an entry cap alone would admit ~74 MB per 512 entries on hosts
+/// sized for a coinbase-only chain. The binding cap is whichever bites first.
+pub const MAX_PENDING_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// What a duty refused for state lag says (issue #130 (a)). Named because it is a
+/// node declaring its own view stale, which is a different statement from any
+/// judgement about the object or its sender.
+pub const STATE_LAG_REASON: &str = "state lag: this node's applied state is behind its chain";
+
+/// The memory a held body actually costs: the proof bytes (which dominate — one 2×2
+/// proof is ~145 kB against a ~100-byte public surface) plus its declared surface.
+fn body_weight(body: &BlockBody) -> usize {
+    let txs: usize = body
+        .txs
+        .iter()
+        .map(|tx| {
+            tx.proof.len()
+                + 32 * (1 + tx.public.nullifiers.len() + tx.public.commitments.len())
+                + 16
+        })
+        .sum();
+    txs + 40 // coinbase counter + payout key + map overhead
 }
 
 /// The payout key a node mines to when no wallet has been configured (issue #101).
@@ -284,6 +346,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             rounds: RoundLedger::default(),
             metrics: Metrics::new(),
             miner_rkm: UNCONFIGURED_MINER_RKM,
+            pending_bodies: BTreeMap::new(),
+            pending_bytes: 0,
         }
     }
 
@@ -461,6 +525,148 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         &self.finality
     }
 
+    // --- issue #130 (a): the two chain views, and the duties that need them ----
+
+    /// **The gap between this node's two chain views** — the state machine's applied
+    /// tip against fork choice's header tip (issue #130).
+    ///
+    /// One definition, shared with the telemetry surface and with
+    /// [`qlab_node::telemetry::SupplyCoverage`], so a duty cannot be refused on one
+    /// reading of "am I behind" while a figure is published on another.
+    pub fn state_lag(&self) -> StateLag {
+        StateLag::new(self.state.tip_height(), self.chain.tip_height())
+    }
+
+    /// Bodies currently held awaiting the state tip, and their weight in bytes.
+    /// Operator-visible so buffer occupancy is a measurement, not an inference.
+    pub fn pending_bodies(&self) -> (usize, usize) {
+        (self.pending_bodies.len(), self.pending_bytes)
+    }
+
+    /// How many times a duty was refused because the state machine was lagging —
+    /// read from the one metric registry, never from a second ledger.
+    pub fn lag_refusals(&self, duty: &str) -> u64 {
+        self.metrics.lag_refusals(duty)
+    }
+
+    /// Record a refused duty (issue #130 (a) part 3).
+    fn refuse_for_lag(&mut self, duty: &'static str) {
+        self.metrics.observe_lag_refusal(duty);
+    }
+
+    /// Hold a body whose header this node already has, for application when the
+    /// state tip reaches its parent.
+    ///
+    /// Refused, silently and correctly, for anything that cannot become applicable:
+    /// a height at or below the applied tip (already folded in, or on a branch this
+    /// state machine will never rewind to), and a height beyond
+    /// [`MAX_PENDING_BODY_HEIGHTS`]. Over either cap, the **highest** held entry is
+    /// dropped: the lowest heights are the ones that close the gap, so the entry
+    /// furthest from applicable is the one worth least.
+    fn buffer_body(&mut self, header: BlockHeader, body: BlockBody) {
+        let state_tip = self.state.tip_height();
+        if header.height <= state_tip || header.height > state_tip + MAX_PENDING_BODY_HEIGHTS {
+            return;
+        }
+        let key = (header.height, header.header_hash());
+        let weight = body_weight(&body);
+        if let Some((_, old)) = self.pending_bodies.insert(key, (header, body)) {
+            // Re-announce of a body we already hold: replace, and do not double-count.
+            self.pending_bytes = self.pending_bytes.saturating_sub(body_weight(&old));
+        }
+        self.pending_bytes += weight;
+        while self.pending_bodies.len() > MAX_PENDING_BODIES
+            || (self.pending_bytes > MAX_PENDING_BODY_BYTES && self.pending_bodies.len() > 1)
+        {
+            let Some(highest) = self.pending_bodies.keys().next_back().copied() else { break };
+            if let Some((_, dropped)) = self.pending_bodies.remove(&highest) {
+                self.pending_bytes = self.pending_bytes.saturating_sub(body_weight(&dropped));
+            }
+        }
+    }
+
+    /// Apply every held body that has become applicable, **in ascending height
+    /// order**, until none extends the state tip.
+    ///
+    /// Ascending is the whole mechanism: the state machine applies at its tip only,
+    /// so a held span empties from the bottom as the tip advances — which is why one
+    /// arriving body can close a gap of many, and why the old "apply what this one
+    /// announcement carried" shape could never catch up.
+    fn drain_pending_bodies(&mut self) {
+        while let Some(key) = self.next_applicable_body() {
+            let (header, body) = self.pending_bodies.remove(&key).expect("just located");
+            self.pending_bytes = self.pending_bytes.saturating_sub(body_weight(&body));
+            // `apply_block` is the authoritative gate and it re-validates the body
+            // against the tree it is actually being applied to — so nothing is ever
+            // folded in on the strength of an anchor answer computed from a stale
+            // tree. It also persists: the log append is inside it, which is what
+            // makes a buffered-then-applied body durable (issue #104).
+            match self.state.apply_block(header, body.clone(), &self.verifier) {
+                Ok(_) => {
+                    self.mempool.on_block_connected(header.height, &body, &self.state);
+                }
+                // GUARANTEED HERE, and this is not the old "expected" annotation: a
+                // body that fails at the funnel has mutated nothing (`apply_state`
+                // validates before it writes), and no peer is charged for it — the
+                // sender was judged once, on arrival, and this path holds no sender
+                // to charge a second time. What such a failure costs is visibility,
+                // and it has it: the body is dropped, the lag stays nonzero, and the
+                // duty gate below keeps refusing until it is not.
+                Err(_) => {}
+            }
+        }
+        // The finalized head is part of the view that has to catch up, not a separate
+        // concern — see `sync_state_finality`.
+        self.sync_state_finality();
+        // Anything no longer reachable from the applied tip is dead weight.
+        let state_tip = self.state.tip_height();
+        self.pending_bodies.retain(|(height, _), body| {
+            let keep = *height > state_tip && *height <= state_tip + MAX_PENDING_BODY_HEIGHTS;
+            if !keep {
+                // `pending_bytes` is maintained here rather than recomputed, so the
+                // two never drift.
+                self.pending_bytes = self.pending_bytes.saturating_sub(body_weight(&body.1));
+            }
+            keep
+        });
+    }
+
+    /// Advance the **state machine's** finalized head to the committee's, as far as
+    /// the state machine can see it (issue #130 (a)).
+    ///
+    /// One place, called from both sites that can move it: a finalization arriving
+    /// ([`Self::ingest_checkpoint_votes`]) and buffered bodies advancing the applied
+    /// tip. The second call site is the fix. `Node::finalize` requires the block to be
+    /// **known locally**, so a checkpoint that finalized while the state was lagging
+    /// named a block the state machine did not have: it returned `Ok(false)`, no
+    /// `Finalize` record was appended, and nothing ever came back for it (the second
+    /// fact #104 could not place). It is not only a log gap —
+    /// [`qlab_node::NodeState::is_valid_anchor`] reads *this* finalized head, so a node
+    /// whose bodies caught up but whose finality did not answers "no anchor is valid"
+    /// forever.
+    ///
+    /// GUARANTEED: whenever the state machine holds the committee's finalized block,
+    /// its own finalized head is advanced to it. A persistence failure on the append
+    /// is still swallowed here (issue #85, unchanged by this pass) — but it is now
+    /// *retried* on the next drain rather than being a single lost attempt.
+    fn sync_state_finality(&mut self) {
+        let Some(cp) = self.finality.latest().copied() else { return };
+        if self.state.finalized_height() == Some(cp.height) {
+            return;
+        }
+        let _ = self.state.finalize(cp.block_hash);
+    }
+
+    /// The lowest held body that extends the applied tip, if any.
+    fn next_applicable_body(&self) -> Option<(u64, Hash32)> {
+        let tip_hash = self.state.tip_hash();
+        let next = self.state.tip_height() + 1;
+        self.pending_bodies
+            .range((next, [0u8; 32])..=(next, [0xffu8; 32]))
+            .find(|(_, (header, _))| header.prev == tip_hash)
+            .map(|(key, _)| *key)
+    }
+
     /// Advance the epoch machinery to the current tip; reset the downtime window on
     /// an epoch change (indices reindex at a boundary — matches `StubNode`).
     fn advance_epoch(&mut self) {
@@ -577,6 +783,20 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // not, and that is fine — §4's hybrid honesty note; the committee, not miner
         // unanimity, is what makes the upgrade clean.
         if !self.rules.accepts_height(self.chain.tip_height() + 1) {
+            return None;
+        }
+        // STATE LAG (issue #130 (a), part 3 — the first of the three refusals).
+        //
+        // The parent comes from FORK CHOICE and the body is assembled from STATE. When
+        // those disagree, the block this would produce is a valid child of the
+        // fork-choice tip that the node's own state machine then refuses, so its
+        // coinbase note never gets a commitment-tree leaf and the coins are gone with
+        // no error raised anywhere. A node that cannot record its own block does not
+        // mine one — Ethereum's optimistic-sync rule ("an optimistic validator MUST
+        // NOT produce a block"), and the reason this is a refusal rather than a
+        // best-effort attempt.
+        if self.state_lag().is_lagging() {
+            self.refuse_for_lag("mine");
             return None;
         }
         let template =
@@ -716,17 +936,23 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         }
         // 2. Header into the consensus chain (PoW / fork-choice).
         let outcome = self.submit_header(header);
-        // 3. On a fresh accept, fold the body into real state (best-effort: a
-        //    non-tip block — benign reorg lag — is left for the canonical chain,
-        //    since the state machine is tip-only by design).
-        if outcome == IngestOutcome::Accepted {
-            match self.state.apply_block(header, body.clone(), &self.verifier) {
-                Ok(_) => {
-                    self.mempool.on_block_connected(header.height, &body, &self.state);
-                }
-                Err(NodeError::NotExtendingTip { .. }) => { /* reorg lag — expected */ }
-                Err(_) => { /* body already validated above; nothing else to do */ }
-            }
+        // 3. Application is gated on **whether we hold this header**, never on
+        //    whether the header was NEW (issue #130 (a)).
+        //
+        //    GUARANTEED: a body whose header is in this node's chain is applied as
+        //    soon as the state tip reaches its parent, in ascending height order,
+        //    and the state machine converges on its own chain with no restart.
+        //
+        //    `Duplicate` is the load-bearing half of that condition. Header-first
+        //    sync means the header is normally already known by the time its body is
+        //    announced, so the old `== Accepted` gate discarded exactly the body that
+        //    closes the gap, one branch above the `NotExtendingTip` arm the issue was
+        //    filed against. `Ignored` is deliberately excluded: a halted release must
+        //    not apply above its halt height (#74 H2), and `Orphan`/`Rejected` mean
+        //    the header is not in the chain to apply a body against.
+        if matches!(outcome, IngestOutcome::Accepted | IngestOutcome::Duplicate) {
+            self.buffer_body(header, body);
+            self.drain_pending_bodies();
         }
         outcome
     }
@@ -734,6 +960,25 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
 
 impl<P: PowEngine, V: TxVerifier + Clone> TxPool for NodeAdapter<P, V> {
     fn ingest_tx(&mut self, tx: TxEntry) -> IngestOutcome {
+        // STATE LAG (issue #130 (a), part 3 — refusals two and three, which are the
+        // same seam).
+        //
+        // `Mempool::admit` answers `is_valid_anchor` from the state machine's tree,
+        // and a stale tree answers a CONSENSUS rule (protocol-spec §4 / frozen §7)
+        // wrongly in both directions: it cannot see roots it has not applied, and its
+        // stale tip makes the `MAX_ANCHOR_AGE_BLOCKS` window read as more permissive
+        // than it is. This is also the wallet refusal — `submit_local_tx`, the only
+        // write a co-resident wallet has (#123), lands here — so a wallet cannot cut
+        // a witness against the wrong prefix of the tree and have this node take it.
+        //
+        // `Ignored`, never `Rejected`: the transaction may be perfectly valid and the
+        // sender is not at fault, and #134 is precisely the cost of confusing "this is
+        // invalid" with "I cannot judge this". So it is not relayed, not pooled, and
+        // NOT scored.
+        if self.state_lag().is_lagging() {
+            self.refuse_for_lag("admit_tx");
+            return IngestOutcome::Ignored(STATE_LAG_REASON);
+        }
         let wid = wire_tx_id(&tx);
         match self.mempool.admit(tx, vec![], &self.state, &self.verifier) {
             Ok(id) => {
@@ -854,11 +1099,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
                 Ok(()) => {
                     self.seen_checkpoints.insert(id);
                     self.observe_finality_advance(cp, prev_cp, tip);
-                    // Advance the consensus finalized pointer (no reorg past finality)
-                    // and the state-machine finalized height — both best-effort: the
-                    // block may not be known locally yet, which anchor queries tolerate.
+                    // Advance the consensus finalized pointer (no reorg past finality).
                     let _ = self.chain.set_finalized(cp.block_hash);
-                    let _ = self.state.finalize(cp.block_hash);
+                    // …and the state machine's finalized head, through the single
+                    // place that does it. It may not hold this block yet — but that is
+                    // no longer where the attempt ends: the next drain retries it
+                    // (issue #130 (a)).
+                    self.sync_state_finality();
                     let signers: Vec<usize> = active_now.iter().map(|v| v.signer).collect();
                     self.signing.record_round(&signers);
                     self.apply_downtime_jails(cp.height);
@@ -1076,6 +1323,427 @@ mod tests {
         let h2 = BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, bad_body.commitment());
         assert_eq!(a.ingest_block(h2, bad_body), IngestOutcome::Rejected("bad body"));
         assert_eq!(a.chain().tip_height(), 1, "tip did not move on a bad block");
+    }
+
+    // --- issue #130 (a): the state machine catches up with its own chain -----
+
+    /// Mine `n` blocks on `proposer`, returning the `(header, body)` pairs in
+    /// ascending height order. The proposer applies each one itself.
+    fn mine_chain(
+        proposer: &mut NodeAdapter<KeccakPow, MockVerifier>,
+        n: usize,
+    ) -> Vec<(BlockHeader, BlockBody)> {
+        (0..n)
+            .map(|_| {
+                let (h, body) = proposer.mine_block().expect("mine");
+                assert_eq!(proposer.ingest_block(h, body.clone()), IngestOutcome::Accepted);
+                (h, body)
+            })
+            .collect()
+    }
+
+    /// A follower that has synced HEADERS for `blocks` and applied no body — the
+    /// state of every node that joins a running net, and of every node whose
+    /// header-first sync ran ahead of a body announce.
+    fn follower_with_headers_only(
+        blocks: &[(BlockHeader, BlockBody)],
+    ) -> NodeAdapter<KeccakPow, MockVerifier> {
+        let mut f = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        for (h, _) in blocks {
+            assert_eq!(f.ingest_header(*h), IngestOutcome::Accepted);
+        }
+        assert_eq!(f.chain().tip_height(), blocks.len() as u64);
+        assert_eq!(f.state().tip_height(), 0, "no body has been applied");
+        f
+    }
+
+    /// **Acceptance 1 (#130 (a)): a node whose state tip trails its fork-choice tip
+    /// applies the bodies it is holding, in ascending order, and converges — with no
+    /// restart.**
+    ///
+    /// Before this, body application was gated on `submit_header` returning
+    /// `Accepted`, i.e. on the header being *new*. Header-first sync guarantees the
+    /// header is already known by the time the body arrives, so every body was
+    /// dropped one branch above the `NotExtendingTip` arm everyone was looking at
+    /// (QUM-18's F1). The bodies below arrive out of order and for headers this node
+    /// already holds — both properties the old path could not survive.
+    #[test]
+    fn a_state_machine_behind_fork_choice_drains_buffered_bodies_in_ascending_order() {
+        let mut p = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let blocks = mine_chain(&mut p, 3);
+        let mut f = follower_with_headers_only(&blocks);
+        assert_eq!(f.state_lag().blocks(), 3, "the #130 gap, measured");
+
+        // Bodies arrive newest-first. Each header is already held, so each ingest is
+        // a `Duplicate` *header* — and each body is still applicable material.
+        assert_eq!(f.ingest_block(blocks[2].0, blocks[2].1.clone()), IngestOutcome::Duplicate);
+        assert_eq!(f.state().tip_height(), 0, "block 3 must not be applied before 2");
+        assert_eq!(f.ingest_block(blocks[1].0, blocks[1].1.clone()), IngestOutcome::Duplicate);
+        assert_eq!(f.state().tip_height(), 0, "…nor 2 before 1");
+
+        // The body that closes the gap. Everything buffered drains behind it, in
+        // ascending order, in this one call.
+        assert_eq!(f.ingest_block(blocks[0].0, blocks[0].1.clone()), IngestOutcome::Duplicate);
+        assert_eq!(f.state().tip_height(), 3, "the state machine caught up to its own chain");
+        assert_eq!(f.state_lag().blocks(), 0);
+        assert!(!f.state_lag().is_lagging());
+        assert_eq!(f.state().tip_hash(), f.chain().tip_hash(), "and to the same block");
+    }
+
+    /// **Acceptance 2 (#130 (a)): the regression that produced this issue — a node
+    /// mining on a fork-choice tip above its own state tip must not silently lose its
+    /// coinbase.**
+    ///
+    /// `mine_block` takes its parent from **fork choice** (`chain.tip_hash()`) and
+    /// assembles the body from **state**. So a lagging miner produced a valid child of
+    /// the fork-choice tip, `submit_header` accepted it (it really did extend fork
+    /// choice), and `apply_block` then refused it because `header.prev` was not the
+    /// state tip: the coinbase note's leaf never entered the tree, the miner could
+    /// never spend what it mined, and nothing anywhere reported an error.
+    ///
+    /// This gets its own test rather than riding along on the drain test above,
+    /// because it is the sharpest of the four consequences and the one that reaches a
+    /// miner's balance.
+    #[test]
+    fn a_miner_ahead_of_its_own_state_tip_does_not_silently_lose_its_coinbase() {
+        let mut p = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let blocks = mine_chain(&mut p, 2);
+        let mut f = follower_with_headers_only(&blocks);
+
+        // Lagging: it declines to produce a block it could not record.
+        let leaves_before = f.state().commitment_count();
+        assert!(
+            f.mine_block().is_none(),
+            "a node that cannot apply its own block must not mine one"
+        );
+        assert_eq!(f.lag_refusals("mine"), 1, "and the refusal is counted, not silent");
+        assert_eq!(f.state().commitment_count(), leaves_before, "no leaf, and no lost leaf");
+
+        // Caught up: it mines, and the coinbase leaf is in its own tree — which is
+        // what "did not lose it" has to mean after #101 (a leaf is what makes a
+        // mined coin spendable).
+        for (header, body) in &blocks {
+            assert_eq!(f.ingest_block(*header, body.clone()), IngestOutcome::Duplicate);
+        }
+        assert!(!f.state_lag().is_lagging(), "converged");
+        let leaves = f.state().commitment_count();
+        let (header, body) = f.mine_block().expect("mines once its state machine is its chain");
+        assert_eq!(f.ingest_block(header, body), IngestOutcome::Accepted);
+        assert_eq!(f.state().tip_height(), 3, "its own block is in its own state");
+        assert_eq!(
+            f.state().commitment_count(),
+            leaves + 1,
+            "the coinbase note it just mined has a commitment-tree leaf"
+        );
+    }
+
+    /// **#134's boundary, checked rather than assumed: a body that is held, retried
+    /// and possibly dropped is never a second peer fault.**
+    ///
+    /// #134 (a joiner banning honest peers because `AnchorNotFinal` is classified as a
+    /// peer fault) is out of scope here, and the one thing (a) owes it is not to make
+    /// it worse. Two properties do that, and both are asserted:
+    ///
+    /// 1. **Nothing is scored on the retry path.** Peer scoring keys on the
+    ///    `IngestOutcome` that `ingest_block` returns to `P2pNode::complete_block`,
+    ///    which is computed once, on arrival. `drain_pending_bodies` holds no
+    ///    `PeerId` — it is not that the retry declines to penalise, it is that it has
+    ///    nobody to penalise, which is a stronger guarantee than a policy.
+    /// 2. **A held body's arrival verdict is not a fault to begin with.** It is
+    ///    `Duplicate` (the header was already known) or `Accepted`.
+    ///
+    /// What this pass does NOT do is change the arrival-time classification: a body
+    /// whose anchor cannot be judged is still `Rejected("bad body")` exactly as before,
+    /// once, for the same reason, with the same penalty. That is #134's to fix, and
+    /// changing it here in either direction would either widen it or quietly do its
+    /// job.
+    #[test]
+    fn a_held_body_is_never_a_second_peer_fault_however_often_it_is_retried() {
+        let mut p = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let blocks = mine_chain(&mut p, 3);
+        let mut f = follower_with_headers_only(&blocks);
+
+        // Every arrival of a body for a header we hold — including repeats of the same
+        // body, which is what a re-announce is — is a non-fault outcome.
+        for round in 0..2 {
+            for (header, body) in blocks.iter().skip(1) {
+                let outcome = f.ingest_block(*header, body.clone());
+                assert_eq!(outcome, IngestOutcome::Duplicate, "round {round}");
+                assert!(!outcome.is_peer_fault(), "round {round}: a held body is not a fault");
+            }
+            assert_eq!(
+                f.pending_bodies().0,
+                2,
+                "a re-announced body replaces its entry rather than adding one"
+            );
+        }
+
+        // Draining does not produce an outcome at all: there is no return value for a
+        // caller to score, and no sender attached to the retry.
+        assert_eq!(f.ingest_block(blocks[0].0, blocks[0].1.clone()), IngestOutcome::Duplicate);
+        assert_eq!(f.state().tip_height(), 3);
+        assert_eq!(f.pending_bodies(), (0, 0), "and the window empties behind it");
+    }
+
+    /// **The pending-body window is bounded on all three axes** (issue #130 (a)).
+    ///
+    /// #135 filed the unbounded twin of this map and made the argument this test
+    /// exists to honour: a count cap alone does not behave when body size is variable
+    /// by ~145 kB per transaction, and a byte budget alone does not behave when a
+    /// coinbase-only body is tens of bytes. So there are two caps and a height window,
+    /// and the eviction drops the entry **furthest** from applicable — the lowest
+    /// heights are the ones that can close a gap.
+    ///
+    /// `buffer_body` is exercised directly: it is the admission decision, and it is
+    /// deliberately reachable only for headers this node already holds, so a header
+    /// 1,025 blocks above the applied tip (#106 resynced 3,597) cannot be built with
+    /// real PoW inside a unit test.
+    #[test]
+    fn the_pending_body_window_is_bounded_by_height_count_and_bytes() {
+        let (mut a, _anchor) = adapter_with_finalized_genesis();
+        let genesis = *a.chain().header(&a.chain().genesis_hash()).expect("genesis header");
+        let header_at = |height: u64| {
+            let mut h = BlockHeader::child_of(&genesis, height * 75, genesis.difficulty, [0; 32]);
+            h.height = height;
+            h
+        };
+        let small = BlockBody::default();
+
+        // At or below the applied tip: nothing to do with it.
+        a.buffer_body(header_at(0), small.clone());
+        assert_eq!(a.pending_bodies().0, 0, "height 0 is already applied");
+
+        // Inside the window, held; one block past it, refused.
+        a.buffer_body(header_at(1), small.clone());
+        a.buffer_body(header_at(MAX_PENDING_BODY_HEIGHTS), small.clone());
+        assert_eq!(a.pending_bodies().0, 2);
+        a.buffer_body(header_at(MAX_PENDING_BODY_HEIGHTS + 1), small.clone());
+        assert_eq!(
+            a.pending_bodies().0,
+            2,
+            "beyond the window a body cannot become applicable without material this \
+             node has no message to request (#130 (c))"
+        );
+
+        // The entry cap holds, and it is the highest heights that go.
+        for height in 2..(MAX_PENDING_BODIES as u64 + 20) {
+            a.buffer_body(header_at(height), small.clone());
+        }
+        assert_eq!(a.pending_bodies().0, MAX_PENDING_BODIES);
+        assert_eq!(
+            a.next_applicable_body().map(|(height, _)| height),
+            Some(1),
+            "the applicable pick is the LOWEST held height, whatever order they arrived in"
+        );
+        let heights: Vec<u64> = a.pending_bodies.keys().map(|(h, _)| *h).collect();
+        assert_eq!(heights[0], 1, "the lowest held height survived eviction");
+        assert!(
+            *heights.last().expect("nonempty") < MAX_PENDING_BODIES as u64 + 19,
+            "the furthest-from-applicable entries were the ones dropped"
+        );
+
+        // The byte budget bites first when bodies carry proofs.
+        let (mut b, anchor) = adapter_with_finalized_genesis();
+        let mut fat = BlockBody { txs: vec![tx_with(anchor, 1, b"ok")], coinbase: 0, coinbase_rkm: [0; 4] };
+        fat.txs[0].proof = vec![0u8; 2 * 1024 * 1024];
+        for height in 1..24u64 {
+            b.buffer_body(header_at(height), fat.clone());
+        }
+        assert!(
+            b.pending_bodies().1 <= MAX_PENDING_BODY_BYTES,
+            "byte budget: {} bytes held",
+            b.pending_bodies().1
+        );
+        assert!(
+            b.pending_bodies().0 < 23 && b.pending_bodies().0 > 1,
+            "the byte cap bound it, not the entry cap: {} entries",
+            b.pending_bodies().0
+        );
+    }
+
+    /// **(#130 (a), and #104's second unplaced fact): the state machine's FINALIZED
+    /// head catches up too, and its `Finalize` log records with it.**
+    ///
+    /// A checkpoint that finalizes while the state lags names a block the state
+    /// machine does not have, so `Node::finalize` bails at `set_finalized` and returns
+    /// `Ok(false)` — no error, no append, and nothing ever came back for it. That is
+    /// why #104 saw a `blocks.log` that had not grown across ~450 finalizations.
+    ///
+    /// It matters beyond the log: `is_valid_anchor` requires a **finalized** height
+    /// from the state machine's own store, so a state machine that catches up on
+    /// bodies but not on finality answers "no valid anchors exist" forever — which
+    /// would hand T1 a node that syncs and still cannot accept a transaction.
+    #[test]
+    fn the_state_machines_finalized_head_catches_up_after_the_bodies_do() {
+        use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS as CADENCE;
+
+        let dir = temp_dir("finality-catchup");
+        let (cstate, validators) = committee7();
+        let mut p = NodeAdapter::new(cstate, KeccakPow, MockVerifier, easy_sim());
+        let blocks = mine_chain(&mut p, CADENCE as usize);
+        {
+            let mut f =
+                NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+                    .expect("open disk-backed");
+            for (header, _) in &blocks {
+                assert_eq!(f.ingest_header(*header), IngestOutcome::Accepted);
+            }
+            // A quorum finalizes slot 8 while this node's state is still at genesis.
+            let (cp, votes) = f.make_checkpoint(CADENCE, &validators).expect("checkpoint");
+            assert!(matches!(
+                f.ingest_checkpoint_votes(&cp, &votes[..5]),
+                VotesOutcome::Learned { finalized: true, .. }
+            ));
+            assert_eq!(f.finalized_height(), Some(CADENCE), "the committee finalized");
+            assert_eq!(
+                f.state().finalized_height(),
+                None,
+                "…and the state machine could not, because it does not have that block"
+            );
+
+            // Bodies arrive. The applied tip catches up — and so must the finalized
+            // head, which nothing was retrying.
+            for (header, body) in &blocks {
+                f.ingest_block(*header, body.clone());
+            }
+            assert_eq!(f.state().tip_height(), CADENCE);
+            assert_eq!(
+                f.state().finalized_height(),
+                Some(CADENCE),
+                "the state machine's finalized head caught up with the committee's"
+            );
+            assert!(
+                f.state().is_valid_anchor(&f.state().commitment_root()),
+                "and a finalized root is a valid anchor again"
+            );
+        }
+        // The `Finalize` record reached the log: a restart replays the finalized head
+        // rather than starting over with none.
+        let reopened = MemNode::open(&dir, genesis_block(easy_sim().genesis_difficulty, 0))
+            .expect("reopen");
+        assert_eq!(reopened.finalized_height(), Some(CADENCE));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A private temp dir for a disk-backed adapter.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let mut p = std::env::temp_dir();
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        p.push(format!("qlab-p2p-i130a-{tag}-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&p).expect("create temp dir");
+        p
+    }
+
+    /// **Acceptance (#104 — this defect's first observation, from production, three
+    /// days before #130 was filed): a body that was buffered and then applied is
+    /// PERSISTED.**
+    ///
+    /// #104 recorded `blocks.log` frozen on all four T0 hosts, four different sizes,
+    /// four different stop times, all inside the first 27 minutes of a 73-hour run,
+    /// and could not place two of its facts. Both are this: `apply_block` returns
+    /// `NotExtendingTip` **before** `persist::append_record`, so the append was never
+    /// attempted — a fix that replayed a buffer into memory without reaching the log
+    /// would leave #104's exact symptom alive after its cause was gone. The append is
+    /// inside `apply_block`, so applying through it is what makes it durable, and this
+    /// test is what proves it rather than asserting it.
+    #[test]
+    fn buffered_bodies_reach_the_block_log_so_a_restart_replays_from_disk() {
+        use qlab_node::BLOCK_LOG;
+
+        let dir = temp_dir("persist");
+        let log = dir.join(BLOCK_LOG);
+        let mut p = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let blocks = mine_chain(&mut p, 3);
+
+        let before = std::fs::metadata(&log).map(|m| m.len()).unwrap_or(0);
+        {
+            let mut f =
+                NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+                    .expect("open disk-backed");
+            for (header, _) in &blocks {
+                assert_eq!(f.ingest_header(*header), IngestOutcome::Accepted);
+            }
+            assert_eq!(f.state().tip_height(), 0, "headers only");
+            // Newest-first, so every one of them is buffered before any is applied.
+            for (header, body) in blocks.iter().rev() {
+                f.ingest_block(*header, body.clone());
+            }
+            assert_eq!(f.state().tip_height(), 3, "drained");
+        }
+        let after = std::fs::metadata(&log).expect("the block log exists").len();
+        assert!(
+            after > before,
+            "the block log must grow when buffered bodies apply ({before} → {after})"
+        );
+
+        // The #104 acceptance shape: a restart replays its own chain from disk instead
+        // of resyncing from peers. `open` (snapshot-assisted) and `replay`
+        // (from-genesis) must agree — this repo's own correctness anchor.
+        let genesis = genesis_block(easy_sim().genesis_difficulty, 0);
+        let reopened = MemNode::open(&dir, genesis.clone()).expect("reopen");
+        let replayed = MemNode::replay(&dir, genesis).expect("replay");
+        assert_eq!(reopened.tip_height(), 3, "restart replays three applied bodies");
+        assert_eq!(replayed.tip_height(), 3);
+        assert_eq!(reopened.tip_hash(), replayed.tip_hash());
+        assert_eq!(reopened.commitment_root(), replayed.commitment_root());
+        assert_eq!(
+            reopened.commitment_count(),
+            3,
+            "three coinbase leaves — the bodies really were folded in, not just logged"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **Acceptance 3 (#130 (a) part 3): every duty that needs a current view is
+    /// refused while the lag is nonzero, and refused NO LONGER once it converges.**
+    ///
+    /// The second half is the load-bearing one: a refusal that never lifts is a
+    /// permanently degraded node wearing a fix's clothes. Ethereum's optimistic-sync
+    /// rule is the precedent — an optimistic validator MUST NOT produce a block or
+    /// attest, *while it is optimistic*.
+    #[test]
+    fn duties_are_refused_while_the_state_lags_and_resume_once_it_converges() {
+        let mut p = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let blocks = mine_chain(&mut p, 2);
+        let mut f = follower_with_headers_only(&blocks);
+        // Finalized genesis ⇒ the empty-tree root is a valid anchor, so only the lag
+        // can be the reason the transaction below is refused.
+        let genesis = f.chain().genesis_hash();
+        f.state_mut().finalize(genesis).expect("finalize genesis");
+        let anchor = f.state().commitment_root();
+        let tx = tx_with(anchor, 7, b"ok");
+
+        // 1. Mining — it would build on a tip whose body it has not applied.
+        assert!(f.mine_block().is_none());
+        // 2. Admitting a transaction — `Mempool::admit` answers `is_valid_anchor`
+        //    from the state machine's tree, and that tree is stale.
+        let refused = f.ingest_tx(tx.clone());
+        assert!(
+            matches!(refused, IngestOutcome::Ignored(_)),
+            "a refusal to judge is `Ignored`, got {refused:?}"
+        );
+        assert!(
+            !refused.is_peer_fault(),
+            "the sender did nothing wrong — this node is the one that cannot judge (#134's boundary)"
+        );
+        assert_eq!(f.mempool().len(), 0);
+        assert_eq!(f.lag_refusals("mine"), 1);
+        assert_eq!(f.lag_refusals("admit_tx"), 1);
+
+        // Converge.
+        for (header, body) in &blocks {
+            assert_eq!(f.ingest_block(*header, body.clone()), IngestOutcome::Duplicate);
+        }
+        assert!(!f.state_lag().is_lagging());
+
+        // 3. Both duties resume, and the counters stop climbing.
+        assert!(f.mine_block().is_some(), "mining resumes");
+        assert_eq!(f.ingest_tx(tx), IngestOutcome::Accepted, "admission resumes");
+        assert_eq!(f.mempool().len(), 1);
+        assert_eq!(f.lag_refusals("mine"), 1, "no further refusal after convergence");
+        assert_eq!(f.lag_refusals("admit_tx"), 1);
     }
 
     // --- issue #77: the p2p ingest seam ------------------------------------
