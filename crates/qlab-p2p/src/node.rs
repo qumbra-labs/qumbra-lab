@@ -31,11 +31,26 @@ use crate::n1::{IngestOutcome, NodeState, VotesOutcome};
 use crate::peer::{NodeId, PeerId, PeerTable, VersionMsg};
 use crate::ratelimit::{RateKey, RateLimiter, RateLimits, RateStats};
 use crate::sync::{build_locator, answer_get_headers, SyncPhase, SyncState, MAX_HEADERS_PER_BATCH};
-use crate::transport::{DialCompletion, DialStart, Transport};
+use crate::transport::{DialCompletion, DialStart, Transport, TransportError};
 use crate::wire::{Envelope, MsgType};
 
 /// Service-bits placeholder advertised in the handshake (`[devnet-placeholder]`).
 pub const SERVICE_FULL: u64 = 0x01;
+
+/// The `DIAL` journal line for one completed outbound connect — `key=value` like
+/// `TELEMETRY`/`ROUND` so the same grep/awk habits work (readers key on the line
+/// prefix, e.g. `deploy/docker/soak.sh`'s `grep '^TELEMETRY'`).
+///
+/// The duration is logged on failures too, quoting the error last: a dial the
+/// kernel gave up on after its SYN retry ladder (127 s on the deployed hosts —
+/// issue #107's number) and one refused in 3 ms are different operational
+/// events, and `result=err` alone cannot tell them apart.
+fn dial_line(addr: &str, elapsed_ms: u64, result: &Result<PeerId, TransportError>) -> String {
+    match result {
+        Ok(_) => format!("DIAL addr={addr} ms={elapsed_ms} result=ok"),
+        Err(e) => format!("DIAL addr={addr} ms={elapsed_ms} result=err err=\"{e}\""),
+    }
+}
 
 /// A running P2P node: transport + node-state + peers + gossip + sync.
 pub struct P2pNode<T: Transport, N: NodeState> {
@@ -183,9 +198,16 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// supplied by the caller starts failure backoff *after* the wait ended; #107
     /// previously started it before a blocking connect, so a long SYN timeout
     /// silently consumed the whole backoff.
+    ///
+    /// Every completion is journalled (issue #137). #132 took connects off this
+    /// loop, so a connect sitting in the kernel's SYN retry loop no longer shows
+    /// up as a stalled node — this line is the only place it shows up at all.
+    /// Only real-socket transports ever return completions here (the in-process
+    /// hub resolves dials inline), so deterministic sims stay silent.
     fn finish_dials(&mut self, now_ms: u64) -> usize {
         let mut connected = 0;
-        for DialCompletion { addr, elapsed_ms: _, result } in self.transport.poll_dials() {
+        for DialCompletion { addr, elapsed_ms, result } in self.transport.poll_dials() {
+            println!("{}", dial_line(&addr, elapsed_ms, &result));
             match result {
                 Ok(pid) => {
                     self.addrs.on_dial_success(&addr, pid);
@@ -1773,6 +1795,27 @@ mod tests {
 
         server.shutdown();
         node.transport().shutdown();
+    }
+
+    #[test]
+    fn dial_line_success_carries_addr_and_duration() {
+        // Issue #137: the duration is the number #107 needed — a slow *success*
+        // (131 s connect floor) must be as visible as a failure.
+        let line = dial_line("10.0.0.7:9400", 131_072, &Ok(PeerId(3)));
+        assert_eq!(line, "DIAL addr=10.0.0.7:9400 ms=131072 result=ok");
+    }
+
+    #[test]
+    fn dial_line_failure_carries_duration_and_error() {
+        // Issue #137's failure-side decision: a dial that dies in 3 ms (refused)
+        // and one that dies after 127 s (kernel SYN retries exhausted) are
+        // different operational events, so failures log the duration too.
+        let err = Err(TransportError::Io("connection timed out".to_string()));
+        let line = dial_line("10.0.0.7:9400", 127_000, &err);
+        assert_eq!(
+            line,
+            "DIAL addr=10.0.0.7:9400 ms=127000 result=err err=\"transport io: connection timed out\""
+        );
     }
 
     #[test]
