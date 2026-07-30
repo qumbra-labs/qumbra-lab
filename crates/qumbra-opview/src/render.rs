@@ -493,4 +493,62 @@ mod tests {
         assert!(!text.contains("AGREED"), "partial coverage must not claim agreement:\n{text}");
         assert!(!supply_diverged(&readings), "unavailable is not a supply violation");
     }
+
+    /// **Issue #136: `UNAVAILABLE` is a stable token and alerting may depend on it.**
+    ///
+    /// It is the machine-readable half of #130's refusal, and it is the *only* thing
+    /// that separates "supply was checked across the whole canonical chain and
+    /// agreed" from "supply was never checked" — the assertions below show both
+    /// leaving `supply_diverged` false, i.e. both exiting `0`. A script that reads
+    /// only the exit status cannot tell them apart, so it must grep this token, and
+    /// that makes the token a public contract in two directions:
+    ///
+    /// - it renders as a bare word under partial coverage, and
+    /// - it is **absent** under complete coverage, or grepping it would mean nothing.
+    ///
+    /// Deliberately asserted as the bare token, separately from
+    /// `supply_view_refuses_when_state_machine_lags_fork_choice`'s assertion on the
+    /// whole refusal sentence: rewording that sentence must not be able to take the
+    /// token with it. Same reason PR #126 pinned `!text.contains("AGREED")`.
+    #[test]
+    fn unavailable_is_a_stable_token_and_exit_zero_does_not_attest_coverage() {
+        // One honest epoch, exact to the bessel. The only difference between the two
+        // readings below is whether the state ledger has caught fork choice.
+        let epoch = SupplyEpoch {
+            epoch: 0,
+            start_height: 0,
+            end_height: 1151,
+            measured_coinbase: 5_000_000_000,
+            expected_coinbase: 5_000_000_000,
+            fees: 456,
+        };
+        let lagging = vec![ok(
+            "joining",
+            t_at(1200, Some(1151), Some(0x0102_0304_0506), None).with_supply(vec![epoch.clone()]),
+        )];
+        let covered = vec![ok(
+            "steady",
+            t_at(1151, Some(1151), Some(0x0102_0304_0506), None).with_supply(vec![epoch]),
+        )];
+
+        let lagging_text = view(&lagging, &Agreement::of(&lagging));
+        let covered_text = view(&covered, &Agreement::of(&covered));
+
+        assert!(
+            lagging_text.split_whitespace().any(|word| word == "UNAVAILABLE"),
+            "incomplete coverage must render the token as a bare word:\n{lagging_text}"
+        );
+        assert!(
+            !covered_text.contains("UNAVAILABLE"),
+            "complete coverage must not emit the token, or the grep says nothing:\n{covered_text}"
+        );
+        // Complete coverage renders the figures the token's absence vouches for.
+        assert!(covered_text.contains("5000000000"), "{covered_text}");
+        assert!(!lagging_text.contains("5000000000"), "{lagging_text}");
+
+        // The reason the token has to carry this: neither reading is a divergence,
+        // so `main` exits 0 for both. Only the token separates them.
+        assert!(!supply_diverged(&lagging), "partial coverage is not a violation");
+        assert!(!supply_diverged(&covered), "an exact match is not a violation");
+    }
 }

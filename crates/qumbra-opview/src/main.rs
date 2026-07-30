@@ -11,6 +11,25 @@
 //! usage. Only a STOP-grade finding is non-zero — an operator wiring this into an
 //! alert must not be paged because a node is down or because a routine
 //! signed-variant split was recorded.
+//!
+//! # `0` is "nothing divergent was detected", not "supply was verified" (#136)
+//!
+//! A node whose state ledger trails fork choice reports coverage
+//! `Unavailable`, its figures are refused rather than rendered
+//! (#130), and `render::supply_diverged` correctly declines to fire on partial
+//! evidence — so **exit `0` covers both "supply was checked across the whole
+//! canonical chain and agreed" and "supply was never checked".** The exit status
+//! cannot tell those apart, and it is not meant to: **coverage is reported in the
+//! output, not in the exit status.** A consumer that needs to know greps the
+//! supply block for `UNAVAILABLE`, which is a **stable token alerting may depend
+//! on** and is pinned by a test on both sides (present under partial coverage,
+//! absent under complete coverage).
+//!
+//! Deliberately **not** a third exit code, and deliberately not promoted to `2`:
+//! every joining or briefly-lagging node reports `Unavailable`, so a non-zero
+//! code here would ring continuously and train operators to ignore the one code
+//! that means STOP — strictly worse than this silence, and against #117's
+//! convention that only a STOP-grade finding is non-zero.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -36,9 +55,19 @@ OPTIONS:
     -h, --help           this text
 
 EXIT:
-    0  no critical divergence (nodes may be down; an sid split is a finding)
+    0  no critical divergence was DETECTED (nodes may be down; an sid split is a
+       finding; supply coverage may be incomplete — see below)
     2  fid divergence (R2 STOP) or non-zero scheduled-supply divergence
     1  usage error
+
+Exit 0 does not assert that supply was verified. A node whose state ledger trails
+fork choice reports coverage UNAVAILABLE and its supply figures are refused, which
+also exits 0 — so the exit status alone cannot tell `checked across the whole
+canonical chain and agreed` from `never checked`. Coverage is reported in the
+output, not in the exit status: grep the supply block for UNAVAILABLE. That token
+is stable and alerting may depend on it. It is deliberately not a third exit code
+— every joining or briefly-lagging node is UNAVAILABLE, so paging on it would
+train operators to ignore the one code that means STOP.
 
 This view exposes only public chain facts. It deliberately has no address,
 balance, or traceable-transfer pages because Qumbra has no transparent tier.
@@ -98,6 +127,37 @@ fn run(args: &[String]) -> Result<ExitCode, String> {
     let readings = poll_all(&endpoints, PollOptions { timeout });
     let agreement = Agreement::of(&readings);
     print!("{}", render::view(&readings, &agreement));
+    // `critical` is "a divergence was DETECTED". It is deliberately NOT "supply
+    // was verified": under `SupplyCoverage::Unavailable` the figures are refused,
+    // `supply_diverged` is false, and this exits 0 — the same 0 a fully covered,
+    // agreeing net produces. Coverage lives in the output above, as the
+    // `UNAVAILABLE` token, and the `EXIT:` block says so (issue #136).
     let critical = agreement.exit_code() != 0 || render::supply_diverged(&readings);
     Ok(ExitCode::from(if critical { 2 } else { 0 }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::USAGE;
+
+    /// **Issue #136: the operator text is the only thing that tells a script author
+    /// exit `0` is not a coverage assertion** — so pin the two claims a consumer
+    /// depends on. `UNAVAILABLE` is the token an alert greps (rendered by
+    /// `render::supply`, pinned on both sides in that module's tests); this text is
+    /// what points anyone at it. Rewording the `EXIT:` block is fine, silently
+    /// dropping either claim is not.
+    ///
+    /// Same reason PR #126 pinned `!text.contains("AGREED")`: a later reword must
+    /// not be able to break a consumer without breaking a test first.
+    #[test]
+    fn usage_says_exit_zero_does_not_attest_supply_coverage() {
+        assert!(
+            USAGE.contains("Exit 0 does not assert that supply was verified."),
+            "the EXIT: block must state what 0 does not claim:\n{USAGE}"
+        );
+        assert!(
+            USAGE.contains("UNAVAILABLE"),
+            "the EXIT: block must name the token a consumer greps for coverage:\n{USAGE}"
+        );
+    }
 }
