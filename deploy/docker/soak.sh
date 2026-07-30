@@ -17,6 +17,36 @@
 #   soak.sh committee-recover    restart them → T0-2 catch-up → Final
 #   soak.sh teardown             docker compose down -v (destroys volumes)
 #
+# ── WHAT THIS HARNESS MODELS ABOUT THE T0 HOSTS ──────────────────────────────
+#
+# THREE host properties, added one at a time by issue #107's steps 1b–1d, and this is
+# the one place they are listed together. Each is a separate knob with a separate
+# readback and a separate caveat, and NONE of them reads any other:
+#
+#   property                     set with                    read back with
+#   ───────────────────────────  ──────────────────────────  ────────────────────────
+#   WAN latency          (1b)    soak.sh netem <ms>          soak.sh netem-show
+#   advertised-addr absence (1c) QUMBRA_ADVERTISE_ADDR=none  soak.sh advertise-show
+#   CPU budget           (1d)    QUMBRA_CPUS / QUMBRA_CPUSET soak.sh cpu-show
+#                                or soak.sh cpu-budget <n>
+#
+# All three DEFAULT to what every run before 2026-07-30 was — no qdisc, advertised,
+# unconstrained — so an ordinary soak is unchanged and each of the eight combinations
+# is reachable and legible. A fourth axis is orthogonal to all of them and is not a
+# host property at all: whether the `faucet` container (#128) is in the run. It is a
+# FIFTH node that none of the four T0 hosts corresponds to, so it is excluded from
+# every four-node assertion here — but it mines, so it is NOT excluded from the CPU
+# budget (see cpu_targets).
+#
+# Two rules that apply to all three, and they are why the knobs exist at all:
+#
+#   1. STATE THE CONDITION WITH THE NUMBER. Two runs of this harness that differ on
+#      any one of these axes are two different experiments. Every readback command
+#      prints, and most will assert, so there is no reason to infer.
+#   2. A KNOB ANSWERS "IS THIS EFFECT <X>-SHAPED", NEVER "DOES THIS MATCH T0". Each
+#      section below says exactly what its own negative result does and does not rule
+#      out. Read the one you used before quoting anything from it.
+#
 # LATENCY INJECTION (issue #107 step 1b). Run against a net that is already up.
 #
 #   soak.sh netem <delay_ms> [jit_ms]  install `tc netem` on every node's eth0,
@@ -27,6 +57,18 @@
 #   soak.sh netem-show                 the qdisc + the measured RTT matrix
 #   soak.sh netem-clear                remove it, and prove it is gone
 #
+# ADVERTISED-ADDRESS MODE (issue #107 step 1c). Set on the compose service, read
+# back from the running containers:
+#
+#   QUMBRA_ADVERTISE_ADDR=none soak.sh rehearsal   bring the net up with NO node
+#                                      advertising itself — the four T0 hosts' own
+#                                      configuration. Default (unset) = advertised,
+#                                      i.e. every run before 2026-07-30.
+#   soak.sh advertise-show [auto|none] which mode each node is ACTUALLY in, read from
+#                                      the generated node.toml inside each container
+#                                      and from the node's own startup output. With
+#                                      an argument it asserts and dies on a mismatch.
+#
 # CPU BUDGET (issue #107 step 1d). Two ways in, because they answer different
 # questions; both default to UNCONSTRAINED, which is what every run before
 # 2026-07-30 was.
@@ -35,20 +77,22 @@
 #                                      a FRESH net under a limit, set on the compose
 #                                      service. This is the durable path — see
 #                                      docker-compose.yml. Prefer per-node
-#                                      NODE<i>_CPUSET so the four do not share cores.
+#                                      NODE<i>_CPUSET so the four do not share cores,
+#                                      and FAUCET_CPUS/FAUCET_CPUSET if the faucet is
+#                                      in the run (it mines; see cpu_targets below).
 #   soak.sh cpu-budget <n> [quota-only]
 #                                      apply to a net that is ALREADY UP, live, with
 #                                      no restart: quota n CPU + a DISTINCT n-core
-#                                      block per node (`quota-only` omits the cpuset,
-#                                      leaving `nproc` at the host count). Same
+#                                      block per container (`quota-only` omits the
+#                                      cpuset, leaving `nproc` at the host count). Same
 #                                      idiom as `netem` — it is what lets one net be
 #                                      measured under two budgets with the build,
 #                                      tip range and process lifetime held fixed.
 #   soak.sh cpu-budget none            raise the ceiling back to the whole VM. NOT the
 #                                      same as never having had a limit — see the
 #                                      `docker update --cpus 0` trap below.
-#   soak.sh cpu-show [n|none]          what each node ACTUALLY has, read from its own
-#                                      cgroup, plus whether that still matches the
+#   soak.sh cpu-show [n|none]          what each container ACTUALLY has, read from its
+#                                      own cgroup, plus whether that still matches the
 #                                      budget it booted with. With an argument it
 #                                      asserts and dies on a mismatch.
 #
@@ -90,6 +134,28 @@
 #   * `netem` therefore answers "is this effect latency-SHAPED", not "does this match
 #     the T0 net". A negative result under netem rules out delay-as-such; it does not
 #     rule out the WAN.
+#
+# CONFIGURATION FIDELITY: the harness can now model a node with NO advertised
+# address, which until 2026-07-30 it could not. This is not a convenience knob.
+# `entrypoint.sh` has always written `advertise_addr`, while /opt/qumbra/node.toml on
+# all four T0 hosts has never carried it — the field arrived with issue #86 on
+# 2026-07-28, the hosts were provisioned 2026-07-26, and rolling the image does not
+# regenerate node.toml. So every local run was structurally incapable of reproducing
+# a T0 condition that depends on the field being absent, and issue #107's first two
+# local negatives could not have been anything else. What is true now:
+#
+#   * A default run (`auto`) has every node advertising itself dialable. That is a
+#     LOCAL configuration; do not present its numbers as the hosts' behaviour.
+#   * `QUMBRA_ADVERTISE_ADDR=none` is the hosts' configuration on this axis, and only
+#     on this axis. The hosts still differ in kernel, arch, RTT, tip height and
+#     uptime, so `none` narrows the gap rather than closing it.
+#   * A node with no `advertise_addr` still dials out, syncs, mines and votes; it is
+#     never GOSSIPED, so nobody learns it who was not configured with it. On this
+#     full-mesh net every node is a configured seed of every other, which is why the
+#     mesh still forms in `none` mode — and why `dialable=`/`peers=` are the fields to
+#     watch when comparing the two modes.
+#   * State the mode with the numbers, every time. Two runs of this harness that
+#     differ only here are two different experiments.
 #
 # CPU: the harness can now be held to the T0 hosts' CPU budget, which until
 # 2026-07-30 it could not. The four hosts are `t4g.small` — 2 vCPU each — and these
@@ -258,6 +324,42 @@ netem_rtt_matrix() {
 # letting the kernel silently clamp a cpuset and the run report a budget it never had.
 vm_cores() { docker info --format '{{.NCPU}}' 2>/dev/null || echo 0; }
 
+# WHICH CONTAINERS A CPU BUDGET APPLIES TO — the four nodes, plus `faucet` when it is
+# actually running. This is the ONE place in this script where the faucet (#128) is not
+# excluded, and the asymmetry is deliberate on both sides:
+#
+#   * It is excluded from `NODES` — and therefore from every scenario, telemetry
+#     snapshot, netem matrix and advertise assertion — because it is a FIFTH node that
+#     no T0 host corresponds to. Counting it as a T0 node would inflate every
+#     four-node claim this harness makes.
+#   * It is INCLUDED here because a CPU budget is a statement about the machine, not
+#     about the topology. The faucet mines RandomX on the same synchronous main loop
+#     the others do, so an unbudgeted faucet is an unlimited competitor for exactly
+#     the cores a dedicated cpuset was meant to reserve. Budgeting the four and
+#     leaving the fifth free does not measure a 2-vCPU host; it measures four
+#     constrained nodes next to one that is not, which is a condition the T0 net has
+#     no counterpart for and nobody would knowingly report.
+#
+# The four always come first and in NODES order, so their dedicated blocks are
+# unchanged by whether the faucet is up (node0=0-1 … node3=6-7 at width 2, and the
+# faucet takes 8-9). That keeps a with-faucet run comparable to a without-faucet one
+# on the four nodes' own terms.
+#
+# `cid` (compose `ps -q`, which lists RUNNING services only) is empty for a faucet that
+# is not up, which is how "is the faucet in this run" gets answered — from docker,
+# rather than from an env var or an assumption about how the net was started.
+#
+# Callers read this with `targets=( $(cpu_targets) )` and NOT with `mapfile`/`readarray`:
+# this script's shebang is `env bash` and macOS ships bash 3.2, which has neither. A
+# `mapfile` here would abort the script on the rig it is most often run from, and the
+# same reasoning is already recorded above for BSD `seq`. Container names are single
+# words with no glob characters, so unquoted word-splitting is safe on them.
+cpu_targets() {
+  local t=("${NODES[@]}")
+  [[ -n "$(cid faucet 2>/dev/null)" ]] && t+=(faucet)
+  printf '%s\n' "${t[@]}"
+}
+
 # CPU budgets in HUNDREDTHS of a CPU, so the comparison is integer arithmetic and a
 # fractional budget can be asserted exactly. "2" -> 200, "0.25" -> 25, "1.5" -> 150.
 #
@@ -329,36 +431,43 @@ cpu_startup_line() {   # cpu_startup_line <node>
 }
 
 cpu_report() {   # cpu_report <label>
-  local cores; cores="$(vm_cores)"
+  local cores targets n; cores="$(vm_cores)"
+  targets=( $(cpu_targets) )
   echo "== CPU budget: $1 =="
   echo "   docker sees $cores cores on this machine. The four T0 hosts have 2 vCPU EACH,"
   echo "   on four separate machines — this is one VM's scheduler either way."
+  echo "   ${#targets[@]} containers in scope: ${targets[*]}"
+  # `faucet` in that list is the FIFTH container, not a fifth T0 host — see
+  # cpu_targets. It is budgeted because it mines and would otherwise compete for the
+  # very cores a dedicated cpuset reserves; it is still excluded from every four-node
+  # claim this harness makes.
   echo "   -- cgroup (the kernel's view, read inside each container) --"
-  for n in "${NODES[@]}"; do
+  for n in "${targets[@]}"; do
     printf '     %-6s %s\n' "$n" "$(cpu_cgroup "$n")"
   done
   echo "   -- HostConfig (what was REQUESTED of the daemon) --"
-  for n in "${NODES[@]}"; do
+  for n in "${targets[@]}"; do
     printf '     %-6s %s\n' "$n" "$(cpu_inspect "$n")"
   done
   echo "   -- did the budget ever BIND? (kernel throttling counters) --"
-  for n in "${NODES[@]}"; do
+  for n in "${targets[@]}"; do
     printf '     %-6s %s\n' "$n" "$(cpu_throttle "$n")"
   done
-  echo "   -- the budget each node BOOTED under (its own startup line) --"
-  for n in "${NODES[@]}"; do
+  echo "   -- the budget each container BOOTED under (its own startup line) --"
+  for n in "${targets[@]}"; do
     local sl; sl="$(cpu_startup_line "$n")"
     printf '     %-6s %s\n' "$n" "${sl:-<no CPU_BUDGET line: image predates issue #107 step 1d>}"
   done
 }
 
-# Assert every node's cgroup matches <want>, where want is a whole number of CPUs or
-# the word `none`. Dies on the first mismatch: a run measured under a budget it cannot
-# demonstrate is not evidence, and this is the check most worth not skipping.
+# Assert every in-scope container's cgroup matches <want>, where want is a number of
+# CPUs or the word `none`. Dies on the first mismatch: a run measured under a budget it
+# cannot demonstrate is not evidence, and this is the check most worth not skipping.
 cpu_check() {   # cpu_check <n|none>
-  local want="$1" bad=0
-  echo "   -- asserting every node is at: $want --"
-  for n in "${NODES[@]}"; do
+  local want="$1" bad=0 targets
+  targets=( $(cpu_targets) )
+  echo "   -- asserting every container in scope (${targets[*]}) is at: $want --"
+  for n in "${targets[@]}"; do
     local cg q; cg="$(cpu_cgroup "$n")"
     q="${cg#quota=}"; q="${q%%/*}"
     if [[ "$want" == "none" ]]; then
@@ -384,12 +493,15 @@ cpu_check() {   # cpu_check <n|none>
       fi
     fi
   done
-  (( bad == 0 )) || die "the CPU budget is not what was requested on at least one node.
-   Do NOT report numbers from this net — the condition is not established. If the
-   nodes were brought up from an image that predates issue #107 step 1d they will
+  (( bad == 0 )) || die "the CPU budget is not what was requested on at least one
+   container. Do NOT report numbers from this net — the condition is not established.
+   If the nodes were brought up from an image that predates issue #107 step 1d they will
    still be limited correctly (the limit is the daemon's, not the image's), but they
-   will print no CPU_BUDGET startup line, so the run's own record will not carry it."
-  echo "   ✓ every node's cgroup matches what was requested"
+   will print no CPU_BUDGET startup line, so the run's own record will not carry it.
+   If the MISMATCH is on \`faucet\` alone, the likely cause is that it was started
+   after \`cpu-budget\` ran — the budget is applied to what is up at the time, so
+   re-run \`cpu-budget\` (or set FAUCET_CPUS/FAUCET_CPUSET on the compose service)."
+  echo "   ✓ every in-scope container's cgroup matches what was requested"
 }
 
 netem_report() {   # netem_report <d0,d1,d2,d3|""> <label>
@@ -412,6 +524,86 @@ netem_report() {   # netem_report <d0,d1,d2,d3|""> <label>
    netem produces a clean, confident answer that means nothing. STOP."
   echo "   ✓ every node's qdisc matches what was requested"
   netem_rtt_matrix
+}
+
+# ── advertised-address mode (issue #107 step 1c) ─────────────────────────────
+#
+# Which mode a node is in is NOT read from the environment of whoever runs this
+# script — that would only prove what was requested. It is read back from the running
+# container, two independent ways, the same discipline the netem commands use:
+#
+#   (1) the generated /tmp/node.toml: does an `advertise_addr =` key exist at all
+#   (2) the node's OWN startup output: the binary prints "no advertise_addr: ..."
+#       (qumbra-node/src/run.rs) when the field is missing, so mode `none` is
+#       confirmed by the code under test rather than by the file we wrote for it
+#
+# A disagreement between (1) and (2) means the running process is not using the
+# config file we are reading, which is a reason to stop rather than to interpret.
+advertise_mode_of() {
+  local n="$1" toml=""
+  # `|| true`: a stopped node makes exec fail, which would abort under pipefail.
+  toml="$(dc exec -T "$n" sh -c 'grep -c "^advertise_addr[[:space:]]*=" /tmp/node.toml || true' 2>/dev/null | tr -d '\r' | tail -1)"
+  case "$toml" in
+    0) echo none ;;
+    ''|*[!0-9]*) echo unknown ;;
+    *) echo auto ;;
+  esac
+}
+
+# Did the node itself say it has no advertised address? (Absence of this line is only
+# evidence when the node has produced output at all, so report the two apart.)
+#
+# `grep -c`, never `grep -q`, and the reason is not style: -q exits on the FIRST match,
+# which SIGPIPEs `docker compose logs`, and under `set -o pipefail` the pipeline then
+# reports 141 — so a matched line reads as "no match" whenever the log is long enough
+# that the writer is still going. That inverts this answer on exactly the nodes that
+# have been running longest, and it is a race, so it passes on a short log.
+advertise_node_said_none() {
+  local hits
+  hits="$(dc logs --no-log-prefix "$1" 2>/dev/null | grep -c '^no advertise_addr:' || true)"
+  [[ "${hits:-0}" -gt 0 ]] && echo yes || echo no
+}
+
+# Print each node's mode; with an expected mode, assert it. Fatal on a disagreement
+# between the two readbacks (always) or on a mode that is not the expected one; a
+# node that is simply down is reported, not fatal — the partition and committee
+# scenarios stop nodes on purpose.
+advertise_show() {
+  local want="${1:-}" n mode said inconsistent=0 wrong=0 down=0 line dial prs
+  echo "   -- advertised-address mode, read back per container --"
+  for n in "${NODES[@]}"; do
+    mode="$(advertise_mode_of "$n")"
+    said="$(advertise_node_said_none "$n")"
+    line="$(latest "$n")"
+    dial="$(field "$line" dialable)"; prs="$(field "$line" peers)"
+    printf '     %-6s node.toml=%-7s binary-said-none=%-3s dialable=%-5s peers=%s\n' \
+      "$n" "$mode" "$said" "${dial:-?}" "${prs:-?}"
+    if [[ "$mode" == unknown ]]; then
+      echo "     ^ $n did not answer (down, or no /tmp/node.toml) — mode unread"
+      down=1
+    elif [[ "$mode" == none && "$said" == no ]]; then
+      echo "     ^ $n has no advertise_addr in its config but never printed the"
+      echo "       'no advertise_addr' line — the process may not be using this file."
+      inconsistent=1
+    elif [[ "$mode" == auto && "$said" == yes ]]; then
+      echo "     ^ $n HAS an advertise_addr but printed 'no advertise_addr' — same"
+      echo "       problem from the other direction."
+      inconsistent=1
+    fi
+    if [[ -n "$want" && "$mode" != unknown && "$mode" != "$want" ]]; then
+      echo "     ^ $n is in mode '$mode', expected '$want'"; wrong=1
+    fi
+  done
+  (( inconsistent )) && die "a node's config file and its own output disagree about the
+   advertised address. The running process may not be reading the file this check
+   reads. STOP — do not attribute this run to either condition."
+  (( wrong )) && die "advertised-address mode is not '$want' on every node — do not
+   attribute this run to either condition until that is resolved."
+  if [[ -n "$want" ]]; then
+    (( down )) && { echo "   (partial) every node that answered is in mode '$want'"; return 0; }
+    echo "   ✓ every node is in advertise mode '$want'"
+  fi
+  return 0
 }
 
 # Wait until a node's tip reaches at least H (or timeout secs). Returns 0/1.
@@ -671,10 +863,22 @@ case "$cmd" in
     [[ "$got" == "$PINNED_GENESIS" ]] \
       || die "GENESIS HASH MISMATCH — in-container genesis is not the frozen T0 genesis. STOP."
     echo "   ✓ in-container genesis == pinned T0 genesis (8811d4e0…3cff)"
+    # Which advertised-address condition this net came up in, in the net's own output
+    # (issue #107 step 1c). Asserted when the caller named a mode, printed either way:
+    # a per-node NODE<i>_ADVERTISE override means the global env is not authoritative,
+    # so the readback is, and it is what gets printed.
+    advertise_show "${QUMBRA_ADVERTISE_ADDR:-}" || true
     echo "   nodes up; watch blocks with: $0 sample 200"
     ;;
 
   status)  snapshot ;;
+
+  advertise-show)
+    want="${1:-}"
+    [[ -z "$want" || "$want" == auto || "$want" == none ]] \
+      || die "advertise-show takes 'auto', 'none', or nothing (got '$want')"
+    advertise_show "$want"
+    ;;
 
   sample)
     secs="${1:-180}"; ivl="${2:-30}"; waited=0
@@ -724,7 +928,7 @@ case "$cmd" in
     ;;
 
   cpu-budget)
-    arg="${1:?cpu-budget needs a whole number of CPUs per node, or 'none' to raise the ceiling back}"
+    arg="${1:?cpu-budget needs a number of CPUs per container (2, 1.5, 0.25 — fractions are the positive control), or 'none' to raise the ceiling back}"
     mode="${2:-dedicated}"
     [[ "$mode" == dedicated || "$mode" == quota-only ]] \
       || die "cpu-budget's second argument is 'dedicated' (default) or 'quota-only', got '$mode'"
@@ -734,7 +938,8 @@ case "$cmd" in
       # NOT a clear — see the trap note above `vm_cores`. Raise quota to every core and
       # widen the cpuset to all of them, which is the largest budget a container on this
       # machine could ever use, and label it honestly.
-      for n in "${NODES[@]}"; do
+      targets=( $(cpu_targets) )
+      for n in "${targets[@]}"; do
         docker update --cpus "$cores" --cpuset-cpus "0-$(( cores - 1 ))" "$(cid "$n")" >/dev/null \
           || die "docker update failed on $n"
         echo "   raised on $n: quota $cores CPU, cpuset 0-$(( cores - 1 ))"
@@ -747,8 +952,8 @@ case "$cmd" in
       echo "   all of them). \`docker update --cpus 0\` is a silent no-op, so there is no"
       echo "   way to remove them from a running container — only a fresh \`up\` with the"
       echo "   compose defaults gives NanoCpus=0. Report this condition as 'quota raised"
-      echo "   to $cores CPU', and note that these nodes' CPU_BUDGET startup lines still"
-      echo "   show whatever they booted with."
+      echo "   to $cores CPU', and note that these containers' CPU_BUDGET startup lines"
+      echo "   still show whatever they booted with."
       exit 0
     fi
     [[ "$arg" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(cpu_hundredths "$arg") > 0 )) \
@@ -758,15 +963,22 @@ case "$cmd" in
     # budget still gets one core of affinity and the quota does the limiting.
     width=$(( ( $(cpu_hundredths "$arg") + 99 ) / 100 ))
     (( width >= 1 )) || width=1
+    # The four nodes, plus the faucet when it is up — see cpu_targets for why the CPU
+    # budget is the one axis the fifth container is NOT excluded from. NODES order is
+    # preserved and the faucet is appended last, so node0..node3 keep the same blocks
+    # whether or not the faucet is in the run.
+    targets=( $(cpu_targets) )
     if [[ "$mode" == dedicated ]]; then
-      need=$(( width * ${#NODES[@]} ))
-      (( cores >= need )) || die "a dedicated $width-core block for each of ${#NODES[@]} nodes needs $need cores;
-   docker reports only $cores on this machine. Either lower the budget or use
-   'cpu-budget $arg quota-only', which does not pin cores — but say which you used,
-   because sharing cores between the four containers is a different experiment."
+      need=$(( width * ${#targets[@]} ))
+      (( cores >= need )) || die "a dedicated $width-core block for each of ${#targets[@]} containers
+   (${targets[*]}) needs $need cores; docker reports only $cores on this machine.
+   Either lower the budget, or stop the faucet if it is in the list and the run does
+   not need it, or use 'cpu-budget $arg quota-only', which does not pin cores — but say
+   which you used, because sharing cores between the containers is a different
+   experiment."
     fi
-    for (( i = 0; i < ${#NODES[@]}; i++ )); do
-      n="${NODES[$i]}"
+    for (( i = 0; i < ${#targets[@]}; i++ )); do
+      n="${targets[$i]}"
       if [[ "$mode" == dedicated ]]; then
         blk="$(cpu_block "$width" "$i")"
         docker update --cpus "$arg" --cpuset-cpus "$blk" "$(cid "$n")" >/dev/null \
@@ -778,11 +990,11 @@ case "$cmd" in
         echo "   applied on $n: quota $arg CPU, cores NOT pinned (nproc stays at $cores)"
       fi
     done
-    cpu_report "applied live: $arg CPU per node ($mode)"
+    cpu_report "applied live: $arg CPU per container ($mode)"
     cpu_check "$arg"
     echo
-    echo "   The nodes were NOT restarted, so this is the same processes, the same tip"
-    echo "   range and the same build as before the change — which is the point. Their"
+    echo "   The containers were NOT restarted, so this is the same processes, the same"
+    echo "   tip range and the same build as before the change — which is the point. Their"
     echo "   CPU_BUDGET startup lines still report the budget they BOOTED with, so read"
     echo "   the cgroup block above, not the startup block, for the current condition."
     echo "   Give the net a few telemetry cadences before starting the window you report."

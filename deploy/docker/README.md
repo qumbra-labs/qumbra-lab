@@ -69,6 +69,68 @@ pgrep -f qlab_bench     # must print nothing
   even if they shared a genesis. Crossing that on a running net is the halt-height
   mechanism's job (#74), not a redeploy.
 
+## What this harness models about the T0 hosts
+
+Three host properties, added one at a time by issue #107's steps 1b–1d, each with its
+own knob, its own readback and its own caveat. `deploy/docker/soak.sh`'s header is the
+canonical list; the two sections below are the detail for the two that are
+configuration rather than a qdisc.
+
+| property | set with | read back with |
+|---|---|---|
+| WAN latency (1b) | `soak.sh netem <ms>` | `soak.sh netem-show` |
+| advertised-address absence (1c) | `QUMBRA_ADVERTISE_ADDR=none` | `soak.sh advertise-show` |
+| CPU budget (1d) | `QUMBRA_CPUS` / `QUMBRA_CPUSET`, or `soak.sh cpu-budget <n>` | `soak.sh cpu-show` |
+
+They are **independent**, and all three default to what every run before 2026-07-30
+was — no qdisc, advertised, unconstrained — so an ordinary soak is unchanged and each
+of the eight combinations is reachable. Orthogonal to all three, and not a host
+property at all: whether the **`faucet`** container (#123/#128) is in the run. It is a
+fifth node no T0 host corresponds to, so it is excluded from every four-node
+assertion — but it *mines*, so `cpu-budget` deliberately does **not** exclude it (see
+`cpu_targets` in `soak.sh`). Leaving it unbudgeted next to four budgeted nodes puts an
+unlimited competitor on the very cores a dedicated cpuset was meant to reserve.
+
+**State the condition with the number, every time.** Two runs of this harness that
+differ on any one of these axes are two different experiments.
+
+## Advertised-address mode (issue #107 step 1c)
+
+The harness can model **a node with no advertised address**, which until 2026-07-30
+it could not — and that gap was not cosmetic. `entrypoint.sh` has always written
+`advertise_addr`; `/opt/qumbra/node.toml` on all four T0 hosts has **never** carried
+it. The field arrived with issue [#86](https://github.com/lai3d/qumbra-lab/issues/86)
+on 2026-07-28, the hosts were provisioned 2026-07-26, and **rolling the image does
+not regenerate `node.toml`** (recorded as a dated correction in `qumbra-deploy`
+OPERATOR §3). So every local run before this one was structurally incapable of
+reproducing any T0 condition that depends on the field being absent.
+
+```sh
+QUMBRA_ADVERTISE_ADDR=none deploy/docker/soak.sh rehearsal   # the hosts' configuration
+deploy/docker/soak.sh rehearsal                              # default: advertised
+NODE2_ADVERTISE=none deploy/docker/soak.sh rehearsal          # mixed net, per node
+deploy/docker/soak.sh advertise-show          # which mode each node is ACTUALLY in
+deploy/docker/soak.sh advertise-show none     # …and assert it; dies on a mismatch
+```
+
+- **`auto` (default)** — `advertise_addr = "node<i>:9401"`. Unchanged behaviour;
+  an ordinary soak is byte-for-byte what it was.
+- **`none`** — the key is **absent** from the generated `node.toml`, not empty and
+  not commented-into-a-parsed-value. The node still dials out, syncs, mines and
+  votes; it is simply **never gossiped** (`entrypoint.sh`'s own note, and
+  `qumbra-node`'s startup line `no advertise_addr: …`).
+- Anything else is a **hard failure** at startup, not a silent fallback to `auto` —
+  a typo in this variable inverts the experiment.
+- `advertise-show` does **not** read the operator's environment (that would only
+  prove what was *requested*). It reads the generated `node.toml` from inside each
+  running container **and** the node's own startup output, and treats a disagreement
+  between the two as a stop rather than something to interpret.
+
+`none` is the hosts' configuration **on this axis only**. The hosts still differ in
+kernel, architecture, RTT, tip height and uptime, so it narrows the gap rather than
+closing it. State the mode alongside any number this harness produces: two runs that
+differ only here are two different experiments.
+
 ## CPU budget (issue #107 step 1d)
 
 The harness can now be held to **the T0 hosts' CPU budget**, which until 2026-07-30
@@ -91,11 +153,20 @@ earlier local run was measured where it was abundant.
 QUMBRA_CPUS=2 NODE0_CPUSET=0-1 NODE1_CPUSET=2-3 NODE2_CPUSET=4-5 NODE3_CPUSET=6-7 \
   deploy/docker/soak.sh rehearsal
 
+# …and if the faucet is in the run, give it a budget and a block of its own
+FAUCET_CPUS=2 FAUCET_CPUSET=8-9 \
+  docker compose -f deploy/docker/docker-compose.yml up -d faucet
+
 # or apply to a net that is already up, live, with no restart
-deploy/docker/soak.sh cpu-budget 2              # quota 2 + a dedicated pair per node
+deploy/docker/soak.sh cpu-budget 2              # quota 2 + a dedicated block each
 deploy/docker/soak.sh cpu-budget 2 quota-only   # quota only; nproc stays at 18
 deploy/docker/soak.sh cpu-budget none           # raise the ceiling to the whole VM
 deploy/docker/soak.sh cpu-show 2                # read it back, and assert it
+
+# all three axes at once — this composes, and each one reports itself
+QUMBRA_ADVERTISE_ADDR=none QUMBRA_CPUS=2 NODE0_CPUSET=0-1 NODE1_CPUSET=2-3 \
+  NODE2_CPUSET=4-5 NODE3_CPUSET=6-7 deploy/docker/soak.sh rehearsal
+deploy/docker/soak.sh netem 100                 # then add ~200 ms RTT on top
 ```
 
 - **Default is unconstrained.** At the defaults compose omits `cpus:`/`cpuset:` from
@@ -107,19 +178,29 @@ deploy/docker/soak.sh cpu-show 2                # read it back, and assert it
   which is what the hosts' own `nproc` reports. Only cpuset reproduces the topology.
   **Use a distinct block per node**: four containers pinned to the same pair are a 4:1
   oversubscription of one pair, not four 2-vCPU hosts.
-- **Every node records its own budget.** `entrypoint.sh` prints one greppable line
+- **Every container records its own budget.** `entrypoint.sh` prints one greppable line
   before the config dump, read from the container's **cgroup** rather than from the
   environment it was passed — the environment says what was requested, the cgroup says
   what the kernel will enforce:
 
   ```
-  CPU_BUDGET node0 quota=2.00cpu cpuset=0-1 nproc=2
-  CPU_BUDGET node0 quota=unconstrained cpuset=0-17 nproc=18
+  CPU_BUDGET node0  quota=2.00cpu       cpuset=0-1  nproc=2
+  CPU_BUDGET node0  quota=unconstrained cpuset=0-17 nproc=18
+  CPU_BUDGET faucet quota=2.00cpu       cpuset=8-9  nproc=2
   ```
 
   `soak.sh cpu-show` prints that startup line **beside** the live cgroup, because
   `cpu-budget` changes the cgroup without restarting the process and cannot rewrite a
   log line already emitted. When the two disagree, the budget was applied live.
+- **The faucet is in scope for this axis and only this one.** `soak.sh cpu-budget`
+  applies to the four nodes **plus `faucet` when it is running** (`cpu_targets`), and
+  it appends the faucet last so `node0`…`node3` keep the same blocks either way. Every
+  *other* command here — scenarios, telemetry snapshots, the netem matrix,
+  `advertise-show` — excludes it, because it is a fifth node no T0 host corresponds to.
+  The asymmetry is the point: a CPU budget is a claim about the machine, not about the
+  topology, and the faucet mines on the same synchronous main loop the others do.
+  A `cpu-budget 2 dedicated` therefore needs 10 cores rather than 8 with the faucet up,
+  and says so instead of silently overlapping blocks.
 - **`docker update --cpus 0` is a silent no-op** — it exits 0, prints the container
   name and changes nothing, because docker reads `0`/`""` as "leave this field alone".
   So `cpu-budget none` *raises* the ceiling to every core on the machine and says so;
@@ -132,6 +213,11 @@ hosts share none of those. There is also no memory limit here — the hosts have
 and Phase B-lite measured ~262 MiB/node, so memory is not the scarce axis, but the
 Docker VM's own ceiling on this rig is 8.3 GB across all four. **A limit answers "is
 this effect CPU-scarcity-shaped", not "does this match the T0 net".**
+
+The same holds for combining axes: `QUMBRA_ADVERTISE_ADDR=none` + a CPU budget + netem
+is three emulations at once, not a T0 host. Each narrows the gap on its own axis and
+none of them closes it, so a negative under all three still rules out only the three
+shapes it tested.
 
 ## Observability
 
@@ -183,6 +269,41 @@ single-node health page, with four it is the agreement view, over one code path.
 would look exactly like a node that had finalized nothing. The image must be
 rebuilt for the view to read anything (`deny_unknown_fields` also means an old
 binary refuses the new config outright — ship the binary first).
+
+### The faucet (`qumbra-faucet`, issue #123)
+
+A **fifth** container, and deliberately not one of the four: it holds **no committee
+keys**, because `testnet-plan.md` §6.2 rules that a node holding committee keys
+exposes nothing beyond P2P — so the faucet's hot spending key never shares a host
+with them. `qumbra-faucet` **refuses to start** if its node config names any key
+file, so this is enforced rather than documented.
+
+```sh
+docker compose -f deploy/docker/docker-compose.yml up -d --build faucet
+open http://127.0.0.1:9450/                    # the page a person uses
+curl http://127.0.0.1:9414/v1/telemetry        # its keyless node's telemetry
+docker exec qumbra-t0-lite-faucet-1 \
+    qumbra-faucet ticket --config /data/faucet.toml --id 1   # one single-use ticket
+```
+
+The in-container bind is `0.0.0.0:9450` — a private bridge namespace, the same
+argument this file already makes for `telemetry_addr` — and compose publishes it to
+**`127.0.0.1` on the host**, which is where the exposure decision actually lives. On a
+real host, off-loopback is a deliberate act paired with a source-restricted inbound
+rule, and the binary says so loudly at every startup that is not on loopback.
+
+Key material is minted **once** into the faucet's own volume (`0600`) and reused
+across restarts, so the faucet keeps what it has mined. `QUMBRA_FAUCET_TICKETS=open`
+turns tickets off; `qlab_faucet::policy` prices exactly what that costs (saturable by
+roughly a hundred distinct subnets).
+
+🔴 **It cannot serve a grant on a fresh net for ~3 h.** `COINBASE_MATURITY_BLOCKS` =
+144 (FROZEN §2) at the frozen 75 s block time, and a 2×2 bucket needs **two** matured
+notes. Until then the page names the height it changes at and **refuses** rather than
+queueing a request it cannot honour. Two further blockers are recorded on issue #123
+and are not fixed: a recipient cannot detect a grant on a net whose nodes serve no
+note discovery, and a node's state machine desynchronises permanently from its own
+chain once it falls one block behind.
 
 ## Running the protocol
 

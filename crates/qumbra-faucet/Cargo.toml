@@ -1,0 +1,81 @@
+[package]
+name = "qumbra-faucet"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Issue #123: the T1 **faucet listener** — an HTTP surface a browser can use, over
+# `qlab-faucet`'s tested request core, running in-process with a KEYLESS node.
+#
+# Its own crate rather than a `[[bin]]` inside `qlab-faucet`, for one mechanical
+# reason and two structural ones (argued in the PR):
+#
+#   1. Cargo has no per-target dependencies. A bin in `qlab-faucet` puts
+#      `qumbra-node` — and behind it qlab-p2p, randomx-rs, tiny_http, toml, ctrlc —
+#      into the *library's* `[dependencies]`, so every consumer of the faucet
+#      library, and every workspace test build, pays the whole node graph. Today
+#      `qumbra-node` is a **dev**-dependency of `qlab-faucet` and the library's own
+#      deps are wallet/tree/devnet/note/air only.
+#   2. Precedent, twice. M10-T0-1 refused a bin in `qlab-node` (PR #65); #117
+#      refused one in `qumbra-node` for `qumbra-opview` — "weight it does not need
+#      is weight the node's build graph would pay for. The dependency arrow points
+#      ONE way."
+#   3. `qlab-faucet`'s crate docs say "There is no listener here, deliberately",
+#      and the sentence is load-bearing: the library is what a future non-HTTP
+#      front end reuses. Keeping the listener out of it keeps that literally true.
+#
+# The arrow points one way: this crate depends on `qlab-faucet` and `qumbra-node`;
+# neither knows it exists.
+
+[[bin]]
+name = "qumbra-faucet"
+path = "src/main.rs"
+
+[dependencies]
+# The tested request core: gate → queue → plan → prove → hand back for submission.
+# NOT reimplemented here; this crate calls `Faucet::accept` and `Faucet::dispense`
+# and nothing else builds a grant.
+qlab-faucet = { path = "../qlab-faucet" }
+# The node this faucet runs in-process with (composition, not a network write path:
+# `RunningNode::submit_local_tx` is `P2pNode::announce_tx`, the local-origination
+# path a mining node already uses). Also the real RandomX/verifier wiring.
+qumbra-node = { path = "../qumbra-node" }
+# Live consensus state: the commitment tree witnesses are cut from, the anchor set,
+# and `coinbase_note` — how the faucet re-derives the notes its own node mined
+# (issue #101). Also `COINBASE_MATURITY_BLOCKS`, the frozen §2 gate this binary
+# honours at the funding boundary.
+qlab-node = { path = "../qlab-node" }
+# The faucet's spending key (HD account, never rendered) and `Address` decode for
+# the recipient a browser submits.
+qlab-wallet = { path = "../qlab-wallet" }
+# `[u64;4]` ↔ `[u8;32]` lane conversions on the note-commitment/anchor boundary.
+qlab-note = { path = "../qlab-note" }
+# The depth-32 commitment tree type `ChainView::tree` hands the faucet.
+qlab-cbserver = { path = "../qlab-cbserver" }
+# The block body / tx entry types, the posted-fee table, and RandomX for the
+# in-process node's PoW engine.
+qlab-devnet = { path = "../qlab-devnet" }
+# `adapter::MiningClock` (the wall-clock header-timestamp opt-in the node binary
+# also takes) and `peers()` for the status page's peer count. Already in the graph
+# via qumbra-node; named because this binary uses it directly.
+qlab-p2p = { path = "../qlab-p2p" }
+# TOML service config, same posture and same `=`-free pin as the node's.
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+# The HTTP listener. Same `=` pin as qlab-node's RPC surface, qlab-cbserver's
+# reference server and qumbra-node's /metrics + /v1/telemetry — one HTTP
+# implementation in the tree, not four.
+tiny_http = "=0.12.0"
+# Grant proving needs a CSPRNG (the note ρ/rseed the requester's output binds).
+# Workspace rev, same as qlab-faucet's.
+rand = "0.10"
+# Ctrl-C handling: the same graceful-shutdown posture as the node, because the
+# shutdown flushes the node's snapshot.
+ctrlc = "3.4"
+
+[dev-dependencies]
+# The acceptance suite drives the whole HTTP path to a REAL grant against a real
+# in-process node, and then has the requester scan the chain for it with the
+# unmodified reference light client (`qlab_cbserver::client::light_client_scan`) over
+# a real socket — already a dependency above, so nothing extra is needed here.

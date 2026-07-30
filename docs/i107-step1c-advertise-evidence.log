@@ -1,0 +1,1038 @@
+# issue #107 step 1c — raw evidence: does the loop regression appear when advertise_addr is absent?
+#
+# Two nets, one image, one binary (sha256 0f2c38c19abb48bf3630113ea359257409a1191116b47fb0ec966741d8e7b6a9,
+# compiled 2026-07-29T23:27:10Z), same rig, comparable duration.
+#   T = treatment: QUMBRA_ADVERTISE_ADDR=none on all four nodes (the four T0 hosts' configuration)
+#   C = control:   default, advertise_addr present on all four (every local run before 2026-07-30)
+#
+# METHOD (unchanged from step 1 and step 1b): `docker compose logs -t --no-log-prefix <node>` per
+# node -> EVERY line matching TELEMETRY -> all docker capture timestamps sorted -> adjacent pairs
+# differenced. No --since. No first-line-of-a-kind. A gap counts for a cut window only when BOTH
+# endpoints are inside it, so a cut can neither manufacture nor hide one.
+#
+# Regenerate the tables from the TELEMETRY sections at the bottom of this file.
+
+############ TIMELINE (UTC) ############
+=== START T (advertise absent) 2026-07-29T23:28:04Z ===
+T net up (all four in mode none) 2026-07-29T23:29:05Z
+=== T sealed 2026-07-30T00:19:22Z ===
+qumbra-t0-lite-node2-1 266.3MiB / 7.748GiB 0.91%
+qumbra-t0-lite-node0-1 266.8MiB / 7.748GiB 0.89%
+qumbra-t0-lite-node1-1 266.5MiB / 7.748GiB 0.90%
+qumbra-t0-lite-node3-1 266.4MiB / 7.748GiB 0.92%
+IMAGE sha256:11f442a8d0b2c4b80862619ba860b0fc697b0843711d55c160f39267ce9960cd
+=== START C (advertise present, default) 2026-07-30T00:21:04Z ===
+-rwxr-xr-x 1 root root 3640984 2026-07-29 23:27:10.000000000 +0000 /usr/local/bin/qumbra-node
+0f2c38c19abb48bf3630113ea359257409a1191116b47fb0ec966741d8e7b6a9  /usr/local/bin/qumbra-node
+=== C ATTEMPT 1 DISCARDED (host sleep) 2026-07-30T01:10:54Z ===
+all four nodes: identical gaps 191.9s / 1662.6s / 488.2s in identical wall-clock windows
+00:30:05->00:33:17, 00:33:47->01:01:29, 01:01:59->01:10:08 (resumed on first host access)
+=== START C attempt 2 (advertise PRESENT, default) 2026-07-30T01:11:09Z ===
+-rwxr-xr-x 1 root root 3640984 2026-07-29 23:27:10.000000000 +0000 /usr/local/bin/qumbra-node
+0f2c38c19abb48bf3630113ea359257409a1191116b47fb0ec966741d8e7b6a9  /usr/local/bin/qumbra-node
+=== C sealed 2026-07-30T02:03:58Z ===
+qumbra-t0-lite-node1-1 265.9MiB / 7.748GiB 0.89%
+qumbra-t0-lite-node2-1 265.5MiB / 7.748GiB 0.84%
+qumbra-t0-lite-node0-1 265.6MiB / 7.748GiB 0.88%
+qumbra-t0-lite-node3-1 265.6MiB / 7.748GiB 0.92%
+=== after docker compose stop (SIGTERM), condition C: node0 /data ===
+blocks.log
+finalizer-0.state
+finalizer-1.state
+finalizer-2.state
+finalizer-3.state
+finalizer-4.state
+finalizer-5.state
+peers.dat present: NO
+graceful-shutdown marker in log: 0
+=== rig released 2026-07-30T02:05:28Z ===
+
+############ ANALYSIS: T (advertise_addr ABSENT) ############
+### T — advertise_addr ABSENT on all four
+window: 23:28:10Z -> 00:19:12Z (51.0 min of captured TELEMETRY)
+TELEMETRY lines: node0=103, node1=103, node2=103, node3=103
+
+-- no cut at all --
+node        n      min   median      p90      max     <60s    <130s
+node0     102    30.00    30.01    30.02    30.37   102/102   102/102
+node1     102    30.00    30.01    30.02    30.36   102/102   102/102
+node2     102    30.00    30.01    30.02    30.32   102/102   102/102
+node3     102    30.00    30.01    30.02    30.40   102/102   102/102
+ALL       408    30.00    30.01    30.02    30.40   408/408   408/408
+
+-- cut +1 min --
+node        n      min   median      p90      max     <60s    <130s
+node0     100    30.00    30.01    30.02    30.37   100/100   100/100
+node1     100    30.00    30.01    30.02    30.36   100/100   100/100
+node2     100    30.00    30.01    30.02    30.32   100/100   100/100
+node3     100    30.00    30.01    30.02    30.40   100/100   100/100
+ALL       400    30.00    30.01    30.02    30.40   400/400   400/400
+
+-- cut +10 min --
+node        n      min   median      p90      max     <60s    <130s
+node0      82    30.00    30.01    30.02    30.37    82/82     82/82 
+node1      82    30.00    30.01    30.02    30.36    82/82     82/82 
+node2      82    30.00    30.01    30.02    30.32    82/82     82/82 
+node3      82    30.00    30.01    30.02    30.40    82/82     82/82 
+ALL       328    30.00    30.01    30.02    30.40   328/328   328/328
+
+-- cut +20 min --
+node        n      min   median      p90      max     <60s    <130s
+node0      62    30.00    30.01    30.02    30.37    62/62     62/62 
+node1      62    30.00    30.01    30.02    30.36    62/62     62/62 
+node2      62    30.00    30.01    30.02    30.32    62/62     62/62 
+node3      62    30.00    30.01    30.02    30.40    62/62     62/62 
+ALL       248    30.00    30.01    30.02    30.40   248/248   248/248
+
+############ ANALYSIS: C (advertise_addr PRESENT, control) ############
+### C — advertise_addr PRESENT on all four (control)
+window: 01:11:16Z -> 02:03:49Z (52.6 min of captured TELEMETRY)
+TELEMETRY lines: node0=106, node1=106, node2=106, node3=106
+
+-- no cut at all --
+node        n      min   median      p90      max     <60s    <130s
+node0     105    30.00    30.01    30.02    31.99   105/105   105/105
+node1     105    30.00    30.01    30.02    32.01   105/105   105/105
+node2     105    30.00    30.01    30.02    31.97   105/105   105/105
+node3     105    30.00    30.01    30.02    32.00   105/105   105/105
+ALL       420    30.00    30.01    30.02    32.01   420/420   420/420
+
+-- cut +1 min --
+node        n      min   median      p90      max     <60s    <130s
+node0     103    30.00    30.01    30.02    31.99   103/103   103/103
+node1     103    30.00    30.01    30.02    32.01   103/103   103/103
+node2     103    30.00    30.01    30.02    31.97   103/103   103/103
+node3     103    30.00    30.01    30.02    32.00   103/103   103/103
+ALL       412    30.00    30.01    30.02    32.01   412/412   412/412
+
+-- cut +10 min --
+node        n      min   median      p90      max     <60s    <130s
+node0      85    30.00    30.01    30.02    31.99    85/85     85/85 
+node1      85    30.00    30.01    30.02    32.01    85/85     85/85 
+node2      85    30.00    30.01    30.02    31.97    85/85     85/85 
+node3      85    30.00    30.01    30.02    32.00    85/85     85/85 
+ALL       340    30.00    30.01    30.02    32.01   340/340   340/340
+
+-- cut +20 min --
+node        n      min   median      p90      max     <60s    <130s
+node0      65    30.00    30.01    30.02    31.99    65/65     65/65 
+node1      65    30.00    30.01    30.02    32.01    65/65     65/65 
+node2      65    30.00    30.01    30.02    31.97    65/65     65/65 
+node3      65    30.00    30.01    30.02    32.00    65/65     65/65 
+ALL       260    30.00    30.01    30.02    32.01   260/260   260/260
+
+############ SELF-CONNECTION CENSUS (from /proc/net/tcp inside each container) ############
+=== self-connection census, condition T (advertise_addr ABSENT), 2026-07-29T23:48:41Z ===
+node0 ip=172.26.0.3 established=8 self_loop_sockets=2
+node1 ip=172.26.0.2 established=8 self_loop_sockets=2
+node2 ip=172.26.0.5 established=8 self_loop_sockets=2
+node3 ip=172.26.0.4 established=8 self_loop_sockets=2
+=== peers.dat, condition T (advertise_addr ABSENT), 2026-07-30T00:20:10Z ===
+node0 persisted dialable: 
+(no peers.dat)
+node1 persisted dialable: 
+(no peers.dat)
+node2 persisted dialable: 
+(no peers.dat)
+node3 persisted dialable: 
+(no peers.dat)
+
+=== self-connection census, condition C (advertise_addr PRESENT), 2026-07-30T02:04:00Z ===
+node0 ip=172.26.0.5 established=6 self_loop_sockets=0
+node1 ip=172.26.0.2 established=6 self_loop_sockets=0
+node2 ip=172.26.0.4 established=6 self_loop_sockets=0
+node3 ip=172.26.0.3 established=6 self_loop_sockets=0
+
+############ PER-CONDITION FACTS AND STOP-POINT CHECKS ############
+===== T (advertise ABSENT) =====
+  node0: tip 0->40  diff 42-256  final 0->40  peers=8 dialable=4/4 rounds=9 rfail=4 regime=Final
+  node1: tip 0->40  diff 42-256  final 0->40  peers=8 dialable=4/4 rounds=9 rfail=4 regime=Final
+  node2: tip 0->40  diff 42-256  final 0->40  peers=8 dialable=4/4 rounds=9 rfail=4 regime=Final
+  node3: tip 0->40  diff 42-256  final 0->40  peers=8 dialable=4/4 rounds=9 rfail=4 regime=Final
+  finalized heights seen: ['0', '8', '16', '24', '32', '40']
+  heights with >1 distinct fid across nodes: NONE
+  node0 finalized rounds (slot, quorum_ms): [('8', '31'), ('16', '30'), ('24', '28'), ('32', '28'), ('40', '32')]
+  node0 ROUND close reasons: {'finalized': 5, 'silent': 4, 'open': 1}
+  node0 ROUND rej= values: {'f0/u0/d0/i0': 10}
+
+===== C (advertise PRESENT) =====
+  node0: tip 0->41  diff 42-256  final 0->40  peers=6 dialable=3/3 rounds=9 rfail=4 regime=Final
+  node1: tip 0->41  diff 42-256  final 0->40  peers=6 dialable=3/3 rounds=9 rfail=4 regime=Final
+  node2: tip 0->41  diff 42-256  final 0->40  peers=6 dialable=3/3 rounds=9 rfail=4 regime=Final
+  node3: tip 0->41  diff 42-256  final 0->40  peers=6 dialable=3/3 rounds=9 rfail=4 regime=Final
+  finalized heights seen: ['0', '8', '16', '24', '32', '40']
+  heights with >1 distinct fid across nodes: NONE
+  node0 finalized rounds (slot, quorum_ms): [('8', '29'), ('16', '32'), ('24', '29'), ('32', '113'), ('40', '42')]
+  node0 ROUND close reasons: {'finalized': 5, 'silent': 4, 'open': 2}
+  node0 ROUND rej= values: {'f0/u0/d0/i0': 11}
+
+
+############ DISCARDED CONTROL ATTEMPT 1 (host sleep) ############
+# Attempt 1 of the control ran 00:24:05Z -> 01:10:08Z and is DISCARDED, not reported as a result.
+# All four nodes showed byte-for-byte the same three gaps in the same wall-clock windows:
+#   191.9 s  00:30:05 -> 00:33:17
+#  1662.6 s  00:33:47 -> 01:01:29
+#   488.2 s  01:01:59 -> 01:10:08   (telemetry resumed on the first host access after the gap)
+# Four independent processes cannot agree to 0.1 s: the host slept while the driving session was
+# not running. The re-run (attempt 2, 01:11Z) was wrapped in `caffeinate -dimsu`.
+# Raw logs for the discarded attempt were kept off-repo; the gap table above is the whole of it.
+
+############ REBASED-TREE SMOKE TEST (not the measurement) ############
+# The 51/53-minute measurement above was taken on 396c018 + the step-1c commit, i.e.
+# BEFORE PR #118 (step 1b netem) and PR #119 (#117 opview) landed on main. The branch
+# was then rebased onto 7c7c33d and the harness re-exercised, but NOT re-measured:
+#   * QUMBRA_ADVERTISE_ADDR=none soak.sh rehearsal -> genesis == pinned, advertise-show
+#     asserts 'none' on all four
+#   * QUMBRA_ADVERTISE_ADDR=nope -> "run: QUMBRA_ADVERTISE_ADDR must be 'auto' or
+#     'none', got 'nope'" and the node refuses to start
+#   * soak.sh netem-show (step 1b's command) still works on the merged tree
+#   * the self-connection reproduces on the rebased build: see the census entry
+#     stamped c95c9e4 above (established=8, self_loop_sockets=2 on every node)
+
+############ TELEMETRY, condition T (docker capture stamps, every line) ############
+---- T node0 ----
+2026-07-29T23:28:10.951806502Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=1 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=1/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-29T23:28:40.969274835Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=8 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-29T23:29:10.989669794Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=8 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-29T23:29:41.010279585Z TELEMETRY tip=1 final=0 stall=1 age_s=1785367765 diff=256 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:30:11.024095960Z TELEMETRY tip=1 final=0 stall=1 age_s=1785367765 diff=256 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:30:41.025553919Z TELEMETRY tip=1 final=0 stall=1 age_s=1785367765 diff=256 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:31:11.030497710Z TELEMETRY tip=2 final=0 stall=2 age_s=1785367842 diff=42 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:31:41.047457294Z TELEMETRY tip=2 final=0 stall=2 age_s=1785367842 diff=42 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:32:11.048848669Z TELEMETRY tip=3 final=0 stall=3 age_s=1785367918 diff=55 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:32:41.053890252Z TELEMETRY tip=3 final=0 stall=3 age_s=1785367918 diff=55 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:33:11.067892335Z TELEMETRY tip=3 final=0 stall=3 age_s=1785367918 diff=55 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:33:41.069935460Z TELEMETRY tip=4 final=0 stall=4 age_s=1785367993 diff=63 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:34:11.090085127Z TELEMETRY tip=4 final=0 stall=4 age_s=1785367993 diff=63 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:34:41.098838044Z TELEMETRY tip=5 final=0 stall=5 age_s=1785368069 diff=68 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:35:11.101222294Z TELEMETRY tip=5 final=0 stall=5 age_s=1785368069 diff=68 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:35:41.117015210Z TELEMETRY tip=5 final=0 stall=5 age_s=1785368069 diff=68 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:36:11.134873335Z TELEMETRY tip=6 final=0 stall=6 age_s=1785368149 diff=72 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:36:41.142526460Z TELEMETRY tip=6 final=0 stall=6 age_s=1785368149 diff=72 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:37:11.148174960Z TELEMETRY tip=7 final=0 stall=7 age_s=1785368226 diff=73 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:37:41.150202919Z TELEMETRY tip=7 final=0 stall=7 age_s=1785368226 diff=73 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:38:11.167795544Z TELEMETRY tip=7 final=0 stall=7 age_s=1785368226 diff=73 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:38:41.184496544Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=74 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:39:11.188599377Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=74 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:39:41.190930085Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=74 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:40:11.193626044Z TELEMETRY tip=9 final=8 stall=1 age_s=79 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:40:41.211354919Z TELEMETRY tip=9 final=8 stall=1 age_s=79 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:41:11.222639669Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:41:41.228493044Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:42:11.238279960Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:42:41.249729127Z TELEMETRY tip=11 final=8 stall=3 age_s=234 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:43:11.250385835Z TELEMETRY tip=11 final=8 stall=3 age_s=234 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:43:41.258066502Z TELEMETRY tip=12 final=8 stall=4 age_s=310 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:44:11.261560085Z TELEMETRY tip=12 final=8 stall=4 age_s=310 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:44:41.269966377Z TELEMETRY tip=12 final=8 stall=4 age_s=310 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:45:11.284326585Z TELEMETRY tip=13 final=8 stall=5 age_s=387 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:45:41.303821710Z TELEMETRY tip=13 final=8 stall=5 age_s=387 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:46:11.319898377Z TELEMETRY tip=14 final=8 stall=6 age_s=462 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:46:41.323561794Z TELEMETRY tip=14 final=8 stall=6 age_s=462 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:47:11.325982377Z TELEMETRY tip=14 final=8 stall=6 age_s=462 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:47:41.349135585Z TELEMETRY tip=15 final=8 stall=7 age_s=539 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:48:11.358699377Z TELEMETRY tip=15 final=8 stall=7 age_s=539 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:48:41.378492752Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:49:11.386996377Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:49:41.393967127Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:50:11.394919377Z TELEMETRY tip=17 final=16 stall=1 age_s=77 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:50:41.397173710Z TELEMETRY tip=17 final=16 stall=1 age_s=77 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:51:11.403352377Z TELEMETRY tip=18 final=16 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:51:41.424055960Z TELEMETRY tip=18 final=16 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:52:11.426882502Z TELEMETRY tip=18 final=16 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:52:41.443814460Z TELEMETRY tip=19 final=16 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:53:11.445474085Z TELEMETRY tip=19 final=16 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:53:41.818903294Z TELEMETRY tip=20 final=16 stall=4 age_s=304 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:54:11.833805627Z TELEMETRY tip=20 final=16 stall=4 age_s=304 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:54:41.842865127Z TELEMETRY tip=20 final=16 stall=4 age_s=304 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:55:11.861175544Z TELEMETRY tip=21 final=16 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:55:41.875174961Z TELEMETRY tip=21 final=16 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:56:11.877147919Z TELEMETRY tip=21 final=16 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:56:41.898440961Z TELEMETRY tip=22 final=16 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:57:11.907849252Z TELEMETRY tip=22 final=16 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:57:41.921169544Z TELEMETRY tip=23 final=16 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:58:11.940574794Z TELEMETRY tip=23 final=16 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:58:41.949168544Z TELEMETRY tip=23 final=16 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:59:11.949909502Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-29T23:59:41.960051544Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:00:11.973087086Z TELEMETRY tip=25 final=24 stall=1 age_s=75 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:00:41.989370044Z TELEMETRY tip=25 final=24 stall=1 age_s=75 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:01:11.992402502Z TELEMETRY tip=25 final=24 stall=1 age_s=75 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:01:42.002598544Z TELEMETRY tip=26 final=24 stall=2 age_s=150 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:02:12.008078461Z TELEMETRY tip=26 final=24 stall=2 age_s=150 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:02:42.025414586Z TELEMETRY tip=27 final=24 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:03:12.030224169Z TELEMETRY tip=27 final=24 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:03:42.051736252Z TELEMETRY tip=27 final=24 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:04:12.056552419Z TELEMETRY tip=28 final=24 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:04:42.061300877Z TELEMETRY tip=28 final=24 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:05:12.396951752Z TELEMETRY tip=29 final=24 stall=5 age_s=382 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:05:42.421689044Z TELEMETRY tip=29 final=24 stall=5 age_s=382 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:06:12.441379544Z TELEMETRY tip=29 final=24 stall=5 age_s=382 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:06:42.453720586Z TELEMETRY tip=30 final=24 stall=6 age_s=462 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:07:12.482229919Z TELEMETRY tip=30 final=24 stall=6 age_s=462 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:07:42.485584794Z TELEMETRY tip=30 final=24 stall=6 age_s=462 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:08:12.488701419Z TELEMETRY tip=31 final=24 stall=7 age_s=538 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:08:42.510206336Z TELEMETRY tip=31 final=24 stall=7 age_s=538 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:09:12.510922086Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:09:42.525379586Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:10:12.531182711Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:10:42.558801002Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:11:12.567566461Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:11:42.586700794Z TELEMETRY tip=34 final=32 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:12:12.591758127Z TELEMETRY tip=34 final=32 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:12:42.603429919Z TELEMETRY tip=34 final=32 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:13:12.613801627Z TELEMETRY tip=35 final=32 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:13:42.629545919Z TELEMETRY tip=35 final=32 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:14:12.640220877Z TELEMETRY tip=36 final=32 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:14:42.646527502Z TELEMETRY tip=36 final=32 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:15:12.654494627Z TELEMETRY tip=36 final=32 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:15:42.671514169Z TELEMETRY tip=37 final=32 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:16:12.689167461Z TELEMETRY tip=37 final=32 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:16:42.708002169Z TELEMETRY tip=38 final=32 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:17:12.713917919Z TELEMETRY tip=38 final=32 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:17:42.735371003Z TELEMETRY tip=38 final=32 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:18:12.750073211Z TELEMETRY tip=39 final=32 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:18:42.751136711Z TELEMETRY tip=39 final=32 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:19:12.769640378Z TELEMETRY tip=40 final=40 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=9 rfail=4 fid=04b3f49022e0 sslot=40 sid=04b3f49022e0
+---- T node1 ----
+2026-07-29T23:28:10.950509002Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=0 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=0/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-29T23:28:40.959652710Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=8 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-29T23:29:10.962519669Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=8 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-29T23:29:40.975757252Z TELEMETRY tip=1 final=0 stall=1 age_s=1785367765 diff=256 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:30:10.976485835Z TELEMETRY tip=1 final=0 stall=1 age_s=1785367765 diff=256 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:30:40.981466835Z TELEMETRY tip=1 final=0 stall=1 age_s=1785367765 diff=256 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:31:11.001090460Z TELEMETRY tip=2 final=0 stall=2 age_s=1785367842 diff=42 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:31:41.010968960Z TELEMETRY tip=2 final=0 stall=2 age_s=1785367842 diff=42 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:32:11.021791960Z TELEMETRY tip=3 final=0 stall=3 age_s=1785367918 diff=55 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:32:41.032161835Z TELEMETRY tip=3 final=0 stall=3 age_s=1785367918 diff=55 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:33:11.048684460Z TELEMETRY tip=3 final=0 stall=3 age_s=1785367918 diff=55 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:33:41.066708377Z TELEMETRY tip=4 final=0 stall=4 age_s=1785367993 diff=63 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:34:11.069779585Z TELEMETRY tip=4 final=0 stall=4 age_s=1785367993 diff=63 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:34:41.077005419Z TELEMETRY tip=5 final=0 stall=5 age_s=1785368069 diff=68 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:35:11.090637877Z TELEMETRY tip=5 final=0 stall=5 age_s=1785368069 diff=68 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:35:41.106200752Z TELEMETRY tip=5 final=0 stall=5 age_s=1785368069 diff=68 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:36:11.107819294Z TELEMETRY tip=6 final=0 stall=6 age_s=1785368149 diff=72 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:36:41.121796835Z TELEMETRY tip=6 final=0 stall=6 age_s=1785368149 diff=72 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:37:11.126212335Z TELEMETRY tip=7 final=0 stall=7 age_s=1785368226 diff=73 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:37:41.127084210Z TELEMETRY tip=7 final=0 stall=7 age_s=1785368226 diff=73 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:38:11.146234835Z TELEMETRY tip=7 final=0 stall=7 age_s=1785368226 diff=73 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:38:41.148736794Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=74 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:39:11.156880752Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=74 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:39:41.174817919Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=74 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:40:11.181677585Z TELEMETRY tip=9 final=8 stall=1 age_s=79 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:40:41.199739044Z TELEMETRY tip=9 final=8 stall=1 age_s=79 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:41:11.205567669Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:41:41.218237544Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:42:11.237471294Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:42:41.248644544Z TELEMETRY tip=11 final=8 stall=3 age_s=234 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:43:11.253277419Z TELEMETRY tip=11 final=8 stall=3 age_s=234 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:43:41.265770835Z TELEMETRY tip=12 final=8 stall=4 age_s=310 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:44:11.281635460Z TELEMETRY tip=12 final=8 stall=4 age_s=310 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:44:41.296880752Z TELEMETRY tip=12 final=8 stall=4 age_s=310 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:45:11.308014044Z TELEMETRY tip=13 final=8 stall=5 age_s=387 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:45:41.325845210Z TELEMETRY tip=13 final=8 stall=5 age_s=387 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:46:11.342880794Z TELEMETRY tip=14 final=8 stall=6 age_s=462 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:46:41.348517627Z TELEMETRY tip=14 final=8 stall=6 age_s=462 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:47:11.367919794Z TELEMETRY tip=14 final=8 stall=6 age_s=462 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:47:41.385518085Z TELEMETRY tip=15 final=8 stall=7 age_s=539 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:48:11.395001752Z TELEMETRY tip=15 final=8 stall=7 age_s=539 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:48:41.404725252Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:49:11.406195294Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:49:41.426522627Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:50:11.440134835Z TELEMETRY tip=17 final=16 stall=1 age_s=77 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:50:41.441320752Z TELEMETRY tip=17 final=16 stall=1 age_s=77 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:51:11.451995002Z TELEMETRY tip=18 final=16 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:51:41.470952002Z TELEMETRY tip=18 final=16 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:52:11.472902752Z TELEMETRY tip=18 final=16 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:52:41.488294585Z TELEMETRY tip=19 final=16 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:53:11.508708169Z TELEMETRY tip=19 final=16 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:53:41.823896877Z TELEMETRY tip=20 final=16 stall=4 age_s=304 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:54:11.843526252Z TELEMETRY tip=20 final=16 stall=4 age_s=304 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:54:41.860246711Z TELEMETRY tip=20 final=16 stall=4 age_s=304 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:55:11.865532044Z TELEMETRY tip=21 final=16 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:55:41.886432211Z TELEMETRY tip=21 final=16 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:56:11.897788086Z TELEMETRY tip=21 final=16 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:56:41.902858711Z TELEMETRY tip=22 final=16 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:57:11.908271419Z TELEMETRY tip=22 final=16 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:57:41.910052336Z TELEMETRY tip=23 final=16 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:58:11.929938211Z TELEMETRY tip=23 final=16 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:58:41.939670461Z TELEMETRY tip=23 final=16 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:59:11.954566544Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-29T23:59:41.962729336Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:00:11.971813461Z TELEMETRY tip=25 final=24 stall=1 age_s=75 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:00:41.979051919Z TELEMETRY tip=25 final=24 stall=1 age_s=75 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:01:11.988898294Z TELEMETRY tip=25 final=24 stall=1 age_s=75 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:01:42.009555627Z TELEMETRY tip=26 final=24 stall=2 age_s=150 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:02:12.013044377Z TELEMETRY tip=26 final=24 stall=2 age_s=150 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:02:42.016040544Z TELEMETRY tip=27 final=24 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:03:12.036315502Z TELEMETRY tip=27 final=24 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:03:42.043252794Z TELEMETRY tip=27 final=24 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:04:12.046431377Z TELEMETRY tip=28 final=24 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:04:42.061368669Z TELEMETRY tip=28 final=24 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:05:12.417831127Z TELEMETRY tip=29 final=24 stall=5 age_s=382 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:05:42.419629336Z TELEMETRY tip=29 final=24 stall=5 age_s=382 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:06:12.441294669Z TELEMETRY tip=29 final=24 stall=5 age_s=382 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:06:42.446131377Z TELEMETRY tip=30 final=24 stall=6 age_s=462 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:07:12.464947252Z TELEMETRY tip=30 final=24 stall=6 age_s=462 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:07:42.480096836Z TELEMETRY tip=30 final=24 stall=6 age_s=462 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:08:12.485065502Z TELEMETRY tip=31 final=24 stall=7 age_s=538 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:08:42.504979544Z TELEMETRY tip=31 final=24 stall=7 age_s=538 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:09:12.524212752Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:09:42.545227627Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:10:12.564573586Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:10:42.577508836Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:11:12.592255919Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:11:42.619571086Z TELEMETRY tip=34 final=32 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:12:12.629023419Z TELEMETRY tip=34 final=32 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:12:42.635786961Z TELEMETRY tip=34 final=32 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:13:12.640424336Z TELEMETRY tip=35 final=32 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:13:42.649572836Z TELEMETRY tip=35 final=32 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:14:12.664160752Z TELEMETRY tip=36 final=32 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:14:42.668101544Z TELEMETRY tip=36 final=32 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:15:12.680926086Z TELEMETRY tip=36 final=32 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:15:42.694968753Z TELEMETRY tip=37 final=32 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:16:12.706897378Z TELEMETRY tip=37 final=32 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:16:42.715061419Z TELEMETRY tip=38 final=32 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:17:12.731529211Z TELEMETRY tip=38 final=32 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:17:42.745019169Z TELEMETRY tip=38 final=32 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:18:12.742936253Z TELEMETRY tip=39 final=32 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:18:42.741801294Z TELEMETRY tip=39 final=32 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:19:12.756331003Z TELEMETRY tip=40 final=40 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=9 rfail=4 fid=04b3f49022e0 sslot=40 sid=04b3f49022e0
+---- T node2 ----
+2026-07-29T23:28:10.958336377Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=3 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-29T23:28:40.973365210Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=8 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-29T23:29:10.987445877Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=8 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-29T23:29:40.990029085Z TELEMETRY tip=1 final=0 stall=1 age_s=1785367765 diff=256 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:30:10.996364544Z TELEMETRY tip=1 final=0 stall=1 age_s=1785367765 diff=256 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:30:41.016630002Z TELEMETRY tip=1 final=0 stall=1 age_s=1785367765 diff=256 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:31:11.034223335Z TELEMETRY tip=2 final=0 stall=2 age_s=1785367842 diff=42 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:31:41.040505835Z TELEMETRY tip=2 final=0 stall=2 age_s=1785367842 diff=42 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:32:11.045927294Z TELEMETRY tip=3 final=0 stall=3 age_s=1785367918 diff=55 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:32:41.062416335Z TELEMETRY tip=3 final=0 stall=3 age_s=1785367918 diff=55 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:33:11.073927002Z TELEMETRY tip=3 final=0 stall=3 age_s=1785367918 diff=55 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:33:41.088010335Z TELEMETRY tip=4 final=0 stall=4 age_s=1785367993 diff=63 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:34:11.094376919Z TELEMETRY tip=4 final=0 stall=4 age_s=1785367993 diff=63 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:34:41.108083627Z TELEMETRY tip=5 final=0 stall=5 age_s=1785368069 diff=68 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:35:11.109216960Z TELEMETRY tip=5 final=0 stall=5 age_s=1785368069 diff=68 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:35:41.112077419Z TELEMETRY tip=5 final=0 stall=5 age_s=1785368069 diff=68 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:36:11.131150252Z TELEMETRY tip=6 final=0 stall=6 age_s=1785368149 diff=72 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:36:41.131734460Z TELEMETRY tip=6 final=0 stall=6 age_s=1785368149 diff=72 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:37:11.148200794Z TELEMETRY tip=7 final=0 stall=7 age_s=1785368226 diff=73 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:37:41.158276960Z TELEMETRY tip=7 final=0 stall=7 age_s=1785368226 diff=73 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:38:11.167795460Z TELEMETRY tip=7 final=0 stall=7 age_s=1785368226 diff=73 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:38:41.186012210Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=74 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:39:11.186542044Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=74 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:39:41.194833044Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=74 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:40:11.211179210Z TELEMETRY tip=9 final=8 stall=1 age_s=79 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:40:41.226294002Z TELEMETRY tip=9 final=8 stall=1 age_s=79 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:41:11.237766210Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:41:41.234497169Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:42:11.253794669Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:42:41.257275794Z TELEMETRY tip=11 final=8 stall=3 age_s=234 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:43:11.270794710Z TELEMETRY tip=11 final=8 stall=3 age_s=234 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:43:41.273238627Z TELEMETRY tip=12 final=8 stall=4 age_s=310 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:44:11.283220460Z TELEMETRY tip=12 final=8 stall=4 age_s=310 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:44:41.287731794Z TELEMETRY tip=12 final=8 stall=4 age_s=310 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:45:11.305198294Z TELEMETRY tip=13 final=8 stall=5 age_s=387 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:45:41.328320710Z TELEMETRY tip=13 final=8 stall=5 age_s=387 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:46:11.348440377Z TELEMETRY tip=14 final=8 stall=6 age_s=462 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:46:41.361723044Z TELEMETRY tip=14 final=8 stall=6 age_s=462 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:47:11.375431419Z TELEMETRY tip=14 final=8 stall=6 age_s=462 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:47:41.397657502Z TELEMETRY tip=15 final=8 stall=7 age_s=539 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:48:11.401981335Z TELEMETRY tip=15 final=8 stall=7 age_s=539 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:48:41.407748419Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:49:11.417329835Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:49:41.425157002Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:50:11.427212127Z TELEMETRY tip=17 final=16 stall=1 age_s=77 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:50:41.442744460Z TELEMETRY tip=17 final=16 stall=1 age_s=77 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:51:11.463192794Z TELEMETRY tip=18 final=16 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:51:41.475830002Z TELEMETRY tip=18 final=16 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:52:11.490896627Z TELEMETRY tip=18 final=16 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:52:41.509773335Z TELEMETRY tip=19 final=16 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:53:11.513286835Z TELEMETRY tip=19 final=16 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:53:41.837793211Z TELEMETRY tip=20 final=16 stall=4 age_s=304 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:54:11.852911877Z TELEMETRY tip=20 final=16 stall=4 age_s=304 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:54:41.864375169Z TELEMETRY tip=20 final=16 stall=4 age_s=304 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:55:11.872750836Z TELEMETRY tip=21 final=16 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:55:41.879145919Z TELEMETRY tip=21 final=16 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:56:11.904080252Z TELEMETRY tip=21 final=16 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:56:41.915733961Z TELEMETRY tip=22 final=16 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:57:11.938249252Z TELEMETRY tip=22 final=16 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:57:41.944434294Z TELEMETRY tip=23 final=16 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:58:11.968571127Z TELEMETRY tip=23 final=16 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:58:41.977672544Z TELEMETRY tip=23 final=16 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:59:11.996318252Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-29T23:59:42.006623836Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:00:12.005727044Z TELEMETRY tip=25 final=24 stall=1 age_s=75 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:00:42.004618669Z TELEMETRY tip=25 final=24 stall=1 age_s=75 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:01:12.008256711Z TELEMETRY tip=25 final=24 stall=1 age_s=75 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:01:42.009520211Z TELEMETRY tip=26 final=24 stall=2 age_s=150 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:02:12.026041919Z TELEMETRY tip=26 final=24 stall=2 age_s=150 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:02:42.029002502Z TELEMETRY tip=27 final=24 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:03:12.052040169Z TELEMETRY tip=27 final=24 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:03:42.074220919Z TELEMETRY tip=27 final=24 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:04:12.085293044Z TELEMETRY tip=28 final=24 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:04:42.093938169Z TELEMETRY tip=28 final=24 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:05:12.409596419Z TELEMETRY tip=29 final=24 stall=5 age_s=382 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:05:42.413958127Z TELEMETRY tip=29 final=24 stall=5 age_s=382 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:06:12.415139877Z TELEMETRY tip=29 final=24 stall=5 age_s=382 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:06:42.437912377Z TELEMETRY tip=30 final=24 stall=6 age_s=462 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:07:12.452544211Z TELEMETRY tip=30 final=24 stall=6 age_s=462 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:07:42.471308544Z TELEMETRY tip=30 final=24 stall=6 age_s=462 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:08:12.486930544Z TELEMETRY tip=31 final=24 stall=7 age_s=538 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:08:42.497969086Z TELEMETRY tip=31 final=24 stall=7 age_s=538 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:09:12.511323252Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:09:42.529874627Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:10:12.547843919Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:10:42.573221752Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:11:12.576079836Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:11:42.590751877Z TELEMETRY tip=34 final=32 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:12:12.598654211Z TELEMETRY tip=34 final=32 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:12:42.601663419Z TELEMETRY tip=34 final=32 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:13:12.612654294Z TELEMETRY tip=35 final=32 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:13:42.626810919Z TELEMETRY tip=35 final=32 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:14:12.631091169Z TELEMETRY tip=36 final=32 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:14:42.647531711Z TELEMETRY tip=36 final=32 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:15:12.648013169Z TELEMETRY tip=36 final=32 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:15:42.655319836Z TELEMETRY tip=37 final=32 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:16:12.674788794Z TELEMETRY tip=37 final=32 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:16:42.695994003Z TELEMETRY tip=38 final=32 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:17:12.708514503Z TELEMETRY tip=38 final=32 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:17:42.711142586Z TELEMETRY tip=38 final=32 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:18:12.724423878Z TELEMETRY tip=39 final=32 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:18:42.737203253Z TELEMETRY tip=39 final=32 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:19:12.756329253Z TELEMETRY tip=40 final=40 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=9 rfail=4 fid=04b3f49022e0 sslot=40 sid=04b3f49022e0
+---- T node3 ----
+2026-07-29T23:28:10.955649835Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=2 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=2/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-29T23:28:40.974141669Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=8 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-29T23:29:10.988848544Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=8 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-29T23:29:40.997230419Z TELEMETRY tip=1 final=0 stall=1 age_s=1785367765 diff=256 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:30:11.008728294Z TELEMETRY tip=1 final=0 stall=1 age_s=1785367765 diff=256 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:30:41.012259544Z TELEMETRY tip=1 final=0 stall=1 age_s=1785367765 diff=256 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:31:11.013277835Z TELEMETRY tip=2 final=0 stall=2 age_s=1785367842 diff=42 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:31:41.026858419Z TELEMETRY tip=2 final=0 stall=2 age_s=1785367842 diff=42 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:32:11.041762085Z TELEMETRY tip=3 final=0 stall=3 age_s=1785367918 diff=55 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:32:41.052013460Z TELEMETRY tip=3 final=0 stall=3 age_s=1785367918 diff=55 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:33:11.056759710Z TELEMETRY tip=3 final=0 stall=3 age_s=1785367918 diff=55 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:33:41.062875294Z TELEMETRY tip=4 final=0 stall=4 age_s=1785367993 diff=63 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:34:11.070783127Z TELEMETRY tip=4 final=0 stall=4 age_s=1785367993 diff=63 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:34:41.083171460Z TELEMETRY tip=5 final=0 stall=5 age_s=1785368069 diff=68 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:35:11.086658210Z TELEMETRY tip=5 final=0 stall=5 age_s=1785368069 diff=68 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:35:41.089021169Z TELEMETRY tip=5 final=0 stall=5 age_s=1785368069 diff=68 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:36:11.105764752Z TELEMETRY tip=6 final=0 stall=6 age_s=1785368149 diff=72 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:36:41.119063919Z TELEMETRY tip=6 final=0 stall=6 age_s=1785368149 diff=72 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:37:11.120329669Z TELEMETRY tip=7 final=0 stall=7 age_s=1785368226 diff=73 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:37:41.136532544Z TELEMETRY tip=7 final=0 stall=7 age_s=1785368226 diff=73 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:38:11.143638460Z TELEMETRY tip=7 final=0 stall=7 age_s=1785368226 diff=73 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-29T23:38:41.144185252Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=74 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:39:11.148763877Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=74 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:39:41.164627419Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=74 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:40:11.170315044Z TELEMETRY tip=9 final=8 stall=1 age_s=79 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:40:41.178003669Z TELEMETRY tip=9 final=8 stall=1 age_s=79 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:41:11.186869127Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:41:41.198508835Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:42:11.210808085Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=75 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:42:41.210850294Z TELEMETRY tip=11 final=8 stall=3 age_s=234 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:43:11.212746835Z TELEMETRY tip=11 final=8 stall=3 age_s=234 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:43:41.223590919Z TELEMETRY tip=12 final=8 stall=4 age_s=310 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:44:11.245667585Z TELEMETRY tip=12 final=8 stall=4 age_s=310 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:44:41.267117835Z TELEMETRY tip=12 final=8 stall=4 age_s=310 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:45:11.284260127Z TELEMETRY tip=13 final=8 stall=5 age_s=387 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:45:41.296430169Z TELEMETRY tip=13 final=8 stall=5 age_s=387 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:46:11.299931752Z TELEMETRY tip=14 final=8 stall=6 age_s=462 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:46:41.305029169Z TELEMETRY tip=14 final=8 stall=6 age_s=462 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:47:11.325973627Z TELEMETRY tip=14 final=8 stall=6 age_s=462 diff=76 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:47:41.339506002Z TELEMETRY tip=15 final=8 stall=7 age_s=539 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:48:11.341629752Z TELEMETRY tip=15 final=8 stall=7 age_s=539 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=1 rfail=0 fid=1dcfc0521cc3 sslot=8 sid=1dcfc0521cc3
+2026-07-29T23:48:41.347914335Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:49:11.353915127Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:49:41.364960669Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:50:11.384405252Z TELEMETRY tip=17 final=16 stall=1 age_s=77 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:50:41.387774335Z TELEMETRY tip=17 final=16 stall=1 age_s=77 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:51:11.405311544Z TELEMETRY tip=18 final=16 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:51:41.408974877Z TELEMETRY tip=18 final=16 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:52:11.411767585Z TELEMETRY tip=18 final=16 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:52:41.413876960Z TELEMETRY tip=19 final=16 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:53:11.432913627Z TELEMETRY tip=19 final=16 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:53:41.837810836Z TELEMETRY tip=20 final=16 stall=4 age_s=304 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:54:11.842744627Z TELEMETRY tip=20 final=16 stall=4 age_s=304 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:54:41.849546002Z TELEMETRY tip=20 final=16 stall=4 age_s=304 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:55:11.851486919Z TELEMETRY tip=21 final=16 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:55:41.856140044Z TELEMETRY tip=21 final=16 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:56:11.873900127Z TELEMETRY tip=21 final=16 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:56:41.892234544Z TELEMETRY tip=22 final=16 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:57:11.899032086Z TELEMETRY tip=22 final=16 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:57:41.902097336Z TELEMETRY tip=23 final=16 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:58:11.908602919Z TELEMETRY tip=23 final=16 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:58:41.909164961Z TELEMETRY tip=23 final=16 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=3 rfail=1 fid=a3c39cc73229 sslot=16 sid=a3c39cc73229
+2026-07-29T23:59:11.919210919Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-29T23:59:41.933615877Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:00:11.943277169Z TELEMETRY tip=25 final=24 stall=1 age_s=75 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:00:41.941287211Z TELEMETRY tip=25 final=24 stall=1 age_s=75 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:01:11.946882711Z TELEMETRY tip=25 final=24 stall=1 age_s=75 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:01:41.960847752Z TELEMETRY tip=26 final=24 stall=2 age_s=150 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:02:11.964959877Z TELEMETRY tip=26 final=24 stall=2 age_s=150 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:02:41.976191711Z TELEMETRY tip=27 final=24 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:03:11.990421586Z TELEMETRY tip=27 final=24 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:03:42.017783961Z TELEMETRY tip=27 final=24 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:04:12.021970252Z TELEMETRY tip=28 final=24 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:04:42.038270377Z TELEMETRY tip=28 final=24 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:05:12.416319544Z TELEMETRY tip=29 final=24 stall=5 age_s=382 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:05:42.432307127Z TELEMETRY tip=29 final=24 stall=5 age_s=382 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:06:12.452438919Z TELEMETRY tip=29 final=24 stall=5 age_s=382 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:06:42.470204794Z TELEMETRY tip=30 final=24 stall=6 age_s=462 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:07:12.478536919Z TELEMETRY tip=30 final=24 stall=6 age_s=462 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:07:42.492717169Z TELEMETRY tip=30 final=24 stall=6 age_s=462 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:08:12.498959961Z TELEMETRY tip=31 final=24 stall=7 age_s=538 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:08:42.510209794Z TELEMETRY tip=31 final=24 stall=7 age_s=538 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=5 rfail=2 fid=46c5b6337de1 sslot=24 sid=46c5b6337de1
+2026-07-30T00:09:12.515780877Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:09:42.532623002Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:10:12.543722502Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:10:42.557297711Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:11:12.563490169Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:11:42.566099419Z TELEMETRY tip=34 final=32 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:12:12.582911419Z TELEMETRY tip=34 final=32 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:12:42.591669544Z TELEMETRY tip=34 final=32 stall=2 age_s=152 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:13:12.601829752Z TELEMETRY tip=35 final=32 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:13:42.601897377Z TELEMETRY tip=35 final=32 stall=3 age_s=228 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:14:12.616711169Z TELEMETRY tip=36 final=32 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:14:42.625372627Z TELEMETRY tip=36 final=32 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:15:12.641540002Z TELEMETRY tip=36 final=32 stall=4 age_s=305 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:15:42.647161752Z TELEMETRY tip=37 final=32 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:16:12.661305169Z TELEMETRY tip=37 final=32 stall=5 age_s=380 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:16:42.671336377Z TELEMETRY tip=38 final=32 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:17:12.687651127Z TELEMETRY tip=38 final=32 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:17:42.701433794Z TELEMETRY tip=38 final=32 stall=6 age_s=456 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:18:12.707442669Z TELEMETRY tip=39 final=32 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:18:42.708674836Z TELEMETRY tip=39 final=32 stall=7 age_s=532 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=7 rfail=3 fid=c511f58782cd sslot=32 sid=c511f58782cd
+2026-07-30T00:19:12.709621586Z TELEMETRY tip=40 final=40 stall=0 age_s=0 diff=77 peers=8 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=4/4 rounds=9 rfail=4 fid=04b3f49022e0 sslot=40 sid=04b3f49022e0
+
+############ TELEMETRY, condition C (docker capture stamps, every line) ############
+---- C node0 ----
+2026-07-30T01:11:16.324287669Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=3 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-30T01:11:46.343878086Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=6 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-30T01:12:16.349265794Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=6 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-30T01:12:46.352007961Z TELEMETRY tip=1 final=0 stall=1 age_s=1785373951 diff=256 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:13:16.353696419Z TELEMETRY tip=1 final=0 stall=1 age_s=1785373951 diff=256 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:13:46.364453544Z TELEMETRY tip=1 final=0 stall=1 age_s=1785373951 diff=256 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:14:16.371687128Z TELEMETRY tip=2 final=0 stall=2 age_s=1785374030 diff=42 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:14:46.388938378Z TELEMETRY tip=2 final=0 stall=2 age_s=1785374030 diff=42 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:15:16.403291628Z TELEMETRY tip=3 final=0 stall=3 age_s=1785374106 diff=55 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:15:46.412025503Z TELEMETRY tip=3 final=0 stall=3 age_s=1785374106 diff=55 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:16:16.428132378Z TELEMETRY tip=3 final=0 stall=3 age_s=1785374106 diff=55 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:16:46.434918253Z TELEMETRY tip=4 final=0 stall=4 age_s=1785374181 diff=63 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:17:16.448656503Z TELEMETRY tip=4 final=0 stall=4 age_s=1785374181 diff=63 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:17:46.449291253Z TELEMETRY tip=5 final=0 stall=5 age_s=1785374257 diff=68 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:18:16.460128836Z TELEMETRY tip=5 final=0 stall=5 age_s=1785374257 diff=68 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:18:46.471888753Z TELEMETRY tip=5 final=0 stall=5 age_s=1785374257 diff=68 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:19:16.478082920Z TELEMETRY tip=6 final=0 stall=6 age_s=1785374334 diff=71 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:19:46.479065420Z TELEMETRY tip=6 final=0 stall=6 age_s=1785374334 diff=71 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:20:16.499258003Z TELEMETRY tip=7 final=0 stall=7 age_s=1785374409 diff=73 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:20:46.502879961Z TELEMETRY tip=7 final=0 stall=7 age_s=1785374409 diff=73 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:21:16.514743753Z TELEMETRY tip=7 final=0 stall=7 age_s=1785374409 diff=73 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:21:46.531431003Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=75 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:22:16.538096628Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=75 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:22:46.539202420Z TELEMETRY tip=9 final=8 stall=1 age_s=77 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:23:16.548406461Z TELEMETRY tip=9 final=8 stall=1 age_s=77 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:23:46.566863878Z TELEMETRY tip=9 final=8 stall=1 age_s=77 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:24:16.581580045Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:24:46.582646086Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:25:16.596284961Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:25:46.615398461Z TELEMETRY tip=11 final=8 stall=3 age_s=238 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:26:16.630530295Z TELEMETRY tip=11 final=8 stall=3 age_s=238 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:26:46.647114711Z TELEMETRY tip=12 final=8 stall=4 age_s=315 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:27:16.663846086Z TELEMETRY tip=12 final=8 stall=4 age_s=315 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:27:46.672840628Z TELEMETRY tip=12 final=8 stall=4 age_s=315 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:28:16.685524628Z TELEMETRY tip=13 final=8 stall=5 age_s=390 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:28:46.694932378Z TELEMETRY tip=13 final=8 stall=5 age_s=390 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:29:16.707134545Z TELEMETRY tip=14 final=8 stall=6 age_s=466 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:29:46.717660711Z TELEMETRY tip=14 final=8 stall=6 age_s=466 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:30:16.731641045Z TELEMETRY tip=14 final=8 stall=6 age_s=466 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:30:46.750236795Z TELEMETRY tip=15 final=8 stall=7 age_s=544 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:31:16.757467336Z TELEMETRY tip=15 final=8 stall=7 age_s=544 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:31:46.773284795Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:32:16.775789795Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:32:46.790172836Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:33:16.805160836Z TELEMETRY tip=17 final=16 stall=1 age_s=76 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:33:46.822594920Z TELEMETRY tip=17 final=16 stall=1 age_s=76 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:34:17.079462295Z TELEMETRY tip=18 final=16 stall=2 age_s=151 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:34:47.092645420Z TELEMETRY tip=18 final=16 stall=2 age_s=151 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:35:17.099478461Z TELEMETRY tip=18 final=16 stall=2 age_s=151 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:35:47.109506836Z TELEMETRY tip=19 final=16 stall=3 age_s=227 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:36:17.115045253Z TELEMETRY tip=19 final=16 stall=3 age_s=227 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:36:47.119989878Z TELEMETRY tip=19 final=16 stall=3 age_s=227 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:37:17.123606461Z TELEMETRY tip=20 final=16 stall=4 age_s=302 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:37:47.147774878Z TELEMETRY tip=20 final=16 stall=4 age_s=302 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:38:17.151163753Z TELEMETRY tip=21 final=16 stall=5 age_s=378 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:38:47.157763586Z TELEMETRY tip=21 final=16 stall=5 age_s=378 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:39:17.172456045Z TELEMETRY tip=21 final=16 stall=5 age_s=378 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:39:47.190237836Z TELEMETRY tip=22 final=16 stall=6 age_s=455 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:40:17.207782128Z TELEMETRY tip=22 final=16 stall=6 age_s=455 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:40:47.226786253Z TELEMETRY tip=23 final=16 stall=7 age_s=533 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:41:17.232248878Z TELEMETRY tip=23 final=16 stall=7 age_s=533 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:41:47.247521378Z TELEMETRY tip=23 final=16 stall=7 age_s=533 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:42:17.278558378Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:42:47.296168836Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:43:17.319031795Z TELEMETRY tip=25 final=24 stall=1 age_s=78 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:43:47.326296211Z TELEMETRY tip=25 final=24 stall=1 age_s=78 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:44:17.333517545Z TELEMETRY tip=25 final=24 stall=1 age_s=78 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:44:47.349636420Z TELEMETRY tip=26 final=24 stall=2 age_s=154 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:45:17.360329253Z TELEMETRY tip=26 final=24 stall=2 age_s=154 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:45:49.347046254Z TELEMETRY tip=27 final=24 stall=3 age_s=233 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:46:19.344940379Z TELEMETRY tip=27 final=24 stall=3 age_s=233 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:46:49.362568671Z TELEMETRY tip=27 final=24 stall=3 age_s=233 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:47:19.367888879Z TELEMETRY tip=28 final=24 stall=4 age_s=310 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:47:49.383913921Z TELEMETRY tip=28 final=24 stall=4 age_s=310 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:48:19.390366296Z TELEMETRY tip=28 final=24 stall=4 age_s=310 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:48:49.399255546Z TELEMETRY tip=29 final=24 stall=5 age_s=389 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:49:19.416835379Z TELEMETRY tip=29 final=24 stall=5 age_s=389 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:49:49.425504337Z TELEMETRY tip=30 final=24 stall=6 age_s=468 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:50:19.431184796Z TELEMETRY tip=30 final=24 stall=6 age_s=468 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:50:49.437457212Z TELEMETRY tip=30 final=24 stall=6 age_s=468 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:51:19.442136046Z TELEMETRY tip=31 final=24 stall=7 age_s=544 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:51:49.464616212Z TELEMETRY tip=31 final=24 stall=7 age_s=544 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:52:19.484596421Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:52:49.490504462Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:53:19.497556296Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:53:49.517924088Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:54:19.520216838Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:54:49.534758504Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:55:19.548398171Z TELEMETRY tip=34 final=32 stall=2 age_s=159 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:55:49.555073754Z TELEMETRY tip=34 final=32 stall=2 age_s=159 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:56:19.572243213Z TELEMETRY tip=35 final=32 stall=3 age_s=236 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:56:49.575069338Z TELEMETRY tip=35 final=32 stall=3 age_s=236 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:57:19.579069963Z TELEMETRY tip=35 final=32 stall=3 age_s=236 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:57:49.592196296Z TELEMETRY tip=36 final=32 stall=4 age_s=314 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:58:19.610074296Z TELEMETRY tip=36 final=32 stall=4 age_s=314 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:58:49.624040879Z TELEMETRY tip=37 final=32 stall=5 age_s=389 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:59:19.629489421Z TELEMETRY tip=37 final=32 stall=5 age_s=389 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:59:49.639345754Z TELEMETRY tip=37 final=32 stall=5 age_s=389 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:00:19.649231838Z TELEMETRY tip=38 final=32 stall=6 age_s=465 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:00:49.653349504Z TELEMETRY tip=38 final=32 stall=6 age_s=465 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:01:19.655251171Z TELEMETRY tip=39 final=32 stall=7 age_s=540 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:01:49.663217046Z TELEMETRY tip=39 final=32 stall=7 age_s=540 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:02:19.680901296Z TELEMETRY tip=39 final=32 stall=7 age_s=540 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:02:49.693294379Z TELEMETRY tip=40 final=40 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=9 rfail=4 fid=238ef8ec5ec2 sslot=40 sid=238ef8ec5ec2
+2026-07-30T02:03:19.712656463Z TELEMETRY tip=40 final=40 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=9 rfail=4 fid=238ef8ec5ec2 sslot=40 sid=238ef8ec5ec2
+2026-07-30T02:03:49.728914379Z TELEMETRY tip=41 final=40 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=9 rfail=4 fid=238ef8ec5ec2 sslot=40 sid=238ef8ec5ec2
+---- C node1 ----
+2026-07-30T01:11:16.302389086Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=0 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=0/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-30T01:11:46.304920211Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=6 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-30T01:12:16.315020961Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=6 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-30T01:12:46.323948044Z TELEMETRY tip=1 final=0 stall=1 age_s=1785373951 diff=256 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:13:16.337669461Z TELEMETRY tip=1 final=0 stall=1 age_s=1785373951 diff=256 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:13:46.342092378Z TELEMETRY tip=1 final=0 stall=1 age_s=1785373951 diff=256 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:14:16.343960419Z TELEMETRY tip=2 final=0 stall=2 age_s=1785374030 diff=42 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:14:46.347903961Z TELEMETRY tip=2 final=0 stall=2 age_s=1785374030 diff=42 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:15:16.351013669Z TELEMETRY tip=3 final=0 stall=3 age_s=1785374106 diff=55 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:15:46.366176711Z TELEMETRY tip=3 final=0 stall=3 age_s=1785374106 diff=55 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:16:16.366432086Z TELEMETRY tip=3 final=0 stall=3 age_s=1785374106 diff=55 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:16:46.372966669Z TELEMETRY tip=4 final=0 stall=4 age_s=1785374181 diff=63 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:17:16.386795086Z TELEMETRY tip=4 final=0 stall=4 age_s=1785374181 diff=63 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:17:46.402395253Z TELEMETRY tip=5 final=0 stall=5 age_s=1785374257 diff=68 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:18:16.415053086Z TELEMETRY tip=5 final=0 stall=5 age_s=1785374257 diff=68 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:18:46.428002461Z TELEMETRY tip=5 final=0 stall=5 age_s=1785374257 diff=68 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:19:16.427593419Z TELEMETRY tip=6 final=0 stall=6 age_s=1785374334 diff=71 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:19:46.441072086Z TELEMETRY tip=6 final=0 stall=6 age_s=1785374334 diff=71 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:20:16.459626586Z TELEMETRY tip=7 final=0 stall=7 age_s=1785374409 diff=73 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:20:46.471647753Z TELEMETRY tip=7 final=0 stall=7 age_s=1785374409 diff=73 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:21:16.478378336Z TELEMETRY tip=7 final=0 stall=7 age_s=1785374409 diff=73 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:21:46.486757295Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=75 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:22:16.503358836Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=75 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:22:46.514387795Z TELEMETRY tip=9 final=8 stall=1 age_s=77 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:23:16.528001128Z TELEMETRY tip=9 final=8 stall=1 age_s=77 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:23:46.528316211Z TELEMETRY tip=9 final=8 stall=1 age_s=77 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:24:16.543040170Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:24:46.560293128Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:25:16.574644711Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:25:46.585416836Z TELEMETRY tip=11 final=8 stall=3 age_s=238 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:26:16.591890670Z TELEMETRY tip=11 final=8 stall=3 age_s=238 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:26:46.596671836Z TELEMETRY tip=12 final=8 stall=4 age_s=315 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:27:16.604586128Z TELEMETRY tip=12 final=8 stall=4 age_s=315 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:27:46.608322170Z TELEMETRY tip=12 final=8 stall=4 age_s=315 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:28:16.622893086Z TELEMETRY tip=13 final=8 stall=5 age_s=390 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:28:46.635412128Z TELEMETRY tip=13 final=8 stall=5 age_s=390 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:29:16.655779128Z TELEMETRY tip=14 final=8 stall=6 age_s=466 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:29:46.665017170Z TELEMETRY tip=14 final=8 stall=6 age_s=466 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:30:16.683572878Z TELEMETRY tip=14 final=8 stall=6 age_s=466 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:30:46.686439836Z TELEMETRY tip=15 final=8 stall=7 age_s=544 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:31:16.697306336Z TELEMETRY tip=15 final=8 stall=7 age_s=544 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:31:46.701955336Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:32:16.720500253Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:32:46.735058128Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:33:16.737854045Z TELEMETRY tip=17 final=16 stall=1 age_s=76 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:33:46.739958045Z TELEMETRY tip=17 final=16 stall=1 age_s=76 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:34:17.079769545Z TELEMETRY tip=18 final=16 stall=2 age_s=151 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:34:47.081524711Z TELEMETRY tip=18 final=16 stall=2 age_s=151 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:35:17.082972753Z TELEMETRY tip=18 final=16 stall=2 age_s=151 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:35:47.099803753Z TELEMETRY tip=19 final=16 stall=3 age_s=227 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:36:17.108163795Z TELEMETRY tip=19 final=16 stall=3 age_s=227 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:36:47.113820836Z TELEMETRY tip=19 final=16 stall=3 age_s=227 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:37:17.123204086Z TELEMETRY tip=20 final=16 stall=4 age_s=302 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:37:47.133078711Z TELEMETRY tip=20 final=16 stall=4 age_s=302 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:38:17.150760045Z TELEMETRY tip=21 final=16 stall=5 age_s=378 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:38:47.155843670Z TELEMETRY tip=21 final=16 stall=5 age_s=378 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:39:17.178234128Z TELEMETRY tip=21 final=16 stall=5 age_s=378 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:39:47.187275378Z TELEMETRY tip=22 final=16 stall=6 age_s=455 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:40:17.207055670Z TELEMETRY tip=22 final=16 stall=6 age_s=455 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:40:47.218403795Z TELEMETRY tip=23 final=16 stall=7 age_s=533 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:41:17.236045586Z TELEMETRY tip=23 final=16 stall=7 age_s=533 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:41:47.253478378Z TELEMETRY tip=23 final=16 stall=7 age_s=533 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:42:17.287729920Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:42:47.292954586Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:43:17.294042628Z TELEMETRY tip=25 final=24 stall=1 age_s=78 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:43:47.296275295Z TELEMETRY tip=25 final=24 stall=1 age_s=78 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:44:17.314395961Z TELEMETRY tip=25 final=24 stall=1 age_s=78 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:44:47.331039086Z TELEMETRY tip=26 final=24 stall=2 age_s=154 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:45:17.339563628Z TELEMETRY tip=26 final=24 stall=2 age_s=154 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:45:49.353728379Z TELEMETRY tip=27 final=24 stall=3 age_s=233 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:46:19.357378754Z TELEMETRY tip=27 final=24 stall=3 age_s=233 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:46:49.374750671Z TELEMETRY tip=27 final=24 stall=3 age_s=233 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:47:19.390729296Z TELEMETRY tip=28 final=24 stall=4 age_s=310 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:47:49.398463004Z TELEMETRY tip=28 final=24 stall=4 age_s=310 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:48:19.410106254Z TELEMETRY tip=28 final=24 stall=4 age_s=310 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:48:49.413955129Z TELEMETRY tip=29 final=24 stall=5 age_s=389 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:49:19.430174212Z TELEMETRY tip=29 final=24 stall=5 age_s=389 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:49:49.445214921Z TELEMETRY tip=30 final=24 stall=6 age_s=468 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:50:19.445048171Z TELEMETRY tip=30 final=24 stall=6 age_s=468 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:50:49.461631962Z TELEMETRY tip=30 final=24 stall=6 age_s=468 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:51:19.474596087Z TELEMETRY tip=31 final=24 stall=7 age_s=544 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:51:49.487836212Z TELEMETRY tip=31 final=24 stall=7 age_s=544 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:52:19.510394129Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:52:49.528966213Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:53:19.531881296Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:53:49.541325088Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:54:19.545381088Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:54:49.564605588Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:55:19.583656379Z TELEMETRY tip=34 final=32 stall=2 age_s=159 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:55:49.593759796Z TELEMETRY tip=34 final=32 stall=2 age_s=159 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:56:19.598412004Z TELEMETRY tip=35 final=32 stall=3 age_s=236 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:56:49.605741213Z TELEMETRY tip=35 final=32 stall=3 age_s=236 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:57:19.616415129Z TELEMETRY tip=35 final=32 stall=3 age_s=236 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:57:49.632594213Z TELEMETRY tip=36 final=32 stall=4 age_s=314 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:58:19.637428421Z TELEMETRY tip=36 final=32 stall=4 age_s=314 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:58:49.649761921Z TELEMETRY tip=37 final=32 stall=5 age_s=389 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:59:19.661577629Z TELEMETRY tip=37 final=32 stall=5 age_s=389 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:59:49.662409879Z TELEMETRY tip=37 final=32 stall=5 age_s=389 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:00:19.675453504Z TELEMETRY tip=38 final=32 stall=6 age_s=465 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:00:49.698831629Z TELEMETRY tip=38 final=32 stall=6 age_s=465 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:01:19.714368171Z TELEMETRY tip=39 final=32 stall=7 age_s=540 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:01:49.730465504Z TELEMETRY tip=39 final=32 stall=7 age_s=540 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:02:19.752839296Z TELEMETRY tip=39 final=32 stall=7 age_s=540 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:02:49.765416796Z TELEMETRY tip=40 final=40 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=9 rfail=4 fid=238ef8ec5ec2 sslot=40 sid=238ef8ec5ec2
+2026-07-30T02:03:19.780224754Z TELEMETRY tip=40 final=40 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=9 rfail=4 fid=238ef8ec5ec2 sslot=40 sid=238ef8ec5ec2
+2026-07-30T02:03:49.796969838Z TELEMETRY tip=41 final=40 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=9 rfail=4 fid=238ef8ec5ec2 sslot=40 sid=238ef8ec5ec2
+---- C node2 ----
+2026-07-30T01:11:16.317618753Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=2 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=2/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-30T01:11:46.320764003Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=6 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-30T01:12:16.330717378Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=6 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-30T01:12:46.338036919Z TELEMETRY tip=1 final=0 stall=1 age_s=1785373951 diff=256 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:13:16.353300336Z TELEMETRY tip=1 final=0 stall=1 age_s=1785373951 diff=256 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:13:46.360814753Z TELEMETRY tip=1 final=0 stall=1 age_s=1785373951 diff=256 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:14:16.370972086Z TELEMETRY tip=2 final=0 stall=2 age_s=1785374030 diff=42 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:14:46.386418211Z TELEMETRY tip=2 final=0 stall=2 age_s=1785374030 diff=42 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:15:16.400840294Z TELEMETRY tip=3 final=0 stall=3 age_s=1785374106 diff=55 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:15:46.413249336Z TELEMETRY tip=3 final=0 stall=3 age_s=1785374106 diff=55 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:16:16.428729336Z TELEMETRY tip=3 final=0 stall=3 age_s=1785374106 diff=55 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:16:46.431628753Z TELEMETRY tip=4 final=0 stall=4 age_s=1785374181 diff=63 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:17:16.432938253Z TELEMETRY tip=4 final=0 stall=4 age_s=1785374181 diff=63 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:17:46.436424503Z TELEMETRY tip=5 final=0 stall=5 age_s=1785374257 diff=68 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:18:16.449002878Z TELEMETRY tip=5 final=0 stall=5 age_s=1785374257 diff=68 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:18:46.464327045Z TELEMETRY tip=5 final=0 stall=5 age_s=1785374257 diff=68 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:19:16.466733378Z TELEMETRY tip=6 final=0 stall=6 age_s=1785374334 diff=71 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:19:46.466555920Z TELEMETRY tip=6 final=0 stall=6 age_s=1785374334 diff=71 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:20:16.479815170Z TELEMETRY tip=7 final=0 stall=7 age_s=1785374409 diff=73 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:20:46.489975795Z TELEMETRY tip=7 final=0 stall=7 age_s=1785374409 diff=73 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:21:16.493405420Z TELEMETRY tip=7 final=0 stall=7 age_s=1785374409 diff=73 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:21:46.496734586Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=75 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:22:16.508540628Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=75 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:22:46.525561503Z TELEMETRY tip=9 final=8 stall=1 age_s=77 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:23:16.544354711Z TELEMETRY tip=9 final=8 stall=1 age_s=77 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:23:46.546575628Z TELEMETRY tip=9 final=8 stall=1 age_s=77 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:24:16.551802920Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:24:46.567893628Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:25:16.580410378Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:25:46.583899128Z TELEMETRY tip=11 final=8 stall=3 age_s=238 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:26:16.598704336Z TELEMETRY tip=11 final=8 stall=3 age_s=238 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:26:46.604754711Z TELEMETRY tip=12 final=8 stall=4 age_s=315 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:27:16.604631670Z TELEMETRY tip=12 final=8 stall=4 age_s=315 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:27:46.605361586Z TELEMETRY tip=12 final=8 stall=4 age_s=315 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:28:16.617077086Z TELEMETRY tip=13 final=8 stall=5 age_s=390 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:28:46.630447211Z TELEMETRY tip=13 final=8 stall=5 age_s=390 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:29:16.634396170Z TELEMETRY tip=14 final=8 stall=6 age_s=466 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:29:46.634803628Z TELEMETRY tip=14 final=8 stall=6 age_s=466 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:30:16.649701128Z TELEMETRY tip=14 final=8 stall=6 age_s=466 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:30:46.651008545Z TELEMETRY tip=15 final=8 stall=7 age_s=544 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:31:16.669661128Z TELEMETRY tip=15 final=8 stall=7 age_s=544 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:31:46.688522003Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:32:16.692411003Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:32:46.692756336Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:33:16.702031711Z TELEMETRY tip=17 final=16 stall=1 age_s=76 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:33:46.718064753Z TELEMETRY tip=17 final=16 stall=1 age_s=76 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:34:17.081665920Z TELEMETRY tip=18 final=16 stall=2 age_s=151 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:34:47.102237378Z TELEMETRY tip=18 final=16 stall=2 age_s=151 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:35:17.106695670Z TELEMETRY tip=18 final=16 stall=2 age_s=151 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:35:47.119828128Z TELEMETRY tip=19 final=16 stall=3 age_s=227 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:36:17.139782045Z TELEMETRY tip=19 final=16 stall=3 age_s=227 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:36:47.141287836Z TELEMETRY tip=19 final=16 stall=3 age_s=227 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:37:17.157796128Z TELEMETRY tip=20 final=16 stall=4 age_s=302 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:37:47.167388170Z TELEMETRY tip=20 final=16 stall=4 age_s=302 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:38:17.170198086Z TELEMETRY tip=21 final=16 stall=5 age_s=378 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:38:47.174969336Z TELEMETRY tip=21 final=16 stall=5 age_s=378 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:39:17.181329920Z TELEMETRY tip=21 final=16 stall=5 age_s=378 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:39:47.196648961Z TELEMETRY tip=22 final=16 stall=6 age_s=455 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:40:17.206962211Z TELEMETRY tip=22 final=16 stall=6 age_s=455 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:40:47.220182711Z TELEMETRY tip=23 final=16 stall=7 age_s=533 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:41:17.239927295Z TELEMETRY tip=23 final=16 stall=7 age_s=533 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:41:47.262869586Z TELEMETRY tip=23 final=16 stall=7 age_s=533 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:42:17.295029420Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:42:47.309926545Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:43:17.329840670Z TELEMETRY tip=25 final=24 stall=1 age_s=78 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:43:47.336993420Z TELEMETRY tip=25 final=24 stall=1 age_s=78 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:44:17.356928253Z TELEMETRY tip=25 final=24 stall=1 age_s=78 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:44:47.367389670Z TELEMETRY tip=26 final=24 stall=2 age_s=154 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:45:17.370143295Z TELEMETRY tip=26 final=24 stall=2 age_s=154 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:45:49.344749712Z TELEMETRY tip=27 final=24 stall=3 age_s=233 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:46:19.350733629Z TELEMETRY tip=27 final=24 stall=3 age_s=233 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:46:49.361991546Z TELEMETRY tip=27 final=24 stall=3 age_s=233 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:47:19.362360754Z TELEMETRY tip=28 final=24 stall=4 age_s=310 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:47:49.375759254Z TELEMETRY tip=28 final=24 stall=4 age_s=310 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:48:19.395057421Z TELEMETRY tip=28 final=24 stall=4 age_s=310 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:48:49.407009921Z TELEMETRY tip=29 final=24 stall=5 age_s=389 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:49:19.424548671Z TELEMETRY tip=29 final=24 stall=5 age_s=389 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:49:49.441907629Z TELEMETRY tip=30 final=24 stall=6 age_s=468 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:50:19.456462296Z TELEMETRY tip=30 final=24 stall=6 age_s=468 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:50:49.457356254Z TELEMETRY tip=30 final=24 stall=6 age_s=468 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:51:19.462023504Z TELEMETRY tip=31 final=24 stall=7 age_s=544 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:51:49.472355754Z TELEMETRY tip=31 final=24 stall=7 age_s=544 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:52:19.480095046Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:52:49.490495921Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:53:19.509680129Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:53:49.517776629Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:54:19.532638754Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:54:49.554966421Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:55:19.556703046Z TELEMETRY tip=34 final=32 stall=2 age_s=159 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:55:49.581407504Z TELEMETRY tip=34 final=32 stall=2 age_s=159 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:56:19.598713713Z TELEMETRY tip=35 final=32 stall=3 age_s=236 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:56:49.604421004Z TELEMETRY tip=35 final=32 stall=3 age_s=236 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:57:19.611898088Z TELEMETRY tip=35 final=32 stall=3 age_s=236 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:57:49.631689254Z TELEMETRY tip=36 final=32 stall=4 age_s=314 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:58:19.648249504Z TELEMETRY tip=36 final=32 stall=4 age_s=314 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:58:49.660359671Z TELEMETRY tip=37 final=32 stall=5 age_s=389 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:59:19.676017671Z TELEMETRY tip=37 final=32 stall=5 age_s=389 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:59:49.691713046Z TELEMETRY tip=37 final=32 stall=5 age_s=389 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:00:19.702297838Z TELEMETRY tip=38 final=32 stall=6 age_s=465 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:00:49.717141463Z TELEMETRY tip=38 final=32 stall=6 age_s=465 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:01:19.735173796Z TELEMETRY tip=39 final=32 stall=7 age_s=540 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:01:49.741928754Z TELEMETRY tip=39 final=32 stall=7 age_s=540 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:02:19.753975129Z TELEMETRY tip=39 final=32 stall=7 age_s=540 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:02:49.756241713Z TELEMETRY tip=40 final=40 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=9 rfail=4 fid=238ef8ec5ec2 sslot=40 sid=238ef8ec5ec2
+2026-07-30T02:03:19.755942004Z TELEMETRY tip=40 final=40 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=9 rfail=4 fid=238ef8ec5ec2 sslot=40 sid=238ef8ec5ec2
+2026-07-30T02:03:49.761886879Z TELEMETRY tip=41 final=40 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=9 rfail=4 fid=238ef8ec5ec2 sslot=40 sid=238ef8ec5ec2
+---- C node3 ----
+2026-07-30T01:11:16.311041753Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=1 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=1/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-30T01:11:46.324887711Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=6 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-30T01:12:16.333629836Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=6 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=- sslot=- sid=-
+2026-07-30T01:12:46.338149086Z TELEMETRY tip=1 final=0 stall=1 age_s=1785373951 diff=256 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:13:16.343746044Z TELEMETRY tip=1 final=0 stall=1 age_s=1785373951 diff=256 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:13:46.360852669Z TELEMETRY tip=1 final=0 stall=1 age_s=1785373951 diff=256 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:14:16.379937669Z TELEMETRY tip=2 final=0 stall=2 age_s=1785374030 diff=42 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:14:46.397300086Z TELEMETRY tip=2 final=0 stall=2 age_s=1785374030 diff=42 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:15:16.403131336Z TELEMETRY tip=3 final=0 stall=3 age_s=1785374106 diff=55 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:15:46.406666294Z TELEMETRY tip=3 final=0 stall=3 age_s=1785374106 diff=55 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:16:16.415067544Z TELEMETRY tip=3 final=0 stall=3 age_s=1785374106 diff=55 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:16:46.431690878Z TELEMETRY tip=4 final=0 stall=4 age_s=1785374181 diff=63 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:17:16.437575711Z TELEMETRY tip=4 final=0 stall=4 age_s=1785374181 diff=63 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:17:46.450180419Z TELEMETRY tip=5 final=0 stall=5 age_s=1785374257 diff=68 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:18:16.459795336Z TELEMETRY tip=5 final=0 stall=5 age_s=1785374257 diff=68 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:18:46.464826836Z TELEMETRY tip=5 final=0 stall=5 age_s=1785374257 diff=68 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:19:16.470941628Z TELEMETRY tip=6 final=0 stall=6 age_s=1785374334 diff=71 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:19:46.475608170Z TELEMETRY tip=6 final=0 stall=6 age_s=1785374334 diff=71 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:20:16.480596920Z TELEMETRY tip=7 final=0 stall=7 age_s=1785374409 diff=73 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:20:46.493120211Z TELEMETRY tip=7 final=0 stall=7 age_s=1785374409 diff=73 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:21:16.494616795Z TELEMETRY tip=7 final=0 stall=7 age_s=1785374409 diff=73 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=0 rfail=0 fid=9eaaffe872f7 sslot=0 sid=9eaaffe872f7
+2026-07-30T01:21:46.497910503Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=75 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:22:16.517528378Z TELEMETRY tip=8 final=8 stall=0 age_s=0 diff=75 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:22:46.534614086Z TELEMETRY tip=9 final=8 stall=1 age_s=77 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:23:16.539178253Z TELEMETRY tip=9 final=8 stall=1 age_s=77 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:23:46.544000711Z TELEMETRY tip=9 final=8 stall=1 age_s=77 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:24:16.557971211Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:24:46.562771045Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:25:16.571581420Z TELEMETRY tip=10 final=8 stall=2 age_s=155 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:25:46.585425711Z TELEMETRY tip=11 final=8 stall=3 age_s=238 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:26:16.603159128Z TELEMETRY tip=11 final=8 stall=3 age_s=238 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:26:46.615637545Z TELEMETRY tip=12 final=8 stall=4 age_s=315 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:27:16.632046128Z TELEMETRY tip=12 final=8 stall=4 age_s=315 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:27:46.640402545Z TELEMETRY tip=12 final=8 stall=4 age_s=315 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:28:16.649187170Z TELEMETRY tip=13 final=8 stall=5 age_s=390 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:28:46.662911753Z TELEMETRY tip=13 final=8 stall=5 age_s=390 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:29:16.682361545Z TELEMETRY tip=14 final=8 stall=6 age_s=466 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:29:46.698676586Z TELEMETRY tip=14 final=8 stall=6 age_s=466 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:30:16.714830628Z TELEMETRY tip=14 final=8 stall=6 age_s=466 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:30:46.730087711Z TELEMETRY tip=15 final=8 stall=7 age_s=544 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:31:16.749210628Z TELEMETRY tip=15 final=8 stall=7 age_s=544 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=1 rfail=0 fid=c163557e4784 sslot=8 sid=c163557e4784
+2026-07-30T01:31:46.760829128Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:32:16.769079086Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:32:46.772003586Z TELEMETRY tip=16 final=16 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:33:16.781619545Z TELEMETRY tip=17 final=16 stall=1 age_s=76 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:33:46.789095711Z TELEMETRY tip=17 final=16 stall=1 age_s=76 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:34:17.075956170Z TELEMETRY tip=18 final=16 stall=2 age_s=151 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:34:47.078070378Z TELEMETRY tip=18 final=16 stall=2 age_s=151 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:35:17.079942128Z TELEMETRY tip=18 final=16 stall=2 age_s=151 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:35:47.088992170Z TELEMETRY tip=19 final=16 stall=3 age_s=227 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:36:17.106000545Z TELEMETRY tip=19 final=16 stall=3 age_s=227 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:36:47.113836961Z TELEMETRY tip=19 final=16 stall=3 age_s=227 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:37:17.123428836Z TELEMETRY tip=20 final=16 stall=4 age_s=302 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:37:47.133054253Z TELEMETRY tip=20 final=16 stall=4 age_s=302 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:38:17.144516045Z TELEMETRY tip=21 final=16 stall=5 age_s=378 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:38:47.163538795Z TELEMETRY tip=21 final=16 stall=5 age_s=378 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:39:17.175012711Z TELEMETRY tip=21 final=16 stall=5 age_s=378 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:39:47.193145128Z TELEMETRY tip=22 final=16 stall=6 age_s=455 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:40:17.203122170Z TELEMETRY tip=22 final=16 stall=6 age_s=455 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:40:47.220113878Z TELEMETRY tip=23 final=16 stall=7 age_s=533 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:41:17.224545003Z TELEMETRY tip=23 final=16 stall=7 age_s=533 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:41:47.241300045Z TELEMETRY tip=23 final=16 stall=7 age_s=533 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=3 rfail=1 fid=67fc61aefef6 sslot=16 sid=67fc61aefef6
+2026-07-30T01:42:17.282710336Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:42:47.298667753Z TELEMETRY tip=24 final=24 stall=0 age_s=0 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:43:17.305011128Z TELEMETRY tip=25 final=24 stall=1 age_s=78 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:43:47.315905753Z TELEMETRY tip=25 final=24 stall=1 age_s=78 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:44:17.324982836Z TELEMETRY tip=25 final=24 stall=1 age_s=78 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:44:47.325434128Z TELEMETRY tip=26 final=24 stall=2 age_s=154 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:45:17.345937545Z TELEMETRY tip=26 final=24 stall=2 age_s=154 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:45:49.348204671Z TELEMETRY tip=27 final=24 stall=3 age_s=233 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:46:19.355989837Z TELEMETRY tip=27 final=24 stall=3 age_s=233 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:46:49.373312379Z TELEMETRY tip=27 final=24 stall=3 age_s=233 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:47:19.386016962Z TELEMETRY tip=28 final=24 stall=4 age_s=310 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:47:49.407880421Z TELEMETRY tip=28 final=24 stall=4 age_s=310 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:48:19.419484046Z TELEMETRY tip=28 final=24 stall=4 age_s=310 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:48:49.420122129Z TELEMETRY tip=29 final=24 stall=5 age_s=389 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:49:19.434398754Z TELEMETRY tip=29 final=24 stall=5 age_s=389 diff=77 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:49:49.451750879Z TELEMETRY tip=30 final=24 stall=6 age_s=468 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:50:19.457645879Z TELEMETRY tip=30 final=24 stall=6 age_s=468 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:50:49.464271837Z TELEMETRY tip=30 final=24 stall=6 age_s=468 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:51:19.485741421Z TELEMETRY tip=31 final=24 stall=7 age_s=544 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:51:49.500342046Z TELEMETRY tip=31 final=24 stall=7 age_s=544 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=5 rfail=2 fid=aa5e7402cbd3 sslot=24 sid=aa5e7402cbd3
+2026-07-30T01:52:19.520947713Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:52:49.533767046Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:53:19.536753046Z TELEMETRY tip=32 final=32 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:53:49.557886046Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:54:19.566969421Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:54:49.575939921Z TELEMETRY tip=33 final=32 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:55:19.583607088Z TELEMETRY tip=34 final=32 stall=2 age_s=159 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:55:49.586845754Z TELEMETRY tip=34 final=32 stall=2 age_s=159 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:56:19.596751963Z TELEMETRY tip=35 final=32 stall=3 age_s=236 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:56:49.616814088Z TELEMETRY tip=35 final=32 stall=3 age_s=236 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:57:19.615527754Z TELEMETRY tip=35 final=32 stall=3 age_s=236 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:57:49.638312171Z TELEMETRY tip=36 final=32 stall=4 age_s=314 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:58:19.657939046Z TELEMETRY tip=36 final=32 stall=4 age_s=314 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:58:49.658783588Z TELEMETRY tip=37 final=32 stall=5 age_s=389 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:59:19.667282838Z TELEMETRY tip=37 final=32 stall=5 age_s=389 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T01:59:49.687499713Z TELEMETRY tip=37 final=32 stall=5 age_s=389 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:00:19.689893838Z TELEMETRY tip=38 final=32 stall=6 age_s=465 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:00:49.706617213Z TELEMETRY tip=38 final=32 stall=6 age_s=465 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:01:19.709833046Z TELEMETRY tip=39 final=32 stall=7 age_s=540 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:01:49.721135379Z TELEMETRY tip=39 final=32 stall=7 age_s=540 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:02:19.727639379Z TELEMETRY tip=39 final=32 stall=7 age_s=540 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=7 rfail=3 fid=3adcf908c9d4 sslot=32 sid=3adcf908c9d4
+2026-07-30T02:02:49.728348504Z TELEMETRY tip=40 final=40 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=9 rfail=4 fid=238ef8ec5ec2 sslot=40 sid=238ef8ec5ec2
+2026-07-30T02:03:19.739672629Z TELEMETRY tip=40 final=40 stall=0 age_s=0 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=9 rfail=4 fid=238ef8ec5ec2 sslot=40 sid=238ef8ec5ec2
+2026-07-30T02:03:49.757552171Z TELEMETRY tip=41 final=40 stall=1 age_s=76 diff=76 peers=6 mempool=0 epoch=0 regime=Final halt=- hignore=0 powrej=0 dialable=3/3 rounds=9 rfail=4 fid=238ef8ec5ec2 sslot=40 sid=238ef8ec5ec2
