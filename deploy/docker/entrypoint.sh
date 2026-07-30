@@ -174,7 +174,11 @@ EOF
     #     `qumbra-faucet` refuses to start if the two do not match — because a faucet
     #     mining to somebody else's key looks perfectly healthy and is simply never
     #     funded, for as long as it runs.
-    rkm_line="$(qumbra-faucet address --config "$svc_cfg" | head -1)"
+    # `grep`, not `head -1`: `address` prints the rkm line AND the receive address,
+    # and `head` closes the pipe after the first line, which makes the second
+    # `println!` fail with EPIPE and panic (Rust does not ignore SIGPIPE). grep reads
+    # to EOF, so the writer never sees a closed pipe. Observed on the first run.
+    rkm_line="$(qumbra-faucet address --config "$svc_cfg" | grep '^miner_rkm')"
     echo "faucet: $rkm_line"
 
     # (4) The KEYLESS node config. Note `committee_key_paths` is absent (i.e. empty).

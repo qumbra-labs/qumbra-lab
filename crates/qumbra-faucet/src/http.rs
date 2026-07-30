@@ -265,11 +265,18 @@ impl FaucetServer {
 
                 // The access journal. Subnet, not client IP; no body, no ticket, and
                 // no address — see the module docs.
+                let line = format!(
+                    "FAUCET {method} {path} {status_code} subnet={}",
+                    subnet_label(&client)
+                );
+                // Both, and the same string: an access log an operator cannot read is
+                // not an access log, and a redaction asserted against an in-memory
+                // copy that differs from what stdout gets is not a redaction. The
+                // test reads `journal()`; the operator reads stdout; they are one
+                // `format!`.
+                println!("{line}");
                 if let Ok(mut j) = worker_journal.lock() {
-                    j.push(format!(
-                        "FAUCET {method} {path} {status_code} subnet={}",
-                        subnet_label(&client)
-                    ));
+                    j.push(line);
                 }
 
                 let mut response = tiny_http::Response::from_string(body)
