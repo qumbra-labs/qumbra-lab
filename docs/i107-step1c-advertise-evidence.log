@@ -177,6 +177,18 @@ node3 ip=172.26.0.3 established=6 self_loop_sockets=0
 # not running. The re-run (attempt 2, 01:11Z) was wrapped in `caffeinate -dimsu`.
 # Raw logs for the discarded attempt were kept off-repo; the gap table above is the whole of it.
 
+############ REBASED-TREE SMOKE TEST (not the measurement) ############
+# The 51/53-minute measurement above was taken on 396c018 + the step-1c commit, i.e.
+# BEFORE PR #118 (step 1b netem) and PR #119 (#117 opview) landed on main. The branch
+# was then rebased onto 7c7c33d and the harness re-exercised, but NOT re-measured:
+#   * QUMBRA_ADVERTISE_ADDR=none soak.sh rehearsal -> genesis == pinned, advertise-show
+#     asserts 'none' on all four
+#   * QUMBRA_ADVERTISE_ADDR=nope -> "run: QUMBRA_ADVERTISE_ADDR must be 'auto' or
+#     'none', got 'nope'" and the node refuses to start
+#   * soak.sh netem-show (step 1b's command) still works on the merged tree
+#   * the self-connection reproduces on the rebased build: see the census entry
+#     stamped c95c9e4 above (established=8, self_loop_sockets=2 on every node)
+
 ############ TELEMETRY, condition T (docker capture stamps, every line) ############
 ---- T node0 ----
 2026-07-29T23:28:10.951806502Z TELEMETRY tip=0 final=- stall=0 age_s=- diff=256 peers=1 mempool=0 epoch=0 regime=Degraded halt=- hignore=0 powrej=0 dialable=1/3 rounds=0 rfail=0 fid=- sslot=- sid=-
