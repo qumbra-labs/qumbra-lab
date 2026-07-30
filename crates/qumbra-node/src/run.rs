@@ -450,6 +450,41 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         &self.p2p
     }
 
+    /// Read-only access to the node's consensus state — the chain store, the
+    /// depth-32 commitment tree and the nullifier set.
+    ///
+    /// Added for the in-process faucet (issue #123): a wallet composed into this
+    /// process needs the live tree to cut membership witnesses against, and the
+    /// live anchor set to bind a proof to. It is `&`, never `&mut`: a co-resident
+    /// wallet **reads** consensus state and writes only by submitting a
+    /// transaction ([`Self::submit_local_tx`]), which is the same one-way arrow
+    /// `qumbra-opview` has over the telemetry wire.
+    pub fn state(&self) -> &qlab_node::MemNode {
+        self.p2p.node().state()
+    }
+
+    /// Submit a **locally-originated** transaction: admit it to this node's own
+    /// mempool and gossip it to peers. Returns whether the node admitted it.
+    ///
+    /// Added for the in-process faucet (issue #123), and deliberately the *only*
+    /// write a co-resident process gets. This is `P2pNode::announce_tx` — the
+    /// pre-existing local-origination path a mining node already uses — so it adds
+    /// **no network write surface**: nothing new listens, no wire codepoint
+    /// changes, and a peer cannot reach it. A faucet running in this process
+    /// submits exactly as a wallet on the same host would if the node had a
+    /// wallet-facing RPC, which it does not and which this does not add.
+    ///
+    /// Honest limitation: `announce_tx` returns nothing, so the reason for a
+    /// refusal is not recoverable here — only whether the transaction is in the
+    /// pool afterwards. Callers that need a reason must pre-check what they can
+    /// (`GrantPlan::is_submittable` re-checks the anchor) and treat `false` as
+    /// "the node did not take it".
+    pub fn submit_local_tx(&mut self, tx: TxEntry) -> bool {
+        let id = qlab_p2p::codec::tx_id(&tx);
+        self.p2p.announce_tx(tx);
+        qlab_p2p::n1::TxPool::has_tx(self.p2p.node(), &id)
+    }
+
     /// Tip height reported by the consensus chain view.
     pub fn tip_height(&self) -> u64 {
         self.p2p.node().tip_height()
@@ -1023,6 +1058,30 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// checkpoints, until `shutdown` is set. On exit performs the graceful-shutdown
     /// **snapshot flush** (item 1).
     pub fn run_until(&mut self, shutdown: &AtomicBool) {
+        self.run_until_with(shutdown, |_| {})
+    }
+
+    /// [`Self::run_until`] with a per-iteration hook — the seam a co-resident
+    /// process uses to do its own work on this node's loop instead of on a thread
+    /// of its own (issue #123, the in-process faucet).
+    ///
+    /// `on_tick` runs **once per loop iteration, after** the node's own work for
+    /// that iteration (transport pump, regime accounting, mining, snapshot
+    /// refreshes) and **before** the idle sleep. Consequences worth stating rather
+    /// than discovering:
+    ///
+    /// - It runs on the consensus loop's thread, so whatever it costs, the loop
+    ///   pays. A hook that blocks for seconds delays mining and the transport pump
+    ///   by that long. The faucet's hook does exactly that once per grant (a
+    ///   measured ~2.3 s STARK), which is affordable against a 75 s block time and
+    ///   is the reason it is a hook rather than a thread: a second thread would
+    ///   need `&mut` node state concurrently with the loop, and the honest way to
+    ///   share `&mut` is not to.
+    /// - It cannot make the loop exit; only `shutdown` does.
+    ///
+    /// [`Self::run_until`] is this with a no-op hook, so an ordinary node run is
+    /// byte-for-byte the behaviour it was.
+    pub fn run_until_with<F: FnMut(&mut Self)>(&mut self, shutdown: &AtomicBool, mut on_tick: F) {
         // An initial sample at startup (height/finality as opened from disk).
         println!("{}", self.telemetry_sample());
         self.last_sample = Instant::now();
@@ -1065,6 +1124,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 self.maintain_peers(); // re-dial, auto-connect, ask for addresses (#83)
                 self.last_maintain = Instant::now();
             }
+            // The co-resident hook (#123), last so it observes this iteration's
+            // state rather than the previous one's.
+            on_tick(self);
             if n == 0 {
                 std::thread::sleep(Duration::from_millis(20));
             }
