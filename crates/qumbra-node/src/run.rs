@@ -602,8 +602,25 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // the `ROUND` journal carries the detail, this carries the alarm.
         // Caliper: both are cumulative since PROCESS START, over rounds this node
         // closed; a restart resets them.
+        //
+        // Issue #105 narrowed WHAT they count, and nothing else — the names, the
+        // positions and the arithmetic are untouched. They now cover **live rounds
+        // only**: slots within one cadence of this node's own tip when it first
+        // learned of them, plus any round that finalized here. A node that resyncs
+        // 3,597 blocks crosses ~450 cadence slots the network settled hours before
+        // it arrived; those are `backfill`, they are still journalled, and they are
+        // counted in `rback=` below instead. Before this, they were `rfail`, and a
+        // healthy node read `rounds=1316 rfail=1315` — an alarm at 99.9 % on a node
+        // whose `final=` matched its three peers is an alarm nobody will ever read
+        // again.
+        //
+        // `rback=` is appended at the end, under the #87/#84 rule. It exists so the
+        // narrowing is not indistinguishable from deleting the counter on the line
+        // an operator actually reads: the history a node walked through is a real
+        // fact (it is the #104/#106 restart signature), it is just not a failure.
         let rounds_closed = node.rounds().closed_total();
         let rounds_failed = node.rounds().failed_total();
+        let rounds_backfill = node.rounds().backfill_total();
         // Issue #84: `fid` / `sslot` / `sid` are **appended at the end**, and every
         // pre-existing field keeps its name, position and meaning (the #87 rule,
         // unchanged). They are the pair the drills need:
@@ -625,7 +642,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // The three renderings live on `Telemetry` since #117, so the log line and
         // any reader of the wire cannot disagree about what `-` or `split` means.
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -634,6 +651,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             t.fid_field(),
             t.sslot_field(),
             t.sid_field(),
+            rounds_backfill,
         )
     }
 
@@ -775,6 +793,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// Without this, a slot that nobody proposed — or whose proposal never reached
     /// us — would leave no trace, and "no trace" is indistinguishable from "nothing
     /// happened". That indistinguishability is the 42 h silence.
+    ///
+    /// **This is also where a resync used to manufacture 1,315 failed rounds**
+    /// (issue #105). The cursor is unchanged and still crosses every slot — the
+    /// trace stays — but the ledger now reads `ctx.tip` alongside the roster and
+    /// records whether this node reached each slot as a round or as history. On a
+    /// resync the tip has already jumped hundreds of blocks by the time this runs,
+    /// so all but the slot at the very edge of the jump are `backfill`.
     pub fn note_slots_reached(&mut self) {
         let tip = self.p2p.node().tip_height();
         while self.next_round_slot <= tip {

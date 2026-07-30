@@ -443,7 +443,11 @@ pub fn render(m: &Metrics, g: &LiveGauges) -> String {
     o.push_str(
         "# HELP qumbra_checkpoint_rounds_total Checkpoint rounds CLOSED since process start, by verdict. \
 A round is one cadence slot; it closes when it finalizes, when a later slot finalizes past it (superseded), \
-or when the open-round cap evicts it.\n\
+or when the open-round cap evicts it. CALIPER (issue #105): verdict=\"backfill\" is a slot this node reached \
+as HISTORY — more than one cadence away from its own tip when it first learned of the slot, e.g. every slot \
+crossed during a resync — and it is NOT a failed round: nothing failed, the node was not there. The \
+TELEMETRY line's rounds=/rfail= pair EXCLUDES backfill and counts live rounds only, so sum every verdict \
+here and you get rounds= + backfill, not rounds=.\n\
 # TYPE qumbra_checkpoint_rounds_total counter\n",
     );
     for (label, c) in &m.rounds_total {
@@ -920,7 +924,7 @@ mod tests {
     #[test]
     fn closed_round_folds_into_verdict_and_member_counters() {
         let mut l = RoundLedger::new(ObsClock::Deterministic);
-        let c = SlotContext { height: 8, epoch: 1, roster: 21, active: 21, need: 15 };
+        let c = SlotContext { height: 8, epoch: 1, roster: 21, active: 21, need: 15, tip: 8 };
         l.note_votes(&c, &(0..11).collect::<Vec<_>>(), &[], VoteRejects::default(), 1);
         l.note_finalized(16); // slot 8 superseded, unfinalized
 

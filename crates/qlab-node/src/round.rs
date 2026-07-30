@@ -42,6 +42,41 @@
 //!   *this* node before the round closed". It is not proof the member was down.
 //! * Counters and timings are **since process start**; a restart resets them, which
 //!   is deliberate (this project counts restarts).
+//! * [`RoundLedger::closed_total`] / [`RoundLedger::failed_total`] — the `rounds=` /
+//!   `rfail=` pair on the `TELEMETRY` line — count **live rounds only** (issue #105).
+//!   A slot this node reached long after the chain had passed it is a
+//!   [`RoundDiagnosis::Backfill`] round: journalled like any other, counted in
+//!   [`RoundLedger::backfill_total`], and **absent from both alarm counters**. See
+//!   [`RoundLedger::is_live_slot`] for the exact predicate.
+//!
+//! ## Live vs. backfill (issue #105), and why the test is the slot's distance to our tip
+//!
+//! A healthy node reported `rounds=1316 rfail=1315` while its finalized checkpoint
+//! matched its three peers. Nothing was lying: during a 3,597-block resync the slot
+//! cursor opened a round for every cadence slot it crossed, including thousands the
+//! network had settled hours earlier, and each closed with no votes. **An alarm that
+//! reads 99.9 % on a healthy node has been switched off by its own value.**
+//!
+//! The fix has to name what those rounds were not, and it must do so from a fact the
+//! node cannot be wrong about:
+//!
+//! * *Not* "the node was syncing" — the sync phase is entered because **a peer claims
+//!   to be taller**, so a peer advertising an absurd height would hold `rfail` off
+//!   forever. An alarm with a remote off-switch is worse than the defect.
+//! * *Not* "the slot is at or below the finalized head" — [`FinalityTracker`] is
+//!   rebuilt empty at every process start (it is process state, not chain state) and
+//!   the vote tally refuses every ahead-of-tip vote set until the tip arrives, so the
+//!   finalized head is `None` for the **whole** of a catch-up. The floor is not there
+//!   to gate on.
+//!
+//! What is always there is this node's own tip. A slot the node crossed while its own
+//! chain had already run a full cadence past it was history when it got there: the
+//! next round had opened before this one could be voted in, at this node, on this
+//! node's own evidence. That is the test, and it is symmetric — a slot more than one
+//! cadence *above* our tip is a slot we are too far behind to participate in, and it
+//! is the same bound the tally already applies (`TALLY_TIP_SLACK`) one layer down.
+//!
+//! [`FinalityTracker`]: qlab_devnet::finality::FinalityTracker
 //!
 //! Nothing here touches consensus: the ledger observes, it never gates. The quorum
 //! rule, the roster, the tombstone filter and `try_finalize` are all unchanged and
@@ -89,6 +124,23 @@ pub const OVERDUE_REPEAT_MS: u64 = 600_000;
 /// 600 s round period (cadence 8 × 75 s), which puts it comfortably clear of both
 /// "still in flight" and "stopped long ago". **Devnet-grade, tunable, NOT frozen.**
 pub const STILL_ARRIVING_MS: u64 = 60_000;
+
+/// How far a checkpoint slot may sit from **this node's own tip**, in either
+/// direction, and still be a round this node was a participant in (issue #105).
+///
+/// One checkpoint cadence, and the value is not a free parameter in either
+/// direction:
+/// * **below** the tip — a slot the chain has already run a full cadence past is a
+///   slot whose *successor* round had opened before this node arrived; there was
+///   never a moment at which this node could have voted in it;
+/// * **above** the tip — this is exactly [`qlab_devnet::tally::TALLY_TIP_SLACK`],
+///   the window the vote tally itself admits. A vote set the tally refuses can
+///   never grow a round, so opening one for it and then reporting that it failed
+///   counts our own distance from the chain as a committee fault.
+///
+/// **Devnet-grade, tunable, NOT frozen** — it is derived from the cadence, so it
+/// moves with it.
+pub const LIVE_SLOT_SLACK: u64 = qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
 
 /// The clock backing round timings.
 ///
@@ -184,6 +236,17 @@ impl RoundClose {
 pub enum RoundDiagnosis {
     /// Reached quorum and finalized.
     Finalized,
+    /// **This node reached the slot as history, not as a round** (issue #105): its
+    /// own tip was already more than one cadence away when it first learned of the
+    /// slot, so there was no moment at which it could have participated. Recorded
+    /// and journalled like any other round; **never counted as a failure**, because
+    /// nothing failed — the node simply was not there.
+    ///
+    /// This is also the answer to "is `silent` the right word during catch-up?".
+    /// It is not: `have == 0` on a slot the network settled hours ago is the
+    /// *expected* reading, and calling it silence puts a diagnosis on a
+    /// non-event.
+    Backfill,
     /// Fewer active members than the quorum needs: the round **could not** have
     /// finalized however well the network behaved. Points at the roster
     /// (tombstones/jails/epoch), not at latency.
@@ -212,6 +275,7 @@ impl RoundDiagnosis {
     pub fn as_str(&self) -> &'static str {
         match self {
             RoundDiagnosis::Finalized => "finalized",
+            RoundDiagnosis::Backfill => "backfill",
             RoundDiagnosis::QuorumImpossible => "quorum_impossible",
             RoundDiagnosis::Silent => "silent",
             RoundDiagnosis::VotesShort => "votes_short",
@@ -225,14 +289,22 @@ impl RoundDiagnosis {
     /// (a counter that only appears after the first failure is a counter an alert
     /// cannot be written against). [`RoundDiagnosis::Open`] is deliberately absent:
     /// it is not an outcome and must never be counted as one.
-    pub const ALL: [RoundDiagnosis; 6] = [
+    pub const ALL: [RoundDiagnosis; 7] = [
         RoundDiagnosis::Finalized,
+        RoundDiagnosis::Backfill,
         RoundDiagnosis::QuorumImpossible,
         RoundDiagnosis::Silent,
         RoundDiagnosis::VotesShort,
         RoundDiagnosis::Timeout,
         RoundDiagnosis::Unclassified,
     ];
+
+    /// Whether this verdict counts toward the `rounds=` / `rfail=` alarm pair
+    /// (issue #105). [`RoundDiagnosis::Backfill`] is the one closed verdict that
+    /// does not: it is history this node walked through, not a round it lost.
+    pub fn counts_as_a_round(&self) -> bool {
+        !matches!(self, RoundDiagnosis::Backfill | RoundDiagnosis::Open)
+    }
 }
 
 /// One checkpoint round, from the first thing this node learned about the slot to
@@ -277,6 +349,15 @@ pub struct RoundRecord {
     pub local_cpid: Option<u64>,
     /// Whether this node proposed this slot.
     pub proposed_locally: bool,
+    /// **Whether this node was a participant in this round** (issue #105), decided
+    /// once, when the round was opened, by [`RoundLedger::is_live_slot`] against the
+    /// node's own tip at that instant. `false` = the slot was already history to us.
+    ///
+    /// Fixed at open on purpose. Re-deciding it at close would silence the exact
+    /// alarm this counter exists for: during a committee outage the node keeps
+    /// mining, so its tip runs a long way past a round it genuinely lost, and a
+    /// close-time test would call that backfill too.
+    pub live: bool,
     /// Votes that reached the node and could not count.
     pub rejects: VoteRejects,
     /// Absolute wall-clock ms when this node opened the round (`None` under
@@ -295,7 +376,15 @@ pub struct RoundRecord {
 }
 
 impl RoundRecord {
-    fn new(height: u64, epoch: u64, roster: usize, active: usize, need: usize, now: Option<u64>) -> Self {
+    fn new(
+        height: u64,
+        epoch: u64,
+        roster: usize,
+        active: usize,
+        need: usize,
+        live: bool,
+        now: Option<u64>,
+    ) -> Self {
         Self {
             height,
             epoch,
@@ -309,6 +398,7 @@ impl RoundRecord {
             local_votes: 0,
             local_cpid: None,
             proposed_locally: false,
+            live,
             rejects: VoteRejects::default(),
             opened_at_ms: now,
             first_ms: None,
@@ -336,16 +426,22 @@ impl RoundRecord {
     /// **The verdict.** The ladder, in order:
     ///
     /// 1. closed as finalized ⇒ [`RoundDiagnosis::Finalized`];
-    /// 2. `active < need` ⇒ [`RoundDiagnosis::QuorumImpossible`] (the roster could
+    /// 2. opened as history (`live == false`) ⇒ [`RoundDiagnosis::Backfill`] — the
+    ///    node was not a participant, so no cause below applies to it (issue #105);
+    /// 3. `active < need` ⇒ [`RoundDiagnosis::QuorumImpossible`] (the roster could
     ///    not have produced a quorum, so latency is not the story);
-    /// 3. `have == 0` ⇒ [`RoundDiagnosis::Silent`] (nothing reached us at all);
-    /// 4. with timing: last new vote within [`STILL_ARRIVING_MS`] of the close ⇒
+    /// 4. `have == 0` ⇒ [`RoundDiagnosis::Silent`] (nothing reached us at all);
+    /// 5. with timing: last new vote within [`STILL_ARRIVING_MS`] of the close ⇒
     ///    [`RoundDiagnosis::Timeout`], else [`RoundDiagnosis::VotesShort`];
-    /// 5. without timing ⇒ [`RoundDiagnosis::Unclassified`].
+    /// 6. without timing ⇒ [`RoundDiagnosis::Unclassified`].
     ///
-    /// Step 4 is the discriminant issue #87 asks for, and it is decidable **from the
+    /// Step 5 is the discriminant issue #87 asks for, and it is decidable **from the
     /// recorded fields alone** — `closed_ms`, `last_ms`, `have`, `need`, `active` —
     /// which is the property the round journal exists to have.
+    ///
+    /// Step 2 sits *below* `Finalized` and not above it: a backfilled slot that
+    /// nevertheless reached quorum here did happen as a round, and saying otherwise
+    /// would hide a success rather than a failure.
     pub fn diagnose(&self) -> RoundDiagnosis {
         if self.close.is_none() {
             // Still open: the counts are real, the outcome is not yet decided, and
@@ -354,6 +450,9 @@ impl RoundRecord {
         }
         if self.close == Some(RoundClose::Finalized) {
             return RoundDiagnosis::Finalized;
+        }
+        if !self.live {
+            return RoundDiagnosis::Backfill;
         }
         if self.active < self.need {
             return RoundDiagnosis::QuorumImpossible;
@@ -447,6 +546,11 @@ pub struct SlotContext {
     pub active: usize,
     /// Quorum threshold at that height.
     pub need: usize,
+    /// **This node's own tip height when the observation was made** (issue #105).
+    /// Read from the local chain by the caller, like every other field here — it is
+    /// what decides whether a slot is a live round or history walked through, and it
+    /// is deliberately our own number rather than a peer's claim about theirs.
+    pub tip: u64,
 }
 
 /// What one ingested vote-set message added to a round.
@@ -476,8 +580,15 @@ pub struct RoundLedger {
     /// height → (vote count, instant) at that round's last still-open report, so a
     /// stuck round says so once and then stops repeating itself.
     reported: BTreeMap<u64, (usize, Option<u64>)>,
+    /// The highest slot this node has finalized, once it has finalized anything.
+    /// A slot at or below it is settled and can never open another round — without
+    /// this, a re-gossiped vote set for a finalized slot re-opens the record that
+    /// already closed, and the open-round cap then closes it a second time as a
+    /// failure. Nothing else in the ledger remembers what has already closed.
+    finalized_floor: Option<u64>,
     closed_total: u64,
     failed_total: u64,
+    backfill_total: u64,
 }
 
 impl Default for RoundLedger {
@@ -495,8 +606,10 @@ impl RoundLedger {
             emit: VecDeque::new(),
             recent: VecDeque::new(),
             reported: BTreeMap::new(),
+            finalized_floor: None,
             closed_total: 0,
             failed_total: 0,
+            backfill_total: 0,
         }
     }
 
@@ -530,10 +643,28 @@ impl RoundLedger {
         height != 0
     }
 
+    /// **Was this node a participant in `height`'s round, or did it arrive as a
+    /// tourist?** (issue #105) — decided from the slot's distance to this node's own
+    /// tip, in either direction, against [`LIVE_SLOT_SLACK`].
+    ///
+    /// This is the whole classification, and it is deliberately a fact about the
+    /// chain rather than a mode the node believes itself to be in. See the module
+    /// docs for why neither the sync phase nor the finalized head can carry it.
+    pub fn is_live_slot(height: u64, tip: u64) -> bool {
+        height.saturating_add(LIVE_SLOT_SLACK) > tip
+            && height <= tip.saturating_add(LIVE_SLOT_SLACK)
+    }
+
+    /// Whether `height` is settled — at or below this node's finalized head, so no
+    /// round for it can still be running.
+    fn settled(&self, height: u64) -> bool {
+        self.finalized_floor.is_some_and(|f| height <= f)
+    }
+
     /// Open the record for `ctx.height` if this node has not seen the slot yet.
     /// Returns nothing — it is the entry point every other method funnels through.
     fn ensure_open(&mut self, ctx: &SlotContext) {
-        if !Self::tracked(ctx.height) {
+        if !Self::tracked(ctx.height) || self.settled(ctx.height) {
             return;
         }
         if self.open.contains_key(&ctx.height) {
@@ -549,9 +680,15 @@ impl RoundLedger {
             return;
         }
         let now = self.now();
+        // Issue #105: the live/backfill verdict is taken HERE, from the tip this
+        // node held at the moment it first learned of the slot, and never revisited.
+        // A later refresh knows a different tip and would answer a different
+        // question ("is it still live?"), which is not the one that decides whether
+        // this node was ever a participant.
+        let live = Self::is_live_slot(ctx.height, ctx.tip);
         self.open.insert(
             ctx.height,
-            RoundRecord::new(ctx.height, ctx.epoch, ctx.roster, ctx.active, ctx.need, now),
+            RoundRecord::new(ctx.height, ctx.epoch, ctx.roster, ctx.active, ctx.need, live, now),
         );
         self.enforce_open_cap(ctx.height);
     }
@@ -684,6 +821,10 @@ impl RoundLedger {
         if self.open.contains_key(&height) {
             self.close(height, RoundClose::Finalized);
         }
+        // Everything at or below the new head is settled: no later observation may
+        // re-open a round for it (issue #105 — this is candidate B, kept for the one
+        // thing it does buy, which is not the resync case).
+        self.finalized_floor = Some(self.finalized_floor.map_or(height, |f| f.max(height)));
     }
 
     fn close(&mut self, height: u64, how: RoundClose) {
@@ -693,9 +834,17 @@ impl RoundLedger {
         };
         rec.closed_ms = Self::offset(&rec, now);
         rec.close = Some(how);
-        self.closed_total += 1;
-        if how != RoundClose::Finalized {
-            self.failed_total += 1;
+        // Issue #105: only a round this node was a participant in reaches the alarm
+        // pair. A round that FINALIZED counts however it was classified at open —
+        // it demonstrably happened here, and hiding a success is the one direction
+        // this filter must never move in.
+        if rec.diagnose().counts_as_a_round() {
+            self.closed_total += 1;
+            if how != RoundClose::Finalized {
+                self.failed_total += 1;
+            }
+        } else {
+            self.backfill_total += 1;
         }
         self.reported.remove(&height);
         self.emit.push_back(rec.clone());
@@ -769,15 +918,35 @@ impl RoundLedger {
         self.open.len()
     }
 
-    /// Rounds closed since process start.
+    /// **Live** rounds closed since process start (`rounds=`).
+    ///
+    /// Caliper (issue #105): rounds this node was a participant in — slot within
+    /// [`LIVE_SLOT_SLACK`] of its own tip when it first learned of the slot — plus
+    /// any round that finalized here regardless. Slots crossed as history are in
+    /// [`Self::backfill_total`] instead, so this is a denominator an operator can
+    /// divide by.
     pub fn closed_total(&self) -> u64 {
         self.closed_total
     }
 
-    /// Rounds closed **without** finalizing since process start — the number that
-    /// makes a stall visible to a consumer that only reads the `TELEMETRY` line.
+    /// **Live** rounds closed **without** finalizing since process start (`rfail=`)
+    /// — the number that makes a stall visible to a consumer that only reads the
+    /// `TELEMETRY` line, and the one issue #105 exists to make readable again.
+    ///
+    /// Caliper: the same population as [`Self::closed_total`]. A resync, a restart,
+    /// or any other path that walks the node through slots the chain had already
+    /// passed adds **nothing** here; a live round that timed out, fell short of
+    /// quorum, or heard nothing at all still adds one.
     pub fn failed_total(&self) -> u64 {
         self.failed_total
+    }
+
+    /// Slots closed that this node reached as **history** (issue #105) — journalled,
+    /// never counted as rounds and never as failures. A large value beside a small
+    /// `rfail` is the signature of a node that restarted and caught up, which is a
+    /// fact worth having and not an alarm.
+    pub fn backfill_total(&self) -> u64 {
+        self.backfill_total
     }
 }
 
@@ -785,14 +954,30 @@ impl RoundLedger {
 mod tests {
     use super::*;
 
+    /// A slot this node reached **as the chain's frontier** — `tip == height`, which
+    /// is what ordinary operation looks like (the tip advances one block at a time,
+    /// so it is exactly on the slot when the cursor crosses it). Every pre-#105 test
+    /// means this, so it stays the default.
     fn ctx(height: u64, roster: usize, active: usize, need: usize) -> SlotContext {
-        SlotContext { height, epoch: 1, roster, active, need }
+        ctx_at_tip(height, height, roster, active, need)
+    }
+
+    /// A slot observed while this node's own tip was at `tip` — the shape a resync
+    /// makes, where the tip has already jumped far past the slot being opened.
+    fn ctx_at_tip(
+        height: u64,
+        tip: u64,
+        roster: usize,
+        active: usize,
+        need: usize,
+    ) -> SlotContext {
+        SlotContext { height, epoch: 1, roster, active, need, tip }
     }
 
     /// A record built by hand at a chosen instant — the classifier tests need
     /// synthetic times, which is exactly why the ledger takes its clock as a seam.
     fn rec_at(have: usize, need: usize, active: usize, last: u64, closed: u64) -> RoundRecord {
-        let mut r = RoundRecord::new(8, 1, 21, active, need, Some(0));
+        let mut r = RoundRecord::new(8, 1, 21, active, need, true, Some(0));
         r.voted = (0..have).collect();
         r.first_ms = Some(0);
         r.last_ms = Some(last);
@@ -1015,7 +1200,8 @@ mod tests {
     #[test]
     fn open_is_not_a_closed_verdict() {
         assert!(!RoundDiagnosis::ALL.contains(&RoundDiagnosis::Open));
-        assert_eq!(RoundDiagnosis::ALL.len(), 6);
+        assert_eq!(RoundDiagnosis::ALL.len(), 7);
+        assert!(!RoundDiagnosis::Open.counts_as_a_round());
     }
 
     /// **The write-volume caliper, machine-checked.** The always-on decision rests on
@@ -1025,7 +1211,7 @@ mod tests {
     #[test]
     fn journal_line_stays_within_the_quoted_budget() {
         const BUDGET_BYTES: usize = 400;
-        let mut r = RoundRecord::new(1_384, 12, 21, 21, 15, Some(1_769_000_000_000));
+        let mut r = RoundRecord::new(1_384, 12, 21, 21, 15, true, Some(1_769_000_000_000));
         r.voted = (0..11).collect();
         r.excluded = vec![19, 20];
         r.variants = 2;
@@ -1058,7 +1244,7 @@ mod tests {
     /// logs, and a reader that counts fields must not be shifted under.
     #[test]
     fn round_line_gains_cpid_at_the_end_and_nowhere_else() {
-        let mut r = RoundRecord::new(3_776, 12, 21, 21, 15, None);
+        let mut r = RoundRecord::new(3_776, 12, 21, 21, 15, true, None);
         r.voted = (0..16).collect();
         r.close = Some(RoundClose::Finalized);
         let line = r.to_line();

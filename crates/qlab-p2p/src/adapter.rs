@@ -386,6 +386,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// for that height (never re-derived here): roster size, active members, and the
     /// quorum threshold in force. This is what makes a round record answerable —
     /// `have=11 need=15 active=21` is a diagnosis, `have=11` alone is not.
+    ///
+    /// Carries this node's own tip height too (issue #105): the ledger decides
+    /// whether a slot is a live round or history this node walked through from the
+    /// slot's distance to that tip, and reading it here — beside the roster, from
+    /// the same local state, at the same instant — is what keeps that judgement a
+    /// measurement rather than a mode the node believes itself to be in.
     pub fn slot_context(&self, height: u64) -> SlotContext {
         let cstate = self.committee.state_for_height(height);
         SlotContext {
@@ -394,6 +400,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             roster: cstate.size(),
             active: cstate.active_count(height),
             need: cstate.quorum_threshold(),
+            tip: self.chain.tip_height(),
         }
     }
 
