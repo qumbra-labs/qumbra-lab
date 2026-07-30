@@ -43,8 +43,9 @@ qlab-faucet = { path = "../qlab-faucet" }
 qumbra-node = { path = "../qumbra-node" }
 # Live consensus state: the commitment tree witnesses are cut from, the anchor set,
 # and `coinbase_note` — how the faucet re-derives the notes its own node mined
-# (issue #101). Also `COINBASE_MATURITY_BLOCKS`, the frozen §2 gate this binary
-# honours at the funding boundary.
+# (issue #101). Also `coinbase_leaf_appears_at`, the frozen §2 append schedule this
+# binary reads to decide when a mined note is worth proving against (issue #102 moved
+# enforcement into the tree; this crate no longer imposes the rule, only reports it).
 qlab-node = { path = "../qlab-node" }
 # The faucet's spending key (HD account, never rendered) and `Address` decode for
 # the recipient a browser submits.

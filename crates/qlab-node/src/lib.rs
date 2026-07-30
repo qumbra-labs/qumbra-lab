@@ -57,8 +57,9 @@ pub mod supply;
 pub mod telemetry;
 
 pub use coinbase::{
-    coinbase_note, coinbase_note_leaf, coinbase_note_value, coinbase_rho, coinbase_rseed,
-    COINBASE_RHO_DOMAIN, COINBASE_RSEED_DOMAIN,
+    coinbase_leaf_appears_at, coinbase_maturity, coinbase_note, coinbase_note_leaf,
+    coinbase_note_value, coinbase_rho, coinbase_rseed, matured_coinbase_leaf,
+    matures_coinbase_minted_at, CoinbaseMaturity, COINBASE_RHO_DOMAIN, COINBASE_RSEED_DOMAIN,
 };
 pub use emission::{coinbase, s_atomic, RewardSplit, COINBASE_MATURITY_BLOCKS};
 pub use mempool::{

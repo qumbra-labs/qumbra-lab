@@ -54,8 +54,8 @@ fn admitted_txs_assemble_into_a_block_the_node_accepts() {
     let mut mp = Mempool::default();
 
     // Admit two txs against the real node state (anchor = finalized genesis root).
-    mp.admit(tx(g_root, 1), vec![], &node, &MockVerifier).expect("admit 1");
-    mp.admit(tx(g_root, 2), vec![], &node, &MockVerifier).expect("admit 2");
+    mp.admit(tx(g_root, 1), &node, &MockVerifier).expect("admit 1");
+    mp.admit(tx(g_root, 2), &node, &MockVerifier).expect("admit 2");
     assert_eq!(mp.len(), 2);
 
     // Genesis has no block-weight history ⇒ effective median = the 10 MB floor,
@@ -75,20 +75,34 @@ fn admitted_txs_assemble_into_a_block_the_node_accepts() {
     let header = BlockHeader::child_of(&g_header, 1, GENESIS_DIFFICULTY, template.body.commitment());
     let hash = node.apply_block(header, template.body.clone(), &MockVerifier).expect("node accepts");
     assert_eq!(node.tip_hash(), hash);
+    // Issue #102 changed this count from 3 to 2, and the missing one is the point.
+    // Before, a block appended its own coinbase-note leaf immediately (issue #101).
+    // Now the leaf is appended 144 blocks later, so a block at height 1 contributes
+    // only its transactions' output commitments — block 1 matures nothing, because
+    // there is no height −143.
     assert_eq!(
         node.commitment_count(),
-        3,
-        "both txs' output commitments landed, plus the block's coinbase-note leaf (issue #101)"
+        2,
+        "both txs' output commitments landed; the coinbase-note leaf is deferred to \
+         height 1 + 144 (issue #102)"
     );
 
-    // Reconcile the pool: the mined txs are evicted, the coinbase note recorded.
-    mp.on_block_connected(1, &template.body, &node);
+    // Reconcile the pool: the mined txs are evicted. Nothing is recorded about the
+    // coinbase note — the registry that used to hold it is deleted.
+    mp.on_block_connected(&template.body, &node);
     assert!(mp.is_empty(), "mined txs leave the pool");
+
+    // The note exists and its commitment is known, but it is deliberately NOT a tree
+    // leaf yet. This is the whole enforcement mechanism in one assertion: no leaf ⇒
+    // no membership witness ⇒ no provable spend, with nothing declared and nothing
+    // trusted.
     let cb = template.coinbase_note.expect("a minting template mints a note");
-    assert_eq!(mp.coinbase_note_height(&cb), Some(1));
-    // The registry and the commitment tree name the SAME object now: the leaf the
-    // node appended is the note commitment the maturity gate is keyed on.
-    assert!(node.commitments().tree().position_of(&digest_from_bytes(&cb)).is_some());
+    assert!(
+        node.commitments().tree().position_of(&digest_from_bytes(&cb)).is_none(),
+        "an immature coinbase note must not be in the tree — its absence IS the \
+         frozen §2 maturity rule (issue #102)"
+    );
+    assert_eq!(qlab_node::coinbase_leaf_appears_at(1), 1 + qlab_node::COINBASE_MATURITY_BLOCKS);
 }
 
 #[test]
@@ -101,7 +115,7 @@ fn mempool_rejects_what_the_node_would_reject_unfinalized_anchor() {
     let g_root = node.commitment_root();
     assert!(!node.is_valid_anchor(&g_root));
     assert_eq!(
-        mp.admit(tx(g_root, 1), vec![], &node, &MockVerifier),
+        mp.admit(tx(g_root, 1), &node, &MockVerifier),
         Err(MempoolError::AnchorNotValid)
     );
 }
@@ -122,7 +136,7 @@ fn mempool_rejects_a_tx_double_spending_an_already_applied_nullifier() {
     let mut mp = Mempool::default();
     // Anchor still valid (genesis root finalized); the double-spend is the reason.
     assert_eq!(
-        mp.admit(tx(g_root, 7), vec![], &node, &MockVerifier),
+        mp.admit(tx(g_root, 7), &node, &MockVerifier),
         Err(MempoolError::AlreadySpent { nullifier: [7; 32] })
     );
 }

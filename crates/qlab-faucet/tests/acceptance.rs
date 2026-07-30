@@ -662,18 +662,22 @@ fn a_faucet_on_an_unfinalized_chain_reports_the_cold_start() {
 }
 
 // ---------------------------------------------------------------------------
-// The maturity declaration reaches the gate that enforces it
+// A coinbase-funded grant discloses nothing about its coinbase origin
 // ---------------------------------------------------------------------------
 
+/// **Replaces `a_coinbase_funded_grant_declares_its_maturity_obligation`, and
+/// asserts the opposite property on purpose (issue #102).**
+///
+/// That test locked in that the faucet *computed* the `spends_coinbase` declaration
+/// the maturity gate needed. The declaration is deleted, because computing it
+/// honestly was the defect: naming the coinbase notes a transaction spends links the
+/// spend to the coinbase, and on a chain with one global shielded pool and no
+/// transparent tier that collapses the anonymity set of exactly the first
+/// transaction a new user makes. Maturity is structural now, so nothing needs to be
+/// said — and this test pins that nothing *is* said.
 #[test]
-fn a_coinbase_funded_grant_declares_its_maturity_obligation() {
+fn a_coinbase_funded_grant_discloses_no_coinbase_origin() {
     let _prover = prover_gate();
-    // Constraint four at the seam that exists. `NodeRpc::submit_tx` passes
-    // `vec![]` for `spends_coinbase`, so the frozen §2 144-block gate is unreachable
-    // through the wallet-facing RPC — that is reported as a finding. What the faucet
-    // can do is *compute* the declaration, and this locks that it does: a grant
-    // spending coinbase-derived notes declares them, and one spending ordinary notes
-    // declares nothing.
     let mut rng = StdRng::from_seed([0x71; 32]);
     let wallet = Wallet::from_seed_lanes([0xFA0C_E700_0000_0001; 4]);
     let d = Diversifier::default();
@@ -707,8 +711,8 @@ fn a_coinbase_funded_grant_declares_its_maturity_obligation() {
             ..FaucetConfig::default()
         },
     );
-    for (n, cb) in plain.into_iter().zip([cb0, cb1]) {
-        faucet.fund(OwnedNote { coinbase_note: Some(cb), ..n });
+    for (n, minted_at) in plain.into_iter().zip([1u64, 2u64]) {
+        faucet.fund(OwnedNote { coinbase_minted_at: Some(minted_at), ..n });
     }
 
     let (_, addr) = requester(0x7000);
@@ -717,10 +721,39 @@ fn a_coinbase_funded_grant_declares_its_maturity_obligation() {
         DispenseOutcome::Ready { plan, .. } => plan,
         other => panic!("expected a ready grant, got {other:?}"),
     };
-    let declared = plan.spends_coinbase();
-    assert_eq!(declared.len(), 2, "both inputs are coinbase-derived and both are declared");
-    assert!(declared.contains(&cb0) && declared.contains(&cb1));
+    // The faucet knows privately that both inputs are coinbase-derived, and knows the
+    // heights — it needs them to decide when to fund, and a holder needs them to tell
+    // "immature" from "nonexistent".
+    let minted: Vec<u64> =
+        plan.spent.iter().map(|n| n.coinbase_minted_at.expect("coinbase-derived")).collect();
+    assert_eq!(minted, vec![1, 2]);
 
-    // The change note carries no obligation of its own — it is an ordinary output.
-    assert_eq!(plan.change.coinbase_note, None);
+    // 🔴 THE CLAIM: none of that reaches the wire. The consensus surface is
+    // `anchor ‖ nullifiers ‖ commitments ‖ bucket ‖ fee`, and neither coinbase leaf
+    // appears anywhere in it — not as an input (a spend appears only as a nullifier,
+    // which is unlinkable by construction), and not as a declaration, because there
+    // is no field left to carry one.
+    let p = &plan.entry.public;
+    for cb in [cb0, cb1] {
+        assert!(!p.nullifiers.contains(&cb), "a coinbase leaf must not appear as a nullifier");
+        assert!(!p.commitments.contains(&cb), "nor as an output commitment");
+        assert_ne!(p.anchor, cb, "nor as the anchor");
+    }
+    // And nowhere in the bytes a peer actually receives: the serialized proof plus
+    // every field of the public surface, concatenated.
+    let mut wire = plan.entry.proof.clone();
+    wire.extend_from_slice(&p.anchor);
+    for h in p.nullifiers.iter().chain(p.commitments.iter()) {
+        wire.extend_from_slice(h);
+    }
+    wire.extend_from_slice(&p.fee.to_le_bytes());
+    for cb in [cb0, cb1] {
+        assert!(
+            !wire.windows(32).any(|w| w == cb),
+            "no coinbase-note commitment may appear anywhere on the transaction wire"
+        );
+    }
+
+    // The change note is an ordinary output with no coinbase origin of its own.
+    assert_eq!(plan.change.coinbase_minted_at, None);
 }

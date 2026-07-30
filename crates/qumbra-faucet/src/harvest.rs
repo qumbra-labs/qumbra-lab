@@ -7,42 +7,38 @@
 //! needs no side channel: it walks its own node's main chain, and every block whose
 //! `coinbase_rkm` is the faucet's own `rkm` is one note it owns.
 //!
-//! ## The maturity gate, and why it lives here rather than in the core
+//! ## The maturity delay, and what this file still owes it
 //!
-//! `COINBASE_MATURITY_BLOCKS` = 144 (frozen §2) gates spending fresh coinbase.
-//! Enforcing it should be the mempool's job, and it *is* — `Mempool::admit` takes
-//! the coinbase notes a transaction declares it spends, and
-//! `GrantPlan::spends_coinbase` computes exactly that declaration. But **both**
-//! submission seams in this tree hardcode an empty declaration:
+//! `COINBASE_MATURITY_BLOCKS` = 144 (frozen §2) delays spending fresh coinbase.
 //!
-//! - `qlab_node::rpc::NodeRpc::submit_tx` → `mempool.admit(tx, vec![], …)`
-//! - `qlab_p2p::adapter::NodeAdapter::ingest_tx` → `mempool.admit(tx, vec![], …)`
+//! **Issue #102 changed who enforces this, and this module got smaller as a
+//! result.** It used to carry the *only* live enforcement of the frozen rule in the
+//! tree. The mempool's gate needed a submitter-supplied declaration of the coinbase
+//! notes a transaction spent, and both submission seams hardcoded an empty one
+//! (`NodeRpc::submit_tx` and `NodeAdapter::ingest_tx` each passed `vec![]`), so the
+//! gate was unreachable from the wallet RPC *and* from the wire — the finding this
+//! crate's baton reported as "#102 is one seam wider than #102 records". The faucet
+//! therefore applied the threshold itself, at the funding boundary, because it was
+//! the one place that knew a note's minted height.
 //!
-//! so the gate is unreachable from the wallet RPC *and* from the wire. That is issue
-//! #102, and this baton found it is one seam wider than #102 records.
+//! That declaration is now deleted, and with it the leak that condemned it: naming
+//! the coinbase notes a transaction spends links the spend to the coinbase, on a
+//! chain whose whole privacy claim is one global shielded pool with no transparent
+//! tier. Maturity is enforced by the commitment tree instead — the coinbase leaf is
+//! appended 144 blocks late, so an immature note has no leaf, no membership witness,
+//! and no provable spend. It binds a lying submitter, a peer bypassing the mempool,
+//! and a restarted node identically, none of which the declaration did.
 //!
-//! Nor can `qlab-faucet` enforce it: `OwnedNote::coinbase_note` carries a note's
-//! *commitment* but not the *height* it was minted at, and maturity is a function of
-//! the height. Only a funder that watched the block go by knows it.
+//! **What remains here is economics, not enforcement.** A grant proof costs a
+//! measured ~2.3 s and a slot and a fee, so the faucet still checks
+//! [`spendable_at_tip`] before funding a note into the inventory — not because an
+//! immature spend would be *admitted* (it cannot be built), but because building one
+//! and failing would burn the proving time and tell the operator nothing. The
+//! refusal carries a height (qumbra-faucet §6.2).
 //!
-//! **So the gate is applied at the funding boundary**, at exactly the mempool's own
-//! threshold and not one block either side of it. `Mempool::admit` compares the
-//! **prospective** height — `tip + 1`, the earliest block a submission can land in —
-//! against `minted_height + 144`, so a note is spendable once
-//! `tip + 1 ≥ minted_height + 144`, i.e. once the tip reaches
-//! [`spendable_at_tip`]`(minted_height)`. `Faucet::fund` is called then and not
-//! before. Every note in the inventory is therefore mature by construction, no
-//! immature spend is ever built (and a grant proof costs a measured ~2.3 s, so
-//! refusing before proving is not a nicety), and nothing rides on a gate that would
-//! not have fired.
-//!
-//! Reproducing the threshold rather than asking the mempool for it is a duplication,
-//! and the one test that matters about it asserts the two agree
-//! ([`tests::the_funding_threshold_is_the_mempools_own`]).
-//!
-//! The alternative — submit undeclared, let the immature spend through, because
-//! block validation never checks maturity either — would make a browser demo work
-//! today by riding #102. It is not taken.
+//! The threshold is no longer a duplicated constant either: [`spendable_at_tip`]
+//! delegates to [`qlab_node::coinbase_leaf_appears_at`], the same function the append
+//! schedule uses, so there is one statement of the rule and this file quotes it.
 
 use std::collections::HashSet;
 
@@ -51,15 +47,29 @@ use qlab_node::{coinbase_note, coinbase_note_leaf, ChainStore, MemNode, NodeStat
 use qlab_wallet::address::Diversifier;
 use qlab_wallet::Wallet;
 
-/// The tip height at which a coinbase note minted at `minted_height` becomes
-/// spendable — the mempool's frozen §2 threshold, restated in the units the faucet
-/// and the status page work in.
+/// The earliest tip height at which a coinbase note minted at `minted_height` can
+/// be spent — now the height at which its leaf enters the commitment tree.
 ///
-/// `Mempool::admit` admits when `prospective_height ≥ minted + COINBASE_MATURITY_BLOCKS`
-/// and `prospective_height` is `tip + 1`, so the tip must reach
-/// `minted + COINBASE_MATURITY_BLOCKS − 1`.
+/// **This moved by one block at issue #102, and the reconciliation is deliberate
+/// rather than an edit to match new behaviour.** It used to return
+/// `minted + 144 − 1`, derived from the mempool policy gate: `Mempool::admit`
+/// admitted when `prospective_height ≥ minted + 144` and `prospective_height` is
+/// `tip + 1`, so `tip ≥ minted + 143` sufficed. That gate is gone. What binds now
+/// is that the leaf is appended while applying block `minted + 144`
+/// ([`qlab_node::coinbase_leaf_appears_at`]), and no earlier root contains it — so
+/// the tip must actually *reach* `minted + 144`. One block later, and it is the
+/// real constraint rather than a restatement of a removed one.
+///
+/// **It is a lower bound, not a sufficient condition.** A spend also needs an
+/// anchor, and `Node::is_valid_anchor` requires the anchor's height to be
+/// *finalized* (and within `MAX_ANCHOR_AGE_BLOCKS`). So the true earliest spend is
+/// when finality covers `minted + 144`, which lags the tip by up to a checkpoint
+/// cadence. The faucet does not need the exact moment — it needs never to prove
+/// against a leaf that cannot exist — so it waits for this height and then lets the
+/// anchor check speak for itself. A caller that wants the sufficient condition must
+/// consult `finalized_height`, not this function.
 pub fn spendable_at_tip(minted_height: u64) -> u64 {
-    minted_height + qlab_node::COINBASE_MATURITY_BLOCKS - 1
+    qlab_node::coinbase_leaf_appears_at(minted_height)
 }
 
 /// What one harvest pass did, and what it is still waiting for.
@@ -117,7 +127,11 @@ pub fn harvest_matured(
         if seen.contains(&leaf) {
             continue;
         }
-        // 🔴 The frozen §2 gate, at the boundary that can see the height.
+        // The frozen §2 delay. No longer a gate this code has to *impose* — since
+        // issue #102 an immature coinbase has no tree leaf, so a grant built on one
+        // could not be proved even if the faucet tried. What remains here is the
+        // faucet declining to waste ~2.3 s of proving on a note it can see is not
+        // spendable yet, and reporting a height instead (qumbra-faucet §6.2).
         let at = spendable_at_tip(height);
         if tip < at {
             report.maturing += 1;
@@ -125,7 +139,7 @@ pub fn harvest_matured(
             continue;
         }
         let Some(note) = coinbase_note(height, &body) else { continue };
-        faucet.fund(OwnedNote::from_coinbase(wallet, note.value, note.rho, note.rseed, d, leaf));
+        faucet.fund(OwnedNote::from_coinbase(wallet, note.value, note.rho, note.rseed, d, height));
         seen.insert(leaf);
         report.funded += 1;
     }
@@ -239,37 +253,40 @@ mod tests {
                 tree.position_of(&note.cm).is_some(),
                 "a harvested note must be a leaf of the live tree"
             );
-            let cb = note.coinbase_note.expect("a harvested note declares its coinbase origin");
+            // A harvested note carries the height it was minted at, not a declaration
+            // of its commitment (issue #102) — the height is what maturity is a
+            // function of, and it is what lets the holder ask why a leaf is missing.
+            let minted_at =
+                note.coinbase_minted_at.expect("a harvested note records its minted height");
             assert_eq!(
-                cb,
-                qlab_note::hash::digest_bytes(&note.cm),
-                "the declaration is the leaf itself"
+                qlab_node::coinbase_maturity(minted_at, node.tip_height()),
+                qlab_node::CoinbaseMaturity::Matured {
+                    leaf_at: qlab_node::coinbase_leaf_appears_at(minted_at)
+                },
+                "the faucet only funds notes whose leaf has actually landed"
             );
         }
     }
 
-    /// 🔴 **The funding threshold is the mempool's own threshold**, asserted against
-    /// `Mempool::admit` itself rather than against a restatement of it.
+    /// 🔴 **The funding threshold is the append schedule's own threshold**, asserted
+    /// against the commitment tree itself rather than against a restatement of it.
     ///
-    /// This is the test that makes the whole "honour the gate at the funding
-    /// boundary" argument checkable: at [`spendable_at_tip`] the mempool's frozen §2
-    /// gate no longer refuses the note (only the absent proof does), and one block
-    /// earlier it refuses with `ImmatureCoinbase`. If `COINBASE_MATURITY_BLOCKS` or
-    /// the mempool's prospective-height rule ever moves, this fails rather than the
-    /// faucet quietly funding an immature note.
+    /// **This replaces `the_funding_threshold_is_the_mempools_own`, and the thing it
+    /// checks against changed because the enforcement did.** That test asserted the
+    /// mempool refused with `ImmatureCoinbase` one block below the threshold and only
+    /// `ProofInvalid` at it — a real cross-check against the gate that existed, but
+    /// that gate was reachable only because the test called `Mempool::admit` directly
+    /// and passed the declaration by hand. Production passed `vec![]` on both seams,
+    /// so what this test pinned was never what a node did.
+    ///
+    /// The check that survives the change is stronger: at `spendable_at_tip` the note
+    /// **has a tree leaf**, and one block earlier it **has none**. That is the
+    /// property a spend actually depends on, it is the same one a peer bypassing the
+    /// mempool is bound by, and it cannot be satisfied by declaring anything.
+    ///
+    /// The one-block move is deliberate — see [`spendable_at_tip`].
     #[test]
-    fn the_funding_threshold_is_the_mempools_own() {
-        use qlab_devnet::fees::{posted_fee, ArityBucket};
-        use qlab_devnet::body::TxPublic;
-        use qlab_node::{Mempool, MempoolError};
-
-        struct RejectAll;
-        impl TxVerifier for RejectAll {
-            fn verify_tx(&self, _: &TxEntry) -> bool {
-                false
-            }
-        }
-
+    fn the_funding_threshold_is_the_append_schedules_own() {
         let miner = Wallet::from_seed_lanes([0x1230_0000_0000_0005; 4]);
         let d = Diversifier::default();
         let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
@@ -284,46 +301,34 @@ mod tests {
             coinbase_rkm: miner.rkm(d),
         };
         let cb = coinbase_note_leaf(minted_at, &body).expect("a minting block");
-        let mut mp = Mempool::default();
-        mp.record_coinbase_note(cb, minted_at);
+        let cm = qlab_note::hash::digest_from_bytes(&cb);
 
-        let candidate = |anchor| TxEntry {
-            proof: Vec::new(),
-            public: TxPublic {
-                anchor,
-                nullifiers: vec![[0x51; 32], [0x52; 32]],
-                commitments: vec![[0x53; 32], [0x54; 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: posted_fee(ArityBucket::TwoByTwo),
-            },
-        };
-
-        // One block short of the threshold this module funds at.
+        // The threshold this module funds at is the append schedule's, not a copy.
         let at = spendable_at_tip(minted_at);
+        assert_eq!(at, qlab_node::coinbase_leaf_appears_at(minted_at));
+
+        // One block short: no leaf, so no witness, so nothing to fund.
         let to_mine = at - 1 - node.tip_height();
         mine(&mut node, &mut tip, to_mine, [0xDD; 4]);
         assert_eq!(node.tip_height(), at - 1);
-        let err = mp
-            .admit(candidate(node.commitment_root()), vec![cb], &node, &RejectAll)
-            .unwrap_err();
         assert!(
-            matches!(err, MempoolError::ImmatureCoinbase { .. }),
-            "one block below spendable_at_tip the mempool must still refuse, got {err:?}"
+            node.commitments().tree().position_of(&cm).is_none(),
+            "one block below spendable_at_tip the leaf must not exist"
         );
-
-        // At the threshold, the maturity gate no longer refuses — the absent proof
-        // does, which is how we know the gate was passed rather than skipped.
-        mine(&mut node, &mut tip, 1, [0xDD; 4]);
-        assert_eq!(node.tip_height(), at);
-        assert_eq!(
-            mp.admit(candidate(node.commitment_root()), vec![cb], &node, &RejectAll),
-            Err(MempoolError::ProofInvalid),
-            "at spendable_at_tip the frozen §2 gate is satisfied"
-        );
-
-        // …and that is exactly the tip at which the harvester funds it.
         let mut faucet = faucet_for(&miner);
         let mut seen = HashSet::new();
+        let early = harvest_matured(&mut faucet, &node, &miner, d, &mut seen);
+        assert_eq!(early.funded, 0, "and the harvester funds nothing");
+        assert_eq!(early.maturing, 1);
+        assert_eq!(early.next_maturity, Some(at), "it reports the height, not a silent wait");
+
+        // At the threshold: the leaf exists, and that is the tip the harvester funds at.
+        mine(&mut node, &mut tip, 1, [0xDD; 4]);
+        assert_eq!(node.tip_height(), at);
+        assert!(
+            node.commitments().tree().position_of(&cm).is_some(),
+            "at spendable_at_tip the leaf is in the tree"
+        );
         assert_eq!(harvest_matured(&mut faucet, &node, &miner, d, &mut seen).funded, 1);
     }
 

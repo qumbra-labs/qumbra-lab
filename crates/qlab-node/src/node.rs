@@ -313,10 +313,28 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         Ok(hash)
     }
 
+    /// The ancestor at exactly `height` of the block whose parent hash is `from`,
+    /// found by walking `prev` through the chain store. `None` if the walk leaves
+    /// the store or `height` is above `from`'s own height.
+    ///
+    /// Walking rather than indexing by height is deliberate: it answers "the
+    /// ancestor **of this block**", which is what makes the maturity append
+    /// schedule follow reorgs for free (see [`Self::apply_state`]). The cost is
+    /// `depth` map lookups — 144 per block application at the maturity delay,
+    /// against blocks the store holds anyway.
+    fn ancestor_at(&self, from: &Hash32, height: u64) -> Option<&StoredBlock> {
+        let mut cur = self.chain.block(from)?;
+        while cur.header.height > height {
+            cur = self.chain.block(&cur.header.prev)?;
+        }
+        (cur.header.height == height).then_some(cur)
+    }
+
     /// The pure state transition (no proof verification, no log write): reject
-    /// cross-block/in-block double-spends, store the block, append its output
-    /// commitments, insert its nullifiers, and record the resulting root at this
-    /// height. Used by both [`Self::apply_block`] and replay.
+    /// cross-block/in-block double-spends, store the block, append the coinbase
+    /// leaf it matures plus its own output commitments, insert its nullifiers, and
+    /// record the resulting root at this height. Used by both
+    /// [`Self::apply_block`] and replay.
     fn apply_state(&mut self, block: &StoredBlock) -> Result<Hash32, NodeError> {
         // The funnel guard (issue #77): every state mutation — fresh application
         // and disk-log replay alike — passes through here, so the header/body
@@ -333,29 +351,49 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
                 seen.push(*nf);
             }
         }
+        // The coinbase leaf this block MATURES goes in first (issue #102) — the
+        // one minted 144 blocks back, not this block's own. Computed before any
+        // mutation, and before `put_block`, so it is a pure read of the ancestry
+        // this block already commits to via `prev`.
+        //
+        // *Why the leaf moved.* Maturity used to be a mempool policy check
+        // against a declaration the submitter supplied, which is a gate that only
+        // fires when the spender chooses to let it — and, worse, a gate whose
+        // honest use publishes "this tx spends that coinbase", collapsing the
+        // anonymity set on a chain with no transparent tier. Appending the leaf
+        // late instead makes an immature spend **unprovable**: the leaf is in no
+        // anchor, so there is no membership witness to prove against. Nothing is
+        // declared, so nothing can be lied about, and the rule holds identically
+        // on the P2P path and on a node that has just restarted.
+        //
+        // *Why it is derived and not queued.* A leaf owed at `h + 144` is the
+        // obvious candidate for a pending-insert map, and that would be a bug.
+        // `Node::open`'s snapshot fast path applies `put_block` but deliberately
+        // **skips `apply_state`** for every block at or below `applied_height`,
+        // so any in-memory queue filled by `apply_state` would be missing exactly
+        // the leaves owed across the snapshot boundary — `open` would build a
+        // different tree than `replay`, which is a node forking from itself. So
+        // the owed leaf is re-derived from the chain store, which both paths
+        // populate for every block. Nothing is persisted and `Snapshot` is
+        // unchanged.
+        //
+        // *Why it is reorg-safe.* The lookup walks `prev` from this block, so it
+        // resolves against this block's own ancestry rather than a height index.
+        // A block that leaves the main chain takes its unmatured coinbase with it:
+        // whatever chain wins, the leaves appended are that chain's.
+        //
+        // *That it goes in first* is unchanged from issue #101 — an arbitrary but
+        // fixed choice, and this is still the single funnel both fresh
+        // application and log replay pass through, so `open == replay` holds by
+        // construction.
+        let matured = crate::coinbase::matured_coinbase_leaf(block.header.height, |minted_at| {
+            self.ancestor_at(&block.header.prev, minted_at).map(|b| b.body())
+        });
         let hash = self
             .chain
             .put_block(block.clone())
             .map_err(NodeError::Chain)?;
-        // The coinbase note's leaf goes in FIRST, before this block's transaction
-        // commitments (issue #101).
-        //
-        // *That a leaf goes in at all* is what this issue is about: before it, a
-        // mined coin had no commitment-tree leaf, so no Merkle witness, so no real
-        // 2×2 proof could spend it — "mine → mature → spend" did not exist. The
-        // old `coinbase_note_commitment` could not have been used for this: it was
-        // a digest under its own domain that the circuit cannot open, so appending
-        // it would have produced a leaf that was still unspendable.
-        //
-        // *That it goes in first* is an arbitrary but fixed choice — the coinbase
-        // is the block's first output, and the compact-relay wire already treats
-        // slot 0 as the coinbase position. It only has to be the same everywhere,
-        // and it is: this is the single funnel both fresh application and log
-        // replay pass through, so `open == replay` holds by construction.
-        //
-        // Derived from `(height, body)` alone — no node state, no clock, no
-        // randomness — see [`crate::coinbase`].
-        if let Some(cb) = crate::coinbase::coinbase_note_leaf(block.header.height, &block.body()) {
+        if let Some(cb) = matured {
             self.commitments.append(cb);
             self.commitments_ordered.push(cb);
         }
@@ -420,6 +458,19 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// Borrow the nullifier store.
     pub fn nullifiers(&self) -> &N {
         &self.nullifiers
+    }
+
+    /// Whether the coinbase note minted at `minted_height` has entered the
+    /// commitment tree yet, and if not, when it will (issue #102).
+    ///
+    /// This is the answer to "my coinbase note has no membership witness — is it
+    /// immature, or does it not exist?", a question option (b) creates by making
+    /// the two look identical. Reading it discloses nothing: both inputs are
+    /// public chain facts, and unlike the `spends_coinbase` declaration it
+    /// replaces, it says nothing about a spend. See
+    /// [`crate::coinbase::CoinbaseMaturity`].
+    pub fn coinbase_maturity(&self, minted_height: u64) -> crate::coinbase::CoinbaseMaturity {
+        crate::coinbase::coinbase_maturity(minted_height, self.chain.tip_height())
     }
 }
 

@@ -603,7 +603,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // makes a buffered-then-applied body durable (issue #104).
             match self.state.apply_block(header, body.clone(), &self.verifier) {
                 Ok(_) => {
-                    self.mempool.on_block_connected(header.height, &body, &self.state);
+                    self.mempool.on_block_connected(&body, &self.state);
                 }
                 // GUARANTEED HERE, and this is not the old "expected" annotation: a
                 // body that fails at the funnel has mutated nothing (`apply_state`
@@ -878,7 +878,6 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         match err {
             MempoolError::WrongFee { .. } => "wrong fee",
             MempoolError::AnchorNotValid => "anchor not valid",
-            MempoolError::ImmatureCoinbase { .. } => "immature coinbase",
             MempoolError::AlreadySpent { .. } => "nullifier spent",
             MempoolError::NullifierConflictInPool { .. } => "nullifier in-pool conflict",
             MempoolError::DuplicateTx => "duplicate",
@@ -980,7 +979,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> TxPool for NodeAdapter<P, V> {
             return IngestOutcome::Ignored(STATE_LAG_REASON);
         }
         let wid = wire_tx_id(&tx);
-        match self.mempool.admit(tx, vec![], &self.state, &self.verifier) {
+        // Issue #102: this line used to read `admit(tx, vec![], …)`. The hardcoded
+        // empty declaration meant every transaction arriving from a peer claimed to
+        // spend no coinbase note, so the frozen §2 maturity loop iterated zero times
+        // on the *only* path that carries other people's transactions — the rule had
+        // no enforcement here at all. There is no declaration to hardcode now: an
+        // immature coinbase has no leaf in any valid anchor, so a spend of one has no
+        // witness, fails `verify_tx`, and is refused as `proof invalid` — by the same
+        // check that refuses every other unprovable claim.
+        match self.mempool.admit(tx, &self.state, &self.verifier) {
             Ok(id) => {
                 self.wire_ids.insert(wid, id);
                 IngestOutcome::Accepted
@@ -1268,6 +1275,58 @@ mod tests {
         assert_eq!(a.mempool().len(), 1);
         // Re-submitting the good tx is a duplicate.
         assert_eq!(a.ingest_tx(good), IngestOutcome::Duplicate);
+    }
+
+    /// 🔴 **The wire path can no longer admit an immature coinbase spend — issue
+    /// #102's second seam, tested through `ingest_tx` rather than through the mempool
+    /// API.**
+    ///
+    /// This is the line that used to read `admit(tx, vec![], …)`. The hardcoded empty
+    /// declaration meant the frozen §2 maturity loop iterated **zero times for every
+    /// transaction that ever arrived from a peer** — the rule had no enforcement at
+    /// all on the only path carrying other people's transactions, and no test could
+    /// have caught it by driving `Mempool::admit` directly, because the declaration
+    /// production omitted was the very argument such a test supplies by hand.
+    ///
+    /// There is nothing to hardcode now, and that is what makes this testable here:
+    /// the enforcement is that the immature coinbase's leaf is in no anchor, so a
+    /// spend of it has no witness, so its proof cannot verify. What arrives from a
+    /// peer is refused by the proof gate — the same gate that refuses every other
+    /// unprovable claim, reached without anyone being asked to declare anything.
+    ///
+    /// `MockVerifier` here accepts `b"ok"` and rejects everything else, standing in
+    /// for "a proof against an anchor containing the leaf" versus "any proof an
+    /// immature spender could actually construct". The cryptographic half — that no
+    /// such proof exists to bring — is `qumbra-node/tests/coinbase_spend.rs`
+    /// (`an_immature_coinbase_spend_is_unprovable_not_refused`), against the real
+    /// production verifier.
+    #[test]
+    fn the_wire_path_cannot_admit_an_immature_coinbase_spend() {
+        let (mut a, anchor) = adapter_with_finalized_genesis();
+
+        // A peer's transaction claiming to spend a coinbase note that has not matured.
+        // It declares nothing about coinbase origin — there is no field for it — so
+        // this is exactly the shape a hostile or careless submitter sends.
+        let immature = tx_with(anchor, 7, b"unprovable");
+        assert!(
+            matches!(a.ingest_tx(immature.clone()), IngestOutcome::Rejected("proof invalid")),
+            "an immature spend off the wire is refused as unprovable"
+        );
+        assert!(!a.has_tx(&wire_tx_id(&immature)), "and is not pooled");
+        assert_eq!(a.mempool().len(), 0);
+
+        // The refusal is the proof gate, not a maturity policy: `MempoolError` has no
+        // maturity variant left to return, so `reject_reason` cannot name one.
+        assert_eq!(
+            NodeAdapter::<KeccakPow, MockVerifier>::reject_reason(&MempoolError::ProofInvalid),
+            "proof invalid"
+        );
+
+        // And a provable spend on the same path is still admitted — the gate refuses
+        // what cannot be proved, not everything.
+        let provable = tx_with(anchor, 8, b"ok");
+        assert_eq!(a.ingest_tx(provable.clone()), IngestOutcome::Accepted);
+        assert!(a.has_tx(&wire_tx_id(&provable)));
     }
 
     #[test]

@@ -197,3 +197,70 @@ fn tx_id_is_stable_across_pending_and_accepted_forms() {
     let blocks = decode_compact_response(&bytes).unwrap();
     assert!(!blocks[0].groups[0].recipients.is_empty(), "accepted tx serves its discovery");
 }
+
+
+/// 🔴 **The RPC's per-height reconstruction agrees with `apply_state` across the
+/// maturity delay — issue #116's derived cross-check, landing with issue #102.**
+///
+/// `NodeRpc` republishes per-height tree state by *recounting* what `apply_state`
+/// appended, and the coordinator's #102 ruling was that this had to stop being an
+/// independent restatement before the append rule started sliding. It now is one:
+/// both sides call `qlab_node::matured_coinbase_leaf` and differ only in how they
+/// resolve an ancestor.
+///
+/// **Asserted per height, against the roots the node actually had.** An earlier
+/// version of this test compared the *set* of published anchors and was worthless:
+/// `root_at` clamps a too-large count to the full tree, so an offset error produced
+/// the identical set of distinct roots and the test passed with the schedule wrong.
+/// The height→count mapping is what breaks, so that is what is checked — via
+/// `/v1/tree/frontier?at=h`, which is served straight from `leaves_at(h)` and is the
+/// surface a wallet builds witnesses against.
+///
+/// This failure is otherwise silent: a miscount does not error, it hands wallets a
+/// frontier for the wrong prefix, and witnesses cut against it simply do not fold to
+/// any anchor the node will accept.
+#[test]
+fn per_height_frontiers_match_the_nodes_own_roots_across_the_maturity_delay() {
+    let delay = qlab_node::COINBASE_MATURITY_BLOCKS;
+    let height = delay + 25;
+
+    let mut node = MemNode::in_memory(genesis_block(1_000, 0));
+    let ghash = node.chain().genesis_hash();
+    assert!(node.finalize(ghash).unwrap());
+
+    // The node's own root after each height — the ground truth to reconstruct.
+    let mut roots_live: Vec<Hash32> = vec![node.commitment_root()]; // height 0
+    for _ in 0..height {
+        apply_block(&mut node, Vec::new());
+        let tip = node.tip_hash();
+        node.finalize(tip).expect("finalize");
+        roots_live.push(node.commitment_root());
+    }
+    assert_eq!(node.tip_height(), height);
+    assert_eq!(
+        node.commitment_count(),
+        height - delay,
+        "the tree runs exactly one maturity delay behind the chain"
+    );
+    // The delay is genuinely spanned: early heights share the empty root, later ones
+    // do not — so a mapping that is off by the delay cannot coincide with the truth.
+    assert_eq!(roots_live[1], roots_live[delay as usize], "nothing matures before the delay");
+    assert_ne!(roots_live[delay as usize], roots_live[height as usize]);
+
+    let rpc = qlab_node::NodeRpc::new(node);
+    for (h, expected) in roots_live.iter().enumerate() {
+        let bytes = rpc.route(&format!("/v1/tree/frontier?at={h}")).unwrap();
+        let f = Frontier::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            digest_bytes(&f.root()),
+            *expected,
+            "the frontier served for height {h} must reconstruct the root the node had \
+             at height {h} — a mismatch means the RPC recounted the append schedule"
+        );
+    }
+
+    // And every anchor it publishes is one the node accepts.
+    for root in &rpc.anchors().roots {
+        assert!(rpc.node().is_valid_anchor(root), "published a root the node rejects");
+    }
+}

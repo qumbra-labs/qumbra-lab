@@ -186,10 +186,13 @@ pub enum RejectReason {
     NullifierPending,
     /// The discovery artifacts' commitments do not match the tx's commitments.
     DiscoveryMismatch,
-    /// The tx spends a coinbase note that has not matured (frozen §2: 144 blocks).
-    ImmatureCoinbase,
     /// The proof failed to verify under the injected verifier.
     ProofInvalid,
+    // NOTE (issue #102): `ImmatureCoinbase` is gone. Maturity is enforced by the
+    // commitment tree's append schedule, so an immature spend is unprovable rather
+    // than refused — it cannot reach a refusal reason at all. A wallet that wants
+    // to know *why* a coinbase note has no witness yet asks
+    // [`NodeRpc::coinbase_maturity`], which answers from public chain facts.
 }
 
 // ---------------------------------------------------------------------------
@@ -323,9 +326,15 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
         }
 
         // The N4 mempool runs the real admission gates (posted fee → valid anchor →
-        // coinbase maturity → consensus double-spend → duplicate → in-pool nullifier
-        // conflict → injected proof) against live node state and holds the tx.
-        match self.mempool.admit(tx, vec![], &self.node, verifier) {
+        // consensus double-spend → duplicate → in-pool nullifier conflict →
+        // injected proof) against live node state and holds the tx.
+        //
+        // No maturity gate, and no empty declaration standing in for one (issue
+        // #102): this call site used to pass a hardcoded `vec![]`, which made the
+        // frozen §2 rule unreachable from the wallet RPC. It is now enforced by the
+        // commitment tree's append schedule, so there is nothing to pass and no way
+        // for this path to skip it.
+        match self.mempool.admit(tx, &self.node, verifier) {
             Ok(_body_id) => {
                 self.discovery.insert(txid, discovery);
                 SubmitOutcome::Accepted(txid)
@@ -342,9 +351,6 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             }
             Err(MempoolError::NullifierConflictInPool { .. }) => {
                 SubmitOutcome::Rejected(RejectReason::NullifierPending)
-            }
-            Err(MempoolError::ImmatureCoinbase { .. }) => {
-                SubmitOutcome::Rejected(RejectReason::ImmatureCoinbase)
             }
             Err(MempoolError::ProofInvalid) => SubmitOutcome::Rejected(RejectReason::ProofInvalid),
         }
@@ -363,6 +369,20 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             nullifier_count: self.node.nullifier_count() as u64,
             pending_count: self.mempool.len() as u64,
         }
+    }
+
+    /// Whether the coinbase note minted at `minted_height` is in the commitment
+    /// tree yet, and if not, at what height it will be (issue #102).
+    ///
+    /// The wallet-facing half of option (b). A holder that cannot build a
+    /// membership witness for a coinbase note needs to tell "not yet mature" from
+    /// "no such note", and under (b) the tree alone cannot tell them apart — the
+    /// leaf is simply absent in both cases. `qumbra-faucet` §6.2 settled the same
+    /// question for an unservable faucet by refusing with a height rather than
+    /// queueing silently; this is the equivalent, and it is a read rather than a
+    /// refusal because the wallet needs the answer *before* it tries to prove.
+    pub fn coinbase_maturity(&self, minted_height: u64) -> crate::coinbase::CoinbaseMaturity {
+        self.node.coinbase_maturity(minted_height)
     }
 
     /// The set of commitment roots that are valid anchors right now (finalized +
@@ -482,16 +502,29 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
     /// `(height, commitment-count-after-this-block)` for each main-chain height.
     ///
     /// Must count exactly what `Node::apply_state` appends, in the same order, or
-    /// every root this module reconstructs is wrong. Since issue #101 that is the
-    /// block's **coinbase-note leaf first** (one, when the block mints), then its
-    /// transaction commitments. Miscounting here would not fail loudly: it would
-    /// publish anchors nobody can build a witness against.
+    /// every root this module reconstructs is wrong. Miscounting here would not
+    /// fail loudly: it would publish anchors nobody can build a witness against.
+    ///
+    /// Since issue #102 that is the coinbase leaf the block **matures** (the one
+    /// minted 144 blocks back, not its own), then its transaction commitments.
+    /// The offset makes this a *sliding* rule, and two independent restatements of
+    /// a sliding rule is worse than two of a fixed one — so this does not restate
+    /// it. Both sides call [`crate::coinbase::matured_coinbase_leaf`], differing
+    /// only in how they resolve an ancestor: `apply_state` walks `prev` through the
+    /// chain store, and this walks the main chain it already materialised. That is
+    /// what issue #116 asked for, and (b) is why it stopped being optional.
     fn main_chain_counts(&self) -> Vec<(u64, u64)> {
+        let chain = self.main_chain();
+        let by_height: HashMap<u64, &StoredBlock> =
+            chain.iter().map(|b| (b.header.height, b)).collect();
         let mut count = 0u64;
-        self.main_chain()
+        chain
             .iter()
             .map(|b| {
-                if crate::coinbase::coinbase_note_leaf(b.header.height, &b.body()).is_some() {
+                let matured = crate::coinbase::matured_coinbase_leaf(b.header.height, |minted_at| {
+                    by_height.get(&minted_at).map(|a| a.body())
+                });
+                if matured.is_some() {
                     count += 1;
                 }
                 count += b.txs.iter().map(|t| t.commitments.len() as u64).sum::<u64>();

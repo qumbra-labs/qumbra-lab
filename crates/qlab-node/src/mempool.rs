@@ -10,9 +10,8 @@
 //!      (0.01 / 0.02 / 0.04 QMB); a wrong fee is invalid (protocol-spec §4);
 //!    - **valid anchor** — a finalized commitment root within the ≤ 1,152-block
 //!      window ([`NodeState::is_valid_anchor`], §4/§7);
-//!    - **coinbase maturity** — a coinbase note may not be spent until 144 blocks
-//!      after it was mined (frozen §2; tokenomics §6 one-hop-transparency model,
-//!      below);
+//!      (**not** coinbase maturity — that left this list at issue #102 and is now
+//!      enforced by the commitment tree's append schedule; see below);
 //!    - **double-spend** — no nullifier already in the consensus set, and none
 //!      already claimed by another pooled tx (so an assembled block never
 //!      in-block double-spends);
@@ -31,31 +30,43 @@
 //! assembles into a body the node accepts (the fee source is the *same*
 //! `posted_fee`; the anchor gate is the *same* `is_valid_anchor`).
 //!
-//! ## Coinbase-maturity model (issue #101 moved half of this into reality)
+//! ## Coinbase maturity is not enforced here any more (issue #102)
 //!
 //! A coinbase note "carries public value at creation and enters the pool as an
 //! ordinary note after a maturity delay" (tokenomics §6, one-hop transparency).
+//! Issue #101 made it a **real note** — [`crate::coinbase::coinbase_note`],
+//! openable by the 2×2 circuit — with a leaf, a membership witness, and a real
+//! 2×2 spend. Issue #102 moved the *delay* out of this file.
 //!
-//! Block assembly now mints a **real note** — [`crate::coinbase::coinbase_note`],
-//! openable by the 2×2 circuit — and `Node::apply_state` appends its commitment
-//! to the depth-32 tree, so a mined coin has a leaf and a membership witness and
-//! can actually be spent. What was here before was a domain-separated digest that
-//! no circuit could open, deliberately incapable of being a note; it is deleted.
+//! There used to be an admission gate here: the mempool kept a
+//! commitment → creation-height registry, a candidate transaction **declared**
+//! the coinbase notes it consumed, and admission required each to be ≥ 144 blocks
+//! deep. All of it is deleted, because the declaration could not be made to work:
 //!
-//! **Maturity itself is still policy, not structure.** The node records the note
-//! with its creation height ([`Mempool::record_coinbase_note`]); a candidate tx
-//! **declares** the coinbase notes it consumes (`spends_coinbase`), and admission
-//! requires each to be ≥ 144 blocks deep at the prospective block height. That
-//! declaration is only as good as the submitter — see
-//! [#102](https://github.com/lai3d/qumbra-lab/issues/102), which this baton turns
-//! from an unreachable seam into a live hole and which is sequenced next.
+//! - it was **submitter-controlled** — `vec![]` skipped the gate entirely;
+//! - the P2P path (`NodeAdapter::ingest_tx`) hardcoded `vec![]`, so on the only
+//!   path that carries other people's transactions the loop ran zero times;
+//! - an undeclared-but-unknown commitment fell through the registry lookup and
+//!   passed; and the registry was in-memory, rebuilt only from blocks connected
+//!   during this process's lifetime, so **after any restart every historical
+//!   coinbase was unknown** and every immature spend of one was admitted;
+//! - and worst, the gate *when used honestly* published that this transaction is
+//!   the coinbase's next hop — on a chain with one global shielded pool and no
+//!   transparent tier, that is precisely the link tokenomics §6 promises to
+//!   erase, collapsing the anonymity set of a new user's first transaction.
 //!
-//! A **structural** alternative exists and needs no circuit change: append the
-//! coinbase leaf at `h + 144` rather than at `h`, so no anchor contains the leaf
-//! until it has matured and an immature spend is *unprovable* rather than
-//! refused-by-policy. Not taken here (it is a further consensus-layer decision,
-//! and it would leave `record_coinbase_note` with nothing to do), but recorded as
-//! the option on the table when #102 is written.
+//! A gate that only fires when the spender deanonymises themself is not a gate.
+//! So maturity is now **structural**, enforced by the commitment tree's shape:
+//! [`crate::coinbase::matures_coinbase_minted_at`] delays the coinbase leaf's
+//! append by 144 blocks, so until it matures **no valid anchor contains the leaf**
+//! and an immature spend is *unprovable* rather than refused-by-policy. There is
+//! nothing to declare, so nothing to lie about, and the rule binds a submitter
+//! who lies, a peer that bypasses this mempool, and a node that just restarted.
+//!
+//! `COINBASE_MATURITY_BLOCKS` is unchanged at 144 and means the same thing; only
+//! the place it is enforced moved. A holder asking *why* a note has no witness
+//! yet gets [`crate::coinbase::CoinbaseMaturity`], which is public-data-only and
+//! implies nothing about a spend.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -66,7 +77,10 @@ use qlab_devnet::weight::{
     is_weight_admissible, quadratic_penalty, weight_limit, WeightGovernor, WeightParams,
 };
 
-use crate::emission::{coinbase, RewardSplit, COINBASE_MATURITY_BLOCKS};
+// `COINBASE_MATURITY_BLOCKS` is deliberately not imported here any more (issue
+// #102): this module no longer enforces maturity, and importing the constant would
+// invite a second, weaker gate to grow back beside the structural one.
+use crate::emission::{coinbase, RewardSplit};
 use crate::node::NodeState;
 use crate::store::Hash32;
 
@@ -121,8 +135,12 @@ pub enum MempoolError {
     /// The anchor is not a valid transaction anchor now (not finalized, or aged
     /// past the ≤ 1,152-block window — §4/§7).
     AnchorNotValid,
-    /// The tx spends a coinbase note that has not matured (frozen §2: 144 blocks).
-    ImmatureCoinbase { commitment: Hash32, created_at: u64, matures_at: u64, prospective_height: u64 },
+    // NOTE (issue #102): there is no `ImmatureCoinbase` variant. Maturity is not a
+    // policy refusal any more — an immature coinbase has no commitment-tree leaf,
+    // so an immature spend cannot be *constructed*, and a forged attempt fails at
+    // `AnchorNotValid` or `ProofInvalid` like any other unprovable claim. A
+    // variant here would be unreachable, and an unreachable refusal reads as an
+    // enforced one.
     /// A nullifier is already spent in the consensus set (cross-block double-spend).
     AlreadySpent { nullifier: Hash32 },
     /// A nullifier is already claimed by another pooled tx (would in-block
@@ -148,8 +166,11 @@ pub enum AssemblyError {
 // Pool entries + weight/id helpers.
 // ---------------------------------------------------------------------------
 
-/// A pooled transaction: its consensus entry, cached weight, and the coinbase
-/// notes it declares it spends (for the maturity gate).
+/// A pooled transaction: its consensus entry and cached weight.
+///
+/// The `spends_coinbase` field is gone with the declaration it recorded (issue
+/// #102) — the pool stored it only to feed a maturity gate that has moved into
+/// the commitment tree's append schedule.
 #[derive(Clone)]
 pub struct MempoolTx {
     /// The transaction id (Keccak of the canonical preimage).
@@ -158,8 +179,6 @@ pub struct MempoolTx {
     pub entry: TxEntry,
     /// Serialized weight in bytes (proof + public surface).
     pub weight: u64,
-    /// Coinbase-note commitments this tx consumes (one-hop-transparency model).
-    pub spends_coinbase: Vec<Hash32>,
 }
 
 /// Canonical Keccak-256 id of a transaction — the injective per-tx encoding the
@@ -320,10 +339,13 @@ impl BlockTemplate {
 
 /// The transaction mempool + block assembler.
 ///
-/// Holds admitted transactions (indexed by id), a nullifier → owning-tx index
-/// (the in-pool double-spend gate), and the coinbase-note registry (creation
-/// heights for the maturity gate). It reads consensus state through the
+/// Holds admitted transactions (indexed by id) and a nullifier → owning-tx index
+/// (the in-pool double-spend gate). It reads consensus state through the
 /// [`NodeState`] trait, so it composes with any node backend.
+///
+/// The coinbase-note registry is gone (issue #102). It existed to answer "how
+/// deep is this coinbase note", which only the commitment tree's append schedule
+/// now needs to know — and unlike this map, the tree survives a restart.
 #[derive(Clone)]
 pub struct Mempool {
     params: MempoolParams,
@@ -331,8 +353,6 @@ pub struct Mempool {
     txs: BTreeMap<TxId, MempoolTx>,
     /// nullifier → the pooled tx that claims it.
     nf_index: HashMap<Hash32, TxId>,
-    /// coinbase-note commitment → creation height (maturity = +144 blocks).
-    coinbase_notes: HashMap<Hash32, u64>,
 }
 
 impl Default for Mempool {
@@ -344,12 +364,7 @@ impl Default for Mempool {
 impl Mempool {
     /// A fresh mempool with the given (frozen) parameters.
     pub fn new(params: MempoolParams) -> Self {
-        Self {
-            params,
-            txs: BTreeMap::new(),
-            nf_index: HashMap::new(),
-            coinbase_notes: HashMap::new(),
-        }
+        Self { params, txs: BTreeMap::new(), nf_index: HashMap::new() }
     }
 
     /// The configured parameters.
@@ -384,37 +399,21 @@ impl Mempool {
         self.txs.get(id).map(|m| &m.entry)
     }
 
-    /// Record a coinbase note minted at `height` (its maturity clock starts here).
-    /// Called when a block is accepted; the coinbase note becomes spendable at
-    /// `height + 144` (frozen §2).
+    /// Admit a candidate transaction, or say why it was refused. Checks run
+    /// cheapest-first; the proof verify is last.
     ///
-    /// Issue #101 narrowed this to **maturity bookkeeping only** and re-keyed it
-    /// on the real note commitment. Remaining callers: [`Self::on_block_connected`]
-    /// (the production path — every accepted block), and the mempool/assembly and
-    /// faucet tests that seed a matured note. Nothing computes a coinbase
-    /// "commitment" here any more; the leaf comes from [`crate::coinbase`].
-    pub fn record_coinbase_note(&mut self, commitment: Hash32, height: u64) {
-        self.coinbase_notes.insert(commitment, height);
-    }
-
-    /// The recorded creation height of a coinbase note, if known.
-    pub fn coinbase_note_height(&self, commitment: &Hash32) -> Option<u64> {
-        self.coinbase_notes.get(commitment).copied()
-    }
-
-    /// Admit a candidate transaction, or say why it was refused. `spends_coinbase`
-    /// lists the coinbase-note commitments the tx consumes (empty for ordinary
-    /// spends). Checks run cheapest-first; the proof verify is last.
+    /// There is no maturity check and no `spends_coinbase` argument (issue #102):
+    /// an immature coinbase has no leaf in any valid anchor, so an immature spend
+    /// has no witness and cannot be proved. Enforcement is
+    /// [`crate::coinbase::matures_coinbase_minted_at`], applied by
+    /// `Node::apply_state`, and it binds every path into the node rather than
+    /// this one.
     pub fn admit<S: NodeState, V: TxVerifier>(
         &mut self,
         entry: TxEntry,
-        spends_coinbase: Vec<Hash32>,
         state: &S,
         verifier: &V,
     ) -> Result<TxId, MempoolError> {
-        // The block this tx would first be mineable in.
-        let prospective_height = state.tip_height() + 1;
-
         // 1. Posted-price fee (protocol-spec §4, frozen §5). Cheapest — pure
         //    function of the public bucket.
         let expected = posted_fee(entry.public.bucket);
@@ -427,30 +426,14 @@ impl Mempool {
             return Err(MempoolError::AnchorNotValid);
         }
 
-        // 3. Coinbase maturity (frozen §2): each spent coinbase note must be
-        //    ≥ 144 blocks deep at the prospective height.
-        for cm in &spends_coinbase {
-            if let Some(&created_at) = self.coinbase_notes.get(cm) {
-                let matures_at = created_at + COINBASE_MATURITY_BLOCKS;
-                if prospective_height < matures_at {
-                    return Err(MempoolError::ImmatureCoinbase {
-                        commitment: *cm,
-                        created_at,
-                        matures_at,
-                        prospective_height,
-                    });
-                }
-            }
-        }
-
-        // 4. Double-spend against the permanent consensus nullifier set.
+        // 3. Double-spend against the permanent consensus nullifier set.
         for nf in &entry.public.nullifiers {
             if state.is_spent(nf) {
                 return Err(MempoolError::AlreadySpent { nullifier: *nf });
             }
         }
 
-        // 5. Exact duplicate? (Checked before the in-pool nullifier gate — an
+        // 4. Exact duplicate? (Checked before the in-pool nullifier gate — an
         //    identical resubmission shares its own nullifiers, so it would
         //    otherwise report the less-specific conflict below.)
         let id = txid(&entry);
@@ -458,7 +441,7 @@ impl Mempool {
             return Err(MempoolError::DuplicateTx);
         }
 
-        // 6. A *distinct* tx reusing a pooled nullifier (would in-block
+        // 5. A *distinct* tx reusing a pooled nullifier (would in-block
         //    double-spend if both were mined).
         for nf in &entry.public.nullifiers {
             if self.nf_index.contains_key(nf) {
@@ -466,7 +449,7 @@ impl Mempool {
             }
         }
 
-        // 7. Proof verify — last, the only non-trivial cost (consensus §1).
+        // 6. Proof verify — last, the only non-trivial cost (consensus §1).
         if !verifier.verify_tx(&entry) {
             return Err(MempoolError::ProofInvalid);
         }
@@ -476,7 +459,7 @@ impl Mempool {
             self.nf_index.insert(*nf, id);
         }
         let weight = tx_weight(&entry);
-        self.txs.insert(id, MempoolTx { txid: id, entry, weight, spends_coinbase });
+        self.txs.insert(id, MempoolTx { txid: id, entry, weight });
         Ok(id)
     }
 
@@ -490,19 +473,19 @@ impl Mempool {
         Some(tx)
     }
 
-    /// Reconcile the pool after a block is connected at `height`: record its
-    /// coinbase note, drop the txs it mined, and evict any pooled tx that now
-    /// double-spends a nullifier the block consumed. Keeps the pool a set of txs
-    /// that can still be mined next.
-    pub fn on_block_connected<S: NodeState>(&mut self, height: u64, body: &BlockBody, state: &S) {
-        // Record the coinbase note (its maturity clock starts at this height).
-        // Keyed on the REAL note commitment now (issue #101) — the same leaf
-        // `Node::apply_state` appended, so the maturity registry and the
-        // commitment tree name the same object.
-        if let Some(cb) = crate::coinbase::coinbase_note_leaf(height, body) {
-            self.record_coinbase_note(cb, height);
-        }
-
+    /// Reconcile the pool after a block is connected: drop the txs it mined, and
+    /// evict any pooled tx that now double-spends a nullifier the block consumed
+    /// or whose anchor has aged out. Keeps the pool a set of txs that can still be
+    /// mined next.
+    ///
+    /// It no longer records the block's coinbase note (issue #102). That write was
+    /// the only reason this function needed the height, and it was load-bearing for
+    /// a maturity gate that is now structural — which matters because this is
+    /// called *only* from `ingest_block`'s success arm, an arm issue #130 shows is
+    /// skipped once the state machine falls behind fork choice. Maturity must not
+    /// depend on a call site that stops firing on a desynchronised node, and now
+    /// it does not.
+    pub fn on_block_connected<S: NodeState>(&mut self, body: &BlockBody, state: &S) {
         // Collect the nullifiers the block spent.
         let spent: HashSet<Hash32> =
             body.txs.iter().flat_map(|t| t.public.nullifiers.iter().copied()).collect();
@@ -677,7 +660,7 @@ mod tests {
     fn admits_a_well_formed_tx() {
         let mut mp = Mempool::default();
         let st = state_with_anchor();
-        let id = mp.admit(good_tx(1), vec![], &st, &MockVerifier).expect("admit");
+        let id = mp.admit(good_tx(1), &st, &MockVerifier).expect("admit");
         assert_eq!(mp.len(), 1);
         assert!(mp.contains(&id));
     }
@@ -689,7 +672,7 @@ mod tests {
         let mut mp = Mempool::default();
         let st = state_with_anchor();
         let tx = good_tx(1);
-        let id = mp.admit(tx.clone(), vec![], &st, &MockVerifier).expect("admit");
+        let id = mp.admit(tx.clone(), &st, &MockVerifier).expect("admit");
         let listed = mp.entries();
         assert_eq!(listed.len(), 1);
         assert_eq!(txid(&listed[0]), id);
@@ -706,7 +689,7 @@ mod tests {
         let mut tx = good_tx(1);
         tx.public.fee += 1; // one bessel off the posted price → invalid (§4)
         assert_eq!(
-            mp.admit(tx, vec![], &st, &MockVerifier),
+            mp.admit(tx, &st, &MockVerifier),
             Err(MempoolError::WrongFee {
                 expected: posted_fee(ArityBucket::TwoByTwo),
                 got: posted_fee(ArityBucket::TwoByTwo) + 1,
@@ -724,7 +707,7 @@ mod tests {
         tx.public.bucket = ArityBucket::FourByFour;
         tx.public.fee = posted_fee(ArityBucket::TwoByTwo);
         assert_eq!(
-            mp.admit(tx, vec![], &st, &MockVerifier),
+            mp.admit(tx, &st, &MockVerifier),
             Err(MempoolError::WrongFee {
                 expected: posted_fee(ArityBucket::FourByFour),
                 got: posted_fee(ArityBucket::TwoByTwo),
@@ -738,39 +721,51 @@ mod tests {
         let st = state_with_anchor();
         let mut tx = good_tx(1);
         tx.public.anchor = [0xEE; 32]; // not a finalized/in-window root
-        assert_eq!(mp.admit(tx, vec![], &st, &MockVerifier), Err(MempoolError::AnchorNotValid));
+        assert_eq!(mp.admit(tx, &st, &MockVerifier), Err(MempoolError::AnchorNotValid));
     }
 
+    /// The mempool has **no opinion on coinbase maturity**, and that is the point
+    /// of issue #102 rather than a regression.
+    ///
+    /// This replaces `rejects_immature_coinbase_spend_then_admits_after_maturity`,
+    /// which asserted the old policy gate. That test passed for the entire life of
+    /// the defect while the rule it named was unenforced on every path a stranger
+    /// could use, because it drove `Mempool::admit` directly and hand-fed it the
+    /// declaration that production hardcoded empty. A test can only be as honest as
+    /// the seam it exercises.
+    ///
+    /// So what is pinned here is the *boundary*: this pool admits a transaction
+    /// whose surface is well-formed without asking about maturity at all, because a
+    /// transaction spending an immature coinbase cannot have a valid proof to bring
+    /// — the leaf is in no anchor, so no witness exists. The real property is
+    /// asserted where it now lives: `qumbra-node/tests/coinbase_spend.rs` (an
+    /// immature spend is unprovable, against the production verifier) and
+    /// `qlab-node/tests/maturity_schedule.rs` (the append schedule and its replay).
     #[test]
-    fn rejects_immature_coinbase_spend_then_admits_after_maturity() {
+    fn admission_does_not_consider_coinbase_maturity() {
         let mut mp = Mempool::default();
 
-        // A coinbase note minted at height 100 — the REAL note commitment now.
+        // A coinbase note minted at 100, whose leaf under the frozen delay does not
+        // enter the tree until 244 — i.e. immature at this tip by any reading.
+        let minted_at = 100;
         let cb = crate::coinbase::coinbase_note_leaf(
-            100,
-            &BlockBody { txs: vec![], coinbase: coinbase(100), coinbase_rkm: TEST_RKM },
+            minted_at,
+            &BlockBody { txs: vec![], coinbase: coinbase(minted_at), coinbase_rkm: TEST_RKM },
         )
         .expect("a minting body has a coinbase leaf");
-        mp.record_coinbase_note(cb, 100);
+        assert_eq!(crate::coinbase::coinbase_leaf_appears_at(minted_at), 244);
 
-        // Tip 200 ⇒ prospective height 201; matures at 100 + 144 = 244 > 201.
+        // Tip 200: the leaf does not exist yet. The pool admits anyway — there is no
+        // maturity gate and no declaration to carry `cb` through one. `MockVerifier`
+        // stands in for a proof; on a real net no such proof could be produced,
+        // which is exactly the enforcement this pool is no longer responsible for.
         let st = state_with_anchor(); // tip 200
-        let err = mp.admit(good_tx(1), vec![cb], &st, &MockVerifier).unwrap_err();
-        assert_eq!(
-            err,
-            MempoolError::ImmatureCoinbase {
-                commitment: cb,
-                created_at: 100,
-                matures_at: 244,
-                prospective_height: 201,
-            }
-        );
-        assert!(mp.is_empty());
-
-        // Advance the tip to 243 ⇒ prospective 244 == matures_at ⇒ spendable.
-        let st2 = TestState { tip: 243, finalized: Some(240), ..state_with_anchor() };
-        mp.admit(good_tx(1), vec![cb], &st2, &MockVerifier).expect("matured coinbase spends");
+        mp.admit(good_tx(1), &st, &MockVerifier).expect("admission is maturity-blind");
         assert_eq!(mp.len(), 1);
+
+        // And the commitment is nowhere in the pool's state: nothing records it, so
+        // nothing can be lied to about it, and no restart can lose it.
+        let _ = cb;
     }
 
     #[test]
@@ -779,7 +774,7 @@ mod tests {
         let mut st = state_with_anchor();
         st.spent.insert([7; 32]); // nullifier already in the consensus set
         assert_eq!(
-            mp.admit(good_tx(7), vec![], &st, &MockVerifier),
+            mp.admit(good_tx(7), &st, &MockVerifier),
             Err(MempoolError::AlreadySpent { nullifier: [7; 32] })
         );
     }
@@ -788,12 +783,12 @@ mod tests {
     fn rejects_in_pool_double_spend() {
         let mut mp = Mempool::default();
         let st = state_with_anchor();
-        mp.admit(good_tx(9), vec![], &st, &MockVerifier).expect("first admits");
+        mp.admit(good_tx(9), &st, &MockVerifier).expect("first admits");
         // A different tx (distinct commitments) reusing the same nullifier.
         let mut tx2 = good_tx(9);
         tx2.public.commitments = vec![[200; 32]];
         assert_eq!(
-            mp.admit(tx2, vec![], &st, &MockVerifier),
+            mp.admit(tx2, &st, &MockVerifier),
             Err(MempoolError::NullifierConflictInPool { nullifier: [9; 32] })
         );
         assert_eq!(mp.len(), 1);
@@ -803,9 +798,9 @@ mod tests {
     fn rejects_duplicate_tx() {
         let mut mp = Mempool::default();
         let st = state_with_anchor();
-        mp.admit(good_tx(3), vec![], &st, &MockVerifier).expect("first");
+        mp.admit(good_tx(3), &st, &MockVerifier).expect("first");
         assert_eq!(
-            mp.admit(good_tx(3), vec![], &st, &MockVerifier),
+            mp.admit(good_tx(3), &st, &MockVerifier),
             Err(MempoolError::DuplicateTx)
         );
     }
@@ -816,7 +811,7 @@ mod tests {
         let st = state_with_anchor();
         let mut tx = good_tx(1);
         tx.proof = b"forged".to_vec();
-        assert_eq!(mp.admit(tx, vec![], &st, &MockVerifier), Err(MempoolError::ProofInvalid));
+        assert_eq!(mp.admit(tx, &st, &MockVerifier), Err(MempoolError::ProofInvalid));
     }
 
     // ── weight parameters (frozen §6) ────────────────────────────────────────
@@ -839,7 +834,7 @@ mod tests {
         let mut mp = Mempool::default();
         let st = state_with_anchor(); // tip 200 ⇒ height 201
         for nf in 0..5u8 {
-            mp.admit(good_tx(nf), vec![], &st, &MockVerifier).unwrap();
+            mp.admit(good_tx(nf), &st, &MockVerifier).unwrap();
         }
         // A tiny effective median so only a couple of ~135-byte mock txs fit free.
         let m = 2 * tx_weight(&good_tx(0)); // exactly two txs fit the free zone
@@ -867,7 +862,7 @@ mod tests {
         let st = state_with_anchor();
         let mut ids = Vec::new();
         for nf in 0..5u8 {
-            ids.push(mp.admit(good_tx(nf), vec![], &st, &MockVerifier).unwrap());
+            ids.push(mp.admit(good_tx(nf), &st, &MockVerifier).unwrap());
         }
         let one = tx_weight(&good_tx(0));
         // Effective median so the hard cap (2·M) admits only 3 of the 5 txs.
@@ -895,24 +890,25 @@ mod tests {
         );
     }
 
+    /// Eviction only. The `…_and_records_coinbase` half of this test's old name is
+    /// gone with the registry it checked (issue #102): the pool no longer records
+    /// the block's coinbase note, so `on_block_connected` no longer takes a height.
     #[test]
-    fn on_block_connected_evicts_mined_and_conflicting_txs_and_records_coinbase() {
+    fn on_block_connected_evicts_mined_and_conflicting_txs() {
         let mut mp = Mempool::default();
         let st = state_with_anchor();
-        let a = mp.admit(good_tx(1), vec![], &st, &MockVerifier).unwrap();
-        let _b = mp.admit(good_tx(2), vec![], &st, &MockVerifier).unwrap();
+        let a = mp.admit(good_tx(1), &st, &MockVerifier).unwrap();
+        let _b = mp.admit(good_tx(2), &st, &MockVerifier).unwrap();
         assert_eq!(mp.len(), 2);
 
         // A block at height 201 mines tx `a` (spends nullifier [1;32]).
         let mined = mp.txs.get(&a).unwrap().entry.clone();
         let body =
             BlockBody { txs: vec![mined], coinbase: coinbase(201), coinbase_rkm: TEST_RKM };
-        mp.on_block_connected(201, &body, &st);
+        mp.on_block_connected(&body, &st);
 
-        // `a` is gone; `b` remains; the coinbase note is registered at 201.
+        // `a` is gone; `b` remains.
         assert!(!mp.contains(&a));
         assert_eq!(mp.len(), 1);
-        let cb = crate::coinbase::coinbase_note_leaf(201, &body).expect("minting body");
-        assert_eq!(mp.coinbase_note_height(&cb), Some(201));
     }
 }

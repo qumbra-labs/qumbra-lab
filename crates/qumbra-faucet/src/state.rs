@@ -45,8 +45,9 @@ pub enum Availability {
     /// the change note of a recent grant is in a block that is mined but not yet
     /// finalized. Self-clearing on the checkpoint cadence.
     AwaitingFinality { held: usize, anchored: usize },
-    /// Coinbase notes are held but still inside the frozen §2 maturity gate.
-    /// `matures_at` is the height the earliest-maturing pair becomes spendable at.
+    /// Coinbase notes are held but still inside the frozen §2 maturity delay — they
+    /// have no commitment-tree leaf yet, so no witness and no provable spend
+    /// (issue #102). `matures_at` is the height the earliest one's leaf lands at.
     Maturing { held: usize, matures_at: u64, tip: u64 },
     /// Nothing is finalized, so there is no valid anchor and no proof can be bound.
     /// On a fresh net this is the cold start; the faucet may be fully funded.
@@ -162,9 +163,10 @@ pub struct ServiceStatus {
 /// Classify what the faucet can do right now.
 ///
 /// `next_maturity` is the height at which the earliest **immature** coinbase note
-/// this node mined becomes spendable, if any is outstanding — the one fact
-/// `qlab_faucet` cannot compute for itself, because `OwnedNote::coinbase_note`
-/// carries a note's commitment but not the height it was minted at.
+/// this node mined becomes spendable, if any is outstanding — i.e. the height its
+/// leaf is appended at (`minted + 144`, issue #102). It is passed in rather than
+/// derived here because only a caller walking its own node's main chain knows which
+/// blocks this faucet mined and at what heights.
 pub fn classify<V: qlab_faucet::ChainView>(
     faucet: &Faucet,
     view: &V,
