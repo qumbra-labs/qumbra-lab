@@ -258,6 +258,24 @@ netem_rtt_matrix() {
 # letting the kernel silently clamp a cpuset and the run report a budget it never had.
 vm_cores() { docker info --format '{{.NCPU}}' 2>/dev/null || echo 0; }
 
+# CPU budgets in HUNDREDTHS of a CPU, so the comparison is integer arithmetic and a
+# fractional budget can be asserted exactly. "2" -> 200, "0.25" -> 25, "1.5" -> 150.
+#
+# Fractions are supported for one reason, and it is not convenience: measured on this
+# harness (issue #107 step 1d) each node draws ~2.7 % of ONE core, so a 2-CPU budget is
+# ~70x more than it asks for and `nr_throttled` stays 0 — the limit is installed and
+# never binds. A budget BELOW measured demand is the positive control that shows the
+# instrument can move the loop period at all, which is what makes a negative at the
+# hosts' 2 vCPU worth anything. Such a budget is NOT a host model; label it as a
+# control, never as "the hosts".
+cpu_hundredths() {   # cpu_hundredths <n[.nn]>
+  local v="$1" int frac
+  int="${v%%.*}"
+  if [[ "$v" == *.* ]]; then frac="${v#*.}"; else frac=""; fi
+  frac="${frac}00"; frac="${frac:0:2}"
+  echo $(( 10#${int:-0} * 100 + 10#${frac} ))
+}
+
 # node<idx>'s DEDICATED block of <width> cores: node0=0-1, node1=2-3, … for width 2.
 # Distinct blocks are the point — four containers pinned to the same pair are a 4:1
 # oversubscription of one pair, which is not what four 2-vCPU hosts are.
@@ -281,6 +299,26 @@ cpu_inspect() {   # cpu_inspect <node>
     "$(cid "$1")" 2>/dev/null || echo "uninspectable"
 }
 
+# DID THE LIMIT EVER ACTUALLY BIND? This is the question a CPU-scarcity run turns on,
+# and it is not answerable from the limit itself — a quota that is never reached is
+# installed, verified, and inert. `cpu.stat` answers it from the kernel's own counters:
+#
+#   nr_periods     enforcement windows elapsed (100 ms each)
+#   nr_throttled   how many of them the cgroup was cut off in
+#   throttled_usec total time spent cut off
+#   usage_usec     CPU actually consumed — divide by nr_periods*100ms for the share
+#
+# nr_throttled = 0 means the budget was never the binding constraint, so any negative
+# result from that run is a statement about the WORKLOAD's demand, not about scarcity.
+# Say so when it happens rather than reporting the negative on its own.
+cpu_throttle() {   # cpu_throttle <node>
+  dc exec -T "$1" bash -c '
+    awk "/^(nr_periods|nr_throttled|throttled_usec|usage_usec) /{printf \"%s=%s \", \$1, \$2}" \
+      /sys/fs/cgroup/cpu.stat
+    echo
+  ' 2>/dev/null | tr -d '\r' || echo "unreadable"
+}
+
 # The CPU_BUDGET line the node printed AT STARTUP (entrypoint.sh). This is the budget
 # the process booted under, which is not necessarily the one it has now — `cpu-budget`
 # changes the cgroup live and cannot rewrite a log line already emitted. Comparing the
@@ -302,6 +340,10 @@ cpu_report() {   # cpu_report <label>
   echo "   -- HostConfig (what was REQUESTED of the daemon) --"
   for n in "${NODES[@]}"; do
     printf '     %-6s %s\n' "$n" "$(cpu_inspect "$n")"
+  done
+  echo "   -- did the budget ever BIND? (kernel throttling counters) --"
+  for n in "${NODES[@]}"; do
+    printf '     %-6s %s\n' "$n" "$(cpu_throttle "$n")"
   done
   echo "   -- the budget each node BOOTED under (its own startup line) --"
   for n in "${NODES[@]}"; do
@@ -333,7 +375,9 @@ cpu_check() {   # cpu_check <n|none>
       fi
     else
       local period="${cg#*/}"; period="${period%% *}"
-      if [[ "$q" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ ]] && (( q == want * period )); then
+      # Integer comparison in hundredths of a CPU, so 0.25 asserts as exactly as 2 does.
+      if [[ "$q" =~ ^[0-9]+$ && "$period" =~ ^[1-9][0-9]*$ ]] \
+        && (( q * 100 / period == $(cpu_hundredths "$want") )); then
         printf '     %-6s ok  (%s)\n' "$n" "$cg"
       else
         printf '     %-6s MISMATCH (wanted quota %s CPU): %s\n' "$n" "$want" "$cg"; bad=1
@@ -707,11 +751,16 @@ case "$cmd" in
       echo "   show whatever they booted with."
       exit 0
     fi
-    [[ "$arg" =~ ^[0-9]+$ ]] && (( arg > 0 )) || die "cpu-budget takes a positive whole number of CPUs, got '$arg'"
+    [[ "$arg" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(cpu_hundredths "$arg") > 0 )) \
+      || die "cpu-budget takes a positive number of CPUs (2, 0.5, 0.25), got '$arg'"
     cores="$(vm_cores)"
+    # A dedicated block is whole cores — you cannot pin half a core — so a fractional
+    # budget still gets one core of affinity and the quota does the limiting.
+    width=$(( ( $(cpu_hundredths "$arg") + 99 ) / 100 ))
+    (( width >= 1 )) || width=1
     if [[ "$mode" == dedicated ]]; then
-      need=$(( arg * ${#NODES[@]} ))
-      (( cores >= need )) || die "a dedicated $arg-core block for each of ${#NODES[@]} nodes needs $need cores;
+      need=$(( width * ${#NODES[@]} ))
+      (( cores >= need )) || die "a dedicated $width-core block for each of ${#NODES[@]} nodes needs $need cores;
    docker reports only $cores on this machine. Either lower the budget or use
    'cpu-budget $arg quota-only', which does not pin cores — but say which you used,
    because sharing cores between the four containers is a different experiment."
@@ -719,7 +768,7 @@ case "$cmd" in
     for (( i = 0; i < ${#NODES[@]}; i++ )); do
       n="${NODES[$i]}"
       if [[ "$mode" == dedicated ]]; then
-        blk="$(cpu_block "$arg" "$i")"
+        blk="$(cpu_block "$width" "$i")"
         docker update --cpus "$arg" --cpuset-cpus "$blk" "$(cid "$n")" >/dev/null \
           || die "docker update failed on $n (is the net up?)"
         echo "   applied on $n: quota $arg CPU, dedicated cores $blk"
