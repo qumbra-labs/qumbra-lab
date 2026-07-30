@@ -1640,15 +1640,22 @@ mod tests {
         acfg.dial_peers = vec![b_addr.clone()];
         let mut a = RunningNode::start(&acfg, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
         assert_eq!(a.p2p().transport().peers().len(), 0, "B is down at boot → no peer");
+        pump(&mut [&mut a], 5);
+        assert!(
+            a.p2p().addrs().entry(&b_addr).unwrap().failures >= 1,
+            "the refused startup dial completed before the heal"
+        );
 
         // B comes up on the same address.
         let (mut bcfg, bgen, bbase) = rig("redial_b", false);
         bcfg.listen_addr = b_addr.clone();
-        let b = RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let mut b =
+            RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
 
         // Re-dial reconnects A to B with no restart.
         a.force_redial_ready();
         a.maintain_peers();
+        pump(&mut [&mut a, &mut b], 5);
         assert_eq!(a.p2p().transport().peers().len(), 1, "re-dial reconnected the healed peer");
 
         // A second re-dial does NOT open a duplicate connection to the live peer.
@@ -1801,12 +1808,13 @@ mod tests {
         let (mut bcfg, bgen, bbase) = rig("book_b", false);
         bcfg.listen_addr = b_addr.clone();
         bcfg.advertise_addr = Some(b_addr.clone());
-        let b = RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let mut b =
+            RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
 
         let (mut acfg, agen, abase) = rig("book_a", false);
         acfg.dial_peers = vec![b_addr.clone()];
         let mut a = RunningNode::start(&acfg, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
-        a.maintain_peers();
+        pump(&mut [&mut a, &mut b], 5);
         assert_eq!(a.p2p().addrs().dialable_count(), 1);
         a.save_addr_book();
         drop(a);
@@ -1814,7 +1822,9 @@ mod tests {
         // Restart with an EMPTY seed list: whatever it knows was restored from disk.
         let mut acfg2 = acfg.clone();
         acfg2.dial_peers = vec![];
-        let a2 = RunningNode::start(&acfg2, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let mut a2 =
+            RunningNode::start(&acfg2, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        pump(&mut [&mut a2, &mut b], 5);
         assert_eq!(a2.p2p().addrs().known(), vec![b_addr.clone()], "restored from peers.dat");
         assert_eq!(a2.p2p().addrs().dialable_count(), 1);
         assert_eq!(

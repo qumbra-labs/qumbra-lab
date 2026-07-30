@@ -1,7 +1,9 @@
 //! Dual transport: an in-process simulator and a real `std::net` TCP transport,
 //! behind one [`Transport`] trait. No async runtime — TCP uses blocking reader
-//! threads, unblocked on shutdown by `TcpStream::shutdown` (matching the stack's
-//! sync posture; the same poll/step [`crate::node::P2pNode`] logic drives both).
+//! threads plus short-lived outbound connector threads. Readers are unblocked on
+//! shutdown by `TcpStream::shutdown`; connectors may finish their kernel wait
+//! later but never hold up the node loop or shutdown. The same poll/step
+//! [`crate::node::P2pNode`] logic drives both transports.
 //!
 //! A "frame" here is one whole envelope byte-buffer (`MAGIC ‖ header ‖ payload`).
 //! The transport moves frames; framing/validation is [`crate::wire`]. Delivery is
@@ -14,6 +16,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use crate::peer::PeerId;
 use crate::wire::{FrameHeader, HEADER_LEN};
@@ -37,6 +40,27 @@ impl core::fmt::Display for TransportError {
 }
 impl std::error::Error for TransportError {}
 
+/// Result of starting an outbound dial.
+///
+/// A real TCP connect may sit in the kernel's SYN retry loop for minutes. The
+/// transport therefore owns that wait and reports [`Pending`](DialStart::Pending)
+/// immediately; the node later collects the result through
+/// [`Transport::poll_dials`]. Deterministic transports may complete inline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DialStart {
+    Connected(PeerId),
+    Pending,
+    Failed(TransportError),
+}
+
+/// One outbound dial that completed after [`DialStart::Pending`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DialCompletion {
+    pub addr: String,
+    pub elapsed_ms: u64,
+    pub result: Result<PeerId, TransportError>,
+}
+
 /// A frame mover. Send delivers one whole frame to a peer; poll drains all
 /// frames received since the last call (with the local peer handle they came
 /// from). Both are non-blocking.
@@ -46,16 +70,22 @@ pub trait Transport {
     /// Peers currently reachable through this transport.
     fn peers(&self) -> Vec<PeerId>;
 
-    /// Open an **outbound** connection to `addr`, returning the local handle
-    /// (issue #83). This is the mechanism half of auto-connect — the policy
+    /// Start an **outbound** connection to `addr` without waiting on network I/O
+    /// (issue #83, #107). This is the mechanism half of auto-connect — the policy
     /// (whom to dial, how often, under which cap) is [`crate::addrman`].
     ///
-    /// Both shipped transports implement it, so the discovery loop in
-    /// [`crate::node::P2pNode::maintain`] is the *same code* in deterministic
-    /// in-process tests and over real sockets. The default is a refusal, for any
-    /// future frame-mover that cannot originate connections.
-    fn dial(&self, addr: &str) -> Result<PeerId, TransportError> {
-        Err(TransportError::Io(format!("transport cannot dial {addr}")))
+    /// A transport that returns [`DialStart::Pending`] must later publish exactly
+    /// one [`DialCompletion`] from [`Transport::poll_dials`]. Both shipped
+    /// transports implement this contract, so policy remains shared between the
+    /// deterministic simulator and real sockets.
+    fn dial(&self, addr: &str) -> DialStart {
+        DialStart::Failed(TransportError::Io(format!("transport cannot dial {addr}")))
+    }
+
+    /// Drain outbound dial completions. Deterministic transports complete in
+    /// [`Transport::dial`] and have nothing to report here.
+    fn poll_dials(&self) -> Vec<DialCompletion> {
+        Vec::new()
     }
 
     /// The remote endpoint behind a local handle, if this transport knows one
@@ -202,14 +232,16 @@ impl Transport for InProcTransport {
     }
     /// Dial = resolve the bound address and link both ways. An address nobody
     /// bound is unreachable, exactly as a node behind a router is.
-    fn dial(&self, addr: &str) -> Result<PeerId, TransportError> {
+    fn dial(&self, addr: &str) -> DialStart {
         match self.hub.resolve(addr) {
             Some(target) if target != self.id => {
                 self.hub.link(self.id, target);
-                Ok(target)
+                DialStart::Connected(target)
             }
-            Some(_) => Err(TransportError::Io("refusing to dial self".to_string())),
-            None => Err(TransportError::Io(format!("no route to {addr}"))),
+            Some(_) => {
+                DialStart::Failed(TransportError::Io("refusing to dial self".to_string()))
+            }
+            None => DialStart::Failed(TransportError::Io(format!("no route to {addr}"))),
         }
     }
 }
@@ -276,6 +308,10 @@ struct TcpShared {
     remote_addrs: Mutex<HashMap<PeerId, String>>,
     /// Frames refused because the receive queue was full.
     dropped: AtomicU64,
+    /// Addresses with a connector thread currently waiting in DNS/TCP setup.
+    dialing: Mutex<HashSet<String>>,
+    /// Completed outbound connects, consumed by the main loop without waiting.
+    dial_completions: Mutex<Vec<DialCompletion>>,
 }
 
 impl TcpShared {
@@ -332,6 +368,8 @@ impl TcpTransport {
             inbound_cap: AtomicU64::new(crate::addrman::MAX_INBOUND as u64),
             remote_addrs: Mutex::new(HashMap::new()),
             dropped: AtomicU64::new(0),
+            dialing: Mutex::new(HashSet::new()),
+            dial_completions: Mutex::new(Vec::new()),
         });
         let mut threads = Vec::new();
 
@@ -376,6 +414,55 @@ impl TcpTransport {
     pub fn connect(&self, addr: &str) -> io::Result<PeerId> {
         let stream = TcpStream::connect(addr)?;
         Ok(TcpTransport::register_stream(&self.shared, stream, false))
+    }
+
+    /// Spawn one connector. The closure seam makes the non-blocking contract
+    /// testable without depending on a particular OS route or SYN timeout.
+    fn start_dial_with<F>(&self, addr: &str, connect: F) -> DialStart
+    where
+        F: FnOnce(String) -> io::Result<TcpStream> + Send + 'static,
+    {
+        if !self.shared.running.load(Ordering::SeqCst) {
+            return DialStart::Failed(TransportError::Io("transport is shut down".to_string()));
+        }
+
+        let addr = addr.to_string();
+        {
+            let mut dialing = self.shared.dialing.lock().unwrap();
+            if !dialing.insert(addr.clone()) {
+                return DialStart::Pending;
+            }
+        }
+
+        let shared = Arc::clone(&self.shared);
+        let dial_addr = addr.clone();
+        let spawned = std::thread::Builder::new().name("qlab-p2p-dial".to_string()).spawn(move || {
+            let started = Instant::now();
+            let result = match connect(dial_addr.clone()) {
+                Ok(stream) if shared.running.load(Ordering::SeqCst) => {
+                    Ok(TcpTransport::register_stream(&shared, stream, false))
+                }
+                Ok(stream) => {
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    Err(TransportError::Io("transport shut down during dial".to_string()))
+                }
+                Err(e) => Err(TransportError::Io(e.to_string())),
+            };
+            let elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            shared.dialing.lock().unwrap().remove(&dial_addr);
+            shared
+                .dial_completions
+                .lock()
+                .unwrap()
+                .push(DialCompletion { addr: dial_addr, elapsed_ms, result });
+        });
+        if let Err(e) = spawned {
+            self.shared.dialing.lock().unwrap().remove(&addr);
+            return DialStart::Failed(TransportError::Io(format!(
+                "spawn connector for {addr}: {e}"
+            )));
+        }
+        DialStart::Pending
     }
 
     /// Set the maximum simultaneous **inbound** connections (issue #83, scope 6).
@@ -474,8 +561,11 @@ impl Transport for TcpTransport {
         v.sort();
         v
     }
-    fn dial(&self, addr: &str) -> Result<PeerId, TransportError> {
-        self.connect(addr).map_err(|e| TransportError::Io(e.to_string()))
+    fn dial(&self, addr: &str) -> DialStart {
+        self.start_dial_with(addr, TcpStream::connect)
+    }
+    fn poll_dials(&self) -> Vec<DialCompletion> {
+        std::mem::take(&mut *self.shared.dial_completions.lock().unwrap())
     }
     fn peer_addr(&self, id: PeerId) -> Option<String> {
         self.shared.remote_addrs.lock().unwrap().get(&id).cloned()
@@ -536,11 +626,58 @@ mod tests {
         let _b = InProcTransport::new(PeerId(2), Arc::clone(&hub));
         hub.bind_addr("b:9333", PeerId(2));
 
-        assert_eq!(a.dial("b:9333"), Ok(PeerId(2)));
+        assert_eq!(a.dial("b:9333"), DialStart::Connected(PeerId(2)));
         assert!(a.send(PeerId(2), &Envelope::new(MsgType::Ping, vec![]).encode()).is_ok());
         // An address nobody bound is unreachable — the outbound-only participant.
-        assert!(a.dial("nat:9333").is_err());
-        assert!(a.dial("a-self:9333").is_err(), "unbound self address is not dialable");
+        assert!(matches!(a.dial("nat:9333"), DialStart::Failed(_)));
+        assert!(
+            matches!(a.dial("a-self:9333"), DialStart::Failed(_)),
+            "unbound self address is not dialable"
+        );
+    }
+
+    #[test]
+    fn tcp_dial_never_waits_for_the_connector() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let transport = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            release_tx.send(()).unwrap();
+        });
+
+        let call_started = Instant::now();
+        let outcome = transport.start_dial_with("blackhole.invalid:1", move |_| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Err(io::Error::new(io::ErrorKind::TimedOut, "synthetic SYN timeout"))
+        });
+        assert_eq!(outcome, DialStart::Pending, "the main loop gets control back immediately");
+        assert!(
+            call_started.elapsed() < Duration::from_millis(500),
+            "dial waited for the connector instead of returning Pending"
+        );
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the connector thread started");
+        assert!(
+            transport.poll_dials().is_empty(),
+            "a blocked connector does not fabricate a completion"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let completion = loop {
+            if let Some(done) = transport.poll_dials().pop() {
+                break done;
+            }
+            assert!(Instant::now() < deadline, "connector never reported its result");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(completion.addr, "blackhole.invalid:1");
+        assert!(matches!(completion.result, Err(TransportError::Io(ref e)) if e.contains("synthetic SYN timeout")));
     }
 
     #[test]
@@ -566,7 +703,7 @@ mod tests {
         drop(accepted_streams);
         std::thread::sleep(std::time::Duration::from_millis(200));
         let fresh = TcpTransport::bind("127.0.0.1:0").unwrap();
-        let _ = fresh.dial(&addr).unwrap();
+        let _ = fresh.connect(&addr).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(server.inbound_count() >= 1, "the cap is a live count, not a lifetime total");
 
@@ -578,7 +715,7 @@ mod tests {
     fn tcp_dial_counts_as_outbound_not_inbound() {
         let server = TcpTransport::bind("127.0.0.1:0").unwrap();
         let client = TcpTransport::bind("127.0.0.1:0").unwrap();
-        let _pid = client.dial(&server.local_addr().to_string()).unwrap();
+        let _pid = client.connect(&server.local_addr().to_string()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(client.inbound_count(), 0, "the dialer's own connection is outbound");
         assert_eq!(server.inbound_count(), 1);
@@ -598,6 +735,8 @@ mod tests {
             inbound_cap: AtomicU64::new(crate::addrman::MAX_INBOUND as u64),
             remote_addrs: Mutex::new(HashMap::new()),
             dropped: AtomicU64::new(0),
+            dialing: Mutex::new(HashSet::new()),
+            dial_completions: Mutex::new(Vec::new()),
         })
     }
 
@@ -652,7 +791,7 @@ mod tests {
         // identity that outlives its socket.
         let server = TcpTransport::bind("127.0.0.1:0").unwrap();
         let client = TcpTransport::bind("127.0.0.1:0").unwrap();
-        let cid = client.dial(&server.local_addr().to_string()).unwrap();
+        let cid = client.connect(&server.local_addr().to_string()).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(150));
 
         let accepted = server.peers();

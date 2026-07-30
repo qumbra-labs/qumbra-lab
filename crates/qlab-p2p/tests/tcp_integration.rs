@@ -159,7 +159,7 @@ fn getaddr_throttling_survives_a_reconnect() {
 
     // --- first connection: served ---
     let c1 = TcpTransport::bind("127.0.0.1:0").unwrap();
-    let p1 = c1.dial(&server_addr).unwrap();
+    let p1 = c1.connect(&server_addr).unwrap();
     std::thread::sleep(Duration::from_millis(100));
     c1.send(p1, &getaddr).unwrap();
     for _ in 0..50 {
@@ -176,7 +176,7 @@ fn getaddr_throttling_survives_a_reconnect() {
 
     // --- reconnect from the same host: a brand-new socket and PeerId ---
     let c2 = TcpTransport::bind("127.0.0.1:0").unwrap();
-    let p2 = c2.dial(&server_addr).unwrap();
+    let p2 = c2.connect(&server_addr).unwrap();
     std::thread::sleep(Duration::from_millis(100));
     c2.send(p2, &getaddr).unwrap();
     for _ in 0..50 {
