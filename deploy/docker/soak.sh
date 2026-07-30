@@ -267,8 +267,16 @@ advertise_mode_of() {
 
 # Did the node itself say it has no advertised address? (Absence of this line is only
 # evidence when the node has produced output at all, so report the two apart.)
+#
+# `grep -c`, never `grep -q`, and the reason is not style: -q exits on the FIRST match,
+# which SIGPIPEs `docker compose logs`, and under `set -o pipefail` the pipeline then
+# reports 141 — so a matched line reads as "no match" whenever the log is long enough
+# that the writer is still going. That inverts this answer on exactly the nodes that
+# have been running longest, and it is a race, so it passes on a short log.
 advertise_node_said_none() {
-  dc logs --no-log-prefix "$1" 2>/dev/null | grep -qc '^no advertise_addr:' && echo yes || echo no
+  local hits
+  hits="$(dc logs --no-log-prefix "$1" 2>/dev/null | grep -c '^no advertise_addr:' || true)"
+  [[ "${hits:-0}" -gt 0 ]] && echo yes || echo no
 }
 
 # Print each node's mode; with an expected mode, assert it. Fatal on a disagreement
