@@ -13,7 +13,7 @@
 use crate::agree::{Agreement, IdGroup, SignedVerdict, Verdict};
 use crate::poll::{NodeReading, Reading};
 
-use qlab_node::telemetry::LOCAL_COMMITMENT_SPLIT;
+use qlab_node::telemetry::{SupplyCoverage, LOCAL_COMMITMENT_SPLIT};
 
 /// Render the per-node table.
 pub fn table(readings: &[NodeReading]) -> String {
@@ -65,13 +65,20 @@ pub fn table(readings: &[NodeReading]) -> String {
     out
 }
 
-/// Whether any reachable node reports an exact scheduled-issuance mismatch.
+/// Whether any reachable node with complete state coverage reports an exact
+/// scheduled-issuance mismatch.
+///
+/// A partial state ledger is unavailable, not divergent: the operator may infer
+/// neither supply agreement nor a supply violation until it catches fork choice.
 pub fn supply_diverged(readings: &[NodeReading]) -> bool {
     readings.iter().any(|reading| {
         reading
             .reading
             .telemetry()
-            .is_some_and(|t| t.supply.iter().any(|row| !row.agrees()))
+            .is_some_and(|t| {
+                t.supply_coverage() == SupplyCoverage::Complete
+                    && t.supply.iter().any(|row| !row.agrees())
+            })
     })
 }
 
@@ -96,10 +103,24 @@ pub fn supply(readings: &[NodeReading]) -> String {
         "FEES_BSL", "STATUS",
     ));
     let mut rows = 0usize;
+    let mut unavailable = 0usize;
     for reading in readings {
         let Reading::Ok(t) = &reading.reading else {
             continue;
         };
+        if let SupplyCoverage::Unavailable {
+            state_tip,
+            fork_choice_tip,
+        } = t.supply_coverage()
+        {
+            unavailable += 1;
+            let state_tip = state_tip.map(|h| h.to_string()).unwrap_or_else(|| "-".to_string());
+            out.push_str(&format!(
+                "{:<label_w$}  UNAVAILABLE — state ledger tip {} does not match fork-choice tip {}; refusing partial supply figures\n",
+                reading.endpoint.label, state_tip, fork_choice_tip,
+            ));
+            continue;
+        }
         for row in &t.supply {
             rows += 1;
             let relative = if row.relative_divergence().is_finite() {
@@ -121,8 +142,13 @@ pub fn supply(readings: &[NodeReading]) -> String {
             ));
         }
     }
-    if rows == 0 {
+    if rows == 0 && unavailable == 0 {
         out.push_str("no reachable node reported a supply epoch\n");
+    }
+    if unavailable != 0 {
+        out.push_str(
+            "An unavailable supply view means the state ledger is behind or otherwise disagrees with fork choice; conclude neither supply agreement nor a supply violation until the tips match.\n",
+        );
     }
     if supply_diverged(readings) {
         out.push_str(
@@ -257,11 +283,20 @@ mod tests {
     use qlab_node::{SupplyEpoch, Telemetry};
     use std::time::Duration;
 
-    fn t(fin: Option<u64>, fid: Option<u64>, signed: Option<(u64, Option<u64>)>) -> Telemetry {
-        Telemetry::assemble(3800, fin, 75, 0, 3, 0, 16)
+    fn t_at(
+        tip: u64,
+        fin: Option<u64>,
+        fid: Option<u64>,
+        signed: Option<(u64, Option<u64>)>,
+    ) -> Telemetry {
+        Telemetry::assemble(tip, fin, 75, 0, 3, 0, 16)
             .with_committee(21, 19, 15)
             .with_checkpoint(fid, signed.map(|(slot, id)| LocalCommitment { slot, id }))
             .with_tip_difficulty(Some(1_048_576))
+    }
+
+    fn t(fin: Option<u64>, fid: Option<u64>, signed: Option<(u64, Option<u64>)>) -> Telemetry {
+        t_at(3800, fin, fid, signed)
     }
 
     fn ok(label: &str, tel: Telemetry) -> NodeReading {
@@ -412,7 +447,7 @@ mod tests {
         };
         let readings = vec![ok(
             "node0",
-            t(Some(2303), Some(0x0102_0304_0506), None)
+            t_at(2303, Some(2303), Some(0x0102_0304_0506), None)
                 .with_supply(vec![honest, wrong]),
         )];
         let text = view(&readings, &Agreement::of(&readings));
@@ -422,5 +457,40 @@ mod tests {
         assert!(text.contains("DIVERGED"), "{text}");
         assert!(text.contains("first preserve the node data"), "{text}");
         assert!(supply_diverged(&readings));
+    }
+
+    /// Issue #130: the state machine can permanently trail fork choice because
+    /// historical bodies are not transferred. A partial row is not rendered as
+    /// `AGREED` (and cannot trigger the divergence exit); the operator gets one
+    /// explicit refusal and the only conclusion the evidence supports.
+    #[test]
+    fn supply_view_refuses_when_state_machine_lags_fork_choice() {
+        let partial = SupplyEpoch {
+            epoch: 0,
+            start_height: 0,
+            end_height: 4,
+            measured_coinbase: 123_456_789,
+            expected_coinbase: 123_456_789,
+            fees: 17,
+        };
+        let readings = vec![ok(
+            "late-joiner",
+            t_at(14, Some(8), Some(0x0102_0304_0506), None).with_supply(vec![partial]),
+        )];
+
+        let text = supply(&readings);
+        assert!(
+            text.contains(
+                "late-joiner  UNAVAILABLE — state ledger tip 4 does not match fork-choice tip 14"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("conclude neither supply agreement nor a supply violation"),
+            "{text}"
+        );
+        assert!(!text.contains("123456789"), "partial figures must not render:\n{text}");
+        assert!(!text.contains("AGREED"), "partial coverage must not claim agreement:\n{text}");
+        assert!(!supply_diverged(&readings), "unavailable is not a supply violation");
     }
 }

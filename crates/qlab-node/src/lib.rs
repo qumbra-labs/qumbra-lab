@@ -75,7 +75,7 @@ pub use rpc::{
     RecipientDiscovery, RejectReason, RouteResult, RpcServerHandle, SubmitOutcome, TxDiscovery,
     RPC_VERSION,
 };
-pub use telemetry::{LocalCommitment, Telemetry, LOCAL_COMMITMENT_SPLIT};
+pub use telemetry::{LocalCommitment, SupplyCoverage, Telemetry, LOCAL_COMMITMENT_SPLIT};
 pub use persist::{Snapshot, BLOCK_LOG, FORMAT_VERSION, SNAPSHOT};
 pub use store::{
     ChainStore, CommitmentStore, Hash32, MemChainStore, MemCommitmentStore, MemNullifierStore,

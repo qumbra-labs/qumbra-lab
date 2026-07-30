@@ -103,6 +103,24 @@ impl LocalCommitment {
     }
 }
 
+/// Whether the supply ledger covers the same tip as fork choice.
+///
+/// The supply rows are derived from bodies the state machine has applied, while
+/// [`Telemetry::tip_height`] is fork choice. Issue #130 established that those
+/// views can disagree permanently on a late joiner. A partial ledger must
+/// therefore be rendered as unavailable, never as supply agreement or a supply
+/// violation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SupplyCoverage {
+    /// The last applied supply row reaches the fork-choice tip.
+    Complete,
+    /// The views disagree, or this composition supplied no ledger rows.
+    Unavailable {
+        state_tip: Option<u64>,
+        fork_choice_tip: u64,
+    },
+}
+
 /// A single observability snapshot of a node's finality health.
 ///
 /// `stall_depth` and `last_finalized_age_secs` are the two the runbook keys on:
@@ -148,7 +166,11 @@ pub struct Telemetry {
     /// Quorum threshold currently in force, read from committee state.
     pub committee_quorum: u64,
     /// Scheduled-issuance attestation grouped by epoch, from genesis through the
-    /// current tip. Each row compares integer bessel at zero tolerance.
+    /// state machine's applied tip. Each row compares integer bessel at zero
+    /// tolerance.
+    ///
+    /// Consumers must use [`Self::supply_coverage`] before rendering or acting on
+    /// these rows: the state tip may trail the fork-choice `tip_height`.
     pub supply: Vec<SupplyEpoch>,
     /// **The identity of the finalized checkpoint** (`fid`, issue #117), or `None`
     /// when nothing is finalized *or* when the composition serving this snapshot
@@ -262,6 +284,25 @@ impl Telemetry {
     pub fn with_supply(mut self, supply: Vec<SupplyEpoch>) -> Self {
         self.supply = supply;
         self
+    }
+
+    /// The one availability rule for supply figures.
+    ///
+    /// This mirrors [`Self::age_field`]'s refusal discipline: figures are
+    /// publishable only when the applied state ledger and fork choice name the
+    /// same tip height. The existing `0x03` payload already carries both heights
+    /// (`tip_height` and the last supply row's `end_height`), so this rule needs
+    /// no wire change.
+    pub fn supply_coverage(&self) -> SupplyCoverage {
+        let state_tip = self.supply.last().map(|row| row.end_height);
+        if state_tip == Some(self.tip_height) {
+            SupplyCoverage::Complete
+        } else {
+            SupplyCoverage::Unavailable {
+                state_tip,
+                fork_choice_tip: self.tip_height,
+            }
+        }
     }
 
     /// Stamp in the checkpoint-identity half (issue #117), the way
@@ -702,6 +743,7 @@ mod tests {
         );
         assert_eq!(t.supply.len(), 1);
         assert_eq!(t.supply[0].divergence_bessel(), 0);
+        assert_eq!(t.supply_coverage(), SupplyCoverage::Complete);
 
         let mut old = bytes;
         old[0] = 0x02;
@@ -709,6 +751,30 @@ mod tests {
             Telemetry::from_bytes(&old),
             Err(CodecError::BadVersion { got: 2 })
         ));
+    }
+
+    #[test]
+    fn supply_coverage_refuses_a_state_tip_behind_fork_choice_without_a_wire_change() {
+        let partial = Telemetry::assemble(14, Some(8), 75, 0, 3, 0, MAX_LAG)
+            .with_supply(vec![SupplyEpoch {
+                epoch: 0,
+                start_height: 0,
+                end_height: 4,
+                measured_coinbase: 123,
+                expected_coinbase: 123,
+                fees: 0,
+            }]);
+        assert_eq!(
+            partial.supply_coverage(),
+            SupplyCoverage::Unavailable {
+                state_tip: Some(4),
+                fork_choice_tip: 14,
+            }
+        );
+
+        let decoded = Telemetry::from_bytes(&partial.to_bytes()).unwrap();
+        assert_eq!(decoded.supply_coverage(), partial.supply_coverage());
+        assert_eq!(decoded.to_bytes()[0], 0x03, "coverage uses fields already on v3");
     }
 
     /// **Acceptance (#117): a `0x01` payload is REJECTED, not best-effort parsed.**
