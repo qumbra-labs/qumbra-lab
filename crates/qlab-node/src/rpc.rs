@@ -46,7 +46,8 @@
 //! unknown-version and trailing-byte rejection — and are round-trip +
 //! golden-digest locked here. The compact/full/frontier wires are **not** touched
 //! and stay at [`qlab_cbserver::WIRE_VERSION`]; issue #117 moved `RPC_VERSION` to
-//! `0x02` and see its doc for why the two constants are no longer the same one.
+//! `0x02`, and issue #121 moved it to `0x03`. See its doc for why the two
+//! constants are no longer the same one.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,11 +74,13 @@ use crate::telemetry::{LocalCommitment, Telemetry};
 /// The RPC wire-format version byte for the node's **own** surfaces —
 /// `/v1/status`, `/v1/anchors` and `/v1/telemetry`.
 ///
-/// **`0x02` since issue #117.** It was `0x01`, defined as `= qlab_cbserver::
+/// **`0x03` since issue #121.** It was `0x01`, defined as `= qlab_cbserver::
 /// WIRE_VERSION` and documented as deliberately equal "so a client speaks one
 /// version to the whole node". Adding the finalized-checkpoint identity to
 /// [`Telemetry`] is a payload change on a reject-unknown-version wire, so the
-/// bump is the ratified mechanism (#117) — and it necessarily severs that tie:
+/// `0x02` bump was the ratified mechanism (#117). Adding the public committee
+/// aggregates and supply attestation makes the same ratified bump to `0x03`
+/// (#121) — and it necessarily keeps that tie severed:
 ///
 /// - The ratified **compact-block** family (`/v1/compact`, `/v1/…/full`,
 ///   `/v1/tree/frontier`) stays at [`qlab_cbserver::WIRE_VERSION`] = `0x01`. It
@@ -90,9 +93,9 @@ use crate::telemetry::{LocalCommitment, Telemetry};
 ///   an old reader failing loudly against a new node is the reject-unknown
 ///   feature working, not a regression.
 ///
-/// So a client now speaks `0x02` to the node's own wires and `0x01` to the
+/// So a client now speaks `0x03` to the node's own wires and `0x01` to the
 /// compact-block wires it shares with the `qlab-cbserver` reference server.
-pub const RPC_VERSION: u8 = 0x02;
+pub const RPC_VERSION: u8 = 0x03;
 
 // ---------------------------------------------------------------------------
 // Transaction identity + note-discovery artifacts
@@ -1112,27 +1115,29 @@ mod tests {
         assert!(matches!(AnchorSet::from_bytes(&extra_a), Err(CodecError::TrailingBytes { .. })));
     }
 
-    /// Issue #117's **collateral, made explicit**: `/v1/status` and `/v1/anchors`
+    /// Issue #121's **collateral, made explicit**: `/v1/status` and `/v1/anchors`
     /// share `RPC_VERSION` with `/v1/telemetry`, so bumping it for the checkpoint
-    /// identity moves them to `0x02` too even though their payloads are byte-for-
+    /// telemetry tail moves them to `0x03` too even though their payloads are byte-for-
     /// byte what they were. A `0x01` reader now fails loudly against them.
     ///
     /// That is the accepted trade (see [`RPC_VERSION`]'s doc), and it is locked
     /// here so nobody later "fixes" it back into a silent accept-both.
     #[test]
-    fn status_and_anchors_moved_to_0x02_with_telemetry_and_reject_0x01() {
+    fn status_and_anchors_moved_to_0x03_with_telemetry_and_reject_older_versions() {
         let (rpc, _) = rpc_with_finalized_genesis();
-        assert_eq!(RPC_VERSION, 0x02);
+        assert_eq!(RPC_VERSION, 0x03);
 
         for mut payload in [rpc.status().to_bytes(), rpc.anchors().to_bytes(), rpc.telemetry().to_bytes()] {
-            assert_eq!(payload[0], 0x02, "the node's own surfaces move as one");
-            payload[0] = 0x01;
-            let as_status = NodeStatus::from_bytes(&payload);
-            let as_anchors = AnchorSet::from_bytes(&payload);
-            let as_telemetry = Telemetry::from_bytes(&payload);
-            assert!(matches!(as_status, Err(CodecError::BadVersion { got: 1 })));
-            assert!(matches!(as_anchors, Err(CodecError::BadVersion { got: 1 })));
-            assert!(matches!(as_telemetry, Err(CodecError::BadVersion { got: 1 })));
+            assert_eq!(payload[0], 0x03, "the node's own surfaces move as one");
+            for old in [0x01, 0x02] {
+                payload[0] = old;
+                let as_status = NodeStatus::from_bytes(&payload);
+                let as_anchors = AnchorSet::from_bytes(&payload);
+                let as_telemetry = Telemetry::from_bytes(&payload);
+                assert!(matches!(as_status, Err(CodecError::BadVersion { got }) if got == old));
+                assert!(matches!(as_anchors, Err(CodecError::BadVersion { got }) if got == old));
+                assert!(matches!(as_telemetry, Err(CodecError::BadVersion { got }) if got == old));
+            }
         }
 
         // …while the ratified compact-block family is untouched at 0x01. Bumping it

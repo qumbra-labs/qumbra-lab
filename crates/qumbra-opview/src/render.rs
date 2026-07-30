@@ -20,16 +20,16 @@ pub fn table(readings: &[NodeReading]) -> String {
     let label_w = readings.iter().map(|r| r.endpoint.label.len()).max().unwrap_or(4).max(4);
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<label_w$}  {:>8} {:>8} {:>13} {:>9} {:>6} {:>6} {:>5} {:>5} {:>10} {:>8} {:>13}\n",
-        "NODE", "TIP", "FINAL", "FID", "REGIME", "STALL", "AGE_S", "PEERS", "EPOCH", "DIFF",
-        "SSLOT", "SID",
+        "{:<label_w$}  {:>8} {:>8} {:>13} {:>9} {:>6} {:>6} {:>5} {:>5} {:>6} {:>6} {:>6} {:>10} {:>8} {:>13}\n",
+        "NODE", "TIP", "FINAL", "FID", "REGIME", "STALL", "AGE_S", "PEERS", "EPOCH", "C_SIZE",
+        "C_ACT", "C_QRM", "DIFF", "SSLOT", "SID",
     ));
     for r in readings {
         match &r.reading {
             Reading::Ok(t) => {
                 let regime = format!("{:?}", t.finality_status);
                 out.push_str(&format!(
-                    "{:<label_w$}  {:>8} {:>8} {:>13} {:>9} {:>6} {:>6} {:>5} {:>5} {:>10} {:>8} {:>13}\n",
+                    "{:<label_w$}  {:>8} {:>8} {:>13} {:>9} {:>6} {:>6} {:>5} {:>5} {:>6} {:>6} {:>6} {:>10} {:>8} {:>13}\n",
                     r.endpoint.label,
                     t.tip_height,
                     t.finalized_height.map(|h| h.to_string()).unwrap_or_else(|| "-".into()),
@@ -42,6 +42,9 @@ pub fn table(readings: &[NodeReading]) -> String {
                     t.age_field(),
                     t.peer_count,
                     t.epoch,
+                    t.committee_size,
+                    t.committee_active,
+                    t.committee_quorum,
                     t.diff_field(),
                     t.sslot_field(),
                     t.sid_field(),
@@ -189,6 +192,7 @@ mod tests {
 
     fn t(fin: Option<u64>, fid: Option<u64>, signed: Option<(u64, Option<u64>)>) -> Telemetry {
         Telemetry::assemble(3800, fin, 75, 0, 3, 0, 16)
+            .with_committee(21, 19, 15)
             .with_checkpoint(fid, signed.map(|(slot, id)| LocalCommitment { slot, id }))
             .with_tip_difficulty(Some(1_048_576))
     }
@@ -295,5 +299,26 @@ mod tests {
         assert!(text.contains("signed variant (sslot/sid): AGREED"), "{text}");
         assert!(text.contains("010203040506"), "{text}");
         assert!(text.contains("1048576"), "difficulty renders:\n{text}");
+        assert!(text.contains("C_SIZE"), "committee header renders:\n{text}");
+        assert!(text.contains("    21     19     15"), "committee aggregates render:\n{text}");
+    }
+
+    /// **Acceptance (#121): the public view has no per-signer participation
+    /// family.** Aggregates are useful; a roster availability map is an attacker's
+    /// checklist. Keep the exact private metric/journal tokens out so a future
+    /// well-meaning renderer addition breaks this test.
+    #[test]
+    fn public_view_cannot_render_per_signer_participation() {
+        let readings =
+            vec![ok("node0", t(Some(384), Some(0x0102_0304_0506), Some((384, Some(0x0102_0304_0506)))))];
+        let text = view(&readings, &Agreement::of(&readings));
+        for forbidden in [
+            "qumbra_committee_signed",
+            "qumbra_committee_absent",
+            "voted=",
+            "absent=",
+        ] {
+            assert!(!text.contains(forbidden), "public view leaked `{forbidden}`:\n{text}");
+        }
     }
 }

@@ -41,8 +41,10 @@
 //!
 //! Appending them is a breaking change on a reject-unknown-version wire — that is
 //! deliberate (§0: a truncated or stale read fails loudly instead of misparsing),
-//! and it is why [`RPC_VERSION`] went `0x01` → `0x02`. An old reader is *supposed*
-//! to fail against a new node.
+//! and it is why [`RPC_VERSION`] went `0x01` → `0x02`. Issue #121 adds only the
+//! publishable committee aggregates (never signer identities) and the supply
+//! attestation, moving the wire to `0x03`. An old reader is *supposed* to fail
+//! against a new node.
 
 use qlab_cbserver::codec::CodecError;
 use qlab_devnet::committee::checkpoint_id_hex;
@@ -134,6 +136,16 @@ pub struct Telemetry {
     pub mempool_size: u64,
     /// Current committee epoch (injected from the P2P/committee layer).
     pub epoch: u64,
+    /// Roster size of the current committee.
+    ///
+    /// This is deliberately an aggregate. Per-signer participation belongs on the
+    /// operator's loopback `/metrics` and in the `ROUND` journal, never on this
+    /// public wire (issue #121).
+    pub committee_size: u64,
+    /// Active committee members (roster minus tombstoned/jailed).
+    pub committee_active: u64,
+    /// Quorum threshold currently in force, read from committee state.
+    pub committee_quorum: u64,
     /// **The identity of the finalized checkpoint** (`fid`, issue #117), or `None`
     /// when nothing is finalized *or* when the composition serving this snapshot
     /// does not carry a committee finality tracker to read it from.
@@ -216,10 +228,29 @@ impl Telemetry {
             peer_count,
             mempool_size,
             epoch,
+            committee_size: 0,
+            committee_active: 0,
+            committee_quorum: 0,
             finalized_id: None,
             signed: None,
             tip_difficulty: None,
         }
+    }
+
+    /// Stamp in the public committee aggregates (issue #121).
+    ///
+    /// There is intentionally no signer list in this type, so neither the wire nor
+    /// any consumer can accidentally turn it into an availability map.
+    pub fn with_committee(
+        mut self,
+        committee_size: u64,
+        committee_active: u64,
+        committee_quorum: u64,
+    ) -> Self {
+        self.committee_size = committee_size;
+        self.committee_active = committee_active;
+        self.committee_quorum = committee_quorum;
+        self
     }
 
     /// Stamp in the checkpoint-identity half (issue #117), the way
@@ -293,12 +324,13 @@ impl Telemetry {
         }
     }
 
-    /// `version(0x02) ‖ finality(u8) ‖ tip(8 LE) ‖ has_final(u8) ‖
+    /// `version(0x03) ‖ finality(u8) ‖ tip(8 LE) ‖ has_final(u8) ‖
     /// [final_height(8 LE) if has] ‖ stall_depth(8) ‖ age_secs(8) ‖
     /// peer_count(8) ‖ mempool_size(8) ‖ epoch(8) ‖`
     /// `has_fid(u8) ‖ [finalized_id(8 LE) if has] ‖ has_signed(u8) ‖`
     /// `[signed_slot(8 LE) ‖ has_signed_id(u8) ‖ [signed_id(8 LE) if has] if has] ‖`
-    /// `has_diff(u8) ‖ [tip_difficulty(8 LE) if has]`.
+    /// `has_diff(u8) ‖ [tip_difficulty(8 LE) if has] ‖`
+    /// `committee_size(8 LE) ‖ committee_active(8 LE) ‖ committee_quorum(8 LE)`.
     ///
     /// The `0x02` tail (issue #117) nests `sid` **inside** `sslot`'s presence, so
     /// "an identity with no slot" is not representable on the wire: a signed
@@ -357,6 +389,10 @@ impl Telemetry {
             }
             None => out.push(0),
         }
+        // ---- issue #121: publishable committee aggregates only --------------
+        out.extend_from_slice(&self.committee_size.to_le_bytes());
+        out.extend_from_slice(&self.committee_active.to_le_bytes());
+        out.extend_from_slice(&self.committee_quorum.to_le_bytes());
         out
     }
 
@@ -389,6 +425,9 @@ impl Telemetry {
             None
         };
         let tip_difficulty = if r.u8()? == 1 { Some(r.u64()?) } else { None };
+        let committee_size = r.u64()?;
+        let committee_active = r.u64()?;
+        let committee_quorum = r.u64()?;
         r.finish()?;
         Ok(Telemetry {
             finality_status,
@@ -399,6 +438,9 @@ impl Telemetry {
             peer_count,
             mempool_size,
             epoch,
+            committee_size,
+            committee_active,
+            committee_quorum,
             finalized_id,
             signed,
             tip_difficulty,
@@ -548,11 +590,11 @@ mod tests {
         out
     }
 
-    /// **Acceptance (#117): `Telemetry` round-trips at `0x02`** across every state
-    /// the identity half can be in — absent, present, and the `split` case where a
-    /// node's own keys are committed to two variants at one slot.
+    /// `Telemetry` keeps the #117 identity states intact at `0x03`: absent,
+    /// present, and the `split` case where a node's own keys are committed to two
+    /// variants at one slot.
     #[test]
-    fn telemetry_roundtrips_checkpoint_identity_at_0x02() {
+    fn telemetry_roundtrips_checkpoint_identity_at_0x03() {
         let base = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 2, MAX_LAG);
 
         // Nothing injected: the composition cannot see the identity. Fields render
@@ -564,7 +606,7 @@ mod tests {
         assert_eq!(base.sid_field(), "-");
         assert_eq!(Telemetry::from_bytes(&base.to_bytes()).unwrap(), base);
         assert_eq!(base.to_bytes()[0], RPC_VERSION);
-        assert_eq!(RPC_VERSION, 0x02, "the ratified bump");
+        assert_eq!(RPC_VERSION, 0x03, "the ratified issue #121 bump");
 
         // Fully populated: finalized identity + this node's own signed variant.
         let full = base
@@ -599,6 +641,28 @@ mod tests {
         );
     }
 
+    /// **Acceptance (#121): committee aggregates round-trip at `0x03`, while the
+    /// immediately preceding `0x02` wire is rejected on its version byte.**
+    #[test]
+    fn committee_aggregates_roundtrip_at_0x03_and_0x02_is_rejected() {
+        let t = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 3, MAX_LAG)
+            .with_committee(21, 19, 15);
+        let bytes = t.to_bytes();
+        assert_eq!(bytes[0], 0x03);
+        assert_eq!(Telemetry::from_bytes(&bytes).unwrap(), t);
+        assert_eq!(
+            (t.epoch, t.committee_size, t.committee_active, t.committee_quorum),
+            (3, 21, 19, 15),
+        );
+
+        let mut old = bytes;
+        old[0] = 0x02;
+        assert!(matches!(
+            Telemetry::from_bytes(&old),
+            Err(CodecError::BadVersion { got: 2 })
+        ));
+    }
+
     /// **Acceptance (#117): a `0x01` payload is REJECTED, not best-effort parsed.**
     ///
     /// This is the property the version byte exists for. A stale reader against a
@@ -621,13 +685,13 @@ mod tests {
             "a 0x01 payload must be rejected on the version byte"
         );
 
-        // And the tail is not optional: a v2-stamped payload that stops where v1
-        // stopped is truncated, not "v2 with the identity absent".
+        // And the tail is not optional: a current-version-stamped payload that
+        // stops where v1 stopped is truncated, not "current with the tail absent".
         let mut stamped = old.clone();
         stamped[0] = RPC_VERSION;
         assert!(
             matches!(Telemetry::from_bytes(&stamped), Err(CodecError::Truncated { .. })),
-            "the identity tail is mandatory at 0x02"
+            "the versioned tails are mandatory at 0x03"
         );
     }
 }

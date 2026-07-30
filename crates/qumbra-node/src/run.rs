@@ -578,6 +578,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 tip_ts.saturating_sub(base_ts)
             }
         };
+        let committee = node.slot_context(node.tip_height());
         Telemetry::assemble_with_halt(
             node.tip_height(),
             node.finalized_height(),
@@ -587,6 +588,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             node.committee().current_epoch(),
             DEGRADED_MODE_LAG_BLOCKS,
             self.halt_at,
+        )
+        .with_committee(
+            committee.roster as u64,
+            committee.active as u64,
+            committee.need as u64,
         )
         .with_checkpoint(self.finalized_checkpoint_id(), self.local_commitment())
         .with_tip_difficulty(chain.header(&chain.tip_hash()).map(|h| h.difficulty))
