@@ -120,6 +120,41 @@ would look exactly like a node that had finalized nothing. The image must be
 rebuilt for the view to read anything (`deny_unknown_fields` also means an old
 binary refuses the new config outright — ship the binary first).
 
+### The faucet (`qumbra-faucet`, issue #123)
+
+A **fifth** container, and deliberately not one of the four: it holds **no committee
+keys**, because `testnet-plan.md` §6.2 rules that a node holding committee keys
+exposes nothing beyond P2P — so the faucet's hot spending key never shares a host
+with them. `qumbra-faucet` **refuses to start** if its node config names any key
+file, so this is enforced rather than documented.
+
+```sh
+docker compose -f deploy/docker/docker-compose.yml up -d --build faucet
+open http://127.0.0.1:9450/                    # the page a person uses
+curl http://127.0.0.1:9414/v1/telemetry        # its keyless node's telemetry
+docker exec qumbra-t0-lite-faucet-1 \
+    qumbra-faucet ticket --config /data/faucet.toml --id 1   # one single-use ticket
+```
+
+The in-container bind is `0.0.0.0:9450` — a private bridge namespace, the same
+argument this file already makes for `telemetry_addr` — and compose publishes it to
+**`127.0.0.1` on the host**, which is where the exposure decision actually lives. On a
+real host, off-loopback is a deliberate act paired with a source-restricted inbound
+rule, and the binary says so loudly at every startup that is not on loopback.
+
+Key material is minted **once** into the faucet's own volume (`0600`) and reused
+across restarts, so the faucet keeps what it has mined. `QUMBRA_FAUCET_TICKETS=open`
+turns tickets off; `qlab_faucet::policy` prices exactly what that costs (saturable by
+roughly a hundred distinct subnets).
+
+🔴 **It cannot serve a grant on a fresh net for ~3 h.** `COINBASE_MATURITY_BLOCKS` =
+144 (FROZEN §2) at the frozen 75 s block time, and a 2×2 bucket needs **two** matured
+notes. Until then the page names the height it changes at and **refuses** rather than
+queueing a request it cannot honour. Two further blockers are recorded on issue #123
+and are not fixed: a recipient cannot detect a grant on a net whose nodes serve no
+note discovery, and a node's state machine desynchronises permanently from its own
+chain once it falls one block behind.
+
 ## Running the protocol
 
 ```sh
