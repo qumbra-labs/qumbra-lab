@@ -66,6 +66,11 @@ services:
     environment:
       QUMBRA_BIN: ${NODE0_BIN:-qumbra-node}
       QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
+    # /v1/telemetry (issue #117), published so `qumbra-opview` can be run from the
+    # host: `qumbra-opview node0=http://127.0.0.1:9410 …`. Read-only, GET only,
+    # bound to localhost on the host side — nothing here is reachable off-machine.
+    ports:
+      - "127.0.0.1:9410:9410"
     command: ["run", "0"]   # holds committee keys 00..05 (6)
     volumes:
       - shared:/shared
@@ -80,6 +85,11 @@ services:
     environment:
       QUMBRA_BIN: ${NODE1_BIN:-qumbra-node}
       QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
+    # /v1/telemetry (issue #117), published so `qumbra-opview` can be run from the
+    # host: `qumbra-opview node0=http://127.0.0.1:9410 …`. Read-only, GET only,
+    # bound to localhost on the host side — nothing here is reachable off-machine.
+    ports:
+      - "127.0.0.1:9411:9410"
     command: ["run", "1"]   # holds committee keys 06..10 (5)
     volumes:
       - shared:/shared
@@ -94,6 +104,11 @@ services:
     environment:
       QUMBRA_BIN: ${NODE2_BIN:-qumbra-node}
       QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
+    # /v1/telemetry (issue #117), published so `qumbra-opview` can be run from the
+    # host: `qumbra-opview node0=http://127.0.0.1:9410 …`. Read-only, GET only,
+    # bound to localhost on the host side — nothing here is reachable off-machine.
+    ports:
+      - "127.0.0.1:9412:9410"
     command: ["run", "2"]   # holds committee keys 11..15 (5)
     volumes:
       - shared:/shared
@@ -108,6 +123,11 @@ services:
     environment:
       QUMBRA_BIN: ${NODE3_BIN:-qumbra-node}
       QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
+    # /v1/telemetry (issue #117), published so `qumbra-opview` can be run from the
+    # host: `qumbra-opview node0=http://127.0.0.1:9410 …`. Read-only, GET only,
+    # bound to localhost on the host side — nothing here is reachable off-machine.
+    ports:
+      - "127.0.0.1:9413:9410"
     command: ["run", "3"]   # holds committee keys 16..20 (5)
     volumes:
       - shared:/shared

@@ -7,14 +7,45 @@
 //! runbook (and the T0-3 soak monitor) actually watch — stall depth, how long
 //! finality has been stuck, peers, mempool, heights, and epoch.
 //!
-//! Wire discipline mirrors the N6 surfaces ([`crate::rpc::NodeStatus`]): a `0x01`
-//! lead version byte, little-endian fixed fields, and reject-unknown-version /
-//! reject-trailing on decode (§0). Peer count and epoch are **injected** from the
-//! P2P layer (they are not node-state — the N1 traits do not carry them), so the
-//! node-owned half is assembled from live state and the network half is stamped in
-//! by the p2p glue via [`crate::rpc::NodeRpc::set_net_facts`].
+//! Wire discipline mirrors the N6 surfaces ([`crate::rpc::NodeStatus`]): a
+//! [`RPC_VERSION`] lead version byte, little-endian fixed fields, and
+//! reject-unknown-version / reject-trailing on decode (§0). Peer count and epoch
+//! are **injected** from the P2P layer (they are not node-state — the N1 traits do
+//! not carry them), so the node-owned half is assembled from live state and the
+//! network half is stamped in by the p2p glue via
+//! [`crate::rpc::NodeRpc::set_net_facts`].
+//!
+//! # Checkpoint identity (issue #117, wire `0x02`)
+//!
+//! `final=` says how *high* a node finalized and never *what*, so two nodes that
+//! finalized different checkpoints at one height printed identical telemetry.
+//! #110 put the identity on the `TELEMETRY` log line and on `/metrics`; this wire
+//! carries it too, because it is the operator surface and checkpoint identity is
+//! the operator's most severe question. Mirroring the log line:
+//!
+//! - [`Telemetry::finalized_id`] (`fid`) — **what** this node finalized.
+//! - [`Telemetry::signed`] (`sslot`/`sid`) — what this node's own committee keys
+//!   are committed to, and at which slot. A minority that signed a different
+//!   variant still finalizes the majority's, so a split shows up *here* while
+//!   `final` and `fid` still agree everywhere.
+//! - [`Telemetry::tip_difficulty`] (`diff`) — a **fourth** field beyond the three
+//!   the #117 decision named, added because the operator view that decision exists
+//!   to serve is required to render difficulty per node and no wire carried it.
+//!   Riding the same version bump costs nothing extra; shipping a column that
+//!   could only say `-` would.
+//!
+//! Like peer count and epoch, they are **injected**: they live in the committee
+//! finality tracker and the never-double-sign ledgers, not in [`crate::Node`].
+//! A composition that does not inject them reports them absent, which is the
+//! truth about that composition rather than a zero standing in for one.
+//!
+//! Appending them is a breaking change on a reject-unknown-version wire — that is
+//! deliberate (§0: a truncated or stale read fails loudly instead of misparsing),
+//! and it is why [`RPC_VERSION`] went `0x01` → `0x02`. An old reader is *supposed*
+//! to fail against a new node.
 
 use qlab_cbserver::codec::CodecError;
+use qlab_devnet::committee::checkpoint_id_hex;
 use qlab_devnet::ebbflow::FinalityStatus;
 use qlab_devnet::halt::regime as halt_regime;
 
@@ -28,6 +59,46 @@ const STATUS_DEGRADED: u8 = 1;
 const STATUS_HALTING: u8 = 2;
 /// Wire discriminant for [`FinalityStatus::Halted`].
 const STATUS_HALTED: u8 = 3;
+
+/// The `sid=` token when a node's own held keys are committed to *different*
+/// checkpoints at the same slot (issue #84). Distinguishable from an identity by
+/// length and by not being hex; see [`LocalCommitment::id_field`].
+///
+/// *(Moved here from `qumbra-node`'s run loop by issue #117 so the wire, the log
+/// line and any reader share one definition; `qumbra_node::run` re-exports it.)*
+pub const LOCAL_COMMITMENT_SPLIT: &str = "split";
+
+/// What a node's own committee keys are committed to at one slot (issue #84).
+///
+/// The slot reported is the highest any held key has committed to, which is
+/// deliberately **not** the finalized height: at a split, the minority still
+/// finalizes the majority's checkpoint, so the two nodes agree on `final` (and on
+/// `fid`) and differ only here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalCommitment {
+    /// The highest slot any held key has committed to.
+    pub slot: u64,
+    /// The identity every held key that committed to `slot` agrees on, or `None`
+    /// when they disagree — this node's key set is split across two variants.
+    pub id: Option<u64>,
+}
+
+impl LocalCommitment {
+    /// The `sid=` field: the identity hex, or [`LOCAL_COMMITMENT_SPLIT`] when this
+    /// node's own held keys are committed to different checkpoints for one slot.
+    ///
+    /// `split` is reachable — a key restored from a ledger written on one history
+    /// refuses to re-sign while a key with no ledger signs the new one — and it is
+    /// this node equivocating against itself across its own key set. Picking one of
+    /// the two to print would be the exact failure #84 exists to remove: a line
+    /// that looks healthy while the thing it describes is not.
+    pub fn id_field(&self) -> String {
+        match self.id {
+            Some(id) => checkpoint_id_hex(Some(id)),
+            None => LOCAL_COMMITMENT_SPLIT.to_string(),
+        }
+    }
+}
 
 /// A single observability snapshot of a node's finality health.
 ///
@@ -55,6 +126,29 @@ pub struct Telemetry {
     pub mempool_size: u64,
     /// Current committee epoch (injected from the P2P/committee layer).
     pub epoch: u64,
+    /// **The identity of the finalized checkpoint** (`fid`, issue #117), or `None`
+    /// when nothing is finalized *or* when the composition serving this snapshot
+    /// does not carry a committee finality tracker to read it from.
+    ///
+    /// Injected via [`Self::with_checkpoint`] — see the module docs. Two nodes
+    /// reporting the same `finalized_height` with different `finalized_id` is two
+    /// different checkpoints at one height: the R2 stop condition, and the reason
+    /// this field exists.
+    pub finalized_id: Option<u64>,
+    /// **What this node's own committee keys are committed to** (`sslot`/`sid`,
+    /// issue #117), or `None` when it holds no committee keys, has committed to
+    /// nothing, or the composition does not inject it.
+    pub signed: Option<LocalCommitment>,
+    /// The tip block's PoW difficulty (issue #117), or `None` when the tip header
+    /// is not available to the composition serving this snapshot.
+    ///
+    /// Already on the `TELEMETRY` log line as `diff=` (Phase B-lite amendment-1
+    /// item 4, so the LWMA retarget trace is visible over a soak) and on
+    /// `/metrics`, but on no wire — and #117's operator view is required to render
+    /// it per node. Carried here inside the same `0x02` bump rather than shipping a
+    /// column that could only ever say `-`; see the PR for why this is a fourth
+    /// field beside the three the decision named.
+    pub tip_difficulty: Option<u64>,
 }
 
 impl Telemetry {
@@ -114,12 +208,75 @@ impl Telemetry {
             peer_count,
             mempool_size,
             epoch,
+            finalized_id: None,
+            signed: None,
+            tip_difficulty: None,
         }
     }
 
-    /// `version(0x01) ‖ finality(u8) ‖ tip(8 LE) ‖ has_final(u8) ‖
+    /// Stamp in the checkpoint-identity half (issue #117), the way
+    /// [`crate::rpc::NodeRpc::set_net_facts`] stamps in peers/epoch: these live in
+    /// the committee finality tracker and the never-double-sign ledgers, which
+    /// [`crate::Node`] does not own.
+    ///
+    /// Leaving them unset is honest, not a gap — it says "this composition cannot
+    /// see the identity", which is different from "there is no identity", and a
+    /// reader that needs the distinction has it.
+    pub fn with_checkpoint(
+        mut self,
+        finalized_id: Option<u64>,
+        signed: Option<LocalCommitment>,
+    ) -> Self {
+        self.finalized_id = finalized_id;
+        self.signed = signed;
+        self
+    }
+
+    /// Stamp in the tip block's PoW difficulty (issue #117) — the `diff=` field of
+    /// the `TELEMETRY` line, which lives in the header chain rather than in the
+    /// finality state.
+    pub fn with_tip_difficulty(mut self, difficulty: Option<u64>) -> Self {
+        self.tip_difficulty = difficulty;
+        self
+    }
+
+    /// The `diff=` field: the tip block's difficulty, or `-` when unavailable.
+    pub fn diff_field(&self) -> String {
+        self.tip_difficulty.map(|d| d.to_string()).unwrap_or_else(|| "-".to_string())
+    }
+
+    /// The `fid=` field: the finalized checkpoint's identity as the canonical
+    /// 12-char lowercase hex, or `-` when absent — the same rendering as the
+    /// `TELEMETRY` log line (#84), from the same helper.
+    pub fn fid_field(&self) -> String {
+        checkpoint_id_hex(self.finalized_id)
+    }
+
+    /// The `sslot=` field: the slot this node's keys last committed to, or `-`.
+    pub fn sslot_field(&self) -> String {
+        self.signed.map(|c| c.slot.to_string()).unwrap_or_else(|| "-".to_string())
+    }
+
+    /// The `sid=` field: the signed identity hex, `-` when this node holds no
+    /// committee keys or has committed to nothing, or
+    /// [`LOCAL_COMMITMENT_SPLIT`] when its own keys disagree.
+    pub fn sid_field(&self) -> String {
+        match self.signed {
+            None => checkpoint_id_hex(None),
+            Some(c) => c.id_field(),
+        }
+    }
+
+    /// `version(0x02) ‖ finality(u8) ‖ tip(8 LE) ‖ has_final(u8) ‖
     /// [final_height(8 LE) if has] ‖ stall_depth(8) ‖ age_secs(8) ‖
-    /// peer_count(8) ‖ mempool_size(8) ‖ epoch(8)`.
+    /// peer_count(8) ‖ mempool_size(8) ‖ epoch(8) ‖`
+    /// `has_fid(u8) ‖ [finalized_id(8 LE) if has] ‖ has_signed(u8) ‖`
+    /// `[signed_slot(8 LE) ‖ has_signed_id(u8) ‖ [signed_id(8 LE) if has] if has] ‖`
+    /// `has_diff(u8) ‖ [tip_difficulty(8 LE) if has]`.
+    ///
+    /// The `0x02` tail (issue #117) nests `sid` **inside** `sslot`'s presence, so
+    /// "an identity with no slot" is not representable on the wire: a signed
+    /// identity without the slot it was signed at is not a fact anyone can act on.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(RPC_VERSION);
@@ -142,6 +299,38 @@ impl Telemetry {
         out.extend_from_slice(&self.peer_count.to_le_bytes());
         out.extend_from_slice(&self.mempool_size.to_le_bytes());
         out.extend_from_slice(&self.epoch.to_le_bytes());
+        // ---- issue #117: the checkpoint-identity tail ----
+        match self.finalized_id {
+            Some(id) => {
+                out.push(1);
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+        match self.signed {
+            Some(c) => {
+                out.push(1);
+                out.extend_from_slice(&c.slot.to_le_bytes());
+                match c.id {
+                    Some(id) => {
+                        out.push(1);
+                        out.extend_from_slice(&id.to_le_bytes());
+                    }
+                    // The `split` state: this node's own keys are committed to two
+                    // different variants at one slot, so there is no single identity
+                    // to encode. Absent-with-a-slot IS the signal.
+                    None => out.push(0),
+                }
+            }
+            None => out.push(0),
+        }
+        match self.tip_difficulty {
+            Some(d) => {
+                out.push(1);
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+            None => out.push(0),
+        }
         out
     }
 
@@ -164,6 +353,16 @@ impl Telemetry {
         let peer_count = r.u64()?;
         let mempool_size = r.u64()?;
         let epoch = r.u64()?;
+        // ---- issue #117: the checkpoint-identity tail ----
+        let finalized_id = if r.u8()? == 1 { Some(r.u64()?) } else { None };
+        let signed = if r.u8()? == 1 {
+            let slot = r.u64()?;
+            let id = if r.u8()? == 1 { Some(r.u64()?) } else { None };
+            Some(LocalCommitment { slot, id })
+        } else {
+            None
+        };
+        let tip_difficulty = if r.u8()? == 1 { Some(r.u64()?) } else { None };
         r.finish()?;
         Ok(Telemetry {
             finality_status,
@@ -174,6 +373,9 @@ impl Telemetry {
             peer_count,
             mempool_size,
             epoch,
+            finalized_id,
+            signed,
+            tip_difficulty,
         })
     }
 }
@@ -242,10 +444,10 @@ mod tests {
 
         // Unknown version byte.
         let mut bad_ver = good.clone();
-        bad_ver[0] = 2;
+        bad_ver[0] = 9;
         assert!(matches!(
             Telemetry::from_bytes(&bad_ver),
-            Err(CodecError::BadVersion { got: 2 })
+            Err(CodecError::BadVersion { got: 9 })
         ));
 
         // Unknown finality-status discriminant (byte 1).
@@ -266,5 +468,118 @@ mod tests {
 
         // Truncation.
         assert!(Telemetry::from_bytes(&good[..good.len() - 1]).is_err());
+    }
+
+    // ---- issue #117: the checkpoint-identity tail ---------------------------
+
+    /// The pre-#117 `0x01` encoding, hand-rolled. This is what a node built before
+    /// this change emits and what a reader built before it expects — kept here as a
+    /// literal so the rejection test cannot drift with the encoder it is testing.
+    fn v1_payload(t: &Telemetry) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(0x01);
+        out.push(match t.finality_status {
+            FinalityStatus::Final => STATUS_FINAL,
+            FinalityStatus::Degraded => STATUS_DEGRADED,
+            FinalityStatus::Halting => STATUS_HALTING,
+            FinalityStatus::Halted => STATUS_HALTED,
+        });
+        out.extend_from_slice(&t.tip_height.to_le_bytes());
+        match t.finalized_height {
+            Some(h) => {
+                out.push(1);
+                out.extend_from_slice(&h.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&t.stall_depth.to_le_bytes());
+        out.extend_from_slice(&t.last_finalized_age_secs.to_le_bytes());
+        out.extend_from_slice(&t.peer_count.to_le_bytes());
+        out.extend_from_slice(&t.mempool_size.to_le_bytes());
+        out.extend_from_slice(&t.epoch.to_le_bytes());
+        out
+    }
+
+    /// **Acceptance (#117): `Telemetry` round-trips at `0x02`** across every state
+    /// the identity half can be in — absent, present, and the `split` case where a
+    /// node's own keys are committed to two variants at one slot.
+    #[test]
+    fn telemetry_roundtrips_checkpoint_identity_at_0x02() {
+        let base = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 2, MAX_LAG);
+
+        // Nothing injected: the composition cannot see the identity. Fields render
+        // as absent, exactly like the `TELEMETRY` log line's `-`.
+        assert_eq!(base.finalized_id, None);
+        assert_eq!(base.signed, None);
+        assert_eq!(base.fid_field(), "-");
+        assert_eq!(base.sslot_field(), "-");
+        assert_eq!(base.sid_field(), "-");
+        assert_eq!(Telemetry::from_bytes(&base.to_bytes()).unwrap(), base);
+        assert_eq!(base.to_bytes()[0], RPC_VERSION);
+        assert_eq!(RPC_VERSION, 0x02, "the ratified bump");
+
+        // Fully populated: finalized identity + this node's own signed variant.
+        let full = base
+            .clone()
+            .with_checkpoint(Some(0x3f1a_9c2b_0d41), Some(LocalCommitment { slot: 3776, id: Some(0x3f1a_9c2b_0d41) }))
+            .with_tip_difficulty(Some(1_048_576));
+        assert_eq!(full.diff_field(), "1048576");
+        assert_eq!(base.diff_field(), "-", "absent until injected");
+        assert_eq!(full.fid_field(), "3f1a9c2b0d41");
+        assert_eq!(full.sslot_field(), "3776");
+        assert_eq!(full.sid_field(), "3f1a9c2b0d41");
+        assert_eq!(Telemetry::from_bytes(&full.to_bytes()).unwrap(), full);
+
+        // The split: a slot, and deliberately no identity for it.
+        let split = base
+            .clone()
+            .with_checkpoint(Some(0x3f1a_9c2b_0d41), Some(LocalCommitment { slot: 3776, id: None }));
+        assert_eq!(split.sslot_field(), "3776");
+        assert_eq!(split.sid_field(), LOCAL_COMMITMENT_SPLIT);
+        assert_eq!(Telemetry::from_bytes(&split.to_bytes()).unwrap(), split);
+
+        // A verify-only node: it finalized something, but holds no keys, so it has
+        // signed nothing. Distinct on the wire from the split above.
+        let verify_only = base.clone().with_checkpoint(Some(0x3f1a_9c2b_0d41), None);
+        assert_eq!(verify_only.sslot_field(), "-");
+        assert_eq!(verify_only.sid_field(), "-");
+        assert_eq!(Telemetry::from_bytes(&verify_only.to_bytes()).unwrap(), verify_only);
+        assert_ne!(
+            verify_only.to_bytes(),
+            split.to_bytes(),
+            "`no keys` and `my keys disagree` must not encode alike — one is fine and one is a finding"
+        );
+    }
+
+    /// **Acceptance (#117): a `0x01` payload is REJECTED, not best-effort parsed.**
+    ///
+    /// This is the property the version byte exists for. A stale reader against a
+    /// new node, or a new reader against a stale node, must fail loudly rather than
+    /// return a snapshot whose identity half is silently absent — which would read
+    /// exactly like "this node finalized nothing", the healthiest-looking possible
+    /// rendering of an unknown.
+    #[test]
+    fn a_v1_telemetry_payload_is_rejected_not_best_effort_parsed() {
+        let t = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 2, MAX_LAG);
+        let old = v1_payload(&t);
+
+        // The old encoding is genuinely the prefix of the new one — i.e. the failure
+        // mode being guarded against is real and not hypothetical.
+        assert_eq!(&t.to_bytes()[1..old.len()], &old[1..], "v2 appends, it does not reshuffle");
+        assert!(t.to_bytes().len() > old.len());
+
+        assert!(
+            matches!(Telemetry::from_bytes(&old), Err(CodecError::BadVersion { got: 1 })),
+            "a 0x01 payload must be rejected on the version byte"
+        );
+
+        // And the tail is not optional: a v2-stamped payload that stops where v1
+        // stopped is truncated, not "v2 with the identity absent".
+        let mut stamped = old.clone();
+        stamped[0] = RPC_VERSION;
+        assert!(
+            matches!(Telemetry::from_bytes(&stamped), Err(CodecError::Truncated { .. })),
+            "the identity tail is mandatory at 0x02"
+        );
     }
 }

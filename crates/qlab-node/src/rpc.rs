@@ -42,9 +42,11 @@
 //! # New wires (status / anchors)
 //!
 //! `/v1/status` and `/v1/anchors` are new N6 surfaces (no prior golden). They
-//! follow the repo's versioning discipline — a `0x01` lead byte, unknown-version
-//! and trailing-byte rejection — and are round-trip + golden-digest locked here.
-//! The compact/full/frontier wires are **not** touched.
+//! follow the repo's versioning discipline — a [`RPC_VERSION`] lead byte,
+//! unknown-version and trailing-byte rejection — and are round-trip +
+//! golden-digest locked here. The compact/full/frontier wires are **not** touched
+//! and stay at [`qlab_cbserver::WIRE_VERSION`]; issue #117 moved `RPC_VERSION` to
+//! `0x02` and see its doc for why the two constants are no longer the same one.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -66,12 +68,31 @@ use std::collections::HashMap;
 use crate::mempool::{Mempool, MempoolError};
 use crate::node::{Node, NodeState};
 use crate::store::{ChainStore, CommitmentStore, Hash32, NullifierStore, StoredBlock, StoredTx};
-use crate::telemetry::Telemetry;
+use crate::telemetry::{LocalCommitment, Telemetry};
 
-/// The RPC wire-format version byte. Shares the value of the ratified
-/// compact-block wire ([`qlab_cbserver::WIRE_VERSION`] = `0x01`); the two are
-/// kept equal on purpose so a client speaks one version to the whole node.
-pub const RPC_VERSION: u8 = qlab_cbserver::WIRE_VERSION;
+/// The RPC wire-format version byte for the node's **own** surfaces —
+/// `/v1/status`, `/v1/anchors` and `/v1/telemetry`.
+///
+/// **`0x02` since issue #117.** It was `0x01`, defined as `= qlab_cbserver::
+/// WIRE_VERSION` and documented as deliberately equal "so a client speaks one
+/// version to the whole node". Adding the finalized-checkpoint identity to
+/// [`Telemetry`] is a payload change on a reject-unknown-version wire, so the
+/// bump is the ratified mechanism (#117) — and it necessarily severs that tie:
+///
+/// - The ratified **compact-block** family (`/v1/compact`, `/v1/…/full`,
+///   `/v1/tree/frontier`) stays at [`qlab_cbserver::WIRE_VERSION`] = `0x01`. It
+///   is golden-digest locked and its lead byte is asserted on the P2P compact
+///   relay path (`qlab_p2p::compact`), so bumping it would be a wire-codepoint
+///   change. Untouched here, on purpose.
+/// - `/v1/status` and `/v1/anchors` share this constant and therefore bump too,
+///   although their payloads did not change. That is accepted rather than giving
+///   `Telemetry` a private version byte: the node's own surfaces move as one, and
+///   an old reader failing loudly against a new node is the reject-unknown
+///   feature working, not a regression.
+///
+/// So a client now speaks `0x02` to the node's own wires and `0x01` to the
+/// compact-block wires it shares with the `qlab-cbserver` reference server.
+pub const RPC_VERSION: u8 = 0x02;
 
 // ---------------------------------------------------------------------------
 // Transaction identity + note-discovery artifacts
@@ -189,6 +210,11 @@ pub struct NodeRpc<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// epoch): the N1 traits do not carry them, so the P2P glue stamps them in via
     /// [`Self::set_net_facts`] for `/v1/telemetry`. Zero on a standalone node.
     net: NetFacts,
+    /// Checkpoint-identity facts the node itself cannot observe (issue #117): they
+    /// live in the committee finality tracker and the never-double-sign ledgers.
+    /// Stamped in by the same glue via [`Self::set_checkpoint_facts`]; **absent**
+    /// on a standalone node, which is the truth about it.
+    checkpoint: CheckpointFacts,
 }
 
 /// The network-layer half of [`Telemetry`], injected by the P2P layer (M10-T0-2).
@@ -198,6 +224,17 @@ pub struct NetFacts {
     pub peer_count: u64,
     /// Current committee epoch.
     pub epoch: u64,
+}
+
+/// The checkpoint-identity half of [`Telemetry`], injected the same way
+/// [`NetFacts`] is (issue #117). Default = both absent, i.e. "this composition
+/// cannot see the identity" — never a zero standing in for one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointFacts {
+    /// `fid` — the identity of the finalized checkpoint.
+    pub finalized_id: Option<u64>,
+    /// `sslot`/`sid` — what this node's own committee keys are committed to.
+    pub signed: Option<LocalCommitment>,
 }
 
 /// The default all-in-memory RPC composition.
@@ -215,6 +252,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             mempool: Mempool::default(),
             discovery: HashMap::new(),
             net: NetFacts::default(),
+            checkpoint: CheckpointFacts::default(),
         }
     }
 
@@ -352,6 +390,15 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
         self.net = NetFacts { peer_count, epoch };
     }
 
+    /// Stamp in the checkpoint-identity facts the node cannot observe itself
+    /// (issue #117): what it finalized (`fid`) and what its own committee keys are
+    /// committed to (`sslot`/`sid`). The P2P/committee glue calls this; a
+    /// composition that does not leaves them absent, and `/v1/telemetry` then says
+    /// so rather than reporting a checkpoint identity it never had.
+    pub fn set_checkpoint_facts(&mut self, facts: CheckpointFacts) {
+        self.checkpoint = facts;
+    }
+
     /// A live finality-health snapshot (`/v1/telemetry`, M10-T0-2). The node-owned
     /// half (regime, stall depth, last-finalized age, heights, mempool) is derived
     /// from live state; peer count and epoch come from the injected [`NetFacts`].
@@ -372,6 +419,12 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             self.net.peer_count,
             self.net.epoch,
             DEGRADED_MODE_LAG_BLOCKS,
+        )
+        .with_checkpoint(self.checkpoint.finalized_id, self.checkpoint.signed)
+        // Unlike the identity half, this one IS node state: the tip header is in
+        // the chain store, so it is read rather than injected (issue #117).
+        .with_tip_difficulty(
+            self.node.chain().block(&self.node.tip_hash()).map(|b| b.header.difficulty),
         )
     }
 
@@ -957,6 +1010,13 @@ mod tests {
         let (mut rpc, anchor) = rpc_with_finalized_genesis();
         // Inject the network half (peers, epoch) the node cannot observe itself.
         rpc.set_net_facts(4, 2);
+        // …and the checkpoint-identity half (issue #117), which lives in the
+        // committee finality tracker and the never-double-sign ledgers.
+        assert_eq!(rpc.telemetry().finalized_id, None, "absent until injected");
+        rpc.set_checkpoint_facts(CheckpointFacts {
+            finalized_id: Some(0x3f1a_9c2b_0d41),
+            signed: Some(LocalCommitment { slot: 0, id: Some(0x3f1a_9c2b_0d41) }),
+        });
         let tx = tx_with(anchor, &[1, 2], &[10, 11], posted_fee(ArityBucket::TwoByTwo));
         rpc.submit_tx(tx, TxDiscovery { recipients: vec![recip(0x10, &[10, 11])] }, &OkVerifier);
 
@@ -969,6 +1029,9 @@ mod tests {
         assert_eq!(t.peer_count, 4, "injected peer count surfaces");
         assert_eq!(t.epoch, 2, "injected epoch surfaces");
         assert_eq!(t.mempool_size, 1, "one pending tx");
+        assert_eq!(t.fid_field(), "3f1a9c2b0d41", "injected checkpoint identity surfaces");
+        assert_eq!(t.sslot_field(), "0");
+        assert_eq!(t.sid_field(), "3f1a9c2b0d41");
         assert_eq!(Telemetry::from_bytes(&t.to_bytes()).unwrap(), t, "telemetry round-trips");
 
         // The `/v1/telemetry` route serves exactly those bytes.
@@ -982,8 +1045,9 @@ mod tests {
         let (rpc, _) = rpc_with_finalized_genesis();
         let mut sb = rpc.status().to_bytes();
         let good = sb.clone();
-        sb[0] = 0x02;
-        assert!(matches!(NodeStatus::from_bytes(&sb), Err(CodecError::BadVersion { got: 2 })));
+        assert_eq!(good[0], RPC_VERSION);
+        sb[0] = 0x09;
+        assert!(matches!(NodeStatus::from_bytes(&sb), Err(CodecError::BadVersion { got: 9 })));
         let mut extra = good.clone();
         extra.push(0xff);
         assert!(matches!(NodeStatus::from_bytes(&extra), Err(CodecError::TrailingBytes { .. })));
@@ -991,11 +1055,41 @@ mod tests {
 
         let mut ab = rpc.anchors().to_bytes();
         let good_a = ab.clone();
-        ab[0] = 0x02;
-        assert!(matches!(AnchorSet::from_bytes(&ab), Err(CodecError::BadVersion { got: 2 })));
+        ab[0] = 0x09;
+        assert!(matches!(AnchorSet::from_bytes(&ab), Err(CodecError::BadVersion { got: 9 })));
         let mut extra_a = good_a.clone();
         extra_a.push(0);
         assert!(matches!(AnchorSet::from_bytes(&extra_a), Err(CodecError::TrailingBytes { .. })));
+    }
+
+    /// Issue #117's **collateral, made explicit**: `/v1/status` and `/v1/anchors`
+    /// share `RPC_VERSION` with `/v1/telemetry`, so bumping it for the checkpoint
+    /// identity moves them to `0x02` too even though their payloads are byte-for-
+    /// byte what they were. A `0x01` reader now fails loudly against them.
+    ///
+    /// That is the accepted trade (see [`RPC_VERSION`]'s doc), and it is locked
+    /// here so nobody later "fixes" it back into a silent accept-both.
+    #[test]
+    fn status_and_anchors_moved_to_0x02_with_telemetry_and_reject_0x01() {
+        let (rpc, _) = rpc_with_finalized_genesis();
+        assert_eq!(RPC_VERSION, 0x02);
+
+        for mut payload in [rpc.status().to_bytes(), rpc.anchors().to_bytes(), rpc.telemetry().to_bytes()] {
+            assert_eq!(payload[0], 0x02, "the node's own surfaces move as one");
+            payload[0] = 0x01;
+            let as_status = NodeStatus::from_bytes(&payload);
+            let as_anchors = AnchorSet::from_bytes(&payload);
+            let as_telemetry = Telemetry::from_bytes(&payload);
+            assert!(matches!(as_status, Err(CodecError::BadVersion { got: 1 })));
+            assert!(matches!(as_anchors, Err(CodecError::BadVersion { got: 1 })));
+            assert!(matches!(as_telemetry, Err(CodecError::BadVersion { got: 1 })));
+        }
+
+        // …while the ratified compact-block family is untouched at 0x01. Bumping it
+        // would be a wire-codepoint change (it is asserted on the p2p relay path).
+        assert_eq!(qlab_cbserver::WIRE_VERSION, 0x01);
+        assert_eq!(rpc.route("/v1/compact?from=0&to=0").unwrap()[0], qlab_cbserver::WIRE_VERSION);
+        assert_eq!(rpc.route("/v1/tree/frontier?at=0").unwrap()[0], qlab_cbserver::WIRE_VERSION);
     }
 
     // Apply one real block carrying `tx` to the node (so it becomes serveable).

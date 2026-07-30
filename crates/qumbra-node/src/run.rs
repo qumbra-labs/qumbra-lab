@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use qlab_devnet::body::{TxEntry, TxVerifier};
-use qlab_devnet::committee::{checkpoint_id_hex, CommitteeState};
+use qlab_devnet::committee::CommitteeState;
 use qlab_devnet::ebbflow::FinalityStatus;
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::{CHECKPOINT_CADENCE_BLOCKS, DEGRADED_MODE_LAG_BLOCKS};
@@ -49,6 +49,7 @@ use qlab_node::round::ObsClock;
 use qlab_node::Telemetry;
 
 use crate::metrics_server::MetricsServer;
+use crate::telemetry_server::TelemetryServer;
 
 use qlab_p2p::addrman::{AddrManager, DIAL_RETRY_INTERVAL_MS};
 use qlab_p2p::adapter::{MiningClock, NodeAdapter};
@@ -57,19 +58,12 @@ use qlab_p2p::transport::TcpTransport;
 use qlab_p2p::P2pNode;
 
 /// The `sid=` value when this node's own held keys are committed to *different*
-/// checkpoints at the same slot (issue #84). Distinguishable from an identity by
-/// length and by not being hex; see [`RunningNode::signed_id_field`].
-pub const LOCAL_COMMITMENT_SPLIT: &str = "split";
-
-/// What this node's own committee keys are committed to at one slot (issue #84).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LocalCommitment {
-    /// The highest slot any held key has committed to.
-    pub slot: u64,
-    /// The identity every held key that committed to `slot` agrees on, or `None`
-    /// when they disagree — this node's key set is split across two variants.
-    pub id: Option<u64>,
-}
+/// checkpoints at the same slot (issue #84), and the type carrying it.
+///
+/// **Both moved down into `qlab_node::telemetry` by issue #117** so the wire, the
+/// `TELEMETRY` log line and any reader share one definition instead of three; they
+/// are re-exported here so this module's public surface is unchanged.
+pub use qlab_node::telemetry::{LocalCommitment, LOCAL_COMMITMENT_SPLIT};
 
 /// How often [`RunningNode::run_until`] runs a discovery maintenance pass —
 /// re-dial, auto-connect, ask for addresses (issue #83; was `REDIAL_INTERVAL`).
@@ -84,6 +78,19 @@ const ADDRBOOK_FILE: &str = "peers.dat";
 /// few dozen string appends over integer state; the run loop pays it, never a
 /// request handler. Observability only: it changes nothing but snapshot freshness.
 const METRICS_REFRESH: Duration = Duration::from_secs(5);
+
+/// How often the `/v1/telemetry` snapshot is re-rendered (issue #117).
+///
+/// Same argument as [`METRICS_REFRESH`], same number: the node — not whoever is
+/// polling it — decides how often it pays, and rendering is a handful of integer
+/// reads into ~90 bytes. The cost is bounded staleness of at most this interval,
+/// which against a FROZEN 75 s block time and a
+/// [`CHECKPOINT_CADENCE_BLOCKS`]-block checkpoint grid cannot change any answer
+/// the operator view gives: a finalized checkpoint is never reverted, so a node's
+/// `fid` at a given `finalized_height` reads the same whenever it is read, and a
+/// stale sample can only make a node look *behind* — which the view renders as
+/// lag, never as disagreement.
+pub const TELEMETRY_REFRESH: Duration = Duration::from_secs(5);
 
 /// Unix seconds now (wall clock). Used for the metric surface's `process_start` and
 /// `rendered_at` stamps only — never for consensus, which reads header timestamps.
@@ -238,6 +245,16 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// The scrape server, when `metrics_addr` is configured. `None` = the node
     /// listens on nothing extra, which is the default.
     metrics_server: Option<MetricsServer>,
+    /// The last encoded `/v1/telemetry` payload, shared with the read endpoint
+    /// (issue #117). Same snapshot discipline as `metrics_snapshot`: the run loop
+    /// encodes on its own cadence and the server thread serves the bytes, so a
+    /// poller can never contend with the consensus loop for node state.
+    telemetry_snapshot: Arc<Mutex<Vec<u8>>>,
+    /// When the telemetry snapshot was last encoded.
+    last_telemetry_render: Instant,
+    /// The `/v1/telemetry` server, when `telemetry_addr` is configured. `None` =
+    /// the node listens on nothing extra, which is the default.
+    telemetry_server: Option<TelemetryServer>,
     /// Unix seconds this process started (exported so a restart is a visible fact).
     process_start_secs: u64,
     /// Local listen address (for logs).
@@ -405,6 +422,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             metrics_snapshot: Arc::new(Mutex::new(String::new())),
             last_metrics_render: Instant::now(),
             metrics_server: None,
+            telemetry_snapshot: Arc::new(Mutex::new(Vec::new())),
+            last_telemetry_render: Instant::now(),
+            telemetry_server: None,
             process_start_secs: unix_secs(),
             listen_addr: bound,
             // Sample telemetry roughly every 30 s (well under the 75 s block time,
@@ -489,23 +509,47 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         Some(LocalCommitment { slot, id: if agreed { id } else { None } })
     }
 
-    /// The `sid=` field: the identity hex, `-` when this node holds no committee
-    /// keys or has committed to nothing, or `split` when its own held keys are
-    /// committed to *different* checkpoints for the same slot.
+    /// The canonical live [`Telemetry`] snapshot for this node — **the one place**
+    /// the operator surface is assembled (issue #117).
     ///
-    /// `split` is reachable — a key restored from a ledger written on one history
-    /// refuses to re-sign while a key with no ledger signs the new one — and it is
-    /// this node equivocating against itself across its own key set. Picking one
-    /// of the two to print would be the exact failure this issue exists to remove:
-    /// a line that looks healthy while the thing it describes is not.
-    fn signed_id_field(&self) -> String {
-        match self.local_commitment() {
-            None => checkpoint_id_hex(None),
-            Some(c) => match c.id {
-                Some(id) => checkpoint_id_hex(Some(id)),
-                None => LOCAL_COMMITMENT_SPLIT.to_string(),
-            },
-        }
+    /// Both consumers read it: the `TELEMETRY` stdout sample line below, and the
+    /// `/v1/telemetry` wire served by [`crate::telemetry_server`] when
+    /// `telemetry_addr` is configured. They cannot disagree about what this node
+    /// finalized, because there is nothing for them to disagree with.
+    ///
+    /// Reuses the canonical [`Telemetry::assemble_with_halt`] rule — it never
+    /// re-derives the frozen Ebb-and-Flow finality semantics — and stamps in the
+    /// two halves [`qlab_node::Node`] cannot see: the network facts (peers, epoch)
+    /// and the checkpoint identity (`fid` from the finality tracker's own head,
+    /// `sslot`/`sid` from the never-double-sign ledgers).
+    ///
+    /// Age is chain-time (block timestamps), so that half is deterministic given
+    /// the chain; the network half is read live.
+    pub fn telemetry(&self) -> Telemetry {
+        let node = self.p2p.node();
+        let chain = node.chain();
+        // Age is chain-time from the finalized block; 0 when nothing is finalized
+        // (S8: no finalized head ⇒ no finalized-age, not a genesis-fallback absolute).
+        let age = if node.finalized_height().is_none() {
+            0
+        } else {
+            let tip_ts = chain.header(&chain.tip_hash()).map(|h| h.timestamp).unwrap_or(0);
+            let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_hash());
+            let base_ts = chain.header(&base_hash).map(|h| h.timestamp).unwrap_or(0);
+            tip_ts.saturating_sub(base_ts)
+        };
+        Telemetry::assemble_with_halt(
+            node.tip_height(),
+            node.finalized_height(),
+            age,
+            node.mempool().len() as u64,
+            self.p2p.peers().len() as u64,
+            node.committee().current_epoch(),
+            DEGRADED_MODE_LAG_BLOCKS,
+            self.halt_at,
+        )
+        .with_checkpoint(self.finalized_checkpoint_id(), self.local_commitment())
+        .with_tip_difficulty(chain.header(&chain.tip_hash()).map(|h| h.difficulty))
     }
 
     /// A single observability sample line for the soak monitor (M10-T0-3 Phase
@@ -517,32 +561,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// read live. Emitted to stdout, captured via `docker compose logs`.
     pub fn telemetry_sample(&self) -> String {
         let node = self.p2p.node();
-        let chain = node.chain();
-        let tip_hash = chain.tip_hash();
-        let (tip_ts, tip_diff) = chain
-            .header(&tip_hash)
-            .map(|h| (h.timestamp, h.difficulty))
-            .unwrap_or((0, 0));
-        // Age is chain-time from the finalized block; 0 when nothing is finalized
-        // (S8: no finalized head ⇒ no finalized-age, not a genesis-fallback absolute).
-        let age = if node.finalized_height().is_none() {
-            0
-        } else {
-            let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_hash());
-            let base_ts = chain.header(&base_hash).map(|h| h.timestamp).unwrap_or(0);
-            tip_ts.saturating_sub(base_ts)
-        };
-
-        let t = Telemetry::assemble_with_halt(
-            node.tip_height(),
-            node.finalized_height(),
-            age,
-            node.mempool().len() as u64,
-            self.p2p.peers().len() as u64,
-            node.committee().current_epoch(),
-            DEGRADED_MODE_LAG_BLOCKS,
-            self.halt_at,
-        );
+        // Issue #117: assembled once, in `telemetry()`, and shared with the
+        // `/v1/telemetry` wire — the line and the wire report the same snapshot by
+        // construction rather than by two copies of the same arithmetic.
+        let t = self.telemetry();
         let regime = match t.finality_status {
             FinalityStatus::Final => "Final",
             FinalityStatus::Degraded => "Degraded",
@@ -600,19 +622,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // positional and a key that comes and goes forces a special case on every
         // parser. A verify-only node holding no committee keys prints
         // `sslot=- sid=-` and is still parsed by the same reader.
-        let commitment = self.local_commitment();
-        let sslot_str =
-            commitment.map(|c| c.slot.to_string()).unwrap_or_else(|| "-".to_string());
+        // The three renderings live on `Telemetry` since #117, so the log line and
+        // any reader of the wire cannot disagree about what `-` or `split` means.
         format!(
             "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={}",
-            t.tip_height, final_str, t.stall_depth, age_str, tip_diff,
+            t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
             self.p2p.addrs().dialable_count(), self.p2p.addrs().known_count(),
             rounds_closed, rounds_failed,
-            checkpoint_id_hex(self.finalized_checkpoint_id()),
-            sslot_str,
-            self.signed_id_field(),
+            t.fid_field(),
+            t.sslot_field(),
+            t.sid_field(),
         )
     }
 
@@ -697,6 +718,29 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             outbound_netgroups: self.p2p.addrs().outbound_groups().len() as u64,
             process_start_secs: self.process_start_secs,
             rendered_at_secs: unix_secs(),
+        }
+    }
+
+    /// Bind the `/v1/telemetry` read endpoint (issue #117). Returns the bound
+    /// address.
+    ///
+    /// Called only when `telemetry_addr` is set in the config. Like
+    /// [`Self::start_metrics_endpoint`], an unbindable address is an **error**, not
+    /// a silent no-op: a node whose operator believes it is readable and which is
+    /// not is the failure this endpoint exists to remove.
+    pub fn start_telemetry_endpoint(&mut self, addr: &str) -> std::io::Result<std::net::SocketAddr> {
+        self.refresh_telemetry(); // serve a real snapshot from the first read on
+        let srv = TelemetryServer::start(addr, Arc::clone(&self.telemetry_snapshot))?;
+        let bound = srv.addr();
+        self.telemetry_server = Some(srv);
+        Ok(bound)
+    }
+
+    /// Re-encode the snapshot the `/v1/telemetry` endpoint serves.
+    fn refresh_telemetry(&mut self) {
+        let bytes = self.telemetry().to_bytes();
+        if let Ok(mut slot) = self.telemetry_snapshot.lock() {
+            *slot = bytes;
         }
     }
 
@@ -1001,6 +1045,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 self.refresh_metrics();
                 self.last_metrics_render = Instant::now();
             }
+            if self.telemetry_server.is_some()
+                && self.last_telemetry_render.elapsed() >= TELEMETRY_REFRESH
+            {
+                self.refresh_telemetry();
+                self.last_telemetry_render = Instant::now();
+            }
             if self.last_sample.elapsed() >= self.sample_interval {
                 println!("{}", self.telemetry_sample());
                 // A stall's open rounds report themselves on the same cadence as the
@@ -1081,6 +1131,7 @@ mod tests {
             mining,
             expected_genesis_hash: Some(genesis.hash_hex()),
             metrics_addr: None,
+            telemetry_addr: None,
             miner_rkm: None,
         };
         (config, genesis, base)
@@ -2104,6 +2155,58 @@ mod tests {
         assert!(body.contains("qumbra_blocks_connected_total 8"));
         assert!(body.contains("qumbra_finality_advance_blocks_bucket"));
         assert!(body.contains("qumbra_process_start_time_seconds "));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Issue #117, the precondition end to end**: the `/v1/telemetry` endpoint,
+    /// over a real socket, serving a real node's live snapshot — and the snapshot
+    /// carries the finalized checkpoint's identity, which is the whole point.
+    ///
+    /// This is the surface that did not exist before this change: the binary bound
+    /// no RPC listener at all, so an operator view had nothing to poll. The test
+    /// asserts the same three things the view depends on — the endpoint is off
+    /// unless configured, the bytes decode as `Telemetry` at `0x02`, and `fid`
+    /// equals the identity the node's own finality tracker holds.
+    #[test]
+    fn telemetry_endpoint_serves_the_wire_with_fid_and_is_off_by_default() {
+        let (config, genesis, base) = rig("telemetry-endpoint", true);
+        assert!(config.telemetry_addr.is_none(), "no listener unless the operator asks");
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint();
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+            assert!(node.try_mine());
+            node.note_slots_reached();
+            node.try_checkpoint();
+        }
+        let fid = node.finalized_checkpoint_id().expect("this rig finalizes");
+
+        let bound = node.start_telemetry_endpoint("127.0.0.1:0").expect("bind ephemeral");
+        let raw = {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(bound).unwrap();
+            write!(s, "GET /v1/telemetry HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+            let mut out = Vec::new();
+            s.read_to_end(&mut out).unwrap();
+            out
+        };
+        let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("header terminator");
+        assert!(String::from_utf8_lossy(&raw[..sep]).starts_with("HTTP/1.1 200"));
+        let served = Telemetry::from_bytes(&raw[sep + 4..]).expect("the versioned wire decodes");
+
+        assert_eq!(served.to_bytes()[0], qlab_node::RPC_VERSION);
+        assert_eq!(served.tip_height, CHECKPOINT_CADENCE_BLOCKS);
+        assert_eq!(served.finalized_height, node.finalized_height());
+        assert_eq!(served.finalized_id, Some(fid), "fid is on the wire, not just in the log line");
+        assert_eq!(served.fid_field(), node.telemetry().fid_field());
+        // The endpoint and the stdout sample line report the SAME snapshot — they
+        // read one `telemetry()`, so they cannot drift.
+        let line = node.telemetry_sample();
+        assert!(line.contains(&format!("fid={}", served.fid_field())), "{line}");
+        assert!(line.contains(&format!("sid={}", served.sid_field())), "{line}");
+        assert!(line.contains(&format!("sslot={}", served.sslot_field())), "{line}");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 

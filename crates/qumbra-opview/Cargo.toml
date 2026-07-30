@@ -1,0 +1,39 @@
+[package]
+name = "qumbra-opview"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Issue #117: the T0 **operator view** — a read-only cross-node checkpoint
+# agreement view over a configured list of node endpoints.
+#
+# NOT `testnet-plan` §6's T1 minimal explorer, and deliberately not named or
+# structured as one. "Do these N nodes agree?" is the whole truth on T0, where the
+# four hosts ARE the network; on a public net it is the operator's own curated
+# nodes vouching for themselves, and presenting that as "the chain is healthy"
+# would quietly unlabel a committee the design docs already call an honest
+# federation-of-one. The T1 question — "does MY node agree with the peers it
+# actually has" — is answered in the node, not here, and nothing reports it today.
+#
+# Its own crate rather than a bin inside qumbra-node: the view has no consensus
+# role, and weight it does not need is weight the node's build graph would pay
+# for. The dependency arrow points ONE way — the view reads the node's wire; the
+# node does not know the view exists (observability-and-evidence.md §5.2).
+
+[[bin]]
+name = "qumbra-opview"
+path = "src/main.rs"
+
+[dependencies]
+# The versioned `/v1/telemetry` wire and its decoder. This is the ONLY dependency,
+# and it is here so the view parses the node's own encoding rather than carrying a
+# second implementation of it — a second encoding is exactly how "the identities
+# match" starts meaning two different things.
+qlab-node = { path = "../qlab-node" }
+
+[dev-dependencies]
+# A real HTTP/1.1 server to poll in the tests, so the reachable/unreachable
+# distinction is exercised over real sockets rather than mocked at the seam that
+# matters. Same `=` pin as every other HTTP surface in the tree.
+tiny_http = "=0.12.0"

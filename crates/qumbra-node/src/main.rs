@@ -156,6 +156,23 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         println!("  metrics:      not served (set metrics_addr in the config to enable)");
     }
 
+    // Issue #117 — the `/v1/telemetry` read endpoint, the wire the T0 operator
+    // agreement view polls. Same rule as `metrics_addr` and for the same reason:
+    // no `telemetry_addr`, no listener; a failure to bind is fatal rather than a
+    // node that its operator believes is readable and is not.
+    if let Some(addr) = config.telemetry_addr.as_deref() {
+        let bound = node.start_telemetry_endpoint(addr)?;
+        println!("  telemetry:    http://{bound}/v1/telemetry (versioned read wire, GET only)");
+        if !bound.ip().is_loopback() {
+            println!(
+                "  ⚠️  telemetry is bound to a non-loopback address — it must be paired with a \
+                 SOURCE-RESTRICTED inbound rule to the operator's collector, not an open one."
+            );
+        }
+    } else {
+        println!("  telemetry:    not served (set telemetry_addr in the config to enable)");
+    }
+
     // Telemetry sampling cadence — OBSERVABILITY ONLY. This changes how often a
     // TELEMETRY line is printed and nothing else: not consensus, not the halt
     // height, not any frozen value. It exists because `regime=Halting` is a real
