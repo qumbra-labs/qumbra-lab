@@ -168,11 +168,11 @@ pub fn poll_one(endpoint: &Endpoint, opts: PollOptions) -> NodeReading {
         Ok(body) => match Telemetry::from_bytes(&body) {
             Ok(t) => Reading::Ok(Box::new(t)),
             // A decode failure is NOT a disagreement either. The commonest cause is
-            // the one this issue created: a node built before the `0x02` bump, whose
+            // the one this issue created: a node built before the `0x03` bump, whose
             // wire this build refuses on purpose rather than best-effort parsing.
             Err(e) => Reading::Unreachable(format!(
                 "answered, but the body is not a telemetry wire this build reads: {e:?} \
-                 (a node predating the 0x02 checkpoint-identity bump reports 0x01)"
+                 (this build requires the 0x03 committee/supply wire; older nodes report 0x01 or 0x02)"
             )),
         },
     };

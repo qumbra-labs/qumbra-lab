@@ -5,16 +5,15 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Issue #117: the T0 **operator view** — a read-only cross-node checkpoint
-# agreement view over a configured list of node endpoints.
+# Issues #117/#121: the read-only public chain-health and supply-attestation view
+# over a configured list of node endpoints.
 #
-# NOT `testnet-plan` §6's T1 minimal explorer, and deliberately not named or
-# structured as one. "Do these N nodes agree?" is the whole truth on T0, where the
-# four hosts ARE the network; on a public net it is the operator's own curated
-# nodes vouching for themselves, and presenting that as "the chain is healthy"
-# would quietly unlabel a committee the design docs already call an honest
-# federation-of-one. The T1 question — "does MY node agree with the peers it
-# actually has" — is answered in the node, not here, and nothing reports it today.
+# Deliberately NOT an Etherscan-shaped transaction explorer. Qumbra has no public
+# addresses, balances or traceable transfers; pages for them would be empty by
+# design. This process exposes the public facts that do exist: chain/finality,
+# committee aggregates (never per-signer availability), and independently
+# checkable scheduled issuance. "Do these N nodes agree?" remains a claim about
+# the configured nodes, not the whole public network.
 #
 # Its own crate rather than a bin inside qumbra-node: the view has no consensus
 # role, and weight it does not need is weight the node's build graph would pay

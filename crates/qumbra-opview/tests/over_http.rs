@@ -196,21 +196,22 @@ fn a_silent_node_times_out_and_reads_as_unreachable() {
     assert!(a.unreachable[0].1.contains("read"), "the reason names the step: {:?}", a.unreachable[0].1);
 }
 
-/// **A pre-#117 node is unreachable-with-a-reason, not silently mis-parsed.**
+/// **A pre-#121 `0x02` node is unreachable-with-a-reason, not silently parsed.**
 ///
-/// This is the version-byte discipline arriving where it matters: a `0x01` payload
-/// carries no identity, and best-effort parsing it would render `fid=-` — which
-/// reads exactly like "this node has finalized nothing", the healthiest-looking
-/// possible rendering of a node whose telemetry this build cannot understand.
+/// This is the version-byte discipline arriving where it matters: a `0x02`
+/// payload carries no committee/supply tail, and best-effort parsing it would
+/// render zero aggregates and no attestation — the healthiest-looking possible
+/// rendering of a node whose telemetry this build cannot understand.
 #[test]
-fn a_node_speaking_the_old_0x01_wire_is_refused_with_a_reason() {
-    // A genuine v1 payload: the v2 encoding minus its #117 tail, stamped 0x01.
-    let v2 = telem(3776, 0xaaaa_aaaa_aaaa, Some((3776, Some(0xaaaa_aaaa_aaaa)))).to_bytes();
-    let mut v1 = v2[..v2.len() - 1 - 1 - 9 - 9].to_vec(); // drop diff, signed, fid tails
-    v1[0] = 0x01;
-    assert!(Telemetry::from_bytes(&v1).is_err(), "the fixture really is not readable at 0x02");
+fn a_node_speaking_the_old_0x02_wire_is_refused_with_a_reason() {
+    // A genuine v2 payload: the current encoding minus three u64 committee
+    // aggregates and the zero-length supply varint, stamped 0x02.
+    let v3 = telem(3776, 0xaaaa_aaaa_aaaa, Some((3776, Some(0xaaaa_aaaa_aaaa)))).to_bytes();
+    let mut v2 = v3[..v3.len() - 24 - 1].to_vec();
+    v2[0] = 0x02;
+    assert!(Telemetry::from_bytes(&v2).is_err(), "the fixture really is not readable at 0x03");
 
-    let old = FakeNode::serving(v1);
+    let old = FakeNode::serving(v2);
     let eps = vec![old.endpoint("stale-node")];
     let readings = poll_all(&eps, PollOptions { timeout: Duration::from_millis(800) });
 
@@ -219,7 +220,7 @@ fn a_node_speaking_the_old_0x01_wire_is_refused_with_a_reason() {
     assert_eq!(a.verdict, Verdict::Agreed, "one unreadable node is no evidence, not a split");
     assert_eq!(a.exit_code(), 0);
     let text = render::view(&readings, &a);
-    assert!(text.contains("0x02 checkpoint-identity bump"), "the reason names the cause:\n{text}");
+    assert!(text.contains("requires the 0x03 committee/supply wire"), "the reason names the cause:\n{text}");
 }
 
 /// A server that answers something else entirely (404 on the route) is also just

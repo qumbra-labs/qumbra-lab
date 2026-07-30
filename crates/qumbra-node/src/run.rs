@@ -40,13 +40,15 @@ use qlab_devnet::body::{TxEntry, TxVerifier};
 use qlab_devnet::committee::CommitteeState;
 use qlab_devnet::ebbflow::FinalityStatus;
 use qlab_devnet::node::SimConfig;
-use qlab_devnet::params_devnet::{CHECKPOINT_CADENCE_BLOCKS, DEGRADED_MODE_LAG_BLOCKS};
+use qlab_devnet::params_devnet::{
+    CHECKPOINT_CADENCE_BLOCKS, DEGRADED_MODE_LAG_BLOCKS, EPOCH_LENGTH_BLOCKS,
+};
 use qlab_devnet::pow::PowEngine;
 
 use qlab_node::metrics::{render as render_metrics, LiveGauges};
 use qlab_node::recovery::{Finalizer, FinalizerState};
 use qlab_node::round::ObsClock;
-use qlab_node::Telemetry;
+use qlab_node::{supply_by_epoch, ChainStore, SupplyBlock, Telemetry};
 
 use crate::metrics_server::MetricsServer;
 use crate::telemetry_server::TelemetryServer;
@@ -82,9 +84,11 @@ const METRICS_REFRESH: Duration = Duration::from_secs(5);
 /// How often the `/v1/telemetry` snapshot is re-rendered (issue #117).
 ///
 /// Same argument as [`METRICS_REFRESH`], same number: the node — not whoever is
-/// polling it — decides how often it pays, and rendering is a handful of integer
-/// reads into ~90 bytes. The cost is bounded staleness of at most this interval,
-/// which against a FROZEN 75 s block time and a
+/// polling it — decides how often it pays. Issue #121 adds one 48-byte supply row
+/// per epoch and derives those rows from the canonical stored bodies; at the
+/// frozen one-day epoch this remains a small daily growth rather than a per-block
+/// payload. The cost is bounded staleness of at most this interval, which against
+/// a FROZEN 75 s block time and a
 /// [`CHECKPOINT_CADENCE_BLOCKS`]-block checkpoint grid cannot change any answer
 /// the operator view gives: a finalized checkpoint is never reverted, so a node's
 /// `fid` at a given `finalized_height` reads the same whenever it is read, and a
@@ -563,6 +567,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     pub fn telemetry(&self) -> Telemetry {
         let node = self.p2p.node();
         let chain = node.chain();
+        let state_chain = node.state().chain();
+        let supply = supply_by_epoch(
+            state_chain.chain().main_chain().iter().map(|hash| {
+                let block = state_chain
+                    .block(hash)
+                    .expect("every canonical state-chain hash has its stored body");
+                SupplyBlock {
+                    height: block.header.height,
+                    coinbase: block.coinbase,
+                    fees: block.txs.iter().map(|tx| tx.fee).sum(),
+                }
+            }),
+            EPOCH_LENGTH_BLOCKS,
+        )
+        .expect("the canonical state chain is contiguous from genesis");
         // Age is chain-time from the finalized block; 0 when there is no finalized
         // CHECKPOINT to measure from — nothing finalized (S8: no finalized head ⇒
         // no finalized-age, not a genesis-fallback absolute) or the finalized head
@@ -594,6 +613,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             committee.active as u64,
             committee.need as u64,
         )
+        .with_supply(supply)
         .with_checkpoint(self.finalized_checkpoint_id(), self.local_commitment())
         .with_tip_difficulty(chain.header(&chain.tip_hash()).map(|h| h.difficulty))
     }

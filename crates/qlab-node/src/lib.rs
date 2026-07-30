@@ -53,6 +53,7 @@ pub mod recovery;
 pub mod round;
 pub mod rpc;
 mod store;
+pub mod supply;
 pub mod telemetry;
 
 pub use coinbase::{
@@ -80,3 +81,4 @@ pub use store::{
     ChainStore, CommitmentStore, Hash32, MemChainStore, MemCommitmentStore, MemNullifierStore,
     NullifierStore, StoredBlock, StoredHeader, StoredTx,
 };
+pub use supply::{supply_by_epoch, SupplyBlock, SupplyEpoch, SupplyError};

@@ -65,6 +65,73 @@ pub fn table(readings: &[NodeReading]) -> String {
     out
 }
 
+/// Whether any reachable node reports an exact scheduled-issuance mismatch.
+pub fn supply_diverged(readings: &[NodeReading]) -> bool {
+    readings.iter().any(|reading| {
+        reading
+            .reading
+            .telemetry()
+            .is_some_and(|t| t.supply.iter().any(|row| !row.agrees()))
+    })
+}
+
+/// Render the scheduled-issuance attestation carried by each reachable node.
+///
+/// Fees are a separate column because they are transfers and `body.coinbase`
+/// already excludes them. Pass/fail is the exact integer `DIV_BSL == 0`; the
+/// relative column is context for humans, never a floating-point tolerance.
+pub fn supply(readings: &[NodeReading]) -> String {
+    let label_w = readings
+        .iter()
+        .map(|r| r.endpoint.label.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let mut out = String::from(
+        "\nsupply attestation: scheduled body.coinbase; fees are transfers and are not subtracted; tolerance=0 bessel\n",
+    );
+    out.push_str(&format!(
+        "{:<label_w$}  {:>7} {:>17} {:>20} {:>20} {:>14} {:>11} {:>14} {:>8}\n",
+        "NODE", "EPOCH", "HEIGHTS", "MEASURED_BSL", "EXPECTED_BSL", "DIV_BSL", "RELATIVE",
+        "FEES_BSL", "STATUS",
+    ));
+    let mut rows = 0usize;
+    for reading in readings {
+        let Reading::Ok(t) = &reading.reading else {
+            continue;
+        };
+        for row in &t.supply {
+            rows += 1;
+            let relative = if row.relative_divergence().is_finite() {
+                format!("{:+.3e}", row.relative_divergence())
+            } else {
+                "+inf".to_string()
+            };
+            out.push_str(&format!(
+                "{:<label_w$}  {:>7} {:>17} {:>20} {:>20} {:>+14} {:>11} {:>14} {:>8}\n",
+                reading.endpoint.label,
+                row.epoch,
+                format!("{}..={}", row.start_height, row.end_height),
+                row.measured_coinbase,
+                row.expected_coinbase,
+                row.divergence_bessel(),
+                relative,
+                row.fees,
+                if row.agrees() { "AGREED" } else { "DIVERGED" },
+            ));
+        }
+    }
+    if rows == 0 {
+        out.push_str("no reachable node reported a supply epoch\n");
+    }
+    if supply_diverged(readings) {
+        out.push_str(
+            "🔴 A non-zero divergence means a canonical block committed scheduled issuance outside the frozen curve; first preserve the node data and identify the first divergent epoch/block before restarting or rolling.\n",
+        );
+    }
+    out
+}
+
 fn ids_line(g: &IdGroup, absent_means: &str) -> String {
     let parts: Vec<String> = g
         .ids
@@ -179,7 +246,7 @@ pub fn verdicts(a: &Agreement) -> String {
 
 /// The whole view: table, then verdicts.
 pub fn view(readings: &[NodeReading], a: &Agreement) -> String {
-    format!("{}{}", table(readings), verdicts(a))
+    format!("{}{}{}", table(readings), supply(readings), verdicts(a))
 }
 
 #[cfg(test)]
@@ -187,7 +254,7 @@ mod tests {
     use super::*;
     use crate::poll::Endpoint;
     use qlab_node::telemetry::LocalCommitment;
-    use qlab_node::Telemetry;
+    use qlab_node::{SupplyEpoch, Telemetry};
     use std::time::Duration;
 
     fn t(fin: Option<u64>, fid: Option<u64>, signed: Option<(u64, Option<u64>)>) -> Telemetry {
@@ -320,5 +387,40 @@ mod tests {
         ] {
             assert!(!text.contains(forbidden), "public view leaked `{forbidden}`:\n{text}");
         }
+    }
+
+    /// The rendered view carries both halves of the supply acceptance: an honest
+    /// epoch passes at exact zero, while a one-bessel error is visibly divergent
+    /// and produces an operator action.
+    #[test]
+    fn supply_view_distinguishes_exact_match_from_one_bessel_error() {
+        let honest = SupplyEpoch {
+            epoch: 0,
+            start_height: 0,
+            end_height: 1151,
+            measured_coinbase: 5_000_000_000,
+            expected_coinbase: 5_000_000_000,
+            fees: 456,
+        };
+        let wrong = SupplyEpoch {
+            epoch: 1,
+            start_height: 1152,
+            end_height: 2303,
+            measured_coinbase: 4_000_000_001,
+            expected_coinbase: 4_000_000_000,
+            fees: 789,
+        };
+        let readings = vec![ok(
+            "node0",
+            t(Some(2303), Some(0x0102_0304_0506), None)
+                .with_supply(vec![honest, wrong]),
+        )];
+        let text = view(&readings, &Agreement::of(&readings));
+        assert!(text.contains("tolerance=0 bessel"), "{text}");
+        assert!(text.contains("          +0"), "honest absolute divergence:\n{text}");
+        assert!(text.contains("          +1"), "wrong absolute divergence:\n{text}");
+        assert!(text.contains("DIVERGED"), "{text}");
+        assert!(text.contains("first preserve the node data"), "{text}");
+        assert!(supply_diverged(&readings));
     }
 }

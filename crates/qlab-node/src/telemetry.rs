@@ -46,12 +46,13 @@
 //! attestation, moving the wire to `0x03`. An old reader is *supposed* to fail
 //! against a new node.
 
-use qlab_cbserver::codec::CodecError;
+use qlab_cbserver::codec::{write_varint, CodecError};
 use qlab_devnet::committee::checkpoint_id_hex;
 use qlab_devnet::ebbflow::FinalityStatus;
 use qlab_devnet::halt::regime as halt_regime;
 
 use crate::rpc::{Reader, RPC_VERSION};
+use crate::supply::SupplyEpoch;
 
 /// Wire discriminant for [`FinalityStatus::Final`].
 const STATUS_FINAL: u8 = 0;
@@ -146,6 +147,9 @@ pub struct Telemetry {
     pub committee_active: u64,
     /// Quorum threshold currently in force, read from committee state.
     pub committee_quorum: u64,
+    /// Scheduled-issuance attestation grouped by epoch, from genesis through the
+    /// current tip. Each row compares integer bessel at zero tolerance.
+    pub supply: Vec<SupplyEpoch>,
     /// **The identity of the finalized checkpoint** (`fid`, issue #117), or `None`
     /// when nothing is finalized *or* when the composition serving this snapshot
     /// does not carry a committee finality tracker to read it from.
@@ -231,6 +235,7 @@ impl Telemetry {
             committee_size: 0,
             committee_active: 0,
             committee_quorum: 0,
+            supply: Vec::new(),
             finalized_id: None,
             signed: None,
             tip_difficulty: None,
@@ -250,6 +255,12 @@ impl Telemetry {
         self.committee_size = committee_size;
         self.committee_active = committee_active;
         self.committee_quorum = committee_quorum;
+        self
+    }
+
+    /// Stamp in the public per-epoch supply attestation (issue #121).
+    pub fn with_supply(mut self, supply: Vec<SupplyEpoch>) -> Self {
+        self.supply = supply;
         self
     }
 
@@ -330,7 +341,9 @@ impl Telemetry {
     /// `has_fid(u8) ‖ [finalized_id(8 LE) if has] ‖ has_signed(u8) ‖`
     /// `[signed_slot(8 LE) ‖ has_signed_id(u8) ‖ [signed_id(8 LE) if has] if has] ‖`
     /// `has_diff(u8) ‖ [tip_difficulty(8 LE) if has] ‖`
-    /// `committee_size(8 LE) ‖ committee_active(8 LE) ‖ committee_quorum(8 LE)`.
+    /// `committee_size(8 LE) ‖ committee_active(8 LE) ‖ committee_quorum(8 LE) ‖`
+    /// `n_supply(varint) ‖ n × (epoch ‖ start_height ‖ end_height ‖`
+    /// `measured_coinbase ‖ expected_coinbase ‖ fees)` (all entry fields u64 LE).
     ///
     /// The `0x02` tail (issue #117) nests `sid` **inside** `sslot`'s presence, so
     /// "an identity with no slot" is not representable on the wire: a signed
@@ -393,6 +406,15 @@ impl Telemetry {
         out.extend_from_slice(&self.committee_size.to_le_bytes());
         out.extend_from_slice(&self.committee_active.to_le_bytes());
         out.extend_from_slice(&self.committee_quorum.to_le_bytes());
+        write_varint(&mut out, self.supply.len() as u64);
+        for row in &self.supply {
+            out.extend_from_slice(&row.epoch.to_le_bytes());
+            out.extend_from_slice(&row.start_height.to_le_bytes());
+            out.extend_from_slice(&row.end_height.to_le_bytes());
+            out.extend_from_slice(&row.measured_coinbase.to_le_bytes());
+            out.extend_from_slice(&row.expected_coinbase.to_le_bytes());
+            out.extend_from_slice(&row.fees.to_le_bytes());
+        }
         out
     }
 
@@ -428,6 +450,21 @@ impl Telemetry {
         let committee_size = r.u64()?;
         let committee_active = r.u64()?;
         let committee_quorum = r.u64()?;
+        let n_supply = r.varint()?;
+        // Do not preallocate from an untrusted count. A truncated/malicious body
+        // fails on the first absent field without turning its varint into a memory
+        // allocation request.
+        let mut supply = Vec::new();
+        for _ in 0..n_supply {
+            supply.push(SupplyEpoch {
+                epoch: r.u64()?,
+                start_height: r.u64()?,
+                end_height: r.u64()?,
+                measured_coinbase: r.u64()?,
+                expected_coinbase: r.u64()?,
+                fees: r.u64()?,
+            });
+        }
         r.finish()?;
         Ok(Telemetry {
             finality_status,
@@ -441,6 +478,7 @@ impl Telemetry {
             committee_size,
             committee_active,
             committee_quorum,
+            supply,
             finalized_id,
             signed,
             tip_difficulty,
@@ -646,7 +684,15 @@ mod tests {
     #[test]
     fn committee_aggregates_roundtrip_at_0x03_and_0x02_is_rejected() {
         let t = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 3, MAX_LAG)
-            .with_committee(21, 19, 15);
+            .with_committee(21, 19, 15)
+            .with_supply(vec![SupplyEpoch {
+                epoch: 3,
+                start_height: 3456,
+                end_height: 3776,
+                measured_coinbase: 1_234_567,
+                expected_coinbase: 1_234_567,
+                fees: 890,
+            }]);
         let bytes = t.to_bytes();
         assert_eq!(bytes[0], 0x03);
         assert_eq!(Telemetry::from_bytes(&bytes).unwrap(), t);
@@ -654,6 +700,8 @@ mod tests {
             (t.epoch, t.committee_size, t.committee_active, t.committee_quorum),
             (3, 21, 19, 15),
         );
+        assert_eq!(t.supply.len(), 1);
+        assert_eq!(t.supply[0].divergence_bessel(), 0);
 
         let mut old = bytes;
         old[0] = 0x02;
