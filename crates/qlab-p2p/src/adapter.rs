@@ -1214,6 +1214,7 @@ mod tests {
     use qlab_devnet::params_devnet::BOND_AMOUNT;
     use qlab_devnet::pow::KeccakPow;
     use qlab_node::round::{RoundClose, RoundDiagnosis};
+    use qlab_node::ChainStore as _;
     use qlab_node::telemetry::Telemetry;
 
     /// Mock M3 verifier: a proof is valid iff its bytes are exactly `b"ok"`.
@@ -1489,11 +1490,30 @@ mod tests {
         let (header, body) = f.mine_block().expect("mines once its state machine is its chain");
         assert_eq!(f.ingest_block(header, body), IngestOutcome::Accepted);
         assert_eq!(f.state().tip_height(), 3, "its own block is in its own state");
-        assert_eq!(
-            f.state().commitment_count(),
-            leaves + 1,
-            "the coinbase note it just mined has a commitment-tree leaf"
+
+        // Issue #102 moved this test's observable, and the substitution is deliberate.
+        // It asserted `leaves + 1` — the coinbase leaf appearing the moment the block
+        // was applied, which was #101's semantics. The leaf now lands 144 blocks later,
+        // so at height 3 there is nothing to count, and asserting `leaves + 0` would be
+        // *vacuous*: it holds just as well if the block was never applied at all, which
+        // is the silent-loss failure this test exists to catch.
+        //
+        // So "did not lose its coinbase" is checked as: the block is in this node's own
+        // state, the note it minted is derivable from that stored body, and the leaf is
+        // scheduled rather than missing. That a scheduled leaf really does land is
+        // `qlab-node/tests/maturity_schedule.rs`, which spans the delay; here the point
+        // is that the miner recorded its own block, which is what #130 (a) fixed.
+        assert_eq!(f.state().commitment_count(), leaves, "not yet — it matures at 147");
+        let stored = f
+            .state()
+            .chain()
+            .block(&f.state().tip_hash())
+            .expect("its own mined block is in its own chain store");
+        assert!(
+            qlab_node::coinbase_note_leaf(3, &stored.body()).is_some(),
+            "the note it mined is derivable from the body it recorded — nothing is lost"
         );
+        assert_eq!(qlab_node::coinbase_leaf_appears_at(3), 3 + qlab_node::COINBASE_MATURITY_BLOCKS);
     }
 
     /// **#134's boundary, checked rather than assumed: a body that is held, retried
@@ -1747,10 +1767,34 @@ mod tests {
         assert_eq!(replayed.tip_height(), 3);
         assert_eq!(reopened.tip_hash(), replayed.tip_hash());
         assert_eq!(reopened.commitment_root(), replayed.commitment_root());
+        // Issue #102 moved this assertion's observable too, and for the same reason as
+        // in `a_miner_ahead_of_its_own_state_tip_does_not_silently_lose_its_coinbase`.
+        // It counted three coinbase leaves as proof the bodies "really were folded in,
+        // not just logged"; three blocks now append no leaves, and `== 0` would be true
+        // of a header-only log as well, which is precisely the distinction this line
+        // exists to draw.
+        //
+        // The replacement is strictly stronger: every height's *body* came back off
+        // disk, byte-identical to what was mined. A log that recorded only headers
+        // cannot produce that, and neither can one whose bodies were buffered and
+        // dropped.
+        for (height, (_, mined)) in (1..=3u64).zip(blocks.iter()) {
+            let hash = reopened.chain().chain().main_chain()[height as usize];
+            let stored = reopened.chain().block(&hash).expect("the body replayed from disk");
+            assert_eq!(
+                stored.body().commitment(),
+                mined.commitment(),
+                "height {height}: the body itself replayed, not just its header"
+            );
+            assert!(
+                qlab_node::coinbase_note_leaf(height, &stored.body()).is_some(),
+                "height {height}: and it is a minting body, so a leaf is owed for it"
+            );
+        }
         assert_eq!(
             reopened.commitment_count(),
-            3,
-            "three coinbase leaves — the bodies really were folded in, not just logged"
+            0,
+            "and none of the three has matured yet — the first lands at 145"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
