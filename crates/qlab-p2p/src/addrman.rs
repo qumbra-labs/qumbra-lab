@@ -13,15 +13,32 @@
 //! and transacts but cannot serve peers. That makes the central distinction here:
 //!
 //! - **known / candidate** — an address we have heard of. It may be unreachable.
+//!   An address this node has ruled out as **itself** is not known: it is never
+//!   admitted to the book (issue #127).
 //! - **dialable** — an address we have **successfully connected *to*** at least
 //!   once. Only these may be gossiped onward ([`AddrManager::gossipable`]).
 //!
 //! Gossiping merely-connected addresses would fill every joiner's book with
 //! entries nobody can dial, and it would *look* like discovery was working.
-//! Reachability of **ourselves** is not inferred — a node cannot learn its own
-//! public address without being told, and telling it is a wire change (S1). It is
-//! therefore **explicit configuration**: [`AddrManager::set_self_advertise`], set
-//! by the operator (the T0 seeds set it; a home node does not).
+//!
+//! ## Self-recognition (issue #127)
+//!
+//! Two separate facts about "us", deliberately not collapsed into one field:
+//!
+//! - **Gossip identity** ([`AddrManager::set_self_advertise`]): the operator
+//!   declares a publicly dialable address so peers are told about us. Unset is
+//!   the normal outbound-only case (Larry's NAT decision). A node cannot learn
+//!   its own *public* address without being told, and being told is a wire
+//!   change (S1) — so gossip stays explicit configuration.
+//! - **Filter identity** ([`AddrManager::note_self_addr`]): every address this
+//!   process can recognise as itself, used to refuse self-admission and
+//!   self-dials. Sources the binary can know without the operator: the bound
+//!   socket, the configured listen string, the system hostname, loopback. The
+//!   advertise address, when set, is *also* a filter identity.
+//!
+//! The bug #127 found was that the only self-filter was `self_advertise ==
+//! Some(a)`, which is dead whenever the field is unset. Filter identity must
+//! fire with the field absent — that is the test that matters.
 //!
 //! ## One dialer
 //!
@@ -165,9 +182,15 @@ impl AddrEntry {
 #[derive(Clone, Debug)]
 pub struct AddrManager {
     entries: BTreeMap<String, AddrEntry>,
-    /// Our own address, iff the operator declared us reachable. `None` ⇒ we are
-    /// never gossiped (the outbound-only case, and it is expected).
+    /// Our gossip identity, iff the operator declared us reachable. `None` ⇒ we
+    /// are never gossiped (the outbound-only case, and it is expected). This is
+    /// **not** the only self-filter — see [`Self::self_addrs`] / issue #127.
     self_advertise: Option<String>,
+    /// Every address string this node recognises as **itself**. Drives admission
+    /// and dial exclusion. Populated from local facts (bound addr, hostname, …)
+    /// plus `self_advertise` when set. A match here never enters `entries`, so
+    /// `known` does not count us.
+    self_addrs: HashSet<String>,
     /// Per-peer last `GetAddr` time, for the ask rate limit.
     last_getaddr: BTreeMap<PeerId, u64>,
     max_outbound: usize,
@@ -184,6 +207,7 @@ impl Default for AddrManager {
         AddrManager {
             entries: BTreeMap::new(),
             self_advertise: None,
+            self_addrs: HashSet::new(),
             last_getaddr: BTreeMap::new(),
             max_outbound: MAX_OUTBOUND,
             max_book: MAX_ADDR_BOOK,
@@ -208,14 +232,48 @@ impl AddrManager {
         m
     }
 
-    /// Declare our own reachable address (scope 3). Operator-set; unset means
-    /// this node is outbound-only and is never gossiped.
+    /// Declare our own reachable address for **gossip** (scope 3). Operator-set;
+    /// unset means this node is outbound-only and is never gossiped.
+    ///
+    /// When `Some`, the address is also recorded as a filter identity
+    /// ([`Self::note_self_addr`]): we must not dial what we advertise. Unset does
+    /// **not** clear identities already noted from local sources (bound addr,
+    /// hostname, …) — those keep the self-filter alive without this field.
     pub fn set_self_advertise(&mut self, addr: Option<String>) {
         self.self_advertise = addr.filter(|a| valid_addr(a));
+        if let Some(a) = self.self_advertise.clone() {
+            self.note_self_addr(a);
+        }
     }
 
     pub fn self_advertise(&self) -> Option<&str> {
         self.self_advertise.as_deref()
+    }
+
+    /// Record an address this process recognises as **itself** (issue #127).
+    ///
+    /// Filter only — does not make us gossipable. Invalid strings are ignored.
+    /// If the address was already in the book (e.g. restored from `peers.dat`
+    /// before local identities were wired), it is purged so `known` never counts
+    /// us.
+    pub fn note_self_addr(&mut self, addr: String) {
+        if !valid_addr(&addr) {
+            return;
+        }
+        self.entries.remove(&addr);
+        self.self_addrs.insert(addr);
+    }
+
+    /// Whether `addr` is one of this node's self-identities.
+    pub fn is_self(&self, addr: &str) -> bool {
+        self.self_addrs.contains(addr)
+    }
+
+    /// Every self-identity currently recorded (ops / tests).
+    pub fn self_addrs(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.self_addrs.iter().cloned().collect();
+        v.sort();
+        v
     }
 
     /// Override the outbound cap (tests / testnet tuning).
@@ -249,9 +307,10 @@ impl AddrManager {
     }
 
     /// Add a configured seed. Idempotent; upgrades a previously-learned entry to
-    /// `Seed` so it can no longer be evicted.
+    /// `Seed` so it can no longer be evicted. Self-identities are refused: an
+    /// operator who lists this node in `dial_peers` must not make us dial ourselves.
     pub fn add_seed(&mut self, addr: String) {
-        if !valid_addr(&addr) {
+        if !valid_addr(&addr) || self.is_self(&addr) {
             return;
         }
         let seq = self.next_seq();
@@ -265,10 +324,11 @@ impl AddrManager {
 
     /// Admit addresses learned from a peer's `Addr` message (scope 1).
     ///
-    /// Returns how many were newly admitted. Invalid, duplicate and over-cap
-    /// entries are silently dropped: a peer's claim about a third party is a
-    /// candidate at best (S6), so a bad one is never a scoring event — it would
-    /// let any peer get a third party penalised.
+    /// Returns how many were newly admitted. Invalid, duplicate, **self**, and
+    /// over-cap entries are silently dropped: a peer's claim about a third party
+    /// is a candidate at best (S6), so a bad one is never a scoring event — it
+    /// would let any peer get a third party penalised. Self is not a peer
+    /// (issue #127): it is not known and not dialable.
     pub fn learn<I: IntoIterator<Item = String>>(&mut self, addrs: I) -> usize {
         // Netgroup occupancy is computed once and updated as we go: recounting per
         // address would make one Addr message O(entries x addresses).
@@ -283,8 +343,8 @@ impl AddrManager {
             if !valid_addr(&a) || self.entries.contains_key(&a) {
                 continue;
             }
-            if self.self_advertise.as_deref() == Some(a.as_str()) {
-                continue; // never dial ourselves
+            if self.is_self(&a) {
+                continue; // never dial ourselves — fires with advertise_addr absent
             }
             // Anti-eclipse (issue #91): one netgroup may not occupy the book. Like
             // an unusable address, an over-quota one is silently dropped and is NOT
@@ -410,7 +470,11 @@ impl AddrManager {
         let mut cands: Vec<&AddrEntry> = self
             .entries
             .values()
-            .filter(|e| e.connected.is_none() && now_ms >= e.next_retry_ms)
+            .filter(|e| {
+                e.connected.is_none()
+                    && now_ms >= e.next_retry_ms
+                    && !self.is_self(&e.addr) // belt: self must not be dialed even if in book
+            })
             .collect();
         cands.sort_by_key(|e| {
             let seed_rank = if e.source == AddrSource::Seed { 0 } else { 1 };
@@ -712,6 +776,59 @@ mod tests {
         m.set_self_advertise(Some(a("me:1")));
         assert_eq!(m.learn(vec![a("me:1"), a("other:2")]), 1);
         assert!(!m.known().contains(&a("me:1")));
+    }
+
+    /// The test that matters most (issue #127): the self-filter must fire when
+    /// `advertise_addr` is **absent**. The pre-fix guard compared against
+    /// `self_advertise == Some(_)`, which is dead for every `a` when the field is
+    /// `None` — and that is how this survived #86's acceptance.
+    #[test]
+    fn never_learns_itself_when_advertise_addr_is_absent() {
+        let mut m = AddrManager::new();
+        assert!(m.self_advertise().is_none(), "field deliberately unset");
+        // Local identity only — what the binary knows without the operator.
+        m.note_self_addr(a("node0:9401"));
+        assert!(m.is_self("node0:9401"));
+
+        let n = m.learn(vec![a("node0:9401"), a("node1:9401"), a("node2:9401")]);
+        assert_eq!(n, 2, "self is refused; the other two are admitted");
+        assert!(
+            !m.known().contains(&a("node0:9401")),
+            "self is not a known peer: {known:?}",
+            known = m.known()
+        );
+        assert_eq!(m.known_count(), 2, "known excludes self so dialable/known is honest");
+        assert_eq!(m.dialable_count(), 0);
+
+        // And we will not dial it even if a misconfigured seed tried to put it in.
+        m.add_seed(a("node0:9401"));
+        assert!(!m.known().contains(&a("node0:9401")));
+        assert!(!m.next_dials(0).contains(&a("node0:9401")));
+    }
+
+    #[test]
+    fn noting_self_purges_a_prior_book_entry() {
+        // peers.dat restored before local identities are wired can contain us
+        // (the pre-#127 state). note_self_addr must evict, not merely refuse future
+        // learns — otherwise known keeps counting a self that is already in.
+        let mut m = AddrManager::new();
+        assert_eq!(m.learn(vec![a("me:1"), a("peer:2")]), 2);
+        m.note_self_addr(a("me:1"));
+        assert!(!m.known().contains(&a("me:1")));
+        assert_eq!(m.known(), vec![a("peer:2")]);
+        assert_eq!(m.learn(vec![a("me:1")]), 0, "still refused after purge");
+    }
+
+    #[test]
+    fn known_does_not_count_self() {
+        let mut m = AddrManager::new();
+        m.note_self_addr(a("self:1"));
+        m.set_self_advertise(Some(a("public:1"))); // also a filter identity
+        m.learn(vec![a("self:1"), a("public:1"), a("peer:2")]);
+        assert_eq!(m.known_count(), 1);
+        assert_eq!(m.known(), vec![a("peer:2")]);
+        // Gossip still only carries the declared advertise, not every filter id.
+        assert_eq!(m.gossipable(), vec![a("public:1")]);
     }
 
     #[test]

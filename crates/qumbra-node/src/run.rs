@@ -51,7 +51,7 @@ use qlab_node::Telemetry;
 use crate::metrics_server::MetricsServer;
 use crate::telemetry_server::TelemetryServer;
 
-use qlab_p2p::addrman::{AddrManager, DIAL_RETRY_INTERVAL_MS};
+use qlab_p2p::addrman::{valid_addr, AddrManager, DIAL_RETRY_INTERVAL_MS};
 use qlab_p2p::adapter::{MiningClock, NodeAdapter};
 use qlab_p2p::n1::{ChainView, CommitteeControl};
 use qlab_p2p::transport::TcpTransport;
@@ -377,6 +377,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         };
         for addr in &config.dial_peers {
             addrs.add_seed(addr.clone());
+        }
+        // Self-filter identities (issue #127). These are independent of
+        // `advertise_addr`: the filter must fire when the field is absent, or a
+        // peer that gossips our seed-list name back at us admits and dials it.
+        // Gossip identity stays operator-declared below — local facts never make
+        // us gossipable on their own (outbound-only remains the default).
+        for self_addr in local_self_identities(&config.listen_addr, &bound) {
+            addrs.note_self_addr(self_addr);
         }
         addrs.set_self_advertise(config.advertise_addr.clone());
         if config.advertise_addr.is_none() {
@@ -1174,6 +1182,86 @@ fn node_id_from_addr(addr: &str) -> [u8; 32] {
     qlab_devnet::hash::keccak256(addr.as_bytes())
 }
 
+/// Local self-identities for the address-book filter (issue #127).
+///
+/// A node must recognise its own address **without** `advertise_addr`. The
+/// operator-declared advertise is a *gossip* fact; these are *filter* facts the
+/// process can know on its own:
+///
+/// - the bound socket (`transport.local_addr()`), always
+/// - the configured `listen_addr` string (may be `0.0.0.0:port`)
+/// - the system hostname + listen port (docker compose sets `hostname: nodeN`,
+///   and that is exactly the form peers use in `dial_peers` / gossip)
+/// - loopback aliases when the bind is unspecified, so a self-dial via
+///   `127.0.0.1` is also refused
+///
+/// Honest remainder: a public address that is not on any local interface and is
+/// not the hostname (AWS EIP, 1:1 NAT) is **not** knowable here. Without
+/// `advertise_addr` that form can still enter the book as an undialable
+/// candidate. Refusing every address we "cannot rule out as self" would refuse
+/// discovery for every outbound-only home node — a regression against the NAT
+/// decision. The EIP case is therefore a separable remainder, not a reason to
+/// take the stricter posture.
+fn local_self_identities(listen_addr: &str, bound: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |s: String| {
+        if valid_addr(&s) && !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    push(bound.to_string());
+    push(listen_addr.to_string());
+
+    let port = addr_port(bound).or_else(|| addr_port(listen_addr));
+    if let Some(port) = port {
+        if let Some(host) = system_hostname() {
+            push(format!("{host}:{port}"));
+        }
+        if host_is_unspecified(listen_addr) || host_is_unspecified(bound) {
+            push(format!("127.0.0.1:{port}"));
+            push(format!("[::1]:{port}"));
+            push(format!("localhost:{port}"));
+        }
+    }
+    out
+}
+
+fn addr_port(addr: &str) -> Option<u16> {
+    let (_host, port) = addr.rsplit_once(':')?;
+    port.parse().ok()
+}
+
+fn host_is_unspecified(addr: &str) -> bool {
+    let host = match addr.rsplit_once(':') {
+        Some((h, _)) => h,
+        None => addr,
+    };
+    let unbracketed = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    unbracketed == "0.0.0.0"
+        || unbracketed == "::"
+        || unbracketed == "[::]"
+        || unbracketed.eq_ignore_ascii_case("0:0:0:0:0:0:0:0")
+}
+
+/// Best-effort system hostname. Docker compose stamps `hostname: nodeN` into
+/// `/etc/hostname`; bare processes may only have `$HOSTNAME`. Either is enough
+/// for the filter; neither is used for gossip.
+fn system_hostname() -> Option<String> {
+    if let Ok(s) = std::fs::read_to_string("/etc/hostname") {
+        let t = s.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    std::env::var("HOSTNAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Path of committee member `index`'s persistent finalizer ledger under `data_dir`.
 fn finalizer_state_path(data_dir: &std::path::Path, index: usize) -> std::path::PathBuf {
     data_dir.join(format!("finalizer-{index}.state"))
@@ -1464,6 +1552,57 @@ mod tests {
         let p = l.local_addr().unwrap().port();
         drop(l);
         p
+    }
+
+    #[test]
+    fn local_self_identities_cover_bound_listen_and_loopback_aliases() {
+        // Unspecified bind → loopback forms are also self (a self-dial via 127.0.0.1).
+        let ids = local_self_identities("0.0.0.0:9401", "0.0.0.0:9401");
+        assert!(ids.contains(&"0.0.0.0:9401".to_string()));
+        assert!(ids.contains(&"127.0.0.1:9401".to_string()));
+        assert!(ids.contains(&"localhost:9401".to_string()));
+        // Concrete bind is itself, not every loopback alias.
+        let ids2 = local_self_identities("10.0.0.5:9333", "10.0.0.5:9333");
+        assert!(ids2.contains(&"10.0.0.5:9333".to_string()));
+        assert!(!ids2.contains(&"127.0.0.1:9333".to_string()));
+    }
+
+    /// Issue #127 over the real socket: a node with **no** `advertise_addr` still
+    /// refuses to admit the address it is listening on when a peer gossips it back.
+    #[test]
+    fn node_without_advertise_addr_refuses_its_own_bound_address() {
+        let port = free_port();
+        let addr = format!("127.0.0.1:{port}");
+
+        let (mut cfg, gen, base) = rig("self_filter", false);
+        cfg.listen_addr = addr.clone();
+        cfg.advertise_addr = None; // the field is absent — the guard must still fire
+        let mut node =
+            RunningNode::start(&cfg, &gen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+
+        assert!(node.p2p().addrs().self_advertise().is_none());
+        assert!(
+            node.p2p().addrs().is_self(&addr),
+            "bound address must be a filter identity even without advertise_addr"
+        );
+
+        // Simulate a peer gossiping our address back (the ordinary seed→dialable→
+        // gossip path that put us in our own book before #127).
+        let admitted = node
+            .p2p
+            .addrs_mut()
+            .learn(vec![addr.clone(), "203.0.113.9:9333".into()]);
+        assert_eq!(admitted, 1, "self refused; the stranger admitted");
+        assert!(
+            !node.p2p.addrs().known().contains(&addr),
+            "self must not appear in known: {:?}",
+            node.p2p.addrs().known()
+        );
+        assert_eq!(node.p2p.addrs().known_count(), 1);
+        assert!(!node.p2p.addrs().next_dials(0).contains(&addr));
+
+        drop(node);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Pump every node's message loop a few times so handshakes/replies land.
