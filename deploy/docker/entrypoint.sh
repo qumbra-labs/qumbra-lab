@@ -6,6 +6,9 @@
 #                               into /shared, exactly once (idempotent on restart)
 #   entrypoint.sh run <idx>     generate node<idx>'s config from the fixed 4-node
 #                               topology and run it (real TCP + RandomX + disk)
+#   entrypoint.sh faucet        the T1 faucet listener on a KEYLESS node of its own
+#                               (issue #123) — mints its own key material once into
+#                               its data volume, mines to its own rkm, serves HTTP
 #
 # QUMBRA_BIN selects WHICH node binary runs (issue #74). The halt height is a
 # compile-time release constant with no runtime override (H1), so a "binary swap"
@@ -51,6 +54,9 @@ LISTEN_PORT=9401
 # exposure decision; on a real host the same key is paired with a
 # source-restricted inbound rule (see config.rs's doc for `telemetry_addr`).
 TELEMETRY_PORT=9410
+# The T1 faucet's HTTP listener (issue #123). Same reasoning as TELEMETRY_PORT for
+# the in-container bind; compose publishes it to 127.0.0.1 on the host.
+FAUCET_PORT=9450
 GENESIS_FILE="$GENESIS_DIR/genesis.qmb"
 INIT_LOG="$GENESIS_DIR/genesis-init.log"
 HASH_FILE="$GENESIS_DIR/genesis.hash"
@@ -160,8 +166,93 @@ EOF
     exec "$BIN" run --config "$cfg" --sample-interval-secs "${QUMBRA_SAMPLE_SECS:-30}"
     ;;
 
+  faucet)
+    # The T1 faucet listener (issue #123), on a node of its own that holds NO
+    # committee keys. `testnet-plan.md` §6.2: a node that holds committee keys
+    # exposes nothing beyond P2P, so the faucet's hot spending key and the
+    # committee's signing keys never share a host. `qumbra-faucet` REFUSES to start
+    # if `committee_key_paths` is non-empty, so this is enforced, not documented.
+    for _ in $(seq 1 120); do [[ -f "$HASH_FILE" && -f "$GENESIS_FILE" ]] && break; sleep 1; done
+    [[ -f "$HASH_FILE" ]] || { echo "faucet: shared genesis never appeared" >&2; exit 1; }
+    ghash="$(cat "$HASH_FILE")"
+
+    mkdir -p "$DATA_DIR/node"
+    svc_cfg="$DATA_DIR/faucet.toml"
+    node_cfg="$DATA_DIR/faucet-node.toml"
+
+    # (1) Key material, once, in the faucet's own persistent volume. `keygen` writes
+    #     0600 and prints only the PUBLIC parts (the address and the rkm); it refuses
+    #     to overwrite an existing file, so a restart reuses the same faucet identity
+    #     and keeps whatever it has already mined.
+    if [[ ! -f "$DATA_DIR/faucet.seed" ]]; then
+      qumbra-faucet keygen --out "$DATA_DIR"
+    else
+      echo "faucet: reusing the existing seed in $DATA_DIR (restart-safe)"
+    fi
+
+    # (2) The service config. `0.0.0.0` INSIDE a container namespace on a private
+    #     bridge is not a host-exposure decision — the same argument this file already
+    #     makes for telemetry_addr. docker-compose publishes it to 127.0.0.1 on the
+    #     HOST, so the loopback default survives the boundary that matters. On a real
+    #     host, binding off-loopback is a deliberate deployment act paired with a
+    #     source-restricted inbound rule, and `qumbra-faucet` says so loudly at
+    #     startup every time it is not on loopback.
+    #
+    #     QUMBRA_FAUCET_TICKETS=open turns tickets OFF, which makes the faucet
+    #     saturable by roughly a hundred subnets (qlab_faucet::policy is explicit
+    #     about the price). Default is required.
+    tickets=true
+    [[ "${QUMBRA_FAUCET_TICKETS:-required}" == "open" ]] && tickets=false
+    cat > "$svc_cfg" <<EOF
+# generated in-container by entrypoint.sh (do not hand-edit)
+listen_addr = "0.0.0.0:$FAUCET_PORT"
+node_config = "$node_cfg"
+seed_file = "$DATA_DIR/faucet.seed"
+ticket_secret_file = "$DATA_DIR/faucet-tickets.secret"
+tickets_required = $tickets
+EOF
+
+    # (3) The payout key, derived from the seed we just wrote. This is the whole
+    #     funding story: the faucet's node mines to the faucet's own rkm, and
+    #     `qumbra-faucet` refuses to start if the two do not match — because a faucet
+    #     mining to somebody else's key looks perfectly healthy and is simply never
+    #     funded, for as long as it runs.
+    # `grep`, not `head -1`: `address` prints the rkm line AND the receive address,
+    # and `head` closes the pipe after the first line, which makes the second
+    # `println!` fail with EPIPE and panic (Rust does not ignore SIGPIPE). grep reads
+    # to EOF, so the writer never sees a closed pipe. Observed on the first run.
+    rkm_line="$(qumbra-faucet address --config "$svc_cfg" | grep '^miner_rkm')"
+    echo "faucet: $rkm_line"
+
+    # (4) The KEYLESS node config. Note `committee_key_paths` is absent (i.e. empty).
+    peers=""
+    for j in 0 1 2 3; do peers+="\"node$j:$LISTEN_PORT\", "; done
+    peers="${peers%, }"
+    cat > "$node_cfg" <<EOF
+# generated in-container by entrypoint.sh for the faucet's KEYLESS node (#123)
+data_dir = "$DATA_DIR/node"
+listen_addr = "0.0.0.0:$LISTEN_PORT"
+advertise_addr = "faucet:$LISTEN_PORT"
+dial_peers = [$peers]
+genesis_file = "$GENESIS_FILE"
+committee_key_paths = []
+mining = true
+expected_genesis_hash = "$ghash"
+telemetry_addr = "0.0.0.0:$TELEMETRY_PORT"
+$rkm_line
+EOF
+    echo "== faucet config =="
+    cat "$svc_cfg"
+    echo "== faucet node config =="
+    cat "$node_cfg"
+    # Pre-flight: the genesis byte-verify, the keyless check, and the payout check —
+    # all of them before a socket is bound or a block is mined.
+    qumbra-faucet check --config "$svc_cfg"
+    exec qumbra-faucet run --config "$svc_cfg"
+    ;;
+
   *)
-    echo "entrypoint: unknown command '${cmd:-}' (expected: init | run <idx>)" >&2
+    echo "entrypoint: unknown command '${cmd:-}' (expected: init | run <idx> | faucet)" >&2
     exit 2
     ;;
 esac

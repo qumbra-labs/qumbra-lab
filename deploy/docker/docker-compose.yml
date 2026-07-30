@@ -8,6 +8,7 @@
 #
 #   docker compose -f deploy/docker/docker-compose.yml up --build         # all 4
 #   docker compose -f deploy/docker/docker-compose.yml up -d --build node0 node1 node2
+#   docker compose -f deploy/docker/docker-compose.yml up -d --build faucet  # +#123
 #   deploy/docker/soak.sh                                                 # scenarios
 #
 # QUMBRA_ADVERTISE_ADDR=none brings the net up with NO advertised address on any
@@ -41,6 +42,7 @@ x-node-common: &node-common
 
 volumes:
   shared:                   # the ONE shared genesis + 21 keys (init writes, nodes read)
+  dataf:                    # the faucet's node data + its own key material (#123)
   data0:
   data1:
   data2:
@@ -62,6 +64,39 @@ services:
     command: ["init"]
     volumes:
       - shared:/shared
+
+  # ── the T1 faucet (issue #123) ────────────────────────────────────────────
+  #
+  # A FIFTH node, and deliberately not one of the four: it holds NO committee keys
+  # (testnet-plan.md §6.2 — a node that holds committee keys exposes nothing beyond
+  # P2P, so the faucet's hot spending key never shares a host with them), and
+  # `qumbra-faucet` refuses to start if its node config names any. It mines like the
+  # others and pays its coinbase to its own rkm, which is the whole funding story.
+  #
+  #   docker compose -f deploy/docker/docker-compose.yml up -d --build faucet
+  #   open http://127.0.0.1:9450/
+  #
+  # 🔴 The faucet cannot serve a grant until its own coinbase matures: 144 blocks
+  # (FROZEN §2) at the FROZEN 75 s block time is ~3 h after it wins its first two
+  # blocks. Until then the page says so, with the height, and refuses rather than
+  # queueing a request it cannot honour.
+  faucet:
+    <<: *node-common
+    hostname: faucet
+    environment:
+      # `required` (default) or `open`. Open makes the faucet saturable by roughly a
+      # hundred subnets — qlab_faucet::policy prices it exactly.
+      QUMBRA_FAUCET_TICKETS: ${QUMBRA_FAUCET_TICKETS:-required}
+    # Published to the HOST's loopback only. The in-container bind is 0.0.0.0 inside a
+    # private bridge namespace, which is not a host-exposure decision; this line is
+    # where the exposure decision actually lives, and it says loopback.
+    ports:
+      - "127.0.0.1:9450:9450"
+      - "127.0.0.1:9414:9410"
+    command: ["faucet"]
+    volumes:
+      - shared:/shared
+      - dataf:/data
 
   node0:                    # de-facto bootstrap (all nodes full-mesh dial each other)
     <<: *node-common
