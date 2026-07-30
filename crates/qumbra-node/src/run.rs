@@ -48,7 +48,7 @@ use qlab_devnet::pow::PowEngine;
 use qlab_node::metrics::{render as render_metrics, LiveGauges};
 use qlab_node::recovery::{Finalizer, FinalizerState};
 use qlab_node::round::ObsClock;
-use qlab_node::{supply_by_epoch, ChainStore, SupplyBlock, Telemetry};
+use qlab_node::{ChainStore, SupplyBlock, SupplyLedger, Telemetry};
 
 use crate::metrics_server::MetricsServer;
 use crate::telemetry_server::TelemetryServer;
@@ -85,10 +85,11 @@ const METRICS_REFRESH: Duration = Duration::from_secs(5);
 ///
 /// Same argument as [`METRICS_REFRESH`], same number: the node — not whoever is
 /// polling it — decides how often it pays. Issue #121 adds one 48-byte supply row
-/// per epoch and derives those rows from the canonical stored bodies; at the
-/// frozen one-day epoch this remains a small daily growth rather than a per-block
-/// payload. The cost is bounded staleness of at most this interval, which against
-/// a FROZEN 75 s block time and a
+/// per epoch: the ledger rebuilds from canonical stored bodies once at startup,
+/// then advances only over new heights. At the frozen one-day epoch this remains
+/// small daily payload growth rather than a per-block history or a repeated chain
+/// scan. The cost is bounded staleness of at most this interval, which against a
+/// FROZEN 75 s block time and a
 /// [`CHECKPOINT_CADENCE_BLOCKS`]-block checkpoint grid cannot change any answer
 /// the operator view gives: a finalized checkpoint is never reverted, so a node's
 /// `fid` at a given `finalized_height` reads the same whenever it is read, and a
@@ -137,6 +138,9 @@ pub enum RunError {
     /// The binary's halt-height release constants are not startable, or this
     /// binary must not resume past the halt this node already performed (#74).
     Release(ReleaseError),
+    /// Persisted canonical bodies could not be reduced to a contiguous supply
+    /// ledger. Starting without an audit basis would make the public view lie.
+    Supply(qlab_node::SupplyError),
 }
 
 impl std::fmt::Display for RunError {
@@ -147,6 +151,7 @@ impl std::fmt::Display for RunError {
             RunError::Node(e) => write!(f, "node: {e}"),
             RunError::Io(e) => write!(f, "io: {e}"),
             RunError::Release(e) => write!(f, "release: {e}"),
+            RunError::Supply(e) => write!(f, "supply attestation: {e:?}"),
         }
     }
 }
@@ -164,6 +169,11 @@ impl From<qlab_node::NodeError> for RunError {
 impl From<ReleaseError> for RunError {
     fn from(e: ReleaseError) -> Self {
         RunError::Release(e)
+    }
+}
+impl From<qlab_node::SupplyError> for RunError {
+    fn from(e: qlab_node::SupplyError) -> Self {
+        RunError::Supply(e)
     }
 }
 
@@ -259,6 +269,9 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// The `/v1/telemetry` server, when `telemetry_addr` is configured. `None` =
     /// the node listens on nothing extra, which is the default.
     telemetry_server: Option<TelemetryServer>,
+    /// Incremental scheduled-issuance accounting. Rebuilt once from the persisted
+    /// canonical bodies at startup, then advanced only for new heights.
+    supply_ledger: Mutex<SupplyLedger>,
     /// Unix seconds this process started (exported so a restart is a visible fact).
     process_start_secs: u64,
     /// Local listen address (for logs).
@@ -410,6 +423,24 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         *p2p.addrs_mut() = addrs;
         p2p.maintain(0); // dial the seeds now
 
+        let supply_ledger = {
+            let node = p2p.node();
+            let state_chain = node.state().chain();
+            SupplyLedger::from_blocks(
+                state_chain.chain().main_chain().iter().map(|hash| {
+                    let block = state_chain
+                        .block(hash)
+                        .expect("every canonical state-chain hash has its stored body");
+                    SupplyBlock {
+                        height: block.header.height,
+                        coinbase: block.coinbase,
+                        fees: block.txs.iter().map(|tx| tx.fee).sum(),
+                    }
+                }),
+                EPOCH_LENGTH_BLOCKS,
+            )?
+        };
+
         Ok(RunningNode {
             p2p,
             finalizers,
@@ -429,6 +460,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             telemetry_snapshot: Arc::new(Mutex::new(Vec::new())),
             last_telemetry_render: Instant::now(),
             telemetry_server: None,
+            supply_ledger: Mutex::new(supply_ledger),
             process_start_secs: unix_secs(),
             listen_addr: bound,
             // Sample telemetry roughly every 30 s (well under the 75 s block time,
@@ -568,20 +600,29 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         let node = self.p2p.node();
         let chain = node.chain();
         let state_chain = node.state().chain();
-        let supply = supply_by_epoch(
-            state_chain.chain().main_chain().iter().map(|hash| {
+        let supply = {
+            let mut ledger = self
+                .supply_ledger
+                .lock()
+                .expect("the supply ledger mutex is not poisoned");
+            let main_chain = state_chain.chain().main_chain();
+            for height in ledger.next_height()..=state_chain.tip_height() {
+                let hash = main_chain
+                    .get(height as usize)
+                    .expect("every canonical height has a hash");
                 let block = state_chain
                     .block(hash)
                     .expect("every canonical state-chain hash has its stored body");
-                SupplyBlock {
-                    height: block.header.height,
-                    coinbase: block.coinbase,
-                    fees: block.txs.iter().map(|tx| tx.fee).sum(),
-                }
-            }),
-            EPOCH_LENGTH_BLOCKS,
-        )
-        .expect("the canonical state chain is contiguous from genesis");
+                ledger
+                    .push(SupplyBlock {
+                        height: block.header.height,
+                        coinbase: block.coinbase,
+                        fees: block.txs.iter().map(|tx| tx.fee).sum(),
+                    })
+                    .expect("new canonical heights extend the supply ledger contiguously");
+            }
+            ledger.rows().to_vec()
+        };
         // Age is chain-time from the finalized block; 0 when there is no finalized
         // CHECKPOINT to measure from — nothing finalized (S8: no finalized head ⇒
         // no finalized-age, not a genesis-fallback absolute) or the finalized head

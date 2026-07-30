@@ -81,4 +81,6 @@ pub use store::{
     ChainStore, CommitmentStore, Hash32, MemChainStore, MemCommitmentStore, MemNullifierStore,
     NullifierStore, StoredBlock, StoredHeader, StoredTx,
 };
-pub use supply::{supply_by_epoch, SupplyBlock, SupplyEpoch, SupplyError};
+pub use supply::{
+    supply_by_epoch, SupplyBlock, SupplyEpoch, SupplyError, SupplyLedger,
+};

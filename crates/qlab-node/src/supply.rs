@@ -73,6 +73,97 @@ pub enum SupplyError {
     SumOverflow { epoch: u64 },
 }
 
+/// Incremental supply accounting: rebuild once from the persisted canonical
+/// chain at startup, then append only newly accepted heights.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupplyLedger {
+    epoch_length: u64,
+    next_height: u64,
+    rows: Vec<SupplyEpoch>,
+}
+
+impl SupplyLedger {
+    pub fn new(epoch_length: u64) -> Result<Self, SupplyError> {
+        if epoch_length == 0 {
+            return Err(SupplyError::ZeroEpochLength);
+        }
+        Ok(Self {
+            epoch_length,
+            next_height: 0,
+            rows: Vec::new(),
+        })
+    }
+
+    pub fn from_blocks<I>(blocks: I, epoch_length: u64) -> Result<Self, SupplyError>
+    where
+        I: IntoIterator<Item = SupplyBlock>,
+    {
+        let mut ledger = Self::new(epoch_length)?;
+        for block in blocks {
+            ledger.push(block)?;
+        }
+        Ok(ledger)
+    }
+
+    /// The next canonical height this ledger expects.
+    pub fn next_height(&self) -> u64 {
+        self.next_height
+    }
+
+    pub fn rows(&self) -> &[SupplyEpoch] {
+        &self.rows
+    }
+
+    /// Append one canonical block. Heights must be contiguous from genesis.
+    pub fn push(&mut self, block: SupplyBlock) -> Result<(), SupplyError> {
+        if self.next_height == 0 && self.rows.is_empty() && block.height != 0 {
+            return Err(SupplyError::DoesNotStartAtGenesis { got: block.height });
+        }
+        if block.height != self.next_height {
+            return Err(SupplyError::NonContiguous {
+                expected: self.next_height,
+                got: block.height,
+            });
+        }
+        self.next_height =
+            self.next_height
+                .checked_add(1)
+                .ok_or(SupplyError::SumOverflow {
+                    epoch: block.height / self.epoch_length,
+                })?;
+
+        let epoch = block.height / self.epoch_length;
+        if self.rows.last().is_none_or(|row| row.epoch != epoch) {
+            self.rows.push(SupplyEpoch {
+                epoch,
+                start_height: block.height,
+                end_height: block.height,
+                measured_coinbase: 0,
+                expected_coinbase: 0,
+                fees: 0,
+            });
+        }
+        let row = self.rows.last_mut().expect("the epoch row was inserted above");
+        row.end_height = block.height;
+        row.measured_coinbase = row
+            .measured_coinbase
+            .checked_add(block.coinbase)
+            .ok_or(SupplyError::SumOverflow { epoch })?;
+        row.fees = row
+            .fees
+            .checked_add(block.fees)
+            .ok_or(SupplyError::SumOverflow { epoch })?;
+
+        let first_mint = row.start_height.max(1);
+        row.expected_coinbase = if row.end_height < first_mint {
+            0
+        } else {
+            s_atomic(row.end_height + 1) - s_atomic(first_mint)
+        };
+        Ok(())
+    }
+}
+
 /// Group a contiguous canonical chain into epoch attestations.
 ///
 /// Genesis is part of epoch 0's covered range but contributes zero expected
@@ -86,60 +177,7 @@ pub fn supply_by_epoch<I>(
 where
     I: IntoIterator<Item = SupplyBlock>,
 {
-    if epoch_length == 0 {
-        return Err(SupplyError::ZeroEpochLength);
-    }
-
-    let mut out: Vec<SupplyEpoch> = Vec::new();
-    let mut expected_height = 0u64;
-    for block in blocks {
-        if expected_height == 0 && out.is_empty() && block.height != 0 {
-            return Err(SupplyError::DoesNotStartAtGenesis { got: block.height });
-        }
-        if block.height != expected_height {
-            return Err(SupplyError::NonContiguous {
-                expected: expected_height,
-                got: block.height,
-            });
-        }
-        expected_height = expected_height
-            .checked_add(1)
-            .ok_or(SupplyError::SumOverflow {
-                epoch: block.height / epoch_length,
-            })?;
-
-        let epoch = block.height / epoch_length;
-        if out.last().is_none_or(|row| row.epoch != epoch) {
-            out.push(SupplyEpoch {
-                epoch,
-                start_height: block.height,
-                end_height: block.height,
-                measured_coinbase: 0,
-                expected_coinbase: 0,
-                fees: 0,
-            });
-        }
-        let row = out.last_mut().expect("the epoch row was inserted above");
-        row.end_height = block.height;
-        row.measured_coinbase = row
-            .measured_coinbase
-            .checked_add(block.coinbase)
-            .ok_or(SupplyError::SumOverflow { epoch })?;
-        row.fees = row
-            .fees
-            .checked_add(block.fees)
-            .ok_or(SupplyError::SumOverflow { epoch })?;
-    }
-
-    for row in &mut out {
-        let first_mint = row.start_height.max(1);
-        row.expected_coinbase = if row.end_height < first_mint {
-            0
-        } else {
-            s_atomic(row.end_height + 1) - s_atomic(first_mint)
-        };
-    }
-    Ok(out)
+    Ok(SupplyLedger::from_blocks(blocks, epoch_length)?.rows)
 }
 
 #[cfg(test)]
@@ -182,6 +220,18 @@ mod tests {
         assert!(rows[0].agrees());
         assert_eq!(rows[1].divergence_bessel(), 1);
         assert!(!rows[1].agrees());
+    }
+
+    #[test]
+    fn incremental_append_matches_one_shot_rebuild() {
+        let blocks = known_chain(10, 4);
+        let rebuilt = supply_by_epoch(blocks.clone(), 4).unwrap();
+        let mut incremental = SupplyLedger::new(4).unwrap();
+        for block in blocks {
+            incremental.push(block).unwrap();
+        }
+        assert_eq!(incremental.next_height(), 11);
+        assert_eq!(incremental.rows(), rebuilt);
     }
 
     #[test]
