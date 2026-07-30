@@ -1143,6 +1143,15 @@ mod tests {
         apply_block_with_shape(rpc.node_mut(), vec![], false);
         applied.push((rpc.node().tip_height(), rpc.node().commitment_count()));
 
+        // Keep walking beyond #102's ratified height-offset boundary. This
+        // deliberately says nothing about whether those later transitions
+        // append a matured coinbase leaf; it only ensures the comparison still
+        // observes that append site after the schedule changes.
+        for height in 5..=(crate::COINBASE_MATURITY_BLOCKS + 4) {
+            apply_block_with_shape(rpc.node_mut(), vec![], height % 2 == 1);
+            applied.push((rpc.node().tip_height(), rpc.node().commitment_count()));
+        }
+
         assert_eq!(
             rpc.main_chain_counts(),
             applied,
