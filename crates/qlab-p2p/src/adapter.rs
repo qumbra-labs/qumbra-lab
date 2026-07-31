@@ -2200,7 +2200,7 @@ mod tests {
         // this fix, and the contrast that makes (a) mean something.
         let mut source = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
         let chain = mine_chain(&mut source, 3);
-        let mut follower = follower_with_headers_only(&chain);
+        let follower = follower_with_headers_only(&chain);
         assert!(follower.state_lag().blocks() > 0, "behind");
         assert_eq!(
             follower.applied_tip().chain_field(),
