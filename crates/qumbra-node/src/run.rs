@@ -1368,8 +1368,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
 
     /// The event loop: pump the transport, mine on the cadence, and propose
     /// checkpoints, until `shutdown` is set. On exit performs the graceful-shutdown
-    /// **snapshot flush** (item 1).
-    pub fn run_until(&mut self, shutdown: &AtomicBool) {
+    /// **snapshot flush** (item 1) and address-book write.
+    ///
+    /// Returns `true` when the snapshot flush succeeded, `false` when it failed
+    /// (the failure is already `eprintln!`'d). The binary uses this so it does not
+    /// print "snapshot flushed" after a failed write (issue #145).
+    pub fn run_until(&mut self, shutdown: &AtomicBool) -> bool {
         self.run_until_with(shutdown, |_| {})
     }
 
@@ -1391,9 +1395,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     ///   share `&mut` is not to.
     /// - It cannot make the loop exit; only `shutdown` does.
     ///
+    /// Returns `true` when the snapshot flush on exit succeeded — same contract as
+    /// [`Self::run_until`]. The address book is always attempted (best-effort) after
+    /// the snapshot write; it does not affect the return value.
+    ///
     /// [`Self::run_until`] is this with a no-op hook, so an ordinary node run is
-    /// byte-for-byte the behaviour it was.
-    pub fn run_until_with<F: FnMut(&mut Self)>(&mut self, shutdown: &AtomicBool, mut on_tick: F) {
+    /// byte-for-byte the behaviour it was (aside from the returned status).
+    pub fn run_until_with<F: FnMut(&mut Self)>(&mut self, shutdown: &AtomicBool, mut on_tick: F) -> bool {
         // An initial sample at startup (height/finality as opened from disk).
         println!("{}", self.telemetry_sample());
         self.last_sample = Instant::now();
@@ -1448,10 +1456,19 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // The rounds that DID close are flushed, so nothing already decided is lost.
         self.emit_rounds();
         // Graceful shutdown = snapshot flush + the learned address book.
-        if let Err(e) = self.save_snapshot() {
-            eprintln!("snapshot flush on shutdown failed: {e}");
-        }
+        // Both sit here so every stop path that sets `shutdown` (SIGINT, and with
+        // ctrlc's `termination` feature also SIGTERM/SIGHUP — issue #145) reaches
+        // them. Returning the snapshot outcome is what lets main not claim a flush
+        // that failed.
+        let snapshot_ok = match self.save_snapshot() {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("snapshot flush on shutdown failed: {e}");
+                false
+            }
+        };
         self.save_addr_book();
+        snapshot_ok
     }
 }
 
@@ -1900,10 +1917,44 @@ mod tests {
         node.set_mine_interval(Duration::ZERO);
         node.try_mine();
         // A pre-set shutdown flag: run_until does the graceful flush and returns.
+        // This proves the *exit path* writes both files when the flag is set; the
+        // signal→flag arming is covered by `tests/sigterm_shutdown.rs` (issue #145).
         let shutdown = AtomicBool::new(true);
-        node.run_until(&shutdown);
+        let ok = node.run_until(&shutdown);
+        assert!(ok, "snapshot flush succeeds on a writable data dir");
         // The snapshot file now exists in the data dir (graceful flush ran).
         assert!(config.data_dir.join(qlab_node::SNAPSHOT).exists(), "snapshot flushed");
+        // peers.dat is the same post-loop block — every deployment restart was
+        // manufacturing a seeds-only book because this write never ran (#145).
+        assert!(
+            config.data_dir.join(ADDRBOOK_FILE).exists(),
+            "peers.dat written on the same graceful-shutdown path as the snapshot"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #145: `run_until` must return `false` when the snapshot flush fails,
+    /// so main does not print "snapshot flushed" after a failed write.
+    #[test]
+    fn run_until_returns_false_when_snapshot_flush_fails() {
+        let (config, genesis, base) = rig("shutdown_fail", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_mine();
+        // Make the data dir unwritable so the atomic snapshot create (tmp + rename)
+        // cannot succeed. The return value is what main keys the status line on.
+        let mut perms = std::fs::metadata(&config.data_dir).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&config.data_dir, perms.clone()).unwrap();
+
+        let shutdown = AtomicBool::new(true);
+        let ok = node.run_until(&shutdown);
+        assert!(!ok, "snapshot flush failure must surface as false to the caller");
+
+        // Restore writability so cleanup can remove the tree.
+        perms.set_readonly(false);
+        std::fs::set_permissions(&config.data_dir, perms).unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 
