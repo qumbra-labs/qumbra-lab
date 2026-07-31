@@ -541,6 +541,18 @@ impl GenesisFile {
     ) -> Result<Vec<std::path::PathBuf>, GenesisError> {
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir).map_err(GenesisError::Io)?;
+        // 0700 on the directory, 0600 on each file (below). `deploy.sh` moves these
+        // with `rsync -a`, which **preserves** permissions — so whatever mode is set
+        // here is the mode they land with on four public-IP hosts, and the default
+        // from umask is 755/644.
+        //
+        // Today's T0 keys are derived from a deterministic seed (`committee_seed`)
+        // and each file says so in as many words, so a 644 mode is not the exposure
+        // it looks like — anyone with the source regenerates them. **That is exactly
+        // why this is worth fixing now rather than later:** the mode has to be right
+        // *before* the seeds stop being derivable, and a permission bug is hardest to
+        // notice in the window where it does not matter yet.
+        set_mode(dir, 0o700)?;
         let mut paths = Vec::new();
         for i in 0..self.committee_keys.len() {
             let kf = KeyFile {
@@ -551,10 +563,28 @@ impl GenesisFile {
             };
             let path = dir.join(format!("committee-{i:02}.key"));
             std::fs::write(&path, kf.to_toml()).map_err(GenesisError::Io)?;
+            // After the write, not via `OpenOptions::mode`: that is ignored when the
+            // file already exists, so a re-run into a populated dir would silently
+            // keep the old mode.
+            set_mode(&path, 0o600)?;
             paths.push(path);
         }
         Ok(paths)
     }
+}
+
+/// Set a path's permission bits. No-op off Unix, where the concept does not apply
+/// and the deploy path (`rsync` over ssh to Debian hosts) does not exist either.
+#[cfg(unix)]
+fn set_mode(path: impl AsRef<std::path::Path>, mode: u32) -> Result<(), GenesisError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .map_err(GenesisError::Io)
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: impl AsRef<std::path::Path>, _mode: u32) -> Result<(), GenesisError> {
+    Ok(())
 }
 
 // ── minimal hex (no `hex` crate in the tree) ───────────────────────────────
@@ -647,6 +677,40 @@ mod tests {
     /// refuses to start against either older net, which is the loud, intended
     /// outcome (see [`GenesisFile`]'s docs for why they were already incompatible
     /// before the hash moved).
+
+    /// Issue: committee key files land on four public-IP hosts via `rsync -a`,
+    /// which preserves permissions — so the mode set here is the mode they get.
+    /// 0700 on the directory and 0600 on each key, asserted rather than assumed.
+    ///
+    /// Deliberately checks a **re-run into a populated directory** too: `fs::write`
+    /// does not change an existing file's mode, and `OpenOptions::mode` is ignored
+    /// when the file exists, so a fix applied only at creation would pass a
+    /// first-run test and leave a stale 0644 behind on every regeneration.
+    #[cfg(unix)]
+    #[test]
+    fn committee_key_files_are_not_world_readable_even_on_a_re_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("qumbra-keyperm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let dir = tmp.join("keys");
+        // Pre-create one key at a deliberately wrong mode: this is the re-run case.
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = dir.join("committee-00.key");
+        std::fs::write(&stale, "stale").unwrap();
+        std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let gf = GenesisFile::new_devnet_t0();
+        let paths = gf.write_committee_key_files(&dir).expect("write keys");
+        assert_eq!(paths.len(), 21, "21 committee keys");
+
+        let dmode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dmode, 0o700, "keys/ must be 0700, got {dmode:o}");
+        for p in &paths {
+            let m = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(m, 0o600, "{} must be 0600, got {m:o}", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
     #[test]
     fn genesis_hash_is_pinned() {
         assert_eq!(
