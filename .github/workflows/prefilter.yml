@@ -11,8 +11,14 @@
 # claims to have run one.
 name: pre-filter
 
+# push is restricted to main. A branch push and its PR produce DIFFERENT
+# github.ref values (refs/heads/x vs refs/pull/N/merge), so the concurrency
+# group below cannot merge them — an unrestricted `push:` bills every branch
+# commit twice, once as push and once as pull_request. Observed on this
+# workflow's own first two runs (30673165146 + 30673165522, same commit).
 on:
   push:
+    branches: [main]
   pull_request:
 
 # Supersede in-flight runs for the same ref. Private-repo Actions minutes are
