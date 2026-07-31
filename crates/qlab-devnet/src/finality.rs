@@ -83,6 +83,17 @@ impl FinalityTracker {
         Self::default()
     }
 
+    /// Rehydrate a tracker from one checkpoint already established before this
+    /// process started.
+    ///
+    /// Recovery is deliberately not routed through [`Self::try_finalize`]: no new
+    /// quorum event occurs at startup, and the durable node state has already
+    /// proved this exact checkpoint against its reconstructed main chain. Keeping
+    /// the constructor named prevents a restore from masquerading as a live vote.
+    pub fn from_restored_checkpoint(checkpoint: Checkpoint) -> Self {
+        Self { finalized: vec![checkpoint] }
+    }
+
     /// Attempt to finalize `cp` given `votes` and the `committee`.
     ///
     /// Requires: `cp` strictly advances finality (height > current finalized);
@@ -234,6 +245,16 @@ mod tests {
         assert!(!fin.is_root_final(&[0xAB; 32]));
         assert!(fin.is_height_final(4) && fin.is_height_final(3));
         assert!(!fin.is_height_final(5));
+    }
+
+    #[test]
+    fn restored_checkpoint_rehydrates_without_claiming_a_new_quorum_event() {
+        let checkpoint = Checkpoint::new(8, [0x08; 32], [0x08; 32]);
+        let tracker = FinalityTracker::from_restored_checkpoint(checkpoint);
+
+        assert_eq!(tracker.latest(), Some(&checkpoint));
+        assert_eq!(tracker.finalized_height(), Some(8));
+        assert_eq!(tracker.count(), 1);
     }
 
     #[test]

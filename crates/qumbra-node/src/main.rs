@@ -194,6 +194,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("qumbra-node running");
     println!("  listen:       {}", node.listen_addr());
     println!("  data dir:     {}", config.data_dir.display());
+    println!("  {}", node.recovery_report());
     println!("  genesis hash: {}", genesis.hash_hex());
     println!("  mining:       {}", config.mining);
     println!("  committee keys held: {}", config.committee_key_paths.len());

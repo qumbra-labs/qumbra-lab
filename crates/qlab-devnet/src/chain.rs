@@ -45,6 +45,22 @@ pub enum FinalizeMarkError {
     NotAdvancing,
 }
 
+/// Why reinstating a previously-established finalized head was refused.
+///
+/// This is deliberately separate from [`FinalizeMarkError`]. A live finalization
+/// must strictly advance from the current head; recovery instead proves that one
+/// exact point already belongs to the reconstructed main chain, then reinstates
+/// it without pretending a new quorum event happened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestoreFinalizedError {
+    /// The snapshot names a block absent from the reconstructed store.
+    Unknown,
+    /// The snapshot's redundant height does not match the stored header.
+    HeightMismatch { snapshot: u64, stored: u64 },
+    /// The block is known, but is not on the reconstructed main chain.
+    NotOnMainChain,
+}
+
 /// A finalized point: the block hash and its height.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FinalPoint {
@@ -131,6 +147,37 @@ impl ChainState {
         if !self.descends_from_finalized(&self.tip) {
             self.tip = hash;
         }
+        Ok(())
+    }
+
+    /// Reinstate a finalized point recorded by a durable snapshot.
+    ///
+    /// Recovery is not a live finalization: no votes are being judged and there
+    /// is no prior in-memory head to advance from. The persisted point is accepted
+    /// only when its block exists at the stated height and is an ancestor of the
+    /// reconstructed tip. That proof preserves the no-reorg-past-finality invariant
+    /// while keeping the operation visibly distinct from [`Self::set_finalized`].
+    pub fn restore_finalized(
+        &mut self,
+        hash: Hash32,
+        snapshot_height: u64,
+    ) -> Result<(), RestoreFinalizedError> {
+        let stored_height = self
+            .blocks
+            .get(&hash)
+            .ok_or(RestoreFinalizedError::Unknown)?
+            .header
+            .height;
+        if stored_height != snapshot_height {
+            return Err(RestoreFinalizedError::HeightMismatch {
+                snapshot: snapshot_height,
+                stored: stored_height,
+            });
+        }
+        if !self.is_descendant_of(&self.tip, &hash, snapshot_height) {
+            return Err(RestoreFinalizedError::NotOnMainChain);
+        }
+        self.finalized = Some(FinalPoint { hash, height: snapshot_height });
         Ok(())
     }
 
@@ -420,5 +467,39 @@ mod tests {
         let b2h = *c.header(&b2).unwrap();
         let b3 = c.insert_header(BlockHeader::child_of(&b2h, 6, 1_000, [0xB3; 32])).unwrap();
         assert_eq!(c.set_finalized(b3), Err(FinalizeMarkError::NotDescendantOfFinalized));
+    }
+
+    #[test]
+    fn restore_finalized_proves_the_persisted_point_against_the_main_chain() {
+        let mut c = ChainState::new(genesis());
+        let gh = *c.header(&c.genesis_hash()).unwrap();
+        let a1 = c
+            .insert_header(BlockHeader::child_of(&gh, 2, 1_000, [0xA1; 32]))
+            .unwrap();
+
+        c.restore_finalized(a1, 1).unwrap();
+        assert_eq!(c.finalized_hash(), Some(a1));
+        assert_eq!(c.finalized_height(), Some(1));
+
+        assert_eq!(
+            c.restore_finalized([0xEE; 32], 1),
+            Err(RestoreFinalizedError::Unknown)
+        );
+        assert_eq!(
+            c.restore_finalized(a1, 2),
+            Err(RestoreFinalizedError::HeightMismatch {
+                snapshot: 2,
+                stored: 1,
+            })
+        );
+
+        // A known sibling is not the point the reconstructed tip descends from.
+        let sibling = c
+            .insert_header(BlockHeader::child_of(&gh, 2, 1_000, [0xB1; 32]))
+            .unwrap();
+        assert_eq!(
+            c.restore_finalized(sibling, 1),
+            Err(RestoreFinalizedError::NotOnMainChain)
+        );
     }
 }
