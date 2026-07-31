@@ -56,7 +56,7 @@ use qlab_node::mempool::TxId;
 use qlab_node::metrics::Metrics;
 use qlab_node::recovery::Finalizer;
 use qlab_node::round::{ObsClock, RoundLedger, SlotContext, VoteRejects};
-use qlab_node::telemetry::StateLag;
+use qlab_node::telemetry::{AppliedTip, StateLag};
 use qlab_node::{
     genesis_block, MemNode, Mempool, MempoolError, NodeError, NodeState as _, RecoveryReport,
 };
@@ -676,6 +676,25 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// reading of "am I behind" while a figure is published on another.
     pub fn state_lag(&self) -> StateLag {
         StateLag::new(self.state.tip_height(), self.chain.tip_height())
+    }
+
+    /// **The identity of the applied tip, and whether it is on the chain this node
+    /// is following** (issue #162 finding 6) — the other half of the same question
+    /// [`Self::state_lag`] answers by height.
+    ///
+    /// `state_lag()` cannot separate a node three blocks behind from a node whose
+    /// state machine is stranded on a losing sibling and will never catch up
+    /// (`buffer_body` drops the one body that could rebuild it, and
+    /// `qlab_node::Node` cannot rewind). Both print a nonzero `slag=`. Only the
+    /// comparison here distinguishes them, and it is one lookup:
+    /// `state.tip_hash() != chain.main_chain_hash_at(state.tip_height())`.
+    ///
+    /// The main-chain lookup goes through [`ChainView::main_chain_hash_at`] rather
+    /// than reaching into `self.chain` — one definition of "what is on the main
+    /// chain at height h", shared with sync.
+    pub fn applied_tip(&self) -> AppliedTip {
+        let height = self.state.tip_height();
+        AppliedTip::new(height, self.state.tip_hash(), self.main_chain_hash_at(height))
     }
 
     /// Bodies currently held awaiting the state tip, and their weight in bytes.

@@ -77,7 +77,8 @@ pub use rpc::{
     RPC_VERSION,
 };
 pub use telemetry::{
-    LocalCommitment, StateLag, SupplyCoverage, Telemetry, LOCAL_COMMITMENT_SPLIT,
+    AppliedTip, LocalCommitment, StateLag, SupplyCoverage, Telemetry, APPLIED_TIP_OFF_MAIN,
+    APPLIED_TIP_ON_MAIN, LOCAL_COMMITMENT_SPLIT,
 };
 pub use persist::{Snapshot, BLOCK_LOG, FORMAT_VERSION, SNAPSHOT};
 pub use store::{
