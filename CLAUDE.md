@@ -81,7 +81,31 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
 2. Every recorded result carries: this repo's git rev, prover crate revs, hardware model, OS, power state (AC/battery, thermal).
 3. A number is publishable to the design repo only after being reproduced twice on the same rig.
 4. Calibrate the rig against published Poseidon2 numbers (benchmark-survey §2) before trusting any conservative-hash cell.
-5. **The acceptance bar is the full unfiltered `cargo test --release -p qlab-bench`** — never a mode-scoped filter (`… m4gate`). A filtered run structurally cannot see other modules' cross-checks; exactly that let a stale width pin drift across sessions until PR #23's acceptance caught it.
+5. 🔴 **The acceptance bar is the full unfiltered workspace suite, serial:**
+
+   ```sh
+   cargo test --release --workspace -- --test-threads=1
+   ```
+
+   **Never a mode-scoped filter, and — amended 2026-08-01 — never a crate-scoped one either.**
+   A filtered run structurally cannot see other modules' cross-checks. That first cost a stale
+   width pin drifting across sessions until `PR #23`'s acceptance caught it, and the rule
+   written then said `-p qlab-bench`, which **is itself a filter one level up**. `PR #166` paid
+   for the gap: it reported `-p qlab-p2p` 198/0 and `-p qlab-devnet` 149/0, both honest, and the
+   workspace suite failed on `n7soak::tests::s2_adversarial_rejected` — **in `qlab-bench`, a
+   crate neither targeted run touches.** No crate-scoped run could have caught it.
+
+   `--test-threads=1` is required, not stylistic: `qumbra-node` holds three real M3 prove tests
+   and the release suite peaks 16–30 GB on a 36 GiB rig. **Never start a second one while one is
+   running** — take a slot on [issue #64](https://github.com/lai3d/qumbra-lab/issues/64) first.
+
+   **Reconcile the arithmetic out loud**: your total must equal `main`'s baseline plus your new
+   tests. Verify the negatives too — `FAILED` (case-sensitive), `panicked at`, `^error` all zero.
+   Exit 0 from a launcher is not exit 0 from the suite.
+
+   **If you cannot run it, name the gap; do not imply a pass.** A stated "I did not run the
+   workspace suite and here is what I did run" is fine and the coordinator re-runs at
+   acceptance. A crate-scoped green reported as if it were the bar is not.
 
 ## Working conventions
 
