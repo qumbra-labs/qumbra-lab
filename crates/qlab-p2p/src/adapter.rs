@@ -1320,12 +1320,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
 
         // Verify + active-filter against THIS height's epoch roster (frozen §4:
         // tombstoned/jailed excluded BEFORE the count). Issue #164 splits the old
-        // catch-all `Invalid` the way #134 split the body-path wildcard:
+        // catch-all `Invalid` the way #134 split the body-path wildcard — but
+        // **only** the out-of-range arm is positional (PR #166 rework):
         //
-        // - unknown index / signature valid only under a different roster slot →
-        //   `Unjudged` (positional: depends on *this* node's membership)
-        // - duplicate padding / signature no roster member produced → `Invalid`
-        //   (intrinsic: same answer on every node that holds those keys)
+        // - index out of range for this roster → `Unjudged` (positional)
+        // - index resolves, signature fails against that key → `Invalid` (forged)
+        // - duplicate-signer padding → `Invalid`
         //
         // `committee` is cloned so the immutable borrow ends before the mutable ops.
         //
@@ -1356,12 +1356,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
                     rejects.forged += 1;
                     self.rounds.note_rejected_message(&ctx, rejects);
                     self.metrics.observe_votes(0, rejects);
-                    // Signature belongs to a different slot on this roster ⇒ the
-                    // claimed index is roster-order-dependent (the #164 reseal case).
-                    if committee.any_member_signed(cp, v) {
-                        return VotesOutcome::Unjudged;
-                    }
-                    return VotesOutcome::Invalid; // no roster member produced this sig
+                    // Index resolved; signature fails against that key → forged.
+                    // Do NOT re-check other roster slots: that arm was over-broad
+                    // and classed the soak's forged-cp (member-1 sig as signer 0)
+                    // as Unjudged (PR #166 rejection).
+                    return VotesOutcome::Invalid;
                 }
                 if cstate.is_active(v.signer, cp.height) {
                     active_kept.push(v.clone());
@@ -3145,11 +3144,11 @@ mod tests {
         }
     }
 
-    /// Acceptance #4 (updated #164): intrinsic rejects never grow the tally and are
-    /// `Invalid` (→ the wire handler penalises). Unknown index is now `Unjudged`
-    /// (positional — not a peer fault); a signature by a different *in-roster*
-    /// member is also `Unjudged` (roster-order dependent). A signature **no**
-    /// roster member produced is still `Invalid`.
+    /// Acceptance #4 (updated #164 rework): intrinsic rejects never grow the tally
+    /// and are `Invalid` (→ the wire handler penalises). Unknown index is
+    /// `Unjudged` (positional — not a peer fault). A signature under a
+    /// **resolvable** index that fails against that key is `Invalid` — including
+    /// the soak's forged-cp shape (valid member-1 sig claimed as signer 0).
     #[test]
     fn forged_unknown_dup_never_increase_tally() {
         let (cstate, validators) = committee7();
@@ -3157,7 +3156,6 @@ mod tests {
         let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
 
         // Genuine forge: an outsider's signature attributed to an in-range index.
-        // No roster member produced it ⇒ Intrinsic ⇒ Invalid.
         let outsider = qlab_devnet::committee::Validator::from_seed(99, [0xEE; 32]);
         let forged = Vote {
             signer: 0,
@@ -3173,12 +3171,13 @@ mod tests {
         ));
         assert!(!VotesOutcome::Unjudged.is_peer_fault());
 
-        // In-roster signature under the wrong claimed index ⇒ Unjudged (positional).
+        // In-roster signature under the wrong claimed index ⇒ still Invalid
+        // (index resolved; verify fails). This is n7soak S2's forged-cp shape.
         let misindexed =
             Vote { signer: 0, signature: validators[1].sign_checkpoint(&cp).signature };
         assert!(matches!(
             a.ingest_checkpoint_votes(&cp, &[misindexed]),
-            VotesOutcome::Unjudged
+            VotesOutcome::Invalid
         ));
 
         // Duplicate-signer padding within one set ⇒ still Invalid.
@@ -3835,18 +3834,16 @@ mod tests {
         ));
     }
 
-    /// 🔴 **ACCEPTANCE 2 (#164): at the epoch boundary the rosters diverge, and
-    /// neither side treats the other's honest votes as a peer fault.**
+    /// 🔴 **ACCEPTANCE 2 (#164 rework): at the epoch boundary the rosters diverge,
+    /// and an out-of-range index is Unjudged (not scored).**
     ///
-    /// Both halves, pinned together so a future change cannot keep the divergence
-    /// and re-introduce the penalty (or kill the penalty by preventing the
-    /// divergence):
-    /// 1. After seal, the node that held the tombstone has a smaller, reindexed
-    ///    roster; the node that lost it does not.
-    /// 2. Each node's honest votes against the other's roster are `Unjudged`, not
-    ///    `Invalid` — so `is_peer_fault()` is false on both directions.
+    /// Only the **out-of-range** arm is positional. After seal, holds has N=6 and
+    /// lost has N=7: lost's honest vote at signer 6 is unaddressable on holds and
+    /// must not be a peer fault. Mid-index reseal (index in range, wrong key) is
+    /// **not** amnestied — that residual is still Invalid; evidence-on-chain is
+    /// the real agreement fix (STOP-POINT, not this baton).
     #[test]
-    fn at_the_epoch_boundary_divergent_rosters_do_not_score_each_other() {
+    fn at_the_epoch_boundary_out_of_range_votes_are_unjudged() {
         const EPOCH: u64 = 8;
         let (mut holds, mut lost, validators) = pair_under_epoch(EPOCH, 7);
         // Tombstone a mid-index member so seal shifts every higher index down by one.
@@ -3875,35 +3872,71 @@ mod tests {
             "lost: key_5 still at index 5"
         );
 
-        // Half 2 — honest votes across the divergence are Unjudged, not Invalid.
         let tip = holds.chain().tip_hash();
         let cp = Checkpoint::new(EPOCH, tip, tip);
 
-        // `lost` signs under the unshifted roster (signer 5 = key_5).
-        let lost_honest = validators[5].sign_checkpoint(&cp);
-        let from_lost = holds.ingest_checkpoint_votes(&cp, &[lost_honest]);
+        // Positional half — lost's high index is out of range on holds.
+        let lost_high = validators[6].sign_checkpoint(&cp);
+        assert_eq!(lost_high.signer, 6);
+        let from_high = holds.ingest_checkpoint_votes(&cp, &[lost_high]);
         assert!(
-            matches!(from_lost, VotesOutcome::Unjudged),
-            "holds reads lost's honest vote as Unjudged, not forged"
+            matches!(from_high, VotesOutcome::Unjudged),
+            "index 6 does not resolve on holds' N=6 roster"
         );
-        assert!(!from_lost.is_peer_fault(), "and does not charge the peer");
+        assert!(!from_high.is_peer_fault(), "out-of-range is not a peer fault");
 
-        // `holds` signs under the shifted roster (signer 4 = key_5).
-        let mut holds_honest = validators[5].sign_checkpoint(&cp);
-        holds_honest.signer = 4;
-        let from_holds = lost.ingest_checkpoint_votes(&cp, &[holds_honest]);
+        // Residual half — mid-index reseal still looks like a forge under the
+        // narrowed boundary (index resolves, key is wrong). Pinned so nobody
+        // re-widens Unjudged to swallow this without naming the trade-off.
+        let lost_mid = validators[5].sign_checkpoint(&cp);
+        let from_mid = holds.ingest_checkpoint_votes(&cp, &[lost_mid]);
         assert!(
-            matches!(from_holds, VotesOutcome::Unjudged),
-            "lost reads holds's honest vote as Unjudged, not forged"
+            matches!(from_mid, VotesOutcome::Invalid),
+            "mid-index reseal: index resolves, verify fails → Invalid (not Unjudged)"
         );
-        assert!(!from_holds.is_peer_fault(), "and does not charge the peer");
+        assert!(from_mid.is_peer_fault());
     }
 
-    /// 🔴 **ACCEPTANCE 3 (#164): a genuinely forged vote is still scored.**
+    /// 🔴 **ACCEPTANCE 3 (#164 criterion 3): a forged vote with a resolvable index
+    /// is still scored.**
     ///
-    /// The amnesty is not blanket. A signature **no** roster member produced is
-    /// Intrinsic — same answer on every node that holds those keys — and remains
-    /// `Invalid` + `is_peer_fault()`. (Issue #134 criterion 2, applied identically.)
+    /// Shape matches `n7soak::tests::s2_adversarial_rejected`'s forged-cp: a valid
+    /// signature by member 1 claimed under signer index 0. Index resolves; verify
+    /// against key_0 fails → `Invalid` + `is_peer_fault()`. This must not become a
+    /// blanket amnesty (issue #134 criterion 2, applied identically). Named so the
+    /// next regression is caught by name, not by soak luck.
+    #[test]
+    fn a_forged_vote_with_a_resolvable_index_is_still_scored() {
+        let (cstate, validators) = committee7();
+        let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+        let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
+
+        // Soak shape: member-1 signature, claimed as signer 0.
+        let soak_forged = Vote {
+            signer: 0,
+            signature: validators[1].sign_checkpoint(&cp).signature,
+        };
+        let out = a.ingest_checkpoint_votes(&cp, &[soak_forged]);
+        assert!(
+            matches!(out, VotesOutcome::Invalid),
+            "resolvable index + bad sig is Invalid, not Unjudged"
+        );
+        assert!(out.is_peer_fault(), "and it is a peer fault");
+
+        // Outsider signature under an in-range index is the same arm.
+        let outsider = Validator::from_seed(99, [0xEE; 32]);
+        let outsider_forged = Vote {
+            signer: 0,
+            signature: outsider.sign_checkpoint(&cp).signature,
+        };
+        let out2 = a.ingest_checkpoint_votes(&cp, &[outsider_forged]);
+        assert!(matches!(out2, VotesOutcome::Invalid));
+        assert!(out2.is_peer_fault());
+        assert_eq!(a.finalized_height(), None);
+    }
+
+    /// Backward-compatible name for the outsider half of criterion 3 (kept so
+    /// older references in the PR body / issue comments still resolve).
     #[test]
     fn a_genuinely_forged_vote_is_still_a_peer_fault() {
         let (cstate, _validators) = committee7();
