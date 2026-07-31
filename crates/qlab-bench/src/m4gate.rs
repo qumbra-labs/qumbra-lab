@@ -8318,4 +8318,190 @@ mod tests {
             "consistent feeL+Σfee tamper must be UNSAT after D2 (PR #25 boundary closed)"
         );
     }
+
+    // =====================================================================
+    // issue #78 settlement probes — REPORT-ONLY, DELETE BEFORE MERGE.
+    //
+    // The audit on #78 established four class-(2) findings by reading the
+    // constraint set and explicitly ran no test. This probe is the execution
+    // half. It PRINTS SAT/UNSAT rather than asserting it, because the whole
+    // point of #78 is that a naive tamper→UNSAT proves nothing here: every
+    // derived column reads its inputs, so the honest instrument is
+    // tamper-AND-REPROPAGATE. `fill_derived` is the fill's one re-runnable
+    // pass (Phase-1a current-row products, pure per row) — running it after a
+    // tamper is exactly what turns "does this cell appear in a live
+    // constraint" into "does the constraint system determine this cell".
+    //
+    // Every probe carries a CONTROL of the same shape against a column the
+    // audit says IS carried (PBUF, RUNEV) — a SAT that is not paired with a
+    // control UNSAT is not evidence, it is a broken harness.
+    // =====================================================================
+    #[test]
+    fn i78_settlement_probes() {
+        let _g = heavy_lock();
+        let t0 = Instant::now();
+        let (sched, pvs, _) = shared();
+        eprintln!("[i78] shared() (one consensus prove + walk): {:?}", t0.elapsed());
+        let shape = GateShape::narrow();
+        let layout = GateLayout::from_shape(&shape);
+        let tb = Instant::now();
+        let (base, meta) = build_gate_trace(sched, pvs, &shape, 0);
+        eprintln!("[i78] build_gate_trace(narrow): {:?}", tb.elapsed());
+        let w = GATE_WIDTH;
+        let rows = base.values.len() / w;
+        let opvs = meta.opvs.clone();
+        let one = Val::ONE;
+        eprintln!("[i78] narrow trace: {rows} rows x {w} cols, {} perms + {} tail rows",
+            rows / 24, rows % 24);
+
+        let cell = |r: usize, c: usize| base.values[r * w + c];
+        let casm = |r: usize| cell(r, CZD) + cell(r, CZ7) + cell(r, CF);
+        let run = |t: RowMajorMatrix<Val>, name: &str| -> bool {
+            let t1 = Instant::now();
+            let un = is_unsat(t, opvs.clone());
+            eprintln!("[i78] {:<58} {}  ({:?})", name, if un { "UNSAT" } else { "SAT  " }, t1.elapsed());
+            !un
+        };
+
+        // -- structure 1: FSFULL / CFULL in the honest trace ----------------
+        {
+            let (mut nfull, mut ncfull) = (0usize, 0usize);
+            for r in 0..rows {
+                if cell(r, FSFULL) == one { nfull += 1 }
+                if cell(r, CFULL) == one { ncfull += 1 }
+            }
+            let mut nonconst = 0usize;
+            let mut pin15_bad = 0usize;
+            for p in 0..rows / 24 {
+                let f = cell(p * 24, FSFULL);
+                if (0..24).any(|r| cell(p * 24 + r, FSFULL) != f) { nonconst += 1 }
+                if f != cell(p * 24 + 15, FSGATE) { pin15_bad += 1 }
+            }
+            eprintln!("[i78] FSFULL=1 on {nfull} rows; CFULL=1 on {ncfull} rows (CFULL=1 is the \
+                       only state in which the :2899 refill guard has any content)");
+            eprintln!("[i78] FSFULL non-constant within {nonconst} perms; \
+                       FSFULL != FSGATE@row15 in {pin15_bad} perms (candidate pin)");
+            let tail = rows % 24;
+            if tail > 15 {
+                let r = rows - tail + 15;
+                eprintln!("[i78] tail row {r} (sf(15)): FSFULL={:?} FSGATE={:?}",
+                    cell(r, FSFULL), cell(r, FSGATE));
+            }
+        }
+
+        // -- structure 2: the asm pending/consuming pairing ------------------
+        {
+            let mut gaps: HashMap<usize, usize> = HashMap::new();
+            let (mut pend, mut pin_ok, mut pin_bad, mut src_ok, mut dangling) = (0, 0, 0, 0, 0);
+            for r in 0..rows {
+                if casm(r) != one || cell(r, POS) != one { continue }
+                pend += 1;
+                let mut n = r + 1;
+                while n < rows && casm(n) != one { n += 1 }
+                if n >= rows { dangling += 1; continue }
+                *gaps.entry(n - r).or_insert(0) += 1;
+                // candidate fix: casm·pos0 -> nv(asm0) == cv(w0c)
+                if r + 1 < rows && cell(r + 1, ASM0) == cell(r, W0C) && cell(r + 1, ASM1) == cell(r, W1C) {
+                    pin_ok += 1
+                } else {
+                    pin_bad += 1
+                }
+                // what the consuming row actually reads
+                if cell(n, ASM0) == cell(r, W0C) && cell(n, ASM1) == cell(r, W1C) { src_ok += 1 }
+            }
+            let mut g: Vec<_> = gaps.iter().map(|(a, b)| (*a, *b)).collect();
+            g.sort();
+            eprintln!("[i78] asm pending rows (casm & POS0): {pend}, dangling {dangling}");
+            eprintln!("[i78] gap(pending -> consuming) histogram: {g:?}");
+            eprintln!("[i78] honest trace satisfies `casm·pos0 -> nv(asm)==cv(wc)` on {pin_ok} \
+                       pending rows, VIOLATES it on {pin_bad}");
+            eprintln!("[i78] consuming row reads the pending row's word on {src_ok}/{pend}");
+        }
+
+        // -- baseline --------------------------------------------------------
+        run(base.clone(), "P0 honest narrow trace");
+
+        // -- experiment A (finding 3, FSFULL col 2924) -----------------------
+        {
+            let mut t = base.clone();
+            for r in 0..rows { t.values[r * w + FSFULL] = one }
+            run(t, "P1 A-naive: FSFULL:=1 every row, no repropagate");
+        }
+        {
+            let mut t = base.clone();
+            for r in 0..rows { t.values[r * w + FSFULL] = one }
+            fill_derived(&mut t.values, &layout, &shape);
+            run(t, "P2 A-repropagated: FSFULL:=1 every row + fill_derived");
+        }
+
+        // -- experiment B (finding 1, ASM0/ASM1 cols 3318/3319) --------------
+        {
+            let mut t = base.clone();
+            let mut n = 0usize;
+            for r in 0..rows {
+                if cell(r, CONSZ) == one || cell(r, CONSF) == one || cell(r, CONSZ7) == one { continue }
+                t.values[r * w + ASM0] += one;
+                t.values[r * w + ASM1] += one;
+                n += 1;
+            }
+            fill_derived(&mut t.values, &layout, &shape);
+            run(t, &format!("P3 ASM0/ASM1 += 1 on all {n} non-consuming rows"));
+        }
+        {
+            // CONTROL: same shape against PBUF, which HAS an unconditional carry.
+            let mut t = base.clone();
+            for r in 0..rows {
+                if cell(r, CONSF) == one && cell(r, VCE) == one { continue }
+                for k in 0..4 { t.values[r * w + PBUF + k] += one }
+            }
+            fill_derived(&mut t.values, &layout, &shape);
+            run(t, "P4 CONTROL PBUF += 1 on all non-capture rows");
+        }
+        {
+            // The transcript-side half: move the word the pending row carries,
+            // leave the consumed ASM0 honest. Re-canonicalise + repropagate.
+            let pr = (0..rows).find(|&r| casm(r) == one && cell(r, POS) == one && cell(r, CZD) == one);
+            let pr = pr.expect("a pending dup value-carry row");
+            let old = cell(pr, W0C).as_canonical_u32();
+            let newv = if old == 0 { 1 } else { old - 1 };
+            let mut t = base.clone();
+            t.values[pr * w + W0C] = Val::from_u32(newv);
+            fill_canon(&mut t.values, pr, 0, newv, &layout);
+            fill_derived(&mut t.values, &layout, &shape);
+            run(t, &format!("P5 W0C {old}->{newv} at pending dup row {pr} (+canon,+derived)"));
+        }
+        {
+            // The documented trap: tamper ASM0 at a CONSUMING row.
+            let cr = (0..rows).find(|&r| cell(r, CONSZ) == one).expect("a consz row");
+            let mut t = base.clone();
+            t.values[cr * w + ASM0] += one;
+            fill_derived(&mut t.values, &layout, &shape);
+            run(t, &format!("P6 TRAP ASM0 += 1 at consuming row {cr}"));
+        }
+
+        // -- finding 2 (SCR): the missing carry, cheapest possible probe -----
+        {
+            let mfhi0 = MSEL + shape.m_fhi(0) as usize;
+            let p = (0..rows / 24).find(|&p| cell(p * 24 + 2, mfhi0) == one);
+            match p {
+                None => eprintln!("[i78] no M_FHI0 perm found — SCR probe skipped"),
+                Some(p) => {
+                    let mut t = base.clone();
+                    for r in [2usize, 3] {
+                        for k in 0..4 { t.values[(p * 24 + r) * w + SCR + k] += one }
+                    }
+                    fill_derived(&mut t.values, &layout, &shape);
+                    run(t, &format!("P7 SCR[0] += 1 at rows 2,3 of M_FHI0 perm {p}"));
+
+                    let mut t = base.clone();
+                    for r in [2usize, 3] {
+                        for k in 0..4 { t.values[(p * 24 + r) * w + RUNEV + k] += one }
+                    }
+                    fill_derived(&mut t.values, &layout, &shape);
+                    run(t, &format!("P8 CONTROL RUNEV += 1 at rows 2,3 of M_FHI0 perm {p}"));
+                }
+            }
+        }
+        eprintln!("[i78] total probe wall time: {:?}", t0.elapsed());
+    }
 }
