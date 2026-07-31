@@ -8,10 +8,11 @@
 //! ([`crate::compact`]) once the header chain is known.
 //!
 //! ```text
-//!   Idle ──peer taller──▶ AwaitingHeaders ──full batch & still behind──┐
-//!    ▲                          │                                       │
-//!    │                          │ short batch / caught up               │
-//!    └───────── Synced ◀────────┘◀──────────────────────────────────────┘
+//!   Unknown ──peer taller──▶ AwaitingHeaders ──full batch & still behind──┐
+//!      ▲                          │                                       │
+//!      │ no peer claims a height  │ short batch, still behind → Behind ───┤
+//!      │                          │ caught up                             │
+//!      └───────── Synced ◀────────┘◀──────────────────────────────────────┘
 //! ```
 
 use qlab_devnet::header::{BlockHeader, Hash32, ZERO_HASH};
@@ -24,15 +25,56 @@ use crate::peer::PeerId;
 pub const MAX_HEADERS_PER_BATCH: usize = 2000;
 
 /// The sync state machine's phase.
+///
+/// # Why there are two non-syncing phases (issue #106)
+///
+/// This enum used to carry a single `Idle` documented as *"either caught up or no
+/// taller peer known yet"* — one variant for two states that differ by everything
+/// that matters. **A node that has heard from nobody is not a node that is caught
+/// up**, and until this split there was no way to say so: a process cold-started
+/// on an empty data dir sat in the same variant a fully-synced node sits in, so
+/// anything asking "am I at the network's height?" was answered *yes* on the
+/// strength of zero evidence. That is how node0 mined a genesis fork through a
+/// restart on the T0 WAN net — the mining gate had no sync condition to read
+/// because there was no honest one to read.
+///
+/// The three non-`AwaitingHeaders` states are now distinct facts:
+///
+/// - [`SyncPhase::Unknown`] — no ready peer has claimed a height. **Nothing is
+///   known**, and in particular "caught up" is not knowable.
+/// - [`SyncPhase::Behind`] — a peer's claim was received and we are below it, with
+///   no request outstanding (the last batch fell short or did not connect).
+/// - [`SyncPhase::Synced`] — we compared our tip against a claim we actually
+///   received and are not below it.
+///
+/// The distinction lives here, on the state machine that owns it, rather than as a
+/// second concept beside it: a caller that needs "does this node know where the
+/// chain is" reads the phase.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SyncPhase {
-    /// Not syncing — either caught up or no taller peer known yet.
-    Idle,
+    /// No ready peer has claimed a height yet, so this node does not know whether
+    /// it is caught up. The phase every process starts in, and the phase it
+    /// returns to when it has no peer left to ask.
+    Unknown,
     /// A `GetHeaders` is outstanding to `peer`, expecting a batch building on our
     /// tip height `from_height`.
     AwaitingHeaders { peer: PeerId, from_height: u64 },
-    /// Caught up to the best known peer height.
+    /// Below the best height a ready peer claimed, with no request outstanding —
+    /// the next pass re-anchors and asks again.
+    Behind,
+    /// Caught up to the best height a ready peer claimed. Reaching this phase
+    /// requires a claim to have been received: it is never asserted about a net
+    /// this node has not spoken to.
     Synced,
+}
+
+impl SyncPhase {
+    /// Whether this node has positive evidence that it is at the network's height.
+    ///
+    /// True for exactly one variant, and that is the point — see the type's note.
+    pub fn is_synced(&self) -> bool {
+        matches!(self, SyncPhase::Synced)
+    }
 }
 
 /// Holds the current phase.
@@ -43,7 +85,7 @@ pub struct SyncState {
 
 impl Default for SyncState {
     fn default() -> Self {
-        SyncState { phase: SyncPhase::Idle }
+        SyncState { phase: SyncPhase::Unknown }
     }
 }
 
