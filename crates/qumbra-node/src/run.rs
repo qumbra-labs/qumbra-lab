@@ -1203,6 +1203,29 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         lines
     }
 
+    /// Emit one `REWIND` journal line per state-machine rewind since the last call
+    /// (issue #162), and return the lines emitted.
+    ///
+    /// Emitted on the message-pump cadence rather than the telemetry cadence, beside
+    /// `ROUND`, because a rewind is an **event** and the telemetry line only ever
+    /// carries levels. `slag=` returning to zero is what an operator sees; this is the
+    /// line that says why it did — which is the whole difference between a wedge
+    /// detector that went quiet because the wedge went away and one that went quiet
+    /// because it broke.
+    pub fn emit_rewinds(&mut self) -> Vec<String> {
+        let lines: Vec<String> = self
+            .p2p
+            .node_mut()
+            .drain_rewinds()
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+        for line in &lines {
+            println!("{line}");
+        }
+        lines
+    }
+
     /// Emit a `close=open` line for any round that has been open too long — so a
     /// **stall is visible while it is happening**, not only once it ends.
     ///
@@ -1533,6 +1556,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             self.accumulate_regime();
             self.note_slots_reached();
             self.emit_rounds();
+            self.emit_rewinds();
             if self.mining && self.last_mine.elapsed() >= self.mine_interval {
                 if self.try_mine() {
                     self.try_checkpoint();
@@ -2204,9 +2228,14 @@ mod tests {
     ///
     /// Both halves, because a detector that fires on any nonzero `slag=` is worse
     /// than none: it retrains the operator to ignore it. `slag=` covers both states
-    /// and they need opposite responses — a lagging node catches up when its bodies
-    /// arrive, a stranded one never does, because `buffer_body` drops the one body
-    /// that could rebuild its state tip and `qlab_node::Node` cannot rewind.
+    /// and they need different responses — a lagging node catches up by applying
+    /// forward, a stranded one has to undo an applied block first.
+    ///
+    /// **Amended by issue #162 (acceptance item 5).** The stranded node now recovers
+    /// too, so the tail of this test is inverted: what it pins is that the detector
+    /// still SEPARATES the two states while they differ, and that the wedged one goes
+    /// quiet because a rewind fixed it — evidenced by the rewind counter and the
+    /// `REWIND` journal line, not by the absence of an alarm.
     ///
     /// The wedged node here is the live shape exactly: it mined its own height 1,
     /// lost the fork race, its **chain** reorged onto the winner and its **state**
@@ -2283,10 +2312,18 @@ mod tests {
             "{lagging_metrics}"
         );
 
-        // ── **The half that proves the two states are genuinely different.** Every
-        //    body of the winning branch is handed to both nodes. The lagging node
-        //    converges — `slag=0`, still `schain=main`. The wedged one does not: its
-        //    state tip is still the losing sibling and `schain=fork` stands.
+        // ── **The half that proves the two states are genuinely different, and —
+        //    since issue #162 — that BOTH of them recover.** Every body of the
+        //    winning branch is handed to both nodes.
+        //
+        //    Rewritten by the #162 baton. It used to close by asserting that the
+        //    wedged node's state tip had not moved, annotated "fixing it is a
+        //    separate baton". That baton is this one, so the assertion is inverted
+        //    rather than deleted: the two nodes still reach `slag=0 schain=main` by
+        //    **different routes**, and the routes are what this test is for. The
+        //    lagging node applies forward and never rewinds; the wedged one rewinds
+        //    off its sibling first, and `REWIND` in the journal is what distinguishes
+        //    them afterwards, when both lines read identically.
         for header in &winning {
             let hash = header.header_hash();
             let stored = winner.state().chain().block(&hash).expect("the winner has it").clone();
@@ -2297,14 +2334,46 @@ mod tests {
         let lagger_after = lagger.telemetry_sample();
         assert_eq!(field(&lagger_after, "slag"), "0", "the lagging node catches up: {lagger_after}");
         assert_eq!(field(&lagger_after, "schain"), "main", "{lagger_after}");
+        assert_eq!(
+            lagger.p2p().node().state_rewinds(),
+            (0, 0),
+            "and it did NOT rewind — a node that is merely behind must never pay for one"
+        );
+
         let loser_after = loser.telemetry_sample();
         assert_eq!(
+            field(&loser_after, "schain"),
+            "main",
+            "the wedged node rejoined the main chain (#162): {loser_after}"
+        );
+        assert_eq!(field(&loser_after, "slag"), "0", "and converged: {loser_after}");
+        assert_ne!(
             field(&loser_after, "stipid"),
             expected,
-            "the wedged node's state tip has not moved — this is the absorbing state, \
-             and fixing it is a separate baton: {loser_after}"
+            "its applied tip is no longer the losing sibling: {loser_after}"
         );
-        assert_eq!(field(&loser_after, "schain"), "fork", "{loser_after}");
+        assert_eq!(
+            field(&loser_after, "stipid"),
+            field(&lagger_after, "stipid"),
+            "both nodes ended on the same block, by different routes"
+        );
+        assert_eq!(
+            loser.p2p().node().state_rewinds(),
+            (1, 1),
+            "one rewind, one block undone — the route the lagging node did not take"
+        );
+        // The event is in the journal, which is where the difference survives after
+        // the two telemetry lines have become identical.
+        let journal = loser.emit_rewinds();
+        assert_eq!(journal.len(), 1, "{journal:?}");
+        assert!(journal[0].starts_with("REWIND applied tip "), "{}", journal[0]);
+        assert!(journal[0].ends_with("(1 block(s) undone)"), "{}", journal[0]);
+        assert!(
+            loser.emit_rewinds().is_empty(),
+            "drained, so the same event is not journalled twice"
+        );
+        println!("PR-SAMPLE rewind : {}", journal[0]);
+        println!("PR-SAMPLE rejoin : {loser_after}");
 
         println!("PR-SAMPLE healthy: {healthy}");
         println!("PR-SAMPLE lagging: {lagging}");

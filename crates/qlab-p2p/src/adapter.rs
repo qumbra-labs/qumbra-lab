@@ -59,6 +59,7 @@ use qlab_node::round::{ObsClock, RoundLedger, SlotContext, VoteRejects};
 use qlab_node::telemetry::{AppliedTip, StateLag};
 use qlab_node::{
     genesis_block, MemNode, Mempool, MempoolError, NodeError, NodeState as _, RecoveryReport,
+    RewindReport,
 };
 use qlab_devnet::body::TxVerifier;
 
@@ -208,7 +209,15 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// What the last `open` found in the ledger and did with it. Reported at startup
     /// so "restored nothing" and "had nothing to restore" are distinguishable.
     punish_restore: PunishmentRestore,
+    /// Rewind reports awaiting the journal (issue #162), newest-wins and bounded by
+    /// [`MAX_JOURNALLED_REWINDS`]. See [`NodeAdapter::drain_rewinds`].
+    rewinds: Vec<RewindReport>,
 }
+
+/// How many [`RewindReport`]s are held for the journal before the oldest is dropped
+/// (issue #162). Small on purpose: this is a detail buffer for a rare event, and
+/// `qumbra_state_rewinds_total` is the lossless record.
+pub const MAX_JOURNALLED_REWINDS: usize = 16;
 
 /// How far above the state machine's applied tip a body is worth holding
 /// (issue #130 (a)). Bitcoin's in-flight download window, reused as the shape rather
@@ -511,6 +520,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             dir: None,
             punishments: Vec::new(),
             punish_restore: PunishmentRestore::default(),
+            rewinds: Vec::new(),
         }
     }
 
@@ -748,6 +758,22 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         (self.metrics.state_rewinds(), self.metrics.state_rewind_blocks())
     }
 
+    /// Take the rewind reports not yet journalled (issue #162).
+    ///
+    /// The counters above are the lossless record and the alertable one; this is the
+    /// **detail**, and it goes to the container log for the same reason `ROUND` does:
+    /// metrics answer "how often", and only the journal can answer "off which block,
+    /// onto which, at what height" after the fact. `[`RewindReport`] renders itself.
+    ///
+    /// Bounded at [`MAX_JOURNALLED_REWINDS`] with the OLDEST dropped, which is the
+    /// opposite of the pending-body window's rule and for the opposite reason: here
+    /// the newest event is the one an operator is looking at. An undrained buffer
+    /// therefore cannot grow, and nothing is silently lost — the counters still hold
+    /// every event, so a drop is visible as the count exceeding what was journalled.
+    pub fn drain_rewinds(&mut self) -> Vec<RewindReport> {
+        std::mem::take(&mut self.rewinds)
+    }
+
     /// The main-chain hash at `height`, walked back from the fork-choice tip.
     ///
     /// `ChainView::main_chain_hash_at` answers the same question by materialising
@@ -916,6 +942,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         match self.state.rewind_to(fork_hash) {
             Ok(report) if !report.is_noop() => {
                 self.metrics.observe_state_rewind(report.blocks_undone());
+                if self.rewinds.len() >= MAX_JOURNALLED_REWINDS {
+                    self.rewinds.remove(0);
+                }
+                self.rewinds.push(report);
             }
             Ok(_) => {}
             // Unreachable as the guards above stand (the target is an ancestor of
