@@ -1022,6 +1022,96 @@ mod tests {
         assert!(StateLag::new(0, 1).is_lagging());
     }
 
+    // ---- issue #162 finding 6: the applied tip's identity and the detector ----
+
+    fn h(first: u8) -> Hash32 {
+        let mut out = [0xee; 32];
+        out[0] = first;
+        out
+    }
+
+    /// **`stipid` is `fid`'s scheme applied to a block, not a second one.** Same
+    /// width, same fold, same renderer — and the value is the block hash's own
+    /// prefix rather than a re-hash, so an operator lining `stipid=` up against a
+    /// block hash from any other tool sees the same digits.
+    #[test]
+    fn the_applied_tip_identity_is_the_block_hashs_prefix_at_fids_width() {
+        let hash = h(0x01);
+        let tip = AppliedTip::new(1, hash, Some(hash));
+        assert_eq!(tip.identity(), 0x01ee_eeee_eeee, "the first 6 bytes, big-endian");
+        assert_eq!(tip.id_field(), "01eeeeeeeeee");
+        assert_eq!(tip.id_field().len(), checkpoint_id_hex(Some(0)).len(), "fid's width");
+        // Two blocks differing only outside the prefix are NOT separated — a 48-bit
+        // identity is a display width, and this states the collision bound honestly
+        // rather than implying the field is a hash comparison.
+        let mut far = hash;
+        far[31] ^= 0xff;
+        assert_eq!(AppliedTip::new(1, far, Some(far)).identity(), tip.identity());
+        // Two blocks differing inside it are.
+        assert_ne!(AppliedTip::new(1, h(0x02), Some(h(0x02))).identity(), tip.identity());
+    }
+
+    /// **The detector, and the third answer.** `schain=` fires only on a genuine
+    /// mismatch: `main` when the applied tip IS the main-chain block at its height
+    /// (however far behind fork choice it is), `fork` when it is not, and `-` when
+    /// there is no main-chain block at that height to compare against — because an
+    /// alarm must not fire on the absence of evidence, and an unmade comparison must
+    /// not print as healthy either.
+    #[test]
+    fn the_wedge_verdict_separates_lagging_from_stranded_and_refuses_to_guess() {
+        let mine = h(0x01);
+        let theirs = h(0x02);
+
+        let on_main = AppliedTip::new(1, mine, Some(mine));
+        assert_eq!(on_main.off_main_chain(), Some(false));
+        assert!(!on_main.is_off_main_chain());
+        assert_eq!(on_main.chain_field(), APPLIED_TIP_ON_MAIN);
+
+        let stranded = AppliedTip::new(1, mine, Some(theirs));
+        assert_eq!(stranded.off_main_chain(), Some(true));
+        assert!(stranded.is_off_main_chain());
+        assert_eq!(stranded.chain_field(), APPLIED_TIP_OFF_MAIN);
+
+        let unjudgeable = AppliedTip::new(1, mine, None);
+        assert_eq!(unjudgeable.off_main_chain(), None);
+        assert!(!unjudgeable.is_off_main_chain(), "no evidence is not an alarm");
+        assert_eq!(unjudgeable.chain_field(), CHECKPOINT_ID_ABSENT);
+
+        // The three tokens are distinguishable and none is a prefix of another, so a
+        // `qumbra-ops/` parser cannot match `main` inside anything else.
+        let tokens = [APPLIED_TIP_ON_MAIN, APPLIED_TIP_OFF_MAIN, CHECKPOINT_ID_ABSENT];
+        for (i, a) in tokens.iter().enumerate() {
+            for (j, b) in tokens.iter().enumerate() {
+                assert_eq!(i == j, a == b, "{a} vs {b}");
+            }
+        }
+    }
+
+    /// **`slag=` and `schain=` are independent, which is the entire finding.** The
+    /// height gap says nothing about which branch the state machine is on, and the
+    /// branch says nothing about the gap — all four combinations are reachable and
+    /// each is a different operator instruction.
+    #[test]
+    fn the_lag_and_the_branch_are_orthogonal() {
+        let mine = h(0x01);
+        let theirs = h(0x02);
+        // Healthy: caught up, on the main chain.
+        assert_eq!(StateLag::new(3, 3).blocks(), 0);
+        assert_eq!(AppliedTip::new(3, mine, Some(mine)).chain_field(), APPLIED_TIP_ON_MAIN);
+        // Lagging but sound — wait, it converges when the bodies arrive.
+        assert_eq!(StateLag::new(0, 3).blocks(), 3);
+        assert_eq!(AppliedTip::new(0, mine, Some(mine)).chain_field(), APPLIED_TIP_ON_MAIN);
+        // Wedged — same nonzero `slag=`, opposite response. This pair printed
+        // identically before this field existed, and that is what cost an afternoon.
+        assert_eq!(StateLag::new(1, 3).blocks(), 2);
+        assert_eq!(AppliedTip::new(1, mine, Some(theirs)).chain_field(), APPLIED_TIP_OFF_MAIN);
+        // And the fourth corner: a zero gap over a disagreeing block. Not reachable
+        // through `NodeAdapter` today (fork choice's tip IS the applied block there),
+        // but the verdict must not be derived from the gap, so it is asserted.
+        assert_eq!(StateLag::new(3, 3).blocks(), 0);
+        assert_eq!(AppliedTip::new(3, mine, Some(theirs)).chain_field(), APPLIED_TIP_OFF_MAIN);
+    }
+
     /// **Acceptance (#117): a `0x01` payload is REJECTED, not best-effort parsed.**
     ///
     /// This is the property the version byte exists for. A stale reader against a

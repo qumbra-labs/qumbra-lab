@@ -874,6 +874,8 @@ mod tests {
             finalized_checkpoint_id: Some(0x4cc8_904e_1f2a),
             signed_checkpoint_id: Some(0x4cc8_904e_1f2a),
             signed_checkpoint_slot: Some(1_352),
+            state_tip_id: 0x00c4_332a_230c,
+            state_tip_off_main_chain: Some(false),
             process_start_secs: 1_769_000_000,
             rendered_at_secs: 1_769_150_000,
         }
@@ -1063,12 +1065,69 @@ mod tests {
             "qumbra_finalized_checkpoint_id",
             "qumbra_signed_checkpoint_id",
             "qumbra_signed_checkpoint_slot",
+            // issue #162 finding 6 — a block identity turns over every block, so an
+            // info metric here would be worse than #84's rejected one, not better.
+            "qumbra_state_tip_id",
+            "qumbra_state_tip_off_main_chain",
         ] {
             let series: Vec<&str> =
                 text.lines().filter(|l| l.starts_with(fam) && !l.starts_with('#')).collect();
             assert_eq!(series.len(), 1, "exactly one series for {fam}: {series:?}");
             assert!(!series[0].contains('{'), "{fam} must carry no labels: {}", series[0]);
         }
+    }
+
+    /// **Issue #162 finding 6 — the scrape half of the detector, both verdicts and
+    /// the honest third answer.**
+    ///
+    /// `qumbra_state_tip_off_main_chain` is the alarm to page on, so it must be a
+    /// real reading in both directions and **absent** when the comparison could not
+    /// be made — a `0` there would assert "checked, healthy" about a check that
+    /// never ran, which is the class of lie this whole issue is about.
+    #[test]
+    fn the_wedge_gauge_is_present_in_both_verdicts_and_absent_when_unjudgeable() {
+        let m = Metrics::new();
+        let mut g = gauges();
+
+        g.state_tip_off_main_chain = Some(false);
+        let on_main = render(&m, &g);
+        assert!(on_main.contains("\nqumbra_state_tip_off_main_chain 0\n"), "{on_main}");
+
+        g.state_tip_off_main_chain = Some(true);
+        let wedged = render(&m, &g);
+        assert!(wedged.contains("\nqumbra_state_tip_off_main_chain 1\n"), "{wedged}");
+
+        g.state_tip_off_main_chain = None;
+        let unjudged = render(&m, &g);
+        assert!(
+            unjudged.contains("# TYPE qumbra_state_tip_off_main_chain gauge"),
+            "declared from the first scrape, so an alert can be written: {unjudged}"
+        );
+        assert!(
+            !unjudged.lines().any(|l| l.starts_with("qumbra_state_tip_off_main_chain ")),
+            "no series when the comparison could not be made: {unjudged}"
+        );
+        // The identity itself has no absent case — a node always has an applied tip
+        // — so it is unconditional in all three renderings.
+        for text in [&on_main, &wedged, &unjudged] {
+            assert!(
+                text.contains(&format!("\nqumbra_state_tip_id {}\n", g.state_tip_id)),
+                "{text}"
+            );
+        }
+        // #84's correspondence, held for the third identity too: the float64 a
+        // Prometheus client parses recovers the log field exactly.
+        let scraped: f64 = on_main
+            .lines()
+            .find_map(|l| l.strip_prefix("qumbra_state_tip_id "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            format!("{:012x}", scraped as u64),
+            qlab_devnet::committee::checkpoint_id_hex(Some(g.state_tip_id)),
+            "printf '%012x' of the gauge must reproduce the stipid= log field"
+        );
     }
 
     /// Absence follows `qumbra_finalized_height`'s rule — declared but no series —

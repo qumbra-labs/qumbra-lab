@@ -2042,6 +2042,247 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base_b);
     }
 
+    // ---- issue #162 finding 6: the applied tip's IDENTITY, and the wedge -----
+
+    /// [`rig`], plus a distinct miner payout key.
+    ///
+    /// **This is the ingredient the whole #130 (a) suite lacks and the live net
+    /// has.** `mine_chain()` builds one linear chain from one proposer and the
+    /// follower starts at state tip 0 on that same chain, so a *sibling at the state
+    /// tip's own height* does not exist anywhere in it (QUM-35's §3). Two nodes with
+    /// different `miner_rkm` pay their coinbase to different keys, so their coinbase
+    /// bodies differ, so their `tx_body_commitment` differs, so their height-1
+    /// headers are **genuine siblings** — which is how `node0` and `node2` came to
+    /// hold different blocks at `stip=1` on 2026-07-31 with three of them mining at
+    /// `tip=0` within three seconds of each other.
+    fn rig_paying(tag: &str, rkm_byte: u8) -> (NodeConfig, GenesisFile, PathBuf) {
+        let (mut config, genesis, base) = rig(tag, true);
+        config.miner_rkm = Some(format!("{rkm_byte:02x}").repeat(32));
+        (config, genesis, base)
+    }
+
+    /// Start a node on the shared genesis, finalize genesis, and mine `n` blocks of
+    /// its own. Returns it at `stip=n slag=0`.
+    fn node_mining_its_own(config: &NodeConfig, genesis: &GenesisFile, n: usize) -> RunningNode<KeccakPow, DevnetRehearsalVerifier> {
+        let mut node =
+            RunningNode::start(config, genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint(); // finalize genesis, so `final=`/`fid=` carry values
+        for _ in 0..n {
+            assert!(node.try_mine(), "KeccakPow mines at the genesis difficulty");
+        }
+        node
+    }
+
+    /// Every main-chain header of `node` from height 1 to its tip, ascending.
+    fn main_chain_headers(
+        node: &RunningNode<KeccakPow, DevnetRehearsalVerifier>,
+    ) -> Vec<qlab_devnet::header::BlockHeader> {
+        let chain = node.p2p().node().chain();
+        (1..=chain.tip_height() as usize)
+            .map(|h| *chain.header(&chain.main_chain()[h]).expect("main-chain header"))
+            .collect()
+    }
+
+    /// **ACCEPTANCE #1 — the whole point of the issue, and #84's sentence one layer
+    /// down.**
+    ///
+    /// Two nodes at the *same* `stip=` height having applied *different* blocks must
+    /// print different `stipid=`. On the 2026-07-31 T0 net `node0`'s `stip=1` and
+    /// `node2`'s `stip=1` looked identical and were different blocks — node2's a
+    /// sibling on a losing branch — and that single ambiguity is why diagnosing the
+    /// wedge took an archive dive instead of a glance.
+    ///
+    /// The third node repeats the first exactly, which pins the other half: two
+    /// nodes on the same block must be **byte-identical**, or the field cries wolf
+    /// on every healthy net and gets ignored (#84's rule, followed here).
+    #[test]
+    fn nodes_at_one_stip_height_on_different_applied_blocks_print_different_stipid() {
+        let (ca, genesis, ba) = rig_paying("stipid_a", 0xa1);
+        let (cb, _, bb) = rig_paying("stipid_b", 0xb2);
+        let (cc, _, bc) = rig_paying("stipid_c", 0xa1); // A's payout key ⇒ A's block
+
+        let node_a = node_mining_its_own(&ca, &genesis, 1);
+        let node_b = node_mining_its_own(&cb, &genesis, 1);
+        let node_c = node_mining_its_own(&cc, &genesis, 1);
+        let a = node_a.telemetry_sample();
+        let b = node_b.telemetry_sample();
+        let c = node_c.telemetry_sample();
+
+        // All three agree on the height, which is exactly the problem: `stip=` alone
+        // cannot tell the sibling from the shared block.
+        for l in [&a, &b, &c] {
+            assert_eq!(field(l, "stip"), "1", "{l}");
+            assert_eq!(field(l, "slag"), "0", "each applied what it mined: {l}");
+        }
+
+        // A and B applied different blocks at height 1 ⇒ different identities.
+        assert_ne!(
+            field(&a, "stipid"),
+            field(&b, "stipid"),
+            "two different applied blocks at one height MUST NOT print the same \
+             identity\nA: {a}\nB: {b}"
+        );
+        // A and C applied the same block ⇒ byte-identical identities.
+        assert_eq!(
+            field(&a, "stipid"),
+            field(&c, "stipid"),
+            "agreeing nodes MUST be byte-identical\nA: {a}\nC: {c}"
+        );
+
+        // Well-formed, and at `fid`/`sid`'s width — the three are one scheme, so an
+        // operator can compare them by eye without knowing which is which.
+        for l in [&a, &b, &c] {
+            let stipid = field(l, "stipid");
+            assert_eq!(stipid.len(), field(l, "fid").len(), "same width as fid: {l}");
+            assert_eq!(stipid.len(), 12, "{l}");
+            assert!(u64::from_str_radix(stipid, 16).is_ok(), "{l}");
+            assert!(
+                stipid.chars().all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase()),
+                "{l}"
+            );
+        }
+
+        // The identity is the block hash's prefix and **not a second scheme**:
+        // re-derived here from the raw hash, independently of the rendering path, so
+        // a future short-id helper that quietly re-hashes fails this line.
+        let applied = node_a.p2p().node().applied_tip();
+        let expected: String =
+            applied.hash[..6].iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(field(&a, "stipid"), expected, "stipid IS the block hash prefix");
+        // …and the scrape carries the same number in decimal (#84's correspondence:
+        // `printf '%012x'` of the gauge is the log field).
+        let text = node_a.metrics_text();
+        assert!(
+            text.contains(&format!("\nqumbra_state_tip_id {}\n", applied.identity())),
+            "{text}"
+        );
+        assert_eq!(
+            u64::from_str_radix(field(&a, "stipid"), 16).unwrap(),
+            applied.identity(),
+            "the log field and the gauge are two spellings of one number"
+        );
+
+        for base in [ba, bb, bc] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// **ACCEPTANCE #2 — the detector fires on a wedged node and stays QUIET on a
+    /// merely lagging one.**
+    ///
+    /// Both halves, because a detector that fires on any nonzero `slag=` is worse
+    /// than none: it retrains the operator to ignore it. `slag=` covers both states
+    /// and they need opposite responses — a lagging node catches up when its bodies
+    /// arrive, a stranded one never does, because `buffer_body` drops the one body
+    /// that could rebuild its state tip and `qlab_node::Node` cannot rewind.
+    ///
+    /// The wedged node here is the live shape exactly: it mined its own height 1,
+    /// lost the fork race, its **chain** reorged onto the winner and its **state**
+    /// could not follow.
+    #[test]
+    fn the_wedge_detector_fires_on_a_stranded_state_machine_and_not_on_a_lagging_one() {
+        use qlab_p2p::n1::{BlockIngest, IngestOutcome};
+
+        // The winner: three blocks, all its own.
+        let (cw, genesis, bw) = rig_paying("wedge_win", 0xa1);
+        let winner = node_mining_its_own(&cw, &genesis, 3);
+        let healthy = winner.telemetry_sample();
+        let winning = main_chain_headers(&winner);
+
+        // ── The WEDGED node. It mined its own height 1 — a genuine sibling — and
+        //    then heard the winner's heavier branch. Fork choice reorgs; the state
+        //    machine, which has no rewind, cannot.
+        let (cl, _, bl) = rig_paying("wedge_lose", 0xb2);
+        let mut loser = node_mining_its_own(&cl, &genesis, 1);
+        let own_block_1 = loser.p2p().node().applied_tip().hash;
+        assert_ne!(own_block_1, winning[0].header_hash(), "a genuine sibling at height 1");
+        for header in &winning {
+            loser.p2p_mut().node_mut().ingest_header(*header);
+        }
+        let wedged = loser.telemetry_sample();
+
+        // ── The LAGGING node. Same headers, but it never mined, so its applied tip
+        //    is genesis — which IS the main-chain block at height 0.
+        let (cg, _, bg) = rig_paying("wedge_lag", 0xc3);
+        let mut lagger = node_mining_its_own(&cg, &genesis, 0);
+        for header in &winning {
+            assert_eq!(
+                lagger.p2p_mut().node_mut().ingest_header(*header),
+                IngestOutcome::Accepted
+            );
+        }
+        let lagging = lagger.telemetry_sample();
+
+        // 🔴 THE FINDING. Both are behind their own chain and `slag=` cannot tell
+        // them apart; only `schain=` can.
+        assert!(field(&wedged, "slag").parse::<u64>().unwrap() > 0, "{wedged}");
+        assert!(field(&lagging, "slag").parse::<u64>().unwrap() > 0, "{lagging}");
+        assert_eq!(field(&wedged, "schain"), "fork", "the detector FIRES: {wedged}");
+        assert_eq!(field(&lagging, "schain"), "main", "and stays QUIET: {lagging}");
+        assert_eq!(field(&healthy, "schain"), "main", "and on a healthy node: {healthy}");
+        assert_eq!(field(&healthy, "slag"), "0", "{healthy}");
+
+        // The identity is what says *which* block, and it is the losing sibling's.
+        let expected: String =
+            own_block_1[..6].iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(field(&wedged, "stipid"), expected, "{wedged}");
+        assert_ne!(
+            field(&wedged, "stipid"),
+            field(&healthy, "stipid"),
+            "the two nodes' applied tips are different blocks"
+        );
+
+        // The scrape carries the same verdict, from the same `applied_tip()`.
+        let wedged_metrics = loser.metrics_text();
+        assert!(
+            wedged_metrics.contains("\nqumbra_state_tip_off_main_chain 1\n"),
+            "{wedged_metrics}"
+        );
+        assert!(
+            wedged_metrics.contains(&format!(
+                "\nqumbra_state_tip_id {}\n",
+                u64::from_str_radix(field(&wedged, "stipid"), 16).unwrap()
+            )),
+            "printf '%012x' of the gauge is the log field: {wedged_metrics}"
+        );
+        let lagging_metrics = lagger.metrics_text();
+        assert!(
+            lagging_metrics.contains("\nqumbra_state_tip_off_main_chain 0\n"),
+            "{lagging_metrics}"
+        );
+
+        // ── **The half that proves the two states are genuinely different.** Every
+        //    body of the winning branch is handed to both nodes. The lagging node
+        //    converges — `slag=0`, still `schain=main`. The wedged one does not: its
+        //    state tip is still the losing sibling and `schain=fork` stands.
+        for header in &winning {
+            let hash = header.header_hash();
+            let stored = winner.state().chain().block(&hash).expect("the winner has it").clone();
+            let body = stored.body();
+            lagger.p2p_mut().node_mut().ingest_block(*header, body.clone());
+            loser.p2p_mut().node_mut().ingest_block(*header, body);
+        }
+        let lagger_after = lagger.telemetry_sample();
+        assert_eq!(field(&lagger_after, "slag"), "0", "the lagging node catches up: {lagger_after}");
+        assert_eq!(field(&lagger_after, "schain"), "main", "{lagger_after}");
+        let loser_after = loser.telemetry_sample();
+        assert_eq!(
+            field(&loser_after, "stipid"),
+            expected,
+            "the wedged node's state tip has not moved — this is the absorbing state, \
+             and fixing it is a separate baton: {loser_after}"
+        );
+        assert_eq!(field(&loser_after, "schain"), "fork", "{loser_after}");
+
+        println!("PR-SAMPLE healthy: {healthy}");
+        println!("PR-SAMPLE lagging: {lagging}");
+        println!("PR-SAMPLE wedged : {wedged}");
+        for base in [bw, bl, bg] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
     #[test]
     fn telemetry_age_is_dash_when_nothing_finalized() {
         // S8: a node that has mined but never finalized prints `final=-` AND `age_s=-`
