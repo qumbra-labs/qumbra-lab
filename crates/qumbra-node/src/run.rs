@@ -397,7 +397,38 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         release.validate()?;
         let marker = HaltMarker::load(&config.data_dir)?;
         release.check_against_marker(marker.as_ref())?;
-        let rules = release.rule_schedule()?;
+        //     (c) #81: the schedule is a property of this release AND of this data
+        //         dir. A routine release after an upgrade declares no boundary of its
+        //         own, and must still apply the post-halt rule domain recorded on
+        //         disk — otherwise it would reject every block the upgraded
+        //         population mined above the boundary.
+        let rules = release.rule_schedule_on(marker.as_ref())?;
+        //     (d) #81: having been *permitted* past the boundary, this binary records
+        //         that its revision is now the one in force. Without this the marker
+        //         keeps naming the pre-upgrade revision and every later release is
+        //         refused forever — the defect #81 was filed for.
+        //
+        //         This write is FATAL on failure, unlike `maintain_halt_marker`'s
+        //         best-effort posture. The asymmetry is deliberate: failing to record
+        //         a halt leaves a node that is halted anyway, while failing to record
+        //         a transition leaves a marker claiming the OLD revision is in force —
+        //         under which a downgrade to the pre-upgrade binary would be silently
+        //         ACCEPTED. A gate that quietly weakens on a full disk is worse than
+        //         one that refuses to start.
+        let marker = match marker {
+            Some(m) if release.supersedes(&m) => {
+                let advanced = m.superseded_by(&release);
+                advanced.write(&config.data_dir)?;
+                println!(
+                    "HALT marker advanced: boundary height {} passed; revision in force is now \
+                     `{}`. Later releases carrying this revision start without declaring the \
+                     boundary (issue #81).",
+                    advanced.height, advanced.revision_id
+                );
+                Some(advanced)
+            }
+            other => other,
+        };
 
         // (1) Byte-verify the genesis file + optional hash pin BEFORE any state.
         genesis.verify_startup(config.expected_genesis_hash.as_deref())?;
@@ -572,7 +603,17 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             started: Instant::now(),
             release,
             halt_at: release.halt_at(),
-            marker_final_written: marker.is_some_and(|m| m.boundary_finalized),
+            // "The marker for THIS release's halt is already in its final form", so
+            // it may only be seeded from a marker that is actually about this halt.
+            // Seeding it from any marker at all was unreachable under the height-keyed
+            // gate — a binary armed at a SECOND boundary on a resumed data dir was
+            // refused outright, so there was never a marker for a different boundary
+            // to be confused by. #81 makes the second upgrade possible and therefore
+            // makes it live: the node would halt at the new boundary and never write a
+            // marker for it, leaving the gate to consult a stale boundary afterwards.
+            marker_final_written: marker
+                .filter(|m| !m.resumed && Some(m.height) == release.halt_at())
+                .is_some_and(|m| m.boundary_finalized),
         })
     }
 
@@ -2792,6 +2833,299 @@ mod tests {
         // It mines past the boundary, under the post-halt rules.
         assert!(up.try_mine(), "the resumed release produces block H+1");
         assert_eq!(up.tip_height(), DH + 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Drive a data dir through halt-at-H and the declared upgrade, leaving it running
+    /// `resume_release()` past the boundary — i.e. the state a real net is in the day
+    /// after an upgrade. Returns the tip and the hash of the first post-boundary block,
+    /// so a later binary can be checked for agreeing about it.
+    fn halt_then_upgrade(
+        config: &NodeConfig,
+        genesis: &GenesisFile,
+    ) -> (u64, qlab_devnet::header::Hash32) {
+        {
+            let mut node = RunningNode::start_with_release(
+                config, genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+            )
+            .unwrap();
+            node.set_mine_interval(Duration::ZERO);
+            node.try_checkpoint();
+            mine_and_checkpoint(&mut node, DH);
+            assert_eq!(node.finalized_height(), Some(DH), "the boundary is finalized");
+            node.maintain_halt_marker();
+            node.save_snapshot().unwrap();
+        }
+        let mut up = RunningNode::start_with_release(
+            config, genesis, KeccakPow, DevnetRehearsalVerifier, resume_release(),
+        )
+        .expect("the declared upgrade starts");
+        up.set_mine_interval(Duration::ZERO);
+        assert!(up.try_mine(), "mines the first post-boundary block");
+        up.try_checkpoint();
+        let tip = up.tip_height();
+        let first_post = up.p2p().node().main_chain_hash_at(DH + 1).unwrap();
+        up.save_snapshot().unwrap();
+        (tip, first_post)
+    }
+
+    /// **🎯 #81, THE DEFECT AS FILED, through the run path.** A routine release with no
+    /// halt of its own and no declaration starts cleanly on a data dir that previously
+    /// halted — and it agrees with the upgraded population about the blocks above the
+    /// boundary rather than forking from them.
+    ///
+    /// Under the height-keyed gate this exact release was refused with
+    /// `UndeclaredResume { marked: 16 }`, and would have been for the life of the data
+    /// dir.
+    #[test]
+    fn a_routine_later_release_resumes_a_previously_halted_data_dir() {
+        let (config, genesis, base) = rig("halt_routine", true);
+        let (tip_after_upgrade, first_post_block) = halt_then_upgrade(&config, &genesis);
+        assert!(tip_after_upgrade > DH);
+
+        // The marker now names the revision IN FORCE, keeping H as the audit record.
+        let m = HaltMarker::load(&config.data_dir).unwrap().expect("marker still on disk");
+        assert_eq!(m.height, DH, "the boundary height is preserved as the audit record");
+        assert_eq!(m.revision_id, "v1.0.1-drill", "…and the in-force revision advanced");
+        assert!(m.resumed, "the data dir has PASSED the boundary");
+        assert!(m.boundary_finalized, "the original halt's audit fact survives the rewrite");
+
+        // A routine bug-fix release months later: same revision (it moves no frozen
+        // constant), new binary name, halts nowhere, and says NOTHING about height 16.
+        let routine = Release {
+            name: "test [v1.0.2 — a routine release, no halt of its own]",
+            plan: HaltPlan::None,
+            revision: Some(REVISION_V1_0_1_DRILL),
+            resumes_from: None,
+        };
+        let mut later = RunningNode::start_with_release(
+            &config, &genesis, KeccakPow, DevnetRehearsalVerifier, routine,
+        )
+        .expect("a routine release must start on a data dir that once halted (#81)");
+        later.set_mine_interval(Duration::ZERO);
+
+        // It opened the upgraded chain, not a fresh one, and it did not re-sync.
+        assert_eq!(later.tip_height(), tip_after_upgrade, "no re-sync, no replay");
+        assert_eq!(
+            later.p2p().node().main_chain_hash_at(DH + 1),
+            Some(first_post_block),
+            "it accepts the upgraded population's post-boundary block — the PoW domain \
+             it inherited from the marker is the same one that block was mined under"
+        );
+        assert_eq!(later.halt_at(), None, "it halts nowhere of its own");
+        // And it keeps mining on that chain rather than forking off it.
+        assert!(later.try_mine(), "the routine release extends the upgraded chain");
+        assert_eq!(later.tip_height(), tip_after_upgrade + 1);
+
+        // Starting it did NOT rewrite the marker — nothing about the data dir changed.
+        assert_eq!(HaltMarker::load(&config.data_dir).unwrap(), Some(m));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **🎯 #81, THE OTHER HALF, through the run path.** The marker is still a gate: an
+    /// arbitrary binary is refused on a halted node, and the pre-announcement binary is
+    /// refused on the upgraded one. The second refusal is the one a gate keyed on the
+    /// bare *frozen* digest would have lost — the drill's upgrade is inert, so `v1.0`
+    /// and `v1.0.1-drill` have byte-identical frozen digests.
+    #[test]
+    fn an_arbitrary_binary_is_still_refused_on_a_halted_and_on_an_upgraded_data_dir() {
+        let (config, genesis, base) = rig("halt_arbitrary", true);
+        {
+            let mut node = RunningNode::start_with_release(
+                &config, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+            )
+            .unwrap();
+            node.set_mine_interval(Duration::ZERO);
+            node.try_checkpoint();
+            mine_and_checkpoint(&mut node, DH);
+            node.maintain_halt_marker();
+            node.save_snapshot().unwrap();
+        }
+        // (a) HALTED at the boundary: the plain pre-announcement binary is refused,
+        //     even though it carries exactly the revision the marker records. A node
+        //     paused at an announced boundary is resumed deliberately or not at all.
+        let plain = Release {
+            name: "test [plain v1.0, pre-announcement]",
+            plan: HaltPlan::None,
+            revision: Some(REVISION_V1_0),
+            resumes_from: None,
+        };
+        assert!(matches!(
+            RunningNode::start_with_release(
+                &config, &genesis, KeccakPow, DevnetRehearsalVerifier, plain,
+            ),
+            Err(RunError::Release(ReleaseError::UndeclaredResume { marked, .. })) if marked == DH
+        ));
+
+        // Now perform the upgrade for real.
+        {
+            let mut up = RunningNode::start_with_release(
+                &config, &genesis, KeccakPow, DevnetRehearsalVerifier, resume_release(),
+            )
+            .unwrap();
+            up.set_mine_interval(Duration::ZERO);
+            assert!(up.try_mine());
+            up.try_checkpoint();
+            up.save_snapshot().unwrap();
+        }
+        assert_eq!(
+            REVISION_V1_0.frozen_digest_hex, REVISION_V1_0_1_DRILL.frozen_digest_hex,
+            "precondition: this upgrade is INERT, so a frozen-digest key could not \
+             tell these two binaries apart"
+        );
+        // (b) UPGRADED: the same plain binary is a downgrade now, and still refused —
+        //     with the two revisions named, so the operator can see which is which.
+        let err = RunningNode::start_with_release(
+            &config, &genesis, KeccakPow, DevnetRehearsalVerifier, plain,
+        );
+        match err {
+            Err(RunError::Release(
+                ref e @ ReleaseError::UndeclaredResume { ref in_force_revision, .. },
+            )) => {
+                assert_eq!(in_force_revision, "v1.0.1-drill");
+                let msg = e.to_string();
+                assert!(msg.contains("`v1.0.1-drill`") && msg.contains("`v1.0`"), "{msg}");
+            }
+            Err(other) => panic!("expected an UndeclaredResume refusal, got {other:?}"),
+            Ok(_) => panic!("the pre-announcement binary must NOT start on an upgraded data dir"),
+        }
+        // …and the refused start left the marker untouched.
+        let m = HaltMarker::load(&config.data_dir).unwrap().unwrap();
+        assert_eq!(m.revision_id, "v1.0.1-drill");
+        assert!(m.resumed);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **🎯 #81 point 2, through the run path.** A marker written under the pre-#81
+    /// height-keyed scheme refuses the node's start with a reason that names the
+    /// boundary and the remedy. Critically it does **not** fall through to a fresh
+    /// start: the chain on disk is untouched, and the marker is left exactly as found
+    /// for an operator to inspect.
+    #[test]
+    fn a_pre_81_marker_refuses_the_start_and_does_not_fall_through_to_a_fresh_one() {
+        let (config, genesis, base) = rig("halt_schema0", true);
+        let tip;
+        {
+            let mut node = RunningNode::start_with_release(
+                &config, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+            )
+            .unwrap();
+            node.set_mine_interval(Duration::ZERO);
+            node.try_checkpoint();
+            mine_and_checkpoint(&mut node, DH);
+            tip = node.tip_height();
+            node.maintain_halt_marker();
+            node.save_snapshot().unwrap();
+        }
+        // Rewrite the marker in the pre-#81 shape: the four original fields, no
+        // `schema` and no `resumed`. This is byte-for-byte what #74's binary wrote.
+        let on_disk = HaltMarker::load(&config.data_dir).unwrap().unwrap();
+        std::fs::write(
+            HaltMarker::path(&config.data_dir),
+            format!(
+                "height = {}\nrevision_id = \"{}\"\nfrozen_digest_hex = \"{}\"\n\
+                 boundary_finalized = {}\n",
+                on_disk.height,
+                on_disk.revision_id,
+                on_disk.frozen_digest_hex,
+                on_disk.boundary_finalized,
+            ),
+        )
+        .unwrap();
+        let raw_before = std::fs::read_to_string(HaltMarker::path(&config.data_dir)).unwrap();
+
+        // Even the correct upgrade binary is refused — the marker cannot say whether
+        // this data dir already resumed, so nothing may be inferred from it.
+        for release in [armed_release(), resume_release()] {
+            let err = RunningNode::start_with_release(
+                &config, &genesis, KeccakPow, DevnetRehearsalVerifier, release,
+            );
+            match err {
+                Err(RunError::Release(
+                    e @ ReleaseError::UnknownMarkerSchema { found: 0, expected: 1, .. },
+                )) => {
+                    let msg = e.to_string();
+                    assert!(msg.contains(&format!("height {DH}")), "names the boundary: {msg}");
+                    assert!(msg.contains(&format!("resumes_from={DH}")), "names a remedy: {msg}");
+                }
+                Err(other) => panic!("expected a schema refusal, got {other:?}"),
+                Ok(_) => panic!("a marker this binary cannot interpret must refuse the start"),
+            }
+        }
+        // The refusal is inert: the marker is untouched and the chain is intact.
+        assert_eq!(
+            std::fs::read_to_string(HaltMarker::path(&config.data_dir)).unwrap(),
+            raw_before,
+            "a refused start must not rewrite the evidence it refused on"
+        );
+        std::fs::remove_file(HaltMarker::path(&config.data_dir)).unwrap();
+        let reopened = RunningNode::start_with_release(
+            &config, &genesis, KeccakPow, DevnetRehearsalVerifier, resume_release(),
+        )
+        .expect("with the marker deliberately removed, the upgrade starts");
+        assert_eq!(
+            reopened.tip_height(),
+            tip,
+            "…on the SAME chain — the schema refusal never cost the data dir a replay"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A **second** upgrade on the same data dir — the case the height-keyed gate could
+    /// not express at all, and the reason #81 exists. Halt at a second boundary under
+    /// the already-upgraded revision, resume past it, and confirm the marker tracks the
+    /// new boundary and the new revision in force.
+    #[test]
+    fn a_second_upgrade_advances_the_boundary_and_the_revision_in_force() {
+        let (config, genesis, base) = rig("halt_second", true);
+        halt_then_upgrade(&config, &genesis);
+        const H2: u64 = DH + CHECKPOINT_CADENCE_BLOCKS; // the next boundary on the grid
+
+        // The second armed release: carries the CURRENT in-force revision (it changes
+        // no frozen constant yet — the halt is what arms the change) and stops at H2.
+        let armed2 = Release {
+            name: "test [armed at the second boundary]",
+            plan: HaltPlan::Armed { height: H2 },
+            revision: Some(REVISION_V1_0_1_DRILL),
+            resumes_from: None,
+        };
+        {
+            let mut node = RunningNode::start_with_release(
+                &config, &genesis, KeccakPow, DevnetRehearsalVerifier, armed2,
+            )
+            .expect("it carries the revision in force, so it needs no declaration (#81)");
+            node.set_mine_interval(Duration::ZERO);
+            assert_eq!(node.halt_at(), Some(H2));
+            mine_and_checkpoint(&mut node, H2);
+            assert_eq!(node.tip_height(), H2, "halted at the second boundary");
+            assert!(node.is_halted());
+            node.maintain_halt_marker();
+            node.save_snapshot().unwrap();
+        }
+        let m = HaltMarker::load(&config.data_dir).unwrap().unwrap();
+        assert_eq!(m.height, H2, "the marker tracks the SECOND boundary");
+        assert!(!m.resumed, "halted at it, not past it");
+        assert_eq!(m.revision_id, "v1.0.1-drill");
+
+        // The second upgrade declares H2 — not DH. Under the height-keyed gate this
+        // release would have had to declare the historical boundary 16 as well, and
+        // there is no field in which to say both.
+        let up2 = Release {
+            name: "test [the second upgrade]",
+            plan: HaltPlan::None,
+            revision: Some(REVISION_V1_0),
+            resumes_from: Some(H2),
+        };
+        let mut node = RunningNode::start_with_release(
+            &config, &genesis, KeccakPow, DevnetRehearsalVerifier, up2,
+        )
+        .expect("the second upgrade starts by declaring the SECOND boundary only");
+        node.set_mine_interval(Duration::ZERO);
+        assert_eq!(node.tip_height(), H2, "opened at the boundary, no replay");
+        let m = HaltMarker::load(&config.data_dir).unwrap().unwrap();
+        assert_eq!(m.height, H2);
+        assert!(m.resumed);
+        assert_eq!(m.revision_id, "v1.0", "the second upgrade's revision is now in force");
         let _ = std::fs::remove_dir_all(&base);
     }
 
