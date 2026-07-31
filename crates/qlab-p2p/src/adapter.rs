@@ -995,32 +995,6 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         )
     }
 
-    /// Whether `header` is a block someone actually **mined** — either already in our
-    /// chain (so header validation passed when it went in) or PoW/LWMA-valid under
-    /// this release's rules right now.
-    ///
-    /// This is the price of the #134 amnesty, and it is what stops the amnesty from
-    /// being cheaper for an attacker than the fault path. `validate_body` runs
-    /// [`check_body_binding`](qlab_devnet::body::check_body_binding) **first**, so a
-    /// body that reaches the anchor check is the body its header committed to; adding
-    /// this check means an attacker who wants an unjudged (uncharged) refusal must
-    /// bring a *mined* header committing to their bad body — a block of real work per
-    /// attempt. Anything cheaper fails here and is charged exactly as it is today.
-    fn header_is_mined(&self, header: &BlockHeader) -> bool {
-        if self.chain.header(&header.header_hash()).is_some() {
-            return true;
-        }
-        validate_header_under(
-            &self.chain,
-            &self.pow,
-            header,
-            self.block_time,
-            self.schedule,
-            &self.rules,
-        )
-        .is_ok()
-    }
-
     fn reject_reason(err: &MempoolError) -> &'static str {
         match err {
             MempoolError::WrongFee { .. } => "wrong fee",
@@ -1088,23 +1062,45 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
             Ok(()) => {}
             Err(e) => match Self::body_fault_class(&e) {
                 BodyFault::Intrinsic(why) => return IngestOutcome::Rejected(why),
-                // Positional. Charge it only where our verdict is the network's, and
-                // only for a header someone paid to mine (see `header_is_mined`).
-                BodyFault::Positional(why) => {
-                    if self.anchor_verdict_is_authoritative(&header) || !self.header_is_mined(&header)
-                    {
-                        return IngestOutcome::Rejected(why);
-                    }
-                    // `Ignored`, never `Rejected` — the #130 (a) shape, for the reason
-                    // #130 (a) cited this issue for. Not relayed, not applied, not
-                    // buffered (an unjudged body has had its proofs unverified, so
-                    // holding it would let unpaid-for bytes into the #130 (a) window),
-                    // and — the load-bearing part — NOT scored.
-                    //
-                    // Refusing to apply is unchanged: this node still does not accept
-                    // the block. Not penalising is not accepting.
-                    self.ingest_counters.unjudged_anchor += 1;
-                    return IngestOutcome::Ignored(UNJUDGED_ANCHOR_REASON);
+                // Positional. Charged where our verdict IS the network's — the live
+                // path, where a bad anchor is a bad anchor and costs the sender
+                // exactly what it costs today.
+                BodyFault::Positional(why) if self.anchor_verdict_is_authoritative(&header) => {
+                    return IngestOutcome::Rejected(why)
+                }
+                // Positional, and we cannot judge it. Judge the HEADER instead: PoW +
+                // LWMA under this release's rules is a check with no positional
+                // component, and it is what separates "a peer served me real history"
+                // from "a peer sent me bytes".
+                //
+                // **This is the price of the amnesty, and it is what stops it being a
+                // hole.** `validate_body` runs the header/body binding FIRST, so a body
+                // that reached the anchor check is the body this header committed to;
+                // an attacker who wants an uncharged refusal must therefore bring a
+                // *mined* header committing to their bad body — a block of real work
+                // per attempt, at the difficulty the chain is running at. Anything
+                // cheaper lands in one of the arms below and is charged.
+                BodyFault::Positional(_) => {
+                    return match self.submit_header(header) {
+                        // Real work, and the header is now ours — so this is
+                        // header-first sync doing its job, and the announcement that
+                        // carried it was not wasted. The BODY is still refused: not
+                        // relayed, not applied, and not buffered (its proofs were never
+                        // verified, so it must not enter the #130 (a) window). And —
+                        // the load-bearing part — the sender is NOT scored.
+                        //
+                        // Not penalising is not accepting.
+                        IngestOutcome::Accepted | IngestOutcome::Duplicate => {
+                            self.ingest_counters.unjudged_anchor += 1;
+                            IngestOutcome::Ignored(UNJUDGED_ANCHOR_REASON)
+                        }
+                        // Unknown parent → the same orphan sync-kick a header-only
+                        // announce gets, rather than a fault. Invalid header → the
+                        // fault is the header's and it is now NAMED as one
+                        // ("invalid header: pow") instead of being folded into the
+                        // undifferentiated "bad body" this arm used to return.
+                        other => other,
+                    };
                 }
             },
         }
@@ -1706,11 +1702,11 @@ mod tests {
     /// 2. **A held body's arrival verdict is not a fault to begin with.** It is
     ///    `Duplicate` (the header was already known) or `Accepted`.
     ///
-    /// What this pass does NOT do is change the arrival-time classification: a body
-    /// whose anchor cannot be judged is still `Rejected("bad body")` exactly as before,
-    /// once, for the same reason, with the same penalty. That is #134's to fix, and
-    /// changing it here in either direction would either widen it or quietly do its
-    /// job.
+    /// What this pass did NOT do is change the arrival-time classification — that was
+    /// #134's to fix, and it has since: a body whose anchor this node cannot judge is
+    /// now `Ignored(UNJUDGED_ANCHOR_REASON)` rather than `Rejected("bad body")`. Both
+    /// properties above survive it unchanged, and neither depends on which of the two
+    /// the arrival returns; they are about the RETRY path, which scores nothing at all.
     #[test]
     fn a_held_body_is_never_a_second_peer_fault_however_often_it_is_retried() {
         let mut p = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
@@ -1737,6 +1733,245 @@ mod tests {
         assert_eq!(f.ingest_block(blocks[0].0, blocks[0].1.clone()), IngestOutcome::Duplicate);
         assert_eq!(f.state().tip_height(), 3);
         assert_eq!(f.pending_bodies(), (0, 0), "and the window empties behind it");
+    }
+
+    // --- issue #134: an anchor this node cannot judge is not a peer fault -----
+
+    /// A proposer that can put **real transactions** in the blocks it mines: its
+    /// genesis root is finalized, so a tx anchored there is admissible and
+    /// `mine_block` will assemble it into the body.
+    ///
+    /// This is the state every chain reaches the moment it carries one transaction —
+    /// T1 by construction, since `t1-discovery-serving-decision.md` decided
+    /// body-bound discovery. Every block below carries a tx, which is exactly what
+    /// makes `validate_body`'s anchor loop execute at all; on a coinbase-only chain
+    /// it iterates zero times and `AnchorNotFinal` is unreachable.
+    fn transacting_proposer(n: usize) -> Vec<(BlockHeader, BlockBody)> {
+        let mut p = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let g = p.chain().genesis_hash();
+        p.state_mut().finalize(g).expect("finalize genesis");
+        let anchor = p.state().commitment_root();
+        (0..n)
+            .map(|i| {
+                assert_eq!(
+                    p.ingest_tx(tx_with(anchor, i as u8 + 1, b"ok")),
+                    IngestOutcome::Accepted,
+                    "the proposer admits its own tx"
+                );
+                let (h, body) = p.mine_block().expect("mine");
+                assert_eq!(body.txs.len(), 1, "the block carries a transaction");
+                assert_eq!(p.ingest_block(h, body.clone()), IngestOutcome::Accepted);
+                (h, body)
+            })
+            .collect()
+    }
+
+    /// 🔴 **ACCEPTANCE 1 (#134), at the verdict seam: a joiner replaying history that
+    /// contains transactions it cannot yet anchor never returns a peer fault — and
+    /// still refuses to apply the bodies.**
+    ///
+    /// The joiner has header-synced (the state of every node that joins a running net)
+    /// and has finalized nothing, so `is_valid_anchor` answers "no" to every anchor in
+    /// every historical body — correctly, about itself. Under the old
+    /// `Err(_) => Rejected("bad body")` wildcard each of these six blocks was a peer
+    /// fault worth `PENALTY_INVALID_OBJECT` = 20 against `BAN_THRESHOLD` = −100: five
+    /// blocks banned the peer serving them. The scoring half of that claim is
+    /// `node.rs`'s `a_joiner_does_not_ban_the_peer_serving_it_correct_history`; this is
+    /// the classification half.
+    ///
+    /// **Not penalising is not accepting**, and the second half of the test is the
+    /// half that says so: the state machine applies nothing, the pending-body window
+    /// stays empty (an unjudged body's proofs were never verified, so it must not be
+    /// held), and the lag does not close.
+    #[test]
+    fn a_joiner_does_not_fault_a_peer_for_history_it_cannot_judge() {
+        let blocks = transacting_proposer(6);
+        let mut j = follower_with_headers_only(&blocks);
+        assert_eq!(j.state().finalized_height(), None, "a joiner has finalized nothing");
+
+        for (i, (header, body)) in blocks.iter().enumerate() {
+            let outcome = j.ingest_block(*header, body.clone());
+            assert_eq!(
+                outcome,
+                IngestOutcome::Ignored(UNJUDGED_ANCHOR_REASON),
+                "block {} is unjudged, not invalid",
+                i + 1
+            );
+            assert!(
+                !outcome.is_peer_fault(),
+                "block {}: the peer served correct history and is not at fault",
+                i + 1
+            );
+        }
+        assert!(blocks.len() >= 5, "≥5 blocks — enough to have banned the peer at −20 each");
+        assert_eq!(
+            j.ingest_counters().unjudged_anchor,
+            6,
+            "and every one of them is visible to an operator"
+        );
+
+        // Not penalising is not accepting.
+        assert_eq!(j.state().tip_height(), 0, "the joiner applied none of the bodies");
+        assert_eq!(j.pending_bodies(), (0, 0), "and held none of them either");
+        assert_eq!(j.state_lag().blocks(), 6, "the sync gap is unchanged — this is not a sync fix");
+    }
+
+    /// 🔴 **ACCEPTANCE 2 (#134): the distinction is not a blanket amnesty.**
+    ///
+    /// Two ways a body is still the sender's fault, on the same node in the same test:
+    ///
+    /// 1. **An intrinsic failure, from any position.** A bad proof is a bad proof on
+    ///    every node at every height; the joiner above would charge for it too.
+    /// 2. **A positional failure where the verdict IS the network's.** A node standing
+    ///    at the body's own parent, with a current finalized head, is running the rule
+    ///    the network runs — so a genuinely non-final anchor costs the sender exactly
+    ///    what it cost before this pass.
+    ///
+    /// (2) is the one that matters: it is the live path, and if it did not charge, the
+    /// fix would have traded a joiner's problem for a validator's.
+    #[test]
+    fn a_genuinely_invalid_body_still_costs_the_sender() {
+        let (mut a, anchor) = adapter_with_finalized_genesis();
+        assert!(
+            a.anchor_verdict_is_authoritative(
+                &BlockHeader::child_of(
+                    a.chain().header(&a.chain().tip_hash()).expect("tip"),
+                    75,
+                    1,
+                    [0; 32]
+                )
+            ),
+            "this node stands at the position the anchor rule is defined at"
+        );
+
+        // (1) Intrinsic: the proof does not verify. Same verdict on every node.
+        let bad_proof = BlockBody {
+            txs: vec![tx_with(anchor, 9, b"bad")],
+            coinbase: 0,
+            coinbase_rkm: [0; 4],
+        };
+        let tip = *a.chain().header(&a.chain().tip_hash()).expect("tip header");
+        let h1 =
+            BlockHeader::child_of(&tip, tip.timestamp + 75, tip.difficulty, bad_proof.commitment());
+        let out = a.ingest_block(h1, bad_proof);
+        assert_eq!(out, IngestOutcome::Rejected("bad body"));
+        assert!(out.is_peer_fault(), "an unverifiable proof is always the sender's fault");
+
+        // (2) Positional, judged from the position that owns the verdict: an anchor
+        // that is simply not a finalized root of this chain.
+        let never_final = BlockBody {
+            txs: vec![tx_with([0xEE; 32], 10, b"ok")],
+            coinbase: 0,
+            coinbase_rkm: [0; 4],
+        };
+        let h2 = BlockHeader::child_of(
+            &tip,
+            tip.timestamp + 75,
+            tip.difficulty,
+            never_final.commitment(),
+        );
+        let out = a.ingest_block(h2, never_final);
+        assert_eq!(out, IngestOutcome::Rejected("bad body"));
+        assert!(out.is_peer_fault(), "a bad anchor at the tip is still a bad anchor");
+        assert_eq!(
+            a.ingest_counters().unjudged_anchor,
+            0,
+            "nothing here was excused as unjudgeable"
+        );
+    }
+
+    /// The **membership test** for the amnesty, stated so it cannot drift: both clauses
+    /// of `anchor_verdict_is_authoritative` are computed from this node's own two
+    /// numbers, and each one alone is enough to disqualify the verdict.
+    ///
+    /// This is the answer to "how does a node know it is in the 'cannot judge' case
+    /// without that becoming a hole an attacker walks through" — it never asks, and
+    /// there is no input here a sender can reach.
+    #[test]
+    fn the_unjudged_case_is_decided_by_this_nodes_own_two_numbers() {
+        // Clause 2 alone: standing at the right position, but having finalized
+        // nothing. This is the joiner, and it is also any node in a finality stall.
+        let lagging = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let g = *lagging.chain().header(&lagging.chain().genesis_hash()).expect("genesis");
+        let at_tip = BlockHeader::child_of(&g, 75, g.difficulty, [0; 32]);
+        assert_eq!(at_tip.prev, lagging.state().tip_hash(), "clause 1 holds");
+        assert!(
+            !lagging.anchor_verdict_is_authoritative(&at_tip),
+            "clause 2 fails: a node that has finalized nothing has no view of what was final"
+        );
+
+        // Clause 1 alone: finality is current, but the body is not at the position the
+        // rule is defined at — `apply_block` would refuse it with `NotExtendingTip`,
+        // and `is_valid_anchor` would be reading the wrong root index and the wrong tip.
+        let (current, _anchor) = adapter_with_finalized_genesis();
+        let cg = *current.chain().header(&current.chain().genesis_hash()).expect("genesis");
+        let one = BlockHeader::child_of(&cg, 75, cg.difficulty, [0; 32]);
+        let elsewhere = BlockHeader::child_of(&one, 150, cg.difficulty, [0; 32]);
+        assert_ne!(elsewhere.prev, current.state().tip_hash());
+        assert!(
+            !current.anchor_verdict_is_authoritative(&elsewhere),
+            "clause 1 fails: our verdict would be about our position, not about the body"
+        );
+
+        // Both: the live path. This is where a bad anchor is charged.
+        assert_eq!(one.prev, current.state().tip_hash());
+        assert!(current.anchor_verdict_is_authoritative(&one));
+    }
+
+    /// Every `BodyError` variant has a declared side of the boundary, and the strings
+    /// are the ones this arm has always returned.
+    ///
+    /// The point of the exhaustive match is that a **future** variant cannot inherit
+    /// "peer fault" by silence the way `AnchorNotFinal` did — this test is what makes
+    /// the current assignment reviewable, the compiler is what makes the next one
+    /// unavoidable.
+    #[test]
+    fn every_body_error_declares_whether_it_is_intrinsic_or_positional() {
+        type A = NodeAdapter<KeccakPow, MockVerifier>;
+        let intrinsic = |e: BodyError, want: &str| match A::body_fault_class(&e) {
+            BodyFault::Intrinsic(why) => assert_eq!(why, want, "{e:?}"),
+            BodyFault::Positional(_) => panic!("{e:?} is intrinsic"),
+        };
+        intrinsic(
+            BodyError::CommitmentMismatch { expected: [0; 32], got: [1; 32] },
+            "body does not match header commitment",
+        );
+        intrinsic(BodyError::MissingCoinbasePayee, "bad body");
+        intrinsic(BodyError::WrongFee { index: 0, expected: 1, got: 2 }, "bad body");
+        intrinsic(BodyError::DoubleSpendInBlock { index: 0 }, "bad body");
+        intrinsic(BodyError::ProofInvalid { index: 0 }, "bad body");
+        // The one positional check, and the whole of #134.
+        assert!(matches!(
+            A::body_fault_class(&BodyError::AnchorNotFinal { index: 0 }),
+            BodyFault::Positional("bad body")
+        ));
+    }
+
+    /// A body we could not judge does not become a body we *relay*. The header it
+    /// carried is still learned — that is header-first sync, and it is why the next
+    /// announcement in the sequence is not an orphan — but the block is not accepted,
+    /// so `P2pNode::announce_block`'s "do not put on the wire what our own node
+    /// refused" guard (#77) covers it.
+    #[test]
+    fn an_unjudged_body_is_not_applied_but_its_header_is_learned() {
+        let blocks = transacting_proposer(3);
+        // No header sync this time: the bodies arrive cold, as announcements.
+        let mut j = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        for (i, (header, body)) in blocks.iter().enumerate() {
+            assert_eq!(
+                j.ingest_block(*header, body.clone()),
+                IngestOutcome::Ignored(UNJUDGED_ANCHOR_REASON),
+                "announcement {} is unjudged, not an orphan and not a fault",
+                i + 1
+            );
+            assert_eq!(
+                j.chain().tip_height(),
+                i as u64 + 1,
+                "the header IS learned, so announcement {} is not an orphan",
+                i + 2
+            );
+        }
+        assert_eq!(j.state().tip_height(), 0, "and not one body was applied");
     }
 
     /// **The pending-body window is bounded on all three axes** (issue #130 (a)).
