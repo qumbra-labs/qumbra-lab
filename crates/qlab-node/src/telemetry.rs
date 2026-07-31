@@ -47,11 +47,12 @@
 //! against a new node.
 
 use qlab_cbserver::codec::{write_varint, CodecError};
-use qlab_devnet::committee::checkpoint_id_hex;
+use qlab_devnet::committee::{checkpoint_id_hex, CHECKPOINT_ID_ABSENT, CHECKPOINT_ID_BYTES};
 use qlab_devnet::ebbflow::FinalityStatus;
 use qlab_devnet::halt::regime as halt_regime;
 
 use crate::rpc::{Reader, RPC_VERSION};
+use crate::store::Hash32;
 use crate::supply::SupplyEpoch;
 
 /// Wire discriminant for [`FinalityStatus::Final`].
@@ -145,6 +146,124 @@ impl StateLag {
     /// reading while a figure is published on another.
     pub fn is_lagging(&self) -> bool {
         self.blocks() > 0
+    }
+}
+
+/// The `schain=` token for an applied tip that **is** the main-chain block at its
+/// own height: healthy, whatever `slag=` says. It will catch up.
+pub const APPLIED_TIP_ON_MAIN: &str = "main";
+
+/// The `schain=` token for an applied tip that is **not** the main-chain block at
+/// its own height (issue #162 finding 6) — the state machine is on a branch fork
+/// choice did not choose, and since `qlab_node::Node` cannot rewind
+/// (`node.rs`'s `NotExtendingTip`; *"fork/reorg handling is N-later"*), it will
+/// never catch up. **This is the absorbing state, made loud.**
+pub const APPLIED_TIP_OFF_MAIN: &str = "fork";
+
+/// **The identity of the state machine's applied tip, and whether it is on the
+/// chain this node is following** (issue #162, finding 6).
+///
+/// [`StateLag`] answers *how far* the state machine trails fork choice. It cannot
+/// answer *whether trailing is the whole story*, and those are different questions
+/// with opposite operator responses:
+///
+/// - `slag=13` on a node whose applied tip is the main-chain block at height 1 is a
+///   node **catching up**. Wait.
+/// - `slag=13` on a node whose applied tip is a **sibling** of the main-chain block
+///   at height 1 is a node that will never catch up. Intervene.
+///
+/// On the 2026-07-31 T0 net those two printed identically, and separating them
+/// needed an archive dive: `node0`'s `stip=1` and `node2`'s `stip=1` looked the
+/// same and were different blocks — node2's a sibling on a losing branch, node0's
+/// the main chain. That is issue #84's sentence one layer down: *"`final=` says how
+/// high, never **what**."*
+///
+/// # The identity is derived, not invented
+///
+/// [`Self::identity`] takes the first [`CHECKPOINT_ID_BYTES`] of the block hash,
+/// big-endian, and renders it through the same [`checkpoint_id_hex`] that prints
+/// `fid` and `sid` — one width, one scheme, three fields comparable by eye.
+///
+/// The block hash is *already* `keccak256` over the header preimage
+/// (`qlab_devnet::header::BlockHeader::header_hash`), i.e. the canonical name of
+/// the object, which is the same thing
+/// [`qlab_devnet::committee::Checkpoint::identity`] takes its prefix of (there, the
+/// digest of the exact bytes the committee signs). So the prefix is taken
+/// **directly** rather than re-hashed: re-hashing a hash would be a second
+/// derivation of one identity, which is the failure mode this repo has ruled
+/// against repeatedly — and a divergence between two encodings presents as "the
+/// identities match" while the objects differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppliedTip {
+    /// Height whose body the state machine has applied — the same number
+    /// [`StateLag::state_tip`] carries, from the same place.
+    pub height: u64,
+    /// The hash of the block the state machine applied **at that height**. This is
+    /// the fact `stip=` alone cannot carry.
+    pub hash: Hash32,
+    /// The hash fork choice holds on its **main chain** at [`Self::height`], or
+    /// `None` when fork choice has no block at that height at all.
+    ///
+    /// `None` is not reachable on a node whose fork-choice tip is at or above its
+    /// applied tip (every applied block arrived through fork choice), which is
+    /// every node in a healthy or a lagging state. It is kept as an honest third
+    /// answer rather than collapsed into either verdict: an unjudgeable comparison
+    /// must not print as "on the main chain".
+    pub main_chain_hash: Option<Hash32>,
+}
+
+impl AppliedTip {
+    pub fn new(height: u64, hash: Hash32, main_chain_hash: Option<Hash32>) -> Self {
+        Self { height, hash, main_chain_hash }
+    }
+
+    /// **The applied tip's identity**: the first [`CHECKPOINT_ID_BYTES`] of the
+    /// block hash, big-endian, as an integer — the same width and the same fold as
+    /// [`qlab_devnet::committee::Checkpoint::identity`]. See the type docs for why
+    /// the prefix is taken directly.
+    pub fn identity(&self) -> u64 {
+        self.hash[..CHECKPOINT_ID_BYTES].iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
+    }
+
+    /// The `stipid=` field: [`Self::identity`] as the canonical 12-char lowercase
+    /// hex, from the same helper as `fid=` and `sid=`.
+    ///
+    /// **Always a value.** A node always has an applied tip — genesis at minimum —
+    /// so there is no absent case to print `-` for, and inventing one would be a
+    /// sentinel that never fires.
+    pub fn id_field(&self) -> String {
+        checkpoint_id_hex(Some(self.identity()))
+    }
+
+    /// **The detector**, and the one place it is computed:
+    /// `state.tip_hash() != chain.main_chain_hash_at(state.tip_height())`.
+    ///
+    /// `None` when the comparison cannot be made ([`Self::main_chain_hash`] is
+    /// absent). Every surface — the `schain=` field, the `/metrics` gauge, any
+    /// future consumer — reads its verdict from here, so none of them can be
+    /// checking a different condition than the others.
+    pub fn off_main_chain(&self) -> Option<bool> {
+        self.main_chain_hash.map(|main| main != self.hash)
+    }
+
+    /// [`Self::off_main_chain`] as a plain predicate: `false` when the comparison
+    /// could not be made, because an alarm must not fire on the absence of
+    /// evidence.
+    pub fn is_off_main_chain(&self) -> bool {
+        self.off_main_chain().unwrap_or(false)
+    }
+
+    /// The `schain=` field: [`APPLIED_TIP_ON_MAIN`], [`APPLIED_TIP_OFF_MAIN`], or
+    /// [`CHECKPOINT_ID_ABSENT`] when fork choice holds no block at this height.
+    ///
+    /// This is the field that separates a lagging node from a wedged one on the one
+    /// line an operator reads. `slag=` covers both; this does not.
+    pub fn chain_field(&self) -> &'static str {
+        match self.off_main_chain() {
+            None => CHECKPOINT_ID_ABSENT,
+            Some(false) => APPLIED_TIP_ON_MAIN,
+            Some(true) => APPLIED_TIP_OFF_MAIN,
+        }
     }
 }
 

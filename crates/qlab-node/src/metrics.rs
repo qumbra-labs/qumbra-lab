@@ -243,6 +243,17 @@ pub struct LiveGauges {
     pub pending_bodies: u64,
     /// Bytes held in the pending-body window.
     pub pending_body_bytes: u64,
+    /// **Identity of the block the state machine applied at [`Self::state_tip`]**
+    /// (issue #162 finding 6) — the 48-bit
+    /// [`crate::telemetry::AppliedTip::identity`], the same width and scheme as
+    /// [`Self::finalized_checkpoint_id`]. `qumbra_state_tip_height` says how high;
+    /// this says *what*, which is the difference between two nodes agreeing and two
+    /// nodes on different branches.
+    pub state_tip_id: u64,
+    /// **Whether the applied tip is a block fork choice did NOT choose** (issue #162
+    /// finding 6): `1` = wedged, `0` = on the main chain, `None` = fork choice holds
+    /// no block at that height, so the comparison could not be made.
+    pub state_tip_off_main_chain: Option<bool>,
     /// Distinct netgroups this node currently holds outbound connections to
     /// (issue #91). **The eclipse gauge**: a node whose outbound set collapses to
     /// one netgroup is one network's prisoner however many peers it reports.
@@ -769,6 +780,41 @@ without its slot is not comparable across nodes, so the two appear and disappear
     );
     if let Some(slot) = g.signed_checkpoint_slot {
         o.push_str(&format!("qumbra_signed_checkpoint_slot {slot}\n"));
+    }
+    // ---- issue #162 finding 6: the applied tip's identity, and the wedge -----
+    //
+    // #84's rule, followed rather than restated: a value and never a label, 48 bits
+    // so a float64 exposition value carries it unrounded, and `printf '%012x'` of
+    // this gauge is the `stipid=` field in the logs. The arithmetic that rejected an
+    // info metric there is worse here — a block turns over every 75 s, not every
+    // slot, so a `stipid` label would be ~1,150 series per node per day.
+    //
+    // Unlike the two checkpoint identities this one has **no absent case**: a node
+    // always has an applied tip, genesis at minimum. The series is unconditional
+    // because the reading always exists, not because a placeholder was convenient.
+    o.push_str(
+        "# HELP qumbra_state_tip_id Identity of the block the state machine has APPLIED at \
+qumbra_state_tip_height (issue #162): the first 6 bytes of its block hash, big-endian. printf '%012x' gives \
+the `stipid=` field in the logs. qumbra_state_tip_height says how high; this says what — two nodes reporting \
+one height with different values here have applied different blocks.\n\
+# TYPE qumbra_state_tip_id gauge\n",
+    );
+    o.push_str(&format!("qumbra_state_tip_id {}\n", g.state_tip_id));
+    // The detector. A boolean gauge and not a label, for the same reason as above,
+    // and **no series** when the comparison could not be made (fork choice holds no
+    // block at the applied height) — following `qumbra_finalized_height`'s rule that
+    // a metric is present-or-absent and a placeholder there is a fabricated reading.
+    // A 0 here would be an assertion that the node was checked and found healthy.
+    o.push_str(
+        "# HELP qumbra_state_tip_off_main_chain 1 when the state machine's applied tip is NOT the \
+main-chain block at its own height (issue #162): the node is on a branch fork choice did not choose and \
+cannot rewind to leave, so it will never catch up. This is the alarm to page on — \
+`qumbra_state_lag_blocks` is nonzero for an ordinary lagging node too, and the two need opposite \
+responses. No series when fork choice holds no block at that height, i.e. the comparison could not be \
+made.\n# TYPE qumbra_state_tip_off_main_chain gauge\n",
+    );
+    if let Some(off) = g.state_tip_off_main_chain {
+        o.push_str(&format!("qumbra_state_tip_off_main_chain {}\n", u8::from(off)));
     }
     o.push_str(
         "# HELP qumbra_finality_regime Current regime, one-hot: the series with value 1 is the live one.\n\

@@ -950,8 +950,45 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // a key that comes and goes forces a special case on every parser in
         // `qumbra-ops/`.
         let mready = self.mine_gate();
+        // Issue #162 finding 6: `stipid=` / `schain=` are **appended at the end**,
+        // after `mready=`, under the same rule as every addition since #87 — every
+        // pre-existing field keeps its name, position and meaning, and the
+        // `PRE_I84_FIELDS` prefix test passes unmodified.
+        //
+        // 🔴 **`stip=` publishes a height and not an identity**, which is #84's
+        // sentence one layer down: *"`final=` says how high, never what."* On the
+        // 2026-07-31 T0 net, `node0`'s `stip=1` and `node2`'s `stip=1` looked
+        // identical and were different blocks — node2's a sibling on a losing
+        // branch — and separating them cost an archive dive. `stipid=` is that
+        // identity, derived from the block hash at #84's width and printed through
+        // #84's helper, so `fid` / `sid` / `stipid` are three readings of one scheme
+        // and are comparable by eye.
+        //
+        // **`schain=` is the half that matters**, and it is a SEPARATE field rather
+        // than a distinct `stipid=` rendering. The identity is the thing the archive
+        // dive was for; overloading it with a verdict token would put a marker on
+        // the one value every cross-host comparison reads, and each of those
+        // comparisons would then have to strip it. #84's `sid=split` is not a
+        // counter-example: there the identity is genuinely not single-valued, so
+        // there is nothing to overload.
+        //
+        // `schain=main` = the applied tip IS the main-chain block at its height —
+        // this node is lagging at worst, and will catch up. `schain=fork` = it is
+        // not, so the state machine is on a branch it cannot rewind off and will
+        // never catch up. **That distinction is the requirement**: `slag=13` covers
+        // both states and they need opposite operator responses. Reading it against
+        // `slag=`: `slag=0 schain=main` healthy · `slag=13 schain=main` catching up,
+        // wait · `slag=13 schain=fork` **wedged, intervene**.
+        //
+        // Both always printed (the #130 (a) rule): a node always has an applied tip
+        // and always knows whether it is on its own main chain, so an omitted field
+        // would only force a special case on every parser in `qumbra-ops/`.
+        // `schain=-` is reserved for the one comparison that cannot be made — fork
+        // choice holding no block at the applied height — which is unreachable while
+        // fork choice is at or above the applied tip.
+        let applied = node.applied_tip();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -965,6 +1002,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             lag.blocks(),
             ic.unjudged_anchor,
             mready.field(),
+            applied.id_field(),
+            applied.chain_field(),
         )
     }
 
@@ -1021,11 +1060,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // Issue #130 (a): both views, and the buffer between them, read from the
         // adapter's single `state_lag()` rather than re-differenced here.
         let lag = node.state_lag();
+        // Issue #162 finding 6: the applied tip's identity and the wedge verdict come
+        // from the adapter's one `applied_tip()`, exactly as the heights come from its
+        // one `state_lag()` — the log line and the scrape cannot disagree about which
+        // block the state machine is on.
+        let applied = node.applied_tip();
         let (pending, pending_bytes) = node.pending_bodies();
         LiveGauges {
             tip_height: tip,
             state_tip: lag.state_tip,
             state_lag: lag.blocks(),
+            state_tip_id: applied.identity(),
+            state_tip_off_main_chain: applied.off_main_chain(),
             pending_bodies: pending as u64,
             pending_body_bytes: pending_bytes as u64,
             finalized_height: finalized,
@@ -3203,6 +3249,8 @@ mod tests {
                 "uanchor",
                 // ── appended by #106, at the end ──
                 "mready",
+                // ── appended by #162 finding 6, at the end ──
+                "stipid", "schain",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -3215,7 +3263,10 @@ mod tests {
         assert!(line.contains(" stip=1 slag=0"), "both views, and the zero gap: {line}");
         // #106: this rig has no seeds and no peers, so it is the whole net and says
         // which of the gate's permitting reasons applies.
-        assert!(line.ends_with(" mready=alone"), "the readiness verdict, last: {line}");
+        assert!(line.contains(" mready=alone "), "the readiness verdict: {line}");
+        // #162 finding 6: this node mined and applied its own tip, so the applied tip
+        // IS the main-chain block at its height.
+        assert!(line.ends_with(" schain=main"), "the wedge verdict, last: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
