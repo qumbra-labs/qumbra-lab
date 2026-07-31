@@ -128,6 +128,19 @@ impl Committee {
             None => false,
         }
     }
+
+    /// Whether `vote.signature` is a valid checkpoint signature by **any** member of
+    /// this committee, ignoring the claimed `vote.signer` index.
+    ///
+    /// Issue #164: after an epoch-boundary reseal two honest nodes can disagree about
+    /// which key sits at index `i`. Each then sees the other's correct vote fail
+    /// [`Self::verify_vote`] at the claimed index, while the signature still belongs
+    /// to a key on their own roster — just at a different slot. That case is
+    /// roster-positional, not a forgery.
+    pub fn any_member_signed(&self, cp: &Checkpoint, vote: &Vote) -> bool {
+        let msg = cp.signing_message();
+        self.members.iter().any(|k| k.verify(&msg, &vote.signature).is_ok())
+    }
 }
 
 /// A committee validator's signing side — holds the ML-DSA-65 secret key.

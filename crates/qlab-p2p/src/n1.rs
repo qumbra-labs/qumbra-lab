@@ -126,10 +126,33 @@ pub enum VotesOutcome {
     /// No new information — already tallied, already finalized, or out of the tally
     /// window. Do NOT relay, do NOT penalise.
     Stale,
-    /// The set carried a forged signature, an unknown signer index, or duplicate-
-    /// signer padding — penalise the sender (task-book S5). A well-formed partial set
-    /// (valid sigs, distinct in-committee signers, merely below quorum) is never this.
+    /// Intrinsic badness under this node's roster: duplicate-signer padding, or a
+    /// signature no roster member produced. Penalise the sender (task-book S5).
+    ///
+    /// **Not** an unknown signer index, and **not** a signature that verifies under
+    /// a different roster slot than the one claimed — those are [`Self::Unjudged`]
+    /// (issue #164 / the #134 Intrinsic·Positional split, one layer up).
     Invalid,
+    /// This node **cannot judge** the vote against its own roster (issue #164).
+    ///
+    /// The verdict depends on the receiver's membership: an index outside this
+    /// roster, or a signature that belongs to a key at a *different* index after a
+    /// reseal. Two honest nodes that disagree about a tombstone produce exactly
+    /// this for each other's correct votes at the next epoch boundary. Do NOT
+    /// relay, do NOT penalise — same rule [`IngestOutcome::Ignored`] encodes for
+    /// unjudged bodies (#134).
+    Unjudged,
+}
+
+impl VotesOutcome {
+    /// Whether the **sender** is at fault and should be penalized.
+    ///
+    /// Only [`Self::Invalid`]. [`Self::Unjudged`] is deliberately not a fault: the
+    /// receiver's roster is what failed to resolve the vote, and charging for that
+    /// bans honest peers that simply disagree about membership (issue #164).
+    pub fn is_peer_fault(&self) -> bool {
+        matches!(self, VotesOutcome::Invalid)
+    }
 }
 
 /// Read-only view of the chain — the primitives sync/relay/serving need.
@@ -223,6 +246,8 @@ pub trait CheckpointIngest {
             }
             VotesOutcome::Stale => IngestOutcome::Duplicate,
             VotesOutcome::Invalid => IngestOutcome::Rejected("invalid vote"),
+            // Same statement as #134's unjudged body: refuse, do not charge.
+            VotesOutcome::Unjudged => IngestOutcome::Ignored("unjudged vote: roster cannot resolve"),
         }
     }
 
@@ -422,7 +447,10 @@ impl CheckpointIngest for StubNode {
         let tip = self.chain.tip_height();
 
         // Verify + active-filter against THIS height's epoch roster (frozen §4:
-        // tombstoned/jailed excluded BEFORE the count; forged/unknown/dup penalised).
+        // tombstoned/jailed excluded BEFORE the count). Issue #164 splits the old
+        // catch-all `Invalid`: unknown index / roster-shifted signature are
+        // Unjudged (positional — do not penalise); only duplicate padding and a
+        // signature no roster member produced are Invalid (intrinsic).
         // `committee` is cloned so the immutable borrow of `self.committee` ends before
         // the mutable finalization ops.
         let (committee, quorum, active_kept) = {
@@ -432,13 +460,17 @@ impl CheckpointIngest for StubNode {
             let mut active_kept: Vec<Vote> = Vec::new();
             for v in votes {
                 if committee.member(v.signer).is_none() {
-                    return VotesOutcome::Invalid; // unknown signer index
+                    return VotesOutcome::Unjudged; // index does not resolve under my roster
                 }
                 if !seen_signer.insert(v.signer) {
                     return VotesOutcome::Invalid; // duplicate-signer padding
                 }
                 if !committee.verify_vote(cp, v) {
-                    return VotesOutcome::Invalid; // forged signature
+                    // Valid under a different slot ⇒ roster-order dependent (#164).
+                    if committee.any_member_signed(cp, v) {
+                        return VotesOutcome::Unjudged;
+                    }
+                    return VotesOutcome::Invalid; // no roster member produced this sig
                 }
                 if cstate.is_active(v.signer, cp.height) {
                     active_kept.push(v.clone());
