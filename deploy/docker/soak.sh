@@ -193,12 +193,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE="$SCRIPT_DIR/docker-compose.yml"
 NET_MAIN=qumbra_t0
 NET_SIDEB=qumbra_t0_sideb
-# The genesis identity MOVED in issue #101: the genesis file embeds the genesis
-# block, which gained `coinbase_rkm`. The T0 net on t0-wan-2 is still pinned to the
-# pre-#101 value 4a75b3b8…c2c3 and a
-# binary from this revision will refuse to start against it — deliberately, since
-# the block-body format changed and the two could not agree anyway.
-PINNED_GENESIS=8811d4e0ccdee702bafd4c92afad768495dc43360778072338aa140d87a73cff
+# The genesis identity has MOVED TWICE since the T0 net was minted, so this is the
+# value THIS TREE builds, not the value any host is running:
+#   issue #101 — StoredBlock gained `coinbase_rkm`, so the embedded genesis block
+#                changed (4a75b3b8…c2c3 → 8811d4e0…3cff).
+#   issue #115 — the genesis header now commits to its own body, deliberately, at
+#                the mint (8811d4e0…3cff → the value below).
+# The T0 net on t0-wan-2 is still pinned to the pre-#101 4a75b3b8…c2c3 and a binary
+# from this revision will refuse to start against it — deliberately, since the
+# block-body format changed too and the two could not agree anyway. Keep this in
+# step with `qumbra_node::genesis::tests::genesis_hash_is_pinned`; the operator-side
+# pin (qumbra-deploy OPERATOR.md) moves separately, in the same act as the mint.
+PINNED_GENESIS=bd3604804aade38ece989d87e72e3541cede939512f513840c5cdcf13986a66f
 NODES=(node0 node1 node2 node3)
 # The halt height compiled into the drill binaries (release.rs DRILL_HALT_HEIGHT).
 # On the checkpoint-cadence grid (16 = 2 x 8), deliberately low so each drill is
@@ -862,7 +868,9 @@ case "$cmd" in
     echo "   pinned T0 genesis hash:    $PINNED_GENESIS"
     [[ "$got" == "$PINNED_GENESIS" ]] \
       || die "GENESIS HASH MISMATCH — in-container genesis is not the frozen T0 genesis. STOP."
-    echo "   ✓ in-container genesis == pinned T0 genesis (8811d4e0…3cff)"
+    # Derived from $PINNED_GENESIS, never re-typed — the hardcoded literal that
+    # used to live here went stale twice (#101, #115) while the check above passed.
+    echo "   ✓ in-container genesis == pinned T0 genesis (${PINNED_GENESIS:0:8}…${PINNED_GENESIS: -4})"
     # Which advertised-address condition this net came up in, in the net's own output
     # (issue #107 step 1c). Asserted when the caller named a mode, printed either way:
     # a per-node NODE<i>_ADVERTISE override means the global env is not authoritative,

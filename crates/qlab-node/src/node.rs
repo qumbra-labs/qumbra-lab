@@ -114,17 +114,22 @@ fn hex8(h: &Hash32) -> String {
 /// Cost on replay is one Keccak pass over each block's bytes — bytes replay has
 /// already paid to read off disk and deserialize, which costs strictly more.
 ///
-/// **Genesis (height 0) is the single, deliberate exemption.** The devnet genesis
-/// header pins `tx_body_commitment = ZERO_HASH` (`header.rs:107`) while an empty
-/// body commits to `keccak256(coinbase_le)`, so genesis has never satisfied the
-/// invariant; its hash is the frozen, operator-supplied network identity
-/// (`4a75b3b8…c2c3`) and it is never sourced from the network. Changing it would
-/// mean a new network, which is out of this fix's scope — see issue #77 finding
-/// F1 and `qlab_devnet::body::tests::genesis_header_does_not_bind_its_empty_body`.
+/// **There is no height-0 exemption any more (issue #115).** Genesis used to be
+/// the single, deliberate exception: [`BlockHeader::genesis`] pinned
+/// `tx_body_commitment = ZERO_HASH` while the genesis body committed to
+/// `keccak256(coinbase_le ‖ rkm_le)`, so genesis structurally could not satisfy
+/// the invariant and this function returned `Ok` for it unconditionally. That
+/// exemption existed because genesis *predated* the binding (issue #77 F1), and
+/// while it stood, "this genesis block is not the body it claims to be" was not
+/// a property anything could express — a hand-assembled or disk-corrupted
+/// genesis record entered node state unchallenged, and the only thing standing
+/// between a node and a foreign genesis body was the `expected_genesis_hash`
+/// config pin, which covers the *file* and not a `StoredBlock` reconstructed
+/// past it. The 2026-07-31 mint set the genesis header's commitment to its real
+/// body commitment, so the exemption is deleted rather than special-cased and
+/// genesis is checked exactly like every other block — see
+/// `qlab_devnet::body::tests::genesis_header_binds_its_empty_body`.
 fn check_stored_binding(block: &StoredBlock) -> Result<(), NodeError> {
-    if block.header.height == 0 {
-        return Ok(()); // genesis — the documented exemption above
-    }
     let got = block.body().commitment();
     if block.header.tx_body_commitment != got {
         return Err(NodeError::BodyCommitmentMismatch {
@@ -249,6 +254,16 @@ impl MemNode {
 
     fn from_genesis(genesis: StoredBlock, dir: Option<PathBuf>) -> Self {
         assert_eq!(genesis.header.height, 0, "genesis height must be 0");
+        // Issue #115: genesis is bound to its body like every other block, and
+        // this is the one seam a genesis enters by without passing
+        // `check_stored_binding` (it is put straight into the chain store).
+        // Panicking matches the height assertion above — the genesis block is
+        // locally built or operator-supplied, never network input.
+        assert_eq!(
+            genesis.header.tx_body_commitment,
+            genesis.body().commitment(),
+            "genesis must bind its own body"
+        );
         let commitments = MemCommitmentStore::default();
         let chain = MemChainStore::new(genesis);
         let mut roots_by_height = BTreeMap::new();
@@ -687,22 +702,88 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Genesis is the one exemption, and it is exercised on every single startup:
-    /// its header pins `ZERO_HASH` while an empty body hashes to
-    /// `keccak256(coinbase_le)`. Locked so the exemption cannot be deleted without
-    /// this failing loudly.
+    /// **Issue #115 — the property the height-0 exemption made inexpressible.**
+    ///
+    /// A genesis whose body is not the body its header commits to is rejected, at
+    /// height 0, by the same guard every other block passes. Two mismatches are
+    /// exercised because they fail differently in the wild: (a) the *pre-#115
+    /// genesis itself* — an honest empty body under a header pinning `ZERO_HASH`,
+    /// which is what a node built before this change writes into its log; and
+    /// (b) an honest genesis header carrying a foreign body, which is what a
+    /// hand-assembled `StoredBlock` or a corrupted log record looks like.
+    ///
+    /// While the exemption stood, both returned `Ok`.
     #[test]
-    fn genesis_is_exempt_from_the_binding_guard() {
+    fn a_genesis_that_is_not_its_own_body_is_rejected() {
         let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
-        assert_ne!(
+
+        // The correct genesis binds its own body and passes the guard.
+        assert_eq!(
             genesis.header.tx_body_commitment,
             genesis.body().commitment(),
-            "genesis really does not satisfy the invariant"
+            "genesis satisfies the invariant since #115"
         );
-        assert!(check_stored_binding(&genesis).is_ok(), "…and is exempt by height");
-        // Nothing above height 0 inherits the exemption.
-        let mut not_genesis = genesis.clone();
-        not_genesis.header.height = 1;
-        assert!(check_stored_binding(&not_genesis).is_err());
+        assert!(check_stored_binding(&genesis).is_ok());
+
+        // (a) the pre-#115 genesis header: ZERO_HASH over the same empty body.
+        let mut pre_115 = genesis.clone();
+        pre_115.header.tx_body_commitment = qlab_devnet::header::ZERO_HASH;
+        assert!(
+            matches!(
+                check_stored_binding(&pre_115),
+                Err(NodeError::BodyCommitmentMismatch { height: 0, .. })
+            ),
+            "the pre-#115 genesis must not enter node state"
+        );
+
+        // (b) the honest genesis header over a foreign body.
+        let mut foreign_body = genesis.clone();
+        foreign_body.coinbase = 1; // any body edit moves the commitment
+        assert!(matches!(
+            check_stored_binding(&foreign_body),
+            Err(NodeError::BodyCommitmentMismatch { height: 0, .. })
+        ));
+
+        // The guard no longer reads the height at all: the same mismatched pair
+        // is rejected identically at height 1, and the *correct* pair is accepted
+        // at height 0. Before #115 the first of these passed and the second was
+        // waved through unchecked.
+        let mut mismatch_at_1 = pre_115.clone();
+        mismatch_at_1.header.height = 1;
+        assert!(matches!(
+            check_stored_binding(&mismatch_at_1),
+            Err(NodeError::BodyCommitmentMismatch { height: 1, .. })
+        ));
+    }
+
+    /// A mismatched genesis is refused at **construction**, not only at the
+    /// state-mutation funnel — the seam a node actually starts from. Matches the
+    /// pre-existing `genesis height must be 0` assertion in the same function:
+    /// the genesis block is locally constructed or operator-supplied, never
+    /// network input, so a mismatch is a build/operator error and panicking is
+    /// the loudest available refusal at a seam whose callers do not return
+    /// `Result` ([`MemNode::in_memory`]).
+    #[test]
+    #[should_panic(expected = "genesis must bind its own body")]
+    fn a_node_refuses_to_start_from_a_mismatched_genesis() {
+        let mut bad = genesis_block(GENESIS_DIFFICULTY, 0);
+        bad.header.tx_body_commitment = qlab_devnet::header::ZERO_HASH;
+        let _ = MemNode::in_memory(bad);
+    }
+
+    /// A correct genesis still constructs, verifies and applies a child — the
+    /// positive half of #115's acceptance, so "reject everything" cannot pass.
+    #[test]
+    fn a_correct_genesis_constructs_and_extends() {
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let g_header = genesis.header();
+        let mut node = MemNode::in_memory(genesis);
+        node.finalize(g_header.header_hash()).unwrap();
+        let root = node.commitment_root();
+
+        let body = BlockBody { txs: vec![tx(root, 21)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let header = child_committing_to(&g_header, &body);
+        node.apply_block(header, body, &MockVerifier).expect("child applies over genesis");
+        assert_eq!(node.tip_height(), 1);
     }
 }

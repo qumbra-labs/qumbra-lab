@@ -13,17 +13,18 @@
 //! rehearsal fields ([`GenesisFile::network`], [`GenesisFile::genesis_difficulty`])
 //! are `[devnet-placeholder]`, not consensus.
 //!
-//! ## 🔴 Owed at the next genesis mint (T1) — issue #77 F1
-//! The genesis header pins `tx_body_commitment = ZERO_HASH` while its empty body
-//! commits to `keccak256(coinbase_le)`, so **genesis is the one block that does
-//! not satisfy the header/body binding** every other block is now held to. It is
-//! safe today only because a *stronger* check covers the same ground: every node
-//! pins `expected_genesis_hash` and refuses to start against a different genesis
-//! — the binding protects blocks that arrive from the network, and genesis never
-//! does. Fixing it changes the genesis hash and therefore the network, so it was
-//! deferred rather than dismissed. **Minting a new genesis is the moment it is
-//! free: set the header's commitment to the real body commitment and delete the
-//! height-0 exemption in `qlab_node::node::check_stored_binding`.**
+//! ## ✅ Paid at the 2026-07-31 mint — issue #115, closing issue #77 F1
+//! The genesis header used to pin `tx_body_commitment = ZERO_HASH` while its
+//! empty body committed to `keccak256(coinbase_le ‖ rkm_le)`, so **genesis was
+//! the one block that did not satisfy the header/body binding** every other block
+//! is held to, and `qlab_node::node::check_stored_binding` carried a height-0
+//! exemption for it. That was safe only because a *stronger* check covered the
+//! same ground: every node pins `expected_genesis_hash` and refuses to start
+//! against a different genesis. Fixing it moved the genesis hash and therefore
+//! the network identity, so it waited for a mint — and this is that mint. The
+//! header now commits to the real body commitment, the exemption is **deleted**
+//! rather than special-cased, and the config pin is a second independent gate
+//! rather than the only one.
 //!
 //! ## Committee keys — the T0 rehearsal arrangement (item 4)
 //! Genesis committee₀ is the frozen N=21 / quorum 15. For the T0 rehearsal the
@@ -283,40 +284,48 @@ impl KeyFile {
 /// format is `[full-M8]`, NOT frozen); the [`frozen`](Self::frozen) table it
 /// carries IS the binding FROZEN v1.0 consensus set.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-/// (issue #101) **This file's hash changed, so the network identity changed.**
+/// **This file's hash is the network identity, and it has moved twice.**
 ///
 /// The genesis hash is `keccak256` over this file's bincode, and the file embeds
-/// the genesis block as a [`StoredBlock`], which gained `coinbase_rkm`. So:
+/// the genesis block as a [`StoredBlock`]:
 ///
 /// ```text
 ///   pre-#101:  4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3
 ///   post-#101: 8811d4e0ccdee702bafd4c92afad768495dc43360778072338aa140d87a73cff
+///   post-#115: bd3604804aade38ece989d87e72e3541cede939512f513840c5cdcf13986a66f
 /// ```
 ///
-/// (Both `coinbase_rkm` and the `format_version` bump below feed that value; the
-/// intermediate `44f7d464…` — the field alone, before the version bump — is not
-/// an identity any build produces and is named here only so the two causes are
-/// not mistaken for one.)
+/// **#101 — `coinbase_rkm`, a consequence rather than a decision.** [`StoredBlock`]
+/// gained the field, so the embedded genesis block's bytes changed. (Both
+/// `coinbase_rkm` and the `format_version` bump fed that value; the intermediate
+/// `44f7d464…` — the field alone, before the version bump — is not an identity any
+/// build produces and is named here only so the two causes are not mistaken for
+/// one.) A node built from that revision could not join the pre-#101 T0 net
+/// whatever the genesis hash said: the block-body commitment preimage changed
+/// (`qlab_devnet::body`), so #79's header/body binding rejects every block across
+/// the boundary in both directions. The identity change did not create that
+/// incompatibility — it made it fail at **startup**, with `WrongGenesisHash`,
+/// instead of silently at the first block.
 ///
-/// **This is a consequence, not a decision.** A node built from this revision
-/// cannot join the T0 net whatever the genesis hash says: the block-body
-/// commitment preimage changed (`qlab_devnet::body`), so #79's header/body binding
-/// rejects every block across the boundary in both directions. The identity change
-/// does not create that incompatibility — it makes it fail at **startup**, with
-/// `WrongGenesisHash`, instead of silently at the first block.
+/// **#115 — genesis binds its own body, and this one IS a decision.** The genesis
+/// header's `tx_body_commitment` moved from `ZERO_HASH` to the genesis body's real
+/// commitment, so the embedded block's bytes — and this file's hash — moved again.
+/// It was deliberately held for a mint (see issue #115): the identity is changing
+/// at the mint anyway, so the change costs nothing here and would be a gratuitous
+/// network-identity change at any other time. What it buys is that "this genesis
+/// is not the body it claims to be" became an expressible, checked property; while
+/// the height-0 exemption stood, it was not.
 ///
-/// A running net crosses this the way `committee-and-governance` §4 says: the
-/// halt-height mechanism (#74/PR #76), which is drilled but has never been used in
-/// anger. That is a deployment question, and it is not this baton's.
+/// Note the two are different *kinds* of move. #101 changed the **body preimage**,
+/// so every block's commitment changed. #115 changed **only what the genesis
+/// header commits to** — the body preimage is untouched, and
+/// `qlab_devnet::body::tests::golden_body_commitment_bytes` and
+/// `golden_empty_body_commitment_bytes` both pass unmodified across it.
 ///
-/// **Not done here, deliberately:** `qlab_devnet::header`'s F1 note says the next
-/// genesis mint is the free moment to set `tx_body_commitment` to the real body
-/// commitment and delete the height-0 exemption in
-/// `qlab_node::node::check_stored_binding`. The identity is moving anyway, so the
-/// moment is arguably here — but "the hash moved as a side effect of a body-format
-/// change" is not the same event as "we deliberately minted T1's genesis", and
-/// bundling a second consensus decision into a side effect is how the first one
-/// stops being reviewable. Flagged for the coordinator instead.
+/// A running net crosses either of these the way `committee-and-governance` §4
+/// says: the halt-height mechanism (#74/PR #76), which is drilled but has never
+/// been used in anger. That is a deployment question, and it is not this baton's —
+/// the operator-side pin moves in the same act as the mint.
 pub struct GenesisFile {
     /// Genesis-file format version (NOT frozen).
     pub format_version: u32,
@@ -625,24 +634,64 @@ mod tests {
     /// the key encoding, or the file shape is caught here (a deliberate change bumps
     /// this pin and `GENESIS_FORMAT_VERSION`). Every node computes this same value.
     ///
-    /// 🔴 **Changed by issue #101** — the file embeds the genesis block as a
-    /// `StoredBlock`, which gained `coinbase_rkm`. The pre-#101 value
-    /// `4a75b3b8…c2c3` is the identity of the T0 net now running on `t0-wan-2`;
-    /// a node built from this revision refuses to start against it, which is the
-    /// intended, loud outcome (see [`GenesisFile`]'s docs for why the two nets
-    /// were already incompatible before the hash moved).
+    /// 🔴 **Changed by issue #115** — the genesis header now commits to its own
+    /// body (`tx_body_commitment` moved off `ZERO_HASH`), so the embedded
+    /// `StoredBlock`'s bytes moved and with them this file's hash. That is the
+    /// intended outcome of the mint, not a regression: **a PR that changes how the
+    /// genesis header is formed and leaves this constant standing has not changed
+    /// it.** Previously changed by issue #101 (`coinbase_rkm` on `StoredBlock`).
+    ///
+    /// The two superseded values are kept visible so each break is a fact in the
+    /// tree rather than a deleted line in a diff. `4a75b3b8…c2c3` is the identity
+    /// of the T0 net that ran on `t0-wan-2`; a node built from this revision
+    /// refuses to start against either older net, which is the loud, intended
+    /// outcome (see [`GenesisFile`]'s docs for why they were already incompatible
+    /// before the hash moved).
     #[test]
     fn genesis_hash_is_pinned() {
         assert_eq!(
             GenesisFile::new_devnet_t0().hash_hex(),
-            "8811d4e0ccdee702bafd4c92afad768495dc43360778072338aa140d87a73cff",
+            "bd3604804aade38ece989d87e72e3541cede939512f513840c5cdcf13986a66f",
         );
-        // The identity the T0 net is pinned to, kept visible so the break is a
-        // fact in the tree rather than a deleted line in a diff.
-        assert_ne!(
-            GenesisFile::new_devnet_t0().hash_hex(),
+        for superseded in [
+            // pre-#101 — the T0 net on t0-wan-2.
             "4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3",
-            "pre-#101 T0 identity — see this test's doc comment"
+            // post-#101 / pre-#115 — never deployed.
+            "8811d4e0ccdee702bafd4c92afad768495dc43360778072338aa140d87a73cff",
+        ] {
+            assert_ne!(
+                GenesisFile::new_devnet_t0().hash_hex(),
+                superseded,
+                "superseded identity — see this test's doc comment"
+            );
+        }
+    }
+
+    /// The genesis block inside the file **satisfies the header/body binding**
+    /// (issue #115). This is the mint-time statement of the property: the file
+    /// every node loads carries a genesis that is its own body, so the binding
+    /// check `qlab_node` now applies at height 0 passes on the real artifact and
+    /// not merely on a test fixture.
+    #[test]
+    fn the_baked_genesis_block_binds_its_own_body() {
+        let gf = GenesisFile::new_devnet_t0();
+        let g = &gf.genesis_block;
+        assert_eq!(g.header.height, 0);
+        assert_eq!(
+            g.header.tx_body_commitment,
+            g.body().commitment(),
+            "the baked genesis block must bind its own body"
+        );
+        assert_ne!(
+            g.header.tx_body_commitment,
+            qlab_devnet::header::ZERO_HASH,
+            "ZERO_HASH is the pre-#115 value the height-0 exemption existed for"
+        );
+        // It survives the round-trip every node performs on startup.
+        let back = GenesisFile::from_bytes(&gf.to_bytes()).expect("decode");
+        assert_eq!(
+            back.genesis_block.header.tx_body_commitment,
+            back.genesis_block.body().commitment()
         );
     }
 

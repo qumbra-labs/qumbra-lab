@@ -59,15 +59,18 @@ pgrep -f qlab_bench     # must print nothing
 - **Full mesh**: each node dials the other three by compose service name. node0 is
   the de-facto bootstrap; node3 is the late-joiner in the sync scenario.
 - Genesis pinned to
-  `8811d4e0ccdee702bafd4c92afad768495dc43360778072338aa140d87a73cff`; every node
+  `bd3604804aade38ece989d87e72e3541cede939512f513840c5cdcf13986a66f`; every node
   byte-verifies it on startup (`expected_genesis_hash`).
-  **This value changed in issue #101** — the genesis file embeds the genesis block,
-  which gained `coinbase_rkm`. The live T0 net is pinned to the pre-#101
-  `4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3`; a binary from
-  this revision refuses to start against it, which is intended: the block-body
-  commitment preimage changed too, so the two builds could not agree on a block
-  even if they shared a genesis. Crossing that on a running net is the halt-height
-  mechanism's job (#74), not a redeploy.
+  **This value has moved twice**, and it is what *this tree* builds, not what any
+  host runs: issue #101 (the genesis file embeds the genesis block, which gained
+  `coinbase_rkm` — `4a75b3b8…c2c3` → `8811d4e0…3cff`) and issue #115 (the genesis
+  header now commits to its own body, taken deliberately at the mint —
+  `8811d4e0…3cff` → the value above). The live T0 net is still pinned to the
+  pre-#101 `4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3`; a
+  binary from this revision refuses to start against it, which is intended: the
+  block-body commitment preimage changed too, so the two builds could not agree on
+  a block even if they shared a genesis. Crossing that on a running net is the
+  halt-height mechanism's job (#74), not a redeploy.
 
 ## What this harness models about the T0 hosts
 
