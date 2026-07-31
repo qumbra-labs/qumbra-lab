@@ -549,6 +549,85 @@ mod tests {
         }
     }
 
+    /// **The test that makes the per-record epoch advance load-bearing, rather than
+    /// merely defensible.**
+    ///
+    /// Two punishments, one on each side of a boundary. The second names its signer by
+    /// the **epoch-1** index, which is not the epoch-0 index of the same key: the first
+    /// tombstone left the roster at the boundary (forced exit, §2) and every higher
+    /// index shifted down by one. A replay that adjudicated every record against the
+    /// genesis roster would therefore read the second record's signature against a
+    /// different member's key entirely — and, because `verify_equivocation` is two
+    /// signature checks and not a name lookup, it would come out as *unverified* and
+    /// the node would refuse to start on a ledger it wrote itself.
+    ///
+    /// The control is the live node again: same two punishments in the same order
+    /// without a restart.
+    #[test]
+    fn a_punishment_after_a_boundary_is_adjudicated_against_the_roster_that_owned_it() {
+        let sched = EpochSchedule::new(8);
+        let (committee, validators) = devnet_committee(5); // 0..4
+
+        // Live: tombstone member 2 in epoch 0, cross into epoch 1 (roster shrinks to
+        // 4 and reindexes: old 3 → new 2, old 4 → new 3), then tombstone the member
+        // now at index 3 — which is validator 4's key.
+        let mut live =
+            EpochCommittee::genesis(sched, CommitteeState::new(committee.clone(), BOND_AMOUNT));
+        let first = evidence(&validators, 2, 3); // epoch 0, index 2
+        let slash2 = equivocation_slash(live.state().bond(2).unwrap());
+        assert!(live.state_mut().tombstone(2, slash2));
+        live.advance_to(8);
+        assert_eq!(live.state().size(), 4);
+        // Sanity that the shift really happened — index 3 is validator 4's key now.
+        assert_eq!(
+            live.state().committee().member(3).unwrap().encode().to_vec(),
+            validators[4].verifying_key().encode().to_vec(),
+            "the boundary reindexed the roster; the test depends on it"
+        );
+        // The second record is signed by validator 4 but CLAIMS index 3, which is what
+        // an epoch-1 vote from that member looks like.
+        let second = {
+            let cp_a = Checkpoint::new(9, [0xC4; 32], [0xCC; 32]);
+            let cp_b = Checkpoint::new(9, [0xD4; 32], [0xDD; 32]);
+            let mut v_a = validators[4].sign_checkpoint(&cp_a);
+            let mut v_b = validators[4].sign_checkpoint(&cp_b);
+            v_a.signer = 3;
+            v_b.signer = 3;
+            EquivocationEvidence { vote_a: v_a, cp_a, vote_b: v_b, cp_b }
+        };
+        assert_eq!(verify_equivocation(&second, live.state().committee()), Ok(3));
+        let slash3 = equivocation_slash(live.state().bond(3).unwrap());
+        assert!(live.state_mut().tombstone(3, slash3));
+
+        // Restart: replay both records from the ledger onto a fresh genesis roster.
+        let mut restored =
+            EpochCommittee::genesis(sched, CommitteeState::new(committee, BOND_AMOUNT));
+        let mut records = vec![second, first];
+        sort_records(&mut records); // the ledger is replayed in slot order
+        assert_eq!(replay(&mut restored, &records, 9).unwrap(), vec![2, 3]);
+        restored.advance_to(9);
+
+        assert_eq!(restored.current_epoch(), live.current_epoch());
+        assert_eq!(restored.state().size(), live.state().size());
+        for i in 0..restored.state().size() {
+            assert_eq!(
+                restored.state().committee().member(i).unwrap().encode().to_vec(),
+                live.state().committee().member(i).unwrap().encode().to_vec(),
+                "member {i}"
+            );
+            assert_eq!(restored.state().status(i), live.state().status(i), "member {i} status");
+            assert_eq!(restored.state().bond(i), live.state().bond(i), "member {i} bond");
+            assert_eq!(restored.state().slashed(i), live.state().slashed(i), "member {i} slash");
+        }
+        // And the member punished in epoch 1 is the one that was actually punished:
+        // validator 4's key, not validator 3's.
+        assert_eq!(
+            restored.state().status(3),
+            Some(MemberStatus::Tombstoned),
+            "the epoch-1 punishment landed on the member the evidence names"
+        );
+    }
+
     /// A duplicated record neither slashes twice nor reports twice — `tombstone` is
     /// idempotent, and replay reports only what it newly applied.
     #[test]

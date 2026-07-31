@@ -435,7 +435,33 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         };
 
         // (5) Disk-backed adapter (restart-safe) + TCP transport + P2P node.
+        //     `committee` above is always a fresh all-Active genesis roster, because
+        //     that is all the genesis file describes. `open` replays this data dir's
+        //     committee-punishment ledger onto it (issue #133); a ledger it cannot
+        //     honour is an error here and the node does not start.
         let mut adapter = NodeAdapter::open(&config.data_dir, committee, pow, verifier, sim)?;
+        // Issue #133's counter. Printed on EVERY start, zero included: the silence
+        // after a restart is what made this class of defect invisible five times over,
+        // because a node that restored nothing and a node that had nothing to restore
+        // printed the same thing — nothing. Note what this line does NOT claim: it
+        // reports what THIS node knows. Two nodes that observed different evidence
+        // still disagree about who may sign, and now they disagree durably; agreement
+        // needs the evidence on chain, which is a payload change and out of scope.
+        {
+            let restore = adapter.punishment_restore();
+            println!("{}", restore.summary_line());
+            if restore.ledger_absent_on_populated_datadir {
+                println!(
+                    "⚠️  this data dir already holds chain history but carried NO committee-\
+                     punishment ledger, so it was written by a binary predating issue #133. \
+                     Whether a punishment was ever applied against it is UNKNOWABLE — a \
+                     tombstone from before this upgrade is gone, and this node starts with \
+                     none. An empty ledger has been written, so later restarts are \
+                     unambiguous. If this net has ever seen an equivocation, re-check this \
+                     node's committee view against a peer that did not restart."
+                );
+            }
+        }
         // The release's halt/rule schedule, installed once. No runtime path (H1).
         adapter.set_rule_schedule(rules);
         let transport = TcpTransport::bind(&config.listen_addr).map_err(RunError::Io)?;
@@ -1662,6 +1688,89 @@ mod tests {
             reopened.finalizers_mut()[0].sign(&conflicting).is_err(),
             "restarted finalizer must not equivocate against its persisted slot-8 vote"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **ACCEPTANCE (issue #133) through the real run path, on the real frozen
+    /// committee: a tombstoned member stays tombstoned across a restart.**
+    ///
+    /// The adapter-level tests in `qlab-p2p` prove the mechanism; this one proves the
+    /// *binary* uses it, on the N=21 genesis roster, because that is where the defect
+    /// lived: `RunningNode::start` builds `CommitteeState::new(genesis.committee(), …)`
+    /// — 21 Active, full bond, zero slashed — on **every** start, and nothing carried a
+    /// punishment past it. `reopened` below is a fresh `start` against the same data
+    /// dir, exactly as a restarted host is.
+    ///
+    /// The control is the assertion before the punishment: the freshly-started node
+    /// really does hold member 7 Active with a full bond, so what survives afterwards
+    /// cannot have come from the fixture.
+    #[test]
+    fn a_committee_punishment_survives_a_restart_through_the_run_path() {
+        use qlab_devnet::committee::{Checkpoint, MemberStatus};
+        use qlab_devnet::ebbflow::EquivocationEvidence;
+        use qlab_p2p::n1::CommitteeControl;
+
+        let (config, genesis, base) = rig("punish", true);
+        let validators = genesis.load_validators(&config.committee_key_paths).unwrap();
+        let bond = genesis
+            .frozen
+            .self_bond_qmb_steady
+            .saturating_mul(genesis.frozen.bessel_per_qmb);
+        let expect_slash = bond / 10;
+        let signer = 7usize;
+
+        // Two conflicting slot-8 checkpoints signed by member 7's real key — the whole
+        // adjudication, two signature checks, no human judgement (committee-gov §3).
+        let cp_a = Checkpoint::new(CHECKPOINT_CADENCE_BLOCKS, [0xA7; 32], [0xAA; 32]);
+        let cp_b = Checkpoint::new(CHECKPOINT_CADENCE_BLOCKS, [0xB7; 32], [0xBB; 32]);
+        let ev = EquivocationEvidence {
+            vote_a: validators[signer].sign_checkpoint(&cp_a),
+            cp_a,
+            vote_b: validators[signer].sign_checkpoint(&cp_b),
+            cp_b,
+        };
+
+        {
+            let mut node =
+                RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+            // Control: the frozen genesis roster is 21 Active with a full bond.
+            let cstate = node.p2p().node().committee().state();
+            assert_eq!(cstate.size(), 21);
+            assert_eq!(cstate.status(signer), Some(MemberStatus::Active));
+            assert_eq!(cstate.bond(signer), Some(bond));
+            assert_eq!(cstate.active_count(0), 21);
+
+            assert_eq!(node.p2p_mut().node_mut().apply_evidence(&ev), Some(signer));
+            assert!(node.p2p().node().is_tombstoned(signer));
+            node.save_snapshot().unwrap();
+        }
+
+        // --- the host restarts; only the data dir survived ---
+
+        let reopened =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let cstate = reopened.p2p().node().committee().state();
+        assert_eq!(
+            cstate.status(signer),
+            Some(MemberStatus::Tombstoned),
+            "FROZEN §4's permanent removal must be permanent per CHAIN, not per process"
+        );
+        assert!(!cstate.is_active(signer, u64::MAX), "never active again, at any height");
+        assert_eq!(cstate.bond(signer), Some(bond - expect_slash), "the bond is still slashed");
+        assert_eq!(cstate.slashed(signer), Some(expect_slash), "and the slash ledger agrees");
+        assert_eq!(
+            cstate.active_count(0),
+            20,
+            "the roster this node will count votes against matches a peer that never restarted"
+        );
+
+        // The counter #133 asked for: this restart says what it restored, by name.
+        let restore = reopened.p2p().node().punishment_restore();
+        assert_eq!(restore.records, 1);
+        assert_eq!(restore.tombstoned, vec![signer]);
+        assert!(!restore.ledger_absent_on_populated_datadir);
+        assert!(restore.summary_line().contains("1 tombstone(s) restored (members 7)"));
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
