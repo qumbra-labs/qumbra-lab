@@ -14,7 +14,7 @@ use qlab_devnet::fees::{posted_fee, ArityBucket};
 use qlab_devnet::header::{BlockHeader, Hash32};
 use qlab_devnet::params_devnet::GENESIS_DIFFICULTY;
 
-use qlab_node::{genesis_block, MemNode, NodeError, NodeState};
+use qlab_node::{genesis_block, ChainStore as _, MemNode, NodeError, NodeState};
 
 /// Mock verifier — a proof is "valid" iff its bytes are `b"ok"` (mirrors the
 /// devnet body-validation tests; the node is prover-free by design).
@@ -281,4 +281,232 @@ fn stored_block_round_trips_header_hash() {
     let child = BlockHeader::child_of(&g_header, 1, GENESIS_DIFFICULTY, [0xAB; 32]);
     let stored = qlab_node::StoredBlock::from_parts(&child, &BlockBody::default());
     assert_eq!(stored.header().header_hash(), child.header_hash());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #162 — the rewind, and the durability it has to keep.
+// ---------------------------------------------------------------------------
+
+/// Apply a block extending `parent` carrying one `marker`-tagged transaction, so
+/// two calls with different markers produce genuine siblings **whose state
+/// differs**: distinct nullifiers and distinct output commitments, i.e. a
+/// different tree root and a different spent set on each branch.
+///
+/// The coinbase note cannot serve here — it matures 144 blocks later, so at the
+/// heights a fork test runs at both branches have an identically empty tree, and a
+/// rewind that forgot to rebuild anything at all would pass.
+fn apply_marked(
+    node: &mut MemNode,
+    parent: &BlockHeader,
+    anchor: Hash32,
+    marker: u8,
+) -> (BlockHeader, Hash32) {
+    let body = BlockBody {
+        txs: vec![tx(anchor, vec![[marker; 32]], vec![[marker.wrapping_add(0x40); 32]])],
+        coinbase: 0,
+        coinbase_rkm: [marker as u64; 4],
+    };
+    let header =
+        BlockHeader::child_of(parent, parent.timestamp + 75, GENESIS_DIFFICULTY, body.commitment());
+    let hash = node.apply_block(header, body, &MockVerifier).expect("marked block applies");
+    (header, hash)
+}
+
+/// A disk-backed node whose genesis root is finalized, so the marked blocks above
+/// have a valid anchor. Returns the node, the genesis header and that root.
+fn node_with_finalized_genesis(dir: &PathBuf) -> (MemNode, BlockHeader, Hash32) {
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    let g_header = genesis.header();
+    let mut node = MemNode::open(dir, genesis).unwrap();
+    assert!(node.finalize(g_header.header_hash()).unwrap());
+    let root = node.commitment_root();
+    (node, g_header, root)
+}
+
+/// **A rewound node IS a from-genesis replay of the chain it kept** — the
+/// property that lets `rewind_to` re-fold through `apply_state` instead of
+/// carrying an inverse of the state transition.
+///
+/// Checked on state that actually differs across the fork: the two siblings pay
+/// their coinbase to different keys, so their matured leaves differ and a rewind
+/// that forgot to rebuild the tree would be caught by the root, not just by the
+/// tip pointer.
+#[test]
+fn a_rewound_node_equals_a_replay_of_the_chain_it_kept() {
+    let dir = temp_dir("i162-rewind-equals-replay");
+    let ref_dir = temp_dir("i162-rewind-reference");
+
+    // Reference: a node that only ever saw the winning branch.
+    let (mut reference, g_header, root) = node_with_finalized_genesis(&ref_dir);
+    let (w1_ref, _) = apply_marked(&mut reference, &g_header, root, 0xA1);
+    apply_marked(&mut reference, &w1_ref, root, 0xA2);
+
+    // Under test: applies the loser, rewinds to genesis, then the winner.
+    let (mut node, _, _) = node_with_finalized_genesis(&dir);
+    let (l1, l1_hash) = apply_marked(&mut node, &g_header, root, 0xB2);
+    assert_eq!(node.tip_hash(), l1_hash);
+    let losing_root = node.commitment_root();
+    assert!(node.is_spent(&[0xB2; 32]), "the loser's nullifier is in the set");
+
+    let report = node.rewind_to(g_header.header_hash()).expect("rewind to genesis");
+    assert_eq!(report.blocks_undone(), 1);
+    assert!(!report.is_noop());
+    assert_eq!(node.tip_height(), 0, "back at genesis");
+    assert_eq!(node.tip_hash(), g_header.header_hash());
+    assert!(!node.is_spent(&[0xB2; 32]), "and the nullifier set came back with it");
+    assert_eq!(node.commitment_count(), 0, "as did the tree");
+    assert_eq!(node.finalized_height(), Some(0), "finality survived the rewind");
+
+    let (w1, _) = apply_marked(&mut node, &g_header, root, 0xA1);
+    apply_marked(&mut node, &w1, root, 0xA2);
+
+    assert_eq!(node.tip_hash(), reference.tip_hash(), "same tip as the never-forked node");
+    assert_eq!(node.commitment_root(), reference.commitment_root(), "same tree root");
+    assert_eq!(node.commitment_count(), reference.commitment_count());
+    assert_eq!(node.nullifier_count(), reference.nullifier_count());
+    assert_ne!(losing_root, node.commitment_root(), "the two branches really differ");
+    assert!(!node.is_spent(&[0xB2; 32]), "the orphan's spend is not on this chain");
+    assert!(!node.chain().contains(&l1_hash), "the orphan is out of the block store");
+    assert_eq!(l1.height, 1);
+
+    // And the log, which still holds the orphan, replays to the same place.
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    let replayed = MemNode::replay(&dir, genesis.clone()).expect("replay");
+    assert_eq!(replayed.tip_hash(), node.tip_hash());
+    assert_eq!(replayed.commitment_root(), node.commitment_root());
+    assert!(!replayed.is_spent(&[0xB2; 32]));
+    assert!(!replayed.chain().contains(&l1_hash), "replay did not resurrect it either");
+    let opened = MemNode::open(&dir, genesis).expect("open");
+    assert_eq!(opened.tip_hash(), node.tip_hash(), "open == replay");
+    assert_eq!(opened.commitment_root(), node.commitment_root());
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&ref_dir).ok();
+}
+
+/// **A snapshot taken on the branch that then lost is not honoured** — it is
+/// discarded for a full replay, not read.
+///
+/// Before #162 the snapshot's agreement with the log held by construction: both
+/// the log and the applied chain were append-only, so reconstructing the log
+/// prefix at or below `applied_height` could only land on `snap.tip`. A rewind is
+/// the first thing that breaks it, and the failure would have been silent and
+/// severe: the snapshot's commitment tree and nullifier set are the LOSING
+/// branch's, and every anchor answer downstream would have been computed against
+/// them.
+#[test]
+fn a_snapshot_for_a_branch_the_log_abandoned_is_discarded_not_honoured() {
+    let dir = temp_dir("i162-stale-branch-snapshot");
+    let (mut node, g_header, root) = node_with_finalized_genesis(&dir);
+
+    let (_l1, l1_hash) = apply_marked(&mut node, &g_header, root, 0xB2);
+    // The snapshot is written HERE — on the branch that is about to lose.
+    node.save_snapshot().expect("snapshot on the losing branch");
+    let losing_root = node.commitment_root();
+
+    node.rewind_to(g_header.header_hash()).expect("rewind");
+    let (w1, _) = apply_marked(&mut node, &g_header, root, 0xA1);
+    apply_marked(&mut node, &w1, root, 0xA2);
+    let live_tip = node.tip_hash();
+    let live_root = node.commitment_root();
+    assert_ne!(live_root, losing_root);
+    drop(node);
+
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    let opened = MemNode::open(&dir, genesis.clone()).expect("open");
+    assert_eq!(
+        opened.recovery_report().snapshot_height,
+        None,
+        "the snapshot was not used — its tip is not where this log's prefix ends"
+    );
+    assert_eq!(opened.tip_hash(), live_tip, "and the resume landed on the winner");
+    assert_eq!(opened.commitment_root(), live_root);
+    assert!(!opened.is_spent(&[0xB2; 32]), "the losing branch's spend did not come back");
+    assert!(!opened.chain().contains(&l1_hash));
+
+    let replayed = MemNode::replay(&dir, genesis).expect("replay");
+    assert_eq!(opened.tip_hash(), replayed.tip_hash(), "open == replay");
+    assert_eq!(opened.commitment_root(), replayed.commitment_root());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// **A snapshot that the log DOES corroborate is still used** — the positive half,
+/// so "always full replay" cannot pass the test above.
+///
+/// The rewind happens *inside* the snapshot prefix here: the snapshot is taken
+/// after the rejoin, so reconstructing the prefix has to follow the same rewind at
+/// the chain-store layer and still land on `snap.tip`.
+#[test]
+fn a_snapshot_taken_after_a_rewind_is_still_a_fast_path() {
+    let dir = temp_dir("i162-post-rewind-snapshot");
+    let (mut node, g_header, root) = node_with_finalized_genesis(&dir);
+
+    let (_l1, l1_hash) = apply_marked(&mut node, &g_header, root, 0xB2);
+    node.rewind_to(g_header.header_hash()).expect("rewind");
+    let (w1, _) = apply_marked(&mut node, &g_header, root, 0xA1);
+    let (w2, _) = apply_marked(&mut node, &w1, root, 0xA2);
+    node.save_snapshot().expect("snapshot after the rejoin");
+    let live_root = node.commitment_root();
+    drop(node);
+
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    let opened = MemNode::open(&dir, genesis.clone()).expect("open");
+    assert_eq!(
+        opened.recovery_report().snapshot_height,
+        Some(2),
+        "the snapshot IS honoured — the prefix reconstruction followed the rewind"
+    );
+    assert_eq!(opened.tip_hash(), w2.header_hash());
+    assert_eq!(opened.commitment_root(), live_root);
+    assert!(!opened.chain().contains(&l1_hash), "and the orphan stayed out");
+
+    let replayed = MemNode::replay(&dir, genesis).expect("replay");
+    assert_eq!(opened.tip_hash(), replayed.tip_hash(), "open == replay");
+    assert_eq!(opened.commitment_root(), replayed.commitment_root());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// **Every rewind refusal leaves the node exactly as it was.**
+///
+/// The finality crossing is covered at the adapter (where a real committee quorum
+/// finalizes); this pins the other two refusals and, for all three, the fact that
+/// nothing was mutated on the way to saying no.
+#[test]
+fn a_refused_rewind_mutates_nothing() {
+    use qlab_node::RewindError;
+
+    let dir = temp_dir("i162-refusals");
+    let (mut node, g_header, root) = node_with_finalized_genesis(&dir);
+    let (h1, hash1) = apply_marked(&mut node, &g_header, root, 0xA1);
+    let (_h2, hash2) = apply_marked(&mut node, &h1, root, 0xA2);
+    let tree_root = node.commitment_root();
+
+    // Unknown: a hash nobody has ever seen.
+    assert!(matches!(
+        node.rewind_to([0x77; 32]),
+        Err(NodeError::Rewind(RewindError::UnknownTarget))
+    ));
+
+    // A real block that this node never applied. `MemNode`'s block store only ever
+    // holds one linear chain, so from here a foreign sibling is UNKNOWN rather than
+    // not-an-ancestor — the two refusals are reachable from different layers, and
+    // `NotAnAncestorOfTip` is pinned where a side branch can actually exist, in
+    // `store::tests::a_rewind_refuses_a_target_off_the_tips_own_ancestry`.
+    let side_dir = temp_dir("i162-refusals-side");
+    let (mut other, _, side_root) = node_with_finalized_genesis(&side_dir);
+    let (_s1, side_hash) = apply_marked(&mut other, &g_header, side_root, 0xB2);
+    assert_ne!(side_hash, hash1);
+    assert!(matches!(
+        node.rewind_to(side_hash),
+        Err(NodeError::Rewind(RewindError::UnknownTarget))
+    ));
+
+    // Every refusal above, and the state is untouched.
+    assert_eq!(node.tip_hash(), hash2);
+    assert_eq!(node.tip_height(), 2);
+    assert_eq!(node.commitment_root(), tree_root);
+    assert!(node.chain().contains(&hash1));
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&side_dir).ok();
 }

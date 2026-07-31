@@ -218,6 +218,28 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
 pub const MAX_PENDING_BODY_HEIGHTS: u64 = 1024;
 
+/// **How far below its applied tip this node will hold material to rewind onto**
+/// (issue #162) — the depth of divergence it is prepared to recover from without a
+/// re-sync.
+///
+/// It is the counterpart to [`MAX_PENDING_BODY_HEIGHTS`] on the other side of the
+/// applied tip, and it exists because #162's fix requires holding bodies at and
+/// below that tip: without a floor, "hold the sibling" would mean "hold every fork
+/// anyone ever offered", and the entry cap would be spent on ancient branches
+/// instead of on the gap.
+///
+/// **8 × the checkpoint cadence (`CHECKPOINT_CADENCE_BLOCKS` = 8).** The cadence is
+/// the natural unit: a block more than a few cadences below the tip is finalized on
+/// a healthy net, and [`qlab_node::MemNode::rewind_to`] refuses to cross the
+/// finalized head, so material below that is unusable by construction. The ×8 is
+/// headroom for a *stalled* committee — the one regime in which nothing finalizes
+/// and a divergence can legitimately run deep — and it is not derived from any
+/// measurement of a real reorg, because this net has not produced one to measure.
+/// The observed T0 wedge had a fork depth of 1.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_REWIND_DEPTH: u64 = 8 * qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
+
 /// Hard entry cap on the pending-body window (issue #130 (a)).
 pub const MAX_PENDING_BODIES: usize = 512;
 
@@ -714,18 +736,121 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         self.metrics.observe_lag_refusal(duty);
     }
 
-    /// Hold a body whose header this node already has, for application when the
-    /// state tip reaches its parent.
+    /// How many times this node's state machine has rewound onto the main chain,
+    /// and how many applied blocks that cost in total (issue #162).
     ///
-    /// Refused, silently and correctly, for anything that cannot become applicable:
-    /// a height at or below the applied tip (already folded in, or on a branch this
-    /// state machine will never rewind to), and a height beyond
-    /// [`MAX_PENDING_BODY_HEIGHTS`]. Over either cap, the **highest** held entry is
-    /// dropped: the lowest heights are the ones that close the gap, so the entry
-    /// furthest from applicable is the one worth least.
-    fn buffer_body(&mut self, header: BlockHeader, body: BlockBody) {
+    /// **Why a counter and not only `slag`.** After this fix the wedge's symptom
+    /// disappears, and a detector that has gone quiet because the defect is gone
+    /// looks exactly like one that has gone quiet because it broke. `slag` falling
+    /// is the *absence* of a symptom; this is the presence of the cure — the event
+    /// that says the state machine noticed it was on a losing branch and left it.
+    pub fn state_rewinds(&self) -> (u64, u64) {
+        (self.metrics.state_rewinds(), self.metrics.state_rewind_blocks())
+    }
+
+    /// The main-chain hash at `height`, walked back from the fork-choice tip.
+    ///
+    /// `ChainView::main_chain_hash_at` answers the same question by materialising
+    /// the whole main chain — `O(tip)` allocation per call, which is fine for the
+    /// once-per-telemetry-line reader it was written for and is not fine on the
+    /// ingest path. This walks `tip − height` parent links instead, so the common
+    /// case (a body at or just below the tip) is a handful of map lookups.
+    fn main_chain_ancestor(&self, height: u64) -> Option<Hash32> {
+        let tip_height = self.chain.tip_height();
+        if height > tip_height {
+            return None;
+        }
+        self.chain.ancestor(&self.chain.tip_hash(), tip_height - height)
+    }
+
+    /// **The block the state machine must rewind to before it can follow fork
+    /// choice** (issue #162): the highest block that is both an ancestor of the
+    /// applied tip and on the fork-choice main chain.
+    ///
+    /// When the applied tip is *on* the main chain — every node, almost always —
+    /// this is the applied tip itself and the walk exits on its first comparison,
+    /// so the ordinary path pays one lookup. When the state machine is stranded on
+    /// a losing sibling it walks the abandoned branch down to the fork point, which
+    /// is what makes the strand measurable rather than merely visible: the walk
+    /// length **is** the depth of the divergence.
+    ///
+    /// The walk reads the STATE machine's own block store, not fork choice's: the
+    /// abandoned branch is what it has applied, and that is the only side of the
+    /// fork this function needs to enumerate. Genesis is shared by construction, so
+    /// the walk always terminates.
+    fn state_fork_point(&self) -> Option<(u64, Hash32)> {
+        use qlab_node::ChainStore as _;
+        let mut hash = self.state.tip_hash();
+        let mut height = self.state.tip_height();
+        loop {
+            if self.main_chain_ancestor(height) == Some(hash) {
+                return Some((height, hash));
+            }
+            if height == 0 {
+                return None;
+            }
+            hash = self.state.chain().block(&hash)?.header.prev;
+            height -= 1;
+        }
+    }
+
+    /// **Whether a body is worth holding** — the single rule [`Self::buffer_body`]
+    /// admits against and [`Self::drain_pending_bodies`] retains against (issue
+    /// #162; one rule, so a body cannot be accepted by one and re-dropped by the
+    /// other on the same tick).
+    ///
+    /// The pre-#162 rule was `height > applied tip`, and its doc comment stated the
+    /// premise it rested on: a body at or below the applied tip is "already folded
+    /// in, or on a branch this state machine will never rewind to". The second
+    /// half was true only because `rewind_to` did not exist — and it was
+    /// load-bearing in the worst possible way. **A sibling body arrives at exactly
+    /// the applied tip's own height, and it arrives before fork choice has moved**:
+    /// at the moment the winner's block reaches a node that already applied the
+    /// loser, both branches carry equal work and the tie-break keeps the incumbent,
+    /// so the node still reads as on the main chain. Any rule phrased against
+    /// *where fork choice is now* discards the one object that will be needed one
+    /// block later, and re-announcement never brings it back (`GetData(Block)`
+    /// answers header-only — the #153 finding, untouched here).
+    ///
+    /// So the question is not "is this above my tip" but "have I applied this":
+    ///
+    /// - **applied already** ⇒ no. Read from the state machine's own block store,
+    ///   which after a rewind holds exactly the branch being applied — so this
+    ///   sharpens rather than approximates the old height test.
+    /// - **more than [`MAX_PENDING_BODY_HEIGHTS`] above the applied tip** ⇒ no.
+    ///   Unchanged: past it, a body cannot become applicable without material this
+    ///   node has no message to request (#130 (c)).
+    /// - **more than [`MAX_REWIND_DEPTH`] below the applied tip** ⇒ no. New, and it
+    ///   is what keeps "hold siblings" from meaning "hold every fork ever offered":
+    ///   below that depth this node will not rewind, so the body has no use.
+    /// - otherwise ⇒ yes.
+    ///
+    /// Genesis is excluded explicitly: it is applied at construction, never through
+    /// this window, and a genesis body in the queue would be a body that can never
+    /// drain.
+    fn is_body_worth_holding(&self, header: &BlockHeader) -> bool {
+        use qlab_node::ChainStore as _;
+        if header.height == 0 {
+            return false;
+        }
+        if self.state.chain().contains(&header.header_hash()) {
+            return false;
+        }
         let state_tip = self.state.tip_height();
-        if header.height <= state_tip || header.height > state_tip + MAX_PENDING_BODY_HEIGHTS {
+        header.height <= state_tip + MAX_PENDING_BODY_HEIGHTS
+            && header.height + MAX_REWIND_DEPTH > state_tip
+    }
+
+    /// Hold a body whose header this node already has, for application when the
+    /// state machine reaches its parent.
+    ///
+    /// Admission is [`Self::is_body_worth_holding`]. Over the entry or byte cap the
+    /// **highest** held entry is dropped: the lowest heights are the ones that close
+    /// the gap, so the entry furthest from applicable is the one worth least — and
+    /// since #162 that ordering also protects the sibling bodies at and just below
+    /// the applied tip, which are the ones a rewind needs.
+    fn buffer_body(&mut self, header: BlockHeader, body: BlockBody) {
+        if !self.is_body_worth_holding(&header) {
             return;
         }
         let key = (header.height, header.header_hash());
@@ -745,6 +870,64 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         }
     }
 
+    /// **Take the state machine off a losing branch and back onto the chain fork
+    /// choice is following** (issue #162) — the fix, at the seam that owns both
+    /// views.
+    ///
+    /// Fires only when the applied tip is *not* the main-chain block at its own
+    /// height: `state_lag()` cannot see this condition (a stranded node and a node
+    /// three blocks behind both print a nonzero `slag=`), and #168's
+    /// `applied_tip().off_main_chain()` is the comparison that can. This is the same
+    /// predicate, reached through [`Self::state_fork_point`] so the rewind target
+    /// and the detector cannot drift apart.
+    ///
+    /// **Gated on the rewind being immediately useful, and that gate is a
+    /// position.** A rewind is only taken when this node already holds the
+    /// main-chain body at `fork + 1`, so every rewind is followed in the same
+    /// `drain_pending_bodies` pass by at least one application. Rewinding
+    /// unconditionally would be defensible — fork choice has moved and the state
+    /// machine's job is to follow it — but it would trade a wedged node for a node
+    /// that has thrown away applied state and still cannot move, and it would let a
+    /// branch that flaps re-fold the retained chain on every flap. The refusal to
+    /// rewind without a way forward keeps the cost proportional to the progress.
+    ///
+    /// **What this does NOT do is decide the fork.** `ChainState`'s heaviest-chain
+    /// rule, gated by finality, has already chosen; the losing branch is losing
+    /// before this function is called, and `Node::rewind_to` refuses outright to
+    /// cross the finalized head. A rewind here can only discard blocks that fork
+    /// choice has already stopped counting.
+    ///
+    /// A refused rewind is recorded, not swallowed: the node stays exactly where it
+    /// was — wedged, with `schain=fork` still true and `slag=` still climbing, which
+    /// is the honest reading — and the refusal is attributable through the same lag
+    /// counter every other refused duty uses.
+    fn rejoin_main_chain(&mut self) {
+        let Some((fork_height, fork_hash)) = self.state_fork_point() else { return };
+        if fork_height == self.state.tip_height() {
+            return; // the applied tip is on the main chain — nothing to undo
+        }
+        // The rewind must be able to be followed by an application, or it is a
+        // pure loss. `fork + 1` on the main chain is the only block that can be.
+        let next = fork_height + 1;
+        let Some(next_hash) = self.main_chain_ancestor(next) else { return };
+        if !self.pending_bodies.contains_key(&(next, next_hash)) {
+            return;
+        }
+        match self.state.rewind_to(fork_hash) {
+            Ok(report) if !report.is_noop() => {
+                self.metrics.observe_state_rewind(report.blocks_undone());
+            }
+            Ok(_) => {}
+            // Unreachable as the guards above stand (the target is an ancestor of
+            // the applied tip, and it is on the main chain, which descends from
+            // finality). Kept as a refusal rather than an `expect` because the one
+            // way it could ever fire is the finality line, and a node that has
+            // convinced itself it must cross that line should stop, not panic and
+            // not proceed.
+            Err(_) => self.refuse_for_lag("rewind"),
+        }
+    }
+
     /// Apply every held body that has become applicable, **in ascending height
     /// order**, until none extends the state tip.
     ///
@@ -753,6 +936,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// arriving body can close a gap of many, and why the old "apply what this one
     /// announcement carried" shape could never catch up.
     fn drain_pending_bodies(&mut self) {
+        // Issue #162: before asking what is applicable, make sure the tip the
+        // question is asked against is on the chain this node is following.
+        self.rejoin_main_chain();
         while let Some(key) = self.next_applicable_body() {
             let (header, body) = self.pending_bodies.remove(&key).expect("just located");
             self.pending_bytes = self.pending_bytes.saturating_sub(body_weight(&body));
@@ -778,10 +964,22 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // The finalized head is part of the view that has to catch up, not a separate
         // concern — see `sync_state_finality`.
         self.sync_state_finality();
-        // Anything no longer reachable from the applied tip is dead weight.
-        let state_tip = self.state.tip_height();
-        self.pending_bodies.retain(|(height, _), body| {
-            let keep = *height > state_tip && *height <= state_tip + MAX_PENDING_BODY_HEIGHTS;
+        // Anything no longer worth holding is dead weight — and it is the SAME rule
+        // the entry gate admits against (issue #162). Two rules here would either
+        // re-drop the sibling body on the tick it was accepted, or accumulate bodies
+        // the entry gate would have refused.
+        //
+        // Evaluated against a snapshot of the rule's inputs rather than inside the
+        // closure, because `retain` holds the map borrowed.
+        let worth: Vec<(u64, Hash32)> = self
+            .pending_bodies
+            .iter()
+            .filter(|(_, (header, _))| self.is_body_worth_holding(header))
+            .map(|(key, _)| *key)
+            .collect();
+        let worth: std::collections::HashSet<(u64, Hash32)> = worth.into_iter().collect();
+        self.pending_bodies.retain(|key, body| {
+            let keep = worth.contains(key);
             if !keep {
                 // `pending_bytes` is maintained here rather than recomputed, so the
                 // two never drift.
@@ -1787,25 +1985,31 @@ mod tests {
         (a, b)
     }
 
-    /// **REPRODUCTION (issue #162): a state machine that applied a block which then
-    /// lost fork choice never rejoins the main chain, and `slag` grows without
-    /// bound.**
+    /// **THE FIX (issue #162): a state machine that applied a block which then lost
+    /// fork choice REJOINS the main chain — it does not merely buffer more.**
     ///
-    /// This is the live-net condition #130 (a) does not cover. (a)'s window closes
-    /// the gap between "the header is held" and "the body is applied" *on one
-    /// branch*. It says nothing about a state tip that is on the **wrong** branch,
-    /// and two guards make that state absorbing:
+    /// This is `PR #163`'s reproduction with every assertion about the wedge
+    /// inverted, deliberately kept as one test rather than added beside it: the two
+    /// cannot both be true, and leaving the red one in the tree next to a green one
+    /// would make the suite claim both. Its shape is the ingredient every
+    /// `mine_chain`-based test lacks — a competing block at a height the state
+    /// machine has already applied — and it fails on `main` today at the very first
+    /// changed line (`main` holds zero of the winning sibling's body; here it holds
+    /// one).
     ///
-    /// - `buffer_body` refuses a body at or below the applied tip, so the winning
-    ///   sibling's body — the one thing that could rebuild the state tip — is
-    ///   dropped silently;
-    /// - `next_applicable_body` matches only `header.prev == state.tip_hash()`, and
-    ///   no descendant of the winning sibling ever satisfies that.
+    /// The three things it pins, in order:
     ///
-    /// Underneath both, `qlab_node::Node::apply_block` extends the tip only
-    /// (`NodeError::NotExtendingTip`) — the state machine has no rewind at all.
+    /// 1. **The sibling body is HELD, at the moment it arrives, while both branches
+    ///    still carry equal work and this node still reads as on the main chain.**
+    ///    This is the load-bearing half. A rule phrased against where fork choice is
+    ///    *now* discards it here, one block before it is needed, and nothing brings
+    ///    it back (`GetData(Block)` answers header-only — #153's finding).
+    /// 2. **The state machine rewinds and re-applies** once fork choice moves, in
+    ///    the same ingest that moves it.
+    /// 3. **It ends converged**: `slag` zero, applied tip == fork-choice tip, and
+    ///    the duties it was refusing resume.
     #[test]
-    fn i162_a_state_machine_on_a_losing_sibling_never_rejoins_the_main_chain() {
+    fn i162_a_state_machine_on_a_losing_sibling_rejoins_the_main_chain() {
         let (mut winner, mut loser) = two_racers();
 
         // Both mine at height 1 before hearing the other — the four-way race a
@@ -1817,39 +2021,299 @@ mod tests {
         assert_ne!(wh1.header_hash(), lh1.header_hash(), "a genuine sibling race");
         assert_eq!(loser.state().tip_hash(), lh1.header_hash(), "it applied its own");
 
-        // The winner's height-1 block arrives after the loser applied its own. The
-        // header is new, so it is accepted into the header tree — and the BODY is
-        // dropped by `buffer_body`'s `height <= state_tip` guard, silently.
+        // (1) The winner's height-1 block arrives after the loser applied its own.
+        // Equal work, so the tie-break keeps the incumbent: fork choice has NOT
+        // moved, `schain=` still reads main, and nothing yet says this node is on
+        // the losing side. The body is held anyway — that is the fix.
         assert_eq!(loser.ingest_block(wh1, wb1.clone()), IngestOutcome::Accepted);
-        assert_eq!(loser.pending_bodies().0, 0, "the winning sibling's body was not even held");
+        assert_eq!(loser.chain().tip_hash(), lh1.header_hash(), "fork choice has not moved yet");
+        assert!(!loser.applied_tip().is_off_main_chain(), "and nothing yet says otherwise");
+        assert_eq!(
+            loser.pending_bodies().0,
+            1,
+            "the winning sibling's body is held BEFORE it is known to be the winner"
+        );
+        assert_eq!(loser.state().tip_hash(), lh1.header_hash(), "and nothing was rewound for it");
+        assert_eq!(loser.state_rewinds(), (0, 0), "a held body is not a rewind");
 
-        // The winner extends. Fork choice on the loser follows the taller branch —
-        // its CHAIN reorgs, its STATE cannot.
+        // (2) The winner extends. Fork choice on the loser follows the taller
+        // branch — and in the same ingest the state machine rewinds to the fork
+        // point and re-applies both winning blocks.
         let (wh2, wb2) = winner.mine_block().expect("mine");
         assert_eq!(winner.ingest_block(wh2, wb2.clone()), IngestOutcome::Accepted);
         assert_eq!(loser.ingest_block(wh2, wb2.clone()), IngestOutcome::Accepted);
         assert_eq!(loser.chain().tip_hash(), wh2.header_hash(), "fork choice moved");
-        assert_eq!(loser.state().tip_height(), 1, "the state machine did not");
-        assert_eq!(loser.state().tip_hash(), lh1.header_hash(), "still on the orphan");
+        assert_eq!(loser.state().tip_hash(), wh2.header_hash(), "and the state machine followed");
+        assert_eq!(loser.state().tip_height(), 2);
+        assert_eq!(
+            loser.state_rewinds(),
+            (1, 1),
+            "one rewind, one applied block undone — the depth of a sibling race"
+        );
 
-        // And it is absorbing: every further block on the winning branch is held
-        // and none is applicable, so `slag` tracks the block rate exactly as
-        // node2/node3 did on the 2026-07-31 T0 net.
+        // The abandoned sibling is gone from the state machine's block store, which
+        // is what let its own height be re-used. It is not served any more either:
+        // `stored_body` answers what this node has APPLIED (#135), and it has not.
+        use qlab_node::ChainStore as _;
+        assert!(!loser.state().chain().contains(&lh1.header_hash()), "the orphan was dropped");
+        assert!(loser.stored_body(&lh1.header_hash()).is_none(), "and is not served");
+        assert!(loser.stored_body(&wh1.header_hash()).is_some(), "the winner's is");
+        assert_eq!(lb1.coinbase_rkm, [0xB2; 4], "the orphan really was the loser's own block");
+
+        // (3) Converged, and it stays converged as the winner keeps extending.
         for _ in 0..6 {
             let (h, b) = winner.mine_block().expect("mine");
             assert_eq!(winner.ingest_block(h, b.clone()), IngestOutcome::Accepted);
             assert_eq!(loser.ingest_block(h, b), IngestOutcome::Accepted);
         }
         assert_eq!(loser.chain().tip_height(), 8);
-        assert_eq!(loser.state().tip_height(), 1, "frozen at the losing sibling's height");
-        assert_eq!(loser.state_lag().blocks(), 7, "slag, growing with the block rate");
-        assert!(loser.state_lag().is_lagging());
-        // Not one of the held bodies is applicable, and none ever will be.
-        assert_eq!(loser.pending_bodies().0, 7, "seven bodies held, none applicable");
-        assert_eq!(loser.ingest_counters().unjudged_anchor, 0, "and #134's path never fired");
-        // The duty refusals fire, which is why this is a liveness stop and not a
-        // safety break — and why the node stops mining and stops signing.
-        assert!(loser.mine_block().is_none(), "a lagging node does not mine");
+        assert_eq!(loser.state().tip_height(), 8, "the state machine is on the chain, not behind it");
+        assert_eq!(loser.state_lag().blocks(), 0, "slag zero");
+        assert!(!loser.state_lag().is_lagging());
+        assert_eq!(loser.pending_bodies(), (0, 0), "nothing left held, and no bytes leaked");
+        assert_eq!(loser.state_rewinds(), (1, 1), "and no further rewind was needed");
+        assert_eq!(loser.ingest_counters().unjudged_anchor, 0, "#134's path never fired");
+        assert_eq!(loser.lag_refusals("rewind"), 0, "no rewind was refused");
+        // The duties resume, which is the point: a node that cannot mine and cannot
+        // admit a transaction is the liveness stop this issue was filed for.
+        assert!(loser.mine_block().is_some(), "a converged node mines again");
+    }
+
+    /// **The slope, not the value (issue #162 acceptance item 2).**
+    ///
+    /// The production measurement that decided this issue was a *rate*: `slag`
+    /// climbing at 0.78/min against a 0.80 blocks/min block rate, i.e. at the
+    /// ceiling, for eleven hours. Nothing at ceiling slope recovers on its own, and
+    /// the recovery criterion is the mirror image — after the fix, `slag` under the
+    /// same load must climb **strictly slower than the block rate**, observable
+    /// without waiting for it to reach zero.
+    ///
+    /// So this measures a slope in blocks rather than in minutes, which is the same
+    /// quantity with the wall clock divided out: it drives the wedged node with N
+    /// main-chain blocks and asks how much `slag` grew. On `main` the answer is N
+    /// (slope 1.0, the ceiling). Here it is ≤ 0 — the fix does not merely slow the
+    /// climb, it reverses it inside one block.
+    #[test]
+    fn i162_the_slag_slope_falls_below_the_block_rate_within_one_block() {
+        let (mut winner, mut loser) = two_racers();
+        let (wh1, wb1) = winner.mine_block().expect("mine");
+        winner.ingest_block(wh1, wb1.clone());
+        let (lh1, lb1) = loser.mine_block().expect("mine");
+        loser.ingest_block(lh1, lb1);
+        loser.ingest_block(wh1, wb1);
+
+        // Drive the strand for one cadence of main-chain blocks, sampling `slag`
+        // after each — the in-process equivalent of T-ops' 20-minute sampler.
+        let mut slag = vec![loser.state_lag().blocks()];
+        for _ in 0..qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS {
+            let (h, b) = winner.mine_block().expect("mine");
+            winner.ingest_block(h, b.clone());
+            loser.ingest_block(h, b);
+            slag.push(loser.state_lag().blocks());
+        }
+        let blocks = slag.len() as u64 - 1;
+        let growth = slag.last().copied().expect("sampled") as i64 - slag[0] as i64;
+
+        // The criterion, stated as the issue states it.
+        assert!(
+            (growth as f64) / (blocks as f64) < 1.0,
+            "slag slope {growth}/{blocks} must be strictly below the block rate; \
+             samples {slag:?}"
+        );
+        // And the stronger fact the criterion deliberately does not require: it is
+        // not slower growth, it is no growth.
+        assert_eq!(slag.last().copied(), Some(0), "converged, not merely slowed: {slag:?}");
+        assert_eq!(
+            loser.state_rewinds().0,
+            1,
+            "one rewind did it — the counter is the positive signal that the wedge \
+             detector went quiet because the wedge went away"
+        );
+    }
+
+    /// **Acceptance item 5: the `PR #168` wedge detector still separates lagging
+    /// from stranded after the fix — and it goes quiet for the right reason.**
+    ///
+    /// A detector that stops firing because the defect is gone and one that stops
+    /// firing because it broke look identical from the outside, so this exercises
+    /// all three of its readings on the same tick:
+    ///
+    /// - a node whose state machine is genuinely behind on the SAME branch reads
+    ///   `slag>0 schain=main` — the detector is still capable of a nonzero `slag`;
+    /// - the node from the wedge reads `slag=0 schain=main` once it has rejoined —
+    ///   quiet, and the rewind counter says why;
+    /// - and `schain=fork` is still reachable, still off `slag` entirely, by
+    ///   holding the sibling body back so no rewind can fire.
+    #[test]
+    fn i162_the_wedge_detector_still_separates_lagging_from_stranded() {
+        // (a) Stranded, with the fix's material withheld: the detector fires.
+        let (mut winner, mut loser) = two_racers();
+        let (wh1, wb1) = winner.mine_block().expect("mine");
+        winner.ingest_block(wh1, wb1.clone());
+        let (lh1, lb1) = loser.mine_block().expect("mine");
+        loser.ingest_block(lh1, lb1);
+        // The HEADER only — this is the state a restarted node is in, since no peer
+        // will re-serve a historical body (#153's open finding). The rewind gate is
+        // "hold the body at fork+1", so withholding it withholds the recovery.
+        assert_eq!(loser.ingest_header(wh1), IngestOutcome::Accepted);
+        let (wh2, wb2) = winner.mine_block().expect("mine");
+        winner.ingest_block(wh2, wb2.clone());
+        loser.ingest_block(wh2, wb2);
+
+        let stranded = loser.applied_tip();
+        assert_eq!(stranded.chain_field(), qlab_node::APPLIED_TIP_OFF_MAIN, "schain=fork");
+        assert!(loser.state_lag().blocks() > 0, "and slag is nonzero");
+        assert_eq!(loser.state_rewinds(), (0, 0), "no rewind fired, so nothing is being claimed");
+        let stranded_id = stranded.identity();
+
+        // (b) Lagging on the SAME branch: nonzero slag, schain=main. Unchanged by
+        // this fix, and the contrast that makes (a) mean something.
+        let mut source = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let chain = mine_chain(&mut source, 3);
+        let mut follower = follower_with_headers_only(&chain);
+        assert!(follower.state_lag().blocks() > 0, "behind");
+        assert_eq!(
+            follower.applied_tip().chain_field(),
+            qlab_node::APPLIED_TIP_ON_MAIN,
+            "schain=main — behind is not stranded"
+        );
+
+        // (c) The same wedge, with the body in hand: quiet, and for the right
+        // reason. `stipid` moved off the orphan, which is the identity half of the
+        // detector doing its job rather than the detector going silent.
+        let (mut winner2, mut loser2) = two_racers();
+        let (w1, wb1b) = winner2.mine_block().expect("mine");
+        winner2.ingest_block(w1, wb1b.clone());
+        let (l1, lb1b) = loser2.mine_block().expect("mine");
+        loser2.ingest_block(l1, lb1b);
+        loser2.ingest_block(w1, wb1b);
+        let (w2, wb2b) = winner2.mine_block().expect("mine");
+        winner2.ingest_block(w2, wb2b.clone());
+        loser2.ingest_block(w2, wb2b);
+
+        let rejoined = loser2.applied_tip();
+        assert_eq!(rejoined.chain_field(), qlab_node::APPLIED_TIP_ON_MAIN, "schain=main");
+        assert_eq!(loser2.state_lag().blocks(), 0, "slag=0");
+        assert_eq!(loser2.state_rewinds(), (1, 1), "quiet BECAUSE the wedge was undone");
+        assert_ne!(
+            rejoined.identity(),
+            stranded_id,
+            "stipid moved off the orphan — the detector's identity half still answers"
+        );
+    }
+
+    /// **The rewind refuses to cross the finalized head — and that refusal is why
+    /// `finality.rs` and `recovery.rs` are untouched.**
+    ///
+    /// The gate is checked at the state machine, on a node whose finalized head is
+    /// its applied tip: no ancestor of that tip is a legal target, so every rewind
+    /// that would cross it is refused with the state left exactly as it was. This
+    /// is the one refusal that must never become an `expect`.
+    #[test]
+    fn i162_a_rewind_may_not_cross_the_finalized_head() {
+        use qlab_node::RewindError;
+
+        let (cstate, validators) = committee7();
+        let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, easy_sim());
+        let chain = mine_chain(&mut a, qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS as usize);
+        let height = a.chain().tip_height();
+        let (cp, votes) = a.make_checkpoint(height, &validators).expect("checkpoint");
+        assert!(
+            matches!(
+                a.ingest_checkpoint_votes(&cp, &votes),
+                VotesOutcome::Learned { finalized: true, .. }
+            ),
+            "the quorum finalizes"
+        );
+        assert_eq!(a.state().finalized_height(), Some(height), "the state machine finalized it");
+
+        let tip = a.state().tip_hash();
+        let parent = chain[chain.len() - 2].0.header_hash();
+        let root = a.chain().genesis_hash();
+
+        // One block back, and all the way to genesis: both are below the finalized
+        // head, and both are refused with the state untouched.
+        for target in [parent, root] {
+            let err = a.state_mut().rewind_to(target).expect_err("must refuse");
+            assert!(
+                matches!(
+                    err,
+                    qlab_node::NodeError::Rewind(RewindError::PastFinalized {
+                        finalized_height, ..
+                    }) if finalized_height == height
+                ),
+                "got {err}"
+            );
+            assert_eq!(a.state().tip_hash(), tip, "a refused rewind changes nothing");
+            assert_eq!(a.state().finalized_height(), Some(height));
+        }
+
+        // The finalized block itself is a legal target (rewinding TO finality is
+        // not rewinding PAST it) — the positive half, so "refuse everything" cannot
+        // pass this test.
+        let report = a.state_mut().rewind_to(tip).expect("rewinding to the tip is a no-op");
+        assert!(report.is_noop());
+        assert_eq!(a.state().tip_hash(), tip);
+        // …and an unknown target is refused as unknown, not as a finality crossing.
+        assert!(matches!(
+            a.state_mut().rewind_to([0x5a; 32]),
+            Err(qlab_node::NodeError::Rewind(RewindError::UnknownTarget))
+        ));
+    }
+
+    /// **A rewind survives the restart** — the durability half, and the reason the
+    /// block log needed no new record type.
+    ///
+    /// The log is append-only and stays so, but the applied chain is not any more.
+    /// A logged block whose `prev` is not the running tip can only mean the live
+    /// node rewound to that `prev` before applying it, and replay infers exactly
+    /// that. This drives a real wedge-and-rejoin on a disk-backed adapter, then
+    /// asserts the three durability facts that matter: `open` resumes on the
+    /// winning branch, `open == replay`, and the orphan is gone from both.
+    #[test]
+    fn i162_a_rewound_state_machine_replays_from_disk_onto_the_winning_branch() {
+        use qlab_node::ChainStore as _;
+
+        let dir = temp_dir("i162-rewind-replay");
+        let sim = easy_sim();
+        let mut loser =
+            NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, sim).expect("open");
+        loser.set_miner_rkm([0xB2; 4]);
+        let mut winner = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, sim);
+        winner.set_miner_rkm([0xA1; 4]);
+
+        let (wh1, wb1) = winner.mine_block().expect("mine");
+        winner.ingest_block(wh1, wb1.clone());
+        let (lh1, lb1) = loser.mine_block().expect("mine");
+        loser.ingest_block(lh1, lb1);
+        loser.ingest_block(wh1, wb1);
+        let (wh2, wb2) = winner.mine_block().expect("mine");
+        winner.ingest_block(wh2, wb2.clone());
+        loser.ingest_block(wh2, wb2);
+        assert_eq!(loser.state().tip_hash(), wh2.header_hash(), "rejoined live");
+        assert_eq!(loser.state_rewinds(), (1, 1));
+        let live_root = loser.state().commitment_root();
+        let live_count = loser.state().commitment_count();
+        loser.save_snapshot().expect("snapshot");
+        drop(loser);
+
+        // The log holds BOTH height-1 blocks — the orphan was never removed from it.
+        let genesis = genesis_block(sim.genesis_difficulty, 0);
+        for (what, node) in [
+            ("open", MemNode::open(&dir, genesis.clone()).expect("open")),
+            ("replay", MemNode::replay(&dir, genesis).expect("replay")),
+        ] {
+            assert_eq!(node.tip_hash(), wh2.header_hash(), "{what} resumed on the winner");
+            assert_eq!(node.tip_height(), 2, "{what} height");
+            assert_eq!(node.commitment_root(), live_root, "{what} tree root == live");
+            assert_eq!(node.commitment_count(), live_count, "{what} leaf count == live");
+            assert!(
+                !node.chain().contains(&lh1.header_hash()),
+                "{what} did not resurrect the orphan"
+            );
+            assert!(node.chain().contains(&wh1.header_hash()), "{what} holds the winner");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// **#135's durable serving path**: `stored_body` answers exactly the bodies
