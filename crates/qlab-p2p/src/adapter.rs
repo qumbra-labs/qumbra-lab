@@ -1740,6 +1740,84 @@ mod tests {
         assert_eq!(f.state().tip_hash(), f.chain().tip_hash(), "and to the same block");
     }
 
+    /// Two adapters on one genesis, each mining to its own payout key — so their
+    /// height-1 bodies differ and their height-1 headers are genuine siblings.
+    /// This is the shape every `mine_chain`-based test lacks: a competing block at
+    /// a height the state machine has already applied.
+    fn two_racers() -> (NodeAdapter<KeccakPow, MockVerifier>, NodeAdapter<KeccakPow, MockVerifier>)
+    {
+        let mut a = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let mut b = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        a.set_miner_rkm([0xA1; 4]);
+        b.set_miner_rkm([0xB2; 4]);
+        (a, b)
+    }
+
+    /// **REPRODUCTION (issue #162): a state machine that applied a block which then
+    /// lost fork choice never rejoins the main chain, and `slag` grows without
+    /// bound.**
+    ///
+    /// This is the live-net condition #130 (a) does not cover. (a)'s window closes
+    /// the gap between "the header is held" and "the body is applied" *on one
+    /// branch*. It says nothing about a state tip that is on the **wrong** branch,
+    /// and two guards make that state absorbing:
+    ///
+    /// - `buffer_body` refuses a body at or below the applied tip, so the winning
+    ///   sibling's body — the one thing that could rebuild the state tip — is
+    ///   dropped silently;
+    /// - `next_applicable_body` matches only `header.prev == state.tip_hash()`, and
+    ///   no descendant of the winning sibling ever satisfies that.
+    ///
+    /// Underneath both, `qlab_node::Node::apply_block` extends the tip only
+    /// (`NodeError::NotExtendingTip`) — the state machine has no rewind at all.
+    #[test]
+    fn i162_a_state_machine_on_a_losing_sibling_never_rejoins_the_main_chain() {
+        let (mut winner, mut loser) = two_racers();
+
+        // Both mine at height 1 before hearing the other — the four-way race a
+        // fresh net's genesis difficulty makes near-certain.
+        let (wh1, wb1) = winner.mine_block().expect("mine");
+        assert_eq!(winner.ingest_block(wh1, wb1.clone()), IngestOutcome::Accepted);
+        let (lh1, lb1) = loser.mine_block().expect("mine");
+        assert_eq!(loser.ingest_block(lh1, lb1.clone()), IngestOutcome::Accepted);
+        assert_ne!(wh1.header_hash(), lh1.header_hash(), "a genuine sibling race");
+        assert_eq!(loser.state().tip_hash(), lh1.header_hash(), "it applied its own");
+
+        // The winner's height-1 block arrives after the loser applied its own. The
+        // header is new, so it is accepted into the header tree — and the BODY is
+        // dropped by `buffer_body`'s `height <= state_tip` guard, silently.
+        assert_eq!(loser.ingest_block(wh1, wb1.clone()), IngestOutcome::Accepted);
+        assert_eq!(loser.pending_bodies().0, 0, "the winning sibling's body was not even held");
+
+        // The winner extends. Fork choice on the loser follows the taller branch —
+        // its CHAIN reorgs, its STATE cannot.
+        let (wh2, wb2) = winner.mine_block().expect("mine");
+        assert_eq!(winner.ingest_block(wh2, wb2.clone()), IngestOutcome::Accepted);
+        assert_eq!(loser.ingest_block(wh2, wb2.clone()), IngestOutcome::Accepted);
+        assert_eq!(loser.chain().tip_hash(), wh2.header_hash(), "fork choice moved");
+        assert_eq!(loser.state().tip_height(), 1, "the state machine did not");
+        assert_eq!(loser.state().tip_hash(), lh1.header_hash(), "still on the orphan");
+
+        // And it is absorbing: every further block on the winning branch is held
+        // and none is applicable, so `slag` tracks the block rate exactly as
+        // node2/node3 did on the 2026-07-31 T0 net.
+        for _ in 0..6 {
+            let (h, b) = winner.mine_block().expect("mine");
+            assert_eq!(winner.ingest_block(h, b.clone()), IngestOutcome::Accepted);
+            assert_eq!(loser.ingest_block(h, b), IngestOutcome::Accepted);
+        }
+        assert_eq!(loser.chain().tip_height(), 8);
+        assert_eq!(loser.state().tip_height(), 1, "frozen at the losing sibling's height");
+        assert_eq!(loser.state_lag().blocks(), 7, "slag, growing with the block rate");
+        assert!(loser.state_lag().is_lagging());
+        // Not one of the held bodies is applicable, and none ever will be.
+        assert_eq!(loser.pending_bodies().0, 7, "seven bodies held, none applicable");
+        assert_eq!(loser.ingest_counters().unjudged_anchor, 0, "and #134's path never fired");
+        // The duty refusals fire, which is why this is a liveness stop and not a
+        // safety break — and why the node stops mining and stops signing.
+        assert!(loser.mine_block().is_none(), "a lagging node does not mine");
+    }
+
     /// **#135's durable serving path**: `stored_body` answers exactly the bodies
     /// this node has APPLIED — with the exact body, since serving a different one
     /// would re-open #77 from the serving side — and declines a body that is
