@@ -350,7 +350,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         let outcome = self
             .node
             .ingest_block(header, BlockBody { txs: txs.clone(), coinbase, coinbase_rkm });
-        if let IngestOutcome::Rejected(_) = outcome {
+        // Issue #134 widens this from `Rejected` to "anything but accepted", and the
+        // widening is the point rather than tidiness. `Ignored` now also covers a body
+        // whose anchors this node **could not evaluate** — announcing that would make
+        // this node the origin of an object it never validated, which is the same
+        // failure #77 closed for `Rejected` here. `Ignored` was previously reachable
+        // only via the halt, where a halted node does not mine, so nothing that
+        // announces today changes behaviour.
+        if !matches!(outcome, IngestOutcome::Accepted) {
             return;
         }
         self.blocks.insert(bh, (txs.clone(), coinbase, coinbase_rkm));

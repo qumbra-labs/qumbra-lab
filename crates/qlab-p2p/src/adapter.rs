@@ -31,7 +31,7 @@ use qlab_devnet::body::{validate_body, BlockBody, BodyError, TxEntry};
 use qlab_devnet::chain::{ChainState, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, MemberStatus, Validator, Vote};
 use qlab_devnet::ebbflow::{
-    verify_equivocation, EquivocationEvidence, FinalityStatus, SigningWindow,
+    finality_status, verify_equivocation, EquivocationEvidence, FinalityStatus, SigningWindow,
 };
 use qlab_devnet::epoch::{EpochCommittee, EpochSchedule};
 use qlab_devnet::finality::{FinalityTracker, FinalizeError};
@@ -215,6 +215,48 @@ pub const MAX_PENDING_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// judgement about the object or its sender.
 pub const STATE_LAG_REASON: &str = "state lag: this node's applied state is behind its chain";
 
+/// What a body refusal says when this node **could not judge** the anchor rule
+/// (issue #134). Named for the same reason [`STATE_LAG_REASON`] is: it is a node
+/// declaring its own view unable to answer, which is a different statement from
+/// any judgement about the body or its sender — and the difference is exactly what
+/// [`IngestOutcome::is_peer_fault`] reads.
+pub const UNJUDGED_ANCHOR_REASON: &str =
+    "unjudged anchor: this node cannot evaluate anchor finality at this position";
+
+/// Whether a [`BodyError`] is a statement about the **body** or a statement about
+/// **this node's chain position** (issue #134).
+///
+/// This is the boundary the issue asked to have named rather than patched a third
+/// time, and it is the one distinction the old `Err(_) => Rejected("bad body")`
+/// wildcard erased:
+///
+/// - [`Self::Intrinsic`] — the verdict is a function of `(header, body)` alone. Every
+///   node, at every height, from any position, computes the same answer. A peer that
+///   sends one is at fault, always, and nothing about the receiver's state can excuse
+///   it. The binding, the coinbase payee, the posted fee, the in-block nullifier
+///   uniqueness and the proof are all of this kind.
+/// - [`Self::Positional`] — the verdict is computed **against the receiver's own
+///   applied state**, so two honest nodes at different positions answer differently
+///   for the same body. `AnchorNotFinal` is the only one today:
+///   [`qlab_node::NodeState::is_valid_anchor`] reads the receiver's root index, its
+///   finalized head and its applied tip, and a joiner has none of the three at the
+///   height it is being served. Charging for it bans honest peers for serving correct
+///   history — the whole of #134.
+///
+/// The match on it is **exhaustive on purpose** (no wildcard arm): a new `BodyError`
+/// variant must declare which kind it is, and cannot inherit "peer fault" by silence
+/// the way `AnchorNotFinal` did.
+enum BodyFault {
+    /// Same verdict on every node ⇒ always the sender's fault. Carries the reject
+    /// reason string.
+    Intrinsic(&'static str),
+    /// Verdict depends on the receiver's position ⇒ the sender's fault only when this
+    /// node occupies the position the rule is defined at
+    /// ([`NodeAdapter::anchor_verdict_is_authoritative`]). Carries the reject reason
+    /// used when it *is* chargeable.
+    Positional(&'static str),
+}
+
 /// The memory a held body actually costs: the proof bytes (which dominate — one 2×2
 /// proof is ~145 kB against a ~100-byte public surface) plus its declared surface.
 fn body_weight(body: &BlockBody) -> usize {
@@ -246,13 +288,15 @@ fn body_weight(body: &BlockBody) -> usize {
 pub const UNCONFIGURED_MINER_RKM: [u64; 4] =
     [0x1101_1101_1101_1101, 0x1101_1101_1101_1101, 0x1101_1101_1101_1101, 0x1101_1101_1101_1101];
 
-/// Layer-attributed ingest refusal counts (issue #74).
+/// Layer-attributed ingest refusal counts (issue #74; extended by #134).
 ///
-/// The two are deliberately separate because they are different claims about the
+/// They are deliberately separate because they are different claims about the
 /// upgrade. `halt_ignored` is the **release** layer: this node has stopped, so it
 /// will not act on the block (and does not blame the sender). `pow_rejected` is the
 /// **header-validation** layer: under the post-halt rule domain the block's PoW does
-/// not meet the target, so it is invalid, not merely unwanted.
+/// not meet the target, so it is invalid, not merely unwanted. `unjudged_anchor` is
+/// the **receiver** layer: nothing is wrong with the block or the sender, this node
+/// simply cannot evaluate the rule from where it stands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IngestCounters {
     /// Headers/blocks not acted on because this release is halted (release layer).
@@ -260,6 +304,14 @@ pub struct IngestCounters {
     /// Headers rejected because the PoW value did not meet the target
     /// (header-validation layer).
     pub pow_rejected: u64,
+    /// Bodies neither applied nor charged because this node could not evaluate anchor
+    /// finality at its own position (receiver layer, issue #134).
+    ///
+    /// **This is the joiner's instrument.** A number that climbs while `slag=` stays
+    /// pinned is a node that is being served history it cannot judge — the state #134
+    /// describes, which before this counter was indistinguishable from "nobody would
+    /// talk to me" because the only visible symptom was an outbound set going quiet.
+    pub unjudged_anchor: u64,
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
@@ -874,6 +926,101 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         }
     }
 
+    /// Classify a body failure as intrinsic to the body or positional to this node
+    /// (issue #134). See [`BodyFault`] for why the distinction exists.
+    ///
+    /// The reason strings are **unchanged** from the wildcard this replaces
+    /// (`CommitmentMismatch` → its own string, everything else → `"bad body"`), so
+    /// no existing rejection changes its name; the only thing this adds is a
+    /// compiler-enforced decision point for every present and future variant.
+    fn body_fault_class(err: &BodyError) -> BodyFault {
+        match err {
+            // Unambiguous misbehaviour by whoever handed us the pair, not a merely
+            // invalid transaction — and it is the reason a body that reaches the
+            // anchor check is always the body its header committed to.
+            BodyError::CommitmentMismatch { .. } => {
+                BodyFault::Intrinsic("body does not match header commitment")
+            }
+            // All computed from `(header, body)` alone: a minting block with no payee
+            // (#101), the posted-price fee (§8), in-block nullifier uniqueness, and
+            // the STARK proof. No node's chain position changes any of these answers.
+            BodyError::MissingCoinbasePayee
+            | BodyError::WrongFee { .. }
+            | BodyError::DoubleSpendInBlock { .. }
+            | BodyError::ProofInvalid { .. } => BodyFault::Intrinsic("bad body"),
+            // The one positional check (#134). `is_valid_anchor` answers from THIS
+            // node's root index, finalized head and applied tip; a joiner replaying
+            // history has none of the three at the height it is being served, so its
+            // "no" is a fact about itself.
+            BodyError::AnchorNotFinal { .. } => BodyFault::Positional("bad body"),
+        }
+    }
+
+    /// Whether this node's answer to the anchor-finality rule for `header`'s body is
+    /// the **network's** answer, or merely a fact about where this node happens to
+    /// stand (issue #134).
+    ///
+    /// Both clauses are computed from this node's own two numbers. **Nothing the
+    /// sender says enters**, which is the property that keeps the amnesty from being
+    /// a hole: a peer cannot put us into the unjudged case by claiming anything, and
+    /// "the sender told me I'm syncing" is not expressible here.
+    ///
+    /// 1. **Position.** [`qlab_node::Node::apply_block`] refuses anything that does
+    ///    not extend the applied tip (`NotExtendingTip`), so the applied tip is the
+    ///    *only* position at which this check is ever run for real. Judged anywhere
+    ///    else, `is_valid_anchor` reads a root index that does not yet contain the
+    ///    roots this block may legitimately name, and measures `MAX_ANCHOR_AGE_BLOCKS`
+    ///    against the wrong tip.
+    /// 2. **Finality currency.** Even standing at the right height, the rule's other
+    ///    input is this node's finalized head, and a node whose finality has not kept
+    ///    up with its own chain has no view of what the network had finalized. That is
+    ///    exactly `FinalityStatus::Degraded` — the project's existing definition of
+    ///    "my finality is not current" ([`DEGRADED_MODE_LAG_BLOCKS`]) — and a joiner,
+    ///    which has finalized nothing at all, is permanently in it.
+    ///
+    /// Both are read off the **state machine's** pair (applied tip / applied finalized
+    /// head), not fork choice's, because those are precisely the two inputs
+    /// `is_valid_anchor` consumed to produce the verdict being classified.
+    fn anchor_verdict_is_authoritative(&self, header: &BlockHeader) -> bool {
+        if header.prev != self.state.tip_hash() {
+            return false;
+        }
+        matches!(
+            finality_status(
+                self.state.tip_height(),
+                self.state.finalized_height(),
+                DEGRADED_MODE_LAG_BLOCKS,
+            ),
+            FinalityStatus::Final
+        )
+    }
+
+    /// Whether `header` is a block someone actually **mined** — either already in our
+    /// chain (so header validation passed when it went in) or PoW/LWMA-valid under
+    /// this release's rules right now.
+    ///
+    /// This is the price of the #134 amnesty, and it is what stops the amnesty from
+    /// being cheaper for an attacker than the fault path. `validate_body` runs
+    /// [`check_body_binding`](qlab_devnet::body::check_body_binding) **first**, so a
+    /// body that reaches the anchor check is the body its header committed to; adding
+    /// this check means an attacker who wants an unjudged (uncharged) refusal must
+    /// bring a *mined* header committing to their bad body — a block of real work per
+    /// attempt. Anything cheaper fails here and is charged exactly as it is today.
+    fn header_is_mined(&self, header: &BlockHeader) -> bool {
+        if self.chain.header(&header.header_hash()).is_some() {
+            return true;
+        }
+        validate_header_under(
+            &self.chain,
+            &self.pow,
+            header,
+            self.block_time,
+            self.schedule,
+            &self.rules,
+        )
+        .is_ok()
+    }
+
     fn reject_reason(err: &MempoolError) -> &'static str {
         match err {
             MempoolError::WrongFee { .. } => "wrong fee",
@@ -917,21 +1064,49 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
     }
 
     fn ingest_block(&mut self, header: BlockHeader, body: BlockBody) -> IngestOutcome {
-        // 1. Body validity is independent of tip-extension: a body that is not the
-        //    one this header committed to (issue #77), or an invalid tx proof /
-        //    fee / in-block double-spend / non-final anchor, is adversarial and must
-        //    be rejected + penalized regardless of fork position. `validate_body`
-        //    checks the header/body binding first — it is the cheapest rejection
-        //    and, for the empty-body relay, the only one that fires.
+        // 1. Body validity is checked independently of tip-extension: a body that is
+        //    not the one this header committed to (issue #77), or an invalid tx proof
+        //    / fee / in-block double-spend, is adversarial and is rejected + penalized
+        //    regardless of fork position. `validate_body` checks the header/body
+        //    binding first — it is the cheapest rejection and, for the empty-body
+        //    relay, the only one that fires.
+        //
+        //    Issue #134 splits that sentence, because it was never true of *every*
+        //    body failure. A body can be **intrinsically** invalid — the same verdict
+        //    on every node, from every position — or it can fail a check this node
+        //    computes **against its own applied state**, where an honest peer serving
+        //    correct history draws the same verdict as an attacker. The anchor rule is
+        //    the second kind, and the old `Err(_)` wildcard charged both at
+        //    `PENALTY_INVALID_OBJECT`: a joiner replaying a chain that has ever carried
+        //    one transaction banned the peer serving it after five blocks and its whole
+        //    outbound set after forty — for correct behaviour, with no malformed byte
+        //    on the wire. See [`BodyFault`] for the boundary, and
+        //    [`Self::anchor_verdict_is_authoritative`] for how a node decides which
+        //    side of it it is standing on.
         let anchor_ok = |root: &Hash32| self.state.is_valid_anchor(root);
         match validate_body(&header, &body, &self.verifier, anchor_ok) {
             Ok(()) => {}
-            // Distinct reason string: a mismatch is unambiguous misbehaviour by
-            // whoever handed us the pair, not a merely invalid transaction.
-            Err(BodyError::CommitmentMismatch { .. }) => {
-                return IngestOutcome::Rejected("body does not match header commitment")
-            }
-            Err(_) => return IngestOutcome::Rejected("bad body"),
+            Err(e) => match Self::body_fault_class(&e) {
+                BodyFault::Intrinsic(why) => return IngestOutcome::Rejected(why),
+                // Positional. Charge it only where our verdict is the network's, and
+                // only for a header someone paid to mine (see `header_is_mined`).
+                BodyFault::Positional(why) => {
+                    if self.anchor_verdict_is_authoritative(&header) || !self.header_is_mined(&header)
+                    {
+                        return IngestOutcome::Rejected(why);
+                    }
+                    // `Ignored`, never `Rejected` — the #130 (a) shape, for the reason
+                    // #130 (a) cited this issue for. Not relayed, not applied, not
+                    // buffered (an unjudged body has had its proofs unverified, so
+                    // holding it would let unpaid-for bytes into the #130 (a) window),
+                    // and — the load-bearing part — NOT scored.
+                    //
+                    // Refusing to apply is unchanged: this node still does not accept
+                    // the block. Not penalising is not accepting.
+                    self.ingest_counters.unjudged_anchor += 1;
+                    return IngestOutcome::Ignored(UNJUDGED_ANCHOR_REASON);
+                }
+            },
         }
         // 2. Header into the consensus chain (PoW / fork-choice).
         let outcome = self.submit_header(header);
