@@ -93,6 +93,9 @@ pub enum NodeError {
     /// A decoded snapshot named a finalized point that cannot be proven against
     /// the reconstructed main chain. Refuse rather than silently starting clean.
     SnapshotFinality(RestoreFinalizedError),
+    /// The snapshot claims finality that the authoritative append-only log cannot
+    /// reproduce. Accepting it would make `open` disagree with `replay`.
+    SnapshotFinalityNotLogged { hash: Hash32, height: u64 },
     /// A persistence error.
     Io(io::Error),
 }
@@ -121,6 +124,11 @@ impl std::fmt::Display for NodeError {
             NodeError::SnapshotFinality(e) => {
                 write!(f, "snapshot finalized head is inconsistent with the block log: {e:?}")
             }
+            NodeError::SnapshotFinalityNotLogged { hash, height } => write!(
+                f,
+                "snapshot finalized head {} at height {height} has no matching finalization in the block log",
+                hex8(hash)
+            ),
             NodeError::Io(e) => write!(f, "persistence error: {e}"),
         }
     }
@@ -271,6 +279,12 @@ impl MemNode {
                 node.chain
                     .restore_finalized(hash, height)
                     .map_err(NodeError::SnapshotFinality)?;
+                if !records
+                    .iter()
+                    .any(|rec| matches!(rec, LogRecord::Finalize(logged) if *logged == hash))
+                {
+                    return Err(NodeError::SnapshotFinalityNotLogged { hash, height });
+                }
             }
 
             // Replay only state beyond the snapshot. Every finalization record is
@@ -757,6 +771,27 @@ mod tests {
         assert!(matches!(
             MemNode::open(&dir, genesis),
             Err(NodeError::BodyCommitmentMismatch { .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_finality_without_its_authoritative_log_record_refuses_to_open() {
+        let dir = temp_dir("snapshot-finality-not-logged");
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let genesis_hash = genesis.header().header_hash();
+        let mut node = MemNode::open(&dir, genesis.clone()).unwrap();
+
+        // Construct the inconsistency directly: the snapshot carries a proven
+        // point, but no live `finalize` call appended its source-of-truth record.
+        node.chain.restore_finalized(genesis_hash, 0).unwrap();
+        node.save_snapshot().unwrap();
+        drop(node);
+
+        assert!(matches!(
+            MemNode::open(&dir, genesis),
+            Err(NodeError::SnapshotFinalityNotLogged { hash, height: 0 })
+                if hash == genesis_hash
         ));
         std::fs::remove_dir_all(&dir).ok();
     }
