@@ -42,17 +42,34 @@ pub enum IngestOutcome {
     Orphan,
     /// Rejected as invalid; the peer that sent it may be penalized.
     Rejected(&'static str),
-    /// Well-formed as far as this node can tell, but **this release will not act
-    /// on it** (issue #74: the object is above our halt height). Not relayed, not
-    /// synced toward, and — the load-bearing part — **the sender is not penalized**.
+    /// Well-formed as far as this node can tell, but **this node will not act on
+    /// it**. Not relayed, not synced toward, and — the load-bearing part — **the
+    /// sender is not penalized**.
     ///
-    /// Distinct from [`Self::Rejected`] on purpose. A peer still mining above a
-    /// halt height is on a different release, not misbehaving; §4 says explicitly
-    /// that old-binary miners *can* keep producing blocks past the halt height.
-    /// Scoring them as invalid-object senders would ban honest peers during the
-    /// upgrade window — partitioning the net at exactly the moment an operator
-    /// needs it whole. This is the #70 S5 rule ("a well-formed thing we cannot use
-    /// is not a misbehaving peer") applied to the halt.
+    /// Distinct from [`Self::Rejected`] on purpose, and the distinction has now been
+    /// needed three times. **`Rejected` means "this object is invalid". `Ignored`
+    /// means "I will not act on this, and the sender is not why."** Every use falls
+    /// into one of two families, and naming them is the point — the third extension
+    /// should be a new member of a family, not a fourth rediscovery of the rule:
+    ///
+    /// - **This RELEASE will not act.** The object is above our halt height (issue
+    ///   #74). A peer still mining there is on a different release, not misbehaving;
+    ///   `committee-and-governance` §4 says explicitly that old-binary miners *can*
+    ///   keep producing blocks past the halt. Scoring them as invalid-object senders
+    ///   would ban honest peers during the upgrade window — partitioning the net at
+    ///   exactly the moment an operator needs it whole.
+    /// - **This NODE cannot judge.** The object may be perfectly valid and the sender
+    ///   may be perfectly honest; this node's own view cannot answer the question.
+    ///   Two members today, both in
+    ///   [`crate::adapter`]: a transaction arriving while the state machine lags its
+    ///   own chain (`STATE_LAG_REASON`, issue #130 (a)), and a block body whose anchor
+    ///   this node cannot evaluate from where it stands (`UNJUDGED_ANCHOR_REASON`,
+    ///   issue #134). The second is the sharper case: a joiner is *guaranteed* unable
+    ///   to judge historical anchors, where a halt-height mismatch is only occasional.
+    ///
+    /// The membership test for the second family is the one thing that must not drift:
+    /// the inability has to be a fact this node computes **about itself**, from its own
+    /// numbers. "The sender told me I am syncing" is not a member and never can be.
     Ignored(&'static str),
 }
 
@@ -64,12 +81,16 @@ impl IngestOutcome {
 
     /// Whether the **sender** is at fault and should be penalized.
     ///
-    /// Only [`Self::Rejected`]. In particular [`Self::Ignored`] is NOT a fault: a
-    /// peer producing blocks above our halt height is on a different release, which
-    /// `committee-and-governance.md` §4 says explicitly it may be. Penalizing it
-    /// would ban honest peers during the upgrade window — partitioning the net at
-    /// exactly the moment an operator needs it whole (issue #74; the #70 S5 rule
-    /// applied to the halt).
+    /// Only [`Self::Rejected`]. In particular [`Self::Ignored`] is NOT a fault, in
+    /// either of its two families (see the variant's docs): a peer producing blocks
+    /// above our halt height is on a different release, which
+    /// `committee-and-governance.md` §4 says explicitly it may be (issue #74), and a
+    /// peer serving us history we cannot yet judge is doing exactly what a joiner
+    /// needs it to do (issue #134). Penalizing either bans honest peers at precisely
+    /// the moment the net must stay whole — during an upgrade window, or while a new
+    /// node is joining. This is the #70 S5 rule ("a well-formed thing we cannot use is
+    /// not a misbehaving peer"), and it is asked in exactly one place so the tx,
+    /// header and block paths cannot drift apart on it.
     pub fn is_peer_fault(&self) -> bool {
         matches!(self, IngestOutcome::Rejected(_))
     }
