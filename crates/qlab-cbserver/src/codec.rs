@@ -13,7 +13,9 @@
 //!         clue_len : u8  (= 0 at v1)
 //!         clue     : clue_len bytes  (= 0 at v1)
 //! ```
-//! All integers little-endian; a format version byte leads every response
+//! All integers little-endian, and every varint is **canonical** — the shortest
+//! encoding of its value, one byte string per value ([`read_varint`]). A format
+//! version byte leads every response
 //! ([`crate::WIRE_VERSION`]). The response wrapper `/v1/compact` returns:
 //! ```text
 //! version   : u8 (= 0x01)
@@ -41,6 +43,13 @@ pub enum CodecError {
     UnsupportedClue { clue_len: u8 },
     /// A varint that does not terminate within 10 bytes (u64 overflow guard).
     VarintOverflow,
+    /// A varint that is not the shortest encoding of its value — e.g. `0x80 0x00`
+    /// for `0`. `len` is how many bytes the offending varint consumed.
+    ///
+    /// Two byte strings that decode to one value are a malleability vector the
+    /// moment these bytes enter a consensus commitment
+    /// (`discovery-on-the-consensus-wire.md` D6), so the decoder refuses them.
+    NonCanonicalVarint { len: usize },
     /// Trailing bytes remained after a whole-buffer decode.
     TrailingBytes { remaining: usize },
 }
@@ -79,8 +88,22 @@ pub fn write_varint(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-/// Read an unsigned LEB128 varint, advancing `pos`. Guards u64 overflow (≤10 bytes).
+/// Read an unsigned LEB128 varint, advancing `pos`. Guards u64 overflow (≤10
+/// bytes) and rejects **non-canonical** encodings.
+///
+/// Canonical = the shortest encoding of the value. Equivalently: the terminating
+/// byte (the one without the continuation bit) is never `0x00` unless the whole
+/// encoding is the single byte `0x00`. A multi-byte encoding whose last group is
+/// zero is padded, and a padded encoding is a second byte string for a value that
+/// already has one — `0x80 0x00` and `0x00` both mean `0`.
+///
+/// That is harmless while nothing commits to these bytes and is a malleability
+/// vector the moment they enter a consensus commitment, which is why
+/// `discovery-on-the-consensus-wire.md` D6 requires the rejection **before** any
+/// preimage work. [`write_varint`] already emits only shortest encodings, so this
+/// tightens the decoder without moving a single byte the encoder produces.
 pub fn read_varint(b: &[u8], pos: &mut usize) -> Result<u64, CodecError> {
+    let start = *pos;
     let mut result: u64 = 0;
     let mut shift = 0u32;
     loop {
@@ -91,6 +114,13 @@ pub fn read_varint(b: &[u8], pos: &mut usize) -> Result<u64, CodecError> {
         }
         result |= ((byte & 0x7f) as u64) << shift;
         if byte & 0x80 == 0 {
+            let len = *pos - start;
+            // A terminating 0x00 after at least one continuation byte means the
+            // top group is zero: a longer encoding of a value that fits in fewer
+            // bytes. `0x00` alone is the canonical encoding of 0 and is fine.
+            if len > 1 && byte == 0 {
+                return Err(CodecError::NonCanonicalVarint { len });
+            }
             return Ok(result);
         }
         shift += 7;
@@ -340,6 +370,170 @@ mod tests {
         let bad = vec![0x80u8; 11];
         let mut pos = 0;
         assert_eq!(read_varint(&bad, &mut pos), Err(CodecError::VarintOverflow));
+    }
+
+    /// Append one padding byte: set the continuation bit on the current last
+    /// byte and add a zero group. Same value, one byte longer, non-canonical.
+    fn pad_once(v: &[u8]) -> Vec<u8> {
+        let mut out = v.to_vec();
+        *out.last_mut().expect("varint is never empty") |= 0x80;
+        out.push(0x00);
+        out
+    }
+
+    #[test]
+    fn padded_zero_is_rejected_and_bare_zero_is_accepted() {
+        // D6, the exact pair the spec names: `0x80 0x00` and `0x00` are two byte
+        // strings for one value, and that is what a consensus commitment cannot
+        // tolerate. After this change only one of them decodes at all.
+        let mut pos = 0;
+        assert_eq!(read_varint(&[0x00], &mut pos), Ok(0), "bare 0x00 is canonical 0");
+        assert_eq!(pos, 1, "and consumes exactly its one byte");
+
+        let mut pos = 0;
+        assert_eq!(
+            read_varint(&[0x80, 0x00], &mut pos),
+            Err(CodecError::NonCanonicalVarint { len: 2 }),
+            "0x80 0x00 is a padded 0 and is rejected"
+        );
+
+        // The property, stated as the spec states it: they no longer decode to
+        // the same value, because the padded one no longer decodes.
+        let mut p1 = 0;
+        let mut p2 = 0;
+        let canonical = read_varint(&[0x00], &mut p1);
+        let padded = read_varint(&[0x80, 0x00], &mut p2);
+        assert_ne!(canonical, padded, "one value, one byte string");
+
+        // The same holds one value up: `0x81 0x00` vs `0x01`.
+        let mut pos = 0;
+        assert_eq!(read_varint(&[0x01], &mut pos), Ok(1));
+        let mut pos = 0;
+        assert_eq!(
+            read_varint(&[0x81, 0x00], &mut pos),
+            Err(CodecError::NonCanonicalVarint { len: 2 })
+        );
+    }
+
+    #[test]
+    fn canonical_varints_over_a_range_accept_encoder_output_and_reject_padding() {
+        // A range, not a hand-picked pair: one example proves the check exists,
+        // a range proves it is the *shortest-encoding* check and not something
+        // that merely happens to catch `0x80 0x00`.
+        let values: Vec<u64> = (0u64..=1_000)
+            .chain([
+                126, 127, 128, 129, 16_382, 16_383, 16_384, 16_385,
+                2_097_151, 2_097_152, u32::MAX as u64, u32::MAX as u64 + 1,
+                u64::MAX / 2, u64::MAX - 1, u64::MAX,
+            ])
+            .collect();
+
+        for v in values {
+            let mut enc = Vec::new();
+            write_varint(&mut enc, v);
+
+            // 1. The encoder's output decodes, round-trips, and is consumed whole.
+            let mut pos = 0;
+            assert_eq!(read_varint(&enc, &mut pos), Ok(v), "round-trip {v}");
+            assert_eq!(pos, enc.len(), "consumes exactly its bytes for {v}");
+
+            // 2. It re-encodes to itself — §4's "re-encode to themselves" check
+            //    holds by construction once the decoder is canonical.
+            let mut re = Vec::new();
+            write_varint(&mut re, v);
+            assert_eq!(re, enc, "re-encode is byte-identical for {v}");
+
+            // 3. The encoder never emits a padded form: only a 1-byte encoding
+            //    may end in 0x00.
+            assert!(
+                enc.len() == 1 || *enc.last().unwrap() != 0x00,
+                "write_varint emits the shortest encoding for {v}"
+            );
+
+            // 4. The one-byte-longer variant of the SAME value is rejected.
+            let padded = pad_once(&enc);
+            assert_eq!(padded.len(), enc.len() + 1);
+            let mut pos = 0;
+            let got = read_varint(&padded, &mut pos);
+            if enc.len() == 10 {
+                // An 11-byte varint cannot be a u64 at all; the ≤10-byte ceiling
+                // fires first and the value is still refused. Reported as
+                // overflow, not non-canonical — the length guard is the older
+                // and stricter statement about the same bytes.
+                assert_eq!(got, Err(CodecError::VarintOverflow), "padded {v} (10-byte)");
+            } else {
+                assert_eq!(
+                    got,
+                    Err(CodecError::NonCanonicalVarint { len: enc.len() + 1 }),
+                    "padded {v}"
+                );
+            }
+
+            // 5. Two bytes of padding are refused too (padding is not a parity
+            //    trick), where the ≤10-byte ceiling leaves room for it.
+            if enc.len() <= 8 {
+                let mut pos = 0;
+                assert_eq!(
+                    read_varint(&pad_once(&padded), &mut pos),
+                    Err(CodecError::NonCanonicalVarint { len: enc.len() + 2 }),
+                    "twice-padded {v}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_response_rejects_a_padded_varint_field() {
+        // The check has to reach the wire path, not just the primitive: a
+        // response whose `n_blocks` is padded must not decode. Hand-built,
+        // because the encoder cannot produce this.
+        let good = encode_compact_response(&sample_blocks());
+        assert!(decode_compact_response(&good).is_ok());
+
+        // good[1] is n_blocks (= 3, one byte). Replace it with 0x83 0x00.
+        let mut padded = Vec::new();
+        padded.push(good[0]);
+        padded.extend_from_slice(&[good[1] | 0x80, 0x00]);
+        padded.extend_from_slice(&good[2..]);
+        assert!(
+            matches!(
+                decode_compact_response(&padded),
+                Err(CodecError::NonCanonicalVarint { len: 2 })
+            ),
+            "a padded n_blocks is refused by the response decoder"
+        );
+    }
+
+    #[test]
+    fn truncation_is_still_reported_as_truncation_not_canonicity() {
+        // The stricter varint must not move where a short buffer is reported:
+        // a buffer cut mid-varint is Truncated, and one cut mid-body is caught
+        // by the body reader, exactly as before.
+        let mut pos = 0;
+        assert_eq!(
+            read_varint(&[0x80], &mut pos),
+            Err(CodecError::Truncated { what: "varint" }),
+            "a continuation byte with nothing after it is truncation"
+        );
+
+        let good = encode_compact_response(&sample_blocks());
+        for cut in [1usize, 2, 3, 5, 50, good.len() - 1] {
+            assert!(
+                matches!(
+                    decode_compact_response(&good[..cut]),
+                    Err(CodecError::Truncated { .. })
+                ),
+                "prefix of length {cut} is reported as truncation"
+            );
+        }
+
+        // And TrailingBytes still wins when there is a whole message plus extra.
+        let mut extra = good.clone();
+        extra.push(0xff);
+        assert!(matches!(
+            decode_compact_response(&extra),
+            Err(CodecError::TrailingBytes { remaining: 1 })
+        ));
     }
 
     // ---- per-output equivalence to qlab-note ----
