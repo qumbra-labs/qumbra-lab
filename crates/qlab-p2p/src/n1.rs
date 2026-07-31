@@ -31,6 +31,21 @@ use qlab_devnet::params_devnet::{
 
 use crate::codec::{checkpoint_id, tx_id};
 
+/// The memory a body's transactions actually cost: the proof bytes (which
+/// dominate — one 2×2 proof is ~145 kB against a ~100-byte public surface) plus
+/// each declared surface. **One meter, shared** by the adapter's pending-body
+/// window (issue #130 (a)) and [`crate::P2pNode`]'s serving cache (issue #135),
+/// so the two byte budgets are measured on the same scale and stay comparable.
+pub(crate) fn txs_weight(txs: &[TxEntry]) -> usize {
+    txs.iter()
+        .map(|tx| {
+            tx.proof.len()
+                + 32 * (1 + tx.public.nullifiers.len() + tx.public.commitments.len())
+                + 16
+        })
+        .sum()
+}
+
 /// What happened when an object was handed to the node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IngestOutcome {
@@ -109,6 +124,23 @@ pub trait ChainView {
     fn has_header(&self, hash: &Hash32) -> bool;
     /// The finalized height, if any checkpoint has finalized.
     fn finalized_height(&self) -> Option<u64>;
+    /// The **applied** body for `hash` from the node's authoritative block store,
+    /// if it holds one (issue #135). This is the durable serving path behind
+    /// [`crate::P2pNode`]'s bounded body cache: the store is written by
+    /// `apply_block`, so an answer here is a body this node folded into state —
+    /// evicting such a body from the cache never makes it unservable.
+    ///
+    /// Default `None`: a header-only node-state ([`StubNode`]) has no body store,
+    /// and for it the bounded cache is the only serving surface — the same
+    /// capability statement its `ingest_block` default already makes.
+    fn stored_body(&self, hash: &Hash32) -> Option<BlockBody> {
+        let _ = hash;
+        None
+    }
+    /// Whether [`Self::stored_body`] would answer, without cloning the body.
+    fn has_stored_body(&self, hash: &Hash32) -> bool {
+        self.stored_body(hash).is_some()
+    }
 }
 
 /// Ingest headers received from peers.

@@ -215,19 +215,11 @@ pub const MAX_PENDING_BODY_BYTES: usize = 32 * 1024 * 1024;
 /// judgement about the object or its sender.
 pub const STATE_LAG_REASON: &str = "state lag: this node's applied state is behind its chain";
 
-/// The memory a held body actually costs: the proof bytes (which dominate — one 2×2
-/// proof is ~145 kB against a ~100-byte public surface) plus its declared surface.
+/// The memory a held body actually costs — [`crate::n1::txs_weight`] (the meter
+/// shared with the #135 serving cache, so the two byte budgets are comparable)
+/// plus the fixed part: coinbase counter + payout key + map overhead.
 fn body_weight(body: &BlockBody) -> usize {
-    let txs: usize = body
-        .txs
-        .iter()
-        .map(|tx| {
-            tx.proof.len()
-                + 32 * (1 + tx.public.nullifiers.len() + tx.public.commitments.len())
-                + 16
-        })
-        .sum();
-    txs + 40 // coinbase counter + payout key + map overhead
+    crate::n1::txs_weight(&body.txs) + 40
 }
 
 /// The payout key a node mines to when no wallet has been configured (issue #101).
@@ -909,6 +901,20 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         // Committee checkpoints are the source of truth (as in `StubNode`).
         self.finality.finalized_height()
     }
+    fn stored_body(&self, hash: &Hash32) -> Option<BlockBody> {
+        // The state machine's block store (issue #135): written inside
+        // `apply_block` — the same append that makes a body durable (#104) — so an
+        // answer here is a body this node validated AND folded into state. A body
+        // merely buffered in `pending_bodies` is deliberately not served from
+        // here: it has not been applied, and it is still in the serving cache if
+        // it arrived for a new header.
+        use qlab_node::ChainStore as _;
+        self.state.chain().block(hash).map(|b| b.body())
+    }
+    fn has_stored_body(&self, hash: &Hash32) -> bool {
+        use qlab_node::ChainStore as _;
+        self.state.chain().block(hash).is_some()
+    }
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
@@ -1448,6 +1454,43 @@ mod tests {
         assert_eq!(f.state_lag().blocks(), 0);
         assert!(!f.state_lag().is_lagging());
         assert_eq!(f.state().tip_hash(), f.chain().tip_hash(), "and to the same block");
+    }
+
+    /// **#135's durable serving path**: `stored_body` answers exactly the bodies
+    /// this node has APPLIED — with the exact body, since serving a different one
+    /// would re-open #77 from the serving side — and declines a body that is
+    /// merely buffered. The buffered body is deliberately not served from the
+    /// store: it has not been validated against the tree it will be applied to,
+    /// and while it awaits application it is still in the P2P serving cache if it
+    /// arrived for a new header.
+    #[test]
+    fn stored_body_answers_applied_blocks_and_declines_merely_buffered_ones() {
+        let mut p = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let blocks = mine_chain(&mut p, 2);
+        let h0 = blocks[0].0.header_hash();
+        let h1 = blocks[1].0.header_hash();
+
+        // The proposer applied both — the store answers, with the exact body.
+        assert!(p.has_stored_body(&h0) && p.has_stored_body(&h1));
+        let served = p.stored_body(&h0).expect("applied → servable");
+        // "Exact" is #77's meaning of exact: the served body commits to the same
+        // value the header committed to (which covers txs, coinbase AND payout key).
+        assert_eq!(served.commitment(), blocks[0].1.commitment(), "the exact body");
+
+        // A follower holding only headers serves nothing…
+        let mut f = follower_with_headers_only(&blocks);
+        assert!(!f.has_stored_body(&h0) && !f.has_stored_body(&h1));
+        // …and a body buffered out-of-order (header already held → `Duplicate`)
+        // is buffered, not applied, and therefore still not served.
+        assert_eq!(f.ingest_block(blocks[1].0, blocks[1].1.clone()), IngestOutcome::Duplicate);
+        assert_eq!(f.pending_bodies().0, 1, "held for the state tip");
+        assert!(!f.has_stored_body(&h1), "a buffered body is not an applied body");
+        assert!(f.stored_body(&h1).is_none());
+
+        // The gap closes → both apply → both become servable, durably.
+        assert_eq!(f.ingest_block(blocks[0].0, blocks[0].1.clone()), IngestOutcome::Duplicate);
+        assert_eq!(f.state().tip_height(), 2);
+        assert!(f.has_stored_body(&h0) && f.has_stored_body(&h1));
     }
 
     /// **Acceptance 2 (#130 (a)): the regression that produced this issue — a node
