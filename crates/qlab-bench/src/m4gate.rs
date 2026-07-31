@@ -8639,9 +8639,12 @@ mod tests {
     ///
     /// This tamper perturbs `ASM0` **only on rows r+2..=r+7 of gap-8 pairs** —
     /// precisely the window the pin leaves open, and nowhere else. Under the
-    /// pin-only form it is **SAT** (measured on a local pin-only patch,
-    /// 2026-07-31, base `723e348`: 2.30 s, SAT); with the hold it is UNSAT
-    /// because the hold at row r+1 sees `nv(asm) != cv(asm)`. That single
+    /// pin-only form it is **SAT** — measured 2026-07-31 on base `723e348` by
+    /// deleting the two hold constraints from `:3389` in an uncommitted local
+    /// patch and re-running: this test failed at its tamper assertion (i.e.
+    /// SAT) while `gate_neg_asm_free_witness` still passed, which is the whole
+    /// point. With the hold it is UNSAT, because the hold at row r+1 sees
+    /// `nv(asm) != cv(asm)`. That single
     /// SAT/UNSAT pair is the entire justification for the extra two
     /// constraints, so if this test is ever deleted the fourth constraint has
     /// no recorded reason to exist.
