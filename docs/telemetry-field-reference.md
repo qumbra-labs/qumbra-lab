@@ -75,7 +75,7 @@ Five rules that hold for the whole line:
 | 3 | `stall` | `tip − final` | 🟢 never (it is `regime` in another unit) |
 | 4 | `age_s` | chain-seconds since the finalized checkpoint | 🟡 not alone |
 | 5 | `diff` | tip block's PoW difficulty | 🟢 never |
-| 6 | `peers` | live peer count | ⛔ **not documented — issue #172 open, see §7** |
+| 6 | `peers` | live peer count | ⛔ **not documented — issue #172 open, see §6** |
 | 7 | `mempool` | pending transactions | 🟢 never |
 | 8 | `epoch` | committee epoch | 🟢 never |
 | 9 | `regime` | Final / Degraded / Halting / Halted | 🟡 not alone |
@@ -229,7 +229,7 @@ current T0 net as a new finding.
 ⚠️ **Two hosts' `rfail` are not comparable if either restarted** (rule 3, §0).
 
 **Escalate when:** `rfail` starts climbing on a net that *was* finalizing. Then
-read, in order: `regime=` (§9) and `final=` (§13) to confirm finality actually
+read, in order: `regime=` (§20) and `final=` (§13) to confirm finality actually
 stopped, then the `ROUND` lines for `why=` — `silent` (no vote reached us),
 `votes_short` (the committee gave all it had), `timeout` (votes still arriving
 when it was cut off), `quorum_impossible` (the roster could not have made quorum
@@ -622,7 +622,7 @@ other; the same soak recorded all four ending at the same `final`.
 
 **What a change means.** `tip` not advancing on **all** hosts is mining stopping.
 `tip` not advancing on **one** host is that host being disconnected or refusing to
-extend (check `mready=`, §22). A `tip` that goes backwards is a reorg.
+extend (check `mready=`, §25). A `tip` that goes backwards is a reorg.
 
 **Escalate when:** never from this value alone; but `tip` frozen across all hosts
 for many samples is a net-wide stop and worth reporting.
