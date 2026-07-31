@@ -4,8 +4,22 @@
 //! Composes the keccak lane (stock p3-keccak-air through the LaneBuilder),
 //! the ext-mul/ext-add banks, and the inc-2/3 routing/FS machinery into a
 //! single 2^16-row rectangle driven by the Stage-1 recorder's schedule
-//! (`m4gaterec::walk`), with every gate column BOUND — the prover cannot
-//! choose which rows route, draw, or fold.
+//! (`m4gaterec::walk`). The ROUTING columns are bound — the prover cannot
+//! choose which rows route, draw or fold.
+//!
+//! 🔴 **NOT every gate column is bound, and this header said so until
+//! 2026-07-31.** Issue #78's class-(2) audit found four columns that
+//! constraints *read* but nothing *determines*, three of them since confirmed
+//! by execution (`i78_*` tests below), and only one of them fixed here:
+//!
+//! | column | state |
+//! |---|---|
+//! | `FSFULL` (2924) | **FIXED** (issue #78 finding 3): bool + per-perm hold + pinned to `FSGATE@row15`, `:3114`. Was a free witness; `cfull ≡ 0` was reachable and the refill guard vacuous. |
+//! | `ASM0`/`ASM1` (3318/3319) | **OPEN** (finding 1): limbs 0–1 of *every* value the pipeline consumes — zeta openings, final-poly coefficients, fold leaves — with no pin, no carry, not even a boolean. `i78_finding1_asm_free_witness` holds the confirmation. |
+//! | `SCR` (3443…) | **OPEN** (finding 2): no hold outside the `mr` gate, so a fold intermediate is not carried from its write to its next read. `i78_finding2_scr_no_hold`. |
+//! | `W0C`/`W1C` (2657/2658) | **OPEN** (finding 4): pinned to the sponge on F0 perms only — see the scope note at `:2646`. With finding 1 stacked on it, **all four** limbs of every consumed value are free, so the recorded gate-widening does not close the pipeline. |
+//!
+//! A reader who greps this header for reassurance should stop at the table.
 //!
 //! # What is verified in-circuit
 //!
@@ -30,7 +44,13 @@
 //!   refill/observe interlock (NEED = "required group complete",
 //!   FSFULL = "all 8 window draws taken") pins the flush schedule to the
 //!   native lazy-flush automaton, and the last-row anchor (all 20 query
-//!   blocks completed) forces the whole program to execute.
+//!   blocks completed) forces the whole program to execute. **The FSFULL
+//!   half of that interlock only became true on 2026-07-31** (issue #78
+//!   finding 3, `:3114`): `fsfull` used to be an unpinned witness, so a
+//!   prover could assert "window exhausted" for free and refill early.
+//!   What is pinned now, exactly: `fsfull` is boolean, constant across its
+//!   perm, and equal to `FSGATE` at row 15 — so claiming a full window
+//!   requires the eight digest-bound draws it claims. NEED is unchanged.
 //! - **Merkle openings**: leaf sponges (overwrite mode: fresh rate limbs
 //!   are the routed opened values, carried limbs equal the previous
 //!   output — per-role fresh counts), path compressions whose chained
@@ -3112,6 +3132,49 @@ where
             }
 
             // =================================================================
+            // issue #78 finding 3: FSFULL is the window-exhausted flag, and
+            // until this block it was a FREE WITNESS. Its only reference is
+            // `cfull = sf(23)·consumersel·(1 − fsfull)` (`:2028`), whose only
+            // consumer is the refill guard `nv(refsel)·cfull == 0` (`:2899`);
+            // nothing pinned it, nothing even made it boolean. Confirmed by
+            // execution, not argument: setting FSFULL := 1 on every row and
+            // letting `fill_derived` recompute CFULL was SAT on the honest
+            // narrow trace, i.e. `cfull ≡ 0` is reachable and the refill guard
+            // was vacuous — the prover could refill early, abandoning a
+            // digest's unused draws and re-deriving the next group's challenge
+            // (including the query-index groups) from a fresh squeeze.
+            // `gate_neg_fsfull_*` below are that experiment, inverted.
+            //
+            // Three constraints, no new column:
+            //   bool  — it is a flag; it was not even range-restricted.
+            //   hold  — constant within a perm (the fill writes one per-perm
+            //           value to all 24 rows), so the value `cfull` reads at
+            //           row 23 is the value pinned at row 15.
+            //   pin   — at row 15 it must equal FSGATE. FSGATE is a contiguous
+            //           prefix (above) and off every non-consumer perm, so
+            //           `fsgate@15 = 1` ⟺ all 16 draw rows are live ⟺ the full
+            //           8-draw window was taken, each draw bound to the digest
+            //           limbs by `limb_mux`. Claiming a full window now costs
+            //           the eight real draws it claims.
+            // Row 15 (not 23) is where the window state is local; the hold
+            // carries it the remaining 8 rows. Measured on the honest narrow
+            // trace before writing this: FSFULL is constant within all 2730
+            // perms and equals FSGATE@row15 in all of them, and the 16-row
+            // tail's `sf(15)` row has FSFULL = FSGATE = 0.
+            // =================================================================
+            {
+                builder.assert_bool(cv(self.layout.fsfull));
+                builder.assert_zero(
+                    sf(15) * (cv(self.layout.fsfull) - cv(self.layout.fsgate)),
+                );
+                let mut t = builder.when_transition();
+                t.assert_zero(
+                    (AB::Expr::ONE - sf(23))
+                        * (nv(self.layout.fsfull) - cv(self.layout.fsfull)),
+                );
+            }
+
+            // =================================================================
             // Ext-challenge assembly (inc-4): accepted field draws feed the
             // self.layout.coef ring / self.layout.curch limbs; every 4th accepted draw assembles
             // self.layout.chal[grp] and advances the self.layout.grp ring. PoW/query-index (bits) draws
@@ -3522,8 +3585,12 @@ where
         // M_INV (inc-4): witnessed inverses self.layout.invz = 1/(zeta - x) [r=0] and
         // self.layout.invzn = 1/(zeta_next - x) [r=1]. Add bank forms (operand - x) as a-c;
         // mul bank pins the inverse via mul_c == 1. self.layout.invz is fully sound (zeta =
-        // self.layout.chal bound, x = self.layout.xreg bound); self.layout.invzn's soundness pends the ZN/trailer
-        // binding (self.layout.znreg is still free witness). Native arithmetic.
+        // self.layout.chal bound, x = self.layout.xreg bound); self.layout.invzn's soundness is COMPLETED by the
+        // ZN pin 45 lines below (`znreg == g_trace·zeta` on every phq row,
+        // `:3635`), not pending it. This comment claimed "znreg is still free
+        // witness" until 2026-07-31 — stale in the understating direction, and
+        // the same failure mode as the two claims issue #78 caught in the
+        // module header. Native arithmetic.
         // =====================================================================
         {
             let msel_i = cv(self.layout.msel + M_INV as usize);
@@ -8317,5 +8384,314 @@ mod tests {
             is_unsat_interior(base, o),
             "consistent feeL+Σfee tamper must be UNSAT after D2 (PR #25 boundary closed)"
         );
+    }
+
+    // =====================================================================
+    // issue #78 — the class-(2) settlement, made resident.
+    //
+    // #78's audit found four columns that constraints READ but nothing
+    // DETERMINES, and named the reason both instruments proposed for the job
+    // are blind to them: a set difference sees the read, and a plain
+    // tamper→UNSAT scan sees the derived column that reads it die. The
+    // instrument that works is tamper-AND-REPROPAGATE — perturb the cell,
+    // re-run `fill_derived` (the fill's one re-runnable pass; every Phase-1a
+    // product is a pure function of its own row), and only then check.
+    //
+    // Two rules these tests follow, and any future class-(2) test should:
+    //   1. EVERY SAT IS PAIRED WITH A CONTROL of the same shape against a
+    //      column that IS carried (PBUF, RUNEV). An unpaired SAT cannot be
+    //      distinguished from a probe that tampered nothing.
+    //   2. The SAT tests below are KNOWN GAPS, not properties. When findings
+    //      1/2 are fixed they must INVERT — that is the point of pinning them.
+    // =====================================================================
+
+    /// Shared narrow fixture for the `i78` tests: honest trace + layout.
+    /// `shared()`'s consensus prove is already cached process-wide, so each
+    /// test pays only `build_gate_trace` (~0.16 s) plus its checks.
+    fn i78_fixture() -> (RowMajorMatrix<Val>, Vec<Val>, GateLayout, GateShape) {
+        let (sched, pvs, _) = shared();
+        let shape = GateShape::narrow();
+        let layout = GateLayout::from_shape(&shape);
+        let (trace, meta) = build_gate_trace(sched, pvs, &shape, 0);
+        (trace, meta.opvs, layout, shape)
+    }
+
+    /// #78 finding 3, INVERTED — the settlement experiment turned into the
+    /// negative it earned. Setting `FSFULL := 1` on every row and letting the
+    /// fill's derived pass recompute `CFULL` (which then vanishes: `cfull =
+    /// sf(23)·consumersel·(1−fsfull)`) was **SAT** on 2026-07-31 at rev
+    /// `b98455c`: the refill guard `nv(refsel)·cfull == 0` was vacuous and the
+    /// prover could refill early, choosing which digest's window to abandon
+    /// and re-deriving the next group's challenge — including the query-index
+    /// groups — from a fresh squeeze. With the `:3114` block it is UNSAT.
+    ///
+    /// The naive form of this tamper (no `fill_derived`) is UNSAT even without
+    /// the fix, on `CFULL`'s own defining constraint — that is the false
+    /// negative #78 is about, and it is why this test repropagates.
+    #[test]
+    fn gate_neg_fsfull_all_ones() {
+        let _g = heavy_lock();
+        let (base, opvs, layout, shape) = i78_fixture();
+        let w = layout.gate_width;
+        let rows = base.values.len() / w;
+        let mut t = base;
+        for r in 0..rows {
+            t.values[r * w + layout.fsfull] = Val::ONE;
+        }
+        fill_derived(&mut t.values, &layout, &shape);
+        assert!(
+            is_unsat(t, opvs),
+            "FSFULL := 1 on every row (repropagated) must be UNSAT after the #78 finding-3 pin"
+        );
+    }
+
+    /// #78 finding 3 at the size a prover would actually use it: claim a full
+    /// draw window on ONE consumer perm that honestly exhausted only part of
+    /// its window — the 8 rows where `CFULL = 1`, i.e. the only rows where the
+    /// refill guard has any content at all. Pre-fix this is SAT for the same
+    /// reason the all-rows form is (pre-fix, `fsfull`'s ONLY constraint is
+    /// `cfull`'s definition, which `fill_derived` re-satisfies); post-fix the
+    /// row-15 `FSGATE` pin makes the claim cost the eight draws it asserts.
+    #[test]
+    fn gate_neg_fsfull_single_perm() {
+        let _g = heavy_lock();
+        let (base, opvs, layout, shape) = i78_fixture();
+        let w = layout.gate_width;
+        let rows = base.values.len() / w;
+        let one = Val::ONE;
+        let p = (0..rows / 24)
+            .find(|&p| (0..24).any(|r| base.values[(p * 24 + r) * w + layout.cfull] == one))
+            .expect("a perm on which the refill guard is live (CFULL = 1)");
+        let mut t = base;
+        for r in 0..24 {
+            t.values[(p * 24 + r) * w + layout.fsfull] = one;
+        }
+        fill_derived(&mut t.values, &layout, &shape);
+        assert!(
+            is_unsat(t, opvs),
+            "claiming a full FS window on one guard-live perm must be UNSAT after the #78 pin"
+        );
+    }
+
+    /// 🔴 #78 **finding 1 — OPEN GAP, pinned here as SAT.** `ASM0`/`ASM1`
+    /// carry limbs 0–1 of every value the pipeline consumes (zeta openings,
+    /// final-poly coefficients, fold leaves) and NO constraint determines
+    /// them: adding 1 to both on all ~63 k rows that are not a consuming row
+    /// — including every row where the honest fill "stores" the captured word
+    /// — is SATISFIABLE. They are not registers; they are two cells read at
+    /// the consuming row and free everywhere else.
+    ///
+    /// CONTROL: the same tamper on `PBUF`, which has an unconditional carry,
+    /// is UNSAT. Without it a SAT here would be indistinguishable from a
+    /// broken probe.
+    ///
+    /// **When finding 1 is fixed this test MUST FLIP to UNSAT.** Do not
+    /// "repair" it by narrowing the tamper — invert the assertion.
+    #[test]
+    fn i78_finding1_asm_free_witness() {
+        let _g = heavy_lock();
+        let (base, opvs, layout, shape) = i78_fixture();
+        let w = layout.gate_width;
+        let rows = base.values.len() / w;
+        let one = Val::ONE;
+        let consuming = |v: &[Val], r: usize| {
+            v[r * w + layout.consz] == one || v[r * w + layout.consf] == one || v[r * w + layout.consz7] == one
+        };
+
+        let mut t = base.clone();
+        let mut n = 0usize;
+        for r in 0..rows {
+            if consuming(&base.values, r) {
+                continue;
+            }
+            t.values[r * w + layout.asm0] += one;
+            t.values[r * w + layout.asm1] += one;
+            n += 1;
+        }
+        assert!(n > 60_000, "expected ~63 k non-consuming rows, got {n}");
+        fill_derived(&mut t.values, &layout, &shape);
+        assert!(
+            !is_unsat(t, opvs.clone()),
+            "#78 finding 1 is FIXED — ASM0/ASM1 are now determined. Invert this test."
+        );
+
+        // CONTROL — PBUF is carried, so the same shape of tamper must fail.
+        let mut c = base.clone();
+        for r in 0..rows {
+            if base.values[r * w + layout.consf] == one && base.values[r * w + layout.vce] == one {
+                continue;
+            }
+            for k in 0..4 {
+                c.values[r * w + layout.pbuf + k] += one;
+            }
+        }
+        fill_derived(&mut c.values, &layout, &shape);
+        assert!(is_unsat(c, opvs.clone()), "CONTROL: PBUF is carried; this tamper must be UNSAT");
+
+        // The transcript-side half of the same gap (also #78 finding 4): move
+        // the word the capture row carries — re-canonicalised and
+        // repropagated — and the consumed limb does not move with it.
+        let casm = |r: usize| {
+            base.values[r * w + layout.czd] + base.values[r * w + layout.cz7] + base.values[r * w + layout.cf]
+        };
+        let pr = (0..rows)
+            .find(|&r| casm(r) == one && base.values[r * w + layout.pos] == one && base.values[r * w + layout.czd] == one)
+            .expect("a pending dup value-carry row");
+        let old = base.values[pr * w + layout.w0c].as_canonical_u32();
+        let newv = if old == 0 { 1 } else { old - 1 };
+        let mut d = base;
+        d.values[pr * w + layout.w0c] = Val::from_u32(newv);
+        fill_canon(&mut d.values, pr, 0, newv, &layout);
+        fill_derived(&mut d.values, &layout, &shape);
+        assert!(
+            !is_unsat(d, opvs),
+            "#78 finding 1/4: W0C at a capture row is now tied to the consumed limb. Invert this test."
+        );
+    }
+
+    /// 🔴 #78 **finding 2 — OPEN GAP, pinned here as SAT.** `SCR` is the only
+    /// pipeline register without an unconditional carry (compare `runev`,
+    /// `pbuf`, `breg`, `inv2s`). In an `M_FHI` perm the pair schedule
+    /// `[(1,0),(1,1),(1,2),(1,3),(2,0),(2,1),(3,0)]` pins only row r+1's single
+    /// target, so `scr[0]` — written at row 1, read again at row 4 — is
+    /// unheld at rows 2 and 3, and tampering it there is SATISFIABLE.
+    ///
+    /// This confirms the MECHANISM (no carry between write and next read),
+    /// which is what `gate_neg_mro` cannot see: that test tampers `SCR` inside
+    /// the `mr` gate, the one region where it IS carried, and is correctly
+    /// UNSAT. It does NOT confirm that a prover can move a fold output — that
+    /// needs the row-4 read changed and the row-5 target recomputed, and
+    /// nobody has built it.
+    ///
+    /// CONTROL: `RUNEV` at the same two rows is UNSAT (which also proves the
+    /// perm is live rather than pad).
+    #[test]
+    fn i78_finding2_scr_no_hold() {
+        let _g = heavy_lock();
+        let (base, opvs, layout, shape) = i78_fixture();
+        let w = layout.gate_width;
+        let rows = base.values.len() / w;
+        let one = Val::ONE;
+        let mfhi0 = layout.msel + shape.m_fhi(0) as usize;
+        let p = (0..rows / 24)
+            .find(|&p| base.values[(p * 24 + 2) * w + mfhi0] == one)
+            .expect("an M_FHI round-0 perm");
+
+        let mut t = base.clone();
+        for r in [2usize, 3] {
+            for k in 0..4 {
+                t.values[(p * 24 + r) * w + layout.scr + k] += one;
+            }
+        }
+        fill_derived(&mut t.values, &layout, &shape);
+        assert!(
+            !is_unsat(t, opvs.clone()),
+            "#78 finding 2 is FIXED — SCR is held between write and read. Invert this test."
+        );
+
+        // CONTROL — RUNEV carries unconditionally on the same rows.
+        let mut c = base;
+        for r in [2usize, 3] {
+            for k in 0..4 {
+                c.values[(p * 24 + r) * w + layout.runev + k] += one;
+            }
+        }
+        fill_derived(&mut c.values, &layout, &shape);
+        assert!(is_unsat(c, opvs), "CONTROL: RUNEV is carried; this tamper must be UNSAT");
+    }
+
+    /// 🔴 #78 finding 1's FIX PREMISE, measured — the reason no fix for it is
+    /// in this PR. The audit specified two constraints, `casm·pos0 →
+    /// nv(asm0) == cv(w0c)` per limb, resting on "the two rows are adjacent by
+    /// construction". **They are not.** Of the 2358 capture→consume pairs in
+    /// the honest narrow trace, 2220 are adjacent and 138 are 8 rows apart:
+    /// `czd` spans rows 4..=16 of dup block 0 and 0..=16 of the others, both
+    /// odd-length, so a capture lands on a block's row 16 and its consume is
+    /// row 0 of the next block. `POS` carries across the gap correctly; the
+    /// value has nothing carrying it.
+    ///
+    /// So the specified pin is honest-satisfiable (it holds on 2358/2358) but
+    /// closes only 94 % of the sites — which is worse than closing none,
+    /// because the column then reads as pinned (`:2646`'s trap, again). The
+    /// 4-constraint form (pin + `pos1·(1−casm) → nv(asm) == cv(asm)` hold, no
+    /// new column) is honest-satisfiable too, asserted below, and is what this
+    /// test exists to hand the next baton.
+    ///
+    /// No `check_constraints`: this is a scan of the honest witness.
+    #[test]
+    fn i78_asm_pairing_structure() {
+        let _g = heavy_lock();
+        let (base, _opvs, layout, _shape) = i78_fixture();
+        let w = layout.gate_width;
+        let rows = base.values.len() / w;
+        let one = Val::ONE;
+        let g = |r: usize, c: usize| base.values[r * w + c];
+        let casm = |r: usize| g(r, layout.czd) + g(r, layout.cz7) + g(r, layout.cf);
+
+        let (mut pairs, mut adjacent, mut gap8) = (0usize, 0usize, 0usize);
+        for r in 0..rows {
+            if casm(r) != one || g(r, layout.pos) != one {
+                continue;
+            }
+            let mut n = r + 1;
+            while n < rows && casm(n) != one {
+                n += 1;
+            }
+            assert!(n < rows, "pending capture at row {r} with no consuming row");
+            assert_eq!(g(n, layout.pos + 1), one, "the paired row must be POS1");
+            pairs += 1;
+            match n - r {
+                1 => adjacent += 1,
+                8 => gap8 += 1,
+                other => panic!("unexpected capture→consume gap {other} at row {r}"),
+            }
+            // the specified pin: honest-satisfiable everywhere...
+            assert_eq!(g(r + 1, layout.asm0), g(r, layout.w0c), "pin premise, asm0 at row {}", r + 1);
+            assert_eq!(g(r + 1, layout.asm1), g(r, layout.w1c), "pin premise, asm1 at row {}", r + 1);
+            // ...and the consuming row does read that word.
+            assert_eq!(g(n, layout.asm0), g(r, layout.w0c), "consumed limb 0 at row {n}");
+            assert_eq!(g(n, layout.asm1), g(r, layout.w1c), "consumed limb 1 at row {n}");
+        }
+        assert_eq!((pairs, adjacent, gap8), (2358, 2220, 138), "asm pairing shape (narrow)");
+
+        // The hold premise: on every transition out of a POS1 non-consuming
+        // row, the honest witness leaves ASM0/ASM1 alone — so the 4-constraint
+        // form costs the honest prover nothing.
+        for r in 0..rows - 1 {
+            if g(r, layout.pos + 1) == one && casm(r) != one {
+                assert_eq!(g(r + 1, layout.asm0), g(r, layout.asm0), "hold premise, asm0 at row {r}");
+                assert_eq!(g(r + 1, layout.asm1), g(r, layout.asm1), "hold premise, asm1 at row {r}");
+            }
+        }
+    }
+
+    /// #78 finding 3's fix premise, measured, for the same reason as above:
+    /// the row-15 pin and the per-perm hold must be free for the honest
+    /// prover, on every perm and on the 16-row tail — not just where the FS
+    /// gadget is active. (2730 perms; `FSFULL = 1` on 2 of them.)
+    #[test]
+    fn i78_fsfull_pin_premise() {
+        let _g = heavy_lock();
+        let (base, _opvs, layout, _shape) = i78_fixture();
+        let w = layout.gate_width;
+        let rows = base.values.len() / w;
+        let g = |r: usize, c: usize| base.values[r * w + c];
+        let mut full = 0usize;
+        for p in 0..rows / 24 {
+            let f = g(p * 24, layout.fsfull);
+            assert!(f == Val::ZERO || f == Val::ONE, "FSFULL boolean, perm {p}");
+            for r in 0..24 {
+                assert_eq!(g(p * 24 + r, layout.fsfull), f, "FSFULL constant within perm {p}");
+            }
+            assert_eq!(f, g(p * 24 + 15, layout.fsgate), "FSFULL == FSGATE@row15, perm {p}");
+            if f == Val::ONE {
+                full += 1;
+            }
+        }
+        assert_eq!(full, 2, "narrow: exactly 2 perms take a full 8-draw window");
+        for r in (rows / 24) * 24..rows {
+            assert_eq!(g(r, layout.fsfull), Val::ZERO, "tail row {r} FSFULL");
+            assert_eq!(g(r, layout.fsgate), Val::ZERO, "tail row {r} FSGATE");
+        }
     }
 }
