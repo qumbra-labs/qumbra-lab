@@ -1319,7 +1319,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
         let ctx = self.slot_context(cp.height);
 
         // Verify + active-filter against THIS height's epoch roster (frozen §4:
-        // tombstoned/jailed excluded BEFORE the count; forged/unknown/dup penalised).
+        // tombstoned/jailed excluded BEFORE the count). Issue #164 splits the old
+        // catch-all `Invalid` the way #134 split the body-path wildcard:
+        //
+        // - unknown index / signature valid only under a different roster slot →
+        //   `Unjudged` (positional: depends on *this* node's membership)
+        // - duplicate padding / signature no roster member produced → `Invalid`
+        //   (intrinsic: same answer on every node that holds those keys)
+        //
         // `committee` is cloned so the immutable borrow ends before the mutable ops.
         //
         // Issue #87: each refusal is *recorded before it returns*. The 42 h soak's
@@ -1337,7 +1344,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
                     rejects.unknown_signer += 1;
                     self.rounds.note_rejected_message(&ctx, rejects);
                     self.metrics.observe_votes(0, rejects);
-                    return VotesOutcome::Invalid; // unknown signer index
+                    return VotesOutcome::Unjudged; // index does not resolve under my roster
                 }
                 if !seen_signer.insert(v.signer) {
                     rejects.duplicate += 1;
@@ -1349,7 +1356,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
                     rejects.forged += 1;
                     self.rounds.note_rejected_message(&ctx, rejects);
                     self.metrics.observe_votes(0, rejects);
-                    return VotesOutcome::Invalid; // forged signature
+                    // Signature belongs to a different slot on this roster ⇒ the
+                    // claimed index is roster-order-dependent (the #164 reseal case).
+                    if committee.any_member_signed(cp, v) {
+                        return VotesOutcome::Unjudged;
+                    }
+                    return VotesOutcome::Invalid; // no roster member produced this sig
                 }
                 if cstate.is_active(v.signer, cp.height) {
                     active_kept.push(v.clone());
@@ -3133,30 +3145,47 @@ mod tests {
         }
     }
 
-    /// Acceptance #4: forged, unknown-signer, and duplicate-signer sets never grow the
-    /// tally and are reported Invalid (→ the wire handler penalises).
+    /// Acceptance #4 (updated #164): intrinsic rejects never grow the tally and are
+    /// `Invalid` (→ the wire handler penalises). Unknown index is now `Unjudged`
+    /// (positional — not a peer fault); a signature by a different *in-roster*
+    /// member is also `Unjudged` (roster-order dependent). A signature **no**
+    /// roster member produced is still `Invalid`.
     #[test]
     fn forged_unknown_dup_never_increase_tally() {
         let (cstate, validators) = committee7();
         let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
         let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
 
-        // Forged: a valid signature attributed to the wrong signer index.
-        let forged = Vote { signer: 0, signature: validators[1].sign_checkpoint(&cp).signature };
-        assert!(matches!(a.ingest_checkpoint_votes(&cp, &[forged]), VotesOutcome::Invalid));
-
-        // Unknown signer index (outside the 7-member committee).
+        // Genuine forge: an outsider's signature attributed to an in-range index.
+        // No roster member produced it ⇒ Intrinsic ⇒ Invalid.
         let outsider = qlab_devnet::committee::Validator::from_seed(99, [0xEE; 32]);
+        let forged = Vote {
+            signer: 0,
+            signature: outsider.sign_checkpoint(&cp).signature,
+        };
+        assert!(matches!(a.ingest_checkpoint_votes(&cp, &[forged]), VotesOutcome::Invalid));
+        assert!(VotesOutcome::Invalid.is_peer_fault());
+
+        // Unknown signer index (outside the 7-member committee) ⇒ Unjudged (#164).
         assert!(matches!(
             a.ingest_checkpoint_votes(&cp, &[outsider.sign_checkpoint(&cp)]),
-            VotesOutcome::Invalid
+            VotesOutcome::Unjudged
+        ));
+        assert!(!VotesOutcome::Unjudged.is_peer_fault());
+
+        // In-roster signature under the wrong claimed index ⇒ Unjudged (positional).
+        let misindexed =
+            Vote { signer: 0, signature: validators[1].sign_checkpoint(&cp).signature };
+        assert!(matches!(
+            a.ingest_checkpoint_votes(&cp, &[misindexed]),
+            VotesOutcome::Unjudged
         ));
 
-        // Duplicate-signer padding within one set.
+        // Duplicate-signer padding within one set ⇒ still Invalid.
         let dup = vec![validators[3].sign_checkpoint(&cp), validators[3].sign_checkpoint(&cp)];
         assert!(matches!(a.ingest_checkpoint_votes(&cp, &dup), VotesOutcome::Invalid));
 
-        assert_eq!(a.finalized_height(), None, "no invalid set moved finality");
+        assert_eq!(a.finalized_height(), None, "no invalid/unjudged set moved finality");
     }
 
     // ---- issue #87: round-level diagnostics on the real ingest path -----------
@@ -3225,19 +3254,23 @@ mod tests {
 
     /// A round being fed junk must not look like a round nobody spoke about. Forged,
     /// unknown-signer and duplicate sets are recorded against the slot with their
-    /// reason — and still never touch what counts.
+    /// reason — and still never touch what counts. (#164: unknown is Unjudged, not
+    /// Invalid, but the diagnostic counters still name each refuse.)
     #[test]
     fn rejected_vote_sets_are_recorded_against_the_round_they_targeted() {
         let (cstate, validators) = committee7();
         let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
         let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
 
-        let forged = Vote { signer: 0, signature: validators[1].sign_checkpoint(&cp).signature };
-        assert!(matches!(a.ingest_checkpoint_votes(&cp, &[forged]), VotesOutcome::Invalid));
         let outsider = qlab_devnet::committee::Validator::from_seed(99, [0xEE; 32]);
+        let forged = Vote {
+            signer: 0,
+            signature: outsider.sign_checkpoint(&cp).signature,
+        };
+        assert!(matches!(a.ingest_checkpoint_votes(&cp, &[forged]), VotesOutcome::Invalid));
         assert!(matches!(
             a.ingest_checkpoint_votes(&cp, &[outsider.sign_checkpoint(&cp)]),
-            VotesOutcome::Invalid
+            VotesOutcome::Unjudged
         ));
         let dup = vec![validators[3].sign_checkpoint(&cp), validators[3].sign_checkpoint(&cp)];
         assert!(matches!(a.ingest_checkpoint_votes(&cp, &dup), VotesOutcome::Invalid));
@@ -3710,5 +3743,196 @@ mod tests {
         }
         assert_eq!(n.finalized_height(), Some(DRILL_H + 8), "finality never paused");
         assert_eq!(n.finality_status(), FinalityStatus::Final, "never reports a halt regime");
+    }
+
+    // --- issue #164: a roster mismatch is "I cannot judge this", not "you forged it" --
+
+    /// Build two adapters that share a genesis committee under a short epoch so a
+    /// unit test can cross a boundary without mining a day of blocks.
+    fn pair_under_epoch(
+        epoch_len: u64,
+        n: usize,
+    ) -> (NodeAdapter<KeccakPow, MockVerifier>, NodeAdapter<KeccakPow, MockVerifier>, Vec<Validator>) {
+        let (committee, validators) = devnet_committee(n);
+        let sched = EpochSchedule::new(epoch_len);
+        let holds = NodeAdapter::with_epoch(
+            EpochCommittee::genesis(sched, CommitteeState::new(committee.clone(), BOND_AMOUNT)),
+            KeccakPow,
+            MockVerifier,
+            sim(),
+        );
+        let lost = NodeAdapter::with_epoch(
+            EpochCommittee::genesis(sched, CommitteeState::new(committee, BOND_AMOUNT)),
+            KeccakPow,
+            MockVerifier,
+            sim(),
+        );
+        (holds, lost, validators)
+    }
+
+    fn tombstone_mid(a: &mut NodeAdapter<KeccakPow, MockVerifier>, validators: &[Validator], idx: usize) {
+        let ca = Checkpoint::new(90, [0xA0 + idx as u8; 32], [0xA0; 32]);
+        let cb = Checkpoint::new(90, [0xB0 + idx as u8; 32], [0xB0; 32]);
+        let ev = EquivocationEvidence {
+            vote_a: validators[idx].sign_checkpoint(&ca),
+            cp_a: ca,
+            vote_b: validators[idx].sign_checkpoint(&cb),
+            cp_b: cb,
+        };
+        assert_eq!(a.apply_evidence(&ev), Some(idx));
+    }
+
+    /// Mine `n` blocks onto `a` so the epoch machinery advances with the tip.
+    fn mine_n(a: &mut NodeAdapter<KeccakPow, MockVerifier>, n: usize) {
+        for _ in 0..n {
+            let (h, body) = a.mine_block().expect("mine");
+            assert_eq!(a.ingest_block(h, body), IngestOutcome::Accepted);
+        }
+    }
+
+    /// 🔴 **ACCEPTANCE 1 (#164): two nodes that disagree about a tombstone still
+    /// agree within the epoch** — quorum is over roster size N, not over active
+    /// members, so a mid-epoch tombstone moves nothing about thresholds or indices.
+    ///
+    /// This is the correction to the coordinator's original claim on issue #133
+    /// (that a divergent tombstone changes the quorum threshold). Pinned here so
+    /// nobody re-derives the wrong mechanism.
+    #[test]
+    fn two_nodes_disagreeing_about_a_tombstone_still_agree_within_the_epoch() {
+        let (mut holds, mut lost, validators) = pair_under_epoch(8, 7);
+        // Mid-index tombstone — the case that *will* shift indices at the boundary.
+        tombstone_mid(&mut holds, &validators, 2);
+
+        assert!(holds.is_tombstoned(2));
+        assert!(!lost.is_tombstoned(2));
+
+        // Within the epoch the roster is fixed: both still N=7, quorum 5.
+        assert_eq!(holds.committee().state().size(), 7, "tombstone does not shrink the roster mid-epoch");
+        assert_eq!(lost.committee().state().size(), 7);
+        assert_eq!(
+            holds.committee().state().quorum_threshold(),
+            lost.committee().state().quorum_threshold(),
+            "quorum is over N, not over active — both compute the same threshold"
+        );
+        assert_eq!(holds.committee().state().quorum_threshold(), 5);
+
+        // Indices are unshifted on both: signer 5 is still key_5 on both, so an
+        // honest vote verifies under either roster.
+        let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
+        let vote5 = validators[5].sign_checkpoint(&cp);
+        assert!(holds.committee().state().committee().verify_vote(&cp, &vote5));
+        assert!(lost.committee().state().committee().verify_vote(&cp, &vote5));
+
+        // And the vote is accepted into the tally on both (tombstoned signer 2 is
+        // the only one excluded on `holds`; signer 5 is active everywhere).
+        assert!(matches!(
+            holds.ingest_checkpoint_votes(&cp, &[vote5.clone()]),
+            VotesOutcome::Learned { finalized: false, .. }
+        ));
+        assert!(matches!(
+            lost.ingest_checkpoint_votes(&cp, &[vote5]),
+            VotesOutcome::Learned { finalized: false, .. }
+        ));
+    }
+
+    /// 🔴 **ACCEPTANCE 2 (#164): at the epoch boundary the rosters diverge, and
+    /// neither side treats the other's honest votes as a peer fault.**
+    ///
+    /// Both halves, pinned together so a future change cannot keep the divergence
+    /// and re-introduce the penalty (or kill the penalty by preventing the
+    /// divergence):
+    /// 1. After seal, the node that held the tombstone has a smaller, reindexed
+    ///    roster; the node that lost it does not.
+    /// 2. Each node's honest votes against the other's roster are `Unjudged`, not
+    ///    `Invalid` — so `is_peer_fault()` is false on both directions.
+    #[test]
+    fn at_the_epoch_boundary_divergent_rosters_do_not_score_each_other() {
+        const EPOCH: u64 = 8;
+        let (mut holds, mut lost, validators) = pair_under_epoch(EPOCH, 7);
+        // Tombstone a mid-index member so seal shifts every higher index down by one.
+        tombstone_mid(&mut holds, &validators, 2);
+
+        mine_n(&mut holds, EPOCH as usize);
+        mine_n(&mut lost, EPOCH as usize);
+        assert_eq!(holds.committee().current_epoch(), 1);
+        assert_eq!(lost.committee().current_epoch(), 1);
+
+        // Half 1 — the divergence still happens.
+        assert_eq!(holds.committee().state().size(), 6, "seal drops the tombstoned member");
+        assert_eq!(lost.committee().state().size(), 7, "a node that never saw the tombstone keeps N");
+        assert_eq!(holds.committee().state().quorum_threshold(), 5); // ⌊2·6/3⌋+1 = 5
+        assert_eq!(lost.committee().state().quorum_threshold(), 5); // ⌊2·7/3⌋+1 = 5
+        // Key that was at 5 is at 4 on holds (shifted), still at 5 on lost.
+        let key5 = validators[5].verifying_key().encode().to_vec();
+        assert_eq!(
+            holds.committee().state().committee().member(4).map(|k| k.encode().to_vec()),
+            Some(key5.clone()),
+            "holds: key_5 shifted to index 4"
+        );
+        assert_eq!(
+            lost.committee().state().committee().member(5).map(|k| k.encode().to_vec()),
+            Some(key5),
+            "lost: key_5 still at index 5"
+        );
+
+        // Half 2 — honest votes across the divergence are Unjudged, not Invalid.
+        let tip = holds.chain().tip_hash();
+        let cp = Checkpoint::new(EPOCH, tip, tip);
+
+        // `lost` signs under the unshifted roster (signer 5 = key_5).
+        let lost_honest = validators[5].sign_checkpoint(&cp);
+        let from_lost = holds.ingest_checkpoint_votes(&cp, &[lost_honest]);
+        assert!(
+            matches!(from_lost, VotesOutcome::Unjudged),
+            "holds reads lost's honest vote as Unjudged, not forged"
+        );
+        assert!(!from_lost.is_peer_fault(), "and does not charge the peer");
+
+        // `holds` signs under the shifted roster (signer 4 = key_5).
+        let mut holds_honest = validators[5].sign_checkpoint(&cp);
+        holds_honest.signer = 4;
+        let from_holds = lost.ingest_checkpoint_votes(&cp, &[holds_honest]);
+        assert!(
+            matches!(from_holds, VotesOutcome::Unjudged),
+            "lost reads holds's honest vote as Unjudged, not forged"
+        );
+        assert!(!from_holds.is_peer_fault(), "and does not charge the peer");
+    }
+
+    /// 🔴 **ACCEPTANCE 3 (#164): a genuinely forged vote is still scored.**
+    ///
+    /// The amnesty is not blanket. A signature **no** roster member produced is
+    /// Intrinsic — same answer on every node that holds those keys — and remains
+    /// `Invalid` + `is_peer_fault()`. (Issue #134 criterion 2, applied identically.)
+    #[test]
+    fn a_genuinely_forged_vote_is_still_a_peer_fault() {
+        let (cstate, _validators) = committee7();
+        let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+        let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
+
+        let outsider = Validator::from_seed(99, [0xEE; 32]);
+        let forged = Vote {
+            signer: 0,
+            signature: outsider.sign_checkpoint(&cp).signature,
+        };
+        let out = a.ingest_checkpoint_votes(&cp, &[forged]);
+        assert!(matches!(out, VotesOutcome::Invalid), "genuine forge is Invalid");
+        assert!(out.is_peer_fault(), "and it is a peer fault");
+        assert_eq!(a.finalized_height(), None);
+    }
+
+    /// Classification boundary itself — every refuse path declares Intrinsic vs
+    /// Positional, so a new arm cannot inherit "peer fault" by silence (#134's
+    /// exhaustive-match discipline, applied to votes).
+    #[test]
+    fn every_vote_refuse_declares_whether_it_is_a_peer_fault() {
+        assert!(VotesOutcome::Invalid.is_peer_fault());
+        assert!(!VotesOutcome::Unjudged.is_peer_fault());
+        assert!(!VotesOutcome::Stale.is_peer_fault());
+        assert!(!VotesOutcome::Learned {
+            finalized: false,
+            accumulated: vec![]
+        }
+        .is_peer_fault());
     }
 }
