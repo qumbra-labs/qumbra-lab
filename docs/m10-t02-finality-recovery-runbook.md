@@ -48,6 +48,11 @@ Poll the versioned telemetry endpoint (`qlab_node::telemetry::Telemetry`):
 operator reasons in — "how many blocks behind" and "how long stuck." Age is derived
 from block timestamps (chain-time), so it is deterministic, not wall-clock.
 
+> The seven fields above are the stall-relevant subset. The `TELEMETRY` stdout line
+> now carries **25** fields, and every one of them — what it counts, what a normal
+> value looks like, and **whether it is ever an alarm on its own** — is in
+> [`telemetry-field-reference.md`](telemetry-field-reference.md) (issue #173).
+
 > **Cold-start caveat (added 2026-07-25, M10-T0-5 / PR #72).** The two units agree
 > only once something has been finalized. On a node that has **never** finalized a
 > checkpoint — a fresh net, or a node reopened from disk before the first re-gossip
