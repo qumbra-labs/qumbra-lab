@@ -2534,6 +2534,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bbase);
     }
 
+    /// Issue #172 — `peer_count` is the live connection-table size, so a peer
+    /// process restart must remove both of the old directed connections from the
+    /// survivor before the replacement connections are counted. In a fully
+    /// configured N-host mesh every host has one outbound and one inbound
+    /// connection to each other host: `2 * (N - 1)` live connections.
+    #[test]
+    fn peer_process_restart_leaves_both_sides_at_the_live_connection_count() {
+        let (a_port, b_port) = (free_port(), free_port());
+        let (a_addr, b_addr) =
+            (format!("127.0.0.1:{a_port}"), format!("127.0.0.1:{b_port}"));
+
+        let (mut acfg, agen, abase) = rig("peer_restart_a", false);
+        acfg.listen_addr = a_addr.clone();
+        acfg.dial_peers = vec![b_addr.clone()];
+        let mut a =
+            RunningNode::start(&acfg, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+
+        let (mut bcfg, bgen, bbase) = rig("peer_restart_b", false);
+        bcfg.listen_addr = b_addr.clone();
+        bcfg.dial_peers = vec![a_addr];
+        let mut b =
+            RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+
+        // B connected out while A was already listening; make A's initially
+        // refused dial retry now that B is up. The two-host instance of
+        // `2 * (N - 1)` is two connections on each side.
+        pump(&mut [&mut a, &mut b], 5);
+        a.force_redial_ready();
+        a.maintain_peers();
+        pump(&mut [&mut a, &mut b], 5);
+        assert_eq!(a.telemetry().peer_count, 2, "A sees both live directions");
+        assert_eq!(b.telemetry().peer_count, 2, "B sees both live directions");
+
+        // A is the survivor. Once B's process is gone, both sockets disappear
+        // from the transport; maintenance must make the connection table agree.
+        drop(b);
+        let stopped = std::time::Instant::now();
+        while !a.p2p().transport().peers().is_empty() {
+            a.step_once();
+            assert!(
+                stopped.elapsed() < Duration::from_secs(1),
+                "survivor did not observe the stopped peer"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        a.maintain_peers();
+        assert_eq!(
+            a.telemetry().peer_count,
+            0,
+            "the survivor must not retain either pre-restart connection"
+        );
+
+        // Restart B on the same address and restore both directed connections.
+        let mut b =
+            RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        pump(&mut [&mut a, &mut b], 5);
+        a.force_redial_ready();
+        a.maintain_peers();
+        pump(&mut [&mut a, &mut b], 5);
+
+        assert_eq!(
+            a.telemetry().peer_count,
+            2,
+            "the survivor counts only B's replacement connections"
+        );
+        assert_eq!(b.telemetry().peer_count, 2, "the restarted side also converges");
+
+        drop(a);
+        drop(b);
+        for base in [abase, bbase] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
     // ================= peer discovery over real TCP (issue #83) =================
 
     /// Reserve a free loopback port and release it (the address is then free to
