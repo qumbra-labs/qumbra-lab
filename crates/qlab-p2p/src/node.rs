@@ -478,7 +478,16 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         let outcome = self
             .node
             .ingest_block(header, BlockBody { txs: txs.clone(), coinbase, coinbase_rkm });
-        if let IngestOutcome::Rejected(_) = outcome {
+        // Issue #134 widens this from `Rejected` to `Rejected | Ignored`. `Ignored` now
+        // also covers a body whose anchors this node **could not evaluate**, and
+        // announcing one would make this node the origin of an object it never
+        // validated — the same failure #77 closed here for `Rejected`. It is reachable
+        // for a node's own block: a miner in a finality stall can assemble a body whose
+        // anchors its own (stalled) view can no longer judge.
+        //
+        // `Orphan` deliberately still announces: it is not a refusal, and the orphan
+        // sync-kick on the receiving side is how a gap gets closed.
+        if matches!(outcome, IngestOutcome::Rejected(_) | IngestOutcome::Ignored(_)) {
             return;
         }
         self.blocks.insert(header.height, bh, txs.clone(), coinbase, coinbase_rkm);
@@ -2531,5 +2540,269 @@ mod tests {
         // Heal: the next maintenance pass re-dials.
         nodes[0].maintain(crate::addrman::DIAL_BACKOFF_MAX_MS * 2);
         assert_eq!(nodes[0].addrs().outbound_live(), 1, "reconnected without a restart");
+    }
+
+    // --- issue #134: the scoring half, over the real gossip path ---------------
+
+    mod i134 {
+        //! A joiner must not ban the honest peers that serve it correct history.
+        //!
+        //! `adapter.rs` locks the *classification* (an anchor this node cannot judge is
+        //! `Ignored`, not `Rejected`). This module locks what the classification is
+        //! **for**: a real [`PeerTable`] score, moved by the real
+        //! `BlockAnnounce` → `complete_block` → `is_peer_fault` → `penalize` path, on a
+        //! chain whose every block carries a transaction.
+
+        use std::sync::Arc;
+
+        use qlab_devnet::body::{BlockBody, TxEntry, TxPublic, TxVerifier};
+        use qlab_devnet::committee::{devnet_committee, CommitteeState};
+        use qlab_devnet::fees::{posted_fee, ArityBucket};
+        use qlab_devnet::header::{BlockHeader, Hash32};
+        use qlab_devnet::node::SimConfig;
+        use qlab_devnet::params_devnet::BOND_AMOUNT;
+        use qlab_devnet::pow::KeccakPow;
+        use qlab_node::NodeState as _;
+
+        use crate::adapter::NodeAdapter;
+        use crate::n1::{IngestOutcome, TxPool};
+        use crate::node::P2pNode;
+        use crate::peer::{PeerId, BAN_THRESHOLD};
+        use crate::transport::{InProcHub, InProcTransport};
+
+        /// A proof is valid iff its bytes are `b"ok"` — the same stand-in `adapter.rs`
+        /// and the n7 soak use, so a body's validity here turns on the checks under
+        /// test rather than on the prover.
+        ///
+        /// `strict: false` is how the second test builds a peer that will **serve** a
+        /// body this node refuses: a broken or hostile node whose own verifier waves
+        /// the proof through. Nothing else about it differs — same genesis, same PoW,
+        /// same mined header — so the only variable between the two tests below is the
+        /// body, which is the comparison the acceptance bar asks for.
+        #[derive(Clone)]
+        struct MockVerifier {
+            strict: bool,
+        }
+        impl TxVerifier for MockVerifier {
+            fn verify_tx(&self, entry: &TxEntry) -> bool {
+                !self.strict || entry.proof == b"ok"
+            }
+        }
+
+        type Adapter = NodeAdapter<KeccakPow, MockVerifier>;
+        type Net = P2pNode<InProcTransport, Adapter>;
+
+        /// Low difficulty so a unit test can mine real PoW headers — the headers must
+        /// be genuine, because after #134 a mined header is exactly what buys the
+        /// amnesty.
+        fn sim() -> SimConfig {
+            SimConfig {
+                block_time_secs: 2,
+                genesis_difficulty: 8,
+                mine_nonce_budget: 5_000_000,
+                ..SimConfig::default()
+            }
+        }
+
+        fn adapter(strict: bool) -> Adapter {
+            let (committee, _v) = devnet_committee(7);
+            NodeAdapter::new(
+                CommitteeState::new(committee, BOND_AMOUNT),
+                KeccakPow,
+                MockVerifier { strict },
+                sim(),
+            )
+        }
+
+        /// A node that can mine transactions: its genesis root is finalized, so a tx
+        /// anchored there is admissible. This is what a chain looks like from the first
+        /// block that carries a transaction — T1 by construction.
+        fn transacting_server(strict: bool) -> (Adapter, Hash32) {
+            let mut s = adapter(strict);
+            let g = s.chain().genesis_hash();
+            s.state_mut().finalize(g).expect("finalize genesis");
+            let anchor = s.state().commitment_root();
+            (s, anchor)
+        }
+
+        fn tx_with(anchor: Hash32, nf: u8, proof: &[u8]) -> TxEntry {
+            TxEntry {
+                proof: proof.to_vec(),
+                public: TxPublic {
+                    anchor,
+                    nullifiers: vec![[nf; 32]],
+                    commitments: vec![[nf.wrapping_add(50); 32]],
+                    bucket: ArityBucket::TwoByTwo,
+                    fee: posted_fee(ArityBucket::TwoByTwo),
+                },
+            }
+        }
+
+        /// Two linked in-process nodes: `[0]` serves, `[1]` joins. Returns them past
+        /// the handshake, so `ready_peers` is non-empty and an announce actually moves.
+        fn pair(server: Adapter, joiner: Adapter) -> (Vec<Net>, Arc<InProcHub>) {
+            let hub = InProcHub::new();
+            let mut nodes = vec![
+                P2pNode::new(InProcTransport::new(PeerId(1), Arc::clone(&hub)), server, [1; 32]),
+                P2pNode::new(InProcTransport::new(PeerId(2), Arc::clone(&hub)), joiner, [2; 32]),
+            ];
+            hub.link(PeerId(1), PeerId(2));
+            hub.link(PeerId(2), PeerId(1));
+            nodes[0].add_peer(PeerId(2), None);
+            nodes[1].add_peer(PeerId(1), None);
+            drive(&mut nodes, 0);
+            (nodes, hub)
+        }
+
+        /// Drive both nodes to quiescence from `base_ms` (the local twin of `run_at`,
+        /// which is typed to the `StubNode` mesh).
+        fn drive(nodes: &mut [Net], base_ms: u64) {
+            for round in 0..1000u64 {
+                let mut moved = 0;
+                for n in nodes.iter_mut() {
+                    moved += n.tick(base_ms + round * 10);
+                }
+                if moved == 0 {
+                    break;
+                }
+            }
+        }
+
+        /// Mine one block on `nodes[0]` carrying a single transaction and announce it.
+        /// Returns the announced `(header, body)`.
+        fn serve_one_transacting_block(
+            nodes: &mut [Net],
+            anchor: Hash32,
+            nf: u8,
+            round: u64,
+        ) -> (BlockHeader, BlockBody) {
+            assert_eq!(
+                nodes[0].node_mut().ingest_tx(tx_with(anchor, nf, b"ok")),
+                IngestOutcome::Accepted,
+                "the server admits the tx it is about to mine"
+            );
+            let (header, body) = nodes[0].node_mut().mine_block().expect("mine");
+            assert_eq!(body.txs.len(), 1, "the served block carries a transaction");
+            nodes[0].announce_block(
+                header,
+                body.txs.clone(),
+                body.coinbase,
+                body.coinbase_rkm,
+                round,
+            );
+            drive(nodes, (round + 1) * 10_000);
+            (header, body)
+        }
+
+        /// 🔴 **ACCEPTANCE 1 (#134): a joiner replaying history it cannot anchor does
+        /// not penalise the serving peer — and the peer's score is still exactly zero
+        /// after more blocks than it used to take to ban it.**
+        ///
+        /// Six blocks, each carrying one transaction, served over the real
+        /// `BlockAnnounce` path. Under the pre-#134 rule each one was
+        /// `Rejected("bad body")` ⇒ `is_peer_fault()` ⇒ `PENALTY_INVALID_OBJECT` = 20;
+        /// with `BAN_THRESHOLD` = −100 the **fifth** block banned an honest peer, and
+        /// at `MAX_OUTBOUND` = 8 the fortieth would have taken the joiner's entire
+        /// outbound set — every replacement earning the same ban for the same correct
+        /// behaviour.
+        ///
+        /// The assertion is on the score itself, not on the outcome enum, because the
+        /// score is the thing that bans.
+        #[test]
+        fn a_joiner_does_not_ban_the_peer_serving_it_correct_history() {
+            let (server, anchor) = transacting_server(true);
+
+            // The joiner has finalized nothing — the state of every node with an empty
+            // data dir, which is every node that has ever joined a running net.
+            let joiner = adapter(true);
+            assert_eq!(joiner.state().finalized_height(), None);
+
+            let (mut nodes, _hub) = pair(server, joiner);
+
+            const SERVED: u64 = 6;
+            for i in 0..SERVED {
+                serve_one_transacting_block(&mut nodes, anchor, i as u8 + 1, i);
+            }
+
+            // The whole point, in one number.
+            let peer = nodes[1].peers().get(PeerId(1)).expect("the serving peer");
+            assert_eq!(
+                peer.score, 0,
+                "{SERVED} correctly-served blocks must cost the honest peer nothing"
+            );
+            assert!(!nodes[1].peers().is_banned(PeerId(1)), "and it is not banned");
+            assert!(
+                SERVED as i32 * 20 > -BAN_THRESHOLD,
+                "the run is long enough to have banned the peer under the old rule"
+            );
+
+            // ...and the joiner is honest about why: it learned the headers, applied no
+            // body, and counted every refusal it could not stand behind.
+            assert_eq!(nodes[1].node().chain().tip_height(), SERVED, "header-first sync ran");
+            assert_eq!(nodes[1].node().state().tip_height(), 0, "no body was applied");
+            assert_eq!(
+                nodes[1].node().ingest_counters().unjudged_anchor,
+                SERVED,
+                "`uanchor=` is what an operator greps for this state"
+            );
+        }
+
+        /// 🔴 **ACCEPTANCE 2 (#134) at the same seam: a genuinely invalid body still
+        /// costs the sender.** The distinction is not a blanket amnesty on the block
+        /// path either.
+        ///
+        /// 🔴 **ACCEPTANCE 2 (#134) at the same seam: a genuinely invalid body still
+        /// costs the sender.** The distinction is not a blanket amnesty on the block
+        /// path either.
+        ///
+        /// The sender runs a **lenient verifier** — a broken or hostile node that waves
+        /// its own proofs through — and mines and announces a block whose transaction
+        /// carries a proof the receiver refuses. Same genesis, same real PoW, same
+        /// announce path as the test above; only the body differs.
+        ///
+        /// The receiver is a **synced** node rather than the joiner, and the difference
+        /// is the whole point of the boundary: it stands at the block's own parent with
+        /// a current finalized head, so its verdict on this body is the network's and it
+        /// charges for what it finds. `ProofInvalid` is intrinsic, so it would charge
+        /// from anywhere — but on the joiner it would never *see* it. `validate_body`
+        /// checks each tx's anchor before its proof, so on a node that cannot answer the
+        /// anchor question the per-tx checks after it are never reached. That is a
+        /// consequence worth naming, and it is exactly why an unjudged body is dropped
+        /// rather than buffered: nothing in it has been verified.
+        ///
+        /// The complement — a genuinely non-final **anchor**, charged from the position
+        /// that owns that verdict — is
+        /// `adapter::tests::a_genuinely_invalid_body_still_costs_the_sender` case (2).
+        #[test]
+        fn a_body_with_an_unverifiable_proof_still_costs_the_sender() {
+            let (server, anchor) = transacting_server(false);
+            // The receiver is synced: same finalized genesis, standing at the same tip.
+            let (receiver, _) = transacting_server(true);
+            assert_eq!(receiver.state().finalized_height(), Some(0), "its finality is current");
+            let (mut nodes, _hub) = pair(server, receiver);
+
+            // The server admits and mines a tx its own (lenient) verifier accepts.
+            assert_eq!(
+                nodes[0].node_mut().ingest_tx(tx_with(anchor, 1, b"not-a-proof")),
+                IngestOutcome::Accepted,
+                "the lenient server takes its own bad proof"
+            );
+            let (header, body) = nodes[0].node_mut().mine_block().expect("mine");
+            assert_eq!(body.txs.len(), 1);
+            nodes[0].announce_block(header, body.txs.clone(), body.coinbase, body.coinbase_rkm, 1);
+            drive(&mut nodes, 50_000);
+
+            assert_eq!(
+                nodes[1].peers().get(PeerId(1)).expect("peer").score,
+                -crate::gossip::PENALTY_INVALID_OBJECT,
+                "an unverifiable proof is the sender's fault and is charged as one"
+            );
+            assert_eq!(
+                nodes[1].node().ingest_counters().unjudged_anchor,
+                0,
+                "and nothing about it was excused as unjudgeable"
+            );
+            assert_eq!(nodes[1].node().chain().tip_height(), 0, "nor was the header taken");
+        }
     }
 }
