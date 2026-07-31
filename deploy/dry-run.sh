@@ -9,7 +9,17 @@
 #   2. the 21 keys split 6/5/5/5, disjoint and complete (union == 0..20),
 #   3. the genesis file is byte-identical on all 4 nodes,
 #   4. `qumbra-node check` passes on every node (real verify_startup + key
-#      cross-check against committee₀), reporting the same pinned genesis hash.
+#      cross-check against committee₀), reporting the same pinned genesis hash,
+#   5. the committee keys are laid down at 0700 on the DIRECTORY and 0600 on each
+#      FILE — asserted in the deployed tree, in the staging tree they were copied
+#      from, and again after a re-deploy over a deliberately loosened tree.
+#
+# Why (5) is three assertions and not one: the defect it guards against left every
+# key FILE correctly 0600 and only the enclosing DIRECTORY world-searchable, so a
+# file-mode check passed while four public-IP hosts ran `drwxr-xr-x /opt/qumbra/keys`.
+# Asserting the deployed copy alone would also pass for a fix applied to the copy
+# instead of the stage, and a fresh-tree assertion cannot see that `cp -R` leaves an
+# existing directory's mode alone where `rsync -a` rewrites it.
 #
 # Exit non-zero on the first failed assertion.
 #
@@ -35,11 +45,38 @@ done
 
 [[ -n "$BASE" ]] || BASE="$(mktemp -d "${TMPDIR:-/tmp}/qmb-t0-dryrun.XXXXXX")"
 BASE="$(cd "$BASE" && pwd)"
-cleanup() { [[ "$KEEP" -eq 1 ]] || rm -rf "$BASE"; }
+# Set by pass 2 (deploy.sh --keep-stage); removed with the rest on exit.
+STAGE=""
+cleanup() {
+  [[ "$KEEP" -eq 1 ]] || rm -rf "$BASE"
+  [[ -z "$STAGE" || "$KEEP" -eq 1 ]] || rm -rf "$STAGE"
+  return 0
+}
 trap cleanup EXIT
 
 pass() { echo "  ok  - $*"; }
 fail() { echo "  FAIL- $*" >&2; exit 1; }
+
+# A path's permission bits as octal, without a leading 0. BSD stat (macOS, where
+# the staging half of a deploy runs) and GNU stat (Linux) spell this differently.
+mode_of() { stat -f '%OLp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+
+# Assert keys/ is 0700 and every committee key in it is 0600, then report. `where`
+# labels the failure message: the same invariant is checked in three places, and a
+# failure has to say WHICH of them broke.
+assert_key_modes() {
+  local dir="$1" where="$2" m kp km n=0
+  [[ -d "$dir" ]] || fail "$where: no keys/ directory at $dir"
+  m="$(mode_of "$dir")"
+  [[ "$m" == "700" ]] || fail "$where: keys/ must be 0700, got 0$m"
+  for kp in "$dir"/committee-*.key; do
+    [[ -e "$kp" ]] || fail "$where: keys/ holds no committee-*.key"
+    km="$(mode_of "$kp")"
+    [[ "$km" == "600" ]] || fail "$where: $(basename "$kp") must be 0600, got 0$km"
+    n=$((n + 1))
+  done
+  pass "$where: keys/ 0700, all $n key files 0600"
+}
 
 echo "== T0 deploy dry-run =="
 echo "  base: $BASE"
@@ -97,6 +134,15 @@ for i in "${!NODES[@]}"; do
   done
   pass "$name: holds $got_keys committee keys"
 
+  # 2c. key material modes, DIRECTORY as well as files. `genesis init` writes 0700/0600
+  #     and both deploy transports preserve modes, so this is the mode the live hosts
+  #     get. `node_root` itself is deliberately NOT asserted: it holds only public
+  #     material (genesis.qmb, node.toml, the binary, data/), it is left at the
+  #     operator's umask by design, and pinning it to 0755 here would fail for anyone
+  #     deploying under a tighter umask — a test that can fail on umask alone is worse
+  #     than no test.
+  assert_key_modes "$root/keys" "$name deployed"
+
   # 3. genesis byte-identical vs node0
   if [[ "$i" -gt 0 ]]; then
     cmp -s "$BASE/nodes/node0/genesis.qmb" "$root/genesis.qmb" \
@@ -137,6 +183,46 @@ for h in "${HASHES[@]}"; do
   [[ "$h" == "$base_hash" ]] || fail "genesis hash mismatch across nodes ($h != $base_hash)"
 done
 pass "all 4 nodes pinned to genesis $base_hash"
+
+# ---- pass 2: the creation site, and a re-deploy over a loosened tree ---------
+#
+# Everything above inspects a COPY of the staging tree. Two failures it cannot see:
+#
+#   (a) a mode fixed on the copy instead of at the stage. `--keep-stage` keeps the
+#       staging tree and deploy.sh prints its path, so the modes can be asserted
+#       where they are set rather than one transport downstream.
+#   (b) a re-deploy onto a tree the PRE-FIX script laid down. `rsync -a --delete`
+#       (real hosts) rewrites an existing directory's mode; `cp -R` (local mode)
+#       does not — so without an explicit mode on the destination, a 0755 keys/
+#       would survive every future local deploy while the remote path self-repaired.
+#
+# Loosen all four keys/ to 0755 first: that is exactly the state the live net was
+# found in on 2026-07-31, so this pass fails on an unfixed script and passes on a
+# fixed one.
+echo "== pass 2: staged modes + re-deploy over a loosened tree =="
+for name in "${NODES[@]}"; do
+  chmod 755 "$BASE/nodes/$name/keys"
+  [[ "$(mode_of "$BASE/nodes/$name/keys")" == "755" ]] \
+    || fail "$name: could not loosen keys/ to 0755 to set up the re-deploy check"
+done
+pass "loosened all 4 keys/ to 0755 (the state the live net was found in)"
+
+"$SCRIPT_DIR/deploy.sh" \
+  --hosts "$HOSTS" \
+  --local-base "$BASE/nodes" \
+  --metrics-port 9090 \
+  --binary "$BINARY" \
+  --keep-stage > "$BASE/redeploy.log"
+STAGE="$(awk '/^ *stage: /{print $2}' "$BASE/redeploy.log")"
+[[ -n "$STAGE" && -d "$STAGE/stage" ]] \
+  || fail "deploy.sh --keep-stage reported no usable stage path (got '${STAGE:-}')"
+pass "re-deploy complete, stage kept at $STAGE"
+
+for i in "${!NODES[@]}"; do
+  name="${NODES[$i]}"
+  assert_key_modes "$STAGE/stage/$name/keys" "$name staged"
+  assert_key_modes "$BASE/nodes/$name/keys" "$name re-deployed"
+done
 
 echo "== DRY-RUN PASSED =="
 echo "genesis hash: $base_hash"

@@ -48,6 +48,11 @@ readonly N_MACHINES=4
 readonly N_KEYS=21
 readonly KEY_SPLIT=(6 5 5 5)   # sums to 21; ~5-6 keys/node
 
+# Mode for the committee-key directory, at BOTH ends of both transports. Not the
+# umask default: see the block at the staging `install -d` below for why this is
+# the one directory in the payload whose mode is load-bearing.
+readonly KEYS_DIR_MODE=700
+
 # ---- args -------------------------------------------------------------------
 HOSTS_FILE=""
 LOCAL_BASE="./t0-deploy"
@@ -126,6 +131,10 @@ echo "  binary:      $BINARY"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/qmb-t0-deploy.XXXXXX")"
 cleanup() { [[ "$KEEP_STAGE" -eq 1 ]] || rm -rf "$WORK"; }
 trap cleanup EXIT
+# Printed as soon as the stage exists (not at the end), so it is available even if
+# the run dies mid-way — and so a checker can assert the staged modes AT their
+# creation site rather than at a downstream copy of them.
+[[ "$KEEP_STAGE" -eq 1 ]] && echo "  stage:       $WORK  (kept: --keep-stage)"
 
 # ---- generate the ONE shared genesis + 21 keys ------------------------------
 echo "== generating genesis + $N_KEYS committee keys =="
@@ -160,9 +169,21 @@ for i in "${!NAMES[@]}"; do
   peers_csv="$(IFS=, ; echo "${peers[*]}")"
 
   # this node's committee key files (its slice of the 21)
+  #
+  # 0700 EXPLICITLY, not whatever the operator's umask gives. `genesis init` writes
+  # keys/ at 0700 and each key at 0600 (issue #161), and both transports below
+  # preserve modes — so the mode set HERE is the mode on four public-IP hosts.
+  # The `cp` in the loop below carries the FILE mode faithfully, which is why a
+  # check that only looks at file modes passes; the staging DIRECTORY got
+  # 0755 from the default umask, and `rsync -a` then carried that 0755 to the live
+  # net (found by hand after the 2026-07-31 genesis mint, `drwxr-xr-x /opt/qumbra/keys`).
+  #
+  # Fixed at creation rather than with `rsync --chmod`: --chmod fixes the transport
+  # and leaves the stage wrong, so anyone who inspects the stage (--keep-stage) or
+  # moves it another way gets 0755 back.
   key_paths=()
   stage="$WORK/stage/$name"
-  mkdir -p "$stage/keys"
+  install -d -m "$KEYS_DIR_MODE" "$stage/keys"
   for ((k=0; k<n_keys; k++)); do
     idx=$((key_start + k))
     kf="$(printf 'committee-%02d.key' "$idx")"
@@ -223,6 +244,17 @@ EOF
   if [[ "$ssh" == "-" ]]; then
     echo "-- $name -> LOCAL $node_root ($n_keys keys, listen $listen)"
     mkdir -p "$node_root"
+    # `$node_root` itself keeps the umask default: it holds genesis.qmb (public and
+    # hash-pinned), node.toml (addresses and key PATHS, no key material), the binary
+    # and data/. Only keys/ is tightened.
+    #
+    # keys/ is set here as well as on the stage because the two transports differ on
+    # a RE-deploy: `rsync -a --delete` (remote) rewrites an existing directory's mode,
+    # so a host laid down by the pre-fix script is repaired on the next deploy — but
+    # `cp -R` (local) leaves an existing directory's mode alone, so a 0755 keys/ from
+    # a pre-fix run would survive every future local deploy. Same trap `genesis.rs`
+    # documents for `fs::write` not changing an existing file's mode.
+    install -d -m "$KEYS_DIR_MODE" "$node_root/keys"
     cp -R "$stage/." "$node_root/"
   else
     echo "-- $name -> $ssh:$node_root ($n_keys keys, listen $listen)"

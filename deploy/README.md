@@ -31,9 +31,27 @@ deploy/dry-run.sh --keep     # keep the tree to inspect it
 
 It writes a local hosts spec (`127.0.0.1:9401..9404`, ssh target `-`), invokes
 `deploy.sh` in local mode, and checks: every payload present; the 21 keys split
-6/5/5/5 disjoint + complete; the genesis file byte-identical on all 4 nodes; and
+6/5/5/5 disjoint + complete; the genesis file byte-identical on all 4 nodes;
 `qumbra-node check` passing on every node with a single shared pinned genesis
-hash. Exits non-zero on the first failed assertion.
+hash; and the **committee key modes — 0700 on `keys/`, 0600 on each key file**.
+Exits non-zero on the first failed assertion.
+
+The mode check runs three times over and is worth understanding before editing it.
+On 2026-07-31 the T0 net was found with `drwxr-xr-x /opt/qumbra/keys` while every
+key file inside was correctly `0600`: `genesis init` sets both modes, but
+`deploy.sh` re-created the staging directory under the default umask and
+`rsync -a` faithfully carried `0755` to four public-IP hosts. So:
+
+1. the **deployed** tree is asserted — the fresh-deploy case,
+2. the **staging** tree is asserted (`deploy.sh --keep-stage` now prints its path)
+   — the modes at the site where they are set, not one transport downstream,
+3. the deployed tree is asserted **again after a re-deploy** over a `keys/` that
+   was deliberately loosened back to `0755` — because `rsync -a --delete` rewrites
+   an existing directory's mode but `cp -R` (local mode) does not, so the two
+   transports disagree on whether a pre-fix tree self-repairs.
+
+A check that looked only at file modes, or only at the deployed copy, would have
+passed at every point in that history.
 
 ## Phase B-WAN — VPS provisioning requirements **[manual — Larry]** ✅ DISCHARGED 2026-07-26
 
@@ -121,7 +139,11 @@ uses) fits the ≥ 4 GB / 2 vCPU VPS spec.
   (`expected_genesis_hash`) — a node started against a different genesis refuses
   to boot (item 2).
 - Each node receives **only** the committee keys it holds (key distribution, not a
-  blanket copy).
+  blanket copy), in a `keys/` directory set to **0700 explicitly at creation** —
+  both transports preserve modes, so the staged mode is the mode on the host.
+  `$node_root` itself (`/opt/qumbra`) is deliberately left at the operator's umask:
+  it holds `genesis.qmb` (public and hash-pinned), `node.toml` (addresses and key
+  *paths*, no key material), the binary and `data/`.
 - Configs carry absolute destination paths, so the same payload works whether the
   root is a local dry-run dir or `/opt/qumbra` on a VPS.
 
