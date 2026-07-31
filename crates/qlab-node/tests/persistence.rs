@@ -510,3 +510,71 @@ fn a_refused_rewind_mutates_nothing() {
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&side_dir).ok();
 }
+
+/// **The measured cost of a rewind** (issue #162) — `#[ignore]`d because it is a
+/// measurement, not an assertion, and a timing threshold in the suite is a flake
+/// waiting to happen.
+///
+/// Run it deliberately:
+/// `cargo test --release -p qlab-node --test persistence -- --ignored --nocapture`
+///
+/// What it measures: a **depth-1** rewind (the ordinary sibling race) at several
+/// retained heights, because `rewind_to` re-folds the retained path from genesis and
+/// so costs `O(retained height)` regardless of how little it undoes. That is the
+/// trade the design took — one forward transition function instead of a forward one
+/// plus its inverse — and this is the number that says what it costs.
+#[test]
+#[ignore]
+fn measure_the_cost_of_a_rewind() {
+    for height in [64u64, 256, 1024] {
+        let dir = temp_dir(&format!("i162-cost-{height}"));
+        let (mut node, g_header, root) = node_with_finalized_genesis(&dir);
+        let mut parent = g_header;
+        for i in 0..height {
+            // Unique nullifier + commitment per block, so the chain is real work for
+            // the re-fold rather than a repeat of one leaf.
+            let mut nf = [0u8; 32];
+            nf[..8].copy_from_slice(&i.to_le_bytes());
+            let mut cm = [0xffu8; 32];
+            cm[..8].copy_from_slice(&i.to_le_bytes());
+            let body = BlockBody {
+                txs: vec![tx(root, vec![nf], vec![cm])],
+                coinbase: 0,
+                coinbase_rkm: [i; 4],
+            };
+            let header = BlockHeader::child_of(
+                &parent,
+                parent.timestamp + 75,
+                GENESIS_DIFFICULTY,
+                body.commitment(),
+            );
+            node.apply_block(header, body, &MockVerifier).expect("chain block applies");
+            parent = header;
+        }
+        let target = parent.prev;
+        let started = std::time::Instant::now();
+        let report = node.rewind_to(target).expect("depth-1 rewind");
+        let elapsed = started.elapsed();
+        assert_eq!(report.blocks_undone(), 1);
+
+        // The comparison that says where the cost lives: a from-genesis `replay` of
+        // the same log. Both re-fold every retained block through `apply_state`, so
+        // if the two are the same order of magnitude, the rewind is not paying for
+        // anything a restart does not already pay for — and any future work on one
+        // is work on the other.
+        let started_replay = std::time::Instant::now();
+        let replayed = MemNode::replay(&dir, genesis_block(GENESIS_DIFFICULTY, 0)).expect("replay");
+        let replay_elapsed = started_replay.elapsed();
+        assert_eq!(replayed.commitment_count(), node.commitment_count() + 1);
+
+        println!(
+            "REWIND-COST retained_height={height} blocks_undone=1 rewind_us={} \
+             replay_us={} leaves={} nullifiers={}",
+            elapsed.as_micros(),
+            replay_elapsed.as_micros(),
+            node.commitment_count(),
+            node.nullifier_count()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
