@@ -66,7 +66,9 @@ pub use mempool::{
     consensus_weight_params, tx_weight, txid, AssemblyError, BlockTemplate, Mempool, MempoolError,
     MempoolParams, MempoolTx, TxId,
 };
-pub use node::{genesis_block, MemNode, Node, NodeError, NodeState, RecoveryReport};
+pub use node::{
+    genesis_block, MemNode, Node, NodeError, NodeState, RecoveryReport, RewindReport,
+};
 pub use recovery::{
     catch_up_slot, committee_accrual_finalized, committee_accrual_for_span, Finalizer,
     FinalizerState, SignRefusal, FINALIZER_FORMAT_VERSION,
@@ -83,7 +85,7 @@ pub use telemetry::{
 pub use persist::{Snapshot, BLOCK_LOG, FORMAT_VERSION, SNAPSHOT};
 pub use store::{
     ChainStore, CommitmentStore, Hash32, MemChainStore, MemCommitmentStore, MemNullifierStore,
-    NullifierStore, StoredBlock, StoredHeader, StoredTx,
+    NullifierStore, RewindError, StoredBlock, StoredHeader, StoredTx,
 };
 pub use supply::{
     supply_by_epoch, SupplyBlock, SupplyEpoch, SupplyError, SupplyLedger,

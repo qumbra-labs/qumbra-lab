@@ -33,7 +33,7 @@ use qlab_devnet::params_devnet::MAX_ANCHOR_AGE_BLOCKS;
 use crate::persist::{self, LogRecord, Snapshot, FORMAT_VERSION};
 use crate::store::{
     ChainStore, CommitmentStore, Hash32, MemChainStore, MemCommitmentStore, MemNullifierStore,
-    NullifierStore, StoredBlock,
+    NullifierStore, RewindError, StoredBlock,
 };
 
 /// The default all-in-memory node composition (with optional disk durability).
@@ -68,6 +68,49 @@ impl std::fmt::Display for RecoveryReport {
     }
 }
 
+/// What a [`MemNode::rewind_to`] undid (issue #162).
+///
+/// Carries both ends rather than a depth, because "how far back" and "back onto
+/// what" are different operator questions and the second one is the one that
+/// distinguishes a rejoin from a repeat: `to_hash` is the block the state machine
+/// will now re-apply forward from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RewindReport {
+    pub from_height: u64,
+    pub from_hash: Hash32,
+    pub to_height: u64,
+    pub to_hash: Hash32,
+}
+
+impl RewindReport {
+    /// How many applied blocks were dropped. The abandoned branch is linear from
+    /// `to_hash` to `from_hash` (the target is an ancestor of the old tip — the
+    /// rewind refuses otherwise), so the height difference is the block count.
+    pub fn blocks_undone(&self) -> u64 {
+        self.from_height.saturating_sub(self.to_height)
+    }
+
+    /// Whether anything was actually undone. A rewind to the current tip is a
+    /// permitted no-op, and a no-op must not be reported as a recovery event.
+    pub fn is_noop(&self) -> bool {
+        self.from_hash == self.to_hash
+    }
+}
+
+impl std::fmt::Display for RewindReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "REWIND applied tip {} at height {} → {} at height {} ({} block(s) undone)",
+            hex8(&self.from_hash),
+            self.from_height,
+            hex8(&self.to_hash),
+            self.to_height,
+            self.blocks_undone()
+        )
+    }
+}
+
 /// Why applying a block failed.
 #[derive(Debug)]
 pub enum NodeError {
@@ -96,6 +139,9 @@ pub enum NodeError {
     /// The snapshot claims finality that the authoritative append-only log cannot
     /// reproduce. Accepting it would make `open` disagree with `replay`.
     SnapshotFinalityNotLogged { hash: Hash32, height: u64 },
+    /// A rewind of the applied chain was refused (issue #162). See
+    /// [`RewindError`] — every variant leaves node state untouched.
+    Rewind(RewindError),
     /// A persistence error.
     Io(io::Error),
 }
@@ -129,6 +175,7 @@ impl std::fmt::Display for NodeError {
                 "snapshot finalized head {} at height {height} has no matching finalization in the block log",
                 hex8(hash)
             ),
+            NodeError::Rewind(e) => write!(f, "rewind refused: {e}"),
             NodeError::Io(e) => write!(f, "persistence error: {e}"),
         }
     }
@@ -244,82 +291,141 @@ impl MemNode {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).map_err(NodeError::Io)?;
 
-        let mut node = Self::from_genesis(genesis, Some(dir.clone()));
         let records = persist::read_records(&dir).map_err(NodeError::Io)?;
+        let genesis_hash = genesis.header().header_hash();
+        let snapshot = persist::load_snapshot(&dir)
+            .map_err(NodeError::Io)?
+            .filter(|snap| snap.genesis_hash == genesis_hash);
 
         // Fast path: restore derived state (tree/nullifiers/roots) from the
         // snapshot, so log-prefix blocks only need to rebuild the chain store
         // (cheap header inserts), not re-fold the tree. Blocks past the snapshot,
         // and every finalization, are fully replayed — keeping the result
-        // identical to a from-genesis `replay`. No valid snapshot ⇒ full replay.
-        let snapshot = persist::load_snapshot(&dir)
-            .map_err(NodeError::Io)?
-            .filter(|snap| snap.genesis_hash == node.chain.genesis_hash());
-        let mut replayed_records = 0usize;
+        // identical to a from-genesis `replay`.
+        //
+        // A snapshot that the log does not corroborate is `Ok(None)`, not an
+        // error: the full replay below is always correct, and that fall-through is
+        // the discipline `persist` already documents for a torn or
+        // version-mismatched snapshot. Issue #162 gave it a second way to happen —
+        // see [`Self::resume_from_snapshot`].
         if let Some(snap) = snapshot.as_ref() {
-            node.restore_from_snapshot(snap);
+            if let Some(node) = Self::resume_from_snapshot(&dir, &genesis, snap, &records)? {
+                return Ok(node);
+            }
+        }
+        Self::resume_by_replay(&dir, genesis, &records)
+    }
 
-            // First reconstruct the snapshot prefix's block store. Finality is
-            // restored only after every prefix block exists, so the persisted
-            // `(hash, height)` can be proved against the actual main chain.
-            for rec in &records {
-                if let LogRecord::Block(b) = rec {
-                    if b.header.height <= snap.applied_height {
-                        // Derived state already restored — just rebuild the chain
-                        // store. The binding is still checked (issue #77): this
-                        // path skips `apply_state`, so it would otherwise be the
-                        // one way a corrupted log record enters unchecked.
-                        check_stored_binding(b)?;
-                        node.chain.put_block(b.clone()).map_err(NodeError::Chain)?;
+    /// The snapshot-assisted resume. `Ok(None)` = this snapshot cannot be
+    /// honoured against this log and the caller must replay from genesis.
+    fn resume_from_snapshot(
+        dir: &Path,
+        genesis: &StoredBlock,
+        snap: &Snapshot,
+        records: &[LogRecord],
+    ) -> Result<Option<Self>, NodeError> {
+        let mut node = Self::from_genesis(genesis.clone(), Some(dir.to_path_buf()));
+        node.restore_from_snapshot(snap);
+
+        // First reconstruct the snapshot prefix's block store. Finality is
+        // restored only after every prefix block exists, so the persisted
+        // `(hash, height)` can be proved against the actual main chain.
+        for rec in records {
+            if let LogRecord::Block(b) = rec {
+                if b.header.height <= snap.applied_height {
+                    // Derived state already restored — just rebuild the chain
+                    // store. The binding is still checked (issue #77): this
+                    // path skips `apply_state`, so it would otherwise be the
+                    // one way a corrupted log record enters unchecked. It stays
+                    // FIRST: a tampered record is refused outright, and must not
+                    // be mistaken for the rewind below.
+                    check_stored_binding(b)?;
+                    // Issue #162: the log is append-only but the applied chain is
+                    // no longer append-only, so a prefix record whose parent is not
+                    // the running tip is the live node's rewind, replayed here at
+                    // the chain-store layer only (derived state came from the
+                    // snapshot). See [`Self::apply_logged_block`] for the rule.
+                    if b.header.height > 0 && b.header.prev != node.chain.tip_hash() {
+                        node.chain.rewind_to(b.header.prev).map_err(NodeError::Rewind)?;
                     }
+                    node.chain.put_block(b.clone()).map_err(NodeError::Chain)?;
                 }
             }
+        }
 
-            if let Some((hash, height)) = snap.finalized {
-                node.chain
-                    .restore_finalized(hash, height)
-                    .map_err(NodeError::SnapshotFinality)?;
-                if !records
-                    .iter()
-                    .any(|rec| matches!(rec, LogRecord::Finalize(logged) if *logged == hash))
-                {
-                    return Err(NodeError::SnapshotFinalityNotLogged { hash, height });
-                }
+        // **The snapshot has to describe the state this log actually reaches.**
+        // Before issue #162 that held by construction: the log was append-only and
+        // so was the applied chain, so reconstructing every record at or below
+        // `applied_height` could only land on `snap.tip`. A rewind breaks the
+        // second half of that — a snapshot taken at height H on the branch that
+        // subsequently lost carries derived state for a tip the log no longer ends
+        // that prefix on. Its tree and nullifier set are for the wrong branch, and
+        // nothing downstream would notice. So the agreement is checked rather than
+        // assumed, and a disagreement costs a full replay instead of a fork.
+        if node.chain.tip_hash() != snap.tip {
+            return Ok(None);
+        }
+
+        if let Some((hash, height)) = snap.finalized {
+            node.chain
+                .restore_finalized(hash, height)
+                .map_err(NodeError::SnapshotFinality)?;
+            if !records
+                .iter()
+                .any(|rec| matches!(rec, LogRecord::Finalize(logged) if *logged == hash))
+            {
+                return Err(NodeError::SnapshotFinalityNotLogged { hash, height });
             }
+        }
 
-            // Replay only state beyond the snapshot. Every finalization record is
-            // offered to the live advance rule: prefix records are harmlessly
-            // rejected as non-advancing, while a finalization written after the
-            // snapshot still advances even when it names a prefix block.
-            for rec in &records {
-                match rec {
-                    LogRecord::Block(b) if b.header.height <= snap.applied_height => {}
-                    LogRecord::Block(b) => {
-                        node.apply_state(b)?;
+        // Replay only state beyond the snapshot. Every finalization record is
+        // offered to the live advance rule: prefix records are harmlessly
+        // rejected as non-advancing, while a finalization written after the
+        // snapshot still advances even when it names a prefix block.
+        let mut replayed_records = 0usize;
+        for rec in records {
+            match rec {
+                LogRecord::Block(b) if b.header.height <= snap.applied_height => {}
+                LogRecord::Block(b) => {
+                    node.apply_logged_block(b)?;
+                    replayed_records += 1;
+                }
+                LogRecord::Finalize(hash) => {
+                    if node.chain.set_finalized(*hash) {
                         replayed_records += 1;
                     }
-                    LogRecord::Finalize(hash) => {
-                        if node.chain.set_finalized(*hash) {
-                            replayed_records += 1;
-                        }
-                    }
                 }
-            }
-        } else {
-            for rec in &records {
-                match rec {
-                    LogRecord::Block(b) => {
-                        node.apply_state(b)?;
-                    }
-                    LogRecord::Finalize(hash) => {
-                        node.chain.set_finalized(*hash);
-                    }
-                }
-                replayed_records += 1;
             }
         }
         node.recovery = RecoveryReport {
-            snapshot_height: snapshot.as_ref().map(|snap| snap.applied_height),
+            snapshot_height: Some(snap.applied_height),
+            replayed_records,
+            resumed_tip: node.chain.tip_height(),
+        };
+        Ok(Some(node))
+    }
+
+    /// The from-genesis resume: every record replayed, no snapshot consulted.
+    fn resume_by_replay(
+        dir: &Path,
+        genesis: StoredBlock,
+        records: &[LogRecord],
+    ) -> Result<Self, NodeError> {
+        let mut node = Self::from_genesis(genesis, Some(dir.to_path_buf()));
+        let mut replayed_records = 0usize;
+        for rec in records {
+            match rec {
+                LogRecord::Block(b) => {
+                    node.apply_logged_block(b)?;
+                }
+                LogRecord::Finalize(hash) => {
+                    node.chain.set_finalized(*hash);
+                }
+            }
+            replayed_records += 1;
+        }
+        node.recovery = RecoveryReport {
+            snapshot_height: None,
             replayed_records,
             resumed_tip: node.chain.tip_height(),
         };
@@ -335,7 +441,7 @@ impl MemNode {
         for rec in persist::read_records(&dir).map_err(NodeError::Io)? {
             match rec {
                 LogRecord::Block(b) => {
-                    node.apply_state(&b)?;
+                    node.apply_logged_block(&b)?;
                 }
                 LogRecord::Finalize(h) => {
                     node.chain.set_finalized(h);
@@ -343,6 +449,105 @@ impl MemNode {
             }
         }
         Ok(node)
+    }
+
+    /// Apply one block read back from the durable log, **following the same
+    /// rewind the live node performed** (issue #162).
+    ///
+    /// The block log is append-only and stays that way — no new record type, no
+    /// format bump, no rewrite. What changed is that the *applied chain* is no
+    /// longer append-only, and the log already carries that faithfully: a record
+    /// is written by [`Node::apply_block`], which applies at the tip only, so in
+    /// log order every block's `prev` **is** the tip at the moment it was applied.
+    /// A record whose `prev` is not the running tip therefore says exactly one
+    /// thing — the live node rewound to `prev` before applying it — and replaying
+    /// that inference reproduces the live sequence exactly.
+    ///
+    /// Inferring it beats recording it. A `LogRecord::Rewind` would have to be read
+    /// by binaries that predate it, and a datadir written after this change could
+    /// not be opened by one that came before; the inference costs one hash
+    /// comparison per record and leaves every existing `blocks.log` byte-identical
+    /// in meaning. It is also self-checking: `rewind_to` refuses a `prev` that is
+    /// not an ancestor of the replayed tip, so a log that does *not* describe a
+    /// rewind cannot be silently reinterpreted as one.
+    fn apply_logged_block(&mut self, block: &StoredBlock) -> Result<(), NodeError> {
+        if block.header.height > 0 && block.header.prev != self.chain.tip_hash() {
+            self.rewind_to(block.header.prev)?;
+        }
+        self.apply_state(block)?;
+        Ok(())
+    }
+
+    /// **Rewind the applied state to `target`, an ancestor of the applied tip**
+    /// (issue #162) — the operation whose absence made a state machine on a losing
+    /// sibling absorbing.
+    ///
+    /// `apply_block` extends the tip and only the tip. Before this existed, a state
+    /// machine that had applied a block which then lost fork choice had no move: the
+    /// winning sibling did not extend its tip, no descendant of the winner ever
+    /// would, and the node reported `mready=synced` while applying nothing, forever
+    /// (measured on the 2026-07-31 T0 net at the full block rate for eleven hours).
+    ///
+    /// **What it does not do.** This is not fork choice and it is not a reorg
+    /// primitive. It only *undoes*: it takes the state machine back to a block it
+    /// has already applied, and re-application forward is the caller's, through the
+    /// unchanged `apply_block` funnel. Nothing here decides which branch is right —
+    /// `ChainState`'s heaviest-chain rule already did, and this is the state machine
+    /// catching up with that answer.
+    ///
+    /// **Three refusals, and the state is untouched on every one of them**
+    /// ([`RewindError`]): an unknown target, a target that is not an ancestor of the
+    /// applied tip, and — the load-bearing one — a target that would cross the
+    /// finalized head. The finality refusal is why `qlab_devnet::finality` and
+    /// [`crate::recovery`] are untouched by this change: the no-reorg-past-finality
+    /// rule is enforced at the new door, in front of the drop, rather than being
+    /// repaired after the fact by the machinery that owns it.
+    ///
+    /// **Rebuilt, not un-applied.** The retained ancestor path is re-folded from
+    /// genesis through `apply_state` — the same single funnel `replay` uses — so the
+    /// rewound state is by construction the state a from-genesis replay of the
+    /// retained chain produces, which is this crate's standing correctness anchor.
+    /// Un-applying the suffix in place would mean a second, inverse transition
+    /// function to keep in step with the forward one; the tree, the nullifier set,
+    /// the anchor index and the derived coinbase-maturity leaf would each need their
+    /// own undo, and only one of those four is a plain truncation. The cost is
+    /// `O(retained height)` per rewind, paid on a rare event (fork choice moving off
+    /// a branch this node had applied), against an in-memory re-fold with no proof
+    /// verification and no disk write — see the PR body for the measured figure.
+    ///
+    /// **Nothing is written.** The log already holds every retained block; the
+    /// abandoned blocks stay in it too, and [`Self::apply_logged_block`] is what
+    /// makes replay reach the same place.
+    pub fn rewind_to(&mut self, target: Hash32) -> Result<RewindReport, NodeError> {
+        let from_height = self.chain.tip_height();
+        let from_hash = self.chain.tip_hash();
+        if from_hash == target {
+            return Ok(RewindReport { from_height, from_hash, to_height: from_height, to_hash: target });
+        }
+        let kept = self.chain.rewind_path(&target).map_err(NodeError::Rewind)?;
+        let finalized = self.chain.finalized_hash().zip(self.chain.finalized_height());
+
+        // Built beside the live state and swapped in only on success, so a failure
+        // anywhere in the re-fold leaves the node exactly as it was.
+        let mut rebuilt = Self::from_genesis(kept[0].clone(), self.dir.clone());
+        for block in &kept[1..] {
+            rebuilt.apply_state(block)?;
+        }
+        if let Some((hash, height)) = finalized {
+            rebuilt
+                .chain
+                .restore_finalized(hash, height)
+                .expect("rewind_path proved the retained tip descends from the finalized head");
+        }
+        rebuilt.recovery = self.recovery;
+        let report = RewindReport {
+            from_height,
+            from_hash,
+            to_height: rebuilt.chain.tip_height(),
+            to_hash: rebuilt.chain.tip_hash(),
+        };
+        *self = rebuilt;
+        Ok(report)
     }
 
     fn from_genesis(genesis: StoredBlock, dir: Option<PathBuf>) -> Self {
