@@ -1996,9 +1996,18 @@ mod tests {
         // 🔴 The finding, as an assertion: before `stip`/`slag`, this line was
         // byte-identical to the healthy node's. Every pre-existing field on it comes
         // from fork choice — the view that works.
+        // `stipid=`/`schain=` (issue #162 finding 6) are stripped alongside #130 (a)'s
+        // two, because the claim under test is about the line **as it stood before
+        // either baton** — and this list growing is itself the point: `stipid=` alone
+        // would also have separated these two nodes, one baton later.
         let strip = |line: &str| {
             line.split_whitespace()
-                .filter(|kv| !kv.starts_with("stip=") && !kv.starts_with("slag="))
+                .filter(|kv| {
+                    !kv.starts_with("stip=")
+                        && !kv.starts_with("slag=")
+                        && !kv.starts_with("stipid=")
+                        && !kv.starts_with("schain=")
+                })
                 .collect::<Vec<_>>()
                 .join(" ")
         };
@@ -2735,7 +2744,7 @@ mod tests {
         assert_eq!(b.mine_gate(), MineGate::Unknown, "a node that has heard from nobody");
         assert!(!b.try_mine(), "🔴 this call mining a block IS the #106 fork");
         assert_eq!(b.tip_height(), 0, "and no fork block exists");
-        assert!(b.telemetry_sample().ends_with(" mready=unknown"));
+        assert!(b.telemetry_sample().contains(" mready=unknown "), "{}", b.telemetry_sample());
 
         // ── (2) Catching up. Refused on every pass until the header chain lands.
         let mut refusals = 0;
@@ -2760,7 +2769,7 @@ mod tests {
         assert!(!b.try_mine(), "still refused, now for the state lag");
         let line = b.telemetry_sample();
         assert!(line.contains(" stip=0 slag=3"), "{line}");
-        assert!(line.ends_with(" mready=synced"), "the readiness gate is open: {line}");
+        assert!(line.contains(" mready=synced "), "the readiness gate is open: {line}");
 
         // ── (3) The bodies arrive the way a live announce would deliver them.
         let chain = a.p2p().node().chain();
@@ -2868,7 +2877,7 @@ mod tests {
         assert!(zero.try_mine(), "no network to be behind");
         assert!(!one.try_mine(), "one address it has not reached is enough to wait");
         assert_eq!(one.tip_height(), 0);
-        assert!(one.telemetry_sample().ends_with(" mready=unknown"));
+        assert!(one.telemetry_sample().contains(" mready=unknown "), "{}", one.telemetry_sample());
 
         let _ = std::fs::remove_dir_all(&zbase);
         let _ = std::fs::remove_dir_all(&obase);
