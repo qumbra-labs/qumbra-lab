@@ -1,0 +1,83 @@
+# A PRE-FILTER. NOT the acceptance bar.
+#
+# The acceptance bar is, and stays, the full unfiltered workspace suite run
+# serially on the rig — see CLAUDE.md §5. This workflow exists for one reason:
+# four batons queueing for one machine is the project's actual bottleneck, and a
+# compile error should never consume an 18-minute rig slot to be discovered.
+#
+# It deliberately does NOT run tests. A CI that ran "everything except the heavy
+# tests" would be a filtered run reported as a pass, which is exactly what
+# lab PR #166 cost us. This one cannot be mistaken for the bar because it never
+# claims to have run one.
+name: pre-filter
+
+# push is restricted to main. A branch push and its PR produce DIFFERENT
+# github.ref values (refs/heads/x vs refs/pull/N/merge), so the concurrency
+# group below cannot merge them — an unrestricted `push:` bills every branch
+# commit twice, once as push and once as pull_request. Observed on this
+# workflow's own first two runs (30673165146 + 30673165522, same commit).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Supersede in-flight runs for the same ref. Private-repo Actions minutes are
+# billed; a force-push should not pay for the run it just made irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0        # incremental is a loss on a cold CI cache
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30        # a runaway build must not bill indefinitely
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # randomx-rs builds a C++ library at compile time. cmake and g++ are
+      # preinstalled on ubuntu-latest today; installing explicitly means a
+      # change to the runner image fails here, loudly, instead of failing
+      # inside a dependency's build script where it reads as a Rust error.
+      - name: C++ toolchain for randomx-rs
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cmake g++
+
+      # No rust-toolchain.toml exists in this repo, so CI uses whatever stable
+      # the runner image ships. Printing it puts the version in every log:
+      # this repo pins Plonky3 revs because "bench numbers against a moving
+      # prover are meaningless", and the toolchain moves too. See the PR.
+      - name: Toolchain provenance
+        run: |
+          rustc --version
+          cargo --version
+          cmake --version | head -1
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # --locked: Cargo.lock is committed and holds the pinned prover revs.
+      # A CI that silently updated them would check a different tree than the
+      # rig does.
+      - name: cargo check --workspace --all-targets
+        run: cargo check --workspace --all-targets --locked
+
+      # Reporting only, NOT failing. The tree has pre-existing warnings
+      # (qlab-bench alone generated 37 on 2026-08-01). A gate that is red on
+      # its first run teaches everyone to ignore it — the same failure as an
+      # alarm at 99.9% that nobody reads again (lab issue #105). Promote to
+      # `-D warnings` in a follow-up, once the baseline is zero and staying
+      # there is a real signal.
+      - name: cargo clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets --locked
