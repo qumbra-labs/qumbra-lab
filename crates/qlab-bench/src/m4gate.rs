@@ -8554,12 +8554,24 @@ mod tests {
     /// controls were dropped once it turned green is a probe nobody can
     /// re-derive.
     ///
-    /// The third check is the transcript-side half (also #78 finding 4): move
-    /// the word a pending capture row carries, re-canonicalise, repropagate.
-    /// Before the fix the consumed limb did not move with it (**SAT**); now
-    /// the pin ties them and it is UNSAT. Note what that does and does not
-    /// mean — the consumed limb now follows the capture row's `W0C`, and
-    /// `W0C` on the dup chain is still pinned to the sponge by nothing.
+    /// The third check is the transcript-side half: move the word a pending
+    /// capture row carries, re-canonicalise, repropagate. Before the fix the
+    /// consumed limb did not move with it (**SAT**); now the pin ties them and
+    /// it is UNSAT.
+    ///
+    /// ⚠️ **READ THIS BEFORE CITING THAT UNSAT FOR ANYTHING.** It is NOT
+    /// evidence that `W0C` became bound. As PR #144's P5, this check's SAT was
+    /// the resident proof that `W0C` on the dup chain is free (#78 finding 4);
+    /// the pin makes an inconsistent `W0C`/`ASM` pair detectable, so the same
+    /// tamper now fails for a different reason and **that evidence is no longer
+    /// resident anywhere** — it lives in PR #144's body and in the module
+    /// header's finding-4 row. The tamper that WOULD still witness the freedom
+    /// (move `W0C` at the capture row *and* `ASM` along the pending chain
+    /// consistently) cannot be run: it changes the consumed value, which feeds
+    /// `pzacc += preg·v`, and `fill_derived` has no register repropagate — so
+    /// it is UNSAT on the `pzacc` recurrence regardless of whether the value is
+    /// bound. That is PR #144's P6 trap met from the other side. A resident
+    /// freedom witness for finding 4 needs the register repropagate first.
     #[test]
     fn gate_neg_asm_free_witness() {
         let _g = heavy_lock();
