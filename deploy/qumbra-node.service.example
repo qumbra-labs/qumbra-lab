@@ -3,7 +3,10 @@
 # has laid down <remote-root> (default /opt/qumbra). Then:
 #   systemctl daemon-reload && systemctl enable --now qumbra-node
 #
-# Ctrl-C / systemctl stop triggers the graceful-shutdown snapshot flush.
+# systemctl stop sends SIGTERM (default KillSignal). The binary arms SIGTERM for
+# graceful shutdown (ctrlc `termination` feature, issue #145), so the post-loop
+# snapshot flush + peers.dat write run before exit. No KillSignal= override is
+# needed — the binary handles the signal systemd actually sends.
 [Unit]
 Description=Qumbra T0 full node
 After=network-online.target
@@ -15,6 +18,7 @@ WorkingDirectory=/opt/qumbra
 ExecStart=/opt/qumbra/qumbra-node run --config /opt/qumbra/node.toml
 Restart=on-failure
 RestartSec=5
+# Default KillSignal=SIGTERM is correct: the binary flushes on SIGTERM.
 # RandomX light mode fits the ≥4 GB VPS spec; no huge-pages requirement.
 LimitNOFILE=65536
 

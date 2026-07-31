@@ -8,7 +8,8 @@
 //! ```
 //!
 //! All the testable logic lives in the library ([`qumbra_node`]); this is thin
-//! CLI glue. Graceful shutdown (Ctrl-C) flushes an atomic snapshot.
+//! CLI glue. Graceful shutdown (SIGINT / SIGTERM / SIGHUP) flushes an atomic
+//! snapshot and the learned address book.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -207,14 +208,23 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         println!("      blocks, and stop signing checkpoints above it. regime=Halting until the");
         println!("      boundary finalizes, then regime=Halted.");
     }
-    println!("(Ctrl-C to shut down — snapshot is flushed on exit)");
+    println!("(SIGINT/SIGTERM/SIGHUP to shut down — snapshot + peers.dat flushed on exit)");
 
+    // ctrlc with the `termination` feature (Cargo.toml): SIGINT + SIGTERM + SIGHUP.
+    // The handler must stay async-signal-safe — only an AtomicBool store, nothing
+    // else. SIGHUP is accepted as graceful stop: this binary has no config-reload
+    // path, and a terminal hangup that would otherwise kill the process mid-loop
+    // is exactly the case where a flush is wanted (issue #145).
     let shutdown = Arc::new(AtomicBool::new(false));
     let sig = Arc::clone(&shutdown);
     ctrlc::set_handler(move || sig.store(true, Ordering::SeqCst))?;
 
-    node.run_until(&shutdown);
-    println!("shutdown complete (snapshot flushed)");
+    if node.run_until(&shutdown) {
+        println!("shutdown complete (snapshot flushed)");
+    } else {
+        // Do not claim the flush when run_until already logged the failure.
+        println!("shutdown complete (snapshot flush failed)");
+    }
     Ok(())
 }
 

@@ -82,8 +82,12 @@ bincode = "1"
 # TOML node config (data dir, listen addr, dial peers, committee-key paths,
 # mining on/off) — the issue's specified config format.
 toml = "0.8"
-# Ctrl-C handling for graceful shutdown = snapshot flush.
-ctrlc = "3.4"
+# Graceful-shutdown signal handling = snapshot flush + peers.dat write.
+# Default ctrlc registers SIGINT only; `termination` also arms SIGTERM and
+# SIGHUP (issue #145). Docker `compose stop` / systemd `systemctl stop` send
+# SIGTERM to PID 1 — without this feature those paths never set the shutdown
+# flag and the post-loop flush is never attempted.
+ctrlc = { version = "3.4", features = ["termination"] }
 # The /metrics scrape endpoint (issue #87). Same minimal blocking HTTP/1.1 server,
 # and the same `=` pin, as qlab-node's RPC surface and qlab-cbserver's reference
 # server — one HTTP implementation in the tree, not three.
