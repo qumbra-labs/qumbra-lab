@@ -42,8 +42,51 @@
 //! materialized at block q is the round-q input, so state(q+1) =
 //! Round_{q mod 24}(state(q)) for every q, including padding rows — no
 //! gating, no boundary constraints, the first block's state is whatever
-//! the zero-initialized registers emit (warmup), and every subsequent
-//! 24-block group is a genuine keccak-f of its input.
+//! the registers emit at row 0 (warmup).
+//!
+//! ## What the first permutation's input is bound to, and what makes it safe
+//!
+//! Nothing binds it (issue #143). Row 0's `S`/`V`/`U` cells appear in `eval`
+//! only in read positions — the two same-row recompositions have the register
+//! slot on the *source* side of the `assert_eq` (so they range-limit it to
+//! 25 / 25 / 10 bits and no more), every other occurrence targets `next[..]`,
+//! and no `when_first_row` touches them. So **row 0's `S[1..=64]` carries the
+//! first permutation's round-0 input — 64 slots x 25 bits = 1600 bits, one
+//! whole Keccak state, entirely prover-chosen.** (The materialized state `a` is
+//! their image under chi o pi, plus iota on lane 0; chi is invertible, so every
+//! state is reachable.) The remaining 191 free cells (`S[65..=126]`,
+//! `V[1..=64]`, `U[1..=65]`) perturb only cells nothing reads.
+//!
+//! That is safe because the value has **no consumer**, and the three facts
+//! carrying that are program-layout facts, not constraints:
+//!
+//!   1. `program[0] = ROLE_DUMMY`. `ROLE_DUMMY` is absent from `sel_codes`, so
+//!      every selector, injection flag and bank gate is 0 on perm 0 — it cannot
+//!      reach a public value.
+//!   2. `program[1] = ROLE_ANK`, and `msg_ank` is a **full-state override**: it
+//!      assigns all 25 lanes from witness + periodic constants with no `a` term.
+//!      Since V/U ingest only `eff` and S refills from `ap = theta(eff)`, the
+//!      warmup residue is severed exactly one block wide. The first role that
+//!      *reads* the chained digest is `program[2] = ROLE_NF`, and what it reads
+//!      is the ANK perm's output.
+//!   3. Every accumulator reaching a public value is pinned at row 0 (EQ, BQ,
+//!      BL, EP), so warmup cannot preload a bank.
+//!
+//! The program is not prover-chosen either: the PR ring is pinned at row 0 to
+//! the verifier's `pr_limb`. So (1) and (2) are verifier-side and the prover
+//! cannot deviate from them — but **the AIR does not forbid a program that
+//! violates them** (`merkle_chain_matches_reference` builds one, and its first
+//! real role does consume the warmup state). Two tests hold this up:
+//! `first_perm_input_is_free_and_unconsumed` locks the property, and
+//! `bucket_program_does_not_consume_warmup` locks the layout.
+//!
+//! One consequence of row 0 being free: "every 24-block group is a genuine
+//! keccak-f of its input" holds for perms 1.. but **not for perm 0 under an
+//! adversarial prover** — row 0's `U[65]` reaches `S` at row 64 through the
+//! `u_col(64)` entry, so perm 0's round 0 need not be a Keccak round at all.
+//! Under the zero init that `generate_trace` uses, that term is 0 and every
+//! block including the warmup is a genuine round (`chain_matches_reference_
+//! rounds`). Perm 0's output is read by nothing either way.
 
 use p3_air::{Air, AirBuilder, BaseAir, WindowAccess};
 use p3_field::{Field, PrimeCharacteristicRing};
@@ -1185,6 +1228,35 @@ pub fn build_bucket_with_witnesses(
 // Trace generation
 // ---------------------------------------------------------------------------
 
+/// Row-0 contents of the three shift registers, slot-indexed (index 0 unused).
+///
+/// These are exactly the cells the AIR leaves free (issue #143): no
+/// `when_first_row` constraint touches `S`/`V`/`U`, so a prover may put
+/// anything here that survives the slot-1 range checks. `S[1..=64]` **carries
+/// the first permutation's round-0 input** — 1600 bits, one whole Keccak state.
+///
+/// Production proving always uses [`RegisterInit::ZERO`] via
+/// [`NarrowKeccakAir::generate_trace`]. This type is a parameter, not a knob:
+/// it exists so a test can perturb row 0 **and re-run the whole fill**, which is
+/// the only honest instrument here — tampering row 0 in a finished trace breaks
+/// the row0 -> row1 transition and reads UNSAT, which says nothing about whether
+/// row 0 is determined.
+#[derive(Clone, Copy)]
+struct RegisterInit {
+    s: [u32; S_SLOTS + 1],
+    v: [u32; V_SLOTS + 1],
+    u: [u32; U_SLOTS + 1],
+}
+
+impl RegisterInit {
+    /// The zero warm-up the honest prover uses.
+    const ZERO: Self = Self {
+        s: [0; S_SLOTS + 1],
+        v: [0; V_SLOTS + 1],
+        u: [0; U_SLOTS + 1],
+    };
+}
+
 impl NarrowKeccakAir {
     /// Generate the full-height trace by simulating the pipeline row by
     /// row from zero-initialized registers. Every cell satisfies the AIR
@@ -1194,14 +1266,25 @@ impl NarrowKeccakAir {
         &self,
         extra_capacity_bits: usize,
     ) -> RowMajorMatrix<F> {
+        self.generate_trace_from(extra_capacity_bits, RegisterInit::ZERO)
+    }
+
+    /// [`Self::generate_trace`]'s body, with the row-0 register contents as a
+    /// parameter. Private: the free cells are a fact about the AIR, not a knob
+    /// for a prover, and `generate_trace` is the only production entry point.
+    fn generate_trace_from<F: Field>(
+        &self,
+        extra_capacity_bits: usize,
+        init: RegisterInit,
+    ) -> RowMajorMatrix<F> {
         let height = 1usize << self.log_height;
         let size = height * NARROW_WIDTH;
         let mut values = Vec::with_capacity(size << extra_capacity_bits);
 
         // Registers, indexed by slot (index 0 unused).
-        let mut s = [0u32; S_SLOTS + 1];
-        let mut v = [0u32; V_SLOTS + 1];
-        let mut u = [0u32; U_SLOTS + 1];
+        let mut s = init.s;
+        let mut v = init.v;
+        let mut u = init.u;
         // Iota RC ring: R[i] = 7-bit pack of round (q - 1 + i) mod 24.
         let mut r: [u32; 24] = core::array::from_fn(|i| Self::rc_pack((23 + i) % 24));
         // Perm-boundary, phase, and program rings.
@@ -1733,6 +1816,182 @@ mod tests {
     /// during the epoch (programs without bind/bal roles).
     fn zero_pvs() -> Vec<F> {
         vec![F::ZERO; PV_LEN]
+    }
+
+    /// Issue #143, and the reason this file's row-0 note says what it says.
+    ///
+    /// The first permutation's input state is a **free witness** — no
+    /// `when_first_row` constraint touches `S`/`V`/`U` — and it is safe only
+    /// because nothing consumes it. This test locks **that property**; the
+    /// layout that currently delivers it is locked separately by
+    /// `bucket_program_does_not_consume_warmup`. This one fails if the severing
+    /// ever breaks: if some future role at `program[1]` reads the chained state
+    /// instead of overriding it, (b) goes red.
+    ///
+    /// It is deliberately **perturb-and-repropagate**, not tamper: row 0 is
+    /// changed and the whole fill re-runs, so the trace stays self-consistent.
+    /// Tampering a finished trace instead would break the row0 -> row1
+    /// transition and read UNSAT, which is the false negative that hid this
+    /// question in the first place — a prover who picks row 0 and lets every
+    /// later row follow has a *valid* trace, not a broken one.
+    ///
+    /// Only `S[1..=64]` is perturbed, and that is on purpose twice over: those
+    /// 64 slots x 25 bits = 1600 bits are exactly the first permutation's
+    /// round-0 input, and leaving the other 191 free cells zero keeps the fill
+    /// a valid witness (it applies register entries with `|=`, which equals the
+    /// constraint's `+` only where the entering bits are disjoint from what the
+    /// slot already holds; with `S[65..]`/`V`/`U` zero, every entry ORs into a
+    /// zeroed slot). Those 191 cells are free too, but they are not the input
+    /// state and they only perturb cells nothing reads.
+    #[test]
+    fn first_perm_input_is_free_and_unconsumed() {
+        let sk = [0xfeed_1111u64, 0xfeed_2222, 0xfeed_3333, 0xfeed_4444];
+        let rho = [0xa11c_e001u64, 0xa11c_e002, 0xa11c_e003, 0xa11c_e004];
+
+        // [DUMMY, ANK, NF, DUMMY..]: the consensus prefix. ANK is the first
+        // real role (full-state override), NF the first role that READS the
+        // chained digest. No bind/bal role, so zero public values are valid.
+        let mut program = [ROLE_DUMMY; PROGRAM_SLOTS];
+        program[1] = ROLE_ANK;
+        program[2] = ROLE_NF;
+        let mut slot_witness = vec![SlotWitness::default(); PROGRAM_SLOTS];
+        slot_witness[1].w[..4].copy_from_slice(&sk);
+        slot_witness[2].w[..4].copy_from_slice(&rho);
+        let air = NarrowKeccakAir {
+            log_height: 14, // 128 blocks: perm 2's output at block 72 is in range
+            program,
+            slot_witness,
+            fee: 0,
+        };
+
+        // A prover-chosen first-perm input: 64 slots of 25 bits each.
+        let mut x = 0x1234_5678_9abc_def0u64;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut chosen = RegisterInit::ZERO;
+        for d in 1..=64 {
+            chosen.s[d] = (rnd() as u32) & 0x01ff_ffff; // 25 bits
+        }
+
+        let honest = air.generate_trace_from::<F>(0, RegisterInit::ZERO);
+        let chosen_trace = air.generate_trace_from::<F>(0, chosen);
+
+        // The perturbation really did move the first permutation's input —
+        // without this the rest of the test could pass vacuously.
+        assert_ne!(
+            NarrowKeccakAir::extract_state(&honest, 0),
+            NarrowKeccakAir::extract_state(&chosen_trace, 0),
+            "the chosen init must change the first perm's round-0 input"
+        );
+
+        // (a) The degree of freedom is real: a trace built from a
+        // prover-chosen row 0 satisfies EVERY constraint, first-row pins
+        // included. Nothing binds the first permutation's input state.
+        check_constraints(&air, &chosen_trace, &zero_pvs());
+
+        // (b) And it is severed. The load-bearing half first, as a cross-run
+        // equality that does not depend on knowing the right answer: the ANK
+        // perm's output (block 24*2, the state perm 2 materializes) is
+        // bit-identical no matter what the prover chose for row 0, because
+        // `msg_ank` overrides all 25 lanes from witness + periodic constants
+        // with no `a` term. Put a role that READS the chained state at
+        // `program[1]` and this is the assertion that goes red.
+        assert_eq!(
+            NarrowKeccakAir::extract_state(&honest, 24 * 2),
+            NarrowKeccakAir::extract_state(&chosen_trace, 24 * 2),
+            "the first perm's output must not depend on the chosen row 0"
+        );
+        assert_eq!(
+            NarrowKeccakAir::extract_state(&honest, 24 * 3),
+            NarrowKeccakAir::extract_state(&chosen_trace, 24 * 3),
+            "nor may anything downstream of it"
+        );
+
+        // …and the severed value is the RIGHT one — the reference nk, so this
+        // cannot be satisfied by a pipeline that severs by producing garbage.
+        let nk_state = reference::keccak_f(&st_ank(&sk, 0));
+        for (label, trace) in [("honest", &honest), ("chosen", &chosen_trace)] {
+            assert_eq!(
+                NarrowKeccakAir::extract_state(trace, 24 * 2),
+                nk_state,
+                "{label}: ANK output must be keccak_f(st_ank(sk))"
+            );
+        }
+
+        // …and so is everything downstream of it: the NF perm consumes that
+        // digest through `msg_mrk`'s lane 0..3, and its output is the nullifier
+        // the real bucket binds to PV_NF1.
+        let nf_state = reference::keccak_f(&st_pair(&digest(&nk_state), &rho));
+        for (label, trace) in [("honest", &honest), ("chosen", &chosen_trace)] {
+            assert_eq!(
+                NarrowKeccakAir::extract_state(trace, 24 * 3),
+                nf_state,
+                "{label}: nf must not depend on the warmup state"
+            );
+        }
+    }
+
+    /// Issue #143's tripwire. The severing above holds because of two lines in
+    /// `build_bucket_with_witnesses` that read as layout housekeeping —
+    /// `let mut slot = 1usize;` leaving `program[0]` dummy, and `input_chain`
+    /// writing `ROLE_ANK` first — and **the AIR does not enforce either**:
+    /// `merkle_chain_matches_reference` builds a program whose first real role
+    /// is `ROLE_MERKLE`, which reads the chained state through `msg_mrk`'s lane
+    /// 0..3, i.e. it consumes the warmup. That is fine in a semantics test and
+    /// would not be fine here.
+    ///
+    /// So this asserts the layout directly. If you are here because this test
+    /// went red after reordering `input_chain`: the constraint you may not
+    /// break is that **neither of the first two perms may read the chained
+    /// state**, because for perm 0 and perm 1 that state is prover-chosen
+    /// warmup. Re-point the assertion only once that still holds.
+    #[test]
+    fn bucket_program_does_not_consume_warmup() {
+        let inputs = [
+            TxInput { sk: [1, 2, 3, 4], value: 7, rho: [5, 6, 7, 8], rseed: [9, 10, 11, 12], d: [0, 0] },
+            TxInput { sk: [13, 14, 15, 16], value: 3, rho: [17, 18, 19, 20], rseed: [21, 22, 23, 24], d: [0, 0] },
+        ];
+        let outputs = [
+            TxOutput { value: 6, rkm: [1; 4], rho: [2; 4], rseed: [3; 4] },
+            TxOutput { value: 3, rkm: [4; 4], rho: [5; 4], rseed: [6; 4] },
+        ];
+        let program = build_bucket(18, &inputs, &outputs, 1).air.program;
+
+        assert_eq!(program[0], ROLE_DUMMY, "perm 0 must stay the warm-up slot");
+        assert_eq!(
+            program[1], ROLE_ANK,
+            "perm 1 must be the full-state override that seeds the chain"
+        );
+        assert_eq!(
+            program[2], ROLE_NF,
+            "perm 2 is the first role that may read a chained digest"
+        );
+
+        // The generalized property the two assertions above stand in for: a
+        // role reads the previous perm's output either through its `msg`
+        // (MERKLE/NF lane 0..3, ACM lane 1..4) or through the bind bank's
+        // capture of `a[0..4]`. None of those may sit at perm 0 or perm 1.
+        const READS_CHAINED_STATE: [u32; 8] = [
+            ROLE_MERKLE,
+            ROLE_NF,
+            ROLE_ACM,
+            ROLE_BANCHOR,
+            ROLE_BNF1,
+            ROLE_BNF2,
+            ROLE_BCM1,
+            ROLE_BCM2,
+        ];
+        for p in 0..2 {
+            assert!(
+                !READS_CHAINED_STATE.contains(&program[p]),
+                "program[{p}] = {} consumes the prover-chosen warmup state",
+                program[p]
+            );
+        }
     }
 
     /// M3 step 3a: the full input chain — ank -> nf -> arkm -> acm ->
