@@ -132,6 +132,29 @@ pub const DRILL_HALT_HEIGHT: u64 = 16;
 /// The baseline v1.0 revision every un-upgraded binary carries. Its digest is the
 /// digest of the FROZEN v1.0 table — asserted at startup and in tests, so this
 /// string cannot drift away from the constants it claims to describe.
+///
+/// # 🔴 A ROUTINE RELEASE DOES NOT MINT A NEW REVISION — defend this
+///
+/// A `Revision` names the **frozen parameter set's revision document**, not the
+/// binary. The binary's version belongs in [`Release::name`]. So a bug-fix release,
+/// a performance release, a release that rewrites half the node — all of them keep
+/// the `Revision` they inherited and change only `name`.
+///
+/// This is load-bearing since #81, because the resume gate keys on
+/// [`Revision::digest`], which binds the identifier as well as the frozen digest.
+/// Bump the identifier for a release that moved no frozen constant and that release
+/// will demand a declared transition it has no business declaring — and so will
+/// every release after it. The declaration would stop meaning "the parameter set
+/// moved" and start meaning "a release happened", which is precisely the alarm
+/// fatigue the #81 addendum and `revision.rs`'s "constraint to defend" section
+/// forbid, arrived at from a third direction.
+///
+/// The identifier is bound in rather than dropped because H5 needs it: an *inert*
+/// upgrade moves no frozen value, so without the identifier `v1.0` and
+/// `v1.0.1-drill` would be indistinguishable and the gate could not refuse the
+/// pre-announcement binary on an upgraded node. The rule that reconciles the two is
+/// simply: **mint a revision when, and only when, you are shipping an upgrade with a
+/// boundary** — which is the same occasion that requires a revision document anyway.
 pub const REVISION_V1_0: Revision = Revision {
     id: "v1.0",
     frozen_digest_hex: "19564ecaffd8f78e69b31840cf465b3b34553968813f7fcaff83194077534571",
