@@ -335,23 +335,37 @@ impl std::error::Error for RevisionError {}
 /// Domain tag for [`Revision::digest`].
 pub const REVISION_TAG: &[u8] = b"qumbra:revision:v1";
 
+/// The revision digest over a borrowed `(id, frozen_digest_hex)` pair.
+///
+/// [`Revision`] holds `&'static str`s because it is a compile-time constant, but the
+/// halt marker holds the same two values as `String`s read back from disk (issue
+/// #81: the marker records the revision **in force** on the data dir). Both must
+/// produce the identical 32 bytes or the resume gate would compare a binary against
+/// a re-encoding of itself, so there is exactly one preimage definition and
+/// [`Revision::digest`] delegates to it.
+pub fn revision_digest(id: &str, frozen_digest_hex: &str) -> Hash32 {
+    let mut buf = Vec::with_capacity(REVISION_TAG.len() + 8 + id.len() + 64);
+    buf.extend_from_slice(REVISION_TAG);
+    buf.extend_from_slice(&(id.len() as u64).to_le_bytes());
+    buf.extend_from_slice(id.as_bytes());
+    buf.extend_from_slice(frozen_digest_hex.to_ascii_lowercase().as_bytes());
+    keccak256(&buf)
+}
+
 impl Revision {
     /// The **revision digest**: this revision's identity as a 32-byte value,
     /// binding *both* the identifier and the frozen-parameter digest it claims.
     ///
     /// This — not the bare frozen digest — is what a resumed release uses as its
-    /// post-halt rule domain ([`qlab_devnet::halt::PostHaltRules`]). The reason is
-    /// H5: an *inert* revision changes no frozen value, so consecutive inert
-    /// revisions share a frozen digest. Binding the identifier as well guarantees
-    /// distinct revisions are distinct rule sets, which is what the upgrade
-    /// boundary needs in order to be a boundary at all.
+    /// post-halt rule domain ([`qlab_devnet::halt::PostHaltRules`]), and (since
+    /// #81) what the resume gate compares against the marker. The reason is the
+    /// same in both places, H5: an *inert* revision changes no frozen value, so
+    /// consecutive inert revisions share a frozen digest. Binding the identifier as
+    /// well guarantees distinct revisions are distinct rule sets, which is what the
+    /// upgrade boundary needs in order to be a boundary at all — and what lets the
+    /// gate still refuse the pre-announcement binary after an inert upgrade.
     pub fn digest(&self) -> Hash32 {
-        let mut buf = Vec::with_capacity(REVISION_TAG.len() + 8 + self.id.len() + 64);
-        buf.extend_from_slice(REVISION_TAG);
-        buf.extend_from_slice(&(self.id.len() as u64).to_le_bytes());
-        buf.extend_from_slice(self.id.as_bytes());
-        buf.extend_from_slice(self.frozen_digest_hex.to_ascii_lowercase().as_bytes());
-        keccak256(&buf)
+        revision_digest(self.id, self.frozen_digest_hex)
     }
 
     /// Hex form of [`Self::digest`].
@@ -504,6 +518,34 @@ mod tests {
         std::mem::swap(&mut q.split_miner_pct, &mut q.split_treasury_pct);
         assert_ne!(frozen_digest(&q), frozen_digest(&base));
     }
+
+    /// #81: the borrowed-`&str` digest and the `Revision` digest are the same 32
+    /// bytes, including across ASCII-case differences in the hex. The resume gate
+    /// compares a compile-time `Revision` against two `String`s read off disk, so a
+    /// divergence here would make a binary fail to recognise its own revision.
+    #[test]
+    fn the_borrowed_revision_digest_matches_the_constants_digest() {
+        assert_eq!(
+            revision_digest(REVISION_V1_0_ID_FOR_TEST, &own_frozen_digest_hex()),
+            Revision {
+                id: REVISION_V1_0_ID_FOR_TEST,
+                frozen_digest_hex: Box::leak(own_frozen_digest_hex().into_boxed_str()),
+            }
+            .digest(),
+        );
+        // The marker stores whatever hex the halting binary carried; case must not
+        // change the identity.
+        assert_eq!(
+            revision_digest("v1.0", &own_frozen_digest_hex().to_uppercase()),
+            revision_digest("v1.0", &own_frozen_digest_hex()),
+        );
+        // …but the identifier is part of the identity, so inert revisions differ.
+        assert_ne!(
+            revision_digest("v1.0", &own_frozen_digest_hex()),
+            revision_digest("v1.0.1-drill", &own_frozen_digest_hex()),
+        );
+    }
+    const REVISION_V1_0_ID_FOR_TEST: &str = "v1.0";
 
     /// The rule-domain property H5 depends on: two **inert** revisions (same frozen
     /// digest, different identifier) must still be distinct rule sets, or a second
