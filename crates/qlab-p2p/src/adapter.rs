@@ -26,12 +26,14 @@
 //! while the pool stays keyed by its own id.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 
 use qlab_devnet::body::{validate_body, BlockBody, BodyError, TxEntry};
 use qlab_devnet::chain::{ChainState, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, MemberStatus, Validator, Vote};
 use qlab_devnet::ebbflow::{
-    finality_status, verify_equivocation, EquivocationEvidence, FinalityStatus, SigningWindow,
+    equivocation_slash, finality_status, verify_equivocation, EquivocationEvidence, FinalityStatus,
+    SigningWindow,
 };
 use qlab_devnet::epoch::{EpochCommittee, EpochSchedule};
 use qlab_devnet::finality::{FinalityTracker, FinalizeError};
@@ -62,6 +64,7 @@ use crate::codec::{checkpoint_id, tx_id as wire_tx_id};
 use crate::n1::{
     BlockIngest, ChainView, CheckpointIngest, CommitteeControl, IngestOutcome, TxPool, VotesOutcome,
 };
+use crate::punish::{self, PunishmentRestore};
 
 /// The effective §6 median a soak-node assembles against: large enough that the
 /// penalty-free zone accepts every pending tx (no gigantism at prototype scale).
@@ -188,6 +191,21 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// Running weight of [`Self::pending_bodies`] in bytes, so the byte budget is a
     /// subtraction rather than a walk of the map on every insert.
     pending_bytes: usize,
+    /// The node's data dir, when disk-backed — the durability seam for the committee
+    /// punishment ledger (issue #133). `None` for an in-memory adapter, which keeps
+    /// every in-process sim, soak and test writing nothing.
+    ///
+    /// Held here rather than reached for through `MemNode` because the punishment
+    /// ledger is *this* layer's state: the committee lives here, and `qlab-node`
+    /// deliberately knows nothing about ML-DSA signatures.
+    dir: Option<PathBuf>,
+    /// Every equivocation this node has adjudicated, in the order it applied them —
+    /// the in-memory mirror of `punishments.dat` (issue #133). Bounded by the roster
+    /// (a member is tombstoned once).
+    punishments: Vec<EquivocationEvidence>,
+    /// What the last `open` found in the ledger and did with it. Reported at startup
+    /// so "restored nothing" and "had nothing to restore" are distinguishable.
+    punish_restore: PunishmentRestore,
 }
 
 /// How far above the state machine's applied tip a body is worth holding
@@ -330,6 +348,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// block-log tail), so accepted blocks and finalizations persist across
     /// restarts. Wraps `committee` at the frozen epoch length (like [`Self::new`]).
     /// [`Self::save_snapshot`] flushes the derived state on graceful shutdown.
+    ///
+    /// **Committee punishments are restored here too (issue #133).** The `committee`
+    /// argument is always a fresh all-Active genesis roster — that is what the binary
+    /// can build from the genesis file, and it is the whole defect: a member proven to
+    /// have equivocated came back Active with a full bond on every restart. The
+    /// punishment ledger in `dir` is replayed onto that roster **before** the epoch
+    /// machinery advances, so the forced exits at each boundary drop exactly the
+    /// members a node that never restarted had already dropped. A ledger this binary
+    /// cannot honour is an error, never an empty start — see [`crate::punish`].
     pub fn open(
         dir: impl AsRef<std::path::Path>,
         committee: CommitteeState,
@@ -337,9 +364,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         verifier: V,
         sim: SimConfig,
     ) -> Result<Self, NodeError> {
+        let dir = dir.as_ref().to_path_buf();
         let ec = EpochCommittee::genesis(EpochSchedule::new(EPOCH_LENGTH_BLOCKS), committee);
-        let state = MemNode::open(dir, genesis_block(sim.genesis_difficulty, 0))?;
+        let state = MemNode::open(&dir, genesis_block(sim.genesis_difficulty, 0))?;
         let mut me = Self::assemble(ec, pow, verifier, sim, state);
+        me.dir = Some(dir.clone());
         // Restart-resume the in-memory fork-choice header chain from the persisted
         // block log: the state machine is the durable source of truth, so on open
         // the adapter adopts its restored ChainState (headers + finalized head),
@@ -348,8 +377,56 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // to re-sync everything it already had on disk.
         let resumed = me.state.chain().chain().clone();
         me.chain = resumed;
+        // Punishments BEFORE the epoch advance: a tombstone's effect at a boundary is
+        // to shrink the roster and reindex it, and applying it afterwards would punish
+        // whichever member had shifted into that index.
+        me.restore_punishments(&dir)?;
         me.advance_epoch();
         Ok(me)
+    }
+
+    /// Replay `dir`'s punishment ledger onto the genesis committee this adapter was
+    /// opened with (issue #133).
+    ///
+    /// Refuses — returns `Err` — for any ledger that exists and cannot be honoured.
+    /// A ledger that is merely **absent** is reported, not refused, and this is a
+    /// judgement call worth naming: an absent ledger on a data dir that already holds
+    /// chain history is a pre-#133 data dir whose punishment history is *unknowable*,
+    /// and refusing there would brick every existing data dir on upgrade. So it is
+    /// recorded in [`PunishmentRestore`] and printed loudly by the binary instead —
+    /// the "or reports" half of the rule, not a silent fall-through.
+    fn restore_punishments(&mut self, dir: &std::path::Path) -> Result<(), NodeError> {
+        let loaded = punish::load(dir).map_err(NodeError::Io)?;
+        let absent = loaded.is_none();
+        let mut records = loaded.unwrap_or_default();
+        punish::sort_records(&mut records);
+        let tip = self.chain.tip_height();
+        let tombstoned = punish::replay(&mut self.committee, &records, tip)
+            .map_err(|e| NodeError::Io(e.to_io()))?;
+        self.punish_restore = PunishmentRestore {
+            records: records.len(),
+            tombstoned,
+            ledger_absent_on_populated_datadir: absent && tip > 0,
+        };
+        self.punishments = records;
+        // Write the ledger out when this data dir had none, so a *later* restart can
+        // tell "this node has recorded no punishments" from "nobody ever asked".
+        if absent {
+            punish::save(dir, &self.punishments).map_err(NodeError::Io)?;
+        }
+        Ok(())
+    }
+
+    /// What the last [`Self::open`] found in the punishment ledger and did with it.
+    /// Empty and all-zero for an in-memory adapter.
+    pub fn punishment_restore(&self) -> &PunishmentRestore {
+        &self.punish_restore
+    }
+
+    /// Every equivocation this node has adjudicated — the in-memory mirror of the
+    /// durable ledger. One record per tombstoned member.
+    pub fn punishments(&self) -> &[EquivocationEvidence] {
+        &self.punishments
     }
 
     /// Flush the state machine's derived state to an atomic on-disk snapshot
@@ -394,6 +471,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             miner_rkm: UNCONFIGURED_MINER_RKM,
             pending_bodies: BTreeMap::new(),
             pending_bytes: 0,
+            dir: None,
+            punishments: Vec::new(),
+            punish_restore: PunishmentRestore::default(),
         }
     }
 
@@ -1355,13 +1435,44 @@ impl<P: PowEngine, V: TxVerifier + Clone> CommitteeControl for NodeAdapter<P, V>
             verify_equivocation(ev, self.committee.state_for_height(ev.cp_a.height).committee());
         match verified {
             Ok(signer) => {
+                // Durability FIRST (issue #133). A tombstone is permanent under FROZEN
+                // §4 and cannot be re-derived from anything on disk — evidence is not in
+                // blocks and the gossip that carried it is push-once — so a process that
+                // dies between applying a punishment and recording it has simply lost
+                // it, and the member is Active with a full bond on the next start. The
+                // record is written ahead of the effect for the same reason the finalizer
+                // ledger is written ahead of its vote.
+                let already = matches!(
+                    self.committee.state().status(signer),
+                    Some(MemberStatus::Tombstoned)
+                );
+                if !already {
+                    self.punishments.push(ev.clone());
+                    if let Some(dir) = self.dir.clone() {
+                        if let Err(e) = punish::save(&dir, &self.punishments) {
+                            // The exclusion is applied anyway, and loudly. Frozen §4's
+                            // "tombstoned votes MUST NOT count toward quorum" is an
+                            // immediate safety rule, and making it conditional on a disk
+                            // write would trade a durability failure for a live one. What
+                            // the operator needs to know is that it will not survive a
+                            // restart.
+                            eprintln!(
+                                "⚠️  committee punishment for member {signer} APPLIED but NOT \
+                                 PERSISTED ({e}): the tombstone is in force now and will be LOST \
+                                 on restart. Fix the data dir before restarting this node."
+                            );
+                        }
+                    }
+                }
                 // Equivocation slash = **10 % of the member's bond** + permanent
                 // tombstone (consensus-parameters §4 FROZEN; issue #62 item 5
                 // convergence — replaces the flat `EQUIVOCATION_SLASH_AMOUNT`
                 // placeholder now that the bond is a genesis constant). Integer
-                // floor; a ramped bond of 0 slashes 0 (still tombstones).
+                // floor; a ramped bond of 0 slashes 0 (still tombstones). Named in
+                // `ebbflow` since #133, because the restart path re-derives it and two
+                // copies of a frozen rule is how the two views drift apart.
                 let bond = self.committee.state().bond(signer).unwrap_or(0);
-                let slash = bond / 10;
+                let slash = equivocation_slash(bond);
                 self.committee.state_mut().tombstone(signer, slash);
                 Some(signer)
             }
