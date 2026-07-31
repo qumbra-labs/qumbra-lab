@@ -269,6 +269,29 @@ fn halt_status(args: &[String]) -> Result<(), Box<dyn Error>> {
             return Err(Box::new(e));
         }
         println!("  resume gate:  OK for this data dir");
+        // #81: the rule domain this binary will actually run under is a property of
+        // the release AND of the data dir — a routine release inherits the boundary
+        // from the marker. An operator diagnosing a fork needs to see the effective
+        // value, not the one this binary declares.
+        match RELEASE.rule_schedule_on(Some(m)) {
+            Ok(s) => match s.post_halt {
+                Some(p) => println!(
+                    "  rule domain:  {} above height {} ({})",
+                    qumbra_node::genesis::hex_encode(&p.domain),
+                    p.from_height,
+                    if RELEASE.resumes_from == Some(p.from_height) {
+                        "declared by this release"
+                    } else {
+                        "inherited from the halt marker"
+                    }
+                ),
+                None => println!("  rule domain:  none — v1.0 rules at every height"),
+            },
+            Err(e) => {
+                println!("  rule domain:  REFUSES TO START — {e}");
+                return Err(Box::new(e));
+            }
+        }
     }
     Ok(())
 }

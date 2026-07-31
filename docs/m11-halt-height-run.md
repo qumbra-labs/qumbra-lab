@@ -140,11 +140,10 @@ excluded field does not, and that swapping two equal-width fields moves it.
 
 ### The resume gate, and why it is anchored on an on-disk marker (H4)
 
-A node that reaches H writes `halt.marker` into its data dir: the height, the
-revision that halted it, that revision's frozen digest, and whether the boundary
-finalized. Any later binary that would carry the node **past** the marked height
-must both carry a revision and *declare* `resumes_from == that height`, or it
-refuses to start.
+A node that reaches H writes `halt.marker` into its data dir: the boundary height,
+the revision **in force**, that revision's frozen digest, whether the boundary
+finalized, and (since #81) a marker schema and whether the boundary has been
+*passed*.
 
 The marker is what makes this non-dodgeable. If the gate depended only on the
 resuming binary declaring its own intent, a binary that simply declared nothing
@@ -152,13 +151,42 @@ would sail through. Because the halted binary already wrote the fact down, silen
 is refused too. A **corrupt** marker is an error, never read as "never halted" — a
 node that halted must not become resumable by mangling its own evidence.
 
+**What the gate keys on (rekeyed by [#81](https://github.com/lai3d/qumbra-lab/issues/81)):**
+
+| data dir state | the gate's question |
+|---|---|
+| halted **at** the boundary, not yet resumed | does this binary carry a revision and *declare* `resumes_from == H`? |
+| **passed** the boundary | is this binary's `Revision::digest()` the one the marker records as in force? |
+
+The split is the whole of #81. The height was a serviceable proxy for exactly one
+upgrade — the top row — and the top row keeps it, because at a boundary the chain
+has been deliberately paused and the pre-halt revision is *trivially* still in
+force, so digest equality there would admit the very binary the marker exists to
+refuse. Everything after the upgrade is the bottom row, and that is what the height
+key got wrong: the marked height never moves again, so every later release had to
+declare `resumes_from = 16` forever.
+
+Two properties worth stating explicitly, because a naive reading of "digest
+equality" loses both:
+
+- It is the **revision** digest, not the bare frozen digest. This drill's upgrade is
+  *inert* — `v1.0` and `v1.0.1-drill` have byte-identical frozen digests — so only
+  the identifier-bound `Revision::digest()` still refuses the pre-announcement
+  binary on an upgraded node. A frozen-digest key would have matched and started it.
+- A binary that matches must still run the **same post-halt rule domain**, because
+  the domain is mixed into the PoW value. `Release::rule_schedule_on` therefore reads
+  the boundary and domain off the marker for a release that declares none of its own.
+  Without that, "starts freely" would mean "starts and forks", which is worse than
+  the refusal it replaced.
+
 Two consequences worth stating, because they surprised us:
 
 - Handing a halted node the *pre-announcement* v1.0 binary is refused
   (`UndeclaredResume`). That is correct: "fixing" a halted node by downgrading to a
   binary that does not know about the halt is precisely the mistake the marker
   exists to catch. It is also why the drill's old-binary miner is a node that
-  **never armed** — see the drill topology below.
+  **never armed** — see the drill topology below. Since #81 the same refusal holds
+  *after* the upgrade, where the plain binary is a downgrade.
 - Restarting the *same* halted binary is not a resume, and is allowed. An operator
   must be able to stop and inspect a halted node.
 
@@ -455,9 +483,49 @@ The four stop-points from the task-book, and what the tooling does about each:
    releases move no frozen constant, an ordinary bug-fix release digests identically
    and simply starts. #81 is gated to land before any real halt-height upgrade after
    the drill.
+
+   ✅ **FIXED in #81.** The marker records the revision in force (schema 1) and is
+   rewritten by the binary that legitimately resumes; the gate keys on
+   `Revision::digest()` equality once the boundary has been *passed*, and keeps the
+   declaration while the node is halted at it (see the rekeyed gate table above).
+   Two things the implementation had to correct in the decision as written, both
+   reported on #81:
+
+   - **Digest equality alone would have forked the chain.** `PostHaltRules.domain` is
+     mixed into the PoW value, and was derived only from the binary's own
+     `resumes_from` — so the routine release #81 exists to unblock would have started
+     with no domain and rejected every post-boundary block. The domain is now read
+     from the marker. Folded in as a precondition, not scope growth.
+   - **The bare *frozen* digest was the wrong key.** This drill's upgrade is inert, so
+     it cannot distinguish `v1.0` from `v1.0.1-drill` — it would have re-admitted the
+     pre-announcement binary and lost the refusal in the bullet above.
+
 9. **A node that voted on the old branch cannot vote for the new one at the same
    slot.** The never-double-sign ledger is doing its job, but it means a committee
    member who mined past H on the old binary and voted there has burned those slots
    for the upgraded branch. This is correct behaviour and an argument for halting
    *before* forking rather than mining through — worth a line in the operator
    procedure, which it has.
+10. **🔴 One marker cannot express domain HISTORY, and this is still open.** Found
+    while building #81; **pre-existing and not caused by it.** A release carries
+    exactly one `resumes_from`, and the marker records exactly one boundary and one
+    in-force revision, so after a *second* upgrade there is nowhere to record that
+    blocks 17–H2 ran under revision A's domain while H2+1 upward run under B's. A
+    node **syncing from genesis** would compute the earlier span under the later
+    domain and reject it. It does not affect the resume-from-snapshot path the drill
+    exercises (`a_second_upgrade_advances_the_boundary_and_the_revision_in_force`
+    passes on a snapshot), and it is invisible until a net has taken two upgrades and
+    then onboards a fresh node. The fix is the "releases carry boundary history"
+    alternative #81 rejected as unbounded, so it needs a coordinator decision rather
+    than a builder's guess. Reported on #81, deliberately not built.
+
+11. **A second halt on a resumed data dir never wrote its marker** — found and fixed
+    in #81, and worth recording because of *why* it was invisible.
+    `marker_final_written` was seeded from any marker's `boundary_finalized`, so a
+    node armed at a second boundary on a data dir whose first boundary had finalized
+    started with the flag already true and skipped writing the new marker entirely.
+    It was **unreachable** before #81: the height-keyed gate refused such a binary
+    outright, so a marker for a different boundary could never be in play. Opening
+    the second upgrade is what made it live, which is the general shape worth
+    remembering — the first real use of a newly-unblocked path is where latent
+    single-use assumptions surface.

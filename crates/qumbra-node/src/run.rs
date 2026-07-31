@@ -577,7 +577,17 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             started: Instant::now(),
             release,
             halt_at: release.halt_at(),
-            marker_final_written: marker.is_some_and(|m| m.boundary_finalized),
+            // "The marker for THIS release's halt is already in its final form", so
+            // it may only be seeded from a marker that is actually about this halt.
+            // Seeding it from any marker at all was unreachable under the height-keyed
+            // gate — a binary armed at a SECOND boundary on a resumed data dir was
+            // refused outright, so there was never a marker for a different boundary
+            // to be confused by. #81 makes the second upgrade possible and therefore
+            // makes it live: the node would halt at the new boundary and never write a
+            // marker for it, leaving the gate to consult a stale boundary afterwards.
+            marker_final_written: marker
+                .filter(|m| !m.resumed && Some(m.height) == release.halt_at())
+                .is_some_and(|m| m.boundary_finalized),
         })
     }
 
