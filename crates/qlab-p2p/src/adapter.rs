@@ -57,7 +57,9 @@ use qlab_node::metrics::Metrics;
 use qlab_node::recovery::Finalizer;
 use qlab_node::round::{ObsClock, RoundLedger, SlotContext, VoteRejects};
 use qlab_node::telemetry::StateLag;
-use qlab_node::{genesis_block, MemNode, Mempool, MempoolError, NodeError, NodeState as _};
+use qlab_node::{
+    genesis_block, MemNode, Mempool, MempoolError, NodeError, NodeState as _, RecoveryReport,
+};
 use qlab_devnet::body::TxVerifier;
 
 use crate::codec::{checkpoint_id, tx_id as wire_tx_id};
@@ -377,6 +379,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // to re-sync everything it already had on disk.
         let resumed = me.state.chain().chain().clone();
         me.chain = resumed;
+        // The state-machine chain already restored and proved this durable point.
+        // Rehydrate the committee tracker through its named recovery constructor:
+        // startup is not a fresh quorum event and must never be routed through
+        // `try_finalize`. Without this, the chain/anchor head survives but the
+        // operator-facing `final=` / `fid=` pair resets to absent on every restart.
+        if let Some(checkpoint) = me.state.restored_checkpoint() {
+            me.finality = FinalityTracker::from_restored_checkpoint(checkpoint);
+        }
         // Punishments BEFORE the epoch advance: a tombstone's effect at a boundary is
         // to shrink the roster and reindex it, and applying it afterwards would punish
         // whichever member had shifted into that index.
@@ -421,6 +431,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// Empty and all-zero for an in-memory adapter.
     pub fn punishment_restore(&self) -> &PunishmentRestore {
         &self.punish_restore
+    }
+
+    /// What the durable state-machine open recovered from disk.
+    pub fn recovery_report(&self) -> &RecoveryReport {
+        self.state.recovery_report()
     }
 
     /// Every equivocation this node has adjudicated — the in-memory mirror of the

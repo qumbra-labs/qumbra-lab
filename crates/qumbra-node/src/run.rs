@@ -683,6 +683,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         self.p2p.node().finalized_height()
     }
 
+    /// One-line provenance for how this process recovered its durable chain.
+    pub fn recovery_report(&self) -> &qlab_node::RecoveryReport {
+        self.p2p.node().recovery_report()
+    }
+
     /// Override the mining cadence (tests set 0 to mine every step).
     pub fn set_mine_interval(&mut self, d: Duration) {
         self.mine_interval = d;
@@ -1690,6 +1695,8 @@ mod tests {
             node.try_checkpoint();
         }
         assert_eq!(node.tip_height(), 3);
+        let finalized_before = node.finalized_height();
+        let fid_before = node.finalized_checkpoint_id();
 
         // Flush + drop, then re-open the SAME data dir: the tip persists (the disk
         // stores + snapshot are real — restart safety).
@@ -1698,6 +1705,20 @@ mod tests {
         let reopened =
             RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
         assert_eq!(reopened.tip_height(), 3, "state persisted across restart");
+        assert_eq!(
+            reopened.finalized_height(),
+            finalized_before,
+            "the operator-facing finalized head survives the real run path"
+        );
+        assert_eq!(
+            reopened.finalized_checkpoint_id(),
+            fid_before,
+            "the exact identity survives, not only the checkpoint height"
+        );
+        assert_eq!(
+            reopened.recovery_report().to_string(),
+            "RECOVERY restored snapshot at height 3, replayed 0 records, resumed at tip 3"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1718,18 +1739,19 @@ mod tests {
         }
         node.try_checkpoint(); // slot 8
         assert_eq!(node.finalized_height(), Some(CHECKPOINT_CADENCE_BLOCKS), "slot 8 finalized");
+        let fid_before = node.finalized_checkpoint_id();
         // Ledgers were persisted (write-ahead, before broadcast).
         assert!(config.data_dir.join("finalizer-0.state").exists(), "finalizer 0 ledger on disk");
         node.save_snapshot().unwrap();
         drop(node);
 
-        // Restart: finalizers restore their ledgers from disk. NOTE: the finality
-        // TRACKER is intentionally NOT persisted (S7 — the vote tally / finalized head
-        // rebuilds from re-gossip), so a solo reopened node with no peers reports no
-        // finalized height until a checkpoint is re-gossiped. What #7 requires is that
-        // the never-double-sign LEDGER survives:
+        // Restart: finalizers restore their ledgers from disk, and the finality
+        // tracker is reconstructed from the durable state-machine checkpoint. This
+        // is recovery, not a fresh quorum event; no votes are replayed to establish it.
         let mut reopened =
             RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        assert_eq!(reopened.finalized_height(), Some(CHECKPOINT_CADENCE_BLOCKS));
+        assert_eq!(reopened.finalized_checkpoint_id(), fid_before);
         assert_eq!(
             reopened.finalizers_mut()[0].last_voted_slot(),
             Some(CHECKPOINT_CADENCE_BLOCKS),
