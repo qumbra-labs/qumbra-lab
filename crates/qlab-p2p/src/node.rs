@@ -435,7 +435,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                     self.store_and_announce_finalized(cp, accumulated, None);
                 }
             }
-            VotesOutcome::Stale | VotesOutcome::Invalid => {}
+            // Stale / Invalid / Unjudged: nothing to relay from our own announce.
+            VotesOutcome::Stale | VotesOutcome::Invalid | VotesOutcome::Unjudged => {}
         }
     }
 
@@ -782,8 +783,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 }
             }
             VotesOutcome::Stale => {} // already known / finalized — no relay, no penalty
-            VotesOutcome::Invalid => {
-                self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+            // Issue #164: only Intrinsic failures cost the sender. `Unjudged` is the
+            // positional half — a roster this node cannot reconcile with the vote —
+            // and is asked through one predicate so the scoring path cannot drift
+            // from the classification (same shape as `IngestOutcome::is_peer_fault`).
+            other => {
+                if other.is_peer_fault() {
+                    self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+                }
             }
         }
     }
@@ -1442,17 +1449,23 @@ mod tests {
         }
     }
 
-    /// ACCEPTANCE #4 (wire half) — a `CheckpointVotes` frame carrying a forged vote is
-    /// penalised over the wire (a valid signature attributed to the wrong signer).
+    /// ACCEPTANCE #4 (wire half) — a `CheckpointVotes` frame carrying a **genuine**
+    /// forge is penalised over the wire (issue #164: a signature no roster member
+    /// produced — not a mis-indexed in-roster signature, which is Unjudged).
     #[test]
     fn forged_votes_penalised_over_the_wire() {
-        let (committee, validators) = devnet_committee(21);
+        let (committee, _validators) = devnet_committee(21);
         let (mut nodes, _hub) = mesh_sharing(2, &committee);
         run(&mut nodes);
 
         let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
-        // Valid signature by validator 1, attributed to signer 0 → does not verify.
-        let forged = Vote { signer: 0, signature: validators[1].sign_checkpoint(&cp).signature };
+        // Outsider signature claimed under an in-range index — no roster member
+        // produced it, so the Intrinsic arm still fires.
+        let outsider = Validator::from_seed(99, [0xEE; 32]);
+        let forged = Vote {
+            signer: 0,
+            signature: outsider.sign_checkpoint(&cp).signature,
+        };
         let frame =
             Envelope::new(MsgType::CheckpointVotes, encode_checkpoint_votes(&cp, &[forged])).encode();
         // Node 0 (PeerId 1) injects the forged frame to node 1 (PeerId 2).
