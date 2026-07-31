@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use qlab_cbserver::tree::CommitmentTree;
 use qlab_devnet::body::{BlockBody, TxEntry, TxPublic};
-use qlab_devnet::chain::{ChainState, InsertError};
+use qlab_devnet::chain::{ChainState, InsertError, RestoreFinalizedError};
 use qlab_devnet::fees::ArityBucket;
 use qlab_devnet::header::BlockHeader;
 
@@ -196,6 +196,14 @@ pub trait ChainStore {
     fn contains(&self, hash: &Hash32) -> bool;
     /// Mark `hash` finalized (must be known, strictly advance, descend finality).
     fn set_finalized(&mut self, hash: Hash32) -> bool;
+    /// Reinstate a finalized point from a durable snapshot. Unlike
+    /// [`Self::set_finalized`], this proves one previously-established point
+    /// against the reconstructed main chain rather than advancing live finality.
+    fn restore_finalized(
+        &mut self,
+        hash: Hash32,
+        height: u64,
+    ) -> Result<(), RestoreFinalizedError>;
 }
 
 /// The permanent nullifier set — the consensus double-spend gate (protocol-spec
@@ -288,6 +296,13 @@ impl ChainStore for MemChainStore {
     }
     fn set_finalized(&mut self, hash: Hash32) -> bool {
         self.chain.set_finalized(hash).is_ok()
+    }
+    fn restore_finalized(
+        &mut self,
+        hash: Hash32,
+        height: u64,
+    ) -> Result<(), RestoreFinalizedError> {
+        self.chain.restore_finalized(hash, height)
     }
 }
 

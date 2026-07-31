@@ -96,7 +96,7 @@ fn build_chain(dir: &PathBuf) -> (Hash32, u64, usize, Hash32, Option<u64>) {
 }
 
 #[test]
-fn restart_from_snapshot_and_replay_agree() {
+fn open_equals_replay_on_the_finalized_checkpoint_and_state() {
     let dir = temp_dir("restart");
     let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
 
@@ -109,6 +109,8 @@ fn restart_from_snapshot_and_replay_agree() {
     assert_eq!(reopened.nullifier_count(), nc);
     assert_eq!(reopened.commitment_root(), root, "commitment root survives restart");
     assert_eq!(reopened.finalized_height(), fh, "finalized head survives restart");
+    assert_eq!(reopened.recovery_report().snapshot_height, Some(2));
+    assert_eq!(reopened.recovery_report().replayed_records, 0);
     assert!(reopened.is_spent(&[9u8; 32]));
 
     // Rebuild purely from the log (ignores the snapshot) — the correctness anchor.
@@ -118,8 +120,84 @@ fn restart_from_snapshot_and_replay_agree() {
     assert_eq!(replayed.nullifier_count(), nc);
     assert_eq!(replayed.commitment_root(), root);
     assert_eq!(replayed.finalized_height(), fh, "finalized head reconstructed from the log");
+    assert_eq!(
+        reopened.restored_checkpoint(),
+        replayed.restored_checkpoint(),
+        "open == replay on the exact checkpoint, including the identity-bearing hash"
+    );
     assert!(replayed.is_spent(&[9u8; 32]));
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_snapshot_whose_finalized_block_is_absent_refuses_to_open() {
+    let dir = temp_dir("bad-finalized");
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    build_chain(&dir);
+
+    let path = dir.join(qlab_node::SNAPSHOT);
+    let mut snap: qlab_node::Snapshot =
+        bincode::deserialize(&std::fs::read(&path).unwrap()).unwrap();
+    snap.finalized = Some(([0xEE; 32], 1));
+    std::fs::write(&path, bincode::serialize(&snap).unwrap()).unwrap();
+
+    match MemNode::open(&dir, genesis) {
+        Err(NodeError::SnapshotFinality(
+            qlab_devnet::chain::RestoreFinalizedError::Unknown,
+        )) => {}
+        Err(other) => panic!("wrong refusal: {other}"),
+        Ok(_) => panic!("an inconsistent finalized head must never start fresh"),
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_fresh_datadir_starts_without_finality_quietly() {
+    let dir = temp_dir("fresh");
+    let node = MemNode::open(&dir, genesis_block(GENESIS_DIFFICULTY, 0)).unwrap();
+
+    assert_eq!(node.finalized_height(), None);
+    assert_eq!(node.restored_checkpoint(), None);
+    assert_eq!(
+        node.recovery_report().to_string(),
+        "RECOVERY no snapshot, replayed 0 records, resumed at tip 0"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn a_finalization_recorded_after_the_snapshot_still_survives() {
+    let dir = temp_dir("post-snapshot-finalize");
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    let g_header = genesis.header();
+    let mut node = MemNode::open(&dir, genesis.clone()).unwrap();
+
+    assert!(node.finalize(g_header.header_hash()).unwrap());
+    let root = node.commitment_root();
+    let (_h1, hash1) = apply_one_tx_block(
+        &mut node,
+        &g_header,
+        tx(root, vec![], vec![[1u8; 32]]),
+    )
+    .unwrap();
+    node.save_snapshot().unwrap();
+    assert_eq!(node.finalized_height(), Some(0), "snapshot contains genesis finality");
+
+    // This record is appended after the snapshot even though it names a block at
+    // the snapshot's applied height. Recovery must judge record order, not assume
+    // `height <= applied_height` means the finalization was already snapshotted.
+    assert!(node.finalize(hash1).unwrap());
+    drop(node);
+
+    let reopened = MemNode::open(&dir, genesis).unwrap();
+    assert_eq!(reopened.finalized_height(), Some(1));
+    assert_eq!(reopened.recovery_report().snapshot_height, Some(1));
+    assert_eq!(
+        reopened.recovery_report().replayed_records,
+        1,
+        "only the post-snapshot finalization advances recovery state"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

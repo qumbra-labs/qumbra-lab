@@ -25,7 +25,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use qlab_devnet::body::{validate_body, BlockBody, BodyError, TxVerifier};
-use qlab_devnet::chain::InsertError;
+use qlab_devnet::chain::{InsertError, RestoreFinalizedError};
+use qlab_devnet::committee::Checkpoint;
 use qlab_devnet::header::BlockHeader;
 use qlab_devnet::params_devnet::MAX_ANCHOR_AGE_BLOCKS;
 
@@ -37,6 +38,35 @@ use crate::store::{
 
 /// The default all-in-memory node composition (with optional disk durability).
 pub type MemNode = Node<MemChainStore, MemNullifierStore, MemCommitmentStore>;
+
+/// What [`MemNode::open`] recovered from disk.
+///
+/// `replayed_records` counts log records that advanced state beyond the snapshot:
+/// blocks above its applied height plus finalizations that advanced beyond its
+/// restored finalized head. With no snapshot, every decoded record is replayed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryReport {
+    pub snapshot_height: Option<u64>,
+    pub replayed_records: usize,
+    pub resumed_tip: u64,
+}
+
+impl std::fmt::Display for RecoveryReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.snapshot_height {
+            Some(height) => write!(
+                f,
+                "RECOVERY restored snapshot at height {height}, replayed {} records, resumed at tip {}",
+                self.replayed_records, self.resumed_tip
+            ),
+            None => write!(
+                f,
+                "RECOVERY no snapshot, replayed {} records, resumed at tip {}",
+                self.replayed_records, self.resumed_tip
+            ),
+        }
+    }
+}
 
 /// Why applying a block failed.
 #[derive(Debug)]
@@ -60,6 +90,9 @@ pub enum NodeError {
     NullifierSpent { tx: usize },
     /// The chain store rejected the header (bad parent / height / duplicate).
     Chain(InsertError),
+    /// A decoded snapshot named a finalized point that cannot be proven against
+    /// the reconstructed main chain. Refuse rather than silently starting clean.
+    SnapshotFinality(RestoreFinalizedError),
     /// A persistence error.
     Io(io::Error),
 }
@@ -85,6 +118,9 @@ impl std::fmt::Display for NodeError {
                 write!(f, "tx {tx} double-spends an already-nullified note")
             }
             NodeError::Chain(e) => write!(f, "chain store rejected block: {e:?}"),
+            NodeError::SnapshotFinality(e) => {
+                write!(f, "snapshot finalized head is inconsistent with the block log: {e:?}")
+            }
             NodeError::Io(e) => write!(f, "persistence error: {e}"),
         }
     }
@@ -181,6 +217,9 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     nullifiers_ordered: Vec<Hash32>,
     /// Directory backing the block log + snapshot; `None` = in-memory only.
     dir: Option<PathBuf>,
+    /// Recovery provenance for the startup banner. In-memory nodes carry the
+    /// all-zero fresh report; disk-backed `open` replaces it before returning.
+    recovery: RecoveryReport,
 }
 
 impl MemNode {
@@ -205,31 +244,71 @@ impl MemNode {
         // (cheap header inserts), not re-fold the tree. Blocks past the snapshot,
         // and every finalization, are fully replayed — keeping the result
         // identical to a from-genesis `replay`. No valid snapshot ⇒ full replay.
-        let applied_height = match persist::load_snapshot(&dir).map_err(NodeError::Io)? {
-            Some(snap) if snap.genesis_hash == node.chain.genesis_hash() => {
-                node.restore_from_snapshot(&snap);
-                snap.applied_height
+        let snapshot = persist::load_snapshot(&dir)
+            .map_err(NodeError::Io)?
+            .filter(|snap| snap.genesis_hash == node.chain.genesis_hash());
+        let mut replayed_records = 0usize;
+        if let Some(snap) = snapshot.as_ref() {
+            node.restore_from_snapshot(snap);
+
+            // First reconstruct the snapshot prefix's block store. Finality is
+            // restored only after every prefix block exists, so the persisted
+            // `(hash, height)` can be proved against the actual main chain.
+            for rec in &records {
+                if let LogRecord::Block(b) = rec {
+                    if b.header.height <= snap.applied_height {
+                        // Derived state already restored — just rebuild the chain
+                        // store. The binding is still checked (issue #77): this
+                        // path skips `apply_state`, so it would otherwise be the
+                        // one way a corrupted log record enters unchecked.
+                        check_stored_binding(b)?;
+                        node.chain.put_block(b.clone()).map_err(NodeError::Chain)?;
+                    }
+                }
             }
-            _ => 0,
-        };
-        for rec in &records {
-            match rec {
-                LogRecord::Block(b) if b.header.height <= applied_height => {
-                    // Derived state already restored — just rebuild the chain store.
-                    // The binding is still checked (issue #77): this path skips
-                    // `apply_state`, so it would otherwise be the one way a
-                    // corrupted log record enters the node unchallenged.
-                    check_stored_binding(b)?;
-                    node.chain.put_block(b.clone()).map_err(NodeError::Chain)?;
+
+            if let Some((hash, height)) = snap.finalized {
+                node.chain
+                    .restore_finalized(hash, height)
+                    .map_err(NodeError::SnapshotFinality)?;
+            }
+
+            // Replay only state beyond the snapshot. Every finalization record is
+            // offered to the live advance rule: prefix records are harmlessly
+            // rejected as non-advancing, while a finalization written after the
+            // snapshot still advances even when it names a prefix block.
+            for rec in &records {
+                match rec {
+                    LogRecord::Block(b) if b.header.height <= snap.applied_height => {}
+                    LogRecord::Block(b) => {
+                        node.apply_state(b)?;
+                        replayed_records += 1;
+                    }
+                    LogRecord::Finalize(hash) => {
+                        if node.chain.set_finalized(*hash) {
+                            replayed_records += 1;
+                        }
+                    }
                 }
-                LogRecord::Block(b) => {
-                    node.apply_state(b)?;
+            }
+        } else {
+            for rec in &records {
+                match rec {
+                    LogRecord::Block(b) => {
+                        node.apply_state(b)?;
+                    }
+                    LogRecord::Finalize(hash) => {
+                        node.chain.set_finalized(*hash);
+                    }
                 }
-                LogRecord::Finalize(h) => {
-                    node.chain.set_finalized(*h);
-                }
+                replayed_records += 1;
             }
         }
+        node.recovery = RecoveryReport {
+            snapshot_height: snapshot.as_ref().map(|snap| snap.applied_height),
+            replayed_records,
+            resumed_tip: node.chain.tip_height(),
+        };
         Ok(node)
     }
 
@@ -278,6 +357,7 @@ impl MemNode {
             commitments_ordered: Vec::new(),
             nullifiers_ordered: Vec::new(),
             dir,
+            recovery: RecoveryReport::default(),
         }
     }
 
@@ -291,6 +371,19 @@ impl MemNode {
         }
         self.nullifiers_ordered = snap.nullifiers.clone();
         self.roots_by_height = snap.roots_by_height.iter().copied().collect();
+    }
+
+    /// The checkpoint represented by the durable state-machine finalized head.
+    ///
+    /// The current devnet checkpoint root is the documented block-hash stand-in,
+    /// so `(height, hash)` reconstructs the exact signed checkpoint identity. This
+    /// does not finalize anything; the P2P adapter uses it only to restore its
+    /// otherwise-ephemeral [`qlab_devnet::finality::FinalityTracker`].
+    pub fn restored_checkpoint(&self) -> Option<Checkpoint> {
+        self.chain
+            .finalized_hash()
+            .zip(self.chain.finalized_height())
+            .map(|(hash, height)| Checkpoint::new(height, hash, hash))
     }
 }
 
@@ -476,6 +569,11 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// Borrow the nullifier store.
     pub fn nullifiers(&self) -> &N {
         &self.nullifiers
+    }
+
+    /// Recovery provenance from the last disk-backed [`MemNode::open`].
+    pub fn recovery_report(&self) -> &RecoveryReport {
+        &self.recovery
     }
 
     /// Whether the coinbase note minted at `minted_height` has entered the
