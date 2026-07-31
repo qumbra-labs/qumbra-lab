@@ -849,6 +849,23 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // an omitted field would only force a special case on every parser in
         // `qumbra-ops/`. `slag=0` is the healthy reading and it is a fact.
         let lag = node.state_lag();
+        // Issue #134: `uanchor=` is **appended at the end**, under the same rule as
+        // #87's, #84's, #105's and #130 (a)'s additions — every pre-existing field
+        // keeps its name, position and meaning.
+        //
+        // It counts block bodies this node **neither applied nor charged anyone for**,
+        // because it could not evaluate anchor finality from where it stands. It is the
+        // joiner's instrument, and until it existed the state #134 describes had no
+        // field on this line at all: a joiner burning its outbound set for serving it
+        // correct history looked, from the logs, exactly like "nobody would talk to
+        // me". The pair to read it against is `slag=` — `uanchor=` climbing while
+        // `slag=` stays pinned is a node being served history it cannot judge, i.e.
+        // sync is not progressing and the peers are not at fault.
+        //
+        // Caliper: cumulative since PROCESS START, over bodies this node was handed; a
+        // restart resets it. Zero is printed rather than omitted (the #130 (a) rule) —
+        // a node always knows this count, so an omitted field would only force a
+        // special case on every parser in `qumbra-ops/`.
         // Issue #106: `mready=` is **appended at the end**, under the same rule as
         // #87's, #84's and #130 (a)'s additions — every pre-existing field keeps its
         // name, position and meaning, and the `PRE_I84_FIELDS` prefix test passes
@@ -867,7 +884,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // `qumbra-ops/`.
         let mready = self.mine_gate();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} mready={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -879,6 +896,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             rounds_backfill,
             lag.state_tip,
             lag.blocks(),
+            ic.unjudged_anchor,
             mready.field(),
         )
     }
@@ -2687,6 +2705,8 @@ mod tests {
                 "rback",
                 // ── appended by #130 (a), at the end ──
                 "stip", "slag",
+                // ── appended by #134, at the end ──
+                "uanchor",
                 // ── appended by #106, at the end ──
                 "mready",
             ],

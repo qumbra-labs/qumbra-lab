@@ -5,7 +5,7 @@
 //! over the in-process and TCP transports, so tests are deterministic in-process
 //! and identical over the socket.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use qlab_devnet::committee::{Checkpoint, Vote};
 use qlab_devnet::body::{BlockBody, TxEntry};
@@ -52,6 +52,127 @@ fn dial_line(addr: &str, elapsed_ms: u64, result: &Result<PeerId, TransportError
     }
 }
 
+/// Entry cap on the body-serving cache (issue #135).
+///
+/// The cache exists to answer `GetBlockTxn` for announces still in flight — a
+/// reconstruction round-trip is seconds, and a re-announce re-drives a failed
+/// one — so its horizon is the live relay window, not history. 128 blocks is
+/// ~160 minutes at the 75 s target: three orders of magnitude past any round-trip,
+/// and a ~5 KB floor on a coinbase-only chain (40 B/entry). Deliberately NOT
+/// #130 (a)'s 512: that window must absorb a header-sync run-ahead; this one has
+/// no such job, and everything applied is servable from the store regardless.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_SERVED_BODIES: usize = 128;
+
+/// Byte budget for the body-serving cache (issue #135), on the same meter as
+/// #130 (a)'s window ([`crate::n1::txs_weight`]).
+///
+/// Two caps because either alone is wrong — (a)'s reasoning, which transfers even
+/// though the numbers do not: a coinbase-only body is tens of bytes, so a byte
+/// budget alone would admit ~200k entries; a proof-carrying body is ~145,754 B
+/// per tx at FROZEN v1.0 sizes, so the entry cap alone would admit ~19 MB at
+/// 1 tx/block and ~187 MB at 10 tx/block — on `t4g.small` hosts whose whole
+/// process measured ~262 MiB in the Phase B-lite soak. 8 MiB is ~57 single-tx
+/// bodies (~71 min of chain) or ~5 ten-tx bodies (~6 min), all far beyond the
+/// relay round-trip the cache serves, and 0.4 % of a 2 GB host.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_SERVED_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// One cached body: the ordered txs, the coinbase counter and the payout key —
+/// all three are needed to rebuild the *exact* body (issue #101) — plus the
+/// height it entered under and its metered weight, so eviction needs no rescan.
+struct ServedBody {
+    height: u64,
+    txs: Vec<TxEntry>,
+    // `GetBlockTxn` answers only tx indexes, so nothing reads these two today —
+    // they were equally unread in the pre-#135 tuple, where tuple fields don't
+    // warn. Kept anyway: a cache entry that cannot rebuild the *exact* body
+    // (issue #101: txs + coinbase + payout key) would be a trap for the next
+    // serving path (#130 (c)), silently missing what the announce carried.
+    #[allow(dead_code)]
+    coinbase: u64,
+    #[allow(dead_code)]
+    coinbase_rkm: [u64; 4],
+    weight: usize,
+}
+
+/// The bounded body-serving cache (issue #135) — full block bodies this node can
+/// hand to a `GetBlockTxn`, keyed by header hash, with a height index for
+/// eviction order.
+///
+/// **The eviction rule: lowest height first.** `GetBlockTxn` asks follow this
+/// node's own `BlockAnnounce` pushes, so the ask distribution concentrates at the
+/// tip; the deeper below the tip a body sits, the less likely anyone still wants
+/// it over compact relay — and once applied it is servable from the node's block
+/// store ([`crate::n1::ChainView::stored_body`]) forever, so evicting it loses
+/// nothing. What eviction CAN lose is a never-applied body (a side branch, or a
+/// body evicted before its application caught up) older than everything else
+/// held — which is precisely the least useful thing this cache holds, and a peer
+/// that needs genuinely historical bodies needs #130 (c), not this cache.
+///
+/// No third height-window cap (½ of (a)'s two-and-a-half): applicability has a
+/// hard cliff, so (a)'s window states a real invariant; serviceability only
+/// decays, and lowest-first eviction already orders by exactly that decay.
+struct ServedBodies {
+    by_hash: HashMap<Hash32, ServedBody>,
+    /// Eviction order: ascending `(height, hash)` — `first()` is the next victim.
+    by_height: BTreeSet<(u64, Hash32)>,
+    /// Running metered weight, maintained on insert/evict so the budget is a
+    /// subtraction rather than a walk (same discipline as (a)'s `pending_bytes`).
+    bytes: usize,
+}
+
+impl ServedBodies {
+    fn new() -> Self {
+        ServedBodies { by_hash: HashMap::new(), by_height: BTreeSet::new(), bytes: 0 }
+    }
+
+    fn contains(&self, hash: &Hash32) -> bool {
+        self.by_hash.contains_key(hash)
+    }
+
+    fn get(&self, hash: &Hash32) -> Option<&ServedBody> {
+        self.by_hash.get(hash)
+    }
+
+    fn len(&self) -> usize {
+        self.by_hash.len()
+    }
+
+    /// Cache a body, then evict lowest-height-first until back inside both caps.
+    /// The byte budget keeps ≥1 entry ((a)'s guard, same reason): a single body
+    /// over the whole budget is one this node just announced — evicting it would
+    /// break our own relay, and one body is not a resource-exhaustion surface.
+    ///
+    /// The freshly-inserted entry gets no special treatment: if it is the lowest
+    /// height held while the cache is full, it IS the least useful entry by the
+    /// rule, and it goes (its announce was still relayed; a peer that misses the
+    /// re-request window recovers via re-announce or, once applied, the store).
+    fn insert(&mut self, height: u64, hash: Hash32, txs: Vec<TxEntry>, coinbase: u64, coinbase_rkm: [u64; 4]) {
+        let weight = crate::n1::txs_weight(&txs) + 40;
+        let entry = ServedBody { height, txs, coinbase, coinbase_rkm, weight };
+        if let Some(old) = self.by_hash.insert(hash, entry) {
+            // Same hash re-completed (e.g. re-announce after restart): replace,
+            // do not double-count.
+            self.by_height.remove(&(old.height, hash));
+            self.bytes = self.bytes.saturating_sub(old.weight);
+        }
+        self.by_height.insert((height, hash));
+        self.bytes += weight;
+        while self.by_hash.len() > MAX_SERVED_BODIES
+            || (self.bytes > MAX_SERVED_BODY_BYTES && self.by_hash.len() > 1)
+        {
+            let Some(&(h, bh)) = self.by_height.iter().next() else { break };
+            self.by_height.remove(&(h, bh));
+            if let Some(dropped) = self.by_hash.remove(&bh) {
+                self.bytes = self.bytes.saturating_sub(dropped.weight);
+            }
+        }
+    }
+}
+
 /// A running P2P node: transport + node-state + peers + gossip + sync.
 pub struct P2pNode<T: Transport, N: NodeState> {
     transport: T,
@@ -63,11 +184,12 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     sync: SyncState,
     version_sent: HashSet<PeerId>,
     /// Full block bodies this node can serve (originated or fully reconstructed),
-    /// keyed by header hash — backs `GetBlockTxn` answering. Stores the ordered
-    /// txs, the body's coinbase counter and its payout key (all three are needed
-    /// to rebuild the *exact* body — issue #101 added the third; without it the
-    /// rebuilt body commits to a different value than the header).
-    blocks: HashMap<Hash32, (Vec<TxEntry>, u64, [u64; 4])>,
+    /// keyed by header hash — backs `GetBlockTxn` answering. **Bounded** (issue
+    /// #135): a cache over the hot relay window, no longer the authoritative
+    /// serving store — an applied body outlives its eviction via
+    /// [`crate::n1::ChainView::stored_body`], the fallback `on_get_block_txn`
+    /// takes on a cache miss.
+    blocks: ServedBodies,
     /// Announcements awaiting missing transactions (block hash → announce).
     pending_blocks: HashMap<Hash32, BlockAnnounce>,
     /// Finalized checkpoints + their votes, keyed by checkpoint id — so a
@@ -94,7 +216,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             seen: SeenCache::default(),
             sync: SyncState::new(),
             version_sent: HashSet::new(),
-            blocks: HashMap::new(),
+            blocks: ServedBodies::new(),
             pending_blocks: HashMap::new(),
             checkpoints: HashMap::new(),
             addrs: AddrManager::new(),
@@ -121,6 +243,12 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// The address book / dial policy (issue #83).
     pub fn addrs(&self) -> &AddrManager {
         &self.addrs
+    }
+    /// Serving-cache occupancy `(entries, metered bytes)` (issue #135) —
+    /// operator-visible so occupancy is a measurement, not an inference (the
+    /// same statement the adapter makes for its pending-body window).
+    pub fn served_bodies(&self) -> (usize, usize) {
+        (self.blocks.len(), self.blocks.bytes)
     }
     pub fn addrs_mut(&mut self) -> &mut AddrManager {
         &mut self.addrs
@@ -350,10 +478,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         let outcome = self
             .node
             .ingest_block(header, BlockBody { txs: txs.clone(), coinbase, coinbase_rkm });
-        if let IngestOutcome::Rejected(_) = outcome {
+        // Issue #134 widens this from `Rejected` to `Rejected | Ignored`. `Ignored` now
+        // also covers a body whose anchors this node **could not evaluate**, and
+        // announcing one would make this node the origin of an object it never
+        // validated — the same failure #77 closed here for `Rejected`. It is reachable
+        // for a node's own block: a miner in a finality stall can assemble a body whose
+        // anchors its own (stalled) view can no longer judge.
+        //
+        // `Orphan` deliberately still announces: it is not a refusal, and the orphan
+        // sync-kick on the receiving side is how a gap gets closed.
+        if matches!(outcome, IngestOutcome::Rejected(_) | IngestOutcome::Ignored(_)) {
             return;
         }
-        self.blocks.insert(bh, (txs.clone(), coinbase, coinbase_rkm));
+        self.blocks.insert(header.height, bh, txs.clone(), coinbase, coinbase_rkm);
         self.seen.insert(bh);
 
         let (prefilled, short_ids) = build_announce_parts(&txs, nonce);
@@ -848,8 +985,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         let bh = ann.header.header_hash();
-        if self.blocks.contains_key(&bh) {
-            return; // already have the full body
+        if self.blocks.contains(&bh) || self.node.has_stored_body(&bh) {
+            return; // already have the full body (hot cache or applied store)
         }
         let candidates = self.node.all_txs();
         match reconstruct(&ann, &candidates) {
@@ -873,11 +1010,18 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return;
             }
         };
-        let Some((body, _coinbase, _rkm)) = self.blocks.get(&req.block_hash) else {
+        // Hot cache first, then the applied-block store (issue #135): the cache is
+        // the relay window, the store is authoritative for everything this node
+        // has folded into state — so eviction never makes an applied body
+        // unanswerable. A miss on both is a body this node never applied and no
+        // longer holds (or never held); it stays silent, as before.
+        let txs: Vec<TxEntry> = if let Some(entry) = self.blocks.get(&req.block_hash) {
+            req.indexes.iter().filter_map(|&i| entry.txs.get(i as usize).cloned()).collect()
+        } else if let Some(body) = self.node.stored_body(&req.block_hash) {
+            req.indexes.iter().filter_map(|&i| body.txs.get(i as usize).cloned()).collect()
+        } else {
             return; // we don't have that block's body
         };
-        let txs: Vec<TxEntry> =
-            req.indexes.iter().filter_map(|&i| body.get(i as usize).cloned()).collect();
         self.send(
             from,
             MsgType::BlockTxn,
@@ -962,7 +1106,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             return;
         }
-        self.blocks.insert(bh, (txs, ann.coinbase, ann.coinbase_rkm));
+        self.blocks.insert(ann.header.height, bh, txs, ann.coinbase, ann.coinbase_rkm);
         self.seen.insert(bh);
         let payload = encode_announce(&ann);
         for pid in self.peers.ready_peers() {
@@ -991,7 +1135,7 @@ fn build_announce_parts(txs: &[TxEntry], nonce: u64) -> (Vec<PrefilledTx>, Vec<[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::n1::{BlockIngest, ChainView, CommitteeControl, StubNode, TxPool};
+    use crate::n1::{BlockIngest, ChainView, CheckpointIngest, CommitteeControl, StubNode, TxPool};
     use crate::transport::{InProcHub, InProcTransport, TcpTransport};
     use qlab_devnet::body::TxPublic;
     use qlab_devnet::committee::{devnet_committee, CommitteeState, MemberStatus, Validator};
@@ -1480,7 +1624,7 @@ mod tests {
             "the announcer of an unbound body is penalised"
         );
         assert!(!nodes[1].node().has_header(&bh), "the header was not adopted");
-        assert!(!nodes[1].blocks.contains_key(&bh), "the body was not cached for serving");
+        assert!(!nodes[1].blocks.contains(&bh), "the body was not cached for serving");
         // …and it was not re-announced onward to node 2.
         nodes[2].tick(0);
         assert!(!nodes[2].node().has_header(&bh), "a rejected block is not relayed");
@@ -1497,8 +1641,287 @@ mod tests {
         let bh = header.header_hash();
         nodes[0].announce_block(header, vec![tx(2)], 0, [0; 4], 0xFEED);
         run(&mut nodes);
-        assert!(!nodes[0].blocks.contains_key(&bh), "not cached locally");
+        assert!(!nodes[0].blocks.contains(&bh), "not cached locally");
         assert!(!nodes[1].node().has_header(&bh), "never announced to the peer");
+    }
+
+    // ── issue #135: the body-serving cache is bounded ────────────────────────
+
+    /// A cache entry: `height` names it, `proof_len` sizes it (the metered weight
+    /// is `proof_len + 112 + 40` — one nullifier, one commitment, per [`tx`]'s
+    /// shape). The hash is derived from the height so entries stay distinct.
+    fn cache_insert(c: &mut ServedBodies, height: u64, proof_len: usize) -> Hash32 {
+        let mut hash = [0u8; 32];
+        hash[..8].copy_from_slice(&height.to_le_bytes());
+        let entry = TxEntry {
+            proof: vec![0xBB; proof_len],
+            public: TxPublic {
+                anchor: [1; 32],
+                nullifiers: vec![[2; 32]],
+                commitments: vec![[3; 32]],
+                bucket: ArityBucket::TwoByTwo,
+                fee: 0,
+            },
+        };
+        c.insert(height, hash, vec![entry], 0, [0; 4]);
+        hash
+    }
+
+    /// The rule, not just the ceiling: at the entry cap the cache keeps the
+    /// HIGHEST heights — and provably by height, not by insertion order, which is
+    /// why the heights arrive interleaved (evens ascending, then odds descending).
+    #[test]
+    fn serving_cache_keeps_the_highest_heights_at_the_entry_cap() {
+        let mut c = ServedBodies::new();
+        let total = MAX_SERVED_BODIES as u64 + 8;
+        let mut hashes = HashMap::new();
+        for h in (1..=total).filter(|h| h % 2 == 0) {
+            hashes.insert(h, cache_insert(&mut c, h, 0));
+        }
+        for h in (1..=total).filter(|h| h % 2 == 1).rev() {
+            hashes.insert(h, cache_insert(&mut c, h, 0));
+        }
+        assert_eq!(c.len(), MAX_SERVED_BODIES, "the map stopped growing at the bound");
+        for h in 1..=8 {
+            assert!(!c.contains(&hashes[&h]), "height {h} is the least useful and was evicted");
+        }
+        for h in 9..=total {
+            assert!(c.contains(&hashes[&h]), "height {h} is within the window and was kept");
+        }
+    }
+
+    /// The byte budget binds when entries are fat — and keeps at least one body,
+    /// because a single body over the whole budget is one this node just announced
+    /// and must still be able to serve.
+    #[test]
+    fn serving_cache_byte_budget_binds_and_keeps_at_least_one_body() {
+        let mut c = ServedBodies::new();
+        let three_mib = 3 * 1024 * 1024;
+        let h1 = cache_insert(&mut c, 1, three_mib);
+        let h2 = cache_insert(&mut c, 2, three_mib);
+        assert_eq!(c.len(), 2, "6 MiB fits the 8 MiB budget");
+        let h3 = cache_insert(&mut c, 3, three_mib);
+        assert!(c.bytes <= MAX_SERVED_BODY_BYTES, "the budget holds after eviction");
+        assert!(!c.contains(&h1), "lowest height paid for the overflow");
+        assert!(c.contains(&h2) && c.contains(&h3));
+
+        let mut solo = ServedBodies::new();
+        let big = cache_insert(&mut solo, 1, MAX_SERVED_BODY_BYTES + 1);
+        assert!(solo.contains(&big), "a single over-budget body is kept, not thrashed");
+        assert_eq!(solo.len(), 1);
+    }
+
+    /// A re-completed hash (re-announce after restart) replaces its entry without
+    /// double-counting the byte meter — the drift (a) guards against in
+    /// `pending_bytes`, guarded here for the same reason.
+    #[test]
+    fn serving_cache_replaces_a_re_announced_hash_without_double_counting() {
+        let mut c = ServedBodies::new();
+        let hash = cache_insert(&mut c, 5, 1000);
+        let once = c.bytes;
+        let again = cache_insert(&mut c, 5, 1000);
+        assert_eq!(hash, again);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c.bytes, once, "replacement, not accumulation");
+    }
+
+    /// The bound holds at the announce surface, not just on the struct: a node
+    /// that announces an unbounded chain of blocks serves a bounded window of it.
+    /// (Pre-#135 this map grew by one body per accepted block, forever.)
+    #[test]
+    fn announcing_an_unbounded_chain_caches_a_bounded_serving_window() {
+        let hub = InProcHub::new();
+        let t = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let mut node = P2pNode::new(t, stub(), [1; 32]);
+
+        let mut parent = genesis();
+        let mut hashes = Vec::new();
+        for i in 0..(MAX_SERVED_BODIES + 10) {
+            let header = header_over(&parent, 75 * (i as u64 + 1), &[], i as u64);
+            hashes.push(header.header_hash());
+            node.announce_block(header, vec![], i as u64, [0; 4], i as u64);
+            parent = header;
+        }
+        let (entries, bytes) = node.served_bodies();
+        assert_eq!(entries, MAX_SERVED_BODIES, "the map stopped growing at the bound");
+        assert_eq!(bytes, MAX_SERVED_BODIES * 40, "40 B per empty body on the shared meter");
+        for bh in &hashes[..10] {
+            assert!(!node.blocks.contains(bh), "the oldest blocks were evicted");
+        }
+        for bh in &hashes[10..] {
+            assert!(node.blocks.contains(bh), "the newest {MAX_SERVED_BODIES} still serve");
+        }
+    }
+
+    /// A [`StubNode`] with an applied-body store bolted on — the smallest
+    /// `NodeState` whose `stored_body` answers, so the store-fallback serving path
+    /// is testable at the P2P surface. (The REAL store side — `NodeAdapter` over
+    /// the state machine's block store — has its own test in `adapter.rs`.)
+    struct StoreStub {
+        inner: StubNode,
+        bodies: HashMap<Hash32, BlockBody>,
+    }
+
+    impl StoreStub {
+        fn new() -> Self {
+            StoreStub { inner: stub(), bodies: HashMap::new() }
+        }
+    }
+
+    impl ChainView for StoreStub {
+        fn genesis_hash(&self) -> Hash32 {
+            self.inner.genesis_hash()
+        }
+        fn tip_hash(&self) -> Hash32 {
+            self.inner.tip_hash()
+        }
+        fn tip_height(&self) -> u64 {
+            self.inner.tip_height()
+        }
+        fn header(&self, hash: &Hash32) -> Option<BlockHeader> {
+            self.inner.header(hash)
+        }
+        fn main_chain_hash_at(&self, height: u64) -> Option<Hash32> {
+            self.inner.main_chain_hash_at(height)
+        }
+        fn has_header(&self, hash: &Hash32) -> bool {
+            self.inner.has_header(hash)
+        }
+        fn finalized_height(&self) -> Option<u64> {
+            self.inner.finalized_height()
+        }
+        fn stored_body(&self, hash: &Hash32) -> Option<BlockBody> {
+            self.bodies.get(hash).cloned()
+        }
+        fn has_stored_body(&self, hash: &Hash32) -> bool {
+            self.bodies.contains_key(hash)
+        }
+    }
+
+    impl BlockIngest for StoreStub {
+        fn ingest_header(&mut self, header: BlockHeader) -> IngestOutcome {
+            self.inner.ingest_header(header)
+        }
+        fn ingest_block(&mut self, header: BlockHeader, body: BlockBody) -> IngestOutcome {
+            if qlab_devnet::body::check_body_binding(&header, &body).is_err() {
+                return IngestOutcome::Rejected("body does not match header commitment");
+            }
+            let outcome = self.inner.ingest_header(header);
+            // Mirror the adapter's shape: a body for a header we hold is folded in
+            // (here: stored immediately — the stub has no lagging state machine).
+            if matches!(outcome, IngestOutcome::Accepted | IngestOutcome::Duplicate) {
+                self.bodies.insert(header.header_hash(), body);
+            }
+            outcome
+        }
+    }
+
+    impl TxPool for StoreStub {
+        fn ingest_tx(&mut self, tx: TxEntry) -> IngestOutcome {
+            self.inner.ingest_tx(tx)
+        }
+        fn get_tx(&self, id: &Hash32) -> Option<TxEntry> {
+            self.inner.get_tx(id)
+        }
+        fn has_tx(&self, id: &Hash32) -> bool {
+            self.inner.has_tx(id)
+        }
+        fn all_txs(&self) -> Vec<TxEntry> {
+            self.inner.all_txs()
+        }
+    }
+
+    impl CheckpointIngest for StoreStub {
+        fn ingest_checkpoint_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> VotesOutcome {
+            self.inner.ingest_checkpoint_votes(cp, votes)
+        }
+        fn has_checkpoint(&self, id: &Hash32) -> bool {
+            self.inner.has_checkpoint(id)
+        }
+    }
+
+    impl CommitteeControl for StoreStub {
+        fn observe_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> Vec<EquivocationEvidence> {
+            self.inner.observe_votes(cp, votes)
+        }
+        fn apply_evidence(&mut self, ev: &EquivocationEvidence) -> Option<usize> {
+            self.inner.apply_evidence(ev)
+        }
+        fn finality_status(&self) -> FinalityStatus {
+            self.inner.finality_status()
+        }
+        fn is_tombstoned(&self, idx: usize) -> bool {
+            self.inner.is_tombstoned(idx)
+        }
+    }
+
+    /// **The acceptance property: `GetBlockTxn` still answers after eviction.**
+    /// A body evicted from the cache but applied to the node's store is served
+    /// from the store — the full reconstruct round-trip completes against a node
+    /// whose cache no longer holds the block. And the store also gates
+    /// re-requests: an announce for a body a node already stores asks for nothing.
+    #[test]
+    fn get_block_txn_is_answered_from_the_store_after_eviction() {
+        let hub = InProcHub::new();
+        let ta = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let tb = InProcTransport::new(PeerId(2), Arc::clone(&hub));
+        hub.link(PeerId(1), PeerId(2));
+        let mut a: P2pNode<InProcTransport, StoreStub> =
+            P2pNode::new(ta, StoreStub::new(), [1; 32]);
+        let mut b: P2pNode<InProcTransport, StoreStub> =
+            P2pNode::new(tb, StoreStub::new(), [2; 32]);
+        a.add_peer(PeerId(2), None);
+        b.add_peer(PeerId(1), None);
+        for round in 0..20u64 {
+            if a.tick(round * SIM_TICK_MS) + b.tick(round * SIM_TICK_MS) == 0 {
+                break;
+            }
+        }
+
+        // A block whose body B cannot fully reconstruct: tx(1) rides prefilled
+        // (slot 0), tx(2) hides behind a short id B has never seen.
+        let txs = vec![tx(1), tx(2)];
+        let header = header_over(&genesis(), 75, &txs, 0);
+        let bh = header.header_hash();
+        a.announce_block(header, txs.clone(), 0, [0; 4], 0xC0DE);
+        assert!(a.blocks.contains(&bh) && a.node().has_stored_body(&bh));
+
+        // Evict it from A's cache FOR REAL — through the eviction rule, by
+        // burying it under MAX_SERVED_BODIES higher-height entries.
+        for i in 0..MAX_SERVED_BODIES as u64 {
+            cache_insert(&mut a.blocks, 100 + i, 0);
+        }
+        assert!(!a.blocks.contains(&bh), "evicted: the cache alone can no longer answer");
+        assert!(a.node().has_stored_body(&bh), "…but the applied store still can");
+
+        b.tick(1_000); // B: announce → tx(2) missing → GetBlockTxn to A
+        assert!(b.pending_blocks.contains_key(&bh), "B is waiting on the missing tx");
+        a.tick(1_010); // A: cache miss → store hit → BlockTxn
+        b.tick(1_020); // B: reconstructs, ingests, stores
+        assert!(b.node().has_header(&bh), "the block completed against an evicted cache");
+        assert!(b.node().has_stored_body(&bh), "and B folded the body in");
+
+        // Re-request gate: bury B's own cache copy, then re-deliver the announce.
+        // B recognises the body from its store and asks for nothing.
+        for i in 0..MAX_SERVED_BODIES as u64 {
+            cache_insert(&mut b.blocks, 200 + i, 0);
+        }
+        assert!(!b.blocks.contains(&bh));
+        let (prefilled, short_ids) = build_announce_parts(&txs, 0xC0DE);
+        let ann = BlockAnnounce {
+            header,
+            nonce: 0xC0DE,
+            coinbase: 0,
+            coinbase_rkm: [0; 4],
+            short_ids,
+            prefilled,
+        };
+        a.send(PeerId(2), MsgType::BlockAnnounce, encode_announce(&ann));
+        b.tick(2_000);
+        assert!(
+            b.pending_blocks.is_empty(),
+            "an announce for a stored body re-requests nothing"
+        );
     }
 
     #[test]
@@ -2163,5 +2586,269 @@ mod tests {
         // Heal: the next maintenance pass re-dials.
         nodes[0].maintain(crate::addrman::DIAL_BACKOFF_MAX_MS * 2);
         assert_eq!(nodes[0].addrs().outbound_live(), 1, "reconnected without a restart");
+    }
+
+    // --- issue #134: the scoring half, over the real gossip path ---------------
+
+    mod i134 {
+        //! A joiner must not ban the honest peers that serve it correct history.
+        //!
+        //! `adapter.rs` locks the *classification* (an anchor this node cannot judge is
+        //! `Ignored`, not `Rejected`). This module locks what the classification is
+        //! **for**: a real [`PeerTable`] score, moved by the real
+        //! `BlockAnnounce` → `complete_block` → `is_peer_fault` → `penalize` path, on a
+        //! chain whose every block carries a transaction.
+
+        use std::sync::Arc;
+
+        use qlab_devnet::body::{BlockBody, TxEntry, TxPublic, TxVerifier};
+        use qlab_devnet::committee::{devnet_committee, CommitteeState};
+        use qlab_devnet::fees::{posted_fee, ArityBucket};
+        use qlab_devnet::header::{BlockHeader, Hash32};
+        use qlab_devnet::node::SimConfig;
+        use qlab_devnet::params_devnet::BOND_AMOUNT;
+        use qlab_devnet::pow::KeccakPow;
+        use qlab_node::NodeState as _;
+
+        use crate::adapter::NodeAdapter;
+        use crate::n1::{IngestOutcome, TxPool};
+        use crate::node::P2pNode;
+        use crate::peer::{PeerId, BAN_THRESHOLD};
+        use crate::transport::{InProcHub, InProcTransport};
+
+        /// A proof is valid iff its bytes are `b"ok"` — the same stand-in `adapter.rs`
+        /// and the n7 soak use, so a body's validity here turns on the checks under
+        /// test rather than on the prover.
+        ///
+        /// `strict: false` is how the second test builds a peer that will **serve** a
+        /// body this node refuses: a broken or hostile node whose own verifier waves
+        /// the proof through. Nothing else about it differs — same genesis, same PoW,
+        /// same mined header — so the only variable between the two tests below is the
+        /// body, which is the comparison the acceptance bar asks for.
+        #[derive(Clone)]
+        struct MockVerifier {
+            strict: bool,
+        }
+        impl TxVerifier for MockVerifier {
+            fn verify_tx(&self, entry: &TxEntry) -> bool {
+                !self.strict || entry.proof == b"ok"
+            }
+        }
+
+        type Adapter = NodeAdapter<KeccakPow, MockVerifier>;
+        type Net = P2pNode<InProcTransport, Adapter>;
+
+        /// Low difficulty so a unit test can mine real PoW headers — the headers must
+        /// be genuine, because after #134 a mined header is exactly what buys the
+        /// amnesty.
+        fn sim() -> SimConfig {
+            SimConfig {
+                block_time_secs: 2,
+                genesis_difficulty: 8,
+                mine_nonce_budget: 5_000_000,
+                ..SimConfig::default()
+            }
+        }
+
+        fn adapter(strict: bool) -> Adapter {
+            let (committee, _v) = devnet_committee(7);
+            NodeAdapter::new(
+                CommitteeState::new(committee, BOND_AMOUNT),
+                KeccakPow,
+                MockVerifier { strict },
+                sim(),
+            )
+        }
+
+        /// A node that can mine transactions: its genesis root is finalized, so a tx
+        /// anchored there is admissible. This is what a chain looks like from the first
+        /// block that carries a transaction — T1 by construction.
+        fn transacting_server(strict: bool) -> (Adapter, Hash32) {
+            let mut s = adapter(strict);
+            let g = s.chain().genesis_hash();
+            s.state_mut().finalize(g).expect("finalize genesis");
+            let anchor = s.state().commitment_root();
+            (s, anchor)
+        }
+
+        fn tx_with(anchor: Hash32, nf: u8, proof: &[u8]) -> TxEntry {
+            TxEntry {
+                proof: proof.to_vec(),
+                public: TxPublic {
+                    anchor,
+                    nullifiers: vec![[nf; 32]],
+                    commitments: vec![[nf.wrapping_add(50); 32]],
+                    bucket: ArityBucket::TwoByTwo,
+                    fee: posted_fee(ArityBucket::TwoByTwo),
+                },
+            }
+        }
+
+        /// Two linked in-process nodes: `[0]` serves, `[1]` joins. Returns them past
+        /// the handshake, so `ready_peers` is non-empty and an announce actually moves.
+        fn pair(server: Adapter, joiner: Adapter) -> (Vec<Net>, Arc<InProcHub>) {
+            let hub = InProcHub::new();
+            let mut nodes = vec![
+                P2pNode::new(InProcTransport::new(PeerId(1), Arc::clone(&hub)), server, [1; 32]),
+                P2pNode::new(InProcTransport::new(PeerId(2), Arc::clone(&hub)), joiner, [2; 32]),
+            ];
+            hub.link(PeerId(1), PeerId(2));
+            hub.link(PeerId(2), PeerId(1));
+            nodes[0].add_peer(PeerId(2), None);
+            nodes[1].add_peer(PeerId(1), None);
+            drive(&mut nodes, 0);
+            (nodes, hub)
+        }
+
+        /// Drive both nodes to quiescence from `base_ms` (the local twin of `run_at`,
+        /// which is typed to the `StubNode` mesh).
+        fn drive(nodes: &mut [Net], base_ms: u64) {
+            for round in 0..1000u64 {
+                let mut moved = 0;
+                for n in nodes.iter_mut() {
+                    moved += n.tick(base_ms + round * 10);
+                }
+                if moved == 0 {
+                    break;
+                }
+            }
+        }
+
+        /// Mine one block on `nodes[0]` carrying a single transaction and announce it.
+        /// Returns the announced `(header, body)`.
+        fn serve_one_transacting_block(
+            nodes: &mut [Net],
+            anchor: Hash32,
+            nf: u8,
+            round: u64,
+        ) -> (BlockHeader, BlockBody) {
+            assert_eq!(
+                nodes[0].node_mut().ingest_tx(tx_with(anchor, nf, b"ok")),
+                IngestOutcome::Accepted,
+                "the server admits the tx it is about to mine"
+            );
+            let (header, body) = nodes[0].node_mut().mine_block().expect("mine");
+            assert_eq!(body.txs.len(), 1, "the served block carries a transaction");
+            nodes[0].announce_block(
+                header,
+                body.txs.clone(),
+                body.coinbase,
+                body.coinbase_rkm,
+                round,
+            );
+            drive(nodes, (round + 1) * 10_000);
+            (header, body)
+        }
+
+        /// 🔴 **ACCEPTANCE 1 (#134): a joiner replaying history it cannot anchor does
+        /// not penalise the serving peer — and the peer's score is still exactly zero
+        /// after more blocks than it used to take to ban it.**
+        ///
+        /// Six blocks, each carrying one transaction, served over the real
+        /// `BlockAnnounce` path. Under the pre-#134 rule each one was
+        /// `Rejected("bad body")` ⇒ `is_peer_fault()` ⇒ `PENALTY_INVALID_OBJECT` = 20;
+        /// with `BAN_THRESHOLD` = −100 the **fifth** block banned an honest peer, and
+        /// at `MAX_OUTBOUND` = 8 the fortieth would have taken the joiner's entire
+        /// outbound set — every replacement earning the same ban for the same correct
+        /// behaviour.
+        ///
+        /// The assertion is on the score itself, not on the outcome enum, because the
+        /// score is the thing that bans.
+        #[test]
+        fn a_joiner_does_not_ban_the_peer_serving_it_correct_history() {
+            let (server, anchor) = transacting_server(true);
+
+            // The joiner has finalized nothing — the state of every node with an empty
+            // data dir, which is every node that has ever joined a running net.
+            let joiner = adapter(true);
+            assert_eq!(joiner.state().finalized_height(), None);
+
+            let (mut nodes, _hub) = pair(server, joiner);
+
+            const SERVED: u64 = 6;
+            for i in 0..SERVED {
+                serve_one_transacting_block(&mut nodes, anchor, i as u8 + 1, i);
+            }
+
+            // The whole point, in one number.
+            let peer = nodes[1].peers().get(PeerId(1)).expect("the serving peer");
+            assert_eq!(
+                peer.score, 0,
+                "{SERVED} correctly-served blocks must cost the honest peer nothing"
+            );
+            assert!(!nodes[1].peers().is_banned(PeerId(1)), "and it is not banned");
+            assert!(
+                SERVED as i32 * 20 > -BAN_THRESHOLD,
+                "the run is long enough to have banned the peer under the old rule"
+            );
+
+            // ...and the joiner is honest about why: it learned the headers, applied no
+            // body, and counted every refusal it could not stand behind.
+            assert_eq!(nodes[1].node().chain().tip_height(), SERVED, "header-first sync ran");
+            assert_eq!(nodes[1].node().state().tip_height(), 0, "no body was applied");
+            assert_eq!(
+                nodes[1].node().ingest_counters().unjudged_anchor,
+                SERVED,
+                "`uanchor=` is what an operator greps for this state"
+            );
+        }
+
+        /// 🔴 **ACCEPTANCE 2 (#134) at the same seam: a genuinely invalid body still
+        /// costs the sender.** The distinction is not a blanket amnesty on the block
+        /// path either.
+        ///
+        /// 🔴 **ACCEPTANCE 2 (#134) at the same seam: a genuinely invalid body still
+        /// costs the sender.** The distinction is not a blanket amnesty on the block
+        /// path either.
+        ///
+        /// The sender runs a **lenient verifier** — a broken or hostile node that waves
+        /// its own proofs through — and mines and announces a block whose transaction
+        /// carries a proof the receiver refuses. Same genesis, same real PoW, same
+        /// announce path as the test above; only the body differs.
+        ///
+        /// The receiver is a **synced** node rather than the joiner, and the difference
+        /// is the whole point of the boundary: it stands at the block's own parent with
+        /// a current finalized head, so its verdict on this body is the network's and it
+        /// charges for what it finds. `ProofInvalid` is intrinsic, so it would charge
+        /// from anywhere — but on the joiner it would never *see* it. `validate_body`
+        /// checks each tx's anchor before its proof, so on a node that cannot answer the
+        /// anchor question the per-tx checks after it are never reached. That is a
+        /// consequence worth naming, and it is exactly why an unjudged body is dropped
+        /// rather than buffered: nothing in it has been verified.
+        ///
+        /// The complement — a genuinely non-final **anchor**, charged from the position
+        /// that owns that verdict — is
+        /// `adapter::tests::a_genuinely_invalid_body_still_costs_the_sender` case (2).
+        #[test]
+        fn a_body_with_an_unverifiable_proof_still_costs_the_sender() {
+            let (server, anchor) = transacting_server(false);
+            // The receiver is synced: same finalized genesis, standing at the same tip.
+            let (receiver, _) = transacting_server(true);
+            assert_eq!(receiver.state().finalized_height(), Some(0), "its finality is current");
+            let (mut nodes, _hub) = pair(server, receiver);
+
+            // The server admits and mines a tx its own (lenient) verifier accepts.
+            assert_eq!(
+                nodes[0].node_mut().ingest_tx(tx_with(anchor, 1, b"not-a-proof")),
+                IngestOutcome::Accepted,
+                "the lenient server takes its own bad proof"
+            );
+            let (header, body) = nodes[0].node_mut().mine_block().expect("mine");
+            assert_eq!(body.txs.len(), 1);
+            nodes[0].announce_block(header, body.txs.clone(), body.coinbase, body.coinbase_rkm, 1);
+            drive(&mut nodes, 50_000);
+
+            assert_eq!(
+                nodes[1].peers().get(PeerId(1)).expect("peer").score,
+                -crate::gossip::PENALTY_INVALID_OBJECT,
+                "an unverifiable proof is the sender's fault and is charged as one"
+            );
+            assert_eq!(
+                nodes[1].node().ingest_counters().unjudged_anchor,
+                0,
+                "and nothing about it was excused as unjudgeable"
+            );
+            assert_eq!(nodes[1].node().chain().tip_height(), 0, "nor was the header taken");
+        }
     }
 }

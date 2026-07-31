@@ -31,6 +31,21 @@ use qlab_devnet::params_devnet::{
 
 use crate::codec::{checkpoint_id, tx_id};
 
+/// The memory a body's transactions actually cost: the proof bytes (which
+/// dominate — one 2×2 proof is ~145 kB against a ~100-byte public surface) plus
+/// each declared surface. **One meter, shared** by the adapter's pending-body
+/// window (issue #130 (a)) and [`crate::P2pNode`]'s serving cache (issue #135),
+/// so the two byte budgets are measured on the same scale and stay comparable.
+pub(crate) fn txs_weight(txs: &[TxEntry]) -> usize {
+    txs.iter()
+        .map(|tx| {
+            tx.proof.len()
+                + 32 * (1 + tx.public.nullifiers.len() + tx.public.commitments.len())
+                + 16
+        })
+        .sum()
+}
+
 /// What happened when an object was handed to the node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IngestOutcome {
@@ -42,17 +57,34 @@ pub enum IngestOutcome {
     Orphan,
     /// Rejected as invalid; the peer that sent it may be penalized.
     Rejected(&'static str),
-    /// Well-formed as far as this node can tell, but **this release will not act
-    /// on it** (issue #74: the object is above our halt height). Not relayed, not
-    /// synced toward, and — the load-bearing part — **the sender is not penalized**.
+    /// Well-formed as far as this node can tell, but **this node will not act on
+    /// it**. Not relayed, not synced toward, and — the load-bearing part — **the
+    /// sender is not penalized**.
     ///
-    /// Distinct from [`Self::Rejected`] on purpose. A peer still mining above a
-    /// halt height is on a different release, not misbehaving; §4 says explicitly
-    /// that old-binary miners *can* keep producing blocks past the halt height.
-    /// Scoring them as invalid-object senders would ban honest peers during the
-    /// upgrade window — partitioning the net at exactly the moment an operator
-    /// needs it whole. This is the #70 S5 rule ("a well-formed thing we cannot use
-    /// is not a misbehaving peer") applied to the halt.
+    /// Distinct from [`Self::Rejected`] on purpose, and the distinction has now been
+    /// needed three times. **`Rejected` means "this object is invalid". `Ignored`
+    /// means "I will not act on this, and the sender is not why."** Every use falls
+    /// into one of two families, and naming them is the point — the third extension
+    /// should be a new member of a family, not a fourth rediscovery of the rule:
+    ///
+    /// - **This RELEASE will not act.** The object is above our halt height (issue
+    ///   #74). A peer still mining there is on a different release, not misbehaving;
+    ///   `committee-and-governance` §4 says explicitly that old-binary miners *can*
+    ///   keep producing blocks past the halt. Scoring them as invalid-object senders
+    ///   would ban honest peers during the upgrade window — partitioning the net at
+    ///   exactly the moment an operator needs it whole.
+    /// - **This NODE cannot judge.** The object may be perfectly valid and the sender
+    ///   may be perfectly honest; this node's own view cannot answer the question.
+    ///   Two members today, both in
+    ///   [`crate::adapter`]: a transaction arriving while the state machine lags its
+    ///   own chain (`STATE_LAG_REASON`, issue #130 (a)), and a block body whose anchor
+    ///   this node cannot evaluate from where it stands (`UNJUDGED_ANCHOR_REASON`,
+    ///   issue #134). The second is the sharper case: a joiner is *guaranteed* unable
+    ///   to judge historical anchors, where a halt-height mismatch is only occasional.
+    ///
+    /// The membership test for the second family is the one thing that must not drift:
+    /// the inability has to be a fact this node computes **about itself**, from its own
+    /// numbers. "The sender told me I am syncing" is not a member and never can be.
     Ignored(&'static str),
 }
 
@@ -64,12 +96,16 @@ impl IngestOutcome {
 
     /// Whether the **sender** is at fault and should be penalized.
     ///
-    /// Only [`Self::Rejected`]. In particular [`Self::Ignored`] is NOT a fault: a
-    /// peer producing blocks above our halt height is on a different release, which
-    /// `committee-and-governance.md` §4 says explicitly it may be. Penalizing it
-    /// would ban honest peers during the upgrade window — partitioning the net at
-    /// exactly the moment an operator needs it whole (issue #74; the #70 S5 rule
-    /// applied to the halt).
+    /// Only [`Self::Rejected`]. In particular [`Self::Ignored`] is NOT a fault, in
+    /// either of its two families (see the variant's docs): a peer producing blocks
+    /// above our halt height is on a different release, which
+    /// `committee-and-governance.md` §4 says explicitly it may be (issue #74), and a
+    /// peer serving us history we cannot yet judge is doing exactly what a joiner
+    /// needs it to do (issue #134). Penalizing either bans honest peers at precisely
+    /// the moment the net must stay whole — during an upgrade window, or while a new
+    /// node is joining. This is the #70 S5 rule ("a well-formed thing we cannot use is
+    /// not a misbehaving peer"), and it is asked in exactly one place so the tx,
+    /// header and block paths cannot drift apart on it.
     pub fn is_peer_fault(&self) -> bool {
         matches!(self, IngestOutcome::Rejected(_))
     }
@@ -109,6 +145,23 @@ pub trait ChainView {
     fn has_header(&self, hash: &Hash32) -> bool;
     /// The finalized height, if any checkpoint has finalized.
     fn finalized_height(&self) -> Option<u64>;
+    /// The **applied** body for `hash` from the node's authoritative block store,
+    /// if it holds one (issue #135). This is the durable serving path behind
+    /// [`crate::P2pNode`]'s bounded body cache: the store is written by
+    /// `apply_block`, so an answer here is a body this node folded into state —
+    /// evicting such a body from the cache never makes it unservable.
+    ///
+    /// Default `None`: a header-only node-state ([`StubNode`]) has no body store,
+    /// and for it the bounded cache is the only serving surface — the same
+    /// capability statement its `ingest_block` default already makes.
+    fn stored_body(&self, hash: &Hash32) -> Option<BlockBody> {
+        let _ = hash;
+        None
+    }
+    /// Whether [`Self::stored_body`] would answer, without cloning the body.
+    fn has_stored_body(&self, hash: &Hash32) -> bool {
+        self.stored_body(hash).is_some()
+    }
 }
 
 /// Ingest headers received from peers.
