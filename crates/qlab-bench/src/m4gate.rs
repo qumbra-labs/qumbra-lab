@@ -7,17 +7,20 @@
 //! (`m4gaterec::walk`). The ROUTING columns are bound — the prover cannot
 //! choose which rows route, draw or fold.
 //!
-//! 🔴 **NOT every gate column is bound, and this header said so until
-//! 2026-07-31.** Issue #78's class-(2) audit found four columns that
-//! constraints *read* but nothing *determines*, three of them since confirmed
-//! by execution (`i78_*` tests below), and only one of them fixed here:
+//! 🔴 **NOT every gate column is bound, and this header claimed otherwise
+//! until 2026-07-31.** Issue #78's class-(2) audit found four columns that
+//! constraints *read* but nothing *determines*; three were confirmed by
+//! execution (`i78_*`/`gate_neg_asm_*` tests below), and two are now fixed.
+//! **A determined column is not a bound value** — read finding 1's and
+//! finding 4's rows together before concluding anything about the value
+//! pipeline:
 //!
 //! | column | state |
 //! |---|---|
 //! | `FSFULL` (2924) | **FIXED** (issue #78 finding 3): bool + per-perm hold + pinned to `FSGATE@row15`, `:3114`. Was a free witness; `cfull ≡ 0` was reachable and the refill guard vacuous. |
-//! | `ASM0`/`ASM1` (3318/3319) | **OPEN** (finding 1): limbs 0–1 of *every* value the pipeline consumes — zeta openings, final-poly coefficients, fold leaves — with no pin, no carry, not even a boolean. `i78_finding1_asm_free_witness` holds the confirmation. |
+//! | `ASM0`/`ASM1` (3318/3319) | **DETERMINED** (issue #78 finding 1): capture-row pin + pending-row hold, 4 constraints, `:3389`. Was limbs 0–1 of *every* consumed value with no pin, no carry, not even a boolean. `gate_neg_asm_free_witness` (was SAT, now UNSAT) and `gate_neg_asm_gap8_hole` hold the evidence. **This did not close the value pipeline** — see the `W0C`/`W1C` row: the consumed value is now identically four transcript word cells, and on the dup chain none of the four is sponge-bound. |
 //! | `SCR` (3443…) | **OPEN** (finding 2): no hold outside the `mr` gate, so a fold intermediate is not carried from its write to its next read. `i78_finding2_scr_no_hold`. |
-//! | `W0C`/`W1C` (2657/2658) | **OPEN** (finding 4): pinned to the sponge on F0 perms only — see the scope note at `:2646`. With finding 1 stacked on it, **all four** limbs of every consumed value are free, so the recorded gate-widening does not close the pipeline. |
+//! | `W0C`/`W1C` (2657/2658) | **OPEN** (finding 4), and **it is now the whole gap**: pinned to the sponge on F0 perms only — see the scope note at `:2646`. Since finding 1's fix routes limbs 0–1 through the capture row's `W0C`/`W1C`, **all four** limbs of every consumed dup value are these columns, and on the dup chain / final-poly flush / query leaf absorbs nothing pins them. So a prover still chooses every consumed value; what changed is that closing finding 4 would now close all four limbs instead of two. |
 //!
 //! A reader who greps this header for reassurance should stop at the table.
 //!
@@ -3384,7 +3387,60 @@ where
             {
                 let mut t = builder.when_transition();
                 t.assert_eq(nv(self.layout.pos), cv(self.layout.pos) + casm.clone() * (cv(self.layout.pos + 1) - cv(self.layout.pos)));
-                t.assert_eq(nv(self.layout.pos + 1), cv(self.layout.pos + 1) + casm * (cv(self.layout.pos) - cv(self.layout.pos + 1)));
+                t.assert_eq(nv(self.layout.pos + 1), cv(self.layout.pos + 1) + casm.clone() * (cv(self.layout.pos) - cv(self.layout.pos + 1)));
+            }
+            // -----------------------------------------------------------------
+            // #78 finding 1 (2026-07-31): ASM0/ASM1 pinned. Until this block
+            // existed, the two columns carrying limbs 0-1 of EVERY value the
+            // pipeline consumes — dup zeta openings, final-poly coefficients,
+            // fold leaves — had no pin, no carry and not even a boolean:
+            // adding 1 to both on all 63 178 non-consuming rows was SAT
+            // (`gate_neg_asm_free_witness`, now the negative it earned).
+            //
+            // FOUR constraints, not the two the audit specified, and the reason
+            // is measured rather than argued (`i78_asm_pairing_structure`): of
+            // the 2358 capture->consume pairs in the honest narrow trace 2220
+            // are ADJACENT and 138 are 8 ROWS APART — `czd` spans rows 4..=16
+            // of dup block 0 and 0..=16 of the others, both odd-length, so a
+            // capture landing on a block's row 16 consumes at row 0 of the next
+            // block. A pin alone closes the 2220 and leaves rows r+2..=r+8 free
+            // on the other 138, which is worse than closing none: the column
+            // then READS as pinned to its next reader, exactly `:2666`'s trap.
+            // `i78_asm_gap8_hole` is the tamper that separates the two forms —
+            // it is SAT under the pin alone and UNSAT with the hold.
+            //
+            //   pin  : casm·POS0     -> nv(asm) == cv(wc)     (deg 3)
+            //   hold : POS1·(1-casm) -> nv(asm) == cv(asm)    (deg 3)
+            //
+            // POS is the pending flag and its toggle above is casm-gated, so
+            // POS1 holds across the gap even though the value did not:
+            //   capture row (casm·POS0): asm := this row's transcript word
+            //   pending rows (POS1, no casm): asm holds
+            //   consume row (casm·POS1): asm free again, the value was read.
+            // Both are `when_transition`; a pending capture on the last row
+            // would escape, and the structure test asserts there is none.
+            //
+            // 🔴 WHAT THIS DOES NOT DO. The consumed value is now IDENTICALLY
+            // the four transcript word cells of its two rows —
+            // (w0c,w1c)@capture as limbs 0-1, (w0c,w1c)@consume as limbs 2-3 —
+            // and on the dup chain NONE of those four is pinned to the sponge
+            // (finding 4, `:2666`; D3 binds `w0c`/`w1c` on F0 perms only). So
+            // this block removes a degree of freedom from the WITNESS and
+            // changes nothing about which VALUES a prover may claim. What it
+            // buys is that finding 4's fix becomes sufficient for all four
+            // limbs; before it, pinning the words would have closed only two.
+            // -----------------------------------------------------------------
+            {
+                let mut t = builder.when_transition();
+                for (asm, wc) in [
+                    (self.layout.asm0, self.layout.w0c),
+                    (self.layout.asm1, self.layout.w1c),
+                ] {
+                    t.assert_zero(casm.clone() * cv(self.layout.pos) * (nv(asm) - cv(wc)));
+                    t.assert_zero(
+                        cv(self.layout.pos + 1) * (one() - casm.clone()) * (nv(asm) - cv(asm)),
+                    );
+                }
             }
             // Completion flags: value fully captured on the pos==1 (word-1) row.
             builder.assert_eq(cv(self.layout.consz), cv(self.layout.czd) * cv(self.layout.pos + 1));
@@ -8473,22 +8529,39 @@ mod tests {
         );
     }
 
-    /// 🔴 #78 **finding 1 — OPEN GAP, pinned here as SAT.** `ASM0`/`ASM1`
-    /// carry limbs 0–1 of every value the pipeline consumes (zeta openings,
-    /// final-poly coefficients, fold leaves) and NO constraint determines
-    /// them: adding 1 to both on all ~63 k rows that are not a consuming row
-    /// — including every row where the honest fill "stores" the captured word
-    /// — is SATISFIABLE. They are not registers; they are two cells read at
-    /// the consuming row and free everywhere else.
+    /// #78 finding 1, **INVERTED** — the settlement experiment turned into the
+    /// negative it earned, exactly as its previous incarnation demanded ("when
+    /// finding 1 is fixed this test MUST FLIP to UNSAT; do not repair it by
+    /// narrowing the tamper"). The tamper is byte-for-byte the P3 of PR #144
+    /// and only the assertions moved.
+    ///
+    /// `ASM0`/`ASM1` carry limbs 0–1 of every value the pipeline consumes
+    /// (dup zeta openings, final-poly coefficients, fold leaves). Adding 1 to
+    /// both on all 63 178 rows that are not a consuming row — including every
+    /// row where the honest fill "stores" the captured word — was
+    /// **SATISFIABLE** on 2026-07-31 at rev `723e348`: no pin, no carry, not
+    /// even a boolean. They were not registers, they were two cells read at
+    /// the consuming row and free everywhere else. With the `:3389` block it
+    /// is UNSAT.
+    ///
+    /// **This test alone does not justify four constraints over two** — the
+    /// pin-only form also flips it, because a gap-8 capture's `nv(asm)` lands
+    /// on a pending row the tamper touches. `gate_neg_asm_gap8_hole` is the
+    /// experiment that separates the two forms; keep them together.
     ///
     /// CONTROL: the same tamper on `PBUF`, which has an unconditional carry,
-    /// is UNSAT. Without it a SAT here would be indistinguishable from a
-    /// broken probe.
+    /// was UNSAT before the fix too. It stays here because a probe whose
+    /// controls were dropped once it turned green is a probe nobody can
+    /// re-derive.
     ///
-    /// **When finding 1 is fixed this test MUST FLIP to UNSAT.** Do not
-    /// "repair" it by narrowing the tamper — invert the assertion.
+    /// The third check is the transcript-side half (also #78 finding 4): move
+    /// the word a pending capture row carries, re-canonicalise, repropagate.
+    /// Before the fix the consumed limb did not move with it (**SAT**); now
+    /// the pin ties them and it is UNSAT. Note what that does and does not
+    /// mean — the consumed limb now follows the capture row's `W0C`, and
+    /// `W0C` on the dup chain is still pinned to the sponge by nothing.
     #[test]
-    fn i78_finding1_asm_free_witness() {
+    fn gate_neg_asm_free_witness() {
         let _g = heavy_lock();
         let (base, opvs, layout, shape) = i78_fixture();
         let w = layout.gate_width;
@@ -8511,8 +8584,8 @@ mod tests {
         assert!(n > 60_000, "expected ~63 k non-consuming rows, got {n}");
         fill_derived(&mut t.values, &layout, &shape);
         assert!(
-            !is_unsat(t, opvs.clone()),
-            "#78 finding 1 is FIXED — ASM0/ASM1 are now determined. Invert this test."
+            is_unsat(t, opvs.clone()),
+            "#78 finding 1 has REGRESSED — ASM0/ASM1 are free again on the non-consuming rows"
         );
 
         // CONTROL — PBUF is carried, so the same shape of tamper must fail.
@@ -8544,8 +8617,105 @@ mod tests {
         fill_canon(&mut d.values, pr, 0, newv, &layout);
         fill_derived(&mut d.values, &layout, &shape);
         assert!(
-            !is_unsat(d, opvs),
-            "#78 finding 1/4: W0C at a capture row is now tied to the consumed limb. Invert this test."
+            is_unsat(d, opvs),
+            "#78 finding 1: the pin must tie a pending capture row's W0C to the consumed limb 0"
+        );
+    }
+
+    /// 🔴 #78 finding 1 — **the experiment that decides four constraints over
+    /// two, and the only one that does.** `gate_neg_asm_free_witness` flips
+    /// under the pin alone, so on its own it would have ratified a fix with a
+    /// 6 % hole in it.
+    ///
+    /// The audit specified two constraints (`casm·POS0 -> nv(asm) == cv(wc)`
+    /// per limb) on the premise that a capture and its consume are adjacent by
+    /// construction. PR #144 measured that premise and it is **false**: of the
+    /// 2358 pairs in the honest narrow trace, 2220 are adjacent and 138 are 8
+    /// rows apart (`i78_asm_pairing_structure` re-asserts the histogram). On
+    /// those 138 the pin fixes row r+1 and says nothing about rows r+2..=r+8,
+    /// so the value the consume row reads is free again — 94 % closed, and the
+    /// column now READING as pinned to its next reader, which is strictly
+    /// worse than 0 % closed.
+    ///
+    /// This tamper perturbs `ASM0` **only on rows r+2..=r+7 of gap-8 pairs** —
+    /// precisely the window the pin leaves open, and nowhere else. Under the
+    /// pin-only form it is **SAT** (measured on a local pin-only patch,
+    /// 2026-07-31, base `723e348`: 2.30 s, SAT); with the hold it is UNSAT
+    /// because the hold at row r+1 sees `nv(asm) != cv(asm)`. That single
+    /// SAT/UNSAT pair is the entire justification for the extra two
+    /// constraints, so if this test is ever deleted the fourth constraint has
+    /// no recorded reason to exist.
+    ///
+    /// Two CONTROLS, both on the same trace, because an unpaired UNSAT is
+    /// indistinguishable from a probe that broke something unrelated:
+    /// * the honest baseline is SAT on this fixture, so the UNSAT is the
+    ///   tamper's and not the fixture's;
+    /// * `POS` — which *does* carry across this exact gap, and whose correct
+    ///   carry is why the gap was invisible — is UNSAT when swapped on the
+    ///   same rows in a way that preserves its boolean one-hot. That proves
+    ///   the rows are live rather than pad.
+    #[test]
+    fn gate_neg_asm_gap8_hole() {
+        let _g = heavy_lock();
+        let (base, opvs, layout, shape) = i78_fixture();
+        let w = layout.gate_width;
+        let rows = base.values.len() / w;
+        let one = Val::ONE;
+        let g = |r: usize, c: usize| base.values[r * w + c];
+        let casm = |r: usize| g(r, layout.czd) + g(r, layout.cz7) + g(r, layout.cf);
+
+        // Enumerate the gap-8 sites and collect the rows the pin alone frees.
+        let mut free_rows: Vec<usize> = Vec::new();
+        let mut sites = 0usize;
+        for r in 0..rows {
+            if casm(r) != one || g(r, layout.pos) != one {
+                continue;
+            }
+            let mut n = r + 1;
+            while n < rows && casm(n) != one {
+                n += 1;
+            }
+            if n - r != 8 {
+                continue;
+            }
+            sites += 1;
+            // r+1 is pinned by the 2-constraint form; r+8 is the consume.
+            free_rows.extend(r + 2..=r + 7);
+        }
+        assert_eq!(sites, 138, "gap-8 capture->consume sites (narrow)");
+        assert_eq!(free_rows.len(), 138 * 6, "rows the pin-only form leaves free");
+
+        // CONTROL A — the honest baseline on this very trace.
+        assert!(
+            !is_unsat(base.clone(), opvs.clone()),
+            "CONTROL: the honest fixture must be SAT, or the UNSATs below prove nothing"
+        );
+
+        let mut t = base.clone();
+        for &r in &free_rows {
+            t.values[r * w + layout.asm0] += one;
+        }
+        fill_derived(&mut t.values, &layout, &shape);
+        assert!(
+            is_unsat(t, opvs.clone()),
+            "#78 finding 1: the gap-8 window r+2..=r+7 is UNHELD — this is the 6 % hole the \
+             2-constraint form would have shipped, and it is SAT under that form"
+        );
+
+        // CONTROL B — POS carries across the same gap. Swap its one-hot on the
+        // same rows (honest: POS0=0, POS1=1) so booleanity and sum==1 survive
+        // and only the casm-gated carry can fire.
+        let mut c = base;
+        for &r in &free_rows {
+            let (p0, p1) = (c.values[r * w + layout.pos], c.values[r * w + layout.pos + 1]);
+            assert_eq!((p0, p1), (Val::ZERO, one), "pending row {r} must be POS1");
+            c.values[r * w + layout.pos] = p1;
+            c.values[r * w + layout.pos + 1] = p0;
+        }
+        fill_derived(&mut c.values, &layout, &shape);
+        assert!(
+            is_unsat(c, opvs),
+            "CONTROL: POS is carried across the gap-8 window; swapping it there must be UNSAT"
         );
     }
 
@@ -8600,8 +8770,12 @@ mod tests {
         assert!(is_unsat(c, opvs), "CONTROL: RUNEV is carried; this tamper must be UNSAT");
     }
 
-    /// 🔴 #78 finding 1's FIX PREMISE, measured — the reason no fix for it is
-    /// in this PR. The audit specified two constraints, `casm·pos0 →
+    /// 🔴 #78 finding 1's FIX PREMISE, measured — first the reason no fix
+    /// shipped in PR #144, now the reason the fix at `:3389` has four
+    /// constraints instead of two. **The body below is unmodified from PR
+    /// #144**; only this prose moved. If the honest premises it asserts ever
+    /// move, the fix is wrong, not this test. The audit specified two
+    /// constraints, `casm·pos0 →
     /// nv(asm0) == cv(w0c)` per limb, resting on "the two rows are adjacent by
     /// construction". **They are not.** Of the 2358 capture→consume pairs in
     /// the honest narrow trace, 2220 are adjacent and 138 are 8 rows apart:
