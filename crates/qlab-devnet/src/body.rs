@@ -508,8 +508,9 @@ mod tests {
         );
     }
 
-    /// The empty body's commitment, pinned for the same reason: it is the value
-    /// the genesis exemption is stated against, and it is the cheapest body an
+    /// The empty body's commitment, pinned for the same reason: since issue #115
+    /// it **is the genesis header's `tx_body_commitment`**, so this constant is
+    /// now an input to the network identity; and it is the cheapest body an
     /// attacker can substitute (`empty_body_under_an_honest_header_is_rejected`).
     #[test]
     fn golden_empty_body_commitment_bytes() {
@@ -521,20 +522,55 @@ mod tests {
         );
     }
 
-    /// The devnet genesis header pins `tx_body_commitment = ZERO_HASH` while an
-    /// empty body commits to `keccak256(coinbase_le)` — so **genesis does not
-    /// satisfy the invariant**. Locked here so the exemption stays a deliberate,
-    /// visible fact rather than something a later reader "fixes" by editing the
-    /// frozen genesis header (issue #77 finding F1).
+    /// **Inverted by issue #115 at the 2026-07-31 genesis mint.** This test used
+    /// to read `genesis_header_does_not_bind_its_empty_body` and locked the
+    /// opposite fact: the genesis header pinned `tx_body_commitment = ZERO_HASH`
+    /// while its empty body commits to `keccak256(coinbase_le ‖ rkm_le)`, so
+    /// genesis was the one block that did not satisfy the binding. Its own note
+    /// said "if this ever becomes equal the genesis exemption can be dropped" —
+    /// it has, and it was.
+    ///
+    /// Locked in this direction now so the binding cannot be un-done by a later
+    /// reader restoring `ZERO_HASH`, which would silently move the network
+    /// identity back.
     #[test]
-    fn genesis_header_does_not_bind_its_empty_body() {
+    fn genesis_header_binds_its_empty_body() {
         let g = BlockHeader::genesis(1_000, 0);
-        assert_eq!(g.tx_body_commitment, crate::header::ZERO_HASH);
-        assert_ne!(
+        assert_eq!(
             g.tx_body_commitment,
             BlockBody::default().commitment(),
-            "if this ever becomes equal the genesis exemption can be dropped"
+            "genesis binds its own body (issue #115)"
         );
+        assert_ne!(
+            g.tx_body_commitment,
+            crate::header::ZERO_HASH,
+            "ZERO_HASH is the pre-#115 value — restoring it re-opens issue #77 F1"
+        );
+        // …and the binding check agrees, with no height special case.
+        assert!(check_body_binding(&g, &BlockBody::default()).is_ok());
+    }
+
+    /// The negative half at this crate's seam: a genesis header paired with a
+    /// body it does not commit to is rejected by `check_body_binding` exactly
+    /// like any other height (issue #115). `qlab_node` locks the same property
+    /// at the node's state-mutation funnel.
+    #[test]
+    fn a_genesis_header_with_a_foreign_body_is_rejected() {
+        let g = BlockHeader::genesis(1_000, 0);
+        let foreign = BlockBody { txs: Vec::new(), coinbase: 1, coinbase_rkm: [1, 2, 3, 4] };
+        assert!(matches!(
+            check_body_binding(&g, &foreign),
+            Err(BodyError::CommitmentMismatch { .. })
+        ));
+
+        // And the pre-#115 genesis header over the honest empty body: the exact
+        // pair the height-0 exemption used to wave through.
+        let mut pre_115 = g;
+        pre_115.tx_body_commitment = crate::header::ZERO_HASH;
+        assert!(matches!(
+            check_body_binding(&pre_115, &BlockBody::default()),
+            Err(BodyError::CommitmentMismatch { .. })
+        ));
     }
 }
 

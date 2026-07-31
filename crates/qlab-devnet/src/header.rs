@@ -13,6 +13,7 @@
 //! and *activating* them later is a real, deliberate format change rather than a
 //! silent addition.
 
+use crate::body::BlockBody;
 use crate::hash::keccak256;
 
 /// A 256-bit hash (Keccak-256 digest), the header/block identity type.
@@ -96,29 +97,37 @@ impl BlockHeader {
     }
 
     /// Construct the genesis header at the given difficulty. `prev = ZERO_HASH`,
-    /// `height = 0`, `nonce = 0` (genesis carries no PoW), empty body commitment.
+    /// `height = 0`, `nonce = 0` (genesis carries no PoW), and
+    /// `tx_body_commitment` = the commitment of the **genesis body**, which is
+    /// [`BlockBody::default()`] — no premine, fair launch (protocol-spec §9).
     ///
-    /// # 🔴 T1: the next genesis mint must commit to its body (issue #77 F1)
+    /// # Genesis binds its own body (issue #115, closing issue #77 F1)
     ///
-    /// `tx_body_commitment` is pinned to [`ZERO_HASH`] here, but an empty body
-    /// commits to `keccak256(coinbase_le)` — so **the genesis block is the one
-    /// block that does not satisfy the header/body binding**, and it is the one
-    /// explicit exemption in `qlab_node`'s state-mutation guard.
+    /// Until the 2026-07-31 mint this field was pinned to [`ZERO_HASH`] while the
+    /// genesis body committed to `keccak256(coinbase_le ‖ rkm_le)` — so genesis
+    /// was **the one block that did not satisfy the header/body binding** that
+    /// [`crate::body::check_body_binding`] (issue #79) holds every other block to,
+    /// and `qlab_node::node::check_stored_binding` carried an explicit height-0
+    /// exemption to let it through. That exemption existed because genesis
+    /// *predated* the binding, not because genesis should be exempt: while it was
+    /// there, "this genesis is not the body it claims" was not an expressible
+    /// property. It is now deleted, and genesis is checked like any other block.
     ///
-    /// *Why the exemption is safe:* not because "it is only genesis", but because
-    /// genesis is covered by a **stronger** check — every node pins
-    /// `expected_genesis_hash` in its config and refuses to start against any
-    /// other genesis (`deploy/README.md`, `qumbra-node check`). The binding
-    /// protects blocks that arrive from the network; genesis never does.
+    /// The pin to a *stronger* check still holds and is unchanged — every node
+    /// pins `expected_genesis_hash` and refuses to start against a different
+    /// genesis (`deploy/README.md`, `qumbra-node check`). The binding is a second,
+    /// independent gate over the same ground, and it is the one that survives a
+    /// caller assembling a genesis by hand or a corrupted disk replay.
     ///
-    /// *Why it was not fixed:* setting this to `BlockBody::default().commitment()`
-    /// changes the genesis hash, hence the network identity — the T0 net is pinned
-    /// to `4a75b3b8…c2c3`. That is a new-network decision, and Larry's alone.
+    /// 🔴 **This moved the genesis hash, hence the network identity.** It was
+    /// taken at a genesis mint precisely because the identity was moving anyway;
+    /// at any other time it would be a gratuitous network-identity change. See
+    /// `qumbra_node::genesis::GenesisFile` for the before/after values.
     ///
-    /// *The requirement:* **when T1's genesis is minted, set this to the real
-    /// commitment of the genesis body and delete the height-0 exemption in
-    /// `qlab_node::node::check_stored_binding`.** A new network is exactly the
-    /// moment the change is free.
+    /// *If you change what the genesis body is*, this constructor must change with
+    /// it — but it can no longer fail silently: a genesis header committing to a
+    /// body it was not paired with is rejected at the first binding check, which
+    /// is the whole point of deleting the exemption.
     pub fn genesis(difficulty: u64, timestamp: u64) -> Self {
         Self {
             prev: ZERO_HASH,
@@ -126,9 +135,9 @@ impl BlockHeader {
             timestamp,
             difficulty,
             nonce: 0,
-            // 🔴 T1: see the doc comment above — must become the real body
-            // commitment at the next genesis mint (issue #77 F1).
-            tx_body_commitment: ZERO_HASH,
+            // The genesis body is the empty body — bound here, not exempted
+            // (issue #115).
+            tx_body_commitment: BlockBody::default().commitment(),
             aggregate_proof: AggregateProofSlot,
             epoch_supply_attestation: EpochSupplyAttestation,
         }
@@ -197,6 +206,18 @@ mod tests {
     fn preimage_has_fixed_width() {
         // 32 (prev) + 8*4 (height,timestamp,difficulty,nonce) + 32 (body) + 2 (tags).
         assert_eq!(sample_genesis().preimage().len(), 32 + 32 + 32 + 2);
+    }
+
+    #[test]
+    fn genesis_binds_its_own_body() {
+        // issue #115: genesis is no longer the one block that fails the
+        // header/body binding. Its commitment IS the genesis body's commitment.
+        let g = sample_genesis();
+        assert_eq!(g.tx_body_commitment, BlockBody::default().commitment());
+        assert_ne!(
+            g.tx_body_commitment, ZERO_HASH,
+            "ZERO_HASH is the pre-#115 value the height-0 exemption existed for"
+        );
     }
 
     #[test]
