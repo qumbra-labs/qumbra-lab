@@ -125,6 +125,12 @@ pub fn finality_status(tip_height: u64, finalized_height: Option<u64>, max_lag: 
 
 /// Two conflicting signed votes from one validator for the same checkpoint slot —
 /// the self-contained proof of equivocation (committee-gov §3).
+///
+/// `Clone` (issue #133): a node that persists a punishment keeps the evidence that
+/// produced it, so the punishment is re-derivable and re-verifiable on restart
+/// rather than being an unverifiable status flag. `Vote` is `Clone` and
+/// `Checkpoint` is `Copy`, so this is a derive and nothing more.
+#[derive(Clone)]
 pub struct EquivocationEvidence {
     /// First checkpoint and the validator's vote on it.
     pub cp_a: Checkpoint,
@@ -171,6 +177,21 @@ pub fn verify_equivocation(
     Ok(signer)
 }
 
+/// The frozen §4 equivocation slash: **10 % of the member's remaining bond**
+/// (consensus-parameters §4; issue #62 item 5 convergence — this replaced the flat
+/// `EQUIVOCATION_SLASH_AMOUNT` placeholder once the bond became a genesis constant).
+/// Integer floor, so a ramped bond of 0 slashes 0 and still tombstones.
+///
+/// Named here rather than left inline (issue #133) because the rule now has **two**
+/// callers: the live evidence path and the restart path that re-derives a persisted
+/// punishment. Two copies of a frozen rule is how the two diverge, and a punishment
+/// whose slash differs across a restart is exactly the ledger inconsistency #133 is
+/// about. At [`crate::params_devnet::BOND_AMOUNT`] this is byte-identical to
+/// [`crate::params_devnet::EQUIVOCATION_SLASH_AMOUNT`] — test-locked below.
+pub fn equivocation_slash(bond: u64) -> u64 {
+    bond / 10
+}
+
 /// Verify equivocation evidence and, if valid, apply the automated penalty:
 /// permanent tombstone + bond slash of `slash_amount` (committee-gov §3). Returns
 /// the punished signer index.
@@ -215,6 +236,18 @@ mod tests {
         assert_eq!(state.slashed(signer), Some(EQUIVOCATION_SLASH_AMOUNT));
         assert_eq!(state.bond(signer), Some(BOND_AMOUNT - EQUIVOCATION_SLASH_AMOUNT));
         assert!(!state.is_active(signer, u64::MAX));
+    }
+
+    /// The named slash rule is the same arithmetic the retired flat placeholder
+    /// froze at the standard bond, and it is a floor (issue #133 — the rule now has
+    /// a second caller on the restart path, so its value is locked in one place).
+    #[test]
+    fn equivocation_slash_is_ten_percent_floor_of_bond() {
+        assert_eq!(equivocation_slash(BOND_AMOUNT), EQUIVOCATION_SLASH_AMOUNT);
+        assert_eq!(equivocation_slash(BOND_AMOUNT), BOND_AMOUNT / 10);
+        assert_eq!(equivocation_slash(0), 0, "a ramped bond of 0 slashes 0");
+        assert_eq!(equivocation_slash(9), 0, "integer floor, never rounds up");
+        assert_eq!(equivocation_slash(10), 1);
     }
 
     #[test]

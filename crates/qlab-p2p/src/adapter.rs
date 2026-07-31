@@ -26,12 +26,14 @@
 //! while the pool stays keyed by its own id.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 
 use qlab_devnet::body::{validate_body, BlockBody, BodyError, TxEntry};
 use qlab_devnet::chain::{ChainState, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, MemberStatus, Validator, Vote};
 use qlab_devnet::ebbflow::{
-    finality_status, verify_equivocation, EquivocationEvidence, FinalityStatus, SigningWindow,
+    equivocation_slash, finality_status, verify_equivocation, EquivocationEvidence, FinalityStatus,
+    SigningWindow,
 };
 use qlab_devnet::epoch::{EpochCommittee, EpochSchedule};
 use qlab_devnet::finality::{FinalityTracker, FinalizeError};
@@ -62,6 +64,7 @@ use crate::codec::{checkpoint_id, tx_id as wire_tx_id};
 use crate::n1::{
     BlockIngest, ChainView, CheckpointIngest, CommitteeControl, IngestOutcome, TxPool, VotesOutcome,
 };
+use crate::punish::{self, PunishmentRestore};
 
 /// The effective §6 median a soak-node assembles against: large enough that the
 /// penalty-free zone accepts every pending tx (no gigantism at prototype scale).
@@ -188,6 +191,21 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// Running weight of [`Self::pending_bodies`] in bytes, so the byte budget is a
     /// subtraction rather than a walk of the map on every insert.
     pending_bytes: usize,
+    /// The node's data dir, when disk-backed — the durability seam for the committee
+    /// punishment ledger (issue #133). `None` for an in-memory adapter, which keeps
+    /// every in-process sim, soak and test writing nothing.
+    ///
+    /// Held here rather than reached for through `MemNode` because the punishment
+    /// ledger is *this* layer's state: the committee lives here, and `qlab-node`
+    /// deliberately knows nothing about ML-DSA signatures.
+    dir: Option<PathBuf>,
+    /// Every equivocation this node has adjudicated, in the order it applied them —
+    /// the in-memory mirror of `punishments.dat` (issue #133). Bounded by the roster
+    /// (a member is tombstoned once).
+    punishments: Vec<EquivocationEvidence>,
+    /// What the last `open` found in the ledger and did with it. Reported at startup
+    /// so "restored nothing" and "had nothing to restore" are distinguishable.
+    punish_restore: PunishmentRestore,
 }
 
 /// How far above the state machine's applied tip a body is worth holding
@@ -330,6 +348,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// block-log tail), so accepted blocks and finalizations persist across
     /// restarts. Wraps `committee` at the frozen epoch length (like [`Self::new`]).
     /// [`Self::save_snapshot`] flushes the derived state on graceful shutdown.
+    ///
+    /// **Committee punishments are restored here too (issue #133).** The `committee`
+    /// argument is always a fresh all-Active genesis roster — that is what the binary
+    /// can build from the genesis file, and it is the whole defect: a member proven to
+    /// have equivocated came back Active with a full bond on every restart. The
+    /// punishment ledger in `dir` is replayed onto that roster **before** the epoch
+    /// machinery advances, so the forced exits at each boundary drop exactly the
+    /// members a node that never restarted had already dropped. A ledger this binary
+    /// cannot honour is an error, never an empty start — see [`crate::punish`].
     pub fn open(
         dir: impl AsRef<std::path::Path>,
         committee: CommitteeState,
@@ -337,9 +364,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         verifier: V,
         sim: SimConfig,
     ) -> Result<Self, NodeError> {
+        let dir = dir.as_ref().to_path_buf();
         let ec = EpochCommittee::genesis(EpochSchedule::new(EPOCH_LENGTH_BLOCKS), committee);
-        let state = MemNode::open(dir, genesis_block(sim.genesis_difficulty, 0))?;
+        let state = MemNode::open(&dir, genesis_block(sim.genesis_difficulty, 0))?;
         let mut me = Self::assemble(ec, pow, verifier, sim, state);
+        me.dir = Some(dir.clone());
         // Restart-resume the in-memory fork-choice header chain from the persisted
         // block log: the state machine is the durable source of truth, so on open
         // the adapter adopts its restored ChainState (headers + finalized head),
@@ -348,8 +377,56 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // to re-sync everything it already had on disk.
         let resumed = me.state.chain().chain().clone();
         me.chain = resumed;
+        // Punishments BEFORE the epoch advance: a tombstone's effect at a boundary is
+        // to shrink the roster and reindex it, and applying it afterwards would punish
+        // whichever member had shifted into that index.
+        me.restore_punishments(&dir)?;
         me.advance_epoch();
         Ok(me)
+    }
+
+    /// Replay `dir`'s punishment ledger onto the genesis committee this adapter was
+    /// opened with (issue #133).
+    ///
+    /// Refuses — returns `Err` — for any ledger that exists and cannot be honoured.
+    /// A ledger that is merely **absent** is reported, not refused, and this is a
+    /// judgement call worth naming: an absent ledger on a data dir that already holds
+    /// chain history is a pre-#133 data dir whose punishment history is *unknowable*,
+    /// and refusing there would brick every existing data dir on upgrade. So it is
+    /// recorded in [`PunishmentRestore`] and printed loudly by the binary instead —
+    /// the "or reports" half of the rule, not a silent fall-through.
+    fn restore_punishments(&mut self, dir: &std::path::Path) -> Result<(), NodeError> {
+        let loaded = punish::load(dir).map_err(NodeError::Io)?;
+        let absent = loaded.is_none();
+        let mut records = loaded.unwrap_or_default();
+        punish::sort_records(&mut records);
+        let tip = self.chain.tip_height();
+        let tombstoned = punish::replay(&mut self.committee, &records, tip)
+            .map_err(|e| NodeError::Io(e.to_io()))?;
+        self.punish_restore = PunishmentRestore {
+            records: records.len(),
+            tombstoned,
+            ledger_absent_on_populated_datadir: absent && tip > 0,
+        };
+        self.punishments = records;
+        // Write the ledger out when this data dir had none, so a *later* restart can
+        // tell "this node has recorded no punishments" from "nobody ever asked".
+        if absent {
+            punish::save(dir, &self.punishments).map_err(NodeError::Io)?;
+        }
+        Ok(())
+    }
+
+    /// What the last [`Self::open`] found in the punishment ledger and did with it.
+    /// Empty and all-zero for an in-memory adapter.
+    pub fn punishment_restore(&self) -> &PunishmentRestore {
+        &self.punish_restore
+    }
+
+    /// Every equivocation this node has adjudicated — the in-memory mirror of the
+    /// durable ledger. One record per tombstoned member.
+    pub fn punishments(&self) -> &[EquivocationEvidence] {
+        &self.punishments
     }
 
     /// Flush the state machine's derived state to an atomic on-disk snapshot
@@ -394,6 +471,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             miner_rkm: UNCONFIGURED_MINER_RKM,
             pending_bodies: BTreeMap::new(),
             pending_bytes: 0,
+            dir: None,
+            punishments: Vec::new(),
+            punish_restore: PunishmentRestore::default(),
         }
     }
 
@@ -1355,13 +1435,44 @@ impl<P: PowEngine, V: TxVerifier + Clone> CommitteeControl for NodeAdapter<P, V>
             verify_equivocation(ev, self.committee.state_for_height(ev.cp_a.height).committee());
         match verified {
             Ok(signer) => {
+                // Durability FIRST (issue #133). A tombstone is permanent under FROZEN
+                // §4 and cannot be re-derived from anything on disk — evidence is not in
+                // blocks and the gossip that carried it is push-once — so a process that
+                // dies between applying a punishment and recording it has simply lost
+                // it, and the member is Active with a full bond on the next start. The
+                // record is written ahead of the effect for the same reason the finalizer
+                // ledger is written ahead of its vote.
+                let already = matches!(
+                    self.committee.state().status(signer),
+                    Some(MemberStatus::Tombstoned)
+                );
+                if !already {
+                    self.punishments.push(ev.clone());
+                    if let Some(dir) = self.dir.clone() {
+                        if let Err(e) = punish::save(&dir, &self.punishments) {
+                            // The exclusion is applied anyway, and loudly. Frozen §4's
+                            // "tombstoned votes MUST NOT count toward quorum" is an
+                            // immediate safety rule, and making it conditional on a disk
+                            // write would trade a durability failure for a live one. What
+                            // the operator needs to know is that it will not survive a
+                            // restart.
+                            eprintln!(
+                                "⚠️  committee punishment for member {signer} APPLIED but NOT \
+                                 PERSISTED ({e}): the tombstone is in force now and will be LOST \
+                                 on restart. Fix the data dir before restarting this node."
+                            );
+                        }
+                    }
+                }
                 // Equivocation slash = **10 % of the member's bond** + permanent
                 // tombstone (consensus-parameters §4 FROZEN; issue #62 item 5
                 // convergence — replaces the flat `EQUIVOCATION_SLASH_AMOUNT`
                 // placeholder now that the bond is a genesis constant). Integer
-                // floor; a ramped bond of 0 slashes 0 (still tombstones).
+                // floor; a ramped bond of 0 slashes 0 (still tombstones). Named in
+                // `ebbflow` since #133, because the restart path re-derives it and two
+                // copies of a frozen rule is how the two views drift apart.
                 let bond = self.committee.state().bond(signer).unwrap_or(0);
-                let slash = bond / 10;
+                let slash = equivocation_slash(bond);
                 self.committee.state_mut().tombstone(signer, slash);
                 Some(signer)
             }
@@ -2157,6 +2268,271 @@ mod tests {
             .expect("reopen");
         assert_eq!(reopened.finalized_height(), Some(CADENCE));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- issue #133: committee punishments survive a restart -------------------
+
+    /// Conflicting evidence at `slot` from `signer`, signed by the real key.
+    fn conflicting(
+        validators: &[Validator],
+        signer: usize,
+        slot: u64,
+    ) -> EquivocationEvidence {
+        let cp_a = Checkpoint::new(slot, [0xA0 + signer as u8; 32], [0xAA; 32]);
+        let cp_b = Checkpoint::new(slot, [0xB0 + signer as u8; 32], [0xBB; 32]);
+        EquivocationEvidence {
+            vote_a: validators[signer].sign_checkpoint(&cp_a),
+            cp_a,
+            vote_b: validators[signer].sign_checkpoint(&cp_b),
+            cp_b,
+        }
+    }
+
+    /// **THE acceptance property (issue #133), stated as the defect it repairs: a
+    /// tombstoned member stays tombstoned across a restart.**
+    ///
+    /// `qumbra-node` rebuilds its committee from the genesis file on every start, so
+    /// the reopen below is given a *fresh all-Active* `CommitteeState` — exactly what
+    /// the binary hands `NodeAdapter::open`. Before this change that was the whole
+    /// bug: the reopened node answered `is_active` = true for a signer every
+    /// non-restarted node on the net had permanently removed, and counted its votes
+    /// toward quorum. The control assertion is the one that matters — the fresh
+    /// committee really does start Active, so the restored state is not an artifact
+    /// of the test handing the node a pre-punished roster.
+    #[test]
+    fn a_tombstoned_member_stays_tombstoned_across_a_restart() {
+        let dir = temp_dir("i133-tombstone");
+        let (_c, validators) = committee7();
+        let ev = conflicting(&validators, 3, 8);
+
+        {
+            let mut a = NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+                .expect("open");
+            assert_eq!(a.committee().state().status(3), Some(MemberStatus::Active));
+            assert_eq!(a.apply_evidence(&ev), Some(3));
+            assert!(a.is_tombstoned(3));
+            assert_eq!(a.punishments().len(), 1, "the evidence was recorded");
+        }
+
+        // The ledger is on disk under its own name, not folded into the snapshot or
+        // the block log (both of which are allowed to be rebuilt or ignored).
+        assert!(dir.join(crate::punish::PUNISHMENT_FILE).exists());
+
+        // --- process dies; the datadir is all that survived ---
+
+        // The control: a genesis committee, untouched, really is all-Active.
+        assert_eq!(committee7().0.status(3), Some(MemberStatus::Active));
+
+        let b = NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+            .expect("reopen");
+        assert!(b.is_tombstoned(3), "the tombstone must survive the restart");
+        assert_eq!(b.committee().state().status(3), Some(MemberStatus::Tombstoned));
+        assert!(
+            !b.committee().state().is_active(3, u64::MAX),
+            "and it is never active again, at any height"
+        );
+        assert_eq!(
+            b.committee().state().active_count(0),
+            6,
+            "roster 7 minus one tombstone — the number a peer that never restarted has"
+        );
+        assert_eq!(b.punishment_restore().records, 1);
+        assert_eq!(b.punishment_restore().tombstoned, vec![3]);
+        assert!(!b.punishment_restore().ledger_absent_on_populated_datadir);
+
+        // And its votes no longer reach quorum: 7 signers, 6 countable, quorum 5 —
+        // still enough. So check the load-bearing half directly: the tombstoned
+        // signer is excluded from the tally.
+        let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
+        let mut b = b;
+        let votes: Vec<Vote> = [3usize, 0, 1, 2, 4]
+            .iter()
+            .map(|&i| validators[i].sign_checkpoint(&cp))
+            .collect();
+        match b.ingest_checkpoint_votes(&cp, &votes) {
+            VotesOutcome::Learned { finalized, accumulated } => {
+                assert!(!finalized, "5 votes minus the tombstoned signer is 4 < quorum 5");
+                assert_eq!(accumulated.len(), 4, "the tombstoned signer's vote is excluded");
+            }
+            _ => panic!("expected a below-quorum Learned outcome"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The second acceptance item, and the reason it is its own test: the BOND and
+    /// the SLASHED amount survive too.**
+    ///
+    /// #133's own words are that the member comes back *"Active with a full bond"* —
+    /// two facts, not one. A fix that restored `status` while leaving `bond` at its
+    /// genesis value would pass a status-only test and still hand the node a ledger
+    /// saying the slash never happened. Both are asserted here against the exact
+    /// frozen arithmetic (10 % of bond, integer floor), not against "something less
+    /// than before".
+    #[test]
+    fn the_bond_and_the_slash_survive_the_restart_not_just_the_status_flag() {
+        let dir = temp_dir("i133-bond");
+        let (_c, validators) = committee7();
+        let ev = conflicting(&validators, 5, 16);
+        let expect_slash = BOND_AMOUNT / 10;
+
+        {
+            let mut a = NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+                .expect("open");
+            assert_eq!(a.apply_evidence(&ev), Some(5));
+            assert_eq!(a.committee().state().slashed(5), Some(expect_slash));
+            assert_eq!(a.committee().state().bond(5), Some(BOND_AMOUNT - expect_slash));
+        }
+
+        // The control: a fresh genesis committee has a FULL bond and a zero slash, so
+        // the numbers below cannot have leaked in from the constructor.
+        assert_eq!(committee7().0.bond(5), Some(BOND_AMOUNT));
+        assert_eq!(committee7().0.slashed(5), Some(0));
+
+        let b = NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+            .expect("reopen");
+        assert_eq!(b.committee().state().slashed(5), Some(expect_slash), "slash survives");
+        assert_eq!(
+            b.committee().state().bond(5),
+            Some(BOND_AMOUNT - expect_slash),
+            "and the bond is still short by exactly the slash"
+        );
+        // Nobody else was touched.
+        for i in 0..7 {
+            if i != 5 {
+                assert_eq!(b.committee().state().bond(i), Some(BOND_AMOUNT), "member {i}");
+                assert_eq!(b.committee().state().slashed(i), Some(0), "member {i}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **The third acceptance item, and the whole defect class: a ledger this binary
+    /// cannot understand makes the node REFUSE, not start fresh.**
+    ///
+    /// `PR #140` found `Node::open`'s genesis guard falling through to a replay rather
+    /// than refusing, and #133 is filed as *"a fallback that restores a proven
+    /// misbehaver to good standing"*. A punishment ledger that fell back to empty
+    /// would be a second instance of the same shape inside the fix for the first —
+    /// which is why the assertion is on the *refusal*, and why the error names the
+    /// file and tells the operator to re-sync rather than to bump a constant.
+    #[test]
+    fn a_punishment_ledger_this_binary_cannot_read_refuses_to_open() {
+        let (_c, validators) = committee7();
+
+        // (a) An unknown format version.
+        let dir = temp_dir("i133-badversion");
+        let mut bytes = crate::punish::encode(&[conflicting(&validators, 1, 8)]);
+        bytes[0] = crate::punish::PUNISHMENT_FORMAT_VERSION + 1;
+        std::fs::write(crate::punish::path(&dir), &bytes).unwrap();
+        let err = refuses_to_open(&dir, "an unknown ledger version");
+        let msg = format!("{err:?}");
+        assert!(msg.contains(crate::punish::PUNISHMENT_FILE), "names the file: {msg}");
+        assert!(msg.contains("Re-sync this data dir"), "tells the operator what to do: {msg}");
+        std::fs::remove_dir_all(&dir).ok();
+
+        // (b) A well-formed ledger whose evidence is not signed by a member of THIS
+        //     node's committee — a datadir carried across a committee change. The
+        //     seed differs at the same index, because `devnet_committee` derives key
+        //     `i` from the index alone and two committee SIZES share their keys.
+        let dir = temp_dir("i133-foreign");
+        let foreign = Validator::from_seed(1, [0x77; 32]);
+        let cp_a = Checkpoint::new(8, [0xA1; 32], [0xAA; 32]);
+        let cp_b = Checkpoint::new(8, [0xB1; 32], [0xBB; 32]);
+        let ev = EquivocationEvidence {
+            vote_a: foreign.sign_checkpoint(&cp_a),
+            cp_a,
+            vote_b: foreign.sign_checkpoint(&cp_b),
+            cp_b,
+        };
+        std::fs::write(crate::punish::path(&dir), crate::punish::encode(&[ev])).unwrap();
+        let err = refuses_to_open(&dir, "unverifiable evidence");
+        assert!(format!("{err:?}").contains("not a verified equivocation"), "{err:?}");
+        std::fs::remove_dir_all(&dir).ok();
+
+        // (c) Trailing garbage.
+        let dir = temp_dir("i133-trailing");
+        let mut bytes = crate::punish::encode(&[conflicting(&validators, 1, 8)]);
+        bytes.push(0xEE);
+        std::fs::write(crate::punish::path(&dir), &bytes).unwrap();
+        refuses_to_open(&dir, "trailing bytes");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `NodeAdapter` has no `Debug`, so `expect_err` cannot be used: open, require the
+    /// refusal, and hand back the error.
+    fn refuses_to_open(dir: &std::path::Path, what: &str) -> NodeError {
+        match NodeAdapter::open(dir, committee7().0, KeccakPow, MockVerifier, easy_sim()) {
+            Err(e) => e,
+            Ok(_) => panic!("{what} must refuse to open, but the node started"),
+        }
+    }
+
+    /// A data dir that already holds chain history but carries **no** ledger is a
+    /// pre-#133 data dir: whether a punishment was ever applied against it is
+    /// unknowable, so it is *reported* rather than passed off as clean. This is the
+    /// "or reports" half of the rule, and it is deliberately not a refusal — refusing
+    /// would brick every existing data dir on upgrade.
+    ///
+    /// The reopen is the other half of the property: once an empty ledger has been
+    /// written, "this node has recorded no punishments" is a statement on disk, and
+    /// the flag goes quiet.
+    #[test]
+    fn a_populated_datadir_with_no_ledger_reports_rather_than_passing_as_clean() {
+        let dir = temp_dir("i133-preexisting");
+        // Build a datadir with real chain history and no ledger, the way a pre-#133
+        // binary would have left it.
+        {
+            let mut a = NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+                .expect("open");
+            mine_chain(&mut a, 3);
+            assert_eq!(a.state().tip_height(), 3);
+        }
+        std::fs::remove_file(crate::punish::path(&dir)).expect("simulate a pre-#133 datadir");
+
+        let a = NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+            .expect("must still start — refusing would brick every existing datadir");
+        assert!(
+            a.punishment_restore().ledger_absent_on_populated_datadir,
+            "a populated datadir with no ledger must be reported, not assumed clean"
+        );
+        assert_eq!(a.punishment_restore().records, 0);
+        drop(a);
+
+        // An empty ledger was written, so the next start is unambiguous.
+        assert!(crate::punish::path(&dir).exists());
+        let b = NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+            .expect("reopen");
+        assert!(
+            !b.punishment_restore().ledger_absent_on_populated_datadir,
+            "an explicitly empty ledger is a statement, not an absence"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A fresh data dir is not the reported case: no chain history means no history to
+    /// have lost a punishment from, so the flag is quiet and the counter is a plain
+    /// zero. Stated as a test because "reports on every cold start" would be a
+    /// warning nobody reads, which is the same failure as no warning at all.
+    #[test]
+    fn a_fresh_datadir_restores_zero_punishments_quietly() {
+        let dir = temp_dir("i133-fresh");
+        let a = NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+            .expect("open");
+        assert_eq!(a.punishment_restore(), &crate::punish::PunishmentRestore::default());
+        assert!(a.punishment_restore().summary_line().contains("0 record(s) on disk"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An in-memory adapter writes nothing and restores nothing — every in-process
+    /// sim, soak and test keeps its previous behaviour byte for byte.
+    #[test]
+    fn an_in_memory_adapter_persists_no_punishments() {
+        let (cstate, validators) = committee7();
+        let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+        assert_eq!(a.apply_evidence(&conflicting(&validators, 4, 8)), Some(4));
+        assert!(a.is_tombstoned(4), "the punishment still applies in memory");
+        assert_eq!(a.punishments().len(), 1);
+        assert_eq!(a.punishment_restore(), &crate::punish::PunishmentRestore::default());
     }
 
     /// A private temp dir for a disk-backed adapter.
