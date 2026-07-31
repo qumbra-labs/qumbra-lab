@@ -851,14 +851,24 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         if self.sync.awaiting() {
             return;
         }
-        let best = self.peers.best_height().unwrap_or(0);
-        if best > self.node.tip_height() {
-            // Sync from the tallest ready peer.
-            if let Some(peer) = self.tallest_ready_peer() {
-                self.start_sync_with(peer);
+        // Issue #106: `None` and `Some(0)` are NOT the same answer, and treating
+        // them as one is what let a node with no peers report itself `Synced`.
+        // `best_height()` is `None` when no ready peer has claimed a height at all
+        // — an empty peer table, or peers still mid-handshake — and the honest
+        // phase for that is `Unknown`, not "caught up to 0". A node on a brand-new
+        // net whose peers really are at height 0 gets `Some(0)`, compares against
+        // its own tip, and reaches `Synced` on evidence.
+        match self.peers.best_height() {
+            None => self.sync.phase = SyncPhase::Unknown,
+            Some(best) if best > self.node.tip_height() => {
+                // Sync from the tallest ready peer.
+                if let Some(peer) = self.tallest_ready_peer() {
+                    self.start_sync_with(peer);
+                } else {
+                    self.sync.phase = SyncPhase::Behind;
+                }
             }
-        } else {
-            self.sync.phase = SyncPhase::Synced;
+            Some(_) => self.sync.phase = SyncPhase::Synced,
         }
     }
 
@@ -923,8 +933,12 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         }
 
-        // Advance the state machine.
-        let still_behind = self.peers.best_height().unwrap_or(0) > self.node.tip_height();
+        // Advance the state machine. `best` is read once: the same `None`/`Some(0)`
+        // conflation fixed in `maybe_start_sync` (issue #106) was here too — a peer
+        // that dropped mid-batch left `unwrap_or(0)`, hence `still_behind == false`,
+        // hence `Synced` on a node that had just lost its only source of heights.
+        let best = self.peers.best_height();
+        let still_behind = best.is_some_and(|b| b > self.node.tip_height());
         if batch_len == MAX_HEADERS_PER_BATCH && still_behind && accepted > 0 {
             // Full batch and more to go → request the next one.
             let loc = build_locator(&self.node);
@@ -932,8 +946,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             self.sync.phase =
                 SyncPhase::AwaitingHeaders { peer: from, from_height: self.node.tip_height() };
         } else {
-            self.sync.phase =
-                if still_behind { SyncPhase::Idle } else { SyncPhase::Synced };
+            self.sync.phase = match best {
+                None => SyncPhase::Unknown,
+                Some(_) if still_behind => SyncPhase::Behind,
+                Some(_) => SyncPhase::Synced,
+            };
         }
     }
 
@@ -1474,6 +1491,35 @@ mod tests {
         assert_eq!(nodes[1].node().tip_height(), 30, "behind node synced to tip");
         assert_eq!(nodes[1].node().chain().tip_hash(), nodes[0].node().chain().tip_hash());
         assert_eq!(*nodes[1].sync_phase(), SyncPhase::Synced);
+    }
+
+    /// **Issue #106 — a node that has spoken to nobody never reports `Synced`.**
+    ///
+    /// The phase this asserts about used to be reachable by a node with an empty
+    /// peer table: `best_height().unwrap_or(0) > tip` is false at height 0 with no
+    /// peers, so the old `else` arm declared the node caught up on the strength of
+    /// nothing at all. Everything downstream that asks "am I at the network's
+    /// height?" — the #106 mining gate above all — was reading that answer.
+    #[test]
+    fn a_node_with_no_peers_never_claims_to_be_synced() {
+        let hub = InProcHub::new();
+        let t0 = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let mut lonely = P2pNode::new(t0, stub(), [1; 32]);
+
+        for now in 0..5u64 {
+            lonely.tick(now);
+            assert_eq!(
+                *lonely.sync_phase(),
+                SyncPhase::Unknown,
+                "no peer has claimed a height, so nothing is known"
+            );
+        }
+
+        // A peer that connects but has not completed its handshake is not a claim
+        // either: the phase only moves once a `Version` has been received.
+        lonely.add_peer(PeerId(2), None);
+        lonely.tick(6);
+        assert_eq!(*lonely.sync_phase(), SyncPhase::Unknown, "mid-handshake claims nothing");
     }
 
     #[test]

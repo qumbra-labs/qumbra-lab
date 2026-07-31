@@ -56,6 +56,7 @@ use crate::telemetry_server::TelemetryServer;
 use qlab_p2p::addrman::{valid_addr, AddrManager, DIAL_RETRY_INTERVAL_MS};
 use qlab_p2p::adapter::{MiningClock, NodeAdapter};
 use qlab_p2p::n1::{ChainView, CommitteeControl};
+use qlab_p2p::sync::SyncPhase;
 use qlab_p2p::transport::TcpTransport;
 use qlab_p2p::P2pNode;
 
@@ -294,6 +295,70 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// Whether the durable halt marker for this halt has been written with
     /// `boundary_finalized = true` yet (it is rewritten once when H finalizes).
     marker_final_written: bool,
+    /// **Issue #106: has this node ever been cleared to mine?** Latches `true` the
+    /// first time [`Self::mine_gate`] permits a block and never clears.
+    ///
+    /// The latch is what keeps this a *startup* gate rather than a standing "am I
+    /// behind?" check, and that boundary is deliberate:
+    ///
+    /// - The defect is a **cold** node extending a chain it knows nothing about. A
+    ///   node that has already established where the chain is cannot make that
+    ///   mistake again in this process's lifetime — it has real history, and #130
+    ///   (a)'s `state_lag` gate plus fork choice cover it from there.
+    /// - Without the latch, a single peer claiming an absurd height would stop an
+    ///   established miner indefinitely (it can never catch up to a chain that does
+    ///   not exist). Latching bounds that to *before this node's first block*, where
+    ///   refusing is the safe direction anyway.
+    mine_gate_latched: bool,
+}
+
+/// Why this node may or may not mine right now (issue #106) — the verdict behind
+/// the `TELEMETRY` line's `mready=` field.
+///
+/// The whole gate is one sentence: **before its first block, a node must either
+/// know where the chain is, or know there is no chain to know about.** The three
+/// permitting variants are the two halves of that plus the latch; the two refusing
+/// variants are the states node0 was in when it mined a genesis fork through a
+/// restart on the T0 WAN net.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MineGate {
+    /// Not a miner at all (`mining = false`) — the gate has nothing to say.
+    NotMining,
+    /// PERMITTED: a ready peer claimed a height and this node is not below it.
+    Synced,
+    /// PERMITTED: there is nobody to ask — no address to dial and no live peer —
+    /// so this node *is* the net. The genuinely-first node on a brand-new chain,
+    /// which must mine or no net ever starts.
+    Alone,
+    /// PERMITTED: cleared once already in this process's lifetime (the latch).
+    Latched,
+    /// REFUSED: no ready peer has claimed a height yet, and there are addresses
+    /// left to try. **This is the cold-restart state** — an empty data dir with
+    /// seeds configured, before the first handshake lands.
+    Unknown,
+    /// REFUSED: a peer's chain is taller and this node has not caught up to it.
+    Behind,
+}
+
+impl MineGate {
+    /// Whether this verdict permits mining.
+    pub fn permits(&self) -> bool {
+        matches!(self, MineGate::Synced | MineGate::Alone | MineGate::Latched)
+    }
+
+    /// The `mready=` token for the `TELEMETRY` line. `-` for a non-miner, matching
+    /// `final=-` / `age_s=-`: the field is positional and a node with no mining
+    /// duty has no readiness to report.
+    pub fn field(&self) -> &'static str {
+        match self {
+            MineGate::NotMining => "-",
+            MineGate::Synced => "synced",
+            MineGate::Alone => "alone",
+            MineGate::Latched => "latched",
+            MineGate::Unknown => "unknown",
+            MineGate::Behind => "behind",
+        }
+    }
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
@@ -477,6 +542,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             sample_interval: Duration::from_secs(30),
             last_sample: Instant::now(),
             last_maintain: Instant::now(),
+            mine_gate_latched: false,
             started: Instant::now(),
             release,
             halt_at: release.halt_at(),
@@ -800,8 +866,25 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // restart resets it. Zero is printed rather than omitted (the #130 (a) rule) —
         // a node always knows this count, so an omitted field would only force a
         // special case on every parser in `qumbra-ops/`.
+        // Issue #106: `mready=` is **appended at the end**, under the same rule as
+        // #87's, #84's and #130 (a)'s additions — every pre-existing field keeps its
+        // name, position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified.
+        //
+        // It exists because **a node deliberately not mining looks exactly like a
+        // node failing to mine**, and the operator surface had no field that could
+        // tell them apart. After this change a rolled host that refuses to extend
+        // the chain until it has synced is the correct, designed behaviour, and it
+        // MUST be legible as such: `mready=unknown` says "I have not heard from any
+        // peer yet", `mready=behind` says "I am catching up", and both are answers
+        // to the question an operator asks at 12:01 while watching `tip=` sit at 4.
+        //
+        // Always printed, `-` for a non-miner (`final=-`/`age_s=-`'s precedent):
+        // a key that comes and goes forces a special case on every parser in
+        // `qumbra-ops/`.
+        let mready = self.mine_gate();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -814,6 +897,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             lag.state_tip,
             lag.blocks(),
             ic.unjudged_anchor,
+            mready.field(),
         )
     }
 
@@ -1035,9 +1119,77 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         self.p2p.rate_stats()
     }
 
+    /// **Issue #106 — may this node mine right now?** See [`MineGate`].
+    ///
+    /// The two facts it reads, and why these and not others:
+    ///
+    /// - the sync phase ([`qlab_p2p::sync::SyncPhase`]), which since #106 can say
+    ///   "I have not heard from anyone" instead of folding that into "caught up";
+    /// - whether there is **anyone to ask**: no address in the book and no live
+    ///   peer. This is the discriminator between *genuinely first* and *rejoining
+    ///   and ignorant*, and it is derived from what the operator already wrote —
+    ///   `dial_peers` — rather than from a new flag or a wall-clock grace period.
+    ///   A node told about a network believes a network exists and will not extend
+    ///   the chain until it has found it; a node told about nobody is the net.
+    ///
+    /// The address book, not the live peer set, is the load-bearing half: node0's
+    /// restart had three seeds configured and zero peers *handshaked yet*, which is
+    /// precisely the window it forked in. Requiring the peer table to be empty as
+    /// well closes the narrower window where an inbound socket is mid-handshake and
+    /// is about to tell us the height.
+    ///
+    /// Not read on purpose: the tip's timestamp. Genesis is stamped `timestamp = 0`
+    /// so its hash is reproducible, so "how old is my tip" cannot distinguish a
+    /// fresh chain from a three-day-old one at exactly the height where the answer
+    /// matters.
+    pub fn mine_gate(&self) -> MineGate {
+        if !self.mining {
+            return MineGate::NotMining;
+        }
+        if self.p2p.sync_phase().is_synced() {
+            return MineGate::Synced;
+        }
+        if self.p2p.addrs().known_count() == 0 && self.p2p.peers().is_empty() {
+            return MineGate::Alone;
+        }
+        if self.mine_gate_latched {
+            return MineGate::Latched;
+        }
+        match self.p2p.sync_phase() {
+            SyncPhase::Unknown => MineGate::Unknown,
+            _ => MineGate::Behind,
+        }
+    }
+
     /// Attempt to mine + announce the next block over the tip. Returns whether a
     /// block was produced (real RandomX PoW under the key-block seed).
+    ///
+    /// Issue #106: the readiness gate is here rather than at the call site, so it
+    /// covers every caller — the event loop and the tests alike — and so a future
+    /// caller cannot reintroduce mine-before-sync by forgetting it.
     pub fn try_mine(&mut self) -> bool {
+        let gate = self.mine_gate();
+        if !gate.permits() {
+            return false;
+        }
+        // First clearance is worth exactly one line: an operator reading a startup
+        // log wants to know *when* this node decided it knew where the chain was,
+        // and on the T0 hosts that instant is the difference between a clean join
+        // and a genesis fork. Logged before the attempt, because the attempt itself
+        // may fail on PoW and this fact is about the decision, not the block.
+        if !self.mine_gate_latched {
+            self.mine_gate_latched = true;
+            println!(
+                "MINEGATE ready=1 why={} tip={} best={}",
+                gate.field(),
+                self.tip_height(),
+                self.p2p
+                    .peers()
+                    .best_height()
+                    .map(|h| h.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            );
+        }
         match self.p2p.node_mut().mine_block() {
             Some((header, body)) => {
                 self.nonce = self.nonce.wrapping_add(1);
@@ -2047,6 +2199,248 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    // ===== issue #106: a node with an empty data dir must not mine its own chain =====
+
+    /// **ACCEPTANCE — the defect, both halves, over the real socket.**
+    ///
+    /// This is node0's roll on the T0 WAN net (2026-07-29): a host restarted onto an
+    /// empty data dir, with its three peers configured and a network 2,000 blocks
+    /// tall, mined its own chain from genesis instead of syncing one. Everything the
+    /// old code had to go on is present here — the seed list, the taller peer, an
+    /// empty data dir, `mining = true` — and the node now refuses to extend a chain
+    /// it has not found yet.
+    ///
+    /// The four phases are the four states that mattered:
+    ///
+    /// 1. **before any contact** — `mready=unknown`, and mining now is the fork;
+    /// 2. **catching up** — refused at every step, tip never leaves 0 by our own hand;
+    /// 3. **synced** — the gate opens, and the block that follows builds on the
+    ///    network's chain rather than on genesis;
+    /// 4. **eclipsed afterwards** — the peer goes away and mining CONTINUES, because
+    ///    the gate is a startup condition and a partition is not proof of anything
+    ///    (the same reasoning #86 gave for sticky dialability).
+    #[test]
+    fn a_cold_node_with_a_taller_peer_does_not_mine_until_it_has_synced() {
+        use qlab_p2p::n1::{BlockIngest, IngestOutcome};
+
+        let a_port = free_port();
+        let a_addr = format!("127.0.0.1:{a_port}");
+
+        // A is the established net: three blocks, and dialable.
+        let (mut acfg, agen, abase) = rig("i106_net", true);
+        acfg.listen_addr = a_addr.clone();
+        acfg.advertise_addr = Some(a_addr.clone());
+        let mut a = RunningNode::start(&acfg, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        a.set_mine_interval(Duration::ZERO);
+        for _ in 0..3 {
+            assert!(a.try_mine(), "A is genuinely alone and mines the net into being");
+        }
+        assert_eq!(a.tip_height(), 3);
+
+        // B is the rolled host: empty data dir, mining on, A configured as a seed.
+        let (mut bcfg, bgen, bbase) = rig("i106_cold", true);
+        bcfg.dial_peers = vec![a_addr.clone()];
+        let mut b = RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        b.set_mine_interval(Duration::ZERO);
+
+        // ── (1) Nothing known yet. The seed has not answered; `Unknown` is not `Synced`.
+        assert_eq!(b.mine_gate(), MineGate::Unknown, "a node that has heard from nobody");
+        assert!(!b.try_mine(), "🔴 this call mining a block IS the #106 fork");
+        assert_eq!(b.tip_height(), 0, "and no fork block exists");
+        assert!(b.telemetry_sample().ends_with(" mready=unknown"));
+
+        // ── (2) Catching up. Refused on every pass until the header chain lands.
+        let mut refusals = 0;
+        for _ in 0..60 {
+            if b.p2p().sync_phase().is_synced() && b.tip_height() == 3 {
+                break;
+            }
+            a.step_once();
+            b.step_once();
+            assert!(!b.try_mine(), "refused while catching up: gate={:?}", b.mine_gate());
+            refusals += 1;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(refusals > 0, "the catch-up window was exercised");
+        assert_eq!(b.tip_height(), 3, "B took the network's chain, not one of its own");
+        assert_eq!(b.mine_gate(), MineGate::Synced, "compared against a real claim");
+
+        // The other gate is still shut, and for its own reason: header-first sync
+        // gives B the headers, and `GetData(Block)` serves headers only, so B's state
+        // machine has applied no body (#130 (a) / #104 — not this issue's business).
+        // Two independent gates, two different answers, both correct.
+        assert!(!b.try_mine(), "still refused, now for the state lag");
+        let line = b.telemetry_sample();
+        assert!(line.contains(" stip=0 slag=3"), "{line}");
+        assert!(line.ends_with(" mready=synced"), "the readiness gate is open: {line}");
+
+        // ── (3) The bodies arrive the way a live announce would deliver them.
+        let chain = a.p2p().node().chain();
+        let mined: Vec<_> =
+            (1..=3).map(|h| *chain.header(&chain.main_chain()[h]).expect("header")).collect();
+        for header in &mined {
+            let hash = header.header_hash();
+            let stored = a.state().chain().block(&hash).expect("A holds the body").clone();
+            assert_eq!(
+                b.p2p_mut().node_mut().ingest_block(*header, stored.body()),
+                IngestOutcome::Duplicate,
+                "the header was already held"
+            );
+        }
+        assert!(b.try_mine(), "and now it mines: gate={:?}", b.mine_gate());
+        assert_eq!(b.tip_height(), 4, "on top of the network's chain, not beside it");
+
+        // ── (4) Eclipse after clearance does not stop an established miner.
+        drop(a);
+        for _ in 0..5 {
+            b.step_once();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            matches!(b.mine_gate(), MineGate::Latched | MineGate::Synced),
+            "gate={:?}",
+            b.mine_gate()
+        );
+        assert!(b.try_mine(), "a node that lost its peers keeps extending its own history");
+
+        drop(b);
+        let _ = std::fs::remove_dir_all(&abase);
+        let _ = std::fs::remove_dir_all(&bbase);
+    }
+
+    /// **ACCEPTANCE — the test that breaks if the fix is too blunt.** Naming it, as
+    /// the task book asks: *this* is the one a crude "require a peer before mining"
+    /// or "require a header before mining" rule fails, and a net that cannot start
+    /// is a worse outcome than the fork this issue is about. The first node on a
+    /// brand-new chain has no peers and no history and legitimately must mine.
+    ///
+    /// It passes for a stated reason and not by luck: with no seed configured and no
+    /// live peer there is **nobody to ask**, and a node with nobody to ask is the
+    /// net. `deploy/deploy.sh` writes a full mesh into every node's `dial_peers`, so
+    /// on the real T0 net no host can reach this branch — see
+    /// `a_fresh_net_of_configured_peers_still_starts_from_genesis` for how that one
+    /// starts instead.
+    #[test]
+    fn the_genuinely_first_node_on_a_new_net_does_mine() {
+        let (config, genesis, base) = rig("i106_first", true);
+        assert!(config.dial_peers.is_empty(), "nobody to ask");
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+
+        assert_eq!(node.p2p().addrs().known_count(), 0);
+        assert_eq!(node.mine_gate(), MineGate::Alone);
+        assert!(!node.p2p().sync_phase().is_synced(), "…and it does NOT pretend it synced");
+        assert!(node.try_mine(), "the net starts");
+        assert_eq!(node.tip_height(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **ACCEPTANCE — the discriminator AT ITS BOUNDARY.**
+    ///
+    /// The rule chosen in position 1 is *"is there anybody to ask?"*, and its
+    /// boundary is **one address**: zero known addresses permits mining, one known
+    /// address forbids it until that address answers. The two nodes here differ in
+    /// nothing else — same genesis, same empty data dir, same `mining = true`, same
+    /// unreachable network — so the assertion isolates the discriminator itself.
+    ///
+    /// The failure mode this shape accepts, stated: a node whose seeds are all down
+    /// never mines. That is the safe direction (it cannot know whether a chain is
+    /// out there), and it is the reason `mready=` exists on the telemetry line —
+    /// otherwise a deliberately-idle node is indistinguishable from a broken one.
+    #[test]
+    fn the_gate_turns_on_one_configured_address_not_on_whether_it_answers() {
+        // Reserve a port and release it: an address that is syntactically fine,
+        // known to the book, and answers nothing.
+        let dead = format!("127.0.0.1:{}", free_port());
+
+        let (zero_cfg, genesis, zbase) = rig("i106_zero", true);
+        let mut zero =
+            RunningNode::start(&zero_cfg, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        zero.set_mine_interval(Duration::ZERO);
+
+        let (mut one_cfg, _g, obase) = rig("i106_one", true);
+        one_cfg.dial_peers = vec![dead];
+        let mut one =
+            RunningNode::start(&one_cfg, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        one.set_mine_interval(Duration::ZERO);
+
+        // Both have exhausted what they can do about it: neither has a peer.
+        for _ in 0..5 {
+            zero.step_once();
+            one.step_once();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(zero.p2p().addrs().known_count(), 0);
+        assert_eq!(one.p2p().addrs().known_count(), 1);
+        assert!(one.p2p().peers().is_empty(), "the seed never answered");
+
+        assert_eq!(zero.mine_gate(), MineGate::Alone);
+        assert_eq!(one.mine_gate(), MineGate::Unknown);
+        assert!(zero.try_mine(), "no network to be behind");
+        assert!(!one.try_mine(), "one address it has not reached is enough to wait");
+        assert_eq!(one.tip_height(), 0);
+        assert!(one.telemetry_sample().ends_with(" mready=unknown"));
+
+        let _ = std::fs::remove_dir_all(&zbase);
+        let _ = std::fs::remove_dir_all(&obase);
+    }
+
+    /// **ACCEPTANCE — `deploy/deploy.sh`'s net still starts.** Every node it writes
+    /// gets a full mesh in `dial_peers`, so none of them takes the "nobody to ask"
+    /// branch; they start because they ask each other, agree that nobody is taller
+    /// than genesis, and mine on that evidence. Without the `None`/`Some(0)` split
+    /// in `maybe_start_sync` this test would pass for the wrong reason — every node
+    /// would have called itself `Synced` before the handshake landed.
+    #[test]
+    fn a_fresh_net_of_configured_peers_still_starts_from_genesis() {
+        let (p_port, q_port) = (free_port(), free_port());
+        let (p_addr, q_addr) = (format!("127.0.0.1:{p_port}"), format!("127.0.0.1:{q_port}"));
+
+        let mut nodes = Vec::new();
+        for (tag, listen, peer) in
+            [("i106_mesh_p", &p_addr, &q_addr), ("i106_mesh_q", &q_addr, &p_addr)]
+        {
+            let (mut cfg, genesis, base) = rig(tag, true);
+            cfg.listen_addr = listen.clone();
+            cfg.advertise_addr = Some(listen.clone());
+            cfg.dial_peers = vec![peer.clone()];
+            let mut n =
+                RunningNode::start(&cfg, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+            n.set_mine_interval(Duration::ZERO);
+            nodes.push((n, base));
+        }
+
+        // Cold, mesh-configured, nobody has answered yet: neither may mine.
+        for (n, _) in nodes.iter() {
+            assert_eq!(n.mine_gate(), MineGate::Unknown, "a mesh node waits for the mesh");
+        }
+
+        for _ in 0..40 {
+            if nodes.iter().all(|(n, _)| n.mine_gate() == MineGate::Synced) {
+                break;
+            }
+            for (n, _) in nodes.iter_mut() {
+                n.step_once();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for (n, _) in nodes.iter_mut() {
+            assert_eq!(n.mine_gate(), MineGate::Synced, "genesis is nobody's fork");
+            assert_eq!(
+                n.p2p().peers().best_height(),
+                Some(0),
+                "and it opened on a claim that was actually received, not on a default"
+            );
+            assert!(n.try_mine(), "the net starts");
+        }
+
+        for (n, base) in nodes {
+            drop(n);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
     #[test]
     fn verify_only_node_starts_without_keys() {
         let (mut config, genesis, base) = rig("verifyonly", false);
@@ -2313,6 +2707,8 @@ mod tests {
                 "stip", "slag",
                 // ── appended by #134, at the end ──
                 "uanchor",
+                // ── appended by #106, at the end ──
+                "mready",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -2323,6 +2719,9 @@ mod tests {
         // A healthy node states the zero rather than omitting the field (#130 (a)):
         // this node mined its own tip, so its two views agree.
         assert!(line.contains(" stip=1 slag=0"), "both views, and the zero gap: {line}");
+        // #106: this rig has no seeds and no peers, so it is the whole net and says
+        // which of the gate's permitting reasons applies.
+        assert!(line.ends_with(" mready=alone"), "the readiness verdict, last: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

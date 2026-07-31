@@ -222,11 +222,21 @@ impl PeerTable {
         v
     }
 
-    /// The highest tip height advertised by any ready peer (sync target).
+    /// The highest tip height **claimed** by any ready peer (sync target), or
+    /// `None` when nobody has claimed one.
+    ///
+    /// Issue #106: `node_id.is_some()` is the test for "this peer sent us a
+    /// `Version`", and a peer that has not is no source of heights. `tip_height`
+    /// initialises to 0 ([`PeerInfo::new`]) and `on_verack` promotes to `Ready`
+    /// unconditionally, so without this filter a socket that sent a bare `VerAck`
+    /// and nothing else would contribute a **fabricated claim of height 0** — and a
+    /// claim of 0 is exactly what makes a cold node believe it is caught up. The
+    /// `None` is load-bearing on the same grounds and callers must not flatten it
+    /// to 0: "nobody said anything" is not "somebody said genesis".
     pub fn best_height(&self) -> Option<u64> {
         self.peers
             .values()
-            .filter(|p| p.state == PeerState::Ready)
+            .filter(|p| p.state == PeerState::Ready && p.node_id.is_some())
             .map(|p| p.tip_height)
             .max()
     }
@@ -301,6 +311,28 @@ mod tests {
         t.on_verack(id);
         assert!(t.is_ready(id));
         assert_eq!(t.best_height(), Some(9));
+    }
+
+    /// Issue #106 — a socket that reached `Ready` without ever sending a `Version`
+    /// has claimed no height, and must not contribute the `tip_height: 0` default as
+    /// if it had. A fabricated claim of genesis is exactly the input that makes a
+    /// cold node believe it is caught up.
+    #[test]
+    fn a_ready_peer_that_never_claimed_a_height_is_no_height_source() {
+        let mut t = PeerTable::new();
+        let bare = PeerId(1);
+        t.add(bare, None);
+        t.on_verack(bare); // a bare VerAck, no Version
+        assert!(t.is_ready(bare), "the handshake state machine is unchanged");
+        assert_eq!(t.best_height(), None, "…but it told us nothing, so we know nothing");
+
+        // One peer that did claim, and the answer exists.
+        let real = PeerId(2);
+        t.add(real, None);
+        let v = VersionMsg { node_id: [2; 32], services: 1, tip_height: 7, user_agent: "x".into() };
+        t.on_version(real, &v);
+        t.on_verack(real);
+        assert_eq!(t.best_height(), Some(7));
     }
 
     #[test]
