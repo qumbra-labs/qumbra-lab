@@ -1067,8 +1067,31 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // is punishment-free: a peer that saw the evidence and this host did not still
         // disagree about who may sign. Agreement needs evidence in blocks (D1).
         let prest = node.punishment_restore().telemetry_field();
+        // Issue #130 (b): `bdrop=` is appended after `fback=`, under the same rule as
+        // every addition since #87 — every pre-existing field keeps its name, position
+        // and meaning, and the `PRE_I84_FIELDS` prefix test passes unmodified.
+        //
+        // 🔴 It is the field #130 asked for by name. `apply_block`'s failure at the
+        // body-application funnel was swallowed by an `Err(_) => {}` arm carrying a
+        // comment that called the drop expected, and **no counter and no telemetry
+        // field existed for it** — so on the one instrument an operator has, a node
+        // dropping every body it was handed printed exactly what a healthy node
+        // prints. #130 is explicit that this is what made it the worst of the five
+        // same-shaped defects that week: *"every other instance was silence; this one
+        // was silence with a comment vouching for it."*
+        //
+        // Caliper: cumulative since PROCESS START over bodies this node's own state
+        // machine refused, paired with the CHAIN HEIGHT of the most recent refusal —
+        // `bdrop=0@-` when there has been none. See
+        // [`qlab_p2p::NodeAdapter::body_refusals`] for why the height is there and why
+        // it is a height. The pair to read it against is `stip=`: `bdrop=17@412` next
+        // to `stip=413` is a node refusing bodies right now; the same `bdrop=17@412`
+        // next to `stip=9000` is a burst that ended long ago. Per-reason attribution
+        // is on `/metrics` (`qumbra_body_apply_refused_total`), which is where the
+        // question "which of the five, and is `not_extending_tip` still zero" belongs.
+        let bdrop = bdrop_field(node.body_refusals());
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} bdrop={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1087,6 +1110,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             body_reqs,
             finality_backing,
             prest,
+            bdrop,
         )
     }
 
@@ -1689,6 +1713,26 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         };
         self.save_addr_book();
         snapshot_ok
+    }
+}
+
+/// Render `bdrop=` from the count/last-height pair (issue #130 (b)):
+/// `<total>@<height>`, and `0@-` when this node has refused no body.
+///
+/// **One token, not two fields**, following `dialable=8/32`: the count and the height
+/// are one reading and splitting them would put two appends on a line that has
+/// already had two collide in a merge today. `@` rather than `/` because the second
+/// number is a position, not a denominator.
+///
+/// **Always printed, zero included** (the #130 (a) rule) — a node always knows both
+/// halves, so an omitted field would only force a special case on every parser. The
+/// `-` is the #125/#84 convention for "no value to state", used here for the height
+/// alone: `0@-` says *nothing has been refused*, which is different in kind from
+/// `0@412`, a state this field cannot reach and a parser should not have to consider.
+fn bdrop_field((total, last_height): (u64, Option<u64>)) -> String {
+    match last_height {
+        Some(h) => format!("{total}@{h}"),
+        None => format!("{total}@-"),
     }
 }
 
@@ -3766,6 +3810,8 @@ mod tests {
                 "fback",
                 // ── appended by #133 D3, at the end ──
                 "prest",
+                // ── appended by #130 (b), at the end ──
+                "bdrop",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -3790,11 +3836,31 @@ mod tests {
         // now the tail. Both appends are correct — only one can be last, and it is the
         // one that landed later. This assertion was `ends_with` when `fback=` WAS last.
         assert!(line.contains(" fback=local "), "backing verdict present: {line}");
-        // #133 D3: `prest=` is the newest append and is now the last field. A fresh
-        // data dir has nothing to restore — and the shape is restored/known, not a
-        // bare zero, so "nothing to restore" is distinguishable from "unk".
-        assert!(line.ends_with(" prest=0/0"), "nothing restored, last: {line}");
+        // #133 D3: a fresh data dir has nothing to restore — and the shape is
+        // restored/known, not a bare zero, so "nothing to restore" is distinguishable
+        // from "unk". Also no longer `ends_with`: `bdrop=` (#130 (b)) landed after it,
+        // for the same reason `prest=` displaced `fback=` one commit earlier.
+        assert!(line.contains(" prest=0/0 "), "nothing restored: {line}");
+        // #130 (b): this node applied every body it produced, so nothing has been
+        // refused — and it says so with a zero and an explicit "no height", rather
+        // than by the field being absent.
+        assert!(line.ends_with(" bdrop=0@-"), "no body refused, last: {line}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `bdrop=`'s two renderings, pinned as tokens (issue #130 (b)).
+    ///
+    /// The `-` half is the load-bearing one: `0@-` and a hypothetical `0@0` would be
+    /// the same claim to a careless reader and are not the same fact, and genesis is
+    /// height 0, so the ambiguity is not academic.
+    #[test]
+    fn bdrop_renders_the_count_and_the_height_of_the_last_refusal() {
+        assert_eq!(bdrop_field((0, None)), "0@-", "nothing refused states no height");
+        assert_eq!(bdrop_field((1, Some(0))), "1@0", "…and height 0 is a real height");
+        assert_eq!(bdrop_field((17, Some(412))), "17@412");
+        // One whitespace-free token, so `soak.sh`'s generic `field()` extractor
+        // (`sed -n "s/.* $2=\([^ ]*\).*/\1/p"`) returns the whole value.
+        assert!(!bdrop_field((17, Some(412))).contains(' '));
     }
 
     /// The compatibility contract, stated so that **it survives the next append**.

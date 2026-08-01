@@ -146,6 +146,41 @@ pub enum NodeError {
     Io(io::Error),
 }
 
+impl NodeError {
+    /// The [`crate::metrics::BODY_REFUSAL_REASONS`] token this failure is counted
+    /// under when a body is refused at the application funnel (issue #130 (b)).
+    ///
+    /// **The match is exhaustive on purpose.** #130's whole complaint is a refusal
+    /// that reached no instrument, so a variant added later must not be able to
+    /// arrive here and be silently folded into a catch-all: with no `_ =>` arm,
+    /// adding one to [`NodeError`] fails to compile until somebody decides which
+    /// class it belongs in. That decision is cheap to make and impossible to
+    /// remember to make later.
+    ///
+    /// It lives beside the enum rather than at the counting site for the same
+    /// reason: the enum and its classification are one thing to keep in step, and
+    /// the compiler only enforces that if they are in the same file.
+    pub fn refusal_reason(&self) -> &'static str {
+        match self {
+            NodeError::NotExtendingTip { .. } => "not_extending_tip",
+            NodeError::Body(_) => "bad_body",
+            NodeError::NullifierSpent { .. } => "nullifier_spent",
+            NodeError::Io(_) => "persist_io",
+            // Each of these means an invariant this node believes cannot fire has
+            // fired, so they share one bucket — but they are enumerated, not
+            // wildcarded. `BodyCommitmentMismatch` is the funnel guard (#77) and is
+            // deliberately NOT `bad_body`: that one is an adversarial object refused
+            // at an entry point, this one is an internally-assembled or on-disk
+            // corrupted block, and the enum's own doc comment says not to merge them.
+            NodeError::BodyCommitmentMismatch { .. }
+            | NodeError::Chain(_)
+            | NodeError::SnapshotFinality(_)
+            | NodeError::SnapshotFinalityNotLogged { .. }
+            | NodeError::Rewind(_) => "internal",
+        }
+    }
+}
+
 impl std::fmt::Display for NodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1120,5 +1155,71 @@ mod tests {
         let header = child_committing_to(&g_header, &body);
         node.apply_block(header, body, &MockVerifier).expect("child applies over genesis");
         assert_eq!(node.tip_height(), 1);
+    }
+
+    /// **Issue #130 (b): every way `apply_block` can fail has a name on the
+    /// instrument**, and the two that a real `NotExtendingTip` would produce are
+    /// reached from real errors rather than asserted about in prose.
+    ///
+    /// The `not_extending_tip` arm is the one that matters and it is the one that
+    /// cannot be produced through the adapter, so it is produced here directly: this
+    /// is what keeps the token from being dead code that nobody would notice had
+    /// stopped classifying anything.
+    #[test]
+    fn every_apply_failure_classifies_to_a_declared_refusal_reason() {
+        use crate::metrics::BODY_REFUSAL_REASONS;
+        let (mut node, g, root) = node_with_finalized_genesis();
+
+        // The variant #130 was filed against — produced for real, by handing
+        // `apply_block` a block whose parent is not the tip.
+        let body = BlockBody { txs: Vec::new(), coinbase: 0, coinbase_rkm: [0; 4] };
+        let orphan = BlockHeader {
+            prev: [0x9c; 32],
+            ..BlockHeader::child_of(&g, g.timestamp + 150, GENESIS_DIFFICULTY, body.commitment())
+        };
+        let err = node.apply_block(orphan, body, &MockVerifier).unwrap_err();
+        assert!(matches!(err, NodeError::NotExtendingTip { .. }), "got {err}");
+        assert_eq!(err.refusal_reason(), "not_extending_tip");
+
+        // A body failure, likewise produced rather than constructed.
+        let honest = BlockBody { txs: vec![tx(root, 1)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let header = child_committing_to(&g, &honest);
+        let swapped = BlockBody { txs: vec![tx(root, 2)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let err = node.apply_block(header, swapped, &MockVerifier).unwrap_err();
+        assert_eq!(err.refusal_reason(), "bad_body");
+
+        // The remaining classes, so no arm of the exhaustive match is unexercised.
+        for (err, want) in [
+            (NodeError::NullifierSpent { tx: 0 }, "nullifier_spent"),
+            (
+                NodeError::Io(io::Error::new(io::ErrorKind::StorageFull, "log append failed")),
+                "persist_io",
+            ),
+            (
+                NodeError::BodyCommitmentMismatch {
+                    height: 1,
+                    expected: [0; 32],
+                    got: [1; 32],
+                },
+                "internal",
+            ),
+            (NodeError::Rewind(RewindError::UnknownTarget), "internal"),
+        ] {
+            assert_eq!(err.refusal_reason(), want, "for {err}");
+        }
+
+        // And every token a classification can return is a series `/metrics` already
+        // declares — a reason that reached the registry under a name it does not know
+        // would be silently dropped by `observe_body_refusal`, which is exactly the
+        // "counted nowhere" failure this issue is about.
+        for reason in [
+            "not_extending_tip",
+            "bad_body",
+            "nullifier_spent",
+            "persist_io",
+            "internal",
+        ] {
+            assert!(BODY_REFUSAL_REASONS.contains(&reason), "{reason} is not declared");
+        }
     }
 }

@@ -279,6 +279,37 @@ pub const VOTE_RESULTS: [&str; 5] = ["counted", "inactive", "forged", "unknown_s
 /// already in trouble.
 pub const LAG_REFUSAL_DUTIES: [&str; 3] = ["mine", "admit_tx", "rewind"];
 
+/// Why the state machine refused a body at the application funnel (issue #130 (b)),
+/// pre-declared so every series exists from the first scrape.
+///
+/// **This is the counter the `Err(_) => {}` arm did not have.** #130's sharpest
+/// sentence is about the comment that sat above it — *"a comment asserting that a
+/// dropped block is normal is what kept anyone from asking whether it was"* — and the
+/// answer to that is not a bare total: it is an attribution, because the reasons a
+/// body can be refused are not one phenomenon. Two of these five are the node's own
+/// invariants and are expected to stay at zero forever; three are things that can
+/// really happen to a running node.
+///
+/// - `not_extending_tip` — [`crate::NodeError::NotExtendingTip`], the variant #130 was
+///   filed against. **It is an invariant tripwire, not a rate.** The only production
+///   caller of [`crate::Node::apply_block`] selects the body it applies with the exact
+///   negation of this error's trigger, so a nonzero value here means that selection
+///   and this check have come apart — a defect in this node, not in the network.
+/// - `bad_body` — body validation failed at application time against the tree the
+///   block is actually being applied to. Reachable: the anchor rule is answered from
+///   state, and state moves between a body's arrival and its application.
+/// - `nullifier_spent` — a cross-block double-spend. Reachable, and it is checked
+///   only in the state funnel, never by the arrival-time body validation, so this is
+///   the one refusal class no earlier gate can pre-empt.
+/// - `persist_io` — the block-log append failed. This is #104's shape: a durable
+///   chain that has quietly stopped being durable.
+/// - `internal` — every remaining [`crate::NodeError`], each of which means an
+///   invariant this node believes cannot fire has fired. Grouped rather than
+///   wildcarded: the classifier matches the enum exhaustively, so a new variant
+///   breaks the build instead of landing here silently.
+pub const BODY_REFUSAL_REASONS: [&str; 5] =
+    ["not_extending_tip", "bad_body", "nullifier_spent", "persist_io", "internal"];
+
 /// The node's accumulated metric state. Owned by the node adapter (which is where
 /// the events happen) and rendered on demand.
 #[derive(Clone, Debug)]
@@ -303,6 +334,9 @@ pub struct Metrics {
     regime_ms: BTreeMap<&'static str, u64>,
     // ---- state lag (issue #130 (a)) ----------------------------------------
     lag_refusals: BTreeMap<&'static str, Counter>,
+    // ---- body-application refusals (issue #130 (b)) ------------------------
+    body_refusals: BTreeMap<&'static str, Counter>,
+    body_refusal_last_height: Option<u64>,
     // ---- state rewinds (issue #162) ----------------------------------------
     state_rewinds: Counter,
     state_rewind_blocks: Counter,
@@ -333,8 +367,14 @@ impl Metrics {
         for d in LAG_REFUSAL_DUTIES {
             lag_refusals.insert(d, Counter::default());
         }
+        let mut body_refusals = BTreeMap::new();
+        for r in BODY_REFUSAL_REASONS {
+            body_refusals.insert(r, Counter::default());
+        }
         Self {
             lag_refusals,
+            body_refusals,
+            body_refusal_last_height: None,
             rounds_total,
             votes_total,
             signer_signed: BTreeMap::new(),
@@ -409,6 +449,45 @@ impl Metrics {
     /// How many times `duty` was refused for state lag.
     pub fn lag_refusals(&self, duty: &str) -> u64 {
         self.lag_refusals.get(duty).map(|c| c.get()).unwrap_or(0)
+    }
+
+    /// Record one body the state machine refused at the application funnel, and the
+    /// height it was refused at (issue #130 (b)).
+    ///
+    /// It lives here for the same reason [`Self::observe_lag_refusal`] does: the
+    /// events happen at the adapter, the registry is rendered here, and a second
+    /// counter ledger beside this one is the shape this repo has ruled against.
+    ///
+    /// **The height is kept as well as the count**, and that is the whole of what
+    /// makes this readable off one telemetry line. A cumulative total answers *how
+    /// many*; it cannot answer *are they still arriving*, which is the question an
+    /// operator actually has — and on this line there is no previous sample to
+    /// difference against and no clock to lean on (genesis is stamped `timestamp = 0`
+    /// for a reproducible genesis hash, so #106 already recorded that wall-clock
+    /// freshness is unusable here). Chain height is the one monotone quantity that
+    /// *is* on the line, twice (`tip=` / `stip=`), so "the last refusal was at height
+    /// H" is a self-contained answer: H next to `stip=` is happening now, H far below
+    /// it is a burst that is over.
+    pub fn observe_body_refusal(&mut self, reason: &'static str, height: u64) {
+        if let Some(c) = self.body_refusals.get_mut(reason) {
+            c.inc();
+        }
+        self.body_refusal_last_height = Some(height);
+    }
+
+    /// How many bodies were refused for `reason`.
+    pub fn body_refusals(&self, reason: &str) -> u64 {
+        self.body_refusals.get(reason).map(|c| c.get()).unwrap_or(0)
+    }
+
+    /// Bodies refused at the application funnel for any reason.
+    pub fn body_refusals_total(&self) -> u64 {
+        self.body_refusals.values().map(|c| c.get()).sum()
+    }
+
+    /// The height of the most recently refused body, or `None` if none has been.
+    pub fn body_refusal_last_height(&self) -> Option<u64> {
+        self.body_refusal_last_height
     }
 
     /// Record one state-machine rewind onto the main chain, and what it cost in
@@ -671,6 +750,23 @@ Every series exists from the first scrape.\n\
         o.push_str(&format!(
             "qumbra_state_lag_refusals_total{{duty=\"{d}\"}} {}\n",
             m.lag_refusals(d)
+        ));
+    }
+
+    // ---- issue #130 (b): bodies refused at the application funnel -------------
+    o.push_str(
+        "# HELP qumbra_body_apply_refused_total Block bodies the state machine refused at the \
+application funnel, by reason (issue #130 (b)). This is the counter the `Err(_) => {}` arm did not \
+have: a dropped body was annotated as expected and left no trace anywhere. reason=\"not_extending_tip\" \
+and reason=\"internal\" are INVARIANT TRIPWIRES — the only production caller selects bodies by the \
+exact negation of the first, so either being nonzero is a defect in this node. The other three can \
+really happen. Cumulative since process start; every series exists from the first scrape.\n\
+# TYPE qumbra_body_apply_refused_total counter\n",
+    );
+    for r in BODY_REFUSAL_REASONS {
+        o.push_str(&format!(
+            "qumbra_body_apply_refused_total{{reason=\"{r}\"}} {}\n",
+            m.body_refusals(r)
         ));
     }
 
@@ -1144,6 +1240,61 @@ mod tests {
     /// **Cardinality 1, by construction.** The rejected alternative was an info
     /// metric carrying the identity as a label; this asserts we did not quietly
     /// grow one, on any of the three new families.
+    /// **Issue #130 (b) — every refusal reason is a series from the first scrape,
+    /// including the two that should never move.**
+    ///
+    /// The pre-declaration is not cosmetic here, and it is the reason the reason set
+    /// is a constant rather than whatever the classifier happened to emit: an alert
+    /// cannot be written against a counter that only appears the first time the
+    /// thing it watches happens, and `reason="not_extending_tip"` is precisely a
+    /// counter you want an alert on *before* it has ever been nonzero.
+    #[test]
+    fn every_body_refusal_reason_is_a_series_from_the_first_scrape() {
+        let mut m = Metrics::new();
+        let text = render(&m, &gauges());
+        assert!(text.contains("# TYPE qumbra_body_apply_refused_total counter"), "{text}");
+        for r in BODY_REFUSAL_REASONS {
+            assert!(
+                text.contains(&format!("qumbra_body_apply_refused_total{{reason=\"{r}\"}} 0\n")),
+                "{r} must exist at zero before it ever fires: {text}"
+            );
+        }
+        assert_eq!(m.body_refusals_total(), 0);
+        assert_eq!(m.body_refusal_last_height(), None);
+
+        // One refusal moves exactly one series, the total, and the height.
+        m.observe_body_refusal("nullifier_spent", 412);
+        let text = render(&m, &gauges());
+        assert!(
+            text.contains("qumbra_body_apply_refused_total{reason=\"nullifier_spent\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("qumbra_body_apply_refused_total{reason=\"not_extending_tip\"} 0\n"),
+            "the tripwire is untouched by an unrelated refusal: {text}"
+        );
+        assert_eq!(m.body_refusals_total(), 1);
+        assert_eq!(m.body_refusal_last_height(), Some(412));
+
+        // The height is the LAST refusal's, not the first's or the deepest's — the
+        // question it answers is "is this still happening", so it must track forward
+        // even when the new refusal is at a lower height than the previous one (which
+        // a rewind makes ordinary).
+        m.observe_body_refusal("bad_body", 9);
+        assert_eq!(m.body_refusals_total(), 2);
+        assert_eq!(m.body_refusal_last_height(), Some(9), "most recent, not highest");
+
+        // An undeclared reason creates no series — a scrape must not grow a label
+        // value nobody wrote an alert for. The height still moves, because a refusal
+        // still happened and `bdrop=` must not go quiet about it. The case is
+        // unreachable in production (`NodeError::refusal_reason` is exhaustive and
+        // test-locked against this same constant in `node.rs`); it is pinned here so
+        // the two halves of that answer are on the record rather than implied.
+        m.observe_body_refusal("invented", 1);
+        assert_eq!(m.body_refusals_total(), 2, "no undeclared series appears");
+        assert_eq!(m.body_refusal_last_height(), Some(1), "but the refusal is not hidden");
+    }
+
     #[test]
     fn identity_families_carry_no_labels() {
         let m = Metrics::new();
