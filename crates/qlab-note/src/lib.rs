@@ -15,6 +15,7 @@
 //! (`qlab_air::reference::keccak_f` + the `value‖rkm‖rho‖rseed` packing the
 //! circuit binds) — never forked. See `note::note_commitment`.
 
+pub mod compact;
 pub mod derive;
 pub mod hash;
 pub mod kem;

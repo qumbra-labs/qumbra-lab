@@ -26,193 +26,36 @@
 //! The per-output encoding is byte-identical to qlab-note's
 //! [`CompactEntry::to_bytes`] for the empty (v1) clue — asserted in tests — so
 //! this framing composes with the ratified wire rather than forking it.
+//!
+//! ## Where the group framing lives (issue #188 baton 1)
+//!
+//! The **per-tx group** framing (varints, entry, bundle, group) moved to
+//! [`qlab_note::compact`] and is re-exported here unchanged, so every existing
+//! path — including the golden vector below — reads exactly the bytes it always
+//! did. It had to move because `discovery-on-the-consensus-wire.md` D2 puts
+//! those exact bytes into the block-body preimage, and `qlab-devnet` (which owns
+//! the body) cannot depend on this crate: this crate depends on it. D2 forbids a
+//! second encoder, so the framing moved *down* rather than being duplicated —
+//! see that module's header for the full reasoning.
+//!
+//! What stays here is the **response wrapper** (`version ‖ n_blocks ‖ per-block
+//! height ‖ n_groups`), a serving envelope no block body commits to.
+//!
+//! 🔴 **`golden_bytes_lock_the_framing` is now a consensus lock, not a wire
+//! lock** (D2): changing those bytes changes `BlockBody::commitment()`.
 
-use qlab_note::kem::CT_LEN;
-use qlab_note::wire::{ClueSlot, CompactEntry, RecipientBundle};
+pub use qlab_note::compact::{
+    decode_group, encode_group, group_len, groups_eq, read_bundle, read_entry, read_group,
+    read_varint, write_bundle, write_entry, write_group, write_varint, CodecError, CompactGroup,
+};
 
 use crate::WIRE_VERSION;
-
-/// A decode error with a byte offset for diagnosis.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CodecError {
-    /// Ran out of bytes while reading `what`.
-    Truncated { what: &'static str },
-    /// A format version byte that this reference does not implement.
-    BadVersion { got: u8 },
-    /// A `clue_len` this v1 reference does not support (only 0 at launch).
-    UnsupportedClue { clue_len: u8 },
-    /// A varint that does not terminate within 10 bytes (u64 overflow guard).
-    VarintOverflow,
-    /// A varint that is not the shortest encoding of its value — e.g. `0x80 0x00`
-    /// for `0`. `len` is how many bytes the offending varint consumed.
-    ///
-    /// Two byte strings that decode to one value are a malleability vector the
-    /// moment these bytes enter a consensus commitment
-    /// (`discovery-on-the-consensus-wire.md` D6), so the decoder refuses them.
-    NonCanonicalVarint { len: usize },
-    /// Trailing bytes remained after a whole-buffer decode.
-    TrailingBytes { remaining: usize },
-}
-
-/// One transaction's compact group: its index within the block and the
-/// per-recipient bundles (each a shared ML-KEM ct + its output entries).
-///
-/// `Clone` only: `qlab_note::wire::RecipientBundle` derives `Clone` alone (it is
-/// ratified; we do not edit it), so structural `PartialEq`/`Debug` cannot be
-/// derived here. Field-wise comparison lives in tests (`bundle_eq`).
-#[derive(Clone)]
-pub struct CompactGroup {
-    pub tx_index: u64,
-    pub recipients: Vec<RecipientBundle>,
-}
 
 /// One block's compact groups (the unit `/v1/compact` streams).
 #[derive(Clone)]
 pub struct CompactBlock {
     pub height: u64,
     pub groups: Vec<CompactGroup>,
-}
-
-// ---- varint (unsigned LEB128) ------------------------------------------------
-
-/// Append `v` as unsigned LEB128 (little-endian base-128).
-pub fn write_varint(out: &mut Vec<u8>, mut v: u64) {
-    loop {
-        let byte = (v & 0x7f) as u8;
-        v >>= 7;
-        if v == 0 {
-            out.push(byte);
-            break;
-        }
-        out.push(byte | 0x80);
-    }
-}
-
-/// Read an unsigned LEB128 varint, advancing `pos`. Guards u64 overflow (≤10
-/// bytes) and rejects **non-canonical** encodings.
-///
-/// Canonical = the shortest encoding of the value. Equivalently: the terminating
-/// byte (the one without the continuation bit) is never `0x00` unless the whole
-/// encoding is the single byte `0x00`. A multi-byte encoding whose last group is
-/// zero is padded, and a padded encoding is a second byte string for a value that
-/// already has one — `0x80 0x00` and `0x00` both mean `0`.
-///
-/// That is harmless while nothing commits to these bytes and is a malleability
-/// vector the moment they enter a consensus commitment, which is why
-/// `discovery-on-the-consensus-wire.md` D6 requires the rejection **before** any
-/// preimage work. [`write_varint`] already emits only shortest encodings, so this
-/// tightens the decoder without moving a single byte the encoder produces.
-pub fn read_varint(b: &[u8], pos: &mut usize) -> Result<u64, CodecError> {
-    let start = *pos;
-    let mut result: u64 = 0;
-    let mut shift = 0u32;
-    loop {
-        let byte = *b.get(*pos).ok_or(CodecError::Truncated { what: "varint" })?;
-        *pos += 1;
-        if shift >= 64 || (shift == 63 && byte > 1) {
-            return Err(CodecError::VarintOverflow);
-        }
-        result |= ((byte & 0x7f) as u64) << shift;
-        if byte & 0x80 == 0 {
-            let len = *pos - start;
-            // A terminating 0x00 after at least one continuation byte means the
-            // top group is zero: a longer encoding of a value that fits in fewer
-            // bytes. `0x00` alone is the canonical encoding of 0 and is fine.
-            if len > 1 && byte == 0 {
-                return Err(CodecError::NonCanonicalVarint { len });
-            }
-            return Ok(result);
-        }
-        shift += 7;
-    }
-}
-
-// ---- per-output entry --------------------------------------------------------
-
-/// Encode one compact entry per §2: `cm(32) ‖ tag(8) ‖ clue_len(u8) ‖ clue`.
-/// For the launch (empty) clue this is exactly `cm ‖ tag ‖ 0x00`.
-fn write_entry(out: &mut Vec<u8>, e: &CompactEntry) {
-    out.extend_from_slice(&e.cm);
-    out.extend_from_slice(&e.tag);
-    match e.clue {
-        // clue_len = 0, no clue bytes.
-        ClueSlot::Empty => out.push(0),
-    }
-}
-
-fn read_entry(b: &[u8], pos: &mut usize) -> Result<CompactEntry, CodecError> {
-    let end = *pos + 32 + 8 + 1;
-    if b.len() < end {
-        return Err(CodecError::Truncated { what: "compact entry" });
-    }
-    let mut cm = [0u8; 32];
-    cm.copy_from_slice(&b[*pos..*pos + 32]);
-    let mut tag = [0u8; 8];
-    tag.copy_from_slice(&b[*pos + 32..*pos + 40]);
-    let clue_len = b[*pos + 40];
-    *pos = end;
-    if clue_len != 0 {
-        // v1 reserves the byte but activates no clue payload (Decision 2).
-        return Err(CodecError::UnsupportedClue { clue_len });
-    }
-    Ok(CompactEntry {
-        cm,
-        tag,
-        clue: ClueSlot::Empty,
-    })
-}
-
-// ---- recipient bundle --------------------------------------------------------
-
-fn write_bundle(out: &mut Vec<u8>, r: &RecipientBundle) {
-    out.extend_from_slice(&r.ct);
-    debug_assert!(r.entries.len() <= u8::MAX as usize, "n_outputs is a u8");
-    out.push(r.entries.len() as u8);
-    for e in &r.entries {
-        write_entry(out, e);
-    }
-}
-
-fn read_bundle(b: &[u8], pos: &mut usize) -> Result<RecipientBundle, CodecError> {
-    if b.len() < *pos + CT_LEN {
-        return Err(CodecError::Truncated { what: "ml_kem_ct" });
-    }
-    let mut ct = [0u8; CT_LEN];
-    ct.copy_from_slice(&b[*pos..*pos + CT_LEN]);
-    *pos += CT_LEN;
-    let n_outputs = *b.get(*pos).ok_or(CodecError::Truncated { what: "n_outputs" })?;
-    *pos += 1;
-    let mut entries = Vec::with_capacity(n_outputs as usize);
-    for _ in 0..n_outputs {
-        entries.push(read_entry(b, pos)?);
-    }
-    Ok(RecipientBundle { ct, entries })
-}
-
-// ---- compact group -----------------------------------------------------------
-
-/// Encode one per-tx compact group (no leading version byte — groups nest inside
-/// a versioned response).
-pub fn write_group(out: &mut Vec<u8>, g: &CompactGroup) {
-    write_varint(out, g.tx_index);
-    debug_assert!(g.recipients.len() <= u8::MAX as usize, "n_recipients is a u8");
-    out.push(g.recipients.len() as u8);
-    for r in &g.recipients {
-        write_bundle(out, r);
-    }
-}
-
-fn read_group(b: &[u8], pos: &mut usize) -> Result<CompactGroup, CodecError> {
-    let tx_index = read_varint(b, pos)?;
-    let n_recipients = *b
-        .get(*pos)
-        .ok_or(CodecError::Truncated { what: "n_recipients" })?;
-    *pos += 1;
-    let mut recipients = Vec::with_capacity(n_recipients as usize);
-    for _ in 0..n_recipients {
-        recipients.push(read_bundle(b, pos)?);
-    }
-    Ok(CompactGroup { tx_index, recipients })
 }
 
 // ---- /v1/compact response ----------------------------------------------------
@@ -317,19 +160,12 @@ pub fn decode_full_response(b: &[u8]) -> Result<Vec<Vec<Vec<u8>>>, CodecError> {
     Ok(out)
 }
 
-// ---- byte accounting ---------------------------------------------------------
-
-/// Exact serialized bytes of one compact group (for the measured report).
-pub fn group_len(g: &CompactGroup) -> usize {
-    let mut out = Vec::new();
-    write_group(&mut out, g);
-    out.len()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use qlab_air::reference::keccak_f;
+    use qlab_note::kem::CT_LEN;
+    use qlab_note::wire::{ClueSlot, CompactEntry, RecipientBundle};
 
     // Field-wise bundle equality (RecipientBundle derives Clone only).
     fn bundle_eq(a: &RecipientBundle, b: &RecipientBundle) -> bool {
