@@ -1174,6 +1174,7 @@ dependencies = [
  "qlab-p2p",
  "qlab-pow",
  "qlab-wallet",
+ "rand",
  "serde",
  "tiny_http",
  "toml",

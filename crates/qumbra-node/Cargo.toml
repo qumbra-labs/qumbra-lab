@@ -109,3 +109,5 @@ qlab-note = { path = "../qlab-note" }
 # `qlab_node::compact_response`; a test that decoded with anything other than the
 # reference decoder would not be testing the wire.
 qlab-cbserver = { path = "../qlab-cbserver" }
+# CSPRNG for the acceptance test's ML-KEM keypairs and note material (workspace rev).
+rand = "0.10"

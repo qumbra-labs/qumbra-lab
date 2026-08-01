@@ -4433,6 +4433,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// 🔴 **Issue #188 baton 2, scope item 2: the deployed binary serves it.**
+    ///
+    /// Not "the endpoint returns bytes" — this asserts the composition that did not
+    /// exist. Before this the binary bound no discovery listener at all and
+    /// composed no `NodeRpc`, so a `/v1/compact` reading committed bytes would have
+    /// been a fix inside a type nothing constructs.
+    ///
+    /// The chain here is coinbase-only (`rig` mines with `KeccakPow`), so every
+    /// served block carries zero groups — which is the *correct* answer under D5
+    /// and is exactly what the endpoint must say about a T0-shaped net. The
+    /// recipient-finds-its-output half needs a transaction and lives in
+    /// `tests/discovery_serving.rs`.
+    #[test]
+    fn discovery_endpoint_serves_the_binarys_own_chain_over_a_real_socket() {
+        let (config, genesis, base) = rig("discovery-endpoint", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        for _ in 0..3 {
+            assert!(node.try_mine());
+        }
+
+        let bound = node.start_discovery_endpoint("127.0.0.1:0").expect("bind ephemeral");
+        assert_eq!(node.discovery_addr(), Some(bound));
+
+        let body = {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(bound).unwrap();
+            write!(
+                s,
+                "GET /v1/compact?from=0&to=99 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut raw = Vec::new();
+            s.read_to_end(&mut raw).unwrap();
+            raw
+        };
+        let head = String::from_utf8_lossy(&body[..body.windows(4).position(|w| w == b"\r\n\r\n").unwrap()]).to_string();
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let sep = body.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let blocks = qlab_cbserver::codec::decode_compact_response(&body[sep..])
+            .expect("the served bytes are the ratified compact wire");
+        assert_eq!(blocks.len(), 4, "genesis + 3 mined blocks");
+        assert_eq!(blocks[3].height, node.tip_height());
+        assert!(
+            blocks.iter().all(|b| b.groups.is_empty()),
+            "a coinbase-only chain carries no discovery groups — D5, and the honest answer"
+        );
+
+        // The projection follows the chain on the run loop's own cadence: one more
+        // block, one more served height, no restart and no request-time chain walk.
+        assert!(node.try_mine());
+        assert!(node.refresh_discovery(), "a moved tip re-projects");
+        assert!(!node.refresh_discovery(), "an unchanged tip does no work");
+        assert_eq!(node.discovery_view().tip_height(), Some(node.tip_height()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// The scrape endpoint, end to end over a real socket, serving live node state.
     #[test]
     fn metrics_endpoint_serves_live_state_and_is_off_by_default() {
