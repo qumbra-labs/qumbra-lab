@@ -102,7 +102,7 @@ differ on any one of these axes are two different experiments.
 The harness can model **a node with no advertised address**, which until 2026-07-30
 it could not — and that gap was not cosmetic. `entrypoint.sh` has always written
 `advertise_addr`; `/opt/qumbra/node.toml` on all four T0 hosts has **never** carried
-it. The field arrived with issue [#86](https://github.com/lai3d/qumbra-lab/issues/86)
+it. The field arrived with issue [#86](https://github.com/qumbra-labs/qumbra-lab/issues/86)
 on 2026-07-28, the hosts were provisioned 2026-07-26, and **rolling the image does
 not regenerate `node.toml`** (recorded as a dated correction in `qumbra-deploy`
 OPERATOR §3). So every local run before this one was structurally incapable of
@@ -329,7 +329,7 @@ report — never patch-and-continue.
 
 ## Latency injection (`soak.sh netem`)
 
-Added for [#107](https://github.com/lai3d/qumbra-lab/issues/107) step 1b, where a
+Added for [#107](https://github.com/qumbra-labs/qumbra-lab/issues/107) step 1b, where a
 loop-period regression visible on the WAN net did not reproduce locally and
 **latency was the only remaining difference** — a question this harness could not
 express. Run these against a net that is already up; no restart is needed.

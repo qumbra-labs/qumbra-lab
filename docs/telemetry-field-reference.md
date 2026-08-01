@@ -389,7 +389,7 @@ address book (§17).
 
 Beyond that, **what the number should be on an N-host mesh, and whether a peer
 can remain counted after its connection is gone, are open questions in
-[`issue #172`](https://github.com/lai3d/qumbra-lab/issues/172)** — filed on
+[`issue #172`](https://github.com/qumbra-labs/qumbra-lab/issues/172)** — filed on
 2026-08-01 after a restarted host read `peers=6` for eight hours while its three
 untouched peers read `peers=8`. #172 states the two candidate causes have
 **opposite fixes**, and that it does not yet know which of 6 or 8 is the correct

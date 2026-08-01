@@ -81,7 +81,7 @@ composability gap. **Recommended follow-up:** extract a shared `qlab-consensus`
 library so `qlab-bench` and any consumer share one definition.
 
 **F2 — `build_bucket` fabricated its own membership tree. RESOLVED
-([issue #39](https://github.com/lai3d/qumbra-lab/issues/39)).** It used to derive
+([issue #39](https://github.com/qumbra-labs/qumbra-lab/issues/39)).** It used to derive
 depth-32 Merkle siblings pseudo-randomly and assert a single self-consistent
 *invented* root, accepting no caller witness — so the proof's `anchor` was not
 the live commitment-tree root. Now `build_bucket_with_witnesses` takes a

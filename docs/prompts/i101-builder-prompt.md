@@ -2,7 +2,7 @@
 
 ## 你的任务书
 
-https://github.com/lai3d/qumbra-lab/issues/101
+https://github.com/qumbra-labs/qumbra-lab/issues/101
 
 **读 issue 正文，再读 coordinator 的两条评论**：一条是任务书（尺寸和依赖），一条是三条 STOP-POINT 裁定。**三条裁定是前置条件，不是建议**——它们已经裁完了，你不需要等，但如果你认为其中哪条错了，**在动手之前**发在 issue 上。第 2 条（`rseed`）是设计文档没写、由我们自己定的，**它最可能是错的**。
 
@@ -58,7 +58,7 @@ issue 标题读起来像"忘了往树里 append 一片叶子"。**不是。**
 
 1. **不要部署。** T0 内网四台在 `t0-wan-2` 跑着。块格式改动**不能**靠逐台换二进制滚上去——那要走 #74 的 halt-height 升级机制（PR #76 实现了，**从没演练过**）。**部署是另一件事，不归这根棒。** 你在本地新链上建和测。
 2. **不碰 `qumbra-design`。** 裁定 1 和 2 是共识规则，该进 `transaction-model-and-anonymity-set.md` + `-zh`——**由 coordinator 在你的 PR 合并后落地**，理由是"先验证再提交"：万一规则实现不了，今天写进去的设计文档就会以权威口吻错一次。你若认为措辞该怎么写，写进 PR 正文。
-3. **[#102](https://github.com/lai3d/qumbra-lab/issues/102) 不在范围内。** `submit_tx` 里那个硬编码的 `vec![]` 今天是够不着的接缝；**你这根棒落地之后它会变成活的正确性漏洞**——那是紧接着的下一根棒，不是这一根。看见了就报，别顺手修。
+3. **[#102](https://github.com/qumbra-labs/qumbra-lab/issues/102) 不在范围内。** `submit_tx` 里那个硬编码的 `vec![]` 今天是够不着的接缝；**你这根棒落地之后它会变成活的正确性漏洞**——那是紧接着的下一根棒，不是这一根。看见了就报，别顺手修。
 
 ## 不要部署
 

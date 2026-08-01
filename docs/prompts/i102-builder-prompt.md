@@ -2,7 +2,7 @@
 
 ## 你的任务书
 
-https://github.com/lai3d/qumbra-lab/issues/102
+https://github.com/qumbra-labs/qumbra-lab/issues/102
 
 读 issue 正文，然后读 **coordinator 的任务书评论**（最新那条）—— 你的范围、四个要带理由表态的点、STOP-POINT、验收判据。
 

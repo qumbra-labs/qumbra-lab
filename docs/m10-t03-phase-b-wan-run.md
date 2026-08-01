@@ -14,7 +14,7 @@ Scope label: **WAN**. Four hosts, three continents, real intercontinental latenc
 |---|---|
 | Topology | 4 × AWS `t4g.small` (Graviton, arm64, 2 vCPU / 2 GB), Debian 12 |
 | Regions | `us-east-1` · `eu-west-1` · `ap-southeast-1` · `ap-northeast-1` |
-| Provisioning | Terraform, [`qumbra-deploy`](https://github.com/lai3d/qumbra-deploy) (private), one state, four aliased providers |
+| Provisioning | Terraform, [`qumbra-deploy`](https://github.com/qumbra-labs/qumbra-deploy) (private), one state, four aliased providers |
 | Image | `ghcr.io/lai3d/qumbra-node@sha256:7e4080f3…e60fdea` — **digest-pinned, identical on all four**; GHCR package public, so no host holds a registry credential |
 | Genesis hash | `4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3`, pinned and verified on every node |
 | Committee | N=21 ML-DSA keys split **6/5/5/5** — **no node holds the quorum of 15** |
@@ -35,7 +35,7 @@ The bar is **≥ 48 h continuous**, and it is timed from the **net**, not from t
 
 This pack is built from the **nodes' own container logs**, not from the 5-minute SSH sampler. That is a deliberate choice and it was load-bearing: the sampler went blind for **10.15 hours** mid-run (see "Observation gaps"), while the container logs did not miss a line.
 
-The reasoning is written up as an adopted design doc — [`qumbra-design/observability-and-evidence.md`](https://github.com/lai3d/qumbra-design/blob/main/observability-and-evidence.md) — whose rule is: *evidence is the node's own durable, archived output; a dashboard is never the evidence.*
+The reasoning is written up as an adopted design doc — [`qumbra-design/observability-and-evidence.md`](https://github.com/qumbra-labs/qumbra-design/blob/main/observability-and-evidence.md) — whose rule is: *evidence is the node's own durable, archived output; a dashboard is never the evidence.*
 
 Two details make the archive usable, and both are easy to omit:
 
@@ -59,7 +59,7 @@ The tip reorgs are depth-1 and occur in the run's first minutes, before finality
 
 ## Distributed finality across three continents, with no node holding a quorum
 
-The property [issue #70](https://github.com/lai3d/qumbra-lab/issues/70) fixed and [Phase B-lite](m10-t03-phase-b-lite-run.md) could only show on localhost: with 21 keys split 6/5/5/5, **finality forms and advances at 68–223 ms RTT** for two days. `final` reached 2352 identically on all four.
+The property [issue #70](https://github.com/qumbra-labs/qumbra-lab/issues/70) fixed and [Phase B-lite](m10-t03-phase-b-lite-run.md) could only show on localhost: with 21 keys split 6/5/5/5, **finality forms and advances at 68–223 ms RTT** for two days. `final` reached 2352 identically on all four.
 
 ## Two epoch boundaries at real WAN pacing
 
@@ -123,11 +123,11 @@ against `DEGRADED_MODE_LAG_BLOCKS = 16`. A stall of 16 is two missed checkpoints
 
 **Whether 16 is mis-set or the committee genuinely wobbles under real RTT cannot be answered from this run**, and the reason is worth stating plainly: **a node emits nothing when it misses a checkpoint.** Across the full 48 h node0 produced *ten* non-telemetry log lines, all at startup. No round number, no vote count, no timeout reason, no absentee list. The `stall` counter climbs from 8 to 40 and falls back, and the interval between is opaque.
 
-That gap is [issue #87](https://github.com/lai3d/qumbra-lab/issues/87). It is not cosmetic — it blocks a FROZEN-set decision, and `DEGRADED_MODE_LAG_BLOCKS` must not be touched until it is closed.
+That gap is [issue #87](https://github.com/qumbra-labs/qumbra-lab/issues/87). It is not cosmetic — it blocks a FROZEN-set decision, and `DEGRADED_MODE_LAG_BLOCKS` must not be touched until it is closed.
 
 ### A cross-check that did hold
 
-`regime = Degraded` and `stall > 16` agree on **14,647 of 14,659** archived samples across all four nodes. The twelve exceptions are all the same thing: the **genesis head** — `tip=0`, `final=-`, nothing finalized yet — three samples per node inside the run's first 60 seconds. That is [issue #73](https://github.com/lai3d/qumbra-lab/issues/73), and this run quantifies it. **After the first finalization there are zero disagreements.**
+`regime = Degraded` and `stall > 16` agree on **14,647 of 14,659** archived samples across all four nodes. The twelve exceptions are all the same thing: the **genesis head** — `tip=0`, `final=-`, nothing finalized yet — three samples per node inside the run's first 60 seconds. That is [issue #73](https://github.com/qumbra-labs/qumbra-lab/issues/73), and this run quantifies it. **After the first finalization there are zero disagreements.**
 
 ### Cross-node finality agreement — what is and is not provable here
 
@@ -135,7 +135,7 @@ The four nodes end at the same `final` (2352), and no node's `final` ever decrea
 
 That is the signature of sampling phase against jump-wise advance, not of divergence: telemetry is emitted every ~47 s per node with independent phase, finality moves in steps of 8–40 blocks, so two nodes sampled a cadence apart will straddle a step. Tip spread behaves the same way — greater than 3 blocks on 4.9 % of aligned samples, maximum 8.
 
-**The honest limit: telemetry carries no checkpoint identity**, so this pack can show that no node's finality height regressed and that the four always reconverge — it **cannot** show that the four finalized the *same* checkpoints. Height agreement is not identity agreement. That is [issue #84](https://github.com/lai3d/qumbra-lab/issues/84), and it is a limitation of the evidence surface, not a finding about the net.
+**The honest limit: telemetry carries no checkpoint identity**, so this pack can show that no node's finality height regressed and that the four always reconverge — it **cannot** show that the four finalized the *same* checkpoints. Height agreement is not identity agreement. That is [issue #84](https://github.com/qumbra-labs/qumbra-lab/issues/84), and it is a limitation of the evidence surface, not a finding about the net.
 
 ## Observation gaps — disclosed, and why they cost nothing
 
@@ -157,7 +157,7 @@ The fix and the lessons are recorded in `qumbra-deploy/OPERATOR.md` §3/§6: `ad
 ## What this run does NOT claim
 
 - **The four scenario drills are not in this pack**: late-joiner sync, mining-node restart, 2+2 partition → heal, committee stall → recovery. They are owed and they are **deliberately not run yet**.
-- **The reason is the image, not the schedule.** These hosts carry an image built 2026-07-26. Merged to `main` since: [#79](https://github.com/lai3d/qumbra-lab/pull/79) (block bodies bound to their header — a *consensus-correctness* fix), [#82](https://github.com/lai3d/qumbra-lab/pull/82) (D3 leaf-digest binding), [#86](https://github.com/lai3d/qumbra-lab/pull/86) (M11 peer discovery). Drills validate the design *as it stands*, so drill evidence taken on this image would describe a superseded build and would have to be re-run.
+- **The reason is the image, not the schedule.** These hosts carry an image built 2026-07-26. Merged to `main` since: [#79](https://github.com/qumbra-labs/qumbra-lab/pull/79) (block bodies bound to their header — a *consensus-correctness* fix), [#82](https://github.com/qumbra-labs/qumbra-lab/pull/82) (D3 leaf-digest binding), [#86](https://github.com/qumbra-labs/qumbra-lab/pull/86) (M11 peer discovery). Drills validate the design *as it stands*, so drill evidence taken on this image would describe a superseded build and would have to be re-run.
 - **The continuity claim is unaffected by that, and the distinction matters.** "A real build ran unattended for ≥ 48 h with zero restarts and zero finality reversions" does not weaken when the build advances. Drills that validate present design do not have that property.
 - **One of the four is not runnable today at all** — committee stall → recovery, for the reason in the finality section: the node is silent on exactly the quantity being measured.
 - No claim is made about NAT'd or adversarial participants; every host here is one we control, with a public IP and an open inbound P2P port.
@@ -175,7 +175,7 @@ Sequencing decided 2026-07-28 (`observability-and-evidence.md` §5.1, `OPERATOR.
 
 ## Owed after this pack
 
-- [#87](https://github.com/lai3d/qumbra-lab/issues/87) — committee round diagnostics + structured metrics; blocks the `DEGRADED_MODE_LAG_BLOCKS` question.
+- [#87](https://github.com/qumbra-labs/qumbra-lab/issues/87) — committee round diagnostics + structured metrics; blocks the `DEGRADED_MODE_LAG_BLOCKS` question.
 - The four drills, on the post-redeploy image.
 - `testnet-plan` M10/M11 estimate-vs-actual; the ROADMAP M10 row.
-- [#73](https://github.com/lai3d/qumbra-lab/issues/73) — genesis-head telemetry, now quantified above at exactly 3 samples per node.
+- [#73](https://github.com/qumbra-labs/qumbra-lab/issues/73) — genesis-head telemetry, now quantified above at exactly 3 samples per node.

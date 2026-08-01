@@ -2,7 +2,7 @@
 
 > [English](m10-epoch-boundary-run.md)
 
-> **范围标签:LOCALHOST/DOCKER。不作任何 WAN 延迟层面的主张。** 这次运行的存在只为跨过一条特定的线——**1,152 块的委员会 epoch 边界**——并把其余变量尽可能按住不动。WAN 侧的测量(真实 RTT、WAN 步调下的 LWMA、≥48 小时)属于 Phase B-WAN([#64](https://github.com/lai3d/qumbra-lab/issues/64)),此处不主张。
+> **范围标签:LOCALHOST/DOCKER。不作任何 WAN 延迟层面的主张。** 这次运行的存在只为跨过一条特定的线——**1,152 块的委员会 epoch 边界**——并把其余变量尽可能按住不动。WAN 侧的测量(真实 RTT、WAN 步调下的 LWMA、≥48 小时)属于 Phase B-WAN([#64](https://github.com/qumbra-labs/qumbra-lab/issues/64)),此处不主张。
 
 > **⚠️ 出处警示,放在最前面,因为它是这次运行最弱的地方。** 本次浸泡由 **coordinator** 启动、采样并撰写——而它同时是将要对结果下判决的那个角色。**这正是 `qumbra-deploy/OPERATOR.md` R1 为 T-ops 设立的独立性规矩所要防止的情形。** 它起于 2026-07-26 00:24,早于 T-ops 角色存在,事后也未移交。**请把它的结论读作"协调者自产",而非独立验证。** Phase B-WAN 那次运行不存在这个缺陷。
 

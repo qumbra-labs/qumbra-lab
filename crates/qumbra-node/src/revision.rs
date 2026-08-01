@@ -81,7 +81,7 @@
 //! however much it looks like extra safety.
 //!
 //! (Coordinator decision, 2026-07-26, issue #74 review; carried into
-//! [#81](https://github.com/lai3d/qumbra-lab/issues/81), which makes the resume gate
+//! [#81](https://github.com/qumbra-labs/qumbra-lab/issues/81), which makes the resume gate
 //! key on digest equality — a change that depends on exactly this property, because
 //! it is what lets an ordinary bug-fix release start without a declared transition.)
 //!

@@ -2,7 +2,7 @@
 
 *EN (authoritative on technical detail) · 中文: [`m11-faucet-run-zh.md`](m11-faucet-run-zh.md)*
 
-Issue [#100](https://github.com/lai3d/qumbra-lab/issues/100). Crate `qlab-faucet` (the lab's 15th).
+Issue [#100](https://github.com/qumbra-labs/qumbra-lab/issues/100). Crate `qlab-faucet` (the lab's 15th).
 
 ---
 

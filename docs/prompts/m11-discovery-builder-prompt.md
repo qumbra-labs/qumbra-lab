@@ -3,7 +3,7 @@
 ## 你的任务书
 
 lab issue **#83** 的正文是**唯一权威范围**:
-https://github.com/lai3d/qumbra-lab/issues/83
+https://github.com/qumbra-labs/qumbra-lab/issues/83
 
 先完整读它。里面有:Larry 关于 NAT 的决定(以及它对设计的强制后果)、**已经存在的那一半机制**(带 file:line,别重造)、范围 7 项、六条钉死项 S1–S6、停车点、验收。
 
@@ -44,7 +44,7 @@ PR #76 和 PR #79 都在改 `qlab-p2p/src/node.rs`。它们的 hunk 在约 `@196
 
 2. **REPEAT-GOTCHA(本项目已有两次实测事故)**:曾有 builder subagent 误改**主工作树**。**每一批编辑前先确认 cwd 是你自己的 worktree**;派任何 subagent 都要把这条警告原样转发进它的 prompt。
 
-3. **🔴 机器占用中,重活要问。** 一个 4 节点 docker 浸泡 + 三根棒排在 rig 上。**定向测试随便跑**(`-p qlab-p2p` 之类,不吃内存);**全量 `cargo test --release --workspace` 开跑前必须问 coordinator**。rig 状态公布在 [#64](https://github.com/lai3d/qumbra-lab/issues/64) 的置顶评论上(原地编辑,看时间戳不看记忆),**去读那条,不要来问**。
+3. **🔴 机器占用中,重活要问。** 一个 4 节点 docker 浸泡 + 三根棒排在 rig 上。**定向测试随便跑**(`-p qlab-p2p` 之类,不吃内存);**全量 `cargo test --release --workspace` 开跑前必须问 coordinator**。rig 状态公布在 [#64](https://github.com/qumbra-labs/qumbra-lab/issues/64) 的置顶评论上(原地编辑,看时间戳不看记忆),**去读那条,不要来问**。
 
 4. **分阶段提交**。本项目 builder 多次在 usage limit 中途被打断——**未提交的大改动 = 丢失的工作**。
 

@@ -44,7 +44,7 @@ RandomX-on-Linux, genesis rehearsal, late-joiner sync, restart=replay, and the
 PoW + LWMA liveness soak. Evidence trace:
 `docs/m10-t03-phase-b-lite-finding-finality.log`.
 
-[issue #70]: https://github.com/lai3d/qumbra-lab/issues/70
+[issue #70]: https://github.com/qumbra-labs/qumbra-lab/issues/70
 
 ## Precondition item 0 — wall-clock header timestamps ✓
 

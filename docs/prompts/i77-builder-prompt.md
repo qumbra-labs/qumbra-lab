@@ -3,7 +3,7 @@
 ## 你的任务书
 
 issue #77 的**正文**(缺口分析 + 修法)加上**两条** coordinator 评论——**"Task-book — bind block bodies to their header (2026-07-26)"** 和其后的 **"Addendum — four corrections to the task-book, before dispatch"**——共同构成权威范围。**两者冲突时以 Addendum 为准**:
-https://github.com/lai3d/qumbra-lab/issues/77
+https://github.com/qumbra-labs/qumbra-lab/issues/77
 
 正文是 coordinator **今天亲自核实过**的(不是转述报告):`validate_body` 只收 `&BlockBody`、结构上做不了这个检查;`ingest_block` 和 `apply_block` 都同时握着头和体、都没比对;全仓唯一一处断言在测试夹具里。**seam 的权威清单是任务书评论里那张对照表(含 file:line)加上 Addendum A2 的回放路径——正文里任何"几处"的说法都不作数**(A3)。
 
