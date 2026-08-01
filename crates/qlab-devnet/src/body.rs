@@ -284,6 +284,19 @@ pub enum BodyError {
     /// or (on the serving side) a non-canonical varint. `err` is the codec's own
     /// verdict, kept rather than flattened.
     DiscoveryMalformed { index: usize, err: CodecError },
+    /// The tx at `index` carries discovery bytes that decode but do **not
+    /// re-encode to themselves** — `discovery-on-the-consensus-wire.md` §4 rule
+    /// 3 stated literally.
+    ///
+    /// **Unreachable today, and deliberately kept anyway.** With `tx_index`
+    /// excluded, every field in the committed region is fixed-width or
+    /// single-valued, so decode is injective and this cannot fire. It is a
+    /// separate answer rather than a fabricated `DiscoveryMalformed` because
+    /// §7's first open item — clue activation — puts a variable-length field
+    /// back inside these bytes, and on that day the difference between "these
+    /// bytes are not a group" and "these bytes are a second spelling of a group"
+    /// is the difference this baton exists to preserve.
+    DiscoveryNotCanonical { index: usize },
     /// The tx at `index` has a well-formed discovery group that describes
     /// different output commitments than the transaction declares —
     /// `discovery-on-the-consensus-wire.md` D4.
@@ -449,14 +462,8 @@ pub fn placeholder_discovery(commitments: &[Hash32]) -> Vec<u8> {
 pub fn check_tx_discovery(index: usize, tx: &TxEntry) -> Result<(), BodyError> {
     let recipients = tx.discovery_group(index)?;
 
-    let reencoded = encode_group_contents(&recipients);
-    if reencoded != tx.discovery {
-        return Err(BodyError::DiscoveryMalformed {
-            index,
-            err: CodecError::TrailingBytes {
-                remaining: tx.discovery.len().saturating_sub(reencoded.len()),
-            },
-        });
+    if encode_group_contents(&recipients) != tx.discovery {
+        return Err(BodyError::DiscoveryNotCanonical { index });
     }
 
     let described = contents_commitments(&recipients);

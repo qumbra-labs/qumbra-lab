@@ -1289,6 +1289,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // as the fee check — this node's chain position cannot change the
             // answer, which is what keeps them out of #134's amnesty.
             | BodyError::DiscoveryMalformed { .. }
+            | BodyError::DiscoveryNotCanonical { .. }
             | BodyError::DiscoveryDoesNotBind { .. } => BodyFault::Intrinsic("bad body"),
             // The one positional check (#134). `is_valid_anchor` answers from THIS
             // node's root index, finalized head and applied tip; a joiner replaying
