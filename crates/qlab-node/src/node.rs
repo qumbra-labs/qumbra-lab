@@ -20,7 +20,7 @@
 //! proof-checked; replay of already-accepted log blocks trusts the log and
 //! re-applies deterministically (double-spends would still surface).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +38,127 @@ use crate::store::{
 
 /// The default all-in-memory node composition (with optional disk durability).
 pub type MemNode = Node<MemChainStore, MemNullifierStore, MemCommitmentStore>;
+
+/// **How many rewound blocks stay retrievable** (issue #198).
+///
+/// `8 × CHECKPOINT_CADENCE_BLOCKS`, the same figure and the same reasoning as
+/// `qlab_p2p::adapter::MAX_REWIND_DEPTH` — it cannot be *imported* from there
+/// (`qlab-p2p` depends on this crate, not the other way round), so it is restated
+/// with its derivation rather than aliased. A block more than a few cadences below
+/// the tip is finalized on a healthy net and [`Node::rewind_to`] refuses to cross
+/// the finalized head, so material below that depth can never be re-applied; ×8 is
+/// headroom for a stalled committee, the one regime in which a divergence can
+/// legitimately run deep.
+///
+/// **This is a serving budget, not a correctness bound.** Overflowing it costs a
+/// body some peer may have wanted; it cannot make this node wrong.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_RETAINED_BODIES: usize =
+    (8 * qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS) as usize;
+
+/// The byte budget for the same archive, matched to `qlab_p2p`'s
+/// `MAX_PENDING_BODY_BYTES` so the two body queues a node carries cannot be sized
+/// against different assumptions. Weight is the same crude sum the P2P side meters
+/// with (proof bytes + 32 per nullifier/commitment + per-tx overhead), not a
+/// serialization — this runs on a rewind and must not cost one.
+pub const MAX_RETAINED_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// **Blocks this node has APPLIED AT SOME POINT and still holds, whether or not
+/// they are in the applied chain right now** (issue #198).
+///
+/// `#182` gave the serving path one question — *have I applied this?* — and that
+/// was a faithful proxy for *do I have this?* on the day it landed. `#178` broke
+/// the equivalence four hours later: [`Node::rewind_to`] rebuilds the node from
+/// genesis over the retained ancestor path, so the undone suffix leaves the block
+/// store entirely. On 2026-08-01 the live net closed the loop that opens up
+/// (`#197`), and the answer taken is that **possession outlives application**.
+///
+/// This is where the possession lives. It is deliberately NOT the applied store:
+/// `ChainStore::contains` means *applied* to four separate callers — the duty
+/// gate's lag arithmetic, `missing_body_hashes`, `is_body_worth_holding`, and
+/// `on_block_announce`'s "we already have this" early return — and widening it
+/// would have a node that rewound past a block treat the re-announced body as
+/// redundant and drop it, which is the same deadlock one seam over.
+///
+/// Eviction is lowest-height-first, by a linear scan: `MAX_RETAINED_BODIES` is 64
+/// and an eviction happens only on a rewind, so an index would cost more to
+/// maintain than the scan costs to run.
+#[derive(Clone, Debug, Default)]
+struct RetainedBodies {
+    by_hash: HashMap<Hash32, StoredBlock>,
+    bytes: usize,
+}
+
+impl RetainedBodies {
+    fn get(&self, hash: &Hash32) -> Option<&StoredBlock> {
+        self.by_hash.get(hash)
+    }
+
+    fn len(&self) -> usize {
+        self.by_hash.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.by_hash.is_empty()
+    }
+
+    /// A block is back in the applied chain — the archive copy is now dead weight.
+    fn forget(&mut self, hash: &Hash32) {
+        if let Some(b) = self.by_hash.remove(hash) {
+            self.bytes = self.bytes.saturating_sub(block_weight(&b));
+        }
+    }
+
+    fn insert(&mut self, block: StoredBlock) {
+        let hash = block.header().header_hash();
+        let weight = block_weight(&block);
+        if let Some(old) = self.by_hash.insert(hash, block) {
+            self.bytes = self.bytes.saturating_sub(block_weight(&old));
+        }
+        self.bytes += weight;
+        self.evict();
+    }
+
+    /// Drop anything more than [`MAX_RETAINED_BODIES`] below `tip` — past that
+    /// depth `rewind_to` will refuse to go, so no peer can put the block back into
+    /// an applied chain and the bytes serve nobody.
+    fn prune_below(&mut self, tip: u64) {
+        let floor = tip.saturating_sub(MAX_RETAINED_BODIES as u64);
+        self.by_hash.retain(|_, b| {
+            let keep = b.header.height > floor;
+            if !keep {
+                self.bytes = self.bytes.saturating_sub(block_weight(b));
+            }
+            keep
+        });
+    }
+
+    fn evict(&mut self) {
+        while self.by_hash.len() > MAX_RETAINED_BODIES
+            || (self.bytes > MAX_RETAINED_BODY_BYTES && self.by_hash.len() > 1)
+        {
+            let victim = self
+                .by_hash
+                .iter()
+                .min_by_key(|(hash, b)| (b.header.height, **hash))
+                .map(|(hash, _)| *hash);
+            let Some(victim) = victim else { break };
+            self.forget(&victim);
+        }
+    }
+}
+
+/// The metered weight of a block, matched to `qlab_p2p::n1::txs_weight` plus the
+/// coinbase fields — a budget unit, not a byte count.
+fn block_weight(block: &StoredBlock) -> usize {
+    block
+        .txs
+        .iter()
+        .map(|tx| tx.proof.len() + 32 * (1 + tx.nullifiers.len() + tx.commitments.len()) + 16)
+        .sum::<usize>()
+        + 40
+}
 
 /// What [`MemNode::open`] recovered from disk.
 ///
@@ -270,6 +391,9 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// exact order, so the on-disk form is stable).
     commitments_ordered: Vec<Hash32>,
     nullifiers_ordered: Vec<Hash32>,
+    /// **Bodies this node still POSSESSES but has not applied** — the suffix undone
+    /// by a rewind (issue #198). Bounded; see [`RetainedBodies`].
+    retained: RetainedBodies,
     /// Directory backing the block log + snapshot; `None` = in-memory only.
     dir: Option<PathBuf>,
     /// Recovery provenance for the startup banner. In-memory nodes carry the
@@ -346,12 +470,27 @@ impl MemNode {
                     // the chain-store layer only (derived state came from the
                     // snapshot). See [`Self::apply_logged_block`] for the rule.
                     if b.header.height > 0 && b.header.prev != node.chain.tip_hash() {
+                        // Issue #198: the prefix rewind happens at the chain-store
+                        // layer, which `Node::rewind_to`'s retention does not cover —
+                        // so the suffix is archived here too. Without this, `open`
+                        // and `replay` would resume with different possession from
+                        // the same log, and possession is what the serving path now
+                        // keys on.
+                        let mut cursor = node.chain.tip_hash();
+                        while cursor != b.header.prev {
+                            let Some(undone) = node.chain.block(&cursor).cloned() else { break };
+                            cursor = undone.header.prev;
+                            node.retained.insert(undone);
+                        }
                         node.chain.rewind_to(b.header.prev).map_err(NodeError::Rewind)?;
                     }
                     node.chain.put_block(b.clone()).map_err(NodeError::Chain)?;
+                    node.retained.forget(&b.header().header_hash());
                 }
             }
         }
+
+        node.retained.prune_below(node.chain.tip_height());
 
         // **The snapshot has to describe the state this log actually reaches.**
         // Before issue #162 that held by construction: the log was append-only and
@@ -518,6 +657,14 @@ impl MemNode {
     /// **Nothing is written.** The log already holds every retained block; the
     /// abandoned blocks stay in it too, and [`Self::apply_logged_block`] is what
     /// makes replay reach the same place.
+    ///
+    /// **The undone suffix is RETAINED, not discarded** (issue #198). Before this,
+    /// the rebuild dropped the suffix's bodies along with its state, which made the
+    /// node unable to serve a block whose bytes it had written to `blocks.log`
+    /// minutes earlier — see [`RetainedBodies`] and [`Self::held_block`]. The
+    /// retention changes nothing about *state*: the applied chain after a rewind is
+    /// byte-identical to what it was, and every consumer of "have I applied this"
+    /// still reads the applied store.
     pub fn rewind_to(&mut self, target: Hash32) -> Result<RewindReport, NodeError> {
         let from_height = self.chain.tip_height();
         let from_hash = self.chain.tip_hash();
@@ -526,6 +673,18 @@ impl MemNode {
         }
         let kept = self.chain.rewind_path(&target).map_err(NodeError::Rewind)?;
         let finalized = self.chain.finalized_hash().zip(self.chain.finalized_height());
+
+        // The suffix about to be undone, walked off the LIVE store before anything
+        // is replaced. `rewind_path` has already proved `target` is an ancestor of
+        // the applied tip, so this terminates at `target`.
+        let mut undone: Vec<StoredBlock> = Vec::new();
+        let mut cursor = from_hash;
+        while cursor != target {
+            let Some(block) = self.chain.block(&cursor) else { break };
+            let prev = block.header.prev;
+            undone.push(block.clone());
+            cursor = prev;
+        }
 
         // Built beside the live state and swapped in only on success, so a failure
         // anywhere in the re-fold leaves the node exactly as it was.
@@ -540,6 +699,19 @@ impl MemNode {
                 .expect("rewind_path proved the retained tip descends from the finalized head");
         }
         rebuilt.recovery = self.recovery;
+        // Possession carries across the swap: what this node already held plus what
+        // it is about to stop having applied.
+        rebuilt.retained = std::mem::take(&mut self.retained);
+        for block in undone {
+            rebuilt.retained.insert(block);
+        }
+        // An archived block that the re-fold put back into the applied chain needs
+        // no second copy. (`apply_state` already forgets on the live node, so this
+        // is belt-and-braces rather than the load-bearing path.)
+        for block in &kept[1..] {
+            rebuilt.retained.forget(&block.header().header_hash());
+        }
+        rebuilt.retained.prune_below(rebuilt.chain.tip_height());
         let report = RewindReport {
             from_height,
             from_hash,
@@ -575,6 +747,7 @@ impl MemNode {
             roots_by_height,
             commitments_ordered: Vec::new(),
             nullifiers_ordered: Vec::new(),
+            retained: RetainedBodies::default(),
             dir,
             recovery: RecoveryReport::default(),
         }
@@ -739,7 +912,35 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         }
         self.roots_by_height
             .insert(block.header.height, self.commitments.root_bytes());
+        // Issue #198: a block back in the applied chain is servable from the applied
+        // store again, so the archive copy is dropped — and the archive is pruned to
+        // the depth a rewind could still reach from the new tip. Guarded on
+        // non-empty so the ordinary application path (the archive is empty on every
+        // node that has never rewound) pays one boolean.
+        if !self.retained.is_empty() {
+            self.retained.forget(&hash);
+            self.retained.prune_below(block.header.height);
+        }
         Ok(hash)
+    }
+
+    /// **A block this node HOLDS, applied or not** (issue #198) — the possession
+    /// predicate the serving path keys on.
+    ///
+    /// The applied store first, then the rewind archive. The distinction from
+    /// `ChainStore::block` is the whole of #198: whether *this* node has folded a
+    /// block into its own state says nothing about whether a *requester* can use it,
+    /// because the requester validates the body against the header's
+    /// `tx_body_commitment` either way. Refusing to hand over a body you have is
+    /// withholding data for no safety reason — and on 2026-08-01 it halted the net.
+    pub fn held_block(&self, hash: &Hash32) -> Option<&StoredBlock> {
+        self.chain.block(hash).or_else(|| self.retained.get(hash))
+    }
+
+    /// How many rewound-but-still-held blocks this node is carrying. Zero on any
+    /// node that has never rewound, which is almost every node almost always.
+    pub fn retained_bodies(&self) -> usize {
+        self.retained.len()
     }
 
     /// Mark `hash` finalized (delegates the no-reorg-past-finality rule to the

@@ -708,10 +708,16 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
     }
 
-    /// The body this node can serve for `hash`: the hot relay cache first, then the
-    /// applied-block store — the same two sources, in the same order, that
-    /// [`Self::on_get_block_txn`] already reads (issue #135). Stated once so the two
-    /// serving paths cannot come to disagree about what this node holds.
+    /// The body this node can serve for `hash`: the hot relay cache first, then
+    /// everything the node state **holds** — the same two sources, in the same
+    /// order, that [`Self::on_get_block_txn`] already reads (issue #135). Stated
+    /// once so the two serving paths cannot come to disagree about what this node
+    /// holds.
+    ///
+    /// The second source was `stored_body` — *applied* — until issue #198. It is now
+    /// [`crate::n1::ChainView::held_body`] — *possessed* — because a node that
+    /// rewound past a block still has its bytes and there is no safety reason to
+    /// refuse them: see that method for the loop this closed on the live net.
     fn body_for_serving(&self, hash: &Hash32) -> Option<BlockBody> {
         if let Some(entry) = self.blocks.get(hash) {
             return Some(BlockBody {
@@ -720,7 +726,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 coinbase_rkm: entry.coinbase_rkm,
             });
         }
-        self.node.stored_body(hash)
+        self.node.held_body(hash)
     }
 
     fn dispatch(&mut self, from: PeerId, env: Envelope, key: RateKey, now_ms: u64) {
@@ -1282,14 +1288,16 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return;
             }
         };
-        // Hot cache first, then the applied-block store (issue #135): the cache is
-        // the relay window, the store is authoritative for everything this node
-        // has folded into state — so eviction never makes an applied body
-        // unanswerable. A miss on both is a body this node never applied and no
-        // longer holds (or never held); it stays silent, as before.
+        // Hot cache first, then everything the node state holds (issue #135, and
+        // #198 for the second source): the cache is the relay window, the node
+        // state is authoritative for every body this node POSSESSES — so neither
+        // eviction nor a rewind makes a body we have unanswerable. A miss on both
+        // is a body this node no longer holds (or never held); it stays silent, as
+        // before. Same two sources and same order as `body_for_serving`, which is
+        // the point of stating them twice rather than diverging.
         let txs: Vec<TxEntry> = if let Some(entry) = self.blocks.get(&req.block_hash) {
             req.indexes.iter().filter_map(|&i| entry.txs.get(i as usize).cloned()).collect()
-        } else if let Some(body) = self.node.stored_body(&req.block_hash) {
+        } else if let Some(body) = self.node.held_body(&req.block_hash) {
             req.indexes.iter().filter_map(|&i| body.txs.get(i as usize).cloned()).collect()
         } else {
             return; // we don't have that block's body

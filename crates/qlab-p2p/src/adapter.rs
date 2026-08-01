@@ -1380,6 +1380,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         use qlab_node::ChainStore as _;
         self.state.chain().block(hash).is_some()
     }
+    fn held_body(&self, hash: &Hash32) -> Option<BlockBody> {
+        // POSSESSION (issue #198): the applied store, then the rewind archive —
+        // bodies this node applied at some point and still holds. `MemNode` owns
+        // that distinction because `rewind_to` is where it is created.
+        self.state.held_block(hash).map(|b| b.body())
+    }
 
     /// The main-chain blocks whose bodies this node still needs (issue #130 (c)).
     ///
@@ -2155,13 +2161,21 @@ mod tests {
             "one rewind, one applied block undone — the depth of a sibling race"
         );
 
-        // The abandoned sibling is gone from the state machine's block store, which
-        // is what let its own height be re-used. It is not served any more either:
-        // `stored_body` answers what this node has APPLIED (#135), and it has not.
+        // The abandoned sibling is gone from the state machine's APPLIED store,
+        // which is what let its own height be re-used. `stored_body` answers what
+        // this node has applied (#135), and it has not.
+        //
+        // **It IS still served** — the sentence here used to end "and is not served
+        // any more either", and that half was the defect. Serving keyed on
+        // application, `rewind_to` (this very function) can un-apply a block the
+        // node still holds, and on 2026-08-01 those two composed into a net-wide
+        // mining deadlock (#197/#198). Since #198 the serving path asks `held_body`
+        // and the applied predicate below is only half the answer.
         use qlab_node::ChainStore as _;
         assert!(!loser.state().chain().contains(&lh1.header_hash()), "the orphan was dropped");
-        assert!(loser.stored_body(&lh1.header_hash()).is_none(), "and is not served");
-        assert!(loser.stored_body(&wh1.header_hash()).is_some(), "the winner's is");
+        assert!(loser.stored_body(&lh1.header_hash()).is_none(), "not APPLIED");
+        assert!(loser.held_body(&lh1.header_hash()).is_some(), "but still HELD, and served (#198)");
+        assert!(loser.stored_body(&wh1.header_hash()).is_some(), "the winner's is applied");
         assert_eq!(lb1.coinbase_rkm, [0xB2; 4], "the orphan really was the loser's own block");
 
         // (3) Converged, and it stays converged as the winner keeps extending.
