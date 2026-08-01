@@ -212,6 +212,16 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// Rewind reports awaiting the journal (issue #162), newest-wins and bounded by
     /// [`MAX_JOURNALLED_REWINDS`]. See [`NodeAdapter::drain_rewinds`].
     rewinds: Vec<RewindReport>,
+    /// Issue #200: monotonic-ms when this node first entered the continuous
+    /// *lagging + outstanding unserved body ask* state, or `None` when that
+    /// condition is not holding. Progress (a requested body arrived) or leaving
+    /// the condition clears it.
+    unserved_since_ms: Option<u64>,
+    /// Issue #200: the unobtainable-body exemption is armed. Once set, stays set
+    /// until the applied tip is back on the main chain at zero lag — so a sibling
+    /// mined under the exemption can be extended until fork choice adopts it
+    /// (equal-work keeps the incumbent tip, so one sibling alone is not enough).
+    state_tip_mine_ready: bool,
 }
 
 /// How many [`RewindReport`]s are held for the journal before the oldest is dropped
@@ -248,6 +258,48 @@ pub const MAX_PENDING_BODY_HEIGHTS: u64 = 1024;
 ///
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
 pub const MAX_REWIND_DEPTH: u64 = 8 * qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
+
+/// **How many checkpoint cadences of continuous lagging-with-unserved-asks before
+/// a node may mine on its verified state tip** (issue #200).
+///
+/// The duty gate (#130 (a)) refuses to mine while the applied view is stale —
+/// Ethereum's *"an optimistic validator MUST NOT produce a block"*. That rule is
+/// right. On 2026-08-01 it composed with a body that **no host ever applied**
+/// (#197 / #198's archive check) into a permanent halt: every node held a header
+/// whose body exists nowhere, every node asked (`breq>0`), nobody could serve, and
+/// nobody would mine the sibling that would break the deadlock.
+///
+/// This constant is the **exhaustion**, not the impatience, half of the exemption
+/// that re-opens that loop:
+///
+/// | too small | a node merely slow to be served forks the chain for nothing |
+/// | too large | the net stays halted longer than it must |
+///
+/// **N = 2**, not tuned to today's multi-hour incident:
+///
+/// - **1 cadence** (one 10-min bucket at the 75 s target) is one long partition or
+///   one overloaded peer away from a needless fork. A single body-request cycle is
+///   15 s (`BODY_REQUEST_TIMEOUT_MS`); one cadence is ~40 re-asks across the mesh —
+///   enough to try every peer many times, but not enough margin for a WAN blip that
+///   is still progress-bound.
+/// - **2 cadences** is two full cadence windows of *continuous non-service* with an
+///   outstanding ask. Any body that actually arrives resets the clock (progress is
+///   "a requested body was satisfied", not "lag moved for any reason"), so a node
+///   that is lagging **and being served** never reaches the threshold — that is the
+///   half `the_duty_gate_still_refuses_to_mine_while_lagging_and_receiving` locks.
+/// - **Not wall-clock seconds as a bare constant**: the threshold is
+///   `N × CHECKPOINT_CADENCE_BLOCKS × block_time_secs` of monotonic time. Cadence is
+///   the unit because the checkpoint grid is this net's natural progress quantum
+///   (same precedent as [`MAX_REWIND_DEPTH`]); block time is the conversion because
+///   while the chain is halted no height advances, and a loop-count threshold would
+///   be wrong by the #107 factor (30 s vs 131 s loop period) between images.
+///
+/// At the live 75 s target this is **20 minutes**. At the in-process sim's 2 s
+/// target it is 32 s of sim time. Either way it is network-parameter-relative, not
+/// incident-tuned.
+///
+/// `[devnet-placeholder]`, testnet-tunable, **NOT frozen**.
+pub const UNOBTAINABLE_BODY_CADENCES: u64 = 2;
 
 /// Hard entry cap on the pending-body window (issue #130 (a)).
 pub const MAX_PENDING_BODIES: usize = 512;
@@ -521,6 +573,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             punishments: Vec::new(),
             punish_restore: PunishmentRestore::default(),
             rewinds: Vec::new(),
+            unserved_since_ms: None,
+            state_tip_mine_ready: false,
         }
     }
 
@@ -739,6 +793,100 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// read from the one metric registry, never from a second ledger.
     pub fn lag_refusals(&self, duty: &str) -> u64 {
         self.metrics.lag_refusals(duty)
+    }
+
+    /// **Issue #200 — is the unobtainable-body exemption armed?**
+    ///
+    /// When true, [`Self::mine_block`] will produce a child of the **state tip**
+    /// rather than refuse (or rather than extend a fork-choice tip this node cannot
+    /// verify). Operator-visible as `uex=` on `TELEMETRY`: an operator seeing a
+    /// node mine while `slag>0` needs to know it was this exemption and not a bug.
+    pub fn state_tip_mine_ready(&self) -> bool {
+        self.state_tip_mine_ready
+    }
+
+    /// How many blocks this node has mined under the #200 exemption.
+    pub fn state_tip_mines(&self) -> u64 {
+        self.metrics.state_tip_mines()
+    }
+
+    /// Duration of continuous unserved lag (ms) required before the exemption
+    /// arms — `UNOBTAINABLE_BODY_CADENCES × CHECKPOINT_CADENCE_BLOCKS × block_time`
+    /// in milliseconds. Exposed so tests can drive the clock to the threshold
+    /// without hard-coding the arithmetic.
+    pub fn unobtainable_threshold_ms(&self) -> u64 {
+        UNOBTAINABLE_BODY_CADENCES
+            .saturating_mul(qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS)
+            .saturating_mul(self.block_time)
+            .saturating_mul(1_000)
+    }
+
+    /// **Issue #200 — feed the duty-gate exemption the body-fetch facts it keys on.**
+    ///
+    /// Called once per `P2pNode::tick` after body requests have been (re)issued, so
+    /// `outstanding_breqs` already reflects this tick's ask set.
+    ///
+    /// - `body_progress`: a historical body **we asked for** was satisfied this
+    ///   tick. That is the "being served" half of the distinction; lag moving for
+    ///   any other reason (including our own exemption-mined sibling applying)
+    ///   is deliberately not progress.
+    /// - Leaving lag, or stopping asking, clears the unserved window. The armed
+    ///   exemption itself only clears when the applied tip is back on the main
+    ///   chain at zero lag — see [`Self::state_tip_mine_ready`].
+    pub fn observe_body_fetch(
+        &mut self,
+        now_ms: u64,
+        outstanding_breqs: usize,
+        body_progress: bool,
+    ) {
+        let lagging = self.state_lag().is_lagging();
+        let on_main_caught_up =
+            !lagging && !self.applied_tip().is_off_main_chain();
+
+        if on_main_caught_up {
+            // Healthy: applied tip is the main-chain tip. Disarm everything.
+            self.unserved_since_ms = None;
+            self.state_tip_mine_ready = false;
+            return;
+        }
+
+        if body_progress {
+            // A requested body arrived — we are being served. Reset the unserved
+            // window; if the exemption had armed on a false start, drop it too so
+            // a lagging-and-receiving node falls back under the duty gate.
+            self.unserved_since_ms = None;
+            self.state_tip_mine_ready = false;
+            // If still lagging and still asking, the window restarts from now so a
+            // later stall can still arm.
+            if lagging && outstanding_breqs > 0 {
+                self.unserved_since_ms = Some(now_ms);
+            }
+            return;
+        }
+
+        if !lagging {
+            // Heights match but we may be off-main (exemption-mined sibling that
+            // has not yet taken fork choice). Keep the armed flag so we continue
+            // mining on the state tip until the branch wins; do not start a new
+            // unserved window (there is nothing outstanding to be unserved for).
+            self.unserved_since_ms = None;
+            return;
+        }
+
+        // Lagging.
+        if outstanding_breqs == 0 {
+            // Not asking — cannot conclude unobtainable. Do not arm; if already
+            // armed (e.g. peers dropped mid-recovery), leave the flag alone so a
+            // recovery already in flight can finish on the state tip.
+            self.unserved_since_ms = None;
+            return;
+        }
+
+        // Lagging + asking + no progress this tick.
+        let since = *self.unserved_since_ms.get_or_insert(now_ms);
+        if now_ms.saturating_sub(since) >= self.unobtainable_threshold_ms() {
+            self.state_tip_mine_ready = true;
+        }
     }
 
     /// Record a refused duty (issue #130 (a) part 3).
@@ -1166,32 +1314,72 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// Returns `(mined_header, body)`; the caller ingests it via `announce_block`
     /// → `ingest_block`, which is the single insert/apply path. `None` if there is
     /// no known parent or the nonce budget is exhausted.
+    ///
+    /// # Parent selection (issue #130 (a) + issue #200)
+    ///
+    /// The parent comes from **fork choice** and the body is assembled from
+    /// **state**. When those disagree, the block this would produce is a valid
+    /// child of the fork-choice tip that the node's own state machine then
+    /// refuses — coinbase notes with no commitment-tree leaf, silent loss.
+    ///
+    /// - **Default (healthy):** parent = fork-choice tip.
+    /// - **Lagging, exemption not armed:** refuse. Ethereum's optimistic-sync
+    ///   rule ("an optimistic validator MUST NOT produce a block").
+    /// - **Exemption armed (issue #200):** parent = **state tip** — the height
+    ///   this node has actually verified. Never the fork-choice tip it cannot
+    ///   reach. Produces a sibling that fork choice can resolve once extended
+    ///   past the unobtainable header's work.
     pub fn mine_block(&mut self) -> Option<(BlockHeader, BlockBody)> {
+        let lagging = self.state_lag().is_lagging();
+        let off_main = self.applied_tip().is_off_main_chain();
+        let exempt = self.state_tip_mine_ready;
+
+        // Parent height for the halt gate: under the exemption we extend the
+        // *state* tip, so the height that must clear H2 is state_tip+1, not the
+        // fork-choice tip the node cannot verify.
+        let next_height = if exempt && (lagging || off_main) {
+            self.state.tip_height().saturating_add(1)
+        } else {
+            self.chain.tip_height().saturating_add(1)
+        };
         // HALT (H2): an upgraded node stops mining above H. Un-upgraded miners will
         // not, and that is fine — §4's hybrid honesty note; the committee, not miner
         // unanimity, is what makes the upgrade clean.
-        if !self.rules.accepts_height(self.chain.tip_height() + 1) {
+        if !self.rules.accepts_height(next_height) {
             return None;
         }
-        // STATE LAG (issue #130 (a), part 3 — the first of the three refusals).
-        //
-        // The parent comes from FORK CHOICE and the body is assembled from STATE. When
-        // those disagree, the block this would produce is a valid child of the
-        // fork-choice tip that the node's own state machine then refuses, so its
-        // coinbase note never gets a commitment-tree leaf and the coins are gone with
-        // no error raised anywhere. A node that cannot record its own block does not
-        // mine one — Ethereum's optimistic-sync rule ("an optimistic validator MUST
-        // NOT produce a block"), and the reason this is a refusal rather than a
-        // best-effort attempt.
-        if self.state_lag().is_lagging() {
-            self.refuse_for_lag("mine");
-            return None;
+
+        let parent_hash = if lagging {
+            if !exempt {
+                self.refuse_for_lag("mine");
+                return None;
+            }
+            // #200: mine on the verified state tip.
+            self.state.tip_hash()
+        } else if exempt && off_main {
+            // Heights match but the applied tip is a sibling of the main-chain
+            // block at that height (the equal-work incumbent still holds fork
+            // choice). Keep extending the verified branch until it is heavier.
+            self.state.tip_hash()
+        } else {
+            self.chain.tip_hash()
+        };
+
+        let mined = self.mine_on_parent(parent_hash)?;
+        if exempt && (lagging || off_main) {
+            self.metrics.observe_state_tip_mine();
         }
+        Some(mined)
+    }
+
+    /// Mine a child of `parent_hash` (must be a known header). Shared by the
+    /// healthy fork-choice path and the #200 state-tip path so the two cannot
+    /// drift on timestamp / difficulty / seed selection.
+    fn mine_on_parent(&mut self, parent_hash: Hash32) -> Option<(BlockHeader, BlockBody)> {
         let template =
             self.mempool.assemble(&self.state, SOAK_EFFECTIVE_MEDIAN, self.miner_rkm);
         let body = template.body;
         let bc = body.commitment();
-        let parent_hash = self.chain.tip_hash();
         let parent = *self.chain.header(&parent_hash)?;
         let difficulty = expected_difficulty(&self.chain, &parent_hash, self.block_time)?;
         let timestamp = self.next_timestamp(&parent);
@@ -1448,6 +1636,19 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         }
         out.reverse(); // ascending — the order the state machine can apply them in
         out
+    }
+
+    fn observe_body_fetch(
+        &mut self,
+        now_ms: u64,
+        outstanding_breqs: usize,
+        body_progress: bool,
+    ) {
+        NodeAdapter::observe_body_fetch(self, now_ms, outstanding_breqs, body_progress);
+    }
+
+    fn state_tip_mine_ready(&self) -> bool {
+        NodeAdapter::state_tip_mine_ready(self)
     }
 }
 

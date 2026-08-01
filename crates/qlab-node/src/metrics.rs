@@ -306,6 +306,8 @@ pub struct Metrics {
     // ---- state rewinds (issue #162) ----------------------------------------
     state_rewinds: Counter,
     state_rewind_blocks: Counter,
+    // ---- unobtainable-body exemption mines (issue #200) --------------------
+    state_tip_mines: Counter,
 }
 
 impl Default for Metrics {
@@ -345,6 +347,7 @@ impl Metrics {
             round_variants_total: Counter::default(),
             state_rewinds: Counter::default(),
             state_rewind_blocks: Counter::default(),
+            state_tip_mines: Counter::default(),
             blocks_connected: Counter::default(),
             block_interval: Histogram::new(BLOCK_INTERVAL_SECS_BUCKETS, 1),
             finality_advances: Counter::default(),
@@ -409,6 +412,19 @@ impl Metrics {
     /// How many times `duty` was refused for state lag.
     pub fn lag_refusals(&self, duty: &str) -> u64 {
         self.lag_refusals.get(duty).map(|c| c.get()).unwrap_or(0)
+    }
+
+    /// Record one block mined under the unobtainable-body exemption (issue #200).
+    ///
+    /// An operator seeing a node mine while `slag>0` needs a counter that says
+    /// "it was the exemption" rather than "the duty gate broke".
+    pub fn observe_state_tip_mine(&mut self) {
+        self.state_tip_mines.inc();
+    }
+
+    /// How many blocks this node has mined under the #200 exemption.
+    pub fn state_tip_mines(&self) -> u64 {
+        self.state_tip_mines.get()
     }
 
     /// Record one state-machine rewind onto the main chain, and what it cost in
@@ -692,6 +708,18 @@ ordinary sibling race, deep is a question for a human.\n\
     o.push_str(&format!(
         "qumbra_state_rewind_blocks_total {}\n",
         m.state_rewind_blocks()
+    ));
+
+    // ---- issue #200: mines under the unobtainable-body exemption -------------
+    o.push_str(
+        "# HELP qumbra_state_tip_mines_total Blocks this node mined on its verified state tip \
+under the unobtainable-body exemption (issue #200). A rising rate while qumbra_state_lag_blocks \
+is nonzero means the exemption fired — the duty gate did not break. Exists from the first scrape.\n\
+# TYPE qumbra_state_tip_mines_total counter\n",
+    );
+    o.push_str(&format!(
+        "qumbra_state_tip_mines_total {}\n",
+        m.state_tip_mines()
     ));
 
     // ---- live gauges ------------------------------------------------------
