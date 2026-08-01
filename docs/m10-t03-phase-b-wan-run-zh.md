@@ -14,7 +14,7 @@
 |---|---|
 | 拓扑 | 4 × AWS `t4g.small`(Graviton,arm64,2 vCPU / 2 GB),Debian 12 |
 | 区域 | `us-east-1` · `eu-west-1` · `ap-southeast-1` · `ap-northeast-1` |
-| 供给 | Terraform,[`qumbra-deploy`](https://github.com/lai3d/qumbra-deploy)(私有),一份 state、四个 aliased provider |
+| 供给 | Terraform,[`qumbra-deploy`](https://github.com/qumbra-labs/qumbra-deploy)(私有),一份 state、四个 aliased provider |
 | 镜像 | `ghcr.io/lai3d/qumbra-node@sha256:7e4080f3…e60fdea` —— **digest 锁定,四台完全一致**;GHCR 包为公开,故任何主机都不持有 registry 凭据 |
 | 创世哈希 | `4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3`,每台均已钉死并校验 |
 | 委员会 | N=21 个 ML-DSA 密钥,按 **6/5/5/5** 分布 —— **没有任何节点持有 quorum 15** |
@@ -35,7 +35,7 @@
 
 本包建立在**节点自己的容器日志**之上,而非那个 5 分钟 SSH 采样器。这是个刻意的选择,而且它是承重的:采样器在运行中途**瞎了 10.15 小时**(见"观测缺口"),而容器日志一行没漏。
 
-其中的论证已写成一份采纳的设计文档——[`qumbra-design/observability-and-evidence.md`](https://github.com/lai3d/qumbra-design/blob/main/observability-and-evidence.md),其规则是:**证据是节点自己的、持久的、经归档的输出;看板永远不是证据。**
+其中的论证已写成一份采纳的设计文档——[`qumbra-design/observability-and-evidence.md`](https://github.com/qumbra-labs/qumbra-design/blob/main/observability-and-evidence.md),其规则是:**证据是节点自己的、持久的、经归档的输出;看板永远不是证据。**
 
 有两个细节让这份归档真正可用,而且都很容易漏掉:
 
@@ -59,7 +59,7 @@
 
 ## 跨三大洲的分布式 finality,且无节点持有 quorum
 
-[issue #70](https://github.com/lai3d/qumbra-lab/issues/70) 修复、而 [Phase B-lite](m10-t03-phase-b-lite-run.md) 只能在 localhost 上展示的那条性质:21 个密钥按 6/5/5/5 分布,**finality 在 68–223 ms RTT 下持续形成并推进**,连续两天。`final` 在四台上一致到达 2352。
+[issue #70](https://github.com/qumbra-labs/qumbra-lab/issues/70) 修复、而 [Phase B-lite](m10-t03-phase-b-lite-run.md) 只能在 localhost 上展示的那条性质:21 个密钥按 6/5/5/5 分布,**finality 在 68–223 ms RTT 下持续形成并推进**,连续两天。`final` 在四台上一致到达 2352。
 
 ## 真实 WAN 节奏下的两次 epoch 边界
 
@@ -123,11 +123,11 @@ mean 901 s   median 673 s   p90 1802 s   max 3161 s      (名义 8 块 ≈ 690 s
 
 **16 是否定错、还是委员会在真实 RTT 下确实在抖,本次运行答不了**,而理由值得明说:**节点在丢 checkpoint 时什么都不发。** 整整 48 小时里 node0 只产出**十**行非 telemetry 日志,全部在启动时。没有 round 号、没有票数、没有超时原因、没有缺席名单。`stall` 计数器从 8 爬到 40 又落回来,中间那段是不透明的。
 
-这个缺口就是 [issue #87](https://github.com/lai3d/qumbra-lab/issues/87)。它不是锦上添花——它挡着一个 FROZEN 集合的决定,而在它关闭之前,**`DEGRADED_MODE_LAG_BLOCKS` 不得改动**。
+这个缺口就是 [issue #87](https://github.com/qumbra-labs/qumbra-lab/issues/87)。它不是锦上添花——它挡着一个 FROZEN 集合的决定,而在它关闭之前,**`DEGRADED_MODE_LAG_BLOCKS` 不得改动**。
 
 ### 一条确实成立的交叉核对
 
-在四台合计 14,659 个归档采样中,`regime = Degraded` 与 `stall > 16` 在 **14,647** 个上吻合。十二个例外全是同一件事:**创世头**——`tip=0`、`final=-`、尚未有任何东西被最终化——每台节点在运行头 60 秒内各 3 条。这就是 [issue #73](https://github.com/lai3d/qumbra-lab/issues/73),而本次运行把它量化了。**首次最终化之后,零例外。**
+在四台合计 14,659 个归档采样中,`regime = Degraded` 与 `stall > 16` 在 **14,647** 个上吻合。十二个例外全是同一件事:**创世头**——`tip=0`、`final=-`、尚未有任何东西被最终化——每台节点在运行头 60 秒内各 3 条。这就是 [issue #73](https://github.com/qumbra-labs/qumbra-lab/issues/73),而本次运行把它量化了。**首次最终化之后,零例外。**
 
 ### 跨节点的 finality 一致性 —— 什么能证明、什么不能
 
@@ -135,7 +135,7 @@ mean 901 s   median 673 s   p90 1802 s   max 3161 s      (名义 8 块 ≈ 690 s
 
 这是采样相位对上跃迁式推进的特征,不是发散:每台约每 47 s 发一条 telemetry 且相位独立,而 finality 一次跳 8–40 块,所以相隔一个节奏采到的两台会跨在同一次跃迁的两侧。tip spread 表现相同——对齐样点中 4.9 % 超过 3 块,最大 8 块。
 
-**诚实的边界:telemetry 不携带 checkpoint 身份**,所以本包能证明没有任何节点的 finality 高度回退、且四台总能重新重合,**不能**证明四台最终化的是**同一批** checkpoint。**高度一致不等于身份一致。** 这就是 [issue #84](https://github.com/lai3d/qumbra-lab/issues/84),它是证据面的限制,不是关于这个网的发现。
+**诚实的边界:telemetry 不携带 checkpoint 身份**,所以本包能证明没有任何节点的 finality 高度回退、且四台总能重新重合,**不能**证明四台最终化的是**同一批** checkpoint。**高度一致不等于身份一致。** 这就是 [issue #84](https://github.com/qumbra-labs/qumbra-lab/issues/84),它是证据面的限制,不是关于这个网的发现。
 
 ## 观测缺口 —— 如实披露,以及为何它没有造成损失
 
@@ -157,7 +157,7 @@ mean 901 s   median 673 s   p90 1802 s   max 3161 s      (名义 8 块 ≈ 690 s
 ## 本次运行不主张什么
 
 - **四个场景演练不在本包内**:late-joiner sync、mining-node restart、2+2 分区 → 愈合、committee stall → recovery。它们欠着,而且是**刻意尚未跑**。
-- **原因是镜像,不是排期。** 这四台跑的是 2026-07-26 构建的镜像。此后合并进 `main` 的有:[#79](https://github.com/lai3d/qumbra-lab/pull/79)(把 block body 绑到 header —— 一处**共识正确性**修复)、[#82](https://github.com/lai3d/qumbra-lab/pull/82)(D3 leaf-digest 绑定)、[#86](https://github.com/lai3d/qumbra-lab/pull/86)(M11 peer discovery)。演练检验的是**当下的**设计,所以在这个镜像上取的演练证据描述的是一个已被取代的构建,将不得不重跑。
+- **原因是镜像,不是排期。** 这四台跑的是 2026-07-26 构建的镜像。此后合并进 `main` 的有:[#79](https://github.com/qumbra-labs/qumbra-lab/pull/79)(把 block body 绑到 header —— 一处**共识正确性**修复)、[#82](https://github.com/qumbra-labs/qumbra-lab/pull/82)(D3 leaf-digest 绑定)、[#86](https://github.com/qumbra-labs/qumbra-lab/pull/86)(M11 peer discovery)。演练检验的是**当下的**设计,所以在这个镜像上取的演练证据描述的是一个已被取代的构建,将不得不重跑。
 - **连续性主张不受此影响,而这个区分很要紧。** "某个真实构建无人值守连跑 ≥ 48 h、零重启、零 finality 回退"——这句话不会因为构建往前走而变弱。检验当下设计的演练没有这个性质。
 - **四个里有一个今天根本跑不了** —— committee stall → recovery,理由见 finality 一节:节点恰恰对被测量的那个量沉默。
 - 本包不对 NAT 后的参与者或敌意参与者作任何主张;这里每一台都是我们控制的、有公网 IP、入站 P2P 端口开放的主机。
@@ -175,7 +175,7 @@ mean 901 s   median 673 s   p90 1802 s   max 3161 s      (名义 8 块 ≈ 690 s
 
 ## 本包之后欠着的
 
-- [#87](https://github.com/lai3d/qumbra-lab/issues/87) —— 委员会 round 级诊断 + 结构化指标;它挡着 `DEGRADED_MODE_LAG_BLOCKS` 那个问题。
+- [#87](https://github.com/qumbra-labs/qumbra-lab/issues/87) —— 委员会 round 级诊断 + 结构化指标;它挡着 `DEGRADED_MODE_LAG_BLOCKS` 那个问题。
 - 四个演练,在重部之后的镜像上。
 - `testnet-plan` 的 M10/M11 估时 vs 实际;ROADMAP 的 M10 行。
-- [#73](https://github.com/lai3d/qumbra-lab/issues/73) —— 创世头 telemetry,上文已量化为每台恰好 3 条采样。
+- [#73](https://github.com/qumbra-labs/qumbra-lab/issues/73) —— 创世头 telemetry,上文已量化为每台恰好 3 条采样。

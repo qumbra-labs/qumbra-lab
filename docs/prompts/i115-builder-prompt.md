@@ -2,7 +2,7 @@
 
 ## Your task book
 
-https://github.com/lai3d/qumbra-lab/issues/115
+https://github.com/qumbra-labs/qumbra-lab/issues/115
 
 Read the issue body, then the coordinator's task-book comment (the most recent one). The issue carries the *what* and the *why it was deliberately not done in `PR #113`*; the task book carries what has changed since it was filed.
 
@@ -49,7 +49,7 @@ Delete the height-0 exemption; do not branch around it. If the exemption survive
 
 - **worktree + PR, never direct to `main`**: `git worktree add ../qumbra-lab-i115 -b claude/i115`. Say the path in your first reply.
 - **Full unfiltered `cargo test --release --workspace -- --test-threads=1`, raw total.** `main` was **938 passed / 0 failed** at `PR #144`, but `PR #153` may land before you — reconcile against whatever `main` is when you branch and **say which commit you branched from**. If it does not reconcile, say that before explaining anything else.
-- Check **[`issue #64`](https://github.com/lai3d/qumbra-lab/issues/64)**'s latest comment for the rig queue and post start/finish lines. QUM-29 is also queued; one release suite at a time.
+- Check **[`issue #64`](https://github.com/qumbra-labs/qumbra-lab/issues/64)**'s latest comment for the rig queue and post start/finish lines. QUM-29 is also queued; one release suite at a time.
 - **Blocked on a judgement call that is not a STOP-POINT: take the smaller action, mark it separable, and say in the PR that you asked and proceeded. Do not wait for the coordinator.**
 
 Closes `issue #115`.

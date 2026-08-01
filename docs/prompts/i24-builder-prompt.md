@@ -3,7 +3,7 @@
 ## 你的任务书
 
 issue #24 的 **coordinator 评论**(标题 "Coordinator decision + task-book — closing #24",2026-07-26)是**唯一权威范围**:
-https://github.com/lai3d/qumbra-lab/issues/24
+https://github.com/qumbra-labs/qumbra-lab/issues/24
 
 先读那条评论,再读 issue 正文(PR #23 验收时点名的 residual + 两条收口路径的原始描述)。
 

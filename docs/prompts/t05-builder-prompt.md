@@ -3,7 +3,7 @@
 ## 你的任务书
 
 lab issue #70 的 coordinator 评论(标题 "M10-T0-5 — task-book",2026-07-25)是**唯一权威范围**:
-https://github.com/lai3d/qumbra-lab/issues/70
+https://github.com/qumbra-labs/qumbra-lab/issues/70
 
 先完整读它,再读 issue 正文(Phase B-lite 的原始 finding)。任务书 §0 已经把三处结构性阻塞定位到具体文件行,§1 有 9 条 coordinator 钉死的不可协商项(S1–S9),§3 是停车点,§4 是验收标准。**不要重新发明 §1 里已经定死的东西**;§1 之外的设计(编码字段顺序、tally 数据结构、中继策略是 gossip 还是请求-应答)由你定,在计划文档里写清理由。
 

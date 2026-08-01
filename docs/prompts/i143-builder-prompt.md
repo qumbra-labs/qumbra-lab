@@ -2,7 +2,7 @@
 
 ## 你的任务书
 
-https://github.com/lai3d/qumbra-lab/issues/143
+https://github.com/qumbra-labs/qumbra-lab/issues/143
 
 读 issue 正文，然后读 coordinator 的任务书评论（最新那条）。**先只读，交付的是一个判定，不是一个修复。**
 
@@ -55,7 +55,7 @@ https://github.com/lai3d/qumbra-lab/issues/143
 
 ## 机器
 
-🔴 只读。`cargo check` 可以。**不许跑 `cargo test --release`，尤其不许 `-p qlab-bench`** —— 那一段就是 906–946 秒，interior gate 峰值近 20 GB。四根 Multica 棒在飞，队列在 **[#64](https://github.com/lai3d/qumbra-lab/issues/64)**。
+🔴 只读。`cargo check` 可以。**不许跑 `cargo test --release`，尤其不许 `-p qlab-bench`** —— 那一段就是 906–946 秒，interior gate 峰值近 20 GB。四根 Multica 棒在飞，队列在 **[#64](https://github.com/qumbra-labs/qumbra-lab/issues/64)**。
 
 若判定需要在 narrow trace 上跑 `check_constraints`（#78 估约 0.2 秒），**去队列占一个位、报起跑/收工、并报 peak RSS** —— 那条路径没人单独量过。
 

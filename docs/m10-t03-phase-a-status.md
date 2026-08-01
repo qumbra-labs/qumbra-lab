@@ -1,6 +1,6 @@
 # M10-T0-3 Phase A — status (wall-clock timestamps + deploy tooling)
 
-Issue [#64](https://github.com/lai3d/qumbra-lab/issues/64) (M10 wave 2). This branch
+Issue [#64](https://github.com/qumbra-labs/qumbra-lab/issues/64) (M10 wave 2). This branch
 (`claude/m10-t03`) delivers **Phase A** — the two pieces that need no VPS. **Phase B
 (genesis rehearsal, the four WAN soak scenarios, the ≥ 48 h telemetry run, and the
 T0 evidence pack) resumes on this same branch once Larry provides the 4 VPSes.**

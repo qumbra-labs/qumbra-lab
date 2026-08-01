@@ -1,6 +1,6 @@
 # M9-N7 — integration + soak, T0 readiness evidence (run 1)
 
-Issue [#54](https://github.com/lai3d/qumbra-lab/issues/54). The full node — qlab-p2p
+Issue [#54](https://github.com/qumbra-labs/qumbra-lab/issues/54). The full node — qlab-p2p
 driving the **real** qlab-node state machine (N1) + N4 mempool + N5 committee + N3
 PoW — run as an N-node in-process mesh over real P2P messages.
 

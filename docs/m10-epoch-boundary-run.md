@@ -1,6 +1,6 @@
 # Local epoch-boundary soak — LOCALHOST/DOCKER run doc
 
-> **Scope label: LOCALHOST/DOCKER. No WAN-latency claims.** This run exists to cross one specific line — the **1,152-block committee epoch boundary** — with every other variable held as still as possible. The WAN measurements (real RTT, LWMA at WAN pacing, ≥ 48 h) belong to Phase B-WAN ([#64](https://github.com/lai3d/qumbra-lab/issues/64)) and are not claimed here.
+> **Scope label: LOCALHOST/DOCKER. No WAN-latency claims.** This run exists to cross one specific line — the **1,152-block committee epoch boundary** — with every other variable held as still as possible. The WAN measurements (real RTT, LWMA at WAN pacing, ≥ 48 h) belong to Phase B-WAN ([#64](https://github.com/qumbra-labs/qumbra-lab/issues/64)) and are not claimed here.
 
 > **⚠️ Provenance caveat, stated first because it is the weakest thing about this run.** This soak was started, sampled and is being written up **by the coordinator** — the same role that will rule on it. That is exactly the independence problem `qumbra-deploy/OPERATOR.md` R1 exists to prevent for T-ops. It was started at 00:24 on 2026-07-26, before the T-ops role existed, and it was not migrated afterwards. **Read its conclusions as coordinator-produced, not independently verified.** The Phase B-WAN run does not share this defect.
 

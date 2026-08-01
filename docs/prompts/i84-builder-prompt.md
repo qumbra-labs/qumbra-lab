@@ -2,7 +2,7 @@
 
 ## 你的任务书
 
-https://github.com/lai3d/qumbra-lab/issues/84
+https://github.com/qumbra-labs/qumbra-lab/issues/84
 
 **先读 issue 正文，再读 coordinator 2026-07-29 的那条评论。** 正文写于 07-26，评论写于今天——两者的范围差了一半，而差的那一半是你**不该做**的部分。
 

@@ -2,14 +2,14 @@
 
 ## 你的任务书
 
-https://github.com/lai3d/qumbra-lab/issues/130
+https://github.com/qumbra-labs/qumbra-lab/issues/130
 
 读 issue 正文，然后读**两条**评论，顺序很重要：
 
 1. **QUM-18 的 research 评论**（历史 body 该怎么传）。它是 (b) 和 (c) 被排除出你范围的依据，而且它**纠正了 coordinator 早先评论里的四点**。**research 与 coordinator 冲突时，以 research 为准。**
 2. **coordinator 的任务书评论**（最新那条）—— 你的范围、STOP-POINT、验收判据。当 spec 用。
 
-再读 **https://github.com/lai3d/qumbra-lab/issues/104** —— 这不是可选的，它改了"做完"的定义。见下。
+再读 **https://github.com/qumbra-labs/qumbra-lab/issues/104** —— 这不是可选的，它改了"做完"的定义。见下。
 
 ## 先说清楚：这根棒只做 (a)
 
@@ -72,7 +72,7 @@ T-ops 在 2026-07-29 记的生产现象：四台 T0 主机的 `blocks.log` 全�
 
 header 已经在手的 body 必须能被应用。**按高度升序**应用，让攒着的一段随状态 tip 前进而顺序排空，而不是一次公告只进一块。
 
-**设计 buffer 之前先读 https://github.com/lai3d/qumbra-lab/issues/135。** `P2pNode::blocks`（`qlab-p2p/src/node.rs:55`）已经在缓每一个 *header* 被接受的块的 `(txs, coinbase, coinbase_rkm)` —— 无界、不淘汰、不持久。**你要的 body 极可能已经在内存里了**：faucet 节点报 state tip 4 的时候，手里握着块 6..14。
+**设计 buffer 之前先读 https://github.com/qumbra-labs/qumbra-lab/issues/135。** `P2pNode::blocks`（`qlab-p2p/src/node.rs:55`）已经在缓每一个 *header* 被接受的块的 `(txs, coinbase, coinbase_rkm)` —— 无界、不淘汰、不持久。**你要的 body 极可能已经在内存里了**：faucet 节点报 state tip 4 的时候，手里握着块 6..14。
 
 **对这个关系表态**，别在它旁边再造第二个 buffer：复用、替换、还是两个并存但生命周期不同 —— 在 PR 里说是哪个、为什么。#135（给那个 map 加上限）**不在你范围内**，但别把它弄得更糟。
 

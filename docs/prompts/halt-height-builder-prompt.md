@@ -3,7 +3,7 @@
 ## 你的任务书
 
 issue #74 的**两条 coordinator 评论**(2026-07-26)是**唯一权威范围**:
-https://github.com/lai3d/qumbra-lab/issues/74
+https://github.com/qumbra-labs/qumbra-lab/issues/74
 
 1. **"Decisions ratified — H1–H5 settled"** —— 五条设计决定 + 两条新增要求(N1/N2)。**这些已经钉死,不要重开。**
 2. **"Task-book — scope, stop-points, acceptance"** —— 范围 8 项、停车点、验收标准。它取代了 issue 正文里的 §2–§5(正文是草稿,保留作审计痕迹)。

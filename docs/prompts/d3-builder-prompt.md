@@ -5,7 +5,7 @@
 1. **`docs/issue24-findings.md` 的 §"D3 spec (the remaining leaf binding)"** —— **这是设计**,由做完 D0–D2 的 builder 从机制内部写的。**先读它,照它做。**
 2. **issue #24 上标题为 "Task-book — D3: leaf F0 digest input binding (2026-07-26)" 的 coordinator 评论** —— 只补 spec 写作时(PR #30 时代)不可能知道的东西:`main` 当前状态、边界、验收标准。
 
-https://github.com/lai3d/qumbra-lab/issues/24
+https://github.com/qumbra-labs/qumbra-lab/issues/24
 
 **两者冲突时:技术设计以 findings 文档为准,范围与验收以 coordinator 评论为准。**
 

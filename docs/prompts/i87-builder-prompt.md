@@ -6,7 +6,7 @@
 
 ## 你的任务书
 
-https://github.com/lai3d/qumbra-lab/issues/87
+https://github.com/qumbra-labs/qumbra-lab/issues/87
 
 它是从 T0 四节点 WAN soak 的实测数据里长出来的,不是凭空提的。开工前把 issue 正文里那组数字读完——它们决定了这根棒的形状。
 
@@ -37,13 +37,13 @@ coordinator 的立场在 `qumbra-design/observability-and-evidence.md` §5,**并
 
 **一、不动 `DEGRADED_MODE_LAG_BLOCKS`,不动 FROZEN v1.0 集合里的任何常量。** 这根棒的产出是用来*支撑*那个判断的证据,不是那个判断本身。改 FROZEN 要走 halt-height + 修订文档,是完全独立的一件事。**在这根棒里顺手调一下"看起来更合理的阈值"= 直接停车。**
 
-**二、现有那一行 `TELEMETRY` 的格式不许改。** 外部有消费者(含 `dialable=<n>/<known>`、一个正在跑的 T0 采样器,以及**一份已经封存合并的证据包** [PR #93](https://github.com/lai3d/qumbra-lab/pull/93))。**新增字段可以,改动或重排现有字段不行。**
+**二、现有那一行 `TELEMETRY` 的格式不许改。** 外部有消费者(含 `dialable=<n>/<known>`、一个正在跑的 T0 采样器,以及**一份已经封存合并的证据包** [PR #93](https://github.com/qumbra-labs/qumbra-lab/pull/93))。**新增字段可以,改动或重排现有字段不行。**
 
 **三、不碰共识层**,不新增 codepoint,不改任何载荷。
 
 ## 不要部署
 
-这根棒的产物**不由你上线**。48 h 连续性证据已于 2026-07-28 封存([PR #93](https://github.com/lai3d/qumbra-lab/pull/93)),但那四台仍在跑,等的是一次**统一重部**——由 coordinator 与 T-ops 执行,一次性携带 #79 + #82 + #86 + 你这个。**在 lab 网里验,不要碰那四台,也不要请求碰。**
+这根棒的产物**不由你上线**。48 h 连续性证据已于 2026-07-28 封存([PR #93](https://github.com/qumbra-labs/qumbra-lab/pull/93)),但那四台仍在跑,等的是一次**统一重部**——由 coordinator 与 T-ops 执行,一次性携带 #79 + #82 + #86 + 你这个。**在 lab 网里验,不要碰那四台,也不要请求碰。**
 
 ## 工作纪律(全部强制)
 
@@ -53,7 +53,7 @@ coordinator 的立场在 `qumbra-design/observability-and-evidence.md` §5,**并
 
 2. **REPEAT-GOTCHA(本项目已有两次实测事故)**:曾有 builder subagent 误改**主工作树**。**每一批编辑前先确认 cwd 是你自己的 worktree**;派任何 subagent 都要把这条警告原样转发进它的 prompt。
 
-3. **重活要问。** 定向测试随便跑(`-p qlab-node` 之类);**全量 `cargo test --release --workspace` 开跑前先问 coordinator**——rig 是共享的,并发两个 release 套件会 OOM。**[issue #91](https://github.com/lai3d/qumbra-lab/issues/91)(peer hardening)可能同时在跑,它和你抢同一台机器。**
+3. **重活要问。** 定向测试随便跑(`-p qlab-node` 之类);**全量 `cargo test --release --workspace` 开跑前先问 coordinator**——rig 是共享的,并发两个 release 套件会 OOM。**[issue #91](https://github.com/qumbra-labs/qumbra-lab/issues/91)(peer hardening)可能同时在跑,它和你抢同一台机器。**
 
 4. **分阶段提交。** 本项目 builder 多次在 usage limit 中途被打断——**未提交的大改动 = 丢失的工作。**
 

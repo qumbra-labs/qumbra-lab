@@ -56,7 +56,7 @@ passed at every point in that history.
 ## Phase B-WAN — VPS provisioning requirements **[manual — Larry]** ✅ DISCHARGED 2026-07-26
 
 > **The gate is closed and the net is live since 2026-07-26 15:43.** Provisioning is no longer manual: it is
-> Terraform in the private [`qumbra-deploy`](https://github.com/lai3d/qumbra-deploy) repo — 4 × `t4g.small`
+> Terraform in the private [`qumbra-deploy`](https://github.com/qumbra-labs/qumbra-deploy) repo — 4 × `t4g.small`
 > (Graviton/arm64, Debian 12) across us-east-1 · eu-west-1 · ap-southeast-1 · ap-northeast-1, measured
 > inter-node RTT **68–223 ms**. Operations run as **T-ops**; the live state lives in `qumbra-deploy/OPERATOR.md`.
 > The requirements below are preserved as the record of what was asked for and why — several of them were
@@ -101,7 +101,7 @@ nothing to observe in scenarios (c)/(d), and the run would only reproduce B-lite
 **Duration/cost shape**: the soak is **≥ 48 h continuous**, plus the scenario passes
 and a re-run after T0-5 — budget roughly a week of uptime on four small instances.
 
-[#70]: https://github.com/lai3d/qumbra-lab/issues/70
+[#70]: https://github.com/qumbra-labs/qumbra-lab/issues/70
 
 ## Phase B — the real 4-VPS deploy ✅ executed 2026-07-26 (see `qumbra-deploy`)
 

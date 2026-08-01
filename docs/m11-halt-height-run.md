@@ -9,7 +9,7 @@
 > scheduled upgrade can be stood down before the height. It is **not** evidence
 > about upgrade behaviour under WAN latency or at production committee scale.
 
-**Issue:** [#74](https://github.com/lai3d/qumbra-lab/issues/74).
+**Issue:** [#74](https://github.com/qumbra-labs/qumbra-lab/issues/74).
 **Governing spec:** `qumbra-design/committee-and-governance.md` §4 (EN authoritative;
 `committee-and-governance-zh.md` §4). Decisions H1–H5 + N1–N2 ratified by the
 coordinator on the issue, 2026-07-26.
@@ -151,7 +151,7 @@ would sail through. Because the halted binary already wrote the fact down, silen
 is refused too. A **corrupt** marker is an error, never read as "never halted" — a
 node that halted must not become resumable by mangling its own evidence.
 
-**What the gate keys on (rekeyed by [#81](https://github.com/lai3d/qumbra-lab/issues/81)):**
+**What the gate keys on (rekeyed by [#81](https://github.com/qumbra-labs/qumbra-lab/issues/81)):**
 
 | data dir state | the gate's question |
 |---|---|
@@ -475,7 +475,7 @@ The four stop-points from the task-book, and what the tooling does about each:
    naming it.
 
    **DECIDED by the coordinator, filed as
-   [#81](https://github.com/lai3d/qumbra-lab/issues/81), and explicitly not this
+   [#81](https://github.com/qumbra-labs/qumbra-lab/issues/81), and explicitly not this
    baton's to build:** the marker will record the frozen digest in force and the
    gate will key on **digest equality**, with height kept as the audit record. The
    gate's real question was never "which height did this node halt at" but "is this

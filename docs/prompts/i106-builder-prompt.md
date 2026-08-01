@@ -2,7 +2,7 @@
 
 ## 你的任务书
 
-https://github.com/lai3d/qumbra-lab/issues/106
+https://github.com/qumbra-labs/qumbra-lab/issues/106
 
 **读 issue 全帖，然后读 coordinator 的任务书评论（最新那条）。** 17 条评论、四个会话在上面收敛过，而且**若干自信的早期结论被撤回过，其中三条是 coordinator 自己的**。任务书里列了撤回清单 —— **不要去追它们**，那是这根棒最容易浪费掉的时间。
 
@@ -64,7 +64,7 @@ pub enum SyncPhase {
 
 - **worktree + PR，绝不直推 main。** `git worktree add ../qumbra-lab-i106 -b claude/i106`，第一条回复里说出路径
 - **完整无过滤 `cargo test --release --workspace -- --test-threads=1`，报原始总数。** `main` 现在是 **915 passed / 0 failed**（coordinator 在 PR #141 上独立核过），所以应该是 915 + 你的测试数。**对不上先说这件事，别先解释别的**
-- 跑重活前看 **[#64](https://github.com/lai3d/qumbra-lab/issues/64)** 最新评论的队列并报起跑/收工。四根 Multica 棒在飞，**一次只能一个完整套件**
+- 跑重活前看 **[#64](https://github.com/qumbra-labs/qumbra-lab/issues/64)** 最新评论的队列并报起跑/收工。四根 Multica 棒在飞，**一次只能一个完整套件**
 - STOP-POINT：任何 FROZEN 常量、任何新 codepoint、任何 `BlockBody`/`BlockHeader` 改动 —— 报告并等
 - **卡在非 STOP-POINT 的判断上：取小的那个动作、标为可分离、在 PR 里写"我问了并继续了"。不要等 coordinator。**
 
