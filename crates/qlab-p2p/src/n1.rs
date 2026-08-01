@@ -193,6 +193,31 @@ pub trait ChainView {
     fn has_stored_body(&self, hash: &Hash32) -> bool {
         self.stored_body(hash).is_some()
     }
+
+    /// **The main-chain blocks whose BODIES this node still needs**, ascending from
+    /// the frontier its state machine can apply at, at most `max` of them (issue
+    /// #130 (c)).
+    ///
+    /// This is the requesting side's whole question, and it is asked of the node
+    /// state rather than computed in [`crate::P2pNode`] because only the node state
+    /// holds both views: fork choice knows which headers are on the main chain, and
+    /// the state machine knows which of those it has actually applied. `slag` is the
+    /// *size* of that set; this is its *identity*.
+    ///
+    /// Default **empty**, and the default is a capability statement, not a stub — the
+    /// same one [`Self::stored_body`]'s `None` makes. A header-only node-state
+    /// ([`StubNode`]) applies a header and is by construction never behind its own
+    /// chain, so it has nothing to ask for; answering otherwise would have every
+    /// in-process sim request a body for every block it ever heard of.
+    ///
+    /// GUARANTEED of any real implementation, because termination depends on it: a
+    /// hash leaves this set once its body is applied, and no hash enters it that is
+    /// not on the fork-choice main chain at or below the header tip. A caller may
+    /// therefore treat an empty answer as "caught up" and stop asking.
+    fn missing_body_hashes(&self, max: usize) -> Vec<Hash32> {
+        let _ = max;
+        Vec::new()
+    }
 }
 
 /// Ingest headers received from peers.
