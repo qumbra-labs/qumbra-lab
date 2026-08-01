@@ -241,6 +241,51 @@ pub trait CommitmentStore {
 // Default in-memory implementations.
 // ---------------------------------------------------------------------------
 
+/// Why a rewind of the applied chain was refused (issue #162).
+///
+/// Every variant is a **refusal that leaves the store untouched**. A rewind is
+/// the one operation in this crate that removes accepted blocks from node state,
+/// so it says no on anything it cannot prove, and it says which proof failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RewindError {
+    /// The target block is not in the store.
+    UnknownTarget,
+    /// The target is known but is not an ancestor of (or equal to) the current
+    /// tip — so "rewind" would be a jump onto a branch this store never applied,
+    /// which is a different operation and is not this one.
+    NotAnAncestorOfTip,
+    /// The target is at or below the finalized head without descending from it.
+    ///
+    /// **This is the no-reorg-past-finality line, enforced at the one new door
+    /// that could cross it.** `qlab_devnet::finality` and [`crate::recovery`] are
+    /// untouched by the rewind work precisely because the rule is checked here,
+    /// before anything is dropped, rather than repaired afterwards.
+    PastFinalized { target_height: u64, finalized_height: u64 },
+    /// A header on the retained ancestor path has no stored block. An internal
+    /// invariant break ([`MemChainStore::put_block`] writes both together), never
+    /// reachable from network input — reported rather than papered over.
+    MissingBlockOnPath { height: u64 },
+}
+
+impl std::fmt::Display for RewindError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RewindError::UnknownTarget => write!(f, "rewind target is not a known block"),
+            RewindError::NotAnAncestorOfTip => {
+                write!(f, "rewind target is not an ancestor of the applied tip")
+            }
+            RewindError::PastFinalized { target_height, finalized_height } => write!(
+                f,
+                "rewind to height {target_height} would cross the finalized head at \
+                 height {finalized_height}"
+            ),
+            RewindError::MissingBlockOnPath { height } => {
+                write!(f, "no stored block for the retained path at height {height}")
+            }
+        }
+    }
+}
+
 /// In-memory [`ChainStore`]: a `qlab_devnet::ChainState` for headers/fork-choice
 /// + a hash→block map for bodies.
 #[derive(Clone)]
@@ -264,6 +309,87 @@ impl MemChainStore {
     /// Read-only access to the wrapped fork-choice state.
     pub fn chain(&self) -> &ChainState {
         &self.chain
+    }
+
+    /// The blocks this store would **keep** on a rewind to `target`: genesis →
+    /// `target` inclusive, ascending — or the reason the rewind is refused.
+    ///
+    /// Read-only, so a caller can establish that a rewind is permitted before it
+    /// commits to one. The three refusals are checked in the order they can be
+    /// answered cheapest-first, and the finality one is last because it is the one
+    /// that matters: see [`RewindError::PastFinalized`].
+    pub fn rewind_path(&self, target: &Hash32) -> Result<Vec<StoredBlock>, RewindError> {
+        let target_height =
+            self.chain.header(target).ok_or(RewindError::UnknownTarget)?.height;
+        let tip_height = self.chain.tip_height();
+        if target_height > tip_height
+            || self.chain.ancestor(&self.chain.tip_hash(), tip_height - target_height)
+                != Some(*target)
+        {
+            return Err(RewindError::NotAnAncestorOfTip);
+        }
+        if let (Some(fin_hash), Some(fin_height)) =
+            (self.chain.finalized_hash(), self.chain.finalized_height())
+        {
+            if target_height < fin_height
+                || !self.chain.is_descendant_of(target, &fin_hash, fin_height)
+            {
+                return Err(RewindError::PastFinalized {
+                    target_height,
+                    finalized_height: fin_height,
+                });
+            }
+        }
+        let mut path = Vec::with_capacity(target_height as usize + 1);
+        let mut cur = *target;
+        let mut height = target_height;
+        loop {
+            let block =
+                self.blocks.get(&cur).ok_or(RewindError::MissingBlockOnPath { height })?;
+            path.push(block.clone());
+            if block.header.height == 0 {
+                break;
+            }
+            cur = block.header.prev;
+            height -= 1;
+        }
+        path.reverse();
+        Ok(path)
+    }
+
+    /// Drop every block that is not an ancestor of `target`, making `target` the
+    /// tip. Returns the retained path (genesis → `target`, ascending).
+    ///
+    /// **Rebuilt rather than pruned in place, and that is the point.**
+    /// `ChainState` has no set-tip and must not grow one: its tip is the output of
+    /// the heaviest-chain rule, and a store that could be told what its tip is
+    /// would be a second, un-gated fork choice. Re-inserting the retained path into
+    /// a fresh `ChainState` reaches the same answer *through* the rule — every
+    /// insert strictly increases cumulative work, so the tip lands on `target` —
+    /// and leaves `qlab_devnet::chain` byte-for-byte unchanged.
+    ///
+    /// The abandoned branch is dropped from the block store too. That is deliberate
+    /// and is what makes re-application possible at all: while the losing sibling
+    /// is still present, `insert_header` answers `Duplicate` for it and the
+    /// heaviest-chain tie-break keeps it as the incumbent tip.
+    ///
+    /// On refusal the store is untouched.
+    pub fn rewind_to(&mut self, target: Hash32) -> Result<Vec<StoredBlock>, RewindError> {
+        let kept = self.rewind_path(&target)?;
+        let finalized = self.chain.finalized_hash().zip(self.chain.finalized_height());
+        let mut rebuilt = Self::new(kept[0].clone());
+        for block in &kept[1..] {
+            rebuilt
+                .put_block(block.clone())
+                .expect("a retained ancestor path re-inserts in ascending order");
+        }
+        if let Some((hash, height)) = finalized {
+            rebuilt.chain.restore_finalized(hash, height).expect(
+                "rewind_path proved the retained tip descends from the finalized head",
+            );
+        }
+        *self = rebuilt;
+        Ok(kept)
     }
 }
 
@@ -342,5 +468,128 @@ impl CommitmentStore for MemCommitmentStore {
     }
     fn tree(&self) -> &CommitmentTree {
         &self.tree
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Issue #162 — the chain-store rewind, at the one layer where a side branch
+    //! can actually exist.
+    //!
+    //! `MemChainStore` accepts side branches (`ChainState::insert_header` stores a
+    //! non-adopted block and returns `Ok`), so this is where
+    //! [`RewindError::NotAnAncestorOfTip`] is reachable. `MemNode`'s own store never
+    //! holds one — the state machine applies a single linear chain — which is why
+    //! the node-level tests pin the other refusals instead.
+
+    use qlab_devnet::params_devnet::GENESIS_DIFFICULTY;
+
+    use super::*;
+
+    fn block(parent: &BlockHeader, marker: u64) -> StoredBlock {
+        let body = BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [marker; 4] };
+        let header = BlockHeader::child_of(
+            parent,
+            parent.timestamp + 75,
+            GENESIS_DIFFICULTY,
+            body.commitment(),
+        );
+        StoredBlock::from_parts(&header, &body)
+    }
+
+    fn genesis() -> StoredBlock {
+        crate::node::genesis_block(GENESIS_DIFFICULTY, 0)
+    }
+
+    /// A three-block chain plus a sibling of block 1 that fork choice did not
+    /// adopt (equal work ⇒ the tie-break keeps the incumbent, then the main branch
+    /// pulls ahead).
+    fn store_with_a_side_branch() -> (MemChainStore, Vec<Hash32>, Hash32) {
+        let g = genesis();
+        let g_header = g.header();
+        let mut store = MemChainStore::new(g);
+        let b1 = block(&g_header, 0xA1);
+        let b2 = block(&b1.header(), 0xA2);
+        let b3 = block(&b2.header(), 0xA3);
+        let side = block(&g_header, 0xB2);
+        let mut main = vec![store.genesis_hash()];
+        for b in [b1, b2, b3] {
+            main.push(store.put_block(b).expect("main chain inserts"));
+        }
+        let side_hash = store.put_block(side).expect("a side branch is stored, not rejected");
+        assert_eq!(store.tip_hash(), main[3], "and it is not the tip");
+        (store, main, side_hash)
+    }
+
+    #[test]
+    fn a_rewind_keeps_the_ancestor_path_and_drops_everything_else() {
+        let (mut store, main, side_hash) = store_with_a_side_branch();
+        let kept = store.rewind_to(main[1]).expect("rewind to height 1");
+
+        assert_eq!(store.tip_hash(), main[1], "the tip is the target");
+        assert_eq!(store.tip_height(), 1);
+        assert_eq!(
+            kept.iter().map(|b| b.header().header_hash()).collect::<Vec<_>>(),
+            vec![main[0], main[1]],
+            "genesis → target, ascending"
+        );
+        assert!(store.contains(&main[0]) && store.contains(&main[1]));
+        assert!(!store.contains(&main[2]), "the abandoned suffix is gone");
+        assert!(!store.contains(&main[3]));
+        assert!(!store.contains(&side_hash), "and so is the side branch");
+        assert_eq!(store.genesis_hash(), main[0], "genesis identity is unchanged");
+    }
+
+    /// The reason the abandoned branch is **dropped** rather than left in place:
+    /// while it is present, re-inserting it answers `Duplicate` and the
+    /// heaviest-chain tie-break keeps it as the tip. A rewind that only moved a
+    /// pointer would leave the store unable to re-apply the winner.
+    #[test]
+    fn a_dropped_branch_can_be_re_applied_and_becomes_the_tip() {
+        let (mut store, main, _) = store_with_a_side_branch();
+        let b1 = store.block(&main[1]).expect("held").clone();
+        store.rewind_to(main[0]).expect("rewind to genesis");
+        let re = store.put_block(b1).expect("re-inserts after the drop");
+        assert_eq!(re, main[1]);
+        assert_eq!(store.tip_hash(), main[1], "and it is the tip again");
+    }
+
+    #[test]
+    fn a_rewind_refuses_a_target_off_the_tips_own_ancestry() {
+        let (mut store, main, side_hash) = store_with_a_side_branch();
+        assert_eq!(
+            store.rewind_path(&side_hash),
+            Err(RewindError::NotAnAncestorOfTip),
+            "a stored block that is not an ancestor of the tip is not a rewind target"
+        );
+        assert_eq!(store.rewind_to(side_hash), Err(RewindError::NotAnAncestorOfTip));
+        assert_eq!(store.tip_hash(), main[3], "and the refusal changed nothing");
+        assert!(store.contains(&side_hash));
+
+        assert_eq!(store.rewind_path(&[0x99; 32]), Err(RewindError::UnknownTarget));
+    }
+
+    /// The finality line, at the store. Rewinding **to** the finalized head is
+    /// legal; one block below it is not, and the refusal names both heights.
+    #[test]
+    fn a_rewind_refuses_to_cross_the_finalized_head() {
+        let (mut store, main, _) = store_with_a_side_branch();
+        assert!(store.set_finalized(main[2]), "finalize height 2");
+
+        assert_eq!(
+            store.rewind_path(&main[1]),
+            Err(RewindError::PastFinalized { target_height: 1, finalized_height: 2 })
+        );
+        assert_eq!(
+            store.rewind_path(&main[0]),
+            Err(RewindError::PastFinalized { target_height: 0, finalized_height: 2 })
+        );
+        assert_eq!(store.tip_hash(), main[3], "refusals changed nothing");
+
+        // TO the finalized head is allowed, and the head survives the rebuild.
+        store.rewind_to(main[2]).expect("rewinding to finality is not rewinding past it");
+        assert_eq!(store.tip_hash(), main[2]);
+        assert_eq!(store.finalized_hash(), Some(main[2]));
+        assert_eq!(store.finalized_height(), Some(2));
     }
 }

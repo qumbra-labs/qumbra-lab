@@ -277,7 +277,7 @@ pub const VOTE_RESULTS: [&str; 5] = ["counted", "inactive", "forged", "unknown_s
 /// (issue #130 (a) part 3), pre-declared so both series exist from the first scrape:
 /// an alert cannot be written against a counter that only appears once the node is
 /// already in trouble.
-pub const LAG_REFUSAL_DUTIES: [&str; 2] = ["mine", "admit_tx"];
+pub const LAG_REFUSAL_DUTIES: [&str; 3] = ["mine", "admit_tx", "rewind"];
 
 /// The node's accumulated metric state. Owned by the node adapter (which is where
 /// the events happen) and rendered on demand.
@@ -303,6 +303,9 @@ pub struct Metrics {
     regime_ms: BTreeMap<&'static str, u64>,
     // ---- state lag (issue #130 (a)) ----------------------------------------
     lag_refusals: BTreeMap<&'static str, Counter>,
+    // ---- state rewinds (issue #162) ----------------------------------------
+    state_rewinds: Counter,
+    state_rewind_blocks: Counter,
 }
 
 impl Default for Metrics {
@@ -340,6 +343,8 @@ impl Metrics {
             vote_arrival: Histogram::new(LATENCY_MS_BUCKETS, 1_000),
             round_votes: Histogram::new(VOTE_COUNT_BUCKETS, 1),
             round_variants_total: Counter::default(),
+            state_rewinds: Counter::default(),
+            state_rewind_blocks: Counter::default(),
             blocks_connected: Counter::default(),
             block_interval: Histogram::new(BLOCK_INTERVAL_SECS_BUCKETS, 1),
             finality_advances: Counter::default(),
@@ -404,6 +409,33 @@ impl Metrics {
     /// How many times `duty` was refused for state lag.
     pub fn lag_refusals(&self, duty: &str) -> u64 {
         self.lag_refusals.get(duty).map(|c| c.get()).unwrap_or(0)
+    }
+
+    /// Record one state-machine rewind onto the main chain, and what it cost in
+    /// applied blocks (issue #162).
+    ///
+    /// **Two counters, because either alone answers the wrong question.** The
+    /// count says how often this node has been stranded — a number that should be
+    /// rare and whose *rate* is the alarm. The block total says how much applied
+    /// work the strands cost, which is what separates a one-block sibling race
+    /// (ordinary, and now self-healing) from a deep divergence that wants a human.
+    ///
+    /// Both are **unlabelled**, per #84: the interesting dimension here would be
+    /// the block identity, and a hash as a Prometheus label grows the series set
+    /// forever.
+    pub fn observe_state_rewind(&mut self, blocks_undone: u64) {
+        self.state_rewinds.inc();
+        self.state_rewind_blocks.add(blocks_undone);
+    }
+
+    /// How many times the state machine has rewound onto the main chain.
+    pub fn state_rewinds(&self) -> u64 {
+        self.state_rewinds.get()
+    }
+
+    /// How many applied blocks those rewinds dropped in total.
+    pub fn state_rewind_blocks(&self) -> u64 {
+        self.state_rewind_blocks.get()
     }
 
     /// Record the arrival offset (ms from round open) of one newly-counting vote.
@@ -630,8 +662,9 @@ since process start. This is the measured Degraded share; it is NOT a fraction o
     // ---- issue #130 (a): duties refused because the state machine is behind ----
     o.push_str(
         "# HELP qumbra_state_lag_refusals_total Duties this node refused because its state machine \
-was behind its own chain (issue #130). NOT a peer fault and not an error: a node declining to act \
-on a view it knows is stale. Both series exist from the first scrape.\n\
+is not where its chain is (issue #130; duty=\"rewind\" added by #162, a refused rejoin onto the main \
+chain). NOT a peer fault and not an error: a node declining to act on a view it knows is stale. \
+Every series exists from the first scrape.\n\
 # TYPE qumbra_state_lag_refusals_total counter\n",
     );
     for d in LAG_REFUSAL_DUTIES {
@@ -640,6 +673,26 @@ on a view it knows is stale. Both series exist from the first scrape.\n\
             m.lag_refusals(d)
         ));
     }
+
+    // ---- issue #162: the state machine leaving a losing branch ----------------
+    o.push_str(
+        "# HELP qumbra_state_rewinds_total Times this node's state machine rewound off a branch \
+fork choice had abandoned and rejoined the main chain (issue #162). Recovery from the wedge that \
+froze three of four T0 nodes on 2026-08-01; a rising rate is sibling races healing, a rising \
+qumbra_state_lag_blocks with this flat is a strand that is NOT healing.\n\
+# TYPE qumbra_state_rewinds_total counter\n",
+    );
+    o.push_str(&format!("qumbra_state_rewinds_total {}\n", m.state_rewinds()));
+    o.push_str(
+        "# HELP qumbra_state_rewind_blocks_total Applied blocks dropped by those rewinds, in total \
+(issue #162). Against qumbra_state_rewinds_total this is the mean divergence depth: ~1 is the \
+ordinary sibling race, deep is a question for a human.\n\
+# TYPE qumbra_state_rewind_blocks_total counter\n",
+    );
+    o.push_str(&format!(
+        "qumbra_state_rewind_blocks_total {}\n",
+        m.state_rewind_blocks()
+    ));
 
     // ---- live gauges ------------------------------------------------------
     let gauges: [(&str, &str, u64); 19] = [
@@ -1024,6 +1077,40 @@ mod tests {
         let text2 = render(&m2, &gauges());
         assert!(text2.contains("qumbra_state_lag_refusals_total{duty=\"mine\"} 2\n"));
         assert!(text2.contains("qumbra_state_lag_refusals_total{duty=\"admit_tx\"} 1\n"));
+    }
+
+    /// **Issue #162: the positive signal that the wedge detector went quiet for the
+    /// right reason.**
+    ///
+    /// `qumbra_state_lag_blocks` falling to zero is the *absence* of a symptom, and a
+    /// detector that broke produces the same absence. These two counters are the
+    /// presence of the cure — the state machine noticing it was on a losing branch
+    /// and leaving it — so they exist from the first scrape, before any rewind has
+    /// happened, or an alert could not be written against them.
+    #[test]
+    fn the_rewind_counters_exist_from_the_first_scrape_and_carry_count_and_depth() {
+        let m = Metrics::new();
+        let text = render(&m, &LiveGauges::default());
+        assert!(text.contains("# TYPE qumbra_state_rewinds_total counter"));
+        assert!(text.contains("\nqumbra_state_rewinds_total 0\n"));
+        assert!(text.contains("# TYPE qumbra_state_rewind_blocks_total counter"));
+        assert!(text.contains("\nqumbra_state_rewind_blocks_total 0\n"));
+        // The refused-rewind series is in the lag-refusal family and is declared too.
+        assert!(text.contains("qumbra_state_lag_refusals_total{duty=\"rewind\"} 0\n"));
+
+        // Count and depth are separate because a one-block sibling race and a deep
+        // divergence are different operator situations with the same count.
+        let mut m2 = Metrics::new();
+        m2.observe_state_rewind(1);
+        m2.observe_state_rewind(5);
+        assert_eq!(m2.state_rewinds(), 2);
+        assert_eq!(m2.state_rewind_blocks(), 6);
+        let text2 = render(&m2, &LiveGauges::default());
+        assert!(text2.contains("\nqumbra_state_rewinds_total 2\n"));
+        assert!(text2.contains("\nqumbra_state_rewind_blocks_total 6\n"));
+        // Unlabelled, per #84 — the interesting dimension would be a block hash.
+        assert!(!text2.contains("qumbra_state_rewinds_total{"));
+        assert!(!text2.contains("qumbra_state_rewind_blocks_total{"));
     }
 
     // ---- issue #84: the identity gauges --------------------------------------
