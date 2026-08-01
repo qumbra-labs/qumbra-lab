@@ -712,6 +712,30 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         self.p2p.node().finality().latest().map(|cp| cp.identity())
     }
 
+    /// Whether the checkpoint behind the operator-facing `final=` is present in
+    /// this host's own header chain (issue #85).
+    ///
+    /// `final=` deliberately remains the committee
+    /// [`FinalityTracker`](qlab_devnet::finality::FinalityTracker)'s view: a
+    /// behind node must still be able to learn that a quorum formed before it has
+    /// downloaded the block. This comparison makes the second view explicit
+    /// without weakening that capability:
+    ///
+    /// - `local` — fork choice holds the exact block hash the tracker finalized;
+    /// - `heard` — the tracker verified quorum, but fork choice does not hold it;
+    /// - `-` — the tracker has no finalized checkpoint to classify.
+    ///
+    /// The comparison is by the full block hash, not by height: issue #84 already
+    /// established that equal heights do not establish equal checkpoints.
+    fn finality_backing_field(&self) -> &'static str {
+        let node = self.p2p.node();
+        match node.finality().latest() {
+            None => "-",
+            Some(cp) if node.chain().header(&cp.block_hash).is_some() => "local",
+            Some(_) => "heard",
+        }
+    }
+
     /// **What this node's own committee keys are committed to** (issue #84).
     ///
     /// Read from the never-double-sign ledgers — the same records that live in
@@ -1013,6 +1037,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // `qlab_p2p::MAX_BODIES_IN_FLIGHT` (16). Always printed, zero included (the
         // #130 (a) rule): a node always knows this number.
         let body_reqs = self.p2p.body_requests();
+        // Issue #85: `fback=` is appended after every existing field. It says
+        // whether the exact checkpoint named by the finality tracker is backed by a
+        // block in this host's own header chain (`local`) or is something this host
+        // has only learned reached quorum (`heard`). `final=` keeps its existing
+        // tracker meaning — learn-ahead is the capability, silent disagreement was
+        // the defect. See `finality_backing_field` for the full-hash comparison.
+        let finality_backing = self.finality_backing_field();
         // Issue #133 D3: `prest=` is **appended at the end**, after `breq=`, under the
         // same rule as every addition since #87 — every pre-existing field keeps its
         // name, position and meaning, and the `PRE_I84_FIELDS` prefix test passes
@@ -1037,7 +1068,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // disagree about who may sign. Agreement needs evidence in blocks (D1).
         let prest = node.punishment_restore().telemetry_field();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} prest={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1054,6 +1085,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             applied.id_field(),
             applied.chain_field(),
             body_reqs,
+            finality_backing,
             prest,
         )
     }
@@ -3730,6 +3762,8 @@ mod tests {
                 "stipid", "schain",
                 // ── appended by #130 (c), at the end ──
                 "breq",
+                // ── appended by #85, at the end ──
+                "fback",
                 // ── appended by #133 D3, at the end ──
                 "prest",
             ],
@@ -3748,6 +3782,11 @@ mod tests {
         // #162 finding 6: this node mined and applied its own tip, so the applied tip
         // IS the main-chain block at its height.
         assert!(line.contains(" schain=main"), "the wedge verdict: {line}");
+        // #130 (c): a node alone on its own chain has nothing outstanding.
+        assert!(line.contains(" breq=0 "), "nothing in flight: {line}");
+        // #85: this node finalized genesis locally, so the newest append says the
+        // tracker checkpoint is backed by its exact block in fork choice.
+        assert!(line.ends_with(" fback=local"), "local finality, last: {line}");
         // #130 (c): nothing outstanding on a lone node.
         assert!(line.contains(" breq=0 "), "nothing in flight: {line}");
         // #133 D3: `prest=` is the newest append and is now the last field. A fresh
@@ -3804,6 +3843,92 @@ mod tests {
         line.split_whitespace()
             .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
             .unwrap_or_else(|| panic!("no {key}= in: {line}"))
+    }
+
+    // ---- issue #85: tracker finality vs locally-held chain ------------------
+
+    /// **ACCEPTANCE (issue #85): preserve learn-ahead and name its backing.**
+    ///
+    /// The first node deliberately verifies a frozen-roster quorum for slot 8
+    /// while still at genesis and without the checkpoint block. The tracker must
+    /// advance — that capability is how a merely-behind node learns it is behind —
+    /// while the chain's finalized pointer remains untouched. Its line says
+    /// `tip=0 final=8 fback=heard`. A second node finalizes its locally-mined slot-8
+    /// block and prints `fback=local`, so the two formerly-ambiguous states differ
+    /// on the telemetry line alone.
+    #[test]
+    fn quorum_ahead_of_local_chain_stays_learned_and_prints_heard() {
+        use qlab_devnet::committee::Checkpoint;
+        use qlab_p2p::n1::{CheckpointIngest, VotesOutcome};
+
+        let (heard_config, heard_genesis, heard_base) = rig("finality_heard", false);
+        let validators = heard_genesis
+            .load_validators(&heard_config.committee_key_paths)
+            .expect("the rig's 21 committee keys load");
+        let mut heard = RunningNode::start(
+            &heard_config,
+            &heard_genesis,
+            KeccakPow,
+            DevnetRehearsalVerifier,
+        )
+        .unwrap();
+        assert_eq!(field(&heard.telemetry_sample(), "fback"), "-");
+
+        let slot = CHECKPOINT_CADENCE_BLOCKS;
+        let cp = Checkpoint::new(slot, [0x85; 32], [0x58; 32]);
+        let votes: Vec<_> = validators.iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        let need = heard.p2p().node().slot_context(slot).need;
+        assert_eq!(need, 15, "the frozen 21-member roster requires a 15-vote quorum");
+        assert!(matches!(
+            heard
+                .p2p_mut()
+                .node_mut()
+                .ingest_checkpoint_votes(&cp, &votes[..need]),
+            VotesOutcome::Learned { finalized: true, .. }
+        ));
+
+        assert_eq!(heard.tip_height(), 0, "the checkpoint block was never supplied");
+        assert_eq!(heard.finalized_height(), Some(slot), "the tracker learns ahead");
+        assert!(
+            heard.p2p().node().chain().header(&cp.block_hash).is_none(),
+            "fork choice does not hold the finalized block"
+        );
+        assert_eq!(
+            heard.p2p().node().chain().finalized_height(),
+            None,
+            "ChainState::set_finalized leaves its pointer untouched for an unknown block"
+        );
+        let heard_line = heard.telemetry_sample();
+        assert_eq!(field(&heard_line, "tip"), "0", "{heard_line}");
+        assert_eq!(field(&heard_line, "final"), slot.to_string(), "{heard_line}");
+        assert_eq!(field(&heard_line, "fback"), "heard", "{heard_line}");
+
+        let (local_config, local_genesis, local_base) = rig("finality_local", true);
+        let mut local = RunningNode::start(
+            &local_config,
+            &local_genesis,
+            KeccakPow,
+            DevnetRehearsalVerifier,
+        )
+        .unwrap();
+        local.set_mine_interval(Duration::ZERO);
+        local.try_checkpoint(); // bootstrap genesis finality
+        for _ in 0..slot {
+            assert!(local.try_mine());
+        }
+        local.try_checkpoint();
+        let local_line = local.telemetry_sample();
+        assert_eq!(field(&local_line, "final"), field(&heard_line, "final"));
+        assert_eq!(field(&local_line, "fback"), "local", "{local_line}");
+        assert_ne!(
+            field(&heard_line, "fback"),
+            field(&local_line, "fback"),
+            "heard-only and locally-backed finality must print differently"
+        );
+
+        for base in [heard_base, local_base] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 
     /// Mine to the first cadence slot and finalize it, returning the sample line.
