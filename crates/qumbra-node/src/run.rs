@@ -1013,8 +1013,31 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // `qlab_p2p::MAX_BODIES_IN_FLIGHT` (16). Always printed, zero included (the
         // #130 (a) rule): a node always knows this number.
         let body_reqs = self.p2p.body_requests();
+        // Issue #133 D3: `prest=` is **appended at the end**, after `breq=`, under the
+        // same rule as every addition since #87 — every pre-existing field keeps its
+        // name, position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified. Touches TELEMETRY.
+        //
+        // It is the committee-punishment restore report from process start, and it
+        // exists because after a restart `qumbra_committee_active` and `ROUND`'s
+        // `active=` return to the full roster with no other surface saying so —
+        // **byte-identical to a net where nobody was ever punished, and byte-identical
+        // to every healthy cold start.** Five other instances of that shape were
+        // invisible in exactly this way.
+        //
+        // Shape is `restored/known` (or `unk`), not a bare count: `0` alone cannot
+        // distinguish *nothing to restore* from *could not restore anything*. See
+        // [`qlab_p2p::punish::PunishmentRestore::telemetry_field`]. Latched at open;
+        // every sample in the process reprints the same value. Always printed, zero
+        // included.
+        //
+        // ⚠️ A host that never observed an equivocation prints `prest=0/0` forever.
+        // That is correct for the local ledger (PR #159) and is **not** proof the net
+        // is punishment-free: a peer that saw the evidence and this host did not still
+        // disagree about who may sign. Agreement needs evidence in blocks (D1).
+        let prest = node.punishment_restore().telemetry_field();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} prest={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1031,6 +1054,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             applied.id_field(),
             applied.chain_field(),
             body_reqs,
+            prest,
         )
     }
 
@@ -1942,6 +1966,18 @@ mod tests {
         assert_eq!(restore.tombstoned, vec![signer]);
         assert!(!restore.ledger_absent_on_populated_datadir);
         assert!(restore.summary_line().contains("1 tombstone(s) restored (members 7)"));
+        // And the same fact is on the TELEMETRY line operators already read (D3).
+        // Shape is restored/known: 1 tombstone re-applied from 1 on-disk record.
+        assert_eq!(restore.telemetry_field(), "1/1");
+        let line = reopened.telemetry_sample();
+        assert!(
+            line.contains(" prest=1/1"),
+            "TELEMETRY must carry the restore report, not only the startup println: {line}"
+        );
+        assert!(
+            line.ends_with(" prest=1/1"),
+            "prest is the newest append, last field: {line}"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -3694,6 +3730,8 @@ mod tests {
                 "stipid", "schain",
                 // ── appended by #130 (c), at the end ──
                 "breq",
+                // ── appended by #133 D3, at the end ──
+                "prest",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -3710,9 +3748,12 @@ mod tests {
         // #162 finding 6: this node mined and applied its own tip, so the applied tip
         // IS the main-chain block at its height.
         assert!(line.contains(" schain=main"), "the wedge verdict: {line}");
-        // #130 (c): `breq=` is the newest append and is now the last field. A node
-        // alone on its own chain has nothing outstanding.
-        assert!(line.ends_with(" breq=0"), "nothing in flight, last: {line}");
+        // #130 (c): nothing outstanding on a lone node.
+        assert!(line.contains(" breq=0 "), "nothing in flight: {line}");
+        // #133 D3: `prest=` is the newest append and is now the last field. A fresh
+        // data dir has nothing to restore — and the shape is restored/known, not a
+        // bare zero, so "nothing to restore" is distinguishable from "unk".
+        assert!(line.ends_with(" prest=0/0"), "nothing restored, last: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

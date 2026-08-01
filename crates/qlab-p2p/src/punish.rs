@@ -294,6 +294,36 @@ impl PunishmentRestore {
             self.tombstoned.len()
         )
     }
+
+    /// The `TELEMETRY` form of this report (issue #133 D3 / Multica QUM-47).
+    ///
+    /// **Shape is `restored/known`, not a bare count.** A bare `0` cannot tell
+    /// *nothing to restore* from *could not restore anything* — and that distinction
+    /// is the entire defect this counter exists to surface. Values:
+    ///
+    /// | value | meaning |
+    /// |---|---|
+    /// | `0/0` | ledger present (or written empty on this open); nothing to restore |
+    /// | `N/M` | `N` tombstones re-applied from `M` on-disk records this process start |
+    /// | `unk` | data dir already held chain history but **no** ledger — punishment history
+    ///          is unknowable (pre-#133 datadir). Not silence, not clean. |
+    ///
+    /// ⚠️ **A live host that has never observed an equivocation prints `0/0` forever.**
+    /// That is correct for the local ledger and is **not** proof the net has never
+    /// punished anyone: a peer that saw the evidence and this host did not still
+    /// disagree about who may sign (push-once gossip, no getdata). Agreement needs
+    /// evidence in blocks (D1); this field only reports what *this* process restored.
+    ///
+    /// Latched at [`crate::adapter::NodeAdapter::open`]: every later sample in the
+    /// process lifetime reprints the same value. It is a startup fact, not a running
+    /// total.
+    pub fn telemetry_field(&self) -> String {
+        if self.ledger_absent_on_populated_datadir {
+            "unk".to_string()
+        } else {
+            format!("{}/{}", self.tombstoned.len(), self.records)
+        }
+    }
 }
 
 /// Re-adjudicate `records` against `ec` and re-apply their tombstones, returning the
