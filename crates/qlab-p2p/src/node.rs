@@ -16,7 +16,7 @@ use crate::codec::{
     checkpoint_id, decode_checkpoint_msg, decode_checkpoint_votes, decode_evidence_msg,
     decode_headers, decode_inv, decode_locator, decode_tx, encode_checkpoint_msg,
     encode_checkpoint_votes, encode_evidence_msg, encode_headers, encode_inv, encode_locator,
-    encode_tx, evidence_id, tx_id, InvItem, InvKind,
+    encode_tx, evidence_id, tx_id, InvItem, InvKind, InvVec,
 };
 use crate::compact::{
     decode_announce, decode_block_txn, decode_get_block_txn, encode_announce, encode_block_txn,
@@ -32,7 +32,7 @@ use crate::peer::{NodeId, PeerId, PeerTable, VersionMsg};
 use crate::ratelimit::{RateKey, RateLimiter, RateLimits, RateStats};
 use crate::sync::{build_locator, answer_get_headers, SyncPhase, SyncState, MAX_HEADERS_PER_BATCH};
 use crate::transport::{DialCompletion, DialStart, Transport, TransportError};
-use crate::wire::{Envelope, MsgType};
+use crate::wire::{Envelope, Frame, MsgType};
 
 /// Service-bits placeholder advertised in the handshake (`[devnet-placeholder]`).
 pub const SERVICE_FULL: u64 = 0x01;
@@ -50,6 +50,44 @@ fn dial_line(addr: &str, elapsed_ms: u64, result: &Result<PeerId, TransportError
         Ok(_) => format!("DIAL addr={addr} ms={elapsed_ms} result=ok"),
         Err(e) => format!("DIAL addr={addr} ms={elapsed_ms} result=err err=\"{e}\""),
     }
+}
+
+/// **How many distinct unknown envelope-type codes get a `WIRE` journal line
+/// before this node goes quiet about them** (issue #181).
+///
+/// The counter says *that* a newer peer is talking; the journal line says *what*
+/// it is speaking, which is the difference between "something is off" and "node1
+/// is sending 0x0044". But one line per frame would be the flooding channel this
+/// baton is supposed to close — at the inbound frame budget
+/// ([`crate::ratelimit::MSG_REFILL_PER_SEC`] = 64/s per rate key) that is 64
+/// lines/s/peer of attacker-chosen text into the operator's log.
+///
+/// So the line is emitted **once per distinct code, per process**, and the set of
+/// codes remembered is capped: the u16 space is 65,536 wide and an attacker can
+/// walk all of it. Eight is past any plausible honest skew (one rolling upgrade
+/// introduces one or two codes) and the ninth onward are counted in silence — the
+/// count never stops, only the narration does.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_UNKNOWN_TYPES_JOURNALLED: usize = 8;
+
+/// **Well-formed inbound things this build does not implement** (issue #181).
+///
+/// Not faults, and never scoring inputs — the same boundary
+/// [`crate::ratelimit::RateStats`] draws for throttling, for the same reason.
+/// Both numbers are process-lifetime totals; a restart resets them.
+///
+/// The pair exists because an operator rolling one host at a time needs to see
+/// version skew *as skew*. Before #181 these frames were bans, so the signal was
+/// "the net fell apart"; after #181 they are ignored, and without a counter the
+/// signal would be nothing at all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnknownStats {
+    /// Frames carrying an envelope type code this build does not implement.
+    pub frames: u64,
+    /// Inventory items carrying a kind code this build does not implement,
+    /// summed over every `inv` / `getdata` / `notfound` received.
+    pub inv_items: u64,
 }
 
 /// Entry cap on the body-serving cache (issue #135).
@@ -265,6 +303,13 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// peer costs a fraction of a batch rather than the whole of it, and so a re-ask
     /// after a timeout lands somewhere new.
     body_rr: usize,
+    /// Counts of well-formed inbound things this build does not implement
+    /// (issue #181). Read by operators; **never** a scoring input.
+    unknown: UnknownStats,
+    /// Unknown envelope-type codes already journalled, so the `WIRE` line is one
+    /// per code and not one per frame. Bounded by
+    /// [`MAX_UNKNOWN_TYPES_JOURNALLED`] — an attacker can pick 65,536 codes.
+    unknown_types_seen: BTreeSet<u16>,
 }
 
 impl<T: Transport, N: NodeState> P2pNode<T, N> {
@@ -286,6 +331,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             limiter: RateLimiter::default(),
             body_reqs: HashMap::new(),
             body_rr: 0,
+            unknown: UnknownStats::default(),
+            unknown_types_seen: BTreeSet::new(),
         }
     }
 
@@ -336,6 +383,16 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// Read by operators; **never** fed back into scoring (see [`crate::ratelimit`]).
     pub fn rate_stats(&self) -> RateStats {
         self.limiter.stats()
+    }
+
+    // --- version skew (issue #181) ---
+
+    /// Counts of well-formed inbound things this build does not implement.
+    ///
+    /// Read by operators as the *"am I talking to something newer?"* instrument.
+    /// **Never** fed back into scoring — that is the whole of #181.
+    pub fn unknown_stats(&self) -> UnknownStats {
+        self.unknown
     }
 
     /// Re-tune the inbound budgets (tests / testnet). Deliberately programmatic
@@ -628,10 +685,34 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 // Inbound connection we have not registered yet.
                 self.peers.add(from, None);
             }
-            match Envelope::decode(&frame) {
-                Ok(env) => self.dispatch(from, env, key, now_ms),
+            // 🔴 **Three arms, and issue #181 is the middle one.** These used to be
+            // two: `MsgType::from_u16` returning `None` was folded into `WireError`
+            // and caught by the `Err(_)` below, so a frame of a type this build did
+            // not implement was charged `PENALTY_MALFORMED` (100) against a
+            // `BAN_THRESHOLD` of −100 — an instant, one-frame ban for running an
+            // older image than the sender. On a net that rolls one host at a time
+            // that made every additive `MsgType` a partition.
+            //
+            // The two arms are kept apart in the TYPE and not merely here: the
+            // unknown-type case is `Ok(Frame::UnknownType)` and `WireError` has no
+            // variant for it, so this branch cannot be re-merged by accident. See
+            // `crate::wire::Frame`.
+            match Frame::decode(&frame) {
+                Ok(Frame::Known(env)) => self.dispatch(from, env, key, now_ms),
+                // "You are running a newer build than me." Not a fault, so not
+                // scored, not disconnected, and the connection carries on — the
+                // peer's *known* traffic is still every bit as useful as before.
+                // Counted, because a silent ignore is how the next version-skew
+                // incident becomes invisible.
+                Ok(Frame::UnknownType { msg_type_raw, payload_len }) => {
+                    self.on_unknown_type(from, msg_type_raw, payload_len);
+                }
+                // "You sent me bytes I cannot parse": bad magic, truncation,
+                // trailing bytes, an oversize length prefix — or a protocol
+                // version this build does not speak, which #181 deliberately did
+                // NOT move (a version bump is a wire break, not an additive
+                // change; see `crate::wire::Frame`'s doc for the open finding).
                 Err(_) => {
-                    // Malformed frame at the wire layer → strong penalty.
                     self.peers.penalize(from, PENALTY_MALFORMED);
                 }
             }
@@ -639,6 +720,56 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         self.maybe_start_sync();
         self.request_missing_bodies(now_ms);
         n
+    }
+
+    // --- issue #181: version skew is not misbehaviour -------------------------
+
+    /// A frame of a type this build does not implement: **ignore, count, and say
+    /// so once.**
+    ///
+    /// Three things it deliberately does not do:
+    ///
+    /// 1. **It does not score.** That is the fix.
+    /// 2. **It does not disconnect.** The peer's known traffic is still good, and
+    ///    on a rolling upgrade the newer host is exactly the one we need to stay
+    ///    talking to. Dropping the connection would be a slower version of the ban.
+    /// 3. **It does not reply.** There is no "I did not understand that" message
+    ///    in this protocol, and inventing one would be the new `MsgType` this
+    ///    baton is forbidden to add — and it would be unparseable by the older
+    ///    side, which is the same bug pointing the other way.
+    ///
+    /// The flooding bound is [`crate::ratelimit`], which already sits ahead of
+    /// decode in [`Self::tick`]: an unknown frame is charged against the same
+    /// frame and byte budgets as a known one, *before* it gets here. This handler
+    /// costs one increment and, at most [`MAX_UNKNOWN_TYPES_JOURNALLED`] times per
+    /// process, one line — so "ignore anything I don't recognise" is strictly
+    /// cheaper than handling the frame would have been.
+    fn on_unknown_type(&mut self, from: PeerId, msg_type_raw: u16, payload_len: usize) {
+        self.unknown.frames = self.unknown.frames.saturating_add(1);
+        if self.unknown_types_seen.contains(&msg_type_raw) {
+            return;
+        }
+        if self.unknown_types_seen.len() >= MAX_UNKNOWN_TYPES_JOURNALLED {
+            return; // still counted above; only the narration is capped
+        }
+        self.unknown_types_seen.insert(msg_type_raw);
+        // `key=value` like `TELEMETRY` / `ROUND` / `DIAL`, so the same grep/awk
+        // habits work. First sighting only — see the constant for the arithmetic.
+        println!(
+            "WIRE event=unknown_type type=0x{msg_type_raw:04x} bytes={payload_len} \
+             peer={} action=ignored scored=no",
+            from.0
+        );
+    }
+
+    /// Fold an inventory vector's skipped-kind count into the node's counters
+    /// (issue #181). One place, so `inv` / `getdata` / `notfound` cannot come to
+    /// disagree about whether an unknown kind is a fault.
+    fn count_unknown_inv(&mut self, v: &InvVec) {
+        if v.unknown_kinds > 0 {
+            self.unknown.inv_items =
+                self.unknown.inv_items.saturating_add(v.unknown_kinds as u64);
+        }
     }
 
     // --- issue #130 (c): the requesting side of historical body transfer -------
@@ -794,15 +925,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     // --- inventory gossip ---
 
     fn on_inv(&mut self, from: PeerId, payload: &[u8]) {
-        let items = match decode_inv(payload) {
+        let inv = match decode_inv(payload) {
             Ok(i) => i,
             Err(_) => {
                 self.peers.penalize(from, PENALTY_MALFORMED);
                 return;
             }
         };
+        // Issue #181: items of a kind this build does not implement were skipped by
+        // the codec. We simply do not ask for them — declining an offer costs
+        // nothing, and the peer is newer, not wrong.
+        self.count_unknown_inv(&inv);
         let mut want = Vec::new();
-        for it in items {
+        for it in inv.items {
             if self.already_have(&it) {
                 continue;
             }
@@ -837,32 +972,45 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// exempt, and everything else is charged exactly as before.
     ///
     /// A `NotFound` we cannot decode is still the sender's own malformed frame.
+    ///
+    /// Issue #181 narrows the welsh charge by exactly one case: an item whose kind
+    /// this build does not implement is skipped by the codec and so cannot trigger
+    /// it. That is correct and not a loophole — we could never have asked for such
+    /// an item, so its appearance here is version skew rather than a broken promise.
     fn on_not_found(&mut self, from: PeerId, payload: &[u8]) {
-        let items = match decode_inv(payload) {
+        let inv = match decode_inv(payload) {
             Ok(i) => i,
             Err(_) => {
                 self.peers.penalize(from, PENALTY_MALFORMED);
                 return;
             }
         };
+        self.count_unknown_inv(&inv);
         // Charge once per message, not per item, matching the pre-#130 (c) behaviour
         // for a message this node did not originate as a body request.
-        if items.iter().any(|it| !self.body_reqs.contains_key(&it.id)) {
+        if inv.items.iter().any(|it| !self.body_reqs.contains_key(&it.id)) {
             self.peers.penalize(from, PENALTY_WELSHED_INV);
         }
     }
 
     fn on_getdata(&mut self, from: PeerId, payload: &[u8]) {
-        let items = match decode_inv(payload) {
+        let inv = match decode_inv(payload) {
             Ok(i) => i,
             Err(_) => {
                 self.peers.penalize(from, PENALTY_MALFORMED);
                 return;
             }
         };
+        // Issue #181: an item of a kind this build does not implement is answered
+        // with **nothing** — not `NotFound`, which would be a lie (we do not know
+        // whether we hold it; we do not know what it is), and which the requester
+        // scores as a welshed inv. No reply is already this path's honest answer
+        // for a block we cannot serve (see `request_missing_bodies`), and it is the
+        // only answer expressible: `InvItem` cannot hold a kind we do not have.
+        self.count_unknown_inv(&inv);
         let mut not_found = Vec::new();
         let mut bodies_served = 0usize;
-        for it in items {
+        for it in inv.items {
             match it.kind {
                 InvKind::Tx => match self.node.get_tx(&it.id) {
                     Some(tx) => self.send(from, MsgType::Tx, encode_tx(&tx)),
@@ -888,10 +1036,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 // why this shape was chosen over the additive type the task book
                 // permitted: a NEW node asking an OLD one gets a header back and is
                 // not scored; an OLD node asking a NEW one gets a `BlockAnnounce` it
-                // has understood since M9. Neither side sees an unknown type — and an
-                // unknown type on this net is not ignored, it is `PENALTY_MALFORMED`
-                // (100) against a `BAN_THRESHOLD` of −100, i.e. **an instant, one-frame
-                // ban**. See the PR body; this is the finding the task book asked for.
+                // has understood since M9. Neither side sees an unknown type — which
+                // at the time was a ban on the first frame, the finding #130 (c)
+                // filed as `issue #181`.
+                //
+                // **#181 is fixed and this shape is still the right one**, because
+                // the fix only helps between two nodes that both HAVE it. Every host
+                // deployed before it still bans an unknown type, so the reasoning
+                // above stands unchanged for as long as any such host is running.
                 InvKind::Block => match self.node.header(&it.id) {
                     Some(h) => {
                         let body = if bodies_served < MAX_BODIES_PER_GETDATA {
@@ -1830,58 +1982,309 @@ mod tests {
         assert_eq!(*lonely.sync_phase(), SyncPhase::Unknown, "mid-handshake claims nothing");
     }
 
-    /// 🔴 **THE MIXED-VERSION FINDING (issue #130 (c)), test-locked.**
-    ///
-    /// The task book asked what a node does with an envelope type it does not know —
-    /// ignore, disconnect, or penalise — because the answer decides whether an
-    /// additive `MsgType` can be deployed onto a net running two images.
-    ///
-    /// **It penalises, and it bans on the FIRST FRAME.** `Envelope::decode` returns
-    /// `WireError::UnknownMsgType`, `tick` maps every wire-layer decode failure to
-    /// `PENALTY_MALFORMED` (100), and `BAN_THRESHOLD` is −100 — so one frame of an
-    /// unallocated type is a permanent ban, with no second chance and no distinction
-    /// between "you sent me garbage" and "you are newer than me".
-    ///
-    /// This test exists so the finding cannot be re-derived wrongly by the next
-    /// baton, and so that if anyone later makes unknown types benign, the change
-    /// shows up here as a deliberate edit rather than as a silent widening.
-    ///
-    /// It is why #130 (c) reuses `GetData(Block)` instead of allocating an envelope
-    /// type: with three of four T0 hosts on the older image, a new node asking them
-    /// for a body would have been banned by each of them on its first request.
-    #[test]
-    fn an_unknown_envelope_type_bans_the_sender_on_the_very_first_frame() {
-        let (mut nodes, _hub) = mesh(2);
-        run(&mut nodes);
-        assert_eq!(nodes[1].peers().get(PeerId(1)).unwrap().score, 0, "starts clean");
-
-        // A well-formed frame at the current protocol version whose type code is
-        // unallocated — exactly what an additive `MsgType` looks like to a node that
-        // predates it. Hand-built, because `Envelope::new` cannot express it.
-        let unknown_type: u16 = 0x0044;
-        assert!(MsgType::from_u16(unknown_type).is_none(), "0x0044 really is unallocated");
+    /// A well-formed frame at the current protocol version carrying a type code
+    /// this build does not implement — exactly what an additive `MsgType` looks
+    /// like to a node that predates it. Hand-built, because `Envelope::new`
+    /// cannot express a type that does not exist.
+    fn unknown_type_frame(msg_type_raw: u16, body: &[u8]) -> Vec<u8> {
+        assert!(
+            MsgType::from_u16(msg_type_raw).is_none(),
+            "0x{msg_type_raw:04x} must really be unallocated for this test to mean anything"
+        );
         let mut frame = Vec::new();
         frame.extend_from_slice(&crate::wire::MAGIC);
         frame.extend_from_slice(&crate::wire::PROTOCOL_VERSION.to_le_bytes());
-        frame.extend_from_slice(&unknown_type.to_le_bytes());
-        frame.extend_from_slice(&0u32.to_le_bytes()); // empty body
-        assert_eq!(
-            Envelope::decode(&frame),
-            Err(crate::wire::WireError::UnknownMsgType { got: unknown_type })
+        frame.extend_from_slice(&msg_type_raw.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        frame.extend_from_slice(body);
+        frame
+    }
+
+    /// A node under test as `PeerId(1)`, plus a raw transport handle for a
+    /// handshaked peer `PeerId(2)` whose frames the test hand-crafts and whose
+    /// inbox the test reads. Raw rather than a second [`P2pNode`] because every
+    /// #181 test sends something no `P2pNode` can be made to send.
+    fn node_and_peer() -> (InProcP2p, InProcTransport, Arc<InProcHub>) {
+        let hub = InProcHub::new();
+        let t0 = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let mut n0 = P2pNode::new(t0, stub(), [1; 32]);
+        let peer = sniffer(&hub, PeerId(2), "peer:9333");
+        hub.link(PeerId(2), PeerId(1));
+        let v = VersionMsg { node_id: [2; 32], services: 1, tip_height: 0, user_agent: "p".into() };
+        peer.send(PeerId(1), &Envelope::new(MsgType::Version, v.encode()).encode()).unwrap();
+        peer.send(PeerId(1), &Envelope::new(MsgType::VerAck, vec![]).encode()).unwrap();
+        n0.tick(0);
+        let _ = peer.poll(); // drop the handshake replies
+        assert_eq!(n0.peers().get(PeerId(2)).unwrap().score, 0, "starts clean");
+        (n0, peer, hub)
+    }
+
+    /// 🔴 **ISSUE #181, HALF ONE: an unknown envelope type is ignored, not scored.**
+    ///
+    /// This test replaces `an_unknown_envelope_type_bans_the_sender_on_the_very_first_frame`,
+    /// which asserted the defect (#130 (c) filed it deliberately, so it could not be
+    /// re-derived wrongly). The inversion is the fix.
+    ///
+    /// What it locks, in the order that matters:
+    ///
+    /// 1. **the score does not move** — not by `PENALTY_MALFORMED`, not by anything;
+    /// 2. **the peer is not banned**, which is the outcome that partitioned a
+    ///    rolling upgrade (100 against a −100 threshold, on frame one);
+    /// 3. **the connection keeps working** — a known frame sent straight after the
+    ///    unknown one is still handled. Silently dropping the peer would have been
+    ///    a slower version of the same bug, and only this assertion can tell the
+    ///    two apart;
+    /// 4. **it is counted**, with the type code journalled once.
+    ///
+    /// Read it against `a_malformed_body_under_a_known_type_is_still_penalised`:
+    /// **the pair is the fix**, because either one alone is satisfiable by a
+    /// mistake — score nothing ever, or score everything as before.
+    #[test]
+    fn an_unknown_envelope_type_is_ignored_and_never_scored() {
+        let (mut n0, peer, _hub) = node_and_peer();
+        assert_eq!(n0.unknown_stats(), UnknownStats::default());
+
+        // 0x0044 is the next code after `BlockTxn` — the literal shape of "the
+        // upgraded host allocated one more type than I know about".
+        let frame = unknown_type_frame(0x0044, &[]);
+        assert!(
+            matches!(Frame::decode(&frame), Ok(Frame::UnknownType { msg_type_raw: 0x0044, .. })),
+            "the framing layer classifies it rather than erroring"
         );
 
-        nodes[0].transport().send(PeerId(2), &frame).unwrap();
-        nodes[1].tick(0);
+        peer.send(PeerId(1), &frame).unwrap();
+        n0.tick(1);
 
         assert_eq!(
-            nodes[1].peers().get(PeerId(1)).unwrap().score,
-            -crate::gossip::PENALTY_MALFORMED,
-            "an unknown type is charged as a malformed frame — the strongest penalty"
+            n0.peers().get(PeerId(2)).unwrap().score,
+            0,
+            "a peer running a newer build has not misbehaved, so nothing is charged"
         );
         assert!(
-            nodes[1].peers().is_banned(PeerId(1)),
-            "🔴 ONE frame of an unknown type is a ban: PENALTY_MALFORMED(100) meets \
-             BAN_THRESHOLD(-100) exactly, so there is no budget for a version skew"
+            !n0.peers().is_banned(PeerId(2)),
+            "🔴 the whole of #181: an additive MsgType must not partition a rolling upgrade"
+        );
+        assert_eq!(n0.unknown_stats().frames, 1, "ignored is not the same as invisible");
+        assert_eq!(n0.unknown_stats().inv_items, 0, "the inv counter is a separate fact");
+
+        // Ten more, including a second distinct code and non-empty bodies: still
+        // nothing scored, still counted. One tolerated frame would not prove the
+        // peer survives a real skew, which is a stream and not a single message.
+        for i in 0..10 {
+            let f = unknown_type_frame(if i % 2 == 0 { 0x0044 } else { 0x0100 }, &[9; 16]);
+            peer.send(PeerId(1), &f).unwrap();
+        }
+        n0.tick(2);
+        assert_eq!(n0.peers().get(PeerId(2)).unwrap().score, 0);
+        assert!(!n0.peers().is_banned(PeerId(2)));
+        assert_eq!(n0.unknown_stats().frames, 11);
+
+        // The assertion that separates "ignored" from "quietly dropped the peer":
+        // a KNOWN frame from the same peer is still answered afterwards.
+        let _ = peer.poll();
+        peer.send(PeerId(1), &Envelope::new(MsgType::Ping, vec![0xAB]).encode()).unwrap();
+        n0.tick(3);
+        let replies = peer.poll();
+        assert_eq!(
+            count_msgs(&replies, MsgType::Pong),
+            1,
+            "the connection is still live and useful after 11 unknown frames"
+        );
+        assert_eq!(n0.peers().get(PeerId(2)).unwrap().score, 0, "and still unscored");
+    }
+
+    /// 🔴 **ISSUE #181, HALF TWO: bytes we cannot parse are still the sender's
+    /// fault.** The distinction IS the fix, so this is not an afterthought —
+    /// without it, "ignore unknown types" could have been implemented as "stop
+    /// penalising frames", which is a different and much worse change.
+    ///
+    /// Three cases, all still `PENALTY_MALFORMED`:
+    ///
+    /// - a frame that is garbage at the **framing** layer (bad magic);
+    /// - a frame whose **body** fails to decode under a type this node knows —
+    ///   the case the task book names explicitly;
+    /// - a protocol **version** this build does not speak, which #181 deliberately
+    ///   left alone (see `crate::wire::Frame` for the grounds and the finding).
+    #[test]
+    fn a_malformed_body_under_a_known_type_is_still_penalised() {
+        // --- the body case: `Addr` (0x0006), a type every build knows, carrying a
+        // payload its codec rejects. The type dispatches; the decode fails; the
+        // sender is charged, exactly as before #181.
+        let (mut n0, peer, _hub) = node_and_peer();
+        peer.send(PeerId(1), &Envelope::new(MsgType::Addr, vec![0xFF; 3]).encode()).unwrap();
+        n0.tick(1);
+        assert_eq!(
+            n0.peers().get(PeerId(2)).unwrap().score,
+            -crate::gossip::PENALTY_MALFORMED,
+            "a body that will not decode under a KNOWN type really is garbage"
+        );
+        assert!(n0.peers().is_banned(PeerId(2)), "and 100 against −100 still bans");
+        assert_eq!(
+            n0.unknown_stats(),
+            UnknownStats::default(),
+            "garbage is not version skew and must not inflate the skew counter"
+        );
+
+        // --- the framing case: bad magic, on a fresh pair so the score is clean.
+        let (mut n0, peer, _hub) = node_and_peer();
+        let mut bad_magic = Envelope::new(MsgType::Ping, vec![]).encode();
+        bad_magic[0] = b'X';
+        peer.send(PeerId(1), &bad_magic).unwrap();
+        n0.tick(1);
+        assert_eq!(
+            n0.peers().get(PeerId(2)).unwrap().score,
+            -crate::gossip::PENALTY_MALFORMED,
+            "junk framing is still junk"
+        );
+
+        // --- the version case: unchanged by #181, and asserted so that a later
+        // change to it is a deliberate edit rather than a silent widening.
+        let (mut n0, peer, _hub) = node_and_peer();
+        let mut v2 = Envelope::new(MsgType::Ping, vec![]).encode();
+        v2[4] = 0x02;
+        peer.send(PeerId(1), &v2).unwrap();
+        n0.tick(1);
+        assert_eq!(
+            n0.peers().get(PeerId(2)).unwrap().score,
+            -crate::gossip::PENALTY_MALFORMED,
+            "🔴 a PROTOCOL_VERSION bump still bans on frame one — #181 did not move this, \
+             and a version bump therefore still partitions a rolling upgrade"
+        );
+        assert_eq!(n0.unknown_stats().frames, 0, "counted as a fault, not as skew");
+    }
+
+    /// 🔴 **ISSUE #181 scope item 2: unknown frames cannot be used to flood.**
+    ///
+    /// "Ignore anything I don't recognise" is a free channel only if unknown
+    /// frames are unlimited. They are not, and the reason is placement rather than
+    /// a new bound: `ratelimit.rs` is charged in `tick` **before** decode, so an
+    /// unknown frame is metered on exactly the same frame and byte budgets as a
+    /// known one and is dropped by the same code path. This test is the
+    /// confirmation the task book asked for.
+    ///
+    /// The three assertions that make it a flood test rather than a rate-limiter
+    /// test: the excess is *dropped*, the excess is *not counted as skew* (it never
+    /// reached the classifier), and the peer is *still not scored* — the flood does
+    /// not sneak a ban in through the throttle either.
+    #[test]
+    fn unknown_frames_cannot_be_used_to_flood() {
+        let (mut n0, peer, _hub) = node_and_peer();
+        // A small, exactly-known budget: 8 frames and no refill inside the test's
+        // clock. `set_rate_limits` is programmatic precisely so a test can pin it,
+        // and it clears the buckets, so the handshake above is not charged here.
+        const BURST: u64 = 8;
+        const EXCESS: u64 = 24;
+        n0.set_rate_limits(RateLimits {
+            msg_burst: BURST,
+            msg_refill_per_sec: 0,
+            ..RateLimits::default()
+        });
+        let before = n0.rate_stats().throttled_frames;
+
+        for i in 0..(BURST + EXCESS) {
+            // Vary the code so the journal cap is exercised under flood too: 65,536
+            // codes are available to an attacker and only 8 may ever be printed.
+            let f = unknown_type_frame(0x0044u16.wrapping_add(i as u16), &[7; 32]);
+            peer.send(PeerId(1), &f).unwrap();
+        }
+        n0.tick(1);
+
+        assert_eq!(
+            n0.unknown_stats().frames,
+            BURST,
+            "only the budgeted frames were ever classified — the limiter is AHEAD of decode"
+        );
+        assert_eq!(
+            n0.rate_stats().throttled_frames - before,
+            EXCESS,
+            "the rest were dropped by the throttle, unopened"
+        );
+        assert_eq!(
+            n0.peers().get(PeerId(2)).unwrap().score,
+            0,
+            "and a flood of unknown frames still scores nothing — throttling is not a verdict"
+        );
+        assert!(!n0.peers().is_banned(PeerId(2)));
+    }
+
+    /// The **log** side of the same flooding question: an attacker picks the type
+    /// code, so one journal line per unknown frame would be attacker-controlled
+    /// text at the inbound frame rate. The count must not stop; the narration must.
+    #[test]
+    fn the_unknown_type_journal_is_bounded_but_the_counter_is_not() {
+        let (mut n0, peer, _hub) = node_and_peer();
+        n0.set_rate_limits(RateLimits::unlimited());
+        const DISTINCT: u16 = 40;
+        assert!(DISTINCT as usize > MAX_UNKNOWN_TYPES_JOURNALLED);
+        for i in 0..DISTINCT {
+            // 0x8000+ is far above every allocated code and stays unallocated.
+            peer.send(PeerId(1), &unknown_type_frame(0x8000 + i, &[])).unwrap();
+        }
+        n0.tick(1);
+        assert_eq!(
+            n0.unknown_stats().frames,
+            DISTINCT as u64,
+            "every unknown frame is counted, however many distinct codes there are"
+        );
+        assert_eq!(
+            n0.unknown_types_seen.len(),
+            MAX_UNKNOWN_TYPES_JOURNALLED,
+            "but only the first MAX_UNKNOWN_TYPES_JOURNALLED codes are ever narrated"
+        );
+        assert_eq!(n0.peers().get(PeerId(2)).unwrap().score, 0);
+    }
+
+    /// 🔴 **ISSUE #181 scope item 4: an unknown `InvKind` inside a KNOWN message.**
+    ///
+    /// The same category error one layer in, and the thing that blocked `#133` D2
+    /// from allocating `InvKind::Evidence`. The unknown item is skipped, the known
+    /// items in the same vector are still acted on (the `GetData` this node emits
+    /// is the proof it acted), the sender is not scored, and the skip is counted.
+    #[test]
+    fn an_unknown_inv_kind_is_skipped_and_the_rest_of_the_message_still_works() {
+        let (mut n0, peer, _hub) = node_and_peer();
+
+        // An `inv` (a type both sides know) offering one unknown kind followed by
+        // one `Tx` this node does not hold. Hand-patched, because `InvKind` cannot
+        // represent a kind that does not exist.
+        let wanted = InvItem { kind: InvKind::Tx, id: [0x5A; 32] };
+        let mut payload = encode_inv(&[InvItem { kind: InvKind::Tx, id: [0x11; 32] }, wanted]);
+        payload[1] = 0x04; // the reserved-but-unallocated CheckpointVotes kind
+        peer.send(PeerId(1), &Envelope::new(MsgType::Inv, payload).encode()).unwrap();
+        n0.tick(1);
+
+        assert_eq!(
+            n0.peers().get(PeerId(2)).unwrap().score,
+            0,
+            "an inventory kind we do not implement is version skew, not misbehaviour"
+        );
+        assert!(!n0.peers().is_banned(PeerId(2)));
+        assert_eq!(n0.unknown_stats().inv_items, 1);
+        assert_eq!(n0.unknown_stats().frames, 0, "the envelope type WAS known");
+
+        // The known item in the same vector was still acted on: we asked for it.
+        let asked: Vec<InvItem> = peer
+            .poll()
+            .iter()
+            .filter_map(|(_, f)| Frame::decode(f).ok())
+            .filter_map(|f| match f {
+                Frame::Known(e) if e.msg_type == MsgType::GetData => decode_inv(&e.payload).ok(),
+                _ => None,
+            })
+            .flat_map(|v| v.items)
+            .collect();
+        assert!(
+            asked.contains(&wanted),
+            "the skip must not swallow its neighbours: expected a GetData for the Tx, got {asked:?}"
+        );
+
+        // And a genuinely malformed inv under the same known type still scores.
+        peer.send(PeerId(1), &Envelope::new(MsgType::Inv, vec![0x01, 0x02]).encode()).unwrap();
+        n0.tick(2);
+        assert_eq!(
+            n0.peers().get(PeerId(2)).unwrap().score,
+            -crate::gossip::PENALTY_MALFORMED,
+            "a truncated inventory item is garbage, and the distinction survives one layer in"
         );
     }
 
@@ -2732,7 +3135,7 @@ mod tests {
     fn count_msgs(frames: &[(PeerId, Vec<u8>)], want: MsgType) -> usize {
         frames
             .iter()
-            .filter(|(_, f)| Envelope::decode(f).map(|e| e.msg_type == want).unwrap_or(false))
+            .filter(|(_, f)| Frame::decode(f).map(|fr| fr.msg_type() == Some(want)).unwrap_or(false))
             .count()
     }
 
