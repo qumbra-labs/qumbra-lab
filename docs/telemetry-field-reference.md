@@ -85,7 +85,7 @@ Five rules that hold for the whole line:
 | 13 | `dialable` | `<dialable>/<known>` addresses in the address book | 🟡 not alone |
 | 14 | `rounds` | **live** checkpoint rounds closed since process start | 🟢 never |
 | 15 | `rfail` | live rounds closed without finalizing | 🟡 not alone |
-| 16 | `fid` | identity of the finalized checkpoint | 🟡 not alone — **and the comparison is the R2 STOP** |
+| 16 | `fid` | identity of the finalized checkpoint | 🟡 not alone — **the comparison is the R2 STOP, and it is only a comparison at equal `final=`** |
 | 17 | `sslot` | slot this node's own keys last committed to | 🟢 never |
 | 18 | `sid` | identity those keys committed to, or `split` | 🔴 **yes — `sid=split`** |
 | 19 | `rback` | slots this node crossed as **history** | 🟢 **never. This is the field that cost two reports.** |
@@ -430,6 +430,16 @@ exactly what node2 and node3 showed (`sslot=0` while `tip=14`): their state
 machines never reached the slot, so they were **absent from it**, which is a
 different failure from disagreeing about it.
 
+**`sslot` leads `final=`, and that is what makes a `fid` split readable.** A key
+commits at **sign** time; `fid` only moves once a quorum is recorded finalized.
+So a host mid-transition prints an `sslot` **above** its own `final=`, carrying
+the identity the rest of the net is about to agree on. A host whose `sslot`/`sid`
+match the leader's height and identity while its `fid` still names the older
+checkpoint is **behind by one propagation step, not diverging** — §9 step 4. On
+the `t0-wan-5` roll (2026-08-01 12:52) that is exactly what node2 showed:
+`sslot=800 sid=17dd2cbdac3a` while its own `fid` still read the `792` checkpoint
+(`issue #183`).
+
 **Escalate when:** never from this field alone. Read it beside `sid` (§8) and
 `stip`/`slag` (§4, §5) — a stuck `sslot` with a stuck `stip` is the state machine,
 not the committee.
@@ -464,10 +474,12 @@ line that looks healthy while the thing it describes is not.
 |---|---|
 | `sid=split` on one host | 🔴 **alarm.** That host's key set disagrees with itself. |
 | `sid` differs **across hosts** at the same `sslot` | a **finding**, not a stop — this is the half that catches a committee split, and it may also simply mean a host was absent from the slot. |
+| `sid` differs across hosts at **different** `sslot` | **not a disagreement about content** — the two hosts are committed at different slots, so the identities are not comparable. Judge `sslot` itself first (§7: a host whose `sslot` is stuck while `tip` climbs has stopped signing, which is the `issue #162` shape), and compare identities only at a shared slot. |
 | `fid` differs across hosts at the same `final` | 🔴 **R2 STOP** — see §9. |
+| `fid` differs across hosts at **different** `final` | **not R2** — one host is ahead. §9 step 1. |
 
-The last two are kept apart deliberately: a `fid` split is a STOP and a `sid`
-split is a finding. On the 2026-07-31 net, node2/node3 printed a different `sid`
+The `fid` rows are kept apart from the `sid` rows deliberately: a `fid` split **at
+one height** is a STOP and a `sid` split is a finding. On the 2026-07-31 net, node2/node3 printed a different `sid`
 from node0/node1 and that turned out **not** to be a committee split on content
 at all — they had not signed at that slot at all, because their state machines
 never reached it (`issue #162`). Check `sslot` before concluding anything from a
@@ -485,7 +497,7 @@ difference: report it with the `sslot` values beside it.
 ## 9. `fid` — the identity of the finalized checkpoint
 
 **🟡 Not an alarm on its own — but the cross-host comparison is the one R2 STOP
-this line can express.**
+this line can express. Compare the heights before the identities.**
 
 **What it counts.** The identity of the checkpoint at `final=`, as 12 lowercase
 hex characters, read from the finality tracker's own head — the checkpoint the
@@ -497,20 +509,93 @@ is finalized.
 printed identical telemetry — **the most severe consensus failure this net can
 have was invisible to the only instrument an operator has.**
 
-**Normal value.** Identical across every host that reports the same `final=`.
+**Normal value.** Identical across every host that reports the **same** `final=`.
+Across hosts reporting **different** `final=`, a differing `fid=` is the ordinary
+state, not a discrepancy: `fid` names a different checkpoint because it is a
+different height.
 
-**🔴 The comparison:**
+### 🔴 The comparison, in order. Step 1 is not optional.
+
+**1 — Compare `final=` first.** **Different heights ⇒ not a fork**, whatever the
+`fid=` values say. One host is ahead and the other has not recorded that
+checkpoint finalized yet; finality propagates. This is not R2, and it is not an
+escalation. Go to step 3.
+
+**2 — Only when `final=` is equal across hosts does `fid=` decide anything.**
 
 ```
-same final=  +  different fid=   ⇒  two different checkpoints at one height  ⇒  R2 STOP
+same final=       +  different fid=   ⇒  two different checkpoints at one height  ⇒  🔴 R2 STOP
+different final=  +  different fid=   ⇒  one host is ahead                        ⇒  not R2 — step 3
 ```
+
+**The R2 stop-point is the first line of that block and this section narrows
+nothing about it**: two hosts reporting one `final=` and two `fid=` values is a
+STOP on the first sample that shows it — no waiting period, no second opinion, no
+corroborating field. Everything below concerns the case where the heights
+**differ**, which was never inside R2's criterion.
+
+**3 — A split at unequal heights should close within a sampling period or two.**
+The lagging host's `final=` reaches the leader's and its `fid=` becomes the
+leader's value.
+
+⚠️ **Count samples, not seconds.** `sample_interval` defaults to 30 s
+(`run.rs:599`) but it is a **floor**: the line is emitted from the main loop, and
+on the T0 WAN net that loop's period was measured **never below 131 s across 53
+samples on four hosts** (`issue #107`, open — the surface named there is
+`ratelimit.rs` / `transport.rs` / `addrman.rs`). A "sampling period" is whatever
+the gap between two `TELEMETRY` lines on that host actually is.
+
+A split at unequal heights that does **not** close — the lagging host's `final=`
+pinned while the leader keeps advancing — is a **finding, and still not R2**:
+that host is failing to finalize, which is `regime=` (§20), `rfail=` (§2) and the
+`ROUND why=` journal, not a checkpoint disagreement. Report it with both hosts'
+`final=`, `fid=`, `sslot=`, `sid=` and the number of samples it has persisted.
+
+**4 — `sslot`/`sid` are the leading indicator, and they are what makes the
+reading legible.** A node's keys commit at **sign** time, while `fid` moves only
+once a quorum is recorded finalized — so on a host that is mid-transition
+`sslot=` runs **ahead** of its own `final=` (§7, §8). A host whose `sslot` is at
+the leader's height carrying the leader's `sid`, while its own `fid` still names
+the older checkpoint, **has already signed the thing the others finalized**: it
+is mid-transition, not diverging. Read `sslot`/`sid` on both sides before drawing
+any conclusion from `fid`.
+
+**The reading this order exists for** (`t0-wan-5` roll, 2026-08-01 12:52,
+mid-convergence; four hosts, one sample — `issue #183`, reported by T-ops during
+the roll):
+
+```
+two hosts   final=792  fid=ff893294bc8a
+two hosts   final=800  fid=17dd2cbdac3a
+```
+
+**Not R2, and step 1 alone ends it**: 792 and 800 are different heights. The gap
+is `800 − 792 = 8`, exactly one checkpoint cadence
+(`CHECKPOINT_CADENCE_BLOCKS = 8`) — checkpoints are proposed only on the cadence
+grid (`run.rs:1418`), so hosts one checkpoint apart is the smallest disagreement
+this field can show and is what a checkpoint in flight looks like. Step 4 says
+the same thing from the other side: node2, one of the two hosts printing
+`final=792`, was already carrying `sslot=800 sid=17dd2cbdac3a` — it had signed
+what the leaders had finalized. It was gone one sampling period later, and
+`f800 → f808 → f816 → f824` was unanimous on every tick after.
+
+**Why the order is written down rather than left to judgement.** During ordinary
+propagation `fid` differs across hosts constantly, for seconds at a time,
+entirely correctly. An operator who has been told only *"a `fid` split is a
+STOP"* meets that and escalates — and **an alarm that fires during normal
+operation gets turned off.** That is `issue #105`'s lesson (`rounds=1316
+rfail=1315` on a healthy node: *"an alarm nobody will ever read again"*), pointed
+this time at the most severe alarm the line has. Losing the `fid` check to false
+positives would cost more than never having had it.
 
 **What a change means.** `fid` changing on one host while `final=` advances is
 ordinary — a new checkpoint has a new identity. `fid` going from a value to `-`
 is `final=` going backwards (§13), which is its own 🔴.
 
-**Escalate when:** any two hosts report the same `final=` with different `fid=`.
-Stop and report per R2; do not restart anything to see whether it recovers.
+**Escalate when:** any two hosts report **the same** `final=` with different
+`fid=`. Stop and report per R2; do not restart anything to see whether it
+recovers. **Different `final=` is not that condition** — it is step 3: watch it
+for a sample or two, and report it only if it fails to close.
 
 **Locked by:** `identity_fields_are_present_and_well_formed_before_anything_finalizes`
 (`run.rs:3679`), `telemetry_roundtrips_checkpoint_identity_at_0x03`
@@ -1030,6 +1115,10 @@ In order. Stop at the first 🔴.
 
 1. **`final=` went backwards on any host** (including `N` → `-`) ⇒ 🔴 R2 STOP.
 2. **Same `final=`, different `fid=`** across hosts ⇒ 🔴 R2 STOP.
+   ⚠️ **Compare `final=` first.** Different `final=` with different `fid=` is
+   **not** this row — one host is ahead and finality is propagating. It should
+   close within a sampling period or two; if it does not, report it as a finding
+   and keep going down this list. See §9, which is the whole check order.
 3. **`sid=split`** on any host ⇒ 🔴 escalate.
 4. **`schain=fork`** on any host ⇒ 🔴 wedged, intervene. (`schain=-` ⇒ report.)
 5. `slag` nonzero with a slope ≈ block rate ⇒ the state machine is applying
@@ -1061,5 +1150,5 @@ rendering) · `crates/qlab-node/src/round.rs` (the round ledger) ·
 `crates/qlab-p2p/src/addrman.rs` (the address book) ·
 `crates/qlab-devnet/src/params_devnet.rs` (the frozen constants).
 
-Issues cited: #73 #74 #83 #84 #87 #104 #105 #106 #117 #121 #130 #134 #162 #164
-#165 #167 #169 #172 #173. PRs cited: #72 #93 #110 #119 #153 #168 #171.
+Issues cited: #73 #74 #83 #84 #87 #104 #105 #106 #107 #117 #121 #130 #134 #162
+#164 #165 #167 #169 #172 #173 #183. PRs cited: #72 #93 #110 #119 #153 #168 #171.
