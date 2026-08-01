@@ -1166,6 +1166,7 @@ dependencies = [
  "ctrlc",
  "ml-dsa",
  "qlab-air",
+ "qlab-cbserver",
  "qlab-consensus",
  "qlab-devnet",
  "qlab-node",

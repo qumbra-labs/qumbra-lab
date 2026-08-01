@@ -99,5 +99,13 @@ tiny_http = "=0.12.0"
 # the only spend-witness constructor, so this is what proves the minted note is
 # spendable by its payee and by nobody else.
 qlab-wallet = { path = "../qlab-wallet" }
-# `[u64;4]` ↔ `[u8;32]` lane conversions on the note-commitment/anchor boundary.
+# `[u64;4]` ↔ `[u8;32]` lane conversions on the note-commitment/anchor boundary,
+# and — since issue #188 baton 2 — the real ML-KEM/AEAD note encryption plus
+# `scan::detect_matches`, so the discovery acceptance test detects a payment the
+# way a wallet does rather than by re-deriving a tag in the test.
 qlab-note = { path = "../qlab-note" }
+# The ratified compact-block wire DECODER, used only to read back what the
+# discovery endpoint serves. The encoder this binary serves with is
+# `qlab_node::compact_response`; a test that decoded with anything other than the
+# reference decoder would not be testing the wire.
+qlab-cbserver = { path = "../qlab-cbserver" }

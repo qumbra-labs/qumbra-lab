@@ -50,6 +50,7 @@ use qlab_node::recovery::{Finalizer, FinalizerState};
 use qlab_node::round::ObsClock;
 use qlab_node::{ChainStore, SupplyBlock, SupplyLedger, Telemetry};
 
+use crate::discovery_server::{DiscoveryServer, DiscoveryView};
 use crate::metrics_server::MetricsServer;
 use crate::telemetry_server::TelemetryServer;
 
@@ -97,6 +98,22 @@ const METRICS_REFRESH: Duration = Duration::from_secs(5);
 /// stale sample can only make a node look *behind* — which the view renders as
 /// lag, never as disagreement.
 pub const TELEMETRY_REFRESH: Duration = Duration::from_secs(5);
+
+/// How often the run loop re-projects the main chain's committed note-discovery
+/// for the `/v1/compact` endpoint (issue #188 baton 2).
+///
+/// Same snapshot discipline, same reason: a wallet polling this must never be able
+/// to contend with the consensus loop for node state, so **the node decides how
+/// often it pays** and a request costs an `Arc` clone. The refresh itself is
+/// incremental — an unchanged tip does no work at all, and a changed one costs the
+/// new blocks — so the cadence bounds staleness rather than cost.
+///
+/// 5 s against a FROZEN 75 s block time means a served range is at most one
+/// fifteenth of a block behind, and below the finalized head not even that: no
+/// reorg can cross the finalized head, so a finalized height's body — and
+/// therefore its committed discovery — is fixed forever. A stale projection can
+/// only show a wallet *fewer* of its outputs, never a different one.
+pub const DISCOVERY_REFRESH: Duration = Duration::from_secs(5);
 
 /// Unix seconds now (wall clock). Used for the metric surface's `process_start` and
 /// `rendered_at` stamps only — never for consensus, which reads header timestamps.
@@ -270,6 +287,16 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// The `/v1/telemetry` server, when `telemetry_addr` is configured. `None` =
     /// the node listens on nothing extra, which is the default.
     telemetry_server: Option<TelemetryServer>,
+    /// The main chain's committed note-discovery, as of the last refresh — what
+    /// `/v1/compact` serves (issue #188 baton 2). One `Arc` swap per refresh, so a
+    /// reader holds the lock only long enough to clone a pointer.
+    discovery_view: Arc<Mutex<Arc<DiscoveryView>>>,
+    /// When the projection was last refreshed.
+    last_discovery_refresh: Instant,
+    /// The `/v1/compact` server. `None` only when the operator wrote
+    /// `discovery_addr = "off"` — **this is the one listener whose default is on**;
+    /// see [`crate::discovery_server`] for why it inverts `metrics_addr`'s default.
+    discovery_server: Option<DiscoveryServer>,
     /// Incremental scheduled-issuance accounting. Rebuilt once from the persisted
     /// canonical bodies at startup, then advanced only for new heights.
     supply_ledger: Mutex<SupplyLedger>,
@@ -590,6 +617,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             telemetry_snapshot: Arc::new(Mutex::new(Vec::new())),
             last_telemetry_render: Instant::now(),
             telemetry_server: None,
+            discovery_view: Arc::new(Mutex::new(Arc::new(DiscoveryView::default()))),
+            last_discovery_refresh: Instant::now(),
+            discovery_server: None,
             supply_ledger: Mutex::new(supply_ledger),
             process_start_secs: unix_secs(),
             listen_addr: bound,
@@ -1212,6 +1242,55 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         }
     }
 
+    /// Bind the `/v1/compact` note-discovery endpoint (issue #188 baton 2).
+    /// Returns the bound address.
+    ///
+    /// Called whenever `config.discovery_bind()` yields an address, which — unlike
+    /// every other listener in this binary — is the **default**. An unbindable
+    /// address is an error and never a silent no-op, and because this one is on by
+    /// default that turns a port conflict into a node that will not start; the
+    /// error message names `discovery_addr = "off"`.
+    pub fn start_discovery_endpoint(&mut self, addr: &str) -> std::io::Result<std::net::SocketAddr> {
+        // Project before binding, so the first read is answered from the chain this
+        // process actually opened rather than from an empty view.
+        self.refresh_discovery();
+        let srv = DiscoveryServer::start(addr, Arc::clone(&self.discovery_view))?;
+        let bound = srv.addr();
+        self.discovery_server = Some(srv);
+        Ok(bound)
+    }
+
+    /// The bound `/v1/compact` address, if serving.
+    pub fn discovery_addr(&self) -> Option<std::net::SocketAddr> {
+        self.discovery_server.as_ref().map(|s| s.addr())
+    }
+
+    /// Re-project the main chain's committed discovery for `/v1/compact`.
+    ///
+    /// Reads the block store and copies `StoredTx::discovery` verbatim; there is no
+    /// encoder between the block and the served bytes, which is what makes a served
+    /// group that differs from the committed one unconstructible rather than
+    /// unlikely. Incremental: an unchanged tip returns without touching the view.
+    pub fn refresh_discovery(&mut self) -> bool {
+        let mut next = (**self
+            .discovery_view
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()))
+        .clone();
+        if !next.refresh(self.p2p.node().state().chain()) {
+            return false;
+        }
+        if let Ok(mut slot) = self.discovery_view.lock() {
+            *slot = Arc::new(next);
+        }
+        true
+    }
+
+    /// The projection `/v1/compact` is currently serving (tests / accounting).
+    pub fn discovery_view(&self) -> Arc<DiscoveryView> {
+        Arc::clone(&self.discovery_view.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
     /// Re-render the snapshot the scrape server serves.
     fn refresh_metrics(&mut self) {
         let text = self.metrics_text();
@@ -1644,6 +1723,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 self.refresh_metrics();
                 self.last_metrics_render = Instant::now();
             }
+            if self.discovery_server.is_some()
+                && self.last_discovery_refresh.elapsed() >= DISCOVERY_REFRESH
+            {
+                self.refresh_discovery();
+                self.last_discovery_refresh = Instant::now();
+            }
             if self.telemetry_server.is_some()
                 && self.last_telemetry_render.elapsed() >= TELEMETRY_REFRESH
             {
@@ -1823,6 +1908,11 @@ mod tests {
             expected_genesis_hash: Some(genesis.hash_hex()),
             metrics_addr: None,
             telemetry_addr: None,
+            // Explicitly off in the in-process fixtures: the default is a fixed
+            // loopback port and these tests start many nodes in one process, so
+            // the second bind would fail. `discovery_default_is_on_*` covers the
+            // default itself, from a config FILE, which is where it applies.
+            discovery_addr: None,
             miner_rkm: None,
         };
         (config, genesis, base)
