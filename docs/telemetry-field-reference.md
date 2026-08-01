@@ -96,7 +96,21 @@ Five rules that hold for the whole line:
 | 24 | `stipid` | identity of the applied tip | 🟡 not alone |
 | 25 | `schain` | `main` / `fork` / `-` | 🔴 **yes — `schain=fork`** |
 | 26 | `breq` | historical block-body requests in flight | 🟡 not alone |
-| 27 | `prest` | committee punishments restored at process start | 🟡 not alone |
+| 27 | `fback` | ⛔ **not documented here** — appended 2026-08-01 by `issue #85` | — |
+| 28 | `prest` | committee punishments restored at process start | 🟡 not alone |
+| 29 | `bdrop` | `<total>@<height>` — bodies the state machine refused, and where | 🟡 not alone — **read the height against `stip=`** |
+
+⚠️ **One field on the line still has no row here: `fback=`.** It is named above
+rather than omitted so that an operator meeting it cold knows it is
+*undocumented*, not *unknown to this project* — the exact distinction the `rback=`
+failure at the top of this document cost two reports to learn.
+
+⚠️ **And the numbering above was off by one until now**, which matters more than
+it sounds for a document whose first rule is that the line is positional: `fback=`
+sits between `breq=` and `prest=` on the real line, so the rows previously
+numbered 26/27 (`breq`/`prest`) were 26 and **28**. Corrected here as a
+precondition for adding row 29 — a positional reference with a hole in it points
+every row after the hole at the wrong field.
 
 ---
 
@@ -1127,7 +1141,7 @@ sustained is *asking and not being served*.
 
 ---
 
-## 27. `prest` — committee punishments restored at process start (touches TELEMETRY)
+## 28. `prest` — committee punishments restored at process start (touches TELEMETRY)
 
 **🟡 Not alone.** A non-zero value is a local fact about this host's ledger; a
 cross-host comparison is the load-bearing reading.
@@ -1175,6 +1189,67 @@ not an operator action on one host.
 expects `prest=1/1` after restart),
 `a_non_witness_finalizes_a_checkpoint_the_restarted_witness_refuses`
 (`adapter.rs` — the two-node same-height divergence the local ledger cannot close).
+## 29. `bdrop` — bodies the state machine refused, and where
+
+**🟡 Not an alarm on its own. Read the height against `stip=`.**
+
+**What it counts.** `<total>@<height>`: block bodies this node's own state machine
+**refused at the application funnel**, cumulative since process start, paired with
+the **chain height of the most recent refusal**. `bdrop=0@-` means none has been
+refused; the `-` is the "no figure to state" convention, and it is not the same
+claim as a height of `0` (genesis is height 0). See
+`NodeAdapter::body_refusals` and `bdrop_field` (`run.rs`).
+
+**Why the field exists.** Until `issue #130 (b)` this refusal was an `Err(_) => {}`
+arm under a comment calling the drop expected, and there was no counter and no
+field anywhere. **A node dropping every body it was handed printed exactly what a
+healthy node prints.** #130 records that this is what made it the worst of five
+same-shaped defects that week: *"every other instance was silence; this one was
+silence with a comment vouching for it."*
+
+**Why a height and not a rate.** A cumulative total answers *how many* and cannot
+answer *are they still arriving*, and those two want opposite responses. One
+telemetry line has no previous sample to difference against, and chain time has no
+wall-clock anchor here (genesis is stamped `timestamp = 0` for a reproducible
+genesis hash — `issue #106`). Height is the monotone quantity that is already on
+the line, so the comparison is done by eye from one sample.
+
+**Normal value.** `0@-`.
+
+**What a change means — the pair to read:**
+
+| reading | verdict |
+|---|---|
+| `bdrop=0@-` | nothing has been refused |
+| `bdrop=N@H` with `H` far below `stip=` | a burst that is **over**. Record `N` and `H`; do not escalate on the total alone |
+| `bdrop=N@H` with `H` at or next to `stip=` | 🟡 this node is refusing bodies **now**, and `slag=` will not close while it does |
+| `N` rising across samples | 🟡 sustained refusal — take the per-reason breakdown from `/metrics` before reporting |
+
+**The per-reason breakdown is on `/metrics`, not on this line:**
+`qumbra_body_apply_refused_total{reason=…}` over `not_extending_tip`, `bad_body`,
+`nullifier_spent`, `persist_io`, `internal`.
+
+🔴 **Two of those five reasons must be zero forever.**
+`reason="not_extending_tip"` and `reason="internal"` are **invariant tripwires**:
+the only production caller of `apply_block` selects the body it applies by the
+exact negation of the first error's trigger, so a nonzero scrape is a defect in
+**this node's own code**, not a network condition. **Report it; it is not an
+operator action.** The other three (`bad_body`, `nullifier_spent`, `persist_io`)
+can genuinely happen — the first two mean a peer served a chain whose bodies do
+not validate, the third is `issue #104`'s shape, a durable chain that has quietly
+stopped being durable.
+
+**Escalate when:** `not_extending_tip` or `internal` is nonzero on `/metrics`
+(report, do not act); or the total is rising with the height tracking `stip=`
+across several samples.
+
+**Locked by:** `a_body_refused_at_the_application_funnel_is_counted_and_located`
+and `i130b_a_held_body_that_does_not_extend_the_applied_tip_never_reaches_apply_block`
+(`adapter.rs`), `every_apply_failure_classifies_to_a_declared_refusal_reason`
+(`qlab-node/src/node.rs`),
+`every_body_refusal_reason_is_a_series_from_the_first_scrape`
+(`qlab-node/src/metrics.rs`),
+`bdrop_renders_the_count_and_the_height_of_the_last_refusal` (`run.rs`).
 
 ---
 
