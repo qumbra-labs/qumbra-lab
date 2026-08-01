@@ -28,7 +28,7 @@ The line is emitted to stdout every `TELEMETRY_REFRESH` interval by
 order is the `format!` at `run.rs:996`:
 
 ```
-TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain=
+TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= unk=<n>/<n>
 ```
 
 ⚠️ **That is the field list, not a capture.** The only values quoted in this
@@ -95,6 +95,9 @@ Five rules that hold for the whole line:
 | 23 | `mready` | mining-readiness verdict | 🟢 never |
 | 24 | `stipid` | identity of the applied tip | 🟡 not alone |
 | 25 | `schain` | `main` / `fork` / `-` | 🔴 **yes — `schain=fork`** |
+| — | `breq` | historical body requests in flight (`issue #130` (c)) | ⛔ **not documented here — this doc predates the field** |
+| — | `fback` | is the tracker's checkpoint backed by this host's own chain (`issue #85`) | ⛔ **not documented here — this doc predates the field** |
+| 26 | `unk` | `<frames>/<inv items>` this build does not implement | 🟡 not alone — see §26 |
 
 ---
 
@@ -1109,6 +1112,70 @@ connectivity report.
 
 ---
 
+## 26. `unk` — frames and inventory items this build does not implement
+
+**🟡 Not an alarm alone — and the reading depends entirely on whether an upgrade
+is in flight.** It is the version-skew instrument, added by `issue #181` in the
+same change that stopped an unrecognised frame from banning its sender.
+
+**What it counts.** `unk=<frames>/<inv items>`, both cumulative **since process
+start** (a restart resets them), over traffic that survived the inbound rate
+limiter:
+
+- **left** — inbound frames whose *envelope type code* this build does not
+  implement. Ignored, never scored;
+- **right** — *inventory items* whose kind code this build does not implement,
+  over every `inv` / `getdata` / `notfound` received. Skipped, never scored.
+
+Neither number is ever a scoring input. **A peer that appears here has not
+misbehaved — it is running a newer build than this host.** Before `#181` such a
+frame was charged `PENALTY_MALFORMED` (100) against a `BAN_THRESHOLD` of −100,
+i.e. an instant ban on the first frame, which is why no baton has been able to
+add a message type since.
+
+**Normal value.** `unk=0/0` on a net where every host runs the same image.
+
+**What a change means.**
+
+| reading | means |
+|---|---|
+| `0/0` | no skew seen |
+| left climbing **during a rolling upgrade** | ✅ expected — this host is older than the one already rolled, and it is coping. It is the *confirmation* that the roll is in progress, not a problem |
+| left climbing with **no upgrade in flight** | 🟡 report it. Either a host is running an image nobody recorded, or something is speaking the magic and the version but not the protocol |
+| left **stops** climbing after a roll completes | ✅ the skew closed |
+| right climbing | the same thing one layer in — a peer is offering an inventory kind this build has no code for |
+
+🔴 **The sequencing this field exists to make visible, and it is the whole point
+of `#181`: the fix only helps for versions AFTER it lands.** Every host must be
+running the `#181` image before any new `MsgType` or `InvKind` may be introduced.
+A host that predates it still bans on the first unknown frame — and it will not
+print `unk=` at all, because it does not have the field. **An absent `unk=` is
+therefore itself a reading: that host is not yet safe to send a new type to.**
+
+⚠️ **`unk` does not cover a `PROTOCOL_VERSION` bump.** A frame at a version this
+build does not speak is still scored as malformed and still bans on the first
+frame. `#181` deliberately did not move that (a version bump is a wire break, not
+an additive change) and recorded it as open. Do not read `unk=0/0` as "any wire
+change is safe to roll".
+
+**On `/metrics`** as `qumbra_unknown_msg_type_total` and
+`qumbra_unknown_inv_kind_total`, the same two numbers. There is also a `WIRE`
+journal line naming each distinct unknown type code the **first** time it is
+seen (`WIRE event=unknown_type type=0x0044 … action=ignored scored=no`), capped
+at 8 distinct codes per process so it cannot itself be flooded — the count keeps
+going after that, only the narration stops.
+
+**Escalate when:** never from this field alone. Report a climbing left-hand
+number when no upgrade is in flight.
+
+**Locked by:** `an_unknown_envelope_type_is_ignored_and_never_scored` and
+`a_malformed_body_under_a_known_type_is_still_penalised`
+(`crates/qlab-p2p/src/node.rs`),
+`an_unknown_envelope_type_over_tcp_is_ignored_and_reported_on_both_surfaces`
+(`crates/qumbra-node/src/run.rs`).
+
+---
+
 ## Appendix A — the two-minute triage
 
 In order. Stop at the first 🔴.
@@ -1136,6 +1203,13 @@ cumulative since **process** start.
 - **`peers=`** — open, `issue #172`. See §6.
 - **Whether `mready` should read `slag`** — open, `issue #162` observation 1. See
   §25.
+- **`breq=` and `fback=`** — both landed after this document was written and
+  neither has a section here. They are named in the glance table so the "in the
+  order the line prints them" claim stays true, and nothing more. Do not infer
+  their semantics from their names.
+- **What a node should do with a `PROTOCOL_VERSION` it does not speak** — open,
+  reported by `issue #181`, which fixed the message-type case and deliberately
+  left this one. See §26.
 - **Any absolute threshold for "too long in `Degraded`"** — there is no measured
   basis for one, and inventing a number here would be exactly the kind of figure
   this project has been bitten by. The runbook owns the procedure.
@@ -1150,5 +1224,5 @@ rendering) · `crates/qlab-node/src/round.rs` (the round ledger) ·
 `crates/qlab-p2p/src/addrman.rs` (the address book) ·
 `crates/qlab-devnet/src/params_devnet.rs` (the frozen constants).
 
-Issues cited: #73 #74 #83 #84 #87 #104 #105 #106 #107 #117 #121 #130 #134 #162
-#164 #165 #167 #169 #172 #173 #183. PRs cited: #72 #93 #110 #119 #153 #168 #171.
+Issues cited: #73 #74 #83 #84 #85 #87 #104 #105 #106 #107 #117 #121 #130 #133 #134
+#162 #164 #165 #167 #169 #172 #173 #181 #183. PRs cited: #72 #93 #110 #119 #153 #168 #171.
