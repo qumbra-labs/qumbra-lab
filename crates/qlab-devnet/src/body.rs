@@ -774,6 +774,247 @@ mod tests {
         );
     }
 
+    // --- issue #188: body-bound discovery -----------------------------------
+
+    /// **The round-trip over the new body**, including the empty case.
+    ///
+    /// Three separate claims, because they fail separately:
+    ///   1. a transaction's committed discovery bytes decode back to the group
+    ///      that produced them and re-encode to the same bytes;
+    ///   2. the commitment is deterministic and sensitive to the discovery
+    ///      region alone;
+    ///   3. the empty body — no transactions, therefore no discovery groups —
+    ///      has a stable encoding that does **not** collide with the pre-change
+    ///      empty body. Claim 3 is the one `BODY_PREIMAGE_DOMAIN` exists for;
+    ///      without the domain tag §3's encoding leaves it byte-identical.
+    #[test]
+    fn discovery_round_trips_and_the_empty_body_does_not_collide_with_v1() {
+        let cms = vec![[0x44u8; 32], [0x55u8; 32]];
+        let tx = TxEntry {
+            proof: b"ok".to_vec(),
+            public: TxPublic {
+                anchor: FINAL_ANCHOR,
+                nullifiers: vec![[0x22; 32], [0x33; 32]],
+                commitments: cms.clone(),
+                bucket: ArityBucket::TwoByTwo,
+                fee: posted_fee(ArityBucket::TwoByTwo),
+            },
+            discovery: two_recipient_discovery(&cms),
+        };
+        // 1. decode ∘ encode = id, on the bytes the body commits to.
+        let back = tx.discovery_group(0).expect("discovery decodes");
+        assert_eq!(encode_group_contents(&back), tx.discovery);
+        assert_eq!(contents_commitments(&back), cms, "D4 order, recipient-major");
+
+        // 2. deterministic, and sensitive to the discovery region alone.
+        let body = BlockBody { txs: vec![tx.clone()], coinbase: 0, coinbase_rkm: [0; 4] };
+        assert_eq!(body.commitment(), body.commitment());
+        let mut swapped = tx.clone();
+        swapped.discovery = two_recipient_discovery(&[cms[1], cms[0]]);
+        let reordered = BlockBody { txs: vec![swapped], coinbase: 0, coinbase_rkm: [0; 4] };
+        assert_ne!(
+            body.commitment(),
+            reordered.commitment(),
+            "the discovery region is inside the commitment"
+        );
+
+        // 3. the empty body: stable, and distinct from the v1 preimage. The v1
+        //    preimage is reconstructed here rather than quoted, so the claim is
+        //    "these two functions disagree" and not "this constant differs from
+        //    another constant I also wrote".
+        let empty = BlockBody::default();
+        assert_eq!(empty.commitment(), BlockBody::default().commitment());
+        let v1_empty = {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&empty.coinbase.to_le_bytes());
+            for lane in &empty.coinbase_rkm {
+                buf.extend_from_slice(&lane.to_le_bytes());
+            }
+            keccak256(&buf)
+        };
+        assert_eq!(
+            hex_of(&v1_empty),
+            "daa77426c30c02a43d9fba4e841a6556c524d47030762eb14dc4af897e605d9b",
+            "this reconstruction IS the pre-#188 empty-body commitment"
+        );
+        assert_ne!(
+            empty.commitment(),
+            v1_empty,
+            "a body with no discovery groups must not collide with a pre-change body"
+        );
+    }
+
+    /// 🔴 **The malleability test — the property the whole option rests on.**
+    ///
+    /// Two byte strings that decode to the same logical body must be
+    /// *impossible*, not merely unlikely. The committed discovery region is
+    /// fixed-width throughout (`n_recipients` u8, `ct` 1088 B, `n_outputs` u8,
+    /// `cm` 32 B, `tag` 8 B, `clue_len` u8 = 0) and length-prefixed by a `u64`
+    /// LE, so it contains **no varint at all** — stronger than D6 asked for, and
+    /// true only because `tx_index` is excluded (see
+    /// `qlab_note::compact::write_group_contents`).
+    ///
+    /// So this attacks it three ways: a non-canonical varint fed directly into
+    /// the region, a padded `tx_index` fed into the serving form that projects
+    /// from the same bytes, and trailing junk.
+    #[test]
+    fn non_canonical_bytes_cannot_reach_a_body_commitment() {
+        let cms = vec![[0x44u8; 32], [0x55u8; 32]];
+        let honest = two_recipient_discovery(&cms);
+        let mut tx = good_tx(1);
+        tx.public.commitments = cms.clone();
+        tx.discovery = honest.clone();
+        let body = BlockBody { txs: vec![tx.clone()], coinbase: 0, coinbase_rkm: [0; 4] };
+        assert_eq!(validate_body(&header_for(&body), &body, &MockVerifier, is_final), Ok(()));
+
+        // (a) A padded varint spliced at the region's first byte. `0x82 0x00` is
+        //     the LEB128 padding of 2 — the exact shape D6 names. There is no
+        //     varint here for it to be accepted by: `0x82` is read as
+        //     `n_recipients = 130` and the buffer runs out. It can never be a
+        //     second spelling of `n_recipients = 2`, which is the property.
+        let mut padded = vec![0x82u8, 0x00];
+        padded.extend_from_slice(&honest[1..]);
+        let mut bad = tx.clone();
+        bad.discovery = padded;
+        assert!(
+            matches!(check_tx_discovery(0, &bad), Err(BodyError::DiscoveryMalformed { .. })),
+            "a padded varint spliced into the committed region is refused"
+        );
+
+        // (b) The serving projection over the same bytes — `varint(index) ‖
+        //     region`. THIS has a varint, and a padded one is rejected by the
+        //     ratified decoder (D6, PR #149). Asserted here because the served
+        //     form is what a wallet scans in baton 2.
+        let mut served = Vec::new();
+        qlab_note::compact::write_varint(&mut served, 2);
+        served.extend_from_slice(&honest);
+        assert!(qlab_note::compact::decode_group(&served).is_ok());
+        let mut served_padded = vec![0x82u8, 0x00];
+        served_padded.extend_from_slice(&honest);
+        assert!(
+            matches!(
+                qlab_note::compact::decode_group(&served_padded),
+                Err(CodecError::NonCanonicalVarint { len: 2 })
+            ),
+            "a padded tx_index is refused on the serving wire"
+        );
+
+        // (c) Trailing junk: a well-formed prefix plus anything would be a
+        //     second byte string for one logical group, so it must not decode.
+        let mut trailing = honest.clone();
+        trailing.push(0x00);
+        let mut bad = tx.clone();
+        bad.discovery = trailing;
+        assert!(matches!(
+            check_tx_discovery(0, &bad),
+            Err(BodyError::DiscoveryMalformed {
+                index: 0,
+                err: CodecError::TrailingBytes { remaining: 1 }
+            })
+        ));
+
+        // (d) The positive half of the same property: the accepted encoding
+        //     re-encodes to itself, so there is exactly one of it.
+        assert_eq!(encode_group_contents(&tx.discovery_group(0).unwrap()), honest);
+    }
+
+    /// **The rejection test**: a body whose discovery does not bind is refused
+    /// with a typed error, and *cannot parse* stays a different answer from
+    /// *parses but does not bind*.
+    #[test]
+    fn discovery_that_does_not_bind_is_rejected_and_omission_is_its_n_equals_zero_case() {
+        let cms = vec![[0x44u8; 32], [0x55u8; 32]];
+        let mut tx = good_tx(1);
+        tx.public.commitments = cms.clone();
+        tx.discovery = two_recipient_discovery(&cms);
+
+        // Wrong commitment, right shape — parses, does not bind.
+        let mut wrong = tx.clone();
+        wrong.discovery = two_recipient_discovery(&[cms[0], [0xEE; 32]]);
+        let body = BlockBody { txs: vec![wrong], coinbase: 0, coinbase_rkm: [0; 4] };
+        assert_eq!(
+            validate_body(&header_for(&body), &body, &MockVerifier, is_final),
+            Err(BodyError::DiscoveryDoesNotBind {
+                index: 0,
+                expected: 2,
+                got: 2,
+                first_mismatch: Some(1),
+            })
+        );
+
+        // Right commitments, wrong ORDER — D4 fixes the order for exactly this.
+        let mut reordered = tx.clone();
+        reordered.discovery = two_recipient_discovery(&[cms[1], cms[0]]);
+        let body = BlockBody { txs: vec![reordered], coinbase: 0, coinbase_rkm: [0; 4] };
+        assert_eq!(
+            validate_body(&header_for(&body), &body, &MockVerifier, is_final),
+            Err(BodyError::DiscoveryDoesNotBind {
+                index: 0,
+                expected: 2,
+                got: 2,
+                first_mismatch: Some(0),
+            })
+        );
+
+        // 🔴 §1, the sentence this baton exists to create: attaching nothing is
+        // invalid, and it is the n = 0 case of the same rule, not a branch.
+        let mut omitted = tx.clone();
+        omitted.discovery = TxEntry::empty_discovery();
+        let body = BlockBody { txs: vec![omitted], coinbase: 0, coinbase_rkm: [0; 4] };
+        assert_eq!(
+            validate_body(&header_for(&body), &body, &MockVerifier, is_final),
+            Err(BodyError::DiscoveryDoesNotBind {
+                index: 0,
+                expected: 2,
+                got: 0,
+                first_mismatch: None,
+            })
+        );
+
+        // …and *cannot parse* is a different answer, not the same one.
+        let mut garbage = tx.clone();
+        garbage.discovery = vec![0x01, 0xFF, 0xFF];
+        let body = BlockBody { txs: vec![garbage], coinbase: 0, coinbase_rkm: [0; 4] };
+        assert!(matches!(
+            validate_body(&header_for(&body), &body, &MockVerifier, is_final),
+            Err(BodyError::DiscoveryMalformed { index: 0, err: CodecError::Truncated { .. } })
+        ));
+
+        // A zero-length field is not "no discovery" — it is unparseable, and it
+        // must not be mistaken for the honest n = 0 encoding.
+        let mut nothing = tx.clone();
+        nothing.discovery = Vec::new();
+        let body = BlockBody { txs: vec![nothing], coinbase: 0, coinbase_rkm: [0; 4] };
+        assert!(matches!(
+            validate_body(&header_for(&body), &body, &MockVerifier, is_final),
+            Err(BodyError::DiscoveryMalformed { index: 0, .. })
+        ));
+    }
+
+    /// D5: the coinbase carries no discovery and that is not an oversight. A
+    /// minting block with no transactions is valid, and nothing in §4 reaches
+    /// the coinbase note.
+    #[test]
+    fn the_coinbase_needs_no_discovery() {
+        let body = BlockBody { txs: vec![], coinbase: 5_000, coinbase_rkm: MINER_RKM };
+        assert_eq!(validate_body(&header_for(&body), &body, &MockVerifier, is_final), Ok(()));
+    }
+
+    /// §4 rule 4, the boundary: consensus judges shape and binding, never
+    /// payload validity. An all-zero ML-KEM ciphertext — which no recipient can
+    /// ever decapsulate — is **valid**, because a node cannot judge a ciphertext
+    /// addressed to someone else and must not pretend to.
+    #[test]
+    fn consensus_does_not_judge_the_ciphertext() {
+        let tx = good_tx(1); // placeholder_discovery: ct = [0; 1088], tag = [0; 8]
+        let body = BlockBody { txs: vec![tx], coinbase: 0, coinbase_rkm: [0; 4] };
+        assert_eq!(validate_body(&header_for(&body), &body, &MockVerifier, is_final), Ok(()));
+    }
+
+    fn hex_of(h: &Hash32) -> String {
+        h.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     /// The empty body's commitment, pinned for the same reason: since issue #115
     /// it **is the genesis header's `tx_body_commitment`**, so this constant is
     /// now an input to the network identity; and it is the cheapest body an

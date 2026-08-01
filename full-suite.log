@@ -1,0 +1,1840 @@
+   Compiling libc v0.2.189
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling cmov v0.5.4
+   Compiling cfg-if v1.0.4
+   Compiling typenum v1.20.1
+   Compiling getrandom v0.4.3
+   Compiling rand_core v0.10.1
+   Compiling serde_core v1.0.229
+   Compiling autocfg v1.5.1
+   Compiling serde v1.0.229
+   Compiling crossbeam-utils v0.8.22
+   Compiling crossbeam-epoch v0.9.20
+   Compiling crossbeam-deque v0.8.7
+   Compiling rayon-core v1.13.0
+   Compiling either v1.16.0
+   Compiling strength_reduce v0.2.4
+   Compiling paste v1.0.15
+   Compiling pin-project-lite v0.2.17
+   Compiling ctutils v0.4.2
+   Compiling tracing-core v0.1.36
+   Compiling itertools v0.14.0
+   Compiling find-msvc-tools v0.1.9
+   Compiling shlex v2.0.1
+   Compiling num-traits v0.2.19
+   Compiling thiserror v1.0.69
+   Compiling const-oid v0.10.2
+   Compiling cc v1.3.0
+   Compiling hybrid-array v0.4.13
+   Compiling bitflags v1.3.2
+   Compiling zeroize v1.9.0
+   Compiling cmake v0.1.58
+   Compiling sponge-cursor v0.1.0
+   Compiling block-buffer v0.12.1
+   Compiling inout v0.2.2
+   Compiling httpdate v1.0.3
+   Compiling randomx-rs v1.4.1
+   Compiling ascii v1.1.0
+   Compiling log v0.4.33
+   Compiling chunked_transfer v1.5.0
+   Compiling scopeguard v1.2.0
+   Compiling tiny_http v0.12.0
+   Compiling lock_api v0.4.14
+   Compiling crunchy v0.2.4
+   Compiling spin v0.12.2
+   Compiling tiny-keccak v2.0.2
+   Compiling der v0.8.1
+   Compiling cpufeatures v0.3.0
+   Compiling qlab-econ v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-econ)
+   Compiling keccak v0.2.0
+   Compiling thiserror v2.0.19
+   Compiling spki v0.8.0
+   Compiling libm v0.2.16
+   Compiling pkcs8 v0.11.0
+   Compiling objc2 v0.6.4
+   Compiling cfg_aliases v0.2.2
+   Compiling objc2-encode v4.1.0
+   Compiling nix v0.31.3
+   Compiling hashbrown v0.17.1
+   Compiling syn v3.0.3
+   Compiling syn v2.0.119
+   Compiling equivalent v1.0.2
+   Compiling bitflags v2.13.1
+   Compiling indexmap v2.14.0
+   Compiling toml_write v0.1.2
+   Compiling winnow v0.7.15
+   Compiling semver v1.0.28
+   Compiling byteorder v1.5.0
+   Compiling hash32 v0.2.1
+   Compiling serde_derive v1.0.229
+   Compiling thiserror-impl v2.0.19
+   Compiling rustc_version v0.4.1
+   Compiling heapless v0.7.17
+   Compiling stable_deref_trait v1.2.1
+   Compiling tracing-attributes v0.1.31
+   Compiling thiserror-impl v1.0.69
+   Compiling num-integer v0.1.46
+   Compiling module-lattice v0.2.3
+   Compiling tracing v0.1.44
+   Compiling transpose v0.2.3
+   Compiling num-bigint v0.4.8
+   Compiling rayon v1.12.0
+   Compiling crypto-common v0.2.2
+   Compiling cipher v0.5.2
+   Compiling digest v0.11.3
+   Compiling universal-hash v0.6.1
+   Compiling aead v0.6.1
+   Compiling kem v0.3.0
+   Compiling poly1305 v0.9.1
+   Compiling sha3 v0.11.0
+   Compiling shake v0.1.0
+   Compiling signature v3.0.0
+   Compiling chacha20 v0.10.1
+   Compiling ml-dsa v0.1.1
+   Compiling p3-maybe-rayon v0.6.1
+   Compiling rand v0.10.2
+   Compiling chacha20poly1305 v0.11.0
+   Compiling ml-kem v0.3.2
+   Compiling block2 v0.6.2
+   Compiling dispatch2 v0.3.1
+   Compiling ctrlc v3.5.2
+   Compiling p3-util v0.6.1
+   Compiling bincode v1.3.3
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling toml_edit v0.22.27
+   Compiling p3-field v0.6.1
+   Compiling toml v0.8.23
+   Compiling qlab-pow v0.1.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-pow)
+   Compiling cobs v0.3.0
+   Compiling postcard v1.1.3
+   Compiling p3-matrix v0.6.1
+   Compiling p3-symmetric v0.6.1
+   Compiling p3-keccak v0.6.1
+   Compiling p3-air v0.6.1
+   Compiling p3-dft v0.6.1
+   Compiling p3-multilinear-util v0.6.1
+   Compiling qlab-air v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-air)
+   Compiling p3-keccak-air v0.6.1
+   Compiling p3-blake3-air v0.6.1
+   Compiling p3-mds v0.6.1
+warning: constant `SIB_OFF` is never used
+   --> crates/qlab-air/src/narrow.rs:128:7
+    |
+128 | const SIB_OFF: usize = W_OFF; // sibling digest lanes = W0..3 (merkle rows)
+    |       ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling p3-poseidon2 v0.6.1
+   Compiling p3-poseidon1 v0.6.1
+   Compiling qlab-note v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-note)
+   Compiling p3-poseidon2-air v0.6.1
+   Compiling p3-monty-31 v0.6.1
+warning: `qlab-air` (lib) generated 1 warning
+   Compiling qlab-devnet v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-devnet)
+   Compiling qlab-wallet v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-wallet)
+   Compiling p3-challenger v0.6.1
+   Compiling p3-commit v0.6.1
+   Compiling p3-koala-bear v0.6.1
+   Compiling p3-fri v0.6.1
+   Compiling p3-merkle-tree v0.6.1
+   Compiling qlab-cbserver v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-cbserver)
+   Compiling p3-uni-stark v0.6.1
+   Compiling qlab-node v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-node)
+   Compiling qlab-consensus v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-consensus)
+   Compiling qlab-disclosure v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-disclosure)
+   Compiling qlab-demo v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-demo)
+   Compiling qlab-p2p v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-p2p)
+   Compiling qumbra-opview v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qumbra-opview)
+   Compiling qumbra-node v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qumbra-node)
+   Compiling qlab-faucet v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-faucet)
+   Compiling qumbra-faucet v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qumbra-faucet)
+warning: variable does not need to be mutable
+    --> crates/qlab-p2p/src/node.rs:2889:13
+     |
+2889 |         let mut bind = |addr: &str, h: &mut u64| {
+     |             ----^^^^
+     |             |
+     |             help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling qlab-bench v0.0.0 (/Users/larry/multica_workspaces_desktop-api.multica.ai/46d91c35-b6ba-4b47-8c0e-134392657ed8/0d29f838/workdir/qumbra-lab/crates/qlab-bench)
+warning: unused import: `std::time::Instant`
+   --> crates/qlab-bench/src/m4gate.rs:107:5
+    |
+107 | use std::time::Instant;
+    |     ^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `BatchTag` and `digest_lanes`
+   --> crates/qlab-bench/src/m4gate.rs:118:11
+    |
+118 |     self, digest_lanes, keccakf, BatchTag, ChalTag, CompressTag, DrawKind, LeafTag, Role,
+    |           ^^^^^^^^^^^^           ^^^^^^^^
+
+warning: unused import: `std::borrow::Borrow`
+  --> crates/qlab-bench/src/m4skel.rs:27:5
+   |
+27 | use std::borrow::Borrow;
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ChainView`
+   --> crates/qlab-bench/src/n7soak.rs:718:37
+    |
+718 |     use qlab_p2p::n1::{BlockIngest, ChainView};
+    |                                     ^^^^^^^^^
+
+warning: variable does not need to be mutable
+  --> crates/qlab-bench/src/m4anchor.rs:81:9
+   |
+81 |     let mut rnd_ext = |rng: &mut SmallRng| -> Ext {
+   |         ----^^^^^^^
+   |         |
+   |         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `nq`
+    --> crates/qlab-bench/src/m4gate.rs:5648:9
+     |
+5648 |     let nq = shape.nq;
+     |         ^^
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+help: you might have meant to pattern match on the similarly named constant `NQ`
+     |
+5648 -     let nq = shape.nq;
+5648 +     let m4gate::NQ = shape.nq;
+     |
+help: if this is intentional, prefix it with an underscore
+     |
+5648 |     let _nq = shape.nq;
+     |         +
+
+warning: unused variable: `qslots`
+    --> crates/qlab-bench/src/m4gate.rs:5649:9
+     |
+5649 |     let qslots = shape.qslots();
+     |         ^^^^^^
+     |
+help: you might have meant to pattern match on the similarly named constant `QSLOTS`
+     |
+5649 -     let qslots = shape.qslots();
+5649 +     let m4gate::QSLOTS = shape.qslots();
+     |
+help: if this is intentional, prefix it with an underscore
+     |
+5649 |     let _qslots = shape.qslots();
+     |         +
+
+warning: unused variable: `cum`
+    --> crates/qlab-bench/src/m4gate.rs:5650:9
+     |
+5650 |     let cum = shape.cum();
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_cum`
+
+warning: unused variable: `n_rounds`
+    --> crates/qlab-bench/src/m4gate.rs:5651:9
+     |
+5651 |     let n_rounds = shape.n_fri_rounds();
+     |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_n_rounds`
+
+warning: variable does not need to be mutable
+   --> crates/qlab-bench/src/m4skel.rs:186:9
+    |
+186 |     let mut rnd_ext = |rng: &mut SmallRng| -> Ext {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: function `n_shapes` is never used
+   --> crates/qlab-bench/src/m4gate.rs:836:15
+    |
+836 | pub(crate) fn n_shapes(shape: &GateShape) -> usize {
+    |               ^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `R_NONE` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1583:7
+     |
+1583 | const R_NONE: u32 = 0;
+     |       ^^^^^^
+
+warning: constant `R_PLAST_F0` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1592:7
+     |
+1592 | const R_PLAST_F0: u32 = 9;
+     |       ^^^^^^^^^^
+
+warning: constant `R_PLAST_F1` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1593:7
+     |
+1593 | const R_PLAST_F1: u32 = 10;
+     |       ^^^^^^^^^^
+
+warning: constant `R_PLAST_F2` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1594:7
+     |
+1594 | const R_PLAST_F2: u32 = 11;
+     |       ^^^^^^^^^^
+
+warning: constant `R_PLAST_F3` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1595:7
+     |
+1595 | const R_PLAST_F3: u32 = 12;
+     |       ^^^^^^^^^^
+
+warning: constant `M_S0` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1603:7
+     |
+1603 | const M_S0: u32 = 4; // s chain, round 0 (18 muls + inv2s witness)
+     |       ^^^^
+
+warning: constant `M_S1` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1604:7
+     |
+1604 | const M_S1: u32 = 5;
+     |       ^^^^
+
+warning: constant `M_S2` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1605:7
+     |
+1605 | const M_S2: u32 = 6;
+     |       ^^^^
+
+warning: constant `M_S3` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1606:7
+     |
+1606 | const M_S3: u32 = 7;
+     |       ^^^^
+
+warning: constant `M_B0` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1607:7
+     |
+1607 | const M_B0: u32 = 8; // B ladder, round 0
+     |       ^^^^
+
+warning: constant `M_B1` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1608:7
+     |
+1608 | const M_B1: u32 = 9;
+     |       ^^^^
+
+warning: constant `M_B2` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1609:7
+     |
+1609 | const M_B2: u32 = 10;
+     |       ^^^^
+
+warning: constant `M_B3` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1610:7
+     |
+1610 | const M_B3: u32 = 11;
+     |       ^^^^
+
+warning: constant `M_FHI0` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1611:7
+     |
+1611 | const M_FHI0: u32 = 12; // higher fold levels, round 0 -> RUNEV
+     |       ^^^^^^
+
+warning: constant `M_FHI1` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1612:7
+     |
+1612 | const M_FHI1: u32 = 13;
+     |       ^^^^^^
+
+warning: constant `M_FHI2` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1613:7
+     |
+1613 | const M_FHI2: u32 = 14;
+     |       ^^^^^^
+
+warning: constant `M_FHI3` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1614:7
+     |
+1614 | const M_FHI3: u32 = 15;
+     |       ^^^^^^
+
+warning: constant `M_FIN` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1615:7
+     |
+1615 | const M_FIN: u32 = 16; // x_fin chain
+     |       ^^^^^
+
+warning: constant `M_HORN` is never used
+    --> crates/qlab-bench/src/m4gate.rs:1616:7
+     |
+1616 | const M_HORN: u32 = 17; // final-poly Horner + compare
+     |       ^^^^^^
+
+warning: field `trailer_row` is never read
+    --> crates/qlab-bench/src/m4gate.rs:4323:9
+     |
+4317 | pub(crate) struct GateMeta {
+     |                   -------- field in this struct
+...
+4323 |     pub trailer_row: usize,
+     |         ^^^^^^^^^^^
+
+warning: function `ext_of` is never used
+    --> crates/qlab-bench/src/m4gate.rs:4519:4
+     |
+4519 | fn ext_of(v: &[Val; 4]) -> Ext {
+     |    ^^^^^^
+
+warning: function `bucket_instance` is never used
+  --> crates/qlab-bench/src/m4gaterec.rs:65:15
+   |
+65 | pub(crate) fn bucket_instance() -> (BucketInstance, Vec<Val>) {
+   |               ^^^^^^^^^^^^^^^
+
+warning: variant `Pad` is never constructed
+   --> crates/qlab-bench/src/m4gaterec.rs:184:5
+    |
+157 | pub(crate) enum Role {
+    |                 ---- variant in this enum
+...
+184 |     Pad,
+    |     ^^^
+    |
+    = note: `Role` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `j` is never read
+   --> crates/qlab-bench/src/m4gaterec.rs:229:9
+    |
+225 | pub(crate) struct DrawRec {
+    |                   ------- field in this struct
+...
+229 |     pub j: usize,
+    |         ^
+    |
+    = note: `DrawRec` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `log_arity` and `beta` are never read
+   --> crates/qlab-bench/src/m4gaterec.rs:354:9
+    |
+353 | pub(crate) struct FoldRec {
+    |                   ------- fields in this struct
+354 |     pub log_arity: usize,
+    |         ^^^^^^^^^
+...
+365 |     pub beta: Ext,
+    |         ^^^^
+    |
+    = note: `FoldRec` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: field `zeta_next` is never read
+   --> crates/qlab-bench/src/m4gaterec.rs:377:9
+    |
+368 | pub(crate) struct Schedule {
+    |                   -------- field in this struct
+...
+377 |     pub zeta_next: Ext,
+    |         ^^^^^^^^^
+
+warning: `qlab-p2p` (lib test) generated 1 warning (run `cargo fix --lib -p qlab-p2p --tests` to apply 1 suggestion)
+warning: `qlab-bench` (bin "qlab-bench" test) generated 37 warnings (run `cargo fix --bin "qlab-bench" -p qlab-bench --tests` to apply 9 suggestions)
+    Finished `release` profile [optimized] target(s) in 1m 01s
+     Running unittests src/lib.rs (target/release/deps/qlab_air-e79e3750b443164f)
+
+running 16 tests
+test narrow::tests::bucket_negatives_detected ... ok
+test narrow::tests::bucket_program_does_not_consume_warmup ... ok
+test narrow::tests::chain_matches_reference_permutation ... ok
+test narrow::tests::chain_matches_reference_rounds ... ok
+test narrow::tests::corrupted_merkle_witness_detected ... ok
+test narrow::tests::corrupted_trace_detected ... ok
+test narrow::tests::fabricated_wrapper_matches_explicit_witnesses ... ok
+test narrow::tests::first_perm_input_is_free_and_unconsumed ... ok
+test narrow::tests::full_bucket_satisfies_constraints ... ok
+test narrow::tests::inconsistent_witness_detected_by_banks ... ok
+test narrow::tests::input_chain_matches_reference ... ok
+test narrow::tests::merkle_chain_matches_reference ... ok
+test narrow::tests::rkm_diversifier_dependent ... ok
+test narrow::tests::trace_satisfies_constraints ... ok
+test narrow::tests::witness_anchor_mismatch_rejected ... ok
+test reference::tests::reference_matches_p3_keccak ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.71s
+
+     Running unittests src/main.rs (target/release/deps/qlab_bench-be8dd8bf87ac5b93)
+
+running 111 tests
+test disclosure::tests::consensus_config_prove_verify ... ok
+test disclosure::tests::end_to_end_wallet_disclosure ... ok
+test geometry::tests::corrupted_mock_trace_detected ... ok
+test geometry::tests::ladder_covers_every_column ... ok
+test geometry::tests::mock_trace_satisfies_constraints ... ok
+test levers::tests::arity_16_config_roundtrips ... ok
+test levers::tests::blowup_32_arity_8_config_roundtrips ... ok
+test levers::tests::l6_covers_every_column ... ok
+test m4assembly::tests::consumer_fee_predicate_binds ... ok
+test m4assembly::tests::consumer_root_predicate_binds ... ok
+test m4gate::tests::b2prime_fitcheck_interior_2p19 ... ok
+test m4gate::tests::b2prime_fitcheck_leaf_2p16 ... ok
+test m4gate::tests::constraint_degree_within_budget ... ok
+test m4gate::tests::d3_audit_filled_but_unconstrained_columns ... ok
+test m4gate::tests::d3_f0_mosaic_is_total_for_both_shapes ... ok
+test m4gate::tests::d3_f0_mosaic_matches_the_recorded_transcript ... ok
+test m4gate::tests::d3_f0dig_is_the_digest_of_the_public_surface ... ok
+test m4gate::tests::d3_public_surface_cascade ... ok
+test m4gate::tests::dump_accum ... ok
+test m4gate::tests::dump_cols ... ok
+test m4gate::tests::dump_constraint ... ok
+test m4gate::tests::dump_trace ... ok
+test m4gate::tests::gate_layout_narrow_reproduces_consts ... ok
+test m4gate::tests::gate_lowering_builds ... ok
+test m4gate::tests::gate_neg_asm_free_witness ... ok
+test m4gate::tests::gate_neg_asm_gap8_hole ... ok
+test m4gate::tests::gate_neg_bad_fold ... ok
+test m4gate::tests::gate_neg_breg ... ok
+test m4gate::tests::gate_neg_capture ... ok
+test m4gate::tests::gate_neg_csel_narrow ... ok
+test m4gate::tests::gate_neg_f0_recovered_word ... ok
+test m4gate::tests::gate_neg_f0_single_cap_limb ... ok
+test m4gate::tests::gate_neg_f0_xor_bit ... ok
+test m4gate::tests::gate_neg_f0dig_first ... ok
+test m4gate::tests::gate_neg_f0dig_last ... ok
+test m4gate::tests::gate_neg_fpreg ... ok
+test m4gate::tests::gate_neg_fs_row_moved ... ok
+test m4gate::tests::gate_neg_fsfull_all_ones ... ok
+test m4gate::tests::gate_neg_fsfull_single_perm ... ok
+test m4gate::tests::gate_neg_grp_schedule ... ok
+test m4gate::tests::gate_neg_inner_pv_fee_tail ... ok
+test m4gate::tests::gate_neg_inner_pv_first ... ok
+test m4gate::tests::gate_neg_inner_pv_mid ... ok
+test m4gate::tests::gate_neg_inv2s ... ok
+test m4gate::tests::gate_neg_invz ... ok
+test m4gate::tests::gate_neg_mro ... ok
+test m4gate::tests::gate_neg_noncanonical_word ... ok
+test m4gate::tests::gate_neg_preg ... ok
+test m4gate::tests::gate_neg_pzacc ... ok
+test m4gate::tests::gate_neg_tampered_opening ... ok
+test m4gate::tests::gate_neg_value_schedule ... ok
+test m4gate::tests::gate_neg_wrong_challenge_chal ... ok
+test m4gate::tests::gate_neg_wrong_challenge_fs ... ok
+test m4gate::tests::gate_neg_wrong_query_index ... ok
+test m4gate::tests::gate_neg_wrong_root ... ok
+test m4gate::tests::gate_neg_xfin_chain ... ok
+test m4gate::tests::gate_neg_xreg_chain ... ok
+test m4gate::tests::gate_neg_zn ... ok
+test m4gate::tests::gate_rectangle_satisfies ... ok
+test m4gate::tests::gate_shape_derived_counts_narrow ... ok
+test m4gate::tests::gate_shape_narrow_reproduces_consts ... ok
+test m4gate::tests::gate_shape_wide_values ... ok
+test m4gate::tests::i78_asm_pairing_structure ... ok
+test m4gate::tests::i78_finding2_scr_no_hold ... ok
+test m4gate::tests::i78_fsfull_pin_premise ... ok
+test m4gate::tests::interior_epoch_fee ... ok
+test m4gate::tests::interior_epoch_fee_boundary ... ok
+test m4gate::tests::interior_merge_native ... ok
+test m4gate::tests::interior_neg_epoch_fee ... ok
+test m4gate::tests::interior_neg_merge_bind ... ok
+test m4gate::tests::interior_neg_merge_chain ... ok
+test m4gate::tests::interior_neg_merge_msg ... ok
+test m4gate::tests::interior_neg_merge_region ... ok
+test m4gate::tests::interior_neg_msh_ring ... ok
+test m4gate::tests::interior_single_child_negatives ... ok
+test m4gate::tests::interior_single_child_satisfies ... ok
+test m4gate::tests::interior_two_child_negatives ... ok
+test m4gate::tests::interior_two_child_satisfies ... ok
+test m4gate::tests::interior_two_child_satisfies_distinct ... ok
+test m4gate::tests::probe_zval_parse ... ok
+test m4gate::tests::tamper_coverage ... ok
+test m4gaterec::tests::ext_challenges_assemble ... ok
+test m4gaterec::tests::probe_shape ... ok
+test m4gaterec::tests::schedule_shape ... ok
+test m4gaterec::tests::walk_matches_native_challenger ... ok
+test m4gaterec::tests::walk_matches_native_hashing ... ok
+test m4route::tests::forged_chain_gate_detected ... ok
+test m4route::tests::fs_matches_native_challenger ... ok
+test m4route::tests::injection_byte_limb_mismatch_detected ... ok
+test m4route::tests::out_of_range_emission_detected ... ok
+test m4route::tests::prove_verify_roundtrip ... ok
+test m4route::tests::routed_rectangle_satisfies ... ok
+test m4route::tests::tampered_challenge_detected ... ok
+test m4treerec::tests::recorder_accepts_leaf ... ok
+test m4treerec::tests::variant_child_has_distinct_opvs ... ok
+test m5note::tests::amortization_two_of_one ... ok
+test m5note::tests::bytes_per_note_matches_doc ... ok
+test m5note::tests::commitment_matches_qlab_air ... ok
+test m5note::tests::roundtrip_both_paths ... ok
+test m5note::tests::tampered_cm_fails_recompute ... ok
+test m5note::tests::tampered_ct_and_payload_fail ... ok
+test m5note::tests::wrong_key_no_detection ... ok
+test m6devnet::tests::m6_body_wiring_validates_with_mock_verifier ... ok
+test n7soak::tests::randomx_pow_composes_single_node ... ok
+test n7soak::tests::s1_sync_under_churn ... ok
+test n7soak::tests::s2_adversarial_rejected ... ok
+test n7soak::tests::s3_restart_reorg_partition ... ok
+test n7soak::tests::s4_leak_bounded ... ok
+test n7soak::tests::single_node_mines_applies_and_reports_new_tip ... ok
+test n7soak::tests::two_nodes_handshake_to_ready ... ok
+test narrow_bench::tests::narrow_air_prove_verify_roundtrip ... ok
+
+test result: ok. 111 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1171.05s
+
+     Running unittests src/lib.rs (target/release/deps/qlab_cbserver-695a906c82edec92)
+
+running 34 tests
+test client::tests::decoy_fetches_at_least_one_per_match_when_on_and_zero_when_off ... ok
+test client::tests::scan_finds_exactly_the_planted_notes_both_modes ... ok
+test client::tests::scan_local_matches_socket_scan_and_finds_planted_notes ... ok
+test client::tests::scan_local_wrong_key_finds_nothing ... ok
+test client::tests::wrong_key_finds_nothing ... ok
+test codec::tests::canonical_varints_over_a_range_accept_encoder_output_and_reject_padding ... ok
+test codec::tests::compact_response_rejects_a_padded_varint_field ... ok
+test codec::tests::compact_response_roundtrip ... ok
+test codec::tests::decode_rejects_bad_version_and_trailing ... ok
+test codec::tests::entry_encoding_equals_qlab_note_compact_entry ... ok
+test codec::tests::full_response_roundtrip ... ok
+test codec::tests::golden_bytes_lock_the_framing ... ok
+test codec::tests::padded_zero_is_rejected_and_bare_zero_is_accepted ... ok
+test codec::tests::truncation_is_still_reported_as_truncation_not_canonicity ... ok
+test codec::tests::unsupported_clue_rejected ... ok
+test codec::tests::varint_overflow_rejected ... ok
+test codec::tests::varint_roundtrip_edge_values ... ok
+test data::tests::chain_is_well_formed ... ok
+test data::tests::devnet_generates_deterministically ... ok
+test data::tests::from_parts_reconstructs_equivalent_devnet ... ok
+test data::tests::leaves_at_is_monotone_and_matches_tree ... ok
+test data::tests::planted_notes_are_really_ours_and_decoys_are_not ... ok
+test server::tests::end_to_end_over_localhost_socket ... ok
+test server::tests::route_compact_range ... ok
+test server::tests::route_errors ... ok
+test server::tests::route_full_and_frontier ... ok
+test tree::tests::auth_path_folds_to_root_at_every_position ... ok
+test tree::tests::empty_tree_root_is_zeros_top ... ok
+test tree::tests::frontier_at_prefix_matches_fresh_tree ... ok
+test tree::tests::frontier_decode_rejects_tampering ... ok
+test tree::tests::frontier_root_matches_ground_truth_at_every_size ... ok
+test tree::tests::frontier_serialization_roundtrip_and_root ... ok
+test tree::tests::tampered_auth_path_changes_root ... ok
+test tree::tests::zeros_ladder_is_deterministic ... ok
+
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running unittests src/bin/cbreport.rs (target/release/deps/cbreport-f282cc2b657cb1fb)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/release/deps/qlab_consensus-86f0603b8a17f04a)
+
+running 3 tests
+test tests::consensus_cfg_is_value_locked ... ok
+test tests::consensus_wire_is_145609_bytes ... ok
+test tests::real_m3_proof_roundtrips ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.23s
+
+     Running unittests src/lib.rs (target/release/deps/qlab_demo-ad6b7b6fb9d55abb)
+
+running 3 tests
+test ledger::tests::nullifier_set_rejects_double_spend ... ok
+test ledger::tests::supply_tracks_coinbase_and_fees ... ok
+test prover::tests::real_proof_against_live_tree ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.58s
+
+     Running unittests src/bin/qlab-demo.rs (target/release/deps/qlab_demo-1513076819b3bf6e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/e2e.rs (target/release/deps/e2e-a2807f590f75edd1)
+
+running 1 test
+test end_to_end_payment_loop_holds_all_invariants ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.63s
+
+     Running unittests src/lib.rs (target/release/deps/qlab_devnet-cc6a94e89d5f21db)
+
+running 151 tests
+test body::tests::a_genesis_header_with_a_foreign_body_is_rejected ... ok
+test body::tests::a_minting_block_with_no_payee_is_rejected ... ok
+test body::tests::binding_is_checked_before_any_other_body_work ... ok
+test body::tests::body_not_matching_the_header_commitment_is_rejected ... ok
+test body::tests::empty_body_under_an_honest_header_is_rejected ... ok
+test body::tests::genesis_header_binds_its_empty_body ... ok
+test body::tests::golden_body_commitment_bytes ... ok
+test body::tests::golden_empty_body_commitment_bytes ... ok
+test body::tests::in_block_double_spend_is_rejected ... ok
+test body::tests::invalid_proof_is_rejected ... ok
+test body::tests::non_finalized_anchor_is_rejected ... ok
+test body::tests::redirecting_the_payout_key_breaks_the_header_binding ... ok
+test body::tests::valid_body_passes_and_commitment_is_deterministic ... ok
+test body::tests::wrong_fee_is_rejected ... ok
+test chain::tests::ancestor_walks_back_parent_links ... ok
+test chain::tests::bad_height_is_rejected ... ok
+test chain::tests::duplicate_and_unknown_parent_are_rejected ... ok
+test chain::tests::equal_work_keeps_the_incumbent_tip ... ok
+test chain::tests::extending_advances_the_tip_and_accumulates_work ... ok
+test chain::tests::heavier_fork_wins_the_tip ... ok
+test chain::tests::main_chain_is_genesis_to_tip ... ok
+test chain::tests::new_chain_tip_is_genesis ... ok
+test chain::tests::no_reorg_past_finalized_checkpoint_ever ... ok
+test chain::tests::restore_finalized_proves_the_persisted_point_against_the_main_chain ... ok
+test chain::tests::set_finalized_enforces_advance_and_descent ... ok
+test committee::tests::checkpoint_domain_is_production_string ... ok
+test committee::tests::from_seed_is_deterministic_and_distinct ... ok
+test committee::tests::id_hex_is_fixed_width_or_the_absent_sentinel ... ok
+test committee::tests::identity_is_exact_in_a_float64_exposition_value ... ok
+test committee::tests::identity_is_the_digest_prefix_of_the_signing_message ... ok
+test committee::tests::identity_separates_variants_and_agrees_on_equals ... ok
+test committee::tests::quorum_threshold_is_strictly_over_two_thirds ... ok
+test committee::tests::signing_message_is_domain_separated_and_binds_fields ... ok
+test committee::tests::valid_vote_verifies_wrong_signer_or_message_does_not ... ok
+test ebbflow::tests::degraded_when_finality_lags_or_absent ... ok
+test ebbflow::tests::equivocation_is_detected_and_punished ... ok
+test ebbflow::tests::equivocation_slash_is_ten_percent_floor_of_bond ... ok
+test ebbflow::tests::evidence_negatives ... ok
+test ebbflow::tests::jail_is_no_slash_and_auto_readmits ... ok
+test ebbflow::tests::signing_window_jails_a_dark_validator_only_when_full ... ok
+test ebbflow::tests::signing_window_threshold_is_strict_and_integer ... ok
+test epoch::tests::admit_appends_at_boundary_and_new_member_can_finalize ... ok
+test epoch::tests::epoch_committee_seeded_at_frozen_n_has_frozen_quorum ... ok
+test epoch::tests::frozen_genesis_n_and_quorum_agree ... ok
+test epoch::tests::multiple_boundaries_apply_pending_once ... ok
+test epoch::tests::past_epoch_committee_is_retained_for_behind_checkpoints ... ok
+test epoch::tests::schedule_maps_heights_to_epochs_and_boundaries ... ok
+test epoch::tests::staged_change_is_invisible_until_the_boundary ... ok
+test epoch::tests::tombstoned_member_is_dropped_at_the_next_boundary ... ok
+test fees::tests::bucketing_picks_the_smallest_fitting_tier ... ok
+test fees::tests::fee_is_deterministic_and_monotone_in_arity ... ok
+test fees::tests::posted_fees_are_the_frozen_absolutes ... ok
+test fees::tests::table_covers_all_buckets ... ok
+test finality::tests::anchor_age_window_accepts_fresh_rejects_expired_and_nonfinal ... ok
+test finality::tests::below_quorum_is_rejected ... ok
+test finality::tests::checkpoint_cadence_grid_and_next_slot ... ok
+test finality::tests::duplicate_and_unknown_signers_are_rejected ... ok
+test finality::tests::finalization_must_strictly_advance ... ok
+test finality::tests::forged_vote_is_rejected ... ok
+test finality::tests::quorum_finalizes_and_anchor_becomes_valid ... ok
+test finality::tests::restored_checkpoint_rehydrates_without_claiming_a_new_quorum_event ... ok
+test halt::tests::a_cancelled_plan_halts_nowhere_but_still_names_its_height ... ok
+test halt::tests::a_node_with_no_halt_never_reports_a_halt_regime ... ok
+test halt::tests::a_stuck_halt_stays_visibly_halting_not_degraded ... ok
+test halt::tests::armed_release_accepts_up_to_h_and_nothing_above ... ok
+test halt::tests::grid_rule_accepts_multiples_and_rejects_everything_else ... ok
+test halt::tests::post_halt_domain_changes_pow_values_only_strictly_above_the_boundary ... ok
+test halt::tests::regime_walks_final_then_halting_then_halted ... ok
+test halt::tests::rule_schedule_validates_its_post_halt_boundary_too ... ok
+test halt::tests::v1_0_rules_accept_every_height_and_never_change_a_pow_value ... ok
+test hash::tests::keccak256_is_deterministic ... ok
+test hash::tests::keccak256_matches_tiny_keccak ... ok
+test header::tests::child_links_to_parent_and_increments_height ... ok
+test header::tests::genesis_binds_its_own_body ... ok
+test header::tests::header_hash_is_deterministic ... ok
+test header::tests::nonce_changes_the_hash ... ok
+test header::tests::preimage_binds_the_reserved_field_tags ... ok
+test header::tests::preimage_has_fixed_width ... ok
+test load::jail::tests::correlated_blips_raise_false_jails_versus_independent ... ok
+test load::jail::tests::detection_lag_is_one_minus_x_times_y ... ok
+test load::jail::tests::deterministic_reproduces_identically ... ok
+test load::jail::tests::jail_decision_applies_to_real_committee_state ... ok
+test load::jail::tests::realistic_uptime_is_not_falsely_jailed_at_lenient_thresholds ... ok
+test load::jail::tests::stricter_threshold_raises_false_jail_rate ... ok
+test load::reorg::tests::chainstate_reorg_depth_matches_the_model_semantics ... ok
+test load::reorg::tests::deeper_reorgs_are_more_likely_with_more_adversary_hashrate ... ok
+test load::reorg::tests::deterministic_reproduces_identically ... ok
+test load::reorg::tests::natural_orphan_rate_is_small_and_depth2_is_negligible ... ok
+test load::reorg::tests::near_half_adversary_can_exceed_maturity_only_finality_bounds_that ... ok
+test load::reorg::tests::weak_adversary_stays_far_under_a_100_block_maturity ... ok
+test load::reorg::tests::worst_over_seeds_is_at_least_any_single_seed ... ok
+test load::rng::tests::below_stays_in_range ... ok
+test load::rng::tests::bernoulli_frequency_is_roughly_p ... ok
+test load::rng::tests::different_seeds_diverge ... ok
+test load::rng::tests::exponential_mean_is_roughly_correct ... ok
+test load::rng::tests::f64_is_in_unit_interval ... ok
+test load::rng::tests::golden_first_draws_are_pinned ... ok
+test load::rng::tests::same_seed_replays_identical_stream ... ok
+test load::spam::tests::a_longer_long_window_damps_the_creep ... ok
+test load::spam::tests::budget_limited_flood_costs_at_most_its_budget_fraction ... ok
+test load::spam::tests::deterministic_reproduces_identically ... ok
+test load::spam::tests::no_governor_growth_scales_with_budget ... ok
+test load::spam::tests::peak_block_never_exceeds_the_final_medians_hard_cap ... ok
+test load::spam::tests::permanent_flood_creeps_the_median_upward_not_downward ... ok
+test load::spam::tests::rational_block_is_at_least_the_free_zone_and_at_most_double ... ok
+test load::spam::tests::tail_era_gives_more_ground_than_launch ... ok
+test load::tests::emission_arithmetic_matches_the_appendix ... ok
+test load::tests::fee_ratios_are_one_two_four ... ok
+test load::tests::two_by_two_maximizes_bytes_per_fee_the_worst_case_spam_vehicle ... ok
+test mining::tests::exhausted_budget_returns_none ... ok
+test mining::tests::mines_a_valid_block_at_low_difficulty ... ok
+test net::tests::committee_minority_offline_blocks_then_resumes_finality ... ok
+test net::tests::miner_only_liveness_keeps_chain_growing_degraded ... ok
+test net::tests::partition_rejoin_converges_and_respects_finality ... ok
+test node::tests::heavier_fork_reorgs_the_tip ... ok
+test node::tests::mined_blocks_are_self_valid_and_distinct ... ok
+test node::tests::mines_a_linear_chain_and_advances_height ... ok
+test node::tests::node_does_not_reorg_past_finalized_checkpoint ... ok
+test node::tests::stall_degrades_then_recovers_while_chain_keeps_growing ... ok
+test node::tests::submit_accepts_valid_and_rejects_tampered ... ok
+test node::tests::tombstoned_votes_do_not_count_toward_quorum ... ok
+test pow::tests::a_mined_nonce_actually_satisfies_the_target ... ok
+test pow::tests::keccak_placeholder_ignores_the_seed ... ok
+test pow::tests::threshold_is_monotone_in_difficulty ... ok
+test tally::tests::accumulates_distinct_signers_across_calls ... ok
+test tally::tests::dedups_same_signer ... ok
+test tally::tests::genesis_height_zero_is_in_window_when_nothing_finalized ... ok
+test tally::tests::ignores_stale_and_future_heights ... ok
+test tally::tests::on_finalized_and_prune_drop_slots ... ok
+test tally::tests::slot_cap_keeps_newest ... ok
+test tally::tests::variant_cap_bounds_per_height ... ok
+test validation::tests::child_of_genesis_holds_parent_difficulty ... ok
+test validation::tests::expected_difficulty_matches_pure_lwma_over_the_window ... ok
+test validation::tests::lwma_trace_is_flat_under_a_constant_clock_and_moves_under_variable_solvetimes ... ok
+test validation::tests::on_target_keeps_difficulty_stable ... ok
+test validation::tests::pow_seed_bootstraps_from_genesis_then_rotates ... ok
+test validation::tests::retarget_responds_to_block_rate ... ok
+test validation::tests::validate_accepts_good_and_rejects_bad ... ok
+test weight::tests::devnet_default_wires_the_placeholders ... ok
+test weight::tests::fresh_governor_effective_median_is_min_weight ... ok
+test weight::tests::long_term_cap_limits_how_fast_one_block_lifts_the_baseline ... ok
+test weight::tests::median_odd_and_even ... ok
+test weight::tests::penalty_fires_exactly_one_byte_above_the_median ... ok
+test weight::tests::penalty_is_full_base_reward_at_double_the_median ... ok
+test weight::tests::penalty_is_quadratic_at_the_quarter_point ... ok
+test weight::tests::penalty_is_zero_at_or_below_median ... ok
+test weight::tests::short_term_median_is_capped_by_st_cap_times_long_term ... ok
+test weight::tests::short_term_median_tracks_recent_larger_blocks ... ok
+test weight::tests::steady_small_blocks_hold_the_effective_median_at_min_weight ... ok
+test weight::tests::tiny_overage_rounds_to_zero_when_base_is_small_relative_to_m_squared ... ok
+test weight::tests::weight_limit_and_admissibility_at_the_hard_cap ... ok
+
+test result: ok. 151 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s
+
+     Running unittests src/bin/load.rs (target/release/deps/load-9b156fd67aaffee3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/randomx_e2e.rs (target/release/deps/randomx_e2e-c5524010c3438071)
+
+running 3 tests
+test randomx_hash_depends_on_the_key_block_seed ... ok
+test randomx_key_block_seed_actually_rotates ... ok
+test randomx_node_mines_validates_and_rotates_the_key ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.55s
+
+     Running unittests src/lib.rs (target/release/deps/qlab_disclosure-0c371dfd7addb8c7)
+
+running 18 tests
+test air::tests::chain_only_is_real_keccak ... ok
+test air::tests::chain_only_satisfies_constraints ... ok
+test air::tests::constraint_degree_within_budget ... ok
+test air::tests::disclosure_digests_match_packing ... ok
+test air::tests::disclosure_instance_satisfies_constraints ... ok
+test air::tests::disclosure_rkm_mismatch_fails - should panic ... ok
+test air::tests::disclosure_wrong_addr_fails - should panic ... ok
+test air::tests::disclosure_wrong_cm_fails - should panic ... ok
+test air::tests::disclosure_wrong_value_fails - should panic ... ok
+test envelope::tests::envelope_roundtrip_and_verify ... ok
+test envelope::tests::reject_unknown_ver_and_type ... ok
+test envelope::tests::tamper_negatives ... ok
+test packing::tests::addr_commitment_is_keccak256_of_raw ... ok
+test packing::tests::note_commitment_equals_keccak256_of_le_bytes ... ok
+test packing::tests::note_commitment_matches_build_bucket ... ok
+test packing::tests::shared_rkm_binds_note_to_address ... ok
+test prove::tests::prove_verify_roundtrip ... ok
+test prove::tests::wrong_pv_rejected ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.66s
+
+     Running unittests src/lib.rs (target/release/deps/qlab_econ-b9577962de45e2f4)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/release/deps/qlab_econ-24301e781a2fdb25)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/sweep_tests.rs (target/release/deps/sweep_tests-db340c99c643c190)
+
+running 11 tests
+test all_candidates_pass_all_four_job_checks ... ok
+test block_time_barely_moves_economics ... ok
+test closed_form_check_discriminates_a_wrong_curve ... ok
+test committee_check_fails_without_a_tail ... ok
+test exact_integer_telescoping_in_atomic_units ... ok
+test inflation_is_asymptotically_one_over_year ... ok
+test monero_decay_is_a_pure_function_of_cumulative_issuance ... ok
+test no_cliffs_check_fails_on_steep_per_block_drops ... ok
+test r0_is_pure_denomination ... ok
+test supply_equals_running_sum_to_the_coin ... ok
+test tail_activation_inflation_matches_calibration_target ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+     Running unittests src/lib.rs (target/release/deps/qlab_faucet-4d6283c1d7035845)
+
+running 36 tests
+test grant::tests::the_lease_sits_far_inside_the_protocol_window ... ok
+test inventory::tests::a_note_absent_from_the_tree_is_never_selected ... ok
+test inventory::tests::a_recut_preserves_the_count_a_grant_costs_one ... ok
+test inventory::tests::cm_matches_the_circuit_derivation ... ok
+test inventory::tests::grants_available_is_count_minus_one ... ok
+test inventory::tests::insufficient_value_reports_the_best_pair ... ok
+test inventory::tests::out_of_notes_names_held_and_anchored_separately ... ok
+test inventory::tests::selection_takes_the_smallest_covering_pair ... ok
+test inventory::tests::take_and_restore_are_inverse ... ok
+test policy::tests::a_bracketless_v6_literal_keeps_its_last_group ... ok
+test policy::tests::a_forged_tag_is_rejected_and_encoding_round_trips ... ok
+test policy::tests::a_returning_user_is_served_again_after_the_window ... ok
+test policy::tests::a_throttle_does_not_consume_the_ticket ... ok
+test policy::tests::a_ticket_verifies_only_under_its_own_secret ... ok
+test policy::tests::a_ticketless_flood_cannot_burn_the_global_budget ... ok
+test policy::tests::an_unparseable_client_gets_its_own_key_not_a_shared_one ... ok
+test policy::tests::malformed_ticket_strings_are_rejected_before_any_secret_is_touched ... ok
+test policy::tests::open_mode_admits_without_a_ticket_and_ignores_one ... ok
+test policy::tests::the_gate_admits_ordinary_traffic ... ok
+test policy::tests::the_gate_blocks_what_it_claims_to_block ... ok
+test policy::tests::the_global_budget_is_the_block_interval ... ok
+test policy::tests::the_secret_is_never_rendered ... ok
+test policy::tests::the_subnet_map_is_bounded_and_evicts_in_batches ... ok
+test policy::tests::unlimited_limits_never_trip ... ok
+test policy::tests::v4_keys_collapse_to_the_configured_prefix ... ok
+test policy::tests::v6_keys_on_the_prefix_not_the_address ... ok
+test queue::tests::a_full_queue_refuses_rather_than_evicting ... ok
+test queue::tests::a_retry_goes_to_the_front_and_gives_up_after_the_budget ... ok
+test queue::tests::the_default_depth_is_the_documented_one ... ok
+test queue::tests::the_estimated_wait_is_the_pessimistic_one ... ok
+test queue::tests::the_queue_is_fifo ... ok
+test service::tests::a_full_queue_does_not_burn_a_ticket ... ok
+test service::tests::a_gate_refusal_never_reaches_the_queue ... ok
+test service::tests::dispense_is_idle_with_nothing_queued_and_stalls_without_an_anchor ... ok
+test service::tests::the_default_grant_is_a_thousand_fees ... ok
+test service::tests::the_faucet_key_is_not_account_zero ... ok
+
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/acceptance.rs (target/release/deps/acceptance-abc4aedd1eddd8af)
+
+running 7 tests
+test a_coinbase_funded_grant_discloses_no_coinbase_origin ... ok
+test a_faucet_on_an_unfinalized_chain_reports_the_cold_start ... ok
+test an_aged_out_anchor_is_rejected_by_both_the_faucet_and_the_node ... ok
+test consecutive_grants_do_not_wedge_and_the_wedge_is_named ... ok
+test end_to_end_grant_is_scanned_by_the_requester ... ok
+test the_abuse_control_admits_ordinary_requests ... ok
+test the_abuse_control_blocks_what_it_claims ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.95s
+
+     Running unittests src/lib.rs (target/release/deps/qlab_node-61c77160dd6045ec)
+
+running 107 tests
+test coinbase::tests::derivation_is_deterministic ... ok
+test coinbase::tests::height_and_payee_each_separate_the_note ... ok
+test coinbase::tests::no_mint_and_no_payee_yield_no_note ... ok
+test coinbase::tests::siblings_at_one_height_share_rho_and_therefore_a_nullifier ... ok
+test coinbase::tests::the_minted_leaf_is_a_real_note_commitment ... ok
+test coinbase::tests::value_is_the_miner_share_plus_fees ... ok
+test emission::tests::coinbase_is_non_negative_and_positive_through_and_past_the_tail ... ok
+test emission::tests::coinbase_telescopes_to_s_atomic_exactly ... ok
+test emission::tests::genesis_coinbase_is_r0 ... ok
+test emission::tests::split_is_65_15_20_and_sums_exactly ... ok
+test emission::tests::tail_activates_near_the_design_height ... ok
+test mempool::tests::admission_does_not_consider_coinbase_maturity ... ok
+test mempool::tests::admits_a_well_formed_tx ... ok
+test mempool::tests::assemble_fills_the_free_zone_and_pays_the_coinbase ... ok
+test mempool::tests::assemble_selection_rejects_unknown_tx ... ok
+test mempool::tests::consensus_weight_params_are_the_frozen_set ... ok
+test mempool::tests::entries_and_get_expose_admitted_txs ... ok
+test mempool::tests::on_block_connected_evicts_mined_and_conflicting_txs ... ok
+test mempool::tests::over_weight_template_is_refused ... ok
+test mempool::tests::rejects_cross_block_double_spend ... ok
+test mempool::tests::rejects_duplicate_tx ... ok
+test mempool::tests::rejects_in_pool_double_spend ... ok
+test mempool::tests::rejects_invalid_anchor ... ok
+test mempool::tests::rejects_invalid_proof_last ... ok
+test mempool::tests::rejects_wrong_fee ... ok
+test mempool::tests::rejects_wrong_fee_even_for_a_different_bucket ... ok
+test metrics::tests::a_node_with_nothing_to_report_emits_declarations_but_no_series ... ok
+test metrics::tests::both_chain_views_and_the_lag_refusals_are_on_the_scrape_from_the_first_sample ... ok
+test metrics::tests::closed_round_folds_into_verdict_and_member_counters ... ok
+test metrics::tests::event_fed_histograms_carry_the_soak_quantities ... ok
+test metrics::tests::every_series_is_predeclared_and_shaped_for_prometheus ... ok
+test metrics::tests::histogram_renders_cumulative_monotone_buckets ... ok
+test metrics::tests::identity_families_carry_no_labels ... ok
+test metrics::tests::identity_gauge_is_the_log_field_in_decimal ... ok
+test metrics::tests::nothing_finalized_emits_no_finalized_height_series ... ok
+test metrics::tests::regime_residency_is_accumulated_not_sampled ... ok
+test metrics::tests::the_rewind_counters_exist_from_the_first_scrape_and_carry_count_and_depth ... ok
+test metrics::tests::the_wedge_gauge_is_present_in_both_verdicts_and_absent_when_unjudgeable ... ok
+test node::tests::a_correct_genesis_constructs_and_extends ... ok
+test node::tests::a_genesis_that_is_not_its_own_body_is_rejected ... ok
+test node::tests::a_node_refuses_to_start_from_a_mismatched_genesis - should panic ... ok
+test node::tests::apply_block_rejects_a_body_the_header_did_not_commit_to ... ok
+test node::tests::apply_block_rejects_an_honest_header_with_an_empty_body ... ok
+test node::tests::open_snapshot_fast_path_also_rejects_a_tampered_record ... ok
+test node::tests::replay_rejects_a_log_record_whose_body_no_longer_matches_its_header ... ok
+test node::tests::snapshot_finality_without_its_authoritative_log_record_refuses_to_open ... ok
+test recovery::tests::catch_up_resumes_and_finalizes_a_later_slot_directly ... ok
+test recovery::tests::committee_accrues_only_for_finalized_span ... ok
+test recovery::tests::finalizer_state_roundtrips_and_rejects_bad_version_and_trailing ... ok
+test recovery::tests::guard_survives_restart_via_persistence ... ok
+test recovery::tests::never_re_signs_a_conflicting_checkpoint ... ok
+test round::tests::a_backfilled_slot_that_finalizes_here_still_counts_as_a_round ... ok
+test round::tests::a_guard_refused_slot_still_names_what_this_node_is_committed_to ... ok
+test round::tests::a_live_round_that_genuinely_fails_still_increments_the_alarm ... ok
+test round::tests::a_node_with_no_keys_prints_the_absent_sentinel ... ok
+test round::tests::a_recorded_commitment_is_never_un_set ... ok
+test round::tests::a_resync_does_not_manufacture_failed_rounds_but_still_journals_every_slot ... ok
+test round::tests::a_settled_slot_is_never_re_opened_by_a_late_vote ... ok
+test round::tests::a_split_round_is_one_grep_across_the_hosts ... ok
+test round::tests::a_stuck_round_reports_itself_while_still_open_and_then_stops_repeating ... ok
+test round::tests::accumulates_names_absentees_and_supersedes_skipped_slots ... ok
+test round::tests::deterministic_clock_records_counts_but_never_invents_a_cause ... ok
+test round::tests::diagnosis_separates_timeout_from_votes_short ... ok
+test round::tests::excluded_members_are_not_reported_absent ... ok
+test round::tests::genesis_is_never_journalled_as_a_round ... ok
+test round::tests::journal_line_stays_within_the_quoted_budget ... ok
+test round::tests::open_is_not_a_closed_verdict ... ok
+test round::tests::open_rounds_are_capped_and_evictions_are_reported ... ok
+test round::tests::out_of_window_vote_sets_cannot_pump_the_alarm ... ok
+test round::tests::rejected_only_round_is_recorded_not_dropped ... ok
+test round::tests::round_line_gains_cpid_at_the_end_and_nowhere_else ... ok
+test round::tests::the_live_window_is_one_cadence_either_side_of_our_own_tip ... ok
+test rpc::tests::compact_and_full_serve_accepted_blocks_only ... ok
+test rpc::tests::compact_encoder_matches_golden_framing ... ok
+test rpc::tests::e2e_over_localhost_socket ... ok
+test rpc::tests::frontier_served_from_live_tree_reconstructs_node_root ... ok
+test rpc::tests::main_chain_counts_matches_apply_state_sequence_for_mixed_blocks ... ok
+test rpc::tests::status_and_anchors_moved_to_0x03_with_telemetry_and_reject_older_versions ... ok
+test rpc::tests::status_and_anchors_roundtrip_and_reflect_state ... ok
+test rpc::tests::submit_accepts_valid_tx_and_records_discovery ... ok
+test rpc::tests::submit_rejects_each_bad_condition ... ok
+test rpc::tests::submit_rejects_pending_and_spent_nullifiers ... ok
+test rpc::tests::telemetry_age_is_zero_when_nothing_finalized ... ok
+test rpc::tests::telemetry_age_is_zero_while_the_finalized_head_is_genesis ... ok
+test rpc::tests::telemetry_endpoint_reflects_state_and_injected_net_facts ... ok
+test rpc::tests::wires_reject_bad_version_and_trailing ... ok
+test store::tests::a_dropped_branch_can_be_re_applied_and_becomes_the_tip ... ok
+test store::tests::a_rewind_keeps_the_ancestor_path_and_drops_everything_else ... ok
+test store::tests::a_rewind_refuses_a_target_off_the_tips_own_ancestry ... ok
+test store::tests::a_rewind_refuses_to_cross_the_finalized_head ... ok
+test supply::tests::deliberately_wrong_supply_is_outside_zero_bessel_tolerance ... ok
+test supply::tests::incremental_append_matches_one_shot_rebuild ... ok
+test supply::tests::known_chain_supply_is_inside_zero_bessel_tolerance_per_epoch ... ok
+test supply::tests::refuses_a_gapped_or_non_genesis_sequence ... ok
+test telemetry::tests::a_v1_telemetry_payload_is_rejected_not_best_effort_parsed ... ok
+test telemetry::tests::age_field_is_dash_until_a_real_checkpoint_finalizes ... ok
+test telemetry::tests::committee_aggregates_roundtrip_at_0x03_and_0x02_is_rejected ... ok
+test telemetry::tests::state_lag_never_underflows_and_zero_is_not_lagging ... ok
+test telemetry::tests::supply_coverage_and_state_lag_are_the_same_comparison ... ok
+test telemetry::tests::supply_coverage_refuses_a_state_tip_behind_fork_choice_without_a_wire_change ... ok
+test telemetry::tests::telemetry_rejects_bad_version_and_trailing_and_bad_status ... ok
+test telemetry::tests::telemetry_roundtrips_both_regimes ... ok
+test telemetry::tests::telemetry_roundtrips_checkpoint_identity_at_0x03 ... ok
+test telemetry::tests::telemetry_roundtrips_halting_and_halted ... ok
+test telemetry::tests::the_applied_tip_identity_is_the_block_hashs_prefix_at_fids_width ... ok
+test telemetry::tests::the_lag_and_the_branch_are_orthogonal ... ok
+test telemetry::tests::the_wedge_verdict_separates_lagging_from_stranded_and_refuses_to_guess ... ok
+
+test result: ok. 107 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/maturity_schedule.rs (target/release/deps/maturity_schedule-d80c21987a735ab6)
+
+running 5 tests
+test a_chain_across_the_maturity_delay_replays_identically ... ok
+test a_coinbase_leaf_lands_exactly_one_maturity_delay_later ... ok
+test per_height_anchors_survive_the_restart ... ok
+test the_owed_leaf_follows_the_blocks_own_ancestry ... ok
+test the_snapshot_boundary_does_not_lose_owed_leaves ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.21s
+
+     Running tests/mempool_assembly.rs (target/release/deps/mempool_assembly-fdd4ecf8fc25b111)
+
+running 3 tests
+test admitted_txs_assemble_into_a_block_the_node_accepts ... ok
+test mempool_rejects_a_tx_double_spending_an_already_applied_nullifier ... ok
+test mempool_rejects_what_the_node_would_reject_unfinalized_anchor ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/persistence.rs (target/release/deps/persistence-411c82bcdc718631)
+
+running 13 tests
+test a_finalization_recorded_after_the_snapshot_still_survives ... ok
+test a_fresh_datadir_starts_without_finality_quietly ... ok
+test a_refused_rewind_mutates_nothing ... ok
+test a_rewound_node_equals_a_replay_of_the_chain_it_kept ... ok
+test a_snapshot_for_a_branch_the_log_abandoned_is_discarded_not_honoured ... ok
+test a_snapshot_taken_after_a_rewind_is_still_a_fast_path ... ok
+test a_snapshot_whose_finalized_block_is_absent_refuses_to_open ... ok
+test cross_block_double_spend_is_rejected ... ok
+test measure_the_cost_of_a_rewind ... ignored
+test open_equals_replay_on_the_finalized_checkpoint_and_state ... ok
+test open_without_snapshot_full_replays_to_same_state ... ok
+test stored_block_round_trips_header_hash ... ok
+test unfinalized_anchor_is_rejected ... ok
+
+test result: ok. 12 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.35s
+
+     Running tests/rpc.rs (target/release/deps/rpc-02397bb2c0c14ecf)
+
+running 4 tests
+test embedded_compact_bytes_equal_the_cbserver_encoder ... ok
+test per_height_frontiers_match_the_nodes_own_roots_across_the_maturity_delay ... ok
+test reference_light_client_scans_a_live_node_and_finds_planted_notes ... ok
+test tx_id_is_stable_across_pending_and_accepted_forms ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/lib.rs (target/release/deps/qlab_note-9e04ae954aef10a6)
+
+running 30 tests
+test compact::tests::a_group_followed_by_junk_is_rejected ... ok
+test compact::tests::a_padded_tx_index_is_rejected ... ok
+test compact::tests::commitments_are_recipient_major_then_per_output ... ok
+test compact::tests::committed_contents_are_the_serving_group_minus_its_index_varint ... ok
+test compact::tests::committed_contents_reject_trailing_and_truncation ... ok
+test compact::tests::committed_contents_round_trip_and_contain_no_varint ... ok
+test compact::tests::group_roundtrips_and_reencodes_to_itself ... ok
+test compact::tests::the_empty_group_is_two_bytes_and_describes_nothing ... ok
+test derive::tests::domain_separation ... ok
+test derive::tests::per_index_key_nonce_distinct ... ok
+test derive::tests::tag_determinism_and_sensitivity ... ok
+test hash::tests::digest_bytes_roundtrip ... ok
+test hash::tests::known_vectors ... ok
+test hash::tests::matches_tiny_keccak ... ok
+test kem::tests::distinct_encapsulations_differ ... ok
+test kem::tests::ek_bytes_roundtrip_and_reject_garbage ... ok
+test kem::tests::encap_decap_roundtrip_and_sizes ... ok
+test kem::tests::wrong_key_decap_differs ... ok
+test note::tests::commitment_matches_qlab_air_build_bucket ... ok
+test note::tests::plaintext_roundtrip ... ok
+test scan::tests::amortization_two_outputs_one_ct ... ok
+test scan::tests::recompute_gate_rejects_tampered_cm ... ok
+test scan::tests::roundtrip_both_paths ... ok
+test scan::tests::tampered_aead_payload_fails ... ok
+test scan::tests::tampered_cm_no_detection ... ok
+test scan::tests::tampered_mlkem_ct_no_detection ... ok
+test scan::tests::wrong_key_no_detection ... ok
+test wire::tests::bundle_len_matches_formula ... ok
+test wire::tests::bytes_per_note_matches_doc ... ok
+test wire::tests::entry_roundtrip_and_len ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/release/deps/qlab_p2p-c12c1922473a5d91)
+
+running 207 tests
+test adapter::tests::a_forged_vote_with_a_resolvable_index_is_still_scored ... ok
+test adapter::tests::a_fresh_datadir_restores_zero_punishments_quietly ... ok
+test adapter::tests::a_genuinely_forged_vote_is_still_a_peer_fault ... ok
+test adapter::tests::a_genuinely_invalid_body_still_costs_the_sender ... ok
+test adapter::tests::a_held_body_is_never_a_second_peer_fault_however_often_it_is_retried ... ok
+test adapter::tests::a_joiner_does_not_fault_a_peer_for_history_it_cannot_judge ... ok
+test adapter::tests::a_miner_ahead_of_its_own_state_tip_does_not_silently_lose_its_coinbase ... ok
+test adapter::tests::a_populated_datadir_with_no_ledger_reports_rather_than_passing_as_clean ... ok
+test adapter::tests::a_punishment_ledger_this_binary_cannot_read_refuses_to_open ... ok
+test adapter::tests::a_stalled_round_names_its_number_its_counts_and_its_absentees ... ok
+test adapter::tests::a_state_machine_behind_fork_choice_drains_buffered_bodies_in_ascending_order ... ok
+test adapter::tests::a_tombstoned_member_stays_tombstoned_across_a_restart ... ok
+test adapter::tests::an_in_memory_adapter_persists_no_punishments ... ok
+test adapter::tests::an_unjudged_body_is_not_applied_but_its_header_is_learned ... ok
+test adapter::tests::at_the_epoch_boundary_out_of_range_votes_are_unjudged ... ok
+test adapter::tests::buffered_bodies_reach_the_block_log_so_a_restart_replays_from_disk ... ok
+test adapter::tests::checkpoint_quorum_gate_and_finalized_height ... ok
+test adapter::tests::diagnostics_do_not_change_what_finalizes ... ok
+test adapter::tests::drill_a_old_miner_grows_past_h_and_never_finalizes ... ok
+test adapter::tests::drill_b_finality_does_not_resume_below_quorum ... ok
+test adapter::tests::drill_d_a_cancelled_upgrade_does_not_halt ... ok
+test adapter::tests::duties_are_refused_while_the_state_lags_and_resume_once_it_converges ... ok
+test adapter::tests::equivocation_evidence_tombstones_and_drops_from_quorum ... ok
+test adapter::tests::equivocation_slash_is_ten_percent_of_bond ... ok
+test adapter::tests::every_body_error_declares_whether_it_is_intrinsic_or_positional ... ok
+test adapter::tests::every_vote_refuse_declares_whether_it_is_a_peer_fault ... ok
+test adapter::tests::finality_stall_degrade_committee_restart_recovery ... ok
+test adapter::tests::forged_unknown_dup_never_increase_tally ... ok
+test adapter::tests::genesis_placeholders_never_enter_the_event_histograms ... ok
+test adapter::tests::halt_committee_refuses_to_sign_or_finalize_above_h ... ok
+test adapter::tests::halt_default_schedule_is_a_no_op ... ok
+test adapter::tests::halt_stops_mining_accepting_and_signing_above_h ... ok
+test adapter::tests::i162_a_rewind_may_not_cross_the_finalized_head ... ok
+test adapter::tests::i162_a_rewound_state_machine_replays_from_disk_onto_the_winning_branch ... ok
+test adapter::tests::i162_a_state_machine_on_a_losing_sibling_rejoins_the_main_chain ... ok
+test adapter::tests::i162_the_slag_slope_falls_below_the_block_rate_within_one_block ... ok
+test adapter::tests::i162_the_wedge_detector_still_separates_lagging_from_stranded ... ok
+test adapter::tests::ingest_block_applies_a_produced_block_and_rejects_a_bad_body ... ok
+test adapter::tests::ingest_block_rejects_a_body_that_is_not_the_headers_body ... ok
+test adapter::tests::ingest_block_rejects_an_honest_header_with_an_empty_body ... ok
+test adapter::tests::ingest_header_orphan_then_accept ... ok
+test adapter::tests::mining_clock_default_is_deterministic_binary_uses_wall_clock ... ok
+test adapter::tests::observe_votes_detects_conflict_not_forgery ... ok
+test adapter::tests::partial_then_completing_set_finalizes ... ok
+test adapter::tests::rejected_vote_sets_are_recorded_against_the_round_they_targeted ... ok
+test adapter::tests::stored_body_answers_applied_blocks_and_declines_merely_buffered_ones ... ok
+test adapter::tests::the_bond_and_the_slash_survive_the_restart_not_just_the_status_flag ... ok
+test adapter::tests::the_pending_body_window_is_bounded_by_height_count_and_bytes ... ok
+test adapter::tests::the_state_machines_finalized_head_catches_up_after_the_bodies_do ... ok
+test adapter::tests::the_unjudged_case_is_decided_by_this_nodes_own_two_numbers ... ok
+test adapter::tests::the_wire_path_cannot_admit_an_immature_coinbase_spend ... ok
+test adapter::tests::tombstoned_members_are_excluded_not_reported_absent ... ok
+test adapter::tests::tombstoned_vote_excluded_from_tally ... ok
+test adapter::tests::two_nodes_disagreeing_about_a_tombstone_still_agree_within_the_epoch ... ok
+test adapter::tests::txpool_rejects_invalid_proof_and_admits_valid ... ok
+test addrman::tests::a_full_book_of_dialable_entries_refuses_new_candidates ... ok
+test addrman::tests::a_single_netgroup_cannot_occupy_the_address_book ... ok
+test addrman::tests::dial_budget_respects_the_outbound_cap ... ok
+test addrman::tests::dialable_is_sticky_across_a_drop ... ok
+test addrman::tests::failed_dials_back_off_and_recover ... ok
+test addrman::tests::getaddr_is_rate_limited_per_peer ... ok
+test addrman::tests::gossip_is_bounded_per_message ... ok
+test addrman::tests::known_does_not_count_self ... ok
+test addrman::tests::learned_addresses_are_admitted_once_and_validated ... ok
+test addrman::tests::netgroup_buckets_ipv4_by_16_ipv6_by_32_and_names_whole ... ok
+test addrman::tests::never_learns_itself ... ok
+test addrman::tests::never_learns_itself_when_advertise_addr_is_absent ... ok
+test addrman::tests::noting_self_purges_a_prior_book_entry ... ok
+test addrman::tests::one_addr_message_cannot_flood_the_book ... ok
+test addrman::tests::one_netgroup_cannot_fill_the_outbound_budget ... ok
+test addrman::tests::only_dialable_addresses_are_gossiped ... ok
+test addrman::tests::pending_dials_reserve_slots_and_are_not_started_twice ... ok
+test addrman::tests::persistence_rejects_unknown_version_and_trailing ... ok
+test addrman::tests::persistence_round_trips_dialable_entries_only ... ok
+test addrman::tests::seeds_are_exempt_from_the_diversity_caps ... ok
+test addrman::tests::seeds_are_tried_first_and_never_evicted ... ok
+test addrman::tests::self_is_gossiped_only_when_declared_reachable ... ok
+test addrman::tests::sync_live_drops_vanished_handles ... ok
+test addrman::tests::the_outbound_budget_fills_completely_from_distinct_netgroups ... ok
+test addrman::tests::validates_addresses ... ok
+test codec::tests::checkpoint_and_votes_round_trip ... ok
+test codec::tests::checkpoint_votes_body_golden_and_roundtrip ... ok
+test codec::tests::checkpoint_votes_reject_trailing_and_truncated ... ok
+test codec::tests::evidence_round_trips_and_id_is_stable ... ok
+test codec::tests::header_rejects_tampered_reserved_tag ... ok
+test codec::tests::header_rejects_trailing ... ok
+test codec::tests::header_round_trips_and_preserves_hash ... ok
+test codec::tests::headers_batch_round_trips ... ok
+test codec::tests::inv_round_trips_and_rejects_unknown_kind ... ok
+test codec::tests::locator_round_trips ... ok
+test codec::tests::the_discovery_group_survives_the_tx_wire ... ok
+test codec::tests::tx_rejects_unknown_bucket ... ok
+test codec::tests::tx_round_trips ... ok
+test codec::tests::vote_signature_is_frozen_length ... ok
+test compact::tests::announce_round_trips ... ok
+test compact::tests::get_and_block_txn_round_trip ... ok
+test compact::tests::reconstruct_complete_when_mempool_has_all ... ok
+test compact::tests::reconstruct_reports_missing_slots ... ok
+test compact::tests::s5_relay_inherits_reject_unknown_version ... ok
+test compact::tests::s5_relay_is_byte_identical_to_cbserver ... ok
+test gossip::tests::evicts_oldest_past_capacity ... ok
+test gossip::tests::insert_reports_novelty ... ok
+test n1::tests::checkpoint_ingest_quorum_gate ... ok
+test n1::tests::downtime_jail_fires_over_the_ingest_path ... ok
+test n1::tests::header_ingest_accept_dup_orphan ... ok
+test n1::tests::ingest_checkpoint_drops_tombstoned_votes_from_quorum ... ok
+test n1::tests::observe_votes_detects_conflict_but_not_duplicates_or_forgeries ... ok
+test n1::tests::only_rejected_is_a_peer_fault ... ok
+test n1::tests::stubnode_ingest_block_defaults_to_header_only ... ok
+test n1::tests::stubnode_ingest_block_rejects_a_body_the_header_did_not_commit_to ... ok
+test n1::tests::tx_ingest_dedups ... ok
+test node::tests::a_dropped_peer_is_redialed_after_backoff ... ok
+test node::tests::a_gossiped_flood_of_one_netgroup_cannot_eclipse_the_outbound_set ... ok
+test node::tests::a_malformed_addr_frame_is_scored_but_a_bogus_address_is_not ... ok
+test node::tests::a_message_flood_is_dropped_at_the_limit_and_never_scores_the_peer ... ok
+test node::tests::a_node_that_is_not_dialable_is_never_gossiped ... ok
+test node::tests::a_node_with_no_peers_never_claims_to_be_synced ... ok
+test node::tests::an_oversized_stream_is_dropped_at_the_byte_budget ... ok
+test node::tests::an_unknown_envelope_type_bans_the_sender_on_the_very_first_frame ... ok
+test node::tests::announced_body_that_is_not_the_headers_body_is_rejected_and_penalised ... ok
+test node::tests::announcing_an_unbounded_chain_caches_a_bounded_serving_window ... ok
+test node::tests::auto_connect_stops_at_the_outbound_cap ... ok
+test node::tests::checkpoint_gossip_propagates_and_finalizes ... ok
+test node::tests::checkpoints_follow_the_8_block_cadence ... ok
+test node::tests::compact_block_relay_fetches_missing_tx ... ok
+test node::tests::compact_block_relay_reconstructs_from_mempool ... ok
+test node::tests::conflicting_checkpoints_auto_detected_and_propagated ... ok
+test node::tests::dial_line_failure_carries_duration_and_error ... ok
+test node::tests::dial_line_success_carries_addr_and_duration ... ok
+test node::tests::epoch_advances_with_the_chain_over_network ... ok
+test node::tests::equivocation_evidence_gossip_tombstones_whole_network ... ok
+test node::tests::every_message_the_body_requester_sends_is_a_pre_existing_type ... ok
+test node::tests::finality_degrades_and_recovers_over_network ... ok
+test node::tests::forged_votes_penalised_over_the_wire ... ok
+test node::tests::get_block_txn_is_answered_from_the_store_after_eviction ... ok
+test node::tests::getaddr_is_asked_once_per_peer_per_interval ... ok
+test node::tests::handshake_reaches_ready_both_ways ... ok
+test node::tests::header_first_sync_catches_up_a_behind_node ... ok
+test node::tests::header_gossip_propagates ... ok
+test node::tests::i134::a_body_with_an_unverifiable_proof_still_costs_the_sender ... ok
+test node::tests::i134::a_joiner_does_not_ban_the_peer_serving_it_correct_history ... ok
+test node::tests::late_votes_for_a_known_checkpoint_are_learnable ... ok
+test node::tests::malformed_frame_penalizes_sender ... ok
+test node::tests::non_advancing_checkpoint_rejected_over_network ... ok
+test node::tests::orphan_block_announce_kicks_header_sync ... ok
+test node::tests::own_announce_of_an_unbound_body_is_not_relayed ... ok
+test node::tests::partial_sets_do_not_penalise ... ok
+test node::tests::seed_only_node_learns_the_mesh_and_connects ... ok
+test node::tests::serving_cache_byte_budget_binds_and_keeps_at_least_one_body ... ok
+test node::tests::serving_cache_keeps_the_highest_heights_at_the_entry_cap ... ok
+test node::tests::serving_cache_replaces_a_re_announced_hash_without_double_counting ... ok
+test node::tests::six_five_five_five_reaches_quorum ... ok
+test node::tests::tcp_maintenance_collects_an_async_dial_without_restarting_it ... ok
+test node::tests::tombstoned_vote_excluded_from_quorum_over_network ... ok
+test node::tests::tx_gossip_propagates_across_mesh ... ok
+test peer::tests::a_ready_peer_that_never_claimed_a_height_is_no_height_source ... ok
+test peer::tests::addrs_round_trip ... ok
+test peer::tests::handshake_flow_reaches_ready ... ok
+test peer::tests::penalize_bans_at_threshold ... ok
+test peer::tests::version_rejects_trailing ... ok
+test peer::tests::version_round_trips ... ok
+test punish::tests::a_duplicated_record_does_not_double_apply ... ok
+test punish::tests::a_punishment_above_the_tip_does_not_advance_the_epoch_past_it ... ok
+test punish::tests::a_punishment_after_a_boundary_is_adjudicated_against_the_roster_that_owned_it ... ok
+test punish::tests::an_unreadable_ledger_is_refused_never_treated_as_empty ... ok
+test punish::tests::evidence_from_a_foreign_committee_refuses_rather_than_starting_clean ... ok
+test punish::tests::ledger_round_trips_including_empty ... ok
+test punish::tests::replay_reproduces_a_boundary_crossing_committee_exactly ... ok
+test punish::tests::save_load_round_trips_and_a_missing_file_is_none ... ok
+test punish::tests::summary_line_states_zero_rather_than_omitting_it ... ok
+test ratelimit::tests::bucket_spends_its_burst_then_refills_at_the_stated_rate ... ok
+test ratelimit::tests::frames_are_charged_against_both_budgets ... ok
+test ratelimit::tests::getaddr_allowance_is_one_per_interval_per_key ... ok
+test ratelimit::tests::host_is_split_at_the_last_colon ... ok
+test ratelimit::tests::slow_refill_is_not_rounded_away_by_frequent_polls ... ok
+test ratelimit::tests::the_key_is_the_host_so_a_reconnect_lands_on_the_same_bucket ... ok
+test ratelimit::tests::the_key_map_is_bounded_and_evicts_the_oldest_in_batches ... ok
+test ratelimit::tests::unlimited_limits_never_trip ... ok
+test sync::tests::answer_from_partial_locator_continues_after_ancestor ... ok
+test sync::tests::answer_respects_max_batch ... ok
+test sync::tests::answer_returns_headers_after_common_ancestor ... ok
+test sync::tests::locator_is_dense_then_sparse_and_ends_at_genesis ... ok
+test transport::tests::inproc_delivers_only_over_links ... ok
+test transport::tests::inproc_dial_resolves_bound_addresses_only ... ok
+test transport::tests::inproc_partition_and_heal ... ok
+test transport::tests::inproc_reports_a_bound_peers_address_and_none_for_an_unbound_one ... ok
+test transport::tests::one_peer_cannot_consume_the_whole_receive_queue ... ok
+test transport::tests::tcp_dial_counts_as_outbound_not_inbound ... ok
+test transport::tests::tcp_dial_never_waits_for_the_connector ... ok
+test transport::tests::tcp_inbound_cap_refuses_a_flood_rather_than_absorbing_it ... ok
+test transport::tests::tcp_reports_the_remote_address_of_an_accepted_connection ... ok
+test transport::tests::tcp_round_trip_over_loopback ... ok
+test transport::tests::the_receive_queue_accepts_up_to_its_global_bound_and_refuses_past_it ... ok
+test varint::tests::overflow_beyond_ten_bytes_is_rejected ... ok
+test varint::tests::round_trip_boundaries ... ok
+test varint::tests::single_byte_below_128 ... ok
+test varint::tests::truncated_varint_is_rejected ... ok
+test wire::tests::empty_payload_round_trips ... ok
+test wire::tests::golden_checkpoint_votes_header_bytes ... ok
+test wire::tests::golden_header_bytes ... ok
+test wire::tests::reject_bad_magic ... ok
+test wire::tests::reject_oversize_length_prefix ... ok
+test wire::tests::reject_trailing_bytes ... ok
+test wire::tests::reject_truncated_body ... ok
+test wire::tests::reject_unknown_msg_type ... ok
+test wire::tests::reject_unknown_version ... ok
+test wire::tests::round_trip_all_msg_types ... ok
+
+test result: ok. 207 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.79s
+
+     Running tests/getaddr_amplification.rs (target/release/deps/getaddr_amplification-0792b951592dda68)
+
+running 2 tests
+test a_request_exactly_on_the_serve_interval_is_answered ... ok
+test measure_inbound_getaddr_amplification ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/historical_body_transfer.rs (target/release/deps/historical_body_transfer-9d53afac33983786)
+
+running 11 tests
+test a_bare_getdata_for_a_block_is_answered_with_the_whole_block ... ok
+test a_getdata_asking_for_more_bodies_than_the_cap_gets_headers_for_the_remainder ... ok
+test a_node_at_height_one_with_the_headers_in_hand_reaches_the_tip ... ok
+test a_peer_that_holds_no_bodies_answers_with_a_header_and_is_never_scored ... ok
+test a_served_block_uses_the_existing_announce_codec_and_no_new_msg_type ... ok
+test a_served_body_that_does_not_match_the_header_commitment_is_charged_to_the_server ... ok
+test a_state_machine_stranded_on_a_sibling_asks_for_the_block_that_frees_it ... ok
+test a_whole_block_announce_reconstructs_against_an_empty_candidate_set ... ok
+test not_found_for_a_body_we_requested_is_not_a_fault_but_an_unsolicited_one_is ... ok
+test the_requester_is_bounded_while_it_runs_and_silent_once_it_converges ... ok
+test the_slag_slope_is_strictly_below_the_block_rate_under_continuing_load ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/tcp_integration.rs (target/release/deps/tcp_integration-4290d7dabef82129)
+
+running 3 tests
+test getaddr_throttling_survives_a_reconnect ... ok
+test tcp_checkpoint_gossip_finalizes_peer ... ok
+test tcp_handshake_gossip_and_header_first_sync ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.52s
+
+     Running unittests src/lib.rs (target/release/deps/qlab_pow-57e62ec678cfcf68)
+
+running 25 tests
+test keyblock::tests::first_rotation_is_one_block_after_epoch_plus_lag ... ok
+test keyblock::tests::is_rotation_height_flags_only_the_boundaries ... ok
+test keyblock::tests::lag_delays_the_rotation_by_exactly_lag_blocks ... ok
+test keyblock::tests::matches_monero_bitmask_form_for_power_of_two_epoch ... ok
+test keyblock::tests::non_power_of_two_epoch_still_lands_on_multiples ... ok
+test keyblock::tests::schedule_struct_wraps_the_free_fn_and_defaults_to_monero ... ok
+test keyblock::tests::seed_height_is_always_a_multiple_of_epoch ... ok
+test keyblock::tests::seed_height_is_monotone_non_decreasing_in_height ... ok
+test keyblock::tests::warmup_pins_genesis_seed_until_epoch_plus_lag ... ok
+test keyblock::tests::within_an_epoch_the_seed_is_constant ... ok
+test keyblock::tests::zero_epoch_disables_rotation ... ok
+test lwma::tests::a_single_huge_gap_is_clamped_to_six_t ... ok
+test lwma::tests::empty_window_returns_floor ... ok
+test lwma::tests::faster_blocks_raise_difficulty ... ok
+test lwma::tests::on_target_window_is_a_fixed_point ... ok
+test lwma::tests::out_of_sequence_timestamp_is_handled_deterministically ... ok
+test lwma::tests::recency_weighting_a_recent_slowdown_lowers_more_than_an_old_one ... ok
+test lwma::tests::result_is_floored_at_one ... ok
+test lwma::tests::rise_is_capped_by_the_low_clamp ... ok
+test lwma::tests::slower_blocks_lower_difficulty ... ok
+test lwma::tests::works_for_a_short_warmup_window ... ok
+test randomx::tests::deterministic_and_key_and_input_sensitive ... ok
+test randomx::tests::matches_official_reference_vectors ... ok
+test randomx::tests::memoized_key_switch_stays_correct ... ok
+test randomx::tests::output_is_flag_independent ... ok
+
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.37s
+
+     Running unittests src/lib.rs (target/release/deps/qlab_wallet-192abe730128340a)
+
+running 44 tests
+test address::tests::bech32m_roundtrip_and_hrp ... ok
+test address::tests::different_diversifiers_distinct_short_addresses ... ok
+test address::tests::encapsulation_key_is_functional ... ok
+test address::tests::measured_sizes ... ok
+test address::tests::raw_len_is_1233 ... ok
+test address::tests::raw_roundtrip ... ok
+test address::tests::rkm_lanes_roundtrips ... ok
+test address::tests::short_address_roundtrip_and_resolution ... ok
+test bech32m::tests::bip350_invalid_vectors_reject ... ok
+test bech32m::tests::bip350_valid_vectors_verify ... ok
+test bech32m::tests::corruption_detected ... ok
+test bech32m::tests::roundtrip_payloads ... ok
+test diversifier::tests::allocate_is_monotonic_and_unique ... ok
+test diversifier::tests::collision_guard_rejects_shared_diversifier ... ok
+test diversifier::tests::index_diversifier_is_pseudorandom_and_deterministic ... ok
+test diversifier::tests::manual_default_diversifier_coexists_with_managed ... ok
+test diversifier::tests::persistence_rejects_malformed ... ok
+test diversifier::tests::persistence_roundtrips ... ok
+test diversifier::tests::reuse_guard_rejects_double_reserve ... ok
+test keys::tests::derivations_deterministic_and_separated ... ok
+test keys::tests::leaf_commitment_matches_build_bucket_leaf ... ok
+test keys::tests::nk_nf_path_locked_to_build_bucket ... ok
+test keys::tests::rkm_packing_byte_identical ... ok
+test keys::tests::rkm_path_locked_via_anchor ... ok
+test keys::tests::spend_input_carries_sk ... ok
+test mnemonic::tests::bad_checksum_rejected ... ok
+test mnemonic::tests::roundtrip_all_seed_recovers ... ok
+test mnemonic::tests::unknown_word_rejected ... ok
+test mnemonic::tests::whitespace_tolerant ... ok
+test mnemonic::tests::wordlist_is_2048_unique ... ok
+test mnemonic::tests::wrong_word_count_rejected ... ok
+test mnemonic::tests::zero_entropy_is_byte_frozen ... ok
+test seed::tests::accounts_and_versions_are_separated ... ok
+test seed::tests::chain_matches_by_hand ... ok
+test seed::tests::debug_redacts_entropy ... ok
+test seed::tests::sk_derivation_is_byte_frozen ... ok
+test viewing::tests::addresses_of_one_wallet_are_unlinkable ... ok
+test viewing::tests::different_wallets_have_different_keys ... ok
+test viewing::tests::diversified_keypairs_differ_but_are_deterministic ... ok
+test viewing::tests::fvk_and_wallet_produce_the_same_address ... ok
+test viewing::tests::fvk_derives_rkm_matching_wallet ... ok
+test viewing::tests::fvk_views_spends_matching_spending_key ... ok
+test viewing::tests::managed_index_addresses_agree_across_capabilities ... ok
+test viewing::tests::rotation_yields_fresh_unlinkable_addresses ... ok
+
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/end_to_end.rs (target/release/deps/end_to_end-a70e95c257b1ea50)
+
+running 4 tests
+test amortized_two_output_scan ... ok
+test derive_address_encrypt_scan_recompute_and_spend ... ok
+test seed_to_mnemonic_to_rotated_address_encrypt_scan_spend ... ok
+test two_diversified_addresses_are_unlinkable_and_both_spend ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/release/deps/qumbra_faucet-2220ec46ddcd7304)
+
+running 29 tests
+test config::tests::a_node_holding_committee_keys_is_refused ... ok
+test config::tests::a_payout_that_is_not_the_faucets_is_fatal ... ok
+test config::tests::a_short_secret_file_is_refused_without_quoting_it ... ok
+test config::tests::an_unknown_key_is_rejected_not_ignored ... ok
+test config::tests::hd_account_zero_is_refused ... ok
+test config::tests::missing_required_fields_are_errors ... ok
+test config::tests::non_loopback_binds_are_recognised_as_exposure ... ok
+test config::tests::the_listener_defaults_to_loopback ... ok
+test harvest::tests::a_coinbase_note_is_funded_at_maturity_and_not_one_block_before ... ok
+test harvest::tests::another_miners_blocks_are_never_harvested ... ok
+test harvest::tests::the_funding_threshold_is_the_append_schedules_own ... ok
+test harvest::tests::the_harvested_note_is_the_leaf_the_node_appended ... ok
+test http::tests::a_bad_address_is_a_400_and_costs_nothing ... ok
+test http::tests::a_request_reaches_the_core_and_a_refusal_keeps_its_name ... ok
+test http::tests::an_address_is_only_ever_rendered_truncated ... ok
+test http::tests::an_unavailable_faucet_refuses_without_burning_a_ticket ... ok
+test http::tests::no_refusal_is_ever_a_server_error ... ok
+test http::tests::the_form_decoder_handles_what_a_browser_actually_sends ... ok
+test http::tests::the_journal_label_is_a_subnet_not_a_client ... ok
+test http::tests::the_page_has_no_script_and_no_external_reference ... ok
+test service::tests::a_refusal_issues_no_receipt ... ok
+test service::tests::receipts_are_issued_in_queue_order_and_carry_a_position ... ok
+test service::tests::serving_the_head_renumbers_everyone_behind_it ... ok
+test state::tests::every_state_explains_itself ... ok
+test state::tests::maturity_inside_the_advertised_wait_is_queued_and_beyond_it_is_refused ... ok
+test state::tests::only_the_self_clearing_states_accept_requests ... ok
+test state::tests::the_advertised_wait_is_the_queue_depth ... ok
+test view::tests::an_unfinalized_chain_offers_no_anchor ... ok
+test view::tests::the_newest_anchor_is_the_finalized_tip_root_and_its_prefix_resolves ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running unittests src/main.rs (target/release/deps/qumbra_faucet-becc83294cf12601)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/acceptance.rs (target/release/deps/acceptance-2a4eae2e27a52214)
+
+running 7 tests
+test a_browser_request_becomes_a_real_grant_the_requester_detects ... ok
+test an_http_request_reaches_faucet_accept ... ok
+test an_unbindable_listen_addr_is_fatal ... ok
+test an_unservable_faucet_refuses_and_keeps_the_requesters_ticket ... ok
+test every_refusal_is_a_refusal_over_the_wire_never_a_500 ... ok
+test the_access_log_carries_no_full_requester_address ... ok
+test the_listener_defaults_to_loopback ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.55s
+
+     Running unittests src/lib.rs (target/release/deps/qumbra_node-a1c898a58d92bdae)
+
+running 112 tests
+test config::tests::an_unknown_key_is_rejected_not_ignored ... ok
+test config::tests::miner_rkm_parses_and_rejects_the_two_wrong_shapes ... ok
+test config::tests::missing_required_field_is_an_error ... ok
+test config::tests::optional_fields_default ... ok
+test config::tests::parses_a_full_config ... ok
+test config::tests::round_trips_through_toml ... ok
+test genesis::tests::committee_key_files_are_not_world_readable_even_on_a_re_run ... ok
+test genesis::tests::committee_matches_devnet_committee_21 ... ok
+test genesis::tests::frozen_committee_is_21_quorum_15 ... ok
+test genesis::tests::genesis_hash_is_deterministic_and_stable ... ok
+test genesis::tests::genesis_hash_is_pinned ... ok
+test genesis::tests::genesis_round_trips_through_bytes ... ok
+test genesis::tests::hex_round_trips ... ok
+test genesis::tests::key_file_round_trips_and_loads_a_validator ... ok
+test genesis::tests::load_validators_rejects_a_key_for_the_wrong_index ... ok
+test genesis::tests::the_baked_genesis_block_binds_its_own_body ... ok
+test genesis::tests::verify_startup_accepts_a_good_genesis_and_matching_hash ... ok
+test genesis::tests::verify_startup_refuses_a_wrong_hash ... ok
+test genesis::tests::verify_startup_rejects_tampered_committee_size ... ok
+test genesis::tests::write_and_load_committee_key_files_round_trips_all_21 ... ok
+test metrics_server::tests::an_unbindable_address_is_an_error_not_a_silent_no_op ... ok
+test metrics_server::tests::serves_the_snapshot_at_metrics_over_a_real_socket ... ok
+test params_audit::tests::cadence_is_recorded_but_not_frozen ... ok
+test params_audit::tests::converged_constants_match_frozen_genesis ... ok
+test params_audit::tests::equivocation_slash_is_ten_percent_of_bond ... ok
+test params_audit::tests::markdown_covers_every_row_and_all_statuses ... ok
+test release::tests::a_pre_81_height_scheme_marker_is_refused_with_a_reason ... ok
+test release::tests::a_release_armed_at_the_height_it_claims_to_resume_past_is_contradictory ... ok
+test release::tests::a_resume_release_halts_nowhere_and_applies_post_halt_rules_above_the_boundary ... ok
+test release::tests::a_routine_later_release_starts_on_a_data_dir_that_already_resumed ... ok
+test release::tests::a_routine_release_inherits_the_post_halt_domain_from_the_marker ... ok
+test release::tests::an_arbitrary_binary_is_refused_on_a_halted_node_and_on_a_resumed_one ... ok
+test release::tests::an_armed_release_halts_at_h_and_declares_no_post_halt_rules ... ok
+test release::tests::an_off_grid_release_refuses_to_start ... ok
+test release::tests::both_shipped_revisions_describe_this_binary ... ok
+test release::tests::drill_c_resume_without_a_revision_refuses_to_start ... ok
+test release::tests::drill_d_a_cancelled_release_does_not_halt ... ok
+test release::tests::halt_marker_round_trips_on_disk_and_a_corrupt_one_is_an_error ... ok
+test release::tests::no_config_key_can_set_a_halt_height ... ok
+test release::tests::restarting_the_same_halted_binary_is_not_a_resume ... ok
+test release::tests::resume_gate_accepts_the_matching_release_and_rejects_an_undeclared_one ... ok
+test release::tests::resuming_always_carries_a_post_halt_rule_domain ... ok
+test release::tests::the_banner_distinguishes_halted_at_from_passed_through ... ok
+test release::tests::the_compiled_in_release_validates ... ok
+test release::tests::the_drill_revision_is_inert ... ok
+test release::tests::the_marker_is_rewritten_on_a_transition_and_not_on_a_restart ... ok
+test revision::tests::a_revision_that_does_not_describe_this_binary_is_rejected ... ok
+test revision::tests::a_revision_whose_digest_matches_this_binary_verifies ... ok
+test revision::tests::digest_is_deterministic_and_covers_the_declared_field_count ... ok
+test revision::tests::distinct_identifiers_are_distinct_rule_domains_even_when_inert ... ok
+test revision::tests::every_covered_field_changes_the_digest ... ok
+test revision::tests::frozen_digest_is_pinned ... ok
+test revision::tests::swapping_two_equal_width_fields_changes_the_digest ... ok
+test revision::tests::the_borrowed_revision_digest_matches_the_constants_digest ... ok
+test revision::tests::the_not_frozen_cadence_field_is_excluded ... ok
+test run::tests::a_catch_up_lands_in_rback_while_a_lost_live_round_still_lands_in_rfail ... ok
+test run::tests::a_cold_node_with_a_taller_peer_does_not_mine_until_it_has_synced ... ok
+test run::tests::a_committee_punishment_survives_a_restart_through_the_run_path ... ok
+test run::tests::a_corrupt_address_book_is_ignored_at_startup ... ok
+test run::tests::a_fresh_net_of_configured_peers_still_starts_from_genesis ... ok
+test run::tests::a_minority_key_holder_names_the_members_it_never_heard_from ... ok
+test run::tests::a_node_behind_its_own_chain_says_so_on_the_telemetry_line_and_refuses_to_mine ... ok
+test run::tests::a_node_whose_own_keys_disagree_prints_split_rather_than_picking_one ... ok
+test run::tests::a_pre_81_marker_refuses_the_start_and_does_not_fall_through_to_a_fresh_one ... ok
+test run::tests::a_routine_later_release_resumes_a_previously_halted_data_dir ... ok
+test run::tests::a_second_upgrade_advances_the_boundary_and_the_revision_in_force ... ok
+test run::tests::an_arbitrary_binary_is_still_refused_on_a_halted_and_on_an_upgraded_data_dir ... ok
+test run::tests::armed_release_halts_at_h_and_writes_a_durable_marker ... ok
+test run::tests::closed_rounds_are_journalled_on_the_run_path ... ok
+test run::tests::drill_c_no_revision_refuses_to_resume_a_halted_data_dir ... ok
+test run::tests::drill_d_cancelled_release_mines_through_the_cancelled_height ... ok
+test run::tests::identity_fields_are_present_and_well_formed_before_anything_finalizes ... ok
+test run::tests::local_self_identities_cover_bound_listen_and_loopback_aliases ... ok
+test run::tests::metrics_endpoint_serves_live_state_and_is_off_by_default ... ok
+test run::tests::node_without_advertise_addr_refuses_its_own_bound_address ... ok
+test run::tests::nodes_at_one_stip_height_on_different_applied_blocks_print_different_stipid ... ok
+test run::tests::nodes_that_finalized_different_checkpoints_at_one_height_print_different_identities ... ok
+test run::tests::peer_process_restart_leaves_both_sides_at_the_live_connection_count ... ok
+test run::tests::preflight_reports_a_key_subset ... ok
+test run::tests::preflight_validates_a_staged_node_without_binding ... ok
+test run::tests::randomx_engine_composes_and_mines_over_tcp ... ok
+test run::tests::redial_reconnects_a_configured_peer_without_restart ... ok
+test run::tests::refuses_to_start_on_a_wrong_genesis_hash ... ok
+test run::tests::restart_never_equivocates_through_the_run_path ... ok
+test run::tests::round_journal_volume_is_set_by_the_cadence_not_the_block_rate ... ok
+test run::tests::run_until_flushes_a_snapshot_on_shutdown ... ok
+test run::tests::run_until_returns_false_when_snapshot_flush_fails ... ok
+test run::tests::seed_only_node_learns_the_net_and_an_undialable_one_is_never_gossiped ... ok
+test run::tests::starts_mines_checkpoints_and_persists ... ok
+test run::tests::telemetry_age_is_dash_at_genesis_then_real_after_first_checkpoint ... ok
+test run::tests::telemetry_age_is_dash_when_nothing_finalized ... ok
+test run::tests::telemetry_endpoint_serves_v3_checkpoint_committee_and_supply ... ok
+test run::tests::telemetry_line_is_extended_at_the_end_and_nowhere_else ... ok
+test run::tests::telemetry_sample_reports_live_state ... ok
+test run::tests::the_address_book_survives_a_restart ... ok
+test run::tests::the_gate_turns_on_one_configured_address_not_on_whether_it_answers ... ok
+test run::tests::the_genuinely_first_node_on_a_new_net_does_mine ... ok
+test run::tests::the_line_the_scrape_and_the_wire_agree_on_the_state_lag ... ok
+test run::tests::the_pre_i84_telemetry_prefix_is_frozen_against_future_appends ... ok
+test run::tests::the_round_journal_names_what_this_node_signed_for_each_slot ... ok
+test run::tests::the_scrape_and_the_log_line_report_one_identity ... ok
+test run::tests::the_scrape_declares_the_backfill_verdict_and_states_the_caliper ... ok
+test run::tests::the_upgraded_release_resumes_at_h_without_a_resync ... ok
+test run::tests::the_wedge_detector_fires_on_a_stranded_state_machine_and_not_on_a_lagging_one ... ok
+test run::tests::verify_only_node_starts_without_keys ... ok
+test telemetry_server::tests::an_unbindable_address_is_an_error_not_a_silent_no_op ... ok
+test telemetry_server::tests::only_v1_telemetry_is_served_and_writes_are_refused ... ok
+test telemetry_server::tests::serves_the_telemetry_wire_at_v1_telemetry_over_a_real_socket ... ok
+test verifier::tests::real_verifier_accepts_a_real_m3_proof ... ok
+test verifier::tests::real_verifier_rejects_a_tampered_public_surface ... ok
+test verifier::tests::real_verifier_rejects_garbage_and_wrong_shape ... ok
+test verifier::tests::rehearsal_flag_is_opt_in_and_logs_loudly ... ok
+
+test result: ok. 112 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.02s
+
+     Running unittests src/main.rs (target/release/deps/qumbra_node-7c66401cc029c056)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/coinbase_spend.rs (target/release/deps/coinbase_spend-7173557f262159fb)
+
+running 9 tests
+test a_forged_anchor_carrying_a_real_proof_is_rejected_at_the_block_path ... ok
+test a_mined_coin_can_be_spent_after_maturity_with_a_real_proof ... ok
+test a_minting_block_with_no_payout_key_is_rejected ... ok
+test a_pre_101_block_announcement_does_not_decode ... ok
+test a_redirected_payout_key_is_rejected_by_the_header_binding ... ok
+test an_immature_coinbase_spend_is_unprovable_not_refused ... ok
+test only_the_payout_key_derives_the_minted_note ... ok
+test replay_reproduces_the_coinbase_leaves ... ok
+test the_leaf_appears_exactly_at_maturity_and_not_one_block_earlier ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.90s
+
+     Running tests/sigterm_shutdown.rs (target/release/deps/sigterm_shutdown-a93aab183623537a)
+
+running 2 tests
+test sigterm_does_not_claim_flush_when_it_failed ... qumbra-node genesis init
+  network:        qumbra-devnet-t0
+  format version: 3 (NOT frozen — [devnet-placeholder] shape)
+  committee:      N=21 quorum=15
+  block time:     75 s (FROZEN)
+  consensus FRI:  b16/q21/g22/fp16/a16
+  genesis file:   /tmp/multica-task-2552323540/qmb-i145-sigterm-fail-99269-42/genesis.qmb
+  key files:      21 in /tmp/multica-task-2552323540/qmb-i145-sigterm-fail-99269-42/keys
+  GENESIS HASH:   566d4ed01426ece7a10ffa41829b6ec43d19a8bbb51b3d11aba7048192f0f80f
+  self-verify:    OK
+ok
+test sigterm_flushes_snapshot_and_peers_dat ... qumbra-node genesis init
+  network:        qumbra-devnet-t0
+  format version: 3 (NOT frozen — [devnet-placeholder] shape)
+  committee:      N=21 quorum=15
+  block time:     75 s (FROZEN)
+  consensus FRI:  b16/q21/g22/fp16/a16
+  genesis file:   /tmp/multica-task-2552323540/qmb-i145-sigterm-99269-41/genesis.qmb
+  key files:      21 in /tmp/multica-task-2552323540/qmb-i145-sigterm-99269-41/keys
+  GENESIS HASH:   566d4ed01426ece7a10ffa41829b6ec43d19a8bbb51b3d11aba7048192f0f80f
+  self-verify:    OK
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+
+     Running unittests src/lib.rs (target/release/deps/qumbra_opview-2fa2b95b12501ae3)
+
+running 19 tests
+test agree::tests::a_finalized_height_without_an_identity_is_indeterminate_not_agreed ... ok
+test agree::tests::a_nodes_own_key_split_is_a_finding_and_holding_no_keys_is_not ... ok
+test agree::tests::an_unreachable_node_is_unreachable_not_a_dissenter ... ok
+test agree::tests::different_finalized_heights_are_lag_and_not_a_verdict ... ok
+test agree::tests::grouping_is_order_independent_and_sorted ... ok
+test agree::tests::n_equals_one_is_agreement_through_the_same_path ... ok
+test agree::tests::same_height_different_fid_is_disagreement_and_same_fid_is_agreement ... ok
+test agree::tests::sid_divergence_is_a_finding_beside_an_agreeing_fid_not_a_stop ... ok
+test poll::tests::a_closed_port_reads_as_unreachable_with_its_reason ... ok
+test poll::tests::endpoint_parsing_accepts_what_an_operator_actually_types ... ok
+test render::tests::age_renders_as_dash_while_the_finalized_head_is_genesis ... ok
+test render::tests::n_equals_one_renders_a_whole_view ... ok
+test render::tests::public_view_cannot_render_per_signer_participation ... ok
+test render::tests::rendering_is_deterministic ... ok
+test render::tests::supply_view_distinguishes_exact_match_from_one_bessel_error ... ok
+test render::tests::supply_view_refuses_when_state_machine_lags_fork_choice ... ok
+test render::tests::the_two_divergences_render_at_different_severities ... ok
+test render::tests::unavailable_is_a_stable_token_and_exit_zero_does_not_attest_coverage ... ok
+test render::tests::unreachable_renders_as_unreachable_and_never_as_a_dissent ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/release/deps/qumbra_opview-081a239b3db83eae)
+
+running 1 test
+test tests::usage_says_exit_zero_does_not_attest_supply_coverage ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/over_http.rs (target/release/deps/over_http-c45a378cc4af8a8e)
+
+running 5 tests
+test a_node_speaking_the_old_0x02_wire_is_refused_with_a_reason ... ok
+test a_real_split_over_sockets_is_the_stop_condition ... ok
+test a_silent_node_times_out_and_reads_as_unreachable ... ok
+test a_wrong_endpoint_is_unreachable_not_a_verdict ... ok
+test four_nodes_one_down_renders_agreement_over_real_sockets ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.43s
+
+   Doc-tests qlab_air
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qlab_cbserver
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qlab_consensus
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qlab_demo
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qlab_devnet
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qlab_disclosure
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qlab_econ
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qlab_faucet
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qlab_node
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qlab_note
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qlab_p2p
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qlab_pow
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qlab_wallet
+
+running 3 tests
+test crates/qlab-wallet/src/lib.rs - (line 49) - compile fail ... ok
+test crates/qlab-wallet/src/lib.rs - (line 58) - compile fail ... ok
+test crates/qlab-wallet/src/lib.rs - (line 67) - compile fail ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+   Doc-tests qumbra_faucet
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qumbra_node
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests qumbra_opview
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+EXIT=0
