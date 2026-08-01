@@ -23,7 +23,7 @@
 `TELEMETRY_REFRESH` 输出到 stdout。字段顺序就是 `run.rs:996` 那个 `format!`：
 
 ```
-TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain=
+TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= prest=
 ```
 
 ⚠️ **上面是字段清单，不是一次采样。** 本文中作为「实测」引用的数值，只有标注了具体
@@ -84,6 +84,8 @@ issue 或证据包出处的那些；其余全部由源码推导。拼一条「�
 | 23 | `mready` | 挖矿就绪判定 | 🟢 从不 |
 | 24 | `stipid` | 已应用链尖的身份 | 🟡 不单独 |
 | 25 | `schain` | `main` / `fork` / `-` | 🔴 **是 —— `schain=fork`** |
+| 26 | `breq` | 当前在途的历史区块体请求数 | 🟡 不单独 |
+| 27 | `prest` | 进程启动时恢复的委员会惩罚 | 🟡 不单独 |
 
 ---
 
@@ -937,6 +939,60 @@ discovery，所以收款方找不到自己的输出（见 `CLAUDE.md` 的 T1 条
 
 ---
 
+## 26. `breq` —— 当前在途的历史区块体请求
+
+**🟡 不单独。** 与 `slag=` 配对读。
+
+**它统计什么。** 本节点此刻有多少个历史区块体请求尚未完成（`run.rs` 的 `body_reqs`，
+上限 `MAX_BODIES_IN_FLIGHT`）。瞬时水位，不是累计；请求完成后自然回落。始终打印，含零。
+由 issue #130 (c) 追加。
+
+**与 `slag=` 一起读：** `slag>0 breq=0` 是*没在问*；`slag>0 breq>0` 持续是*问了但没被服务*。
+
+**何时升级：** 单独永不。
+
+---
+
+## 27. `prest` —— 进程启动时恢复的委员会惩罚（触及 TELEMETRY）
+
+**🟡 不单独。** 非零值是本机 ledger 的本地事实；跨主机比较才是负载相关的读法。
+
+**它统计什么。** [`NodeAdapter::open`](../../crates/qlab-p2p/src/adapter.rs) 在本次进程
+启动时，从 `punishments.dat` 里找到并重新施加到全新创世委员会上的东西
+（`PunishmentRestore::telemetry_field`，`crates/qlab-p2p/src/punish.rs`）。**在 open 时闩住**
+—— 本进程生命周期内之后每一次采样都重印同一个值。它是启动事实，不是运行中累计。
+
+**形状是 `restored/known`，不是裸计数。** 单独的 `0` 分不清*没有东西可恢复*与*什么都恢复不了*，
+而这个区分正是该字段存在的理由：
+
+| 取值 | 含义 |
+|---|---|
+| `0/0` | ledger 存在（或本次 open 写了空 ledger）；没有东西可恢复 |
+| `N/M` | 本次启动从磁盘上的 `M` 条记录重新施加了 `N` 个 tombstone |
+| `unk` | 数据目录已有链历史但**没有** ledger —— 惩罚历史不可知（#133 之前的 datadir）。不是沉默，也不是干净。 |
+
+⚠️ **一台从未观察到双签的主机永远打印 `prest=0/0`。** 对本地 ledger（PR #159）来说这是正确的，
+**并不能**证明全网从未惩罚过任何人。证据是 push-once gossip、没有 getdata 路径：看到冲突对的对端与
+没看到的本机，对谁可以签名仍然意见不一，而且重启之后分歧是*持久的*。一致需要证据上链
+（issue #133 D1）。不要因为永远是 `0/0` 就「修」掉这个字段。
+
+**正常值。** 从未见过双签的网上每台主机都是 `0/0` —— T0 soak 记录正是如此。只有本节点在之前
+某次进程生命周期里自己裁决过证据，才会出现 `N/M`。
+
+**变化意味着什么。** 进程中途不会变。跨重启变化（`0/0` → `1/1`）表示本节点恢复了它曾记录的惩罚；
+那是健康的 PR #159 路径。pre-#133 datadir 首次启动时的 `unk` 是一次性升级信号 —— 随后会写入
+空 ledger，之后的重启就不再含糊。
+
+**何时升级：** 单独永不。同高度、不同 `prest`（且没有共享证据路径）的两台主机，是 D1 命名的
+那类问题，不是对某一台主机的运维动作。
+
+**由这些测试锁定：** `telemetry_line_is_extended_at_the_end_and_nowhere_else`（`run.rs`，期望末尾
+`prest=0/0`）、`a_committee_punishment_survives_a_restart_through_the_run_path`（`run.rs`，重启后期望
+`prest=1/1`）、`a_non_witness_finalizes_a_checkpoint_the_restarted_witness_refuses`
+（`adapter.rs` —— 本地 ledger 无法闭合的双节点同高度分歧）。
+
+---
+
 ## 附录 A —— 两分钟分诊
 
 按顺序。遇到第一个 🔴 就停。
@@ -973,5 +1029,5 @@ discovery，所以收款方找不到自己的输出（见 `CLAUDE.md` 的 T1 条
 `crates/qlab-p2p/src/addrman.rs`（地址簿）·
 `crates/qlab-devnet/src/params_devnet.rs`（冻结常量）。
 
-引用的 issue：#73 #74 #83 #84 #87 #104 #105 #106 #107 #117 #121 #130 #134 #162 #164
-#165 #167 #169 #172 #173 #183。引用的 PR：#72 #93 #110 #119 #153 #168 #171。
+引用的 issue：#73 #74 #83 #84 #87 #104 #105 #106 #107 #117 #121 #130 #133 #134 #162 #164
+#165 #167 #169 #172 #173 #183。引用的 PR：#72 #93 #110 #119 #153 #159 #168 #171。

@@ -1044,8 +1044,31 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // tracker meaning — learn-ahead is the capability, silent disagreement was
         // the defect. See `finality_backing_field` for the full-hash comparison.
         let finality_backing = self.finality_backing_field();
+        // Issue #133 D3: `prest=` is **appended at the end**, after `breq=`, under the
+        // same rule as every addition since #87 — every pre-existing field keeps its
+        // name, position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified. Touches TELEMETRY.
+        //
+        // It is the committee-punishment restore report from process start, and it
+        // exists because after a restart `qumbra_committee_active` and `ROUND`'s
+        // `active=` return to the full roster with no other surface saying so —
+        // **byte-identical to a net where nobody was ever punished, and byte-identical
+        // to every healthy cold start.** Five other instances of that shape were
+        // invisible in exactly this way.
+        //
+        // Shape is `restored/known` (or `unk`), not a bare count: `0` alone cannot
+        // distinguish *nothing to restore* from *could not restore anything*. See
+        // [`qlab_p2p::punish::PunishmentRestore::telemetry_field`]. Latched at open;
+        // every sample in the process reprints the same value. Always printed, zero
+        // included.
+        //
+        // ⚠️ A host that never observed an equivocation prints `prest=0/0` forever.
+        // That is correct for the local ledger (PR #159) and is **not** proof the net
+        // is punishment-free: a peer that saw the evidence and this host did not still
+        // disagree about who may sign. Agreement needs evidence in blocks (D1).
+        let prest = node.punishment_restore().telemetry_field();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1063,6 +1086,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             applied.chain_field(),
             body_reqs,
             finality_backing,
+            prest,
         )
     }
 
@@ -1974,6 +1998,18 @@ mod tests {
         assert_eq!(restore.tombstoned, vec![signer]);
         assert!(!restore.ledger_absent_on_populated_datadir);
         assert!(restore.summary_line().contains("1 tombstone(s) restored (members 7)"));
+        // And the same fact is on the TELEMETRY line operators already read (D3).
+        // Shape is restored/known: 1 tombstone re-applied from 1 on-disk record.
+        assert_eq!(restore.telemetry_field(), "1/1");
+        let line = reopened.telemetry_sample();
+        assert!(
+            line.contains(" prest=1/1"),
+            "TELEMETRY must carry the restore report, not only the startup println: {line}"
+        );
+        assert!(
+            line.ends_with(" prest=1/1"),
+            "prest is the newest append, last field: {line}"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -3728,6 +3764,8 @@ mod tests {
                 "breq",
                 // ── appended by #85, at the end ──
                 "fback",
+                // ── appended by #133 D3, at the end ──
+                "prest",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -3748,7 +3786,14 @@ mod tests {
         assert!(line.contains(" breq=0 "), "nothing in flight: {line}");
         // #85: this node finalized genesis locally, so the newest append says the
         // tracker checkpoint is backed by its exact block in fork choice.
-        assert!(line.ends_with(" fback=local"), "local finality, last: {line}");
+        // Not `ends_with` any more: `prest=` (#133 D3) landed after this field and is
+        // now the tail. Both appends are correct — only one can be last, and it is the
+        // one that landed later. This assertion was `ends_with` when `fback=` WAS last.
+        assert!(line.contains(" fback=local "), "backing verdict present: {line}");
+        // #133 D3: `prest=` is the newest append and is now the last field. A fresh
+        // data dir has nothing to restore — and the shape is restored/known, not a
+        // bare zero, so "nothing to restore" is distinguishable from "unk".
+        assert!(line.ends_with(" prest=0/0"), "nothing restored, last: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
