@@ -1,36 +1,47 @@
-# ONE EXPERIMENT, not a policy.
+# COLLECTING COMPARISON DATA. Still not the acceptance bar.
 #
-# This exists to answer four questions with a single manual run, and nothing
-# else. Until they are answered, the acceptance bar remains the rig -- see
-# CLAUDE.md §5. Nothing triggers this automatically and nothing should until
-# the numbers are in.
+# The bar remains the rig -- CLAUDE.md section 5 -- and stays there until this
+# workflow and the rig have agreed on the same number across several PRs. One
+# experiment proved it CAN run; it did not prove it keeps running correctly, and
+# those are different claims.
 #
-#   1. Does the suite FIT?    32 GB here against 15.6 GB observed on the M3 rig
-#                             -- where the macOS compressor engages and Linux
-#                             has no equivalent, so the peak may be higher.
-#   2. Does it PASS?          1029 / 0 is the rig's answer at this commit.
-#   3. How LONG?              ~18 min on the rig. A GH core is slower and
-#                             --test-threads=1 means core count does not help
-#                             the test phase, only the build.
-#   4. What does it COST?     (3) times the per-minute rate.
+# What two manual runs established (2026-08-01, commit 9b5cf1a):
+#
+#   fits     15.58 / 15.54 GB peak against 32 GB. macOS M3 measured 15.6 GB --
+#            three measurements, two operating systems, one number. The memory
+#            profile is architecture-independent, which was assumed and is now
+#            measured.
+#   passes   1029 / 0 / 1 both times, exactly the rig's count. Not "about".
+#   time     34:41 cold, 33:45 warm. The cache works -- the release build
+#            finished in 57s with zero Compiling lines -- so ~32 of those
+#            minutes are the tests themselves. An arm64 core is ~1.8x slower
+#            than the M3 Max at single-threaded work, and --test-threads=1
+#            means core count cannot help. 34 minutes is this runner's floor;
+#            there is no cache fix to find.
+#   cost     ~$0.7 per run against a $20/month budget cap with stop-usage on.
 #
 # arm64 deliberately: the rig is M3 and the four T0 hosts are AWS t4g.small
-# (Graviton). x64 would validate an architecture this project has never
-# deployed and never will, and `randomx-rs` builds a C++ library at compile
-# time -- aarch64 was a real problem once (M10-T0-3 Phase B-lite).
-name: suite (arm64, manual)
+# Graviton, so arm64 is the deployment architecture and not merely the dev one.
+name: suite (arm64)
 
 on:
+  # Only when Rust actually changed. A docs PR cannot fail this suite, so it
+  # must not spend 34 minutes proving that -- the exception every acceptance
+  # comment has stated by hand is encoded here instead of restated each time.
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
   workflow_dispatch:
-    inputs:
-      baseline:
-        description: "Expected passing count on the rig at this commit"
-        required: true
-        default: "1029"
 
 concurrency:
-  group: suite-arm64
-  cancel-in-progress: false     # never cancel a paid run that is already burning
+  # Per PR, and superseded runs ARE cancelled here -- unlike the manual path.
+  # Once a newer commit exists the older run's answer is about a tree nobody
+  # will merge, so the remaining minutes buy nothing. Cancelling early is the
+  # cheaper half of a paid run.
+  group: suite-arm64-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   suite:
@@ -79,7 +90,8 @@ jobs:
           echo "=== 2. counts ==="
           grep -E '^test result:' suite.log \
             | awk '{p+=$4; f+=$6; i+=$8} END {print "passed="p" failed="f" ignored="i}'
-          echo "baseline (rig) = ${{ inputs.baseline }}"
+          echo "(the rig baseline is compared by the coordinator at acceptance,"
+          echo " not asserted here -- this job reports, it does not rule)"
           echo "=== negatives, all must be 0 ==="
           echo "FAILED(cs)=$(grep -c 'FAILED' suite.log)  panicked=$(grep -c 'panicked at' suite.log)"
           echo "=== 1. peak memory ==="
