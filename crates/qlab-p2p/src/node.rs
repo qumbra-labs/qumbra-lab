@@ -295,6 +295,22 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         for pid in self.peers.all_peers() {
             if !live.contains(&pid) {
                 self.addrs.on_disconnect(pid);
+                // Issue #172: `PeerTable` is the live connection table and is
+                // the source of `peer_count`. The transport drops its handle
+                // when the reader observes EOF, so keeping this row would count
+                // a dead connection forever and add another stale row after
+                // every process restart.
+                self.peers.remove(pid);
+                // In-process transports may reuse their stable peer handle after
+                // an unlink/relink. Let that replacement connection perform a
+                // fresh handshake rather than inheriting the old one.
+                self.version_sent.remove(&pid);
+                if matches!(
+                    &self.sync.phase,
+                    SyncPhase::AwaitingHeaders { peer, .. } if *peer == pid
+                ) {
+                    self.sync.phase = SyncPhase::Unknown;
+                }
             }
         }
 
