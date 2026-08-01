@@ -80,20 +80,70 @@ pub const MAX_SERVED_BODIES: usize = 128;
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
 pub const MAX_SERVED_BODY_BYTES: usize = 8 * 1024 * 1024;
 
+/// **How many block bodies this node will have outstanding at once** (issue
+/// #130 (c)) — the in-flight window of the historical-body requester.
+///
+/// The bound that matters is not bandwidth, it is the pending-body window this
+/// feeds: every answered request lands in the adapter's queue, capped at
+/// [`crate::adapter::MAX_PENDING_BODIES`] = 512 entries / 32 MiB. 16 is 3 % of
+/// that entry cap, so a full in-flight window cannot on its own evict material
+/// the state machine still needs — and at the FROZEN v1.0 proof size (~145,754 B
+/// per tx, #135's measurement) 16 single-tx bodies are ~2.3 MB, well inside the
+/// 8 MiB/s per-peer byte budget the inbound limiter already permits.
+///
+/// **The catch-up arithmetic, since that is the acceptance criterion.** One
+/// request round completes in one round trip (the answer is handled on the next
+/// `tick`), so throughput is 16 bodies per round trip against a block rate of one
+/// per 75 s. At the Phase B-WAN measured RTT baseline of 68–223 ms that is three
+/// orders of magnitude above the block rate; even at issue #107's *worst* observed
+/// main-loop period of 131 s it is 16 bodies against ~1.7 new blocks, so `slag`
+/// falls. It is the ratio, not the constant, that the criterion needs.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_BODIES_IN_FLIGHT: usize = 16;
+
+/// **How long an unanswered body request is held before it may be re-asked**
+/// (issue #130 (c)).
+///
+/// It is a re-ask interval, not a failure verdict: nothing is scored when it
+/// expires (see [`P2pNode::request_missing_bodies`]). 15 s is ~70× the worst
+/// measured WAN RTT (223 ms, Phase B-WAN's pre-run baseline), so an expiry means
+/// the peer genuinely did not answer rather than that the network was slow; and it
+/// caps the cost of a batch lost to the inbound throttle at 15 s of standing still.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const BODY_REQUEST_TIMEOUT_MS: u64 = 15_000;
+
+/// **How many whole bodies this node will serve from one `GetData`** (issue
+/// #130 (c)).
+///
+/// `GetData(Block)` used to cost us a header; it can now cost us a body, which is
+/// the #91 amplifier shape in miniature (a ~45 B request against a body that is
+/// ~145 kB per transaction at FROZEN v1.0 sizes). The response to over-asking is
+/// deliberately **not** silence and **not** `NotFound`: items past this cap are
+/// answered header-only, exactly as they were before this change. That degrades to
+/// the pre-#130 (c) behaviour rather than to a refusal — and `NotFound` would be
+/// actively wrong, because the receiving side scores it ([`PENALTY_WELSHED_INV`]).
+///
+/// Matched to [`MAX_BODIES_IN_FLIGHT`] so an honest requester at its own cap is
+/// never truncated by ours.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_BODIES_PER_GETDATA: usize = 16;
+
 /// One cached body: the ordered txs, the coinbase counter and the payout key —
 /// all three are needed to rebuild the *exact* body (issue #101) — plus the
 /// height it entered under and its metered weight, so eviction needs no rescan.
 struct ServedBody {
     height: u64,
     txs: Vec<TxEntry>,
-    // `GetBlockTxn` answers only tx indexes, so nothing reads these two today —
-    // they were equally unread in the pre-#135 tuple, where tuple fields don't
-    // warn. Kept anyway: a cache entry that cannot rebuild the *exact* body
-    // (issue #101: txs + coinbase + payout key) would be a trap for the next
-    // serving path (#130 (c)), silently missing what the announce carried.
-    #[allow(dead_code)]
+    // Read since issue #130 (c): serving a whole block needs the coinbase counter
+    // and payout key as well as the txs, because they are body fields and not tx
+    // slots. #135 kept them against exactly this — "a cache entry that cannot
+    // rebuild the *exact* body would be a trap for the next serving path" — and
+    // the `#[allow(dead_code)]` they carried until now is gone because they are no
+    // longer dead.
     coinbase: u64,
-    #[allow(dead_code)]
     coinbase_rkm: [u64; 4],
     weight: usize,
 }
@@ -202,6 +252,19 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// Per-peer inbound budgets (issue #91). Keyed on the remote **host**, not the
     /// connection, so dropping and redialling does not hand out a fresh budget.
     limiter: RateLimiter,
+    /// **Historical body requests we have outstanding** (issue #130 (c)): block
+    /// hash → the `now_ms` the ask was sent at. Bounded by
+    /// [`MAX_BODIES_IN_FLIGHT`]; an entry older than [`BODY_REQUEST_TIMEOUT_MS`] is
+    /// dropped so the hash may be asked again, of a different peer.
+    ///
+    /// It is also the list [`Self::on_not_found`] reads: an ask WE originated that a
+    /// peer cannot serve is not a welshed inv, and without this set there is no way
+    /// to tell those two apart.
+    body_reqs: HashMap<Hash32, u64>,
+    /// Rotation cursor for spreading body requests across ready peers, so one silent
+    /// peer costs a fraction of a batch rather than the whole of it, and so a re-ask
+    /// after a timeout lands somewhere new.
+    body_rr: usize,
 }
 
 impl<T: Transport, N: NodeState> P2pNode<T, N> {
@@ -221,6 +284,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             checkpoints: HashMap::new(),
             addrs: AddrManager::new(),
             limiter: RateLimiter::default(),
+            body_reqs: HashMap::new(),
+            body_rr: 0,
         }
     }
 
@@ -249,6 +314,17 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// same statement the adapter makes for its pending-body window).
     pub fn served_bodies(&self) -> (usize, usize) {
         (self.blocks.len(), self.blocks.bytes)
+    }
+    /// Historical body requests outstanding right now (issue #130 (c)).
+    ///
+    /// Operator-visible for the same reason `slag` is: **a node asking and getting
+    /// nothing looks exactly like a node that is not asking**, and that is the
+    /// precise state the live net was in on 2026-08-01 — node3 sat at `stip=1` for
+    /// thirteen minutes with no line in its log for anything. `slag` falling is the
+    /// cure; this is the attempt, and only the two together separate "no peer will
+    /// serve me" from "I never asked".
+    pub fn body_requests(&self) -> usize {
+        self.body_reqs.len()
     }
     pub fn addrs_mut(&mut self) -> &mut AddrManager {
         &mut self.addrs
@@ -561,7 +637,90 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         }
         self.maybe_start_sync();
+        self.request_missing_bodies(now_ms);
         n
+    }
+
+    // --- issue #130 (c): the requesting side of historical body transfer -------
+
+    /// **Ask for the bodies this node's state machine is missing.**
+    ///
+    /// The gap #130 (c) names is that nothing ever asked: `GetBlockTxn` has exactly
+    /// one send site, in reply to a fresh `BlockAnnounce`, so a node holding 649
+    /// headers and no bodies had no message it could send. This is that message —
+    /// and it is deliberately **not a new one**. See [`Self::on_getdata`] for why
+    /// `GetData(Block)` is the request and a whole-body `BlockAnnounce` is the
+    /// answer; the short version is that a new `MsgType` would be banned on sight by
+    /// every node running the current image.
+    ///
+    /// Four bounds, all named constants:
+    ///
+    /// 1. [`MAX_BODIES_IN_FLIGHT`] outstanding asks at once;
+    /// 2. one ask per hash per [`BODY_REQUEST_TIMEOUT_MS`];
+    /// 3. the ask set itself is bounded and shrinking —
+    ///    [`crate::n1::ChainView::missing_body_hashes`] returns only main-chain
+    ///    blocks at or below the header tip that are neither applied nor already
+    ///    held, so **it empties as the state machine advances and the node stops
+    ///    asking**. That is the termination argument, and it is the node state's
+    ///    guarantee rather than a timer here;
+    /// 4. nothing is asked with no ready peer to ask.
+    ///
+    /// **No reply is not a fault.** A peer that never applied a block genuinely
+    /// cannot serve it, and on a mixed-version net it will answer with a header
+    /// instead — both are honest. So an expiry here scores nothing; the only scoring
+    /// on this path is the one that was already there, in `complete_block`, for a
+    /// body that does not match the header's `tx_body_commitment`.
+    fn request_missing_bodies(&mut self, now_ms: u64) {
+        self.body_reqs
+            .retain(|_, sent| now_ms.saturating_sub(*sent) < BODY_REQUEST_TIMEOUT_MS);
+        let room = MAX_BODIES_IN_FLIGHT.saturating_sub(self.body_reqs.len());
+        if room == 0 {
+            return;
+        }
+        let peers = self.peers.ready_peers();
+        if peers.is_empty() {
+            return;
+        }
+        let wanted: Vec<Hash32> = self
+            .node
+            .missing_body_hashes(MAX_BODIES_IN_FLIGHT)
+            .into_iter()
+            .filter(|h| !self.body_reqs.contains_key(h))
+            .take(room)
+            .collect();
+        if wanted.is_empty() {
+            return;
+        }
+        // Grouped through a peer-ordered Vec rather than a map: the send order must
+        // be a function of the peer list alone, or the in-process sims stop being
+        // reproducible byte-for-byte (the M9-N7 property).
+        let n = peers.len();
+        let mut batches: Vec<Vec<InvItem>> = vec![Vec::new(); n];
+        for (i, id) in wanted.iter().enumerate() {
+            batches[(self.body_rr + i) % n].push(InvItem { kind: InvKind::Block, id: *id });
+            self.body_reqs.insert(*id, now_ms);
+        }
+        self.body_rr = self.body_rr.wrapping_add(1);
+        for (pid, items) in peers.into_iter().zip(batches) {
+            if !items.is_empty() {
+                self.send(pid, MsgType::GetData, encode_inv(&items));
+            }
+        }
+    }
+
+    /// The body this node can serve for `hash`: the hot relay cache first, then the
+    /// applied-block store — the same two sources, in the same order, that
+    /// [`Self::on_get_block_txn`] already reads (issue #135). Stated once so the two
+    /// serving paths cannot come to disagree about what this node holds.
+    fn body_for_serving(&self, hash: &Hash32) -> Option<BlockBody> {
+        if let Some(entry) = self.blocks.get(hash) {
+            return Some(BlockBody {
+                txs: entry.txs.clone(),
+                coinbase: entry.coinbase,
+                coinbase_rkm: entry.coinbase_rkm,
+            });
+        }
+        self.node.stored_body(hash)
     }
 
     fn dispatch(&mut self, from: PeerId, env: Envelope, key: RateKey, now_ms: u64) {
@@ -598,9 +757,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             MsgType::Addr => self.on_addr(from, &env.payload),
             MsgType::Inv => self.on_inv(from, &env.payload),
             MsgType::GetData => self.on_getdata(from, &env.payload),
-            MsgType::NotFound => {
-                self.peers.penalize(from, PENALTY_WELSHED_INV);
-            }
+            MsgType::NotFound => self.on_not_found(from, &env.payload),
             MsgType::Tx => self.on_tx(from, &env.payload),
             MsgType::Header => self.on_header(from, &env.payload),
             MsgType::Checkpoint => self.on_checkpoint(from, &env.payload),
@@ -664,6 +821,37 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
     }
 
+    /// A peer telling us it cannot serve something we asked for.
+    ///
+    /// **The penalty is now conditional, and it has to be** (issue #130 (c)).
+    /// `PENALTY_WELSHED_INV` was written for the only `GetData` this node used to
+    /// send: one issued in reply to an `Inv`, i.e. asking a peer for an object it
+    /// had *just advertised*. Answering `NotFound` to that is welshing, and 5 points
+    /// is right.
+    ///
+    /// The historical-body requester sends a `GetData` nobody advertised, for a block
+    /// a peer may legitimately not hold — a joiner, a node that pruned, a node behind
+    /// us. Charging that would be #134's mistake in a new place: **banning honest
+    /// peers for not having history**, at 5 points a block over a 649-block catch-up,
+    /// which is 20 blocks to a ban. So an item we ourselves put in flight is
+    /// exempt, and everything else is charged exactly as before.
+    ///
+    /// A `NotFound` we cannot decode is still the sender's own malformed frame.
+    fn on_not_found(&mut self, from: PeerId, payload: &[u8]) {
+        let items = match decode_inv(payload) {
+            Ok(i) => i,
+            Err(_) => {
+                self.peers.penalize(from, PENALTY_MALFORMED);
+                return;
+            }
+        };
+        // Charge once per message, not per item, matching the pre-#130 (c) behaviour
+        // for a message this node did not originate as a body request.
+        if items.iter().any(|it| !self.body_reqs.contains_key(&it.id)) {
+            self.peers.penalize(from, PENALTY_WELSHED_INV);
+        }
+    }
+
     fn on_getdata(&mut self, from: PeerId, payload: &[u8]) {
         let items = match decode_inv(payload) {
             Ok(i) => i,
@@ -673,14 +861,58 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         let mut not_found = Vec::new();
+        let mut bodies_served = 0usize;
         for it in items {
             match it.kind {
                 InvKind::Tx => match self.node.get_tx(&it.id) {
                     Some(tx) => self.send(from, MsgType::Tx, encode_tx(&tx)),
                     None => not_found.push(it),
                 },
+                // **The door #130 (c) opens, and it needed no new envelope type.**
+                //
+                // This arm answered with a header and nothing else, which is the
+                // "other door is shut" the issue names: a node holding a header and
+                // wanting its body had no way to ask for it, because the only
+                // body-bearing request in the protocol (`GetBlockTxn`) names
+                // transactions by index and a `BlockHeader` carries no transaction
+                // count to build those indexes from.
+                //
+                // So the request is `GetData(Block)` — unchanged, already understood
+                // by every deployed node — and the answer is the fullest thing we
+                // hold: a `BlockAnnounce` (0x0041) with every transaction prefilled
+                // and no short ids, which is the existing announce codec used exactly
+                // as its own docs describe ("txs it predicts the peer lacks"). The
+                // codec is not forked and no `MsgType` is added.
+                //
+                // Both mixed-version directions degrade to the status quo, which is
+                // why this shape was chosen over the additive type the task book
+                // permitted: a NEW node asking an OLD one gets a header back and is
+                // not scored; an OLD node asking a NEW one gets a `BlockAnnounce` it
+                // has understood since M9. Neither side sees an unknown type — and an
+                // unknown type on this net is not ignored, it is `PENALTY_MALFORMED`
+                // (100) against a `BAN_THRESHOLD` of −100, i.e. **an instant, one-frame
+                // ban**. See the PR body; this is the finding the task book asked for.
                 InvKind::Block => match self.node.header(&it.id) {
-                    Some(h) => self.send(from, MsgType::Header, crate::codec::encode_header(&h)),
+                    Some(h) => {
+                        let body = if bodies_served < MAX_BODIES_PER_GETDATA {
+                            self.body_for_serving(&it.id)
+                        } else {
+                            None
+                        };
+                        match body {
+                            Some(b) => {
+                                bodies_served += 1;
+                                let ann = whole_block_announce(h, b);
+                                self.send(from, MsgType::BlockAnnounce, encode_announce(&ann));
+                            }
+                            // No body held, or past the per-message cap: the header,
+                            // exactly as before. Never `NotFound` — we do have the
+                            // object this inv named, and `NotFound` is scored.
+                            None => {
+                                self.send(from, MsgType::Header, crate::codec::encode_header(&h))
+                            }
+                        }
+                    }
                     None => not_found.push(it),
                 },
                 InvKind::Checkpoint => match self.checkpoints.get(&it.id) {
@@ -1007,6 +1239,13 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         let bh = ann.header.header_hash();
+        // An answer arrived for this hash, whatever we go on to make of it (issue
+        // #130 (c)). Clearing the in-flight entry here rather than on success is
+        // deliberate: if the announce turns out to be unusable, the next
+        // `request_missing_bodies` pass re-adds the hash and the rotation sends it to
+        // a *different* peer — which is the recovery we want, and is not reachable if
+        // a failed answer leaves the slot occupied until the timeout.
+        self.body_reqs.remove(&bh);
         if self.blocks.contains(&bh) || self.node.has_stored_body(&bh) {
             return; // already have the full body (hot cache or applied store)
         }
@@ -1136,6 +1375,37 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 self.send(pid, MsgType::BlockAnnounce, payload.clone());
             }
         }
+    }
+}
+
+/// **A whole block, in the announce codec** (issue #130 (c)): every transaction
+/// prefilled, no short ids.
+///
+/// A `BlockAnnounce` already carries the two body fields that are not transaction
+/// slots — `coinbase` and `coinbase_rkm` (issue #101) — which is exactly why it,
+/// and not `BlockTxn`, is the answer to a historical body request: `BlockTxn`
+/// carries transactions only, so a receiver could never rebuild a body whose
+/// commitment matches the header, and every served block would be rejected as a
+/// binding mismatch.
+///
+/// The salt `nonce` is 0 and is genuinely unused: it exists to randomise short
+/// ids, and there are none. Fixing it rather than inventing one keeps the encoding
+/// a pure function of the block, so two nodes serving the same block serve the
+/// same bytes.
+fn whole_block_announce(header: BlockHeader, body: BlockBody) -> BlockAnnounce {
+    let prefilled = body
+        .txs
+        .into_iter()
+        .enumerate()
+        .map(|(i, tx)| PrefilledTx { index: i as u32, tx })
+        .collect();
+    BlockAnnounce {
+        header,
+        nonce: 0,
+        coinbase: body.coinbase,
+        coinbase_rkm: body.coinbase_rkm,
+        short_ids: Vec::new(),
+        prefilled,
     }
 }
 

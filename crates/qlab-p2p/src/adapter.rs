@@ -1380,6 +1380,69 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         use qlab_node::ChainStore as _;
         self.state.chain().block(hash).is_some()
     }
+
+    /// The main-chain blocks whose bodies this node still needs (issue #130 (c)).
+    ///
+    /// **Where the walk starts is the whole of the correctness here**, and it is not
+    /// the applied tip. It is [`Self::state_fork_point`] — the highest applied block
+    /// that is *also* on the fork-choice main chain — for the #162 case: a state
+    /// machine stranded on a losing sibling has an applied tip that is on no chain
+    /// anyone will extend, and asking for `applied_tip + 1` there would request a
+    /// block that does not exist. Starting at the fork point instead asks for
+    /// `fork + 1`, which is exactly the body [`Self::rejoin_main_chain`] requires
+    /// before it will rewind — so the requester also unwedges a strand whose sibling
+    /// body was never offered live, which is the case #162 could only handle when the
+    /// body happened to arrive on its own.
+    ///
+    /// Two exclusions, both of which are what makes the ask set shrink monotonically:
+    ///
+    /// - **already applied** — read from the state machine's own block store, the same
+    ///   authority [`Self::is_body_worth_holding`] uses;
+    /// - **already held in the pending-body window** — it will drain on its own as the
+    ///   tip advances, and re-fetching it would be pure duplicate traffic.
+    ///
+    /// The scan is a window of `max` heights above the fork point rather than a search
+    /// for the first `max` missing ones: bodies drain ascending, so the frontier is
+    /// where the gap is, and an unbounded scan would walk the whole chain on a node
+    /// that has been asked for one hash.
+    ///
+    /// Cost: one `tip − top` ancestor walk plus `max` parent hops, so it does not
+    /// re-walk the chain per height the way repeated `main_chain_ancestor` calls would.
+    fn missing_body_hashes(&self, max: usize) -> Vec<Hash32> {
+        use qlab_node::ChainStore as _;
+        if max == 0 {
+            return Vec::new();
+        }
+        let base = self
+            .state_fork_point()
+            .map(|(h, _)| h)
+            .unwrap_or_else(|| self.state.tip_height());
+        let tip = self.chain.tip_height();
+        let top = tip.min(base.saturating_add(max as u64));
+        if top <= base {
+            return Vec::new();
+        }
+        let Some(mut hash) = self.chain.ancestor(&self.chain.tip_hash(), tip - top) else {
+            return Vec::new();
+        };
+        let mut height = top;
+        let mut out = Vec::new();
+        loop {
+            let held = self.state.chain().contains(&hash)
+                || self.pending_bodies.contains_key(&(height, hash));
+            if !held {
+                out.push(hash);
+            }
+            if height == base + 1 {
+                break;
+            }
+            let Some(header) = self.chain.header(&hash) else { break };
+            hash = header.prev;
+            height -= 1;
+        }
+        out.reverse(); // ascending — the order the state machine can apply them in
+        out
+    }
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {

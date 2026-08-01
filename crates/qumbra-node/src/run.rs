@@ -992,8 +992,29 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // choice holding no block at the applied height — which is unreachable while
         // fork choice is at or above the applied tip.
         let applied = node.applied_tip();
+        // Issue #130 (c): `breq=` is **appended at the end**, after `schain=`, under
+        // the same rule as every addition since #87 — every pre-existing field keeps
+        // its name, position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified.
+        //
+        // It is the count of historical block-body requests this node has
+        // outstanding, and it exists because **`slag=` alone cannot distinguish a node
+        // whose asks are going unanswered from a node that is not asking at all.**
+        // That is not a hypothetical: on 2026-08-01 node3 held `stip=1` for thirteen
+        // minutes and matched zero log lines for anything, and the archive could not
+        // say from the telemetry whether the requester was broken or absent — it was
+        // absent, because before this baton no requester existed. The pair to read is
+        // `slag=` / `breq=`: `slag>0 breq=0` is *not asking* (no ready peer, or caught
+        // up on the frontier); `slag>0 breq>0` sustained is *asking and not being
+        // served*, which is a peer-side or version-skew problem and not this node's.
+        //
+        // Caliper: an instantaneous level, not a total — how many asks are in flight at
+        // the moment the line is printed, capped at
+        // `qlab_p2p::MAX_BODIES_IN_FLIGHT` (16). Always printed, zero included (the
+        // #130 (a) rule): a node always knows this number.
+        let body_reqs = self.p2p.body_requests();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1009,6 +1030,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             mready.field(),
             applied.id_field(),
             applied.chain_field(),
+            body_reqs,
         )
     }
 
@@ -2053,6 +2075,10 @@ mod tests {
                         && !kv.starts_with("slag=")
                         && !kv.starts_with("stipid=")
                         && !kv.starts_with("schain=")
+                        // #130 (c)'s append, stripped for the same reason: it is a
+                        // field of this family, added after the line the claim is
+                        // about, and the list growing is the point.
+                        && !kv.starts_with("breq=")
                 })
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -3666,6 +3692,8 @@ mod tests {
                 "mready",
                 // ── appended by #162 finding 6, at the end ──
                 "stipid", "schain",
+                // ── appended by #130 (c), at the end ──
+                "breq",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -3681,7 +3709,10 @@ mod tests {
         assert!(line.contains(" mready=alone "), "the readiness verdict: {line}");
         // #162 finding 6: this node mined and applied its own tip, so the applied tip
         // IS the main-chain block at its height.
-        assert!(line.ends_with(" schain=main"), "the wedge verdict, last: {line}");
+        assert!(line.contains(" schain=main"), "the wedge verdict: {line}");
+        // #130 (c): `breq=` is the newest append and is now the last field. A node
+        // alone on its own chain has nothing outstanding.
+        assert!(line.ends_with(" breq=0"), "nothing in flight, last: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
