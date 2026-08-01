@@ -1239,14 +1239,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         let bh = ann.header.header_hash();
-        // An answer arrived for this hash, whatever we go on to make of it (issue
-        // #130 (c)). Clearing the in-flight entry here rather than on success is
-        // deliberate: if the announce turns out to be unusable, the next
-        // `request_missing_bodies` pass re-adds the hash and the rotation sends it to
-        // a *different* peer — which is the recovery we want, and is not reachable if
-        // a failed answer leaves the slot occupied until the timeout.
-        self.body_reqs.remove(&bh);
         if self.blocks.contains(&bh) || self.node.has_stored_body(&bh) {
+            self.body_reqs.remove(&bh); // nothing outstanding: we hold this body
             return; // already have the full body (hot cache or applied store)
         }
         let candidates = self.node.all_txs();
@@ -1260,6 +1254,23 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                     encode_get_block_txn(&GetBlockTxn { block_hash: bh, indexes }),
                 );
             }
+        }
+        // **The ask is satisfied only if we now hold the body** (issue #130 (c)).
+        //
+        // Clearing the in-flight entry on *arrival* rather than on *success* was the
+        // obvious shape and it is a busy loop: a body this node refuses — a joiner's
+        // unjudgeable anchor (#134), a body that loses its own fork — is not applied,
+        // so the next `request_missing_bodies` pass re-asks for it on the very next
+        // tick, and the peer re-serves it, forever, at the tick rate.
+        //
+        // Leaving the entry in place makes [`BODY_REQUEST_TIMEOUT_MS`] pace the retry
+        // instead: at most one re-ask per block per 15 s, and the rotation still sends
+        // that re-ask to a different peer. The cost is that a *bad* answer also delays
+        // the retry by up to 15 s, which is the same bound a *missing* answer already
+        // pays and is the honest reading of both — we asked, and we still do not have
+        // it.
+        if self.blocks.contains(&bh) || self.node.has_stored_body(&bh) {
+            self.body_reqs.remove(&bh);
         }
     }
 
@@ -1817,6 +1828,80 @@ mod tests {
         lonely.add_peer(PeerId(2), None);
         lonely.tick(6);
         assert_eq!(*lonely.sync_phase(), SyncPhase::Unknown, "mid-handshake claims nothing");
+    }
+
+    /// 🔴 **THE MIXED-VERSION FINDING (issue #130 (c)), test-locked.**
+    ///
+    /// The task book asked what a node does with an envelope type it does not know —
+    /// ignore, disconnect, or penalise — because the answer decides whether an
+    /// additive `MsgType` can be deployed onto a net running two images.
+    ///
+    /// **It penalises, and it bans on the FIRST FRAME.** `Envelope::decode` returns
+    /// `WireError::UnknownMsgType`, `tick` maps every wire-layer decode failure to
+    /// `PENALTY_MALFORMED` (100), and `BAN_THRESHOLD` is −100 — so one frame of an
+    /// unallocated type is a permanent ban, with no second chance and no distinction
+    /// between "you sent me garbage" and "you are newer than me".
+    ///
+    /// This test exists so the finding cannot be re-derived wrongly by the next
+    /// baton, and so that if anyone later makes unknown types benign, the change
+    /// shows up here as a deliberate edit rather than as a silent widening.
+    ///
+    /// It is why #130 (c) reuses `GetData(Block)` instead of allocating an envelope
+    /// type: with three of four T0 hosts on the older image, a new node asking them
+    /// for a body would have been banned by each of them on its first request.
+    #[test]
+    fn an_unknown_envelope_type_bans_the_sender_on_the_very_first_frame() {
+        let (mut nodes, _hub) = mesh(2);
+        run(&mut nodes);
+        assert_eq!(nodes[1].peers().get(PeerId(1)).unwrap().score, 0, "starts clean");
+
+        // A well-formed frame at the current protocol version whose type code is
+        // unallocated — exactly what an additive `MsgType` looks like to a node that
+        // predates it. Hand-built, because `Envelope::new` cannot express it.
+        let unknown_type: u16 = 0x0044;
+        assert!(MsgType::from_u16(unknown_type).is_none(), "0x0044 really is unallocated");
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&crate::wire::MAGIC);
+        frame.extend_from_slice(&crate::wire::PROTOCOL_VERSION.to_le_bytes());
+        frame.extend_from_slice(&unknown_type.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes()); // empty body
+        assert_eq!(
+            Envelope::decode(&frame),
+            Err(crate::wire::WireError::UnknownMsgType { got: unknown_type })
+        );
+
+        nodes[0].transport().send(PeerId(2), &frame).unwrap();
+        nodes[1].tick(0);
+
+        assert_eq!(
+            nodes[1].peers().get(PeerId(1)).unwrap().score,
+            -crate::gossip::PENALTY_MALFORMED,
+            "an unknown type is charged as a malformed frame — the strongest penalty"
+        );
+        assert!(
+            nodes[1].peers().is_banned(PeerId(1)),
+            "🔴 ONE frame of an unknown type is a ban: PENALTY_MALFORMED(100) meets \
+             BAN_THRESHOLD(-100) exactly, so there is no budget for a version skew"
+        );
+    }
+
+    /// The complement, and the reason the chosen shape is safe: **every message this
+    /// baton puts on the wire is a type that already existed.** A node that predates
+    /// #130 (c) decodes all of them.
+    #[test]
+    fn every_message_the_body_requester_sends_is_a_pre_existing_type() {
+        for (mt, code) in [
+            (MsgType::GetData, 0x0011u16),      // the request
+            (MsgType::BlockAnnounce, 0x0041),   // the answer, whole-body
+            (MsgType::Header, 0x0021),          // the answer when we hold no body
+            (MsgType::NotFound, 0x0012),        // the answer when we hold nothing
+        ] {
+            assert_eq!(mt.as_u16(), code);
+            assert_eq!(MsgType::from_u16(code), Some(mt), "0x{code:04x} predates this baton");
+        }
+        // And no code was allocated: the highest assigned type is still BlockTxn.
+        assert_eq!(MsgType::BlockTxn.as_u16(), 0x0043);
+        assert!(MsgType::from_u16(0x0044).is_none(), "nothing new was added");
     }
 
     #[test]
@@ -3083,10 +3168,23 @@ mod tests {
             // body, and counted every refusal it could not stand behind.
             assert_eq!(nodes[1].node().chain().tip_height(), SERVED, "header-first sync ran");
             assert_eq!(nodes[1].node().state().tip_height(), 0, "no body was applied");
-            assert_eq!(
-                nodes[1].node().ingest_counters().unjudged_anchor,
-                SERVED,
-                "`uanchor=` is what an operator greps for this state"
+            // `uanchor=` counts **refused bodies**, not blocks served, and since
+            // issue #130 (c) those are no longer the same number: the joiner now asks
+            // for the bodies it is missing, so a body it cannot judge is re-offered on
+            // the requester's ladder (one re-ask per block per `BODY_REQUEST_TIMEOUT_MS`)
+            // and refused again each time. The counter's own contract is what it
+            // counts — "bodies neither applied nor charged" — and it is stated as a
+            // process-lifetime cumulative, so this is the counter doing its job rather
+            // than a changed meaning.
+            //
+            // The bound is asserted rather than the exact value, because the exact
+            // value is a function of how long the harness runs its clock for, and
+            // pinning it would make this test a timer. What is load-bearing is
+            // unchanged and asserted above: **the peer's score is zero.**
+            assert!(
+                nodes[1].node().ingest_counters().unjudged_anchor >= SERVED,
+                "`uanchor=` is what an operator greps for this state: {}",
+                nodes[1].node().ingest_counters().unjudged_anchor
             );
         }
 
