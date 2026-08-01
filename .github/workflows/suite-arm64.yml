@@ -1,0 +1,95 @@
+# ONE EXPERIMENT, not a policy.
+#
+# This exists to answer four questions with a single manual run, and nothing
+# else. Until they are answered, the acceptance bar remains the rig -- see
+# CLAUDE.md §5. Nothing triggers this automatically and nothing should until
+# the numbers are in.
+#
+#   1. Does the suite FIT?    32 GB here against 15.6 GB observed on the M3 rig
+#                             -- where the macOS compressor engages and Linux
+#                             has no equivalent, so the peak may be higher.
+#   2. Does it PASS?          1029 / 0 is the rig's answer at this commit.
+#   3. How LONG?              ~18 min on the rig. A GH core is slower and
+#                             --test-threads=1 means core count does not help
+#                             the test phase, only the build.
+#   4. What does it COST?     (3) times the per-minute rate.
+#
+# arm64 deliberately: the rig is M3 and the four T0 hosts are AWS t4g.small
+# (Graviton). x64 would validate an architecture this project has never
+# deployed and never will, and `randomx-rs` builds a C++ library at compile
+# time -- aarch64 was a real problem once (M10-T0-3 Phase B-lite).
+name: suite (arm64, manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: "Expected passing count on the rig at this commit"
+        required: true
+        default: "1029"
+
+concurrency:
+  group: suite-arm64
+  cancel-in-progress: false     # never cancel a paid run that is already burning
+
+jobs:
+  suite:
+    runs-on: qumbra-arm64-8
+    timeout-minutes: 120        # if it needs longer than this it is not viable
+                                # as a bar anyway, and that is itself the answer
+
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: C++ toolchain for randomx-rs
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cmake g++
+
+      - name: Provenance
+        run: |
+          echo "commit   $(git rev-parse HEAD)"
+          uname -m; nproc; free -g | head -2
+          rustc --version; cargo --version; cmake --version | head -1
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: arm64-suite-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: arm64-suite-
+
+      # /usr/bin/time -v gives Maximum resident set size, which is question 1.
+      # Kept separate from the test command's own exit code: `set -o pipefail`
+      # plus tee, so a failing suite still leaves a readable log AND fails.
+      - name: Full workspace suite, serial, unfiltered
+        run: |
+          set -o pipefail
+          /usr/bin/time -v cargo test --release --workspace --locked \
+            -- --test-threads=1 2>&1 | tee suite.log
+
+      - name: The four answers
+        if: always()
+        run: |
+          echo "=== 2. counts ==="
+          grep -E '^test result:' suite.log \
+            | awk '{p+=$4; f+=$6; i+=$8} END {print "passed="p" failed="f" ignored="i}'
+          echo "baseline (rig) = ${{ inputs.baseline }}"
+          echo "=== negatives, all must be 0 ==="
+          echo "FAILED(cs)=$(grep -c 'FAILED' suite.log)  panicked=$(grep -c 'panicked at' suite.log)"
+          echo "=== 1. peak memory ==="
+          grep -E 'Maximum resident set size' suite.log || echo "(time -v line not captured)"
+          echo "=== 3. wall time ==="
+          grep -E 'Elapsed \(wall clock\)' suite.log || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: suite-log
+          path: suite.log
+          retention-days: 14
