@@ -265,6 +265,10 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// peer costs a fraction of a batch rather than the whole of it, and so a re-ask
     /// after a timeout lands somewhere new.
     body_rr: usize,
+    /// Issue #200: a historical body request was **satisfied** this tick (not
+    /// merely timed out). Fed into [`crate::n1::ChainView::observe_body_fetch`] so
+    /// the unobtainable-body exemption keys on exhaustion, not on lag alone.
+    body_fetch_progress: bool,
 }
 
 impl<T: Transport, N: NodeState> P2pNode<T, N> {
@@ -286,6 +290,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             limiter: RateLimiter::default(),
             body_reqs: HashMap::new(),
             body_rr: 0,
+            body_fetch_progress: false,
         }
     }
 
@@ -638,6 +643,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
         self.maybe_start_sync();
         self.request_missing_bodies(now_ms);
+        // Issue #200: after (re)issuing asks, hand the duty-gate exemption the
+        // facts it keys on — outstanding asks + whether any ask was satisfied
+        // this tick. Progress is cleared for the next tick so a single delivery
+        // cannot keep resetting the window forever.
+        let progress = self.body_fetch_progress;
+        self.body_fetch_progress = false;
+        self.node
+            .observe_body_fetch(now_ms, self.body_reqs.len(), progress);
         n
     }
 
@@ -1246,7 +1259,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         };
         let bh = ann.header.header_hash();
         if self.blocks.contains(&bh) || self.node.has_stored_body(&bh) {
-            self.body_reqs.remove(&bh); // nothing outstanding: we hold this body
+            if self.body_reqs.remove(&bh).is_some() {
+                // Issue #200: a requested body is now held — that is progress.
+                self.body_fetch_progress = true;
+            }
             return; // already have the full body (hot cache or applied store)
         }
         let candidates = self.node.all_txs();
@@ -1276,7 +1292,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // pays and is the honest reading of both — we asked, and we still do not have
         // it.
         if self.blocks.contains(&bh) || self.node.has_stored_body(&bh) {
-            self.body_reqs.remove(&bh);
+            if self.body_reqs.remove(&bh).is_some() {
+                // Issue #200: a requested body is now held — that is progress.
+                self.body_fetch_progress = true;
+            }
         }
     }
 

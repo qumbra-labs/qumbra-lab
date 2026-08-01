@@ -255,6 +255,25 @@ pub trait ChainView {
         let _ = max;
         Vec::new()
     }
+
+    /// **Issue #200 — feed the duty-gate exemption the body-fetch facts it keys on.**
+    ///
+    /// Default is a no-op: a header-only node-state never has state lag (it applies
+    /// headers into both views together), so it has nothing to exhaust over.
+    /// [`crate::adapter::NodeAdapter`] is the real implementation.
+    fn observe_body_fetch(
+        &mut self,
+        now_ms: u64,
+        outstanding_breqs: usize,
+        body_progress: bool,
+    ) {
+        let _ = (now_ms, outstanding_breqs, body_progress);
+    }
+
+    /// **Issue #200 — is the unobtainable-body exemption armed?** Default false.
+    fn state_tip_mine_ready(&self) -> bool {
+        false
+    }
 }
 
 /// Ingest headers received from peers.
