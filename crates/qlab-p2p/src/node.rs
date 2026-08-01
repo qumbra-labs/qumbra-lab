@@ -1486,16 +1486,13 @@ mod tests {
     }
 
     fn tx(seed: u8) -> TxEntry {
-        TxEntry {
-            proof: vec![seed; 32],
-            public: TxPublic {
-                anchor: [seed; 32],
-                nullifiers: vec![[seed; 32]],
-                commitments: vec![[seed.wrapping_add(9); 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: 1_000_000,
-            },
-        }
+        TxEntry::with_placeholder_discovery(vec![seed; 32], TxPublic {
+            anchor: [seed; 32],
+            nullifiers: vec![[seed; 32]],
+            commitments: vec![[seed.wrapping_add(9); 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: 1_000_000,
+            })
     }
 
     /// Milliseconds a simulated round advances the deterministic clock the tests
@@ -2035,16 +2032,13 @@ mod tests {
     fn cache_insert(c: &mut ServedBodies, height: u64, proof_len: usize) -> Hash32 {
         let mut hash = [0u8; 32];
         hash[..8].copy_from_slice(&height.to_le_bytes());
-        let entry = TxEntry {
-            proof: vec![0xBB; proof_len],
-            public: TxPublic {
-                anchor: [1; 32],
-                nullifiers: vec![[2; 32]],
-                commitments: vec![[3; 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: 0,
-            },
-        };
+        let entry = TxEntry::with_placeholder_discovery(vec![0xBB; proof_len], TxPublic {
+            anchor: [1; 32],
+            nullifiers: vec![[2; 32]],
+            commitments: vec![[3; 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: 0,
+            });
         c.insert(height, hash, vec![entry], 0, [0; 4]);
         hash
     }
@@ -3054,16 +3048,13 @@ mod tests {
         }
 
         fn tx_with(anchor: Hash32, nf: u8, proof: &[u8]) -> TxEntry {
-            TxEntry {
-                proof: proof.to_vec(),
-                public: TxPublic {
-                    anchor,
-                    nullifiers: vec![[nf; 32]],
-                    commitments: vec![[nf.wrapping_add(50); 32]],
-                    bucket: ArityBucket::TwoByTwo,
-                    fee: posted_fee(ArityBucket::TwoByTwo),
-                },
-            }
+            TxEntry::with_placeholder_discovery(proof.to_vec(), TxPublic {
+                anchor,
+                nullifiers: vec![[nf; 32]],
+                commitments: vec![[nf.wrapping_add(50); 32]],
+                bucket: ArityBucket::TwoByTwo,
+                fee: posted_fee(ArityBucket::TwoByTwo),
+                })
         }
 
         /// Two linked in-process nodes: `[0]` serves, `[1]` joins. Returns them past

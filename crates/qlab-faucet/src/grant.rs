@@ -363,16 +363,23 @@ pub fn build_grant<R: CryptoRng>(
     let self_ek = wallet.diversified_keypair(&change_d).ek;
     let to_self = encrypt_to_recipient(&self_ek, &[change_note], rng);
 
-    let entry = TxEntry {
-        proof: proof_bytes_vec,
-        public: TxPublic {
+    // Issue #188: the grant's discovery group is now part of the transaction the
+    // body commits to, and these are the REAL ML-KEM/AEAD bundles — recipient
+    // first, then change-to-self, which is exactly D4's recipient-major order
+    // over `commitments = [grant_cm, change_cm]`. The `TxDiscovery` below keeps
+    // the AEAD payloads for the RPC full-fetch path; only the compact bundles
+    // enter consensus.
+    let entry = TxEntry::new(
+        proof_bytes_vec,
+        TxPublic {
             anchor: lease.anchor,
             nullifiers: vec![digest_bytes(&inst.nf[0]), digest_bytes(&inst.nf[1])],
             commitments: vec![digest_bytes(&inst.cm_out[0]), digest_bytes(&inst.cm_out[1])],
             bucket: ArityBucket::TwoByTwo,
             fee,
         },
-    };
+        &[to_recipient.bundle.clone(), to_self.bundle.clone()],
+    );
     let discovery = TxDiscovery {
         recipients: vec![
             RecipientDiscovery { bundle: to_recipient.bundle, payloads: to_recipient.payloads },

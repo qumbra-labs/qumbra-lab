@@ -1283,7 +1283,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             BodyError::MissingCoinbasePayee
             | BodyError::WrongFee { .. }
             | BodyError::DoubleSpendInBlock { .. }
-            | BodyError::ProofInvalid { .. } => BodyFault::Intrinsic("bad body"),
+            | BodyError::ProofInvalid { .. }
+            // Issue #188. Both discovery rules read only the transaction's own
+            // bytes and its own declared commitments, so they are as intrinsic
+            // as the fee check — this node's chain position cannot change the
+            // answer, which is what keeps them out of #134's amnesty.
+            | BodyError::DiscoveryMalformed { .. }
+            | BodyError::DiscoveryNotCanonical { .. }
+            | BodyError::DiscoveryDoesNotBind { .. } => BodyFault::Intrinsic("bad body"),
             // The one positional check (#134). `is_valid_anchor` answers from THIS
             // node's root index, finalized head and applied tip; a joiner replaying
             // history has none of the three at the height it is being served, so its
@@ -1876,16 +1883,13 @@ mod tests {
     }
 
     fn tx_with(anchor: Hash32, nf: u8, proof: &[u8]) -> TxEntry {
-        TxEntry {
-            proof: proof.to_vec(),
-            public: qlab_devnet::body::TxPublic {
-                anchor,
-                nullifiers: vec![[nf; 32]],
-                commitments: vec![[nf.wrapping_add(50); 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: posted_fee(ArityBucket::TwoByTwo),
-            },
-        }
+        TxEntry::with_placeholder_discovery(proof.to_vec(), qlab_devnet::body::TxPublic {
+            anchor,
+            nullifiers: vec![[nf; 32]],
+            commitments: vec![[nf.wrapping_add(50); 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: posted_fee(ArityBucket::TwoByTwo),
+            })
     }
 
     #[test]

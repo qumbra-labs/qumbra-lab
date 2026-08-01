@@ -1033,6 +1033,7 @@ version = "0.0.0"
 dependencies = [
  "ml-dsa",
  "qlab-air",
+ "qlab-note",
  "qlab-pow",
  "tiny-keccak",
 ]

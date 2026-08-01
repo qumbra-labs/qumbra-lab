@@ -26,16 +26,13 @@ impl qlab_devnet::body::TxVerifier for MockVerifier {
 }
 
 fn tx(anchor: Hash32, nf: u8) -> TxEntry {
-    TxEntry {
-        proof: b"ok".to_vec(),
-        public: TxPublic {
-            anchor,
-            nullifiers: vec![[nf; 32]],
-            commitments: vec![[nf.wrapping_add(1); 32]],
-            bucket: ArityBucket::TwoByTwo,
-            fee: posted_fee(ArityBucket::TwoByTwo),
-        },
-    }
+    TxEntry::with_placeholder_discovery(b"ok".to_vec(), TxPublic {
+        anchor,
+        nullifiers: vec![[nf; 32]],
+        commitments: vec![[nf.wrapping_add(1); 32]],
+        bucket: ArityBucket::TwoByTwo,
+        fee: posted_fee(ArityBucket::TwoByTwo),
+        })
 }
 
 /// A node with genesis finalized (so the genesis empty root is a valid anchor).

@@ -36,16 +36,13 @@ fn temp_dir(tag: &str) -> PathBuf {
 }
 
 fn tx(anchor: Hash32, nullifiers: Vec<Hash32>, commitments: Vec<Hash32>) -> TxEntry {
-    TxEntry {
-        proof: b"ok".to_vec(),
-        public: TxPublic {
-            anchor,
-            nullifiers,
-            commitments,
-            bucket: ArityBucket::TwoByTwo,
-            fee: posted_fee(ArityBucket::TwoByTwo),
-        },
-    }
+    TxEntry::with_placeholder_discovery(b"ok".to_vec(), TxPublic {
+        anchor,
+        nullifiers,
+        commitments,
+        bucket: ArityBucket::TwoByTwo,
+        fee: posted_fee(ArityBucket::TwoByTwo),
+        })
 }
 
 /// A running-tip helper: applies a one-tx block extending `parent`, returns the

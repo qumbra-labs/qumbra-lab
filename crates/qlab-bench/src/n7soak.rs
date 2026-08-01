@@ -153,16 +153,13 @@ impl FullNode {
 /// A well-formed soak tx anchored at `anchor`, paying the posted 2×2 price, with a
 /// verifier-accepted (`b"ok"`) or -rejected proof.
 pub fn soak_tx(anchor: [u8; 32], nf: u8, good_proof: bool) -> TxEntry {
-    TxEntry {
-        proof: if good_proof { b"ok".to_vec() } else { b"bad".to_vec() },
-        public: TxPublic {
-            anchor,
-            nullifiers: vec![[nf; 32]],
-            commitments: vec![[nf.wrapping_add(70); 32]],
-            bucket: ArityBucket::TwoByTwo,
-            fee: posted_fee(ArityBucket::TwoByTwo),
-        },
-    }
+    TxEntry::with_placeholder_discovery(if good_proof { b"ok".to_vec() } else { b"bad".to_vec() }, TxPublic {
+        anchor,
+        nullifiers: vec![[nf; 32]],
+        commitments: vec![[nf.wrapping_add(70); 32]],
+        bucket: ArityBucket::TwoByTwo,
+        fee: posted_fee(ArityBucket::TwoByTwo),
+        })
 }
 
 /// Build a fully-connected mesh of `n` full nodes over one hub. Node 0 is the
