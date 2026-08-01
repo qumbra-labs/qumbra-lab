@@ -2050,9 +2050,16 @@ mod tests {
             line.contains(" prest=1/1"),
             "TELEMETRY must carry the restore report, not only the startup println: {line}"
         );
+        // `prest=` was the last field when #133 D3 landed and is not any more:
+        // #130 (b)'s `bdrop=` appended after it. What #133 was actually pinning is
+        // that the restore report reaches the line an operator reads, and the
+        // `contains` above is that assertion; "and it is last" was true on the day
+        // and is not a property `prest=` owns. So this checks the CURRENT tail
+        // instead of deleting the idea — one field is last, and whichever one it is
+        // must still be asserted, or a truncated line would pass.
         assert!(
-            line.ends_with(" prest=1/1"),
-            "prest is the newest append, last field: {line}"
+            line.ends_with(" bdrop=0@-"),
+            "the newest append is last, and this node refused no body: {line}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
