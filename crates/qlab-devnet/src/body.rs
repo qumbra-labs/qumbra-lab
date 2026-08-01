@@ -106,6 +106,14 @@ impl TxEntry {
         Self { proof, public, discovery: encode_group_contents(recipients) }
     }
 
+    /// A transaction whose discovery group is a [`placeholder_discovery`]
+    /// binding its own declared commitments — read that function's note before
+    /// using this outside a fixture.
+    pub fn with_placeholder_discovery(proof: Vec<u8>, public: TxPublic) -> Self {
+        let discovery = placeholder_discovery(&public.commitments);
+        Self { proof, public, discovery }
+    }
+
     /// The canonical encoding of "this transaction attaches no discovery",
     /// i.e. `n_recipients = 0`. Valid only for a transaction with no output
     /// commitments; see [`TxEntry::discovery`].

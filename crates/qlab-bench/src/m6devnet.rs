@@ -77,16 +77,13 @@ impl TxVerifier for PoolVerifier<'_> {
 /// A `TxEntry` referencing pooled proof `idx`, with its real public surface.
 fn entry_for(pool: &[Pooled], idx: usize) -> TxEntry {
     let (inst, _, _) = &pool[idx];
-    TxEntry {
-        proof: (idx as u64).to_le_bytes().to_vec(),
-        public: TxPublic {
+    TxEntry::with_placeholder_discovery((idx as u64).to_le_bytes().to_vec(), TxPublic {
             anchor: h32(&inst.anchor),
             nullifiers: vec![h32(&inst.nf[0]), h32(&inst.nf[1])],
             commitments: vec![h32(&inst.cm_out[0]), h32(&inst.cm_out[1])],
             bucket: ArityBucket::TwoByTwo,
             fee: posted_fee(ArityBucket::TwoByTwo),
-        },
-    }
+        })
 }
 
 pub fn run_m6devnet(power: &str) {
@@ -234,16 +231,13 @@ mod tests {
         ];
         let inst = build_bucket(18, &inputs, &outputs, 1_000);
 
-        let entry = TxEntry {
-            proof: 0u64.to_le_bytes().to_vec(),
-            public: TxPublic {
+        let entry = TxEntry::with_placeholder_discovery(0u64.to_le_bytes().to_vec(), TxPublic {
                 anchor: h32(&inst.anchor),
                 nullifiers: vec![h32(&inst.nf[0]), h32(&inst.nf[1])],
                 commitments: vec![h32(&inst.cm_out[0]), h32(&inst.cm_out[1])],
                 bucket: ArityBucket::TwoByTwo,
                 fee: posted_fee(ArityBucket::TwoByTwo),
-            },
-        };
+            });
         let anchor = h32(&inst.anchor);
         let body = BlockBody { txs: vec![entry], coinbase: 0, coinbase_rkm: [0; 4] };
         let header = BlockHeader::child_of(&BlockHeader::genesis(1, 0), 0, 1, body.commitment());

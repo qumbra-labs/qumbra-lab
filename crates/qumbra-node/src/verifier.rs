@@ -190,16 +190,13 @@ mod tests {
     /// Build the `TxEntry` a real 2×2 tx would carry: the bincode-encoded proof
     /// (the consensus wire) + the public surface derived from the instance.
     fn real_tx_entry(inst: &BucketInstance, proof: &Proof<Config>) -> TxEntry {
-        TxEntry {
-            proof: bincode::serialize(proof).expect("serialize proof"),
-            public: TxPublic {
+        TxEntry::with_placeholder_discovery(bincode::serialize(proof).expect("serialize proof"), TxPublic {
                 anchor: h32(&inst.anchor),
                 nullifiers: vec![h32(&inst.nf[0]), h32(&inst.nf[1])],
                 commitments: vec![h32(&inst.cm_out[0]), h32(&inst.cm_out[1])],
                 bucket: ArityBucket::TwoByTwo,
                 fee: 1_000,
-            },
-        }
+            })
     }
 
     #[test]
@@ -272,16 +269,13 @@ mod tests {
         assert!(rehlog.contains("NEVER"));
 
         // The rehearsal verifier accepts anything (it is the labelled stand-in).
-        let entry = TxEntry {
-            proof: vec![],
-            public: TxPublic {
+        let entry = TxEntry::with_placeholder_discovery(vec![], TxPublic {
                 anchor: [0; 32],
                 nullifiers: vec![[0; 32], [1; 32]],
                 commitments: vec![[2; 32], [3; 32]],
                 bucket: ArityBucket::TwoByTwo,
                 fee: 1_000,
-            },
-        };
+            });
         assert!(reh.verify_tx(&entry), "rehearsal stand-in accepts everything");
         // …while the real default rejects the same bytes (no real proof).
         assert!(!def.verify_tx(&entry), "real verifier rejects a bogus proof");

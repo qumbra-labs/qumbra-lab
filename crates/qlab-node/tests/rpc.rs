@@ -47,16 +47,13 @@ fn real_tx(ek: &Ek, k: usize, nf_seed: u8, anchor: Hash32, rng: &mut StdRng) -> 
     let enc: EncryptedOutputs = encrypt_to_recipient(ek, &notes, rng);
     let commitments: Vec<Hash32> = enc.bundle.entries.iter().map(|e| e.cm).collect();
     let nullifiers: Vec<Hash32> = (0..k).map(|i| [nf_seed.wrapping_add(i as u8); 32]).collect();
-    let tx = TxEntry {
-        proof: b"real-m3-proof-placeholder".to_vec(),
-        public: TxPublic {
+    let tx = TxEntry::with_placeholder_discovery(b"real-m3-proof-placeholder".to_vec(), TxPublic {
             anchor,
             nullifiers,
             commitments,
             bucket: ArityBucket::TwoByTwo,
             fee: posted_fee(ArityBucket::TwoByTwo),
-        },
-    };
+        });
     let discovery = TxDiscovery {
         recipients: vec![RecipientDiscovery { bundle: enc.bundle, payloads: enc.payloads }],
     };

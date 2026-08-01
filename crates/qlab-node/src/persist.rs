@@ -37,7 +37,14 @@ use crate::store::{Hash32, StoredBlock};
 /// short. That is a data-directory break, not just a slow start: see the operator
 /// note in the PR. Nothing in-tree carries a v1 datadir; the T0 hosts are not
 /// being upgraded by this baton.
-pub const FORMAT_VERSION: u32 = 2;
+///
+/// **3** since issue #188: [`StoredBlock`]'s transactions gained `discovery`,
+/// without which a replayed body's `commitment()` no longer matches the
+/// persisted header and every block carrying a transaction fails the #77
+/// header/body binding on restart. A v2 datadir is a full break for the same
+/// reason a v1 one was — and #188 changes the genesis hash anyway, so a v2
+/// datadir belongs to a different network and must not be resumed.
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The append-only log file name (source of truth: blocks + finalizations).
 pub const BLOCK_LOG: &str = "blocks.log";

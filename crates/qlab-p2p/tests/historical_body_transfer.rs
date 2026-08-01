@@ -528,16 +528,13 @@ fn a_bare_getdata_for_a_block_is_answered_with_the_whole_block() {
 #[test]
 fn a_whole_block_announce_reconstructs_against_an_empty_candidate_set() {
     let txs: Vec<TxEntry> = (1u8..=3)
-        .map(|s| TxEntry {
-            proof: vec![s; 8],
-            public: TxPublic {
+        .map(|s| TxEntry::with_placeholder_discovery(vec![s; 8], TxPublic {
                 anchor: [s; 32],
                 nullifiers: vec![[s; 32]],
                 commitments: vec![[s.wrapping_add(1); 32]],
                 bucket: ArityBucket::TwoByTwo,
                 fee: 1_000_000,
-            },
-        })
+            }))
         .collect();
     let body = BlockBody { txs: txs.clone(), coinbase: 42, coinbase_rkm: [7; 4] };
     let header = BlockHeader::child_of(&BlockHeader::genesis(1000, 0), 75, 1000, body.commitment());
@@ -603,16 +600,13 @@ fn a_served_block_uses_the_existing_announce_codec_and_no_new_msg_type() {
         short_ids: Vec::new(),
         prefilled: vec![PrefilledTx {
             index: 0,
-            tx: TxEntry {
-                proof: b"ok".to_vec(),
-                public: TxPublic {
+            tx: TxEntry::with_placeholder_discovery(b"ok".to_vec(), TxPublic {
                     anchor: [1; 32],
                     nullifiers: vec![],
                     commitments: vec![],
                     bucket: ArityBucket::TwoByTwo,
                     fee: 0,
-                },
-            },
+                }),
         }],
     };
     let frame = Envelope::new(MsgType::BlockAnnounce, encode_announce(&ann)).encode();

@@ -278,16 +278,13 @@ mod tests {
     use qlab_devnet::fees::ArityBucket;
 
     fn tx(seed: u8) -> TxEntry {
-        TxEntry {
-            proof: vec![seed; 16],
-            public: TxPublic {
+        TxEntry::with_placeholder_discovery(vec![seed; 16], TxPublic {
                 anchor: [seed; 32],
                 nullifiers: vec![[seed; 32]],
                 commitments: vec![[seed.wrapping_add(1); 32]],
                 bucket: ArityBucket::TwoByTwo,
                 fee: 1_000_000,
-            },
-        }
+            })
     }
 
     fn header() -> BlockHeader {
