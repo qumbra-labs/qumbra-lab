@@ -28,7 +28,7 @@ The line is emitted to stdout every `TELEMETRY_REFRESH` interval by
 order is the `format!` at `run.rs:996`:
 
 ```
-TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= prest=
+TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= prest= bdrop=
 ```
 
 ⚠️ **That is the field list, not a capture.** The only values quoted in this

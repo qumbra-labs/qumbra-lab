@@ -23,7 +23,7 @@
 `TELEMETRY_REFRESH` 输出到 stdout。字段顺序就是 `run.rs:996` 那个 `format!`：
 
 ```
-TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= prest=
+TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= prest= bdrop=
 ```
 
 ⚠️ **上面是字段清单，不是一次采样。** 本文中作为「实测」引用的数值，只有标注了具体
