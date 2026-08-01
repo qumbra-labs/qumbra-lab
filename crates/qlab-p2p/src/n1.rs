@@ -194,6 +194,43 @@ pub trait ChainView {
         self.stored_body(hash).is_some()
     }
 
+    /// **The body for `hash` if this node HOLDS it at all** — applied or not
+    /// (issue #198). This is what the *serving* paths ask; [`Self::stored_body`] is
+    /// what the *application* paths ask, and the two questions came apart on
+    /// 2026-08-01.
+    ///
+    /// `#182` gave serving one predicate — "have I applied it" — and on the day it
+    /// landed that was a faithful proxy for "do I have it": nothing could hold a
+    /// body it had not applied. `#178` shipped four hours later and created exactly
+    /// that state, because `Node::rewind_to` rebuilds the applied chain from the
+    /// retained ancestor path and the undone suffix leaves the block store. #197
+    /// then closed the loop on the live net: four hosts rewound past height 1058,
+    /// none had it applied, none would serve its body, all four sat at `slag=1`, and
+    /// the duty gate refuses to mine while lagging — so nothing could clear the lag
+    /// and nothing could produce the block that would.
+    ///
+    /// **Serving on possession is the more correct rule on its own terms**, not
+    /// merely the cheaper fix. Whether *this* node applied a block says nothing
+    /// about whether the *requester* can use it: the requester validates the body
+    /// against the header's `tx_body_commitment` regardless (issue #77), and
+    /// `complete_block` scores a mismatch. Refusing to serve a body you have is
+    /// withholding data for no safety reason.
+    ///
+    /// **Deliberately a separate method rather than a widening of
+    /// [`Self::has_stored_body`].** "Applied" has four other callers —
+    /// `missing_body_hashes`, `is_body_worth_holding`, the `slag` arithmetic behind
+    /// the duty gate, and `on_block_announce`'s "we already hold this body" early
+    /// return — and the last of those would, if widened, have a node that rewound
+    /// past a block discard the re-announced body as redundant. That is the same
+    /// deadlock one seam over, so the two predicates stay apart by construction.
+    ///
+    /// Default: [`Self::stored_body`]. A node state with no rewind (`StubNode`)
+    /// possesses exactly what it has applied, which is the pre-#178 world and still
+    /// the correct answer there.
+    fn held_body(&self, hash: &Hash32) -> Option<BlockBody> {
+        self.stored_body(hash)
+    }
+
     /// **The main-chain blocks whose BODIES this node still needs**, ascending from
     /// the frontier its state machine can apply at, at most `max` of them (issue
     /// #130 (c)).

@@ -30,6 +30,9 @@ use qlab_p2p::peer::PeerId;
 use qlab_p2p::transport::{InProcHub, InProcTransport};
 use qlab_p2p::P2pNode;
 
+/// The number of nodes in the acceptance net — the live T0 topology (#197).
+const NET: usize = 4;
+
 /// Only a tx marked `ok` verifies — the bodies here are coinbase-only, so nothing
 /// depends on it.
 #[derive(Clone)]
@@ -83,6 +86,12 @@ fn mine_on(a: &mut Adapter) -> (BlockHeader, BlockBody) {
 }
 
 const SIM_TICK_MS: u64 = 10;
+
+/// `slag` — the applied-state lag the duty gate reads, and the number every one of
+/// the four T0 hosts was printing as `slag=1`.
+fn slag(node: &Node) -> u64 {
+    node.node().state_lag().blocks()
+}
 
 fn run(nodes: &mut [&mut Node], rounds: u64, base_ms: u64) -> u64 {
     let mut now = base_ms;
@@ -178,4 +187,186 @@ fn fact_a_rewound_body_leaves_the_applied_store_and_stays_in_blocks_log() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// 2. THE FIX, at the predicate
+// ---------------------------------------------------------------------------
+
+/// **Possession outlives application.** Same construction as the fact test; the
+/// question is the other one.
+///
+/// `stored_body` still answers "have I applied this" and still says no — #182's
+/// rule is not widened, because four other callers read it as "applied" and one of
+/// them (`on_block_announce`'s already-have early return) would drop the very body
+/// that closes the gap. `held_body` is the new question and it says yes, with the
+/// exact bytes: the served body commits to what the header committed to, so
+/// serving from possession cannot re-open #77 from the serving side.
+#[test]
+fn possession_outlives_application_and_the_applied_predicate_is_unchanged() {
+    let mut loser = adapter(0xB2);
+    let mut winner = adapter(0xA1);
+
+    let (lh1, lb1) = mine_on(&mut loser);
+    let l1 = lh1.header_hash();
+    let (wh1, wb1) = mine_on(&mut winner);
+    let (wh2, wb2) = mine_on(&mut winner);
+    assert_eq!(loser.ingest_block(wh1, wb1), IngestOutcome::Accepted);
+    assert_eq!(loser.ingest_block(wh2, wb2), IngestOutcome::Accepted);
+    assert_eq!(loser.state_rewinds(), (1, 1), "the rewind happened");
+
+    // The applied predicate: unchanged, still no.
+    assert!(!loser.has_stored_body(&l1), "`stored_body` still means APPLIED");
+    assert!(loser.stored_body(&l1).is_none());
+    // The possession predicate: yes, and byte-exact.
+    let held = loser.held_body(&l1).expect("a rewound body is still HELD");
+    assert_eq!(held.commitment(), lb1.commitment(), "the exact body the header commits to");
+    assert_eq!(held.commitment(), lh1.tx_body_commitment, "…which is #77's binding");
+    assert_eq!(loser.state().retained_bodies(), 1, "one block retained, the one undone");
+
+    // And re-applying it drops the archive copy rather than keeping a duplicate:
+    // extend the losing branch until it wins again and the block comes back.
+    let (lh2, lb2) = {
+        let mut ext = adapter(0xB2);
+        assert_eq!(ext.ingest_block(lh1, lb1.clone()), IngestOutcome::Accepted);
+        let b = ext.mine_block().expect("mine");
+        assert_eq!(ext.ingest_block(b.0, b.1.clone()), IngestOutcome::Accepted);
+        let c = ext.mine_block().expect("mine");
+        assert_eq!(ext.ingest_block(c.0, c.1.clone()), IngestOutcome::Accepted);
+        (vec![b.0, c.0], vec![b.1, c.1])
+    };
+    // The body at fork+1 has to be in hand before `rejoin_main_chain` will rewind,
+    // and on `main` there was no way to obtain it — which is the deadlock. Here it
+    // is handed over directly; the wire path is the acceptance test below.
+    assert_eq!(loser.ingest_block(lh1, lb1), IngestOutcome::Duplicate);
+    for (h, b) in lh2.into_iter().zip(lb2) {
+        loser.ingest_block(h, b);
+    }
+    assert_eq!(loser.state().tip_height(), 3, "back on the branch it once abandoned");
+    assert!(loser.has_stored_body(&l1), "applied again ⇒ the applied predicate answers");
+    assert_eq!(loser.state().retained_bodies(), 2, "and the archive holds the W suffix, not L1");
+}
+
+/// **A rewind survives a restart with its possession intact** — the disk half of
+/// the fact, turned into the behaviour that depends on it.
+///
+/// `blocks.log` still carries the rewound record (the fact test reads it back), and
+/// `apply_logged_block` re-derives the rewind from it, so a node that restarts is
+/// able to serve exactly what it could serve before. Both resume paths are checked
+/// because they are different code: `replay` re-folds every record, `open` restores
+/// a snapshot and rebuilds the prefix at the chain-store layer.
+#[test]
+fn possession_survives_open_and_replay() {
+    let dir = temp_dir("restart");
+    let (committee, _v) = devnet_committee(7);
+    let mut loser = NodeAdapter::open(
+        &dir,
+        CommitteeState::new(committee, qlab_devnet::params_devnet::BOND_AMOUNT),
+        KeccakPow,
+        MarkerVerifier,
+        easy_sim(),
+    )
+    .expect("open");
+    loser.set_miner_rkm([0xB2; 4]);
+    let mut winner = adapter(0xA1);
+
+    let (lh1, lb1) = mine_on(&mut loser);
+    let l1 = lh1.header_hash();
+    let (wh1, wb1) = mine_on(&mut winner);
+    let (wh2, wb2) = mine_on(&mut winner);
+    loser.ingest_block(wh1, wb1);
+    loser.ingest_block(wh2, wb2);
+    assert_eq!(loser.state_rewinds(), (1, 1));
+    assert!(loser.held_body(&l1).is_some(), "held before the restart");
+    loser.save_snapshot().expect("snapshot");
+    drop(loser);
+
+    let genesis = genesis_block(easy_sim().genesis_difficulty, 0);
+    for (what, node) in [
+        ("open", MemNode::open(&dir, genesis.clone()).expect("open")),
+        ("replay", MemNode::replay(&dir, genesis).expect("replay")),
+    ] {
+        assert_eq!(node.tip_hash(), wh2.header_hash(), "{what}: resumed on the winner");
+        assert!(!node.chain().contains(&l1), "{what}: and did not resurrect it into state");
+        let held = node.held_block(&l1).unwrap_or_else(|| panic!("{what}: still possessed"));
+        assert_eq!(held.body().commitment(), lb1.commitment(), "{what}: the exact body");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// 3. THE GATE — it must survive, and its survival is asserted, not assumed
+// ---------------------------------------------------------------------------
+
+/// **The duty gate stays.** A node that is lagging AND actively receiving still
+/// refuses to mine, for as long as it is lagging.
+///
+/// This is the assertion the task book asked for by name, and it is the one that
+/// says what the fix is *not*. Ethereum's *"an optimistic validator MUST NOT
+/// produce a block"* is right and #130 (a) is right to enforce it; a node mining on
+/// a view it knows is stale can extend a chain it has not verified, and a halt is
+/// recoverable where an invalid chain is not. The net stopping was the SAFE outcome
+/// of a bad composition, and #198 does not trade that away — it removes the reason
+/// the lag could never clear.
+///
+/// "And receiving" is the sharp part: the node is being driven, frames are landing,
+/// bodies are arriving and being buffered, and the refusal holds through all of it
+/// and only lifts on the tick where `slag` reaches zero.
+#[test]
+fn the_duty_gate_still_refuses_to_mine_while_lagging_and_receiving() {
+    let mut factory = adapter(0xF0);
+    let chain: Vec<(BlockHeader, BlockBody)> = (0..4).map(|_| mine_on(&mut factory)).collect();
+
+    let hub = InProcHub::new();
+    let mut server =
+        P2pNode::new(InProcTransport::new(PeerId(1), Arc::clone(&hub)), adapter(0xF0), [1; 32]);
+    let mut behind =
+        P2pNode::new(InProcTransport::new(PeerId(2), Arc::clone(&hub)), adapter(0xB1), [2; 32]);
+    hub.link(PeerId(1), PeerId(2));
+    server.add_peer(PeerId(2), None);
+    behind.add_peer(PeerId(1), None);
+
+    // The server holds every body; the lagging node holds every HEADER and no body
+    // past height 0 — `slag = 4`, the shape three T0 hosts sat in.
+    for (h, b) in &chain {
+        assert_eq!(server.node_mut().ingest_block(*h, b.clone()), IngestOutcome::Accepted);
+        assert_eq!(behind.node_mut().ingest_header(*h), IngestOutcome::Accepted);
+    }
+    assert_eq!(slag(&behind), 4, "four blocks of applied-state lag");
+
+    // Drive them together. On every tick where the node is still lagging it must
+    // refuse, and it must be genuinely receiving while it refuses.
+    let mut refused_while_receiving = 0u32;
+    let mut cleared_at = None;
+    let mut now = 0u64;
+    for round in 0..400u32 {
+        now += SIM_TICK_MS;
+        server.tick(now);
+        let frames = behind.tick(now);
+        if slag(&behind) > 0 {
+            assert!(
+                behind.node_mut().mine_block().is_none(),
+                "round {round}: lagging by {} and it mined anyway",
+                slag(&behind)
+            );
+            if frames > 0 {
+                refused_while_receiving += 1;
+            }
+        } else if cleared_at.is_none() {
+            cleared_at = Some(round);
+        }
+    }
+    assert!(
+        refused_while_receiving > 0,
+        "the refusal was never exercised on a tick that actually delivered frames"
+    );
+    assert!(cleared_at.is_some(), "the lag never cleared, so the gate was never the variable");
+    // The refusal counter is the operator-visible half and it agrees.
+    assert!(
+        behind.node().lag_refusals("mine") > 0,
+        "`qumbra_state_lag_refusals_total{{duty=mine}}` recorded the refusals"
+    );
+    // …and once caught up the same node mines. The gate is a lag gate, not a wall.
+    assert_eq!(slag(&behind), 0);
+    assert!(behind.node_mut().mine_block().is_some(), "caught up ⇒ the duty is allowed");
 }

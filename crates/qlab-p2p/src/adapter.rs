@@ -1387,6 +1387,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         use qlab_node::ChainStore as _;
         self.state.chain().block(hash).is_some()
     }
+    fn held_body(&self, hash: &Hash32) -> Option<BlockBody> {
+        // POSSESSION (issue #198): the applied store, then the rewind archive —
+        // bodies this node applied at some point and still holds. `MemNode` owns
+        // that distinction because `rewind_to` is where it is created.
+        self.state.held_block(hash).map(|b| b.body())
+    }
 
     /// The main-chain blocks whose bodies this node still needs (issue #130 (c)).
     ///
