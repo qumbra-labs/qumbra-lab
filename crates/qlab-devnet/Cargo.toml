@@ -16,6 +16,14 @@ publish.workspace = true
 # Keccak-256 sponge is built on qlab-air's reference::keccak_f — never forked.
 qlab-air = { path = "../qlab-air" }
 
+# The ratified §2 compact-group framing (`qlab_note::compact`) — the exact bytes
+# a block body now commits to per transaction
+# (`discovery-on-the-consensus-wire.md` D2). This crate used to depend on
+# qlab-note "only for the shared Keccak primitive"; body-bound discovery ends
+# that, because D2 requires ONE encoder for these bytes and qlab-cbserver (their
+# previous home) depends on this crate. Still no prover, no IO, no serde here.
+qlab-note = { path = "../qlab-note" }
+
 # The real CPU-friendly PoW primitive (RandomX) + the LWMA-120 retarget and the
 # key-block rotation schedule (M9-N3). The `PowEngine` adapter (`pow::RandomXPow`)
 # and the difficulty wiring (`validation`) live here; qlab-pow is the reusable,

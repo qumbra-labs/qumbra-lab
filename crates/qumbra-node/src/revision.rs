@@ -40,7 +40,7 @@
 //!
 //! - **committee₀'s 21 verifying keys, the genesis block, the genesis difficulty,
 //!   and the network label.** These are covered by a different and already-existing
-//!   pin, the genesis hash (`bd360480…a66f` since issue #115 — see `genesis.rs`),
+//!   pin, the genesis hash (`566d4ed0…f80f` since issue #188 — see `genesis.rs`),
 //!   which every node asserts on startup.
 //!   Two overlapping pins on the same bytes would be redundancy, not assurance.
 //! - **Every `params_devnet` knob annotated testnet-tunable** (LWMA window/clamps,

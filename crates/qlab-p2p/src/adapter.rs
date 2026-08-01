@@ -1283,7 +1283,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             BodyError::MissingCoinbasePayee
             | BodyError::WrongFee { .. }
             | BodyError::DoubleSpendInBlock { .. }
-            | BodyError::ProofInvalid { .. } => BodyFault::Intrinsic("bad body"),
+            | BodyError::ProofInvalid { .. }
+            // Issue #188. Both discovery rules read only the transaction's own
+            // bytes and its own declared commitments, so they are as intrinsic
+            // as the fee check — this node's chain position cannot change the
+            // answer, which is what keeps them out of #134's amnesty.
+            | BodyError::DiscoveryMalformed { .. }
+            | BodyError::DiscoveryNotCanonical { .. }
+            | BodyError::DiscoveryDoesNotBind { .. } => BodyFault::Intrinsic("bad body"),
             // The one positional check (#134). `is_valid_anchor` answers from THIS
             // node's root index, finalized head and applied tip; a joiner replaying
             // history has none of the three at the height it is being served, so its
@@ -1876,16 +1883,13 @@ mod tests {
     }
 
     fn tx_with(anchor: Hash32, nf: u8, proof: &[u8]) -> TxEntry {
-        TxEntry {
-            proof: proof.to_vec(),
-            public: qlab_devnet::body::TxPublic {
-                anchor,
-                nullifiers: vec![[nf; 32]],
-                commitments: vec![[nf.wrapping_add(50); 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: posted_fee(ArityBucket::TwoByTwo),
-            },
-        }
+        TxEntry::with_placeholder_discovery(proof.to_vec(), qlab_devnet::body::TxPublic {
+            anchor,
+            nullifiers: vec![[nf; 32]],
+            commitments: vec![[nf.wrapping_add(50); 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: posted_fee(ArityBucket::TwoByTwo),
+            })
     }
 
     #[test]
@@ -2966,6 +2970,116 @@ mod tests {
             vote_b: validators[signer].sign_checkpoint(&cp_b),
             cp_b,
         }
+    }
+
+    /// **Issue #133 D3 — the two-node same-height finality divergence, executed.**
+    ///
+    /// The Multica baton asked for the case the single-node restart test cannot
+    /// show: *a node that observed the evidence and one that did not disagree about
+    /// whether an equivocator's vote counts toward quorum*, and at a round that
+    /// reaches quorum **only** with that vote, one finalizes a checkpoint the other
+    /// refuses. That is a same-height finality split — the R2 stop condition — and
+    /// it is the class problem D1 (evidence in blocks) is for: local `punishments.dat`
+    /// (PR #159) makes the witness durable, but it cannot teach a non-witness.
+    ///
+    /// Numbers (committee7, quorum 5): tombstone signer 3 on the witness only. Feed
+    /// both nodes the same five votes from signers `{0,1,2,3,4}`:
+    /// - witness excludes 3 → 4 active < 5 → does **not** finalize
+    /// - non-witness counts all five → finalizes
+    ///
+    /// Then the witness restarts from its own data dir. After PR #159 it still
+    /// refuses; the non-witness still finalizes. The divergence **survives** the
+    /// restart rather than flipping — the resurrection the original issue predicted
+    /// does **not** reproduce on a node that holds the ledger. What remains open is
+    /// the non-witness forever, which is D1, not a missing local file.
+    #[test]
+    fn a_non_witness_finalizes_a_checkpoint_the_restarted_witness_refuses() {
+        let dir = temp_dir("i133-two-node");
+        let (_c, validators) = committee7();
+        let ev = conflicting(&validators, 3, 8);
+        let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
+        // Five votes including the equivocator: quorum-marginal for a full roster,
+        // below-quorum once signer 3 is excluded.
+        let votes: Vec<Vote> = [0usize, 1, 2, 3, 4]
+            .iter()
+            .map(|&i| validators[i].sign_checkpoint(&cp))
+            .collect();
+
+        {
+            let mut witness =
+                NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+                    .expect("open witness");
+            assert_eq!(witness.apply_evidence(&ev), Some(3));
+            assert!(witness.is_tombstoned(3));
+            match witness.ingest_checkpoint_votes(&cp, &votes) {
+                VotesOutcome::Learned { finalized, accumulated } => {
+                    assert!(
+                        !finalized,
+                        "witness must refuse: 5 votes minus tombstoned signer 3 is 4 < quorum 5"
+                    );
+                    assert_eq!(accumulated.len(), 4);
+                }
+                VotesOutcome::Stale => panic!("witness expected Learned(not finalized), got Stale"),
+                VotesOutcome::Invalid => {
+                    panic!("witness expected Learned(not finalized), got Invalid")
+                }
+                VotesOutcome::Unjudged => {
+                    panic!("witness expected Learned(not finalized), got Unjudged")
+                }
+            }
+            assert_eq!(witness.finalized_height(), None);
+        }
+
+        // Non-witness: never saw the evidence, same five votes, finalizes.
+        let mut non_witness =
+            NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        assert!(!non_witness.is_tombstoned(3));
+        assert_eq!(
+            non_witness.ingest_checkpoint(cp, votes.clone()),
+            IngestOutcome::Accepted,
+            "non-witness counts the equivocator toward quorum and finalizes"
+        );
+        assert_eq!(non_witness.finalized_height(), Some(2));
+
+        // --- witness restarts from its own data dir ---
+
+        let mut restarted =
+            NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+                .expect("reopen witness");
+        // Control: the constructor still hands open a fresh all-Active roster; the
+        // ledger is what keeps signer 3 tombstoned (PR #159). Without it this assert
+        // would fail and the defect would have reproduced.
+        assert_eq!(committee7().0.status(3), Some(MemberStatus::Active));
+        assert!(
+            restarted.is_tombstoned(3),
+            "resurrection across restart does NOT reproduce when the ledger is present"
+        );
+        assert_eq!(restarted.punishment_restore().telemetry_field(), "1/1");
+        match restarted.ingest_checkpoint_votes(&cp, &votes) {
+            VotesOutcome::Learned { finalized, accumulated } => {
+                assert!(
+                    !finalized,
+                    "restarted witness still refuses the checkpoint its non-witness peer finalized"
+                );
+                assert_eq!(accumulated.len(), 4);
+            }
+            VotesOutcome::Stale => {
+                panic!("restarted witness expected Learned(not finalized), got Stale")
+            }
+            VotesOutcome::Invalid => {
+                panic!("restarted witness expected Learned(not finalized), got Invalid")
+            }
+            VotesOutcome::Unjudged => {
+                panic!("restarted witness expected Learned(not finalized), got Unjudged")
+            }
+        }
+        assert_eq!(
+            restarted.finalized_height(),
+            None,
+            "same height, different finality: non-witness final=2, restarted witness final=none"
+        );
+        assert_eq!(non_witness.finalized_height(), Some(2));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// **THE acceptance property (issue #133), stated as the defect it repairs: a
