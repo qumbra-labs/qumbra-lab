@@ -46,11 +46,11 @@ fn chain_stub(n: u64) -> StubNode {
 
 fn tx(seed: u8) -> TxEntry {
     TxEntry::with_placeholder_discovery(vec![seed; 48], TxPublic {
-            anchor: [seed; 32],
-            nullifiers: vec![[seed; 32]],
-            commitments: vec![[seed.wrapping_add(3); 32]],
-            bucket: ArityBucket::TwoByTwo,
-            fee: 1_000_000,
+        anchor: [seed; 32],
+        nullifiers: vec![[seed; 32]],
+        commitments: vec![[seed.wrapping_add(3); 32]],
+        bucket: ArityBucket::TwoByTwo,
+        fee: 1_000_000,
         })
 }
 

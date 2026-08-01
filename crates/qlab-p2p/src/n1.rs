@@ -679,11 +679,11 @@ mod tests {
     fn tx_ingest_dedups() {
         let mut n = node();
         let tx = TxEntry::with_placeholder_discovery(vec![1, 2, 3], qlab_devnet::body::TxPublic {
-                anchor: [0; 32],
-                nullifiers: vec![],
-                commitments: vec![],
-                bucket: qlab_devnet::fees::ArityBucket::TwoByTwo,
-                fee: 0,
+            anchor: [0; 32],
+            nullifiers: vec![],
+            commitments: vec![],
+            bucket: qlab_devnet::fees::ArityBucket::TwoByTwo,
+            fee: 0,
             });
         assert_eq!(n.ingest_tx(tx.clone()), IngestOutcome::Accepted);
         assert_eq!(n.ingest_tx(tx.clone()), IngestOutcome::Duplicate);

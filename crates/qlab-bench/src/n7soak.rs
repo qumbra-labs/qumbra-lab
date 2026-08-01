@@ -154,11 +154,11 @@ impl FullNode {
 /// verifier-accepted (`b"ok"`) or -rejected proof.
 pub fn soak_tx(anchor: [u8; 32], nf: u8, good_proof: bool) -> TxEntry {
     TxEntry::with_placeholder_discovery(if good_proof { b"ok".to_vec() } else { b"bad".to_vec() }, TxPublic {
-            anchor,
-            nullifiers: vec![[nf; 32]],
-            commitments: vec![[nf.wrapping_add(70); 32]],
-            bucket: ArityBucket::TwoByTwo,
-            fee: posted_fee(ArityBucket::TwoByTwo),
+        anchor,
+        nullifiers: vec![[nf; 32]],
+        commitments: vec![[nf.wrapping_add(70); 32]],
+        bucket: ArityBucket::TwoByTwo,
+        fee: posted_fee(ArityBucket::TwoByTwo),
         })
 }
 

@@ -917,11 +917,11 @@ mod tests {
 
     fn tx_with(anchor: Hash32, nfs: &[u8], cms: &[u8], fee: u64) -> TxEntry {
         TxEntry::with_placeholder_discovery(b"ok".to_vec(), TxPublic {
-                anchor,
-                nullifiers: nfs.iter().map(|&n| [n; 32]).collect(),
-                commitments: cms.iter().map(|&c| cm_bytes(c)).collect(),
-                bucket: ArityBucket::TwoByTwo,
-                fee,
+            anchor,
+            nullifiers: nfs.iter().map(|&n| [n; 32]).collect(),
+            commitments: cms.iter().map(|&c| cm_bytes(c)).collect(),
+            bucket: ArityBucket::TwoByTwo,
+            fee,
             })
     }
 

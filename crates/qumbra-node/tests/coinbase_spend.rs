@@ -245,11 +245,11 @@ fn a_mined_coin_can_be_spent_after_maturity_with_a_real_proof() {
     let (_pvs, proof) = prove_bucket(&inst);
 
     let entry = TxEntry::with_placeholder_discovery(bincode::serialize(&proof).expect("proof serializes"), TxPublic {
-            anchor,
-            nullifiers: vec![digest_bytes(&inst.nf[0]), digest_bytes(&inst.nf[1])],
-            commitments: vec![digest_bytes(&inst.cm_out[0]), digest_bytes(&inst.cm_out[1])],
-            bucket: ArityBucket::TwoByTwo,
-            fee,
+        anchor,
+        nullifiers: vec![digest_bytes(&inst.nf[0]), digest_bytes(&inst.nf[1])],
+        commitments: vec![digest_bytes(&inst.cm_out[0]), digest_bytes(&inst.cm_out[1])],
+        bucket: ArityBucket::TwoByTwo,
+        fee,
         });
 
     // 🔴 THE CLAIM: the production verifier accepts a real spend of a mined coin.
@@ -414,11 +414,11 @@ fn an_immature_coinbase_spend_is_unprovable_not_refused() {
     let anchor = digest_bytes(&tree.root_at(leaves_through(chain.tip.height)));
     assert!(chain.node.is_valid_anchor(&anchor));
     let candidate = TxEntry::with_placeholder_discovery(Vec::new(), TxPublic {
-            anchor,
-            nullifiers: vec![[0x21; 32], [0x22; 32]],
-            commitments: vec![[0x23; 32], [0x24; 32]],
-            bucket: ArityBucket::TwoByTwo,
-            fee: posted_fee(ArityBucket::TwoByTwo),
+        anchor,
+        nullifiers: vec![[0x21; 32], [0x22; 32]],
+        commitments: vec![[0x23; 32], [0x24; 32]],
+        bucket: ArityBucket::TwoByTwo,
+        fee: posted_fee(ArityBucket::TwoByTwo),
         });
     assert_eq!(
         mp.admit(candidate, &chain.node, &ConsensusVerifier),
@@ -519,11 +519,11 @@ fn a_forged_anchor_carrying_a_real_proof_is_rejected_at_the_block_path() {
     );
     let (_pvs, proof) = prove_bucket(&inst);
     let entry = TxEntry::with_placeholder_discovery(bincode::serialize(&proof).expect("proof serializes"), TxPublic {
-            anchor: forged_anchor,
-            nullifiers: vec![digest_bytes(&inst.nf[0]), digest_bytes(&inst.nf[1])],
-            commitments: vec![digest_bytes(&inst.cm_out[0]), digest_bytes(&inst.cm_out[1])],
-            bucket: ArityBucket::TwoByTwo,
-            fee,
+        anchor: forged_anchor,
+        nullifiers: vec![digest_bytes(&inst.nf[0]), digest_bytes(&inst.nf[1])],
+        commitments: vec![digest_bytes(&inst.cm_out[0]), digest_bytes(&inst.cm_out[1])],
+        bucket: ArityBucket::TwoByTwo,
+        fee,
         });
 
     // The proof is genuinely valid — the attacker did not fail at cryptography, and

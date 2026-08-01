@@ -1883,11 +1883,11 @@ mod tests {
 
     fn tx_with(anchor: Hash32, nf: u8, proof: &[u8]) -> TxEntry {
         TxEntry::with_placeholder_discovery(proof.to_vec(), qlab_devnet::body::TxPublic {
-                anchor,
-                nullifiers: vec![[nf; 32]],
-                commitments: vec![[nf.wrapping_add(50); 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: posted_fee(ArityBucket::TwoByTwo),
+            anchor,
+            nullifiers: vec![[nf; 32]],
+            commitments: vec![[nf.wrapping_add(50); 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: posted_fee(ArityBucket::TwoByTwo),
             })
     }
 

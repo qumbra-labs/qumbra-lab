@@ -1487,11 +1487,11 @@ mod tests {
 
     fn tx(seed: u8) -> TxEntry {
         TxEntry::with_placeholder_discovery(vec![seed; 32], TxPublic {
-                anchor: [seed; 32],
-                nullifiers: vec![[seed; 32]],
-                commitments: vec![[seed.wrapping_add(9); 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: 1_000_000,
+            anchor: [seed; 32],
+            nullifiers: vec![[seed; 32]],
+            commitments: vec![[seed.wrapping_add(9); 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: 1_000_000,
             })
     }
 
@@ -2033,11 +2033,11 @@ mod tests {
         let mut hash = [0u8; 32];
         hash[..8].copy_from_slice(&height.to_le_bytes());
         let entry = TxEntry::with_placeholder_discovery(vec![0xBB; proof_len], TxPublic {
-                anchor: [1; 32],
-                nullifiers: vec![[2; 32]],
-                commitments: vec![[3; 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: 0,
+            anchor: [1; 32],
+            nullifiers: vec![[2; 32]],
+            commitments: vec![[3; 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: 0,
             });
         c.insert(height, hash, vec![entry], 0, [0; 4]);
         hash
@@ -3049,11 +3049,11 @@ mod tests {
 
         fn tx_with(anchor: Hash32, nf: u8, proof: &[u8]) -> TxEntry {
             TxEntry::with_placeholder_discovery(proof.to_vec(), TxPublic {
-                    anchor,
-                    nullifiers: vec![[nf; 32]],
-                    commitments: vec![[nf.wrapping_add(50); 32]],
-                    bucket: ArityBucket::TwoByTwo,
-                    fee: posted_fee(ArityBucket::TwoByTwo),
+                anchor,
+                nullifiers: vec![[nf; 32]],
+                commitments: vec![[nf.wrapping_add(50); 32]],
+                bucket: ArityBucket::TwoByTwo,
+                fee: posted_fee(ArityBucket::TwoByTwo),
                 })
         }
 

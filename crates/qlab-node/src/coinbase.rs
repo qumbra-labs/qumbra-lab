@@ -293,11 +293,11 @@ mod tests {
 
     fn fee_tx(nf: u8) -> TxEntry {
         TxEntry::with_placeholder_discovery(vec![0u8; 8], TxPublic {
-                anchor: [0x0F; 32],
-                nullifiers: vec![[nf; 32]],
-                commitments: vec![[nf.wrapping_add(1); 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: posted_fee(ArityBucket::TwoByTwo),
+            anchor: [0x0F; 32],
+            nullifiers: vec![[nf; 32]],
+            commitments: vec![[nf.wrapping_add(1); 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: posted_fee(ArityBucket::TwoByTwo),
             })
     }
 

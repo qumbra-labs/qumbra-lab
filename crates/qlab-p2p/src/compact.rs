@@ -279,11 +279,11 @@ mod tests {
 
     fn tx(seed: u8) -> TxEntry {
         TxEntry::with_placeholder_discovery(vec![seed; 16], TxPublic {
-                anchor: [seed; 32],
-                nullifiers: vec![[seed; 32]],
-                commitments: vec![[seed.wrapping_add(1); 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: 1_000_000,
+            anchor: [seed; 32],
+            nullifiers: vec![[seed; 32]],
+            commitments: vec![[seed.wrapping_add(1); 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: 1_000_000,
             })
     }
 

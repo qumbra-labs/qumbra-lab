@@ -655,11 +655,11 @@ mod tests {
     /// A well-formed candidate paying the correct 2×2 posted price.
     fn good_tx(nf: u8) -> TxEntry {
         TxEntry::with_placeholder_discovery(b"ok".to_vec(), qlab_devnet::body::TxPublic {
-                anchor: ANCHOR,
-                nullifiers: vec![[nf; 32]],
-                commitments: vec![[nf.wrapping_add(100); 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: posted_fee(ArityBucket::TwoByTwo),
+            anchor: ANCHOR,
+            nullifiers: vec![[nf; 32]],
+            commitments: vec![[nf.wrapping_add(100); 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: posted_fee(ArityBucket::TwoByTwo),
             })
     }
 

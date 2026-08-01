@@ -76,11 +76,11 @@ impl TxVerifier for PoolVerifier {
 /// A `TxEntry` (pool index 0) carrying `inst`'s real public surface.
 fn tx_entry(inst: &BucketInstance) -> TxEntry {
     TxEntry::with_placeholder_discovery(0u64.to_le_bytes().to_vec(), TxPublic {
-            anchor: h32(&inst.anchor),
-            nullifiers: vec![h32(&inst.nf[0]), h32(&inst.nf[1])],
-            commitments: vec![h32(&inst.cm_out[0]), h32(&inst.cm_out[1])],
-            bucket: ArityBucket::TwoByTwo,
-            fee: posted_fee(ArityBucket::TwoByTwo),
+        anchor: h32(&inst.anchor),
+        nullifiers: vec![h32(&inst.nf[0]), h32(&inst.nf[1])],
+        commitments: vec![h32(&inst.cm_out[0]), h32(&inst.cm_out[1])],
+        bucket: ArityBucket::TwoByTwo,
+        fee: posted_fee(ArityBucket::TwoByTwo),
         })
 }
 
@@ -91,11 +91,11 @@ fn tx_entry(inst: &BucketInstance) -> TxEntry {
 /// inert (never reached).
 fn entry_with_anchor(anchor: Hash32) -> TxEntry {
     TxEntry::with_placeholder_discovery(0u64.to_le_bytes().to_vec(), TxPublic {
-            anchor,
-            nullifiers: vec![[0u8; 32], [1u8; 32]],
-            commitments: vec![[2u8; 32], [3u8; 32]],
-            bucket: ArityBucket::TwoByTwo,
-            fee: posted_fee(ArityBucket::TwoByTwo),
+        anchor,
+        nullifiers: vec![[0u8; 32], [1u8; 32]],
+        commitments: vec![[2u8; 32], [3u8; 32]],
+        bucket: ArityBucket::TwoByTwo,
+        fee: posted_fee(ArityBucket::TwoByTwo),
         })
 }
 

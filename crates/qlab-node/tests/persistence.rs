@@ -37,11 +37,11 @@ fn temp_dir(tag: &str) -> PathBuf {
 
 fn tx(anchor: Hash32, nullifiers: Vec<Hash32>, commitments: Vec<Hash32>) -> TxEntry {
     TxEntry::with_placeholder_discovery(b"ok".to_vec(), TxPublic {
-            anchor,
-            nullifiers,
-            commitments,
-            bucket: ArityBucket::TwoByTwo,
-            fee: posted_fee(ArityBucket::TwoByTwo),
+        anchor,
+        nullifiers,
+        commitments,
+        bucket: ArityBucket::TwoByTwo,
+        fee: posted_fee(ArityBucket::TwoByTwo),
         })
 }
 

@@ -27,11 +27,11 @@ impl qlab_devnet::body::TxVerifier for MockVerifier {
 
 fn tx(anchor: Hash32, nf: u8) -> TxEntry {
     TxEntry::with_placeholder_discovery(b"ok".to_vec(), TxPublic {
-            anchor,
-            nullifiers: vec![[nf; 32]],
-            commitments: vec![[nf.wrapping_add(1); 32]],
-            bucket: ArityBucket::TwoByTwo,
-            fee: posted_fee(ArityBucket::TwoByTwo),
+        anchor,
+        nullifiers: vec![[nf; 32]],
+        commitments: vec![[nf.wrapping_add(1); 32]],
+        bucket: ArityBucket::TwoByTwo,
+        fee: posted_fee(ArityBucket::TwoByTwo),
         })
 }
 

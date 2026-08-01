@@ -611,11 +611,11 @@ mod tests {
     #[test]
     fn tx_round_trips() {
         let tx = TxEntry::with_placeholder_discovery(vec![9u8; 200], TxPublic {
-                anchor: [1; 32],
-                nullifiers: vec![[2; 32], [3; 32]],
-                commitments: vec![[4; 32], [5; 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: 1_000_000,
+            anchor: [1; 32],
+            nullifiers: vec![[2; 32], [3; 32]],
+            commitments: vec![[4; 32], [5; 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: 1_000_000,
             });
         let bytes = encode_tx(&tx);
         let back = decode_tx(&bytes).unwrap();
@@ -675,11 +675,11 @@ mod tests {
     #[test]
     fn tx_rejects_unknown_bucket() {
         let tx = TxEntry::with_placeholder_discovery(vec![], TxPublic {
-                anchor: [0; 32],
-                nullifiers: vec![],
-                commitments: vec![],
-                bucket: ArityBucket::EightByEight,
-                fee: 0,
+            anchor: [0; 32],
+            nullifiers: vec![],
+            commitments: vec![],
+            bucket: ArityBucket::EightByEight,
+            fee: 0,
             });
         let mut bytes = encode_tx(&tx);
         // bucket byte sits after anchor(32) + n_nf(1 varint=0) + n_cm(1 varint=0).
