@@ -28,7 +28,7 @@ The line is emitted to stdout every `TELEMETRY_REFRESH` interval by
 order is the `format!` at `run.rs:996`:
 
 ```
-TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain=
+TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= prest=
 ```
 
 ⚠️ **That is the field list, not a capture.** The only values quoted in this
@@ -95,6 +95,8 @@ Five rules that hold for the whole line:
 | 23 | `mready` | mining-readiness verdict | 🟢 never |
 | 24 | `stipid` | identity of the applied tip | 🟡 not alone |
 | 25 | `schain` | `main` / `fork` / `-` | 🔴 **yes — `schain=fork`** |
+| 26 | `breq` | historical block-body requests in flight | 🟡 not alone |
+| 27 | `prest` | committee punishments restored at process start | 🟡 not alone |
 
 ---
 
@@ -1109,6 +1111,73 @@ connectivity report.
 
 ---
 
+## 26. `breq` — historical block-body requests currently in flight
+
+**🟡 Not alone.** Pair with `slag=`.
+
+**What it counts.** How many historical block-body asks this node has outstanding
+right now (`run.rs` `body_reqs`, capped at `MAX_BODIES_IN_FLIGHT`). Instantaneous
+level, not a total — resets implicitly when asks complete. Always printed, zero
+included. Appended by issue #130 (c).
+
+**Reading it with `slag=`:** `slag>0 breq=0` is *not asking*; `slag>0 breq>0`
+sustained is *asking and not being served*.
+
+**Escalate when:** never from this field alone.
+
+---
+
+## 27. `prest` — committee punishments restored at process start (touches TELEMETRY)
+
+**🟡 Not alone.** A non-zero value is a local fact about this host's ledger; a
+cross-host comparison is the load-bearing reading.
+
+**What it counts.** What [`NodeAdapter::open`](../../crates/qlab-p2p/src/adapter.rs)
+found in `punishments.dat` and re-applied into the fresh genesis committee on this
+process start (`PunishmentRestore::telemetry_field`,
+`crates/qlab-p2p/src/punish.rs`). **Latched at open** — every later sample in the
+process lifetime reprints the same value. It is a startup fact, not a running total.
+
+**Shape is `restored/known`, not a bare count.** A bare `0` cannot distinguish
+*nothing to restore* from *could not restore anything*, and that distinction is
+why the field exists:
+
+| value | meaning |
+|---|---|
+| `0/0` | ledger present (or written empty on this open); nothing to restore |
+| `N/M` | `N` tombstones re-applied from `M` on-disk records this process start |
+| `unk` | data dir already held chain history but **no** ledger — punishment history is unknowable (pre-#133 datadir). Not silence, not clean. |
+
+⚠️ **A host that has never observed an equivocation prints `prest=0/0` forever.**
+That is correct for the local ledger (PR #159) and is **not** proof the net has
+never punished anyone. Evidence is push-once gossip with no getdata path: a peer
+that saw the conflicting pair and this host did not still disagree about who may
+sign, and after a restart they disagree *durably*. Agreement needs the evidence
+in blocks (issue #133 D1). Do not "fix" a perpetual `0/0` by deleting the field.
+
+**Normal value.** `0/0` on every host of a net that has never seen an
+equivocation — the T0 soak record is exactly that. `N/M` only after this node
+itself adjudicated evidence in a prior process lifetime.
+
+**What a change means.** The value cannot change mid-process. A change across a
+restart (`0/0` → `1/1`) means this node restored a punishment it had recorded;
+that is the healthy PR #159 path. `unk` on first start of a pre-#133 datadir is
+the one-shot upgrade signal — an empty ledger is then written so later restarts
+are unambiguous.
+
+**Escalate when:** never from this field alone. Two hosts at the same height with
+different `prest` (and no shared evidence path) is the class problem D1 names,
+not an operator action on one host.
+
+**Locked by:** `telemetry_line_is_extended_at_the_end_and_nowhere_else`
+(`run.rs`, expects trailing `prest=0/0`),
+`a_committee_punishment_survives_a_restart_through_the_run_path` (`run.rs`,
+expects `prest=1/1` after restart),
+`a_non_witness_finalizes_a_checkpoint_the_restarted_witness_refuses`
+(`adapter.rs` — the two-node same-height divergence the local ledger cannot close).
+
+---
+
 ## Appendix A — the two-minute triage
 
 In order. Stop at the first 🔴.
@@ -1150,5 +1219,5 @@ rendering) · `crates/qlab-node/src/round.rs` (the round ledger) ·
 `crates/qlab-p2p/src/addrman.rs` (the address book) ·
 `crates/qlab-devnet/src/params_devnet.rs` (the frozen constants).
 
-Issues cited: #73 #74 #83 #84 #87 #104 #105 #106 #107 #117 #121 #130 #134 #162
-#164 #165 #167 #169 #172 #173 #183. PRs cited: #72 #93 #110 #119 #153 #168 #171.
+Issues cited: #73 #74 #83 #84 #87 #104 #105 #106 #107 #117 #121 #130 #133 #134 #162
+#164 #165 #167 #169 #172 #173 #183. PRs cited: #72 #93 #110 #119 #153 #159 #168 #171.

@@ -53,7 +53,18 @@ use qlab_node::{genesis_block, StoredBlock};
 /// genesis block as a [`StoredBlock`], which gained `coinbase_rkm`, so the file's
 /// bytes — and therefore **the genesis hash, which is the network identity** —
 /// changed. See [`GenesisFile`]'s docs.
-pub const GENESIS_FORMAT_VERSION: u32 = 2;
+///
+/// **3** since issue #188. Judgement call, recorded rather than assumed: the
+/// struct *shape* is unchanged — genesis carries no transactions, so
+/// [`StoredTx`]'s new `discovery` field never appears in these bytes, and #115
+/// moved the hash without a bump on exactly that reasoning. It is bumped anyway
+/// because a v2 file is **semantically** incompatible now: its embedded header
+/// commits to a v1 body preimage, so a #188 binary that loaded one would pass
+/// the hash check (the file hashes to what it hashes to) and only fail later, at
+/// the height-0 header/body binding, with a much worse error. #81's rule is that
+/// an incompatible artifact is refused with a reason and never migrated by
+/// guesswork; the bump is what makes that refusal happen at load.
+pub const GENESIS_FORMAT_VERSION: u32 = 3;
 
 /// The FROZEN v1.0 consensus wire size in bytes (qlab-consensus
 /// `consensus_wire_is_145609_bytes`; consensus-parameters §1). Baked so the
@@ -293,6 +304,7 @@ impl KeyFile {
 ///   pre-#101:  4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3
 ///   post-#101: 8811d4e0ccdee702bafd4c92afad768495dc43360778072338aa140d87a73cff
 ///   post-#115: bd3604804aade38ece989d87e72e3541cede939512f513840c5cdcf13986a66f
+///   post-#188: 566d4ed01426ece7a10ffa41829b6ec43d19a8bbb51b3d11aba7048192f0f80f
 /// ```
 ///
 /// **#101 — `coinbase_rkm`, a consequence rather than a decision.** [`StoredBlock`]
@@ -664,6 +676,14 @@ mod tests {
     /// the key encoding, or the file shape is caught here (a deliberate change bumps
     /// this pin and `GENESIS_FORMAT_VERSION`). Every node computes this same value.
     ///
+    /// 🔴 **Changed again by issue #188** — body format v2. The genesis header's
+    /// `tx_body_commitment` **is** the empty body's commitment (#115), and #188
+    /// moves the empty body's preimage (`BODY_PREIMAGE_DOMAIN`), so the embedded
+    /// `StoredBlock`'s header bytes move and with them this file's hash. This is
+    /// the T1 rider `t1-discovery-serving-decision.md` §10 stamped; **T0's four
+    /// hosts are not upgraded by this baton** and none of T0's four drills
+    /// involves a transaction, so discovery is never reached there.
+    ///
     /// 🔴 **Changed by issue #115** — the genesis header now commits to its own
     /// body (`tx_body_commitment` moved off `ZERO_HASH`), so the embedded
     /// `StoredBlock`'s bytes moved and with them this file's hash. That is the
@@ -715,13 +735,15 @@ mod tests {
     fn genesis_hash_is_pinned() {
         assert_eq!(
             GenesisFile::new_devnet_t0().hash_hex(),
-            "bd3604804aade38ece989d87e72e3541cede939512f513840c5cdcf13986a66f",
+            "566d4ed01426ece7a10ffa41829b6ec43d19a8bbb51b3d11aba7048192f0f80f",
         );
         for superseded in [
             // pre-#101 — the T0 net on t0-wan-2.
             "4a75b3b8a80122cbbc35867df17bd14f19054658b511dbc45bcfa67053cfc2c3",
             // post-#101 / pre-#115 — never deployed.
             "8811d4e0ccdee702bafd4c92afad768495dc43360778072338aa140d87a73cff",
+            // post-#115 / pre-#188 — the identity t0-wan-3..5 run on.
+            "bd3604804aade38ece989d87e72e3541cede939512f513840c5cdcf13986a66f",
         ] {
             assert_ne!(
                 GenesisFile::new_devnet_t0().hash_hex(),
