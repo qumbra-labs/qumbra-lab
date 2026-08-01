@@ -98,9 +98,10 @@ impl CompactGroup {
     ///
     /// This ordering is `discovery-on-the-consensus-wire.md` **D4** and is not a
     /// preference — "an unordered rule would let two orderings of the same
-    /// content produce two commitments". It is the same order
-    /// `qlab_node::rpc::TxDiscovery::commitments` already used RPC-side, lifted
-    /// here so consensus and serving read one function.
+    /// content produce two commitments". It is the same order the node RPC used
+    /// to state privately, lifted here so consensus and serving read one
+    /// function; that private copy was deleted in baton 2 rather than left to
+    /// drift against this one.
     pub fn commitments(&self) -> Vec<[u8; CM_LEN]> {
         self.recipients
             .iter()
