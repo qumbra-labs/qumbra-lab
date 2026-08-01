@@ -3786,9 +3786,10 @@ mod tests {
         assert!(line.contains(" breq=0 "), "nothing in flight: {line}");
         // #85: this node finalized genesis locally, so the newest append says the
         // tracker checkpoint is backed by its exact block in fork choice.
-        assert!(line.ends_with(" fback=local"), "local finality, last: {line}");
-        // #130 (c): nothing outstanding on a lone node.
-        assert!(line.contains(" breq=0 "), "nothing in flight: {line}");
+        // Not `ends_with` any more: `prest=` (#133 D3) landed after this field and is
+        // now the tail. Both appends are correct — only one can be last, and it is the
+        // one that landed later. This assertion was `ends_with` when `fback=` WAS last.
+        assert!(line.contains(" fback=local "), "backing verdict present: {line}");
         // #133 D3: `prest=` is the newest append and is now the last field. A fresh
         // data dir has nothing to restore — and the shape is restored/known, not a
         // bare zero, so "nothing to restore" is distinguishable from "unk".
