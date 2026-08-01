@@ -2314,7 +2314,13 @@ mod tests {
         assert_eq!(a.state().tip_height(), 2);
         assert_eq!(a.chain().tip_height(), 3);
         assert_eq!(a.state_lag().blocks(), 1);
-        assert_eq!(a.pending_bodies().0, 0, "and the refused body is not re-tried in a loop");
+        // The refused body leaves the window rather than being retried against an
+        // unchanged state. It stays *re-requestable* — `missing_body_hashes` derives
+        // its ask set from what has been applied, so the next tick asks for height 3
+        // again, and each redelivery is counted here. That is the intended reading:
+        // a body that can never apply makes `bdrop` climb with its height pinned,
+        // which is the "still happening" signal this field exists to give.
+        assert_eq!(a.pending_bodies().0, 0, "the refused body is not held");
     }
 
     /// 🔴 **Issue #130 (b), the reachability question: `NotExtendingTip` cannot be
