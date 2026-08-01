@@ -243,19 +243,47 @@ pub fn read_bundle(b: &[u8], pos: &mut usize) -> Result<RecipientBundle, CodecEr
 
 // ---- compact group -----------------------------------------------------------
 
-/// Encode one per-tx compact group (no leading version byte — groups nest inside
-/// a versioned response, or inside a block-body tx region).
-pub fn write_group(out: &mut Vec<u8>, g: &CompactGroup) {
-    write_varint(out, g.tx_index);
-    debug_assert!(g.recipients.len() <= u8::MAX as usize, "n_recipients is a u8");
-    out.push(g.recipients.len() as u8);
-    for r in &g.recipients {
+// ---- group *contents* — the part a block body commits to ---------------------
+//
+// A group on the serving wire is `tx_index(varint) ‖ contents`. The block body
+// commits to **contents only**; see [`write_group_contents`].
+
+/// Encode a group's contents: `n_recipients(u8) ‖ [ct(1088) ‖ n_outputs(u8) ‖
+/// entries]`. **No `tx_index`.**
+///
+/// 🔴 **Why the index is not in here** (issue #188 baton 1, a deviation from a
+/// literal reading of `discovery-on-the-consensus-wire.md` D2, reported on the
+/// issue): a transaction's index within a block is not known until the block is
+/// assembled, and a transaction is built, gossiped and deduplicated by
+/// `keccak256(encode_tx(..))` long before that. Committing `tx_index` inside the
+/// transaction would force the assembler to rewrite the transaction's own bytes
+/// at inclusion time, which moves its id between the mempool and the block and
+/// breaks compact-block reconstruction.
+///
+/// D1's own reasoning is the argument for leaving it out — *"an index is a
+/// second thing that can disagree with the first; positional containment cannot
+/// disagree with itself."* Serving stays a projection rather than a re-encoding:
+/// `/v1/compact` emits `varint(position) ‖ committed_bytes`, a concatenation
+/// whose only new byte group is derived from the body's own ordering.
+///
+/// **Consequence, stated because it is load-bearing:** every field here is
+/// fixed-width or single-valued, so the committed region contains **no varint
+/// at all** and admits exactly one byte string per logical group by
+/// construction. D6 is still required for the serving wire (step 4) and is
+/// already landed (`PR #149`); it simply never gets a chance to matter inside
+/// the preimage.
+pub fn write_group_contents(out: &mut Vec<u8>, recipients: &[RecipientBundle]) {
+    debug_assert!(recipients.len() <= u8::MAX as usize, "n_recipients is a u8");
+    out.push(recipients.len() as u8);
+    for r in recipients {
         write_bundle(out, r);
     }
 }
 
-pub fn read_group(b: &[u8], pos: &mut usize) -> Result<CompactGroup, CodecError> {
-    let tx_index = read_varint(b, pos)?;
+pub fn read_group_contents(
+    b: &[u8],
+    pos: &mut usize,
+) -> Result<Vec<RecipientBundle>, CodecError> {
     let n_recipients = *b
         .get(*pos)
         .ok_or(CodecError::Truncated { what: "n_recipients" })?;
@@ -264,29 +292,68 @@ pub fn read_group(b: &[u8], pos: &mut usize) -> Result<CompactGroup, CodecError>
     for _ in 0..n_recipients {
         recipients.push(read_bundle(b, pos)?);
     }
+    Ok(recipients)
+}
+
+/// Encode group contents to their own buffer — **the exact bytes a block body
+/// commits to** (D1/D3).
+pub fn encode_group_contents(recipients: &[RecipientBundle]) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_group_contents(&mut out, recipients);
+    out
+}
+
+/// Decode group contents from a whole buffer, rejecting trailing bytes.
+///
+/// This is the consensus entry point. `discovery-on-the-consensus-wire.md` §4
+/// rule 3 requires that the bytes "decode, decode canonically (D6), and
+/// re-encode to themselves"; with no varint in the region, canonicity reduces to
+/// **exact consumption**, because a well-formed prefix followed by junk would
+/// otherwise be a second byte string for the same logical group.
+pub fn decode_group_contents(b: &[u8]) -> Result<Vec<RecipientBundle>, CodecError> {
+    let mut pos = 0usize;
+    let r = read_group_contents(b, &mut pos)?;
+    if pos != b.len() {
+        return Err(CodecError::TrailingBytes {
+            remaining: b.len() - pos,
+        });
+    }
+    Ok(r)
+}
+
+/// The commitments a group's contents describe, in D4's order (recipient-major,
+/// then per-output).
+pub fn contents_commitments(recipients: &[RecipientBundle]) -> Vec<[u8; CM_LEN]> {
+    recipients
+        .iter()
+        .flat_map(|r| r.entries.iter().map(|e| e.cm))
+        .collect()
+}
+
+// ---- full group (serving form) -----------------------------------------------
+
+/// Encode one per-tx compact group for the serving wire: `tx_index(varint) ‖
+/// contents`. No leading version byte — groups nest inside a versioned response.
+pub fn write_group(out: &mut Vec<u8>, g: &CompactGroup) {
+    write_varint(out, g.tx_index);
+    write_group_contents(out, &g.recipients);
+}
+
+pub fn read_group(b: &[u8], pos: &mut usize) -> Result<CompactGroup, CodecError> {
+    let tx_index = read_varint(b, pos)?;
+    let recipients = read_group_contents(b, pos)?;
     Ok(CompactGroup { tx_index, recipients })
 }
 
-/// Encode one group to its own buffer — the bytes a block body commits to
-/// (D2/D3) and the bytes `/v1/compact` serves for that transaction.
+/// Encode one group to its own buffer — the bytes `/v1/compact` serves.
 pub fn encode_group(g: &CompactGroup) -> Vec<u8> {
     let mut out = Vec::new();
     write_group(&mut out, g);
     out
 }
 
-/// Decode **exactly one** group from a whole buffer, rejecting trailing bytes.
-///
-/// This is the consensus entry point: `discovery-on-the-consensus-wire.md` §4
-/// rule 3 requires that the bytes "decode, decode canonically (D6), and
-/// re-encode to themselves". Canonicity of the one varint in the framing
-/// (`tx_index`) is [`read_varint`]'s job; **exact consumption** is this
-/// function's, because a group followed by junk is a second byte string for the
-/// same logical group.
-///
-/// Every other field in the framing is fixed-width (`n_recipients` u8, `ct`
-/// 1088 B, `n_outputs` u8, `cm` 32 B, `tag` 8 B) or single-valued (`clue_len`
-/// must be 0), so those admit exactly one encoding by construction.
+/// Decode **exactly one** serving-form group from a whole buffer, rejecting
+/// trailing bytes. `tx_index` canonicity is [`read_varint`]'s job (D6).
 pub fn decode_group(b: &[u8]) -> Result<CompactGroup, CodecError> {
     let mut pos = 0usize;
     let g = read_group(b, &mut pos)?;
@@ -344,6 +411,53 @@ mod tests {
         let g = sample_group();
         assert_eq!(g.commitments(), vec![[1u8; 32], [2u8; 32], [9u8; 32]]);
         assert_eq!(g.n_outputs(), 3);
+    }
+
+    #[test]
+    fn committed_contents_are_the_serving_group_minus_its_index_varint() {
+        // The projection property, as a byte identity rather than a claim:
+        // serving = varint(position) ‖ committed_bytes. Nothing is re-encoded.
+        let g = sample_group();
+        let committed = encode_group_contents(&g.recipients);
+        let mut served = Vec::new();
+        write_varint(&mut served, g.tx_index);
+        served.extend_from_slice(&committed);
+        assert_eq!(served, encode_group(&g));
+    }
+
+    #[test]
+    fn committed_contents_round_trip_and_contain_no_varint() {
+        let g = sample_group();
+        let bytes = encode_group_contents(&g.recipients);
+        let back = decode_group_contents(&bytes).expect("contents decode");
+        assert_eq!(encode_group_contents(&back), bytes, "re-encode is byte-identical");
+        assert_eq!(contents_commitments(&back), g.commitments());
+
+        // Every field is fixed-width or single-valued, so the length is a pure
+        // function of the shape — the arithmetic no varint could satisfy.
+        let expected = 1 // n_recipients
+            + 2 * (CT_LEN + 1) // two bundles: ct + n_outputs
+            + 3 * CompactEntry::LEN_EMPTY_CLUE; // three entries in total
+        assert_eq!(bytes.len(), expected);
+    }
+
+    #[test]
+    fn committed_contents_reject_trailing_and_truncation() {
+        let g = sample_group();
+        let good = encode_group_contents(&g.recipients);
+        let mut extra = good.clone();
+        extra.push(0x00);
+        assert!(matches!(
+            decode_group_contents(&extra),
+            Err(CodecError::TrailingBytes { remaining: 1 })
+        ));
+        assert!(matches!(
+            decode_group_contents(&good[..good.len() - 1]),
+            Err(CodecError::Truncated { .. })
+        ));
+        // The empty contents are one byte and nothing else decodes to them.
+        assert_eq!(encode_group_contents(&[]), vec![0x00]);
+        assert!(decode_group_contents(&[]).is_err());
     }
 
     #[test]

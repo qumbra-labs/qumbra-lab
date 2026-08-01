@@ -45,8 +45,10 @@
 //! lock** (D2): changing those bytes changes `BlockBody::commitment()`.
 
 pub use qlab_note::compact::{
-    decode_group, encode_group, group_len, groups_eq, read_bundle, read_entry, read_group,
-    read_varint, write_bundle, write_entry, write_group, write_varint, CodecError, CompactGroup,
+    contents_commitments, decode_group, decode_group_contents, encode_group,
+    encode_group_contents, group_len, groups_eq, read_bundle, read_entry, read_group,
+    read_group_contents, read_varint, write_bundle, write_entry, write_group,
+    write_group_contents, write_varint, CodecError, CompactGroup,
 };
 
 use crate::WIRE_VERSION;
