@@ -1097,8 +1097,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // is punishment-free: a peer that saw the evidence and this host did not still
         // disagree about who may sign. Agreement needs evidence in blocks (D1).
         let prest = node.punishment_restore().telemetry_field();
+        // Issue #200: `uex=` is **appended at the end**, after `prest=`, under the
+        // same rule as every addition since #87 — every pre-existing field keeps its
+        // name, position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified. **Touches TELEMETRY.**
+        //
+        // It is the unobtainable-body exemption latch: `1` when this node has been
+        // lagging with an outstanding, unserved body request for
+        // `UNOBTAINABLE_BODY_CADENCES` cadences and may therefore mine on its
+        // verified state tip; `0` otherwise. It exists because **a node mining
+        // while `slag>0` looks exactly like a broken duty gate**, and an operator
+        // needs one field that says "it was the exemption". Always printed, zero
+        // included (the #130 (a) rule).
+        let uex = u8::from(node.state_tip_mine_ready());
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1117,6 +1130,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             body_reqs,
             finality_backing,
             prest,
+            uex,
         )
     }
 
@@ -2096,9 +2110,10 @@ mod tests {
             line.contains(" prest=1/1"),
             "TELEMETRY must carry the restore report, not only the startup println: {line}"
         );
+        // Not `ends_with`: #200's `uex=` is the newest append after `prest=`.
         assert!(
-            line.ends_with(" prest=1/1"),
-            "prest is the newest append, last field: {line}"
+            line.contains(" prest=1/1 "),
+            "prest remains a mid-line field after #200: {line}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -3856,6 +3871,8 @@ mod tests {
                 "fback",
                 // ── appended by #133 D3, at the end ──
                 "prest",
+                // ── appended by #200, at the end ──
+                "uex",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -3876,14 +3893,13 @@ mod tests {
         assert!(line.contains(" breq=0 "), "nothing in flight: {line}");
         // #85: this node finalized genesis locally, so the newest append says the
         // tracker checkpoint is backed by its exact block in fork choice.
-        // Not `ends_with` any more: `prest=` (#133 D3) landed after this field and is
-        // now the tail. Both appends are correct — only one can be last, and it is the
-        // one that landed later. This assertion was `ends_with` when `fback=` WAS last.
+        // Not `ends_with` any more: later appends landed after this field.
         assert!(line.contains(" fback=local "), "backing verdict present: {line}");
-        // #133 D3: `prest=` is the newest append and is now the last field. A fresh
-        // data dir has nothing to restore — and the shape is restored/known, not a
-        // bare zero, so "nothing to restore" is distinguishable from "unk".
-        assert!(line.ends_with(" prest=0/0"), "nothing restored, last: {line}");
+        // #133 D3: `prest=` — a fresh data dir has nothing to restore.
+        // Not `ends_with`: #200's `uex=` is now the tail.
+        assert!(line.contains(" prest=0/0"), "nothing restored: {line}");
+        // #200: a healthy node is not under the unobtainable-body exemption.
+        assert!(line.ends_with(" uex=0"), "exemption disarmed, last: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
