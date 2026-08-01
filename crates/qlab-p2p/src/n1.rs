@@ -126,10 +126,41 @@ pub enum VotesOutcome {
     /// No new information — already tallied, already finalized, or out of the tally
     /// window. Do NOT relay, do NOT penalise.
     Stale,
-    /// The set carried a forged signature, an unknown signer index, or duplicate-
-    /// signer padding — penalise the sender (task-book S5). A well-formed partial set
-    /// (valid sigs, distinct in-committee signers, merely below quorum) is never this.
+    /// Intrinsic badness under this node's roster: duplicate-signer padding, or a
+    /// signature that fails against the key the claimed index **does** resolve to
+    /// (forged, or mis-attributed under a resolvable index). Penalise the sender
+    /// (task-book S5 / issue #164 criterion 3).
+    ///
+    /// **Not** an unknown signer index — that is [`Self::Unjudged`] (issue #164 /
+    /// the #134 Intrinsic·Positional split, one layer up). Index-resolves + verify
+    /// fails is always Intrinsic: the receiver has a key at that slot and the
+    /// signature is wrong for it. A prior over-broad arm treated "sig valid under
+    /// some other roster member" as positional; that swallowed the soak's forged-cp
+    /// (valid member-1 sig claimed as signer 0) and was rejected on PR #166.
     Invalid,
+    /// This node **cannot judge** the vote against its own roster (issue #164).
+    ///
+    /// **Only** when the claimed signer index is out of range for this node's
+    /// roster. The receiver has no key to check against, so the verdict depends on
+    /// the receiver's membership size — same rule [`IngestOutcome::Ignored`]
+    /// encodes for unjudged bodies (#134). Do NOT relay, do NOT penalise.
+    ///
+    /// A mid-index reseal mismatch (index in range, different key at that slot)
+    /// is **not** this case — it is [`Self::Invalid`]. Evidence-on-chain is the
+    /// real agreement fix for divergent rosters; this variant only stops scoring
+    /// votes this node literally cannot address.
+    Unjudged,
+}
+
+impl VotesOutcome {
+    /// Whether the **sender** is at fault and should be penalized.
+    ///
+    /// Only [`Self::Invalid`]. [`Self::Unjudged`] is deliberately not a fault: the
+    /// receiver's roster cannot resolve the claimed index, and charging for that
+    /// bans peers whose membership simply differs (issue #164).
+    pub fn is_peer_fault(&self) -> bool {
+        matches!(self, VotesOutcome::Invalid)
+    }
 }
 
 /// Read-only view of the chain — the primitives sync/relay/serving need.
@@ -223,6 +254,8 @@ pub trait CheckpointIngest {
             }
             VotesOutcome::Stale => IngestOutcome::Duplicate,
             VotesOutcome::Invalid => IngestOutcome::Rejected("invalid vote"),
+            // Same statement as #134's unjudged body: refuse, do not charge.
+            VotesOutcome::Unjudged => IngestOutcome::Ignored("unjudged vote: roster cannot resolve"),
         }
     }
 
@@ -422,9 +455,17 @@ impl CheckpointIngest for StubNode {
         let tip = self.chain.tip_height();
 
         // Verify + active-filter against THIS height's epoch roster (frozen §4:
-        // tombstoned/jailed excluded BEFORE the count; forged/unknown/dup penalised).
-        // `committee` is cloned so the immutable borrow of `self.committee` ends before
-        // the mutable finalization ops.
+        // tombstoned/jailed excluded BEFORE the count). Issue #164 splits the old
+        // catch-all `Invalid`:
+        //
+        // - index out of range for this roster → `Unjudged` (positional)
+        // - index resolves, signature fails against that key → `Invalid` (forged)
+        // - duplicate-signer padding → `Invalid`
+        //
+        // The boundary is the first check only. A prior arm also unjudged
+        // "verify fails but some other member signed" — that was over-broad and
+        // swallowed forged-cp (n7soak S2). `committee` is cloned so the immutable
+        // borrow of `self.committee` ends before the mutable finalization ops.
         let (committee, quorum, active_kept) = {
             let cstate = self.committee.state_for_height(cp.height);
             let committee = cstate.committee().clone();
@@ -432,13 +473,13 @@ impl CheckpointIngest for StubNode {
             let mut active_kept: Vec<Vote> = Vec::new();
             for v in votes {
                 if committee.member(v.signer).is_none() {
-                    return VotesOutcome::Invalid; // unknown signer index
+                    return VotesOutcome::Unjudged; // index does not resolve under my roster
                 }
                 if !seen_signer.insert(v.signer) {
                     return VotesOutcome::Invalid; // duplicate-signer padding
                 }
                 if !committee.verify_vote(cp, v) {
-                    return VotesOutcome::Invalid; // forged signature
+                    return VotesOutcome::Invalid; // index resolved; signature fails → forged
                 }
                 if cstate.is_active(v.signer, cp.height) {
                     active_kept.push(v.clone());

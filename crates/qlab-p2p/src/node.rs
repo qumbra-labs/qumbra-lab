@@ -435,7 +435,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                     self.store_and_announce_finalized(cp, accumulated, None);
                 }
             }
-            VotesOutcome::Stale | VotesOutcome::Invalid => {}
+            // Stale / Invalid / Unjudged: nothing to relay from our own announce.
+            VotesOutcome::Stale | VotesOutcome::Invalid | VotesOutcome::Unjudged => {}
         }
     }
 
@@ -782,8 +783,13 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 }
             }
             VotesOutcome::Stale => {} // already known / finalized — no relay, no penalty
-            VotesOutcome::Invalid => {
-                self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+            // Issue #164: only Intrinsic failures cost the sender. `Unjudged` is
+            // out-of-range only (positional); index-resolves + verify-fail is
+            // Invalid. One predicate so scoring cannot drift from classification.
+            other => {
+                if other.is_peer_fault() {
+                    self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+                }
             }
         }
     }
@@ -1442,8 +1448,9 @@ mod tests {
         }
     }
 
-    /// ACCEPTANCE #4 (wire half) — a `CheckpointVotes` frame carrying a forged vote is
-    /// penalised over the wire (a valid signature attributed to the wrong signer).
+    /// ACCEPTANCE #4 (wire half) — a `CheckpointVotes` frame carrying a forge with
+    /// a **resolvable** index is penalised over the wire (issue #164 criterion 3 /
+    /// n7soak S2 forged-cp shape: valid member-1 sig claimed as signer 0).
     #[test]
     fn forged_votes_penalised_over_the_wire() {
         let (committee, validators) = devnet_committee(21);
@@ -1451,8 +1458,12 @@ mod tests {
         run(&mut nodes);
 
         let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
-        // Valid signature by validator 1, attributed to signer 0 → does not verify.
-        let forged = Vote { signer: 0, signature: validators[1].sign_checkpoint(&cp).signature };
+        // Soak shape: in-roster signature under the wrong claimed index.
+        // Index resolves; verify fails → Invalid → penalise.
+        let forged = Vote {
+            signer: 0,
+            signature: validators[1].sign_checkpoint(&cp).signature,
+        };
         let frame =
             Envelope::new(MsgType::CheckpointVotes, encode_checkpoint_votes(&cp, &[forged])).encode();
         // Node 0 (PeerId 1) injects the forged frame to node 1 (PeerId 2).
