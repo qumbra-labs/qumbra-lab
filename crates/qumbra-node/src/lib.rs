@@ -9,6 +9,9 @@
 //!   v1.0 constant table + committee₀ verifying keys + the genesis block, plus
 //!   `genesis init` tooling. Every node loads and byte-verifies the same file
 //!   (the genesis hash is printed and asserted; a wrong hash refuses startup).
+//! - [`discovery_server`] — `GET /v1/compact`, the note-discovery endpoint a
+//!   recipient finds its outputs on (issue #188 baton 2). **On by default**,
+//!   bound to loopback; serving the committed body bytes, never a side table.
 //! - [`params_audit`] — the params_devnet-vs-FROZEN-v1.0 convergence audit
 //!   (the docs/ table's data, test-locked here).
 //! - [`run`] — composes the N7 stack over the REAL TCP transport + RandomXPow +
@@ -23,6 +26,7 @@
 //! N7 stack has always exposed; T0-4 just makes the real verifier the default.
 
 pub mod config;
+pub mod discovery_server;
 pub mod genesis;
 pub mod metrics_server;
 pub mod params_audit;

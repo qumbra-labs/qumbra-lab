@@ -47,13 +47,22 @@ fn real_tx(ek: &Ek, k: usize, nf_seed: u8, anchor: Hash32, rng: &mut StdRng) -> 
     let enc: EncryptedOutputs = encrypt_to_recipient(ek, &notes, rng);
     let commitments: Vec<Hash32> = enc.bundle.entries.iter().map(|e| e.cm).collect();
     let nullifiers: Vec<Hash32> = (0..k).map(|i| [nf_seed.wrapping_add(i as u8); 32]).collect();
-    let tx = TxEntry::with_placeholder_discovery(b"real-m3-proof-placeholder".to_vec(), TxPublic {
-        anchor,
-        nullifiers,
-        commitments,
-        bucket: ArityBucket::TwoByTwo,
-        fee: posted_fee(ArityBucket::TwoByTwo),
-        });
+    // The transaction **commits** to the real bundle (issue #188 baton 2). It used
+    // to carry `with_placeholder_discovery` — an all-zero ML-KEM ciphertext — while
+    // the real bundle went only into the side table, which is exactly the split
+    // this baton removed: the tx a peer relays and the bytes a wallet scans are one
+    // artifact now, so a fixture cannot have two.
+    let tx = TxEntry::new(
+        b"real-m3-proof-placeholder".to_vec(),
+        TxPublic {
+            anchor,
+            nullifiers,
+            commitments,
+            bucket: ArityBucket::TwoByTwo,
+            fee: posted_fee(ArityBucket::TwoByTwo),
+        },
+        &[enc.bundle.clone()],
+    );
     let discovery = TxDiscovery {
         recipients: vec![RecipientDiscovery { bundle: enc.bundle, payloads: enc.payloads }],
     };

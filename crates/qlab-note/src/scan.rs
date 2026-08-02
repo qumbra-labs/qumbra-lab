@@ -85,6 +85,39 @@ pub fn encrypt_to_recipient<R: CryptoRng>(
     }
 }
 
+/// **Detection alone** — which of `bundle`'s outputs are addressed to `dk`, by
+/// output index. One decapsulation, then the tag comparison, and nothing else.
+///
+/// ## Why this is a public primitive since issue #188 baton 2
+///
+/// Under `discovery-on-the-consensus-wire.md` the compact bundle — the shared
+/// ML-KEM ct and the per-output `cm ‖ tag` — is **committed to the block body**,
+/// while the AEAD payload [`scan`] needs is not. So *detecting* a payment is
+/// answerable from chain data alone, and *opening* it is not, and the two stopped
+/// being one operation on the day the first half moved onto the consensus wire.
+///
+/// This is what a wallet runs against a node's `/v1/compact`: it locates the
+/// outputs paid to it without asking anybody for a payload, and therefore without
+/// a server being in a position to hide one. Before this it existed only as a
+/// private helper inside `qlab-cbserver`'s reference *client*, which is the wrong
+/// home for the one operation the chain now guarantees.
+///
+/// **A match is a detection, not an authentication.** The tag's false-positive
+/// rate is 2^-64 and a tag is not a signature; the authenticity check is
+/// [`scan`]'s (FO inside `decapsulate`, plus the AEAD tag, plus — under
+/// [`ScanMode::FoSkip`] — the commitment recompute). A caller that treats a
+/// detection as a received note has skipped that.
+pub fn detect_matches(dk: &Dk, bundle: &RecipientBundle) -> Vec<usize> {
+    let k = decapsulate(dk, &bundle.ct);
+    bundle
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| detection_tag(&k, &digest_from_bytes(&e.cm)) == e.tag)
+        .map(|(i, _)| i)
+        .collect()
+}
+
 /// FoSkip authenticity gate: does the note recovered from the payload recompute
 /// to the `cm` stored on the wire? This is the "recompute the note commitment"
 /// check that replaces the FO re-encryption at scan time.

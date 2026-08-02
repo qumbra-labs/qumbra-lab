@@ -40,3 +40,23 @@ mining = true
 # blocks, but their coinbase notes are paid to a fixed placeholder key that nobody
 # holds a spend key for. The node says so loudly at startup when mining = true.
 # miner_rkm = "0000000000000000000000000000000000000000000000000000000000000000"
+
+# ── note-discovery serving (issue #188) ──────────────────────────────────────
+#
+# ⚠️  This is the ONE listener whose default is ON. Omitting the key does not
+# turn it off; it binds 127.0.0.1:9420 and serves GET /v1/compact?from=&to= —
+# the committed note-discovery groups out of the block bodies this node holds.
+#
+# Why on, when metrics_addr and telemetry_addr are off unless asked for: those
+# two are off because setting them OPENS A PORT, and a loopback default opens
+# nothing an off-host attacker can reach. A recipient cannot find an output paid
+# to them on a node that serves nothing, so an opt-in most operators leave off is
+# a chain that commits discovery correctly and hands it to nobody.
+#
+# So: serving is the default, EXPOSURE is your act. Set a non-loopback address
+# only together with a SOURCE-RESTRICTED inbound firewall rule.
+# discovery_addr = "0.0.0.0:9420"
+#
+# To serve nothing at all — and be told at startup that recipients cannot find
+# their outputs here — say so explicitly:
+# discovery_addr = "off"
