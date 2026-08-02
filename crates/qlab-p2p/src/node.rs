@@ -161,21 +161,32 @@ pub const CHECKPOINT_QUERY_INTERVAL_MS: u64 = 5_000;
 pub const MAX_CHECKPOINT_QUERIES_IN_FLIGHT: usize = 1;
 
 /// **How far this node's own chain must run past a checkpoint slot it has not
-/// finalized before it asks the net about it** (issue #204), in cadences.
+/// finalized before it asks the net about it** (issue #204), in blocks.
 ///
 /// The hysteresis is chain-derived rather than a wall-clock grace period — #106's
-/// preference, and for the same reason: a wall clock has no anchor a cold or
-/// wedged node can trust. One full cadence means the ordinary path (sign → push →
-/// accumulate → quorum) has had an entire slot's worth of chain to deliver and did
-/// not, which on a healthy net never happens: the quorum forms within seconds of
-/// the slot height, long before the next slot's blocks are mined.
+/// preference, and for the same reason: a wall clock has no anchor a lagging or
+/// wedged node can trust, and this is the one path such a node is on.
 ///
-/// `1` is deliberately the smallest value that is not zero. At zero the query
-/// would fire on every node between "tip crossed the slot" and "the votes
-/// converged", i.e. constantly, on a perfectly healthy net.
+/// **One block, and the value is doing real work at both ends.** At zero the query
+/// would fire the instant the tip reached a slot — i.e. on every node, at every
+/// slot, racing the ordinary sign → push → accumulate path for something it is
+/// about to be handed anyway. At one, the chain has produced a *whole further
+/// block* (75 s at the T0 target, against a quorum that converges in seconds) and
+/// the slot is still not finalized, which on a healthy net does not happen.
+///
+/// A larger value was tried and rejected: at one full cadence the hysteresis does
+/// not cover **the incident's own state** — node1's preserved `snapshot.bin` has
+/// `applied_height = 1057` against slot 1056, which is exactly one block past the
+/// slot. A trigger that cannot see the artifact this issue was filed from is the
+/// wrong trigger.
+///
+/// A false positive costs ~45 B out and a `NotFound` back, because a peer with
+/// nothing above our head has nothing to send; the ~70 KB answer only happens when
+/// the peer holds a checkpoint we do not, which is the query working. The expensive
+/// case is the useful case.
 ///
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
-pub const CHECKPOINT_QUERY_LAG_CADENCES: u64 = 1;
+pub const CHECKPOINT_QUERY_LAG_BLOCKS: u64 = 1;
 
 /// One cached body: the ordered txs, the coinbase counter and the payout key —
 /// all three are needed to rebuild the *exact* body (issue #101) — plus the
@@ -835,9 +846,9 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// [`next_checkpoint_height`] is the first cadence slot strictly above the
     /// finalized head and at or below the tip: exactly "a slot my chain has passed
     /// that my finalized pointer has not". The hysteresis
-    /// ([`CHECKPOINT_QUERY_LAG_CADENCES`]) is what keeps a healthy node silent —
-    /// tip crossing a slot before its votes converge is ordinary, tip running a
-    /// whole further cadence past it is not.
+    /// ([`CHECKPOINT_QUERY_LAG_BLOCKS`]) is what keeps a healthy node silent —
+    /// reaching a slot before its votes converge is ordinary, mining a whole
+    /// further block past it without finalizing it is not.
     ///
     /// The returned height is the **tip**, not the slot: the query asks for the
     /// highest finalized checkpoint at or below it, so one round trip moves this
@@ -857,8 +868,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         let tip = self.node.tip_height();
         let next =
             next_checkpoint_height(self.node.finalized_height(), tip, CHECKPOINT_CADENCE_BLOCKS)?;
-        let lag = CHECKPOINT_QUERY_LAG_CADENCES.saturating_mul(CHECKPOINT_CADENCE_BLOCKS);
-        if tip < next.saturating_add(lag) {
+        if tip < next.saturating_add(CHECKPOINT_QUERY_LAG_BLOCKS) {
             return None;
         }
         Some(tip)
