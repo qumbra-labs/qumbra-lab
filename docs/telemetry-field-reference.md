@@ -28,7 +28,7 @@ The line is emitted to stdout every `TELEMETRY_REFRESH` interval by
 order is the `format!` at `run.rs:996`:
 
 ```
-TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= prest= bdrop=
+TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= prest= uex= bdrop= unk=<n>/<n>
 ```
 
 ⚠️ **That is the field list, not a capture.** The only values quoted in this
@@ -98,19 +98,26 @@ Five rules that hold for the whole line:
 | 26 | `breq` | historical block-body requests in flight | 🟡 not alone |
 | 27 | `fback` | ⛔ **not documented here** — appended 2026-08-01 by `issue #85` | — |
 | 28 | `prest` | committee punishments restored at process start | 🟡 not alone |
-| 29 | `bdrop` | `<total>@<height>` — bodies the state machine refused, and where | 🟡 not alone — **read the height against `stip=`** |
+| 29 | `uex` | ⛔ **not documented here** — appended 2026-08-01 by `issue #200` | — |
+| 30 | `bdrop` | `<total>@<height>` — bodies the state machine refused, and where | 🟡 not alone — **read the height against `stip=`** |
+| 31 | `unk` | `<frames>/<inv items>` this build does not implement | 🟡 not alone — see §31 |
 
-⚠️ **One field on the line still has no row here: `fback=`.** It is named above
+⚠️ **Two fields on the line still have no section here: `fback=` and `uex=`.** It is named above
 rather than omitted so that an operator meeting it cold knows it is
 *undocumented*, not *unknown to this project* — the exact distinction the `rback=`
 failure at the top of this document cost two reports to learn.
 
-⚠️ **And the numbering above was off by one until now**, which matters more than
-it sounds for a document whose first rule is that the line is positional: `fback=`
-sits between `breq=` and `prest=` on the real line, so the rows previously
-numbered 26/27 (`breq`/`prest`) were 26 and **28**. Corrected here as a
-precondition for adding row 29 — a positional reference with a hole in it points
-every row after the hole at the wrong field.
+⚠️ **The numbering above has now been off by one twice, from the same cause — and the
+second time was introduced by the correction of the first.** `#130 (b)` corrected an
+off-by-one caused by `fback=` having no row, writing *"a positional reference with a hole
+in it points every row after the hole at the wrong field"* — and in the same edit numbered
+`bdrop=` **29**, which is wrong, because `uex=` (`issue #200`) sits between `prest=` and
+`bdrop=` on the real line and also had no row. `bdrop=` is **30**.
+
+**Corrected here by giving every field on the line a row, undocumented ones included** —
+a hole is what breaks this index, so the fix is to have none rather than to renumber
+around them. The order is checked against the format string in `qumbra-node/src/run.rs`,
+which is the authority: `breq fback prest uex bdrop unk`.
 
 ---
 
@@ -1189,7 +1196,7 @@ not an operator action on one host.
 expects `prest=1/1` after restart),
 `a_non_witness_finalizes_a_checkpoint_the_restarted_witness_refuses`
 (`adapter.rs` — the two-node same-height divergence the local ledger cannot close).
-## 29. `bdrop` — bodies the state machine refused, and where
+## 30. `bdrop` — bodies the state machine refused, and where
 
 **🟡 Not an alarm on its own. Read the height against `stip=`.**
 
@@ -1251,6 +1258,68 @@ and `i130b_a_held_body_that_does_not_extend_the_applied_tip_never_reaches_apply_
 (`qlab-node/src/metrics.rs`),
 `bdrop_renders_the_count_and_the_height_of_the_last_refusal` (`run.rs`).
 
+## 31. `unk` — frames and inventory items this build does not implement
+
+**🟡 Not an alarm alone — and the reading depends entirely on whether an upgrade
+is in flight.** It is the version-skew instrument, added by `issue #181` in the
+same change that stopped an unrecognised frame from banning its sender.
+
+**What it counts.** `unk=<frames>/<inv items>`, both cumulative **since process
+start** (a restart resets them), over traffic that survived the inbound rate
+limiter:
+
+- **left** — inbound frames whose *envelope type code* this build does not
+  implement. Ignored, never scored;
+- **right** — *inventory items* whose kind code this build does not implement,
+  over every `inv` / `getdata` / `notfound` received. Skipped, never scored.
+
+Neither number is ever a scoring input. **A peer that appears here has not
+misbehaved — it is running a newer build than this host.** Before `#181` such a
+frame was charged `PENALTY_MALFORMED` (100) against a `BAN_THRESHOLD` of −100,
+i.e. an instant ban on the first frame, which is why no baton has been able to
+add a message type since.
+
+**Normal value.** `unk=0/0` on a net where every host runs the same image.
+
+**What a change means.**
+
+| reading | means |
+|---|---|
+| `0/0` | no skew seen |
+| left climbing **during a rolling upgrade** | ✅ expected — this host is older than the one already rolled, and it is coping. It is the *confirmation* that the roll is in progress, not a problem |
+| left climbing with **no upgrade in flight** | 🟡 report it. Either a host is running an image nobody recorded, or something is speaking the magic and the version but not the protocol |
+| left **stops** climbing after a roll completes | ✅ the skew closed |
+| right climbing | the same thing one layer in — a peer is offering an inventory kind this build has no code for |
+
+🔴 **The sequencing this field exists to make visible, and it is the whole point
+of `#181`: the fix only helps for versions AFTER it lands.** Every host must be
+running the `#181` image before any new `MsgType` or `InvKind` may be introduced.
+A host that predates it still bans on the first unknown frame — and it will not
+print `unk=` at all, because it does not have the field. **An absent `unk=` is
+therefore itself a reading: that host is not yet safe to send a new type to.**
+
+⚠️ **`unk` does not cover a `PROTOCOL_VERSION` bump.** A frame at a version this
+build does not speak is still scored as malformed and still bans on the first
+frame. `#181` deliberately did not move that (a version bump is a wire break, not
+an additive change) and recorded it as open. Do not read `unk=0/0` as "any wire
+change is safe to roll".
+
+**On `/metrics`** as `qumbra_unknown_msg_type_total` and
+`qumbra_unknown_inv_kind_total`, the same two numbers. There is also a `WIRE`
+journal line naming each distinct unknown type code the **first** time it is
+seen (`WIRE event=unknown_type type=0x0044 … action=ignored scored=no`), capped
+at 8 distinct codes per process so it cannot itself be flooded — the count keeps
+going after that, only the narration stops.
+
+**Escalate when:** never from this field alone. Report a climbing left-hand
+number when no upgrade is in flight.
+
+**Locked by:** `an_unknown_envelope_type_is_ignored_and_never_scored` and
+`a_malformed_body_under_a_known_type_is_still_penalised`
+(`crates/qlab-p2p/src/node.rs`),
+`an_unknown_envelope_type_over_tcp_is_ignored_and_reported_on_both_surfaces`
+(`crates/qumbra-node/src/run.rs`).
+
 ---
 
 ## Appendix A — the two-minute triage
@@ -1280,6 +1349,13 @@ cumulative since **process** start.
 - **`peers=`** — open, `issue #172`. See §6.
 - **Whether `mready` should read `slag`** — open, `issue #162` observation 1. See
   §25.
+- **`breq=` and `fback=`** — both landed after this document was written and
+  neither has a section here. They are named in the glance table so the "in the
+  order the line prints them" claim stays true, and nothing more. Do not infer
+  their semantics from their names.
+- **What a node should do with a `PROTOCOL_VERSION` it does not speak** — open,
+  reported by `issue #181`, which fixed the message-type case and deliberately
+  left this one. See §26.
 - **Any absolute threshold for "too long in `Degraded`"** — there is no measured
   basis for one, and inventing a number here would be exactly the kind of figure
   this project has been bitten by. The runbook owns the procedure.
@@ -1294,5 +1370,5 @@ rendering) · `crates/qlab-node/src/round.rs` (the round ledger) ·
 `crates/qlab-p2p/src/addrman.rs` (the address book) ·
 `crates/qlab-devnet/src/params_devnet.rs` (the frozen constants).
 
-Issues cited: #73 #74 #83 #84 #87 #104 #105 #106 #107 #117 #121 #130 #133 #134 #162
-#164 #165 #167 #169 #172 #173 #183. PRs cited: #72 #93 #110 #119 #153 #159 #168 #171.
+Issues cited: #73 #74 #83 #84 #85 #87 #104 #105 #106 #107 #117 #121 #130 #133 #134 #162 #164 #165 #167 #169 #172 #173 #181 #183.
+PRs cited: #72 #93 #110 #119 #153 #159 #168 #171.

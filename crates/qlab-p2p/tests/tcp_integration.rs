@@ -120,7 +120,7 @@ fn collect(t: &TcpTransport, want: qlab_p2p::MsgType) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     for _ in 0..100 {
         for (_, f) in t.poll() {
-            if qlab_p2p::Envelope::decode(&f).map(|e| e.msg_type == want).unwrap_or(false) {
+            if qlab_p2p::Frame::decode(&f).map(|fr| fr.msg_type() == Some(want)).unwrap_or(false) {
                 out.push(f);
             }
         }

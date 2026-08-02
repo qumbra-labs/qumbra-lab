@@ -31,7 +31,7 @@ use qlab_p2p::n1::{BlockIngest, ChainView, IngestOutcome};
 use qlab_p2p::node::MAX_BODIES_IN_FLIGHT;
 use qlab_p2p::peer::PeerId;
 use qlab_p2p::transport::{InProcHub, InProcTransport, Transport};
-use qlab_p2p::wire::{Envelope, MsgType};
+use qlab_p2p::wire::{Envelope, Frame, MsgType};
 use qlab_p2p::P2pNode;
 
 /// Same shape as the adapter's own test verifier: only a tx marked `ok` verifies.
@@ -610,7 +610,8 @@ fn a_served_block_uses_the_existing_announce_codec_and_no_new_msg_type() {
         }],
     };
     let frame = Envelope::new(MsgType::BlockAnnounce, encode_announce(&ann)).encode();
-    let back = Envelope::decode(&frame).expect("a type every deployed node knows");
+    let back = Frame::decode(&frame).expect("well-formed framing");
+    let back = back.known().expect("a type every deployed node knows");
     assert_eq!(back.msg_type, MsgType::BlockAnnounce);
     assert_eq!(back.msg_type.as_u16(), 0x0041, "no new envelope code was allocated");
 }
@@ -654,7 +655,7 @@ fn a_getdata_asking_for_more_bodies_than_the_cap_gets_headers_for_the_remainder(
 
     let (mut bodies, mut headers, mut not_found) = (0, 0, 0);
     for (_, raw) in client.transport().poll() {
-        match Envelope::decode(&raw).expect("well-formed").msg_type {
+        match Frame::decode(&raw).expect("well-formed").msg_type().expect("a known type") {
             MsgType::BlockAnnounce => bodies += 1,
             MsgType::Header => headers += 1,
             MsgType::NotFound => not_found += 1,

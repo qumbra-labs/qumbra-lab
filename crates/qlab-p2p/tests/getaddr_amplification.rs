@@ -31,7 +31,7 @@ use qlab_p2p::n1::StubNode;
 use qlab_p2p::peer::PeerId;
 use qlab_p2p::ratelimit::{RateLimits, GETADDR_SERVE_INTERVAL_MS};
 use qlab_p2p::transport::{InProcHub, InProcTransport, Transport};
-use qlab_p2p::wire::{Envelope, MsgType, HEADER_LEN};
+use qlab_p2p::wire::{Envelope, Frame, MsgType, HEADER_LEN};
 use qlab_p2p::P2pNode;
 
 fn stub() -> StubNode {
@@ -111,7 +111,7 @@ fn flood(victim_addrs: &[String], requests: usize, gap_ms: u64, limits: RateLimi
         victim.tick(i as u64 * gap_ms);
         for (_, f) in attacker.poll() {
             bytes_out += f.len();
-            if Envelope::decode(&f).map(|e| e.msg_type == MsgType::Addr).unwrap_or(false) {
+            if Frame::decode(&f).map(|fr| fr.msg_type() == Some(MsgType::Addr)).unwrap_or(false) {
                 replies += 1;
             }
         }

@@ -39,9 +39,14 @@ pub enum DecodeError {
     /// A block-header reserved-slot tag byte was not its frozen value.
     BadHeaderTag { pos: usize, got: u8 },
     /// An arity-bucket discriminant was not 0/1/2 (reject-unknown).
+    ///
+    /// **Deliberately still an error**, and NOT the [`InvKind`] case issue #181
+    /// changed: an `ArityBucket` is a *consensus* value (it selects the proof
+    /// shape and the fee schedule), so a transaction naming one this build does
+    /// not implement is a transaction this build cannot validate. Skipping it
+    /// would mean relaying an object we never judged. An inventory kind is only
+    /// an offer of something to fetch, and declining the offer costs nothing.
     BadBucket { got: u8 },
-    /// An inventory-kind discriminant was not 1/2/3 (reject-unknown).
-    BadInvKind { got: u8 },
     /// The ML-DSA signature bytes did not decode to a valid signature.
     BadSignature,
 }
@@ -359,7 +364,16 @@ pub fn tx_id(tx: &TxEntry) -> Hash32 {
 // Inventory (inv / getdata / notfound)
 // --------------------------------------------------------------------------
 
-/// The kind of an inventory item. Reject-unknown on decode.
+/// The kind of an inventory item.
+///
+/// **An unrecognised kind is skipped, not rejected** (issue #181) — see
+/// [`InvVec`]. It is [`crate::wire::Frame::UnknownType`]'s problem one layer in:
+/// a kind code this build does not implement means the *sender* implements one
+/// this build does not, which is version skew and not misbehaviour. Before #181
+/// it was `DecodeError::BadInvKind`, every `decode_inv` caller charged
+/// `PENALTY_MALFORMED` for a decode failure, and a single `inv` naming a newer
+/// kind therefore banned its sender — which is what stopped `issue #133` D2 from
+/// allocating `InvKind::Evidence`.
 ///
 /// `CheckpointVotes = 4` is reserved by the coordinator (task-book S3) for an
 /// inv/getdata vote-set path; M10-T0-5 relays partial vote sets by **direct push**
@@ -374,14 +388,38 @@ pub enum InvKind {
 }
 
 impl InvKind {
-    fn from_u8(v: u8) -> Result<Self, DecodeError> {
-        match v {
-            1 => Ok(InvKind::Tx),
-            2 => Ok(InvKind::Block),
-            3 => Ok(InvKind::Checkpoint),
-            got => Err(DecodeError::BadInvKind { got }),
-        }
+    /// Decode a raw kind code, or `None` for one this build does not implement.
+    /// Mirrors [`crate::wire::MsgType::from_u16`] deliberately: same question,
+    /// same answer shape, so the two cannot drift into different policies.
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            1 => InvKind::Tx,
+            2 => InvKind::Block,
+            3 => InvKind::Checkpoint,
+            _ => return None,
+        })
     }
+}
+
+/// A decoded inventory vector: the items this build can act on, plus **how many
+/// it skipped because their kind code is newer than this build** (issue #181).
+///
+/// The skipped count is carried out of the codec rather than swallowed here for
+/// the same reason [`crate::wire::Frame::UnknownType`] carries its type code: a
+/// silent ignore is how the next version-skew incident becomes invisible. It is a
+/// count and never a verdict — no caller may score it.
+///
+/// Skipping is safe *because the item is fixed-width*: `kind(1) ‖ id(32)`. The
+/// reader steps past an unknown kind exactly as far as it steps past a known one,
+/// so the rest of the vector still parses and reject-trailing still binds. That
+/// is not true of a variable-length unknown, which is why this treatment does not
+/// generalise to, say, an unknown [`ArityBucket`] inside a transaction body.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InvVec {
+    /// Items whose kind this build implements, in wire order.
+    pub items: Vec<InvItem>,
+    /// Well-formed items whose kind code this build does not implement.
+    pub unknown_kinds: usize,
 }
 
 /// A `(kind, id)` inventory item — the unit of inv / getdata / notfound.
@@ -402,18 +440,27 @@ pub fn encode_inv(items: &[InvItem]) -> Vec<u8> {
     out
 }
 
-/// Decode an inventory vector.
-pub fn decode_inv(buf: &[u8]) -> Result<Vec<InvItem>, DecodeError> {
+/// Decode an inventory vector, skipping items whose kind this build does not
+/// implement (issue #181 — see [`InvVec`]).
+///
+/// Truncation, a malformed varint and trailing bytes are still `Err`, and still
+/// the sender's fault. The **only** thing that moved is the kind code.
+pub fn decode_inv(buf: &[u8]) -> Result<InvVec, DecodeError> {
     let mut r = Reader::new(buf);
     let n = r.varint()? as usize;
-    let mut items = Vec::with_capacity(n);
+    let mut out = InvVec::default();
     for _ in 0..n {
-        let kind = InvKind::from_u8(r.u8("inv.kind")?)?;
+        // The id is read either way: the item is fixed-width, so an unknown kind
+        // is stepped over rather than desyncing the rest of the vector.
+        let kind = InvKind::from_u8(r.u8("inv.kind")?);
         let id = r.hash32("inv.id")?;
-        items.push(InvItem { kind, id });
+        match kind {
+            Some(kind) => out.items.push(InvItem { kind, id }),
+            None => out.unknown_kinds += 1,
+        }
     }
     r.finish()?;
-    Ok(items)
+    Ok(out)
 }
 
 // --------------------------------------------------------------------------
@@ -689,18 +736,75 @@ mod tests {
     }
 
     #[test]
-    fn inv_round_trips_and_rejects_unknown_kind() {
+    fn inv_round_trips() {
         let items = vec![
             InvItem { kind: InvKind::Tx, id: [1; 32] },
             InvItem { kind: InvKind::Block, id: [2; 32] },
             InvItem { kind: InvKind::Checkpoint, id: [3; 32] },
         ];
         let bytes = encode_inv(&items);
-        assert_eq!(decode_inv(&bytes).unwrap(), items);
+        let got = decode_inv(&bytes).unwrap();
+        assert_eq!(got.items, items);
+        assert_eq!(got.unknown_kinds, 0);
+    }
 
+    /// 🔴 **Issue #181, the [`InvKind`] half.** An unknown kind is skipped and
+    /// counted; the known items around it still decode. This used to be
+    /// `Err(BadInvKind)`, which every caller charged `PENALTY_MALFORMED` for.
+    ///
+    /// The middle item is the one clobbered on purpose: skipping it must not
+    /// desync the reader, or the third item would decode as garbage.
+    #[test]
+    fn inv_skips_an_unknown_kind_and_keeps_the_rest() {
+        let items = vec![
+            InvItem { kind: InvKind::Tx, id: [1; 32] },
+            InvItem { kind: InvKind::Block, id: [2; 32] },
+            InvItem { kind: InvKind::Checkpoint, id: [3; 32] },
+        ];
         let mut bad = encode_inv(&items);
-        bad[1] = 0xFF; // first item's kind byte
-        assert_eq!(decode_inv(&bad), Err(DecodeError::BadInvKind { got: 0xFF }));
+        // varint(3) is one byte, then item i starts at 1 + i*33.
+        bad[1 + 33] = 0x04; // the reserved-but-unallocated CheckpointVotes code
+        assert!(InvKind::from_u8(0x04).is_none(), "code 4 really is unallocated");
+        let got = decode_inv(&bad).unwrap();
+        assert_eq!(got.unknown_kinds, 1);
+        assert_eq!(
+            got.items,
+            vec![items[0], items[2]],
+            "the reader stepped over the unknown item without losing its place"
+        );
+
+        // A vector of nothing but unknown kinds decodes to nothing, and is still
+        // not an error — the whole message is one newer peer's offer we decline.
+        let mut all_unknown = encode_inv(&items);
+        for i in 0..3 {
+            all_unknown[1 + i * 33] = 0xFF;
+        }
+        let got = decode_inv(&all_unknown).unwrap();
+        assert!(got.items.is_empty());
+        assert_eq!(got.unknown_kinds, 3);
+    }
+
+    /// The complement, and the reason the fix is a distinction rather than a
+    /// widening: an inv that is genuinely **malformed** is still `Err`.
+    #[test]
+    fn inv_still_rejects_malformed_bytes() {
+        let items = vec![InvItem { kind: InvKind::Tx, id: [1; 32] }];
+        let bytes = encode_inv(&items);
+
+        let mut trailing = bytes.clone();
+        trailing.push(0x00);
+        assert!(matches!(decode_inv(&trailing), Err(DecodeError::Trailing { .. })));
+
+        assert!(
+            matches!(decode_inv(&bytes[..bytes.len() - 1]), Err(DecodeError::Truncated { .. })),
+            "a truncated id is garbage, not version skew"
+        );
+
+        // A count that outruns the body: the same, even though every kind byte
+        // present is fine.
+        let mut over = bytes.clone();
+        over[0] = 0x02;
+        assert!(matches!(decode_inv(&over), Err(DecodeError::Truncated { .. })));
     }
 
     #[test]

@@ -23,7 +23,7 @@
 `TELEMETRY_REFRESH` 输出到 stdout。字段顺序就是 `run.rs:996` 那个 `format!`：
 
 ```
-TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= prest= bdrop=
+TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= prest= uex= bdrop= unk=<n>/<n>
 ```
 
 ⚠️ **上面是字段清单，不是一次采样。** 本文中作为「实测」引用的数值，只有标注了具体
@@ -87,16 +87,22 @@ issue 或证据包出处的那些；其余全部由源码推导。拼一条「�
 | 26 | `breq` | 当前在途的历史区块体请求数 | 🟡 不单独 |
 | 27 | `fback` | ⛔ **本文未收录** —— 2026-08-01 由 `issue #85` 追加 | — |
 | 28 | `prest` | 进程启动时恢复的委员会惩罚 | 🟡 不单独 |
-| 29 | `bdrop` | `<总数>@<高度>` —— 状态机拒绝的区块体，以及拒在哪里 | 🟡 不单独 —— **把高度对着 `stip=` 读** |
+| 29 | `uex` | ⛔ **本文未收录** —— 2026-08-01 由 `issue #200` 追加 | — |
+| 30 | `bdrop` | `<总数>@<高度>` —— 状态机拒绝的区块体，以及拒在哪里 | 🟡 不单独 —— **把高度对着 `stip=` 读** |
+| 31 | `unk` | 本构建不认识的 `<帧>/<inv 条目>` 数 | 🟡 不单独 —— 见 §31 |
 
-⚠️ **实际行上还有一个字段在本文没有小节：`fback=`。** 上表点名而不是省略它，是为了让冷遇
+⚠️ **实际行上还有两个字段在本文没有小节：`fback=` 和 `uex=`。** 上表点名而不是省略它，是为了让冷遇
 它的运维知道：它是 **未被记录**，而不是 **本项目不认识** —— 这正是本文开头那次 `rback=`
 失败花了两份报告才学到的区别。
 
-⚠️ **另外，上面的编号在此之前一直错了一位**，而对一份第一条规则就是「这一行是位置相关的」
-的文档来说，这比听上去要紧：`fback=` 在真实行上位于 `breq=` 与 `prest=` 之间，所以原先编号
-为 26/27 的 `breq`/`prest` 实际是 26 和 **28**。在这里更正，是加入第 29 行的前提 —— 一份带
-洞的位置索引，会让洞之后的每一行都指向错误的字段。
+⚠️ **上面的编号至今已经错位过两次，成因相同 —— 而第二次是由第一次的更正引入的。**
+`#130 (b)` 更正了由 `fback=` 没有行位引起的错位，写下*「一份带洞的位置索引，会让洞之后的每
+一行都指向错误的字段」* —— 而在同一次编辑里把 `bdrop=` 编成 **29**，这是错的：`uex=`
+（`issue #200`）在真实行上位于 `prest=` 与 `bdrop=` 之间，同样没有行位。`bdrop=` 是 **30**。
+
+**这里的更正方式是：让行上的每一个字段都有一行，包括未被记录的那些** —— 破坏这份索引的是
+「洞」，所以修法是不留洞，而不是绕着洞重新编号。行序对照 `qumbra-node/src/run.rs` 的格式串
+核对，那里是权威：`breq fback prest uex bdrop unk`。
 
 ---
 
@@ -1001,7 +1007,7 @@ discovery，所以收款方找不到自己的输出（见 `CLAUDE.md` 的 T1 条
 `prest=0/0`）、`a_committee_punishment_survives_a_restart_through_the_run_path`（`run.rs`，重启后期望
 `prest=1/1`）、`a_non_witness_finalizes_a_checkpoint_the_restarted_witness_refuses`
 （`adapter.rs` —— 本地 ledger 无法闭合的双节点同高度分歧）。
-## 29. `bdrop` —— 状态机拒绝的区块体，以及拒在哪里
+## 30. `bdrop` —— 状态机拒绝的区块体，以及拒在哪里
 
 **🟡 单独不是告警。把高度对着 `stip=` 读。**
 
@@ -1053,6 +1059,54 @@ discovery，所以收款方找不到自己的输出（见 `CLAUDE.md` 的 T1 条
 （`qlab-node/src/metrics.rs`）、
 `bdrop_renders_the_count_and_the_height_of_the_last_refusal`（`run.rs`）。
 
+## 31. `unk` —— 本构建不认识的帧与 inv 条目
+
+**🟡 单独不构成告警 —— 怎么读完全取决于当下是否正在滚动升级。** 这是版本偏斜
+（version skew）的仪表，由 `issue #181` 在「不认识的帧不再封禁发送方」这同一次改动里加入。
+
+**它数什么。** `unk=<帧>/<inv 条目>`，两个数都是**自进程启动**累计（重启归零），统计范围是
+通过了入站限速之后的流量：
+
+- **左** —— 信封类型码（envelope type code）本构建没有实现的入站帧。忽略，永不计分；
+- **右** —— 种类码（kind code）本构建没有实现的**清单条目**，覆盖收到的每一条
+  `inv` / `getdata` / `notfound`。跳过，永不计分。
+
+两个数都永远不作为计分输入。**出现在这里的对端并没有作恶 —— 它跑的是比本机更新的构建。**
+在 `#181` 之前，这样一个帧会被记 `PENALTY_MALFORMED`（100），对上 `BAN_THRESHOLD` 的
+−100，也就是第一帧即永久封禁 —— 这正是此后没有任何一棒能新增消息类型的原因。
+
+**正常值。** 全网同一镜像时是 `unk=0/0`。
+
+| 读数 | 含义 |
+|---|---|
+| `0/0` | 没有观察到偏斜 |
+| 滚动升级期间左边在涨 | ✅ 预期之内 —— 本机比已滚动的那台旧，而且它扛住了。这是滚动正在进行的**确认**，不是问题 |
+| 没有升级在进行而左边在涨 | 🟡 上报。要么有主机跑着没人记录的镜像，要么有东西在说对 magic 和版本、却不说这个协议 |
+| 滚动结束后左边**停止**增长 | ✅ 偏斜已闭合 |
+| 右边在涨 | 同一件事往协议里再进一层 —— 有对端在提供本构建没有代码可处理的清单种类 |
+
+🔴 **这个字段要让人看见的时序，也就是 `#181` 的全部要点：这个修复只对它落地之后的版本有效。**
+在引入任何新的 `MsgType` 或 `InvKind` 之前，**每一台**主机都必须先跑上带 `#181` 的镜像。
+早于它的主机仍然会在第一个不认识的帧上封禁 —— 而且它根本不会打印 `unk=`，因为它没有这个
+字段。**因此 `unk=` 的缺席本身就是一个读数：那台主机还不能安全地被发送新类型。**
+
+⚠️ **`unk` 不覆盖 `PROTOCOL_VERSION` 提升。** 版本本构建不认识的帧仍按 malformed 计分，
+仍是第一帧即封禁。`#181` 刻意没有动这一条（版本提升本身就是一次断裂式改动，而非增量改动），
+并将其记为未决。不要把 `unk=0/0` 读成「任何线路改动都可以安全滚动」。
+
+**在 `/metrics` 上**是 `qumbra_unknown_msg_type_total` 与 `qumbra_unknown_inv_kind_total`，
+同样这两个数。另有 `WIRE` 日志行，在**首次**看到某个不认识的类型码时把它写出来
+（`WIRE event=unknown_type type=0x0044 … action=ignored scored=no`），每进程最多 8 个不同
+的码，因此它自身无法被灌爆 —— 之后计数照常继续，只是不再叙述。
+
+**何时升级：** 单独永不。没有升级在进行时左边的数在涨，作为发现上报。
+
+**由这些测试锁定：** `an_unknown_envelope_type_is_ignored_and_never_scored` 与
+`a_malformed_body_under_a_known_type_is_still_penalised`
+（`crates/qlab-p2p/src/node.rs`）、
+`an_unknown_envelope_type_over_tcp_is_ignored_and_reported_on_both_surfaces`
+（`crates/qumbra-node/src/run.rs`）。
+
 ---
 
 ## 附录 A —— 两分钟分诊
@@ -1078,6 +1132,10 @@ discovery，所以收款方找不到自己的输出（见 `CLAUDE.md` 的 T1 条
 
 - **`peers=`** —— 未决，`issue #172`。见 §6。
 - **`mready` 该不该读 `slag`** —— 未决，`issue #162` 观察 1。见 §25。
+- **`breq=` 与 `fback=`** —— 两者都晚于本文落地，本文没有它们的章节。它们只出现在总览表里，
+  好让「按行内打印顺序」这句话仍然成立，仅此而已。不要从名字推断它们的语义。
+- **节点遇到自己不认识的 `PROTOCOL_VERSION` 该怎么办** —— 未决，由 `issue #181` 上报；
+  该 issue 修好了消息类型这一侧，刻意留下了这一侧。见 §31。
 - **任何「`Degraded` 待多久算太久」的绝对阈值** —— 没有任何实测依据，在这里编一个数字，
   恰好就是这个项目被咬过的那类数字。流程归 runbook 管。
 
@@ -1091,5 +1149,5 @@ discovery，所以收款方找不到自己的输出（见 `CLAUDE.md` 的 T1 条
 `crates/qlab-p2p/src/addrman.rs`（地址簿）·
 `crates/qlab-devnet/src/params_devnet.rs`（冻结常量）。
 
-引用的 issue：#73 #74 #83 #84 #87 #104 #105 #106 #107 #117 #121 #130 #133 #134 #162 #164
-#165 #167 #169 #172 #173 #183。引用的 PR：#72 #93 #110 #119 #153 #159 #168 #171。
+Issues cited: .
+PRs cited: .
