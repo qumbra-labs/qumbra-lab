@@ -2204,9 +2204,20 @@ mod tests {
         );
         // So the "one field is last" idea is kept rather than deleted — whichever
         // field it is must still be asserted, or a truncated line would pass.
+        //
+        // ⚠️ This assertion has now been rewritten by three consecutive appends
+        // (#200, #130 (b), #181), which is the cost of pinning the tail **by name**
+        // on an append-only line: every addition must edit it, and three concurrent
+        // batons had to edit the same two lines. It is kept anyway — a truncated
+        // line has to fail something — but the name is the newest field, not
+        // whichever field happened to be last when the test was written.
         assert!(
-            line.ends_with(" bdrop=0@-"),
-            "the newest append is last, and this node refused no body: {line}"
+            line.contains(" bdrop=0@- "),
+            "the body-refusal field is present and mid-line: {line}"
+        );
+        assert!(
+            line.ends_with(" unk=0/0"),
+            "the newest append is last, and this node saw no version skew: {line}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
