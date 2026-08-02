@@ -14,12 +14,38 @@
 //!
 //! The HTTP client is a dependency-free std `TcpStream` GET (we own both ends,
 //! localhost, fixed response shapes) — recorded in the plan doc.
+//!
+//! ## 🔴 Step 2 and step 3 no longer answer to the same authority (issue #188)
+//!
+//! Since baton 1 the compact bundle of step 2 is **in the block body and covered
+//! by `tx_body_commitment`**. The AEAD payload of step 3 is not: D2 commits
+//! `ct ‖ cm ‖ tag ‖ clue_len` and the ~585 B/note the design priced is
+//! `1088/2 + 41`, with no payload in it. So a scan now has **two halves with
+//! different guarantees** — detection is answerable from chain data alone, and
+//! opening depends on somebody choosing to serve bytes no consensus rule obliges
+//! them to hold. Against a `qumbra-node`, whose `/v1/compact` is the whole
+//! surface, step 3 is a 404 by design.
+//!
+//! A scan flow that reports only [`ScanOutcome::notes`] therefore collapses two
+//! answers a wallet must never confuse:
+//!
+//! | truth | old report | now |
+//! |---|---|---|
+//! | this key was paid nothing here | `notes: []` | `notes: []`, [`Completeness::Complete`] |
+//! | this key was paid, and the payload could not be had | `Err(io)` or `notes: []` | `notes: []` + [`ScanOutcome::unopened`], [`Completeness::Incomplete`] |
+//!
+//! Every output the committed bundle says is ours and this scan did not open is
+//! recorded in [`ScanOutcome::unopened`] with its chain coordinates and a reason.
+//! **A failed `/full` fetch is no longer fatal to the whole scan**: it is one
+//! output's outcome, not the run's, so a wallet against a node that serves no
+//! payloads still gets the complete list of what it owns and where.
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use qlab_note::kem::Dk;
-use qlab_note::scan::{scan, DetectedNote, EncryptedOutputs, ScanMode};
+use qlab_note::scan::{detect_matches, scan, DetectedNote, EncryptedOutputs, ScanMode};
+use qlab_note::wire::CM_LEN;
 use rand::rngs::StdRng;
 use rand::Rng;
 
@@ -58,11 +84,70 @@ pub struct LocatedNote {
     pub detected: DetectedNote,
 }
 
+/// Why an output the committed discovery says is ours did not become a note.
+///
+/// Every variant is about the **payload**, because the payload is the half that
+/// is not on the chain. None of them can mean "the detection was wrong": the tag
+/// and the `cm` it binds are consensus-committed bytes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Unopened {
+    /// The `/full` fetch did not complete — transport failure, a non-200, or a
+    /// response that did not decode. Against a `qumbra-node` this is a 404 and it
+    /// is the **honest** answer: the AEAD payload is not in the block body, so no
+    /// node is obliged to hold it (issue #188, `discovery_server`'s module docs).
+    PayloadUnavailable(String),
+    /// The fetch completed and carried no payload at this recipient index — the
+    /// server's payload list is shorter than the committed bundle it belongs to.
+    PayloadMissing,
+    /// A payload was returned for this output and did not authenticate under this
+    /// key (AEAD tag, or the `FoSkip` commitment recompute).
+    PayloadRejected,
+}
+
+/// An output located on the chain that this scan could not turn into a note.
+///
+/// The coordinates are the committed ones, so this is a claim a wallet can show
+/// its user and re-check against any other node: *"height `h`, transaction `t`,
+/// output `o`, commitment `cm` — the chain says this is yours and I could not
+/// read it."*
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct UnopenedOutput {
+    pub height: u64,
+    pub tx_index: u64,
+    pub recipient_index: usize,
+    /// Index within the recipient bundle — the same index [`LocatedNote`]'s
+    /// `detected.index` carries.
+    pub output_index: usize,
+    /// The committed note commitment this output was detected on.
+    pub cm: [u8; CM_LEN],
+    pub why: Unopened,
+}
+
+/// Whether a scan saw everything the chain says this key owns.
+///
+/// 🔴 This is the distinction a wallet UI must render, and it is why
+/// `notes.is_empty()` is not a question a wallet may ask on its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Completeness {
+    /// Every output detected in the committed discovery was opened and
+    /// authenticated. An empty `notes` under this verdict means **nothing was
+    /// paid to this key in this range**, and says so on the chain's authority.
+    Complete,
+    /// `detected` outputs are this key's by the committed discovery, and only
+    /// `opened` of them became notes. An empty `notes` under this verdict means
+    /// **something is here and this scan could not read it** — never "no notes".
+    Incomplete { detected: usize, opened: usize },
+}
+
 /// Observable outcome of a scan (drives the report + the fetch-count test).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScanStats {
     /// Total bytes of the `/v1/compact` range response.
     pub compact_bytes: usize,
+    /// Outputs whose **committed** tag matched this key — detection, decided from
+    /// chain data alone and before any fetch. `notes_found` can only ever be a
+    /// subset of this, and the difference is [`ScanOutcome::unopened`].
+    pub detected_outputs: usize,
     /// `/full` fetches that followed a real tag match.
     pub matched_fetches: usize,
     /// `/full` fetches issued as decoys.
@@ -73,11 +158,34 @@ pub struct ScanStats {
 
 /// Result of a scan.
 pub struct ScanOutcome {
+    /// Outputs opened and authenticated.
     pub notes: Vec<LocatedNote>,
+    /// Outputs detected on the chain and **not** opened. Never folded into
+    /// `notes`, and never silently dropped — see [`Completeness`].
+    pub unopened: Vec<UnopenedOutput>,
     pub stats: ScanStats,
 }
 
+impl ScanOutcome {
+    /// Did this scan see everything the committed discovery says is ours?
+    pub fn completeness(&self) -> Completeness {
+        if self.unopened.is_empty() {
+            Completeness::Complete
+        } else {
+            Completeness::Incomplete {
+                detected: self.stats.detected_outputs,
+                opened: self.notes.len(),
+            }
+        }
+    }
+}
+
 /// Run the light-client scan against `base_url` over `[from, to]`.
+///
+/// `Err` is reserved for a scan that **never started**: only the `/v1/compact`
+/// range fetch and its decode are fatal, because without the committed bytes
+/// there is nothing to report at all. A `/full` fetch that fails is one output's
+/// outcome and lands in [`ScanOutcome::unopened`].
 pub fn light_client_scan(
     base_url: &str,
     dk: &Dk,
@@ -86,10 +194,49 @@ pub fn light_client_scan(
     config: ScanConfig,
     rng: &mut StdRng,
 ) -> std::io::Result<ScanOutcome> {
-    let compact = http_get(base_url, &format!("/v1/compact?from={from}&to={to}"))?;
+    let mut fetch = |path: &str| http_get(base_url, path).map_err(|e| e.to_string());
+    scan_over(&mut fetch, dk, from, to, config, rng)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// The light-client scan flow, run **fully in-process** against a `&Devnet`
+/// via `crate::server::route` — no socket, no `TcpStream`. Behaviourally
+/// identical to [`light_client_scan`] (it *is* the same function, over a
+/// different fetch); this is the composition path for an in-process driver
+/// (qlab-demo) under a no-networking constraint.
+pub fn scan_local(
+    devnet: &crate::data::Devnet,
+    dk: &Dk,
+    from: u64,
+    to: u64,
+    config: ScanConfig,
+    rng: &mut StdRng,
+) -> ScanOutcome {
+    let mut fetch = |path: &str| {
+        crate::server::route(devnet, path).map_err(|(code, msg)| format!("{code} {msg}"))
+    };
+    // The reference server answers every well-formed internal URL this function
+    // builds, so the fatal arm is unreachable here — kept as an `expect` rather
+    // than a silent empty outcome for exactly that reason.
+    scan_over(&mut fetch, dk, from, to, config, rng).expect("in-process compact range must resolve")
+}
+
+/// The scan itself, over any fetch. One implementation so the socket path and the
+/// in-process path cannot drift on what counts as detected, opened or unopened.
+fn scan_over<F>(
+    fetch: &mut F,
+    dk: &Dk,
+    from: u64,
+    to: u64,
+    config: ScanConfig,
+    rng: &mut StdRng,
+) -> Result<ScanOutcome, String>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
+    let compact = fetch(&format!("/v1/compact?from={from}&to={to}"))?;
     let mut stats = ScanStats { compact_bytes: compact.len(), ..Default::default() };
-    let blocks = decode_compact_response(&compact)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+    let blocks = decode_compact_response(&compact).map_err(|e| format!("{e:?}"))?;
 
     // The (height, n_txs) space, for randomized decoy targeting.
     let tx_space: Vec<(u64, u64)> = blocks
@@ -99,42 +246,101 @@ pub fn light_client_scan(
         .collect();
 
     let mut notes = Vec::new();
+    let mut unopened = Vec::new();
 
     for block in &blocks {
         for group in &block.groups {
-            // Tag pre-filter: any entry in this tx matches our key?
-            let matched = group
+            // ---- Detection. Decided from the committed bytes alone, before any
+            // fetch, and recorded whether or not the fetch that follows works.
+            let detected: Vec<(usize, Vec<usize>)> = group
                 .recipients
                 .iter()
-                .any(|bundle| bundle_has_tag_match(dk, bundle));
-            if !matched {
+                .enumerate()
+                .map(|(ri, bundle)| (ri, detect_matches(dk, bundle)))
+                .filter(|(_, hits)| !hits.is_empty())
+                .collect();
+            if detected.is_empty() {
                 continue;
             }
+            stats.detected_outputs += detected.iter().map(|(_, h)| h.len()).sum::<usize>();
 
-            // Matched: full-fetch the payloads for this (height, tx).
-            let full = http_get(
-                base_url,
-                &format!("/v1/block/{}/tx/{}/full", block.height, group.tx_index),
-            )?;
+            // The committed coordinates of one detected output. Built from the
+            // block and the group, never from anything the `/full` fetch returned.
+            let located = |ri: usize, oi: usize, why: Unopened| UnopenedOutput {
+                height: block.height,
+                tx_index: group.tx_index,
+                recipient_index: ri,
+                output_index: oi,
+                cm: group.recipients[ri].entries[oi].cm,
+                why,
+            };
+
+            // ---- Opening. Everything below this line depends on bytes no
+            // consensus rule obliges anybody to hold.
+            let path = format!("/v1/block/{}/tx/{}/full", block.height, group.tx_index);
+            let fetched = fetch(&path);
             stats.matched_fetches += 1;
-            let payloads_per_recipient = decode_full_response(&full)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+            let payloads_per_recipient = match &fetched {
+                Ok(bytes) => decode_full_response(bytes)
+                    .map_err(|e| format!("undecodable /full response: {e:?}")),
+                Err(e) => Err(e.clone()),
+            };
 
-            // Authenticate via the ratified scan (per recipient).
-            for (ri, bundle) in group.recipients.iter().enumerate() {
-                let Some(payloads) = payloads_per_recipient.get(ri) else { continue };
-                let enc = EncryptedOutputs { bundle: bundle.clone(), payloads: payloads.clone() };
-                for detected in scan(dk, &enc, config.mode) {
-                    notes.push(LocatedNote {
-                        height: block.height,
-                        tx_index: group.tx_index,
-                        recipient_index: ri,
-                        detected,
-                    });
+            match payloads_per_recipient {
+                Err(why) => {
+                    // The whole transaction is unreadable: every detected output
+                    // is reported, with the reason, rather than the scan ending.
+                    for (ri, hits) in &detected {
+                        for &oi in hits {
+                            unopened.push(located(
+                                *ri,
+                                oi,
+                                Unopened::PayloadUnavailable(why.clone()),
+                            ));
+                        }
+                    }
+                }
+                Ok(payloads_per_recipient) => {
+                    for (ri, hits) in &detected {
+                        let (opened, missing) = match payloads_per_recipient.get(*ri) {
+                            Some(payloads) => {
+                                let enc = EncryptedOutputs {
+                                    bundle: group.recipients[*ri].clone(),
+                                    payloads: payloads.clone(),
+                                };
+                                // `scan` re-runs the same tag comparison, so what it
+                                // returns is a subset of `hits` by construction.
+                                let found = scan(dk, &enc, config.mode);
+                                let idx: Vec<usize> = found.iter().map(|d| d.index).collect();
+                                for detected in found {
+                                    notes.push(LocatedNote {
+                                        height: block.height,
+                                        tx_index: group.tx_index,
+                                        recipient_index: *ri,
+                                        detected,
+                                    });
+                                }
+                                (idx, false)
+                            }
+                            None => (Vec::new(), true),
+                        };
+                        for &oi in hits {
+                            if !opened.contains(&oi) {
+                                let why = if missing {
+                                    Unopened::PayloadMissing
+                                } else {
+                                    Unopened::PayloadRejected
+                                };
+                                unopened.push(located(*ri, oi, why));
+                            }
+                        }
+                    }
                 }
             }
 
             // Decoy over-fetch (§2 mitigation) — randomized targets, discarded.
+            // A decoy's *result* is discarded by construction, so its failure is
+            // discarded too: a 404 on a decoy must not decide a real scan's fate.
             if let DecoyPolicy::PerMatch { max } = config.decoy {
                 let max = max.max(1);
                 let n_decoys = 1 + (rng.next_u64() as usize % max); // 1..=max
@@ -144,7 +350,7 @@ pub fn light_client_scan(
                     }
                     let (h, n_tx) = tx_space[rng.next_u64() as usize % tx_space.len()];
                     let ti = rng.next_u64() % n_tx;
-                    let _ = http_get(base_url, &format!("/v1/block/{h}/tx/{ti}/full"))?;
+                    let _ = fetch(&format!("/v1/block/{h}/tx/{ti}/full"));
                     stats.decoy_fetches += 1;
                 }
             }
@@ -152,90 +358,7 @@ pub fn light_client_scan(
     }
 
     stats.notes_found = notes.len();
-    Ok(ScanOutcome { notes, stats })
-}
-
-/// The light-client scan flow, run **fully in-process** against a `&Devnet`
-/// via `crate::server::route` — no socket, no `TcpStream`. Behaviourally
-/// identical to [`light_client_scan`] (same codec, same tag pre-filter, same
-/// `qlab_note::scan::scan`, same decoy over-fetch); this is the composition
-/// path for an in-process driver (qlab-demo) under a no-networking constraint.
-pub fn scan_local(
-    devnet: &crate::data::Devnet,
-    dk: &Dk,
-    from: u64,
-    to: u64,
-    config: ScanConfig,
-    rng: &mut StdRng,
-) -> ScanOutcome {
-    // `route` never errors for well-formed internal URLs; unwrap the bytes.
-    let route_get = |url: &str| -> Vec<u8> {
-        crate::server::route(devnet, url).expect("in-process route must succeed")
-    };
-
-    let compact = route_get(&format!("/v1/compact?from={from}&to={to}"));
-    let mut stats = ScanStats { compact_bytes: compact.len(), ..Default::default() };
-    let blocks = decode_compact_response(&compact).expect("internal compact response decodes");
-
-    let tx_space: Vec<(u64, u64)> = blocks
-        .iter()
-        .map(|b| (b.height, b.groups.len() as u64))
-        .filter(|(_, n)| *n > 0)
-        .collect();
-
-    let mut notes = Vec::new();
-    for block in &blocks {
-        for group in &block.groups {
-            let matched = group
-                .recipients
-                .iter()
-                .any(|bundle| bundle_has_tag_match(dk, bundle));
-            if !matched {
-                continue;
-            }
-            let full = route_get(&format!("/v1/block/{}/tx/{}/full", block.height, group.tx_index));
-            stats.matched_fetches += 1;
-            let payloads_per_recipient =
-                decode_full_response(&full).expect("internal full response decodes");
-            for (ri, bundle) in group.recipients.iter().enumerate() {
-                let Some(payloads) = payloads_per_recipient.get(ri) else { continue };
-                let enc = EncryptedOutputs { bundle: bundle.clone(), payloads: payloads.clone() };
-                for detected in scan(dk, &enc, config.mode) {
-                    notes.push(LocatedNote {
-                        height: block.height,
-                        tx_index: group.tx_index,
-                        recipient_index: ri,
-                        detected,
-                    });
-                }
-            }
-            if let DecoyPolicy::PerMatch { max } = config.decoy {
-                let max = max.max(1);
-                let n_decoys = 1 + (rng.next_u64() as usize % max);
-                for _ in 0..n_decoys {
-                    if tx_space.is_empty() {
-                        break;
-                    }
-                    let (h, n_tx) = tx_space[rng.next_u64() as usize % tx_space.len()];
-                    let ti = rng.next_u64() % n_tx;
-                    let _ = route_get(&format!("/v1/block/{h}/tx/{ti}/full"));
-                    stats.decoy_fetches += 1;
-                }
-            }
-        }
-    }
-    stats.notes_found = notes.len();
-    ScanOutcome { notes, stats }
-}
-
-/// Does any entry in `bundle` produce a detection-tag match under `dk`? (The
-/// cheap pre-filter that decides whether to full-fetch.)
-/// The tag pre-filter. Delegates to [`qlab_note::scan::detect_matches`], which is
-/// where this moved in issue #188 baton 2 — the compact bundle is now consensus-
-/// committed, so "which outputs are mine" is a wallet primitive the note crate
-/// owns rather than a private helper in a reference server's client.
-fn bundle_has_tag_match(dk: &Dk, bundle: &qlab_note::wire::RecipientBundle) -> bool {
-    !qlab_note::scan::detect_matches(dk, bundle).is_empty()
+    Ok(ScanOutcome { notes, unopened, stats })
 }
 
 /// Minimal dependency-free HTTP/1.1 GET over `TcpStream`. `base_url` is
@@ -343,6 +466,12 @@ mod tests {
                 "{mode:?}: found all planted notes over localhost"
             );
             assert_eq!(out.stats.notes_found, d.expected_matches);
+            // A server that serves both halves opens everything it detected, so
+            // the verdict is Complete — the counterweight that keeps
+            // `Incomplete` from being what this code always says.
+            assert_eq!(out.stats.detected_outputs, d.expected_matches, "{mode:?}");
+            assert!(out.unopened.is_empty(), "{mode:?}: {:?}", out.unopened);
+            assert_eq!(out.completeness(), Completeness::Complete, "{mode:?}");
             handle.shutdown();
         }
     }
@@ -431,7 +560,160 @@ mod tests {
         .unwrap();
         assert_eq!(out.notes.len(), 0, "a stranger's key detects nothing");
         assert_eq!(out.stats.matched_fetches, 0, "no matches → no full fetches");
+        // 🔴 And it says so on the chain's authority: nothing was detected, so the
+        // empty result is a *complete* answer and not a failed one.
+        assert_eq!(out.stats.detected_outputs, 0);
+        assert!(out.unopened.is_empty());
+        assert_eq!(out.completeness(), Completeness::Complete);
         handle.shutdown();
+    }
+
+    // ---- issue #188 (3/4): an incomplete scan is never an empty one -----------
+
+    /// Serve `/v1/compact` from the reference server and answer every `/full`
+    /// with `err`. This is a `qumbra-node`'s shape: the committed compact bundle
+    /// is served from the block, and the AEAD payload — which is not in any block
+    /// — is a 404.
+    fn compact_only<'a>(
+        devnet: &'a Devnet,
+        err: &'a str,
+    ) -> impl FnMut(&str) -> Result<Vec<u8>, String> + 'a {
+        move |path: &str| {
+            if path.starts_with("/v1/compact") {
+                crate::server::route(devnet, path).map_err(|(c, m)| format!("{c} {m}"))
+            } else {
+                Err(err.to_string())
+            }
+        }
+    }
+
+    /// 🔴 **The distinction, in isolation.** A wallet that matches a committed tag
+    /// and cannot complete the fetch reports *something other than "no notes"*.
+    ///
+    /// Three separate claims, because two of them would pass on an accident:
+    /// the detected count is right, the unopened list carries the chain
+    /// coordinates of every one of them, and the verdict is `Incomplete`.
+    #[test]
+    fn a_detected_output_whose_payload_cannot_be_fetched_is_reported_not_dropped() {
+        let d = Devnet::generate(GenParams::default());
+        let mut rng = StdRng::seed_from_u64(41);
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::Off };
+        let mut fetch = compact_only(&d, "non-200 response: HTTP/1.1 404 Not Found");
+        let out = scan_over(&mut fetch, &d.our.dk, 1, d.tip_height(), cfg, &mut rng)
+            .expect("the compact half still resolves, so the scan runs");
+
+        assert!(d.expected_matches > 0, "the fixture plants something to lose");
+        assert_eq!(
+            out.stats.detected_outputs, d.expected_matches,
+            "detection is answered from committed bytes and does not need the payload"
+        );
+        assert_eq!(out.notes.len(), 0, "nothing could be opened");
+        assert_eq!(
+            out.completeness(),
+            Completeness::Incomplete { detected: d.expected_matches, opened: 0 },
+            "🔴 a scan that could not complete must not read as a scan that found nothing"
+        );
+        assert_eq!(out.unopened.len(), d.expected_matches);
+        for u in &out.unopened {
+            assert!(
+                matches!(u.why, Unopened::PayloadUnavailable(ref e) if e.contains("404")),
+                "the reason names what actually happened: {:?}",
+                u.why
+            );
+            assert!(u.height >= 1, "a chain coordinate a wallet can re-check elsewhere");
+            assert_ne!(u.cm, [0u8; CM_LEN], "the committed commitment travels with it");
+        }
+        // The commitments reported unopened are exactly the ones the same fixture
+        // opens when the payloads are served — no set is invented and none is lost.
+        let (d2, handle) = fresh();
+        let mut rng2 = StdRng::seed_from_u64(41);
+        let good = light_client_scan(&handle.base_url(), &d2.our.dk, 1, d2.tip_height(), cfg, &mut rng2)
+            .expect("scan");
+        handle.shutdown();
+        let mut lost: Vec<[u8; CM_LEN]> = out.unopened.iter().map(|u| u.cm).collect();
+        let mut opened: Vec<[u8; CM_LEN]> = good
+            .notes
+            .iter()
+            .map(|n| qlab_note::hash::digest_bytes(&n.detected.note.commitment()))
+            .collect();
+        lost.sort();
+        opened.sort();
+        assert_eq!(lost, opened, "the unopened set is the set that would have been opened");
+    }
+
+    /// A `/full` that answers 200 with a **shorter** payload list than the
+    /// committed bundle it belongs to. The old flow's `else { continue }` dropped
+    /// exactly this case in silence — a 200 that means nothing is the same absence
+    /// as a 404, and it is now named separately because the two want different
+    /// operator responses.
+    #[test]
+    fn a_short_full_response_is_payload_missing_and_not_an_empty_wallet() {
+        let d = Devnet::generate(GenParams::default());
+        let mut rng = StdRng::seed_from_u64(42);
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::Off };
+        let mut fetch = |path: &str| -> Result<Vec<u8>, String> {
+            if path.starts_with("/v1/compact") {
+                crate::server::route(&d, path).map_err(|(c, m)| format!("{c} {m}"))
+            } else {
+                // Well-formed, decodable, and carrying nobody's payloads.
+                Ok(crate::codec::encode_full_response(&[]))
+            }
+        };
+        let out = scan_over(&mut fetch, &d.our.dk, 1, d.tip_height(), cfg, &mut rng).expect("scan");
+        assert_eq!(out.notes.len(), 0);
+        assert_eq!(out.unopened.len(), d.expected_matches);
+        assert!(out.unopened.iter().all(|u| u.why == Unopened::PayloadMissing), "{:?}", out.unopened);
+        assert!(matches!(out.completeness(), Completeness::Incomplete { opened: 0, .. }));
+    }
+
+    /// A payload that arrives and does not authenticate. Distinct from both
+    /// absences above: the bytes were served and the wallet refused them, which is
+    /// the one case where the *server* is the suspect rather than the topology.
+    #[test]
+    fn a_tampered_payload_is_reported_rejected_rather_than_missing() {
+        let d = Devnet::generate(GenParams::default());
+        let mut rng = StdRng::seed_from_u64(43);
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::Off };
+        let mut fetch = |path: &str| -> Result<Vec<u8>, String> {
+            let bytes = crate::server::route(&d, path).map_err(|(c, m)| format!("{c} {m}"))?;
+            if path.starts_with("/v1/compact") {
+                return Ok(bytes);
+            }
+            let mut payloads = crate::codec::decode_full_response(&bytes).expect("reference bytes");
+            for recipient in payloads.iter_mut() {
+                for p in recipient.iter_mut() {
+                    if let Some(last) = p.last_mut() {
+                        *last ^= 0x01; // break the Poly1305 tag, keep the shape
+                    }
+                }
+            }
+            Ok(crate::codec::encode_full_response(&payloads))
+        };
+        let out = scan_over(&mut fetch, &d.our.dk, 1, d.tip_height(), cfg, &mut rng).expect("scan");
+        assert_eq!(out.notes.len(), 0, "a tampered payload authenticates nothing");
+        assert_eq!(out.unopened.len(), d.expected_matches);
+        assert!(
+            out.unopened.iter().all(|u| u.why == Unopened::PayloadRejected),
+            "{:?}",
+            out.unopened
+        );
+    }
+
+    /// A decoy fetch that fails must not decide a real scan's fate. Its result is
+    /// discarded by construction, and before this the `?` on it aborted a scan
+    /// that had already succeeded — which on a `qumbra-node` (every `/full` is a
+    /// 404) is every scan with a match in it.
+    #[test]
+    fn a_failing_decoy_fetch_does_not_end_the_scan() {
+        let d = Devnet::generate(GenParams::default());
+        let mut rng = StdRng::seed_from_u64(44);
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::PerMatch { max: 3 } };
+        let mut fetch = compact_only(&d, "connection refused");
+        let out = scan_over(&mut fetch, &d.our.dk, 1, d.tip_height(), cfg, &mut rng)
+            .expect("a failing decoy is not a failed scan");
+        assert!(out.stats.decoy_fetches >= out.stats.matched_fetches, "decoys still issued");
+        assert_eq!(out.stats.detected_outputs, d.expected_matches);
+        assert_eq!(out.unopened.len(), d.expected_matches);
     }
 }
 
