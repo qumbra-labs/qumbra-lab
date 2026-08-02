@@ -25,10 +25,32 @@
 name: suite (arm64)
 
 on:
-  # Only when Rust actually changed. A docs PR cannot fail this suite, so it
-  # must not spend 34 minutes proving that -- the exception every acceptance
-  # comment has stated by hand is encoded here instead of restated each time.
+  # Two filters, and they answer two different questions.
+  #
+  # `paths` -- only when Rust actually changed. A docs PR cannot fail this
+  # suite, so it must not spend 34 minutes proving that; the exception every
+  # acceptance comment has stated by hand is encoded here instead of restated
+  # each time.
+  #
+  # `types: [labeled]` -- only on the tree somebody will actually READ.
+  # The verification procedure is same-tree comparison: the coordinator merges
+  # `main` into the PR, pushes THAT tree, and compares this run's count against
+  # the rig's on it. A run triggered by a builder's intermediate push is a
+  # number on a tree nobody will merge -- never read, never quoted in an
+  # acceptance comment, never entered in the agreement ledger.
+  #
+  # Measured before this change (docs/ci-runner-cost-decision.md Section 5):
+  # several PRs ran the suite two or three times against exactly one read, and
+  # roughly HALF the month's spend bought numbers nobody looked at. On
+  # 2026-08-02 one in-flight baton had already burned two runs on a PR that had
+  # not yet been opened.
+  #
+  # So the suite runs when the `verify` label is applied, which is the
+  # coordinator's explicit "this is the tree" -- and re-applying the label
+  # re-runs it. Not `synchronize`: that is the builder-push trigger this change
+  # exists to remove.
   pull_request:
+    types: [labeled]
     paths:
       - "crates/**"
       - "Cargo.toml"
@@ -45,6 +67,13 @@ concurrency:
 
 jobs:
   suite:
+    # The label gate. `types: [labeled]` fires for ANY label, so the name is
+    # checked here -- otherwise adding an unrelated label would spend 34 paid
+    # minutes. `workflow_dispatch` bypasses this deliberately: the manual path
+    # is already an explicit act and predates the label.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'verify'
     runs-on: qumbra-arm64-8
     timeout-minutes: 120        # if it needs longer than this it is not viable
                                 # as a bar anyway, and that is itself the answer

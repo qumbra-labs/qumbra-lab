@@ -155,6 +155,17 @@ information currently used is one run per PR — the merged-tree run — and thi
 change to `suite-arm64.yml`, and a docs-only or workflow-only PR does not trigger the suite (the
 `paths` filter from `PR #191`), so proposing it is itself free.
 
+**Implemented 2026-08-02:** `pull_request: types: [labeled]`, plus a job-level `if` checking the
+label is `verify` (the `labeled` event fires for *any* label, so without the name check an
+unrelated label would spend 34 paid minutes). `workflow_dispatch` bypasses the gate deliberately —
+the manual path is already an explicit act.
+
+🔴 **The ordering this creates, and it is a trap of exactly the shape this project keeps paying
+for: push the merged tree FIRST, then apply the label.** Labelling before the push runs the suite
+against the pre-merge head and returns a number that *looks* like a same-tree result and is not.
+The count would still reconcile against the PR's own base, so nothing would flag it. Re-applying
+the label re-runs on the current head, and `cancel-in-progress` kills the stale run.
+
 ### C. AWS EC2 Graviton spot, self-hosted runner
 
 Cheapest per minute by a wide margin — a `t4g`/`c7g`-class spot instance is on the order of
@@ -278,7 +289,7 @@ should be sized against *that*, with CI riding it rather than justifying it.
 | **Whether to buy a Savings Plan, and sized against what** | **Larry (R3)** — see §7F: the T0 fleet, not CI, is the workload that fits one |
 | **Reading the actual AWS bill for the T0 fleet** | unassigned, and it is the largest unmeasured number in this document |
 | Repo visibility | **Larry** |
-| The trigger change (§7B) | coordinator — free and reversible, proposed as its own PR |
+| ~~The trigger change (§7B)~~ | **DONE 2026-08-02** — `types: [labeled]` + a `verify` gate. See §7B. |
 
 ---
 
