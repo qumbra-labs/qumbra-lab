@@ -245,7 +245,7 @@ mod tests {
     fn chainstate_reorg_depth_matches_the_model_semantics() {
         let g = BlockHeader::genesis(1_000, 0);
         let mut c = ChainState::new(g);
-        let gh = *c.header(&c.genesis_hash()).unwrap();
+        let gh = *c.header(&c.genesis_block_hash()).unwrap();
         // Honest branch A: 3 blocks (depth-3 suffix on genesis).
         let a1 = c.insert_header(BlockHeader::child_of(&gh, 2, 1_000, [0xA1; 32])).unwrap();
         let a1h = *c.header(&a1).unwrap();
@@ -257,7 +257,7 @@ mod tests {
 
         // No finality (degraded mode): a heavier private branch B (from genesis,
         // 4 blocks) reorgs the tip, rolling back the 3-block honest suffix.
-        let mut prev = c.genesis_hash();
+        let mut prev = c.genesis_block_hash();
         for i in 0..4u8 {
             let ph = *c.header(&prev).unwrap();
             prev = c.insert_header(BlockHeader::child_of(&ph, (i as u64 + 1) * 3, 1_000, [0xB0 + i; 32])).unwrap();

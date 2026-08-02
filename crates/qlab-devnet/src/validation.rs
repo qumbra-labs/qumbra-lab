@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn child_of_genesis_holds_parent_difficulty() {
         let c = ChainState::new(easy_genesis());
-        let g = c.genesis_hash();
+        let g = c.genesis_block_hash();
         assert_eq!(expected_difficulty(&c, &g, 2), Some(EASY));
     }
 
@@ -360,7 +360,7 @@ mod tests {
         let small = KeyBlockSchedule::new(2, 1); // epoch 2, lag 1
         let c = build_linear_chain(EASY, 2, 8);
         let chain = &c;
-        let genesis = chain.genesis_hash();
+        let genesis = chain.genesis_block_hash();
 
         // A block extending the tip at height H uses seed = hash at seed_height(H).
         let tip = chain.tip_hash();

@@ -147,7 +147,7 @@ fn a_recipient_finds_its_output_from_a_restarted_nodes_committed_discovery() {
     let (paid_notes, committed_groups, tx_height) = {
         let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
         let mut node = MemNode::open(&dir, genesis).expect("open a fresh data dir");
-        let ghash = node.chain().genesis_hash();
+        let ghash = node.chain().genesis_block_hash();
         assert!(node.finalize(ghash).expect("finalize genesis"));
         let anchor = node.commitment_root();
         assert!(node.is_valid_anchor(&anchor), "the finalized empty root is an anchor");
@@ -269,7 +269,7 @@ fn a_payment_that_attaches_no_discovery_cannot_reach_the_serving_path() {
     let dir = temp_dir("omission-refused");
     let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
     let mut node = MemNode::open(&dir, genesis).expect("open");
-    let ghash = node.chain().genesis_hash();
+    let ghash = node.chain().genesis_block_hash();
     assert!(node.finalize(ghash).expect("finalize genesis"));
     let anchor = node.commitment_root();
 

@@ -69,7 +69,34 @@ pub enum LogRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub format_version: u32,
-    pub genesis_hash: Hash32,
+    /// The **genesis block header** hash — `keccak256` over the height-0
+    /// `BlockHeader`. It is the root this snapshot's chain hangs from, and
+    /// [`crate::node::Node::open`] compares it against the genesis it was handed
+    /// to decide whether this snapshot belongs to this chain at all.
+    ///
+    /// 🔴 **This is NOT the number an operator means by "the genesis hash", and
+    /// comparing the two is meaningless** (issue #206). The operational genesis
+    /// hash — the one `qumbra-node genesis init` prints, the one pinned as
+    /// `expected_genesis_hash` in every node config, the one asserted at startup
+    /// and quoted in `qumbra-deploy/OPERATOR.md` and every roll task book — is
+    /// `qumbra_node::genesis::GenesisFile::hash()`: `keccak256` over the whole
+    /// **genesis file's** canonical bincode (network name, FROZEN v1.0 params,
+    /// all 21 committee keys, *and* the genesis block).
+    ///
+    /// The file contains the block, so the two values are **structurally
+    /// guaranteed to differ**. A mismatch between this field and the runbook is
+    /// the expected state, not evidence of a wrong net — which matters because
+    /// the moment an operator decodes `snapshot.bin` is the moment a host has
+    /// already come back wrong. To answer "does this data dir belong to this
+    /// net", compare this field against the genesis block header hash the node
+    /// computes from its own genesis file (`Node::open` does exactly that), and
+    /// compare `expected_genesis_hash` against `genesis init` — never across.
+    ///
+    /// Renamed from `genesis_hash` by issue #206. Field names are not on disk:
+    /// `bincode` 1.x serialises struct fields positionally, so the rename moved
+    /// no byte (test-locked by
+    /// `tests::the_genesis_block_hash_rename_moved_no_on_disk_byte`).
+    pub genesis_block_hash: Hash32,
     /// Height of the highest block whose state transition is folded in here.
     pub applied_height: u64,
     pub tip: Hash32,
@@ -207,4 +234,90 @@ pub fn load_snapshot(dir: &Path) -> io::Result<Option<Snapshot>> {
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 317 on-disk bytes of a fully-populated [`Snapshot`], captured from the
+    /// tree **before** issue #206 renamed `Snapshot::genesis_hash` to
+    /// `genesis_block_hash` (`main` `e8d2e95`, by serialising the struct built in
+    /// [`golden_snapshot`] below and printing the hex).
+    ///
+    /// This is the vector that makes the #206 rename provable rather than merely
+    /// asserted: `bincode` 1.x writes struct fields **positionally** and never
+    /// writes a field name, so a rename must move exactly zero bytes. If a future
+    /// change reorders, adds, retypes or removes a field, this literal stops
+    /// matching and [`FORMAT_VERSION`] is owed a bump.
+    const GOLDEN_SNAPSHOT_PRE_I206: &str = "\
+03000000111111111111111111111111111111111111111111111111111111111111111107000000\
+00000000222222222222222222222222222222222222222222222222222222222222222201333333\
+33333333333333333333333333333333333333333333333333333333330400000000000000020000\
+00000000004444444444444444444444444444444444444444444444444444444444444444555555\
+55555555555555555555555555555555555555555555555555555555550100000000000000666666\
+66666666666666666666666666666666666666666666666666666666660200000000000000000000\
+00000000007777777777777777777777777777777777777777777777777777777777777777010000\
+00000000008888888888888888888888888888888888888888888888888888888888888888";
+
+    fn h(b: u8) -> Hash32 {
+        [b; 32]
+    }
+
+    /// Every field populated and distinguishable, so a reorder is visible in the
+    /// bytes rather than hidden behind two equal values.
+    fn golden_snapshot() -> Snapshot {
+        Snapshot {
+            format_version: FORMAT_VERSION,
+            genesis_block_hash: h(0x11),
+            applied_height: 7,
+            tip: h(0x22),
+            finalized: Some((h(0x33), 4)),
+            commitments: vec![h(0x44), h(0x55)],
+            nullifiers: vec![h(0x66)],
+            roots_by_height: vec![(0, h(0x77)), (1, h(0x88))],
+        }
+    }
+
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// 🔴 Issue #206's format question, answered by the bytes and not by argument.
+    ///
+    /// A **rename** of a `bincode`-serialised field is byte-neutral, so
+    /// [`FORMAT_VERSION`] does not move and every existing data dir keeps
+    /// resuming. The alternative — a bump — would have refused every deployed
+    /// snapshot for a naming fix, which is not a trade worth making; that is why
+    /// this test exists rather than a comment saying it should be fine.
+    #[test]
+    fn the_genesis_block_hash_rename_moved_no_on_disk_byte() {
+        let bytes = bincode::serialize(&golden_snapshot()).expect("serialize");
+        assert_eq!(
+            to_hex(&bytes),
+            GOLDEN_SNAPSHOT_PRE_I206,
+            "the on-disk snapshot bytes moved. `bincode` is positional and a field \
+             *rename* cannot do this, so something else changed shape — bump \
+             FORMAT_VERSION (currently {FORMAT_VERSION}) rather than re-pinning this vector"
+        );
+        assert_eq!(bytes.len(), GOLDEN_SNAPSHOT_PRE_I206.len() / 2);
+    }
+
+    /// The other direction: a snapshot file written by a **pre-#206 binary**
+    /// decodes into the renamed struct with every field intact. Byte-equality
+    /// above proves the writer did not move; this proves the reader did not
+    /// either, which is the half an operator's data dir actually depends on.
+    #[test]
+    fn a_pre_i206_snapshot_file_still_decodes() {
+        let bytes: Vec<u8> = (0..GOLDEN_SNAPSHOT_PRE_I206.len() / 2)
+            .map(|i| u8::from_str_radix(&GOLDEN_SNAPSHOT_PRE_I206[i * 2..i * 2 + 2], 16).unwrap())
+            .collect();
+        let snap: Snapshot = bincode::deserialize(&bytes).expect("a pre-#206 snapshot decodes");
+        assert_eq!(snap, golden_snapshot());
+        assert_eq!(
+            snap.genesis_block_hash,
+            h(0x11),
+            "the field the rename touched reads back the same value it was written with"
+        );
+    }
 }

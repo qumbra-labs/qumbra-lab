@@ -451,10 +451,10 @@ impl MemNode {
         std::fs::create_dir_all(&dir).map_err(NodeError::Io)?;
 
         let records = persist::read_records(&dir).map_err(NodeError::Io)?;
-        let genesis_hash = genesis.header().header_hash();
+        let genesis_block_hash = genesis.header().header_hash();
         let snapshot = persist::load_snapshot(&dir)
             .map_err(NodeError::Io)?
-            .filter(|snap| snap.genesis_hash == genesis_hash);
+            .filter(|snap| snap.genesis_block_hash == genesis_block_hash);
 
         // Fast path: restore derived state (tree/nullifiers/roots) from the
         // snapshot, so log-prefix blocks only need to rebuild the chain store
@@ -999,7 +999,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         let Some(dir) = &self.dir else { return Ok(()) };
         let snap = Snapshot {
             format_version: FORMAT_VERSION,
-            genesis_hash: self.chain.genesis_hash(),
+            genesis_block_hash: self.chain.genesis_block_hash(),
             applied_height: self.chain.tip_height(),
             tip: self.chain.tip_hash(),
             finalized: self
@@ -1217,19 +1217,19 @@ mod tests {
     fn snapshot_finality_without_its_authoritative_log_record_refuses_to_open() {
         let dir = temp_dir("snapshot-finality-not-logged");
         let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
-        let genesis_hash = genesis.header().header_hash();
+        let genesis_block_hash = genesis.header().header_hash();
         let mut node = MemNode::open(&dir, genesis.clone()).unwrap();
 
         // Construct the inconsistency directly: the snapshot carries a proven
         // point, but no live `finalize` call appended its source-of-truth record.
-        node.chain.restore_finalized(genesis_hash, 0).unwrap();
+        node.chain.restore_finalized(genesis_block_hash, 0).unwrap();
         node.save_snapshot().unwrap();
         drop(node);
 
         assert!(matches!(
             MemNode::open(&dir, genesis),
             Err(NodeError::SnapshotFinalityNotLogged { hash, height: 0 })
-                if hash == genesis_hash
+                if hash == genesis_block_hash
         ));
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -2830,8 +2830,8 @@ mod tests {
     }
 
     impl ChainView for StoreStub {
-        fn genesis_hash(&self) -> Hash32 {
-            self.inner.genesis_hash()
+        fn genesis_block_hash(&self) -> Hash32 {
+            self.inner.genesis_block_hash()
         }
         fn tip_hash(&self) -> Hash32 {
             self.inner.tip_hash()
@@ -3726,7 +3726,7 @@ mod tests {
         /// block that carries a transaction — T1 by construction.
         fn transacting_server(strict: bool) -> (Adapter, Hash32) {
             let mut s = adapter(strict);
-            let g = s.chain().genesis_hash();
+            let g = s.chain().genesis_block_hash();
             s.state_mut().finalize(g).expect("finalize genesis");
             let anchor = s.state().commitment_root();
             (s, anchor)

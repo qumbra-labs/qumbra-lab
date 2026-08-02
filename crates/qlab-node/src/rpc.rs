@@ -606,7 +606,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             .block(&chain.tip_hash())
             .map(|b| b.header.timestamp)
             .unwrap_or(0);
-        let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_hash());
+        let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_block_hash());
         let base_ts = chain.block(&base_hash).map(|b| b.header.timestamp).unwrap_or(0);
         tip_ts.saturating_sub(base_ts)
     }
@@ -1105,7 +1105,7 @@ mod tests {
     fn rpc_with_finalized_genesis() -> (MemNodeRpc, Hash32) {
         let genesis = genesis_block(1_000, 0);
         let mut node = MemNode::in_memory(genesis.clone());
-        let ghash = node.chain().genesis_hash();
+        let ghash = node.chain().genesis_block_hash();
         assert!(node.finalize(ghash).unwrap());
         let anchor = node.commitment_root(); // empty-tree root, finalized at height 0
         assert!(node.is_valid_anchor(&anchor), "genesis root is a valid anchor once finalized");
