@@ -120,6 +120,14 @@ fn mine_chain(miner: &mut Node, n: usize) -> Vec<(BlockHeader, BlockBody)> {
         .collect()
 }
 
+/// Give `node` the headers only — fork choice reaches the tip, the state machine
+/// does not move. The `slag` shape #130 named, and the shape node1 was in.
+fn replay_headers_only(node: &mut Node, blocks: &[(BlockHeader, BlockBody)]) {
+    for (h, _) in blocks {
+        assert_eq!(node.node_mut().ingest_header(*h), IngestOutcome::Accepted);
+    }
+}
+
 /// Give `node` the same chain, block for block, with every body applied.
 fn replay(node: &mut Node, blocks: &[(BlockHeader, BlockBody)]) {
     for (h, b) in blocks {
@@ -709,4 +717,160 @@ fn a_query_flood_is_answered_at_most_once_per_serve_interval() {
         1,
         "one answer per interval, not one ever"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 6. 🔴 The second defect, from the coordinator's 2026-08-02 correction:
+//    a refusal to record the finalized head durably, spelled `let _`
+// ---------------------------------------------------------------------------
+
+/// 🔴 **THE #203 SHAPE, AS RE-DIAGNOSED: head #1 advances, head #3 refuses, and
+/// until now the refusal went to `let _` and nothing anywhere said so.**
+///
+/// Node B holds every header (fork choice is at the tip) and has applied bodies only
+/// to height 8 — the `slag` shape, and the shape node1 was in when its state machine
+/// did not hold the main-chain block the 1056 checkpoint names.
+///
+/// A quorum for slot 16 arrives. `FinalityTracker` (head #1) advances, because a
+/// quorum of verified votes is all `try_finalize` needs and it is right about that.
+/// The **durable** head (#3) refuses, because the block is not there. `final=` now
+/// reads 16 and a restart would read 8.
+///
+/// Before this pass that refusal was `Ok(false)` into `let _`: not logged, not
+/// counted, not on telemetry, and **not distinguishable from success**.
+#[test]
+fn a_durable_head_that_refuses_is_counted_journalled_and_on_the_line() {
+    let (committee, validators) = devnet_committee(COMMITTEE_N);
+    let (mut a, mut b, _hub) = pair(&committee);
+    let blocks = mine_chain(&mut a, 17);
+    replay(&mut b, &blocks[..8]); // bodies to 8
+    replay_headers_only(&mut b, &blocks[8..]); // headers to 17
+    assert_eq!(b.node().tip_height(), 17, "fork choice is at the tip");
+    assert_eq!(b.node().state_lag().state_tip, 8, "the state machine is not");
+
+    let cp16 = checkpoint_at(&b, 16);
+    b.announce_checkpoint(cp16, sign(&validators, &cp16, 0..QUORUM));
+
+    // Head #1 advanced — correctly. It saw a quorum.
+    assert_eq!(b.node().finality().finalized_height(), Some(16), "the tracker head");
+    // Head #3 did not. This is the divergence, and it is now VISIBLE.
+    assert_eq!(
+        b.node().durable_finalized_height(),
+        None,
+        "the durable head never advanced — a restart would read this, not 16"
+    );
+    assert_eq!(b.node().finalize_refused_total(), 1, "counted: fdrop=1");
+
+    let journal = b.node_mut().drain_finalize_refusals();
+    assert_eq!(journal.len(), 1, "journalled once");
+    assert_eq!(journal[0].head, "state", "the DURABLE head is the one that refused");
+    assert_eq!(journal[0].height, 16);
+    assert_eq!(journal[0].why, "unknown", "the state machine does not hold that block");
+    assert!(
+        journal[0].to_string().starts_with("FINALIZE refused head=state h=16 cp="),
+        "and it renders for the container log: {}",
+        journal[0]
+    );
+    assert!(journal[0].to_string().ends_with(" why=unknown"), "{}", journal[0]);
+}
+
+/// The retry is unchanged (#130 (a)) and the counter is a **transition** count, not
+/// an attempt count. A stuck durable head is one number, not a per-tick ramp — and
+/// when the bodies arrive the retry succeeds, the divergence closes, and the count
+/// stays as the lossless record that it happened.
+#[test]
+fn a_stuck_durable_head_counts_once_and_closes_when_the_bodies_arrive() {
+    let (committee, validators) = devnet_committee(COMMITTEE_N);
+    let (mut a, mut b, _hub) = pair(&committee);
+    let blocks = mine_chain(&mut a, 17);
+    replay(&mut b, &blocks[..8]);
+    replay_headers_only(&mut b, &blocks[8..]);
+    let cp16 = checkpoint_at(&b, 16);
+    b.announce_checkpoint(cp16, sign(&validators, &cp16, 0..QUORUM));
+    assert_eq!(b.node().finalize_refused_total(), 1);
+    assert_eq!(b.node_mut().drain_finalize_refusals().len(), 1, "journalled once, then taken");
+
+    // Many more drains, each of which retries the refused record.
+    link(&mut a, &mut b);
+    run(&mut [&mut a, &mut b], 200, 0);
+    assert!(
+        b.node_mut().drain_finalize_refusals().is_empty(),
+        "200 retries of a divergence that has not changed produce no new journal lines"
+    );
+    assert_eq!(
+        b.node().finalize_refused_total(),
+        1,
+        "one divergence, not one per tick — this is the retry rate NOT being reported \
+         as the defect rate"
+    );
+
+    // The bodies land, the retry succeeds, and the two heads agree again.
+    for (h, body) in &blocks[8..] {
+        let _ = b.node_mut().ingest_block(*h, body.clone());
+    }
+    run(&mut [&mut a, &mut b], 100, 2_000);
+    assert_eq!(b.node().state_lag().state_tip, 17, "the state machine caught up");
+    assert_eq!(
+        b.node().durable_finalized_height(),
+        Some(16),
+        "and the durable head recorded what the tracker head already said"
+    );
+    assert_eq!(
+        b.node().finalize_refused_total(),
+        1,
+        "the count is the lossless record that it happened, not a live gauge"
+    );
+    assert!(b.node_mut().drain_finalize_refusals().is_empty(), "nothing new to journal");
+}
+
+/// A healthy node never refuses, so `fdrop=0` means what it says. Stated because a
+/// counter that is noisy in normal operation is a counter nobody will alert on.
+#[test]
+fn a_healthy_node_refuses_nothing() {
+    let (committee, validators) = devnet_committee(COMMITTEE_N);
+    let (mut a, mut b, _hub) = pair(&committee);
+    let blocks = mine_chain(&mut a, 17);
+    replay(&mut b, &blocks);
+    for h in [8u64, 16] {
+        let cp = checkpoint_at(&a, h);
+        a.announce_checkpoint(cp, sign(&validators, &cp, 0..QUORUM));
+    }
+    link(&mut a, &mut b);
+    run(&mut [&mut a, &mut b], 300, 0);
+
+    for n in [&a, &b] {
+        assert_eq!(n.node().finalize_refused_total(), 0, "nothing refused");
+        assert_eq!(
+            n.node().durable_finalized_height(),
+            n.node().finality().finalized_height(),
+            "and the operator-facing head and the durable head agree"
+        );
+        assert_eq!(n.node().durable_finalized_height(), Some(16));
+    }
+}
+
+/// The fork-choice head (#2) is read too. It refuses for its own reasons, and its
+/// refusal is attributed to `head=chain` so an operator is never left guessing which
+/// of the three heads declined.
+#[test]
+fn the_fork_choice_head_refusing_is_reported_as_its_own_head() {
+    let (committee, validators) = devnet_committee(COMMITTEE_N);
+    let (mut hostile, mut b, _hub) = pair(&committee);
+    let blocks = mine_chain(&mut hostile, 17);
+    replay(&mut b, &blocks);
+    link(&mut hostile, &mut b);
+    run(&mut [&mut hostile, &mut b], 20, 0);
+
+    // A quorum for a block no head holds.
+    let off_chain = Checkpoint::new(16, [0x77; 32], [0x77; 32]);
+    inject_checkpoint_answer(&hostile, PeerId(2), &off_chain, &sign(&validators, &off_chain, 0..QUORUM));
+    run(&mut [&mut b], 20, 1_000);
+
+    let journal = b.node_mut().drain_finalize_refusals();
+    let heads: Vec<&str> = journal.iter().map(|r| r.head).collect();
+    assert!(heads.contains(&"chain"), "fork choice refused and said so: {heads:?}");
+    assert!(heads.contains(&"state"), "so did the durable head: {heads:?}");
+    assert!(journal.iter().all(|r| r.height == 16 && r.why == "unknown"), "{journal:?}");
+    assert_eq!(b.node().chain().finalized_height(), None, "and neither pointer moved");
+    assert_eq!(b.node().durable_finalized_height(), None);
 }

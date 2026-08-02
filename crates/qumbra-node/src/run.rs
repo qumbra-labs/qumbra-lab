@@ -1105,8 +1105,35 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // `qlab_p2p::node::MAX_CHECKPOINT_QUERIES_IN_FLIGHT` (1). Always printed,
         // zero included (the #130 (a) rule).
         let cpq = self.p2p.checkpoint_queries();
+        // Issue #204 (the coordinator's 2026-08-02 correction to #203): `dfin=` and
+        // `fdrop=` are **appended at the end**, after `cpq=`, under the same rule as
+        // every addition since #87 — every pre-existing field keeps its name,
+        // position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified. **Touches TELEMETRY.**
+        //
+        // 🔴 **`final=` is not the head that survives a restart.** `final=` and `fid=`
+        // read the `FinalityTracker` (head #1), which is discarded at shutdown and
+        // re-derived at `open` from the state machine's chain store (head #3) — and
+        // head #3 is what `Snapshot.finalized` is written from, and what
+        // `no_reorg_past_finalized_checkpoint_ever` ultimately executes on. Nothing
+        // anywhere compared the two. node1 printed `final=1056` on every sample for
+        // hours with a durable head of 1048, and no field on this line could say so.
+        //
+        //   `dfin=` — head #3's height, or `-`. `final=` and `dfin=` disagreeing is
+        //     the divergence, on one line, side by side, in the same units.
+        //   `fdrop=` — distinct finalize-record refusals since process start. A
+        //     TRANSITION count, not an attempt count: `sync_state_finality` retries
+        //     every drain, so counting attempts would report the retry rate. `0` on
+        //     every healthy node, always; `>0` means read the `FINALIZE refused`
+        //     journal lines, which carry the head, the height and the reason.
+        //
+        // Both always printed, zero and `-` included (the #130 (a) rule).
+        let dfin = node
+            .durable_finalized_height()
+            .map_or_else(|| "-".to_string(), |h| h.to_string());
+        let fdrop = node.finalize_refused_total();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} cpq={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} cpq={} dfin={} fdrop={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1127,6 +1154,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             prest,
             uex,
             cpq,
+            dfin,
+            fdrop,
         )
     }
 
@@ -1335,6 +1364,28 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             .p2p
             .node_mut()
             .drain_rewinds()
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+        for line in &lines {
+            println!("{line}");
+        }
+        lines
+    }
+
+    /// Emit one `FINALIZE refused` journal line per finalize record this node
+    /// declined to write since the last call (issue #204), and return the lines.
+    ///
+    /// Beside `REWIND`, on the message-pump cadence, for the same reason: a refusal
+    /// is an **event** and the telemetry line only ever carries levels. `fdrop=` is
+    /// the alertable count; this is the line that says which head refused, at what
+    /// height, for which checkpoint, and why — which is the whole difference between
+    /// knowing a divergence happened and being able to act on it.
+    pub fn emit_finalize_refusals(&mut self) -> Vec<String> {
+        let lines: Vec<String> = self
+            .p2p
+            .node_mut()
+            .drain_finalize_refusals()
             .iter()
             .map(|r| r.to_string())
             .collect();
@@ -1675,6 +1726,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             self.note_slots_reached();
             self.emit_rounds();
             self.emit_rewinds();
+            self.emit_finalize_refusals();
             if self.mining && self.last_mine.elapsed() >= self.mine_interval {
                 if self.try_mine() {
                     self.try_checkpoint();
@@ -3810,7 +3862,7 @@ mod tests {
                 // ── appended by #200, at the end ──
                 "uex",
                 // ── appended by #204, at the end ──
-                "cpq",
+                "cpq", "dfin", "fdrop",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -3841,7 +3893,13 @@ mod tests {
         assert!(line.contains(" uex=0"), "exemption disarmed: {line}");
         // #204: a node alone on its own chain has nobody to ask and nothing to ask
         // about — the zero is printed, not omitted (the #130 (a) rule).
-        assert!(line.ends_with(" cpq=0"), "no query in flight, last: {line}");
+        // Not `ends_with` any more: #204's second pair is now the tail.
+        assert!(line.contains(" cpq=0"), "no query in flight: {line}");
+        // #204: the durable head is the one a restart reads, and on a healthy node it
+        // agrees with `final=`. This rig finalized genesis, so both say 0.
+        assert!(line.contains(" final=0 "), "the tracker head: {line}");
+        assert!(line.contains(" dfin=0"), "and the DURABLE head agrees: {line}");
+        assert!(line.ends_with(" fdrop=0"), "nothing was refused, last: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

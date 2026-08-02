@@ -29,7 +29,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use qlab_devnet::body::{validate_body, BlockBody, BodyError, TxEntry};
-use qlab_devnet::chain::{ChainState, InsertError};
+use qlab_devnet::chain::{ChainState, FinalizeMarkError, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, MemberStatus, Validator, Vote};
 use qlab_devnet::ebbflow::{
     equivocation_slash, finality_status, verify_equivocation, EquivocationEvidence, FinalityStatus,
@@ -212,6 +212,19 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// Rewind reports awaiting the journal (issue #162), newest-wins and bounded by
     /// [`MAX_JOURNALLED_REWINDS`]. See [`NodeAdapter::drain_rewinds`].
     rewinds: Vec<RewindReport>,
+    /// Finalize records refused and not yet journalled (issue #204). Bounded by
+    /// [`MAX_JOURNALLED_FINALIZE_REFUSALS`], oldest dropped.
+    finalize_refusals: Vec<FinalizeRefusal>,
+    /// Lossless count of refusal **transitions** since process start — the number
+    /// behind `fdrop=`. A transition, not an attempt: `sync_state_finality` retries
+    /// on every drain (issue #130 (a)), so counting attempts would report the retry
+    /// rate rather than the divergence, and an operator would have no way to tell
+    /// one stuck head from a thousand.
+    finalize_refused_total: u64,
+    /// The refusal currently latched — `(head, height)`. Set on a new refusal,
+    /// cleared the moment that head records a finalize. Exists so the retry loop
+    /// neither re-counts nor re-journals a divergence that has not changed.
+    finalize_refused_live: Option<(&'static str, u64)>,
     /// Issue #200: monotonic-ms when this node first entered the continuous
     /// *lagging + outstanding unserved body ask* state, or `None` when that
     /// condition is not holding. Progress (a requested body arrived) or leaving
@@ -223,6 +236,66 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// (equal-work keeps the incumbent tip, so one sibling alone is not enough).
     state_tip_mine_ready: bool,
 }
+
+/// **A finalize record this node refused to write, and why** (issue #204, from the
+/// coordinator's 2026-08-02 correction to #203).
+///
+/// There are three finalized heads on a running node and only one of them survives
+/// a restart:
+///
+/// | # | head | written by | durable |
+/// |---|---|---|---|
+/// | 1 | [`FinalityTracker`] | `try_finalize`, on quorum | rehydrated from #3 at `open` |
+/// | 2 | the adapter's fork-choice [`ChainState`] | `set_finalized` | no |
+/// | 3 | the state machine's chain store | `Node::finalize` → snapshot + `Finalize` log | **yes** |
+///
+/// `final=` and `fid=` on the telemetry line read **#1**. `Snapshot.finalized` is
+/// written from **#3**. Both writes to #2 and #3 used to be spelled `let _ =`, so a
+/// refusal was **not logged, not counted, not on telemetry, and indistinguishable
+/// from success** — which is how node1 could run for hours with an operator-facing
+/// head of 1056 and a durable head of 1048 and no instrument able to say so.
+///
+/// `Ok(false)` from `Node::finalize` means head #1 and head #3 have diverged **at
+/// that instant, on this node, at a known height, for a known reason**. It is the
+/// cheapest and earliest detection point this class will ever have.
+/// The first four bytes of a hash, rendered like every other short id on the
+/// journal lines (`REWIND`, `ROUND`'s `cpid`, `TELEMETRY`'s `fid`).
+fn finalize_hex8(h: &Hash32) -> String {
+    h[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FinalizeRefusal {
+    /// Which head refused: `"chain"` (#2, fork choice) or `"state"` (#3, durable).
+    pub head: &'static str,
+    /// The checkpoint height the refused record was for.
+    pub height: u64,
+    /// The block the checkpoint names.
+    pub hash: Hash32,
+    /// Why, in the store's own terms: `unknown` (this head does not hold the block),
+    /// `not-advancing`, `off-finality` (not a descendant of the current finalized
+    /// head), or `persist` (the append failed).
+    pub why: &'static str,
+}
+
+impl std::fmt::Display for FinalizeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "FINALIZE refused head={} h={} cp={} why={}",
+            self.head,
+            self.height,
+            finalize_hex8(&self.hash),
+            self.why
+        )
+    }
+}
+
+/// How many [`FinalizeRefusal`]s are held for the journal before the oldest is
+/// dropped. Same rule and same reason as [`MAX_JOURNALLED_REWINDS`]: the newest
+/// event is the one an operator is looking at, and the counter is the lossless
+/// record so a drop is visible as the count exceeding what was journalled.
+pub const MAX_JOURNALLED_FINALIZE_REFUSALS: usize = 32;
 
 /// How many [`RewindReport`]s are held for the journal before the oldest is dropped
 /// (issue #162). Small on purpose: this is a detail buffer for a rare event, and
@@ -573,6 +646,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             punishments: Vec::new(),
             punish_restore: PunishmentRestore::default(),
             rewinds: Vec::new(),
+            finalize_refusals: Vec::new(),
+            finalize_refused_total: 0,
+            finalize_refused_live: None,
             unserved_since_ms: None,
             state_tip_mine_ready: false,
         }
@@ -906,6 +982,55 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         (self.metrics.state_rewinds(), self.metrics.state_rewind_blocks())
     }
 
+    /// Record that a head refused a finalize record (issue #204).
+    ///
+    /// Deduplicated on `(head, height)` so a retry loop reports once, not once per
+    /// tick. Every distinct divergence is counted **and** journalled.
+    fn note_finalize_refused(&mut self, head: &'static str, height: u64, hash: Hash32, why: &'static str) {
+        if self.finalize_refused_live == Some((head, height)) {
+            return;
+        }
+        self.finalize_refused_live = Some((head, height));
+        self.finalize_refused_total += 1;
+        if self.finalize_refusals.len() >= MAX_JOURNALLED_FINALIZE_REFUSALS {
+            self.finalize_refusals.remove(0);
+        }
+        self.finalize_refusals.push(FinalizeRefusal { head, height, hash, why });
+    }
+
+    /// `head` recorded a finalize — its latched divergence, if any, is over. Scoped
+    /// to the head that succeeded, so a fork-choice advance cannot silently clear a
+    /// **durable**-head divergence that is still live.
+    fn note_finalize_recorded(&mut self, head: &'static str) {
+        if self.finalize_refused_live.is_some_and(|(h, _)| h == head) {
+            self.finalize_refused_live = None;
+        }
+    }
+
+    /// Take the finalize refusals not yet journalled (issue #204). Drained and
+    /// printed on the message-pump cadence beside `REWIND`, because a refusal is an
+    /// **event** and the telemetry line carries only levels.
+    pub fn drain_finalize_refusals(&mut self) -> Vec<FinalizeRefusal> {
+        std::mem::take(&mut self.finalize_refusals)
+    }
+
+    /// Distinct finalize-record refusals since process start — `fdrop=`. Zero on
+    /// every healthy node, always.
+    pub fn finalize_refused_total(&self) -> u64 {
+        self.finalize_refused_total
+    }
+
+    /// The **durable** finalized head (head #3) — what a restart of this node would
+    /// read, and the head `Snapshot.finalized` is written from.
+    ///
+    /// `final=` reads head #1. Until issue #204 nothing anywhere compared the two,
+    /// which is why a node whose durable head had never advanced past 1048 printed
+    /// `final=1056` on every sample for hours.
+    pub fn durable_finalized_height(&self) -> Option<u64> {
+        use qlab_node::ChainStore as _;
+        self.state.chain().finalized_height()
+    }
+
     /// Take the rewind reports not yet journalled (issue #162).
     ///
     /// The counters above are the lossless record and the alertable one; this is the
@@ -1190,7 +1315,35 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         if self.state.finalized_height() == Some(cp.height) {
             return;
         }
-        let _ = self.state.finalize(cp.block_hash);
+        // Issue #204: this was `let _ =`, and it is the one that mattered. The
+        // value discarded here is `Ok(false)` — "the chain store rejected it
+        // (unknown / non-advancing / off-finality)" — i.e. the **durable** head
+        // declining to record what the operator-facing head already reports. That is
+        // exactly the state node1 was in, and nothing on the node could say so.
+        //
+        // The reason is derived from the same store state `ChainStore::set_finalized`
+        // checked (it flattens `ChainState`'s typed error to a bool), so the three
+        // arms below are its three refusals and not a guess about them.
+        //
+        // The retry itself is unchanged (#130 (a)): a refusal is re-attempted on the
+        // next drain. What changed is that it is now counted, journalled and on the
+        // telemetry line while it lasts.
+        use qlab_node::ChainStore as _;
+        match self.state.finalize(cp.block_hash) {
+            Ok(true) => self.note_finalize_recorded("state"),
+            Ok(false) => {
+                let store = self.state.chain();
+                let why = if !store.contains(&cp.block_hash) {
+                    "unknown"
+                } else if store.finalized_height().is_some_and(|f| cp.height <= f) {
+                    "not-advancing"
+                } else {
+                    "off-finality"
+                };
+                self.note_finalize_refused("state", cp.height, cp.block_hash, why);
+            }
+            Err(_) => self.note_finalize_refused("state", cp.height, cp.block_hash, "persist"),
+        }
     }
 
     /// The lowest held body that extends the applied tip, if any.
@@ -1916,7 +2069,22 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
                     self.seen_checkpoints.insert(id);
                     self.observe_finality_advance(cp, prev_cp, tip);
                     // Advance the consensus finalized pointer (no reorg past finality).
-                    let _ = self.chain.set_finalized(cp.block_hash);
+                    //
+                    // Issue #204: this was `let _ =`. `ChainState::set_finalized`
+                    // returns a typed refusal and it was being thrown away, so a
+                    // fork-choice head that declined to advance was byte-identical,
+                    // on every surface, to one that did.
+                    match self.chain.set_finalized(cp.block_hash) {
+                        Ok(()) => self.note_finalize_recorded("chain"),
+                        Err(e) => {
+                            let why = match e {
+                                FinalizeMarkError::Unknown => "unknown",
+                                FinalizeMarkError::NotAdvancing => "not-advancing",
+                                FinalizeMarkError::NotDescendantOfFinalized => "off-finality",
+                            };
+                            self.note_finalize_refused("chain", cp.height, cp.block_hash, why);
+                        }
+                    }
                     // …and the state machine's finalized head, through the single
                     // place that does it. It may not hold this block yet — but that is
                     // no longer where the attempt ends: the next drain retries it
