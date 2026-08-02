@@ -1044,6 +1044,36 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // tracker meaning — learn-ahead is the capability, silent disagreement was
         // the defect. See `finality_backing_field` for the full-hash comparison.
         let finality_backing = self.finality_backing_field();
+        // Issue #181: `unk=` is **appended at the end**, under the same rule as
+        // every addition since #87 — every pre-existing field keeps its name,
+        // position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified. This branch was written when `fback=` was the tail at `main`
+        // `70706fc` and said so; `prest=` (#133 D3), `uex=` (#200) and `bdrop=`
+        // (#130 (b)) have landed since, so `unk=` now follows all three.
+        //
+        // 🔴 **Why it is on this line and not only in `/metrics`.** #181 makes an
+        // unrecognised frame silent, and a silent ignore is how the next
+        // version-skew incident becomes invisible. The window where that matters is
+        // a rolling upgrade — `OPERATOR.md` §4 rolls one host at a time and the
+        // operator watches stdout while each host rejoins — and `/metrics` is
+        // **off unless `metrics_addr` is set** (#87's decision, deliberate: a node
+        // nobody scrapes listens on nothing extra). A counter that lives only
+        // behind an optional endpoint would be absent on precisely the hosts that
+        // skew first, which is the same shape as #84's finding: the most
+        // informative reading missing from the only instrument the operator has.
+        // It is also on `/metrics` (two counters), because a rate is a machine's
+        // question — the two are the same numbers, as `dialable=` already is.
+        //
+        // Two numbers in one field, `dialable={}/{}`'s precedent: they answer one
+        // question ("is something newer talking to me?") at two layers, and
+        // splitting them would put two fields on the line for one fact.
+        //
+        // Caliper: cumulative **since process start**, over frames and inventory
+        // items this node was handed after the inbound rate limiter; a restart
+        // resets both. Always printed, zeroes included (the #130 (a) rule) — a node
+        // always knows these counts, and `unk=0/0` is the healthy reading and a
+        // fact. Neither number is ever a scoring input; that is the whole of #181.
+        let unk = self.p2p.unknown_stats();
         // Issue #133 D3: `prest=` is **appended at the end**, after `breq=`, under the
         // same rule as every addition since #87 — every pre-existing field keeps its
         // name, position and meaning, and the `PRE_I84_FIELDS` prefix test passes
@@ -1106,7 +1136,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // question "which of the five, and is `not_extending_tip` still zero" belongs.
         let bdrop = bdrop_field(node.body_refusals());
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={} unk={}/{}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1127,6 +1157,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             prest,
             uex,
             bdrop,
+            unk.frames,
+            unk.inv_items,
         )
     }
 
@@ -1223,6 +1255,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 s.throttled_frames + s.throttled_bytes
             },
             throttled_getaddr: self.p2p.rate_stats().throttled_getaddr,
+            // Issue #181, read from the same `unknown_stats()` the `TELEMETRY`
+            // line reads, so the log and the scrape cannot come to disagree about
+            // how much version skew this node has seen.
+            unknown_msg_type: self.p2p.unknown_stats().frames,
+            unknown_inv_kind: self.p2p.unknown_stats().inv_items,
             outbound_netgroups: self.p2p.addrs().outbound_groups().len() as u64,
             process_start_secs: self.process_start_secs,
             rendered_at_secs: unix_secs(),
@@ -2077,9 +2114,20 @@ mod tests {
         );
         // So the "one field is last" idea is kept rather than deleted — whichever
         // field it is must still be asserted, or a truncated line would pass.
+        //
+        // ⚠️ This assertion has now been rewritten by three consecutive appends
+        // (#200, #130 (b), #181), which is the cost of pinning the tail **by name**
+        // on an append-only line: every addition must edit it, and three concurrent
+        // batons had to edit the same two lines. It is kept anyway — a truncated
+        // line has to fail something — but the name is the newest field, not
+        // whichever field happened to be last when the test was written.
         assert!(
-            line.ends_with(" bdrop=0@-"),
-            "the newest append is last, and this node refused no body: {line}"
+            line.contains(" bdrop=0@- "),
+            "the body-refusal field is present and mid-line: {line}"
+        );
+        assert!(
+            line.ends_with(" unk=0/0"),
+            "the newest append is last, and this node saw no version skew: {line}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -3841,6 +3889,8 @@ mod tests {
                 "uex",
                 // ── appended by #130 (b), at the end ──
                 "bdrop",
+                // ── appended by #181, at the end ──
+                "unk",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -3874,7 +3924,75 @@ mod tests {
         // #130 (b): this node applied every body it produced, so nothing has been
         // refused — and it says so with a zero and an explicit "no height", rather
         // than by the field being absent.
-        assert!(line.ends_with(" bdrop=0@-"), "no body refused, last: {line}");
+        // No longer `ends_with` either — `unk=` (#181) appended after it.
+        assert!(line.contains(" bdrop=0@- "), "no body refused: {line}");
+        // #181: a node that has spoken to nobody has seen no version skew, and it
+        // says the zero rather than omitting the field (the #130 (a) rule). It is
+        // the newest append, so it carries the "one field is last" check.
+        assert!(line.ends_with(" unk=0/0"), "no skew seen, last: {line}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Issue #181 end-to-end, over a real socket: the frame is ignored, the peer
+    /// is not banned, and both operator surfaces say so with the same number.**
+    ///
+    /// It goes through the TCP transport on purpose. The unit tests in `qlab-p2p`
+    /// prove the classification; what only the binary can prove is that a frame an
+    /// upgraded host would actually send reaches the counter, and that the counter
+    /// reaches `TELEMETRY` and `/metrics` without the two disagreeing — which is
+    /// the failure #84 named, one fact rendered twice from two derivations.
+    ///
+    /// The placement decision it guards is that `unk=` is on the log line at all:
+    /// `/metrics` is off unless `metrics_addr` is set, so a scrape-only counter
+    /// would be absent on precisely the hosts a rolling upgrade skews first.
+    #[test]
+    fn an_unknown_envelope_type_over_tcp_is_ignored_and_reported_on_both_surfaces() {
+        use std::io::Write;
+
+        let (config, genesis, base) = rig("telemetry_unk", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        assert_eq!(field(&node.telemetry_sample(), "unk"), "0/0", "clean at start");
+
+        // A well-formed frame at our protocol version carrying a type code no build
+        // implements — exactly what an additive `MsgType` looks like to a host that
+        // predates it. Hand-built, because `Envelope::new` cannot express it.
+        let unknown_type: u16 = 0x0044;
+        assert!(qlab_p2p::MsgType::from_u16(unknown_type).is_none());
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&qlab_p2p::MAGIC);
+        frame.extend_from_slice(&qlab_p2p::PROTOCOL_VERSION.to_le_bytes());
+        frame.extend_from_slice(&unknown_type.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut sock = std::net::TcpStream::connect(node.listen_addr()).expect("dial the node");
+        sock.write_all(&frame).expect("send the newer type");
+        sock.flush().unwrap();
+
+        // Pump until the frame lands. The reader thread and the node loop are
+        // separate, so a single step can legitimately see nothing yet.
+        for _ in 0..200 {
+            node.step_once();
+            if node.p2p().unknown_stats().frames > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            field(&node.telemetry_sample(), "unk"),
+            "1/0",
+            "the frame was ignored, and saying so is the whole point of the field"
+        );
+        assert!(
+            node.metrics_text().contains("\nqumbra_unknown_msg_type_total 1\n"),
+            "the log and the scrape carry the same number: {}",
+            node.metrics_text()
+        );
+        assert!(
+            node.p2p().peers().iter().all(|p| p.score == 0),
+            "🔴 no peer was scored for speaking a type this build does not implement"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

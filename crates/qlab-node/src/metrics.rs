@@ -231,6 +231,14 @@ pub struct LiveGauges {
     /// Inbound `GetAddr` requests received but not answered (issue #91) — the
     /// amplifier's muzzle, counted.
     pub throttled_getaddr: u64,
+    /// Inbound frames carrying an envelope type code this build does not
+    /// implement (issue #181). **Version skew, not misbehaviour**: these frames
+    /// are ignored and never scored, and this is the only trace they leave.
+    pub unknown_msg_type: u64,
+    /// Inventory items carrying a kind code this build does not implement
+    /// (issue #181), summed over every `inv` / `getdata` / `notfound` received.
+    /// Same rule: skipped, never scored.
+    pub unknown_inv_kind: u64,
     /// **Highest height whose body the state machine has applied** (issue #130). The
     /// gauge `qumbra_tip_height` is fork choice; this is the other view, and the pair
     /// is the only way a scrape can see them disagree.
@@ -819,7 +827,7 @@ is nonzero means the exemption fired — the duty gate did not break. Exists fro
     ));
 
     // ---- live gauges ------------------------------------------------------
-    let gauges: [(&str, &str, u64); 19] = [
+    let gauges: [(&str, &str, u64); 21] = [
         ("qumbra_tip_height", "Fork-choice tip height.", g.tip_height),
         (
             "qumbra_state_tip_height",
@@ -878,6 +886,21 @@ count — throttling never scores or bans a peer; it is reported so an operator 
             "qumbra_throttled_getaddr_total",
             "Inbound GetAddr requests received but not answered (issue #91 amplifier limit).",
             g.throttled_getaddr,
+        ),
+        (
+            "qumbra_unknown_msg_type_total",
+            "Inbound frames whose envelope type code this build does not implement (issue #181). \
+NOT a misbehaviour count — the sender is running a newer build, the frame is ignored, and nothing \
+is scored. Nonzero on a rolling upgrade is EXPECTED and is the signal that a skew is in progress; \
+nonzero when no upgrade is in flight is the alert. Pairs with the TELEMETRY line's unk= field.",
+            g.unknown_msg_type,
+        ),
+        (
+            "qumbra_unknown_inv_kind_total",
+            "Inventory items whose kind code this build does not implement (issue #181), over all \
+inv/getdata/notfound received. Same rule as qumbra_unknown_msg_type_total: skipped, never scored. \
+Separate series because the two answer the same question one protocol layer apart.",
+            g.unknown_inv_kind,
         ),
         ("qumbra_mempool_size", "Transactions in the mempool.", g.mempool),
         ("qumbra_committee_epoch", "Current committee epoch.", g.epoch),
@@ -1046,6 +1069,8 @@ mod tests {
             open_rounds: 2,
             throttled_frames: 5,
             throttled_getaddr: 2,
+            unknown_msg_type: 7,
+            unknown_inv_kind: 4,
             outbound_netgroups: 3,
             halt_at: None,
             finalized_checkpoint_id: Some(0x4cc8_904e_1f2a),
@@ -1156,6 +1181,36 @@ mod tests {
             !text.lines().any(|l| l.starts_with("qumbra_finalized_height ")),
             "a never-finalized node must not report height 0 as finalized"
         );
+    }
+
+    /// **Issue #181: version skew is on the scrape, from the first sample, as its
+    /// own two series.**
+    ///
+    /// The zero case is the one worth asserting. An unrecognised frame is now
+    /// silent, so if these series only materialised once skew had already happened,
+    /// an operator could not write an alert against them before the upgrade they
+    /// want to watch — which is the same "the instrument appears after the incident"
+    /// shape #130 (a)'s refusal counters were given a test for.
+    #[test]
+    fn version_skew_counters_are_on_the_scrape_before_any_skew_happens() {
+        let m = Metrics::new();
+        let mut g = gauges();
+        g.unknown_msg_type = 0;
+        g.unknown_inv_kind = 0;
+        let text = render(&m, &g);
+        assert!(text.contains("\nqumbra_unknown_msg_type_total 0\n"), "{text}");
+        assert!(text.contains("\nqumbra_unknown_inv_kind_total 0\n"), "{text}");
+        // The HELP text must say the thing #181 exists to say, or an operator reads
+        // a nonzero count as a misbehaviour count and re-derives the banning bug.
+        assert!(
+            text.contains("NOT a misbehaviour count"),
+            "the scrape must state that unknown-type frames are not faults: {text}"
+        );
+
+        // And they carry real values, kept apart: two layers, two series.
+        let text = render(&m, &gauges());
+        assert!(text.contains("\nqumbra_unknown_msg_type_total 7\n"), "{text}");
+        assert!(text.contains("\nqumbra_unknown_inv_kind_total 4\n"), "{text}");
     }
 
     // ---- issue #130 (a): the two chain views, and the refusals ----------------

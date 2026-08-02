@@ -14,7 +14,17 @@
 //! The header is fixed 12 bytes, so a stream transport reads the header, learns
 //! the exact body length, and frames one message deterministically. Everything
 //! after the length prefix is authoritative: decoders reject trailing bytes,
-//! truncation, unknown version, unknown type, and oversize frames.
+//! truncation, unknown version, and oversize frames.
+//!
+//! ## An unknown *type* is not an error (issue #181)
+//!
+//! Framing has **three** outcomes, not two — see [`Frame`]. A type code this
+//! build does not implement is not a [`WireError`]; it cannot be, because
+//! [`WireError`] is the vocabulary of "the sender is at fault" and *"you are
+//! running a newer build than me"* is not a fault. The two used to share
+//! `WireError::UnknownMsgType`, one caller matched `Err(_)`, and an additive
+//! `MsgType` therefore banned its sender on the first frame. **The variant is
+//! gone so that branch cannot be written again.**
 
 /// Envelope magic — `b"QMBP"` (Qumbra P2P). Not a protocol version; purely a
 /// stream-desync / wrong-protocol guard so junk bytes fail fast rather than
@@ -37,9 +47,9 @@ pub const HEADER_LEN: usize = 12;
 pub const MAX_PAYLOAD: u32 = 8 * 1024 * 1024;
 
 /// Message types. `[devnet-placeholder]` — the *set* and *codes* are a lab
-/// proposal (§10). Unknown codes are reject-unknown (§0): [`MsgType::from_u16`]
-/// returns `None`, and [`Envelope::from_parts`] turns that into
-/// [`WireError::UnknownMsgType`].
+/// proposal (§10). A code this build does not implement makes
+/// [`MsgType::from_u16`] return `None`, which [`Frame::from_parts`] turns into
+/// [`Frame::UnknownType`] — **ignored, never scored** (issue #181).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u16)]
 pub enum MsgType {
@@ -143,9 +153,10 @@ pub enum WireError {
     /// Leading magic did not match — wrong protocol or a desynced stream.
     BadMagic { got: [u8; 4] },
     /// Version-tagged format carried a version we do not implement (§0).
+    ///
+    /// **Deliberately still an error, and issue #181 did not change it** — see
+    /// [`Frame`] for the grounds and for the finding this leaves open.
     UnsupportedVersion { got: u16 },
-    /// Message-type code is not one we implement (§0 reject-unknown).
-    UnknownMsgType { got: u16 },
     /// Declared body length exceeds [`MAX_PAYLOAD`].
     Oversize { got: u32, max: u32 },
     /// Bytes remained after a complete, well-formed envelope (reject-trailing).
@@ -162,7 +173,6 @@ impl core::fmt::Display for WireError {
             WireError::UnsupportedVersion { got } => {
                 write!(f, "unsupported protocol version {got} (want {PROTOCOL_VERSION})")
             }
-            WireError::UnknownMsgType { got } => write!(f, "unknown message type 0x{got:04x}"),
             WireError::Oversize { got, max } => write!(f, "oversize frame: {got} > {max}"),
             WireError::TrailingBytes { remaining } => {
                 write!(f, "trailing bytes after envelope: {remaining}")
@@ -231,20 +241,90 @@ impl Envelope {
         out
     }
 
-    /// Reassemble a validated header + already-read body into an envelope,
-    /// applying reject-unknown on version and type (§0).
-    pub fn from_parts(header: FrameHeader, payload: Vec<u8>) -> Result<Envelope, WireError> {
+}
+
+/// **One framed inbound message, classified — and the whole point is that there
+/// are three outcomes and not two** (issue #181).
+///
+/// | outcome | means | the sender's fault |
+/// |---|---|---|
+/// | `Ok(Frame::Known)` | a type this build implements | — |
+/// | `Ok(Frame::UnknownType)` | **you are running a newer build than me** | **no** |
+/// | `Err(WireError)` | you sent bytes I cannot parse | **yes** |
+///
+/// Before #181 the middle row did not exist: `MsgType::from_u16` returning `None`
+/// became `WireError::UnknownMsgType`, [`crate::node::P2pNode::tick`] matched
+/// `Err(_)` and charged `PENALTY_MALFORMED` (100) against a `BAN_THRESHOLD` of
+/// −100 — **an instant, one-frame ban for the crime of being newer.** On a net
+/// that rolls one host at a time, that made any additive `MsgType` a partition:
+/// the upgraded host would be banned by every host it still needed. `issue #130`
+/// (c) was authorised to add a type and declined for exactly this reason.
+///
+/// The separation is structural rather than behavioural on purpose. The bug
+/// existed because both cases were reachable through one `Err(_)`, so the
+/// unknown-type case was **removed from [`WireError`] entirely**: a future caller
+/// cannot re-conflate them, because the error type can no longer say it.
+///
+/// ## What this does NOT cover, and it is the thing most likely to bite next
+///
+/// [`WireError::UnsupportedVersion`] is still an error and still scores. That is
+/// deliberate and it is a narrower claim than it looks:
+///
+/// - an additive **type code** inside one protocol version is designed to be
+///   forward-compatible — the framing is unchanged, the body is skippable
+///   because its length is declared, and the receiver loses nothing by ignoring
+///   it;
+/// - a **version** bump is by definition a wire break, and nothing guarantees a
+///   v2 frame is even framed the way this parser assumes. "Ignore it and keep
+///   reading the stream" is not obviously safe there, and choosing between
+///   ignore / disconnect / score is a handshake-policy decision this baton was
+///   not given.
+///
+/// 🔴 **So the consequence stands and is reported rather than fixed: if a future
+/// change bumps `PROTOCOL_VERSION` instead of adding a type code, it partitions a
+/// rolling upgrade exactly the way #181 describes, and this fix does not help.**
+/// There is also no separate handshake version check to fall back on — `peer.rs`
+/// says the guarantee "is enforced one layer down, at `crate::wire` decode", and
+/// that decode is this one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Frame {
+    /// A type this build implements. Dispatch it.
+    Known(Envelope),
+    /// A well-formed frame at **our** protocol version whose type code this build
+    /// does not implement. Ignore it; count it; never score it.
+    ///
+    /// The body is dropped rather than carried: we cannot parse it (that is what
+    /// unknown means) and holding it would only invite someone to try.
+    UnknownType {
+        /// The raw code, so the counter can say *what* the newer peer is speaking.
+        msg_type_raw: u16,
+        /// The body length we skipped — an unknown type is still framed, because
+        /// the length prefix is type-independent.
+        payload_len: usize,
+    },
+}
+
+impl Frame {
+    /// Classify a validated header + already-read body. Version is reject-unknown
+    /// (§0); type is reject-unknown *without* being an error (issue #181).
+    pub fn from_parts(header: FrameHeader, payload: Vec<u8>) -> Result<Frame, WireError> {
         if header.version != PROTOCOL_VERSION {
             return Err(WireError::UnsupportedVersion { got: header.version });
         }
-        let msg_type = MsgType::from_u16(header.msg_type_raw)
-            .ok_or(WireError::UnknownMsgType { got: header.msg_type_raw })?;
-        Ok(Envelope { version: header.version, msg_type, payload })
+        match MsgType::from_u16(header.msg_type_raw) {
+            Some(msg_type) => {
+                Ok(Frame::Known(Envelope { version: header.version, msg_type, payload }))
+            }
+            None => Ok(Frame::UnknownType {
+                msg_type_raw: header.msg_type_raw,
+                payload_len: payload.len(),
+            }),
+        }
     }
 
-    /// Decode exactly one envelope from a whole-frame buffer. Rejects truncation
-    /// and trailing bytes (the transport delivers one frame per buffer).
-    pub fn decode(buf: &[u8]) -> Result<Envelope, WireError> {
+    /// Decode exactly one frame from a whole-frame buffer. Rejects truncation and
+    /// trailing bytes (the transport delivers one frame per buffer).
+    pub fn decode(buf: &[u8]) -> Result<Frame, WireError> {
         let header = FrameHeader::parse(buf)?;
         let total = HEADER_LEN + header.payload_len as usize;
         if buf.len() < total {
@@ -253,8 +333,21 @@ impl Envelope {
         if buf.len() > total {
             return Err(WireError::TrailingBytes { remaining: buf.len() - total });
         }
-        let payload = buf[HEADER_LEN..total].to_vec();
-        Envelope::from_parts(header, payload)
+        Frame::from_parts(header, buf[HEADER_LEN..total].to_vec())
+    }
+
+    /// The envelope, if this build implements the type. Convenience for tests and
+    /// for readers that only care about known traffic.
+    pub fn known(&self) -> Option<&Envelope> {
+        match self {
+            Frame::Known(e) => Some(e),
+            Frame::UnknownType { .. } => None,
+        }
+    }
+
+    /// The message type, if this build implements it.
+    pub fn msg_type(&self) -> Option<MsgType> {
+        self.known().map(|e| e.msg_type)
     }
 }
 
@@ -272,7 +365,7 @@ mod tests {
             assert_eq!(mt.as_u16(), raw);
             let env = Envelope::new(mt, vec![1, 2, 3, 4, 5]);
             let bytes = env.encode();
-            assert_eq!(Envelope::decode(&bytes).unwrap(), env);
+            assert_eq!(Frame::decode(&bytes).unwrap(), Frame::Known(env));
         }
     }
 
@@ -310,50 +403,70 @@ mod tests {
         let env = Envelope::new(MsgType::VerAck, vec![]);
         let bytes = env.encode();
         assert_eq!(bytes.len(), HEADER_LEN);
-        assert_eq!(Envelope::decode(&bytes).unwrap(), env);
+        assert_eq!(Frame::decode(&bytes).unwrap(), Frame::Known(env));
     }
 
     #[test]
     fn reject_unknown_version() {
         let mut bytes = Envelope::new(MsgType::Version, vec![]).encode();
         bytes[4] = 0x02; // version 2
-        assert_eq!(Envelope::decode(&bytes), Err(WireError::UnsupportedVersion { got: 2 }));
+        assert_eq!(Frame::decode(&bytes), Err(WireError::UnsupportedVersion { got: 2 }));
     }
 
+    /// **Issue #181 at the framing layer: an unknown type is `Ok`, not `Err`.**
+    ///
+    /// The assertion that carries the fix is not the returned variant, it is that
+    /// no [`WireError`] is produced at all — the caller that used to ban on
+    /// `Err(_)` now has nothing to ban on. The body is skipped by its declared
+    /// length, which is what makes ignoring safe: the frame is still framed.
     #[test]
-    fn reject_unknown_msg_type() {
-        let mut bytes = Envelope::new(MsgType::Version, vec![]).encode();
+    fn an_unknown_msg_type_is_a_frame_outcome_and_not_an_error() {
+        let mut bytes = Envelope::new(MsgType::Version, vec![7; 5]).encode();
         bytes[6] = 0xFF; // type 0x00FF, unassigned
         bytes[7] = 0x00;
-        assert_eq!(Envelope::decode(&bytes), Err(WireError::UnknownMsgType { got: 0x00FF }));
-        assert!(MsgType::from_u16(0x00FF).is_none());
+        assert!(MsgType::from_u16(0x00FF).is_none(), "0x00FF really is unallocated");
+        assert_eq!(
+            Frame::decode(&bytes),
+            Ok(Frame::UnknownType { msg_type_raw: 0x00FF, payload_len: 5 }),
+            "a newer peer's type code is an outcome, never a WireError"
+        );
+        let f = Frame::decode(&bytes).unwrap();
+        assert!(f.known().is_none());
+        assert_eq!(f.msg_type(), None);
     }
 
+    /// The complement: **the frames that ARE the sender's fault still are.** These
+    /// four are the whole of `WireError` besides `UnsupportedVersion`, and every
+    /// one of them is bytes this node cannot parse under any type it knows.
     #[test]
-    fn reject_bad_magic() {
-        let mut bytes = Envelope::new(MsgType::Ping, vec![]).encode();
-        bytes[0] = b'X';
-        match Envelope::decode(&bytes) {
-            Err(WireError::BadMagic { .. }) => {}
-            other => panic!("expected BadMagic, got {other:?}"),
-        }
-    }
+    fn malformed_framing_is_still_an_error_for_every_case() {
+        let mut bad_magic = Envelope::new(MsgType::Ping, vec![]).encode();
+        bad_magic[0] = b'X';
+        assert!(matches!(Frame::decode(&bad_magic), Err(WireError::BadMagic { .. })));
 
-    #[test]
-    fn reject_trailing_bytes() {
-        let mut bytes = Envelope::new(MsgType::Pong, vec![9, 9]).encode();
-        bytes.push(0x00); // one byte too many
-        assert_eq!(Envelope::decode(&bytes), Err(WireError::TrailingBytes { remaining: 1 }));
-    }
+        let mut trailing = Envelope::new(MsgType::Pong, vec![9, 9]).encode();
+        trailing.push(0x00);
+        assert_eq!(Frame::decode(&trailing), Err(WireError::TrailingBytes { remaining: 1 }));
 
-    #[test]
-    fn reject_truncated_body() {
-        let bytes = Envelope::new(MsgType::Tx, vec![1, 2, 3, 4]).encode();
-        let short = &bytes[..bytes.len() - 1];
-        match Envelope::decode(short) {
-            Err(WireError::Truncated { .. }) => {}
-            other => panic!("expected Truncated, got {other:?}"),
-        }
+        let full = Envelope::new(MsgType::Tx, vec![1, 2, 3, 4]).encode();
+        assert!(matches!(
+            Frame::decode(&full[..full.len() - 1]),
+            Err(WireError::Truncated { .. })
+        ));
+
+        let mut oversize = Vec::new();
+        oversize.extend_from_slice(&MAGIC);
+        oversize.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+        oversize.extend_from_slice(&MsgType::Tx.as_u16().to_le_bytes());
+        oversize.extend_from_slice(&(MAX_PAYLOAD + 1).to_le_bytes());
+        assert!(matches!(Frame::decode(&oversize), Err(WireError::Oversize { .. })));
+
+        // And the distinction holds when both are wrong at once: garbage framing
+        // wins, because we never got far enough to read a type code.
+        let mut both = Envelope::new(MsgType::Ping, vec![]).encode();
+        both[0] = b'X';
+        both[6] = 0xFF;
+        assert!(matches!(Frame::decode(&both), Err(WireError::BadMagic { .. })));
     }
 
     #[test]
