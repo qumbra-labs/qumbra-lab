@@ -21,6 +21,15 @@ tiny_http = "=0.12.0"
 # CSPRNG for keypair/note generation and randomized decoy fetches (workspace rev).
 rand = "0.10"
 
+[dev-dependencies]
+# Issue #215: the collision the scan defends against is a property of the REAL
+# key hierarchy — one `nk` per spend key, `dk_d` per diversifier, `nf` binding
+# neither the diversifier nor the value. The tests build real wallets and real
+# diversified addresses and check `nf` with the wallet's own `derive_nf` (which is
+# regression-locked to the circuit) rather than restating the derivation.
+# Not a cycle: qlab-wallet depends on qlab-note/qlab-air, never on this crate.
+qlab-wallet = { path = "../qlab-wallet" }
+
 [[bin]]
 name = "cbreport"
 path = "src/bin/cbreport.rs"

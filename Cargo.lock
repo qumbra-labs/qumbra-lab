@@ -989,6 +989,7 @@ dependencies = [
  "qlab-air",
  "qlab-devnet",
  "qlab-note",
+ "qlab-wallet",
  "rand",
  "tiny_http",
 ]
