@@ -1165,8 +1165,60 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // is on `/metrics` (`qumbra_body_apply_refused_total`), which is where the
         // question "which of the five, and is `not_extending_tip` still zero" belongs.
         let bdrop = bdrop_field(node.body_refusals());
+        // Issue #204: `cpq=` is **appended at the end**, after `uex=`, under the same
+        // rule as every addition since #87 — every pre-existing field keeps its name,
+        // position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified. **Touches TELEMETRY.**
+        //
+        // It is the count of finalized-checkpoint queries in flight (issue #204's
+        // "ask the net what is finalized"), and it exists because of the sentence
+        // that issue asked to be kept: **`sslot=` and `final=` are both already on
+        // this line and nothing compared them.** The comparison is now made in code
+        // every tick — `tip` against `final`, which is the superset, because a
+        // keyless node has no `sslot` and was diverging in exactly the same way —
+        // and this field is where an operator sees that check firing.
+        //
+        // The pair to read is `final=` / `cpq=`, exactly as #130 (c) reads
+        // `slag=` / `breq=`: `final=` stuck with `cpq=0` is *this node has not
+        // noticed*; `final=` stuck with `cpq=1` sustained is *asking and not being
+        // served*, which is a peer-side or version-skew problem and not this node's.
+        // On 2026-08-01 node1 printed the first reading for hours and there was no
+        // field on the line that could have told the two apart.
+        //
+        // Caliper: an instantaneous level, not a total — how many asks are in flight
+        // at the moment the line is printed, capped at
+        // `qlab_p2p::node::MAX_CHECKPOINT_QUERIES_IN_FLIGHT` (1). Always printed,
+        // zero included (the #130 (a) rule).
+        let cpq = self.p2p.checkpoint_queries();
+        // Issue #204 (the coordinator's 2026-08-02 correction to #203): `dfin=` and
+        // `fdrop=` are **appended at the end**, after `cpq=`, under the same rule as
+        // every addition since #87 — every pre-existing field keeps its name,
+        // position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified. **Touches TELEMETRY.**
+        //
+        // 🔴 **`final=` is not the head that survives a restart.** `final=` and `fid=`
+        // read the `FinalityTracker` (head #1), which is discarded at shutdown and
+        // re-derived at `open` from the state machine's chain store (head #3) — and
+        // head #3 is what `Snapshot.finalized` is written from, and what
+        // `no_reorg_past_finalized_checkpoint_ever` ultimately executes on. Nothing
+        // anywhere compared the two. node1 printed `final=1056` on every sample for
+        // hours with a durable head of 1048, and no field on this line could say so.
+        //
+        //   `dfin=` — head #3's height, or `-`. `final=` and `dfin=` disagreeing is
+        //     the divergence, on one line, side by side, in the same units.
+        //   `fdrop=` — distinct finalize-record refusals since process start. A
+        //     TRANSITION count, not an attempt count: `sync_state_finality` retries
+        //     every drain, so counting attempts would report the retry rate. `0` on
+        //     every healthy node, always; `>0` means read the `FINALIZE refused`
+        //     journal lines, which carry the head, the height and the reason.
+        //
+        // Both always printed, zero and `-` included (the #130 (a) rule).
+        let dfin = node
+            .durable_finalized_height()
+            .map_or_else(|| "-".to_string(), |h| h.to_string());
+        let fdrop = node.finalize_refused_total();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={} unk={}/{}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={} unk={}/{} cpq={} dfin={} fdrop={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1189,6 +1241,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             bdrop,
             unk.frames,
             unk.inv_items,
+            cpq,
+            dfin,
+            fdrop,
         )
     }
 
@@ -1451,6 +1506,28 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             .p2p
             .node_mut()
             .drain_rewinds()
+            .iter()
+            .map(|r| r.to_string())
+            .collect();
+        for line in &lines {
+            println!("{line}");
+        }
+        lines
+    }
+
+    /// Emit one `FINALIZE refused` journal line per finalize record this node
+    /// declined to write since the last call (issue #204), and return the lines.
+    ///
+    /// Beside `REWIND`, on the message-pump cadence, for the same reason: a refusal
+    /// is an **event** and the telemetry line only ever carries levels. `fdrop=` is
+    /// the alertable count; this is the line that says which head refused, at what
+    /// height, for which checkpoint, and why — which is the whole difference between
+    /// knowing a divergence happened and being able to act on it.
+    pub fn emit_finalize_refusals(&mut self) -> Vec<String> {
+        let lines: Vec<String> = self
+            .p2p
+            .node_mut()
+            .drain_finalize_refusals()
             .iter()
             .map(|r| r.to_string())
             .collect();
@@ -1791,6 +1868,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             self.note_slots_reached();
             self.emit_rounds();
             self.emit_rewinds();
+            self.emit_finalize_refusals();
             if self.mining && self.last_mine.elapsed() >= self.mine_interval {
                 if self.try_mine() {
                     self.try_checkpoint();
@@ -2216,8 +2294,17 @@ mod tests {
             "the body-refusal field is present and mid-line: {line}"
         );
         assert!(
-            line.ends_with(" unk=0/0"),
-            "the newest append is last, and this node saw no version skew: {line}"
+            line.contains(" unk=0/0 "),
+            "the version-skew field is present and mid-line: {line}"
+        );
+        // ⚠️ Rewritten a fourth time, by #204. This assertion pins the tail BY NAME
+        // on an append-only line, so every append must edit it — and git produced no
+        // conflict marker here on any of the four, because the incoming branch never
+        // touched this hunk. The identical idea 1800 lines below DID conflict, every
+        // time, which is what makes this copy the dangerous one.
+        assert!(
+            line.ends_with(" fdrop=0"),
+            "the newest append is last, and nothing was refused: {line}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -3981,6 +4068,8 @@ mod tests {
                 "bdrop",
                 // ── appended by #181, at the end ──
                 "unk",
+                // ── appended by #204, at the end ──
+                "cpq", "dfin", "fdrop",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -4005,21 +4094,25 @@ mod tests {
         assert!(line.contains(" fback=local "), "backing verdict present: {line}");
         // #133 D3: a fresh data dir has nothing to restore — and the shape is
         // restored/known, not a bare zero, so "nothing to restore" is distinguishable
-        // from "unk". Also no longer `ends_with`: `uex=` (#200) and then `bdrop=`
-        // (#130 (b)) landed after it.
+        // from "unk". Not `ends_with`: four fields have appended after it.
         assert!(line.contains(" prest=0/0 "), "nothing restored: {line}");
-        // #200: a healthy node is not under the unobtainable-body exemption. No
-        // longer `ends_with` either — `bdrop=` appended after it.
+        // #200: a healthy node is not under the unobtainable-body exemption.
         assert!(line.contains(" uex=0 "), "exemption disarmed: {line}");
         // #130 (b): this node applied every body it produced, so nothing has been
         // refused — and it says so with a zero and an explicit "no height", rather
         // than by the field being absent.
-        // No longer `ends_with` either — `unk=` (#181) appended after it.
         assert!(line.contains(" bdrop=0@- "), "no body refused: {line}");
         // #181: a node that has spoken to nobody has seen no version skew, and it
-        // says the zero rather than omitting the field (the #130 (a) rule). It is
-        // the newest append, so it carries the "one field is last" check.
-        assert!(line.ends_with(" unk=0/0"), "no skew seen, last: {line}");
+        // says the zero rather than omitting the field (the #130 (a) rule).
+        assert!(line.contains(" unk=0/0 "), "no skew seen: {line}");
+        // #204: a node alone on its own chain has nobody to ask and nothing to ask
+        // about — the zero is printed, not omitted.
+        assert!(line.contains(" cpq=0 "), "no query in flight: {line}");
+        // #204: the durable head is the one a restart reads, and on a healthy node it
+        // agrees with `final=`. This rig finalized genesis, so both say 0.
+        assert!(line.contains(" final=0 "), "the tracker head: {line}");
+        assert!(line.contains(" dfin=0 "), "and the DURABLE head agrees: {line}");
+        assert!(line.ends_with(" fdrop=0"), "nothing was refused, last: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
