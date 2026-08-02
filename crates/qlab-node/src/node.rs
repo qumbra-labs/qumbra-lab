@@ -160,20 +160,109 @@ fn block_weight(block: &StoredBlock) -> usize {
         + 40
 }
 
+/// **Why a snapshot that was present and decodable was not honoured** (issue
+/// #225) — the discarded half of a fall-through to the full replay.
+///
+/// The fall-through itself is always correct: the block log is the source of
+/// truth and a from-genesis replay of it is this crate's standing correctness
+/// anchor. That is exactly why the *reason* has to survive. A datadir whose
+/// snapshot cannot be honoured has just told the operator something about
+/// itself, and a node that recovers without saying so turns a finding into a
+/// startup that is merely slower than usual — which is how this defect would
+/// come back wearing a different hat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotRejection {
+    /// The reconstructed log prefix did not end on the tip the snapshot claims,
+    /// so the snapshot's derived state is for a branch this log abandoned
+    /// (issue #162). Pre-#225 this was already a silent `Ok(None)`.
+    TipDisagreement { applied_height: u64, snapshot_tip: Hash32, prefix_tip: Hash32 },
+    /// A rewind the log implies could not be honoured against the chain store
+    /// the snapshot path reconstructed (issue #225).
+    ///
+    /// `above_snapshot` says which of the two reconstruction loops refused.
+    /// `true` is the shape that stranded a T0 host: fork choice moved the applied
+    /// tip back onto a same-height sibling, so the prefix reconstruction dropped
+    /// the orphan's parent, and the one logged block above `applied_height`
+    /// then asked to rewind onto it.
+    RewindRefused {
+        applied_height: u64,
+        /// Height of the log record whose `prev` asked for the rewind.
+        at_height: u64,
+        /// The rewind target — the record's `prev`.
+        target: Hash32,
+        error: RewindError,
+        above_snapshot: bool,
+    },
+}
+
+impl std::fmt::Display for SnapshotRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotRejection::TipDisagreement { applied_height, snapshot_tip, prefix_tip } => {
+                write!(
+                    f,
+                    "the log prefix at or below height {applied_height} ends on {}, but the \
+                     snapshot claims tip {} — its derived state is for a branch this log abandoned",
+                    hex8(prefix_tip),
+                    hex8(snapshot_tip)
+                )
+            }
+            SnapshotRejection::RewindRefused {
+                applied_height,
+                at_height,
+                target,
+                error,
+                above_snapshot,
+            } => {
+                let where_ = if *above_snapshot {
+                    "above the snapshot"
+                } else {
+                    "inside the snapshot prefix"
+                };
+                write!(
+                    f,
+                    "the log record at height {at_height} ({where_}, applied_height \
+                     {applied_height}) implies a rewind to {} that this reconstruction cannot \
+                     honour: {error}",
+                    hex8(target)
+                )
+            }
+        }
+    }
+}
+
 /// What [`MemNode::open`] recovered from disk.
 ///
 /// `replayed_records` counts log records that advanced state beyond the snapshot:
 /// blocks above its applied height plus finalizations that advanced beyond its
 /// restored finalized head. With no snapshot, every decoded record is replayed.
+///
+/// `snapshot_rejected` is `Some` when a snapshot **was** on disk, decoded, and
+/// matched this genesis, but could not be honoured against the log — see
+/// [`SnapshotRejection`]. `snapshot_height` is `None` in that case (no snapshot
+/// was used), which is exactly why the two fields are separate: before issue
+/// #225 "no snapshot was used" and "the snapshot was unusable" were the same
+/// report.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
     pub snapshot_height: Option<u64>,
     pub replayed_records: usize,
     pub resumed_tip: u64,
+    pub snapshot_rejected: Option<SnapshotRejection>,
 }
 
 impl std::fmt::Display for RecoveryReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The rejected case is checked first and worded loudly: it is the one
+        // startup where the operator has something to do afterwards.
+        if let Some(why) = &self.snapshot_rejected {
+            return write!(
+                f,
+                "RECOVERY snapshot DISCARDED ({why}), full replay from genesis, replayed {} \
+                 records, resumed at tip {}",
+                self.replayed_records, self.resumed_tip
+            );
+        }
         match self.snapshot_height {
             Some(height) => write!(
                 f,
@@ -436,6 +525,16 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     recovery: RecoveryReport,
 }
 
+/// The outcome of [`MemNode::resume_from_snapshot`] — a node, or the reason this
+/// snapshot could not be honoured against this log.
+///
+/// It replaces an `Option<MemNode>` (issue #225): the `None` carried no reason,
+/// and the reason is the half of this fall-through an operator needs.
+enum SnapshotResume {
+    Resumed(MemNode),
+    Rejected(SnapshotRejection),
+}
+
 impl MemNode {
     /// An in-memory node from a genesis block, with no disk durability.
     pub fn in_memory(genesis: StoredBlock) -> Self {
@@ -462,27 +561,58 @@ impl MemNode {
         // and every finalization, are fully replayed — keeping the result
         // identical to a from-genesis `replay`.
         //
-        // A snapshot that the log does not corroborate is `Ok(None)`, not an
+        // A snapshot that the log does not corroborate is a REJECTION, not an
         // error: the full replay below is always correct, and that fall-through is
         // the discipline `persist` already documents for a torn or
-        // version-mismatched snapshot. Issue #162 gave it a second way to happen —
-        // see [`Self::resume_from_snapshot`].
+        // version-mismatched snapshot. Issue #162 gave it a second way to happen,
+        // and issue #225 a third — see [`Self::resume_from_snapshot`]. The reason
+        // is carried into the [`RecoveryReport`] rather than dropped.
+        let mut snapshot_rejected = None;
         if let Some(snap) = snapshot.as_ref() {
-            if let Some(node) = Self::resume_from_snapshot(&dir, &genesis, snap, &records)? {
-                return Ok(node);
+            match Self::resume_from_snapshot(&dir, &genesis, snap, &records)? {
+                SnapshotResume::Resumed(node) => return Ok(node),
+                SnapshotResume::Rejected(why) => snapshot_rejected = Some(why),
             }
         }
-        Self::resume_by_replay(&dir, genesis, &records)
+        Self::resume_by_replay(&dir, genesis, &records, snapshot_rejected)
     }
 
-    /// The snapshot-assisted resume. `Ok(None)` = this snapshot cannot be
+    /// The snapshot-assisted resume. `Rejected` = this snapshot cannot be
     /// honoured against this log and the caller must replay from genesis.
+    ///
+    /// # Which failures are a fall-through, and which are still a refusal
+    ///
+    /// **A fall-through is only ever "this SNAPSHOT cannot be honoured against
+    /// this LOG".** Two things can say that, and both are recoverable because the
+    /// log is the source of truth and the full replay does not consult the
+    /// snapshot at all:
+    ///
+    /// - the reconstructed prefix does not end on `snap.tip` (issue #162), and
+    /// - **a rewind refusal in either reconstruction loop** (issue #225). The
+    ///   prefix loop rebuilds only records at or below `applied_height`, so a
+    ///   rewind target that the *full* log holds can be missing here; and
+    ///   `MemChainStore::rewind_to` drops the losing sibling, so a block logged
+    ///   above `applied_height` whose parent lost fork choice asks to rewind onto
+    ///   a block the prefix no longer stores. Neither says anything about the log.
+    ///
+    /// **Everything else still refuses, loudly**: a tampered or corrupt record
+    /// ([`check_stored_binding`], and every [`Self::apply_state`] failure inside
+    /// [`Self::apply_logged_block`]), a chain-store insert refusal, and the two
+    /// snapshot-finality refusals. Those are properties of the datadir, not of
+    /// the snapshot, so a full replay would refuse them too — swallowing them
+    /// here would trade a loud refusal for a silent one.
+    ///
+    /// **The fall-through cannot hide a genuinely broken log**, and that is the
+    /// argument for drawing the line at the rewind rather than at some narrower
+    /// subset of [`RewindError`]: whatever the log really is, the from-genesis
+    /// replay is what decides, and if the log is the problem the replay refuses
+    /// with its own reason.
     fn resume_from_snapshot(
         dir: &Path,
         genesis: &StoredBlock,
         snap: &Snapshot,
         records: &[LogRecord],
-    ) -> Result<Option<Self>, NodeError> {
+    ) -> Result<SnapshotResume, NodeError> {
         let mut node = Self::from_genesis(genesis.clone(), Some(dir.to_path_buf()));
         node.restore_from_snapshot(snap);
 
@@ -517,7 +647,23 @@ impl MemNode {
                             cursor = undone.header.prev;
                             node.retained.insert(undone);
                         }
-                        node.chain.rewind_to(b.header.prev).map_err(NodeError::Rewind)?;
+                        // Issue #225: a refusal here is "this snapshot cannot be
+                        // honoured against this log", not "this log is broken" —
+                        // the prefix loop has only the records at or below
+                        // `applied_height`, so a target the whole log holds can be
+                        // absent from it. Fall through to the full replay, which
+                        // has every record and is always correct.
+                        if let Err(error) = node.chain.rewind_to(b.header.prev) {
+                            return Ok(SnapshotResume::Rejected(
+                                SnapshotRejection::RewindRefused {
+                                    applied_height: snap.applied_height,
+                                    at_height: b.header.height,
+                                    target: b.header.prev,
+                                    error,
+                                    above_snapshot: false,
+                                },
+                            ));
+                        }
                     }
                     node.chain.put_block(b.clone()).map_err(NodeError::Chain)?;
                     node.retained.forget(&b.header().header_hash());
@@ -537,7 +683,11 @@ impl MemNode {
         // nothing downstream would notice. So the agreement is checked rather than
         // assumed, and a disagreement costs a full replay instead of a fork.
         if node.chain.tip_hash() != snap.tip {
-            return Ok(None);
+            return Ok(SnapshotResume::Rejected(SnapshotRejection::TipDisagreement {
+                applied_height: snap.applied_height,
+                snapshot_tip: snap.tip,
+                prefix_tip: node.chain.tip_hash(),
+            }));
         }
 
         if let Some((hash, height)) = snap.finalized {
@@ -561,7 +711,24 @@ impl MemNode {
             match rec {
                 LogRecord::Block(b) if b.header.height <= snap.applied_height => {}
                 LogRecord::Block(b) => {
-                    node.apply_logged_block(b)?;
+                    if let Err(e) = node.apply_logged_block(b) {
+                        // Issue #225 — THE line this issue is about, and the
+                        // boundary it draws. A rewind refusal means the prefix
+                        // reconstruction dropped a block the full log still holds
+                        // (fork choice moved the applied tip back onto a
+                        // same-height sibling, so the orphan's parent left the
+                        // store); anything else — a tampered body, a chain-store
+                        // refusal, IO — is a property of the datadir that the
+                        // full replay would hit too, so it is re-raised.
+                        let NodeError::Rewind(error) = e else { return Err(e) };
+                        return Ok(SnapshotResume::Rejected(SnapshotRejection::RewindRefused {
+                            applied_height: snap.applied_height,
+                            at_height: b.header.height,
+                            target: b.header.prev,
+                            error,
+                            above_snapshot: true,
+                        }));
+                    }
                     replayed_records += 1;
                 }
                 LogRecord::Finalize(hash) => {
@@ -575,15 +742,21 @@ impl MemNode {
             snapshot_height: Some(snap.applied_height),
             replayed_records,
             resumed_tip: node.chain.tip_height(),
+            snapshot_rejected: None,
         };
-        Ok(Some(node))
+        Ok(SnapshotResume::Resumed(node))
     }
 
     /// The from-genesis resume: every record replayed, no snapshot consulted.
+    ///
+    /// `snapshot_rejected` is carried in rather than recomputed: by the time this
+    /// runs the snapshot has already been discarded, and "there was no snapshot"
+    /// and "the snapshot was unusable" are different things to tell an operator.
     fn resume_by_replay(
         dir: &Path,
         genesis: StoredBlock,
         records: &[LogRecord],
+        snapshot_rejected: Option<SnapshotRejection>,
     ) -> Result<Self, NodeError> {
         let mut node = Self::from_genesis(genesis, Some(dir.to_path_buf()));
         let mut replayed_records = 0usize;
@@ -602,6 +775,7 @@ impl MemNode {
             snapshot_height: None,
             replayed_records,
             resumed_tip: node.chain.tip_height(),
+            snapshot_rejected,
         };
         Ok(node)
     }
