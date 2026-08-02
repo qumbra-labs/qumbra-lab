@@ -1,6 +1,9 @@
 # Where the CI suite runs, and what it costs
 
-**Status: one half decided, one half open.** The architecture is settled and stays settled. The
+**Status: one half decided, one half open.** *(Amended 2026-08-02: option F added at Larry's
+suggestion — EC2 on-demand under a Savings Plan — which the first version omitted, and which
+displaces spot as the AWS option worth pricing. The amendment also surfaced that the T0 fleet's own
+on-demand cost has never been measured.)* The architecture is settled and stays settled. The
 *hosting* was never decided — it was assumed by a $2 experiment that has since become a $9.31
 month — and the budget is Larry's call under R3. This file exists because that assumption had no
 written record, which was discovered on 2026-08-02 when the budget page was read for the first
@@ -177,6 +180,57 @@ What it costs that the table does not show:
 **None of this disqualifies C.** It says C's real price is operational and structural, not
 per-minute, and that a comparison run purely on the per-minute rate would be misleading.
 
+**Superseded in part by F below**: if the argument for leaving GitHub is cost, on-demand with
+start/stop captures most of the saving without the eviction failure mode, so **C is now the weaker
+of the two AWS options** and is kept here only because the per-minute figure is genuinely lower.
+
+### F. AWS EC2 Graviton **on-demand**, started and stopped around each run — optionally under a Savings Plan
+
+**Raised by Larry, 2026-08-02, after this document's first version omitted it.** It is not a variant
+of C; it removes C's one *technical* objection outright.
+
+**Spot's eviction is fatal here and on-demand's is not.** A two-minute eviction notice against a
+35-minute serial run that cannot be resumed means the run is lost, and the re-run is equally
+interruptible. `--test-threads=1` is not negotiable (`CLAUDE.md` §5), so the run cannot be shortened
+by parallelism to duck under the risk. On-demand simply does not have this failure mode.
+
+**The instance must be stopped when idle, and that is the whole cost model.** EC2 bills by the
+second while running. The suite runs on the order of one hour a day; a machine left up would bill
+720 hours a month to do 30 hours of work. So option F is really *on-demand plus start/stop
+orchestration*, and the orchestration is the thing being bought, not the instance.
+
+**Where a Savings Plan does and does not help — and this is the part worth getting right.** A
+Compute Savings Plan commits to a fixed **dollars-per-hour, continuously**, for one or three years,
+in exchange for a discount. **That instrument is a poor fit for a workload used ~4 % of the time**:
+sized to cover the CI burst it pays for ~23 idle hours a day, and sized small enough not to, it
+discounts only a sliver. **A Savings Plan bought *for CI alone* would likely cost more than it
+saves.**
+
+**But this project already runs a continuous on-demand fleet, and nobody has priced it.** The four
+T0 hosts are `t4g.small`, on-demand, in four regions (`us-east-1`, `eu-west-1`, `ap-southeast-1`,
+`ap-northeast-1`), and `terraform/` contains **no `spot` or `market_options` block anywhere** — so
+all four are full on-demand. They have been up continuously since 2026-07-26 15:43: **≈161 hours
+each, ≈646 instance-hours, and still running.**
+
+🔴 **That fleet is the workload a Savings Plan actually fits, and it is almost certainly a larger
+line item than the entire CI question this document was opened about.** Four small instances
+running 24/7 across four regions is on the order of a few tens of dollars a month at list price
+against a **$20** CI budget — and a Compute Savings Plan applies **across instance families and
+regions**, so one commitment sized to the T0 fleet would also absorb a CI instance's occasional
+hours as a side effect.
+
+**Caliper on those dollar figures: none of them are measured.** This document's §4 numbers come
+from GitHub's billing page divided by run durations. **The AWS side has not been read at all** —
+no Cost Explorer figure, no bill, no per-region price lookup. The instance types, count, regions
+and uptime above **are** verified from `terraform/` and the deployment record; the *dollars* are
+list-price reasoning and must be confirmed against the actual AWS bill before anything is bought.
+**R3 applies with full force: this is spend, and it is Larry's, every time.**
+
+**What F still costs, unchanged from C:** a fifth machine to maintain that is not part of the net,
+a runner registration to keep alive, the self-hosted-runner-executing-PR-code shape, and the R1
+dilution — a runner this session provisions and can reach is a weaker witness than one it cannot
+touch.
+
 ### D. Rig only — delete CI
 
 Saves everything and gives up R1. The coordinator would again be the sole producer and sole judge
@@ -198,7 +252,8 @@ to have a CI consequence, and it belongs to Larry entirely.
 and removes the half of the spend that buys nothing. Whatever is decided about hosting is decided
 against a halved baseline, which is the honest number to decide against.
 
-**Then decide A vs C deliberately, with C's operational cost priced rather than assumed.** After B,
+**Then decide A vs F deliberately** — not A vs C — **with F's operational cost priced rather than
+assumed.** After B,
 the current procedure costs roughly one suite run per merged PR — the rate at which this project
 actually merges, not the rate at which builders push. That may well be affordable on A, which
 would make C's maintenance burden unjustified. **That arithmetic cannot be done before B, because
@@ -207,12 +262,21 @@ today's number is dominated by runs nobody reads.**
 **Not recommended: D**, for the reason in §7. **Not assessed here: E**, because it is not a CI
 question.
 
+**Separately, and larger than everything above: read the AWS bill.** §7F establishes that four
+on-demand instances have been running continuously for 161 hours across four regions with no
+Savings Plan and no spot, and that **nobody has ever looked at what they cost.** That number is
+plausibly several times the $20 this document was opened about. **Whatever is decided about CI, the
+T0 fleet is the bigger line and it is unmeasured** — and a Savings Plan, if one is ever bought,
+should be sized against *that*, with CI riding it rather than justifying it.
+
 ## 9. What is open
 
 | | owner |
 |---|---|
 | The `$20` budget: raise, hold, or hold-and-cut-usage | **Larry (R3)** |
-| Whether to move off GitHub-hosted at all | **Larry**, informed by §7C |
+| Whether to move off GitHub-hosted at all | **Larry**, informed by §7F (§7C is the weaker AWS option) |
+| **Whether to buy a Savings Plan, and sized against what** | **Larry (R3)** — see §7F: the T0 fleet, not CI, is the workload that fits one |
+| **Reading the actual AWS bill for the T0 fleet** | unassigned, and it is the largest unmeasured number in this document |
 | Repo visibility | **Larry** |
 | The trigger change (§7B) | coordinator — free and reversible, proposed as its own PR |
 
