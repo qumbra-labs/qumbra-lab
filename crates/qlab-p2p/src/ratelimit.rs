@@ -118,6 +118,26 @@ pub const GETADDR_SERVE_INTERVAL_MS: u64 = 30_000;
 /// by another route.
 pub const MAX_RATE_KEYS: usize = 4096;
 
+/// Minimum gap between two finalized-checkpoint **query answers we serve** to one
+/// rate key (issue #204).
+///
+/// The #204 query is a 45 B `GetData` whose answer is a whole finalized checkpoint
+/// plus its quorum vote set — at the T0 committee size that is 21 ML-DSA-65
+/// signatures, ~3,309 B each, so ~70 KB off one small request. That is #91's
+/// amplifier shape exactly (measured 1084x for `GetAddr`), and the query path is
+/// the first one that can be driven **without an inv first**, so it needs its own
+/// serve budget rather than inheriting the inv path's implicit one.
+///
+/// 5 s caps the sustained answer rate at ~14 KB/s per key — 0.17 % of the 8 MiB/s
+/// the inbound byte budget already permits per key, and still fast enough that a
+/// node walking its finalized head up a long catch-up is not the bottleneck (one
+/// answer per 5 s against a 75 s block target). Matched to
+/// [`crate::node::CHECKPOINT_QUERY_INTERVAL_MS`], the rate at which we ask, so an
+/// honest requester is never throttled by an honest server.
+///
+/// `[devnet-placeholder]` testnet-tunable, NOT frozen.
+pub const CHECKPOINT_QUERY_SERVE_INTERVAL_MS: u64 = 5_000;
+
 /// Fraction of the key map dropped when it is full (oldest-first): `1/N`.
 pub const EVICT_FRACTION: usize = 4;
 
@@ -269,6 +289,10 @@ pub struct RateLimits {
     /// limit** — the only supported use is [`RateLimits::unlimited`], which exists
     /// to reproduce pre-fix behaviour through this same code path.
     pub getaddr_serve_interval_ms: u64,
+    /// Minimum gap between served finalized-checkpoint query answers (issue #204).
+    /// **`0` disables the serve limit**, same contract as
+    /// `getaddr_serve_interval_ms`.
+    pub cp_query_serve_interval_ms: u64,
     pub max_keys: usize,
 }
 
@@ -280,6 +304,7 @@ impl Default for RateLimits {
             byte_burst: BYTE_BURST,
             byte_refill_per_sec: BYTE_REFILL_PER_SEC,
             getaddr_serve_interval_ms: GETADDR_SERVE_INTERVAL_MS,
+            cp_query_serve_interval_ms: CHECKPOINT_QUERY_SERVE_INTERVAL_MS,
             max_keys: MAX_RATE_KEYS,
         }
     }
@@ -296,6 +321,7 @@ impl RateLimits {
             byte_burst: u64::MAX / 1000,
             byte_refill_per_sec: u64::MAX / 1000,
             getaddr_serve_interval_ms: 0,
+            cp_query_serve_interval_ms: 0,
             max_keys: MAX_RATE_KEYS,
         }
     }
@@ -328,6 +354,8 @@ pub struct RateStats {
     pub throttled_bytes: u64,
     /// `GetAddr` requests received but not answered (the amplifier, muzzled).
     pub throttled_getaddr: u64,
+    /// Finalized-checkpoint queries received but not answered (issue #204).
+    pub throttled_cp_query: u64,
     /// Rate keys dropped to keep the map bounded.
     pub evicted_keys: u64,
     /// Rate keys currently tracked.
@@ -339,6 +367,7 @@ struct Entry {
     msgs: TokenBucket,
     bytes: TokenBucket,
     getaddr: TokenBucket,
+    cp_query: TokenBucket,
     last_seen_ms: u64,
 }
 
@@ -391,6 +420,10 @@ impl RateLimiter {
                 0 => TokenBucket::per_sec(u64::MAX / 1000, u64::MAX / 1000),
                 ms => TokenBucket::every(ms),
             },
+            cp_query: match limits.cp_query_serve_interval_ms {
+                0 => TokenBucket::per_sec(u64::MAX / 1000, u64::MAX / 1000),
+                ms => TokenBucket::every(ms),
+            },
             last_seen_ms: now_ms,
         });
         e.last_seen_ms = now_ms;
@@ -432,6 +465,25 @@ impl RateLimiter {
             true
         } else {
             self.stats.throttled_getaddr += 1;
+            false
+        }
+    }
+
+    /// Whether we may answer a finalized-checkpoint query from `key` now (issue
+    /// #204). Consumes the allowance when it returns true.
+    ///
+    /// Over-rate queries are dropped in silence and **not scored**, and — unlike
+    /// every other unservable `GetData` item — they are not answered `NotFound`
+    /// either: `NotFound` is itself scored by the receiver
+    /// ([`crate::gossip::PENALTY_WELSHED_INV`]) on every path that is not its own
+    /// outstanding ask, and a throttle is our limit, not the asker's fault. Asking
+    /// twice is not misbehaviour (the `GetAddr` rule, unchanged).
+    pub fn may_serve_cp_query(&mut self, key: RateKey, now_ms: u64) -> bool {
+        let e = self.entry(key, now_ms);
+        if e.cp_query.try_take(1, now_ms) {
+            true
+        } else {
+            self.stats.throttled_cp_query += 1;
             false
         }
     }
