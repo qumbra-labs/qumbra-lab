@@ -97,7 +97,40 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
 
    `--test-threads=1` is required, not stylistic: `qumbra-node` holds three real M3 prove tests
    and the release suite peaks 16–30 GB on a 36 GiB rig. **Never start a second one while one is
-   running** — take a slot on [issue #64](https://github.com/qumbra-labs/qumbra-lab/issues/64) first.
+   running.**
+
+   🔴 **Take the lock. It is not a courtesy queue — it is the only way any of the jobs finish.**
+
+   ```sh
+   scripts/rig run -- cargo test --release --workspace -- --test-threads=1
+   ```
+
+   `scripts/rig` is an actual mutex on this machine (`~/.qumbra-rig.lock`, created with `mkdir`,
+   which is atomic). It waits for the holder, runs your command, and releases on exit — including
+   on Ctrl-C and on a kill. `scripts/rig status` says who holds it. A holder whose process is gone
+   is reaped automatically, so a crashed baton cannot wedge the rig.
+
+   **This replaces "check `ps`, then post a START line on issue #64", and the reason is that the old
+   rule could not work.** Check-then-act is a race, and issue #64 records it losing twice: two
+   batons read the same "machine is free" and started 56 seconds apart, and separately the
+   coordinator collided with a baton six minutes into its run. The thread's own remedy — *"re-check
+   `ps` immediately before `cargo test`, not before writing the comment"* — narrows the window and
+   does not close it. **On 2026-08-02 a measurement read 2.1× its true value** because a suite
+   started underneath it; it was caught only because that baton knew what a contaminated run looks
+   like.
+
+   **It binds the coordinator too**, which the convention did not. The coordinator runs the most
+   suites of anyone here and was outside the protocol that everyone else was being told to follow.
+
+   **Issue #64 stays**, and its job is now the one it is actually good at: a human-readable log of
+   what ran, what it measured, and what it cost. **It is no longer the mechanism.** Post there for
+   the record, not for the lock.
+
+   **If you must run heavy work outside the wrapper**, hold the lock around it yourself
+   (`scripts/rig run -- bash -c '…'`) rather than skipping it. And if a release-mode number looks
+   wrong, the cheap tell for contamination on this rig is **`sys` time inflated several-fold with
+   instructions-retired nearly flat** — that pattern means something else was running, and the
+   number should be discarded rather than caveated.
 
    **Reconcile the arithmetic out loud**: your total must equal `main`'s baseline plus your new
    tests. Verify the negatives too — `FAILED` (case-sensitive), `panicked at`, `^error` all zero.
