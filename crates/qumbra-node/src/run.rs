@@ -1080,8 +1080,33 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // needs one field that says "it was the exemption". Always printed, zero
         // included (the #130 (a) rule).
         let uex = u8::from(node.state_tip_mine_ready());
+        // Issue #204: `cpq=` is **appended at the end**, after `uex=`, under the same
+        // rule as every addition since #87 — every pre-existing field keeps its name,
+        // position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified. **Touches TELEMETRY.**
+        //
+        // It is the count of finalized-checkpoint queries in flight (issue #204's
+        // "ask the net what is finalized"), and it exists because of the sentence
+        // that issue asked to be kept: **`sslot=` and `final=` are both already on
+        // this line and nothing compared them.** The comparison is now made in code
+        // every tick — `tip` against `final`, which is the superset, because a
+        // keyless node has no `sslot` and was diverging in exactly the same way —
+        // and this field is where an operator sees that check firing.
+        //
+        // The pair to read is `final=` / `cpq=`, exactly as #130 (c) reads
+        // `slag=` / `breq=`: `final=` stuck with `cpq=0` is *this node has not
+        // noticed*; `final=` stuck with `cpq=1` sustained is *asking and not being
+        // served*, which is a peer-side or version-skew problem and not this node's.
+        // On 2026-08-01 node1 printed the first reading for hours and there was no
+        // field on the line that could have told the two apart.
+        //
+        // Caliper: an instantaneous level, not a total — how many asks are in flight
+        // at the moment the line is printed, capped at
+        // `qlab_p2p::node::MAX_CHECKPOINT_QUERIES_IN_FLIGHT` (1). Always printed,
+        // zero included (the #130 (a) rule).
+        let cpq = self.p2p.checkpoint_queries();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} cpq={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1101,6 +1126,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             finality_backing,
             prest,
             uex,
+            cpq,
         )
     }
 
@@ -3783,6 +3809,8 @@ mod tests {
                 "prest",
                 // ── appended by #200, at the end ──
                 "uex",
+                // ── appended by #204, at the end ──
+                "cpq",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -3809,7 +3837,11 @@ mod tests {
         // Not `ends_with`: #200's `uex=` is now the tail.
         assert!(line.contains(" prest=0/0"), "nothing restored: {line}");
         // #200: a healthy node is not under the unobtainable-body exemption.
-        assert!(line.ends_with(" uex=0"), "exemption disarmed, last: {line}");
+        // Not `ends_with` any more: #204's `cpq=` is now the tail.
+        assert!(line.contains(" uex=0"), "exemption disarmed: {line}");
+        // #204: a node alone on its own chain has nobody to ask and nothing to ask
+        // about — the zero is printed, not omitted (the #130 (a) rule).
+        assert!(line.ends_with(" cpq=0"), "no query in flight, last: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
