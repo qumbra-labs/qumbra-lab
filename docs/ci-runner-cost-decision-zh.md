@@ -136,6 +136,14 @@ English: [`ci-runner-cost-decision.md`](./ci-runner-cost-decision.md) —— 技
 **这不需要预算决定，也不需要 Larry。** 它是对 `suite-arm64.yml` 的单文件、可逆改动；而且一个纯文档或
 纯 workflow 的 PR **不会触发套件**（`PR #191` 加的 `paths` 过滤），所以提出它本身是免费的。
 
+**2026-08-02 已实施：** `pull_request: types: [labeled]`，外加一个 job 级 `if` 检查标签名是
+`verify`（`labeled` 事件对**任何**标签都触发，所以没有名字检查的话，加一个无关标签就会花掉 34 分钟的
+付费时间）。`workflow_dispatch` 有意绕过这个门 —— 手动路径本身已经是一次明确的行为。
+
+🔴 **它造出来的次序，而且是这个项目反复付账的那个形状：先推合并树，再打标签。** 先打标签会让套件跑在
+合并之前的 head 上，返回一个**看起来像**同树结果、而实际不是的数字。它对着 PR 自己的 base 照样能对上
+账，所以不会有任何东西报警。重新打标签会在当前 head 上重跑，`cancel-in-progress` 会杀掉过期那次。
+
 ### C. AWS EC2 Graviton spot，self-hosted runner
 
 单位分钟成本便宜一大截 —— `t4g`/`c7g` 一类的 spot 大约是 GitHub larger runner 的五分之一到十分之一，
@@ -237,7 +245,7 @@ self-hosted runner 执行 PR 代码的那个安全形状、以及 R1 的稀释 �
 | **要不要买 Savings Plan，以及按什么规模买** | **Larry（R3）** —— 见 §7F：适配它的是 T0 机队，不是 CI |
 | **去读 T0 机队真实的 AWS 账单** | 未指派，而它是本文档里最大的一个未测量数字 |
 | 仓库可见性 | **Larry** |
-| 触发条件改动（§7B） | 协调者 —— 免费且可逆，作为独立 PR 提出 |
+| ~~触发条件改动（§7B）~~ | **2026-08-02 已完成** —— `types: [labeled]` + `verify` 门。见 §7B。 |
 
 ---
 
