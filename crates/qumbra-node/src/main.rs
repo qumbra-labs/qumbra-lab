@@ -174,6 +174,40 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         println!("  telemetry:    not served (set telemetry_addr in the config to enable)");
     }
 
+    // Issue #188 baton 2 — `/v1/compact`, the note-discovery endpoint a recipient
+    // finds its outputs on. 🔴 **The opposite default to the two above, and the
+    // opposite for a reason**: `metrics` and `telemetry` are off unless asked for
+    // because setting them opens a port, while this one defaults to LOOPBACK, which
+    // opens nothing an off-host attacker can reach. A chain whose recipients cannot
+    // find their money unless the operator opted in is `t1-discovery-serving-
+    // decision.md`'s option 2a with extra steps — the chain commits discovery
+    // correctly and hands it to nobody. Turning it off is an explicit
+    // `discovery_addr = "off"`.
+    if let Some(addr) = config.discovery_bind() {
+        let bound = node.start_discovery_endpoint(addr)?;
+        let view = node.discovery_view();
+        println!(
+            "  discovery:    http://{bound}/v1/compact?from=&to= (committed note discovery, GET only)"
+        );
+        println!(
+            "                projected {} main-chain blocks, {} B of committed discovery",
+            view.blocks.len(),
+            view.len_bytes()
+        );
+        if !bound.ip().is_loopback() {
+            println!(
+                "  ⚠️  discovery is bound to a non-loopback address — it must be paired with a \
+                 SOURCE-RESTRICTED inbound rule, not an open one. The bytes are public chain \
+                 data, but the listener is still an attack surface."
+            );
+        }
+    } else {
+        println!(
+            "  discovery:    ⚠️  NOT SERVED (discovery_addr = \"off\"). Recipients of any \
+             transaction this node accepts cannot find their outputs here."
+        );
+    }
+
     // Telemetry sampling cadence — OBSERVABILITY ONLY. This changes how often a
     // TELEMETRY line is printed and nothing else: not consensus, not the halt
     // height, not any frozen value. It exists because `regime=Halting` is a real

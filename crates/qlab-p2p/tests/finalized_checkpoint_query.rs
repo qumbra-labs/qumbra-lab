@@ -38,7 +38,7 @@ use qlab_p2p::peer::BAN_THRESHOLD;
 use qlab_p2p::n1::{BlockIngest, ChainView, IngestOutcome};
 use qlab_p2p::peer::PeerId;
 use qlab_p2p::transport::{InProcHub, InProcTransport, Transport};
-use qlab_p2p::wire::{Envelope, MsgType};
+use qlab_p2p::wire::{Envelope, Frame, MsgType};
 use qlab_p2p::P2pNode;
 
 /// Only a tx marked `ok` verifies; every body these tests move is coinbase-only.
@@ -364,7 +364,8 @@ fn the_answer_is_the_highest_finalized_checkpoint_at_or_below_the_height_asked_f
         server.tick(1_000 + ask * CHECKPOINT_QUERY_SERVE_INTERVAL_MS);
         let mut got = None;
         for (_, raw) in asker.transport().poll() {
-            let env = Envelope::decode(&raw).expect("well-formed");
+            let f = Frame::decode(&raw).expect("well-formed");
+            let env = f.known().expect("a known type");
             match env.msg_type {
                 MsgType::Checkpoint => {
                     got = Some(decode_checkpoint_msg(&env.payload).expect("well-formed").0.height)
@@ -395,10 +396,11 @@ fn the_requester_names_its_own_tip() {
         .poll()
         .iter()
         .filter_map(|(_, raw)| {
-            let env = Envelope::decode(raw).expect("well-formed");
+            let f = Frame::decode(raw).expect("well-formed");
+            let env = f.known().expect("a known type");
             (env.msg_type == MsgType::GetData).then(|| env.payload.clone())
         })
-        .flat_map(|p| decode_inv(&p).expect("well-formed"))
+        .flat_map(|p| decode_inv(&p).expect("well-formed").items)
         .filter_map(|it| checkpoint_query_height(&it.id))
         .collect();
     assert_eq!(asked, vec![17], "one query, naming this node's own tip");
@@ -523,17 +525,25 @@ fn the_query_allocates_no_new_msg_type_and_no_new_inv_kind() {
     let frame =
         Envelope::new(MsgType::GetData, encode_inv(&[InvItem { kind: InvKind::Checkpoint, id }]))
             .encode();
-    let back = Envelope::decode(&frame).expect("a type every deployed node knows");
+    let back_frame = Frame::decode(&frame).expect("a type every deployed node knows");
+    let back = back_frame.known().expect("a known type");
     assert_eq!(back.msg_type, MsgType::GetData);
     assert_eq!(back.msg_type.as_u16(), 0x0011, "no new envelope code was allocated");
-    let items = decode_inv(&back.payload).expect("well-formed");
-    assert_eq!(items[0].kind, InvKind::Checkpoint, "kind 3, allocated in M10-T0-5");
-    assert_eq!(items[0].kind as u8, 3);
+    // `#181` made `decode_inv` return an `InvVec`, which also reports item kinds
+    // this build does not implement (`unk=`'s second number). This query's kind is
+    // one this build DOES implement, so it must arrive in `items` and leave
+    // `unknown_kinds` at zero — asserted, because a query landing in the unknown
+    // bucket would be silently unserved and look exactly like a peer that has
+    // nothing.
+    let inv = decode_inv(&back.payload).expect("well-formed");
+    assert_eq!(inv.unknown_kinds, 0, "Checkpoint is a kind this build implements");
+    assert_eq!(inv.items[0].kind, InvKind::Checkpoint, "kind 3, allocated in M10-T0-5");
+    assert_eq!(inv.items[0].kind as u8, 3);
 
     // The answer is the message both sides have understood since M9.
     let cp = Checkpoint::new(1056, [1; 32], [1; 32]);
     let ans = Envelope::new(MsgType::Checkpoint, encode_checkpoint_msg(&cp, &[])).encode();
-    assert_eq!(Envelope::decode(&ans).expect("known").msg_type.as_u16(), 0x0022);
+    assert_eq!(Frame::decode(&ans).expect("known").msg_type().expect("known").as_u16(), 0x0022);
 }
 
 /// The query id namespace and a real checkpoint id cannot be confused. A checkpoint
@@ -684,7 +694,7 @@ fn a_query_flood_is_answered_at_most_once_per_serve_interval() {
             .poll()
             .iter()
             .filter(|(_, raw)| {
-                Envelope::decode(raw).expect("well-formed").msg_type == MsgType::Checkpoint
+                Frame::decode(raw).expect("well-formed").msg_type() == Some(MsgType::Checkpoint)
             })
             .count();
     }
@@ -711,7 +721,7 @@ fn a_query_flood_is_answered_at_most_once_per_serve_interval() {
             .poll()
             .iter()
             .filter(|(_, raw)| {
-                Envelope::decode(raw).expect("well-formed").msg_type == MsgType::Checkpoint
+                Frame::decode(raw).expect("well-formed").msg_type() == Some(MsgType::Checkpoint)
             })
             .count(),
         1,

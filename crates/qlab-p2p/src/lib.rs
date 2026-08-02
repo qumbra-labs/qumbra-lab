@@ -16,8 +16,11 @@
 //!
 //! - **§0 versioning** — every version-tagged wire format is **reject-unknown**.
 //!   The [`wire`] envelope carries an explicit protocol version and message type;
-//!   unknown values of either, trailing bytes, and oversize frames are all
-//!   rejected at decode.
+//!   an unknown version, trailing bytes, and oversize frames are all rejected at
+//!   decode. An unknown **message type** is reject-unknown in the sense that
+//!   matters — it is never acted on — but it is *ignored and counted*, not scored
+//!   as a fault (issue #181; see [`wire::Frame`]). Same for an unknown
+//!   [`codec::InvKind`] inside a known message.
 //! - **§5 framing** — the note-discovery / compact-block wire (`version(0x01)`
 //!   lead byte, unsigned LEB128 varints, reject trailing / unknown-version /
 //!   non-zero-clue). Compact-block relay **reuses** `qlab_cbserver::codec`
@@ -49,4 +52,6 @@ pub mod wire;
 
 pub use node::P2pNode;
 pub use peer::PeerId;
-pub use wire::{Envelope, FrameHeader, MsgType, WireError, MAGIC, MAX_PAYLOAD, PROTOCOL_VERSION};
+pub use wire::{
+    Envelope, Frame, FrameHeader, MsgType, WireError, MAGIC, MAX_PAYLOAD, PROTOCOL_VERSION,
+};

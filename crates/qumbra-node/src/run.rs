@@ -50,6 +50,7 @@ use qlab_node::recovery::{Finalizer, FinalizerState};
 use qlab_node::round::ObsClock;
 use qlab_node::{ChainStore, SupplyBlock, SupplyLedger, Telemetry};
 
+use crate::discovery_server::{DiscoveryServer, DiscoveryView};
 use crate::metrics_server::MetricsServer;
 use crate::telemetry_server::TelemetryServer;
 
@@ -97,6 +98,22 @@ const METRICS_REFRESH: Duration = Duration::from_secs(5);
 /// stale sample can only make a node look *behind* — which the view renders as
 /// lag, never as disagreement.
 pub const TELEMETRY_REFRESH: Duration = Duration::from_secs(5);
+
+/// How often the run loop re-projects the main chain's committed note-discovery
+/// for the `/v1/compact` endpoint (issue #188 baton 2).
+///
+/// Same snapshot discipline, same reason: a wallet polling this must never be able
+/// to contend with the consensus loop for node state, so **the node decides how
+/// often it pays** and a request costs an `Arc` clone. The refresh itself is
+/// incremental — an unchanged tip does no work at all, and a changed one costs the
+/// new blocks — so the cadence bounds staleness rather than cost.
+///
+/// 5 s against a FROZEN 75 s block time means a served range is at most one
+/// fifteenth of a block behind, and below the finalized head not even that: no
+/// reorg can cross the finalized head, so a finalized height's body — and
+/// therefore its committed discovery — is fixed forever. A stale projection can
+/// only show a wallet *fewer* of its outputs, never a different one.
+pub const DISCOVERY_REFRESH: Duration = Duration::from_secs(5);
 
 /// Unix seconds now (wall clock). Used for the metric surface's `process_start` and
 /// `rendered_at` stamps only — never for consensus, which reads header timestamps.
@@ -270,6 +287,16 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// The `/v1/telemetry` server, when `telemetry_addr` is configured. `None` =
     /// the node listens on nothing extra, which is the default.
     telemetry_server: Option<TelemetryServer>,
+    /// The main chain's committed note-discovery, as of the last refresh — what
+    /// `/v1/compact` serves (issue #188 baton 2). One `Arc` swap per refresh, so a
+    /// reader holds the lock only long enough to clone a pointer.
+    discovery_view: Arc<Mutex<Arc<DiscoveryView>>>,
+    /// When the projection was last refreshed.
+    last_discovery_refresh: Instant,
+    /// The `/v1/compact` server. `None` only when the operator wrote
+    /// `discovery_addr = "off"` — **this is the one listener whose default is on**;
+    /// see [`crate::discovery_server`] for why it inverts `metrics_addr`'s default.
+    discovery_server: Option<DiscoveryServer>,
     /// Incremental scheduled-issuance accounting. Rebuilt once from the persisted
     /// canonical bodies at startup, then advanced only for new heights.
     supply_ledger: Mutex<SupplyLedger>,
@@ -590,6 +617,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             telemetry_snapshot: Arc::new(Mutex::new(Vec::new())),
             last_telemetry_render: Instant::now(),
             telemetry_server: None,
+            discovery_view: Arc::new(Mutex::new(Arc::new(DiscoveryView::default()))),
+            last_discovery_refresh: Instant::now(),
+            discovery_server: None,
             supply_ledger: Mutex::new(supply_ledger),
             process_start_secs: unix_secs(),
             listen_addr: bound,
@@ -1044,6 +1074,36 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // tracker meaning — learn-ahead is the capability, silent disagreement was
         // the defect. See `finality_backing_field` for the full-hash comparison.
         let finality_backing = self.finality_backing_field();
+        // Issue #181: `unk=` is **appended at the end**, under the same rule as
+        // every addition since #87 — every pre-existing field keeps its name,
+        // position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified. This branch was written when `fback=` was the tail at `main`
+        // `70706fc` and said so; `prest=` (#133 D3), `uex=` (#200) and `bdrop=`
+        // (#130 (b)) have landed since, so `unk=` now follows all three.
+        //
+        // 🔴 **Why it is on this line and not only in `/metrics`.** #181 makes an
+        // unrecognised frame silent, and a silent ignore is how the next
+        // version-skew incident becomes invisible. The window where that matters is
+        // a rolling upgrade — `OPERATOR.md` §4 rolls one host at a time and the
+        // operator watches stdout while each host rejoins — and `/metrics` is
+        // **off unless `metrics_addr` is set** (#87's decision, deliberate: a node
+        // nobody scrapes listens on nothing extra). A counter that lives only
+        // behind an optional endpoint would be absent on precisely the hosts that
+        // skew first, which is the same shape as #84's finding: the most
+        // informative reading missing from the only instrument the operator has.
+        // It is also on `/metrics` (two counters), because a rate is a machine's
+        // question — the two are the same numbers, as `dialable=` already is.
+        //
+        // Two numbers in one field, `dialable={}/{}`'s precedent: they answer one
+        // question ("is something newer talking to me?") at two layers, and
+        // splitting them would put two fields on the line for one fact.
+        //
+        // Caliper: cumulative **since process start**, over frames and inventory
+        // items this node was handed after the inbound rate limiter; a restart
+        // resets both. Always printed, zeroes included (the #130 (a) rule) — a node
+        // always knows these counts, and `unk=0/0` is the healthy reading and a
+        // fact. Neither number is ever a scoring input; that is the whole of #181.
+        let unk = self.p2p.unknown_stats();
         // Issue #133 D3: `prest=` is **appended at the end**, after `breq=`, under the
         // same rule as every addition since #87 — every pre-existing field keeps its
         // name, position and meaning, and the `PRE_I84_FIELDS` prefix test passes
@@ -1080,6 +1140,31 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // needs one field that says "it was the exemption". Always printed, zero
         // included (the #130 (a) rule).
         let uex = u8::from(node.state_tip_mine_ready());
+        // Issue #130 (b): `bdrop=` is appended after `uex=`, under the same rule as
+        // every addition since #87 — every pre-existing field keeps its name, position
+        // and meaning, and the `PRE_I84_FIELDS` prefix test passes unmodified.
+        // (Merged after #200 landed on `main`; this branch was written when `fback=`
+        // was the tail, so `bdrop=` follows `prest=` and `uex=`, not `fback=`.)
+        //
+        // 🔴 It is the field #130 asked for by name. `apply_block`'s failure at the
+        // body-application funnel was swallowed by an `Err(_) => {}` arm carrying a
+        // comment that called the drop expected, and **no counter and no telemetry
+        // field existed for it** — so on the one instrument an operator has, a node
+        // dropping every body it was handed printed exactly what a healthy node
+        // prints. #130 is explicit that this is what made it the worst of the five
+        // same-shaped defects that week: *"every other instance was silence; this one
+        // was silence with a comment vouching for it."*
+        //
+        // Caliper: cumulative since PROCESS START over bodies this node's own state
+        // machine refused, paired with the CHAIN HEIGHT of the most recent refusal —
+        // `bdrop=0@-` when there has been none. See
+        // [`qlab_p2p::NodeAdapter::body_refusals`] for why the height is there and why
+        // it is a height. The pair to read it against is `stip=`: `bdrop=17@412` next
+        // to `stip=413` is a node refusing bodies right now; the same `bdrop=17@412`
+        // next to `stip=9000` is a burst that ended long ago. Per-reason attribution
+        // is on `/metrics` (`qumbra_body_apply_refused_total`), which is where the
+        // question "which of the five, and is `not_extending_tip` still zero" belongs.
+        let bdrop = bdrop_field(node.body_refusals());
         // Issue #204: `cpq=` is **appended at the end**, after `uex=`, under the same
         // rule as every addition since #87 — every pre-existing field keeps its name,
         // position and meaning, and the `PRE_I84_FIELDS` prefix test passes
@@ -1133,7 +1218,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             .map_or_else(|| "-".to_string(), |h| h.to_string());
         let fdrop = node.finalize_refused_total();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} cpq={} dfin={} fdrop={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={} unk={}/{} cpq={} dfin={} fdrop={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1153,6 +1238,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             finality_backing,
             prest,
             uex,
+            bdrop,
+            unk.frames,
+            unk.inv_items,
             cpq,
             dfin,
             fdrop,
@@ -1252,6 +1340,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 s.throttled_frames + s.throttled_bytes
             },
             throttled_getaddr: self.p2p.rate_stats().throttled_getaddr,
+            // Issue #181, read from the same `unknown_stats()` the `TELEMETRY`
+            // line reads, so the log and the scrape cannot come to disagree about
+            // how much version skew this node has seen.
+            unknown_msg_type: self.p2p.unknown_stats().frames,
+            unknown_inv_kind: self.p2p.unknown_stats().inv_items,
             outbound_netgroups: self.p2p.addrs().outbound_groups().len() as u64,
             process_start_secs: self.process_start_secs,
             rendered_at_secs: unix_secs(),
@@ -1279,6 +1372,55 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         if let Ok(mut slot) = self.telemetry_snapshot.lock() {
             *slot = bytes;
         }
+    }
+
+    /// Bind the `/v1/compact` note-discovery endpoint (issue #188 baton 2).
+    /// Returns the bound address.
+    ///
+    /// Called whenever `config.discovery_bind()` yields an address, which — unlike
+    /// every other listener in this binary — is the **default**. An unbindable
+    /// address is an error and never a silent no-op, and because this one is on by
+    /// default that turns a port conflict into a node that will not start; the
+    /// error message names `discovery_addr = "off"`.
+    pub fn start_discovery_endpoint(&mut self, addr: &str) -> std::io::Result<std::net::SocketAddr> {
+        // Project before binding, so the first read is answered from the chain this
+        // process actually opened rather than from an empty view.
+        self.refresh_discovery();
+        let srv = DiscoveryServer::start(addr, Arc::clone(&self.discovery_view))?;
+        let bound = srv.addr();
+        self.discovery_server = Some(srv);
+        Ok(bound)
+    }
+
+    /// The bound `/v1/compact` address, if serving.
+    pub fn discovery_addr(&self) -> Option<std::net::SocketAddr> {
+        self.discovery_server.as_ref().map(|s| s.addr())
+    }
+
+    /// Re-project the main chain's committed discovery for `/v1/compact`.
+    ///
+    /// Reads the block store and copies `StoredTx::discovery` verbatim; there is no
+    /// encoder between the block and the served bytes, which is what makes a served
+    /// group that differs from the committed one unconstructible rather than
+    /// unlikely. Incremental: an unchanged tip returns without touching the view.
+    pub fn refresh_discovery(&mut self) -> bool {
+        let mut next = (**self
+            .discovery_view
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()))
+        .clone();
+        if !next.refresh(self.p2p.node().state().chain()) {
+            return false;
+        }
+        if let Ok(mut slot) = self.discovery_view.lock() {
+            *slot = Arc::new(next);
+        }
+        true
+    }
+
+    /// The projection `/v1/compact` is currently serving (tests / accounting).
+    pub fn discovery_view(&self) -> Arc<DiscoveryView> {
+        Arc::clone(&self.discovery_view.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// Re-render the snapshot the scrape server serves.
@@ -1736,6 +1878,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 self.refresh_metrics();
                 self.last_metrics_render = Instant::now();
             }
+            if self.discovery_server.is_some()
+                && self.last_discovery_refresh.elapsed() >= DISCOVERY_REFRESH
+            {
+                self.refresh_discovery();
+                self.last_discovery_refresh = Instant::now();
+            }
             if self.telemetry_server.is_some()
                 && self.last_telemetry_render.elapsed() >= TELEMETRY_REFRESH
             {
@@ -1781,6 +1929,26 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         };
         self.save_addr_book();
         snapshot_ok
+    }
+}
+
+/// Render `bdrop=` from the count/last-height pair (issue #130 (b)):
+/// `<total>@<height>`, and `0@-` when this node has refused no body.
+///
+/// **One token, not two fields**, following `dialable=8/32`: the count and the height
+/// are one reading and splitting them would put two appends on a line that has
+/// already had two collide in a merge today. `@` rather than `/` because the second
+/// number is a position, not a denominator.
+///
+/// **Always printed, zero included** (the #130 (a) rule) — a node always knows both
+/// halves, so an omitted field would only force a special case on every parser. The
+/// `-` is the #125/#84 convention for "no value to state", used here for the height
+/// alone: `0@-` says *nothing has been refused*, which is different in kind from
+/// `0@412`, a state this field cannot reach and a parser should not have to consider.
+fn bdrop_field((total, last_height): (u64, Option<u64>)) -> String {
+    match last_height {
+        Some(h) => format!("{total}@{h}"),
+        None => format!("{total}@-"),
     }
 }
 
@@ -1915,6 +2083,11 @@ mod tests {
             expected_genesis_hash: Some(genesis.hash_hex()),
             metrics_addr: None,
             telemetry_addr: None,
+            // Explicitly off in the in-process fixtures: the default is a fixed
+            // loopback port and these tests start many nodes in one process, so
+            // the second bind would fail. `discovery_default_is_on_*` covers the
+            // default itself, from a config FILE, which is where it applies.
+            discovery_addr: None,
             miner_rkm: None,
         };
         (config, genesis, base)
@@ -2098,10 +2271,40 @@ mod tests {
             line.contains(" prest=1/1"),
             "TELEMETRY must carry the restore report, not only the startup println: {line}"
         );
-        // Not `ends_with`: #200's `uex=` is the newest append after `prest=`.
+        // `prest=` was the last field when #133 D3 landed and is not any more:
+        // #200's `uex=` and then #130 (b)'s `bdrop=` appended after it. What #133 was
+        // actually pinning is that the restore report reaches the line an operator
+        // reads, and the `contains` is that assertion; "and it is last" was true on
+        // the day and is not a property `prest=` owns.
         assert!(
             line.contains(" prest=1/1 "),
-            "prest remains a mid-line field after #200: {line}"
+            "prest remains a mid-line field after #200 and #130 (b): {line}"
+        );
+        // So the "one field is last" idea is kept rather than deleted — whichever
+        // field it is must still be asserted, or a truncated line would pass.
+        //
+        // ⚠️ This assertion has now been rewritten by three consecutive appends
+        // (#200, #130 (b), #181), which is the cost of pinning the tail **by name**
+        // on an append-only line: every addition must edit it, and three concurrent
+        // batons had to edit the same two lines. It is kept anyway — a truncated
+        // line has to fail something — but the name is the newest field, not
+        // whichever field happened to be last when the test was written.
+        assert!(
+            line.contains(" bdrop=0@- "),
+            "the body-refusal field is present and mid-line: {line}"
+        );
+        assert!(
+            line.contains(" unk=0/0 "),
+            "the version-skew field is present and mid-line: {line}"
+        );
+        // ⚠️ Rewritten a fourth time, by #204. This assertion pins the tail BY NAME
+        // on an append-only line, so every append must edit it — and git produced no
+        // conflict marker here on any of the four, because the incoming branch never
+        // touched this hunk. The identical idea 1800 lines below DID conflict, every
+        // time, which is what makes this copy the dangerous one.
+        assert!(
+            line.ends_with(" fdrop=0"),
+            "the newest append is last, and nothing was refused: {line}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -3861,6 +4064,10 @@ mod tests {
                 "prest",
                 // ── appended by #200, at the end ──
                 "uex",
+                // ── appended by #130 (b), at the end ──
+                "bdrop",
+                // ── appended by #181, at the end ──
+                "unk",
                 // ── appended by #204, at the end ──
                 "cpq", "dfin", "fdrop",
             ],
@@ -3885,22 +4092,106 @@ mod tests {
         // tracker checkpoint is backed by its exact block in fork choice.
         // Not `ends_with` any more: later appends landed after this field.
         assert!(line.contains(" fback=local "), "backing verdict present: {line}");
-        // #133 D3: `prest=` — a fresh data dir has nothing to restore.
-        // Not `ends_with`: #200's `uex=` is now the tail.
-        assert!(line.contains(" prest=0/0"), "nothing restored: {line}");
+        // #133 D3: a fresh data dir has nothing to restore — and the shape is
+        // restored/known, not a bare zero, so "nothing to restore" is distinguishable
+        // from "unk". Not `ends_with`: four fields have appended after it.
+        assert!(line.contains(" prest=0/0 "), "nothing restored: {line}");
         // #200: a healthy node is not under the unobtainable-body exemption.
-        // Not `ends_with` any more: #204's `cpq=` is now the tail.
-        assert!(line.contains(" uex=0"), "exemption disarmed: {line}");
+        assert!(line.contains(" uex=0 "), "exemption disarmed: {line}");
+        // #130 (b): this node applied every body it produced, so nothing has been
+        // refused — and it says so with a zero and an explicit "no height", rather
+        // than by the field being absent.
+        assert!(line.contains(" bdrop=0@- "), "no body refused: {line}");
+        // #181: a node that has spoken to nobody has seen no version skew, and it
+        // says the zero rather than omitting the field (the #130 (a) rule).
+        assert!(line.contains(" unk=0/0 "), "no skew seen: {line}");
         // #204: a node alone on its own chain has nobody to ask and nothing to ask
-        // about — the zero is printed, not omitted (the #130 (a) rule).
-        // Not `ends_with` any more: #204's second pair is now the tail.
-        assert!(line.contains(" cpq=0"), "no query in flight: {line}");
+        // about — the zero is printed, not omitted.
+        assert!(line.contains(" cpq=0 "), "no query in flight: {line}");
         // #204: the durable head is the one a restart reads, and on a healthy node it
         // agrees with `final=`. This rig finalized genesis, so both say 0.
         assert!(line.contains(" final=0 "), "the tracker head: {line}");
-        assert!(line.contains(" dfin=0"), "and the DURABLE head agrees: {line}");
+        assert!(line.contains(" dfin=0 "), "and the DURABLE head agrees: {line}");
         assert!(line.ends_with(" fdrop=0"), "nothing was refused, last: {line}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Issue #181 end-to-end, over a real socket: the frame is ignored, the peer
+    /// is not banned, and both operator surfaces say so with the same number.**
+    ///
+    /// It goes through the TCP transport on purpose. The unit tests in `qlab-p2p`
+    /// prove the classification; what only the binary can prove is that a frame an
+    /// upgraded host would actually send reaches the counter, and that the counter
+    /// reaches `TELEMETRY` and `/metrics` without the two disagreeing — which is
+    /// the failure #84 named, one fact rendered twice from two derivations.
+    ///
+    /// The placement decision it guards is that `unk=` is on the log line at all:
+    /// `/metrics` is off unless `metrics_addr` is set, so a scrape-only counter
+    /// would be absent on precisely the hosts a rolling upgrade skews first.
+    #[test]
+    fn an_unknown_envelope_type_over_tcp_is_ignored_and_reported_on_both_surfaces() {
+        use std::io::Write;
+
+        let (config, genesis, base) = rig("telemetry_unk", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        assert_eq!(field(&node.telemetry_sample(), "unk"), "0/0", "clean at start");
+
+        // A well-formed frame at our protocol version carrying a type code no build
+        // implements — exactly what an additive `MsgType` looks like to a host that
+        // predates it. Hand-built, because `Envelope::new` cannot express it.
+        let unknown_type: u16 = 0x0044;
+        assert!(qlab_p2p::MsgType::from_u16(unknown_type).is_none());
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&qlab_p2p::MAGIC);
+        frame.extend_from_slice(&qlab_p2p::PROTOCOL_VERSION.to_le_bytes());
+        frame.extend_from_slice(&unknown_type.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut sock = std::net::TcpStream::connect(node.listen_addr()).expect("dial the node");
+        sock.write_all(&frame).expect("send the newer type");
+        sock.flush().unwrap();
+
+        // Pump until the frame lands. The reader thread and the node loop are
+        // separate, so a single step can legitimately see nothing yet.
+        for _ in 0..200 {
+            node.step_once();
+            if node.p2p().unknown_stats().frames > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert_eq!(
+            field(&node.telemetry_sample(), "unk"),
+            "1/0",
+            "the frame was ignored, and saying so is the whole point of the field"
+        );
+        assert!(
+            node.metrics_text().contains("\nqumbra_unknown_msg_type_total 1\n"),
+            "the log and the scrape carry the same number: {}",
+            node.metrics_text()
+        );
+        assert!(
+            node.p2p().peers().iter().all(|p| p.score == 0),
+            "🔴 no peer was scored for speaking a type this build does not implement"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `bdrop=`'s two renderings, pinned as tokens (issue #130 (b)).
+    ///
+    /// The `-` half is the load-bearing one: `0@-` and a hypothetical `0@0` would be
+    /// the same claim to a careless reader and are not the same fact, and genesis is
+    /// height 0, so the ambiguity is not academic.
+    #[test]
+    fn bdrop_renders_the_count_and_the_height_of_the_last_refusal() {
+        assert_eq!(bdrop_field((0, None)), "0@-", "nothing refused states no height");
+        assert_eq!(bdrop_field((1, Some(0))), "1@0", "…and height 0 is a real height");
+        assert_eq!(bdrop_field((17, Some(412))), "17@412");
+        // One whitespace-free token, so `soak.sh`'s generic `field()` extractor
+        // (`sed -n "s/.* $2=\([^ ]*\).*/\1/p"`) returns the whole value.
+        assert!(!bdrop_field((17, Some(412))).contains(' '));
     }
 
     /// The compatibility contract, stated so that **it survives the next append**.
@@ -4446,6 +4737,64 @@ mod tests {
             text.contains("EXCLUDES backfill"),
             "the caliper travels with the number, not in a runbook: {text}"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 🔴 **Issue #188 baton 2, scope item 2: the deployed binary serves it.**
+    ///
+    /// Not "the endpoint returns bytes" — this asserts the composition that did not
+    /// exist. Before this the binary bound no discovery listener at all and
+    /// composed no `NodeRpc`, so a `/v1/compact` reading committed bytes would have
+    /// been a fix inside a type nothing constructs.
+    ///
+    /// The chain here is coinbase-only (`rig` mines with `KeccakPow`), so every
+    /// served block carries zero groups — which is the *correct* answer under D5
+    /// and is exactly what the endpoint must say about a T0-shaped net. The
+    /// recipient-finds-its-output half needs a transaction and lives in
+    /// `tests/discovery_serving.rs`.
+    #[test]
+    fn discovery_endpoint_serves_the_binarys_own_chain_over_a_real_socket() {
+        let (config, genesis, base) = rig("discovery-endpoint", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        for _ in 0..3 {
+            assert!(node.try_mine());
+        }
+
+        let bound = node.start_discovery_endpoint("127.0.0.1:0").expect("bind ephemeral");
+        assert_eq!(node.discovery_addr(), Some(bound));
+
+        let body = {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(bound).unwrap();
+            write!(
+                s,
+                "GET /v1/compact?from=0&to=99 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut raw = Vec::new();
+            s.read_to_end(&mut raw).unwrap();
+            raw
+        };
+        let head = String::from_utf8_lossy(&body[..body.windows(4).position(|w| w == b"\r\n\r\n").unwrap()]).to_string();
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let sep = body.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let blocks = qlab_cbserver::codec::decode_compact_response(&body[sep..])
+            .expect("the served bytes are the ratified compact wire");
+        assert_eq!(blocks.len(), 4, "genesis + 3 mined blocks");
+        assert_eq!(blocks[3].height, node.tip_height());
+        assert!(
+            blocks.iter().all(|b| b.groups.is_empty()),
+            "a coinbase-only chain carries no discovery groups — D5, and the honest answer"
+        );
+
+        // The projection follows the chain on the run loop's own cadence: one more
+        // block, one more served height, no restart and no request-time chain walk.
+        assert!(node.try_mine());
+        assert!(node.refresh_discovery(), "a moved tip re-projects");
+        assert!(!node.refresh_discovery(), "an unchanged tip does no work");
+        assert_eq!(node.discovery_view().tip_height(), Some(node.tip_height()));
         let _ = std::fs::remove_dir_all(&base);
     }
 

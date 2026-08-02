@@ -178,6 +178,13 @@ impl PeerTable {
         self.peers.len()
     }
 
+    /// Every peer in the table, read-only (ops / tests). Iteration order is the
+    /// map's and is deliberately not relied on — callers that need order use
+    /// [`Self::ready_peers`], which sorts.
+    pub fn iter(&self) -> impl Iterator<Item = &PeerInfo> {
+        self.peers.values()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.peers.is_empty()
     }
