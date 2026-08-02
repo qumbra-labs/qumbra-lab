@@ -26,6 +26,12 @@
 //! # OPTIONAL — refuse to start unless the loaded genesis hashes to this
 //! # (hex-encoded keccak256 of the genesis file). The safety pin item 2 asks for.
 //! # expected_genesis_hash = "…64 hex chars…"
+//!
+//! # NOTE — note-discovery serving is ON by default at 127.0.0.1:9420. Omitting
+//! # the key does NOT turn it off; `discovery_addr = "off"` does. Recipients
+//! # cannot find their outputs on a node that serves nothing, so this is the one
+//! # listener here whose default is on. See `discovery_addr` below.
+//! # discovery_addr = "0.0.0.0:9420"
 //! ```
 //!
 //! Everything here is process/deployment config — NOT consensus. The frozen
@@ -124,6 +130,43 @@ pub struct NodeConfig {
     /// before this change. Ship the binary first, then the config.
     #[serde(default)]
     pub telemetry_addr: Option<String>,
+    /// Bind address for the `/v1/compact` note-discovery endpoint (issue #188
+    /// baton 2) — **on by default**, unlike every other listener here.
+    ///
+    /// Absent from the config ⇒ [`crate::discovery_server::DEFAULT_DISCOVERY_ADDR`]
+    /// (`127.0.0.1:9420`). `discovery_addr = "off"` is the only way to have no
+    /// listener at all. This is the one decision in this file that inverts
+    /// `metrics_addr`'s default, and the reasoning is worth having here rather
+    /// than only in the PR:
+    ///
+    /// - **`metrics_addr` is off-by-default because setting it opens a port.** A
+    ///   loopback default opens nothing an off-host attacker can reach, so the
+    ///   argument that makes `/metrics` opt-in does not transfer to this one.
+    /// - **`testnet-plan` §6.2 — a committee-key host "exposes nothing beyond
+    ///   P2P" — is honoured literally** by a loopback bind, and the bytes are
+    ///   public chain data regardless: every one of them is inside a block body
+    ///   any peer can already ask for. No key material, no mempool, no peer list,
+    ///   no write surface.
+    /// - **A chain whose recipients cannot find their money by default is not a
+    ///   chain.** An opt-in most operators leave off reproduces
+    ///   `t1-discovery-serving-decision.md`'s option 2a with extra steps: the
+    ///   chain commits discovery correctly and hands it to nobody, which from a
+    ///   wallet's side is indistinguishable from having no discovery at all.
+    ///
+    /// So **serving is the default and exposure is the operator's act**:
+    /// `0.0.0.0:9420` exposes it to whatever the host firewall admits, and on a
+    /// real host that means pairing it with a source-restricted inbound rule
+    /// (standalone `aws_security_group_rule` resources only — the inline-rule
+    /// incident of 2026-07-26 is why). Nothing here authenticates.
+    ///
+    /// Deployment ordering caveat, same as `metrics_addr`: `deny_unknown_fields`
+    /// is deliberate, so a config carrying this key is REFUSED by a binary built
+    /// before this change. Ship the binary first, then the config. Note the
+    /// asymmetry this default creates — a **new** binary reading an **old**
+    /// config starts serving on loopback without the config mentioning it, which
+    /// is the intent.
+    #[serde(default = "default_discovery_addr")]
+    pub discovery_addr: Option<String>,
     /// OPTIONAL — where this node's mined coinbase notes are paid (issue #101):
     /// the miner's raw `rkm`, hex-encoded as **64 hex characters** = 32 bytes,
     /// lane-major little-endian (`qlab_wallet::Wallet::rkm(d)` under the node's
@@ -142,6 +185,15 @@ pub struct NodeConfig {
     /// before this change. Ship the binary first, then the config.
     #[serde(default)]
     pub miner_rkm: Option<String>,
+}
+
+/// The serde default behind [`NodeConfig::discovery_addr`]: **on, loopback**.
+///
+/// A function rather than `Option::default` because the whole point is that the
+/// absence of the key is not the absence of the listener. Read that field's note
+/// before changing it — it is a decision, not a convenience.
+fn default_discovery_addr() -> Option<String> {
+    Some(crate::discovery_server::DEFAULT_DISCOVERY_ADDR.to_string())
 }
 
 /// Why a config failed to load.
@@ -173,6 +225,23 @@ impl NodeConfig {
     pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(ConfigError::Io)?;
         Self::from_toml(&text)
+    }
+
+    /// The address discovery serving should bind, or `None` for *serve nothing*.
+    ///
+    /// The one place `"off"` is interpreted, so no caller has to remember that a
+    /// `Some("off")` is not an address. `None` in the field means the same thing —
+    /// a struct built in code says what it wants, while a config file that omits
+    /// the key gets the on-by-default value from
+    /// [`default_discovery_addr`].
+    pub fn discovery_bind(&self) -> Option<&str> {
+        match self.discovery_addr.as_deref() {
+            None => None,
+            Some(a) if a.trim().eq_ignore_ascii_case(crate::discovery_server::DISCOVERY_OFF) => {
+                None
+            }
+            Some(a) => Some(a),
+        }
     }
 
     /// The configured payout key as circuit lanes, or an error describing why the
@@ -225,6 +294,46 @@ mod tests {
         mining = true
         expected_genesis_hash = "abc123"
     "#;
+
+    /// 🔴 **The decision, as a test rather than as a paragraph** (issue #188 baton
+    /// 2, scope item 3). A config that never mentions discovery serves it, on
+    /// loopback. Every other listener in this file is off in exactly this
+    /// situation, and this one is not, because a chain whose recipients cannot find
+    /// their money by default is not a chain.
+    #[test]
+    fn discovery_default_is_on_and_loopback_when_the_config_is_silent() {
+        let c = NodeConfig::from_toml(SAMPLE).expect("parse");
+        assert!(
+            !SAMPLE.contains("discovery"),
+            "the fixture must not mention discovery — that is the whole point"
+        );
+        assert_eq!(
+            c.discovery_bind(),
+            Some(crate::discovery_server::DEFAULT_DISCOVERY_ADDR),
+            "silence means serve, on loopback"
+        );
+        assert!(
+            c.discovery_bind().unwrap().starts_with("127.0.0.1:"),
+            "the default must not be reachable off-host: exposure is the operator's act"
+        );
+        // The contrast that makes the asymmetry deliberate rather than accidental.
+        assert!(c.metrics_addr.is_none(), "metrics stays off unless asked for");
+        assert!(c.telemetry_addr.is_none(), "telemetry stays off unless asked for");
+    }
+
+    /// The only way to have no listener, and it has to be written down. A missing
+    /// key cannot mean this, or the default above would be unreachable.
+    #[test]
+    fn discovery_off_is_the_explicit_opt_out_and_case_insensitive() {
+        for value in ["off", "OFF", " Off "] {
+            let toml = format!("{SAMPLE}\ndiscovery_addr = \"{value}\"\n");
+            let c = NodeConfig::from_toml(&toml).expect("parse");
+            assert_eq!(c.discovery_bind(), None, "{value:?} means serve nothing");
+        }
+        let c = NodeConfig::from_toml(&format!("{SAMPLE}\ndiscovery_addr = \"0.0.0.0:9420\"\n"))
+            .expect("parse");
+        assert_eq!(c.discovery_bind(), Some("0.0.0.0:9420"), "an address is an address");
+    }
 
     #[test]
     fn parses_a_full_config() {
