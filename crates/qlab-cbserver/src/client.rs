@@ -39,11 +39,52 @@
 //! **A failed `/full` fetch is no longer fatal to the whole scan**: it is one
 //! output's outcome, not the run's, so a wallet against a node that serves no
 //! payloads still gets the complete list of what it owns and where.
+//!
+//! ## 🔴 A third truth: it is here, it opens, and it is already dead (issue #215)
+//!
+//! `nf = keccak(nk ‖ ρ)` and **nothing else** — not value, not `rkm`, not
+//! `rseed`, not the tree position, **not the diversifier**
+//! (`qlab_air::narrow::derive_input`, `qlab_wallet::keys::derive_nf`). `nk` is
+//! one per spend key and is shared by every diversified address a wallet hands
+//! out. So two notes payable to one wallet that share ρ **share a nullifier even
+//! when every other field differs**, and spending either one publishes that
+//! nullifier and kills the other. Both notes are entirely valid — valid proof,
+//! valid commitment, correct encryption, correct discovery. There is no
+//! malformed thing to reject, which is exactly why this was invisible.
+//!
+//! ρ is sender-chosen (`qlab-faucet`'s `build_grant` draws it from a CSPRNG;
+//! nothing checks the result), so a sender can reuse it deliberately. That is
+//! the spec's *"faerie gold"* attack (`transaction-model-and-anonymity-set.md`
+//! §4) and the structural fix — deriving ρ from a nullifier consumed in the same
+//! transaction — is a circuit change that does not exist. This module carries the
+//! **interim recipient-side defence**: the recipient is the harmed party and the
+//! only party that can see both ρ values.
+//!
+//! | truth | verdict |
+//! |---|---|
+//! | this key was paid nothing here | [`Completeness::Complete`], `notes: []` |
+//! | it was paid and the payload could not be had | [`Completeness::Incomplete`] |
+//! | 🔴 it was paid, it opens, and it cannot be spent | [`Completeness::Shadowed`] |
+//!
+//! **The scan never computes `nf`.** It cannot: `nf` needs `nk`, which comes from
+//! the spend key, and a scanner holds a viewing key. It does not need to — for
+//! two notes payable to one wallet, `nf₁ == nf₂ ⟺ ρ₁ == ρ₂`, and ρ is in the
+//! decrypted note plaintext. See [`NullifierClaim`] for the derivation and for
+//! the one-wallet precondition that makes it an equivalence.
+//!
+//! **The value rule is in the type, not in this comment.**
+//! [`ScanOutcome::notes`] holds only spendable notes — at most one per claim — so
+//! summing it is correct on its own and there is no field a balance can forget.
+//! The dead ones are in [`ScanOutcome::shadowed`], never folded into `notes` and
+//! never dropped.
 
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
 use qlab_note::kem::Dk;
+use qlab_note::note::Note;
 use qlab_note::scan::{detect_matches, scan, DetectedNote, EncryptedOutputs, ScanMode};
 use qlab_note::wire::CM_LEN;
 use rand::rngs::StdRng;
@@ -75,13 +116,91 @@ impl Default for ScanConfig {
     }
 }
 
+/// The chain's own name for one output — committed coordinates and nothing a
+/// server or a sender could have chosen after the fact.
+///
+/// `cm` is the **committed** commitment from the compact entry, never a
+/// recompute of the decrypted plaintext, so this is a claim a wallet can show a
+/// user and re-check against any other node.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct NoteRef {
+    pub height: u64,
+    pub tx_index: u64,
+    pub recipient_index: usize,
+    /// Index within the recipient bundle — the same index a [`DetectedNote`]
+    /// carries.
+    pub output_index: usize,
+    pub cm: [u8; CM_LEN],
+}
+
+/// The claim a note stakes on a nullifier, as much of it as a **scanner** can
+/// see — and that turns out to be all of it.
+///
+/// `nf = keccak(nk ‖ ρ)`, a function of `(nk, ρ)` and of nothing else: not
+/// `value`, not `rkm`, not `rseed`, not the tree position, **not the
+/// diversifier** (`qlab_air::narrow::derive_input`, host-mirrored in
+/// `qlab_wallet::keys::derive_nf`, both single-block Keccak-f over
+/// `st[0..4] = nk`, `st[4..8] = ρ`). `nk = keccak(sk ‖ D_N)` is one per spend key
+/// and is shared by every diversified address the wallet hands out — `rkm` binds
+/// the diversifier, `nf` does not. Therefore, for two notes payable to **one
+/// wallet**:
+///
+/// ```text
+/// nf₁ == nf₂   ⟺   ρ₁ == ρ₂     (⇐ trivially; ⇒ under Keccak collision resistance)
+/// ```
+///
+/// so this type carries ρ and nothing else, and the scan **never computes `nf`**:
+/// that would need `nk`, which comes from the spend key a scanner does not hold.
+///
+/// 🔴 **One wallet is a precondition, not a property of this type.** Two notes to
+/// two *different* wallets may share ρ and do not collide, because their `nk`
+/// differ. One [`ScanOutcome`] always satisfies the precondition — a scan takes
+/// one `dk`, and a wallet's `dk_d` are all derived from one `div_seed` and hence
+/// one `sk` (`qlab_wallet::viewing`). Aggregating across scans does **not**:
+/// see [`ClaimSet`].
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct NullifierClaim([u64; 4]);
+
+impl NullifierClaim {
+    /// The claim `note` stakes: its ρ, verbatim.
+    pub fn of(note: &Note) -> Self {
+        Self(note.rho)
+    }
+
+    /// ρ, for a caller that holds `nk` and wants the actual nullifier.
+    pub fn rho(&self) -> [u64; 4] {
+        self.0
+    }
+}
+
 /// A detected note located within the chain.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct LocatedNote {
     pub height: u64,
     pub tx_index: u64,
     pub recipient_index: usize,
+    /// The **committed** commitment of the entry this note was detected on.
+    /// Recorded from the compact bundle, not recomputed from the plaintext.
+    pub cm: [u8; CM_LEN],
     pub detected: DetectedNote,
+}
+
+impl LocatedNote {
+    /// The chain's name for this output.
+    pub fn at(&self) -> NoteRef {
+        NoteRef {
+            height: self.height,
+            tx_index: self.tx_index,
+            recipient_index: self.recipient_index,
+            output_index: self.detected.index,
+            cm: self.cm,
+        }
+    }
+
+    /// The claim this note stakes on a nullifier.
+    pub fn claim(&self) -> NullifierClaim {
+        NullifierClaim::of(&self.detected.note)
+    }
 }
 
 /// Why an output the committed discovery says is ours did not become a note.
@@ -123,20 +242,55 @@ pub struct UnopenedOutput {
     pub why: Unopened,
 }
 
-/// Whether a scan saw everything the chain says this key owns.
+/// An output that opened and authenticated and can **never be spent**, because
+/// another note this wallet holds already claims its nullifier (issue #215).
+///
+/// Nothing is wrong with this note. It has a valid commitment, a valid proof
+/// behind it, correct encryption and correct discovery. It is dead because
+/// `nf = keccak(nk ‖ ρ)` binds neither its value nor its position nor the address
+/// it was paid to, so the moment [`Self::claimed_by`] is spent this one's
+/// nullifier is on the chain — and the reverse is equally true, which is why the
+/// choice of which one survives is the wallet's and is stated in
+/// [`ScanOutcome::notes`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ShadowedNote {
+    /// The note in full — a wallet must be able to show its user what it lost.
+    pub note: LocatedNote,
+    /// The note that claims the nullifier. Within one scan this is one of
+    /// [`ScanOutcome::notes`]; after [`ScanOutcome::shadow_against`] it may be a
+    /// note from an earlier scan.
+    pub claimed_by: NoteRef,
+    /// The shared claim, i.e. the shared ρ.
+    pub claim: NullifierClaim,
+}
+
+/// Whether a scan saw everything the chain says this key owns, and whether what
+/// it saw can be spent.
 ///
 /// 🔴 This is the distinction a wallet UI must render, and it is why
-/// `notes.is_empty()` is not a question a wallet may ask on its own.
+/// `notes.is_empty()` is not a question a wallet may ask on its own. Since issue
+/// #215 there are two independent ways for the answer to be other than
+/// `Complete`, and they are **not** collapsed into one another: a payload that
+/// could not be read is an availability problem someone can fix by asking another
+/// node, and a note whose nullifier is already claimed is a value loss no node
+/// can undo.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Completeness {
     /// Every output detected in the committed discovery was opened and
-    /// authenticated. An empty `notes` under this verdict means **nothing was
-    /// paid to this key in this range**, and says so on the chain's authority.
+    /// authenticated, and no two of them claim the same nullifier. An empty
+    /// `notes` under this verdict means **nothing was paid to this key in this
+    /// range**, and says so on the chain's authority.
     Complete,
     /// `detected` outputs are this key's by the committed discovery, and only
-    /// `opened` of them became notes. An empty `notes` under this verdict means
+    /// `opened` of them could be read. An empty `notes` under this verdict means
     /// **something is here and this scan could not read it** — never "no notes".
     Incomplete { detected: usize, opened: usize },
+    /// 🔴 Everything detected was read, and `opened − spendable` of the notes are
+    /// **already dead**: another note in this result claims their nullifier.
+    /// *Something is here, it opens, and it cannot be spent.*
+    Shadowed { opened: usize, spendable: usize },
+    /// Both at once — reported together rather than one hiding the other.
+    IncompleteAndShadowed { detected: usize, opened: usize, spendable: usize },
 }
 
 /// Observable outcome of a scan (drives the report + the fetch-count test).
@@ -152,32 +306,227 @@ pub struct ScanStats {
     pub matched_fetches: usize,
     /// `/full` fetches issued as decoys.
     pub decoy_fetches: usize,
-    /// Notes detected and authenticated.
+    /// Notes detected, authenticated **and spendable** — the length of
+    /// [`ScanOutcome::notes`].
     pub notes_found: usize,
+    /// Notes detected and authenticated whose nullifier another note already
+    /// claims (issue #215) — the length of [`ScanOutcome::shadowed`].
+    ///
+    /// `detected_outputs == notes_found + shadowed_outputs + unopened.len()`
+    /// partitions every detected output exactly once.
+    pub shadowed_outputs: usize,
 }
 
 /// Result of a scan.
 pub struct ScanOutcome {
-    /// Outputs opened and authenticated.
+    /// Outputs opened, authenticated **and spendable** — at most one per
+    /// [`NullifierClaim`].
+    ///
+    /// 🔴 **This is the list a balance sums, and summing it on its own is
+    /// correct.** A note that can never be spent is not in here at all; it is in
+    /// [`Self::shadowed`]. There is no field to forget and no flag to check.
+    ///
+    /// **The rule, when two notes claim one nullifier: the greater value is the
+    /// spendable one**, ties broken toward the earlier committed position and then
+    /// the committed `cm`. `nf` binds nothing but `(nk, ρ)`, so *which* member of
+    /// a colliding set gets spent is the recipient's choice and not the chain's —
+    /// the recipient can spend any one of them, so the realizable value of the set
+    /// is its maximum and this list holds exactly that. Taking the first-seen
+    /// instead would understate the balance **and hand the attacker the reported
+    /// number**, since the attacker chooses the order the two notes land in.
     pub notes: Vec<LocatedNote>,
     /// Outputs detected on the chain and **not** opened. Never folded into
     /// `notes`, and never silently dropped — see [`Completeness`].
     pub unopened: Vec<UnopenedOutput>,
+    /// Outputs that opened and authenticated and can never be spent, because a
+    /// note in `notes` (or, after [`Self::shadow_against`], in an earlier scan)
+    /// already claims their nullifier. Never folded into `notes`, never summed
+    /// into a balance, never dropped.
+    pub shadowed: Vec<ShadowedNote>,
     pub stats: ScanStats,
 }
 
 impl ScanOutcome {
-    /// Did this scan see everything the committed discovery says is ours?
+    /// Did this scan see everything the committed discovery says is ours, and can
+    /// what it saw be spent?
     pub fn completeness(&self) -> Completeness {
-        if self.unopened.is_empty() {
-            Completeness::Complete
-        } else {
-            Completeness::Incomplete {
-                detected: self.stats.detected_outputs,
-                opened: self.notes.len(),
+        let opened = self.notes.len() + self.shadowed.len();
+        let spendable = self.notes.len();
+        let detected = self.stats.detected_outputs;
+        match (self.unopened.is_empty(), self.shadowed.is_empty()) {
+            (true, true) => Completeness::Complete,
+            (false, true) => Completeness::Incomplete { detected, opened },
+            (true, false) => Completeness::Shadowed { opened, spendable },
+            (false, false) => {
+                Completeness::IncompleteAndShadowed { detected, opened, spendable }
             }
         }
     }
+
+    /// The value a caller may credit: the sum of [`Self::notes`].
+    ///
+    /// `u128` because the sum of `u64` values is not a `u64`; a wallet that
+    /// saturates or wraps here would be reporting an attacker-chosen number.
+    pub fn spendable_value(&self) -> u128 {
+        self.notes.iter().map(|n| u128::from(n.detected.note.value)).sum()
+    }
+
+    /// The value this scan detected, opened, and had to write off — the sum of
+    /// [`Self::shadowed`]. Never part of a balance; this is what a wallet tells
+    /// its user it lost.
+    pub fn shadowed_value(&self) -> u128 {
+        self.shadowed.iter().map(|s| u128::from(s.note.detected.note.value)).sum()
+    }
+
+    /// The nullifier claims this scan's spendable notes stake — what a wallet
+    /// with a note store persists, and feeds to the next scan via
+    /// [`Self::shadow_against`].
+    pub fn claims(&self) -> ClaimSet {
+        let mut set = ClaimSet::new();
+        for n in &self.notes {
+            set.remember(n.claim(), n.at());
+        }
+        set
+    }
+
+    /// Shadow every spendable note whose nullifier `prior` already claims — the
+    /// **cross-scan** half of the defence.
+    ///
+    /// This exists because one [`ScanOutcome`] cannot see the whole attack. A scan
+    /// takes one `dk`, a wallet's `dk_d` is per-diversifier
+    /// (`qlab_wallet::viewing::Wallet::diversified_keypair`), and `nf` does not
+    /// bind the diversifier — so two notes sharing ρ paid to two *different*
+    /// diversified addresses of one wallet collide, are detected by two
+    /// *different* scans, and are invisible to each scan alone. A wallet or an
+    /// integrator that scans several addresses must aggregate here or the
+    /// collision passes straight through.
+    ///
+    /// 🔴 **The incumbent wins, regardless of value** — the deliberate asymmetry
+    /// with the greater-value rule inside one scan. This function cannot retract a
+    /// note it did not produce, and a wallet cannot un-spend one it has already
+    /// credited or spent. A caller that would rather re-decide has everything it
+    /// needs in [`Self::shadowed`] (`claimed_by` names the incumbent) and may do
+    /// so; this function will not do it silently.
+    ///
+    /// 🔴 **Same wallet only.** `prior` must come from scans of addresses of the
+    /// **one** wallet this outcome was scanned for — see [`ClaimSet`].
+    pub fn shadow_against(&mut self, prior: &ClaimSet) {
+        let mut keep = Vec::with_capacity(self.notes.len());
+        for note in std::mem::take(&mut self.notes) {
+            let claim = note.claim();
+            match prior.holder_of(&claim) {
+                Some(claimed_by) => self.shadowed.push(ShadowedNote { note, claimed_by, claim }),
+                None => keep.push(note),
+            }
+        }
+        self.notes = keep;
+        self.stats.notes_found = self.notes.len();
+        self.stats.shadowed_outputs = self.shadowed.len();
+    }
+}
+
+/// The nullifier claims a set of notes stakes — the state a wallet persists so
+/// that a collision spanning two scans is not a collision nobody can see.
+///
+/// 🔴 **One wallet per set, and the type cannot enforce it.** `nf = keccak(nk ‖ ρ)`
+/// collides on equal ρ only when `nk` is equal too, so a set built from two
+/// wallets' scans produces **false positives** — it would write off a live note of
+/// wallet B because wallet A happens to hold one with the same ρ. A wallet's own
+/// diversified addresses all share one `nk` (their `dk_d` derive from one
+/// `div_seed`, which derives from one `sk`), so aggregating across a wallet's
+/// addresses is exactly the supported case and aggregating across wallets is
+/// exactly the unsupported one.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+pub struct ClaimSet {
+    claims: BTreeMap<NullifierClaim, NoteRef>,
+}
+
+impl ClaimSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.claims.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.claims.is_empty()
+    }
+
+    /// Which note holds `claim`, if any.
+    pub fn holder_of(&self, claim: &NullifierClaim) -> Option<NoteRef> {
+        self.claims.get(claim).copied()
+    }
+
+    /// Record `at` as the holder of `claim`. **Keeps the incumbent** and returns
+    /// it if the claim was already held — for the same reason
+    /// [`ScanOutcome::shadow_against`] does: a wallet cannot un-spend.
+    pub fn remember(&mut self, claim: NullifierClaim, at: NoteRef) -> Option<NoteRef> {
+        match self.claims.get(&claim) {
+            Some(incumbent) => Some(*incumbent),
+            None => {
+                self.claims.insert(claim, at);
+                None
+            }
+        }
+    }
+
+    /// Fold another scan's spendable claims in, incumbents winning.
+    pub fn absorb(&mut self, other: &ClaimSet) {
+        for (claim, at) in &other.claims {
+            self.remember(*claim, *at);
+        }
+    }
+}
+
+/// Is `a` the better representative of its [`NullifierClaim`] than `b`?
+///
+/// Greater value wins — the realizable value of a colliding set is its maximum,
+/// because the recipient may spend whichever member it likes. Equal value breaks
+/// toward the earlier **committed** position and then the committed `cm`, so the
+/// outcome does not depend on iteration order, on which node served the range, or
+/// on the order the notes happened to be decrypted in.
+fn outranks(a: &LocatedNote, b: &LocatedNote) -> bool {
+    match a.detected.note.value.cmp(&b.detected.note.value) {
+        Ordering::Greater => true,
+        Ordering::Less => false,
+        Ordering::Equal => a.at() < b.at(),
+    }
+}
+
+/// Partition the notes this scan opened into the spendable set and the dead set.
+///
+/// Keyed on ρ alone (see [`NullifierClaim`]) — no `nf`, no `nk`, no secret the
+/// scanner does not already hold. Relative order within each output list is
+/// preserved, so the two lists read in chain order.
+fn resolve_claims(opened: Vec<LocatedNote>) -> (Vec<LocatedNote>, Vec<ShadowedNote>) {
+    let mut best: BTreeMap<NullifierClaim, usize> = BTreeMap::new();
+    for (i, note) in opened.iter().enumerate() {
+        let claim = note.claim();
+        match best.get(&claim) {
+            Some(&j) if !outranks(note, &opened[j]) => {}
+            _ => {
+                best.insert(claim, i);
+            }
+        }
+    }
+    let holder: BTreeMap<NullifierClaim, NoteRef> =
+        best.iter().map(|(claim, &i)| (*claim, opened[i].at())).collect();
+    let winners: BTreeSet<usize> = best.values().copied().collect();
+
+    let mut spendable = Vec::with_capacity(winners.len());
+    let mut shadowed = Vec::new();
+    for (i, note) in opened.into_iter().enumerate() {
+        if winners.contains(&i) {
+            spendable.push(note);
+        } else {
+            let claim = note.claim();
+            let claimed_by = holder[&claim];
+            shadowed.push(ShadowedNote { note, claimed_by, claim });
+        }
+    }
+    (spendable, shadowed)
 }
 
 /// Run the light-client scan against `base_url` over `[from, to]`.
@@ -313,10 +662,14 @@ where
                                 let found = scan(dk, &enc, config.mode);
                                 let idx: Vec<usize> = found.iter().map(|d| d.index).collect();
                                 for detected in found {
+                                    // The committed `cm`, from the bundle — never a
+                                    // recompute of the plaintext we just decrypted.
+                                    let cm = group.recipients[*ri].entries[detected.index].cm;
                                     notes.push(LocatedNote {
                                         height: block.height,
                                         tx_index: group.tx_index,
                                         recipient_index: *ri,
+                                        cm,
                                         detected,
                                     });
                                 }
@@ -357,8 +710,14 @@ where
         }
     }
 
+    // 🔴 Issue #215: of two notes payable to this wallet that share ρ, only one
+    // can ever be spent. Decided here, over the whole range, once every note is
+    // in hand — not per block, because the two halves of the attack are two
+    // different transactions in two different blocks by design.
+    let (notes, shadowed) = resolve_claims(notes);
     stats.notes_found = notes.len();
-    Ok(ScanOutcome { notes, unopened, stats })
+    stats.shadowed_outputs = shadowed.len();
+    Ok(ScanOutcome { notes, unopened, shadowed, stats })
 }
 
 /// Minimal dependency-free HTTP/1.1 GET over `TcpStream`. `base_url` is
