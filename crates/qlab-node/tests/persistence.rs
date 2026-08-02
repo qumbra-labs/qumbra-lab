@@ -416,6 +416,22 @@ fn a_snapshot_for_a_branch_the_log_abandoned_is_discarded_not_honoured() {
         None,
         "the snapshot was not used — its tip is not where this log's prefix ends"
     );
+    // Issue #225: and it now says SO. This fall-through was silent from #162
+    // until #225 — `snapshot_height: None` reads identically to a datadir that
+    // never had a snapshot at all, which is the whole detection gap.
+    assert!(
+        matches!(
+            opened.recovery_report().snapshot_rejected,
+            Some(qlab_node::SnapshotRejection::TipDisagreement { applied_height: 1, .. })
+        ),
+        "the reason survives: {:?}",
+        opened.recovery_report().snapshot_rejected
+    );
+    assert!(
+        opened.recovery_report().to_string().contains("snapshot DISCARDED"),
+        "and it reaches the startup line: {}",
+        opened.recovery_report()
+    );
     assert_eq!(opened.tip_hash(), live_tip, "and the resume landed on the winner");
     assert_eq!(opened.commitment_root(), live_root);
     assert!(!opened.is_spent(&[0xB2; 32]), "the losing branch's spend did not come back");
@@ -506,6 +522,206 @@ fn a_refused_rewind_mutates_nothing() {
 
     std::fs::remove_dir_all(&dir).ok();
     std::fs::remove_dir_all(&side_dir).ok();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #225 — the graceful stop that minted a datadir refusing to start.
+// ---------------------------------------------------------------------------
+
+/// **A snapshot whose log implies a rewind it cannot honour opens by full
+/// replay, and reaches the state `replay` reaches** (issue #225).
+///
+/// Not "does not crash" — the SAME state. That is the only claim worth making,
+/// because the fall-through's whole justification is that the from-genesis
+/// replay is the correctness anchor.
+///
+/// **The shape, which the two #162 snapshot tests bracket without covering.**
+/// They put the orphan *at* `applied_height` (tip disagreement) and *below* it
+/// (a prefix-loop rewind). This is the third position and the only one that
+/// reaches the failing line: an orphan strictly **above** `applied_height` while
+/// `snap.tip` still agrees.
+///
+/// ```text
+/// apply P (h=1) · apply A2 (h=2) · apply A3 (h=3)
+/// rewind to P   · apply B2 (h=2)      <- a SAME-HEIGHT sibling: the tip does not pass A3
+/// save_snapshot()                     <- applied_height = 2, tip = B2
+/// ```
+///
+/// The prefix loop's rewind to `P` drops `A2`; the beyond-the-snapshot loop then
+/// meets `A3`, whose `prev` is `A2`, and asks to rewind onto a block that is no
+/// longer stored. Before this fix that `RewindError::UnknownTarget` was an `Err`
+/// out of `Node::open` and the process died on it — 19 times on a rolled T0
+/// host, with no startup line at all. A same-height (or lower) reorg is
+/// **required**: rewinding to an ancestor and walking straight back up does not
+/// reproduce it, because the rewind target itself survives.
+#[test]
+fn a_snapshot_whose_log_implies_a_rewind_it_cannot_honour_opens_by_full_replay() {
+    let dir = temp_dir("i225-orphan-above-snapshot");
+    let (mut node, g_header, root) = node_with_finalized_genesis(&dir);
+
+    let (p, p_hash) = apply_marked(&mut node, &g_header, root, 0xC1);
+    let (a2, a2_hash) = apply_marked(&mut node, &p, root, 0xA2);
+    let (_a3, a3_hash) = apply_marked(&mut node, &a2, root, 0xA3);
+    assert_eq!(node.tip_height(), 3, "the node really did reach h=3 on branch A");
+
+    node.rewind_to(p_hash).expect("fork choice moves the applied tip back to P");
+    let (_b2, b2_hash) = apply_marked(&mut node, &p, root, 0xB2);
+    assert_eq!(node.tip_height(), 2, "and ends on a SAME-HEIGHT sibling, not past A3");
+
+    // The graceful-shutdown flush, which is the only place a snapshot is written
+    // in the production path — this is the poison being minted.
+    node.save_snapshot().expect("the graceful stop writes the snapshot");
+    let live_tip = node.tip_hash();
+    let live_root = node.commitment_root();
+    let live_cms = node.commitment_count();
+    let live_nfs = node.nullifier_count();
+    assert_eq!(live_tip, b2_hash);
+    drop(node);
+
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    let opened = MemNode::open(&dir, genesis.clone()).expect("open must NOT refuse (issue #225)");
+
+    // (1) The snapshot was rejected, and the reason names the failure exactly.
+    let report = *opened.recovery_report();
+    assert_eq!(report.snapshot_height, None, "the snapshot was not honoured");
+    match report.snapshot_rejected {
+        Some(qlab_node::SnapshotRejection::RewindRefused {
+            applied_height,
+            at_height,
+            target,
+            error,
+            above_snapshot,
+        }) => {
+            assert_eq!(applied_height, 2, "the snapshot the graceful stop wrote");
+            assert_eq!(at_height, 3, "A3 is the record that asked for the rewind");
+            assert_eq!(target, a2_hash, "onto A2, which the prefix reconstruction dropped");
+            assert_eq!(error, qlab_node::RewindError::UnknownTarget);
+            assert!(above_snapshot, "the beyond-the-snapshot loop, not the prefix loop");
+        }
+        other => panic!("expected a rewind refusal on the snapshot path, got {other:?}"),
+    }
+    assert!(
+        report.to_string().contains("snapshot DISCARDED"),
+        "and an operator reading the startup line sees it: {report}"
+    );
+
+    // (2) The state, which is the claim that matters: open == replay, not merely
+    // "open returned Ok".
+    let replayed = MemNode::replay(&dir, genesis).expect("the log was always replayable");
+    assert_eq!(opened.tip_hash(), replayed.tip_hash(), "open == replay: tip");
+    assert_eq!(opened.tip_height(), replayed.tip_height());
+    assert_eq!(opened.commitment_root(), replayed.commitment_root(), "open == replay: tree");
+    assert_eq!(opened.commitment_count(), replayed.commitment_count());
+    assert_eq!(opened.nullifier_count(), replayed.nullifier_count());
+    assert_eq!(opened.finalized_height(), replayed.finalized_height());
+
+    // …and both equal the live node that wrote the log.
+    assert_eq!(opened.tip_hash(), live_tip, "and equals the state that was flushed");
+    assert_eq!(opened.commitment_root(), live_root);
+    assert_eq!(opened.commitment_count(), live_cms);
+    assert_eq!(opened.nullifier_count(), live_nfs);
+    assert!(opened.is_spent(&[0xB2; 32]), "the winner's spend is applied");
+    assert!(!opened.is_spent(&[0xA2; 32]), "the abandoned branch's are not");
+    assert!(!opened.is_spent(&[0xA3; 32]));
+    assert!(!opened.chain().contains(&a3_hash), "and the orphans are out of the store");
+    assert!(!opened.chain().contains(&a2_hash));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// **No stop point on a reorg-churning chain mints a datadir that refuses to
+/// start** (issue #225's property, the class rather than the one instance).
+///
+/// `#225` measured the class on the four real T0 logs by simulating a graceful
+/// stop after each of the last 200 block records: **6.0 % of node0's stop points
+/// produced a datadir that refuses to open**, 5.0 % / 5.0 % / 3.0 % on the other
+/// three, and `falls back to full replay` was **0 out of 800** — the safe
+/// fall-through was essentially never reached, because it did not exist for this
+/// failure. This is that sweep, in-crate and deterministic.
+///
+/// **What a stop point is here.** The script is replayed from genesis into a
+/// fresh datadir and stopped after step `k`, then `save_snapshot()` — which is
+/// byte-for-byte what the production graceful-shutdown flush writes, and the only
+/// place a snapshot is written. Then `open` must succeed AND equal `replay`.
+///
+/// **The script has to contain the shape or the sweep proves nothing**: every
+/// fourth step is a depth-2 rewind followed by a same-height sibling, so the log
+/// carries a block above the applied tip whose parent lost fork choice. The
+/// assertion at the end pins that at least one stop point actually rejected its
+/// snapshot — without it, a sweep of 24 honoured fast paths would pass while the
+/// bug stood.
+#[test]
+fn no_graceful_stop_point_mints_a_datadir_that_refuses_to_start() {
+    const STEPS: usize = 24;
+    let mut rejected = 0usize;
+    let mut honoured = 0usize;
+
+    for stop_after in 1..=STEPS {
+        let dir = temp_dir(&format!("i225-stop-{stop_after}"));
+        let (mut node, g_header, root) = node_with_finalized_genesis(&dir);
+        let mut marker: u8 = 0;
+        let mut parent = g_header;
+
+        for step in 0..stop_after {
+            // Fork-choice churn: the applied tip moves BACK two and rejoins on a
+            // sibling, so the log keeps a block above the tip whose parent is on
+            // the branch this node abandoned.
+            if step % 4 == 3 && node.tip_height() >= 2 {
+                let tip = node.chain().block(&node.tip_hash()).expect("tip is stored").clone();
+                let mid = node.chain().block(&tip.header.prev).expect("parent is stored").clone();
+                let target = mid.header.prev;
+                node.rewind_to(target).expect("rewind to depth 2");
+                parent = node.chain().block(&node.tip_hash()).expect("new tip").header();
+            }
+            marker += 1;
+            let (h, _) = apply_marked(&mut node, &parent, root, marker);
+            parent = h;
+        }
+
+        // The graceful stop.
+        node.save_snapshot().expect("shutdown flush");
+        let live_tip = node.tip_hash();
+        let live_root = node.commitment_root();
+        drop(node);
+
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let opened = match MemNode::open(&dir, genesis.clone()) {
+            Ok(n) => n,
+            Err(e) => panic!("stop point {stop_after} minted a datadir that refuses to start: {e}"),
+        };
+        let replayed = MemNode::replay(&dir, genesis).expect("the log always replays");
+        assert_eq!(opened.tip_hash(), replayed.tip_hash(), "stop {stop_after}: open == replay tip");
+        assert_eq!(
+            opened.commitment_root(),
+            replayed.commitment_root(),
+            "stop {stop_after}: open == replay tree"
+        );
+        assert_eq!(opened.nullifier_count(), replayed.nullifier_count());
+        assert_eq!(opened.tip_hash(), live_tip, "stop {stop_after}: and equals what was flushed");
+        assert_eq!(opened.commitment_root(), live_root);
+
+        if opened.recovery_report().snapshot_rejected.is_some() {
+            rejected += 1;
+        } else {
+            honoured += 1;
+            assert_eq!(
+                opened.recovery_report().snapshot_height,
+                Some(opened.tip_height()),
+                "stop {stop_after}: an honoured snapshot is the fast path it claims to be"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Both halves have to be non-zero or the sweep is not measuring anything:
+    // all-honoured would pass with the fix reverted, all-rejected would pass with
+    // the snapshot path deleted outright.
+    assert!(rejected > 0, "no stop point exercised the fall-through — the sweep proves nothing");
+    assert!(honoured > 0, "no stop point took the fast path — the snapshot is not being used");
+    println!(
+        "I225-STOP-SWEEP steps={STEPS} rejected_snapshot={rejected} honoured_snapshot={honoured} \
+         refused_to_start=0"
+    );
 }
 
 /// **The measured cost of a rewind** (issue #162) — `#[ignore]`d because it is a

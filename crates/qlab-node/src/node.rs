@@ -1447,6 +1447,104 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **The negative for issue #225: the fall-through must not become a
+    /// swallow.** A tampered record ABOVE `applied_height` goes through
+    /// `apply_logged_block` — the same call whose rewind refusal is now a
+    /// fall-through — and must still refuse, with the height it refused at.
+    ///
+    /// The existing test above covers a tampered record *at* `applied_height`,
+    /// which `check_stored_binding` catches in the prefix loop; this covers the
+    /// other side of the boundary, where the widening would actually have
+    /// happened. `#225` is specific that a torn or undecodable log still refuses
+    /// loudly and only a rewind refusal falls through, and this is that line.
+    #[test]
+    fn a_tampered_record_above_the_snapshot_still_refuses_rather_than_falling_through() {
+        let dir = temp_dir("i225-tamper-above-snapshot");
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let g_header = genesis.header();
+        let mut node = MemNode::open(&dir, genesis.clone()).unwrap();
+        node.finalize(g_header.header_hash()).unwrap();
+        let root = node.commitment_root();
+
+        let body = BlockBody { txs: vec![tx(root, 7)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let h1 = child_committing_to(&g_header, &body);
+        node.apply_block(h1, body, &MockVerifier).unwrap();
+        node.save_snapshot().unwrap();
+        assert_eq!(node.tip_height(), 1, "snapshot applied_height = 1");
+        drop(node);
+
+        // A record at height 2 — strictly above the snapshot, so the beyond loop
+        // takes it — whose stored body is not the body its header commits to.
+        let honest2 = BlockBody { txs: vec![tx(root, 8)], coinbase: 0, coinbase_rkm: [0; 4] };
+        let h2 = child_committing_to(&h1, &honest2);
+        let tampered = StoredBlock {
+            header: StoredHeader::from(&h2),
+            txs: Vec::new(),
+            coinbase: 0,
+            coinbase_rkm: [0; 4],
+        };
+        persist::append_record(&dir, &LogRecord::Block(tampered)).unwrap();
+
+        let err = match MemNode::open(&dir, genesis.clone()) {
+            Err(e) => e,
+            Ok(n) => panic!(
+                "a corrupt record must not be recovered from: opened at tip {} ({:?})",
+                n.tip_height(),
+                n.recovery_report()
+            ),
+        };
+        assert!(
+            matches!(err, NodeError::BodyCommitmentMismatch { height: 2, .. }),
+            "and it says which record and why, got {err}"
+        );
+        // The full replay refuses it identically — which is the argument for the
+        // fall-through: it hands the decision to a path that is not more tolerant.
+        assert!(matches!(
+            MemNode::replay(&dir, genesis),
+            Err(NodeError::BodyCommitmentMismatch { height: 2, .. })
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **A genuinely corrupt log still refuses to start, with a reason** (issue
+    /// #225's negative, upstream half).
+    ///
+    /// A record that does not decode with bytes still after it is not a torn
+    /// tail, and `read_records` refuses it before the snapshot is even consulted
+    /// — so the #225 fall-through structurally cannot reach it. Pinned here
+    /// anyway, because "the fix did not turn a refusal into a silent replay" is
+    /// the claim, and it is worth an assertion rather than an argument.
+    #[test]
+    fn a_block_log_that_does_not_decode_still_refuses_to_start_with_a_reason() {
+        use std::io::Write as _;
+
+        let dir = temp_dir("i225-corrupt-log");
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+
+        // Two length-framed records of bytes that are not a `LogRecord`. The
+        // second is what makes the first a corruption rather than a crash
+        // mid-append: a torn record is by construction the LAST thing in the file.
+        let junk = [0xffu8; 24];
+        let mut f = std::fs::File::create(dir.join(persist::BLOCK_LOG)).unwrap();
+        for _ in 0..2 {
+            f.write_all(&(junk.len() as u32).to_le_bytes()).unwrap();
+            f.write_all(&junk).unwrap();
+        }
+        f.sync_all().unwrap();
+        drop(f);
+
+        let err = match MemNode::open(&dir, genesis) {
+            Err(e) => e,
+            Ok(n) => panic!("a corrupt log must not start: opened at tip {}", n.tip_height()),
+        };
+        let NodeError::Io(io) = &err else { panic!("expected an IO refusal, got {err}") };
+        assert_eq!(io.kind(), std::io::ErrorKind::InvalidData);
+        let text = err.to_string();
+        assert!(text.contains("does not decode"), "the reason is in it: {text}");
+        assert!(text.contains("Re-sync this datadir"), "and what to do about it: {text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// **Issue #115 — the property the height-0 exemption made inexpressible.**
     ///
     /// A genesis whose body is not the body its header commits to is rejected, at
