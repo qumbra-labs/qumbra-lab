@@ -230,15 +230,12 @@ pub fn scan_local(
 
 /// Does any entry in `bundle` produce a detection-tag match under `dk`? (The
 /// cheap pre-filter that decides whether to full-fetch.)
+/// The tag pre-filter. Delegates to [`qlab_note::scan::detect_matches`], which is
+/// where this moved in issue #188 baton 2 — the compact bundle is now consensus-
+/// committed, so "which outputs are mine" is a wallet primitive the note crate
+/// owns rather than a private helper in a reference server's client.
 fn bundle_has_tag_match(dk: &Dk, bundle: &qlab_note::wire::RecipientBundle) -> bool {
-    use qlab_note::derive::detection_tag;
-    use qlab_note::hash::digest_from_bytes;
-    use qlab_note::kem::decapsulate;
-    let k = decapsulate(dk, &bundle.ct);
-    bundle
-        .entries
-        .iter()
-        .any(|e| detection_tag(&k, &digest_from_bytes(&e.cm)) == e.tag)
+    !qlab_note::scan::detect_matches(dk, bundle).is_empty()
 }
 
 /// Minimal dependency-free HTTP/1.1 GET over `TcpStream`. `base_url` is

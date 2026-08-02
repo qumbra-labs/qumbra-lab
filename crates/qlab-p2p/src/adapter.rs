@@ -212,6 +212,16 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// Rewind reports awaiting the journal (issue #162), newest-wins and bounded by
     /// [`MAX_JOURNALLED_REWINDS`]. See [`NodeAdapter::drain_rewinds`].
     rewinds: Vec<RewindReport>,
+    /// Issue #200: monotonic-ms when this node first entered the continuous
+    /// *lagging + outstanding unserved body ask* state, or `None` when that
+    /// condition is not holding. Progress (a requested body arrived) or leaving
+    /// the condition clears it.
+    unserved_since_ms: Option<u64>,
+    /// Issue #200: the unobtainable-body exemption is armed. Once set, stays set
+    /// until the applied tip is back on the main chain at zero lag — so a sibling
+    /// mined under the exemption can be extended until fork choice adopts it
+    /// (equal-work keeps the incumbent tip, so one sibling alone is not enough).
+    state_tip_mine_ready: bool,
 }
 
 /// How many [`RewindReport`]s are held for the journal before the oldest is dropped
@@ -248,6 +258,48 @@ pub const MAX_PENDING_BODY_HEIGHTS: u64 = 1024;
 ///
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
 pub const MAX_REWIND_DEPTH: u64 = 8 * qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
+
+/// **How many checkpoint cadences of continuous lagging-with-unserved-asks before
+/// a node may mine on its verified state tip** (issue #200).
+///
+/// The duty gate (#130 (a)) refuses to mine while the applied view is stale —
+/// Ethereum's *"an optimistic validator MUST NOT produce a block"*. That rule is
+/// right. On 2026-08-01 it composed with a body that **no host ever applied**
+/// (#197 / #198's archive check) into a permanent halt: every node held a header
+/// whose body exists nowhere, every node asked (`breq>0`), nobody could serve, and
+/// nobody would mine the sibling that would break the deadlock.
+///
+/// This constant is the **exhaustion**, not the impatience, half of the exemption
+/// that re-opens that loop:
+///
+/// | too small | a node merely slow to be served forks the chain for nothing |
+/// | too large | the net stays halted longer than it must |
+///
+/// **N = 2**, not tuned to today's multi-hour incident:
+///
+/// - **1 cadence** (one 10-min bucket at the 75 s target) is one long partition or
+///   one overloaded peer away from a needless fork. A single body-request cycle is
+///   15 s (`BODY_REQUEST_TIMEOUT_MS`); one cadence is ~40 re-asks across the mesh —
+///   enough to try every peer many times, but not enough margin for a WAN blip that
+///   is still progress-bound.
+/// - **2 cadences** is two full cadence windows of *continuous non-service* with an
+///   outstanding ask. Any body that actually arrives resets the clock (progress is
+///   "a requested body was satisfied", not "lag moved for any reason"), so a node
+///   that is lagging **and being served** never reaches the threshold — that is the
+///   half `the_duty_gate_still_refuses_to_mine_while_lagging_and_receiving` locks.
+/// - **Not wall-clock seconds as a bare constant**: the threshold is
+///   `N × CHECKPOINT_CADENCE_BLOCKS × block_time_secs` of monotonic time. Cadence is
+///   the unit because the checkpoint grid is this net's natural progress quantum
+///   (same precedent as [`MAX_REWIND_DEPTH`]); block time is the conversion because
+///   while the chain is halted no height advances, and a loop-count threshold would
+///   be wrong by the #107 factor (30 s vs 131 s loop period) between images.
+///
+/// At the live 75 s target this is **20 minutes**. At the in-process sim's 2 s
+/// target it is 32 s of sim time. Either way it is network-parameter-relative, not
+/// incident-tuned.
+///
+/// `[devnet-placeholder]`, testnet-tunable, **NOT frozen**.
+pub const UNOBTAINABLE_BODY_CADENCES: u64 = 2;
 
 /// Hard entry cap on the pending-body window (issue #130 (a)).
 pub const MAX_PENDING_BODIES: usize = 512;
@@ -521,6 +573,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             punishments: Vec::new(),
             punish_restore: PunishmentRestore::default(),
             rewinds: Vec::new(),
+            unserved_since_ms: None,
+            state_tip_mine_ready: false,
         }
     }
 
@@ -741,9 +795,130 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         self.metrics.lag_refusals(duty)
     }
 
+    /// **Issue #200 — is the unobtainable-body exemption armed?**
+    ///
+    /// When true, [`Self::mine_block`] will produce a child of the **state tip**
+    /// rather than refuse (or rather than extend a fork-choice tip this node cannot
+    /// verify). Operator-visible as `uex=` on `TELEMETRY`: an operator seeing a
+    /// node mine while `slag>0` needs to know it was this exemption and not a bug.
+    pub fn state_tip_mine_ready(&self) -> bool {
+        self.state_tip_mine_ready
+    }
+
+    /// How many blocks this node has mined under the #200 exemption.
+    pub fn state_tip_mines(&self) -> u64 {
+        self.metrics.state_tip_mines()
+    }
+
+    /// Duration of continuous unserved lag (ms) required before the exemption
+    /// arms — `UNOBTAINABLE_BODY_CADENCES × CHECKPOINT_CADENCE_BLOCKS × block_time`
+    /// in milliseconds. Exposed so tests can drive the clock to the threshold
+    /// without hard-coding the arithmetic.
+    pub fn unobtainable_threshold_ms(&self) -> u64 {
+        UNOBTAINABLE_BODY_CADENCES
+            .saturating_mul(qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS)
+            .saturating_mul(self.block_time)
+            .saturating_mul(1_000)
+    }
+
+    /// **Issue #200 — feed the duty-gate exemption the body-fetch facts it keys on.**
+    ///
+    /// Called once per `P2pNode::tick` after body requests have been (re)issued, so
+    /// `outstanding_breqs` already reflects this tick's ask set.
+    ///
+    /// - `body_progress`: a historical body **we asked for** was satisfied this
+    ///   tick. That is the "being served" half of the distinction; lag moving for
+    ///   any other reason (including our own exemption-mined sibling applying)
+    ///   is deliberately not progress.
+    /// - Leaving lag, or stopping asking, clears the unserved window. The armed
+    ///   exemption itself only clears when the applied tip is back on the main
+    ///   chain at zero lag — see [`Self::state_tip_mine_ready`].
+    pub fn observe_body_fetch(
+        &mut self,
+        now_ms: u64,
+        outstanding_breqs: usize,
+        body_progress: bool,
+    ) {
+        let lagging = self.state_lag().is_lagging();
+        let on_main_caught_up =
+            !lagging && !self.applied_tip().is_off_main_chain();
+
+        if on_main_caught_up {
+            // Healthy: applied tip is the main-chain tip. Disarm everything.
+            self.unserved_since_ms = None;
+            self.state_tip_mine_ready = false;
+            return;
+        }
+
+        if body_progress {
+            // A requested body arrived — we are being served. Reset the unserved
+            // window; if the exemption had armed on a false start, drop it too so
+            // a lagging-and-receiving node falls back under the duty gate.
+            self.unserved_since_ms = None;
+            self.state_tip_mine_ready = false;
+            // If still lagging and still asking, the window restarts from now so a
+            // later stall can still arm.
+            if lagging && outstanding_breqs > 0 {
+                self.unserved_since_ms = Some(now_ms);
+            }
+            return;
+        }
+
+        if !lagging {
+            // Heights match but we may be off-main (exemption-mined sibling that
+            // has not yet taken fork choice). Keep the armed flag so we continue
+            // mining on the state tip until the branch wins; do not start a new
+            // unserved window (there is nothing outstanding to be unserved for).
+            self.unserved_since_ms = None;
+            return;
+        }
+
+        // Lagging.
+        if outstanding_breqs == 0 {
+            // Not asking — cannot conclude unobtainable. Do not arm; if already
+            // armed (e.g. peers dropped mid-recovery), leave the flag alone so a
+            // recovery already in flight can finish on the state tip.
+            self.unserved_since_ms = None;
+            return;
+        }
+
+        // Lagging + asking + no progress this tick.
+        let since = *self.unserved_since_ms.get_or_insert(now_ms);
+        if now_ms.saturating_sub(since) >= self.unobtainable_threshold_ms() {
+            self.state_tip_mine_ready = true;
+        }
+    }
+
     /// Record a refused duty (issue #130 (a) part 3).
     fn refuse_for_lag(&mut self, duty: &'static str) {
         self.metrics.observe_lag_refusal(duty);
+    }
+
+    /// **Bodies this node's state machine refused at the application funnel, and the
+    /// height of the most recent one** (issue #130 (b)) — the pair `bdrop=` prints.
+    ///
+    /// Read from the one metric registry, never from a second ledger.
+    ///
+    /// **Why a pair and not a total.** A cumulative count answers *how many* and
+    /// cannot answer *are they still arriving*, and those want opposite operator
+    /// responses: a burst while a joiner caught up is over, the same total still
+    /// climbing is a node that is not converging. `/metrics` answers that with
+    /// `rate()`; a single telemetry line has no previous sample to difference
+    /// against. Height is the monotone quantity that IS on that line — `tip=` and
+    /// `stip=` — so the last refusal's height read against `stip=` is the same
+    /// answer, computed by eye, from one sample.
+    ///
+    /// **Height and not a timestamp**, deliberately: #106 recorded that genesis is
+    /// stamped `timestamp = 0` for a reproducible genesis hash, so chain time has no
+    /// wall-clock anchor, and a process-relative age would reset on the restarts this
+    /// project counts.
+    pub fn body_refusals(&self) -> (u64, Option<u64>) {
+        (self.metrics.body_refusals_total(), self.metrics.body_refusal_last_height())
+    }
+
+    /// Bodies refused for one [`qlab_node::metrics::BODY_REFUSAL_REASONS`] class.
+    pub fn body_refusals_by_reason(&self, reason: &str) -> u64 {
+        self.metrics.body_refusals(reason)
     }
 
     /// How many times this node's state machine has rewound onto the main chain,
@@ -981,14 +1156,23 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
                 Ok(_) => {
                     self.mempool.on_block_connected(&body, &self.state);
                 }
-                // GUARANTEED HERE, and this is not the old "expected" annotation: a
-                // body that fails at the funnel has mutated nothing (`apply_state`
+                // A body that fails at the funnel has mutated nothing (`apply_state`
                 // validates before it writes), and no peer is charged for it — the
                 // sender was judged once, on arrival, and this path holds no sender
-                // to charge a second time. What such a failure costs is visibility,
-                // and it has it: the body is dropped, the lag stays nonzero, and the
-                // duty gate below keeps refusing until it is not.
-                Err(_) => {}
+                // to charge a second time.
+                //
+                // 🔴 **Issue #130 (b): what it costs is visibility, and until this
+                // line it did not have any.** The sentence this arm's predecessor
+                // carried — that the drop was expected — was the whole of #130's
+                // complaint: *"a comment asserting that a dropped block is normal is
+                // what kept anyone from asking whether it was."* Naming the error
+                // class and the height turns the assertion into a measurement, so the
+                // next person asking gets an answer instead of a comment. The
+                // classification is [`qlab_node::NodeError::refusal_reason`], beside
+                // the enum, where the compiler enforces that it stays exhaustive.
+                Err(e) => {
+                    self.metrics.observe_body_refusal(e.refusal_reason(), header.height);
+                }
             }
         }
         // The finalized head is part of the view that has to catch up, not a separate
@@ -1166,32 +1350,72 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// Returns `(mined_header, body)`; the caller ingests it via `announce_block`
     /// → `ingest_block`, which is the single insert/apply path. `None` if there is
     /// no known parent or the nonce budget is exhausted.
+    ///
+    /// # Parent selection (issue #130 (a) + issue #200)
+    ///
+    /// The parent comes from **fork choice** and the body is assembled from
+    /// **state**. When those disagree, the block this would produce is a valid
+    /// child of the fork-choice tip that the node's own state machine then
+    /// refuses — coinbase notes with no commitment-tree leaf, silent loss.
+    ///
+    /// - **Default (healthy):** parent = fork-choice tip.
+    /// - **Lagging, exemption not armed:** refuse. Ethereum's optimistic-sync
+    ///   rule ("an optimistic validator MUST NOT produce a block").
+    /// - **Exemption armed (issue #200):** parent = **state tip** — the height
+    ///   this node has actually verified. Never the fork-choice tip it cannot
+    ///   reach. Produces a sibling that fork choice can resolve once extended
+    ///   past the unobtainable header's work.
     pub fn mine_block(&mut self) -> Option<(BlockHeader, BlockBody)> {
+        let lagging = self.state_lag().is_lagging();
+        let off_main = self.applied_tip().is_off_main_chain();
+        let exempt = self.state_tip_mine_ready;
+
+        // Parent height for the halt gate: under the exemption we extend the
+        // *state* tip, so the height that must clear H2 is state_tip+1, not the
+        // fork-choice tip the node cannot verify.
+        let next_height = if exempt && (lagging || off_main) {
+            self.state.tip_height().saturating_add(1)
+        } else {
+            self.chain.tip_height().saturating_add(1)
+        };
         // HALT (H2): an upgraded node stops mining above H. Un-upgraded miners will
         // not, and that is fine — §4's hybrid honesty note; the committee, not miner
         // unanimity, is what makes the upgrade clean.
-        if !self.rules.accepts_height(self.chain.tip_height() + 1) {
+        if !self.rules.accepts_height(next_height) {
             return None;
         }
-        // STATE LAG (issue #130 (a), part 3 — the first of the three refusals).
-        //
-        // The parent comes from FORK CHOICE and the body is assembled from STATE. When
-        // those disagree, the block this would produce is a valid child of the
-        // fork-choice tip that the node's own state machine then refuses, so its
-        // coinbase note never gets a commitment-tree leaf and the coins are gone with
-        // no error raised anywhere. A node that cannot record its own block does not
-        // mine one — Ethereum's optimistic-sync rule ("an optimistic validator MUST
-        // NOT produce a block"), and the reason this is a refusal rather than a
-        // best-effort attempt.
-        if self.state_lag().is_lagging() {
-            self.refuse_for_lag("mine");
-            return None;
+
+        let parent_hash = if lagging {
+            if !exempt {
+                self.refuse_for_lag("mine");
+                return None;
+            }
+            // #200: mine on the verified state tip.
+            self.state.tip_hash()
+        } else if exempt && off_main {
+            // Heights match but the applied tip is a sibling of the main-chain
+            // block at that height (the equal-work incumbent still holds fork
+            // choice). Keep extending the verified branch until it is heavier.
+            self.state.tip_hash()
+        } else {
+            self.chain.tip_hash()
+        };
+
+        let mined = self.mine_on_parent(parent_hash)?;
+        if exempt && (lagging || off_main) {
+            self.metrics.observe_state_tip_mine();
         }
+        Some(mined)
+    }
+
+    /// Mine a child of `parent_hash` (must be a known header). Shared by the
+    /// healthy fork-choice path and the #200 state-tip path so the two cannot
+    /// drift on timestamp / difficulty / seed selection.
+    fn mine_on_parent(&mut self, parent_hash: Hash32) -> Option<(BlockHeader, BlockBody)> {
         let template =
             self.mempool.assemble(&self.state, SOAK_EFFECTIVE_MEDIAN, self.miner_rkm);
         let body = template.body;
         let bc = body.commitment();
-        let parent_hash = self.chain.tip_hash();
         let parent = *self.chain.header(&parent_hash)?;
         let difficulty = expected_difficulty(&self.chain, &parent_hash, self.block_time)?;
         let timestamp = self.next_timestamp(&parent);
@@ -1283,7 +1507,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             BodyError::MissingCoinbasePayee
             | BodyError::WrongFee { .. }
             | BodyError::DoubleSpendInBlock { .. }
-            | BodyError::ProofInvalid { .. } => BodyFault::Intrinsic("bad body"),
+            | BodyError::ProofInvalid { .. }
+            // Issue #188. Both discovery rules read only the transaction's own
+            // bytes and its own declared commitments, so they are as intrinsic
+            // as the fee check — this node's chain position cannot change the
+            // answer, which is what keeps them out of #134's amnesty.
+            | BodyError::DiscoveryMalformed { .. }
+            | BodyError::DiscoveryNotCanonical { .. }
+            | BodyError::DiscoveryDoesNotBind { .. } => BodyFault::Intrinsic("bad body"),
             // The one positional check (#134). `is_valid_anchor` answers from THIS
             // node's root index, finalized head and applied tip; a joiner replaying
             // history has none of the three at the height it is being served, so its
@@ -1380,6 +1611,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         use qlab_node::ChainStore as _;
         self.state.chain().block(hash).is_some()
     }
+    fn held_body(&self, hash: &Hash32) -> Option<BlockBody> {
+        // POSSESSION (issue #198): the applied store, then the rewind archive —
+        // bodies this node applied at some point and still holds. `MemNode` owns
+        // that distinction because `rewind_to` is where it is created.
+        self.state.held_block(hash).map(|b| b.body())
+    }
 
     /// The main-chain blocks whose bodies this node still needs (issue #130 (c)).
     ///
@@ -1442,6 +1679,19 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         }
         out.reverse(); // ascending — the order the state machine can apply them in
         out
+    }
+
+    fn observe_body_fetch(
+        &mut self,
+        now_ms: u64,
+        outstanding_breqs: usize,
+        body_progress: bool,
+    ) {
+        NodeAdapter::observe_body_fetch(self, now_ms, outstanding_breqs, body_progress);
+    }
+
+    fn state_tip_mine_ready(&self) -> bool {
+        NodeAdapter::state_tip_mine_ready(self)
     }
 }
 
@@ -1876,16 +2126,13 @@ mod tests {
     }
 
     fn tx_with(anchor: Hash32, nf: u8, proof: &[u8]) -> TxEntry {
-        TxEntry {
-            proof: proof.to_vec(),
-            public: qlab_devnet::body::TxPublic {
-                anchor,
-                nullifiers: vec![[nf; 32]],
-                commitments: vec![[nf.wrapping_add(50); 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: posted_fee(ArityBucket::TwoByTwo),
-            },
-        }
+        TxEntry::with_placeholder_discovery(proof.to_vec(), qlab_devnet::body::TxPublic {
+            anchor,
+            nullifiers: vec![[nf; 32]],
+            commitments: vec![[nf.wrapping_add(50); 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: posted_fee(ArityBucket::TwoByTwo),
+            })
     }
 
     #[test]
@@ -2155,13 +2402,21 @@ mod tests {
             "one rewind, one applied block undone — the depth of a sibling race"
         );
 
-        // The abandoned sibling is gone from the state machine's block store, which
-        // is what let its own height be re-used. It is not served any more either:
-        // `stored_body` answers what this node has APPLIED (#135), and it has not.
+        // The abandoned sibling is gone from the state machine's APPLIED store,
+        // which is what let its own height be re-used. `stored_body` answers what
+        // this node has applied (#135), and it has not.
+        //
+        // **It IS still served** — the sentence here used to end "and is not served
+        // any more either", and that half was the defect. Serving keyed on
+        // application, `rewind_to` (this very function) can un-apply a block the
+        // node still holds, and on 2026-08-01 those two composed into a net-wide
+        // mining deadlock (#197/#198). Since #198 the serving path asks `held_body`
+        // and the applied predicate below is only half the answer.
         use qlab_node::ChainStore as _;
         assert!(!loser.state().chain().contains(&lh1.header_hash()), "the orphan was dropped");
-        assert!(loser.stored_body(&lh1.header_hash()).is_none(), "and is not served");
-        assert!(loser.stored_body(&wh1.header_hash()).is_some(), "the winner's is");
+        assert!(loser.stored_body(&lh1.header_hash()).is_none(), "not APPLIED");
+        assert!(loser.held_body(&lh1.header_hash()).is_some(), "but still HELD, and served (#198)");
+        assert!(loser.stored_body(&wh1.header_hash()).is_some(), "the winner's is applied");
         assert_eq!(lb1.coinbase_rkm, [0xB2; 4], "the orphan really was the loser's own block");
 
         // (3) Converged, and it stays converged as the winner keeps extending.
@@ -2181,6 +2436,211 @@ mod tests {
         // The duties resume, which is the point: a node that cannot mine and cannot
         // admit a transaction is the liveness stop this issue was filed for.
         assert!(loser.mine_block().is_some(), "a converged node mines again");
+    }
+
+    /// Mine a block over the current fork-choice tip carrying `body` **verbatim**.
+    ///
+    /// [`NodeAdapter::mine_block`] cannot be used for this: it assembles the body
+    /// from the mempool, and the mempool refuses a cross-block double-spend by
+    /// design — which is exactly the body the funnel-refusal test needs. This is
+    /// `mine_block`'s own header arithmetic with the assembly step replaced, so the
+    /// block it produces is indistinguishable on the wire from one a hostile miner
+    /// with the same hash power would produce.
+    fn mine_body_over_tip(
+        a: &mut NodeAdapter<KeccakPow, MockVerifier>,
+        body: &BlockBody,
+    ) -> BlockHeader {
+        let parent_hash = a.chain.tip_hash();
+        let parent = *a.chain.header(&parent_hash).expect("the tip has a header");
+        let difficulty =
+            expected_difficulty(&a.chain, &parent_hash, a.block_time).expect("difficulty");
+        let timestamp = a.next_timestamp(&parent);
+        let candidate = BlockHeader::child_of(&parent, timestamp, difficulty, body.commitment());
+        let seed = pow_seed(&a.chain, &parent_hash, candidate.height, a.schedule).expect("seed");
+        mine_under(&a.pow, candidate, a.nonce_budget, &seed, &a.rules).expect("mine")
+    }
+
+    /// 🔴 **Issue #130 (b): a body the state machine refuses is counted, and the
+    /// count says where — and a node that refuses nothing still reads zero.**
+    ///
+    /// This is the arm the issue was filed against. It used to be `Err(_) => {}`
+    /// under a comment calling the drop expected, and #130's sharpest sentence is
+    /// about that comment: *"a comment asserting that a dropped block is normal is
+    /// what kept anyone from asking whether it was."* There was no counter and no
+    /// telemetry field, so a node dropping every body it was handed printed exactly
+    /// what a healthy node prints.
+    ///
+    /// The refusal driven here is **`nullifier_spent`, and that choice is the
+    /// evidence, not a convenience**: it is the only class no earlier gate can
+    /// pre-empt. `validate_body` checks in-block double-spends and knows nothing
+    /// about the permanent nullifier set, so a two-block span whose second block
+    /// re-spends the first's nullifier passes every arrival-time check on both
+    /// blocks and can only fail at the state funnel — where, before this change,
+    /// failing cost nothing and told nobody. Both headers carry real PoW.
+    ///
+    /// Both halves of the acceptance item are here in order: the counter is zero
+    /// after a clean block is applied, and it moves — once, at the right height —
+    /// when one is refused.
+    #[test]
+    fn a_body_refused_at_the_application_funnel_is_counted_and_located() {
+        let (mut a, anchor) = adapter_with_finalized_genesis();
+        assert_eq!(a.body_refusals(), (0, None), "a fresh node has refused nothing");
+
+        // ── stays put: an ordinary block, applied ──
+        let (h1, b1) = a.mine_block().expect("mine");
+        assert_eq!(a.ingest_block(h1, b1), IngestOutcome::Accepted);
+        assert_eq!(a.state().tip_height(), 1);
+        assert_eq!(a.body_refusals(), (0, None), "applying a body is not refusing one");
+
+        // ── moves: a two-block span whose second block re-spends the first's
+        //    nullifier. Height 2 spends it; height 3 spends it again.
+        let spend = tx_with(anchor, 1, b"ok");
+        let b2 = BlockBody { txs: vec![spend.clone()], coinbase: 0, coinbase_rkm: [0; 4] };
+        let h2 = mine_body_over_tip(&mut a, &b2);
+        assert_eq!(a.ingest_header(h2), IngestOutcome::Accepted, "header-first sync");
+        let b3 = BlockBody { txs: vec![spend], coinbase: 0, coinbase_rkm: [0; 4] };
+        let h3 = mine_body_over_tip(&mut a, &b3);
+        assert_eq!(h3.height, 3);
+
+        // The bodies arrive out of order — the #130 (a) shape — so the second is
+        // buffered and only reaches the funnel behind the first.
+        assert_eq!(a.ingest_block(h3, b3), IngestOutcome::Accepted);
+        assert_eq!(a.state().tip_height(), 1, "held: its parent is not applied yet");
+        assert_eq!(a.body_refusals(), (0, None), "and holding is not refusing");
+
+        assert_eq!(a.ingest_block(h2, b2), IngestOutcome::Duplicate);
+        assert_eq!(a.state().tip_height(), 2, "the first spend applied");
+
+        // The refusal, counted and located.
+        assert_eq!(
+            a.body_refusals(),
+            (1, Some(3)),
+            "one body refused, at the height it was refused at"
+        );
+        assert_eq!(a.body_refusals_by_reason("nullifier_spent"), 1, "and by the right name");
+        assert_eq!(
+            a.body_refusals_by_reason("not_extending_tip"),
+            0,
+            "the invariant tripwire did not fire"
+        );
+        // Nothing was mutated by the refusal and nothing was charged to a peer: the
+        // state machine sits one block behind fork choice, which is now legible as a
+        // refusal rather than only as a gap.
+        assert_eq!(a.state().tip_height(), 2);
+        assert_eq!(a.chain().tip_height(), 3);
+        assert_eq!(a.state_lag().blocks(), 1);
+        // The refused body leaves the window rather than being retried against an
+        // unchanged state. It stays *re-requestable* — `missing_body_hashes` derives
+        // its ask set from what has been applied, so the next tick asks for height 3
+        // again, and each redelivery is counted here. That is the intended reading:
+        // a body that can never apply makes `bdrop` climb with its height pinned,
+        // which is the "still happening" signal this field exists to give.
+        assert_eq!(a.pending_bodies().0, 0, "the refused body is not held");
+    }
+
+    /// 🔴 **Issue #130 (b), the reachability question: `NotExtendingTip` cannot be
+    /// produced on any live path after `#178` and `#182` — and this is the test that
+    /// fails if it becomes reachable again.**
+    ///
+    /// The argument is a chain of three facts, each mechanically checkable:
+    ///
+    /// 1. [`qlab_node::NodeError::NotExtendingTip`] has **one** construction site,
+    ///    the first statement of [`qlab_node::Node::apply_block`].
+    /// 2. `apply_block` has **one** production caller,
+    ///    [`NodeAdapter::drain_pending_bodies`] (the others are a bench harness and
+    ///    test modules). `#178`'s replay path reaches `apply_state` through
+    ///    `apply_logged_block`, which rewinds first and never calls `apply_block`.
+    /// 3. That caller selects what it applies with [`NodeAdapter::next_applicable_body`],
+    ///    whose predicate — `header.prev == state.tip_hash()` — is the **exact
+    ///    negation** of the error's trigger.
+    ///
+    /// Fact 3 is the one a future change can break silently, so it is the one under
+    /// test, in **the one state where nothing else would stop it**. The selector has
+    /// two clauses and only the second is the invariant here: the height range
+    /// (`state tip + 1`) already excludes a sibling held at the applied tip's own
+    /// height, so a test built on that shape passes even with the `prev` comparison
+    /// deleted, and proves nothing. The state that isolates the `prev` clause is a
+    /// held body **at `tip + 1` on a different branch** — the winner's second block
+    /// arriving before its first — and that is what is built below. Delete the `prev`
+    /// comparison and `apply_block` gets a block it must refuse, the counter moves,
+    /// and this test goes red; that mutation was run, and it does.
+    ///
+    /// **An argument without a test decays into a comment, which is what this issue
+    /// is about** — and the counter itself is the production half of the same
+    /// tripwire: `qumbra_body_apply_refused_total{reason="not_extending_tip"}` is
+    /// expected to be zero forever on every host, so a nonzero scrape is this
+    /// argument failing in the field rather than in CI.
+    #[test]
+    fn i130b_a_held_body_that_does_not_extend_the_applied_tip_never_reaches_apply_block() {
+        let (mut winner, mut loser) = two_racers();
+        let (wh1, wb1) = winner.mine_block().expect("mine");
+        assert_eq!(winner.ingest_block(wh1, wb1.clone()), IngestOutcome::Accepted);
+        let (wh2, wb2) = winner.mine_block().expect("mine");
+        assert_eq!(winner.ingest_block(wh2, wb2.clone()), IngestOutcome::Accepted);
+
+        let (lh1, lb1) = loser.mine_block().expect("mine");
+        assert_eq!(loser.ingest_block(lh1, lb1), IngestOutcome::Accepted);
+        assert_ne!(wh1.header_hash(), lh1.header_hash(), "a genuine sibling race");
+
+        // Header-first sync gives the loser the winner's branch as headers. Fork
+        // choice moves to it — it is two blocks to the loser's one — while the state
+        // machine is still on `lh1`, which is now off the main chain.
+        assert_eq!(loser.ingest_header(wh1), IngestOutcome::Accepted);
+        assert_eq!(loser.ingest_header(wh2), IngestOutcome::Accepted);
+        assert_eq!(loser.chain().tip_hash(), wh2.header_hash(), "fork choice has moved");
+        assert!(loser.applied_tip().is_off_main_chain(), "and the applied tip is stranded");
+
+        // 🔴 THE STATE UNDER TEST. The winner's SECOND body arrives; its first has
+        // not. It is held at `applied tip + 1` — inside the selector's height range,
+        // so the range does not save us — and its parent is `wh1`, not the applied
+        // tip `lh1`. It is the exact object `NotExtendingTip` exists to refuse, and
+        // it is queued for application.
+        assert_eq!(loser.ingest_block(wh2, wb2), IngestOutcome::Duplicate);
+        // Asserted FIRST, because it is the claim: that ingest ran a full drain, and
+        // if the selector had handed this body to `apply_block` the refusal would
+        // already be on the counter.
+        assert_eq!(
+            loser.body_refusals(),
+            (0, None),
+            "\u{1f534} the drain this ingest ran refused nothing — nothing reached the funnel"
+        );
+        assert_eq!(loser.pending_bodies().0, 1, "held");
+        assert_eq!(wh2.height, loser.state().tip_height() + 1, "at tip + 1");
+        assert_ne!(wh2.prev, loser.state().tip_hash(), "and it does NOT extend that tip");
+        // No rewind is available either: `rejoin_main_chain` needs the body at
+        // `fork + 1` (= `wh1`) and the loser does not hold it, so nothing moves the
+        // applied tip out from under the question.
+        assert_eq!(loser.state_rewinds(), (0, 0));
+
+        // The selector declines it — not by erroring, by not choosing it.
+        assert!(
+            loser.next_applicable_body().is_none(),
+            "the held body does not extend the applied tip, so nothing is applicable"
+        );
+        loser.drain_pending_bodies();
+        assert_eq!(loser.pending_bodies().0, 1, "still held, not consumed and not dropped");
+        assert_eq!(loser.state().tip_hash(), lh1.header_hash(), "and nothing was applied");
+        assert_eq!(
+            loser.body_refusals(),
+            (0, None),
+            "🔴 nothing reached the funnel to be refused — this is the assertion that \
+             fails if the selector and `apply_block`'s first check come apart"
+        );
+
+        // The missing body arrives and the whole `#178` path runs: rewind off the
+        // losing sibling, then apply both winners ascending. The invariant holds
+        // across the rewind too — `rewind_to` moves the applied tip to the parent
+        // BEFORE anything is re-applied, so every `apply_block` still extends its tip.
+        assert_eq!(loser.ingest_block(wh1, wb1), IngestOutcome::Duplicate);
+        assert_eq!(loser.state().tip_hash(), wh2.header_hash(), "rejoined the main chain");
+        assert_eq!(loser.state_rewinds(), (1, 1), "via exactly one rewind");
+        assert_eq!(loser.state_lag().blocks(), 0);
+        assert_eq!(
+            loser.body_refusals_by_reason("not_extending_tip"),
+            0,
+            "🔴 NotExtendingTip stayed unreachable across the rewind as well"
+        );
+        assert_eq!(loser.body_refusals(), (0, None), "and nothing else was refused either");
     }
 
     /// **The slope, not the value (issue #162 acceptance item 2).**
@@ -2966,6 +3426,116 @@ mod tests {
             vote_b: validators[signer].sign_checkpoint(&cp_b),
             cp_b,
         }
+    }
+
+    /// **Issue #133 D3 — the two-node same-height finality divergence, executed.**
+    ///
+    /// The Multica baton asked for the case the single-node restart test cannot
+    /// show: *a node that observed the evidence and one that did not disagree about
+    /// whether an equivocator's vote counts toward quorum*, and at a round that
+    /// reaches quorum **only** with that vote, one finalizes a checkpoint the other
+    /// refuses. That is a same-height finality split — the R2 stop condition — and
+    /// it is the class problem D1 (evidence in blocks) is for: local `punishments.dat`
+    /// (PR #159) makes the witness durable, but it cannot teach a non-witness.
+    ///
+    /// Numbers (committee7, quorum 5): tombstone signer 3 on the witness only. Feed
+    /// both nodes the same five votes from signers `{0,1,2,3,4}`:
+    /// - witness excludes 3 → 4 active < 5 → does **not** finalize
+    /// - non-witness counts all five → finalizes
+    ///
+    /// Then the witness restarts from its own data dir. After PR #159 it still
+    /// refuses; the non-witness still finalizes. The divergence **survives** the
+    /// restart rather than flipping — the resurrection the original issue predicted
+    /// does **not** reproduce on a node that holds the ledger. What remains open is
+    /// the non-witness forever, which is D1, not a missing local file.
+    #[test]
+    fn a_non_witness_finalizes_a_checkpoint_the_restarted_witness_refuses() {
+        let dir = temp_dir("i133-two-node");
+        let (_c, validators) = committee7();
+        let ev = conflicting(&validators, 3, 8);
+        let cp = Checkpoint::new(2, [0x22; 32], [0x22; 32]);
+        // Five votes including the equivocator: quorum-marginal for a full roster,
+        // below-quorum once signer 3 is excluded.
+        let votes: Vec<Vote> = [0usize, 1, 2, 3, 4]
+            .iter()
+            .map(|&i| validators[i].sign_checkpoint(&cp))
+            .collect();
+
+        {
+            let mut witness =
+                NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+                    .expect("open witness");
+            assert_eq!(witness.apply_evidence(&ev), Some(3));
+            assert!(witness.is_tombstoned(3));
+            match witness.ingest_checkpoint_votes(&cp, &votes) {
+                VotesOutcome::Learned { finalized, accumulated } => {
+                    assert!(
+                        !finalized,
+                        "witness must refuse: 5 votes minus tombstoned signer 3 is 4 < quorum 5"
+                    );
+                    assert_eq!(accumulated.len(), 4);
+                }
+                VotesOutcome::Stale => panic!("witness expected Learned(not finalized), got Stale"),
+                VotesOutcome::Invalid => {
+                    panic!("witness expected Learned(not finalized), got Invalid")
+                }
+                VotesOutcome::Unjudged => {
+                    panic!("witness expected Learned(not finalized), got Unjudged")
+                }
+            }
+            assert_eq!(witness.finalized_height(), None);
+        }
+
+        // Non-witness: never saw the evidence, same five votes, finalizes.
+        let mut non_witness =
+            NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        assert!(!non_witness.is_tombstoned(3));
+        assert_eq!(
+            non_witness.ingest_checkpoint(cp, votes.clone()),
+            IngestOutcome::Accepted,
+            "non-witness counts the equivocator toward quorum and finalizes"
+        );
+        assert_eq!(non_witness.finalized_height(), Some(2));
+
+        // --- witness restarts from its own data dir ---
+
+        let mut restarted =
+            NodeAdapter::open(&dir, committee7().0, KeccakPow, MockVerifier, easy_sim())
+                .expect("reopen witness");
+        // Control: the constructor still hands open a fresh all-Active roster; the
+        // ledger is what keeps signer 3 tombstoned (PR #159). Without it this assert
+        // would fail and the defect would have reproduced.
+        assert_eq!(committee7().0.status(3), Some(MemberStatus::Active));
+        assert!(
+            restarted.is_tombstoned(3),
+            "resurrection across restart does NOT reproduce when the ledger is present"
+        );
+        assert_eq!(restarted.punishment_restore().telemetry_field(), "1/1");
+        match restarted.ingest_checkpoint_votes(&cp, &votes) {
+            VotesOutcome::Learned { finalized, accumulated } => {
+                assert!(
+                    !finalized,
+                    "restarted witness still refuses the checkpoint its non-witness peer finalized"
+                );
+                assert_eq!(accumulated.len(), 4);
+            }
+            VotesOutcome::Stale => {
+                panic!("restarted witness expected Learned(not finalized), got Stale")
+            }
+            VotesOutcome::Invalid => {
+                panic!("restarted witness expected Learned(not finalized), got Invalid")
+            }
+            VotesOutcome::Unjudged => {
+                panic!("restarted witness expected Learned(not finalized), got Unjudged")
+            }
+        }
+        assert_eq!(
+            restarted.finalized_height(),
+            None,
+            "same height, different finality: non-witness final=2, restarted witness final=none"
+        );
+        assert_eq!(non_witness.finalized_height(), Some(2));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// **THE acceptance property (issue #133), stated as the defect it repairs: a

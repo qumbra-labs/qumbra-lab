@@ -310,6 +310,10 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// per code and not one per frame. Bounded by
     /// [`MAX_UNKNOWN_TYPES_JOURNALLED`] — an attacker can pick 65,536 codes.
     unknown_types_seen: BTreeSet<u16>,
+    /// Issue #200: a historical body request was **satisfied** this tick (not
+    /// merely timed out). Fed into [`crate::n1::ChainView::observe_body_fetch`] so
+    /// the unobtainable-body exemption keys on exhaustion, not on lag alone.
+    body_fetch_progress: bool,
 }
 
 impl<T: Transport, N: NodeState> P2pNode<T, N> {
@@ -333,6 +337,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             body_rr: 0,
             unknown: UnknownStats::default(),
             unknown_types_seen: BTreeSet::new(),
+            body_fetch_progress: false,
         }
     }
 
@@ -719,6 +724,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
         self.maybe_start_sync();
         self.request_missing_bodies(now_ms);
+        // Issue #200: after (re)issuing asks, hand the duty-gate exemption the
+        // facts it keys on — outstanding asks + whether any ask was satisfied
+        // this tick. Progress is cleared for the next tick so a single delivery
+        // cannot keep resetting the window forever.
+        let progress = self.body_fetch_progress;
+        self.body_fetch_progress = false;
+        self.node
+            .observe_body_fetch(now_ms, self.body_reqs.len(), progress);
         n
     }
 
@@ -839,10 +852,16 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
     }
 
-    /// The body this node can serve for `hash`: the hot relay cache first, then the
-    /// applied-block store — the same two sources, in the same order, that
-    /// [`Self::on_get_block_txn`] already reads (issue #135). Stated once so the two
-    /// serving paths cannot come to disagree about what this node holds.
+    /// The body this node can serve for `hash`: the hot relay cache first, then
+    /// everything the node state **holds** — the same two sources, in the same
+    /// order, that [`Self::on_get_block_txn`] already reads (issue #135). Stated
+    /// once so the two serving paths cannot come to disagree about what this node
+    /// holds.
+    ///
+    /// The second source was `stored_body` — *applied* — until issue #198. It is now
+    /// [`crate::n1::ChainView::held_body`] — *possessed* — because a node that
+    /// rewound past a block still has its bytes and there is no safety reason to
+    /// refuse them: see that method for the loop this closed on the live net.
     fn body_for_serving(&self, hash: &Hash32) -> Option<BlockBody> {
         if let Some(entry) = self.blocks.get(hash) {
             return Some(BlockBody {
@@ -851,7 +870,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 coinbase_rkm: entry.coinbase_rkm,
             });
         }
-        self.node.stored_body(hash)
+        self.node.held_body(hash)
     }
 
     fn dispatch(&mut self, from: PeerId, env: Envelope, key: RateKey, now_ms: u64) {
@@ -1392,7 +1411,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         };
         let bh = ann.header.header_hash();
         if self.blocks.contains(&bh) || self.node.has_stored_body(&bh) {
-            self.body_reqs.remove(&bh); // nothing outstanding: we hold this body
+            if self.body_reqs.remove(&bh).is_some() {
+                // Issue #200: a requested body is now held — that is progress.
+                self.body_fetch_progress = true;
+            }
             return; // already have the full body (hot cache or applied store)
         }
         let candidates = self.node.all_txs();
@@ -1422,7 +1444,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // pays and is the honest reading of both — we asked, and we still do not have
         // it.
         if self.blocks.contains(&bh) || self.node.has_stored_body(&bh) {
-            self.body_reqs.remove(&bh);
+            if self.body_reqs.remove(&bh).is_some() {
+                // Issue #200: a requested body is now held — that is progress.
+                self.body_fetch_progress = true;
+            }
         }
     }
 
@@ -1434,14 +1459,16 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return;
             }
         };
-        // Hot cache first, then the applied-block store (issue #135): the cache is
-        // the relay window, the store is authoritative for everything this node
-        // has folded into state — so eviction never makes an applied body
-        // unanswerable. A miss on both is a body this node never applied and no
-        // longer holds (or never held); it stays silent, as before.
+        // Hot cache first, then everything the node state holds (issue #135, and
+        // #198 for the second source): the cache is the relay window, the node
+        // state is authoritative for every body this node POSSESSES — so neither
+        // eviction nor a rewind makes a body we have unanswerable. A miss on both
+        // is a body this node no longer holds (or never held); it stays silent, as
+        // before. Same two sources and same order as `body_for_serving`, which is
+        // the point of stating them twice rather than diverging.
         let txs: Vec<TxEntry> = if let Some(entry) = self.blocks.get(&req.block_hash) {
             req.indexes.iter().filter_map(|&i| entry.txs.get(i as usize).cloned()).collect()
-        } else if let Some(body) = self.node.stored_body(&req.block_hash) {
+        } else if let Some(body) = self.node.held_body(&req.block_hash) {
             req.indexes.iter().filter_map(|&i| body.txs.get(i as usize).cloned()).collect()
         } else {
             return; // we don't have that block's body
@@ -1638,16 +1665,13 @@ mod tests {
     }
 
     fn tx(seed: u8) -> TxEntry {
-        TxEntry {
-            proof: vec![seed; 32],
-            public: TxPublic {
-                anchor: [seed; 32],
-                nullifiers: vec![[seed; 32]],
-                commitments: vec![[seed.wrapping_add(9); 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: 1_000_000,
-            },
-        }
+        TxEntry::with_placeholder_discovery(vec![seed; 32], TxPublic {
+            anchor: [seed; 32],
+            nullifiers: vec![[seed; 32]],
+            commitments: vec![[seed.wrapping_add(9); 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: 1_000_000,
+            })
     }
 
     /// Milliseconds a simulated round advances the deterministic clock the tests
@@ -2438,16 +2462,13 @@ mod tests {
     fn cache_insert(c: &mut ServedBodies, height: u64, proof_len: usize) -> Hash32 {
         let mut hash = [0u8; 32];
         hash[..8].copy_from_slice(&height.to_le_bytes());
-        let entry = TxEntry {
-            proof: vec![0xBB; proof_len],
-            public: TxPublic {
-                anchor: [1; 32],
-                nullifiers: vec![[2; 32]],
-                commitments: vec![[3; 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: 0,
-            },
-        };
+        let entry = TxEntry::with_placeholder_discovery(vec![0xBB; proof_len], TxPublic {
+            anchor: [1; 32],
+            nullifiers: vec![[2; 32]],
+            commitments: vec![[3; 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: 0,
+            });
         c.insert(height, hash, vec![entry], 0, [0; 4]);
         hash
     }
@@ -3457,16 +3478,13 @@ mod tests {
         }
 
         fn tx_with(anchor: Hash32, nf: u8, proof: &[u8]) -> TxEntry {
-            TxEntry {
-                proof: proof.to_vec(),
-                public: TxPublic {
-                    anchor,
-                    nullifiers: vec![[nf; 32]],
-                    commitments: vec![[nf.wrapping_add(50); 32]],
-                    bucket: ArityBucket::TwoByTwo,
-                    fee: posted_fee(ArityBucket::TwoByTwo),
-                },
-            }
+            TxEntry::with_placeholder_discovery(proof.to_vec(), TxPublic {
+                anchor,
+                nullifiers: vec![[nf; 32]],
+                commitments: vec![[nf.wrapping_add(50); 32]],
+                bucket: ArityBucket::TwoByTwo,
+                fee: posted_fee(ArityBucket::TwoByTwo),
+                })
         }
 
         /// Two linked in-process nodes: `[0]` serves, `[1]` joins. Returns them past

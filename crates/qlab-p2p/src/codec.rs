@@ -316,6 +316,12 @@ pub fn encode_tx(tx: &TxEntry) -> Vec<u8> {
     out.extend_from_slice(&p.fee.to_le_bytes());
     write_varint(&mut out, tx.proof.len() as u64);
     out.extend_from_slice(&tx.proof);
+    // Issue #188: the discovery group travels with the transaction, because the
+    // block body commits to it. A transaction relayed without it could not be
+    // included in any valid block, so this is not an optional extension of the
+    // tx payload — it is what makes the body change coherent on the wire.
+    write_varint(&mut out, tx.discovery.len() as u64);
+    out.extend_from_slice(&tx.discovery);
     out
 }
 
@@ -337,8 +343,14 @@ pub fn decode_tx(buf: &[u8]) -> Result<TxEntry, DecodeError> {
     let fee = r.u64_le("tx.fee")?;
     let proof_len = r.varint()? as usize;
     let proof = r.rest(proof_len, "tx.proof")?;
+    let discovery_len = r.varint()? as usize;
+    let discovery = r.rest(discovery_len, "tx.discovery")?;
     r.finish()?;
-    Ok(TxEntry { proof, public: TxPublic { anchor, nullifiers, commitments, bucket, fee } })
+    Ok(TxEntry {
+        proof,
+        discovery,
+        public: TxPublic { anchor, nullifiers, commitments, bucket, fee },
+    })
 }
 
 /// A transaction's inventory id (there is no consensus tx-id in the devnet; the
@@ -645,16 +657,13 @@ mod tests {
 
     #[test]
     fn tx_round_trips() {
-        let tx = TxEntry {
-            proof: vec![9u8; 200],
-            public: TxPublic {
-                anchor: [1; 32],
-                nullifiers: vec![[2; 32], [3; 32]],
-                commitments: vec![[4; 32], [5; 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: 1_000_000,
-            },
-        };
+        let tx = TxEntry::with_placeholder_discovery(vec![9u8; 200], TxPublic {
+            anchor: [1; 32],
+            nullifiers: vec![[2; 32], [3; 32]],
+            commitments: vec![[4; 32], [5; 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: 1_000_000,
+            });
         let bytes = encode_tx(&tx);
         let back = decode_tx(&bytes).unwrap();
         assert_eq!(back.public, tx.public);
@@ -662,18 +671,63 @@ mod tests {
         assert_eq!(tx_id(&back), tx_id(&tx));
     }
 
+    /// 🔴 Issue #188: the discovery group survives the tx wire, and the body a
+    /// peer rebuilds from decoded transactions commits to the same value.
+    ///
+    /// Without this the change is incoherent rather than merely incomplete: a
+    /// transaction whose discovery is dropped in transit can be included in no
+    /// valid block, and the failure would surface as a `CommitmentMismatch` at
+    /// the far end of the sync path rather than here.
+    #[test]
+    fn the_discovery_group_survives_the_tx_wire() {
+        use qlab_devnet::body::BlockBody;
+        use qlab_note::wire::{ClueSlot, CompactEntry, RecipientBundle};
+
+        let cms = vec![[4u8; 32], [5u8; 32]];
+        let bundles = vec![RecipientBundle {
+            ct: core::array::from_fn(|i| (i % 251) as u8),
+            entries: cms
+                .iter()
+                .map(|cm| CompactEntry { cm: *cm, tag: [0xA5; 8], clue: ClueSlot::Empty })
+                .collect(),
+        }];
+        let tx = TxEntry::new(
+            vec![9u8; 200],
+            TxPublic {
+                anchor: [1; 32],
+                nullifiers: vec![[2; 32], [3; 32]],
+                commitments: cms,
+                bucket: ArityBucket::TwoByTwo,
+                fee: 1_000_000,
+            },
+            &bundles,
+        );
+        assert!(tx.discovery.len() > 1, "a real group is not the empty encoding");
+
+        let back = decode_tx(&encode_tx(&tx)).unwrap();
+        assert_eq!(back.discovery, tx.discovery, "discovery bytes are carried verbatim");
+
+        let here = BlockBody { txs: vec![tx.clone()], coinbase: 7, coinbase_rkm: [1, 2, 3, 4] };
+        let there = BlockBody { txs: vec![back], coinbase: 7, coinbase_rkm: [1, 2, 3, 4] };
+        assert_eq!(here.commitment(), there.commitment());
+
+        // And a peer that strips the group produces a different body — the
+        // mutation this test exists to catch.
+        let mut stripped = decode_tx(&encode_tx(&tx)).unwrap();
+        stripped.discovery = TxEntry::empty_discovery();
+        let mutated = BlockBody { txs: vec![stripped], coinbase: 7, coinbase_rkm: [1, 2, 3, 4] };
+        assert_ne!(here.commitment(), mutated.commitment());
+    }
+
     #[test]
     fn tx_rejects_unknown_bucket() {
-        let tx = TxEntry {
-            proof: vec![],
-            public: TxPublic {
-                anchor: [0; 32],
-                nullifiers: vec![],
-                commitments: vec![],
-                bucket: ArityBucket::EightByEight,
-                fee: 0,
-            },
-        };
+        let tx = TxEntry::with_placeholder_discovery(vec![], TxPublic {
+            anchor: [0; 32],
+            nullifiers: vec![],
+            commitments: vec![],
+            bucket: ArityBucket::EightByEight,
+            fee: 0,
+            });
         let mut bytes = encode_tx(&tx);
         // bucket byte sits after anchor(32) + n_nf(1 varint=0) + n_cm(1 varint=0).
         let bucket_pos = 32 + 1 + 1;

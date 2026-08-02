@@ -55,8 +55,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use qlab_cbserver::codec::{
-    encode_compact_response, encode_full_response, read_varint, write_varint, CodecError,
-    CompactBlock, CompactGroup,
+    decode_group_contents, encode_compact_response, encode_full_response, encode_group_contents,
+    read_varint, write_varint, CodecError, CompactBlock, CompactGroup,
 };
 use qlab_cbserver::tree::Frontier;
 use qlab_devnet::body::{TxEntry, TxPublic, TxVerifier};
@@ -144,16 +144,133 @@ pub struct TxDiscovery {
     pub recipients: Vec<RecipientDiscovery>,
 }
 
-impl TxDiscovery {
-    /// The output commitments the discovery artifacts describe, in serving order
-    /// (recipient-major, then per-output) — must equal the consensus tx's
-    /// `commitments` for the discovery to bind to the statement.
-    fn commitments(&self) -> Vec<Hash32> {
-        self.recipients
+// NOTE (issue #188 baton 2): `TxDiscovery::commitments` is gone. It stated D4's
+// recipient-major-then-per-output order a second time, next to
+// `qlab_note::compact::contents_commitments` which is now the consensus statement
+// of the same rule — and a rule written twice is a rule that can disagree with
+// itself, which is D1's own argument. Its one caller (the submit-time binding
+// check) compares committed bytes now, which is strictly stronger.
+
+// ---------------------------------------------------------------------------
+// The committed-discovery projection (issue #188 baton 2)
+// ---------------------------------------------------------------------------
+
+/// The most blocks one `/v1/compact` response will ever carry.
+///
+/// A range request is a client-chosen number, and before this bound existed
+/// [`NodeRpc::compact_range`] iterated `from..=to` literally — so `to = u64::MAX`
+/// was an unbounded loop against a node, reachable by anyone who could reach the
+/// endpoint. That was harmless while the only caller was an in-process test and
+/// stops being harmless the moment a deployed node serves this (issue #188 baton
+/// 2, scope item 2), so the bound lands with the exposure that makes it matter.
+///
+/// **The contract, because a truncated range must not read as an empty one:** a
+/// response carries every main-chain height in `[from, to]` the node holds, up to
+/// this many blocks. A client that receives exactly this many pages from the last
+/// height + 1. `1024` blocks is ~21 hours of chain at the 75 s target.
+pub const MAX_COMPACT_BLOCKS: usize = 1024;
+
+/// One main-chain block's **committed** note-discovery, as the verbatim bytes the
+/// body preimage covers — the projection `/v1/compact` serves.
+///
+/// ## Why this type exists rather than a `StoredBlock`
+///
+/// Serving needs a transaction's discovery group and nothing else about it. A
+/// `StoredBlock` also carries the proof, which is ~136 KB against a discovery
+/// group's ~1.2 KB, so a serving surface that had to hold blocks would hold ~99 %
+/// bytes it never reads. `qumbra-node`'s discovery server publishes a snapshot of
+/// these and therefore pays ~1 % of the block store rather than a second copy of
+/// it.
+///
+/// `groups[i]` is `block.txs[i].discovery` **cloned, never re-encoded**. That is
+/// the whole guarantee: there is no code path from a `StoredBlock` to a served
+/// group that could produce different bytes, because there is no encoder between
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockDiscovery {
+    /// The block's height on the main chain.
+    pub height: u64,
+    /// The block's header hash — carried so a consumer maintaining an incremental
+    /// projection can tell "extends what I have" from "replaces it".
+    pub hash: Hash32,
+    /// Per transaction, in block order: the committed §2 group **contents**,
+    /// verbatim. Coinbase contributes nothing (D5).
+    pub groups: Vec<Vec<u8>>,
+}
+
+impl BlockDiscovery {
+    /// Project a stored block. `hash` is the caller's — the chain store keys blocks
+    /// by it, so re-hashing the header here would be a second derivation of a fact
+    /// the caller already holds.
+    pub fn of(hash: Hash32, block: &StoredBlock) -> Self {
+        Self {
+            height: block.header.height,
+            hash,
+            groups: block.txs.iter().map(|t| t.discovery.clone()).collect(),
+        }
+    }
+
+    /// Bytes of committed discovery this block carries (the snapshot's cost).
+    pub fn len_bytes(&self) -> usize {
+        self.groups.iter().map(|g| g.len()).sum()
+    }
+
+    /// The serving-form groups: `tx_index` = position in the block, contents =
+    /// the committed bytes decoded.
+    ///
+    /// 🔴 **This decode cannot change the bytes, and that is a consensus fact
+    /// rather than a hope.** `qlab_devnet::body::check_tx_discovery` refuses any
+    /// body whose discovery does not re-encode to itself (`DiscoveryNotCanonical`,
+    /// `discovery-on-the-consensus-wire.md` §4 rule 3), so for every block in a
+    /// node's store `encode_group_contents(decode_group_contents(b)) == b` already
+    /// held before the block was accepted. Serving is therefore the projection D2
+    /// requires — `varint(position) ‖ committed_bytes` — and not a re-encoding of
+    /// it. `served_groups_are_the_committed_bytes_verbatim` asserts the byte
+    /// identity rather than trusting this paragraph.
+    ///
+    /// An `Err` here means a stored block carries bytes `validate_body` would have
+    /// rejected, i.e. a broken internal invariant. It is returned rather than
+    /// flattened to an empty group **because an empty group is a meaningful
+    /// answer** — it is `n = 0`, "this transaction attaches no discovery", which is
+    /// exactly the state a recipient must never be told about a transaction that
+    /// does. A serving surface that answers a corrupt block with "no outputs here"
+    /// is the absence-reads-as-healthy shape option 3 exists to remove.
+    pub fn compact_groups(&self) -> Result<Vec<CompactGroup>, CodecError> {
+        self.groups
             .iter()
-            .flat_map(|r| r.bundle.entries.iter().map(|e| e.cm))
+            .enumerate()
+            .map(|(i, bytes)| {
+                Ok(CompactGroup {
+                    tx_index: i as u64,
+                    recipients: decode_group_contents(bytes)?,
+                })
+            })
             .collect()
     }
+}
+
+/// Encode the `/v1/compact` response for `[from, to]` over an **ascending**
+/// main-chain projection.
+///
+/// Iterates the projection and filters, rather than iterating the requested range
+/// and looking up: the cost is then bounded by what the node holds instead of by
+/// what the client asked for (see [`MAX_COMPACT_BLOCKS`]).
+pub fn compact_response(
+    blocks: &[BlockDiscovery],
+    from: u64,
+    to: u64,
+) -> Result<Vec<u8>, CodecError> {
+    let mut out = Vec::new();
+    for b in blocks {
+        if b.height < from || b.height > to {
+            continue;
+        }
+        if out.len() == MAX_COMPACT_BLOCKS {
+            break;
+        }
+        out.push(CompactBlock { height: b.height, groups: b.compact_groups()? });
+    }
+    Ok(encode_compact_response(&out))
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +301,9 @@ pub enum RejectReason {
     NullifierRepeatedInTx,
     /// A nullifier collides with one already reserved by a pending transaction.
     NullifierPending,
-    /// The discovery artifacts' commitments do not match the tx's commitments.
+    /// The submitted discovery artifacts are not the transaction's **own
+    /// committed group**, byte for byte (issue #188 baton 2 — it compared
+    /// commitments only before the group entered the body preimage).
     DiscoveryMismatch,
     /// The proof failed to verify under the injected verifier.
     ProofInvalid,
@@ -320,8 +439,24 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
                 return SubmitOutcome::Rejected(RejectReason::NullifierRepeatedInTx);
             }
         }
-        // (2) the note-discovery artifacts must describe exactly this tx's outputs.
-        if discovery.commitments() != p.commitments {
+        // (2) the submitted artifacts must be **the transaction's own committed
+        // group**, byte for byte.
+        //
+        // Until issue #188 baton 2 this compared commitments only, which was the
+        // strongest check available while both `/v1/compact` and `/v1/…/full` read
+        // the same side table — they could not disagree because they had one
+        // source. They now have two: compact groups come from the block and
+        // payloads from here. A submission whose bundles merely *agree on the
+        // commitments* would put payloads on `/v1/…/full` that are index-aligned
+        // against a different ciphertext than `/v1/compact` serves, so a wallet
+        // that matched a committed tag would AEAD-decrypt with a key derived from
+        // a `ct` the chain never saw and silently find nothing. Byte equality is
+        // what keeps the two surfaces one artifact; it implies the old
+        // commitment check.
+        if encode_group_contents(
+            &discovery.recipients.iter().map(|r| r.bundle.clone()).collect::<Vec<_>>(),
+        ) != tx.discovery
+        {
             return SubmitOutcome::Rejected(RejectReason::DiscoveryMismatch);
         }
 
@@ -560,32 +695,49 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
 
     // ---- compact-block serving (byte-identical, live-gated) -----------------
 
-    /// The `/v1/compact` blocks for `[from, to]` (inclusive), gated by the
-    /// node's accepted chain: heights the node does not have are skipped. Each
-    /// group is the block's transaction joined to its recorded discovery
-    /// artifacts (an empty group if none were recorded).
-    fn compact_range(&self, from: u64, to: u64) -> Vec<CompactBlock> {
-        let by_height: HashMap<u64, StoredBlock> =
-            self.main_chain().into_iter().map(|b| (b.header.height, b)).collect();
+    /// The main chain's **committed** discovery, genesis-first — the projection
+    /// `/v1/compact` is served from (issue #188 baton 2).
+    ///
+    /// Public because `qumbra-node`'s discovery server publishes exactly this and
+    /// must not grow a second way of computing it.
+    pub fn main_chain_discovery(&self) -> Vec<BlockDiscovery> {
+        let chain = self.node.chain();
         let mut out = Vec::new();
-        for height in from..=to {
-            let Some(block) = by_height.get(&height) else { continue };
-            let groups = block
-                .txs
-                .iter()
-                .enumerate()
-                .map(|(tx_index, tx)| {
-                    let recipients = self
-                        .discovery
-                        .get(&tx_id_of_stored(tx))
-                        .map(|d| d.recipients.iter().map(|r| r.bundle.clone()).collect())
-                        .unwrap_or_default();
-                    CompactGroup { tx_index: tx_index as u64, recipients }
-                })
-                .collect();
-            out.push(CompactBlock { height, groups });
+        let mut hash = chain.tip_hash();
+        loop {
+            let Some(block) = chain.block(&hash) else { break };
+            let prev = block.header.prev;
+            let height = block.header.height;
+            out.push(BlockDiscovery::of(hash, block));
+            if height == 0 {
+                break;
+            }
+            hash = prev;
         }
+        out.reverse();
         out
+    }
+
+    /// The `/v1/compact` response for `[from, to]` (inclusive), gated by the
+    /// node's accepted chain: heights the node does not have are skipped.
+    ///
+    /// 🔴 **The groups come from the block, not from [`Self::discovery`]** (issue
+    /// #188 baton 2). Until body-bound discovery landed, this joined each stored
+    /// transaction to the in-memory side table by statement id and served an
+    /// **empty group** whenever the lookup missed — which is every transaction
+    /// this node did not itself admit, every transaction after a restart, and
+    /// every transaction on a node that never had a wallet talk to it. The bytes
+    /// are now in `StoredTx::discovery`, covered by `tx_body_commitment`, so the
+    /// side table is not consulted here at all and cannot make a served group
+    /// differ from the committed one.
+    ///
+    /// The side table survives for `/v1/…/full` only: the AEAD payloads it holds
+    /// are **not** in the body preimage (`discovery-on-the-consensus-wire.md` D2
+    /// commits the compact bundle — `ct ‖ cm ‖ tag ‖ clue_len` — and nothing
+    /// else), so there is nowhere else for them to come from. Reported as a
+    /// finding on issue #188.
+    fn compact_range_bytes(&self, from: u64, to: u64) -> Result<Vec<u8>, CodecError> {
+        compact_response(&self.main_chain_discovery(), from, to)
     }
 
     /// The `/v1/…/full` per-recipient payload lists for one accepted `(height,
@@ -622,7 +774,12 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
                 if to < from {
                     return Err((400, "'to' < 'from'"));
                 }
-                Ok(encode_compact_response(&self.compact_range(from, to)))
+                // A stored block whose committed discovery does not decode is a
+                // broken internal invariant (`validate_body` refuses such a body),
+                // and the one thing this must not do is answer it with an empty
+                // group — see [`BlockDiscovery::compact_groups`].
+                self.compact_range_bytes(from, to)
+                    .map_err(|_| (500, "stored discovery does not decode"))
             }
             ["v1", "block", h, "tx", i, "full"] => {
                 let height = h.parse::<u64>().map_err(|_| (400, "invalid height"))?;
@@ -915,17 +1072,32 @@ mod tests {
         }
     }
 
+    /// The one ct pattern every fixture transaction commits to. Since issue #188
+    /// baton 2 a fixture cannot pick its discovery group independently of its
+    /// transaction: the group is IN the transaction, and `submit_tx` refuses a
+    /// submission whose bundles are not the committed ones byte for byte.
+    const CT_BASE: u8 = 0x10;
+
+    /// A transaction whose committed discovery group is the real bundle
+    /// [`disc_for`] hands the RPC — the pairing every honest submission has.
     fn tx_with(anchor: Hash32, nfs: &[u8], cms: &[u8], fee: u64) -> TxEntry {
-        TxEntry {
-            proof: b"ok".to_vec(),
-            public: TxPublic {
+        TxEntry::new(
+            b"ok".to_vec(),
+            TxPublic {
                 anchor,
                 nullifiers: nfs.iter().map(|&n| [n; 32]).collect(),
                 commitments: cms.iter().map(|&c| cm_bytes(c)).collect(),
                 bucket: ArityBucket::TwoByTwo,
                 fee,
             },
-        }
+            &[recip(CT_BASE, cms).bundle],
+        )
+    }
+
+    /// The submitted artifacts (bundle + AEAD payloads) matching [`tx_with`]'s
+    /// committed group.
+    fn disc_for(cms: &[u8]) -> TxDiscovery {
+        TxDiscovery { recipients: vec![recip(CT_BASE, cms)] }
     }
 
     // A node with genesis finalized so anchors become valid, plus one applied
@@ -999,12 +1171,12 @@ mod tests {
     fn submit_accepts_valid_tx_and_records_discovery() {
         let (mut rpc, anchor) = rpc_with_finalized_genesis();
         let tx = tx_with(anchor, &[1, 2], &[10, 11], posted_fee(ArityBucket::TwoByTwo));
-        let disc = TxDiscovery { recipients: vec![recip(0x10, &[10, 11])] };
+        let disc = disc_for(&[10, 11]);
         let out = rpc.submit_tx(tx.clone(), disc, &OkVerifier);
         assert!(matches!(out, SubmitOutcome::Accepted(_)));
         assert_eq!(rpc.pending_len(), 1);
         // Duplicate submit is a no-op.
-        let disc2 = TxDiscovery { recipients: vec![recip(0x10, &[10, 11])] };
+        let disc2 = disc_for(&[10, 11]);
         assert_eq!(rpc.submit_tx(tx, disc2, &OkVerifier), SubmitOutcome::Duplicate);
     }
 
@@ -1015,7 +1187,7 @@ mod tests {
 
         // Bad anchor.
         let bad_anchor = tx_with([0xEE; 32], &[1], &[10], fee);
-        let d = TxDiscovery { recipients: vec![recip(1, &[10])] };
+        let d = disc_for(&[10]);
         assert_eq!(
             rpc.submit_tx(bad_anchor, d, &OkVerifier),
             SubmitOutcome::Rejected(RejectReason::AnchorNotValid)
@@ -1023,7 +1195,7 @@ mod tests {
 
         // Wrong fee.
         let wrong_fee = tx_with(anchor, &[1], &[10], fee + 1);
-        let d = TxDiscovery { recipients: vec![recip(1, &[10])] };
+        let d = disc_for(&[10]);
         assert_eq!(
             rpc.submit_tx(wrong_fee, d, &OkVerifier),
             SubmitOutcome::Rejected(RejectReason::WrongFee { expected: fee, got: fee + 1 })
@@ -1031,15 +1203,18 @@ mod tests {
 
         // Repeated nullifier in-tx.
         let dup_nf = tx_with(anchor, &[5, 5], &[10, 11], fee);
-        let d = TxDiscovery { recipients: vec![recip(1, &[10, 11])] };
+        let d = disc_for(&[10, 11]);
         assert_eq!(
             rpc.submit_tx(dup_nf, d, &OkVerifier),
             SubmitOutcome::Rejected(RejectReason::NullifierRepeatedInTx)
         );
 
-        // Discovery/commitment mismatch (discovery lists a different cm).
+        // Discovery mismatch: the submitted bundle is not the transaction's own
+        // committed group. Both halves are exercised — a different cm here, and a
+        // same-cm-different-ct case in
+        // `submit_refuses_artifacts_that_are_not_the_committed_group`.
         let mismatch = tx_with(anchor, &[1], &[10], fee);
-        let d = TxDiscovery { recipients: vec![recip(1, &[99])] };
+        let d = TxDiscovery { recipients: vec![recip(CT_BASE, &[99])] };
         assert_eq!(
             rpc.submit_tx(mismatch, d, &OkVerifier),
             SubmitOutcome::Rejected(RejectReason::DiscoveryMismatch)
@@ -1048,7 +1223,7 @@ mod tests {
         // Bad proof (verifier rejects).
         let mut bad_proof = tx_with(anchor, &[1], &[10], fee);
         bad_proof.proof = b"nope".to_vec();
-        let d = TxDiscovery { recipients: vec![recip(1, &[10])] };
+        let d = disc_for(&[10]);
         assert_eq!(
             rpc.submit_tx(bad_proof, d, &OkVerifier),
             SubmitOutcome::Rejected(RejectReason::ProofInvalid)
@@ -1063,13 +1238,13 @@ mod tests {
         let fee = posted_fee(ArityBucket::TwoByTwo);
         let a = tx_with(anchor, &[7], &[10], fee);
         assert!(matches!(
-            rpc.submit_tx(a, TxDiscovery { recipients: vec![recip(1, &[10])] }, &OkVerifier),
+            rpc.submit_tx(a, disc_for(&[10]), &OkVerifier),
             SubmitOutcome::Accepted(_)
         ));
         // A second tx reusing nullifier 7 conflicts with the pending reservation.
         let b = tx_with(anchor, &[7], &[11], fee);
         assert_eq!(
-            rpc.submit_tx(b, TxDiscovery { recipients: vec![recip(2, &[11])] }, &OkVerifier),
+            rpc.submit_tx(b, disc_for(&[11]), &OkVerifier),
             SubmitOutcome::Rejected(RejectReason::NullifierPending)
         );
     }
@@ -1078,7 +1253,7 @@ mod tests {
     fn status_and_anchors_roundtrip_and_reflect_state() {
         let (mut rpc, anchor) = rpc_with_finalized_genesis();
         let tx = tx_with(anchor, &[1, 2], &[10, 11], posted_fee(ArityBucket::TwoByTwo));
-        rpc.submit_tx(tx, TxDiscovery { recipients: vec![recip(0x10, &[10, 11])] }, &OkVerifier);
+        rpc.submit_tx(tx, disc_for(&[10, 11]), &OkVerifier);
 
         let s = rpc.status();
         assert_eq!(s.tip_height, 0);
@@ -1104,7 +1279,7 @@ mod tests {
             signed: Some(LocalCommitment { slot: 0, id: Some(0x3f1a_9c2b_0d41) }),
         });
         let tx = tx_with(anchor, &[1, 2], &[10, 11], posted_fee(ArityBucket::TwoByTwo));
-        rpc.submit_tx(tx, TxDiscovery { recipients: vec![recip(0x10, &[10, 11])] }, &OkVerifier);
+        rpc.submit_tx(tx, disc_for(&[10, 11]), &OkVerifier);
 
         let t = rpc.telemetry();
         // Genesis finalized at height 0, tip 0 ⇒ Final, no stall.
@@ -1252,7 +1427,7 @@ mod tests {
         let (mut rpc, anchor) = rpc_with_finalized_genesis();
         let fee = posted_fee(ArityBucket::TwoByTwo);
         let tx = tx_with(anchor, &[1, 2], &[10, 11], fee);
-        let disc = TxDiscovery { recipients: vec![recip(0x10, &[10, 11])] };
+        let disc = disc_for(&[10, 11]);
         assert!(matches!(rpc.submit_tx(tx.clone(), disc, &OkVerifier), SubmitOutcome::Accepted(_)));
 
         // Before the tx is in a block, nothing is served for height 1.
@@ -1279,12 +1454,134 @@ mod tests {
         assert!(matches!(rpc.route("/v1/block/9/tx/0/full"), Err((404, _))));
     }
 
+    /// 🔴 **The baton's first acceptance item, stated as a byte identity.**
+    ///
+    /// A served group is `varint(position) ‖ StoredTx::discovery` — the committed
+    /// bytes, concatenated, never re-encoded. Asserted against the stored block
+    /// itself rather than against a value the test computed a second way, because
+    /// the claim is *these are the same bytes* and only the block can say so.
+    #[test]
+    fn served_groups_are_the_committed_bytes_verbatim() {
+        let (mut rpc, anchor) = rpc_with_finalized_genesis();
+        let fee = posted_fee(ArityBucket::TwoByTwo);
+        let a = tx_with(anchor, &[1, 2], &[10, 11], fee);
+        let b = tx_with(anchor, &[3, 4], &[12, 13], fee);
+        apply_block_with(rpc.node_mut(), vec![a, b]);
+
+        let served = rpc.route("/v1/compact?from=1&to=1").unwrap();
+        let blocks = decode_compact_response(&served).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].groups.len(), 2);
+
+        let hash = rpc.node().chain().tip_hash();
+        let stored = rpc.node().chain().block(&hash).expect("tip stored").clone();
+        for (i, group) in blocks[0].groups.iter().enumerate() {
+            assert_eq!(group.tx_index, i as u64, "position is the index, nothing else is");
+            let mut expected = Vec::new();
+            write_varint(&mut expected, i as u64);
+            expected.extend_from_slice(&stored.txs[i].discovery);
+            assert_eq!(
+                qlab_cbserver::codec::encode_group(group),
+                expected,
+                "the served group is varint(position) ‖ the committed bytes, verbatim"
+            );
+        }
+    }
+
+    /// 🔴 **The defect this baton exists to fix.** `/v1/compact` used to join each
+    /// stored transaction to `NodeRpc`'s in-memory side table by statement id and
+    /// serve an **empty group** when the lookup missed — so a node that had not
+    /// itself admitted the transaction (every peer's node, and every node after a
+    /// restart) told a wallet "this transaction pays nobody".
+    ///
+    /// Here nothing is ever recorded in the side table, and the block still serves
+    /// its full group. Then the side table is deliberately **poisoned** with a
+    /// different group for the same statement id and the served bytes do not move:
+    /// the side table is not merely unused on the happy path, it is not consulted.
+    #[test]
+    fn compact_serves_the_block_and_never_the_side_table() {
+        let (mut rpc, anchor) = rpc_with_finalized_genesis();
+        let fee = posted_fee(ArityBucket::TwoByTwo);
+        let tx = tx_with(anchor, &[1, 2], &[10, 11], fee);
+        // NOT submitted: no `submit_tx`, no `record_discovery`. The block arrives
+        // the way a peer's block arrives.
+        apply_block_with(rpc.node_mut(), vec![tx.clone()]);
+        assert!(rpc.discovery.is_empty(), "the side table is empty on this path");
+
+        let from_block = rpc.route("/v1/compact?from=1&to=1").unwrap();
+        let blocks = decode_compact_response(&from_block).unwrap();
+        assert_eq!(blocks[0].groups[0].recipients.len(), 1);
+        assert_eq!(
+            blocks[0].groups[0].commitments(),
+            tx.public.commitments,
+            "the committed group binds the transaction's own outputs"
+        );
+
+        // Poison the side table with a group describing different outputs.
+        let txid = tx_id_of_public(&tx.public);
+        rpc.record_discovery(txid, disc_for(&[99]));
+        assert_eq!(
+            rpc.route("/v1/compact?from=1&to=1").unwrap(),
+            from_block,
+            "a side table that disagrees with the block changes nothing that is served"
+        );
+    }
+
+    /// The submitted artifacts must BE the transaction's committed group, not
+    /// merely agree with it about commitments — otherwise `/v1/…/full` would hand
+    /// back payloads keyed to a ciphertext `/v1/compact` never served, and a wallet
+    /// that matched a committed tag would decrypt to nothing and report no funds.
+    #[test]
+    fn submit_refuses_artifacts_that_are_not_the_committed_group() {
+        let (mut rpc, anchor) = rpc_with_finalized_genesis();
+        let fee = posted_fee(ArityBucket::TwoByTwo);
+        let tx = tx_with(anchor, &[1, 2], &[10, 11], fee);
+        // Same commitments, in the same order — a different ML-KEM ciphertext.
+        // The pre-#188 check compared commitments and would have accepted this.
+        let wrong_ct = TxDiscovery { recipients: vec![recip(CT_BASE ^ 0xff, &[10, 11])] };
+        assert_eq!(
+            wrong_ct.recipients[0].bundle.entries.iter().map(|e| e.cm).collect::<Vec<_>>(),
+            tx.public.commitments,
+            "the fixture really does agree on commitments"
+        );
+        assert_eq!(
+            rpc.submit_tx(tx.clone(), wrong_ct, &OkVerifier),
+            SubmitOutcome::Rejected(RejectReason::DiscoveryMismatch)
+        );
+        // The honest pairing is admitted.
+        assert!(matches!(
+            rpc.submit_tx(tx, disc_for(&[10, 11]), &OkVerifier),
+            SubmitOutcome::Accepted(_)
+        ));
+    }
+
+    /// A range is a client-chosen number and must not become a client-chosen amount
+    /// of node work. Before this the router iterated `from..=to` literally, so
+    /// `to = u64::MAX` was an unbounded loop; the response is now bounded by what
+    /// the node holds and then by [`MAX_COMPACT_BLOCKS`].
+    #[test]
+    fn a_range_is_bounded_by_what_the_node_holds_not_by_what_was_asked() {
+        let (mut rpc, _anchor) = rpc_with_finalized_genesis();
+        for _ in 0..3 {
+            apply_block_with(rpc.node_mut(), vec![]);
+        }
+        let bytes = rpc.route("/v1/compact?from=0&to=18446744073709551615").unwrap();
+        let blocks = decode_compact_response(&bytes).unwrap();
+        assert_eq!(blocks.len(), 4, "genesis + 3, and not one iteration more");
+        assert_eq!(blocks.last().unwrap().height, 3);
+
+        // The cap is a cap on blocks, not a filter on heights: with fewer blocks
+        // than the cap the whole chain is served, which is what makes a short
+        // response unambiguous here.
+        assert!(blocks.len() < MAX_COMPACT_BLOCKS);
+    }
+
     #[test]
     fn e2e_over_localhost_socket() {
         let (mut rpc, anchor) = rpc_with_finalized_genesis();
         let fee = posted_fee(ArityBucket::TwoByTwo);
         let tx = tx_with(anchor, &[1, 2], &[10, 11], fee);
-        rpc.submit_tx(tx.clone(), TxDiscovery { recipients: vec![recip(0x10, &[10, 11])] }, &OkVerifier);
+        rpc.submit_tx(tx.clone(), disc_for(&[10, 11]), &OkVerifier);
         apply_block_with(rpc.node_mut(), vec![tx]);
 
         let shared = Arc::new(Mutex::new(rpc));
@@ -1306,7 +1603,7 @@ mod tests {
         let (mut rpc, anchor) = rpc_with_finalized_genesis();
         let fee = posted_fee(ArityBucket::TwoByTwo);
         let tx = tx_with(anchor, &[1, 2], &[10, 11], fee);
-        rpc.submit_tx(tx.clone(), TxDiscovery { recipients: vec![recip(0x10, &[10, 11])] }, &OkVerifier);
+        rpc.submit_tx(tx.clone(), disc_for(&[10, 11]), &OkVerifier);
         apply_block_with(rpc.node_mut(), vec![tx]);
 
         let bytes = rpc.route("/v1/tree/frontier?at=1").unwrap();

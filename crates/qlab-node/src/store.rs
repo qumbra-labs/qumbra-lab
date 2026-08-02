@@ -87,6 +87,16 @@ pub struct StoredTx {
     pub bucket_actions: u32,
     pub fee: u64,
     pub proof: Vec<u8>,
+    /// The transaction's committed discovery group (issue #188), as the §2 group
+    /// contents the block body's preimage covers.
+    ///
+    /// Persisted for the same reason `coinbase_rkm` is: without it
+    /// [`StoredBlock::body`] rebuilds a body whose `commitment()` no longer
+    /// equals the persisted header's `tx_body_commitment`, so a restart would
+    /// fail its own header/body binding (#77) on every block that carries a
+    /// transaction. Adding it is an incompatible on-disk change, hence
+    /// `persist::FORMAT_VERSION = 3`.
+    pub discovery: Vec<u8>,
 }
 
 fn bucket_from_actions(actions: u32) -> ArityBucket {
@@ -106,6 +116,7 @@ impl From<&TxEntry> for StoredTx {
             bucket_actions: t.public.bucket.logical_actions(),
             fee: t.public.fee,
             proof: t.proof.clone(),
+            discovery: t.discovery.clone(),
         }
     }
 }
@@ -114,6 +125,7 @@ impl From<&StoredTx> for TxEntry {
     fn from(s: &StoredTx) -> Self {
         TxEntry {
             proof: s.proof.clone(),
+            discovery: s.discovery.clone(),
             public: TxPublic {
                 anchor: s.anchor,
                 nullifiers: s.nullifiers.clone(),

@@ -28,7 +28,7 @@ The line is emitted to stdout every `TELEMETRY_REFRESH` interval by
 order is the `format!` at `run.rs:996`:
 
 ```
-TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= unk=<n>/<n>
+TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= prest= uex= bdrop= unk=<n>/<n>
 ```
 
 ⚠️ **That is the field list, not a capture.** The only values quoted in this
@@ -95,9 +95,29 @@ Five rules that hold for the whole line:
 | 23 | `mready` | mining-readiness verdict | 🟢 never |
 | 24 | `stipid` | identity of the applied tip | 🟡 not alone |
 | 25 | `schain` | `main` / `fork` / `-` | 🔴 **yes — `schain=fork`** |
-| — | `breq` | historical body requests in flight (`issue #130` (c)) | ⛔ **not documented here — this doc predates the field** |
-| — | `fback` | is the tracker's checkpoint backed by this host's own chain (`issue #85`) | ⛔ **not documented here — this doc predates the field** |
-| 26 | `unk` | `<frames>/<inv items>` this build does not implement | 🟡 not alone — see §26 |
+| 26 | `breq` | historical block-body requests in flight | 🟡 not alone |
+| 27 | `fback` | ⛔ **not documented here** — appended 2026-08-01 by `issue #85` | — |
+| 28 | `prest` | committee punishments restored at process start | 🟡 not alone |
+| 29 | `uex` | ⛔ **not documented here** — appended 2026-08-01 by `issue #200` | — |
+| 30 | `bdrop` | `<total>@<height>` — bodies the state machine refused, and where | 🟡 not alone — **read the height against `stip=`** |
+| 31 | `unk` | `<frames>/<inv items>` this build does not implement | 🟡 not alone — see §31 |
+
+⚠️ **Two fields on the line still have no section here: `fback=` and `uex=`.** It is named above
+rather than omitted so that an operator meeting it cold knows it is
+*undocumented*, not *unknown to this project* — the exact distinction the `rback=`
+failure at the top of this document cost two reports to learn.
+
+⚠️ **The numbering above has now been off by one twice, from the same cause — and the
+second time was introduced by the correction of the first.** `#130 (b)` corrected an
+off-by-one caused by `fback=` having no row, writing *"a positional reference with a hole
+in it points every row after the hole at the wrong field"* — and in the same edit numbered
+`bdrop=` **29**, which is wrong, because `uex=` (`issue #200`) sits between `prest=` and
+`bdrop=` on the real line and also had no row. `bdrop=` is **30**.
+
+**Corrected here by giving every field on the line a row, undocumented ones included** —
+a hole is what breaks this index, so the fix is to have none rather than to renumber
+around them. The order is checked against the format string in `qumbra-node/src/run.rs`,
+which is the authority: `breq fback prest uex bdrop unk`.
 
 ---
 
@@ -1112,7 +1132,133 @@ connectivity report.
 
 ---
 
-## 26. `unk` — frames and inventory items this build does not implement
+## 26. `breq` — historical block-body requests currently in flight
+
+**🟡 Not alone.** Pair with `slag=`.
+
+**What it counts.** How many historical block-body asks this node has outstanding
+right now (`run.rs` `body_reqs`, capped at `MAX_BODIES_IN_FLIGHT`). Instantaneous
+level, not a total — resets implicitly when asks complete. Always printed, zero
+included. Appended by issue #130 (c).
+
+**Reading it with `slag=`:** `slag>0 breq=0` is *not asking*; `slag>0 breq>0`
+sustained is *asking and not being served*.
+
+**Escalate when:** never from this field alone.
+
+---
+
+## 28. `prest` — committee punishments restored at process start (touches TELEMETRY)
+
+**🟡 Not alone.** A non-zero value is a local fact about this host's ledger; a
+cross-host comparison is the load-bearing reading.
+
+**What it counts.** What [`NodeAdapter::open`](../../crates/qlab-p2p/src/adapter.rs)
+found in `punishments.dat` and re-applied into the fresh genesis committee on this
+process start (`PunishmentRestore::telemetry_field`,
+`crates/qlab-p2p/src/punish.rs`). **Latched at open** — every later sample in the
+process lifetime reprints the same value. It is a startup fact, not a running total.
+
+**Shape is `restored/known`, not a bare count.** A bare `0` cannot distinguish
+*nothing to restore* from *could not restore anything*, and that distinction is
+why the field exists:
+
+| value | meaning |
+|---|---|
+| `0/0` | ledger present (or written empty on this open); nothing to restore |
+| `N/M` | `N` tombstones re-applied from `M` on-disk records this process start |
+| `unk` | data dir already held chain history but **no** ledger — punishment history is unknowable (pre-#133 datadir). Not silence, not clean. |
+
+⚠️ **A host that has never observed an equivocation prints `prest=0/0` forever.**
+That is correct for the local ledger (PR #159) and is **not** proof the net has
+never punished anyone. Evidence is push-once gossip with no getdata path: a peer
+that saw the conflicting pair and this host did not still disagree about who may
+sign, and after a restart they disagree *durably*. Agreement needs the evidence
+in blocks (issue #133 D1). Do not "fix" a perpetual `0/0` by deleting the field.
+
+**Normal value.** `0/0` on every host of a net that has never seen an
+equivocation — the T0 soak record is exactly that. `N/M` only after this node
+itself adjudicated evidence in a prior process lifetime.
+
+**What a change means.** The value cannot change mid-process. A change across a
+restart (`0/0` → `1/1`) means this node restored a punishment it had recorded;
+that is the healthy PR #159 path. `unk` on first start of a pre-#133 datadir is
+the one-shot upgrade signal — an empty ledger is then written so later restarts
+are unambiguous.
+
+**Escalate when:** never from this field alone. Two hosts at the same height with
+different `prest` (and no shared evidence path) is the class problem D1 names,
+not an operator action on one host.
+
+**Locked by:** `telemetry_line_is_extended_at_the_end_and_nowhere_else`
+(`run.rs`, expects trailing `prest=0/0`),
+`a_committee_punishment_survives_a_restart_through_the_run_path` (`run.rs`,
+expects `prest=1/1` after restart),
+`a_non_witness_finalizes_a_checkpoint_the_restarted_witness_refuses`
+(`adapter.rs` — the two-node same-height divergence the local ledger cannot close).
+## 30. `bdrop` — bodies the state machine refused, and where
+
+**🟡 Not an alarm on its own. Read the height against `stip=`.**
+
+**What it counts.** `<total>@<height>`: block bodies this node's own state machine
+**refused at the application funnel**, cumulative since process start, paired with
+the **chain height of the most recent refusal**. `bdrop=0@-` means none has been
+refused; the `-` is the "no figure to state" convention, and it is not the same
+claim as a height of `0` (genesis is height 0). See
+`NodeAdapter::body_refusals` and `bdrop_field` (`run.rs`).
+
+**Why the field exists.** Until `issue #130 (b)` this refusal was an `Err(_) => {}`
+arm under a comment calling the drop expected, and there was no counter and no
+field anywhere. **A node dropping every body it was handed printed exactly what a
+healthy node prints.** #130 records that this is what made it the worst of five
+same-shaped defects that week: *"every other instance was silence; this one was
+silence with a comment vouching for it."*
+
+**Why a height and not a rate.** A cumulative total answers *how many* and cannot
+answer *are they still arriving*, and those two want opposite responses. One
+telemetry line has no previous sample to difference against, and chain time has no
+wall-clock anchor here (genesis is stamped `timestamp = 0` for a reproducible
+genesis hash — `issue #106`). Height is the monotone quantity that is already on
+the line, so the comparison is done by eye from one sample.
+
+**Normal value.** `0@-`.
+
+**What a change means — the pair to read:**
+
+| reading | verdict |
+|---|---|
+| `bdrop=0@-` | nothing has been refused |
+| `bdrop=N@H` with `H` far below `stip=` | a burst that is **over**. Record `N` and `H`; do not escalate on the total alone |
+| `bdrop=N@H` with `H` at or next to `stip=` | 🟡 this node is refusing bodies **now**, and `slag=` will not close while it does |
+| `N` rising across samples | 🟡 sustained refusal — take the per-reason breakdown from `/metrics` before reporting |
+
+**The per-reason breakdown is on `/metrics`, not on this line:**
+`qumbra_body_apply_refused_total{reason=…}` over `not_extending_tip`, `bad_body`,
+`nullifier_spent`, `persist_io`, `internal`.
+
+🔴 **Two of those five reasons must be zero forever.**
+`reason="not_extending_tip"` and `reason="internal"` are **invariant tripwires**:
+the only production caller of `apply_block` selects the body it applies by the
+exact negation of the first error's trigger, so a nonzero scrape is a defect in
+**this node's own code**, not a network condition. **Report it; it is not an
+operator action.** The other three (`bad_body`, `nullifier_spent`, `persist_io`)
+can genuinely happen — the first two mean a peer served a chain whose bodies do
+not validate, the third is `issue #104`'s shape, a durable chain that has quietly
+stopped being durable.
+
+**Escalate when:** `not_extending_tip` or `internal` is nonzero on `/metrics`
+(report, do not act); or the total is rising with the height tracking `stip=`
+across several samples.
+
+**Locked by:** `a_body_refused_at_the_application_funnel_is_counted_and_located`
+and `i130b_a_held_body_that_does_not_extend_the_applied_tip_never_reaches_apply_block`
+(`adapter.rs`), `every_apply_failure_classifies_to_a_declared_refusal_reason`
+(`qlab-node/src/node.rs`),
+`every_body_refusal_reason_is_a_series_from_the_first_scrape`
+(`qlab-node/src/metrics.rs`),
+`bdrop_renders_the_count_and_the_height_of_the_last_refusal` (`run.rs`).
+
+## 31. `unk` — frames and inventory items this build does not implement
 
 **🟡 Not an alarm alone — and the reading depends entirely on whether an upgrade
 is in flight.** It is the version-skew instrument, added by `issue #181` in the
@@ -1224,5 +1370,5 @@ rendering) · `crates/qlab-node/src/round.rs` (the round ledger) ·
 `crates/qlab-p2p/src/addrman.rs` (the address book) ·
 `crates/qlab-devnet/src/params_devnet.rs` (the frozen constants).
 
-Issues cited: #73 #74 #83 #84 #85 #87 #104 #105 #106 #107 #117 #121 #130 #133 #134
-#162 #164 #165 #167 #169 #172 #173 #181 #183. PRs cited: #72 #93 #110 #119 #153 #168 #171.
+Issues cited: #73 #74 #83 #84 #85 #87 #104 #105 #106 #107 #117 #121 #130 #133 #134 #162 #164 #165 #167 #169 #172 #173 #181 #183.
+PRs cited: #72 #93 #110 #119 #153 #159 #168 #171.

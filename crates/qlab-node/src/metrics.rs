@@ -287,6 +287,37 @@ pub const VOTE_RESULTS: [&str; 5] = ["counted", "inactive", "forged", "unknown_s
 /// already in trouble.
 pub const LAG_REFUSAL_DUTIES: [&str; 3] = ["mine", "admit_tx", "rewind"];
 
+/// Why the state machine refused a body at the application funnel (issue #130 (b)),
+/// pre-declared so every series exists from the first scrape.
+///
+/// **This is the counter the `Err(_) => {}` arm did not have.** #130's sharpest
+/// sentence is about the comment that sat above it — *"a comment asserting that a
+/// dropped block is normal is what kept anyone from asking whether it was"* — and the
+/// answer to that is not a bare total: it is an attribution, because the reasons a
+/// body can be refused are not one phenomenon. Two of these five are the node's own
+/// invariants and are expected to stay at zero forever; three are things that can
+/// really happen to a running node.
+///
+/// - `not_extending_tip` — [`crate::NodeError::NotExtendingTip`], the variant #130 was
+///   filed against. **It is an invariant tripwire, not a rate.** The only production
+///   caller of [`crate::Node::apply_block`] selects the body it applies with the exact
+///   negation of this error's trigger, so a nonzero value here means that selection
+///   and this check have come apart — a defect in this node, not in the network.
+/// - `bad_body` — body validation failed at application time against the tree the
+///   block is actually being applied to. Reachable: the anchor rule is answered from
+///   state, and state moves between a body's arrival and its application.
+/// - `nullifier_spent` — a cross-block double-spend. Reachable, and it is checked
+///   only in the state funnel, never by the arrival-time body validation, so this is
+///   the one refusal class no earlier gate can pre-empt.
+/// - `persist_io` — the block-log append failed. This is #104's shape: a durable
+///   chain that has quietly stopped being durable.
+/// - `internal` — every remaining [`crate::NodeError`], each of which means an
+///   invariant this node believes cannot fire has fired. Grouped rather than
+///   wildcarded: the classifier matches the enum exhaustively, so a new variant
+///   breaks the build instead of landing here silently.
+pub const BODY_REFUSAL_REASONS: [&str; 5] =
+    ["not_extending_tip", "bad_body", "nullifier_spent", "persist_io", "internal"];
+
 /// The node's accumulated metric state. Owned by the node adapter (which is where
 /// the events happen) and rendered on demand.
 #[derive(Clone, Debug)]
@@ -311,9 +342,14 @@ pub struct Metrics {
     regime_ms: BTreeMap<&'static str, u64>,
     // ---- state lag (issue #130 (a)) ----------------------------------------
     lag_refusals: BTreeMap<&'static str, Counter>,
+    // ---- body-application refusals (issue #130 (b)) ------------------------
+    body_refusals: BTreeMap<&'static str, Counter>,
+    body_refusal_last_height: Option<u64>,
     // ---- state rewinds (issue #162) ----------------------------------------
     state_rewinds: Counter,
     state_rewind_blocks: Counter,
+    // ---- unobtainable-body exemption mines (issue #200) --------------------
+    state_tip_mines: Counter,
 }
 
 impl Default for Metrics {
@@ -341,8 +377,14 @@ impl Metrics {
         for d in LAG_REFUSAL_DUTIES {
             lag_refusals.insert(d, Counter::default());
         }
+        let mut body_refusals = BTreeMap::new();
+        for r in BODY_REFUSAL_REASONS {
+            body_refusals.insert(r, Counter::default());
+        }
         Self {
             lag_refusals,
+            body_refusals,
+            body_refusal_last_height: None,
             rounds_total,
             votes_total,
             signer_signed: BTreeMap::new(),
@@ -353,6 +395,7 @@ impl Metrics {
             round_variants_total: Counter::default(),
             state_rewinds: Counter::default(),
             state_rewind_blocks: Counter::default(),
+            state_tip_mines: Counter::default(),
             blocks_connected: Counter::default(),
             block_interval: Histogram::new(BLOCK_INTERVAL_SECS_BUCKETS, 1),
             finality_advances: Counter::default(),
@@ -417,6 +460,58 @@ impl Metrics {
     /// How many times `duty` was refused for state lag.
     pub fn lag_refusals(&self, duty: &str) -> u64 {
         self.lag_refusals.get(duty).map(|c| c.get()).unwrap_or(0)
+    }
+
+    /// Record one body the state machine refused at the application funnel, and the
+    /// height it was refused at (issue #130 (b)).
+    ///
+    /// It lives here for the same reason [`Self::observe_lag_refusal`] does: the
+    /// events happen at the adapter, the registry is rendered here, and a second
+    /// counter ledger beside this one is the shape this repo has ruled against.
+    ///
+    /// **The height is kept as well as the count**, and that is the whole of what
+    /// makes this readable off one telemetry line. A cumulative total answers *how
+    /// many*; it cannot answer *are they still arriving*, which is the question an
+    /// operator actually has — and on this line there is no previous sample to
+    /// difference against and no clock to lean on (genesis is stamped `timestamp = 0`
+    /// for a reproducible genesis hash, so #106 already recorded that wall-clock
+    /// freshness is unusable here). Chain height is the one monotone quantity that
+    /// *is* on the line, twice (`tip=` / `stip=`), so "the last refusal was at height
+    /// H" is a self-contained answer: H next to `stip=` is happening now, H far below
+    /// it is a burst that is over.
+    pub fn observe_body_refusal(&mut self, reason: &'static str, height: u64) {
+        if let Some(c) = self.body_refusals.get_mut(reason) {
+            c.inc();
+        }
+        self.body_refusal_last_height = Some(height);
+    }
+
+    /// How many bodies were refused for `reason`.
+    pub fn body_refusals(&self, reason: &str) -> u64 {
+        self.body_refusals.get(reason).map(|c| c.get()).unwrap_or(0)
+    }
+
+    /// Bodies refused at the application funnel for any reason.
+    pub fn body_refusals_total(&self) -> u64 {
+        self.body_refusals.values().map(|c| c.get()).sum()
+    }
+
+    /// The height of the most recently refused body, or `None` if none has been.
+    pub fn body_refusal_last_height(&self) -> Option<u64> {
+        self.body_refusal_last_height
+    }
+
+    /// Record one block mined under the unobtainable-body exemption (issue #200).
+    ///
+    /// An operator seeing a node mine while `slag>0` needs a counter that says
+    /// "it was the exemption" rather than "the duty gate broke".
+    pub fn observe_state_tip_mine(&mut self) {
+        self.state_tip_mines.inc();
+    }
+
+    /// How many blocks this node has mined under the #200 exemption.
+    pub fn state_tip_mines(&self) -> u64 {
+        self.state_tip_mines.get()
     }
 
     /// Record one state-machine rewind onto the main chain, and what it cost in
@@ -682,6 +777,23 @@ Every series exists from the first scrape.\n\
         ));
     }
 
+    // ---- issue #130 (b): bodies refused at the application funnel -------------
+    o.push_str(
+        "# HELP qumbra_body_apply_refused_total Block bodies the state machine refused at the \
+application funnel, by reason (issue #130 (b)). This is the counter the `Err(_) => {}` arm did not \
+have: a dropped body was annotated as expected and left no trace anywhere. reason=\"not_extending_tip\" \
+and reason=\"internal\" are INVARIANT TRIPWIRES — the only production caller selects bodies by the \
+exact negation of the first, so either being nonzero is a defect in this node. The other three can \
+really happen. Cumulative since process start; every series exists from the first scrape.\n\
+# TYPE qumbra_body_apply_refused_total counter\n",
+    );
+    for r in BODY_REFUSAL_REASONS {
+        o.push_str(&format!(
+            "qumbra_body_apply_refused_total{{reason=\"{r}\"}} {}\n",
+            m.body_refusals(r)
+        ));
+    }
+
     // ---- issue #162: the state machine leaving a losing branch ----------------
     o.push_str(
         "# HELP qumbra_state_rewinds_total Times this node's state machine rewound off a branch \
@@ -700,6 +812,18 @@ ordinary sibling race, deep is a question for a human.\n\
     o.push_str(&format!(
         "qumbra_state_rewind_blocks_total {}\n",
         m.state_rewind_blocks()
+    ));
+
+    // ---- issue #200: mines under the unobtainable-body exemption -------------
+    o.push_str(
+        "# HELP qumbra_state_tip_mines_total Blocks this node mined on its verified state tip \
+under the unobtainable-body exemption (issue #200). A rising rate while qumbra_state_lag_blocks \
+is nonzero means the exemption fired — the duty gate did not break. Exists from the first scrape.\n\
+# TYPE qumbra_state_tip_mines_total counter\n",
+    );
+    o.push_str(&format!(
+        "qumbra_state_tip_mines_total {}\n",
+        m.state_tip_mines()
     ));
 
     // ---- live gauges ------------------------------------------------------
@@ -814,16 +938,56 @@ this release carries no halt.\n# TYPE qumbra_halt_height gauge\n");
     //
     // A plain numeric gauge has cardinality 1 forever and answers the actual
     // question better. The alert an operator wants is "do the nodes agree", and on
-    // a value that is one line:
+    // a value that is two lines, with no clean equivalent over a label:
     //
-    //     count(count_values("id", qumbra_finalized_checkpoint_id)) > 1
+    //     count(count_values("id", qumbra_finalized_checkpoint_id))
+    //       > count(count_values("h",  qumbra_finalized_height))
     //
-    // which has no clean equivalent over a label. Humans read the hex out of the
-    // `TELEMETRY`/`ROUND` lines; `/metrics` is for the machine. The two are the
-    // same number — `printf '%012x'` of this gauge is the log field, exactly,
-    // which is why the identity is 48 bits (a float64 exposition value carries it
-    // unrounded; 64 bits would silently round and the correspondence would be a
-    // lie).
+    // **More distinct identities than distinct heights ⇒ some height carries two ⇒
+    // exactly R2**, and nothing else. No false positive: two hosts at one height
+    // with different `fid` *is* the fork. No false negative, subject to the premise
+    // below: every observed height contributes at least one identity, so the
+    // identity count can exceed the height count only where some height carries two
+    // — a split cannot hide by cancelling against another height.
+    //
+    // 🔴 **Issue #187 — what stood here was
+    // `count(count_values("id", qumbra_finalized_checkpoint_id)) > 1`, and it fires
+    // on ordinary finality propagation.** It counted distinct identities and never
+    // looked at height; hosts briefly at different `final=` are correctly at
+    // different `fid`. Live on the T0 net at 2026-08-01 12:52, mid-roll, two hosts
+    // read `final=792 fid=ff893294bc8a` and two read `final=800 fid=17dd2cbdac3a` —
+    // two heights, two identities, entirely correct, and that expression returns
+    // `2 > 1`. An alarm that fires during normal operation gets turned off (issue
+    // #105's lesson), and this is the most severe alarm this system has. Both
+    // directions are locked by test below, because this expression exists in two
+    // places — `qumbra-deploy/OPERATOR.md` §3 is the other, fixed in its PR #42 —
+    // and the two diverged silently once already.
+    //
+    // **The premise, stated because it is not always true: every host reporting a
+    // finalized height must also report an identity for it.** Within one binary it
+    // holds — both gauges resolve from the same finalized head and appear and
+    // disappear together. Across a roll it does not: a host on an image predating
+    // #84 exposes `qumbra_finalized_height` and no identity family at all, which
+    // adds a height to the right-hand side while adding no identity to the left,
+    // and that can cancel a real split at another height. Two hosts split at 800
+    // plus one un-rolled host at 792 is `2 > 2` — silent. So the alarm above is
+    // paired with a coverage check whose meaning is "the alarm cannot answer right
+    // now", the same third answer `qumbra-opview` renders as `Indeterminate` and
+    // `soak.sh` prints as "the check DID NOT RUN" instead of a tick:
+    //
+    //     count(qumbra_finalized_height)
+    //       != (count(qumbra_finalized_checkpoint_id) or vector(0))
+    //
+    // (`or vector(0)`: a whole net predating #84 makes the right side an empty
+    // vector, and an empty side makes the comparison itself — and so the check —
+    // vanish. Both sides empty, i.e. nothing finalized anywhere, is still silent,
+    // which is correct: there is nothing to cover.)
+    //
+    // Humans read the hex out of the `TELEMETRY`/`ROUND` lines; `/metrics` is for
+    // the machine. The two are the same number — `printf '%012x'` of this gauge is
+    // the log field, exactly, which is why the identity is 48 bits (a float64
+    // exposition value carries it unrounded; 64 bits would silently round and the
+    // correspondence would be a lie).
     //
     // Absence follows `qumbra_finalized_height`'s established rule rather than the
     // log lines': **no series**, never a zero. A log line is positional and must
@@ -832,9 +996,11 @@ this release carries no halt.\n# TYPE qumbra_halt_height gauge\n");
     o.push_str(
         "# HELP qumbra_finalized_checkpoint_id Identity of the finalized checkpoint (issue #84): the first \
 6 bytes of keccak256 over the exact bytes the committee signs, big-endian. Deliberately a value and not a \
-label — cardinality 1, and `count(count_values(\"id\", qumbra_finalized_checkpoint_id)) > 1` across a net is \
-the two-different-checkpoints-at-one-height alarm. printf '%012x' gives the `fid=` field in the logs. No \
-series when nothing is finalized.\n# TYPE qumbra_finalized_checkpoint_id gauge\n",
+label — cardinality 1, and `count(count_values(\"id\", qumbra_finalized_checkpoint_id)) > \
+count(count_values(\"h\", qumbra_finalized_height))` across a net is the \
+two-different-checkpoints-at-one-height alarm — more identities than heights means some height carries two \
+(issue #187: comparing against 1 instead pages on ordinary finality propagation). printf '%012x' gives the \
+`fid=` field in the logs. No series when nothing is finalized.\n# TYPE qumbra_finalized_checkpoint_id gauge\n",
     );
     if let Some(id) = g.finalized_checkpoint_id {
         o.push_str(&format!("qumbra_finalized_checkpoint_id {id}\n"));
@@ -1199,6 +1365,61 @@ mod tests {
     /// **Cardinality 1, by construction.** The rejected alternative was an info
     /// metric carrying the identity as a label; this asserts we did not quietly
     /// grow one, on any of the three new families.
+    /// **Issue #130 (b) — every refusal reason is a series from the first scrape,
+    /// including the two that should never move.**
+    ///
+    /// The pre-declaration is not cosmetic here, and it is the reason the reason set
+    /// is a constant rather than whatever the classifier happened to emit: an alert
+    /// cannot be written against a counter that only appears the first time the
+    /// thing it watches happens, and `reason="not_extending_tip"` is precisely a
+    /// counter you want an alert on *before* it has ever been nonzero.
+    #[test]
+    fn every_body_refusal_reason_is_a_series_from_the_first_scrape() {
+        let mut m = Metrics::new();
+        let text = render(&m, &gauges());
+        assert!(text.contains("# TYPE qumbra_body_apply_refused_total counter"), "{text}");
+        for r in BODY_REFUSAL_REASONS {
+            assert!(
+                text.contains(&format!("qumbra_body_apply_refused_total{{reason=\"{r}\"}} 0\n")),
+                "{r} must exist at zero before it ever fires: {text}"
+            );
+        }
+        assert_eq!(m.body_refusals_total(), 0);
+        assert_eq!(m.body_refusal_last_height(), None);
+
+        // One refusal moves exactly one series, the total, and the height.
+        m.observe_body_refusal("nullifier_spent", 412);
+        let text = render(&m, &gauges());
+        assert!(
+            text.contains("qumbra_body_apply_refused_total{reason=\"nullifier_spent\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("qumbra_body_apply_refused_total{reason=\"not_extending_tip\"} 0\n"),
+            "the tripwire is untouched by an unrelated refusal: {text}"
+        );
+        assert_eq!(m.body_refusals_total(), 1);
+        assert_eq!(m.body_refusal_last_height(), Some(412));
+
+        // The height is the LAST refusal's, not the first's or the deepest's — the
+        // question it answers is "is this still happening", so it must track forward
+        // even when the new refusal is at a lower height than the previous one (which
+        // a rewind makes ordinary).
+        m.observe_body_refusal("bad_body", 9);
+        assert_eq!(m.body_refusals_total(), 2);
+        assert_eq!(m.body_refusal_last_height(), Some(9), "most recent, not highest");
+
+        // An undeclared reason creates no series — a scrape must not grow a label
+        // value nobody wrote an alert for. The height still moves, because a refusal
+        // still happened and `bdrop=` must not go quiet about it. The case is
+        // unreachable in production (`NodeError::refusal_reason` is exhaustive and
+        // test-locked against this same constant in `node.rs`); it is pinned here so
+        // the two halves of that answer are on the record rather than implied.
+        m.observe_body_refusal("invented", 1);
+        assert_eq!(m.body_refusals_total(), 2, "no undeclared series appears");
+        assert_eq!(m.body_refusal_last_height(), Some(1), "but the refusal is not hidden");
+    }
+
     #[test]
     fn identity_families_carry_no_labels() {
         let m = Metrics::new();
@@ -1296,6 +1517,194 @@ mod tests {
                 "{fam} must emit no series when there is nothing to report"
             );
         }
+    }
+
+    // ---- issue #187: the R2 alarm expression, locked --------------------------
+    //
+    // The expression documented above `qumbra_finalized_checkpoint_id` is the most
+    // severe alarm this system has, and it has now been wrong once in each of the
+    // two places it lives. A comment cannot be wrong twice if a test reads it.
+    //
+    // **These tests do not evaluate PromQL.** Nothing in this workspace can, and
+    // pulling in an engine to check a comment would be a larger change than the
+    // thing under test — so the predicate is expressed directly over the gauge
+    // values, which the issue permits explicitly and which the PR states. What is
+    // modelled is only the two functions' meaning on *unlabelled* gauges:
+    // `count_values` emits one series per distinct sample value, `count` counts
+    // series, so `count(count_values(...))` is "how many distinct values" and
+    // `count(m)` is "how many hosts expose m". The scrapes fed in are real
+    // `render()` output, so the metric names and the present-or-absent rule under
+    // test are the live ones and not a paraphrase of them.
+    //
+    // One modelling difference, stated rather than hidden: PromQL's `count()` over
+    // an absent metric is an empty vector, not 0, and a comparison with an empty
+    // side yields nothing. Here absence is 0. For the alarm the two agree (`0 > 0`
+    // and "empty" are both "no page"); for the coverage check they agree only
+    // because the documented expression carries `or vector(0)`, which is what that
+    // clause is for.
+
+    /// One host's scrape at a given finalized head. `fid = None` with a height is
+    /// the mid-roll host on a pre-#84 image: it publishes the height and no
+    /// identity family at all.
+    fn scrape_at(finalized: Option<u64>, fid: Option<u64>) -> String {
+        let m = Metrics::new();
+        let mut g = gauges();
+        g.finalized_height = finalized;
+        g.finalized_checkpoint_id = fid;
+        render(&m, &g)
+    }
+
+    /// `count(m)` — the hosts exposing `m` as a series at all.
+    fn series_count(scrapes: &[String], metric: &str) -> usize {
+        let prefix = format!("{metric} ");
+        scrapes
+            .iter()
+            .filter(|s| s.lines().any(|l| l.starts_with(&prefix)))
+            .count()
+    }
+
+    /// `count(count_values("x", m))` — the distinct values of `m` across the scrape
+    /// set.
+    fn distinct_values(scrapes: &[String], metric: &str) -> usize {
+        let prefix = format!("{metric} ");
+        scrapes
+            .iter()
+            .filter_map(|s| s.lines().find_map(|l| l.strip_prefix(&prefix)))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    }
+
+    /// The documented alarm:
+    /// `count(count_values("id", …_checkpoint_id)) > count(count_values("h", …_height))`.
+    fn r2_alarm_fires(scrapes: &[String]) -> bool {
+        distinct_values(scrapes, "qumbra_finalized_checkpoint_id")
+            > distinct_values(scrapes, "qumbra_finalized_height")
+    }
+
+    /// What the comment documented until #187: `count(count_values("id", …)) > 1`.
+    /// Kept so the defect is locked, not only its replacement — a future edit that
+    /// reverts to counting identities alone fails here.
+    fn pre_i187_alarm_fires(scrapes: &[String]) -> bool {
+        distinct_values(scrapes, "qumbra_finalized_checkpoint_id") > 1
+    }
+
+    /// The coverage check:
+    /// `count(…_height) != (count(…_checkpoint_id) or vector(0))`.
+    fn coverage_check_fires(scrapes: &[String]) -> bool {
+        series_count(scrapes, "qumbra_finalized_height")
+            != series_count(scrapes, "qumbra_finalized_checkpoint_id")
+    }
+
+    /// **Direction 1 — two hosts at two heights with two identities must NOT
+    /// trigger.** This is the live reading of 2026-08-01 12:52, mid-roll on T0: two
+    /// hosts at `final=792 fid=ff893294bc8a`, two at `final=800 fid=17dd2cbdac3a`.
+    /// Two heights, two identities, entirely correct — finality propagating.
+    ///
+    /// The second assertion is the point of the baton: the expression that stood in
+    /// this file *would* have paged on exactly this scrape.
+    #[test]
+    fn the_r2_alarm_is_silent_while_finality_propagates_across_two_heights() {
+        let net = [
+            scrape_at(Some(792), Some(0xff89_3294_bc8a)),
+            scrape_at(Some(792), Some(0xff89_3294_bc8a)),
+            scrape_at(Some(800), Some(0x17dd_2cbd_ac3a)),
+            scrape_at(Some(800), Some(0x17dd_2cbd_ac3a)),
+        ];
+        assert_eq!(distinct_values(&net, "qumbra_finalized_checkpoint_id"), 2);
+        assert_eq!(distinct_values(&net, "qumbra_finalized_height"), 2);
+        assert!(!r2_alarm_fires(&net), "propagation is not a fork");
+        assert!(
+            pre_i187_alarm_fires(&net),
+            "the pre-#187 expression pages on this scrape — the defect, reproduced"
+        );
+        assert!(!coverage_check_fires(&net), "every host reports both, so the alarm can answer");
+    }
+
+    /// **Direction 2 — two hosts at ONE height with two identities must trigger.**
+    /// Two different checkpoints finalized at one height is R2, the most severe
+    /// failure this net can have.
+    #[test]
+    fn the_r2_alarm_fires_on_two_identities_at_one_height() {
+        let split = [
+            scrape_at(Some(800), Some(0x17dd_2cbd_ac3a)),
+            scrape_at(Some(800), Some(0x4cc8_904e_1f2a)),
+        ];
+        assert_eq!(distinct_values(&split, "qumbra_finalized_checkpoint_id"), 2);
+        assert_eq!(distinct_values(&split, "qumbra_finalized_height"), 1);
+        assert!(r2_alarm_fires(&split));
+
+        // And the agreeing case at one height stays silent, so the test above is
+        // not passing on the mere presence of a shared height.
+        let agreed = [
+            scrape_at(Some(800), Some(0x17dd_2cbd_ac3a)),
+            scrape_at(Some(800), Some(0x17dd_2cbd_ac3a)),
+        ];
+        assert!(!r2_alarm_fires(&agreed));
+    }
+
+    /// The no-false-negative claim, tested rather than asserted in prose: a split at
+    /// one height is not cancelled by a host sitting at another. Three identities
+    /// over two heights still exceeds two.
+    #[test]
+    fn a_split_at_one_height_is_not_cancelled_by_a_host_at_another() {
+        let net = [
+            scrape_at(Some(792), Some(0xff89_3294_bc8a)),
+            scrape_at(Some(800), Some(0x17dd_2cbd_ac3a)),
+            scrape_at(Some(800), Some(0x4cc8_904e_1f2a)),
+        ];
+        assert_eq!(distinct_values(&net, "qumbra_finalized_checkpoint_id"), 3);
+        assert_eq!(distinct_values(&net, "qumbra_finalized_height"), 2);
+        assert!(r2_alarm_fires(&net));
+    }
+
+    /// A net that has finalized nothing, and a net where only some hosts have, are
+    /// both silent — on the alarm *and* on the coverage check. A host publishing
+    /// neither series is not a coverage hole; it has nothing to be covered.
+    #[test]
+    fn nothing_to_compare_is_never_an_alarm() {
+        let cold = [scrape_at(None, None), scrape_at(None, None)];
+        assert_eq!(series_count(&cold, "qumbra_finalized_height"), 0, "no series, not a 0");
+        assert!(!r2_alarm_fires(&cold));
+        assert!(!coverage_check_fires(&cold));
+
+        let partial = [
+            scrape_at(Some(800), Some(0x17dd_2cbd_ac3a)),
+            scrape_at(Some(800), Some(0x17dd_2cbd_ac3a)),
+            scrape_at(None, None),
+        ];
+        assert!(!r2_alarm_fires(&partial));
+        assert!(!coverage_check_fires(&partial));
+    }
+
+    /// **The limit of the alarm, recorded as a test rather than as a hope.**
+    ///
+    /// The no-false-negative argument holds only while every host reporting a
+    /// height also reports an identity. A host mid-roll on a pre-#84 image reports
+    /// the height and no identity, which adds a height and no identity — and here
+    /// that cancels a genuine split at another height, so the alarm is silent on a
+    /// real R2. The coverage check is what makes that state visible instead of
+    /// reading as an all-clear; `qumbra-opview` calls the same state
+    /// `Indeterminate` and `soak.sh` prints "the check DID NOT RUN".
+    #[test]
+    fn a_height_without_an_identity_can_mask_a_split_and_the_coverage_check_says_so() {
+        let mid_roll = [
+            scrape_at(Some(800), Some(0x17dd_2cbd_ac3a)),
+            scrape_at(Some(800), Some(0x4cc8_904e_1f2a)), // a real R2 split at 800
+            scrape_at(Some(792), None),                   // pre-#84 image: height, no identity
+        ];
+        assert_eq!(distinct_values(&mid_roll, "qumbra_finalized_checkpoint_id"), 2);
+        assert_eq!(distinct_values(&mid_roll, "qumbra_finalized_height"), 2);
+        assert!(
+            !r2_alarm_fires(&mid_roll),
+            "documented limit: 2 > 2 is false, so a real split is silent here"
+        );
+        assert!(
+            coverage_check_fires(&mid_roll),
+            "…which is exactly why the coverage check has to be deployed with it"
+        );
+        // The masking host is a real render: a height series and no identity series.
+        assert!(mid_roll[2].contains("\nqumbra_finalized_height 792\n"));
+        assert!(!mid_roll[2].lines().any(|l| l.starts_with("qumbra_finalized_checkpoint_id ")));
     }
 
     /// A closed round folds into the aggregates exactly once, and per-member

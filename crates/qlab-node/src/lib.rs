@@ -74,15 +74,15 @@ pub use recovery::{
     FinalizerState, SignRefusal, FINALIZER_FORMAT_VERSION,
 };
 pub use rpc::{
-    serve, AnchorSet, CheckpointFacts, MemNodeRpc, NetFacts, NodeRpc, NodeStatus,
-    RecipientDiscovery, RejectReason, RouteResult, RpcServerHandle, SubmitOutcome, TxDiscovery,
-    RPC_VERSION,
+    compact_response, serve, AnchorSet, BlockDiscovery, CheckpointFacts, MemNodeRpc, NetFacts,
+    NodeRpc, NodeStatus, RecipientDiscovery, RejectReason, RouteResult, RpcServerHandle,
+    SubmitOutcome, TxDiscovery, MAX_COMPACT_BLOCKS, RPC_VERSION,
 };
 pub use telemetry::{
     AppliedTip, LocalCommitment, StateLag, SupplyCoverage, Telemetry, APPLIED_TIP_OFF_MAIN,
     APPLIED_TIP_ON_MAIN, LOCAL_COMMITMENT_SPLIT,
 };
-pub use persist::{Snapshot, BLOCK_LOG, FORMAT_VERSION, SNAPSHOT};
+pub use persist::{read_records, LogRecord, Snapshot, BLOCK_LOG, FORMAT_VERSION, SNAPSHOT};
 pub use store::{
     ChainStore, CommitmentStore, Hash32, MemChainStore, MemCommitmentStore, MemNullifierStore,
     NullifierStore, RewindError, StoredBlock, StoredHeader, StoredTx,

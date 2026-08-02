@@ -23,7 +23,7 @@
 `TELEMETRY_REFRESH` 输出到 stdout。字段顺序就是 `run.rs:996` 那个 `format!`：
 
 ```
-TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= unk=<n>/<n>
+TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= prest= uex= bdrop= unk=<n>/<n>
 ```
 
 ⚠️ **上面是字段清单，不是一次采样。** 本文中作为「实测」引用的数值，只有标注了具体
@@ -84,9 +84,25 @@ issue 或证据包出处的那些；其余全部由源码推导。拼一条「�
 | 23 | `mready` | 挖矿就绪判定 | 🟢 从不 |
 | 24 | `stipid` | 已应用链尖的身份 | 🟡 不单独 |
 | 25 | `schain` | `main` / `fork` / `-` | 🔴 **是 —— `schain=fork`** |
-| — | `breq` | 在途的历史区块体请求数（`issue #130` (c)） | ⛔ **本文未收录 —— 该字段晚于本文** |
-| — | `fback` | 追踪器的检查点是否由本机自己的链背书（`issue #85`） | ⛔ **本文未收录 —— 该字段晚于本文** |
-| 26 | `unk` | 本构建不认识的 `<帧>/<inv 条目>` 数 | 🟡 不单独 —— 见 §26 |
+| 26 | `breq` | 当前在途的历史区块体请求数 | 🟡 不单独 |
+| 27 | `fback` | ⛔ **本文未收录** —— 2026-08-01 由 `issue #85` 追加 | — |
+| 28 | `prest` | 进程启动时恢复的委员会惩罚 | 🟡 不单独 |
+| 29 | `uex` | ⛔ **本文未收录** —— 2026-08-01 由 `issue #200` 追加 | — |
+| 30 | `bdrop` | `<总数>@<高度>` —— 状态机拒绝的区块体，以及拒在哪里 | 🟡 不单独 —— **把高度对着 `stip=` 读** |
+| 31 | `unk` | 本构建不认识的 `<帧>/<inv 条目>` 数 | 🟡 不单独 —— 见 §31 |
+
+⚠️ **实际行上还有两个字段在本文没有小节：`fback=` 和 `uex=`。** 上表点名而不是省略它，是为了让冷遇
+它的运维知道：它是 **未被记录**，而不是 **本项目不认识** —— 这正是本文开头那次 `rback=`
+失败花了两份报告才学到的区别。
+
+⚠️ **上面的编号至今已经错位过两次，成因相同 —— 而第二次是由第一次的更正引入的。**
+`#130 (b)` 更正了由 `fback=` 没有行位引起的错位，写下*「一份带洞的位置索引，会让洞之后的每
+一行都指向错误的字段」* —— 而在同一次编辑里把 `bdrop=` 编成 **29**，这是错的：`uex=`
+（`issue #200`）在真实行上位于 `prest=` 与 `bdrop=` 之间，同样没有行位。`bdrop=` 是 **30**。
+
+**这里的更正方式是：让行上的每一个字段都有一行，包括未被记录的那些** —— 破坏这份索引的是
+「洞」，所以修法是不留洞，而不是绕着洞重新编号。行序对照 `qumbra-node/src/run.rs` 的格式串
+核对，那里是权威：`breq fback prest uex bdrop unk`。
 
 ---
 
@@ -940,7 +956,110 @@ discovery，所以收款方找不到自己的输出（见 `CLAUDE.md` 的 T1 条
 
 ---
 
-## 26. `unk` —— 本构建不认识的帧与 inv 条目
+## 26. `breq` —— 当前在途的历史区块体请求
+
+**🟡 不单独。** 与 `slag=` 配对读。
+
+**它统计什么。** 本节点此刻有多少个历史区块体请求尚未完成（`run.rs` 的 `body_reqs`，
+上限 `MAX_BODIES_IN_FLIGHT`）。瞬时水位，不是累计；请求完成后自然回落。始终打印，含零。
+由 issue #130 (c) 追加。
+
+**与 `slag=` 一起读：** `slag>0 breq=0` 是*没在问*；`slag>0 breq>0` 持续是*问了但没被服务*。
+
+**何时升级：** 单独永不。
+
+---
+
+## 28. `prest` —— 进程启动时恢复的委员会惩罚（触及 TELEMETRY）
+
+**🟡 不单独。** 非零值是本机 ledger 的本地事实；跨主机比较才是负载相关的读法。
+
+**它统计什么。** [`NodeAdapter::open`](../../crates/qlab-p2p/src/adapter.rs) 在本次进程
+启动时，从 `punishments.dat` 里找到并重新施加到全新创世委员会上的东西
+（`PunishmentRestore::telemetry_field`，`crates/qlab-p2p/src/punish.rs`）。**在 open 时闩住**
+—— 本进程生命周期内之后每一次采样都重印同一个值。它是启动事实，不是运行中累计。
+
+**形状是 `restored/known`，不是裸计数。** 单独的 `0` 分不清*没有东西可恢复*与*什么都恢复不了*，
+而这个区分正是该字段存在的理由：
+
+| 取值 | 含义 |
+|---|---|
+| `0/0` | ledger 存在（或本次 open 写了空 ledger）；没有东西可恢复 |
+| `N/M` | 本次启动从磁盘上的 `M` 条记录重新施加了 `N` 个 tombstone |
+| `unk` | 数据目录已有链历史但**没有** ledger —— 惩罚历史不可知（#133 之前的 datadir）。不是沉默，也不是干净。 |
+
+⚠️ **一台从未观察到双签的主机永远打印 `prest=0/0`。** 对本地 ledger（PR #159）来说这是正确的，
+**并不能**证明全网从未惩罚过任何人。证据是 push-once gossip、没有 getdata 路径：看到冲突对的对端与
+没看到的本机，对谁可以签名仍然意见不一，而且重启之后分歧是*持久的*。一致需要证据上链
+（issue #133 D1）。不要因为永远是 `0/0` 就「修」掉这个字段。
+
+**正常值。** 从未见过双签的网上每台主机都是 `0/0` —— T0 soak 记录正是如此。只有本节点在之前
+某次进程生命周期里自己裁决过证据，才会出现 `N/M`。
+
+**变化意味着什么。** 进程中途不会变。跨重启变化（`0/0` → `1/1`）表示本节点恢复了它曾记录的惩罚；
+那是健康的 PR #159 路径。pre-#133 datadir 首次启动时的 `unk` 是一次性升级信号 —— 随后会写入
+空 ledger，之后的重启就不再含糊。
+
+**何时升级：** 单独永不。同高度、不同 `prest`（且没有共享证据路径）的两台主机，是 D1 命名的
+那类问题，不是对某一台主机的运维动作。
+
+**由这些测试锁定：** `telemetry_line_is_extended_at_the_end_and_nowhere_else`（`run.rs`，期望末尾
+`prest=0/0`）、`a_committee_punishment_survives_a_restart_through_the_run_path`（`run.rs`，重启后期望
+`prest=1/1`）、`a_non_witness_finalizes_a_checkpoint_the_restarted_witness_refuses`
+（`adapter.rs` —— 本地 ledger 无法闭合的双节点同高度分歧）。
+## 30. `bdrop` —— 状态机拒绝的区块体，以及拒在哪里
+
+**🟡 单独不是告警。把高度对着 `stip=` 读。**
+
+**它统计什么。** `<总数>@<高度>`：本节点自己的状态机**在应用漏斗处拒绝**的区块体数量，
+自进程启动累计，并附上**最近一次拒绝所在的链上高度**。`bdrop=0@-` 表示一次都没拒过；这个
+`-` 是「没有可陈述的数值」那个约定，它和高度 `0` 不是同一个断言（创世就是高度 0）。见
+`NodeAdapter::body_refusals` 与 `bdrop_field`（`run.rs`）。
+
+**这个字段为什么存在。** 在 `issue #130 (b)` 之前，这次拒绝是一个 `Err(_) => {}` 分支，上面
+挂着一句说这个丢弃是预期的注释，而且哪里都没有计数器、没有字段。**一个把递给它的每一个区块
+体都丢掉的节点，打印出来的东西和健康节点一模一样。** #130 记下了这正是它比那一周同形状的另
+外四个缺陷都更糟的原因：*「其他每一例都是沉默；这一例是有注释替它背书的沉默。」*
+
+**为什么是高度而不是速率。** 累计总数回答的是*有多少*，回答不了*现在还在不在发生*，而这两者
+需要相反的响应。一行遥测没有上一份采样可以做差；链上时间在这里也没有墙钟锚点（创世被固定为
+`timestamp = 0` 以保证创世哈希可复现 —— `issue #106`）。高度是这行上本来就有的单调量，所以
+这个比较靠肉眼、在一份采样里就能完成。
+
+**正常值。** `0@-`。
+
+**变化意味着什么 —— 要成对读：**
+
+| 读数 | 判定 |
+|---|---|
+| `bdrop=0@-` | 什么都没被拒 |
+| `bdrop=N@H`，`H` 远低于 `stip=` | 一阵**已经过去**的爆发。记下 `N` 和 `H`；不要只凭总数升级 |
+| `bdrop=N@H`，`H` 就在 `stip=` 旁边 | 🟡 这个节点**此刻**正在拒绝区块体，而且只要还在拒，`slag=` 就不会收敛 |
+| `N` 在多次采样间上升 | 🟡 持续拒绝 —— 上报前先从 `/metrics` 取按原因的拆分 |
+
+**按原因的拆分在 `/metrics` 上，不在这一行：**
+`qumbra_body_apply_refused_total{reason=…}`，取值为 `not_extending_tip`、`bad_body`、
+`nullifier_spent`、`persist_io`、`internal`。
+
+🔴 **这五个原因里有两个必须永远为零。** `reason="not_extending_tip"` 与
+`reason="internal"` 是**不变量绊线**：`apply_block` 在生产上唯一的调用方，是用第一个错误
+触发条件的严格否定来挑选它要应用的区块体的，所以一次非零的抓取意味着**本节点自己代码**里的
+缺陷，而不是一种网络状况。**上报它；这不是一个运维动作。** 另外三个（`bad_body`、
+`nullifier_spent`、`persist_io`）是真会发生的 —— 前两个意味着某个对端送来了区块体过不了校验
+的链，第三个是 `issue #104` 的形状：一条已经悄悄不再持久的持久链。
+
+**何时升级：** `/metrics` 上 `not_extending_tip` 或 `internal` 非零（上报，不要动手）；或者
+总数在上升且高度贴着 `stip=` 走了好几次采样。
+
+**由这些测试锁定：** `a_body_refused_at_the_application_funnel_is_counted_and_located`
+与 `i130b_a_held_body_that_does_not_extend_the_applied_tip_never_reaches_apply_block`
+（`adapter.rs`）、`every_apply_failure_classifies_to_a_declared_refusal_reason`
+（`qlab-node/src/node.rs`）、
+`every_body_refusal_reason_is_a_series_from_the_first_scrape`
+（`qlab-node/src/metrics.rs`）、
+`bdrop_renders_the_count_and_the_height_of_the_last_refusal`（`run.rs`）。
+
+## 31. `unk` —— 本构建不认识的帧与 inv 条目
 
 **🟡 单独不构成告警 —— 怎么读完全取决于当下是否正在滚动升级。** 这是版本偏斜
 （version skew）的仪表，由 `issue #181` 在「不认识的帧不再封禁发送方」这同一次改动里加入。
@@ -1016,7 +1135,7 @@ discovery，所以收款方找不到自己的输出（见 `CLAUDE.md` 的 T1 条
 - **`breq=` 与 `fback=`** —— 两者都晚于本文落地，本文没有它们的章节。它们只出现在总览表里，
   好让「按行内打印顺序」这句话仍然成立，仅此而已。不要从名字推断它们的语义。
 - **节点遇到自己不认识的 `PROTOCOL_VERSION` 该怎么办** —— 未决，由 `issue #181` 上报；
-  该 issue 修好了消息类型这一侧，刻意留下了这一侧。见 §26。
+  该 issue 修好了消息类型这一侧，刻意留下了这一侧。见 §31。
 - **任何「`Degraded` 待多久算太久」的绝对阈值** —— 没有任何实测依据，在这里编一个数字，
   恰好就是这个项目被咬过的那类数字。流程归 runbook 管。
 
@@ -1030,5 +1149,5 @@ discovery，所以收款方找不到自己的输出（见 `CLAUDE.md` 的 T1 条
 `crates/qlab-p2p/src/addrman.rs`（地址簿）·
 `crates/qlab-devnet/src/params_devnet.rs`（冻结常量）。
 
-引用的 issue：#73 #74 #83 #84 #85 #87 #104 #105 #106 #107 #117 #121 #130 #133 #134 #162 #164
-#165 #167 #169 #172 #173 #181 #183。引用的 PR：#72 #93 #110 #119 #153 #168 #171。
+Issues cited: .
+PRs cited: .

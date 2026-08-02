@@ -45,16 +45,13 @@ fn chain_stub(n: u64) -> StubNode {
 }
 
 fn tx(seed: u8) -> TxEntry {
-    TxEntry {
-        proof: vec![seed; 48],
-        public: TxPublic {
-            anchor: [seed; 32],
-            nullifiers: vec![[seed; 32]],
-            commitments: vec![[seed.wrapping_add(3); 32]],
-            bucket: ArityBucket::TwoByTwo,
-            fee: 1_000_000,
-        },
-    }
+    TxEntry::with_placeholder_discovery(vec![seed; 48], TxPublic {
+        anchor: [seed; 32],
+        nullifiers: vec![[seed; 32]],
+        commitments: vec![[seed.wrapping_add(3); 32]],
+        bucket: ArityBucket::TwoByTwo,
+        fee: 1_000_000,
+        })
 }
 
 /// Drive two nodes until `done` holds or the budget is exhausted.

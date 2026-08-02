@@ -168,7 +168,12 @@ impl Devnet {
                 };
                 // Opaque placeholder proof — the discovery server never opens it.
                 let proof = format!("devnet-proof:h{height}:tx{tx_i}").into_bytes();
-                body_txs.push(TxEntry { proof, public });
+                // Issue #188: the discovery group is now part of the body, and
+                // these bundles are the real ML-KEM/AEAD artifacts, so the
+                // generated chain commits to exactly what it serves.
+                let bundles: Vec<_> =
+                    recipients.iter().map(|r| r.enc.bundle.clone()).collect();
+                body_txs.push(TxEntry::new(proof, public, &bundles));
                 stored_txs.push(StoredTx { recipients });
             }
 

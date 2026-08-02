@@ -292,16 +292,13 @@ mod tests {
     const RKM_B: [u64; 4] = [0x5555, 0x6666, 0x7777, 0x8888];
 
     fn fee_tx(nf: u8) -> TxEntry {
-        TxEntry {
-            proof: vec![0u8; 8],
-            public: TxPublic {
-                anchor: [0x0F; 32],
-                nullifiers: vec![[nf; 32]],
-                commitments: vec![[nf.wrapping_add(1); 32]],
-                bucket: ArityBucket::TwoByTwo,
-                fee: posted_fee(ArityBucket::TwoByTwo),
-            },
-        }
+        TxEntry::with_placeholder_discovery(vec![0u8; 8], TxPublic {
+            anchor: [0x0F; 32],
+            nullifiers: vec![[nf; 32]],
+            commitments: vec![[nf.wrapping_add(1); 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: posted_fee(ArityBucket::TwoByTwo),
+            })
     }
 
     fn body_at(height: u64, rkm: [u64; 4], n_txs: u8) -> BlockBody {

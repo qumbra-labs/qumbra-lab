@@ -169,16 +169,13 @@ impl Rig {
                 h[..8].copy_from_slice(&(epoch * 1_000 + k).to_le_bytes());
                 h
             };
-            txs.push(TxEntry {
-                proof: b"seed-stand-in-for-coinbase".to_vec(),
-                public: TxPublic {
+            txs.push(TxEntry::with_placeholder_discovery(b"seed-stand-in-for-coinbase".to_vec(), TxPublic {
                     anchor,
                     nullifiers: vec![nf(chunk as u64 * 2), nf(chunk as u64 * 2 + 1)],
                     commitments,
                     bucket: ArityBucket::TwoByTwo,
                     fee: fee(),
-                },
-            });
+                }));
         }
         self.mine(txs, &AcceptAll);
         self.finalize_tip();
