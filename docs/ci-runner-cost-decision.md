@@ -3,7 +3,9 @@
 **Status: one half decided, one half open.** *(Amended 2026-08-02: option F added at Larry's
 suggestion — EC2 on-demand under a Savings Plan — which the first version omitted, and which
 displaces spot as the AWS option worth pricing. The amendment also surfaced that the T0 fleet's own
-on-demand cost has never been measured.)* The architecture is settled and stays settled. The
+on-demand cost has never been measured. Amended again the same day: option G — EKS with runners as
+pods — assessed and not recommended, and assessing it surfaced a sizing lever that applies to every
+option.)* The architecture is settled and stays settled. The
 *hosting* was never decided — it was assumed by a $2 experiment that has since become a $9.31
 month — and the budget is Larry's call under R3. This file exists because that assumption had no
 written record, which was discovered on 2026-08-02 when the budget page was read for the first
@@ -242,6 +244,123 @@ a runner registration to keep alive, the self-hosted-runner-executing-PR-code sh
 dilution — a runner this session provisions and can reach is a weaker witness than one it cannot
 touch.
 
+### G. AWS EKS, runners as pods (actions-runner-controller)
+
+**Raised by Larry, 2026-08-02.** Assessed against the same four axes, and the answer turns on what
+the workload actually is rather than on anything wrong with EKS.
+
+**What it would genuinely buy.** `actions-runner-controller` gives **ephemeral runners** — a fresh
+pod per job, destroyed after — which is a materially better security posture than F's long-lived
+self-hosted runner, because the "self-hosted runner executing PR code" shape in §7C/§7F is largely
+a *persistence* problem. It is declarative, it scales node capacity to zero between jobs, and it is
+the standard answer at organisations running hundreds of jobs an hour.
+
+**Why it does not fit here, and the number is not close.** **An EKS control plane bills
+continuously and cannot scale to zero** — on the order of $70–75 a month at list price, *before a
+single node runs a single test*. That is **roughly 3.5× this document's entire $20 CI budget**, to
+serve **one job, once or twice a day, that needs no scheduling decisions at all.**
+
+Kubernetes solves multi-tenancy, bin-packing and fleet orchestration. **This workload has one
+tenant, one pod, and nothing to pack.** The suite is a single serial process on a single machine;
+there is no scheduling problem for a scheduler to solve.
+
+**And the operational surface is larger than F's, not smaller.** A cluster, ARC and its webhooks,
+node groups or Karpenter, IRSA, plus EKS's own forced Kubernetes version upgrades — against F's
+"one instance, start it, stop it". §7C's and §7F's R1 objection applies unchanged: a cluster this
+session provisions and can reach is a weaker witness than a runner it cannot touch.
+
+**Where G would become right:** if CI volume grew to many jobs an hour, if several repositories
+shared it, or if a cluster already existed for another reason. **None of those is true**, and the
+first is the opposite of the direction §7B just moved in.
+
+**The ephemeral-runner benefit is separable, and that is the useful part of the question.** F can
+have most of it without a cluster — an instance started per run from a launch template and
+terminated after, or a container task on **ECS/Fargate**, which has **no control-plane fee at all**
+and supports arm64. If the reason to consider G is *ephemerality* rather than *Kubernetes*, Fargate
+is the cheaper way to buy it and belongs in the F comparison rather than as its own option.
+
+**Not recommended — on the premise that the cluster would exist for CI.** Not because EKS is
+wrong, but because the fixed control-plane cost alone exceeds the total budget this document is
+about, for a workload with no scheduling problem.
+
+#### 🔴 That premise changed while this section was being written
+
+Larry, 2026-08-02: *"I could take a lot of the EC2 instances out of the `default` AWS profile and
+run them in EKS instead."*
+
+**If a cluster is going to exist anyway, its control-plane fee is not attributable to CI, and G's
+main objection above dissolves.** This is structurally the same argument as §7F's Savings Plan
+conclusion: the fixed cost is justified by the *continuous* workload, and CI rides it as a side
+effect rather than having to justify it. **G is not disqualified; the version of G assessed above
+simply is not the version on the table.**
+
+What G would then be, honestly compared against F:
+
+| | F (on-demand + start/stop) | G (existing cluster + ARC) |
+|---|---|---|
+| control-plane cost attributable to CI | none | **none, under the new premise** |
+| runner lifetime | long-lived instance, or per-run launch template | **ephemeral pod per job — better** |
+| operational surface added *by CI* | one instance + start/stop | **an ARC install on a cluster already being run** |
+| R1 independence | diluted (§7C) | **diluted the same way, no better and no worse** |
+
+**On this premise G becomes the stronger option**, because ephemeral runners are the right answer
+to the persistence half of the self-hosted security shape, and under a shared cluster they cost
+almost nothing extra.
+
+**What is needed before deciding, and it is not an opinion:** the actual list of what is in that
+profile, what each instance does, and whether any of it is stateful. This document cannot assess a
+consolidation it has not seen.
+
+#### 🔴 The four T0 hosts must not be part of that consolidation
+
+Stated here because it is the one migration that would be actively wrong, and cost is not the
+reason.
+
+**The T0 fleet is four `t4g.small` in `us-east-1`, `eu-west-1`, `ap-southeast-1` and
+`ap-northeast-1` — three continents — and the geography IS the experiment.** The Phase B-WAN
+evidence pack rests on a **measured 68–223 ms RTT baseline** and on distributed finality forming
+across real intercontinental latency with no node holding a quorum. **An EKS cluster is regional.**
+Consolidating those four into one cluster collapses the RTT to intra-region single-digit
+milliseconds and **destroys the property the 48-hour soak was run to establish** — while leaving
+the net apparently healthy, which is this project's recurring shape once more.
+
+They are also live: the net is finalizing right now, and `qumbra-deploy`'s **R3 applies —
+*"changing instance types, adding hosts... ask, every time, and never infer approval from an
+earlier yes."*** Consolidating them is a destroy-and-recreate.
+
+**Everything else in the profile is a fair candidate. These four are not**, and if they were in the
+count that motivated the idea, the arithmetic needs redoing without them.
+
+### The sizing lever nobody has pulled, which applies to A, C, F and G alike
+
+Found while assessing G, and it is worth more than the choice between them.
+
+**`--test-threads=1` means core count cannot help** — the workflow's own header records this:
+*"an arm64 core is ~1.8× slower than the M3 Max at single-threaded work, and `--test-threads=1`
+means core count cannot help. 34 minutes is this runner's floor; there is no cache fix to find."*
+
+The measured profile of the suite is therefore:
+
+| | measured | source |
+|---|---|---|
+| peak RSS | **16.33 GB** | `/usr/bin/time -v` on the `PR #202` and `#195` runs |
+| wall clock | **34–38 min** | same runs |
+| useful parallelism | **1** | `-- --test-threads=1`, non-negotiable per `CLAUDE.md` §5 |
+
+🔴 **The current runner is 8 cores. The suite can use one.** Seven of them are paid for and idle
+for 35 minutes, every run. The binding constraint is **memory — ~32 GB to hold a 16.33 GB peak with
+headroom** — and single-thread speed. Not core count.
+
+**So on any self-hosted option, the instance to price is a few fast cores with 32 GB, not an
+8-core.** A `4 vCPU / 32 GB` Graviton type would run this suite at the same wall clock as an
+`8 vCPU / 32 GB` one and cost meaningfully less. **This lever has never been pulled and is
+independent of where the runner lives** — it is a property of the workload, established by
+measurement, and it is the reason a per-minute comparison between hosting options is the wrong
+first question.
+
+*(It cannot be pulled on option A: GitHub's larger-runner catalogue is sized by core count, so
+paying for 8 cores is the price of getting 32 GB there.)*
+
 ### D. Rig only — delete CI
 
 Saves everything and gives up R1. The coordinator would again be the sole producer and sole judge
@@ -270,8 +389,17 @@ actually merges, not the rate at which builders push. That may well be affordabl
 would make C's maintenance burden unjustified. **That arithmetic cannot be done before B, because
 today's number is dominated by runs nobody reads.**
 
-**Not recommended: D**, for the reason in §7. **Not assessed here: E**, because it is not a CI
-question.
+**Not recommended: D**, for the reason in §7. **G is now conditional, not rejected** — its control-plane fee is ~3.5× this whole budget *if CI
+must justify it*, and **not chargeable to CI at all if the cluster exists anyway**, which Larry
+raised as a live possibility on 2026-08-02 (§7G). On that premise G overtakes F, on ephemeral
+runners. **The four T0 hosts are excluded from any such consolidation — see §7G, and the reason is
+correctness, not cost.** **Not
+assessed here: E**, because it is not a CI question.
+
+**And before pricing any of them, pull the sizing lever.** §7G's closing subsection establishes by
+measurement that the suite uses **one core** and needs **32 GB**, so seven of the current runner's
+eight cores are paid for and idle every run. **The instance to price is `4 vCPU / 32 GB`, not
+8-core** — which changes the arithmetic of C, F and G before the choice between them is even made.
 
 **Separately, and larger than everything above: read the AWS bill.** §7F establishes that four
 on-demand instances have been running continuously for 161 hours across four regions with no
@@ -285,7 +413,10 @@ should be sized against *that*, with CI riding it rather than justifying it.
 | | owner |
 |---|---|
 | The `$20` budget: raise, hold, or hold-and-cut-usage | **Larry (R3)** |
-| Whether to move off GitHub-hosted at all | **Larry**, informed by §7F (§7C is the weaker AWS option) |
+| Whether to move off GitHub-hosted at all | **Larry**, informed by §7F (§7C and §7G are the weaker options) |
+| **Sizing any self-hosted instance at 4 vCPU / 32 GB rather than 8-core** | coordinator, once a host is chosen — measured, see §7G |
+| **Whether the `default` profile's other EC2 workloads consolidate into EKS** | **Larry** — not a CI decision; CI only rides the outcome (§7G) |
+| Confirming the T0 four are excluded from that consolidation | **Larry (R3)** — §7G says why they must be |
 | **Whether to buy a Savings Plan, and sized against what** | **Larry (R3)** — see §7F: the T0 fleet, not CI, is the workload that fits one |
 | **Reading the actual AWS bill for the T0 fleet** | unassigned, and it is the largest unmeasured number in this document |
 | Repo visibility | **Larry** |
