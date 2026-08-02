@@ -23,7 +23,7 @@
 `TELEMETRY_REFRESH` 输出到 stdout。字段顺序就是 `run.rs:996` 那个 `format!`：
 
 ```
-TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= prest=
+TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= prest= bdrop=
 ```
 
 ⚠️ **上面是字段清单，不是一次采样。** 本文中作为「实测」引用的数值，只有标注了具体
@@ -85,7 +85,18 @@ issue 或证据包出处的那些；其余全部由源码推导。拼一条「�
 | 24 | `stipid` | 已应用链尖的身份 | 🟡 不单独 |
 | 25 | `schain` | `main` / `fork` / `-` | 🔴 **是 —— `schain=fork`** |
 | 26 | `breq` | 当前在途的历史区块体请求数 | 🟡 不单独 |
-| 27 | `prest` | 进程启动时恢复的委员会惩罚 | 🟡 不单独 |
+| 27 | `fback` | ⛔ **本文未收录** —— 2026-08-01 由 `issue #85` 追加 | — |
+| 28 | `prest` | 进程启动时恢复的委员会惩罚 | 🟡 不单独 |
+| 29 | `bdrop` | `<总数>@<高度>` —— 状态机拒绝的区块体，以及拒在哪里 | 🟡 不单独 —— **把高度对着 `stip=` 读** |
+
+⚠️ **实际行上还有一个字段在本文没有小节：`fback=`。** 上表点名而不是省略它，是为了让冷遇
+它的运维知道：它是 **未被记录**，而不是 **本项目不认识** —— 这正是本文开头那次 `rback=`
+失败花了两份报告才学到的区别。
+
+⚠️ **另外，上面的编号在此之前一直错了一位**，而对一份第一条规则就是「这一行是位置相关的」
+的文档来说，这比听上去要紧：`fback=` 在真实行上位于 `breq=` 与 `prest=` 之间，所以原先编号
+为 26/27 的 `breq`/`prest` 实际是 26 和 **28**。在这里更正，是加入第 29 行的前提 —— 一份带
+洞的位置索引，会让洞之后的每一行都指向错误的字段。
 
 ---
 
@@ -953,7 +964,7 @@ discovery，所以收款方找不到自己的输出（见 `CLAUDE.md` 的 T1 条
 
 ---
 
-## 27. `prest` —— 进程启动时恢复的委员会惩罚（触及 TELEMETRY）
+## 28. `prest` —— 进程启动时恢复的委员会惩罚（触及 TELEMETRY）
 
 **🟡 不单独。** 非零值是本机 ledger 的本地事实；跨主机比较才是负载相关的读法。
 
@@ -990,6 +1001,57 @@ discovery，所以收款方找不到自己的输出（见 `CLAUDE.md` 的 T1 条
 `prest=0/0`）、`a_committee_punishment_survives_a_restart_through_the_run_path`（`run.rs`，重启后期望
 `prest=1/1`）、`a_non_witness_finalizes_a_checkpoint_the_restarted_witness_refuses`
 （`adapter.rs` —— 本地 ledger 无法闭合的双节点同高度分歧）。
+## 29. `bdrop` —— 状态机拒绝的区块体，以及拒在哪里
+
+**🟡 单独不是告警。把高度对着 `stip=` 读。**
+
+**它统计什么。** `<总数>@<高度>`：本节点自己的状态机**在应用漏斗处拒绝**的区块体数量，
+自进程启动累计，并附上**最近一次拒绝所在的链上高度**。`bdrop=0@-` 表示一次都没拒过；这个
+`-` 是「没有可陈述的数值」那个约定，它和高度 `0` 不是同一个断言（创世就是高度 0）。见
+`NodeAdapter::body_refusals` 与 `bdrop_field`（`run.rs`）。
+
+**这个字段为什么存在。** 在 `issue #130 (b)` 之前，这次拒绝是一个 `Err(_) => {}` 分支，上面
+挂着一句说这个丢弃是预期的注释，而且哪里都没有计数器、没有字段。**一个把递给它的每一个区块
+体都丢掉的节点，打印出来的东西和健康节点一模一样。** #130 记下了这正是它比那一周同形状的另
+外四个缺陷都更糟的原因：*「其他每一例都是沉默；这一例是有注释替它背书的沉默。」*
+
+**为什么是高度而不是速率。** 累计总数回答的是*有多少*，回答不了*现在还在不在发生*，而这两者
+需要相反的响应。一行遥测没有上一份采样可以做差；链上时间在这里也没有墙钟锚点（创世被固定为
+`timestamp = 0` 以保证创世哈希可复现 —— `issue #106`）。高度是这行上本来就有的单调量，所以
+这个比较靠肉眼、在一份采样里就能完成。
+
+**正常值。** `0@-`。
+
+**变化意味着什么 —— 要成对读：**
+
+| 读数 | 判定 |
+|---|---|
+| `bdrop=0@-` | 什么都没被拒 |
+| `bdrop=N@H`，`H` 远低于 `stip=` | 一阵**已经过去**的爆发。记下 `N` 和 `H`；不要只凭总数升级 |
+| `bdrop=N@H`，`H` 就在 `stip=` 旁边 | 🟡 这个节点**此刻**正在拒绝区块体，而且只要还在拒，`slag=` 就不会收敛 |
+| `N` 在多次采样间上升 | 🟡 持续拒绝 —— 上报前先从 `/metrics` 取按原因的拆分 |
+
+**按原因的拆分在 `/metrics` 上，不在这一行：**
+`qumbra_body_apply_refused_total{reason=…}`，取值为 `not_extending_tip`、`bad_body`、
+`nullifier_spent`、`persist_io`、`internal`。
+
+🔴 **这五个原因里有两个必须永远为零。** `reason="not_extending_tip"` 与
+`reason="internal"` 是**不变量绊线**：`apply_block` 在生产上唯一的调用方，是用第一个错误
+触发条件的严格否定来挑选它要应用的区块体的，所以一次非零的抓取意味着**本节点自己代码**里的
+缺陷，而不是一种网络状况。**上报它；这不是一个运维动作。** 另外三个（`bad_body`、
+`nullifier_spent`、`persist_io`）是真会发生的 —— 前两个意味着某个对端送来了区块体过不了校验
+的链，第三个是 `issue #104` 的形状：一条已经悄悄不再持久的持久链。
+
+**何时升级：** `/metrics` 上 `not_extending_tip` 或 `internal` 非零（上报，不要动手）；或者
+总数在上升且高度贴着 `stip=` 走了好几次采样。
+
+**由这些测试锁定：** `a_body_refused_at_the_application_funnel_is_counted_and_located`
+与 `i130b_a_held_body_that_does_not_extend_the_applied_tip_never_reaches_apply_block`
+（`adapter.rs`）、`every_apply_failure_classifies_to_a_declared_refusal_reason`
+（`qlab-node/src/node.rs`）、
+`every_body_refusal_reason_is_a_series_from_the_first_scrape`
+（`qlab-node/src/metrics.rs`）、
+`bdrop_renders_the_count_and_the_height_of_the_last_refusal`（`run.rs`）。
 
 ---
 
