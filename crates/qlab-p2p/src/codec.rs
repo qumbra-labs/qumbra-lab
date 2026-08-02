@@ -223,6 +223,44 @@ pub fn checkpoint_id(cp: &Checkpoint) -> Hash32 {
     keccak256(&cp.signing_message())
 }
 
+/// The 24-byte tag that marks an [`InvKind::Checkpoint`] id as a **query** rather
+/// than a checkpoint id (issue #204).
+///
+/// A checkpoint id is `keccak256(signing_message)`; this tag fixes 192 bits of the
+/// 256-bit id space to a constant, so a real checkpoint id colliding with the query
+/// namespace is a 2⁻¹⁹² event. The remaining 8 bytes carry the queried height,
+/// big-endian, so the id stays byte-ordered by height and is trivially readable in
+/// a hexdump.
+pub const CHECKPOINT_QUERY_TAG: [u8; 24] = *b"qumbra:cp-at-or-below:v1";
+
+/// Build the `GetData(InvKind::Checkpoint, …)` id that means **"the highest
+/// finalized checkpoint you hold at height ≤ `height`"** (issue #204).
+///
+/// The gap #204 names is that `GetData(Checkpoint, id)` requires the requester to
+/// already know the checkpoint's id, and a node that never accumulated the quorum
+/// does not. This is the same door #130 (c) opened for block bodies: the *request*
+/// is unchanged and already understood by every deployed node, and only what it
+/// answers with changes. A node running the current image answers `NotFound` (it
+/// holds no checkpoint under this id), which the requester deliberately does not
+/// score — see [`crate::node::P2pNode::on_not_found`].
+pub fn checkpoint_query_id(height: u64) -> Hash32 {
+    let mut id = [0u8; 32];
+    id[..24].copy_from_slice(&CHECKPOINT_QUERY_TAG);
+    id[24..].copy_from_slice(&height.to_be_bytes());
+    id
+}
+
+/// The height an id built by [`checkpoint_query_id`] asks about, or `None` if the
+/// id is an ordinary checkpoint id.
+pub fn checkpoint_query_height(id: &Hash32) -> Option<u64> {
+    if id[..24] != CHECKPOINT_QUERY_TAG {
+        return None;
+    }
+    let mut h = [0u8; 8];
+    h.copy_from_slice(&id[24..]);
+    Some(u64::from_be_bytes(h))
+}
+
 /// Encode a `CheckpointVotes` (0x0024) body — a checkpoint plus a **partial** vote
 /// set that nodes accumulate to a quorum (M10-T0-5). The body is byte-identical to
 /// the [`MsgType::Checkpoint`] body ([`encode_checkpoint_msg`]); only the envelope

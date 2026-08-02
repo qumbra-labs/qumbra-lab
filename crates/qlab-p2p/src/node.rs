@@ -5,7 +5,7 @@
 //! over the in-process and TCP transports, so tests are deterministic in-process
 //! and identical over the socket.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use qlab_devnet::committee::{Checkpoint, Vote};
 use qlab_devnet::body::{BlockBody, TxEntry};
@@ -13,7 +13,7 @@ use qlab_devnet::ebbflow::EquivocationEvidence;
 use qlab_devnet::header::{BlockHeader, Hash32};
 
 use crate::codec::{
-    checkpoint_id, decode_checkpoint_msg, decode_checkpoint_votes, decode_evidence_msg,
+    checkpoint_id, checkpoint_query_height, checkpoint_query_id, decode_checkpoint_msg, decode_checkpoint_votes, decode_evidence_msg,
     decode_headers, decode_inv, decode_locator, decode_tx, encode_checkpoint_msg,
     encode_checkpoint_votes, encode_evidence_msg, encode_headers, encode_inv, encode_locator,
     encode_tx, evidence_id, tx_id, InvItem, InvKind,
@@ -31,6 +31,8 @@ use crate::n1::{IngestOutcome, NodeState, VotesOutcome};
 use crate::peer::{NodeId, PeerId, PeerTable, VersionMsg};
 use crate::ratelimit::{RateKey, RateLimiter, RateLimits, RateStats};
 use crate::sync::{build_locator, answer_get_headers, SyncPhase, SyncState, MAX_HEADERS_PER_BATCH};
+use qlab_devnet::finality::next_checkpoint_height;
+use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
 use crate::transport::{DialCompletion, DialStart, Transport, TransportError};
 use crate::wire::{Envelope, MsgType};
 
@@ -130,6 +132,50 @@ pub const BODY_REQUEST_TIMEOUT_MS: u64 = 15_000;
 ///
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
 pub const MAX_BODIES_PER_GETDATA: usize = 16;
+
+/// **How long an unanswered finalized-checkpoint query is held before it may be
+/// re-asked** (issue #204), and therefore the ceiling on how often this node asks.
+///
+/// Same contract as [`BODY_REQUEST_TIMEOUT_MS`]: it is a re-ask interval, not a
+/// failure verdict, and nothing is scored when it expires — a peer that has not
+/// finalized anything above our head, or one running an image that predates this
+/// query, is being honest. Matched to
+/// [`crate::ratelimit::CHECKPOINT_QUERY_SERVE_INTERVAL_MS`] so an honest requester
+/// at its own rate is never throttled by an honest server.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const CHECKPOINT_QUERY_INTERVAL_MS: u64 = 5_000;
+
+/// **How many finalized-checkpoint queries this node will have outstanding at
+/// once** (issue #204).
+///
+/// One. The answer is a whole quorum vote set (~70 KB at the T0 committee size),
+/// the queries are all asking the same question, and a second concurrent answer
+/// could not advance the finalized pointer further than the first — `try_finalize`
+/// is strictly advancing, so the second is `NotAdvancing` at best. Fanning out
+/// would buy nothing and cost a multiple of the largest response on this wire.
+/// The peer asked rotates ([`P2pNode::cp_query_rr`]), so one silent peer costs one
+/// interval rather than the whole recovery.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_CHECKPOINT_QUERIES_IN_FLIGHT: usize = 1;
+
+/// **How far this node's own chain must run past a checkpoint slot it has not
+/// finalized before it asks the net about it** (issue #204), in cadences.
+///
+/// The hysteresis is chain-derived rather than a wall-clock grace period — #106's
+/// preference, and for the same reason: a wall clock has no anchor a cold or
+/// wedged node can trust. One full cadence means the ordinary path (sign → push →
+/// accumulate → quorum) has had an entire slot's worth of chain to deliver and did
+/// not, which on a healthy net never happens: the quorum forms within seconds of
+/// the slot height, long before the next slot's blocks are mined.
+///
+/// `1` is deliberately the smallest value that is not zero. At zero the query
+/// would fire on every node between "tip crossed the slot" and "the votes
+/// converged", i.e. constantly, on a perfectly healthy net.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const CHECKPOINT_QUERY_LAG_CADENCES: u64 = 1;
 
 /// One cached body: the ordered txs, the coinbase counter and the payout key —
 /// all three are needed to rebuild the *exact* body (issue #101) — plus the
@@ -246,6 +292,13 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// `GetData(Checkpoint)` can be re-served (checkpoints, unlike headers/txs,
     /// are not reconstructable from other state).
     checkpoints: HashMap<Hash32, (Checkpoint, Vec<Vote>)>,
+    /// Height index over [`Self::checkpoints`] (issue #204): finalized height →
+    /// checkpoint id. One entry per height by construction — `try_finalize` is
+    /// strictly advancing, so this node can never have finalized two variants at
+    /// one height. It exists so the #204 query ("the highest finalized checkpoint
+    /// you hold at height ≤ H") is a `BTreeMap` range lookup rather than a scan of
+    /// an unbounded map on a path a peer can drive.
+    checkpoints_by_height: BTreeMap<u64, Hash32>,
     /// Peer discovery: the address book + dial policy (issue #83). Seeds are fed
     /// in by the operator; learned addresses arrive over `Addr`.
     addrs: AddrManager,
@@ -269,6 +322,20 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// merely timed out). Fed into [`crate::n1::ChainView::observe_body_fetch`] so
     /// the unobtainable-body exemption keys on exhaustion, not on lag alone.
     body_fetch_progress: bool,
+    /// **Finalized-checkpoint queries we have outstanding** (issue #204): query id
+    /// → the `now_ms` the ask was sent at. Bounded by
+    /// [`MAX_CHECKPOINT_QUERIES_IN_FLIGHT`]; an entry older than
+    /// [`CHECKPOINT_QUERY_INTERVAL_MS`] is dropped so the question may be asked
+    /// again, of a different peer.
+    ///
+    /// Like [`Self::body_reqs`], it is also the list [`Self::on_not_found`] reads:
+    /// a peer that holds nothing above our finalized head answers `NotFound`
+    /// honestly, and so does every node running an image that predates this query.
+    /// Scoring either would ban honest peers — #130 (c)'s finding, in a new place.
+    cp_queries: HashMap<Hash32, u64>,
+    /// Rotation cursor for the peer a query is sent to, so one peer that cannot or
+    /// will not answer costs one interval rather than the whole recovery.
+    cp_query_rr: usize,
 }
 
 impl<T: Transport, N: NodeState> P2pNode<T, N> {
@@ -286,11 +353,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             blocks: ServedBodies::new(),
             pending_blocks: HashMap::new(),
             checkpoints: HashMap::new(),
+            checkpoints_by_height: BTreeMap::new(),
             addrs: AddrManager::new(),
             limiter: RateLimiter::default(),
             body_reqs: HashMap::new(),
             body_rr: 0,
             body_fetch_progress: false,
+            cp_queries: HashMap::new(),
+            cp_query_rr: 0,
         }
     }
 
@@ -330,6 +400,20 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// serve me" from "I never asked".
     pub fn body_requests(&self) -> usize {
         self.body_reqs.len()
+    }
+
+    /// Finalized-checkpoint queries in flight right now (issue #204) — an
+    /// instantaneous level, not a total, capped at
+    /// [`MAX_CHECKPOINT_QUERIES_IN_FLIGHT`].
+    ///
+    /// Operator-visible for `breq=`'s reason, one layer up: `final=` standing still
+    /// while `tip=` climbs is the symptom, and this is the only field that
+    /// separates *this node has not noticed* from *this node is asking and nobody
+    /// is answering*. The incident that produced #204 printed the first reading on
+    /// every sample for hours and there was no field that could have said which it
+    /// was.
+    pub fn checkpoint_queries(&self) -> usize {
+        self.cp_queries.len()
     }
     pub fn addrs_mut(&mut self) -> &mut AddrManager {
         &mut self.addrs
@@ -552,6 +636,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// it via the `Checkpoint` inv path (so late joiners can `getdata` the full set).
     fn store_and_announce_finalized(&mut self, cp: Checkpoint, votes: Vec<Vote>, except: Option<PeerId>) {
         let id = checkpoint_id(&cp);
+        self.checkpoints_by_height.insert(cp.height, id);
         self.checkpoints.insert(id, (cp, votes));
         self.seen.insert(id);
         self.relay_inv(InvItem { kind: InvKind::Checkpoint, id }, except);
@@ -643,6 +728,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
         self.maybe_start_sync();
         self.request_missing_bodies(now_ms);
+        self.request_finalized_checkpoint(now_ms);
         // Issue #200: after (re)issuing asks, hand the duty-gate exemption the
         // facts it keys on — outstanding asks + whether any ask was satisfied
         // this tick. Progress is cleared for the next tick so a single delivery
@@ -721,6 +807,108 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
     }
 
+    // --- issue #204: asking the net what it finalized ------------------------
+
+    /// The highest finalized checkpoint this node holds at height ≤ `at_or_below`,
+    /// with the full vote set that finalized it — the answer to a #204 query.
+    ///
+    /// Reads [`Self::checkpoints`], the store that already backed
+    /// `GetData(Checkpoint)` re-serving, through its height index. **It is what
+    /// this node finalized in this process, not what it believes**: a checkpoint
+    /// only enters that store via `store_and_announce_finalized`, i.e. after the
+    /// unchanged `try_finalize` accepted a quorum here. A node cannot forward a
+    /// claim it never verified, because it never holds one.
+    ///
+    /// 🔴 The corollary, stated because it bounds the fix: the votes are **not
+    /// persisted anywhere**, so a peer that restarted holds nothing to serve until
+    /// it finalizes again. See the PR body — this is a reported limitation, not a
+    /// silent one.
+    fn finalized_at_or_below(&self, at_or_below: u64) -> Option<(Checkpoint, Vec<Vote>)> {
+        let (_, id) = self.checkpoints_by_height.range(..=at_or_below).next_back()?;
+        self.checkpoints.get(id).cloned()
+    }
+
+    /// **The slot this node's own chain says it should have finalized and has
+    /// not** — the trigger for a #204 query, or `None` when there is nothing to
+    /// ask about.
+    ///
+    /// [`next_checkpoint_height`] is the first cadence slot strictly above the
+    /// finalized head and at or below the tip: exactly "a slot my chain has passed
+    /// that my finalized pointer has not". The hysteresis
+    /// ([`CHECKPOINT_QUERY_LAG_CADENCES`]) is what keeps a healthy node silent —
+    /// tip crossing a slot before its votes converge is ordinary, tip running a
+    /// whole further cadence past it is not.
+    ///
+    /// The returned height is the **tip**, not the slot: the query asks for the
+    /// highest finalized checkpoint at or below it, so one round trip moves this
+    /// node as far as its own chain can carry it instead of one slot at a time.
+    /// Capping at the tip is also what keeps the answer usable — a checkpoint above
+    /// our tip is outside the tally window `(finalized, tip + TALLY_TIP_SLACK]` and
+    /// would be dropped as `Stale`, and we would not hold its block to finalize
+    /// against anyway.
+    ///
+    /// **This is the comparison issue #204 asked to become somebody's job.** It is
+    /// `tip` against `final=`, not `sslot` against `final=`: a node that signed
+    /// slot S necessarily has a tip at or above S, so this fires for the signing
+    /// host the incident was about *and* for a keyless one, which has no `sslot` to
+    /// compare. It fires a cadence later than an `sslot`-keyed check would; see the
+    /// PR body for why that trade was taken.
+    fn checkpoint_query_target(&self) -> Option<u64> {
+        let tip = self.node.tip_height();
+        let next =
+            next_checkpoint_height(self.node.finalized_height(), tip, CHECKPOINT_CADENCE_BLOCKS)?;
+        let lag = CHECKPOINT_QUERY_LAG_CADENCES.saturating_mul(CHECKPOINT_CADENCE_BLOCKS);
+        if tip < next.saturating_add(lag) {
+            return None;
+        }
+        Some(tip)
+    }
+
+    /// **Ask one peer what it has finalized at or below our tip** (issue #204).
+    ///
+    /// The gap #204 names is that nothing could ask: `set_finalized` has exactly one
+    /// caller, the vote-tally path, so the only way a node learned a checkpoint was
+    /// final was by accumulating the quorum itself — and the tally is not persisted,
+    /// rebuilds only from re-gossip, and gossip is push-once. A node that missed the
+    /// window for a slot had no message it could send. This is that message.
+    ///
+    /// Four bounds, all named constants:
+    ///
+    /// 1. [`MAX_CHECKPOINT_QUERIES_IN_FLIGHT`] outstanding asks at once;
+    /// 2. one ask per [`CHECKPOINT_QUERY_INTERVAL_MS`], and the server has its own
+    ///    matching budget ([`crate::ratelimit::CHECKPOINT_QUERY_SERVE_INTERVAL_MS`]);
+    /// 3. the trigger itself is self-clearing — [`Self::checkpoint_query_target`]
+    ///    goes `None` the moment the finalized pointer catches its own chain up, so
+    ///    **the node stops asking because the reason to ask is gone**, not because a
+    ///    timer expired. That is the termination argument;
+    /// 4. nothing is asked with no ready peer to ask.
+    ///
+    /// **No reply is not a fault.** A peer with nothing finalized above our head
+    /// answers `NotFound` honestly, and so does one running an image that predates
+    /// this query. Nothing on this path is scored.
+    fn request_finalized_checkpoint(&mut self, now_ms: u64) {
+        self.cp_queries
+            .retain(|_, sent| now_ms.saturating_sub(*sent) < CHECKPOINT_QUERY_INTERVAL_MS);
+        if self.cp_queries.len() >= MAX_CHECKPOINT_QUERIES_IN_FLIGHT {
+            return;
+        }
+        let Some(at_or_below) = self.checkpoint_query_target() else {
+            return;
+        };
+        let id = checkpoint_query_id(at_or_below);
+        if self.cp_queries.contains_key(&id) {
+            return;
+        }
+        let peers = self.peers.ready_peers();
+        if peers.is_empty() {
+            return;
+        }
+        let pid = peers[self.cp_query_rr % peers.len()];
+        self.cp_query_rr = self.cp_query_rr.wrapping_add(1);
+        self.cp_queries.insert(id, now_ms);
+        self.send(pid, MsgType::GetData, encode_inv(&[InvItem { kind: InvKind::Checkpoint, id }]));
+    }
+
     /// The body this node can serve for `hash`: the hot relay cache first, then
     /// everything the node state **holds** — the same two sources, in the same
     /// order, that [`Self::on_get_block_txn`] already reads (issue #135). Stated
@@ -775,7 +963,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             MsgType::Addr => self.on_addr(from, &env.payload),
             MsgType::Inv => self.on_inv(from, &env.payload),
-            MsgType::GetData => self.on_getdata(from, &env.payload),
+            MsgType::GetData => self.on_getdata(from, &env.payload, key, now_ms),
             MsgType::NotFound => self.on_not_found(from, &env.payload),
             MsgType::Tx => self.on_tx(from, &env.payload),
             MsgType::Header => self.on_header(from, &env.payload),
@@ -866,12 +1054,22 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         };
         // Charge once per message, not per item, matching the pre-#130 (c) behaviour
         // for a message this node did not originate as a body request.
-        if items.iter().any(|it| !self.body_reqs.contains_key(&it.id)) {
+        //
+        // Issue #204 widens the same exemption to the finalized-checkpoint query.
+        // `NotFound` is the **correct and expected** answer from two honest peers:
+        // one that has finalized nothing above our head, and one running an image
+        // that predates the query and so holds no checkpoint under that id. On a
+        // net that upgrades one host at a time the second is the common case, and
+        // charging it would ban every peer that has not been rolled yet.
+        if items
+            .iter()
+            .any(|it| !self.body_reqs.contains_key(&it.id) && !self.cp_queries.contains_key(&it.id))
+        {
             self.peers.penalize(from, PENALTY_WELSHED_INV);
         }
     }
 
-    fn on_getdata(&mut self, from: PeerId, payload: &[u8]) {
+    fn on_getdata(&mut self, from: PeerId, payload: &[u8], key: RateKey, now_ms: u64) {
         let items = match decode_inv(payload) {
             Ok(i) => i,
             Err(_) => {
@@ -934,11 +1132,57 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                     }
                     None => not_found.push(it),
                 },
-                InvKind::Checkpoint => match self.checkpoints.get(&it.id) {
-                    Some((cp, votes)) => {
-                        self.send(from, MsgType::Checkpoint, encode_checkpoint_msg(cp, votes))
+                // **The door #204 opens, and — like #130 (c) — it needed no new
+                // envelope type and no new `InvKind`.**
+                //
+                // `GetData(Checkpoint, id)` could only ever be sent by a node that
+                // already knew the checkpoint's id, which it learns from the `Inv`
+                // that follows a finalize. A node whose own tally never reached
+                // quorum for that slot never saw that inv, and the tally is
+                // deliberately not persisted and rebuilds only from re-gossip —
+                // and nothing re-gossips a slot the rest of the net settled hours
+                // ago. So the one thing such a node could not do is **ask**.
+                //
+                // A query id ([`checkpoint_query_id`]) names a height instead of a
+                // checkpoint, and the answer is the highest finalized checkpoint
+                // this node holds at or below it — carried by `MsgType::Checkpoint`
+                // (0x0022), the message both sides have understood since M9, with
+                // its full quorum vote set. Both mixed-version directions degrade
+                // to the status quo: a NEW node asking an OLD one gets `NotFound`
+                // and does not score it (see `on_not_found`), and an OLD node never
+                // sends a query id at all. Neither side sees an unknown type, which
+                // on this net is `PENALTY_MALFORMED` (100) against a `BAN_THRESHOLD`
+                // of −100 — an instant, one-frame ban (#181).
+                //
+                // 🔴 The answer is **evidence, not a verdict**. It re-enters through
+                // the same `on_checkpoint` → `absorb_votes` →
+                // `ingest_checkpoint_votes` path as any gossiped set, so the
+                // unchanged `try_finalize` re-verifies roster membership, every
+                // signature and the count against quorum before anything moves.
+                // Nothing here can make a peer's claim load-bearing.
+                InvKind::Checkpoint => match checkpoint_query_height(&it.id) {
+                    Some(at_or_below) => {
+                        // The amplifier gate (#91's shape): a 45 B request against a
+                        // ~70 KB answer. Over-rate queries are dropped in silence —
+                        // NOT `NotFound`, which the receiver scores.
+                        if !self.limiter.may_serve_cp_query(key.clone(), now_ms) {
+                            continue;
+                        }
+                        match self.finalized_at_or_below(at_or_below) {
+                            Some((cp, votes)) => self.send(
+                                from,
+                                MsgType::Checkpoint,
+                                encode_checkpoint_msg(&cp, &votes),
+                            ),
+                            None => not_found.push(it),
+                        }
                     }
-                    None => not_found.push(it),
+                    None => match self.checkpoints.get(&it.id) {
+                        Some((cp, votes)) => {
+                            self.send(from, MsgType::Checkpoint, encode_checkpoint_msg(cp, votes))
+                        }
+                        None => not_found.push(it),
+                    },
                 },
             }
         }

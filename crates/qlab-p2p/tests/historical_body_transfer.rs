@@ -654,10 +654,24 @@ fn a_getdata_asking_for_more_bodies_than_the_cap_gets_headers_for_the_remainder(
 
     let (mut bodies, mut headers, mut not_found) = (0, 0, 0);
     for (_, raw) in client.transport().poll() {
-        match Envelope::decode(&raw).expect("well-formed").msg_type {
+        let env = Envelope::decode(&raw).expect("well-formed");
+        match env.msg_type {
             MsgType::BlockAnnounce => bodies += 1,
             MsgType::Header => headers += 1,
-            MsgType::NotFound => not_found += 1,
+            // Issue #204: the count is scoped to BLOCK items, which is what this
+            // test is about. Both nodes now also ask each other what they have
+            // finalized, and on a chain with no checkpoint at all that query is
+            // honestly answered `NotFound` — an item of kind `Checkpoint`, from a
+            // different request, exempt from scoring on the requester's side. The
+            // assertion below still says exactly what it said before: over-asking
+            // for BODIES is never answered with a scored refusal.
+            MsgType::NotFound => {
+                not_found += qlab_p2p::codec::decode_inv(&env.payload)
+                    .expect("well-formed")
+                    .iter()
+                    .filter(|it| it.kind == InvKind::Block)
+                    .count()
+            }
             _ => {}
         }
     }
