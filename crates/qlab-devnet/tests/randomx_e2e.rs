@@ -60,7 +60,7 @@ fn randomx_key_block_seed_actually_rotates() {
         node.mine_next([h as u8; 32]).unwrap();
     }
     let chain = node.chain();
-    let genesis: Hash32 = chain.genesis_hash();
+    let genesis: Hash32 = chain.genesis_block_hash();
     let tip = chain.tip_hash();
 
     // Early block (height 1) is bootstrap-keyed from genesis.

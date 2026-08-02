@@ -120,7 +120,7 @@ pub fn build_locator(view: &dyn ChainView) -> Locator {
         height -= step;
     }
     // Always finish with genesis so there is always a common ancestor.
-    have.push(view.genesis_hash());
+    have.push(view.genesis_block_hash());
     Locator { have, stop: ZERO_HASH }
 }
 
@@ -193,7 +193,7 @@ mod tests {
         let loc = build_locator(&node);
         // First entry is the tip; last is genesis.
         assert_eq!(loc.have.first().copied(), node.main_chain_hash_at(50));
-        assert_eq!(loc.have.last().copied(), Some(node.genesis_hash()));
+        assert_eq!(loc.have.last().copied(), Some(node.genesis_block_hash()));
         // Far fewer than 50 entries thanks to exponential back-off.
         assert!(loc.have.len() < 25, "locator has {} entries", loc.have.len());
     }

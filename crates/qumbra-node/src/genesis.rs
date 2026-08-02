@@ -442,6 +442,23 @@ impl GenesisFile {
 
     /// The genesis hash: keccak256 over the file's canonical bincode. This is the
     /// value printed on `genesis init` and asserted on startup.
+    ///
+    /// **This is "the genesis hash" in the operational sense** — the number
+    /// pinned as `expected_genesis_hash` in every node config, quoted in
+    /// `qumbra-deploy/OPERATOR.md` and in every roll task book, and the one that
+    /// answers *is this host on the same net*. It covers the whole file:
+    /// network name, the FROZEN v1.0 table, all 21 committee keys, **and** the
+    /// genesis block.
+    ///
+    /// 🔴 **A second, different value also identifies genesis, and comparing the
+    /// two is meaningless** (issue #206). The genesis **block header** hash —
+    /// `qlab_devnet::ChainState::genesis_block_hash()`, persisted as
+    /// `qlab_node::persist::Snapshot::genesis_block_hash` inside `snapshot.bin`
+    /// — hashes only the height-0 header. This file *contains* that block, so
+    /// the two values are structurally guaranteed to differ; a mismatch between
+    /// a decoded snapshot and the runbook is the expected state, not a net
+    /// mismatch. If you are here because a number did not match, that is
+    /// probably why — stop looking.
     pub fn hash(&self) -> Hash32 {
         let bytes = bincode::serialize(self).expect("GenesisFile is always serializable");
         qlab_devnet::hash::keccak256(&bytes)
@@ -751,6 +768,80 @@ mod tests {
                 "superseded identity — see this test's doc comment"
             );
         }
+    }
+
+    /// 🔴 **The two values both called "the genesis hash" are different values,
+    /// and each is what it claims to be** (issue #206). This is the assertion
+    /// that stops the next person collapsing them back together, and it sits
+    /// beside [`GenesisFile::hash`] because that is where a reader chasing a
+    /// mismatched number is most likely to be standing.
+    ///
+    /// - [`GenesisFile::hash`] — keccak256 over the **whole file's** canonical
+    ///   bincode. Printed by `genesis init`, pinned as `expected_genesis_hash`,
+    ///   quoted in `qumbra-deploy/OPERATOR.md`. Operationally *the* genesis hash.
+    /// - `Snapshot::genesis_block_hash` (inside `snapshot.bin`) — the genesis
+    ///   **block header** hash, from `ChainState::genesis_block_hash()`.
+    ///
+    /// The file *contains* the block, so the two are structurally guaranteed to
+    /// differ — asserted here by locating the block's own bincode inside the
+    /// file's. The `assert_ne!` is therefore not an incidental fact about two
+    /// hashes that happen not to collide; it is a consequence of the containment
+    /// this test also checks.
+    ///
+    /// The snapshot side is taken from a **real snapshot written by a real
+    /// node and decoded off disk**, not from a hand-built struct — the same act
+    /// an operator performs on a host that has come back wrong, which is the
+    /// situation #206 was filed from.
+    #[test]
+    fn the_file_hash_and_the_genesis_block_hash_are_different_values() {
+        let gf = GenesisFile::new_devnet_t0();
+
+        // (1) The file hash is keccak256 over the whole file's bincode.
+        let file_hash = gf.hash();
+        assert_eq!(
+            file_hash,
+            qlab_devnet::hash::keccak256(&gf.to_bytes()),
+            "GenesisFile::hash() must be keccak256 over the file's canonical bincode"
+        );
+
+        // (2) The block hash is the height-0 header's hash, and nothing else.
+        let block_hash = gf.genesis_block.header().header_hash();
+        assert_eq!(gf.genesis_block.header.height, 0, "the baked block is genesis");
+
+        // (3) They differ — and they differ *because* the file contains the block.
+        assert_ne!(
+            file_hash, block_hash,
+            "issue #206: the genesis FILE hash and the genesis BLOCK hash are \
+             different values; comparing them is meaningless"
+        );
+        let file_bytes = gf.to_bytes();
+        let block_bytes = bincode::serialize(&gf.genesis_block).expect("block serializes");
+        assert!(
+            file_bytes
+                .windows(block_bytes.len())
+                .any(|w| w == block_bytes.as_slice()),
+            "the genesis file's bincode must contain the genesis block's bincode — \
+             that containment is why the two hashes can never be equal"
+        );
+
+        // (4) A real node's snapshot carries the BLOCK hash, decoded off disk the
+        //     way an operator decodes it.
+        let dir = std::env::temp_dir().join(format!("qumbra-i206-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let node = qlab_node::Node::open(&dir, gf.genesis_block.clone()).expect("open node");
+        node.save_snapshot().expect("write snapshot");
+        let raw = std::fs::read(dir.join(qlab_node::SNAPSHOT)).expect("read snapshot.bin");
+        let snap: qlab_node::Snapshot = bincode::deserialize(&raw).expect("decode snapshot.bin");
+        assert_eq!(
+            snap.genesis_block_hash, block_hash,
+            "Snapshot::genesis_block_hash is the genesis BLOCK header hash"
+        );
+        assert_ne!(
+            snap.genesis_block_hash, file_hash,
+            "issue #206: snapshot.bin does NOT carry the value in OPERATOR.md — \
+             an operator comparing the two always sees a mismatch, and it means nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The genesis block inside the file **satisfies the header/body binding**

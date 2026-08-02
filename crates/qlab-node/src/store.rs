@@ -192,8 +192,14 @@ pub trait ChainStore {
     /// Store a fully-validated block, linking it to its parent and updating the
     /// tip per the heaviest-chain-gated-by-finality rule. Returns the block hash.
     fn put_block(&mut self, block: StoredBlock) -> Result<Hash32, InsertError>;
-    /// The genesis block hash.
-    fn genesis_hash(&self) -> Hash32;
+    /// The genesis **block header** hash (the root of the header DAG).
+    ///
+    /// 🔴 Not the operational "genesis hash" (issue #206): that is
+    /// `qumbra_node::genesis::GenesisFile::hash()` over the whole genesis
+    /// **file**, which is what `genesis init` prints and `expected_genesis_hash`
+    /// pins. The file contains the block, so the two always differ. Named
+    /// `genesis_hash` before #206.
+    fn genesis_block_hash(&self) -> Hash32;
     /// The current fork-choice tip hash.
     fn tip_hash(&self) -> Hash32;
     /// The tip height (main-chain length − 1).
@@ -411,7 +417,7 @@ impl ChainStore for MemChainStore {
         self.blocks.insert(hash, block);
         Ok(hash)
     }
-    fn genesis_hash(&self) -> Hash32 {
+    fn genesis_block_hash(&self) -> Hash32 {
         self.genesis
     }
     fn tip_hash(&self) -> Hash32 {
@@ -524,7 +530,7 @@ mod tests {
         let b2 = block(&b1.header(), 0xA2);
         let b3 = block(&b2.header(), 0xA3);
         let side = block(&g_header, 0xB2);
-        let mut main = vec![store.genesis_hash()];
+        let mut main = vec![store.genesis_block_hash()];
         for b in [b1, b2, b3] {
             main.push(store.put_block(b).expect("main chain inserts"));
         }
@@ -549,7 +555,7 @@ mod tests {
         assert!(!store.contains(&main[2]), "the abandoned suffix is gone");
         assert!(!store.contains(&main[3]));
         assert!(!store.contains(&side_hash), "and so is the side branch");
-        assert_eq!(store.genesis_hash(), main[0], "genesis identity is unchanged");
+        assert_eq!(store.genesis_block_hash(), main[0], "genesis identity is unchanged");
     }
 
     /// The reason the abandoned branch is **dropped** rather than left in place:

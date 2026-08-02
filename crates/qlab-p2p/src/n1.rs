@@ -165,7 +165,15 @@ impl VotesOutcome {
 
 /// Read-only view of the chain — the primitives sync/relay/serving need.
 pub trait ChainView {
-    fn genesis_hash(&self) -> Hash32;
+    /// The genesis **block header** hash — the locator tail every `GetHeaders`
+    /// falls back to.
+    ///
+    /// 🔴 Not the operational "genesis hash" (issue #206): that is
+    /// `qumbra_node::genesis::GenesisFile::hash()` over the whole genesis
+    /// **file**, printed by `genesis init` and pinned as
+    /// `expected_genesis_hash`. The file contains the block, so the two always
+    /// differ. Named `genesis_hash` before #206.
+    fn genesis_block_hash(&self) -> Hash32;
     fn tip_hash(&self) -> Hash32;
     fn tip_height(&self) -> u64;
     /// A header by its hash, if known (on any fork).
@@ -458,8 +466,8 @@ impl StubNode {
 }
 
 impl ChainView for StubNode {
-    fn genesis_hash(&self) -> Hash32 {
-        self.chain.genesis_hash()
+    fn genesis_block_hash(&self) -> Hash32 {
+        self.chain.genesis_block_hash()
     }
     fn tip_hash(&self) -> Hash32 {
         self.chain.tip_hash()
