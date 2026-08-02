@@ -1506,6 +1506,81 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **A log that no path can honour still refuses, whichever loop notices
+    /// first** — the load-bearing property of the #225 fall-through.
+    ///
+    /// The fall-through hands the decision to the from-genesis replay rather than
+    /// making it. So the way to check it cannot hide anything is to hand it a log
+    /// the replay itself refuses: `open` must still come back with a refusal and
+    /// a reason, not a node.
+    ///
+    /// The log here is **fabricated** — a live node cannot write it, because
+    /// `apply_block` applies at the tip only and `P` is out of the store by the
+    /// time `R` is appended. That is deliberate: it is the only way I could reach
+    /// the PREFIX loop's rewind refusal at all (verified by mutation: this test
+    /// is the only one that enters that branch). See the note on
+    /// [`MemNode::resume_from_snapshot`] and the PR body — I could not construct
+    /// a prefix-loop refusal that a full replay then survives, so that half of
+    /// the fall-through is not behaviourally distinguishable from the `?` it
+    /// replaced.
+    #[test]
+    fn a_log_the_replay_also_refuses_is_still_a_refusal_not_a_recovery() {
+        let dir = temp_dir("i225-prefix-rewind-refusal");
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let g_header = genesis.header();
+
+        // Three records: P and Q are siblings at height 1 (so Q's arrival is a
+        // rewind to genesis that drops P), then R at height 2 claims P as parent.
+        let mk = |parent: &BlockHeader, nf: u8| {
+            let body = BlockBody { txs: vec![tx([9u8; 32], nf)], coinbase: 0, coinbase_rkm: [0; 4] };
+            let header = child_committing_to(parent, &body);
+            let stored = StoredBlock {
+                header: StoredHeader::from(&header),
+                txs: body.txs.iter().map(|t| t.into()).collect(),
+                coinbase: 0,
+                coinbase_rkm: [0; 4],
+            };
+            (header, stored)
+        };
+        let (p_header, p) = mk(&g_header, 21);
+        let (_q_header, q) = mk(&g_header, 22);
+        let (_r_header, r) = mk(&p_header, 23);
+        assert_eq!(r.header.height, 2);
+        for rec in [&p, &q, &r] {
+            persist::append_record(&dir, &LogRecord::Block(rec.clone())).unwrap();
+        }
+
+        // A snapshot covering both heights, so the PREFIX loop sees all three.
+        persist::save_snapshot(&dir, &Snapshot {
+            format_version: FORMAT_VERSION,
+            genesis_block_hash: g_header.header_hash(),
+            applied_height: 2,
+            tip: r.header().header_hash(),
+            finalized: None,
+            commitments: Vec::new(),
+            nullifiers: Vec::new(),
+            roots_by_height: vec![(0, MemNode::in_memory(genesis.clone()).commitment_root())],
+        })
+        .unwrap();
+
+        // Both paths refuse, and `open` reports the replay's refusal rather than
+        // starting on a state neither path could reach.
+        assert!(
+            matches!(
+                MemNode::replay(&dir, genesis.clone()),
+                Err(NodeError::Rewind(RewindError::UnknownTarget))
+            ),
+            "the log itself is not replayable"
+        );
+        let err = match MemNode::open(&dir, genesis) {
+            Err(e) => e,
+            Ok(n) => panic!("open must not recover from it: tip {}", n.tip_height()),
+        };
+        assert!(matches!(err, NodeError::Rewind(RewindError::UnknownTarget)), "got {err}");
+        assert_eq!(err.to_string(), "rewind refused: rewind target is not a known block");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// **A genuinely corrupt log still refuses to start, with a reason** (issue
     /// #225's negative, upstream half).
     ///
