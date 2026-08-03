@@ -142,6 +142,23 @@ const BLCLOSE_COL: usize = BLC_OFF + 9; // 1: balance close gate
 const INJ3E_COL: usize = BLCLOSE_COL + 1; // 1: inj(acm) * ep
 const INJ4E_COL: usize = INJ3E_COL + 1; // 1: inj(acmout) * ep
 const EFF_OFF: usize = INJ4E_COL + 1; // 25: effective round input
+// --- issue #219 / QUM-69: the ROLE_BNF2 liveness latch (feature `q69-latch`) ---
+/// `L` — the one-bit span latch. Set at `ROLE_BNF2`'s close row, cleared at the
+/// next `ROLE_BANCHOR`'s, pinned to 0 at row 0. Both set and clear events are
+/// already materialized as bind-close gates, so this is **program-driven**: the
+/// prover chooses nothing about where it is high.
+#[cfg(feature = "q69-latch")]
+const LATCH_COL: usize = EFF_OFF + 25;
+/// `dv` — the prover's liveness bool, persistent for the whole trace.
+#[cfg(feature = "q69-latch")]
+const DV_COL: usize = LATCH_COL + 1;
+/// `L·dv` — materialized so the gated anchor close and the value-zero mint
+/// guard both stay at degree 3, matching this file's convention.
+#[cfg(feature = "q69-latch")]
+const LDV_COL: usize = DV_COL + 1;
+#[cfg(feature = "q69-latch")]
+pub const NARROW_WIDTH: usize = LDV_COL + 1;
+#[cfg(not(feature = "q69-latch"))]
 pub const NARROW_WIDTH: usize = EFF_OFF + 25; // 618
 
 /// Program slots (= perm slots per program period).
@@ -275,6 +292,17 @@ pub struct NarrowKeccakAir {
     pub slot_witness: Vec<SlotWitness>,
     /// Public fee (needed to witness the balance carry encodings).
     pub fee: u64,
+    /// Issue #219 / QUM-69: the prover's liveness bool `dv`. `true` declares
+    /// **input slot 1 a dummy** — its anchor bind is relaxed and its Merkle fold
+    /// is unconstrained, and the AIR forces its value to 0 in exchange.
+    ///
+    /// It is a *witness*, so it enters only the trace, never a constraint
+    /// constant: the AIR is program-independent and so is unchanged by this
+    /// flag. Slot 0 can never be the dummy — see the latch section of `eval`.
+    /// Honoured only under the `q69-latch` feature; setting it without the
+    /// feature panics in `generate_trace_from` rather than silently proving a
+    /// real spend the caller believes is a dummy.
+    pub dv: bool,
 }
 
 impl NarrowKeccakAir {
@@ -285,6 +313,7 @@ impl NarrowKeccakAir {
             program: [ROLE_DUMMY; PROGRAM_SLOTS],
             slot_witness: Vec::new(),
             fee: 0,
+            dv: false,
         }
     }
 
@@ -718,10 +747,23 @@ where
         let pv_base: [usize; 5] = [PV_ANCHOR, PV_NF1, PV_NF2, PV_CM1, PV_CM2];
         for (x, base) in pv_base.iter().enumerate() {
             for j in 0..16 {
-                builder.assert_zero(
-                    local[BGC_OFF + x].clone()
-                        * (local[BQ_OFF + j].clone() - pv(base + j) * ep.clone()),
-                );
+                let close = local[BGC_OFF + x].clone()
+                    * (local[BQ_OFF + j].clone() - pv(base + j) * ep.clone());
+                // Issue #219: `L·dv` relaxes the ANCHOR close and nothing else.
+                // The four other binds (PV_NF1, PV_NF2, PV_CM1, PV_CM2) fire
+                // unconditionally, so a dummy slot still publishes a nullifier
+                // that the proof commits to — an unbound `PV_NF2` is a
+                // censorship vector a relay can rewrite, not merely a
+                // uniqueness question. Degree 3 (three materialized factors:
+                // the close gate, `1 − L·dv`, and the accumulator; public
+                // values are degree 0), so the quotient degree does not move.
+                #[cfg(feature = "q69-latch")]
+                let close = if x == 0 {
+                    (AB::Expr::ONE - local[LDV_COL].clone()) * close
+                } else {
+                    close
+                };
+                builder.assert_zero(close);
             }
         }
         for j in 0..16 {
@@ -769,6 +811,48 @@ where
             close.clone()
                 * (local[BL_OFF + 3].clone() + carry(2) - pv(PV_FEE + 3) * ep.clone()),
         );
+
+        // --- Issue #219 / QUM-69: the ROLE_BNF2 liveness latch (same-row) ---
+        //
+        // The canonical program emits, per input,
+        // `ANK → NF → BNF_j → ARKM → ACM → 32 × MERKLE → BANCHOR`, chain 0 with
+        // `ROLE_BNF1` and chain 1 with `ROLE_BNF2` (`input_chain` below). So
+        // `ROLE_BNF2` marks chain 1 uniquely, and a bit set at its close row and
+        // cleared at the next `ROLE_BANCHOR`'s is high across exactly chain 1's
+        // `ARKM…BANCHOR` span.
+        //
+        // Both events are ALREADY materialized as bind-close gates —
+        // `BGC_OFF+2 = gperm·sel(BNF2)` and `BGC_OFF+0 = gperm·sel(BANCHOR)`
+        // (`:704-709`) — so the latch is **one transition constraint at degree
+        // 2**, below. That is why this is cheaper than the equality-bank
+        // precedent it was modelled on: the two gates it needs were already paid
+        // for by the bind bank.
+        //
+        // What makes slot 0 unreachable is the row-0 pin plus program order, not
+        // an argument: `L` starts at 0 and can only rise at `ROLE_BNF2`'s close,
+        // which the verifier's own program places AFTER chain 0's
+        // `ROLE_BANCHOR`. The prover picks `dv`; it cannot pick where `L` is
+        // high, so `L·dv` can only ever relax chain 1.
+        #[cfg(feature = "q69-latch")]
+        {
+            let latch = local[LATCH_COL].clone();
+            let dv = local[DV_COL].clone();
+            builder.assert_bool(latch.clone());
+            builder.assert_bool(dv.clone());
+            builder.when_first_row().assert_zero(latch.clone());
+            builder.assert_eq(local[LDV_COL].clone(), latch * dv);
+            // 🔴 MANDATORY, and the ruling on `#219` names it explicitly:
+            // without the anchor bind, an unconstrained input value is a mint.
+            // `INJ3E = inj(acm)·ep` fires on the 64 boundary rows of every
+            // `ROLE_ACM` perm and `W4` carries bit z of that slot's value, so
+            // this forces the dummy slot's value to 0 one bit at a time. Degree
+            // 3 — `L·dv` is materialized precisely so this is not degree 4.
+            builder.assert_zero(
+                local[INJ3E_COL].clone()
+                    * local[LDV_COL].clone()
+                    * local[W_OFF + 4].clone(),
+            );
+        }
 
         // RC ring: R[0]'s bit decomposition (bool + recompose), first-row
         // pin to the RC table, and one-step rotation per block.
@@ -911,6 +995,23 @@ where
                         * local[W_OFF + 4].clone(),
             );
         }
+        // Issue #219 / QUM-69: the latch, as ONE transition constraint at
+        // degree 2 — set at BNF2's close, cleared at BANCHOR's, hold otherwise.
+        // Both gates are bool and never fire on the same row (one perm, one
+        // role), so `L` stays in {0, 1} without needing the bool check to carry
+        // the argument. `dv` is persistent: one bool for the whole trace, which
+        // is what makes it a per-TRANSACTION declaration rather than something
+        // the prover can vary per perm.
+        #[cfg(feature = "q69-latch")]
+        {
+            t.assert_eq(
+                next[LATCH_COL].clone(),
+                local[LATCH_COL].clone() * (AB::Expr::ONE - local[BGC_OFF].clone())
+                    + local[BGC_OFF + 2].clone(),
+            );
+            t.assert_eq(next[DV_COL].clone(), local[DV_COL].clone());
+        }
+
         // Equality-bank accumulation (deg 3: gate * chunk-weight * source).
         let pwk = |j: usize| per[35 + j].clone();
         for l in 0..4 {
@@ -1216,12 +1317,107 @@ pub fn build_bucket_with_witnesses(
             program,
             slot_witness: sw,
             fee,
+            dv: false,
         },
         pvs,
         anchor,
         nf: [nf1, nf2],
         cm_out: [cmo1, cmo2],
     }
+}
+
+/// Fabricate a depth-32 path for ONE leaf (issue #219). The dummy-input tests
+/// need a tree that holds the real note and does **not** hold the dummy one, so
+/// [`fabricated_shared_tree`]'s two-leaves-at-0/1 shape does not fit. Sibling
+/// `i` is deterministic pseudo-random, seeded distinctly from that function's,
+/// and every path bit is `false` (the leaf is the leftmost of its level).
+pub fn fabricated_single_tree(cm: &[u64; 4]) -> (MerkleWitness, [u64; 4]) {
+    let mut x = 0x0219_c0de_5eed_1eafu64;
+    let mut rnd = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut siblings = [[0u64; 4]; MERKLE_DEPTH];
+    for sib in siblings.iter_mut() {
+        *sib = [rnd(), rnd(), rnd(), rnd()];
+    }
+    let w = MerkleWitness { siblings, path_bits: [false; MERKLE_DEPTH] };
+    let root = w.fold_root(cm);
+    (w, root)
+}
+
+/// A Merkle path for a note that is **in no tree** — the dummy slot's witness
+/// (issue #219). Deliberately a distinct deterministic pattern from
+/// [`fabricated_single_tree`]'s so a test can assert it does not fold to the
+/// real anchor, and thereby that the dummy tests are not vacuous.
+#[cfg(feature = "q69-latch")]
+pub fn off_tree_witness() -> MerkleWitness {
+    let mut x = 0xdead_d0d0_0000_0219u64;
+    let mut rnd = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut siblings = [[0u64; 4]; MERKLE_DEPTH];
+    for sib in siblings.iter_mut() {
+        *sib = [rnd(), rnd(), rnd(), rnd()];
+    }
+    MerkleWitness { siblings, path_bits: [true; MERKLE_DEPTH] }
+}
+
+/// Build a 2×2 bucket whose **second input slot is a dummy** — issue #219, the
+/// `ROLE_BNF2` latch construction the coordinator's ruling selected.
+///
+/// The program is **byte-identical** to [`build_bucket_with_witnesses`]'s: same
+/// 83 perms, same 96-slot role word pinned at row 0, same trace height, same
+/// public-value layout. That is the whole point — the padding property
+/// `transaction-model` §7/§10 decided requires that a one-input spend be
+/// indistinguishable from a two-input one, so nothing about the *shape* may
+/// differ. The only differences are in the witness:
+///
+/// - `dv = true`, which under the latch relaxes chain 1's anchor bind and leaves
+///   its Merkle fold unconstrained. That is the entire content of "dummy".
+/// - `dummy.value` must be 0. The AIR enforces it
+///   (`assert_zero(inj3e · L·dv · w4)`); this asserts it too, so a caller gets a
+///   panic at build time rather than an unprovable instance.
+/// - `dummy`'s `sk`/`rho`/`rseed` are prover-invented, so `PV_NF2` is a **real
+///   nullifier of an invented note** — Orchard's construction, which
+///   `transaction-model:61` already adopts as-is. It is still *bound*:
+///   `ROLE_BNF2` stays in the dummy chain, so a relay cannot rewrite it.
+///
+/// `anchor` and `witnesses[0]` come from the live tree exactly as on the real
+/// path; `witnesses[1]` may be anything (see [`off_tree_witness`]).
+#[cfg(feature = "q69-latch")]
+pub fn build_bucket_dummy1(
+    log_height: usize,
+    real: &TxInput,
+    real_witness: &MerkleWitness,
+    dummy: &TxInput,
+    dummy_witness: &MerkleWitness,
+    outputs: &[TxOutput; 2],
+    fee: u64,
+    anchor: [u64; 4],
+) -> BucketInstance {
+    assert_eq!(
+        dummy.value, 0,
+        "a dummy input slot contributes 0 to the balance; the AIR enforces it \
+         via assert_zero(inj3e · L·dv · w4) and a nonzero value here is a mint \
+         attempt that cannot be proved"
+    );
+    let inputs = [real.clone(), dummy.clone()];
+    let mut inst = build_bucket_with_witnesses(
+        log_height,
+        &inputs,
+        outputs,
+        fee,
+        &[*real_witness, *dummy_witness],
+        anchor,
+    );
+    inst.air.dv = true;
+    inst
 }
 
 // ---------------------------------------------------------------------------
@@ -1308,6 +1504,18 @@ impl NarrowKeccakAir {
         let mut ep: u32 = 1;
         let mut bq = [0i64; 16];
         let mut bl = [0i64; 4];
+        // Issue #219 / QUM-69: the latch starts LOW (the AIR pins row 0) and the
+        // liveness bool is constant for the whole trace.
+        #[cfg(feature = "q69-latch")]
+        let mut latch: u32 = 0;
+        #[cfg(feature = "q69-latch")]
+        let dvv: u32 = self.dv as u32;
+        #[cfg(not(feature = "q69-latch"))]
+        assert!(
+            !self.dv,
+            "dv = true needs the `q69-latch` feature; without it there is no \
+             latch and this would prove input slot 1 as a REAL spend"
+        );
 
         let bit = |w: u32, i: usize| (w >> i) & 1;
 
@@ -1498,6 +1706,16 @@ impl NarrowKeccakAir {
             for i in 0..5 {
                 row[BGC_OFF + i] = F::from_u32(gpermv * selv[6 + i]);
             }
+            // Issue #219 / QUM-69: the latch's two events are exactly the
+            // BANCHOR and BNF2 bind-close gates just written above.
+            #[cfg(feature = "q69-latch")]
+            let (bgc_banchor, bgc_bnf2) = (gpermv * selv[6], gpermv * selv[8]);
+            #[cfg(feature = "q69-latch")]
+            {
+                row[LATCH_COL] = F::from_u32(latch);
+                row[DV_COL] = F::from_u32(dvv);
+                row[LDV_COL] = F::from_u32(latch * dvv);
+            }
             let inj3e = bndv * se[2];
             let inj4e = bndv * se[3];
             row[INJ3E_COL] = F::from_u32(inj3e);
@@ -1568,6 +1786,11 @@ impl NarrowKeccakAir {
                     bq = [0i64; 16];
                 }
                 ep *= 1 - gwrap;
+                // Mirrors the latch transition constraint exactly.
+                #[cfg(feature = "q69-latch")]
+                {
+                    latch = latch * (1 - bgc_banchor) + bgc_bnf2;
+                }
             }
             for d in 1..=S_SLOTS {
                 row[s_col(d)] = F::from_u32(s[d]);
@@ -1733,6 +1956,7 @@ mod tests {
             program,
             slot_witness,
             fee: 0,
+            dv: false,
         };
         let trace = air.generate_trace::<F>(0);
         check_constraints(&air, &trace, &zero_pvs());
@@ -1765,6 +1989,7 @@ mod tests {
             program,
             slot_witness,
             fee: 0,
+            dv: false,
         };
         let mut trace = air.generate_trace::<F>(0);
         // Flip a sibling bit on an injection row (perm 1 boundary block =
@@ -1862,6 +2087,7 @@ mod tests {
             program,
             slot_witness,
             fee: 0,
+            dv: false,
         };
 
         // A prover-chosen first-perm input: 64 slots of 25 bits each.
@@ -2054,6 +2280,7 @@ mod tests {
             program,
             slot_witness: sw,
             fee: 0,
+            dv: false,
         };
         let trace = air.generate_trace::<F>(0);
         check_constraints(&air, &trace, &zero_pvs());
@@ -2121,6 +2348,7 @@ mod tests {
                 program,
                 slot_witness: sw,
                 fee: 0,
+                dv: false,
             }
         };
         // Sanity: untampered witness satisfies constraints at this height.
