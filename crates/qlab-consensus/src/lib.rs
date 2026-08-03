@@ -267,9 +267,121 @@ mod tests {
         let bytes = bincode::serialize(&proof)
             .expect("bincode serialization failed")
             .len();
+        #[cfg(not(feature = "q69-latch"))]
         assert_eq!(
             bytes, 145_609,
             "consensus wire byte-identical regression (issue #38 extraction / #41 B″)"
+        );
+        // Issue #219 / QUM-69: the `q69-latch` feature adds three trace columns
+        // (`NARROW_WIDTH` 617 → 620). 145,957 = 145,609 + 3 × 116, i.e. the
+        // latch's real columns cost exactly what QUM-67's three INERT probe
+        // columns cost — the 116.0 B/column slope, which holds only because the
+        // quotient degree does not move (`q69_quotient_degree_does_not_move`).
+        //
+        // 🔴 This is why the feature is default-off: 145,957 ≠
+        // `qumbra_node::genesis::CONSENSUS_WIRE_BYTES`, a FROZEN v1.0 constant
+        // baked into the genesis hash. Enabling it by default is a genesis
+        // change, not a builder's call.
+        #[cfg(feature = "q69-latch")]
+        assert_eq!(
+            bytes, 145_957,
+            "latched consensus wire (issue #219): 145,609 + 3 columns × 116 B"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #219 / QUM-69: the dummy-input arm, through the REAL verifier.
+    //
+    // `check_constraints` passing is not the same claim as `p3_uni_stark::verify`
+    // accepting at the frozen config, so both are exercised: the AIR-level
+    // soundness set lives in `qlab-air`, and this is the end-to-end one.
+    // -----------------------------------------------------------------------
+
+    /// A one-real-input spend: 1,000 in, 600 + 399 out, fee 1, slot 1 dummy.
+    #[cfg(feature = "q69-latch")]
+    fn dummy1_bucket() -> qlab_air::narrow::BucketInstance {
+        use qlab_air::narrow::{
+            build_bucket_dummy1, derive_input, fabricated_single_tree, off_tree_witness,
+        };
+        let real = TxInput {
+            sk: [0x11, 0x22, 0x33, 0x44],
+            value: 1_000,
+            rho: [0x55, 0x66, 0x77, 0x88],
+            rseed: [0x99, 0xaa, 0xbb, 0xcc],
+            d: [0xd1, 0xd2],
+        };
+        let dummy = TxInput {
+            sk: [0xf00d, 0xf00e, 0xf00f, 0xf010],
+            value: 0,
+            rho: [0xbeef01, 0xbeef02, 0xbeef03, 0xbeef04],
+            rseed: [0xcafe01, 0xcafe02, 0xcafe03, 0xcafe04],
+            d: [0, 0],
+        };
+        let outputs = [
+            TxOutput { value: 600, rkm: [2; 4], rho: [3; 4], rseed: [4; 4] },
+            TxOutput { value: 399, rkm: [5; 4], rho: [6; 4], rseed: [7; 4] },
+        ];
+        let (_, _, cm_real) = derive_input(&real);
+        let (w_real, anchor) = fabricated_single_tree(&cm_real);
+        build_bucket_dummy1(
+            LOG_HEIGHT,
+            &real,
+            &w_real,
+            &dummy,
+            &off_tree_witness(),
+            &outputs,
+            1,
+            anchor,
+        )
+    }
+
+    /// 🔴 The padding property, measured end to end: a **dummy** transaction's
+    /// proof is accepted by the real verifier at the frozen config AND is
+    /// **byte-identical in size** to a real two-input one. Same program, same
+    /// height, same width, same quotient degree — so proof size discloses
+    /// nothing about the sender's true input arity, which is the whole reason
+    /// `transaction-model` §7/§10 lists arity buckets as Decided.
+    #[cfg(feature = "q69-latch")]
+    #[test]
+    fn q69_dummy_proof_verifies_and_is_size_indistinguishable() {
+        let real = balanced_bucket();
+        let (real_pvs, real_proof) = prove_bucket(&real);
+        assert!(verify_proof(&real, &real_pvs, &real_proof), "real 2×2 must verify");
+
+        let dummy = dummy1_bucket();
+        assert!(dummy.air.dv, "precondition: slot 1 is declared dummy");
+        let (d_pvs, d_proof) = prove_bucket(&dummy);
+        assert!(
+            verify_proof(&dummy, &d_pvs, &d_proof),
+            "the dummy-slot proof must be accepted by p3_uni_stark::verify at \
+             the frozen config, not merely by check_constraints"
+        );
+
+        let real_bytes = bincode::serialize(&real_proof).unwrap().len();
+        let d_bytes = bincode::serialize(&d_proof).unwrap().len();
+        assert_eq!(
+            d_bytes, real_bytes,
+            "a dummy proof must not be distinguishable by size"
+        );
+        assert_eq!(d_bytes, 145_957, "latched wire");
+    }
+
+    /// The verifier binds the dummy instance to its declared surface exactly as
+    /// it binds a real one: tamper `PV_NF2` — the dummy slot's own nullifier —
+    /// and the real verifier refuses. The relaxed anchor bind does not relax
+    /// this, which is what keeps a relay from rewriting a dummy nullifier.
+    #[cfg(feature = "q69-latch")]
+    #[test]
+    fn q69_dummy_proof_is_bound_to_its_declared_nullifier() {
+        use qlab_air::narrow::PV_NF2;
+        let dummy = dummy1_bucket();
+        let (pvs, proof) = prove_bucket(&dummy);
+        assert!(verify_proof(&dummy, &pvs, &proof));
+        let mut tampered = pvs.clone();
+        tampered[PV_NF2 + 5] += Val::ONE;
+        assert!(
+            !verify_proof(&dummy, &tampered, &proof),
+            "a rewritten dummy nullifier must be refused by the real verifier"
         );
     }
 }
