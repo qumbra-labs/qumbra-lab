@@ -142,6 +142,23 @@ const BLCLOSE_COL: usize = BLC_OFF + 9; // 1: balance close gate
 const INJ3E_COL: usize = BLCLOSE_COL + 1; // 1: inj(acm) * ep
 const INJ4E_COL: usize = INJ3E_COL + 1; // 1: inj(acmout) * ep
 const EFF_OFF: usize = INJ4E_COL + 1; // 25: effective round input
+// --- issue #219 / QUM-69: the ROLE_BNF2 liveness latch (feature `q69-latch`) ---
+/// `L` — the one-bit span latch. Set at `ROLE_BNF2`'s close row, cleared at the
+/// next `ROLE_BANCHOR`'s, pinned to 0 at row 0. Both set and clear events are
+/// already materialized as bind-close gates, so this is **program-driven**: the
+/// prover chooses nothing about where it is high.
+#[cfg(feature = "q69-latch")]
+const LATCH_COL: usize = EFF_OFF + 25;
+/// `dv` — the prover's liveness bool, persistent for the whole trace.
+#[cfg(feature = "q69-latch")]
+const DV_COL: usize = LATCH_COL + 1;
+/// `L·dv` — materialized so the gated anchor close and the value-zero mint
+/// guard both stay at degree 3, matching this file's convention.
+#[cfg(feature = "q69-latch")]
+const LDV_COL: usize = DV_COL + 1;
+#[cfg(feature = "q69-latch")]
+pub const NARROW_WIDTH: usize = LDV_COL + 1;
+#[cfg(not(feature = "q69-latch"))]
 pub const NARROW_WIDTH: usize = EFF_OFF + 25;
 
 /// Program slots (= perm slots per program period).
@@ -275,6 +292,17 @@ pub struct NarrowKeccakAir {
     pub slot_witness: Vec<SlotWitness>,
     /// Public fee (needed to witness the balance carry encodings).
     pub fee: u64,
+    /// Issue #219 / QUM-69: the prover's liveness bool `dv`. `true` declares
+    /// **input slot 1 a dummy** — its anchor bind is relaxed and its Merkle fold
+    /// is unconstrained, and the AIR forces its value to 0 in exchange.
+    ///
+    /// It is a *witness*, so it enters only the trace, never a constraint
+    /// constant: the AIR is program-independent and so is unchanged by this
+    /// flag. Slot 0 can never be the dummy — see the latch section of `eval`.
+    /// Honoured only under the `q69-latch` feature; setting it without the
+    /// feature panics in `generate_trace_from` rather than silently proving a
+    /// real spend the caller believes is a dummy.
+    pub dv: bool,
 }
 
 impl NarrowKeccakAir {
@@ -285,6 +313,7 @@ impl NarrowKeccakAir {
             program: [ROLE_DUMMY; PROGRAM_SLOTS],
             slot_witness: Vec::new(),
             fee: 0,
+            dv: false,
         }
     }
 
@@ -718,10 +747,23 @@ where
         let pv_base: [usize; 5] = [PV_ANCHOR, PV_NF1, PV_NF2, PV_CM1, PV_CM2];
         for (x, base) in pv_base.iter().enumerate() {
             for j in 0..16 {
-                builder.assert_zero(
-                    local[BGC_OFF + x].clone()
-                        * (local[BQ_OFF + j].clone() - pv(base + j) * ep.clone()),
-                );
+                let close = local[BGC_OFF + x].clone()
+                    * (local[BQ_OFF + j].clone() - pv(base + j) * ep.clone());
+                // Issue #219: `L·dv` relaxes the ANCHOR close and nothing else.
+                // The four other binds (PV_NF1, PV_NF2, PV_CM1, PV_CM2) fire
+                // unconditionally, so a dummy slot still publishes a nullifier
+                // that the proof commits to — an unbound `PV_NF2` is a
+                // censorship vector a relay can rewrite, not merely a
+                // uniqueness question. Degree 3 (three materialized factors:
+                // the close gate, `1 − L·dv`, and the accumulator; public
+                // values are degree 0), so the quotient degree does not move.
+                #[cfg(feature = "q69-latch")]
+                let close = if x == 0 {
+                    (AB::Expr::ONE - local[LDV_COL].clone()) * close
+                } else {
+                    close
+                };
+                builder.assert_zero(close);
             }
         }
         for j in 0..16 {
@@ -769,6 +811,48 @@ where
             close.clone()
                 * (local[BL_OFF + 3].clone() + carry(2) - pv(PV_FEE + 3) * ep.clone()),
         );
+
+        // --- Issue #219 / QUM-69: the ROLE_BNF2 liveness latch (same-row) ---
+        //
+        // The canonical program emits, per input,
+        // `ANK → NF → BNF_j → ARKM → ACM → 32 × MERKLE → BANCHOR`, chain 0 with
+        // `ROLE_BNF1` and chain 1 with `ROLE_BNF2` (`input_chain` below). So
+        // `ROLE_BNF2` marks chain 1 uniquely, and a bit set at its close row and
+        // cleared at the next `ROLE_BANCHOR`'s is high across exactly chain 1's
+        // `ARKM…BANCHOR` span.
+        //
+        // Both events are ALREADY materialized as bind-close gates —
+        // `BGC_OFF+2 = gperm·sel(BNF2)` and `BGC_OFF+0 = gperm·sel(BANCHOR)`
+        // (`:704-709`) — so the latch is **one transition constraint at degree
+        // 2**, below. That is why this is cheaper than the equality-bank
+        // precedent it was modelled on: the two gates it needs were already paid
+        // for by the bind bank.
+        //
+        // What makes slot 0 unreachable is the row-0 pin plus program order, not
+        // an argument: `L` starts at 0 and can only rise at `ROLE_BNF2`'s close,
+        // which the verifier's own program places AFTER chain 0's
+        // `ROLE_BANCHOR`. The prover picks `dv`; it cannot pick where `L` is
+        // high, so `L·dv` can only ever relax chain 1.
+        #[cfg(feature = "q69-latch")]
+        {
+            let latch = local[LATCH_COL].clone();
+            let dv = local[DV_COL].clone();
+            builder.assert_bool(latch.clone());
+            builder.assert_bool(dv.clone());
+            builder.when_first_row().assert_zero(latch.clone());
+            builder.assert_eq(local[LDV_COL].clone(), latch * dv);
+            // 🔴 MANDATORY, and the ruling on `#219` names it explicitly:
+            // without the anchor bind, an unconstrained input value is a mint.
+            // `INJ3E = inj(acm)·ep` fires on the 64 boundary rows of every
+            // `ROLE_ACM` perm and `W4` carries bit z of that slot's value, so
+            // this forces the dummy slot's value to 0 one bit at a time. Degree
+            // 3 — `L·dv` is materialized precisely so this is not degree 4.
+            builder.assert_zero(
+                local[INJ3E_COL].clone()
+                    * local[LDV_COL].clone()
+                    * local[W_OFF + 4].clone(),
+            );
+        }
 
         // RC ring: R[0]'s bit decomposition (bool + recompose), first-row
         // pin to the RC table, and one-step rotation per block.
@@ -911,6 +995,23 @@ where
                         * local[W_OFF + 4].clone(),
             );
         }
+        // Issue #219 / QUM-69: the latch, as ONE transition constraint at
+        // degree 2 — set at BNF2's close, cleared at BANCHOR's, hold otherwise.
+        // Both gates are bool and never fire on the same row (one perm, one
+        // role), so `L` stays in {0, 1} without needing the bool check to carry
+        // the argument. `dv` is persistent: one bool for the whole trace, which
+        // is what makes it a per-TRANSACTION declaration rather than something
+        // the prover can vary per perm.
+        #[cfg(feature = "q69-latch")]
+        {
+            t.assert_eq(
+                next[LATCH_COL].clone(),
+                local[LATCH_COL].clone() * (AB::Expr::ONE - local[BGC_OFF].clone())
+                    + local[BGC_OFF + 2].clone(),
+            );
+            t.assert_eq(next[DV_COL].clone(), local[DV_COL].clone());
+        }
+
         // Equality-bank accumulation (deg 3: gate * chunk-weight * source).
         let pwk = |j: usize| per[35 + j].clone();
         for l in 0..4 {
@@ -1216,12 +1317,107 @@ pub fn build_bucket_with_witnesses(
             program,
             slot_witness: sw,
             fee,
+            dv: false,
         },
         pvs,
         anchor,
         nf: [nf1, nf2],
         cm_out: [cmo1, cmo2],
     }
+}
+
+/// Fabricate a depth-32 path for ONE leaf (issue #219). The dummy-input tests
+/// need a tree that holds the real note and does **not** hold the dummy one, so
+/// [`fabricated_shared_tree`]'s two-leaves-at-0/1 shape does not fit. Sibling
+/// `i` is deterministic pseudo-random, seeded distinctly from that function's,
+/// and every path bit is `false` (the leaf is the leftmost of its level).
+pub fn fabricated_single_tree(cm: &[u64; 4]) -> (MerkleWitness, [u64; 4]) {
+    let mut x = 0x0219_c0de_5eed_1eafu64;
+    let mut rnd = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut siblings = [[0u64; 4]; MERKLE_DEPTH];
+    for sib in siblings.iter_mut() {
+        *sib = [rnd(), rnd(), rnd(), rnd()];
+    }
+    let w = MerkleWitness { siblings, path_bits: [false; MERKLE_DEPTH] };
+    let root = w.fold_root(cm);
+    (w, root)
+}
+
+/// A Merkle path for a note that is **in no tree** — the dummy slot's witness
+/// (issue #219). Deliberately a distinct deterministic pattern from
+/// [`fabricated_single_tree`]'s so a test can assert it does not fold to the
+/// real anchor, and thereby that the dummy tests are not vacuous.
+#[cfg(feature = "q69-latch")]
+pub fn off_tree_witness() -> MerkleWitness {
+    let mut x = 0xdead_d0d0_0000_0219u64;
+    let mut rnd = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let mut siblings = [[0u64; 4]; MERKLE_DEPTH];
+    for sib in siblings.iter_mut() {
+        *sib = [rnd(), rnd(), rnd(), rnd()];
+    }
+    MerkleWitness { siblings, path_bits: [true; MERKLE_DEPTH] }
+}
+
+/// Build a 2×2 bucket whose **second input slot is a dummy** — issue #219, the
+/// `ROLE_BNF2` latch construction the coordinator's ruling selected.
+///
+/// The program is **byte-identical** to [`build_bucket_with_witnesses`]'s: same
+/// 83 perms, same 96-slot role word pinned at row 0, same trace height, same
+/// public-value layout. That is the whole point — the padding property
+/// `transaction-model` §7/§10 decided requires that a one-input spend be
+/// indistinguishable from a two-input one, so nothing about the *shape* may
+/// differ. The only differences are in the witness:
+///
+/// - `dv = true`, which under the latch relaxes chain 1's anchor bind and leaves
+///   its Merkle fold unconstrained. That is the entire content of "dummy".
+/// - `dummy.value` must be 0. The AIR enforces it
+///   (`assert_zero(inj3e · L·dv · w4)`); this asserts it too, so a caller gets a
+///   panic at build time rather than an unprovable instance.
+/// - `dummy`'s `sk`/`rho`/`rseed` are prover-invented, so `PV_NF2` is a **real
+///   nullifier of an invented note** — Orchard's construction, which
+///   `transaction-model:61` already adopts as-is. It is still *bound*:
+///   `ROLE_BNF2` stays in the dummy chain, so a relay cannot rewrite it.
+///
+/// `anchor` and `witnesses[0]` come from the live tree exactly as on the real
+/// path; `witnesses[1]` may be anything (see [`off_tree_witness`]).
+#[cfg(feature = "q69-latch")]
+pub fn build_bucket_dummy1(
+    log_height: usize,
+    real: &TxInput,
+    real_witness: &MerkleWitness,
+    dummy: &TxInput,
+    dummy_witness: &MerkleWitness,
+    outputs: &[TxOutput; 2],
+    fee: u64,
+    anchor: [u64; 4],
+) -> BucketInstance {
+    assert_eq!(
+        dummy.value, 0,
+        "a dummy input slot contributes 0 to the balance; the AIR enforces it \
+         via assert_zero(inj3e · L·dv · w4) and a nonzero value here is a mint \
+         attempt that cannot be proved"
+    );
+    let inputs = [real.clone(), dummy.clone()];
+    let mut inst = build_bucket_with_witnesses(
+        log_height,
+        &inputs,
+        outputs,
+        fee,
+        &[*real_witness, *dummy_witness],
+        anchor,
+    );
+    inst.air.dv = true;
+    inst
 }
 
 // ---------------------------------------------------------------------------
@@ -1308,6 +1504,18 @@ impl NarrowKeccakAir {
         let mut ep: u32 = 1;
         let mut bq = [0i64; 16];
         let mut bl = [0i64; 4];
+        // Issue #219 / QUM-69: the latch starts LOW (the AIR pins row 0) and the
+        // liveness bool is constant for the whole trace.
+        #[cfg(feature = "q69-latch")]
+        let mut latch: u32 = 0;
+        #[cfg(feature = "q69-latch")]
+        let dvv: u32 = self.dv as u32;
+        #[cfg(not(feature = "q69-latch"))]
+        assert!(
+            !self.dv,
+            "dv = true needs the `q69-latch` feature; without it there is no \
+             latch and this would prove input slot 1 as a REAL spend"
+        );
 
         let bit = |w: u32, i: usize| (w >> i) & 1;
 
@@ -1498,6 +1706,16 @@ impl NarrowKeccakAir {
             for i in 0..5 {
                 row[BGC_OFF + i] = F::from_u32(gpermv * selv[6 + i]);
             }
+            // Issue #219 / QUM-69: the latch's two events are exactly the
+            // BANCHOR and BNF2 bind-close gates just written above.
+            #[cfg(feature = "q69-latch")]
+            let (bgc_banchor, bgc_bnf2) = (gpermv * selv[6], gpermv * selv[8]);
+            #[cfg(feature = "q69-latch")]
+            {
+                row[LATCH_COL] = F::from_u32(latch);
+                row[DV_COL] = F::from_u32(dvv);
+                row[LDV_COL] = F::from_u32(latch * dvv);
+            }
             let inj3e = bndv * se[2];
             let inj4e = bndv * se[3];
             row[INJ3E_COL] = F::from_u32(inj3e);
@@ -1568,6 +1786,11 @@ impl NarrowKeccakAir {
                     bq = [0i64; 16];
                 }
                 ep *= 1 - gwrap;
+                // Mirrors the latch transition constraint exactly.
+                #[cfg(feature = "q69-latch")]
+                {
+                    latch = latch * (1 - bgc_banchor) + bgc_bnf2;
+                }
             }
             for d in 1..=S_SLOTS {
                 row[s_col(d)] = F::from_u32(s[d]);
@@ -1658,6 +1881,7 @@ impl NarrowKeccakAir {
 mod tests {
     use p3_air::{check_all_constraints, check_constraints};
     use p3_koala_bear::KoalaBear;
+    use p3_matrix::Matrix;
 
     use super::*;
     use crate::reference;
@@ -1733,6 +1957,7 @@ mod tests {
             program,
             slot_witness,
             fee: 0,
+            dv: false,
         };
         let trace = air.generate_trace::<F>(0);
         check_constraints(&air, &trace, &zero_pvs());
@@ -1765,6 +1990,7 @@ mod tests {
             program,
             slot_witness,
             fee: 0,
+            dv: false,
         };
         let mut trace = air.generate_trace::<F>(0);
         // Flip a sibling bit on an injection row (perm 1 boundary block =
@@ -1862,6 +2088,7 @@ mod tests {
             program,
             slot_witness,
             fee: 0,
+            dv: false,
         };
 
         // A prover-chosen first-perm input: 64 slots of 25 bits each.
@@ -2054,6 +2281,7 @@ mod tests {
             program,
             slot_witness: sw,
             fee: 0,
+            dv: false,
         };
         let trace = air.generate_trace::<F>(0);
         check_constraints(&air, &trace, &zero_pvs());
@@ -2121,6 +2349,7 @@ mod tests {
                 program,
                 slot_witness: sw,
                 fee: 0,
+                dv: false,
             }
         };
         // Sanity: untampered witness satisfies constraints at this height.
@@ -2359,6 +2588,367 @@ mod tests {
         let trace = bad.air.generate_trace::<F>(0);
         let report = check_all_constraints(&bad.air, &trace, &pvs, Some(10));
         assert!(!report.is_ok(), "witness that does not fold to the anchor must be rejected");
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #219 / QUM-69: the measured trace geometry and quotient degree.
+    //
+    // These two are the numbers the ruling on `#219` is conditional on, so they
+    // are asserted rather than printed. Both are read off the AIR the prover is
+    // handed — `NARROW_WIDTH` is the width of the matrix `generate_trace`
+    // returns, and the degree comes from Plonky3's own symbolic evaluation, not
+    // from counting factors by hand.
+    // -----------------------------------------------------------------------
+
+    /// The trace width `prove` is handed. **617 unfeatured** — which is also the
+    /// third independent sighting of the stale `618` in the comment on
+    /// `NARROW_WIDTH`'s definition and in `protocol-spec.md:59` (issue #234, NOT
+    /// fixed here) — and **620 with the latch's three columns.**
+    #[test]
+    fn q69_trace_width_is_read_off_the_matrix() {
+        let air = NarrowKeccakAir::chain_only(10);
+        let trace = air.generate_trace::<F>(0);
+        assert_eq!(trace.width(), NARROW_WIDTH, "width must be the matrix's own");
+        #[cfg(not(feature = "q69-latch"))]
+        assert_eq!(trace.width(), 617, "unfeatured base width");
+        #[cfg(feature = "q69-latch")]
+        assert_eq!(trace.width(), 620, "base + L + dv + L·dv");
+    }
+
+    /// 🔴 The condition the ruling on `#219` names: **does the gated anchor close
+    /// stay inside the degree budget?**
+    ///
+    /// It does, and the reason is that the budget was never 3. The AIR's ceiling
+    /// is **4**, set by the 13 materialized role selectors
+    /// (`sel = pair(r0,r1) · pair(r2,r3)`, a product of two degree-2 half
+    /// selectors) — a SAME-ROW constraint with nothing to do with the
+    /// accumulator transitions the file's "stay deg ≤ 3" comments are about.
+    /// `IsTransition` is priced at degree **0** in Plonky3 0.6.1
+    /// (`p3-air/src/symbolic/expression.rs`), so `when_transition` is free and
+    /// the deg-3 bank legs land at 3, not 4.
+    ///
+    /// Plonky3 picks `2^ceil(log2(deg − 1))` quotient chunks, so **deg 4 and deg
+    /// 5 both give 4 chunks**: the latch's degree-3 additions have two whole
+    /// degrees of headroom, and even the 2-column variant (no materialized
+    /// `L·dv`, both new constraints at degree 4) would not move it. Only a
+    /// degree-6 constraint would.
+    #[test]
+    fn q69_quotient_degree_does_not_move() {
+        use p3_air::symbolic::{get_max_constraint_degree, AirLayout};
+        let air = NarrowKeccakAir::chain_only(18);
+        let layout = AirLayout::from_air::<F>(&air);
+        let deg = get_max_constraint_degree::<F, _>(&air, layout);
+        assert_eq!(
+            deg, 4,
+            "max constraint degree — unchanged by the latch; the 13 role \
+             selectors set it, not the latch and not the transitions"
+        );
+        // Plonky3's own arithmetic, restated so the consequence is test-locked
+        // and not left to a reader: `get_log_num_quotient_chunks` computes
+        // `log2_ceil(max(deg, 2) - 1)`.
+        assert_eq!((deg - 1).next_power_of_two(), 4, "quotient chunks");
+    }
+
+    /// 🔴 Executes what QUM-67's correction 2 reasoned from source and did not
+    /// run: with `Σin = 0` the balance chain forces `fee = 0`, and **the circuit
+    /// is perfectly happy with that.** A zero-everything 2×2 bucket satisfies
+    /// every constraint at `fee = 0`.
+    ///
+    /// So nothing in the AIR makes a transaction pay. What refuses a zero-fee
+    /// transaction is `qlab_devnet::body::validate_body`'s `WrongFee` against
+    /// `posted_fee` — a **consensus** check (`posted_fee(TwoByTwo)` is
+    /// test-locked at 1,000,000 bessel by `fees::tests::
+    /// posted_fees_are_the_frozen_absolutes`, and the refusal itself by
+    /// `body.rs`'s `WrongFee` case).
+    ///
+    /// That is exactly the load-bearing-by-accident shape the ruling refuses to
+    /// create a second time, and it is why the one-global-flag construction was
+    /// out. The latch does not have this hole:
+    /// `q69_both_slots_dummy_is_unreachable` shows a both-dummy instance is
+    /// refused **in-circuit**, one layer earlier than the posted-fee rule.
+    #[test]
+    fn q69_zero_fee_is_satisfiable_in_circuit() {
+        let inputs = [
+            TxInput { sk: [1, 2, 3, 4], value: 0, rho: [5, 6, 7, 8], rseed: [9, 10, 11, 12], d: [0, 0] },
+            TxInput { sk: [13, 14, 15, 16], value: 0, rho: [17, 18, 19, 20], rseed: [21, 22, 23, 24], d: [0, 0] },
+        ];
+        let outputs = [
+            TxOutput { value: 0, rkm: [1; 4], rho: [2; 4], rseed: [3; 4] },
+            TxOutput { value: 0, rkm: [4; 4], rho: [5; 4], rseed: [6; 4] },
+        ];
+        let inst = build_bucket(18, &inputs, &outputs, 0);
+        assert_eq!(inst.pvs[PV_FEE], 0, "precondition: the declared fee is 0");
+        let pvs: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        let trace = inst.air.generate_trace::<F>(0);
+        // No `assert!` needed — `check_constraints` panics on any violation.
+        check_constraints(&inst.air, &trace, &pvs);
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #219 / QUM-69: the latch's soundness set.
+    // -----------------------------------------------------------------------
+
+    /// The shared fixture: one real input in a live tree, one invented dummy.
+    /// The real note's value covers both outputs and the fee on its own — that
+    /// IS the one-note spend `#219` says a payment recipient cannot make today.
+    #[cfg(feature = "q69-latch")]
+    fn dummy1_parts() -> (TxInput, MerkleWitness, TxInput, [TxOutput; 2], u64, [u64; 4]) {
+        let real = TxInput {
+            sk: [0x11, 0x22, 0x33, 0x44],
+            value: 1_000,
+            rho: [0x55, 0x66, 0x77, 0x88],
+            rseed: [0x99, 0xaa, 0xbb, 0xcc],
+            d: [0xd1, 0xd2],
+        };
+        // Prover-invented: a real nullifier of a note that exists nowhere.
+        let dummy = TxInput {
+            sk: [0xf00d, 0xf00e, 0xf00f, 0xf010],
+            value: 0,
+            rho: [0xbeef01, 0xbeef02, 0xbeef03, 0xbeef04],
+            rseed: [0xcafe01, 0xcafe02, 0xcafe03, 0xcafe04],
+            d: [0, 0],
+        };
+        let outputs = [
+            TxOutput { value: 600, rkm: [2; 4], rho: [3; 4], rseed: [4; 4] },
+            TxOutput { value: 399, rkm: [5; 4], rho: [6; 4], rseed: [7; 4] },
+        ];
+        let fee = 1u64; // 1_000 = 600 + 399 + 1, the ONE real input alone
+        let (_, _, cm_real) = derive_input(&real);
+        let (w_real, anchor) = fabricated_single_tree(&cm_real);
+        (real, w_real, dummy, outputs, fee, anchor)
+    }
+
+    #[cfg(feature = "q69-latch")]
+    fn dummy1_instance() -> BucketInstance {
+        let (real, w_real, dummy, outputs, fee, anchor) = dummy1_parts();
+        build_bucket_dummy1(
+            18,
+            &real,
+            &w_real,
+            &dummy,
+            &off_tree_witness(),
+            &outputs,
+            fee,
+            anchor,
+        )
+    }
+
+    /// The dummy program satisfies the AIR with the real public values — and the
+    /// fixture is not vacuous: the dummy slot's witness genuinely does NOT fold
+    /// to the anchor, so this instance would be unprovable without the latch
+    /// (which `q69_dv_false_is_the_unchanged_2x2` confirms from the other side).
+    #[cfg(feature = "q69-latch")]
+    #[test]
+    fn q69_dummy1_satisfies_constraints() {
+        let (real, w_real, dummy, ..) = dummy1_parts();
+        let (_, _, cm_real) = derive_input(&real);
+        let (_, anchor) = fabricated_single_tree(&cm_real);
+        let (_, _, cm_dummy) = derive_input(&dummy);
+        assert_ne!(
+            off_tree_witness().fold_root(&cm_dummy),
+            anchor,
+            "precondition: the dummy slot must be OFF the tree, else this test \
+             proves nothing about the relaxed anchor bind"
+        );
+        assert_eq!(w_real.fold_root(&cm_real), anchor, "the real slot IS on it");
+
+        let inst = dummy1_instance();
+        assert!(inst.air.dv, "the instance must actually declare slot 1 dummy");
+        let pvs: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        let trace = inst.air.generate_trace::<F>(0);
+        check_constraints(&inst.air, &trace, &pvs);
+    }
+
+    /// The latch is **program-driven**: `L` is high across exactly chain 1's
+    /// `ARKM…BANCHOR` span and nowhere else, read off the trace column rather
+    /// than argued. This is the assertion that makes "the prover cannot move it"
+    /// a measurement.
+    ///
+    /// Program order (`input_chain`): slot 0 warm-up, chain 0 at slots 1..=38
+    /// (`ANK NF BNF1 ARKM ACM 32×MERKLE BANCHOR`), chain 1 at 39..=76. So `L`
+    /// must rise on the first row of perm 42 (chain 1's `ROLE_ARKM`) and fall on
+    /// the first row of perm 77 — high on perm 76's last row, which is where the
+    /// anchor close it relaxes actually fires.
+    #[cfg(feature = "q69-latch")]
+    #[test]
+    fn q69_latch_span_is_exactly_chain_1() {
+        let inst = dummy1_instance();
+        assert_eq!(inst.air.program[3], ROLE_BNF1, "chain 0 carries BNF1");
+        assert_eq!(inst.air.program[41], ROLE_BNF2, "chain 1 carries BNF2");
+        assert_eq!(inst.air.program[38], ROLE_BANCHOR, "chain 0's anchor perm");
+        assert_eq!(inst.air.program[76], ROLE_BANCHOR, "chain 1's anchor perm");
+
+        let trace = inst.air.generate_trace::<F>(0);
+        let height = 1usize << inst.air.log_height;
+        let lo = 42 * ROWS_PER_PERM;
+        let hi = 77 * ROWS_PER_PERM;
+        for row in 0..height {
+            let l = trace.values[row * NARROW_WIDTH + LATCH_COL];
+            let want = if (lo..hi).contains(&row) { F::ONE } else { F::ZERO };
+            assert_eq!(l, want, "latch at row {row} (span {lo}..{hi})");
+        }
+        // The relaxed close fires on perm 76's LAST row, and the latch is still
+        // high there — off-by-one in either direction breaks the construction.
+        assert_eq!(trace.values[(hi - 1) * NARROW_WIDTH + LATCH_COL], F::ONE);
+        assert_eq!(trace.values[hi * NARROW_WIDTH + LATCH_COL], F::ZERO);
+    }
+
+    /// The dummy slot contributes **0** to the balance: a fee one unit off the
+    /// ONE real input's arithmetic is caught. If the dummy's value were free the
+    /// prover could balance any fee it liked.
+    #[cfg(feature = "q69-latch")]
+    #[test]
+    fn q69_dummy_slot_contributes_zero_to_the_balance() {
+        let (real, w_real, dummy, outputs, fee, anchor) = dummy1_parts();
+        let bad = build_bucket_dummy1(
+            18, &real, &w_real, &dummy, &off_tree_witness(), &outputs, fee + 1, anchor,
+        );
+        let pvs: Vec<F> = bad.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        let trace = bad.air.generate_trace::<F>(0);
+        let report = check_all_constraints(&bad.air, &trace, &pvs, Some(10));
+        assert!(!report.is_ok(), "a fee off by one must not balance");
+    }
+
+    /// 🔴 The mandatory mint guard, `assert_zero(inj3e · L·dv · w4)`. Without the
+    /// anchor bind an unconstrained input value is a mint, so the AIR forces the
+    /// dummy slot's value to 0 bit by bit. Built by hand rather than through
+    /// `build_bucket_dummy1` (which asserts on a nonzero dummy value), because
+    /// the claim under test is that the **circuit** refuses it, not the builder.
+    #[cfg(feature = "q69-latch")]
+    #[test]
+    fn q69_dummy_slot_value_must_be_zero() {
+        let (real, w_real, mut dummy, outputs, _, anchor) = dummy1_parts();
+        dummy.value = 500; // the mint: 500 units from a note in no tree
+        let mut inst = build_bucket_with_witnesses(
+            18,
+            &[real, dummy],
+            &outputs,
+            501, // 1_000 + 500 = 600 + 399 + 501, so the BALANCE is satisfied…
+            &[w_real, off_tree_witness()],
+            anchor,
+        );
+        inst.air.dv = true;
+        let pvs: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        let trace = inst.air.generate_trace::<F>(0);
+        let report = check_all_constraints(&inst.air, &trace, &pvs, Some(10));
+        // …and it is refused anyway, by the mint guard alone.
+        assert!(!report.is_ok(), "a nonzero dummy input value is a mint");
+    }
+
+    /// `PV_NF2` is **bound**: flip one bit of the declared `nf₂` ⇒ rejected.
+    /// `ROLE_BNF2` stays in the dummy chain, so the dummy nullifier is a real
+    /// nullifier of an invented note and the proof commits to it — an unbound
+    /// `PV_NF2` would let a relay rewrite it, which is a censorship vector.
+    #[cfg(feature = "q69-latch")]
+    #[test]
+    fn q69_dummy_nullifier_is_bound() {
+        let inst = dummy1_instance();
+        let trace = inst.air.generate_trace::<F>(0);
+        let mut pvs: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        pvs[PV_NF2 + 5] += F::ONE;
+        let report = check_all_constraints(&inst.air, &trace, &pvs, Some(10));
+        assert!(!report.is_ok(), "the dummy slot's nullifier must be bound");
+    }
+
+    /// 🔴 **`dv` cannot be set on slot 0** — proved with a test that tries, not
+    /// with a paragraph. `L` is pinned to 0 at row 0 and can only rise at
+    /// `ROLE_BNF2`'s close, which the verifier's program places after chain 0's
+    /// `ROLE_BANCHOR`; so slot 0's anchor bind fires with `dv` set exactly as it
+    /// does with `dv` clear. This is the property `#215` (i) inherits.
+    #[cfg(feature = "q69-latch")]
+    #[test]
+    fn q69_dv_cannot_make_slot_0_a_dummy() {
+        let (real, _, dummy, outputs, _, _) = dummy1_parts();
+        // Put the DUMMY in slot 0 and the real note in slot 1, and anchor the
+        // tree on the real note as before. `dv` is set; slot 0 is off-tree.
+        let (_, _, cm_real) = derive_input(&real);
+        let (w_real, anchor) = fabricated_single_tree(&cm_real);
+        let mut inst = build_bucket_with_witnesses(
+            18,
+            &[dummy.clone(), real.clone()],
+            &outputs,
+            1,
+            &[off_tree_witness(), w_real],
+            anchor,
+        );
+        inst.air.dv = true;
+        let pvs: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        let trace = inst.air.generate_trace::<F>(0);
+        let report = check_all_constraints(&inst.air, &trace, &pvs, Some(10));
+        assert!(
+            !report.is_ok(),
+            "slot 0's anchor bind must fire regardless of dv — the latch spans \
+             chain 1 only, and the program fixes which chain that is"
+        );
+    }
+
+    /// 🔴 **Both-slots-dummy is unreachable**, and refused **in-circuit** rather
+    /// than by the posted-fee rule. This is the hole the one-global-flag
+    /// construction had: there `Σin = 0` forced `fee = 0`, which only
+    /// `validate_body`'s `WrongFee` catches (see
+    /// `q69_zero_fee_is_satisfiable_in_circuit`, which executes that arithmetic).
+    /// Under the latch there is no `dv` assignment that relaxes both anchors, so
+    /// the circuit refuses one layer earlier and *"slot 0 is a real spend"* stops
+    /// being load-bearing on a consensus check.
+    #[cfg(feature = "q69-latch")]
+    #[test]
+    fn q69_both_slots_dummy_is_unreachable() {
+        let (real, _, dummy, _, _, _) = dummy1_parts();
+        let mut d2 = dummy.clone();
+        d2.sk = [0x1234, 0x5678, 0x9abc, 0xdef0]; // a second invented note
+        let zero_out = [
+            TxOutput { value: 0, rkm: [2; 4], rho: [3; 4], rseed: [4; 4] },
+            TxOutput { value: 0, rkm: [5; 4], rho: [6; 4], rseed: [7; 4] },
+        ];
+        // The anchor is a live tree root; neither slot is in it. Σin = 0 forces
+        // fee = 0, so this is the balanced version of the attack.
+        let (_, _, cm_real) = derive_input(&real);
+        let (_, anchor) = fabricated_single_tree(&cm_real);
+        let mut inst = build_bucket_with_witnesses(
+            18,
+            &[dummy, d2],
+            &zero_out,
+            0,
+            &[off_tree_witness(), off_tree_witness()],
+            anchor,
+        );
+        inst.air.dv = true;
+        let pvs: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        let trace = inst.air.generate_trace::<F>(0);
+        let report = check_all_constraints(&inst.air, &trace, &pvs, Some(10));
+        assert!(
+            !report.is_ok(),
+            "both slots dummy must be refused by the AIR, not by the fee rule"
+        );
+    }
+
+    /// The other direction, and the one that says the latch costs nothing when
+    /// unused: with `dv = false` the AIR is the unchanged 2×2 statement — the
+    /// real bucket still proves, and a witness that does not fold to the anchor
+    /// is still rejected on **both** slots. If the gated close leaked, the second
+    /// half of this would go green and nothing else would notice.
+    #[cfg(feature = "q69-latch")]
+    #[test]
+    fn q69_dv_false_is_the_unchanged_2x2() {
+        let (inst, _) = test_bucket(10, 6, 4, 8);
+        assert!(!inst.air.dv);
+        let pvs: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        let trace = inst.air.generate_trace::<F>(0);
+        check_constraints(&inst.air, &trace, &pvs);
+
+        // And the same slot-1-off-tree instance the latch accepts with dv = 1 is
+        // REJECTED with dv = 0 — so the acceptance in
+        // `q69_dummy1_satisfies_constraints` is the latch's doing and nothing
+        // else's.
+        let (real, w_real, dummy, outputs, fee, anchor) = dummy1_parts();
+        let inert = build_bucket_with_witnesses(
+            18, &[real, dummy], &outputs, fee, &[w_real, off_tree_witness()], anchor,
+        );
+        assert!(!inert.air.dv);
+        let pvs: Vec<F> = inert.pvs.iter().map(|v| F::from_u32(*v)).collect();
+        let trace = inert.air.generate_trace::<F>(0);
+        let report = check_all_constraints(&inert.air, &trace, &pvs, Some(10));
+        assert!(!report.is_ok(), "dv = 0 must still demand real membership");
     }
 
     /// Full-permutation check across a 24-block group.
