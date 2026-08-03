@@ -1109,6 +1109,73 @@ discovery，所以收款方找不到自己的输出（见 `CLAUDE.md` 的 T1 条
 
 ---
 
+## 32. `bask` —— 请求集合，以及请求方是从哪里开始走的（issue #229）
+
+**🟡 不能单独看。** 要和 `breq=`（§26）、`slag=`（§4）、`schain=`（§11）配着读。
+
+**它说的是什么。** 两个数字，`<请求集合>@<分叉点>`：
+
+- **请求集合** —— 本次采样时
+  [`missing_body_hashes`](../crates/qlab-p2p/src/adapter.rs) 产出了多少个主链区块体。
+  **这不是 `breq=`。** `breq=` 是**在途**的请求数；`bask=` 的第一个数字是请求方**想要**多少个。
+- **分叉点** —— `state_fork_point()` 的答案：本节点已应用、且**同时**位于分叉选择所跟随的
+  那条链上的最高区块；走不出结果时为 `-`。它就是请求方开始发问的起点，在这个字段之前
+  没有任何界面公开过它。
+
+**量具。** 瞬时值，打印时计算，用的是请求方自己用的那个 `max`
+（`MAX_BODIES_IN_FLIGHT` = 16）—— **所以第一个数字会在 16 处饱和，它不是差距大小。**
+差距要看 `slag=`。永远打印，包括 `0@-`。
+
+**正常值。** 健康节点是 `bask=0@<stip>`：没有要取的东西，而且分叉点就是已应用的链尖，
+因为链尖本来就在主链上。正常追赶中的节点第一个数字非零并且在下降。
+
+**为什么有这个字段。** 2026-08-03 三台主机连续一个多小时打印 `schain=fork`、冻住的 `stip`、
+`slag=21` 和 `breq=1–2`，而诊断依赖的那个数字这四个字段一个都没有携带：
+**「请求集合 15 而在途 2」和「请求集合就是 2」是同一个 `breq=`，却是不同的 bug。**
+
+| 读数 | 含义 |
+|---|---|
+| `bask=15@2680 breq=15` | 请求方在正常工作 —— 这是**供给**问题，去读 `BODYWAIT` 的逐条明细 |
+| `bask=2@2680 slag=21` | 请求集合根本填不上它面对的那个差距 —— 这是**请求方**问题 |
+| `bask=0@-` | `state_fork_point()` 没有给出答案；请求方没有基点 |
+
+**明细在 `BODYWAIT` 日志行上，不在这里。** 当一个节点的 `stip` 已经
+`UNOBTAINABLE_BODY_CADENCES` 个 cadence（冻结的 75 s 出块时间下是 20 分钟）没有推进，
+并且它要么偏离主链、要么仍在发问时，`qumbra-node` 会向 stdout 写：
+
+```
+BODYWAIT stip= stipid= schain= slag= sfork= ask= breq= pend= gate= mine= mrefuse= stuck_s=
+BODYWAIT ask h= id= age_s= asks= flight= ans=<peer>:<served|header-only|dont-have|noreply>,…
+```
+
+- `gate=` 是 `rejoin_main_chain` 自己的那个条件，只读求值、不执行：`missing@N` 表示本节点
+  **没有**持有 `fork + 1` 处的主链区块体，所以那个本可以回到主链的回退不会被执行。
+- `pend=` 是待应用区块体窗口的占用量。**`pend` 在涨而 `gate=missing`，就是区块体在到达却帮不上忙。**
+- `mine=refused-lag` 配 `mrefuse=N` 就是**本节点已经停止挖矿** —— 职责闸门因为它的已应用视图
+  过时而拒绝。这是正确行为，而在此之前它只作为一个 `/metrics` 计数器存在，偏偏 T0 主机都不开
+  metrics 监听。
+- `ans=` 列出**这条请求发给过的每一个 peer**，包括什么都没回的（`noreply`）。`header-only`
+  是持有区块头但不持有区块体的 peer —— 任何重启过的节点都会给出这个诚实答案，因为服务缓存不落盘。
+
+画面发生变化时写一份完整报告，画面不变时按心跳写一行摘要；健康节点、以及只是落后但
+`stip` 在推进的节点，**什么都不写**。
+
+**何时升级：** 永远不要仅凭这个字段。一台同时是 `schain=fork` 的主机上 `bask=` 与 `slag=`
+相差一个数量级，是值得连同 `BODYWAIT` 行一起上报的发现。
+
+**由谁锁定：** `bask_publishes_the_ask_set_and_the_fork_point_which_breq_cannot`、
+`a_stranded_node_journals_what_it_wants_and_that_it_has_stopped_mining`
+（`crates/qumbra-node/src/run.rs`），
+`the_three_layers_do_not_print_the_same_line`、
+`a_healthy_node_and_a_node_merely_behind_emit_nothing`
+（`crates/qlab-p2p/tests/ask_set_observable.rs`）。
+
+⚠️ **本文 §0 的字段清单是陈旧的，而且原因不是 `bask`。** `cpq`、`dfin`、`fdrop`（issue #204）
+比这个字段更早追加，却从未补进那份清单。请照 §0 已经说过的那样，以 `run.rs` 里的 `format!`
+为准。
+
+---
+
 ## 附录 A —— 两分钟分诊
 
 按顺序。遇到第一个 🔴 就停。

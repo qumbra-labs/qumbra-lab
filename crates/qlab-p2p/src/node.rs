@@ -24,6 +24,7 @@ use crate::compact::{
     Reconstruct,
 };
 use crate::addrman::AddrManager;
+use crate::bodywait::{BodyAnswer, BodyAskEntry, MAX_ANSWERS_PER_ASK, MAX_TRACKED_ASKS};
 use crate::gossip::{
     SeenCache, PENALTY_INVALID_OBJECT, PENALTY_MALFORMED, PENALTY_WELSHED_INV,
 };
@@ -226,6 +227,37 @@ pub const MAX_CHECKPOINT_QUERIES_IN_FLIGHT: usize = 1;
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
 pub const CHECKPOINT_QUERY_LAG_BLOCKS: u64 = 1;
 
+/// **One body request's observation record** (issue #229): how long it has been
+/// wanted, how many times it has been asked, of whom, and what each of them said.
+///
+/// Every field here is written by an instrumentation hook and read by exactly one
+/// consumer — [`P2pNode::body_ask_report`]. Nothing in the requester, the
+/// application funnel or the scoring path reads it, which is what keeps this
+/// module inside #229's "instrumentation only" fence.
+#[derive(Clone, Debug, Default)]
+struct AskRecord {
+    /// When this hash was first asked. **Not** reset by the re-ask ladder.
+    first_ms: u64,
+    /// When it was most recently asked — the prune key, so a record outlives one
+    /// expiry-and-re-ask cycle and is dropped if the hash genuinely goes away.
+    last_ask_ms: u64,
+    /// How many asks have been sent for it.
+    asks: u32,
+    /// Peers it has been asked of, in ask order, capped at
+    /// [`MAX_ANSWERS_PER_ASK`].
+    asked: Vec<PeerId>,
+    /// The most recent answer from each peer that gave one.
+    answers: BTreeMap<PeerId, BodyAnswer>,
+    /// Answers not kept because the cap bit. Printed as `+N`, never silent.
+    answers_dropped: usize,
+}
+
+impl AskRecord {
+    fn new(now_ms: u64) -> Self {
+        Self { first_ms: now_ms, last_ask_ms: now_ms, ..Self::default() }
+    }
+}
+
 /// One cached body: the ordered txs, the coinbase counter and the payout key —
 /// all three are needed to rebuild the *exact* body (issue #101) — plus the
 /// height it entered under and its metered weight, so eviction needs no rescan.
@@ -363,6 +395,21 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// peer cannot serve is not a welshed inv, and without this set there is no way
     /// to tell those two apart.
     body_reqs: HashMap<Hash32, u64>,
+    /// **What each body request has been answered with, and for how long it has
+    /// been wanted** (issue #229) — observation only, never read by any decision.
+    ///
+    /// It is a **separate ledger from [`Self::body_reqs`] on purpose**, and the
+    /// reason is the one number the incident turns on. `body_reqs`'s entry
+    /// lifetime *is* the [`BODY_REQUEST_TIMEOUT_MS`] re-ask ladder — it is dropped
+    /// and re-inserted every 15 s — so its timestamp can only ever answer "how long
+    /// since the last ask". #229 asks how long this node has been **unable to get
+    /// this block**, which outlives every rung of that ladder. Merging the two
+    /// would mean either changing the ladder or losing the number, and the ladder
+    /// is mechanism.
+    ///
+    /// Bounded twice: pruned against `body_reqs` on every request pass, and capped
+    /// at [`crate::bodywait::MAX_TRACKED_ASKS`].
+    body_asks: HashMap<Hash32, AskRecord>,
     /// Rotation cursor for spreading body requests across ready peers, so one silent
     /// peer costs a fraction of a batch rather than the whole of it, and so a re-ask
     /// after a timeout lands somewhere new.
@@ -413,6 +460,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             addrs: AddrManager::new(),
             limiter: RateLimiter::default(),
             body_reqs: HashMap::new(),
+            body_asks: HashMap::new(),
             body_rr: 0,
             unknown: UnknownStats::default(),
             unknown_types_seen: BTreeSet::new(),
@@ -458,6 +506,61 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// serve me" from "I never asked".
     pub fn body_requests(&self) -> usize {
         self.body_reqs.len()
+    }
+
+    /// **Every outstanding body request, with height, age and the per-peer answer**
+    /// (issue #229) — the per-entry half of the `BODYWAIT` journal line.
+    ///
+    /// Ascending by height, which is the order the state machine can apply them in
+    /// and therefore the order an operator reads the gap in. A request whose header
+    /// this node cannot find sorts last and prints `h=?`; that cannot happen while
+    /// the hash is in the ask set, because `missing_body_hashes` walks the header
+    /// chain to produce it.
+    ///
+    /// `now_ms` is the caller's monotonic clock — the same one `tick` is fed — so
+    /// the ages here and the re-ask ladder are measured against one source.
+    pub fn body_ask_report(&self, now_ms: u64) -> Vec<BodyAskEntry> {
+        let mut out: Vec<BodyAskEntry> = self
+            .body_asks
+            .iter()
+            .map(|(hash, rec)| BodyAskEntry {
+                hash: *hash,
+                height: self.node.header(hash).map(|h| h.height),
+                outstanding_ms: now_ms.saturating_sub(rec.first_ms),
+                asks: rec.asks,
+                asked: rec.asked.clone(),
+                answers: rec.answers.clone(),
+                answers_dropped: rec.answers_dropped,
+                in_flight: self.body_reqs.contains_key(hash),
+            })
+            .collect();
+        out.sort_by_key(|e| (e.height.unwrap_or(u64::MAX), e.hash));
+        out
+    }
+
+    /// Note that `hash` was asked of `pid` at `now_ms` (issue #229, observation
+    /// only). `first_ms` survives the re-ask ladder; `asks` counts every rung.
+    fn note_body_ask(&mut self, hash: Hash32, pid: PeerId, now_ms: u64) {
+        let rec = self.body_asks.entry(hash).or_insert_with(|| AskRecord::new(now_ms));
+        rec.asks = rec.asks.saturating_add(1);
+        rec.last_ask_ms = now_ms;
+        if !rec.asked.contains(&pid) && rec.asked.len() < MAX_ANSWERS_PER_ASK {
+            rec.asked.push(pid);
+        }
+    }
+
+    /// Note what `pid` answered for `hash` (issue #229, observation only).
+    ///
+    /// Only hashes this node actually asked for are recorded — an unsolicited
+    /// header or announce for a block nobody requested is ordinary gossip and has
+    /// nothing to say about the ask set.
+    fn note_body_answer(&mut self, hash: &Hash32, pid: PeerId, answer: BodyAnswer) {
+        let Some(rec) = self.body_asks.get_mut(hash) else { return };
+        if rec.answers.len() >= MAX_ANSWERS_PER_ASK && !rec.answers.contains_key(&pid) {
+            rec.answers_dropped = rec.answers_dropped.saturating_add(1);
+            return;
+        }
+        rec.answers.insert(pid, answer);
     }
 
     /// Finalized-checkpoint queries in flight right now (issue #204) — an
@@ -914,6 +1017,13 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     fn request_missing_bodies(&mut self, now_ms: u64) {
         self.body_reqs
             .retain(|_, sent| now_ms.saturating_sub(*sent) < BODY_REQUEST_TIMEOUT_MS);
+        // Issue #229, observation only: prune the ask ledger to what is either in
+        // flight or within one full re-ask cycle of having been. The grace window is
+        // what lets a record survive the expiry above and the re-insert below —
+        // without it the "how long has this been wanted" number would reset to zero
+        // every 15 s, which is exactly the number the incident needed and did not
+        // have. Nothing here is read by the requester.
+        self.prune_body_asks(now_ms);
         let room = MAX_BODIES_IN_FLIGHT.saturating_sub(self.body_reqs.len());
         if room == 0 {
             return;
@@ -938,14 +1048,44 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         let n = peers.len();
         let mut batches: Vec<Vec<InvItem>> = vec![Vec::new(); n];
         for (i, id) in wanted.iter().enumerate() {
-            batches[(self.body_rr + i) % n].push(InvItem { kind: InvKind::Block, id: *id });
+            let slot = (self.body_rr + i) % n;
+            batches[slot].push(InvItem { kind: InvKind::Block, id: *id });
             self.body_reqs.insert(*id, now_ms);
+            // Issue #229: record WHICH peer this rung of the ladder went to, so an
+            // unanswered ask is attributable to a peer rather than to the net. The
+            // slot arithmetic is read, never changed — `peers` and `batches` are
+            // zipped in the same order below, so `peers[slot]` is the peer this
+            // item is sent to.
+            self.note_body_ask(*id, peers[slot], now_ms);
         }
         self.body_rr = self.body_rr.wrapping_add(1);
         for (pid, items) in peers.into_iter().zip(batches) {
             if !items.is_empty() {
                 self.send(pid, MsgType::GetData, encode_inv(&items));
             }
+        }
+    }
+
+    /// Bound the #229 ask ledger. Two rules, both backstops rather than policy:
+    /// a record is kept while its hash is in flight or was asked within two re-ask
+    /// cycles, and the whole ledger is capped at [`MAX_TRACKED_ASKS`] with the
+    /// oldest first-ask evicted.
+    fn prune_body_asks(&mut self, now_ms: u64) {
+        let grace = BODY_REQUEST_TIMEOUT_MS.saturating_mul(2);
+        let reqs = &self.body_reqs;
+        self.body_asks.retain(|hash, rec| {
+            reqs.contains_key(hash) || now_ms.saturating_sub(rec.last_ask_ms) < grace
+        });
+        while self.body_asks.len() > MAX_TRACKED_ASKS {
+            let Some(oldest) = self
+                .body_asks
+                .iter()
+                .min_by_key(|(hash, rec)| (rec.first_ms, **hash))
+                .map(|(hash, _)| *hash)
+            else {
+                break;
+            };
+            self.body_asks.remove(&oldest);
         }
     }
 
@@ -1203,6 +1343,15 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         self.count_unknown_inv(&inv);
+        // Issue #229, before the scoring decision and independent of it: a
+        // `NotFound` for a hash we asked for is **the peer's answer**, and it is one
+        // of the three readings that separate layer (b) from (a) and (c). It says
+        // more than "unserved" — the peer does not hold the block at all, not even
+        // its header, which is a different fact from the header-only answer a peer
+        // that has the header but not the body gives.
+        for it in &inv.items {
+            self.note_body_answer(&it.id, from, BodyAnswer::DontHave);
+        }
         // Charge once per message, not per item, matching the pre-#130 (c) behaviour
         // for a message this node did not originate as a body request.
         //
@@ -1387,6 +1536,16 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         let id = header.header_hash();
+        // 🔴 **Issue #229 — the answer that was easiest to leave out.** A peer
+        // answers `GetData(Block)` with a bare `Header` when it holds the header and
+        // does **not possess the body** (`on_getdata`'s `None` arm; #199's honest
+        // answer, and the answer every node that restarted gives, because
+        // `P2pNode::blocks` is not persisted — #135). On the wire it is
+        // indistinguishable from ordinary header relay, so without this hook layer
+        // (b) has no observable at all: the ask simply stays outstanding and times
+        // out, which is what "nobody is serving me" and "nobody is answering me"
+        // both look like.
+        self.note_body_answer(&id, from, BodyAnswer::HeaderOnly);
         let outcome = self.node.ingest_header(header);
         if outcome.is_peer_fault() {
             self.peers.penalize(from, PENALTY_INVALID_OBJECT);
@@ -1665,6 +1824,12 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         let bh = ann.header.header_hash();
+        // Issue #229: the peer served the whole body. Recorded **before** the
+        // satisfaction checks below, because the case that matters is the one where
+        // the entry is NOT cleared — a body that arrived and was not applied leaves
+        // the ask outstanding with a `served` answer against it, and that reading is
+        // layer (c). Without it, (c) is byte-identical to (b) on every surface.
+        self.note_body_answer(&bh, from, BodyAnswer::Served);
         if self.blocks.contains(&bh) || self.node.has_stored_body(&bh) {
             if self.body_reqs.remove(&bh).is_some() {
                 // Issue #200: a requested body is now held — that is progress.

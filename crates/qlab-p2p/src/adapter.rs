@@ -63,7 +63,9 @@ use qlab_node::{
 };
 use qlab_devnet::body::TxVerifier;
 
+use crate::bodywait::{AskSetObservation, MineDuty, RejoinGate};
 use crate::codec::{checkpoint_id, tx_id as wire_tx_id};
+use crate::node::MAX_BODIES_IN_FLIGHT;
 use crate::n1::{
     BlockIngest, ChainView, CheckpointIngest, CommitteeControl, IngestOutcome, TxPool, VotesOutcome,
 };
@@ -235,6 +237,20 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// mined under the exemption can be extended until fork choice adopts it
     /// (equal-work keeps the incumbent tip, so one sibling alone is not enough).
     state_tip_mine_ready: bool,
+    /// Issue #229: the applied tip height as of the last [`Self::observe_body_fetch`]
+    /// call — the previous sample of the one quantity a stranding freezes.
+    stip_observed: u64,
+    /// Issue #229: monotonic-ms when the applied tip last **changed**, or `None`
+    /// before the first observation. See [`Self::ask_set_observation`] for why any
+    /// change — including a rewind, which lowers it — resets this.
+    stip_moved_ms: Option<u64>,
+    /// Issue #229: monotonic-ms of the most recent observation, so the stall
+    /// duration is measured against the same clock the re-ask ladder uses.
+    stall_now_ms: u64,
+    /// Issue #229: outstanding body asks as of the last observation. Kept because
+    /// the arming predicate needs it and nothing else on the adapter can see it —
+    /// the in-flight map lives in `P2pNode`.
+    breq_observed: usize,
 }
 
 /// **A finalize record this node refused to write, and why** (issue #204, from the
@@ -651,6 +667,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             finalize_refused_live: None,
             unserved_since_ms: None,
             state_tip_mine_ready: false,
+            stip_observed: 0,
+            stip_moved_ms: None,
+            stall_now_ms: 0,
+            breq_observed: 0,
         }
     }
 
@@ -915,6 +935,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         outstanding_breqs: usize,
         body_progress: bool,
     ) {
+        // ── Issue #229, observation only. ────────────────────────────────────
+        // Kept in its own block, ahead of every early return below, and writing
+        // only to its own fields: #200's latch (`unserved_since_ms`,
+        // `state_tip_mine_ready`) is byte-identical after this change, which is
+        // the property that keeps this baton on the instrumentation side of the
+        // fence.
+        //
+        // It rides in this call rather than in one of its own because the arming
+        // predicate needs `outstanding_breqs`, and this is the only per-tick hook
+        // that has it — the in-flight map lives in `P2pNode`.
+        self.observe_state_stall(now_ms, outstanding_breqs);
+
         let lagging = self.state_lag().is_lagging();
         let on_main_caught_up =
             !lagging && !self.applied_tip().is_off_main_chain();
@@ -968,6 +1000,142 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// Record a refused duty (issue #130 (a) part 3).
     fn refuse_for_lag(&mut self, duty: &'static str) {
         self.metrics.observe_lag_refusal(duty);
+    }
+
+    // ---- issue #229: making the ask set observable ---------------------------
+
+    /// **Sample the applied tip against the clock** — the stall latch behind the
+    /// `BODYWAIT` line. Writes nothing any decision reads.
+    ///
+    /// **Any change to `stip` resets it, including a decrease.** The trigger is
+    /// *frozen*, not *behind*, and the two are different populations separated by
+    /// two orders of magnitude: node3's own journal shows six rewinds in fifteen
+    /// minutes with `stip` advancing throughout — every one of them healthy — and
+    /// then `stip` pinned at 2693 for forty minutes and counting. A rewind lowers
+    /// `stip`, and it is the state machine *moving*; a latch that armed on it
+    /// would fire on exactly the six events the negative acceptance criterion
+    /// names.
+    ///
+    /// `slag` is deliberately **not** the trigger: a node applying blocks more
+    /// slowly than the chain produces them has a rising `slag` and is fine, and
+    /// an off-main node with `slag=0` is #200's legitimate equal-work sibling case
+    /// ("keep extending the verified branch until it is heavier"), which resolves
+    /// by fork choice and must not be reported as a strand.
+    fn observe_state_stall(&mut self, now_ms: u64, outstanding_breqs: usize) {
+        let stip = self.state.tip_height();
+        self.stall_now_ms = now_ms;
+        self.breq_observed = outstanding_breqs;
+        if self.stip_moved_ms.is_none() || stip != self.stip_observed {
+            self.stip_observed = stip;
+            self.stip_moved_ms = Some(now_ms);
+        }
+    }
+
+    /// **[`Self::state_fork_point`]'s answer, published** (issue #229): the
+    /// highest applied block that is also on the fork-choice main chain.
+    ///
+    /// It reaches the private function rather than recomputing the walk, so the
+    /// number an operator reads and the base the requester walks from cannot
+    /// drift. `None` is the reading that says layer (a) outright — the walk fell
+    /// off the state machine's own block store and `missing_body_hashes` silently
+    /// fell back to the applied tip, asking for blocks *above* the strand instead
+    /// of the one block the rejoin gate needs.
+    pub fn state_fork_point_observed(&self) -> Option<(u64, Hash32)> {
+        self.state_fork_point()
+    }
+
+    /// **[`Self::rejoin_main_chain`]'s gate, evaluated without taking it** (issue
+    /// #229) — the discriminator for layer (c).
+    ///
+    /// Recomputed from the same three inputs the gate reads, in the same order,
+    /// and it mutates nothing. A node whose bodies are arriving and whose
+    /// `pend=` is climbing while this stays `Missing` is the (c) reading: the
+    /// material is on the node and the rewind still will not be taken.
+    pub fn rejoin_gate_observed(&self) -> RejoinGate {
+        let Some((fork_height, _)) = self.state_fork_point() else {
+            return RejoinGate::NoForkPoint;
+        };
+        if fork_height == self.state.tip_height() {
+            return RejoinGate::OnMain;
+        }
+        let next = fork_height + 1;
+        let Some(next_hash) = self.main_chain_ancestor(next) else {
+            return RejoinGate::NoMainBlock;
+        };
+        if self.pending_bodies.contains_key(&(next, next_hash)) {
+            RejoinGate::Held(next)
+        } else {
+            RejoinGate::Missing(next)
+        }
+    }
+
+    /// **The whole derived half of the `BODYWAIT` line** (issue #229), in one pass.
+    ///
+    /// `in_flight` is `P2pNode`'s number (`breq=`) and is passed in because the
+    /// in-flight map is not the adapter's; everything else is read here so the two
+    /// views of the ask set cannot disagree.
+    ///
+    /// ## The arming predicate, stated because it is the thing that keeps the line
+    /// from becoming noise
+    ///
+    /// **`stip` frozen for [`UNOBTAINABLE_BODY_CADENCES`] cadences, AND (off-main
+    /// OR something outstanding to ask for).**
+    ///
+    /// - **The clock is `#201`'s, unchanged** — `UNOBTAINABLE_BODY_CADENCES ×
+    ///   CHECKPOINT_CADENCE_BLOCKS × block_time`, 20 minutes at the live 75 s
+    ///   target and 32 s in the in-process sim. Its argument transfers without
+    ///   amendment (cadence is the unit because the checkpoint grid is this net's
+    ///   progress quantum; block time is the conversion because while the chain is
+    ///   halted no height advances, and a loop-count threshold would be wrong by
+    ///   #107's 30 s-vs-131 s factor between images). Reusing it rather than adding
+    ///   a second constant also buys a **controlled comparison for free**: #222
+    ///   established that #201's exemption never armed across 817 production
+    ///   samples, and this latch runs the same clock behind a different predicate,
+    ///   so which of the two fires on a live stranding is evidence about #222
+    ///   obtained without building anything for it.
+    /// - **Twenty minutes is ~4× the measured p99 inter-block gap** (320 s over
+    ///   1,707 Phase B-WAN intervals against an 86 s mean) — outside legitimate
+    ///   jitter, and far inside the 2 h 13 m – 2 h 23 m the observed strandings ran.
+    /// - **The second clause is what makes an empty ask set reportable.** Layer
+    ///   (a)'s worst reading is a node stranded with *nothing* outstanding, so a
+    ///   predicate keyed on `breq > 0` alone would be silent in exactly the case it
+    ///   exists to catch. `off_main` covers it. Conversely a caught-up node on a
+    ///   halted net — `stip` frozen, on-main, nothing to ask — trips neither clause
+    ///   and stays quiet, which is right: it is not stranded, the chain is.
+    pub fn ask_set_observation(&self, in_flight: usize, mining: bool) -> AskSetObservation {
+        let applied = self.applied_tip();
+        let lag = self.state_lag();
+        let off_main = applied.is_off_main_chain();
+        let stuck_ms = self
+            .stip_moved_ms
+            .map_or(0, |t| self.stall_now_ms.saturating_sub(t));
+        let armed = self.stip_moved_ms.is_some()
+            && stuck_ms >= self.unobtainable_threshold_ms()
+            && (off_main || self.breq_observed > 0);
+        let mine = if !mining {
+            MineDuty::Off
+        } else if !lag.is_lagging() {
+            MineDuty::Ok
+        } else if self.state_tip_mine_ready {
+            MineDuty::Exempt
+        } else {
+            MineDuty::RefusedLag
+        };
+        AskSetObservation {
+            armed,
+            stuck_ms,
+            state_tip: applied.height,
+            state_tip_id: applied.id_field(),
+            lag: lag.blocks(),
+            off_main,
+            fork_point: self.state_fork_point().map(|(h, _)| h),
+            ask_set: self.missing_body_hashes(MAX_BODIES_IN_FLIGHT).len(),
+            in_flight,
+            pending: self.pending_bodies.len(),
+            gate: self.rejoin_gate_observed(),
+            mine,
+            mine_refusals: self.metrics.lag_refusals("mine"),
+        }
     }
 
     /// **Bodies this node's state machine refused at the application funnel, and the

@@ -55,6 +55,8 @@ use crate::telemetry_server::TelemetryServer;
 
 use qlab_p2p::addrman::{valid_addr, AddrManager, DIAL_RETRY_INTERVAL_MS};
 use qlab_p2p::adapter::{MiningClock, NodeAdapter};
+use qlab_p2p::bodywait::BodyWaitJournal;
+use qlab_p2p::node::BODY_REQUEST_TIMEOUT_MS;
 use qlab_p2p::n1::{ChainView, CommitteeControl};
 use qlab_p2p::sync::SyncPhase;
 use qlab_p2p::transport::TcpTransport;
@@ -310,6 +312,10 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     ///   not exist). Latching bounds that to *before this node's first block*, where
     ///   refusing is the safe direction anyway.
     mine_gate_latched: bool,
+    /// **Issue #229: the `BODYWAIT` journal's rate limiter.** Holds what was last
+    /// reported and when, so a stranding that changes nothing does not become a
+    /// stream. See [`qlab_p2p::bodywait::BodyWaitJournal`] for the three rules.
+    body_wait: BodyWaitJournal,
 }
 
 /// Why this node may or may not mine right now (issue #106) — the verdict behind
@@ -600,6 +606,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             last_sample: Instant::now(),
             last_maintain: Instant::now(),
             mine_gate_latched: false,
+            body_wait: BodyWaitJournal::new(),
             started: Instant::now(),
             release,
             halt_at: release.halt_at(),
@@ -1187,8 +1194,41 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             .durable_finalized_height()
             .map_or_else(|| "-".to_string(), |h| h.to_string());
         let fdrop = node.finalize_refused_total();
+        // Issue #229: `bask=` is **appended at the end**, after `fdrop=`, under the
+        // same rule as every addition since #87 — every pre-existing field keeps its
+        // name, position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified. **Touches TELEMETRY.**
+        //
+        // 🔴 **It is the one thing this line could not say about a stranded node.**
+        // Three hosts printed `schain=fork`, a frozen `stip`, `slag=21` and
+        // `breq=1–2` for over an hour, and the whole diagnosis turned on a number
+        // none of those four fields carries: *how many bodies the requester actually
+        // asked for*. `breq=` is the in-flight level, capped at
+        // `MAX_BODIES_IN_FLIGHT`; the **ask set** is what `missing_body_hashes`
+        // produced, and **an ask set of 15 with 2 in flight and an ask set of 2 are
+        // the same `breq=` and different bugs.** The second number is
+        // `state_fork_point()`'s answer — where the requester is walking *from* —
+        // which no surface anywhere published, so a wrong base was equally
+        // invisible.
+        //
+        // Two numbers in one field, `dialable=`'s and `unk=`'s precedent: they
+        // answer one question — *is the requester asking for the right blocks?* —
+        // and splitting them would put two fields on the line for one fact.
+        //
+        // Read it against `breq=` and `slag=`: `bask=15@2680 breq=15` is a
+        // requester doing its job and a serving problem; `bask=2@2680 slag=21` is an
+        // ask set that cannot close the gap it is looking at; `bask=0@-` is
+        // `state_fork_point()` answering `None`, which is the requester walking from
+        // the applied tip of a dead branch.
+        //
+        // Caliper: an instantaneous level computed at print time, the ask set the
+        // requester itself would produce on this tick with the same `max`
+        // (`qlab_p2p::node::MAX_BODIES_IN_FLIGHT`, 16) — **so it saturates at 16 and
+        // is not a gap size**. The fork point is a chain height, or `-` when the
+        // walk returns nothing. Always printed, `0@-` included (the #130 (a) rule).
+        let bask = node.ask_set_observation(self.p2p.body_requests(), self.mining).telemetry_field();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={} unk={}/{} cpq={} dfin={} fdrop={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={} unk={}/{} cpq={} dfin={} fdrop={} bask={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1214,6 +1254,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             cpq,
             dfin,
             fdrop,
+            bask,
         )
     }
 
@@ -1452,6 +1493,46 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             .iter()
             .map(|r| r.to_string())
             .collect();
+        for line in &lines {
+            println!("{line}");
+        }
+        lines
+    }
+
+    /// **Emit the `BODYWAIT` journal for a node that has stopped applying blocks**
+    /// (issue #229), and return the lines emitted.
+    ///
+    /// Beside `REWIND` and `FINALIZE refused`, on the message-pump cadence, and
+    /// for the same reason those are: `TELEMETRY` carries levels, and this is the
+    /// surface that can carry per-entry, per-peer detail a field cannot.
+    ///
+    /// 🔴 **Why here and not `/metrics`.** `metrics_addr` is `Option<String>` with
+    /// `#[serde(default)]` — *"Unset = no listener at all, the default and the
+    /// right one for any node"* — and every T0 host runs that default. The mining
+    /// refusal this line reports is already a counter behind exactly that endpoint
+    /// (`refuse_for_lag` is `self.metrics.observe_lag_refusal(duty)` and nothing
+    /// else), which is why three hosts stopped mining for forty minutes with no
+    /// reachable surface saying so. A new counter there would reproduce the defect
+    /// it exists to close.
+    ///
+    /// **Empty on every healthy node, always** — see
+    /// [`qlab_p2p::adapter::NodeAdapter::ask_set_observation`] for the arming
+    /// predicate and why it is `stip` frozen rather than `slag` large.
+    pub fn emit_body_waits(&mut self) -> Vec<String> {
+        let now_ms = self.started.elapsed().as_millis() as u64;
+        self.emit_body_waits_at(now_ms)
+    }
+
+    /// [`Self::emit_body_waits`] against a caller-supplied monotonic clock — the
+    /// seam the tests drive, so a 20-minute threshold is reachable without a
+    /// 20-minute test.
+    pub fn emit_body_waits_at(&mut self, now_ms: u64) -> Vec<String> {
+        let in_flight = self.p2p.body_requests();
+        let obs = self.p2p.node().ask_set_observation(in_flight, self.mining);
+        let entries = self.p2p.body_ask_report(now_ms);
+        let heartbeat = self.p2p.node().unobtainable_threshold_ms();
+        let lines =
+            self.body_wait.report(&obs, &entries, now_ms, heartbeat, BODY_REQUEST_TIMEOUT_MS);
         for line in &lines {
             println!("{line}");
         }
@@ -1790,6 +1871,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             self.emit_rounds();
             self.emit_rewinds();
             self.emit_finalize_refusals();
+            // Issue #229. On the pump cadence like its two neighbours, and silent
+            // on every healthy node — the rate limit is inside the journal, not
+            // here, so the emission cadence and the reporting cadence stay two
+            // separate decisions.
+            self.emit_body_waits();
             if self.mining && self.last_mine.elapsed() >= self.mine_interval {
                 if self.try_mine() {
                     self.try_checkpoint();
@@ -2207,14 +2293,21 @@ mod tests {
             line.contains(" unk=0/0 "),
             "the version-skew field is present and mid-line: {line}"
         );
-        // ⚠️ Rewritten a fourth time, by #204. This assertion pins the tail BY NAME
+        // #204's field is no longer the tail; it is asserted mid-line, by name, so
+        // the next append does not have to touch this one.
+        assert!(line.contains(" fdrop=0 "), "nothing was refused: {line}");
+        // ⚠️ Rewritten a FIFTH time, by #229. This assertion pins the tail BY NAME
         // on an append-only line, so every append must edit it — and git produced no
-        // conflict marker here on any of the four, because the incoming branch never
+        // conflict marker here on any of the five, because the incoming branch never
         // touched this hunk. The identical idea 1800 lines below DID conflict, every
         // time, which is what makes this copy the dangerous one.
+        //
+        // #229: a fresh rig is caught up on its own one-node chain, so the ask set
+        // is empty and the fork point is the applied tip — `bask=0@0`, not `0@-`:
+        // `state_fork_point()` answers, it just answers "you are on the main chain".
         assert!(
-            line.ends_with(" fdrop=0"),
-            "the newest append is last, and nothing was refused: {line}"
+            line.ends_with(" bask=0@0"),
+            "the newest append is last, and the requester wants nothing: {line}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -2353,6 +2446,10 @@ mod tests {
                         // field of this family, added after the line the claim is
                         // about, and the list growing is the point.
                         && !kv.starts_with("breq=")
+                        // #229's append, and it is the sharpest member of the family
+                        // yet: `bask=3@0` against `bask=0@3` separates these two
+                        // nodes on the ask set alone, without reading a height.
+                        && !kv.starts_with("bask=")
                 })
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -2679,6 +2776,137 @@ mod tests {
         println!("PR-SAMPLE lagging: {lagging}");
         println!("PR-SAMPLE wedged : {wedged}");
         for base in [bw, bl, bg] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    // ---- issue #229: the ask set, on the two surfaces an operator has ---------
+
+    /// 🔴 **`bask=` is the ask set, and `breq=` is not.**
+    ///
+    /// *"An ask set of 15 with 2 in flight and an ask set of 2 are the same `breq`
+    /// and different bugs."* The live hosts printed `breq=1–2` for over an hour and
+    /// no field on the line could say which of those two it was, because the ask
+    /// set — what `missing_body_hashes` actually produced — was never published.
+    ///
+    /// This node is stranded with **nothing in flight** (it has no peer to ask) and
+    /// an ask set of three, which is precisely the pair the old line collapsed: on
+    /// `main` it prints `breq=0` and there is no second number.
+    #[test]
+    fn bask_publishes_the_ask_set_and_the_fork_point_which_breq_cannot() {
+        use qlab_p2p::n1::BlockIngest;
+
+        let (cw, genesis, bw) = rig_paying("i229_bask_win", 0xa1);
+        let winner = node_mining_its_own(&cw, &genesis, 3);
+        let winning = main_chain_headers(&winner);
+
+        let (cl, _, bl) = rig_paying("i229_bask_lose", 0xb2);
+        let mut loser = node_mining_its_own(&cl, &genesis, 1);
+        for header in &winning {
+            loser.p2p_mut().node_mut().ingest_header(*header);
+        }
+
+        let healthy = winner.telemetry_sample();
+        let stranded = loser.telemetry_sample();
+        // A node on its own chain wants nothing and knows where it is.
+        assert_eq!(field(&healthy, "bask"), "0@3", "nothing to fetch: {healthy}");
+        assert_eq!(field(&healthy, "breq"), "0");
+        // The stranded node wants three main-chain bodies and has asked for none.
+        assert_eq!(field(&stranded, "schain"), "fork", "{stranded}");
+        assert_eq!(field(&stranded, "breq"), "0", "no peer, so nothing in flight");
+        assert_eq!(
+            field(&stranded, "bask"),
+            "3@0",
+            "🔴 …and yet it wants three bodies, from a fork point at genesis — the \
+             two facts `breq=0` cannot carry: {stranded}"
+        );
+        // The fork point moves with the strand, so it is a measurement and not a
+        // constant: applying the winning branch puts it back on the main chain.
+        for header in &winning {
+            let hash = header.header_hash();
+            let stored = winner.state().chain().block(&hash).expect("winner has it").clone();
+            loser.p2p_mut().node_mut().ingest_block(*header, stored.body());
+        }
+        let rejoined = loser.telemetry_sample();
+        assert_eq!(field(&rejoined, "schain"), "main", "{rejoined}");
+        assert_eq!(field(&rejoined, "bask"), "0@3", "the gap closed: {rejoined}");
+        println!("PR-SAMPLE i229 healthy : {healthy}");
+        println!("PR-SAMPLE i229 stranded: {stranded}");
+        for base in [bw, bl] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// 🔴 **The `BODYWAIT` journal on the binary, including the mining refusal —
+    /// and silence on a healthy node.**
+    ///
+    /// The three stranded hosts stopped mining, correctly (`lagging && !exempt ⇒
+    /// refuse`), and **nothing said so**: `refuse_for_lag` is a `/metrics` counter
+    /// and `metrics_addr` is unset on every T0 host, so the only way to know was to
+    /// difference `tip=` across hosts. This asserts the line says it, on stdout,
+    /// with no listener configured — and that the refusal *count* is on it too, so
+    /// the claim is a measurement rather than a re-derivation of the predicate.
+    ///
+    /// The clock is supplied rather than slept: the latch threshold is
+    /// `UNOBTAINABLE_BODY_CADENCES × CHECKPOINT_CADENCE_BLOCKS × block_time` = 20
+    /// minutes at the frozen 75 s target, and a test that waited for it would be a
+    /// test nobody runs.
+    #[test]
+    fn a_stranded_node_journals_what_it_wants_and_that_it_has_stopped_mining() {
+        use qlab_p2p::n1::BlockIngest;
+
+        let (cw, genesis, bw) = rig_paying("i229_journal_win", 0xa1);
+        let mut winner = node_mining_its_own(&cw, &genesis, 3);
+        let winning = main_chain_headers(&winner);
+
+        let (cl, _, bl) = rig_paying("i229_journal_lose", 0xb2);
+        let mut loser = node_mining_its_own(&cl, &genesis, 1);
+        for header in &winning {
+            loser.p2p_mut().node_mut().ingest_header(*header);
+        }
+        // The refusal the line reports: the duty gate declines, once, for real.
+        assert!(!loser.try_mine(), "a node whose applied view is stale must not mine");
+
+        let threshold = loser.p2p().node().unobtainable_threshold_ms();
+        // Start the stall clock, then step past the threshold. `observe_body_fetch`
+        // is the per-tick hook `P2pNode::tick` calls; driving it directly is what
+        // lets a 20-minute constant be tested in microseconds.
+        loser.p2p_mut().node_mut().observe_body_fetch(0, 0, false);
+        assert!(loser.emit_body_waits_at(0).is_empty(), "not yet — the clock just started");
+        loser.p2p_mut().node_mut().observe_body_fetch(threshold + 1, 0, false);
+        let lines = loser.emit_body_waits_at(threshold + 1);
+
+        assert!(!lines.is_empty(), "a node stranded past the threshold says so");
+        let summary = &lines[0];
+        assert!(summary.starts_with("BODYWAIT stip=1 "), "{summary}");
+        assert!(summary.contains(" schain=fork "), "{summary}");
+        assert!(summary.contains(" sfork=0 ask=3 breq=0 "), "the ask set: {summary}");
+        assert!(summary.contains(" gate=missing@1 "), "the rejoin gate: {summary}");
+        assert!(
+            summary.contains(" mine=refused-lag mrefuse=1 "),
+            "🔴 it has stopped mining, and the count is the evidence: {summary}"
+        );
+        assert!(summary.ends_with(" stuck_s=1200"), "and for how long: {summary}");
+
+        // The rate limit: an unchanged picture inside the floor is silent.
+        loser.p2p_mut().node_mut().observe_body_fetch(threshold + 2_000, 0, false);
+        assert!(
+            loser.emit_body_waits_at(threshold + 2_000).is_empty(),
+            "an unchanged stranding does not repeat itself every pass"
+        );
+
+        // 🔴 The negative, on the binary: the winner is healthy and mining, and it
+        // has been at its tip for longer than the threshold. It emits nothing.
+        winner.p2p_mut().node_mut().observe_body_fetch(0, 0, false);
+        winner.p2p_mut().node_mut().observe_body_fetch(threshold * 4, 0, false);
+        assert!(
+            winner.emit_body_waits_at(threshold * 4).is_empty(),
+            "a healthy node never emits this line — not even a quiet one"
+        );
+        assert!(winner.try_mine(), "…and it is still mining");
+
+        println!("PR-SAMPLE i229 journal: {summary}");
+        for base in [bw, bl] {
             let _ = std::fs::remove_dir_all(&base);
         }
     }
@@ -3980,6 +4208,8 @@ mod tests {
                 "unk",
                 // ── appended by #204, at the end ──
                 "cpq", "dfin", "fdrop",
+                // ── appended by #229, at the end ──
+                "bask",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -4022,7 +4252,12 @@ mod tests {
         // agrees with `final=`. This rig finalized genesis, so both say 0.
         assert!(line.contains(" final=0 "), "the tracker head: {line}");
         assert!(line.contains(" dfin=0 "), "and the DURABLE head agrees: {line}");
-        assert!(line.ends_with(" fdrop=0"), "nothing was refused, last: {line}");
+        assert!(line.contains(" fdrop=0 "), "nothing was refused: {line}");
+        // #229: a node alone on its own chain has an empty ask set and a fork point
+        // that IS its applied tip (height 1 here — it mined one block), so the two
+        // derived quantities say "there is nothing to fetch and I know exactly where
+        // I am". That is the healthy reading and it is a fact, not an absence.
+        assert!(line.ends_with(" bask=0@1"), "nothing wanted, last: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
