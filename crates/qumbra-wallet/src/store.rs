@@ -110,11 +110,20 @@ impl WalletDir {
         }
         let mut entropy = [0u8; ENTROPY_LEN];
         entropy.copy_from_slice(&bytes[1..]);
+        // The version gate, explicit (#246 finding): a mnemonic round-trip does
+        // NOT validate this byte — the phrase carries entropy+checksum only and
+        // decodes at the CURRENT version. The byte is a derivation-domain
+        // separator, so a wrong byte silently derives a DIFFERENT wallet, which
+        // a user reads as vanished funds. Compare, don't round-trip.
+        if bytes[0] != qlab_wallet::seed::SEED_VERSION {
+            return Err(StoreError::BadSeedFile(format!(
+                "version {} refused: this binary derives at version {} only, and a \
+                 different byte would silently derive a different wallet",
+                bytes[0],
+                qlab_wallet::seed::SEED_VERSION
+            )));
+        }
         let seed = MasterSeed::with_version(bytes[0], entropy);
-        // Round-trip the version through the mnemonic layer so an unknown
-        // version fails HERE, loudly, not at backup time.
-        MasterSeed::from_mnemonic(&seed.to_mnemonic())
-            .map_err(|e| StoreError::BadSeedFile(format!("version {} refused: {e:?}", bytes[0])))?;
 
         let allocated = match std::fs::read_to_string(dir.join(ADDR_FILE)) {
             Ok(text) => parse_addresses(&text)?,
@@ -304,5 +313,22 @@ mod tests {
         std::fs::remove_file(d.join(SEED_FILE)).unwrap();
         std::fs::write(d.join(SEED_FILE), seed).unwrap();
         assert!(matches!(WalletDir::open(&d), Err(StoreError::BadSeedFile(_))));
+    }
+
+    #[test]
+    fn a_flipped_version_byte_is_refused_not_silently_a_different_wallet() {
+        // The #246 finding: length-preserving corruption of byte[0] must be a
+        // named refusal — with_version derives DIFFERENT keys per byte, so a
+        // pass here would render someone's funds as vanished.
+        let d = tmp("verbyte");
+        WalletDir::create(&d, MasterSeed::from_entropy([5; ENTROPY_LEN])).unwrap();
+        let mut seed = std::fs::read(d.join(SEED_FILE)).unwrap();
+        seed[0] = 0xEE;
+        std::fs::remove_file(d.join(SEED_FILE)).unwrap();
+        std::fs::write(d.join(SEED_FILE), seed).unwrap();
+        let e = WalletDir::open(&d).unwrap_err();
+        let msg = e.to_string();
+        assert!(msg.contains("version 238 refused"), "{msg}");
+        assert!(msg.contains("different wallet"), "{msg}");
     }
 }
