@@ -195,6 +195,31 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  listen:       {}", node.listen_addr());
     println!("  data dir:     {}", config.data_dir.display());
     println!("  {}", node.recovery_report());
+    // Issue #225: before this, a snapshot that could not be honoured against its
+    // own block log KILLED the process (`rewind refused: rewind target is not a
+    // known block`, 19 times on a rolled T0 host, with no startup line at all).
+    // It is a fall-through now, and the fall-through is always correct — so the
+    // only thing left to get wrong is letting it pass unnoticed. This says, at the
+    // one moment an operator is reading, that the datadir's snapshot was unusable.
+    if let Some(why) = node.recovery_report().snapshot_rejected {
+        println!(
+            "  ⚠️  THE SNAPSHOT IN THIS DATA DIR COULD NOT BE HONOURED against its own \
+             blocks.log (issue #225)."
+        );
+        println!("      reason: {why}");
+        println!(
+            "      Recovered by a full replay from genesis — the log is the source of truth and \
+             this"
+        );
+        println!(
+            "      state is exactly what a from-genesis replay reaches. The stale snapshot is \
+             rewritten"
+        );
+        println!(
+            "      at the next graceful stop. If this repeats every start, the log is what to \
+             look at."
+        );
+    }
     println!("  genesis hash: {}", genesis.hash_hex());
     println!("  mining:       {}", config.mining);
     println!("  committee keys held: {}", config.committee_key_paths.len());
