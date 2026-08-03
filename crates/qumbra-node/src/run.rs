@@ -2426,18 +2426,27 @@ mod tests {
         // #204's field is no longer the tail; it is asserted mid-line, by name, so
         // the next append does not have to touch this one.
         assert!(line.contains(" fdrop=0 "), "nothing was refused: {line}");
-        // ⚠️ Rewritten a FIFTH time, by #229. This assertion pins the tail BY NAME
-        // on an append-only line, so every append must edit it — and git produced no
-        // conflict marker here on any of the five, because the incoming branch never
-        // touched this hunk. The identical idea 1800 lines below DID conflict, every
-        // time, which is what makes this copy the dangerous one.
+        // ⚠️ Rewritten a SIXTH time, by #212 — and this one was caught by the
+        // workspace suite rather than by inspection, which is the warning the fifth
+        // rewrite left. This assertion pins the tail BY NAME on an append-only line,
+        // so every append must edit it, and git produced no conflict marker here on
+        // any of the six because the incoming branch never touched this hunk. The
+        // identical idea 1800 lines below DID conflict, every time, which is what
+        // makes this copy the dangerous one.
         //
-        // #229: a fresh rig is caught up on its own one-node chain, so the ask set
-        // is empty and the fork point is the applied tip — `bask=0@0`, not `0@-`:
-        // `state_fork_point()` answers, it just answers "you are on the main chain".
+        // #229's reading is unchanged and is now asserted mid-line: a fresh rig is
+        // caught up on its own one-node chain, so the ask set is empty and the fork
+        // point is the applied tip — `bask=0@0`, not `0@-`: `state_fork_point()`
+        // answers, it just answers "you are on the main chain".
+        assert!(line.contains(" bask=0@0 "), "the requester wants nothing: {line}");
+        // #212: head #3's identity is the tail now. This rig has finalized nothing on
+        // EITHER head — `final=-` beside `dfin=-`/`dfinbh=-` — which is the consistent
+        // cold-start reading and not a divergence.
+        assert!(line.contains(" final=- "), "nothing finalized on head #1: {line}");
+        assert!(line.contains(" dfin=- "), "nor on head #3: {line}");
         assert!(
-            line.ends_with(" bask=0@0"),
-            "the newest append is last, and the requester wants nothing: {line}"
+            line.ends_with(" dfinbh=-"),
+            "the newest append is last, and it has no head to name: {line}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
@@ -4340,6 +4349,8 @@ mod tests {
                 "cpq", "dfin", "fdrop",
                 // ── appended by #229, at the end ──
                 "bask",
+                // ── appended by #212, at the end ──
+                "dfinbh",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -4387,7 +4398,77 @@ mod tests {
         // that IS its applied tip (height 1 here — it mined one block), so the two
         // derived quantities say "there is nothing to fetch and I know exactly where
         // I am". That is the healthy reading and it is a fact, not an absence.
-        assert!(line.ends_with(" bask=0@1"), "nothing wanted, last: {line}");
+        assert!(line.contains(" bask=0@1 "), "nothing wanted: {line}");
+        // #212: head #3's identity, and it is the LAST field. `dfin=0` above says how
+        // high the durable head is; this says WHAT it is, which is what a cross-host
+        // comparison needs and what `dfin=` alone cannot carry.
+        assert!(line.ends_with(&format!(" dfinbh={}", node.telemetry().durable.id_field())), "{line}");
+        assert_ne!(field(&line, "dfinbh"), "-", "a finalized durable head has an identity: {line}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Acceptance (#212, on a real node): the durable head reaches `/v1/telemetry`,
+    /// the wire and the log line come from ONE snapshot, and the identity is the
+    /// durable head's own block hash.**
+    ///
+    /// The unit tests in `qlab_node::telemetry` prove the encoding; what only the
+    /// binary can prove is that head #3 is actually *read* here and reaches the served
+    /// bytes. That was the whole defect: `dfin=` existed on the log line since
+    /// `PR #207` and `qumbra-opview` reads the wire and nothing else.
+    #[test]
+    fn the_durable_head_reaches_the_telemetry_wire_and_agrees_with_the_log_line() {
+        use qlab_node::{ChainStore as _, DurableView};
+
+        let (config, genesis, base) = rig("telemetry_dfinbh", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint();
+        assert!(node.try_mine());
+
+        let t = node.telemetry();
+        let line = node.telemetry_sample();
+
+        // 🔴 The wire states head #3 — not `Unavailable`, which is what every
+        // composition that cannot see it reports and what this one did before #212.
+        let DurableView::Head(head) = t.durable else {
+            panic!("the binary's composition must state head #3, got {:?}", t.durable);
+        };
+
+        // The identity is the durable head's own block hash prefix, taken from the
+        // state machine's store rather than from anything this test recomputes.
+        let store = node.p2p().node().state().chain();
+        assert_eq!(head.height, store.finalized_height().unwrap());
+        let expected: String = store.finalized_hash().unwrap()[..6]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(head.identity.field(), expected, "dfinbh IS the durable head's block hash prefix");
+
+        // 🔴 …and it is NOT `fid`. Same width, different space: `fid` is the digest of
+        // the bytes the committee signed. If a future edit ever made these equal, the
+        // trap this field is named to avoid would be invisible.
+        assert_ne!(head.identity.field(), t.fid_field(), "a block hash is not a checkpoint identity");
+
+        // One snapshot, both surfaces (#117's discipline): the line's two fields are
+        // the wire's two fields, and there is nothing for them to disagree with.
+        assert_eq!(field(&line, "dfin"), t.durable.height_field());
+        assert_eq!(field(&line, "dfinbh"), t.durable.id_field());
+        assert_eq!(field(&line, "dfin"), field(&line, "final"), "healthy: the two heads agree");
+
+        // And the served bytes round-trip through the reader an operator actually
+        // uses, at the bumped version.
+        let served = t.to_bytes();
+        assert_eq!(served[0], qlab_node::RPC_VERSION);
+        let (version, decoded) = qlab_node::Telemetry::from_bytes_compat(&served).unwrap();
+        assert_eq!(version, 0x04);
+        assert_eq!(decoded, t);
+        assert_eq!(decoded.durable, t.durable);
+        assert_eq!(
+            decoded.durable_agreement(),
+            qlab_node::DurableAgreement::Agreed,
+            "a healthy node's two heads agree, and the WIRE now says so"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 
