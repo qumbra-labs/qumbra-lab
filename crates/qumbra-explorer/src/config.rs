@@ -46,6 +46,12 @@ pub enum ConfigRefusal {
     /// The node config would open a telemetry or metrics listener from this
     /// process; the explorer's page must be its only HTTP surface.
     ExtraListener(&'static str),
+    /// `discovery_addr` is set and not obviously loopback. Loopback and unset
+    /// both pass (the #188 2/4 default is a loopback bind and stays untouched);
+    /// anything else — a public IP, `0.0.0.0`, a hostname, an unparseable value —
+    /// is refused, because this is a startup refusal: a false refusal is loud
+    /// and a false accept is a silent second public surface.
+    PublicDiscoveryAddr(String),
 }
 
 impl std::fmt::Display for ConfigRefusal {
@@ -73,8 +79,34 @@ impl std::fmt::Display for ConfigRefusal {
                  process's only HTTP surface — fleet telemetry stays private (§6.2); remove \
                  {which} from the node config."
             ),
+            ConfigRefusal::PublicDiscoveryAddr(addr) => write!(
+                f,
+                "the observer node's config sets discovery_addr = `{addr}`, which is not \
+                 obviously loopback. The explorer's page must be this process's only public \
+                 HTTP surface — bind discovery to 127.0.0.1/[::1]/localhost, or remove \
+                 discovery_addr to keep the loopback default."
+            ),
         }
     }
+}
+
+/// Whether `host:port` is *obviously* loopback: `localhost`, a loopback IPv4, or
+/// a bracketed loopback IPv6. No DNS resolution — a name that merely resolves to
+/// loopback is not obvious, and a startup check must not depend on a resolver.
+fn is_loopback_hostport(hostport: &str) -> bool {
+    use std::net::IpAddr;
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    };
+    host == "localhost" || host.parse::<IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
 }
 
 impl std::error::Error for ConfigRefusal {}
@@ -115,6 +147,13 @@ impl ExplorerConfig {
         }
         if node.metrics_addr.is_some() {
             return Err(ConfigRefusal::ExtraListener("metrics_addr"));
+        }
+        // The same claim as the two above, enforced rather than inherited from
+        // another crate's default: not obviously loopback ⇒ refuse.
+        if let Some(d) = node.discovery_addr.as_deref() {
+            if !is_loopback_hostport(d) {
+                return Err(ConfigRefusal::PublicDiscoveryAddr(d.to_string()));
+            }
         }
         Ok(())
     }
@@ -174,6 +213,30 @@ mod tests {
         node.mining = true;
         let e = cfg.check_observer(&node).unwrap_err();
         assert!(matches!(e, ConfigRefusal::Mining), "{e}");
+    }
+
+    #[test]
+    fn a_publicly_bound_discovery_addr_is_refused_by_name() {
+        let cfg = ExplorerConfig::from_toml(
+            "node_config = \"/tmp/node.toml\"\nlisten_addr = \"127.0.0.1:0\"\n",
+        )
+        .unwrap();
+        // Not obviously loopback ⇒ refused: a public bind, a LAN address, a
+        // hostname (no resolver at startup), and an unparseable value alike.
+        for bad in ["0.0.0.0:8645", "10.0.0.5:8645", "node0:8645", "garbage"] {
+            let mut node = node_cfg();
+            node.discovery_addr = Some(bad.to_string());
+            let e = cfg.check_observer(&node).unwrap_err();
+            assert!(matches!(e, ConfigRefusal::PublicDiscoveryAddr(_)), "{bad}: {e}");
+            assert!(e.to_string().contains(bad), "{bad} named in the refusal");
+        }
+        // Obviously loopback (and unset) both pass — the #188 2/4 default stands.
+        for ok in ["127.0.0.1:8645", "[::1]:8645", "localhost:8645"] {
+            let mut node = node_cfg();
+            node.discovery_addr = Some(ok.to_string());
+            cfg.check_observer(&node).unwrap_or_else(|e| panic!("{ok} must pass: {e}"));
+        }
+        cfg.check_observer(&node_cfg()).expect("None passes");
     }
 
     #[test]
