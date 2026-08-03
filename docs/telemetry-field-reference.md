@@ -1322,6 +1322,87 @@ number when no upgrade is in flight.
 
 ---
 
+## 32. `bask` — the ask set, and where the requester is walking from (issue #229)
+
+**🟡 Not alone.** Pair with `breq=` (§26), `slag=` (§4) and `schain=` (§11).
+
+**What it says.** Two numbers, `<ask set>@<fork point>`:
+
+- **the ask set** — how many main-chain block bodies
+  [`missing_body_hashes`](../crates/qlab-p2p/src/adapter.rs) produced on this
+  sample. **This is not `breq=`.** `breq=` is how many asks are *in flight*;
+  `bask=`'s first number is how many the requester *wanted*.
+- **the fork point** — `state_fork_point()`'s answer: the highest block this
+  node has applied that is *also* on the chain fork choice is following, or `-`
+  if the walk produced nothing. It is where the requester starts asking from, and
+  before this field no surface published it.
+
+**Caliper.** Instantaneous, computed at print time, with the same `max` the
+requester itself uses (`MAX_BODIES_IN_FLIGHT` = 16) — **so the first number
+saturates at 16 and is not a gap size.** Use `slag=` for the gap. Always printed,
+`0@-` included.
+
+**Normal value.** `bask=0@<stip>` on a healthy node: nothing to fetch, and the
+fork point is the applied tip because the applied tip is on the main chain. A node
+that is legitimately catching up shows a nonzero first number that falls.
+
+**Why it exists.** On 2026-08-03 three hosts printed `schain=fork`, a frozen
+`stip`, `slag=21` and `breq=1–2` for over an hour, and the diagnosis turned on a
+number none of those four fields carried: **an ask set of 15 with 2 in flight and
+an ask set of 2 are the same `breq=` and different bugs.**
+
+| reading | what it means |
+|---|---|
+| `bask=15@2680 breq=15` | the requester is doing its job — a **serving** problem, read the `BODYWAIT` entries |
+| `bask=2@2680 slag=21` | the ask set cannot close the gap it is looking at — a **requester** problem |
+| `bask=0@-` | `state_fork_point()` answered nothing; the requester has no base |
+
+**The detail is on the `BODYWAIT` journal line, not here.** When a node's `stip`
+has not moved for `UNOBTAINABLE_BODY_CADENCES` cadences (20 minutes at the frozen
+75 s block time) and it is either off-main or still asking, `qumbra-node` writes
+to stdout:
+
+```
+BODYWAIT stip= stipid= schain= slag= sfork= ask= breq= pend= gate= mine= mrefuse= stuck_s=
+BODYWAIT ask h= id= age_s= asks= flight= ans=<peer>:<served|header-only|dont-have|noreply>,…
+```
+
+- `gate=` is `rejoin_main_chain`'s own condition, evaluated without taking it:
+  `missing@N` means this node does **not** hold the main-chain body at `fork + 1`,
+  so the rewind that would rejoin the chain will not be taken.
+- `pend=` is the pending-body window's occupancy. **`pend` climbing with
+  `gate=missing` is bodies arriving that do not help.**
+- `mine=refused-lag` with `mrefuse=N` is **this node has stopped mining** — the
+  duty gate declining because its applied view is stale. It is correct behaviour
+  and it was previously visible only as a `/metrics` counter on hosts that expose
+  no metrics endpoint.
+- `ans=` names **every peer the ask went to**, including the ones that said
+  nothing (`noreply`). `header-only` is a peer that holds the header and not the
+  body — the honest answer of any node that restarted, because the serving cache
+  is not persisted.
+
+A full report is written when the picture changes and a summary on a heartbeat
+while it does not; a healthy node, and a node merely behind with `stip` advancing,
+write **nothing**.
+
+**Escalate when:** never from this field alone. `bask=` disagreeing with `slag=`
+by an order of magnitude on a host that is also `schain=fork` is a finding worth
+reporting with the `BODYWAIT` lines attached.
+
+**Locked by:** `bask_publishes_the_ask_set_and_the_fork_point_which_breq_cannot`
+and `a_stranded_node_journals_what_it_wants_and_that_it_has_stopped_mining`
+(`crates/qumbra-node/src/run.rs`),
+`the_three_layers_do_not_print_the_same_line` and
+`a_healthy_node_and_a_node_merely_behind_emit_nothing`
+(`crates/qlab-p2p/tests/ask_set_observable.rs`).
+
+⚠️ **This document's field list in §0 is stale and `bask` is not the reason.**
+`cpq`, `dfin` and `fdrop` (issue #204) were appended before this field and were
+never added to it. Read the `format!` in `run.rs` as the authority, as §0 already
+tells you to.
+
+---
+
 ## Appendix A — the two-minute triage
 
 In order. Stop at the first 🔴.
