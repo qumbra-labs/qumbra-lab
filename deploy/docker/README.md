@@ -51,6 +51,32 @@ pgrep -f qlab_bench     # must print nothing
   `qumbra_t0_sideb` used only during a 2+2 partition).
 - **`soak.sh`** — the scenario driver (below).
 
+## Building the image (revision provenance)
+
+The runtime stage stamps `org.opencontainers.image.revision` from a build-arg
+(`GIT_REVISION`). That key is the one the operator provenance check already reads;
+leaving it off the command line used to produce an image whose inspect returned
+empty (the first `t0-wan-7` build, 2026-08-02 — issue #224). The Dockerfile
+defaults the arg to the string `unknown` so a forgotten flag is visible rather
+than empty.
+
+```sh
+# From the repo root. Pass the revision; tag as you need.
+docker build \
+  -f deploy/docker/Dockerfile \
+  --build-arg GIT_REVISION=$(git rev-parse HEAD) \
+  -t ghcr.io/lai3d/qumbra-node:<tag> \
+  .
+
+# Read it back — this is the check, not the build's exit code.
+docker image inspect ghcr.io/lai3d/qumbra-node:<tag> \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+```
+
+A build that omits `--build-arg GIT_REVISION=…` still succeeds, and inspect then
+returns `unknown`. That is deliberate: an empty label is ambiguous; `unknown`
+means nobody passed a revision.
+
 ## Topology
 
 - **N = 4**, all mining, all holding keys. Committee keys **6/5/5/5** across
