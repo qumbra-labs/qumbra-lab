@@ -2536,6 +2536,10 @@ mod tests {
                         // field of this family, added after the line the claim is
                         // about, and the list growing is the point.
                         && !kv.starts_with("breq=")
+                        // #229's append, and it is the sharpest member of the family
+                        // yet: `bask=3@0` against `bask=0@3` separates these two
+                        // nodes on the ask set alone, without reading a height.
+                        && !kv.starts_with("bask=")
                 })
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -4294,6 +4298,8 @@ mod tests {
                 "unk",
                 // ── appended by #204, at the end ──
                 "cpq", "dfin", "fdrop",
+                // ── appended by #229, at the end ──
+                "bask",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -4338,9 +4344,10 @@ mod tests {
         assert!(line.contains(" dfin=0 "), "and the DURABLE head agrees: {line}");
         assert!(line.contains(" fdrop=0 "), "nothing was refused: {line}");
         // #229: a node alone on its own chain has an empty ask set and a fork point
-        // that IS its applied tip — the two derived quantities say "there is nothing
-        // to fetch and I know where I am", which is the healthy reading and a fact.
-        assert!(line.ends_with(" bask=0@0"), "nothing wanted, last: {line}");
+        // that IS its applied tip (height 1 here — it mined one block), so the two
+        // derived quantities say "there is nothing to fetch and I know exactly where
+        // I am". That is the healthy reading and it is a fact, not an absence.
+        assert!(line.ends_with(" bask=0@1"), "nothing wanted, last: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
