@@ -621,7 +621,7 @@ recovers. **Different `final=` is not that condition** — it is step 3: watch i
 for a sample or two, and report it only if it fails to close.
 
 **Locked by:** `identity_fields_are_present_and_well_formed_before_anything_finalizes`
-(`run.rs:3679`), `telemetry_roundtrips_checkpoint_identity_at_0x03`
+(`run.rs:3679`), `telemetry_roundtrips_checkpoint_identity_at_0x04`
 (`telemetry.rs:853`).
 
 ---
@@ -1399,7 +1399,94 @@ and `a_stranded_node_journals_what_it_wants_and_that_it_has_stopped_mining`
 ⚠️ **This document's field list in §0 is stale and `bask` is not the reason.**
 `cpq`, `dfin` and `fdrop` (issue #204) were appended before this field and were
 never added to it. Read the `format!` in `run.rs` as the authority, as §0 already
-tells you to.
+tells you to. *(`dfin` now has a section — §33 — because issue #212 gave it a
+companion. `cpq` and `fdrop` still do not.)*
+
+---
+
+## 33. `dfin` / `dfinbh` — the finalized head that survives a restart (issue #212)
+
+**🔴 `dfinbh` differing between hosts at one `dfin` is a STOP. 🟡 `dfin` differing
+from `final=` on one host is not.** Read this section before acting on either.
+
+**What they say.** **Head #3** — the state machine's chain store. This is the
+finalized head [`Snapshot.finalized`](../crates/qlab-node/src/persist.rs) is
+written from, the head the no-reorg-past-finality rule executes on, and **the only
+finalized head that survives a restart.**
+
+- **`dfin`** — head #3's height, or `-` when it holds nothing.
+- **`dfinbh`** — the identity of the **block** head #3 holds at that height: the
+  first 6 bytes of its block hash, or `-`.
+
+**🔴 `final=` and `fid=` (§13, §9) are a different head.** They read the committee
+`FinalityTracker` — **head #1** — which needs only a quorum of votes and is
+**discarded at shutdown**. A node can report `final=1056` while a restart would
+bring it back at 1048, and on 2026-08-01 node1 did exactly that for hours.
+
+**🔴 `dfinbh` and `fid` are not comparable and lining them up means nothing.**
+`fid` is `keccak256(height ‖ block_hash ‖ root)` truncated — the digest of the
+exact bytes the committee's ML-DSA keys signed. `dfinbh` is the name of a block. They
+are the same width and the same rendering and nothing else. This is the same trap
+`OPERATOR.md` §3 records under *"two different values are called 'the genesis
+hash'"*, and `dfinbh` is spelled without an `id` so the line itself discourages it.
+`dfinbh` belongs beside **`stipid`** (§10), which is a block-hash prefix too.
+
+**Caliper.** Both are instantaneous levels read from the same snapshot the
+`/v1/telemetry` wire serves — the line and the wire cannot disagree about them.
+Always printed, `-` included.
+
+**Normal value.** `dfin=` equal to `final=`, and `dfinbh=` equal on every host at
+that height. That is the reading all four T0 hosts gave at
+`2026-08-03 07:11:27Z`: `final=2864 fid=63e42f7e13a7 dfin=2864`, identical field for
+field.
+
+| reading | what it means |
+|---|---|
+| `final=2864 dfin=2864` | healthy — head #1 and head #3 name one block |
+| `final=1056 dfin=1048` | 🟡 head #3 has not recorded what head #1 reports. **One sample is a reading, not an alarm** — see below |
+| `final=2864 dfin=-` | 🟡 head #3 holds **nothing**: this host returns to genesis on a restart. Report it |
+| same `dfin` on two hosts, different `dfinbh` | 🔴 **STOP.** Two hosts durably finalized different blocks at one height |
+
+**Why `dfin` behind `final` is not an alarm on one sample.**
+`sync_state_finality` re-attempts on every drain, so the window between a
+checkpoint finalizing and its body being applied looks exactly like this. **What is
+alarming is *sustained*, and one line cannot establish sustained.** Pair it with
+`slag=` (§4 — is the state machine catching up at all?) and `fdrop=` (is the durable
+head *refusing* the record?). This is the same call the coordinator made for `cpq=1`
+on 2026-08-02: *watch, do not assume.*
+
+**Why `dfinbh` differing IS a stop, and worse than an `fid` split.** An `fid` split
+is head #1, which is thrown away at shutdown; this is the head both hosts come back
+as. The operator action is the same as row 2 of Appendix A and one step stronger:
+**stop, do not roll, preserve the data dir on every host** — the divergence is on
+disk, so the evidence survives and rolling would overwrite the binary that produced
+it.
+
+**On the wire, and in `qumbra-opview`.** Both fields are on `/v1/telemetry` at
+`RPC_VERSION 0x04` and rendered as the `DFIN`/`DFINBH` columns, with the two alarms
+on separate verdict lines. `qumbra-opview` exits **2** on a cross-host `dfinbh`
+split and **0** on a single host's `final`/`dfin` disagreement, which it reports as
+the greppable tokens `DURABLE_LAG`, `DURABLE_ABSENT` and `DURABLE_AHEAD`. A host not
+yet rolled onto `0x04` renders `INDETERMINATE` with its wire version — expected
+during a roll, not a fault, and every other column on it is still read.
+
+**Escalate when:** two hosts share a `dfin` and differ on `dfinbh` (🔴 immediately);
+`dfin=-` on a host reporting a real `final=` (report); `final=`/`dfin=` apart across
+several consecutive samples (report, with `slag=` and `fdrop=` attached).
+
+**Locked by:** `the_three_durable_states_are_distinct_on_the_wire_and_round_trip`,
+`the_durable_identity_is_a_block_hash_prefix_and_not_a_checkpoint_identity`,
+`the_tracker_and_the_durable_head_are_compared_in_one_place`,
+`a_reader_at_0x04_still_reads_a_0x03_node_and_knows_that_it_did`
+(`crates/qlab-node/src/telemetry.rs`);
+`the_2026_08_01_node1_divergence_is_visible_and_was_not_before`,
+`two_nodes_durably_holding_different_blocks_at_one_height_is_a_stop`,
+`an_unrolled_host_is_indeterminate_with_its_wire_version_not_a_dissenter`,
+`the_durable_alarms_render_apart_and_the_view_refuses_the_fid_comparison`
+(`crates/qumbra-opview/src`);
+`a_durable_split_over_sockets_is_the_stop_condition_while_fid_agrees` and
+`a_mid_roll_net_is_fully_readable_over_sockets_and_says_which_hosts_predate_the_field`
+(`crates/qumbra-opview/tests/over_http.rs`).
 
 ---
 
@@ -1413,13 +1500,20 @@ In order. Stop at the first 🔴.
    **not** this row — one host is ahead and finality is propagating. It should
    close within a sampling period or two; if it does not, report it as a finding
    and keep going down this list. See §9, which is the whole check order.
-3. **`sid=split`** on any host ⇒ 🔴 escalate.
-4. **`schain=fork`** on any host ⇒ 🔴 wedged, intervene. (`schain=-` ⇒ report.)
-5. `slag` nonzero with a slope ≈ block rate ⇒ the state machine is applying
+3. **Same `dfin=`, different `dfinbh=`** across hosts ⇒ 🔴 STOP, and **do not roll**
+   — the divergence is on disk and rolling overwrites the binary that produced it.
+   ⚠️ Same order of operations as row 2: **compare `dfin=` first**, and never
+   compare `dfinbh=` against `fid=` — they are different spaces (§33).
+4. **`sid=split`** on any host ⇒ 🔴 escalate.
+5. **`schain=fork`** on any host ⇒ 🔴 wedged, intervene. (`schain=-` ⇒ report.)
+6. `slag` nonzero with a slope ≈ block rate ⇒ the state machine is applying
    nothing.
-6. `regime=Degraded` persisting ⇒ finality stall; runbook, plus `ROUND why=`.
-7. `uanchor` climbing with `slag` pinned ⇒ served history it cannot judge.
-8. Everything else ⇒ report with the reading, do not infer.
+7. `final=` ahead of `dfin=` on one host, across several samples ⇒ report, with
+   `slag=` and `fdrop=`. **One sample is not this row** (§33). `dfin=-` beside a real
+   `final=` ⇒ report immediately.
+8. `regime=Degraded` persisting ⇒ finality stall; runbook, plus `ROUND why=`.
+9. `uanchor` climbing with `slag` pinned ⇒ served history it cannot judge.
+10. Everything else ⇒ report with the reading, do not infer.
 
 **Before comparing any counter across hosts**, check whether either host
 restarted. `rounds`, `rfail`, `rback`, `hignore`, `powrej` and `uanchor` are all

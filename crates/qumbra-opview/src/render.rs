@@ -5,31 +5,62 @@
 //! follow the configured order, groups are sorted, and nothing carries a
 //! wall-clock stamp the caller did not ask for.
 //!
-//! The two verdict lines are always both present, and always separate. Merging
-//! them into one "healthy / unhealthy" would destroy the distinction the whole
-//! view exists to preserve: an `fid` split is a STOP and an `sid` split is a
-//! finding, and one line cannot say both.
+//! The verdict lines are always all present, and always separate. Merging them into
+//! one "healthy / unhealthy" would destroy the distinction the whole view exists to
+//! preserve: an `fid` split is a STOP, an `sid` split is a finding, a durable split
+//! is a STOP that survives a restart, and one node's two heads disagreeing is a
+//! finding about that node — one line cannot say four things.
 
-use crate::agree::{Agreement, IdGroup, SignedVerdict, Verdict};
+use crate::agree::{Agreement, DurableVerdict, IdGroup, SignedVerdict, Verdict};
 use crate::poll::{NodeReading, Reading};
 
 use qlab_node::telemetry::{SupplyCoverage, LOCAL_COMMITMENT_SPLIT};
+use qlab_node::{BlockIdentity, DurableAgreement, DURABLE_HEAD_SINCE_VERSION};
+
+/// How an identity renders in a group line.
+///
+/// A trait rather than a `to_string`, because the two identity spaces
+/// ([`BlockIdentity`] and a checkpoint identity's raw `u64`) must keep their types
+/// all the way to the last line that prints them — see [`IdGroup`]'s docs. They
+/// render **identically on purpose**: one width, one scheme, so an operator reads the
+/// digits the same way. That is exactly why the type, and not the rendering, is what
+/// keeps them from being compared.
+pub trait RenderId {
+    fn render(&self) -> String;
+}
+
+impl RenderId for u64 {
+    fn render(&self) -> String {
+        qlab_node::telemetry::LocalCommitment { slot: 0, id: Some(*self) }.id_field()
+    }
+}
+
+impl RenderId for BlockIdentity {
+    fn render(&self) -> String {
+        self.field()
+    }
+}
 
 /// Render the per-node table.
+///
+/// `DFIN`/`DFINBH` are **appended at the end** (issue #212), under the same rule the
+/// node's own `TELEMETRY` line follows for every addition since #87: every
+/// pre-existing column keeps its name, position and meaning, so a `qumbra-ops/`
+/// parser reading by column index does not shift.
 pub fn table(readings: &[NodeReading]) -> String {
     let label_w = readings.iter().map(|r| r.endpoint.label.len()).max().unwrap_or(4).max(4);
     let mut out = String::new();
     out.push_str(&format!(
-        "{:<label_w$}  {:>8} {:>8} {:>13} {:>9} {:>6} {:>6} {:>5} {:>5} {:>6} {:>6} {:>6} {:>10} {:>8} {:>13}\n",
+        "{:<label_w$}  {:>8} {:>8} {:>13} {:>9} {:>6} {:>6} {:>5} {:>5} {:>6} {:>6} {:>6} {:>10} {:>8} {:>13} {:>8} {:>13}\n",
         "NODE", "TIP", "FINAL", "FID", "REGIME", "STALL", "AGE_S", "PEERS", "EPOCH", "C_SIZE",
-        "C_ACT", "C_QRM", "DIFF", "SSLOT", "SID",
+        "C_ACT", "C_QRM", "DIFF", "SSLOT", "SID", "DFIN", "DFINBH",
     ));
     for r in readings {
         match &r.reading {
-            Reading::Ok(t) => {
+            Reading::Ok { telemetry: t, .. } => {
                 let regime = format!("{:?}", t.finality_status);
                 out.push_str(&format!(
-                    "{:<label_w$}  {:>8} {:>8} {:>13} {:>9} {:>6} {:>6} {:>5} {:>5} {:>6} {:>6} {:>6} {:>10} {:>8} {:>13}\n",
+                    "{:<label_w$}  {:>8} {:>8} {:>13} {:>9} {:>6} {:>6} {:>5} {:>5} {:>6} {:>6} {:>6} {:>10} {:>8} {:>13} {:>8} {:>13}\n",
                     r.endpoint.label,
                     t.tip_height,
                     t.finalized_height.map(|h| h.to_string()).unwrap_or_else(|| "-".into()),
@@ -48,6 +79,14 @@ pub fn table(readings: &[NodeReading]) -> String {
                     t.diff_field(),
                     t.sslot_field(),
                     t.sid_field(),
+                    // Issue #212: head #3. `DFIN` is a height and `FINAL` is a
+                    // height, and they are comparable — that comparison is the point.
+                    // `DFINBH` is a BLOCK HASH prefix and `FID` is a checkpoint
+                    // identity, and comparing THOSE two columns is meaningless
+                    // however similar the digits look; the verdict block below says
+                    // so in words and the type says so in code.
+                    t.durable.height_field(),
+                    t.durable.id_field(),
                 ));
             }
             // An unreachable node gets a row of its own, marked as such, with the
@@ -105,7 +144,7 @@ pub fn supply(readings: &[NodeReading]) -> String {
     let mut rows = 0usize;
     let mut unavailable = 0usize;
     for reading in readings {
-        let Reading::Ok(t) = &reading.reading else {
+        let Reading::Ok { telemetry: t, .. } = &reading.reading else {
             continue;
         };
         if let SupplyCoverage::Unavailable {
@@ -158,13 +197,13 @@ pub fn supply(readings: &[NodeReading]) -> String {
     out
 }
 
-fn ids_line(g: &IdGroup, absent_means: &str) -> String {
+fn ids_line<I: RenderId>(g: &IdGroup<I>, absent_means: &str) -> String {
     let parts: Vec<String> = g
         .ids
         .iter()
         .map(|(id, labels)| {
             let shown = match id {
-                Some(v) => qlab_node::telemetry::LocalCommitment { slot: 0, id: Some(*v) }.id_field(),
+                Some(v) => v.render(),
                 None => absent_means.to_string(),
             };
             format!("{shown} [{}]", labels.join(" "))
@@ -256,6 +295,107 @@ pub fn verdicts(a: &Agreement) -> String {
         SignedVerdict::Agreed => {}
     }
 
+    // ---- what survives a restart (issue #212) -------------------------------
+    let dhead = match a.durable_verdict {
+        DurableVerdict::Agreed => "AGREED",
+        DurableVerdict::Indeterminate => "INDETERMINATE",
+        DurableVerdict::Diverged => "🔴 DIVERGED",
+    };
+    out.push_str(&format!("\ndurable finalized head (dfin/dfinbh): {dhead}\n"));
+    out.push_str(
+        "  head #3 — the head that survives a restart. `final`/`fid` above are head #1, \
+         the committee tracker, which is discarded at shutdown.\n",
+    );
+    out.push_str(
+        "  ⚠️ DFINBH is a BLOCK HASH prefix; FID is a checkpoint identity. \
+         Comparing them is meaningless — compare DFINBH node-to-node at one DFIN only.\n",
+    );
+    if a.durable.is_empty() {
+        out.push_str("  no node that answered has durably finalized anything\n");
+    }
+    for g in &a.durable {
+        let marker = if g.is_split() { "🔴" } else { "  " };
+        out.push_str(&format!(
+            "  {marker} dfin={:<8} {}\n",
+            g.at,
+            ids_line(g, "no block identity reported")
+        ));
+    }
+    if !a.not_durable.is_empty() {
+        out.push_str(&format!(
+            "     head #3 holds nothing: {}\n",
+            a.not_durable.join(" ")
+        ));
+    }
+    for (label, version) in &a.durable_blind {
+        if *version < DURABLE_HEAD_SINCE_VERSION {
+            out.push_str(&format!(
+                "     {label}: wire 0x{version:02x} predates the durable head (issue #212) — \
+                 this host has not been rolled yet, which is not a fault\n"
+            ));
+        } else {
+            out.push_str(&format!(
+                "     {label}: wire 0x{version:02x} carries the field and reported no durable \
+                 head — this reader cannot see head #3 on that composition\n"
+            ));
+        }
+    }
+    match a.durable_verdict {
+        DurableVerdict::Diverged => out.push_str(
+            "     🔴 two different blocks durably finalized at one height. This is a STOP, and \
+             it is worse than an fid split: head #3 is what these hosts come back as, so a \
+             restart does not undo it. Stop, do not roll, and preserve the data dir on every \
+             host.\n",
+        ),
+        DurableVerdict::Indeterminate => out.push_str(
+            "     a node stated no durable head, so agreement could not be established (it is \
+             not known to hold, and not known to be broken). During a roll this is expected \
+             until every host serves the new wire.\n",
+        ),
+        DurableVerdict::Agreed => {
+            let comparable = a.comparable_durable_heights();
+            if comparable.is_empty() && a.durable.len() > 1 {
+                out.push_str(
+                    "     no two nodes share a durable height, so nothing was actually \
+                     compared — this is lag, not agreement about identity.\n",
+                );
+            }
+        }
+    }
+
+    // ---- one node's two heads (issue #212) — a FINDING, not a stop ----------
+    if !a.durable_lag.is_empty() {
+        out.push_str("\nhead #1 vs head #3, per node: 🟡 FINDING\n");
+        for (label, agreement) in &a.durable_lag {
+            let token = agreement.token().unwrap_or("");
+            let detail = match agreement {
+                DurableAgreement::TrackerAhead { tracker, durable } => format!(
+                    "final={tracker} over a durable head of {durable} — this node will come back \
+                     at {durable}"
+                ),
+                DurableAgreement::DurableAhead { tracker, durable } => format!(
+                    "durable head {durable} is AHEAD of final={} — not reachable by construction, \
+                     so this is a finding about the code and not about the net",
+                    tracker.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string())
+                ),
+                DurableAgreement::NothingDurable { tracker } => format!(
+                    "final={tracker} and head #3 holds NOTHING — this node returns to genesis on \
+                     a restart"
+                ),
+                DurableAgreement::Agreed | DurableAgreement::Unavailable => String::new(),
+            };
+            // The token is rendered as a BARE WORD — no trailing punctuation — because
+            // alerting greps it, exactly as #136's `UNAVAILABLE` is grepped.
+            out.push_str(&format!("  🟡 {label} {token} — {detail}\n"));
+        }
+        out.push_str(
+            "     🟡 a FINDING, not a stop, and exit stays 0: one poll cannot tell the hours-long \
+             2026-08-01 node1 divergence from the ordinary window between a checkpoint \
+             finalizing and its body being applied. SUSTAINED is the alarm — re-poll, and read \
+             it against the host's own slag= and fdrop=.\n",
+        );
+    }
+
     // ---- who did not answer -------------------------------------------------
     if !a.unreachable.is_empty() {
         out.push_str(&format!(
@@ -283,26 +423,43 @@ mod tests {
     use qlab_node::{SupplyEpoch, Telemetry};
     use std::time::Duration;
 
+    /// A live-composition snapshot: head #3 read, and agreeing with head #1 (issue
+    /// #212 — the healthy default, and what all four T0 hosts report).
     fn t_at(
         tip: u64,
         fin: Option<u64>,
         fid: Option<u64>,
         signed: Option<(u64, Option<u64>)>,
     ) -> Telemetry {
-        Telemetry::assemble(tip, fin, 75, 0, 3, 0, 16)
-            .with_committee(21, 19, 15)
-            .with_checkpoint(fid, signed.map(|(slot, id)| LocalCommitment { slot, id }))
-            .with_tip_difficulty(Some(1_048_576))
+        durable(
+            Telemetry::assemble(tip, fin, 75, 0, 3, 0, 16)
+                .with_committee(21, 19, 15)
+                .with_checkpoint(fid, signed.map(|(slot, id)| LocalCommitment { slot, id }))
+                .with_tip_difficulty(Some(1_048_576)),
+            fin.map(|h| (h, 0xdd)),
+        )
     }
 
     fn t(fin: Option<u64>, fid: Option<u64>, signed: Option<(u64, Option<u64>)>) -> Telemetry {
         t_at(3800, fin, fid, signed)
     }
 
+    fn durable(t: Telemetry, head: Option<(u64, u8)>) -> Telemetry {
+        t.with_durable_head(head.map(|(height, first)| {
+            let mut hash = [0xee_u8; 32];
+            hash[0] = first;
+            (height, hash)
+        }))
+    }
+
     fn ok(label: &str, tel: Telemetry) -> NodeReading {
+        ok_at(label, tel, qlab_node::RPC_VERSION)
+    }
+
+    fn ok_at(label: &str, tel: Telemetry, wire_version: u8) -> NodeReading {
         NodeReading {
             endpoint: Endpoint { label: label.into(), base_url: format!("http://{label}:9410") },
-            reading: Reading::Ok(Box::new(tel)),
+            reading: Reading::Ok { telemetry: Box::new(tel), wire_version },
             elapsed: Duration::from_millis(2),
         }
     }
@@ -403,6 +560,129 @@ mod tests {
         assert!(text.contains("1048576"), "difficulty renders:\n{text}");
         assert!(text.contains("C_SIZE"), "committee header renders:\n{text}");
         assert!(text.contains("    21     19     15"), "committee aggregates render:\n{text}");
+    }
+
+    // ---- issue #212: head #3 ------------------------------------------------
+
+    /// **Acceptance (#212 H): the two new alarms render at DIFFERENT severities and
+    /// on separate lines, and the view says in words that `DFINBH` and `FID` are not
+    /// comparable.**
+    ///
+    /// The warning line is not decoration. `OPERATOR.md` §3 carries a section titled
+    /// *"Two different values are called 'the genesis hash'. Comparing them is
+    /// meaningless"* — written after an operator compared a block-header hash to a
+    /// genesis-file hash and concluded a host was broken. The type system stops the
+    /// mistake in code; this line is the half a human reads at 3 a.m.
+    #[test]
+    fn the_durable_alarms_render_apart_and_the_view_refuses_the_fid_comparison() {
+        const H: u64 = 2864;
+        // A cross-host durable split (🔴 STOP) and, on a third host, head #1 ahead of
+        // head #3 (🟡 finding). Everything head #1 carries agrees on all three.
+        let readings = vec![
+            ok("node0", durable(t_at(2871, Some(H), Some(0xaaaa_aaaa_aaaa), None), Some((H, 0xa1)))),
+            ok("node1", durable(t_at(2871, Some(H), Some(0xaaaa_aaaa_aaaa), None), Some((H, 0xb2)))),
+            ok("node2", durable(t_at(2871, Some(H), Some(0xaaaa_aaaa_aaaa), None), Some((2856, 0xa1)))),
+        ];
+        let a = Agreement::of(&readings);
+        let text = view(&readings, &a);
+
+        // The `fid` verdict is untouched and still says AGREED — the two verdicts are
+        // separate and this is the case that proves it.
+        assert!(text.contains("checkpoint agreement (fid): AGREED"), "{text}");
+
+        // 🔴 The durable split, in its own block, with both identities and who held
+        // each — an alarm that does not say what it saw cannot be acted on.
+        assert!(text.contains("durable finalized head (dfin/dfinbh): 🔴 DIVERGED"), "{text}");
+        assert!(text.contains("a1eeeeeeeeee [node0]"), "{text}");
+        assert!(text.contains("b2eeeeeeeeee [node1]"), "{text}");
+        assert!(text.contains("head #3 is what these hosts come back as"), "{text}");
+        assert_eq!(a.exit_code(), 2);
+
+        // 🟡 The per-node finding, on its own line, at its own severity, with the
+        // greppable token and the numbers.
+        assert!(text.contains("head #1 vs head #3, per node: 🟡 FINDING"), "{text}");
+        assert!(text.contains("node2 DURABLE_LAG"), "{text}");
+        assert!(text.contains("final=2864 over a durable head of 2856"), "{text}");
+        assert!(text.contains("a FINDING, not a stop, and exit stays 0"), "{text}");
+        assert!(text.contains("SUSTAINED is the alarm"), "{text}");
+
+        // 🔴 And the warning that keeps the trap from being re-sprung by eye.
+        assert!(
+            text.contains("DFINBH is a BLOCK HASH prefix; FID is a checkpoint identity"),
+            "the view must refuse the meaningless comparison in words:\n{text}"
+        );
+        assert!(text.contains("Comparing them is meaningless"), "{text}");
+    }
+
+    /// **Acceptance (#212 I — the roll): an un-rolled host renders as INDETERMINATE
+    /// with its wire version and the reason, and its own row still carries every
+    /// pre-existing column.**
+    ///
+    /// The row is the point as much as the verdict: mid-roll an operator must still be
+    /// able to read `FINAL`/`FID` off every host, or the cross-host question cannot be
+    /// asked at all.
+    #[test]
+    fn an_unrolled_host_renders_its_wire_version_and_keeps_its_other_columns() {
+        const H: u64 = 2864;
+        let rolled = durable(t_at(2871, Some(H), Some(0xaaaa_aaaa_aaaa), None), Some((H, 0x63)));
+        // `Unavailable` by construction — no `with_durable_head` call at all, which is
+        // exactly what a `0x03` body decodes to.
+        let unrolled = Telemetry::assemble(2871, Some(H), 75, 0, 3, 0, 16)
+            .with_committee(21, 19, 15)
+            .with_checkpoint(Some(0xaaaa_aaaa_aaaa), None)
+            .with_tip_difficulty(Some(1_048_576));
+        let readings = vec![ok("node0", rolled), ok_at("node1", unrolled, 0x03)];
+        let a = Agreement::of(&readings);
+        let text = view(&readings, &a);
+
+        assert!(text.contains("durable finalized head (dfin/dfinbh): INDETERMINATE"), "{text}");
+        assert!(
+            text.contains("node1: wire 0x03 predates the durable head (issue #212)"),
+            "the reason names the wire, not a defect:\n{text}"
+        );
+        assert!(text.contains("has not been rolled yet, which is not a fault"), "{text}");
+        assert_eq!(a.exit_code(), 0, "an un-rolled host must never page as a STOP");
+
+        // The un-rolled row still carries everything the old wire had; only the two
+        // new columns are `-`.
+        let row = text.lines().find(|l| l.starts_with("node1")).unwrap();
+        assert!(row.contains("2871"), "tip renders: {row}");
+        assert!(row.contains("aaaaaaaaaaaa"), "fid renders: {row}");
+        let tail: Vec<&str> = row.split_whitespace().rev().take(2).collect();
+        assert_eq!(tail, vec!["-", "-"], "DFIN and DFINBH are the two `-` columns: {row}");
+        // …and the rolled host's are not.
+        let rolled_row = text.lines().find(|l| l.starts_with("node0")).unwrap();
+        assert!(rolled_row.contains("63eeeeeeeeee"), "{rolled_row}");
+    }
+
+    /// **`DURABLE_LAG` is a stable token and alerting may depend on it** — the same
+    /// contract #136 gave `UNAVAILABLE`, and for the same reason: the condition it
+    /// names exits `0`, so the exit status alone cannot tell "head #1 and head #3
+    /// agree everywhere" from "one host will come back different".
+    ///
+    /// Pinned in both directions: present when the two heads disagree, and **absent**
+    /// when they agree, or grepping it would mean nothing.
+    #[test]
+    fn durable_lag_is_a_stable_token_pinned_in_both_directions() {
+        const H: u64 = 2864;
+        let lagging = vec![ok("node0", durable(t_at(2871, Some(H), Some(1), None), Some((2856, 0xa1))))];
+        let healthy = vec![ok("node0", durable(t_at(2871, Some(H), Some(1), None), Some((H, 0xa1))))];
+
+        let lagging_text = view(&lagging, &Agreement::of(&lagging));
+        let healthy_text = view(&healthy, &Agreement::of(&healthy));
+
+        assert!(
+            lagging_text.split_whitespace().any(|w| w == "DURABLE_LAG"),
+            "a disagreement must render the token as a bare word:\n{lagging_text}"
+        );
+        assert!(
+            !healthy_text.contains("DURABLE_LAG"),
+            "agreement must not emit the token, or the grep says nothing:\n{healthy_text}"
+        );
+        // Neither is a STOP, which is exactly why the token has to carry the
+        // distinction.
+        assert_eq!(Agreement::of(&lagging).exit_code(), 0);
+        assert_eq!(Agreement::of(&healthy).exit_code(), 0);
     }
 
     /// **Acceptance (#121): the public view has no per-signer participation

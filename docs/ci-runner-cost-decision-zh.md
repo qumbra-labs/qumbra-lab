@@ -347,7 +347,7 @@ runner 放在哪里无关** —— 它是这个工作负载的性质，由测量
 
 | | 归属 |
 |---|---|
-| `$20` 预算：提高、维持、还是维持并削减用量 | **Larry（R3）** |
+| ~~`$20` 预算：提高、维持、还是维持并削减用量~~ | **2026-08-03 已重塑 —— 见 §10。** 产品级硬停错在形状而不只是数额：它把免费的 pre-filter 和付费 suite 的上限拴在了一起。已拆成对真正花钱的那个 runner 的 SKU 级硬停。未决的另一半是用一周 label 门控数据重校 $50 —— **Larry（R3）** |
 | 要不要离开 GitHub 托管 | **Larry**，参考 §7F（§7C 和 §7G 是较弱的那些） |
 | **任何 self-hosted 实例按 `4 vCPU / 32 GB` 而不是 8 核来选** | 协调者，在主机定下来之后 —— 有实测，见 §7G |
 | **`default` profile 里其他 EC2 负载要不要整合进 EKS** | **Larry** —— 这不是 CI 决定；CI 只是搭车（§7G） |
@@ -357,7 +357,60 @@ runner 放在哪里无关** —— 它是这个工作负载的性质，由测量
 | 仓库可见性 | **Larry** |
 | ~~触发条件改动（§7B）~~ | **2026-08-02 已完成** —— `types: [labeled]` + `verify` 门。见 §7B。 |
 
+## 10. stop-usage 的爆炸半径,与 SKU 拆分(2026-08-03)
+
+**本节修的缺陷是一个形状,不是一个数字。** 原先的 `$20` 预算是挂在 `actions` 上的
+`ProductPricing`,且 `prevent_further_usage: true` —— 触顶那天,**所有** Actions workflow 一起
+停,包括跑在标准 runner 免费额度内、根本不花钱的 `prefilter.yml`。便宜的守卫和昂贵的 suite 一起
+死。而且失败是安静的:workflow 只是不再启动,没有任何东西通知车队,第一个症状是四个 baton 又开始
+排 rig —— **恰好是这套 CI 存在就为了消灭的状态**,被本该保护它的预算恢复了。
+
+### 数字,方法同 §4
+
+2026-08-03 取自 `gh api /organizations/qumbra-labs/settings/billing/usage`:
+
+| | 值 | 来源 |
+|---|---|---|
+| 8 月截至 08-03 的花费 | **$20.00 中的 $14.14** | 账单页与 usage API 一致 |
+| 花在哪 | **100% 一个 SKU:`Actions Linux ARM 8-core`** | 1,010 计费分钟 ≈ $0.014/分钟,三条用量记录($8.76 + $4.84 + $0.53) |
+| 标准 `Actions Linux` 分钟 | 87 分钟,**$0** | 在套餐附带额度内 —— pre-filter 从未花过钱 |
+| 剩余空间 | $5.86 ≈ **8 次 suite**(按 §4 的 ~$0.7) | 按 #210 之后的验收节奏,只够几天 |
+
+所以产品级上限把两条毫无共性的流混为一谈:一个占花费 100% 的付费 SKU,和一个占常开守卫 100% 的
+免费层。
+
+### 拆分,2026-08-03 决定
+
+| 预算 | 范围 | 数额 | stop usage | 职责 |
+|---|---|---|---|---|
+| **新建** | `SkuPricing`,`actions_linux_8_core_arm` | $50 | **是** | 硬停,只拦唯一真正花钱的东西 |
+| **重塑** | `ProductPricing`,`actions` | $60 | **否 —— 仅提醒** | 对一切*不是*大 runner 的花费做预警:存储超额、标准分钟超出附带额度 |
+
+$50 ≈ 每月 70 次 suite ≈ 每天 2–3 次验收的余量。**这是过渡性护栏,不是 §8 的托管决定** ——
+一周 label 门控数据后重校;若 A vs F 落到 self-hosted,则整体重推。
+
+经 budgets API 执行(需要 `admin:org`):
+
+```
+POST  /organizations/qumbra-labs/settings/billing/budgets
+      {"budget_type":"SkuPricing","budget_product_sku":"actions_linux_8_core_arm",
+       "budget_scope":"organization","budget_amount":50,"prevent_further_usage":true, …}
+PATCH /organizations/qumbra-labs/settings/billing/budgets/7adffff2-…
+      {"budget_amount":60,"prevent_further_usage":false, …}
+```
+
+验证用同一个 API:`GET …/settings/billing/budgets` 必须显示如上两行。一个值得记录的可复用技巧:
+**合法的 SKU 标识符没有任何地方可以列出,但用一个瞎编的 `budget_product_sku` 去 `POST`,错误消息
+会返回完整的合法清单。**
+
+### 一条本次不动的边界
+
+`packages` 保持 $0 + stop usage **开**。GHCR 上的 node 镜像是公开的,公开包存储免费,今天没有任何
+在跑的东西受影响 —— 但哪天有人推**私有**镜像,push 会栽在这条预算上,而报错读起来像权限问题。
+记在这里,好让那一小时花在这句话上,而不是花在 GHCR 鉴权文档上。
+
 ---
 
 *2026-08-02 由协调者会话写下，起因是 Larry 的账单截图让花费第一次变得可见。§4 的测量可用 `gh run list`
-和组织账单页复现；$9.31 是其中唯一一个"取来的"而非"推导出来的"数字。*
+和组织账单页复现；$9.31 是其中唯一一个"取来的"而非"推导出来的"数字。§10 由评审者会话(Larry 指派)
+于 2026-08-03 在第二张账单截图之后补写;其数字取自 usage API 与 budgets API,均就地引用。*

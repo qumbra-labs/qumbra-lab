@@ -1221,9 +1221,33 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// `final=` reads head #1. Until issue #204 nothing anywhere compared the two,
     /// which is why a node whose durable head had never advanced past 1048 printed
     /// `final=1056` on every sample for hours.
+    ///
+    /// Derived from [`Self::durable_finalized_head`] rather than read separately, so
+    /// the height on the telemetry line and the height on the wire cannot come from
+    /// two reads of the store.
     pub fn durable_finalized_height(&self) -> Option<u64> {
+        self.durable_finalized_head().map(|(height, _)| height)
+    }
+
+    /// **Head #3's height AND the block it names** (issue #212) — the pair
+    /// `/v1/telemetry` publishes as `dfin`/`dfinbh`.
+    ///
+    /// Both halves come from **one borrow** of the store, so the pair is always a
+    /// single observation of a single head. Reading the height and the hash through
+    /// two accessors would let a caller pair a height with a hash from a different
+    /// moment, which on this surface is the one mistake that would be invisible: the
+    /// value would still render as a plausible identity.
+    ///
+    /// A half-present pair — a height with no hash, or the reverse — is not
+    /// representable in the store (`set_finalized`/`restore_finalized` move both or
+    /// neither) and reads as absent here rather than as a fabricated half.
+    pub fn durable_finalized_head(&self) -> Option<(u64, Hash32)> {
         use qlab_node::ChainStore as _;
-        self.state.chain().finalized_height()
+        let store = self.state.chain();
+        match (store.finalized_height(), store.finalized_hash()) {
+            (Some(height), Some(hash)) => Some((height, hash)),
+            _ => None,
+        }
     }
 
     /// Take the rewind reports not yet journalled (issue #162).

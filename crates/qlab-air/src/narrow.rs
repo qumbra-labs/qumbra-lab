@@ -159,7 +159,7 @@ const LDV_COL: usize = DV_COL + 1;
 #[cfg(feature = "q69-latch")]
 pub const NARROW_WIDTH: usize = LDV_COL + 1;
 #[cfg(not(feature = "q69-latch"))]
-pub const NARROW_WIDTH: usize = EFF_OFF + 25; // 618
+pub const NARROW_WIDTH: usize = EFF_OFF + 25;
 
 /// Program slots (= perm slots per program period).
 pub const PROGRAM_SLOTS: usize = 96;
