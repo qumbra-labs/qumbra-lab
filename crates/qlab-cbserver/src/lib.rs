@@ -33,7 +33,9 @@
 
 pub mod client;
 pub mod codec;
+#[cfg(feature = "devnet")]
 pub mod data;
+#[cfg(feature = "devnet")]
 pub mod server;
 pub mod tree;
 

@@ -548,6 +548,7 @@ pub fn light_client_scan(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+#[cfg(feature = "devnet")]
 /// The light-client scan flow, run **fully in-process** against a `&Devnet`
 /// via `crate::server::route` — no socket, no `TcpStream`. Behaviourally
 /// identical to [`light_client_scan`] (it *is* the same function, over a
@@ -798,7 +799,7 @@ fn dechunk(mut b: &[u8]) -> std::io::Result<Vec<u8>> {
     Ok(out)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "devnet"))]
 mod tests {
     use super::*;
     use crate::data::{Devnet, GenParams, StoredBlock, StoredRecipient, StoredTx};

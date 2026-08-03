@@ -1160,6 +1160,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qumbra-ffi"
+version = "0.0.0"
+dependencies = [
+ "qlab-cbserver",
+ "qlab-note",
+ "qlab-wallet",
+ "rand",
+]
+
+[[package]]
 name = "qumbra-node"
 version = "0.0.0"
 dependencies = [
