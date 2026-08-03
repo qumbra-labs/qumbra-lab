@@ -1,0 +1,30 @@
+[package]
+name = "qumbra-wallet"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Issue #243: the **end-user wallet CLI** — keygen / restore / address / backup /
+# scan, and deliberately NOT send (C3-gated; the seam is named in the PR).
+#
+# This is the kernel rehearsal the wallet briefs name: every non-UI component a
+# browser-extension or mobile shell wraps is exercised here first, minus the
+# browser. Same one-way-arrow posture as qumbra-faucet/qumbra-explorer: this
+# crate depends on the libraries; nothing knows it exists. It runs NO node —
+# scan talks to a cbserver URL.
+
+[[bin]]
+name = "qumbra-wallet"
+path = "src/main.rs"
+
+[dependencies]
+# Key hierarchy, non-BIP-39 mnemonic (golden-frozen), diversified addresses.
+qlab-wallet = { path = "../qlab-wallet" }
+# The whole light-client scan flow and its honesty vocabulary (ScanOutcome,
+# Completeness) — reused, never reimplemented.
+qlab-cbserver = { path = "../qlab-cbserver" }
+# ML-KEM Keypair/Dk types the scan takes.
+qlab-note = { path = "../qlab-note" }
+# OS CSPRNG for seed entropy and the scan's decoy rng.
+rand = "0.10"
