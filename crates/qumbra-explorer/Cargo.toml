@@ -1,0 +1,45 @@
+[package]
+name = "qumbra-explorer"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Issue #235: the **public minimal explorer** — one read-only chain-health page for
+# an outsider with no shell access, served from this binary's OWN keyless node's
+# view of the network.
+#
+# Its own crate for the same one-way-arrow reasons `qumbra-faucet` argues in its
+# manifest: this crate depends on `qumbra-node`; nothing knows it exists.
+#
+# What it is deliberately NOT (binding, testnet-plan §6): a transaction explorer.
+# No tx lookup, no address lookup, no note browsing — this is a single-pool
+# privacy chain and a chain-health page is the whole scope. And per §6.2, the
+# fleet's telemetry endpoints stay private: this binary learns over P2P like any
+# peer and its own HTTP port is its only public surface.
+
+[[bin]]
+name = "qumbra-explorer"
+path = "src/main.rs"
+
+[dependencies]
+# The in-process keyless observer node (same composition seam as qumbra-faucet's;
+# read-only here: no wallet, no mining, no tx origination).
+qumbra-node = { path = "../qumbra-node" }
+# `Telemetry` and its rendering disciplines (`age_field`, `supply_coverage`) — the
+# one availability rule for every figure this page publishes.
+qlab-node = { path = "../qlab-node" }
+# RandomX for the observer node's PoW verification, and `FinalityStatus`.
+qlab-devnet = { path = "../qlab-devnet" }
+# `adapter::MiningClock` — the wall-clock header-timestamp opt-in every binary takes.
+qlab-p2p = { path = "../qlab-p2p" }
+# TOML service config, same posture as the node's and the faucet's.
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+# The HTTP listener. Same `=` pin as everywhere else in the tree — one HTTP
+# implementation, not five.
+tiny_http = "=0.12.0"
+# Graceful shutdown flushes the node's snapshot. `termination` arms SIGTERM/SIGHUP
+# too (issue #145) — the faucet predates that fix and still lacks the feature; this
+# crate must not repeat it.
+ctrlc = { version = "3.4", features = ["termination"] }
