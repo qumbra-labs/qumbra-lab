@@ -326,7 +326,10 @@ mod tests {
         seed[0] = 0xEE;
         std::fs::remove_file(d.join(SEED_FILE)).unwrap();
         std::fs::write(d.join(SEED_FILE), seed).unwrap();
-        let e = WalletDir::open(&d).unwrap_err();
+        let e = match WalletDir::open(&d) {
+            Err(e) => e,
+            Ok(_) => panic!("a flipped version byte must be refused"),
+        };
         let msg = e.to_string();
         assert!(msg.contains("version 238 refused"), "{msg}");
         assert!(msg.contains("different wallet"), "{msg}");
