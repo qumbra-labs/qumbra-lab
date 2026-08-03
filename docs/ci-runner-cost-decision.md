@@ -412,7 +412,7 @@ should be sized against *that*, with CI riding it rather than justifying it.
 
 | | owner |
 |---|---|
-| The `$20` budget: raise, hold, or hold-and-cut-usage | **Larry (R3)** |
+| ~~The `$20` budget: raise, hold, or hold-and-cut-usage~~ | **RESHAPED 2026-08-03 — see §10.** The product-level stop was the wrong shape, not just the wrong size: it coupled the free pre-filter to the paid suite's cap. Split into a SKU-level hard stop on the runner that actually spends. The open half is recalibrating the $50 after a week of label-gated cadence — **Larry (R3)** |
 | Whether to move off GitHub-hosted at all | **Larry**, informed by §7F (§7C and §7G are the weaker options) |
 | **Sizing any self-hosted instance at 4 vCPU / 32 GB rather than 8-core** | coordinator, once a host is chosen — measured, see §7G |
 | **Whether the `default` profile's other EC2 workloads consolidate into EKS** | **Larry** — not a CI decision; CI only rides the outcome (§7G) |
@@ -422,8 +422,66 @@ should be sized against *that*, with CI riding it rather than justifying it.
 | Repo visibility | **Larry** |
 | ~~The trigger change (§7B)~~ | **DONE 2026-08-02** — `types: [labeled]` + a `verify` gate. See §7B. |
 
+## 10. The stop-usage blast radius, and the SKU split (2026-08-03)
+
+**The defect this section fixes is a shape, not a number.** The `$20` budget was `ProductPricing`
+on `actions` with `prevent_further_usage: true` — so the day it trips, **every** Actions workflow
+stops, including `prefilter.yml`, which runs on standard runners inside the plan's included
+minutes and costs nothing. The cheap guard dies with the expensive suite. And the failure is
+silent: workflows simply stop starting, nothing alerts the fleet, and the first symptom is four
+batons queueing for the rig again — **the exact state this CI exists to remove**, restored by the
+budget that was supposed to protect it.
+
+### The numbers, same method as §4
+
+From `gh api /organizations/qumbra-labs/settings/billing/usage` on 2026-08-03:
+
+| | value | how |
+|---|---|---|
+| August spend at 08-03 | **$14.14 of $20.00** | billing page + usage API agree |
+| where it went | **100 % one SKU: `Actions Linux ARM 8-core`** | 1,010 billed minutes ≈ $0.014/min, three usage items ($8.76 + $4.84 + $0.53) |
+| standard `Actions Linux` minutes | 87 min, **$0** | inside the plan's included pool — the pre-filter has never cost money |
+| headroom remaining | $5.86 ≈ **8 suite runs** at §4's ~$0.7 | days, at the post-#210 acceptance cadence |
+
+So the product-level cap conflated two flows with nothing in common: a paid SKU that is 100 % of
+the spend, and a free tier that is 100 % of the always-on guard.
+
+### The split, decided 2026-08-03
+
+| budget | scope | amount | stop usage | job |
+|---|---|---|---|---|
+| **new** | `SkuPricing` on `actions_linux_8_core_arm` | $50 | **Yes** | the hard stop, on the only thing that spends |
+| **reshaped** | `ProductPricing` on `actions` | $60 | **No — alert only** | early warning for anything that is *not* the big runner: storage overage, standard minutes past the included pool |
+
+$50 ≈ 70 suite runs/month ≈ 2–3 acceptances/day of headroom. **It is an interim guard, not the §8
+hosting decision** — recalibrate after a week of label-gated data, and re-derive entirely if A vs
+F resolves to a self-hosted runner.
+
+Applied via the budgets API (needs `admin:org`):
+
+```
+POST  /organizations/qumbra-labs/settings/billing/budgets
+      {"budget_type":"SkuPricing","budget_product_sku":"actions_linux_8_core_arm",
+       "budget_scope":"organization","budget_amount":50,"prevent_further_usage":true, …}
+PATCH /organizations/qumbra-labs/settings/billing/budgets/7adffff2-…
+      {"budget_amount":60,"prevent_further_usage":false, …}
+```
+
+Verification is the same API: `GET …/settings/billing/budgets` must show both rows as above.
+One repeatable trick worth recording: **the valid SKU identifiers are not listable anywhere, but a
+`POST` with a bogus `budget_product_sku` returns the full legal list in its error message.**
+
+### One boundary this does not move
+
+`packages` stays at $0 with stop usage **on**. The node image on GHCR is public and public-package
+storage is free, so nothing running today is affected — but the day someone pushes a **private**
+image, the push will fail on this budget and the error will read like a permissions problem.
+Recorded here so that hour is spent on this sentence instead of on GHCR auth docs.
+
 ---
 
 *Written 2026-08-02 by the coordinator session, after Larry's billing screenshot made the spend
 visible. The measurements in §4 are reproducible with `gh run list` and the org billing page; the
-$9.31 is the only figure taken rather than derived.*
+$9.31 is the only figure taken rather than derived. §10 added 2026-08-03 by the reviewer session
+(Larry's dispatch) after the second billing screenshot; its figures come from the usage API and
+the budgets API, both quoted in place.*
