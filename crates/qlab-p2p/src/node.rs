@@ -521,19 +521,17 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// the ages here and the re-ask ladder are measured against one source.
     pub fn body_ask_report(&self, now_ms: u64) -> Vec<BodyAskEntry> {
         let mut out: Vec<BodyAskEntry> = self
-            .body_reqs
-            .keys()
-            .map(|hash| {
-                let rec = self.body_asks.get(hash);
-                BodyAskEntry {
-                    hash: *hash,
-                    height: self.node.header(hash).map(|h| h.height),
-                    outstanding_ms: rec.map_or(0, |r| now_ms.saturating_sub(r.first_ms)),
-                    asks: rec.map_or(0, |r| r.asks),
-                    asked: rec.map(|r| r.asked.clone()).unwrap_or_default(),
-                    answers: rec.map(|r| r.answers.clone()).unwrap_or_default(),
-                    answers_dropped: rec.map_or(0, |r| r.answers_dropped),
-                }
+            .body_asks
+            .iter()
+            .map(|(hash, rec)| BodyAskEntry {
+                hash: *hash,
+                height: self.node.header(hash).map(|h| h.height),
+                outstanding_ms: now_ms.saturating_sub(rec.first_ms),
+                asks: rec.asks,
+                asked: rec.asked.clone(),
+                answers: rec.answers.clone(),
+                answers_dropped: rec.answers_dropped,
+                in_flight: self.body_reqs.contains_key(hash),
             })
             .collect();
         out.sort_by_key(|e| (e.height.unwrap_or(u64::MAX), e.hash));

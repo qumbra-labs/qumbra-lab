@@ -137,6 +137,17 @@ pub struct BodyAskEntry {
     pub answers: BTreeMap<PeerId, BodyAnswer>,
     /// Peers whose answers were not kept because [`MAX_ANSWERS_PER_ASK`] bit.
     pub answers_dropped: usize,
+    /// Whether the request is **still outstanding** right now (`breq=` counts
+    /// exactly these), as opposed to answered-and-no-longer-wanted.
+    ///
+    /// Both are reported, and the flag is why. An ask that was answered with a
+    /// body and left the ask set is the node **being served**; an ask that was
+    /// answered with a body and is *still* outstanding is a body that arrived and
+    /// was not applied. Dropping the answered ones would erase the (c) reading
+    /// entirely on the common path, because a buffered body leaves the ask set the
+    /// moment it lands — `missing_body_hashes` excludes anything in the
+    /// pending-body window — so the only trace that it ever arrived is here.
+    pub in_flight: bool,
 }
 
 impl BodyAskEntry {
@@ -178,11 +189,12 @@ impl BodyAskEntry {
     /// The per-entry journal line.
     pub fn to_line(&self) -> String {
         format!(
-            "BODYWAIT ask h={} id={} age_s={} asks={} ans={}",
+            "BODYWAIT ask h={} id={} age_s={} asks={} flight={} ans={}",
             self.height.map_or_else(|| "?".to_string(), |h| h.to_string()),
             hex12(&self.hash),
             self.outstanding_ms / 1_000,
             self.asks,
+            if self.in_flight { "y" } else { "n" },
             self.answer_field(),
         )
     }
@@ -438,6 +450,7 @@ fn full_signature(obs: &AskSetObservation, entries: &[BodyAskEntry]) -> String {
         sig.push('|');
         sig.push_str(&hex12(&e.hash));
         sig.push(':');
+        sig.push_str(if e.in_flight { "y:" } else { "n:" });
         sig.push_str(&e.answer_field());
     }
     sig
@@ -483,6 +496,7 @@ mod tests {
             asked: asked.iter().map(|p| PeerId(*p)).collect(),
             answers: answers.iter().map(|(p, a)| (PeerId(*p), *a)).collect(),
             answers_dropped: 0,
+            in_flight: true,
         }
     }
 

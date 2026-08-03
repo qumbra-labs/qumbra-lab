@@ -2866,6 +2866,137 @@ mod tests {
         }
     }
 
+    // ---- issue #229: the ask set, on the two surfaces an operator has ---------
+
+    /// 🔴 **`bask=` is the ask set, and `breq=` is not.**
+    ///
+    /// *"An ask set of 15 with 2 in flight and an ask set of 2 are the same `breq`
+    /// and different bugs."* The live hosts printed `breq=1–2` for over an hour and
+    /// no field on the line could say which of those two it was, because the ask
+    /// set — what `missing_body_hashes` actually produced — was never published.
+    ///
+    /// This node is stranded with **nothing in flight** (it has no peer to ask) and
+    /// an ask set of three, which is precisely the pair the old line collapsed: on
+    /// `main` it prints `breq=0` and there is no second number.
+    #[test]
+    fn bask_publishes_the_ask_set_and_the_fork_point_which_breq_cannot() {
+        use qlab_p2p::n1::BlockIngest;
+
+        let (cw, genesis, bw) = rig_paying("i229_bask_win", 0xa1);
+        let winner = node_mining_its_own(&cw, &genesis, 3);
+        let winning = main_chain_headers(&winner);
+
+        let (cl, _, bl) = rig_paying("i229_bask_lose", 0xb2);
+        let mut loser = node_mining_its_own(&cl, &genesis, 1);
+        for header in &winning {
+            loser.p2p_mut().node_mut().ingest_header(*header);
+        }
+
+        let healthy = winner.telemetry_sample();
+        let stranded = loser.telemetry_sample();
+        // A node on its own chain wants nothing and knows where it is.
+        assert_eq!(field(&healthy, "bask"), "0@3", "nothing to fetch: {healthy}");
+        assert_eq!(field(&healthy, "breq"), "0");
+        // The stranded node wants three main-chain bodies and has asked for none.
+        assert_eq!(field(&stranded, "schain"), "fork", "{stranded}");
+        assert_eq!(field(&stranded, "breq"), "0", "no peer, so nothing in flight");
+        assert_eq!(
+            field(&stranded, "bask"),
+            "3@0",
+            "🔴 …and yet it wants three bodies, from a fork point at genesis — the \
+             two facts `breq=0` cannot carry: {stranded}"
+        );
+        // The fork point moves with the strand, so it is a measurement and not a
+        // constant: applying the winning branch puts it back on the main chain.
+        for header in &winning {
+            let hash = header.header_hash();
+            let stored = winner.state().chain().block(&hash).expect("winner has it").clone();
+            loser.p2p_mut().node_mut().ingest_block(*header, stored.body());
+        }
+        let rejoined = loser.telemetry_sample();
+        assert_eq!(field(&rejoined, "schain"), "main", "{rejoined}");
+        assert_eq!(field(&rejoined, "bask"), "0@3", "the gap closed: {rejoined}");
+        println!("PR-SAMPLE i229 healthy : {healthy}");
+        println!("PR-SAMPLE i229 stranded: {stranded}");
+        for base in [bw, bl] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// 🔴 **The `BODYWAIT` journal on the binary, including the mining refusal —
+    /// and silence on a healthy node.**
+    ///
+    /// The three stranded hosts stopped mining, correctly (`lagging && !exempt ⇒
+    /// refuse`), and **nothing said so**: `refuse_for_lag` is a `/metrics` counter
+    /// and `metrics_addr` is unset on every T0 host, so the only way to know was to
+    /// difference `tip=` across hosts. This asserts the line says it, on stdout,
+    /// with no listener configured — and that the refusal *count* is on it too, so
+    /// the claim is a measurement rather than a re-derivation of the predicate.
+    ///
+    /// The clock is supplied rather than slept: the latch threshold is
+    /// `UNOBTAINABLE_BODY_CADENCES × CHECKPOINT_CADENCE_BLOCKS × block_time` = 20
+    /// minutes at the frozen 75 s target, and a test that waited for it would be a
+    /// test nobody runs.
+    #[test]
+    fn a_stranded_node_journals_what_it_wants_and_that_it_has_stopped_mining() {
+        use qlab_p2p::n1::BlockIngest;
+
+        let (cw, genesis, bw) = rig_paying("i229_journal_win", 0xa1);
+        let mut winner = node_mining_its_own(&cw, &genesis, 3);
+        let winning = main_chain_headers(&winner);
+
+        let (cl, _, bl) = rig_paying("i229_journal_lose", 0xb2);
+        let mut loser = node_mining_its_own(&cl, &genesis, 1);
+        for header in &winning {
+            loser.p2p_mut().node_mut().ingest_header(*header);
+        }
+        // The refusal the line reports: the duty gate declines, once, for real.
+        assert!(!loser.try_mine(), "a node whose applied view is stale must not mine");
+
+        let threshold = loser.p2p().node().unobtainable_threshold_ms();
+        // Start the stall clock, then step past the threshold. `observe_body_fetch`
+        // is the per-tick hook `P2pNode::tick` calls; driving it directly is what
+        // lets a 20-minute constant be tested in microseconds.
+        loser.p2p_mut().node_mut().observe_body_fetch(0, 0, false);
+        assert!(loser.emit_body_waits_at(0).is_empty(), "not yet — the clock just started");
+        loser.p2p_mut().node_mut().observe_body_fetch(threshold + 1, 0, false);
+        let lines = loser.emit_body_waits_at(threshold + 1);
+
+        assert!(!lines.is_empty(), "a node stranded past the threshold says so");
+        let summary = &lines[0];
+        assert!(summary.starts_with("BODYWAIT stip=1 "), "{summary}");
+        assert!(summary.contains(" schain=fork "), "{summary}");
+        assert!(summary.contains(" sfork=0 ask=3 breq=0 "), "the ask set: {summary}");
+        assert!(summary.contains(" gate=missing@1 "), "the rejoin gate: {summary}");
+        assert!(
+            summary.contains(" mine=refused-lag mrefuse=1 "),
+            "🔴 it has stopped mining, and the count is the evidence: {summary}"
+        );
+        assert!(summary.ends_with(" stuck_s=1200"), "and for how long: {summary}");
+
+        // The rate limit: an unchanged picture inside the floor is silent.
+        loser.p2p_mut().node_mut().observe_body_fetch(threshold + 2_000, 0, false);
+        assert!(
+            loser.emit_body_waits_at(threshold + 2_000).is_empty(),
+            "an unchanged stranding does not repeat itself every pass"
+        );
+
+        // 🔴 The negative, on the binary: the winner is healthy and mining, and it
+        // has been at its tip for longer than the threshold. It emits nothing.
+        winner.p2p_mut().node_mut().observe_body_fetch(0, 0, false);
+        winner.p2p_mut().node_mut().observe_body_fetch(threshold * 4, 0, false);
+        assert!(
+            winner.emit_body_waits_at(threshold * 4).is_empty(),
+            "a healthy node never emits this line — not even a quiet one"
+        );
+        assert!(winner.try_mine(), "…and it is still mining");
+
+        println!("PR-SAMPLE i229 journal: {summary}");
+        for base in [bw, bl] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
     #[test]
     fn telemetry_age_is_dash_when_nothing_finalized() {
         // S8: a node that has mined but never finalized prints `final=-` AND `age_s=-`
