@@ -148,6 +148,6 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
   - EN stays **authoritative** on technical detail (design-repo convention); the `-zh` is a translation, not a fork. Cross-link both ways at the top.
   - **Not retroactive.** Pair new docs and pair an old one when someone actually needs it. Back-filling 88 files would produce 88 translations nobody asked for and 88 more things to keep in sync.
 - Non-trivial work: `git worktree add ../qumbra-lab-<slug> -b claude/<slug>`, land via PR to `main`, post the full PR URL, clean up the worktree after merge. Trivial single-file fixes may go direct to `main`.
-- Layout: **18 crates** — see `README.md` for the annotated list; `crates/qlab-air` (the fixed-shape AIR) and `crates/qlab-bench` (harness) are the two an AIR change usually touches. `docs/` is scratch — polished results go to the design repo, not here.
+- Layout: **19 crates** — see `README.md` for the annotated list; `crates/qlab-air` (the fixed-shape AIR) and `crates/qlab-bench` (harness) are the two an AIR change usually touches. `docs/` is scratch — polished results go to the design repo, not here.
 - Rust 2021, workspace-managed. Keep `cargo check` green on every commit.
 - Subagents where possible (research, parallel bench runs, doc translation); verify subagent-written files actually exist on disk (`git status` / `wc -l`) before trusting completion reports.
