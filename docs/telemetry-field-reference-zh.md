@@ -520,7 +520,7 @@ verify-only 节点：`sslot=- sid=-`，这是正确的，不是缺口。
 采样，只有当它不消失时才上报。
 
 **由这些测试锁定：** `identity_fields_are_present_and_well_formed_before_anything_finalizes`
-（`run.rs:3679`）、`telemetry_roundtrips_checkpoint_identity_at_0x03`（`telemetry.rs:853`）。
+（`run.rs:3679`）、`telemetry_roundtrips_checkpoint_identity_at_0x04`（`telemetry.rs:853`）。
 
 ---
 
@@ -1172,7 +1172,82 @@ BODYWAIT ask h= id= age_s= asks= flight= ans=<peer>:<served|header-only|dont-hav
 
 ⚠️ **本文 §0 的字段清单是陈旧的，而且原因不是 `bask`。** `cpq`、`dfin`、`fdrop`（issue #204）
 比这个字段更早追加，却从未补进那份清单。请照 §0 已经说过的那样，以 `run.rs` 里的 `format!`
-为准。
+为准。*（`dfin` 现在有了自己的小节 —— §33 —— 因为 issue #212 给了它一个搭档。`cpq` 和
+`fdrop` 仍然没有。）*
+
+---
+
+## 33. `dfin` / `dfinbh` —— 能在重启后存活的那个最终化头（issue #212）
+
+**🔴 同一个 `dfin` 下跨主机的 `dfinbh` 不同就是 STOP。🟡 单台主机上 `dfin` 与 `final=` 不同
+不是。** 对这两者采取任何行动之前，先读完本节。
+
+**它们说的是什么。** **第 3 号头** —— 状态机的链存储。它就是
+[`Snapshot.finalized`](../crates/qlab-node/src/persist.rs) 写出来的那个最终化头，是
+“绝不在最终性之前重组”这条规则实际执行其上的那个头，也是**唯一能在重启后存活的最终化头。**
+
+- **`dfin`** —— 第 3 号头的高度；当它什么都没有最终化时为 `-`。
+- **`dfinbh`** —— 第 3 号头在该高度所持有的那个**区块**的身份：其区块哈希的头 6 字节，或 `-`。
+
+**🔴 `final=` 与 `fid=`（§13、§9）是另一个头。** 它们读的是委员会的
+`FinalityTracker` —— **第 1 号头** —— 它只需要法定票数即可，并且在**关机时被丢弃**。一个节点
+可以报出 `final=1056`，而重启后回来的却是 1048；2026-08-01 的 node1 正是如此，持续了数小时。
+
+**🔴 `dfinbh` 与 `fid` 不可比，把它们并排比较毫无意义。** `fid` 是
+`keccak256(height ‖ block_hash ‖ root)` 的截断 —— 委员会的 ML-DSA 密钥所签的那串确切字节的
+摘要。`dfinbh` 则是一个区块的名字。二者只是宽度相同、渲染相同，除此之外别无共通。这正是
+`OPERATOR.md` §3 以*“两个不同的值都被叫做‘genesis hash’”*记录下来的同一个陷阱；`dfinbh` 的
+拼写里刻意没有 `id`，让这一行本身就不鼓励那种比较。`dfinbh` 应当与 **`stipid`**（§10）归为
+一类 —— 那也是一个区块哈希前缀。
+
+**量具。** 两者都是瞬时水平值，从 `/v1/telemetry` 线上所服务的**同一个**快照读出 —— 日志行与
+线上表示不可能对它们各说一套。始终打印，包括 `-`。
+
+**正常值。** `dfin=` 等于 `final=`，且该高度上每台主机的 `dfinbh=` 相同。这就是四台 T0 主机在
+`2026-08-03 07:11:27Z` 给出的读数：`final=2864 fid=63e42f7e13a7 dfin=2864`，逐字段一致。
+
+| 读数 | 含义 |
+|---|---|
+| `final=2864 dfin=2864` | 健康 —— 第 1 号头与第 3 号头指同一个区块 |
+| `final=1056 dfin=1048` | 🟡 第 3 号头尚未记录第 1 号头所报的内容。**单个采样是读数，不是告警** —— 见下 |
+| `final=2864 dfin=-` | 🟡 第 3 号头**什么都没有**：这台主机重启后回到创世。上报 |
+| 两台主机 `dfin` 相同、`dfinbh` 不同 | 🔴 **STOP。** 两台主机在同一高度持久最终化了不同的区块 |
+
+**为什么 `dfin` 落后于 `final` 在单个采样上不是告警。** `sync_state_finality` 在每次 drain 时
+都会重试，所以“检查点已最终化、其区块体还没被应用”这个窗口看起来就正是如此。**真正需要警惕的
+是*持续*，而一行日志无法确立“持续”。** 请与 `slag=`（§4 —— 状态机到底有没有在追赶？）和
+`fdrop=`（持久头是不是在*拒绝*记录？）配对读。这与协调者 2026-08-02 对 `cpq=1` 的判断相同：
+*观察，不要假定。*
+
+**为什么 `dfinbh` 不同确实是 STOP，而且比 `fid` 分裂更糟。** `fid` 分裂发生在第 1 号头上，那个头
+在关机时会被扔掉；而这里是两台主机重启后回来时的那个头。操作动作与附录 A 第 2 条相同，并且更强
+一步：**停下、不要滚动、在每台主机上保全 data dir** —— 分歧就在磁盘上，所以证据能存活，而滚动
+会覆盖产生它的那个二进制。
+
+**在线上，以及在 `qumbra-opview` 里。** 两个字段都在 `RPC_VERSION 0x04` 的 `/v1/telemetry` 上，
+渲染为 `DFIN`/`DFINBH` 两列，两种告警分列在不同的判定行上。`qumbra-opview` 在跨主机 `dfinbh`
+分裂时以 **2** 退出，在单台主机 `final`/`dfin` 不一致时以 **0** 退出，并把后者报为可 grep 的
+`DURABLE_LAG`、`DURABLE_ABSENT`、`DURABLE_AHEAD`。尚未滚到 `0x04` 的主机渲染为
+`INDETERMINATE` 并带上它的线上版本号 —— 滚动期间这是预期状态，不是故障，而且它其余各列仍然
+被读到。
+
+**何时升级：** 两台主机共享同一个 `dfin` 而 `dfinbh` 不同（🔴 立即）；某台报出真实 `final=` 的
+主机上出现 `dfin=-`（上报）；连续多个采样上 `final=`/`dfin=` 分离（上报，并附上 `slag=` 与
+`fdrop=`）。
+
+**由谁锁定：** `the_three_durable_states_are_distinct_on_the_wire_and_round_trip`、
+`the_durable_identity_is_a_block_hash_prefix_and_not_a_checkpoint_identity`、
+`the_tracker_and_the_durable_head_are_compared_in_one_place`、
+`a_reader_at_0x04_still_reads_a_0x03_node_and_knows_that_it_did`
+（`crates/qlab-node/src/telemetry.rs`）；
+`the_2026_08_01_node1_divergence_is_visible_and_was_not_before`、
+`two_nodes_durably_holding_different_blocks_at_one_height_is_a_stop`、
+`an_unrolled_host_is_indeterminate_with_its_wire_version_not_a_dissenter`、
+`the_durable_alarms_render_apart_and_the_view_refuses_the_fid_comparison`
+（`crates/qumbra-opview/src`）；
+`a_durable_split_over_sockets_is_the_stop_condition_while_fid_agrees`、
+`a_mid_roll_net_is_fully_readable_over_sockets_and_says_which_hosts_predate_the_field`
+（`crates/qumbra-opview/tests/over_http.rs`）。
 
 ---
 
@@ -1185,12 +1260,18 @@ BODYWAIT ask h= id= age_s= asks= flight= ans=<peer>:<served|header-only|dont-hav
    ⚠️ **先比 `final=`。** `final=` 不同而 `fid=` 不同**不属于**这一条 —— 那是一台主机领先、
    终结性正在传播。它应当在一两个采样周期内消失；如果不消失，作为发现上报，然后继续往下走
    这份清单。完整的检查顺序见 §9。
-3. **任何主机 `sid=split`** ⇒ 🔴 升级。
-4. **任何主机 `schain=fork`** ⇒ 🔴 卡死，介入。（`schain=-` ⇒ 上报。）
-5. `slag` 非零且斜率 ≈ 出块速率 ⇒ 状态机什么都没在应用。
-6. `regime=Degraded` 持续 ⇒ 终结停滞；走 runbook，外加 `ROUND why=`。
-7. `uanchor` 上升而 `slag` 钉住 ⇒ 正在被提供它无法判定的历史。
-8. 其余一切 ⇒ 带上读数上报，不要推断。
+3. **`dfin=` 相同而 `dfinbh=` 不同**（跨主机）⇒ 🔴 STOP，并且**不要滚动** —— 分歧就在磁盘上，
+   滚动会覆盖产生它的那个二进制。
+   ⚠️ 操作顺序与第 2 条相同：**先比 `dfin=`**，并且绝不要把 `dfinbh=` 与 `fid=` 相比 ——
+   它们是不同的空间（§33）。
+4. **任何主机 `sid=split`** ⇒ 🔴 升级。
+5. **任何主机 `schain=fork`** ⇒ 🔴 卡死，介入。（`schain=-` ⇒ 上报。）
+6. `slag` 非零且斜率 ≈ 出块速率 ⇒ 状态机什么都没在应用。
+7. 某台主机上 `final=` 领先于 `dfin=`，且跨多个采样持续 ⇒ 上报，并附上 `slag=` 与 `fdrop=`。
+   **单个采样不属于这一条**（§33）。真实 `final=` 旁出现 `dfin=-` ⇒ 立即上报。
+8. `regime=Degraded` 持续 ⇒ 终结停滞；走 runbook，外加 `ROUND why=`。
+9. `uanchor` 上升而 `slag` 钉住 ⇒ 正在被提供它无法判定的历史。
+10. 其余一切 ⇒ 带上读数上报，不要推断。
 
 **跨主机比较任何计数器之前**，先确认是否有一方重启过。`rounds`、`rfail`、`rback`、
 `hignore`、`powrej`、`uanchor` 全部是自**进程**启动累计。

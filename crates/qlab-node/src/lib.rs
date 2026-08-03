@@ -80,8 +80,9 @@ pub use rpc::{
     SubmitOutcome, TxDiscovery, MAX_COMPACT_BLOCKS, RPC_VERSION,
 };
 pub use telemetry::{
-    AppliedTip, LocalCommitment, StateLag, SupplyCoverage, Telemetry, APPLIED_TIP_OFF_MAIN,
-    APPLIED_TIP_ON_MAIN, LOCAL_COMMITMENT_SPLIT,
+    AppliedTip, BlockIdentity, DurableAgreement, DurableHead, DurableView, LocalCommitment,
+    StateLag, SupplyCoverage, Telemetry, APPLIED_TIP_OFF_MAIN, APPLIED_TIP_ON_MAIN,
+    DURABLE_HEAD_SINCE_VERSION, LOCAL_COMMITMENT_SPLIT, READABLE_TELEMETRY_VERSIONS,
 };
 pub use persist::{read_records, LogRecord, Snapshot, BLOCK_LOG, FORMAT_VERSION, SNAPSHOT};
 pub use store::{

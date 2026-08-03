@@ -274,14 +274,31 @@ cargo run -p qumbra-opview -- \
   node2=http://127.0.0.1:9412 node3=http://127.0.0.1:9413
 ```
 
-It prints one row per node and then two verdicts, kept deliberately apart:
+It prints one row per node and then the verdicts, kept deliberately apart:
 
 - **`fid` divergence** — two nodes reporting the *same* `final` with *different*
-  identities, i.e. two checkpoints finalized at one height. **The R2 STOP.** It is
-  the only condition that exits non-zero (exit `2`).
+  identities, i.e. two checkpoints finalized at one height. **The R2 STOP**, exit
+  `2`.
 - **`sid` divergence** — nodes whose own keys signed different variants at one
   slot. A **finding**, not a stop, and exit `0`: the minority still finalizes the
   majority's checkpoint, so `fid` can agree while this does not.
+- **durable-head divergence** (issue #212) — two nodes reporting the same `dfin`
+  with different `dfinbh`, i.e. two hosts that durably finalized **different
+  blocks** at one height. **A STOP**, exit `2`, and worse than an `fid` split:
+  `final`/`fid` read head #1, which is discarded at shutdown, and this reads the
+  head both hosts come back as. Stop, do **not** roll, preserve the data dirs.
+- **head #1 vs head #3 on one node** — `final` ahead of that node's own `dfin`. A
+  **finding**, exit `0`, greppable as `DURABLE_LAG` / `DURABLE_ABSENT` /
+  `DURABLE_AHEAD`. One poll cannot tell the hours-long 2026-08-01 node1 divergence
+  from the ordinary window between a checkpoint finalizing and its body being
+  applied, so *sustained* is the alarm — re-poll, and read it against that host's
+  `slag=` and `fdrop=`.
+
+> ⚠️ **`DFINBH` is a block-hash prefix and `FID` is a checkpoint identity.** They
+> render at one width through one helper and comparing them is meaningless: compare
+> `DFINBH` between nodes at one `DFIN`, never against `FID`. The view says so on its
+> own durable verdict line, and `qlab_node::BlockIdentity` makes the comparison a
+> compile error in code.
 
 A node that does not answer is rendered `UNREACHABLE` with its reason and is
 excluded from both verdicts — a timeout is missing evidence, not a disagreement,
@@ -293,11 +310,25 @@ single-node health page, with four it is the agreement view, over one code path.
 > network. It does not generalise to a public net, where the same output would be
 > the operator's own nodes vouching for themselves.
 
-**A node built before #117 is refused, not best-effort parsed**: its wire is
-`0x01`, this build speaks `0x02`, and a `fid=-` rendered from an unreadable body
-would look exactly like a node that had finalized nothing. The image must be
+**Which wires this view reads, and which it refuses.** The node serves exactly one
+version — `RPC_VERSION`, `0x04` since issue #212 — and every strict decoder is an
+equality check. `qumbra-opview` opts into a **named, bounded** reader set,
+`qlab_node::READABLE_TELEMETRY_VERSIONS` = `[0x03, 0x04]`, and refuses everything
+else with a reason: a `fid=-` rendered from an unreadable body would look exactly
+like a node that had finalized nothing. A node built before #117 (`0x01`) or before
+#121 (`0x02`) is therefore still `UNREACHABLE`-with-a-reason, and its image must be
 rebuilt for the view to read anything (`deny_unknown_fields` also means an old
 binary refuses the new config outright — ship the binary first).
+
+**Why `0x03` is in that set at all: the roll.** T0 rolls one host at a time, and
+the full roll of all four took 23 minutes on 2026-08-03. Without a reader that
+speaks the previous version, an `opview` built at `0x04` would read *nothing* from
+every un-rolled host for that whole window — and its verdict is **cross-host
+agreement**, which an instrument seeing two of four hosts cannot answer. So during
+a roll an un-rolled host renders `INDETERMINATE` **with its wire version and the
+reason**, every other column on it is still read, and the cross-host `fid` question
+stays answerable throughout. `0x03` leaves the set once all four hosts serve
+`0x04`; keeping it after that would let a forgotten host look healthy.
 
 ### The faucet (`qumbra-faucet`, issue #123)
 

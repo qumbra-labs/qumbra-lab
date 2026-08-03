@@ -14,17 +14,49 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use qlab_node::telemetry::LocalCommitment;
-use qlab_node::Telemetry;
-use qumbra_opview::agree::{Agreement, SignedVerdict, Verdict};
+use qlab_node::{DurableAgreement, Telemetry};
+use qumbra_opview::agree::{Agreement, DurableVerdict, SignedVerdict, Verdict};
 use qumbra_opview::poll::{poll_all, Endpoint, PollOptions};
 use qumbra_opview::render;
 
 const MAX_LAG: u64 = 16;
 
+/// A live-composition snapshot: head #3 read, and holding the same height head #1
+/// reports, under a block identity derived from `dfin_first` (issue #212).
 fn telem(fin: u64, fid: u64, signed: Option<(u64, Option<u64>)>) -> Telemetry {
-    Telemetry::assemble(fin + 24, Some(fin), 75, 0, 3, 1, MAX_LAG)
+    telem_durable(fin, fid, signed, Some((fin, 0xdd)))
+}
+
+fn telem_durable(
+    fin: u64,
+    fid: u64,
+    signed: Option<(u64, Option<u64>)>,
+    durable: Option<(u64, u8)>,
+) -> Telemetry {
+    let base = Telemetry::assemble(fin + 24, Some(fin), 75, 0, 3, 1, MAX_LAG)
         .with_checkpoint(Some(fid), signed.map(|(slot, id)| LocalCommitment { slot, id }))
-        .with_tip_difficulty(Some(1_048_576))
+        .with_tip_difficulty(Some(1_048_576));
+    base.with_durable_head(durable.map(|(height, first)| {
+        let mut hash = [0xee_u8; 32];
+        hash[0] = first;
+        (height, hash)
+    }))
+}
+
+/// The `0x03` body for the same facts: everything the pre-#212 wire carried, with no
+/// durable tail, stamped `0x03`. Built by removing the tail the encoder appends and
+/// re-stamping, then **asserted** against the strict decoder so the fixture cannot
+/// quietly become something else.
+fn v3_body(t: &Telemetry) -> Vec<u8> {
+    let full = t.to_bytes();
+    // The 0x04 tail is `discriminant(1) ‖ height(8) ‖ identity(8)` for a present head.
+    let mut old = full[..full.len() - 17].to_vec();
+    old[0] = 0x03;
+    assert!(
+        Telemetry::from_bytes(&old).is_err(),
+        "the fixture must not be readable by the STRICT decoder"
+    );
+    old
 }
 
 /// A node stand-in: a real HTTP server answering `GET /v1/telemetry` with `body`.
@@ -202,25 +234,119 @@ fn a_silent_node_times_out_and_reads_as_unreachable() {
 /// payload carries no committee/supply tail, and best-effort parsing it would
 /// render zero aggregates and no attestation — the healthiest-looking possible
 /// rendering of a node whose telemetry this build cannot understand.
+///
+/// 🔴 **Issue #212 pins the boundary of the compat window here.** `0x03` is now
+/// readable (see the roll test below) and `0x02` is **not**, so this test is what
+/// stops the window from being widened by drift: the readable set is a named list of
+/// versions whose layout this build knows, not a `>=` comparison.
 #[test]
 fn a_node_speaking_the_old_0x02_wire_is_refused_with_a_reason() {
-    // A genuine v2 payload: the current encoding minus three u64 committee
-    // aggregates and the zero-length supply varint, stamped 0x02.
-    let v3 = telem(3776, 0xaaaa_aaaa_aaaa, Some((3776, Some(0xaaaa_aaaa_aaaa)))).to_bytes();
+    // A genuine v2 payload: the 0x03 body minus three u64 committee aggregates and
+    // the zero-length supply varint, stamped 0x02.
+    let live = telem(3776, 0xaaaa_aaaa_aaaa, Some((3776, Some(0xaaaa_aaaa_aaaa))));
+    let v3 = v3_body(&live);
     let mut v2 = v3[..v3.len() - 24 - 1].to_vec();
     v2[0] = 0x02;
-    assert!(Telemetry::from_bytes(&v2).is_err(), "the fixture really is not readable at 0x03");
+    assert!(
+        Telemetry::from_bytes_compat(&v2).is_err(),
+        "the fixture really is outside the readable set"
+    );
 
     let old = FakeNode::serving(v2);
     let eps = vec![old.endpoint("stale-node")];
     let readings = poll_all(&eps, PollOptions { timeout: Duration::from_millis(800) });
 
     assert!(!readings[0].reading.is_reachable());
+    assert_eq!(readings[0].reading.wire_version(), None);
     let a = Agreement::of(&readings);
     assert_eq!(a.verdict, Verdict::Agreed, "one unreadable node is no evidence, not a split");
     assert_eq!(a.exit_code(), 0);
     let text = render::view(&readings, &a);
-    assert!(text.contains("requires the 0x03 committee/supply wire"), "the reason names the cause:\n{text}");
+    assert!(
+        text.contains("this build reads wire versions [3, 4]"),
+        "the reason names the readable set:\n{text}"
+    );
+}
+
+/// **Acceptance (#212, over sockets): mid-roll, the rolled host's durable head is
+/// read and the un-rolled hosts stay fully readable on every other field.**
+///
+/// This is the roll problem answered from bytes off a socket, which is the seam that
+/// matters — `Reader::version` is an equality check, so before this change an
+/// `opview` at `0x04` would have produced four `UNREACHABLE` rows against a net where
+/// three hosts were healthy and simply had not been rolled yet, for the whole 23
+/// minutes of a one-host-at-a-time roll.
+#[test]
+fn a_mid_roll_net_is_fully_readable_over_sockets_and_says_which_hosts_predate_the_field() {
+    const H: u64 = 2864;
+    const FID: u64 = 0x63e4_2f7e_13a7;
+    let live = telem_durable(H, FID, None, Some((H, 0x63)));
+
+    let rolled = FakeNode::serving(live.to_bytes());
+    let old_a = FakeNode::serving(v3_body(&live));
+    let old_b = FakeNode::serving(v3_body(&live));
+    let old_c = FakeNode::serving(v3_body(&live));
+
+    let eps = vec![
+        rolled.endpoint("node0"),
+        old_a.endpoint("node1"),
+        old_b.endpoint("node2"),
+        old_c.endpoint("node3"),
+    ];
+    let readings = poll_all(&eps, PollOptions { timeout: Duration::from_millis(800) });
+
+    // 🔴 The property: all four answered and all four decoded.
+    assert!(readings.iter().all(|r| r.reading.is_reachable()), "every host readable mid-roll");
+    assert_eq!(readings[0].reading.wire_version(), Some(0x04));
+    assert!(readings[0].reading.wire_carries_durable_head());
+    for r in &readings[1..] {
+        assert_eq!(r.reading.wire_version(), Some(0x03));
+        assert!(!r.reading.wire_carries_durable_head(), "0x03 predates the field");
+        // Everything the old wire DID carry is still read, which is the whole reason
+        // the cross-host question stays answerable through the roll.
+        let t = r.reading.telemetry().unwrap();
+        assert_eq!(t.finalized_height, Some(H));
+        assert_eq!(t.fid_field(), "63e42f7e13a7");
+        assert_eq!(t.durable_agreement(), DurableAgreement::Unavailable);
+    }
+
+    let a = Agreement::of(&readings);
+    assert_eq!(a.reachable.len(), 4);
+    assert_eq!(a.verdict, Verdict::Agreed, "the fid verdict is still answerable across all four");
+    assert_eq!(a.comparable_heights().len(), 1);
+    assert_eq!(a.durable_verdict, DurableVerdict::Indeterminate);
+    assert_eq!(a.durable_blind.len(), 3);
+    assert_eq!(a.exit_code(), 0);
+
+    let text = render::view(&readings, &a);
+    assert!(text.contains("checkpoint agreement (fid): AGREED — 4/4 nodes answered"), "{text}");
+    assert!(text.contains("node1: wire 0x03 predates the durable head"), "{text}");
+    assert!(!text.contains("UNREACHABLE"), "no host may be rendered unreachable mid-roll:\n{text}");
+    // The rolled host's durable head renders; the others' are `-`.
+    assert!(text.contains("63eeeeeeeeee"), "{text}");
+}
+
+/// **Acceptance (#212, over sockets): a durable split is the STOP condition, decided
+/// from served bytes, with `fid` agreeing.**
+#[test]
+fn a_durable_split_over_sockets_is_the_stop_condition_while_fid_agrees() {
+    const H: u64 = 2864;
+    const FID: u64 = 0x63e4_2f7e_13a7;
+    let n0 = FakeNode::serving(telem_durable(H, FID, None, Some((H, 0xa1))).to_bytes());
+    let n1 = FakeNode::serving(telem_durable(H, FID, None, Some((H, 0xb2))).to_bytes());
+
+    let eps = vec![n0.endpoint("node0"), n1.endpoint("node1")];
+    let readings = poll_all(&eps, PollOptions { timeout: Duration::from_millis(800) });
+    let a = Agreement::of(&readings);
+
+    assert_eq!(a.verdict, Verdict::Agreed, "head #1 agrees — that is why this was invisible");
+    assert_eq!(a.durable_verdict, DurableVerdict::Diverged);
+    assert_eq!(a.exit_code(), 2, "the same STOP code as an fid split");
+    let text = render::view(&readings, &a);
+    assert!(text.contains("durable finalized head (dfin/dfinbh): 🔴 DIVERGED"), "{text}");
+    assert!(text.contains(&format!("dfin={H}")), "{text}");
+    assert!(text.contains("a1eeeeeeeeee [node0]"), "{text}");
+    assert!(text.contains("b2eeeeeeeeee [node1]"), "{text}");
 }
 
 /// A server that answers something else entirely (404 on the route) is also just
