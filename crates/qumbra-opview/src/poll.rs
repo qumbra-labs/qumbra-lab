@@ -14,6 +14,20 @@
 //! [`Reading::Unreachable`] with its reason, and [`crate::agree`] computes
 //! agreement over the nodes that *answered*.
 //!
+//! # A host that has not been rolled yet is a THIRD thing (issue #212)
+//!
+//! It is neither missing evidence nor conflicting evidence: it answers, its
+//! pre-existing fields are all readable and true, and the field the newest bump
+//! added is simply not on its wire. Rendering that as `Unreachable` would take the
+//! whole cross-host comparison offline for the length of a roll — T0 rolls one host
+//! at a time, and the last full roll took 23 minutes — which is how a version bump
+//! reintroduces exactly the blindness it was made to remove.
+//!
+//! So this module reads every version in
+//! [`READABLE_TELEMETRY_VERSIONS`] and keeps the one it read, on
+//! [`Reading::Ok::wire_version`]. That is what lets [`crate::agree`] say *"node0
+//! predates this field"* instead of `-`.
+//!
 //! # Deadlines
 //!
 //! Every endpoint gets the same wall-clock budget ([`PollOptions::timeout`]),
@@ -42,7 +56,7 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
-use qlab_node::Telemetry;
+use qlab_node::{Telemetry, DURABLE_HEAD_SINCE_VERSION, READABLE_TELEMETRY_VERSIONS};
 
 /// The route a node serves its versioned telemetry wire on.
 pub const TELEMETRY_PATH: &str = "/v1/telemetry";
@@ -103,8 +117,22 @@ impl Default for PollOptions {
 /// What one endpoint said, or why it said nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reading {
-    /// The node answered with a telemetry snapshot this build can decode.
-    Ok(Box<Telemetry>),
+    /// The node answered with a telemetry snapshot this build can decode, at the
+    /// wire version it was stamped with.
+    Ok {
+        telemetry: Box<Telemetry>,
+        /// **Which wire version the body carried** (issue #212) — a member of
+        /// [`qlab_node::READABLE_TELEMETRY_VERSIONS`].
+        ///
+        /// Carried because it is the only thing that can attribute an absent field.
+        /// A `0x03` node predates the durable head entirely and a `0x04` node whose
+        /// composition does not inject one reports it absent; those decode to the
+        /// same [`qlab_node::DurableView::Unavailable`] and are entirely different
+        /// facts. During a one-host-at-a-time roll the first is the state of most of
+        /// the net, and rendering it as the second would say the durable head is
+        /// unreadable on hosts where it is merely not deployed yet.
+        wire_version: u8,
+    },
     /// The node did not answer, or answered something this build cannot read. The
     /// string is the operator-facing reason, and it is carried rather than
     /// collapsed to a boolean because "connection refused" and "unknown wire
@@ -113,14 +141,29 @@ pub enum Reading {
 }
 
 impl Reading {
+    /// A decoded snapshot, at whatever wire version served it.
     pub fn telemetry(&self) -> Option<&Telemetry> {
         match self {
-            Reading::Ok(t) => Some(t),
+            Reading::Ok { telemetry, .. } => Some(telemetry),
             Reading::Unreachable(_) => None,
         }
     }
+    /// The wire version this node served, when it served one.
+    pub fn wire_version(&self) -> Option<u8> {
+        match self {
+            Reading::Ok { wire_version, .. } => Some(*wire_version),
+            Reading::Unreachable(_) => None,
+        }
+    }
+    /// **Whether this node's wire carries the durable head at all** (issue #212).
+    ///
+    /// `false` on a host that has not been rolled yet — which is not the same as a
+    /// host that carries the field and reports it absent.
+    pub fn wire_carries_durable_head(&self) -> bool {
+        self.wire_version().is_some_and(|v| v >= DURABLE_HEAD_SINCE_VERSION)
+    }
     pub fn is_reachable(&self) -> bool {
-        matches!(self, Reading::Ok(_))
+        matches!(self, Reading::Ok { .. })
     }
 }
 
@@ -165,14 +208,21 @@ pub fn poll_one(endpoint: &Endpoint, opts: PollOptions) -> NodeReading {
     let started = Instant::now();
     let reading = match fetch(&endpoint.base_url, TELEMETRY_PATH, opts.timeout) {
         Err(e) => Reading::Unreachable(e),
-        Ok(body) => match Telemetry::from_bytes(&body) {
-            Ok(t) => Reading::Ok(Box::new(t)),
+        // Issue #212: `from_bytes_compat`, not `from_bytes`. A bump would otherwise
+        // make this tool read NOTHING from every host still on the previous image,
+        // for the whole length of a one-host-at-a-time roll — and its verdict is
+        // cross-host agreement, which an instrument seeing two of four hosts cannot
+        // answer. The set is bounded and named (`READABLE_TELEMETRY_VERSIONS`), the
+        // version is kept, and everything outside the set is still refused.
+        Ok(body) => match Telemetry::from_bytes_compat(&body) {
+            Ok((wire_version, t)) => Reading::Ok { telemetry: Box::new(t), wire_version },
             // A decode failure is NOT a disagreement either. The commonest cause is
-            // the one this issue created: a node built before the `0x03` bump, whose
-            // wire this build refuses on purpose rather than best-effort parsing.
+            // a node built before a bump this build no longer reads, whose wire it
+            // refuses on purpose rather than best-effort parsing.
             Err(e) => Reading::Unreachable(format!(
                 "answered, but the body is not a telemetry wire this build reads: {e:?} \
-                 (this build requires the 0x03 committee/supply wire; older nodes report 0x01 or 0x02)"
+                 (this build reads wire versions {READABLE_TELEMETRY_VERSIONS:?}; \
+                 older nodes report 0x01 or 0x02)"
             )),
         },
     };
