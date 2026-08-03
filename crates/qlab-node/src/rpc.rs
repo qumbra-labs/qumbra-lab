@@ -74,13 +74,15 @@ use crate::telemetry::{LocalCommitment, Telemetry};
 /// The RPC wire-format version byte for the node's **own** surfaces —
 /// `/v1/status`, `/v1/anchors` and `/v1/telemetry`.
 ///
-/// **`0x03` since issue #121.** It was `0x01`, defined as `= qlab_cbserver::
+/// **`0x04` since issue #212.** It was `0x01`, defined as `= qlab_cbserver::
 /// WIRE_VERSION` and documented as deliberately equal "so a client speaks one
 /// version to the whole node". Adding the finalized-checkpoint identity to
 /// [`Telemetry`] is a payload change on a reject-unknown-version wire, so the
 /// `0x02` bump was the ratified mechanism (#117). Adding the public committee
-/// aggregates and supply attestation makes the same ratified bump to `0x03`
-/// (#121) — and it necessarily keeps that tie severed:
+/// aggregates and supply attestation made the same ratified bump to `0x03`
+/// (#121), and adding the **durable finalized head** — head #3, the only finalized
+/// head that survives a restart, which `final=`/`fid` are not — makes it again to
+/// `0x04` (#212). It necessarily keeps that tie severed:
 ///
 /// - The ratified **compact-block** family (`/v1/compact`, `/v1/…/full`,
 ///   `/v1/tree/frontier`) stays at [`qlab_cbserver::WIRE_VERSION`] = `0x01`. It
@@ -93,9 +95,22 @@ use crate::telemetry::{LocalCommitment, Telemetry};
 ///   an old reader failing loudly against a new node is the reject-unknown
 ///   feature working, not a regression.
 ///
-/// So a client now speaks `0x03` to the node's own wires and `0x01` to the
+/// So a client now speaks `0x04` to the node's own wires and `0x01` to the
 /// compact-block wires it shares with the `qlab-cbserver` reference server.
-pub const RPC_VERSION: u8 = 0x03;
+///
+/// # The reader side of a bump is not free, and #212 is where that was paid
+///
+/// [`Reader::version`] is an equality check, so **a reader built at `0x04` reads
+/// nothing at all from a node still serving `0x03`.** T0 rolls one host at a time,
+/// so every bump blinds `qumbra-opview` — the drills' cross-host pass/fail
+/// instrument — on every un-rolled host for the length of the roll. #212 pays for it
+/// with [`crate::telemetry::READABLE_TELEMETRY_VERSIONS`]: a bounded, named set of
+/// versions a *reader* may opt into via
+/// [`Telemetry::from_bytes_compat`], which hands back the version it decoded so an
+/// absent field can be attributed. **This constant, and every strict `from_bytes`,
+/// are unchanged in their strictness** — the node still serves exactly one version
+/// and still refuses every other on its own decode paths.
+pub const RPC_VERSION: u8 = 0x04;
 
 // ---------------------------------------------------------------------------
 // Transaction identity + note-discovery artifacts
@@ -932,13 +947,35 @@ impl<'a> Reader<'a> {
     pub(crate) fn new(b: &'a [u8]) -> Self {
         Self { b, pos: 0 }
     }
+    /// Consume the version byte, requiring **exactly** [`RPC_VERSION`].
+    ///
+    /// This is the strict §0 check and every node-side decode uses it. It is
+    /// expressed through [`Self::version_in`] so there is one implementation of
+    /// "read a byte, decide, or fail" rather than two that could drift.
     pub(crate) fn version(&mut self) -> Result<(), CodecError> {
+        self.version_in(&[RPC_VERSION]).map(|_| ())
+    }
+
+    /// Consume the version byte, requiring membership in `allowed`, and return it
+    /// (issue #212).
+    ///
+    /// 🔴 **This is not a relaxation of reject-unknown.** `allowed` is always a
+    /// short, named, compile-time list of versions whose layout this build knows —
+    /// the only caller passing more than one element is
+    /// [`crate::telemetry::Telemetry::from_bytes_compat`], with
+    /// [`crate::telemetry::READABLE_TELEMETRY_VERSIONS`]. A version outside the list
+    /// is still [`CodecError::BadVersion`], and the alternative that was considered
+    /// and rejected — turning this into a `>=` comparison — does not work anyway:
+    /// the fields after the prefix are not skippable, so an old reader would fail on
+    /// [`Self::finish`]'s trailing-byte check instead of on the version, i.e. the
+    /// same blindness reported under a misleading error.
+    pub(crate) fn version_in(&mut self, allowed: &[u8]) -> Result<u8, CodecError> {
         let v = *self.b.get(self.pos).ok_or(CodecError::Truncated { what: "version" })?;
         self.pos += 1;
-        if v != RPC_VERSION {
+        if !allowed.contains(&v) {
             return Err(CodecError::BadVersion { got: v });
         }
-        Ok(())
+        Ok(v)
     }
     pub(crate) fn u8(&mut self) -> Result<u8, CodecError> {
         let v = *self.b.get(self.pos).ok_or(CodecError::Truncated { what: "u8" })?;
@@ -1323,21 +1360,28 @@ mod tests {
         assert!(matches!(AnchorSet::from_bytes(&extra_a), Err(CodecError::TrailingBytes { .. })));
     }
 
-    /// Issue #121's **collateral, made explicit**: `/v1/status` and `/v1/anchors`
-    /// share `RPC_VERSION` with `/v1/telemetry`, so bumping it for the checkpoint
-    /// telemetry tail moves them to `0x03` too even though their payloads are byte-for-
-    /// byte what they were. A `0x01` reader now fails loudly against them.
+    /// Issue #121's **collateral, made explicit** (re-pinned at `0x04` by #212):
+    /// `/v1/status` and `/v1/anchors` share `RPC_VERSION` with `/v1/telemetry`, so
+    /// bumping it for the durable-head tail moves them to `0x04` too even though
+    /// their payloads are byte-for-byte what they were. An older reader now fails
+    /// loudly against them.
     ///
     /// That is the accepted trade (see [`RPC_VERSION`]'s doc), and it is locked
     /// here so nobody later "fixes" it back into a silent accept-both.
+    ///
+    /// 🔴 **Note what #212 did NOT do**: `Telemetry::from_bytes_compat` reads `0x03`,
+    /// and these two surfaces gained no such path. That is deliberate —
+    /// `qumbra-opview` polls `/v1/telemetry` and nothing else, so the roll problem is
+    /// that route's alone, and widening the compat window to routes nothing needs it
+    /// on would be leniency bought for free.
     #[test]
-    fn status_and_anchors_moved_to_0x03_with_telemetry_and_reject_older_versions() {
+    fn status_and_anchors_moved_to_0x04_with_telemetry_and_reject_older_versions() {
         let (rpc, _) = rpc_with_finalized_genesis();
-        assert_eq!(RPC_VERSION, 0x03);
+        assert_eq!(RPC_VERSION, 0x04);
 
         for mut payload in [rpc.status().to_bytes(), rpc.anchors().to_bytes(), rpc.telemetry().to_bytes()] {
-            assert_eq!(payload[0], 0x03, "the node's own surfaces move as one");
-            for old in [0x01, 0x02] {
+            assert_eq!(payload[0], 0x04, "the node's own surfaces move as one");
+            for old in [0x01, 0x02, 0x03] {
                 payload[0] = old;
                 let as_status = NodeStatus::from_bytes(&payload);
                 let as_anchors = AnchorSet::from_bytes(&payload);

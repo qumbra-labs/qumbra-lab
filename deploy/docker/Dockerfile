@@ -60,6 +60,15 @@ RUN cargo build --release --locked -p qumbra-node --features drill-cancel \
 
 # ---- runtime ---------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
+# Provenance (#224 / QUM-72). The key is the one qumbra-deploy's operator check
+# already reads (`org.opencontainers.image.revision`). Default is the string
+# `unknown`, not empty: an empty label is ambiguous (tooling gap vs forgotten
+# flag); `unknown` means nobody passed a revision and is actionable.
+# Pass it at build time:
+#   --build-arg GIT_REVISION=$(git rev-parse HEAD)
+ARG GIT_REVISION=unknown
+LABEL org.opencontainers.image.revision=$GIT_REVISION
+LABEL org.opencontainers.image.source=https://github.com/qumbra-labs/qumbra-lab
 # iproute2 (`tc`) and iputils-ping exist for ONE reason: `soak.sh netem` injects a
 # `tc netem` qdisc into each node container so the harness can ask latency questions
 # (issue #107 step 1b), and `ping` is how a run proves the qdisc is actually on the
