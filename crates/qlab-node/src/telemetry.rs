@@ -45,6 +45,31 @@
 //! publishable committee aggregates (never signer identities) and the supply
 //! attestation, moving the wire to `0x03`. An old reader is *supposed* to fail
 //! against a new node.
+//!
+//! # The durable finalized head (issue #212, wire `0x04`)
+//!
+//! Everything above — `final=`, `fid` — reads **head #1**, the committee
+//! [`FinalityTracker`](qlab_devnet::finality::FinalityTracker). It needs only a
+//! quorum of votes and it is **discarded at shutdown**.
+//!
+//! [`Telemetry::durable`] (`dfin`/`dfinbh`) is **head #3**: the state machine's
+//! chain store — the head [`crate::Snapshot`]`.finalized` is written from, the one
+//! `no_reorg_past_finalized_checkpoint_ever` executes on, and the only one that
+//! survives a restart. `PR #207` put its height on the container log as `dfin=`; it
+//! was not on any wire, and `qumbra-opview` — the pass/fail instrument for the four
+//! T0 drills — reads the wire and nothing else. On 2026-08-01 node1 held
+//! `final=1056 fid=fa3f9ac3680a` while its durable head was 1048 for hours, and
+//! opview would have reported four-way agreement the whole time.
+//!
+//! 🔴 **`fid` and the durable head's identity are not values in the same space.**
+//! `fid` is a [`qlab_devnet::committee::Checkpoint::identity`] — a digest of the
+//! exact bytes the committee's ML-DSA keys signed. The durable head offers a
+//! **block hash**, and no truncation of a block hash becomes a checkpoint identity.
+//! `qumbra-deploy/OPERATOR.md` §3 already carries *"Two different values are called
+//! 'the genesis hash'. Comparing them is meaningless"*, written after an operator
+//! compared a block-header hash to a genesis-file hash and concluded a host was
+//! broken. [`BlockIdentity`] exists so that the second instance of that mistake
+//! **does not compile**.
 
 use qlab_cbserver::codec::{write_varint, CodecError};
 use qlab_devnet::committee::{checkpoint_id_hex, CHECKPOINT_ID_ABSENT, CHECKPOINT_ID_BYTES};
@@ -63,6 +88,108 @@ const STATUS_DEGRADED: u8 = 1;
 const STATUS_HALTING: u8 = 2;
 /// Wire discriminant for [`FinalityStatus::Halted`].
 const STATUS_HALTED: u8 = 3;
+
+/// Wire discriminant for [`DurableView::Unavailable`] (issue #212).
+const DURABLE_UNAVAILABLE: u8 = 0;
+/// Wire discriminant for [`DurableView::Nothing`].
+const DURABLE_NOTHING: u8 = 1;
+/// Wire discriminant for [`DurableView::Head`], followed by height + identity.
+const DURABLE_HEAD: u8 = 2;
+
+/// The first [`RPC_VERSION`] whose `/v1/telemetry` payload carries the durable
+/// finalized head (issue #212). Below it the tail is simply not there, which is a
+/// different fact from a node that carries the tail and reports
+/// [`DurableView::Unavailable`] in it.
+pub const DURABLE_HEAD_SINCE_VERSION: u8 = 0x04;
+
+/// **The telemetry wire versions a READER in this build can decode**, newest last.
+///
+/// 🔴 This is the answer to the roll problem, and it is deliberately narrow. `T0`
+/// rolls one host at a time (`OPERATOR.md` §4: *"with no durable copy anywhere,
+/// rolling several at once has nothing left to resync from"*) and the roll of all
+/// four took 23 minutes on 2026-08-03. [`Telemetry::from_bytes`] is an **equality**
+/// check on the version byte, so an `opview` built at `0x04` could read *nothing*
+/// from a node still serving `0x03` — not a degraded subset, nothing — and
+/// `qumbra-opview`'s verdict is *cross-host agreement*, which an instrument that
+/// can see two of four hosts cannot answer. A bump with no reader-side answer would
+/// reintroduce, for the length of the roll, exactly the blindness issue #212 exists
+/// to remove.
+///
+/// **What this is not.** It is not a relaxation of §0's reject-unknown rule:
+/// `0x01` and `0x02` are still refused, unknown versions are still refused, and
+/// [`Telemetry::from_bytes`] — the path the node's own tests and every non-operator
+/// consumer use — remains a hard equality check on [`RPC_VERSION`]. This list is a
+/// **bounded, named set of versions this build knows the layout of**, read only by
+/// [`Telemetry::from_bytes_compat`], which hands its caller the version it decoded
+/// so the caller can say *why* a field is absent instead of printing a bare `-`.
+///
+/// **What removes `0x03` from it:** all four T0 hosts serving `0x04`. Until then a
+/// reader that drops it is blind during the roll; after then, keeping it lets a
+/// forgotten host look healthy, which is the failure mode in the other direction.
+pub const READABLE_TELEMETRY_VERSIONS: &[u8] = &[0x03, RPC_VERSION];
+
+/// **An identity in the block-hash space**: the first [`CHECKPOINT_ID_BYTES`] of a
+/// block hash, big-endian, rendered at `fid`'s width through `fid`'s helper.
+///
+/// 🔴 **This is not a [`qlab_devnet::committee::Checkpoint::identity`], and
+/// comparing the two is meaningless.** A checkpoint identity is
+/// `keccak256(height ‖ block_hash ‖ root)` truncated — the digest of the exact
+/// bytes the committee's ML-DSA keys commit to, so two nodes reporting one identity
+/// were provably asked to sign one thing. A block hash is the name of a block. They
+/// are the same *width* and the same *rendering* and nothing else, and this repo has
+/// already been bitten once by two same-shaped values with different meanings
+/// (`OPERATOR.md` §3, issue #206).
+///
+/// # Why it is a type and not a convention
+///
+/// Because a convention was already tried and is already half-broken. `stipid=`
+/// (#162 finding 6) is a block-hash prefix and `fid=`/`sid=` are checkpoint
+/// identities, all three are `u64`, all three render identically, and **nothing
+/// stops `applied.identity() == telemetry.finalized_id`** — a comparison that
+/// type-checks, reads plausibly, and cannot mean anything. Issue #212 adds a third
+/// value in the block-hash space, so the choice was to add a third opportunity for
+/// that mistake or to make it a compile error. This is the compile error:
+/// `BlockIdentity` has no `PartialEq<u64>`, so lining it up against `fid` does not
+/// build.
+///
+/// [`Self::bits`] is the one escape hatch, and it exists because a wire and a
+/// Prometheus gauge carry integers. It is named to be conspicuous at a call site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BlockIdentity(u64);
+
+impl BlockIdentity {
+    /// The identity of `hash`: its first [`CHECKPOINT_ID_BYTES`], big-endian.
+    ///
+    /// The prefix is taken **directly** rather than re-hashed, for the reason
+    /// [`AppliedTip`]'s docs give: re-hashing a hash would be a second derivation of
+    /// one identity, and a divergence between two derivations presents as "the
+    /// identities match" while the objects differ.
+    pub fn of(hash: &Hash32) -> Self {
+        Self(hash[..CHECKPOINT_ID_BYTES].iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b)))
+    }
+
+    /// **The raw 48 bits — for an encoder or a gauge, never for a comparison.**
+    ///
+    /// Any call site that feeds this into a comparison against `fid`, `sid`, or any
+    /// [`qlab_devnet::committee::Checkpoint::identity`] has defeated the entire
+    /// reason this type exists. The two live sites are
+    /// [`Telemetry::to_bytes`] and `qumbra_node`'s `qumbra_state_tip_id` gauge.
+    pub fn bits(self) -> u64 {
+        self.0
+    }
+
+    /// Rebuild from [`Self::bits`] — the decoder's counterpart, and nothing else.
+    pub fn from_bits(bits: u64) -> Self {
+        Self(bits)
+    }
+
+    /// The canonical 12-char lowercase hex, from the same helper as `fid=`/`sid=`:
+    /// one width and one scheme, so an operator reads the digits the same way. That
+    /// they are *readable* the same way is exactly why they must not be *compared*.
+    pub fn field(self) -> String {
+        checkpoint_id_hex(Some(self.0))
+    }
+}
 
 /// The `sid=` token when a node's own held keys are committed to *different*
 /// checkpoints at the same slot (issue #84). Distinguishable from an identity by
@@ -218,11 +345,19 @@ impl AppliedTip {
     }
 
     /// **The applied tip's identity**: the first [`CHECKPOINT_ID_BYTES`] of the
-    /// block hash, big-endian, as an integer — the same width and the same fold as
+    /// block hash, big-endian — the same width and the same fold as
     /// [`qlab_devnet::committee::Checkpoint::identity`]. See the type docs for why
     /// the prefix is taken directly.
-    pub fn identity(&self) -> u64 {
-        self.hash[..CHECKPOINT_ID_BYTES].iter().fold(0u64, |acc, b| (acc << 8) | u64::from(*b))
+    ///
+    /// *(Issue #212 changed the return type from a bare `u64` to
+    /// [`BlockIdentity`]. The value is byte-for-byte what it was — the change is
+    /// that it no longer type-checks against `fid`, which is a comparison of two
+    /// different spaces and was always meaningless. Adding a third block-hash
+    /// identity to this file while leaving this one a bare `u64` would have made the
+    /// type system claim the two are different spaces, which is worse than either
+    /// uniform choice.)*
+    pub fn identity(&self) -> BlockIdentity {
+        BlockIdentity::of(&self.hash)
     }
 
     /// The `stipid=` field: [`Self::identity`] as the canonical 12-char lowercase
@@ -232,7 +367,7 @@ impl AppliedTip {
     /// so there is no absent case to print `-` for, and inventing one would be a
     /// sentinel that never fires.
     pub fn id_field(&self) -> String {
-        checkpoint_id_hex(Some(self.identity()))
+        self.identity().field()
     }
 
     /// **The detector**, and the one place it is computed:
@@ -263,6 +398,192 @@ impl AppliedTip {
             None => CHECKPOINT_ID_ABSENT,
             Some(false) => APPLIED_TIP_ON_MAIN,
             Some(true) => APPLIED_TIP_OFF_MAIN,
+        }
+    }
+}
+
+// ---- issue #212: the durable finalized head (head #3) ----------------------
+
+/// **The durable finalized head**: the height head #3 holds, and the identity of
+/// the block it holds there (issue #212).
+///
+/// Head #3 is the state machine's chain store — what [`crate::Snapshot`]`.finalized`
+/// is written from, what the no-reorg-past-finality rule executes on, and the only
+/// finalized head that survives a restart. `final=`/`fid` are head #1, the committee
+/// tracker, which needs only a quorum of votes and is discarded at shutdown.
+///
+/// # The identity is a block hash, and that is the whole design decision
+///
+/// [`Self::identity`] is a [`BlockIdentity`] — `ChainStore::finalized_hash`'s prefix
+/// — because a block hash is what head #3 actually offers
+/// (`qlab-node/src/store.rs`'s `finalized_hash() -> Option<Hash32>`). It is
+/// therefore comparable **node-to-node at a shared [`Self::height`]** and never
+/// against `fid`. The alternative — having head #3 remember the
+/// [`qlab_devnet::committee::Checkpoint::identity`] it finalized under, which would
+/// be comparable to `fid` on a single node — is a [`crate::FORMAT_VERSION`] change
+/// (`Snapshot` grows a field), and the ruling between the two is the coordinator's.
+/// See the PR for both costings.
+///
+/// # What this pair detects that a height alone does not
+///
+/// The 2026-08-01 node1 case was a **height** divergence — `final=1056` over a
+/// durable 1048 — and [`Self::height`] alone is sufficient for it. The identity
+/// covers the *other* failure: two hosts both durably finalized at height `H` and
+/// holding **different blocks** there. That one survives a restart on both hosts,
+/// which is why it is a stop and not a finding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DurableHead {
+    /// The height head #3 has recorded as finalized.
+    pub height: u64,
+    /// The identity of the block head #3 holds at [`Self::height`] — a **block
+    /// hash** prefix, never a checkpoint identity.
+    pub identity: BlockIdentity,
+}
+
+impl DurableHead {
+    pub fn new(height: u64, block_hash: &Hash32) -> Self {
+        Self { height, identity: BlockIdentity::of(block_hash) }
+    }
+}
+
+/// **What a snapshot can say about head #3** (issue #212).
+///
+/// Three states, because two of them are routinely confused and they are not the
+/// same fact:
+///
+/// - [`Self::Unavailable`] — *this composition does not read head #3.* A
+///   [`crate::rpc::NodeRpc`] holds one node and no adapter; a test harness may inject
+///   nothing. Saying "no durable head" there would be a claim about the chain made
+///   from a fact about the plumbing.
+/// - [`Self::Nothing`] — *head #3 was read and it has finalized nothing.* On a node
+///   simultaneously reporting `final=2864` this is an alarm, not a blank.
+/// - [`Self::Head`] — head #3 was read and this is what it holds.
+///
+/// The `dfin=` log field renders the first two identically as `-`, on purpose:
+/// `dfin=`'s vocabulary is unchanged from `PR #207`, and the composition that emits
+/// that line (`qumbra_node::run`) always injects, so it can never be
+/// `Unavailable`. The distinction is for `qumbra-opview`, which polls compositions
+/// it did not build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableView {
+    /// This composition does not read head #3 and declines to answer.
+    Unavailable,
+    /// Head #3 was read; it has finalized nothing.
+    Nothing,
+    /// Head #3 was read; this is its head.
+    Head(DurableHead),
+}
+
+impl DurableView {
+    /// The head, if one was both readable and present.
+    pub fn head(self) -> Option<DurableHead> {
+        match self {
+            DurableView::Head(h) => Some(h),
+            _ => None,
+        }
+    }
+
+    /// Whether this composition read head #3 at all.
+    pub fn is_available(self) -> bool {
+        !matches!(self, DurableView::Unavailable)
+    }
+
+    /// The `dfin=` field: head #3's height, or `-`.
+    ///
+    /// **Always printed, `-` included** (the #130 (a) rule). `-` covers both
+    /// unreadable and nothing-finalized; see the type docs for why that is right on
+    /// this surface and wrong on `qumbra-opview`'s.
+    pub fn height_field(self) -> String {
+        match self {
+            DurableView::Head(h) => h.height.to_string(),
+            _ => CHECKPOINT_ID_ABSENT.to_string(),
+        }
+    }
+
+    /// The `dfinbh=` field: the identity of the **block** head #3 holds, or `-`.
+    ///
+    /// 🔴 Named `dfinbh` — durable-finalized **b**lock **h**ash — and deliberately
+    /// not `dfid`. Every identity field on this surface so far ends in `id`
+    /// (`fid`, `sid`, `stipid`) and two of those three spaces are already
+    /// incomparable, so a fourth `…id` would invite the one comparison that cannot
+    /// mean anything. The name says what the value is.
+    pub fn id_field(self) -> String {
+        match self {
+            DurableView::Head(h) => h.identity.field(),
+            _ => CHECKPOINT_ID_ABSENT.to_string(),
+        }
+    }
+}
+
+/// **The one comparison of head #1 against head #3 on a single node** (issue #212),
+/// and the one place it is computed.
+///
+/// This is a *different alarm* from a cross-host split and the two must never be
+/// merged: this one says **"this node will come back different"** and a cross-host
+/// durable split says **"these nodes finalized different things"**. `#84` established
+/// the same separation for `fid` vs `sid` and `agree.rs` honours it; the durable head
+/// is a third such thing and gets its own name and its own alarm.
+///
+/// It is a type for the reason [`StateLag`] is a type: three surfaces need the same
+/// verdict (the node's own line by eye, `qumbra-opview`'s per-node reading, and its
+/// exit status), and this repo has ruled repeatedly that a second copy of a
+/// derivation is the defect and not the convenience (#116, #102, #125).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurableAgreement {
+    /// This snapshot cannot see head #3. Not agreement and not disagreement.
+    Unavailable,
+    /// The two heads name one height (or both hold nothing).
+    Agreed,
+    /// 🟡 Head #1 is **ahead** of head #3 — the 2026-08-01 node1 shape exactly.
+    ///
+    /// A single sample cannot establish that this is sustained, and the routine
+    /// cause is benign: `sync_state_finality` re-attempts on every drain, so the
+    /// window between a checkpoint finalizing and its body being applied reads
+    /// exactly like this. **Sustained is the alarm**; one sample is a reading. That
+    /// is the same discipline the coordinator applied to `cpq=1` on 2026-08-02
+    /// (*"watch, do not assume"*), and the pair to read it against is `slag=` and
+    /// `fdrop=`.
+    TrackerAhead { tracker: u64, durable: u64 },
+    /// 🟡 Head #3 is ahead of head #1, or holds a head while head #1 reports
+    /// nothing finalized.
+    ///
+    /// **Not reachable by construction today**: head #1 is re-derived at `open` from
+    /// head #3 and only advances afterwards. It is a distinguished variant rather
+    /// than folded into [`Self::TrackerAhead`] because if it is ever observed, the
+    /// finding is about this code and not about the net — and a verdict that could
+    /// not say which would send an operator hunting the wrong layer.
+    DurableAhead { tracker: Option<u64>, durable: u64 },
+    /// 🟡 Head #1 reports a finalized height and head #3 holds **nothing at all**.
+    ///
+    /// Distinct from [`Self::TrackerAhead`] because "1048 vs 1056" and "2864 vs
+    /// nothing" are different magnitudes of the same failure, and the second one
+    /// means a restart returns to genesis.
+    NothingDurable { tracker: u64 },
+}
+
+impl DurableAgreement {
+    /// Whether the two heads disagree. `false` for [`Self::Unavailable`], because
+    /// **an alarm must not fire on the absence of evidence** — the same rule
+    /// [`AppliedTip::is_off_main_chain`] follows.
+    pub fn is_divergent(self) -> bool {
+        !matches!(self, DurableAgreement::Agreed | DurableAgreement::Unavailable)
+    }
+
+    /// **A stable token alerting may depend on**, or `None` when the two heads agree
+    /// or could not be compared.
+    ///
+    /// This is the mechanism that makes a 🟡 severity acceptable rather than a
+    /// silence: issue #136 ruled the same way for `UNAVAILABLE` — a condition every
+    /// briefly-lagging node reports must not be a non-zero exit code, or operators
+    /// learn to ignore the one code that means STOP, so it is reported **in the
+    /// output** as a greppable word instead.
+    pub fn token(self) -> Option<&'static str> {
+        match self {
+            DurableAgreement::Agreed => None,
+            DurableAgreement::Unavailable => None,
+            DurableAgreement::TrackerAhead { .. } => Some("DURABLE_LAG"),
+            DurableAgreement::DurableAhead { .. } => Some("DURABLE_AHEAD"),
+            DurableAgreement::NothingDurable { .. } => Some("DURABLE_ABSENT"),
         }
     }
 }
@@ -361,6 +682,19 @@ pub struct Telemetry {
     /// column that could only ever say `-`; see the PR for why this is a fourth
     /// field beside the three the decision named.
     pub tip_difficulty: Option<u64>,
+    /// **Head #3 — the durable finalized head** (`dfin`/`dfinbh`, issue #212,
+    /// wire `0x04`).
+    ///
+    /// [`Self::finalized_height`] and [`Self::finalized_id`] are head #1, the
+    /// committee tracker, and do not survive a restart. This is the head that does.
+    /// Injected exactly like the checkpoint identity — via
+    /// [`Self::with_durable_head`] — because it lives in the adapter's state
+    /// machine, which [`crate::Node`] alone cannot see.
+    ///
+    /// Its own field, its own name and its own alarm, never a slot inside
+    /// `finalized_id`: `#84` established that `fid` and `sid` stay apart because a
+    /// split in each is a different severity, and this is a third such thing.
+    pub durable: DurableView,
 }
 
 impl Telemetry {
@@ -427,6 +761,10 @@ impl Telemetry {
             finalized_id: None,
             signed: None,
             tip_difficulty: None,
+            // Issue #212: `Unavailable` and NOT `Nothing`. This constructor cannot
+            // see head #3, and "no durable head" would be a claim about the chain
+            // made from a fact about the plumbing.
+            durable: DurableView::Unavailable,
         }
     }
 
@@ -508,6 +846,54 @@ impl Telemetry {
         self
     }
 
+    /// Stamp in **head #3, the durable finalized head** (issue #212), from
+    /// `qlab_p2p::NodeAdapter::durable_finalized_head`'s `(height, block_hash)`
+    /// pair.
+    ///
+    /// 🔴 **Calling this at all is the availability signal.** A composition that
+    /// calls it with `None` is saying *"I read head #3 and it holds nothing"*
+    /// ([`DurableView::Nothing`]); a composition that never calls it reports
+    /// [`DurableView::Unavailable`]. Those are different facts and this is the seam
+    /// that keeps them apart — a node reporting `final=2864` beside a durable head of
+    /// *nothing* is an alarm, and a node whose reader simply cannot see head #3 is
+    /// not.
+    pub fn with_durable_head(mut self, head: Option<(u64, Hash32)>) -> Self {
+        self.durable = match head {
+            Some((height, hash)) => DurableView::Head(DurableHead::new(height, &hash)),
+            None => DurableView::Nothing,
+        };
+        self
+    }
+
+    /// **The one comparison of head #1 against head #3** — see [`DurableAgreement`]
+    /// for the severities and for why this is not the cross-host verdict.
+    ///
+    /// Every consumer reads its verdict from here: the node's own surface, the
+    /// `qumbra-opview` per-node row, and that tool's exit status. None of them can
+    /// be checking a different condition than the others, which is the rule
+    /// [`AppliedTip::off_main_chain`] and [`Self::supply_coverage`] already follow.
+    pub fn durable_agreement(&self) -> DurableAgreement {
+        match (self.finalized_height, self.durable) {
+            (_, DurableView::Unavailable) => DurableAgreement::Unavailable,
+            // Nothing finalized on either head: consistent, and the state every
+            // fresh net boots into.
+            (None, DurableView::Nothing) => DurableAgreement::Agreed,
+            (None, DurableView::Head(d)) => {
+                DurableAgreement::DurableAhead { tracker: None, durable: d.height }
+            }
+            (Some(t), DurableView::Nothing) => DurableAgreement::NothingDurable { tracker: t },
+            (Some(t), DurableView::Head(d)) => match t.cmp(&d.height) {
+                std::cmp::Ordering::Equal => DurableAgreement::Agreed,
+                std::cmp::Ordering::Greater => {
+                    DurableAgreement::TrackerAhead { tracker: t, durable: d.height }
+                }
+                std::cmp::Ordering::Less => {
+                    DurableAgreement::DurableAhead { tracker: Some(t), durable: d.height }
+                }
+            },
+        }
+    }
+
     /// The `diff=` field: the tip block's difficulty, or `-` when unavailable.
     pub fn diff_field(&self) -> String {
         self.tip_difficulty.map(|d| d.to_string()).unwrap_or_else(|| "-".to_string())
@@ -553,7 +939,7 @@ impl Telemetry {
         }
     }
 
-    /// `version(0x03) ‖ finality(u8) ‖ tip(8 LE) ‖ has_final(u8) ‖
+    /// `version(0x04) ‖ finality(u8) ‖ tip(8 LE) ‖ has_final(u8) ‖
     /// [final_height(8 LE) if has] ‖ stall_depth(8) ‖ age_secs(8) ‖
     /// peer_count(8) ‖ mempool_size(8) ‖ epoch(8) ‖`
     /// `has_fid(u8) ‖ [finalized_id(8 LE) if has] ‖ has_signed(u8) ‖`
@@ -561,11 +947,22 @@ impl Telemetry {
     /// `has_diff(u8) ‖ [tip_difficulty(8 LE) if has] ‖`
     /// `committee_size(8 LE) ‖ committee_active(8 LE) ‖ committee_quorum(8 LE) ‖`
     /// `n_supply(varint) ‖ n × (epoch ‖ start_height ‖ end_height ‖`
-    /// `measured_coinbase ‖ expected_coinbase ‖ fees)` (all entry fields u64 LE).
+    /// `measured_coinbase ‖ expected_coinbase ‖ fees)` (all entry fields u64 LE) ‖`
+    /// `durable_state(u8) ‖ [durable_height(8 LE) ‖ durable_id(8 LE) if state==2]`
     ///
     /// The `0x02` tail (issue #117) nests `sid` **inside** `sslot`'s presence, so
     /// "an identity with no slot" is not representable on the wire: a signed
     /// identity without the slot it was signed at is not a fact anyone can act on.
+    ///
+    /// The `0x04` tail (issue #212) is one **three-valued** discriminant and not a
+    /// presence byte, for the same reason: `unavailable` (0), `nothing` (1) and a
+    /// head (2) are three different facts, and a two-state presence byte would have
+    /// forced two of them to share an encoding. An unknown discriminant is
+    /// **rejected** exactly like an unknown finality status (§0), because a fourth
+    /// state this build has never heard of must not be coerced into one of the
+    /// three it has. The identity is a **block-hash** prefix
+    /// ([`BlockIdentity`]) and is encoded in its own 8 LE bytes beside the height,
+    /// never merged into `finalized_id`'s slot.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.push(RPC_VERSION);
@@ -633,12 +1030,60 @@ impl Telemetry {
             out.extend_from_slice(&row.expected_coinbase.to_le_bytes());
             out.extend_from_slice(&row.fees.to_le_bytes());
         }
+        // ---- issue #212: head #3, the durable finalized head -----------------
+        match self.durable {
+            DurableView::Unavailable => out.push(DURABLE_UNAVAILABLE),
+            DurableView::Nothing => out.push(DURABLE_NOTHING),
+            DurableView::Head(h) => {
+                out.push(DURABLE_HEAD);
+                out.extend_from_slice(&h.height.to_le_bytes());
+                // `bits()` is the escape hatch, and this is one of its two live
+                // sites. It is a BLOCK-HASH prefix; it is not comparable to
+                // `finalized_id` above and the type is what says so.
+                out.extend_from_slice(&h.identity.bits().to_le_bytes());
+            }
+        }
         out
     }
 
+    /// Decode a payload stamped with the **current** [`RPC_VERSION`], and nothing
+    /// else.
+    ///
+    /// This is the strict path and it stays strict: an equality check on the version
+    /// byte, exactly as §0 requires, so a stale reader against a new node or a new
+    /// reader against a stale node fails loudly rather than returning a snapshot
+    /// whose tail is silently absent. [`Telemetry::from_bytes_compat`] is the one
+    /// caller-opt-in exception and it exists for a named, bounded reason.
     pub fn from_bytes(b: &[u8]) -> Result<Telemetry, CodecError> {
         let mut r = Reader::new(b);
         r.version()?;
+        Self::decode_body(&mut r, RPC_VERSION)
+    }
+
+    /// **Decode a payload stamped with any version in [`READABLE_TELEMETRY_VERSIONS`],
+    /// and say which one it was** (issue #212).
+    ///
+    /// The version comes back because the caller needs it to render an *honest*
+    /// absence. A `0x03` node carries no durable tail at all, so its snapshot decodes
+    /// with [`DurableView::Unavailable`] — the same value a `0x04` node whose
+    /// composition does not inject head #3 would report. Those are different facts
+    /// (*"this host has not been rolled yet"* vs *"this reader cannot see head #3"*),
+    /// the version byte is the only thing that separates them, and during a rolling
+    /// upgrade the first one is the state of most of the net.
+    ///
+    /// Every other failure mode is unchanged: an unknown version, a truncated body
+    /// and a trailing byte are all still errors.
+    pub fn from_bytes_compat(b: &[u8]) -> Result<(u8, Telemetry), CodecError> {
+        let mut r = Reader::new(b);
+        let version = r.version_in(READABLE_TELEMETRY_VERSIONS)?;
+        Ok((version, Self::decode_body(&mut r, version)?))
+    }
+
+    /// The body decoder, shared by both entry points so there is exactly one
+    /// definition of the layout. `version` selects which tails are present — it is
+    /// never inferred from the remaining length, because "parse what is there" is how
+    /// a truncated body becomes a healthy-looking snapshot.
+    fn decode_body(r: &mut Reader, version: u8) -> Result<Telemetry, CodecError> {
         let finality_status = match r.u8()? {
             STATUS_FINAL => FinalityStatus::Final,
             STATUS_DEGRADED => FinalityStatus::Degraded,
@@ -683,6 +1128,29 @@ impl Telemetry {
                 fees: r.u64()?,
             });
         }
+        // ---- issue #212: head #3 -----------------------------------------------
+        // Absent below 0x04, and that absence is carried by the VERSION the caller
+        // was handed, not by this value: `Unavailable` here means "this snapshot
+        // does not state a durable head", which is true of a 0x03 payload and of a
+        // 0x04 composition that does not inject one.
+        let durable = if version >= DURABLE_HEAD_SINCE_VERSION {
+            match r.u8()? {
+                DURABLE_UNAVAILABLE => DurableView::Unavailable,
+                DURABLE_NOTHING => DurableView::Nothing,
+                DURABLE_HEAD => {
+                    let height = r.u64()?;
+                    DurableView::Head(DurableHead {
+                        height,
+                        identity: BlockIdentity::from_bits(r.u64()?),
+                    })
+                }
+                // Reject rather than coerce (§0 reject-unknown, applied to this
+                // discriminant as it already is to the finality status byte).
+                got => return Err(CodecError::BadVersion { got }),
+            }
+        } else {
+            DurableView::Unavailable
+        };
         r.finish()?;
         Ok(Telemetry {
             finality_status,
@@ -700,6 +1168,7 @@ impl Telemetry {
             finalized_id,
             signed,
             tip_difficulty,
+            durable,
         })
     }
 }
@@ -846,11 +1315,11 @@ mod tests {
         out
     }
 
-    /// `Telemetry` keeps the #117 identity states intact at `0x03`: absent,
+    /// `Telemetry` keeps the #117 identity states intact at `0x04`: absent,
     /// present, and the `split` case where a node's own keys are committed to two
     /// variants at one slot.
     #[test]
-    fn telemetry_roundtrips_checkpoint_identity_at_0x03() {
+    fn telemetry_roundtrips_checkpoint_identity_at_0x04() {
         let base = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 2, MAX_LAG);
 
         // Nothing injected: the composition cannot see the identity. Fields render
@@ -862,7 +1331,7 @@ mod tests {
         assert_eq!(base.sid_field(), "-");
         assert_eq!(Telemetry::from_bytes(&base.to_bytes()).unwrap(), base);
         assert_eq!(base.to_bytes()[0], RPC_VERSION);
-        assert_eq!(RPC_VERSION, 0x03, "the ratified issue #121 bump");
+        assert_eq!(RPC_VERSION, 0x04, "the ratified issue #212 bump");
 
         // Fully populated: finalized identity + this node's own signed variant.
         let full = base
@@ -897,10 +1366,11 @@ mod tests {
         );
     }
 
-    /// **Acceptance (#121): committee aggregates round-trip at `0x03`, while the
-    /// immediately preceding `0x02` wire is rejected on its version byte.**
+    /// **Acceptance (#121, re-pinned at `0x04` by #212): committee aggregates
+    /// round-trip at the current version, while an older wire is rejected on its
+    /// version byte by the STRICT decoder.**
     #[test]
-    fn committee_aggregates_roundtrip_at_0x03_and_0x02_is_rejected() {
+    fn committee_aggregates_roundtrip_at_0x04_and_older_is_rejected() {
         let t = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 3, MAX_LAG)
             .with_committee(21, 19, 15)
             .with_supply(vec![SupplyEpoch {
@@ -912,7 +1382,7 @@ mod tests {
                 fees: 890,
             }]);
         let bytes = t.to_bytes();
-        assert_eq!(bytes[0], 0x03);
+        assert_eq!(bytes[0], 0x04);
         assert_eq!(Telemetry::from_bytes(&bytes).unwrap(), t);
         assert_eq!(
             (t.epoch, t.committee_size, t.committee_active, t.committee_quorum),
@@ -922,12 +1392,20 @@ mod tests {
         assert_eq!(t.supply[0].divergence_bessel(), 0);
         assert_eq!(t.supply_coverage(), SupplyCoverage::Complete);
 
-        let mut old = bytes;
-        old[0] = 0x02;
-        assert!(matches!(
-            Telemetry::from_bytes(&old),
-            Err(CodecError::BadVersion { got: 2 })
-        ));
+        // The strict decoder refuses EVERY older version, including the `0x03` the
+        // compat decoder now knowingly reads. Those are different paths on purpose
+        // and this is the line that keeps them from converging (issue #212).
+        for old_version in [0x01u8, 0x02, 0x03] {
+            let mut old = bytes.clone();
+            old[0] = old_version;
+            assert!(
+                matches!(
+                    Telemetry::from_bytes(&old),
+                    Err(CodecError::BadVersion { got }) if got == old_version
+                ),
+                "the strict decoder must reject 0x{old_version:02x}"
+            );
+        }
     }
 
     #[test]
@@ -951,7 +1429,7 @@ mod tests {
 
         let decoded = Telemetry::from_bytes(&partial.to_bytes()).unwrap();
         assert_eq!(decoded.supply_coverage(), partial.supply_coverage());
-        assert_eq!(decoded.to_bytes()[0], 0x03, "coverage uses fields already on v3");
+        assert_eq!(decoded.to_bytes()[0], 0x04, "coverage uses fields already on the wire");
     }
 
     /// **Acceptance (#130 (a)): `SupplyCoverage` and the state-lag figures are one
@@ -1038,7 +1516,7 @@ mod tests {
     fn the_applied_tip_identity_is_the_block_hashs_prefix_at_fids_width() {
         let hash = h(0x01);
         let tip = AppliedTip::new(1, hash, Some(hash));
-        assert_eq!(tip.identity(), 0x01ee_eeee_eeee, "the first 6 bytes, big-endian");
+        assert_eq!(tip.identity().bits(), 0x01ee_eeee_eeee, "the first 6 bytes, big-endian");
         assert_eq!(tip.id_field(), "01eeeeeeeeee");
         assert_eq!(tip.id_field().len(), checkpoint_id_hex(Some(0)).len(), "fid's width");
         // Two blocks differing only outside the prefix are NOT separated — a 48-bit
@@ -1140,7 +1618,358 @@ mod tests {
         stamped[0] = RPC_VERSION;
         assert!(
             matches!(Telemetry::from_bytes(&stamped), Err(CodecError::Truncated { .. })),
-            "the versioned tails are mandatory at 0x03"
+            "the versioned tails are mandatory at 0x04"
+        );
+        // …and the compat decoder does not weaken that. `0x01` is not in the readable
+        // set, so it is refused by both paths (issue #212).
+        assert!(
+            matches!(Telemetry::from_bytes_compat(&old), Err(CodecError::BadVersion { got: 1 })),
+            "the compat path is a NAMED SET, not a `>=` comparison"
+        );
+    }
+
+    // ---- issue #212: head #3, the durable finalized head ---------------------
+
+    /// The `0x03` payload of `t`, hand-rolled: the current encoding minus the
+    /// durable-head tail, stamped `0x03`.
+    ///
+    /// Built by *construction* rather than by truncating `to_bytes()` at a computed
+    /// offset, so the fixture cannot drift into agreement with the encoder it is
+    /// testing — the same reason [`v1_payload`] is a literal.
+    fn v3_payload(t: &Telemetry) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(0x03);
+        out.push(match t.finality_status {
+            FinalityStatus::Final => STATUS_FINAL,
+            FinalityStatus::Degraded => STATUS_DEGRADED,
+            FinalityStatus::Halting => STATUS_HALTING,
+            FinalityStatus::Halted => STATUS_HALTED,
+        });
+        out.extend_from_slice(&t.tip_height.to_le_bytes());
+        match t.finalized_height {
+            Some(h) => {
+                out.push(1);
+                out.extend_from_slice(&h.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&t.stall_depth.to_le_bytes());
+        out.extend_from_slice(&t.last_finalized_age_secs.to_le_bytes());
+        out.extend_from_slice(&t.peer_count.to_le_bytes());
+        out.extend_from_slice(&t.mempool_size.to_le_bytes());
+        out.extend_from_slice(&t.epoch.to_le_bytes());
+        match t.finalized_id {
+            Some(id) => {
+                out.push(1);
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+        match t.signed {
+            Some(c) => {
+                out.push(1);
+                out.extend_from_slice(&c.slot.to_le_bytes());
+                match c.id {
+                    Some(id) => {
+                        out.push(1);
+                        out.extend_from_slice(&id.to_le_bytes());
+                    }
+                    None => out.push(0),
+                }
+            }
+            None => out.push(0),
+        }
+        match t.tip_difficulty {
+            Some(d) => {
+                out.push(1);
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+        out.extend_from_slice(&t.committee_size.to_le_bytes());
+        out.extend_from_slice(&t.committee_active.to_le_bytes());
+        out.extend_from_slice(&t.committee_quorum.to_le_bytes());
+        write_varint(&mut out, t.supply.len() as u64);
+        for row in &t.supply {
+            out.extend_from_slice(&row.epoch.to_le_bytes());
+            out.extend_from_slice(&row.start_height.to_le_bytes());
+            out.extend_from_slice(&row.end_height.to_le_bytes());
+            out.extend_from_slice(&row.measured_coinbase.to_le_bytes());
+            out.extend_from_slice(&row.expected_coinbase.to_le_bytes());
+            out.extend_from_slice(&row.fees.to_le_bytes());
+        }
+        out
+    }
+
+    fn with_durable(t: Telemetry, head: Option<(u64, u8)>) -> Telemetry {
+        t.with_durable_head(head.map(|(height, first)| (height, h(first))))
+    }
+
+    /// **Acceptance (#212 A): the three durable states are three distinct encodings,
+    /// and each round-trips.**
+    ///
+    /// `unavailable` (this reader cannot see head #3) and `nothing` (head #3 holds
+    /// nothing) must not encode alike — one is a fact about the plumbing and the
+    /// other, beside a real `final=`, is an alarm. This is `#117`'s
+    /// `no keys` vs `my keys disagree` assertion applied to head #3.
+    #[test]
+    fn the_three_durable_states_are_distinct_on_the_wire_and_round_trip() {
+        let base = Telemetry::assemble(2871, Some(2864), 75, 0, 3, 2, MAX_LAG);
+
+        // Not injected at all: this composition does not read head #3.
+        assert_eq!(base.durable, DurableView::Unavailable);
+        assert_eq!(base.durable.height_field(), "-");
+        assert_eq!(base.durable.id_field(), "-");
+        assert!(!base.durable.is_available());
+        assert_eq!(Telemetry::from_bytes(&base.to_bytes()).unwrap(), base);
+
+        // Injected, and head #3 holds nothing.
+        let nothing = with_durable(base.clone(), None);
+        assert_eq!(nothing.durable, DurableView::Nothing);
+        assert!(nothing.durable.is_available());
+        assert_eq!(nothing.durable.height_field(), "-", "`dfin=`'s vocabulary, unchanged");
+        assert_eq!(nothing.durable.id_field(), "-");
+        assert_eq!(Telemetry::from_bytes(&nothing.to_bytes()).unwrap(), nothing);
+
+        // Injected, and head #3 holds a block.
+        let head = with_durable(base.clone(), Some((2864, 0xa1)));
+        assert_eq!(head.durable.height_field(), "2864");
+        assert_eq!(head.durable.id_field(), "a1eeeeeeeeee");
+        assert_eq!(head.durable.head().unwrap().height, 2864);
+        assert_eq!(Telemetry::from_bytes(&head.to_bytes()).unwrap(), head);
+
+        // All three are different bytes. `unavailable` vs `nothing` is the pair that
+        // matters and it is asserted explicitly.
+        assert_ne!(
+            base.to_bytes(),
+            nothing.to_bytes(),
+            "`I cannot see head #3` and `head #3 holds nothing` must not encode alike"
+        );
+        assert_ne!(nothing.to_bytes(), head.to_bytes());
+
+        // A fourth discriminant this build has never heard of is REJECTED, not
+        // coerced into one of the three (§0, as for the finality status byte).
+        let mut bad = head.to_bytes();
+        let tail = bad.len() - 17;
+        bad[tail] = 9;
+        bad.truncate(tail + 1);
+        assert!(matches!(
+            Telemetry::from_bytes(&bad),
+            Err(CodecError::BadVersion { got: 9 })
+        ));
+    }
+
+    /// **Acceptance (#212 B): a block identity is not a checkpoint identity, and it
+    /// is the same block-hash prefix `stipid=` publishes.**
+    ///
+    /// The 🔴 trap in one test. The two values render at one width through one
+    /// helper — which is why they must not be compared — and
+    /// `BlockIdentity`'s missing `PartialEq<u64>` is what makes the comparison a
+    /// compile error rather than a plausible line of code. That half cannot be
+    /// asserted at runtime, so what is asserted here is the *other* half: the value
+    /// really is the block hash's own prefix and really is NOT what
+    /// `Checkpoint::identity` would produce for the same block.
+    #[test]
+    fn the_durable_identity_is_a_block_hash_prefix_and_not_a_checkpoint_identity() {
+        let hash = h(0xa1);
+        let height = 2864u64;
+        let durable = DurableHead::new(height, &hash);
+
+        // It is the block hash's own first 6 bytes, taken directly.
+        let expected: String = hash[..CHECKPOINT_ID_BYTES]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(durable.identity.field(), expected);
+        // …i.e. exactly what `stipid=` publishes for the same block, one scheme.
+        assert_eq!(durable.identity, AppliedTip::new(height, hash, Some(hash)).identity());
+
+        // And NOT the checkpoint identity of the checkpoint that finalized it. The
+        // committee signs `height ‖ block_hash ‖ root`; a block hash is the name of a
+        // block. Same width, different space — comparing them is meaningless, and
+        // this is the line that says so with numbers.
+        let cp = qlab_devnet::committee::Checkpoint::new(height, hash, hash);
+        assert_ne!(
+            durable.identity.bits(),
+            cp.identity(),
+            "if these were ever equal the trap would be invisible"
+        );
+        assert_eq!(
+            durable.identity.field().len(),
+            cp.id_hex().len(),
+            "they are the same WIDTH, which is exactly why the type has to keep them apart"
+        );
+    }
+
+    /// **Acceptance (#212 C): the single-node comparison of head #1 against head #3,
+    /// including the 2026-08-01 node1 reading exactly.**
+    #[test]
+    fn the_tracker_and_the_durable_head_are_compared_in_one_place() {
+        let t = |fin: Option<u64>, durable: Option<Option<(u64, u8)>>| {
+            let base = Telemetry::assemble(1100, fin, 75, 0, 3, 0, MAX_LAG);
+            match durable {
+                None => base,
+                Some(d) => with_durable(base, d),
+            }
+        };
+
+        // 🔴 The reading this issue exists for: node1, 2026-08-01. `final=1056`
+        // over a durable head of 1048, for hours, and opview reported four-way
+        // agreement the whole time.
+        let node1 = t(Some(1056), Some(Some((1048, 0xfa))));
+        assert_eq!(
+            node1.durable_agreement(),
+            DurableAgreement::TrackerAhead { tracker: 1056, durable: 1048 }
+        );
+        assert!(node1.durable_agreement().is_divergent());
+        assert_eq!(node1.durable_agreement().token(), Some("DURABLE_LAG"));
+
+        // The healthy T0 reading (all four hosts, 2026-08-03 07:11:27Z):
+        // `final=2864 dfin=2864`.
+        let healthy = t(Some(2864), Some(Some((2864, 0x63))));
+        assert_eq!(healthy.durable_agreement(), DurableAgreement::Agreed);
+        assert!(!healthy.durable_agreement().is_divergent());
+        assert_eq!(healthy.durable_agreement().token(), None);
+
+        // Head #3 holds NOTHING while head #1 reports a height: a restart returns to
+        // genesis. Its own variant, because "2864 vs nothing" and "1056 vs 1048" are
+        // different magnitudes of the same failure.
+        let absent = t(Some(2864), Some(None));
+        assert_eq!(
+            absent.durable_agreement(),
+            DurableAgreement::NothingDurable { tracker: 2864 }
+        );
+        assert_eq!(absent.durable_agreement().token(), Some("DURABLE_ABSENT"));
+
+        // Nothing finalized on either head: consistent, and the state every fresh
+        // net boots into. Not an alarm.
+        let cold = t(None, Some(None));
+        assert_eq!(cold.durable_agreement(), DurableAgreement::Agreed);
+        assert_eq!(cold.durable_agreement().token(), None);
+
+        // Head #3 ahead. Unreachable by construction today (head #1 is re-derived
+        // from head #3 at `open`), and distinguished so that observing it points at
+        // this code rather than at the net.
+        let ahead = t(Some(1048), Some(Some((1056, 0x11))));
+        assert_eq!(
+            ahead.durable_agreement(),
+            DurableAgreement::DurableAhead { tracker: Some(1048), durable: 1056 }
+        );
+        assert_eq!(ahead.durable_agreement().token(), Some("DURABLE_AHEAD"));
+        let blind_tracker = t(None, Some(Some((1056, 0x11))));
+        assert_eq!(
+            blind_tracker.durable_agreement(),
+            DurableAgreement::DurableAhead { tracker: None, durable: 1056 }
+        );
+
+        // 🔴 And the refusal: a composition that cannot see head #3 is NOT agreement
+        // and NOT disagreement. An alarm must not fire on the absence of evidence,
+        // and an unmade comparison must not print as healthy.
+        let unavailable = t(Some(1056), None);
+        assert_eq!(unavailable.durable_agreement(), DurableAgreement::Unavailable);
+        assert!(!unavailable.durable_agreement().is_divergent());
+        assert_eq!(unavailable.durable_agreement().token(), None);
+    }
+
+    /// **Acceptance (#212 D — the roll): a reader at `0x04` can still read a `0x03`
+    /// node, and is told that is what it read.**
+    ///
+    /// This is the whole answer to the roll problem. T0 rolls one host at a time and
+    /// the last roll took 23 minutes; without this, an `opview` built at `0x04` would
+    /// read *nothing* from the un-rolled hosts for that whole window, and its verdict
+    /// is cross-host agreement — which an instrument seeing two of four hosts cannot
+    /// answer. The version comes back so an absent durable head can be attributed to
+    /// the wire rather than reported as a fact about the chain.
+    #[test]
+    fn a_reader_at_0x04_still_reads_a_0x03_node_and_knows_that_it_did() {
+        let live = with_durable(
+            Telemetry::assemble(2871, Some(2864), 75, 0, 3, 2, MAX_LAG)
+                .with_committee(21, 21, 15)
+                .with_checkpoint(Some(0x63e4_2f7e_13a7), None),
+            Some((2864, 0x63)),
+        );
+
+        // The rolled host: full fidelity, and the version says so.
+        let (v, rolled) = Telemetry::from_bytes_compat(&live.to_bytes()).unwrap();
+        assert_eq!(v, 0x04);
+        assert_eq!(rolled, live);
+        assert!(rolled.durable.is_available());
+
+        // The un-rolled host: everything `0x03` carried is still read, and the
+        // durable head is absent — attributably so.
+        let old = v3_payload(&live);
+        let (v_old, unrolled) = Telemetry::from_bytes_compat(&old).unwrap();
+        assert_eq!(v_old, 0x03);
+        assert!(v_old < DURABLE_HEAD_SINCE_VERSION, "this wire predates the field");
+        assert_eq!(unrolled.finalized_height, Some(2864), "the pre-existing fields still read");
+        assert_eq!(unrolled.fid_field(), "63e42f7e13a7");
+        assert_eq!(unrolled.committee_size, 21);
+        assert_eq!(unrolled.durable, DurableView::Unavailable);
+        assert_eq!(unrolled.durable_agreement(), DurableAgreement::Unavailable);
+
+        // 🔴 The strict decoder is UNCHANGED: `0x03` is refused there. The compat
+        // window is a caller's explicit opt-in, not a property of the wire.
+        assert!(matches!(
+            Telemetry::from_bytes(&old),
+            Err(CodecError::BadVersion { got: 3 })
+        ));
+
+        // The readable set is bounded and named, and it is not a `>=` comparison:
+        // `0x02` and an unknown future `0x05` are both refused by BOTH paths.
+        assert_eq!(READABLE_TELEMETRY_VERSIONS, &[0x03, 0x04]);
+        for refused in [0x00u8, 0x01, 0x02, 0x05, 0xff] {
+            let mut bytes = live.to_bytes();
+            bytes[0] = refused;
+            assert!(
+                matches!(
+                    Telemetry::from_bytes_compat(&bytes),
+                    Err(CodecError::BadVersion { got }) if got == refused
+                ),
+                "0x{refused:02x} must not be readable"
+            );
+        }
+
+        // Truncation and trailing bytes are still errors on the compat path — the
+        // relaxation is the version byte and nothing else.
+        assert!(Telemetry::from_bytes_compat(&old[..old.len() - 1]).is_err());
+        let mut extra = old.clone();
+        extra.push(0);
+        assert!(matches!(
+            Telemetry::from_bytes_compat(&extra),
+            Err(CodecError::TrailingBytes { .. })
+        ));
+    }
+
+    /// **The `0x03` payload really is the prefix of the `0x04` one** — the durable
+    /// tail is appended and nothing before it moved.
+    ///
+    /// This is the field-discipline check for this bump, in bytes: `PRE_I84_FIELDS`
+    /// protects the log line, and this protects the wire. If a future edit inserts a
+    /// field anywhere but the end, this fails before any consumer notices.
+    #[test]
+    fn the_0x04_wire_appends_and_does_not_reshuffle() {
+        let t = with_durable(
+            Telemetry::assemble(2871, Some(2864), 75, 4, 3, 2, MAX_LAG)
+                .with_committee(21, 21, 15)
+                .with_checkpoint(Some(0x63e4_2f7e_13a7), Some(LocalCommitment { slot: 2864, id: Some(0x63e4_2f7e_13a7) }))
+                .with_tip_difficulty(Some(1_048_576))
+                .with_supply(vec![SupplyEpoch {
+                    epoch: 2,
+                    start_height: 2304,
+                    end_height: 2871,
+                    measured_coinbase: 1_234_567,
+                    expected_coinbase: 1_234_567,
+                    fees: 89,
+                }]),
+            Some((2864, 0x63)),
+        );
+        let new = t.to_bytes();
+        let old = v3_payload(&t);
+        assert_eq!(&new[1..old.len()], &old[1..], "0x04 appends, it does not reshuffle");
+        assert_eq!(
+            new.len(),
+            old.len() + 1 + 8 + 8,
+            "the tail is exactly the discriminant, the height and the identity"
         );
     }
 }

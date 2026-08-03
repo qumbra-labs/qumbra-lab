@@ -875,6 +875,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         .with_supply(supply)
         .with_checkpoint(self.finalized_checkpoint_id(), self.local_commitment())
         .with_tip_difficulty(chain.header(&chain.tip_hash()).map(|h| h.difficulty))
+        // Issue #212: head #3, the head that survives a restart. `with_checkpoint`
+        // above stamped head #1, which does not. This composition DOES read head #3,
+        // so calling the builder is the availability signal even when the answer is
+        // `None` — see `Telemetry::with_durable_head`.
+        .with_durable_head(node.durable_finalized_head())
     }
 
     /// A single observability sample line for the soak monitor (M10-T0-3 Phase
@@ -1220,10 +1225,42 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         //     journal lines, which carry the head, the height and the reason.
         //
         // Both always printed, zero and `-` included (the #130 (a) rule).
-        let dfin = node
-            .durable_finalized_height()
-            .map_or_else(|| "-".to_string(), |h| h.to_string());
+        //
+        // Issue #212: `dfin=` now reads the SNAPSHOT (`t.durable`) rather than
+        // calling `durable_finalized_height()` a second time. Same store, same
+        // value, and the same reason #117 assembled this line and the wire from one
+        // snapshot: two reads of one fact can disagree and there is nothing for them
+        // to disagree with if there is only one. `dfin=`'s vocabulary is
+        // **unchanged** — a height, or `-`.
+        let dfin = t.durable.height_field();
         let fdrop = node.finalize_refused_total();
+        // Issue #212: `dfinbh=` is **appended at the end**, after `bask=`, under the
+        // same rule as every addition since #87 — every pre-existing field keeps its
+        // name, position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified. **Touches TELEMETRY.**
+        //
+        // 🔴 **`dfin=` publishes a height and not an identity**, which is #84's
+        // sentence applied to head #3: *"`final=` says how high, never what."* Two
+        // hosts both reporting `dfin=2864` may hold different blocks there, and that
+        // divergence survives a restart on both of them — which is strictly worse
+        // than the `fid` split #84 bought onto this line, because head #1 is
+        // discarded at shutdown and head #3 is not.
+        //
+        // 🔴 **It is a BLOCK HASH prefix and `fid=` is a checkpoint identity.
+        // Comparing them is meaningless** — `fid` is
+        // `keccak256(height ‖ block_hash ‖ root)` truncated, the digest of the exact
+        // bytes the committee's ML-DSA keys signed, and no truncation of a block hash
+        // becomes one. Hence `dfinbh` and not `dfid`: every identity field here so
+        // far ends in `id`, and a fourth would invite exactly that comparison.
+        // `OPERATOR.md` §3 already carries the cost of one such mistake ("two
+        // different values are called 'the genesis hash'"). The wire type
+        // (`qlab_node::BlockIdentity`) makes the comparison a compile error; this
+        // name is the half an operator reads.
+        //
+        // Caliper: an instantaneous level read from the same snapshot as `dfin=`.
+        // Always printed, `-` included (the #130 (a) rule) — `-` when head #3 holds
+        // nothing, which on a node reporting a real `final=` is itself the alarm.
+        let dfinbh = t.durable.id_field();
         // Issue #229: `bask=` is **appended at the end**, after `fdrop=`, under the
         // same rule as every addition since #87 — every pre-existing field keeps its
         // name, position and meaning, and the `PRE_I84_FIELDS` prefix test passes
@@ -1258,7 +1295,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // walk returns nothing. Always printed, `0@-` included (the #130 (a) rule).
         let bask = node.ask_set_observation(self.p2p.body_requests(), self.mining).telemetry_field();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={} unk={}/{} cpq={} dfin={} fdrop={} bask={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={} unk={}/{} cpq={} dfin={} fdrop={} bask={} dfinbh={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1285,6 +1322,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             dfin,
             fdrop,
             bask,
+            dfinbh,
         )
     }
 
@@ -1351,7 +1389,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             tip_height: tip,
             state_tip: lag.state_tip,
             state_lag: lag.blocks(),
-            state_tip_id: applied.identity(),
+            // `bits()` is the one escape hatch on `BlockIdentity` and this gauge is
+            // its second live site: Prometheus carries an integer. See #212.
+            state_tip_id: applied.identity().bits(),
             state_tip_off_main_chain: applied.off_main_chain(),
             pending_bodies: pending as u64,
             pending_body_bytes: pending_bytes as u64,
@@ -2696,12 +2736,12 @@ mod tests {
         // `printf '%012x'` of the gauge is the log field).
         let text = node_a.metrics_text();
         assert!(
-            text.contains(&format!("\nqumbra_state_tip_id {}\n", applied.identity())),
+            text.contains(&format!("\nqumbra_state_tip_id {}\n", applied.identity().bits())),
             "{text}"
         );
         assert_eq!(
             u64::from_str_radix(field(&a, "stipid"), 16).unwrap(),
-            applied.identity(),
+            applied.identity().bits(),
             "the log field and the gauge are two spellings of one number"
         );
 
