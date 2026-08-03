@@ -814,7 +814,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             None | Some(0) => 0,
             Some(_) => {
                 let tip_ts = chain.header(&chain.tip_hash()).map(|h| h.timestamp).unwrap_or(0);
-                let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_hash());
+                let base_hash = chain.finalized_hash().unwrap_or_else(|| chain.genesis_block_hash());
                 let base_ts = chain.header(&base_hash).map(|h| h.timestamp).unwrap_or(0);
                 tip_ts.saturating_sub(base_ts)
             }

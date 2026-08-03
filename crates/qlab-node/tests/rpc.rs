@@ -78,7 +78,7 @@ fn setup(rng: &mut StdRng) -> (MemNodeRpc, Keypair, Keypair, Hash32) {
     let our = generate_keypair(rng);
     let decoy = generate_keypair(rng);
     let mut node = MemNode::in_memory(genesis_block(1_000, 0));
-    let ghash = node.chain().genesis_hash();
+    let ghash = node.chain().genesis_block_hash();
     assert!(node.finalize(ghash).unwrap());
     let anchor = node.commitment_root();
     assert!(node.is_valid_anchor(&anchor));
@@ -225,7 +225,7 @@ fn per_height_frontiers_match_the_nodes_own_roots_across_the_maturity_delay() {
     let height = delay + 25;
 
     let mut node = MemNode::in_memory(genesis_block(1_000, 0));
-    let ghash = node.chain().genesis_hash();
+    let ghash = node.chain().genesis_block_hash();
     assert!(node.finalize(ghash).unwrap());
 
     // The node's own root after each height — the ground truth to reconstruct.

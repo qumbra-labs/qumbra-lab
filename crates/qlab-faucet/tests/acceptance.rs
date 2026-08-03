@@ -102,7 +102,7 @@ impl Rig {
     /// valid anchor and the faucet is not cold-started into a stall.
     fn new() -> Rig {
         let mut node = MemNode::in_memory(genesis_block(1_000, 0));
-        let ghash = node.chain().genesis_hash();
+        let ghash = node.chain().genesis_block_hash();
         assert!(node.finalize(ghash).expect("finalize genesis"), "genesis finalizes");
         Rig { rpc: NodeRpc::new(node), seed_epoch: 0 }
     }

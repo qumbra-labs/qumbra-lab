@@ -1721,8 +1721,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
-    fn genesis_hash(&self) -> Hash32 {
-        self.chain.genesis_hash()
+    fn genesis_block_hash(&self) -> Hash32 {
+        self.chain.genesis_block_hash()
     }
     fn tip_hash(&self) -> Hash32 {
         self.chain.tip_hash()
@@ -2278,7 +2278,7 @@ mod tests {
     fn adapter_with_finalized_genesis() -> (NodeAdapter<KeccakPow, MockVerifier>, Hash32) {
         let (cstate, _v) = committee7();
         let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
-        let g = a.chain().genesis_hash();
+        let g = a.chain().genesis_block_hash();
         // Finalize genesis in the real state machine → its commitment root is a
         // valid anchor within the age window.
         a.state_mut().finalize(g).expect("finalize genesis");
@@ -2957,7 +2957,7 @@ mod tests {
 
         let tip = a.state().tip_hash();
         let parent = chain[chain.len() - 2].0.header_hash();
-        let root = a.chain().genesis_hash();
+        let root = a.chain().genesis_block_hash();
 
         // One block back, and all the way to genesis: both are below the finalized
         // head, and both are refused with the state untouched.
@@ -3208,7 +3208,7 @@ mod tests {
     /// it iterates zero times and `AnchorNotFinal` is unreachable.
     fn transacting_proposer(n: usize) -> Vec<(BlockHeader, BlockBody)> {
         let mut p = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
-        let g = p.chain().genesis_hash();
+        let g = p.chain().genesis_block_hash();
         p.state_mut().finalize(g).expect("finalize genesis");
         let anchor = p.state().commitment_root();
         (0..n)
@@ -3352,7 +3352,7 @@ mod tests {
         // Clause 2 alone: standing at the right position, but having finalized
         // nothing. This is the joiner, and it is also any node in a finality stall.
         let lagging = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
-        let g = *lagging.chain().header(&lagging.chain().genesis_hash()).expect("genesis");
+        let g = *lagging.chain().header(&lagging.chain().genesis_block_hash()).expect("genesis");
         let at_tip = BlockHeader::child_of(&g, 75, g.difficulty, [0; 32]);
         assert_eq!(at_tip.prev, lagging.state().tip_hash(), "clause 1 holds");
         assert!(
@@ -3364,7 +3364,7 @@ mod tests {
         // rule is defined at — `apply_block` would refuse it with `NotExtendingTip`,
         // and `is_valid_anchor` would be reading the wrong root index and the wrong tip.
         let (current, _anchor) = adapter_with_finalized_genesis();
-        let cg = *current.chain().header(&current.chain().genesis_hash()).expect("genesis");
+        let cg = *current.chain().header(&current.chain().genesis_block_hash()).expect("genesis");
         let one = BlockHeader::child_of(&cg, 75, cg.difficulty, [0; 32]);
         let elsewhere = BlockHeader::child_of(&one, 150, cg.difficulty, [0; 32]);
         assert_ne!(elsewhere.prev, current.state().tip_hash());
@@ -3450,7 +3450,7 @@ mod tests {
     #[test]
     fn the_pending_body_window_is_bounded_by_height_count_and_bytes() {
         let (mut a, _anchor) = adapter_with_finalized_genesis();
-        let genesis = *a.chain().header(&a.chain().genesis_hash()).expect("genesis header");
+        let genesis = *a.chain().header(&a.chain().genesis_block_hash()).expect("genesis header");
         let header_at = |height: u64| {
             let mut h = BlockHeader::child_of(&genesis, height * 75, genesis.difficulty, [0; 32]);
             h.height = height;
@@ -4058,7 +4058,7 @@ mod tests {
         let mut f = follower_with_headers_only(&blocks);
         // Finalized genesis ⇒ the empty-tree root is a valid anchor, so only the lag
         // can be the reason the transaction below is refused.
-        let genesis = f.chain().genesis_hash();
+        let genesis = f.chain().genesis_block_hash();
         f.state_mut().finalize(genesis).expect("finalize genesis");
         let anchor = f.state().commitment_root();
         let tx = tx_with(anchor, 7, b"ok");

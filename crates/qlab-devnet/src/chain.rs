@@ -212,8 +212,17 @@ impl ChainState {
         self.ancestor(descendant, entry.header.height - ancestor_height) == Some(*ancestor)
     }
 
-    /// The genesis block hash.
-    pub fn genesis_hash(&self) -> Hash32 {
+    /// The genesis **block header** hash — `keccak256` over the height-0
+    /// `BlockHeader`, i.e. the root of this chain's header DAG.
+    ///
+    /// 🔴 Not the operational "genesis hash" (issue #206). That one is
+    /// `qumbra_node::genesis::GenesisFile::hash()` — `keccak256` over the whole
+    /// genesis **file** (network name, FROZEN v1.0 params, the 21 committee
+    /// keys, and the genesis block) — and it is what `genesis init` prints, what
+    /// `expected_genesis_hash` pins, and what `qumbra-deploy/OPERATOR.md`
+    /// quotes. The file contains the block, so the two values always differ;
+    /// comparing them proves nothing. Named `genesis_hash` before #206.
+    pub fn genesis_block_hash(&self) -> Hash32 {
         self.genesis
     }
 
@@ -298,7 +307,7 @@ mod tests {
     #[test]
     fn new_chain_tip_is_genesis() {
         let c = ChainState::new(genesis());
-        assert_eq!(c.tip_hash(), c.genesis_hash());
+        assert_eq!(c.tip_hash(), c.genesis_block_hash());
         assert_eq!(c.tip_height(), 0);
         assert_eq!(c.tip_work(), 1_000);
         assert!(c.is_empty());
@@ -370,7 +379,7 @@ mod tests {
     #[test]
     fn ancestor_walks_back_parent_links() {
         let mut c = ChainState::new(genesis());
-        let g = c.genesis_hash();
+        let g = c.genesis_block_hash();
         let a = BlockHeader::child_of(c.header(&g).unwrap(), 2, 1_000, [1u8; 32]);
         let a_hash = c.insert_header(a).unwrap();
         let b = BlockHeader::child_of(c.header(&a_hash).unwrap(), 4, 1_000, [2u8; 32]);
@@ -385,7 +394,7 @@ mod tests {
     #[test]
     fn main_chain_is_genesis_to_tip() {
         let mut c = ChainState::new(genesis());
-        let g = c.genesis_hash();
+        let g = c.genesis_block_hash();
         let a = BlockHeader::child_of(c.header(&g).unwrap(), 2, 1_000, [1u8; 32]);
         let a_hash = c.insert_header(a).unwrap();
         let b = BlockHeader::child_of(c.header(&a_hash).unwrap(), 4, 1_000, [2u8; 32]);
@@ -411,7 +420,7 @@ mod tests {
     #[test]
     fn no_reorg_past_finalized_checkpoint_ever() {
         let mut c = ChainState::new(genesis()); // difficulty 1_000
-        let gh = *c.header(&c.genesis_hash()).unwrap();
+        let gh = *c.header(&c.genesis_block_hash()).unwrap();
 
         // Main branch A: A1, A2, A3 (each difficulty 1_000).
         let a1 = c.insert_header(BlockHeader::child_of(&gh, 2, 1_000, [0xA1; 32])).unwrap();
@@ -447,7 +456,7 @@ mod tests {
     #[test]
     fn set_finalized_enforces_advance_and_descent() {
         let mut c = ChainState::new(genesis());
-        let gh = *c.header(&c.genesis_hash()).unwrap();
+        let gh = *c.header(&c.genesis_block_hash()).unwrap();
         // Unknown block.
         assert_eq!(c.set_finalized([0xEE; 32]), Err(FinalizeMarkError::Unknown));
 
@@ -472,7 +481,7 @@ mod tests {
     #[test]
     fn restore_finalized_proves_the_persisted_point_against_the_main_chain() {
         let mut c = ChainState::new(genesis());
-        let gh = *c.header(&c.genesis_hash()).unwrap();
+        let gh = *c.header(&c.genesis_block_hash()).unwrap();
         let a1 = c
             .insert_header(BlockHeader::child_of(&gh, 2, 1_000, [0xA1; 32]))
             .unwrap();
