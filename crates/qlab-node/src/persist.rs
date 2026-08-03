@@ -243,8 +243,16 @@ mod tests {
     /// writes a field name, so a rename must move exactly zero bytes. If a future
     /// change reorders, adds, retypes or removes a field, this literal stops
     /// matching and [`FORMAT_VERSION`] is owed a bump.
+    /// 🔴 **Version byte adapted for `release/t0`.** On `main` this literal begins
+    /// `03000000` because `FORMAT_VERSION` is 3 there; the bump to 3 came with
+    /// `25f8da8` (`#188` 1/4), the body-preimage change that also moved the genesis
+    /// hash to `566d4ed0…`. **That version belongs to the T1 net.** This branch is
+    /// the `bd360480…` net and is `FORMAT_VERSION = 2`, so the first four bytes
+    /// differ and **every byte after them is identical** — which is exactly what the
+    /// test is for: the rename moved nothing, and the one byte that did move is a
+    /// constant this branch deliberately does not carry.
     const GOLDEN_SNAPSHOT_PRE_I206: &str = "\
-03000000111111111111111111111111111111111111111111111111111111111111111107000000\
+02000000111111111111111111111111111111111111111111111111111111111111111107000000\
 00000000222222222222222222222222222222222222222222222222222222222222222201333333\
 33333333333333333333333333333333333333333333333333333333330400000000000000020000\
 00000000004444444444444444444444444444444444444444444444444444444444444444555555\
