@@ -142,7 +142,7 @@ const BLCLOSE_COL: usize = BLC_OFF + 9; // 1: balance close gate
 const INJ3E_COL: usize = BLCLOSE_COL + 1; // 1: inj(acm) * ep
 const INJ4E_COL: usize = INJ3E_COL + 1; // 1: inj(acmout) * ep
 const EFF_OFF: usize = INJ4E_COL + 1; // 25: effective round input
-pub const NARROW_WIDTH: usize = EFF_OFF + 25; // 618
+pub const NARROW_WIDTH: usize = EFF_OFF + 25;
 
 /// Program slots (= perm slots per program period).
 pub const PROGRAM_SLOTS: usize = 96;
