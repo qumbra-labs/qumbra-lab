@@ -485,6 +485,46 @@ paired interleaved runs against a pre-mint binary in one session — not done.
 **Not verified: the b4 interior fallback lane** (31.21 GB pre-mint, ~2.5 % margin — the tight
 one). One more run; not taken.
 
+---
+
+## Stage 3's last item — the wallet-binary E2E (Q2) — DESIGNED, NOT BUILT
+
+Scope expansion approved on #219 (2026-08-04): the deliverable is *the product*, not the
+machine. Recorded here so the next session starts from a design.
+
+### Why the existing tests do not discharge it
+
+`qumbra-wallet/tests/acceptance.rs`'s scan test says so itself: *"one scan integration over the
+reference devnet fixture, **in-process via `scan_local`** — the same function the HTTP path runs,
+over a different fetch"*, and it scans with **`devnet.our.dk`** — the fixture's own key, not a
+key `keygen` produced. So it proves `scan_local` works. It does not exercise the seed →
+diversifier → allocated-index → `diversified_keypair` path that a user's wallet actually walks,
+and that path is the one PR #244 wanted evidence for.
+
+### The shape to build
+
+The harness already exists — `BIN = env!("CARGO_BIN_EXE_qumbra-wallet")` and `run(args, stdin)`
+at `acceptance.rs:18-40`. Four steps:
+
+1. **`keygen --dir D`** through `run()`. Take the printed `address [0]`; the wallet dir now holds
+   the seed and `allocated = [0]`.
+2. **Pay that address on a devnet.** The crux, and the only genuinely new work: the devnet
+   fixture must encrypt to the *wallet's* `ek`, not its own. `WalletDir::open(D)` →
+   `wallet.diversified_keypair(&wallet.diversifier_at_index(0)).ek` gives it; the note must be
+   built at the **derived** seed (`derive_output_rho`, issue #215 (i)) or it will not recompute.
+   `Devnet::from_parts` (used by `qlab-demo::scenario`) is the assembly seam.
+3. **Serve it over HTTP.** `qlab-cbserver`'s test server + `handle.base_url()`, the pattern
+   `client.rs`'s tests use.
+4. **Run the binary**: `scan --dir D --url <base_url> --to <tip>`. Assert the value is visible in
+   the rendered report **and** that the honest-reporting discipline holds — `UNAVAILABLE` absent,
+   completeness reported, no partial totals (`view.rs`'s existing vocabulary).
+
+### The trap to avoid
+
+`scan` seeds its decoy RNG from the OS CSPRNG (`main.rs:151-153`), so the run is **not
+deterministic**. Assert on the value and the discipline tokens, never on exact decoy-dependent
+output.
+
 ## Where this baton stands
 
 | stage | state |
@@ -492,6 +532,6 @@ one). One more run; not taken.
 | 0 — mandatory reading + citation check | ✅ committed; both conflicts raised, ruled, task book corrected (PR #251) |
 | 1 — option 4, the one-permutation form | ✅ committed, measured, gate cleared |
 | 2 — both changes unconditional | ✅ committed; aggregation-lane literals fixed; full bar running |
-| 3 — #188 (a), the discovery payload | 🔴 **BLOCKED on #188's premise, not on the design.** Placement ratified and built against; but (a)'s "rkm is the recipient's own key material" is false for an `Ivk`, and `/v1/compact` carries no nullifier so a light client cannot derive ρ. Two findings reported on #219; payload core preserved on `claude/mint-combo-stage3a-wip` (`186d15f`, does not compile by design) |
+| 3 — #188 (a), the discovery payload | 🟡 **relocation DONE and green (1208/0/1); ρ diagnostic DONE; the wallet-binary E2E is designed above, not built.** Previously blocked — resolved by the #188 amendment. Historical note follows: **BLOCKED on #188's premise, not on the design.** Placement ratified and built against; but (a)'s "rkm is the recipient's own key material" is false for an `Ivk`, and `/v1/compact` carries no nullifier so a light client cannot derive ρ. Two findings reported on #219; payload core preserved on `claude/mint-combo-stage3a-wip` (`186d15f`, does not compile by design) |
 | 4 — measurement battery + the suite | 🟡 proof/width/degree/census done and test-locked; **the interior-prove gate is measured and clear (above)**; still owed: the dummy-composition adversarial case, prove time, the b4 interior fallback lane |
 | 5 — genesis + `CONSENSUS_WIRE_BYTES` → 148,625 | ⬜ not started; the four other break sites are already moved (stage 2), so what remains is the constant, the fixture, the hash reproduced twice, and the params-audit row |
