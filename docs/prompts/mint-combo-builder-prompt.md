@@ -18,8 +18,10 @@ moves bytes that sit inside `qumbra_node::genesis::CONSENSUS_WIRE_BYTES`
 (`crates/qumbra-node/src/genesis.rs:72`, FROZEN v1.0, serialized into the genesis file,
 therefore inside the genesis hash) or inside the body encoding a genesis net must agree on.
 Each alone costs a re-mint; together they cost one. And the target constant **must be a
-measurement on one tree**: 147,813 + 348 = 148,161 B is a sum of measurements on *different*
-trees, and a sum mints nothing (coordinator ruling, #219, 2026-08-03).
+measurement on one tree**: every combined figure quoted anywhere (148,161 B; the stage-0
+arithmetic’s ~148,509 B at width 642) is slope arithmetic or a cross-tree sum, and neither
+mints anything (coordinator ruling, #219, 2026-08-03; gate amendment 2026-08-04). **The
+stage-4 measured figure is the only number that exists.**
 
 ## Mandatory reading before any code (stage 0, ~0.5 sh)
 
@@ -60,15 +62,31 @@ own threads later corrected:
 
 ## Stages — ordered so every measured delta has one cause
 
-**Stage 1 — option 4 (ρ′ derivation + third equality bank), feature OFF (~1.5–2.5 sh).**
-Build per #219's ruling: `ρ′_j = H(nf_0 ‖ j)` in-circuit (two added permutations, 83 → 85)
-plus the third equality bank binding the output commitments' ρ′ lanes to the derived
-values. Slot 0 is a real spend by construction (the latch's
-`q69_dv_cannot_make_slot_0_a_dummy` keeps it so), which is exactly what makes `nf_0` a
-sound uniqueness source — **name this dependency in a test**, see stage 4.
-**Gate: reproduce QUM-62's arm to the byte — width 636, 85 perms, 147,813 B (feature off),
-5/5 identical, quotient degree still 4.** Any other number: STOP and report; do not
-proceed onto a tree whose baseline you cannot explain.
+**Stage 1 — the one-permutation form (ρ′ derivation + third equality bank), feature OFF
+(~1.5–2.5 sh).**
+
+> **Corrected 2026-08-04** ([ruling](https://github.com/qumbra-labs/qumbra-lab/issues/219#issuecomment-5173677816)).
+> This stage originally said `ρ′_j = H(nf_0 ‖ j)` / two perms / a 147,813 B calibration
+> gate — that was #215's **pre-ruling** option-4 paragraph, and the gate's baseline was
+> QUM-62's probe bank, which paid for neither a role code nor an injection class. Both
+> were caught at stage 0 by the first builder, before any code. Original text preserved
+> in git history; the corrected stage follows.
+
+Build per #219's **decision comment** ("the one-permutation form"): `ρ′_0 = nf_0`
+(structural — (i)-strength inherited from the checked double-spend rule), `ρ′_1 =
+H(nf_0 ‖ D_P|1)` via a new **`ROLE_ARHO`** full-state-override permutation (83 → 84, one
+role code spent — reusing `ROLE_ANK` *is* the collision `D_P` exists to close), plus the
+third equality bank binding both output commitments' ρ′ lanes to their two **different**
+sources (a span marker off the existing `BGC[bcm1]`/`BGC[bcm2]` distinguishes the two
+ACMOUT perms, same shape as the latch's BANCHOR answer). Slot 0 is a real spend by
+construction (the latch's `q69_dv_cannot_make_slot_0_a_dummy` keeps it so), which is what
+makes `nf_0` a sound uniqueness source — **name this dependency in a test**, see stage 4.
+**Gate (amended):** (a) account for the width delta over 617 **column by column, every
+column named** (the stage-0 arithmetic says 22 — selector, injection flag, marker, 3 bank
+gates, 16 accumulator, vs the probe's 19 — if the count differs, say which row); (b)
+measure proof bytes 5/5 byte-exact and report them *beside* the slope arithmetic
+(116.0 B/col), never gated on it; (c) 🔴 **hard STOP if the quotient degree or chunk
+count moves** — that is a different tree and the slope does not apply to it.
 
 **Stage 2 — the latch becomes unconditional (~0.5 sh).**
 Delete the `q69-latch` cfg arms (both crates' feature decls, the `cfg` blocks, the
