@@ -182,6 +182,33 @@ fn a_real_wallet_binary_scans_its_own_payment_over_http() {
 }
 
 #[test]
+fn miner_rkm_matches_the_node_config_form_and_names_unallocated_indices() {
+    let dir = tmp("rkm");
+    let d = dir.to_str().unwrap();
+    run(&["keygen", "--dir", d], None);
+
+    let (out, _, ok) = run(&["miner-rkm", "--dir", d], None);
+    assert!(ok);
+    let hex_line = out.lines().find(|l| l.contains("miner_rkm = ")).unwrap();
+    let hex = hex_line.split('"').nth(1).unwrap();
+    assert_eq!(hex.len(), 64, "the 64-hex lane-major LE form NodeConfig parses");
+
+    // Byte-for-byte against the library derivation at index 0's diversifier.
+    let wallet = WalletDir::open(&dir).unwrap().wallet();
+    let d0 = wallet.diversifier_at_index(0);
+    let expect: String = qlab_note::hash::digest_bytes(&wallet.rkm(d0))
+        .iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(hex, expect, "the printed rkm IS address [0]'s identity");
+
+    // An unallocated index is valid but SAID to be outside the scan set.
+    let (out5, err5, ok5) = run(&["miner-rkm", "--dir", d, "--index", "5"], None);
+    assert!(ok5);
+    assert!(err5.contains("not in this wallet's allocated set"), "{err5}");
+    let hex5 = out5.lines().find(|l| l.contains("miner_rkm = ")).unwrap();
+    assert_ne!(hex5, hex_line, "different index, different identity");
+}
+
+#[test]
 fn scan_against_the_reference_fixture_renders_a_complete_report() {
     // The reference devnet pays its own key; scanning with that key through THIS
     // crate's reduction + render is the integration the report path needs. The
