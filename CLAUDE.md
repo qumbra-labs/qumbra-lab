@@ -137,9 +137,19 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
    instructions-retired nearly flat** — that pattern means something else was running, and the
    number should be discarded rather than caveated.
 
+   **Enumerating is not accepting — two phases, two flag sets (added 2026-08-04, from the
+   mint-combo baton).** Cargo stops at the first failing test *binary*, so a change with a wide
+   blast radius reveals its breakage one crate per ~20-minute rig pass — that baton spent four
+   passes listing what one would have shown. When you are *enumerating* what a change breaks,
+   run the bar's command **plus `--no-fail-fast`** (still serial, still rig-locked). The
+   **acceptance** run stays the unmodified command above, verbatim — the two phases answer
+   different questions ("what is red" vs "is it green") and only the second is the bar.
+
    **Reconcile the arithmetic out loud**: your total must equal `main`'s baseline plus your new
    tests. Verify the negatives too — `FAILED` (case-sensitive), `panicked at`, `^error` all zero.
-   Exit 0 from a launcher is not exit 0 from the suite.
+   Exit 0 from a launcher is not exit 0 from the suite. And **a `debug_assert` on a cross-layer
+   agreement is a comment, not a check** — the bar is `--release`, where it compiles to nothing;
+   promote such seams to `assert!` (precedent: the faucet's grant-cm seam, #253).
 
    **If you cannot run it, name the gap; do not imply a pass.** A stated "I did not run the
    workspace suite and here is what I did run" is fine and the coordinator re-runs at
