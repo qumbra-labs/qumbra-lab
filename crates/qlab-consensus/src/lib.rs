@@ -141,7 +141,8 @@ pub const CONSENSUS_CFG: FriCfg = FriCfg {
     max_log_arity: 4,
 };
 
-/// log2 of the 2×2 bucket trace height (83 perms → 2^18 rows; protocol-spec §4).
+/// log2 of the 2×2 bucket trace height (83 perms → 2^18 rows, 84 under
+/// `q215-rho`'s `ROLE_ARHO` — still 2^18; protocol-spec §4).
 pub const LOG_HEIGHT: usize = 18;
 
 /// Build a `StarkConfig` at an arbitrary FRI point. Field, hash, DFT, and the
@@ -253,6 +254,33 @@ mod tests {
         assert!(verify_proof(&inst, &pvs, &proof), "real M3 proof must verify");
     }
 
+    /// The measured consensus proof size for the active feature set, and why.
+    /// **One source of truth**: both the wire pin and the dummy-proof
+    /// size-indistinguishability test read it, so a wire change cannot be half
+    /// applied — which is exactly what a stale literal in the second test caused
+    /// when issue #215 (i) landed on top of the latch.
+    fn expected_wire_bytes() -> (usize, &'static str) {
+        match (cfg!(feature = "q69-latch"), cfg!(feature = "q215-rho")) {
+            // The number the bench suite measured and the coordinator reproduced
+            // for B″ (PR #47). `main`'s wire, untouched.
+            (false, false) => (145_609, "base (issue #38 extraction / #41 B″)"),
+            // Issue #219 / QUM-69: 3 columns (`NARROW_WIDTH` 617 → 620).
+            // 145,609 + 3 × 116.
+            (true, false) => (145_957, "latch: +3 columns"),
+            // Issue #215 (i) / #219 option 4, the one-permutation form: 23
+            // columns (617 → 640). 145,609 + 23 × 116 = 148,277. The added
+            // PERMUTATION costs zero bytes — proof size is a function of
+            // `log_height`, width, quotient degree and the FRI config, and a
+            // permutation moves none of the four (#219's six-arm measurement).
+            (false, true) => (148_277, "option 4: +23 columns, +1 free permutation"),
+            // 🔴 The combined tree the mint measures: 26 columns (617 → 643).
+            // This is the number `CONSENSUS_WIRE_BYTES` moves to, and it is a
+            // MEASUREMENT on one tree — not 148,161, which was a sum of
+            // measurements on different trees and mints nothing.
+            (true, true) => (148_625, "the mint: latch + option 4, +26 columns"),
+        }
+    }
+
     /// The consensus wire is byte-identical at **145,609 B** — the number the
     /// bench suite measured and the coordinator reproduced for B″ (PR #47),
     /// promoted here to a permanent single-source regression pin. bincode fixint
@@ -267,26 +295,18 @@ mod tests {
         let bytes = bincode::serialize(&proof)
             .expect("bincode serialization failed")
             .len();
-        #[cfg(not(feature = "q69-latch"))]
-        assert_eq!(
-            bytes, 145_609,
-            "consensus wire byte-identical regression (issue #38 extraction / #41 B″)"
-        );
-        // Issue #219 / QUM-69: the `q69-latch` feature adds three trace columns
-        // (`NARROW_WIDTH` 617 → 620). 145,957 = 145,609 + 3 × 116, i.e. the
-        // latch's real columns cost exactly what QUM-67's three INERT probe
-        // columns cost — the 116.0 B/column slope, which holds only because the
-        // quotient degree does not move (`q69_quotient_degree_does_not_move`).
+        // One pin per reachable feature set. Every number is MEASURED and pinned
+        // as an absolute; the slope arithmetic beside it is commentary, because
+        // 116.0 B/column is a line only while the quotient degree does not move
+        // (`q69_quotient_degree_does_not_move`, which is asserted for every
+        // feature set, not only the unfeatured one).
         //
-        // 🔴 This is why the feature is default-off: 145,957 ≠
+        // 🔴 Every featured number here differs from
         // `qumbra_node::genesis::CONSENSUS_WIRE_BYTES`, a FROZEN v1.0 constant
-        // baked into the genesis hash. Enabling it by default is a genesis
-        // change, not a builder's call.
-        #[cfg(feature = "q69-latch")]
-        assert_eq!(
-            bytes, 145_957,
-            "latched consensus wire (issue #219): 145,609 + 3 columns × 116 B"
-        );
+        // baked into the genesis hash. That is why both features are default-off:
+        // turning either on is a genesis change, not a builder's call.
+        let (want, why) = expected_wire_bytes();
+        assert_eq!(bytes, want, "consensus wire — {why}");
     }
 
     // -----------------------------------------------------------------------
@@ -363,7 +383,8 @@ mod tests {
             d_bytes, real_bytes,
             "a dummy proof must not be distinguishable by size"
         );
-        assert_eq!(d_bytes, 145_957, "latched wire");
+        // The absolute lives in `expected_wire_bytes`, not here — see its note.
+        assert_eq!(d_bytes, expected_wire_bytes().0, "latched wire");
     }
 
     /// The verifier binds the dummy instance to its declared surface exactly as

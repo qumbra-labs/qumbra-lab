@@ -14,6 +14,15 @@ publish.workspace = true
 # builder's call. See `narrow.rs`'s latch section and the PR body.
 q69-latch = []
 
+# Issue #215 (i) / #219 option 4, the ONE-permutation form: output note rho' is
+# derived rather than witnessed — `rho'_0 = nf_0` (structural, inherited from the
+# checked double-spend rule) and `rho'_1 = H(nf_0 || D_P|1)` via `ROLE_ARHO`,
+# bound by a third equality bank. Closes #215's faerie-gold hole. DEFAULT OFF for
+# the same reason as `q69-latch`: it moves the consensus proof wire and therefore
+# the FROZEN `CONSENSUS_WIRE_BYTES` inside the genesis hash. Both features go
+# unconditional together at the mint. See `narrow.rs`'s option-4 section.
+q215-rho = []
+
 [dependencies]
 # Pinned exactly at 0.6.1, matching qlab-bench (bench discipline).
 p3-air = "=0.6.1"

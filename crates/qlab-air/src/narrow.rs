@@ -119,10 +119,14 @@ const PH_OFF: usize = PB_OFF + 24; // 426: 4: perm-phase ring (mod-4 counter)
 const PR_OFF: usize = PH_OFF + 4; // 430: 24: program ring, 4 slots x 4 bits/limb
 const D_OFF: usize = PR_OFF + 24; // 454: 16: bit-decomposition of PR[0]
 const RB_OFF: usize = D_OFF + 16; // 470: 4: current perm's role bits
-const NSEL: usize = 13; // materialized role selectors, order = SEL_CODES
-const SEL_OFF: usize = RB_OFF + 4; // [mrk, nf, ank, arkm, acm, acmout, banchor, bnf1, bnf2, bcm1, bcm2, bal, end]
-const INJ_OFF: usize = SEL_OFF + NSEL; // 5: injection flags [mrk+nf, ank, arkm, acm, acmout]
-const G4_COL: usize = INJ_OFF + 5; // 1: program-ring rotation gate
+// Materialized role selectors, order = SEL_CODES. Issue #215 (i) / #219
+// option 4 appends a 14th, `ROLE_ARHO`.
+const NSEL: usize = if cfg!(feature = "q215-rho") { 14 } else { 13 };
+const SEL_OFF: usize = RB_OFF + 4; // [mrk, nf, ank, arkm, acm, acmout, banchor, bnf1, bnf2, bcm1, bcm2, bal, end] (+ arho)
+// Injection flags [mrk+nf, ank, arkm, acm, acmout] (+ arho under q215-rho).
+const NINJ: usize = if cfg!(feature = "q215-rho") { 6 } else { 5 };
+const INJ_OFF: usize = SEL_OFF + NSEL;
+const G4_COL: usize = INJ_OFF + NINJ; // 1: program-ring rotation gate
 const PBIT_COL: usize = G4_COL + 1; // 1: merkle path bit (constant per perm)
 const W_OFF: usize = PBIT_COL + 1; // 13: witness lanes (role-multiplexed)
 const SIB_OFF: usize = W_OFF; // sibling digest lanes = W0..3 (merkle rows)
@@ -131,8 +135,14 @@ const EG_OFF: usize = EQ_OFF + 32; // 6: eq gates [e1pos, e1neg, e1close, e2pos,
 // --- step 3b: one-shot epoch, bind bank, balance ---
 const EP_COL: usize = EG_OFF + 6; // 1: epoch flag (1 during program pass 0, then 0)
 const GWRAP_COL: usize = EP_COL + 1; // 1: epoch-kill gate (gperm * sel_end)
-const SE_OFF: usize = GWRAP_COL + 1; // 6: ep-gated selectors [nf, arkm, acm, acmout, bindsum, bal]
-const BQ_OFF: usize = SE_OFF + 6; // 16: bind bank, 4 lanes x 4 chunks
+// ep-gated selectors [nf, arkm, acm, acmout, bindsum, bal] — plus, under
+// q215-rho, a 7th: `(arho + acmout) · ep`, the third bank's window selector.
+const NSE: usize = if cfg!(feature = "q215-rho") { 7 } else { 6 };
+const SE_OFF: usize = GWRAP_COL + 1;
+/// Index of the q215 window selector within the SE block.
+#[cfg(feature = "q215-rho")]
+const SE_RHO: usize = 6;
+const BQ_OFF: usize = SE_OFF + NSE; // 16: bind bank, 4 lanes x 4 chunks
 const BGCAP_COL: usize = BQ_OFF + 16; // 1: bind capture gate
 const BGRST_COL: usize = BGCAP_COL + 1; // 1: bind reset gate
 const BGC_OFF: usize = BGRST_COL + 1; // 5: bind close gates [banchor, bnf1, bnf2, bcm1, bcm2]
@@ -147,8 +157,9 @@ const EFF_OFF: usize = INJ4E_COL + 1; // 25: effective round input
 /// next `ROLE_BANCHOR`'s, pinned to 0 at row 0. Both set and clear events are
 /// already materialized as bind-close gates, so this is **program-driven**: the
 /// prover chooses nothing about where it is high.
+const POST_EFF: usize = EFF_OFF + 25;
 #[cfg(feature = "q69-latch")]
-const LATCH_COL: usize = EFF_OFF + 25;
+const LATCH_COL: usize = POST_EFF;
 /// `dv` — the prover's liveness bool, persistent for the whole trace.
 #[cfg(feature = "q69-latch")]
 const DV_COL: usize = LATCH_COL + 1;
@@ -156,10 +167,33 @@ const DV_COL: usize = LATCH_COL + 1;
 /// guard both stay at degree 3, matching this file's convention.
 #[cfg(feature = "q69-latch")]
 const LDV_COL: usize = DV_COL + 1;
-#[cfg(feature = "q69-latch")]
-pub const NARROW_WIDTH: usize = LDV_COL + 1;
-#[cfg(not(feature = "q69-latch"))]
-pub const NARROW_WIDTH: usize = EFF_OFF + 25;
+const Q69_COLS: usize = if cfg!(feature = "q69-latch") { 3 } else { 0 };
+
+// --- issue #215 (i) / #219 option 4: derived output rho' (feature `q215-rho`) ---
+/// `M` — the output-1 span marker. Set at `ROLE_ARHO`'s close row, cleared at
+/// `ROLE_BCM2`'s, pinned to 0 at row 0. Both events are `gperm` role events the
+/// **program** fixes, so like the `q69` latch this is program-driven and the
+/// prover chooses nothing about where it is high.
+///
+/// It exists because the two output perms share `ROLE_ACMOUT`, so every gate of
+/// the form `bnd · sel(ACMOUT)` fires at **both** — the same obstacle
+/// `ROLE_BANCHOR` hit in #219. Under the one-permutation form the two outputs'
+/// rho' have *different sources* (`nf_0` vs the ARHO digest), so the third bank
+/// has to tell them apart, and `M` is what does it.
+#[cfg(feature = "q215-rho")]
+const OM_COL: usize = POST_EFF + Q69_COLS;
+/// The third equality bank: 4 lanes x 4 z-chunks, one accumulator serving all
+/// three windows in program order (they are disjoint in time).
+#[cfg(feature = "q215-rho")]
+const EQ3_OFF: usize = OM_COL + 1;
+/// `[pos, neg, close]`. `close` doubles as the reset — close and reset are the
+/// same row here (unlike the bind bank, whose capture and reset are different
+/// rows of one perm), so one column serves both.
+#[cfg(feature = "q215-rho")]
+const EG3_OFF: usize = EQ3_OFF + 16;
+const Q215_TAIL: usize = if cfg!(feature = "q215-rho") { 1 + 16 + 3 } else { 0 };
+
+pub const NARROW_WIDTH: usize = POST_EFF + Q69_COLS + Q215_TAIL;
 
 /// Program slots (= perm slots per program period).
 pub const PROGRAM_SLOTS: usize = 96;
@@ -200,6 +234,60 @@ pub const ROLE_BAL: u32 = 12;
 /// Program end: kills the one-shot epoch flag so replayed program passes
 /// in the padding region capture and close nothing.
 pub const ROLE_END: u32 = 13;
+/// Issue #215 (i) / #219 option 4: `rho'_1 = H(nf_0 || D_P)`. A full-state
+/// override with `msg_ank`'s lane shape and a different domain constant —
+/// nf_0 as witness `W5..9` (bound by the third bank against `PV_NF1`),
+/// `D_P = 1 << 3` at lane 4, pad10*1 from bit 320 and at bit 1087.
+///
+/// 🔴 **`D_P` is load-bearing, not hygiene.** Without it this absorb is
+/// byte-identical in shape to `ROLE_ANK`'s (`sk || D_N || pad@320`), so
+/// `rho' = H(nf_0 || pad)` and `nk = H(sk || D_N || pad)` would be the same
+/// function — and an attacker setting `sk := nf_0`, a **public** value, would
+/// obtain `nk == rho'`. Reusing `ROLE_ANK` *is* the collision the tag closes,
+/// which is why this spends a role code rather than borrowing one.
+///
+/// `sel(2)` is the next free iota position (lane 4 = `1 << 3`), so the tag
+/// costs no new periodic column.
+pub const ROLE_ARHO: u32 = 14;
+
+/// Role codes in materialized-selector order. One list, read by both the AIR
+/// and the trace generator, so the two cannot drift.
+#[cfg(not(feature = "q215-rho"))]
+const SEL_CODES: [u32; NSEL] = [
+    ROLE_MERKLE,
+    ROLE_NF,
+    ROLE_ANK,
+    ROLE_ARKM,
+    ROLE_ACM,
+    ROLE_ACMOUT,
+    ROLE_BANCHOR,
+    ROLE_BNF1,
+    ROLE_BNF2,
+    ROLE_BCM1,
+    ROLE_BCM2,
+    ROLE_BAL,
+    ROLE_END,
+];
+#[cfg(feature = "q215-rho")]
+const SEL_CODES: [u32; NSEL] = [
+    ROLE_MERKLE,
+    ROLE_NF,
+    ROLE_ANK,
+    ROLE_ARKM,
+    ROLE_ACM,
+    ROLE_ACMOUT,
+    ROLE_BANCHOR,
+    ROLE_BNF1,
+    ROLE_BNF2,
+    ROLE_BCM1,
+    ROLE_BCM2,
+    ROLE_BAL,
+    ROLE_END,
+    ROLE_ARHO,
+];
+/// `ROLE_ARHO`'s index in [`SEL_CODES`].
+#[cfg(feature = "q215-rho")]
+const SEL_ARHO: usize = 13;
 
 /// Public-value layout: anchor, nf1, nf2, cm1, cm2 as 16 chunks each
 /// (4 lanes x 4 sixteen-bit z-chunks, chunk-major within lane), then fee
@@ -557,22 +645,7 @@ where
             let t1 = if j & 2 == 2 { b1 } else { AB::Expr::ONE - b1 };
             t0 * t1
         };
-        let sel_codes: [u32; NSEL] = [
-            ROLE_MERKLE,
-            ROLE_NF,
-            ROLE_ANK,
-            ROLE_ARKM,
-            ROLE_ACM,
-            ROLE_ACMOUT,
-            ROLE_BANCHOR,
-            ROLE_BNF1,
-            ROLE_BNF2,
-            ROLE_BCM1,
-            ROLE_BCM2,
-            ROLE_BAL,
-            ROLE_END,
-        ];
-        for (i, code) in sel_codes.iter().enumerate() {
+        for (i, code) in SEL_CODES.iter().enumerate() {
             let lo = pair(r(0), r(1), code & 3);
             let hi = pair(r(2), r(3), (code >> 2) & 3);
             builder.assert_eq(local[SEL_OFF + i].clone(), lo * hi);
@@ -591,6 +664,13 @@ where
                 bnd.clone() * sel_role(i + 1),
             );
         }
+        // Issue #215 (i): ROLE_ARHO is its own injection class — a full-state
+        // override, so it cannot share a flag with any existing role.
+        #[cfg(feature = "q215-rho")]
+        builder.assert_eq(
+            local[INJ_OFF + 5].clone(),
+            bnd.clone() * sel_role(SEL_ARHO),
+        );
         // Program-ring rotation gate: perm boundary AND phase wrap.
         builder.assert_eq(
             local[G4_COL].clone(),
@@ -666,6 +746,20 @@ where
                 + inj(2) * (msg_arkm - a(l))
                 + inj(3) * (msg_acm - a(l))
                 + inj(4) * (msg_acmout - a(l));
+            // arho: rho'_1 = H(nf_0 || D_P). nf_0 rides W5..8 — the SAME lanes
+            // ACMOUT's rho' rides — so the third bank's positive leg is one
+            // gate for both roles instead of two.
+            #[cfg(feature = "q215-rho")]
+            let expr = {
+                let msg_arho: AB::Expr = match l {
+                    0..=3 => w(l + 5),
+                    4 => sel(2), // D_P = 1 << 3, the next free iota position
+                    5 => sel(0), // pad10*1 start at bit 320
+                    16 => u63.clone(),
+                    _ => AB::Expr::ZERO,
+                };
+                expr + inj(5) * (msg_arho - a(l))
+            };
             builder.assert_eq(eff(l), expr);
         }
         // Equality banks (4 lanes x 4 z-chunks each). Bank 1 binds arkm's
@@ -721,6 +815,14 @@ where
         let bindsum = sel_role(6) + sel_role(7) + sel_role(8) + sel_role(9) + sel_role(10);
         builder.assert_eq(local[SE_OFF + 4].clone(), bindsum * ep.clone());
         builder.assert_eq(local[SE_OFF + 5].clone(), sel_role(11) * ep.clone());
+        // Issue #215 (i): the third bank's window selector. ARHO and ACMOUT are
+        // the only roles that accumulate into it, and they accumulate the SAME
+        // witness lanes (W5..8), so one ep-gated selector serves both.
+        #[cfg(feature = "q215-rho")]
+        builder.assert_eq(
+            local[SE_OFF + SE_RHO].clone(),
+            (sel_role(SEL_ARHO) + sel_role(5)) * ep.clone(),
+        );
         // Bind capture / reset / close gates.
         builder.assert_eq(
             local[BGCAP_COL].clone(),
@@ -769,6 +871,48 @@ where
         for j in 0..16 {
             builder.when_first_row().assert_zero(local[BQ_OFF + j].clone());
         }
+
+        // --- Issue #215 (i) / #219 option 4: the third equality bank ---
+        //
+        // One accumulator, three windows, disjoint in program order:
+        //
+        //   ACMOUT_0 : +W5..8                       close vs PV_NF1  =>  rho'_0 = nf_0
+        //   ARHO     : +W5..8                       close vs PV_NF1  =>  ARHO absorbs the REAL nf_0
+        //   ACMOUT_1 : +W5..8, -a[0..4]             close vs 0       =>  rho'_1 = the ARHO digest
+        //
+        // `M` selects the close target, so all three share ONE close gate. The
+        // positive leg is one gate because ARHO deliberately takes nf_0 in the
+        // same witness lanes ACMOUT takes rho' in.
+        #[cfg(feature = "q215-rho")]
+        {
+            builder.assert_eq(
+                local[EG3_OFF].clone(),
+                bnd.clone() * local[SE_OFF + SE_RHO].clone(),
+            );
+            builder.assert_eq(
+                local[EG3_OFF + 1].clone(),
+                bnd.clone() * local[SE_OFF + 3].clone() * local[OM_COL].clone(),
+            );
+            builder.assert_eq(
+                local[EG3_OFF + 2].clone(),
+                gperm.clone() * local[SE_OFF + SE_RHO].clone(),
+            );
+            builder.assert_bool(local[OM_COL].clone());
+            builder.when_first_row().assert_zero(local[OM_COL].clone());
+            for j in 0..16 {
+                // Degree 3: the close gate, then `(1 − M) · pv · ep` (public
+                // values are degree 0) against the accumulator.
+                builder.assert_zero(
+                    local[EG3_OFF + 2].clone()
+                        * (local[EQ3_OFF + j].clone()
+                            - (AB::Expr::ONE - local[OM_COL].clone())
+                                * pv(PV_NF1 + j)
+                                * ep.clone()),
+                );
+                builder.when_first_row().assert_zero(local[EQ3_OFF + j].clone());
+            }
+        }
+
         // Balance: ep-gated capture flags; carries as 3-bool encodings; the
         // close row enforces the 16-bit-limb subtraction chain
         // sum_in - sum_out = fee exactly (all magnitudes << p, so the field
@@ -1012,6 +1156,45 @@ where
             t.assert_eq(next[DV_COL].clone(), local[DV_COL].clone());
         }
 
+        // Issue #215 (i): the output-1 span marker, one degree-2 transition —
+        // set at ROLE_ARHO's close, cleared at ROLE_BCM2's. Both are `gperm`
+        // role events, so the span is the program's and not the prover's; the
+        // two never fire on the same row (one perm, one role), so `M` stays
+        // bool without the bool check carrying the argument.
+        #[cfg(feature = "q215-rho")]
+        {
+            // `EG3[2] · sel(ARHO)` = `gperm · sel(ARHO) · ep`: the role
+            // selectors are mutually exclusive by construction, so multiplying
+            // the shared close gate by one of its two roles isolates it —
+            // degree 2, and no fourth gate column.
+            let arho_close =
+                local[EG3_OFF + 2].clone() * local[SEL_OFF + SEL_ARHO].clone();
+            t.assert_eq(
+                next[OM_COL].clone(),
+                local[OM_COL].clone() * (AB::Expr::ONE - local[BGC_OFF + 4].clone())
+                    + arho_close,
+            );
+            // Third bank: reset on close (close and reset are the same row),
+            // else accumulate. Degree 2 — the accumulator is a column, both legs
+            // are gate x periodic weight x column.
+            for l in 0..4 {
+                for j in 0..4 {
+                    let idx = 4 * l + j;
+                    t.assert_eq(
+                        next[EQ3_OFF + idx].clone(),
+                        (AB::Expr::ONE - local[EG3_OFF + 2].clone())
+                            * local[EQ3_OFF + idx].clone()
+                            + local[EG3_OFF].clone()
+                                * per[35 + j].clone()
+                                * local[W_OFF + 5 + l].clone()
+                            - local[EG3_OFF + 1].clone()
+                                * per[35 + j].clone()
+                                * local[A_OFF + l].clone(),
+                    );
+                }
+            }
+        }
+
         // Equality-bank accumulation (deg 3: gate * chunk-weight * source).
         let pwk = |j: usize| per[35 + j].clone();
         for l in 0..4 {
@@ -1076,8 +1259,39 @@ pub struct BucketInstance {
 /// Merkle tree depth of the bucket statement.
 pub const MERKLE_DEPTH: usize = 32;
 /// Perm slots used by the full bucket program, INCLUDING the leading
-/// dummy warm-up slot (fits 2^18 rows: 83 x 3072 = 254,976).
-pub const BUCKET_PERMS: usize = 1 + 2 * (5 + MERKLE_DEPTH + 1) + 2 * 2 + 2;
+/// dummy warm-up slot (fits 2^18 rows: 83 x 3072 = 254,976). Issue #215 (i)
+/// adds ONE — `ROLE_ARHO` — for 84 x 3072 = 258,048, still inside 2^18
+/// (262,144), leaving 1.33 spare perm slots against 2.33 today.
+pub const BUCKET_PERMS: usize = 1
+    + 2 * (5 + MERKLE_DEPTH + 1)
+    + 2 * 2
+    + 2
+    + if cfg!(feature = "q215-rho") { 1 } else { 0 };
+
+/// Issue #215 (i) / #219 option 4, the host mirror of the in-circuit derivation.
+/// Output `j`'s note seed is no longer the sender's choice:
+///
+/// - `rho'_0 = nf_0` — **structural** uniqueness, inherited from the
+///   double-spend rule consensus already enforces on `nf_0`.
+/// - `rho'_1 = H(nf_0 || D_P)` — collision resistance at the 2^128 birthday
+///   bound, the same bound `cm`, `nf` and all 32 Merkle levels already rest on.
+///
+/// Both derive from slot 0 alone, which is what lets slot 1 be a dummy without
+/// touching rho uniqueness (#219) — and why `nf_1 == nf_2` can no longer produce
+/// `rho'_0 == rho'_1` at all, rather than that dependency being pinned by a test.
+#[cfg(feature = "q215-rho")]
+pub fn derive_output_rho(nf0: &[u64; 4], j: usize) -> [u64; 4] {
+    assert!(j < 2, "the frozen 2x2 bucket has two outputs");
+    if j == 0 {
+        return *nf0;
+    }
+    let mut st = [0u64; 25];
+    st[..4].copy_from_slice(nf0);
+    st[4] = 1 << 3; // D_P — see ROLE_ARHO
+    st[5] = 1; // pad10*1 start at bit 320
+    st[16] = 1 << 63;
+    crate::reference::keccak_f(&st)[..4].try_into().unwrap()
+}
 
 /// A caller-supplied depth-32 Merkle authentication path for one spent note
 /// (issue #39). `siblings[i]` / `path_bits[i]` describe level `i`, leaf level
@@ -1230,32 +1444,28 @@ pub fn build_bucket_with_witnesses(
     let (nk1, nf1, _cm1) = derive_input(&inputs[0]);
     let (nk2, nf2, _cm2) = derive_input(&inputs[1]);
 
-    let cmo1 = {
-        let o = &outputs[0];
+    // Issue #215 (i): the output note seeds are DERIVED, not the sender's. Any
+    // `TxOutput::rho` the caller supplied is overridden — a supplied value was
+    // the free witness #215 was filed about. Callers that need to know what was
+    // used call `derive_output_rho`; the value is public either way (`nf_0` is
+    // `PV_NF1`, and the index is fixed by position).
+    #[cfg(feature = "q215-rho")]
+    let out_rho = [derive_output_rho(&nf1, 0), derive_output_rho(&nf1, 1)];
+    #[cfg(not(feature = "q215-rho"))]
+    let out_rho = [outputs[0].rho, outputs[1].rho];
+
+    let cm_of = |o: &TxOutput, rho: &[u64; 4]| -> [u64; 4] {
         let mut st = [0u64; 25];
         st[0] = o.value;
         st[1..5].copy_from_slice(&o.rkm);
-        st[5..9].copy_from_slice(&o.rho);
+        st[5..9].copy_from_slice(rho);
         st[9..13].copy_from_slice(&o.rseed);
         st[13] = 1;
         st[16] = 1 << 63;
-        let d = reference::keccak_f(&st);
-        let dd: [u64; 4] = d[..4].try_into().unwrap();
-        dd
+        reference::keccak_f(&st)[..4].try_into().unwrap()
     };
-    let cmo2 = {
-        let o = &outputs[1];
-        let mut st = [0u64; 25];
-        st[0] = o.value;
-        st[1..5].copy_from_slice(&o.rkm);
-        st[5..9].copy_from_slice(&o.rho);
-        st[9..13].copy_from_slice(&o.rseed);
-        st[13] = 1;
-        st[16] = 1 << 63;
-        let d = reference::keccak_f(&st);
-        let dd: [u64; 4] = d[..4].try_into().unwrap();
-        dd
-    };
+    let cmo1 = cm_of(&outputs[0], &out_rho[0]);
+    let cmo2 = cm_of(&outputs[1], &out_rho[1]);
 
     // Program + witness.
     let mut program = [ROLE_DUMMY; PROGRAM_SLOTS];
@@ -1294,11 +1504,24 @@ pub fn build_bucket_with_witnesses(
     };
     input_chain(&inputs[0], &nk1, &witnesses[0], ROLE_BNF1);
     input_chain(&inputs[1], &nk2, &witnesses[1], ROLE_BNF2);
-    for (o, bcm) in outputs.iter().zip([ROLE_BCM1, ROLE_BCM2]) {
+    for (j, (o, bcm)) in outputs.iter().zip([ROLE_BCM1, ROLE_BCM2]).enumerate() {
+        // Issue #215 (i): `ROLE_ARHO` sits IMMEDIATELY before output 1's
+        // ACMOUT, so that ACMOUT's boundary rows carry the ARHO digest as
+        // `a[0..4]` — which is how the third bank binds `rho'_1` to it with no
+        // witness of its own. Program order is verifier-fixed (the ring is
+        // pinned at row 0 and the verifier builds the AIR from its own
+        // canonical instance), so this adjacency is not a prover choice.
+        #[cfg(feature = "q215-rho")]
+        if j == 1 {
+            program[slot] = ROLE_ARHO;
+            sw[slot].w[5..9].copy_from_slice(&nf1);
+            slot += 1;
+        }
+        let _ = j;
         program[slot] = ROLE_ACMOUT;
         sw[slot].w[4] = o.value;
         sw[slot].w[..4].copy_from_slice(&o.rkm);
-        sw[slot].w[5..9].copy_from_slice(&o.rho);
+        sw[slot].w[5..9].copy_from_slice(&out_rho[j]);
         sw[slot].w[9..13].copy_from_slice(&o.rseed);
         slot += 1;
         program[slot] = bcm;
@@ -1510,6 +1733,12 @@ impl NarrowKeccakAir {
         let mut latch: u32 = 0;
         #[cfg(feature = "q69-latch")]
         let dvv: u32 = self.dv as u32;
+        // Issue #215 (i): the third bank's accumulator and the output-1 span
+        // marker, both pinned to 0 at row 0 by the AIR.
+        #[cfg(feature = "q215-rho")]
+        let mut eq3 = [0i64; 16];
+        #[cfg(feature = "q215-rho")]
+        let mut om: u32 = 0;
         #[cfg(not(feature = "q69-latch"))]
         assert!(
             !self.dv,
@@ -1576,6 +1805,16 @@ impl NarrowKeccakAir {
                         5 => wbit[5],
                         6 => wbit[6],
                         7 => z0,
+                        16 => z63,
+                        _ => 0,
+                    },
+                    // arho: nf_0 at W5..8 (the same lanes ACMOUT's rho' rides),
+                    // D_P at lane 4, pad10*1 from bit 320.
+                    #[cfg(feature = "q215-rho")]
+                    ROLE_ARHO => match l {
+                        0..=3 => wbit[l + 5],
+                        4 => (z == 3) as u32,
+                        5 => z0,
                         16 => z63,
                         _ => 0,
                     },
@@ -1649,23 +1888,8 @@ impl NarrowKeccakAir {
             for k in 0..4 {
                 row[RB_OFF + k] = F::from_u32((role_now >> k) & 1);
             }
-            let sel_codes: [u32; NSEL] = [
-                ROLE_MERKLE,
-                ROLE_NF,
-                ROLE_ANK,
-                ROLE_ARKM,
-                ROLE_ACM,
-                ROLE_ACMOUT,
-                ROLE_BANCHOR,
-                ROLE_BNF1,
-                ROLE_BNF2,
-                ROLE_BCM1,
-                ROLE_BCM2,
-                ROLE_BAL,
-                ROLE_END,
-            ];
             let selv: [u32; NSEL] =
-                core::array::from_fn(|i| (role_now == sel_codes[i]) as u32);
+                core::array::from_fn(|i| (role_now == SEL_CODES[i]) as u32);
             for (i, v) in selv.iter().enumerate() {
                 row[SEL_OFF + i] = F::from_u32(*v);
             }
@@ -1674,19 +1898,28 @@ impl NarrowKeccakAir {
             for i in 1..5 {
                 row[INJ_OFF + i] = F::from_u32(bndv * selv[i + 1]);
             }
+            #[cfg(feature = "q215-rho")]
+            {
+                row[INJ_OFF + 5] = F::from_u32(bndv * selv[SEL_ARHO]);
+            }
             let g4 = ((t % 128 == 127) as u32) * pb[1] * ph[1];
             row[G4_COL] = F::from_u32(g4);
             let gpermv = ((t % 128 == 127) as u32) * pb[1];
             // ep-gated selector products and all bank gates.
             let bindsum = selv[6] + selv[7] + selv[8] + selv[9] + selv[10];
-            let se = [
+            let mut se = [0u32; NSE];
+            se[..6].copy_from_slice(&[
                 selv[1] * ep,
                 selv[3] * ep,
                 selv[4] * ep,
                 selv[5] * ep,
                 bindsum * ep,
                 selv[11] * ep,
-            ];
+            ]);
+            #[cfg(feature = "q215-rho")]
+            {
+                se[SE_RHO] = (selv[SEL_ARHO] + selv[5]) * ep;
+            }
             for (i, v) in se.iter().enumerate() {
                 row[SE_OFF + i] = F::from_u32(*v);
             }
@@ -1715,6 +1948,21 @@ impl NarrowKeccakAir {
                 row[LATCH_COL] = F::from_u32(latch);
                 row[DV_COL] = F::from_u32(dvv);
                 row[LDV_COL] = F::from_u32(latch * dvv);
+            }
+            // Issue #215 (i): the third bank's three gates and the span marker
+            // (mirrors the materialized gate columns exactly).
+            #[cfg(feature = "q215-rho")]
+            let (g3pos, g3neg, g3close) = (
+                bndv * se[SE_RHO],
+                bndv * se[3] * om,
+                gpermv * se[SE_RHO],
+            );
+            #[cfg(feature = "q215-rho")]
+            {
+                row[OM_COL] = F::from_u32(om);
+                row[EG3_OFF] = F::from_u32(g3pos);
+                row[EG3_OFF + 1] = F::from_u32(g3neg);
+                row[EG3_OFF + 2] = F::from_u32(g3close);
             }
             let inj3e = bndv * se[2];
             let inj4e = bndv * se[3];
@@ -1763,6 +2011,10 @@ impl NarrowKeccakAir {
                     -F::from_u32((-*acc) as u32)
                 };
             }
+            #[cfg(feature = "q215-rho")]
+            for (i, acc) in eq3.iter().enumerate() {
+                row[EQ3_OFF + i] = sgn(*acc);
+            }
             for l in 0..25 {
                 row[EFF_OFF + l] = F::from_u32(eff[l]);
             }
@@ -1784,6 +2036,25 @@ impl NarrowKeccakAir {
                     - (inj4e as i64) * wgt * wbit[4] as i64;
                 if bgrst == 1 {
                     bq = [0i64; 16];
+                }
+                // Mirrors the third bank's transition exactly: reset on close,
+                // else accumulate +W5..8 and (at ACMOUT_1 only) -a[0..4].
+                #[cfg(feature = "q215-rho")]
+                {
+                    // The constraint resets every chunk on the close row, and
+                    // the legs are zero there (close is a `gperm` row, the legs
+                    // are `bnd` rows), so reset-then-accumulate is exact.
+                    if g3close == 1 {
+                        eq3 = [0i64; 16];
+                    }
+                    for l in 0..4 {
+                        let idx = 4 * l + jc;
+                        eq3[idx] += g3pos as i64 * wgt * wbit[5 + l] as i64
+                            - g3neg as i64 * wgt * a[l] as i64;
+                    }
+                    // Set at ARHO's close, cleared at BCM2's — the same
+                    // mutual-exclusivity argument the constraint uses.
+                    om = om * (1 - gpermv * selv[10]) + g3close * selv[SEL_ARHO];
                 }
                 ep *= 1 - gwrap;
                 // Mirrors the latch transition constraint exactly.
@@ -2437,7 +2708,15 @@ mod tests {
         assert_eq!(a.nf, b.nf, "nullifiers must not depend on the diversifier");
         // STOP-POINT: perm count + height unchanged by absorbing d.
         assert_eq!(a.air.program.len(), b.air.program.len());
-        assert_eq!(BUCKET_PERMS, 83, "perm count unchanged by the d-absorb");
+        // The claim is that `d` costs no permutation, so this asserts against
+        // whatever the feature set's own perm count is rather than a literal:
+        // 83 base, 84 with issue #215 (i)'s `ROLE_ARHO`. Absorbing `d` moves
+        // neither.
+        assert_eq!(
+            BUCKET_PERMS,
+            83 + if cfg!(feature = "q215-rho") { 1 } else { 0 },
+            "perm count unchanged by the d-absorb"
+        );
     }
 
     fn test_bucket(v1: u64, v2: u64, o1: u64, o2: u64) -> (BucketInstance, u64) {
@@ -2604,15 +2883,53 @@ mod tests {
     /// third independent sighting of the stale `618` in the comment on
     /// `NARROW_WIDTH`'s definition and in `protocol-spec.md:59` (issue #234, NOT
     /// fixed here) — and **620 with the latch's three columns.**
+    ///
+    /// Issue #215 (i) adds **23**, and this test is the mint baton's stage-1
+    /// gate (a): *account for the width delta over 617 column by column, every
+    /// column named.* Every row below is one column, and the sum is asserted
+    /// against the matrix rather than against a remembered number — so a future
+    /// change that adds a column has to add its row here to stay green.
+    ///
+    /// 🔴 The stage-0 estimate was **22** and it was short by one row:
+    /// `SE_RHO`, the ep-gated window selector. The estimate counted the bank's
+    /// three gates but not the selector those gates are built from — the file's
+    /// convention materializes `sel · ep` before a gate multiplies it, and
+    /// banks 1 and 2 get theirs free only because `nf`/`arkm`/`acm` already had
+    /// SE entries for other reasons.
     #[test]
     fn q69_trace_width_is_read_off_the_matrix() {
         let air = NarrowKeccakAir::chain_only(10);
         let trace = air.generate_trace::<F>(0);
         assert_eq!(trace.width(), NARROW_WIDTH, "width must be the matrix's own");
-        #[cfg(not(feature = "q69-latch"))]
-        assert_eq!(trace.width(), 617, "unfeatured base width");
-        #[cfg(feature = "q69-latch")]
-        assert_eq!(trace.width(), 620, "base + L + dv + L·dv");
+
+        const BASE: usize = 617;
+        // Issue #219 / QUM-69, the latch — as merged in PR #239.
+        let q69_latch = usize::from(cfg!(feature = "q69-latch"));
+        let q69 = q69_latch * 3; // L, dv, L·dv
+        // Issue #215 (i) / #219 option 4, the one-permutation form.
+        let q215_on = usize::from(cfg!(feature = "q215-rho"));
+        let q215 = q215_on
+            * (1 // sel(ROLE_ARHO)                — NSEL 13 → 14
+                + 1 // inj(ROLE_ARHO)             — NINJ 5 → 6, a full-state override
+                + 1 // SE_RHO = (arho + acmout)·ep — NSE 6 → 7, the window selector
+                + 1 // OM                          — the output-1 span marker
+                + 3 // EG3                         — pos, neg, close (close doubles as reset)
+                + 16); // EQ3                      — the third accumulator, 4 lanes × 4 chunks
+        assert_eq!(q215, q215_on * 23, "issue #215 (i) costs 23 columns");
+        assert_eq!(
+            trace.width(),
+            BASE + q69 + q215,
+            "width must be 617 plus exactly the columns named above"
+        );
+        // The four reachable feature combinations, pinned as absolutes so the
+        // accounting above cannot drift by cancelling errors.
+        let expected = match (q69_latch, q215_on) {
+            (0, 0) => 617,
+            (1, 0) => 620,
+            (0, 1) => 640,
+            _ => 643,
+        };
+        assert_eq!(trace.width(), expected, "pinned width for this feature set");
     }
 
     /// 🔴 The condition the ruling on `#219` names: **does the gated anchor close
@@ -2632,6 +2949,12 @@ mod tests {
     /// degrees of headroom, and even the 2-column variant (no materialized
     /// `L·dv`, both new constraints at degree 4) would not move it. Only a
     /// degree-6 constraint would.
+    ///
+    /// 🔴 **This is also issue #215 (i)'s hard stop**, and it runs for every
+    /// feature set rather than only the unfeatured one: if the degree or the
+    /// chunk count moved, the 116.0 B/column slope would not apply and the
+    /// combined tree would be a different tree. It does not move — option 4's
+    /// two new degree-4 constraints land on a ceiling that was already 4.
     #[test]
     fn q69_quotient_degree_does_not_move() {
         use p3_air::symbolic::{get_max_constraint_degree, AirLayout};
@@ -2647,6 +2970,37 @@ mod tests {
         // and not left to a reader: `get_log_num_quotient_chunks` computes
         // `log2_ceil(max(deg, 2) - 1)`.
         assert_eq!((deg - 1).next_power_of_two(), 4, "quotient chunks");
+        // The census, pinned. `main`'s 873 / `{1: 207, 2: 511, 3: 142, 4: 13}`
+        // reproduces PR #239's record at `d16ffd5` exactly, which is what makes
+        // the featured rows below comparable to it.
+        //
+        // Issue #215 (i) adds **57**: 1 selector + 1 injection flag + 1 SE + 3
+        // bank gates + 3 for the span marker (bool, row-0 pin, transition) + 16
+        // closes + 16 row-0 pins + 16 accumulator transitions.
+        //
+        // 🔴 The deg-4 count goes 13 → 15, and both additions are named rather
+        // than absorbed: `sel(ROLE_ARHO)` is a 14th materialized role selector
+        // (`pair · pair`, the same shape as the 13 that already set the ceiling),
+        // and `EG3[1] = bnd · SE[acmout] · M` carries one factor more than the
+        // existing bank gates. **The ceiling itself does not move**, which is the
+        // only thing the 116 B/column slope depends on.
+        {
+            use p3_air::symbolic::get_symbolic_constraints;
+            let cs = get_symbolic_constraints::<F, _>(&air, AirLayout::from_air::<F>(&air));
+            let mut hist = std::collections::BTreeMap::new();
+            for c in &cs {
+                *hist.entry(c.degree_multiple()).or_insert(0usize) += 1;
+            }
+            let (want_n, want_deg4) = match (cfg!(feature = "q69-latch"), cfg!(feature = "q215-rho")) {
+                (false, false) => (873, 13),
+                (true, false) => (880, 13),
+                (false, true) => (930, 15),
+                (true, true) => (937, 15),
+            };
+            assert_eq!(cs.len(), want_n, "symbolic constraint count");
+            assert_eq!(hist.get(&4).copied().unwrap_or(0), want_deg4, "deg-4 constraints");
+            assert_eq!(hist.keys().max(), Some(&4), "nothing above degree 4");
+        }
     }
 
     /// 🔴 Executes what QUM-67's correction 2 reasoned from source and did not
@@ -2961,5 +3315,357 @@ mod tests {
         assert_eq!(output, reference::keccak_f(&input));
         let output2 = NarrowKeccakAir::extract_state(&trace, 48);
         assert_eq!(output2, reference::keccak_f(&output));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #215 (i) / #219 option 4 — the one-permutation form.
+    //
+    // `narrow.rs`'s own comment says the equality banks are the soundness core,
+    // and #215's ruling says a third bank without its own tamper test is not a
+    // third bank. These are that, plus the two properties the ruling asked to
+    // have removed rather than documented.
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "q215-rho")]
+    mod q215 {
+        use super::*;
+
+        /// Both derivations, recomputed against the reference permutation rather
+        /// than against the circuit that produced them.
+        #[test]
+        fn q215_rho_derivations_match_the_reference() {
+            let nf0 = [0x1122_3344_5566_7788u64, 0x99aa, 0xbbcc, 0xddee];
+            assert_eq!(derive_output_rho(&nf0, 0), nf0, "rho'_0 IS nf_0");
+            let mut st = [0u64; 25];
+            st[..4].copy_from_slice(&nf0);
+            st[4] = 1 << 3;
+            st[5] = 1;
+            st[16] = 1 << 63;
+            assert_eq!(
+                derive_output_rho(&nf0, 1),
+                digest(&reference::keccak_f(&st)),
+                "rho'_1 = H(nf_0 ‖ D_P)"
+            );
+            assert_ne!(
+                derive_output_rho(&nf0, 0),
+                derive_output_rho(&nf0, 1),
+                "the two outputs' seeds must differ"
+            );
+        }
+
+        /// 🔴 The domain tag is load-bearing, not hygiene — executed rather than
+        /// argued. `ROLE_ANK`'s absorb has the SAME lane shape as `ROLE_ARHO`'s
+        /// (`x ‖ D ‖ pad@320`), so without `D_P` an attacker setting
+        /// `sk := nf_0` — a **public** value — would obtain `nk == rho'`.
+        ///
+        /// This asserts the two functions are actually separated: `H(nf_0 ‖ D_P)`
+        /// ≠ `H(nf_0 ‖ D_N)`, i.e. the collision the tag closes is closed.
+        #[test]
+        fn q215_domain_p_separates_arho_from_ank() {
+            let nf0 = [7u64, 8, 9, 10];
+            // The ANK absorb with sk := nf_0 — what an attacker can compute.
+            let mut ank = [0u64; 25];
+            ank[..4].copy_from_slice(&nf0);
+            ank[4] = 1; // D_N at z0
+            ank[5] = 1;
+            ank[16] = 1 << 63;
+            let nk_of_nf0 = digest(&reference::keccak_f(&ank));
+            assert_ne!(
+                derive_output_rho(&nf0, 1),
+                nk_of_nf0,
+                "without D_P these are the same function and nk == rho'"
+            );
+            // And the tag really is the only difference: flipping D_N to D_P in
+            // that same state reproduces the derivation exactly.
+            let mut arho = ank;
+            arho[4] = 1 << 3;
+            assert_eq!(derive_output_rho(&nf0, 1), digest(&reference::keccak_f(&arho)));
+        }
+
+        /// The bucket the builder emits satisfies the AIR, and the output
+        /// commitments it publishes really are openings at the DERIVED seeds.
+        #[test]
+        fn q215_full_bucket_satisfies_with_derived_rho() {
+            let (inst, _) = test_bucket(7, 5, 3, 9);
+            let pvs: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+            let trace = inst.air.generate_trace::<F>(0);
+            check_constraints(&inst.air, &trace, &pvs);
+            assert_eq!(BUCKET_PERMS, 84, "one added permutation, not two");
+            // The program really does place ARHO immediately before output 1's
+            // ACMOUT — the adjacency the whole binding rests on.
+            let p = &inst.air.program;
+            let arho = p.iter().position(|r| *r == ROLE_ARHO).expect("ARHO emitted");
+            assert_eq!(p[arho + 1], ROLE_ACMOUT, "ARHO must feed output 1's ACMOUT");
+            assert_eq!(p[arho + 2], ROLE_BCM2, "…which is output 1's");
+            assert_eq!(
+                p.iter().filter(|r| **r == ROLE_ARHO).count(),
+                1,
+                "exactly one ARHO — a second would be a second derivation"
+            );
+        }
+
+        fn slot_of(program: &[u32; PROGRAM_SLOTS], role: u32, nth: usize) -> usize {
+            program.iter().enumerate().filter(|(_, r)| **r == role).map(|(i, _)| i).nth(nth).unwrap()
+        }
+
+        /// `cm = H(value ‖ rkm ‖ rho ‖ rseed)` off one ACMOUT slot's own witness
+        /// — so a forged instance can publish the commitment that MATCHES its
+        /// forgery instead of an obviously-wrong one.
+        fn cm_of_slot(w: &SlotWitness) -> [u64; 4] {
+            let mut st = [0u64; 25];
+            st[0] = w.w[4];
+            st[1..5].copy_from_slice(&w.w[..4]);
+            st[5..13].copy_from_slice(&w.w[5..13]);
+            st[13] = 1;
+            st[16] = 1 << 63;
+            digest(&reference::keccak_f(&st))
+        }
+
+        /// 🔴 **The forgery a cheating prover would actually build**, not a bit
+        /// flip. It picks output `j`'s seed freely AND publishes the commitment
+        /// that opens at it, so the ACMOUT injection, the `PV_CM` bind and the
+        /// balance are all satisfied — **every binding except the third bank.**
+        ///
+        /// That distinction is the whole value of these tests. A test that flips
+        /// one rho' bit and leaves `PV_CM` alone passes on `main` too, because
+        /// the commitment bind catches it; it says nothing about whether the seed
+        /// is bound. Pre-#215 this construction VERIFIES — rho' is *"all
+        /// witness"* — which is exactly the faerie-gold hole.
+        ///
+        /// Returns whether the forged instance satisfies the AIR.
+        fn forged_seed_verifies(j: usize, seed: [u64; 4]) -> bool {
+            let (inst, _) = test_bucket(7, 5, 3, 9);
+            let mut air = inst.air;
+            let s = slot_of(&air.program, ROLE_ACMOUT, j);
+            air.slot_witness[s].w[5..9].copy_from_slice(&seed);
+            let mut pv = inst.pvs.clone();
+            let base = if j == 0 { PV_CM1 } else { PV_CM2 };
+            for (k, c) in pv_chunks(&cm_of_slot(&air.slot_witness[s])).iter().enumerate() {
+                pv[base + k] = *c;
+            }
+            let pvs: Vec<F> = pv.iter().map(|v| F::from_u32(*v)).collect();
+            let trace = air.generate_trace::<F>(0);
+            check_all_constraints(&air, &trace, &pvs, Some(10)).is_ok()
+        }
+
+        /// The tamper test the ruling requires, for output 0: its seed must be
+        /// `nf_0` and nothing else. The forgery below is well-formed in every
+        /// other respect, so the third bank's close against `PV_NF1` is the only
+        /// thing that can refuse it.
+        #[test]
+        fn q215_output_0_rho_is_bound_to_nf_0() {
+            let (probe, _) = test_bucket(7, 5, 3, 9);
+            // Sanity, so a broken helper cannot make this vacuous: the HONEST
+            // seed verifies through the same path.
+            assert!(
+                forged_seed_verifies(0, derive_output_rho(&probe.nf[0], 0)),
+                "the honest seed must verify — the helper itself is wrong"
+            );
+            assert!(
+                !forged_seed_verifies(0, [0xdead_beef, 1, 2, 3]),
+                "a prover-chosen rho'_0 with a matching cm VERIFIED — output 0's \
+                 seed is a free witness and faerie gold is open"
+            );
+        }
+
+        /// The same for output 1, whose close is against **zero** rather than a
+        /// public value: its seed must equal the ARHO digest arriving on the
+        /// chain as `a[0..4]`.
+        #[test]
+        fn q215_output_1_rho_is_bound_to_the_arho_digest() {
+            let (probe, _) = test_bucket(7, 5, 3, 9);
+            assert!(
+                forged_seed_verifies(1, derive_output_rho(&probe.nf[0], 1)),
+                "the honest seed must verify — the helper itself is wrong"
+            );
+            assert!(
+                !forged_seed_verifies(1, [0xc0ff_ee00, 9, 9, 9]),
+                "a prover-chosen rho'_1 with a matching cm VERIFIED"
+            );
+            // And the near miss: output 1 may not reuse output 0's seed, which
+            // is the value most obviously to hand.
+            assert!(
+                !forged_seed_verifies(1, probe.nf[0]),
+                "rho'_1 = rho'_0 VERIFIED — the two derivations are not separated"
+            );
+        }
+
+        /// 🔴 The one I most expected to be missed. `ROLE_ARHO` takes `nf_0` as a
+        /// **witness**, so if that witness were unbound the prover would choose
+        /// the ARHO digest — and binding output 1's seed to a digest of the
+        /// prover's choosing binds nothing at all. #215's hole would still be
+        /// open for output 1, one indirection further back.
+        ///
+        /// Window A closes ARHO's own `W5..8` against `PV_NF1`, and this is what
+        /// says so. The forgery is again complete: `nf_0'` is substituted, output
+        /// 1's seed is set to the digest that substitution actually produces, and
+        /// its commitment is republished to match — so window C and every bind
+        /// are satisfied and **only window A can refuse it.**
+        #[test]
+        fn q215_arho_absorbs_the_real_nf_0() {
+            let (inst, _) = test_bucket(7, 5, 3, 9);
+            let mut air = inst.air;
+            let arho = slot_of(&air.program, ROLE_ARHO, 0);
+            let out1 = slot_of(&air.program, ROLE_ACMOUT, 1);
+            let mut nf_forged = inst.nf[0];
+            nf_forged[2] ^= 1 << 40;
+            air.slot_witness[arho].w[5..9].copy_from_slice(&nf_forged);
+            let seed = derive_output_rho(&nf_forged, 1);
+            air.slot_witness[out1].w[5..9].copy_from_slice(&seed);
+            let mut pv = inst.pvs.clone();
+            for (k, c) in pv_chunks(&cm_of_slot(&air.slot_witness[out1])).iter().enumerate() {
+                pv[PV_CM2 + k] = *c;
+            }
+            let pvs: Vec<F> = pv.iter().map(|v| F::from_u32(*v)).collect();
+            let trace = air.generate_trace::<F>(0);
+            assert!(
+                !check_all_constraints(&air, &trace, &pvs, Some(10)).is_ok(),
+                "ARHO absorbed a forged nf_0 and the instance VERIFIED — rho'_1 \
+                 is prover-chosen through the derivation"
+            );
+        }
+
+        /// The span marker is the program's, on all 262,144 rows. `M` must be
+        /// high across exactly output 1's `ACMOUT → BCM2` span and nowhere else;
+        /// both edges are pinned separately, because the close it switches fires
+        /// on a perm's LAST row and an off-by-one either way breaks the
+        /// construction. (This is `q69_latch_span_is_exactly_chain_1`'s shape,
+        /// for the same reason.)
+        #[test]
+        fn q215_marker_span_is_exactly_output_1() {
+            let (inst, _) = test_bucket(7, 5, 3, 9);
+            let trace = inst.air.generate_trace::<F>(0);
+            let arho = slot_of(&inst.air.program, ROLE_ARHO, 0);
+            let bcm2 = slot_of(&inst.air.program, ROLE_BCM2, 0);
+            // Set at ARHO's close row (the last row of perm `arho`), cleared at
+            // BCM2's. Rows are indexed perm-major: perm p owns
+            // [p*ROWS_PER_PERM, (p+1)*ROWS_PER_PERM).
+            let hi_from = (arho + 1) * ROWS_PER_PERM;
+            let hi_to = (bcm2 + 1) * ROWS_PER_PERM; // exclusive
+            let height = 1usize << inst.air.log_height;
+            let mut edges = 0usize;
+            for t in 0..height {
+                let m = trace.get(t, OM_COL).unwrap();
+                let want_hi = t >= hi_from && t < hi_to;
+                assert_eq!(
+                    m == F::ONE,
+                    want_hi,
+                    "marker wrong at row {t} (span {hi_from}..{hi_to})"
+                );
+                if t > 0 && (trace.get(t - 1, OM_COL).unwrap() == F::ONE) != want_hi {
+                    edges += 1;
+                }
+            }
+            assert_eq!(edges, 2, "exactly one rise and one fall in the epoch");
+            assert_eq!(trace.get(0, OM_COL).unwrap(), F::ZERO, "pinned at row 0");
+        }
+
+        /// 🔴 The accident #215 asked to have REMOVED rather than pinned.
+        ///
+        /// Under (i) (`rho'_j = nf_j`) a prover passing the same note twice
+        /// yields two outputs with an identical rho', and the only thing
+        /// stopping it is `apply_state`/`validate_body` — a **consensus** check,
+        /// load-bearing by accident. Under option 4 both seeds derive from slot
+        /// 0 alone under distinct derivations, so `nf_1 == nf_2` **cannot**
+        /// produce `rho'_0 == rho'_1` at all.
+        ///
+        /// This asserts the property directly on the derivation: for any two
+        /// nullifiers whatsoever, including equal ones, the two seeds differ.
+        #[test]
+        fn q215_equal_nullifiers_cannot_equalise_the_seeds() {
+            for nf in [[0u64; 4], [1, 1, 1, 1], [u64::MAX; 4], [3, 5, 7, 11]] {
+                assert_ne!(
+                    derive_output_rho(&nf, 0),
+                    derive_output_rho(&nf, 1),
+                    "the seeds are distinct by derivation, not by nf_1 ≠ nf_2"
+                );
+            }
+            // And the seeds do not depend on nf_1 at all: two buckets differing
+            // ONLY in input 1 publish the same output commitments.
+            let mk = |sk1: [u64; 4]| {
+                let inputs = [
+                    TxInput { sk: [0xa, 0xb, 0xc, 0xd], value: 100, rho: [1, 2, 3, 4], rseed: [5, 6, 7, 8], d: [0, 0] },
+                    TxInput { sk: sk1, value: 50, rho: [9, 10, 11, 12], rseed: [13, 14, 15, 16], d: [0, 0] },
+                ];
+                let outputs = [
+                    TxOutput { value: 90, rkm: [2; 4], rho: [0; 4], rseed: [4; 4] },
+                    TxOutput { value: 55, rkm: [5; 4], rho: [0; 4], rseed: [7; 4] },
+                ];
+                build_bucket(18, &inputs, &outputs, 5)
+            };
+            let a = mk([1, 1, 1, 1]);
+            let b = mk([2, 2, 2, 2]);
+            assert_ne!(a.nf[1], b.nf[1], "input 1 really did change");
+            assert_eq!(
+                a.cm_out, b.cm_out,
+                "both seeds come from nf_0, so slot 1 cannot move an output"
+            );
+        }
+
+        /// 🔴 Faerie gold, direct. Two outputs forced to the same opening —
+        /// identical `(value, rkm, rho', rseed)` — must be unsatisfiable, which
+        /// is the whole point of #215. The prover here does the strongest thing
+        /// available to it: copy output 0's witness wholesale into output 1,
+        /// including the seed, and declare the resulting duplicate commitment.
+        #[test]
+        fn q215_two_identical_output_notes_are_unsatisfiable() {
+            let (inst, _) = test_bucket(7, 5, 6, 6);
+            let s0 = slot_of(&inst.air.program, ROLE_ACMOUT, 0);
+            let s1 = slot_of(&inst.air.program, ROLE_ACMOUT, 1);
+            let mut air = inst.air;
+            air.slot_witness[s1] = air.slot_witness[s0];
+            // Declare the duplicate commitment honestly, so the failure is the
+            // seed binding and not a cm/PV mismatch: cm_out[1] := cm_out[0].
+            let mut pv = inst.pvs.clone();
+            for j in 0..16 {
+                pv[PV_CM2 + j] = pv[PV_CM1 + j];
+            }
+            let pvs: Vec<F> = pv.iter().map(|v| F::from_u32(*v)).collect();
+            let trace = air.generate_trace::<F>(0);
+            assert!(
+                !check_all_constraints(&air, &trace, &pvs, Some(10)).is_ok(),
+                "two identical output notes satisfied the AIR — faerie gold"
+            );
+        }
+
+        /// 🔴 The dependency the task book asks to have NAMED in a test.
+        ///
+        /// `rho'` uniqueness is inherited from `nf_0`'s, and `nf_0`'s is the
+        /// double-spend rule consensus enforces — which is only sound because
+        /// **slot 0 is a real spend**. That is not something the circuit checks;
+        /// it is something the prover cannot express: the program ring is pinned
+        /// at row 0 (`narrow.rs`'s `pr_limb` / `when_first_row`) and the verifier
+        /// builds the AIR from its own canonical instance, overwriting only
+        /// `.pvs`.
+        ///
+        /// So this test asserts the two structural facts the inheritance rests
+        /// on, and it is written to BREAK if either is lost:
+        ///
+        /// 1. slot 0 carries a full real input chain — `ANK → NF → BNF1 →
+        ///    ARKM → ACM → 32 × MERKLE → BANCHOR` — in the canonical program;
+        /// 2. under `q69-latch`, `dv` cannot relax slot 0 (the latch's span
+        ///    starts at `BNF2`), which `q69_dv_cannot_make_slot_0_a_dummy`
+        ///    proves in-circuit and this test cross-references by name.
+        #[test]
+        fn q215_uniqueness_inherits_from_slot_0_being_a_real_spend() {
+            let (inst, _) = test_bucket(7, 5, 3, 9);
+            let p = &inst.air.program;
+            let mut want = vec![ROLE_ANK, ROLE_NF, ROLE_BNF1, ROLE_ARKM, ROLE_ACM];
+            want.extend(std::iter::repeat(ROLE_MERKLE).take(MERKLE_DEPTH));
+            want.push(ROLE_BANCHOR);
+            assert_eq!(
+                &p[1..1 + want.len()],
+                &want[..],
+                "slot 0 must be a full real spend — rho' uniqueness inherits from \
+                 nf_0, and nf_0's inherits from the double-spend rule, which is \
+                 only sound for a genuinely committed note"
+            );
+            // The seed of output 0 IS that chain's nullifier. If slot 0 ever
+            // became relaxable, this is the line that stops meaning what it says.
+            assert_eq!(
+                derive_output_rho(&inst.nf[0], 0),
+                inst.nf[0],
+                "rho'_0 = nf_0 — the structural half of the ruling"
+            );
+        }
     }
 }
