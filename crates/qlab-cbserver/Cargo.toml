@@ -14,7 +14,7 @@ qlab-note = { path = "../qlab-note" }
 # The consensus Merkle node hash for the commitment tree/frontier, and cm packing.
 qlab-air = { path = "../qlab-air" }
 # Real devnet block/header/chain types for the data source.
-qlab-devnet = { path = "../qlab-devnet" }
+qlab-devnet = { path = "../qlab-devnet", optional = true }
 # Minimal maintained blocking HTTP/1.1 server (no async runtime). Pinned exactly
 # per bench discipline. Chosen over axum/hyper for a localhost reference server.
 tiny_http = "=0.12.0"
@@ -33,3 +33,13 @@ qlab-wallet = { path = "../qlab-wallet" }
 [[bin]]
 name = "cbreport"
 path = "src/bin/cbreport.rs"
+required-features = ["devnet"]
+
+[features]
+# The devnet fixture (`data`), the reference server over it (`server`),
+# `client::scan_local` and the `cbreport` bin. Default ON — every existing
+# consumer keeps exactly what it had. OFF for consumers that need only the
+# light-client scan (qumbra-ffi: iOS cannot build RandomX, which rides in via
+# qlab-devnet -> qlab-pow -> randomx-rs's C++ cmake).
+default = ["devnet"]
+devnet = ["dep:qlab-devnet"]
