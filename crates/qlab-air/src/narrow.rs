@@ -3529,6 +3529,68 @@ mod tests {
             );
         }
 
+        /// 🔴 **The dummy-composition seam** — stage 4's named adversarial case,
+        /// and the one place issue #219's latch and issue #215 (i)'s derivation
+        /// have to hold *at the same time*.
+        ///
+        /// Slot 1 is a declared dummy (`dv = 1`), off-tree, with its anchor bind
+        /// relaxed. Both output seeds must still derive from the **real** slot 0's
+        /// nullifier — which is exactly why option 4 sources both from `nf_0`
+        /// rather than per-slot — and a forged seed under that same dummy shape
+        /// must still be refused.
+        ///
+        /// Why the pairing matters: a dummy slot's nullifier is *invented by the
+        /// prover*, so if either seed had come from slot 1 the uniqueness
+        /// inheritance would rest on prover randomness instead of the checked
+        /// double-spend rule. The composition is what makes #219's dummies safe
+        /// for #215 (i), and it is asserted here rather than argued from the two
+        /// changes separately.
+        #[test]
+        fn q215_dummy_composition_keeps_both_seeds_on_the_real_nullifier() {
+            let inst = dummy1_instance();
+            assert!(inst.air.dv, "precondition: slot 1 is a declared dummy");
+
+            // (a) The honest dummy-shaped instance satisfies the AIR.
+            let pvs: Vec<F> = inst.pvs.iter().map(|v| F::from_u32(*v)).collect();
+            let trace = inst.air.generate_trace::<F>(0);
+            check_constraints(&inst.air, &trace, &pvs);
+
+            // (b) 🔴 Both seeds come off the REAL slot 0's nullifier, and neither
+            //     touches slot 1's invented one.
+            let p = &inst.air.program;
+            let out0 = slot_of(p, ROLE_ACMOUT, 0);
+            let out1 = slot_of(p, ROLE_ACMOUT, 1);
+            let arho = slot_of(p, ROLE_ARHO, 0);
+            let seed = |sl: usize| -> [u64; 4] {
+                inst.air.slot_witness[sl].w[5..9].try_into().unwrap()
+            };
+            assert_eq!(seed(out0), derive_output_rho(&inst.nf[0], 0), "ρ′_0 = nf_0");
+            assert_eq!(seed(out1), derive_output_rho(&inst.nf[0], 1), "ρ′_1 = H(nf_0 ‖ D_P)");
+            assert_eq!(seed(arho), inst.nf[0], "ARHO absorbs slot 0's nullifier");
+            assert_ne!(
+                seed(arho),
+                inst.nf[1],
+                "the dummy slot's INVENTED nullifier must feed no seed — if it                  did, ρ uniqueness would rest on prover randomness"
+            );
+
+            // (c) 🔴 And a forged seed under the SAME dummy shape is refused. The
+            //     forgery is complete: the seed is the prover's choice and the
+            //     commitment is republished to open at it, so every bind except
+            //     the third bank is satisfied.
+            let mut air = inst.air;
+            air.slot_witness[out1].w[5..9].copy_from_slice(&[0xbad_5eedu64, 1, 2, 3]);
+            let mut pv = inst.pvs.clone();
+            for (k, c) in pv_chunks(&cm_of_slot(&air.slot_witness[out1])).iter().enumerate() {
+                pv[PV_CM2 + k] = *c;
+            }
+            let pvs: Vec<F> = pv.iter().map(|v| F::from_u32(*v)).collect();
+            let trace = air.generate_trace::<F>(0);
+            assert!(
+                !check_all_constraints(&air, &trace, &pvs, Some(10)).is_ok(),
+                "a forged seed under the dummy shape VERIFIED — the latch's                  relaxation must not reach the third bank"
+            );
+        }
+
         /// 🔴 The dependency the task book asks to have NAMED in a test.
         ///
         /// `rho'` uniqueness is inherited from `nf_0`'s, and `nf_0`'s is the
