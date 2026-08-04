@@ -1,0 +1,4 @@
+module QumbraFFI {
+    header "qumbra_ffi.h"
+    export *
+}
