@@ -231,16 +231,28 @@ fn a_recipient_finds_its_output_from_a_restarted_nodes_committed_discovery() {
     }
     assert_eq!(stranger_found, 1, "the stranger finds its own single output and no more");
 
-    // ---- 4. Served == committed, as a byte identity. -----------------------
+    // ---- 4. Served == committed PREFIX, as a byte identity. ----------------
+    //
+    // 🔴 Since issue #188 (a) the committed region is `group_contents ‖
+    // payloads` and serving projects the prefix — the relocated payload section
+    // is committed but not on the compact wire. Still a projection: these bytes
+    // are copied out of the block's own committed bytes, not rebuilt.
     let tx_block = blocks.iter().find(|b| b.height == tx_height).expect("the payment's block");
     for (i, group) in tx_block.groups.iter().enumerate() {
+        let prefix = qlab_cbserver::codec::committed_contents_prefix(&committed_groups[i])
+            .expect("a stored block's committed region decodes");
         let mut expected = Vec::new();
         qlab_cbserver::codec::write_varint(&mut expected, i as u64);
-        expected.extend_from_slice(&committed_groups[i]);
+        expected.extend_from_slice(prefix);
         assert_eq!(
             qlab_cbserver::codec::encode_group(group),
             expected,
-            "served group {i} is varint(position) ‖ the block's own committed bytes"
+            "served group {i} is varint(position) ‖ the block's own committed PREFIX"
+        );
+        // The other half: the payload section IS there, committed, unserved.
+        assert!(
+            committed_groups[i].len() > prefix.len(),
+            "group {i}'s committed region must carry a payload section"
         );
     }
 
