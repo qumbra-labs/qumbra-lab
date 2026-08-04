@@ -533,6 +533,28 @@ at `acceptance.rs:18-40`. Four steps:
 deterministic**. Assert on the value and the discipline tokens, never on exact decoy-dependent
 output.
 
+## 🏁 Stage 5 — the mint, measured
+
+| | value |
+|---|---|
+| `CONSENSUS_WIRE_BYTES` | **148,625 B** (was 145,609) |
+| genesis identity | **`138e1524…addb`** (was `566d4ed0…f80f`) |
+| `GENESIS_FORMAT_VERSION` | 3 → **4** |
+| frozen digest | `19564eca…4571` → **`a54e73ce…7b5b`** |
+| revision identifier | **`v1.0`, unchanged — deliberately** |
+| acceptance bar | **1218 / 0 / 1**, exit 0 |
+| consensus prove | **12.21 GB peak / 12.16 GB RSS / 3.06 s** (one sample) |
+
+Genesis reproduced twice through the real CLI, with **byte-identical output
+directories** — `genesis.qmb` plus all 21 committee key files.
+
+🟡 **A near-miss worth keeping:** my first prove measurement wrapped `cargo test` in
+`/usr/bin/time -l` and got **25 MB** — it measured *cargo*, not the forked test binary. That
+is the exact trap `m4assembly`'s driver warns about (*"run directly … no cargo inside any
+measurement window"*), which I honoured there and not here. Re-measured against the binary.
+**A wrong number is worse than no number**, and this one would have looked plausible enough to
+survive.
+
 ## Where this baton stands
 
 | stage | state |
