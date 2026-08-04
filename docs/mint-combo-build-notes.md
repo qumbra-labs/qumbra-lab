@@ -453,6 +453,38 @@ worked around: `qlab-note::note::commitment_matches_qlab_air_build_bucket` and
 
 ---
 
+---
+
+## 🟢 Stage 4's interior gate — MEASURED (coordinator item 3, 2026-08-04)
+
+`scripts/rig run -- /usr/bin/time -l ./target/release/qlab-bench m4assembly --lane b2 ac` at
+width 643, twice.
+
+| | run 1 | run 2 | D3 baseline (pre-mint) |
+|---|---|---|---|
+| **peak memory footprint** | **19.75 GB** | **20.80 GB** | 19.75 / 20.42 GB |
+| max RSS | 17.73 GB | 18.66 GB | — |
+| leaf L / R proof | 839.2 KB | 839.2 KB | 839.2 KB |
+| interior root proof | 1.65 MB | 1.65 MB | 1.65 MB |
+| interior rows | 2^19 | 2^19 | 2^19 |
+| swaps | 0 | 0 | 0 |
+
+**No breach: worst sample 20.80 GB against the 32 GB envelope — 35 % margin.** The ≥2× STOP
+would need 64 GB.
+
+🔴 **The structural result matters more than the footprint.** Neither level's proof size or
+height moved *at all* — byte-identical to #24 D3's record. The 26 columns grew the leaf gate's
+row consumption (F2 148 → 154 blocks, which is what broke the 64 tests) **without crossing
+either power-of-two boundary**, and memory follows heights, not cells.
+
+🟡 **The +0.38 GB on the high sample is not attributable.** D3's own two runs spread 0.67 GB on
+a byte-identical tree and my low sample reproduces D3's low sample exactly; both metrics moved
+together between my runs. Read as unchanged within the instrument's spread. A real delta needs
+paired interleaved runs against a pre-mint binary in one session — not done.
+
+**Not verified: the b4 interior fallback lane** (31.21 GB pre-mint, ~2.5 % margin — the tight
+one). One more run; not taken.
+
 ## Where this baton stands
 
 | stage | state |
@@ -460,6 +492,6 @@ worked around: `qlab-note::note::commitment_matches_qlab_air_build_bucket` and
 | 0 — mandatory reading + citation check | ✅ committed; both conflicts raised, ruled, task book corrected (PR #251) |
 | 1 — option 4, the one-permutation form | ✅ committed, measured, gate cleared |
 | 2 — both changes unconditional | ✅ committed; aggregation-lane literals fixed; full bar running |
-| 3 — #188 (a), the discovery payload | ⬜ **designed above, not built** |
-| 4 — measurement battery + the suite | ⬜ partially pre-paid: the proof/width/degree/census battery is done and test-locked; peak RSS and the adversarial set beyond stage 1's ten tests are not |
+| 3 — #188 (a), the discovery payload | 🔴 **BLOCKED on #188's premise, not on the design.** Placement ratified and built against; but (a)'s "rkm is the recipient's own key material" is false for an `Ivk`, and `/v1/compact` carries no nullifier so a light client cannot derive ρ. Two findings reported on #219; payload core preserved on `claude/mint-combo-stage3a-wip` (`186d15f`, does not compile by design) |
+| 4 — measurement battery + the suite | 🟡 proof/width/degree/census done and test-locked; **the interior-prove gate is measured and clear (above)**; still owed: the dummy-composition adversarial case, prove time, the b4 interior fallback lane |
 | 5 — genesis + `CONSENSUS_WIRE_BYTES` → 148,625 | ⬜ not started; the four other break sites are already moved (stage 2), so what remains is the constant, the fixture, the hash reproduced twice, and the params-audit row |
