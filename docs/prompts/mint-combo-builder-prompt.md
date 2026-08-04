@@ -96,12 +96,20 @@ unreachable after the mint. The unfeatured wire pin moves to the measured stage-
 expected 148,161 B (sum), **measured value wins and is the headline**. Gate: quotient
 degree still 4; `dv=0` still the unchanged 2×2 (PR #239's leak test carries over).
 
-**Stage 3 — #188 (a), the discovery payload (~1–2 sh).**
-The 56 B/note AEAD payload (`value ‖ rseed`) per the option-(a) decision, placed per
-`discovery-on-the-consensus-wire.md` (reuse ratified compact bytes; `discovery_len`;
-commitment-equality binding; coinbase excluded). This changes **body bytes, not proof
-bytes** — assert that: the stage-2 proof figure must not move in stage 3. Golden compact
-framing must not move either; if either moves, STOP.
+**Stage 3 — #188 (a) as amended: relocate the payload, do not shrink it (~1–2 sh).**
+
+> **Corrected 2026-08-04** ([amendment](https://github.com/qumbra-labs/qumbra-lab/issues/188#issuecomment-5175013679)).
+> The 56 B form's premise failed one scanner-class down (an `Ivk` deliberately cannot
+> derive `rkm` — issue #32; `/v1/compact` carries no nullifier, so a light client cannot
+> derive ρ). The plaintext stays 104 B (120 B with tag).
+
+The full 120 B AEAD payload, relocated into the committed discovery region per the
+accepted placement position (`group_contents ‖ payloads`, fixed-width per entry, D4
+order; `/v1/compact` projects only the prefix). `scan` verifies `cm` against the entry
+for every scanner class, and a full-body observer cross-checks payload-ρ against the
+derived ρ. This changes **body bytes, not proof bytes** — assert that: the stage-2 proof
+figure must not move in stage 3. Golden compact framing must not move either; if either
+moves, STOP.
 Then close the loop PR #244 left open: **an end-to-end test where a wallet's own key,
 paid on a devnet, finds its payment through `scan` over HTTP** — value and rseed arriving
 via the payload, ρ read off `nf_0` per option 4.
