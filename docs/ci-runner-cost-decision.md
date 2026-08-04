@@ -441,7 +441,14 @@ From `gh api /organizations/qumbra-labs/settings/billing/usage` on 2026-08-03:
 | August spend at 08-03 | **$14.14 of $20.00** | billing page + usage API agree |
 | where it went | **100 % one SKU: `Actions Linux ARM 8-core`** | 1,010 billed minutes ≈ $0.014/min, three usage items ($8.76 + $4.84 + $0.53) |
 | standard `Actions Linux` minutes | 87 min, **$0** | inside the plan's included pool — the pre-filter has never cost money |
-| headroom remaining | $5.86 ≈ **8 suite runs** at §4's ~$0.7 | days, at the post-#210 acceptance cadence |
+| headroom remaining | $5.86 ≈ **11 suite runs** at $0.55 each | days, at the post-#210 acceptance cadence |
+
+⚠️ **The last row previously read "≈ 8 suite runs at §4's ~$0.7". Corrected 2026-08-04, twice
+over.** §4's figure is **$0.49**, not $0.7 — §4 exists in part to retract the $0.7 that `PR #191`
+recorded, so citing it back was a self-citation of a number this document had already withdrawn.
+And $0.49 is the wrong figure to reach for anyway: it is a mean over a **pre-#210 population**
+that included builder-push runs cancelled early. The right per-run cost is derived from this
+section's own rate against this section's own population — see the recalibration below.
 
 So the product-level cap conflated two flows with nothing in common: a paid SKU that is 100 % of
 the spend, and a free tier that is 100 % of the always-on guard.
@@ -453,9 +460,10 @@ the spend, and a free tier that is 100 % of the always-on guard.
 | **new** | `SkuPricing` on `actions_linux_8_core_arm` | $50 | **Yes** | the hard stop, on the only thing that spends |
 | **reshaped** | `ProductPricing` on `actions` | $60 | **No — alert only** | early warning for anything that is *not* the big runner: storage overage, standard minutes past the included pool |
 
-$50 ≈ 70 suite runs/month ≈ 2–3 acceptances/day of headroom. **It is an interim guard, not the §8
-hosting decision** — recalibrate after a week of label-gated data, and re-derive entirely if A vs
-F resolves to a self-hosted runner.
+$50 ≈ **91 suite runs/month ≈ 3 acceptances/day** (corrected 2026-08-04 from "70 ≈ 2–3", same
+cause as the row above). **It is an interim guard, not the §8 hosting decision** — recalibrate
+after a week of label-gated data, and re-derive entirely if A vs F resolves to a self-hosted
+runner.
 
 Applied via the budgets API (needs `admin:org`):
 
@@ -470,6 +478,48 @@ PATCH /organizations/qumbra-labs/settings/billing/budgets/7adffff2-…
 Verification is the same API: `GET …/settings/billing/budgets` must show both rows as above.
 One repeatable trick worth recording: **the valid SKU identifiers are not listable anywhere, but a
 `POST` with a bogus `budget_product_sku` returns the full legal list in its error message.**
+
+### Recalibration (2026-08-04) — partial, and it says the $50 has no margin
+
+§10 asked for a recalibration after a week of label-gated data. This is **2.3 days**, not a week,
+and it is recorded now only because correcting the arithmetic above required deriving the per-run
+cost properly. Treat it as an interim reading.
+
+Every `suite-arm64.yml` entry since the gate landed (`c9b5055`, 2026-08-02T01:14:50Z) through
+2026-08-04T08:46Z:
+
+```
+21m cancelled · 39m · 39m · 39m · 40m · 39m · 38m · 39m · 0m skipped
+```
+
+| | value | how |
+|---|---|---|
+| completed acceptances | **7** | 39.0 min mean, range 38–40 — a remarkably tight distribution |
+| cost per acceptance | **$0.55** | $0.014/min × 39.0 min, both from this section |
+| elapsed | 55.5 h | gate landed → now |
+| **cadence** | **3.03 acceptances/day** | 7 / 2.31 days |
+| post-gate spend | $4.12 | 294 metered minutes × $0.014 |
+| **projected month** | **~$54** | 91 acceptances × $0.55, plus ~13 cancelled runs × $0.29 |
+
+🔴 **$50 is roughly one month of the observed cadence, with no margin — it will trip near month
+end rather than act as a ceiling nobody reaches.** That is not an argument to raise it: a cap that
+occasionally trips is doing its job, and the SKU split means tripping it no longer takes the
+pre-filter down with it. It is an argument to expect it and to have §8 resolved before it happens.
+
+The `0m skipped` entry is the label gate working correctly — a non-`verify` label fired the
+workflow and the job's `if:` declined it, at no cost.
+
+**Method note, because it is the mistake most likely to be repeated.** An earlier reading of this
+same data gave **6.9 runs/day** by dividing the run count by the span *between the first and last
+run*. That silently excludes idle time — here, a 24-hour gap with no acceptances at all — and
+inflates the cadence by more than 2×. Divide by **elapsed wall-clock since the gate**, not by the
+window the runs happen to occupy.
+
+⚠️ **One figure in the 08-03 table has already expired.** Standard `Actions Linux` minutes were
+`87 min, $0` inside the plan's included pool. As of 2026-08-04 they are **171 min, $1.03** — the
+included pool has been exhausted, so *"the pre-filter has never cost money"* is now a statement
+about the past. It does not weaken the split; it strengthens it, because the $60 alert-only
+product budget is now watching a flow that genuinely spends rather than one that could not.
 
 ### One boundary this does not move
 
