@@ -6,11 +6,28 @@
 //! qumbra-opview --endpoints ./nodes.txt --timeout-ms 5000
 //! ```
 //!
-//! Exit codes: `0` = no critical divergence (including when nodes are down or an
-//! `sid` split was found), `2` = 🔴 `fid` or exact supply divergence, `1` = bad
-//! usage. Only a STOP-grade finding is non-zero — an operator wiring this into an
-//! alert must not be paged because a node is down or because a routine
-//! signed-variant split was recorded.
+//! Exit codes: `0` = no critical divergence (including when nodes are down, an
+//! `sid` split was found, or one node's head #1 is ahead of its head #3), `2` =
+//! 🔴 `fid` divergence, 🔴 **durable-head divergence** (issue #212), or exact supply
+//! divergence, `1` = bad usage. Only a STOP-grade finding is non-zero — an operator
+//! wiring this into an alert must not be paged because a node is down or because a
+//! routine signed-variant split was recorded.
+//!
+//! # Head #3 is on the view since issue #212
+//!
+//! `final`/`fid` read the committee tracker, which is **discarded at shutdown**. The
+//! `DFIN`/`DFINBH` columns and the third verdict block read the state machine's chain
+//! store — the head that survives a restart. On 2026-08-01 node1 held `final=1056`
+//! over a durable head of 1048 for hours and this tool reported four-way agreement
+//! the whole time, because the divergence was on no wire it could read.
+//!
+//! Two alarms, deliberately apart: **a cross-host durable split is a STOP** (exit `2`,
+//! beside `fid`, and worse — it is the head both hosts come back as), while **one
+//! node's head #1 vs head #3 is a FINDING** (exit `0`, greppable as `DURABLE_LAG` /
+//! `DURABLE_ABSENT` / `DURABLE_AHEAD`). A single poll cannot tell the node1 case from
+//! the ordinary window between a checkpoint finalizing and its body being applied, and
+//! a code that fires on every briefly-lagging node is a code operators mute — the same
+//! ruling #136 made for `UNAVAILABLE`.
 //!
 //! # `0` is "nothing divergent was detected", not "supply was verified" (#136)
 //!
@@ -59,9 +76,28 @@ OPTIONS:
 
 EXIT:
     0  no critical divergence was DETECTED (nodes may be down; an sid split is a
-       finding; supply coverage may be incomplete — see below)
-    2  fid divergence (R2 STOP) or non-zero scheduled-supply divergence
+       finding; a single node's head #1 vs head #3 disagreement is a finding;
+       supply coverage may be incomplete — see below)
+    2  fid divergence (R2 STOP), durable-head divergence (issue #212), or non-zero
+       scheduled-supply divergence
     1  usage error
+
+DFIN/DFINBH are head #3, the finalized head that SURVIVES A RESTART. FINAL/FID are
+head #1, the committee tracker, which is discarded at shutdown. Two hosts reporting
+the same DFIN with different DFINBH is a STOP and exits 2. One host whose FINAL is
+ahead of its own DFIN is a FINDING and exits 0 — one poll cannot tell a sustained
+divergence from the ordinary window between a checkpoint finalizing and its body
+being applied, so grep DURABLE_LAG, DURABLE_ABSENT and DURABLE_AHEAD and re-poll.
+Those tokens are stable and alerting may depend on them.
+
+DFINBH is a BLOCK HASH prefix and FID is a checkpoint identity. They render at one
+width through one helper and comparing them is meaningless: compare DFINBH between
+nodes at one DFIN, never against FID.
+
+A host that has not been rolled onto the 0x04 wire yet reports no durable head at
+all and renders INDETERMINATE with its wire version. That is expected during a
+one-host-at-a-time roll, is not a fault, and exits 0 — every other column on that
+host is still read, so the cross-host fid question stays answerable throughout.
 
 Exit 0 does not assert that supply was verified. A node whose state ledger trails
 fork choice reports coverage UNAVAILABLE and its supply figures are refused, which
@@ -164,5 +200,30 @@ mod tests {
             USAGE.contains("UNAVAILABLE"),
             "the EXIT: block must name the token a consumer greps for coverage:\n{USAGE}"
         );
+    }
+
+    /// **Issue #212: the operator text is the only place that tells a script author
+    /// which durable condition pages and which does not**, and that `DFINBH` must not
+    /// be compared to `FID`. Same contract as the assertions above: rewording is fine,
+    /// silently dropping any of these claims is not.
+    #[test]
+    fn usage_separates_the_durable_stop_from_the_durable_finding() {
+        for claim in [
+            // The severities, and which exit code each carries.
+            "durable-head divergence (issue #212)",
+            "is a STOP and exits 2",
+            "is a FINDING and exits 0",
+            // The greppable tokens a consumer depends on.
+            "DURABLE_LAG",
+            "DURABLE_ABSENT",
+            "DURABLE_AHEAD",
+            // 🔴 The trap.
+            "DFINBH is a BLOCK HASH prefix and FID is a checkpoint identity",
+            "comparing them is meaningless",
+            // The roll, so an operator mid-roll does not read INDETERMINATE as broken.
+            "has not been rolled onto the 0x04 wire yet",
+        ] {
+            assert!(USAGE.contains(claim), "the EXIT: block must state `{claim}`:\n{USAGE}");
+        }
     }
 }
