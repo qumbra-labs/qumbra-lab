@@ -729,6 +729,7 @@ mod tests {
                 .map(|cm| CompactEntry { cm: *cm, tag: [0xA5; 8], clue: ClueSlot::Empty })
                 .collect(),
         }];
+        let n_payloads = qlab_note::compact::contents_entry_count(&bundles);
         let tx = TxEntry::new(
             vec![9u8; 200],
             TxPublic {
@@ -739,6 +740,8 @@ mod tests {
                 fee: 1_000_000,
             },
             &bundles,
+            // Issue #188 (a): payloads are committed alongside the bundles.
+            &vec![vec![0u8; qlab_note::compact::PAYLOAD_LEN]; n_payloads],
         );
         assert!(tx.discovery.len() > 1, "a real group is not the empty encoding");
 

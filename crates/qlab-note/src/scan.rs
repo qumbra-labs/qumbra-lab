@@ -39,6 +39,7 @@ pub enum ScanMode {
 /// Everything produced for one `(tx, recipient)`: the compact bundle (shared
 /// ct + per-note entries) plus the AEAD payloads that a wallet full-fetches
 /// only for matched notes.
+#[derive(Clone)]
 pub struct EncryptedOutputs {
     pub bundle: RecipientBundle,
     /// AEAD ciphertext per output (index-aligned with `bundle.entries`).
@@ -150,16 +151,36 @@ pub fn scan(dk: &Dk, out: &EncryptedOutputs, mode: ScanMode) -> Vec<DetectedNote
         let Some(note) = Note::from_plaintext(&pt) else {
             continue;
         };
-        // Authenticity.
+        // 🔴 **The commitment recompute is a post-match OBLIGATION, in both
+        // modes.** It used to run only under `FoSkip`, on the reading that FO
+        // inside `decapsulate` plus the AEAD tag already established
+        // authenticity. They do — of the *ciphertext*. They say nothing about
+        // whether the note inside it is the note the **chain committed**, which
+        // is a different claim and the only one a wallet can spend on.
+        //
+        // A sender who encrypts note A while the entry carries `cm(B)` produces
+        // a payload that decapsulates cleanly and whose AEAD tag verifies, so the
+        // old `FullFo` arm accepted it and reported a note at a commitment the
+        // tree does not hold — unspendable, and detected as a balance only much
+        // later. Since issue #188 (a) the payload is **committed**, so that
+        // mismatch is a fact about the block rather than a serving accident, and
+        // a scanner must refuse it.
+        //
+        // This does not weaken `FullFo` or relax `anon-cca-fo-skip`'s boundary:
+        // the FO check still runs inside `decapsulate` on the standard path, and
+        // the recompute is added *after* the match rather than substituted for
+        // anything. `FoSkip` is unchanged — it was already carrying this check as
+        // its whole authenticity argument.
+        if !recompute_matches(&note, &entry.cm) {
+            continue;
+        }
         match mode {
             ScanMode::FullFo => {
-                // FO ran inside decapsulate; AEAD tag verified above. Accept.
+                // FO ran inside `decapsulate`; AEAD tag verified above; the
+                // recompute above binds the note to the committed `cm`.
             }
             ScanMode::FoSkip => {
-                // Authenticity via commitment recompute (FO skipped).
-                if !recompute_matches(&note, &entry.cm) {
-                    continue;
-                }
+                // Authenticity rests on the recompute above, FO skipped.
             }
         }
         found.push(DetectedNote { index: i, note });
@@ -260,6 +281,39 @@ mod tests {
             scan(&kp.dk, &out, ScanMode::FoSkip).is_empty(),
             "tampered cm must not yield an accepted note"
         );
+    }
+
+    /// 🔴 The check that was **present but asleep** under `FullFo`, made to fail.
+    ///
+    /// Both entries keep a self-consistent `(cm, tag)` pair — the pairs are
+    /// swapped between positions, so every tag still matches the `cm` beside it
+    /// and the detection filter passes. The payloads are untouched, so the AEAD
+    /// decrypt at each index also passes. The **only** thing wrong is that the
+    /// note a position opens is not the note that position's `cm` commits to.
+    ///
+    /// Before the recompute became unconditional, `FullFo` accepted both and
+    /// reported each note against the other's commitment — a note no tree holds.
+    #[test]
+    fn a_payload_that_does_not_open_the_committed_cm_is_refused_in_both_modes() {
+        let mut rng = StdRng::seed_from_u64(31);
+        let kp = generate_keypair(&mut rng);
+        let ns = [note(30), note(31)];
+        let honest = encrypt_to_recipient(&kp.ek, &ns, &mut rng);
+        // Control: honest outputs are found in both modes.
+        for mode in [ScanMode::FullFo, ScanMode::FoSkip] {
+            assert_eq!(scan(&kp.dk, &honest, mode).len(), 2, "{mode:?}: control");
+        }
+        let mut swapped = honest.clone();
+        swapped.bundle.entries.swap(0, 1);
+        for mode in [ScanMode::FullFo, ScanMode::FoSkip] {
+            let found = scan(&kp.dk, &swapped, mode);
+            assert!(
+                found.is_empty(),
+                "{mode:?}: a note that does not open its own committed cm was ACCEPTED \
+                 ({} found) — the recompute is not running",
+                found.len()
+            );
+        }
     }
 
     #[test]

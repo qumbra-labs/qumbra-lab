@@ -173,7 +173,12 @@ impl Devnet {
                 // generated chain commits to exactly what it serves.
                 let bundles: Vec<_> =
                     recipients.iter().map(|r| r.enc.bundle.clone()).collect();
-                body_txs.push(TxEntry::new(proof, public, &bundles));
+                // Issue #188 (a): the AEAD payloads are COMMITTED now, so the
+                // fixture's body carries them in D4 order rather than keeping
+                // them only in the served side table.
+                let payloads: Vec<Vec<u8>> =
+                    recipients.iter().flat_map(|r| r.enc.payloads.clone()).collect();
+                body_txs.push(TxEntry::new(proof, public, &bundles, &payloads));
                 stored_txs.push(StoredTx { recipients });
             }
 

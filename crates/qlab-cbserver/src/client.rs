@@ -892,7 +892,9 @@ mod tests {
                 };
                 let proof = format!("i215-fixture-proof:h{height}:tx{ti}").into_bytes();
                 let bundles: Vec<_> = stored.iter().map(|r| r.enc.bundle.clone()).collect();
-                body_txs.push(TxEntry::new(proof, public, &bundles));
+                let payloads: Vec<Vec<u8>> =
+                    stored.iter().flat_map(|r| r.enc.payloads.clone()).collect();
+                body_txs.push(TxEntry::new(proof, public, &bundles, &payloads));
                 stored_txs.push(StoredTx { recipients: stored });
             }
 

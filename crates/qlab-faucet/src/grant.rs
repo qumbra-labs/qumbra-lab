@@ -400,6 +400,12 @@ pub fn build_grant<R: CryptoRng>(
             fee,
         },
         &[to_recipient.bundle.clone(), to_self.bundle.clone()],
+        // Issue #188 (a) as amended: the REAL AEAD payloads are committed
+        // alongside the bundles, recipient-major (D4) — grant first, then
+        // change-to-self, matching `commitments = [grant_cm, change_cm]`. They
+        // are no longer only in the RPC side table, so a light server serving
+        // them is a projection of the body and cannot withhold one undetectably.
+        &[to_recipient.payloads.clone(), to_self.payloads.clone()].concat(),
     );
     let discovery = TxDiscovery {
         recipients: vec![

@@ -24,7 +24,8 @@
 use std::collections::HashSet;
 
 use qlab_note::compact::{
-    contents_commitments, decode_group_contents, encode_group_contents, CodecError,
+    committed_contents_prefix, contents_commitments, decode_committed_discovery,
+    encode_committed_discovery, CodecError, PAYLOAD_LEN,
 };
 use qlab_note::wire::RecipientBundle;
 
@@ -102,8 +103,17 @@ pub struct TxEntry {
 impl TxEntry {
     /// Build a transaction whose discovery group is `recipients`, encoded
     /// canonically. The only constructor callers should need.
-    pub fn new(proof: Vec<u8>, public: TxPublic, recipients: &[RecipientBundle]) -> Self {
-        Self { proof, public, discovery: encode_group_contents(recipients) }
+    pub fn new(
+        proof: Vec<u8>,
+        public: TxPublic,
+        recipients: &[RecipientBundle],
+        payloads: &[Vec<u8>],
+    ) -> Self {
+        Self {
+            proof,
+            public,
+            discovery: encode_committed_discovery(recipients, payloads),
+        }
     }
 
     /// A transaction whose discovery group is a [`placeholder_discovery`]
@@ -118,7 +128,7 @@ impl TxEntry {
     /// i.e. `n_recipients = 0`. Valid only for a transaction with no output
     /// commitments; see [`TxEntry::discovery`].
     pub fn empty_discovery() -> Vec<u8> {
-        encode_group_contents(&[])
+        encode_committed_discovery(&[], &[])
     }
 
     /// Decode this transaction's committed discovery bytes (§4 rule 3).
@@ -126,7 +136,26 @@ impl TxEntry {
     /// `index` is only used to label the error — the bytes themselves carry no
     /// index (see [`qlab_note::compact::write_group_contents`]).
     pub fn discovery_group(&self, index: usize) -> Result<Vec<RecipientBundle>, BodyError> {
-        decode_group_contents(&self.discovery)
+        self.discovery_parts(index).map(|(r, _)| r)
+    }
+
+    /// Both halves of the committed region: the compact bundles and the
+    /// relocated AEAD payloads, one per entry in D4 order (issue #188 (a) as
+    /// amended). The payloads are **committed**, so a light server serving them
+    /// is a projection of the body and cannot withhold one undetectably — which
+    /// is the property option 3 was chosen for.
+    pub fn discovery_parts(
+        &self,
+        index: usize,
+    ) -> Result<(Vec<RecipientBundle>, Vec<Vec<u8>>), BodyError> {
+        decode_committed_discovery(&self.discovery)
+            .map_err(|err| BodyError::DiscoveryMalformed { index, err })
+    }
+
+    /// The `group_contents` prefix — what `/v1/compact` serves, copied out of the
+    /// committed bytes rather than re-encoded.
+    pub fn discovery_served_prefix(&self, index: usize) -> Result<&[u8], BodyError> {
+        committed_contents_prefix(&self.discovery)
             .map_err(|err| BodyError::DiscoveryMalformed { index, err })
     }
 }
@@ -428,7 +457,11 @@ pub fn placeholder_discovery(commitments: &[Hash32]) -> Vec<u8> {
             clue: qlab_note::wire::ClueSlot::Empty,
         })
         .collect();
-    encode_group_contents(&[RecipientBundle { ct: [0u8; qlab_note::kem::CT_LEN], entries }])
+    let n = commitments.len();
+    encode_committed_discovery(
+        &[RecipientBundle { ct: [0u8; qlab_note::kem::CT_LEN], entries }],
+        &vec![vec![0u8; PAYLOAD_LEN]; n],
+    )
 }
 
 /// The `discovery-on-the-consensus-wire.md` §4 checks for one transaction.
@@ -460,9 +493,14 @@ pub fn placeholder_discovery(commitments: &[Hash32]) -> Vec<u8> {
 /// which is the entire reason they need this. Requiring a group for the coinbase
 /// would add ~585 B to every empty block on the chain forever, for nothing.
 pub fn check_tx_discovery(index: usize, tx: &TxEntry) -> Result<(), BodyError> {
-    let recipients = tx.discovery_group(index)?;
+    let (recipients, payloads) = tx.discovery_parts(index)?;
 
-    if encode_group_contents(&recipients) != tx.discovery {
+    // Re-encode to itself (§4 rule 3). Since issue #188 (a) that covers BOTH
+    // halves of the committed region: the group contents and the relocated
+    // fixed-width payload section. `decode_committed_discovery` already refuses a
+    // payload section of the wrong total length, so this closes the remaining
+    // way two byte strings could mean one group.
+    if encode_committed_discovery(&recipients, &payloads) != tx.discovery {
         return Err(BodyError::DiscoveryNotCanonical { index });
     }
 
@@ -542,7 +580,8 @@ mod tests {
                 entries: vec![CompactEntry { cm: *cm, tag: [i as u8; 8], clue: ClueSlot::Empty }],
             })
             .collect();
-        encode_group_contents(&bundles)
+        let n = qlab_note::compact::contents_entry_count(&bundles);
+        encode_committed_discovery(&bundles, &vec![vec![0u8; PAYLOAD_LEN]; n])
     }
 
     #[test]
@@ -749,7 +788,8 @@ mod tests {
     /// ```text
     ///   before #101: 02566c7473c06db6c281fe2b90d264956bccd5a4c75c5fa4828a9d1644bf67cf
     ///   after  #101: 0ac5b4641291df8cbf328ab2c82a83cbb03da8b60a888177791f4ce04a78b613
-    ///   after  #188: (the constant below)
+    ///   after  #188: aab27621de7f0aabcc398b449bfe1db21c83ee09a8138f926a80119dcd5989c1
+    ///   after  #188 (a) payload relocation: (the constant below)
     /// ```
     ///
     /// **Deliberately changed again by issue #188** (body format v2:
@@ -760,6 +800,17 @@ mod tests {
     /// The golden body's transaction now carries a two-recipient group binding
     /// its two commitments `0x44…` and `0x55…`, one output each.
     ///
+    /// 🔴 **And deliberately changed a third time, by #188 (a) as amended**: the
+    /// AEAD payloads moved *into* the committed region (`group_contents ‖
+    /// payloads`, one fixed 120-byte payload per entry). So this body's preimage
+    /// grew by 2 × 120 B and this constant moved with it — **the same evidence
+    /// rule applies, and it firing is the proof the relocation happened.**
+    ///
+    /// The one golden that must **not** move for that change is a different one:
+    /// `qlab-cbserver`'s 1177-byte `/v1/compact` vector. Serving projects only the
+    /// `group_contents` prefix out of these bytes, so the served wire is
+    /// byte-identical and the two goldens move independently by design.
+    ///
     /// The "before" value is recorded so the break is legible, not so it can be
     /// restored. If you are here because this test failed: you changed the block
     /// body format. That is a consensus break and it needs the halt-height upgrade
@@ -769,7 +820,7 @@ mod tests {
         let hex: String =
             golden_body().commitment().iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
-            hex, "aab27621de7f0aabcc398b449bfe1db21c83ee09a8138f926a80119dcd5989c1",
+            hex, "8ef00f318e7a4517107dfd538ed80b7d7ecf7caa71573085e8d5bdcfb5ad6cdc",
             "block-body commitment preimage changed — see this test's doc comment"
         );
     }
@@ -787,6 +838,54 @@ mod tests {
     ///      has a stable encoding that does **not** collide with the pre-change
     ///      empty body. Claim 3 is the one `BODY_PREIMAGE_DOMAIN` exists for;
     ///      without the domain tag §3's encoding leaves it byte-identical.
+    /// 🔴 Pins the sentence `placeholder_discovery`'s own doc makes:
+    /// **consensus-valid and cryptographically useless.** Both halves — "valid"
+    /// is what a fixture relies on, "useless" is what stops anyone mistaking it
+    /// for a real group.
+    ///
+    /// The width/count half exists because that is exactly the kind of claim
+    /// which is true when written and quietly stops being true: relocating the
+    /// payloads (issue #188 (a)) made the placeholder responsible for a second
+    /// field, and nothing but this test would notice if it drifted.
+    #[test]
+    fn placeholder_discovery_is_valid_and_uselessly_zero_at_the_right_width() {
+        let cms: Vec<Hash32> = vec![[7u8; 32], [8u8; 32]];
+        let d = placeholder_discovery(&cms);
+        let (recipients, payloads) =
+            decode_committed_discovery(&d).expect("placeholder must DECODE");
+
+        // Valid: it binds exactly the commitments it was given, in D4 order.
+        assert_eq!(contents_commitments(&recipients), cms);
+
+        // Useless, at the right shape: one zero payload per entry, each exactly
+        // PAYLOAD_LEN. A count drift or a width drift turns this red.
+        assert_eq!(payloads.len(), cms.len(), "one payload per entry");
+        for (i, p) in payloads.iter().enumerate() {
+            assert_eq!(p.len(), PAYLOAD_LEN, "payload {i} width");
+            assert!(p.iter().all(|b| *b == 0), "payload {i} must be uselessly zero");
+        }
+        // Useless: all-zero ct and all-zero tags — nothing to decapsulate.
+        assert!(recipients.iter().all(|r| r.ct.iter().all(|b| *b == 0)), "zero ct");
+        assert!(
+            recipients.iter().flat_map(|r| &r.entries).all(|e| e.tag == [0u8; 8]),
+            "zero tags"
+        );
+
+        // And it passes the consensus rule it exists to pass.
+        let tx = TxEntry {
+            proof: b"ok".to_vec(),
+            public: TxPublic {
+                anchor: FINAL_ANCHOR,
+                nullifiers: vec![[0x22; 32], [0x33; 32]],
+                commitments: cms,
+                bucket: ArityBucket::TwoByTwo,
+                fee: posted_fee(ArityBucket::TwoByTwo),
+            },
+            discovery: d,
+        };
+        check_tx_discovery(0, &tx).expect("placeholder must be consensus-valid");
+    }
+
     #[test]
     fn discovery_round_trips_and_the_empty_body_does_not_collide_with_v1() {
         let cms = vec![[0x44u8; 32], [0x55u8; 32]];
@@ -802,8 +901,8 @@ mod tests {
             discovery: two_recipient_discovery(&cms),
         };
         // 1. decode ∘ encode = id, on the bytes the body commits to.
-        let back = tx.discovery_group(0).expect("discovery decodes");
-        assert_eq!(encode_group_contents(&back), tx.discovery);
+        let (back, pls) = tx.discovery_parts(0).expect("discovery decodes");
+        assert_eq!(encode_committed_discovery(&back, &pls), tx.discovery);
         assert_eq!(contents_commitments(&back), cms, "D4 order, recipient-major");
 
         // 2. deterministic, and sensitive to the discovery region alone.
@@ -885,10 +984,25 @@ mod tests {
         //     region`. THIS has a varint, and a padded one is rejected by the
         //     ratified decoder (D6, PR #149). Asserted here because the served
         //     form is what a wallet scans in baton 2.
+        // 🔴 Since #188 (a) the served form is `varint(index) ‖ the PREFIX of the
+        //     committed region`, not the whole region — serving projects
+        //     `group_contents` and leaves the payload section behind. Splicing the
+        //     whole committed blob after the index is NOT servable, and asserting
+        //     that is what keeps "serving is a projection" a fact rather than a
+        //     convention.
+        let prefix = committed_contents_prefix(&honest).expect("committed region decodes");
         let mut served = Vec::new();
         qlab_note::compact::write_varint(&mut served, 2);
-        served.extend_from_slice(&honest);
+        served.extend_from_slice(prefix);
         assert!(qlab_note::compact::decode_group(&served).is_ok());
+        let mut over = Vec::new();
+        qlab_note::compact::write_varint(&mut over, 2);
+        over.extend_from_slice(&honest);
+        assert!(
+            qlab_note::compact::decode_group(&over).is_err(),
+            "the committed region is NOT the served group — the payload section \
+             must not decode as part of one"
+        );
         let mut served_padded = vec![0x82u8, 0x00];
         served_padded.extend_from_slice(&honest);
         assert!(
@@ -901,6 +1015,14 @@ mod tests {
 
         // (c) Trailing junk: a well-formed prefix plus anything would be a
         //     second byte string for one logical group, so it must not decode.
+        //
+        //     🔴 Since #188 (a) it is refused as `PayloadSectionLen` rather than
+        //     `TrailingBytes`, and the sharper error is the point: the payload
+        //     section's length is *fully determined* by the group contents that
+        //     precede it (`n_entries × PAYLOAD_LEN`), so an extra byte is not
+        //     "leftover" — it is a section of the wrong size, and the decoder can
+        //     say which size it wanted. Exact consumption is still what canonicity
+        //     reduces to; this is the same property with a better name.
         let mut trailing = honest.clone();
         trailing.push(0x00);
         let mut bad = tx.clone();
@@ -909,13 +1031,14 @@ mod tests {
             check_tx_discovery(0, &bad),
             Err(BodyError::DiscoveryMalformed {
                 index: 0,
-                err: CodecError::TrailingBytes { remaining: 1 }
+                err: CodecError::PayloadSectionLen { expected: 240, got: 241 }
             })
         ));
 
         // (d) The positive half of the same property: the accepted encoding
         //     re-encodes to itself, so there is exactly one of it.
-        assert_eq!(encode_group_contents(&tx.discovery_group(0).unwrap()), honest);
+        let (r, pls) = tx.discovery_parts(0).unwrap();
+        assert_eq!(encode_committed_discovery(&r, &pls), honest);
     }
 
     /// **The rejection test**: a body whose discovery does not bind is refused

@@ -1128,6 +1128,8 @@ mod tests {
                 fee,
             },
             &[recip(CT_BASE, cms).bundle],
+            // Issue #188 (a): payloads are committed alongside the bundles.
+            &vec![vec![0u8; qlab_note::compact::PAYLOAD_LEN]; cms.len() / 32],
         )
     }
 
