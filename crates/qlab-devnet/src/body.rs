@@ -838,6 +838,70 @@ mod tests {
     ///      has a stable encoding that does **not** collide with the pre-change
     ///      empty body. Claim 3 is the one `BODY_PREIMAGE_DOMAIN` exists for;
     ///      without the domain tag §3's encoding leaves it byte-identical.
+    /// 🔴 **Stage 4's payload-tamper case — and the mechanism is not the one the
+    /// task book names.**
+    ///
+    /// The book says *"payload tamper → commitment-equality binding refuses the
+    /// body."* **It does not, and cannot.** D4's binding compares the discovery
+    /// group's `cm` values against the transaction's declared `commitments`; a
+    /// flipped payload byte touches neither, so `check_tx_discovery` **passes** on
+    /// a tampered payload. That is asserted below rather than glossed, because a
+    /// test written to the book's wording would have had to fake its way to green.
+    ///
+    /// What actually refuses it is **#79's header↔body binding**, and only because
+    /// issue #188 (a) moved the payloads *into* the preimage: the tampered byte
+    /// changes `BlockBody::commitment()`, so the body no longer matches the header
+    /// that committed to it. Before the relocation this tamper was **invisible to
+    /// consensus entirely** — the payload lived in a served side table that no
+    /// block hash covered. So the relocation is what created the refusal, and this
+    /// test is the evidence for that claim rather than for the book's.
+    #[test]
+    fn a_tampered_payload_byte_is_refused_by_the_header_binding_not_by_d4() {
+        let cms = vec![[0x44u8; 32], [0x55u8; 32]];
+        let honest = two_recipient_discovery(&cms);
+        let mut tx = good_tx(1);
+        tx.public.commitments = cms.clone();
+        tx.discovery = honest.clone();
+        let body = BlockBody { txs: vec![tx.clone()], coinbase: 0, coinbase_rkm: [0; 4] };
+        let header = header_for(&body);
+        assert_eq!(validate_body(&header, &body, &MockVerifier, is_final), Ok(()));
+
+        // Flip one byte INSIDE the payload section — past the group contents, so
+        // no `cm`, no `tag`, no `ct` and no count is touched.
+        let prefix_len = committed_contents_prefix(&honest).expect("decodes").len();
+        assert!(prefix_len < honest.len(), "there is a payload section to tamper");
+        let mut tampered = honest.clone();
+        tampered[prefix_len] ^= 0x01;
+        let mut bad_tx = tx.clone();
+        bad_tx.discovery = tampered;
+
+        // (a) 🔴 D4 does NOT catch it, and that is correct rather than a hole:
+        //     consensus checks shape and binding, never payload validity (§4 rule
+        //     4), and a node holds no key to judge a payload with.
+        assert_eq!(
+            check_tx_discovery(0, &bad_tx),
+            Ok(()),
+            "a payload tamper is invisible to the commitment-equality binding —              D4 compares cm values, and the tamper moved none of them"
+        );
+
+        // (b) And the header binding DOES, because the payloads are in the
+        //     preimage now. Same header, moved body.
+        let bad_body =
+            BlockBody { txs: vec![bad_tx], coinbase: 0, coinbase_rkm: [0; 4] };
+        assert_ne!(
+            bad_body.commitment(),
+            body.commitment(),
+            "the tampered payload must move the body commitment — if it did not,              the relocation would not have put the payloads in the preimage"
+        );
+        assert!(
+            matches!(
+                validate_body(&header, &bad_body, &MockVerifier, is_final),
+                Err(BodyError::CommitmentMismatch { .. })
+            ),
+            "the header↔body binding must refuse a body whose payload moved"
+        );
+    }
+
     /// 🔴 Pins the sentence `placeholder_discovery`'s own doc makes:
     /// **consensus-valid and cryptographically useless.** Both halves — "valid"
     /// is what a fixture relies on, "useless" is what stops anyone mistaking it
