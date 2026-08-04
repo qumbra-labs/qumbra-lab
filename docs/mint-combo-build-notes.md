@@ -510,8 +510,16 @@ at `acceptance.rs:18-40`. Four steps:
    the seed and `allocated = [0]`.
 2. **Pay that address on a devnet.** The crux, and the only genuinely new work: the devnet
    fixture must encrypt to the *wallet's* `ek`, not its own. `WalletDir::open(D)` →
-   `wallet.diversified_keypair(&wallet.diversifier_at_index(0)).ek` gives it; the note must be
-   built at the **derived** seed (`derive_output_rho`, issue #215 (i)) or it will not recompute.
+   `WalletDir::open(D)` → `wallet.diversified_keypair(&wallet.diversifier_at_index(0))`
+   gives it. **`Devnet::generate_paying(params, payee)`** was added for exactly this.
+
+   🔴 **Correction to this note as first written:** it said the fixture's note *"must be built at
+   the derived seed or it will not recompute."* **That is wrong.** The recompute compares the
+   reconstructed note against **the entry's own `cm`**, and the fixture derives that entry from
+   the note it just built — so a fixture note is self-consistent whatever its seed and needs no
+   `derive_output_rho`. The derived seed is a **prover's** obligation (`build_bucket` overrides
+   it), not a discovery fixture's. Recorded rather than silently fixed, because the wrong version
+   would have sent the next session hunting a problem that does not exist.
    `Devnet::from_parts` (used by `qlab-demo::scenario`) is the assembly seam.
 3. **Serve it over HTTP.** `qlab-cbserver`'s test server + `handle.base_url()`, the pattern
    `client.rs`'s tests use.
@@ -532,6 +540,6 @@ output.
 | 0 — mandatory reading + citation check | ✅ committed; both conflicts raised, ruled, task book corrected (PR #251) |
 | 1 — option 4, the one-permutation form | ✅ committed, measured, gate cleared |
 | 2 — both changes unconditional | ✅ committed; aggregation-lane literals fixed; full bar running |
-| 3 — #188 (a), the discovery payload | 🟡 **relocation DONE and green (1208/0/1); ρ diagnostic DONE; the wallet-binary E2E is designed above, not built.** Previously blocked — resolved by the #188 amendment. Historical note follows: **BLOCKED on #188's premise, not on the design.** Placement ratified and built against; but (a)'s "rkm is the recipient's own key material" is false for an `Ivk`, and `/v1/compact` carries no nullifier so a light client cannot derive ρ. Two findings reported on #219; payload core preserved on `claude/mint-combo-stage3a-wip` (`186d15f`, does not compile by design) |
+| 3 — #188 (a), the discovery payload | 🟡 **relocation DONE and green (1208/0/1); ρ diagnostic DONE; the wallet-binary E2E is DONE (`ac42b1e`).** 🏁 **Stage 3 closed.** Previously blocked — resolved by the #188 amendment. Historical note follows: **BLOCKED on #188's premise, not on the design.** Placement ratified and built against; but (a)'s "rkm is the recipient's own key material" is false for an `Ivk`, and `/v1/compact` carries no nullifier so a light client cannot derive ρ. Two findings reported on #219; payload core preserved on `claude/mint-combo-stage3a-wip` (`186d15f`, does not compile by design) |
 | 4 — measurement battery + the suite | 🟡 proof/width/degree/census done and test-locked; **the interior-prove gate is measured and clear (above)**; still owed: the dummy-composition adversarial case, prove time, the b4 interior fallback lane |
 | 5 — genesis + `CONSENSUS_WIRE_BYTES` → 148,625 | ⬜ not started; the four other break sites are already moved (stage 2), so what remains is the constant, the fixture, the hash reproduced twice, and the params-audit row |
