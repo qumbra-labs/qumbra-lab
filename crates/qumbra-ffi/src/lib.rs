@@ -154,6 +154,27 @@ pub unsafe extern "C" fn qmb_wallet_free(w: *mut WalletState) {
     }
 }
 
+/// Allocate `len` bytes inside the module for a CALLER to write inputs into
+/// (phrases, URLs) before calling the ABI — the WASM host has no other way to
+/// hand us a string. Pair with [`qmb_dealloc`]; unrelated to
+/// [`qmb_string_free`], which frees OUR strings.
+#[no_mangle]
+pub extern "C" fn qmb_alloc(len: usize) -> *mut u8 {
+    let mut v: Vec<u8> = Vec::with_capacity(len.max(1));
+    let p = v.as_mut_ptr();
+    std::mem::forget(v);
+    p
+}
+
+/// # Safety
+/// `p` must come from [`qmb_alloc`] with the same `len`; never used after.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_dealloc(p: *mut u8, len: usize) {
+    if !p.is_null() {
+        drop(Vec::from_raw_parts(p, len.max(1), len.max(1)));
+    }
+}
+
 /// # Safety
 /// `s` must be a string returned by this library; never used after this call.
 #[no_mangle]
@@ -381,9 +402,10 @@ mod tests {
         let exported: Vec<&str> = src
             .lines()
             .filter_map(|l| {
-                l.trim().strip_prefix("pub unsafe extern \"C\" fn ").and_then(|r| {
-                    r.split('(').next()
-                })
+                let t = l.trim();
+                t.strip_prefix("pub unsafe extern \"C\" fn ")
+                    .or_else(|| t.strip_prefix("pub extern \"C\" fn "))
+                    .and_then(|r| r.split('(').next())
             })
             .collect();
         assert!(!exported.is_empty());
