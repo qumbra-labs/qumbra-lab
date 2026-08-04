@@ -4,16 +4,6 @@ version = "0.0.0"
 edition.workspace = true
 publish.workspace = true
 
-[features]
-# Issue #219 / QUM-69: the `ROLE_BNF2` liveness latch — in-circuit dummy input
-# slots (protocol-spec §59 "in-circuit dummies"). DEFAULT OFF, deliberately:
-# the latch adds three trace columns, which moves the consensus proof wire and
-# therefore `qumbra_node::genesis::CONSENSUS_WIRE_BYTES` — a FROZEN v1.0
-# constant baked into the genesis hash. Turning this on is a genesis change and
-# rides the mint that `#215` (i) and `#188` (a) already ride; it is not a
-# builder's call. See `narrow.rs`'s latch section and the PR body.
-q69-latch = []
-
 [dependencies]
 # Pinned exactly at 0.6.1, matching qlab-bench (bench discipline).
 p3-air = "=0.6.1"

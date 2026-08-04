@@ -5,7 +5,7 @@
 //! `qlab-consensus` crate. This module used to *reconstruct* that config by hand
 //! and value-lock the copy; it now simply re-exports the single source, so the
 //! demo, `qlab-bench`, and the `qlab-node` stack are guaranteed byte-identical
-//! (the 145,609-B wire regression lives in `qlab-consensus`).
+//! (the 148,625-B wire regression lives in `qlab-consensus`).
 //!
 //! The one thing that stays here is [`live_witness`]: the wallet/prover step that
 //! fetches a spend input's membership witness from a live commitment tree. It

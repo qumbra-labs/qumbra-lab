@@ -62,6 +62,9 @@ fn real_tx(ek: &Ek, k: usize, nf_seed: u8, anchor: Hash32, rng: &mut StdRng) -> 
             fee: posted_fee(ArityBucket::TwoByTwo),
         },
         &[enc.bundle.clone()],
+        // Issue #188 (a): the REAL payloads, committed alongside the bundles —
+        // the tx a peer relays and the bytes a wallet scans are one artifact.
+        &enc.payloads,
     );
     let discovery = TxDiscovery {
         recipients: vec![RecipientDiscovery { bundle: enc.bundle, payloads: enc.payloads }],

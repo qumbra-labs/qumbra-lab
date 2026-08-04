@@ -98,9 +98,30 @@ impl Devnet {
     /// Generate a fresh devnet deterministically from `params`.
     pub fn generate(params: GenParams) -> Self {
         let mut rng = StdRng::seed_from_u64(params.seed);
-
-        // Our wallet + a handful of decoy recipients.
         let our = generate_keypair(&mut rng);
+        Self::generate_paying(params, our)
+    }
+
+    /// Generate a devnet that pays `our` — **a keypair the caller owns**, rather
+    /// than one this fixture invents.
+    ///
+    /// The reason it exists: PR #244 named *"a wallet's own key, paid on a devnet,
+    /// finds its payment through `scan` over HTTP"* as the demonstration the
+    /// wallet crate owed, and with [`Self::generate`] that sentence is not
+    /// expressible — the payee is always a keypair born inside this function, so a
+    /// test can only ever prove `scan_local` works, never that the wallet a user
+    /// runs can see its money. Handing the payee in closes exactly that gap: a
+    /// `qumbra-wallet` acceptance test derives the keypair from a real `keygen`
+    /// directory and passes it here.
+    ///
+    /// Everything else is [`Self::generate`]'s behaviour unchanged, including the
+    /// deterministic recipient mix and the decoys.
+    pub fn generate_paying(params: GenParams, our: Keypair) -> Self {
+        // The rng is re-seeded identically, so `generate`'s own call is
+        // byte-identical to what it produced before this split: the keypair it
+        // draws first comes off the same stream position.
+        let mut rng = StdRng::seed_from_u64(params.seed);
+        let _discarded = generate_keypair(&mut rng);
         let decoys: Vec<Keypair> = (0..4).map(|_| generate_keypair(&mut rng)).collect();
 
         let mut tree = CommitmentTree::new();
@@ -173,7 +194,12 @@ impl Devnet {
                 // generated chain commits to exactly what it serves.
                 let bundles: Vec<_> =
                     recipients.iter().map(|r| r.enc.bundle.clone()).collect();
-                body_txs.push(TxEntry::new(proof, public, &bundles));
+                // Issue #188 (a): the AEAD payloads are COMMITTED now, so the
+                // fixture's body carries them in D4 order rather than keeping
+                // them only in the served side table.
+                let payloads: Vec<Vec<u8>> =
+                    recipients.iter().flat_map(|r| r.enc.payloads.clone()).collect();
+                body_txs.push(TxEntry::new(proof, public, &bundles, &payloads));
                 stored_txs.push(StoredTx { recipients });
             }
 

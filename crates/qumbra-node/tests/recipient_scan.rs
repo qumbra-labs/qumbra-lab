@@ -125,6 +125,9 @@ fn payment_to(
             fee: posted_fee(ArityBucket::TwoByTwo),
         },
         &[enc.bundle],
+        // Issue #188 (a) as amended: the real payloads ride in the committed
+        // discovery region, not only in a served side table.
+        &enc.payloads,
     );
     (tx, notes)
 }

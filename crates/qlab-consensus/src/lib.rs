@@ -18,9 +18,10 @@
 //! - **FRI** the FROZEN v1.0 consensus point b16/q21/g22/fp16/a16
 //!   ([`CONSENSUS_CFG`]; consensus-parameters FROZEN §1, issue #41 "B″").
 //!
-//! The byte-identical wire is regression-pinned at **145,609 B** by
-//! `consensus_wire_is_145609_bytes` below — the same number the bench suite
-//! measures (CLAUDE.md "B″ batch", coordinator-accepted PR #47).
+//! The byte-identical wire is regression-pinned at **148,625 B** by
+//! `consensus_wire_is_148625_bytes` below — issue #215 (i) + #219, measured on
+//! one tree. It was 145,609 B (CLAUDE.md "B″ batch", coordinator-accepted
+//! PR #47) before those two landed.
 
 use p3_challenger::{HashChallenger, SerializingChallenger32};
 use p3_commit::ExtensionMmcs;
@@ -141,7 +142,7 @@ pub const CONSENSUS_CFG: FriCfg = FriCfg {
     max_log_arity: 4,
 };
 
-/// log2 of the 2×2 bucket trace height (83 perms → 2^18 rows; protocol-spec §4).
+/// log2 of the 2×2 bucket trace height (84 perms → 2^18 rows; protocol-spec §4).
 pub const LOG_HEIGHT: usize = 18;
 
 /// Build a `StarkConfig` at an arbitrary FRI point. Field, hash, DFT, and the
@@ -253,39 +254,44 @@ mod tests {
         assert!(verify_proof(&inst, &pvs, &proof), "real M3 proof must verify");
     }
 
-    /// The consensus wire is byte-identical at **145,609 B** — the number the
-    /// bench suite measured and the coordinator reproduced for B″ (PR #47),
-    /// promoted here to a permanent single-source regression pin. bincode fixint
+    /// The minted consensus proof size. **One source of truth**: both the wire
+    /// pin and the dummy-proof size-indistinguishability test read it, so a wire
+    /// change cannot be half applied — which is exactly what a stale literal in
+    /// the second test caused while the two changes were still feature-gated.
+    ///
+    /// **148,625 B** — a MEASUREMENT on one tree, 5/5 byte-exact. Not 148,161,
+    /// which was a sum of measurements on *different* trees and mints nothing.
+    ///
+    /// | tree | width | perms | bytes |
+    /// |---|---|---|---|
+    /// | pre-mint `main` | 617 | 83 | 145,609 |
+    /// | + issue #219 latch (3 cols) | 620 | 83 | 145,957 |
+    /// | + issue #215 (i) option 4 (23 cols, 1 perm) | 643 | 84 | **148,625** |
+    ///
+    /// 26 × 116.0 B/column. The added *permutation* costs zero bytes: proof size
+    /// is a function of `log_height`, width, quotient degree and the FRI config,
+    /// and a permutation moves none of the four (#219's six-arm measurement).
+    /// The 116 B line holds only because the quotient degree does not move,
+    /// which `q69_quotient_degree_does_not_move` asserts off Plonky3's own
+    /// symbolic evaluation.
+    const WIRE_BYTES: usize = 148_625;
+
+    /// The consensus wire is byte-identical at **148,625 B**, a permanent
+    /// single-source regression pin. bincode fixint
     /// is the consensus wire (protocol-spec §4). Proof byte length is a function
     /// of the AIR shape + config only, so it is instance-independent (the grind
     /// nonce is a fixed-width field).
     #[test]
-    fn consensus_wire_is_145609_bytes() {
+    fn consensus_wire_is_148625_bytes() {
         let inst = balanced_bucket();
         let (pvs, proof) = prove_bucket(&inst);
         assert!(verify_proof(&inst, &pvs, &proof));
         let bytes = bincode::serialize(&proof)
             .expect("bincode serialization failed")
             .len();
-        #[cfg(not(feature = "q69-latch"))]
         assert_eq!(
-            bytes, 145_609,
-            "consensus wire byte-identical regression (issue #38 extraction / #41 B″)"
-        );
-        // Issue #219 / QUM-69: the `q69-latch` feature adds three trace columns
-        // (`NARROW_WIDTH` 617 → 620). 145,957 = 145,609 + 3 × 116, i.e. the
-        // latch's real columns cost exactly what QUM-67's three INERT probe
-        // columns cost — the 116.0 B/column slope, which holds only because the
-        // quotient degree does not move (`q69_quotient_degree_does_not_move`).
-        //
-        // 🔴 This is why the feature is default-off: 145,957 ≠
-        // `qumbra_node::genesis::CONSENSUS_WIRE_BYTES`, a FROZEN v1.0 constant
-        // baked into the genesis hash. Enabling it by default is a genesis
-        // change, not a builder's call.
-        #[cfg(feature = "q69-latch")]
-        assert_eq!(
-            bytes, 145_957,
-            "latched consensus wire (issue #219): 145,609 + 3 columns × 116 B"
+            bytes, WIRE_BYTES,
+            "consensus wire — issue #215 (i) + #219, measured on one tree"
         );
     }
 
@@ -298,7 +304,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// A one-real-input spend: 1,000 in, 600 + 399 out, fee 1, slot 1 dummy.
-    #[cfg(feature = "q69-latch")]
     fn dummy1_bucket() -> qlab_air::narrow::BucketInstance {
         use qlab_air::narrow::{
             build_bucket_dummy1, derive_input, fabricated_single_tree, off_tree_witness,
@@ -341,7 +346,6 @@ mod tests {
     /// height, same width, same quotient degree — so proof size discloses
     /// nothing about the sender's true input arity, which is the whole reason
     /// `transaction-model` §7/§10 lists arity buckets as Decided.
-    #[cfg(feature = "q69-latch")]
     #[test]
     fn q69_dummy_proof_verifies_and_is_size_indistinguishable() {
         let real = balanced_bucket();
@@ -363,14 +367,14 @@ mod tests {
             d_bytes, real_bytes,
             "a dummy proof must not be distinguishable by size"
         );
-        assert_eq!(d_bytes, 145_957, "latched wire");
+        // The absolute lives in `WIRE_BYTES`, not here — see its note.
+        assert_eq!(d_bytes, WIRE_BYTES, "the minted wire");
     }
 
     /// The verifier binds the dummy instance to its declared surface exactly as
     /// it binds a real one: tamper `PV_NF2` — the dummy slot's own nullifier —
     /// and the real verifier refuses. The relaxed anchor bind does not relax
     /// this, which is what keeps a relay from rewriting a dummy nullifier.
-    #[cfg(feature = "q69-latch")]
     #[test]
     fn q69_dummy_proof_is_bound_to_its_declared_nullifier() {
         use qlab_air::narrow::PV_NF2;

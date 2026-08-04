@@ -23,7 +23,10 @@ use std::time::Instant;
 
 use qlab_consensus::Proof;
 
-use qlab_air::narrow::{build_bucket_with_witnesses, derive_input, BucketInstance, TxInput, TxOutput};
+use qlab_air::narrow::{
+    build_bucket_with_witnesses, derive_input, derive_output_rho, BucketInstance, TxInput,
+    TxOutput,
+};
 use qlab_cbserver::client::{scan_local, DecoyPolicy, ScanConfig, ScanStats};
 use qlab_cbserver::data::{Devnet, StoredBlock, StoredRecipient, StoredTx};
 use qlab_cbserver::tree::CommitmentTree;
@@ -233,7 +236,20 @@ pub fn run_loop(seed: u64) -> LoopReport {
 
     // ── 3. Alice → Bob: fetch live witnesses, prove the send against R0 ──────
     let sent_value = 60_000u64;
-    let (bob_rho, bob_rseed) = ([0x51u64; 4], [0x52u64; 4]);
+    // 🔴 Issue #215 (i): the output note's seed is DERIVED, not chosen. Alice
+    // cannot pick Bob's rho any more — `build_bucket` overrides it with
+    // `rho'_0 = nf_0`, so a note encrypted at a chosen rho would open a
+    // commitment the chain does not contain, and Bob could detect his payment
+    // and then fail to spend it (which is exactly how this test caught the
+    // change: *"spend input's note commitment must be a leaf of the live tree"*).
+    //
+    // She can compute it, because she knows her own input: `nf_0` is
+    // `derive_input(&a_inputs[0]).1` and it is public once the tx is on chain.
+    // Under #188 (a) the payload stops carrying rho altogether and Bob derives
+    // it from `nf_0` himself — that is stage 3; here Alice simply sends the
+    // right value instead of the wrong one.
+    let bob_rho = derive_output_rho(&derive_input(&a_inputs[0]).1, 0);
+    let bob_rseed = [0x52u64; 4];
     let bob_note = Note {
         value: sent_value,
         rkm: bob_addr.rkm_lanes(),

@@ -106,6 +106,81 @@ fn address_new_allocates_and_the_set_survives_via_the_process() {
     assert!(list.contains("[0]") && list.contains("[1]"), "{list}");
 }
 
+/// 🔴 **The demonstration PR #244 owed and could not give: the wallet a user
+/// actually runs, seeing its own money over HTTP.**
+///
+/// The test below this one scans with `devnet.our.dk` — a keypair the fixture
+/// invents — through this crate's library path. Its own comment says what that
+/// leaves unproven: *"the wallet-owned-key-over-HTTP flow stays gated on #188
+/// 4/4 and is disclosed as not-verified in the PR."* That gate is now open, so
+/// this is the flow it was waiting for, and every step crosses the **process**
+/// boundary:
+///
+/// 1. `keygen` runs as the real binary and writes a real wallet directory;
+/// 2. the payee keypair is **derived from that directory** — seed → managed
+///    diversifier at the allocated index → `diversified_keypair` — which is the
+///    path a user's wallet walks and the one a library-level test skips;
+/// 3. a devnet pays **that** key (`Devnet::generate_paying`, added for exactly
+///    this) and is served over a real localhost socket;
+/// 4. `scan` runs as the real binary against that URL and its **stdout** is the
+///    evidence.
+///
+/// So the claim is about the product, not the machine: no in-process shortcut,
+/// no fixture-owned key, no library call standing in for the CLI.
+#[test]
+fn a_real_wallet_binary_scans_its_own_payment_over_http() {
+    use std::sync::Arc;
+
+    let dir = tmp("wallet_http");
+    let d = dir.to_str().unwrap();
+
+    // 1. keygen, as the process.
+    let (stdout, stderr, ok) = run(&["keygen", "--dir", d], None);
+    assert!(ok, "keygen failed: {stderr}");
+    assert!(stdout.contains("address [0]"), "{stdout}");
+
+    // 2. The payee, derived from the directory keygen just wrote.
+    let w = WalletDir::open(&dir).expect("keygen wrote a readable wallet dir");
+    assert_eq!(w.allocated, vec![0], "keygen allocates index 0");
+    let wallet = w.wallet();
+    let div = wallet.diversifier_at_index(0);
+    let payee = wallet.diversified_keypair(&div);
+
+    // 3. A devnet that pays THAT key, served over a real socket.
+    let devnet = Devnet::generate_paying(GenParams::default(), payee);
+    let tip = devnet.tip_height();
+    let handle = qlab_cbserver::server::serve(Arc::new(devnet));
+    let url = handle.base_url();
+
+    // 4. scan, as the process, over HTTP.
+    let to = tip.to_string();
+    let (out, err, ok) =
+        run(&["scan", "--dir", d, "--url", &url, "--to", &to], None);
+    handle.shutdown();
+    assert!(ok, "scan failed: {err}\n{out}");
+
+    // The money is visible, and the report is honest about it.
+    let total = out
+        .lines()
+        .find_map(|l| l.strip_prefix("TOTAL spendable: "))
+        .and_then(|t| t.split_whitespace().next())
+        .and_then(|n| n.parse::<u128>().ok())
+        .unwrap_or_else(|| panic!("no TOTAL spendable line in scan output:\n{out}"));
+    assert!(total > 0, "the wallet must see the payment made to its own key:\n{out}");
+
+    // 🔴 The honest-reporting discipline, intact across the process boundary:
+    // a scan that could not know something says so, and this one could know.
+    assert!(!out.contains(UNAVAILABLE), "a complete scan must not print {UNAVAILABLE}:\n{out}");
+    // And the range is stated rather than implied — a balance is a claim about a
+    // range, which is why `--to` is mandatory.
+    assert!(out.contains(&format!("{tip}")), "the report states its range:\n{out}");
+
+    // Nothing key-shaped escaped on the scan path either.
+    let mnemonic = reveal_mnemonic(&w);
+    let combined = format!("{out}{err}");
+    assert!(!combined.contains(&mnemonic), "the mnemonic never leaves scan");
+}
+
 #[test]
 fn miner_rkm_matches_the_node_config_form_and_names_unallocated_indices() {
     let dir = tmp("rkm");

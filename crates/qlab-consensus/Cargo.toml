@@ -11,12 +11,6 @@ publish.workspace = true
 # qlab-bench binary (issue #38, F1 from the wallet demo) so qlab-bench, qlab-demo,
 # and the qlab-node stack all agree byte-for-byte instead of reconstructing it.
 
-[features]
-# Issue #219 / QUM-69: forwards to `qlab-air/q69-latch`. Default off — see that
-# crate's note. The wire pin below is feature-aware precisely so a featured build
-# states the new number rather than failing on the old one.
-q69-latch = ["qlab-air/q69-latch"]
-
 [dependencies]
 qlab-air = { path = "../qlab-air" }
 

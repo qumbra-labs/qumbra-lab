@@ -126,9 +126,18 @@ mod tests {
     /// THE hard-line guarantee: `note_commitment` is byte-identical to what
     /// qlab-air's `build_bucket` binds as the output commitment. If qlab-air's
     /// packing ever changes, this test breaks — the recompute cannot drift.
+    ///
+    /// 🔴 Since issue #215 (i) the output seed is **derived, not chosen**:
+    /// `rho'_0 = nf_0` and `rho'_1 = H(nf_0 ‖ D_P)`. `build_bucket` overrides
+    /// whatever `TxOutput::rho` a caller hands it, so a note built with its own
+    /// `rho` no longer opens the commitment the circuit binds. The recipient's
+    /// side of that is #188 (a): `value ‖ rseed` arrives in the discovery
+    /// payload, `rkm` is the recipient's own key material, and `rho` is read off
+    /// `nf_0` — a public value. This test carries the derivation so the
+    /// recompute is locked to the circuit under the new contract too.
     #[test]
     fn commitment_matches_qlab_air_build_bucket() {
-        use qlab_air::narrow::{build_bucket, TxInput, TxOutput};
+        use qlab_air::narrow::{build_bucket, derive_output_rho, TxInput, TxOutput};
 
         let out0 = sample(11);
         let out1 = sample(22);
@@ -157,7 +166,21 @@ mod tests {
         ];
         let inst = build_bucket(18, &inputs, &outputs, fee);
 
-        assert_eq!(out0.commitment(), inst.cm_out[0], "output 0 cm must match circuit");
-        assert_eq!(out1.commitment(), inst.cm_out[1], "output 1 cm must match circuit");
+        // The notes as the RECIPIENT reconstructs them: value and rseed from the
+        // payload, rkm from their own keys, rho derived from the public nf_0.
+        let recovered = |n: &Note, j: usize| Note {
+            rho: derive_output_rho(&inst.nf[0], j),
+            ..*n
+        };
+        assert_eq!(
+            recovered(&out0, 0).commitment(),
+            inst.cm_out[0],
+            "output 0 cm must match circuit"
+        );
+        assert_eq!(
+            recovered(&out1, 1).commitment(),
+            inst.cm_out[1],
+            "output 1 cm must match circuit"
+        );
     }
 }
