@@ -58,6 +58,7 @@ scripts/rig run -- cargo test --release --workspace -- --test-threads=1
 ## 6. Contamination and interruption — the failure modes actually observed
 
 - **Contamination tell**: `sys` time inflated several-fold with instructions-retired nearly flat ⇒ something else was running ⇒ **discard the number, do not caveat it**.
+  *(Refined 2026-08-04, from the mint-combo baton's b4 measurement: inflated `sys` with instructions-retired **risen** is a different animal — that is this machine's own memory compressor doing real work (a ≥33 GB-class footprint forces it), the number is genuine and the machine is merely at its limit; the discriminator is instructions, not sys.)*
 - **Lid-close kills runs** (2026-08-03, twice-verified): closing the MacBook killed a suite mid-test — log truncated mid-line, no process left, lock correctly reaped as stale afterwards. A partial suite result is worthless; the rule is **restart from scratch, overwrite the log**.
 - **Background watchers die more often than the watched** — the WAN sampler died three times in four days while all four nodes held `restarts=0`. Same lesson at rig scale: never assume a long-lived background process survived a period nobody was watching. Check `rig status` / the log's tail, not your memory of having started it.
 
