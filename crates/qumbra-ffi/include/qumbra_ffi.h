@@ -42,6 +42,11 @@ qmb_wallet_t *qmb_wallet_from_parts(uint8_t version, const uint8_t *entropy32,
 void qmb_wallet_free(qmb_wallet_t *w);
 void qmb_string_free(char *s);
 
+/* Caller-side input buffers (the WASM host's only way to hand us a string).
+ * Pair qmb_alloc with qmb_dealloc; unrelated to qmb_string_free. */
+uint8_t *qmb_alloc(size_t len);
+void qmb_dealloc(uint8_t *p, size_t len);
+
 /* --- key material (explicit) -------------------------------------------- */
 
 /* The ONLY key-material return in this ABI — the explicit reveal. */
