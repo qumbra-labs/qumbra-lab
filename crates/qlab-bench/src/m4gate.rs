@@ -134,7 +134,22 @@ const P: u32 = 0x7f00_0001;
 const EXT_W: u32 = 3;
 
 /// Inner trace width (opened row length).
-const TW: usize = 617;
+///
+/// 🔴 **Derived from the consensus AIR, not a literal, since issue #215 (i).**
+/// It read `617` before, and PR #239 named the hazard without closing it — *"a
+/// 620-column trace changes the rung-1 leaf's input shape. Untouched and
+/// unconsidered."* The mint's 643-column AIR made it fatal rather than
+/// theoretical: 64 `m4gate` tests failed on `obs flush 2 block count`, because
+/// the challenger's flush-2 message opens two `tw`-length zeta groups and the
+/// shape table said 148 blocks while the real proof produced 154.
+///
+/// Everything downstream — `flush_blocks`, `dup_captures`, the `A*` offsets —
+/// already derived from this, so tying it to `NARROW_WIDTH` is the whole fix.
+/// **Nothing here may go back to a literal**: a hard-coded inner width is a
+/// silent divergence between the aggregation lane and the circuit it aggregates,
+/// and the only reason it was ever caught is that the mint moved the width by
+/// enough to break an unrelated block count.
+const TW: usize = qlab_air::narrow::NARROW_WIDTH;
 /// Quotient opened words (4 chunks x 4 base values).
 const QW: usize = 16;
 /// Inner public values.
@@ -165,10 +180,31 @@ const PATH_LEVELS: [usize; 6] = [19, 19, 15, 11, 7, 5];
 const N_CAPS: usize = 6;
 const CAP_LEN: usize = 8;
 
-/// Observation flush block counts (F0..F7).
-const FLUSH_BLOCKS: [usize; 8] = [5, 3, 148, 3, 3, 3, 3, 3];
 /// Flush message byte lengths (F0 has no 32-byte chain prefix).
-const FLUSH_BYTES: [usize; 8] = [604, 288, 20_032, 288, 288, 288, 288, 308];
+///
+/// F2 is the only `tw`-dependent entry: it carries the zeta openings, three
+/// groups of `16` base values each — `trace_local` and `trace_next` at `tw`
+/// values apiece plus the quotient at `qw` — behind a 32-byte digest prefix.
+/// **Derived, not a literal**, for the same reason `TW` is: it read `20_032` at
+/// the pre-mint `tw = 617` and issue #215 (i)'s 643 columns made it `20_864`,
+/// which is what broke 64 tests on `obs flush 2 block count`.
+///
+/// Mirrors `GateShape::flush_bytes()`, cross-checked by
+/// `gate_shape_derived_counts_narrow`.
+const FLUSH_BYTES: [usize; 8] =
+    [604, 288, 32 + 16 * (2 * TW + QW), 288, 288, 288, 288, 308];
+/// Observation flush block counts (F0..F7): `bytes / 136 + 1` (keccak rate 136,
+/// `+1` for the always-present `10*1` pad). Mirrors `flush_blocks()`.
+pub(crate) const FLUSH_BLOCKS: [usize; 8] = [
+    5,
+    3,
+    FLUSH_BYTES[2] / 136 + 1,
+    3,
+    3,
+    3,
+    3,
+    3,
+];
 
 /// Draw groups: 0 alpha, 1 zeta, 2 fri_alpha, 3..7 beta0..3, 7 pow,
 /// 8..(8+NQ) idx0..(NQ-1), then DONE. G_DONE / N_GROUPS derive from NQ so a
@@ -269,7 +305,7 @@ impl GateShape {
     /// const block above verbatim.
     pub(crate) fn narrow() -> Self {
         Self {
-            tw: 617,
+            tw: TW, // = qlab_air::narrow::NARROW_WIDTH — never a literal, see TW
             qw: 16,
             n_pvs: 84,
             nq: NQ, // = CONSENSUS_CFG.num_queries (q21 post-B″, issue #41)
@@ -555,9 +591,10 @@ impl GateShape {
     /// group-boundary snapshots are therefore at cumulative value counts `tw`
     /// (A0), `2*tw` (A1) and `2*tw+qw` (A2, the chain end = block `N-1`).
     ///
-    /// Returns `[(block, row_in_perm, blkcnt); 3]` = `[A0, A1, A2]`. Narrow
-    /// (`tw=617,qw=16,N=148`) reproduces the old literals `A0=(72,14,76)`,
-    /// `A1=(145,7,3)`, `A2=(147,5,1)`; wide (`tw=3626,qw=8,N=855`) yields
+    /// Returns `[(block, row_in_perm, blkcnt); 3]` = `[A0, A1, A2]`. At the
+    /// pre-mint narrow width (`tw=617,qw=16,N=148`) this reproduced the old
+    /// literals `A0=(72,14,76)`, `A1=(145,7,3)`, `A2=(147,5,1)` — `tw` is now
+    /// `NARROW_WIDTH` (643) and these move with it; wide (`tw=3626,qw=8,N=855`) yields
     /// `A0=(426,14,429)`, `A1=(853,7,2)`, `A2=(854,6,1)`.
     pub(crate) fn dup_captures(&self) -> [(usize, usize, u32); 3] {
         let n = self.flush_blocks()[2];
@@ -8697,8 +8734,17 @@ mod tests {
             // r+1 is pinned by the 2-constraint form; r+8 is the consume.
             free_rows.extend(r + 2..=r + 7);
         }
-        assert_eq!(sites, 138, "gap-8 capture->consume sites (narrow)");
-        assert_eq!(free_rows.len(), 138 * 6, "rows the pin-only form leaves free");
+        // 138 at the pre-mint `tw = 617`, 141 at 643. These are honest
+        // structural counts over the witness and they scale with the number of
+        // opened values, so they move with the inner width by design — see the
+        // derivation on `i78_asm_pairing_structure`.
+        const GAP8_SITES: usize = 141;
+        assert_eq!(sites, GAP8_SITES, "gap-8 capture->consume sites (narrow)");
+        assert_eq!(
+            free_rows.len(),
+            GAP8_SITES * 6,
+            "rows the pin-only form leaves free"
+        );
 
         // CONTROL A — the honest baseline on this very trace.
         assert!(
@@ -8841,7 +8887,24 @@ mod tests {
             assert_eq!(g(n, layout.asm0), g(r, layout.w0c), "consumed limb 0 at row {n}");
             assert_eq!(g(n, layout.asm1), g(r, layout.w1c), "consumed limb 1 at row {n}");
         }
-        assert_eq!((pairs, adjacent, gap8), (2358, 2220, 138), "asm pairing shape (narrow)");
+        // 🔴 These counts scale with the inner trace width, and after issue
+        // #215 (i) + #219 took it 617 → 643 they read (2410, 2269, 141) rather
+        // than (2358, 2220, 138). The `pairs` delta is **exactly twice** the
+        // width delta — flush 2 opens `trace_local` and `trace_next`, so each
+        // added column is two more opened values and therefore two more
+        // capture→consume pairs. `pairs` is written as that derivation rather
+        // than as a literal; the adjacent/gap-8 split of the 52 new pairs
+        // (49 / 3) depends on where they land against the 17-row absorb block
+        // boundary, which is not worth deriving, so `gap8` stays measured and
+        // `adjacent` is the remainder.
+        let want_pairs = 2358 + 2 * (TW - 617);
+        assert_eq!(want_pairs, 2410, "pairs at tw=643");
+        assert_eq!(gap8, 141, "gap-8 sites at tw=643 (measured)");
+        assert_eq!(
+            (pairs, adjacent, gap8),
+            (want_pairs, want_pairs - 141, 141),
+            "asm pairing shape (narrow)"
+        );
 
         // The hold premise: on every transition out of a POS1 non-consuming
         // row, the honest witness leaves ASM0/ASM1 alone — so the 4-constraint

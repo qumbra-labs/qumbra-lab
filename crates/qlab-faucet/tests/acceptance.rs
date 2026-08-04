@@ -248,7 +248,7 @@ fn end_to_end_grant_is_scanned_by_the_requester() {
         "balance: inputs = grant + change + fee"
     );
     assert_eq!(
-        plan.proof_bytes, 145_609,
+        plan.proof_bytes, 148_625,
         "the grant carries the consensus proof wire, byte-for-byte the size \
          qlab-consensus pins"
     );

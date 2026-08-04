@@ -64,12 +64,34 @@ use qlab_node::{genesis_block, StoredBlock};
 /// the height-0 header/body binding, with a much worse error. #81's rule is that
 /// an incompatible artifact is refused with a reason and never migrated by
 /// guesswork; the bump is what makes that refusal happen at load.
-pub const GENESIS_FORMAT_VERSION: u32 = 3;
+///
+/// **4 since the mint** (issue #215 (i) / #219). Same judgement as #188's, and it
+/// applies for the same reason rather than by pattern-match: the struct shape is
+/// again unchanged — only `CONSENSUS_WIRE_BYTES` moved, 145,609 → 148,625 — but
+/// `expected_genesis_hash` lives in the **operator's config**, not in this binary.
+/// So an operator carrying a stale config *and* a stale file onto a mint binary
+/// would **pass** the hash check (the file hashes to what its own config pins) and
+/// only fail later, when a transaction's proof is 148,625 B against a genesis
+/// recording 145,609. That is the "much worse error" #188's bump exists to
+/// prevent, and the same remedy applies.
+pub const GENESIS_FORMAT_VERSION: u32 = 4;
 
-/// The FROZEN v1.0 consensus wire size in bytes (qlab-consensus
-/// `consensus_wire_is_145609_bytes`; consensus-parameters §1). Baked so the
+/// The FROZEN consensus wire size in bytes (qlab-consensus
+/// `consensus_wire_is_148625_bytes`; consensus-parameters §1). Baked so the
 /// genesis file records the measured wire the net commits to.
-pub const CONSENSUS_WIRE_BYTES: u64 = 145_609;
+///
+/// 🔴 **Moved 145,609 → 148,625 by the mint** (issue #215 (i) / #219, the
+/// combination baton). It is **a measurement on ONE tree**, 5/5 byte-exact at
+/// width 643 / 84 perms — not the 148,161 B that circulated earlier, which was a
+/// sum of measurements on *different* trees and, as #219's sequencing ruling put
+/// it, *"a sum mints nothing"*. The 22 columns that sum assumed were QUM-62's
+/// probe bank; the real construction is 26 (23 for option 4 + 3 for the latch).
+///
+/// Changing this value **re-mints genesis** — it is inside `FrozenParams`, which
+/// is serialized into the genesis file and therefore inside the genesis hash. The
+/// two changes that move it both went unconditional in this baton, so there is no
+/// feature that returns the old wire.
+pub const CONSENSUS_WIRE_BYTES: u64 = 148_625;
 
 /// T0 genesis PoW difficulty — `[devnet-placeholder]`, NOT frozen. Chosen low so
 /// a real-RandomX rehearsal net mines on laptop hardware; the real launch
@@ -305,6 +327,7 @@ impl KeyFile {
 ///   post-#101: 8811d4e0ccdee702bafd4c92afad768495dc43360778072338aa140d87a73cff
 ///   post-#115: bd3604804aade38ece989d87e72e3541cede939512f513840c5cdcf13986a66f
 ///   post-#188: 566d4ed01426ece7a10ffa41829b6ec43d19a8bbb51b3d11aba7048192f0f80f
+///   post-mint: 138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb
 /// ```
 ///
 /// **#101 — `coinbase_rkm`, a consequence rather than a decision.** [`StoredBlock`]
@@ -752,7 +775,7 @@ mod tests {
     fn genesis_hash_is_pinned() {
         assert_eq!(
             GenesisFile::new_devnet_t0().hash_hex(),
-            "566d4ed01426ece7a10ffa41829b6ec43d19a8bbb51b3d11aba7048192f0f80f",
+            "138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb",
         );
         for superseded in [
             // pre-#101 — the T0 net on t0-wan-2.

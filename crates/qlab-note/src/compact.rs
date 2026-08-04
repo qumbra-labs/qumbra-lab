@@ -65,6 +65,12 @@ pub enum CodecError {
     NonCanonicalVarint { len: usize },
     /// Trailing bytes remained after a whole-buffer decode.
     TrailingBytes { remaining: usize },
+    /// The committed region's payload section is not `n_entries × PAYLOAD_LEN`
+    /// bytes. Issue #188 (a) as amended: every entry carries exactly one
+    /// fixed-width payload, so the section's length is fully determined by the
+    /// group contents that precede it and any other length is a second byte
+    /// string for the same logical group.
+    PayloadSectionLen { expected: usize, got: usize },
 }
 
 /// One transaction's compact group: its index within the block and the
@@ -320,6 +326,89 @@ pub fn decode_group_contents(b: &[u8]) -> Result<Vec<RecipientBundle>, CodecErro
         });
     }
     Ok(r)
+}
+
+/// Width of one committed AEAD payload: the 104-byte note plaintext
+/// ([`crate::note::NOTE_PLAINTEXT_LEN`]) plus ChaCha20-Poly1305's 16-byte tag.
+///
+/// 🔴 **Fixed-width, and that is the property the committed region rests on.**
+/// `write_group_contents`'s note explains that the region contains no varint at
+/// all and therefore admits exactly one byte string per logical group. Relocating
+/// the payloads keeps that true only because every payload is the same size — the
+/// entry count is already carried by `n_outputs`, so the section needs no length
+/// prefix and D6's canonicity question still never gets a chance to matter inside
+/// the preimage.
+///
+/// **It stayed 120 B rather than shrinking to 56.** Issue #188 (a) originally
+/// dropped `rkm` and ρ as recipient-derivable; that failed one scanner class down
+/// — an `Ivk` deliberately cannot derive `rkm` (issue #32), and `/v1/compact`
+/// carries no nullifier so a light client cannot derive ρ. Amended 2026-08-04:
+/// *"this is not a size decision"* — 64 B is 0.04 % of a transaction.
+pub const PAYLOAD_LEN: usize = crate::note::NOTE_PLAINTEXT_LEN + 16;
+
+// ---- the committed discovery region -----------------------------------------
+//
+// `group_contents ‖ payloads` — the exact bytes a block body commits to since
+// issue #188 (a). Serving still projects only the `group_contents` prefix, so
+// `/v1/compact`'s golden vector is untouched and a light server stays a mirror
+// of the body rather than a second source.
+
+/// Total entries across all recipients — the payload count, by construction.
+pub fn contents_entry_count(recipients: &[RecipientBundle]) -> usize {
+    recipients.iter().map(|r| r.entries.len()).sum()
+}
+
+/// Encode the committed discovery region. `payloads` is flat, in D4 order
+/// (recipient-major, then per-output), one per entry.
+///
+/// Panics if the count or any width is wrong: those are caller bugs at
+/// construction time, not decode failures — the decoder's job is to refuse the
+/// same conditions arriving from the wire.
+pub fn encode_committed_discovery(
+    recipients: &[RecipientBundle],
+    payloads: &[Vec<u8>],
+) -> Vec<u8> {
+    let want = contents_entry_count(recipients);
+    assert_eq!(payloads.len(), want, "one payload per discovery entry (D4 order)");
+    let mut out = Vec::new();
+    write_group_contents(&mut out, recipients);
+    for p in payloads {
+        assert_eq!(p.len(), PAYLOAD_LEN, "committed payloads are fixed-width");
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// Decode the committed discovery region, rejecting trailing bytes and any
+/// payload section that is not exactly `n_entries × PAYLOAD_LEN`.
+///
+/// This is the consensus entry point. With no varint in the region, canonicity
+/// reduces to **exact consumption** — and the payload section's length being
+/// fully determined is what keeps that reduction valid.
+pub fn decode_committed_discovery(
+    b: &[u8],
+) -> Result<(Vec<RecipientBundle>, Vec<Vec<u8>>), CodecError> {
+    let mut pos = 0usize;
+    let recipients = read_group_contents(b, &mut pos)?;
+    let n = contents_entry_count(&recipients);
+    let expected = n * PAYLOAD_LEN;
+    let got = b.len() - pos;
+    if got != expected {
+        return Err(CodecError::PayloadSectionLen { expected, got });
+    }
+    let payloads = (0..n)
+        .map(|i| b[pos + i * PAYLOAD_LEN..pos + (i + 1) * PAYLOAD_LEN].to_vec())
+        .collect();
+    Ok((recipients, payloads))
+}
+
+/// The `group_contents` prefix of a committed region — what `/v1/compact`
+/// serves. A **projection**, never a re-encoding: the bytes are copied out of the
+/// committed blob rather than rebuilt, so serving cannot drift from the body.
+pub fn committed_contents_prefix(b: &[u8]) -> Result<&[u8], CodecError> {
+    let mut pos = 0usize;
+    let _ = read_group_contents(b, &mut pos)?;
+    Ok(&b[..pos])
 }
 
 /// The commitments a group's contents describe, in D4's order (recipient-major,

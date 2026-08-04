@@ -40,7 +40,7 @@
 //!
 //! - **committee₀'s 21 verifying keys, the genesis block, the genesis difficulty,
 //!   and the network label.** These are covered by a different and already-existing
-//!   pin, the genesis hash (`566d4ed0…f80f` since issue #188 — see `genesis.rs`),
+//!   pin, the genesis hash (`138e1524…addb` since the mint — see `genesis.rs`),
 //!   which every node asserts on startup.
 //!   Two overlapping pins on the same bytes would be redundancy, not assurance.
 //! - **Every `params_devnet` knob annotated testnet-tunable** (LWMA window/clamps,
@@ -400,9 +400,14 @@ mod tests {
     /// revision that names the delta. That pairing is the whole mechanism.
     #[test]
     fn frozen_digest_is_pinned() {
+        // 🔴 Moved by the mint (issue #215 (i) / #219): `CONSENSUS_WIRE_BYTES`
+        // 145,609 → 148,625 is a covered field, so the digest MUST move — this
+        // test firing is the evidence the frozen set actually changed, exactly as
+        // `sensitivity` below says every covered field should behave.
+        //   pre-mint: 19564ecaffd8f78e69b31840cf465b3b34553968813f7fcaff83194077534571
         assert_eq!(
             own_frozen_digest_hex(),
-            "19564ecaffd8f78e69b31840cf465b3b34553968813f7fcaff83194077534571",
+            "a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b",
         );
     }
 

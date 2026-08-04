@@ -155,9 +155,27 @@ pub const DRILL_HALT_HEIGHT: u64 = 16;
 /// pre-announcement binary on an upgraded node. The rule that reconciles the two is
 /// simply: **mint a revision when, and only when, you are shipping an upgrade with a
 /// boundary** — which is the same occasion that requires a revision document anyway.
+/// 🔴 **The frozen digest moved with the mint; the identifier deliberately did
+/// NOT** (issue #215 (i) / #219, `CONSENSUS_WIRE_BYTES` 145,609 → 148,625).
+///
+/// This file's own rule decides it: *"mint a revision when, and only when, you are
+/// shipping an upgrade with a boundary."* The mint is **not** that — it is a
+/// **re-genesis**: a new network from height 0, no halt height, no chain to resume
+/// past. Bumping the identifier would make every later release declare a
+/// transition it has no business declaring, the alarm fatigue #81's addendum
+/// forbids.
+///
+/// The frozen digest moves because the frozen set genuinely moved, and that is safe
+/// **only** for a reason worth stating: it moves *before any chain exists under
+/// it*, so no node ever ran the old digest on the net this mints. On a LIVE chain
+/// the identical edit is precisely what #81's gate exists to refuse.
+///
+/// Pre-mint value, recorded so the break is legible rather than restorable:
+/// `19564eca…4571`. (The schema-0 marker fixture further down still quotes it, and
+/// must — it is a historical artifact of #74, not a pin.)
 pub const REVISION_V1_0: Revision = Revision {
     id: "v1.0",
-    frozen_digest_hex: "19564ecaffd8f78e69b31840cf465b3b34553968813f7fcaff83194077534571",
+    frozen_digest_hex: "a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b",
 };
 
 /// The **deliberately inert** revision the drill upgrades to (H5). It moves **no**
@@ -166,7 +184,7 @@ pub const REVISION_V1_0: Revision = Revision {
 /// drive on it.
 pub const REVISION_V1_0_1_DRILL: Revision = Revision {
     id: "v1.0.1-drill",
-    frozen_digest_hex: "19564ecaffd8f78e69b31840cf465b3b34553968813f7fcaff83194077534571",
+    frozen_digest_hex: "a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b",
 };
 
 /// What this binary is: its name, its halt schedule, the revision it carries, and

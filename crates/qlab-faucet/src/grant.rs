@@ -37,7 +37,8 @@
 use std::time::Instant;
 
 use qlab_air::narrow::{
-    build_bucket_with_witnesses, BucketInstance, MerkleWitness, TxInput, TxOutput,
+    build_bucket_with_witnesses, derive_input, derive_output_rho, BucketInstance, MerkleWitness,
+    TxInput, TxOutput,
 };
 use qlab_cbserver::tree::CommitmentTree;
 use qlab_consensus::{prove_bucket, Config, Proof, Val, LOG_HEIGHT};
@@ -310,11 +311,24 @@ pub fn build_grant<R: CryptoRng>(
     ];
 
     // Output 0: the grant, to the requester's rkm. Output 1: change, to ours.
-    // ρ/rseed are fresh CSPRNG draws — ρ is what the nullifier binds, so a repeat
-    // would make the change note unspendable behind an already-published nullifier.
-    let grant_rho = rand_lanes(rng);
+    //
+    // 🔴 Issue #215 (i): **ρ is DERIVED, not drawn.** It used to be a fresh
+    // CSPRNG draw here — which was #215's finding, a free witness with nothing
+    // enforcing the global uniqueness `transaction-model` §4 requires — and
+    // `build_bucket_with_witnesses` now overrides whatever a caller supplies with
+    // `ρ′_0 = nf_0` / `ρ′_1 = H(nf_0 ‖ D_P)`. Computing them here, from the same
+    // `nf_0` the circuit will, keeps the note we ENCRYPT and the commitment the
+    // circuit BINDS in agreement. Get this wrong and the failure surfaces two
+    // layers away as `validate_body`'s `DiscoveryDoesNotBind`, which is exactly
+    // how it surfaced before this line existed.
+    //
+    // Uniqueness is now structural rather than probabilistic: it is inherited
+    // from the double-spend rule consensus already enforces on `nf_0`. `rseed`
+    // stays a draw — it is the one field still carried in the AEAD payload.
+    let nf0 = derive_input(&spend[0]).1;
+    let grant_rho = derive_output_rho(&nf0, 0);
+    let change_rho = derive_output_rho(&nf0, 1);
     let grant_rseed = rand_lanes(rng);
-    let change_rho = rand_lanes(rng);
     let change_rseed = rand_lanes(rng);
     let change_rkm = wallet.rkm(change_d);
     let outputs = [
@@ -341,7 +355,7 @@ pub fn build_grant<R: CryptoRng>(
     let prove_secs = t.elapsed().as_secs_f64();
 
     // The consensus proof wire (protocol-spec §4): bincode fixint, the encoding
-    // qlab-consensus pins at 145,609 B and the node's real verifier decodes.
+    // qlab-consensus pins at 148,625 B and the node's real verifier decodes.
     let proof_bytes_vec = bincode::serialize(&proof).expect("proof serializes");
     let proof_bytes = proof_bytes_vec.len();
 
@@ -356,8 +370,15 @@ pub fn build_grant<R: CryptoRng>(
     };
     let change_note =
         Note { value: change_value, rkm: change_rkm, rho: change_rho, rseed: change_rseed };
-    debug_assert_eq!(inst.cm_out[0], grant_note.commitment(), "grant cm seam");
-    debug_assert_eq!(inst.cm_out[1], change_note.commitment(), "change cm seam");
+    // 🔴 `assert`, not `debug_assert`. These two lines are the seam between the
+    // note a recipient will open and the commitment the chain will hold, and they
+    // were `debug_assert!` — so in the release-mode acceptance run they were
+    // SILENT, and issue #215 (i)'s seed change surfaced instead as a
+    // `DiscoveryDoesNotBind` from `validate_body` three call layers later. Two
+    // keccak-f permutations is a fair price for a local failure at the point of
+    // construction.
+    assert_eq!(inst.cm_out[0], grant_note.commitment(), "grant cm seam");
+    assert_eq!(inst.cm_out[1], change_note.commitment(), "change cm seam");
 
     let to_recipient = encrypt_to_recipient(&recipient_ek, &[grant_note], rng);
     let self_ek = wallet.diversified_keypair(&change_d).ek;
@@ -379,6 +400,12 @@ pub fn build_grant<R: CryptoRng>(
             fee,
         },
         &[to_recipient.bundle.clone(), to_self.bundle.clone()],
+        // Issue #188 (a) as amended: the REAL AEAD payloads are committed
+        // alongside the bundles, recipient-major (D4) — grant first, then
+        // change-to-self, matching `commitments = [grant_cm, change_cm]`. They
+        // are no longer only in the RPC side table, so a light server serving
+        // them is a projection of the body and cannot withhold one undetectably.
+        &[to_recipient.payloads.clone(), to_self.payloads.clone()].concat(),
     );
     let discovery = TxDiscovery {
         recipients: vec![
