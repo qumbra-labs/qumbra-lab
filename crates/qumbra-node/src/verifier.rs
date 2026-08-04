@@ -27,7 +27,7 @@
 //!    anchor/nullifiers/commitments/fee. A tx that proves a different surface
 //!    than it declares fails to verify (that binding is the point);
 //! 3. deserializes the proof with bincode fixint — the consensus wire
-//!    (protocol-spec §4; the same encoding `qlab-consensus` pins at 145,609 B);
+//!    (protocol-spec §4; the same encoding `qlab-consensus` pins at 148,625 B);
 //! 4. verifies against a **canonical, witness-free AIR**. The AIR's constraints
 //!    read only the structural program ring + trace + public values — never
 //!    `slot_witness` or `self.fee` — so any 2×2 bucket instance yields the exact

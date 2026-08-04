@@ -237,3 +237,229 @@ a wire change can no longer be half-applied. **Also confirmed by that test: a du
 proof is still size-indistinguishable from a real one in the combined tree (148,625 B both),
 and `build_bucket_dummy1` composes with option 4 for free** because it delegates to
 `build_bucket_with_witnesses`.
+
+---
+
+## Stage 2 — both changes unconditional
+
+### What "the latch becomes unconditional" had to mean
+
+The stage title names only the latch, but the figure it names — *"the unfeatured wire pin moves
+to the measured stage-2 figure"* — is the **combination** (the sum it quotes, 148,161 B, is
+19 + 3 columns). With only the latch unconditional the unfeatured pin would be 145,957 B. So
+stage 2 deletes **both** feature gates: `q69-latch` and `q215-rho`, both feature tables, all 50
+`cfg` sites, and the feature-aware branches of the wire pin. One tree, one number, no knob.
+
+Rationale as ruled: a dead config knob on a consensus circuit is a mis-built-binary hazard, and
+the off-shape is unreachable after the mint.
+
+**How the transformation was verified rather than trusted:** the unconditional tree measures
+**exactly** what the both-featured tree measured the stage before — 643 columns, 84 perms,
+148,625 B, degree 4 / 4 chunks, 937 constraints, 37 `qlab-air` + 5 `qlab-consensus` tests. A
+faithless `cfg` strip would have moved one of those.
+
+The wire pin is now one constant, `WIRE_BYTES = 148_625`, read by both the pin and the
+dummy-proof size test. The test is renamed `consensus_wire_is_148625_bytes`.
+
+### 🔴 The finding: the M4 aggregation gate verified a shape the prover no longer emits
+
+`crates/qlab-bench/src/m4gate.rs` had **`const TW: usize = 617` as a hard-coded literal, with
+nothing tying it to `NARROW_WIDTH`.** `GateShape::narrow()` carried the same literal a second
+time. The only assertion on it, `assert_eq!(n.tw, TW)`, checks the gate against *itself*.
+
+PR #239 named this hazard and left it: *"Aggregation. A 620-column trace changes the rung-1
+leaf's input shape. Untouched and unconsidered."*
+
+At 643 columns it stopped being theoretical. **64 `m4gate` tests failed**, all on the same
+assertion:
+
+```
+assertion `left == right` failed: obs flush 2 block count
+  left: 154   right: 148
+```
+
+Flush 2's challenger message opens two `tw`-length zeta groups plus the quotient group, so the
+real proof absorbs 154 keccak blocks where the shape table — built from `tw = 617` — said 148.
+
+**Fix, in two parts, both "make it derived":**
+
+1. `const TW: usize = qlab_air::narrow::NARROW_WIDTH`, and `GateShape::narrow()` reads `TW`
+   instead of repeating the literal. That took the failures 64 → 3.
+2. The remaining three were the *module-level* mirror of the same mistake: `FLUSH_BYTES` and
+   `FLUSH_BLOCKS` were literal arrays holding the `tw = 617` answers (`20_032` bytes / `148`
+   blocks for F2, the zeta-opening flush). F2 is the only `tw`-dependent entry — it carries
+   `2·tw + qw` opened values at 16 bytes each behind a 32-byte digest prefix — so it is now
+   written as `32 + 16 * (2 * TW + QW)`, and `FLUSH_BLOCKS` as `FLUSH_BYTES[2] / 136 + 1`.
+   At 643 columns those come out **20,864 B / 154 blocks**, which is exactly the number the
+   real proof produced.
+
+Everything else downstream (`dup_captures`, the `A*`/`P0R` offsets, `n_shapes_obs`, `qslots`)
+was already derived and needed nothing. Two of them provably do not move at all: F2's block
+count collapses to 3 in `n_shapes_obs`, and `ceil34(617) == ceil34(643) == 19` keeps `QSLOTS`
+at 103. So this is a config correction, not an aggregation redesign.
+
+🔴 **The part worth reporting to the coordinator, not the fix:** the only reason this was ever
+caught is that the mint moved the width by enough to break an *unrelated* block count. A
+smaller width change would have left the aggregation lane silently verifying a shape the
+consensus prover no longer emits — and `assert_eq!(n.tw, TW)` would have stayed green
+throughout. The literal is gone and a comment at `TW` says it may never come back.
+
+### 🔴 The faucet: a free witness that was the finding, and a seam assert that was asleep
+
+`qlab-faucet`'s three acceptance tests failed with `DiscoveryDoesNotBind { index: 0, expected:
+2, got: 2, first_mismatch: Some(0) }` — the count right, the first commitment wrong. The faucet
+drew ρ from the CSPRNG:
+
+```rust
+// ρ/rseed are fresh CSPRNG draws — ρ is what the nullifier binds, so a repeat
+// would make the change note unspendable behind an already-published nullifier.
+let grant_rho = rand_lanes(rng);
+```
+
+That comment is a fair description of the pre-#215 world, and **that line is #215's finding
+itself** — *"the only path that builds a note for a third party"* (`grant.rs:313-318`, quoted in
+the issue body). It is now `derive_output_rho(&nf0, j)` with `nf0 = derive_input(&spend[0]).1`,
+computed before the build from the same nullifier the circuit will use. Uniqueness stops being
+probabilistic and becomes inherited from the double-spend rule.
+
+🟡 **And the guard for exactly this existed and was asleep.** Two lines below, `grant.rs` had:
+
+```rust
+debug_assert_eq!(inst.cm_out[0], grant_note.commitment(), "grant cm seam");
+```
+
+`debug_assert!` — so in the **release-mode** acceptance run (which is the bar) it compiles to
+nothing. The seam between "the note a recipient will open" and "the commitment the chain will
+hold" was checked only in debug, so the break surfaced three call layers away as a consensus
+error instead of at the point of construction. Both are now `assert_eq!`; two keccak-f
+permutations per grant is a fair price. **Worth generalising:** a `debug_assert` on a
+cross-layer agreement is a comment, not a check, because this repo's acceptance bar is
+`--release`.
+
+### 🟡 A process finding about the acceptance bar itself
+
+CLAUDE.md's bar is `cargo test --release --workspace -- --test-threads=1`, and **cargo stops
+after the first failing test binary.** A change with a wide blast radius therefore reveals its
+sites one crate at a time, at ~20 minutes of rig per pass. This baton spent **four** passes
+enumerating what one pass with `--no-fail-fast` would have listed at once:
+
+| pass | revealed |
+|---|---|
+| 1 | 64 × `m4gate` (the `TW` literal) |
+| 2 | `m5note::commitment_matches_qlab_air`, `m4gaterec` census, 2 × asm census |
+| 3 | `qlab-demo` E2E — *the recipient cannot spend what they received* |
+| 4 | `qlab-disclosure::packing::note_commitment_matches_build_bucket` |
+
+Nothing was wrong with any individual run and every number reported was honest. But **the bar
+as written optimises for "is it green" and this baton needed "what is red"**, and those want
+different flags. Worth considering `--no-fail-fast` for the enumerate phase, with the
+unmodified command as the final acceptance run — the suggestion is the coordinator's to take,
+and it is recorded here rather than acted on unilaterally because the bar's exact wording has
+cost this repo twice already (`PR #23`, `PR #166`).
+
+Also worth naming: **three separate crates carry the same `note_commitment` ↔ `build_bucket`
+cross-check** (`qlab-note`, `qlab-bench::m5note`, `qlab-disclosure::packing`). All three are
+good tests and all three broke for the same reason. That is redundancy doing its job, not
+duplication to clean up — but a reader who fixes one should know there are two more.
+
+### Other wire-dependent pins moved (not the frozen constant)
+
+| site | was | now |
+|---|---|---|
+| `qlab-faucet/tests/acceptance.rs` — `plan.proof_bytes` | 145,609 | 148,625 |
+| `qlab-faucet/src/grant.rs`, `qlab-demo/src/prover.rs`, `qumbra-node/src/verifier.rs` | doc refs to 145,609 | 148,625 |
+| `qlab-consensus` `LOG_HEIGHT` doc | "83 perms" | "84 perms" |
+
+`qumbra_node::genesis::CONSENSUS_WIRE_BYTES` is deliberately **untouched here** — that is
+stage 5, with the genesis regeneration and the hash reproduced twice.
+
+---
+
+## Stage 3 — #188 (a), the discovery payload — DESIGNED, NOT BUILT
+
+Written down before building so a session boundary here costs nothing. Everything below is a
+source read at this branch's HEAD, with the design position stated.
+
+### What (a) actually changes
+
+The note plaintext is `value ‖ rkm ‖ ρ ‖ rseed` — `NOTE_PLAINTEXT_LEN = 104`
+(`qlab-note/src/note.rs`). Under option 4 two of the four fields stop needing transmission:
+
+- `rkm` is the recipient's own key material — never needed sending, and it was in there anyway;
+- **`ρ` is now public** — `ρ′_0 = nf_0` is `PV_NF1`, `ρ′_1 = H(nf_0 ‖ D_P)`, and the index is
+  fixed by position, so any observer computes both from block data.
+
+So the payload becomes `value(8) ‖ rseed(32)` = 40 B, plus the 16-byte ChaCha20-Poly1305 tag =
+**56 B/note**, down from 120. That is the whole of (a)'s arithmetic, and it is why (i) *"pays
+for more than half of (a)'s cost"*.
+
+### 🔴 Where the payload goes — the position, with the reason
+
+| constraint | source | consequence |
+|---|---|---|
+| golden compact framing must not move | task book stage 3; the 1177-B vector is a **`/v1/compact` serving response** (`codec.rs:497`) carrying `version ‖ n_blocks ‖ height ‖ n_groups ‖ tx_index ‖ n_recipients ‖ ct ‖ n_outputs ‖ 2 entries` and **no payload** | the payload may **not** enter `CompactEntry` or the group-contents encoding |
+| "(a) does not touch `CompactEntry` at all" | #188's decision comment | same |
+| reuse the ratified compact bytes | `discovery-on-the-consensus-wire.md` D2 | the committed prefix stays byte-identical |
+| the committed region contains **no varint at all** | `compact.rs:270-275` — every field fixed-width or single-valued, so it *"admits exactly one byte string per logical group by construction"* | whatever is appended must be **fixed-width** |
+
+**Position: the body's discovery region becomes `group_contents ‖ payloads`,** with one fixed
+56-byte payload per entry in D4's order (recipient-major, then per-output). `/v1/compact`
+continues to project only the `group_contents` prefix, so the golden serving vector is
+untouched; the payloads are committed and therefore cannot be withheld by a light server,
+which is the whole point of option 3.
+
+🟢 **The no-varint property survives, and that is not luck — it is (a)'s doing.** A 56-byte
+payload is fixed-width precisely *because* ρ and `rkm` left it; the 104-byte plaintext would
+have been fixed-width too, but (d)'s `clue`-slot variant would not. The entry count is already
+carried by `n_outputs`, so no length prefix is needed and D6's canonicity question still never
+gets a chance to matter inside the preimage.
+
+### 🔴 The finding that says why stage 3 is not optional, and the suite found it
+
+`qlab-demo`'s `end_to_end_payment_loop_holds_all_invariants` failed with:
+
+```
+spend input's note commitment must be a leaf of the live tree
+```
+
+Alice pays Bob, Bob **scans and detects** his note, and then **cannot spend it.** The reason is
+the whole of #188 (a) in one sentence: Alice encrypted a note at a ρ *she chose*, `build_bucket`
+committed the note at the ρ it *derives*, so the note Bob reconstructs from the payload has a
+commitment that is not in the tree.
+
+**This is the loop PR #244 left open, failing for real rather than in the abstract** — and it is
+the strongest argument that the payload contents and the derivation are one change and not two.
+The interim fix in stage 2 is minimal and deliberately not stage 3's: Alice now *computes* the
+derived seed (she knows `nf_0` — it is `derive_input(&a_inputs[0]).1`) and sends the right value
+instead of the wrong one. The payload still carries ρ. **Stage 3 removes ρ from the payload
+entirely and has Bob derive it**, which is where the 120 B → 56 B saving actually lands.
+
+### The API ripple, named
+
+`Note::from_plaintext` can no longer reconstruct a `Note` on its own — it yields
+`(value, rseed)`, and the recipient must supply `rkm` (their own) and `ρ` (derived from the
+transaction's `nf_0`). So `scan` gains those inputs, and the seam runs through
+`qlab-note::scan` → `qlab-cbserver` → `qlab_node::rpc` → `qumbra-wallet` / `qlab-faucet` /
+`qlab-demo`. **Two tests already mark this seam** and were updated in stage 2 rather than
+worked around: `qlab-note::note::commitment_matches_qlab_air_build_bucket` and
+`qlab-bench::m5note::commitment_matches_qlab_air`.
+
+### The gates stage 3 must clear
+
+- **Proof bytes must not move**: 148,625 B before and after. (a) is body bytes, not proof bytes.
+- **The golden compact vector must not move** — 1177 B and the same Keccak-256 digest.
+- Then PR #244's open loop: **a wallet's own key, paid on a devnet, finding its payment through
+  `scan` over HTTP** — `value` and `rseed` from the payload, ρ read off `nf_0`.
+
+---
+
+## Where this baton stands
+
+| stage | state |
+|---|---|
+| 0 — mandatory reading + citation check | ✅ committed; both conflicts raised, ruled, task book corrected (PR #251) |
+| 1 — option 4, the one-permutation form | ✅ committed, measured, gate cleared |
+| 2 — both changes unconditional | ✅ committed; aggregation-lane literals fixed; full bar running |
+| 3 — #188 (a), the discovery payload | ⬜ **designed above, not built** |
+| 4 — measurement battery + the suite | ⬜ partially pre-paid: the proof/width/degree/census battery is done and test-locked; peak RSS and the adversarial set beyond stage 1's ten tests are not |
+| 5 — genesis + `CONSENSUS_WIRE_BYTES` → 148,625 | ⬜ not started; the four other break sites are already moved (stage 2), so what remains is the constant, the fixture, the hash reproduced twice, and the params-audit row |

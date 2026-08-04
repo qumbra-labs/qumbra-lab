@@ -119,12 +119,9 @@ const PH_OFF: usize = PB_OFF + 24; // 426: 4: perm-phase ring (mod-4 counter)
 const PR_OFF: usize = PH_OFF + 4; // 430: 24: program ring, 4 slots x 4 bits/limb
 const D_OFF: usize = PR_OFF + 24; // 454: 16: bit-decomposition of PR[0]
 const RB_OFF: usize = D_OFF + 16; // 470: 4: current perm's role bits
-// Materialized role selectors, order = SEL_CODES. Issue #215 (i) / #219
-// option 4 appends a 14th, `ROLE_ARHO`.
-const NSEL: usize = if cfg!(feature = "q215-rho") { 14 } else { 13 };
-const SEL_OFF: usize = RB_OFF + 4; // [mrk, nf, ank, arkm, acm, acmout, banchor, bnf1, bnf2, bcm1, bcm2, bal, end] (+ arho)
-// Injection flags [mrk+nf, ank, arkm, acm, acmout] (+ arho under q215-rho).
-const NINJ: usize = if cfg!(feature = "q215-rho") { 6 } else { 5 };
+const NSEL: usize = 14; // materialized role selectors, order = SEL_CODES
+const SEL_OFF: usize = RB_OFF + 4; // [mrk, nf, ank, arkm, acm, acmout, banchor, bnf1, bnf2, bcm1, bcm2, bal, end, arho]
+const NINJ: usize = 6; // injection flags [mrk+nf, ank, arkm, acm, acmout, arho]
 const INJ_OFF: usize = SEL_OFF + NSEL;
 const G4_COL: usize = INJ_OFF + NINJ; // 1: program-ring rotation gate
 const PBIT_COL: usize = G4_COL + 1; // 1: merkle path bit (constant per perm)
@@ -135,12 +132,10 @@ const EG_OFF: usize = EQ_OFF + 32; // 6: eq gates [e1pos, e1neg, e1close, e2pos,
 // --- step 3b: one-shot epoch, bind bank, balance ---
 const EP_COL: usize = EG_OFF + 6; // 1: epoch flag (1 during program pass 0, then 0)
 const GWRAP_COL: usize = EP_COL + 1; // 1: epoch-kill gate (gperm * sel_end)
-// ep-gated selectors [nf, arkm, acm, acmout, bindsum, bal] — plus, under
-// q215-rho, a 7th: `(arho + acmout) · ep`, the third bank's window selector.
-const NSE: usize = if cfg!(feature = "q215-rho") { 7 } else { 6 };
+// 7: ep-gated selectors [nf, arkm, acm, acmout, bindsum, bal, arho+acmout]
+const NSE: usize = 7;
 const SE_OFF: usize = GWRAP_COL + 1;
-/// Index of the q215 window selector within the SE block.
-#[cfg(feature = "q215-rho")]
+/// The third bank's window selector, `(arho + acmout) · ep`, within the SE block.
 const SE_RHO: usize = 6;
 const BQ_OFF: usize = SE_OFF + NSE; // 16: bind bank, 4 lanes x 4 chunks
 const BGCAP_COL: usize = BQ_OFF + 16; // 1: bind capture gate
@@ -152,24 +147,19 @@ const BLCLOSE_COL: usize = BLC_OFF + 9; // 1: balance close gate
 const INJ3E_COL: usize = BLCLOSE_COL + 1; // 1: inj(acm) * ep
 const INJ4E_COL: usize = INJ3E_COL + 1; // 1: inj(acmout) * ep
 const EFF_OFF: usize = INJ4E_COL + 1; // 25: effective round input
-// --- issue #219 / QUM-69: the ROLE_BNF2 liveness latch (feature `q69-latch`) ---
+// --- issue #219: the ROLE_BNF2 liveness latch (in-circuit dummy input slots) ---
 /// `L` — the one-bit span latch. Set at `ROLE_BNF2`'s close row, cleared at the
 /// next `ROLE_BANCHOR`'s, pinned to 0 at row 0. Both set and clear events are
 /// already materialized as bind-close gates, so this is **program-driven**: the
 /// prover chooses nothing about where it is high.
-const POST_EFF: usize = EFF_OFF + 25;
-#[cfg(feature = "q69-latch")]
-const LATCH_COL: usize = POST_EFF;
+const LATCH_COL: usize = EFF_OFF + 25;
 /// `dv` — the prover's liveness bool, persistent for the whole trace.
-#[cfg(feature = "q69-latch")]
 const DV_COL: usize = LATCH_COL + 1;
 /// `L·dv` — materialized so the gated anchor close and the value-zero mint
 /// guard both stay at degree 3, matching this file's convention.
-#[cfg(feature = "q69-latch")]
 const LDV_COL: usize = DV_COL + 1;
-const Q69_COLS: usize = if cfg!(feature = "q69-latch") { 3 } else { 0 };
 
-// --- issue #215 (i) / #219 option 4: derived output rho' (feature `q215-rho`) ---
+// --- issue #215 (i) / #219 option 4: derived output rho' ---
 /// `M` — the output-1 span marker. Set at `ROLE_ARHO`'s close row, cleared at
 /// `ROLE_BCM2`'s, pinned to 0 at row 0. Both events are `gperm` role events the
 /// **program** fixes, so like the `q69` latch this is program-driven and the
@@ -180,20 +170,16 @@ const Q69_COLS: usize = if cfg!(feature = "q69-latch") { 3 } else { 0 };
 /// `ROLE_BANCHOR` hit in #219. Under the one-permutation form the two outputs'
 /// rho' have *different sources* (`nf_0` vs the ARHO digest), so the third bank
 /// has to tell them apart, and `M` is what does it.
-#[cfg(feature = "q215-rho")]
-const OM_COL: usize = POST_EFF + Q69_COLS;
+const OM_COL: usize = LDV_COL + 1;
 /// The third equality bank: 4 lanes x 4 z-chunks, one accumulator serving all
 /// three windows in program order (they are disjoint in time).
-#[cfg(feature = "q215-rho")]
 const EQ3_OFF: usize = OM_COL + 1;
 /// `[pos, neg, close]`. `close` doubles as the reset — close and reset are the
 /// same row here (unlike the bind bank, whose capture and reset are different
 /// rows of one perm), so one column serves both.
-#[cfg(feature = "q215-rho")]
-const EG3_OFF: usize = EQ3_OFF + 16;
-const Q215_TAIL: usize = if cfg!(feature = "q215-rho") { 1 + 16 + 3 } else { 0 };
+const EG3_OFF: usize = EQ3_OFF + 16; // 3: [pos, neg, close]
 
-pub const NARROW_WIDTH: usize = POST_EFF + Q69_COLS + Q215_TAIL;
+pub const NARROW_WIDTH: usize = EG3_OFF + 3;
 
 /// Program slots (= perm slots per program period).
 pub const PROGRAM_SLOTS: usize = 96;
@@ -252,23 +238,6 @@ pub const ROLE_ARHO: u32 = 14;
 
 /// Role codes in materialized-selector order. One list, read by both the AIR
 /// and the trace generator, so the two cannot drift.
-#[cfg(not(feature = "q215-rho"))]
-const SEL_CODES: [u32; NSEL] = [
-    ROLE_MERKLE,
-    ROLE_NF,
-    ROLE_ANK,
-    ROLE_ARKM,
-    ROLE_ACM,
-    ROLE_ACMOUT,
-    ROLE_BANCHOR,
-    ROLE_BNF1,
-    ROLE_BNF2,
-    ROLE_BCM1,
-    ROLE_BCM2,
-    ROLE_BAL,
-    ROLE_END,
-];
-#[cfg(feature = "q215-rho")]
 const SEL_CODES: [u32; NSEL] = [
     ROLE_MERKLE,
     ROLE_NF,
@@ -286,7 +255,6 @@ const SEL_CODES: [u32; NSEL] = [
     ROLE_ARHO,
 ];
 /// `ROLE_ARHO`'s index in [`SEL_CODES`].
-#[cfg(feature = "q215-rho")]
 const SEL_ARHO: usize = 13;
 
 /// Public-value layout: anchor, nf1, nf2, cm1, cm2 as 16 chunks each
@@ -387,9 +355,8 @@ pub struct NarrowKeccakAir {
     /// It is a *witness*, so it enters only the trace, never a constraint
     /// constant: the AIR is program-independent and so is unchanged by this
     /// flag. Slot 0 can never be the dummy — see the latch section of `eval`.
-    /// Honoured only under the `q69-latch` feature; setting it without the
-    /// feature panics in `generate_trace_from` rather than silently proving a
-    /// real spend the caller believes is a dummy.
+    /// Slot 0 can never be the dummy — the latch's span begins at `ROLE_BNF2`,
+    /// which marks chain 1 uniquely.
     pub dv: bool,
 }
 
@@ -666,7 +633,6 @@ where
         }
         // Issue #215 (i): ROLE_ARHO is its own injection class — a full-state
         // override, so it cannot share a flag with any existing role.
-        #[cfg(feature = "q215-rho")]
         builder.assert_eq(
             local[INJ_OFF + 5].clone(),
             bnd.clone() * sel_role(SEL_ARHO),
@@ -749,7 +715,6 @@ where
             // arho: rho'_1 = H(nf_0 || D_P). nf_0 rides W5..8 — the SAME lanes
             // ACMOUT's rho' rides — so the third bank's positive leg is one
             // gate for both roles instead of two.
-            #[cfg(feature = "q215-rho")]
             let expr = {
                 let msg_arho: AB::Expr = match l {
                     0..=3 => w(l + 5),
@@ -818,7 +783,6 @@ where
         // Issue #215 (i): the third bank's window selector. ARHO and ACMOUT are
         // the only roles that accumulate into it, and they accumulate the SAME
         // witness lanes (W5..8), so one ep-gated selector serves both.
-        #[cfg(feature = "q215-rho")]
         builder.assert_eq(
             local[SE_OFF + SE_RHO].clone(),
             (sel_role(SEL_ARHO) + sel_role(5)) * ep.clone(),
@@ -859,7 +823,6 @@ where
                 // uniqueness question. Degree 3 (three materialized factors:
                 // the close gate, `1 − L·dv`, and the accumulator; public
                 // values are degree 0), so the quotient degree does not move.
-                #[cfg(feature = "q69-latch")]
                 let close = if x == 0 {
                     (AB::Expr::ONE - local[LDV_COL].clone()) * close
                 } else {
@@ -883,7 +846,6 @@ where
         // `M` selects the close target, so all three share ONE close gate. The
         // positive leg is one gate because ARHO deliberately takes nf_0 in the
         // same witness lanes ACMOUT takes rho' in.
-        #[cfg(feature = "q215-rho")]
         {
             builder.assert_eq(
                 local[EG3_OFF].clone(),
@@ -977,7 +939,6 @@ where
         // which the verifier's own program places AFTER chain 0's
         // `ROLE_BANCHOR`. The prover picks `dv`; it cannot pick where `L` is
         // high, so `L·dv` can only ever relax chain 1.
-        #[cfg(feature = "q69-latch")]
         {
             let latch = local[LATCH_COL].clone();
             let dv = local[DV_COL].clone();
@@ -1146,7 +1107,6 @@ where
         // the argument. `dv` is persistent: one bool for the whole trace, which
         // is what makes it a per-TRANSACTION declaration rather than something
         // the prover can vary per perm.
-        #[cfg(feature = "q69-latch")]
         {
             t.assert_eq(
                 next[LATCH_COL].clone(),
@@ -1161,7 +1121,6 @@ where
         // role events, so the span is the program's and not the prover's; the
         // two never fire on the same row (one perm, one role), so `M` stays
         // bool without the bool check carrying the argument.
-        #[cfg(feature = "q215-rho")]
         {
             // `EG3[2] · sel(ARHO)` = `gperm · sel(ARHO) · ep`: the role
             // selectors are mutually exclusive by construction, so multiplying
@@ -1262,11 +1221,7 @@ pub const MERKLE_DEPTH: usize = 32;
 /// dummy warm-up slot (fits 2^18 rows: 83 x 3072 = 254,976). Issue #215 (i)
 /// adds ONE — `ROLE_ARHO` — for 84 x 3072 = 258,048, still inside 2^18
 /// (262,144), leaving 1.33 spare perm slots against 2.33 today.
-pub const BUCKET_PERMS: usize = 1
-    + 2 * (5 + MERKLE_DEPTH + 1)
-    + 2 * 2
-    + 2
-    + if cfg!(feature = "q215-rho") { 1 } else { 0 };
+pub const BUCKET_PERMS: usize = 1 + 2 * (5 + MERKLE_DEPTH + 1) + 2 * 2 + 1 + 2;
 
 /// Issue #215 (i) / #219 option 4, the host mirror of the in-circuit derivation.
 /// Output `j`'s note seed is no longer the sender's choice:
@@ -1279,7 +1234,6 @@ pub const BUCKET_PERMS: usize = 1
 /// Both derive from slot 0 alone, which is what lets slot 1 be a dummy without
 /// touching rho uniqueness (#219) — and why `nf_1 == nf_2` can no longer produce
 /// `rho'_0 == rho'_1` at all, rather than that dependency being pinned by a test.
-#[cfg(feature = "q215-rho")]
 pub fn derive_output_rho(nf0: &[u64; 4], j: usize) -> [u64; 4] {
     assert!(j < 2, "the frozen 2x2 bucket has two outputs");
     if j == 0 {
@@ -1449,10 +1403,7 @@ pub fn build_bucket_with_witnesses(
     // the free witness #215 was filed about. Callers that need to know what was
     // used call `derive_output_rho`; the value is public either way (`nf_0` is
     // `PV_NF1`, and the index is fixed by position).
-    #[cfg(feature = "q215-rho")]
     let out_rho = [derive_output_rho(&nf1, 0), derive_output_rho(&nf1, 1)];
-    #[cfg(not(feature = "q215-rho"))]
-    let out_rho = [outputs[0].rho, outputs[1].rho];
 
     let cm_of = |o: &TxOutput, rho: &[u64; 4]| -> [u64; 4] {
         let mut st = [0u64; 25];
@@ -1511,7 +1462,6 @@ pub fn build_bucket_with_witnesses(
         // witness of its own. Program order is verifier-fixed (the ring is
         // pinned at row 0 and the verifier builds the AIR from its own
         // canonical instance), so this adjacency is not a prover choice.
-        #[cfg(feature = "q215-rho")]
         if j == 1 {
             program[slot] = ROLE_ARHO;
             sw[slot].w[5..9].copy_from_slice(&nf1);
@@ -1575,7 +1525,6 @@ pub fn fabricated_single_tree(cm: &[u64; 4]) -> (MerkleWitness, [u64; 4]) {
 /// (issue #219). Deliberately a distinct deterministic pattern from
 /// [`fabricated_single_tree`]'s so a test can assert it does not fold to the
 /// real anchor, and thereby that the dummy tests are not vacuous.
-#[cfg(feature = "q69-latch")]
 pub fn off_tree_witness() -> MerkleWitness {
     let mut x = 0xdead_d0d0_0000_0219u64;
     let mut rnd = || {
@@ -1613,7 +1562,6 @@ pub fn off_tree_witness() -> MerkleWitness {
 ///
 /// `anchor` and `witnesses[0]` come from the live tree exactly as on the real
 /// path; `witnesses[1]` may be anything (see [`off_tree_witness`]).
-#[cfg(feature = "q69-latch")]
 pub fn build_bucket_dummy1(
     log_height: usize,
     real: &TxInput,
@@ -1729,22 +1677,12 @@ impl NarrowKeccakAir {
         let mut bl = [0i64; 4];
         // Issue #219 / QUM-69: the latch starts LOW (the AIR pins row 0) and the
         // liveness bool is constant for the whole trace.
-        #[cfg(feature = "q69-latch")]
         let mut latch: u32 = 0;
-        #[cfg(feature = "q69-latch")]
         let dvv: u32 = self.dv as u32;
         // Issue #215 (i): the third bank's accumulator and the output-1 span
         // marker, both pinned to 0 at row 0 by the AIR.
-        #[cfg(feature = "q215-rho")]
         let mut eq3 = [0i64; 16];
-        #[cfg(feature = "q215-rho")]
         let mut om: u32 = 0;
-        #[cfg(not(feature = "q69-latch"))]
-        assert!(
-            !self.dv,
-            "dv = true needs the `q69-latch` feature; without it there is no \
-             latch and this would prove input slot 1 as a REAL spend"
-        );
 
         let bit = |w: u32, i: usize| (w >> i) & 1;
 
@@ -1810,7 +1748,6 @@ impl NarrowKeccakAir {
                     },
                     // arho: nf_0 at W5..8 (the same lanes ACMOUT's rho' rides),
                     // D_P at lane 4, pad10*1 from bit 320.
-                    #[cfg(feature = "q215-rho")]
                     ROLE_ARHO => match l {
                         0..=3 => wbit[l + 5],
                         4 => (z == 3) as u32,
@@ -1898,7 +1835,6 @@ impl NarrowKeccakAir {
             for i in 1..5 {
                 row[INJ_OFF + i] = F::from_u32(bndv * selv[i + 1]);
             }
-            #[cfg(feature = "q215-rho")]
             {
                 row[INJ_OFF + 5] = F::from_u32(bndv * selv[SEL_ARHO]);
             }
@@ -1916,7 +1852,6 @@ impl NarrowKeccakAir {
                 bindsum * ep,
                 selv[11] * ep,
             ]);
-            #[cfg(feature = "q215-rho")]
             {
                 se[SE_RHO] = (selv[SEL_ARHO] + selv[5]) * ep;
             }
@@ -1941,9 +1876,7 @@ impl NarrowKeccakAir {
             }
             // Issue #219 / QUM-69: the latch's two events are exactly the
             // BANCHOR and BNF2 bind-close gates just written above.
-            #[cfg(feature = "q69-latch")]
             let (bgc_banchor, bgc_bnf2) = (gpermv * selv[6], gpermv * selv[8]);
-            #[cfg(feature = "q69-latch")]
             {
                 row[LATCH_COL] = F::from_u32(latch);
                 row[DV_COL] = F::from_u32(dvv);
@@ -1951,13 +1884,11 @@ impl NarrowKeccakAir {
             }
             // Issue #215 (i): the third bank's three gates and the span marker
             // (mirrors the materialized gate columns exactly).
-            #[cfg(feature = "q215-rho")]
             let (g3pos, g3neg, g3close) = (
                 bndv * se[SE_RHO],
                 bndv * se[3] * om,
                 gpermv * se[SE_RHO],
             );
-            #[cfg(feature = "q215-rho")]
             {
                 row[OM_COL] = F::from_u32(om);
                 row[EG3_OFF] = F::from_u32(g3pos);
@@ -2011,7 +1942,6 @@ impl NarrowKeccakAir {
                     -F::from_u32((-*acc) as u32)
                 };
             }
-            #[cfg(feature = "q215-rho")]
             for (i, acc) in eq3.iter().enumerate() {
                 row[EQ3_OFF + i] = sgn(*acc);
             }
@@ -2039,7 +1969,6 @@ impl NarrowKeccakAir {
                 }
                 // Mirrors the third bank's transition exactly: reset on close,
                 // else accumulate +W5..8 and (at ACMOUT_1 only) -a[0..4].
-                #[cfg(feature = "q215-rho")]
                 {
                     // The constraint resets every chunk on the close row, and
                     // the legs are zero there (close is a `gperm` row, the legs
@@ -2058,7 +1987,6 @@ impl NarrowKeccakAir {
                 }
                 ep *= 1 - gwrap;
                 // Mirrors the latch transition constraint exactly.
-                #[cfg(feature = "q69-latch")]
                 {
                     latch = latch * (1 - bgc_banchor) + bgc_bnf2;
                 }
@@ -2712,11 +2640,7 @@ mod tests {
         // whatever the feature set's own perm count is rather than a literal:
         // 83 base, 84 with issue #215 (i)'s `ROLE_ARHO`. Absorbing `d` moves
         // neither.
-        assert_eq!(
-            BUCKET_PERMS,
-            83 + if cfg!(feature = "q215-rho") { 1 } else { 0 },
-            "perm count unchanged by the d-absorb"
-        );
+        assert_eq!(BUCKET_PERMS, 84, "perm count unchanged by the d-absorb");
     }
 
     fn test_bucket(v1: u64, v2: u64, o1: u64, o2: u64) -> (BucketInstance, u64) {
@@ -2879,10 +2803,11 @@ mod tests {
     // from counting factors by hand.
     // -----------------------------------------------------------------------
 
-    /// The trace width `prove` is handed. **617 unfeatured** — which is also the
+    /// The trace width `prove` is handed: **643**, and the accounting from the
+    /// pre-mint **617** is spelled out column by column below. (617 is also the
     /// third independent sighting of the stale `618` in the comment on
-    /// `NARROW_WIDTH`'s definition and in `protocol-spec.md:59` (issue #234, NOT
-    /// fixed here) — and **620 with the latch's three columns.**
+    /// `NARROW_WIDTH`'s definition and in `protocol-spec.md:59` — issue #234,
+    /// NOT fixed here.)
     ///
     /// Issue #215 (i) adds **23**, and this test is the mint baton's stage-1
     /// gate (a): *account for the width delta over 617 column by column, every
@@ -2902,34 +2827,27 @@ mod tests {
         let trace = air.generate_trace::<F>(0);
         assert_eq!(trace.width(), NARROW_WIDTH, "width must be the matrix's own");
 
-        const BASE: usize = 617;
-        // Issue #219 / QUM-69, the latch — as merged in PR #239.
-        let q69_latch = usize::from(cfg!(feature = "q69-latch"));
-        let q69 = q69_latch * 3; // L, dv, L·dv
+        // The pre-mint base — `main` before either change.
+        const PRE_MINT: usize = 617;
+        // Issue #219, the latch (PR #239).
+        let latch = 3; // L, dv, L·dv
         // Issue #215 (i) / #219 option 4, the one-permutation form.
-        let q215_on = usize::from(cfg!(feature = "q215-rho"));
-        let q215 = q215_on
-            * (1 // sel(ROLE_ARHO)                — NSEL 13 → 14
-                + 1 // inj(ROLE_ARHO)             — NINJ 5 → 6, a full-state override
-                + 1 // SE_RHO = (arho + acmout)·ep — NSE 6 → 7, the window selector
-                + 1 // OM                          — the output-1 span marker
-                + 3 // EG3                         — pos, neg, close (close doubles as reset)
-                + 16); // EQ3                      — the third accumulator, 4 lanes × 4 chunks
-        assert_eq!(q215, q215_on * 23, "issue #215 (i) costs 23 columns");
+        let opt4 = 1 // sel(ROLE_ARHO)                 — NSEL 13 → 14
+            + 1 // inj(ROLE_ARHO)                      — NINJ 5 → 6, a full-state override
+            + 1 // SE_RHO = (arho + acmout)·ep         — NSE 6 → 7, the window selector
+            + 1 // OM                                  — the output-1 span marker
+            + 3 // EG3                                 — pos, neg, close (close doubles as reset)
+            + 16; // EQ3                               — the third accumulator, 4 lanes × 4 chunks
+        assert_eq!(latch, 3, "issue #219 costs 3 columns");
+        assert_eq!(opt4, 23, "issue #215 (i) costs 23 columns");
         assert_eq!(
             trace.width(),
-            BASE + q69 + q215,
+            PRE_MINT + latch + opt4,
             "width must be 617 plus exactly the columns named above"
         );
-        // The four reachable feature combinations, pinned as absolutes so the
-        // accounting above cannot drift by cancelling errors.
-        let expected = match (q69_latch, q215_on) {
-            (0, 0) => 617,
-            (1, 0) => 620,
-            (0, 1) => 640,
-            _ => 643,
-        };
-        assert_eq!(trace.width(), expected, "pinned width for this feature set");
+        // Pinned as an absolute too, so the accounting cannot drift by
+        // cancelling errors.
+        assert_eq!(trace.width(), 643, "the minted width");
     }
 
     /// 🔴 The condition the ruling on `#219` names: **does the gated anchor close
@@ -2972,7 +2890,7 @@ mod tests {
         assert_eq!((deg - 1).next_power_of_two(), 4, "quotient chunks");
         // The census, pinned. `main`'s 873 / `{1: 207, 2: 511, 3: 142, 4: 13}`
         // reproduces PR #239's record at `d16ffd5` exactly, which is what makes
-        // the featured rows below comparable to it.
+        // the minted census below comparable to it.
         //
         // Issue #215 (i) adds **57**: 1 selector + 1 injection flag + 1 SE + 3
         // bank gates + 3 for the span marker (bool, row-0 pin, transition) + 16
@@ -2991,14 +2909,9 @@ mod tests {
             for c in &cs {
                 *hist.entry(c.degree_multiple()).or_insert(0usize) += 1;
             }
-            let (want_n, want_deg4) = match (cfg!(feature = "q69-latch"), cfg!(feature = "q215-rho")) {
-                (false, false) => (873, 13),
-                (true, false) => (880, 13),
-                (false, true) => (930, 15),
-                (true, true) => (937, 15),
-            };
-            assert_eq!(cs.len(), want_n, "symbolic constraint count");
-            assert_eq!(hist.get(&4).copied().unwrap_or(0), want_deg4, "deg-4 constraints");
+            // 873 pre-mint + 7 (latch) + 57 (option 4) = 937.
+            assert_eq!(cs.len(), 937, "symbolic constraint count");
+            assert_eq!(hist.get(&4).copied().unwrap_or(0), 15, "deg-4 constraints");
             assert_eq!(hist.keys().max(), Some(&4), "nothing above degree 4");
         }
     }
@@ -3045,7 +2958,6 @@ mod tests {
     /// The shared fixture: one real input in a live tree, one invented dummy.
     /// The real note's value covers both outputs and the fee on its own — that
     /// IS the one-note spend `#219` says a payment recipient cannot make today.
-    #[cfg(feature = "q69-latch")]
     fn dummy1_parts() -> (TxInput, MerkleWitness, TxInput, [TxOutput; 2], u64, [u64; 4]) {
         let real = TxInput {
             sk: [0x11, 0x22, 0x33, 0x44],
@@ -3072,7 +2984,6 @@ mod tests {
         (real, w_real, dummy, outputs, fee, anchor)
     }
 
-    #[cfg(feature = "q69-latch")]
     fn dummy1_instance() -> BucketInstance {
         let (real, w_real, dummy, outputs, fee, anchor) = dummy1_parts();
         build_bucket_dummy1(
@@ -3091,7 +3002,6 @@ mod tests {
     /// fixture is not vacuous: the dummy slot's witness genuinely does NOT fold
     /// to the anchor, so this instance would be unprovable without the latch
     /// (which `q69_dv_false_is_the_unchanged_2x2` confirms from the other side).
-    #[cfg(feature = "q69-latch")]
     #[test]
     fn q69_dummy1_satisfies_constraints() {
         let (real, w_real, dummy, ..) = dummy1_parts();
@@ -3123,7 +3033,6 @@ mod tests {
     /// must rise on the first row of perm 42 (chain 1's `ROLE_ARKM`) and fall on
     /// the first row of perm 77 — high on perm 76's last row, which is where the
     /// anchor close it relaxes actually fires.
-    #[cfg(feature = "q69-latch")]
     #[test]
     fn q69_latch_span_is_exactly_chain_1() {
         let inst = dummy1_instance();
@@ -3150,7 +3059,6 @@ mod tests {
     /// The dummy slot contributes **0** to the balance: a fee one unit off the
     /// ONE real input's arithmetic is caught. If the dummy's value were free the
     /// prover could balance any fee it liked.
-    #[cfg(feature = "q69-latch")]
     #[test]
     fn q69_dummy_slot_contributes_zero_to_the_balance() {
         let (real, w_real, dummy, outputs, fee, anchor) = dummy1_parts();
@@ -3168,7 +3076,6 @@ mod tests {
     /// dummy slot's value to 0 bit by bit. Built by hand rather than through
     /// `build_bucket_dummy1` (which asserts on a nonzero dummy value), because
     /// the claim under test is that the **circuit** refuses it, not the builder.
-    #[cfg(feature = "q69-latch")]
     #[test]
     fn q69_dummy_slot_value_must_be_zero() {
         let (real, w_real, mut dummy, outputs, _, anchor) = dummy1_parts();
@@ -3193,7 +3100,6 @@ mod tests {
     /// `ROLE_BNF2` stays in the dummy chain, so the dummy nullifier is a real
     /// nullifier of an invented note and the proof commits to it — an unbound
     /// `PV_NF2` would let a relay rewrite it, which is a censorship vector.
-    #[cfg(feature = "q69-latch")]
     #[test]
     fn q69_dummy_nullifier_is_bound() {
         let inst = dummy1_instance();
@@ -3209,7 +3115,6 @@ mod tests {
     /// `ROLE_BNF2`'s close, which the verifier's program places after chain 0's
     /// `ROLE_BANCHOR`; so slot 0's anchor bind fires with `dv` set exactly as it
     /// does with `dv` clear. This is the property `#215` (i) inherits.
-    #[cfg(feature = "q69-latch")]
     #[test]
     fn q69_dv_cannot_make_slot_0_a_dummy() {
         let (real, _, dummy, outputs, _, _) = dummy1_parts();
@@ -3244,7 +3149,6 @@ mod tests {
     /// Under the latch there is no `dv` assignment that relaxes both anchors, so
     /// the circuit refuses one layer earlier and *"slot 0 is a real spend"* stops
     /// being load-bearing on a consensus check.
-    #[cfg(feature = "q69-latch")]
     #[test]
     fn q69_both_slots_dummy_is_unreachable() {
         let (real, _, dummy, _, _, _) = dummy1_parts();
@@ -3281,7 +3185,6 @@ mod tests {
     /// real bucket still proves, and a witness that does not fold to the anchor
     /// is still rejected on **both** slots. If the gated close leaked, the second
     /// half of this would go green and nothing else would notice.
-    #[cfg(feature = "q69-latch")]
     #[test]
     fn q69_dv_false_is_the_unchanged_2x2() {
         let (inst, _) = test_bucket(10, 6, 4, 8);
@@ -3325,7 +3228,6 @@ mod tests {
     // third bank. These are that, plus the two properties the ruling asked to
     // have removed rather than documented.
     // -----------------------------------------------------------------------
-    #[cfg(feature = "q215-rho")]
     mod q215 {
         use super::*;
 
@@ -3642,7 +3544,7 @@ mod tests {
         ///
         /// 1. slot 0 carries a full real input chain — `ANK → NF → BNF1 →
         ///    ARKM → ACM → 32 × MERKLE → BANCHOR` — in the canonical program;
-        /// 2. under `q69-latch`, `dv` cannot relax slot 0 (the latch's span
+        /// 2. `dv` cannot relax slot 0 (the latch's span
         ///    starts at `BNF2`), which `q69_dv_cannot_make_slot_0_a_dummy`
         ///    proves in-circuit and this test cross-references by name.
         #[test]

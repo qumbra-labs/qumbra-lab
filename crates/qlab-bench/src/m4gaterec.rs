@@ -39,6 +39,7 @@ use p3_symmetric::Permutation;
 use p3_uni_stark::{prove, Proof};
 use qlab_air::narrow::{build_bucket, BucketInstance, TxInput, TxOutput};
 
+use crate::m4gate::FLUSH_BLOCKS;
 use crate::{make_config_with, Config, FriCfg, Val};
 
 pub(crate) type Ext = BinomialExtensionField<Val, 4>;
@@ -1432,11 +1433,23 @@ mod tests {
         // query's verification work: +27 leaf-sponge + 76 path-compress perms
         // (challenger UNCHANGED — the 21st index sample_bits draw fits the
         // existing squeeze buffer, no new keccak block) → 2,336 total.
+        //
+        // Issue #215 (i) + #219 then widened the inner trace 617 → 643, and the
+        // delta lands entirely on the **challenger**: 173 → 179, i.e. exactly
+        // F2's block growth (148 → 154), since flush 2 observes the zeta
+        // openings and one keccak block is one permutation. Leaf and compress do
+        // not move — they are driven by the query COUNT and the Merkle path
+        // depth, neither of which the width touches. Total 2,342.
         let (leaf, compress, chal) = sched.native_counts;
-        assert_eq!(leaf + compress + chal, 2_336, "census total (q21)");
-        assert_eq!(leaf, 567, "census leaf (q21: 540 + 27)");
-        assert_eq!(compress, 1_596, "census compress (q21: 1520 + 76)");
-        assert_eq!(chal, 173, "census challenger (q21: unchanged)");
+        assert_eq!(leaf, 567, "census leaf (q21: 540 + 27; width-independent)");
+        assert_eq!(compress, 1_596, "census compress (q21: 1520 + 76; width-independent)");
+        assert_eq!(
+            chal,
+            173 + (FLUSH_BLOCKS[2] - 148),
+            "census challenger — 173 at tw=617, plus F2's block growth since"
+        );
+        assert_eq!(chal, 179, "census challenger at tw=643");
+        assert_eq!(leaf + compress + chal, 2_342, "census total (q21, tw=643)");
     }
 
     /// The walk's draw model reproduces a real SerializingChallenger32

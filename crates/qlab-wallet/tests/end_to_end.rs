@@ -7,7 +7,7 @@
 //! This exercises every crate boundary: `qlab-wallet` keys/addresses,
 //! `qlab-note` KEM/AEAD/scan, and `qlab-air`'s circuit packing.
 
-use qlab_air::narrow::{build_bucket, TxInput, TxOutput};
+use qlab_air::narrow::{build_bucket, derive_output_rho, TxInput, TxOutput};
 use qlab_note::note::Note;
 use qlab_note::scan::{encrypt_to_recipient, ScanMode};
 use qlab_wallet::address::{Address, Diversifier};
@@ -94,6 +94,14 @@ fn derive_address_encrypt_scan_recompute_and_spend() {
 
     // (a) recompute-cm matches qlab-air packing: the output note's commitment
     //     recomputed by the wallet/qlab-note equals the circuit's cm_out[0].
+    //
+    // 🔴 Issue #215 (i): the seed is DERIVED, so the note the wallet reconstructs
+    // takes `rho` from `derive_output_rho(nf_0, index)` — not from the sender's
+    // choice, which `build_bucket` overrides. `nf_0` is `PV_NF1`, public, so a
+    // wallet needs nothing extra to compute it. This is the wallet-side half of
+    // the contract #188 (a) is priced against, and the packing lock it stands
+    // for is unaffected: only where `rho` comes from changed.
+    let out0 = Note { rho: derive_output_rho(&inst.nf[0], 0), ..out0 };
     assert_eq!(
         out0.commitment(),
         inst.cm_out[0],
@@ -261,6 +269,9 @@ fn seed_to_mnemonic_to_rotated_address_encrypt_scan_spend() {
         wallet.nullifier(&received.rho),
         "circuit nf[0] == seed-derived wallet nullifier (HD key is spendable)"
     );
+    // Issue #215 (i): the reconstructed note's seed is derived — see the note on
+    // the same assertion in `derive_address_encrypt_scan_recompute_and_spend`.
+    let out0 = Note { rho: derive_output_rho(&inst.nf[0], 0), ..out0 };
     assert_eq!(
         out0.commitment(),
         inst.cm_out[0],

@@ -77,7 +77,7 @@ pub const ADDR_RKM_LEN: usize = 32;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qlab_air::narrow::{build_bucket, TxInput, TxOutput};
+    use qlab_air::narrow::{build_bucket, derive_output_rho, TxInput, TxOutput};
     use qlab_note::hash::{digest_bytes, keccak256};
     use qlab_wallet::address::{Address, Diversifier};
     use qlab_wallet::keys::Lanes;
@@ -86,6 +86,13 @@ mod tests {
     /// STOP-POINT lock 1: `note_commitment` reproduces `build_bucket`'s output
     /// commitment byte-for-byte. If qlab-air's ROLE_ACMOUT packing ever moves,
     /// this breaks and the disclosure statement shape is a spec question.
+    ///
+    /// 🔴 Issue #215 (i) moved it — not the packing, the **seed**: `rho'` is now
+    /// derived (`rho'_0 = nf_0`, `rho'_1 = H(nf_0 ‖ D_P)`) and `build_bucket`
+    /// overrides any `TxOutput::rho` a caller supplies. So the disclosure path
+    /// must open the commitment at the DERIVED seed, which is what a discloser
+    /// actually has: `nf_0` is `PV_NF1` and therefore public. The packing itself
+    /// is unchanged, and this lock still says so.
     #[test]
     fn note_commitment_matches_build_bucket() {
         // Deterministic pseudo-random instance (mirrors narrow_bench).
@@ -128,7 +135,8 @@ mod tests {
         ];
         let inst = build_bucket(18, &inputs, &outputs, 1_000);
         for (i, o) in outputs.iter().enumerate() {
-            let cm = note_commitment(o.value, &o.rkm, &o.rho, &o.rseed);
+            let rho = derive_output_rho(&inst.nf[0], i);
+            let cm = note_commitment(o.value, &o.rkm, &rho, &o.rseed);
             assert_eq!(
                 cm, inst.cm_out[i],
                 "note_commitment must match build_bucket's output commitment {i}"

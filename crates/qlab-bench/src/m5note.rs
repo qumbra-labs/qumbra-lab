@@ -170,7 +170,7 @@ mod tests {
     /// commitment recompute is byte-identical to what qlab-air's circuit binds.
     #[test]
     fn commitment_matches_qlab_air() {
-        use qlab_air::narrow::{build_bucket, TxInput, TxOutput};
+        use qlab_air::narrow::{build_bucket, derive_output_rho, TxInput, TxOutput};
         let o0 = note(1);
         let o1 = note(2);
         let fee = 7u64;
@@ -184,8 +184,20 @@ mod tests {
             TxOutput { value: o1.value, rkm: o1.rkm, rho: o1.rho, rseed: o1.rseed },
         ];
         let inst = build_bucket(18, &inputs, &outputs, fee);
-        assert_eq!(note_commitment(o0.value, &o0.rkm, &o0.rho, &o0.rseed), inst.cm_out[0]);
-        assert_eq!(o1.commitment(), inst.cm_out[1]);
+        // 🔴 Issue #215 (i): the output note seed is **derived, not chosen**, so
+        // the `TxOutput::rho` handed in above is overridden and the commitment
+        // opens at `derive_output_rho` instead. That is not a wart to work
+        // around — it is the contract #188 (a) is priced against: the recipient
+        // gets `value ‖ rseed` in the discovery payload and reads rho off
+        // `nf_0`, which is `PV_NF1` and therefore public. A caller that still
+        // believes it picked rho would compute a commitment the chain does not
+        // contain, which is exactly what this assertion now catches.
+        let rho = [
+            derive_output_rho(&inst.nf[0], 0),
+            derive_output_rho(&inst.nf[0], 1),
+        ];
+        assert_eq!(note_commitment(o0.value, &o0.rkm, &rho[0], &o0.rseed), inst.cm_out[0]);
+        assert_eq!(note_commitment(o1.value, &o1.rkm, &rho[1], &o1.rseed), inst.cm_out[1]);
     }
 
     #[test]
