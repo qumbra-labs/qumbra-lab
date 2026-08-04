@@ -55,7 +55,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use qlab_cbserver::codec::{
-    decode_group_contents, encode_compact_response, encode_full_response, encode_group_contents,
+    decode_committed_discovery, encode_committed_discovery, encode_compact_response,
+    encode_full_response,
     read_varint, write_varint, CodecError, CompactBlock, CompactGroup,
 };
 use qlab_cbserver::tree::Frontier;
@@ -237,11 +238,16 @@ impl BlockDiscovery {
     /// rather than a hope.** `qlab_devnet::body::check_tx_discovery` refuses any
     /// body whose discovery does not re-encode to itself (`DiscoveryNotCanonical`,
     /// `discovery-on-the-consensus-wire.md` §4 rule 3), so for every block in a
-    /// node's store `encode_group_contents(decode_group_contents(b)) == b` already
-    /// held before the block was accepted. Serving is therefore the projection D2
-    /// requires — `varint(position) ‖ committed_bytes` — and not a re-encoding of
-    /// it. `served_groups_are_the_committed_bytes_verbatim` asserts the byte
-    /// identity rather than trusting this paragraph.
+    /// node's store `encode_committed_discovery(decode_committed_discovery(b)) == b`
+    /// already held before the block was accepted. Serving is therefore the
+    /// projection D2 requires and not a re-encoding of it.
+    ///
+    /// 🔴 Since issue #188 (a) the projection is `varint(position) ‖ the
+    /// **`group_contents` prefix** of the committed bytes` — the relocated AEAD
+    /// payload section is committed but deliberately **not** on the compact wire,
+    /// which is what keeps `/v1/compact`'s golden vector byte-identical across the
+    /// relocation. `served_groups_are_the_committed_bytes_verbatim` asserts that
+    /// byte identity against the prefix rather than trusting this paragraph.
     ///
     /// An `Err` here means a stored block carries bytes `validate_body` would have
     /// rejected, i.e. a broken internal invariant. It is returned rather than
@@ -257,7 +263,7 @@ impl BlockDiscovery {
             .map(|(i, bytes)| {
                 Ok(CompactGroup {
                     tx_index: i as u64,
-                    recipients: decode_group_contents(bytes)?,
+                    recipients: decode_committed_discovery(bytes)?.0,
                 })
             })
             .collect()
@@ -468,8 +474,15 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
         // a `ct` the chain never saw and silently find nothing. Byte equality is
         // what keeps the two surfaces one artifact; it implies the old
         // commitment check.
-        if encode_group_contents(
+        // 🔴 Since issue #188 (a) the payloads are part of the committed artifact
+        // too, so this compares BOTH halves. That is strictly stronger than
+        // before and it closes the gap the paragraph above describes at its
+        // source: a submission whose payloads differ from the committed ones can
+        // no longer be accepted at all, rather than being accepted and then
+        // serving payloads index-aligned against a `ct` the chain never saw.
+        if encode_committed_discovery(
             &discovery.recipients.iter().map(|r| r.bundle.clone()).collect::<Vec<_>>(),
+            &discovery.recipients.iter().flat_map(|r| r.payloads.clone()).collect::<Vec<_>>(),
         ) != tx.discovery
         {
             return SubmitOutcome::Rejected(RejectReason::DiscoveryMismatch);
@@ -1118,6 +1131,7 @@ mod tests {
     /// A transaction whose committed discovery group is the real bundle
     /// [`disc_for`] hands the RPC — the pairing every honest submission has.
     fn tx_with(anchor: Hash32, nfs: &[u8], cms: &[u8], fee: u64) -> TxEntry {
+        let disc = recip(CT_BASE, cms);
         TxEntry::new(
             b"ok".to_vec(),
             TxPublic {
@@ -1127,9 +1141,13 @@ mod tests {
                 bucket: ArityBucket::TwoByTwo,
                 fee,
             },
-            &[recip(CT_BASE, cms).bundle],
-            // Issue #188 (a): payloads are committed alongside the bundles.
-            &vec![vec![0u8; qlab_note::compact::PAYLOAD_LEN]; cms.len() / 32],
+            // Issue #188 (a): the payloads are committed alongside the bundles,
+            // and they must be the SAME ones `disc_for` hands the RPC — the
+            // fixture cannot pick them independently of its transaction any more
+            // than it can pick its bundle, because `submit_tx` now compares both
+            // halves byte for byte.
+            &[disc.bundle],
+            &disc.payloads,
         )
     }
 
@@ -1523,13 +1541,33 @@ mod tests {
         let stored = rpc.node().chain().block(&hash).expect("tip stored").clone();
         for (i, group) in blocks[0].groups.iter().enumerate() {
             assert_eq!(group.tx_index, i as u64, "position is the index, nothing else is");
+            // 🔴 Since issue #188 (a) "verbatim" means the committed region's
+            // `group_contents` PREFIX — serving projects it and leaves the
+            // relocated payload section behind. Still a projection and not a
+            // re-encoding: these bytes are copied out of `stored.txs[i].discovery`.
+            let committed = &stored.txs[i].discovery;
+            let prefix = qlab_cbserver::codec::committed_contents_prefix(committed)
+                .expect("a stored block's committed region decodes");
             let mut expected = Vec::new();
             write_varint(&mut expected, i as u64);
-            expected.extend_from_slice(&stored.txs[i].discovery);
+            expected.extend_from_slice(prefix);
             assert_eq!(
                 qlab_cbserver::codec::encode_group(group),
                 expected,
-                "the served group is varint(position) ‖ the committed bytes, verbatim"
+                "the served group is varint(position) ‖ the committed PREFIX, verbatim"
+            );
+            // The other half of the projection, asserted rather than assumed: the
+            // payload section is committed and NOT served here. If these were
+            // equal, the compact wire would have grown by 120 B per output and
+            // `golden_bytes_lock_the_framing` would be the one that moved.
+            assert!(
+                prefix.len() < committed.len(),
+                "the committed region must carry a payload section beyond the prefix"
+            );
+            assert_eq!(
+                committed.len() - prefix.len(),
+                stored.txs[i].commitments.len() * qlab_cbserver::codec::PAYLOAD_LEN,
+                "one fixed-width payload per output, committed but not served"
             );
         }
     }

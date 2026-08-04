@@ -43,12 +43,36 @@
 //!
 //! 🔴 **`golden_bytes_lock_the_framing` is now a consensus lock, not a wire
 //! lock** (D2): changing those bytes changes `BlockBody::commitment()`.
+//!
+//! > **Scope narrowed 2026-08-04** (issue #188 (a) as amended, the mint baton's
+//! > stage-3 relocation). The line above was written when the framing bytes
+//! > *were* the whole of what a body commits. They are now a **prefix** of it.
+//! >
+//! > **(a) What this golden locks:** the framing of the committed region's
+//! > `group_contents` **prefix** — which is exactly the source `/v1/compact`
+//! > projects, and therefore still a consensus lock, because a prefix of the
+//! > preimage is as load-bearing as the rest of it.
+//! >
+//! > **(b) Where the whole preimage is locked:**
+//! > `qlab_devnet::body::tests::golden_body_commitment_bytes`. When the payload
+//! > section moves, **that** is the test that goes red — this one does not, and
+//! > must not.
+//! >
+//! > **(c) Why it narrowed:** stage 3 relocated the AEAD payloads *into* the
+//! > committed region (`group_contents ‖ payloads`, one fixed 120-byte payload
+//! > per entry). The accepted placement kept the served wire byte-identical via
+//! > the projection, so these bytes did not change — **only their scope did.**
+//! > Nothing went red, which is precisely why it is written down: a sentence that
+//! > stays true while quietly meaning less than it says is the failure mode this
+//! > baton has now hit twice (the other was `Ivk`'s "scanning is unaffected").
 
 pub use qlab_note::compact::{
-    contents_commitments, decode_group, decode_group_contents, encode_group,
-    encode_group_contents, group_len, groups_eq, read_bundle, read_entry, read_group,
-    read_group_contents, read_varint, write_bundle, write_entry, write_group,
-    write_group_contents, write_varint, CodecError, CompactGroup,
+    committed_contents_prefix, contents_commitments, contents_entry_count,
+    decode_committed_discovery, decode_group, decode_group_contents,
+    encode_committed_discovery, encode_group, encode_group_contents, group_len, groups_eq,
+    read_bundle, read_entry, read_group, read_group_contents, read_varint, write_bundle,
+    write_entry, write_group, write_group_contents, write_varint, CodecError, CompactGroup,
+    PAYLOAD_LEN,
 };
 
 use crate::WIRE_VERSION;
