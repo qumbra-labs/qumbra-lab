@@ -8,11 +8,12 @@
 //!   scan      balance by light-client scan against a cbserver URL
 //! ```
 //!
-//! Deliberately absent: `send` (C3-gated — the dummy mechanism and the mint;
-//! the seam is `qlab_wallet::keys::SpendAuth::spend_input` + a submission
-//! surface, and it is named here so the next baton starts from a sentence, not
-//! a search) · any embedded node (scan is an HTTP client) · GUI/QR (the
-//! shells' business — see the design repo's wallet briefs).
+//! `send` is WRITTEN, NOT ACCEPTED (t1-readiness-plan §3): [`send`] builds and
+//! REALLY proves against the merged #219 latch (lab PR #252), writes the
+//! canonical wire bytes to a file — and does not submit, because no public
+//! submission surface exists by decision (§6.2); the seam stays named.
+//! Deliberately absent: any embedded node (scan is an HTTP client) · GUI/QR
+//! (the shells' business — see the design repo's wallet briefs).
 //!
 //! # The two disciplines everything here bends around
 //!
@@ -29,5 +30,6 @@
 //! and `qumbra-explorer` pin for refused supply figures, so one grep covers all
 //! three surfaces.
 
+pub mod send;
 pub mod store;
 pub mod view;

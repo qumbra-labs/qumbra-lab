@@ -28,6 +28,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("backup") => backup(&args[1..]),
         Some("scan") => scan(&args[1..]),
         Some("miner-rkm") => miner_rkm(&args[1..]),
+        Some("send") => send(&args[1..]),
         Some("-h") | Some("--help") | None => {
             usage();
             Ok(())
@@ -48,7 +49,10 @@ fn usage() {
          qumbra-wallet address --dir DIR [--new|--index N]  show or allocate diversified addresses\n  \
          qumbra-wallet backup  --dir DIR --reveal        print the mnemonic (explicitly, once)\n  \
          qumbra-wallet scan    --dir DIR --url URL --to N [--from N]  balance via light-client scan\n  \
-         qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n\n\
+         qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n  \
+         qumbra-wallet send --dir DIR --url URL --scan-to N --to ADDR --amount BESSEL --out FILE\n  \
+                            build + PROVE a spend (real STARK, ~2 s / ~12 GB); writes wire bytes,\n  \
+                            does NOT submit (no public submission surface exists — by decision)\n\n\
          There is deliberately no `send` yet: it is gated on the dummy-input mechanism\n\
          (lab #219) and the T1 mint. Nothing here runs a node.\n"
     );
@@ -152,6 +156,65 @@ fn miner_rkm(args: &[String]) -> Result<(), Box<dyn Error>> {
          COINBASE_MATURITY_BLOCKS in qlab-node — before it is spendable)"
     );
     Ok(())
+}
+
+/// Written, not accepted (the mint is its acceptance): scan → select → prove →
+/// encrypt → write the canonical wire bytes. Refuses on partial scan coverage
+/// — spending on incomplete knowledge risks double-claimed nullifiers.
+fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use qlab_cbserver::client::{light_client_scan, Completeness, ScanConfig};
+    use qumbra_wallet::send::{os_rng, Spendable};
+
+    let dir = dir_of(args)?;
+    let url = flag(args, "--url").ok_or("send requires --url (cbserver)")?;
+    let scan_to: u64 = flag(args, "--scan-to").ok_or("send requires --scan-to HEIGHT")?.parse()?;
+    let to = flag(args, "--to").ok_or("send requires --to ADDRESS")?;
+    let amount: u64 = flag(args, "--amount").ok_or("send requires --amount BESSEL")?.parse()?;
+    let out = flag(args, "--out").ok_or("send requires --out FILE")?;
+
+    let recipient = qlab_wallet::address::Address::decode(to)
+        .ok_or("`--to` is not a valid qaddr1… address")?;
+
+    let w = WalletDir::open(&dir)?;
+    let wallet = w.wallet();
+    let mut rng = os_rng();
+
+    // Gather spendables — and REFUSE on any non-Complete verdict: a spend
+    // built on partial knowledge can double-claim a nullifier.
+    let mut spendables: Vec<Spendable> = Vec::new();
+    for &idx in &w.allocated {
+        let d = wallet.diversifier_at_index(idx);
+        let kp = wallet.diversified_keypair(&d);
+        let outcome = light_client_scan(url, &kp.dk, 0, scan_to, ScanConfig::default(), &mut rng)
+            .map_err(|e| format!("scan never started for index {idx}: {e}"))?;
+        match outcome.completeness() {
+            Completeness::Complete | Completeness::Shadowed { .. } => {}
+            other => {
+                return Err(format!(
+                    "index {idx} scanned {other:?} — refusing to build a spend on partial                      knowledge (a double-claimed nullifier could be among the unread outputs)"
+                )
+                .into())
+            }
+        }
+        for ln in &outcome.notes {
+            spendables.push(Spendable {
+                div_index: idx,
+                value: ln.detected.note.value,
+                rho: ln.detected.note.rho,
+                rseed: ln.detected.note.rseed,
+            });
+        }
+    }
+
+    // 🔴 The tree. A light client cannot yet RECONSTRUCT the commitment tree
+    // from the compact stream on a real chain (coinbase leaves append at
+    // maturity and are not compact entries) — the named gap this subcommand
+    // carries until a tree-sync surface exists. Acceptance rides the mint.
+    return Err(format!(
+        "send is WRITTEN but cannot complete against a remote endpoint yet: the commitment          tree (witness source) is not reconstructible from the compact stream — coinbase          leaves are not compact entries. {} spendable note(s) were found and the prover path          is real (see `send::build_send` and its test); the tree-sync surface is the named          open piece, tracked with the submission seam. Nothing was written to {out}.",
+        spendables.len()
+    )
+    .into())
 }
 
 fn backup(args: &[String]) -> Result<(), Box<dyn Error>> {

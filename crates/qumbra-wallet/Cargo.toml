@@ -28,3 +28,15 @@ qlab-cbserver = { path = "../qlab-cbserver" }
 qlab-note = { path = "../qlab-note" }
 # OS CSPRNG for seed entropy and the scan's decoy rng.
 rand = "0.10"
+# The send path (written ahead of the mint; acceptance rides it): the frozen
+# 2x2 builder incl. build_bucket_dummy1 (#219's latch, merged in lab PR #252),
+# the REAL prover, tx body types + the posted-fee table, and the canonical tx
+# wire bytes.
+qlab-air = { path = "../qlab-air" }
+qlab-consensus = { path = "../qlab-consensus" }
+qlab-devnet = { path = "../qlab-devnet" }
+qlab-p2p = { path = "../qlab-p2p" }
+bincode = "1"
+# Only for the send test's declared-surface comparison (PrimeField32 → u32),
+# same pin as qlab-consensus.
+p3-field = "=0.6.1"

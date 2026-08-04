@@ -1217,8 +1217,14 @@ dependencies = [
 name = "qumbra-wallet"
 version = "0.0.0"
 dependencies = [
+ "bincode",
+ "p3-field",
+ "qlab-air",
  "qlab-cbserver",
+ "qlab-consensus",
+ "qlab-devnet",
  "qlab-note",
+ "qlab-p2p",
  "qlab-wallet",
  "rand",
 ]
