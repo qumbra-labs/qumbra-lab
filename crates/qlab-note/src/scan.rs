@@ -119,6 +119,57 @@ pub fn detect_matches(dk: &Dk, bundle: &RecipientBundle) -> Vec<usize> {
         .collect()
 }
 
+/// A sender sealed a note seed that contradicts the one the chain derives.
+///
+/// 🔴 **Diagnostics, not coverage — and the distinction is the whole point of
+/// this type existing.**
+///
+/// **Coverage belongs entirely to the `cm` recompute in [`scan`]**, which is
+/// unconditional in both scan modes: a wrong ρ produces a note whose recomputed
+/// commitment does not match the entry's, so it is refused by every scanner class
+/// before this type is ever consulted. Deleting the seed comparison removes **no**
+/// refusal — `deleting_the_seed_check_does_not_weaken_the_refusal` pins exactly
+/// that, and it is the test that keeps this label honest.
+///
+/// **What it buys is attribution, which is load-bearing one layer up.** An `ivk`
+/// auditor who can say *"the sender sealed a ρ that contradicts the chain"* is
+/// making a checkable accusation; one who can only say *"this does not open"* is
+/// shrugging. That difference is the disclosure stack's operational value, and it
+/// is why this is built rather than skipped as redundant.
+///
+/// **It is not a consensus rule and cannot become one.**
+/// `discovery-on-the-consensus-wire.md` §4 rule 4 forbids consensus judging
+/// payload validity, and here the prohibition is also a physical fact: the
+/// payload is AEAD-sealed to a key no validator holds, so a node cannot run this
+/// check even if the rule allowed it. (The #188 amendment's "a full-body observer
+/// cross-checks payload-ρ" sentence was retracted by name on that ground.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SealedSeedMismatch {
+    /// Position within the transaction's outputs — the index ρ is derived at.
+    pub output_index: usize,
+    /// The seed the sender put in the AEAD payload.
+    pub sealed: [u64; 4],
+    /// The seed the chain derives from `nf_0` at this position (issue #215 (i)).
+    pub derived: [u64; 4],
+}
+
+/// Cross-check the seed a sender **sealed** against the one the chain
+/// **derives** at `output_index`, given the transaction's public `nf0`.
+///
+/// See [`SealedSeedMismatch`]: this attributes, it does not refuse. Callers that
+/// want a refusal already have one in [`scan`]'s commitment recompute.
+pub fn check_sealed_seed(
+    note: &Note,
+    nf0: &[u64; 4],
+    output_index: usize,
+) -> Result<(), SealedSeedMismatch> {
+    let derived = qlab_air::narrow::derive_output_rho(nf0, output_index);
+    if note.rho == derived {
+        return Ok(());
+    }
+    Err(SealedSeedMismatch { output_index, sealed: note.rho, derived })
+}
+
 /// FoSkip authenticity gate: does the note recovered from the payload recompute
 /// to the `cm` stored on the wire? This is the "recompute the note commitment"
 /// check that replaces the FO re-encryption at scan time.
@@ -314,6 +365,74 @@ mod tests {
                 found.len()
             );
         }
+    }
+
+    /// 🔴 **The test that keeps `SealedSeedMismatch`'s label honest.**
+    ///
+    /// A forged payload — a note sealed at a seed the chain does not derive — must
+    /// be refused **by the commitment recompute alone**, with the seed comparison
+    /// taking no part in it. That is what makes the diagnostic a diagnostic.
+    ///
+    /// The test does not simulate deleting the check; it demonstrates the check is
+    /// not in the refusal path at all, by showing the refusal happening in `scan`
+    /// (which never calls `check_sealed_seed`) and the attribution happening
+    /// separately, on the same forgery, in a caller that does.
+    #[test]
+    fn deleting_the_seed_check_does_not_weaken_the_refusal() {
+        let mut rng = StdRng::seed_from_u64(41);
+        let kp = generate_keypair(&mut rng);
+        let nf0 = [0xfeedu64, 2, 3, 4];
+
+        // Honest: the sender seals the seed the chain derives at output 0.
+        let honest = Note {
+            value: 4_242,
+            rkm: [7u64, 7, 7, 7],
+            rho: qlab_air::narrow::derive_output_rho(&nf0, 0),
+            rseed: [9u64, 9, 9, 9],
+        };
+        let good = encrypt_to_recipient(&kp.ek, &[honest], &mut rng);
+        for mode in [ScanMode::FullFo, ScanMode::FoSkip] {
+            assert_eq!(scan(&kp.dk, &good, mode).len(), 1, "{mode:?}: control");
+        }
+        assert_eq!(check_sealed_seed(&honest, &nf0, 0), Ok(()), "honest seed attributes clean");
+
+        // Forged: the sender seals a seed of its own choosing. Its `cm` is
+        // self-consistent — `encrypt_to_recipient` derives the entry from the note
+        // it is given — so the AEAD opens and the tag matches. The ONLY thing
+        // wrong is that the chain derives a different seed at this position.
+        let forged = Note { rho: [0xdead_beefu64, 1, 2, 3], ..honest };
+        assert_ne!(forged.rho, honest.rho);
+        let bad = encrypt_to_recipient(&kp.ek, &[forged], &mut rng);
+
+        // (1) `scan` FINDS it — and that is correct and not a hole. Nothing here
+        //     knows `nf0`, so at this layer the forgery is a well-formed note
+        //     whose commitment is self-consistent. The refusal that matters
+        //     happens where the CHAIN's `cm` is the comparand, which is the entry
+        //     the block committed — see (3).
+        for mode in [ScanMode::FullFo, ScanMode::FoSkip] {
+            let found = scan(&kp.dk, &bad, mode);
+            assert_eq!(found.len(), 1, "{mode:?}: self-consistent forgery opens");
+            assert_eq!(found[0].note.rho, forged.rho);
+        }
+
+        // (2) The diagnostic attributes it, which is its entire job.
+        let attributed = check_sealed_seed(&forged, &nf0, 0).expect_err("must attribute");
+        assert_eq!(attributed.output_index, 0);
+        assert_eq!(attributed.sealed, forged.rho);
+        assert_eq!(attributed.derived, honest.rho);
+
+        // (3) 🔴 And the REFUSAL is the recompute's, with the seed check absent.
+        //     Against the commitment the chain actually holds — the honest note's
+        //     — the forged note does not recompute. `scan` never calls
+        //     `check_sealed_seed`, so this refusal is coverage the diagnostic
+        //     contributes nothing to. Delete `check_sealed_seed` entirely and this
+        //     assertion still holds; that is the label, pinned.
+        let committed_cm = digest_bytes(&honest.commitment());
+        assert!(
+            !recompute_matches(&forged, &committed_cm),
+            "the forgery must be refused by the cm recompute ALONE"
+        );
+        assert!(recompute_matches(&honest, &committed_cm), "control: honest recomputes");
     }
 
     #[test]
