@@ -27,6 +27,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("address") => address(&args[1..]),
         Some("backup") => backup(&args[1..]),
         Some("scan") => scan(&args[1..]),
+        Some("miner-rkm") => miner_rkm(&args[1..]),
         Some("-h") | Some("--help") | None => {
             usage();
             Ok(())
@@ -46,7 +47,8 @@ fn usage() {
          qumbra-wallet restore --dir DIR                 seed from a Qumbra mnemonic on STDIN\n  \
          qumbra-wallet address --dir DIR [--new|--index N]  show or allocate diversified addresses\n  \
          qumbra-wallet backup  --dir DIR --reveal        print the mnemonic (explicitly, once)\n  \
-         qumbra-wallet scan    --dir DIR --url URL --to N [--from N]  balance via light-client scan\n\n\
+         qumbra-wallet scan    --dir DIR --url URL --to N [--from N]  balance via light-client scan\n  \
+         qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n\n\
          There is deliberately no `send` yet: it is gated on the dummy-input mechanism\n\
          (lab #219) and the T1 mint. Nothing here runs a node.\n"
     );
@@ -117,6 +119,38 @@ fn address(args: &[String]) -> Result<(), Box<dyn Error>> {
             println!("[{idx}] {}", wallet.address_at_index(*idx).encode());
         }
     }
+    Ok(())
+}
+
+/// The `miner_rkm` a node config needs so its coinbase pays THIS wallet
+/// (issue #246 join-docs gap): `hex(lane-major-LE(digest(rkm)))`, byte-for-byte
+/// the form `NodeConfig::miner_rkm_lanes` parses and the faucet's keygen
+/// prints. Position: derived at an ALLOCATED index's diversifier (default 0) —
+/// the identity this wallet already displays — not the faucet's fixed default
+/// diversifier, which is that binary's own convention.
+fn miner_rkm(args: &[String]) -> Result<(), Box<dyn Error>> {
+    let dir = dir_of(args)?;
+    let w = WalletDir::open(&dir)?;
+    let wallet = w.wallet();
+    let idx: u64 = flag(args, "--index").unwrap_or("0").parse()?;
+    if !w.allocated.contains(&idx) {
+        eprintln!(
+            "note: index {idx} is not in this wallet's allocated set — the rkm is valid, but \
+             allocate it (`address --new`) so scans cover the coinbase identity."
+        );
+    }
+    let d = wallet.diversifier_at_index(idx);
+    let bytes = qlab_note::hash::digest_bytes(&wallet.rkm(d));
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    println!("Put this in the NODE's config so it pays this wallet what it mines:");
+    println!("  miner_rkm = \"{hex}\"");
+    // Deliberately no copied number: the maturity constant lives in
+    // qlab_node::COINBASE_MATURITY_BLOCKS (frozen §2), and a second copy here
+    // is a WRONG-IN-THE-DETAIL waiting to happen.
+    println!(
+        "(coinbase paid to it belongs to address [{idx}]; it matures per frozen §2 — \
+         COINBASE_MATURITY_BLOCKS in qlab-node — before it is spendable)"
+    );
     Ok(())
 }
 
