@@ -106,8 +106,12 @@ degree still 4; `dv=0` still the unchanged 2×2 (PR #239's leak test carries ove
 The full 120 B AEAD payload, relocated into the committed discovery region per the
 accepted placement position (`group_contents ‖ payloads`, fixed-width per entry, D4
 order; `/v1/compact` projects only the prefix). `scan` verifies `cm` against the entry
-for every scanner class, and a full-body observer cross-checks payload-ρ against the
-derived ρ. This changes **body bytes, not proof bytes** — assert that: the stage-2 proof
+for every scanner class; the payload-ρ vs derived-ρ comparison lives in `scan` too and is
+**diagnostics, not coverage** — the payload is AEAD-sealed, so no validator can open it
+(§4 rule 4 stands), and a mismatched ρ is already refused by the unconditional `cm`
+recompute. *(Corrected 2026-08-04: this line originally said "a full-body observer
+cross-checks" — wrong, sealed payload;
+[ruling](https://github.com/qumbra-labs/qumbra-lab/issues/219#issuecomment-5176124371).)* This changes **body bytes, not proof bytes** — assert that: the stage-2 proof
 figure must not move in stage 3. Golden compact framing must not move either; if either
 moves, STOP.
 Then close the loop PR #244 left open: **an end-to-end test where a wallet's own key,
