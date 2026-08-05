@@ -1249,6 +1249,51 @@ BODYWAIT ask h= id= age_s= asks= flight= ans=<peer>:<served|header-only|dont-hav
 `a_mid_roll_net_is_fully_readable_over_sockets_and_says_which_hosts_predate_the_field`
 （`crates/qumbra-opview/tests/over_http.rs`）。
 
+### 33a. `FINALIZE refused` 日志行 —— 怎么读 `why=`（issue #241）
+
+遥测行上的 `fdrop=` 是可告警的**计数**；这一行才说明是**哪个**头拒绝了、在什么高度、
+针对哪个 checkpoint、以及**为什么**。它与 `REWIND`、`BODYWAIT` 并列，按消息泵节奏打印，
+并且**在任何健康节点上永远为空**。
+
+```
+FINALIZE refused head=<chain|state> h=<height> cp=<block-hash-prefix> why=<token>
+```
+
+`head=` 指明三个终结头（§33 的表）中是哪一个拒绝了：`chain` 是 #2，adapter 的分叉选择；
+`state` 是 #3，即**持久**的那一个。`cp=` 是 checkpoint 所指区块哈希的前四字节 ——
+与 `REWIND`、`ROUND` 的 `cpid` 同一套短 id 约定。
+
+**四个 `why=` token。没有第五个，也没有兜底分支：**
+
+| `why=` | 这个头在说什么 | 读法 |
+|---|---|---|
+| `not-held` | 这个头**没有持有** checkpoint 所指的那个区块 | 🟡 普通的滞后形态 —— 与 `slag=`（§4）配对读。持续出现 ⇒ 上报 |
+| `not-advancing` | 该区块没有严格推进这个头的终结点 | 🟡 上报；对已记录的点重试是良性的，持续出现则不是 |
+| `off-finality` | 区块已知，**高于**这个头的终结点，且**不是它的后代** | 🔴 立即上报 —— 终结它就是一次跨越终结性的重组，而且有东西提出了它 |
+| `persist` | 存储同意了，**日志追加失败** | 🔴 根本不是共识判定：这是本机磁盘。`issue #104` 的形态 |
+
+🔴 **`why=unknown` 是 `#241` 之前的行。** 在 `#241` 之前，`not-held` 这一档打印的是
+`unknown` —— 而 `unknown` 正是 `mready=` 与 `MINEGATE why=` 用来表示*「答案未知」*的同一个词
+（§25），所以在容器日志上一次 `grep unknown` 根本分不开这两种含义。在 `#229` 上，持有
+`t0-wan-9` 的会话读到 `FINALIZE refused head=state h=2984 cp=4f2932d6 why=unknown`，
+并且正确地拒绝解释它。**如果你在某台主机上看到 `why=unknown`，那台主机早于 `#241`；
+它报告的那次拒绝就是 `not-held`。**
+
+**何时升级：** 出现 `why=off-finality` 或 `why=persist` —— 只要出现就升级；同一个头上
+`why=not-held` 或 `why=not-advancing` 跨多个连续采样持续出现且 `fdrop=` 在上升。
+
+**被以下测试锁定：** `a_head_that_does_not_hold_the_block_journals_not_held`、
+`a_head_asked_to_finalize_what_it_already_holds_journals_not_advancing`、
+`a_known_block_off_the_finalized_branch_journals_off_finality`、
+`a_failed_log_append_journals_persist_and_no_store_verdict_maps_to_it`、
+`no_refusal_token_is_a_placeholder_and_none_of_them_collide`
+（`crates/qlab-p2p/src/adapter.rs`）；
+`the_chain_store_returns_its_typed_refusal_for_every_variant`
+（`crates/qlab-node/src/store.rs`）；
+`a_durable_head_that_refuses_is_counted_journalled_and_on_the_line` 与
+`the_fork_choice_head_refusing_is_reported_as_its_own_head`
+（`crates/qlab-p2p/tests/finalized_checkpoint_query.rs`）。
+
 ---
 
 ## 附录 A —— 两分钟分诊
@@ -1268,7 +1313,9 @@ BODYWAIT ask h= id= age_s= asks= flight= ans=<peer>:<served|header-only|dont-hav
 5. **任何主机 `schain=fork`** ⇒ 🔴 卡死，介入。（`schain=-` ⇒ 上报。）
 6. `slag` 非零且斜率 ≈ 出块速率 ⇒ 状态机什么都没在应用。
 7. 某台主机上 `final=` 领先于 `dfin=`，且跨多个采样持续 ⇒ 上报，并附上 `slag=` 与 `fdrop=`。
-   **单个采样不属于这一条**（§33）。真实 `final=` 旁出现 `dfin=-` ⇒ 立即上报。
+   **单个采样不属于这一条**（§33）。真实 `final=` 旁出现 `dfin=-` ⇒ 立即上报。若 `fdrop=`
+   非零，先读该主机的 `FINALIZE refused … why=` 行 —— token 会说明是哪一种拒绝，其中
+   `off-finality` 或 `persist` 本身就是 🔴（§33a）。
 8. `regime=Degraded` 持续 ⇒ 终结停滞；走 runbook，外加 `ROUND why=`。
 9. `uanchor` 上升而 `slag` 钉住 ⇒ 正在被提供它无法判定的历史。
 10. 其余一切 ⇒ 带上读数上报，不要推断。

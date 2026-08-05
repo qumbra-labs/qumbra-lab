@@ -1488,6 +1488,55 @@ several consecutive samples (report, with `slag=` and `fdrop=` attached).
 `a_mid_roll_net_is_fully_readable_over_sockets_and_says_which_hosts_predate_the_field`
 (`crates/qumbra-opview/tests/over_http.rs`).
 
+### 33a. The `FINALIZE refused` journal line — reading `why=` (issue #241)
+
+`fdrop=` on the telemetry line is the alertable **count**; this is the line that
+says *which* head refused, at what height, for which checkpoint, and **why**. It is
+printed beside `REWIND` and `BODYWAIT` on the message-pump cadence, and it is
+**empty on every healthy node, always**.
+
+```
+FINALIZE refused head=<chain|state> h=<height> cp=<block-hash-prefix> why=<token>
+```
+
+`head=` names which of the three finalized heads (§33's table) declined:
+`chain` is head #2, the adapter's fork choice; `state` is head #3, the **durable**
+one. `cp=` is the first four bytes of the block the checkpoint names — the same
+short-id convention as `REWIND` and `ROUND`'s `cpid`.
+
+**The four `why=` tokens. There is no fifth, and there is no fall-through:**
+
+| `why=` | what the head is saying | reading |
+|---|---|---|
+| `not-held` | this head **does not hold the block** the checkpoint names | 🟡 the ordinary lag shape — pair with `slag=` (§4). Sustained ⇒ report |
+| `not-advancing` | the block does not strictly advance this head's finalized point | 🟡 report; a retry against an already-recorded point is benign, a persistent one is not |
+| `off-finality` | the block is known, is **above** this head's finalized point, and does **not descend from it** | 🔴 report immediately — finalizing it would be a reorg past finality, and something proposed it |
+| `persist` | the store agreed and the **log append failed** | 🔴 not a consensus verdict at all: this host's disk. `issue #104`'s shape |
+
+🔴 **`why=unknown` is a pre-`#241` line.** Until `#241` the `not-held` case printed
+`unknown`, which is the same word `mready=` and `MINEGATE why=` use for *"the
+answer is not known"* (§25) — so on one `grep unknown` over a container log the two
+meanings were indistinguishable. On `#229` the session holding `t0-wan-9` read
+`FINALIZE refused head=state h=2984 cp=4f2932d6 why=unknown` and correctly declined
+to interpret it. **If you see `why=unknown` on a host, that host predates `#241`;
+the refusal it is reporting is `not-held`.**
+
+**Escalate when:** `why=off-finality` or `why=persist` at all; `why=not-held` or
+`why=not-advancing` on the same head across several consecutive samples with
+`fdrop=` rising.
+
+**Locked by:** `a_head_that_does_not_hold_the_block_journals_not_held`,
+`a_head_asked_to_finalize_what_it_already_holds_journals_not_advancing`,
+`a_known_block_off_the_finalized_branch_journals_off_finality`,
+`a_failed_log_append_journals_persist_and_no_store_verdict_maps_to_it`,
+`no_refusal_token_is_a_placeholder_and_none_of_them_collide`
+(`crates/qlab-p2p/src/adapter.rs`);
+`the_chain_store_returns_its_typed_refusal_for_every_variant`
+(`crates/qlab-node/src/store.rs`);
+`a_durable_head_that_refuses_is_counted_journalled_and_on_the_line` and
+`the_fork_choice_head_refusing_is_reported_as_its_own_head`
+(`crates/qlab-p2p/tests/finalized_checkpoint_query.rs`).
+
 ---
 
 ## Appendix A — the two-minute triage
@@ -1510,7 +1559,9 @@ In order. Stop at the first 🔴.
    nothing.
 7. `final=` ahead of `dfin=` on one host, across several samples ⇒ report, with
    `slag=` and `fdrop=`. **One sample is not this row** (§33). `dfin=-` beside a real
-   `final=` ⇒ report immediately.
+   `final=` ⇒ report immediately. With `fdrop=` nonzero, read the host's
+   `FINALIZE refused … why=` lines first — the token says which refusal, and
+   `off-finality` or `persist` there is its own 🔴 (§33a).
 8. `regime=Degraded` persisting ⇒ finality stall; runbook, plus `ROUND why=`.
 9. `uanchor` climbing with `slag` pinned ⇒ served history it cannot judge.
 10. Everything else ⇒ report with the reading, do not infer.
@@ -1545,5 +1596,5 @@ rendering) · `crates/qlab-node/src/round.rs` (the round ledger) ·
 `crates/qlab-p2p/src/addrman.rs` (the address book) ·
 `crates/qlab-devnet/src/params_devnet.rs` (the frozen constants).
 
-Issues cited: #73 #74 #83 #84 #85 #87 #104 #105 #106 #107 #117 #121 #130 #133 #134 #162 #164 #165 #167 #169 #172 #173 #181 #183.
+Issues cited: #73 #74 #83 #84 #85 #87 #104 #105 #106 #107 #117 #121 #130 #133 #134 #162 #164 #165 #167 #169 #172 #173 #181 #183 #204 #229 #241.
 PRs cited: #72 #93 #110 #119 #153 #159 #168 #171.
