@@ -16,9 +16,15 @@ Three things wearing one name:
 
 ```sh
 scripts/rig run -- cargo test --release --workspace -- --test-threads=1
-scripts/rig status      # who holds it, since when, running what
+scripts/rig ps          # running + queued + last 5 completions (rc, log path)
+scripts/rig log -f      # follow the current holder's log
+scripts/rig status      # holder one-liner (stable output, for scripts)
 scripts/rig release     # manual break — only if a trap failed to fire
 ```
+
+*(2026-08-05: every `run` now auto-tees to `~/develop/qumbra/logs/rig-<stamp>-<pid>.log`,
+waiters are visible in `ps` instead of queueing silently, and completions append to
+`logs/rig-manifest.tsv` — start, end, owner, rc, log, cmd.)*
 
 - **The lock is a directory**: `~/.qumbra-rig.lock` (override: `QUMBRA_RIG_LOCK`). Acquisition is `mkdir`, which is **atomic** on POSIX — two contenders cannot both succeed. Inside it: `owner`, `pid`, `started`, `cmd` — so `status` can answer *who/since when/what* without guessing.
 - **Waiting is polling**: a contender retries every 15 s, logging a "waiting for <owner>" line at first wait and every 5 minutes. This is why a queued suite can legitimately sit 50+ minutes before its first line of output — observed 2026-08-03: a wrapper acquired at 16:46 started its cargo at 17:38.

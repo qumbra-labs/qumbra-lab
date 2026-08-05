@@ -8,15 +8,30 @@
 # a suite started underneath it. `mkdir` is atomic; a `ps` snapshot is not.
 #
 #   scripts/rig run -- cargo test --release --workspace -- --test-threads=1
-#   scripts/rig status
+#   scripts/rig ps               # who is running, who is queued, recent history
+#   scripts/rig log [-f]         # the current holder's log (tail; -f to follow)
+#   scripts/rig status           # holder one-liner (kept stable for scripts)
 #   scripts/rig release          # only if a trap failed to fire
 #
+# 2026-08-05 additions (Larry's ask: see progress, logs, running and queued):
+#   - every `rig run` tees its output to $QUMBRA_RIG_LOGDIR (default
+#     ~/develop/qumbra/logs) as rig-<UTC stamp>-<pid>.log and records the path
+#     in the lock, so `rig log` and `rig ps` always find the live log;
+#   - waiters register themselves in $LOCK.queue/ while they wait, so queueing
+#     is visible instead of silent;
+#   - every completion appends one TSV line to rig-manifest.tsv
+#     (start, end, owner, rc, log, cmd) -- history is greppable.
+
 set -uo pipefail
 
 LOCK="${QUMBRA_RIG_LOCK:-$HOME/.qumbra-rig.lock}"
+QUEUE="$LOCK.queue"
+LOGDIR="${QUMBRA_RIG_LOGDIR:-$HOME/develop/qumbra/logs}"
+MANIFEST="$LOGDIR/rig-manifest.tsv"
 WHO="${QUMBRA_RIG_OWNER:-${MULTICA_ISSUE_ID:-$(whoami)@$(hostname -s)}}"
 
 now() { date '+%Y-%m-%d %H:%M:%S %z'; }
+stamp() { date -u '+%Y%m%dT%H%M%SZ'; }
 
 holder_pid() { cat "$LOCK/pid" 2>/dev/null || echo ""; }
 
@@ -30,18 +45,69 @@ reap_if_stale() {
   rm -rf "$LOCK"; return 0
 }
 
+# Same reaping for the queue: a waiter whose process died must not haunt `ps`.
+reap_queue() {
+  local f pid
+  for f in "$QUEUE"/*.pid; do
+    [ -e "$f" ] || continue
+    pid="$(cat "$f" 2>/dev/null)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null && continue
+    rm -f "${f%.pid}".*
+  done
+}
+
 status() {
   if [ -d "$LOCK" ]; then
     reap_if_stale && { echo "rig: FREE (stale lock reaped)"; return 0; }
     echo "rig: HELD by $(cat "$LOCK/owner" 2>/dev/null) pid $(holder_pid) since $(cat "$LOCK/started" 2>/dev/null)"
     echo "     cmd: $(cat "$LOCK/cmd" 2>/dev/null)"
+    [ -f "$LOCK/logfile" ] && echo "     log: $(cat "$LOCK/logfile")"
     return 1
   fi
   echo "rig: FREE"; return 0
 }
 
+ps_view() {
+  status || true
+  local n=0 f base
+  if [ -d "$QUEUE" ]; then
+    reap_queue
+    for f in "$QUEUE"/*.owner; do
+      [ -e "$f" ] || continue
+      base="${f%.owner}"
+      n=$((n + 1))
+      echo "queued[$n]: $(cat "$f" 2>/dev/null) since $(cat "$base.since" 2>/dev/null) -- $(cat "$base.cmd" 2>/dev/null)"
+    done
+  fi
+  [ "$n" -eq 0 ] && echo "queue: empty"
+  if [ -f "$MANIFEST" ]; then
+    echo "recent (rc | start -> end | owner | log | cmd):"
+    tail -5 "$MANIFEST" | awk -F'\t' '{printf "  rc=%s | %s -> %s | %s | %s | %s\n", $4, $1, $2, $3, $5, $6}'
+  fi
+}
+
+log_view() {
+  if [ ! -d "$LOCK" ] || [ ! -f "$LOCK/logfile" ]; then
+    echo "rig: nothing running -- see $MANIFEST for history" >&2; return 1
+  fi
+  local lf; lf="$(cat "$LOCK/logfile")"
+  if [ "${1:-}" = "-f" ]; then exec tail -f "$lf"; else exec tail -40 "$lf"; fi
+}
+
+release() {
+  rm -f "$QUEUE/$$".* 2>/dev/null
+  if [ -d "$LOCK" ] && [ "$(holder_pid)" = "$$" ]; then
+    rm -rf "$LOCK"; echo "rig: RELEASED by $WHO at $(now)" >&2
+  fi
+}
+
 acquire() {
   local waited=0
+  mkdir -p "$QUEUE"
+  printf '%s\n' "$WHO"    > "$QUEUE/$$.owner"
+  printf '%s\n' "$(now)"  > "$QUEUE/$$.since"
+  printf '%s\n' "$*"      > "$QUEUE/$$.cmd"
+  printf '%s\n' "$$"      > "$QUEUE/$$.pid"
   until mkdir "$LOCK" 2>/dev/null; do
     reap_if_stale && continue
     if [ "$waited" -eq 0 ] || [ $((waited % 300)) -eq 0 ]; then
@@ -49,6 +115,7 @@ acquire() {
     fi
     sleep 15; waited=$((waited + 15))
   done
+  rm -f "$QUEUE/$$".*
   printf '%s\n' "$WHO"    > "$LOCK/owner"
   printf '%s\n' "$$"      > "$LOCK/pid"
   printf '%s\n' "$(now)"  > "$LOCK/started"
@@ -56,22 +123,26 @@ acquire() {
   echo "rig: ACQUIRED by $WHO at $(now)${waited:+ (waited ${waited}s)}" >&2
 }
 
-release() {
-  if [ -d "$LOCK" ] && [ "$(holder_pid)" = "$$" ]; then
-    rm -rf "$LOCK"; echo "rig: RELEASED by $WHO at $(now)" >&2
-  fi
-}
-
 case "${1:-status}" in
   status)  status ;;
+  ps)      ps_view ;;
+  log)     shift; log_view "${1:-}" ;;
   release) rm -rf "$LOCK"; echo "rig: lock removed by $WHO at $(now)" >&2 ;;
   run)
     shift; [ "${1:-}" = "--" ] && shift
     [ $# -eq 0 ] && { echo "usage: scripts/rig run -- <command>" >&2; exit 2; }
+    mkdir -p "$LOGDIR"
+    LOGFILE="$LOGDIR/rig-$(stamp)-$$.log"
     acquire "$*"
+    printf '%s\n' "$LOGFILE" > "$LOCK/logfile"
     trap release EXIT INT TERM
-    "$@"; rc=$?
+    START="$(now)"
+    # tee passes stdout through unchanged, so callers that parse output keep
+    # working; PIPESTATUS keeps the command's own exit code (bash-only, which
+    # is why the shebang is bash and not sh).
+    "$@" 2>&1 | tee "$LOGFILE"; rc=${PIPESTATUS[0]}
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$START" "$(now)" "$WHO" "$rc" "$LOGFILE" "$*" >> "$MANIFEST"
     echo "rig: command exited $rc at $(now)" >&2
     exit $rc ;;
-  *) echo "usage: scripts/rig {run -- <cmd>|status|release}" >&2; exit 2 ;;
+  *) echo "usage: scripts/rig {run -- <cmd>|ps|log [-f]|status|release}" >&2; exit 2 ;;
 esac
