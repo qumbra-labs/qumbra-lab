@@ -93,6 +93,18 @@ pub const SIM_EPOCH_LENGTH_BLOCKS: u64 = 16;
 /// frozen with the full-M8 P2P section. Sets the "minutes-class" finality latency.
 pub const CHECKPOINT_CADENCE_BLOCKS: u64 = 8;
 
+/// Sign-hysteresis for checkpoint slots (issue #269): a committee member does not
+/// propose/sign slot S until its tip is at least `S + this`, so the slot's block
+/// has settled before any key commits to a variant. Signing at `tip == S` — the
+/// exact tip-race window — is issue #223's burn mechanism, and on 2026-08-05 a
+/// mesh-degraded roll turned it into three consecutively burned slots and a
+/// 51-minute finality outage. Cost: this × 75 s of added finality latency,
+/// constant. **Waived at the halt boundary** (`halt_at == S`): a halted chain
+/// never grows past S, so the boundary checkpoint — which issue #74 requires to
+/// exist — would otherwise never be signed. Devnet-grade, testnet-tunable, NOT
+/// frozen.
+pub const CHECKPOINT_SIGN_HYSTERESIS_BLOCKS: u64 = 2;
+
 /// Per-validator self-bond, in **bessel** (1 QMB = 10⁸ bessel, frozen §8).
 ///
 /// **CONVERGED to the FROZEN v1.0 genesis steady-state self-bond (M10-T0-4,
