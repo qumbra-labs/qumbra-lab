@@ -9,6 +9,15 @@
 //! | the access/request logs contain **no** full requester address | [`the_access_log_carries_no_full_requester_address`] |
 //! | a browser request becomes a real grant the requester can find | [`a_browser_request_becomes_a_real_grant_the_requester_detects`] |
 //!
+//! Issue #266 added the open-mode half at the same seam — the stamped posture
+//! (`t1-faucet-access-decision.md`, option B) was already built and locked at
+//! `AbuseGate::admit`, but never exercised through the listener:
+//!
+//! | acceptance item | test |
+//! |---|---|
+//! | open mode admits a bare address through `POST /request` | [`open_mode_admits_a_bare_address_through_post_request`] |
+//! | …and a supplied ticket — forged included — is a no-op there | [`open_mode_ignores_a_supplied_ticket_forged_included_through_post_request`] |
+//!
 //! Every request here goes over a **real TCP socket** with a hand-written HTTP/1.1
 //! exchange. Nothing calls a handler directly; the unit tests in `src/http.rs` do
 //! that, and they are a different claim.
@@ -443,6 +452,93 @@ fn an_unservable_faucet_refuses_and_keeps_the_requesters_ticket() {
         post_request(server.addr(), &addr.encode(), Some(&ticket)).0,
         202,
         "the ticket refused by a 503 is still good"
+    );
+    server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #266 — the stamped open posture, locked at the listener seam
+// ---------------------------------------------------------------------------
+
+/// 🔴 **Open mode admits a bare address through `POST /request`.**
+///
+/// The stamped posture (`t1-faucet-access-decision.md`, option B):
+/// `tickets_required = false` means a browser posting nothing but an address gets a
+/// 202 and a receipt. Every other socket test here runs `TicketPolicy::Required`;
+/// this one locks the open half at the same seam, asserted on the core's own
+/// counters — a listener that returned 202 without the core queueing anything would
+/// pass a status-code test and be a lie.
+#[test]
+fn open_mode_admits_a_bare_address_through_post_request() {
+    let wallet = faucet_wallet();
+    let mut node = TestNode::new();
+    let mut svc = service(&wallet, TicketPolicy::Disabled);
+    funded(&mut node, &mut svc, &wallet);
+
+    let gate = svc.gate();
+    let server = FaucetServer::start("127.0.0.1:0", svc.gate(), svc.status()).expect("bind");
+    let (_, addr) = requester(0xC0DE_0266);
+
+    let (status, _, body) = post_request(server.addr(), &addr.encode(), None);
+    assert_eq!(status, 202, "{body}");
+    assert!(body.contains("queued at position 1"), "{body}");
+    assert!(body.contains("receipt is 1"), "{body}");
+    {
+        let g = gate.lock().unwrap();
+        assert_eq!(g.faucet().stats().queued, 1, "the CORE queued it, not just the listener");
+        assert_eq!(g.faucet().gate_stats().admitted, 1);
+        assert_eq!(g.faucet().gate_stats().tickets_spent, 0, "no ticket exists to spend");
+        assert_eq!(g.faucet().stats().refused, 0);
+        assert_eq!(g.state_of(1), Some(RequestState::Queued { position: 1 }));
+    }
+    server.shutdown();
+}
+
+/// 🔴 **In open mode a supplied ticket — forged included — is a no-op through
+/// `POST /request`: admitted, no serial burned, no refusal.**
+///
+/// The stale-bookmark case: a user who kept the ticketed form and still has a
+/// ticket in the field must not be refused by a faucet that stopped requiring one.
+/// The forged half is the sharper claim — open mode ignores a presented ticket
+/// entirely rather than half-validating it, so a ticket this faucet never issued
+/// admits exactly like a real one, and neither touches the serial ledger.
+#[test]
+fn open_mode_ignores_a_supplied_ticket_forged_included_through_post_request() {
+    let wallet = faucet_wallet();
+    let mut node = TestNode::new();
+    let mut svc = service(&wallet, TicketPolicy::Disabled);
+    funded(&mut node, &mut svc, &wallet);
+
+    let gate = svc.gate();
+    let server = FaucetServer::start("127.0.0.1:0", svc.gate(), svc.status()).expect("bind");
+    let (_, addr) = requester(0xC0DE_0267);
+    let encoded = addr.encode();
+
+    // (a) a real ticket, issued by this faucet: admitted, and its serial survives.
+    let ticket = gate.lock().unwrap().issue_ticket(1);
+    let (status, _, body) = post_request(server.addr(), &encoded, Some(&ticket.encode()));
+    assert_eq!(status, 202, "{body}");
+
+    // (b) a forged ticket (the tag is flipped, so the MAC could never verify):
+    // admitted identically. In Required mode this exact forgery is a 403.
+    let mut forged = gate.lock().unwrap().issue_ticket(2);
+    forged.tag[0] ^= 0x80;
+    let (status, _, body) = post_request(server.addr(), &encoded, Some(&forged.encode()));
+    assert_eq!(status, 202, "{body}");
+
+    {
+        let g = gate.lock().unwrap();
+        assert_eq!(g.faucet().stats().queued, 2, "both requests reached the core's queue");
+        assert_eq!(g.faucet().gate_stats().admitted, 2);
+        assert_eq!(g.faucet().gate_stats().tickets_spent, 0, "no serial was burned by either");
+        assert_eq!(g.faucet().stats().refused, 0, "and the gate refused nothing");
+    }
+    // No refusal reached the wire either: every /request line the server journalled
+    // is the 202.
+    let journal = server.journal();
+    assert!(
+        journal.iter().filter(|l| l.contains("POST /request")).all(|l| l.contains(" 202 ")),
+        "{journal:?}"
     );
     server.shutdown();
 }
