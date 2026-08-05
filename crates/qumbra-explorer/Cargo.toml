@@ -39,7 +39,8 @@ serde = { version = "1", features = ["derive"] }
 # The HTTP listener. Same `=` pin as everywhere else in the tree — one HTTP
 # implementation, not five.
 tiny_http = "=0.12.0"
-# Graceful shutdown flushes the node's snapshot. `termination` arms SIGTERM/SIGHUP
-# too (issue #145) — the faucet predates that fix and still lacks the feature; this
-# crate must not repeat it.
-ctrlc = { version = "3.4", features = ["termination"] }
+# Graceful shutdown flushes the node's snapshot. The workspace declaration
+# carries `termination` (SIGTERM/SIGHUP too, issue #145) — since #238 no crate
+# declares its own version/features, so the faucet's bare-redeclaration slip
+# cannot recur here.
+ctrlc = { workspace = true }
