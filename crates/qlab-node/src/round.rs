@@ -14,6 +14,7 @@
 //! | field | answers |
 //! |---|---|
 //! | `have` / `need` / `active` / `roster` | was the quorum reachable at all? |
+//! | `seen` | distinct signers across every variant (only differs from `have` on a split) |
 //! | `voted` / `absent` / `excluded` | who was missing, and who was excluded by rule |
 //! | `first_ms` / `last_ms` / `closed_ms` | were votes still arriving when it ended? |
 //! | `quorum_ms` | how long the round took when it *did* work |
@@ -33,11 +34,13 @@
 //!   nodes and must not be differenced between hosts. Chain-time (block timestamps)
 //!   cannot express "votes were still arriving", which is why this one quantity is
 //!   not deterministic — see [`ObsClock`].
-//! * `have` is **distinct active signers accumulated at this node**, across every
-//!   message it received — the same set the authoritative
-//!   `FinalityTracker::try_finalize` gate is handed. A different node may legitimately
-//!   record a different `have` for the same round; that difference is itself a
-//!   finding (gossip reach), not an inconsistency.
+//! * `have` is the **largest single-variant tally** at this node — the number that is
+//!   comparable to `need`. Quorum is per checkpoint, so a split of 10 + 6 against a
+//!   need of 15 is `have=10 need=15`, not `have=16 need=15` (issue #226). The total
+//!   distinct signers across every variant is `seen`; on a healthy one-variant round
+//!   the two are equal. A different node may legitimately record a different `have`
+//!   for the same round; that difference is itself a finding (gossip reach), not an
+//!   inconsistency.
 //! * `absent` is "in the roster, not tombstoned/jailed, and no vote of theirs reached
 //!   *this* node before the round closed". It is not proof the member was down.
 //! * Counters and timings are **since process start**; a restart resets them, which
@@ -321,8 +324,14 @@ pub struct RoundRecord {
     pub active: usize,
     /// Quorum threshold at this height (⅔ rule, read — never re-derived here).
     pub need: usize,
-    /// Distinct **counting** signers accumulated at this node, ascending.
+    /// Distinct **counting** signers accumulated at this node across every variant,
+    /// ascending. This is the set behind [`Self::seen`]; it is **not** the number
+    /// comparable to `need` (that is [`Self::have`] / `best`).
     pub voted: Vec<usize>,
+    /// Largest single-variant tally observed at this height (issue #226). This is
+    /// what `have=` prints and what is comparable to `need`. Updated from each
+    /// non-empty `counted` observation, which is one variant's full accumulated set.
+    pub best: usize,
     /// In-roster signers whose valid votes were excluded as inactive, ascending.
     pub excluded: Vec<usize>,
     /// Distinct checkpoint variants seen at this height (>1 ⇒ the committee is
@@ -392,6 +401,7 @@ impl RoundRecord {
             active,
             need,
             voted: Vec::new(),
+            best: 0,
             excluded: Vec::new(),
             variants: 0,
             msgs: 0,
@@ -409,8 +419,18 @@ impl RoundRecord {
         }
     }
 
-    /// Distinct counting signers accumulated (`have`).
+    /// Largest single-variant tally (`have`) — the number comparable to `need`.
+    ///
+    /// Issue #226: printing the cross-variant total next to `need` made
+    /// `have=16 need=15 close=open` read as a contradiction. Quorum is per
+    /// checkpoint, so this is the max over variants, not the union.
     pub fn have(&self) -> usize {
+        self.best
+    }
+
+    /// Distinct counting signers across every variant (`seen`). Equal to
+    /// [`Self::have`] on a one-variant round; larger when the committee is split.
+    pub fn seen(&self) -> usize {
         self.voted.len()
     }
 
@@ -497,7 +517,7 @@ impl RoundRecord {
             "ROUND slot={} epoch={} why={} close={} by={} have={} need={} active={} roster={} \
              voted={} absent={} excluded={} variants={} msgs={} local={} \
              rej=f{}/u{}/d{}/i{} open_ms={} first_ms={} last_ms={} quorum_ms={} closed_ms={} \
-             cpid={}",
+             cpid={} seen={}",
             self.height,
             self.epoch,
             self.diagnose().as_str(),
@@ -522,11 +542,15 @@ impl RoundRecord {
             ms(self.last_ms),
             ms(self.quorum_ms),
             ms(self.closed_ms),
-            // Issue #84 — **appended at the end**, same discipline as the
-            // `TELEMETRY` line: existing fields keep their name and position.
+            // Issue #84 — `cpid` was appended at the end of the pre-#84 line.
             // Absent is printed (`-`), never omitted, so a fixed reader never has
             // to special-case the "this node holds no keys" node.
             checkpoint_id_hex(self.local_cpid),
+            // Issue #226 — **appended after cpid**: pre-#226 fields keep their
+            // name and position. `have` is the best-variant tally (comparable to
+            // `need`); `seen` is the cross-variant total that used to live in
+            // `have` and made `have>need close=open` read as a contradiction.
+            self.seen(),
         )
     }
 }
@@ -753,11 +777,15 @@ impl RoundLedger {
 
     /// Record a processed vote-set message.
     ///
-    /// * `counted` — the **full accumulated** distinct counting signers after this
-    ///   message (the same set handed to `try_finalize`), not just this message's.
-    ///   Merged into the round, never replacing it, so a message that added nothing
-    ///   (a duplicate, or one the tally window refused) can be recorded truthfully
-    ///   with an empty `counted` without erasing what is already known.
+    /// * `counted` — the **full accumulated** distinct counting signers for the
+    ///   **variant this message belongs to** after this message (the same set
+    ///   handed to `try_finalize`), not just this message's and not the union
+    ///   across variants. Merged into the round's cross-variant `voted` set, never
+    ///   replacing it, so a message that added nothing (a duplicate, or one the
+    ///   tally window refused) can be recorded truthfully with an empty `counted`
+    ///   without erasing what is already known. A non-empty `counted` also updates
+    ///   `best` to `max(best, counted.len())` — that is the per-variant number
+    ///   comparable to `need` (issue #226).
     /// * `excluded` — in-roster signers in this message excluded as inactive.
     /// * `variants` — distinct checkpoint variants now tracked at this height.
     ///
@@ -781,6 +809,11 @@ impl RoundLedger {
         rec.msgs += 1;
         rec.rejects.add(rejects);
         rec.variants = rec.variants.max(variants);
+        // Issue #226: `counted` is one variant's full set. Track the largest such
+        // set so `have` stays comparable to `need` under a split.
+        if !counted.is_empty() {
+            rec.best = rec.best.max(counted.len());
+        }
 
         let mut merged: BTreeSet<usize> = rec.voted.iter().copied().collect();
         let before = merged.len();
@@ -799,7 +832,9 @@ impl RoundLedger {
             }
             rec.last_ms = offset;
         }
-        if rec.quorum_ms.is_none() && rec.voted.len() >= rec.need {
+        // Quorum is per variant — wall-clock the moment the *best* variant crossed
+        // `need`, not the moment the cross-variant union did (issue #226).
+        if rec.quorum_ms.is_none() && rec.best >= rec.need {
             rec.quorum_ms = offset;
         }
         let arrivals = match offset {
@@ -978,7 +1013,10 @@ mod tests {
     /// synthetic times, which is exactly why the ledger takes its clock as a seam.
     fn rec_at(have: usize, need: usize, active: usize, last: u64, closed: u64) -> RoundRecord {
         let mut r = RoundRecord::new(8, 1, 21, active, need, true, Some(0));
+        // One-variant synthetic: best == seen. Callers that need a split construct
+        // `best` and `voted` by hand (issue #226).
         r.voted = (0..have).collect();
+        r.best = have;
         r.first_ms = Some(0);
         r.last_ms = Some(last);
         r.closed_ms = Some(closed);
@@ -1213,6 +1251,7 @@ mod tests {
         const BUDGET_BYTES: usize = 400;
         let mut r = RoundRecord::new(1_384, 12, 21, 21, 15, true, Some(1_769_000_000_000));
         r.voted = (0..11).collect();
+        r.best = 11; // one-variant shape for the length budget; best == seen
         r.excluded = vec![19, 20];
         r.variants = 2;
         r.msgs = 9;
@@ -1231,21 +1270,31 @@ mod tests {
             line.len()
         );
         // The line must actually carry the discriminant fields, not just be short.
-        for key in ["why=timeout", "have=11", "need=15", "active=21", "absent=", "last_ms=", "closed_ms="] {
+        for key in [
+            "why=timeout",
+            "have=11",
+            "need=15",
+            "active=21",
+            "absent=",
+            "last_ms=",
+            "closed_ms=",
+            "seen=11",
+        ] {
             assert!(line.contains(key), "journal line is missing {key}: {line}");
         }
     }
 
-    // ---- issue #84: the identity in the per-slot journal ----------------------
+    // ---- issue #84 / #226: identity + per-variant reading on the journal ------
 
-    /// `cpid` is **appended at the end** and every pre-#84 key keeps its name and
-    /// its position. Same contract the `TELEMETRY` line holds itself to, for the
-    /// same reason: `qumbra-ops/` parses these lines out of archived container
-    /// logs, and a reader that counts fields must not be shifted under.
+    /// `cpid` (issue #84) and `seen` (issue #226) are **appended**; every earlier
+    /// key keeps its name and position. Same contract the `TELEMETRY` line holds
+    /// itself to: `qumbra-ops/` parses these lines out of archived container logs,
+    /// and a reader that counts fields must not be shifted under.
     #[test]
-    fn round_line_gains_cpid_at_the_end_and_nowhere_else() {
+    fn round_line_appends_cpid_and_seen_without_moving_earlier_fields() {
         let mut r = RoundRecord::new(3_776, 12, 21, 21, 15, true, None);
         r.voted = (0..16).collect();
+        r.best = 10; // majority variant; seen (16) is the cross-variant total
         r.close = Some(RoundClose::Finalized);
         let line = r.to_line();
         let keys: Vec<&str> = line
@@ -1260,17 +1309,26 @@ mod tests {
                 "slot", "epoch", "why", "close", "by", "have", "need", "active", "roster",
                 "voted", "absent", "excluded", "variants", "msgs", "local", "rej", "open_ms",
                 "first_ms", "last_ms", "quorum_ms", "closed_ms",
-                // ── appended by #84, at the end ──
+                // ── appended by #84 ──
                 "cpid",
+                // ── appended by #226 ──
+                "seen",
             ],
             "existing ROUND fields must not move or be renamed"
         );
+        // And the values match the #226 reading: have is best-variant, seen is total.
+        assert!(line.contains("have=10 need=15"), "{line}");
+        assert!(line.contains("seen=16"), "{line}");
     }
 
     /// **Slot 3776, reconstructed.** Three nodes' keys signed one variant and one
     /// node's signed another; all four then finalize the majority variant, so the
     /// round closes `finalized` on every host and nothing but `cpid` distinguishes
     /// them. One `grep 'ROUND slot=3776'` across four hosts is the whole forensic.
+    ///
+    /// Issue #226: the two variant observations are recorded as two `note_votes`
+    /// calls (10 + 6), so `have` is the majority tally and `seen` is the total —
+    /// not a single `counted` of 16 with `variants=2`, which would lie about best.
     #[test]
     fn a_split_round_is_one_grep_across_the_hosts() {
         let majority = 0x4cc8_904e_1f2a;
@@ -1279,9 +1337,10 @@ mod tests {
             let mut l = RoundLedger::new(ObsClock::Deterministic);
             let c = ctx(3_776, 21, 21, 15);
             l.note_local_proposal(&c, 5, Some(cpid));
-            // Every host accumulates the same 16 counting signers and finalizes the
-            // same majority checkpoint — the split leaves no mark on `have`.
-            l.note_votes(&c, &(0..16).collect::<Vec<_>>(), &[], VoteRejects::default(), 2);
+            // Majority variant: 10 counting signers. Minority: 6 more. Neither is
+            // the union, and `have` must report the larger one (issue #226).
+            l.note_votes(&c, &(0..10).collect::<Vec<_>>(), &[], VoteRejects::default(), 1);
+            l.note_votes(&c, &(10..16).collect::<Vec<_>>(), &[], VoteRejects::default(), 2);
             l.note_finalized(3_776);
             l.take_emitted().remove(0).to_line()
         };
@@ -1290,7 +1349,8 @@ mod tests {
 
         // Every host reports the same round, the same counts, the same outcome…
         for l in &lines {
-            assert!(l.contains("have=16 need=15"), "{l}");
+            assert!(l.contains("have=10 need=15"), "best-variant, not the union: {l}");
+            assert!(l.contains("seen=16"), "cross-variant total is still on the line: {l}");
             assert!(l.contains("close=finalized"), "{l}");
             assert!(l.contains("variants=2"), "{l}");
         }
@@ -1302,6 +1362,43 @@ mod tests {
         assert_ne!(lines[0], lines[3], "the minority host's line differs");
         assert!(lines[0].contains("cpid=4cc8904e1f2a"), "{}", lines[0]);
         assert!(lines[3].contains("cpid=ee8e07e95b31"), "{}", lines[3]);
+    }
+
+    /// **Issue #226 acceptance.** The textbook stall line was
+    /// `have=16 need=15 close=open variants=2` — sixteen is more than fifteen, yet
+    /// the round did not close, because the sixteen were split 10 + 6 across two
+    /// checkpoints. After this change the line itself carries the per-variant
+    /// reading: `have` is the best variant (comparable to `need`), `seen` is the
+    /// total that used to live in `have`.
+    #[test]
+    fn a_split_open_round_does_not_read_as_have_exceeding_need() {
+        let mut l = RoundLedger::new(ObsClock::Deterministic);
+        let c = ctx(2_480, 21, 21, 15);
+        // The incident shape: 10 keys on one checkpoint, 6 on the other.
+        l.note_votes(&c, &(0..10).collect::<Vec<_>>(), &[], VoteRejects::default(), 1);
+        l.note_votes(
+            &c,
+            &(10..16).collect::<Vec<_>>(),
+            &[],
+            VoteRejects::default(),
+            2,
+        );
+        let r = l.open_round(2_480).expect("round is open");
+        assert_eq!(r.have(), 10, "have is the best variant, not 16");
+        assert_eq!(r.seen(), 16, "seen is the cross-variant total");
+        assert_eq!(r.variants, 2);
+        assert_eq!(r.need, 15);
+        assert!(r.have() < r.need, "have vs need no longer contradicts close=open");
+        let line = r.to_line();
+        assert!(line.contains("close=open"), "{line}");
+        assert!(line.contains("have=10 need=15"), "{line}");
+        assert!(line.contains("seen=16"), "{line}");
+        assert!(line.contains("variants=2"), "{line}");
+        // The wrong reading — have above need while still open — must be impossible.
+        assert!(
+            !line.contains("have=16 need=15"),
+            "the pre-#226 contradiction must not reappear: {line}"
+        );
     }
 
     /// A node holding **no committee keys** still emits the field, as `-`. The
