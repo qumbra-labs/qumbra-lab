@@ -41,7 +41,8 @@ use qlab_devnet::committee::CommitteeState;
 use qlab_devnet::ebbflow::FinalityStatus;
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::{
-    CHECKPOINT_CADENCE_BLOCKS, DEGRADED_MODE_LAG_BLOCKS, EPOCH_LENGTH_BLOCKS,
+    CHECKPOINT_CADENCE_BLOCKS, CHECKPOINT_SIGN_HYSTERESIS_BLOCKS, DEGRADED_MODE_LAG_BLOCKS,
+    EPOCH_LENGTH_BLOCKS,
 };
 use qlab_devnet::pow::PowEngine;
 
@@ -1784,7 +1785,25 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             return;
         }
         let tip = self.tip_height();
-        while self.next_checkpoint <= tip {
+        loop {
+            // Sign-hysteresis (issue #269): do not commit a key to slot S at
+            // `tip == S` — that is the exact tip-race window, and a vote cast there
+            // is burned forever if the race resolves the other way (#223; the
+            // 2026-08-05 outage was three consecutive slots burned this way).
+            // Waived at slot 0 (genesis is hash-pinned — no race exists to wait
+            // out, and finalizing it is a bootstrap act) and at the halt boundary
+            // (a halted chain never grows past H, so H's checkpoint — which issue
+            // #74 requires — must sign at `tip == H`).
+            let hysteresis = if self.next_checkpoint == 0
+                || self.halt_at == Some(self.next_checkpoint)
+            {
+                0
+            } else {
+                CHECKPOINT_SIGN_HYSTERESIS_BLOCKS
+            };
+            if self.next_checkpoint.saturating_add(hysteresis) > tip {
+                break;
+            }
             // HALT (issue #74, H2): the committee stops checkpointing ABOVE H. The
             // adapter refuses to sign there in any case (the load-bearing gate); the
             // loop stops advancing too, so a halted node does not spin proposing
@@ -2261,6 +2280,60 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// Issue #269 — sign-hysteresis: a cadence slot is NOT proposed the moment the
+    /// tip reaches it (`tip == S` is the exact tip-race window issue #223 burns
+    /// votes in — three consecutive slots burned on the live net, 2026-08-05), only
+    /// once the chain has grown `CHECKPOINT_SIGN_HYSTERESIS_BLOCKS` past it. Slot 0
+    /// stays exempt: genesis is hash-pinned, no race exists to wait out.
+    #[test]
+    fn checkpoint_slot_waits_for_the_sign_hysteresis() {
+        let (config, genesis, base) = rig("hyst", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+
+        node.try_checkpoint();
+        assert_eq!(
+            node.finalized_height(),
+            Some(0),
+            "genesis is exempt — a bootstrap act on a hash-pinned block"
+        );
+
+        // Mine exactly to the first cadence slot and stop: tip == S.
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+            assert!(node.try_mine(), "KeccakPow mines at genesis difficulty");
+        }
+        assert_eq!(node.tip_height(), CHECKPOINT_CADENCE_BLOCKS);
+        node.try_checkpoint();
+        assert_eq!(
+            node.finalized_height(),
+            Some(0),
+            "slot S must NOT be signed at tip == S — that is the tip-race window"
+        );
+
+        // Grow to one block short of the hysteresis: still no signature.
+        for _ in 0..CHECKPOINT_SIGN_HYSTERESIS_BLOCKS - 1 {
+            assert!(node.try_mine());
+            node.try_checkpoint();
+            assert_eq!(
+                node.finalized_height(),
+                Some(0),
+                "still inside the hysteresis window — no key committed"
+            );
+        }
+
+        // tip == S + hysteresis: the slot block has settled; holding all 21 keys,
+        // the checkpoint signs and finalizes in one act.
+        assert!(node.try_mine());
+        node.try_checkpoint();
+        assert_eq!(
+            node.finalized_height(),
+            Some(CHECKPOINT_CADENCE_BLOCKS),
+            "the slot signs once the chain has grown past it"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// ACCEPTANCE #7 — the never-double-sign guard survives a restart through the
     /// real run path: checkpoint slot 8 (persisting each finalizer ledger before
     /// broadcast), restart from the same data dir, and the restored finalizer refuses
@@ -2273,10 +2346,10 @@ mod tests {
             RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
         node.set_mine_interval(Duration::ZERO);
         node.try_checkpoint(); // finalize genesis (slot 0)
-        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS {
             assert!(node.try_mine());
         }
-        node.try_checkpoint(); // slot 8
+        node.try_checkpoint(); // slot 8, past the #269 hysteresis
         assert_eq!(node.finalized_height(), Some(CHECKPOINT_CADENCE_BLOCKS), "slot 8 finalized");
         let fid_before = node.finalized_checkpoint_id();
         // Ledgers were persisted (write-ahead, before broadcast).
@@ -3092,8 +3165,9 @@ mod tests {
             "the wire carries 0, never tip_ts − genesis placeholder"
         );
 
-        // Cross the boundary: reach slot 8, finalize it, move the tip one past it.
-        for _ in 1..CHECKPOINT_CADENCE_BLOCKS {
+        // Cross the boundary: reach slot 8 plus the #269 sign-hysteresis (the slot
+        // is deliberately not signed at tip == slot), finalize it.
+        for _ in 1..CHECKPOINT_CADENCE_BLOCKS + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS {
             assert!(node.try_mine());
         }
         node.try_checkpoint();
@@ -4275,8 +4349,9 @@ mod tests {
         node.set_mine_interval(Duration::ZERO);
         assert_eq!(node.halt_at(), None, "a cancelled upgrade stops nowhere");
         node.try_checkpoint();
-        assert_eq!(mine_and_checkpoint(&mut node, DH + 8), DH + 8, "mined through it");
-        assert_eq!(node.tip_height(), DH + 8);
+        let past = DH + 8 + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS; // #269: last slot signs hysteresis-late
+        assert_eq!(mine_and_checkpoint(&mut node, past), past, "mined through it");
+        assert_eq!(node.tip_height(), past);
         assert!(!node.is_halted());
         assert_eq!(node.finalized_height(), Some(DH + 8), "finality never paused");
         let line = node.telemetry_sample();
@@ -4667,7 +4742,7 @@ mod tests {
         .unwrap();
         local.set_mine_interval(Duration::ZERO);
         local.try_checkpoint(); // bootstrap genesis finality
-        for _ in 0..slot {
+        for _ in 0..slot + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS {
             assert!(local.try_mine());
         }
         local.try_checkpoint();
@@ -4699,10 +4774,10 @@ mod tests {
             node.set_mining_clock(MiningClock::WallClock);
         }
         node.try_checkpoint(); // genesis (slot 0)
-        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS {
             assert!(node.try_mine(), "{tag}: mines at the genesis difficulty");
         }
-        node.try_checkpoint(); // slot 8
+        node.try_checkpoint(); // slot 8, signed once the #269 hysteresis has passed
         assert_eq!(
             node.finalized_height(),
             Some(CHECKPOINT_CADENCE_BLOCKS),
@@ -4806,7 +4881,7 @@ mod tests {
             RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
         node.set_mine_interval(Duration::ZERO);
         node.try_checkpoint();
-        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS {
             assert!(node.try_mine());
         }
         node.try_checkpoint();
@@ -4835,7 +4910,7 @@ mod tests {
             RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
         node.set_mine_interval(Duration::ZERO);
         node.try_checkpoint();
-        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS {
             assert!(node.try_mine());
             node.note_slots_reached();
             node.try_checkpoint();
@@ -4916,7 +4991,7 @@ mod tests {
         node.set_mine_interval(Duration::ZERO);
         node.try_checkpoint(); // genesis (slot 0) — finalized without a round
 
-        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS {
             assert!(node.try_mine());
             node.note_slots_reached();
             node.try_checkpoint();
@@ -4958,7 +5033,7 @@ mod tests {
         node.try_checkpoint();
         assert_eq!(node.finalized_height(), None, "6 < quorum 15: not even genesis finalizes");
 
-        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS {
             assert!(node.try_mine());
             node.note_slots_reached();
             node.try_checkpoint();
@@ -5163,7 +5238,7 @@ mod tests {
             RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
         node.set_mine_interval(Duration::ZERO);
         node.try_checkpoint();
-        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS {
             assert!(node.try_mine());
             node.note_slots_reached();
             node.try_checkpoint();
@@ -5182,14 +5257,15 @@ mod tests {
         };
         assert!(body.starts_with("HTTP/1.1 200"), "{body}");
         assert!(body.contains("text/plain; version=0.0.4"));
-        // Live levels…
-        assert!(body.contains(&format!("qumbra_tip_height {CHECKPOINT_CADENCE_BLOCKS}")), "{body}");
+        // Live levels… (tip carries the #269 hysteresis past the finalized slot)
+        let mined = CHECKPOINT_CADENCE_BLOCKS + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS;
+        assert!(body.contains(&format!("qumbra_tip_height {mined}")), "{body}");
         assert!(body.contains("qumbra_committee_quorum 15"));
         assert!(body.contains("qumbra_committee_size 21"));
         assert!(body.contains("qumbra_finality_regime{regime=\"final\"} 1"));
         // …and the accumulated, source-side aggregates.
         assert!(body.contains("qumbra_checkpoint_rounds_total{verdict=\"finalized\"} 1"));
-        assert!(body.contains("qumbra_blocks_connected_total 8"));
+        assert!(body.contains(&format!("qumbra_blocks_connected_total {mined}")));
         assert!(body.contains("qumbra_finality_advance_blocks_bucket"));
         assert!(body.contains("qumbra_process_start_time_seconds "));
         let _ = std::fs::remove_dir_all(&base);
@@ -5212,7 +5288,7 @@ mod tests {
             RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
         node.set_mine_interval(Duration::ZERO);
         node.try_checkpoint();
-        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS {
             assert!(node.try_mine());
             node.note_slots_reached();
             node.try_checkpoint();
@@ -5233,15 +5309,21 @@ mod tests {
         let served = Telemetry::from_bytes(&raw[sep + 4..]).expect("the versioned wire decodes");
 
         assert_eq!(served.to_bytes()[0], qlab_node::RPC_VERSION);
-        assert_eq!(served.tip_height, CHECKPOINT_CADENCE_BLOCKS);
+        assert_eq!(
+            served.tip_height,
+            CHECKPOINT_CADENCE_BLOCKS + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS
+        );
         assert_eq!(served.finalized_height, node.finalized_height());
         assert_eq!(served.finalized_id, Some(fid), "fid is on the wire, not just in the log line");
         assert_eq!(
             (served.committee_size, served.committee_active, served.committee_quorum),
             (21, 21, 15),
         );
-        assert_eq!(served.supply.len(), 1, "eight mined blocks remain in epoch 0");
-        assert_eq!((served.supply[0].start_height, served.supply[0].end_height), (0, 8));
+        assert_eq!(served.supply.len(), 1, "all mined blocks remain in epoch 0");
+        assert_eq!(
+            (served.supply[0].start_height, served.supply[0].end_height),
+            (0, CHECKPOINT_CADENCE_BLOCKS + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS)
+        );
         assert_eq!(served.supply[0].divergence_bessel(), 0);
         assert!(served.supply[0].measured_coinbase > 0, "the test covers real issuance");
         assert_eq!(served.fid_field(), node.telemetry().fid_field());
