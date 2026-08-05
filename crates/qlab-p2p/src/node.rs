@@ -1830,12 +1830,54 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // the ask outstanding with a `served` answer against it, and that reading is
         // layer (c). Without it, (c) is byte-identical to (b) on every surface.
         self.note_body_answer(&bh, from, BodyAnswer::Served);
-        if self.blocks.contains(&bh) || self.node.has_stored_body(&bh) {
+        // 🔴 **Issue #229: this asks whether the STATE MACHINE has the body, and
+        // nothing else may answer.** It used to read
+        // `self.blocks.contains(&bh) || self.node.has_stored_body(&bh)`, and the
+        // first disjunct is [`Self::blocks`] — the #135 body-*serving* cache. That
+        // is a third ledger of "I have this body", it lives in this struct rather
+        // than in the state machine, and **nothing removes an entry from it when the
+        // block leaves the applied chain**: its only mutation is `insert`, with
+        // lowest-height-first eviction. So after `Node::rewind_to` the cache went on
+        // answering "we hold this" for a block the state machine no longer had —
+        // and this `return` skips `ingest_block`, so `buffer_body` never ran,
+        // `pending_bodies` never received the body, and `rejoin_main_chain`'s gate
+        // read `Missing` until the cache happened to evict the entry.
+        //
+        // That was five strandings in twenty hours on the T0 net, 1 h 25 m – 2 h 09 m
+        // each, every peer answering `served` and the ask never clearing. **The
+        // "self-heal" was the eviction deadline of a 128-entry cache, not recovery.**
+        //
+        // **#198 reasoned about exactly this deadlock and stopped one ledger short.**
+        // `n1::ChainView::held_body`'s doc names this early return as a caller that
+        // must NOT be widened from "applied" to "possessed" — *"that is the same
+        // deadlock one seam over, so the two predicates stay apart by
+        // construction"* — and that reasoning held for `has_stored_body`.
+        // `self.blocks` was a third ledger in the same `if`, and it already answered
+        // possession across a rewind, for free.
+        //
+        // The cache keeps its job: it is still written by `complete_block` and
+        // `announce_block` and still read by `on_get_block_txn` and
+        // `body_for_serving` (#135's purpose, and #198/#199's possession serving).
+        // What it may no longer do is stand in for "the state machine has this".
+        //
+        // Cost of dropping it: a re-announced body this node holds in cache but has
+        // NOT applied now runs `reconstruct` + `ingest_block` instead of returning
+        // early. That case is exactly the one that must be processed, and it is not a
+        // new exposure — a re-announced body that was never cached has always taken
+        // this path, so the cache was only ever an accidental partial mitigation, and
+        // `crate::ratelimit` sits ahead of decode either way (#91).
+        //
+        // The post-ingest check below is deliberately NOT changed: it runs *after*
+        // `complete_block`, so `self.blocks.contains` there is a faithful proxy for
+        // "ingest accepted this body", and it is what keeps #200's progress signal
+        // honest for a body that arrived and was buffered rather than applied.
+        if self.node.has_stored_body(&bh) {
             if self.body_reqs.remove(&bh).is_some() {
-                // Issue #200: a requested body is now held — that is progress.
+                // Issue #200: a requested body is now applied — that is progress,
+                // and after #229 it is progress this node actually made.
                 self.body_fetch_progress = true;
             }
-            return; // already have the full body (hot cache or applied store)
+            return; // already applied — the ask is genuinely satisfied
         }
         let candidates = self.node.all_txs();
         match reconstruct(&ann, &candidates) {

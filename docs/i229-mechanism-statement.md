@@ -216,6 +216,39 @@ exactly the sibling rate the 1–2-block rewind churn implies. Durations 1 h 25 
 measured 86 s mean interval agree. **This is consistent, not verified** — see §7 for the one test that
 would verify it.
 
+> ### 🔴 CORRECTION 2026-08-05, from the stage-1 measurement — the arithmetic above does not hold
+>
+> The eviction experiment was built and run against the pre-fix condition. **The qualitative claim
+> survives and is now measured: the strand ends by cache eviction.** The cache fills to exactly
+> `MAX_SERVED_BODIES = 128` entries and the applied tip moves only once the trapped entry is
+> displaced. That is the "self-heal was never a heal" finding, and it is confirmed.
+>
+> **The relation `slag at unfreeze ≈ 128 / (bodies per height)` is retracted.** In a two-node sim
+> producing exactly one body per height, the strand should then have ended at announcement 128. It
+> did not:
+>
+> | delivery time per announced block | announcements to unfreeze | cache at unfreeze |
+> |---|---|---|
+> | 30 ticks | **142** | 128 (full) |
+> | 6 ticks | **325** | 128 (full) |
+>
+> The count is bounded below by the cap and **inflated by delivery loss**, converging toward 128 only
+> as delivery stops being the binding constraint. So the cap sets a floor on the duration, not the
+> duration — and the production coefficient of 1.5–1.8 bodies per height, which I derived *backwards*
+> from `slag` 74–84, is **not established by anything measured here.** It remains one arithmetic
+> consistent with the observation, and I should not have written it as the explanation.
+>
+> **The sub-finding that produced the gap is worth more than the retracted law.** The refusal loop's
+> own traffic is what starves delivery: V re-asks and the peer re-serves at tick rate, throttled
+> frames are dropped and deliberately not scored (#91, ahead of decode), so **the loop delays the
+> eviction that ends it — and a busier net strands for longer.** That is the opposite of what "the
+> accident arrives reliably" predicts, and it means the ~2 h constant is not a constant at all: it is
+> a floor of `MAX_SERVED_BODIES` blocks plus however much the node's own thrashing costs it.
+>
+> **Consequence for the ROADMAP correction** (design-side, coordinator's): the line may say the
+> self-heal is a cache-eviction deadline rather than recovery. It may **not** say the duration is
+> `128 / (bodies per height)` blocks.
+
 🔴 **This retires "the expected wait for an accident."** The constant is a cache-capacity deadline, and
 the ROADMAP line that survived the 2026-08-03 correction as *"waiting is defensible because the
 accident arrives reliably"* now has a mechanism instead: the wait is `MAX_SERVED_BODIES` blocks. It is
@@ -290,10 +323,14 @@ Written to be bounced or ratified, not to pre-empt the fix.
 
 ## 8. What I did not run
 
-**Nothing in this branch is code, so the workspace suite was not run and is not the bar for stage 0.**
-No test was added, no crate touched; `git diff --stat` against `main` is docs only. The rig lock was
-not taken and no heavy job was started. Stage 1's first act should be the reproduction above, under
-`scripts/rig run`.
+**At the time this statement was submitted for ratification, nothing in the branch was code**, so the
+workspace suite was not run and was not the bar for stage 0: no test was added, no crate touched, and
+`git diff --stat` against `main` was docs only. The rig lock was not taken and no heavy job was
+started.
+
+**Stage 1 was ratified on 2026-08-05 and its runs are recorded on PR #264**, including the
+reproduction going red on `main` in both directions and the eviction measurement that produced the
+correction in §4.
 
 **Evidence read:** issue #229 in full (body + 23 comments), `qumbra-ops/i229-onset-windows-20260805/`
 (all 8 four-host logs), and `main` `37a3fb5` at every line cited. Nothing was run against a host and
