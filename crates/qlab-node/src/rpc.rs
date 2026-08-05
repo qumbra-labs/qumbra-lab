@@ -1163,7 +1163,7 @@ mod tests {
         let genesis = genesis_block(1_000, 0);
         let mut node = MemNode::in_memory(genesis.clone());
         let ghash = node.chain().genesis_block_hash();
-        assert!(node.finalize(ghash).unwrap());
+        assert!(node.finalize(ghash).unwrap().is_recorded());
         let anchor = node.commitment_root(); // empty-tree root, finalized at height 0
         assert!(node.is_valid_anchor(&anchor), "genesis root is a valid anchor once finalized");
         (NodeRpc::new(node), anchor)
@@ -1217,7 +1217,7 @@ mod tests {
         // The boundary: the first non-genesis block finalizes ⇒ a real age, from
         // real timestamps on both ends of the subtraction.
         let _h2 = apply_block_at(rpc.node_mut(), 1_785_352_435); // 75 s later
-        assert!(rpc.node_mut().finalize(h1).unwrap(), "height 1 finalizes");
+        assert!(rpc.node_mut().finalize(h1).unwrap().is_recorded(), "height 1 finalizes");
         let t = rpc.telemetry();
         assert_eq!(t.finalized_height, Some(1));
         assert_eq!(t.last_finalized_age_secs, 75, "tip_ts − finalized_ts, both real");

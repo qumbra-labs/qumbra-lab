@@ -67,8 +67,8 @@ pub use mempool::{
     MempoolParams, MempoolTx, TxId,
 };
 pub use node::{
-    genesis_block, MemNode, Node, NodeError, NodeState, RecoveryReport, RewindReport,
-    SnapshotRejection,
+    genesis_block, FinalizeOutcome, MemNode, Node, NodeError, NodeState, RecoveryReport,
+    RewindReport, SnapshotRejection,
 };
 pub use recovery::{
     catch_up_slot, committee_accrual_finalized, committee_accrual_for_span, Finalizer,

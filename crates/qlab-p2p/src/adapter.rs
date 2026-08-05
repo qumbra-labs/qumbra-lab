@@ -58,8 +58,8 @@ use qlab_node::recovery::Finalizer;
 use qlab_node::round::{ObsClock, RoundLedger, SlotContext, VoteRejects};
 use qlab_node::telemetry::{AppliedTip, StateLag};
 use qlab_node::{
-    genesis_block, MemNode, Mempool, MempoolError, NodeError, NodeState as _, RecoveryReport,
-    RewindReport,
+    genesis_block, FinalizeOutcome, MemNode, Mempool, MempoolError, NodeError, NodeState as _,
+    RecoveryReport, RewindReport,
 };
 use qlab_devnet::body::TxVerifier;
 
@@ -280,6 +280,85 @@ fn finalize_hex8(h: &Hash32) -> String {
     h[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// **Why a head refused a finalize record — the store's own verdict, typed** (issue
+/// #241).
+///
+/// This was a `&'static str` chosen by an `if / else if / else` over re-read store
+/// state. Two things were wrong with that and only one of them was visible on
+/// `t0-wan-9`:
+///
+/// 1. the chain of `else if`s ended in an **unconditional `else`**, so a
+///    [`FinalizeMarkError`] variant nobody had thought about would have rendered as
+///    `off-finality` — a confident, wrong attribution, and no compiler complaint;
+/// 2. it was a *second implementation* of [`ChainState::set_finalized`]'s decision
+///    and could disagree with the first (it tested the checkpoint's claimed height
+///    where the store tests the stored header's, and asked the block map where the
+///    store asks the header map).
+///
+/// Both are closed by construction here: the only way in from the store's refusal is
+/// [`From<FinalizeMarkError>`], which is an exhaustive `match`, and the only way out
+/// to the journal line is [`Self::as_str`], which is another. **A new
+/// `FinalizeMarkError` variant is a compile error in two places and cannot render as
+/// a placeholder.**
+///
+/// [`ChainState::set_finalized`]: qlab_devnet::chain::ChainState::set_finalized
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinalizeRefusalReason {
+    /// **This head does not hold the block the checkpoint names.** The `t0-wan-9`
+    /// refusal, and the `#229` shape: fork choice is at the tip, the state machine's
+    /// bodies are short, a quorum arrives for a block the durable head has never
+    /// applied.
+    NotHeld,
+    /// The block's height does not strictly advance this head's finalized point.
+    NotAdvancing,
+    /// The block is known, but does not descend from this head's finalized point —
+    /// finalizing it would be a reorg past finality.
+    OffFinality,
+    /// The append to the durable log failed. Not a store verdict at all: the store
+    /// said yes and the disk said no.
+    Persist,
+}
+
+impl FinalizeRefusalReason {
+    /// The `why=` token as it reaches the journal line and the container log.
+    ///
+    /// 🔴 **`NotHeld` renders `not-held`, and it rendered `unknown` before #241.**
+    /// The rename is the whole operator-facing half of that issue. `unknown` is the
+    /// same word this codebase uses for *"we could not determine"* on the line
+    /// immediately above it (`mready=unknown`, `MineGate::Unknown`), so on one
+    /// `grep unknown` over a container log the two meanings are indistinguishable —
+    /// and on `#229` the session holding the host read it the wrong way and
+    /// explicitly declined to interpret the line. The other three tokens were never
+    /// ambiguous and are byte-identical to what they were.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FinalizeRefusalReason::NotHeld => "not-held",
+            FinalizeRefusalReason::NotAdvancing => "not-advancing",
+            FinalizeRefusalReason::OffFinality => "off-finality",
+            FinalizeRefusalReason::Persist => "persist",
+        }
+    }
+}
+
+impl From<FinalizeMarkError> for FinalizeRefusalReason {
+    /// The one door from the store's typed refusal into the journal's typed reason.
+    /// **Exhaustive on purpose** — this is the compile-time guarantee acceptance item
+    /// 2 of issue #241 asks for, and it only holds while there is no `_ =>` arm here.
+    fn from(e: FinalizeMarkError) -> Self {
+        match e {
+            FinalizeMarkError::Unknown => FinalizeRefusalReason::NotHeld,
+            FinalizeMarkError::NotAdvancing => FinalizeRefusalReason::NotAdvancing,
+            FinalizeMarkError::NotDescendantOfFinalized => FinalizeRefusalReason::OffFinality,
+        }
+    }
+}
+
+impl std::fmt::Display for FinalizeRefusalReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FinalizeRefusal {
     /// Which head refused: `"chain"` (#2, fork choice) or `"state"` (#3, durable).
@@ -288,10 +367,9 @@ pub struct FinalizeRefusal {
     pub height: u64,
     /// The block the checkpoint names.
     pub hash: Hash32,
-    /// Why, in the store's own terms: `unknown` (this head does not hold the block),
-    /// `not-advancing`, `off-finality` (not a descendant of the current finalized
-    /// head), or `persist` (the append failed).
-    pub why: &'static str,
+    /// Why, in the store's own terms. Typed since issue #241 — see
+    /// [`FinalizeRefusalReason`].
+    pub why: FinalizeRefusalReason,
 }
 
 impl std::fmt::Display for FinalizeRefusal {
@@ -302,7 +380,7 @@ impl std::fmt::Display for FinalizeRefusal {
             self.head,
             self.height,
             finalize_hex8(&self.hash),
-            self.why
+            self.why.as_str()
         )
     }
 }
@@ -1181,7 +1259,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     ///
     /// Deduplicated on `(head, height)` so a retry loop reports once, not once per
     /// tick. Every distinct divergence is counted **and** journalled.
-    fn note_finalize_refused(&mut self, head: &'static str, height: u64, hash: Hash32, why: &'static str) {
+    fn note_finalize_refused(
+        &mut self,
+        head: &'static str,
+        height: u64,
+        hash: Hash32,
+        why: FinalizeRefusalReason,
+    ) {
         if self.finalize_refused_live == Some((head, height)) {
             return;
         }
@@ -1543,34 +1627,38 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         if self.state.finalized_height() == Some(cp.height) {
             return;
         }
-        // Issue #204: this was `let _ =`, and it is the one that mattered. The
-        // value discarded here is `Ok(false)` — "the chain store rejected it
-        // (unknown / non-advancing / off-finality)" — i.e. the **durable** head
-        // declining to record what the operator-facing head already reports. That is
-        // exactly the state node1 was in, and nothing on the node could say so.
+        // Issue #204: this was `let _ =`, and it is the one that mattered — the
+        // **durable** head declining to record what the operator-facing head already
+        // reports. That is exactly the state node1 was in, and nothing on the node
+        // could say so.
         //
-        // The reason is derived from the same store state `ChainStore::set_finalized`
-        // checked (it flattens `ChainState`'s typed error to a bool), so the three
-        // arms below are its three refusals and not a guess about them.
+        // 🔴 Issue #241: and until then the *reason* still did not survive the trip.
+        // `Node::finalize` returned `Ok(false)`, so the three arms that used to live
+        // here re-derived the reason by re-reading store state — a second
+        // implementation of `ChainStore::set_finalized`'s own decision, which could
+        // disagree with it (it tested `cp.height`, the checkpoint's *claimed* height,
+        // where the store tests the stored header's; and it asked `contains`, the
+        // block map, where the store asks its header map). Worse, its last arm was an
+        // unconditional `else`, so a fourth refusal variant would have rendered
+        // `off-finality` with no compile error. The store's verdict is now threaded
+        // through and converted once, exhaustively, at
+        // `FinalizeRefusalReason::from`.
         //
         // The retry itself is unchanged (#130 (a)): a refusal is re-attempted on the
-        // next drain. What changed is that it is now counted, journalled and on the
-        // telemetry line while it lasts.
-        use qlab_node::ChainStore as _;
+        // next drain. What changed is that it is counted, journalled and on the
+        // telemetry line while it lasts — and now that it says which refusal.
         match self.state.finalize(cp.block_hash) {
-            Ok(true) => self.note_finalize_recorded("state"),
-            Ok(false) => {
-                let store = self.state.chain();
-                let why = if !store.contains(&cp.block_hash) {
-                    "unknown"
-                } else if store.finalized_height().is_some_and(|f| cp.height <= f) {
-                    "not-advancing"
-                } else {
-                    "off-finality"
-                };
-                self.note_finalize_refused("state", cp.height, cp.block_hash, why);
+            Ok(FinalizeOutcome::Recorded) => self.note_finalize_recorded("state"),
+            Ok(FinalizeOutcome::Refused(e)) => {
+                self.note_finalize_refused("state", cp.height, cp.block_hash, e.into());
             }
-            Err(_) => self.note_finalize_refused("state", cp.height, cp.block_hash, "persist"),
+            // Not a store verdict: the store said yes and the log append failed.
+            Err(_) => self.note_finalize_refused(
+                "state",
+                cp.height,
+                cp.block_hash,
+                FinalizeRefusalReason::Persist,
+            ),
         }
     }
 
@@ -2305,12 +2393,17 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
                     match self.chain.set_finalized(cp.block_hash) {
                         Ok(()) => self.note_finalize_recorded("chain"),
                         Err(e) => {
-                            let why = match e {
-                                FinalizeMarkError::Unknown => "unknown",
-                                FinalizeMarkError::NotAdvancing => "not-advancing",
-                                FinalizeMarkError::NotDescendantOfFinalized => "off-finality",
-                            };
-                            self.note_finalize_refused("chain", cp.height, cp.block_hash, why);
+                            // Issue #241: this head always held the typed refusal —
+                            // it is the durable head that lost it. The rendering now
+                            // goes through the same one-way door for both, so the
+                            // two heads cannot drift apart on what a reason is
+                            // called.
+                            self.note_finalize_refused(
+                                "chain",
+                                cp.height,
+                                cp.block_hash,
+                                e.into(),
+                            );
                         }
                     }
                     // …and the state machine's finalized head, through the single

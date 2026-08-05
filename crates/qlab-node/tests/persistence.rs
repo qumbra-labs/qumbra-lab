@@ -67,7 +67,7 @@ fn build_chain(dir: &PathBuf) -> (Hash32, u64, usize, Hash32, Option<u64>) {
     let mut node = MemNode::open(dir, genesis).unwrap();
 
     // Finalize genesis so its (empty) root is a valid anchor.
-    assert!(node.finalize(g_header.header_hash()).unwrap());
+    assert!(node.finalize(g_header.header_hash()).unwrap().is_recorded());
     let g_root = node.commitment_root();
 
     // block1: two output commitments, anchored to the finalized genesis root.
@@ -75,7 +75,7 @@ fn build_chain(dir: &PathBuf) -> (Hash32, u64, usize, Hash32, Option<u64>) {
         apply_one_tx_block(&mut node, &g_header, tx(g_root, vec![], vec![[1u8; 32], [2u8; 32]]))
             .unwrap();
     assert_eq!(node.commitment_count(), 2);
-    assert!(node.finalize(hash1).unwrap());
+    assert!(node.finalize(hash1).unwrap().is_recorded());
     let r1 = node.commitment_root();
 
     // block2: a spend (one nullifier) + one new output, anchored to block1's root.
@@ -170,7 +170,7 @@ fn a_finalization_recorded_after_the_snapshot_still_survives() {
     let g_header = genesis.header();
     let mut node = MemNode::open(&dir, genesis.clone()).unwrap();
 
-    assert!(node.finalize(g_header.header_hash()).unwrap());
+    assert!(node.finalize(g_header.header_hash()).unwrap().is_recorded());
     let root = node.commitment_root();
     let (_h1, hash1) = apply_one_tx_block(
         &mut node,
@@ -184,7 +184,7 @@ fn a_finalization_recorded_after_the_snapshot_still_survives() {
     // This record is appended after the snapshot even though it names a block at
     // the snapshot's applied height. Recovery must judge record order, not assume
     // `height <= applied_height` means the finalization was already snapshotted.
-    assert!(node.finalize(hash1).unwrap());
+    assert!(node.finalize(hash1).unwrap().is_recorded());
     drop(node);
 
     let reopened = MemNode::open(&dir, genesis).unwrap();
@@ -315,7 +315,7 @@ fn node_with_finalized_genesis(dir: &PathBuf) -> (MemNode, BlockHeader, Hash32) 
     let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
     let g_header = genesis.header();
     let mut node = MemNode::open(dir, genesis).unwrap();
-    assert!(node.finalize(g_header.header_hash()).unwrap());
+    assert!(node.finalize(g_header.header_hash()).unwrap().is_recorded());
     let root = node.commitment_root();
     (node, g_header, root)
 }

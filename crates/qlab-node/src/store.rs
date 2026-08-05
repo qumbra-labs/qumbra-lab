@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use qlab_cbserver::tree::CommitmentTree;
 use qlab_devnet::body::{BlockBody, TxEntry, TxPublic};
-use qlab_devnet::chain::{ChainState, InsertError, RestoreFinalizedError};
+use qlab_devnet::chain::{ChainState, FinalizeMarkError, InsertError, RestoreFinalizedError};
 use qlab_devnet::fees::ArityBucket;
 use qlab_devnet::header::BlockHeader;
 
@@ -213,7 +213,18 @@ pub trait ChainStore {
     /// Whether a block with this hash is stored.
     fn contains(&self, hash: &Hash32) -> bool;
     /// Mark `hash` finalized (must be known, strictly advance, descend finality).
-    fn set_finalized(&mut self, hash: Hash32) -> bool;
+    ///
+    /// 🔴 **Returns the store's own typed refusal, not a bool** (issue #241). This
+    /// returned `bool` until then, and `MemChainStore` produced it with
+    /// `self.chain.set_finalized(hash).is_ok()` — throwing away a
+    /// [`FinalizeMarkError`] that the layer above then had to *reconstruct* from
+    /// store state in order to journal a `why=`. That reconstruction was a second
+    /// implementation of this method's decision and could disagree with it: it read
+    /// the checkpoint's claimed height where this reads the stored header's, and it
+    /// asked the block map where this asks the header map. Issue #205 is the same
+    /// defect one layer up (`let _ = set_finalized(…)`); this is the seam it left
+    /// behind.
+    fn set_finalized(&mut self, hash: Hash32) -> Result<(), FinalizeMarkError>;
     /// Reinstate a finalized point from a durable snapshot. Unlike
     /// [`Self::set_finalized`], this proves one previously-established point
     /// against the reconstructed main chain rather than advancing live finality.
@@ -438,8 +449,8 @@ impl ChainStore for MemChainStore {
     fn contains(&self, hash: &Hash32) -> bool {
         self.blocks.contains_key(hash)
     }
-    fn set_finalized(&mut self, hash: Hash32) -> bool {
-        self.chain.set_finalized(hash).is_ok()
+    fn set_finalized(&mut self, hash: Hash32) -> Result<(), FinalizeMarkError> {
+        self.chain.set_finalized(hash)
     }
     fn restore_finalized(
         &mut self,
@@ -592,7 +603,7 @@ mod tests {
     #[test]
     fn a_rewind_refuses_to_cross_the_finalized_head() {
         let (mut store, main, _) = store_with_a_side_branch();
-        assert!(store.set_finalized(main[2]), "finalize height 2");
+        assert_eq!(store.set_finalized(main[2]), Ok(()), "finalize height 2");
 
         assert_eq!(
             store.rewind_path(&main[1]),

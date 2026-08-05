@@ -25,7 +25,7 @@ use qlab_devnet::header::BlockHeader;
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
 use qlab_devnet::pow::KeccakPow;
-use qlab_p2p::adapter::NodeAdapter;
+use qlab_p2p::adapter::{FinalizeRefusalReason, NodeAdapter};
 use qlab_p2p::codec::{
     checkpoint_id, checkpoint_query_height, checkpoint_query_id, decode_checkpoint_msg,
     decode_inv, encode_checkpoint_msg, encode_inv, InvItem, InvKind, CHECKPOINT_QUERY_TAG,
@@ -775,13 +775,20 @@ fn a_durable_head_that_refuses_is_counted_journalled_and_on_the_line() {
     assert_eq!(journal.len(), 1, "journalled once");
     assert_eq!(journal[0].head, "state", "the DURABLE head is the one that refused");
     assert_eq!(journal[0].height, 16);
-    assert_eq!(journal[0].why, "unknown", "the state machine does not hold that block");
+    assert_eq!(
+        journal[0].why,
+        FinalizeRefusalReason::NotHeld,
+        "the state machine does not hold that block"
+    );
     assert!(
         journal[0].to_string().starts_with("FINALIZE refused head=state h=16 cp="),
         "and it renders for the container log: {}",
         journal[0]
     );
-    assert!(journal[0].to_string().ends_with(" why=unknown"), "{}", journal[0]);
+    // Issue #241: this asserted `why=unknown` until the token was renamed. The
+    // refusal is the same one, at the same instant, for the same cause — what
+    // changed is that the line no longer shares a word with `mready=unknown`.
+    assert!(journal[0].to_string().ends_with(" why=not-held"), "{}", journal[0]);
 }
 
 /// The retry is unchanged (#130 (a)) and the counter is a **transition** count, not
@@ -880,7 +887,10 @@ fn the_fork_choice_head_refusing_is_reported_as_its_own_head() {
     let heads: Vec<&str> = journal.iter().map(|r| r.head).collect();
     assert!(heads.contains(&"chain"), "fork choice refused and said so: {heads:?}");
     assert!(heads.contains(&"state"), "so did the durable head: {heads:?}");
-    assert!(journal.iter().all(|r| r.height == 16 && r.why == "unknown"), "{journal:?}");
+    assert!(
+        journal.iter().all(|r| r.height == 16 && r.why == FinalizeRefusalReason::NotHeld),
+        "{journal:?}"
+    );
     assert_eq!(b.node().chain().finalized_height(), None, "and neither pointer moved");
     assert_eq!(b.node().durable_finalized_height(), None);
 }

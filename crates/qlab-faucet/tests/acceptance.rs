@@ -103,7 +103,7 @@ impl Rig {
     fn new() -> Rig {
         let mut node = MemNode::in_memory(genesis_block(1_000, 0));
         let ghash = node.chain().genesis_block_hash();
-        assert!(node.finalize(ghash).expect("finalize genesis"), "genesis finalizes");
+        assert!(node.finalize(ghash).expect("finalize genesis").is_recorded(), "genesis finalizes");
         Rig { rpc: NodeRpc::new(node), seed_epoch: 0 }
     }
 
@@ -127,7 +127,7 @@ impl Rig {
     fn finalize_tip(&mut self) {
         let node = self.rpc.node_mut();
         let tip = node.tip_hash();
-        assert!(node.finalize(tip).expect("finalize"), "tip finalizes");
+        assert!(node.finalize(tip).expect("finalize").is_recorded(), "tip finalizes");
     }
 
     /// Mine `n` empty blocks — the cheap way to age an anchor out of its window.
