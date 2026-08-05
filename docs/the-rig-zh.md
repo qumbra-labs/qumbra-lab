@@ -16,9 +16,15 @@
 
 ```sh
 scripts/rig run -- cargo test --release --workspace -- --test-threads=1
-scripts/rig status      # 谁持锁、从何时起、在跑什么
+scripts/rig ps          # 在跑的 + 排队的 + 最近 5 次完成(退出码、日志路径)
+scripts/rig log -f      # 实时跟当前持锁者的日志
+scripts/rig status      # 持锁者一行版(输出稳定,供脚本用)
 scripts/rig release     # 手动破锁——仅当 trap 没能触发时用
 ```
+
+*(2026-08-05:每次 `run` 自动 tee 到 `~/develop/qumbra/logs/rig-<时间戳>-<pid>.log`,
+等锁者在 `ps` 里可见而非静默排队,完成后追加一行进 `logs/rig-manifest.tsv`——
+起止、owner、退出码、日志、命令。)*
 
 - **锁是一个目录**:`~/.qumbra-rig.lock`(可用 `QUMBRA_RIG_LOCK` 覆盖)。抢锁就是 `mkdir`——POSIX 上是**原子**的,两个竞争者不可能同时成功。目录里放四个文件:`owner`、`pid`、`started`、`cmd`,所以 `status` 回答"谁/何时/在干嘛"不用猜。
 - **等锁是轮询**:每 15 秒重试一次,首次等待和之后每 5 分钟打一行 "waiting for <owner>"。这就是为什么一个排队的套件可以合法地 50 多分钟没有任何输出——2026-08-03 实测:一个 wrapper 16:46 开始抢锁,17:38 才真正起跑 cargo。
