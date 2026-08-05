@@ -621,4 +621,47 @@ mod tests {
         assert_eq!(store.finalized_hash(), Some(main[2]));
         assert_eq!(store.finalized_height(), Some(2));
     }
+
+    /// 🔴 **Issue #241 — the trait hands back the store's own refusal, not a bool.**
+    ///
+    /// This is the seam the issue is about. `ChainStore::set_finalized` returned
+    /// `bool`, and `MemChainStore` produced it with
+    /// `self.chain.set_finalized(hash).is_ok()`, so the one caller that has to print
+    /// *which* refusal happened had no choice but to reconstruct it by re-reading
+    /// store state. All three variants are produced here by the real store, from the
+    /// real conditions, so nothing downstream has to guess.
+    #[test]
+    fn the_chain_store_returns_its_typed_refusal_for_every_variant() {
+        let (mut store, main, side_hash) = store_with_a_side_branch();
+
+        // (1) Unknown — a hash this store has never held.
+        assert_eq!(store.set_finalized([0x99; 32]), Err(FinalizeMarkError::Unknown));
+        assert_eq!(store.finalized_hash(), None, "a refusal changes nothing");
+
+        // Grow the un-adopted side branch past the height we are about to finalize,
+        // so there is a KNOWN block above the finalized head that does not descend
+        // from it — the only way to reach `NotDescendantOfFinalized`.
+        let side1 = store.block(&side_hash).expect("the side branch is stored").clone();
+        let side2 = block(&side1.header(), 0xB3);
+        let side3 = block(&side2.header(), 0xB4);
+        store.put_block(side2).expect("a side branch extends");
+        let side3_hash = store.put_block(side3).expect("a side branch extends");
+
+        assert_eq!(store.set_finalized(main[2]), Ok(()), "finalize height 2");
+
+        // (2) NotAdvancing — known, on the main chain, but at or below the head.
+        assert_eq!(store.set_finalized(main[1]), Err(FinalizeMarkError::NotAdvancing));
+        assert_eq!(store.set_finalized(main[2]), Err(FinalizeMarkError::NotAdvancing));
+
+        // (3) NotDescendantOfFinalized — known, ABOVE the head, wrong branch. This
+        // is the no-reorg-past-finality refusal and it is the one an operator most
+        // needs told apart from the other two.
+        assert_eq!(
+            store.set_finalized(side3_hash),
+            Err(FinalizeMarkError::NotDescendantOfFinalized)
+        );
+
+        assert_eq!(store.finalized_hash(), Some(main[2]), "and none of them moved the head");
+        assert_eq!(store.finalized_height(), Some(2));
+    }
 }
