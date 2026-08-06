@@ -25,7 +25,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use qlab_devnet::body::{validate_body, BlockBody, BodyError, TxVerifier};
-use qlab_devnet::chain::{InsertError, RestoreFinalizedError};
+use qlab_devnet::chain::{FinalizeMarkError, InsertError, RestoreFinalizedError};
 use qlab_devnet::committee::Checkpoint;
 use qlab_devnet::header::BlockHeader;
 use qlab_devnet::params_devnet::MAX_ANCHOR_AGE_BLOCKS;
@@ -318,6 +318,44 @@ impl std::fmt::Display for RewindReport {
             self.to_height,
             self.blocks_undone()
         )
+    }
+}
+
+/// What [`Node::finalize`] did with a finalize request (issue #241).
+///
+/// **A two-state enum and not a `bool`, because the refusal has to carry its own
+/// reason to the operator's journal line.** Before #241 this was `Ok(bool)`, and the
+/// one caller that renders `FINALIZE refused … why=` had to re-derive the reason by
+/// re-reading store state — a second implementation of
+/// [`ChainStore::set_finalized`]'s decision, able to disagree with the first. Issue
+/// #205 removed exactly this discard one layer up (`let _ = set_finalized(…)`);
+/// keeping a `bool` here preserved it one layer down.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FinalizeOutcome {
+    /// The finalized head advanced, and (for a disk-backed node) the `Finalize`
+    /// record is on the log.
+    Recorded,
+    /// The chain store refused, in its own terms. **Never a placeholder** — this is
+    /// the value [`ChainState::set_finalized`] returned, not a reconstruction of it.
+    ///
+    /// [`ChainState::set_finalized`]: qlab_devnet::chain::ChainState::set_finalized
+    Refused(FinalizeMarkError),
+}
+
+impl FinalizeOutcome {
+    /// Whether the head advanced. A convenience for call sites that genuinely do not
+    /// care *why* a refusal happened (replay, tests) — the reason is still in the
+    /// value, not thrown away by the type.
+    pub fn is_recorded(&self) -> bool {
+        matches!(self, FinalizeOutcome::Recorded)
+    }
+
+    /// The store's refusal, if it refused.
+    pub fn refusal(&self) -> Option<&FinalizeMarkError> {
+        match self {
+            FinalizeOutcome::Recorded => None,
+            FinalizeOutcome::Refused(e) => Some(e),
+        }
     }
 }
 
@@ -732,7 +770,7 @@ impl MemNode {
                     replayed_records += 1;
                 }
                 LogRecord::Finalize(hash) => {
-                    if node.chain.set_finalized(*hash) {
+                    if node.chain.set_finalized(*hash).is_ok() {
                         replayed_records += 1;
                     }
                 }
@@ -766,7 +804,7 @@ impl MemNode {
                     node.apply_logged_block(b)?;
                 }
                 LogRecord::Finalize(hash) => {
-                    node.chain.set_finalized(*hash);
+                    let _ = node.chain.set_finalized(*hash);
                 }
             }
             replayed_records += 1;
@@ -792,7 +830,7 @@ impl MemNode {
                     node.apply_logged_block(&b)?;
                 }
                 LogRecord::Finalize(h) => {
-                    node.chain.set_finalized(h);
+                    let _ = node.chain.set_finalized(h);
                 }
             }
         }
@@ -1155,16 +1193,22 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// Mark `hash` finalized (delegates the no-reorg-past-finality rule to the
     /// chain store) and log it, so a restart/replay reconstructs the finalized
     /// head. Finalization is what makes a commitment root a *valid anchor* (§4).
-    /// `Ok(false)` = the chain store rejected it (unknown / non-advancing /
-    /// off-finality); `Err` = a persistence failure.
-    pub fn finalize(&mut self, hash: Hash32) -> Result<bool, NodeError> {
-        if !self.chain.set_finalized(hash) {
-            return Ok(false);
+    ///
+    /// `Ok(`[`FinalizeOutcome::Refused`]`)` = the chain store said no, **carrying the
+    /// store's own [`FinalizeMarkError`]**; `Err` = a persistence failure.
+    ///
+    /// This returned `Ok(bool)` until issue #241. The caller that journals the
+    /// `FINALIZE refused why=` line then had to reconstruct the reason from store
+    /// state, because `Ok(false)` did not carry it — the same discard issue #205
+    /// removed one layer up, surviving one layer down.
+    pub fn finalize(&mut self, hash: Hash32) -> Result<FinalizeOutcome, NodeError> {
+        if let Err(refusal) = self.chain.set_finalized(hash) {
+            return Ok(FinalizeOutcome::Refused(refusal));
         }
         if let Some(dir) = &self.dir {
             persist::append_record(dir, &LogRecord::Finalize(hash)).map_err(NodeError::Io)?;
         }
-        Ok(true)
+        Ok(FinalizeOutcome::Recorded)
     }
 
     /// Persist the current derived state as an atomic snapshot (no-op for an
@@ -1307,7 +1351,7 @@ mod tests {
         let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
         let g_header = genesis.header();
         let mut node = MemNode::in_memory(genesis);
-        assert!(node.finalize(g_header.header_hash()).unwrap());
+        assert!(node.finalize(g_header.header_hash()).unwrap().is_recorded());
         let root = node.commitment_root();
         (node, g_header, root)
     }

@@ -114,7 +114,7 @@ fn apply_and_finalize(node: &mut MemNode, txs: Vec<TxEntry>) -> u64 {
     let body = BlockBody { txs, coinbase: height, coinbase_rkm: [height, 2, 3, 4] };
     let header = BlockHeader::child_of(&parent, height * 75, GENESIS_DIFFICULTY, body.commitment());
     let hash = node.apply_block(header, body, &AcceptAll).expect("block applies");
-    assert!(node.finalize(hash).expect("finalize"), "height {height} finalizes");
+    assert!(node.finalize(hash).expect("finalize").is_recorded(), "height {height} finalizes");
     height
 }
 
@@ -151,7 +151,7 @@ fn a_recipient_finds_its_output_from_a_restarted_nodes_committed_discovery() {
         let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
         let mut node = MemNode::open(&dir, genesis).expect("open a fresh data dir");
         let ghash = node.chain().genesis_block_hash();
-        assert!(node.finalize(ghash).expect("finalize genesis"));
+        assert!(node.finalize(ghash).expect("finalize genesis").is_recorded());
         let anchor = node.commitment_root();
         assert!(node.is_valid_anchor(&anchor), "the finalized empty root is an anchor");
 
@@ -285,7 +285,7 @@ fn a_payment_that_attaches_no_discovery_cannot_reach_the_serving_path() {
     let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
     let mut node = MemNode::open(&dir, genesis).expect("open");
     let ghash = node.chain().genesis_block_hash();
-    assert!(node.finalize(ghash).expect("finalize genesis"));
+    assert!(node.finalize(ghash).expect("finalize genesis").is_recorded());
     let anchor = node.commitment_root();
 
     let (good, _notes) = payment_to(&recipient.ek, 2, 1, anchor, &mut rng);

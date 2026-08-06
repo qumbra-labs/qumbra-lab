@@ -88,7 +88,7 @@ fn setup(rng: &mut StdRng) -> (MemNodeRpc, Keypair, Keypair, Hash32) {
     let decoy = generate_keypair(rng);
     let mut node = MemNode::in_memory(genesis_block(1_000, 0));
     let ghash = node.chain().genesis_block_hash();
-    assert!(node.finalize(ghash).unwrap());
+    assert!(node.finalize(ghash).unwrap().is_recorded());
     let anchor = node.commitment_root();
     assert!(node.is_valid_anchor(&anchor));
     (qlab_node::NodeRpc::new(node), our, decoy, anchor)
@@ -235,7 +235,7 @@ fn per_height_frontiers_match_the_nodes_own_roots_across_the_maturity_delay() {
 
     let mut node = MemNode::in_memory(genesis_block(1_000, 0));
     let ghash = node.chain().genesis_block_hash();
-    assert!(node.finalize(ghash).unwrap());
+    assert!(node.finalize(ghash).unwrap().is_recorded());
 
     // The node's own root after each height — the ground truth to reconstruct.
     let mut roots_live: Vec<Hash32> = vec![node.commitment_root()]; // height 0

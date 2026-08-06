@@ -145,7 +145,7 @@ impl TestNode {
         let tip = genesis.header();
         let mut node = MemNode::in_memory(genesis);
         let ghash = node.chain().genesis_block_hash();
-        assert!(node.finalize(ghash).expect("finalize genesis"), "genesis finalizes");
+        assert!(node.finalize(ghash).expect("finalize genesis").is_recorded(), "genesis finalizes");
         TestNode { rpc: NodeRpc::new(node), tip, pending: Vec::new() }
     }
 

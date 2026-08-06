@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use qlab_cbserver::tree::CommitmentTree;
 use qlab_devnet::body::{BlockBody, TxEntry, TxPublic};
-use qlab_devnet::chain::{ChainState, InsertError, RestoreFinalizedError};
+use qlab_devnet::chain::{ChainState, FinalizeMarkError, InsertError, RestoreFinalizedError};
 use qlab_devnet::fees::ArityBucket;
 use qlab_devnet::header::BlockHeader;
 
@@ -213,7 +213,18 @@ pub trait ChainStore {
     /// Whether a block with this hash is stored.
     fn contains(&self, hash: &Hash32) -> bool;
     /// Mark `hash` finalized (must be known, strictly advance, descend finality).
-    fn set_finalized(&mut self, hash: Hash32) -> bool;
+    ///
+    /// 🔴 **Returns the store's own typed refusal, not a bool** (issue #241). This
+    /// returned `bool` until then, and `MemChainStore` produced it with
+    /// `self.chain.set_finalized(hash).is_ok()` — throwing away a
+    /// [`FinalizeMarkError`] that the layer above then had to *reconstruct* from
+    /// store state in order to journal a `why=`. That reconstruction was a second
+    /// implementation of this method's decision and could disagree with it: it read
+    /// the checkpoint's claimed height where this reads the stored header's, and it
+    /// asked the block map where this asks the header map. Issue #205 is the same
+    /// defect one layer up (`let _ = set_finalized(…)`); this is the seam it left
+    /// behind.
+    fn set_finalized(&mut self, hash: Hash32) -> Result<(), FinalizeMarkError>;
     /// Reinstate a finalized point from a durable snapshot. Unlike
     /// [`Self::set_finalized`], this proves one previously-established point
     /// against the reconstructed main chain rather than advancing live finality.
@@ -438,8 +449,8 @@ impl ChainStore for MemChainStore {
     fn contains(&self, hash: &Hash32) -> bool {
         self.blocks.contains_key(hash)
     }
-    fn set_finalized(&mut self, hash: Hash32) -> bool {
-        self.chain.set_finalized(hash).is_ok()
+    fn set_finalized(&mut self, hash: Hash32) -> Result<(), FinalizeMarkError> {
+        self.chain.set_finalized(hash)
     }
     fn restore_finalized(
         &mut self,
@@ -592,7 +603,7 @@ mod tests {
     #[test]
     fn a_rewind_refuses_to_cross_the_finalized_head() {
         let (mut store, main, _) = store_with_a_side_branch();
-        assert!(store.set_finalized(main[2]), "finalize height 2");
+        assert_eq!(store.set_finalized(main[2]), Ok(()), "finalize height 2");
 
         assert_eq!(
             store.rewind_path(&main[1]),
@@ -608,6 +619,49 @@ mod tests {
         store.rewind_to(main[2]).expect("rewinding to finality is not rewinding past it");
         assert_eq!(store.tip_hash(), main[2]);
         assert_eq!(store.finalized_hash(), Some(main[2]));
+        assert_eq!(store.finalized_height(), Some(2));
+    }
+
+    /// 🔴 **Issue #241 — the trait hands back the store's own refusal, not a bool.**
+    ///
+    /// This is the seam the issue is about. `ChainStore::set_finalized` returned
+    /// `bool`, and `MemChainStore` produced it with
+    /// `self.chain.set_finalized(hash).is_ok()`, so the one caller that has to print
+    /// *which* refusal happened had no choice but to reconstruct it by re-reading
+    /// store state. All three variants are produced here by the real store, from the
+    /// real conditions, so nothing downstream has to guess.
+    #[test]
+    fn the_chain_store_returns_its_typed_refusal_for_every_variant() {
+        let (mut store, main, side_hash) = store_with_a_side_branch();
+
+        // (1) Unknown — a hash this store has never held.
+        assert_eq!(store.set_finalized([0x99; 32]), Err(FinalizeMarkError::Unknown));
+        assert_eq!(store.finalized_hash(), None, "a refusal changes nothing");
+
+        // Grow the un-adopted side branch past the height we are about to finalize,
+        // so there is a KNOWN block above the finalized head that does not descend
+        // from it — the only way to reach `NotDescendantOfFinalized`.
+        let side1 = store.block(&side_hash).expect("the side branch is stored").clone();
+        let side2 = block(&side1.header(), 0xB3);
+        let side3 = block(&side2.header(), 0xB4);
+        store.put_block(side2).expect("a side branch extends");
+        let side3_hash = store.put_block(side3).expect("a side branch extends");
+
+        assert_eq!(store.set_finalized(main[2]), Ok(()), "finalize height 2");
+
+        // (2) NotAdvancing — known, on the main chain, but at or below the head.
+        assert_eq!(store.set_finalized(main[1]), Err(FinalizeMarkError::NotAdvancing));
+        assert_eq!(store.set_finalized(main[2]), Err(FinalizeMarkError::NotAdvancing));
+
+        // (3) NotDescendantOfFinalized — known, ABOVE the head, wrong branch. This
+        // is the no-reorg-past-finality refusal and it is the one an operator most
+        // needs told apart from the other two.
+        assert_eq!(
+            store.set_finalized(side3_hash),
+            Err(FinalizeMarkError::NotDescendantOfFinalized)
+        );
+
+        assert_eq!(store.finalized_hash(), Some(main[2]), "and none of them moved the head");
         assert_eq!(store.finalized_height(), Some(2));
     }
 }
