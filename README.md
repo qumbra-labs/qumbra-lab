@@ -27,7 +27,7 @@ crates/         # 20 crates
   qumbra-node/        # the shipping binary: config, genesis, run
   qumbra-opview/      # the T0 operator view: cross-node checkpoint agreement + supply attestation (deliberately NOT an explorer)
   qumbra-faucet/      # the T1 faucet listener: HTTP over qlab-faucet's core, in-process with a KEYLESS node
-  qumbra-explorer/    # the public chain-health page over its own keyless observer node (deliberately not an Etherscan)
+  qumbra-explorer/    # the public chain-health JSON projection over its own keyless observer node (deliberately not an Etherscan; the page is qumbra-explorer-web, #281)
   qumbra-wallet/      # the end-user wallet CLI: keygen/restore/address/backup/scan — deliberately no send yet (#219/mint)
   qumbra-ffi/         # the wallet kernel over a hand C ABI, cross-compiled for iOS (rung A, #246)
 docs/           # lab notes; polished results go to the design repo, not here

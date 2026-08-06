@@ -44,3 +44,15 @@ tiny_http = "=0.12.0"
 # declares its own version/features, so the faucet's bare-redeclaration slip
 # cannot recur here.
 ctrlc = { workspace = true }
+
+[dev-dependencies]
+# Parse-and-assert for the hand-rolled encoder, and **dev-only on purpose**
+# (issue #281): the encoder itself ships zero new runtime dependencies, and a
+# real parser in the test is what proves the hand-rolled bytes are JSON rather
+# than something that merely looks like it. The whole workspace carries no
+# `serde_json` at runtime and this does not change that.
+serde_json = "1"
+# `keccak256` for the golden digest only — the same helper #277 locks its leaf-stream
+# framing with. Test machinery: the binary depends on qlab-note transitively but
+# this crate does not, and must not, at runtime.
+qlab-note = { path = "../qlab-note" }

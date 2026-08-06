@@ -2,8 +2,12 @@
 //!
 //! ```text
 //! qumbra-explorer check --config FILE   validate the whole deployment, bind nothing
-//! qumbra-explorer run   --config FILE   run the keyless observer node + the page
+//! qumbra-explorer run   --config FILE   keyless observer node + the JSON projection
 //! ```
+//!
+//! Since issue #281 this binary serves **no page**: `GET /v1/health.json` and
+//! `/healthz`, nothing else. The page is `qumbra-explorer-web`, static files served
+//! by svc0's Caddy from a file root beside these two routes.
 //!
 //! CLI glue only; the testable logic is in the library, the same posture as
 //! `qumbra-node`'s and `qumbra-faucet`'s `main.rs`.
@@ -19,8 +23,8 @@ use qlab_node::round::ObsClock;
 use qlab_p2p::adapter::MiningClock;
 
 use qumbra_explorer::config::ExplorerConfig;
-use qumbra_explorer::http::ExplorerServer;
-use qumbra_explorer::view;
+use qumbra_explorer::http::{self, ExplorerServer};
+use qumbra_explorer::json;
 use qumbra_node::config::NodeConfig;
 use qumbra_node::genesis::GenesisFile;
 use qumbra_node::run::RunningNode;
@@ -83,13 +87,14 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     let cfg_path = flag(args, "--config").ok_or("check requires --config FILE")?;
     let (cfg, node, genesis) = load(cfg_path)?;
     println!("qumbra-explorer check: OK");
-    println!("  page listen:    {}", cfg.listen_addr);
+    println!("  api listen:     {}", cfg.listen_addr);
     println!("  node listen:    {}", node.listen_addr);
     println!("  dial peers:     {}", node.dial_peers.len());
     println!("  genesis file hash: {}", genesis.hash_hex());
     println!("  committee keys: 0 (keyless — enforced)");
     println!("  mining:         false (enforced)");
     println!("  extra listeners: none (telemetry_addr/metrics_addr refused — §6.2)");
+    println!("  routes:         {} + /healthz (no page, no write path)", http::HEALTH_PATH);
     Ok(())
 }
 
@@ -104,10 +109,10 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     node.set_mining_clock(MiningClock::WallClock);
     node.set_obs_clock(ObsClock::WallClock);
 
-    // Render once before binding, so the first request served is never blank —
-    // the faucet's rule, kept.
+    // Serialize once before binding, so the first request served is never blank —
+    // the faucet's rule, kept across the split.
     let genesis_hash = genesis.hash_hex();
-    let page = Arc::new(RwLock::new(view::render(
+    let page = Arc::new(RwLock::new(json::health(
         &node.telemetry(),
         &genesis_hash,
         cfg.refresh_secs,
@@ -117,7 +122,8 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let server = ExplorerServer::start(&cfg.listen_addr, Arc::clone(&page))?;
 
     println!("qumbra-explorer running");
-    println!("  page:           http://{}/", server.addr());
+    println!("  projection:     http://{}{}", server.addr(), http::HEALTH_PATH);
+    println!("  page:           served separately (qumbra-explorer-web) — no / here");
     println!("  node listen:    {}", node.listen_addr());
     println!("  node data dir:  {}", node_cfg.data_dir.display());
     println!("  genesis file hash: {genesis_hash}");
@@ -137,20 +143,23 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     // ctrlc with the `termination` feature: SIGINT + SIGTERM + SIGHUP (issue #145).
     ctrlc::set_handler(move || sig.store(true, Ordering::SeqCst))?;
 
-    // Re-render when the snapshot's cheap fingerprint moves, and at least once per
+    // Re-serialize when the snapshot's cheap fingerprint moves, and at least once per
     // refresh interval so age/regime keep pace with chain time even on a quiet net.
+    // The fingerprint rule lives in the library (`json::fingerprint`) because it IS a
+    // rule — this file is CLI glue, and a rule kept here could not be tested. It now
+    // includes head #3, which the pre-#281 tuple omitted.
     let refresh = Duration::from_secs(cfg.refresh_secs.max(1));
     let mut last_render = Instant::now();
-    let mut last_seen = (0u64, None::<u64>, None::<u64>, 0u64, 0u64);
+    let mut last_seen: Option<json::Fingerprint> = None;
     node.run_until_with(&shutdown, |n| {
         let t = n.telemetry();
-        let seen = (t.tip_height, t.finalized_height, t.finalized_id, t.peer_count, t.epoch);
-        if seen != last_seen || last_render.elapsed() >= refresh {
-            let html = view::render(&t, &genesis_hash, cfg.refresh_secs);
+        let seen = json::fingerprint(&t);
+        if last_seen != Some(seen) || last_render.elapsed() >= refresh {
+            let body = json::health(&t, &genesis_hash, cfg.refresh_secs);
             if let Ok(mut p) = page.write() {
-                *p = html;
+                *p = body;
             }
-            last_seen = seen;
+            last_seen = Some(seen);
             last_render = Instant::now();
         }
     });
