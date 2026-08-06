@@ -59,6 +59,67 @@ RUN cargo build --release --locked -p qumbra-node --features drill-cancel \
     && cp target/release/qumbra-node /usr/local/bin/qumbra-node-cancel
 
 # ---- runtime ---------------------------------------------------------------
+# ---- the explorer's own image (issue #281 / design brief §7 touchpoint 3) ----
+#
+# `qumbra-explorer` gets its OWN image rather than riding this one, and the reason is
+# blast radius, not tidiness: sharing would mean that **editing a page's backend
+# produces a new fleet image digest**, so the next roll of the four CONSENSUS hosts
+# would carry an explorer change. `MANUAL-DEPLOY.md`'s per-host gate ("one NEW
+# finalization after the restart") exists because rolling a signing node is a
+# consensus event; coupling a keyless observer's edits to that inverts the risk.
+# svc0's keyless roles have no consensus gate at all (`HOST-PULL-SETUP.md`).
+#
+# Second reason, also not taste: the shared image contains `qumbra-faucet` — the HOT
+# KEY binary that the whole svc0/svc1 split exists to keep off the public host
+# (`docker-compose.svc-light.yml`: "No key material exists on this host at all …
+# that separation is the point"). The keys are not there, so it is not an exploit;
+# shipping the spending binary onto the keyless public box still contradicts the
+# stated reason for the split.
+#
+# 🔴 THESE STAGES SIT BEFORE `runtime` ON PURPOSE. This file already warns that a new
+# last stage becomes the default target, so "any release build would then have to pass
+# --target runtime explicitly, and a forgotten flag fails silently in the direction of
+# shipping more, not less." Appending here would mean a `docker build` following
+# README.md's own command (which passes no --target) produces an explorer image tagged
+# as qumbra-node. Inserting before `runtime` keeps `runtime` last and the documented
+# command unchanged.
+#
+# 🔴 AND THE BUILD IS A SEPARATE STAGE, NOT AN EXTRA `RUN` IN `builder`. Adding the
+# explorer's cargo build to `builder` would change `builder`'s layers, which
+# `runtime` COPYs from — so the FLEET IMAGE DIGEST WOULD MOVE because a page's
+# backend was compiled. `FROM builder AS build-explorer` leaves `builder` and
+# `runtime` untouched, so `--target runtime` has a byte-identical input graph.
+#
+#   docker build -f deploy/docker/Dockerfile --target runtime-explorer \
+#     --build-arg GIT_REVISION=$(git rev-parse HEAD) \
+#     -t ghcr.io/qumbra-labs/qumbra-explorer:<tag> .
+FROM builder AS build-explorer
+RUN cargo build --release --locked -p qumbra-explorer \
+    && cp target/release/qumbra-explorer /usr/local/bin/qumbra-explorer
+
+FROM debian:bookworm-slim AS runtime-explorer
+ARG GIT_REVISION=unknown
+LABEL org.opencontainers.image.revision=$GIT_REVISION
+LABEL org.opencontainers.image.source=https://github.com/qumbra-labs/qumbra-lab
+LABEL org.opencontainers.image.title=qumbra-explorer
+LABEL org.opencontainers.image.description="Keyless observer node serving the chain-health projection at /v1/health.json. Deliberately not a transaction explorer, and it serves no HTML."
+# Deliberately NOT `iproute2`/`iputils-ping`: those exist in `runtime` for `soak.sh
+# netem`'s tc qdisc on the T0 harness, and svc0 runs no drills. Nor `bash`, which is
+# there for entrypoint.sh — this image has no entrypoint script. `ca-certificates` is
+# kept because a keyless observer that later needs an outbound TLS fetch failing on a
+# missing trust store is a bad way to find that out.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build-explorer /usr/local/bin/qumbra-explorer /usr/local/bin/qumbra-explorer
+
+# 🔴 The binary IS the entrypoint, unlike `runtime`. entrypoint.sh's dispatch is
+# T0-shaped — `run` demands a node index 0..3 and waits for a shared genesis file
+# that svc0 does not have — so a purpose-built image gets the right entrypoint
+# instead of an override in someone's compose file. svc0's compose then reads
+# `command: ["run", "--config", "/opt/qumbra/explorer.toml"]`, which says what it does.
+ENTRYPOINT ["/usr/local/bin/qumbra-explorer"]
+
 FROM debian:bookworm-slim AS runtime
 # Provenance (#224 / QUM-72). The key is the one qumbra-deploy's operator check
 # already reads (`org.opencontainers.image.revision`). Default is the string
