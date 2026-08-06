@@ -32,4 +32,5 @@
 
 pub mod send;
 pub mod store;
+pub mod sync;
 pub mod view;
