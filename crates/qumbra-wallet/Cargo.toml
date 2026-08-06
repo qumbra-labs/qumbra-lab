@@ -40,3 +40,13 @@ bincode = "1"
 # Only for the send test's declared-surface comparison (PrimeField32 → u32),
 # same pin as qlab-consensus.
 p3-field = "=0.6.1"
+
+# The first-spend e2e (issue #276) runs a REAL local devnet: a node the test
+# mines directly, the faucet that funds the sender, and the production
+# verifier. Dev-only — the wallet itself stays nodeless (the brief's A2
+# rejection); nothing below enters the library's dependency graph.
+[dev-dependencies]
+qlab-node = { path = "../qlab-node" }
+qlab-faucet = { path = "../qlab-faucet" }
+qumbra-faucet = { path = "../qumbra-faucet" }
+qumbra-node = { path = "../qumbra-node" }
