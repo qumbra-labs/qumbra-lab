@@ -5519,11 +5519,26 @@ mod tests {
                 let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
                 raw[sep + 4..].to_vec()
             };
+            // …and the anchor route beside it (issue #276). This is the ONLY
+            // place `/v1/anchors` is exercised off a real `RunningNode`: the
+            // projection is unit-tested against a mined chain and the route is
+            // tested against a hand-built snapshot, and neither would notice if
+            // `start_discovery_server` failed to hand the view to the server —
+            // the deployed route would then serve an empty set forever.
+            let anchors = {
+                let mut s = std::net::TcpStream::connect(addr).unwrap();
+                write!(s, "GET /v1/anchors HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+                let mut raw = Vec::new();
+                s.read_to_end(&mut raw).unwrap();
+                let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                raw[sep + 4..].to_vec()
+            };
             client_shutdown.store(true, Ordering::Relaxed);
-            (accepted, duplicate, cheap, unbound, leaves)
+            (accepted, duplicate, cheap, unbound, leaves, anchors)
         });
         node.run_until(&shutdown);
-        let (accepted, duplicate, cheap, unbound, leaves) = client.join().unwrap();
+        let (accepted, duplicate, cheap, unbound, leaves, anchors) = client.join().unwrap();
 
         // 202 + the statement tx id — the id NodeRpc::submit_tx would answer.
         let ok_tx = tx_for(1, fee, true);
@@ -5560,6 +5575,25 @@ mod tests {
             .expect("the served bytes are the versioned leaf wire");
         assert_eq!(page.total, 0);
         assert!(page.leaves.is_empty());
+
+        // And the anchor route, off the SAME live binary (issue #276): the
+        // wallet's own decoder reads it, and what it carries is the node's real
+        // anchor set — the finalized (still-empty) root this test already
+        // asserted `is_valid_anchor` for above. An empty `roots` here would mean
+        // the projection never reached the server, which is the one wiring
+        // failure both halves' own tests are blind to.
+        let served = qlab_node::AnchorSet::from_bytes(&anchors)
+            .expect("the served bytes are the AnchorSet wire");
+        assert_eq!(
+            served,
+            qlab_node::anchor_set(node.p2p().node().state()),
+            "the route serves anchor_set's own output — one derivation, not a second"
+        );
+        assert!(
+            served.roots.contains(&anchor),
+            "the finalized root this test spent its transactions against is served as an anchor"
+        );
+        assert_eq!(served.finalized_height, node.finalized_height());
 
         let _ = std::fs::remove_dir_all(&base);
     }
