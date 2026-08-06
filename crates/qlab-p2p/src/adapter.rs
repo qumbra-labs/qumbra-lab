@@ -2277,9 +2277,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
             let cstate = self.committee.state_for_height(cp.height);
             added.accumulated.iter().filter(|v| cstate.is_active(v.signer, cp.height)).cloned().collect()
         };
-        // Issue #87: the accumulated set is the round's `have`, and the offsets of the
-        // signers new in this message are real arrival observations — fed straight
-        // into a histogram, because they cannot be recovered later from a printed count.
+        // Issue #87 / #226: `counted` is this **variant's** full accumulated set
+        // (what `try_finalize` is handed). The ledger unions it into `seen` and
+        // tracks `have` = max over variants so `have` stays comparable to `need`.
+        // Arrival offsets of newly-seen signers feed the histogram directly —
+        // they cannot be recovered later from a printed count.
         {
             let counted: Vec<usize> = active_now.iter().map(|v| v.signer).collect();
             let new = self.rounds.note_votes(&ctx, &counted, &excluded_idx, rejects, variants);
