@@ -52,8 +52,8 @@ use qlab_node::round::ObsClock;
 use qlab_node::{ChainStore, SupplyBlock, SupplyLedger, Telemetry};
 
 use crate::discovery_server::{
-    DiscoveryServer, DiscoveryView, LeavesView, SubmitRequest, TxRefusal, TxSubmitOutcome,
-    MAX_QUEUED_SUBMITS,
+    AnchorsView, DiscoveryServer, DiscoveryView, LeavesView, SubmitRequest, TxRefusal,
+    TxSubmitOutcome, MAX_QUEUED_SUBMITS,
 };
 use crate::metrics_server::MetricsServer;
 use crate::telemetry_server::TelemetryServer;
@@ -313,6 +313,16 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// applied chain and therefore the same derived leaves — the count rides
     /// along because it makes the comparison's meaning legible in a debugger.
     leaves_sig: Option<(qlab_devnet::header::Hash32, u64)>,
+    /// The valid-anchor set as of the last refresh — what `/v1/anchors` serves
+    /// (issue #276), pre-encoded. Same Arc-swap discipline again.
+    anchors_view: Arc<Mutex<Arc<AnchorsView>>>,
+    /// `(applied tip, finalized height)` the current anchor snapshot was
+    /// projected at. Finality is in the key because it is the *only* other
+    /// input that moves the set: a block finalizing turns an already-applied
+    /// root into an anchor without the tip moving at all, and keying on the tip
+    /// alone would serve a stale anchor set across exactly the event a waiting
+    /// wallet is waiting for.
+    anchors_sig: Option<(qlab_devnet::header::Hash32, Option<u64>)>,
     /// The `POST /v1/tx` rendezvous: the server enqueues, the run loop answers
     /// ([`Self::drain_remote_submits`]). `None` until the discovery endpoint
     /// starts.
@@ -646,6 +656,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             discovery_server: None,
             leaves_view: Arc::new(Mutex::new(Arc::new(LeavesView::default()))),
             leaves_sig: None,
+            anchors_view: Arc::new(Mutex::new(Arc::new(AnchorsView::default()))),
+            anchors_sig: None,
             submit_rx: None,
             supply_ledger: Mutex::new(supply_ledger),
             process_start_secs: unix_secs(),
@@ -1489,6 +1501,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // process actually opened rather than from an empty view.
         self.refresh_discovery();
         self.refresh_leaves();
+        self.refresh_anchors();
         // The submit rendezvous (issue #275): the server holds the sender, this
         // loop drains the receiver once per iteration.
         let (submit_tx, submit_rx) = std::sync::mpsc::sync_channel(MAX_QUEUED_SUBMITS);
@@ -1496,6 +1509,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             addr,
             Arc::clone(&self.discovery_view),
             Arc::clone(&self.leaves_view),
+            Arc::clone(&self.anchors_view),
             submit_tx,
         )?;
         let bound = srv.addr();
@@ -1561,6 +1575,36 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// The leaves `/v1/tree/leaves` is currently serving (tests / accounting).
     pub fn leaves_view(&self) -> Arc<LeavesView> {
         Arc::clone(&self.leaves_view.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Re-project the valid-anchor set for `/v1/anchors` (issue #276).
+    ///
+    /// Keyed on `(applied tip, finalized height)` — see [`Self::anchors_sig`]
+    /// for why finality has to be in the key. The derivation is
+    /// [`qlab_node::anchor_set`], the same one `NodeRpc::anchors` uses; this
+    /// binary composes no `NodeRpc`, which is exactly why that function stopped
+    /// being a method in issue #276.
+    ///
+    /// Encoded here rather than per request: one answer, no query, so the loop
+    /// pays the encode once per change and a poller cannot make the server
+    /// work.
+    pub fn refresh_anchors(&mut self) -> bool {
+        let state = self.p2p.node().state();
+        let sig = (state.chain().tip_hash(), state.chain().finalized_height());
+        if self.anchors_sig == Some(sig) {
+            return false;
+        }
+        let snapshot = Arc::new(AnchorsView { encoded: qlab_node::anchor_set(state).to_bytes() });
+        if let Ok(mut slot) = self.anchors_view.lock() {
+            *slot = snapshot;
+        }
+        self.anchors_sig = Some(sig);
+        true
+    }
+
+    /// The anchor set `/v1/anchors` is currently serving (tests / accounting).
+    pub fn anchors_view(&self) -> Arc<AnchorsView> {
+        Arc::clone(&self.anchors_view.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     /// Answer every submission the discovery server has queued (issue #275).
@@ -2167,6 +2211,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             {
                 self.refresh_discovery();
                 self.refresh_leaves();
+                self.refresh_anchors();
                 self.last_discovery_refresh = Instant::now();
             }
             // Every iteration, not on the refresh cadence: a submitter is parked
@@ -5515,6 +5560,87 @@ mod tests {
             .expect("the served bytes are the versioned leaf wire");
         assert_eq!(page.total, 0);
         assert!(page.leaves.is_empty());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The anchor projection (issue #276), and the property that made the route
+    /// necessary: **the newest valid anchor is not the tip root** once the chain
+    /// runs ahead of its finality. A wallet building at the leaf count it just
+    /// synced to would declare that tip root and be refused `anchor-not-valid`;
+    /// this is where it learns which root it may actually use.
+    #[test]
+    fn the_anchor_snapshot_serves_finalized_roots_and_refreshes_on_finality() {
+        let (config, genesis, base) = rig("anchors", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+
+        // Mine PAST coinbase maturity, so leaves actually accrue: from height
+        // COINBASE_MATURITY_BLOCKS on, every block appends the coinbase leaf it
+        // matures (issue #102's append schedule). Below that the tree is empty
+        // at every height, every height shares the empty root, and the tip root
+        // is trivially the finalized root — which is exactly the degenerate
+        // case that hid this whole problem.
+        node.try_checkpoint();
+        for _ in 0..qlab_node::COINBASE_MATURITY_BLOCKS + CHECKPOINT_CADENCE_BLOCKS * 2 {
+            assert!(node.try_mine());
+            node.note_slots_reached();
+            node.try_checkpoint();
+        }
+
+        assert!(node.refresh_anchors(), "the first projection publishes");
+        assert!(!node.refresh_anchors(), "an unchanged (tip, finalized) costs nothing");
+
+        let served = qlab_node::AnchorSet::from_bytes(&node.anchors_view().encoded)
+            .expect("the snapshot holds the AnchorSet wire");
+        let state = node.p2p().node().state();
+        assert_eq!(
+            served,
+            qlab_node::anchor_set(state),
+            "the snapshot IS anchor_set's output — one derivation, not a second one"
+        );
+
+        let fin = served.finalized_height.expect("something finalized");
+        assert!(served.tip_height > fin, "the chain is ahead of its finality — the real case");
+        assert!(!served.roots.is_empty(), "and it has anchors to offer");
+
+        // 🔴 The finding, at the node: the tip root is NOT among the anchors.
+        let tip_root = qlab_node::main_chain_roots_of(state)
+            .last()
+            .map(|(_, r)| *r)
+            .expect("a tip root exists");
+        assert!(
+            !served.roots.contains(&tip_root),
+            "the tip root must NOT be a valid anchor while tip {} is ahead of finalized {fin} — \
+             this is exactly why a wallet cannot build at the leaf count it just synced to",
+            served.tip_height
+        );
+
+        // Every served root IS a main-chain root at a finalized height.
+        let finalized_roots: Vec<qlab_node::Hash32> = qlab_node::main_chain_roots_of(state)
+            .into_iter()
+            .filter(|(h, _)| *h <= fin)
+            .map(|(_, r)| r)
+            .collect();
+        for root in &served.roots {
+            assert!(finalized_roots.contains(root), "a served anchor is a finalized main-chain root");
+        }
+
+        // Finality moving — with or without the tip moving — must republish, or
+        // a wallet waiting for its anchor would poll a snapshot that never
+        // changes across the one event it is waiting for.
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS {
+            assert!(node.try_mine());
+            node.note_slots_reached();
+            node.try_checkpoint();
+        }
+        assert!(node.refresh_anchors(), "a moved chain republishes");
+        let later = qlab_node::AnchorSet::from_bytes(&node.anchors_view().encoded).unwrap();
+        assert!(
+            later.finalized_height.unwrap() > fin,
+            "finality advanced and the served set followed it"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
