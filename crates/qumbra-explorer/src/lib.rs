@@ -1,8 +1,9 @@
-//! `qumbra-explorer` — the public minimal explorer (issue #235): one read-only
-//! chain-health page, rendered from this binary's **own keyless node's** view.
+//! `qumbra-explorer` — the public minimal explorer (issues #235, #281): one
+//! read-only chain-health **projection**, serialized from this binary's **own
+//! keyless node's** view.
 //!
 //! ```text
-//!   P2P net ──▶ in-process observer node ──▶ Telemetry ──▶ render ──▶ GET /
+//!   P2P net ──▶ in-process observer node ──▶ Telemetry ──▶ json ──▶ GET /v1/health.json
 //! ```
 //!
 //! # What this is
@@ -11,35 +12,66 @@
 //! `qumbra-opview` deliberately is not. It answers, for an outsider with no shell
 //! access: is this chain alive, is it finalizing, and does its supply add up.
 //!
+//! **The page is not here.** Issue #281 split it out: this binary serves the
+//! projection and `/healthz` and no HTML at all, and the human-readable page is
+//! `qumbra-labs/qumbra-explorer-web` — static files svc0's Caddy serves from a file
+//! root beside these two routes, same origin, no CORS. The decision and its rejected
+//! alternatives are in `qumbra-design/t1-explorer-split-decision.md`.
+//!
 //! # What this is deliberately NOT
 //!
 //! - **Not a transaction explorer.** No tx lookup, no address lookup, no note
 //!   browsing, no balance queries. Single global shielded pool; a chain-health
-//!   page is the whole scope, and [`http`] answers anything else with 404.
+//!   surface is the whole scope, and [`http`] answers anything else with a typed
+//!   404 — including everything `/v1/tx…`-shaped, which is now *adjacent* to a real
+//!   `/v1` route and therefore tested rather than assumed.
 //! - **Not a window into the fleet.** §6.2 decided the fleet's telemetry
 //!   endpoints stay private. This binary learns chain state **over P2P like any
 //!   peer** and renders its own node's view; it never polls another node's
 //!   `/v1/telemetry`, and [`config::ExplorerConfig::check_observer`] refuses a
 //!   node config that would open telemetry/metrics listeners from this process.
 //! - **Not a writer.** The node holds no committee keys, mines nothing, and no
-//!   route mutates anything ([`http`] takes `GET` only).
+//!   route mutates anything ([`http`] takes `GET` only). #275's `POST /v1/tx`
+//!   belongs to svc0's separate `cbnode`, never to this process.
 //!
 //! # Why the figures can be trusted (and when they refuse to exist)
 //!
-//! Every number on the page comes from [`qlab_node::Telemetry`] and inherits its
+//! Every number in the document comes from [`qlab_node::Telemetry`] and inherits its
 //! refusal disciplines verbatim: `age_field` refuses to state an age it cannot
 //! know (issue #73), and `supply_coverage` refuses supply figures while the
-//! applied state ledger trails fork choice (issues #130/#136) — the page renders
-//! the stable `UNAVAILABLE` token in that state, never a number. **This module
+//! applied state ledger trails fork choice (issues #130/#136) — the projection
+//! carries the stable `UNAVAILABLE` token in that state and **omits the figures
+//! entirely**, so a reader cannot render one it must not. **This crate
 //! adds no rendering rule of its own for either**; it would be a second place for
 //! the rule to be wrong.
 //!
-//! One caveat is labelled rather than hidden: `fid` is served from the committee
-//! tracker, not the durable finalized head — [issue #212]. Until that lands, the
-//! page says so next to the value ([`view::FID_CAVEAT`]).
+//! **Both finalized heads are on the surface**, which is what [issue #212] made
+//! possible and what this crate failed to do for three days: `head1` is the
+//! committee tracker's view and does **not** survive a restart, `head3` is the
+//! durable head that does, and the verdict comparing them is
+//! `Telemetry::durable_agreement`'s — never recomputed here. The prose caveat this
+//! module used to carry beside `fid` is gone, because the distinction is now
+//! structural: two objects, named for what they are.
+//!
+//! # Why this surface may run a client-side page while the faucet's may not
+//!
+//! `qumbra-faucet` has a test forbidding `<script`, external URLs and cookies on its
+//! page, for a stated reason: *a faucet page that pulls a font from a CDN tells that
+//! CDN who is asking a privacy chain for money.* This crate's reader runs JavaScript,
+//! and that is **not** the faucet's rule being broken — it is a different surface.
+//!
+//! The axis is what each one handles. The faucet takes a recipient address and a
+//! single-use ticket, a bearer credential, so code delivery and request shape are in
+//! its threat model. This surface takes **no input at all** and keeps no access
+//! journal; the only thing it could leak about a reader is readership, which a static
+//! page leaks identically. So the faucet's test stays exactly as it is, and it is not
+//! a standard this crate failed. Do not "reconcile" the two.
+//!
+//! The reachable half of that posture is kept: the page carries **no external
+//! reference of any kind**, self-hosted assets only.
 //!
 //! [issue #212]: https://github.com/qumbra-labs/qumbra-lab/issues/212
 
 pub mod config;
 pub mod http;
-pub mod view;
+pub mod json;
