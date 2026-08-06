@@ -2224,43 +2224,73 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
     }
 }
 
-impl<P: PowEngine, V: TxVerifier + Clone> TxPool for NodeAdapter<P, V> {
-    fn ingest_tx(&mut self, tx: TxEntry) -> IngestOutcome {
-        // STATE LAG (issue #130 (a), part 3 — refusals two and three, which are the
-        // same seam).
-        //
-        // `Mempool::admit` answers `is_valid_anchor` from the state machine's tree,
-        // and a stale tree answers a CONSENSUS rule (protocol-spec §4 / frozen §7)
-        // wrongly in both directions: it cannot see roots it has not applied, and its
-        // stale tip makes the `MAX_ANCHOR_AGE_BLOCKS` window read as more permissive
-        // than it is. This is also the wallet refusal — `submit_local_tx`, the only
-        // write a co-resident wallet has (#123), lands here — so a wallet cannot cut
-        // a witness against the wrong prefix of the tree and have this node take it.
-        //
-        // `Ignored`, never `Rejected`: the transaction may be perfectly valid and the
-        // sender is not at fault, and #134 is precisely the cost of confusing "this is
-        // invalid" with "I cannot judge this". So it is not relayed, not pooled, and
-        // NOT scored.
+/// Why a submitted transaction was refused, carried whole (issue #275).
+///
+/// [`NodeAdapter::submit_tx_typed`] returns this so the deployed `POST /v1/tx`
+/// surface can answer with a **named** refusal — `TxPool::ingest_tx`'s
+/// [`IngestOutcome`] flattens the same verdict to a relay decision plus a static
+/// string, which is the right shape for the peer wire and boolean-blind for a
+/// wallet (`WrongFee`'s expected/got, in particular, do not survive it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TxSubmitRefusal {
+    /// The node cannot judge (issue #130 (a)): its applied state is behind its
+    /// chain, and a stale tree answers the anchor rule wrongly in both
+    /// directions. Not the submitter's fault — retry once the node catches up.
+    StateLagging,
+    /// Refused by the pool's admission gates, reason carried whole.
+    Pool(MempoolError),
+}
+
+impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
+    /// Typed submission — **the exact admission [`TxPool::ingest_tx`] applies**,
+    /// with the refusal carried whole instead of flattened to a relay verdict
+    /// (issue #275). `ingest_tx` is a mapping over this, so the deployed
+    /// `POST /v1/tx` surface and the peer wire cannot run two different rules.
+    ///
+    /// STATE LAG (issue #130 (a), part 3 — refusals two and three, which are the
+    /// same seam): `Mempool::admit` answers `is_valid_anchor` from the state
+    /// machine's tree, and a stale tree answers a CONSENSUS rule (protocol-spec
+    /// §4 / frozen §7) wrongly in both directions — it cannot see roots it has
+    /// not applied, and its stale tip makes the `MAX_ANCHOR_AGE_BLOCKS` window
+    /// read as more permissive than it is. This is also the wallet refusal —
+    /// `submit_local_tx` (#123) and the `POST /v1/tx` surface both land here —
+    /// so a wallet cannot cut a witness against the wrong prefix of the tree
+    /// and have this node take it.
+    ///
+    /// Issue #102: there is no coinbase-maturity declaration to pass and no way
+    /// for this path to skip the rule — an immature coinbase has no leaf in any
+    /// valid anchor, so a spend of one has no witness, fails `verify_tx`, and is
+    /// refused as `ProofInvalid` by the same check that refuses every other
+    /// unprovable claim.
+    pub fn submit_tx_typed(&mut self, tx: TxEntry) -> Result<TxId, TxSubmitRefusal> {
         if self.state_lag().is_lagging() {
             self.refuse_for_lag("admit_tx");
-            return IngestOutcome::Ignored(STATE_LAG_REASON);
+            return Err(TxSubmitRefusal::StateLagging);
         }
         let wid = wire_tx_id(&tx);
-        // Issue #102: this line used to read `admit(tx, vec![], …)`. The hardcoded
-        // empty declaration meant every transaction arriving from a peer claimed to
-        // spend no coinbase note, so the frozen §2 maturity loop iterated zero times
-        // on the *only* path that carries other people's transactions — the rule had
-        // no enforcement here at all. There is no declaration to hardcode now: an
-        // immature coinbase has no leaf in any valid anchor, so a spend of one has no
-        // witness, fails `verify_tx`, and is refused as `proof invalid` — by the same
-        // check that refuses every other unprovable claim.
         match self.mempool.admit(tx, &self.state, &self.verifier) {
             Ok(id) => {
                 self.wire_ids.insert(wid, id);
-                IngestOutcome::Accepted
+                Ok(id)
             }
-            Err(MempoolError::DuplicateTx) => IngestOutcome::Duplicate,
-            Err(e) => IngestOutcome::Rejected(Self::reject_reason(&e)),
+            Err(e) => Err(TxSubmitRefusal::Pool(e)),
+        }
+    }
+}
+
+impl<P: PowEngine, V: TxVerifier + Clone> TxPool for NodeAdapter<P, V> {
+    fn ingest_tx(&mut self, tx: TxEntry) -> IngestOutcome {
+        // The admission itself lives in `submit_tx_typed` (issue #275) — this is
+        // the peer wire's flattening of it and nothing more. `Ignored`, never
+        // `Rejected`, for state lag: the transaction may be perfectly valid and
+        // the sender is not at fault, and #134 is precisely the cost of confusing
+        // "this is invalid" with "I cannot judge this". So it is not relayed, not
+        // pooled, and NOT scored.
+        match self.submit_tx_typed(tx) {
+            Ok(_) => IngestOutcome::Accepted,
+            Err(TxSubmitRefusal::StateLagging) => IngestOutcome::Ignored(STATE_LAG_REASON),
+            Err(TxSubmitRefusal::Pool(MempoolError::DuplicateTx)) => IngestOutcome::Duplicate,
+            Err(TxSubmitRefusal::Pool(e)) => IngestOutcome::Rejected(Self::reject_reason(&e)),
         }
     }
     fn get_tx(&self, id: &Hash32) -> Option<TxEntry> {
@@ -2604,6 +2634,67 @@ mod tests {
         assert_eq!(a.mempool().len(), 1);
         // Re-submitting the good tx is a duplicate.
         assert_eq!(a.ingest_tx(good), IngestOutcome::Duplicate);
+    }
+
+    /// **The typed seam and the peer wire are one gate (issue #275).**
+    /// `ingest_tx` is a mapping over [`NodeAdapter::submit_tx_typed`], so every
+    /// verdict here is the verdict a peer submission gets — and the typed side
+    /// carries what the flattening drops (`WrongFee`'s expected/got numbers, the
+    /// exact `MempoolError` variant).
+    #[test]
+    fn submit_tx_typed_is_the_wire_gate_with_the_refusal_carried_whole() {
+        let (mut a, anchor) = adapter_with_finalized_genesis();
+
+        // Accepted: pooled under the returned id, wire id mapped as on the peer
+        // path — and a resubmission is the typed duplicate.
+        let good = tx_with(anchor, 1, b"ok");
+        let id = a.submit_tx_typed(good.clone()).expect("admitted");
+        assert!(a.mempool().contains(&id));
+        assert!(a.has_tx(&wire_tx_id(&good)), "the wire id maps, exactly as ingest_tx would");
+        assert_eq!(
+            a.submit_tx_typed(good),
+            Err(TxSubmitRefusal::Pool(MempoolError::DuplicateTx))
+        );
+
+        // WrongFee: the numbers a wallet needs survive, which the wire's static
+        // string ("wrong fee") structurally cannot carry.
+        let mut cheap = tx_with(anchor, 2, b"ok");
+        cheap.public.fee = 1;
+        assert_eq!(
+            a.submit_tx_typed(cheap),
+            Err(TxSubmitRefusal::Pool(MempoolError::WrongFee {
+                expected: posted_fee(ArityBucket::TwoByTwo),
+                got: 1,
+            }))
+        );
+
+        // Anchor and proof refusals, named; nothing extra pooled by any of them.
+        assert_eq!(
+            a.submit_tx_typed(tx_with([0x5c; 32], 3, b"ok")),
+            Err(TxSubmitRefusal::Pool(MempoolError::AnchorNotValid))
+        );
+        assert_eq!(
+            a.submit_tx_typed(tx_with(anchor, 4, b"nope")),
+            Err(TxSubmitRefusal::Pool(MempoolError::ProofInvalid))
+        );
+        assert_eq!(a.mempool().len(), 1, "only the accepted tx is pooled");
+
+        // State lag: fork choice learns a header whose body has not applied — the
+        // #130 (a) state where a stale tree would answer the anchor rule wrongly.
+        // The typed path refuses by name; the wire path Ignores (not a fault),
+        // and both are the same gate.
+        let b = BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [0; 4] };
+        let h = mine_body_over_tip(&mut a, &b);
+        assert_eq!(a.ingest_header(h), IngestOutcome::Accepted);
+        assert!(a.state_lag().is_lagging());
+        assert_eq!(
+            a.submit_tx_typed(tx_with(anchor, 5, b"ok")),
+            Err(TxSubmitRefusal::StateLagging)
+        );
+        assert_eq!(
+            a.ingest_tx(tx_with(anchor, 5, b"ok")),
+            IngestOutcome::Ignored(STATE_LAG_REASON)
+        );
     }
 
     /// 🔴 **The wire path can no longer admit an immature coinbase spend — issue

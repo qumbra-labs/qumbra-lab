@@ -763,6 +763,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
     }
 
+
     /// Ingest a locally-produced header and announce it.
     pub fn announce_header(&mut self, header: BlockHeader) {
         let id = header.header_hash();
@@ -2027,6 +2028,37 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 self.send(pid, MsgType::BlockAnnounce, payload.clone());
             }
         }
+    }
+}
+
+impl<T, P, V> P2pNode<T, crate::adapter::NodeAdapter<P, V>>
+where
+    T: Transport,
+    P: qlab_devnet::pow::PowEngine,
+    V: qlab_devnet::body::TxVerifier + Clone,
+{
+    /// [`Self::announce_tx`] with the refusal carried whole (issue #275) — the
+    /// seam the deployed `POST /v1/tx` surface answers from.
+    ///
+    /// Admission is [`crate::adapter::NodeAdapter::submit_tx_typed`] — the exact
+    /// gate every peer-delivered transaction passes — and the relay fires exactly
+    /// when [`Self::announce_tx`] would have relayed: on acceptance, never on a
+    /// duplicate or a refusal. It lives on the `NodeAdapter` composition rather
+    /// than on the generic node because the typed verdict is the adapter's — the
+    /// N1 traits deliberately flatten it to a relay decision
+    /// ([`IngestOutcome`]), and widening them for one composition's benefit
+    /// would put a wallet-facing shape on the peer wire's contract.
+    pub fn announce_tx_typed(
+        &mut self,
+        tx: TxEntry,
+    ) -> Result<qlab_node::mempool::TxId, crate::adapter::TxSubmitRefusal> {
+        let id = tx_id(&tx);
+        let res = self.node.submit_tx_typed(tx);
+        if res.is_ok() {
+            self.seen.insert(id);
+            self.relay_inv(InvItem { kind: InvKind::Tx, id }, None);
+        }
+        res
     }
 }
 

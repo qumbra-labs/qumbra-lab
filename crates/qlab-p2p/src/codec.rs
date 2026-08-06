@@ -367,13 +367,17 @@ pub fn encode_tx(tx: &TxEntry) -> Vec<u8> {
 pub fn decode_tx(buf: &[u8]) -> Result<TxEntry, DecodeError> {
     let mut r = Reader::new(buf);
     let anchor = r.hash32("tx.anchor")?;
+    // The counts are attacker-controlled (this decodes the peer wire, and since
+    // issue #275 an HTTP body too): cap each pre-allocation by what the remaining
+    // bytes could actually hold, so a tiny payload claiming 2^60 entries is a
+    // truncation refusal on its first read and never a giant allocation.
     let n_nf = r.varint()? as usize;
-    let mut nullifiers = Vec::with_capacity(n_nf);
+    let mut nullifiers = Vec::with_capacity(n_nf.min(buf.len() / 32));
     for _ in 0..n_nf {
         nullifiers.push(r.hash32("tx.nf")?);
     }
     let n_cm = r.varint()? as usize;
-    let mut commitments = Vec::with_capacity(n_cm);
+    let mut commitments = Vec::with_capacity(n_cm.min(buf.len() / 32));
     for _ in 0..n_cm {
         commitments.push(r.hash32("tx.cm")?);
     }
@@ -774,6 +778,25 @@ mod tests {
         let bucket_pos = 32 + 1 + 1;
         bytes[bucket_pos] = 9;
         assert!(matches!(decode_tx(&bytes), Err(DecodeError::BadBucket { got: 9 })));
+    }
+
+    /// A tiny payload claiming 2^60 nullifiers is a truncation refusal, never a
+    /// 2^65-byte pre-allocation (issue #275 — the counts are attacker-controlled
+    /// on the peer wire, and on an HTTP body once `POST /v1/tx` serves this
+    /// decoder). Before the cap, `Vec::with_capacity(n_nf)` ran on the claimed
+    /// count *before* the first element read could refuse it.
+    #[test]
+    fn tx_decode_refuses_a_count_the_bytes_cannot_hold_without_allocating() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0u8; 32]); // anchor
+        write_varint(&mut bytes, 1u64 << 60); // n_nf, a lie
+        assert!(matches!(decode_tx(&bytes), Err(DecodeError::Truncated { .. })));
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[0u8; 32]); // anchor
+        write_varint(&mut bytes, 0); // n_nf
+        write_varint(&mut bytes, 1u64 << 60); // n_cm, the same lie one field later
+        assert!(matches!(decode_tx(&bytes), Err(DecodeError::Truncated { .. })));
     }
 
     #[test]
