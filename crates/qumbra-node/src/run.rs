@@ -51,7 +51,10 @@ use qlab_node::recovery::{Finalizer, FinalizerState};
 use qlab_node::round::ObsClock;
 use qlab_node::{ChainStore, SupplyBlock, SupplyLedger, Telemetry};
 
-use crate::discovery_server::{DiscoveryServer, DiscoveryView};
+use crate::discovery_server::{
+    DiscoveryServer, DiscoveryView, LeavesView, SubmitRequest, TxRefusal, TxSubmitOutcome,
+    MAX_QUEUED_SUBMITS,
+};
 use crate::metrics_server::MetricsServer;
 use crate::telemetry_server::TelemetryServer;
 
@@ -296,10 +299,24 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     discovery_view: Arc<Mutex<Arc<DiscoveryView>>>,
     /// When the projection was last refreshed.
     last_discovery_refresh: Instant,
-    /// The `/v1/compact` server. `None` only when the operator wrote
+    /// The discovery server (`/v1/compact` + `/v1/tree/leaves` + `POST /v1/tx`
+    /// since issue #275). `None` only when the operator wrote
     /// `discovery_addr = "off"` — **this is the one listener whose default is on**;
     /// see [`crate::discovery_server`] for why it inverts `metrics_addr`'s default.
     discovery_server: Option<DiscoveryServer>,
+    /// The commitment-tree leaves as of the last refresh — what
+    /// `/v1/tree/leaves` serves (issue #275). Same Arc-swap discipline as
+    /// [`Self::discovery_view`].
+    leaves_view: Arc<Mutex<Arc<LeavesView>>>,
+    /// `(applied tip, leaf count)` the current leaves snapshot was projected at.
+    /// The tip hash alone decides identity — the same applied tip means the same
+    /// applied chain and therefore the same derived leaves — the count rides
+    /// along because it makes the comparison's meaning legible in a debugger.
+    leaves_sig: Option<(qlab_devnet::header::Hash32, u64)>,
+    /// The `POST /v1/tx` rendezvous: the server enqueues, the run loop answers
+    /// ([`Self::drain_remote_submits`]). `None` until the discovery endpoint
+    /// starts.
+    submit_rx: Option<std::sync::mpsc::Receiver<SubmitRequest>>,
     /// Incremental scheduled-issuance accounting. Rebuilt once from the persisted
     /// canonical bodies at startup, then advanced only for new heights.
     supply_ledger: Mutex<SupplyLedger>,
@@ -627,6 +644,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             discovery_view: Arc::new(Mutex::new(Arc::new(DiscoveryView::default()))),
             last_discovery_refresh: Instant::now(),
             discovery_server: None,
+            leaves_view: Arc::new(Mutex::new(Arc::new(LeavesView::default()))),
+            leaves_sig: None,
+            submit_rx: None,
             supply_ledger: Mutex::new(supply_ledger),
             process_start_secs: unix_secs(),
             listen_addr: bound,
@@ -1468,9 +1488,19 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // Project before binding, so the first read is answered from the chain this
         // process actually opened rather than from an empty view.
         self.refresh_discovery();
-        let srv = DiscoveryServer::start(addr, Arc::clone(&self.discovery_view))?;
+        self.refresh_leaves();
+        // The submit rendezvous (issue #275): the server holds the sender, this
+        // loop drains the receiver once per iteration.
+        let (submit_tx, submit_rx) = std::sync::mpsc::sync_channel(MAX_QUEUED_SUBMITS);
+        let srv = DiscoveryServer::start(
+            addr,
+            Arc::clone(&self.discovery_view),
+            Arc::clone(&self.leaves_view),
+            submit_tx,
+        )?;
         let bound = srv.addr();
         self.discovery_server = Some(srv);
+        self.submit_rx = Some(submit_rx);
         Ok(bound)
     }
 
@@ -1503,6 +1533,115 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// The projection `/v1/compact` is currently serving (tests / accounting).
     pub fn discovery_view(&self) -> Arc<DiscoveryView> {
         Arc::clone(&self.discovery_view.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Re-project the commitment-tree leaves for `/v1/tree/leaves` (issue #275).
+    ///
+    /// Keyed on the applied tip hash: the leaves are derived deterministically
+    /// from the applied chain (`apply_state`'s funnel — and a rewind rebuilds
+    /// them with the rest of derived state), so the same applied tip means the
+    /// same leaves and an unchanged tip costs two comparisons and no copy. On a
+    /// change the whole ordered vector is cloned — 32 B per leaf, once per
+    /// applied block at steady state — rather than diffed, because a wrong
+    /// incremental splice here would serve a tree the node never had.
+    pub fn refresh_leaves(&mut self) -> bool {
+        let state = self.p2p.node().state();
+        let sig = (state.chain().tip_hash(), state.commitments_ordered().len() as u64);
+        if self.leaves_sig == Some(sig) {
+            return false;
+        }
+        let snapshot = Arc::new(LeavesView { leaves: state.commitments_ordered().to_vec() });
+        if let Ok(mut slot) = self.leaves_view.lock() {
+            *slot = snapshot;
+        }
+        self.leaves_sig = Some(sig);
+        true
+    }
+
+    /// The leaves `/v1/tree/leaves` is currently serving (tests / accounting).
+    pub fn leaves_view(&self) -> Arc<LeavesView> {
+        Arc::clone(&self.leaves_view.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Answer every submission the discovery server has queued (issue #275).
+    ///
+    /// Called once per loop iteration — an empty queue costs one `try_recv`. The
+    /// queue is bounded at [`MAX_QUEUED_SUBMITS`], so one pass is bounded work,
+    /// and each verdict costs this loop the same admission a peer-delivered tx
+    /// costs it (the proof verify dominating). A reply whose handler already
+    /// gave up waiting is dropped on the floor by `try_send` — the admission
+    /// stands either way, and a resubmission answers `duplicate`.
+    pub fn drain_remote_submits(&mut self) {
+        loop {
+            let req = match self.submit_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(req)) => req,
+                _ => break,
+            };
+            let outcome = self.submit_remote_tx(req.tx);
+            let _ = req.reply.try_send(outcome);
+        }
+    }
+
+    /// Judge and (on success) announce one remotely-submitted transaction — the
+    /// server half of the stamped A1 seam (issue #275).
+    ///
+    /// The checks are `NodeRpc::submit_tx`'s, in its order, run **before**
+    /// `announce_tx` so every refusal is named (a surface on bare `announce_tx`
+    /// would be boolean-blind — the faucet's honest limitation, decision brief
+    /// §2), and none is a second validation path:
+    ///
+    /// 1. **In-tx nullifier repeat** — [`qlab_node::repeated_nullifier_in_tx`],
+    ///    the shared rpc-layer precheck (`Mempool::admit`'s two nullifier gates
+    ///    both compare against state outside the candidate).
+    /// 2. **The §4 discovery↔cm binding** —
+    ///    [`qlab_devnet::body::check_tx_discovery`], the same consensus function
+    ///    `validate_body` runs per block. `NodeRpc::submit_tx`'s own discovery
+    ///    check compares separately-submitted artifacts against the committed
+    ///    bytes; over this wire there are no separate artifacts — the group IS
+    ///    in the body — so the §4 rules are the whole check, and they are
+    ///    strictly what a block embedding this tx will be judged by.
+    /// 3. **The typed admission + relay** —
+    ///    [`P2pNode::announce_tx_typed`], i.e. `NodeAdapter::submit_tx_typed`
+    ///    (the state-lag gate and `Mempool::admit`'s posted-fee / anchor /
+    ///    double-spend / duplicate / in-pool-conflict / real-proof gates —
+    ///    exactly what every peer-delivered tx passes), relaying exactly when
+    ///    `announce_tx` would.
+    /// 4. **The pool re-read** — `submit_local_tx`'s pattern: report what IS in
+    ///    the pool, not what the return value promised. Its failure arm is a
+    ///    named 500, kept expressible so this stays a check.
+    ///
+    /// Answers the **statement** tx id ([`qlab_node::rpc::tx_id`]) — the id
+    /// `NodeRpc::submit_tx` answers, stable whether the tx is pending or later
+    /// embedded — not the mempool's body-commitment id or the gossip wire id.
+    pub fn submit_remote_tx(&mut self, tx: TxEntry) -> TxSubmitOutcome {
+        let p = &tx.public;
+        let txid = qlab_node::rpc::tx_id(
+            &p.anchor,
+            &p.nullifiers,
+            &p.commitments,
+            p.bucket.logical_actions(),
+            p.fee,
+        );
+        if qlab_node::repeated_nullifier_in_tx(p).is_some() {
+            return TxSubmitOutcome::Refused(TxRefusal::RepeatedNullifier);
+        }
+        if let Err(e) = qlab_devnet::body::check_tx_discovery(0, &tx) {
+            return TxSubmitOutcome::Refused(TxRefusal::Discovery(e));
+        }
+        use qlab_p2p::adapter::TxSubmitRefusal as R;
+        match self.p2p.announce_tx_typed(tx) {
+            Ok(pool_id) => {
+                if self.p2p.node().mempool().contains(&pool_id) {
+                    TxSubmitOutcome::Accepted { txid }
+                } else {
+                    TxSubmitOutcome::Refused(TxRefusal::AdmittedButNotPooled)
+                }
+            }
+            Err(R::Pool(qlab_node::MempoolError::DuplicateTx)) => {
+                TxSubmitOutcome::Duplicate { txid }
+            }
+            Err(e) => TxSubmitOutcome::Refused(TxRefusal::Submit(e)),
+        }
     }
 
     /// Re-render the snapshot the scrape server serves.
@@ -2027,8 +2166,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 && self.last_discovery_refresh.elapsed() >= DISCOVERY_REFRESH
             {
                 self.refresh_discovery();
+                self.refresh_leaves();
                 self.last_discovery_refresh = Instant::now();
             }
+            // Every iteration, not on the refresh cadence: a submitter is parked
+            // on a socket waiting for this, and an empty queue costs one
+            // `try_recv` (issue #275).
+            self.drain_remote_submits();
             if self.telemetry_server.is_some()
                 && self.last_telemetry_render.elapsed() >= TELEMETRY_REFRESH
             {
@@ -4536,7 +4680,7 @@ mod tests {
         let served = t.to_bytes();
         assert_eq!(served[0], qlab_node::RPC_VERSION);
         let (version, decoded) = qlab_node::Telemetry::from_bytes_compat(&served).unwrap();
-        assert_eq!(version, 0x04);
+        assert_eq!(version, 0x05, "the current wire (#275's route bump)");
         assert_eq!(decoded, t);
         assert_eq!(decoded.durable, t.durable);
         assert_eq!(
@@ -5226,6 +5370,152 @@ mod tests {
         assert!(node.refresh_discovery(), "a moved tip re-projects");
         assert!(!node.refresh_discovery(), "an unchanged tip does no work");
         assert_eq!(node.discovery_view().tip_height(), Some(node.tip_height()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 🔴 **Issue #275 seam 1, the acceptance shape: the deployed binary takes a
+    /// wallet's transaction over a real socket, judges it BEFORE announcing, and
+    /// answers by name — through the real run loop, not a harness stand-in.**
+    ///
+    /// One node plays the whole cast: it finalizes its own genesis-era root
+    /// (all-21 rig), serves the discovery listener, runs `run_until` on the main
+    /// test thread while a client thread submits over TCP. The verifier is the
+    /// rehearsal stand-in — the *real*-proof half of the gate is the same
+    /// `Mempool::admit` proof arm `tests/coinbase_spend.rs` exercises against
+    /// real STARKs, and what this test pins is everything around it: decode,
+    /// prechecks, typed verdicts, the queue crossing, the pool re-read, and the
+    /// duplicate answer that makes retry safe.
+    #[test]
+    fn the_submit_route_judges_over_a_real_socket_through_the_run_loop() {
+        use qlab_devnet::body::{placeholder_discovery, TxPublic};
+        use qlab_devnet::fees::{posted_fee, ArityBucket};
+
+        let (config, genesis, base) = rig("i275-submit", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+
+        // Finalize: mine to the first checkpoint slot; the rig holds all 21 keys.
+        node.try_checkpoint();
+        for _ in 0..CHECKPOINT_CADENCE_BLOCKS + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS {
+            assert!(node.try_mine());
+            node.note_slots_reached();
+            node.try_checkpoint();
+        }
+        assert!(node.finalized_height().is_some(), "the all-21 rig finalizes");
+        use qlab_node::NodeState as _;
+        let anchor = node.state().commitment_root();
+        assert!(
+            node.state().is_valid_anchor(&anchor),
+            "the finalized (still-empty) root is a valid anchor"
+        );
+
+        // Idle the miner so the loop's iterations are pump + drain, then serve.
+        node.set_mine_interval(Duration::from_secs(3600));
+        let addr = node.start_discovery_endpoint("127.0.0.1:0").expect("bind ephemeral");
+
+        let fee = posted_fee(ArityBucket::TwoByTwo);
+        let tx_for = |nf: u8, fee: u64, bind: bool| {
+            let commitments = vec![[nf.wrapping_add(1); 32]];
+            let discovery = if bind {
+                placeholder_discovery(&commitments)
+            } else {
+                // A group binding a DIFFERENT commitment: §4 rule 2 must refuse it.
+                placeholder_discovery(&[[0xEE; 32]])
+            };
+            TxEntry {
+                proof: b"rehearsal-accepts-anything".to_vec(),
+                public: TxPublic {
+                    anchor,
+                    nullifiers: vec![[nf; 32]],
+                    commitments,
+                    bucket: ArityBucket::TwoByTwo,
+                    fee,
+                },
+                discovery,
+            }
+        };
+        let wire_ok = qlab_p2p::codec::encode_tx(&tx_for(1, fee, true));
+        let wire_cheap = qlab_p2p::codec::encode_tx(&tx_for(2, 1, true));
+        let wire_unbound = qlab_p2p::codec::encode_tx(&tx_for(3, fee, false));
+
+        // The client, on its own thread against the real socket; the node's run
+        // loop — the thing that answers — runs on this one.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let client_shutdown = Arc::clone(&shutdown);
+        let client = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let post = |body: &[u8]| {
+                let mut s = std::net::TcpStream::connect(addr).unwrap();
+                write!(
+                    s,
+                    "POST /v1/tx HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .unwrap();
+                s.write_all(body).unwrap();
+                let mut raw = Vec::new();
+                s.read_to_end(&mut raw).unwrap();
+                let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                (
+                    String::from_utf8_lossy(&raw[..sep]).lines().next().unwrap().to_string(),
+                    String::from_utf8_lossy(&raw[sep + 4..]).to_string(),
+                )
+            };
+            let accepted = post(&wire_ok);
+            let duplicate = post(&wire_ok);
+            let cheap = post(&wire_cheap);
+            let unbound = post(&wire_unbound);
+            let leaves = {
+                let mut s = std::net::TcpStream::connect(addr).unwrap();
+                write!(s, "GET /v1/tree/leaves?from=0 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+                let mut raw = Vec::new();
+                s.read_to_end(&mut raw).unwrap();
+                let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                raw[sep + 4..].to_vec()
+            };
+            client_shutdown.store(true, Ordering::Relaxed);
+            (accepted, duplicate, cheap, unbound, leaves)
+        });
+        node.run_until(&shutdown);
+        let (accepted, duplicate, cheap, unbound, leaves) = client.join().unwrap();
+
+        // 202 + the statement tx id — the id NodeRpc::submit_tx would answer.
+        let ok_tx = tx_for(1, fee, true);
+        let expected_id = qlab_node::rpc::tx_id(
+            &ok_tx.public.anchor,
+            &ok_tx.public.nullifiers,
+            &ok_tx.public.commitments,
+            ok_tx.public.bucket.logical_actions(),
+            ok_tx.public.fee,
+        );
+        let expected_hex: String = expected_id.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(accepted.0.starts_with("HTTP/1.1 202"), "{accepted:?}");
+        assert_eq!(accepted.1, format!("accepted {expected_hex}"));
+
+        // The same bytes again: 200 duplicate, same id — retry after a timeout
+        // is safe by construction.
+        assert!(duplicate.0.starts_with("HTTP/1.1 200"), "{duplicate:?}");
+        assert_eq!(duplicate.1, format!("duplicate {expected_hex}"));
+
+        // The named refusals, through the whole stack.
+        assert!(cheap.0.starts_with("HTTP/1.1 400"), "{cheap:?}");
+        assert_eq!(cheap.1, format!("refused: wrong-fee expected={fee} got=1"));
+        assert!(unbound.0.starts_with("HTTP/1.1 400"), "{unbound:?}");
+        assert!(unbound.1.starts_with("refused: discovery-does-not-bind"), "{unbound:?}");
+
+        // What IS pooled is exactly the accepted transaction.
+        assert_eq!(node.p2p().node().mempool().len(), 1, "one admission, one pool entry");
+
+        // And the leaf stream served alongside: the versioned wire, honestly
+        // empty — no coinbase has matured on this young chain, so the tree HAS
+        // no leaves, and `total = 0` is the true answer (the served-order and
+        // root-reconstruction properties are locked in qlab-node's route tests).
+        let page = qlab_node::TreeLeaves::from_bytes(&leaves)
+            .expect("the served bytes are the versioned leaf wire");
+        assert_eq!(page.total, 0);
+        assert!(page.leaves.is_empty());
+
         let _ = std::fs::remove_dir_all(&base);
     }
 

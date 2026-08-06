@@ -14,24 +14,51 @@
 //!
 //! ## What it is, and what it deliberately is not
 //!
-//! Exactly one route, `GET /v1/compact?from=&to=`, serving
-//! [`qlab_node::compact_response`]'s bytes — the same encoder, over the same
-//! projection, that `NodeRpc` serves in-process. Not the wallet-facing RPC:
+//! Three routes — the deployed binary's whole wallet-facing surface:
 //!
-//! - **`/v1/block/{h}/tx/{i}/full` is not served here, and that is a finding
-//!   rather than an omission.** Its bytes are the AEAD payloads, and D2 commits
-//!   the compact bundle (`ct ‖ cm ‖ tag ‖ clue_len`) and nothing else — the
-//!   ~585 B/note the design priced is `1088/2 + 41`, with no payload in it. The
-//!   only place payloads exist is `NodeRpc`'s in-memory side table, and serving
-//!   *that* from a deployed node would be option 2a with extra steps: a surface
-//!   whose contents no consensus rule obliges anyone to have attached. Reported
-//!   on issue #188; it is what baton 4 (spend) has to answer, because detection
-//!   is committed and **opening is not**.
-//! - **`/v1/tree/frontier` is not served here.** A wallet needs it to build a
-//!   membership witness, which is spending. Baton 4.
+//! - `GET /v1/compact?from=&to=` — [`qlab_node::compact_response`]'s bytes, the
+//!   same encoder, over the same projection, that `NodeRpc` serves in-process
+//!   (issue #188 baton 2). How a recipient **finds** its money.
+//! - `GET /v1/tree/leaves?from=` — the commitment tree's leaves in authoritative
+//!   append order ([`qlab_node::TreeLeaves`], issue #275 / decision brief B1).
+//!   How a wallet builds the **witness** to spend: it replays the stream into a
+//!   local tree and computes `auth_path` itself, so this server never learns
+//!   which positions matter to it. `/v1/tree/frontier` stays unserved on
+//!   purpose — a frontier reconstructs the root only, structurally, and a root
+//!   is not a witness.
+//! - `POST /v1/tx` — body = the canonical tx wire bytes
+//!   (`qlab_p2p::codec::encode_tx`, what `build_send` produces). How a
+//!   wallet-built transaction gets **in** (issue #275 / decision brief A1). The
+//!   checks `NodeRpc::submit_tx` runs — in-tx nullifier repeat, the §4
+//!   discovery↔cm binding, then the pool's posted-fee / anchor / double-spend /
+//!   duplicate / conflict / real-proof gates — run **before** `announce_tx`,
+//!   and every refusal comes back **typed and named** (the faucet's
+//!   named-refusal house style; a surface on bare `announce_tx` would be
+//!   boolean-blind — brief §2). See [`SubmitRequest`] for how a write crosses
+//!   into the consensus loop without a second thread ever holding node state.
+//!
+//! Still not the wallet-facing RPC:
+//!
+//! - **`/v1/block/{h}/tx/{i}/full` is not served here.** Since issue #188 (a)
+//!   the AEAD payloads ride in the **committed** discovery region (they are no
+//!   longer side-table-only), but `/v1/compact` deliberately serves the
+//!   `group_contents` prefix and nothing more — that is what keeps its golden
+//!   vector byte-identical. Serving the committed payload section to a detached
+//!   wallet is the discovery lane's open item, not this issue's.
 //! - **`/v1/status`, `/v1/anchors` are not served here.** They are not this
-//!   baton's scope and the node already has a versioned health wire
+//!   surface's scope and the node already has a versioned health wire
 //!   (`/v1/telemetry`).
+//!
+//! ## The `POST /v1/tx` response wire, pinned
+//!
+//! Success is `202` with body `accepted <txid-hex>` — the statement tx id
+//! ([`qlab_node::rpc::tx_id`]), the same id `NodeRpc::submit_tx` answers.
+//! A resubmission of a pending tx is `200` / `duplicate <txid-hex>`, so
+//! retry-after-timeout is safe. Refusals are `400` with `refused: <name>`
+//! (first token machine-usable, e.g. `refused: wrong-fee expected=1000000
+//! got=1`), and `503` with `unavailable: <name>` for states that are the
+//! node's, not the transaction's (state lag, queue full, no verdict in time).
+//! Nothing here is a 500 unless an internal invariant broke.
 //!
 //! ## Why a snapshot, and why that cannot make a served group wrong
 //!
@@ -83,14 +110,178 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
-use qlab_node::{compact_response, BlockDiscovery};
+use qlab_devnet::body::{BodyError, TxEntry};
+use qlab_node::{compact_response, BlockDiscovery, Hash32, MempoolError, TreeLeaves};
+use qlab_p2p::adapter::TxSubmitRefusal;
 
-/// The route this endpoint serves, and the only one.
+/// The note-discovery route (issue #188 baton 2).
 pub const COMPACT_PATH: &str = "/v1/compact";
+
+/// The leaf-stream route (issue #275, decision brief B1) — GET only.
+pub const TREE_LEAVES_PATH: &str = "/v1/tree/leaves";
+
+/// The submit route (issue #275, decision brief A1) — POST only.
+pub const TX_SUBMIT_PATH: &str = "/v1/tx";
+
+/// The most bytes `POST /v1/tx` will read as a body.
+///
+/// Basis: the canonical 2×2 transaction wire is the 148,625 B consensus proof
+/// (the mint, PR #252) plus the public surface (~200 B) plus the committed
+/// discovery group (~2.7 KB with payloads) — ~152 KB total, and the verifier
+/// rejects every non-2×2 shape, so no honest submission is larger. 256 KiB
+/// covers that with slack and refuses a body an order of magnitude larger
+/// before it is read. `[devnet-placeholder]` — moves if the consensus wire
+/// does; not a frozen number.
+pub const MAX_TX_WIRE_BYTES: usize = 256 * 1024;
+
+/// Submissions the run loop can owe verdicts on at once; a fuller queue answers
+/// `503 unavailable: submit-queue-full` without touching the node. Sized to the
+/// loop's appetite, not the client's: each verdict costs a real proof verify on
+/// the consensus thread, and a deeper queue would only convert refusals into
+/// timeouts.
+pub const MAX_QUEUED_SUBMITS: usize = 8;
+
+/// Concurrent `POST /v1/tx` handler threads (each owns one socket: body read,
+/// queue wait, response). The GET worker never blocks on a submitter — see
+/// [`DiscoveryServer::start`] — and past this many in flight the answer is an
+/// immediate `503`, not a longer line.
+pub const MAX_INFLIGHT_SUBMITS: usize = 8;
+
+/// How long a submit handler waits for the run loop's verdict before answering
+/// `503 unavailable: no-verdict-in-time`.
+///
+/// Basis: a loop pass is normally milliseconds, but issue #107 measured
+/// deployed loop periods that never got below 131 s across 53 samples on the
+/// t0-wan-2 image — an open defect, not a budget. 60 s deliberately sits under
+/// a Cloudflare-proxied edge's ~100 s timeout (the stamped topology fronts this
+/// host with that edge) and over any healthy loop's pass; a node exhibiting
+/// #107's period answers 503 by name, and because a landed-but-unanswered
+/// submission answers `duplicate` on resubmission, timing out is safe to retry.
+pub const SUBMIT_VERDICT_TIMEOUT: Duration = Duration::from_secs(60);
+
+// ---------------------------------------------------------------------------
+// The submit rendezvous (issue #275)
+// ---------------------------------------------------------------------------
+
+/// One queued `POST /v1/tx`, handed from the HTTP thread to the run loop.
+///
+/// **Why a queue and not a lock**: every other route here serves a snapshot so
+/// that a poller can never contend with the consensus loop — but a submission
+/// IS a consensus write, so it must reach the loop. The honest way to share
+/// `&mut` node state is not to: the handler thread parks on `reply` while the
+/// loop, on its own iteration cadence, runs the checks and answers
+/// ([`crate::run::RunningNode::drain_remote_submits`]). The loop pays exactly
+/// one admission (the same cost a peer-delivered tx costs it); the socket
+/// thread pays all the waiting.
+pub struct SubmitRequest {
+    /// The decoded transaction (the HTTP thread already paid the decode).
+    pub tx: TxEntry,
+    /// Where the verdict goes. Capacity 1; if the handler gave up waiting the
+    /// send fails and the loop moves on — the tx's fate is still whatever the
+    /// admission decided, discoverable by resubmitting (`duplicate`).
+    pub reply: mpsc::SyncSender<TxSubmitOutcome>,
+}
+
+/// The run loop's verdict on one submission — what
+/// [`crate::run::RunningNode::submit_remote_tx`] answers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TxSubmitOutcome {
+    /// Admitted to this node's pool (re-read confirmed) and relayed to peers.
+    /// Carries the **statement** tx id — [`qlab_node::rpc::tx_id`], the same id
+    /// `NodeRpc::submit_tx` answers — so the wallet-facing meaning of "the tx
+    /// id" does not depend on which surface admitted it.
+    Accepted { txid: Hash32 },
+    /// Already pending (same statement); no state change. Retry-safe by design.
+    Duplicate { txid: Hash32 },
+    /// Refused, by name.
+    Refused(TxRefusal),
+}
+
+/// Why a submission was refused — each variant is one of the checks
+/// `NodeRpc::submit_tx` runs, carried whole rather than re-judged here
+/// (issue #275's one-validation-path constraint).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TxRefusal {
+    /// A nullifier repeated within the transaction itself
+    /// ([`qlab_node::repeated_nullifier_in_tx`], the rpc-layer precheck).
+    RepeatedNullifier,
+    /// The committed discovery group failed the §4 rules — not decodable,
+    /// not canonical, or not binding the declared commitments
+    /// ([`qlab_devnet::body::check_tx_discovery`]).
+    Discovery(BodyError),
+    /// The typed admission gate ([`TxSubmitRefusal`]): state lag, or one of
+    /// the pool's named refusals (fee, anchor, spent/conflicting nullifier,
+    /// proof).
+    Submit(TxSubmitRefusal),
+    /// The pool re-read after an accepted admission did not find the tx — a
+    /// broken internal invariant, never a client fault. Kept expressible so
+    /// the re-read is a check and not a comment.
+    AdmittedButNotPooled,
+}
+
+fn txid_hex(id: &Hash32) -> String {
+    id.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Render a verdict as `(status, body)` — the response wire pinned in the
+/// module docs. The first token is machine-usable; the rest is for a person.
+pub fn render_submit_outcome(outcome: &TxSubmitOutcome) -> (u16, String) {
+    match outcome {
+        TxSubmitOutcome::Accepted { txid } => (202, format!("accepted {}", txid_hex(txid))),
+        TxSubmitOutcome::Duplicate { txid } => (200, format!("duplicate {}", txid_hex(txid))),
+        TxSubmitOutcome::Refused(r) => render_refusal(r),
+    }
+}
+
+fn render_refusal(refusal: &TxRefusal) -> (u16, String) {
+    match refusal {
+        TxRefusal::RepeatedNullifier => {
+            (400, "refused: nullifier-repeated-in-tx".to_string())
+        }
+        TxRefusal::Discovery(BodyError::DiscoveryNotCanonical { .. }) => {
+            (400, "refused: discovery-not-canonical".to_string())
+        }
+        TxRefusal::Discovery(BodyError::DiscoveryDoesNotBind { expected, got, .. }) => (
+            400,
+            format!("refused: discovery-does-not-bind expected={expected} got={got}"),
+        ),
+        // `check_tx_discovery` can also surface a malformed group (its decode
+        // step); any other BodyError variant cannot reach here, and naming the
+        // variant keeps the answer honest if that ever changes.
+        TxRefusal::Discovery(other) => (400, format!("refused: discovery {other:?}")),
+        TxRefusal::Submit(TxSubmitRefusal::StateLagging) => (
+            503,
+            "unavailable: state-lag — this node's applied state is behind its chain \
+             and it will not judge a submission it could judge wrongly; retry"
+                .to_string(),
+        ),
+        TxRefusal::Submit(TxSubmitRefusal::Pool(e)) => match e {
+            MempoolError::WrongFee { expected, got } => {
+                (400, format!("refused: wrong-fee expected={expected} got={got}"))
+            }
+            MempoolError::AnchorNotValid => (400, "refused: anchor-not-valid".to_string()),
+            MempoolError::AlreadySpent { .. } => (400, "refused: nullifier-spent".to_string()),
+            MempoolError::NullifierConflictInPool { .. } => {
+                (400, "refused: nullifier-conflict-in-pool".to_string())
+            }
+            MempoolError::ProofInvalid => (400, "refused: proof-invalid".to_string()),
+            // The loop maps DuplicateTx to `TxSubmitOutcome::Duplicate` before
+            // wrapping; reaching here means that mapping broke.
+            MempoolError::DuplicateTx => {
+                (500, "internal: duplicate escaped its mapping".to_string())
+            }
+        },
+        TxRefusal::AdmittedButNotPooled => (
+            500,
+            "internal: admitted but not visible in the pool — report this".to_string(),
+        ),
+    }
+}
 
 /// Where discovery serving binds when the config does not say.
 ///
@@ -166,8 +357,28 @@ impl DiscoveryView {
     }
 }
 
-/// A running `/v1/compact` endpoint: bound address + worker thread + the shared
-/// projection the run loop refreshes.
+/// The commitment-tree leaves the run loop last projected — what
+/// `GET /v1/tree/leaves` serves (issue #275).
+///
+/// Same snapshot discipline as [`DiscoveryView`]: the run loop publishes on its
+/// own cadence ([`crate::run::RunningNode::refresh_leaves`], keyed on the
+/// applied tip so an unchanged state costs two comparisons), the server thread
+/// serves, and a poller can never contend with the consensus loop. The vector
+/// is `Node::commitments_ordered()` **cloned, never re-derived** — the exact
+/// append order `apply_state` produced, matured-coinbase-first — so a served
+/// page cannot differ in content or order from the tree the node proves
+/// against. What a snapshot *can* be is behind, by at most
+/// [`crate::run::DISCOVERY_REFRESH`] of chain: a wallet that reads a stale
+/// snapshot sees fewer leaves, never different ones, and its next poll sees
+/// the rest.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LeavesView {
+    /// Every leaf, tree order (position `i` in the tree is `leaves[i]`).
+    pub leaves: Vec<Hash32>,
+}
+
+/// A running discovery-server endpoint: bound address + worker thread + the
+/// shared projections the run loop refreshes + the submit queue it drains.
 pub struct DiscoveryServer {
     addr: SocketAddr,
     server: Arc<tiny_http::Server>,
@@ -176,12 +387,28 @@ pub struct DiscoveryServer {
 }
 
 impl DiscoveryServer {
-    /// Bind `addr` and serve `view` at [`COMPACT_PATH`] until [`Self::shutdown`].
+    /// Bind `addr` and serve until [`Self::shutdown`]: `view` at
+    /// [`COMPACT_PATH`], `leaves` at [`TREE_LEAVES_PATH`], and submissions into
+    /// `submits` at [`TX_SUBMIT_PATH`].
     ///
     /// An unbindable address is an **error**, never a silent no-op: a node whose
     /// operator believes recipients can find their outputs and which serves
     /// nothing is precisely the state this endpoint exists to remove.
-    pub fn start(addr: &str, view: Arc<Mutex<Arc<DiscoveryView>>>) -> io::Result<Self> {
+    ///
+    /// # Threading, because a write route changes the old story
+    ///
+    /// The GET worker answers every read inline from a snapshot (microseconds)
+    /// and never blocks on a submitter. Each `POST /v1/tx` moves to a
+    /// short-lived handler thread — the body read and the verdict wait both
+    /// block, and a slow or trickling submitter must not be able to hold the
+    /// read surface hostage. At most [`MAX_INFLIGHT_SUBMITS`] handlers exist at
+    /// once; past that the answer is an immediate 503, not a longer line.
+    pub fn start(
+        addr: &str,
+        view: Arc<Mutex<Arc<DiscoveryView>>>,
+        leaves: Arc<Mutex<Arc<LeavesView>>>,
+        submits: mpsc::SyncSender<SubmitRequest>,
+    ) -> io::Result<Self> {
         let server = tiny_http::Server::http(addr).map_err(|e| {
             io::Error::other(format!(
                 "discovery_addr {addr}: {e} (set discovery_addr = \"{DISCOVERY_OFF}\" to serve nothing)"
@@ -196,34 +423,63 @@ impl DiscoveryServer {
 
         let worker = Arc::clone(&server);
         let worker_served = Arc::clone(&served);
+        let inflight = Arc::new(AtomicUsize::new(0));
         let thread = std::thread::spawn(move || {
             for request in worker.incoming_requests() {
                 worker_served.fetch_add(1, Ordering::Relaxed);
-                // Read-only means read-only: anything that is not a GET is refused
-                // before the path is looked at.
+                let url = request.url().to_string();
+                let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
+
+                // The one write route, method-gated first (the faucet's 405+Allow
+                // shape) and handed off before its body is read — see the method
+                // docs for why the GET worker must never block on a submitter.
+                if path == TX_SUBMIT_PATH {
+                    if *request.method() != tiny_http::Method::Post {
+                        let allow = tiny_http::Header::from_bytes(&b"Allow"[..], &b"POST"[..])
+                            .expect("static header parses");
+                        let _ = request.respond(
+                            tiny_http::Response::from_string("method not allowed: POST a canonical tx wire")
+                                .with_status_code(405)
+                                .with_header(allow),
+                        );
+                        continue;
+                    }
+                    spawn_submit_handler(request, submits.clone(), Arc::clone(&inflight));
+                    continue;
+                }
+
+                // Read-only means read-only: anything else that is not a GET is
+                // refused before the path is looked at.
                 if *request.method() != tiny_http::Method::Get {
                     let _ = request.respond(
                         tiny_http::Response::from_string("method not allowed").with_status_code(405),
                     );
                     continue;
                 }
-                let url = request.url().to_string();
-                let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
-                if path != COMPACT_PATH {
-                    let _ = request.respond(
-                        tiny_http::Response::from_string(format!(
-                            "not found: try {COMPACT_PATH}?from=&to="
-                        ))
-                        .with_status_code(404),
-                    );
-                    continue;
-                }
-                // Clone the Arc under the lock, encode with it released.
-                let snapshot = match view.lock() {
-                    Ok(g) => Arc::clone(&g),
-                    Err(p) => Arc::clone(&p.into_inner()),
+                let response = match path {
+                    COMPACT_PATH => {
+                        // Clone the Arc under the lock, encode with it released.
+                        let snapshot = match view.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(p) => Arc::clone(&p.into_inner()),
+                        };
+                        respond(&snapshot, query)
+                    }
+                    TREE_LEAVES_PATH => {
+                        let snapshot = match leaves.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(p) => Arc::clone(&p.into_inner()),
+                        };
+                        respond_leaves(&snapshot, query)
+                    }
+                    _ => Err((
+                        404,
+                        format!(
+                            "not found: try {COMPACT_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, \
+                             or POST {TX_SUBMIT_PATH}"
+                        ),
+                    )),
                 };
-                let response = respond(&snapshot, query);
                 let _ = match response {
                     Ok(bytes) => {
                         let header =
@@ -276,6 +532,101 @@ pub fn respond(view: &DiscoveryView, query: &str) -> Result<Vec<u8>, (u16, Strin
         .map_err(|e| (500, format!("stored discovery does not decode: {e:?}")))
 }
 
+/// The socket-free `/v1/tree/leaves` core: a `from` query against the leaves
+/// snapshot. Mirrors [`qlab_node::NodeRpc::route`]'s refusals — a missing or
+/// unparseable `from` is a 400 — and the page arithmetic is
+/// [`TreeLeaves::page`], the same function the in-process route uses, so the
+/// two servers cannot disagree about a page boundary.
+pub fn respond_leaves(view: &LeavesView, query: &str) -> Result<Vec<u8>, (u16, String)> {
+    let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'".to_string()))?;
+    Ok(TreeLeaves::page(&view.leaves, from).to_bytes())
+}
+
+/// Handle one `POST /v1/tx` on its own bounded thread: read the body, decode,
+/// queue for the run loop, wait for the verdict, answer. See
+/// [`DiscoveryServer::start`] for why this never runs on the GET worker.
+fn spawn_submit_handler(
+    request: tiny_http::Request,
+    submits: mpsc::SyncSender<SubmitRequest>,
+    inflight: Arc<AtomicUsize>,
+) {
+    // Claim a slot before spawning; the refusal must not cost a thread either.
+    if inflight.fetch_add(1, Ordering::AcqRel) >= MAX_INFLIGHT_SUBMITS {
+        inflight.fetch_sub(1, Ordering::AcqRel);
+        let _ = request.respond(
+            tiny_http::Response::from_string(
+                "unavailable: submit-busy — too many submissions in flight; retry",
+            )
+            .with_status_code(503),
+        );
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut request = request;
+        let (code, body) = submit_verdict(&mut request, &submits);
+        let _ = request
+            .respond(tiny_http::Response::from_string(body).with_status_code(code));
+        inflight.fetch_sub(1, Ordering::AcqRel);
+    });
+}
+
+/// The submit handler's whole decision, as `(status, body)`.
+fn submit_verdict(
+    request: &mut tiny_http::Request,
+    submits: &mpsc::SyncSender<SubmitRequest>,
+) -> (u16, String) {
+    // 1. The body, bounded BEFORE it is read: a declared oversize is refused on
+    //    the header, an undeclared one on the byte that crosses the cap.
+    if let Some(len) = request.body_length() {
+        if len > MAX_TX_WIRE_BYTES {
+            return (413, format!("refused: body-too-large ({len} > {MAX_TX_WIRE_BYTES} bytes)"));
+        }
+    }
+    let mut body = Vec::new();
+    {
+        use std::io::Read;
+        let mut bounded = request.as_reader().take(MAX_TX_WIRE_BYTES as u64 + 1);
+        if bounded.read_to_end(&mut body).is_err() {
+            return (400, "refused: body-unreadable".to_string());
+        }
+    }
+    if body.len() > MAX_TX_WIRE_BYTES {
+        return (413, format!("refused: body-too-large (> {MAX_TX_WIRE_BYTES} bytes)"));
+    }
+
+    // 2. Decode — the same canonical wire the P2P layer speaks, same decoder.
+    let tx = match qlab_p2p::codec::decode_tx(&body) {
+        Ok(tx) => tx,
+        Err(e) => return (400, format!("refused: decode {e:?}")),
+    };
+
+    // 3. Hand it to the run loop and wait for the verdict.
+    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+    match submits.try_send(SubmitRequest { tx, reply: reply_tx }) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(_)) => {
+            return (503, "unavailable: submit-queue-full — the node is behind on verdicts; retry".to_string());
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            return (503, "unavailable: node-shutting-down".to_string());
+        }
+    }
+    match reply_rx.recv_timeout(SUBMIT_VERDICT_TIMEOUT) {
+        Ok(outcome) => render_submit_outcome(&outcome),
+        Err(mpsc::RecvTimeoutError::Timeout) => (
+            503,
+            format!(
+                "unavailable: no-verdict-in-time — the node loop did not answer within \
+                 {}s; if the submission landed, resubmitting answers `duplicate`",
+                SUBMIT_VERDICT_TIMEOUT.as_secs()
+            ),
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            (503, "unavailable: node-shutting-down".to_string())
+        }
+    }
+}
+
 fn query_u64(query: &str, key: &str) -> Option<u64> {
     for kv in query.split('&') {
         if let Some((k, v)) = kv.split_once('=') {
@@ -323,10 +674,44 @@ mod tests {
         }
     }
 
+    /// A server over `view` + `leaves`, with the submit queue's consumer end
+    /// handed back so a test can either answer submissions or drop it (a dropped
+    /// consumer answers every POST `503 node-shutting-down`, immediately).
+    fn serve(
+        view: Arc<Mutex<Arc<DiscoveryView>>>,
+        leaves: Arc<Mutex<Arc<LeavesView>>>,
+    ) -> (DiscoveryServer, mpsc::Receiver<SubmitRequest>) {
+        let (tx, rx) = mpsc::sync_channel(MAX_QUEUED_SUBMITS);
+        let srv = DiscoveryServer::start("127.0.0.1:0", view, leaves, tx).expect("bind");
+        (srv, rx)
+    }
+
+    fn no_leaves() -> Arc<Mutex<Arc<LeavesView>>> {
+        Arc::new(Mutex::new(Arc::new(LeavesView::default())))
+    }
+
+    /// A minimal HTTP/1.1 POST crossing a real socket.
+    fn post(addr: SocketAddr, path: &str, body: &[u8]) -> (String, String) {
+        let mut s = TcpStream::connect(addr).expect("connect");
+        write!(
+            s,
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        s.write_all(body).unwrap();
+        let mut raw = Vec::new();
+        s.read_to_end(&mut raw).expect("read");
+        let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("header terminator");
+        let status = String::from_utf8_lossy(&raw[..sep]).lines().next().unwrap_or_default().to_string();
+        let body = String::from_utf8_lossy(&raw[sep + 4..]).to_string();
+        (status, body)
+    }
+
     #[test]
     fn serves_the_compact_wire_over_a_real_socket() {
         let view = Arc::new(Mutex::new(Arc::new(a_view())));
-        let srv = DiscoveryServer::start("127.0.0.1:0", Arc::clone(&view)).expect("bind");
+        let (srv, _submits) = serve(Arc::clone(&view), no_leaves());
         let addr = srv.addr();
 
         let (status, body) = get(addr, "/v1/compact?from=0&to=2");
@@ -347,13 +732,13 @@ mod tests {
     }
 
     /// Nothing else is served, and the refusals are the RPC's refusals — not a
-    /// half-implemented wallet API. `/v1/…/full` in particular is a 404 **because
-    /// its bytes are not committed**, and a deployed node must not imply it holds
-    /// them (see the module docs).
+    /// half-implemented wallet API. `/v1/…/full` and `/v1/tree/frontier` in
+    /// particular stay 404s (see the module docs), and the read routes stay
+    /// GET-only even now that a write route exists beside them.
     #[test]
-    fn only_v1_compact_is_served_and_writes_are_refused() {
+    fn only_the_three_routes_are_served_and_methods_are_gated() {
         let view = Arc::new(Mutex::new(Arc::new(a_view())));
-        let srv = DiscoveryServer::start("127.0.0.1:0", Arc::clone(&view)).expect("bind");
+        let (srv, _submits) = serve(Arc::clone(&view), no_leaves());
         let addr = srv.addr();
 
         for path in [
@@ -369,21 +754,27 @@ mod tests {
             assert!(status.starts_with("HTTP/1.1 404"), "{path} => {status}");
         }
 
-        // Bad bounds are 400s, not empty successes.
-        for path in ["/v1/compact", "/v1/compact?from=0", "/v1/compact?from=2&to=1"] {
+        // Bad bounds are 400s, not empty successes — on both read routes.
+        for path in [
+            "/v1/compact",
+            "/v1/compact?from=0",
+            "/v1/compact?from=2&to=1",
+            "/v1/tree/leaves",
+            "/v1/tree/leaves?from=zzz",
+        ] {
             let (status, _) = get(addr, path);
             assert!(status.starts_with("HTTP/1.1 400"), "{path} => {status}");
         }
 
-        let mut s = TcpStream::connect(addr).expect("connect");
-        write!(
-            s,
-            "POST /v1/compact HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
-        let mut raw = String::new();
-        s.read_to_string(&mut raw).expect("read");
-        assert!(raw.starts_with("HTTP/1.1 405"), "{raw}");
+        // A write verb on a read route is a 405, exactly as before #275…
+        let (status, _) = post(addr, "/v1/compact", b"");
+        assert!(status.starts_with("HTTP/1.1 405"), "{status}");
+        let (status, _) = post(addr, "/v1/tree/leaves", b"");
+        assert!(status.starts_with("HTTP/1.1 405"), "{status}");
+        // …and a read verb on the write route is a 405 too, not a 404: the
+        // route exists and the answer says what it takes.
+        let (status, _) = get(addr, "/v1/tx");
+        assert!(status.starts_with("HTTP/1.1 405"), "{status}");
 
         srv.shutdown();
     }
@@ -391,7 +782,8 @@ mod tests {
     #[test]
     fn an_unbindable_address_is_an_error_and_the_message_names_the_opt_out() {
         let view = Arc::new(Mutex::new(Arc::new(DiscoveryView::default())));
-        let err = match DiscoveryServer::start("256.256.256.256:9", view) {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let err = match DiscoveryServer::start("256.256.256.256:9", view, no_leaves(), tx) {
             Err(e) => e,
             Ok(_) => panic!("that address cannot be bound"),
         };
@@ -399,6 +791,187 @@ mod tests {
             err.to_string().contains(DISCOVERY_OFF),
             "a default-on listener that cannot bind must tell the operator how to turn it off: {err}"
         );
+    }
+
+    // ---- the leaf stream over the socket (issue #275) ------------------------
+
+    /// The served page is [`qlab_node::TreeLeaves`]'s wire over the snapshot —
+    /// decodable by the same versioned decoder the in-process route's consumers
+    /// use, refreshed by an `Arc` swap exactly like the compact view.
+    #[test]
+    fn serves_the_leaf_stream_over_a_real_socket() {
+        let leaves = Arc::new(Mutex::new(Arc::new(LeavesView {
+            leaves: vec![[0xAA; 32], [0xBB; 32], [0xCC; 32]],
+        })));
+        let (srv, _submits) = serve(Arc::new(Mutex::new(Arc::new(a_view()))), Arc::clone(&leaves));
+        let addr = srv.addr();
+
+        let (status, body) = get(addr, "/v1/tree/leaves?from=1");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        let page = TreeLeaves::from_bytes(&body).expect("the served bytes are the versioned wire");
+        assert_eq!(page.from, 1);
+        assert_eq!(page.total, 3);
+        assert_eq!(page.leaves, vec![[0xBB; 32], [0xCC; 32]]);
+
+        // Beyond the tree: the empty page carrying `total`, never an error.
+        let (status, body) = get(addr, "/v1/tree/leaves?from=99");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        let ahead = TreeLeaves::from_bytes(&body).unwrap();
+        assert!(ahead.leaves.is_empty());
+        assert_eq!(ahead.total, 3);
+
+        // A refreshed snapshot is what the next read sees.
+        *leaves.lock().unwrap() = Arc::new(LeavesView { leaves: vec![[0xAA; 32]; 5] });
+        let (_, body) = get(addr, "/v1/tree/leaves?from=0");
+        assert_eq!(TreeLeaves::from_bytes(&body).unwrap().total, 5);
+
+        srv.shutdown();
+    }
+
+    // ---- the submit route's HTTP half (issue #275) ----------------------------
+    //
+    // The verdicts themselves are the run loop's (`run.rs` tests them against a
+    // real node); these tests pin the HTTP plumbing — that a queued submission
+    // reaches a consumer decoded and intact, and that every rendered answer and
+    // every local refusal carries its name and status.
+
+    fn a_wire_tx(nf: u8) -> Vec<u8> {
+        let public = qlab_devnet::body::TxPublic {
+            anchor: [0x0F; 32],
+            nullifiers: vec![[nf; 32]],
+            commitments: vec![[nf.wrapping_add(1); 32]],
+            bucket: qlab_devnet::fees::ArityBucket::TwoByTwo,
+            fee: qlab_devnet::fees::posted_fee(qlab_devnet::fees::ArityBucket::TwoByTwo),
+        };
+        let discovery = qlab_devnet::body::placeholder_discovery(&public.commitments);
+        let tx = qlab_devnet::body::TxEntry { proof: b"ok".to_vec(), public, discovery };
+        qlab_p2p::codec::encode_tx(&tx)
+    }
+
+    /// A POSTed body reaches the loop-side consumer as the decoded transaction,
+    /// and the consumer's verdict comes back rendered: 202 `accepted`, 200
+    /// `duplicate`, 400 `refused: <name>` — the response wire the module docs pin.
+    #[test]
+    fn a_submission_crosses_the_queue_and_the_verdict_comes_back_named() {
+        let (srv, submits) = serve(Arc::new(Mutex::new(Arc::new(a_view()))), no_leaves());
+        let addr = srv.addr();
+
+        // The loop stand-in: answer each queued submission with a scripted verdict.
+        let consumer = std::thread::spawn(move || {
+            let verdicts = [
+                TxSubmitOutcome::Accepted { txid: [0xA1; 32] },
+                TxSubmitOutcome::Duplicate { txid: [0xA1; 32] },
+                TxSubmitOutcome::Refused(TxRefusal::Submit(TxSubmitRefusal::Pool(
+                    MempoolError::WrongFee { expected: 1_000_000, got: 1 },
+                ))),
+                TxSubmitOutcome::Refused(TxRefusal::Submit(TxSubmitRefusal::StateLagging)),
+            ];
+            let mut seen = Vec::new();
+            for v in verdicts {
+                let req = submits.recv().expect("a queued submission");
+                seen.push(req.tx.public.nullifiers[0][0]);
+                let _ = req.reply.try_send(v);
+            }
+            seen
+        });
+
+        let (status, body) = post(addr, "/v1/tx", &a_wire_tx(1));
+        assert!(status.starts_with("HTTP/1.1 202"), "{status} {body}");
+        assert_eq!(body, format!("accepted {}", "a1".repeat(32)));
+
+        let (status, body) = post(addr, "/v1/tx", &a_wire_tx(2));
+        assert!(status.starts_with("HTTP/1.1 200"), "{status} {body}");
+        assert!(body.starts_with("duplicate "), "{body}");
+
+        let (status, body) = post(addr, "/v1/tx", &a_wire_tx(3));
+        assert!(status.starts_with("HTTP/1.1 400"), "{status} {body}");
+        assert_eq!(body, "refused: wrong-fee expected=1000000 got=1");
+
+        let (status, body) = post(addr, "/v1/tx", &a_wire_tx(4));
+        assert!(status.starts_with("HTTP/1.1 503"), "{status} {body}");
+        assert!(body.starts_with("unavailable: state-lag"), "{body}");
+
+        assert_eq!(
+            consumer.join().unwrap(),
+            vec![1, 2, 3, 4],
+            "each verdict answered the submission that asked for it, decoded intact"
+        );
+        srv.shutdown();
+    }
+
+    /// The refusals the HTTP layer owns, each by name: an undecodable body never
+    /// reaches the queue, an oversize body is refused on its declared length,
+    /// and a server whose loop is gone answers immediately rather than parking
+    /// the socket until the timeout.
+    #[test]
+    fn local_refusals_are_named_and_never_reach_the_queue() {
+        let leaves = no_leaves();
+        let (srv, submits) = serve(Arc::new(Mutex::new(Arc::new(a_view()))), leaves);
+        let addr = srv.addr();
+
+        // Garbage bytes: 400, named, and nothing was queued.
+        let (status, body) = post(addr, "/v1/tx", b"not a transaction");
+        assert!(status.starts_with("HTTP/1.1 400"), "{status}");
+        assert!(body.starts_with("refused: decode"), "{body}");
+
+        // A declared-oversize body: 413 on the header, without reading it.
+        let mut s = TcpStream::connect(addr).expect("connect");
+        write!(
+            s,
+            "POST /v1/tx HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            MAX_TX_WIRE_BYTES + 1
+        )
+        .unwrap();
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).expect("read");
+        assert!(raw.starts_with("HTTP/1.1 413"), "{raw}");
+        assert!(raw.contains("body-too-large"), "{raw}");
+
+        assert!(
+            matches!(submits.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "neither refusal consumed loop budget"
+        );
+
+        // Loop gone (receiver dropped): a well-formed submission answers 503
+        // by name, immediately — not after SUBMIT_VERDICT_TIMEOUT.
+        drop(submits);
+        let before = std::time::Instant::now();
+        let (status, body) = post(addr, "/v1/tx", &a_wire_tx(9));
+        assert!(status.starts_with("HTTP/1.1 503"), "{status}");
+        assert!(body.contains("node-shutting-down"), "{body}");
+        assert!(
+            before.elapsed() < SUBMIT_VERDICT_TIMEOUT / 2,
+            "a dropped consumer must answer promptly, not by timeout"
+        );
+
+        srv.shutdown();
+    }
+
+    /// A full queue is an immediate `503 submit-queue-full` — the client's
+    /// refusal, not a longer line. The queue is filled directly through the
+    /// same sender the server holds, so the test does not need nine parked
+    /// sockets to prove the bound.
+    #[test]
+    fn a_full_queue_refuses_by_name_instead_of_queueing_deeper() {
+        let view = Arc::new(Mutex::new(Arc::new(a_view())));
+        let (tx, _rx) = mpsc::sync_channel(MAX_QUEUED_SUBMITS);
+        let srv =
+            DiscoveryServer::start("127.0.0.1:0", view, no_leaves(), tx.clone()).expect("bind");
+        let addr = srv.addr();
+
+        // Fill the queue with requests nobody answers.
+        for _ in 0..MAX_QUEUED_SUBMITS {
+            let (reply, _keep) = mpsc::sync_channel(1);
+            let entry = qlab_p2p::codec::decode_tx(&a_wire_tx(1)).unwrap();
+            tx.try_send(SubmitRequest { tx: entry, reply }).expect("fills");
+            std::mem::forget(_keep); // keep the reply channel alive; the queue slot stays owed
+        }
+
+        let (status, body) = post(addr, "/v1/tx", &a_wire_tx(2));
+        assert!(status.starts_with("HTTP/1.1 503"), "{status}");
+        assert!(body.contains("submit-queue-full"), "{body}");
+
+        srv.shutdown();
     }
 
     /// 🔴 A corrupt committed group is a 500 and never an empty group. An empty

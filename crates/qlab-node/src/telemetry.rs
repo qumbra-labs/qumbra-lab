@@ -123,10 +123,12 @@ pub const DURABLE_HEAD_SINCE_VERSION: u8 = 0x04;
 /// [`Telemetry::from_bytes_compat`], which hands its caller the version it decoded
 /// so the caller can say *why* a field is absent instead of printing a bare `-`.
 ///
-/// **What removes `0x03` from it:** all four T0 hosts serving `0x04`. Until then a
-/// reader that drops it is blind during the roll; after then, keeping it lets a
-/// forgotten host look healthy, which is the failure mode in the other direction.
-pub const READABLE_TELEMETRY_VERSIONS: &[u8] = &[0x03, RPC_VERSION];
+/// **What removes `0x03` from it:** all four T0 hosts serving `0x04` or later.
+/// Until then a reader that drops it is blind during the roll; after then, keeping
+/// it lets a forgotten host look healthy, which is the failure mode in the other
+/// direction. `0x04` (issue #275's route bump — the telemetry *payload* is
+/// byte-identical at `0x04` and `0x05`) leaves under the same rule.
+pub const READABLE_TELEMETRY_VERSIONS: &[u8] = &[0x03, 0x04, RPC_VERSION];
 
 /// **An identity in the block-hash space**: the first [`CHECKPOINT_ID_BYTES`] of a
 /// block hash, big-endian, rendered at `fid`'s width through `fid`'s helper.
@@ -1315,11 +1317,11 @@ mod tests {
         out
     }
 
-    /// `Telemetry` keeps the #117 identity states intact at `0x04`: absent,
-    /// present, and the `split` case where a node's own keys are committed to two
-    /// variants at one slot.
+    /// `Telemetry` keeps the #117 identity states intact at the current version:
+    /// absent, present, and the `split` case where a node's own keys are committed
+    /// to two variants at one slot.
     #[test]
-    fn telemetry_roundtrips_checkpoint_identity_at_0x04() {
+    fn telemetry_roundtrips_checkpoint_identity_at_0x05() {
         let base = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 2, MAX_LAG);
 
         // Nothing injected: the composition cannot see the identity. Fields render
@@ -1331,7 +1333,7 @@ mod tests {
         assert_eq!(base.sid_field(), "-");
         assert_eq!(Telemetry::from_bytes(&base.to_bytes()).unwrap(), base);
         assert_eq!(base.to_bytes()[0], RPC_VERSION);
-        assert_eq!(RPC_VERSION, 0x04, "the ratified issue #212 bump");
+        assert_eq!(RPC_VERSION, 0x05, "the issue #275 route bump (payload unchanged from #212's 0x04)");
 
         // Fully populated: finalized identity + this node's own signed variant.
         let full = base
@@ -1366,11 +1368,11 @@ mod tests {
         );
     }
 
-    /// **Acceptance (#121, re-pinned at `0x04` by #212): committee aggregates
-    /// round-trip at the current version, while an older wire is rejected on its
-    /// version byte by the STRICT decoder.**
+    /// **Acceptance (#121, re-pinned at `0x04` by #212 and at `0x05` by #275):
+    /// committee aggregates round-trip at the current version, while an older wire
+    /// is rejected on its version byte by the STRICT decoder.**
     #[test]
-    fn committee_aggregates_roundtrip_at_0x04_and_older_is_rejected() {
+    fn committee_aggregates_roundtrip_at_0x05_and_older_is_rejected() {
         let t = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 3, MAX_LAG)
             .with_committee(21, 19, 15)
             .with_supply(vec![SupplyEpoch {
@@ -1382,7 +1384,7 @@ mod tests {
                 fees: 890,
             }]);
         let bytes = t.to_bytes();
-        assert_eq!(bytes[0], 0x04);
+        assert_eq!(bytes[0], 0x05);
         assert_eq!(Telemetry::from_bytes(&bytes).unwrap(), t);
         assert_eq!(
             (t.epoch, t.committee_size, t.committee_active, t.committee_quorum),
@@ -1392,10 +1394,10 @@ mod tests {
         assert_eq!(t.supply[0].divergence_bessel(), 0);
         assert_eq!(t.supply_coverage(), SupplyCoverage::Complete);
 
-        // The strict decoder refuses EVERY older version, including the `0x03` the
-        // compat decoder now knowingly reads. Those are different paths on purpose
-        // and this is the line that keeps them from converging (issue #212).
-        for old_version in [0x01u8, 0x02, 0x03] {
+        // The strict decoder refuses EVERY older version, including the `0x03` and
+        // `0x04` the compat decoder now knowingly reads. Those are different paths
+        // on purpose and this is the line that keeps them from converging (#212).
+        for old_version in [0x01u8, 0x02, 0x03, 0x04] {
             let mut old = bytes.clone();
             old[0] = old_version;
             assert!(
@@ -1429,7 +1431,7 @@ mod tests {
 
         let decoded = Telemetry::from_bytes(&partial.to_bytes()).unwrap();
         assert_eq!(decoded.supply_coverage(), partial.supply_coverage());
-        assert_eq!(decoded.to_bytes()[0], 0x04, "coverage uses fields already on the wire");
+        assert_eq!(decoded.to_bytes()[0], 0x05, "coverage uses fields already on the wire");
     }
 
     /// **Acceptance (#130 (a)): `SupplyCoverage` and the state-lag figures are one
@@ -1618,7 +1620,7 @@ mod tests {
         stamped[0] = RPC_VERSION;
         assert!(
             matches!(Telemetry::from_bytes(&stamped), Err(CodecError::Truncated { .. })),
-            "the versioned tails are mandatory at 0x04"
+            "the versioned tails are mandatory at the current version"
         );
         // …and the compat decoder does not weaken that. `0x01` is not in the readable
         // set, so it is refused by both paths (issue #212).
@@ -1871,17 +1873,17 @@ mod tests {
         assert_eq!(unavailable.durable_agreement().token(), None);
     }
 
-    /// **Acceptance (#212 D — the roll): a reader at `0x04` can still read a `0x03`
-    /// node, and is told that is what it read.**
+    /// **Acceptance (#212 D — the roll, extended by #275): a current reader can
+    /// still read a `0x03` or `0x04` node, and is told that is what it read.**
     ///
     /// This is the whole answer to the roll problem. T0 rolls one host at a time and
-    /// the last roll took 23 minutes; without this, an `opview` built at `0x04` would
-    /// read *nothing* from the un-rolled hosts for that whole window, and its verdict
-    /// is cross-host agreement — which an instrument seeing two of four hosts cannot
-    /// answer. The version comes back so an absent durable head can be attributed to
-    /// the wire rather than reported as a fact about the chain.
+    /// the last roll took 23 minutes; without this, an `opview` built at the current
+    /// version would read *nothing* from the un-rolled hosts for that whole window,
+    /// and its verdict is cross-host agreement — which an instrument seeing two of
+    /// four hosts cannot answer. The version comes back so an absent durable head can
+    /// be attributed to the wire rather than reported as a fact about the chain.
     #[test]
-    fn a_reader_at_0x04_still_reads_a_0x03_node_and_knows_that_it_did() {
+    fn a_current_reader_still_reads_a_0x03_or_0x04_node_and_knows_that_it_did() {
         let live = with_durable(
             Telemetry::assemble(2871, Some(2864), 75, 0, 3, 2, MAX_LAG)
                 .with_committee(21, 21, 15)
@@ -1891,9 +1893,18 @@ mod tests {
 
         // The rolled host: full fidelity, and the version says so.
         let (v, rolled) = Telemetry::from_bytes_compat(&live.to_bytes()).unwrap();
-        assert_eq!(v, 0x04);
+        assert_eq!(v, 0x05);
         assert_eq!(rolled, live);
         assert!(rolled.durable.is_available());
+
+        // A `0x04` host (issue #275: the route bump changed no payload byte, so the
+        // `0x04` body is the `0x05` body): full fidelity too, attributed to `0x04`.
+        let mut v4 = live.to_bytes();
+        v4[0] = 0x04;
+        let (v_mid, host_0x04) = Telemetry::from_bytes_compat(&v4).unwrap();
+        assert_eq!(v_mid, 0x04);
+        assert_eq!(host_0x04, live);
+        assert!(host_0x04.durable.is_available(), "0x04 already carried the durable tail");
 
         // The un-rolled host: everything `0x03` carried is still read, and the
         // durable head is absent — attributably so.
@@ -1915,9 +1926,9 @@ mod tests {
         ));
 
         // The readable set is bounded and named, and it is not a `>=` comparison:
-        // `0x02` and an unknown future `0x05` are both refused by BOTH paths.
-        assert_eq!(READABLE_TELEMETRY_VERSIONS, &[0x03, 0x04]);
-        for refused in [0x00u8, 0x01, 0x02, 0x05, 0xff] {
+        // `0x02` and an unknown future `0x06` are both refused by BOTH paths.
+        assert_eq!(READABLE_TELEMETRY_VERSIONS, &[0x03, 0x04, 0x05]);
+        for refused in [0x00u8, 0x01, 0x02, 0x06, 0xff] {
             let mut bytes = live.to_bytes();
             bytes[0] = refused;
             assert!(
@@ -1940,8 +1951,9 @@ mod tests {
         ));
     }
 
-    /// **The `0x03` payload really is the prefix of the `0x04` one** — the durable
-    /// tail is appended and nothing before it moved.
+    /// **The `0x03` payload really is the prefix of the current one** — the durable
+    /// tail `0x04` appended, and nothing before it moved (`0x05` changed no payload
+    /// byte at all, issue #275).
     ///
     /// This is the field-discipline check for this bump, in bytes: `PRE_I84_FIELDS`
     /// protects the log line, and this protects the wire. If a future edit inserts a

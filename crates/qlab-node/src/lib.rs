@@ -75,9 +75,10 @@ pub use recovery::{
     FinalizerState, SignRefusal, FINALIZER_FORMAT_VERSION,
 };
 pub use rpc::{
-    compact_response, serve, AnchorSet, BlockDiscovery, CheckpointFacts, MemNodeRpc, NetFacts,
-    NodeRpc, NodeStatus, RecipientDiscovery, RejectReason, RouteResult, RpcServerHandle,
-    SubmitOutcome, TxDiscovery, MAX_COMPACT_BLOCKS, RPC_VERSION,
+    compact_response, repeated_nullifier_in_tx, serve, AnchorSet, BlockDiscovery, CheckpointFacts,
+    MemNodeRpc, NetFacts, NodeRpc, NodeStatus, RecipientDiscovery, RejectReason, RouteResult,
+    RpcServerHandle, SubmitOutcome, TreeLeaves, TxDiscovery, MAX_COMPACT_BLOCKS, MAX_TREE_LEAVES,
+    RPC_VERSION,
 };
 pub use telemetry::{
     AppliedTip, BlockIdentity, DurableAgreement, DurableHead, DurableView, LocalCommitment,
