@@ -75,7 +75,7 @@ use crate::telemetry::{LocalCommitment, Telemetry};
 /// The RPC wire-format version byte for the node's **own** surfaces —
 /// `/v1/status`, `/v1/anchors` and `/v1/telemetry`.
 ///
-/// **`0x04` since issue #212.** It was `0x01`, defined as `= qlab_cbserver::
+/// It was `0x01`, defined as `= qlab_cbserver::
 /// WIRE_VERSION` and documented as deliberately equal "so a client speaks one
 /// version to the whole node". Adding the finalized-checkpoint identity to
 /// [`Telemetry`] is a payload change on a reject-unknown-version wire, so the
@@ -96,22 +96,32 @@ use crate::telemetry::{LocalCommitment, Telemetry};
 ///   an old reader failing loudly against a new node is the reject-unknown
 ///   feature working, not a regression.
 ///
-/// So a client now speaks `0x04` to the node's own wires and `0x01` to the
+/// So a client now speaks `0x05` to the node's own wires and `0x01` to the
 /// compact-block wires it shares with the `qlab-cbserver` reference server.
+///
+/// **`0x05` since issue #275, and this bump is a ROUTE bump, not a payload one.**
+/// The wallet-send server half adds `/v1/tree/leaves` (a new versioned wire, see
+/// [`TreeLeaves`]) and the deployed `POST /v1/tx` submit surface; every existing
+/// payload is byte-for-byte what it was at `0x04`. The version still moves because
+/// it is the one capability signal a client has: a wallet that reads `0x05` off
+/// `/v1/status` knows the send seams exist without probing for a 404, and the
+/// house rule stays one rule — the node's own surfaces move as one.
 ///
 /// # The reader side of a bump is not free, and #212 is where that was paid
 ///
-/// [`Reader::version`] is an equality check, so **a reader built at `0x04` reads
-/// nothing at all from a node still serving `0x03`.** T0 rolls one host at a time,
-/// so every bump blinds `qumbra-opview` — the drills' cross-host pass/fail
-/// instrument — on every un-rolled host for the length of the roll. #212 pays for it
-/// with [`crate::telemetry::READABLE_TELEMETRY_VERSIONS`]: a bounded, named set of
-/// versions a *reader* may opt into via
+/// [`Reader::version`] is an equality check, so **a reader built at `0x05` reads
+/// nothing at all from a node still serving `0x03` or `0x04`.** T0 rolls one host
+/// at a time, so every bump blinds `qumbra-opview` — the drills' cross-host
+/// pass/fail instrument — on every un-rolled host for the length of the roll. #212
+/// pays for it with [`crate::telemetry::READABLE_TELEMETRY_VERSIONS`]: a bounded,
+/// named set of versions a *reader* may opt into via
 /// [`Telemetry::from_bytes_compat`], which hands back the version it decoded so an
-/// absent field can be attributed. **This constant, and every strict `from_bytes`,
-/// are unchanged in their strictness** — the node still serves exactly one version
-/// and still refuses every other on its own decode paths.
-pub const RPC_VERSION: u8 = 0x04;
+/// absent field can be attributed. #275's bump pays the same way: `0x04` joins that
+/// list (its telemetry layout is `0x05`'s, unchanged), so an opview built here still
+/// reads every host of the current fleet. **This constant, and every strict
+/// `from_bytes`, are unchanged in their strictness** — the node still serves exactly
+/// one version and still refuses every other on its own decode paths.
+pub const RPC_VERSION: u8 = 0x05;
 
 // ---------------------------------------------------------------------------
 // Transaction identity + note-discovery artifacts
@@ -142,6 +152,20 @@ fn tx_id_of_public(p: &TxPublic) -> Hash32 {
 
 fn tx_id_of_stored(t: &StoredTx) -> Hash32 {
     tx_id(&t.anchor, &t.nullifiers, &t.commitments, t.bucket_actions, t.fee)
+}
+
+/// The first nullifier repeated *within* one transaction, if any.
+///
+/// This is an rpc-layer precheck rather than a [`Mempool`] gate on purpose —
+/// `Mempool::admit`'s two nullifier checks (spent set, in-pool index) both compare
+/// against state *outside* the candidate, so a tx spending one note twice sails
+/// through both and is only refused at block validation
+/// (`BodyError::DoubleSpendInBlock`), i.e. after it has poisoned a template. It is
+/// a free function so [`NodeRpc::submit_tx`] and the deployed `POST /v1/tx`
+/// surface (issue #275) run the one rule instead of two copies of it.
+pub fn repeated_nullifier_in_tx(p: &TxPublic) -> Option<Hash32> {
+    let mut in_tx = std::collections::HashSet::new();
+    p.nullifiers.iter().find(|nf| !in_tx.insert(**nf)).copied()
 }
 
 /// One recipient's note-discovery artifacts: the compact bundle a light client
@@ -453,12 +477,10 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
         let txid = tx_id_of_public(p);
 
         // Two rpc-layer pre-checks the mempool contract does not cover:
-        // (1) a nullifier repeated within this single tx, and
-        let mut in_tx = std::collections::HashSet::new();
-        for nf in &p.nullifiers {
-            if !in_tx.insert(*nf) {
-                return SubmitOutcome::Rejected(RejectReason::NullifierRepeatedInTx);
-            }
+        // (1) a nullifier repeated within this single tx (shared with the deployed
+        //     submit surface — see [`repeated_nullifier_in_tx`]), and
+        if repeated_nullifier_in_tx(p).is_some() {
+            return SubmitOutcome::Rejected(RejectReason::NullifierRepeatedInTx);
         }
         // (2) the submitted artifacts must be **the transaction's own committed
         // group**, byte for byte.
@@ -819,6 +841,14 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
                 let at = query_u64(query, "at").ok_or((400, "missing/invalid 'at'"))?;
                 Ok(self.frontier_at(at).to_bytes())
             }
+            ["v1", "tree", "leaves"] => {
+                // Issue #275 (decision brief B1): the witness source. Served here
+                // as well as by `qumbra-node`'s discovery server — stamp rider (2):
+                // the routes land in the node repo so ANY full node can serve
+                // them, not only T1's single stamped host.
+                let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'"))?;
+                Ok(TreeLeaves::page(self.node.commitments_ordered(), from).to_bytes())
+            }
             _ => Err((404, "unknown endpoint")),
         }
     }
@@ -945,6 +975,109 @@ impl AnchorSet {
         }
         r.finish()?;
         Ok(AnchorSet { tip_height, finalized_height, max_age_blocks, roots })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The leaf stream (`/v1/tree/leaves` — issue #275, decision brief B1)
+// ---------------------------------------------------------------------------
+
+/// The most leaves one `/v1/tree/leaves` response will ever carry.
+///
+/// The same contract shape as [`MAX_COMPACT_BLOCKS`], for the same reason: `from`
+/// is a client-chosen number and the response cost must be bounded by the server,
+/// not the request. A full page is `4096 × 32 B = 128 KiB` of leaves plus the
+/// ≤19-byte header — smaller than one transaction proof (~136 KB), so a page costs
+/// the wire less than the tx it lets a wallet spend. A client that receives
+/// exactly this many leaves pages from `from + MAX_TREE_LEAVES`; `total` tells it
+/// when to stop. `[devnet-placeholder]` testnet-tunable, NOT frozen — the framing
+/// below is what freezes, and it carries `n` explicitly so this bound can move
+/// without touching the golden.
+pub const MAX_TREE_LEAVES: usize = 4096;
+
+/// One page of the node's commitment-tree leaves, in **authoritative append
+/// order** (`/v1/tree/leaves?from=N` — issue #275, decision brief B1).
+///
+/// This is the witness source for a nodeless wallet: it maintains a local tree
+/// from these pages and computes `auth_path` itself, so the server learns which
+/// IP syncs leaves and never which positions matter to it — the exact privacy
+/// line that rejected the server-computed-witness alternative (brief B2). The
+/// order served is the order [`crate::Node::apply_state`] appended: **the
+/// coinbase leaf a block matures goes in before that block's own transaction
+/// commitments** (issue #102), and the client never recomputes maturity — a
+/// compact-only reconstruction has wrong *positions*, not just holes, which is
+/// the gap this wire exists to close.
+///
+/// Self-verifying end to end: a wrong or reordered stream yields a wrong local
+/// root, which fails the anchor check at submission. A lying server can censor
+/// (the already-accepted posture) but cannot make a wallet spend against a fake
+/// tree undetected.
+///
+/// # Wire (GOLDEN — stamp rider (1))
+///
+/// `version ‖ from(8 LE) ‖ total(8 LE) ‖ n(varint) ‖ [leaf(32) × n]`
+///
+/// This is an interop-O5-class *served* wire, so it freezes deliberately, with
+/// byte-exact vectors like `/v1/compact`'s, not by accident — see
+/// `golden_bytes_lock_the_leaf_stream_framing`. `from` is echoed so a paging
+/// client cannot misattribute a response; `total` is the tree's live leaf count,
+/// which is both the loop condition ("page until `from + n == total`") and the
+/// honest answer to a `from` beyond the tree (an **empty page carrying `total`**,
+/// never an error — "you are ahead of me" is a meaningful state during a reorg
+/// or against a lagging server, and the wallet's own root check is what judges
+/// it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreeLeaves {
+    /// Index of `leaves[0]` in the tree (echo of the request's `from`).
+    pub from: u64,
+    /// Leaves the serving tree holds right now.
+    pub total: u64,
+    /// At most [`MAX_TREE_LEAVES`] commitments, append order, as the 32-byte cm
+    /// wire bytes the block carried (what [`crate::Node`] appends).
+    pub leaves: Vec<Hash32>,
+}
+
+impl TreeLeaves {
+    /// The page at `from` over an append-ordered leaf slice — the one projection
+    /// both servers use (`NodeRpc::route` here, and `qumbra-node`'s discovery
+    /// server over its snapshot), so there is no second implementation of the
+    /// clamp arithmetic to drift.
+    pub fn page(leaves: &[Hash32], from: u64) -> TreeLeaves {
+        let total = leaves.len() as u64;
+        let start = from.min(total) as usize;
+        let end = (start + MAX_TREE_LEAVES).min(leaves.len());
+        TreeLeaves { from, total, leaves: leaves[start..end].to_vec() }
+    }
+
+    /// `version ‖ from(8 LE) ‖ total(8 LE) ‖ n(varint) ‖ [leaf(32) × n]`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(RPC_VERSION);
+        out.extend_from_slice(&self.from.to_le_bytes());
+        out.extend_from_slice(&self.total.to_le_bytes());
+        write_varint(&mut out, self.leaves.len() as u64);
+        for leaf in &self.leaves {
+            out.extend_from_slice(leaf);
+        }
+        out
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<TreeLeaves, CodecError> {
+        let mut r = Reader::new(b);
+        r.version()?;
+        let from = r.u64()?;
+        let total = r.u64()?;
+        let n = r.varint()?;
+        // The count is attacker-adjacent input on a served wire: cap the
+        // allocation by what the remaining bytes could actually hold, so a tiny
+        // payload claiming 2^60 leaves is a `Truncated` refusal and not a giant
+        // allocation.
+        let mut leaves = Vec::with_capacity((n as usize).min(b.len() / 32));
+        for _ in 0..n {
+            leaves.push(r.hash32()?);
+        }
+        r.finish()?;
+        Ok(TreeLeaves { from, total, leaves })
     }
 }
 
@@ -1380,28 +1513,188 @@ mod tests {
         assert!(matches!(AnchorSet::from_bytes(&extra_a), Err(CodecError::TrailingBytes { .. })));
     }
 
-    /// Issue #121's **collateral, made explicit** (re-pinned at `0x04` by #212):
-    /// `/v1/status` and `/v1/anchors` share `RPC_VERSION` with `/v1/telemetry`, so
-    /// bumping it for the durable-head tail moves them to `0x04` too even though
-    /// their payloads are byte-for-byte what they were. An older reader now fails
-    /// loudly against them.
+    // ---- the leaf stream (`/v1/tree/leaves`, issue #275) ---------------------
+
+    fn hex32(b: &Hash32) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// GOLDEN BYTES — the leaf-stream framing (stamp rider (1)): this is an
+    /// interop-O5-class *served* wire, so it freezes deliberately, with byte-exact
+    /// vectors like `/v1/compact`'s, not by accident. A fixed page; we assert the
+    /// exact field bytes, the exact total length, and a Keccak-256 digest over the
+    /// whole serialization. Any framing drift breaks this test.
+    #[test]
+    fn golden_bytes_lock_the_leaf_stream_framing() {
+        let page =
+            TreeLeaves { from: 2, total: 5, leaves: vec![[0xAA; 32], [0xBB; 32], [0xCC; 32]] };
+        let bytes = page.to_bytes();
+
+        // version(1) + from(8) + total(8) + n(1, varint) + 3 × leaf(32) = 114.
+        assert_eq!(bytes.len(), 114, "golden total length");
+        assert_eq!(bytes[0], 0x05, "golden version — RPC_VERSION at issue #275");
+        assert_eq!(&bytes[1..9], &2u64.to_le_bytes(), "golden from (LE)");
+        assert_eq!(&bytes[9..17], &5u64.to_le_bytes(), "golden total (LE)");
+        assert_eq!(bytes[17], 0x03, "golden n (varint)");
+        assert_eq!(&bytes[18..50], &[0xAA; 32], "golden leaf 0");
+        assert_eq!(&bytes[50..82], &[0xBB; 32], "golden leaf 1");
+        assert_eq!(&bytes[82..114], &[0xCC; 32], "golden leaf 2");
+
+        let digest = keccak256(&bytes);
+        assert_eq!(
+            hex32(&digest),
+            "d478d958e0ad64f706c67f8777c6653416f008c68c6894ec4d9f308c00ba828e",
+            "GOLDEN digest — update ONLY with an intentional, documented framing change"
+        );
+
+        assert_eq!(TreeLeaves::from_bytes(&bytes).unwrap(), page, "and it round-trips");
+
+        // The empty page — the "you are ahead of me" answer — is part of the
+        // framing too: header only, n = 0.
+        let empty = TreeLeaves { from: 9, total: 4, leaves: vec![] };
+        let ebytes = empty.to_bytes();
+        assert_eq!(ebytes.len(), 18, "golden empty-page length");
+        assert_eq!(ebytes[17], 0x00, "golden empty-page n");
+        assert_eq!(TreeLeaves::from_bytes(&ebytes).unwrap(), empty);
+    }
+
+    /// The leaf wire rejects exactly like the node's other own wires: unknown
+    /// version, trailing bytes, truncation — and a claimed count the bytes cannot
+    /// hold is a refusal, not an allocation.
+    #[test]
+    fn leaf_stream_rejects_bad_version_trailing_truncation_and_count_lies() {
+        let good = TreeLeaves { from: 0, total: 2, leaves: vec![[0x11; 32], [0x22; 32]] }.to_bytes();
+        assert_eq!(TreeLeaves::from_bytes(&good).unwrap().leaves.len(), 2);
+
+        let mut bad_v = good.clone();
+        bad_v[0] = 0x04;
+        assert!(matches!(TreeLeaves::from_bytes(&bad_v), Err(CodecError::BadVersion { got: 4 })));
+
+        let mut extra = good.clone();
+        extra.push(0);
+        assert!(matches!(TreeLeaves::from_bytes(&extra), Err(CodecError::TrailingBytes { .. })));
+
+        assert!(matches!(
+            TreeLeaves::from_bytes(&good[..good.len() - 1]),
+            Err(CodecError::Truncated { .. })
+        ));
+
+        // An 18-byte payload claiming 2^60 leaves: `Truncated`, never a 2^65-byte
+        // allocation — the count is attacker-adjacent input on a served wire.
+        let mut lie = Vec::new();
+        lie.push(RPC_VERSION);
+        lie.extend_from_slice(&0u64.to_le_bytes());
+        lie.extend_from_slice(&0u64.to_le_bytes());
+        write_varint(&mut lie, 1u64 << 60);
+        assert!(matches!(TreeLeaves::from_bytes(&lie), Err(CodecError::Truncated { .. })));
+    }
+
+    /// The page arithmetic: bounded at [`MAX_TREE_LEAVES`], the client loops from
+    /// `from + n`, and a `from` at or beyond `total` is an **empty page carrying
+    /// `total`** — a meaningful state (reorg, lagging server), never an error.
+    #[test]
+    fn leaf_pages_are_bounded_and_from_beyond_total_is_an_empty_page() {
+        let leaves: Vec<Hash32> = (0..MAX_TREE_LEAVES as u64 + 5)
+            .map(|i| {
+                let mut h = [0u8; 32];
+                h[..8].copy_from_slice(&i.to_le_bytes());
+                h
+            })
+            .collect();
+
+        let p0 = TreeLeaves::page(&leaves, 0);
+        assert_eq!(p0.leaves.len(), MAX_TREE_LEAVES, "a full page is the bound, not the tree");
+        assert_eq!(p0.total, leaves.len() as u64);
+        assert_eq!(p0.leaves[0], leaves[0]);
+
+        // The client's loop: page from where the last one stopped.
+        let p1 = TreeLeaves::page(&leaves, MAX_TREE_LEAVES as u64);
+        assert_eq!(p1.leaves.len(), 5);
+        assert_eq!(p1.leaves[0], leaves[MAX_TREE_LEAVES]);
+        assert_eq!(p1.from + p1.leaves.len() as u64, p1.total, "…and this page says stop");
+
+        let beyond = TreeLeaves::page(&leaves, u64::MAX);
+        assert!(beyond.leaves.is_empty());
+        assert_eq!(beyond.total, leaves.len() as u64, "the empty page still says where the server is");
+        assert_eq!(beyond.from, u64::MAX, "the echo is the request's — a paging client cannot misattribute it");
+    }
+
+    /// **Acceptance (#275 seam 2): the route serves the node's own append order —
+    /// matured-coinbase-first (issue #102) — and the stream is self-verifying: a
+    /// wallet folding it into a fresh tree reproduces the node's root**, which is
+    /// the anchor its spend will be judged against. This is the property that lets
+    /// the client never recompute maturity.
+    #[test]
+    fn route_serves_the_leaf_stream_in_apply_order_and_it_rebuilds_the_root() {
+        let genesis = genesis_block(1_000, 0);
+        let mut node = MemNode::in_memory(genesis);
+        let g = node.chain().genesis_block_hash();
+        assert!(node.finalize(g).unwrap().is_recorded());
+        let anchor = node.commitment_root();
+
+        // Mint at height 1, walk to the maturity horizon, then land a real
+        // transaction in the exact block that matures height 1's coinbase — the
+        // one block where compact-only reconstruction gets positions wrong.
+        apply_block_with_shape(&mut node, vec![], true);
+        for _ in 2..=crate::emission::COINBASE_MATURITY_BLOCKS {
+            apply_block_with_shape(&mut node, vec![], false);
+        }
+        let before = node.commitments_ordered().len();
+        let fee = posted_fee(ArityBucket::TwoByTwo);
+        apply_block_with_shape(
+            &mut node,
+            vec![tx_with(anchor, &[0x21, 0x22], &[0x77, 0x78], fee)],
+            false,
+        );
+        let ordered = node.commitments_ordered();
+        assert_eq!(ordered.len(), before + 3, "one matured coinbase leaf + two tx commitments");
+        assert_ne!(ordered[before], cm_bytes(0x77), "the coinbase leaf goes in FIRST (issue #102)");
+        assert_eq!(&ordered[before + 1..], &[cm_bytes(0x77), cm_bytes(0x78)], "then the tx's, in order");
+
+        let rpc = NodeRpc::new(node);
+        let served = TreeLeaves::from_bytes(&rpc.route("/v1/tree/leaves?from=0").unwrap())
+            .expect("the route serves the versioned wire");
+        assert_eq!(served.leaves, rpc.node().commitments_ordered(), "served == applied, byte for byte");
+        assert_eq!(served.total as usize, served.leaves.len());
+
+        // Self-verifying end to end: the wallet's replayed tree IS the node's.
+        let mut wallet_tree = qlab_cbserver::tree::CommitmentTree::new();
+        for leaf in &served.leaves {
+            wallet_tree.append_bytes(leaf);
+        }
+        assert_eq!(
+            digest_bytes(&wallet_tree.root()),
+            rpc.node().commitment_root(),
+            "a wallet that replays the stream holds the root its anchor check needs"
+        );
+
+        // Refusals mirror the neighbouring routes': a missing bound is a 400.
+        assert_eq!(rpc.route("/v1/tree/leaves").unwrap_err().0, 400);
+        assert_eq!(rpc.route("/v1/tree/leaves?from=zzz").unwrap_err().0, 400);
+    }
+
+    /// Issue #121's **collateral, made explicit** (re-pinned at `0x04` by #212 and
+    /// at `0x05` by #275): `/v1/status` and `/v1/anchors` share `RPC_VERSION` with
+    /// `/v1/telemetry`, so bumping it — for #212's durable-head tail, and again for
+    /// #275's route additions — moves them too even though their payloads are
+    /// byte-for-byte what they were. An older reader now fails loudly against them.
     ///
     /// That is the accepted trade (see [`RPC_VERSION`]'s doc), and it is locked
     /// here so nobody later "fixes" it back into a silent accept-both.
     ///
-    /// 🔴 **Note what #212 did NOT do**: `Telemetry::from_bytes_compat` reads `0x03`,
-    /// and these two surfaces gained no such path. That is deliberate —
-    /// `qumbra-opview` polls `/v1/telemetry` and nothing else, so the roll problem is
-    /// that route's alone, and widening the compat window to routes nothing needs it
-    /// on would be leniency bought for free.
+    /// 🔴 **Note what #212 did NOT do**: `Telemetry::from_bytes_compat` reads `0x03`
+    /// (and, since #275, `0x04`), and these two surfaces gained no such path. That is
+    /// deliberate — `qumbra-opview` polls `/v1/telemetry` and nothing else, so the
+    /// roll problem is that route's alone, and widening the compat window to routes
+    /// nothing needs it on would be leniency bought for free.
     #[test]
-    fn status_and_anchors_moved_to_0x04_with_telemetry_and_reject_older_versions() {
+    fn status_and_anchors_moved_to_0x05_with_telemetry_and_reject_older_versions() {
         let (rpc, _) = rpc_with_finalized_genesis();
-        assert_eq!(RPC_VERSION, 0x04);
+        assert_eq!(RPC_VERSION, 0x05);
 
         for mut payload in [rpc.status().to_bytes(), rpc.anchors().to_bytes(), rpc.telemetry().to_bytes()] {
-            assert_eq!(payload[0], 0x04, "the node's own surfaces move as one");
-            for old in [0x01, 0x02, 0x03] {
+            assert_eq!(payload[0], 0x05, "the node's own surfaces move as one");
+            for old in [0x01, 0x02, 0x03, 0x04] {
                 payload[0] = old;
                 let as_status = NodeStatus::from_bytes(&payload);
                 let as_anchors = AnchorSet::from_bytes(&payload);

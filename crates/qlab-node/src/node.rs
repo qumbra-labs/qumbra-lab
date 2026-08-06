@@ -1239,6 +1239,20 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     pub fn commitments(&self) -> &T {
         &self.commitments
     }
+    /// Every commitment-tree leaf in **authoritative append order** — the order
+    /// [`Self::apply_state`] appended (the coinbase leaf a block matures first,
+    /// then that block's transaction commitments, issue #102), which is the
+    /// order the tree's positions mean.
+    ///
+    /// This is the projection `/v1/tree/leaves` serves (issue #275): a wallet
+    /// replays it into a local tree and computes membership witnesses itself.
+    /// It was already maintained for the snapshot (a replay reproduces the exact
+    /// order), so serving it adds no second ledger — a rewind rebuilds it with
+    /// the rest of derived state, so a reorged suffix leaves it exactly as a
+    /// re-application would.
+    pub fn commitments_ordered(&self) -> &[Hash32] {
+        &self.commitments_ordered
+    }
     /// Borrow the nullifier store.
     pub fn nullifiers(&self) -> &N {
         &self.nullifiers
