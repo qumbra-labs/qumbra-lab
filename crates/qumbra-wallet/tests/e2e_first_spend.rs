@@ -27,7 +27,9 @@
 //! around admission (`submit_remote_tx` + `drain_remote_submits`): standing up
 //! a full `RunningNode` with real PoW to reach coinbase maturity would multiply
 //! this test's cost to re-cover ground that is already covered node-side by
-//! `qumbra_node::run::tests::submit_endpoint_admits_refuses_and_dedups_over_a_real_socket`.
+//! `qumbra_node::run::tests::the_submit_route_judges_over_a_real_socket_through_the_run_loop`
+//! (which is also the one place `/v1/anchors` is exercised off a real
+//! `RunningNode`).
 //! Here the test itself drains the submit queue and answers with
 //! `NodeRpc::submit_tx` — the same checks, the same typed outcomes.
 //!
