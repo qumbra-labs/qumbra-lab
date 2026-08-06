@@ -6,17 +6,21 @@
 //!   address   show / allocate diversified addresses
 //!   backup    the mnemonic, only behind --reveal, with a warning
 //!   scan      balance by light-client scan against a cbserver URL
+//!   send      scan → sync the tree → prove → POST /v1/tx (issue #276)
 //! ```
 //!
-//! `send` is WRITTEN, NOT ACCEPTED (t1-readiness-plan §3): [`send`] builds and
-//! REALLY proves against the merged #219 latch (lab PR #252), writes the
-//! canonical wire bytes to a file — and does not submit yet. The submission
-//! seam is no longer open: `t1-wallet-send-seams-decision.md` (STAMPED
-//! 2026-08-06, A1+B1) decides `POST /v1/tx` + the `/v1/tree/leaves` stream,
-//! and #276 wires this CLI to both once the server half (#275) serves them.
-//! [`sync`] is that baton's wallet half: the verified local commitment tree.
-//! Deliberately absent: any embedded node (scan is an HTTP client) · GUI/QR
-//! (the shells' business — see the design repo's wallet briefs).
+//! `send` is **wired** as of issue #276, the wallet half of
+//! `t1-wallet-send-seams-decision.md` (STAMPED 2026-08-06, A1+B1): [`send`]
+//! builds and REALLY proves against the merged #219 latch (lab PR #252),
+//! [`sync`] maintains the local commitment tree over the served leaf stream and
+//! picks the anchor a witness may legally be built at, and [`net`] carries both
+//! served seams — `GET /v1/tree/leaves` + `GET /v1/anchors` in, `POST /v1/tx`
+//! out. The server half is #275.
+//!
+//! **Still nodeless, which is the A2 rejection kept.** Every one of those is an
+//! HTTP client against somebody else's node; this crate runs no node, mines
+//! nothing, and gossips nothing. Deliberately absent: GUI/QR (the shells'
+//! business — see the design repo's wallet briefs).
 //!
 //! # The two disciplines everything here bends around
 //!
@@ -33,6 +37,7 @@
 //! and `qumbra-explorer` pin for refused supply figures, so one grep covers all
 //! three surfaces.
 
+pub mod net;
 pub mod send;
 pub mod store;
 pub mod sync;
