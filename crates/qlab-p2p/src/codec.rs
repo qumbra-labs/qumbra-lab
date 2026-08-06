@@ -214,8 +214,13 @@ pub fn encode_checkpoint_msg(cp: &Checkpoint, votes: &[Vote]) -> Vec<u8> {
 pub fn decode_checkpoint_msg(buf: &[u8]) -> Result<(Checkpoint, Vec<Vote>), DecodeError> {
     let mut r = Reader::new(buf);
     let cp = read_checkpoint(&mut r)?;
+    // The count is attacker-controlled (peer wire): cap the pre-allocation by
+    // what the remaining bytes could actually hold (a vote carries a SIG_LEN
+    // signature), so a tiny payload claiming 2^60 votes is a truncation refusal
+    // on its first read and never a giant allocation. Same shape as decode_tx
+    // (issue #275 / PR #277); remaining sites closed by issue #279.
     let n = r.varint()? as usize;
-    let mut votes = Vec::with_capacity(n);
+    let mut votes = Vec::with_capacity(n.min(buf.len() / SIG_LEN));
     for _ in 0..n {
         votes.push(read_vote(&mut r)?);
     }
@@ -531,8 +536,13 @@ pub fn encode_locator(loc: &Locator) -> Vec<u8> {
 /// Decode a `GetHeaders` locator body.
 pub fn decode_locator(buf: &[u8]) -> Result<Locator, DecodeError> {
     let mut r = Reader::new(buf);
+    // The count is attacker-controlled (peer wire): cap the pre-allocation by
+    // what the remaining bytes could actually hold (each hash is 32 B), so a
+    // tiny payload claiming 2^60 hashes is a truncation refusal on its first
+    // read and never a giant allocation. Same shape as decode_tx (issue #275 /
+    // PR #277); remaining sites closed by issue #279.
     let n = r.varint()? as usize;
-    let mut have = Vec::with_capacity(n);
+    let mut have = Vec::with_capacity(n.min(buf.len() / 32));
     for _ in 0..n {
         have.push(r.hash32("loc.have")?);
     }
@@ -554,8 +564,13 @@ pub fn encode_headers(headers: &[BlockHeader]) -> Vec<u8> {
 /// Decode a `Headers` batch body.
 pub fn decode_headers(buf: &[u8]) -> Result<Vec<BlockHeader>, DecodeError> {
     let mut r = Reader::new(buf);
+    // The count is attacker-controlled (peer wire): cap the pre-allocation by
+    // what the remaining bytes could actually hold (each header is
+    // HEADER_WIRE_LEN), so a tiny payload claiming 2^60 headers is a truncation
+    // refusal on its first read and never a giant allocation. Same shape as
+    // decode_tx (issue #275 / PR #277); remaining sites closed by issue #279.
     let n = r.varint()? as usize;
-    let mut headers = Vec::with_capacity(n);
+    let mut headers = Vec::with_capacity(n.min(buf.len() / HEADER_WIRE_LEN));
     for _ in 0..n {
         let raw = r.rest(HEADER_WIRE_LEN, "headers.item")?;
         headers.push(decode_header(&raw)?);
@@ -661,6 +676,30 @@ mod tests {
 
         assert!(decode_checkpoint_votes(&bytes[..bytes.len() - 1]).is_err(), "truncated rejected");
         assert!(decode_checkpoint_votes(&[]).is_err(), "empty rejected");
+    }
+
+    /// A tiny payload claiming 2^60 votes is a truncation refusal, never a
+    /// giant pre-allocation (issue #279 — the count is attacker-controlled on
+    /// the peer wire). Before the cap, `Vec::with_capacity(n)` ran on the
+    /// claimed count *before* the first vote read could refuse it. Shared body
+    /// with `decode_checkpoint_msg`, so one test covers both aliases.
+    #[test]
+    fn checkpoint_votes_decode_refuses_a_count_the_bytes_cannot_hold_without_allocating() {
+        let mut bytes = Vec::new();
+        // checkpoint: height(8) ‖ block_hash(32) ‖ root(32)
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&[0xAB; 32]);
+        bytes.extend_from_slice(&[0xCD; 32]);
+        write_varint(&mut bytes, 1u64 << 60); // n_votes, a lie
+        assert!(matches!(
+            decode_checkpoint_votes(&bytes),
+            Err(DecodeError::Truncated { .. })
+        ));
+        // Same body path as CheckpointVotes — the alias must refuse identically.
+        assert!(matches!(
+            decode_checkpoint_msg(&bytes),
+            Err(DecodeError::Truncated { .. })
+        ));
     }
 
     #[test]
@@ -878,6 +917,22 @@ mod tests {
         assert_eq!(decode_locator(&bytes).unwrap(), loc);
     }
 
+    /// A tiny payload claiming 2^60 locator hashes is a truncation refusal,
+    /// never a giant pre-allocation (issue #279 — the count is attacker-controlled
+    /// on the peer wire). Before the cap, `Vec::with_capacity(n)` ran on the
+    /// claimed count *before* the first hash read could refuse it.
+    ///
+    /// Premise note: issue #279 named this site `decode_inv` at ~line 531; on
+    /// `main` that line is `decode_locator`. `decode_inv` has never used
+    /// `with_capacity` (it pushes into `InvVec::default()` and fails on the
+    /// first truncated element read without a giant allocation).
+    #[test]
+    fn locator_decode_refuses_a_count_the_bytes_cannot_hold_without_allocating() {
+        let mut bytes = Vec::new();
+        write_varint(&mut bytes, 1u64 << 60); // n_have, a lie
+        assert!(matches!(decode_locator(&bytes), Err(DecodeError::Truncated { .. })));
+    }
+
     #[test]
     fn headers_batch_round_trips() {
         let g = BlockHeader::genesis(1000, 0);
@@ -886,5 +941,16 @@ mod tests {
         let batch = vec![g, h1, h2];
         let bytes = encode_headers(&batch);
         assert_eq!(decode_headers(&bytes).unwrap(), batch);
+    }
+
+    /// A tiny payload claiming 2^60 headers is a truncation refusal, never a
+    /// giant pre-allocation (issue #279 — the count is attacker-controlled on
+    /// the peer wire). Before the cap, `Vec::with_capacity(n)` ran on the
+    /// claimed count *before* the first header read could refuse it.
+    #[test]
+    fn headers_decode_refuses_a_count_the_bytes_cannot_hold_without_allocating() {
+        let mut bytes = Vec::new();
+        write_varint(&mut bytes, 1u64 << 60); // n_headers, a lie
+        assert!(matches!(decode_headers(&bytes), Err(DecodeError::Truncated { .. })));
     }
 }
