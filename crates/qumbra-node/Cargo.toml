@@ -86,8 +86,10 @@ toml = "0.8"
 # Default ctrlc registers SIGINT only; `termination` also arms SIGTERM and
 # SIGHUP (issue #145). Docker `compose stop` / systemd `systemctl stop` send
 # SIGTERM to PID 1 — without this feature those paths never set the shutdown
-# flag and the post-loop flush is never attempted.
-ctrlc = { version = "3.4", features = ["termination"] }
+# flag and the post-loop flush is never attempted. Version + feature live in
+# `[workspace.dependencies]` since #238, so no composing crate can redeclare
+# the dep bare (tests/ctrlc_pairing.rs enforces it).
+ctrlc = { workspace = true }
 # The /metrics scrape endpoint (issue #87). Same minimal blocking HTTP/1.1 server,
 # and the same `=` pin, as qlab-node's RPC surface and qlab-cbserver's reference
 # server — one HTTP implementation in the tree, not three.

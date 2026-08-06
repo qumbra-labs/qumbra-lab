@@ -71,9 +71,12 @@ tiny_http = "=0.12.0"
 # Grant proving needs a CSPRNG (the note ρ/rseed the requester's output binds).
 # Workspace rev, same as qlab-faucet's.
 rand = "0.10"
-# Ctrl-C handling: the same graceful-shutdown posture as the node, because the
-# shutdown flushes the node's snapshot.
-ctrlc = "3.4"
+# Signal handling: the same graceful-shutdown posture as the node, because the
+# shutdown flushes the node's snapshot. The workspace declaration carries the
+# `termination` feature (SIGTERM/SIGHUP as well as SIGINT, issue #145) — this
+# line was `ctrlc = "3.4"` until #238, which armed SIGTERM only by feature
+# unification through the qumbra-node dependency above.
+ctrlc = { workspace = true }
 
 [dev-dependencies]
 # The acceptance suite drives the whole HTTP path to a REAL grant against a real

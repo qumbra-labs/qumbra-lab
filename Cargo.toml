@@ -7,5 +7,16 @@ edition = "2021"
 license = "UNLICENSED"
 publish = false
 
+[workspace.dependencies]
+# Signal handling for every long-running binary in this workspace. ONE
+# declaration, on purpose: default ctrlc registers SIGINT only, and the
+# `termination` feature is what also arms SIGTERM/SIGHUP — the signals Docker
+# `stop` and `systemctl stop` actually send (issue #145, regressed once in
+# #238 when qumbra-faucet redeclared the dep bare and inherited the feature
+# only by unification through qumbra-node). Crates take this via
+# `ctrlc = { workspace = true }`; a bare per-crate `ctrlc = "..."` fails
+# qumbra-node's `ctrlc_pairing` test.
+ctrlc = { version = "3.4", features = ["termination"] }
+
 # Plonky3 deps intentionally NOT pinned yet — M1 starts by selecting and
 # pinning exact revs (bench numbers are meaningless against a moving prover).
