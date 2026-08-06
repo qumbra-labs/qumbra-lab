@@ -11,7 +11,8 @@
 //!
 //! What it deliberately does NOT do: **submit.** This module ends at the
 //! canonical wire bytes (`qlab_p2p::codec::encode_tx`); getting them into the
-//! net is the caller's seam. ⚠️ An earlier version of this header claimed
+//! net is [`crate::net::submit_tx`]'s job, over `POST /v1/tx`. ⚠️ An earlier
+//! version of this header claimed
 //! "§6.2 refused `POST /v1/tx`" — **the design repo contains no such
 //! refusal** (what §6.2 rules is topological: a committee-key host exposes
 //! nothing beyond P2P). The submission route was an undecided seam, and it is
@@ -61,8 +62,14 @@ pub struct SendArtifact {
 
 /// Build + PROVE a spend of `amount` to `recipient`, change to this wallet's
 /// address [0]. `tree` must be the chain's commitment tree at `anchor_count`
-/// leaves — the caller owns that correspondence (and on a real net, obtaining
-/// it is the open question this module's docs name).
+/// leaves, and `anchor_count`'s root must be one the network accepts as an
+/// **anchor** — the caller owns that correspondence.
+///
+/// On a real net [`crate::sync::sync_and_select`] is what establishes it, and
+/// it is not a formality: a valid anchor is a *finalized* root, so the count
+/// here is generally **not** the count the leaf stream just served (issue
+/// #276). Passing the freshly-synced tip count builds a perfectly valid proof
+/// of a statement the node will refuse as `anchor-not-valid`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_send(
     wallet: &Wallet,

@@ -50,11 +50,14 @@ fn usage() {
          qumbra-wallet backup  --dir DIR --reveal        print the mnemonic (explicitly, once)\n  \
          qumbra-wallet scan    --dir DIR --url URL --to N [--from N]  balance via light-client scan\n  \
          qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n  \
-         qumbra-wallet send --dir DIR --url URL --scan-to N --to ADDR --amount BESSEL --out FILE\n  \
-                            build + PROVE a spend (real STARK, ~2 s / ~12 GB); writes wire bytes,\n  \
-                            does NOT submit (no public submission surface exists — by decision)\n\n\
-         There is deliberately no `send` yet: it is gated on the dummy-input mechanism\n\
-         (lab #219) and the T1 mint. Nothing here runs a node.\n"
+         qumbra-wallet send --dir DIR --url URL --node URL --scan-to N --to ADDR --amount BESSEL\n  \
+                            [--out FILE] [--no-submit]\n  \
+                            scan → sync the commitment tree → build + PROVE (real STARK,\n  \
+                            ~3 s / ~12 GB) → POST /v1/tx, printing the node's typed outcome\n\n\
+         --url  is the compact/scan endpoint (cbserver or a node's discovery server)\n\
+         --node is the node's discovery server: /v1/tree/leaves, /v1/anchors, POST /v1/tx\n\
+                (defaults to --url when omitted — one host usually serves both)\n\n\
+         Nothing here runs a node: every endpoint above is somebody else's.\n"
     );
 }
 
@@ -158,19 +161,28 @@ fn miner_rkm(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Written, not accepted (the mint is its acceptance): scan → select → prove →
-/// encrypt → write the canonical wire bytes. Refuses on partial scan coverage
-/// — spending on incomplete knowledge risks double-claimed nullifiers.
+/// The whole send path, wired (issue #276): scan → sync the local commitment
+/// tree → select a finalized anchor → build + PROVE → `POST /v1/tx`, printing
+/// the node's typed outcome verbatim.
+///
+/// Refuses on partial scan coverage — spending on incomplete knowledge risks
+/// double-claimed nullifiers (#244's discipline, untouched).
 fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
     use qlab_cbserver::client::{light_client_scan, Completeness, ScanConfig};
-    use qumbra_wallet::send::{os_rng, Spendable};
+    use qumbra_wallet::net::{self, HttpAnchorSource, HttpLeafSource, SubmitClass};
+    use qumbra_wallet::send::{build_send, os_rng, Spendable};
+    use qumbra_wallet::sync::{hex32, sync_and_select};
 
     let dir = dir_of(args)?;
-    let url = flag(args, "--url").ok_or("send requires --url (cbserver)")?;
+    let url = flag(args, "--url").ok_or("send requires --url (compact/scan endpoint)")?;
+    // One host normally serves both; keeping them separable costs a default and
+    // buys the ability to scan one node and submit to another.
+    let node_url = flag(args, "--node").unwrap_or(url);
     let scan_to: u64 = flag(args, "--scan-to").ok_or("send requires --scan-to HEIGHT")?.parse()?;
     let to = flag(args, "--to").ok_or("send requires --to ADDRESS")?;
     let amount: u64 = flag(args, "--amount").ok_or("send requires --amount BESSEL")?.parse()?;
-    let out = flag(args, "--out").ok_or("send requires --out FILE")?;
+    let out = flag(args, "--out");
+    let no_submit = has_flag(args, "--no-submit");
 
     let recipient = qlab_wallet::address::Address::decode(to)
         .ok_or("`--to` is not a valid qaddr1… address")?;
@@ -206,15 +218,99 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // 🔴 The tree. A light client cannot yet RECONSTRUCT the commitment tree
-    // from the compact stream on a real chain (coinbase leaves append at
-    // maturity and are not compact entries) — the named gap this subcommand
-    // carries until a tree-sync surface exists. Acceptance rides the mint.
-    return Err(format!(
-        "send is WRITTEN but cannot complete against a remote endpoint yet: the commitment          tree (witness source) is not reconstructible from the compact stream — coinbase          leaves are not compact entries. {} spendable note(s) were found and the prover path          is real (see `send::build_send` and its test); the tree-sync surface is the named          open piece, tracked with the submission seam. Nothing was written to {out}.",
-        spendables.len()
-    )
-    .into())
+    if spendables.is_empty() {
+        return Err(format!(
+            "no spendable notes: the scan of 0..={scan_to} found nothing this wallet can spend. \
+             If you expect a coinbase, it is not spendable until it matures (frozen §2, \
+             COINBASE_MATURITY_BLOCKS in qlab-node); if you expect a received note, check that \
+             its address index is allocated here (`address --new`)."
+        )
+        .into());
+    }
+
+    // The witness source. The leaf stream reconstructs the tree locally and the
+    // served anchor set says which leaf count may legally be built at — both
+    // refuse by name, and neither is skippable (see `sync`'s module docs).
+    let (synced, anchor) =
+        sync_and_select(&dir, &HttpLeafSource::new(node_url), &HttpAnchorSource::new(node_url))?;
+    eprintln!(
+        "tree: {} leaves held ({} new); anchor at {} leaves, root {} (node tip {}, finalized {})",
+        synced.count,
+        synced.fetched,
+        anchor.count,
+        hex32(&anchor.root),
+        anchor.tip_height,
+        anchor.finalized_height.map(|h| h.to_string()).unwrap_or_else(|| "none".into()),
+    );
+    if anchor.leaves_behind_local > 0 {
+        eprintln!(
+            "  (the anchor is {} leaves behind what this node served — a witness must be built \
+             against a FINALIZED root, so this is normal, not a lag)",
+            anchor.leaves_behind_local
+        );
+    }
+
+    eprintln!("proving (real STARK — this takes seconds and gigabytes)…");
+    let art =
+        build_send(&wallet, &spendables, &recipient, amount, &synced.tree, anchor.count, &mut rng)?;
+    println!(
+        "built: {} bessel to {}, fee {}, change {} — proved in {:.2} s{}",
+        amount,
+        recipient.short().encode(),
+        art.fee,
+        art.change_value,
+        art.prove_secs,
+        if art.used_dummy { " (single real note + dummy slot)" } else { "" }
+    );
+
+    // Written BEFORE submitting when asked for: a proof that cost gigabytes to
+    // make should not be lost to a failed socket.
+    if let Some(path) = out {
+        std::fs::write(path, &art.wire_bytes)?;
+        println!("wire: {} bytes → {path}", art.wire_bytes.len());
+    }
+
+    if no_submit {
+        println!("not submitted (--no-submit).");
+        if out.is_none() {
+            eprintln!(
+                "warning: --no-submit without --out discarded this proof — nothing was written \
+                 and nothing was sent."
+            );
+        }
+        return Ok(());
+    }
+
+    // The node's answer is printed VERBATIM: its first token is the
+    // machine-usable one, and the refusal vocabulary is the node's to own.
+    let answer = net::submit_tx(node_url, &art.wire_bytes).map_err(|e| {
+        format!(
+            "POST /v1/tx never completed ({e}). This is NOT a refusal — the transaction may have \
+             landed. Resubmit the same bytes{}: an already-pending transaction answers \
+             `duplicate`, which is safe.",
+            match out {
+                Some(p) => format!(" (saved at {p})"),
+                None => " (re-run with --out FILE to keep them next time)".to_string(),
+            }
+        )
+    })?;
+    println!("node [{}]: {}", answer.status, answer.body);
+
+    match answer.class() {
+        SubmitClass::Accepted | SubmitClass::Duplicate => Ok(()),
+        SubmitClass::Unavailable => Err(format!(
+            "the node did not judge this transaction — that is its state, not your \
+             transaction's. Retry{}; the transaction itself is unchanged.",
+            match out {
+                Some(p) => format!(" with the saved bytes at {p}"),
+                None => String::new(),
+            }
+        )
+        .into()),
+        SubmitClass::Refused | SubmitClass::Unknown => {
+            Err(format!("the node refused this transaction: {}", answer.body).into())
+        }
+    }
 }
 
 fn backup(args: &[String]) -> Result<(), Box<dyn Error>> {
