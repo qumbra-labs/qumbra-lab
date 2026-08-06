@@ -9,12 +9,14 @@
 //! ~12 GB release) → encrypt outputs to their owners (ML-KEM, the #188 (a)
 //! payloads) → assemble the [`TxEntry`] the wire commits to.
 //!
-//! What it deliberately does NOT do: **submit.** There is no public tx
-//! submission surface on this net by decision (§6.2 refused `POST /v1/tx`);
-//! the only ways in are P2P gossip (needs a node) or `submit_local_tx`
-//! (in-process with a node, the faucet's shape). The artifact is the
-//! canonical wire bytes (`qlab_p2p::codec::encode_tx`) written to a file, and
-//! the submission seam is a NAMED open decision, not a hidden gap.
+//! What it deliberately does NOT do: **submit.** This module ends at the
+//! canonical wire bytes (`qlab_p2p::codec::encode_tx`); getting them into the
+//! net is the caller's seam. ⚠️ An earlier version of this header claimed
+//! "§6.2 refused `POST /v1/tx`" — **the design repo contains no such
+//! refusal** (what §6.2 rules is topological: a committee-key host exposes
+//! nothing beyond P2P). The submission route was an undecided seam, and it is
+//! now DECIDED: `t1-wallet-send-seams-decision.md`, STAMPED 2026-08-06,
+//! A1 — `POST /v1/tx` on the stamped keyless public host (issues #275/#276).
 
 use qlab_air::narrow::{
     build_bucket_dummy1, build_bucket_with_witnesses, derive_input, derive_output_rho,

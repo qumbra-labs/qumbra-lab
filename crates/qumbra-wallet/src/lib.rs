@@ -10,8 +10,11 @@
 //!
 //! `send` is WRITTEN, NOT ACCEPTED (t1-readiness-plan §3): [`send`] builds and
 //! REALLY proves against the merged #219 latch (lab PR #252), writes the
-//! canonical wire bytes to a file — and does not submit, because no public
-//! submission surface exists by decision (§6.2); the seam stays named.
+//! canonical wire bytes to a file — and does not submit yet. The submission
+//! seam is no longer open: `t1-wallet-send-seams-decision.md` (STAMPED
+//! 2026-08-06, A1+B1) decides `POST /v1/tx` + the `/v1/tree/leaves` stream,
+//! and #276 wires this CLI to both once the server half (#275) serves them.
+//! [`sync`] is that baton's wallet half: the verified local commitment tree.
 //! Deliberately absent: any embedded node (scan is an HTTP client) · GUI/QR
 //! (the shells' business — see the design repo's wallet briefs).
 //!
