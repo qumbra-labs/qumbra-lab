@@ -121,6 +121,23 @@ pub fn build_send(
              scan disagree; refusing rather than proving against the wrong anchor"
                 .to_string()
         })?;
+        // The note is in the tree, but is it inside the ANCHOR? `auth_path`
+        // would happily cut a path for a leaf past `anchor_count`, and the
+        // result folds to something that is not the anchor root — a perfectly
+        // well-formed proof of a false statement, which costs ~3 s and ~12 GB
+        // to produce and comes back `refused: proof-invalid` with no hint that
+        // the real problem was finality. A wallet whose note landed in a block
+        // the chain has not finalized yet is in an ordinary, temporary state
+        // and deserves to be told so (issue #276).
+        if pos >= anchor_count {
+            return Err(format!(
+                "this note is at tree position {pos}, which is outside the anchor at \
+                 {anchor_count} leaves — its block is not finalized yet. A witness can only be \
+                 built against a finalized anchor, so this spend is not possible YET; it becomes \
+                 possible with no action once finality advances past that block. Refusing here \
+                 rather than proving a statement the chain would reject."
+            ));
+        }
         witnesses.push(tree.auth_path(pos, anchor_count));
         inputs.push(inp);
     }
@@ -272,6 +289,44 @@ pub fn os_rng() -> StdRng {
 mod tests {
     use super::*;
     use qlab_wallet::seed::MasterSeed;
+
+    /// A note whose block is not finalized yet is IN the local tree but OUTSIDE
+    /// the anchor. Refused by name, before the prove — because `auth_path`
+    /// would otherwise cut a path past `anchor_count` and produce a
+    /// well-formed proof of a false statement, at ~3 s and ~12 GB, whose only
+    /// symptom would be `refused: proof-invalid` (issue #276).
+    ///
+    /// No prove happens on this path, so this test is NOT release-gated.
+    #[test]
+    fn a_note_outside_the_anchor_is_refused_before_any_proof() {
+        let mut rng = StdRng::seed_from_u64(0x0AC7);
+        let wallet = Wallet::from_master_seed(&MasterSeed::from_entropy([31u8; 32]), 0);
+        let recipient =
+            Wallet::from_master_seed(&MasterSeed::from_entropy([32u8; 32]), 0).address_at_index(0);
+
+        let note =
+            Spendable { div_index: 0, value: 10_000_000, rho: [3, 3, 3, 3], rseed: [5, 5, 5, 5] };
+        let d = wallet.diversifier_at_index(0);
+        let inp = wallet.spend_input(note.value, note.rho, note.rseed, d);
+        let (_nk, _nf, cm) = derive_input(&inp);
+
+        // Two earlier leaves are finalized; this note is the third, in a block
+        // finality has not reached — so the anchor is at 2 and the note is at 2.
+        let mut tree = CommitmentTree::new();
+        tree.append([1, 1, 1, 1]);
+        tree.append([2, 2, 2, 2]);
+        tree.append(cm);
+        assert_eq!(tree.position_of(&cm), Some(2));
+
+        let err = match build_send(&wallet, &[note], &recipient, 4_000_000, &tree, 2, &mut rng) {
+            Err(e) => e,
+            Ok(_) => panic!("a note outside the anchor must refuse, not prove"),
+        };
+        assert!(err.contains("position 2"), "{err}");
+        assert!(err.contains("outside the anchor at 2 leaves"), "{err}");
+        assert!(err.contains("not finalized yet"), "{err}");
+        assert!(err.contains("not possible YET"), "the state is temporary and says so: {err}");
+    }
 
     /// One real spend, end to end, through the merged post-mint circuit: build a
     /// tree, put a note this wallet owns in it, send half of it to a stranger,
