@@ -9,12 +9,15 @@
 //! ~12 GB release) → encrypt outputs to their owners (ML-KEM, the #188 (a)
 //! payloads) → assemble the [`TxEntry`] the wire commits to.
 //!
-//! What it deliberately does NOT do: **submit.** There is no public tx
-//! submission surface on this net by decision (§6.2 refused `POST /v1/tx`);
-//! the only ways in are P2P gossip (needs a node) or `submit_local_tx`
-//! (in-process with a node, the faucet's shape). The artifact is the
-//! canonical wire bytes (`qlab_p2p::codec::encode_tx`) written to a file, and
-//! the submission seam is a NAMED open decision, not a hidden gap.
+//! What it deliberately does NOT do: **submit.** This module ends at the
+//! canonical wire bytes (`qlab_p2p::codec::encode_tx`); getting them into the
+//! net is [`crate::net::submit_tx`]'s job, over `POST /v1/tx`. ⚠️ An earlier
+//! version of this header claimed
+//! "§6.2 refused `POST /v1/tx`" — **the design repo contains no such
+//! refusal** (what §6.2 rules is topological: a committee-key host exposes
+//! nothing beyond P2P). The submission route was an undecided seam, and it is
+//! now DECIDED: `t1-wallet-send-seams-decision.md`, STAMPED 2026-08-06,
+//! A1 — `POST /v1/tx` on the stamped keyless public host (issues #275/#276).
 
 use qlab_air::narrow::{
     build_bucket_dummy1, build_bucket_with_witnesses, derive_input, derive_output_rho,
@@ -59,8 +62,14 @@ pub struct SendArtifact {
 
 /// Build + PROVE a spend of `amount` to `recipient`, change to this wallet's
 /// address [0]. `tree` must be the chain's commitment tree at `anchor_count`
-/// leaves — the caller owns that correspondence (and on a real net, obtaining
-/// it is the open question this module's docs name).
+/// leaves, and `anchor_count`'s root must be one the network accepts as an
+/// **anchor** — the caller owns that correspondence.
+///
+/// On a real net [`crate::sync::sync_and_select`] is what establishes it, and
+/// it is not a formality: a valid anchor is a *finalized* root, so the count
+/// here is generally **not** the count the leaf stream just served (issue
+/// #276). Passing the freshly-synced tip count builds a perfectly valid proof
+/// of a statement the node will refuse as `anchor-not-valid`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_send(
     wallet: &Wallet,
@@ -112,6 +121,23 @@ pub fn build_send(
              scan disagree; refusing rather than proving against the wrong anchor"
                 .to_string()
         })?;
+        // The note is in the tree, but is it inside the ANCHOR? `auth_path`
+        // would happily cut a path for a leaf past `anchor_count`, and the
+        // result folds to something that is not the anchor root — a perfectly
+        // well-formed proof of a false statement, which costs ~3 s and ~12 GB
+        // to produce and comes back `refused: proof-invalid` with no hint that
+        // the real problem was finality. A wallet whose note landed in a block
+        // the chain has not finalized yet is in an ordinary, temporary state
+        // and deserves to be told so (issue #276).
+        if pos >= anchor_count {
+            return Err(format!(
+                "this note is at tree position {pos}, which is outside the anchor at \
+                 {anchor_count} leaves — its block is not finalized yet. A witness can only be \
+                 built against a finalized anchor, so this spend is not possible YET; it becomes \
+                 possible with no action once finality advances past that block. Refusing here \
+                 rather than proving a statement the chain would reject."
+            ));
+        }
         witnesses.push(tree.auth_path(pos, anchor_count));
         inputs.push(inp);
     }
@@ -263,6 +289,44 @@ pub fn os_rng() -> StdRng {
 mod tests {
     use super::*;
     use qlab_wallet::seed::MasterSeed;
+
+    /// A note whose block is not finalized yet is IN the local tree but OUTSIDE
+    /// the anchor. Refused by name, before the prove — because `auth_path`
+    /// would otherwise cut a path past `anchor_count` and produce a
+    /// well-formed proof of a false statement, at ~3 s and ~12 GB, whose only
+    /// symptom would be `refused: proof-invalid` (issue #276).
+    ///
+    /// No prove happens on this path, so this test is NOT release-gated.
+    #[test]
+    fn a_note_outside_the_anchor_is_refused_before_any_proof() {
+        let mut rng = StdRng::seed_from_u64(0x0AC7);
+        let wallet = Wallet::from_master_seed(&MasterSeed::from_entropy([31u8; 32]), 0);
+        let recipient =
+            Wallet::from_master_seed(&MasterSeed::from_entropy([32u8; 32]), 0).address_at_index(0);
+
+        let note =
+            Spendable { div_index: 0, value: 10_000_000, rho: [3, 3, 3, 3], rseed: [5, 5, 5, 5] };
+        let d = wallet.diversifier_at_index(0);
+        let inp = wallet.spend_input(note.value, note.rho, note.rseed, d);
+        let (_nk, _nf, cm) = derive_input(&inp);
+
+        // Two earlier leaves are finalized; this note is the third, in a block
+        // finality has not reached — so the anchor is at 2 and the note is at 2.
+        let mut tree = CommitmentTree::new();
+        tree.append([1, 1, 1, 1]);
+        tree.append([2, 2, 2, 2]);
+        tree.append(cm);
+        assert_eq!(tree.position_of(&cm), Some(2));
+
+        let err = match build_send(&wallet, &[note], &recipient, 4_000_000, &tree, 2, &mut rng) {
+            Err(e) => e,
+            Ok(_) => panic!("a note outside the anchor must refuse, not prove"),
+        };
+        assert!(err.contains("position 2"), "{err}");
+        assert!(err.contains("outside the anchor at 2 leaves"), "{err}");
+        assert!(err.contains("not finalized yet"), "{err}");
+        assert!(err.contains("not possible YET"), "the state is temporary and says so: {err}");
+    }
 
     /// One real spend, end to end, through the merged post-mint circuit: build a
     /// tree, put a note this wallet owns in it, send half of it to a stranger,

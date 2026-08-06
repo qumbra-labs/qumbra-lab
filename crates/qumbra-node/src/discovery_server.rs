@@ -14,7 +14,7 @@
 //!
 //! ## What it is, and what it deliberately is not
 //!
-//! Three routes — the deployed binary's whole wallet-facing surface:
+//! Four routes — the deployed binary's whole wallet-facing surface:
 //!
 //! - `GET /v1/compact?from=&to=` — [`qlab_node::compact_response`]'s bytes, the
 //!   same encoder, over the same projection, that `NodeRpc` serves in-process
@@ -26,6 +26,16 @@
 //!   which positions matter to it. `/v1/tree/frontier` stays unserved on
 //!   purpose — a frontier reconstructs the root only, structurally, and a root
 //!   is not a witness.
+//! - `GET /v1/anchors` — the roots that are valid anchors **right now**
+//!   ([`qlab_node::AnchorSet`], issue #276). The other half of the witness
+//!   story, and not an optional one: a valid anchor is a *finalized* root,
+//!   while the leaf stream's `total` is the live count at the applied tip. A
+//!   wallet that built at the count it just synced to would declare an
+//!   unfinalized root and be refused `anchor-not-valid` on every net whose
+//!   finality runs on a cadence — so without this route the leaf stream serves
+//!   a witness source nobody can legally spend against. The wallet matches its
+//!   own reconstructed roots against this set locally, so the server still
+//!   learns nothing positional (brief B2 stays rejected).
 //! - `POST /v1/tx` — body = the canonical tx wire bytes
 //!   (`qlab_p2p::codec::encode_tx`, what `build_send` produces). How a
 //!   wallet-built transaction gets **in** (issue #275 / decision brief A1). The
@@ -39,15 +49,16 @@
 //!
 //! Still not the wallet-facing RPC:
 //!
+//! - **`/v1/status` is not served here.** It is not this surface's scope and
+//!   the node already has a versioned health wire (`/v1/telemetry`).
+//!   `/v1/anchors` moved out of that sentence in issue #276 for the reason
+//!   above — it turned out to be load-bearing for spending, not health.
 //! - **`/v1/block/{h}/tx/{i}/full` is not served here.** Since issue #188 (a)
 //!   the AEAD payloads ride in the **committed** discovery region (they are no
 //!   longer side-table-only), but `/v1/compact` deliberately serves the
 //!   `group_contents` prefix and nothing more — that is what keeps its golden
 //!   vector byte-identical. Serving the committed payload section to a detached
 //!   wallet is the discovery lane's open item, not this issue's.
-//! - **`/v1/status`, `/v1/anchors` are not served here.** They are not this
-//!   surface's scope and the node already has a versioned health wire
-//!   (`/v1/telemetry`).
 //!
 //! ## The `POST /v1/tx` response wire, pinned
 //!
@@ -124,6 +135,9 @@ pub const COMPACT_PATH: &str = "/v1/compact";
 
 /// The leaf-stream route (issue #275, decision brief B1) — GET only.
 pub const TREE_LEAVES_PATH: &str = "/v1/tree/leaves";
+
+/// The valid-anchor route (issue #276) — GET only, no query.
+pub const ANCHORS_PATH: &str = "/v1/anchors";
 
 /// The submit route (issue #275, decision brief A1) — POST only.
 pub const TX_SUBMIT_PATH: &str = "/v1/tx";
@@ -377,6 +391,33 @@ pub struct LeavesView {
     pub leaves: Vec<Hash32>,
 }
 
+/// The valid-anchor set the run loop last projected — what `GET /v1/anchors`
+/// serves (issue #276).
+///
+/// Same snapshot discipline as [`LeavesView`], and **safer than it**: every
+/// root here is finalized, and no-reorg-past-finality means a finalized root is
+/// fixed forever. So a stale anchor snapshot can only offer *fewer, older*
+/// anchors than the node would serve live — never a root that was never an
+/// anchor. The one thing staleness can cost is the newest anchor, and a wallet
+/// that builds against a slightly older finalized root is submitting a
+/// perfectly valid transaction.
+///
+/// The set is derived by [`qlab_node::anchor_set`] — the same function
+/// `NodeRpc::anchors` calls, not a second derivation. That matters more here
+/// than usual: `main_chain_counts_of` must track `apply_state`'s append
+/// schedule exactly, and its own doc comment records that miscounting "would
+/// not fail loudly: it would publish anchors nobody can build a witness
+/// against."
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AnchorsView {
+    /// Encoded [`qlab_node::AnchorSet`] bytes, ready to serve.
+    ///
+    /// Held encoded rather than structured because this route has exactly one
+    /// answer and no query: the run loop pays the encode once per refresh
+    /// instead of once per request, and a poller cannot make the server work.
+    pub encoded: Vec<u8>,
+}
+
 /// A running discovery-server endpoint: bound address + worker thread + the
 /// shared projections the run loop refreshes + the submit queue it drains.
 pub struct DiscoveryServer {
@@ -407,6 +448,7 @@ impl DiscoveryServer {
         addr: &str,
         view: Arc<Mutex<Arc<DiscoveryView>>>,
         leaves: Arc<Mutex<Arc<LeavesView>>>,
+        anchors: Arc<Mutex<Arc<AnchorsView>>>,
         submits: mpsc::SyncSender<SubmitRequest>,
     ) -> io::Result<Self> {
         let server = tiny_http::Server::http(addr).map_err(|e| {
@@ -472,11 +514,18 @@ impl DiscoveryServer {
                         };
                         respond_leaves(&snapshot, query)
                     }
+                    ANCHORS_PATH => {
+                        let snapshot = match anchors.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(p) => Arc::clone(&p.into_inner()),
+                        };
+                        Ok(snapshot.encoded.clone())
+                    }
                     _ => Err((
                         404,
                         format!(
                             "not found: try {COMPACT_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, \
-                             or POST {TX_SUBMIT_PATH}"
+                             {ANCHORS_PATH}, or POST {TX_SUBMIT_PATH}"
                         ),
                     )),
                 };
@@ -681,13 +730,26 @@ mod tests {
         view: Arc<Mutex<Arc<DiscoveryView>>>,
         leaves: Arc<Mutex<Arc<LeavesView>>>,
     ) -> (DiscoveryServer, mpsc::Receiver<SubmitRequest>) {
+        serve_with(view, leaves, no_anchors())
+    }
+
+    fn serve_with(
+        view: Arc<Mutex<Arc<DiscoveryView>>>,
+        leaves: Arc<Mutex<Arc<LeavesView>>>,
+        anchors: Arc<Mutex<Arc<AnchorsView>>>,
+    ) -> (DiscoveryServer, mpsc::Receiver<SubmitRequest>) {
         let (tx, rx) = mpsc::sync_channel(MAX_QUEUED_SUBMITS);
-        let srv = DiscoveryServer::start("127.0.0.1:0", view, leaves, tx).expect("bind");
+        let srv =
+            DiscoveryServer::start("127.0.0.1:0", view, leaves, anchors, tx).expect("bind");
         (srv, rx)
     }
 
     fn no_leaves() -> Arc<Mutex<Arc<LeavesView>>> {
         Arc::new(Mutex::new(Arc::new(LeavesView::default())))
+    }
+
+    fn no_anchors() -> Arc<Mutex<Arc<AnchorsView>>> {
+        Arc::new(Mutex::new(Arc::new(AnchorsView::default())))
     }
 
     /// A minimal HTTP/1.1 POST crossing a real socket.
@@ -706,6 +768,77 @@ mod tests {
         let status = String::from_utf8_lossy(&raw[..sep]).lines().next().unwrap_or_default().to_string();
         let body = String::from_utf8_lossy(&raw[sep + 4..]).to_string();
         (status, body)
+    }
+
+    /// `/v1/anchors` serves `AnchorSet`'s own wire, decodable by the same
+    /// decoder a wallet uses — the route issue #276 added because without it
+    /// the leaf stream is a witness source nobody can legally spend against.
+    #[test]
+    fn serves_the_anchor_set_over_a_real_socket_and_a_wallet_decodes_it() {
+        let set = qlab_node::AnchorSet {
+            tip_height: 40,
+            finalized_height: Some(33),
+            max_age_blocks: 1152,
+            roots: vec![[0x11; 32], [0x22; 32]],
+        };
+        let anchors = Arc::new(Mutex::new(Arc::new(AnchorsView { encoded: set.to_bytes() })));
+        let (srv, _submits) =
+            serve_with(Arc::new(Mutex::new(Arc::new(a_view()))), no_leaves(), Arc::clone(&anchors));
+        let addr = srv.addr();
+
+        let (status, body) = get(addr, "/v1/anchors");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        assert_eq!(
+            qlab_node::AnchorSet::from_bytes(&body).expect("the wallet's own decoder reads it"),
+            set,
+            "served bytes ARE the AnchorSet wire — no second encoding"
+        );
+
+        // A refreshed snapshot is what the next read sees (the Arc-swap).
+        let grown = qlab_node::AnchorSet {
+            tip_height: 41,
+            finalized_height: Some(40),
+            max_age_blocks: 1152,
+            roots: vec![[0x33; 32], [0x11; 32], [0x22; 32]],
+        };
+        *anchors.lock().unwrap() = Arc::new(AnchorsView { encoded: grown.to_bytes() });
+        let (_, body2) = get(addr, "/v1/anchors");
+        assert_eq!(qlab_node::AnchorSet::from_bytes(&body2).unwrap(), grown);
+
+        srv.shutdown();
+    }
+
+    /// A node with nothing finalized serves an EMPTY anchor set, not a 404 and
+    /// not an error: "there is nothing to anchor against yet" is a real state a
+    /// young chain is in, and the wallet renders it as its own named refusal.
+    #[test]
+    fn a_chain_with_nothing_finalized_serves_an_empty_set_not_an_error() {
+        let empty = qlab_node::AnchorSet {
+            tip_height: 7,
+            finalized_height: None,
+            max_age_blocks: 1152,
+            roots: vec![],
+        };
+        let (srv, _submits) = serve_with(
+            Arc::new(Mutex::new(Arc::new(a_view()))),
+            no_leaves(),
+            Arc::new(Mutex::new(Arc::new(AnchorsView { encoded: empty.to_bytes() }))),
+        );
+        let (status, body) = get(srv.addr(), "/v1/anchors");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        let got = qlab_node::AnchorSet::from_bytes(&body).unwrap();
+        assert!(got.roots.is_empty());
+        assert_eq!(got.finalized_height, None);
+        srv.shutdown();
+    }
+
+    /// Read-only means read-only on the new route too.
+    #[test]
+    fn the_anchor_route_refuses_a_non_get() {
+        let (srv, _submits) = serve(Arc::new(Mutex::new(Arc::new(a_view()))), no_leaves());
+        let (status, _) = post(srv.addr(), "/v1/anchors", b"");
+        assert!(status.starts_with("HTTP/1.1 405"), "{status}");
+        srv.shutdown();
     }
 
     #[test]
@@ -736,17 +869,20 @@ mod tests {
     /// particular stay 404s (see the module docs), and the read routes stay
     /// GET-only even now that a write route exists beside them.
     #[test]
-    fn only_the_three_routes_are_served_and_methods_are_gated() {
+    fn only_the_four_routes_are_served_and_methods_are_gated() {
         let view = Arc::new(Mutex::new(Arc::new(a_view())));
         let (srv, _submits) = serve(Arc::clone(&view), no_leaves());
         let addr = srv.addr();
 
+        // `/v1/anchors` is NOT in this list any more: issue #276 made it a
+        // served route, because a wallet cannot pick a legal `anchor_count`
+        // without it. `/v1/tree/frontier` stays unserved on purpose — a
+        // frontier reconstructs a root, and a root is not a witness.
         for path in [
             "/",
             "/metrics",
             "/v1/telemetry",
             "/v1/status",
-            "/v1/anchors",
             "/v1/tree/frontier?at=1",
             "/v1/block/1/tx/0/full",
         ] {
@@ -783,7 +919,7 @@ mod tests {
     fn an_unbindable_address_is_an_error_and_the_message_names_the_opt_out() {
         let view = Arc::new(Mutex::new(Arc::new(DiscoveryView::default())));
         let (tx, _rx) = mpsc::sync_channel(1);
-        let err = match DiscoveryServer::start("256.256.256.256:9", view, no_leaves(), tx) {
+        let err = match DiscoveryServer::start("256.256.256.256:9", view, no_leaves(), no_anchors(), tx) {
             Err(e) => e,
             Ok(_) => panic!("that address cannot be bound"),
         };
@@ -956,7 +1092,8 @@ mod tests {
         let view = Arc::new(Mutex::new(Arc::new(a_view())));
         let (tx, _rx) = mpsc::sync_channel(MAX_QUEUED_SUBMITS);
         let srv =
-            DiscoveryServer::start("127.0.0.1:0", view, no_leaves(), tx.clone()).expect("bind");
+            DiscoveryServer::start("127.0.0.1:0", view, no_leaves(), no_anchors(), tx.clone())
+                .expect("bind");
         let addr = srv.addr();
 
         // Fill the queue with requests nobody answers.

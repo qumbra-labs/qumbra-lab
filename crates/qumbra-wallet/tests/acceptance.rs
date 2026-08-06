@@ -228,3 +228,61 @@ fn scan_against_the_reference_fixture_renders_a_complete_report() {
     assert!(report.contains(&format!("TOTAL spendable: {spendable} bessel")), "{report}");
     assert!(!report.contains(UNAVAILABLE), "{report}");
 }
+
+/// `send`'s usage text and its pre-prove refusals, as a real process (issue
+/// #276). None of these reach `build_send`, so none pay a proof — the cases
+/// that DO prove live in `e2e_first_spend`.
+#[test]
+fn send_names_its_endpoints_and_refuses_before_it_proves() {
+    let dir = tmp("send_refusals");
+    let d = dir.to_str().unwrap();
+    let (_, err, ok) = run(&["keygen", "--dir", d], None);
+    assert!(ok, "{err}");
+
+    // The usage text describes what send DOES. The old text said there was
+    // deliberately no send, and named one blocker where three existed — the
+    // brief's hygiene item.
+    let (_, usage, _) = run(&["--help"], None);
+    assert!(usage.contains("POST /v1/tx"), "usage names the submit route: {usage}");
+    assert!(usage.contains("/v1/tree/leaves"), "…and the witness source: {usage}");
+    assert!(usage.contains("/v1/anchors"), "…and the anchor source: {usage}");
+    assert!(!usage.contains("deliberately no `send`"), "the stale claim is gone: {usage}");
+    assert!(
+        !usage.contains("does NOT submit"),
+        "and the stale 'no public submission surface exists' claim with it: {usage}"
+    );
+
+    // A missing required flag is named, not a panic.
+    let (_, err, ok) = run(&["send", "--dir", d, "--url", "http://127.0.0.1:1"], None);
+    assert!(!ok);
+    assert!(err.contains("--scan-to"), "{err}");
+
+    // A bad address is refused before any network call.
+    let (_, err, ok) = run(
+        &[
+            "send", "--dir", d, "--url", "http://127.0.0.1:1", "--scan-to", "1", "--to",
+            "not-an-address", "--amount", "1",
+        ],
+        None,
+    );
+    assert!(!ok);
+    assert!(err.contains("qaddr1"), "{err}");
+
+    // A dead endpoint is a named scan refusal — never a zero balance, and
+    // never a proof attempted against nothing.
+    let addr = qumbra_wallet::store::WalletDir::open(&dir)
+        .expect("open")
+        .wallet()
+        .address_at_index(0)
+        .encode();
+    let (_, err, ok) = run(
+        &[
+            "send", "--dir", d, "--url", "http://127.0.0.1:1", "--scan-to", "1", "--to", &addr,
+            "--amount", "1",
+        ],
+        None,
+    );
+    assert!(!ok);
+    assert!(err.contains("scan never started"), "a dead endpoint is named: {err}");
+    assert!(!err.contains("proving"), "nothing was proved: {err}");
+}

@@ -36,7 +36,24 @@ qlab-air = { path = "../qlab-air" }
 qlab-consensus = { path = "../qlab-consensus" }
 qlab-devnet = { path = "../qlab-devnet" }
 qlab-p2p = { path = "../qlab-p2p" }
+# The served wires this wallet consumes, decoded by their OWN codecs, never a
+# second reading of them: `TreeLeaves` (golden-frozen by #275, stamp rider 1)
+# and `AnchorSet`. Adds NO crate to the build — qlab-p2p above already depends
+# on qlab-node, so this promotes a transitive dependency to a declared one.
+# The wallet still runs no node (the brief's A2 rejection): it uses the codecs.
+qlab-node = { path = "../qlab-node" }
 bincode = "1"
 # Only for the send test's declared-surface comparison (PrimeField32 → u32),
 # same pin as qlab-consensus.
 p3-field = "=0.6.1"
+
+# The first-spend e2e (issue #276) runs a REAL local devnet: a node the test
+# mines directly and serves over a real socket, the faucet that funds the
+# sender, and the production verifier. Dev-only — the wallet itself stays
+# nodeless (the brief's A2 rejection); nothing below enters the library's
+# dependency graph. (`qlab-node` is NOT repeated here: it is a real dependency
+# above, for the served wires' codecs.)
+[dev-dependencies]
+qlab-faucet = { path = "../qlab-faucet" }
+qumbra-faucet = { path = "../qumbra-faucet" }
+qumbra-node = { path = "../qumbra-node" }

@@ -574,21 +574,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
     /// within the age window), newest first, plus the window context a wallet
     /// needs. Enumerated over the main chain using only the public node API.
     pub fn anchors(&self) -> AnchorSet {
-        let mut roots = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        // Walk main chain tip→genesis, accumulating leaf counts, and test each
-        // height's root for anchor validity.
-        for (_, root) in self.main_chain_roots().into_iter().rev() {
-            if self.node.is_valid_anchor(&root) && seen.insert(root) {
-                roots.push(root);
-            }
-        }
-        AnchorSet {
-            tip_height: self.node.tip_height(),
-            finalized_height: self.node.finalized_height(),
-            max_age_blocks: MAX_ANCHOR_AGE_BLOCKS,
-            roots,
-        }
+        anchor_set(&self.node)
     }
 
     /// Stamp in the network-layer facts the node cannot observe itself (peer
@@ -666,22 +652,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
     /// The main chain, genesis-first, as stored blocks (walks tip→genesis via
     /// `header.prev`, then reverses).
     fn main_chain(&self) -> Vec<StoredBlock> {
-        let chain = self.node.chain();
-        let mut out = Vec::new();
-        let mut hash = chain.tip_hash();
-        loop {
-            let Some(block) = chain.block(&hash) else { break };
-            let block = block.clone();
-            let prev = block.header.prev;
-            let height = block.header.height;
-            out.push(block);
-            if height == 0 {
-                break;
-            }
-            hash = prev;
-        }
-        out.reverse();
-        out
+        main_chain_of(&self.node)
     }
 
     /// `(height, commitment-count-after-this-block)` for each main-chain height.
@@ -699,35 +670,9 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
     /// chain store, and this walks the main chain it already materialised. That is
     /// what issue #116 asked for, and (b) is why it stopped being optional.
     fn main_chain_counts(&self) -> Vec<(u64, u64)> {
-        let chain = self.main_chain();
-        let by_height: HashMap<u64, &StoredBlock> =
-            chain.iter().map(|b| (b.header.height, b)).collect();
-        let mut count = 0u64;
-        chain
-            .iter()
-            .map(|b| {
-                let matured = crate::coinbase::matured_coinbase_leaf(b.header.height, |minted_at| {
-                    by_height.get(&minted_at).map(|a| a.body())
-                });
-                if matured.is_some() {
-                    count += 1;
-                }
-                count += b.txs.iter().map(|t| t.commitments.len() as u64).sum::<u64>();
-                (b.header.height, count)
-            })
-            .collect()
+        main_chain_counts_of(&self.node)
     }
 
-    /// `(height, root-after-this-block)` for each main-chain height, recomputed
-    /// from the live tree prefix — reproduces the node's per-height anchor roots
-    /// without touching private state.
-    fn main_chain_roots(&self) -> Vec<(u64, Hash32)> {
-        let tree = self.node.commitments().tree();
-        self.main_chain_counts()
-            .into_iter()
-            .map(|(h, c)| (h, digest_bytes(&tree.root_at(c))))
-            .collect()
-    }
 
     /// Leaf count of the commitment tree at the end of `height` (clamped to the
     /// live tree). Heights beyond the tip clamp to the full tree.
@@ -975,6 +920,112 @@ impl AnchorSet {
         }
         r.finish()?;
         Ok(AnchorSet { tip_height, finalized_height, max_age_blocks, roots })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The main-chain projections, over a bare `Node`
+// ---------------------------------------------------------------------------
+//
+// These were `NodeRpc` methods until issue #276. They are free functions over
+// `&Node` for the same reason `TreeLeaves::page` is a free-standing function
+// (issue #275): the deployed binary composes **no `NodeRpc`**, so anything only
+// reachable through one is unreachable from `qumbra-node`'s discovery server —
+// and a second implementation of the anchor derivation is exactly the drift
+// `main_chain_counts`' own doc comment warns about, where miscounting "would
+// not fail loudly: it would publish anchors nobody can build a witness
+// against." `NodeRpc`'s methods now delegate here, so there is one.
+
+/// The main chain, genesis-first, as stored blocks (walks tip→genesis via
+/// `header.prev`, then reverses).
+pub fn main_chain_of<C: ChainStore, N: NullifierStore, T: CommitmentStore>(
+    node: &Node<C, N, T>,
+) -> Vec<StoredBlock> {
+    let chain = node.chain();
+    let mut out = Vec::new();
+    let mut hash = chain.tip_hash();
+    loop {
+        let Some(block) = chain.block(&hash) else { break };
+        let block = block.clone();
+        let prev = block.header.prev;
+        let height = block.header.height;
+        out.push(block);
+        if height == 0 {
+            break;
+        }
+        hash = prev;
+    }
+    out.reverse();
+    out
+}
+
+/// `(height, commitment-count-after-this-block)` for each main-chain height.
+/// See [`NodeRpc::main_chain_counts`]'s doc comment for why this must track
+/// `apply_state`'s append schedule exactly.
+pub fn main_chain_counts_of<C: ChainStore, N: NullifierStore, T: CommitmentStore>(
+    node: &Node<C, N, T>,
+) -> Vec<(u64, u64)> {
+    let chain = main_chain_of(node);
+    let by_height: HashMap<u64, &StoredBlock> =
+        chain.iter().map(|b| (b.header.height, b)).collect();
+    let mut count = 0u64;
+    chain
+        .iter()
+        .map(|b| {
+            let matured = crate::coinbase::matured_coinbase_leaf(b.header.height, |minted_at| {
+                by_height.get(&minted_at).map(|a| a.body())
+            });
+            if matured.is_some() {
+                count += 1;
+            }
+            count += b.txs.iter().map(|t| t.commitments.len() as u64).sum::<u64>();
+            (b.header.height, count)
+        })
+        .collect()
+}
+
+/// `(height, root-after-this-block)` for each main-chain height, recomputed
+/// from the live tree prefix.
+pub fn main_chain_roots_of<C: ChainStore, N: NullifierStore, T: CommitmentStore>(
+    node: &Node<C, N, T>,
+) -> Vec<(u64, Hash32)> {
+    let tree = node.commitments().tree();
+    main_chain_counts_of(node)
+        .into_iter()
+        .map(|(h, c)| (h, digest_bytes(&tree.root_at(c))))
+        .collect()
+}
+
+/// The set of commitment roots that are valid anchors right now (finalized +
+/// within the age window), newest first, plus the window context a wallet
+/// needs (`/v1/anchors`).
+///
+/// **Why a wallet cannot do without this** (issue #276): a valid anchor is a
+/// *finalized* root ([`crate::NodeState::is_valid_anchor`]), while the leaf
+/// stream's `total` is the live count at the **applied tip**. A wallet that
+/// built its witness at the count it just synced to would declare an
+/// unfinalized root and be refused `anchor-not-valid` on every net whose
+/// finality runs on a cadence. This is how it learns which of its local leaf
+/// counts it may legally build at — it matches its own reconstructed roots
+/// against this set, so the server still learns nothing positional (the B2
+/// rejection holds).
+pub fn anchor_set<C: ChainStore, N: NullifierStore, T: CommitmentStore>(
+    node: &Node<C, N, T>,
+) -> AnchorSet {
+    let mut roots = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // Walk main chain tip→genesis, accumulating leaf counts, and test each
+    // height's root for anchor validity.
+    for (_, root) in main_chain_roots_of(node).into_iter().rev() {
+        if node.is_valid_anchor(&root) && seen.insert(root) {
+            roots.push(root);
+        }
+    }
+    AnchorSet {
+        tip_height: node.tip_height(),
+        finalized_height: node.finalized_height(),
+        max_age_blocks: MAX_ANCHOR_AGE_BLOCKS,
+        roots,
     }
 }
 

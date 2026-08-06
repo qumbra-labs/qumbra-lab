@@ -182,12 +182,16 @@ fn a_recipient_finds_its_output_from_a_restarted_nodes_committed_discovery() {
     assert!(view.refresh(reopened.chain()), "the projection comes off the reopened store");
     let served_bytes = view.len_bytes();
     let shared = Arc::new(Mutex::new(Arc::new(view)));
-    // The leaves view and submit queue are #275's other routes — empty and
-    // unconsumed here on purpose: this test is about `/v1/compact` alone.
+    // The leaves view, anchor set and submit queue are the other routes
+    // (#275/#276) — empty and unconsumed here on purpose: this test is about
+    // `/v1/compact` alone.
     let leaves = Arc::new(Mutex::new(Arc::new(qumbra_node::discovery_server::LeavesView::default())));
+    let anchors =
+        Arc::new(Mutex::new(Arc::new(qumbra_node::discovery_server::AnchorsView::default())));
     let (submit_tx, _submit_rx) = std::sync::mpsc::sync_channel(1);
     let server =
-        DiscoveryServer::start("127.0.0.1:0", Arc::clone(&shared), leaves, submit_tx).expect("bind");
+        DiscoveryServer::start("127.0.0.1:0", Arc::clone(&shared), leaves, anchors, submit_tx)
+            .expect("bind");
     let addr = server.addr();
 
     // ---- 3. The wallet. Only `dk`, only what the socket returns. -----------

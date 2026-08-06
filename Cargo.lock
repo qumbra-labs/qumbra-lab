@@ -1231,9 +1231,13 @@ dependencies = [
  "qlab-cbserver",
  "qlab-consensus",
  "qlab-devnet",
+ "qlab-faucet",
+ "qlab-node",
  "qlab-note",
  "qlab-p2p",
  "qlab-wallet",
+ "qumbra-faucet",
+ "qumbra-node",
  "rand",
 ]
 
