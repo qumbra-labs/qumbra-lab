@@ -521,6 +521,74 @@ included pool has been exhausted, so *"the pre-filter has never cost money"* is 
 about the past. It does not weaken the split; it strengthens it, because the $60 alert-only
 product budget is now watching a flow that genuinely spends rather than one that could not.
 
+### Measured update (2026-08-07) — the cadence collapsed, and one 08-04 figure does not reproduce
+
+Same two APIs §10 used (`/organizations/qumbra-labs/settings/billing/{usage,budgets}`), so the
+rows below compare line-for-line with the tables above.
+
+**1. The split is in force.** `GET …/settings/billing/budgets` returns exactly §10's table:
+`SkuPricing` on `actions_linux_8_core_arm` at **$50, `prevent_further_usage: true`**, and
+`ProductPricing` on `actions` at **$60, `prevent_further_usage: false`**, both alerting to
+`lai3d`. §10 said *"Verification is the same API"*; this is that verification, four days on.
+
+**2. Spend, and it is still one SKU.**
+
+| sku | quantity | gross | discount | **net** |
+|---|---|---|---|---|
+| `Actions Linux ARM 8-core` | 1,049 min | $14.69 | $0.00 | **$14.69** |
+| `Actions Linux` (standard) | 250 min | $1.50 | $1.50 | **$0.00** |
+| `Actions storage` | 0 | $0.00 | — | **$0.00** |
+
+100 % of net spend is attributed to `qumbra-lab`. The implied rate is $14.69 / 1,049 =
+**$0.014/min**, unchanged from §10.
+
+**3. 🔴 The ~$54 projection is not tracking, because the cadence collapsed.** §10's recalibration
+measured **3.03 acceptances/day** and projected ~$54 for the month. Since that reading:
+
+| | 2026-08-03 (§10) | 2026-08-07 | delta |
+|---|---|---|---|
+| ARM 8-core minutes | 1,010 | 1,049 | **+39 ≈ one acceptance** |
+| net spend | $14.14 | $14.69 | **+$0.55** |
+
+**One acceptance in four days is ≈0.25/day, an order of magnitude under the projection.** At the
+observed four-day rate the $50 is not reachable this month, and §10's *"it will trip near month
+end"* is currently false. Possible cause, offered and **not asserted**: the week's lab work has
+been single-crate batons (#281, #284) whose task books explicitly took targeted tests and **no
+rig or acceptance slot**. If that is it, the cadence returns with the next consensus-surface
+baton and so does the projection — do not read four quiet days as a new baseline.
+
+**4. ⚠️ The 08-04 amendment saying the included pool is exhausted does not reproduce.** It
+recorded standard minutes at *"171 min, $1.03"* and concluded *"the included pool has been
+exhausted, so 'the pre-filter has never cost money' is now a statement about the past."*
+Measured today: **250 min, gross $1.50, discount $1.50, net $0.00**, and the billing overview
+independently shows **243 / 3,000 included minutes used — 8 %.** Two surfaces agree the pool is
+nowhere near exhausted.
+
+The likeliest explanation, stated as likely rather than certain because the 08-04 raw response is
+not recoverable: a **gross-vs-net read.** The usage API reports `grossAmount`, `discountAmount`
+and `netAmount` separately and **only `netAmount` is billed** — $1.03 has the shape of a gross
+figure whose discount was not subtracted.
+
+**The consequence matters more than the arithmetic.** §10 argued the split was strengthened
+because the $60 product budget had come to watch *"a flow that genuinely spends rather than one
+that could not"*. On today's data that flow still spends **nothing** — so the $60 remains an
+early warning for something that has not started, which is what §10 designed it to be. The split
+is not weakened by this; one sentence of its justification is.
+
+**5. A second repository joined the org and costs nothing.** `qumbra-labs/qumbra-explorer-web`
+(created 2026-08-06) runs two workflows, both `ubuntu-latest`: `test.yml` (sub-second) and
+`image.yml` (a COPY-only multi-arch build, **no QEMU and no arm64 runner** — the Dockerfile has
+no `RUN`, so nothing executes on the target platform). It **does not appear in the usage data at
+all**, and its SKU is the one that nets $0. Recorded because a new repo with CI is the obvious
+thing to blame for a billing figure, and here the usage API attributes 100 % of net spend to
+`qumbra-lab`.
+
+**6. How to read this document, which now carries four spend figures in four sections.** $9.31
+(§4, 08-02), $14.14 (§10, 08-03), the $1.03 above (08-04, and item 4 retracts it), $14.69 (here).
+**Compare against the newest, not the first one found.** This update exists partly because that
+mistake was made on the way to writing it: reading a fresh billing screenshot against §4's $9.31
+suggested a steep climb, when §10 already held $14.14 and the true four-day delta is $0.55.
+
 ### One boundary this does not move
 
 `packages` stays at $0 with stop usage **on**. The node image on GHCR is public and public-package
