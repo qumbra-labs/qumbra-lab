@@ -1,14 +1,20 @@
 //! The explorer's own TOML config, and the observer posture it enforces.
 //!
-//! Three refusals, all named, all before anything binds (same order-discipline as
-//! the faucet's `load`): the node must be **keyless** (§6.2 decision 1 — a
+//! **Four** refusals, all named, all before anything binds (same order-discipline
+//! as the faucet's `load`): the node must be **keyless** (§6.2 decision 1 — a
 //! publicly reachable process must hold no committee keys), it must **not mine**
 //! (an explorer that mines is a participant describing itself as an observer,
-//! and its own coinbase would appear in the supply rows it publishes), and its
-//! config must open **no telemetry/metrics listener** from this process — the
-//! page is this binary's only HTTP surface, because §6.2 keeps `/v1/telemetry`
-//! off the public internet and a listener started here would be public by
-//! construction.
+//! and its own coinbase would appear in the supply rows it publishes), its config
+//! must open **no telemetry/metrics listener** from this process — the projection
+//! is this binary's only HTTP surface, because §6.2 keeps `/v1/telemetry` off the
+//! public internet and a listener started here would be public by construction —
+//! and a **non-loopback `discovery_addr`** is refused by name, which is the
+//! reason svc0 runs a separate `cbnode` for `/v1/compact` rather than letting
+//! this process serve it.
+//!
+//! *(Said "three" until 2026-08-07. The fourth arrived with `PR #236`'s review
+//! (`fba4d04`) and this count was not updated — the same drift shape the tree
+//! keeps paying for, in the doc comment of the file that enforces them.)*
 
 use std::path::{Path, PathBuf};
 
@@ -20,10 +26,24 @@ use serde::Deserialize;
 pub struct ExplorerConfig {
     /// Path to the observer node's `NodeConfig` TOML.
     pub node_config: PathBuf,
-    /// Where the page listens, e.g. `127.0.0.1:9480` (put TLS in front for the
-    /// public form — this binary speaks plain HTTP, deliberately).
+    /// Where the projection listens — `/v1/health.json` + `/healthz`, and since
+    /// issue #281 **no HTML at all**. This binary speaks plain HTTP, deliberately;
+    /// TLS belongs to whatever fronts it.
+    ///
+    /// 🔴 In a container this must be `0.0.0.0:9480`, not `127.0.0.1:9480`:
+    /// "loopback" inside a container is the *container's* loopback, so a reverse
+    /// proxy on the compose bridge could not reach it. That is not a public bind —
+    /// the port is `expose`d and never published, and svc0's only public port is
+    /// caddy's 443. Loopback is still right when running this binary on a host
+    /// directly.
     pub listen_addr: String,
-    /// Browser auto-refresh interval (a `<meta http-equiv="refresh">`, no JS).
+    /// The refresh cadence the operator chose, **carried in the document** at
+    /// `refresh_secs` so the reader honours it instead of hardcoding one.
+    ///
+    /// *(Until issue #281 this was a `<meta http-equiv="refresh">` in a page this
+    /// binary rendered. The page moved to `qumbra-explorer-web`; without carrying
+    /// the value into the projection this config knob would have silently become
+    /// dead.)*
     #[serde(default = "default_refresh_secs")]
     pub refresh_secs: u64,
 }
