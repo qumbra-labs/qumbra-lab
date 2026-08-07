@@ -2000,8 +2000,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             MempoolError::WrongFee { .. } => "wrong fee",
             MempoolError::AnchorNotValid => "anchor not valid",
             MempoolError::AlreadySpent { .. } => "nullifier spent",
+            MempoolError::NullifierRepeatedInTx { .. } => "nullifier repeated in tx",
             MempoolError::NullifierConflictInPool { .. } => "nullifier in-pool conflict",
             MempoolError::DuplicateTx => "duplicate",
+            // Issue #278. All three §4 discovery refusals are intrinsic to the
+            // tx's own bytes — the same verdict on every node, from every chain
+            // position — so, like `body_fault_class`'s reading of the identical
+            // errors one layer up, they are peer faults (`Rejected`), never the
+            // state-lag `Ignored`. Named individually because *cannot parse*
+            // and *parses but does not bind* are different peers doing
+            // different things (the #134/#164/#181 lesson).
+            MempoolError::DiscoveryInvalid(e) => match e {
+                BodyError::DiscoveryMalformed { .. } => "discovery malformed",
+                BodyError::DiscoveryNotCanonical { .. } => "discovery not canonical",
+                _ => "discovery does not bind",
+            },
             MempoolError::ProofInvalid => "proof invalid",
         }
     }
@@ -2634,6 +2647,65 @@ mod tests {
         assert_eq!(a.mempool().len(), 1);
         // Re-submitting the good tx is a duplicate.
         assert_eq!(a.ingest_tx(good), IngestOutcome::Duplicate);
+    }
+
+    /// **Issue #278's acceptance bar: a poisoned transaction must not wedge
+    /// mining.** Both flavours block validation refuses — a discovery group
+    /// that does not bind the declared commitments, and a nullifier repeated
+    /// within one transaction — arrive over the peer wire and the node must
+    /// still produce blocks.
+    ///
+    /// Pre-#278 this was a standing, peer-deliverable mining wedge: `admit` ran
+    /// neither §4 lone-tx rule, `mine_on_parent` assembled the pool without
+    /// re-validation, the miner's own `validate_body` then refused the mined
+    /// block at the `announce_block` self-ingest seam (so `mine_block`'s PoW
+    /// was burned and nothing was announced), and `Mempool::remove` fires only
+    /// from a connected block — so the poison stayed pooled and every later
+    /// template re-failed until restart. The assertions here are that wedge's
+    /// negation at each link: the poison never pools, the sender is charged,
+    /// and the node's next blocks pass its own validation.
+    #[test]
+    fn poisoned_tx_is_refused_at_admit_and_the_node_still_mines() {
+        let (mut a, anchor) = adapter_with_finalized_genesis();
+
+        // Flavour 1: a well-formed discovery group describing a DIFFERENT
+        // commitment than the tx declares (`DiscoveryDoesNotBind` in a block).
+        let mut unbound = tx_with(anchor, 1, b"ok");
+        unbound.discovery = qlab_devnet::body::placeholder_discovery(&[[0xEE; 32]]);
+        let out = a.ingest_tx(unbound.clone());
+        assert_eq!(out, IngestOutcome::Rejected("discovery does not bind"));
+        assert!(out.is_peer_fault(), "an unbound group is intrinsic misbehaviour");
+
+        // Flavour 2: a self-double-spend (`DoubleSpendInBlock` once mined). Its
+        // discovery binds its commitments, so only the nullifier rule refuses.
+        let mut self_spend = tx_with(anchor, 2, b"ok");
+        self_spend.public.nullifiers = vec![[2; 32], [2; 32]];
+        let out = a.ingest_tx(self_spend.clone());
+        assert_eq!(out, IngestOutcome::Rejected("nullifier repeated in tx"));
+        assert!(out.is_peer_fault());
+
+        // Neither reached the pool, so neither can reach a template.
+        assert_eq!(a.mempool().len(), 0);
+        assert!(!a.has_tx(&wire_tx_id(&unbound)));
+        assert!(!a.has_tx(&wire_tx_id(&self_spend)));
+
+        // THE NODE STILL MINES — the half a refusal-only test cannot see. An
+        // honest tx is admitted, the template selects exactly it, and the mined
+        // block passes the miner's own `validate_body` at the self-ingest seam
+        // (pre-#278 this ingest was the `Rejected` that discarded the block).
+        let honest = tx_with(anchor, 3, b"ok");
+        assert_eq!(a.ingest_tx(honest), IngestOutcome::Accepted);
+        let (h1, b1) = a.mine_block().expect("mine");
+        assert_eq!(b1.txs.len(), 1, "the template carries exactly the honest tx");
+        assert_eq!(a.ingest_block(h1, b1), IngestOutcome::Accepted);
+        assert_eq!(a.chain().tip_height(), 1, "the chain advanced");
+
+        // And keeps mining: the mined tx was evicted on connect, and the next
+        // (empty) block is also self-acceptable — no standing wedge.
+        assert_eq!(a.mempool().len(), 0, "the mined tx left the pool");
+        let (h2, b2) = a.mine_block().expect("mine again");
+        assert_eq!(a.ingest_block(h2, b2), IngestOutcome::Accepted);
+        assert_eq!(a.chain().tip_height(), 2);
     }
 
     /// **The typed seam and the peer wire are one gate (issue #275).**

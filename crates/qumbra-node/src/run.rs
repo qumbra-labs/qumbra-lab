@@ -1634,9 +1634,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// would be boolean-blind — the faucet's honest limitation, decision brief
     /// §2), and none is a second validation path:
     ///
-    /// 1. **In-tx nullifier repeat** — [`qlab_node::repeated_nullifier_in_tx`],
-    ///    the shared rpc-layer precheck (`Mempool::admit`'s two nullifier gates
-    ///    both compare against state outside the candidate).
+    /// 1. **In-tx nullifier repeat** — [`qlab_node::repeated_nullifier_in_tx`].
+    ///    Since issue #278 `Mempool::admit` runs the same rule on every path
+    ///    into the pool; this surface keeps the early call so the refusal is
+    ///    its own named token (`nullifier-repeated-in-tx`) rather than the
+    ///    flattened pool verdict.
     /// 2. **The §4 discovery↔cm binding** —
     ///    [`qlab_devnet::body::check_tx_discovery`], the same consensus function
     ///    `validate_body` runs per block. `NodeRpc::submit_tx`'s own discovery
@@ -1646,10 +1648,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     ///    strictly what a block embedding this tx will be judged by.
     /// 3. **The typed admission + relay** —
     ///    [`P2pNode::announce_tx_typed`], i.e. `NodeAdapter::submit_tx_typed`
-    ///    (the state-lag gate and `Mempool::admit`'s posted-fee / anchor /
-    ///    double-spend / duplicate / in-pool-conflict / real-proof gates —
-    ///    exactly what every peer-delivered tx passes), relaying exactly when
-    ///    `announce_tx` would.
+    ///    (the state-lag gate and `Mempool::admit`'s posted-fee / in-tx-repeat /
+    ///    anchor / double-spend / duplicate / in-pool-conflict / §4-discovery /
+    ///    real-proof gates — exactly what every peer-delivered tx passes),
+    ///    relaying exactly when `announce_tx` would.
     /// 4. **The pool re-read** — `submit_local_tx`'s pattern: report what IS in
     ///    the pool, not what the return value promised. Its failure arm is a
     ///    named 500, kept expressible so this stays a check.

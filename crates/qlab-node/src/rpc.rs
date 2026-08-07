@@ -154,19 +154,14 @@ fn tx_id_of_stored(t: &StoredTx) -> Hash32 {
     tx_id(&t.anchor, &t.nullifiers, &t.commitments, t.bucket_actions, t.fee)
 }
 
-/// The first nullifier repeated *within* one transaction, if any.
-///
-/// This is an rpc-layer precheck rather than a [`Mempool`] gate on purpose —
-/// `Mempool::admit`'s two nullifier checks (spent set, in-pool index) both compare
-/// against state *outside* the candidate, so a tx spending one note twice sails
-/// through both and is only refused at block validation
-/// (`BodyError::DoubleSpendInBlock`), i.e. after it has poisoned a template. It is
-/// a free function so [`NodeRpc::submit_tx`] and the deployed `POST /v1/tx`
-/// surface (issue #275) run the one rule instead of two copies of it.
-pub fn repeated_nullifier_in_tx(p: &TxPublic) -> Option<Hash32> {
-    let mut in_tx = std::collections::HashSet::new();
-    p.nullifiers.iter().find(|nf| !in_tx.insert(**nf)).copied()
-}
+// Re-exported from where the rule now lives (issue #278): `qlab_devnet::body`,
+// beside the block-level rule it projects. The "rpc-layer precheck on purpose"
+// reasoning this function's doc used to carry is the premise #278 overturned —
+// a precheck bolted onto each surface left the peer wire with none, and the
+// pool poisoned. `Mempool::admit` now runs it on every path into the pool; the
+// re-export keeps the deployed `POST /v1/tx` surface's call path
+// (`qlab_node::repeated_nullifier_in_tx`) stable.
+pub use qlab_devnet::body::repeated_nullifier_in_tx;
 
 /// One recipient's note-discovery artifacts: the compact bundle a light client
 /// pre-filters over ([`RecipientBundle`] = shared ML-KEM ct + per-output
@@ -350,6 +345,13 @@ pub enum RejectReason {
     /// committed group**, byte for byte (issue #188 baton 2 — it compared
     /// commitments only before the group entered the body preimage).
     DiscoveryMismatch,
+    /// The transaction's own committed discovery group fails the §4 lone-tx
+    /// rules — refused by the pool (`MempoolError::DiscoveryInvalid`, issue
+    /// #278). Distinct from [`Self::DiscoveryMismatch`], which says the
+    /// separately-submitted artifacts are not the committed bytes; this one
+    /// says the committed bytes themselves are malformed, non-canonical, or do
+    /// not bind the declared commitments.
+    DiscoveryInvalid,
     /// The proof failed to verify under the injected verifier.
     ProofInvalid,
     // NOTE (issue #102): `ImmatureCoinbase` is gone. Maturity is enforced by the
@@ -476,13 +478,12 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
         // caller gets back. Distinct from the mempool's body-commitment id.
         let txid = tx_id_of_public(p);
 
-        // Two rpc-layer pre-checks the mempool contract does not cover:
-        // (1) a nullifier repeated within this single tx (shared with the deployed
-        //     submit surface — see [`repeated_nullifier_in_tx`]), and
-        if repeated_nullifier_in_tx(p).is_some() {
-            return SubmitOutcome::Rejected(RejectReason::NullifierRepeatedInTx);
-        }
-        // (2) the submitted artifacts must be **the transaction's own committed
+        // One rpc-layer pre-check the mempool contract does not cover (the in-tx
+        // nullifier repeat that used to be checked here first is a pool gate
+        // since issue #278 — `MempoolError::NullifierRepeatedInTx`, mapped
+        // below, so every path into the pool runs it rather than only the
+        // surfaces that remembered to):
+        // the submitted artifacts must be **the transaction's own committed
         // group**, byte for byte.
         //
         // Until issue #188 baton 2 this compared commitments only, which was the
@@ -534,8 +535,14 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             Err(MempoolError::AlreadySpent { .. }) => {
                 SubmitOutcome::Rejected(RejectReason::NullifierSpent)
             }
+            Err(MempoolError::NullifierRepeatedInTx { .. }) => {
+                SubmitOutcome::Rejected(RejectReason::NullifierRepeatedInTx)
+            }
             Err(MempoolError::NullifierConflictInPool { .. }) => {
                 SubmitOutcome::Rejected(RejectReason::NullifierPending)
+            }
+            Err(MempoolError::DiscoveryInvalid(_)) => {
+                SubmitOutcome::Rejected(RejectReason::DiscoveryInvalid)
             }
             Err(MempoolError::ProofInvalid) => SubmitOutcome::Rejected(RejectReason::ProofInvalid),
         }

@@ -222,7 +222,9 @@ pub enum TxSubmitOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TxRefusal {
     /// A nullifier repeated within the transaction itself
-    /// ([`qlab_node::repeated_nullifier_in_tx`], the rpc-layer precheck).
+    /// ([`qlab_node::repeated_nullifier_in_tx`] — since issue #278 also a
+    /// `Mempool::admit` gate; this surface still checks it first for the named
+    /// 400 below).
     RepeatedNullifier,
     /// The committed discovery group failed the §4 rules — not decodable,
     /// not canonical, or not binding the declared commitments
@@ -282,6 +284,17 @@ fn render_refusal(refusal: &TxRefusal) -> (u16, String) {
             MempoolError::AlreadySpent { .. } => (400, "refused: nullifier-spent".to_string()),
             MempoolError::NullifierConflictInPool { .. } => {
                 (400, "refused: nullifier-conflict-in-pool".to_string())
+            }
+            // Issue #278: the pool now runs both §4 lone-tx rules itself. On
+            // THIS surface the pre-checks above answer first with their own
+            // tokens (`nullifier-repeated-in-tx`, `discovery-…`), so these two
+            // arms are the same verdicts arriving from the pool on any path
+            // where a pre-check did not run — same fault, same 400.
+            MempoolError::NullifierRepeatedInTx { .. } => {
+                (400, "refused: nullifier-repeated-in-tx".to_string())
+            }
+            MempoolError::DiscoveryInvalid(e) => {
+                (400, format!("refused: discovery {e:?}"))
             }
             MempoolError::ProofInvalid => (400, "refused: proof-invalid".to_string()),
             // The loop maps DuplicateTx to `TxSubmitOutcome::Duplicate` before
