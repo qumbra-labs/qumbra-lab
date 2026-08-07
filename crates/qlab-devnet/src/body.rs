@@ -522,6 +522,26 @@ pub fn check_tx_discovery(index: usize, tx: &TxEntry) -> Result<(), BodyError> {
     Ok(())
 }
 
+/// The first nullifier repeated *within* one transaction, if any — the lone-tx
+/// projection of [`validate_body`]'s in-block nullifier-uniqueness rule (§4;
+/// [`BodyError::DoubleSpendInBlock`] is what the same repeat is called once the
+/// tx is inside a block).
+///
+/// It lives here, beside the block-level rule it projects, since issue #278.
+/// It used to live in `qlab-node`'s rpc layer as a surface precheck, on the
+/// stated reasoning that the mempool's two nullifier gates compare against
+/// state *outside* the candidate — which was true, and which is exactly why
+/// the one surface with no precheck (the peer wire) pooled a self-double-spend
+/// cleanly, poisoned every assembled template, and wedged the miner. The rule
+/// is a consensus fact about a lone transaction, so it belongs to the layer
+/// that owns the block-level rule; `Mempool::admit` now runs it on every path
+/// into the pool, and the rpc/HTTP surfaces keep calling it early for their
+/// own refusal attribution.
+pub fn repeated_nullifier_in_tx(p: &TxPublic) -> Option<Hash32> {
+    let mut in_tx = HashSet::new();
+    p.nullifiers.iter().find(|nf| !in_tx.insert(**nf)).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

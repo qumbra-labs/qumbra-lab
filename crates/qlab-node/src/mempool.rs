@@ -12,9 +12,12 @@
 //!      window ([`NodeState::is_valid_anchor`], §4/§7);
 //!      (**not** coinbase maturity — that left this list at issue #102 and is now
 //!      enforced by the commitment tree's append schedule; see below);
-//!    - **double-spend** — no nullifier already in the consensus set, and none
-//!      already claimed by another pooled tx (so an assembled block never
-//!      in-block double-spends);
+//!    - **double-spend** — no nullifier already in the consensus set, none
+//!      repeated within the candidate itself (issue #278), and none already
+//!      claimed by another pooled tx (so an assembled block never in-block
+//!      double-spends);
+//!    - **discovery binds** — the §4 lone-tx discovery rules, via the same
+//!      [`check_tx_discovery`] block validation runs per tx (issue #278);
 //!    - **proof validity** — via the injected [`TxVerifier`] (this crate stays
 //!      prover-free, exactly as [`crate::Node::apply_block`]).
 //!
@@ -28,7 +31,11 @@
 //! Everything an assembled template asserts is exactly what [`crate::Node::
 //! apply_block`] → `validate_body` re-checks, so a mempool-admitted tx set
 //! assembles into a body the node accepts (the fee source is the *same*
-//! `posted_fee`; the anchor gate is the *same* `is_valid_anchor`).
+//! `posted_fee`; the anchor gate is the *same* `is_valid_anchor`; the discovery
+//! and in-tx nullifier rules are the *same* §4 functions — issue #278, which is
+//! the incident where this paragraph was not yet true: a peer-delivered tx the
+//! pool admitted but `validate_body` refused stayed pooled forever, and every
+//! template assembled from the pool re-failed — a standing mining wedge).
 //!
 //! ## Coinbase maturity is not enforced here any more (issue #102)
 //!
@@ -76,7 +83,9 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use qlab_devnet::body::{BlockBody, TxEntry, TxVerifier};
+use qlab_devnet::body::{
+    check_tx_discovery, repeated_nullifier_in_tx, BlockBody, BodyError, TxEntry, TxVerifier,
+};
 use qlab_devnet::fees::posted_fee;
 use qlab_devnet::hash::keccak256;
 use qlab_devnet::weight::{
@@ -149,11 +158,23 @@ pub enum MempoolError {
     // enforced one.
     /// A nullifier is already spent in the consensus set (cross-block double-spend).
     AlreadySpent { nullifier: Hash32 },
+    /// A nullifier is repeated *within* this transaction — what block validation
+    /// calls `DoubleSpendInBlock` once the tx is inside a block (issue #278).
+    /// The two gates below both compare against state *outside* the candidate,
+    /// so neither can see this; without this variant the self-double-spend
+    /// pooled cleanly and every template assembled from it failed the miner's
+    /// own `validate_body`.
+    NullifierRepeatedInTx { nullifier: Hash32 },
     /// A nullifier is already claimed by another pooled tx (would in-block
     /// double-spend if both were mined).
     NullifierConflictInPool { nullifier: Hash32 },
     /// This exact transaction is already pooled.
     DuplicateTx,
+    /// The tx fails the §4 discovery rules for a lone transaction (issue #278) —
+    /// carries [`check_tx_discovery`]'s verdict whole, so an admit-time refusal
+    /// names exactly what block validation would have named (only the
+    /// `Discovery*` variants of [`BodyError`] can appear here, with `index: 0`).
+    DiscoveryInvalid(BodyError),
     /// The STARK proof does not verify against the public surface.
     ProofInvalid,
 }
@@ -433,19 +454,30 @@ impl Mempool {
             return Err(MempoolError::WrongFee { expected, got: entry.public.fee });
         }
 
-        // 2. Anchor: a finalized root within the ≤ 1,152-block window (§4/§7).
+        // 2. A nullifier repeated within the candidate itself (issue #278) — a
+        //    pure function of the tx, so it runs with the cheap checks. The two
+        //    nullifier gates below compare against state *outside* the candidate
+        //    and structurally cannot see it, and a pooled self-double-spend is
+        //    exactly the mining wedge: every template that selects it fails the
+        //    miner's own `validate_body` as `DoubleSpendInBlock`, and nothing
+        //    evicts it.
+        if let Some(nullifier) = repeated_nullifier_in_tx(&entry.public) {
+            return Err(MempoolError::NullifierRepeatedInTx { nullifier });
+        }
+
+        // 3. Anchor: a finalized root within the ≤ 1,152-block window (§4/§7).
         if !state.is_valid_anchor(&entry.public.anchor) {
             return Err(MempoolError::AnchorNotValid);
         }
 
-        // 3. Double-spend against the permanent consensus nullifier set.
+        // 4. Double-spend against the permanent consensus nullifier set.
         for nf in &entry.public.nullifiers {
             if state.is_spent(nf) {
                 return Err(MempoolError::AlreadySpent { nullifier: *nf });
             }
         }
 
-        // 4. Exact duplicate? (Checked before the in-pool nullifier gate — an
+        // 5. Exact duplicate? (Checked before the in-pool nullifier gate — an
         //    identical resubmission shares its own nullifiers, so it would
         //    otherwise report the less-specific conflict below.)
         let id = txid(&entry);
@@ -453,7 +485,7 @@ impl Mempool {
             return Err(MempoolError::DuplicateTx);
         }
 
-        // 5. A *distinct* tx reusing a pooled nullifier (would in-block
+        // 6. A *distinct* tx reusing a pooled nullifier (would in-block
         //    double-spend if both were mined).
         for nf in &entry.public.nullifiers {
             if self.nf_index.contains_key(nf) {
@@ -461,7 +493,17 @@ impl Mempool {
             }
         }
 
-        // 6. Proof verify — last, the only non-trivial cost (consensus §1).
+        // 7. The §4 discovery rules for a lone transaction (issue #278) — the
+        //    same consensus function `validate_body` runs per block-tx, so admit
+        //    and block validation cannot disagree about a discovery group.
+        //    O(tx bytes) decode + re-encode, dwarfed by the proof verify below;
+        //    index 0 because the refusal names this candidate, not a block
+        //    position.
+        if let Err(e) = check_tx_discovery(0, &entry) {
+            return Err(MempoolError::DiscoveryInvalid(e));
+        }
+
+        // 8. Proof verify — last, the only non-trivial cost (consensus §1).
         if !verifier.verify_tx(&entry) {
             return Err(MempoolError::ProofInvalid);
         }
@@ -821,6 +863,84 @@ mod tests {
         let mut tx = good_tx(1);
         tx.proof = b"forged".to_vec();
         assert_eq!(mp.admit(tx, &st, &MockVerifier), Err(MempoolError::ProofInvalid));
+    }
+
+    // ── the §4 lone-tx rules (issue #278) ────────────────────────────────────
+    //
+    // Block validation refuses these two shapes (`DoubleSpendInBlock`,
+    // `Discovery*`), and until #278 admission did not — so a peer could pool a
+    // tx every template assembled from would fail the miner's own
+    // `validate_body`, and `on_block_connected` (the only eviction) never fires
+    // for a block that failed validation. What these tests pin is the refusal
+    // AT THE POOL, by name; the node-still-mines half of the acceptance bar
+    // lives at the adapter, where mining actually happens
+    // (`qlab-p2p::adapter`, `poisoned_tx_is_refused_at_admit_and_the_node_still_mines`).
+
+    #[test]
+    fn rejects_a_nullifier_repeated_within_one_tx() {
+        let mut mp = Mempool::default();
+        let st = state_with_anchor();
+        let mut tx = good_tx(4);
+        tx.public.nullifiers = vec![[4; 32], [4; 32]];
+        assert_eq!(
+            mp.admit(tx, &st, &MockVerifier),
+            Err(MempoolError::NullifierRepeatedInTx { nullifier: [4; 32] })
+        );
+        assert!(mp.is_empty(), "a self-double-spend must not enter the pool");
+    }
+
+    #[test]
+    fn rejects_a_discovery_group_that_does_not_bind() {
+        let mut mp = Mempool::default();
+        let st = state_with_anchor();
+        // A well-formed group describing a DIFFERENT commitment than the tx
+        // declares (§4 rule 2 / D4).
+        let mut tx = good_tx(5);
+        tx.discovery = qlab_devnet::body::placeholder_discovery(&[[0xEE; 32]]);
+        assert_eq!(
+            mp.admit(tx, &st, &MockVerifier),
+            Err(MempoolError::DiscoveryInvalid(BodyError::DiscoveryDoesNotBind {
+                index: 0,
+                expected: 1,
+                got: 1,
+                first_mismatch: Some(0),
+            }))
+        );
+        assert!(mp.is_empty());
+    }
+
+    #[test]
+    fn rejects_an_omitted_discovery_group_as_the_n_zero_case() {
+        let mut mp = Mempool::default();
+        let st = state_with_anchor();
+        // §4 rule 1: omission is `DiscoveryDoesNotBind`'s n = 0 case, not a
+        // separate branch — a tx with one output and no discovery is exactly the
+        // "recipient can never find this" shape #278's flavour 1 delivers.
+        let mut tx = good_tx(6);
+        tx.discovery = TxEntry::empty_discovery();
+        assert_eq!(
+            mp.admit(tx, &st, &MockVerifier),
+            Err(MempoolError::DiscoveryInvalid(BodyError::DiscoveryDoesNotBind {
+                index: 0,
+                expected: 1,
+                got: 0,
+                first_mismatch: None,
+            }))
+        );
+        assert!(mp.is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_discovery_bytes() {
+        let mut mp = Mempool::default();
+        let st = state_with_anchor();
+        let mut tx = good_tx(7);
+        tx.discovery = vec![0xFF; 7]; // not a §2 group encoding at all
+        assert!(matches!(
+            mp.admit(tx, &st, &MockVerifier),
+            Err(MempoolError::DiscoveryInvalid(BodyError::DiscoveryMalformed { .. }))
+        ));
+        assert!(mp.is_empty());
     }
 
     // ── weight parameters (frozen §6) ────────────────────────────────────────
