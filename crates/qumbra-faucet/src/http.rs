@@ -5,6 +5,7 @@
 //!   POST /request         address + ticket → 202 with a receipt, or a NAMED refusal
 //!   GET  /r/<receipt>     what happened to one request
 //!   GET  /healthz         "ok" — for a supervisor, no state
+//!   GET  /favicon-{32,16}.png   the brand mark, compiled in (assets/brand/README.md)
 //! ```
 //!
 //! ## Why `POST`, on a chain whose node deliberately has no write path
@@ -38,9 +39,12 @@
 //!
 //! ## Rendering
 //!
-//! No JavaScript, no external fetches, no cookies, no redirects. One `<form>` and
-//! text. A faucet page that pulls a font from a CDN tells that CDN who is asking a
-//! privacy chain for money.
+//! No JavaScript, no external fetches, no cookies, no redirects. One `<form>`, text,
+//! and two icons **this process serves itself**. A faucet page that pulls a font from
+//! a CDN tells that CDN who is asking a privacy chain for money — and an icon is
+//! exactly the sub-resource nobody counts as a request, which is why the same-origin
+//! requirement is asserted by name in `the_page_has_no_script_and_no_external_reference`
+//! rather than left to the no-scheme check that would have missed it.
 
 use std::io;
 use std::net::SocketAddr;
@@ -64,6 +68,44 @@ pub const ADDR_SHOWN_CHARS: usize = 16;
 /// ~2,000 bech32m characters, and a ticket is 57, so 8 KiB is generous for the one
 /// legitimate shape and refuses a body nobody meant to send.
 const MAX_BODY_BYTES: usize = 8 * 1024;
+
+/// The brand mark, compiled in. **Copies** — `qumbra-design/brand/` is the source of
+/// truth and `assets/brand/README.md` records the rest, including why these are PNG
+/// when the canonical file is an SVG. They are `include_bytes!` rather than files on
+/// disk because this process serves no static directory: two known byte strings at two
+/// known paths is a smaller surface than a file server on the one host in the estate
+/// that holds a hot spending key.
+const FAVICON_32: &[u8] = include_bytes!("../assets/brand/favicon-32.png");
+const FAVICON_16: &[u8] = include_bytes!("../assets/brand/favicon-16.png");
+
+/// A response body and the content type that belongs to it.
+///
+/// The two travel together so a route cannot answer with one and be labelled the
+/// other — which is not hypothetical: `/healthz` answered `"ok\n"` under
+/// `text/html; charset=utf-8` for as long as the label was asserted once for every
+/// route, and it was harmless only because nothing parsed it.
+enum Body {
+    Html(String),
+    Text(String),
+    Png(&'static [u8]),
+}
+
+impl Body {
+    fn content_type(&self) -> &'static str {
+        match self {
+            Body::Html(_) => "text/html; charset=utf-8",
+            Body::Text(_) => "text/plain; charset=utf-8",
+            Body::Png(_) => "image/png",
+        }
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Body::Html(s) | Body::Text(s) => s.into_bytes(),
+            Body::Png(b) => b.to_vec(),
+        }
+    }
+}
 
 /// What the listener did with one `POST /request`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -183,22 +225,46 @@ impl FaucetServer {
                 let path = if path.is_empty() { "/".to_string() } else { path };
 
                 let (status_code, body, extra_header) = match (&method, path.as_str()) {
-                    (tiny_http::Method::Get, "/healthz") => (200, "ok\n".to_string(), None),
+                    (tiny_http::Method::Get, "/healthz") => {
+                        (200, Body::Text("ok\n".to_string()), None)
+                    }
+                    // The two brand icons, compiled in — see assets/brand/PROVENANCE.md
+                    // for why they are copies and why they are PNG rather than the SVG.
+                    // Cached hard: a favicon is refetched on every page load otherwise,
+                    // and each fetch is another line in the access journal.
+                    (tiny_http::Method::Get, "/favicon-32.png") => (
+                        200,
+                        Body::Png(FAVICON_32),
+                        Some((
+                            "Cache-Control".to_string(),
+                            "public, max-age=604800, immutable".to_string(),
+                        )),
+                    ),
+                    (tiny_http::Method::Get, "/favicon-16.png") => (
+                        200,
+                        Body::Png(FAVICON_16),
+                        Some((
+                            "Cache-Control".to_string(),
+                            "public, max-age=604800, immutable".to_string(),
+                        )),
+                    ),
                     (tiny_http::Method::Get, "/") => {
-                        (200, render_index(&snapshot(&status), None), None)
+                        (200, Body::Html(render_index(&snapshot(&status), None)), None)
                     }
                     (tiny_http::Method::Get, p) if p.starts_with("/r/") => {
                         let receipt = p.trim_start_matches("/r/").parse::<u64>().ok();
                         match receipt.and_then(|r| lock(&gate).state_of(r).map(|s| (r, s))) {
-                            Some((r, state)) => (200, render_receipt(r, &state), None),
+                            Some((r, state)) => {
+                                (200, Body::Html(render_receipt(r, &state)), None)
+                            }
                             None => (
                                 404,
-                                page(
+                                Body::Html(page(
                                     "unknown receipt",
                                     "<p>No such receipt. Receipts are per-process: a faucet \
                                      restart forgets them, and the grant — if it was made — is \
                                      on the chain regardless.</p>",
-                                ),
+                                )),
                                 None,
                             ),
                         }
@@ -233,7 +299,7 @@ impl FaucetServer {
                         };
                         (
                             outcome.status(),
-                            render_index(&snapshot(&status), Some(&outcome)),
+                            Body::Html(render_index(&snapshot(&status), Some(&outcome))),
                             retry.map(|s| ("Retry-After".to_string(), s.to_string())),
                         )
                     }
@@ -243,22 +309,29 @@ impl FaucetServer {
                     // operator looking for a routing bug.
                     (tiny_http::Method::Get, "/request") => (
                         405,
-                        page(
+                        Body::Html(page(
                             "method not allowed",
                             "<p><code>/request</code> takes <code>POST</code>. It is a POST so \
                              that the address you submit never lands in a URL, and therefore \
                              never in an access log.</p>",
-                        ),
+                        )),
                         Some(("Allow".to_string(), "POST".to_string())),
                     ),
                     (tiny_http::Method::Get, _) => (
                         404,
-                        page("not found", "<p>This faucet serves <code>/</code> only.</p>"),
+                        Body::Html(page(
+                            "not found",
+                            "<p>This faucet serves <code>/</code>, a receipt at \
+                             <code>/r/&lt;n&gt;</code>, and its two icons.</p>",
+                        )),
                         None,
                     ),
                     _ => (
                         405,
-                        page("method not allowed", "<p><code>GET</code> and <code>POST</code>.</p>"),
+                        Body::Html(page(
+                            "method not allowed",
+                            "<p><code>GET</code> and <code>POST</code>.</p>",
+                        )),
                         None,
                     ),
                 };
@@ -279,12 +352,16 @@ impl FaucetServer {
                     j.push(line);
                 }
 
-                let mut response = tiny_http::Response::from_string(body)
+                // The content type travels WITH the body rather than being asserted
+                // once for every route: `/healthz` used to answer "ok\n" labelled
+                // `text/html`, which was harmless only because nothing parsed it.
+                let content_type = body.content_type();
+                let mut response = tiny_http::Response::from_data(body.into_bytes())
                     .with_status_code(status_code)
                     .with_header(
                         tiny_http::Header::from_bytes(
                             &b"Content-Type"[..],
-                            &b"text/html; charset=utf-8"[..],
+                            content_type.as_bytes(),
                         )
                         .expect("static content type parses"),
                     );
@@ -484,6 +561,8 @@ fn page(title: &str, body: &str) -> String {
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
          <title>Qumbra testnet faucet — {}</title>\
+         <link rel=\"icon\" type=\"image/png\" sizes=\"32x32\" href=\"/favicon-32.png\">\
+         <link rel=\"icon\" type=\"image/png\" sizes=\"16x16\" href=\"/favicon-16.png\">\
          <style>body{{font-family:system-ui,sans-serif;max-width:44rem;margin:3rem auto;\
          padding:0 1rem;line-height:1.5}}code{{word-break:break-all}}\
          .state{{padding:.75rem 1rem;border-left:4px solid #888;background:#f6f6f6}}\
@@ -785,6 +864,15 @@ mod tests {
         let html = render_index(&s, Some(&RequestOutcome::Queued { receipt: 9, position: 1 }));
         for forbidden in ["<script", "http://", "https://", "//cdn", "cookie"] {
             assert!(!html.to_lowercase().contains(forbidden), "page contains {forbidden}");
+        }
+        // The icons are the page's only sub-resource, and they are served by this
+        // process at a root-relative path. Stated as its own assertion because the
+        // loop above only proves no *scheme* appears: a protocol-relative or
+        // otherwise off-origin icon would slip past it, and an icon is exactly the
+        // sub-resource nobody thinks of as a request. On a faucet, whoever serves it
+        // learns who is asking for money.
+        for icon in ["href=\"/favicon-32.png\"", "href=\"/favicon-16.png\""] {
+            assert!(html.contains(icon), "the page must declare {icon}: {html}");
         }
         assert!(html.contains("form method=\"post\" action=\"/request\""));
         assert!(html.contains("10.00000000"), "the grant value is rendered in QMB: {html}");
