@@ -16,6 +16,10 @@
 //!   (the docs/ table's data, test-locked here).
 //! - [`run`] — composes the N7 stack over the REAL TCP transport + RandomXPow +
 //!   on-disk qlab-node stores, and runs it with graceful-shutdown snapshot flush.
+//! - [`audit_emission`] — read-only `audit-emission` subcommand: walk a data dir's
+//!   main chain via [`qlab_node::MemNode::open`] and report every height whose
+//!   `body.coinbase` differs from [`qlab_node::emission::coinbase`] (lab #299 /
+//!   QUM-82). Observes only; no consensus change.
 //! - [`verifier`] — the injected transaction verifier. The **default is the real
 //!   M3 verifier** ([`verifier::ConsensusVerifier`] → `qlab_consensus::verify_proof`,
 //!   frozen `CONSENSUS_CFG`); the rehearsal stand-in
@@ -25,6 +29,7 @@
 //! The transaction-proof verifier is injected at the same `TxVerifier` seam the
 //! N7 stack has always exposed; T0-4 just makes the real verifier the default.
 
+pub mod audit_emission;
 pub mod config;
 pub mod discovery_server;
 pub mod genesis;
