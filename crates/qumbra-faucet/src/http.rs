@@ -54,10 +54,31 @@ use std::thread::JoinHandle;
 
 use qlab_faucet::policy::{subnet_key, SubnetKey};
 use qlab_faucet::{AcceptError, Refusal, Ticket};
-use qlab_wallet::address::Address;
+use qlab_wallet::address::{Address, ADDR_HRP};
 
 use crate::service::{FaucetGate, RequestState};
 use crate::state::ServiceStatus;
+
+/// The address shape the form advertises, **derived from the decoder's own HRP**
+/// rather than restated (lab issue #296).
+///
+/// It read `qmb1…` from PR #128 until 2026-08-09 — a prefix
+/// [`Address::decode`] rejects outright, sixteen lines above a test that uses
+/// `"qmb1nonsense"` as its example of *invalid* input. The failure mode is worse
+/// than a blank field: a visitor holding a real `qaddr1…` from `qumbra-wallet
+/// address` reads the placeholder and concludes their own address is wrong, and
+/// there is nothing else on the page to contradict it.
+///
+/// `ADDR_HRP` is imported, never copied, so the page cannot outlive an HRP change.
+/// The `1` is bech32m's separator (BIP-350), fixed by the encoding rather than
+/// chosen by Qumbra, and `qlab_wallet::bech32m` keeps it as a private literal
+/// inside `encode` — so it is written here and then **locked against the encoder**
+/// by `the_placeholder_is_the_shape_the_decoder_accepts`, which asserts a real
+/// encoded address starts with exactly this string. Deriving the HRP alone would
+/// not have caught a drift in the separator or the bech32m shape; the test does.
+fn address_placeholder() -> String {
+    format!("{ADDR_HRP}1…")
+}
 
 /// How many characters of an address ever appear anywhere — page, log or receipt.
 /// The same 16 `qlab_faucet::PendingRequest`'s hand-written `Debug` shows, so the
@@ -602,25 +623,45 @@ fn render_index(s: &ServiceStatus, outcome: Option<&RequestOutcome>) -> String {
          <form method=\"post\" action=\"/request\">\n\
          <p><label for=\"address\">Your Qumbra address</label><br>\n\
          <textarea id=\"address\" name=\"address\" rows=\"4\" required \
-         placeholder=\"qmb1…\"></textarea></p>\n\
+         placeholder=\"{}\"></textarea></p>\n\
          <p><label for=\"ticket\">Grant ticket{}</label><br>\n\
          <input id=\"ticket\" name=\"ticket\" size=\"60\" placeholder=\"qft1…\"{}></p>\n\
          <p><button type=\"submit\">Request {} QMB</button></p>\n\
          </form>\n",
         qmb(s.grant_value),
+        esc(&address_placeholder()),
         if s.tickets_required { "" } else { " (not required on this faucet)" },
         if s.tickets_required { " required" } else { "" },
         qmb(s.grant_value),
     ));
 
-    // The service's own state. Position 3: the two chain integers, and nothing else
-    // about the chain — no per-signer committee participation, ever, and no second
-    // public surface.
+    // The service's own state. Position 3, as amended by lab issue #296: **three**
+    // chain integers — applied height, header tip, and the gap between them — and
+    // nothing else about the chain. No per-signer committee participation, ever,
+    // and no second public surface.
+    //
+    // The stamp this replaces said "the two chain integers, and nothing else", and
+    // the third is added with its reason rather than around it. #296 measured what
+    // the stamp cost: showing only the applied height under the label `chain tip`
+    // put `1930` on this page while `explorer.qumbra.org` showed `4116` for the
+    // same chain, and a visitor could not tell which surface was lying. The
+    // stamp's *stated* rationale was per-signer participation and a second public
+    // surface, and the header tip is neither — the explorer already publishes it,
+    // which is exactly why the disagreement was visible in the first place. What
+    // stays closed is what the sentence was written to close.
     body.push_str("<h2>This faucet right now</h2>\n<table>\n");
     let mut row = |k: &str, v: String| {
         body.push_str(&format!("<tr><td>{}</td><td><code>{}</code></td></tr>\n", esc(k), esc(&v)));
     };
-    row("chain tip", s.tip_height.to_string());
+    // Named for what it is. A grant proof binds to applied state, so this — not
+    // the header tip — is the number that decides whether the faucet can serve;
+    // #296 is explicit that showing the header tip *instead* would be worse.
+    row("applied height", s.chain.state_tip.to_string());
+    row("chain tip (headers)", s.chain.fork_choice_tip.to_string());
+    // `StateLag::blocks()` — the tree's one definition of the gap, the same call
+    // the node's duty gate and its `slag=` telemetry field make. Never a
+    // subtraction written out here.
+    row("behind by", format!("{} block(s)", s.chain.blocks()));
     row(
         "finalized",
         match s.finalized_height {
@@ -635,6 +676,20 @@ fn render_index(s: &ServiceStatus, outcome: Option<&RequestOutcome>) -> String {
     row("notes maturing", s.notes_maturing.to_string());
     row("grants confirmed (this process)", s.confirmed.to_string());
     body.push_str("</table>\n");
+
+    // Lab issue #296: the sentence a visitor comparing this page with the explorer
+    // needs, in the same register as the availability banner above it ("the faucet
+    // may be funded and still unable to pay"). It names the other surface by host,
+    // because that is the surface the comparison is actually made against.
+    body.push_str(
+        "<p><strong>Why this page's height may be lower than the explorer's.</strong> \
+         <code>applied height</code> is how far this faucet's own node has <em>applied</em> \
+         blocks; <code>chain tip (headers)</code> is how far the chain it follows has got. \
+         <code>explorer.qumbra.org</code> publishes the second. This faucet serves grants \
+         from the first, because a grant proof is bound to state this node has applied — so \
+         while <code>behind by</code> is not zero, the two sites will disagree, and neither \
+         is wrong.</p>\n",
+    );
 
     body.push_str(
         "<h2>Two things worth knowing</h2>\n\
@@ -683,7 +738,7 @@ mod tests {
 
     fn a_status(availability: crate::state::Availability) -> Arc<Mutex<ServiceStatus>> {
         Arc::new(Mutex::new(ServiceStatus {
-            tip_height: 200,
+            chain: qlab_node::StateLag::new(200, 200),
             finalized_height: Some(200),
             peers: 3,
             availability,

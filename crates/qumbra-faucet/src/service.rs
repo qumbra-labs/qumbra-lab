@@ -70,6 +70,22 @@ pub trait FaucetNode {
     /// Connected peers — service state, not chain state (a faucet with no peers is a
     /// faucet on its own fork).
     fn peers(&self) -> u64;
+
+    /// **The node's two chain views** — the height it has applied, and the height
+    /// its fork choice holds a header for (lab issue #296).
+    ///
+    /// Returned as one [`qlab_node::StateLag`] rather than as a second bare `u64`
+    /// so the gap between the two is computed by the tree's single definition
+    /// (`StateLag::blocks`), the same one the node's duty gate and its `slag=`
+    /// telemetry field use. A page that differenced two numbers itself would be a
+    /// fourth restatement of a rule that already exists, and the page is where a
+    /// visitor would be least able to tell it had drifted.
+    ///
+    /// A node with no separate fork-choice view answers with its applied tip in
+    /// both positions, which is honest — it is not behind, it simply has one view.
+    /// There is deliberately no default implementation: a new `FaucetNode` must
+    /// state which it has rather than inherit a `slag=0` it never checked.
+    fn chain_views(&self) -> qlab_node::StateLag;
 }
 
 impl<P: qlab_devnet::pow::PowEngine, V: qlab_devnet::body::TxVerifier + Clone> FaucetNode
@@ -100,6 +116,13 @@ impl<P: qlab_devnet::pow::PowEngine, V: qlab_devnet::body::TxVerifier + Clone> F
     }
     fn peers(&self) -> u64 {
         self.p2p().peers().len() as u64
+    }
+    /// The adapter's own `state_lag()`, unmodified — the identical call
+    /// `qumbra-node`'s `TELEMETRY` line and `/metrics` scrape make (`run.rs`, issue
+    /// #130 (a)). So the faucet page, the node's log line and the node's scrape
+    /// cannot disagree about how far behind this node is.
+    fn chain_views(&self) -> qlab_node::StateLag {
+        self.p2p().node().state_lag()
     }
 }
 
@@ -229,7 +252,9 @@ impl FaucetService {
     /// address), because that is the `rkm` the node was told to pay.
     pub fn new(faucet: Faucet, wallet: Wallet, d: Diversifier) -> FaucetService {
         let status = ServiceStatus {
-            tip_height: 0,
+            // Nothing sampled yet: both views at genesis, so the page shows a zero
+            // gap rather than a fabricated one before the first `refresh_status`.
+            chain: qlab_node::StateLag::default(),
             finalized_height: None,
             peers: 0,
             availability: Availability::ColdChain,
@@ -411,7 +436,10 @@ impl FaucetService {
         let availability = classify(gate.faucet(), &view, self.next_maturity, self.maturing);
         let stats = gate.faucet().stats();
         let next = ServiceStatus {
-            tip_height: view.tip_height(),
+            // `chain.state_tip` is the same `MemNode::tip_height()` this `view`
+            // reads — `RunningNode::state()` and `state_lag()`'s left operand are
+            // one object — so the two are not two samples that could disagree.
+            chain: node.chain_views(),
             finalized_height: view.finalized_height(),
             peers: node.peers(),
             availability,
