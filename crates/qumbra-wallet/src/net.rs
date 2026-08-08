@@ -324,14 +324,29 @@ fn connect(base_url: &str) -> std::io::Result<(Box<dyn ReadWrite>, String)> {
         Some(name) => {
             let server_name = rustls::pki_types::ServerName::try_from(name.clone())
                 .map_err(|e| refuse(format!("`{name}` is not a valid TLS server name: {e}")))?;
-            let conn = rustls::ClientConnection::new(tls_config(), server_name).map_err(|e| {
+            let mut conn = rustls::ClientConnection::new(tls_config(), server_name).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("TLS client setup failed: {e}"),
                 )
             })?;
+            let mut tcp = tcp;
+            // Handshake **here**, explicitly, rather than letting the first
+            // `write_all` do it lazily. Measured against badssl.com: driven
+            // lazily, an expired or wrong-host certificate surfaces as
+            // `Connection reset by peer (os error 54)` — rustls' fatal alert
+            // races the peer's reset and the reset is what the user is shown.
+            // A wallet that reports a certificate refusal as a network blip
+            // invites exactly the retry that should never happen.
+            //
             // A TLS failure is an error and never a silent downgrade: there is
             // no http fallback on this path, by decision (#297 stop points).
+            conn.complete_io(&mut tcp).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("TLS handshake with `{name}` failed: {e}"),
+                )
+            })?;
             Ok((Box::new(rustls::StreamOwned::new(conn, tcp)), ep.host))
         }
     }
