@@ -95,6 +95,26 @@ fn get(addr: SocketAddr, path: &str) -> (u16, String, String) {
     http(addr, &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"))
 }
 
+/// Like [`get`], but the body stays **bytes**. `http` reads with `read_to_string`,
+/// which fails outright on a PNG — so a binary route cannot be tested through it,
+/// and a test that only checked the status code would pass against a body that was
+/// silently mangled.
+fn get_bytes(addr: SocketAddr, path: &str) -> (u16, String, Vec<u8>) {
+    let mut s = TcpStream::connect(addr).expect("connect");
+    let raw = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    s.write_all(raw.as_bytes()).expect("write");
+    let mut out = Vec::new();
+    s.read_to_end(&mut out).expect("read");
+    let split = out.windows(4).position(|w| w == b"\r\n\r\n").expect("headers end");
+    let head = String::from_utf8_lossy(&out[..split]).to_string();
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or_else(|| panic!("no status line in {head:?}"));
+    (status, head, out[split + 4..].to_vec())
+}
+
 /// A real form POST — the exchange a browser makes.
 fn post_request(addr: SocketAddr, address: &str, ticket: Option<&str>) -> (u16, String, String) {
     let mut body = format!("address={address}");
@@ -271,6 +291,50 @@ fn the_listener_defaults_to_loopback() {
     let (status, _, body) = get(server.addr(), "/healthz");
     assert_eq!(status, 200);
     assert_eq!(body, "ok\n");
+    server.shutdown();
+}
+
+/// The page's icons are served by **this** process, byte-for-byte as committed.
+///
+/// Three things are asserted rather than one, because each fails differently and the
+/// cheap version of this test would catch none of them: a 200 with an HTML error page
+/// in it (wrong content type, right status), a truncated or re-encoded body (right
+/// type, wrong bytes), and a missing cache header (correct but refetched on every
+/// page load, which puts a line in the access journal each time).
+///
+/// The comparison is against the same files `http.rs` compiles in, so this also locks
+/// what `assets/brand/PROVENANCE.md` records: the served icon is the brand's icon, and
+/// a copy that drifts from the canonical source shows up here as a diff rather than as
+/// a subtly different mark on one of two public faces.
+#[test]
+fn the_brand_icons_are_served_from_this_process_unaltered() {
+    let wallet = faucet_wallet();
+    let svc = service(&wallet, TicketPolicy::Required);
+    let server = FaucetServer::start("127.0.0.1:0", svc.gate(), svc.status()).expect("bind");
+
+    for (path, expected) in [
+        ("/favicon-32.png", &include_bytes!("../assets/brand/favicon-32.png")[..]),
+        ("/favicon-16.png", &include_bytes!("../assets/brand/favicon-16.png")[..]),
+    ] {
+        let (status, head, body) = get_bytes(server.addr(), path);
+        assert_eq!(status, 200, "{path} status; head={head}");
+        assert!(
+            head.to_lowercase().contains("content-type: image/png"),
+            "{path} must be labelled image/png, got {head}"
+        );
+        assert!(
+            head.to_lowercase().contains("cache-control:"),
+            "{path} must carry a cache header, got {head}"
+        );
+        assert_eq!(body, expected, "{path} bytes differ from the committed asset");
+        assert_eq!(&body[..8], b"\x89PNG\r\n\x1a\n", "{path} is not a PNG");
+    }
+
+    // And the page points at exactly these, on this origin.
+    let (_, _, index) = get(server.addr(), "/");
+    assert!(index.contains("href=\"/favicon-32.png\""), "index must declare the 32px icon");
+    assert!(index.contains("href=\"/favicon-16.png\""), "index must declare the 16px icon");
+
     server.shutdown();
 }
 
