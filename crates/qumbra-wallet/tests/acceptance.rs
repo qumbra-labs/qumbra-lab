@@ -229,6 +229,37 @@ fn scan_against_the_reference_fixture_renders_a_complete_report() {
     assert!(!report.contains(UNAVAILABLE), "{report}");
 }
 
+/// The CLI surface issue #297 changes, as a real process: the help text states
+/// **both** accepted schemes, and a scheme this wallet cannot speak is refused
+/// by a message naming both — never by the bare `must be http://` that sent
+/// #297's reporter looking in the wrong crate.
+///
+/// This is the CLI half of the seam; the parsing itself is pinned pure in
+/// `net::tests`. Nothing here opens a TLS connection — `ws://` is refused
+/// before a socket, which is the property being tested.
+#[test]
+fn the_cli_names_both_schemes_and_refuses_the_ones_it_cannot_speak() {
+    let dir = tmp("scheme_surface");
+    let d = dir.to_str().unwrap();
+    let (_, err, ok) = run(&["keygen", "--dir", d], None);
+    assert!(ok, "{err}");
+
+    let (_, usage, _) = run(&["--help"], None);
+    assert!(usage.contains("https://host[:port]"), "usage names https: {usage}");
+    assert!(usage.contains("http://host:PORT"), "…and http: {usage}");
+    assert!(
+        !usage.contains("must be http://"),
+        "the single-scheme refusal is gone from the surface: {usage}"
+    );
+
+    // `scan` renders a verdict rather than exiting non-zero on a per-key
+    // failure (#244's honesty vocabulary, untouched) — so the refusal is on
+    // stdout, and it must carry both schemes.
+    let (out, _, _) = run(&["scan", "--dir", d, "--url", "ws://127.0.0.1:1", "--to", "1"], None);
+    assert!(out.contains("https://"), "the refusal names https: {out}");
+    assert!(out.contains("http://"), "…and http: {out}");
+}
+
 /// `send`'s usage text and its pre-prove refusals, as a real process (issue
 /// #276). None of these reach `build_send`, so none pay a proof — the cases
 /// that DO prove live in `e2e_first_spend`.

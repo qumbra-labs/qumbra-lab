@@ -57,6 +57,10 @@ fn usage() {
          --url  is the compact/scan endpoint (cbserver or a node's discovery server)\n\
          --node is the node's discovery server: /v1/tree/leaves, /v1/anchors, POST /v1/tx\n\
                 (defaults to --url when omitted — one host usually serves both)\n\n\
+         Both URLs accept http://host:PORT (port required, plaintext) and\n\
+         https://host[:port] (TLS, port defaults to 443, roots are the compiled-in\n\
+         Mozilla set). There is no fallback from https to http: a TLS failure is\n\
+         reported, never downgraded.\n\n\
          Nothing here runs a node: every endpoint above is somebody else's.\n"
     );
 }
@@ -168,7 +172,7 @@ fn miner_rkm(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// Refuses on partial scan coverage — spending on incomplete knowledge risks
 /// double-claimed nullifiers (#244's discipline, untouched).
 fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
-    use qlab_cbserver::client::{light_client_scan, Completeness, ScanConfig};
+    use qlab_cbserver::client::{light_client_scan_with, Completeness, ScanConfig};
     use qumbra_wallet::net::{self, HttpAnchorSource, HttpLeafSource, SubmitClass};
     use qumbra_wallet::send::{build_send, os_rng, Spendable};
     use qumbra_wallet::sync::{hex32, sync_and_select};
@@ -197,8 +201,10 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
     for &idx in &w.allocated {
         let d = wallet.diversifier_at_index(idx);
         let kp = wallet.diversified_keypair(&d);
-        let outcome = light_client_scan(url, &kp.dk, 0, scan_to, ScanConfig::default(), &mut rng)
-            .map_err(|e| format!("scan never started for index {idx}: {e}"))?;
+        let mut fetch = net::scan_fetch(url);
+        let outcome =
+            light_client_scan_with(&mut fetch, &kp.dk, 0, scan_to, ScanConfig::default(), &mut rng)
+                .map_err(|e| format!("scan never started for index {idx}: {e}"))?;
         match outcome.completeness() {
             Completeness::Complete | Completeness::Shadowed { .. } => {}
             other => {
@@ -327,11 +333,12 @@ fn backup(args: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
-    use qlab_cbserver::client::{light_client_scan, ScanConfig};
+    use qlab_cbserver::client::{light_client_scan_with, ScanConfig};
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
     let dir = dir_of(args)?;
-    let url = flag(args, "--url").ok_or("scan requires --url http://host:port")?;
+    let url = flag(args, "--url")
+        .ok_or("scan requires --url http://host:port or --url https://host[:port]")?;
     let to: u64 = flag(args, "--to")
         .ok_or("scan requires --to HEIGHT (explicit: a balance is a claim about a range)")?
         .parse()?;
@@ -352,7 +359,11 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
         // `Err` here means the scan NEVER STARTED for this key (compact fetch or
         // decode failed) — render the named cannot-know verdict rather than
         // aborting the whole report or, worse, printing a zero.
-        match light_client_scan(url, &kp.dk, from, to, ScanConfig::default(), &mut rng) {
+        // The fetch is this crate's (`net::scan_fetch`), so the scan reaches an
+        // https edge; the scan FLOW is still qlab-cbserver's, unmodified.
+        let mut fetch = qumbra_wallet::net::scan_fetch(url);
+        match light_client_scan_with(&mut fetch, &kp.dk, from, to, ScanConfig::default(), &mut rng)
+        {
             Ok(outcome) => scans.push(DivScan::from_outcome(idx, short, &outcome)),
             Err(e) => scans.push(DivScan {
                 index: idx,

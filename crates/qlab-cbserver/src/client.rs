@@ -544,7 +544,33 @@ pub fn light_client_scan(
     rng: &mut StdRng,
 ) -> std::io::Result<ScanOutcome> {
     let mut fetch = |path: &str| http_get(base_url, path).map_err(|e| e.to_string());
-    scan_over(&mut fetch, dk, from, to, config, rng)
+    light_client_scan_with(&mut fetch, dk, from, to, config, rng)
+}
+
+/// The same scan, over a **caller-supplied fetch** — one `Err(String)` per
+/// failed path, exactly the contract [`light_client_scan`] builds internally.
+///
+/// Exists for `qumbra-wallet` (issue #297): the wallet must reach an
+/// https-only edge, and [`http_get`] below is plaintext-only and stays that
+/// way — giving *this* crate a TLS stack would link rustls into `qlab-node`'s
+/// build graph, and therefore into the consensus node's. So the wallet brings
+/// its own transport and this function lends it the flow. **The scan itself is
+/// not duplicated anywhere**: [`light_client_scan`] is now a two-line wrapper
+/// over this, so the socket path, the wallet's TLS path and the in-process
+/// [`scan_local`] are all one [`scan_over`] and cannot drift on what counts as
+/// detected, opened or unopened.
+pub fn light_client_scan_with<F>(
+    fetch: &mut F,
+    dk: &Dk,
+    from: u64,
+    to: u64,
+    config: ScanConfig,
+    rng: &mut StdRng,
+) -> std::io::Result<ScanOutcome>
+where
+    F: FnMut(&str) -> Result<Vec<u8>, String>,
+{
+    scan_over(fetch, dk, from, to, config, rng)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
@@ -724,6 +750,15 @@ where
 /// Minimal dependency-free HTTP/1.1 GET over `TcpStream`. `base_url` is
 /// `http://host:port`; returns the response body bytes. Uses `Connection: close`
 /// and reads to EOF (fixed, small localhost responses).
+///
+/// **Plaintext-only, and deliberately so (issue #297).** Every caller here is a
+/// test or a tool talking to a `serve()` handle on loopback; the one caller that
+/// needed to reach a public https edge — `qumbra-wallet` — brings its own
+/// transport and takes the scan flow through [`light_client_scan_with`]. Adding
+/// TLS *here* would link rustls into `qlab-node`, and so into `qumbra-node`,
+/// `qumbra-faucet`, `qumbra-explorer` and `qumbra-ffi`, for the benefit of one
+/// leaf binary. So `base_url must be http://` below is not a stale copy of the
+/// wallet's old refusal — it is an accurate statement about this helper.
 pub fn http_get(base_url: &str, path_and_query: &str) -> std::io::Result<Vec<u8>> {
     let authority = base_url
         .strip_prefix("http://")
