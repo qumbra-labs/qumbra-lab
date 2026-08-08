@@ -5,6 +5,8 @@
 //!                                          key files; print the genesis hash
 //!   qumbra-node run --config FILE          run a full node (TCP + RandomX + disk)
 //!   qumbra-node audit [--out FILE]         emit the params_devnet convergence audit
+//!   qumbra-node audit-emission --data-dir  walk a data dir's main chain and report
+//!     DIR [--from H] [--to H]              every body.coinbase ≠ schedule height
 //! ```
 //!
 //! All the testable logic lives in the library ([`qumbra_node`]); this is thin
@@ -21,6 +23,7 @@ use qlab_devnet::pow::RandomXPow;
 use qlab_node::round::ObsClock;
 use qlab_p2p::adapter::MiningClock;
 
+use qumbra_node::audit_emission::{self, EXIT_CANNOT_RUN};
 use qumbra_node::config::NodeConfig;
 use qumbra_node::genesis::GenesisFile;
 use qumbra_node::params_audit;
@@ -31,6 +34,11 @@ use qumbra_node::verifier::select_verifier;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // audit-emission carries its own exit-code contract (0 clean / 1 mismatch /
+    // 2 cannot-run) and must not be folded into the binary-wide SUCCESS/FAILURE map.
+    if args.first().map(String::as_str) == Some("audit-emission") {
+        return cmd_audit_emission(&args[1..]);
+    }
     match dispatch(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -53,6 +61,10 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("check") => check_config(&args[1..]),
         Some("halt-status") => halt_status(&args[1..]),
         Some("audit") => audit(&args[1..]),
+        Some("audit-emission") => {
+            // Handled in main() for exit-code fidelity; unreachable via dispatch.
+            Err("audit-emission is dispatched from main".into())
+        }
         Some("-h") | Some("--help") | None => {
             usage();
             Ok(())
@@ -74,8 +86,38 @@ fn usage() {
            [--sample-interval-secs N]           telemetry sampling cadence (default 30; observability only)\n  \
          qumbra-node check --config FILE        pre-flight a deployed config (genesis + keys), bind nothing\n  \
          qumbra-node halt-status [--config F]   print this binary's halt schedule + revision digest (#74)\n  \
-         qumbra-node audit [--out FILE]         emit the params_devnet ⟷ FROZEN v1.0 convergence audit"
+         qumbra-node audit [--out FILE]         emit the params_devnet ⟷ FROZEN v1.0 convergence audit\n  \
+         qumbra-node audit-emission --data-dir DIR [--from H] [--to H]\n      \
+                                            walk the persisted main chain; report every height whose\n      \
+                                            body.coinbase ≠ emission::coinbase(height) (lab #299 / QUM-82)\n      \
+                                            exit 0 = clean, 1 = ≥1 mismatch, 2 = could not run"
     );
+}
+
+/// Read-only emission localization (lab #299 baton (a) / QUM-82).
+///
+/// Exit codes are the operator contract, not free-form: 0 ran-clean, 1 ran-with-
+/// mismatches, 2 could-not-run (bad dir / unreadable log / interval beyond tip /
+/// usage). The report always ends with a summary line so a clean chain is never silent.
+fn cmd_audit_emission(args: &[String]) -> ExitCode {
+    let (data_dir, from, to) = match audit_emission::parse_args(args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("qumbra-node audit-emission: {e}");
+            usage();
+            return ExitCode::from(EXIT_CANNOT_RUN);
+        }
+    };
+    match audit_emission::audit_emission(&data_dir, from, to) {
+        Ok(report) => {
+            println!("{}", report.format_output());
+            ExitCode::from(report.exit_code())
+        }
+        Err(e) => {
+            eprintln!("qumbra-node audit-emission: {e}");
+            ExitCode::from(EXIT_CANNOT_RUN)
+        }
+    }
 }
 
 /// `--name VALUE` flag lookup.
