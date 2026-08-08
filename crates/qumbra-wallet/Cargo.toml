@@ -47,6 +47,29 @@ bincode = "1"
 # same pin as qlab-consensus.
 p3-field = "=0.6.1"
 
+# TLS for the wallet↔edge hop (issue #297, coordinator ruling 2026-08-08):
+# rustls as a STREAM LAYER under this crate's existing hand-rolled HTTP/1.1 —
+# not ureq, not hyper. The typed 202/400/503 vocabulary in `net.rs` is
+# load-bearing per the stamped A1 decision, and it already works; the problem
+# lives entirely at the transport.
+#
+# `ring` rather than the default `aws-lc-rs` provider: aws-lc-rs wants cmake in
+# the build environment and this workspace has never needed one. `logging` is
+# left off so no `log` crate enters a leaf binary that prints its own diagnostics.
+# `tls12` is kept: the edge negotiates 1.3, but refusing 1.2 outright would make
+# a wallet that fails against a correctly-configured origin somebody else runs.
+#
+# `rustls-pki-types` is deliberately NOT a direct dependency: `ServerName` comes
+# through `rustls::pki_types`, rustls' own public re-export, so there is one
+# version to keep in step instead of two. It is pinned in `Cargo.lock` either way.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+# The Mozilla root program, compiled in. No `rustls-native-certs`: reading the
+# platform trust store makes the wallet's answer depend on the operator's
+# machine, and a wallet that trusts a locally-injected root is a wallet whose
+# server authentication — the ONLY property classical TLS buys us here — is
+# whatever the host says it is.
+webpki-roots = "1"
+
 # The first-spend e2e (issue #276) runs a REAL local devnet: a node the test
 # mines directly and serves over a real socket, the faucet that funds the
 # sender, and the production verifier. Dev-only — the wallet itself stays
