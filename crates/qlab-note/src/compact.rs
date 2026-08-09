@@ -411,6 +411,41 @@ pub fn committed_contents_prefix(b: &[u8]) -> Result<&[u8], CodecError> {
     Ok(&b[..pos])
 }
 
+/// The committed region's **payload section**, grouped by recipient — what
+/// `/v1/block/{h}/tx/{i}/full` serves (issue #188, the serving+open baton).
+///
+/// A **projection**, exactly like [`committed_contents_prefix`] is for the
+/// compact wire: every payload here is a copy of `PAYLOAD_LEN` bytes out of the
+/// committed blob. Nothing is re-encoded, nothing is derived, and no second
+/// source is consulted — so a served payload cannot differ from the one the
+/// block body's preimage covers.
+///
+/// The grouping is not a choice either. The section is flat and in **D4 order**
+/// (recipient-major, then per-output), one payload per entry, so the recipient
+/// boundaries are `recipients[i].entries.len()` — the same region's own
+/// declaration of its shape. `decode_committed_discovery` has already refused
+/// any section whose length is not `n_entries × PAYLOAD_LEN`, so the walk below
+/// consumes the flat list exactly.
+///
+/// The outer list is per recipient **including recipients with no outputs**: a
+/// bundle with `n_outputs = 0` contributes an empty payload list, never a
+/// missing one, because the served index must be the committed index. A wallet
+/// that detected on recipient `i` reads payload list `i`.
+pub fn committed_payloads_per_recipient(
+    b: &[u8],
+) -> Result<Vec<Vec<Vec<u8>>>, CodecError> {
+    let (recipients, flat) = decode_committed_discovery(b)?;
+    let mut out = Vec::with_capacity(recipients.len());
+    let mut pos = 0usize;
+    for r in &recipients {
+        let n = r.entries.len();
+        out.push(flat[pos..pos + n].to_vec());
+        pos += n;
+    }
+    debug_assert_eq!(pos, flat.len(), "the payload count is the entry count, by decode");
+    Ok(out)
+}
+
 /// The commitments a group's contents describe, in D4's order (recipient-major,
 /// then per-output).
 pub fn contents_commitments(recipients: &[RecipientBundle]) -> Vec<[u8; CM_LEN]> {
@@ -529,6 +564,74 @@ mod tests {
             + 2 * (CT_LEN + 1) // two bundles: ct + n_outputs
             + 3 * CompactEntry::LEN_EMPTY_CLUE; // three entries in total
         assert_eq!(bytes.len(), expected);
+    }
+
+    fn payload(seed: u8) -> Vec<u8> {
+        (0..PAYLOAD_LEN).map(|i| seed.wrapping_add(i as u8)).collect()
+    }
+
+    /// The payload section regroups by recipient in D4 order, and every byte it
+    /// hands back is a **copy out of the committed blob at its own offset** —
+    /// the projection property, asserted as offset arithmetic rather than as a
+    /// round-trip through the encoder (a round-trip would pass even if serving
+    /// re-encoded).
+    #[test]
+    fn payloads_project_out_of_the_committed_region_at_their_own_offsets() {
+        let g = sample_group(); // recipients: 2 entries, then 1 entry
+        let payloads = vec![payload(0x10), payload(0x20), payload(0x30)];
+        let committed = encode_committed_discovery(&g.recipients, &payloads);
+
+        let per_recipient = committed_payloads_per_recipient(&committed).expect("decodes");
+        assert_eq!(per_recipient.len(), 2, "one list per recipient, including empty ones");
+        assert_eq!(per_recipient[0], vec![payload(0x10), payload(0x20)]);
+        assert_eq!(per_recipient[1], vec![payload(0x30)]);
+
+        // Byte identity against the blob itself: the section starts where the
+        // `group_contents` prefix ends and is `n_entries × PAYLOAD_LEN` long.
+        let prefix = committed_contents_prefix(&committed).expect("prefix decodes");
+        let start = prefix.len();
+        assert_eq!(committed.len() - start, 3 * PAYLOAD_LEN);
+        for (i, p) in per_recipient.concat().iter().enumerate() {
+            let at = start + i * PAYLOAD_LEN;
+            assert_eq!(
+                p.as_slice(),
+                &committed[at..at + PAYLOAD_LEN],
+                "payload {i} is the committed bytes at its own offset, not a re-encoding"
+            );
+        }
+    }
+
+    /// A recipient with no outputs contributes an **empty list, never a missing
+    /// one**: the served index has to be the committed index, or a wallet that
+    /// detected on recipient `i` would read somebody else's payloads.
+    #[test]
+    fn a_recipient_with_no_outputs_keeps_its_position_in_the_payload_section() {
+        let recipients = vec![
+            RecipientBundle { ct: ct_pattern(0x01), entries: vec![] },
+            RecipientBundle { ct: ct_pattern(0x02), entries: vec![entry(7)] },
+        ];
+        let committed = encode_committed_discovery(&recipients, &[payload(0x55)]);
+        let per_recipient = committed_payloads_per_recipient(&committed).expect("decodes");
+        assert_eq!(per_recipient.len(), 2);
+        assert!(per_recipient[0].is_empty(), "position kept, list empty");
+        assert_eq!(per_recipient[1], vec![payload(0x55)]);
+    }
+
+    /// A region whose payload section is the wrong length is refused by the
+    /// decoder before any grouping happens — never grouped into short lists,
+    /// which a wallet would read as `PayloadMissing` about a chain that
+    /// committed the payload.
+    #[test]
+    fn a_short_payload_section_is_refused_not_grouped_short() {
+        let g = sample_group();
+        let payloads = vec![payload(1), payload(2), payload(3)];
+        let good = encode_committed_discovery(&g.recipients, &payloads);
+        let short = &good[..good.len() - PAYLOAD_LEN];
+        assert!(matches!(
+            committed_payloads_per_recipient(short),
+            Err(CodecError::PayloadSectionLen { expected, got })
+                if expected == 3 * PAYLOAD_LEN && got == 2 * PAYLOAD_LEN
+        ));
     }
 
     #[test]

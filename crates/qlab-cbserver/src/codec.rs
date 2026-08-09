@@ -67,8 +67,8 @@
 //! > baton has now hit twice (the other was `Ivk`'s "scanning is unaffected").
 
 pub use qlab_note::compact::{
-    committed_contents_prefix, contents_commitments, contents_entry_count,
-    decode_committed_discovery, decode_group, decode_group_contents,
+    committed_contents_prefix, committed_payloads_per_recipient, contents_commitments,
+    contents_entry_count, decode_committed_discovery, decode_group, decode_group_contents,
     encode_committed_discovery, encode_group, encode_group_contents, group_len, groups_eq,
     read_bundle, read_entry, read_group, read_group_contents, read_varint, write_bundle,
     write_entry, write_group, write_group_contents, write_varint, CodecError, CompactGroup,

@@ -55,8 +55,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use qlab_cbserver::codec::{
-    decode_committed_discovery, encode_committed_discovery, encode_compact_response,
-    encode_full_response,
+    committed_payloads_per_recipient, decode_committed_discovery, encode_committed_discovery,
+    encode_compact_response, encode_full_response,
     read_varint, write_varint, CodecError, CompactBlock, CompactGroup,
 };
 use qlab_cbserver::tree::Frontier;
@@ -69,7 +69,7 @@ use std::collections::HashMap;
 
 use crate::mempool::{Mempool, MempoolError};
 use crate::node::{Node, NodeState};
-use crate::store::{ChainStore, CommitmentStore, Hash32, NullifierStore, StoredBlock, StoredTx};
+use crate::store::{ChainStore, CommitmentStore, Hash32, NullifierStore, StoredBlock};
 use crate::telemetry::{LocalCommitment, Telemetry};
 
 /// The RPC wire-format version byte for the node's **own** surfaces —
@@ -150,9 +150,11 @@ fn tx_id_of_public(p: &TxPublic) -> Hash32 {
     tx_id(&p.anchor, &p.nullifiers, &p.commitments, p.bucket.logical_actions(), p.fee)
 }
 
-fn tx_id_of_stored(t: &StoredTx) -> Hash32 {
-    tx_id(&t.anchor, &t.nullifiers, &t.commitments, t.bucket_actions, t.fee)
-}
+// NOTE (issue #188, the serving+open baton): `tx_id_of_stored` is gone. Its one
+// caller was `/v1/…/full`'s join from a stored transaction into the in-memory
+// discovery side table, and that join is what made the route answer 404 for
+// every transaction this node did not itself admit. Serving projects the
+// committed region now, so nothing needs a stored transaction's statement id.
 
 // Re-exported from where the rule now lives (issue #278): `qlab_devnet::body`,
 // beside the block-level rule it projects. The "rpc-layer precheck on purpose"
@@ -287,6 +289,83 @@ impl BlockDiscovery {
             })
             .collect()
     }
+
+    /// One transaction's committed **AEAD payloads**, per recipient — the other
+    /// half of the projection, and the half `/v1/compact` deliberately leaves
+    /// behind (issue #188, the serving+open baton).
+    ///
+    /// `None` when this block has no transaction at `tx_index`; `Err` when the
+    /// committed region does not decode, which is a broken internal invariant
+    /// for the same reason [`Self::compact_groups`] gives — and refused for the
+    /// same reason too: an empty payload list is the meaningful answer *"this
+    /// transaction attaches nothing to open"*, and a serving surface that says
+    /// that about bytes it could not read is the absence-reads-as-healthy shape
+    /// option 3 exists to remove.
+    ///
+    /// The bytes come out of `self.groups[tx_index]`, which is
+    /// `StoredTx::discovery` cloned, so there is no encoder between the block
+    /// and the served payload and no side table between them either.
+    pub fn payloads_of(&self, tx_index: u64) -> Option<Result<Vec<Vec<Vec<u8>>>, CodecError>> {
+        let bytes = self.groups.get(usize::try_from(tx_index).ok()?)?;
+        Some(committed_payloads_per_recipient(bytes))
+    }
+}
+
+/// Why `/v1/block/{h}/tx/{i}/full` could not answer — each case named, because
+/// the client half turns each one into a different sentence for a person
+/// (`qlab_cbserver::client::Unopened`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FullRefusal {
+    /// The node's main-chain projection holds no block at this height. A
+    /// **client fault by coordinates**, and the same 404 a wallet gets from the
+    /// reference server: the height is not on this node's chain, or not yet.
+    NoSuchBlock { height: u64 },
+    /// The block exists and has no transaction at this index. Carries the count
+    /// it does have, so a wallet can tell "I asked past the end" from "the node
+    /// is on a different chain".
+    NoSuchTx { height: u64, tx_index: u64, n_txs: usize },
+    /// The committed region of that transaction did not decode — a stored block
+    /// carrying bytes `validate_body` would have refused. Never an empty
+    /// payload list; see [`BlockDiscovery::payloads_of`].
+    Undecodable { height: u64, tx_index: u64, err: CodecError },
+}
+
+/// Encode the `/v1/block/{h}/tx/{i}/full` response over a main-chain
+/// projection — the payload half of the serving story (issue #188).
+///
+/// **The response is one transaction's whole payload section, or a refusal.**
+/// There is no page, no cursor and no client-chosen amount of work in this
+/// route, so unlike [`compact_response`] it has nothing to truncate: the
+/// request names one `(height, tx_index)` and the answer's size is decided by
+/// the block, not by the caller. That size is bounded twice over by the
+/// committed region's own shape — `n_recipients` is a `u8` and every payload is
+/// exactly `PAYLOAD_LEN` — and once more by consensus, since
+/// `check_tx_discovery` binds the payload count to the transaction's declared
+/// commitments (2 under the FROZEN 2×2 shape, i.e. 240 B of payload). A wallet
+/// therefore never has to ask whether it got all of it; **that is the contract,
+/// and it is the reason this route needs no client-side paging loop where
+/// `/v1/compact` needed one (lab issue #309).**
+///
+/// The wire is [`encode_full_response`] — the same encoder, and therefore the
+/// same decoder, that `qlab-cbserver`'s reference server and the light-client
+/// scan already speak. A second wire for the deployed node would be a second
+/// thing to keep in step for no gain.
+pub fn full_response(
+    blocks: &[BlockDiscovery],
+    height: u64,
+    tx_index: u64,
+) -> Result<Vec<u8>, FullRefusal> {
+    let block = blocks
+        .iter()
+        .find(|b| b.height == height)
+        .ok_or(FullRefusal::NoSuchBlock { height })?;
+    let payloads = block.payloads_of(tx_index).ok_or(FullRefusal::NoSuchTx {
+        height,
+        tx_index,
+        n_txs: block.groups.len(),
+    })?;
+    let payloads = payloads.map_err(|err| FullRefusal::Undecodable { height, tx_index, err })?;
+    Ok(encode_full_response(&payloads))
 }
 
 /// Encode the `/v1/compact` response for `[from, to]` over an **ascending**
@@ -655,12 +734,13 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
     }
 
     // ---- main-chain helpers (public API only) ------------------------------
-
-    /// The main chain, genesis-first, as stored blocks (walks tip→genesis via
-    /// `header.prev`, then reverses).
-    fn main_chain(&self) -> Vec<StoredBlock> {
-        main_chain_of(&self.node)
-    }
+    //
+    // NOTE (issue #188, the serving+open baton): the `main_chain()` wrapper over
+    // `main_chain_of` is gone with its last caller. `/v1/…/full` was that caller
+    // — it walked whole `StoredBlock`s, proofs included, to reach one
+    // transaction's discovery bytes; it now reads the same
+    // `main_chain_discovery()` projection `/v1/compact` does, which is ~1 % of
+    // the bytes and the same source.
 
     /// `(height, commitment-count-after-this-block)` for each main-chain height.
     ///
@@ -733,22 +813,31 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
     /// side table is not consulted here at all and cannot make a served group
     /// differ from the committed one.
     ///
-    /// The side table survives for `/v1/…/full` only: the AEAD payloads it holds
-    /// are **not** in the body preimage (`discovery-on-the-consensus-wire.md` D2
-    /// commits the compact bundle — `ct ‖ cm ‖ tag ‖ clue_len` — and nothing
-    /// else), so there is nowhere else for them to come from. Reported as a
-    /// finding on issue #188.
+    /// 🔴 **And `/v1/…/full` no longer reads it either** (issue #188, the
+    /// serving+open baton). The sentence that stood here — *"the AEAD payloads
+    /// it holds are not in the body preimage … so there is nowhere else for them
+    /// to come from"* — was true when it was written and stopped being true at
+    /// the mint (PR #252, issue #188 (a) as amended), which relocated the 120 B
+    /// payloads **into** the committed region. Both surfaces now project from
+    /// the block, so the side table is not a source for anything served and
+    /// cannot make a served byte differ from a committed one.
     fn compact_range_bytes(&self, from: u64, to: u64) -> Result<Vec<u8>, CodecError> {
         compact_response(&self.main_chain_discovery(), from, to)
     }
 
     /// The `/v1/…/full` per-recipient payload lists for one accepted `(height,
-    /// tx_index)`. `None` if the node has no such block/tx.
-    fn full_payloads(&self, height: u64, tx_index: u64) -> Option<Vec<Vec<Vec<u8>>>> {
-        let block = self.main_chain().into_iter().find(|b| b.header.height == height)?;
-        let tx = block.txs.get(tx_index as usize)?;
-        let disc = self.discovery.get(&tx_id_of_stored(tx))?;
-        Some(disc.recipients.iter().map(|r| r.payloads.clone()).collect())
+    /// tx_index)`, **projected from the committed region** — one function,
+    /// [`full_response`], shared with `qumbra-node`'s discovery server so the
+    /// in-process route and the deployed one cannot disagree about what a
+    /// transaction's payloads are.
+    ///
+    /// It used to join the block to the in-memory side table by statement id and
+    /// answer `None` when the lookup missed — i.e. a 404 for every transaction
+    /// this node did not itself admit, and for every transaction at all after a
+    /// restart. That is the same defect `/v1/compact` was carrying until issue
+    /// #188 baton 2, and it has the same fix.
+    fn full_bytes(&self, height: u64, tx_index: u64) -> Result<Vec<u8>, FullRefusal> {
+        full_response(&self.main_chain_discovery(), height, tx_index)
     }
 
     /// The frontier of the **live** node commitment tree at the leaf count the
@@ -786,8 +875,15 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             ["v1", "block", h, "tx", i, "full"] => {
                 let height = h.parse::<u64>().map_err(|_| (400, "invalid height"))?;
                 let index = i.parse::<u64>().map_err(|_| (400, "invalid tx index"))?;
-                let payloads = self.full_payloads(height, index).ok_or((404, "no such (height, tx)"))?;
-                Ok(encode_full_response(&payloads))
+                self.full_bytes(height, index).map_err(|e| match e {
+                    FullRefusal::NoSuchBlock { .. } | FullRefusal::NoSuchTx { .. } => {
+                        (404, "no such (height, tx)")
+                    }
+                    // Same discipline as `/v1/compact`'s: a stored block whose
+                    // committed region does not decode is a broken invariant,
+                    // never an empty payload list.
+                    FullRefusal::Undecodable { .. } => (500, "stored discovery does not decode"),
+                })
             }
             ["v1", "tree", "frontier"] => {
                 let at = query_u64(query, "at").ok_or((400, "missing/invalid 'at'"))?;
@@ -1960,6 +2056,49 @@ mod tests {
             from_block,
             "a side table that disagrees with the block changes nothing that is served"
         );
+    }
+
+    /// 🔴 **The same defect, one route later** (issue #188, the serving+open
+    /// baton). `/v1/…/full` kept the side-table join after `/v1/compact` lost
+    /// it, so a node answered 404 for every transaction it had not itself
+    /// admitted — every peer's transaction, and every transaction at all after
+    /// a restart. Since the mint the payloads are in the committed region, so
+    /// the block can answer.
+    ///
+    /// Nothing is submitted here, and the side table is then **poisoned** with
+    /// payloads for the same statement id: the served bytes do not move.
+    #[test]
+    fn full_serves_the_block_and_never_the_side_table() {
+        let (mut rpc, anchor) = rpc_with_finalized_genesis();
+        let fee = posted_fee(ArityBucket::TwoByTwo);
+        let tx = tx_with(anchor, &[1, 2], &[10, 11], fee);
+        apply_block_with(rpc.node_mut(), vec![tx.clone()]);
+        assert!(rpc.discovery.is_empty(), "the side table is empty on this path");
+
+        let served = rpc.route("/v1/block/1/tx/0/full").expect("the block can answer");
+        let per_recipient = qlab_cbserver::codec::decode_full_response(&served).unwrap();
+        assert_eq!(per_recipient.len(), 1);
+        assert_eq!(per_recipient[0], vec![vec![10u8; 120], vec![11u8; 120]]);
+
+        // Byte identity with the committed region's tail — the projection, not a
+        // re-encoding of something that merely agrees with it.
+        let hash = rpc.node().chain().tip_hash();
+        let stored = rpc.node().chain().block(&hash).expect("tip stored").clone();
+        let committed = &stored.txs[0].discovery;
+        let prefix = qlab_cbserver::codec::committed_contents_prefix(committed).unwrap().len();
+        assert_eq!(per_recipient.concat().concat(), committed[prefix..].to_vec());
+
+        // Poison the side table with different payloads for the same statement.
+        let txid = tx_id_of_public(&tx.public);
+        rpc.record_discovery(txid, disc_for(&[99]));
+        assert_eq!(
+            rpc.route("/v1/block/1/tx/0/full").unwrap(),
+            served,
+            "a side table that disagrees with the block changes nothing that is served"
+        );
+
+        // A transaction index past the block's end is a 404, not an empty list.
+        assert!(matches!(rpc.route("/v1/block/1/tx/9/full"), Err((404, _))));
     }
 
     /// The submitted artifacts must BE the transaction's committed group, not

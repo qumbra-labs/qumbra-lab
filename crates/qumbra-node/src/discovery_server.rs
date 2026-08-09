@@ -14,7 +14,7 @@
 //!
 //! ## What it is, and what it deliberately is not
 //!
-//! Four routes — the deployed binary's whole wallet-facing surface:
+//! Five routes — the deployed binary's whole wallet-facing surface:
 //!
 //! - `GET /v1/compact?from=&to=` — [`qlab_node::compact_response`]'s bytes, the
 //!   same encoder, over the same projection, that `NodeRpc` serves in-process
@@ -47,18 +47,41 @@
 //!   boolean-blind — brief §2). See [`SubmitRequest`] for how a write crosses
 //!   into the consensus loop without a second thread ever holding node state.
 //!
+//! - `GET /v1/block/{h}/tx/{i}/full` — the **committed AEAD payloads** of one
+//!   transaction ([`qlab_node::full_response`], issue #188's serving+open
+//!   baton). How a recipient **opens** what it found: `/v1/compact` says *which*
+//!   outputs are yours, and these bytes are the only place a transaction
+//!   output's `(value, ρ, rseed)` exists.
+//!
+//!   This route was the lane's named open item until now, and the sentence that
+//!   stood here — *"serving the committed payload section to a detached wallet
+//!   is … not this issue's"* — was written when it was true that
+//!   nothing on a deployed node could answer it. Since the mint (PR #252,
+//!   issue #188 (a) as amended) the 120 B payloads are **inside** the committed
+//!   region, so every node holds them and serving is a projection like every
+//!   other route here: [`respond_full`] copies `PAYLOAD_LEN` bytes at a time out
+//!   of the same snapshot `/v1/compact` reads, regrouped by the recipient
+//!   boundaries that region itself declares. No second encoding, no side table,
+//!   no new index — and `/v1/compact`'s golden vector does not move, because it
+//!   still serves the `group_contents` prefix and nothing more.
+//!
+//!   **The bound, stated because lab issue #309 is what happens when it is
+//!   not:** this route has no range and no cursor. One request names one
+//!   `(height, tx_index)` and the answer is that transaction's whole payload
+//!   section or a named refusal — never a prefix of it — so there is no client
+//!   paging loop to build and nothing that could silently truncate. The size is
+//!   the block's to decide, not the caller's, and consensus bounds it: the
+//!   payload count equals the transaction's declared commitment count
+//!   (`check_tx_discovery`), which the FROZEN 2×2 shape puts at 2, i.e. 240 B.
+//!
 //! Still not the wallet-facing RPC:
 //!
 //! - **`/v1/status` is not served here.** It is not this surface's scope and
 //!   the node already has a versioned health wire (`/v1/telemetry`).
 //!   `/v1/anchors` moved out of that sentence in issue #276 for the reason
 //!   above — it turned out to be load-bearing for spending, not health.
-//! - **`/v1/block/{h}/tx/{i}/full` is not served here.** Since issue #188 (a)
-//!   the AEAD payloads ride in the **committed** discovery region (they are no
-//!   longer side-table-only), but `/v1/compact` deliberately serves the
-//!   `group_contents` prefix and nothing more — that is what keeps its golden
-//!   vector byte-identical. Serving the committed payload section to a detached
-//!   wallet is the discovery lane's open item, not this issue's.
+//! - **`/v1/tree/frontier` is still not served**, for the reason above: a
+//!   frontier reconstructs a root, and a root is not a witness.
 //!
 //! ## The `POST /v1/tx` response wire, pinned
 //!
@@ -127,7 +150,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use qlab_devnet::body::{BodyError, TxEntry};
-use qlab_node::{compact_response, BlockDiscovery, Hash32, MempoolError, TreeLeaves};
+use qlab_node::{
+    compact_response, full_response, BlockDiscovery, FullRefusal, Hash32, MempoolError, TreeLeaves,
+};
 use qlab_p2p::adapter::TxSubmitRefusal;
 
 /// The note-discovery route (issue #188 baton 2).
@@ -138,6 +163,14 @@ pub const TREE_LEAVES_PATH: &str = "/v1/tree/leaves";
 
 /// The valid-anchor route (issue #276) — GET only, no query.
 pub const ANCHORS_PATH: &str = "/v1/anchors";
+
+/// The committed-payload route (issue #188, serving+open) — GET only. Written
+/// as a shape because the path carries its two arguments: it is
+/// `/v1/block/{height}/tx/{tx_index}/full`, the same URL
+/// `qlab_cbserver::client`'s scan has always built and the reference server has
+/// always answered. Held here so a 404 body can name it without spelling it a
+/// second time.
+pub const FULL_PATH_SHAPE: &str = "/v1/block/{h}/tx/{i}/full";
 
 /// The submit route (issue #275, decision brief A1) — POST only.
 pub const TX_SUBMIT_PATH: &str = "/v1/tx";
@@ -534,13 +567,25 @@ impl DiscoveryServer {
                         };
                         Ok(snapshot.encoded.clone())
                     }
-                    _ => Err((
-                        404,
-                        format!(
-                            "not found: try {COMPACT_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, \
-                             {ANCHORS_PATH}, or POST {TX_SUBMIT_PATH}"
-                        ),
-                    )),
+                    // The payload route carries its arguments in the path, so it
+                    // is matched on shape rather than by equality. A path that
+                    // is not this shape falls through to the 404 below.
+                    _ => match full_path_args(path) {
+                        Some(args) => {
+                            let snapshot = match view.lock() {
+                                Ok(g) => Arc::clone(&g),
+                                Err(p) => Arc::clone(&p.into_inner()),
+                            };
+                            respond_full(&snapshot, args)
+                        }
+                        None => Err((
+                            404,
+                            format!(
+                                "not found: try {COMPACT_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, \
+                                 {ANCHORS_PATH}, {FULL_PATH_SHAPE}, or POST {TX_SUBMIT_PATH}"
+                            ),
+                        )),
+                    },
                 };
                 let _ = match response {
                     Ok(bytes) => {
@@ -602,6 +647,63 @@ pub fn respond(view: &DiscoveryView, query: &str) -> Result<Vec<u8>, (u16, Strin
 pub fn respond_leaves(view: &LeavesView, query: &str) -> Result<Vec<u8>, (u16, String)> {
     let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'".to_string()))?;
     Ok(TreeLeaves::page(&view.leaves, from).to_bytes())
+}
+
+/// The two path arguments of `/v1/block/{h}/tx/{i}/full`, **unparsed** — so the
+/// shape match and the number parse stay two separate answers (a path that is
+/// not this route is a 404; this route with a non-numeric height is a 400).
+///
+/// `None` for anything that is not this shape.
+fn full_path_args(path: &str) -> Option<(&str, &str)> {
+    match path.trim_matches('/').split('/').collect::<Vec<_>>().as_slice() {
+        ["v1", "block", h, "tx", i, "full"] => Some((h, i)),
+        _ => None,
+    }
+}
+
+/// The socket-free `/v1/block/{h}/tx/{i}/full` core: one transaction's committed
+/// AEAD payloads, projected out of the same snapshot `/v1/compact` reads.
+///
+/// The page arithmetic that `/v1/compact` and `/v1/tree/leaves` need has no
+/// analogue here and that is the contract, not an omission: the request names
+/// one transaction, so the answer is all of that transaction's payload section
+/// or a refusal (see the module docs).
+///
+/// Refusals, each its own answer because the client turns each into a different
+/// sentence for a person:
+///
+/// - a non-numeric height or index — **400**, before the snapshot is consulted;
+/// - a height this node's projection does not hold, or a transaction index past
+///   the block's end — **404**, the same honest answer the reference server
+///   gives and the one a wallet already renders as `PayloadUnavailable`;
+/// - a stored block whose committed region does not decode — **500 rather than
+///   an empty payload list**, for the same reason [`respond`] refuses there: an
+///   empty list is the meaningful answer *"nothing to open here"*, and it must
+///   never stand in for a broken invariant.
+pub fn respond_full(
+    view: &DiscoveryView,
+    (h, i): (&str, &str),
+) -> Result<Vec<u8>, (u16, String)> {
+    let height = h.parse::<u64>().map_err(|_| (400, format!("invalid height `{h}`")))?;
+    let tx_index = i.parse::<u64>().map_err(|_| (400, format!("invalid tx index `{i}`")))?;
+    full_response(&view.blocks, height, tx_index).map_err(|e| match e {
+        FullRefusal::NoSuchBlock { height } => (
+            404,
+            format!(
+                "no such block: this node's discovery projection holds no main-chain height \
+                 {height} (tip {})",
+                view.tip_height().map(|t| t.to_string()).unwrap_or_else(|| "none".into())
+            ),
+        ),
+        FullRefusal::NoSuchTx { height, tx_index, n_txs } => (
+            404,
+            format!("no such transaction: height {height} carries {n_txs} transaction(s), asked for index {tx_index}"),
+        ),
+        FullRefusal::Undecodable { height, tx_index, err } => (
+            500,
+            format!("stored discovery does not decode at height {height} tx {tx_index}: {err:?}"),
+        ),
+    })
 }
 
 /// Handle one `POST /v1/tx` on its own bounded thread: read the body, decode,
@@ -878,38 +980,47 @@ mod tests {
     }
 
     /// Nothing else is served, and the refusals are the RPC's refusals — not a
-    /// half-implemented wallet API. `/v1/…/full` and `/v1/tree/frontier` in
-    /// particular stay 404s (see the module docs), and the read routes stay
-    /// GET-only even now that a write route exists beside them.
+    /// half-implemented wallet API. `/v1/tree/frontier` in particular stays a
+    /// 404 (see the module docs), and the read routes stay GET-only even now
+    /// that a write route exists beside them.
     #[test]
-    fn only_the_four_routes_are_served_and_methods_are_gated() {
+    fn only_the_five_routes_are_served_and_methods_are_gated() {
         let view = Arc::new(Mutex::new(Arc::new(a_view())));
         let (srv, _submits) = serve(Arc::clone(&view), no_leaves());
         let addr = srv.addr();
 
         // `/v1/anchors` is NOT in this list any more: issue #276 made it a
         // served route, because a wallet cannot pick a legal `anchor_count`
-        // without it. `/v1/tree/frontier` stays unserved on purpose — a
-        // frontier reconstructs a root, and a root is not a witness.
+        // without it. `/v1/block/{h}/tx/{i}/full` left it too (issue #188's
+        // serving+open baton — the payloads are committed, so this node holds
+        // them). `/v1/tree/frontier` stays unserved on purpose — a frontier
+        // reconstructs a root, and a root is not a witness.
         for path in [
             "/",
             "/metrics",
             "/v1/telemetry",
             "/v1/status",
             "/v1/tree/frontier?at=1",
-            "/v1/block/1/tx/0/full",
+            // Near-misses of the payload route's shape: a 404 by shape, never a
+            // 400 (which would claim the route exists and the arguments are bad).
+            "/v1/block/1/tx/0",
+            "/v1/block/1/tx/0/full/extra",
+            "/v1/block/1/full",
         ] {
             let (status, _) = get(addr, path);
             assert!(status.starts_with("HTTP/1.1 404"), "{path} => {status}");
         }
 
-        // Bad bounds are 400s, not empty successes — on both read routes.
+        // Bad bounds are 400s, not empty successes — on every read route that
+        // takes an argument, including the payload route's two path arguments.
         for path in [
             "/v1/compact",
             "/v1/compact?from=0",
             "/v1/compact?from=2&to=1",
             "/v1/tree/leaves",
             "/v1/tree/leaves?from=zzz",
+            "/v1/block/zz/tx/0/full",
+            "/v1/block/1/tx/zz/full",
         ] {
             let (status, _) = get(addr, path);
             assert!(status.starts_with("HTTP/1.1 400"), "{path} => {status}");
@@ -919,6 +1030,8 @@ mod tests {
         let (status, _) = post(addr, "/v1/compact", b"");
         assert!(status.starts_with("HTTP/1.1 405"), "{status}");
         let (status, _) = post(addr, "/v1/tree/leaves", b"");
+        assert!(status.starts_with("HTTP/1.1 405"), "{status}");
+        let (status, _) = post(addr, "/v1/block/1/tx/0/full", b"");
         assert!(status.starts_with("HTTP/1.1 405"), "{status}");
         // …and a read verb on the write route is a 405 too, not a 404: the
         // route exists and the answer says what it takes.
@@ -1122,6 +1235,104 @@ mod tests {
         assert!(body.contains("submit-queue-full"), "{body}");
 
         srv.shutdown();
+    }
+
+    // ---- the committed payload route (issue #188, serving+open) --------------
+
+    /// A committed region with real recipient shapes and recognisable payload
+    /// bytes: recipient 0 has two outputs, recipient 1 has one.
+    fn a_committed_group_with_payloads() -> (Vec<u8>, Vec<Vec<u8>>) {
+        use qlab_note::wire::{ClueSlot, CompactEntry, RecipientBundle};
+        let entry = |s: u8| CompactEntry { cm: [s; 32], tag: [s ^ 0x5a; 8], clue: ClueSlot::Empty };
+        let ct = |b: u8| -> [u8; qlab_note::kem::CT_LEN] { [b; qlab_note::kem::CT_LEN] };
+        let recipients = vec![
+            RecipientBundle { ct: ct(0x11), entries: vec![entry(1), entry(2)] },
+            RecipientBundle { ct: ct(0x22), entries: vec![entry(3)] },
+        ];
+        let payloads: Vec<Vec<u8>> = (0..3u8)
+            .map(|k| (0..qlab_cbserver::codec::PAYLOAD_LEN).map(|i| k.wrapping_add(i as u8)).collect())
+            .collect();
+        (
+            qlab_cbserver::codec::encode_committed_discovery(&recipients, &payloads),
+            payloads,
+        )
+    }
+
+    /// 🔴 **The route this baton exists for.** The served payloads are the
+    /// block's own committed bytes, regrouped by the recipient boundaries that
+    /// same region declares — decoded by the wire the light client already
+    /// speaks, and compared to the committed blob's tail rather than to
+    /// anything this test re-encoded.
+    #[test]
+    fn serves_the_committed_payloads_over_a_real_socket() {
+        use qlab_cbserver::codec::{decode_full_response, PAYLOAD_LEN};
+
+        let (committed, payloads) = a_committed_group_with_payloads();
+        let view = DiscoveryView {
+            blocks: vec![
+                projected(0, 0, vec![]),
+                projected(1, 1, vec![committed.clone(), TxEntry::empty_discovery()]),
+            ],
+        };
+        let (srv, _submits) = serve(Arc::new(Mutex::new(Arc::new(view))), no_leaves());
+        let addr = srv.addr();
+
+        let (status, body) = get(addr, "/v1/block/1/tx/0/full");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        let per_recipient =
+            decode_full_response(&body).expect("the served bytes are the ratified /full wire");
+        assert_eq!(per_recipient.len(), 2, "one list per committed recipient");
+        assert_eq!(per_recipient[0], vec![payloads[0].clone(), payloads[1].clone()]);
+        assert_eq!(per_recipient[1], vec![payloads[2].clone()]);
+
+        // Byte identity against the committed region itself: the payload section
+        // is its tail, and what was served is a copy of it in order.
+        let tail = &committed[committed.len() - 3 * PAYLOAD_LEN..];
+        assert_eq!(
+            per_recipient.concat().concat(),
+            tail.to_vec(),
+            "served payloads ARE the committed tail, in order — no re-encoding"
+        );
+
+        // An `n = 0` transaction serves an EMPTY payload list, not a 404: "this
+        // transaction attaches nothing to open" is a real answer about a real
+        // transaction, and it is not the same fact as "no such transaction".
+        let (status, body) = get(addr, "/v1/block/1/tx/1/full");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        assert!(decode_full_response(&body).expect("decodes").is_empty());
+
+        srv.shutdown();
+    }
+
+    /// Each refusal by name and by status, because the client turns each into a
+    /// different sentence: coordinates that do not exist are 404s and carry what
+    /// the node does hold, and an undecodable committed region is a **500 rather
+    /// than an empty payload list** — the same rule `/v1/compact` follows.
+    #[test]
+    fn the_payload_route_refuses_by_name_and_never_with_an_empty_list() {
+        let (committed, _) = a_committed_group_with_payloads();
+        let view = DiscoveryView {
+            blocks: vec![projected(0, 0, vec![]), projected(1, 1, vec![committed])],
+        };
+
+        // A height the projection does not hold.
+        let (code, msg) = respond_full(&view, ("9", "0")).expect_err("must refuse");
+        assert_eq!(code, 404, "{msg}");
+        assert!(msg.contains("tip 1"), "the refusal says what the node does hold: {msg}");
+
+        // A transaction index past the block's end, with the count it has.
+        let (code, msg) = respond_full(&view, ("1", "7")).expect_err("must refuse");
+        assert_eq!(code, 404, "{msg}");
+        assert!(msg.contains("carries 1 transaction"), "{msg}");
+
+        // Unparseable arguments never reach the snapshot.
+        assert_eq!(respond_full(&view, ("x", "0")).expect_err("must refuse").0, 400);
+        assert_eq!(respond_full(&view, ("1", "x")).expect_err("must refuse").0, 400);
+
+        // 🔴 A stored block whose committed region does not decode.
+        let corrupt = DiscoveryView { blocks: vec![projected(0, 0, vec![vec![0x02, 0x00]])] };
+        let (code, msg) = respond_full(&corrupt, ("0", "0")).expect_err("must refuse");
+        assert_eq!(code, 500, "{msg}");
     }
 
     /// 🔴 A corrupt committed group is a 500 and never an empty group. An empty

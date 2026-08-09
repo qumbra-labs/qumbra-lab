@@ -1236,6 +1236,42 @@ mod tests {
         assert!(matches!(out.completeness(), Completeness::Incomplete { opened: 0, .. }));
     }
 
+    /// A `/full` that answers 200 with a **truncated** body — bytes that are not
+    /// the wire at all. Distinct from the short-but-well-formed case above and
+    /// reported as such: the response never decoded, so the scan cannot even say
+    /// which recipient it was short for, and `PayloadUnavailable` carries the
+    /// decoder's own words rather than a guess.
+    ///
+    /// It is the shape a truncating proxy or a half-written response produces,
+    /// and the property under test is that it stays **one output's outcome** —
+    /// the scan still completes and still reports the coordinates it detected.
+    #[test]
+    fn an_undecodable_full_response_is_reported_with_the_decoders_words() {
+        let d = Devnet::generate(GenParams::default());
+        let mut rng = StdRng::seed_from_u64(0x188_f);
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::Off };
+        let mut fetch = |path: &str| -> Result<Vec<u8>, String> {
+            let bytes = crate::server::route(&d, path).map_err(|(c, m)| format!("{c} {m}"))?;
+            if path.starts_with("/v1/compact") {
+                return Ok(bytes);
+            }
+            Ok(bytes[..bytes.len() / 2].to_vec()) // cut it in half
+        };
+        let out = scan_over(&mut fetch, &d.our.dk, 1, d.tip_height(), cfg, &mut rng)
+            .expect("a bad /full is one output's outcome, never the run's");
+        assert_eq!(out.notes.len(), 0);
+        assert_eq!(out.unopened.len(), d.expected_matches);
+        for u in &out.unopened {
+            match &u.why {
+                Unopened::PayloadUnavailable(e) => {
+                    assert!(e.contains("undecodable /full response"), "{e}")
+                }
+                other => panic!("a body that is not the wire is unavailable, got {other:?}"),
+            }
+        }
+        assert!(matches!(out.completeness(), Completeness::Incomplete { opened: 0, .. }));
+    }
+
     /// A payload that arrives and does not authenticate. Distinct from both
     /// absences above: the bytes were served and the wallet refused them, which is
     /// the one case where the *server* is the suspect rather than the topology.
