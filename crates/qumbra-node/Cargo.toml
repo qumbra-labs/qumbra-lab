@@ -50,6 +50,10 @@ drill-arm = []
 drill-resume = []
 drill-resume-norev = []
 drill-cancel = []
+# The post-boundary release of lab #299 + #303: resumes past
+# `RULE_BOUNDARY_HEIGHT` under the exact-decimal schedule. See `release::RELEASE`
+# for why arming is the default and resuming is the flag.
+rule-boundary-resume = []
 
 [dependencies]
 # The N7 full-node composition: NodeAdapter (real chain/PoW/state/mempool/

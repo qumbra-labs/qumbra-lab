@@ -28,8 +28,42 @@
 //! (frozen §3), applied to `coinbase(h)`; fees are paid to miners on top, never
 //! burned (tokenomics §6). Coinbase outputs mature after **144 blocks** (frozen
 //! §2) — enforced by the mempool ([`crate::mempool`]).
+//!
+//! # 🔴 The schedule has TWO regimes now, and the boundary is what separates them
+//! (lab #299 + #303)
+//!
+//! The `f64` evaluation below is **platform-dependent**: `1 − exp(h·ln(1−d))`
+//! cancels ~12 bits, so a last-ulp `exp` difference between two C libraries
+//! becomes a whole bessel — measured twelve times in the first 4,816 blocks of the
+//! live chain (#303). A validity rule over a platform-dependent function forks a
+//! mixed-platform net, and #299's rule is exactly such a rule.
+//!
+//! So, from [`RULE_BOUNDARY_HEIGHT`] + 1, the canonical schedule is the
+//! **exact-decimal** one ([`qlab_devnet::emission_exact`]), and [`coinbase`] /
+//! [`s_atomic`] switch to it there. At and below the boundary they keep evaluating
+//! the historical `f64` schedule, because history is grandfathered **as recorded**
+//! — the epoch-1 −4114 block and every glibc-vs-exact ±1 included (#303 ruling
+//! clause 2).
+//!
+//! The two names that say which regime you are asking about, when it matters:
+//! [`coinbase_pre_boundary`] / [`s_atomic_pre_boundary`] are the historical `f64`
+//! schedule, and `emission_exact::coinbase_exact` / `s_atomic_exact` are the
+//! canonical one. [`coinbase`] and [`s_atomic`] are the **canonical, boundary-aware**
+//! functions and are what every consensus caller should use — assembly, validation,
+//! accrual and attestation all get the right regime for free, which is why the
+//! switch lives in these two bodies rather than at ~30 call sites.
+//!
+//! **Telescoping survives the boundary**, which is the property the whole audit
+//! anchor rests on: `Σ_{i<h} coinbase(i) == s_atomic(h)` for every `h`, including
+//! `h` straddling the boundary. It survives because `s_atomic` above the boundary
+//! is the cumulative *at* the boundary plus the exact walk from there — not a
+//! second closed form. Test-locked.
 
 use qlab_econ::model::{Family, Model};
+
+pub use qlab_devnet::emission_exact::{
+    coinbase_exact, s_atomic_exact, RULE_BOUNDARY_HEIGHT, TAIL_ACTIVATION_HEIGHT, TAIL_BESSEL,
+};
 
 /// Atomic subunits per coin: **1 QMB = 10⁸ bessel** (frozen §8).
 pub const BESSEL_PER_QMB: u64 = 100_000_000;
@@ -68,24 +102,102 @@ fn frozen_curve() -> Model {
     }
 }
 
-/// Cumulative supply **at** height `h` (coins emitted through block `h−1`, so
-/// `S_atomic(0) = 0`), in **bessel**: `round(S(h) · 10⁸)` (protocol-spec §6).
+/// The **historical** cumulative supply at height `h` in bessel — the `f64`
+/// closed form the live chain was mined and attested under, up to and including
+/// [`RULE_BOUNDARY_HEIGHT`].
 ///
-/// `S(h)` is monotone non-decreasing, so `S_atomic` is too — which is what makes
-/// every [`coinbase`] non-negative.
-pub fn s_atomic(h: u64) -> u64 {
+/// 🔴 **Platform-dependent, and that is why it is named** (#303). Calling this
+/// above the boundary is a bug: use [`s_atomic`] (canonical) or
+/// [`s_atomic_exact`] (explicitly exact). It stays public for exactly two honest
+/// callers — the grandfathered accounting below the boundary, and the pins
+/// generator that computes the activation literals on a glibc host.
+pub fn s_atomic_pre_boundary(h: u64) -> u64 {
     let coins = frozen_curve().supply(h as f64);
     // round-half-away-from-zero on a non-negative value; `S(h) ≥ 0` always.
     (coins * BESSEL_PER_QMB as f64).round() as u64
 }
 
-/// The block subsidy at height `h` in **bessel**: `S_atomic(h+1) − S_atomic(h)`
-/// (protocol-spec §6). Non-negative and telescoping by construction.
-pub fn coinbase(h: u64) -> u64 {
+/// The **historical** block subsidy at height `h`: the `f64`
+/// `S_atomic(h+1) − S_atomic(h)`. See [`s_atomic_pre_boundary`] for why this is
+/// named rather than default.
+pub fn coinbase_pre_boundary(h: u64) -> u64 {
     // S_atomic is monotone, so this never underflows; saturating_sub is a belt-
-    // and-braces guard against f64 rounding jitter (never observed — the tail
-    // reward is ≥ 1.22441 QMB ≈ 1.22e8 bessel, dwarfing ±1-bessel round error).
-    s_atomic(h + 1).saturating_sub(s_atomic(h))
+    // and-braces guard against f64 rounding jitter.
+    s_atomic_pre_boundary(h + 1).saturating_sub(s_atomic_pre_boundary(h))
+}
+
+/// **The pinned cumulative supply at the boundary** — `S_atomic(B+1)`, i.e. every
+/// bessel the historical schedule issued through block `RULE_BOUNDARY_HEIGHT`.
+///
+/// # Why this is a pin and not a computation (ruling clause 3)
+///
+/// Above the boundary, [`s_atomic`] is *this value* plus the exact walk. If it
+/// were recomputed from the `f64` closed form instead, then two nodes on different
+/// C libraries would disagree about the cumulative supply of every post-boundary
+/// height — the fork the exact schedule exists to prevent, reintroduced through
+/// the back door of the audit anchor. Pinned, no node above the boundary evaluates
+/// `f64` at all.
+///
+/// # 🔴 T-ops step at activation — this is the one number that must come from a
+/// glibc host
+///
+/// `None` means "not yet pinned", and the fallback is
+/// `s_atomic_pre_boundary(RULE_BOUNDARY_HEIGHT + 1)` — the current behaviour
+/// exactly, so merging this is not a change on the live glibc fleet. It becomes a
+/// change on a non-glibc node, which is the point.
+///
+/// Produce it on a Linux/glibc host with:
+/// `qumbra-node emission-pins` — it prints the literal to paste here. Deliberately
+/// **not** derived from a data dir: it is a pure function of the frozen constants,
+/// so the pin can be reproduced by anyone with the binary and checked against the
+/// chain's attested rows independently.
+pub const PINNED_S_ATOMIC_AT_BOUNDARY: Option<u64> = None;
+
+/// **The pinned committee accrual at the boundary** — `Σ_{h≤B} 15 % share`, the
+/// same argument as [`PINNED_S_ATOMIC_AT_BOUNDARY`] applied to the accrual ledger
+/// (the census's restart-accrual point, ruling clause 3). `None` ⇒ walk the
+/// historical schedule, which is today's behaviour. Produced by the same
+/// `qumbra-node emission-pins`.
+pub const PINNED_COMMITTEE_ACCRUAL_AT_BOUNDARY: Option<u64> = None;
+
+/// `S_atomic(RULE_BOUNDARY_HEIGHT + 1)` — the pin if it has been supplied, the
+/// historical walk otherwise.
+pub fn s_atomic_at_boundary() -> u64 {
+    match PINNED_S_ATOMIC_AT_BOUNDARY {
+        Some(pinned) => pinned,
+        None => s_atomic_pre_boundary(RULE_BOUNDARY_HEIGHT + 1),
+    }
+}
+
+/// **Canonical cumulative supply at height `h`, in bessel** (protocol-spec §6).
+///
+/// At and below `RULE_BOUNDARY_HEIGHT + 1` this is the historical `f64` closed
+/// form — the value the chain was attested under, grandfathered as recorded.
+/// Above it, the cumulative at the boundary plus the **exact** walk from there, so
+/// `Σ coinbase` still telescopes to it exactly across the boundary.
+///
+/// Monotone non-decreasing, which is what makes every [`coinbase`] non-negative.
+pub fn s_atomic(h: u64) -> u64 {
+    if h <= RULE_BOUNDARY_HEIGHT + 1 {
+        s_atomic_pre_boundary(h)
+    } else {
+        // `s_atomic_exact` is monotone, so the difference never underflows.
+        s_atomic_at_boundary() + (s_atomic_exact(h) - s_atomic_exact(RULE_BOUNDARY_HEIGHT + 1))
+    }
+}
+
+/// **The canonical block subsidy at height `h`, in bessel** — what a block at that
+/// height must commit as `body.coinbase` (#299), and what assembly must pay.
+///
+/// `h ≤ RULE_BOUNDARY_HEIGHT` ⇒ the historical `f64` difference (the last block
+/// under the old schedule is the boundary itself). `h > RULE_BOUNDARY_HEIGHT` ⇒
+/// [`coinbase_exact`].
+pub fn coinbase(h: u64) -> u64 {
+    if h > RULE_BOUNDARY_HEIGHT {
+        coinbase_exact(h)
+    } else {
+        coinbase_pre_boundary(h)
+    }
 }
 
 /// The 65/15/20 division of a block's coinbase (frozen §3). Committee and
@@ -132,11 +244,78 @@ mod tests {
         assert_eq!(coinbase(0), 5_000_000_000);
     }
 
+    /// **The boundary seam** (#299 + #303): the last `f64` block is the boundary
+    /// itself, and the first exact block is the one above it. Stated as a property
+    /// of the two named regimes so it cannot be satisfied by accident.
+    #[test]
+    fn the_boundary_is_the_last_f64_block_and_the_next_is_exact() {
+        let b = RULE_BOUNDARY_HEIGHT;
+        assert_eq!(coinbase(b), coinbase_pre_boundary(b), "B is still f64");
+        assert_eq!(coinbase(b - 1), coinbase_pre_boundary(b - 1));
+        assert_eq!(coinbase(b + 1), coinbase_exact(b + 1), "B+1 is exact");
+        assert_eq!(coinbase(b + 100), coinbase_exact(b + 100));
+        // The cumulative switches one height later, because `s_atomic(h)` counts
+        // coins through block `h-1`: `s_atomic(B+1)` is still entirely historical.
+        assert_eq!(s_atomic(b + 1), s_atomic_pre_boundary(b + 1));
+        assert_eq!(
+            s_atomic(b + 2),
+            s_atomic_at_boundary() + coinbase_exact(b + 1)
+        );
+    }
+
+    /// Above the boundary, no `f64` value can influence the answer **except**
+    /// through the single cumulative offset — which is what the pin replaces. The
+    /// differences of post-boundary heights are pure exact arithmetic.
+    #[test]
+    fn post_boundary_differences_are_pure_exact_arithmetic() {
+        let b = RULE_BOUNDARY_HEIGHT;
+        for (lo, hi) in [(b + 2, b + 3), (b + 2, b + 1_000), (b + 500, b + 20_000)] {
+            assert_eq!(
+                s_atomic(hi) - s_atomic(lo),
+                s_atomic_exact(hi) - s_atomic_exact(lo),
+                "the f64 offset must cancel between two post-boundary heights"
+            );
+        }
+    }
+
+    /// The pin's fallback is today's behaviour exactly, so merging the boundary is
+    /// not a change on the glibc fleet — it becomes a change on a non-glibc node.
+    #[test]
+    fn the_unset_pin_falls_back_to_the_historical_walk() {
+        assert_eq!(PINNED_S_ATOMIC_AT_BOUNDARY, None, "unpinned at merge (T-ops step)");
+        assert_eq!(
+            s_atomic_at_boundary(),
+            s_atomic_pre_boundary(RULE_BOUNDARY_HEIGHT + 1)
+        );
+    }
+
     #[test]
     fn coinbase_telescopes_to_s_atomic_exactly() {
         // Σ_{i<h} coinbase(i) == S_atomic(h) — the audit-anchor invariant that
         // makes the per-block subsidy a difference of the rounded cumulative.
-        for &h in &[0u64, 1, 2, 10, 100, 1_000, 10_000, 100_000] {
+        //
+        // 🔴 The heights straddling `RULE_BOUNDARY_HEIGHT` are the load-bearing
+        // ones: they prove the two regimes join without a seam. It holds because
+        // `s_atomic` above the boundary is the cumulative AT the boundary plus the
+        // exact walk, never a second closed form. (With the T-ops pin supplied on a
+        // host whose own f64 disagrees with glibc's, the below-boundary sum is
+        // grandfathered history and the identity holds against the pin above — see
+        // `PINNED_S_ATOMIC_AT_BOUNDARY`.)
+        for &h in &[
+            0u64,
+            1,
+            2,
+            10,
+            100,
+            1_000,
+            10_000,
+            RULE_BOUNDARY_HEIGHT - 1,
+            RULE_BOUNDARY_HEIGHT,
+            RULE_BOUNDARY_HEIGHT + 1,
+            RULE_BOUNDARY_HEIGHT + 2,
+            RULE_BOUNDARY_HEIGHT + 3,
+            100_000,
+        ] {
             let sum: u64 = (0..h).map(coinbase).sum();
             assert_eq!(sum, s_atomic(h), "telescoping broke at h={h}");
         }

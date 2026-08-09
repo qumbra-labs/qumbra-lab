@@ -32,6 +32,7 @@
 pub mod audit_emission;
 pub mod config;
 pub mod discovery_server;
+pub mod emission_pins;
 pub mod genesis;
 pub mod metrics_server;
 pub mod params_audit;

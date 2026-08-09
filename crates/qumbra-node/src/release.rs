@@ -116,6 +116,7 @@
 //! the fix is the "releases carry boundary history" alternative #81 rejected as
 //! unbounded. Reported on #81, deliberately not built here.
 
+use qlab_devnet::emission_exact::RULE_BOUNDARY_HEIGHT;
 use qlab_devnet::halt::{HaltError, HaltPlan, PostHaltRules, RuleSchedule};
 use serde::{Deserialize, Serialize};
 
@@ -175,6 +176,33 @@ pub const DRILL_HALT_HEIGHT: u64 = 16;
 /// must — it is a historical artifact of #74, not a pin.)
 pub const REVISION_V1_0: Revision = Revision {
     id: "v1.0",
+    frozen_digest_hex: "a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b",
+};
+
+/// **The emission-rule revision** (lab #299 + #303): the parameter set in force
+/// above [`RULE_BOUNDARY_HEIGHT`], where `s_atomic` is the exact-decimal evaluation
+/// and `body.coinbase == coinbase(height)` is a validity rule.
+///
+/// # Why this mints a revision when the mint deliberately did not
+///
+/// This file's rule is *"mint a revision when, and only when, you are shipping an
+/// upgrade with a boundary."* This is precisely that: a live chain, a halt height,
+/// a population that must all cross it together. The mint was a re-genesis with no
+/// chain to resume past, which is why it moved the frozen digest and left the
+/// identifier alone; this moves the identifier and leaves the frozen digest alone.
+///
+/// **The frozen digest does not move, and that is not an oversight.** No FROZEN v1.0
+/// value changes: `d = 8.237e-7`, `r0 = 50`, `tail = 1.22441` are the same decimals.
+/// What changes is how they are *evaluated* — from a platform-dependent `f64`
+/// closed form to the exact rational value those same decimals denote. So this
+/// revision is, in H5's terms, in the same family as the drill's inert one: only the
+/// identifier-bound [`Revision::digest`] distinguishes it, and that is exactly the
+/// digest #81's gate keys on. A pre-rule binary therefore cannot resume past the
+/// boundary — it carries `v1.0`, the marker says `v1.1-exact-emission` is in force,
+/// and `check_against_marker` returns `UndeclaredResume`. That refusal *is* stage 2's
+/// last bullet: the schedule rule rides the revision machinery.
+pub const REVISION_V1_1_EXACT_EMISSION: Revision = Revision {
+    id: "v1.1-exact-emission",
     frozen_digest_hex: "a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b",
 };
 
@@ -607,17 +635,52 @@ impl HaltMarker {
 // ---------------------------------------------------------------------------
 
 /// This binary's release (H1). Compile-time constant, no runtime override.
+///
+/// # 🔴 The default release is ARMED at the emission-rule boundary (#299 + #303)
+///
+/// It halts at [`RULE_BOUNDARY_HEIGHT`] and carries `v1.0` — it is the announcement
+/// binary, the one every host must be running *before* 18,000. The binary that goes
+/// past the boundary is the same source built with `--features rule-boundary-resume`
+/// (see below); it carries [`REVISION_V1_1_EXACT_EMISSION`].
+///
+/// **Why arming is the default rather than a feature.** The two ways to get this
+/// wrong are not symmetric. If arming were opt-in and T-ops forgot the flag, the
+/// fleet would sail past 18,000 with the schedule rule never activating and nothing
+/// to see — a silently unmet T1 gate. Armed by default, forgetting the *resume*
+/// build halts finality at a finalized boundary, loudly, on a net whose resume
+/// binary already exists in this same commit; the operator rolls it and the chain
+/// continues. This repo prefers a loud refusal to a silent wrong everywhere else,
+/// and H1's "baked into the binary, never config" argues the same way: the release
+/// that announces an upgrade should not need a flag to mean it.
+///
+/// Flipping that call is a four-line diff (swap the two arms' `cfg`s) and needs no
+/// other change — recorded so a coordinator can overrule it cheaply.
 #[cfg(not(any(
     feature = "drill-arm",
     feature = "drill-resume",
     feature = "drill-resume-norev",
     feature = "drill-cancel",
+    feature = "rule-boundary-resume",
 )))]
 pub const RELEASE: Release = Release {
-    name: "qumbra-node v1.0 (no upgrade scheduled)",
-    plan: HaltPlan::None,
+    name: "qumbra-node v1.0 (halts at the emission-rule boundary, lab #299/#303)",
+    plan: HaltPlan::Armed { height: RULE_BOUNDARY_HEIGHT },
     revision: Some(REVISION_V1_0),
     resumes_from: None,
+};
+
+/// **The post-boundary release**: the binary that resumes past
+/// [`RULE_BOUNDARY_HEIGHT`] under the exact-decimal schedule and the #299 validity
+/// rule. Built from the same source as the default arm — the schedule switch is a
+/// height comparison against a compiled-in constant, not a feature — so what this
+/// arm adds is the *declaration*: the revision in force above the boundary, and the
+/// PoW rule domain that keeps a pre-rule miner's branch from ever being valid there.
+#[cfg(feature = "rule-boundary-resume")]
+pub const RELEASE: Release = Release {
+    name: "qumbra-node v1.1 (exact-decimal emission, resumes past the rule boundary)",
+    plan: HaltPlan::None,
+    revision: Some(REVISION_V1_1_EXACT_EMISSION),
+    resumes_from: Some(RULE_BOUNDARY_HEIGHT),
 };
 
 /// Drill binary **A** — the armed pre-upgrade release. Halts at
@@ -666,6 +729,131 @@ pub const RELEASE: Release = Release {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the emission-rule boundary as a release object (#299 + #303) ---------
+
+    /// The armed announcement release, whatever `cfg` this test binary was built
+    /// under — so the assertions below are about the boundary, not about which arm
+    /// happens to be live.
+    fn rule_armed() -> Release {
+        Release {
+            name: "rule-boundary armed",
+            plan: HaltPlan::Armed { height: RULE_BOUNDARY_HEIGHT },
+            revision: Some(REVISION_V1_0),
+            resumes_from: None,
+        }
+    }
+    fn rule_resume() -> Release {
+        Release {
+            name: "rule-boundary resume",
+            plan: HaltPlan::None,
+            revision: Some(REVISION_V1_1_EXACT_EMISSION),
+            resumes_from: Some(RULE_BOUNDARY_HEIGHT),
+        }
+    }
+
+    /// **The boundary's #74/#81 semantics, stated exactly as the stamp does**:
+    /// `accepts_height(B)` true, `accepts_height(B+1)` false, `domain_at(B)` none,
+    /// `domain_at(B+1)` the new domain. Both binaries validate structurally, which
+    /// also re-proves the H2 grid rule for 18,000.
+    #[test]
+    fn the_rule_boundary_is_a_halt_height_with_a_new_domain_above_it() {
+        let armed = rule_armed();
+        armed.validate().expect("18,000 is on the cadence grid");
+        let s = armed.rule_schedule().unwrap();
+        assert!(s.accepts_height(RULE_BOUNDARY_HEIGHT));
+        assert!(!s.accepts_height(RULE_BOUNDARY_HEIGHT + 1));
+        assert_eq!(s.domain_at(RULE_BOUNDARY_HEIGHT), None);
+
+        let resume = rule_resume();
+        resume.validate().expect("the resume release is startable");
+        let r = resume.rule_schedule().unwrap();
+        assert!(r.accepts_height(RULE_BOUNDARY_HEIGHT + 1));
+        assert_eq!(r.domain_at(RULE_BOUNDARY_HEIGHT), None, "rules unchanged at/below B");
+        assert_eq!(
+            r.domain_at(RULE_BOUNDARY_HEIGHT + 1),
+            Some(&REVISION_V1_1_EXACT_EMISSION.digest()),
+            "above B, the emission revision's digest is the PoW rule domain"
+        );
+    }
+
+    /// **Stage 2's last bullet.** Once the boundary has been passed under the
+    /// emission revision, a **pre-rule** binary — one that carries `v1.0`, i.e. one
+    /// built before the exact schedule existed — is refused. That refusal is what
+    /// stops an un-upgraded node from validating post-boundary blocks under the
+    /// platform-dependent schedule.
+    #[test]
+    fn a_pre_rule_binary_cannot_resume_past_the_emission_boundary() {
+        let marker = HaltMarker::for_release(&rule_armed(), RULE_BOUNDARY_HEIGHT, true)
+            .superseded_by(&rule_resume());
+        assert!(marker.resumed);
+        assert_eq!(marker.revision_id, REVISION_V1_1_EXACT_EMISSION.id);
+
+        // The pre-rule binary: v1.0, no declaration. This is every image built
+        // before this commit.
+        let pre_rule = Release {
+            name: "pre-rule v1.0",
+            plan: HaltPlan::None,
+            revision: Some(REVISION_V1_0),
+            resumes_from: None,
+        };
+        assert!(matches!(
+            pre_rule.check_against_marker(Some(&marker)),
+            Err(ReleaseError::UndeclaredResume { marked, .. }) if marked == RULE_BOUNDARY_HEIGHT
+        ));
+        // The binary that carries the revision in force starts freely — the routine
+        // later release #81 exists to unblock.
+        let routine = Release {
+            name: "routine v1.1.x",
+            plan: HaltPlan::None,
+            revision: Some(REVISION_V1_1_EXACT_EMISSION),
+            resumes_from: None,
+        };
+        routine.check_against_marker(Some(&marker)).expect("in-force revision starts");
+        // …and it reads the domain off the marker, so it does not fork from the
+        // population that upgraded (#81's correction (1)).
+        let s = routine.rule_schedule_on(Some(&marker)).unwrap();
+        assert_eq!(
+            s.domain_at(RULE_BOUNDARY_HEIGHT + 1),
+            Some(&REVISION_V1_1_EXACT_EMISSION.digest())
+        );
+    }
+
+    /// The emission revision moves the identifier and **not** the frozen digest —
+    /// the two halves of "no FROZEN v1.0 value changes; the evaluation does".
+    #[test]
+    fn the_emission_revision_moves_the_identifier_only() {
+        REVISION_V1_1_EXACT_EMISSION.verify().expect("describes this binary's frozen set");
+        assert_eq!(
+            REVISION_V1_1_EXACT_EMISSION.frozen_digest_hex,
+            REVISION_V1_0.frozen_digest_hex,
+            "no frozen constant moved"
+        );
+        assert_ne!(
+            REVISION_V1_1_EXACT_EMISSION.digest(),
+            REVISION_V1_0.digest(),
+            "and yet the gate can still tell them apart — that is what H5 needs"
+        );
+    }
+
+    /// The shipped default arm is the armed one, and it is armed at the boundary.
+    /// If a coordinator flips that call, this test is the one line that changes.
+    #[test]
+    fn the_shipped_default_release_is_armed_at_the_rule_boundary() {
+        RELEASE.validate().expect("the shipped release must be startable");
+        #[cfg(not(any(
+            feature = "drill-arm",
+            feature = "drill-resume",
+            feature = "drill-resume-norev",
+            feature = "drill-cancel",
+            feature = "rule-boundary-resume",
+        )))]
+        {
+            assert_eq!(RELEASE.halt_at(), Some(RULE_BOUNDARY_HEIGHT));
+            assert_eq!(RELEASE.resumes_from, None);
+            assert_eq!(RELEASE.revision, Some(REVISION_V1_0));
+        }
+    }
 
     fn armed() -> Release {
         Release {
