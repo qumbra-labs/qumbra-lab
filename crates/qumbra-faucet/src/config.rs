@@ -33,6 +33,14 @@
 //! # OPTIONAL — require an operator-issued ticket. Default true, which is the
 //! # recommended T1 posture while "how public is public" is undecided.
 //! # tickets_required = true
+//!
+//! # OPTIONAL — CIDRs of reverse proxies whose `X-Forwarded-For` the rate limiter
+//! # may honor. Default EMPTY = never trust XFF (current behaviour): a faucet
+//! # with no proxy in front must not be spoofable by a client that sets the
+//! # header. Lab #308 — only when `remote_addr` is inside one of these nets is
+//! # the header consulted, and only then by walking right-to-left past trusted
+//! # hops. Deploy-side values (compose bridge subnet, etc.) are the operator's.
+//! # trusted_proxy_cidrs = ["172.18.0.0/16"]
 //! ```
 //!
 //! `deny_unknown_fields`, for the same reason `NodeConfig` has it: a typo'd key that
@@ -70,6 +78,10 @@ pub struct FaucetServiceConfig {
     /// Require an operator-issued ticket. `None` = true.
     #[serde(default)]
     pub tickets_required: Option<bool>,
+    /// CIDRs of reverse proxies whose `X-Forwarded-For` the rate limiter may
+    /// honor. Default empty — see module docs and lab #308.
+    #[serde(default)]
+    pub trusted_proxy_cidrs: Vec<String>,
 }
 
 fn default_listen_addr() -> String {
@@ -151,6 +163,15 @@ impl FaucetServiceConfig {
     /// Whether tickets are required, defaulted to **true**.
     pub fn tickets_required(&self) -> bool {
         self.tickets_required.unwrap_or(true)
+    }
+
+    /// Parse [`Self::trusted_proxy_cidrs`] into the runtime trust set the
+    /// listener keys the rate limiter with. A bad CIDR is a config error —
+    /// refused at load rather than silently ignored, for the same reason an
+    /// unknown key is.
+    pub fn trusted_proxies(&self) -> Result<crate::http::TrustedProxies, ConfigError> {
+        crate::http::TrustedProxies::parse(&self.trusted_proxy_cidrs)
+            .map_err(ConfigError::Parse)
     }
 
     /// Whether the configured bind address is a loopback one. Used to decide whether
@@ -264,6 +285,30 @@ mod tests {
         assert_eq!(c.grant_value(), qlab_faucet::DEFAULT_GRANT_BESSEL);
         assert_eq!(c.hd_account(), 1);
         assert!(c.tickets_required(), "tickets are required unless turned off");
+        // Lab #308: the trust knob defaults empty so a proxyless faucet is not
+        // spoofable by a client that sets X-Forwarded-For.
+        assert!(c.trusted_proxy_cidrs.is_empty(), "default trust set must be empty");
+        assert!(c.trusted_proxies().expect("empty parses").is_empty());
+    }
+
+    /// A configured trusted-proxy CIDR parses, and a garbage one is refused.
+    #[test]
+    fn trusted_proxy_cidrs_parse_or_refuse() {
+        let c = FaucetServiceConfig::from_toml(&format!(
+            "{MINIMAL}\ntrusted_proxy_cidrs = [\"172.18.0.0/16\", \"127.0.0.1/32\"]\n"
+        ))
+        .expect("parse");
+        let t = c.trusted_proxies().expect("cidrs");
+        assert!(!t.is_empty());
+        assert!(t.contains("172.18.0.5".parse().unwrap()));
+        assert!(t.contains("127.0.0.1".parse().unwrap()));
+        assert!(!t.contains("203.0.113.1".parse().unwrap()));
+
+        let bad = FaucetServiceConfig::from_toml(&format!(
+            "{MINIMAL}\ntrusted_proxy_cidrs = [\"not-a-cidr\"]\n"
+        ))
+        .expect("toml parses strings");
+        assert!(matches!(bad.trusted_proxies(), Err(ConfigError::Parse(_))));
     }
 
     /// The exposure gate: every non-loopback form is recognised as such, including
