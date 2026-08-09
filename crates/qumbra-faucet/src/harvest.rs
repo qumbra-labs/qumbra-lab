@@ -46,6 +46,7 @@ use qlab_faucet::{Faucet, OwnedNote};
 use qlab_node::{coinbase_note, coinbase_note_leaf, ChainStore, MemNode, NodeState};
 use qlab_wallet::address::Diversifier;
 use qlab_wallet::Wallet;
+// `NodeState::is_spent` is the chain's authority on spent-ness (lab #310).
 
 /// The earliest tip height at which a coinbase note minted at `minted_height` can
 /// be spent — now the height at which its leaf enters the commitment tree.
@@ -77,6 +78,12 @@ pub fn spendable_at_tip(minted_height: u64) -> u64 {
 pub struct HarvestReport {
     /// Notes funded into the faucet by this pass (matured since the last one).
     pub funded: usize,
+    /// Matured coinbase notes whose nullifiers are already on-chain, so they were
+    /// **not** funded (lab issue #310). A restarted process re-walks the chain with
+    /// an empty `seen` set; without this subtraction it re-includes notes it has
+    /// already spent, and every later dispense double-spends until the retry budget
+    /// burns.
+    pub skipped_spent: usize,
     /// Coinbase notes this node has mined that are **not yet mature**, so are not
     /// yet in the inventory. This is the `notes_maturing` the status page shows.
     pub maturing: usize,
@@ -87,16 +94,25 @@ pub struct HarvestReport {
     pub next_maturity: Option<u64>,
 }
 
-/// Walk `node`'s main chain, fund every **matured** coinbase note paid to this
-/// wallet at `d` that the faucet does not already know about, and report what is
-/// still maturing.
+/// Walk `node`'s main chain, fund every **matured, unspent** coinbase note paid to
+/// this wallet at `d` that the faucet does not already know about, and report what
+/// is still maturing.
 ///
-/// `seen` is the set of coinbase-note commitments already funded (or already spent);
-/// it is the caller's, so a restarted process that has re-derived its inventory does
-/// not double-count. Funding twice would put two `OwnedNote`s with the same `cm` in
-/// the inventory, and `select_pair` would happily choose both — a self-inflicted
-/// double-spend attempt that the node's nullifier set would refuse and that would
-/// cost a proof to discover.
+/// `seen` is the set of coinbase-note commitments already funded (or already known
+/// spent); it is the caller's, so a restarted process that has re-derived its
+/// inventory does not double-count. Funding twice would put two `OwnedNote`s with
+/// the same `cm` in the inventory, and `select_pair` would happily choose both —
+/// a self-inflicted double-spend attempt that the node's nullifier set would refuse
+/// and that would cost a proof to discover.
+///
+/// **Spent notes are subtracted, not re-funded (lab issue #310).** A restart
+/// begins with an empty `seen` and re-walks every matured coinbase paying this
+/// `rkm`. Notes whose nullifiers are already in the consensus set are marked
+/// `seen` and counted in [`HarvestReport::skipped_spent`], never funded: the chain
+/// is the authority on spent-ness, and the wallet derives the nullifier the same
+/// way a spend does (`Wallet::nullifier` over ρ). Without this check the inventory
+/// re-includes already-spent notes, every dispense double-spends, and the retry
+/// budget burns while the page still says ready.
 ///
 /// O(tip) per call: it re-walks the chain. That is deliberate at lab scale and it is
 /// the honest cost of having no per-height note index; a T1-scale faucet would keep
@@ -139,6 +155,14 @@ pub fn harvest_matured(
             continue;
         }
         let Some(note) = coinbase_note(height, &body) else { continue };
+        // Lab #310: the chain knows which notes are spent. Derive the nullifier
+        // the way a spend does, and skip any whose nf is already permanent.
+        let nf = qlab_note::hash::digest_bytes(&wallet.nullifier(&note.rho));
+        if node.is_spent(&nf) {
+            seen.insert(leaf);
+            report.skipped_spent += 1;
+            continue;
+        }
         faucet.fund(OwnedNote::from_coinbase(wallet, note.value, note.rho, note.rseed, d, height));
         seen.insert(leaf);
         report.funded += 1;
@@ -350,5 +374,100 @@ mod tests {
         let r = harvest_matured(&mut faucet, &node, &wallet, d, &mut seen);
         assert_eq!(r, HarvestReport::default(), "no notes, none maturing, no next maturity");
         assert_eq!(faucet.inventory().len(), 0);
+    }
+
+    /// 🔴 **Lab #310 mechanism 1, proved without a STARK.** A matured coinbase
+    /// note whose nullifier is already on-chain must not re-enter the inventory.
+    ///
+    /// This is the post-restart failure mode: `seen` starts empty, harvest walks
+    /// every matured coinbase paying the faucet's rkm, and without the nullifier
+    /// check it re-funds notes the process has already spent. The chain is the
+    /// authority — we inject the nullifier via a body the node applies (AcceptAll
+    /// verifier, no real proof), then re-walk as a restarted process would.
+    #[test]
+    fn harvest_skips_notes_whose_nullifiers_are_already_on_chain() {
+        use qlab_devnet::body::TxPublic;
+        use qlab_devnet::fees::ArityBucket;
+        use qlab_node::coinbase_note as cb_note;
+
+        struct AcceptAll;
+        impl TxVerifier for AcceptAll {
+            fn verify_tx(&self, _: &TxEntry) -> bool {
+                true
+            }
+        }
+
+        let wallet = Wallet::from_seed_lanes([0x1230_0000_0000_0310; 4]);
+        let d = Diversifier::default();
+        let rkm = wallet.rkm(d);
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let mut node = MemNode::in_memory(genesis.clone());
+        let mut tip = genesis.header();
+
+        // Two coinbase notes paying the faucet, matured.
+        mine(&mut node, &mut tip, 2, rkm);
+        mine(&mut node, &mut tip, COINBASE_MATURITY_BLOCKS + 1, [0xEE; 4]);
+
+        // Derive the nullifier of the height-1 coinbase the way a spend does.
+        let body1 = {
+            let hash = *node
+                .chain()
+                .chain()
+                .main_chain()
+                .iter()
+                .find(|h| node.chain().block(h).is_some_and(|b| b.header.height == 1))
+                .expect("height 1 on main chain");
+            node.chain().block(&hash).expect("block").body().clone()
+        };
+        let note1 = cb_note(1, &body1).expect("minting body");
+        let nf1 = qlab_note::hash::digest_bytes(&wallet.nullifier(&note1.rho));
+        assert!(!node.is_spent(&nf1), "precondition: note is not yet spent");
+
+        // Mark it spent by applying a body that carries its nullifier. AcceptAll
+        // skips the STARK; apply_state still inserts the nullifier permanently.
+        // Anchor against the newest finalized root so validate_body accepts it.
+        let anchor = node.commitment_root();
+        {
+            let height = tip.height + 1;
+            let cms = [[0xCD; 32], [0xEF; 32]];
+            let fake = TxEntry::with_placeholder_discovery(
+                b"ok".to_vec(),
+                TxPublic {
+                    anchor,
+                    nullifiers: vec![nf1, [0xAB; 32]],
+                    commitments: cms.to_vec(),
+                    bucket: ArityBucket::TwoByTwo,
+                    fee: qlab_devnet::fees::posted_fee(ArityBucket::TwoByTwo),
+                },
+            );
+            let body = BlockBody {
+                txs: vec![fake],
+                coinbase: coinbase(height),
+                coinbase_rkm: [0xEE; 4],
+            };
+            let header =
+                BlockHeader::child_of(&tip, height * 75, GENESIS_DIFFICULTY, body.commitment());
+            let hash = node.apply_block(header, body, &AcceptAll).expect("applies");
+            node.finalize(hash).expect("finalize");
+            tip = header;
+        }
+        assert!(node.is_spent(&nf1), "nullifier is now permanent — the chain says spent");
+        let _ = tip;
+
+        // Restart path: empty seen, empty inventory, re-walk the chain.
+        let mut faucet = faucet_for(&wallet);
+        let mut seen = HashSet::new();
+        let r = harvest_matured(&mut faucet, &node, &wallet, d, &mut seen);
+        assert_eq!(
+            r.skipped_spent, 1,
+            "the spent coinbase must be counted as skipped, not funded: {r:?}"
+        );
+        assert_eq!(r.funded, 1, "the unspent sibling is still funded: {r:?}");
+        assert_eq!(faucet.inventory().len(), 1, "inventory holds only the live note");
+        // And a second pass does not re-count the spent one.
+        let r2 = harvest_matured(&mut faucet, &node, &wallet, d, &mut seen);
+        assert_eq!(r2.skipped_spent, 0, "seen remembers the spent leaf");
+        assert_eq!(r2.funded, 0);
+        assert_eq!(faucet.inventory().len(), 1);
     }
 }
