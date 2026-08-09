@@ -28,14 +28,16 @@
 //!   verifier is exercised against real STARKs in `tests/coinbase_spend.rs` and
 //!   `qlab-faucet`'s acceptance suite. A real proof here would add ~2.3 s and
 //!   ~11.8 GB and test something already tested.
-//! - **The recipient detects; it does not open.** Detection is `decapsulate` + the
-//!   committed tag, and that is all this baton's acceptance asks for ("Spending is
-//!   baton 4; finding is this one"). The AEAD payload that carries
-//!   `(value, ρ, rseed)` is **not** in the body preimage — D2 commits
-//!   `ct ‖ cm ‖ tag ‖ clue_len` and the ~585 B/note the design priced is
-//!   `1088/2 + 41`, with no payload in it — so the note cannot be opened from
-//!   chain data alone. Reported as a finding on issue #188; it is baton 4's
-//!   question and this file does not pretend otherwise.
+//! - **This file's acceptance test still only detects.** Detection is
+//!   `decapsulate` + the committed tag, which is what it was written for, and it
+//!   is left that way on purpose so the `/v1/compact` byte identity below is not
+//!   entangled with the payload route. **Opening is no longer impossible** — the
+//!   sentence that stood here (the AEAD payload "is not in the body preimage")
+//!   was true until the mint relocated it there (PR #252), and
+//!   `/v1/block/{h}/tx/{i}/full` serves it since issue #188's serving+open
+//!   baton. The opened-end-to-end acceptance lives in `tests/recipient_scan.rs`;
+//!   the payload projection's own golden is
+//!   `the_payload_projection_is_golden_locked_against_a_hand_built_body` below.
 
 use std::sync::{Arc, Mutex};
 
@@ -275,6 +277,114 @@ fn a_recipient_finds_its_output_from_a_restarted_nodes_committed_discovery() {
 
     server.shutdown();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 🔴 **The serving projection, golden-locked against a hand-built body, in
+/// both directions** — the same two-goldens-opposite-directions check the mint
+/// used when it relocated the payloads (PR #252), now applied to the route that
+/// serves them.
+///
+/// - **Direction 1 — the serving vector must be exactly this.** The `/full`
+///   response is written out here byte by byte from the framing rules
+///   (`version ‖ n_recipients ‖ [n_payloads ‖ [len ‖ bytes]]`) and compared to
+///   what the projection produces, so a change to either the framing or the
+///   projection has to come here and say so. The whole response is also pinned
+///   by digest, which is the form a reader can quote.
+/// - **Direction 2 — the body commitment must move when a payload byte does,
+///   and the compact vector must not.** That pairing is what makes the payload
+///   section *committed but unserved on the compact wire*: if flipping a
+///   payload byte moved `/v1/compact`'s bytes, the golden that locks the
+///   compact framing would be the one going red; if it did not move
+///   `BlockBody::commitment()`, the payloads would not be committed at all and
+///   this whole baton would be serving an availability promise instead of a
+///   chain fact.
+#[test]
+fn the_payload_projection_is_golden_locked_against_a_hand_built_body() {
+    use qlab_devnet::hash::keccak256;
+    use qlab_note::compact::PAYLOAD_LEN;
+    use qlab_note::kem::CT_LEN;
+    use qlab_note::wire::{ClueSlot, CompactEntry, RecipientBundle};
+
+    // A hand-built body. No keypair and no AEAD: this test is about bytes, and
+    // a real ciphertext would make the golden depend on an rng.
+    let entry = |s: u8| CompactEntry { cm: [s; 32], tag: [s ^ 0x5a; 8], clue: ClueSlot::Empty };
+    let recipients = vec![
+        RecipientBundle { ct: [0xA1; CT_LEN], entries: vec![entry(0x11), entry(0x22)] },
+        RecipientBundle { ct: [0xB2; CT_LEN], entries: vec![entry(0x33)] },
+    ];
+    let payloads: Vec<Vec<u8>> = (0..3u8).map(|k| vec![0xC0 ^ k; PAYLOAD_LEN]).collect();
+    let public = TxPublic {
+        anchor: [0x07; 32],
+        nullifiers: vec![[0x01; 32], [0x02; 32]],
+        commitments: vec![[0x11; 32], [0x22; 32], [0x33; 32]],
+        bucket: ArityBucket::TwoByTwo,
+        fee: posted_fee(ArityBucket::TwoByTwo),
+    };
+    let tx = TxEntry::new(b"proof-placeholder".to_vec(), public, &recipients, &payloads);
+    let body = BlockBody { txs: vec![tx.clone()], coinbase: 1, coinbase_rkm: [1, 2, 3, 4] };
+
+    let view = DiscoveryView {
+        blocks: vec![qlab_node::BlockDiscovery {
+            height: 1,
+            hash: [0x99; 32],
+            groups: vec![tx.discovery.clone()],
+        }],
+    };
+    let served = qlab_node::full_response(&view.blocks, 1, 0).expect("the projection answers");
+
+    // ---- Direction 1: the serving vector, written out rather than derived. --
+    let mut expected = Vec::new();
+    expected.push(qlab_cbserver::WIRE_VERSION);
+    expected.push(2u8); // n_recipients
+    expected.push(2u8); // recipient 0: n_payloads
+    for p in &payloads[..2] {
+        expected.push(PAYLOAD_LEN as u8); // varint(120) is one byte
+        expected.extend_from_slice(p);
+    }
+    expected.push(1u8); // recipient 1: n_payloads
+    expected.push(PAYLOAD_LEN as u8);
+    expected.extend_from_slice(&payloads[2]);
+    assert_eq!(served, expected, "the /full serving vector is exactly its framing");
+    assert_eq!(served.len(), 1 + 1 + (1 + 2 * (1 + PAYLOAD_LEN)) + (1 + (1 + PAYLOAD_LEN)));
+
+    let digest_hex = |b: &[u8]| -> String {
+        keccak256(b).iter().map(|x| format!("{x:02x}")).collect()
+    };
+    assert_eq!(
+        digest_hex(&served),
+        "8f2fa42e8d5580e7d728ac418600505c2f358c34c673ac3ed0fd7fd45a250b43",
+        "the pinned /full serving vector for this hand-built body"
+    );
+
+    // ---- Direction 2: move one payload byte. --------------------------------
+    let mut tampered_tx = tx.clone();
+    let last = tampered_tx.discovery.len() - 1;
+    tampered_tx.discovery[last] ^= 0x01;
+    let tampered_body =
+        BlockBody { txs: vec![tampered_tx.clone()], coinbase: 1, coinbase_rkm: [1, 2, 3, 4] };
+    let tampered_view = DiscoveryView {
+        blocks: vec![qlab_node::BlockDiscovery {
+            height: 1,
+            hash: [0x99; 32],
+            groups: vec![tampered_tx.discovery.clone()],
+        }],
+    };
+
+    assert_ne!(
+        body.commitment(),
+        tampered_body.commitment(),
+        "🔴 the payload section IS committed: one byte moves tx_body_commitment"
+    );
+    assert_eq!(
+        qlab_node::compact_response(&view.blocks, 1, 1).unwrap(),
+        qlab_node::compact_response(&tampered_view.blocks, 1, 1).unwrap(),
+        "and it is NOT on the compact wire: the same byte moves nothing /v1/compact serves"
+    );
+    assert_ne!(
+        qlab_node::full_response(&tampered_view.blocks, 1, 0).unwrap(),
+        served,
+        "while the payload route serves the byte that moved, which is the point of it"
+    );
 }
 
 /// The negative that makes the acceptance mean something: **omission is not

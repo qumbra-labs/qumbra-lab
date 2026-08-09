@@ -18,24 +18,27 @@
 //! **coinbase-only** chain with no discovery group in it. Neither could see what
 //! this one is for.
 //!
-//! ## 🔴 What it establishes, and the half it establishes is missing
+//! ## 🔴 What it establishes — and the half that was missing is now here
 //!
-//! **Finding works and opening does not, and that is a property of the chain
-//! rather than of this node.** `discovery-on-the-consensus-wire.md` D2 commits
-//! `n_recipients ‖ [ct(1088) ‖ n_outputs ‖ [cm(32) ‖ tag(8) ‖ clue_len(1)]]` and
-//! nothing else. The AEAD payload — `Note::to_plaintext()` under
-//! `aead_key(K, i)`, the only place a transaction output's `(value, ρ, rseed)`
-//! exists — is not in that framing, so it is not in `StoredTx`, not in the body
-//! preimage, and not on the P2P wire. There is no chain state in which a
-//! `qumbra-node` could serve it, which is why `/v1/block/{h}/tx/{i}/full` is a
-//! 404 and why that 404 is honest.
+//! **Finding worked and opening did not**, and this file used to say so at
+//! length: D2 committed `n_recipients ‖ [ct ‖ n_outputs ‖ [cm ‖ tag ‖
+//! clue_len]]` and nothing else, so the AEAD payload — the only place a
+//! transaction output's `(value, ρ, rseed)` exists — was not in `StoredTx`, not
+//! in the body preimage, and unserveable by any node. **That paragraph is
+//! obsolete twice over** and is kept only in this note so a reader does not
+//! trust a stale copy of it elsewhere:
 //!
-//! So the acceptance this file can carry is: the recipient **locates** every
-//! output paid to it, at the right height and transaction, with the right
-//! commitments, from a real node over a real socket — and the scan reports
-//! `Incomplete` with the coordinates of what it could not open, so a wallet can
-//! never render that state as "no notes". Recovering the *value* needs bytes
-//! nobody committed; that is reported on the issue as a coordinator decision.
+//! 1. the mint (PR #252, issue #188 (a) as amended) relocated the 120 B payload
+//!    **into** the committed region, so every node holds it;
+//! 2. this baton's `GET /v1/block/{h}/tx/{i}/full` serves it, as a projection of
+//!    that region.
+//!
+//! So the acceptance is now the whole sentence: the recipient **locates** every
+//! output paid to it and **opens** it, recovering the value the sender actually
+//! paid, from a real node over a real socket — and a stranger's key still
+//! recovers nothing. The honesty vocabulary keeps its shape where it is still
+//! the truth: a payload that fails AEAD is `detected N, opened M<N` with the
+//! reason, never a partial total (`a_tampered_committed_payload_…` below).
 
 use std::time::Duration;
 
@@ -201,11 +204,11 @@ fn a_recipient_finds_its_outputs_on_a_running_nodes_own_chain_over_a_real_socket
     // commitments — from a running node's own chain, over a socket.
     assert_eq!(out.stats.detected_outputs, 2, "both outputs paid to this wallet were located");
     assert!(
-        out.unopened.iter().all(|u| u.height == height),
+        out.notes.iter().all(|n| n.height == height),
         "at the height the payment was mined at: {:?}",
-        out.unopened
+        out.notes.iter().map(|n| n.height).collect::<Vec<_>>()
     );
-    let mut located: Vec<[u8; CM_LEN]> = out.unopened.iter().map(|u| u.cm).collect();
+    let mut located: Vec<[u8; CM_LEN]> = out.notes.iter().map(|n| n.cm).collect();
     let mut expected: Vec<[u8; CM_LEN]> = paid.iter().map(cm_of).collect();
     located.sort();
     expected.sort();
@@ -215,26 +218,31 @@ fn a_recipient_finds_its_outputs_on_a_running_nodes_own_chain_over_a_real_socket
     );
     // The tx index is a real chain coordinate, not a constant: whichever slot the
     // node's assembler put the payment in, both outputs agree on it.
-    let tx_indices: Vec<u64> = out.unopened.iter().map(|u| u.tx_index).collect();
+    let tx_indices: Vec<u64> = out.notes.iter().map(|n| n.tx_index).collect();
     assert!(tx_indices.windows(2).all(|w| w[0] == w[1]), "one transaction: {tx_indices:?}");
 
-    // 🔴 AND THE SECOND PROPERTY: this is reported as an incomplete scan, never as
-    // an empty wallet. The node holds no AEAD payload because no block does.
-    assert_eq!(out.notes.len(), 0, "nothing can be opened from chain data alone");
+    // 🔴 AND THE SECOND PROPERTY, which is the one this baton added: the outputs
+    // OPEN. The committed payload section carries `(value, ρ, rseed)`, the node
+    // serves it as a projection of the block, and the scan recovers the notes
+    // the sender actually paid — value included, which is the number a balance
+    // is made of.
+    assert!(out.unopened.is_empty(), "nothing was left unopened: {:?}", out.unopened);
     assert_eq!(
         out.completeness(),
-        Completeness::Incomplete { detected: 2, opened: 0 },
-        "a scan that could not complete must not read as a scan that found nothing"
+        Completeness::Complete,
+        "detected AND opened — the verdict a wallet may print a figure under"
     );
-    for u in &out.unopened {
-        match &u.why {
-            Unopened::PayloadUnavailable(e) => assert!(
-                e.contains("404"),
-                "the reason is the node's honest 404 on /v1/…/full, verbatim: {e}"
-            ),
-            other => panic!("expected the payload route to be absent, got {other:?}"),
-        }
-    }
+    let mut opened: Vec<Note> = out.notes.iter().map(|n| n.detected.note.clone()).collect();
+    let mut paid_sorted = paid.clone();
+    opened.sort_by_key(|n| n.value);
+    paid_sorted.sort_by_key(|n| n.value);
+    assert_eq!(opened, paid_sorted, "the opened notes ARE the notes that were paid");
+    assert_eq!(
+        out.spendable_value(),
+        paid.iter().map(|n| u128::from(n.value)).sum::<u128>(),
+        "and the spendable balance is the value the sender actually sent"
+    );
+    assert_eq!(out.stats.matched_fetches, 1, "one payload fetch, for the one matched transaction");
 
     // ---- A different key recovers nothing from the same chain. -------------
     let mut srng = StdRng::seed_from_u64(9);
@@ -250,16 +258,168 @@ fn a_recipient_finds_its_outputs_on_a_running_nodes_own_chain_over_a_real_socket
     );
     assert_eq!(none.stats.matched_fetches, 0, "no detection ⇒ no fetch ⇒ no pattern to observe");
 
-    // The neighbour finds exactly its own one output, so detection is a key
-    // operation and not a server-side filter — the node was never told who asked.
+    // The neighbour finds and opens exactly its own one output, so detection is a
+    // key operation and not a server-side filter — the node was never told who
+    // asked, and it served the same payload bytes to both wallets.
     let mut nrng = StdRng::seed_from_u64(11);
     let neighbours = light_client_scan(&base_url, &neighbour.dk, 0, height, cfg, &mut nrng)
         .expect("scan runs");
     assert_eq!(neighbours.stats.detected_outputs, 1);
+    assert_eq!(neighbours.completeness(), Completeness::Complete);
     assert_ne!(
-        neighbours.unopened[0].tx_index, out.unopened[0].tx_index,
+        neighbours.notes[0].tx_index, out.notes[0].tx_index,
         "and it is the other transaction"
     );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 🔴 **The live acceptance shape, in miniature: a grant beyond the first
+/// compact page is detected AND opened, and the spendable balance equals the
+/// grant.** This extends lab issue #309's regression (PR #312) from the
+/// reference server onto a real node's serving surface — #312 proved the client
+/// pages, and could not prove that what the later page points at is openable,
+/// because nothing served the payloads then.
+///
+/// **The page bound is shrunk client-side and that is deliberate**, stated
+/// rather than buried: a deployed node's real bound is
+/// `qlab_node::MAX_COMPACT_BLOCKS` = 1,024 blocks, and mining 1,025 blocks here
+/// would cost minutes of rig time to exercise arithmetic the client already
+/// owns. The wrapper below truncates every `/v1/compact` response to two blocks
+/// — the same condition, at a size a test can hold — and passes `/full` through
+/// untouched, so the only thing under test is that paging and opening compose.
+#[test]
+fn a_grant_beyond_the_first_compact_page_is_detected_and_opened() {
+    use qlab_cbserver::client::light_client_scan_with;
+    use qlab_cbserver::codec::{decode_compact_response, encode_compact_response};
+
+    let mut rng = StdRng::seed_from_u64(0x309_188);
+    let recipient: Keypair = generate_keypair(&mut rng);
+    let stranger: Keypair = generate_keypair(&mut rng);
+
+    let (config, genesis, base) = rig("paged-grant");
+    let mut node = RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier)
+        .expect("the node starts on its own genesis");
+    node.set_mine_interval(Duration::ZERO);
+    node.try_checkpoint();
+    let anchor = node.state().commitment_root();
+
+    // Four blocks paying a stranger, then the grant in the fifth — so the first
+    // two-block page cannot contain it and a client that does not page reports
+    // the #309 symptom (`Complete` / nothing) about a chain that paid it.
+    for i in 0..4u8 {
+        let (theirs, _) = payment_to(&stranger.ek, 1, 40 + i, anchor, &mut rng);
+        assert!(node.submit_local_tx(theirs), "the node admits the stranger's payment");
+        assert!(node.try_mine(), "mined");
+    }
+    let (grant_tx, granted) = payment_to(&recipient.ek, 1, 1, anchor, &mut rng);
+    assert!(node.submit_local_tx(grant_tx));
+    assert!(node.try_mine());
+    let tip = node.tip_height();
+    assert_eq!(tip, 5, "five blocks, the grant in the last one");
+
+    let bound = node.start_discovery_endpoint("127.0.0.1:0").expect("bind ephemeral");
+    let base_url = format!("http://{bound}");
+    let cfg = ScanConfig { mode: qlab_note::scan::ScanMode::FullFo, decoy: DecoyPolicy::Off };
+
+    // The node's real HTTP, with compact responses clipped to two blocks.
+    let asked = std::cell::RefCell::new(Vec::new());
+    let mut fetch = |path: &str| -> Result<Vec<u8>, String> {
+        let bytes = qlab_cbserver::client::http_get(&base_url, path).map_err(|e| e.to_string())?;
+        if path.starts_with("/v1/compact") {
+            asked.borrow_mut().push(path.to_string());
+            let blocks = decode_compact_response(&bytes).expect("the node serves the wire");
+            let page: Vec<_> = blocks.into_iter().take(2).collect();
+            return Ok(encode_compact_response(&page));
+        }
+        Ok(bytes)
+    };
+    let mut wrng = StdRng::seed_from_u64(0x309);
+    let out = light_client_scan_with(&mut fetch, &recipient.dk, 0, tip, cfg, &mut wrng)
+        .expect("the compact half resolves");
+
+    // The client walked the range one page at a time…
+    assert_eq!(
+        *asked.borrow(),
+        vec![
+            "/v1/compact?from=0&to=5".to_string(),
+            "/v1/compact?from=2&to=5".to_string(),
+            "/v1/compact?from=4&to=5".to_string(),
+        ],
+        "pages resume from the last served height + 1"
+    );
+    // …and the grant on the last page is real, spendable money.
+    assert_eq!(out.stats.detected_outputs, 1, "the grant is detected");
+    assert_eq!(out.completeness(), Completeness::Complete);
+    assert_eq!(out.notes.len(), 1);
+    assert_eq!(out.notes[0].height, 5, "at its real chain coordinate");
+    assert_eq!(out.notes[0].detected.note, granted[0], "opened to the note that was paid");
+    assert_eq!(
+        out.spendable_value(),
+        u128::from(granted[0].value),
+        "🔴 spendable equals the grant value — the live acceptance sentence"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// 🔴 **The negative that keeps the positive honest: a payload that does not
+/// authenticate is `detected 1, opened 0` with the reason — never a silent
+/// zero, and never a partial total.**
+///
+/// Consensus deliberately does not judge payload validity
+/// (`discovery-on-the-consensus-wire.md` §4 rule 4 — a node cannot decrypt a
+/// ciphertext addressed to someone else), so a sender CAN commit a payload that
+/// will not open: the region still re-encodes to itself and still binds the
+/// declared commitments. That makes this a reachable chain state rather than a
+/// hypothetical, and the recipient is the only party who can see it.
+#[test]
+fn a_tampered_committed_payload_is_reported_not_silently_dropped() {
+    let mut rng = StdRng::seed_from_u64(0x188_5);
+    let recipient: Keypair = generate_keypair(&mut rng);
+
+    let (config, genesis, base) = rig("tampered-payload");
+    let mut node = RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier)
+        .expect("the node starts on its own genesis");
+    node.set_mine_interval(Duration::ZERO);
+    node.try_checkpoint();
+    let anchor = node.state().commitment_root();
+
+    // A real payment whose committed payload section has one byte flipped. The
+    // tag and `cm` are untouched, so detection still succeeds — which is the
+    // whole point: the chain says this output is yours and it will not open.
+    let (mut tx, _notes) = payment_to(&recipient.ek, 1, 1, anchor, &mut rng);
+    let last = tx.discovery.len() - 1;
+    tx.discovery[last] ^= 0xff;
+    assert!(
+        node.submit_local_tx(tx),
+        "consensus checks shape and binding, never payload validity (§4 rule 4) — so this is a \
+         chain state a sender can really produce"
+    );
+    assert!(node.try_mine());
+    let height = node.tip_height();
+
+    let bound = node.start_discovery_endpoint("127.0.0.1:0").expect("bind ephemeral");
+    let cfg = ScanConfig { mode: qlab_note::scan::ScanMode::FullFo, decoy: DecoyPolicy::Off };
+    let mut wrng = StdRng::seed_from_u64(5);
+    let out = light_client_scan(&format!("http://{bound}"), &recipient.dk, 0, height, cfg, &mut wrng)
+        .expect("the compact half resolves");
+
+    assert_eq!(out.stats.detected_outputs, 1, "the committed tag still matches");
+    assert!(out.notes.is_empty(), "and nothing opened");
+    assert_eq!(
+        out.completeness(),
+        Completeness::Incomplete { detected: 1, opened: 0 },
+        "detected N, opened M<N — the honesty vocabulary, unchanged"
+    );
+    assert_eq!(out.unopened.len(), 1);
+    assert_eq!(
+        out.unopened[0].why,
+        Unopened::PayloadRejected,
+        "🔴 and the reason is AEAD rejection, NOT `PayloadUnavailable`: the node served the \
+         bytes, they are the bytes the block commits, and they do not authenticate"
+    );
+    assert_eq!(out.spendable_value(), 0, "no value is credited under an incomplete verdict");
 
     let _ = std::fs::remove_dir_all(&base);
 }
