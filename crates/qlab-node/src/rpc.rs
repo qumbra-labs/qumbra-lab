@@ -58,7 +58,7 @@ use qlab_cbserver::codec::{
     committed_payloads_per_recipient, decode_committed_discovery, encode_committed_discovery,
     encode_compact_response, encode_full_response,
     read_varint, write_varint, BlockNullifiers, CodecError, CompactBlock, CompactGroup,
-    NullifierPage, MAX_NULLIFIER_BLOCKS,
+    NullifierPage,
 };
 use qlab_cbserver::tree::Frontier;
 use qlab_devnet::body::{TxEntry, TxPublic, TxVerifier};
