@@ -83,6 +83,42 @@ pub struct SendRecord {
     pub nullifiers: Vec<[u8; 32]>,
 }
 
+impl SendRecord {
+    /// The record for a spend this wallet just built, derived from the
+    /// transaction's **declared public surface** — the one the wire carries and
+    /// the node judges.
+    ///
+    /// This is the whole construction, in one place, because `send` runs it
+    /// behind a ~3 s / ~12 GB prove and a test that wanted to check it any
+    /// other way would have to copy it. `tests/e2e_first_spend.rs` calls this
+    /// function on a REAL proved transaction and asserts the id it derives is
+    /// byte-for-byte the one `POST /v1/tx` answered with.
+    pub fn declared(
+        public: &qlab_devnet::body::TxPublic,
+        submitted_at_tip: u64,
+        amount: u64,
+        recipient_short: String,
+    ) -> SendRecord {
+        SendRecord {
+            // The same derivation the node runs over the same fields — the
+            // statement id, so it is stable whether the transaction is pending
+            // or already in a block.
+            txid: qlab_node::rpc::tx_id(
+                &public.anchor,
+                &public.nullifiers,
+                &public.commitments,
+                public.bucket.logical_actions(),
+                public.fee,
+            ),
+            submitted_at_tip,
+            amount,
+            fee: public.fee,
+            recipient_short,
+            nullifiers: public.nullifiers.clone(),
+        }
+    }
+}
+
 /// Every way the send log refuses. Reject-unknown throughout: a file this
 /// binary does not understand is never guessed at, never migrated silently, and
 /// never partially believed.
@@ -397,6 +433,48 @@ mod tests {
         )
         .unwrap();
         assert!(SendLog::load(&d).unwrap_err().to_string().contains("no nf"));
+    }
+
+    /// `declared` reads the record off the transaction's own public surface —
+    /// the fee and the nullifiers are the DECLARED ones rather than anything a
+    /// caller passes alongside, and the id is the node's own statement-id
+    /// derivation. (`tests/e2e_first_spend.rs` runs this same constructor on a
+    /// REAL proved transaction and checks the id against `POST /v1/tx`'s answer;
+    /// this is the debug-runnable half of that.)
+    #[test]
+    fn declared_reads_the_transactions_own_public_surface() {
+        use qlab_devnet::body::TxPublic;
+        use qlab_devnet::fees::{posted_fee, ArityBucket};
+
+        let public = TxPublic {
+            anchor: [0x01; 32],
+            nullifiers: vec![[0x02; 32], [0x03; 32]],
+            commitments: vec![[0x04; 32], [0x05; 32]],
+            bucket: ArityBucket::TwoByTwo,
+            fee: posted_fee(ArityBucket::TwoByTwo),
+        };
+        let r = SendRecord::declared(&public, 42, 100_000_000, "qmbs1payee".into());
+
+        assert_eq!(r.fee, posted_fee(ArityBucket::TwoByTwo), "the declared fee, not a guess");
+        assert_eq!(r.nullifiers, public.nullifiers, "the join key is what the wire carries");
+        assert_eq!(r.submitted_at_tip, 42);
+        assert_eq!(r.amount, 100_000_000);
+        assert_eq!(
+            r.txid,
+            qlab_node::rpc::tx_id(
+                &public.anchor,
+                &public.nullifiers,
+                &public.commitments,
+                2,
+                public.fee
+            ),
+            "the statement id, by the node's own derivation"
+        );
+        // It round-trips through the file unchanged — the record `send` writes
+        // is the record `history` reads.
+        let d = tmp("declared");
+        SendLog::append(&d, &r).unwrap();
+        assert_eq!(SendLog::load(&d).unwrap().unwrap().records, vec![r]);
     }
 
     /// The join is the nullifiers, and an intersection of one is enough.

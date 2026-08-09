@@ -501,20 +501,16 @@ fn a_first_spend_travels_the_whole_story_and_the_recipient_detects_it() {
     // …and with the local record this run really would have written, the one
     // line the chain can never carry is filled in and labeled — and no figure
     // above it moves.
-    let record = SendRecord {
-        txid: qlab_node::rpc::tx_id(
-            &art.entry.public.anchor,
-            &art.entry.public.nullifiers,
-            &art.entry.public.commitments,
-            art.entry.public.bucket.logical_actions(),
-            art.entry.public.fee,
-        ),
-        submitted_at_tip: anchor.tip_height,
-        amount: AMOUNT,
-        fee: art.fee,
-        recipient_short: recipient_addr.short().encode(),
-        nullifiers: art.entry.public.nullifiers.clone(),
-    };
+    // The SAME constructor `send` runs — not a copy of it — over the public
+    // surface a real STARK proved and a real node admitted.
+    let record = SendRecord::declared(
+        &art.entry.public,
+        anchor.tip_height,
+        AMOUNT,
+        recipient_addr.short().encode(),
+    );
+    assert_eq!(record.fee, art.fee, "the record's fee is the DECLARED one");
+    assert_eq!(record.nullifiers, art.entry.public.nullifiers);
     assert_eq!(
         qumbra_wallet::sends::hex32(&record.txid),
         txid_hex,

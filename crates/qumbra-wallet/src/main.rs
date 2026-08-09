@@ -352,24 +352,16 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
     //
     // The statement tx id is derived locally over the declared public surface —
     // the same derivation the node runs, cross-checked against its answer below.
-    let public = &art.entry.public;
-    let record = qumbra_wallet::sends::SendRecord {
-        txid: qlab_node::rpc::tx_id(
-            &public.anchor,
-            &public.nullifiers,
-            &public.commitments,
-            public.bucket.logical_actions(),
-            public.fee,
-        ),
-        // The node's TIP when this was built — not the height it will be mined
-        // at, which nobody knows yet. `history` joins on the nullifiers below,
-        // never on this.
-        submitted_at_tip: anchor.tip_height,
+    //
+    // `submitted_at_tip` is the node's TIP when this was built — not the height
+    // it will be mined at, which nobody knows yet. `history` joins on the
+    // declared nullifiers, never on this.
+    let record = qumbra_wallet::sends::SendRecord::declared(
+        &art.entry.public,
+        anchor.tip_height,
         amount,
-        fee: art.fee,
-        recipient_short: recipient.short().encode(),
-        nullifiers: public.nullifiers.clone(),
-    };
+        recipient.short().encode(),
+    );
     let recorded = qumbra_wallet::sends::SendLog::append(&dir, &record);
     if let Err(e) = &recorded {
         // Enrichment must never block a spend: the money matters more than the
