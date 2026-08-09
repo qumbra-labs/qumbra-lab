@@ -414,6 +414,36 @@ impl Faucet {
             }
         }
     }
+
+    /// The chain refused a grant because one or more of its input notes are
+    /// already spent (nullifiers on-chain). Drop those notes — do **not** put
+    /// them back into inventory — restore any still-live inputs, and requeue the
+    /// request **without** burning an attempt (lab issue #310).
+    ///
+    /// Restoring a spent note is how a post-restart inventory re-burns the retry
+    /// budget on the same double-spend: `select_pair` is deterministic, so the
+    /// next attempt re-picks the same pair. Forgetting the spent notes lets the
+    /// next attempt re-pick; if nothing live remains, the next `dispense` stalls
+    /// on inventory rather than proving another doomed grant.
+    ///
+    /// `spent_cms` are the leaf commitments of the notes known spent. Notes in
+    /// `plan.spent` whose `cm` is not listed are restored.
+    pub fn reject_stale_inputs(
+        &mut self,
+        plan: GrantPlan,
+        request: PendingRequest,
+        spent_cms: &[[u64; 4]],
+    ) {
+        self.stats.rejected += 1;
+        for note in plan.spent {
+            if spent_cms.iter().any(|cm| cm == &note.cm) {
+                // Already spent on-chain — never restore.
+                continue;
+            }
+            self.inventory.insert(note);
+        }
+        self.queue.requeue_unpenalized(request);
+    }
 }
 
 #[cfg(test)]
