@@ -29,6 +29,7 @@ use qlab_note::compact::{
 };
 use qlab_note::wire::RecipientBundle;
 
+use crate::emission_exact::{coinbase_exact, RULE_BOUNDARY_HEIGHT};
 use crate::fees::{posted_fee, ArityBucket};
 use crate::hash::keccak256;
 use crate::header::{BlockHeader, Hash32};
@@ -291,6 +292,31 @@ pub enum BodyError {
     /// yields `rkm = 0`, so the coins are gone. If a block mints, it must name
     /// someone. Genesis is exempt for free — it carries `coinbase == 0`.
     MissingCoinbasePayee,
+    /// **The scheduled-emission rule** (lab #299): the body's `coinbase` counter is
+    /// not the schedule's value for the block's height.
+    ///
+    /// # Why this rule did not exist until now, and why it does now
+    ///
+    /// `coinbase(h)` was defined by protocol-spec §6 and enforced by **nobody** —
+    /// a doc-prose invariant at this file's `BlockBody::coinbase` field. The live T0
+    /// chain paid for that: height 1377 committed `coinbase(1378)`, under-emitting
+    /// 4,114 bessel, and no validator noticed (#299 §5, found by
+    /// `qumbra-node audit-emission`).
+    ///
+    /// It binds **above [`crate::emission_exact::RULE_BOUNDARY_HEIGHT`] only**, and
+    /// the reason is not gentleness: applied retroactively it would invalidate the
+    /// running chain, whose one defective block is grandfathered as recorded history
+    /// (#299 sequencing ruling clause 1). Above the boundary the schedule is the
+    /// exact-decimal one, so the rule is *evaluable identically on every platform* —
+    /// which it would not be under the f64 schedule, where the same rule forks a
+    /// mixed-libc net (#303).
+    ///
+    /// **Genesis is exempt structurally, not by a special case.** `coinbase(0)` is
+    /// `5×10⁹` while the genesis body commits `0`, so a naive rule rejects genesis
+    /// itself (#299's verification comment). The check is `height > boundary`, and no
+    /// boundary can be negative, so height 0 can never reach it — the exemption is a
+    /// property of the comparison rather than a list of exceptions to maintain.
+    WrongScheduledCoinbase { height: u64, expected: u64, got: u64 },
     /// The tx at `index` references an anchor that is not a finalized root (§6).
     AnchorNotFinal { index: usize },
     /// The tx at `index` pays the wrong fee for its arity bucket (§8).
@@ -351,6 +377,45 @@ pub enum BodyError {
     },
 }
 
+/// **The #299 scheduled-emission rule at the shipped boundary.**
+///
+/// `body.coinbase == coinbase_exact(height)` for every block above
+/// [`RULE_BOUNDARY_HEIGHT`]; at and below it, history is grandfathered as recorded
+/// and this returns `Ok` without evaluating the schedule at all.
+///
+/// Called by [`validate_body`], so no caller has to remember it — and every peer's
+/// block goes through `validate_body`, with no mempool and no declaration involved.
+pub fn check_scheduled_coinbase(height: u64, committed: u64) -> Result<(), BodyError> {
+    check_scheduled_coinbase_above(RULE_BOUNDARY_HEIGHT, height, committed)
+}
+
+/// [`check_scheduled_coinbase`] with the boundary as an argument — the **drill**
+/// seam, and nothing else.
+///
+/// The shipped boundary is a compiled-in constant (H1: never config, never genesis,
+/// no runtime override), so the only way to exercise the handoff without mining
+/// 18,000 blocks is to state the boundary explicitly. The drill
+/// (`qumbra-node/tests/rule_boundary_drill.rs`) uses this to prove the property at a
+/// test height; consensus uses [`check_scheduled_coinbase`], which is the only
+/// caller that reads the real constant.
+pub fn check_scheduled_coinbase_above(
+    boundary: u64,
+    height: u64,
+    committed: u64,
+) -> Result<(), BodyError> {
+    if height <= boundary {
+        // Grandfathered. Note this is also the whole of the genesis exemption:
+        // `height 0 <= boundary` for every boundary, so `coinbase_exact(0)` is
+        // never compared against genesis's committed 0.
+        return Ok(());
+    }
+    let expected = coinbase_exact(height);
+    if committed != expected {
+        return Err(BodyError::WrongScheduledCoinbase { height, expected, got: committed });
+    }
+    Ok(())
+}
+
 /// Check that `body` is the body `header` committed to (issue #77).
 ///
 /// `tx_body_commitment` is part of the header's hash preimage
@@ -407,6 +472,10 @@ where
     if body.mints_without_payee() {
         return Err(BodyError::MissingCoinbasePayee);
     }
+    // And it must mint the SCHEDULED amount (lab #299). Also an integer compare,
+    // and it guards the same issuance from the other side: #101 asks "does anyone
+    // get paid", this asks "is that the amount the schedule owes".
+    check_scheduled_coinbase(header.height, body.coinbase)?;
     let mut seen_nf: HashSet<Hash32> = HashSet::new();
     for (i, tx) in body.txs.iter().enumerate() {
         if !is_anchor_final(&tx.public.anchor) {
@@ -571,6 +640,13 @@ mod tests {
     fn header_for(body: &BlockBody) -> BlockHeader {
         let genesis = BlockHeader::genesis(1, 0);
         BlockHeader::child_of(&genesis, 75, 1, body.commitment())
+    }
+
+    /// `header_for` at an arbitrary height. Only `height` and
+    /// `tx_body_commitment` are read by `validate_body`, so overriding the height is
+    /// enough to put a body above or below the rule boundary.
+    fn header_at(height: u64, body: &BlockBody) -> BlockHeader {
+        BlockHeader { height, ..header_for(body) }
     }
 
     fn good_tx(nf: u8) -> TxEntry {
@@ -746,6 +822,144 @@ mod tests {
         assert_eq!(
             validate_body(&header_for(&no_mint), &no_mint, &MockVerifier, is_final),
             Ok(())
+        );
+    }
+
+    // --- lab #299: the scheduled-emission validity rule ---------------------
+
+    /// **Grandfathering is a property, not prose.** The *same* over- and
+    /// under-paying bodies that are refused above the boundary are accepted at and
+    /// below it — including the boundary height itself, which is the last block under
+    /// the old schedule.
+    #[test]
+    fn the_same_wrong_coinbase_is_refused_above_the_boundary_and_accepted_below() {
+        let b = RULE_BOUNDARY_HEIGHT;
+        for delta in [1i64, -1, 1_000_000] {
+            let value = (coinbase_exact(b + 1) as i64 + delta) as u64;
+            let body = BlockBody {
+                txs: vec![good_tx(1)],
+                coinbase: value,
+                coinbase_rkm: MINER_RKM,
+            };
+            // Above: refused, by name, with both numbers in the error.
+            assert_eq!(
+                validate_body(&header_at(b + 1, &body), &body, &MockVerifier, is_final),
+                Err(BodyError::WrongScheduledCoinbase {
+                    height: b + 1,
+                    expected: coinbase_exact(b + 1),
+                    got: value,
+                }),
+                "delta {delta} above the boundary must be refused"
+            );
+            // Below, and AT the boundary: the identical body is fine.
+            for height in [1, b - 1, b] {
+                assert_eq!(
+                    validate_body(&header_at(height, &body), &body, &MockVerifier, is_final),
+                    Ok(()),
+                    "delta {delta} at height {height} is grandfathered history"
+                );
+            }
+        }
+    }
+
+    /// The honest post-boundary block passes, at the boundary's first height and
+    /// well above it — so the rule is not simply "refuse everything up there".
+    #[test]
+    fn an_honest_post_boundary_block_passes_the_schedule_rule() {
+        let b = RULE_BOUNDARY_HEIGHT;
+        for height in [b + 1, b + 2, b + 1_000, b + 500_000] {
+            let body = BlockBody {
+                txs: vec![good_tx(1)],
+                coinbase: coinbase_exact(height),
+                coinbase_rkm: MINER_RKM,
+            };
+            assert_eq!(
+                validate_body(&header_at(height, &body), &body, &MockVerifier, is_final),
+                Ok(()),
+                "the scheduled value must be accepted at {height}"
+            );
+        }
+    }
+
+    /// **The live 1377 shape**: a block committing the *adjacent* height's scheduled
+    /// value (`k = 1` substitution). Below the boundary this is the defect the chain
+    /// actually carries and it is grandfathered; above it, refused. This is the exact
+    /// failure the rule exists for, and it is worth its own test because the delta is
+    /// small — 4,114 bessel at height 1377 — and an "amount looks plausible" check
+    /// would miss it.
+    #[test]
+    fn the_adjacent_height_substitution_is_refused_above_the_boundary() {
+        let b = RULE_BOUNDARY_HEIGHT;
+        let height = b + 1;
+        let wrong = coinbase_exact(height + 1); // what block 1377 did, one height up
+        assert_ne!(wrong, coinbase_exact(height), "the schedule must actually decay");
+        let body = BlockBody {
+            txs: Vec::new(),
+            coinbase: wrong,
+            coinbase_rkm: MINER_RKM,
+        };
+        assert_eq!(
+            validate_body(&header_at(height, &body), &body, &MockVerifier, is_final),
+            Err(BodyError::WrongScheduledCoinbase {
+                height,
+                expected: coinbase_exact(height),
+                got: wrong,
+            })
+        );
+        // The under-emission is small, which is why nothing noticed it for 1,377
+        // blocks: the delta here is the same order as the −4114 of #299.
+        assert!(coinbase_exact(height) - wrong < 10_000);
+        // And the same body below the boundary is accepted — the grandfathering.
+        assert_eq!(
+            validate_body(&header_at(1_377, &body), &body, &MockVerifier, is_final),
+            Ok(())
+        );
+    }
+
+    /// **The #299 verification comment's trap, test-locked**: the rule must never
+    /// evaluate the schedule at height 0 against genesis's committed `0`. It cannot,
+    /// for *any* boundary, because `0 <= boundary` always — so the exemption survives
+    /// a re-stamp of the constant.
+    #[test]
+    fn the_rule_never_evaluates_the_schedule_against_genesis() {
+        let genesis_body = BlockBody { txs: Vec::new(), coinbase: 0, coinbase_rkm: [0; 4] };
+        assert_ne!(coinbase_exact(0), 0, "coinbase(0) is 5e9; genesis commits 0");
+        assert_eq!(
+            validate_body(&header_at(0, &genesis_body), &genesis_body, &MockVerifier, is_final),
+            Ok(())
+        );
+        // Structural, not a special case: at every boundary a caller could stamp,
+        // height 0 is exempt.
+        for boundary in [0u64, 8, 16, RULE_BOUNDARY_HEIGHT, u64::MAX] {
+            assert_eq!(check_scheduled_coinbase_above(boundary, 0, 0), Ok(()));
+        }
+    }
+
+    /// The rule sits **after** the header/body binding and the payee check, and
+    /// before any proof work — so a wrong-schedule block costs one integer compare,
+    /// and a body that is not the header's body still fails as `CommitmentMismatch`
+    /// rather than as a schedule violation.
+    #[test]
+    fn the_binding_still_wins_over_the_schedule_rule() {
+        let b = RULE_BOUNDARY_HEIGHT;
+        let honest = BlockBody {
+            txs: vec![good_tx(1)],
+            coinbase: coinbase_exact(b + 1),
+            coinbase_rkm: MINER_RKM,
+        };
+        let header = header_at(b + 1, &honest);
+        // A foreign body with BOTH defects: wrong commitment and wrong schedule.
+        let foreign = BlockBody { coinbase: 1, ..honest.clone() };
+        assert!(matches!(
+            validate_body(&header, &foreign, &MockVerifier, is_final),
+            Err(BodyError::CommitmentMismatch { .. }),
+        ));
+        // And a minting body with no payee is still MissingCoinbasePayee, not a
+        // schedule error, even above the boundary.
+        let unpaid = BlockBody { coinbase_rkm: [0; 4], ..honest.clone() };
+        assert_eq!(
+            validate_body(&header_at(b + 1, &unpaid), &unpaid, &MockVerifier, is_final),
+            Err(BodyError::MissingCoinbasePayee)
         );
     }
 
