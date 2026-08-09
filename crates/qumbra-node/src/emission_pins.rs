@@ -155,10 +155,22 @@ mod tests {
         assert_eq!(pins.s_atomic_at_boundary, qlab_node::emission::s_atomic_at_boundary());
         // Row-for-row against the attestation's own unpinned expected side.
         let ledger_rows = qlab_node::supply_by_epoch(
-            (0..=17_279u64).map(|height| qlab_node::SupplyBlock {
-                height,
-                coinbase: if height == 0 { 0 } else { qlab_node::coinbase(height) },
-                fees: 0,
+            (0..=17_279u64).map(|height| {
+                // Synthetic identities: the pins are a pure function of the
+                // schedule, so any contiguous chain shape witnesses them.
+                let mut hash = [0u8; 32];
+                hash[..8].copy_from_slice(&height.to_le_bytes());
+                let mut prev = [0u8; 32];
+                if height > 0 {
+                    prev[..8].copy_from_slice(&(height - 1).to_le_bytes());
+                }
+                qlab_node::SupplyBlock {
+                    height,
+                    hash,
+                    prev,
+                    coinbase: if height == 0 { 0 } else { qlab_node::coinbase(height) },
+                    fees: 0,
+                }
             }),
             EPOCH_LENGTH_BLOCKS,
         )

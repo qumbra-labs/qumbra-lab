@@ -51,6 +51,7 @@
 //! Reported on #303 as the reading this baton took of rider 2.
 
 use crate::emission::{s_atomic_exact, s_atomic_pre_boundary, RULE_BOUNDARY_HEIGHT};
+use qlab_devnet::header::Hash32;
 
 /// One activation pin: `(epoch, expected_coinbase_bessel)` for an epoch that ends
 /// at or below [`RULE_BOUNDARY_HEIGHT`].
@@ -75,6 +76,12 @@ pub const PINNED_EPOCH_EXPECTED: &[EpochPin] = &[];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SupplyBlock {
     pub height: u64,
+    /// This block's header hash — the ledger's identity for the height (#299 §4).
+    pub hash: Hash32,
+    /// This block's parent hash. The ledger refuses a block that is not a child of
+    /// what it last absorbed, which is what makes a reorg a **named error** instead
+    /// of a silently wrong sum.
+    pub prev: Hash32,
     /// The scheduled-emission counter committed by the block body.
     pub coinbase: u64,
     /// Transaction fees in the block. Reported, never subtracted from issuance.
@@ -129,6 +136,23 @@ pub enum SupplyError {
     DoesNotStartAtGenesis { got: u64 },
     NonContiguous { expected: u64, got: u64 },
     SumOverflow { epoch: u64 },
+    /// **The reorg refusal** (#299 §4). The pushed block sits at the expected height
+    /// but is not a child of the block the ledger last absorbed — i.e. fork choice
+    /// moved off the branch this ledger has been summing.
+    ///
+    /// Before this existed, such a push was accepted and the orphaned block's
+    /// coinbase stayed in the epoch's `measured_coinbase` **forever**, so the row
+    /// read DIVERGENT by the difference between the two branches' rewards. With the
+    /// #299 validity rule active, DIVERGENT is a real alarm; a reorg that can
+    /// manufacture one is a cry-wolf generator, and the one thing this surface must
+    /// never do is train its reader to ignore red.
+    ///
+    /// The remedy is the caller's: rebuild from the canonical chain
+    /// ([`SupplyLedger::from_blocks`]). The ledger deliberately does **not** rewind
+    /// itself — it keeps no per-height measured history, so a rewind could not
+    /// recompute the partial row it lands in, and a ledger that pretended otherwise
+    /// would be the same defect one layer down.
+    ForkedFromLedgerHead { height: u64, expected_prev: Hash32, got_prev: Hash32 },
 }
 
 /// Incremental supply accounting: rebuild once from the persisted canonical
@@ -146,6 +170,9 @@ pub struct SupplyLedger {
     /// one epoch can straddle [`RULE_BOUNDARY_HEIGHT`] (see the module docs), so one
     /// accumulator covers it.
     straddle_prefix: u64,
+    /// The header hash of the highest block absorbed — the ledger's own view of
+    /// which branch it is summing (#299 §4).
+    head_hash: Option<Hash32>,
 }
 
 impl SupplyLedger {
@@ -167,6 +194,7 @@ impl SupplyLedger {
             rows: Vec::new(),
             pins,
             straddle_prefix: 0,
+            head_hash: None,
         })
     }
 
@@ -190,6 +218,31 @@ impl SupplyLedger {
         &self.rows
     }
 
+    /// The header hash of the highest block this ledger absorbed, if any.
+    ///
+    /// **The reorg check the consumer owes** (#299 §4): a ledger whose head is no
+    /// longer the canonical block at that height is summing an abandoned branch, and
+    /// no amount of appending fixes it — the fork may be entirely *below*
+    /// [`Self::next_height`], in which case appending is a no-op and the stale sums
+    /// simply persist. Compare this against the canonical chain before catching up,
+    /// and rebuild when it differs.
+    pub fn head_hash(&self) -> Option<Hash32> {
+        self.head_hash
+    }
+
+    /// Whether this ledger is still summing `canonical` — i.e. its head is the
+    /// canonical block at its own highest height.
+    ///
+    /// `canonical` is indexed by height (`main_chain()`'s shape). An empty ledger is
+    /// trivially in sync; a ledger taller than the canonical chain is not.
+    pub fn is_in_sync_with(&self, canonical: &[Hash32]) -> bool {
+        match (self.next_height.checked_sub(1), self.head_hash) {
+            (None, _) => true,
+            (Some(h), Some(head)) => canonical.get(h as usize) == Some(&head),
+            (Some(_), None) => false,
+        }
+    }
+
     /// Append one canonical block. Heights must be contiguous from genesis.
     pub fn push(&mut self, block: SupplyBlock) -> Result<(), SupplyError> {
         if self.next_height == 0 && self.rows.is_empty() && block.height != 0 {
@@ -200,6 +253,16 @@ impl SupplyLedger {
                 expected: self.next_height,
                 got: block.height,
             });
+        }
+        // #299 §4: the right height is not enough — it must be the right *block*.
+        if let Some(head) = self.head_hash {
+            if block.prev != head {
+                return Err(SupplyError::ForkedFromLedgerHead {
+                    height: block.height,
+                    expected_prev: head,
+                    got_prev: block.prev,
+                });
+            }
         }
         self.next_height =
             self.next_height
@@ -240,6 +303,7 @@ impl SupplyLedger {
                 .checked_add(block.coinbase)
                 .ok_or(SupplyError::SumOverflow { epoch })?;
         }
+        self.head_hash = Some(block.hash);
         let straddle_prefix = self.straddle_prefix;
         let pins = self.pins;
         let row = self.rows.last_mut().expect("the epoch row was inserted above");
@@ -304,12 +368,35 @@ mod tests {
     use super::*;
     use crate::emission::coinbase;
 
+    /// A deterministic stand-in for a header hash: branch tag + height, so two
+    /// branches at the same height are distinguishable and a child's `prev`
+    /// reproduces its parent's `hash` by construction.
+    fn h(branch: u8, height: u64) -> Hash32 {
+        let mut out = [branch; 32];
+        out[1..9].copy_from_slice(&height.to_le_bytes());
+        out
+    }
+
+    /// One block of branch `branch` at `height`, carrying `coinbase`.
+    fn block_on(branch: u8, height: u64, coinbase: u64, fees: u64) -> SupplyBlock {
+        SupplyBlock {
+            height,
+            hash: h(branch, height),
+            prev: if height == 0 { [0u8; 32] } else { h(branch, height - 1) },
+            coinbase,
+            fees,
+        }
+    }
+
     fn known_chain(tip: u64, epoch_length: u64) -> Vec<SupplyBlock> {
         (0..=tip)
-            .map(|height| SupplyBlock {
-                height,
-                coinbase: if height == 0 { 0 } else { coinbase(height) },
-                fees: if height % epoch_length == 2 { 123 } else { 0 },
+            .map(|height| {
+                block_on(
+                    1,
+                    height,
+                    if height == 0 { 0 } else { coinbase(height) },
+                    if height % epoch_length == 2 { 123 } else { 0 },
+                )
             })
             .collect()
     }
@@ -363,11 +450,7 @@ mod tests {
     /// under the real epoch length and the real boundary.
     fn honest_chain(tip: u64) -> Vec<SupplyBlock> {
         (0..=tip)
-            .map(|height| SupplyBlock {
-                height,
-                coinbase: if height == 0 { 0 } else { coinbase(height) },
-                fees: 0,
-            })
+            .map(|height| block_on(1, height, if height == 0 { 0 } else { coinbase(height) }, 0))
             .collect()
     }
 
@@ -475,15 +558,112 @@ mod tests {
         assert!(PINNED_EPOCH_EXPECTED.is_empty(), "unpinned at merge (T-ops step)");
     }
 
+    // --- #299 §4: the reorg gap ----------------------------------------------
+
+    /// **The gap, and the fix.** Branch 1 mines height 5 with a *different* coinbase
+    /// than branch 2 does. The ledger absorbs branch 1 up to 5, then fork choice
+    /// picks branch 2. Before this fix, pushing branch 2's height 6 succeeded — the
+    /// heights were contiguous — and branch 1's orphaned coinbase stayed in the row
+    /// forever, so the epoch read DIVERGENT by the difference.
+    ///
+    /// Now the push is refused by name, and a rebuild from the canonical chain
+    /// re-derives the row exactly. **A reorg can no longer produce a DIVERGENT.**
+    #[test]
+    fn a_reorg_cannot_leave_an_orphaned_coinbase_in_the_sum() {
+        let epoch_length = 8;
+        // Branch 1: honest up to 4, then height 5 pays 1,000 bessel too much.
+        let mut ledger = SupplyLedger::new(epoch_length).unwrap();
+        for height in 0..=4u64 {
+            ledger
+                .push(block_on(1, height, if height == 0 { 0 } else { coinbase(height) }, 0))
+                .unwrap();
+        }
+        ledger.push(block_on(1, 5, coinbase(5) + 1_000, 0)).unwrap();
+        assert_eq!(ledger.rows()[0].divergence_bessel(), 1_000, "branch 1 is off by 1,000");
+        assert_eq!(ledger.head_hash(), Some(h(1, 5)));
+
+        // Fork choice moves to branch 2, which shares 0..=4 and mines an honest 5.
+        let canonical: Vec<Hash32> = (0..=6u64)
+            .map(|height| if height <= 4 { h(1, height) } else { h(2, height) })
+            .collect();
+        assert!(
+            !ledger.is_in_sync_with(&canonical),
+            "the ledger's head is no longer canonical — this is the check the consumer owes"
+        );
+
+        // The stale ledger REFUSES branch 2's height 6 rather than absorbing it.
+        assert_eq!(
+            ledger.push(block_on(2, 6, coinbase(6), 0)),
+            Err(SupplyError::ForkedFromLedgerHead {
+                height: 6,
+                expected_prev: h(1, 5),
+                got_prev: h(2, 5),
+            }),
+        );
+
+        // Rebuild from the canonical chain: the row re-derives to zero divergence.
+        let rebuilt = SupplyLedger::from_blocks(
+            canonical.iter().enumerate().map(|(height, hash)| SupplyBlock {
+                height: height as u64,
+                hash: *hash,
+                prev: if height == 0 {
+                    [0u8; 32]
+                } else {
+                    canonical[height - 1]
+                },
+                coinbase: if height == 0 { 0 } else { coinbase(height as u64) },
+                fees: 0,
+            }),
+            epoch_length,
+        )
+        .expect("the canonical chain is contiguous from genesis");
+        assert_eq!(rebuilt.rows()[0].divergence_bessel(), 0);
+        assert!(rebuilt.is_in_sync_with(&canonical));
+        assert_eq!(rebuilt.next_height(), 7);
+    }
+
+    /// The reorg may be entirely **below** `next_height`, in which case appending is
+    /// a no-op and the stale sums would simply persist — which is why the consumer's
+    /// check is `is_in_sync_with` and not "did a push fail".
+    #[test]
+    fn a_reorg_below_next_height_is_still_detected() {
+        let mut ledger = SupplyLedger::new(8).unwrap();
+        for height in 0..=5u64 {
+            ledger
+                .push(block_on(1, height, if height == 0 { 0 } else { coinbase(height) }, 0))
+                .unwrap();
+        }
+        // Fork choice replaced heights 3..=5 with a shorter-or-equal branch 2, and
+        // the new tip is 5 — so `next_height() == 6` and there is nothing to append.
+        let canonical: Vec<Hash32> = (0..=5u64)
+            .map(|height| if height <= 2 { h(1, height) } else { h(2, height) })
+            .collect();
+        assert_eq!(ledger.next_height(), 6);
+        assert!(!ledger.is_in_sync_with(&canonical));
+        // …and a chain SHORTER than the ledger is out of sync too.
+        assert!(!ledger.is_in_sync_with(&canonical[..3]));
+    }
+
+    /// An honest extension is in sync at every step, and an empty ledger is
+    /// trivially in sync — so the check cannot fire spuriously on the common path.
+    #[test]
+    fn the_sync_check_does_not_fire_on_an_honest_extension() {
+        let blocks = known_chain(10, 4);
+        let canonical: Vec<Hash32> = blocks.iter().map(|b| b.hash).collect();
+        let mut ledger = SupplyLedger::new(4).unwrap();
+        assert!(ledger.is_in_sync_with(&canonical), "an empty ledger is in sync");
+        for block in blocks {
+            ledger.push(block).unwrap();
+            assert!(ledger.is_in_sync_with(&canonical));
+        }
+        assert_eq!(ledger.head_hash(), Some(h(1, 10)));
+    }
+
     #[test]
     fn refuses_a_gapped_or_non_genesis_sequence() {
         assert_eq!(
             supply_by_epoch(
-                [SupplyBlock {
-                    height: 1,
-                    coinbase: coinbase(1),
-                    fees: 0,
-                }],
+                [block_on(1, 1, coinbase(1), 0)],
                 4,
             ),
             Err(SupplyError::DoesNotStartAtGenesis { got: 1 }),
