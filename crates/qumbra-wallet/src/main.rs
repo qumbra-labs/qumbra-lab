@@ -54,7 +54,9 @@ fn usage() {
                             [--out FILE] [--no-submit]\n  \
                             scan → sync the commitment tree → build + PROVE (real STARK,\n  \
                             ~3 s / ~12 GB) → POST /v1/tx, printing the node's typed outcome\n\n\
-         --url  is the compact/scan endpoint (cbserver or a node's discovery server)\n\
+         --url  is the compact/scan endpoint (cbserver or a node's discovery server):\n\
+                /v1/compact, /v1/block/../full, and /v1/nullifiers (the spent-note\n\
+                subtraction — without it no balance is quotable)\n\
          --node is the node's discovery server: /v1/tree/leaves, /v1/anchors, POST /v1/tx\n\
                 (defaults to --url when omitted — one host usually serves both)\n\n\
          Both URLs accept http://host:PORT (port required, plaintext) and\n\
@@ -71,6 +73,15 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+/// The union of the height ranges several scans' outputs came from — the range
+/// the nullifier stream must cover before any of their figures may be quoted
+/// (lab issue #314). `None` when no scan saw a block at all.
+fn widest_range(
+    ranges: impl IntoIterator<Item = Option<(u64, u64)>>,
+) -> Option<(u64, u64)> {
+    ranges.into_iter().flatten().reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
 }
 
 fn dir_of(args: &[String]) -> Result<PathBuf, Box<dyn Error>> {
@@ -172,9 +183,10 @@ fn miner_rkm(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// Refuses on partial scan coverage — spending on incomplete knowledge risks
 /// double-claimed nullifiers (#244's discipline, untouched).
 fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
-    use qlab_cbserver::client::{light_client_scan_with, Completeness, ScanConfig};
-    use qumbra_wallet::net::{self, HttpAnchorSource, HttpLeafSource, SubmitClass};
+    use qlab_cbserver::client::{light_client_scan_with, Completeness, ScanConfig, ScanOutcome};
+    use qumbra_wallet::net::{self, HttpAnchorSource, HttpLeafSource, HttpNullifierSource, SubmitClass};
     use qumbra_wallet::send::{build_send, os_rng, Spendable};
+    use qumbra_wallet::spent::{fetch_spent, subtract_spent};
     use qumbra_wallet::sync::{hex32, sync_and_select};
 
     let dir = dir_of(args)?;
@@ -197,7 +209,7 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     // Gather spendables — and REFUSE on any non-Complete verdict: a spend
     // built on partial knowledge can double-claim a nullifier.
-    let mut spendables: Vec<Spendable> = Vec::new();
+    let mut scanned: Vec<(u64, ScanOutcome)> = Vec::new();
     for &idx in &w.allocated {
         let d = wallet.diversifier_at_index(idx);
         let kp = wallet.diversified_keypair(&d);
@@ -214,22 +226,53 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
                 .into())
             }
         }
-        for ln in &outcome.notes {
+        scanned.push((idx, outcome));
+    }
+
+    // 🔴 Lab issue #314 scope item 5: **selection skips what the chain already
+    // spent.** Without this the wallet would happily pick a note it spent an
+    // hour ago, pay ~3 s and ~12 GB to prove a statement about it, and be
+    // refused `nullifier-spent` at the node — the #310 ghost-note failure shape,
+    // relocated into every user's wallet. Refusing here, before the prove, on
+    // the same subtraction the balance uses.
+    //
+    // And an UNAVAILABLE stream refuses the whole send rather than guessing: a
+    // spend built on "I could not check" is exactly the wasted proof above.
+    let outputs = widest_range(scanned.iter().map(|(_, o)| o.stats.compact_range_served));
+    let spent_set = fetch_spent(&HttpNullifierSource::new(url), 0, scan_to)
+        .map_err(|e| format!("{e} — refusing to select inputs this wallet may already have spent"))?;
+    spent_set
+        .covers_outputs(outputs)
+        .map_err(|e| format!("{e} — refusing to select inputs this wallet may already have spent"))?;
+
+    let mut spendables: Vec<Spendable> = Vec::new();
+    let mut skipped = 0usize;
+    for (idx, outcome) in &scanned {
+        let report = subtract_spent(&wallet, *idx, &outcome.notes, &spent_set);
+        skipped += report.spent.len();
+        for ln in &report.spendable {
             spendables.push(Spendable {
-                div_index: idx,
+                div_index: *idx,
                 value: ln.detected.note.value,
                 rho: ln.detected.note.rho,
                 rseed: ln.detected.note.rseed,
             });
         }
     }
+    if skipped > 0 {
+        eprintln!(
+            "note: {skipped} already-spent note(s) skipped by input selection (their nullifiers \
+             are on the chain)"
+        );
+    }
 
     if spendables.is_empty() {
         return Err(format!(
-            "no spendable notes: the scan of 0..={scan_to} found nothing this wallet can spend. \
-             If you expect a coinbase, it is not spendable until it matures (frozen §2, \
-             COINBASE_MATURITY_BLOCKS in qlab-node); if you expect a received note, check that \
-             its address index is allocated here (`address --new`)."
+            "no spendable notes: the scan of 0..={scan_to} found nothing this wallet can spend \
+             ({skipped} note(s) it found are already spent). If you expect a coinbase, it is not \
+             spendable until it matures (frozen §2, COINBASE_MATURITY_BLOCKS in qlab-node); if \
+             you expect a received note, check that its address index is allocated here \
+             (`address --new`)."
         )
         .into());
     }
@@ -332,8 +375,19 @@ fn backup(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// `scan` — the balance report, and since lab issue #314 it is a **two-stream**
+/// report: the outputs off `/v1/compact`, then this wallet's own spends
+/// subtracted against `/v1/nullifiers`.
+///
+/// The nullifier stream is fetched **after** every scan, deliberately: the chain
+/// only grows, so a node that advanced mid-scan gives the second fetch MORE
+/// coverage than the outputs need, never less. Fetching it first would turn an
+/// ordinary block arrival into a spurious `UNAVAILABLE`.
 fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
-    use qlab_cbserver::client::{light_client_scan_with, ScanConfig};
+    use qlab_cbserver::client::{light_client_scan_with, ScanConfig, ScanOutcome};
+    use qumbra_wallet::net::HttpNullifierSource;
+    use qumbra_wallet::spent::{fetch_spent, subtract_spent};
+    use qumbra_wallet::view::SpentCoverage;
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
     let dir = dir_of(args)?;
@@ -351,7 +405,9 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
     let mut seed_bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut seed_bytes);
     let mut rng = StdRng::from_seed(seed_bytes);
-    let mut scans = Vec::new();
+
+    // ---- 1. The outputs, per allocated address. ----------------------------
+    let mut outcomes: Vec<(u64, String, Result<ScanOutcome, String>)> = Vec::new();
     for &idx in &w.allocated {
         let d = wallet.diversifier_at_index(idx);
         let kp = wallet.diversified_keypair(&d);
@@ -362,19 +418,43 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
         // The fetch is this crate's (`net::scan_fetch`), so the scan reaches an
         // https edge; the scan FLOW is still qlab-cbserver's, unmodified.
         let mut fetch = qumbra_wallet::net::scan_fetch(url);
-        match light_client_scan_with(&mut fetch, &kp.dk, from, to, ScanConfig::default(), &mut rng)
-        {
-            Ok(outcome) => scans.push(DivScan::from_outcome(idx, short, &outcome)),
-            Err(e) => scans.push(DivScan {
-                index: idx,
-                address_short: short,
-                completeness: qlab_cbserver::client::Completeness::Complete,
-                spendable_bessel: 0,
-                shadowed_bessel: 0,
-                never_started: Some(e.to_string()),
-            }),
-        }
+        let got = light_client_scan_with(&mut fetch, &kp.dk, from, to, ScanConfig::default(), &mut rng)
+            .map_err(|e| e.to_string());
+        outcomes.push((idx, short, got));
     }
-    print!("{}", view::render(&scans, (from, to), url));
+
+    // ---- 2. The spends, over the range the outputs actually reached. -------
+    let outputs = widest_range(
+        outcomes.iter().filter_map(|(_, _, o)| o.as_ref().ok()).map(|o| o.stats.compact_range_served),
+    );
+    let (coverage, set) = match fetch_spent(&HttpNullifierSource::new(url), from, to) {
+        Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),
+        Ok(set) => match set.covers_outputs(outputs) {
+            Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),
+            Ok(()) => (SpentCoverage::Covered { range: set.covered }, Some(set)),
+        },
+    };
+
+    // ---- 3. The report. A figure exists only where both halves do. ---------
+    let scans: Vec<DivScan> = outcomes
+        .into_iter()
+        .map(|(idx, short, got)| match (got, &set) {
+            (Ok(outcome), Some(set)) => {
+                let report = subtract_spent(&wallet, idx, &outcome.notes, set);
+                DivScan::from_subtracted(idx, short, &outcome, &report)
+            }
+            (Ok(outcome), None) => DivScan::unquotable(idx, short, outcome.completeness()),
+            (Err(e), _) => {
+                let mut d = DivScan::unquotable(
+                    idx,
+                    short,
+                    qlab_cbserver::client::Completeness::Complete,
+                );
+                d.never_started = Some(e);
+                d
+            }
+        })
+        .collect();
+    print!("{}", view::render(&scans, (from, to), url, &coverage));
     Ok(())
 }

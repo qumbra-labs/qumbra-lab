@@ -1,8 +1,15 @@
-//! The three §2 endpoints over localhost HTTP (`tiny_http`), in-memory.
+//! The §2 endpoints over localhost HTTP (`tiny_http`), in-memory.
 //!
 //! Endpoints (wallet-interop-spec §2):
 //! - `GET /v1/compact?from=<height>&to=<height>` — range-stream of compact
 //!   groups per block ([`crate::codec::encode_compact_response`]).
+//! - `GET /v1/nullifiers?from=<height>&to=<height>` — the per-block nullifier
+//!   lists a wallet subtracts its own spent notes against
+//!   ([`crate::codec::NullifierPage`], lab issue #314). **Bulk over a range
+//!   only** — a per-nullifier probe would tell this server which notes are the
+//!   asker's, so there is no such form and must never be one. Without this
+//!   route a wallet pointed at the reference server can quote no balance at
+//!   all, because a figure that cannot subtract spends is not quotable.
 //! - `GET /v1/block/<height>/tx/<index>/full` — full ciphertext fetch on a scan
 //!   match ([`crate::codec::encode_full_response`]).
 //! - `GET /v1/tree/frontier?at=<height>` — commitment-tree frontier for witness
@@ -22,7 +29,7 @@ use std::thread::JoinHandle;
 
 use tiny_http::{Method, Response, Server};
 
-use crate::codec::{encode_compact_response, encode_full_response};
+use crate::codec::{encode_compact_response, encode_full_response, NullifierPage};
 use crate::data::Devnet;
 
 /// A running server: bound address + the worker thread. Drop-safe via
@@ -111,6 +118,18 @@ pub fn route(devnet: &Devnet, url: &str) -> RouteResult {
             }
             Ok(encode_compact_response(&devnet.compact_range(from, to)))
         }
+        // /v1/nullifiers?from=&to= — the per-block nullifier lists a wallet
+        // subtracts its own spent notes against (lab issue #314). Bulk over a
+        // range; there is deliberately no per-nullifier membership form, because
+        // "is nf X spent" would tell this server which notes are the asker's.
+        ["v1", "nullifiers"] => {
+            let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'"))?;
+            let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'"))?;
+            if to < from {
+                return Err((400, "'to' < 'from'"));
+            }
+            Ok(NullifierPage::page(devnet.nullifier_range(from, to), from, to).to_bytes())
+        }
         // /v1/block/<height>/tx/<index>/full
         ["v1", "block", h, "tx", i, "full"] => {
             let height = h.parse::<u64>().map_err(|_| (400, "invalid height"))?;
@@ -177,10 +196,56 @@ mod tests {
         assert_eq!(f.root(), d.tree.root_at(d.leaves_at(2)), "served frontier reconstructs the tree root");
     }
 
+    /// The reference server serves the nullifier stream too (lab issue #314) —
+    /// the projection is the block's own `TxPublic::nullifiers`, and every
+    /// height in range is present so a client can tell coverage from silence.
+    ///
+    /// Without this route a wallet pointed here quotes **no** balance: the
+    /// spend-subtraction is required, not optional, and its absence is honestly
+    /// reported as `UNAVAILABLE` rather than papered over with a number.
+    #[test]
+    fn route_nullifier_range() {
+        let d = devnet();
+        let bytes = route(&d, "/v1/nullifiers?from=1&to=3").unwrap();
+        let page = crate::codec::NullifierPage::from_bytes(&bytes).expect("the served wire");
+        assert_eq!((page.from, page.to), (1, 3), "the echoes are the request's");
+        assert_eq!(page.blocks.len(), 3, "every held height in range");
+        for (i, blk) in page.blocks.iter().enumerate() {
+            assert_eq!(blk.height, 1 + i as u64, "ascending and contiguous");
+            let stored = d.block(blk.height).expect("held");
+            let committed: Vec<[u8; 32]> = stored
+                .body
+                .txs
+                .iter()
+                .flat_map(|t| t.public.nullifiers.iter().copied())
+                .collect();
+            assert_eq!(
+                blk.nullifiers, committed,
+                "the served list IS the block's own nullifier section, in block order"
+            );
+        }
+        // A range past the tip is an empty page, not an error.
+        let beyond = crate::codec::NullifierPage::from_bytes(
+            &route(&d, "/v1/nullifiers?from=9000&to=9001").unwrap(),
+        )
+        .unwrap();
+        assert!(beyond.blocks.is_empty());
+    }
+
     #[test]
     fn route_errors() {
         let d = devnet();
         assert_eq!(route(&d, "/v1/compact?from=5&to=1"), Err((400, "'to' < 'from'")));
+        // The nullifier route's bounds refuse exactly like the compact route's —
+        // never an empty success, which a wallet would subtract nothing against
+        // and then quote as a balance.
+        assert_eq!(route(&d, "/v1/nullifiers?from=5&to=1"), Err((400, "'to' < 'from'")));
+        assert_eq!(route(&d, "/v1/nullifiers?to=1"), Err((400, "missing/invalid 'from'")));
+        assert_eq!(route(&d, "/v1/nullifiers?from=1"), Err((400, "missing/invalid 'to'")));
+        // 🔴 And there is no per-nullifier membership form: a probe is a 404 by
+        // shape, so it cannot be answered by accident.
+        assert!(matches!(route(&d, "/v1/nullifier?nf=a1a1"), Err((404, _))));
+        assert!(matches!(route(&d, "/v1/nullifiers/a1a1"), Err((404, _))));
         assert_eq!(route(&d, "/v1/compact?to=1"), Err((400, "missing/invalid 'from'")));
         assert!(matches!(route(&d, "/v1/block/999/tx/0/full"), Err((404, _))));
         assert!(matches!(route(&d, "/v1/nope"), Err((404, _))));

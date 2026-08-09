@@ -1,8 +1,12 @@
 //! The wallet's HTTP clients for the served send seams (issue #276, the wallet
 //! half of the stamped A1+B1 decision).
 //!
-//! Three endpoints on one `qumbra-node` discovery server:
+//! Four endpoints on one `qumbra-node` discovery server:
 //!
+//! - `GET /v1/nullifiers?from=&to=` — [`HttpNullifierSource`], the public
+//!   per-block nullifier lists a balance subtracts its own spent notes against
+//!   (lab issue #314). Bulk over a range, never a per-nullifier probe — see
+//!   [`crate::spent`].
 //! - `GET /v1/tree/leaves?from=N` — [`HttpLeafSource`], the witness source (B1).
 //! - `GET /v1/anchors` — [`HttpAnchorSource`], which leaf count a witness may
 //!   legally be built at. See [`crate::sync`] for why the leaf stream alone
@@ -11,8 +15,10 @@
 //!
 //! # This module decodes nothing itself
 //!
-//! Every wire here is `qlab_node`'s, and this module calls **its** decoders —
-//! `TreeLeaves::from_bytes` and `AnchorSet::from_bytes`. #275 froze the
+//! Every wire here is somebody else's, and this module calls **their** decoders
+//! — `TreeLeaves::from_bytes` and `AnchorSet::from_bytes` from `qlab_node`,
+//! `NullifierPage::from_bytes` from `qlab_cbserver::codec` (that one lives in
+//! the compact family because the reference server serves it too). #275 froze the
 //! leaf-stream framing with golden vectors (stamp rider 1) precisely so there
 //! would be one reading of it; a wallet-side re-implementation would be the
 //! drift those vectors exist to prevent. What this module owns is the *paging*
@@ -47,8 +53,10 @@
 //! exchange at the Cloudflare edge is outside the wallet's control, and this is
 //! testnet-tunable, revisited at T2.
 
+use qlab_cbserver::codec::NullifierPage;
 use qlab_node::{AnchorSet, TreeLeaves};
 
+use crate::spent::{NullifierChunk, NullifierSource};
 use crate::sync::{AnchorSource, Anchors, LeafChunk, LeafSource};
 
 /// Read timeout for every request this module makes.
@@ -114,6 +122,43 @@ impl AnchorSource for HttpAnchorSource {
             finalized_height: set.finalized_height,
             max_age_blocks: set.max_age_blocks,
             roots: set.roots,
+        })
+    }
+}
+
+/// The per-block nullifier stream as a [`NullifierSource`] — `GET
+/// /v1/nullifiers?from=&to=`, decoded by the wire's own
+/// `qlab_cbserver::codec::NullifierPage::from_bytes` (lab issue #314).
+///
+/// The paging loop lives in [`crate::spent::fetch_spent`]; this is one page.
+/// The server bounds a page at `MAX_NULLIFIER_BLOCKS` and names every height it
+/// carries, so a client that resumes from the last height + 1 is correct
+/// without knowing that bound — which is what lets the bound move without
+/// touching the golden.
+///
+/// This is the **scan** endpoint's route, not the send endpoint's: it is served
+/// off the same projection as `/v1/compact`, and a wallet must subtract spends
+/// against the same node whose outputs it is holding.
+pub struct HttpNullifierSource {
+    base_url: String,
+}
+
+impl HttpNullifierSource {
+    pub fn new(base_url: impl Into<String>) -> HttpNullifierSource {
+        HttpNullifierSource { base_url: base_url.into() }
+    }
+}
+
+impl NullifierSource for HttpNullifierSource {
+    fn fetch_range(&self, from: u64, to: u64) -> Result<NullifierChunk, String> {
+        let path = format!("/v1/nullifiers?from={from}&to={to}");
+        let bytes = http_get(&self.base_url, &path).map_err(|e| format!("GET {path}: {e}"))?;
+        let page = NullifierPage::from_bytes(&bytes)
+            .map_err(|e| format!("GET {path} did not decode: {e:?}"))?;
+        Ok(NullifierChunk {
+            from: page.from,
+            to: page.to,
+            blocks: page.blocks.into_iter().map(|b| (b.height, b.nullifiers)).collect(),
         })
     }
 }

@@ -328,6 +328,7 @@ fn the_payload_projection_is_golden_locked_against_a_hand_built_body() {
             height: 1,
             hash: [0x99; 32],
             groups: vec![tx.discovery.clone()],
+            nullifiers: vec![],
         }],
     };
     let served = qlab_node::full_response(&view.blocks, 1, 0).expect("the projection answers");
@@ -367,6 +368,7 @@ fn the_payload_projection_is_golden_locked_against_a_hand_built_body() {
             height: 1,
             hash: [0x99; 32],
             groups: vec![tampered_tx.discovery.clone()],
+            nullifiers: vec![],
         }],
     };
 

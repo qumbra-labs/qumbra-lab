@@ -14,11 +14,26 @@
 //!
 //! ## What it is, and what it deliberately is not
 //!
-//! Five routes — the deployed binary's whole wallet-facing surface:
+//! Six routes — the deployed binary's whole wallet-facing surface:
 //!
 //! - `GET /v1/compact?from=&to=` — [`qlab_node::compact_response`]'s bytes, the
 //!   same encoder, over the same projection, that `NodeRpc` serves in-process
 //!   (issue #188 baton 2). How a recipient **finds** its money.
+//! - `GET /v1/nullifiers?from=&to=` — the per-block nullifier lists
+//!   ([`qlab_node::NullifierPage`], lab issue #314). How a wallet learns that
+//!   money it found has since been **spent**. The compact wire carries no
+//!   nullifier by design (#188 (a) as amended / #32), so before this route a
+//!   scan structurally could not know, and a wallet that had spent an hour ago
+//!   still quoted its old balance under `verdict: complete`.
+//!
+//!   **Bulk over a range, never a membership query.** A `?nullifier=<nf>` form
+//!   would tell this server which notes are the asker's, which is the exact
+//!   linkage the discovery design refuses; the wallet derives its own notes'
+//!   nullifiers from keys only it holds and matches locally. What is served is
+//!   already public — consensus published every one of these bytes inside a
+//!   block body to enforce the double-spend rule — so the bytes add nothing an
+//!   `Ivk` could not already fetch over `GetData(Block)`; a per-nullifier probe
+//!   would add the *question*, and the question is the leak.
 //! - `GET /v1/tree/leaves?from=` — the commitment tree's leaves in authoritative
 //!   append order ([`qlab_node::TreeLeaves`], issue #275 / decision brief B1).
 //!   How a wallet builds the **witness** to spend: it replays the stream into a
@@ -174,6 +189,11 @@ pub const FULL_PATH_SHAPE: &str = "/v1/block/{h}/tx/{i}/full";
 
 /// The submit route (issue #275, decision brief A1) — POST only.
 pub const TX_SUBMIT_PATH: &str = "/v1/tx";
+
+/// The per-block nullifier route (lab issue #314) — GET only, bulk over a
+/// range. There is deliberately **no** per-nullifier form of it; see
+/// [`qlab_node::NullifierPage`].
+pub const NULLIFIERS_PATH: &str = "/v1/nullifiers";
 
 /// The most bytes `POST /v1/tx` will read as a body.
 ///
@@ -553,6 +573,17 @@ impl DiscoveryServer {
                         };
                         respond(&snapshot, query)
                     }
+                    NULLIFIERS_PATH => {
+                        // Same snapshot the compact route reads — the nullifiers
+                        // and the discovery groups of one block are projected
+                        // together, so a wallet can never be served outputs from
+                        // a height whose spends it was not also offered.
+                        let snapshot = match view.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(p) => Arc::clone(&p.into_inner()),
+                        };
+                        respond_nullifiers(&snapshot, query)
+                    }
                     TREE_LEAVES_PATH => {
                         let snapshot = match leaves.lock() {
                             Ok(g) => Arc::clone(&g),
@@ -581,8 +612,9 @@ impl DiscoveryServer {
                         None => Err((
                             404,
                             format!(
-                                "not found: try {COMPACT_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, \
-                                 {ANCHORS_PATH}, {FULL_PATH_SHAPE}, or POST {TX_SUBMIT_PATH}"
+                                "not found: try {COMPACT_PATH}?from=&to=, {NULLIFIERS_PATH}?from=&to=, \
+                                 {TREE_LEAVES_PATH}?from=, {ANCHORS_PATH}, {FULL_PATH_SHAPE}, or \
+                                 POST {TX_SUBMIT_PATH}"
                             ),
                         )),
                     },
@@ -637,6 +669,27 @@ pub fn respond(view: &DiscoveryView, query: &str) -> Result<Vec<u8>, (u16, Strin
     }
     compact_response(&view.blocks, from, to)
         .map_err(|e| (500, format!("stored discovery does not decode: {e:?}")))
+}
+
+/// The socket-free `/v1/nullifiers` core: a `from`/`to` query against the same
+/// projection [`respond`] reads (lab issue #314).
+///
+/// Refusals are `/v1/compact`'s, deliberately: a missing or unparseable bound is
+/// a 400 and an inverted range is a 400. **Never an empty success** — an empty
+/// page means "this node holds no main-chain height in that range", which is a
+/// fact a wallet subtracts against, and it must not also mean "your request was
+/// malformed".
+///
+/// The page arithmetic is [`qlab_node::NullifierPage::of`], the same function
+/// the in-process route uses, so the two servers cannot disagree about where a
+/// page ends.
+pub fn respond_nullifiers(view: &DiscoveryView, query: &str) -> Result<Vec<u8>, (u16, String)> {
+    let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'".to_string()))?;
+    let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'".to_string()))?;
+    if to < from {
+        return Err((400, "'to' < 'from'".to_string()));
+    }
+    Ok(qlab_node::nullifier_page(&view.blocks, from, to).to_bytes())
 }
 
 /// The socket-free `/v1/tree/leaves` core: a `from` query against the leaves
@@ -825,7 +878,17 @@ mod tests {
     /// the serving core does not care how the bytes got there, only that they are
     /// the block's.
     fn projected(height: u64, hash: u8, groups: Vec<Vec<u8>>) -> BlockDiscovery {
-        BlockDiscovery { height, hash: [hash; 32], groups }
+        BlockDiscovery { height, hash: [hash; 32], groups, nullifiers: vec![] }
+    }
+
+    /// The same, spending `nullifiers` (lab issue #314).
+    fn projected_spending(
+        height: u64,
+        hash: u8,
+        groups: Vec<Vec<u8>>,
+        nullifiers: Vec<Hash32>,
+    ) -> BlockDiscovery {
+        BlockDiscovery { height, hash: [hash; 32], groups, nullifiers }
     }
 
     fn a_view() -> DiscoveryView {
@@ -979,12 +1042,61 @@ mod tests {
         srv.shutdown();
     }
 
+    /// 🔴 **The route lab issue #314 exists for**, over a real socket: the
+    /// per-block nullifier lists, decoded by the wallet's own decoder, off the
+    /// SAME snapshot `/v1/compact` reads — so a wallet cannot be offered a
+    /// height's outputs without also being offered that height's spends.
+    ///
+    /// The empty entry is asserted, not incidental: a block that spends nothing
+    /// is served and empty, because an omitted height is indistinguishable from
+    /// an unserved one and that distinction is the whole coverage story.
+    #[test]
+    fn serves_the_per_block_nullifier_lists_over_a_real_socket() {
+        let view = Arc::new(Mutex::new(Arc::new(DiscoveryView {
+            blocks: vec![
+                projected(0, 0, vec![]),
+                projected_spending(
+                    1,
+                    1,
+                    vec![qlab_devnet::body::TxEntry::empty_discovery()],
+                    vec![[0xA1; 32], [0xB2; 32]],
+                ),
+                projected(2, 2, vec![]),
+            ],
+        })));
+        let (srv, _submits) = serve(Arc::clone(&view), no_leaves());
+        let addr = srv.addr();
+
+        let (status, body) = get(addr, "/v1/nullifiers?from=0&to=2");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        let page = qlab_cbserver::codec::NullifierPage::from_bytes(&body)
+            .expect("the served bytes are the wallet's wire");
+        assert_eq!((page.from, page.to), (0, 2), "the echoes are the request's");
+        assert_eq!(page.blocks.len(), 3, "every held height in range, spending or not");
+        assert_eq!(page.blocks[1].nullifiers, vec![[0xA1; 32], [0xB2; 32]]);
+        assert!(page.blocks[0].nullifiers.is_empty());
+        assert!(page.blocks[2].nullifiers.is_empty(), "served and empty, never omitted");
+
+        // A refreshed projection is what the next read sees (the Arc swap), and
+        // it is the same swap the compact route rides — one snapshot, one
+        // refresh, so the two routes cannot disagree about the main chain.
+        let mut later = (**view.lock().unwrap()).clone();
+        later.blocks.push(projected_spending(3, 3, vec![], vec![[0xC3; 32]]));
+        *view.lock().unwrap() = Arc::new(later);
+        let (_, body2) = get(addr, "/v1/nullifiers?from=0&to=99");
+        let page2 = qlab_cbserver::codec::NullifierPage::from_bytes(&body2).unwrap();
+        assert_eq!(page2.blocks.len(), 4);
+        assert_eq!(page2.blocks[3].nullifiers, vec![[0xC3; 32]]);
+
+        srv.shutdown();
+    }
+
     /// Nothing else is served, and the refusals are the RPC's refusals — not a
     /// half-implemented wallet API. `/v1/tree/frontier` in particular stays a
     /// 404 (see the module docs), and the read routes stay GET-only even now
     /// that a write route exists beside them.
     #[test]
-    fn only_the_five_routes_are_served_and_methods_are_gated() {
+    fn only_the_six_routes_are_served_and_methods_are_gated() {
         let view = Arc::new(Mutex::new(Arc::new(a_view())));
         let (srv, _submits) = serve(Arc::clone(&view), no_leaves());
         let addr = srv.addr();
@@ -1001,6 +1113,12 @@ mod tests {
             "/v1/telemetry",
             "/v1/status",
             "/v1/tree/frontier?at=1",
+            // 🔴 There is no per-nullifier membership route and there must never
+            // be one — "is nf X spent" tells the server which notes are the
+            // asker's. A probe for one is a 404 by shape, so it cannot be
+            // answered by accident (lab issue #314).
+            "/v1/nullifier?nf=a1a1",
+            "/v1/nullifiers/a1a1",
             // Near-misses of the payload route's shape: a 404 by shape, never a
             // 400 (which would claim the route exists and the arguments are bad).
             "/v1/block/1/tx/0",
@@ -1017,6 +1135,13 @@ mod tests {
             "/v1/compact",
             "/v1/compact?from=0",
             "/v1/compact?from=2&to=1",
+            // Lab issue #314: the nullifier route's bounds refuse exactly like
+            // the compact route's — never an empty success, which a wallet would
+            // subtract nothing against and then quote as a balance.
+            "/v1/nullifiers",
+            "/v1/nullifiers?from=0",
+            "/v1/nullifiers?to=3",
+            "/v1/nullifiers?from=2&to=1",
             "/v1/tree/leaves",
             "/v1/tree/leaves?from=zzz",
             "/v1/block/zz/tx/0/full",
@@ -1032,6 +1157,8 @@ mod tests {
         let (status, _) = post(addr, "/v1/tree/leaves", b"");
         assert!(status.starts_with("HTTP/1.1 405"), "{status}");
         let (status, _) = post(addr, "/v1/block/1/tx/0/full", b"");
+        assert!(status.starts_with("HTTP/1.1 405"), "{status}");
+        let (status, _) = post(addr, "/v1/nullifiers", b"");
         assert!(status.starts_with("HTTP/1.1 405"), "{status}");
         // …and a read verb on the write route is a 405 too, not a 404: the
         // route exists and the answer says what it takes.

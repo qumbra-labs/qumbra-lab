@@ -6,6 +6,13 @@
 //! it **over `POST /v1/tx`** and gets the typed outcome back — and the
 //! recipient's scan detects the spend's output.
 //!
+//! Since lab issue #314 it carries the other end of that sentence too: the
+//! sender's **post-spend rescan**, where the spent note stops being spendable.
+//! That half is asserted against the nullifiers the real proof actually
+//! declared, so the balance's derivation is checked against the spend path's
+//! own output and not against a second copy of the formula. The cheap version
+//! of the same story — no STARK, debug-runnable — is `spent_subtraction.rs`.
+//!
 //! ## The chain this runs on has a FINALITY CADENCE, and that is the point
 //!
 //! An earlier version of this test finalized every block, which made the tip
@@ -60,8 +67,11 @@ use qumbra_node::discovery_server::{
     AnchorsView, DiscoveryServer, DiscoveryView, LeavesView, SubmitRequest, TxSubmitOutcome,
 };
 use qumbra_node::verifier::ConsensusVerifier;
-use qumbra_wallet::net::{submit_tx, HttpAnchorSource, HttpLeafSource, SubmitClass};
+use qumbra_wallet::net::{
+    submit_tx, HttpAnchorSource, HttpLeafSource, HttpNullifierSource, SubmitClass,
+};
 use qumbra_wallet::send::{build_send, Spendable};
+use qumbra_wallet::spent::{fetch_spent, note_nullifier, subtract_spent};
 use qumbra_wallet::sync::sync_and_select;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -389,6 +399,73 @@ fn a_first_spend_travels_the_whole_story_and_the_recipient_detects_it() {
     .expect("the sender's rescan runs");
     assert_eq!(change.notes.len(), 1, "the sender detects its change output");
     assert_eq!(change.notes[0].detected.note.value, art.change_value);
+
+    // ---- 🔴 lab issue #314: the spent note stops being spendable ------------
+    //
+    // The post-spend rescan over the WHOLE range, which is where the defect
+    // lived: the scan alone still sees the grant note and the change note and
+    // sums both, under `complete`. The subtraction is what makes the number
+    // true — and it runs against `/v1/nullifiers` on the same deployed
+    // discovery server, over the same real socket as everything else here.
+    //
+    // The nullifier being matched is not a fixture: `art.entry.public.nullifiers`
+    // is what `build_send` REALLY proved and the node REALLY admitted, so this
+    // asserts the balance's derivation against the spend path's own output
+    // rather than against a second copy of the formula.
+    refresh(&shared, &discovery_view, &leaves_view, &anchors_view);
+    let full_rescan =
+        light_client_scan(&base, &sender_dk, 0, tip.height, ScanConfig::default(), &mut rng)
+            .expect("the sender's full rescan runs");
+    assert_eq!(full_rescan.notes.len(), 2, "the grant AND the change are both detected");
+    assert_eq!(
+        full_rescan.spendable_value(),
+        u128::from(DEFAULT_GRANT_BESSEL + art.change_value),
+        "the pre-#314 figure: outputs only, spent note included, under `complete`"
+    );
+
+    let spent_set = fetch_spent(&HttpNullifierSource::new(&node_url), 0, tip.height)
+        .expect("the deployed server serves its nullifier stream");
+    spent_set
+        .covers_outputs(full_rescan.stats.compact_range_served)
+        .expect("the stream covers every height the outputs came from");
+    let sender_report = subtract_spent(&sender, 0, &full_rescan.notes, &spent_set);
+
+    let derived = note_nullifier(&sender, 0, &found.notes[0].detected.note);
+    assert!(
+        art.entry.public.nullifiers.contains(&derived),
+        "the balance derives the SAME nullifier the proved spend declared"
+    );
+    assert_eq!(sender_report.spent.len(), 1, "exactly the note that was spent");
+    assert_eq!(sender_report.spent[0].nullifier, derived);
+    assert_eq!(
+        sender_report.spendable_value(),
+        u128::from(art.change_value),
+        "the sender's spendable DROPS to the change alone"
+    );
+    assert_eq!(
+        u128::from(DEFAULT_GRANT_BESSEL) - sender_report.spendable_value(),
+        u128::from(AMOUNT + art.fee),
+        "…i.e. by exactly (spent note − change)"
+    );
+
+    // The negative, on the same set: the recipient never spent, so nothing of
+    // its is subtracted.
+    let recipient_full = light_client_scan(
+        &base,
+        &recipient_dk,
+        0,
+        tip.height,
+        ScanConfig::default(),
+        &mut rng,
+    )
+    .expect("the recipient's full rescan runs");
+    let recipient_report = subtract_spent(&recipient_wallet, 0, &recipient_full.notes, &spent_set);
+    assert_eq!(
+        recipient_report.spendable_value(),
+        u128::from(AMOUNT),
+        "the recipient's spendable RISES by exactly the amount sent"
+    );
+    assert!(recipient_report.spent.is_empty(), "and it has spent nothing");
 
     // ---- and a resync picks up the spend block without re-downloading -----
     refresh(&shared, &discovery_view, &leaves_view, &anchors_view);

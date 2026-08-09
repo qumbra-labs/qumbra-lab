@@ -12,8 +12,9 @@ use std::process::{Command, Stdio};
 
 use qlab_cbserver::client::{scan_local, Completeness, ScanConfig};
 use qlab_cbserver::data::{Devnet, GenParams};
+use qumbra_wallet::spent::SpentReport;
 use qumbra_wallet::store::{reveal_mnemonic, WalletDir};
-use qumbra_wallet::view::{render, DivScan, UNAVAILABLE};
+use qumbra_wallet::view::{render, DivScan, SpentCoverage, UNAVAILABLE};
 
 const BIN: &str = env!("CARGO_BIN_EXE_qumbra-wallet");
 
@@ -221,10 +222,17 @@ fn scan_against_the_reference_fixture_renders_a_complete_report() {
     let outcome = scan_local(&devnet, &devnet.our.dk, 0, tip, ScanConfig::default(), &mut rng);
     assert!(matches!(outcome.completeness(), Completeness::Complete | Completeness::Shadowed { .. }));
 
-    let scan = DivScan::from_outcome(0, "qmbs1fixture".into(), &outcome);
-    let spendable = scan.spendable_bessel;
+    // The reference fixture is a generated bundle, not a chain: it serves no
+    // `/v1/nullifiers` and its notes belong to a raw ML-KEM keypair rather than
+    // to a `Wallet` with a spend key, so there is nothing here that CAN derive a
+    // nullifier. The subtraction is therefore stated as the no-op it is — this
+    // is the seam a real deployment fills from the node (lab issue #314), and
+    // `spent_subtraction.rs` is where that seam is actually exercised.
+    let report_0 = SpentReport { spendable: outcome.notes.clone(), spent: vec![] };
+    let scan = DivScan::from_subtracted(0, "qmbs1fixture".into(), &outcome, &report_0);
+    let spendable = scan.spendable_bessel.expect("a subtracted figure exists");
     assert!(spendable > 0, "the fixture pays its own key");
-    let report = render(&[scan], (0, tip), "in-process");
+    let report = render(&[scan], (0, tip), "in-process", &SpentCoverage::Covered { range: Some((1, tip)) });
     assert!(report.contains(&format!("TOTAL spendable: {spendable} bessel")), "{report}");
     assert!(!report.contains(UNAVAILABLE), "{report}");
 }
