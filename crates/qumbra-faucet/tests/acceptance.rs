@@ -61,14 +61,16 @@ use qlab_faucet::{
 };
 use qlab_node::{
     coinbase, genesis_block, ChainStore, CommitmentStore, MemNode, MemNodeRpc, NodeRpc, NodeState,
-    SubmitOutcome,
+    RejectReason, SubmitOutcome,
 };
 use qlab_wallet::address::{Address, Diversifier};
 use qlab_wallet::Wallet;
 use qumbra_faucet::config::FaucetServiceConfig;
 use qumbra_faucet::harvest::spendable_at_tip;
 use qumbra_faucet::http::FaucetServer;
-use qumbra_faucet::service::{FaucetNode, FaucetService, RequestState};
+use qumbra_faucet::service::{
+    FaucetNode, FaucetService, LocalSubmit, RequestState, SubmitRefusal,
+};
 use qumbra_node::verifier::ConsensusVerifier;
 use rand::SeedableRng;
 
@@ -202,15 +204,31 @@ impl FaucetNode for TestNode {
         self.rpc.node()
     }
 
-    fn submit_local(&mut self, plan: &GrantPlan) -> bool {
+    fn submit_local(&mut self, plan: &GrantPlan) -> LocalSubmit {
         // The full submission, discovery included — see the module docs for why this
         // is the RPC seam and not the seam the deployed binary has.
+        // Named refusals (lab #310) so a double-spend surfaces as `nullifier-spent`
+        // rather than a panic — the post-restart path exercises this.
         match self.rpc.submit_tx(plan.entry.clone(), plan.discovery.clone(), &ConsensusVerifier) {
             SubmitOutcome::Accepted(_) => {
                 self.pending.push(plan.entry.clone());
-                true
+                LocalSubmit::Accepted
             }
-            other => panic!("the production verifier must accept a real grant, got {other:?}"),
+            SubmitOutcome::Duplicate => {
+                LocalSubmit::Refused(SubmitRefusal::Node { reason: "duplicate".into() })
+            }
+            SubmitOutcome::Rejected(RejectReason::NullifierSpent) => {
+                LocalSubmit::Refused(SubmitRefusal::Node { reason: "nullifier-spent".into() })
+            }
+            SubmitOutcome::Rejected(RejectReason::AnchorNotValid) => {
+                LocalSubmit::Refused(SubmitRefusal::Node { reason: "anchor-not-valid".into() })
+            }
+            SubmitOutcome::Rejected(RejectReason::ProofInvalid) => {
+                LocalSubmit::Refused(SubmitRefusal::Node { reason: "proof-invalid".into() })
+            }
+            other => LocalSubmit::Refused(SubmitRefusal::Node {
+                reason: format!("rejected:{other:?}"),
+            }),
         }
     }
 
@@ -807,4 +825,114 @@ fn a_browser_request_becomes_a_real_grant_the_requester_detects() {
 
     handle.shutdown();
     server.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// Lab #310 — post-restart inventory must not re-include spent notes
+// ---------------------------------------------------------------------------
+
+/// 🔴 **Lab #310: after a restart the faucet must not re-fund spent coinbase.**
+///
+/// The live evidence (svc1, rev `4b60f8d`, 2026-08-09): restart →
+/// `FAUCET funded 271 matured coinbase note(s)` → every `POST /request` → 202 →
+/// `FAUCET gave-up`. Mechanism 1 predicted the rebuilt inventory re-includes
+/// notes whose nullifiers are already on-chain; this test proves the fix:
+///
+/// 1. fund two matured coinbase notes and serve one real grant (both notes spent);
+/// 2. mine the grant so the nullifiers are permanent;
+/// 3. build a **fresh** `FaucetService` (empty `harvested`, empty inventory) —
+///    the restart path;
+/// 4. tick: harvest must report `skipped_spent = 2`, `funded = 0`;
+/// 5. availability must be [`Availability::Empty`] (or otherwise non-admitting),
+///    never Ready — §9.1's gate learns the unservable state instead of
+///    accepting a request it will burn.
+///
+/// One real 2×2 STARK (~2.3 s). The unit proof of the nullifier subtraction
+/// without a STARK lives in `harvest::tests::harvest_skips_notes_whose_nullifiers_are_already_on_chain`.
+#[test]
+fn post_restart_harvest_skips_spent_notes_and_availability_is_honest() {
+    use qumbra_faucet::state::Availability;
+
+    let wallet = faucet_wallet();
+    let mine_rkm = wallet.rkm(Diversifier::default());
+    let mut node = TestNode::new();
+    let mut svc = service(&wallet, TicketPolicy::Required);
+
+    // (1) fund two matured notes and serve one grant.
+    funded(&mut node, &mut svc, &wallet);
+    {
+        let g = svc.gate();
+        let g = g.lock().unwrap();
+        assert_eq!(g.faucet().inventory().len(), 2);
+    }
+    let gate = svc.gate();
+    let (_req_wallet, req_addr) = requester(0x3100_0001);
+    let ticket = gate.lock().unwrap().issue_ticket(1);
+    // Admit without HTTP — same accept path the listener uses.
+    {
+        let mut g = gate.lock().unwrap();
+        g.accept("203.0.113.10", req_addr, Some(ticket), 0).expect("admitted");
+    }
+    let mut rng = rand::rngs::StdRng::from_seed([0x31; 32]);
+    let report = svc.tick(&mut node, &mut rng);
+    assert_eq!(report.granted, Some(1), "first grant lands; report: {report:?}");
+    assert_eq!(node.rpc.pending_len(), 1);
+
+    // (2) mine so the nullifiers are permanent.
+    let _height = node.mine_pending(mine_rkm);
+    assert!(
+        node.chain_state().nullifier_count() >= 2,
+        "the grant's two nullifiers are on-chain"
+    );
+
+    // (3) restart path: brand-new service, empty harvested set, empty inventory.
+    let mut restarted = service(&wallet, TicketPolicy::Required);
+    assert_eq!(
+        restarted.gate().lock().unwrap().faucet().inventory().len(),
+        0,
+        "a restarted process starts with no inventory"
+    );
+
+    // (4) one tick re-walks the chain the way harvest always does.
+    let report = restarted.tick(&mut node, &mut rng);
+    assert_eq!(
+        report.harvest.skipped_spent, 2,
+        "both spent coinbases must be skipped, not funded: {report:?}"
+    );
+    assert_eq!(
+        report.harvest.funded, 0,
+        "no live coinbase remains to fund (the change note is not coinbase): {report:?}"
+    );
+    assert_eq!(
+        restarted.gate().lock().unwrap().faucet().inventory().len(),
+        0,
+        "inventory must stay empty when every matured coinbase is spent"
+    );
+
+    // (5) §9.1: the gate must not say ready. Mining the grant paid a fresh
+    // coinbase to the faucet, so the honest state is Maturing (144 blocks out,
+    // beyond the advertised wait) — or Empty if that coinbase were burned.
+    // Either way it must refuse before accept, so no ticket is burned.
+    restarted.refresh_status(&node);
+    let snap = restarted.status().lock().unwrap().clone();
+    assert!(
+        !snap.availability.admits_requests(),
+        "§9.1: an unservable post-restart faucet must refuse, not queue; got {:?}",
+        snap.availability
+    );
+    assert!(
+        matches!(
+            snap.availability,
+            Availability::Empty { .. } | Availability::Maturing { .. }
+        ),
+        "expected Empty or Maturing after spent-only restart, got {:?}",
+        snap.availability
+    );
+    // And specifically not Ready — that was the live bug (page said ready,
+    // every grant gave-up).
+    assert!(
+        !matches!(snap.availability, Availability::Ready { .. }),
+        "Ready with only spent coinbases is the #310 defect: {:?}",
+        snap.availability
+    );
 }
