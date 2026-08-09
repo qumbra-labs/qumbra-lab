@@ -129,9 +129,31 @@ impl Availability {
 /// on live state.
 #[derive(Clone, Debug)]
 pub struct ServiceStatus {
-    /// Position 3's first integer.
-    pub tip_height: u64,
-    /// Position 3's second integer. `None` = nothing finalized.
+    /// **This node's two chain views, from the tree's one definition of the pair**
+    /// (`qlab_node::StateLag`) rather than two fields the page could difference
+    /// itself: `state_tip` is the height whose body this faucet has *applied*, and
+    /// `fork_choice_tip` is the height whose header the chain it follows has
+    /// reached.
+    ///
+    /// Both, and not just the first, because of lab issue #296. The page used to
+    /// carry `state_tip` alone under the label `chain tip`, and on 2026-08-08
+    /// `faucet.qumbra.org` published `chain tip 1930` while `explorer.qumbra.org`
+    /// published 4116 for the same chain — two Qumbra surfaces disagreeing by two
+    /// thousand blocks with nothing on either page explaining why. The explorer
+    /// renders `Telemetry::tip_height`, which `qlab_node::telemetry` documents as
+    /// fork choice; this faucet reads its own applied state, because that is the
+    /// state a grant proof binds to. Neither was wrong. Only one of them was shown.
+    ///
+    /// `state_tip` stays the number every serving decision is made on — see
+    /// [`classify`], which asks the [`qlab_faucet::ChainView`] directly and never
+    /// reads this field.
+    pub chain: qlab_node::StateLag,
+    /// The finalized height of the **applied** view. `None` = nothing finalized.
+    ///
+    /// Left exactly as it was, deliberately: on a faucet whose applied state has
+    /// not yet reached a finalized checkpoint, `nothing finalized yet` is true and
+    /// the 503 it produces is OPERATOR §9.1's design working (issue #296's own
+    /// 'Not a defect' section).
     pub finalized_height: Option<u64>,
     /// Peers the in-process node is connected to. Not chain state — service state:
     /// a faucet with zero peers is a faucet on its own fork, and that is the one

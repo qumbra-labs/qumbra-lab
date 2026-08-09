@@ -54,10 +54,31 @@ use std::thread::JoinHandle;
 
 use qlab_faucet::policy::{subnet_key, SubnetKey};
 use qlab_faucet::{AcceptError, Refusal, Ticket};
-use qlab_wallet::address::Address;
+use qlab_wallet::address::{Address, ADDR_HRP};
 
 use crate::service::{FaucetGate, RequestState};
 use crate::state::ServiceStatus;
+
+/// The address shape the form advertises, **derived from the decoder's own HRP**
+/// rather than restated (lab issue #296).
+///
+/// It read `qmb1…` from PR #128 until 2026-08-09 — a prefix
+/// [`Address::decode`] rejects outright, sixteen lines above a test that uses
+/// `"qmb1nonsense"` as its example of *invalid* input. The failure mode is worse
+/// than a blank field: a visitor holding a real `qaddr1…` from `qumbra-wallet
+/// address` reads the placeholder and concludes their own address is wrong, and
+/// there is nothing else on the page to contradict it.
+///
+/// `ADDR_HRP` is imported, never copied, so the page cannot outlive an HRP change.
+/// The `1` is bech32m's separator (BIP-350), fixed by the encoding rather than
+/// chosen by Qumbra, and `qlab_wallet::bech32m` keeps it as a private literal
+/// inside `encode` — so it is written here and then **locked against the encoder**
+/// by `the_placeholder_is_the_shape_the_decoder_accepts`, which asserts a real
+/// encoded address starts with exactly this string. Deriving the HRP alone would
+/// not have caught a drift in the separator or the bech32m shape; the test does.
+fn address_placeholder() -> String {
+    format!("{ADDR_HRP}1…")
+}
 
 /// How many characters of an address ever appear anywhere — page, log or receipt.
 /// The same 16 `qlab_faucet::PendingRequest`'s hand-written `Debug` shows, so the
@@ -602,25 +623,45 @@ fn render_index(s: &ServiceStatus, outcome: Option<&RequestOutcome>) -> String {
          <form method=\"post\" action=\"/request\">\n\
          <p><label for=\"address\">Your Qumbra address</label><br>\n\
          <textarea id=\"address\" name=\"address\" rows=\"4\" required \
-         placeholder=\"qmb1…\"></textarea></p>\n\
+         placeholder=\"{}\"></textarea></p>\n\
          <p><label for=\"ticket\">Grant ticket{}</label><br>\n\
          <input id=\"ticket\" name=\"ticket\" size=\"60\" placeholder=\"qft1…\"{}></p>\n\
          <p><button type=\"submit\">Request {} QMB</button></p>\n\
          </form>\n",
         qmb(s.grant_value),
+        esc(&address_placeholder()),
         if s.tickets_required { "" } else { " (not required on this faucet)" },
         if s.tickets_required { " required" } else { "" },
         qmb(s.grant_value),
     ));
 
-    // The service's own state. Position 3: the two chain integers, and nothing else
-    // about the chain — no per-signer committee participation, ever, and no second
-    // public surface.
+    // The service's own state. Position 3, as amended by lab issue #296: **three**
+    // chain integers — applied height, header tip, and the gap between them — and
+    // nothing else about the chain. No per-signer committee participation, ever,
+    // and no second public surface.
+    //
+    // The stamp this replaces said "the two chain integers, and nothing else", and
+    // the third is added with its reason rather than around it. #296 measured what
+    // the stamp cost: showing only the applied height under the label `chain tip`
+    // put `1930` on this page while `explorer.qumbra.org` showed `4116` for the
+    // same chain, and a visitor could not tell which surface was lying. The
+    // stamp's *stated* rationale was per-signer participation and a second public
+    // surface, and the header tip is neither — the explorer already publishes it,
+    // which is exactly why the disagreement was visible in the first place. What
+    // stays closed is what the sentence was written to close.
     body.push_str("<h2>This faucet right now</h2>\n<table>\n");
     let mut row = |k: &str, v: String| {
         body.push_str(&format!("<tr><td>{}</td><td><code>{}</code></td></tr>\n", esc(k), esc(&v)));
     };
-    row("chain tip", s.tip_height.to_string());
+    // Named for what it is. A grant proof binds to applied state, so this — not
+    // the header tip — is the number that decides whether the faucet can serve;
+    // #296 is explicit that showing the header tip *instead* would be worse.
+    row("applied height", s.chain.state_tip.to_string());
+    row("chain tip (headers)", s.chain.fork_choice_tip.to_string());
+    // `StateLag::blocks()` — the tree's one definition of the gap, the same call
+    // the node's duty gate and its `slag=` telemetry field make. Never a
+    // subtraction written out here.
+    row("behind by", format!("{} block(s)", s.chain.blocks()));
     row(
         "finalized",
         match s.finalized_height {
@@ -635,6 +676,20 @@ fn render_index(s: &ServiceStatus, outcome: Option<&RequestOutcome>) -> String {
     row("notes maturing", s.notes_maturing.to_string());
     row("grants confirmed (this process)", s.confirmed.to_string());
     body.push_str("</table>\n");
+
+    // Lab issue #296: the sentence a visitor comparing this page with the explorer
+    // needs, in the same register as the availability banner above it ("the faucet
+    // may be funded and still unable to pay"). It names the other surface by host,
+    // because that is the surface the comparison is actually made against.
+    body.push_str(
+        "<p><strong>Why this page's height may be lower than the explorer's.</strong> \
+         <code>applied height</code> is how far this faucet's own node has <em>applied</em> \
+         blocks; <code>chain tip (headers)</code> is how far the chain it follows has got. \
+         <code>explorer.qumbra.org</code> publishes the second. This faucet serves grants \
+         from the first, because a grant proof is bound to state this node has applied — so \
+         while <code>behind by</code> is not zero, the two sites will disagree, and neither \
+         is wrong.</p>\n",
+    );
 
     body.push_str(
         "<h2>Two things worth knowing</h2>\n\
@@ -683,7 +738,7 @@ mod tests {
 
     fn a_status(availability: crate::state::Availability) -> Arc<Mutex<ServiceStatus>> {
         Arc::new(Mutex::new(ServiceStatus {
-            tip_height: 200,
+            chain: qlab_node::StateLag::new(200, 200),
             finalized_height: Some(200),
             peers: 3,
             availability,
@@ -877,5 +932,115 @@ mod tests {
         assert!(html.contains("form method=\"post\" action=\"/request\""));
         assert!(html.contains("10.00000000"), "the grant value is rendered in QMB: {html}");
         assert!(html.contains("Receipt") || html.contains("receipt"));
+    }
+
+    /// 🔴 **The placeholder lock** (lab issue #296). The shape the form advertises
+    /// must be the shape [`Address::decode`] accepts — asserted against the real
+    /// encoder, not against a second copy of the HRP, because a copy is exactly
+    /// what drifted: the page said `qmb1…` for the eleven days between PR #128 and
+    /// this fix while `decode` rejected that HRP outright.
+    ///
+    /// Locking against `Address::encode` rather than against `ADDR_HRP` alone is
+    /// the point of the test. Deriving the HRP protects the page from an HRP
+    /// change; only comparing with a real encoded address also protects it from a
+    /// change to the separator or to the bech32m shape, neither of which
+    /// `address_placeholder` can see.
+    #[test]
+    fn the_placeholder_is_the_shape_the_decoder_accepts() {
+        let placeholder = address_placeholder();
+        let prefix = placeholder.trim_end_matches('…');
+        assert_ne!(prefix, placeholder, "the placeholder ends in an ellipsis");
+        assert_eq!(prefix, format!("{ADDR_HRP}1"), "hrp + bech32m separator");
+
+        // Not one address's accident: every diversifier this wallet can produce
+        // encodes under the prefix the page advertises, and decodes back.
+        for seed in [0x1357u64, 0x2468, 0xdead_beef] {
+            let w = Wallet::from_seed_lanes([seed; 4]);
+            for d in [Diversifier::default(), Diversifier::from_bytes([7; 16])] {
+                let encoded = w.address(d).encode();
+                assert!(
+                    encoded.starts_with(prefix),
+                    "the encoder produces {}…, the page advertises {prefix}…",
+                    &encoded[..prefix.len().min(encoded.len())]
+                );
+                assert!(Address::decode(&encoded).is_some(), "and the decoder takes it back");
+            }
+        }
+
+        // The other direction, which is the defect this test exists for: the same
+        // address under the prefix the page used to advertise is refused. So a
+        // future edit that reintroduces `qmb1…` cannot pass by editing one side.
+        let real = an_address().encode();
+        let impostor = format!("qmb1{}", &real[prefix.len()..]);
+        assert!(Address::decode(&impostor).is_none(), "a wrong HRP is rejected outright");
+
+        // …and the file's own fixture for INVALID input still is invalid input.
+        // #296's sharpest observation was that both lived here at once.
+        for bad in ["", "qmb1nonsense", "not-an-address", "0x1234"] {
+            assert!(!bad.starts_with(prefix), "{bad:?} must not read as the advertised shape");
+            assert!(Address::decode(bad).is_none());
+        }
+
+        // The derived string is what actually reaches the page.
+        let s = lock(&a_status(crate::state::Availability::Ready { grants: 2 })).clone();
+        let html = render_index(&s, None);
+        assert!(html.contains(&format!("placeholder=\"{placeholder}\"")), "{html}");
+        assert!(!html.contains("qmb1"), "the rejected shape appears nowhere on the page");
+        // The ticket placeholder is verified-correct (`qlab_faucet::policy`'s
+        // TICKET_PREFIX) and deliberately untouched by #296; asserted so this pass
+        // cannot be read as having changed it.
+        assert_eq!(qlab_faucet::policy::TICKET_PREFIX, "qft1");
+        assert!(html.contains("placeholder=\"qft1…\""), "{html}");
+    }
+
+    /// The chain rows say what they are (lab issue #296). The live case is the
+    /// fixture: `tip=4116 stip=1984 slag=2132`, the node's own telemetry on
+    /// 2026-08-08, when `faucet.qumbra.org` rendered the applied height alone under
+    /// the label `chain tip` and `explorer.qumbra.org` rendered the header tip. The
+    /// third number — the difference — appeared on neither page.
+    ///
+    /// (#296's report quotes the page as showing `1930` against the same `4116`.
+    /// That pair is two *samples*, taken seconds apart, and differencing them gives
+    /// 2186 rather than the node's own 2132 — which is precisely why this page now
+    /// calls `StateLag::blocks()` on one sampled pair instead of publishing two
+    /// numbers and inviting the reader to subtract. Writing the fixture from the
+    /// report's two numbers is the mistake this test caught while being written.)
+    #[test]
+    fn the_chain_rows_name_the_applied_height_and_the_gap() {
+        let status = a_status(crate::state::Availability::Ready { grants: 2 });
+        lock(&status).chain = qlab_node::StateLag::new(1984, 4116);
+        let html = render_index(&lock(&status).clone(), None);
+
+        assert!(html.contains("<td>applied height</td><td><code>1984</code>"), "{html}");
+        assert!(html.contains("<td>chain tip (headers)</td><td><code>4116</code>"), "{html}");
+        assert!(html.contains("<td>behind by</td><td><code>2132 block(s)</code>"), "{html}");
+        // 2132 is `StateLag::blocks()`, not a subtraction this page performs.
+        assert_eq!(qlab_node::StateLag::new(1984, 4116).blocks(), 2132);
+
+        // The old label is gone, and gone as a *cell* — "chain tip (headers)"
+        // contains the substring, so a naive `!contains("chain tip")` would fail
+        // for the wrong reason and a naive one on the row would pass for it.
+        assert!(!html.contains("<td>chain tip</td>"), "the bare 'chain tip' label is gone: {html}");
+
+        // The explainer, and the thing it has to name to be useful: the other
+        // surface a visitor is comparing against.
+        assert!(html.contains("explorer.qumbra.org"), "{html}");
+        assert!(html.contains("applied</em> blocks"), "{html}");
+
+        // The by-design line #296 records under 'Not a defect' is untouched.
+        assert!(html.contains("nothing finalized yet") || html.contains("<td>finalized</td>"));
+    }
+
+    /// A caught-up faucet says so rather than omitting the row — an absent gap and
+    /// a zero gap must not look the same, because "this page has no gap row" is
+    /// indistinguishable from "this build predates the fix".
+    #[test]
+    fn a_caught_up_faucet_still_shows_the_gap_as_zero() {
+        let status = a_status(crate::state::Availability::Ready { grants: 2 });
+        lock(&status).chain = qlab_node::StateLag::new(4116, 4116);
+        let html = render_index(&lock(&status).clone(), None);
+        assert!(html.contains("<td>behind by</td><td><code>0 block(s)</code>"), "{html}");
+        assert!(html.contains("<td>applied height</td><td><code>4116</code>"), "{html}");
+        assert!(html.contains("<td>chain tip (headers)</td><td><code>4116</code>"), "{html}");
     }
 }

@@ -217,6 +217,15 @@ impl FaucetNode for TestNode {
     fn peers(&self) -> u64 {
         0
     }
+
+    /// This fixture drives `MemNode` directly through `NodeRpc` — there is no P2P
+    /// adapter here and so no fork-choice header view distinct from applied state.
+    /// It answers with its applied tip in both positions, which is the truth for
+    /// this node rather than a convenient zero: it is not behind, it has one view.
+    fn chain_views(&self) -> qlab_node::StateLag {
+        let tip = self.rpc.node().tip_height();
+        qlab_node::StateLag::new(tip, tip)
+    }
 }
 
 fn faucet_wallet() -> Wallet {
