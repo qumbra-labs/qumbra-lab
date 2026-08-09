@@ -274,6 +274,23 @@ fn accrual_below_boundary() -> u64 {
 /// The committee share of every height in `start..=end`, each height under the
 /// regime that governs it (#299 + #303). Split at the boundary so the pinned
 /// prefix can replace the historical walk wholesale.
+///
+/// # 🔴 Disclosed residual: only the from-genesis prefix is pinnable
+///
+/// The pin is a single total for `0..=RULE_BOUNDARY_HEIGHT`, so it applies when the
+/// span starts at genesis — which is the case the census actually flagged (*"a
+/// restart that recomputes accrual from genesis must retain the historical schedule
+/// before the boundary"*). A span that **starts inside** the grandfathered region
+/// (the incremental form, as finality advances) has to walk the historical schedule
+/// over its own partial prefix, and there is no bounded way to pin every partial
+/// prefix.
+///
+/// Consequence, stated rather than buried: on a **non-glibc** host, summing
+/// incremental spans across the boundary can differ from a from-genesis recompute by
+/// the few bessel between that host's `f64` and the pin. Both figures are stable per
+/// host and neither is consensus — `committee_accrual_finalized` is explicitly
+/// devnet-grade, testnet-tunable and NOT frozen. It disappears entirely above the
+/// boundary, where every height is exact integer arithmetic.
 fn accrual_span(start: u64, end: u64) -> u64 {
     if end < start {
         return 0;
