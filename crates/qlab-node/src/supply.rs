@@ -53,9 +53,23 @@
 use crate::emission::{s_atomic_exact, s_atomic_pre_boundary, RULE_BOUNDARY_HEIGHT};
 use qlab_devnet::header::Hash32;
 
-/// One activation pin: `(epoch, expected_coinbase_bessel)` for an epoch that ends
-/// at or below [`RULE_BOUNDARY_HEIGHT`].
-pub type EpochPin = (u64, u64);
+/// One activation pin: the expected issuance of an epoch that lies **wholly** at or
+/// below [`RULE_BOUNDARY_HEIGHT`].
+///
+/// 🔴 **The height range is part of the key, not documentation.** A pin keyed on the
+/// epoch number alone would be applied to a *partial* row of that epoch — the shape a
+/// node has while it is still catching up through it — and hand it the whole epoch's
+/// expected value against a fraction of the measured one, i.e. a large false
+/// DIVERGENT on exactly the surface that must not cry wolf. Matching both endpoints
+/// makes a partial row simply unpinned, which falls back to the closed form over the
+/// range it actually covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpochPin {
+    pub epoch: u64,
+    pub start_height: u64,
+    pub end_height: u64,
+    pub expected_coinbase: u64,
+}
 
 /// **The pinned expected issuance of every wholly-pre-boundary epoch** (#303 ruling
 /// clause 3).
@@ -104,7 +118,69 @@ pub struct SupplyEpoch {
     pub fees: u64,
 }
 
+/// One grandfathered supply scar this chain is **known** to carry, with its
+/// citation (#299 ruling item 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KnownScar {
+    pub epoch: u64,
+    pub start_height: u64,
+    pub end_height: u64,
+    /// The exact divergence this scar produces. Exact, not a tolerance: a *different*
+    /// number in the same epoch is a different fact and must still read DIVERGENT.
+    pub divergence_bessel: i128,
+    pub citation: &'static str,
+}
+
+/// **The scars this chain carries, as recorded history** (#299 ruling item 2).
+///
+/// # Why an alarm surface needs a list of known-red rows
+///
+/// The #299 sequencing ruling grandfathered height 1377's under-emission rather than
+/// re-minting over it, and accepted the consequence explicitly: *"epoch 1 reads
+/// DIVERGENT −4114 on this chain forever."* It also named the cost — **"a tool built
+/// to catch supply violations must not train its readers to ignore red"** — and
+/// required the annotation. Without it, every operator view on the live net shows a
+/// standing 🔴 that everyone learns to scroll past, and the first *real* violation
+/// arrives looking exactly like the noise.
+///
+/// The match is deliberately **tight**: epoch, both endpoints, and the exact
+/// divergence. A partial epoch-1 row (state lag) does not match, and a defect that
+/// happens to land in epoch 1 with any other total still reads DIVERGENT.
+///
+/// 🔴 **Platform note.** Until the T-ops pins land ([`PINNED_EPOCH_EXPECTED`]) the
+/// expected side of a pre-boundary epoch is the historical `f64` closed form, so a
+/// non-glibc attester can compute this row's endpoints ±1 apart and would show
+/// DIVERGENT −4113/−4115 rather than the annotated scar. That is honest — it is a
+/// different number — and it disappears the moment the epoch is pinned, which is one
+/// more reason the pins are the activation step and not paperwork.
+pub const KNOWN_SUPPLY_SCARS: &[KnownScar] = &[KnownScar {
+    epoch: 1,
+    start_height: 1_152,
+    end_height: 2_303,
+    divergence_bessel: -4_114,
+    citation: "lab #299 §5 — block 1377 committed coinbase(1378); grandfathered as \
+               recorded history by the sequencing ruling, never re-minted",
+}];
+
 impl SupplyEpoch {
+    /// The known, grandfathered scar this row *is*, if it is one.
+    pub fn known_scar(&self) -> Option<&'static KnownScar> {
+        KNOWN_SUPPLY_SCARS.iter().find(|scar| {
+            scar.epoch == self.epoch
+                && scar.start_height == self.start_height
+                && scar.end_height == self.end_height
+                && scar.divergence_bessel == self.divergence_bessel()
+        })
+    }
+
+    /// **The alarm predicate**: this row diverges *and* it is not a scar the chain is
+    /// known to carry. This — not [`Self::agrees`] — is what an operator surface
+    /// should escalate on, so that a standing grandfathered red does not train its
+    /// reader to ignore the next one.
+    pub fn is_unexplained_divergence(&self) -> bool {
+        !self.agrees() && self.known_scar().is_none()
+    }
+
     /// Exact signed divergence in bessel. Zero is the only passing value.
     pub fn divergence_bessel(&self) -> i128 {
         self.measured_coinbase as i128 - self.expected_coinbase as i128
@@ -312,9 +388,16 @@ impl SupplyLedger {
     }
 }
 
-/// The pinned expected issuance for `epoch`, if activation supplied one.
-fn pinned_expected(pins: &[EpochPin], epoch: u64) -> Option<u64> {
-    pins.iter().find(|(e, _)| *e == epoch).map(|(_, v)| *v)
+/// The pinned expected issuance for this exact row, if activation supplied one. The
+/// whole key must match — see [`EpochPin`] for why the endpoints are part of it.
+fn pinned_expected(pins: &[EpochPin], row: &SupplyEpoch) -> Option<u64> {
+    pins.iter()
+        .find(|pin| {
+            pin.epoch == row.epoch
+                && pin.start_height == row.start_height
+                && pin.end_height == row.end_height
+        })
+        .map(|pin| pin.expected_coinbase)
 }
 
 /// The expected issuance of one epoch row — the three-case rule the module docs
@@ -331,7 +414,7 @@ fn expected_for_row(row: &SupplyEpoch, pins: &[EpochPin], straddle_prefix: u64) 
     }
     if row.end_height <= RULE_BOUNDARY_HEIGHT {
         // (1) Wholly grandfathered: the attested value, pinned or historical.
-        return pinned_expected(pins, row.epoch).unwrap_or_else(|| {
+        return pinned_expected(pins, row).unwrap_or_else(|| {
             s_atomic_pre_boundary(row.end_height + 1) - s_atomic_pre_boundary(first_mint)
         });
     }
@@ -540,7 +623,12 @@ mod tests {
     /// what the row reports.
     #[test]
     fn a_pinned_pre_boundary_epoch_uses_the_pin_not_the_closed_form() {
-        const PINS: &[EpochPin] = &[(3, 777_777_777)];
+        const PINS: &[EpochPin] = &[EpochPin {
+            epoch: 3,
+            start_height: 3 * EPOCH,
+            end_height: 4 * EPOCH - 1,
+            expected_coinbase: 777_777_777,
+        }];
         let mut ledger = SupplyLedger::with_pins(EPOCH, PINS).unwrap();
         for block in honest_chain(4 * EPOCH - 1) {
             ledger.push(block).unwrap();
@@ -556,6 +644,35 @@ mod tests {
         );
         // And the shipped table is empty at merge, so no live row moves.
         assert!(PINNED_EPOCH_EXPECTED.is_empty(), "unpinned at merge (T-ops step)");
+    }
+
+    /// **A PARTIAL row of a pinned epoch must not take the pin.** This is the shape a
+    /// node has while it is still catching up through the epoch, and handing it the
+    /// whole epoch's expected value against a fraction of the measured one would print
+    /// a large false DIVERGENT — on the surface whose entire job is to make a real
+    /// violation legible.
+    #[test]
+    fn a_partial_row_of_a_pinned_epoch_falls_back_to_its_own_range() {
+        const PINS: &[EpochPin] = &[EpochPin {
+            epoch: 3,
+            start_height: 3 * EPOCH,
+            end_height: 4 * EPOCH - 1,
+            expected_coinbase: 777_777_777,
+        }];
+        // Stop one block short of epoch 3's end, so its row is partial.
+        let tip = 4 * EPOCH - 2;
+        let mut ledger = SupplyLedger::with_pins(EPOCH, PINS).unwrap();
+        for block in honest_chain(tip) {
+            ledger.push(block).unwrap();
+        }
+        let partial = ledger.rows().last().unwrap();
+        assert_eq!((partial.epoch, partial.end_height), (3, tip));
+        assert_ne!(partial.expected_coinbase, 777_777_777, "the pin must not apply");
+        assert_eq!(
+            partial.expected_coinbase,
+            s_atomic_pre_boundary(tip + 1) - s_atomic_pre_boundary(partial.start_height),
+        );
+        assert_eq!(partial.divergence_bessel(), 0, "and an honest partial row agrees");
     }
 
     // --- #299 §4: the reorg gap ----------------------------------------------
@@ -657,6 +774,49 @@ mod tests {
             assert!(ledger.is_in_sync_with(&canonical));
         }
         assert_eq!(ledger.head_hash(), Some(h(1, 10)));
+    }
+
+    // --- #299 ruling item 2: the known-scar annotation ------------------------
+
+    /// The epoch-1 row this chain actually carries: measured 4,114 bessel under the
+    /// closed form, over the full epoch.
+    fn epoch_one_scar_row(divergence: i128) -> SupplyEpoch {
+        let expected = 1_000_000_000u64;
+        SupplyEpoch {
+            epoch: 1,
+            start_height: 1_152,
+            end_height: 2_303,
+            measured_coinbase: (expected as i128 + divergence) as u64,
+            expected_coinbase: expected,
+            fees: 0,
+        }
+    }
+
+    /// **The annotation, and its teeth.** The recorded scar is recognised and is not
+    /// an unexplained divergence; *any other* number in the same epoch still is.
+    #[test]
+    fn the_epoch_one_scar_is_annotated_and_nothing_else_is() {
+        let scar = epoch_one_scar_row(-4_114);
+        assert!(!scar.agrees(), "the scar stays VISIBLE — it is not made to pass");
+        let known = scar.known_scar().expect("the recorded scar is known");
+        assert!(known.citation.contains("#299"));
+        assert!(!scar.is_unexplained_divergence(), "and it is not a new alarm");
+
+        // A different total in the same epoch is a different fact.
+        for other in [-4_113i128, -4_115, -1, 1, 4_114] {
+            let row = epoch_one_scar_row(other);
+            assert!(row.known_scar().is_none(), "divergence {other} is not the scar");
+            assert!(row.is_unexplained_divergence(), "divergence {other} must alarm");
+        }
+        // A PARTIAL epoch-1 row (state lag) is not the scar either, even at −4114.
+        let partial = SupplyEpoch { end_height: 2_000, ..epoch_one_scar_row(-4_114) };
+        assert!(partial.known_scar().is_none());
+        assert!(partial.is_unexplained_divergence());
+        // And an honest row is neither.
+        let honest = epoch_one_scar_row(0);
+        assert!(honest.agrees());
+        assert!(honest.known_scar().is_none());
+        assert!(!honest.is_unexplained_divergence());
     }
 
     #[test]

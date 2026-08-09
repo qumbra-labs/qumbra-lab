@@ -113,9 +113,12 @@ pub fn render(pins: &Pins) -> String {
     out.push_str("// --- paste into crates/qlab-node/src/supply.rs ---\n");
     out.push_str("pub const PINNED_EPOCH_EXPECTED: &[EpochPin] = &[\n");
     for row in &pins.epochs {
+        // The endpoints are part of the pin's KEY, not a comment: a pin keyed on the
+        // epoch alone would be applied to a partial row of that epoch and print a
+        // large false DIVERGENT. See `EpochPin`.
         out.push_str(&format!(
-            "    ({}, {}), // heights {}..={}\n",
-            row.epoch, row.expected_coinbase, row.start_height, row.end_height
+            "    EpochPin {{ epoch: {}, start_height: {}, end_height: {}, expected_coinbase: {} }},\n",
+            row.epoch, row.start_height, row.end_height, row.expected_coinbase
         ));
     }
     out.push_str("];\n");
@@ -193,6 +196,10 @@ mod tests {
         assert!(text.contains("crates/qlab-node/src/emission.rs"));
         assert!(text.contains("crates/qlab-node/src/supply.rs"));
         assert!(text.contains(std::env::consts::OS));
-        assert!(text.contains("(14, "), "the last pinned epoch must appear");
+        // The endpoints are emitted as fields, because they are part of the pin's key.
+        assert!(
+            text.contains("EpochPin { epoch: 14, start_height: 16128, end_height: 17279,"),
+            "the last pinned epoch must appear with its range:\n{text}"
+        );
     }
 }

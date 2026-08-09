@@ -242,6 +242,12 @@ mod tests {
         assert_eq!(s_atomic(1), 50 * BESSEL_PER_QMB);
         assert_eq!(coinbase(0), 50 * BESSEL_PER_QMB);
         assert_eq!(coinbase(0), 5_000_000_000);
+        // The exact schedule carries its own 10⁸ scaling (it is part of the
+        // definition it evaluates). Two copies of a FROZEN constant is how drift
+        // starts, so they are pinned to each other rather than to a literal twice.
+        assert_eq!(BESSEL_PER_QMB, qlab_devnet::emission_exact::BESSEL_PER_QMB);
+        // Likewise the tail: `TAIL_QMB` in coins here, `TAIL_BESSEL` in bessel there.
+        assert_eq!(TAIL_BESSEL, (TAIL_QMB * BESSEL_PER_QMB as f64).round() as u64);
     }
 
     /// **The boundary seam** (#299 + #303): the last `f64` block is the boundary
