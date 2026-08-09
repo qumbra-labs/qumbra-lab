@@ -36,9 +36,18 @@
 //! [`view`] renders that distinction with the same stable token `qumbra-opview`
 //! and `qumbra-explorer` pin for refused supply figures, so one grep covers all
 //! three surfaces.
+//!
+//! Since lab issue #314 that rule has a second half, and it is the one that was
+//! missing: **a balance that could not subtract SPENDS is UNAVAILABLE too.** A
+//! scan reads outputs, and the discovery wire carries no nullifier by design, so
+//! a wallet that had spent kept quoting the spent note under `complete`.
+//! [`spent`] closes it — the node serves per-block nullifiers in bulk, this
+//! wallet derives its own notes' nullifiers with the spend path's own
+//! derivation, and matches locally.
 
 pub mod net;
 pub mod send;
+pub mod spent;
 pub mod store;
 pub mod sync;
 pub mod view;

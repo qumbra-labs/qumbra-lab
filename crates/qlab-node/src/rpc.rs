@@ -233,6 +233,26 @@ pub struct BlockDiscovery {
     /// Per transaction, in block order: the committed §2 group **contents**,
     /// verbatim. Coinbase contributes nothing (D5).
     pub groups: Vec<Vec<u8>>,
+    /// Every nullifier this block spends, in block order (transaction order,
+    /// then each transaction's declared order) — `StoredTx::nullifiers`
+    /// **cloned and concatenated**, never re-derived (lab issue #314).
+    ///
+    /// ## Why it rides in this type rather than a projection of its own
+    ///
+    /// This type is "one main-chain block, as the serving surfaces need it", and
+    /// its whole guarantee is that there is no encoder between the block and the
+    /// served bytes. A second projection would need a second main-chain walk and
+    /// a second incremental/reorg rule (`DiscoveryView::refresh`), and two
+    /// restatements of "what the main chain is" is exactly the shape this file
+    /// keeps refusing elsewhere. The cost is 32 B per nullifier — 64 B per 2×2
+    /// transaction against that transaction's ~1.2 KB of discovery, i.e. ~5 % of
+    /// a projection that is itself ~1 % of the block store.
+    ///
+    /// Coinbase contributes nothing here either: it spends nothing, so it has no
+    /// nullifier, and an empty list for a coinbase-only block is the meaningful
+    /// answer *"this block spent nothing"* — see [`NullifierPage`] for why that
+    /// must never be confused with "this block was not served".
+    pub nullifiers: Vec<Hash32>,
 }
 
 impl BlockDiscovery {
@@ -244,12 +264,22 @@ impl BlockDiscovery {
             height: block.header.height,
             hash,
             groups: block.txs.iter().map(|t| t.discovery.clone()).collect(),
+            nullifiers: block.txs.iter().flat_map(|t| t.nullifiers.iter().copied()).collect(),
         }
     }
 
-    /// Bytes of committed discovery this block carries (the snapshot's cost).
+    /// Bytes of committed **discovery** this block carries. Deliberately not the
+    /// whole projection's cost since lab issue #314 — see
+    /// [`Self::nullifier_len_bytes`] for the other half, kept separate so a
+    /// caller reporting "how much committed discovery am I holding" still gets
+    /// that number and not a sum of two different things.
     pub fn len_bytes(&self) -> usize {
         self.groups.iter().map(|g| g.len()).sum()
+    }
+
+    /// Bytes of nullifier this block carries (lab issue #314) — `32 × n`.
+    pub fn nullifier_len_bytes(&self) -> usize {
+        self.nullifiers.len() * 32
     }
 
     /// The serving-form groups: `tx_index` = position in the block, contents =
@@ -889,6 +919,17 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
                 let at = query_u64(query, "at").ok_or((400, "missing/invalid 'at'"))?;
                 Ok(self.frontier_at(at).to_bytes())
             }
+            ["v1", "nullifiers"] => {
+                // Lab issue #314: the public per-block nullifier lists a wallet
+                // subtracts its own spent notes against. Bulk over a range —
+                // never a per-nullifier membership query, see [`NullifierPage`].
+                let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'"))?;
+                let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'"))?;
+                if to < from {
+                    return Err((400, "'to' < 'from'"));
+                }
+                Ok(NullifierPage::of(&self.main_chain_discovery(), from, to).to_bytes())
+            }
             ["v1", "tree", "leaves"] => {
                 // Issue #275 (decision brief B1): the witness source. Served here
                 // as well as by `qumbra-node`'s discovery server — stamp rider (2):
@@ -1232,6 +1273,162 @@ impl TreeLeaves {
         }
         r.finish()?;
         Ok(TreeLeaves { from, total, leaves })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The nullifier stream (`/v1/nullifiers` — lab issue #314)
+// ---------------------------------------------------------------------------
+
+/// The most main-chain blocks one `/v1/nullifiers` response will ever carry.
+///
+/// The same contract shape, and the same number, as [`MAX_COMPACT_BLOCKS`] — on
+/// purpose, because the client that pages this stream is the client that pages
+/// `/v1/compact` and it pages both over the same requested range. A response
+/// carries every main-chain height in `[from, to]` the node holds, up to this
+/// many blocks; a client whose page ends below `to` pages from the last height
+/// + 1. `[devnet-placeholder]`, testnet-tunable, NOT frozen: the framing below
+/// carries `n_blocks` and every height explicitly, so this bound can move
+/// without touching a golden.
+pub const MAX_NULLIFIER_BLOCKS: usize = 1024;
+
+/// One main-chain block's spent nullifiers, as the block committed them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockNullifiers {
+    pub height: u64,
+    /// `StoredTx::nullifiers` concatenated in block order — see
+    /// [`BlockDiscovery::nullifiers`]. **Empty is a real answer**: a block that
+    /// spends nothing (every coinbase-only block) carries an empty list, and it
+    /// is served as such.
+    pub nullifiers: Vec<Hash32>,
+}
+
+/// One page of the chain's per-block nullifier lists (`GET
+/// /v1/nullifiers?from=&to=` — lab issue #314).
+///
+/// ## What this is for, and why it is safe to serve
+///
+/// A wallet's `spendable` is computed from outputs, and the serving wire
+/// deliberately carries no nullifier inside a discovery group (#188 (a) as
+/// amended / #32's `Ivk` boundary) — so before this route existed **nothing in
+/// a scan could learn that a note it opened had since been spent**, and every
+/// wallet that had ever spent over-quoted its balance under `verdict:
+/// complete`. This is the missing half: the node serves the nullifiers each
+/// block published, the wallet derives its own notes' nullifiers from keys only
+/// it holds, and the match happens **locally**.
+///
+/// 🔴 **Bulk per range, never a membership query.** There is no
+/// `?nullifier=<nf>` form of this route and there must never be one: asking a
+/// server "is nf X spent" tells that server which notes are the asker's, which
+/// is exactly the linkage the whole discovery design refuses. The bytes served
+/// here are already public — every one of them is inside a block body any peer
+/// can request over `GetData(Block)`, and consensus published them to enforce
+/// the double-spend rule — so serving them adds nothing an `Ivk` could not
+/// already obtain; what a per-nullifier probe would add is the **question**, and
+/// the question is the leak.
+///
+/// ## The paging contract, stated because lab issue #309 is what happens when
+/// it is not
+///
+/// The bound is [`MAX_NULLIFIER_BLOCKS`] and it is explicit on the wire: the
+/// page names the `[from, to]` it answers and lists every height it carries, so
+/// a client can always tell how far the answer actually reaches. **A truncated
+/// page must never read as a complete one** — a wallet that believed it had the
+/// whole range would silently fail to subtract a spend in the missing tail and
+/// report the exact wrong number this route exists to remove, so the client half
+/// (`qumbra_wallet::spent`) ships in the same change and refuses a range it
+/// could not cover.
+///
+/// ## Wire
+///
+/// `version ‖ from(8 LE) ‖ to(8 LE) ‖ n_blocks(varint) ‖
+///  [height(8 LE) ‖ n(varint) ‖ nf(32) × n] × n_blocks`
+///
+/// `from`/`to` are echoes of the request so a paging client cannot misattribute
+/// a page (the leaf stream's discipline, and for the same reason). Heights are
+/// ascending and every height the node holds in range is present, **including
+/// the ones that spend nothing** — an omitted height would be
+/// indistinguishable from an unserved one, and "this block spent nothing" is
+/// precisely the fact a balance subtracts against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NullifierPage {
+    /// Echo of the request's `from`.
+    pub from: u64,
+    /// Echo of the request's `to`.
+    pub to: u64,
+    /// Ascending by height; at most [`MAX_NULLIFIER_BLOCKS`] entries.
+    pub blocks: Vec<BlockNullifiers>,
+}
+
+impl NullifierPage {
+    /// The page for `[from, to]` over an **ascending** main-chain projection —
+    /// the one projection both servers use (`NodeRpc::route` here, and
+    /// `qumbra-node`'s discovery server over its snapshot), so there is no
+    /// second implementation of the bound to drift.
+    ///
+    /// Iterates the projection and filters, rather than iterating the requested
+    /// range and looking up, for [`compact_response`]'s reason: the cost is
+    /// bounded by what the node holds instead of by what the client asked for.
+    pub fn of(blocks: &[BlockDiscovery], from: u64, to: u64) -> NullifierPage {
+        let mut out = Vec::new();
+        for b in blocks {
+            if b.height < from || b.height > to {
+                continue;
+            }
+            if out.len() == MAX_NULLIFIER_BLOCKS {
+                break;
+            }
+            out.push(BlockNullifiers { height: b.height, nullifiers: b.nullifiers.clone() });
+        }
+        NullifierPage { from, to, blocks: out }
+    }
+
+    /// The highest height this page carries, if any — where a paging client
+    /// resumes from (`+ 1`).
+    pub fn last_height(&self) -> Option<u64> {
+        self.blocks.last().map(|b| b.height)
+    }
+
+    /// `version ‖ from(8 LE) ‖ to(8 LE) ‖ n_blocks(varint) ‖ [height(8 LE) ‖
+    /// n(varint) ‖ nf(32) × n]`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(RPC_VERSION);
+        out.extend_from_slice(&self.from.to_le_bytes());
+        out.extend_from_slice(&self.to.to_le_bytes());
+        write_varint(&mut out, self.blocks.len() as u64);
+        for b in &self.blocks {
+            out.extend_from_slice(&b.height.to_le_bytes());
+            write_varint(&mut out, b.nullifiers.len() as u64);
+            for nf in &b.nullifiers {
+                out.extend_from_slice(nf);
+            }
+        }
+        out
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<NullifierPage, CodecError> {
+        let mut r = Reader::new(b);
+        r.version()?;
+        let from = r.u64()?;
+        let to = r.u64()?;
+        let n_blocks = r.varint()?;
+        // Both counts are attacker-adjacent input on a served wire: cap every
+        // allocation by what the remaining bytes could actually hold, so a tiny
+        // payload claiming 2^60 entries is a `Truncated` refusal and not a giant
+        // allocation (the `TreeLeaves::from_bytes` discipline).
+        let mut blocks = Vec::with_capacity((n_blocks as usize).min(b.len() / 9));
+        for _ in 0..n_blocks {
+            let height = r.u64()?;
+            let n = r.varint()?;
+            let mut nullifiers = Vec::with_capacity((n as usize).min(b.len() / 32));
+            for _ in 0..n {
+                nullifiers.push(r.hash32()?);
+            }
+            blocks.push(BlockNullifiers { height, nullifiers });
+        }
+        r.finish()?;
+        Ok(NullifierPage { from, to, blocks })
     }
 }
 
@@ -1710,6 +1907,211 @@ mod tests {
         assert_eq!(ebytes.len(), 18, "golden empty-page length");
         assert_eq!(ebytes[17], 0x00, "golden empty-page n");
         assert_eq!(TreeLeaves::from_bytes(&ebytes).unwrap(), empty);
+    }
+
+    // ---- the nullifier stream (`/v1/nullifiers`, lab issue #314) -------------
+
+    /// GOLDEN BYTES — the nullifier-stream framing. Same class as the leaf
+    /// stream's: a *served* wire a wallet's balance depends on, so it freezes
+    /// deliberately with byte-exact vectors rather than by accident.
+    ///
+    /// The empty-block entry is part of the golden on purpose: a height that
+    /// spends nothing must be *present and empty*, because an omitted height is
+    /// indistinguishable from an unserved one and a client that cannot tell
+    /// those apart cannot honestly say whether it covered the range.
+    #[test]
+    fn golden_bytes_lock_the_nullifier_stream_framing() {
+        let page = NullifierPage {
+            from: 4,
+            to: 6,
+            blocks: vec![
+                BlockNullifiers { height: 4, nullifiers: vec![[0xA1; 32], [0xB2; 32]] },
+                BlockNullifiers { height: 5, nullifiers: vec![] },
+                BlockNullifiers { height: 6, nullifiers: vec![[0xC3; 32]] },
+            ],
+        };
+        let bytes = page.to_bytes();
+
+        // version(1) + from(8) + to(8) + n_blocks(1) = 18, then
+        //   height(8) + n(1) + 2 × 32 = 73
+        //   height(8) + n(1)          =  9
+        //   height(8) + n(1) + 1 × 32 = 41
+        assert_eq!(bytes.len(), 18 + 73 + 9 + 41, "golden total length");
+        assert_eq!(bytes[0], 0x05, "golden version — RPC_VERSION, unbumped by this route");
+        assert_eq!(&bytes[1..9], &4u64.to_le_bytes(), "golden from (LE)");
+        assert_eq!(&bytes[9..17], &6u64.to_le_bytes(), "golden to (LE)");
+        assert_eq!(bytes[17], 0x03, "golden n_blocks (varint)");
+        assert_eq!(&bytes[18..26], &4u64.to_le_bytes(), "golden block 0 height");
+        assert_eq!(bytes[26], 0x02, "golden block 0 n");
+        assert_eq!(&bytes[27..59], &[0xA1; 32], "golden block 0 nf 0");
+        assert_eq!(&bytes[59..91], &[0xB2; 32], "golden block 0 nf 1");
+        assert_eq!(&bytes[91..99], &5u64.to_le_bytes(), "golden block 1 height");
+        assert_eq!(bytes[99], 0x00, "golden block 1 n — a block that spends nothing IS served");
+        assert_eq!(&bytes[100..108], &6u64.to_le_bytes(), "golden block 2 height");
+        assert_eq!(bytes[108], 0x01, "golden block 2 n");
+        assert_eq!(&bytes[109..141], &[0xC3; 32], "golden block 2 nf 0");
+
+        let digest = keccak256(&bytes);
+        assert_eq!(
+            hex32(&digest),
+            "18185ef5eeea6c0ba7e9d30d24fe5d22e2b8a8db758423874615d381d1f136df",
+            "GOLDEN digest — update ONLY with an intentional, documented framing change"
+        );
+
+        assert_eq!(NullifierPage::from_bytes(&bytes).unwrap(), page, "and it round-trips");
+
+        // The empty page — "I hold nothing in that range" — is framing too.
+        let empty = NullifierPage { from: 9, to: 9, blocks: vec![] };
+        let ebytes = empty.to_bytes();
+        assert_eq!(ebytes.len(), 18, "golden empty-page length");
+        assert_eq!(ebytes[17], 0x00, "golden empty-page n_blocks");
+        assert_eq!(NullifierPage::from_bytes(&ebytes).unwrap(), empty);
+    }
+
+    /// The nullifier wire rejects exactly like the node's other own wires, and a
+    /// claimed count the bytes cannot hold is a refusal rather than an
+    /// allocation — at BOTH levels of the framing (blocks and nullifiers).
+    #[test]
+    fn nullifier_stream_rejects_bad_version_trailing_truncation_and_count_lies() {
+        let good = NullifierPage {
+            from: 0,
+            to: 1,
+            blocks: vec![BlockNullifiers { height: 1, nullifiers: vec![[0x11; 32]] }],
+        }
+        .to_bytes();
+        assert_eq!(NullifierPage::from_bytes(&good).unwrap().blocks.len(), 1);
+
+        let mut bad_v = good.clone();
+        bad_v[0] = 0x04;
+        assert!(matches!(NullifierPage::from_bytes(&bad_v), Err(CodecError::BadVersion { got: 4 })));
+
+        let mut extra = good.clone();
+        extra.push(0);
+        assert!(matches!(NullifierPage::from_bytes(&extra), Err(CodecError::TrailingBytes { .. })));
+
+        assert!(matches!(
+            NullifierPage::from_bytes(&good[..good.len() - 1]),
+            Err(CodecError::Truncated { .. })
+        ));
+
+        // A header claiming 2^60 blocks: `Truncated`, never a giant allocation.
+        let mut lie_blocks = vec![RPC_VERSION];
+        lie_blocks.extend_from_slice(&0u64.to_le_bytes());
+        lie_blocks.extend_from_slice(&0u64.to_le_bytes());
+        write_varint(&mut lie_blocks, 1u64 << 60);
+        assert!(matches!(
+            NullifierPage::from_bytes(&lie_blocks),
+            Err(CodecError::Truncated { .. })
+        ));
+
+        // …and one block claiming 2^60 nullifiers, which is the inner count and a
+        // separate `with_capacity` to get wrong.
+        let mut lie_nfs = vec![RPC_VERSION];
+        lie_nfs.extend_from_slice(&0u64.to_le_bytes());
+        lie_nfs.extend_from_slice(&0u64.to_le_bytes());
+        write_varint(&mut lie_nfs, 1);
+        lie_nfs.extend_from_slice(&0u64.to_le_bytes());
+        write_varint(&mut lie_nfs, 1u64 << 60);
+        assert!(matches!(NullifierPage::from_bytes(&lie_nfs), Err(CodecError::Truncated { .. })));
+    }
+
+    /// The page arithmetic: bounded at [`MAX_NULLIFIER_BLOCKS`], the client
+    /// resumes from the last height + 1, and a range the projection does not
+    /// reach is an **empty page**, never an error.
+    ///
+    /// This is the #312 paging contract on a second route, and it is the reason
+    /// the client half ships in the same change: a truncated page that read as a
+    /// complete one would leave a wallet quietly failing to subtract a spend in
+    /// the missing tail.
+    #[test]
+    fn nullifier_pages_are_bounded_and_the_client_resumes_from_the_last_height() {
+        let blocks: Vec<BlockDiscovery> = (0..MAX_NULLIFIER_BLOCKS as u64 + 5)
+            .map(|h| {
+                let mut nf = [0u8; 32];
+                nf[..8].copy_from_slice(&h.to_le_bytes());
+                BlockDiscovery {
+                    height: h,
+                    hash: [h as u8; 32],
+                    groups: vec![],
+                    nullifiers: vec![nf],
+                }
+            })
+            .collect();
+
+        let p0 = NullifierPage::of(&blocks, 0, u64::MAX);
+        assert_eq!(p0.blocks.len(), MAX_NULLIFIER_BLOCKS, "a full page is the bound, not the chain");
+        assert_eq!(p0.last_height(), Some(MAX_NULLIFIER_BLOCKS as u64 - 1));
+        assert!(p0.last_height().unwrap() < p0.to, "…and it visibly ends below the request");
+
+        let p1 = NullifierPage::of(&blocks, p0.last_height().unwrap() + 1, u64::MAX);
+        assert_eq!(p1.blocks.len(), 5, "the rest arrives on the next page");
+        assert_eq!(p1.blocks[0].height, MAX_NULLIFIER_BLOCKS as u64);
+
+        let beyond = NullifierPage::of(&blocks, 99_999, 100_000);
+        assert!(beyond.blocks.is_empty(), "a range the node does not hold is empty, not an error");
+        assert_eq!((beyond.from, beyond.to), (99_999, 100_000), "the echoes are the request's");
+    }
+
+    /// 🔴 **Projection discipline (lab issue #314 scope item 1): the served
+    /// nullifiers are the stored block's own nullifier section, cloned.**
+    ///
+    /// Asserted against the stored block rather than against a value this test
+    /// computed a second way — the claim is *these are the same bytes*, and only
+    /// the block can say so. A coinbase-only block is present and empty, which
+    /// is the answer a subtracting client needs to distinguish "spent nothing"
+    /// from "not served".
+    #[test]
+    fn route_serves_the_stored_blocks_nullifier_section_verbatim() {
+        let (mut rpc, anchor) = rpc_with_finalized_genesis();
+        let fee = posted_fee(ArityBucket::TwoByTwo);
+        let a = tx_with(anchor, &[1, 2], &[10, 11], fee);
+        let b = tx_with(anchor, &[3, 4], &[12, 13], fee);
+        apply_block_with(rpc.node_mut(), vec![a, b]);
+        apply_block_with(rpc.node_mut(), vec![]); // a block that spends nothing
+
+        let served = rpc.route("/v1/nullifiers?from=0&to=2").unwrap();
+        let page = NullifierPage::from_bytes(&served).expect("the served bytes are the wire");
+        assert_eq!((page.from, page.to), (0, 2));
+        assert_eq!(page.blocks.len(), 3, "genesis, the tx block, the empty block — all present");
+        assert_eq!(page.blocks[0].height, 0);
+        assert!(page.blocks[0].nullifiers.is_empty(), "genesis spends nothing");
+
+        let stored = {
+            let chain = rpc.node().chain();
+            let mut hash = chain.tip_hash();
+            // height 1 is the tx block: walk back one from the tip.
+            hash = chain.block(&hash).expect("tip stored").header.prev;
+            chain.block(&hash).expect("the tx block is stored").clone()
+        };
+        let committed: Vec<Hash32> =
+            stored.txs.iter().flat_map(|t| t.nullifiers.iter().copied()).collect();
+        assert_eq!(committed.len(), 4, "two 2-nullifier transactions");
+        assert_eq!(
+            page.blocks[1].nullifiers, committed,
+            "the served list IS the stored block's nullifier section, in block order"
+        );
+
+        assert_eq!(page.blocks[2].height, 2);
+        assert!(
+            page.blocks[2].nullifiers.is_empty(),
+            "a coinbase-only block is SERVED and empty — never omitted"
+        );
+    }
+
+    /// The route's refusals are `/v1/compact`'s refusals — a bound that is
+    /// missing or unparseable is a 400, an inverted range is a 400. An empty
+    /// success in either case would be a wallet quoting a balance it could not
+    /// have subtracted against.
+    #[test]
+    fn the_nullifier_route_refuses_bad_bounds_rather_than_answering_empty() {
+        let (rpc, _) = rpc_with_finalized_genesis();
+        assert_eq!(rpc.route("/v1/nullifiers"), Err((400, "missing/invalid 'from'")));
+        assert_eq!(rpc.route("/v1/nullifiers?from=0"), Err((400, "missing/invalid 'to'")));
+        assert_eq!(rpc.route("/v1/nullifiers?from=zz&to=1"), Err((400, "missing/invalid 'from'")));
+        assert_eq!(rpc.route("/v1/nullifiers?from=5&to=1"), Err((400, "'to' < 'from'")));
+        // And there is no per-nullifier membership form of this route: an
+        // unknown path stays a 404, so a probe cannot be answered by accident.
+        assert!(matches!(rpc.route("/v1/nullifier?nf=00"), Err((404, _))));
     }
 
     /// The leaf wire rejects exactly like the node's other own wires: unknown
