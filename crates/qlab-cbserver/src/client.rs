@@ -1,7 +1,10 @@
 //! The light-client scan flow + the normative decoy over-fetch mitigation.
 //!
 //! Flow (note-discovery §2):
-//! 1. range-fetch `/v1/compact` → decode compact groups;
+//! 1. range-fetch `/v1/compact` → decode compact groups — **paged** (lab issue
+//!    #309): a serving node bounds one response at
+//!    `qlab_node::rpc::MAX_COMPACT_BLOCKS`, so the client re-fetches from the
+//!    last served height + 1 until the asked range is in hand;
 //! 2. decap once per `(tx, recipient)`, tag-filter the entries (cheap, no full
 //!    payloads yet) to decide which `(height, tx)` to full-fetch;
 //! 3. for each matched `(height, tx)`: `/full` fetch → reconstruct the
@@ -296,7 +299,9 @@ pub enum Completeness {
 /// Observable outcome of a scan (drives the report + the fetch-count test).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScanStats {
-    /// Total bytes of the `/v1/compact` range response.
+    /// Total bytes of the `/v1/compact` range response, summed across every
+    /// page the scan fetched (lab issue #309: a bounded server answers a wide
+    /// range in pages, and the scan pages until the range is in hand).
     pub compact_bytes: usize,
     /// Outputs whose **committed** tag matched this key — detection, decided from
     /// chain data alone and before any fetch. `notes_found` can only ever be a
@@ -610,9 +615,50 @@ fn scan_over<F>(
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
-    let compact = fetch(&format!("/v1/compact?from={from}&to={to}"))?;
-    let mut stats = ScanStats { compact_bytes: compact.len(), ..Default::default() };
-    let blocks = decode_compact_response(&compact).map_err(|e| format!("{e:?}"))?;
+    // ---- The compact range, PAGED (lab issue #309). A serving node bounds one
+    // response (`qlab_node::rpc::MAX_COMPACT_BLOCKS`, 1,024 blocks ≈ 21 h of
+    // chain), and its contract says a truncated response ends below `to` and the
+    // client pages from the last height + 1. This loop is that client half; it
+    // used to be a single fetch, so a scan of a range wider than one page
+    // silently saw only the first page and reported the rest of the chain —
+    // every note in it included — as `Complete`/nothing. That is exactly how the
+    // first live grant (block 5417) was invisible to a wallet scanning from 0.
+    //
+    // The cap itself cannot be imported here (`qlab-node` depends on this
+    // crate), so the loop is cap-agnostic: page while the last served height is
+    // below `to` and pages keep making progress. A server that is simply behind
+    // `to` ends the loop with one empty page — the honest "I hold nothing
+    // further", same shape as the leaf stream's.
+    let mut blocks = Vec::new();
+    let mut compact_bytes = 0usize;
+    let mut cursor = from;
+    loop {
+        let compact = fetch(&format!("/v1/compact?from={cursor}&to={to}"))?;
+        compact_bytes += compact.len();
+        let page = decode_compact_response(&compact).map_err(|e| format!("{e:?}"))?;
+        let Some(bounds) = page.first().zip(page.last()).map(|(f, l)| (f.height, l.height))
+        else {
+            break; // an empty page: the server holds nothing (more) in the range
+        };
+        let (first, last) = bounds;
+        if first < cursor {
+            // The same misattribution discipline as the leaf stream's `from`
+            // echo: a page below the requested offset would re-scan (and
+            // double-count) heights already in hand, so it is refused before a
+            // block of it is appended — and it is also the progress guard that
+            // keeps a broken server from looping this client forever.
+            return Err(format!(
+                "compact page answers below the requested range: asked from={cursor}, \
+                 got height {first} — refusing to append a page nobody asked for"
+            ));
+        }
+        blocks.extend(page);
+        if last >= to {
+            break; // the whole requested range is in hand
+        }
+        cursor = last + 1;
+    }
+    let mut stats = ScanStats { compact_bytes, ..Default::default() };
 
     // The (height, n_txs) space, for randomized decoy targeting.
     let tx_space: Vec<(u64, u64)> = blocks
@@ -1579,6 +1625,142 @@ mod tests {
         assert!(out.stats.decoy_fetches >= out.stats.matched_fetches, "decoys still issued");
         assert_eq!(out.stats.detected_outputs, d.expected_matches);
         assert_eq!(out.unopened.len(), d.expected_matches);
+    }
+
+    // ---- lab issue #309: the compact range is served in pages -----------------
+
+    /// A fetch over `devnet` whose `/v1/compact` answers are bounded the way a
+    /// deployed node's are (`qlab_node::rpc::MAX_COMPACT_BLOCKS`, shrunk here to
+    /// `page_blocks`): every main-chain height in the asked range, ascending, up
+    /// to that many blocks. `/full` passes through untouched, so the ONLY
+    /// variable is the paging. `asked` records each compact URL, so a test can
+    /// assert the client actually walked the range.
+    fn paged_fetch<'a>(
+        devnet: &'a Devnet,
+        page_blocks: usize,
+        asked: &'a std::cell::RefCell<Vec<String>>,
+    ) -> impl FnMut(&str) -> Result<Vec<u8>, String> + 'a {
+        move |path: &str| {
+            let bytes =
+                crate::server::route(devnet, path).map_err(|(c, m)| format!("{c} {m}"))?;
+            if path.starts_with("/v1/compact") {
+                asked.borrow_mut().push(path.to_string());
+                let blocks = decode_compact_response(&bytes).expect("route serves the wire");
+                let page: Vec<_> = blocks.into_iter().take(page_blocks).collect();
+                return Ok(crate::codec::encode_compact_response(&page));
+            }
+            Ok(bytes)
+        }
+    }
+
+    /// 🔴 **Lab issue #309.** The first live grant (block 5417) was invisible to
+    /// its recipient: a deployed node bounds one `/v1/compact` response at
+    /// `MAX_COMPACT_BLOCKS` (1,024 blocks), and this client fetched ONCE and
+    /// treated the first page as the whole range — so a wallet scanning
+    /// `0..=5425` trial-decapsulated heights 0..=1023 only, found nothing, and
+    /// reported `Complete`/`spendable: 0` about a range it never read. Here the
+    /// chain is five blocks, the page is two, and the note is in the LAST
+    /// block: the single-fetch flow sees blocks [1,2] only and returns the
+    /// exact live symptom; the paging flow finds the note.
+    #[test]
+    fn a_note_beyond_the_first_compact_page_is_found_not_reported_complete_zero() {
+        let wallet = Wallet::from_seed_lanes([0x309, 1, 1, 1]);
+        let d = Diversifier::default();
+        let kp = wallet.diversified_keypair(&d);
+        let grant =
+            Note { value: 1_000_000_000, rkm: wallet.rkm(d), rho: [0x309; 4], rseed: [0x0A; 4] };
+
+        // Blocks 1–4 pay a stranger; block 5 pays us.
+        let stranger = generate_keypair(&mut StdRng::seed_from_u64(0x5417));
+        let noise = |v: u64| Note { value: v, rkm: [v; 4], rho: [v; 4], rseed: [v; 4] };
+        let devnet = chain_paying(
+            generate_keypair(&mut StdRng::seed_from_u64(0xF00D)),
+            &[
+                vec![vec![(&stranger.ek, vec![noise(1)])]],
+                vec![vec![(&stranger.ek, vec![noise(2)])]],
+                vec![vec![(&stranger.ek, vec![noise(3)])]],
+                vec![vec![(&stranger.ek, vec![noise(4)])]],
+                vec![vec![(&kp.ek, vec![grant.clone()])]],
+            ],
+        );
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut fetch = paged_fetch(&devnet, 2, &asked);
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::Off };
+        let out = scan_over(&mut fetch, &kp.dk, 1, 5, cfg, &mut StdRng::seed_from_u64(0x309))
+            .expect("scan runs");
+
+        // The client walked the whole range, one page at a time, resuming from
+        // the last served height + 1 exactly as the serving contract says…
+        assert_eq!(
+            *asked.borrow(),
+            vec![
+                "/v1/compact?from=1&to=5".to_string(),
+                "/v1/compact?from=3&to=5".to_string(),
+                "/v1/compact?from=5&to=5".to_string(),
+            ],
+            "pages resume from the last served height + 1"
+        );
+        // …and the note in the last block is real money, not `Complete`/0.
+        assert_eq!(out.stats.detected_outputs, 1, "the grant is detected");
+        assert_eq!(out.notes.len(), 1);
+        assert_eq!(out.notes[0].detected.note, grant);
+        assert_eq!(out.notes[0].height, 5, "at its real chain coordinate");
+        assert_eq!(out.completeness(), Completeness::Complete);
+        assert_partitions(&out);
+    }
+
+    /// A server that is simply BEHIND the asked `to` ends the walk with one
+    /// empty page — the honest "I hold nothing further", the same shape the
+    /// leaf stream answers past its end — and the scan completes over what
+    /// exists rather than erroring or looping.
+    #[test]
+    fn a_server_behind_the_asked_range_ends_the_walk_cleanly() {
+        let d = Devnet::generate(GenParams::default());
+        let tip = d.tip_height();
+        let asked = std::cell::RefCell::new(Vec::new());
+        let mut fetch = paged_fetch(&d, usize::MAX, &asked);
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::Off };
+        let out =
+            scan_over(&mut fetch, &d.our.dk, 1, tip + 100, cfg, &mut StdRng::seed_from_u64(0x3092))
+                .expect("a chain shorter than the asked range is not an error");
+        assert_eq!(out.notes.len(), d.expected_matches, "everything that exists is found");
+        assert_eq!(
+            asked.borrow().len(),
+            2,
+            "one full page, then the empty page that ends the walk"
+        );
+    }
+
+    /// A page that answers BELOW the requested offset would re-scan heights
+    /// already in hand (and double-count anything in them), so it is refused by
+    /// name — the same misattribution discipline as the leaf stream's `from`
+    /// echo. The refusal is also the progress guard: a server that always
+    /// answers the same page cannot loop this client forever.
+    #[test]
+    fn a_page_answering_below_the_asked_offset_is_refused_not_rescanned() {
+        let d = Devnet::generate(GenParams::default());
+        let mut calls = 0usize;
+        let mut fetch = |path: &str| -> Result<Vec<u8>, String> {
+            assert!(path.starts_with("/v1/compact"), "refused before any /full fetch");
+            calls += 1;
+            // Always the first block, whatever was asked: a stuck or lying server.
+            crate::server::route(&d, "/v1/compact?from=1&to=1")
+                .map_err(|(c, m)| format!("{c} {m}"))
+        };
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::Off };
+        let err = match scan_over(
+            &mut fetch,
+            &d.our.dk,
+            1,
+            d.tip_height(),
+            cfg,
+            &mut StdRng::seed_from_u64(3),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a stuck page must be refused, not scanned"),
+        };
+        assert!(err.contains("below the requested range"), "{err}");
+        assert_eq!(calls, 2, "the first page is fine; the repeat is the refusal");
     }
 }
 
