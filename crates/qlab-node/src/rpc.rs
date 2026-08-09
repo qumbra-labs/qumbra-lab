@@ -2058,6 +2058,49 @@ mod tests {
         );
     }
 
+    /// 🔴 **The same defect, one route later** (issue #188, the serving+open
+    /// baton). `/v1/…/full` kept the side-table join after `/v1/compact` lost
+    /// it, so a node answered 404 for every transaction it had not itself
+    /// admitted — every peer's transaction, and every transaction at all after
+    /// a restart. Since the mint the payloads are in the committed region, so
+    /// the block can answer.
+    ///
+    /// Nothing is submitted here, and the side table is then **poisoned** with
+    /// payloads for the same statement id: the served bytes do not move.
+    #[test]
+    fn full_serves_the_block_and_never_the_side_table() {
+        let (mut rpc, anchor) = rpc_with_finalized_genesis();
+        let fee = posted_fee(ArityBucket::TwoByTwo);
+        let tx = tx_with(anchor, &[1, 2], &[10, 11], fee);
+        apply_block_with(rpc.node_mut(), vec![tx.clone()]);
+        assert!(rpc.discovery.is_empty(), "the side table is empty on this path");
+
+        let served = rpc.route("/v1/block/1/tx/0/full").expect("the block can answer");
+        let per_recipient = qlab_cbserver::codec::decode_full_response(&served).unwrap();
+        assert_eq!(per_recipient.len(), 1);
+        assert_eq!(per_recipient[0], vec![vec![10u8; 120], vec![11u8; 120]]);
+
+        // Byte identity with the committed region's tail — the projection, not a
+        // re-encoding of something that merely agrees with it.
+        let hash = rpc.node().chain().tip_hash();
+        let stored = rpc.node().chain().block(&hash).expect("tip stored").clone();
+        let committed = &stored.txs[0].discovery;
+        let prefix = qlab_cbserver::codec::committed_contents_prefix(committed).unwrap().len();
+        assert_eq!(per_recipient.concat().concat(), committed[prefix..].to_vec());
+
+        // Poison the side table with different payloads for the same statement.
+        let txid = tx_id_of_public(&tx.public);
+        rpc.record_discovery(txid, disc_for(&[99]));
+        assert_eq!(
+            rpc.route("/v1/block/1/tx/0/full").unwrap(),
+            served,
+            "a side table that disagrees with the block changes nothing that is served"
+        );
+
+        // A transaction index past the block's end is a 404, not an empty list.
+        assert!(matches!(rpc.route("/v1/block/1/tx/9/full"), Err((404, _))));
+    }
+
     /// The submitted artifacts must BE the transaction's committed group, not
     /// merely agree with it about commitments — otherwise `/v1/…/full` would hand
     /// back payloads keyed to a ciphertext `/v1/compact` never served, and a wallet
