@@ -159,12 +159,16 @@ fn a_spent_note_stops_being_spendable_and_the_recipient_gains() {
     assert_eq!(before.completeness(), Completeness::Complete);
     assert_eq!(before.notes.len(), 1, "the sender detects the grant");
     assert_eq!(before.notes[0].detected.note.value, GRANT);
-    assert_eq!(before.stats.compact_last_height, Some(tip.height), "the range the outputs reach");
+    assert_eq!(
+        before.stats.compact_range_served,
+        Some((0, tip.height)),
+        "the height range the outputs actually came from"
+    );
 
     let set = fetch_spent(&HttpNullifierSource::new(&url), 0, tip.height)
         .expect("the node serves its nullifier stream");
-    assert_eq!(set.covered_to, Some(tip.height));
-    assert!(set.covers_outputs(before.stats.compact_last_height).is_ok());
+    assert_eq!(set.covered, Some((0, tip.height)));
+    assert!(set.covers_outputs(before.stats.compact_range_served).is_ok());
     assert!(
         set.contains(&[0x77; 32]),
         "the stream carries the chain's nullifiers verbatim, including strangers'"
@@ -221,7 +225,7 @@ fn a_spent_note_stops_being_spendable_and_the_recipient_gains() {
 
     let set = fetch_spent(&HttpNullifierSource::new(&url), 0, tip.height)
         .expect("the node serves the spend's nullifiers too");
-    set.covers_outputs(after.stats.compact_last_height).expect("covered to the outputs' tip");
+    set.covers_outputs(after.stats.compact_range_served).expect("covered to the outputs' tip");
     let report = subtract_spent(&sender, 0, &after.notes, &set);
 
     assert_eq!(report.spent.len(), 1, "exactly the note that was spent");

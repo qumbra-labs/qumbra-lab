@@ -303,17 +303,19 @@ pub struct ScanStats {
     /// page the scan fetched (lab issue #309: a bounded server answers a wide
     /// range in pages, and the scan pages until the range is in hand).
     pub compact_bytes: usize,
-    /// The highest main-chain height the compact stream actually served, or
-    /// `None` when it served no block at all (lab issue #314).
+    /// The lowest and highest main-chain heights the compact stream actually
+    /// served, or `None` when it served no block at all (lab issue #314).
     ///
-    /// 🔴 **This is not the `to` that was asked for**, and the difference is the
-    /// point: a node holds what it holds, so a scan of `0..=5940` against a node
-    /// at height 5930 legitimately ends at 5930. A caller subtracting spends
-    /// needs to know how far the *outputs* it is holding actually reach, because
-    /// that is the range its nullifier stream must cover before a balance may be
-    /// quoted — comparing against `to` instead would refuse every honest scan of
-    /// a range wider than the chain.
-    pub compact_last_height: Option<u64>,
+    /// 🔴 **This is not the `from`/`to` that were asked for**, and the
+    /// difference is the point: a server holds what it holds, so a scan of
+    /// `0..=5940` against a node at height 5930 legitimately ends at 5930, and
+    /// against the reference server (whose first block is height 1) it
+    /// legitimately starts at 1. A caller subtracting spends needs the range the
+    /// *outputs* it is holding actually came from, because that is what its
+    /// nullifier stream must cover before a balance may be quoted — comparing
+    /// against the request instead would refuse every honest scan of a range
+    /// wider than the chain.
+    pub compact_range_served: Option<(u64, u64)>,
     /// Outputs whose **committed** tag matched this key — detection, decided from
     /// chain data alone and before any fetch. `notes_found` can only ever be a
     /// subset of this, and the difference is [`ScanOutcome::unopened`].
@@ -671,7 +673,7 @@ where
     }
     let mut stats = ScanStats {
         compact_bytes,
-        compact_last_height: blocks.last().map(|b| b.height),
+        compact_range_served: blocks.first().zip(blocks.last()).map(|(f, l)| (f.height, l.height)),
         ..Default::default()
     };
 

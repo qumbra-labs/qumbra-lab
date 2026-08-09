@@ -689,7 +689,7 @@ pub fn respond_nullifiers(view: &DiscoveryView, query: &str) -> Result<Vec<u8>, 
     if to < from {
         return Err((400, "'to' < 'from'".to_string()));
     }
-    Ok(qlab_node::NullifierPage::of(&view.blocks, from, to).to_bytes())
+    Ok(qlab_node::nullifier_page(&view.blocks, from, to).to_bytes())
 }
 
 /// The socket-free `/v1/tree/leaves` core: a `from` query against the leaves
@@ -1069,7 +1069,7 @@ mod tests {
 
         let (status, body) = get(addr, "/v1/nullifiers?from=0&to=2");
         assert!(status.starts_with("HTTP/1.1 200"), "{status}");
-        let page = qlab_node::NullifierPage::from_bytes(&body)
+        let page = qlab_cbserver::codec::NullifierPage::from_bytes(&body)
             .expect("the served bytes are the wallet's wire");
         assert_eq!((page.from, page.to), (0, 2), "the echoes are the request's");
         assert_eq!(page.blocks.len(), 3, "every held height in range, spending or not");
@@ -1084,7 +1084,7 @@ mod tests {
         later.blocks.push(projected_spending(3, 3, vec![], vec![[0xC3; 32]]));
         *view.lock().unwrap() = Arc::new(later);
         let (_, body2) = get(addr, "/v1/nullifiers?from=0&to=99");
-        let page2 = qlab_node::NullifierPage::from_bytes(&body2).unwrap();
+        let page2 = qlab_cbserver::codec::NullifierPage::from_bytes(&body2).unwrap();
         assert_eq!(page2.blocks.len(), 4);
         assert_eq!(page2.blocks[3].nullifiers, vec![[0xC3; 32]]);
 

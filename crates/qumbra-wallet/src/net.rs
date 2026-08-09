@@ -15,8 +15,10 @@
 //!
 //! # This module decodes nothing itself
 //!
-//! Every wire here is `qlab_node`'s, and this module calls **its** decoders —
-//! `TreeLeaves::from_bytes` and `AnchorSet::from_bytes`. #275 froze the
+//! Every wire here is somebody else's, and this module calls **their** decoders
+//! — `TreeLeaves::from_bytes` and `AnchorSet::from_bytes` from `qlab_node`,
+//! `NullifierPage::from_bytes` from `qlab_cbserver::codec` (that one lives in
+//! the compact family because the reference server serves it too). #275 froze the
 //! leaf-stream framing with golden vectors (stamp rider 1) precisely so there
 //! would be one reading of it; a wallet-side re-implementation would be the
 //! drift those vectors exist to prevent. What this module owns is the *paging*
@@ -51,7 +53,8 @@
 //! exchange at the Cloudflare edge is outside the wallet's control, and this is
 //! testnet-tunable, revisited at T2.
 
-use qlab_node::{AnchorSet, NullifierPage, TreeLeaves};
+use qlab_cbserver::codec::NullifierPage;
+use qlab_node::{AnchorSet, TreeLeaves};
 
 use crate::spent::{NullifierChunk, NullifierSource};
 use crate::sync::{AnchorSource, Anchors, LeafChunk, LeafSource};
@@ -124,8 +127,8 @@ impl AnchorSource for HttpAnchorSource {
 }
 
 /// The per-block nullifier stream as a [`NullifierSource`] — `GET
-/// /v1/nullifiers?from=&to=`, decoded by `qlab_node`'s own
-/// `NullifierPage::from_bytes` (lab issue #314).
+/// /v1/nullifiers?from=&to=`, decoded by the wire's own
+/// `qlab_cbserver::codec::NullifierPage::from_bytes` (lab issue #314).
 ///
 /// The paging loop lives in [`crate::spent::fetch_spent`]; this is one page.
 /// The server bounds a page at `MAX_NULLIFIER_BLOCKS` and names every height it

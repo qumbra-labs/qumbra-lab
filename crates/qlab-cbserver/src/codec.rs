@@ -186,6 +186,164 @@ pub fn decode_full_response(b: &[u8]) -> Result<Vec<Vec<Vec<u8>>>, CodecError> {
     Ok(out)
 }
 
+// ---- /v1/nullifiers response (lab issue #314) --------------------------------
+
+/// The most main-chain blocks one `/v1/nullifiers` response will ever carry.
+///
+/// The same contract shape, and the same number, as `qlab_node`'s
+/// `MAX_COMPACT_BLOCKS` — on purpose, because the client that pages this stream
+/// is the client that pages `/v1/compact`, over the same requested range. A
+/// response carries every height in `[from, to]` the server holds, up to this
+/// many blocks; a client whose page ends below `to` resumes from the last
+/// height + 1. `[devnet-placeholder]`, testnet-tunable, NOT frozen: the framing
+/// carries `n_blocks` and every height explicitly, so this bound can move
+/// without touching a golden.
+pub const MAX_NULLIFIER_BLOCKS: usize = 1024;
+
+/// One block's spent nullifiers, as the block published them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockNullifiers {
+    pub height: u64,
+    /// The block's nullifier section, in block order (transaction order, then
+    /// each transaction's declared order). **Empty is a real answer**: a block
+    /// that spends nothing carries an empty list and is served as such.
+    pub nullifiers: Vec<[u8; 32]>,
+}
+
+/// One page of the chain's per-block nullifier lists (`GET
+/// /v1/nullifiers?from=&to=` — lab issue #314).
+///
+/// ## What this is for, and why it is safe to serve
+///
+/// A wallet's `spendable` is computed from outputs, and a discovery group
+/// deliberately carries no nullifier (#188 (a) as amended, under #32's `Ivk`
+/// boundary) — so before this wire existed **nothing in a scan could learn that
+/// a note it opened had since been spent**, and every wallet that had ever spent
+/// over-quoted its balance under `verdict: complete`. This is the missing half:
+/// the server publishes the nullifiers each block already committed, the wallet
+/// derives its own notes' nullifiers from keys only it holds, and the match
+/// happens **locally**.
+///
+/// 🔴 **Bulk per range, never a membership query.** There is no
+/// `?nullifier=<nf>` form of this route and there must never be one: asking a
+/// server "is nf X spent" tells that server which notes are the asker's, which
+/// is exactly the linkage the discovery design refuses. The bytes here are
+/// already public — consensus published every one of them to enforce the
+/// double-spend rule — so serving them adds nothing an `Ivk` could not already
+/// obtain; a probe would add the **question**, and the question is the leak.
+///
+/// ## Wire — the compact family's version byte, deliberately
+///
+/// `version ‖ from(varint) ‖ to(varint) ‖ n_blocks(varint) ‖
+///  [height(varint) ‖ n(varint) ‖ nf(32) × n] × n_blocks`
+///
+/// It lives in this module, at [`WIRE_VERSION`], rather than beside the node's
+/// own surfaces, because it is a **sibling of `/v1/compact` by every structural
+/// test**: same projection, same `[from, to]` range paging, same light client,
+/// and served by both this reference server and a deployed `qumbra-node`. A
+/// wallet pointed at either must be able to subtract its spends, and a wire that
+/// only one of them could speak would have left the reference server serving a
+/// balance nobody may quote.
+///
+/// Adding a wire to this family does not move its version: every existing
+/// payload is byte-for-byte what it was, and an older server simply 404s, which
+/// the client renders as `UNAVAILABLE` with the reason (that refusal is required
+/// behaviour here, not a fallback).
+///
+/// `from`/`to` are echoed so a paging client cannot misattribute a page (the
+/// leaf stream's discipline). Heights are ascending and **every** height the
+/// server holds in range is present, including the ones that spend nothing — an
+/// omitted height is indistinguishable from an unserved one, and "this block
+/// spent nothing" is precisely the fact a balance subtracts against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NullifierPage {
+    /// Echo of the request's `from`.
+    pub from: u64,
+    /// Echo of the request's `to`.
+    pub to: u64,
+    /// Ascending by height; at most [`MAX_NULLIFIER_BLOCKS`] entries.
+    pub blocks: Vec<BlockNullifiers>,
+}
+
+impl NullifierPage {
+    /// Build the page for `[from, to]` over an **ascending** per-block source,
+    /// applying the bound. One implementation of the truncation arithmetic, used
+    /// by every server that serves this route.
+    pub fn page(
+        blocks: impl IntoIterator<Item = BlockNullifiers>,
+        from: u64,
+        to: u64,
+    ) -> NullifierPage {
+        let mut out = Vec::new();
+        for b in blocks {
+            if b.height < from || b.height > to {
+                continue;
+            }
+            if out.len() == MAX_NULLIFIER_BLOCKS {
+                break;
+            }
+            out.push(b);
+        }
+        NullifierPage { from, to, blocks: out }
+    }
+
+    /// The highest height this page carries — where a paging client resumes
+    /// from (`+ 1`).
+    pub fn last_height(&self) -> Option<u64> {
+        self.blocks.last().map(|b| b.height)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(WIRE_VERSION);
+        write_varint(&mut out, self.from);
+        write_varint(&mut out, self.to);
+        write_varint(&mut out, self.blocks.len() as u64);
+        for b in &self.blocks {
+            write_varint(&mut out, b.height);
+            write_varint(&mut out, b.nullifiers.len() as u64);
+            for nf in &b.nullifiers {
+                out.extend_from_slice(nf);
+            }
+        }
+        out
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<NullifierPage, CodecError> {
+        let mut pos = 0usize;
+        let ver = *b.get(pos).ok_or(CodecError::Truncated { what: "version" })?;
+        pos += 1;
+        if ver != WIRE_VERSION {
+            return Err(CodecError::BadVersion { got: ver });
+        }
+        let from = read_varint(b, &mut pos)?;
+        let to = read_varint(b, &mut pos)?;
+        let n_blocks = read_varint(b, &mut pos)?;
+        // Both counts are attacker-adjacent input on a served wire: cap every
+        // allocation by what the remaining bytes could actually hold, so a tiny
+        // payload claiming 2^60 entries is a `Truncated` refusal and not a giant
+        // allocation.
+        let mut blocks = Vec::with_capacity((n_blocks as usize).min(b.len() / 2));
+        for _ in 0..n_blocks {
+            let height = read_varint(b, &mut pos)?;
+            let n = read_varint(b, &mut pos)?;
+            let mut nullifiers = Vec::with_capacity((n as usize).min(b.len() / 32));
+            for _ in 0..n {
+                if b.len() < pos + 32 {
+                    return Err(CodecError::Truncated { what: "nullifier" });
+                }
+                nullifiers.push(b[pos..pos + 32].try_into().expect("32 bytes"));
+                pos += 32;
+            }
+            blocks.push(BlockNullifiers { height, nullifiers });
+        }
+        if pos != b.len() {
+            return Err(CodecError::TrailingBytes { remaining: b.len() - pos });
+        }
+        Ok(NullifierPage { from, to, blocks })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +708,157 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].height, 7);
         assert_eq!(back[0].groups[0].tx_index, 2);
+    }
+
+    // ---- /v1/nullifiers (lab issue #314) ------------------------------------
+
+    /// GOLDEN BYTES — the nullifier-stream framing. Same class as
+    /// `/v1/compact`'s: a *served* wire a wallet's balance depends on, so it
+    /// freezes deliberately with byte-exact vectors rather than by accident.
+    ///
+    /// The empty-block entry is part of the golden on purpose: a height that
+    /// spends nothing must be *present and empty*, because an omitted height is
+    /// indistinguishable from an unserved one and a client that cannot tell
+    /// those apart cannot honestly say whether it covered the range.
+    #[test]
+    fn golden_bytes_lock_the_nullifier_stream_framing() {
+        let page = NullifierPage {
+            from: 4,
+            to: 6,
+            blocks: vec![
+                BlockNullifiers { height: 4, nullifiers: vec![[0xA1; 32], [0xB2; 32]] },
+                BlockNullifiers { height: 5, nullifiers: vec![] },
+                BlockNullifiers { height: 6, nullifiers: vec![[0xC3; 32]] },
+            ],
+        };
+        let bytes = page.to_bytes();
+
+        // version(1) + from(1) + to(1) + n_blocks(1) = 4, then
+        //   height(1) + n(1) + 2 × 32 = 66
+        //   height(1) + n(1)          =  2
+        //   height(1) + n(1) + 1 × 32 = 34
+        assert_eq!(bytes.len(), 4 + 66 + 2 + 34, "golden total length");
+        assert_eq!(
+            &bytes[..4],
+            &[0x01, 0x04, 0x06, 0x03],
+            "golden header — WIRE_VERSION, from, to, n_blocks (the compact family's varints)"
+        );
+        assert_eq!(&bytes[4..6], &[0x04, 0x02], "golden block 0: height, n");
+        assert_eq!(&bytes[6..38], &[0xA1; 32], "golden block 0 nf 0");
+        assert_eq!(&bytes[38..70], &[0xB2; 32], "golden block 0 nf 1");
+        assert_eq!(
+            &bytes[70..72],
+            &[0x05, 0x00],
+            "golden block 1 — a block that spends nothing IS served, with n = 0"
+        );
+        assert_eq!(&bytes[72..74], &[0x06, 0x01], "golden block 2: height, n");
+        assert_eq!(&bytes[74..106], &[0xC3; 32], "golden block 2 nf 0");
+
+        let digest = keccak256_bytes(&bytes);
+        assert_eq!(
+            hex(&digest),
+            "c99f517c19b564dbb07356acc46850368d9eba037512a7327a7f0e7ff9aab85c",
+            "GOLDEN digest — update ONLY with an intentional, documented framing change"
+        );
+
+        assert_eq!(NullifierPage::from_bytes(&bytes).unwrap(), page, "and it round-trips");
+
+        // The empty page — "I hold nothing in that range" — is framing too.
+        let empty = NullifierPage { from: 9, to: 9, blocks: vec![] };
+        let ebytes = empty.to_bytes();
+        assert_eq!(ebytes, vec![0x01, 0x09, 0x09, 0x00], "golden empty page");
+        assert_eq!(NullifierPage::from_bytes(&ebytes).unwrap(), empty);
+    }
+
+    /// The nullifier wire rejects exactly like the compact wire, and a claimed
+    /// count the bytes cannot hold is a refusal rather than an allocation — at
+    /// BOTH levels of the framing (blocks and nullifiers).
+    #[test]
+    fn nullifier_stream_rejects_bad_version_trailing_truncation_and_count_lies() {
+        let good = NullifierPage {
+            from: 0,
+            to: 1,
+            blocks: vec![BlockNullifiers { height: 1, nullifiers: vec![[0x11; 32]] }],
+        }
+        .to_bytes();
+        assert_eq!(NullifierPage::from_bytes(&good).unwrap().blocks.len(), 1);
+
+        let mut bad_v = good.clone();
+        bad_v[0] = 0x02;
+        assert_eq!(
+            NullifierPage::from_bytes(&bad_v),
+            Err(CodecError::BadVersion { got: 2 })
+        );
+
+        let mut extra = good.clone();
+        extra.push(0);
+        assert!(matches!(
+            NullifierPage::from_bytes(&extra),
+            Err(CodecError::TrailingBytes { .. })
+        ));
+
+        assert!(matches!(
+            NullifierPage::from_bytes(&good[..good.len() - 1]),
+            Err(CodecError::Truncated { .. })
+        ));
+
+        // A header claiming 2^60 blocks, and a block claiming 2^60 nullifiers:
+        // `Truncated` both times, never a giant allocation.
+        let mut lie_blocks = vec![WIRE_VERSION];
+        write_varint(&mut lie_blocks, 0);
+        write_varint(&mut lie_blocks, 0);
+        write_varint(&mut lie_blocks, 1u64 << 60);
+        assert!(matches!(
+            NullifierPage::from_bytes(&lie_blocks),
+            Err(CodecError::Truncated { .. })
+        ));
+
+        let mut lie_nfs = vec![WIRE_VERSION];
+        write_varint(&mut lie_nfs, 0);
+        write_varint(&mut lie_nfs, 0);
+        write_varint(&mut lie_nfs, 1);
+        write_varint(&mut lie_nfs, 0);
+        write_varint(&mut lie_nfs, 1u64 << 60);
+        assert!(matches!(
+            NullifierPage::from_bytes(&lie_nfs),
+            Err(CodecError::Truncated { .. })
+        ));
+    }
+
+    /// The page arithmetic: bounded at [`MAX_NULLIFIER_BLOCKS`], the client
+    /// resumes from the last height + 1, and a range the source does not reach
+    /// is an **empty page**, never an error.
+    ///
+    /// This is lab issue #312's paging contract on a second route, and it is why
+    /// the client half ships in the same change: a truncated page that read as a
+    /// complete one would leave a wallet quietly failing to subtract a spend in
+    /// the missing tail.
+    #[test]
+    fn nullifier_pages_are_bounded_and_the_client_resumes_from_the_last_height() {
+        let all: Vec<BlockNullifiers> = (0..MAX_NULLIFIER_BLOCKS as u64 + 5)
+            .map(|h| {
+                let mut nf = [0u8; 32];
+                nf[..8].copy_from_slice(&h.to_le_bytes());
+                BlockNullifiers { height: h, nullifiers: vec![nf] }
+            })
+            .collect();
+
+        let p0 = NullifierPage::page(all.iter().cloned(), 0, u64::MAX);
+        assert_eq!(
+            p0.blocks.len(),
+            MAX_NULLIFIER_BLOCKS,
+            "a full page is the bound, not the chain"
+        );
+        assert_eq!(p0.last_height(), Some(MAX_NULLIFIER_BLOCKS as u64 - 1));
+        assert!(p0.last_height().unwrap() < p0.to, "…and it visibly ends below the request");
+
+        let p1 = NullifierPage::page(all.iter().cloned(), p0.last_height().unwrap() + 1, u64::MAX);
+        assert_eq!(p1.blocks.len(), 5, "the rest arrives on the next page");
+        assert_eq!(p1.blocks[0].height, MAX_NULLIFIER_BLOCKS as u64);
+
+        let beyond = NullifierPage::page(all.iter().cloned(), 99_999, 100_000);
+        assert!(beyond.blocks.is_empty(), "a range the source does not hold is empty, not an error");
+        assert_eq!((beyond.from, beyond.to), (99_999, 100_000), "the echoes are the request's");
     }
 
     // Local Keccak-256 (original pad10*1) over qlab-air's permutation, mirroring

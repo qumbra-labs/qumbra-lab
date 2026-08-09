@@ -14,7 +14,7 @@
 //! ## The shape, and the line it does not cross
 //!
 //! The node serves the nullifiers each block published, in bulk over a range
-//! (`GET /v1/nullifiers`, [`qlab_node::NullifierPage`]). This module derives
+//! (`GET /v1/nullifiers`, [`qlab_cbserver::codec::NullifierPage`]). This module derives
 //! **this wallet's own** notes' nullifiers from keys only this wallet holds, and
 //! matches locally.
 //!
@@ -56,8 +56,9 @@ use qlab_note::note::Note;
 use qlab_wallet::Wallet;
 
 /// One bounded response from the nullifier stream — the wallet-side shape of
-/// [`qlab_node::NullifierPage`], field for field, so there is no second reading
-/// of that framing here (the [`crate::sync::LeafChunk`] discipline).
+/// [`qlab_cbserver::codec::NullifierPage`], field for field, so there is no
+/// second reading of that framing here (the [`crate::sync::LeafChunk`]
+/// discipline).
 #[derive(Clone, Debug)]
 pub struct NullifierChunk {
     /// The server's **echo** of the requested `from`. Checked, not trusted.
@@ -94,15 +95,22 @@ pub enum SpentRefusal {
     /// Heights arrived out of order or repeated. Ascending order is what makes
     /// "covered up to N" a claim rather than a hope.
     NotAscending { previous: u64, height: u64 },
-    /// 🔴 A height is **missing** from the stream. Never tolerated and never
-    /// interpolated: a hole is indistinguishable from "that block spent
-    /// nothing" once it is smoothed over, and smoothing it over is precisely
-    /// how a spent note stays spendable.
+    /// 🔴 A height is **missing** from the middle of the stream. Never tolerated
+    /// and never interpolated: a hole is indistinguishable from "that block
+    /// spent nothing" once it is smoothed over, and smoothing it over is
+    /// precisely how a spent note stays spendable.
+    ///
+    /// Only *interior* holes are this refusal. Where the stream **starts** is
+    /// the server's business — the reference server's first block is height 1,
+    /// and a node may hold nothing below some height — so a leading edge above
+    /// the requested `from` is legal and is judged by [`SpentRefusal::NotCovered`]
+    /// against the range the outputs actually came from.
     Gap { expected: u64, got: u64 },
-    /// The stream reaches `covered_to` but the outputs being subtracted against
-    /// reach further, so some of them could have been spent in blocks this
-    /// wallet never saw the nullifiers of. Refused rather than under-subtracted.
-    ShortOfOutputs { covered_to: Option<u64>, outputs_to: u64 },
+    /// The stream does not cover the heights the outputs being subtracted came
+    /// from, at one end or the other — so a note could have been spent in a
+    /// block this wallet never saw the nullifiers of. Refused rather than
+    /// under-subtracted.
+    NotCovered { covered: Option<(u64, u64)>, outputs: (u64, u64) },
 }
 
 impl std::fmt::Display for SpentRefusal {
@@ -136,15 +144,17 @@ impl std::fmt::Display for SpentRefusal {
                  was {got}). A hole is not an empty block — refusing to treat 'I was not told' \
                  as 'nothing was spent there'"
             ),
-            SpentRefusal::ShortOfOutputs { covered_to, outputs_to } => write!(
+            SpentRefusal::NotCovered { covered, outputs } => write!(
                 f,
-                "nullifier stream refused: it covers up to height {} but this scan's outputs \
-                 reach {outputs_to}. A note could have been spent in the uncovered blocks, so \
-                 spendable cannot be quoted for this range",
-                match covered_to {
-                    Some(h) => h.to_string(),
+                "nullifier stream refused: it covers {} but this scan's outputs came from \
+                 {}..={}. A note could have been spent in the uncovered blocks, so spendable \
+                 cannot be quoted for this range",
+                match covered {
+                    Some((a, b)) => format!("{a}..={b}"),
                     None => "nothing".to_string(),
-                }
+                },
+                outputs.0,
+                outputs.1
             ),
         }
     }
@@ -157,15 +167,27 @@ impl std::error::Error for SpentRefusal {}
 /// on.
 #[derive(Clone, Debug, Default)]
 pub struct SpentSet {
-    /// The lowest height this set speaks for.
-    pub from: u64,
-    /// The highest height actually served, or `None` when the endpoint held no
-    /// block in the range at all.
-    pub covered_to: Option<u64>,
+    /// The contiguous height range actually served, or `None` when the endpoint
+    /// held no block in the requested range at all.
+    pub covered: Option<(u64, u64)>,
     nullifiers: BTreeSet<[u8; 32]>,
 }
 
 impl SpentSet {
+    /// Build a set from nullifiers a caller obtained some other way — an
+    /// in-process node, a fixture, a chain reader that is not this HTTP client.
+    ///
+    /// 🔴 **`covered` is the caller's claim and is not checked here**, which is
+    /// why [`fetch_spent`] exists and is what the CLI uses: over the wire the
+    /// coverage has to be *established*, page by page, before it may be
+    /// asserted. This constructor is for callers who already know it.
+    pub fn from_parts(
+        covered: Option<(u64, u64)>,
+        nullifiers: impl IntoIterator<Item = [u8; 32]>,
+    ) -> SpentSet {
+        SpentSet { covered, nullifiers: nullifiers.into_iter().collect() }
+    }
+
     /// Is this nullifier on the chain, within the covered range?
     pub fn contains(&self, nf: &[u8; 32]) -> bool {
         self.nullifiers.contains(nf)
@@ -181,16 +203,25 @@ impl SpentSet {
         self.nullifiers.is_empty()
     }
 
-    /// Does this set cover every height an output could have been spent in,
-    /// given that the outputs themselves reach `outputs_to`?
+    /// Does this set cover every height an output could have been spent in?
     ///
-    /// `None` means the scan saw no block at all, so there is nothing to cover
-    /// and nothing to subtract.
-    pub fn covers_outputs(&self, outputs_to: Option<u64>) -> Result<(), SpentRefusal> {
-        let Some(outputs_to) = outputs_to else { return Ok(()) };
-        match self.covered_to {
-            Some(c) if c >= outputs_to => Ok(()),
-            covered_to => Err(SpentRefusal::ShortOfOutputs { covered_to, outputs_to }),
+    /// `outputs` is the height range the scan's outputs actually came from
+    /// (`ScanStats::compact_range_served`), not the range the user asked for —
+    /// a server holds what it holds at both ends, and refusing an honest scan
+    /// for that would make the whole subtraction unusable. `None` means the scan
+    /// saw no block at all, so there is nothing to cover and nothing to
+    /// subtract.
+    ///
+    /// A note detected at height `h` can be spent at any height from `h`
+    /// onwards, so the covered range must contain the outputs' range at **both**
+    /// ends: an uncovered head hides a spend of an early note, an uncovered tail
+    /// hides the most recent spends — which is the exact case that produced this
+    /// issue.
+    pub fn covers_outputs(&self, outputs: Option<(u64, u64)>) -> Result<(), SpentRefusal> {
+        let Some(outputs) = outputs else { return Ok(()) };
+        match self.covered {
+            Some((from, to)) if from <= outputs.0 && to >= outputs.1 => Ok(()),
+            covered => Err(SpentRefusal::NotCovered { covered, outputs }),
         }
     }
 }
@@ -203,14 +234,20 @@ impl SpentSet {
 /// The loop resumes at the last served height + 1 and stops when a page reaches
 /// `to` or when the endpoint serves nothing further (the honest "I hold no more
 /// of that range"). Contiguity is checked as it goes, and it is also the
-/// progress guard: a page that does not start where the last one ended is a
+/// progress guard: a page that does not continue where the last one ended is a
 /// named refusal rather than another lap.
+///
+/// **Where the stream starts is not checked here** — the reference server's
+/// first block is height 1 and a node may hold nothing below some height, so a
+/// leading edge above `from` is legal. What that costs is judged by
+/// [`SpentSet::covers_outputs`] against the range the outputs actually came
+/// from, which is the question that matters.
 pub fn fetch_spent(
     source: &impl NullifierSource,
     from: u64,
     to: u64,
 ) -> Result<SpentSet, SpentRefusal> {
-    let mut set = SpentSet { from, covered_to: None, nullifiers: BTreeSet::new() };
+    let mut set = SpentSet { covered: None, nullifiers: BTreeSet::new() };
     let mut cursor = from;
     loop {
         let page = source
@@ -230,22 +267,19 @@ pub fn fetch_spent(
             if height < cursor || height > to {
                 return Err(SpentRefusal::OutOfRange { height, asked: (cursor, to) });
             }
-            match set.covered_to {
-                Some(prev) if height <= prev => {
+            match set.covered {
+                Some((_, prev)) if height <= prev => {
                     return Err(SpentRefusal::NotAscending { previous: prev, height })
                 }
-                Some(prev) if height != prev + 1 => {
+                Some((_, prev)) if height != prev + 1 => {
                     return Err(SpentRefusal::Gap { expected: prev + 1, got: height })
-                }
-                None if height != cursor => {
-                    return Err(SpentRefusal::Gap { expected: cursor, got: height })
                 }
                 _ => {}
             }
             set.nullifiers.extend(nfs.iter().copied());
-            set.covered_to = Some(height);
+            set.covered = Some((set.covered.map_or(height, |(f, _)| f), height));
         }
-        let last = set.covered_to.expect("a non-empty page set it");
+        let (_, last) = set.covered.expect("a non-empty page set it");
         if last >= to {
             break;
         }
@@ -384,7 +418,7 @@ mod tests {
     fn the_stream_is_paged_until_the_range_is_in_hand() {
         let src = Honest::new(0..=9, 4);
         let set = fetch_spent(&src, 0, 9).expect("an honest stream pages");
-        assert_eq!(set.covered_to, Some(9));
+        assert_eq!(set.covered, Some((0, 9)));
         assert_eq!(set.len(), 10, "every block's nullifier arrived");
         assert_eq!(
             *src.asked.borrow(),
@@ -394,7 +428,7 @@ mod tests {
         for h in 0..=9u8 {
             assert!(set.contains(&nf(h)));
         }
-        assert!(set.covers_outputs(Some(9)).is_ok());
+        assert!(set.covers_outputs(Some((0, 9))).is_ok());
     }
 
     /// A truncated page must never read as a covered range. Here the endpoint
@@ -403,13 +437,23 @@ mod tests {
     fn a_stream_short_of_the_outputs_refuses_rather_than_under_subtracting() {
         let src = Honest::new(0..=6, 100);
         let set = fetch_spent(&src, 0, 9).expect("the pages themselves are well-formed");
-        assert_eq!(set.covered_to, Some(6), "it covers what it served, honestly");
-        let e = set.covers_outputs(Some(9)).unwrap_err();
-        assert_eq!(e, SpentRefusal::ShortOfOutputs { covered_to: Some(6), outputs_to: 9 });
+        assert_eq!(set.covered, Some((0, 6)), "it covers what it served, honestly");
+        let e = set.covers_outputs(Some((0, 9))).unwrap_err();
+        assert_eq!(e, SpentRefusal::NotCovered { covered: Some((0, 6)), outputs: (0, 9) });
         assert!(e.to_string().contains("cannot be quoted"), "{e}");
         // …and covering exactly as far as the outputs is enough.
-        assert!(set.covers_outputs(Some(6)).is_ok());
+        assert!(set.covers_outputs(Some((0, 6))).is_ok());
         assert!(set.covers_outputs(None).is_ok(), "no outputs, nothing to cover");
+        // An uncovered HEAD is refused too — a spend of an early note would be
+        // just as invisible as a spend of a late one.
+        let late = fetch_spent(&Honest::new(4..=9, 100), 0, 9).unwrap();
+        assert_eq!(late.covered, Some((4, 9)), "a leading edge above `from` is legal…");
+        assert_eq!(
+            late.covers_outputs(Some((1, 9))).unwrap_err(),
+            SpentRefusal::NotCovered { covered: Some((4, 9)), outputs: (1, 9) },
+            "…and is judged against where the outputs actually came from"
+        );
+        assert!(late.covers_outputs(Some((4, 9))).is_ok());
     }
 
     /// A hole is not an empty block. Smoothing one over is how a spent note
@@ -426,15 +470,19 @@ mod tests {
         assert_eq!(e, SpentRefusal::Gap { expected: 1, got: 2 });
         assert!(e.to_string().contains("not an empty block"), "{e}");
 
-        // A first page that does not start where it was asked to is the same
-        // fault, caught before a single nullifier is accumulated.
-        struct Late;
-        impl NullifierSource for Late {
+        // A hole ACROSS a page boundary is the same fault: the second page must
+        // continue where the first stopped.
+        struct HoledAcrossPages;
+        impl NullifierSource for HoledAcrossPages {
             fn fetch_range(&self, from: u64, to: u64) -> Result<NullifierChunk, String> {
-                Ok(NullifierChunk { from, to, blocks: vec![(5, vec![nf(5)])] })
+                let blocks = if from == 0 { vec![(0, vec![]), (1, vec![])] } else { vec![(3, vec![nf(3)])] };
+                Ok(NullifierChunk { from, to, blocks })
             }
         }
-        assert_eq!(fetch_spent(&Late, 0, 9).unwrap_err(), SpentRefusal::Gap { expected: 0, got: 5 });
+        assert_eq!(
+            fetch_spent(&HoledAcrossPages, 0, 5).unwrap_err(),
+            SpentRefusal::Gap { expected: 2, got: 3 }
+        );
     }
 
     /// The bound echoes are checked, not decorative — the leaf stream's
@@ -494,12 +542,12 @@ mod tests {
     #[test]
     fn a_range_the_endpoint_does_not_reach_is_empty_and_covers_nothing() {
         let set = fetch_spent(&Honest::new(0..=3, 100), 8, 9).unwrap();
-        assert_eq!(set.covered_to, None);
+        assert_eq!(set.covered, None);
         assert!(set.is_empty());
         assert!(set.covers_outputs(None).is_ok());
         assert_eq!(
-            set.covers_outputs(Some(9)).unwrap_err(),
-            SpentRefusal::ShortOfOutputs { covered_to: None, outputs_to: 9 }
+            set.covers_outputs(Some((8, 9))).unwrap_err(),
+            SpentRefusal::NotCovered { covered: None, outputs: (8, 9) }
         );
     }
 

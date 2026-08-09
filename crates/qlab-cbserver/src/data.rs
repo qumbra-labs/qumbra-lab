@@ -29,7 +29,7 @@ use qlab_note::scan::{encrypt_to_recipient, EncryptedOutputs};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::codec::{CompactBlock, CompactGroup};
+use crate::codec::{BlockNullifiers, CompactBlock, CompactGroup};
 use crate::tree::CommitmentTree;
 
 /// One recipient bundle's encryption artifacts, stored for serving.
@@ -292,6 +292,35 @@ impl Devnet {
             out.push(CompactBlock { height, groups });
         }
         out
+    }
+
+    /// The per-block nullifier lists for `[from, to]` — what `/v1/nullifiers`
+    /// serves (lab issue #314).
+    ///
+    /// Read from `body.txs[i].public.nullifiers`, the block's own section, in
+    /// block order. Every height this devnet holds in range is present,
+    /// **including the ones that spend nothing**: an omitted height is
+    /// indistinguishable from an unserved one, and a client that cannot tell
+    /// those apart cannot honestly say whether it covered the range.
+    /// Iterates what this devnet **holds** and filters, rather than iterating
+    /// the requested range and looking up — so the cost is bounded by the chain
+    /// rather than by a client-chosen `to` (the bound `MAX_COMPACT_BLOCKS` was
+    /// added to the node's route for; `compact_range` above still has the older
+    /// shape and is localhost-only).
+    pub fn nullifier_range(&self, from: u64, to: u64) -> Vec<BlockNullifiers> {
+        self.blocks
+            .iter()
+            .filter(|blk| blk.height >= from && blk.height <= to)
+            .map(|blk| BlockNullifiers {
+                height: blk.height,
+                nullifiers: blk
+                    .body
+                    .txs
+                    .iter()
+                    .flat_map(|t| t.public.nullifiers.iter().copied())
+                    .collect(),
+            })
+            .collect()
     }
 
     /// The full-fetch payloads for one `(height, tx_index)`: per-recipient AEAD

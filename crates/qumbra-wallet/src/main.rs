@@ -75,6 +75,15 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
+/// The union of the height ranges several scans' outputs came from — the range
+/// the nullifier stream must cover before any of their figures may be quoted
+/// (lab issue #314). `None` when no scan saw a block at all.
+fn widest_range(
+    ranges: impl IntoIterator<Item = Option<(u64, u64)>>,
+) -> Option<(u64, u64)> {
+    ranges.into_iter().flatten().reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+}
+
 fn dir_of(args: &[String]) -> Result<PathBuf, Box<dyn Error>> {
     Ok(PathBuf::from(flag(args, "--dir").ok_or("--dir DIR is required")?))
 }
@@ -229,12 +238,11 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
     //
     // And an UNAVAILABLE stream refuses the whole send rather than guessing: a
     // spend built on "I could not check" is exactly the wasted proof above.
-    let outputs_to =
-        scanned.iter().filter_map(|(_, o)| o.stats.compact_last_height).max();
+    let outputs = widest_range(scanned.iter().map(|(_, o)| o.stats.compact_range_served));
     let spent_set = fetch_spent(&HttpNullifierSource::new(url), 0, scan_to)
         .map_err(|e| format!("{e} — refusing to select inputs this wallet may already have spent"))?;
     spent_set
-        .covers_outputs(outputs_to)
+        .covers_outputs(outputs)
         .map_err(|e| format!("{e} — refusing to select inputs this wallet may already have spent"))?;
 
     let mut spendables: Vec<Spendable> = Vec::new();
@@ -416,16 +424,14 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     // ---- 2. The spends, over the range the outputs actually reached. -------
-    let outputs_to = outcomes
-        .iter()
-        .filter_map(|(_, _, o)| o.as_ref().ok())
-        .filter_map(|o| o.stats.compact_last_height)
-        .max();
+    let outputs = widest_range(
+        outcomes.iter().filter_map(|(_, _, o)| o.as_ref().ok()).map(|o| o.stats.compact_range_served),
+    );
     let (coverage, set) = match fetch_spent(&HttpNullifierSource::new(url), from, to) {
         Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),
-        Ok(set) => match set.covers_outputs(outputs_to) {
+        Ok(set) => match set.covers_outputs(outputs) {
             Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),
-            Ok(()) => (SpentCoverage::Covered { from, to: set.covered_to }, Some(set)),
+            Ok(()) => (SpentCoverage::Covered { range: set.covered }, Some(set)),
         },
     };
 

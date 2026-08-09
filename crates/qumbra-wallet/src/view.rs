@@ -40,12 +40,12 @@ pub const UNAVAILABLE: &str = "UNAVAILABLE";
 /// in it (lab issue #314).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpentCoverage {
-    /// The chain's nullifiers are in hand for `from..=to`, so every figure below
-    /// has had this wallet's spends subtracted. `to` is `None` when the endpoint
-    /// held **no** main-chain block in the requested range at all — which is a
-    /// covered state, not a failed one, because a range with no blocks has no
-    /// outputs in it either.
-    Covered { from: u64, to: Option<u64> },
+    /// The chain's nullifiers are in hand for `range`, so every figure below has
+    /// had this wallet's spends subtracted. `None` means the endpoint held **no**
+    /// main-chain block in the requested range at all — which is a covered state,
+    /// not a failed one, because a range with no blocks has no outputs in it
+    /// either.
+    Covered { range: Option<(u64, u64)> },
     /// The stream could not be read or did not reach far enough. **No figure is
     /// quotable** — carries the reason, verbatim.
     Unavailable { why: String },
@@ -144,13 +144,13 @@ pub fn render(scans: &[DivScan], range: (u64, u64), url: &str, spent: &SpentCove
         range.1
     ));
     match spent {
-        SpentCoverage::Covered { from, to: Some(to) } => out.push_str(&format!(
-            "spent-subtraction: the chain's nullifiers for {from}..={to} are in hand\n\n"
+        SpentCoverage::Covered { range: Some((a, b)) } => out.push_str(&format!(
+            "spent-subtraction: the chain's nullifiers for {a}..={b} are in hand\n\n"
         )),
-        SpentCoverage::Covered { from, to: None } => out.push_str(&format!(
-            "spent-subtraction: the endpoint holds no block in {from}..={} — nothing to \
-             subtract, and nothing was found there either\n\n",
-            range.1
+        SpentCoverage::Covered { range: None } => out.push_str(&format!(
+            "spent-subtraction: the endpoint holds no block in {}..={} — nothing to subtract, \
+             and nothing was found there either\n\n",
+            range.0, range.1
         )),
         SpentCoverage::Unavailable { why } => out.push_str(&format!(
             "spent-subtraction: {UNAVAILABLE} — {why}\n\
@@ -224,7 +224,7 @@ mod tests {
     use super::*;
 
     fn covered() -> SpentCoverage {
-        SpentCoverage::Covered { from: 0, to: Some(8) }
+        SpentCoverage::Covered { range: Some((0, 8)) }
     }
 
     fn div(idx: u64, c: Completeness, spend: u128, shadow: u128) -> DivScan {
@@ -304,7 +304,7 @@ mod tests {
         let mut d = div(0, Completeness::Complete, 3_899_000_000, 0);
         d.spent_count = 1;
         d.spent_bessel = 1_000_000_000;
-        let r = render(&[d], (0, 5940), "http://x", &SpentCoverage::Covered { from: 0, to: Some(5940) });
+        let r = render(&[d], (0, 5940), "http://x", &SpentCoverage::Covered { range: Some((0, 5940)) });
         assert!(r.contains("spendable: 3899000000 bessel"), "{r}");
         assert!(r.contains("spent:     1 note(s), 1000000000 bessel already spent"), "{r}");
         assert!(!r.contains("4899000000"), "the pre-#314 number must not appear anywhere");
