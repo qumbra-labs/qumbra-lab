@@ -322,13 +322,34 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                 report.harvest.funded
             );
         }
+        if report.harvest.skipped_spent > 0 {
+            // Lab #310: spent notes the restart walk would otherwise re-fund.
+            println!(
+                "FAUCET harvest-skipped-spent {}",
+                report.harvest.skipped_spent
+            );
+        }
         if let Some(receipt) = report.granted {
             // The receipt, never the recipient: a grant line in a log rotation must
             // not be a record of who asked (PR #103's redaction, same rule).
             println!("FAUCET granted receipt={receipt}");
         }
+        // Lab #310 / #241: one named reason per refused attempt, before any
+        // gave-up line so the operator sees the fault that burned the budget.
+        if let Some(reason) = &report.refusal_reason {
+            println!("FAUCET refuse reason={reason}");
+        }
+        if report.dropped_spent > 0 {
+            println!(
+                "FAUCET dropped-spent {} (stale inventory; attempt not burned)",
+                report.dropped_spent
+            );
+        }
         if let Some(receipt) = report.gave_up {
-            println!("FAUCET gave-up receipt={receipt}");
+            match &report.refusal_reason {
+                Some(reason) => println!("FAUCET gave-up receipt={receipt} reason={reason}"),
+                None => println!("FAUCET gave-up receipt={receipt}"),
+            }
         }
     });
 

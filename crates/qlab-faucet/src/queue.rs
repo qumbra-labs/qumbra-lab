@@ -171,6 +171,16 @@ impl RequestQueue {
         None
     }
 
+    /// Return a request to the **front** without consuming an attempt.
+    ///
+    /// Used when the failure was the faucet's own inventory (a note whose
+    /// nullifier is already on-chain — lab issue #310), not a submittable-but-
+    /// refused grant. Burning the attempt budget on a stale inventory entry is
+    /// how a restart turned every later grant into `gave-up`.
+    pub fn requeue_unpenalized(&mut self, req: PendingRequest) {
+        self.q.push_front(req);
+    }
+
     /// Peek at the head without removing it.
     pub fn front(&self) -> Option<&PendingRequest> {
         self.q.front()
@@ -227,6 +237,18 @@ mod tests {
         assert_eq!(q.push(req(2)), Err(QueueError::Full { depth: 2 }));
         assert_eq!(q.front().unwrap().ticket_id, Some(0), "the earliest arrival is still first");
         assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn requeue_unpenalized_preserves_the_attempt_count() {
+        let mut q = RequestQueue::new(4);
+        q.push(req(1)).unwrap();
+        let first = q.pop().unwrap();
+        assert_eq!(first.attempts, 0);
+        q.requeue_unpenalized(first);
+        let again = q.pop().unwrap();
+        assert_eq!(again.attempts, 0, "a stale-inventory requeue must not burn an attempt");
+        assert_eq!(q.given_up(), 0);
     }
 
     #[test]

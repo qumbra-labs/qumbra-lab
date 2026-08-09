@@ -732,15 +732,27 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// submits exactly as a wallet on the same host would if the node had a
     /// wallet-facing RPC, which it does not and which this does not add.
     ///
-    /// Honest limitation: `announce_tx` returns nothing, so the reason for a
-    /// refusal is not recoverable here — only whether the transaction is in the
-    /// pool afterwards. Callers that need a reason must pre-check what they can
-    /// (`GrantPlan::is_submittable` re-checks the anchor) and treat `false` as
-    /// "the node did not take it".
+    /// Prefer [`Self::submit_local_tx_named`] when the caller needs the refusal
+    /// reason (lab issue #310): the boolean form discards it.
     pub fn submit_local_tx(&mut self, tx: TxEntry) -> bool {
-        let id = qlab_p2p::codec::tx_id(&tx);
-        self.p2p.announce_tx(tx);
-        qlab_p2p::n1::TxPool::has_tx(self.p2p.node(), &id)
+        self.submit_local_tx_named(tx).is_ok()
+    }
+
+    /// Submit a **locally-originated** transaction and return the **named**
+    /// refusal when the node did not take it (lab issue #310).
+    ///
+    /// Same admission path as [`Self::submit_local_tx`] / peer `ingest_tx` —
+    /// `P2pNode::announce_tx_typed` — only the return shape differs. The reason
+    /// tokens match the deployed `POST /v1/tx` surface (`nullifier-spent`,
+    /// `anchor-not-valid`, …) so an operator reading either log sees one
+    /// vocabulary.
+    pub fn submit_local_tx_named(&mut self, tx: TxEntry) -> Result<(), String> {
+        use qlab_p2p::adapter::TxSubmitRefusal;
+        match self.p2p.announce_tx_typed(tx) {
+            Ok(_) => Ok(()),
+            Err(TxSubmitRefusal::StateLagging) => Err("state-lagging".into()),
+            Err(TxSubmitRefusal::Pool(e)) => Err(mempool_refusal_token(&e).into()),
+        }
     }
 
     /// Tip height reported by the consensus chain view.
@@ -2285,6 +2297,31 @@ fn bdrop_field((total, last_height): (u64, Option<u64>)) -> String {
     match last_height {
         Some(h) => format!("{total}@{h}"),
         None => format!("{total}@-"),
+    }
+}
+
+/// Stable operator-facing token for a mempool refusal (lab issue #310).
+///
+/// Matches the deployed `POST /v1/tx` vocabulary in `discovery_server.rs` so the
+/// faucet log and the wallet-facing surface name the same faults the same way.
+fn mempool_refusal_token(e: &qlab_node::MempoolError) -> &'static str {
+    use qlab_devnet::body::BodyError;
+    use qlab_node::MempoolError;
+    match e {
+        MempoolError::WrongFee { .. } => "wrong-fee",
+        MempoolError::AnchorNotValid => "anchor-not-valid",
+        MempoolError::AlreadySpent { .. } => "nullifier-spent",
+        MempoolError::NullifierRepeatedInTx { .. } => "nullifier-repeated-in-tx",
+        MempoolError::NullifierConflictInPool { .. } => "nullifier-conflict-in-pool",
+        MempoolError::DuplicateTx => "duplicate",
+        MempoolError::DiscoveryInvalid(BodyError::DiscoveryMalformed { .. }) => {
+            "discovery-malformed"
+        }
+        MempoolError::DiscoveryInvalid(BodyError::DiscoveryNotCanonical { .. }) => {
+            "discovery-not-canonical"
+        }
+        MempoolError::DiscoveryInvalid(_) => "discovery-does-not-bind",
+        MempoolError::ProofInvalid => "proof-invalid",
     }
 }
 
