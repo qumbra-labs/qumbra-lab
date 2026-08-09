@@ -39,10 +39,42 @@ use qlab_faucet::ChainView;
 use qlab_node::{MemNode, NodeState};
 use qlab_wallet::address::{Address, Diversifier};
 use qlab_wallet::Wallet;
+// `NodeState::is_spent` is how a refused grant's inputs are diagnosed as stale.
 
 use crate::harvest::{harvest_matured, HarvestReport};
 use crate::state::{classify, Availability, ServiceStatus};
 use crate::view::NodeView;
+
+/// Why a local grant submission was refused — named for the operator log
+/// (lab issue #310 / #241's typed-reason discipline, one layer up).
+///
+/// One token per attempt. The strings match the deployed `POST /v1/tx` surface
+/// where the verdict is the same (`nullifier-spent`, `anchor-not-valid`, …) so an
+/// operator reading either log sees one vocabulary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubmitRefusal {
+    /// The faucet's own pre-submit check failed (anchor lease aged out under the
+    /// proof). Never reached the mempool.
+    AnchorExpired,
+    /// The node refused. `reason` is a stable token, not a `Debug` dump.
+    Node { reason: String },
+}
+
+impl std::fmt::Display for SubmitRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitRefusal::AnchorExpired => write!(f, "anchor-expired"),
+            SubmitRefusal::Node { reason } => write!(f, "{reason}"),
+        }
+    }
+}
+
+/// Result of submitting a proved grant to the co-resident node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LocalSubmit {
+    Accepted,
+    Refused(SubmitRefusal),
+}
 
 /// What the faucet service needs from the node it shares a process with.
 ///
@@ -54,7 +86,9 @@ pub trait FaucetNode {
     /// Live consensus state: the commitment tree, the anchor set, the chain.
     fn chain_state(&self) -> &MemNode;
 
-    /// Submit a proved grant. `true` = the node took it.
+    /// Submit a proved grant. Carries the **named** refusal when the node did not
+    /// take it (lab issue #310) — a boolean was how the operator log only ever
+    /// saw `gave-up` with no per-attempt reason.
     ///
     /// It takes the whole [`GrantPlan`] rather than just `plan.entry` for
     /// history's sake: when this trait was written (issue #123), discovery
@@ -65,7 +99,7 @@ pub trait FaucetNode {
     /// `tx_body_commitment`, so `plan.entry` alone now carries everything the
     /// chain commits to; `plan.discovery` is the same artifacts in their
     /// pre-encoding shape. See the `RunningNode` impl below.
-    fn submit_local(&mut self, plan: &GrantPlan) -> bool;
+    fn submit_local(&mut self, plan: &GrantPlan) -> LocalSubmit;
 
     /// Connected peers — service state, not chain state (a faucet with no peers is a
     /// faucet on its own fork).
@@ -106,13 +140,20 @@ impl<P: qlab_devnet::pow::PowEngine, V: qlab_devnet::body::TxVerifier + Clone> F
     /// is part of `TxEntry::discovery`, committed under `tx_body_commitment`,
     /// carried on the P2P tx wire, persisted in `StoredTx`, and its compact
     /// bundle served by the deployed node's own `/v1/compact` — so
-    /// `submit_local_tx(plan.entry)` submits the consensus transaction *and*
+    /// `announce_tx_typed(plan.entry)` submits the consensus transaction *and*
     /// the recipient's discovery in one object, and a recipient **detects** the
     /// grant from what a deployed node serves
     /// (`qumbra-node/tests/recipient_scan.rs` is the locating property, over a
     /// real socket, for a transaction submitted through this very path).
-    fn submit_local(&mut self, plan: &GrantPlan) -> bool {
-        self.submit_local_tx(plan.entry.clone())
+    ///
+    /// Lab #310: uses the **typed** admission path so a refusal reaches the
+    /// operator log as a named token rather than a bare `false`. Same gates as
+    /// `submit_local_tx` / peer `ingest_tx` — only the return shape differs.
+    fn submit_local(&mut self, plan: &GrantPlan) -> LocalSubmit {
+        match self.submit_local_tx_named(plan.entry.clone()) {
+            Ok(()) => LocalSubmit::Accepted,
+            Err(reason) => LocalSubmit::Refused(SubmitRefusal::Node { reason }),
+        }
     }
     fn peers(&self) -> u64 {
         self.p2p().peers().len() as u64
@@ -221,8 +262,17 @@ pub struct ServeReport {
     pub stalled: Option<String>,
     /// A built grant the node refused; the requester keeps their place.
     pub rejected: Option<u64>,
+    /// Named reason for a refused attempt this tick (lab issue #310) — one token
+    /// for the operator log, never a stack trace. Set whenever `rejected` or
+    /// `gave_up` is set from a submit refusal, and also when stale inputs were
+    /// dropped without burning the attempt budget.
+    pub refusal_reason: Option<String>,
     /// A request abandoned after exhausting its attempts.
     pub gave_up: Option<u64>,
+    /// Stale inventory entries dropped this tick (notes whose nullifiers were
+    /// already on-chain). Non-zero means the restart-inventory bug path fired
+    /// and the service recovered by forgetting rather than re-proving.
+    pub dropped_spent: usize,
 }
 
 /// The faucet service: the gate, the wallet that owns the notes, and the harvest
@@ -384,48 +434,89 @@ impl FaucetService {
             let view = NodeView(node.chain_state());
             plan.is_submittable(&view)
         };
-        let accepted = submittable && node.submit_local(&plan);
+        let outcome = if !submittable {
+            LocalSubmit::Refused(SubmitRefusal::AnchorExpired)
+        } else {
+            node.submit_local(&plan)
+        };
         let tip = node.chain_state().tip_height();
 
-        let mut gate = self.lock_gate();
-        if accepted {
-            let txid = qlab_node::txid(&plan.entry);
-            let value = plan.grant_value;
-            gate.faucet.confirm(plan);
-            gate.order.pop_front();
-            if let Some(r) = receipt {
-                gate.receipts.insert(
-                    r,
-                    RequestState::Granted {
-                        txid_hex: hex32(&txid),
-                        value_bessel: value,
-                        submitted_at_tip: tip,
-                    },
-                );
-            }
-            gate.renumber();
-            report.granted = receipt;
-        } else {
-            // `reject` restores the input notes and gives the requester another
-            // attempt. `false` = the attempt budget is spent.
-            let still_queued = gate.faucet.reject(plan, request);
-            if still_queued {
-                report.rejected = receipt;
-            } else {
+        match outcome {
+            LocalSubmit::Accepted => {
+                let mut gate = self.lock_gate();
+                let txid = qlab_node::txid(&plan.entry);
+                let value = plan.grant_value;
+                gate.faucet.confirm(plan);
                 gate.order.pop_front();
                 if let Some(r) = receipt {
                     gate.receipts.insert(
                         r,
-                        RequestState::GaveUp {
-                            reason: "the node did not admit this grant, and the retry budget is \
-                                     spent"
-                                .to_string(),
+                        RequestState::Granted {
+                            txid_hex: hex32(&txid),
+                            value_bessel: value,
+                            submitted_at_tip: tip,
                         },
                     );
                 }
-                report.gave_up = receipt;
+                gate.renumber();
+                report.granted = receipt;
             }
-            gate.renumber();
+            LocalSubmit::Refused(refusal) => {
+                let reason = refusal.to_string();
+                report.refusal_reason = Some(reason.clone());
+
+                // Lab #310: if any input's nullifier is already on-chain, drop
+                // those notes and requeue without burning the attempt budget.
+                // Restoring them would make the next attempt re-pick the same
+                // pair (select_pair is deterministic) and burn the budget.
+                let spent_cms: Vec<[u64; 4]> = plan
+                    .spent
+                    .iter()
+                    .filter(|n| {
+                        let nf = qlab_note::hash::digest_bytes(&self.wallet.nullifier(&n.rho));
+                        node.chain_state().is_spent(&nf)
+                    })
+                    .map(|n| n.cm)
+                    .collect();
+
+                // Remember the leaves so harvest does not re-fund them (before
+                // taking the gate lock — `self.harvested` and the gate are
+                // disjoint fields, but the lock is on `self.gate`).
+                if !spent_cms.is_empty() {
+                    report.dropped_spent = spent_cms.len();
+                    for cm in &spent_cms {
+                        self.harvested.insert(qlab_note::hash::digest_bytes(cm));
+                    }
+                }
+
+                let mut gate = self.lock_gate();
+                if !spent_cms.is_empty() {
+                    gate.faucet.reject_stale_inputs(plan, request, &spent_cms);
+                    report.rejected = receipt;
+                    // Receipt stays Queued — the attempt was not consumed.
+                } else {
+                    // Ordinary refusal: restore inputs, burn one attempt.
+                    let still_queued = gate.faucet.reject(plan, request);
+                    if still_queued {
+                        report.rejected = receipt;
+                    } else {
+                        gate.order.pop_front();
+                        if let Some(r) = receipt {
+                            gate.receipts.insert(
+                                r,
+                                RequestState::GaveUp {
+                                    reason: format!(
+                                        "the node did not admit this grant ({reason}), and the \
+                                         retry budget is spent"
+                                    ),
+                                },
+                            );
+                        }
+                        report.gave_up = receipt;
+                    }
+                }
+                gate.renumber();
+            }
         }
     }
 

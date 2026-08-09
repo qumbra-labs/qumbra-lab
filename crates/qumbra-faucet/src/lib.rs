@@ -108,6 +108,8 @@ pub mod view;
 pub use config::{ConfigError, FaucetServiceConfig, DEFAULT_LISTEN_ADDR};
 pub use harvest::{harvest_matured, HarvestReport};
 pub use http::{FaucetServer, RequestOutcome};
-pub use service::{FaucetGate, FaucetService, ServeReport};
+pub use service::{
+    FaucetGate, FaucetNode, FaucetService, LocalSubmit, ServeReport, SubmitRefusal,
+};
 pub use state::{Availability, ServiceStatus};
 pub use view::NodeView;
