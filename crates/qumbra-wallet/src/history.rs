@@ -686,7 +686,7 @@ mod tests {
             tx_index: 0,
             recipient_index: 0,
             cm: qlab_note::hash::digest_bytes(&n.commitment()),
-            detected: DetectedNote { index: 0, note: n.clone() },
+            detected: DetectedNote { index: 0, note: *n },
         }
     }
 

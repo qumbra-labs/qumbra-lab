@@ -67,12 +67,15 @@ use qumbra_node::discovery_server::{
     AnchorsView, DiscoveryServer, DiscoveryView, LeavesView, SubmitRequest, TxSubmitOutcome,
 };
 use qumbra_node::verifier::ConsensusVerifier;
+use qumbra_wallet::history::{self, AddressScan, Event, Outgoing};
 use qumbra_wallet::net::{
     submit_tx, HttpAnchorSource, HttpLeafSource, HttpNullifierSource, SubmitClass,
 };
 use qumbra_wallet::send::{build_send, Spendable};
+use qumbra_wallet::sends::SendRecord;
 use qumbra_wallet::spent::{fetch_spent, note_nullifier, subtract_spent};
 use qumbra_wallet::sync::sync_and_select;
+use qumbra_wallet::view::SpentCoverage;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
@@ -446,6 +449,93 @@ fn a_first_spend_travels_the_whole_story_and_the_recipient_detects_it() {
         u128::from(DEFAULT_GRANT_BESSEL) - sender_report.spendable_value(),
         u128::from(AMOUNT + art.fee),
         "…i.e. by exactly (spent note − change)"
+    );
+
+    // ---- 🔴 the LEDGER over the same real spend ---------------------------
+    //
+    // `history` renders exactly what happened here, and the arithmetic it
+    // reconciles is this transaction's own: the inputs are the note the STARK
+    // really proved a spend of, the change is the output the node really
+    // admitted, and the fee is read from the posted table rather than from
+    // anything this test carries. If the ledger and the spend path ever drifted,
+    // this is where it shows — against a real proof rather than a fixture.
+    let ledger_scans = vec![AddressScan {
+        div_index: 0,
+        address_short: sender.address_at_index(0).short().encode(),
+        outcome: Ok(full_rescan),
+    }];
+    let coverage = SpentCoverage::Covered { range: spent_set.covered };
+    let ledger =
+        history::build(&sender, &ledger_scans, Some(&spent_set), &coverage, None, (0, tip.height));
+    assert!(ledger.gaps.is_empty(), "a fully accounted ledger: {:?}", ledger.gaps);
+    assert_eq!(ledger.events.len(), 2, "the grant receipt and the send — the change is folded in");
+    match &ledger.events[0] {
+        Event::Received(r) => {
+            assert_eq!((r.height, r.value), (grant_height, DEFAULT_GRANT_BESSEL))
+        }
+        other => panic!("first event is the grant receipt, got {other:?}"),
+    }
+    let ledger_send = match &ledger.events[1] {
+        Event::Send(s) => s,
+        other => panic!("second event is the send, got {other:?}"),
+    };
+    assert_eq!(ledger_send.height, send_height, "the chain's date is the nullifier's block");
+    assert_eq!(ledger_send.inputs_total, u128::from(DEFAULT_GRANT_BESSEL));
+    assert_eq!(ledger_send.change_total, u128::from(art.change_value));
+    assert_eq!(
+        ledger_send.outgoing,
+        Outgoing::Exact { amount: u128::from(AMOUNT), fee: art.fee },
+        "inputs − change − posted fee == the amount this wallet really sent"
+    );
+    let totals = ledger.totals.clone().expect("an accounted ledger has totals");
+    assert_eq!(
+        totals.total_in - totals.total_out - totals.fees_paid,
+        ledger.current_spendable.expect("quotable"),
+        "in − out − fees == current spendable"
+    );
+    assert_eq!(ledger.current_spendable, Some(u128::from(art.change_value)));
+
+    let chain_only = history::render(&ledger, &node_url);
+    assert!(chain_only.contains("recipient: not recorded"), "{chain_only}");
+
+    // …and with the local record this run really would have written, the one
+    // line the chain can never carry is filled in and labeled — and no figure
+    // above it moves.
+    let record = SendRecord {
+        txid: qlab_node::rpc::tx_id(
+            &art.entry.public.anchor,
+            &art.entry.public.nullifiers,
+            &art.entry.public.commitments,
+            art.entry.public.bucket.logical_actions(),
+            art.entry.public.fee,
+        ),
+        submitted_at_tip: anchor.tip_height,
+        amount: AMOUNT,
+        fee: art.fee,
+        recipient_short: recipient_addr.short().encode(),
+        nullifiers: art.entry.public.nullifiers.clone(),
+    };
+    assert_eq!(
+        qumbra_wallet::sends::hex32(&record.txid),
+        txid_hex,
+        "🔴 the locally derived statement id IS the one the node answered with"
+    );
+    let log = qumbra_wallet::sends::SendLog { records: vec![record] };
+    let labeled = history::build(
+        &sender,
+        &ledger_scans,
+        Some(&spent_set),
+        &coverage,
+        Some(&log),
+        (0, tip.height),
+    );
+    assert_eq!(labeled.totals, ledger.totals, "local memory labels; it moves no chain figure");
+    assert_eq!(labeled.unmatched_records, 0);
+    let labeled_text = history::render(&labeled, &node_url);
+    assert!(
+        labeled_text
+            .contains(&format!("recipient: {} (local record)", recipient_addr.short().encode())),
+        "{labeled_text}"
     );
 
     // The negative, on the same set: the recipient never spent, so nothing of
