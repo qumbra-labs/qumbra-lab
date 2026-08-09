@@ -108,6 +108,16 @@ use crate::telemetry::{LocalCommitment, Telemetry};
 /// `/v1/status` knows the send seams exist without probing for a 404, and the
 /// house rule stays one rule — the node's own surfaces move as one.
 ///
+/// > **🔴 That rationale is SUPERSEDED — ruled at PR #315 (issue #314), 2026-08-10.**
+/// > [`Reader::version`] is an equality check, so a client built after a bump reads
+/// > *nothing* — including `/v1/status` — from a pre-bump node: the "capability
+/// > signal" structurally cannot be delivered by the node that lacks the capability,
+/// > and the probe that works across vintages is the route itself (a 404, surfaced
+/// > as a named UNAVAILABLE — required client behaviour since #312/#315). **The
+/// > rule now: a change to an EXISTING surface's bytes bumps `RPC_VERSION`; a pure
+/// > route addition does not.** `/v1/nullifiers` (#314) is the first route added
+/// > under the ruled form; `0x05` stays as history, not as precedent.
+///
 /// # The reader side of a bump is not free, and #212 is where that was paid
 ///
 /// [`Reader::version`] is an equality check, so **a reader built at `0x05` reads
