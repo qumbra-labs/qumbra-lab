@@ -1938,6 +1938,13 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // (#101), the posted-price fee (§8), in-block nullifier uniqueness, and
             // the STARK proof. No node's chain position changes any of these answers.
             BodyError::MissingCoinbasePayee
+            // Lab #299. `coinbase_exact(header.height)` is a pure function of the
+            // height, evaluated identically on every conforming platform (#303) —
+            // which is exactly what makes this intrinsic rather than positional. A
+            // node's chain position, libc and view of finality are all irrelevant to
+            // the answer, so a peer that relayed such a block either mis-assembled
+            // it or never checked it.
+            | BodyError::WrongScheduledCoinbase { .. }
             | BodyError::WrongFee { .. }
             | BodyError::DoubleSpendInBlock { .. }
             | BodyError::ProofInvalid { .. }

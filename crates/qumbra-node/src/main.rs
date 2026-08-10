@@ -61,6 +61,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("check") => check_config(&args[1..]),
         Some("halt-status") => halt_status(&args[1..]),
         Some("audit") => audit(&args[1..]),
+        Some("emission-pins") => emission_pins(&args[1..]),
         Some("audit-emission") => {
             // Handled in main() for exit-code fidelity; unreachable via dispatch.
             Err("audit-emission is dispatched from main".into())
@@ -90,8 +91,22 @@ fn usage() {
          qumbra-node audit-emission --data-dir DIR [--from H] [--to H]\n      \
                                             walk the persisted main chain; report every height whose\n      \
                                             body.coinbase ≠ emission::coinbase(height) (lab #299 / QUM-82)\n      \
-                                            exit 0 = clean, 1 = ≥1 mismatch, 2 = could not run"
+                                            exit 0 = clean, 1 = ≥1 mismatch, 2 = could not run\n  \
+         qumbra-node emission-pins              print the emission-rule boundary's activation pins as\n      \
+                                            pasteable Rust literals (lab #299/#303 ruling clause 3).\n      \
+                                            🔴 RUN THIS ON A LINUX/glibc HOST — the pins are the\n      \
+                                            HISTORICAL schedule's values and #303 measured that they\n      \
+                                            differ between C libraries."
     );
+}
+
+/// Print the emission-rule boundary's activation pins (lab #299 + #303).
+///
+/// Pure and read-only: no data dir, no network. See
+/// [`qumbra_node::emission_pins`] for why it exists as a command.
+fn emission_pins(_args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    print!("{}", qumbra_node::emission_pins::render(&qumbra_node::emission_pins::compute()));
+    Ok(())
 }
 
 /// Read-only emission localization (lab #299 baton (a) / QUM-82).

@@ -31,7 +31,7 @@ use std::collections::BTreeMap;
 use qlab_cbserver::codec::{read_varint, write_varint, CodecError};
 use qlab_devnet::committee::{Checkpoint, Validator, Vote};
 
-use crate::emission::{coinbase, RewardSplit};
+use crate::emission::{coinbase_exact, coinbase_pre_boundary, RewardSplit, RULE_BOUNDARY_HEIGHT};
 use crate::store::Hash32;
 
 /// On-disk format version for [`FinalizerState`] persistence. Independent of the
@@ -248,10 +248,79 @@ pub fn catch_up_slot(tip: u64, cadence: u64) -> Option<u64> {
 /// Returns the total committee reward accrued up to and including the finalized
 /// head. `None` finalized ⇒ nothing has finalized ⇒ `0` (a stall from genesis
 /// earns the committee nothing, by construction).
+/// The committee's 15 % share of the historical (`f64`) schedule over
+/// `0..=RULE_BOUNDARY_HEIGHT`, walked. Only ever called when the activation pin is
+/// absent — see [`accrual_below_boundary`].
+fn walk_accrual_below_boundary() -> u64 {
+    (0..=RULE_BOUNDARY_HEIGHT)
+        .map(|h| RewardSplit::of(coinbase_pre_boundary(h)).committee)
+        .sum()
+}
+
+/// The grandfathered accrual at the boundary: the pin if activation supplied one,
+/// the historical walk otherwise.
+///
+/// 🔴 **This is the "no node ever re-evaluates the `f64` schedule to agree with
+/// another node" half of #303 ruling clause 3.** A restart recomputes accrual from
+/// genesis; if that recomputation walked the platform-dependent schedule, two nodes
+/// on different C libraries would come back up with different committee ledgers —
+/// the census's restart-accrual point, adopted verbatim. With the pin supplied,
+/// everything below the boundary is one constant and everything above it is exact
+/// integer arithmetic, so the ledger is bit-identical everywhere.
+fn accrual_below_boundary() -> u64 {
+    crate::emission::PINNED_COMMITTEE_ACCRUAL_AT_BOUNDARY.unwrap_or_else(walk_accrual_below_boundary)
+}
+
+/// The committee share of every height in `start..=end`, each height under the
+/// regime that governs it (#299 + #303). Split at the boundary so the pinned
+/// prefix can replace the historical walk wholesale.
+///
+/// # 🔴 Disclosed residual: only the from-genesis prefix is pinnable
+///
+/// The pin is a single total for `0..=RULE_BOUNDARY_HEIGHT`, so it applies when the
+/// span starts at genesis — which is the case the census actually flagged (*"a
+/// restart that recomputes accrual from genesis must retain the historical schedule
+/// before the boundary"*). A span that **starts inside** the grandfathered region
+/// (the incremental form, as finality advances) has to walk the historical schedule
+/// over its own partial prefix, and there is no bounded way to pin every partial
+/// prefix.
+///
+/// Consequence, stated rather than buried: on a **non-glibc** host, summing
+/// incremental spans across the boundary can differ from a from-genesis recompute by
+/// the few bessel between that host's `f64` and the pin. Both figures are stable per
+/// host and neither is consensus — `committee_accrual_finalized` is explicitly
+/// devnet-grade, testnet-tunable and NOT frozen. It disappears entirely above the
+/// boundary, where every height is exact integer arithmetic.
+fn accrual_span(start: u64, end: u64) -> u64 {
+    if end < start {
+        return 0;
+    }
+    if end <= RULE_BOUNDARY_HEIGHT {
+        // Entirely grandfathered: the historical schedule, as recorded.
+        return (start..=end)
+            .map(|h| RewardSplit::of(coinbase_pre_boundary(h)).committee)
+            .sum();
+    }
+    let above: u64 = (start.max(RULE_BOUNDARY_HEIGHT + 1)..=end)
+        .map(|h| RewardSplit::of(coinbase_exact(h)).committee)
+        .sum();
+    if start == 0 {
+        // The whole prefix is covered, so the pin applies as a single constant.
+        accrual_below_boundary() + above
+    } else if start <= RULE_BOUNDARY_HEIGHT {
+        (start..=RULE_BOUNDARY_HEIGHT)
+            .map(|h| RewardSplit::of(coinbase_pre_boundary(h)).committee)
+            .sum::<u64>()
+            + above
+    } else {
+        above
+    }
+}
+
 pub fn committee_accrual_finalized(finalized_height: Option<u64>) -> u64 {
     match finalized_height {
         None => 0,
-        Some(fh) => (0..=fh).map(|h| RewardSplit::of(coinbase(h)).committee).sum(),
+        Some(fh) => accrual_span(0, fh),
     }
 }
 
@@ -262,10 +331,7 @@ pub fn committee_accrual_finalized(finalized_height: Option<u64>) -> u64 {
 /// `prev_final`, the accrual is `0`.
 pub fn committee_accrual_for_span(prev_final: Option<u64>, new_final: u64) -> u64 {
     let start = prev_final.map_or(0, |h| h + 1);
-    if new_final < start {
-        return 0;
-    }
-    (start..=new_final).map(|h| RewardSplit::of(coinbase(h)).committee).sum()
+    accrual_span(start, new_final)
 }
 
 // ---- Checkpoint (de)serialization for the finalizer ledger ------------------
@@ -302,6 +368,7 @@ fn read_hash32(b: &[u8], pos: &mut usize) -> Result<Hash32, CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emission::coinbase;
     use qlab_devnet::committee::devnet_committee;
     use qlab_devnet::finality::{next_checkpoint_height, FinalityTracker};
     use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS as CADENCE;
