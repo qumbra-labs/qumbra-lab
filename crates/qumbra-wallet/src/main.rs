@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
 use qumbra_wallet::store::{seed_from_phrase, reveal_mnemonic, WalletDir};
-use qumbra_wallet::view::{self, DivScan};
+use qumbra_wallet::view;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -86,14 +86,6 @@ fn has_flag(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
-/// The union of the height ranges several scans' outputs came from — the range
-/// the nullifier stream must cover before any of their figures may be quoted
-/// (lab issue #314). `None` when no scan saw a block at all.
-fn widest_range(
-    ranges: impl IntoIterator<Item = Option<(u64, u64)>>,
-) -> Option<(u64, u64)> {
-    ranges.into_iter().flatten().reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
-}
 
 fn dir_of(args: &[String]) -> Result<PathBuf, Box<dyn Error>> {
     Ok(PathBuf::from(flag(args, "--dir").ok_or("--dir DIR is required")?))
@@ -306,7 +298,7 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
     //
     // And an UNAVAILABLE stream refuses the whole send rather than guessing: a
     // spend built on "I could not check" is exactly the wasted proof above.
-    let outputs = widest_range(scanned.iter().map(|(_, o)| o.stats.compact_range_served));
+    let outputs = qumbra_wallet::scan::widest_range(scanned.iter().map(|(_, o)| o.stats.compact_range_served));
     let spent_set = fetch_spent(&HttpNullifierSource::new(url), 0, scan_to)
         .map_err(|e| format!("{e} — refusing to select inputs this wallet may already have spent"))?;
     spent_set
@@ -502,70 +494,6 @@ fn backup(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Everything both `scan` and `history` read off the chain: one light-client
-/// scan per allocated address, then the nullifier stream over the range those
-/// outputs actually came from.
-struct Gathered {
-    outcomes: Vec<(u64, String, Result<qlab_cbserver::client::ScanOutcome, String>)>,
-    coverage: qumbra_wallet::view::SpentCoverage,
-    set: Option<qumbra_wallet::spent::SpentSet>,
-}
-
-/// 🔴 **One gatherer, two commands.** `history` is a different rendering of
-/// exactly the facts `scan` quotes its balance from, so it must not be a second
-/// path to them — a ledger that could disagree with the balance printed beside
-/// it is worse than no ledger. The `--to`/`--from` semantics, the never-started
-/// verdict, the coverage rule and the fetch order are therefore shared here
-/// rather than reimplemented per command.
-///
-/// The nullifier stream is fetched **after** every scan, deliberately: the chain
-/// only grows, so a node that advanced mid-scan gives the second fetch MORE
-/// coverage than the outputs need, never less. Fetching it first would turn an
-/// ordinary block arrival into a spurious `UNAVAILABLE`.
-fn gather(w: &WalletDir, url: &str, from: u64, to: u64) -> Gathered {
-    use qlab_cbserver::client::{light_client_scan_with, ScanConfig, ScanOutcome};
-    use qumbra_wallet::net::HttpNullifierSource;
-    use qumbra_wallet::spent::fetch_spent;
-    use qumbra_wallet::view::SpentCoverage;
-    use rand::{rngs::StdRng, Rng, SeedableRng};
-
-    let wallet = w.wallet();
-    // Seed the decoy rng from the OS CSPRNG (StdRng has no direct from-OS
-    // constructor at this rand pin; the 32-byte seed carries the entropy).
-    let mut seed_bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut seed_bytes);
-    let mut rng = StdRng::from_seed(seed_bytes);
-
-    // ---- 1. The outputs, per allocated address. ----------------------------
-    let mut outcomes: Vec<(u64, String, Result<ScanOutcome, String>)> = Vec::new();
-    for &idx in &w.allocated {
-        let d = wallet.diversifier_at_index(idx);
-        let kp = wallet.diversified_keypair(&d);
-        let short = wallet.address_at_index(idx).short().encode();
-        // `Err` here means the scan NEVER STARTED for this key (compact fetch or
-        // decode failed) — render the named cannot-know verdict rather than
-        // aborting the whole report or, worse, printing a zero.
-        // The fetch is this crate's (`net::scan_fetch`), so the scan reaches an
-        // https edge; the scan FLOW is still qlab-cbserver's, unmodified.
-        let mut fetch = qumbra_wallet::net::scan_fetch(url);
-        let got = light_client_scan_with(&mut fetch, &kp.dk, from, to, ScanConfig::default(), &mut rng)
-            .map_err(|e| e.to_string());
-        outcomes.push((idx, short, got));
-    }
-
-    // ---- 2. The spends, over the range the outputs actually reached. -------
-    let outputs = widest_range(
-        outcomes.iter().filter_map(|(_, _, o)| o.as_ref().ok()).map(|o| o.stats.compact_range_served),
-    );
-    let (coverage, set) = match fetch_spent(&HttpNullifierSource::new(url), from, to) {
-        Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),
-        Ok(set) => match set.covers_outputs(outputs) {
-            Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),
-            Ok(()) => (SpentCoverage::Covered { range: set.covered }, Some(set)),
-        },
-    };
-    Gathered { outcomes, coverage, set }
-}
 
 /// `history` — this wallet's own chronological ledger (the wallet-side
 /// transaction view). Same two streams as `scan`, same honesty vocabulary; what
@@ -609,7 +537,8 @@ fn history(args: &[String]) -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let Gathered { outcomes, coverage, set } = gather(&w, url, from, to);
+    let qumbra_wallet::scan::Gathered { outcomes, coverage, set } =
+        qumbra_wallet::scan::gather(&w, url, from, to);
     let scans: Vec<AddressScan> = outcomes
         .into_iter()
         .map(|(div_index, address_short, outcome)| AddressScan { div_index, address_short, outcome })
@@ -629,8 +558,6 @@ fn history(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// coverage than the outputs need, never less. Fetching it first would turn an
 /// ordinary block arrival into a spurious `UNAVAILABLE`.
 fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
-    use qumbra_wallet::spent::subtract_spent;
-
     let dir = dir_of(args)?;
     let url = flag(args, "--url")
         .ok_or("scan requires --url http://host:port or --url https://host[:port]")?;
@@ -640,29 +567,7 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
     let from: u64 = flag(args, "--from").unwrap_or("0").parse()?;
 
     let w = WalletDir::open(&dir)?;
-    let wallet = w.wallet();
-    let Gathered { outcomes, coverage, set } = gather(&w, url, from, to);
-
-    // The report. A figure exists only where both halves do.
-    let scans: Vec<DivScan> = outcomes
-        .into_iter()
-        .map(|(idx, short, got)| match (got, &set) {
-            (Ok(outcome), Some(set)) => {
-                let report = subtract_spent(&wallet, idx, &outcome.notes, set);
-                DivScan::from_subtracted(idx, short, &outcome, &report)
-            }
-            (Ok(outcome), None) => DivScan::unquotable(idx, short, outcome.completeness()),
-            (Err(e), _) => {
-                let mut d = DivScan::unquotable(
-                    idx,
-                    short,
-                    qlab_cbserver::client::Completeness::Complete,
-                );
-                d.never_started = Some(e);
-                d
-            }
-        })
-        .collect();
+    let (scans, coverage) = qumbra_wallet::scan::scan_report(&w, url, from, to);
     print!("{}", view::render(&scans, (from, to), url, &coverage));
     Ok(())
 }

@@ -58,6 +58,7 @@
 pub mod contacts;
 pub mod history;
 pub mod net;
+pub mod scan;
 pub mod send;
 pub mod sends;
 pub mod spent;
