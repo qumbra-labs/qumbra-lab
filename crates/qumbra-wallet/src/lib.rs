@@ -61,6 +61,7 @@ pub mod net;
 pub mod scan;
 pub mod send;
 pub mod sends;
+pub mod spend;
 pub mod spent;
 pub mod store;
 pub mod sync;

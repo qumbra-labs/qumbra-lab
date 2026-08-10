@@ -223,16 +223,10 @@ fn miner_rkm(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// Refuses on partial scan coverage — spending on incomplete knowledge risks
 /// double-claimed nullifiers (#244's discipline, untouched).
 fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
-    use qlab_cbserver::client::{light_client_scan_with, Completeness, ScanConfig, ScanOutcome};
-    use qumbra_wallet::net::{self, HttpAnchorSource, HttpLeafSource, HttpNullifierSource, SubmitClass};
-    use qumbra_wallet::send::{build_send, os_rng, Spendable};
-    use qumbra_wallet::spent::{fetch_spent, subtract_spent};
-    use qumbra_wallet::sync::{hex32, sync_and_select};
+    use qumbra_wallet::spend::{execute, SendError, SendRequest, SendStep};
 
     let dir = dir_of(args)?;
     let url = flag(args, "--url").ok_or("send requires --url (compact/scan endpoint)")?;
-    // One host normally serves both; keeping them separable costs a default and
-    // buys the ability to scan one node and submit to another.
     let node_url = flag(args, "--node").unwrap_or(url);
     let scan_to: u64 = flag(args, "--scan-to").ok_or("send requires --scan-to HEIGHT")?.parse()?;
     let to = flag(args, "--to");
@@ -259,224 +253,116 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
         ),
     };
 
-    if let Some(name) = &contact_name {
-        eprintln!("→ {name} ({})", recipient.short().encode());
-    }
-
-    let w = WalletDir::open(&dir)?;
-    let wallet = w.wallet();
-    let mut rng = os_rng();
-
-    // Gather spendables — and REFUSE on any non-Complete verdict: a spend
-    // built on partial knowledge can double-claim a nullifier.
-    let mut scanned: Vec<(u64, ScanOutcome)> = Vec::new();
-    for &idx in &w.allocated {
-        let d = wallet.diversifier_at_index(idx);
-        let kp = wallet.diversified_keypair(&d);
-        let mut fetch = net::scan_fetch(url);
-        let outcome =
-            light_client_scan_with(&mut fetch, &kp.dk, 0, scan_to, ScanConfig::default(), &mut rng)
-                .map_err(|e| format!("scan never started for index {idx}: {e}"))?;
-        match outcome.completeness() {
-            Completeness::Complete | Completeness::Shadowed { .. } => {}
-            other => {
-                return Err(format!(
-                    "index {idx} scanned {other:?} — refusing to build a spend on partial                      knowledge (a double-claimed nullifier could be among the unread outputs)"
-                )
-                .into())
+    // The sink. Progress belongs on stderr so a piped stdout stays the result;
+    // the flow itself is `qumbra_wallet::spend`, shared with every other surface.
+    let mut sink = |step: SendStep| match step {
+        SendStep::Resolved { recipient_short, contact } => {
+            if let Some(name) = contact {
+                eprintln!("→ {name} ({recipient_short})");
             }
         }
-        scanned.push((idx, outcome));
-    }
-
-    // 🔴 Lab issue #314 scope item 5: **selection skips what the chain already
-    // spent.** Without this the wallet would happily pick a note it spent an
-    // hour ago, pay ~3 s and ~12 GB to prove a statement about it, and be
-    // refused `nullifier-spent` at the node — the #310 ghost-note failure shape,
-    // relocated into every user's wallet. Refusing here, before the prove, on
-    // the same subtraction the balance uses.
-    //
-    // And an UNAVAILABLE stream refuses the whole send rather than guessing: a
-    // spend built on "I could not check" is exactly the wasted proof above.
-    let outputs = qumbra_wallet::scan::widest_range(scanned.iter().map(|(_, o)| o.stats.compact_range_served));
-    let spent_set = fetch_spent(&HttpNullifierSource::new(url), 0, scan_to)
-        .map_err(|e| format!("{e} — refusing to select inputs this wallet may already have spent"))?;
-    spent_set
-        .covers_outputs(outputs)
-        .map_err(|e| format!("{e} — refusing to select inputs this wallet may already have spent"))?;
-
-    let mut spendables: Vec<Spendable> = Vec::new();
-    let mut skipped = 0usize;
-    for (idx, outcome) in &scanned {
-        let report = subtract_spent(&wallet, *idx, &outcome.notes, &spent_set);
-        skipped += report.spent.len();
-        for ln in &report.spendable {
-            spendables.push(Spendable {
-                div_index: *idx,
-                value: ln.detected.note.value,
-                rho: ln.detected.note.rho,
-                rseed: ln.detected.note.rseed,
-            });
-        }
-    }
-    if skipped > 0 {
-        eprintln!(
-            "note: {skipped} already-spent note(s) skipped by input selection (their nullifiers \
-             are on the chain)"
-        );
-    }
-
-    if spendables.is_empty() {
-        return Err(format!(
-            "no spendable notes: the scan of 0..={scan_to} found nothing this wallet can spend \
-             ({skipped} note(s) it found are already spent). If you expect a coinbase, it is not \
-             spendable until it matures (frozen §2, COINBASE_MATURITY_BLOCKS in qlab-node); if \
-             you expect a received note, check that its address index is allocated here \
-             (`address --new`)."
-        )
-        .into());
-    }
-
-    // The witness source. The leaf stream reconstructs the tree locally and the
-    // served anchor set says which leaf count may legally be built at — both
-    // refuse by name, and neither is skippable (see `sync`'s module docs).
-    let (synced, anchor) =
-        sync_and_select(&dir, &HttpLeafSource::new(node_url), &HttpAnchorSource::new(node_url))?;
-    eprintln!(
-        "tree: {} leaves held ({} new); anchor at {} leaves, root {} (node tip {}, finalized {})",
-        synced.count,
-        synced.fetched,
-        anchor.count,
-        hex32(&anchor.root),
-        anchor.tip_height,
-        anchor.finalized_height.map(|h| h.to_string()).unwrap_or_else(|| "none".into()),
-    );
-    if anchor.leaves_behind_local > 0 {
-        eprintln!(
-            "  (the anchor is {} leaves behind what this node served — a witness must be built \
-             against a FINALIZED root, so this is normal, not a lag)",
-            anchor.leaves_behind_local
-        );
-    }
-
-    eprintln!("proving (real STARK — this takes seconds and gigabytes)…");
-    let art =
-        build_send(&wallet, &spendables, &recipient, amount, &synced.tree, anchor.count, &mut rng)?;
-    println!(
-        "built: {} bessel to {}, fee {}, change {} — proved in {:.2} s{}",
-        amount,
-        recipient.short().encode(),
-        art.fee,
-        art.change_value,
-        art.prove_secs,
-        if art.used_dummy { " (single real note + dummy slot)" } else { "" }
-    );
-
-    // Written BEFORE submitting when asked for: a proof that cost gigabytes to
-    // make should not be lost to a failed socket.
-    if let Some(path) = out {
-        std::fs::write(path, &art.wire_bytes)?;
-        println!("wire: {} bytes → {path}", art.wire_bytes.len());
-    }
-
-    if no_submit {
-        println!("not submitted (--no-submit).");
-        if out.is_none() {
+        SendStep::Selected { skipped_spent, .. } if skipped_spent > 0 => eprintln!(
+            "note: {skipped_spent} already-spent note(s) skipped by input selection (their \
+             nullifiers are on the chain)"
+        ),
+        SendStep::Selected { .. } => {}
+        SendStep::Tree {
+            held, fetched, anchor_count, anchor_root, node_tip, finalized, anchor_behind,
+        } => {
             eprintln!(
-                "warning: --no-submit without --out discarded this proof — nothing was written \
-                 and nothing was sent."
+                "tree: {held} leaves held ({fetched} new); anchor at {anchor_count} leaves, root \
+                 {anchor_root} (node tip {node_tip}, finalized {})",
+                finalized.map(|h| h.to_string()).unwrap_or_else(|| "none".into())
             );
-        }
-        eprintln!(
-            "note: no {} record was written — this send was not submitted, and the local record \
-             exists to name the recipient of a send that is actually on its way.",
-            qumbra_wallet::sends::SENDS_FILE
-        );
-        return Ok(());
-    }
-
-    // 🔴 The local record, written BEFORE the socket.
-    //
-    // The chain will carry every other fact about this transaction — its
-    // nullifiers, its outputs, its fee, the height it lands at — and it can
-    // never carry the recipient, because the outputs are addressed to keys this
-    // wallet does not hold. So the recipient is recorded here or it is lost, and
-    // "here" has to be before the POST: a submission whose answer never arrives
-    // is exactly the case where a user needs to know what they sent.
-    //
-    // The statement tx id is derived locally over the declared public surface —
-    // the same derivation the node runs, cross-checked against its answer below.
-    //
-    // `submitted_at_tip` is the node's TIP when this was built — not the height
-    // it will be mined at, which nobody knows yet. `history` joins on the
-    // declared nullifiers, never on this.
-    let record = qumbra_wallet::sends::SendRecord::declared(
-        &art.entry.public,
-        anchor.tip_height,
-        amount,
-        recipient.short().encode(),
-    );
-    let recorded = qumbra_wallet::sends::SendLog::append(&dir, &record);
-    if let Err(e) = &recorded {
-        // Enrichment must never block a spend: the money matters more than the
-        // memo. But losing it silently is how a ledger quietly starts lying.
-        eprintln!(
-            "warning: could not write the local send record ({e}). The transaction below is \
-             unaffected, but `history` will show this send with `recipient: not recorded`."
-        );
-    }
-
-    // The node's answer is printed VERBATIM: its first token is the
-    // machine-usable one, and the refusal vocabulary is the node's to own.
-    let answer = net::submit_tx(node_url, &art.wire_bytes).map_err(|e| {
-        format!(
-            "POST /v1/tx never completed ({e}). This is NOT a refusal — the transaction may have \
-             landed. Resubmit the same bytes{}: an already-pending transaction answers \
-             `duplicate`, which is safe.",
-            match out {
-                Some(p) => format!(" (saved at {p})"),
-                None => " (re-run with --out FILE to keep them next time)".to_string(),
+            if anchor_behind > 0 {
+                eprintln!(
+                    "  (the anchor is {anchor_behind} leaves behind what this node served — a \
+                     witness must be built against a FINALIZED root, so this is normal, not a lag)"
+                );
             }
-        )
-    })?;
-    println!("node [{}]: {}", answer.status, answer.body);
-
-    // The cross-check the local derivation earns: if the node names a different
-    // statement id than this wallet derived, the record just written points at
-    // a transaction nobody else agrees exists — say so rather than let
-    // `history` join it later as if it were sound.
-    if let Some(theirs) = answer.txid_hex() {
-        let ours = qumbra_wallet::sends::hex32(&record.txid);
-        if theirs != ours {
-            eprintln!(
-                "warning: this wallet derived statement id {ours} and the node answered {theirs}. \
-                 The local send record carries the former; `history` joins on the declared \
-                 nullifiers, not on the id, so the ledger is unaffected — but the two derivations \
-                 disagreeing is worth reporting."
-            );
         }
-    }
-    if recorded.is_ok() {
-        eprintln!(
+        SendStep::Proving => eprintln!("proving (real STARK — this takes seconds and gigabytes)…"),
+        SendStep::Built { amount, fee, change, prove_secs, used_dummy } => println!(
+            "built: {amount} bessel, fee {fee}, change {change} — proved in {prove_secs:.2} s{}",
+            if used_dummy { " (single real note + dummy slot)" } else { "" }
+        ),
+        SendStep::Recorded => eprintln!(
             "note: the recipient was recorded locally in {} (0600). It is NOT on the chain and a \
              restore from your mnemonic will not bring it back.",
             qumbra_wallet::sends::SENDS_FILE
-        );
-    }
+        ),
+        SendStep::Warning(w) => eprintln!("warning: {w}"),
+        SendStep::Submitting => {}
+        SendStep::Answered { status, body } => println!("node [{status}]: {body}"),
+    };
 
-    match answer.class() {
-        SubmitClass::Accepted | SubmitClass::Duplicate => Ok(()),
-        SubmitClass::Unavailable => Err(format!(
-            "the node did not judge this transaction — that is its state, not your \
-             transaction's. Retry{}; the transaction itself is unchanged.",
-            match out {
-                Some(p) => format!(" with the saved bytes at {p}"),
-                None => String::new(),
+    let req = SendRequest {
+        dir: &dir,
+        url,
+        node_url,
+        recipient: &recipient,
+        contact_name: contact_name.as_deref(),
+        amount,
+        scan_to,
+        no_submit,
+    };
+
+    // A proof that cost gigabytes should not be lost to a failed socket — so the
+    // bytes are written on EVERY path that has them, success or not.
+    let keep = |bytes: &[u8]| -> Result<(), Box<dyn Error>> {
+        if let Some(path) = out {
+            std::fs::write(path, bytes)?;
+            println!("wire: {} bytes → {path}", bytes.len());
+        }
+        Ok(())
+    };
+
+    match execute(&req, &mut sink) {
+        Ok(o) => {
+            keep(&o.wire_bytes)?;
+            if o.answer.is_none() {
+                println!("not submitted (--no-submit).");
+                if out.is_none() {
+                    eprintln!(
+                        "warning: --no-submit without --out discarded this proof — nothing was \
+                         written and nothing was sent."
+                    );
+                }
+                eprintln!(
+                    "note: no {} record was written — this send was not submitted, and the local \
+                     record exists to name the recipient of a send that is actually on its way.",
+                    qumbra_wallet::sends::SENDS_FILE
+                );
             }
-        )
-        .into()),
-        SubmitClass::Refused | SubmitClass::Unknown => {
-            Err(format!("the node refused this transaction: {}", answer.body).into())
+            Ok(())
+        }
+        Err(SendError::Refused(why)) => Err(why.into()),
+        Err(SendError::Incomplete { why, wire_bytes }) => {
+            keep(&wire_bytes)?;
+            Err(format!(
+                "{why}{}",
+                match out {
+                    Some(p) => format!(" They are saved at {p}."),
+                    None => " Re-run with --out FILE to keep them next time.".to_string(),
+                }
+            )
+            .into())
+        }
+        Err(SendError::Answered { class, body, wire_bytes, .. }) => {
+            keep(&wire_bytes)?;
+            use qumbra_wallet::net::SubmitClass;
+            Err(match class {
+                SubmitClass::Unavailable => format!(
+                    "the node did not judge this transaction — that is its state, not your \
+                     transaction's. Retry{}; the transaction itself is unchanged.",
+                    match out {
+                        Some(p) => format!(" with the saved bytes at {p}"),
+                        None => String::new(),
+                    }
+                ),
+                _ => format!("the node refused this transaction: {body}"),
+            }
+            .into())
         }
     }
 }
