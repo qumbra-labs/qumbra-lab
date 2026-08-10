@@ -71,6 +71,41 @@ char *qmb_wallet_scan_report(const qmb_wallet_t *w, const char *base_url,
                              const uint64_t *indices, size_t n_indices,
                              const uint8_t *rng_seed32);
 
+/* Fetch one scan path — the transport belongs to the SHELL.
+ *
+ * The public edge is https-only and the Rust socket path above is
+ * plaintext-only on purpose (lab #297: TLS in qlab-cbserver would link rustls
+ * into the consensus node). So instead of giving this library its own TLS, the
+ * shell lends its own: URLSession on iOS brings https and App Transport
+ * Security from the platform — the same trade as entropy, which the platform
+ * also supplies rather than this library inventing it.
+ *
+ * Return 0 on success with the body in *out_body / *out_len. OWNERSHIP MOVES
+ * to this library, which releases both buffers with free() — so they must come
+ * from malloc(). This is the one place a pointer crossing INTO this library is
+ * owned by it; everything returned OUT is still freed with qmb_string_free.
+ *
+ * Return nonzero on failure, optionally with a NUL-terminated reason in
+ * *out_err under the same malloc/free contract. A failed path becomes one
+ * error inside the scan, which the report renders as UNAVAILABLE — never as a
+ * zero balance. */
+typedef int32_t (*qmb_fetch_fn)(void *ctx, const char *path_and_query,
+                               uint8_t **out_body, size_t *out_len,
+                               char **out_err);
+
+/* The same scan over a caller-supplied transport. source_label is what the
+ * report NAMES as its source: this library no longer knows the transport, so
+ * it cannot infer where the numbers came from, and a report must say. Both
+ * this and qmb_wallet_scan_report route into one scan flow, so what counts as
+ * detected/opened/unopened cannot drift between them. Blocking — call off the
+ * main thread. */
+char *qmb_wallet_scan_report_over_fetch(const qmb_wallet_t *w,
+                                        const char *source_label,
+                                        uint64_t from, uint64_t to,
+                                        const uint64_t *indices, size_t n_indices,
+                                        const uint8_t *rng_seed32,
+                                        qmb_fetch_fn fetch, void *fetch_ctx);
+
 #ifdef __cplusplus
 }
 #endif
