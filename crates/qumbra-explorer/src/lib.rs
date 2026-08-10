@@ -18,13 +18,32 @@
 //! root beside these two routes, same origin, no CORS. The decision and its rejected
 //! alternatives are in `qumbra-design/t1-explorer-split-decision.md`.
 //!
+//! # The transaction-EXISTENCE view (issue #326), and its exact size
+//!
+//! Since `t1-explorer-tx-view-decision.md` (STAMPED 2026-08-10) this binary also
+//! serves [`txlist`] at `GET /v1/txlist?from=&to=`: per block-with-transactions its
+//! height and transaction count, and per transaction its id, wire bytes, posted
+//! fee, nullifier count and commitment count. That is D1, and it is not a subset of
+//! something larger — it is everything a shielded transaction publishes.
+//!
+//! 🔴 **There is no lookup by transaction id, and that is D2.** The list is
+//! bulk-served over ranges and a pasted id is matched **client-side over fetched
+//! pages** ([`txlist::match_txid`]); a `/tx/<id>` query would tell this server which
+//! transaction the asker cares about, which is the correlation surface the
+//! nullifier-membership query was refused for at PR #315 decision 3. One rule, both
+//! surfaces. [`http`] has no arm that could match a by-id form, so the refusal is
+//! structural and its 404 is test-locked.
+//!
+//! D3's boundary sentence rides in the document ([`txlist::BOUNDARY_SENTENCE`]) so
+//! the page renders it rather than owning a copy that could drift.
+//!
 //! # What this is deliberately NOT
 //!
-//! - **Not a transaction explorer.** No tx lookup, no address lookup, no note
-//!   browsing, no balance queries. Single global shielded pool; a chain-health
-//!   surface is the whole scope, and [`http`] answers anything else with a typed
-//!   404 — including everything `/v1/tx…`-shaped, which is now *adjacent* to a real
-//!   `/v1` route and therefore tested rather than assumed.
+//! - **Still not an Etherscan.** No address lookup, no note browsing, no balance
+//!   queries, no linkage view, no per-address anything — and not as policy: the
+//!   chain carries none of it. [`http`] answers everything else with a typed 404,
+//!   including everything `/v1/tx…`-shaped, which is now *adjacent* to two real
+//!   `/v1` routes and therefore tested rather than assumed.
 //! - **Not a window into the fleet.** §6.2 decided the fleet's telemetry
 //!   endpoints stay private. This binary learns chain state **over P2P like any
 //!   peer** and renders its own node's view; it never polls another node's
@@ -75,3 +94,4 @@
 pub mod config;
 pub mod http;
 pub mod json;
+pub mod txlist;
