@@ -29,7 +29,15 @@ COPY . .
 
 # Build ONLY the node binary in release — the soak needs nothing else, and the
 # heavy m4* bench crates are irrelevant here. --locked: honor the pinned lockfile.
-RUN cargo build --release --locked -p qumbra-node \
+#
+# NODE_FEATURES selects the emission-boundary variant of the MAIN binary
+# (lab #299/#303, docs/i299-emission-boundary-activation.md §3):
+#   empty (default)        → ARMED — halts at 18000 (the announcement image)
+#   rule-boundary-resume   → the post-boundary release that resumes past 18000
+# Two images from one Dockerfile, the main binary being the right variant, so a
+# fleet roll is the usual image-digest swap. The drill binaries below are unaffected.
+ARG NODE_FEATURES=""
+RUN cargo build --release --locked -p qumbra-node ${NODE_FEATURES:+--features "$NODE_FEATURES"} \
     && cp target/release/qumbra-node /usr/local/bin/qumbra-node
 
 # The T1 faucet listener (issue #123). It is a LEAF crate over the same dependency
