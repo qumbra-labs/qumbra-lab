@@ -107,6 +107,92 @@ fn address_new_allocates_and_the_set_survives_via_the_process() {
     assert!(list.contains("[0]") && list.contains("[1]"), "{list}");
 }
 
+#[test]
+fn contact_commands_and_send_to_contact_keep_the_fingerprint_visible() {
+    use qumbra_wallet::contacts::{ContactBook, CONTACTS_FILE};
+
+    let dir = tmp("contacts");
+    let d = dir.to_str().unwrap();
+    let (_, err, ok) = run(&["keygen", "--dir", d], None);
+    assert!(ok, "{err}");
+    let address = WalletDir::open(&dir).unwrap().wallet().address_at_index(0);
+    let full = address.encode();
+    let short = address.short().encode();
+
+    let (added, err, ok) = run(&["contact", "add", "Alice Smith", &full, "--dir", d], None);
+    assert!(ok, "{err}");
+    assert!(added.contains(&format!("Alice Smith → {short} (short)")), "{added}");
+    assert!(
+        added.contains("confirm this fingerprint with the payee out of band"),
+        "{added}"
+    );
+    assert!(added.contains("a saved name is not a verified one"), "{added}");
+    assert!(!added.contains(&full), "the 2 KB address is not repeated after add");
+
+    let (listed, err, ok) = run(&["contact", "list", "--dir", d], None);
+    assert!(ok, "{err}");
+    assert_eq!(listed.trim(), format!("Alice Smith → {short} (short)"));
+    assert!(dir.join(CONTACTS_FILE).exists());
+
+    let (_, duplicate, ok) =
+        run(&["contact", "add", "Alice Smith", &full, "--dir", d], None);
+    assert!(!ok);
+    assert!(duplicate.contains("contact name `Alice Smith` already exists"), "{duplicate}");
+
+    // The short-address HRP is deliberately not accepted where the full
+    // receiving address is required; this reaches Address::decode in the real
+    // process rather than a second parser.
+    let (_, wrong_hrp, ok) = run(&["contact", "add", "short", &short, "--dir", d], None);
+    assert!(!ok);
+    assert!(wrong_hrp.contains("wrong HRP"), "{wrong_hrp}");
+
+    let dead = "http://127.0.0.1:1";
+    let (_, contact_send, ok) = run(
+        &[
+            "send", "--dir", d, "--url", dead, "--scan-to", "1", "--to-contact",
+            "Alice Smith", "--amount", "1",
+        ],
+        None,
+    );
+    assert!(!ok);
+    assert!(contact_send.contains(&format!("→ Alice Smith ({short})")), "{contact_send}");
+    assert!(contact_send.contains("scan never started"), "{contact_send}");
+    assert!(!contact_send.contains("proving"), "{contact_send}");
+
+    let (_, both, ok) = run(
+        &[
+            "send", "--dir", d, "--url", dead, "--scan-to", "1", "--to", &full,
+            "--to-contact", "Alice Smith", "--amount", "1",
+        ],
+        None,
+    );
+    assert!(!ok);
+    assert!(both.contains("exactly one"), "{both}");
+    assert!(both.contains("both were provided"), "{both}");
+
+    let (_, missing, ok) = run(
+        &["send", "--dir", d, "--url", dead, "--scan-to", "1", "--amount", "1"],
+        None,
+    );
+    assert!(!ok);
+    assert!(missing.contains("exactly one"), "{missing}");
+
+    let (_, unknown, ok) = run(
+        &[
+            "send", "--dir", d, "--url", dead, "--scan-to", "1", "--to-contact", "mallory",
+            "--amount", "1",
+        ],
+        None,
+    );
+    assert!(!ok);
+    assert!(unknown.contains("unknown contact `mallory`"), "{unknown}");
+
+    let (removed, err, ok) = run(&["contact", "remove", "Alice Smith", "--dir", d], None);
+    assert!(ok, "{err}");
+    assert!(removed.contains("removed contact `Alice Smith`"), "{removed}");
+    assert!(ContactBook::load(&dir).unwrap().entries().is_empty());
+}
+
 /// 🔴 **The demonstration PR #244 owed and could not give: the wallet a user
 /// actually runs, seeing its own money over HTTP.**
 ///
