@@ -105,10 +105,21 @@ pub fn table(readings: &[NodeReading]) -> String {
 }
 
 /// Whether any reachable node with complete state coverage reports an exact
-/// scheduled-issuance mismatch.
+/// scheduled-issuance mismatch **that is not a scar this chain is known to carry**.
 ///
 /// A partial state ledger is unavailable, not divergent: the operator may infer
 /// neither supply agreement nor a supply violation until it catches fork choice.
+///
+/// 🔴 **The scar exclusion is not leniency** (#299 ruling item 2). The sequencing
+/// ruling grandfathered height 1377 and accepted that epoch 1 reads DIVERGENT −4114
+/// on this chain **forever**; it also named the price — *"a tool built to catch
+/// supply violations must not train its readers to ignore red."* If this predicate
+/// escalated on the scar, every operator view on the live net would carry a standing
+/// 🔴 and the first real violation would arrive looking exactly like the noise the
+/// operator had learned to scroll past. The scar keeps its row and its number (see
+/// [`supply`]); what it loses is the escalation. The list is
+/// `qlab_node::supply::KNOWN_SUPPLY_SCARS`, matched on epoch, both endpoints and the
+/// exact divergence — one bessel either side of it still alarms.
 pub fn supply_diverged(readings: &[NodeReading]) -> bool {
     readings.iter().any(|reading| {
         reading
@@ -116,8 +127,19 @@ pub fn supply_diverged(readings: &[NodeReading]) -> bool {
             .telemetry()
             .is_some_and(|t| {
                 t.supply_coverage() == SupplyCoverage::Complete
-                    && t.supply.iter().any(|row| !row.agrees())
+                    && t.supply.iter().any(|row| row.is_unexplained_divergence())
             })
+    })
+}
+
+/// Whether any reachable node reports a row that IS a known scar — so the view can
+/// name it once, with its citation, instead of leaving an unexplained red number.
+fn known_scar_seen(readings: &[NodeReading]) -> Option<&'static qlab_node::supply::KnownScar> {
+    readings.iter().find_map(|reading| {
+        reading
+            .reading
+            .telemetry()
+            .and_then(|t| t.supply.iter().find_map(|row| row.known_scar()))
     })
 }
 
@@ -177,7 +199,15 @@ pub fn supply(readings: &[NodeReading]) -> String {
                 row.divergence_bessel(),
                 relative,
                 row.fees,
-                if row.agrees() { "AGREED" } else { "DIVERGED" },
+                if row.agrees() {
+                    "AGREED"
+                } else if row.known_scar().is_some() {
+                    // Still red, still carrying its number — but named, so it is not
+                    // one more unexplained DIVERGED for the operator to triage.
+                    "KNOWN-SCAR"
+                } else {
+                    "DIVERGED"
+                },
             ));
         }
     }
@@ -188,6 +218,16 @@ pub fn supply(readings: &[NodeReading]) -> String {
         out.push_str(
             "An unavailable supply view means the state ledger is behind or otherwise disagrees with fork choice; conclude neither supply agreement nor a supply violation until the tips match.\n",
         );
+    }
+    if let Some(scar) = known_scar_seen(readings) {
+        out.push_str(&format!(
+            "KNOWN-SCAR epoch {} ({}..={}) {:+} bessel — grandfathered, NOT a new alarm: {}. Rows marked KNOWN-SCAR do not raise the divergence exit; any other non-zero total does.\n",
+            scar.epoch,
+            scar.start_height,
+            scar.end_height,
+            scar.divergence_bessel,
+            scar.citation,
+        ));
     }
     if supply_diverged(readings) {
         out.push_str(
@@ -737,6 +777,55 @@ mod tests {
         assert!(text.contains("DIVERGED"), "{text}");
         assert!(text.contains("first preserve the node data"), "{text}");
         assert!(supply_diverged(&readings));
+    }
+
+    /// **#299 ruling item 2 on the operator view.** The grandfathered epoch-1 scar
+    /// keeps its row and its number but is named `KNOWN-SCAR`, does **not** raise the
+    /// divergence escalation, and gets one citation line. Without this, every operator
+    /// view on the live net would carry a standing 🔴 and the next real violation would
+    /// arrive looking like noise. One bessel either side of the recorded total alarms.
+    #[test]
+    fn the_grandfathered_scar_is_named_and_does_not_raise_the_escalation() {
+        fn scar_row(delta: i128) -> SupplyEpoch {
+            let expected = 1_000_000_000u64;
+            SupplyEpoch {
+                epoch: 1,
+                start_height: 1_152,
+                end_height: 2_303,
+                measured_coinbase: (expected as i128 + delta) as u64,
+                expected_coinbase: expected,
+                fees: 0,
+            }
+        }
+        let readings = vec![ok(
+            "node0",
+            t_at(2_303, Some(2_303), Some(0x0102_0304_0506), None)
+                .with_supply(vec![scar_row(-4_114)]),
+        )];
+        let text = view(&readings, &Agreement::of(&readings));
+        assert!(text.contains("KNOWN-SCAR"), "the row is named:\n{text}");
+        assert!(text.contains("-4114"), "the number is still published:\n{text}");
+        assert!(text.contains("lab #299"), "with its citation:\n{text}");
+        assert!(!text.contains("DIVERGED"), "not an unexplained divergence:\n{text}");
+        assert!(
+            !supply_diverged(&readings),
+            "a grandfathered scar must not raise the divergence exit"
+        );
+        assert!(
+            !text.contains("first preserve the node data"),
+            "and must not print the violation runbook:\n{text}"
+        );
+
+        // Teeth: one bessel either side is a different fact and escalates.
+        for other in [-4_113i128, -4_115] {
+            let readings = vec![ok(
+                "node0",
+                t_at(2_303, Some(2_303), Some(0x0102_0304_0506), None)
+                    .with_supply(vec![scar_row(other)]),
+            )];
+            assert!(supply_diverged(&readings), "divergence {other} must escalate");
+            assert!(view(&readings, &Agreement::of(&readings)).contains("DIVERGED"));
+        }
     }
 
     /// Issue #130: the state machine can permanently trail fork choice because

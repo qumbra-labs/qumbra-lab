@@ -31,6 +31,16 @@ pub const UNAVAILABLE: &str = "UNAVAILABLE";
 /// it disagrees, the delta says *by how much*.
 pub const DIVERGENT: &str = "DIVERGENT";
 
+/// The verdict token for a **grandfathered** non-zero row — a scar the chain is known
+/// to carry (`qlab_node::supply::KNOWN_SUPPLY_SCARS`, lab #299 ruling item 2).
+///
+/// A third token rather than reusing either of the other two, because both
+/// alternatives lie: `agreed` hides a real number the page is supposed to publish,
+/// and `DIVERGENT` on a row that will read the same forever is how a stable alerting
+/// token becomes noise. Alerting keys on `DIVERGENT` and this one is deliberately not
+/// a substring of it, so an existing grep neither matches it nor has to be rewritten.
+pub const KNOWN_SCAR: &str = "KNOWN_SCAR";
+
 /// The projection's own version, bumped when this object's **shape** changes.
 ///
 /// 🔴 Deliberately **not** `qlab_node::rpc::RPC_VERSION` (`0x05` at issue #275).
@@ -182,7 +192,19 @@ fn supply(t: &Telemetry) -> String {
                         e.measured_coinbase,
                         e.fees,
                         delta = delta,
-                        verdict = if delta == 0 { "agreed" } else { DIVERGENT },
+                        // #299 ruling item 2: the grandfathered epoch-1 scar keeps its
+                        // row and its delta, but it is NOT reported as a violation —
+                        // a page that shows a permanent DIVERGENT teaches its readers
+                        // that DIVERGENT means nothing. `KNOWN_SCAR` is a third,
+                        // greppable token, matched on epoch, endpoints and the exact
+                        // delta, so one bessel either side of it is still DIVERGENT.
+                        verdict = if delta == 0 {
+                            "agreed"
+                        } else if e.known_scar().is_some() {
+                            KNOWN_SCAR
+                        } else {
+                            DIVERGENT
+                        },
                     )
                 })
                 .collect();
@@ -279,6 +301,20 @@ mod tests {
             start_height: 1,
             end_height: end,
             measured_coinbase: measured,
+            expected_coinbase: expected,
+            fees: 0,
+        }
+    }
+
+    /// The epoch-1 row this chain actually carries (#299 §5): the full epoch, 4,114
+    /// bessel under the closed form.
+    fn epoch_one_scar_row(delta: i128) -> SupplyEpoch {
+        let expected = 1_000_000_000u64;
+        SupplyEpoch {
+            epoch: 1,
+            start_height: 1_152,
+            end_height: 2_303,
+            measured_coinbase: (expected as i128 + delta) as u64,
             expected_coinbase: expected,
             fees: 0,
         }
@@ -481,6 +517,35 @@ mod tests {
         assert_eq!(rows[0]["measured_coinbase"], 700);
         assert_eq!(rows[0]["start_height"], 1);
         assert_eq!(rows[0]["end_height"], 14);
+    }
+
+    /// **#299 ruling item 2 on the public page.** The grandfathered epoch-1 scar keeps
+    /// its row and its exact delta but carries `KNOWN_SCAR`, not `DIVERGENT` — a page
+    /// that shows a permanent `DIVERGENT` teaches its readers that the token means
+    /// nothing, which is the one thing this surface must not do. And the annotation has
+    /// teeth: one bessel either side of the recorded total is `DIVERGENT` again.
+    #[test]
+    fn the_grandfathered_scar_is_named_and_a_neighbouring_total_is_not() {
+        let t = Telemetry::assemble(2_303, Some(2_303), 75, 0, 3, 1, MAX_LAG)
+            .with_supply(vec![epoch_one_scar_row(-4_114)]);
+        let s = health(&t, "aa", 30);
+        let row = &parse(&s)["supply"]["epochs"][0];
+        assert_eq!(row["verdict"], KNOWN_SCAR);
+        assert_eq!(row["delta"], -4_114, "the number is published, not hidden");
+        assert!(
+            !s.contains(DIVERGENT),
+            "a standing scar must not spend the DIVERGENT token: {s}"
+        );
+        // KNOWN_SCAR is deliberately not a substring of DIVERGENT, so an existing
+        // alerting grep neither matches it nor needs rewriting.
+        assert!(!KNOWN_SCAR.contains(DIVERGENT) && !DIVERGENT.contains(KNOWN_SCAR));
+
+        for other in [-4_113i128, -4_115] {
+            let t = Telemetry::assemble(2_303, Some(2_303), 75, 0, 3, 1, MAX_LAG)
+                .with_supply(vec![epoch_one_scar_row(other)]);
+            let s = health(&t, "aa", 30);
+            assert_eq!(parse(&s)["supply"]["epochs"][0]["verdict"], DIVERGENT, "{other}");
+        }
     }
 
     /// The rendered page carried a `DIVERGENT` token on a non-zero supply row and

@@ -210,6 +210,7 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     let genesis = GenesisFile::load(&node.genesis_file)?;
     let pf = qumbra_node::run::preflight(&node, &genesis)?;
 
+    let trusted = svc.trusted_proxies()?;
     println!("qumbra-faucet check: OK ({cfg_path})");
     println!("  listen:            {}", svc.listen_addr);
     println!("  loopback:          {}", svc.binds_loopback());
@@ -220,6 +221,7 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  grant value:       {} bessel", svc.grant_value());
     println!("  hd account:        {}", svc.hd_account());
     println!("  tickets required:  {}", svc.tickets_required());
+    println!("  {}", trusted.posture_line());
     println!("  miner_rkm:         {}", miner_rkm_hex(&wallet));
     if !svc.binds_loopback() {
         println!();
@@ -271,10 +273,19 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     // Render once before binding, so the first request served is never a blank state.
     service.refresh_status(&node);
 
+    // Lab #308: parse the trust set before binding so a bad CIDR refuses to
+    // start rather than silently falling back to the empty (socket-only) posture.
+    let trusted = svc.trusted_proxies()?;
+
     // 🔴 A failure to bind is FATAL. `?` and no fallback: a faucet its operator
     // believes is listening and which is not is discovered by a user who cannot get
     // funds and has no way to report it.
-    let server = FaucetServer::start(&svc.listen_addr, service.gate(), service.status())?;
+    let server = FaucetServer::start_with_trusted_proxies(
+        &svc.listen_addr,
+        service.gate(),
+        service.status(),
+        trusted.clone(),
+    )?;
 
     println!("qumbra-faucet running");
     println!("  faucet:         http://{}/", server.addr());
@@ -285,6 +296,8 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  mining:         {} (payout → this faucet)", node_cfg.mining);
     println!("  grant:          {} bessel", svc.grant_value());
     println!("  tickets:        {}", if svc.tickets_required() { "required" } else { "OPEN" });
+    // Lab #308 / #296 honesty voice: name which client-id posture is active.
+    println!("  {}", trusted.posture_line());
     println!("  {verifier_log}");
     if !server.addr().ip().is_loopback() {
         println!(

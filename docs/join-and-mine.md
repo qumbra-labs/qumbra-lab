@@ -1,98 +1,235 @@
-# Joining and mining — the operator's path
+# Join and mine on the Qumbra testnet
 
-中文: [`join-and-mine-zh.md`](./join-and-mine-zh.md) — EN is authoritative on technical detail.
+中文：[`join-and-mine-zh.md`](./join-and-mine-zh.md) · **English is authoritative on technical detail.**
 
-**Status: written ahead of the T1 mint.** Everything here is exercisable today against a
-private net; the two values only a public net can supply — the genesis file and the seed
-list — are marked **[published at T1]**. This is testnet-plan §6's "join/mine docs" row.
+This is the T1 path for a participant the project does not control. Text in square brackets is
+deliberately waiting for the T1 announcement; do not replace it with a guessed URL, seed, digest,
+or revision.
 
-## 1. What you need
+## 1. Obtain and verify the release
 
-| | |
-|---|---|
-| hardware | 2 vCPU / 2 GB RAM is proven (the T0 fleet is `t4g.small`); RandomX runs in light mode (~256 MB) |
-| network | **outbound TCP only.** You do NOT need a public address, port forwarding, or NAT tricks — the net accepts outbound-only participants by decision (2026-07-26). |
-| OS | Linux x86-64/aarch64 or macOS; the Linux-aarch64 RandomX build caveat is solved in the docker image |
-
-## 2. Get the software
-
-**Docker (recommended):** the node image is public on GHCR — no registry credential,
-digest-pinned tags per release. **[published at T1: image tag + digest]**
-
-**From source:** Rust stable + `cmake` + a C++ toolchain (RandomX builds a C++ library):
+The node image is public at `ghcr.io/qumbra-labs/qumbra-node`. Use the **digest from the T1
+announcement**, never a mutable tag. The image records its source revision in the OCI label
+`org.opencontainers.image.revision`; read it back and compare it with the revision in the
+announcement rather than trusting the tag or a successful pull. The label and node binary are
+part of the runtime image ([`deploy/docker/Dockerfile:123-160`](../deploy/docker/Dockerfile#L123-L160));
+the readback requirement is the lesson of [lab #224](https://github.com/qumbra-labs/qumbra-lab/issues/224).
 
 ```sh
-cargo build --release -p qumbra-node -p qumbra-wallet
+IMAGE='ghcr.io/qumbra-labs/qumbra-node@sha256:[published alongside the T1 announcement]'
+EXPECTED_REV='[published alongside the T1 announcement]'
+
+docker pull "$IMAGE"
+ACTUAL_REV="$(docker image inspect \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")"
+test "$ACTUAL_REV" = "$EXPECTED_REV" || {
+  echo "wrong image revision: got $ACTUAL_REV, want $EXPECTED_REV" >&2
+  exit 1
+}
 ```
 
-## 3. Make a wallet, get your `miner_rkm`
+The announcement also publishes these network-identity inputs together:
 
-Coinbase needs a payee. The wallet CLI produces both your addresses and the node-config form
-of your mining identity:
+- `genesis.qmb` — **format v4**;
+- `expected_genesis_hash` —
+  `138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb`;
+- the initial P2P seed addresses for `dial_peers`.
 
-```sh
-qumbra-wallet keygen --dir ~/.qumbra-wallet     # seed (0600) + address [0]; prints NO key material
-qumbra-wallet miner-rkm --dir ~/.qumbra-wallet  # → miner_rkm = "…64 hex…"
-```
+The format and hash are pinned in the tree
+([`genesis.rs:68-77`](../crates/qumbra-node/src/genesis.rs#L68-L77),
+[`genesis.rs:775-779`](../crates/qumbra-node/src/genesis.rs#L775-L779)). The distribution location and
+seed list are **[to be published alongside the T1 announcement]**; no URL is implied here.
 
-Back up the phrase (`qumbra-wallet backup --dir … --reveal`) **before** you mine anything.
-The phrase is deliberately **not BIP-39** — no other wallet can restore it, and this one will
-not restore other wallets' phrases.
+## 2. Join as a non-mining node
 
-## 4. The node config, knob by knob
+Put the downloaded `genesis.qmb` beside this minimal `node.toml`:
 
 ```toml
-data_dir     = "/var/lib/qumbra"        # chain store + snapshot; survives restarts
-listen_addr  = "0.0.0.0:9400"           # inbound P2P — bound even if nobody can reach you
-genesis_file = "/etc/qumbra/genesis.qmb"          # [published at T1]
-expected_genesis_hash = "…"                       # [published at T1]
-dial_peers   = ["seed1.example:9400", "…"]        # [published at T1]
-mining       = true
-miner_rkm    = "…the 64 hex from step 3…"
+data_dir = "/data"
+listen_addr = "0.0.0.0:9400"
+dial_peers = ["[seed address published alongside the T1 announcement]"]
+genesis_file = "/config/genesis.qmb"
+expected_genesis_hash = "138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb"
+mining = false
 ```
 
-- **`expected_genesis_hash` is a refusal, not a checksum**: a node handed the wrong genesis
-  does not start. The genesis file IS the network's identity.
-- **`advertise_addr` — stated, not discovered.** A node never sees its own public address.
-  Set it **only** if you have one and want inbound peers; leaving it unset means you are an
-  outbound-only participant, which is fully supported. Do not guess a value: a wrong
-  advertisement pollutes other nodes' address books.
-- Peer discovery is automatic past the seeds (learned addresses persist in `peers.dat`);
-  connection caps default 8 outbound / 32 inbound. You configure none of it for a first run.
+These are the fields a joiner needs. `mining` defaults to false, but it is explicit above. Do
+**not** copy fleet configs and do **not** add `committee_key_paths`: a public joiner is a
+verify-only node and holds no committee signing keys
+([`config.rs:54-94`](../crates/qumbra-node/src/config.rs#L54-L94)).
 
-## 5. Run, and read the one line that matters
+Preflight the exact genesis and config before binding a socket, then run:
 
-The `TELEMETRY` line answers, in order of what an operator actually asks:
+```sh
+docker volume create qumbra-data
 
-- **`mready=`** — the mine-readiness gate. A cold node **must not mine before it knows where
-  the chain is** (a real defect, fixed): `mready=synced` means the gate cleared;
-  `mready=unknown` means it is still finding peers — this is a node deliberately not mining,
-  not a node failing to mine.
-- **`tip=` / `final=` / `regime=`** — your height, the finalized height, and whether
-  committee finality is live (`Final`) or the chain is in PoW-only degraded mode.
-- **`dialable=n/known`** — how much of the net's address book you could actually reach.
-  Low `dialable` with rising `known` is normal for an outbound-only node.
+docker run --rm \
+  -v "$PWD:/config:ro" -v qumbra-data:/data \
+  --entrypoint /usr/local/bin/qumbra-node \
+  "$IMAGE" check --config /config/node.toml
 
-## 6. Your coinbase, honestly
+docker run --rm --name qumbra-node \
+  -v "$PWD:/config:ro" -v qumbra-data:/data \
+  --entrypoint /usr/local/bin/qumbra-node \
+  "$IMAGE" run --config /config/node.toml
+```
 
-- A block you win pays `miner_rkm` — that identity is your wallet's **address [0]** (or the
-  index you chose). The note is real chain data: recoverable from the chain itself, by
-  design.
-- It **matures before it is spendable**: `COINBASE_MATURITY_BLOCKS` (frozen §2 — quoted from
-  the constant, currently 144 blocks ≈ 3 h at the 75 s target). Enforcement is structural:
-  an immature note has no tree leaf, so no wallet — yours or a thief's — can spend it early.
-- 🔴 **Two things you cannot do yet, said plainly:**
-  1. **Spend.** T1 transacting is gated on the dummy-input mechanism and the mint (lab #219 /
-     #188). Mining and accumulating are unaffected.
-  2. **See your coinbase balance in `qumbra-wallet scan`.** The scan surface trial-decrypts
-     transaction outputs; coinbase notes are derived from chain data instead, and the CLI's
-     coinbase-harvest surface is a named follow-up, not a hidden hole. Your coins are on
-     chain and re-derivable; the wallet just cannot COUNT them for you yet.
+`check` exercises the same byte/format/hash gate as startup without opening a listener
+([`run.rs:226-242`](../crates/qumbra-node/src/run.rs#L226-L242)). A different file hash produces
+`WrongGenesisHash` and the node refuses to start
+([`genesis.rs:528-555`](../crates/qumbra-node/src/genesis.rs#L528-L555)).
 
-## 7. When something looks wrong
+### NAT is stated, not discovered
 
-`final=` frozen while `tip=` climbs is a committee stall, not a mining problem — keep mining;
-the net recovers finality without your intervention. A wedged-looking node with
-`schain=fork` in its journal is on a losing branch; historically these self-recover, and the
-current work on that mechanism is public (lab #229). Restarting loses nothing that
-`data_dir` holds.
+**Outbound-only participation is accepted by design.** Behind NAT you sync, mine, and transact,
+but your address is never gossiped and you serve no peers. Leave `advertise_addr` unset. Set it
+**only** when the advertised host and port are genuinely publicly dialable all the way to this
+node; for the container that also means publishing the P2P port, for example `-p 9400:9400/tcp`.
+This behavior is the recorded 2026-07-26 NAT decision, not a workaround
+([`config.rs:68-78`](../crates/qumbra-node/src/config.rs#L68-L78),
+[`run.rs:588-595`](../crates/qumbra-node/src/run.rs#L588-L595)).
+
+### What healthy joining looks like
+
+Read successive `TELEMETRY` lines, not one isolated sample
+([`run.rs:1342-1371`](../crates/qumbra-node/src/run.rs#L1342-L1371)):
+
+- `peers=N` is the live peer count: `N > 0` means at least one connection is live; persistent
+  `peers=0` means the node has not joined a peer.
+- `slag=N` is fork-choice tip minus applied-state tip: it should fall toward `0` while joining;
+  `slag=0` means the node has applied its own selected chain
+  ([`run.rs:1017-1034`](../crates/qumbra-node/src/run.rs#L1017-L1034)).
+- `mready=-` is correct for the non-mining config above. After mining is enabled, `unknown` or
+  `behind` means the startup mining gate is correctly refusing; `synced` or `latched` permits
+  mining. It does **not** prove `slag=0`
+  ([`run.rs:376-421`](../crates/qumbra-node/src/run.rs#L376-L421)).
+
+## 3. Turn the joined node into a miner
+
+### 🔴 Hard platform boundary: Linux/glibc only
+
+**Mine on Linux/glibc only until the deterministic-emission boundary is publicly confirmed
+active. Do not mine with a native macOS-built binary.** A macOS miner has been measured to compute
+coinbase values that differ by ±1 bessel from glibc at specific heights. Consensus currently
+accepts those values; that is precisely the defect. Every such block becomes a permanent history
+scar that the activation rule in [lab #299](https://github.com/qumbra-labs/qumbra-lab/issues/299)
+must grandfather. The measurements and mechanism are in
+[lab #303](https://github.com/qumbra-labs/qumbra-lab/issues/303). The digest-pinned Linux image is
+the paved path; a macOS host may run that Linux container, but must not run a native macOS miner.
+
+Generate the payout identity from the wallet whose address should receive coinbase:
+
+```sh
+qumbra-wallet miner-rkm --dir "$HOME/.qumbra-wallet"
+```
+
+The command derives the allocated address index (index 0 by default) and prints the exact
+64-hex-character `miner_rkm = "…"` line expected by the node
+([`qumbra-wallet/main.rs:147-175`](../crates/qumbra-wallet/src/main.rs#L147-L175)). Paste it into
+`node.toml` and change only these mining fields:
+
+```toml
+mining = true
+miner_rkm = "[64 hex characters printed by qumbra-wallet miner-rkm]"
+```
+
+On startup, prove the config took effect by finding this exact line:
+
+```text
+miner payout: coinbase notes paid to the configured miner_rkm
+```
+
+If you instead see the following warning, stop mining and fix the config: valid blocks are being
+paid to an unspendable placeholder and the payout is unrecoverable
+([`run.rs:596-612`](../crates/qumbra-node/src/run.rs#L596-L612)).
+
+```text
+⚠️  NO miner_rkm CONFIGURED: ... Every coin this node mines is BURNED.
+```
+
+### 🔴 The unresolved first-start silence
+
+A node with `miner_rkm` configured has been observed once to spend **about 57 minutes at silent
+100% CPU before its first log line** on first start. This is unresolved
+([lab #300](https://github.com/qumbra-labs/qumbra-lab/issues/300)). It is not necessarily hung:
+if the process is alive and a core is pegged while no log line appears, leave it running. A
+restart does not fix the path and only discards the work already spent; wait for the first line.
+
+### Reward, maturity, pacing, and odds
+
+- A won block pays the wallet **65% of the block subsidy (including the integer rounding
+  remainder) plus all transaction fees**
+  ([`emission.rs:27-30`](../crates/qlab-node/src/emission.rs#L27-L30),
+  [`coinbase.rs:133-139`](../crates/qlab-node/src/coinbase.rs#L133-L139)).
+- The coinbase becomes spendable after **144 more blocks**. That is about three hours at target,
+  not a wall-clock promise
+  ([`emission.rs:47-55`](../crates/qlab-node/src/emission.rs#L47-L55)).
+- The network target is **75 seconds per block**, retargeted every block with **LWMA-120**; the
+  deployable binary uses real RandomX, not the Keccak simulation placeholder
+  ([`params_devnet.rs:16-49`](../crates/qlab-devnet/src/params_devnet.rs#L16-L49),
+  [`pow.rs:66-100`](../crates/qlab-devnet/src/pow.rs#L66-L100)).
+- This is solo mining, not a pool and not one reward every 75 seconds. Your expected share is your
+  effective RandomX work divided by all effective work currently competing. The public surface
+  exposes current difficulty, not fleet hash rate, so this guide cannot honestly quote personal
+  odds. Expect variance and potentially long dry spells.
+
+## 4. Wallet quickstart — five commands
+
+The CLI's own help is the authority for flags and units
+([`qumbra-wallet/main.rs:43-66`](../crates/qumbra-wallet/src/main.rs#L43-L66)). These five commands
+cover the shortest user journey; replace `RECIPIENT_QADDR` and keep in mind that `--amount` is in
+**bessel** (`100,000,000` bessel = `1 QMB`;
+[`emission.rs:34-35`](../crates/qlab-node/src/emission.rs#L34-L35)).
+Command 3 uses `curl` and `jq`; `qumbra-wallet --help` gives the full command reference.
+
+```sh
+# 1 — create the wallet; this prints address [0]
+qumbra-wallet keygen --dir "$HOME/.qumbra-wallet"
+
+# 2 — back up the Qumbra mnemonic in a private terminal
+qumbra-wallet backup --dir "$HOME/.qumbra-wallet" --reveal
+
+# Paste the full address [0] into https://faucet.qumbra.org and wait for its grant.
+
+# 3 — obtain the height against which the balance claim will be made
+TIP="$(curl -fsS https://explorer.qumbra.org/v1/health.json | jq -r '.chain.tip_height')"
+
+# 4 — discover outputs and subtract spent notes through the public node edge
+qumbra-wallet scan --dir "$HOME/.qumbra-wallet" \
+  --url https://seed.qumbra.org --to "$TIP"
+
+# 5 — rescan, build a real proof, and submit; --node defaults to --url if omitted
+qumbra-wallet send --dir "$HOME/.qumbra-wallet" \
+  --url https://seed.qumbra.org --scan-to "$TIP" \
+  --to RECIPIENT_QADDR --amount 100000000
+```
+
+HTTP **429 Too Many Requests is expected behavior for the current faucet limit**; do not hammer
+the form. [Lab #308](https://github.com/qumbra-labs/qumbra-lab/issues/308) records that the
+network-keyed bucket is currently seen through the reverse proxy as a shared bucket, so another
+visitor may have consumed it. Retry after the stated window while that issue remains open.
+
+## 5. Verification record for the image claim
+
+This is evidence that the package path is public and that remote label readback works; it is
+**not** the T1 image announcement. On 2026-08-10, without pulling or registry credentials:
+
+```text
+$ docker buildx imagetools inspect ghcr.io/qumbra-labs/qumbra-node:t0-wan-14
+Name:   ghcr.io/qumbra-labs/qumbra-node:t0-wan-14
+Digest: sha256:931afa0fe57844f52e5bbb390914ec3116a72c3ff04781b11d8a080dcc4c2f29
+
+$ docker buildx imagetools inspect --format \
+  '{{index .Image.Config.Labels "org.opencontainers.image.revision"}}' \
+  ghcr.io/qumbra-labs/qumbra-node@sha256:931afa0fe57844f52e5bbb390914ec3116a72c3ff04781b11d8a080dcc4c2f29
+e8d52d7b194d3560f70de5d1f26b99b6f37bdd2e
+```
+
+Do not substitute that historical T0 digest for the bracketed T1 digest in §1.
+
+The §4 public reads were also checked on 2026-08-10: `GET
+https://explorer.qumbra.org/v1/health.json` returned the pinned genesis hash and a numeric
+`chain.tip_height`, while `GET https://seed.qumbra.org/v1/compact?from=6313&to=6313` returned
+HTTP 200 with `application/octet-stream`. The JSON field is defined at
+[`qumbra-explorer/json.rs:55-80`](../crates/qumbra-explorer/src/json.rs#L55-L80); the height
+`6313` is only the one-sample probe height, not a network parameter.

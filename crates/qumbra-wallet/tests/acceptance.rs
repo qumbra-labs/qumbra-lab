@@ -182,6 +182,59 @@ fn a_real_wallet_binary_scans_its_own_payment_over_http() {
     assert!(!combined.contains(&mnemonic), "the mnemonic never leaves scan");
 }
 
+/// `history` as a real process, against the reference server over a real
+/// socket: the ledger is chain-derived end to end, the wallet has no
+/// `sends.v1`, and the CLI says so rather than leaving the absence to be read
+/// as "this wallet never sent". The derivation itself is pinned by
+/// `tests/history.rs`; what this covers is the argv → gather → render wiring
+/// and the process's own honesty about the local file.
+#[test]
+fn history_through_the_real_process_is_chain_only_when_there_is_no_send_log() {
+    use std::sync::Arc;
+
+    let dir = tmp("wallet_history");
+    let d = dir.to_str().unwrap();
+    let (_, stderr, ok) = run(&["keygen", "--dir", d], None);
+    assert!(ok, "keygen failed: {stderr}");
+
+    let w = WalletDir::open(&dir).expect("keygen wrote a readable wallet dir");
+    let wallet = w.wallet();
+    let payee = wallet.diversified_keypair(&wallet.diversifier_at_index(0));
+    let devnet = Devnet::generate_paying(GenParams::default(), payee);
+    let tip = devnet.tip_height();
+    let handle = qlab_cbserver::server::serve(Arc::new(devnet));
+    let url = handle.base_url();
+
+    let (out, err, ok) =
+        run(&["history", "--dir", d, "--url", &url, "--to", &tip.to_string()], None);
+    handle.shutdown();
+    assert!(ok, "history failed: {err}\n{out}");
+
+    // The wallet was paid and never spent, so every event is a receipt and the
+    // ledger is fully accounted.
+    assert!(out.contains("RECEIVED"), "the payments to this key are named:\n{out}");
+    assert!(!out.contains("SEND"), "this wallet never spent:\n{out}");
+    assert!(!out.contains(UNAVAILABLE), "an accounted ledger prints no {UNAVAILABLE}:\n{out}");
+    assert!(out.contains("total out:         0 bessel"), "{out}");
+    assert!(out.contains(&format!("heights 0..={tip}")), "a ledger is a claim about a range:\n{out}");
+    let spendable = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("current spendable: "))
+        .and_then(|t| t.split_whitespace().next())
+        .and_then(|n| n.parse::<u128>().ok())
+        .unwrap_or_else(|| panic!("no current-spendable line:\n{out}"));
+    assert!(spendable > 0, "the wallet sees what was paid to its own key:\n{out}");
+
+    // 🔴 The derivation boundary, at the process boundary: no local record
+    // exists, the CLI says so, and it says the mnemonic cannot bring one back.
+    assert!(err.contains("sends.v1"), "{err}");
+    assert!(err.contains("NEVER recoverable from a mnemonic"), "{err}");
+
+    // Nothing key-shaped escaped on this path either.
+    let combined = format!("{out}{err}");
+    assert!(!combined.contains(&reveal_mnemonic(&w)), "the mnemonic never leaves history");
+}
+
 #[test]
 fn miner_rkm_matches_the_node_config_form_and_names_unallocated_indices() {
     let dir = tmp("rkm");

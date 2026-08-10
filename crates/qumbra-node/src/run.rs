@@ -67,6 +67,40 @@ use qlab_p2p::sync::SyncPhase;
 use qlab_p2p::transport::TcpTransport;
 use qlab_p2p::P2pNode;
 
+/// One canonical block's supply-accounting inputs, **including its identity**
+/// (lab #299 §4). The identity is what lets the ledger refuse a reorged push instead
+/// of absorbing it.
+fn supply_block_of(hash: qlab_devnet::header::Hash32, block: &qlab_node::StoredBlock) -> SupplyBlock {
+    SupplyBlock {
+        height: block.header.height,
+        hash,
+        prev: block.header.prev,
+        coinbase: block.coinbase,
+        fees: block.txs.iter().map(|tx| tx.fee).sum(),
+    }
+}
+
+/// Build a [`SupplyLedger`] from the applied main chain — the startup path, and the
+/// **reorg-recovery path** (lab #299 §4).
+///
+/// One function for both, deliberately: a rebuild that differed from the startup
+/// build would be a second definition of the ledger, and the whole defect this
+/// closes is two views of the same chain disagreeing.
+fn rebuild_supply_ledger<C: ChainStore>(
+    state_chain: &C,
+    main_chain: &[qlab_devnet::header::Hash32],
+) -> Result<SupplyLedger, qlab_node::SupplyError> {
+    SupplyLedger::from_blocks(
+        main_chain.iter().map(|hash| {
+            let block = state_chain
+                .block(hash)
+                .expect("every canonical state-chain hash has its stored body");
+            supply_block_of(*hash, block)
+        }),
+        EPOCH_LENGTH_BLOCKS,
+    )
+}
+
 /// The `sid=` value when this node's own held keys are committed to *different*
 /// checkpoints at the same slot (issue #84), and the type carrying it.
 ///
@@ -617,19 +651,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         let supply_ledger = {
             let node = p2p.node();
             let state_chain = node.state().chain();
-            SupplyLedger::from_blocks(
-                state_chain.chain().main_chain().iter().map(|hash| {
-                    let block = state_chain
-                        .block(hash)
-                        .expect("every canonical state-chain hash has its stored body");
-                    SupplyBlock {
-                        height: block.header.height,
-                        coinbase: block.coinbase,
-                        fees: block.txs.iter().map(|tx| tx.fee).sum(),
-                    }
-                }),
-                EPOCH_LENGTH_BLOCKS,
-            )?
+            rebuild_supply_ledger(state_chain, &state_chain.chain().main_chain())?
         };
 
         Ok(RunningNode {
@@ -869,6 +891,27 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 .lock()
                 .expect("the supply ledger mutex is not poisoned");
             let main_chain = state_chain.chain().main_chain();
+            // 🔴 **Reorg reconciliation (lab #299 §4).** Appending is only correct
+            // while the ledger is still summing the canonical branch. Fork choice can
+            // move entirely BELOW `next_height`, in which case the loop below runs
+            // zero times and the orphaned branch's coinbase would stay in the sum
+            // forever — a DIVERGENT manufactured by a reorg, on a surface whose whole
+            // job is to make a real supply violation legible.
+            //
+            // Rebuild rather than rewind: the ledger keeps no per-height measured
+            // history, so it cannot recompute the partial row a rewind would land in.
+            // The cost is one O(chain) rebuild on a rare event — the same work the
+            // startup path already does — against one hash comparison per sample.
+            if !ledger.is_in_sync_with(&main_chain) {
+                match rebuild_supply_ledger(state_chain, &main_chain) {
+                    Ok(rebuilt) => *ledger = rebuilt,
+                    // A rebuild cannot fail on a chain the state machine has applied
+                    // (contiguous from genesis by construction), but if it ever did,
+                    // serving a stale row is worse than serving none: `supply_lag`
+                    // then reports the gap and consumers render UNAVAILABLE.
+                    Err(e) => eprintln!("SUPPLY rebuild after reorg failed: {e:?}"),
+                }
+            }
             for height in ledger.next_height()..=state_chain.tip_height() {
                 let hash = main_chain
                     .get(height as usize)
@@ -877,11 +920,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                     .block(hash)
                     .expect("every canonical state-chain hash has its stored body");
                 ledger
-                    .push(SupplyBlock {
-                        height: block.header.height,
-                        coinbase: block.coinbase,
-                        fees: block.txs.iter().map(|tx| tx.fee).sum(),
-                    })
+                    .push(supply_block_of(*hash, block))
                     .expect("new canonical heights extend the supply ledger contiguously");
             }
             ledger.rows().to_vec()

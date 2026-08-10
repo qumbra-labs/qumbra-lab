@@ -1,89 +1,226 @@
-# 加入与挖矿 —— 运营者路径
+# 加入 Qumbra 测试网并挖矿
 
-English: [`join-and-mine.md`](./join-and-mine.md) —— 技术细节以英文版为准。
+English: [`join-and-mine.md`](./join-and-mine.md) · **技术细节以英文版为准。**
 
-**状态:先于 T1 mint 写就。** 本文一切今天即可对着私网演练;只有公网才能提供的两个值——
-genesis 文件与种子列表——标记为 **[T1 发布]**。本文即 testnet-plan §6 的 "join/mine docs" 行。
+这是项目无法控制的参与者进入 T1 的操作路径。方括号中的文字刻意留待 T1 公告填写；不要用
+猜测的 URL、种子、digest 或 revision 替换它。
 
-## 1. 你需要什么
+## 1. 获取并验证发布版本
 
-| | |
-|---|---|
-| 硬件 | 2 vCPU / 2 GB 内存已被证明够用(T0 机队就是 `t4g.small`);RandomX 走 light 模式(~256 MB) |
-| 网络 | **只需出站 TCP。** 不需要公网地址、端口转发或 NAT 技巧——本网按决定(2026-07-26)接受 outbound-only 参与者。 |
-| 系统 | Linux x86-64/aarch64 或 macOS;Linux-aarch64 的 RandomX 构建坑已在 docker 镜像中解决 |
-
-## 2. 获取软件
-
-**Docker(推荐):** 节点镜像在 GHCR 公开——无需 registry 凭证,按发布 digest 锁定。
-**[T1 发布:镜像 tag + digest]**
-
-**源码构建:** Rust stable + `cmake` + C++ 工具链(RandomX 编译一个 C++ 库):
+节点镜像公开位于 `ghcr.io/qumbra-labs/qumbra-node`。只用 **T1 公告给出的 digest**，绝不
+依赖可变 tag。镜像把源码 revision 记录在 OCI 标签
+`org.opencontainers.image.revision` 中；必须读回并与公告中的 revision 比较，不能相信 tag
+或一次成功的 pull。标签与节点二进制均在 runtime 镜像中
+([`deploy/docker/Dockerfile:123-160`](../deploy/docker/Dockerfile#L123-L160))；必须读回是
+[lab #224](https://github.com/qumbra-labs/qumbra-lab/issues/224) 的教训。
 
 ```sh
-cargo build --release -p qumbra-node -p qumbra-wallet
+IMAGE='ghcr.io/qumbra-labs/qumbra-node@sha256:[随 T1 公告发布]'
+EXPECTED_REV='[随 T1 公告发布]'
+
+docker pull "$IMAGE"
+ACTUAL_REV="$(docker image inspect \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE")"
+test "$ACTUAL_REV" = "$EXPECTED_REV" || {
+  echo "wrong image revision: got $ACTUAL_REV, want $EXPECTED_REV" >&2
+  exit 1
+}
 ```
 
-## 3. 建钱包,取你的 `miner_rkm`
+公告还会把以下网络身份输入一同发布：
 
-Coinbase 需要收款人。钱包 CLI 同时产出你的地址和挖矿身份的节点配置形式:
+- `genesis.qmb` —— **格式 v4**；
+- `expected_genesis_hash` ——
+  `138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb`；
+- 写入 `dial_peers` 的初始 P2P 种子地址。
 
-```sh
-qumbra-wallet keygen --dir ~/.qumbra-wallet     # seed(0600)+ 地址 [0];不打印任何密钥材料
-qumbra-wallet miner-rkm --dir ~/.qumbra-wallet  # → miner_rkm = "…64 hex…"
-```
+格式和哈希已在代码树中钉死
+([`genesis.rs:68-77`](../crates/qumbra-node/src/genesis.rs#L68-L77)、
+[`genesis.rs:775-779`](../crates/qumbra-node/src/genesis.rs#L775-L779))。分发位置和种子列表
+**[将随 T1 公告发布]**；本文不暗示任何 URL。
 
-**先备份助记词**(`qumbra-wallet backup --dir … --reveal`)再开挖。助记词刻意**不是
-BIP-39**——别的钱包恢复不了它,它也不接受别家的短语。
+## 2. 作为不挖矿的节点加入
 
-## 4. 节点配置,逐项讲清
+把下载的 `genesis.qmb` 与以下最小 `node.toml` 放在同一目录：
 
 ```toml
-data_dir     = "/var/lib/qumbra"        # 链存储 + snapshot;重启后仍在
-listen_addr  = "0.0.0.0:9400"           # 入站 P2P —— 即使没人能连到你也照常绑定
-genesis_file = "/etc/qumbra/genesis.qmb"          # [T1 发布]
-expected_genesis_hash = "…"                       # [T1 发布]
-dial_peers   = ["seed1.example:9400", "…"]        # [T1 发布]
-mining       = true
-miner_rkm    = "…第 3 步的 64 hex…"
+data_dir = "/data"
+listen_addr = "0.0.0.0:9400"
+dial_peers = ["[随 T1 公告发布的种子地址]"]
+genesis_file = "/config/genesis.qmb"
+expected_genesis_hash = "138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb"
+mining = false
 ```
 
-- **`expected_genesis_hash` 是拒绝,不是校验和**:拿到错误 genesis 的节点不会启动。genesis
-  文件**就是**网络身份。
-- **`advertise_addr` —— 声明,而非发现。** 节点永远看不到自己的公网地址。**只有**当你确实
-  有公网地址并希望接受入站时才设置;不设即为 outbound-only 参与者,完全受支持。不要猜着填:
-  错误的广告会污染其他节点的地址簿。
-- 种子之外的 peer 发现是自动的(学到的地址持久化在 `peers.dat`);连接上限默认出站 8 / 入站
-  32。首跑一项都不用配。
+这些就是加入者需要的字段。`mining` 默认是 false，但上面仍明确写出。**不要**复制机队配置，
+也**不要**添加 `committee_key_paths`：公网加入者是只验证节点，不持有委员会签名密钥
+([`config.rs:54-94`](../crates/qumbra-node/src/config.rs#L54-L94))。
 
-## 5. 运行,并读懂那一行
+先在不绑定 socket 的情况下预检确切的 genesis 与配置，再运行节点：
 
-`TELEMETRY` 行按运营者真正会问的顺序回答:
+```sh
+docker volume create qumbra-data
 
-- **`mready=`** —— 挖矿就绪门。冷启动的节点**在知道链在哪之前绝不能挖**(真实缺陷,已修):
-  `mready=synced` 表示门已通过;`mready=unknown` 表示还在找 peer——这是**刻意不挖**的节点,
-  不是挖不动的节点。
-- **`tip=` / `final=` / `regime=`** —— 你的高度、已终局高度、委员会终局是否在线(`Final`)
-  或链处于 PoW-only 降级模式。
-- **`dialable=n/known`** —— 地址簿里你真正连得上的比例。outbound-only 节点 `dialable` 低而
-  `known` 上涨是正常的。
+docker run --rm \
+  -v "$PWD:/config:ro" -v qumbra-data:/data \
+  --entrypoint /usr/local/bin/qumbra-node \
+  "$IMAGE" check --config /config/node.toml
 
-## 6. 你的 coinbase,照实说
+docker run --rm --name qumbra-node \
+  -v "$PWD:/config:ro" -v qumbra-data:/data \
+  --entrypoint /usr/local/bin/qumbra-node \
+  "$IMAGE" run --config /config/node.toml
+```
 
-- 你赢下的块付给 `miner_rkm`——那个身份就是你钱包的**地址 [0]**(或你选的 index)。note 是
-  真实链上数据:按设计可从链本身复原。
-- **成熟之后才可花**:`COINBASE_MATURITY_BLOCKS`(frozen §2——引自常量,当前为 144 块 ≈
-  75 秒目标下 3 小时)。强制是结构性的:未成熟的 note 没有树叶,任何钱包——你的或贼的——都
-  提前花不了。
-- 🔴 **两件你现在还做不了的事,直说:**
-  1. **花费。** T1 交易能力卡在 dummy 输入机制与 mint(lab #219 / #188)。挖矿与积累不受
-     影响。
-  2. **在 `qumbra-wallet scan` 里看到 coinbase 余额。** scan 面做的是交易输出的试解密;
-     coinbase note 是从链数据派生的,CLI 的 coinbase 收割面是一个**点名的后续**,不是暗坑。
-     币在链上、可复原;只是钱包还不能替你**数**它们。
+`check` 在不开 listener 的情况下执行与启动相同的字节、格式和哈希门
+([`run.rs:226-242`](../crates/qumbra-node/src/run.rs#L226-L242))。文件哈希不同会产生
+`WrongGenesisHash`，节点拒绝启动
+([`genesis.rs:528-555`](../crates/qumbra-node/src/genesis.rs#L528-L555))。
 
-## 7. 看起来不对劲时
+### NAT 是声明，不是发现
 
-`final=` 冻结而 `tip=` 上涨是委员会停摆,不是挖矿问题——继续挖;网会在无需你干预的情况下恢复
-终局。journal 里带 `schain=fork` 的疑似卡死节点是在输掉的分支上;历史上这些都自恢复,该机制的
-当前工作是公开的(lab #229)。重启不会丢失 `data_dir` 里的任何东西。
+**设计上接受仅出站参与。** 在 NAT 后你仍可同步、挖矿和交易，但你的地址永远不会被 gossip，
+也不会为任何 peer 提供服务。不要设置 `advertise_addr`。只有当所填 host 与 port 确实能从公网
+一路拨通到此节点时才设置它；对容器而言还须发布 P2P 端口，例如 `-p 9400:9400/tcp`。这是
+记录在案的 2026-07-26 NAT 决定，不是变通办法
+([`config.rs:68-78`](../crates/qumbra-node/src/config.rs#L68-L78)、
+[`run.rs:588-595`](../crates/qumbra-node/src/run.rs#L588-L595))。
+
+### 健康加入是什么样
+
+要连续阅读多条 `TELEMETRY`，不要只看一个样本
+([`run.rs:1342-1371`](../crates/qumbra-node/src/run.rs#L1342-L1371))：
+
+- `peers=N` 是实时 peer 数：`N > 0` 表示至少一个连接在线；持续 `peers=0` 表示尚未加入任何
+  peer。
+- `slag=N` 是 fork-choice tip 减去 applied-state tip：加入过程中应向 `0` 下降；`slag=0` 表示
+  节点已应用自己选中的链
+  ([`run.rs:1017-1034`](../crates/qumbra-node/src/run.rs#L1017-L1034))。
+- 对上面的非挖矿配置，`mready=-` 完全正确。启用挖矿后，`unknown` 或 `behind` 表示启动挖矿门
+  正在正确拒绝；`synced` 或 `latched` 才允许挖矿。它**不能**证明 `slag=0`
+  ([`run.rs:376-421`](../crates/qumbra-node/src/run.rs#L376-L421))。
+
+## 3. 把已加入的节点改成矿工
+
+### 🔴 平台硬边界：只能用 Linux/glibc
+
+**在确定性发行边界被公开确认已激活之前，只能在 Linux/glibc 上挖矿。禁止用 macOS 原生构建的
+二进制挖矿。** 实测 macOS 矿工在特定高度计算出的 coinbase 会与 glibc 相差 ±1 bessel。当前
+共识会接受这些值；问题恰恰就在这里。每一个这样的块都会成为永久历史伤痕，
+[lab #299](https://github.com/qumbra-labs/qumbra-lab/issues/299) 的激活规则以后必须把它列入
+grandfather。测量与机制见 [lab #303](https://github.com/qumbra-labs/qumbra-lab/issues/303)。
+digest 锁定的 Linux 镜像是铺好的路径；macOS 主机可以运行这个 Linux 容器，但不能运行原生
+macOS 矿工。
+
+从应接收 coinbase 的钱包派生付款身份：
+
+```sh
+qumbra-wallet miner-rkm --dir "$HOME/.qumbra-wallet"
+```
+
+该命令从已分配地址 index 派生（默认 index 0），并打印节点所需的准确 64 位十六进制
+`miner_rkm = "…"` 行
+([`qumbra-wallet/main.rs:147-175`](../crates/qumbra-wallet/src/main.rs#L147-L175))。把它粘进
+`node.toml`，只改变以下挖矿字段：
+
+```toml
+mining = true
+miner_rkm = "[qumbra-wallet miner-rkm 打印的 64 个十六进制字符]"
+```
+
+启动时必须找到下面这条完全一致的行，以证明配置生效：
+
+```text
+miner payout: coinbase notes paid to the configured miner_rkm
+```
+
+如果看到下面的警告，立即停止挖矿并修正配置：有效块正在付给无法花费的占位身份，收益无法找回
+([`run.rs:596-612`](../crates/qumbra-node/src/run.rs#L596-L612))。
+
+```text
+⚠️  NO miner_rkm CONFIGURED: ... Every coin this node mines is BURNED.
+```
+
+### 🔴 尚未解决的首次启动静默
+
+曾有一次观察到：配置了 `miner_rkm` 的节点在首次启动、第一条日志出现之前，**约 57 分钟保持
+100% CPU 且完全静默**。问题尚未解决
+([lab #300](https://github.com/qumbra-labs/qumbra-lab/issues/300))。它不一定卡死：若进程仍活着、
+一个核心被打满但没有日志，就让它继续运行。重启不能修复这条路径，只会丢掉已经花掉的工作；
+等待第一条日志。
+
+### 收益、成熟、节奏与胜率
+
+- 赢下一个块会向钱包支付**区块补贴的 65%（包括整数舍入余数）加全部交易费**
+  ([`emission.rs:27-30`](../crates/qlab-node/src/emission.rs#L27-L30)、
+  [`coinbase.rs:133-139`](../crates/qlab-node/src/coinbase.rs#L133-L139))。
+- Coinbase 再经过 **144 个块**才可花费。按目标约为三小时，但这不是墙上时钟承诺
+  ([`emission.rs:47-55`](../crates/qlab-node/src/emission.rs#L47-L55))。
+- 全网目标为**每块 75 秒**，用 **LWMA-120** 每块重定难度；可部署二进制使用真实 RandomX，
+  不是 Keccak 模拟占位
+  ([`params_devnet.rs:16-49`](../crates/qlab-devnet/src/params_devnet.rs#L16-L49)、
+  [`pow.rs:66-100`](../crates/qlab-devnet/src/pow.rs#L66-L100))。
+- 这是 solo mining，不是矿池，更不是每 75 秒给你一笔奖励。你的期望份额等于你的有效 RandomX
+  工作量除以当前所有竞争工作量。公开面只暴露当前难度，不暴露机队总算力，因此本文无法诚实地
+  报出个人胜率。要预期随机波动，也可能长时间一块不中。
+
+## 4. 钱包快速开始 —— 五条命令
+
+参数和单位以 CLI 自带帮助为准
+([`qumbra-wallet/main.rs:43-66`](../crates/qumbra-wallet/src/main.rs#L43-L66))。以下五条命令
+覆盖最短用户旅程；替换 `RECIPIENT_QADDR`，并记住 `--amount` 的单位是 **bessel**
+（`100,000,000` bessel = `1 QMB`；
+[`emission.rs:34-35`](../crates/qlab-node/src/emission.rs#L34-L35)）。
+第 3 条命令使用 `curl` 和 `jq`；完整命令参考请运行 `qumbra-wallet --help`。
+
+```sh
+# 1 —— 创建钱包；命令会打印 address [0]
+qumbra-wallet keygen --dir "$HOME/.qumbra-wallet"
+
+# 2 —— 在私密终端备份 Qumbra 助记词
+qumbra-wallet backup --dir "$HOME/.qumbra-wallet" --reveal
+
+# 把完整 address [0] 粘贴到 https://faucet.qumbra.org，等待 grant。
+
+# 3 —— 获取余额声明所针对的高度
+TIP="$(curl -fsS https://explorer.qumbra.org/v1/health.json | jq -r '.chain.tip_height')"
+
+# 4 —— 经公开节点边缘发现输出并扣除已花 note
+qumbra-wallet scan --dir "$HOME/.qumbra-wallet" \
+  --url https://seed.qumbra.org --to "$TIP"
+
+# 5 —— 重新扫描、构造真实证明并提交；省略 --node 时默认等于 --url
+qumbra-wallet send --dir "$HOME/.qumbra-wallet" \
+  --url https://seed.qumbra.org --scan-to "$TIP" \
+  --to RECIPIENT_QADDR --amount 100000000
+```
+
+HTTP **429 Too Many Requests 是当前 faucet 限制的预期行为**；不要反复轰击表单。
+[Lab #308](https://github.com/qumbra-labs/qumbra-lab/issues/308) 记录了：通过反向代理后，按网络
+取 key 的 bucket 目前会被看成共享 bucket，因此可能已被另一位访客用掉。只要该 issue 仍开放，
+就按页面给出的窗口之后再试。
+
+## 5. 镜像声明的验证记录
+
+下面的记录只证明 package 路径公开且远程标签读回有效；它**不是** T1 镜像公告。2026-08-10，
+未 pull、未使用 registry 凭证：
+
+```text
+$ docker buildx imagetools inspect ghcr.io/qumbra-labs/qumbra-node:t0-wan-14
+Name:   ghcr.io/qumbra-labs/qumbra-node:t0-wan-14
+Digest: sha256:931afa0fe57844f52e5bbb390914ec3116a72c3ff04781b11d8a080dcc4c2f29
+
+$ docker buildx imagetools inspect --format \
+  '{{index .Image.Config.Labels "org.opencontainers.image.revision"}}' \
+  ghcr.io/qumbra-labs/qumbra-node@sha256:931afa0fe57844f52e5bbb390914ec3116a72c3ff04781b11d8a080dcc4c2f29
+e8d52d7b194d3560f70de5d1f26b99b6f37bdd2e
+```
+
+不要拿这个历史 T0 digest 替换第 1 节方括号中的 T1 digest。
+
+第 4 节的公开读取也于 2026-08-10 验证：`GET
+https://explorer.qumbra.org/v1/health.json` 返回了钉死的 genesis 哈希和数字
+`chain.tip_height`，`GET https://seed.qumbra.org/v1/compact?from=6313&to=6313` 则返回 HTTP 200
+及 `application/octet-stream`。JSON 字段定义在
+[`qumbra-explorer/json.rs:55-80`](../crates/qumbra-explorer/src/json.rs#L55-L80)；高度 `6313`
+只是一次样本探测高度，不是网络参数。
