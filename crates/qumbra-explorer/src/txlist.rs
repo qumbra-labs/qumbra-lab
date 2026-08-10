@@ -238,19 +238,32 @@ pub struct TxListView {
 impl TxListView {
     /// Re-project from a node's main chain. Returns whether anything changed.
     ///
-    /// **The fast path is an extension** — the ordinary case of a chain gaining
-    /// blocks: the walk goes new-tip → down and stops when it meets the hash this
-    /// view was last projected at, so a steady node pays only for its new blocks.
-    /// Anything else — a reorg, or a first projection — rebuilds from genesis.
+    /// The walk goes new-tip → down and stops as soon as it can, then splices by
+    /// **one uniform rule**: whatever this pass walked, it also re-describes, and
+    /// everything strictly below the lowest height it walked is kept as it stood.
+    /// That one rule is correct in all three cases the walk can end in, which is
+    /// why it is one rule and not three branches:
+    ///
+    /// - **an extension** (the ordinary case) — the walk meets the hash this view
+    ///   was last projected at and stops there, so a steady node pays only for its
+    ///   new blocks and everything below is retained;
+    /// - **a reorg or a first projection** — the walk reaches genesis, the lowest
+    ///   walked height is 0, nothing is retained, and the view is rebuilt;
+    /// - 🔴 **a store that does not hold a block on its own tip's ancestry** — the
+    ///   walk stops early, and the rule retains the heights below rather than
+    ///   dropping them. An earlier draft of this function rebuilt from `fresh`
+    ///   alone in every non-extension case, which on this path would have silently
+    ///   **deleted every transaction below the gap** from a served list — a
+    ///   truncation that reads as "those transactions do not exist". Same shape as
+    ///   the bug this whole contract's `covered_to` exists to prevent, one layer
+    ///   down; `DiscoveryView::refresh` takes the same retain-below posture.
     ///
     /// A full rebuild is O(chain) and re-runs the encoder over every transaction
-    /// on it. That is deliberate rather than optimised around: the incremental
-    /// splice that would avoid it has to answer *"which suffix did the reorg
+    /// on it. That is accepted rather than optimised around: an incremental splice
+    /// that tried to be cleverer would have to answer *"which suffix did the reorg
     /// replace"* for a **sparse** list, where the heights that vanished may be
-    /// heights this view never held, and a wrong answer there serves a
-    /// transaction that is no longer on the chain. Rebuilds are bounded in
-    /// practice by no-reorg-past-finality, and the cost is a projection walk, not
-    /// a proof.
+    /// heights this view never held. Rebuilds are bounded in practice by
+    /// no-reorg-past-finality, and the cost is a projection walk, not a proof.
     ///
     /// Nothing here decides what the main chain *is*: `chain.tip_hash()` and
     /// `header.prev` do, which is the fork choice the state machine already
@@ -264,38 +277,36 @@ impl TxListView {
         let mut fresh: Vec<BlockTxs> = Vec::new();
         let mut hash = tip;
         let mut tip_height = None;
-        let mut extends = false;
+        let mut lowest_walked = None;
         loop {
             let Some(block) = chain.block(&hash) else { break };
+            let height = block.header.height;
             if tip_height.is_none() {
-                tip_height = Some(block.header.height);
+                tip_height = Some(height);
             }
+            lowest_walked = Some(height);
             if let Some(b) = BlockTxs::of(block) {
                 fresh.push(b);
             }
-            if block.header.height == 0 {
+            if height == 0 {
                 break;
             }
             let prev = block.header.prev;
             if Some(prev) == anchor {
                 // The view's last tip is this tip's ancestor: everything below is
                 // already held and correct.
-                extends = true;
                 break;
             }
             hash = prev;
         }
-        let Some(tip_height) = tip_height else {
+        let (Some(tip_height), Some(lowest_walked)) = (tip_height, lowest_walked) else {
             // The store does not hold its own tip. Nothing to say; leave the view
             // as it stands rather than replacing it with a fabricated empty one.
             return false;
         };
         fresh.reverse();
-        if extends {
-            self.blocks.extend(fresh);
-        } else {
-            self.blocks = fresh;
-        }
+        self.blocks.retain(|b| b.height < lowest_walked);
+        self.blocks.extend(fresh);
         self.tip_height = tip_height;
         self.tip_hash = Some(tip);
         true
@@ -962,6 +973,140 @@ mod tests {
             vec![1, 2, 3, 4, 5],
             "and still ascending"
         );
+    }
+
+    /// A reorg replaces the suffix rather than appending to it: the walk misses
+    /// the old tip, reaches genesis, and the abandoned branch's transaction is
+    /// gone from the list. A list that kept it would be publishing a transaction
+    /// the chain no longer carries.
+    #[test]
+    fn a_reorg_replaces_the_suffix_and_the_abandoned_branch_leaves_the_list() {
+        let mut chain = qlab_node::MemChainStore::new(stored_block(0, vec![]));
+        let genesis = chain.tip_hash();
+
+        // Branch A: one block with a transaction, minimum weight.
+        let mut a1 = stored_block(1, vec![stored_tx(0xa1, 1_000, 2, 2, 8)]);
+        a1.header.prev = genesis;
+        chain.put_block(a1).expect("link");
+        let mut view = TxListView::default();
+        view.refresh(&chain);
+        assert_eq!(view.tx_count(), 1, "branch A's transaction is listed");
+        let abandoned = view.blocks[0].txs[0].txid;
+
+        // Branch B off genesis, heavier, and two blocks long.
+        let mut b1 = stored_block(1, vec![stored_tx(0xb1, 2_000, 2, 2, 8)]);
+        b1.header.prev = genesis;
+        b1.header.difficulty = 100;
+        b1.header.nonce = 7; // a different header, so a different hash
+        let b1h = chain.put_block(b1).expect("link");
+        let mut b2 = stored_block(2, vec![stored_tx(0xb2, 3_000, 2, 2, 8)]);
+        b2.header.prev = b1h;
+        b2.header.difficulty = 100;
+        chain.put_block(b2).expect("link");
+        assert_eq!(chain.tip_height(), 2, "fork choice took the heavier branch");
+
+        assert!(view.refresh(&chain), "the tip moved");
+        assert_eq!(view.tip_height, 2);
+        assert_eq!(view.blocks.len(), 2, "branch B's two blocks");
+        assert!(
+            view.blocks.iter().all(|b| b.txs.iter().all(|t| t.txid != abandoned)),
+            "the abandoned branch's transaction must not still be served"
+        );
+    }
+
+    /// 🔴 A store that cannot answer for a block on its own tip's ancestry must not
+    /// make the list **shorter**. The walk stops at the gap and everything below is
+    /// retained; an earlier draft rebuilt from the walked suffix alone, which would
+    /// have silently deleted every transaction below the gap — a truncation that
+    /// reads as "those transactions never happened".
+    ///
+    /// `MemChainStore` cannot produce this state (it inserts the header and the
+    /// block together), so the gap is injected by a wrapper that answers `None` for
+    /// one hash and delegates everything else.
+    #[test]
+    fn a_gap_in_the_store_stops_the_walk_and_never_shortens_the_list() {
+        struct Gapped<'a> {
+            inner: &'a qlab_node::MemChainStore,
+            hide: Hash32,
+        }
+        impl ChainStore for Gapped<'_> {
+            fn put_block(
+                &mut self,
+                _b: StoredBlock,
+            ) -> Result<Hash32, qlab_devnet::chain::InsertError> {
+                unreachable!("read-only in this test")
+            }
+            fn genesis_block_hash(&self) -> Hash32 {
+                self.inner.genesis_block_hash()
+            }
+            fn tip_hash(&self) -> Hash32 {
+                self.inner.tip_hash()
+            }
+            fn tip_height(&self) -> u64 {
+                self.inner.tip_height()
+            }
+            fn finalized_hash(&self) -> Option<Hash32> {
+                self.inner.finalized_hash()
+            }
+            fn finalized_height(&self) -> Option<u64> {
+                self.inner.finalized_height()
+            }
+            fn block(&self, hash: &Hash32) -> Option<&StoredBlock> {
+                if *hash == self.hide {
+                    return None;
+                }
+                self.inner.block(hash)
+            }
+            fn contains(&self, hash: &Hash32) -> bool {
+                self.inner.contains(hash)
+            }
+            fn set_finalized(
+                &mut self,
+                _h: Hash32,
+            ) -> Result<(), qlab_devnet::chain::FinalizeMarkError> {
+                unreachable!("read-only in this test")
+            }
+            fn restore_finalized(
+                &mut self,
+                _h: Hash32,
+                _height: u64,
+            ) -> Result<(), qlab_devnet::chain::RestoreFinalizedError> {
+                unreachable!("read-only in this test")
+            }
+        }
+
+        let mut chain = qlab_node::MemChainStore::new(stored_block(0, vec![]));
+        let mut prev = chain.tip_hash();
+        let mut hashes = vec![prev];
+        for h in 1..=4u64 {
+            let mut b = stored_block(h, vec![stored_tx(h as u8, 1_000, 2, 2, 8)]);
+            b.header.prev = prev;
+            prev = chain.put_block(b).expect("link");
+            hashes.push(prev);
+        }
+        let mut view = TxListView::default();
+        view.refresh(&chain);
+        assert_eq!(view.tx_count(), 4, "four transactions, one per height");
+
+        // Now hide height 2 and force a re-walk by moving the tip.
+        let mut b5 = stored_block(5, vec![stored_tx(5, 1_000, 2, 2, 8)]);
+        b5.header.prev = prev;
+        chain.put_block(b5).expect("link");
+        // The old tip is still an ancestor, so this would take the extension path;
+        // hide it too, so the walk has to run past the gap.
+        let gapped = Gapped { inner: &chain, hide: hashes[4] };
+        let mut from_scratch = TxListView { tip_hash: Some([0xde; 32]), ..view.clone() };
+
+        assert!(from_scratch.refresh(&gapped));
+        assert_eq!(from_scratch.tip_height, 5);
+        assert_eq!(
+            from_scratch.blocks.iter().map(|b| b.height).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5],
+            "height 5 freshly walked; 1–4 retained from the previous projection because the \
+             walk stopped at the gap and only re-describes what it actually walked. Nothing \
+             below a gap is ever dropped."
+        );
+        assert_eq!(from_scratch.tx_count(), 5, "and no transaction went missing");
     }
 
     #[test]
