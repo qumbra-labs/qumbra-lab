@@ -501,9 +501,6 @@ fn backup(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// field the chain can never carry — **who a send paid** — is joined in from the
 /// wallet dir's local `sends.v1` when there is one, and labeled every time.
 fn history(args: &[String]) -> Result<(), Box<dyn Error>> {
-    use qumbra_wallet::history::{self, AddressScan};
-    use qumbra_wallet::sends::SendLog;
-
     let dir = dir_of(args)?;
     let url = flag(args, "--url")
         .ok_or("history requires --url http://host:port or --url https://host[:port]")?;
@@ -513,39 +510,13 @@ fn history(args: &[String]) -> Result<(), Box<dyn Error>> {
     let from: u64 = flag(args, "--from").unwrap_or("0").parse()?;
 
     let w = WalletDir::open(&dir)?;
-    let wallet = w.wallet();
-
-    // The local record is OPTIONAL enrichment and must never be able to stop a
-    // chain-derived ledger from printing: an unreadable file is reported and
-    // the ledger continues without it, chain-only.
-    let log = match SendLog::load(&dir) {
-        Ok(log) => log,
-        Err(e) => {
-            eprintln!(
-                "note: {e}\n      the ledger below is chain-only — every `recipient:` line will \
-                 read `not recorded`."
-            );
-            None
-        }
-    };
-    if log.is_none() {
-        eprintln!(
-            "note: no {} in this wallet dir, so recipients are not shown. That file is written by \
-             `send` on this machine and is NEVER recoverable from a mnemonic; everything else \
-             below comes from the chain.",
-            qumbra_wallet::sends::SENDS_FILE
-        );
+    let report = qumbra_wallet::history::report(&dir, &w, url, from, to);
+    // stderr, so a piped ledger stays a ledger — but never dropped: each note
+    // names a reason a `recipient:` line below reads `not recorded`.
+    for note in &report.notes {
+        eprintln!("note: {note}");
     }
-
-    let qumbra_wallet::scan::Gathered { outcomes, coverage, set } =
-        qumbra_wallet::scan::gather(&w, url, from, to);
-    let scans: Vec<AddressScan> = outcomes
-        .into_iter()
-        .map(|(div_index, address_short, outcome)| AddressScan { div_index, address_short, outcome })
-        .collect();
-    let ledger =
-        history::build(&wallet, &scans, set.as_ref(), &coverage, log.as_ref(), (from, to));
-    print!("{}", history::render(&ledger, url));
+    print!("{}", report.text);
     Ok(())
 }
 

@@ -658,8 +658,108 @@ pub fn render(ledger: &Ledger, url: &str) -> String {
     out
 }
 
+/// A rendered ledger plus the caveats a caller must show beside it.
+///
+/// The notes are **data, not output**, because the two callers place them
+/// differently — the CLI writes them to stderr, a GUI has no stderr and must put
+/// them in the panel. Returning them as strings is what lets one flow serve
+/// both without either re-deriving the ledger.
+pub struct HistoryReport {
+    /// The ledger, already rendered.
+    pub text: String,
+    /// 🔴 **Show these.** Each one names a reason a `recipient:` line below reads
+    /// `not recorded`. Dropping them turns "this wallet has no local record of
+    /// who it paid" into an unexplained blank, which is the same class of lie as
+    /// a balance quoted without its coverage.
+    pub notes: Vec<String>,
+}
+
+/// The whole `history` flow: the local send log if there is one, the two chain
+/// streams via [`crate::scan::gather`], and the rendered ledger.
+///
+/// 🔴 **One flow, every caller — the same rule [`crate::scan`] exists for.** This
+/// was ~20 lines in the CLI, and a shell that wanted the ledger would have had
+/// to copy them. That copy has been made before, three times, and each time it
+/// diverged on the axis nobody was watching (transport, then spent-note
+/// subtraction, then the shared types). The ledger is a worse thing to diverge
+/// than the balance: it is the wallet's account of its own past, and two of them
+/// disagreeing is not a stale number but a contradiction.
+///
+/// The local record is **optional enrichment and must never stop a chain-derived
+/// ledger from rendering** — an unreadable file becomes a note and the ledger
+/// continues, chain-only.
+pub fn report(
+    dir: &std::path::Path,
+    w: &crate::store::WalletDir,
+    url: &str,
+    from: u64,
+    to: u64,
+) -> HistoryReport {
+    use crate::sends::{SendLog, SENDS_FILE};
+
+    let wallet = w.wallet();
+    let mut notes: Vec<String> = Vec::new();
+
+    let log = match SendLog::load(dir) {
+        Ok(log) => log,
+        Err(e) => {
+            notes.push(format!(
+                "{e} — the ledger below is chain-only, so every `recipient:` line reads \
+                 `not recorded`."
+            ));
+            None
+        }
+    };
+    if log.is_none() {
+        notes.push(format!(
+            "no {SENDS_FILE} in this wallet dir, so recipients are not shown. That file is \
+             written by `send` on this machine and is NEVER recoverable from a mnemonic; \
+             everything else below comes from the chain."
+        ));
+    }
+
+    let crate::scan::Gathered { outcomes, coverage, set } = crate::scan::gather(w, url, from, to);
+    let scans: Vec<AddressScan> = outcomes
+        .into_iter()
+        .map(|(div_index, address_short, outcome)| AddressScan { div_index, address_short, outcome })
+        .collect();
+    let ledger = build(&wallet, &scans, set.as_ref(), &coverage, log.as_ref(), (from, to));
+    HistoryReport { text: render(&ledger, url), notes }
+}
+
 #[cfg(test)]
 mod tests {
+    /// The local send log is optional enrichment; its absence is a NOTE, never a
+    /// missing ledger and never a silent blank.
+    ///
+    /// A restored wallet never has a `sends.v1` — it is written by `send` on one
+    /// machine and is not recoverable from a mnemonic — so this is the ordinary
+    /// state for anyone who moved wallets, not an edge case. The endpoint here is
+    /// dead as well, which is the harsher combination: no local record AND no
+    /// chain. Both facts must reach the caller.
+    #[test]
+    fn a_wallet_with_no_send_log_gets_a_note_and_still_gets_a_ledger() {
+        use crate::store::WalletDir;
+        use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
+        use rand::Rng;
+
+        let dir = std::env::temp_dir().join("qmb_history_report_no_log");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut entropy = [0u8; ENTROPY_LEN];
+        rand::rng().fill_bytes(&mut entropy);
+        let w = WalletDir::create(&dir, MasterSeed::from_entropy(entropy)).expect("create wallet");
+
+        let out = super::report(&dir, &w, "http://127.0.0.1:1", 0, 8);
+
+        assert!(
+            out.notes.iter().any(|n| n.contains(crate::sends::SENDS_FILE)),
+            "the absent local record must be NAMED: {:?}",
+            out.notes
+        );
+        assert!(!out.text.is_empty(), "a chain-only ledger still renders");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use qlab_cbserver::client::{LocatedNote, ScanStats, ShadowedNote, UnopenedOutput};
     use qlab_note::note::Note;
