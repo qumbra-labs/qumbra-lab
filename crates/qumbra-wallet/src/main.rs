@@ -25,6 +25,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("keygen") => keygen(&args[1..]),
         Some("restore") => restore(&args[1..]),
         Some("address") => address(&args[1..]),
+        Some("contact") => contact(&args[1..]),
         Some("backup") => backup(&args[1..]),
         Some("scan") => scan(&args[1..]),
         Some("history") => history(&args[1..]),
@@ -48,6 +49,9 @@ fn usage() {
          qumbra-wallet keygen  --dir DIR                 new seed (0600) + address 0; prints NO key material\n  \
          qumbra-wallet restore --dir DIR                 seed from a Qumbra mnemonic on STDIN\n  \
          qumbra-wallet address --dir DIR [--new|--index N]  show or allocate diversified addresses\n  \
+         qumbra-wallet contact add NAME QADDR --dir DIR  save a full address under a local name\n  \
+         qumbra-wallet contact list --dir DIR            show NAME → qs1… (short)\n  \
+         qumbra-wallet contact remove NAME --dir DIR     remove a local contact\n  \
          qumbra-wallet backup  --dir DIR --reveal        print the mnemonic (explicitly, once)\n  \
          qumbra-wallet scan    --dir DIR --url URL --to N [--from N]  balance via light-client scan\n  \
          qumbra-wallet history --dir DIR --url URL --to N [--from N]  this wallet's own ledger:\n\
@@ -56,7 +60,8 @@ fn usage() {
                             shown only where this wallet dir holds a local `sends.v1` record, and\n\
                             is labeled as such (a restored wallet never has one)\n  \
          qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n  \
-         qumbra-wallet send --dir DIR --url URL --node URL --scan-to N --to ADDR --amount BESSEL\n  \
+         qumbra-wallet send --dir DIR --url URL --node URL --scan-to N\n  \
+                            (--to ADDR | --to-contact NAME) --amount BESSEL\n  \
                             [--out FILE] [--no-submit]\n  \
                             scan → sync the commitment tree → build + PROVE (real STARK,\n  \
                             ~3 s / ~12 GB) → POST /v1/tx, printing the node's typed outcome\n\n\
@@ -150,6 +155,43 @@ fn address(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn contact(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use qumbra_wallet::contacts::ContactBook;
+
+    let dir = dir_of(args)?;
+    // A contact book belongs to a wallet dir, not merely an arbitrary path.
+    WalletDir::open(&dir)?;
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            let name = args.get(1).ok_or("contact add requires NAME")?;
+            let address = args.get(2).ok_or("contact add requires a full qaddr1… ADDRESS")?;
+            let saved = ContactBook::add(&dir, name, address)?;
+            println!("{} → {} (short)", saved.name, saved.short());
+            println!(
+                "confirm this fingerprint with the payee out of band — a saved name is not a \
+                 verified one"
+            );
+            Ok(())
+        }
+        Some("list") => {
+            for saved in ContactBook::load(&dir)?.entries() {
+                println!("{} → {} (short)", saved.name, saved.short());
+            }
+            Ok(())
+        }
+        Some("remove") => {
+            let name = args.get(1).ok_or("contact remove requires NAME")?;
+            ContactBook::remove(&dir, name)?;
+            println!("removed contact `{name}`");
+            Ok(())
+        }
+        Some(other) => {
+            Err(format!("unknown contact command `{other}` (use add, list, or remove)").into())
+        }
+        None => Err("contact requires add, list, or remove".into()),
+    }
+}
+
 /// The `miner_rkm` a node config needs so its coinbase pays THIS wallet
 /// (issue #246 join-docs gap): `hex(lane-major-LE(digest(rkm)))`, byte-for-byte
 /// the form `NodeConfig::miner_rkm_lanes` parses and the faucet's keygen
@@ -201,13 +243,33 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
     // buys the ability to scan one node and submit to another.
     let node_url = flag(args, "--node").unwrap_or(url);
     let scan_to: u64 = flag(args, "--scan-to").ok_or("send requires --scan-to HEIGHT")?.parse()?;
-    let to = flag(args, "--to").ok_or("send requires --to ADDRESS")?;
+    let to = flag(args, "--to");
+    let to_contact = flag(args, "--to-contact");
     let amount: u64 = flag(args, "--amount").ok_or("send requires --amount BESSEL")?.parse()?;
     let out = flag(args, "--out");
     let no_submit = has_flag(args, "--no-submit");
 
-    let recipient = qlab_wallet::address::Address::decode(to)
-        .ok_or("`--to` is not a valid qaddr1… address")?;
+    let (recipient, contact_name) = match (to, to_contact) {
+        (Some(_), Some(_)) => {
+            return Err("send requires exactly one of --to ADDRESS or --to-contact NAME; both were provided".into())
+        }
+        (None, None) => {
+            return Err("send requires exactly one of --to ADDRESS or --to-contact NAME".into())
+        }
+        (Some(address), None) => (
+            qlab_wallet::address::Address::decode(address)
+                .ok_or("`--to` is not a valid qaddr1… address")?,
+            None,
+        ),
+        (None, Some(name)) => (
+            qumbra_wallet::contacts::ContactBook::load(&dir)?.resolve(name)?,
+            Some(name.to_string()),
+        ),
+    };
+
+    if let Some(name) = &contact_name {
+        eprintln!("→ {name} ({})", recipient.short().encode());
+    }
 
     let w = WalletDir::open(&dir)?;
     let wallet = w.wallet();

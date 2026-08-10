@@ -4,6 +4,7 @@
 //!   keygen    new seed (0600) + address 0 — key material NEVER printed
 //!   restore   seed from a Qumbra mnemonic on STDIN (never argv)
 //!   address   show / allocate diversified addresses
+//!   contact   save / list / remove local names for full addresses
 //!   backup    the mnemonic, only behind --reveal, with a warning
 //!   scan      balance by light-client scan against a cbserver URL
 //!   send      scan → sync the tree → prove → POST /v1/tx (issue #276)
@@ -54,6 +55,7 @@
 //! wallet derives its own notes' nullifiers with the spend path's own
 //! derivation, and matches locally.
 
+pub mod contacts;
 pub mod history;
 pub mod net;
 pub mod send;
