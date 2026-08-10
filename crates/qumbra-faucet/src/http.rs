@@ -47,7 +47,7 @@
 //! rather than left to the no-scheme check that would have missed it.
 
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -58,6 +58,238 @@ use qlab_wallet::address::{Address, ADDR_HRP};
 
 use crate::service::{FaucetGate, RequestState};
 use crate::state::ServiceStatus;
+
+// ---------------------------------------------------------------------------
+// Client identity for the rate limiter (lab #308)
+// ---------------------------------------------------------------------------
+
+/// One IP network — a CIDR, or a bare address (treated as /32 or /128).
+///
+/// Hand-rolled rather than a dependency: the tree has no CIDR crate, and the
+/// only question this type answers is "is this IP inside the operator-named
+/// trusted-proxy set".
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IpNet {
+    addr: IpAddr,
+    prefix: u8,
+}
+
+impl IpNet {
+    fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err("empty CIDR".into());
+        }
+        let (addr_s, prefix) = match s.split_once('/') {
+            Some((a, p)) => {
+                let prefix: u8 = p
+                    .parse()
+                    .map_err(|_| format!("trusted_proxy_cidrs: bad prefix in `{s}`"))?;
+                (a.trim(), prefix)
+            }
+            None => {
+                let addr: IpAddr = s
+                    .parse()
+                    .map_err(|_| format!("trusted_proxy_cidrs: not an IP or CIDR: `{s}`"))?;
+                let prefix = match addr {
+                    IpAddr::V4(_) => 32,
+                    IpAddr::V6(_) => 128,
+                };
+                return Ok(IpNet { addr, prefix });
+            }
+        };
+        let addr: IpAddr = addr_s
+            .parse()
+            .map_err(|_| format!("trusted_proxy_cidrs: bad address in `{s}`"))?;
+        match addr {
+            IpAddr::V4(_) if prefix > 32 => {
+                return Err(format!("trusted_proxy_cidrs: IPv4 prefix > 32 in `{s}`"));
+            }
+            IpAddr::V6(_) if prefix > 128 => {
+                return Err(format!("trusted_proxy_cidrs: IPv6 prefix > 128 in `{s}`"));
+            }
+            _ => {}
+        }
+        Ok(IpNet { addr, prefix })
+    }
+
+    fn contains(&self, ip: IpAddr) -> bool {
+        match (self.addr, ip) {
+            (IpAddr::V4(net), IpAddr::V4(cand)) => {
+                let mask = v4_mask(self.prefix);
+                (u32::from(net) & mask) == (u32::from(cand) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(cand)) => {
+                let mask = v6_mask(self.prefix);
+                (u128::from(net) & mask) == (u128::from(cand) & mask)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn v4_mask(prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else if prefix >= 32 {
+        u32::MAX
+    } else {
+        u32::MAX << (32 - prefix)
+    }
+}
+
+fn v6_mask(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else if prefix >= 128 {
+        u128::MAX
+    } else {
+        u128::MAX << (128 - prefix)
+    }
+}
+
+/// The operator-named set of reverse-proxy hops whose `X-Forwarded-For` the
+/// rate limiter may honor.
+///
+/// **Default empty.** A faucet with no proxy in front must not be spoofable by
+/// a client that sets the header — that is the whole of lab #308's security
+/// claim, and the empty default is the load-bearing half of it. Deploy-side
+/// values (the compose bridge subnet, etc.) are the operator's, not this
+/// crate's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrustedProxies {
+    nets: Vec<IpNet>,
+    /// The original CIDR strings, kept so the startup banner can name them.
+    raw: Vec<String>,
+}
+
+impl TrustedProxies {
+    /// Parse a list of CIDR (or bare-IP) strings. An empty list is the default
+    /// posture and is always valid.
+    pub fn parse(cidrs: &[String]) -> Result<Self, String> {
+        let mut nets = Vec::with_capacity(cidrs.len());
+        let mut raw = Vec::with_capacity(cidrs.len());
+        for c in cidrs {
+            let net = IpNet::parse(c)?;
+            raw.push(c.trim().to_string());
+            nets.push(net);
+        }
+        Ok(TrustedProxies { nets, raw })
+    }
+
+    /// Whether the trust set is empty — the default, XFF-ignoring posture.
+    pub fn is_empty(&self) -> bool {
+        self.nets.is_empty()
+    }
+
+    /// Whether `ip` is inside any configured trusted-proxy network.
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        self.nets.iter().any(|n| n.contains(ip))
+    }
+
+    /// One line for the startup banner: which client-id posture is active.
+    ///
+    /// The #296 honesty voice — name the posture, do not leave the operator to
+    /// infer it from the absence of a warning.
+    pub fn posture_line(&self) -> String {
+        if self.nets.is_empty() {
+            "client-id: socket address only (no trusted_proxy_cidrs — X-Forwarded-For ignored)"
+                .to_string()
+        } else {
+            format!(
+                "client-id: X-Forwarded-For when remote is in trusted_proxy_cidrs [{}]",
+                self.raw.join(", ")
+            )
+        }
+    }
+}
+
+/// Resolve the client identity the rate limiter and access journal key on.
+///
+/// ## Parsing rule (lab #308) — cite this when the PR asks
+///
+/// 1. **Untrusted remote, or empty trust set.** Return the socket address and
+///    ignore `X-Forwarded-For` entirely. A direct-to-origin client must not be
+///    able to spoof its subnet by setting the header.
+/// 2. **Trusted remote.** Parse `X-Forwarded-For` as a comma-separated list of
+///    IPs (left = original client, right = most recent proxy hop — the usual
+///    reverse-proxy append order). Walk the list **right-to-left**, skipping
+///    addresses that are themselves inside the trusted-proxy set, and take the
+///    **first untrusted** address. That is the client as seen by the outermost
+///    trusted hop.
+/// 3. **Empty / unparseable XFF with a trusted remote.** Fall back to the
+///    socket address rather than inventing a client.
+///
+/// The returned string is what `qlab_faucet::policy::subnet_key` already accepts
+/// (an IP, optionally with a port): the socket form keeps `ip:port`; an
+/// XFF-derived form is the bare IP (the header carries no port).
+pub fn resolve_client(
+    remote: Option<&SocketAddr>,
+    x_forwarded_for: Option<&str>,
+    trusted: &TrustedProxies,
+) -> String {
+    let Some(socket) = remote else {
+        return String::new();
+    };
+    let socket_ip = socket.ip();
+
+    // (1) No trust, or the peer is not a named proxy → socket only.
+    if trusted.is_empty() || !trusted.contains(socket_ip) {
+        return socket.to_string();
+    }
+
+    // (2) Trusted hop: walk XFF right-to-left past further trusted hops.
+    let Some(xff) = x_forwarded_for.map(str::trim).filter(|s| !s.is_empty()) else {
+        return socket.to_string();
+    };
+    let ips = parse_xff_ips(xff);
+    for ip in ips.into_iter().rev() {
+        if !trusted.contains(ip) {
+            return ip.to_string();
+        }
+    }
+    // (3) Every hop was trusted or nothing parsed.
+    socket.to_string()
+}
+
+/// Split an `X-Forwarded-For` value into IPs, left-to-right. Unparseable
+/// entries are dropped rather than aborting the walk — a garbage hop is not
+/// a client identity we will key on.
+fn parse_xff_ips(header: &str) -> Vec<IpAddr> {
+    header
+        .split(',')
+        .filter_map(|part| {
+            let part = part.trim().trim_matches('"');
+            if part.is_empty() {
+                return None;
+            }
+            // `[v6]:port` or bare `[v6]`.
+            if let Some(rest) = part.strip_prefix('[') {
+                let end = rest.find(']')?;
+                return rest[..end].parse().ok();
+            }
+            // `v4:port` — only when the left side is a dotted quad, so a bare
+            // IPv6 (which also contains colons) is not truncated.
+            if part.bytes().filter(|&b| b == b'.').count() == 3 {
+                if let Some((ip, _port)) = part.rsplit_once(':') {
+                    if let Ok(v4) = ip.parse::<std::net::Ipv4Addr>() {
+                        return Some(IpAddr::V4(v4));
+                    }
+                }
+            }
+            part.parse().ok()
+        })
+        .collect()
+}
+
+/// The `X-Forwarded-For` header value on a request, if any.
+fn xff_header(request: &tiny_http::Request) -> Option<&str> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("X-Forwarded-For"))
+        .map(|h| h.value.as_str())
+}
 
 /// The address shape the form advertises, **derived from the decoder's own HRP**
 /// rather than restated (lab issue #296).
@@ -208,6 +440,19 @@ impl std::fmt::Debug for FaucetServer {
 }
 
 impl FaucetServer {
+    /// Bind `addr` and serve until [`Self::shutdown`], with the default empty
+    /// trust set (X-Forwarded-For ignored — lab #308's safe default).
+    ///
+    /// Prefer [`Self::start_with_trusted_proxies`] when the operator has named
+    /// reverse-proxy CIDRs.
+    pub fn start(
+        addr: &str,
+        gate: Arc<Mutex<FaucetGate>>,
+        status: Arc<Mutex<ServiceStatus>>,
+    ) -> io::Result<FaucetServer> {
+        Self::start_with_trusted_proxies(addr, gate, status, TrustedProxies::default())
+    }
+
     /// Bind `addr` and serve until [`Self::shutdown`].
     ///
     /// **A failure to bind is an error, never a warning.** The caller is expected to
@@ -215,10 +460,14 @@ impl FaucetServer {
     /// is not is worse than one that refused to start, because the failure is
     /// discovered by a user who cannot get funds and has no way to report it.
     /// `metrics_addr`/`telemetry_addr` have exactly this shape.
-    pub fn start(
+    ///
+    /// `trusted` is the operator-named reverse-proxy set (lab #308). Empty means
+    /// the rate limiter keys on the socket address only.
+    pub fn start_with_trusted_proxies(
         addr: &str,
         gate: Arc<Mutex<FaucetGate>>,
         status: Arc<Mutex<ServiceStatus>>,
+        trusted: TrustedProxies,
     ) -> io::Result<FaucetServer> {
         let server = tiny_http::Server::http(addr)
             .map_err(|e| io::Error::other(format!("listen_addr {addr}: {e}")))?;
@@ -236,7 +485,10 @@ impl FaucetServer {
         let thread = std::thread::spawn(move || {
             for mut request in worker.incoming_requests() {
                 worker_served.fetch_add(1, Ordering::Relaxed);
-                let client = request.remote_addr().map(|a| a.to_string()).unwrap_or_default();
+                // Lab #308: key the limiter on the real client when the peer is a
+                // named trusted proxy; otherwise on the socket address alone.
+                let client =
+                    resolve_client(request.remote_addr(), xff_header(&request), &trusted);
                 let method = request.method().clone();
                 // Query strings are ignored everywhere: this surface takes no
                 // parameters, so there is no input in a URL to get wrong — and
@@ -711,11 +963,18 @@ fn render_receipt(receipt: u64, state: &RequestState) -> String {
             "<p class=\"state\">Receipt <code>{receipt}</code> — waiting, position \
              <code>{position}</code>. Each grant ahead of you costs one note and one proof.</p>"
         ),
+        // Lab #307: the number is the applied height (service.rs fills it from
+        // `node.chain_state().tip_height()`), so the label must use the #296
+        // vocabulary rather than "submitted at chain height" — the same
+        // mislabel #296 fixed on the request page, one route over.
         RequestState::Granted { txid_hex, value_bessel, submitted_at_tip } => format!(
             "<p class=\"state yes\">Receipt <code>{receipt}</code> — <strong>granted</strong>. \
-             {} QMB, transaction <code>{}</code>, submitted at chain height \
+             {} QMB, transaction <code>{}</code>, applied height \
              <code>{submitted_at_tip}</code>. It is in the transaction pool and will be mined \
-             into a block; scan your wallet from that height.</p>",
+             into a block; scan your wallet from that height. \
+             <code>applied height</code> is how far this faucet's own node had applied when \
+             the grant was submitted — the same number the request page shows under that \
+             name.</p>",
             qmb(*value_bessel),
             esc(txid_hex),
         ),
@@ -1042,5 +1301,140 @@ mod tests {
         assert!(html.contains("<td>behind by</td><td><code>0 block(s)</code>"), "{html}");
         assert!(html.contains("<td>applied height</td><td><code>4116</code>"), "{html}");
         assert!(html.contains("<td>chain tip (headers)</td><td><code>4116</code>"), "{html}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Lab #308 — client identity behind a named trusted proxy
+    // -----------------------------------------------------------------------
+
+    fn bridge_trust() -> TrustedProxies {
+        TrustedProxies::parse(&["172.18.0.0/16".to_string()]).expect("bridge cidr")
+    }
+
+    fn sock(ip: &str, port: u16) -> SocketAddr {
+        SocketAddr::new(ip.parse().expect("ip"), port)
+    }
+
+    /// 🔴 Both directions, and a multi-hop walk (lab #308).
+    ///
+    /// 1. Bridge-sourced request with XFF → the forwarded address.
+    /// 2. Internet-sourced request with a forged XFF → the socket address.
+    /// 3. Multiple XFF entries → first untrusted walking right-to-left past
+    ///    trusted hops (the rule cited in `resolve_client`).
+    #[test]
+    fn client_resolution_honors_xff_only_from_a_trusted_proxy() {
+        let trust = bridge_trust();
+        assert!(!trust.is_empty());
+        assert!(trust.contains("172.18.0.2".parse().unwrap()));
+        assert!(!trust.contains("203.0.113.50".parse().unwrap()));
+
+        // (1) Caddy on the compose bridge, XFF = the real visitor.
+        let bridge = sock("172.18.0.2", 45678);
+        assert_eq!(
+            resolve_client(Some(&bridge), Some("203.0.113.50"), &trust),
+            "203.0.113.50",
+            "a bridge-sourced request must use the forwarded address"
+        );
+
+        // (2) A direct-to-origin client with a forged XFF must NOT be trusted —
+        // the empty default is the same claim; this is the non-empty case's
+        // other direction.
+        let internet = sock("198.51.100.7", 51234);
+        assert_eq!(
+            resolve_client(Some(&internet), Some("203.0.113.50"), &trust),
+            internet.to_string(),
+            "an internet-sourced request with a forged XFF uses the socket"
+        );
+
+        // Empty trust set: XFF is always ignored, even from the bridge.
+        assert_eq!(
+            resolve_client(Some(&bridge), Some("203.0.113.50"), &TrustedProxies::default()),
+            bridge.to_string(),
+            "default-empty trust must ignore XFF"
+        );
+
+        // (3) Multi-hop: client, untrusted middle, trusted rightmost.
+        // Walk right-to-left: skip 172.18.0.2 (trusted), take 198.51.100.9
+        // (first untrusted) — not the leftmost original, because an untrusted
+        // intermediate sits between the client and the trusted hop.
+        assert_eq!(
+            resolve_client(
+                Some(&bridge),
+                Some("203.0.113.50, 198.51.100.9, 172.18.0.2"),
+                &trust
+            ),
+            "198.51.100.9",
+            "right-to-left past trusted hops"
+        );
+
+        // Only trusted hops in the chain → fall back to the socket.
+        assert_eq!(
+            resolve_client(Some(&bridge), Some("172.18.0.5, 172.18.0.2"), &trust),
+            bridge.to_string(),
+        );
+
+        // Trusted remote, no XFF → socket.
+        assert_eq!(resolve_client(Some(&bridge), None, &trust), bridge.to_string());
+        assert_eq!(resolve_client(Some(&bridge), Some("  "), &trust), bridge.to_string());
+
+        // Spaces and a v4:port form in XFF still resolve.
+        assert_eq!(
+            resolve_client(Some(&bridge), Some(" 203.0.113.50:1234 "), &trust),
+            "203.0.113.50",
+        );
+    }
+
+    /// The startup banner names the active posture — #296 honesty voice.
+    #[test]
+    fn trusted_proxies_posture_line_names_the_active_posture() {
+        assert!(
+            TrustedProxies::default()
+                .posture_line()
+                .contains("no trusted_proxy_cidrs"),
+            "{}",
+            TrustedProxies::default().posture_line()
+        );
+        let line = bridge_trust().posture_line();
+        assert!(line.contains("X-Forwarded-For"), "{line}");
+        assert!(line.contains("172.18.0.0/16"), "{line}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Lab #307 — receipt label uses the #296 vocabulary
+    // -----------------------------------------------------------------------
+
+    /// 🔴 The receipt says "applied height", not "submitted at chain height".
+    ///
+    /// After #296 the request page and the receipt must use the same word for
+    /// the same number. Grep of this crate for the old phrase is the one-copy
+    /// lock: the assertion below fails if the live render reintroduces it.
+    #[test]
+    fn the_receipt_names_applied_height_not_submitted_at_chain_height() {
+        let html = render_receipt(
+            7,
+            &RequestState::Granted {
+                txid_hex: "deadbeef".into(),
+                value_bessel: qlab_faucet::DEFAULT_GRANT_BESSEL,
+                submitted_at_tip: 1984,
+            },
+        );
+        assert!(
+            html.contains("applied height"),
+            "receipt must use the #296 vocabulary: {html}"
+        );
+        assert!(
+            html.contains("<code>1984</code>"),
+            "the number itself must still render: {html}"
+        );
+        assert!(
+            !html.contains("submitted at chain height"),
+            "the old mislabel must be gone: {html}"
+        );
+        // The one-sentence pointer the page already carries, in the receipt's
+        // voice: same number, same name.
+        assert!(
+            html.contains("the same number the request page shows"),
+            "{html}"
+        );
     }
 }

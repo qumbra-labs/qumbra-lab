@@ -67,7 +67,7 @@ use qlab_wallet::address::{Address, Diversifier};
 use qlab_wallet::Wallet;
 use qumbra_faucet::config::FaucetServiceConfig;
 use qumbra_faucet::harvest::spendable_at_tip;
-use qumbra_faucet::http::FaucetServer;
+use qumbra_faucet::http::{FaucetServer, TrustedProxies};
 use qumbra_faucet::service::{
     FaucetNode, FaucetService, LocalSubmit, RequestState, SubmitRefusal,
 };
@@ -119,6 +119,16 @@ fn get_bytes(addr: SocketAddr, path: &str) -> (u16, String, Vec<u8>) {
 
 /// A real form POST — the exchange a browser makes.
 fn post_request(addr: SocketAddr, address: &str, ticket: Option<&str>) -> (u16, String, String) {
+    post_request_with_headers(addr, address, ticket, "")
+}
+
+/// Like [`post_request`], with extra raw header lines (each ending in `\r\n`).
+fn post_request_with_headers(
+    addr: SocketAddr,
+    address: &str,
+    ticket: Option<&str>,
+    extra_headers: &str,
+) -> (u16, String, String) {
     let mut body = format!("address={address}");
     if let Some(t) = ticket {
         body.push_str(&format!("&ticket={t}"));
@@ -128,7 +138,7 @@ fn post_request(addr: SocketAddr, address: &str, ticket: Option<&str>) -> (u16, 
         &format!(
             "POST /request HTTP/1.1\r\nHost: localhost\r\n\
              Content-Type: application/x-www-form-urlencoded\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+             Content-Length: {}\r\n{extra_headers}Connection: close\r\n\r\n{body}",
             body.len()
         ),
     )
@@ -935,4 +945,76 @@ fn post_restart_harvest_skips_spent_notes_and_availability_is_honest() {
         "Ready with only spent coinbases is the #310 defect: {:?}",
         snap.availability
     );
+}
+
+// ---------------------------------------------------------------------------
+// Lab #308 — XFF over real sockets (both directions)
+// ---------------------------------------------------------------------------
+
+/// 🔴 Over a real TCP socket: a trusted peer's XFF is the journal key; an
+/// untrusted peer's forged XFF is not.
+///
+/// The unit suite in `http.rs` covers the pure resolution rule (including the
+/// multi-hop walk). This test is the wire claim: the listener actually reads
+/// the header and the access journal records the subnet the limiter would
+/// charge. Localhost stands in for the compose bridge — we name `127.0.0.1/32`
+/// as the trusted hop, which is exactly what a single-hop reverse proxy looks
+/// like from the faucet's seat.
+#[test]
+fn xff_is_honored_only_when_the_peer_is_a_named_trusted_proxy() {
+    let wallet = faucet_wallet();
+    let mut node = TestNode::new();
+    let mut svc = service(&wallet, TicketPolicy::Required);
+    funded(&mut node, &mut svc, &wallet);
+    let gate = svc.gate();
+
+    // Direction 1: peer is trusted → journal keys on the forwarded address.
+    let trust = TrustedProxies::parse(&["127.0.0.1/32".to_string()]).expect("loopback trust");
+    let server = FaucetServer::start_with_trusted_proxies(
+        "127.0.0.1:0",
+        svc.gate(),
+        svc.status(),
+        trust,
+    )
+    .expect("bind");
+    let (_, addr) = requester(0x3080_0001);
+    let ticket = gate.lock().unwrap().issue_ticket(3081).encode();
+    let (status, _, _) = post_request_with_headers(
+        server.addr(),
+        &addr.encode(),
+        Some(&ticket),
+        "X-Forwarded-For: 203.0.113.50\r\n",
+    );
+    assert_eq!(status, 202);
+    let journal = server.journal().join("\n");
+    assert!(
+        journal.contains("subnet=203.0.113.0/24"),
+        "trusted peer + XFF must key on the forwarded subnet:\n{journal}"
+    );
+    assert!(
+        !journal.contains("subnet=127.0.0.0/24"),
+        "must not fall back to the socket subnet when XFF is honored:\n{journal}"
+    );
+    server.shutdown();
+
+    // Direction 2: empty trust (the default) → forged XFF is ignored.
+    let server = FaucetServer::start("127.0.0.1:0", svc.gate(), svc.status()).expect("bind");
+    let ticket = gate.lock().unwrap().issue_ticket(3082).encode();
+    let (status, _, _) = post_request_with_headers(
+        server.addr(),
+        &addr.encode(),
+        Some(&ticket),
+        "X-Forwarded-For: 203.0.113.50\r\n",
+    );
+    assert_eq!(status, 202);
+    let journal = server.journal().join("\n");
+    assert!(
+        journal.contains("subnet=127.0.0.0/24"),
+        "default-empty trust must key on the socket subnet:\n{journal}"
+    );
+    assert!(
+        !journal.contains("subnet=203.0.113.0/24"),
+        "a forged XFF must not move the journal key under empty trust:\n{journal}"
+    );
+    server.shutdown();
 }
