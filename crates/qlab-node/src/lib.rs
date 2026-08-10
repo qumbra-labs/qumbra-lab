@@ -49,6 +49,7 @@ pub mod mempool;
 pub mod metrics;
 mod node;
 mod persist;
+mod replay_progress;
 pub mod recovery;
 pub mod round;
 pub mod rpc;
@@ -87,6 +88,10 @@ pub use telemetry::{
     DURABLE_HEAD_SINCE_VERSION, LOCAL_COMMITMENT_SPLIT, READABLE_TELEMETRY_VERSIONS,
 };
 pub use persist::{read_records, LogRecord, Snapshot, BLOCK_LOG, FORMAT_VERSION, SNAPSHOT};
+pub use replay_progress::{
+    capture_progress, take_captured_progress, with_progress_capture,
+    REPLAY_PROGRESS_EVERY_RECORDS, REPLAY_PROGRESS_EVERY_SECS,
+};
 pub use store::{
     ChainStore, CommitmentStore, Hash32, MemChainStore, MemCommitmentStore, MemNullifierStore,
     NullifierStore, RewindError, StoredBlock, StoredHeader, StoredTx,
