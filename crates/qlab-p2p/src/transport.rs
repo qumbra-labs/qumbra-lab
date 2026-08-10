@@ -16,9 +16,12 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::peer::PeerId;
+use crate::sendstall::{
+    SendProgress, MAX_SEND_BACKLOG_BYTES_PER_PEER, SEND_STALL_WINDOW_MS, SEND_WRITE_TIMEOUT_MS,
+};
 use crate::wire::{FrameHeader, HEADER_LEN};
 
 /// Transport-level errors.
@@ -51,6 +54,21 @@ pub enum DialStart {
     Connected(PeerId),
     Pending,
     Failed(TransportError),
+}
+
+/// One connection reported stalled by [`Transport::stalled_peers`] (issue #289),
+/// with the evidence that produced the verdict.
+///
+/// `backlog` is the number `ss` calls `Send-Q` — 191,846 bytes on D4's wedged
+/// socket — and `stalled_ms` is how long none of it moved. Both are carried on
+/// the report because they are only true at the instant of the verdict, and
+/// because the operator has no other way to see them: this condition is invisible
+/// on the node's own TELEMETRY, which is the finding #289 actually reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StallReport {
+    pub peer: PeerId,
+    pub backlog: u64,
+    pub stalled_ms: u64,
 }
 
 /// One outbound dial that completed after [`DialStart::Pending`].
@@ -104,6 +122,30 @@ pub trait Transport {
     fn dropped_frames(&self) -> u64 {
         0
     }
+
+    /// **Connections that are open but are not carrying our bytes** (issue #289):
+    /// each has held an undelivered backlog with zero progress for the transport's
+    /// stall window ([`crate::sendstall`]).
+    ///
+    /// This is a *liveness* signal, not a fault: the peer may be blameless and
+    /// usually is — a silently dropped path (`iptables -j DROP`, a dead router)
+    /// leaves the socket `ESTABLISHED` on both sides with nobody at fault. The
+    /// caller's only sanctioned response is to close the connection and let
+    /// [`crate::addrman`]'s existing ladder re-dial. **Never a scoring input.**
+    ///
+    /// Transports without a send queue (the in-process hub) have nothing to
+    /// report and return empty, which keeps every deterministic sim unchanged.
+    ///
+    /// The report carries its own evidence rather than making the caller ask
+    /// again: the numbers are read under the transport's lock at the moment of
+    /// the verdict, and a second call would be a different instant.
+    fn stalled_peers(&self) -> Vec<StallReport> {
+        Vec::new()
+    }
+
+    /// Close one connection. Idempotent — a handle that is already gone is a
+    /// no-op. This is the only action [`Transport::stalled_peers`] licenses.
+    fn disconnect(&self, _id: PeerId) {}
 }
 
 // ==========================================================================
@@ -230,6 +272,14 @@ impl Transport for InProcTransport {
     fn peer_addr(&self, id: PeerId) -> Option<String> {
         self.hub.addr_of(id)
     }
+    /// Close = cut the link both ways, the in-process model of dropping a socket.
+    /// The hub keeps no send queue, so this transport never *reports* a stall
+    /// ([`Transport::stalled_peers`] stays empty here); it can still be told to
+    /// close a connection, which is what makes the node's own decision testable
+    /// on the deterministic transport.
+    fn disconnect(&self, id: PeerId) {
+        self.hub.unlink(self.id, id);
+    }
     /// Dial = resolve the bound address and link both ways. An address nobody
     /// bound is unreachable, exactly as a node behind a router is.
     fn dial(&self, addr: &str) -> DialStart {
@@ -291,9 +341,87 @@ struct Inbox {
     per_peer: HashMap<PeerId, u64>,
 }
 
+/// One connection's write half **plus the backlog the kernel would not take**
+/// (issue #289).
+///
+/// Before this the send path was `write_all` straight into the socket with no
+/// timeout, which has two consequences and the incident needed both: a peer that
+/// stops reading can park the node loop indefinitely, and — because nothing is
+/// ever queued in user space — the node has **no measurement at all** of a socket
+/// that is open but not moving. `ss` could see 191 KB stuck in the send queue;
+/// the node could not.
+///
+/// The backlog only ever holds bytes the kernel refused after waiting
+/// [`SEND_WRITE_TIMEOUT_MS`], and it is drained in order, so frames neither
+/// interleave nor reorder. Frames are refused whole at
+/// [`MAX_SEND_BACKLOG_BYTES_PER_PEER`] rather than truncated, so the peer's
+/// framing cannot desynchronise.
+struct PeerWriter {
+    stream: TcpStream,
+    /// Undelivered bytes, oldest first.
+    pending: Vec<u8>,
+    progress: SendProgress,
+}
+
+impl PeerWriter {
+    fn new(stream: TcpStream) -> PeerWriter {
+        PeerWriter { stream, pending: Vec::new(), progress: SendProgress::new() }
+    }
+
+    /// Queue one whole frame (or refuse it at the cap) and then hand the kernel
+    /// as much of the backlog as it will take.
+    fn send_frame(&mut self, now_ms: u64, frame: &[u8]) -> Result<(), TransportError> {
+        if self.pending.len() as u64 + frame.len() as u64 > MAX_SEND_BACKLOG_BYTES_PER_PEER {
+            // Congestion, not malice — the same boundary the receive queue draws.
+            // The frame is dropped whole; the connection stays up and the stall
+            // *window* is what rules on it.
+            self.progress.note_dropped_frame();
+        } else {
+            self.pending.extend_from_slice(frame);
+        }
+        self.flush(now_ms)
+    }
+
+    /// Push the backlog at the socket once, recording what the kernel accepted.
+    /// A short write is normal here and is **progress**, not failure.
+    fn flush(&mut self, now_ms: u64) -> Result<(), TransportError> {
+        let mut accepted = 0usize;
+        let mut fatal: Option<TransportError> = None;
+        while accepted < self.pending.len() {
+            match self.stream.write(&self.pending[accepted..]) {
+                Ok(0) => {
+                    fatal = Some(TransportError::Io("socket accepted no bytes".to_string()));
+                    break;
+                }
+                Ok(n) => accepted += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // SO_SNDTIMEO expiry: the buffer is full and stayed full. Keep the
+                // remainder and let the window decide — one slow write is not a
+                // verdict.
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    break
+                }
+                Err(e) => {
+                    fatal = Some(TransportError::Io(e.to_string()));
+                    break;
+                }
+            }
+        }
+        self.pending.drain(..accepted);
+        self.progress.observe(now_ms, accepted as u64, self.pending.len() as u64);
+        match fatal {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
 struct TcpShared {
     inbox: Mutex<Inbox>,
-    writers: Mutex<HashMap<PeerId, TcpStream>>,
+    writers: Mutex<HashMap<PeerId, PeerWriter>>,
     running: AtomicBool,
     next_id: AtomicU64,
     /// Handles of connections we **accepted** (as opposed to dialed), so the
@@ -312,11 +440,23 @@ struct TcpShared {
     dialing: Mutex<HashSet<String>>,
     /// Completed outbound connects, consumed by the main loop without waiting.
     dial_completions: Mutex<Vec<DialCompletion>>,
+    /// This transport's monotonic origin. The send path needs a clock and the
+    /// [`Transport`] trait deliberately has none (its callers pass `now_ms` where
+    /// a *decision* is made); a socket's write outcome is a fact about real time,
+    /// so it is timed here rather than fabricated from the node's logical clock.
+    epoch: Instant,
+    /// No-progress window before a connection is reported stalled (issue #289).
+    /// Defaults to [`SEND_STALL_WINDOW_MS`]; tunable for tests / testnets.
+    stall_window_ms: AtomicU64,
 }
 
 impl TcpShared {
     fn alloc_id(&self) -> PeerId {
         PeerId(self.next_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis().min(u64::MAX as u128) as u64
     }
 
     /// Queue one received frame, or drop it if either byte bound is reached.
@@ -370,6 +510,8 @@ impl TcpTransport {
             dropped: AtomicU64::new(0),
             dialing: Mutex::new(HashSet::new()),
             dial_completions: Mutex::new(Vec::new()),
+            epoch: Instant::now(),
+            stall_window_ms: AtomicU64::new(SEND_STALL_WINDOW_MS),
         });
         let mut threads = Vec::new();
 
@@ -481,6 +623,32 @@ impl TcpTransport {
         self.shared.inbox.lock().unwrap().bytes
     }
 
+    /// Undelivered **outbound** bytes held for one peer (ops / tests) — the number
+    /// `ss` calls `Send-Q` and that the node could not see before issue #289.
+    pub fn backlog_bytes(&self, id: PeerId) -> u64 {
+        self.shared.writers.lock().unwrap().get(&id).map(|w| w.progress.backlog()).unwrap_or(0)
+    }
+
+    /// Re-tune the no-progress window (tests / testnet). Deliberately programmatic
+    /// rather than a config key: like the rate limits, this number should move
+    /// because a measurement said so.
+    pub fn set_send_stall_window_ms(&self, ms: u64) {
+        self.shared.stall_window_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// Try once to drain every backlog. Called before a stall verdict so a link
+    /// that recovered while we had nothing to say still clears its window — the
+    /// alternative is a false close on a socket that came back quietly.
+    fn drain_backlogs(&self) {
+        let now = self.shared.now_ms();
+        let mut writers = self.shared.writers.lock().unwrap();
+        for w in writers.values_mut() {
+            if w.progress.backlog() > 0 {
+                let _ = w.flush(now);
+            }
+        }
+    }
+
     /// Register a connected stream: store its write half, spawn a reader thread,
     /// and return the local peer handle. `inbound` records which half of the
     /// connection budget it consumes.
@@ -491,8 +659,13 @@ impl TcpTransport {
         // next frame instead of erroring `WouldBlock` and exiting the thread.
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_nodelay(true);
+        // Issue #289: bound how long one write may hold the node loop. `SO_SNDTIMEO`
+        // and not non-blocking mode, because the reader thread's blocking
+        // `read_exact` shares this socket through `try_clone` (a `dup`, so
+        // `O_NONBLOCK` would follow it) — the send timeout does not.
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(SEND_WRITE_TIMEOUT_MS)));
         let writer = stream.try_clone().expect("clone tcp stream for writing");
-        shared.writers.lock().unwrap().insert(id, writer);
+        shared.writers.lock().unwrap().insert(id, PeerWriter::new(writer));
         if inbound {
             shared.inbound.lock().unwrap().insert(id);
         }
@@ -534,8 +707,8 @@ impl TcpTransport {
     pub fn shutdown(&self) {
         self.shared.running.store(false, Ordering::SeqCst);
         // Shut down every socket so blocking reader threads unblock and exit.
-        for (_, s) in self.shared.writers.lock().unwrap().drain() {
-            let _ = s.shutdown(std::net::Shutdown::Both);
+        for (_, w) in self.shared.writers.lock().unwrap().drain() {
+            let _ = w.stream.shutdown(std::net::Shutdown::Both);
         }
         for h in self.threads.lock().unwrap().drain(..) {
             let _ = h.join();
@@ -545,11 +718,13 @@ impl TcpTransport {
 
 impl Transport for TcpTransport {
     fn send(&self, to: PeerId, frame: &[u8]) -> Result<(), TransportError> {
-        let writers = self.shared.writers.lock().unwrap();
-        let mut stream = writers.get(&to).ok_or(TransportError::NotConnected(to))?;
-        // Serialised by the writers lock, so frames never interleave on a socket.
-        stream.write_all(frame).map_err(|e| TransportError::Io(e.to_string()))?;
-        stream.flush().map_err(|e| TransportError::Io(e.to_string()))
+        let now = self.shared.now_ms();
+        let mut writers = self.shared.writers.lock().unwrap();
+        let w = writers.get_mut(&to).ok_or(TransportError::NotConnected(to))?;
+        // Serialised by the writers lock, so frames never interleave on a socket —
+        // and now bounded in time as well: a peer that stopped reading costs one
+        // `SEND_WRITE_TIMEOUT_MS`, not the node loop (issue #289).
+        w.send_frame(now, frame)
     }
     fn poll(&self) -> Vec<(PeerId, Vec<u8>)> {
         // Draining releases the whole byte budget in one step, so the accounting
@@ -572,6 +747,35 @@ impl Transport for TcpTransport {
     }
     fn dropped_frames(&self) -> u64 {
         self.shared.dropped.load(Ordering::SeqCst)
+    }
+    /// Issue #289. Every backlog is offered to the kernel one more time first, so
+    /// a link that came back while we were quiet clears its window instead of
+    /// being closed on stale evidence.
+    fn stalled_peers(&self) -> Vec<StallReport> {
+        self.drain_backlogs();
+        let now = self.shared.now_ms();
+        let window = self.shared.stall_window_ms.load(Ordering::SeqCst);
+        let writers = self.shared.writers.lock().unwrap();
+        let mut v: Vec<StallReport> = writers
+            .iter()
+            .filter(|(_, w)| w.progress.is_stalled(now, window))
+            .map(|(id, w)| StallReport {
+                peer: *id,
+                backlog: w.progress.backlog(),
+                stalled_ms: w.progress.stalled_for_ms(now),
+            })
+            .collect();
+        v.sort_by_key(|r| r.peer);
+        v
+    }
+    fn disconnect(&self, id: PeerId) {
+        let writer = self.shared.writers.lock().unwrap().remove(&id);
+        if let Some(w) = writer {
+            // Unblocks the reader thread, which then clears the rest of this
+            // handle's rows (inbound slot, remote address) exactly as it does for
+            // a peer that hung up on us.
+            let _ = w.stream.shutdown(std::net::Shutdown::Both);
+        }
     }
 }
 
@@ -737,6 +941,8 @@ mod tests {
             dropped: AtomicU64::new(0),
             dialing: Mutex::new(HashSet::new()),
             dial_completions: Mutex::new(Vec::new()),
+            epoch: Instant::now(),
+            stall_window_ms: AtomicU64::new(SEND_STALL_WINDOW_MS),
         })
     }
 
@@ -815,6 +1021,174 @@ mod tests {
         // The outbound-only participant has no address, on this transport as on a
         // real net — the rate limiter falls back to the handle.
         assert_eq!(a.peer_addr(PeerId(3)), None);
+    }
+
+    // ================= send-path stalls (issue #289) =================
+
+    /// A frame big enough to fill kernel buffers in a handful of writes.
+    fn fat_frame() -> Vec<u8> {
+        Envelope::new(MsgType::Ping, vec![0xab; 1024 * 1024]).encode()
+    }
+
+    /// Push frames at `pid` until the kernel stops taking them, or give up.
+    /// Returns the backlog reached.
+    fn fill_until_backlog(t: &TcpTransport, pid: PeerId, max_frames: usize) -> u64 {
+        let frame = fat_frame();
+        for _ in 0..max_frames {
+            let _ = t.send(pid, &frame);
+            if t.backlog_bytes(pid) > 0 {
+                break;
+            }
+        }
+        t.backlog_bytes(pid)
+    }
+
+    #[test]
+    fn a_peer_that_stops_reading_produces_a_backlog_a_stall_verdict_and_recovers_from_it() {
+        // Issue #289's mechanism on a real socket. The listener is bound and never
+        // accepted: the kernel completes the handshake, so the connection is
+        // ESTABLISHED on both sides and nobody is reading — which is exactly what
+        // an `iptables -j DROP` partition leaves behind, and what the node had no
+        // way to observe.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let client = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let pid = client.connect(&target).unwrap();
+
+        let backlog = fill_until_backlog(&client, pid, 40);
+        assert!(backlog > 0, "the socket never refused a byte; buffers larger than expected");
+
+        // A backlog alone is NOT a verdict — that is the whole "no progress, not
+        // slowness" rule, at the transport this time.
+        client.set_send_stall_window_ms(10 * 60_000);
+        assert!(client.stalled_peers().is_empty(), "inside the window, nothing is dropped");
+
+        client.set_send_stall_window_ms(1);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let reports = client.stalled_peers();
+        assert_eq!(reports.len(), 1, "past the window the wedged socket is named");
+        assert_eq!(reports[0].peer, pid);
+        assert!(reports[0].backlog > 0, "and the report carries the Send-Q the node could not see");
+
+        // Now the peer starts reading again — a route that came back. The verdict
+        // must evaporate on its own: a false close costs a reconnect, and the
+        // detector is supposed to be biased against that.
+        let (stream, _) = listener.accept().unwrap();
+        let reader = std::thread::spawn(move || {
+            let mut s = stream;
+            let mut buf = vec![0u8; 256 * 1024];
+            let deadline = Instant::now() + std::time::Duration::from_secs(10);
+            while Instant::now() < deadline {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        });
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if client.stalled_peers().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "a reading peer never cleared the stall");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(client.backlog_bytes(pid), 0, "the backlog drained rather than being dropped");
+
+        client.shutdown();
+        let _ = reader.join();
+    }
+
+    #[test]
+    fn a_peer_that_keeps_reading_never_builds_a_backlog() {
+        // The false-positive side: a healthy socket under real load must produce
+        // no backlog at all, so no window length can make it a stall.
+        let server = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let client = TcpTransport::bind("127.0.0.1:0").unwrap();
+        client.set_send_stall_window_ms(1);
+        let pid = client.connect(&server.local_addr().to_string()).unwrap();
+
+        let frame = fat_frame();
+        for _ in 0..16 {
+            client.send(pid, &frame).expect("a reading peer accepts every frame");
+            // Drain the receive side so the *inbox* bound is not what is under test.
+            let _ = server.poll();
+            assert_eq!(client.backlog_bytes(pid), 0, "nothing was ever refused");
+            assert!(client.stalled_peers().is_empty(), "and no verdict at any window");
+        }
+
+        server.shutdown();
+        client.shutdown();
+    }
+
+    #[test]
+    fn a_dropped_connection_is_gone_from_the_peer_set() {
+        // `disconnect` is the only action a stall verdict licenses; it must be a
+        // real close, so the addrman's live-handle reconcile sees the address free.
+        let server = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let client = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let pid = client.connect(&server.local_addr().to_string()).unwrap();
+        assert_eq!(client.peers(), vec![pid]);
+
+        client.disconnect(pid);
+        assert!(client.peers().is_empty(), "the handle is gone immediately, not eventually");
+        client.disconnect(pid); // idempotent
+        assert_eq!(
+            client.send(pid, &Envelope::new(MsgType::Ping, vec![]).encode()),
+            Err(TransportError::NotConnected(pid))
+        );
+
+        server.shutdown();
+        client.shutdown();
+    }
+
+    #[test]
+    fn the_in_process_transport_reports_no_stalls_and_still_closes_on_request() {
+        // Deterministic sims are unchanged by #289: the hub has no send queue, so
+        // it never produces a verdict — but it can be told to close, which is what
+        // makes the node's decision testable without a socket.
+        let hub = InProcHub::new();
+        let a = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let b = InProcTransport::new(PeerId(2), Arc::clone(&hub));
+        hub.link(PeerId(1), PeerId(2));
+        assert!(a.stalled_peers().is_empty());
+
+        a.disconnect(PeerId(2));
+        assert!(a.stalled_peers().is_empty());
+        assert!(a.send(PeerId(2), &Envelope::new(MsgType::Ping, vec![]).encode()).is_err());
+        assert!(b.poll().is_empty());
+    }
+
+    #[test]
+    fn the_send_backlog_refuses_whole_frames_at_its_cap() {
+        // Frame-aligned refusal: a truncated frame in the backlog would
+        // desynchronise the peer's framing, which is worse than a dropped message.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = listener.local_addr().unwrap().to_string();
+        let client = TcpTransport::bind("127.0.0.1:0").unwrap();
+        let pid = client.connect(&target).unwrap();
+        assert!(fill_until_backlog(&client, pid, 40) > 0, "buffers larger than expected");
+
+        let frame = fat_frame();
+        for _ in 0..20 {
+            let _ = client.send(pid, &frame);
+        }
+        let backlog = client.backlog_bytes(pid);
+        assert!(backlog <= MAX_SEND_BACKLOG_BYTES_PER_PEER, "backlog {backlog} exceeded its cap");
+        assert!(
+            backlog + frame.len() as u64 > MAX_SEND_BACKLOG_BYTES_PER_PEER,
+            "backlog {backlog} should be within one frame of the cap"
+        );
+        // At the cap the next frames are refused **whole**: the backlog neither
+        // grows nor gains a truncated frame that would desynchronise the peer.
+        for _ in 0..4 {
+            let _ = client.send(pid, &frame);
+        }
+        assert_eq!(client.backlog_bytes(pid), backlog, "frames are refused, not truncated in");
+
+        client.shutdown();
+        drop(listener);
     }
 
     #[test]

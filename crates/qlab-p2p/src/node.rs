@@ -31,6 +31,7 @@ use crate::gossip::{
 use crate::n1::{IngestOutcome, NodeState, VotesOutcome};
 use crate::peer::{NodeId, PeerId, PeerTable, VersionMsg};
 use crate::ratelimit::{RateKey, RateLimiter, RateLimits, RateStats};
+use crate::sendstall::stall_line;
 use crate::sync::{build_locator, answer_get_headers, SyncPhase, SyncState, MAX_HEADERS_PER_BATCH};
 use qlab_devnet::finality::next_checkpoint_height;
 use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
@@ -626,6 +627,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// Returns how many dials succeeded.
     pub fn maintain(&mut self, now_ms: u64) -> usize {
         let mut connected = self.finish_dials(now_ms);
+        // Issue #289, and it must run BEFORE the live-handle reconcile below: a
+        // connection dropped here has to be gone from `transport.peers()` by the
+        // time `sync_live` runs, or the address stays "connected" in the book and
+        // the ladder suppresses the re-dial for another whole pass.
+        self.drop_stalled_connections();
         let live: HashSet<PeerId> = self.transport.peers().into_iter().collect();
         self.addrs.sync_live(&live);
         for pid in self.peers.all_peers() {
@@ -672,6 +678,48 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         }
         connected
+    }
+
+    /// **Close connections that are open but not carrying our bytes** (issue
+    /// #289), returning the handles dropped.
+    ///
+    /// D4's node2 sat twenty minutes on a losing branch after the partition
+    /// healed because a partition-era socket stayed `ESTABLISHED` with 191 KB
+    /// stuck in its send queue: the node counts sockets, so it counted that dead
+    /// connection as its live path to the other side and never re-dialed. It
+    /// converged when the *kernel* gave up, not on anything the node decided.
+    ///
+    /// Three properties, and each is a decision this baton was asked to take:
+    ///
+    /// 1. **It closes, it does not route around.** Dropping the handle is what
+    ///    lets [`crate::addrman`]'s existing ladder — one path, one cap, one
+    ///    backoff (#86) — re-dial on the very next pass. There is deliberately no
+    ///    second dial path here; adding one is how a node ends up exceeding a cap
+    ///    it believes it is enforcing.
+    /// 2. **It does not score the peer.** A stalled socket is a dead path, not
+    ///    misbehaviour — usually nobody's fault at all, since a silently dropped
+    ///    route leaves both ends `ESTABLISHED`. Penalising it would ban honest
+    ///    peers for the network's failure, which is the S5 / `is_peer_fault`
+    ///    discipline this crate already applies to throttled frames and
+    ///    unusable-but-well-formed objects.
+    /// 3. **It does not record a dial failure either.** `on_dial_failure` is the
+    ///    backoff ladder's input, and this address *was* reachable; charging it a
+    ///    backoff rung would delay the reconnection this exists to cause. The
+    ///    entry stays `dialable` (sticky, #86) and keeps `failures = 0`.
+    ///
+    /// Inbound connections are dropped on the same evidence. We may have no
+    /// address to re-dial them at, but a wedged inbound socket is still not a
+    /// serving path, and holding it consumes a slot the accept path enforces.
+    pub fn drop_stalled_connections(&mut self) -> Vec<PeerId> {
+        let stalled = self.transport.stalled_peers();
+        for r in &stalled {
+            let addr = self.transport.peer_addr(r.peer);
+            // The whole finding is that this is invisible from inside the node it
+            // happens to, so the drop says what it saw.
+            println!("{}", stall_line(r.peer.0, addr.as_deref(), r.backlog, r.stalled_ms));
+            self.transport.disconnect(r.peer);
+        }
+        stalled.into_iter().map(|r| r.peer).collect()
     }
 
     /// Apply connector-thread results on the main loop. The completion timestamp
@@ -3564,6 +3612,191 @@ mod tests {
 
         server.shutdown();
         node.transport().shutdown();
+    }
+
+    // ============== wedged ESTABLISHED sockets (issue #289) ==============
+
+    /// An in-process transport that reports whatever send-stall verdict the test
+    /// hands it, and records the dials and closes the node performs.
+    ///
+    /// A socket that is `ESTABLISHED` while carrying nothing cannot be produced
+    /// in a deterministic sim — on the live net it took a silent 2+2 partition to
+    /// produce once — so the *signal* is modelled here and what is under test is
+    /// the node's **decision**: close, re-dial through the one existing ladder,
+    /// and charge the peer nothing. The signal itself is tested on real sockets
+    /// in [`crate::transport`] and as a state machine in [`crate::sendstall`].
+    struct StallTransport {
+        inner: InProcTransport,
+        stalled: Arc<std::sync::Mutex<Vec<crate::transport::StallReport>>>,
+        dials: Arc<std::sync::Mutex<Vec<String>>>,
+        closed: Arc<std::sync::Mutex<Vec<PeerId>>>,
+    }
+
+    impl Transport for StallTransport {
+        fn send(&self, to: PeerId, frame: &[u8]) -> Result<(), TransportError> {
+            self.inner.send(to, frame)
+        }
+        fn poll(&self) -> Vec<(PeerId, Vec<u8>)> {
+            self.inner.poll()
+        }
+        fn peers(&self) -> Vec<PeerId> {
+            self.inner.peers()
+        }
+        fn peer_addr(&self, id: PeerId) -> Option<String> {
+            self.inner.peer_addr(id)
+        }
+        fn dial(&self, addr: &str) -> DialStart {
+            self.dials.lock().unwrap().push(addr.to_string());
+            self.inner.dial(addr)
+        }
+        fn stalled_peers(&self) -> Vec<crate::transport::StallReport> {
+            self.stalled.lock().unwrap().clone()
+        }
+        fn disconnect(&self, id: PeerId) {
+            self.closed.lock().unwrap().push(id);
+            self.stalled.lock().unwrap().retain(|r| r.peer != id);
+            self.inner.disconnect(id);
+        }
+    }
+
+    /// A node whose one seed is a reachable peer, plus the handles a test needs to
+    /// wedge its socket and watch what the node does about it.
+    #[allow(clippy::type_complexity)]
+    fn stall_net() -> (
+        P2pNode<StallTransport, StubNode>,
+        Arc<std::sync::Mutex<Vec<crate::transport::StallReport>>>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<std::sync::Mutex<Vec<PeerId>>>,
+    ) {
+        let hub = InProcHub::new();
+        let _peer = InProcTransport::new(PeerId(2), Arc::clone(&hub));
+        hub.bind_addr("peer:9333", PeerId(2));
+        let stalled = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dials = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let closed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let t = StallTransport {
+            inner: InProcTransport::new(PeerId(1), Arc::clone(&hub)),
+            stalled: Arc::clone(&stalled),
+            dials: Arc::clone(&dials),
+            closed: Arc::clone(&closed),
+        };
+        // The hub outlives the node through the transports' Arc clones.
+        let mut node = P2pNode::new(t, stub(), [1; 32]);
+        node.addrs_mut().add_seed("peer:9333".to_string());
+        (node, stalled, dials, closed)
+    }
+
+    fn wedged(peer: PeerId) -> crate::transport::StallReport {
+        // D4's actual numbers: 191,846 bytes queued, and by the time it was read
+        // the socket had been going nowhere for minutes.
+        crate::transport::StallReport { peer, backlog: 191_846, stalled_ms: 121_000 }
+    }
+
+    #[test]
+    fn a_wedged_socket_is_dropped_and_redialled_through_the_addrman_ladder() {
+        // The D4 defect, in one pass: the node counted a dead ESTABLISHED socket
+        // as its live path and never re-dialed, converging ~20 min later only when
+        // the kernel gave up.
+        let (mut node, stalled, dials, closed) = stall_net();
+        assert_eq!(node.maintain(0), 1, "the seed connects");
+        assert_eq!(dials.lock().unwrap().len(), 1);
+        assert!(node.addrs().entry("peer:9333").unwrap().dialable);
+
+        // A healthy connection is left alone — no churn from merely running.
+        node.maintain(1_000);
+        assert_eq!(dials.lock().unwrap().len(), 1, "a live path is never re-dialed");
+        assert!(closed.lock().unwrap().is_empty());
+
+        // Now the socket wedges: still open, carrying nothing.
+        stalled.lock().unwrap().push(wedged(PeerId(2)));
+        let reconnected = node.maintain(2_000);
+
+        assert_eq!(closed.lock().unwrap().as_slice(), &[PeerId(2)], "the dead path is closed");
+        assert_eq!(reconnected, 1, "and the node is connected again on the SAME pass");
+        let d = dials.lock().unwrap().clone();
+        assert_eq!(d.len(), 2, "exactly one re-dial: {d:?}");
+        assert_eq!(d[1], "peer:9333", "and it went to the address the book already held");
+        let e = node.addrs().entry("peer:9333").unwrap();
+        assert!(e.connected.is_some(), "the book knows about the new connection");
+        assert!(e.dialable, "the address was reachable and still is");
+        assert_eq!(e.failures, 0, "a stalled socket is not a failed dial");
+    }
+
+    #[test]
+    fn dropping_a_stalled_connection_does_not_score_the_peer() {
+        // S5 / is_peer_fault: a stalled socket is a dead path, not misbehaviour —
+        // and usually nobody's fault at all, since a silently dropped route leaves
+        // both ends ESTABLISHED. Penalising it would ban honest peers for the
+        // network's failure.
+        let (mut node, stalled, _dials, _closed) = stall_net();
+        node.maintain(0);
+        let before = node.peers().get(PeerId(2)).expect("peer row exists").score;
+
+        stalled.lock().unwrap().push(wedged(PeerId(2)));
+        assert_eq!(node.drop_stalled_connections(), vec![PeerId(2)]);
+
+        let after = node.peers().get(PeerId(2)).expect("row survives the close itself");
+        assert_eq!(after.score, before, "the drop cost the peer nothing");
+        assert!(!node.peers().is_banned(PeerId(2)));
+        // And nothing was charged to the address either: no backoff rung, no
+        // failure count, still gossipable.
+        let e = node.addrs().entry("peer:9333").unwrap();
+        assert_eq!(e.failures, 0);
+        assert_eq!(node.addrs().gossipable(), vec!["peer:9333".to_string()]);
+    }
+
+    #[test]
+    fn the_redial_after_a_stall_obeys_the_ladders_backoff() {
+        // "Prefer reusing the existing re-dial ladder over inventing a second
+        // one." The proof is negative: put the address inside its backoff, wedge
+        // the socket, and watch the drop happen with NO dial — a second path would
+        // have dialed anyway.
+        let (mut node, stalled, dials, closed) = stall_net();
+        node.maintain(0);
+        assert_eq!(dials.lock().unwrap().len(), 1);
+        // One failure rung: DIAL_BACKOFF_START_MS doubles to 2 s, so the ladder
+        // will not dial this address again before t=2000.
+        node.addrs_mut().on_dial_failure("peer:9333", 0);
+        node.addrs_mut().on_dial_success("peer:9333", PeerId(2)); // …but connected now
+
+        stalled.lock().unwrap().push(wedged(PeerId(2)));
+        node.maintain(500);
+        assert_eq!(closed.lock().unwrap().len(), 1, "the dead path is still closed at once");
+        assert_eq!(
+            dials.lock().unwrap().len(),
+            1,
+            "and NOT re-dialed: the ladder's backoff is in force, so this is its dial"
+        );
+
+        // 2 × DIAL_BACKOFF_START_MS later the ladder allows the retry, and the
+        // reconnection arrives through it.
+        node.maintain(2 * crate::addrman::DIAL_BACKOFF_START_MS + 1);
+        assert_eq!(dials.lock().unwrap().len(), 2, "the ladder dials when the ladder says so");
+        assert_eq!(node.addrs().outbound_live(), 1, "and the node is connected again");
+    }
+
+    #[test]
+    fn a_connection_the_transport_does_not_report_is_never_touched() {
+        // The false-close side at the node layer: with no verdict there is no
+        // close, however long the node runs.
+        let (mut node, _stalled, dials, closed) = stall_net();
+        node.maintain(0);
+        for i in 1..20u64 {
+            node.maintain(i * crate::addrman::DIAL_RETRY_INTERVAL_MS);
+        }
+        assert!(closed.lock().unwrap().is_empty(), "nothing was dropped");
+        assert_eq!(dials.lock().unwrap().len(), 1, "and nothing was re-dialed");
+        assert_eq!(node.addrs().outbound_live(), 1);
+    }
+
+    #[test]
+    fn the_node_has_exactly_one_dial_call_site() {
+        // #86 folded S9's re-dial into the addrman for "one path, one cap, one
+        // backoff"; #289's fix must not quietly reintroduce a second one. The
+        // needle is assembled at runtime so this assertion cannot match itself.
+        let needle = format!("self.transport{}dial(", ".");
+        let hits = include_str!("node.rs").matches(&needle).count();
+        assert_eq!(hits, 1, "expected one dial call site in node.rs, found {hits}");
     }
 
     #[test]
