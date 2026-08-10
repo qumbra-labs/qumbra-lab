@@ -77,6 +77,7 @@ pub mod diversifier;
 pub mod keys;
 pub mod mnemonic;
 pub mod seed;
+pub mod uri;
 pub mod viewing;
 
 pub use viewing::{Fvk, Ivk, Wallet};
