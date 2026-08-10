@@ -47,7 +47,7 @@
 //! to be complete, or an endpoint that is simply not there all end in
 //! `UNAVAILABLE` with the reason, never in a number.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
 use qlab_air::narrow::derive_input;
 use qlab_cbserver::client::LocatedNote;
@@ -162,20 +162,31 @@ impl std::fmt::Display for SpentRefusal {
 
 impl std::error::Error for SpentRefusal {}
 
-/// The chain's spent nullifiers over a range, and **how much of that range the
-/// stream actually covered** — the second half being the part a balance depends
-/// on.
+/// The chain's spent nullifiers over a range, **the height each one was
+/// published at**, and **how much of that range the stream actually covered** —
+/// the last being the part a balance depends on.
+///
+/// The heights are what makes `history` possible at all (the ledger baton): a
+/// spend event's date is the height of the block whose nullifier list carries
+/// the note's nullifier, and that block is exactly what this wire already
+/// serves. Nothing new is fetched for it — the same pages, one field kept
+/// instead of discarded.
 #[derive(Clone, Debug, Default)]
 pub struct SpentSet {
     /// The contiguous height range actually served, or `None` when the endpoint
     /// held no block in the requested range at all.
     pub covered: Option<(u64, u64)>,
-    nullifiers: BTreeSet<[u8; 32]>,
+    /// nullifier → the height of the block that published it. **First
+    /// occurrence wins**: consensus forbids a nullifier appearing twice on one
+    /// chain, so a repeat is a serving fault rather than a fact, and the earlier
+    /// height is the one that could possibly be true.
+    nullifiers: BTreeMap<[u8; 32], u64>,
 }
 
 impl SpentSet {
-    /// Build a set from nullifiers a caller obtained some other way — an
-    /// in-process node, a fixture, a chain reader that is not this HTTP client.
+    /// Build a set from `(height, nullifier)` pairs a caller obtained some other
+    /// way — an in-process node, a fixture, a chain reader that is not this HTTP
+    /// client.
     ///
     /// 🔴 **`covered` is the caller's claim and is not checked here**, which is
     /// why [`fetch_spent`] exists and is what the CLI uses: over the wire the
@@ -183,14 +194,24 @@ impl SpentSet {
     /// asserted. This constructor is for callers who already know it.
     pub fn from_parts(
         covered: Option<(u64, u64)>,
-        nullifiers: impl IntoIterator<Item = [u8; 32]>,
+        nullifiers: impl IntoIterator<Item = (u64, [u8; 32])>,
     ) -> SpentSet {
-        SpentSet { covered, nullifiers: nullifiers.into_iter().collect() }
+        let mut map: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+        for (height, nf) in nullifiers {
+            map.entry(nf).or_insert(height);
+        }
+        SpentSet { covered, nullifiers: map }
     }
 
     /// Is this nullifier on the chain, within the covered range?
     pub fn contains(&self, nf: &[u8; 32]) -> bool {
-        self.nullifiers.contains(nf)
+        self.nullifiers.contains_key(nf)
+    }
+
+    /// The height of the block that published this nullifier, if the covered
+    /// range carries it — the chain's own date for a spend.
+    pub fn height_of(&self, nf: &[u8; 32]) -> Option<u64> {
+        self.nullifiers.get(nf).copied()
     }
 
     /// How many distinct nullifiers the covered range published (everyone's,
@@ -247,7 +268,7 @@ pub fn fetch_spent(
     from: u64,
     to: u64,
 ) -> Result<SpentSet, SpentRefusal> {
-    let mut set = SpentSet { covered: None, nullifiers: BTreeSet::new() };
+    let mut set = SpentSet { covered: None, nullifiers: BTreeMap::new() };
     let mut cursor = from;
     loop {
         let page = source
@@ -276,7 +297,10 @@ pub fn fetch_spent(
                 }
                 _ => {}
             }
-            set.nullifiers.extend(nfs.iter().copied());
+            for nf in nfs {
+                // First occurrence wins — see the field's doc comment.
+                set.nullifiers.entry(*nf).or_insert(height);
+            }
             set.covered = Some((set.covered.map_or(height, |(f, _)| f), height));
         }
         let (_, last) = set.covered.expect("a non-empty page set it");
@@ -315,6 +339,11 @@ pub struct SpentNote {
     /// The nullifier that matched — the wallet's own derivation, and the same
     /// 32 bytes the block published.
     pub nullifier: [u8; 32],
+    /// The height of the block whose nullifier list carries it — **the chain's
+    /// own date for this spend**, and the only date there is. The wallet's
+    /// ledger groups on it (`crate::history`), so it is a fact and not a
+    /// decoration.
+    pub spent_height: u64,
 }
 
 /// One address's notes, partitioned by whether the chain has seen their
@@ -355,10 +384,11 @@ pub fn subtract_spent(
     let mut report = SpentReport::default();
     for note in notes {
         let nullifier = note_nullifier(wallet, div_index, &note.detected.note);
-        if spent.contains(&nullifier) {
-            report.spent.push(SpentNote { note: note.clone(), nullifier });
-        } else {
-            report.spendable.push(note.clone());
+        match spent.height_of(&nullifier) {
+            Some(spent_height) => {
+                report.spent.push(SpentNote { note: note.clone(), nullifier, spent_height })
+            }
+            None => report.spendable.push(note.clone()),
         }
     }
     report
@@ -551,6 +581,40 @@ mod tests {
         );
     }
 
+    /// The height a nullifier was published at travels with it, and a repeat is
+    /// resolved to the EARLIER height rather than the later one: consensus
+    /// forbids the same nullifier twice on one chain, so a repeat is a serving
+    /// fault, and the first occurrence is the only one that could be true.
+    #[test]
+    fn each_nullifier_carries_the_height_that_published_it_first() {
+        let src = Honest::new(0..=5, 100);
+        let set = fetch_spent(&src, 0, 5).unwrap();
+        for h in 0..=5u8 {
+            assert_eq!(set.height_of(&nf(h)), Some(u64::from(h)), "block {h}'s own nullifier");
+        }
+        assert_eq!(set.height_of(&nf(99)), None, "a nullifier nobody published");
+
+        // The same 32 bytes served at two heights: the earlier one stands.
+        struct Repeated;
+        impl NullifierSource for Repeated {
+            fn fetch_range(&self, from: u64, to: u64) -> Result<NullifierChunk, String> {
+                Ok(NullifierChunk {
+                    from,
+                    to,
+                    blocks: vec![(0, vec![]), (1, vec![nf(7)]), (2, vec![nf(7)])],
+                })
+            }
+        }
+        let set = fetch_spent(&Repeated, 0, 2).unwrap();
+        assert_eq!(set.height_of(&nf(7)), Some(1));
+        assert_eq!(set.len(), 1, "one nullifier, however many times it was served");
+
+        // `from_parts` resolves the same way, for callers holding their own data.
+        let built = SpentSet::from_parts(Some((0, 9)), [(4, nf(3)), (9, nf(3)), (5, nf(4))]);
+        assert_eq!(built.height_of(&nf(3)), Some(4));
+        assert_eq!(built.height_of(&nf(4)), Some(5));
+    }
+
     /// 🔴 **The derivation is the spend path's.** `note_nullifier` runs
     /// `derive_input` on the very `TxInput` `build_send` spends; this checks the
     /// result against `qlab_wallet::keys::derive_nf`, the independent host mirror
@@ -613,6 +677,11 @@ mod tests {
         assert_eq!(report.spent.len(), 1, "and the spent one is REPORTED, not dropped");
         assert_eq!(report.spent_value(), 1_000_000_000);
         assert_eq!(report.spent[0].nullifier, note_nullifier(&w, 0, &spent_note));
+        // 🔴 The ledger's date: the height of the block whose nullifier list
+        // carries it — 7 here, not the note's own height (5). `history` groups on
+        // this, so a wrong one would put a send event in the wrong place.
+        assert_eq!(report.spent[0].spent_height, 7);
+        assert_eq!(report.spent[0].note.height, 5, "…and the note's own height is untouched");
 
         // 🔴 The negative: a wallet that never spent is unchanged by all of this.
         let never = subtract_spent(&w, 0, &notes[1..], &set);

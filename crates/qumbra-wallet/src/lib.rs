@@ -7,7 +7,16 @@
 //!   backup    the mnemonic, only behind --reveal, with a warning
 //!   scan      balance by light-client scan against a cbserver URL
 //!   send      scan → sync the tree → prove → POST /v1/tx (issue #276)
+//!   history   this wallet's own chronological ledger, derived from the chain
 //! ```
+//!
+//! `history` is the wallet-side transaction view: the chain publishes opaque
+//! commitments and nullifiers, and the wallet is the only party that can say
+//! which of them are its own. [`history`] derives receipts, spends and
+//! reconstructed send events from the two streams `scan` already uses, keeping
+//! one line visible throughout — **what the chain proves versus what this
+//! machine merely remembers** ([`sends`], the optional and always-labeled local
+//! record of who a past send paid).
 //!
 //! `send` is **wired** as of issue #276, the wallet half of
 //! `t1-wallet-send-seams-decision.md` (STAMPED 2026-08-06, A1+B1): [`send`]
@@ -45,8 +54,10 @@
 //! wallet derives its own notes' nullifiers with the spend path's own
 //! derivation, and matches locally.
 
+pub mod history;
 pub mod net;
 pub mod send;
+pub mod sends;
 pub mod spent;
 pub mod store;
 pub mod sync;

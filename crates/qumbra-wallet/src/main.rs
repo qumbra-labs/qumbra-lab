@@ -27,6 +27,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("address") => address(&args[1..]),
         Some("backup") => backup(&args[1..]),
         Some("scan") => scan(&args[1..]),
+        Some("history") => history(&args[1..]),
         Some("miner-rkm") => miner_rkm(&args[1..]),
         Some("send") => send(&args[1..]),
         Some("-h") | Some("--help") | None => {
@@ -49,6 +50,11 @@ fn usage() {
          qumbra-wallet address --dir DIR [--new|--index N]  show or allocate diversified addresses\n  \
          qumbra-wallet backup  --dir DIR --reveal        print the mnemonic (explicitly, once)\n  \
          qumbra-wallet scan    --dir DIR --url URL --to N [--from N]  balance via light-client scan\n  \
+         qumbra-wallet history --dir DIR --url URL --to N [--from N]  this wallet's own ledger:\n\
+                            every note received, every note spent, and the sends reconstructed\n\
+                            from them. Chain-derived throughout; the recipient of a past send is\n\
+                            shown only where this wallet dir holds a local `sends.v1` record, and\n\
+                            is labeled as such (a restored wallet never has one)\n  \
          qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n  \
          qumbra-wallet send --dir DIR --url URL --node URL --scan-to N --to ADDR --amount BESSEL\n  \
                             [--out FILE] [--no-submit]\n  \
@@ -327,7 +333,43 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
                  and nothing was sent."
             );
         }
+        eprintln!(
+            "note: no {} record was written — this send was not submitted, and the local record \
+             exists to name the recipient of a send that is actually on its way.",
+            qumbra_wallet::sends::SENDS_FILE
+        );
         return Ok(());
+    }
+
+    // 🔴 The local record, written BEFORE the socket.
+    //
+    // The chain will carry every other fact about this transaction — its
+    // nullifiers, its outputs, its fee, the height it lands at — and it can
+    // never carry the recipient, because the outputs are addressed to keys this
+    // wallet does not hold. So the recipient is recorded here or it is lost, and
+    // "here" has to be before the POST: a submission whose answer never arrives
+    // is exactly the case where a user needs to know what they sent.
+    //
+    // The statement tx id is derived locally over the declared public surface —
+    // the same derivation the node runs, cross-checked against its answer below.
+    //
+    // `submitted_at_tip` is the node's TIP when this was built — not the height
+    // it will be mined at, which nobody knows yet. `history` joins on the
+    // declared nullifiers, never on this.
+    let record = qumbra_wallet::sends::SendRecord::declared(
+        &art.entry.public,
+        anchor.tip_height,
+        amount,
+        recipient.short().encode(),
+    );
+    let recorded = qumbra_wallet::sends::SendLog::append(&dir, &record);
+    if let Err(e) = &recorded {
+        // Enrichment must never block a spend: the money matters more than the
+        // memo. But losing it silently is how a ledger quietly starts lying.
+        eprintln!(
+            "warning: could not write the local send record ({e}). The transaction below is \
+             unaffected, but `history` will show this send with `recipient: not recorded`."
+        );
     }
 
     // The node's answer is printed VERBATIM: its first token is the
@@ -344,6 +386,29 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
         )
     })?;
     println!("node [{}]: {}", answer.status, answer.body);
+
+    // The cross-check the local derivation earns: if the node names a different
+    // statement id than this wallet derived, the record just written points at
+    // a transaction nobody else agrees exists — say so rather than let
+    // `history` join it later as if it were sound.
+    if let Some(theirs) = answer.txid_hex() {
+        let ours = qumbra_wallet::sends::hex32(&record.txid);
+        if theirs != ours {
+            eprintln!(
+                "warning: this wallet derived statement id {ours} and the node answered {theirs}. \
+                 The local send record carries the former; `history` joins on the declared \
+                 nullifiers, not on the id, so the ledger is unaffected — but the two derivations \
+                 disagreeing is worth reporting."
+            );
+        }
+    }
+    if recorded.is_ok() {
+        eprintln!(
+            "note: the recipient was recorded locally in {} (0600). It is NOT on the chain and a \
+             restore from your mnemonic will not bring it back.",
+            qumbra_wallet::sends::SENDS_FILE
+        );
+    }
 
     match answer.class() {
         SubmitClass::Accepted | SubmitClass::Duplicate => Ok(()),
@@ -375,30 +440,33 @@ fn backup(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// `scan` — the balance report, and since lab issue #314 it is a **two-stream**
-/// report: the outputs off `/v1/compact`, then this wallet's own spends
-/// subtracted against `/v1/nullifiers`.
+/// Everything both `scan` and `history` read off the chain: one light-client
+/// scan per allocated address, then the nullifier stream over the range those
+/// outputs actually came from.
+struct Gathered {
+    outcomes: Vec<(u64, String, Result<qlab_cbserver::client::ScanOutcome, String>)>,
+    coverage: qumbra_wallet::view::SpentCoverage,
+    set: Option<qumbra_wallet::spent::SpentSet>,
+}
+
+/// 🔴 **One gatherer, two commands.** `history` is a different rendering of
+/// exactly the facts `scan` quotes its balance from, so it must not be a second
+/// path to them — a ledger that could disagree with the balance printed beside
+/// it is worse than no ledger. The `--to`/`--from` semantics, the never-started
+/// verdict, the coverage rule and the fetch order are therefore shared here
+/// rather than reimplemented per command.
 ///
 /// The nullifier stream is fetched **after** every scan, deliberately: the chain
 /// only grows, so a node that advanced mid-scan gives the second fetch MORE
 /// coverage than the outputs need, never less. Fetching it first would turn an
 /// ordinary block arrival into a spurious `UNAVAILABLE`.
-fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
+fn gather(w: &WalletDir, url: &str, from: u64, to: u64) -> Gathered {
     use qlab_cbserver::client::{light_client_scan_with, ScanConfig, ScanOutcome};
     use qumbra_wallet::net::HttpNullifierSource;
-    use qumbra_wallet::spent::{fetch_spent, subtract_spent};
+    use qumbra_wallet::spent::fetch_spent;
     use qumbra_wallet::view::SpentCoverage;
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
-    let dir = dir_of(args)?;
-    let url = flag(args, "--url")
-        .ok_or("scan requires --url http://host:port or --url https://host[:port]")?;
-    let to: u64 = flag(args, "--to")
-        .ok_or("scan requires --to HEIGHT (explicit: a balance is a claim about a range)")?
-        .parse()?;
-    let from: u64 = flag(args, "--from").unwrap_or("0").parse()?;
-
-    let w = WalletDir::open(&dir)?;
     let wallet = w.wallet();
     // Seed the decoy rng from the OS CSPRNG (StdRng has no direct from-OS
     // constructor at this rand pin; the 32-byte seed carries the entropy).
@@ -434,8 +502,86 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
             Ok(()) => (SpentCoverage::Covered { range: set.covered }, Some(set)),
         },
     };
+    Gathered { outcomes, coverage, set }
+}
 
-    // ---- 3. The report. A figure exists only where both halves do. ---------
+/// `history` — this wallet's own chronological ledger (the wallet-side
+/// transaction view). Same two streams as `scan`, same honesty vocabulary; what
+/// is new is that the events are named rather than summed, and that the one
+/// field the chain can never carry — **who a send paid** — is joined in from the
+/// wallet dir's local `sends.v1` when there is one, and labeled every time.
+fn history(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use qumbra_wallet::history::{self, AddressScan};
+    use qumbra_wallet::sends::SendLog;
+
+    let dir = dir_of(args)?;
+    let url = flag(args, "--url")
+        .ok_or("history requires --url http://host:port or --url https://host[:port]")?;
+    let to: u64 = flag(args, "--to")
+        .ok_or("history requires --to HEIGHT (explicit: a ledger is a claim about a range)")?
+        .parse()?;
+    let from: u64 = flag(args, "--from").unwrap_or("0").parse()?;
+
+    let w = WalletDir::open(&dir)?;
+    let wallet = w.wallet();
+
+    // The local record is OPTIONAL enrichment and must never be able to stop a
+    // chain-derived ledger from printing: an unreadable file is reported and
+    // the ledger continues without it, chain-only.
+    let log = match SendLog::load(&dir) {
+        Ok(log) => log,
+        Err(e) => {
+            eprintln!(
+                "note: {e}\n      the ledger below is chain-only — every `recipient:` line will \
+                 read `not recorded`."
+            );
+            None
+        }
+    };
+    if log.is_none() {
+        eprintln!(
+            "note: no {} in this wallet dir, so recipients are not shown. That file is written by \
+             `send` on this machine and is NEVER recoverable from a mnemonic; everything else \
+             below comes from the chain.",
+            qumbra_wallet::sends::SENDS_FILE
+        );
+    }
+
+    let Gathered { outcomes, coverage, set } = gather(&w, url, from, to);
+    let scans: Vec<AddressScan> = outcomes
+        .into_iter()
+        .map(|(div_index, address_short, outcome)| AddressScan { div_index, address_short, outcome })
+        .collect();
+    let ledger =
+        history::build(&wallet, &scans, set.as_ref(), &coverage, log.as_ref(), (from, to));
+    print!("{}", history::render(&ledger, url));
+    Ok(())
+}
+
+/// `scan` — the balance report, and since lab issue #314 it is a **two-stream**
+/// report: the outputs off `/v1/compact`, then this wallet's own spends
+/// subtracted against `/v1/nullifiers`.
+///
+/// The nullifier stream is fetched **after** every scan, deliberately: the chain
+/// only grows, so a node that advanced mid-scan gives the second fetch MORE
+/// coverage than the outputs need, never less. Fetching it first would turn an
+/// ordinary block arrival into a spurious `UNAVAILABLE`.
+fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use qumbra_wallet::spent::subtract_spent;
+
+    let dir = dir_of(args)?;
+    let url = flag(args, "--url")
+        .ok_or("scan requires --url http://host:port or --url https://host[:port]")?;
+    let to: u64 = flag(args, "--to")
+        .ok_or("scan requires --to HEIGHT (explicit: a balance is a claim about a range)")?
+        .parse()?;
+    let from: u64 = flag(args, "--from").unwrap_or("0").parse()?;
+
+    let w = WalletDir::open(&dir)?;
+    let wallet = w.wallet();
+    let Gathered { outcomes, coverage, set } = gather(&w, url, from, to);
+
+    // The report. A figure exists only where both halves do.
     let scans: Vec<DivScan> = outcomes
         .into_iter()
         .map(|(idx, short, got)| match (got, &set) {
