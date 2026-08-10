@@ -7,6 +7,10 @@ Audience: **T-ops**, plus the coordinator who accepts the roll. This is the live
 of the emission-rule baton — the half a builder session cannot do, because it needs
 host access and a Linux/glibc machine.
 
+> **Orienting on boundary day? Start at [`emission-boundary-index.md`](emission-boundary-index.md)** —
+> a one-page index of what the boundary is, the go/no-go (R2) decision, and where every
+> artifact lives. This file is the step-by-step it points at.
+
 It is written here rather than in `qumbra-deploy/OPERATOR.md` because
 `qumbra-deploy` is a stop point for this baton. Fold it into `OPERATOR.md` §4 when
 convenient; nothing below depends on where it lives.
