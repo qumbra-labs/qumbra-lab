@@ -116,6 +116,7 @@ pub enum SendStep {
 }
 
 /// A spend that got far enough to have bytes.
+#[derive(Debug)]
 pub struct SendOutcome {
     /// The canonical wire bytes. **Keep them.** A proof that cost gigabytes should
     /// survive a failed socket, and resubmitting the same bytes answers
