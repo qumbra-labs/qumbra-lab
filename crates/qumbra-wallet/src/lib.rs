@@ -29,8 +29,11 @@
 //!
 //! **Still nodeless, which is the A2 rejection kept.** Every one of those is an
 //! HTTP client against somebody else's node; this crate runs no node, mines
-//! nothing, and gossips nothing. Deliberately absent: GUI/QR (the shells'
-//! business — see the design repo's wallet briefs).
+//! nothing, and gossips nothing. Deliberately absent: GUI (the shells'
+//! business — see the design repo's wallet briefs). QR left this list with
+//! lab #342: `name-service-decision.md` §3 (2026-08-10) pins the T1 answer to
+//! long-address pain as contact book + QR, so [`qr`] renders payment URIs
+//! (`qlab_wallet::uri`) to the terminal and to SVG.
 //!
 //! # The two disciplines everything here bends around
 //!
@@ -58,6 +61,7 @@
 pub mod contacts;
 pub mod history;
 pub mod net;
+pub mod qr;
 pub mod scan;
 pub mod send;
 pub mod sends;
