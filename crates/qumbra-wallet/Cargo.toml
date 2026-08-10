@@ -28,6 +28,11 @@ qlab-cbserver = { path = "../qlab-cbserver" }
 qlab-note = { path = "../qlab-note" }
 # OS CSPRNG for seed entropy and the scan's decoy rng.
 rand = "0.10"
+# QR encoding for payment URIs (lab #342, name-service-decision §3's T1
+# interim). Pure Rust, no C deps. `default-features = false` keeps the `image`
+# stack out — we render Unicode half-blocks and SVG text ourselves in `qr.rs`,
+# so only the core matrix encoder is used.
+qrcode = { version = "0.14", default-features = false }
 # The send path (written ahead of the mint; acceptance rides it): the frozen
 # 2x2 builder incl. build_bucket_dummy1 (#219's latch, merged in lab PR #252),
 # the REAL prover, tx body types + the posted-fee table, and the canonical tx
