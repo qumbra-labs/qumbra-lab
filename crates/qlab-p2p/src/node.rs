@@ -31,6 +31,7 @@ use crate::gossip::{
 use crate::n1::{IngestOutcome, NodeState, VotesOutcome};
 use crate::peer::{NodeId, PeerId, PeerTable, VersionMsg};
 use crate::ratelimit::{RateKey, RateLimiter, RateLimits, RateStats};
+use crate::sendstall::stall_line;
 use crate::sync::{build_locator, answer_get_headers, SyncPhase, SyncState, MAX_HEADERS_PER_BATCH};
 use qlab_devnet::finality::next_checkpoint_height;
 use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
@@ -626,6 +627,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// Returns how many dials succeeded.
     pub fn maintain(&mut self, now_ms: u64) -> usize {
         let mut connected = self.finish_dials(now_ms);
+        // Issue #289, and it must run BEFORE the live-handle reconcile below: a
+        // connection dropped here has to be gone from `transport.peers()` by the
+        // time `sync_live` runs, or the address stays "connected" in the book and
+        // the ladder suppresses the re-dial for another whole pass.
+        self.drop_stalled_connections();
         let live: HashSet<PeerId> = self.transport.peers().into_iter().collect();
         self.addrs.sync_live(&live);
         for pid in self.peers.all_peers() {
@@ -672,6 +678,48 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         }
         connected
+    }
+
+    /// **Close connections that are open but not carrying our bytes** (issue
+    /// #289), returning the handles dropped.
+    ///
+    /// D4's node2 sat twenty minutes on a losing branch after the partition
+    /// healed because a partition-era socket stayed `ESTABLISHED` with 191 KB
+    /// stuck in its send queue: the node counts sockets, so it counted that dead
+    /// connection as its live path to the other side and never re-dialed. It
+    /// converged when the *kernel* gave up, not on anything the node decided.
+    ///
+    /// Three properties, and each is a decision this baton was asked to take:
+    ///
+    /// 1. **It closes, it does not route around.** Dropping the handle is what
+    ///    lets [`crate::addrman`]'s existing ladder — one path, one cap, one
+    ///    backoff (#86) — re-dial on the very next pass. There is deliberately no
+    ///    second dial path here; adding one is how a node ends up exceeding a cap
+    ///    it believes it is enforcing.
+    /// 2. **It does not score the peer.** A stalled socket is a dead path, not
+    ///    misbehaviour — usually nobody's fault at all, since a silently dropped
+    ///    route leaves both ends `ESTABLISHED`. Penalising it would ban honest
+    ///    peers for the network's failure, which is the S5 / `is_peer_fault`
+    ///    discipline this crate already applies to throttled frames and
+    ///    unusable-but-well-formed objects.
+    /// 3. **It does not record a dial failure either.** `on_dial_failure` is the
+    ///    backoff ladder's input, and this address *was* reachable; charging it a
+    ///    backoff rung would delay the reconnection this exists to cause. The
+    ///    entry stays `dialable` (sticky, #86) and keeps `failures = 0`.
+    ///
+    /// Inbound connections are dropped on the same evidence. We may have no
+    /// address to re-dial them at, but a wedged inbound socket is still not a
+    /// serving path, and holding it consumes a slot the accept path enforces.
+    pub fn drop_stalled_connections(&mut self) -> Vec<PeerId> {
+        let stalled = self.transport.stalled_peers();
+        for r in &stalled {
+            let addr = self.transport.peer_addr(r.peer);
+            // The whole finding is that this is invisible from inside the node it
+            // happens to, so the drop says what it saw.
+            println!("{}", stall_line(r.peer.0, addr.as_deref(), r.backlog, r.stalled_ms));
+            self.transport.disconnect(r.peer);
+        }
+        stalled.into_iter().map(|r| r.peer).collect()
     }
 
     /// Apply connector-thread results on the main loop. The completion timestamp

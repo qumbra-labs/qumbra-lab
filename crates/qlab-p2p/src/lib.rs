@@ -46,6 +46,7 @@ pub mod node;
 pub mod peer;
 pub mod punish;
 pub mod ratelimit;
+pub mod sendstall;
 pub mod sync;
 pub mod transport;
 pub mod varint;
