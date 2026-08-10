@@ -46,6 +46,7 @@
 //! derivation, and matches locally.
 
 pub mod net;
+pub mod scan;
 pub mod send;
 pub mod spent;
 pub mod store;
