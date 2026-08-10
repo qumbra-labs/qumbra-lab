@@ -31,6 +31,7 @@ use qlab_devnet::header::BlockHeader;
 use qlab_devnet::params_devnet::MAX_ANCHOR_AGE_BLOCKS;
 
 use crate::persist::{self, LogRecord, Snapshot, FORMAT_VERSION};
+use crate::replay_progress::ReplayProgress;
 use crate::store::{
     ChainStore, CommitmentStore, Hash32, MemChainStore, MemCommitmentStore, MemNullifierStore,
     NullifierStore, RewindError, StoredBlock,
@@ -744,6 +745,23 @@ impl MemNode {
         // offered to the live advance rule: prefix records are harmlessly
         // rejected as non-advancing, while a finalization written after the
         // snapshot still advances even when it names a prefix block.
+        //
+        // Lab #287: progress tracks the expensive work — block records above the
+        // snapshot. That count is a free pre-scan of the already-loaded vec (not
+        // a second disk read, not a 2× apply). Prefix no-ops and non-advancing
+        // finalizations are not the silent-hang hazard; a tip-aligned restart
+        // (replayed 0) stays quiet. Finalizations that *do* advance are counted
+        // in the final RECOVERY line but are not a separate progress total —
+        // fabricating a finalize-advance denominator would require replaying
+        // them, which is the stop-point this baton refuses.
+        let tail_blocks = records
+            .iter()
+            .filter(|r| matches!(r, LogRecord::Block(b) if b.header.height > snap.applied_height))
+            .count();
+        let mut progress = ReplayProgress::start(
+            tail_blocks,
+            &format!("past snapshot at height {}", snap.applied_height),
+        );
         let mut replayed_records = 0usize;
         for rec in records {
             match rec {
@@ -768,6 +786,7 @@ impl MemNode {
                         }));
                     }
                     replayed_records += 1;
+                    progress.tick();
                 }
                 LogRecord::Finalize(hash) => {
                     if node.chain.set_finalized(*hash).is_ok() {
@@ -797,6 +816,9 @@ impl MemNode {
         snapshot_rejected: Option<SnapshotRejection>,
     ) -> Result<Self, NodeError> {
         let mut node = Self::from_genesis(genesis, Some(dir.to_path_buf()));
+        // Lab #287: every record is applied, so walk total == final replayed_records.
+        // `records` is already in memory from `open`; the total is free.
+        let mut progress = ReplayProgress::start(records.len(), "from genesis");
         let mut replayed_records = 0usize;
         for rec in records {
             match rec {
@@ -808,6 +830,7 @@ impl MemNode {
                 }
             }
             replayed_records += 1;
+            progress.tick();
         }
         node.recovery = RecoveryReport {
             snapshot_height: None,

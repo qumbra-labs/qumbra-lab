@@ -163,6 +163,159 @@ fn a_fresh_datadir_starts_without_finality_quietly() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Lab #287: a 0-record resume (fresh datadir / tip-aligned snapshot) must not
+/// print a progress line — only the final `RECOVERY … resumed at tip` line.
+#[test]
+fn zero_record_resume_emits_no_progress_line() {
+    let dir = temp_dir("i287-zero");
+    let (node, progress) = qlab_node::with_progress_capture(|| {
+        MemNode::open(&dir, genesis_block(GENESIS_DIFFICULTY, 0)).unwrap()
+    });
+    assert!(
+        progress.is_empty(),
+        "0-record open must not emit RECOVERY replaying lines: {progress:?}"
+    );
+    assert_eq!(
+        node.recovery_report().to_string(),
+        "RECOVERY no snapshot, replayed 0 records, resumed at tip 0"
+    );
+
+    // Tip-aligned snapshot path: build, snapshot at tip, reopen — still 0 to
+    // apply, so still silent on the progress channel.
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    build_chain(&dir);
+    let (reopened, progress) =
+        qlab_node::with_progress_capture(|| MemNode::open(&dir, genesis).unwrap());
+    assert_eq!(reopened.recovery_report().replayed_records, 0);
+    assert!(
+        progress.is_empty(),
+        "tip-aligned snapshot reopen must not emit progress: {progress:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Lab #287: a multi-record full log replay prints a start line (total derived
+/// from the already-loaded log) and a percentage line whose denominator matches
+/// the records actually applied.
+#[test]
+fn multi_record_full_replay_emits_progress_before_resume() {
+    let dir = temp_dir("i287-full");
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    build_chain(&dir);
+    // Force the from-genesis path so every log record is applied.
+    std::fs::remove_file(dir.join(qlab_node::SNAPSHOT)).unwrap();
+
+    let (reopened, progress) =
+        qlab_node::with_progress_capture(|| MemNode::open(&dir, genesis).unwrap());
+    let applied = reopened.recovery_report().replayed_records;
+    assert!(applied > 0, "build_chain must leave a non-empty log");
+
+    assert!(
+        !progress.is_empty(),
+        "multi-record replay must emit at least one progress line before resume"
+    );
+    let start = &progress[0];
+    assert_eq!(
+        start,
+        &format!("RECOVERY replaying {applied} records from genesis"),
+        "start line total must equal records actually applied (full path)"
+    );
+    assert!(
+        progress.iter().any(|l| {
+            l.starts_with("RECOVERY replaying: ")
+                && l.contains(&format!("/{applied} records"))
+                && l.ends_with("%)")
+        }),
+        "expected a percentage line over total={applied}; got {progress:?}"
+    );
+    // Final resume line still uses the existing Display form (printed by the
+    // binary after open returns — here we check the report itself).
+    assert!(
+        reopened
+            .recovery_report()
+            .to_string()
+            .starts_with("RECOVERY no snapshot, replayed "),
+        "final resume report must remain: {}",
+        reopened.recovery_report()
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Lab #287: snapshot-assisted tail replay prints progress over the free
+/// pre-count of block records above the snapshot (not a fabricated applied
+/// total). The final resume line still reports records that advanced state.
+#[test]
+fn multi_record_snapshot_tail_emits_progress_before_resume() {
+    let dir = temp_dir("i287-tail");
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    let g_header = genesis.header();
+    let mut node = MemNode::open(&dir, genesis.clone()).unwrap();
+
+    assert!(node.finalize(g_header.header_hash()).unwrap().is_recorded());
+    let mut parent = g_header;
+    let mut root = node.commitment_root();
+    // Snapshot after a few blocks, then append more so reopen has a real tail.
+    for i in 0u8..3 {
+        let (h, hash) = apply_one_tx_block(
+            &mut node,
+            &parent,
+            tx(root, vec![], vec![[i + 1; 32], [i + 10; 32]]),
+        )
+        .unwrap();
+        assert!(node.finalize(hash).unwrap().is_recorded());
+        root = node.commitment_root();
+        parent = h;
+    }
+    node.save_snapshot().unwrap();
+    let snap_height = node.tip_height();
+    for i in 0u8..4 {
+        let (h, hash) = apply_one_tx_block(
+            &mut node,
+            &parent,
+            tx(root, vec![], vec![[i + 50; 32], [i + 60; 32]]),
+        )
+        .unwrap();
+        assert!(node.finalize(hash).unwrap().is_recorded());
+        root = node.commitment_root();
+        parent = h;
+    }
+    let tip = node.tip_height();
+    drop(node);
+
+    let (reopened, progress) =
+        qlab_node::with_progress_capture(|| MemNode::open(&dir, genesis).unwrap());
+    let report = reopened.recovery_report();
+    assert_eq!(report.snapshot_height, Some(snap_height));
+    assert!(report.replayed_records > 0);
+    assert_eq!(report.resumed_tip, tip);
+
+    let tail_blocks = (tip - snap_height) as usize;
+    assert!(
+        !progress.is_empty(),
+        "tail replay must emit progress before the resume report"
+    );
+    assert_eq!(
+        progress[0],
+        format!("RECOVERY replaying {tail_blocks} records past snapshot at height {snap_height}"),
+        "start total is the free pre-count of block records above the snapshot"
+    );
+    assert!(
+        progress.iter().any(|l| {
+            l.starts_with("RECOVERY replaying: ")
+                && l.contains(&format!("/{tail_blocks} records"))
+                && l.ends_with("%)")
+        }),
+        "expected percentage over tail_blocks={tail_blocks}; got {progress:?}"
+    );
+    assert!(
+        report
+            .to_string()
+            .starts_with(&format!("RECOVERY restored snapshot at height {snap_height},")),
+        "final resume line unchanged: {report}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn a_finalization_recorded_after_the_snapshot_still_survives() {
     let dir = temp_dir("post-snapshot-finalize");
