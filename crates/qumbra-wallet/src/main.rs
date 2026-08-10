@@ -49,6 +49,13 @@ fn usage() {
          qumbra-wallet keygen  --dir DIR                 new seed (0600) + address 0; prints NO key material\n  \
          qumbra-wallet restore --dir DIR                 seed from a Qumbra mnemonic on STDIN\n  \
          qumbra-wallet address --dir DIR [--new|--index N]  show or allocate diversified addresses\n  \
+                            [--uri] [--amount-qmb DECIMAL] [--label TEXT] [--qr] [--qr-svg FILE]\n\
+                            --uri prints a qumbra: payment URI for the selected address (index 0\n\
+                            unless --new/--index picked one); --amount-qmb (whole-coin QMB) and\n\
+                            --label fold into it; --qr renders it as a terminal QR, --qr-svg\n\
+                            writes it as an SVG file. The qs1… fingerprint is always printed\n\
+                            beside a URI/QR: a QR that merely scans is NOT a verified address —\n\
+                            confirm the fingerprint with the payee out of band\n  \
          qumbra-wallet contact add NAME QADDR --dir DIR  save a full address under a local name\n  \
          qumbra-wallet contact list --dir DIR            show NAME → qs1… (short)\n  \
          qumbra-wallet contact remove NAME --dir DIR     remove a local contact\n  \
@@ -61,8 +68,12 @@ fn usage() {
                             is labeled as such (a restored wallet never has one)\n  \
          qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n  \
          qumbra-wallet send --dir DIR --url URL --node URL --scan-to N\n  \
-                            (--to ADDR | --to-contact NAME) --amount BESSEL\n  \
+                            (--to ADDR-or-qumbra:URI | --to-contact NAME) [--amount BESSEL]\n  \
                             [--out FILE] [--no-submit]\n  \
+                            --to also takes a qumbra: payment URI; its amount= prefills the\n\
+                            send amount (in that case --amount may be omitted; if both are\n\
+                            given and disagree, the send refuses — no silent preference).\n\
+                            A URI's label/memo are shown for display only, never transmitted\n  \
                             scan → sync the commitment tree → build + PROVE (real STARK,\n  \
                             ~3 s / ~12 GB) → POST /v1/tx, printing the node's typed outcome\n\n\
          --url  is the compact/scan endpoint (cbserver or a node's discovery server):\n\
@@ -127,22 +138,67 @@ fn address(args: &[String]) -> Result<(), Box<dyn Error>> {
     let dir = dir_of(args)?;
     let mut w = WalletDir::open(&dir)?;
     let wallet = w.wallet();
-    if has_flag(args, "--new") {
-        let idx = w.allocate_next()?;
-        let addr = wallet.address_at_index(idx);
-        println!("address [{idx}]:");
-        println!("  {}", addr.encode());
-        println!("  short: {}", addr.short().encode());
+    // Any payment-request flag puts the command in URI mode (lab #342); the
+    // render flags imply --uri because the QR IS the URI.
+    let amount_qmb = flag(args, "--amount-qmb");
+    let label = flag(args, "--label");
+    let qr = has_flag(args, "--qr");
+    let qr_svg = flag(args, "--qr-svg");
+    let uri_mode =
+        has_flag(args, "--uri") || qr || qr_svg.is_some() || amount_qmb.is_some() || label.is_some();
+
+    // A payment request is for exactly one address: --new/--index pick it,
+    // otherwise URI mode falls back to the wallet's canonical index 0.
+    let picked = if has_flag(args, "--new") {
+        Some(w.allocate_next()?)
     } else if let Some(n) = flag(args, "--index") {
-        let idx: u64 = n.parse()?;
-        let addr = wallet.address_at_index(idx);
-        let known = if w.allocated.contains(&idx) { "" } else { " (NOT in this wallet's allocated set — valid, but scans here won't cover it until allocated)" };
-        println!("address [{idx}]{known}:");
-        println!("  {}", addr.encode());
+        Some(n.parse::<u64>()?)
+    } else if uri_mode {
+        Some(0)
     } else {
+        None
+    };
+
+    let Some(idx) = picked else {
         for idx in &w.allocated {
             println!("[{idx}] {}", wallet.address_at_index(*idx).encode());
         }
+        return Ok(());
+    };
+
+    let addr = wallet.address_at_index(idx);
+    let known = if w.allocated.contains(&idx) { "" } else { " (NOT in this wallet's allocated set — valid, but scans here won't cover it until allocated)" };
+    println!("address [{idx}]{known}:");
+    println!("  {}", addr.encode());
+    println!("  short: {}", addr.short().encode());
+
+    if !uri_mode {
+        return Ok(());
+    }
+
+    let amount_bessel = match amount_qmb {
+        Some(s) => Some(
+            qlab_wallet::uri::qmb_to_bessel(s)
+                .map_err(|why| format!("--amount-qmb `{s}`: {why}"))?,
+        ),
+        None => None,
+    };
+    let uri = qlab_wallet::uri::encode(&addr, amount_bessel, label, None);
+    let fp = addr.short().encode();
+    // The fingerprint travels beside EVERY URI/QR display (contact list's
+    // discipline, name-service D3): a QR that merely scans is the phishing
+    // surface — only the qs1… confirmed out of band makes it a verified one.
+    println!("payment URI [fingerprint {fp}]:");
+    println!("  {uri}");
+    if qr {
+        let rendered = qumbra_wallet::qr::render_unicode(&uri)?;
+        println!("QR of the URI above [fingerprint {fp}] — confirm the fingerprint with the payer's screen, not the scan:");
+        print!("{rendered}");
+    }
+    if let Some(file) = qr_svg {
+        let svg = qumbra_wallet::qr::render_svg(&uri)?;
+        std::fs::write(file, svg)?;
+        println!("QR SVG → {file} [fingerprint {fp}]");
     }
     Ok(())
 }
@@ -231,10 +287,13 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
     let scan_to: u64 = flag(args, "--scan-to").ok_or("send requires --scan-to HEIGHT")?.parse()?;
     let to = flag(args, "--to");
     let to_contact = flag(args, "--to-contact");
-    let amount: u64 = flag(args, "--amount").ok_or("send requires --amount BESSEL")?.parse()?;
+    let amount_flag: Option<u64> =
+        flag(args, "--amount").map(|a| a.parse::<u64>()).transpose()?;
     let out = flag(args, "--out");
     let no_submit = has_flag(args, "--no-submit");
 
+    // Filled only when --to is a qumbra: payment URI (lab #342).
+    let mut uri_amount: Option<u64> = None;
     let (recipient, contact_name) = match (to, to_contact) {
         (Some(_), Some(_)) => {
             return Err("send requires exactly one of --to ADDRESS or --to-contact NAME; both were provided".into())
@@ -242,9 +301,35 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
         (None, None) => {
             return Err("send requires exactly one of --to ADDRESS or --to-contact NAME".into())
         }
+        // A bech32m address never contains `:`, so a colon means a URI — and
+        // routing it through the URI parser gives a scheme-shaped mistake
+        // (`bitcoin:…`) a typed refusal instead of "not a valid qaddr1…".
+        (Some(target), None) if target.contains(':') => {
+            let req = qlab_wallet::uri::parse(target)?;
+            eprintln!(
+                "URI → {} — verify this fingerprint with the payee out of band; a URI that \
+                 merely parses is not a verified address",
+                req.address.short().encode()
+            );
+            // label/memo are DISPLAY ONLY: there is no memo on the wire from
+            // this wallet, and this send transmits neither (wallet-interop §1
+            // + the lab #342 ruling — no invented transmit path).
+            if let Some(l) = &req.label {
+                eprintln!("URI label (display only, NOT transmitted): {l}");
+            }
+            if let Some(m) = &req.memo {
+                eprintln!(
+                    "URI memo (display only, NOT transmitted; {} bytes): {}",
+                    m.len(),
+                    String::from_utf8_lossy(m)
+                );
+            }
+            uri_amount = req.amount_bessel;
+            (req.address, None)
+        }
         (Some(address), None) => (
             qlab_wallet::address::Address::decode(address)
-                .ok_or("`--to` is not a valid qaddr1… address")?,
+                .ok_or("`--to` is not a valid qaddr1… address or qumbra: URI")?,
             None,
         ),
         (None, Some(name)) => (
@@ -252,6 +337,7 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
             Some(name.to_string()),
         ),
     };
+    let amount = resolve_send_amount(uri_amount, amount_flag)?;
 
     // The sink. Progress belongs on stderr so a piped stdout stays the result;
     // the flow itself is `qumbra_wallet::spend`, shared with every other surface.
@@ -427,4 +513,46 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
     let (scans, coverage) = qumbra_wallet::scan::scan_report(&w, url, from, to);
     print!("{}", view::render(&scans, (from, to), url, &coverage));
     Ok(())
+}
+
+/// The amount a send actually uses, from the URI's `amount=` and/or `--amount`
+/// (both bessel). A disagreement is a hard error — silently preferring either
+/// one is exactly the confusion the URI amount exists to prevent (lab #342).
+fn resolve_send_amount(
+    uri_bessel: Option<u64>,
+    flag_bessel: Option<u64>,
+) -> Result<u64, String> {
+    use qlab_wallet::uri::bessel_to_qmb;
+    match (uri_bessel, flag_bessel) {
+        (Some(u), Some(f)) if u != f => Err(format!(
+            "the URI requests {u} bessel ({} QMB) but --amount says {f} bessel ({} QMB) — \
+             refusing to choose; drop --amount to honor the URI, or drop the URI amount",
+            bessel_to_qmb(u),
+            bessel_to_qmb(f),
+        )),
+        (Some(u), _) => Ok(u),
+        (None, Some(f)) => Ok(f),
+        (None, None) => {
+            Err("send requires --amount BESSEL (or a qumbra: URI carrying amount=)".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_send_amount;
+
+    #[test]
+    fn send_amount_resolution() {
+        // URI prefills; an explicit flag alone works; agreement is fine.
+        assert_eq!(resolve_send_amount(Some(150_000_000), None), Ok(150_000_000));
+        assert_eq!(resolve_send_amount(None, Some(42)), Ok(42));
+        assert_eq!(resolve_send_amount(Some(42), Some(42)), Ok(42));
+        // No amount from anywhere is a refusal.
+        assert!(resolve_send_amount(None, None).is_err());
+        // Disagreement is a HARD error naming both values, not a preference.
+        let err = resolve_send_amount(Some(150_000_000), Some(42)).unwrap_err();
+        assert!(err.contains("150000000") && err.contains("42"), "{err}");
+        assert!(err.contains("1.5") && err.contains("0.00000042"), "both in QMB: {err}");
+    }
 }
