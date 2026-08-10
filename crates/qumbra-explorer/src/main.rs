@@ -15,7 +15,7 @@
 use std::error::Error;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use qlab_devnet::pow::RandomXPow;
@@ -25,6 +25,7 @@ use qlab_p2p::adapter::MiningClock;
 use qumbra_explorer::config::ExplorerConfig;
 use qumbra_explorer::http::{self, ExplorerServer};
 use qumbra_explorer::json;
+use qumbra_explorer::txlist::{self, TxListView};
 use qumbra_node::config::NodeConfig;
 use qumbra_node::genesis::GenesisFile;
 use qumbra_node::run::RunningNode;
@@ -94,7 +95,12 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  committee keys: 0 (keyless — enforced)");
     println!("  mining:         false (enforced)");
     println!("  extra listeners: none (telemetry_addr/metrics_addr refused — §6.2)");
-    println!("  routes:         {} + /healthz (no page, no write path)", http::HEALTH_PATH);
+    println!(
+        "  routes:         {} + {}?from=&to= + /healthz (no page, no write path)",
+        http::HEALTH_PATH,
+        http::TXLIST_PATH
+    );
+    println!("  tx lookup:      none — bulk list only, matched client-side (D2)");
     Ok(())
 }
 
@@ -118,11 +124,27 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         cfg.refresh_secs,
     )));
 
+    // And project the transaction-existence view once for the same reason: the
+    // first `/v1/txlist` read must be answered from the chain this process
+    // actually opened, not from an empty view that would read as "no transactions"
+    // (the same rule `start_discovery_endpoint` states for `/v1/compact`).
+    let txlist_view = Arc::new(Mutex::new(Arc::new(TxListView::default())));
+    txlist::refresh_shared(&txlist_view, node.state().chain());
+
     // A failure to bind is FATAL, same rule as the faucet's listener.
-    let server = ExplorerServer::start(&cfg.listen_addr, Arc::clone(&page))?;
+    let server = ExplorerServer::start(
+        &cfg.listen_addr,
+        Arc::clone(&page),
+        Arc::clone(&txlist_view),
+    )?;
 
     println!("qumbra-explorer running");
     println!("  projection:     http://{}{}", server.addr(), http::HEALTH_PATH);
+    println!(
+        "  tx existence:   http://{}{}?from=&to=  (bulk only — no lookup by txid, by design)",
+        server.addr(),
+        http::TXLIST_PATH
+    );
     println!("  page:           served separately (qumbra-explorer-web) — no / here");
     println!("  node listen:    {}", node.listen_addr());
     println!("  node data dir:  {}", node_cfg.data_dir.display());
@@ -162,6 +184,12 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             last_seen = Some(seen);
             last_render = Instant::now();
         }
+        // Keyed on the chain's own tip hash inside `refresh_shared`, so an
+        // unchanged chain costs one comparison and no copy. Deliberately NOT on
+        // `refresh_secs`: that knob is the reader's poll cadence, and holding a
+        // known-stale transaction list back for it would be a second staleness
+        // rule nobody asked for.
+        txlist::refresh_shared(&txlist_view, n.state().chain());
     });
 
     server.shutdown();

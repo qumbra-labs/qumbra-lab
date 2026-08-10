@@ -1,12 +1,22 @@
-//! The projection's listener: `GET`-only, two routes, everything else refused.
+//! The projection's listener: `GET`-only, three routes, everything else refused.
 //!
 //! ```text
-//!   GET  /v1/health.json  the chain-health projection (pre-serialized, swapped by
-//!                         the run loop)
-//!   GET  /healthz         "ok" — for a supervisor, no state
-//!   GET  <anything>       404 JSON, and the body says why there is no /v1/tx/…
-//!   non-GET               405 with `Allow: GET`
+//!   GET  /v1/health.json   the chain-health projection (pre-serialized, swapped by
+//!                          the run loop)
+//!   GET  /v1/txlist?from=&to=
+//!                          the transaction-EXISTENCE list (issue #326, D1/D2/D3),
+//!                          encoded per request from the run loop's snapshot
+//!   GET  /healthz          "ok" — for a supervisor, no state
+//!   GET  <anything>        404 JSON, and the body says why there is no /v1/tx/…
+//!   non-GET                405 with `Allow: GET`
 //! ```
+//!
+//! 🔴 **`/v1/txlist/<txid>` is a 404 by shape, and that is D2** — the decision
+//! brief's refusal of a lookup-by-id, enforced by there being no arm that could
+//! match one rather than by an arm that declines to. A `/tx/<id>` query tells this
+//! server which transaction the asker cares about; the page fetches ranges and
+//! matches locally ([`crate::txlist::match_txid`]). Same rule the
+//! nullifier-membership query was refused under at PR #315 decision 3.
 //!
 //! 🔴 **`GET /` is a 404 since issue #281**, and that is the split: the page left
 //! this binary for `qumbra-explorer-web`, and svc0's Caddy routes only `/v1/*` and
@@ -26,11 +36,19 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
-/// The one data route. Caddy path-routes `/v1/*` here (issue #281); the prefix is
-/// shared with the node's own `/v1` surfaces by convention, not by code.
+use crate::txlist::{self, TxListView};
+
+/// The chain-health route. Caddy path-routes `/v1/*` here (issue #281); the prefix
+/// is shared with the node's own `/v1` surfaces by convention, not by code.
 pub const HEALTH_PATH: &str = "/v1/health.json";
+
+/// The transaction-existence route (issue #326 / `t1-explorer-tx-view-decision`).
+///
+/// **Range-only.** There is no `/v1/txlist/<txid>` and no `?txid=` — D2 is
+/// structural here, not a check.
+pub const TXLIST_PATH: &str = "/v1/txlist";
 
 /// What a 404 explains, once, in the place a probe for `/v1/tx/…` or
 /// `/v1/address/…` actually lands (issue #235's exclusion, stated where it is
@@ -39,11 +57,66 @@ pub const HEALTH_PATH: &str = "/v1/health.json";
 /// JSON, because this surface is JSON since issue #281 — and typed (`refusal`) like
 /// every other refusal in the tree, so a client can branch on it while a human still
 /// reads why.
+///
+/// 🔴 It now has to say two different "no" s, because since issue #326 a
+/// transaction surface **does** exist: there is a bulk existence list, and there is
+/// deliberately no way to ask this server about one transaction. A 404 that still
+/// said "no transaction lookup of any kind" would be read as *"the list is not
+/// built yet"*, which is the opposite of the decision.
 const NOT_FOUND_BODY: &str = "{\"refusal\":\"not_found\",\"detail\":\"This explorer \
-serves /v1/health.json and /healthz only. There is deliberately no transaction, \
-address or note lookup — Qumbra is a single shielded pool and this is a \
-chain-health surface, not an Etherscan. The human-readable page is served \
-separately from these routes.\"}\n";
+serves /v1/health.json, /v1/txlist?from=&to= and /healthz only. The transaction \
+list is bulk-only and matched client-side: there is deliberately NO lookup by \
+transaction id, because asking this server about one transaction tells it which \
+transaction you care about. There is no address, balance or note lookup at all — \
+Qumbra is a single shielded pool and the chain carries none of it. The \
+human-readable page is served separately from these routes.\"}\n";
+
+/// A named bad-bounds refusal for [`TXLIST_PATH`], in the same typed shape.
+///
+/// **Never an empty success.** An empty list is the meaningful answer *"no
+/// transactions in the covered range"*, and it must not also stand in for *"your
+/// request was malformed"* — the same rule `/v1/nullifiers` states for itself.
+fn bad_bounds(detail: &str) -> String {
+    format!("{{\"refusal\":\"bad_bounds\",\"detail\":\"{detail}\"}}\n")
+}
+
+/// One `u64` query parameter, or `None` if it is missing or does not parse.
+/// Same shape as the discovery server's `query_u64`.
+fn query_u64(query: &str, key: &str) -> Option<u64> {
+    query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, v)| v.parse::<u64>().ok())
+}
+
+/// The socket-free `/v1/txlist` core: a `from`/`to` query against a projection.
+///
+/// Refusals are `/v1/compact`'s and `/v1/nullifiers`' verbatim, because a client
+/// paging this surface is the same kind of client: a missing or unparseable bound
+/// is a 400, and an inverted range is a 400. A `to` **above the tip** is not a
+/// refusal — it is answered honestly, clamped, with the tip and the covered range
+/// on the document (see [`txlist::TxListPage::covered_to`]).
+pub fn respond_txlist(view: &TxListView, query: &str) -> Result<String, (u16, String)> {
+    let from = query_u64(query, "from").ok_or((
+        400,
+        bad_bounds(
+            "missing or unparseable 'from'. This route is bulk-only: GET \
+             /v1/txlist?from=<height>&to=<height>",
+        ),
+    ))?;
+    let to = query_u64(query, "to").ok_or((
+        400,
+        bad_bounds(
+            "missing or unparseable 'to'. This route is bulk-only: GET \
+             /v1/txlist?from=<height>&to=<height>",
+        ),
+    ))?;
+    if to < from {
+        return Err((400, bad_bounds("'to' is below 'from'")));
+    }
+    Ok(txlist::document(&txlist::page(view, from, to)))
+}
 
 pub struct ExplorerServer {
     addr: SocketAddr,
@@ -53,9 +126,23 @@ pub struct ExplorerServer {
 }
 
 impl ExplorerServer {
-    /// Bind `addr` and serve `page` until [`Self::shutdown`]. A failure to bind
-    /// is an error, never a warning — same rule and same reason as the faucet's.
-    pub fn start(addr: &str, page: Arc<RwLock<String>>) -> io::Result<ExplorerServer> {
+    /// Bind `addr` and serve `page` + `txlist` until [`Self::shutdown`]. A failure
+    /// to bind is an error, never a warning — same rule and same reason as the
+    /// faucet's.
+    ///
+    /// The two surfaces are held differently on purpose. `/v1/health.json` takes no
+    /// parameters, so the run loop pre-serializes it and a request is a string
+    /// clone. `/v1/txlist` takes a range, so it cannot be pre-serialized; it is
+    /// encoded per request from an `Arc` snapshot the run loop swaps — the `Arc` is
+    /// cloned under the lock and the encode happens with the lock released, so a
+    /// slow reader can never hold the snapshot while the run loop wants to replace
+    /// it. Neither path touches node state, which is the property that keeps a
+    /// hostile client off the consensus loop.
+    pub fn start(
+        addr: &str,
+        page: Arc<RwLock<String>>,
+        txlist: Arc<Mutex<Arc<TxListView>>>,
+    ) -> io::Result<ExplorerServer> {
         let server = tiny_http::Server::http(addr)
             .map_err(|e| io::Error::other(format!("listen_addr {addr}: {e}")))?;
         let server = Arc::new(server);
@@ -70,9 +157,9 @@ impl ExplorerServer {
         let thread = std::thread::spawn(move || {
             for request in worker.incoming_requests() {
                 worker_served.fetch_add(1, Ordering::Relaxed);
-                // Query strings are ignored: this surface takes no parameters.
-                let path =
-                    request.url().split('?').next().unwrap_or("/").trim_end_matches('/');
+                let url = request.url().to_string();
+                let (raw_path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
+                let path = raw_path.trim_end_matches('/');
                 let path = if path.is_empty() { "/" } else { path };
 
                 let (code, body, content_type, allow) = match (request.method(), path) {
@@ -80,6 +167,21 @@ impl ExplorerServer {
                         let body =
                             page.read().map(|p| p.clone()).unwrap_or_else(|e| e.into_inner().clone());
                         (200, body, &b"application/json; charset=utf-8"[..], false)
+                    }
+                    (tiny_http::Method::Get, TXLIST_PATH) => {
+                        // Clone the Arc under the lock; encode with it released.
+                        let snapshot = match txlist.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(p) => Arc::clone(&p.into_inner()),
+                        };
+                        match respond_txlist(&snapshot, query) {
+                            Ok(doc) => {
+                                (200, doc, &b"application/json; charset=utf-8"[..], false)
+                            }
+                            Err((code, msg)) => {
+                                (code, msg, &b"application/json; charset=utf-8"[..], false)
+                            }
+                        }
                     }
                     (tiny_http::Method::Get, "/healthz") => {
                         (200, "ok\n".to_string(), &b"text/plain; charset=utf-8"[..], false)
@@ -162,9 +264,55 @@ mod tests {
     }
 
     fn server_with(page: &str) -> (ExplorerServer, Arc<RwLock<String>>) {
-        let handle = Arc::new(RwLock::new(page.to_string()));
-        let server = ExplorerServer::start("127.0.0.1:0", Arc::clone(&handle)).expect("bind");
+        let (server, handle, _) = server_with_txlist(page, TxListView::default());
         (server, handle)
+    }
+
+    fn server_with_txlist(
+        page: &str,
+        view: TxListView,
+    ) -> (ExplorerServer, Arc<RwLock<String>>, Arc<Mutex<Arc<TxListView>>>) {
+        let handle = Arc::new(RwLock::new(page.to_string()));
+        let list = Arc::new(Mutex::new(Arc::new(view)));
+        let server =
+            ExplorerServer::start("127.0.0.1:0", Arc::clone(&handle), Arc::clone(&list))
+                .expect("bind");
+        (server, handle, list)
+    }
+
+    /// A view shaped like the live chain: transaction blocks at 4913 and 5398,
+    /// thousands of empty heights around them.
+    fn live_shaped_view() -> TxListView {
+        TxListView {
+            blocks: vec![
+                txlist::BlockTxs {
+                    height: 4913,
+                    txs: vec![txlist::TxFacts {
+                        txid: [0x5a; 32],
+                        wire_bytes: 151_392,
+                        fee: 1_000_000,
+                        nullifiers: 2,
+                        commitments: 2,
+                    }],
+                },
+                txlist::BlockTxs {
+                    height: 5398,
+                    txs: vec![txlist::TxFacts {
+                        txid: [0x77; 32],
+                        wire_bytes: 151_392,
+                        fee: 1_000_000,
+                        nullifiers: 2,
+                        commitments: 2,
+                    }],
+                },
+            ],
+            tip_height: 6000,
+            tip_hash: Some([0xfe; 32]),
+        }
+    }
+
+    fn body_of(resp: &str) -> &str {
+        resp.split("\r\n\r\n").nth(1).expect("a response body")
     }
 
     #[test]
@@ -246,6 +394,149 @@ mod tests {
         let resp = exchange(
             addr,
             "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        );
+        assert!(resp.starts_with("HTTP/1.1 405"), "{resp}");
+        assert!(resp.contains("Allow: GET"), "{resp}");
+        server.shutdown();
+    }
+
+    // ---- the transaction-existence route (issue #326) ------------------------
+
+    #[test]
+    fn the_txlist_route_serves_the_document_over_a_real_socket() {
+        let (server, _page, _list) = server_with_txlist("{}", live_shaped_view());
+        let addr = server.addr();
+
+        let resp = get(addr, "/v1/txlist?from=4900&to=5400");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains("application/json"), "{resp}");
+        let v: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("JSON off the wire");
+        assert_eq!(v["v"], txlist::TXLIST_VERSION);
+        assert_eq!(v["tip_height"], 6000);
+        assert_eq!(v["range"]["covered_to"], 5400);
+        let heights: Vec<u64> = v["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["height"].as_u64().unwrap())
+            .collect();
+        assert_eq!(heights, vec![4913, 5398]);
+        assert_eq!(
+            v["boundary"], txlist::BOUNDARY_SENTENCE,
+            "D3 reaches the reader with the data, not beside it"
+        );
+        server.shutdown();
+    }
+
+    /// The run loop's swap reaches readers here too — the same property the
+    /// pre-serialized projection has, over a snapshot that is encoded per request.
+    #[test]
+    fn a_snapshot_swap_reaches_txlist_readers() {
+        let (server, _page, list) = server_with_txlist("{}", TxListView::default());
+        let addr = server.addr();
+        let before: serde_json::Value =
+            serde_json::from_str(body_of(&get(addr, "/v1/txlist?from=0&to=10"))).unwrap();
+        assert_eq!(before["blocks"].as_array().unwrap().len(), 0);
+
+        *list.lock().unwrap() = Arc::new(live_shaped_view());
+        let after: serde_json::Value =
+            serde_json::from_str(body_of(&get(addr, "/v1/txlist?from=4900&to=5400"))).unwrap();
+        assert_eq!(after["blocks"].as_array().unwrap().len(), 2);
+        server.shutdown();
+    }
+
+    /// 🔴 D2, test-locked as a **shape**: every by-id form of this route is a 404,
+    /// and the body says why rather than reading as an unbuilt feature.
+    #[test]
+    fn every_by_id_form_of_the_txlist_route_is_a_404_and_the_body_states_d2() {
+        let (server, _page, _list) = server_with_txlist("{}", live_shaped_view());
+        let addr = server.addr();
+        let txid = "5a".repeat(32);
+        for probe in [
+            format!("/v1/txlist/{txid}"),
+            format!("/v1/tx/{txid}"),
+            format!("/v1/txlist/tx/{txid}"),
+            format!("/v1/txlist/by-id/{txid}"),
+            format!("/tx/{txid}"),
+        ] {
+            let resp = get(addr, &probe);
+            assert!(resp.starts_with("HTTP/1.1 404"), "{probe}: {resp}");
+            let v: serde_json::Value =
+                serde_json::from_str(body_of(&resp)).expect("the 404 body is JSON");
+            assert_eq!(v["refusal"], "not_found", "{probe}");
+            let detail = v["detail"].as_str().expect("detail");
+            assert!(
+                detail.contains("bulk-only") && detail.contains("deliberately NO lookup"),
+                "{probe}: the 404 must say the list exists AND that by-id does not: {detail}"
+            );
+        }
+
+        // A txid smuggled in as a query parameter is not a route either: the
+        // handler reads `from`/`to` and nothing else, so this is a bad-bounds 400
+        // and never a filtered answer.
+        let resp = get(addr, &format!("/v1/txlist?txid={txid}"));
+        assert!(resp.starts_with("HTTP/1.1 400"), "{resp}");
+        assert!(!resp.contains(&txid[..8]), "the id is not echoed back: {resp}");
+        server.shutdown();
+    }
+
+    /// Bad bounds are a named 400 and **never an empty success** — an empty list
+    /// is the meaningful answer "no transactions in the covered range".
+    #[test]
+    fn bad_bounds_are_a_named_refusal_and_never_an_empty_list() {
+        let (server, _page, _list) = server_with_txlist("{}", live_shaped_view());
+        let addr = server.addr();
+        for probe in [
+            "/v1/txlist",
+            "/v1/txlist?from=0",
+            "/v1/txlist?to=10",
+            "/v1/txlist?from=abc&to=10",
+            "/v1/txlist?from=0&to=-1",
+            "/v1/txlist?from=10&to=9",
+        ] {
+            let resp = get(addr, probe);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{probe}: {resp}");
+            let v: serde_json::Value =
+                serde_json::from_str(body_of(&resp)).expect("the 400 body is JSON");
+            assert_eq!(v["refusal"], "bad_bounds", "{probe}");
+            assert!(v.get("blocks").is_none(), "{probe} answers no list at all");
+        }
+        server.shutdown();
+    }
+
+    /// A `to` above the tip is **not** a refusal: it is answered, clamped, with the
+    /// tip and the covered range stated. A client asking "everything up to now"
+    /// should not have to know "now" first.
+    #[test]
+    fn a_to_above_the_tip_is_answered_and_clamped_rather_than_refused() {
+        let (server, _page, _list) = server_with_txlist("{}", live_shaped_view());
+        let resp = get(server.addr(), "/v1/txlist?from=0&to=99999999");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value = serde_json::from_str(body_of(&resp)).unwrap();
+        assert_eq!(v["tip_height"], 6000);
+        assert_eq!(
+            v["range"]["covered_to"],
+            txlist::MAX_TXLIST_HEIGHTS - 1,
+            "the scan bound binds first, and the page says how far it looked"
+        );
+        server.shutdown();
+    }
+
+    /// The trailing-slash form is the same route, not a by-id probe.
+    #[test]
+    fn the_trailing_slash_form_is_the_same_route() {
+        let (server, _page, _list) = server_with_txlist("{}", live_shaped_view());
+        let resp = get(server.addr(), "/v1/txlist/?from=0&to=10");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        server.shutdown();
+    }
+
+    #[test]
+    fn the_txlist_route_is_read_only_like_every_other() {
+        let (server, _page, _list) = server_with_txlist("{}", live_shaped_view());
+        let resp = exchange(
+            server.addr(),
+            "POST /v1/txlist HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
         );
         assert!(resp.starts_with("HTTP/1.1 405"), "{resp}");
         assert!(resp.contains("Allow: GET"), "{resp}");
