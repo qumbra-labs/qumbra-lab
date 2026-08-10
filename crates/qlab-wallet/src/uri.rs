@@ -432,20 +432,23 @@ mod tests {
         Address::from_raw_bytes(&raw).expect("fixed golden bytes decode")
     }
 
+    /// The exact expected string, hard-coded — NOT recomputed through
+    /// `encode()`/`Address::encode()`, so a regression in either moves the
+    /// encoded URI away from this constant instead of moving both sides
+    /// together.
+    const GOLDEN_URI: &str = "qumbra:qaddr1qy9pzxqlyckngw6zf9g9whn9d3eh4qvg37tfmf9tk2uup37w6hww86h3lrlsvrg5rv3zjvph8ez5c566v95x7anasj9e9xdq57htt0xretga3hlxah60kqsfzqt3uffvxvayzjz02ewkg6mj0xqg0r54nj364vdchlrvm4xmut5lpal7q5xpxx3p9qhnv02yfdf9jcr8de6hequ2jxvflf4dkjau9jws6l0wtm8nlgqssrckr5jzkv3egpr5u42uvd48z7rls6xefxaz4xct00k9enfa4c0galm06pqtzgvjqfewx57yxjj3tp0kvmt50wpgnyyhn6j6eva6c8yvl4kaun4l97gqqu8p28pr9gcns06xf429kcnfwpmhapvvjwd2r290k67ufj7jm8sw0mh4lsps5ygcrunz6dpmgfy4q467v4k8x75p3z8ed8dy4wetnsx8em2aecl278u07psdzsdjy2fsxuly2nzntfsksmmk0kzghy5e5zn6adduc09drkxlumklf7czpygpw8399sen5s2gfat96ertwfucppuwjkw28243hzludnw5m03wnu8hlczscyc6yy5z7d3ag394yktqvah82lyr32ge38ax4k6thskf6rtaae0v70aqzzq0zcwjg2ej89qywnj4t33k5utc07rgm9ym525mpda7chxd8khparhldlgypvfpjgp89c6ncs6229v97endw3ac9zvsj702tt9nhtqu3n7kmhjwhuheqqrsu9guyv4rzwplgex4gkmzd9c8wl593jfe4gdg47mtm3xt6tv7pelw7h7qxzs3rq0jvtf58dpyj5zhtejkcum6sxygl95a5j4m9wwqcl8dth8ratcl3lcxp52pkg3fxqmnu32v2ddxz6r0we7cfzujnxs20t44hnpu45wcmlnwma8mqgy3q9c7y5krxwjpfp84vhtydde8nqy8362eega2kxutl3kd6nd7960s7llq2rqnrgsjstek84zyk5jevpnkuatusw9frxyl56kmfw7ze8gd0hh9anel5qggputp6fptxgu5q36w24wxx6n30plcdrv5nw32nv9hhmzue576u85wlahaqs93yxfqyuhr20zrffg4shmxd468hq5fjzteafdvkwavrjx06mw7f6ljlyqqwrs4rs3j5vfc8ary64zmvf5hqam7skxf8x4p4zhmd0wye0fdnc88am6lcqc2zyvp7f3dxsa5yj2s2a0x2mrn02qc3ruknkj2hv4ecrrua4wuu040r78lqcx3gxez9ycrw0j9f3f45ctgdam8mpytj2v6pfawkk7v8jk3mr07dm05lvpqjyqhrcjjcve6g9yy74jav34hy7vqs78ft89r42cm307xeh2dhchf7rmlupgvzvdzz2p0xc75gj6jt9sxwmn40jpc4yvcn7n2md9mctyap477uhk087sppq83v8fy9verjsz8fe24ccm2w9u8lp5djjd692dsk7lvtnxnmts73mlkl5zqkyseyqnjudfugd99zkzlvekhg7uz3xgf08494jem4swgeltdme8t7tusqpcwz5wzx2338ql5vn25td3xjurh06zceyu65x52ld4acn9a9k0qulh0tlqrpgg3s8ex956rksjf2pt4uetvwdagrzy0j6w6f2ajh8qv0nk4mn374u0clurq69qmyg5nqde7g4x9xknpdphhvlvy3wffng98466mes7268vdlehd7nasyzgszu0z2tpn8fq5sn6kt4jxkuneszrca9vu5w4trw9lcmxafklza8c00ls9psf35gfg9umr63zt2fvkqemww47g8z53nz06dtd5h0pvn5xhmmj7eul6qyyq79says4nyw2qga892hrrdfchslux3k2fhg4fkzmma3wv60dwr6807m7sgzcjryszwt3483p5552ctanx6arms2yep9u75kktxmhyf4d?amount=1.5&memo=aGVsbG8&label=coffee%20shop";
+
     #[test]
     fn golden_uri_vector() {
         let addr = golden_address();
         let uri = encode(&addr, Some(150_000_000), Some("coffee shop"), Some(b"hello"));
-        let expected = format!(
-            "qumbra:{}?amount=1.5&memo=aGVsbG8&label=coffee%20shop",
-            addr.encode()
-        );
-        assert_eq!(uri, expected);
-        // The address part itself is pinned by its checksum: lock the exact
-        // head/tail so the vector survives even a bech32m regression that
-        // preserves length.
-        assert!(uri.starts_with("qumbra:qaddr1"));
-        assert_eq!(uri.len(), "qumbra:".len() + 1985 + "?amount=1.5&memo=aGVsbG8&label=coffee%20shop".len());
+        assert_eq!(uri, GOLDEN_URI);
+        // And the golden parses back to exactly its inputs.
+        let req = parse(GOLDEN_URI).expect("golden parses");
+        assert_eq!(req.address.to_raw_bytes(), addr.to_raw_bytes());
+        assert_eq!(req.amount_bessel, Some(150_000_000));
+        assert_eq!(req.label.as_deref(), Some("coffee shop"));
+        assert_eq!(req.memo.as_deref(), Some(&b"hello"[..]));
     }
 
     #[test]
