@@ -1,18 +1,20 @@
 //! **Position 2: what a user sees when the faucet is empty.**
 //!
-//! The inventory on this chain is a *note count*, not a value (`qlab_faucet`'s
-//! conservation law: every grant costs exactly one note in every bucket size, and
-//! only coinbase refills the count). One 50 QMB coinbase note funds five grants of
-//! *value* and **one** of *count*. So "empty" is not one state, it is five, and they
-//! call for different answers:
+//! "Empty" is not one state, it is five, and they call for different answers:
 //!
 //! | state | why | answer |
 //! |---|---|---|
-//! | [`Availability::Ready`] | ≥2 anchored notes covering the outlay | queue it |
-//! | [`Availability::AwaitingFinality`] | notes held, <2 witnessable by the current anchor | queue it — it clears on the checkpoint cadence |
+//! | [`Availability::Ready`] | an anchored note (or pair) covers the outlay | queue it |
+//! | [`Availability::AwaitingFinality`] | notes held, none witnessable by the current anchor | queue it — it clears on the checkpoint cadence |
 //! | [`Availability::Maturing`] | coinbase notes held, still inside the frozen §2 144-block gate | queue it **only** if it matures inside the wait the queue would quote; otherwise refuse, naming the height |
 //! | [`Availability::ColdChain`] | nothing finalized, so no valid anchor exists | refuse |
-//! | [`Availability::Empty`] | fewer than two notes and none coming | refuse |
+//! | [`Availability::Empty`] | nothing held that covers the outlay, and none coming | refuse |
+//!
+//! The first two rows read `<2` / `≥2` anchored notes until 2026-08-11: a grant
+//! took two real notes, so one anchored note was an unservable faucet. Issue #292's
+//! fallback makes a single anchored note spendable (`qlab_faucet::Inventory::
+//! select_inputs`), which moves the boundary and turns the tail of the inventory
+//! from a count question into a value one.
 //!
 //! **The rule, stated once: queue only what can be served inside the wait the queue
 //! quotes.** `RequestQueue::estimated_wait_blocks` quotes the note-starved rate —
@@ -39,9 +41,11 @@ pub const MAX_ADVERTISED_WAIT_BLOCKS: u64 = MAX_QUEUE_DEPTH as u64;
 /// Whether the faucet can serve a request, and if not, why and when that changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Availability {
-    /// Servable now. `grants` is the note-count budget (`held − 1`).
+    /// Servable now. `grants` is the value budget, `⌊total value / (grant + fee)⌋`
+    /// — an upper bound, see `Inventory::grants_available`. It was the note-count
+    /// budget (`held − 1`) until the #292 fallback made that number wrong.
     Ready { grants: usize },
-    /// Notes are held but the current anchor's prefix cannot witness two of them —
+    /// Notes are held but the current anchor's prefix cannot witness any of them —
     /// the change note of a recent grant is in a block that is mined but not yet
     /// finalized. Self-clearing on the checkpoint cadence.
     AwaitingFinality { held: usize, anchored: usize },
@@ -52,7 +56,9 @@ pub enum Availability {
     /// Nothing is finalized, so there is no valid anchor and no proof can be bound.
     /// On a fresh net this is the cold start; the faucet may be fully funded.
     ColdChain,
-    /// Fewer than two notes, and nothing maturing. Only coinbase refills the count.
+    /// No note the anchor can witness covers the outlay, and nothing is maturing —
+    /// either nothing is held at all, or what is held is too small. Only coinbase
+    /// refills it.
     Empty { held: usize },
 }
 
@@ -89,12 +95,12 @@ impl Availability {
     pub fn explain(&self) -> String {
         match self {
             Availability::Ready { grants } => format!(
-                "ready — {grants} grant{} of note budget available",
+                "ready — {grants} grant{} of value available",
                 if *grants == 1 { "" } else { "s" }
             ),
             Availability::AwaitingFinality { held, anchored } => format!(
                 "waiting for finality — {held} notes held, {anchored} witnessable by the current \
-                 anchor. A transaction needs 2, and a note becomes witnessable when the block \
+                 anchor. A transaction needs 1, and a note becomes witnessable when the block \
                  holding it finalizes (every {} blocks).",
                 qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS
             ),
@@ -114,9 +120,10 @@ impl Availability {
                  must be bound to a finalized commitment root."
                 .to_string(),
             Availability::Empty { held } => format!(
-                "out of notes — {held} held, and a transaction needs 2. Every grant costs exactly \
-                 one note regardless of value, and the only refill is a coinbase note from a \
-                 block this faucet's node wins."
+                "out of funds — {held} note(s) held, none of them able to cover a grant plus its \
+                 fee. A grant may be built from a single note, so this is a value shortage and \
+                 not a count one, and the only refill is a coinbase note from a block this \
+                 faucet's node wins."
             ),
         }
     }
@@ -211,28 +218,30 @@ pub fn classify<V: qlab_faucet::ChainView>(
         return Availability::ColdChain;
     };
 
-    let need =
-        faucet.config().grant_value + qlab_devnet::fees::posted_fee(qlab_devnet::fees::ArityBucket::TwoByTwo);
-    match faucet.inventory().select_pair(need, view.tree(), leaf_count) {
-        Ok(_) => Availability::Ready { grants: faucet.inventory().grants_available() },
+    // One definition of the outlay, on the faucet itself — selection, the budget
+    // figure and this classification all have to be asking the same question.
+    let need = faucet.need();
+    match faucet.inventory().select_inputs(need, view.tree(), leaf_count) {
+        Ok(_) => Availability::Ready { grants: faucet.inventory().grants_available(need) },
         Err(InventoryError::OutOfNotes { held, anchored }) => {
-            if anchored >= 2 {
-                // Unreachable in practice (select_pair only returns OutOfNotes with
-                // anchored < 2), but classifying it as a value shortage rather than
-                // a count shortage would be a lie if it ever were reachable.
+            if anchored >= 1 {
+                // Unreachable in practice (`select_inputs` only returns OutOfNotes
+                // with anchored == 0 since the #292 fallback), but classifying it
+                // as a value shortage rather than a witness shortage would be a lie
+                // if it ever were reachable.
                 Availability::AwaitingFinality { held, anchored }
             } else if let Some(matures_at) = next_maturity.filter(|m| *m > tip) {
                 Availability::Maturing { held: held + maturing_count, matures_at, tip }
-            } else if held >= 2 {
+            } else if held >= 1 {
                 Availability::AwaitingFinality { held, anchored }
             } else {
                 Availability::Empty { held }
             }
         }
-        // Two or more anchored notes, but no pair covers the outlay. On this chain
-        // that is a *value* shortage, and the only refill is coinbase — the same
-        // remedy as an empty inventory, so it is reported as one rather than as a
-        // fifth state a requester cannot act on differently.
+        // Anchored notes exist, but no legal input set covers the outlay. On this
+        // chain that is a *value* shortage, and the only refill is coinbase — the
+        // same remedy as an empty inventory, so it is reported as one rather than as
+        // a fifth state a requester cannot act on differently.
         Err(InventoryError::InsufficientValue { .. }) => match next_maturity.filter(|m| *m > tip) {
             Some(matures_at) => {
                 Availability::Maturing { held: held + maturing_count, matures_at, tip }
@@ -287,9 +296,12 @@ mod tests {
             let text = a.explain();
             assert!(text.len() > 30, "{a:?} explains itself thinly: {text}");
         }
-        // The count-not-value law is stated where it matters, because a requester
-        // looking at a funded faucet that will not pay assumes the opposite.
-        assert!(Availability::Empty { held: 1 }.explain().contains("one note regardless of value"));
+        // The law is stated where it matters, because a requester looking at a
+        // faucet holding notes that will not pay assumes the opposite. Since lab
+        // #292 that law is about value: one note can fund a grant, so a held note
+        // that cannot pay is too small, not too lonely.
+        let empty = Availability::Empty { held: 1 }.explain();
+        assert!(empty.contains("value shortage and not a count one"), "{empty}");
     }
 
     /// The advertised wait is the queue's own cap, not a second number that could

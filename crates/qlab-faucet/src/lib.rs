@@ -23,7 +23,7 @@
 //! labelled *anti-accident* pre-filter. See [`policy`]'s module docs for why the
 //! rate limits are not the control, stated in attacker cost rather than adjective.
 //!
-//! ### 2. The fixed arity caps grants per *note*, not per block — and it is a
+//! ### 2. The fixed arity governs what a grant costs the faucet — and it is a
 //! ###    conservation law, not a 2×2 artifact
 //!
 //! In an *n*×*n* bucket the faucet spends *n* of its own notes and creates *n*
@@ -33,8 +33,8 @@
 //!   Δ(faucet note count) = −n + (n − g) = −g
 //! ```
 //!
-//! **Every grant costs exactly one note, in every bucket size.** Two corollaries
-//! the naive design misses:
+//! **A two-real grant costs exactly one note, in every bucket size.** Two
+//! corollaries the naive design misses:
 //!
 //! - A self-transaction is 2-in/2-out, i.e. **Δ0** — the note count can never be
 //!   *increased* by a transaction. "Pre-cut the treasury into many small exact
@@ -44,11 +44,16 @@
 //! - Bigger buckets amortise **proofs** (an 8×8 could serve 7 recipients on one
 //!   proof) and buy **zero** extra grants.
 //!
-//! So the faucet's sustainable grant rate equals its **note inflow**, whose only
-//! source is one coinbase note per block it wins: **≤ 1 grant per 75 s block =
-//! 0.8 grants/min**. At the measured 2.28 s/proof the prover could sustain
-//! **26.3 grants/min**, so proof speed is **33× away** from being the binding
-//! constraint. [`inventory`] implements the budget this implies, and reports
+//! **Amended 2026-08-11, issue #292 — the count is no longer the ceiling.** A
+//! grant may spend one real note and one dummy slot (#219's latch, unconditional
+//! since the mint), which is **Δ0**: [`Inventory::select_inputs`] takes that path
+//! when the anchor can witness exactly one note, so the last note is spendable and
+//! the tail of the inventory is bounded by *value* instead. What survives
+//! unchanged is that value only ever enters as coinbase, one note per block the
+//! faucet wins — at `coinbase(0)` = 50 QMB and a 10 QMB grant that is ≈5 grants
+//! per won block rather than 1, still far short of the **26.3 grants/min** the
+//! measured 2.28 s/proof could sustain. Proof speed was never the binding
+//! constraint and is not now. [`inventory`] implements the budget, and reports
 //! running out as a *named state* rather than a silent stall.
 //!
 //! ### 3. There is nothing to pre-generate
@@ -101,7 +106,7 @@ pub mod service;
 pub mod view;
 
 pub use grant::{AnchorLease, GrantError, GrantPlan, PROOF_LEASE_BLOCKS};
-pub use inventory::{Inventory, InventoryError, OwnedNote};
+pub use inventory::{Inventory, InventoryError, OwnedNote, Selection, SpentInputs};
 pub use policy::{AbuseGate, FaucetLimits, Refusal, Ticket, TicketPolicy, TicketSecret};
 pub use queue::{PendingRequest, QueueError, RequestQueue, MAX_ATTEMPTS, MAX_QUEUE_DEPTH};
 pub use service::{

@@ -318,10 +318,17 @@ pub struct FaucetLimits {
     pub global_burst: u64,
     /// Milliseconds per one global request token.
     ///
-    /// **Derived, not guessed**: the sustainable grant rate *is* the coinbase note
-    /// inflow, one note per block ([`crate::inventory`]), so this is the frozen
-    /// 75 s block interval. A faster refill would advertise a rate the note budget
+    /// **Derived, not guessed**: the sustainable grant rate is bounded by coinbase
+    /// inflow, one note per won block ([`crate::inventory`]), so this is the frozen
+    /// 75 s block interval. A faster refill would advertise a rate the funding
     /// cannot honour, which is how a faucet ends up with a queue that only grows.
+    ///
+    /// Since issue #292 this is **conservative rather than exact**: the fallback
+    /// makes a grant note-count-neutral, so one won note is worth as many grants as
+    /// its value covers (≈5 at `coinbase(0)` and a 10 QMB grant) rather than
+    /// exactly one. The window was not widened with the fallback — that is a
+    /// separate rate decision with its own abuse-control side, and this comment
+    /// exists so the next reader knows the headroom is real and unclaimed.
     pub global_refill_window_ms: u64,
     pub max_subnet_keys: usize,
 }

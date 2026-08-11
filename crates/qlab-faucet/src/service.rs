@@ -165,8 +165,9 @@ pub enum StallReason {
     /// fresh net this is the cold start.
     NoValidAnchor,
     /// The inventory cannot fund a transaction right now. `OutOfNotes` with
-    /// `held ≥ 2` means *wait for finality*; with `held < 2` the note budget is
-    /// spent and only coinbase refills it.
+    /// `held ≥ 1` means *wait for finality* (notes exist, the anchor cannot
+    /// witness them yet); with `held == 0` the faucet is unfunded and only coinbase
+    /// refills it. `InsufficientValue` means the notes are there and too small.
     Inventory(InventoryError),
 }
 
@@ -218,7 +219,7 @@ impl std::fmt::Debug for Faucet {
             .field("grant_value", &self.config.grant_value)
             .field("hd_account", &self.config.hd_account)
             .field("notes_held", &self.inventory.len())
-            .field("grants_available", &self.inventory.grants_available())
+            .field("grants_available", &self.inventory.grants_available(self.need()))
             .field("queued", &self.queue.len())
             .field("wallet", &"<spending key withheld>")
             .finish()
@@ -264,9 +265,17 @@ impl Faucet {
         self.inventory.insert(note);
     }
 
-    /// Read-only inventory (the note-count budget lives here).
+    /// Read-only inventory (the budget and the input-shape policy live here).
     pub fn inventory(&self) -> &Inventory {
         &self.inventory
+    }
+
+    /// What one grant costs the faucet: the grant value plus the frozen §5 2×2
+    /// posted fee. One definition, because selection, the budget figure and the
+    /// availability report must all be asking about the same number — they were
+    /// each computing it before.
+    pub fn need(&self) -> u64 {
+        self.config.grant_value.saturating_add(posted_fee(ArityBucket::TwoByTwo))
     }
 
     /// Read-only queue.
@@ -344,9 +353,9 @@ impl Faucet {
             self.stats.stalled += 1;
             return DispenseOutcome::Stalled(StallReason::NoValidAnchor);
         };
-        let need = self.config.grant_value + posted_fee(ArityBucket::TwoByTwo);
-        let pair = match self.inventory.select_pair(need, view.tree(), lease.leaf_count) {
-            Ok(p) => p,
+        let need = self.need();
+        let selection = match self.inventory.select_inputs(need, view.tree(), lease.leaf_count) {
+            Ok(s) => s,
             Err(e) => {
                 self.stats.stalled += 1;
                 return DispenseOutcome::Stalled(StallReason::Inventory(e));
@@ -354,7 +363,7 @@ impl Faucet {
         };
 
         let request = self.queue.pop().expect("queue is non-empty");
-        let inputs = self.inventory.take_pair(pair);
+        let inputs = self.inventory.take_selected(selection);
         // `build_grant` takes the notes by value; keep a copy so a build failure —
         // which touches nothing on the chain — can restore the inventory exactly.
         let backup = inputs.clone();
@@ -374,7 +383,7 @@ impl Faucet {
                 DispenseOutcome::Ready { plan: Box::new(plan), request }
             }
             Err(reason) => {
-                self.inventory.restore_pair(backup);
+                self.inventory.restore(backup);
                 self.stats.rejected += 1;
                 match self.queue.retry(request) {
                     None => DispenseOutcome::Retrying { reason },
@@ -405,7 +414,7 @@ impl Faucet {
     /// broken, not the requesters.
     pub fn reject(&mut self, plan: GrantPlan, request: PendingRequest) -> bool {
         self.stats.rejected += 1;
-        self.inventory.restore_pair(plan.spent);
+        self.inventory.restore(plan.spent);
         match self.queue.retry(request) {
             None => true,
             Some(_abandoned) => {
@@ -421,8 +430,8 @@ impl Faucet {
     /// request **without** burning an attempt (lab issue #310).
     ///
     /// Restoring a spent note is how a post-restart inventory re-burns the retry
-    /// budget on the same double-spend: `select_pair` is deterministic, so the
-    /// next attempt re-picks the same pair. Forgetting the spent notes lets the
+    /// budget on the same double-spend: `select_inputs` is deterministic, so the
+    /// next attempt re-picks the same notes. Forgetting the spent notes lets the
     /// next attempt re-pick; if nothing live remains, the next `dispense` stalls
     /// on inventory rather than proving another doomed grant.
     ///

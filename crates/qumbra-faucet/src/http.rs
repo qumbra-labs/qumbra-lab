@@ -947,11 +947,10 @@ fn render_index(s: &ServiceStatus, outcome: Option<&RequestOutcome>) -> String {
         "<h2>Two things worth knowing</h2>\n\
          <p>A grant is a real transaction carrying a real STARK proof, so it takes a \
          couple of seconds of proving and then has to be mined. It is not instant.</p>\n\
-         <p>This faucet's stock is measured in <em>notes</em>, not value. Every grant \
-         costs exactly one note whatever it is worth, and the only refill is a block \
-         this faucet's node wins — so a faucet showing a large balance can still be \
-         out of stock, and it will say so above rather than queue a request it cannot \
-         serve.</p>\n\
+         <p>This faucet's stock is its <em>value</em>, and the only refill is a block \
+         this faucet's node wins. It will say above when it cannot serve, rather than \
+         queue a request it cannot honour — including the case where it holds notes \
+         that are individually too small to cover a grant and its fee.</p>\n\
          <p>Testnet coins. No value, no guarantees.</p>\n",
     );
     page("request funds", &body)
@@ -961,7 +960,7 @@ fn render_receipt(receipt: u64, state: &RequestState) -> String {
     let body = match state {
         RequestState::Queued { position } => format!(
             "<p class=\"state\">Receipt <code>{receipt}</code> — waiting, position \
-             <code>{position}</code>. Each grant ahead of you costs one note and one proof.</p>"
+             <code>{position}</code>. Each grant ahead of you costs one proof.</p>"
         ),
         // Lab #307: the number is the applied height (service.rs fills it from
         // `node.chain_state().tip_height()`), so the label must use the #296
@@ -1078,8 +1077,15 @@ mod tests {
         assert_eq!(g.faucet().gate_stats().tickets_spent, 0, "the ticket was never presented");
         assert_eq!(g.faucet().stats().refused, 0, "and the gate recorded no refusal of its own");
         assert!(g.faucet().queue().is_empty());
-        // The refusal is actionable: it names the state, not just "unavailable".
-        assert!(out.message().contains("one note regardless of value"), "{}", out.message());
+        // The refusal is actionable: it names the state, not just "unavailable" —
+        // and since lab #292 the state it names is a *value* shortage, because a
+        // single note is now spendable and "you need two notes" would be false.
+        assert!(out.message().contains("out of funds"), "{}", out.message());
+        assert!(
+            out.message().contains("value shortage and not a count one"),
+            "{}",
+            out.message()
+        );
     }
 
     /// A request through the HTTP layer reaches `Faucet::accept`, and a gate refusal
