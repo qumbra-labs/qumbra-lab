@@ -22,6 +22,24 @@
 #   - every completion appends one TSV line to rig-manifest.tsv
 #     (start, end, owner, rc, log, cmd) -- history is greppable.
 
+# 2026-08-11 addition -- the gap the lock does NOT cover, paid for on this date:
+# the mutex serialises WHO RUNS. It says nothing about WHAT THEY RAN ON. A session
+# edited crates/qumbra-explorer/src/json.rs in the shared main tree at 16:22; another
+# started the acceptance suite at 16:24:28; cargo compiles every test binary before
+# running any, so the edit was already inside the binary and two golden tests failed
+# in a run whose owner had not touched that file. Without --no-fail-fast cargo stops
+# at that binary, so the crates after it never ran either.
+#
+# The fix is provenance, not prohibition. Testing your own uncommitted work is the
+# normal case and must stay frictionless -- so this does NOT block. It makes the tree
+# state impossible to miss at start and impossible to lose afterwards: printed,
+# written into the lock, prepended to the log, and carried in the manifest. A red
+# result can then be attributed to a tree instead of argued about.
+#
+# It reads the tree of the DIRECTORY THE COMMAND WILL RUN IN, not "the repo": every
+# worktree shares this one machine-global lock, and dirt in a sibling worktree cannot
+# reach your run. That distinction is the whole reason worktrees are the convention.
+
 set -uo pipefail
 
 LOCK="${QUMBRA_RIG_LOCK:-$HOME/.qumbra-rig.lock}"
@@ -32,6 +50,31 @@ WHO="${QUMBRA_RIG_OWNER:-${MULTICA_ISSUE_ID:-$(whoami)@$(hostname -s)}}"
 
 now() { date '+%Y-%m-%d %H:%M:%S %z'; }
 stamp() { date -u '+%Y%m%dT%H%M%SZ'; }
+
+# The tree this run will actually execute against. Degrades to `unknown` rather than
+# failing: `rig run` is not only for git repos, and a provenance line must never be
+# the reason a job does not start.
+TREE_REV=""; TREE_DIRT=""; TREE_N=0
+read_tree_state() {
+  git rev-parse --git-dir >/dev/null 2>&1 || { TREE_REV="unknown (not a git tree)"; return; }
+  TREE_REV="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+  # --porcelain lists tracked modifications AND untracked files; untracked cannot
+  # change a compiled binary, so they are counted separately and not alarmed on.
+  TREE_DIRT="$(git status --porcelain --untracked-files=no 2>/dev/null)"
+  [ -n "$TREE_DIRT" ] && TREE_N="$(printf '%s\n' "$TREE_DIRT" | wc -l | tr -d ' ')"
+}
+
+tree_banner() {
+  if [ "$TREE_N" -eq 0 ]; then
+    echo "rig: tree  $(pwd)  rev=$TREE_REV  CLEAN"
+  else
+    echo "rig: tree  $(pwd)  rev=$TREE_REV  🔴 DIRTY ($TREE_N tracked file(s) modified)"
+    echo "rig:       this run's result belongs to THIS tree, not to $TREE_REV:"
+    printf '%s\n' "$TREE_DIRT" | sed 's/^/rig:       /'
+    echo "rig:       if you did not make these edits, someone else is working in this"
+    echo "rig:       tree -- stop and use a worktree (CLAUDE.md, working conventions)."
+  fi
+}
 
 holder_pid() { cat "$LOCK/pid" 2>/dev/null || echo ""; }
 
@@ -62,6 +105,7 @@ status() {
     echo "rig: HELD by $(cat "$LOCK/owner" 2>/dev/null) pid $(holder_pid) since $(cat "$LOCK/started" 2>/dev/null)"
     echo "     cmd: $(cat "$LOCK/cmd" 2>/dev/null)"
     [ -f "$LOCK/logfile" ] && echo "     log: $(cat "$LOCK/logfile")"
+    [ -f "$LOCK/tree" ] && echo "     tree: $(cat "$LOCK/tree")"
     return 1
   fi
   echo "rig: FREE"; return 0
@@ -82,7 +126,9 @@ ps_view() {
   [ "$n" -eq 0 ] && echo "queue: empty"
   if [ -f "$MANIFEST" ]; then
     echo "recent (rc | start -> end | owner | log | cmd):"
-    tail -5 "$MANIFEST" | awk -F'\t' '{printf "  rc=%s | %s -> %s | %s | %s | %s\n", $4, $1, $2, $3, $5, $6}'
+    tail -5 "$MANIFEST" | awk -F'\t' '{
+      t = ($7 == "" ? "" : sprintf(" | rev=%s dirty=%s", $7, $8))
+      printf "  rc=%s | %s -> %s | %s%s | %s | %s\n", $4, $1, $2, $3, t, $5, $6 }'
   fi
 }
 
@@ -133,15 +179,23 @@ case "${1:-status}" in
     [ $# -eq 0 ] && { echo "usage: scripts/rig run -- <command>" >&2; exit 2; }
     mkdir -p "$LOGDIR"
     LOGFILE="$LOGDIR/rig-$(stamp)-$$.log"
+    read_tree_state
     acquire "$*"
     printf '%s\n' "$LOGFILE" > "$LOCK/logfile"
+    # In the lock so `rig status`/`ps` can answer "on what?", and at the head of the
+    # log so the answer survives with the output it explains.
+    printf 'rev=%s dirty=%s\n' "$TREE_REV" "$TREE_N" > "$LOCK/tree"
+    { echo "rig: cwd $(pwd)"; tree_banner; } | tee "$LOGFILE" >&2
     trap release EXIT INT TERM
     START="$(now)"
     # tee passes stdout through unchanged, so callers that parse output keep
     # working; PIPESTATUS keeps the command's own exit code (bash-only, which
     # is why the shebang is bash and not sh).
     "$@" 2>&1 | tee "$LOGFILE"; rc=${PIPESTATUS[0]}
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$START" "$(now)" "$WHO" "$rc" "$LOGFILE" "$*" >> "$MANIFEST"
+    # Appended at the END: `ps_view`'s awk reads $1..$6 positionally, and older lines
+    # simply have no $7/$8 (awk yields empty, not an error).
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$START" "$(now)" "$WHO" "$rc" "$LOGFILE" "$*" "$TREE_REV" "$TREE_N" >> "$MANIFEST"
     echo "rig: command exited $rc at $(now)" >&2
     exit $rc ;;
   *) echo "usage: scripts/rig {run -- <cmd>|ps|log [-f]|status|release}" >&2; exit 2 ;;
