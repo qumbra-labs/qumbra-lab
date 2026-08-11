@@ -59,6 +59,7 @@
 //! derivation, and matches locally.
 
 pub mod contacts;
+pub mod envelope;
 pub mod history;
 pub mod net;
 pub mod qr;
