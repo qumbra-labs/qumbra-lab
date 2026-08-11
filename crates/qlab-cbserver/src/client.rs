@@ -93,7 +93,7 @@ use qlab_note::wire::CM_LEN;
 use rand::rngs::StdRng;
 use rand::Rng;
 
-use crate::codec::{decode_compact_response, decode_full_response};
+use crate::codec::{decode_compact_response, decode_full_response, CompactBlock};
 
 /// Decoy over-fetch policy (the §2 trust-posture mitigation).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -573,10 +573,10 @@ pub fn light_client_scan(
 /// way — giving *this* crate a TLS stack would link rustls into `qlab-node`'s
 /// build graph, and therefore into the consensus node's. So the wallet brings
 /// its own transport and this function lends it the flow. **The scan itself is
-/// not duplicated anywhere**: [`light_client_scan`] is now a two-line wrapper
-/// over this, so the socket path, the wallet's TLS path and the in-process
-/// [`scan_local`] are all one [`scan_over`] and cannot drift on what counts as
-/// detected, opened or unopened.
+/// not duplicated anywhere**: [`ScanDriver`] owns the one orchestration, and
+/// this function only pumps it. The socket path, the wallet's TLS path and the
+/// in-process [`scan_local`] therefore cannot drift on what counts as detected,
+/// opened or unopened.
 pub fn light_client_scan_with<F>(
     fetch: &mut F,
     dk: &Dk,
@@ -615,8 +615,344 @@ pub fn scan_local(
     scan_over(&mut fetch, dk, from, to, config, rng).expect("in-process compact range must resolve")
 }
 
-/// The scan itself, over any fetch. One implementation so the socket path and the
-/// in-process path cannot drift on what counts as detected, opened or unopened.
+/// One observation from a caller-pumped [`ScanDriver`].
+///
+/// `Need` carries the exact path vocabulary accepted by
+/// [`light_client_scan_with`]'s fetch closure. Supply that request's result with
+/// [`ScanDriver::supply`], then call [`ScanDriver::step`] again. `Done` and
+/// `Failed` are terminal.
+pub enum ScanDriverStep {
+    Need(String),
+    Done(ScanOutcome),
+    Failed(String),
+}
+
+enum DriverPhase {
+    Compact,
+    Groups { block: usize, group: usize },
+    AfterMatched { block: usize, group: usize },
+    Decoys { paths: Vec<String>, next: usize, block: usize, group: usize },
+    Finished,
+}
+
+enum PendingKind {
+    Compact,
+    Matched { block: usize, group: usize, detected: Vec<(usize, Vec<usize>)> },
+    Decoy,
+}
+
+struct PendingRequest {
+    path: String,
+    kind: PendingKind,
+}
+
+/// The sans-I/O light-client scan state machine (lab issue #350).
+///
+/// The driver owns the decapsulation key and every scan decision. It performs
+/// no I/O: callers alternate [`step`](Self::step) and
+/// [`supply`](Self::supply), and may suspend for any length of time while a
+/// `Need` is outstanding. `StdRng` is deliberately passed per step rather than
+/// borrowed by the driver, so it remains usable by a suspended caller and the
+/// existing synchronous entry points preserve their caller-owned RNG state.
+pub struct ScanDriver {
+    dk: Dk,
+    to: u64,
+    config: ScanConfig,
+    cursor: u64,
+    blocks: Vec<CompactBlock>,
+    tx_space: Vec<(u64, u64)>,
+    stats: ScanStats,
+    notes: Vec<LocatedNote>,
+    unopened: Vec<UnopenedOutput>,
+    phase: DriverPhase,
+    pending: Option<PendingRequest>,
+    fatal: Option<String>,
+}
+
+impl ScanDriver {
+    pub fn new(dk: Dk, from: u64, to: u64, config: ScanConfig) -> Self {
+        Self {
+            dk,
+            to,
+            config,
+            cursor: from,
+            blocks: Vec::new(),
+            tx_space: Vec::new(),
+            stats: ScanStats::default(),
+            notes: Vec::new(),
+            unopened: Vec::new(),
+            phase: DriverPhase::Compact,
+            pending: None,
+            fatal: None,
+        }
+    }
+
+    /// Advance until the scan needs one path, completes, or fails.
+    pub fn step(&mut self, rng: &mut StdRng) -> ScanDriverStep {
+        if let Some(err) = &self.fatal {
+            return ScanDriverStep::Failed(err.clone());
+        }
+        if let Some(pending) = &self.pending {
+            return ScanDriverStep::Need(pending.path.clone());
+        }
+
+        loop {
+            let phase = std::mem::replace(&mut self.phase, DriverPhase::Finished);
+            match phase {
+                DriverPhase::Compact => {
+                    let path = format!("/v1/compact?from={}&to={}", self.cursor, self.to);
+                    self.phase = DriverPhase::Compact;
+                    self.pending = Some(PendingRequest {
+                        path: path.clone(),
+                        kind: PendingKind::Compact,
+                    });
+                    return ScanDriverStep::Need(path);
+                }
+                DriverPhase::Groups { mut block, mut group } => loop {
+                    if block >= self.blocks.len() {
+                        // 🔴 Issue #215: resolve colliding nullifier claims only
+                        // after the entire requested range has been opened.
+                        let (notes, shadowed) = resolve_claims(std::mem::take(&mut self.notes));
+                        self.stats.notes_found = notes.len();
+                        self.stats.shadowed_outputs = shadowed.len();
+                        let outcome = ScanOutcome {
+                            notes,
+                            unopened: std::mem::take(&mut self.unopened),
+                            shadowed,
+                            stats: std::mem::take(&mut self.stats),
+                        };
+                        self.phase = DriverPhase::Finished;
+                        return ScanDriverStep::Done(outcome);
+                    }
+                    if group >= self.blocks[block].groups.len() {
+                        block += 1;
+                        group = 0;
+                        continue;
+                    }
+
+                    let compact_group = &self.blocks[block].groups[group];
+                    let detected: Vec<(usize, Vec<usize>)> = compact_group
+                        .recipients
+                        .iter()
+                        .enumerate()
+                        .map(|(ri, bundle)| (ri, detect_matches(&self.dk, bundle)))
+                        .filter(|(_, hits)| !hits.is_empty())
+                        .collect();
+                    if detected.is_empty() {
+                        group += 1;
+                        continue;
+                    }
+                    self.stats.detected_outputs +=
+                        detected.iter().map(|(_, hits)| hits.len()).sum::<usize>();
+                    let path = format!(
+                        "/v1/block/{}/tx/{}/full",
+                        self.blocks[block].height, compact_group.tx_index
+                    );
+                    self.phase = DriverPhase::AfterMatched { block, group };
+                    self.pending = Some(PendingRequest {
+                        path: path.clone(),
+                        kind: PendingKind::Matched { block, group, detected },
+                    });
+                    return ScanDriverStep::Need(path);
+                },
+                DriverPhase::AfterMatched { block, group } => {
+                    let mut paths = Vec::new();
+                    if let DecoyPolicy::PerMatch { max } = self.config.decoy {
+                        let max = max.max(1);
+                        let n_decoys = 1 + (rng.next_u64() as usize % max);
+                        for _ in 0..n_decoys {
+                            if self.tx_space.is_empty() {
+                                break;
+                            }
+                            let (height, n_txs) =
+                                self.tx_space[rng.next_u64() as usize % self.tx_space.len()];
+                            let tx_index = rng.next_u64() % n_txs;
+                            paths.push(format!("/v1/block/{height}/tx/{tx_index}/full"));
+                        }
+                    }
+                    if paths.is_empty() {
+                        self.phase = DriverPhase::Groups { block, group: group + 1 };
+                        continue;
+                    }
+                    let path = paths[0].clone();
+                    self.phase = DriverPhase::Decoys { paths, next: 1, block, group };
+                    self.pending =
+                        Some(PendingRequest { path: path.clone(), kind: PendingKind::Decoy });
+                    return ScanDriverStep::Need(path);
+                }
+                DriverPhase::Decoys { paths, mut next, block, group } => {
+                    if next >= paths.len() {
+                        self.phase = DriverPhase::Groups { block, group: group + 1 };
+                        continue;
+                    }
+                    let path = paths[next].clone();
+                    next += 1;
+                    self.phase = DriverPhase::Decoys { paths, next, block, group };
+                    self.pending =
+                        Some(PendingRequest { path: path.clone(), kind: PendingKind::Decoy });
+                    return ScanDriverStep::Need(path);
+                }
+                DriverPhase::Finished => {
+                    self.phase = DriverPhase::Finished;
+                    return ScanDriverStep::Failed("scan driver already completed".to_string());
+                }
+            }
+        }
+    }
+
+    /// Supply the result for the currently outstanding `Need`.
+    pub fn supply(&mut self, response: Result<Vec<u8>, String>) {
+        let Some(pending) = self.pending.take() else {
+            self.fatal = Some("scan driver received a response without requesting a path".into());
+            return;
+        };
+        match pending.kind {
+            PendingKind::Compact => self.supply_compact(response),
+            PendingKind::Matched { block, group, detected } => {
+                self.supply_matched(block, group, &detected, response)
+            }
+            PendingKind::Decoy => {
+                // A decoy result is discarded by construction, including an
+                // error; only the fact that the request was made is counted.
+                self.stats.decoy_fetches += 1;
+            }
+        }
+    }
+
+    fn supply_compact(&mut self, response: Result<Vec<u8>, String>) {
+        let compact = match response {
+            Ok(compact) => compact,
+            Err(err) => {
+                self.fatal = Some(err);
+                return;
+            }
+        };
+        self.stats.compact_bytes += compact.len();
+        let page = match decode_compact_response(&compact) {
+            Ok(page) => page,
+            Err(err) => {
+                self.fatal = Some(format!("{err:?}"));
+                return;
+            }
+        };
+        let Some((first, last)) =
+            page.first().zip(page.last()).map(|(first, last)| (first.height, last.height))
+        else {
+            self.finish_compact();
+            return;
+        };
+        if first < self.cursor {
+            self.fatal = Some(format!(
+                "compact page answers below the requested range: asked from={}, \
+                 got height {first} — refusing to append a page nobody asked for",
+                self.cursor
+            ));
+            return;
+        }
+        self.blocks.extend(page);
+        if last >= self.to {
+            self.finish_compact();
+        } else {
+            self.cursor = last + 1;
+        }
+    }
+
+    fn finish_compact(&mut self) {
+        self.stats.compact_range_served = self
+            .blocks
+            .first()
+            .zip(self.blocks.last())
+            .map(|(first, last)| (first.height, last.height));
+        self.tx_space = self
+            .blocks
+            .iter()
+            .map(|block| (block.height, block.groups.len() as u64))
+            .filter(|(_, n_txs)| *n_txs > 0)
+            .collect();
+        self.phase = DriverPhase::Groups { block: 0, group: 0 };
+    }
+
+    fn supply_matched(
+        &mut self,
+        block_index: usize,
+        group_index: usize,
+        detected: &[(usize, Vec<usize>)],
+        fetched: Result<Vec<u8>, String>,
+    ) {
+        self.stats.matched_fetches += 1;
+        let block = &self.blocks[block_index];
+        let group = &block.groups[group_index];
+        let payloads_per_recipient = match &fetched {
+            Ok(bytes) => decode_full_response(bytes)
+                .map_err(|err| format!("undecodable /full response: {err:?}")),
+            Err(err) => Err(err.clone()),
+        };
+
+        match payloads_per_recipient {
+            Err(why) => {
+                for (recipient_index, hits) in detected {
+                    for &output_index in hits {
+                        self.unopened.push(UnopenedOutput {
+                            height: block.height,
+                            tx_index: group.tx_index,
+                            recipient_index: *recipient_index,
+                            output_index,
+                            cm: group.recipients[*recipient_index].entries[output_index].cm,
+                            why: Unopened::PayloadUnavailable(why.clone()),
+                        });
+                    }
+                }
+            }
+            Ok(payloads_per_recipient) => {
+                for (recipient_index, hits) in detected {
+                    let (opened, missing) = match payloads_per_recipient.get(*recipient_index) {
+                        Some(payloads) => {
+                            let encrypted = EncryptedOutputs {
+                                bundle: group.recipients[*recipient_index].clone(),
+                                payloads: payloads.clone(),
+                            };
+                            let found = scan(&self.dk, &encrypted, self.config.mode);
+                            let opened: Vec<usize> =
+                                found.iter().map(|detected| detected.index).collect();
+                            for detected in found {
+                                let cm =
+                                    group.recipients[*recipient_index].entries[detected.index].cm;
+                                self.notes.push(LocatedNote {
+                                    height: block.height,
+                                    tx_index: group.tx_index,
+                                    recipient_index: *recipient_index,
+                                    cm,
+                                    detected,
+                                });
+                            }
+                            (opened, false)
+                        }
+                        None => (Vec::new(), true),
+                    };
+                    for &output_index in hits {
+                        if !opened.contains(&output_index) {
+                            let why = if missing {
+                                Unopened::PayloadMissing
+                            } else {
+                                Unopened::PayloadRejected
+                            };
+                            self.unopened.push(UnopenedOutput {
+                                height: block.height,
+                                tx_index: group.tx_index,
+                                recipient_index: *recipient_index,
+                                output_index,
+                                cm: group.recipients[*recipient_index].entries[output_index].cm,
+                                why,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Synchronous adapter over the one scan orchestration in [`ScanDriver`].
 fn scan_over<F>(
     fetch: &mut F,
     dk: &Dk,
@@ -628,186 +964,14 @@ fn scan_over<F>(
 where
     F: FnMut(&str) -> Result<Vec<u8>, String>,
 {
-    // ---- The compact range, PAGED (lab issue #309). A serving node bounds one
-    // response (`qlab_node::rpc::MAX_COMPACT_BLOCKS`, 1,024 blocks ≈ 21 h of
-    // chain), and its contract says a truncated response ends below `to` and the
-    // client pages from the last height + 1. This loop is that client half; it
-    // used to be a single fetch, so a scan of a range wider than one page
-    // silently saw only the first page and reported the rest of the chain —
-    // every note in it included — as `Complete`/nothing. That is exactly how the
-    // first live grant (block 5417) was invisible to a wallet scanning from 0.
-    //
-    // The cap itself cannot be imported here (`qlab-node` depends on this
-    // crate), so the loop is cap-agnostic: page while the last served height is
-    // below `to` and pages keep making progress. A server that is simply behind
-    // `to` ends the loop with one empty page — the honest "I hold nothing
-    // further", same shape as the leaf stream's.
-    let mut blocks = Vec::new();
-    let mut compact_bytes = 0usize;
-    let mut cursor = from;
+    let mut driver = ScanDriver::new(dk.clone(), from, to, config);
     loop {
-        let compact = fetch(&format!("/v1/compact?from={cursor}&to={to}"))?;
-        compact_bytes += compact.len();
-        let page = decode_compact_response(&compact).map_err(|e| format!("{e:?}"))?;
-        let Some(bounds) = page.first().zip(page.last()).map(|(f, l)| (f.height, l.height))
-        else {
-            break; // an empty page: the server holds nothing (more) in the range
-        };
-        let (first, last) = bounds;
-        if first < cursor {
-            // The same misattribution discipline as the leaf stream's `from`
-            // echo: a page below the requested offset would re-scan (and
-            // double-count) heights already in hand, so it is refused before a
-            // block of it is appended — and it is also the progress guard that
-            // keeps a broken server from looping this client forever.
-            return Err(format!(
-                "compact page answers below the requested range: asked from={cursor}, \
-                 got height {first} — refusing to append a page nobody asked for"
-            ));
-        }
-        blocks.extend(page);
-        if last >= to {
-            break; // the whole requested range is in hand
-        }
-        cursor = last + 1;
-    }
-    let mut stats = ScanStats {
-        compact_bytes,
-        compact_range_served: blocks.first().zip(blocks.last()).map(|(f, l)| (f.height, l.height)),
-        ..Default::default()
-    };
-
-    // The (height, n_txs) space, for randomized decoy targeting.
-    let tx_space: Vec<(u64, u64)> = blocks
-        .iter()
-        .map(|b| (b.height, b.groups.len() as u64))
-        .filter(|(_, n)| *n > 0)
-        .collect();
-
-    let mut notes = Vec::new();
-    let mut unopened = Vec::new();
-
-    for block in &blocks {
-        for group in &block.groups {
-            // ---- Detection. Decided from the committed bytes alone, before any
-            // fetch, and recorded whether or not the fetch that follows works.
-            let detected: Vec<(usize, Vec<usize>)> = group
-                .recipients
-                .iter()
-                .enumerate()
-                .map(|(ri, bundle)| (ri, detect_matches(dk, bundle)))
-                .filter(|(_, hits)| !hits.is_empty())
-                .collect();
-            if detected.is_empty() {
-                continue;
-            }
-            stats.detected_outputs += detected.iter().map(|(_, h)| h.len()).sum::<usize>();
-
-            // The committed coordinates of one detected output. Built from the
-            // block and the group, never from anything the `/full` fetch returned.
-            let located = |ri: usize, oi: usize, why: Unopened| UnopenedOutput {
-                height: block.height,
-                tx_index: group.tx_index,
-                recipient_index: ri,
-                output_index: oi,
-                cm: group.recipients[ri].entries[oi].cm,
-                why,
-            };
-
-            // ---- Opening. Everything below this line depends on bytes no
-            // consensus rule obliges anybody to hold.
-            let path = format!("/v1/block/{}/tx/{}/full", block.height, group.tx_index);
-            let fetched = fetch(&path);
-            stats.matched_fetches += 1;
-            let payloads_per_recipient = match &fetched {
-                Ok(bytes) => decode_full_response(bytes)
-                    .map_err(|e| format!("undecodable /full response: {e:?}")),
-                Err(e) => Err(e.clone()),
-            };
-
-            match payloads_per_recipient {
-                Err(why) => {
-                    // The whole transaction is unreadable: every detected output
-                    // is reported, with the reason, rather than the scan ending.
-                    for (ri, hits) in &detected {
-                        for &oi in hits {
-                            unopened.push(located(
-                                *ri,
-                                oi,
-                                Unopened::PayloadUnavailable(why.clone()),
-                            ));
-                        }
-                    }
-                }
-                Ok(payloads_per_recipient) => {
-                    for (ri, hits) in &detected {
-                        let (opened, missing) = match payloads_per_recipient.get(*ri) {
-                            Some(payloads) => {
-                                let enc = EncryptedOutputs {
-                                    bundle: group.recipients[*ri].clone(),
-                                    payloads: payloads.clone(),
-                                };
-                                // `scan` re-runs the same tag comparison, so what it
-                                // returns is a subset of `hits` by construction.
-                                let found = scan(dk, &enc, config.mode);
-                                let idx: Vec<usize> = found.iter().map(|d| d.index).collect();
-                                for detected in found {
-                                    // The committed `cm`, from the bundle — never a
-                                    // recompute of the plaintext we just decrypted.
-                                    let cm = group.recipients[*ri].entries[detected.index].cm;
-                                    notes.push(LocatedNote {
-                                        height: block.height,
-                                        tx_index: group.tx_index,
-                                        recipient_index: *ri,
-                                        cm,
-                                        detected,
-                                    });
-                                }
-                                (idx, false)
-                            }
-                            None => (Vec::new(), true),
-                        };
-                        for &oi in hits {
-                            if !opened.contains(&oi) {
-                                let why = if missing {
-                                    Unopened::PayloadMissing
-                                } else {
-                                    Unopened::PayloadRejected
-                                };
-                                unopened.push(located(*ri, oi, why));
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Decoy over-fetch (§2 mitigation) — randomized targets, discarded.
-            // A decoy's *result* is discarded by construction, so its failure is
-            // discarded too: a 404 on a decoy must not decide a real scan's fate.
-            if let DecoyPolicy::PerMatch { max } = config.decoy {
-                let max = max.max(1);
-                let n_decoys = 1 + (rng.next_u64() as usize % max); // 1..=max
-                for _ in 0..n_decoys {
-                    if tx_space.is_empty() {
-                        break;
-                    }
-                    let (h, n_tx) = tx_space[rng.next_u64() as usize % tx_space.len()];
-                    let ti = rng.next_u64() % n_tx;
-                    let _ = fetch(&format!("/v1/block/{h}/tx/{ti}/full"));
-                    stats.decoy_fetches += 1;
-                }
-            }
+        match driver.step(rng) {
+            ScanDriverStep::Need(path) => driver.supply(fetch(&path)),
+            ScanDriverStep::Done(outcome) => return Ok(outcome),
+            ScanDriverStep::Failed(err) => return Err(err),
         }
     }
-
-    // 🔴 Issue #215: of two notes payable to this wallet that share ρ, only one
-    // can ever be spent. Decided here, over the whole range, once every note is
-    // in hand — not per block, because the two halves of the attack are two
-    // different transactions in two different blocks by design.
-    let (notes, shadowed) = resolve_claims(notes);
-    stats.notes_found = notes.len();
-    stats.shadowed_outputs = shadowed.len();
-    Ok(ScanOutcome { notes, unopened, shadowed, stats })
 }
 
 /// Minimal dependency-free HTTP/1.1 GET over `TcpStream`. `base_url` is
@@ -1681,6 +1845,266 @@ mod tests {
     }
 
     // ---- lab issue #309: the compact range is served in pages -----------------
+
+    /// Lab issue #350 decision lock. These are the complete request traces made
+    /// by the synchronous implementation before it is inverted into a driver.
+    /// They deliberately pin compact paging before any matched `/full` fetches,
+    /// the inclusive path vocabulary, the empty-response stop, and a fatal
+    /// compact failure after an earlier page made progress.
+    #[test]
+    fn request_path_sequences_are_golden_before_scan_driver_refactor() {
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::Off };
+
+        // One compact page, followed by the two matching transactions in it.
+        let single = Devnet::generate(GenParams {
+            n_blocks: 1,
+            txs_per_block: 2,
+            ..GenParams::default()
+        });
+        let mut single_paths = Vec::new();
+        let mut single_fetch = |path: &str| {
+            single_paths.push(path.to_string());
+            crate::server::route(&single, path).map_err(|(c, m)| format!("{c} {m}"))
+        };
+        scan_over(
+            &mut single_fetch,
+            &single.our.dk,
+            1,
+            1,
+            cfg,
+            &mut StdRng::seed_from_u64(0x3501),
+        )
+        .expect("single-page golden scan");
+        drop(single_fetch);
+        assert_eq!(
+            single_paths,
+            [
+                "/v1/compact?from=1&to=1",
+                "/v1/block/1/tx/0/full",
+                "/v1/block/1/tx/1/full",
+            ]
+        );
+
+        // Five blocks served two at a time: collect every compact page first,
+        // then open each matching transaction in ascending chain order.
+        let multi = Devnet::generate(GenParams {
+            n_blocks: 5,
+            txs_per_block: 1,
+            ..GenParams::default()
+        });
+        let mut multi_paths = Vec::new();
+        let mut multi_fetch = |path: &str| {
+            multi_paths.push(path.to_string());
+            let bytes =
+                crate::server::route(&multi, path).map_err(|(c, m)| format!("{c} {m}"))?;
+            if path.starts_with("/v1/compact") {
+                let blocks = decode_compact_response(&bytes).expect("route serves compact wire");
+                return Ok(crate::codec::encode_compact_response(
+                    &blocks.into_iter().take(2).collect::<Vec<_>>(),
+                ));
+            }
+            Ok(bytes)
+        };
+        scan_over(
+            &mut multi_fetch,
+            &multi.our.dk,
+            1,
+            5,
+            cfg,
+            &mut StdRng::seed_from_u64(0x3502),
+        )
+        .expect("multi-page golden scan");
+        drop(multi_fetch);
+        assert_eq!(
+            multi_paths,
+            [
+                "/v1/compact?from=1&to=5",
+                "/v1/compact?from=3&to=5",
+                "/v1/compact?from=5&to=5",
+                "/v1/block/1/tx/0/full",
+                "/v1/block/2/tx/0/full",
+                "/v1/block/3/tx/0/full",
+                "/v1/block/4/tx/0/full",
+                "/v1/block/5/tx/0/full",
+            ]
+        );
+
+        // A range with no served blocks ends after its one empty compact page.
+        let mut empty_paths = Vec::new();
+        let mut empty_fetch = |path: &str| {
+            empty_paths.push(path.to_string());
+            crate::server::route(&single, path).map_err(|(c, m)| format!("{c} {m}"))
+        };
+        scan_over(
+            &mut empty_fetch,
+            &single.our.dk,
+            9,
+            9,
+            cfg,
+            &mut StdRng::seed_from_u64(0x3503),
+        )
+        .expect("empty-range golden scan");
+        drop(empty_fetch);
+        assert_eq!(empty_paths, ["/v1/compact?from=9&to=9"]);
+
+        // A transport failure on the second compact page is fatal at exactly
+        // that request; no opening request is issued from the partial range.
+        let mut failure_paths = Vec::new();
+        let mut failure_fetch = |path: &str| {
+            failure_paths.push(path.to_string());
+            if path == "/v1/compact?from=3&to=5" {
+                return Err("golden mid-range failure".to_string());
+            }
+            let bytes =
+                crate::server::route(&multi, path).map_err(|(c, m)| format!("{c} {m}"))?;
+            let blocks = decode_compact_response(&bytes).expect("route serves compact wire");
+            Ok(crate::codec::encode_compact_response(
+                &blocks.into_iter().take(2).collect::<Vec<_>>(),
+            ))
+        };
+        let err = match scan_over(
+            &mut failure_fetch,
+            &multi.our.dk,
+            1,
+            5,
+            cfg,
+            &mut StdRng::seed_from_u64(0x3504),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("mid-range compact failure remains fatal"),
+        };
+        drop(failure_fetch);
+        assert_eq!(err, "golden mid-range failure");
+        assert_eq!(
+            failure_paths,
+            ["/v1/compact?from=1&to=5", "/v1/compact?from=3&to=5"]
+        );
+    }
+
+    fn need_from(driver: &mut ScanDriver, rng: &mut StdRng, expected: &str) -> String {
+        match driver.step(rng) {
+            ScanDriverStep::Need(path) => {
+                assert_eq!(path, expected);
+                path
+            }
+            ScanDriverStep::Done(_) => panic!("expected Need({expected}), got Done"),
+            ScanDriverStep::Failed(err) => panic!("expected Need({expected}), got Failed({err})"),
+        }
+    }
+
+    /// The driver can retain an outstanding request across an await-shaped
+    /// boundary. Every step and supply below is a separate invocation; there is
+    /// intentionally no pump loop in this test.
+    #[test]
+    fn scan_driver_pages_can_be_supplied_across_separate_suspensions() {
+        fn suspend(path: String) -> String {
+            path
+        }
+
+        let wallet = Wallet::from_seed_lanes([0x350, 2, 1, 1]);
+        let diversifier = Diversifier::default();
+        let ours = wallet.diversified_keypair(&diversifier);
+        let stranger = generate_keypair(&mut StdRng::seed_from_u64(0x3505));
+        let stranger_note =
+            Note { value: 1, rkm: [1; 4], rho: [1; 4], rseed: [1; 4] };
+        let our_note = Note {
+            value: 350,
+            rkm: wallet.rkm(diversifier),
+            rho: [2; 4],
+            rseed: [3; 4],
+        };
+        let devnet = chain_paying(
+            generate_keypair(&mut StdRng::seed_from_u64(0x3506)),
+            &[
+                vec![vec![(&stranger.ek, vec![stranger_note])]],
+                vec![vec![(&ours.ek, vec![our_note.clone()])]],
+            ],
+        );
+        let cfg =
+            ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::PerMatch { max: 1 } };
+        let mut driver = ScanDriver::new(ours.dk.clone(), 1, 2, cfg);
+        let mut rng = StdRng::seed_from_u64(0x3507);
+
+        let first = suspend(need_from(
+            &mut driver,
+            &mut rng,
+            "/v1/compact?from=1&to=2",
+        ));
+        let first_bytes = crate::server::route(&devnet, &first)
+            .map_err(|(c, m)| format!("{c} {m}"))
+            .expect("first compact response");
+        let first_page = decode_compact_response(&first_bytes).expect("compact wire");
+        driver.supply(Ok(crate::codec::encode_compact_response(&first_page[..1])));
+
+        let second = suspend(need_from(
+            &mut driver,
+            &mut rng,
+            "/v1/compact?from=2&to=2",
+        ));
+        driver.supply(
+            crate::server::route(&devnet, &second).map_err(|(c, m)| format!("{c} {m}")),
+        );
+
+        let full = suspend(need_from(
+            &mut driver,
+            &mut rng,
+            "/v1/block/2/tx/0/full",
+        ));
+        driver.supply(crate::server::route(&devnet, &full).map_err(|(c, m)| format!("{c} {m}")));
+
+        // The RNG is caller-owned and used again after all three suspensions.
+        // With max=1 the driver issues exactly one randomized decoy request.
+        let decoy = suspend(match driver.step(&mut rng) {
+            ScanDriverStep::Need(path) => path,
+            ScanDriverStep::Done(_) => panic!("the post-suspension decoy was skipped"),
+            ScanDriverStep::Failed(err) => panic!("post-suspension RNG step failed: {err}"),
+        });
+        assert!(
+            ["/v1/block/1/tx/0/full", "/v1/block/2/tx/0/full"].contains(&decoy.as_str()),
+            "decoy stays inside the two-transaction scan space: {decoy}"
+        );
+        driver.supply(Err("discarded decoy failure".to_string()));
+
+        let outcome = match driver.step(&mut rng) {
+            ScanDriverStep::Done(outcome) => outcome,
+            ScanDriverStep::Need(path) => panic!("unexpected extra request: {path}"),
+            ScanDriverStep::Failed(err) => panic!("suspended scan failed: {err}"),
+        };
+        assert_eq!(outcome.notes.len(), 1);
+        assert_eq!(outcome.notes[0].height, 2);
+        assert_eq!(outcome.notes[0].detected.note, our_note);
+    }
+
+    /// Paging's progress refusal belongs to the driver itself, so a caller
+    /// cannot pump the same compact page forever and obtain `Complete`/zero.
+    #[test]
+    fn scan_driver_rejects_a_compact_page_that_does_not_advance() {
+        let devnet = Devnet::generate(GenParams {
+            n_blocks: 2,
+            txs_per_block: 1,
+            ..GenParams::default()
+        });
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::Off };
+        let mut driver = ScanDriver::new(devnet.our.dk.clone(), 1, 2, cfg);
+        let mut rng = StdRng::seed_from_u64(0x3508);
+
+        need_from(&mut driver, &mut rng, "/v1/compact?from=1&to=2");
+        let stuck = crate::server::route(&devnet, "/v1/compact?from=1&to=1")
+            .map_err(|(c, m)| format!("{c} {m}"));
+        driver.supply(stuck.clone());
+
+        need_from(&mut driver, &mut rng, "/v1/compact?from=2&to=2");
+        driver.supply(stuck);
+
+        match driver.step(&mut rng) {
+            ScanDriverStep::Failed(err) => {
+                assert!(err.contains("below the requested range"), "{err}");
+                assert!(err.contains("asked from=2"), "{err}");
+            }
+            ScanDriverStep::Need(path) => panic!("stuck page requested again: {path}"),
+            ScanDriverStep::Done(_) => panic!("stuck page must not complete the scan"),
+        }
+    }
 
     /// A fetch over `devnet` whose `/v1/compact` answers are bounded the way a
     /// deployed node's are (`qlab_node::rpc::MAX_COMPACT_BLOCKS`, shrunk here to
