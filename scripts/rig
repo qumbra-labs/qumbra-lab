@@ -22,13 +22,25 @@
 #   - every completion appends one TSV line to rig-manifest.tsv
 #     (start, end, owner, rc, log, cmd) -- history is greppable.
 
-# 2026-08-11 addition -- the gap the lock does NOT cover, paid for on this date:
-# the mutex serialises WHO RUNS. It says nothing about WHAT THEY RAN ON. A session
-# edited crates/qumbra-explorer/src/json.rs in the shared main tree at 16:22; another
-# started the acceptance suite at 16:24:28; cargo compiles every test binary before
-# running any, so the edit was already inside the binary and two golden tests failed
-# in a run whose owner had not touched that file. Without --no-fail-fast cargo stops
-# at that binary, so the crates after it never ran either.
+# 2026-08-11 addition -- the gap the lock does NOT cover. The mutex serialises WHO
+# RUNS. It says nothing about WHAT THEY RAN ON.
+#
+# The incident, corrected the same day and left here in full because the corrected
+# version is the more useful lesson: a session edited
+# crates/qumbra-explorer/src/json.rs in the shared main tree at 16:22, and another
+# started the acceptance suite there at 16:24:28. ~~Two golden tests failed in a run
+# whose owner had not touched that file.~~ **They did not.** The editing session
+# reverted at 16:36:13, and cargo had not yet compiled qumbra-explorer -- the
+# workspace's release build phase was still running twelve minutes in -- so that
+# crate compiled from clean source and the run finished rc=0 with both goldens green
+# (log rig-20260811T082413Z-81722.log:1653).
+#
+# It was a NEAR MISS decided by build-order timing, and the first account of it
+# asserted the damage as fact without reading the log. Both halves matter here: the
+# hazard is real -- had the edit still been in place when that crate compiled, the
+# two goldens would have failed under someone else's name, and with no
+# --no-fail-fast cargo stops at the first failing binary, so every crate after it
+# would never have run -- and the reason nothing broke was luck, not design.
 #
 # The fix is provenance, not prohibition. Testing your own uncommitted work is the
 # normal case and must stay frictionless -- so this does NOT block. It makes the tree
