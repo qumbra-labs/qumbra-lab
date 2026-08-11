@@ -180,7 +180,7 @@ mod tests {
         let mut v = MAGIC.to_vec();
         v.push(format);
         v.push(protection);
-        v.extend(std::iter::repeat(0xAB).take(payload_len));
+        v.extend(std::iter::repeat_n(0xAB, payload_len));
         v
     }
 
@@ -259,7 +259,7 @@ mod tests {
     fn magic_without_a_whole_header_is_a_damaged_envelope() {
         for len in 0..2 {
             let mut v = MAGIC.to_vec();
-            v.extend(std::iter::repeat(0x01).take(len));
+            v.extend(std::iter::repeat_n(0x01, len));
             assert_eq!(
                 inspect(&v),
                 Verdict::TruncatedHeader { len: MAGIC.len() + len },
@@ -278,7 +278,7 @@ mod tests {
         // A truncated plain file — the case the magic was chosen against. Its
         // first byte is SEED_VERSION, which MAGIC[0] provably is not.
         let mut plain = vec![SEED_VERSION];
-        plain.extend(std::iter::repeat(0x5A).take(ENTROPY_LEN));
+        plain.extend(std::iter::repeat_n(0x5A, ENTROPY_LEN));
         for cut in 1..plain.len() {
             assert_eq!(
                 inspect(&plain[..cut]),

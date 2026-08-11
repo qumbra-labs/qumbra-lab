@@ -446,7 +446,7 @@ mod tests {
         let mut v = crate::envelope::MAGIC.to_vec();
         v.push(format);
         v.push(protection);
-        v.extend(std::iter::repeat(0xCD).take(payload_len));
+        v.extend(std::iter::repeat_n(0xCD, payload_len));
         assert_ne!(v.len(), 1 + ENTROPY_LEN, "the fixture must reach the non-plain arm");
         v
     }
