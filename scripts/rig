@@ -191,8 +191,13 @@ case "${1:-status}" in
     [ $# -eq 0 ] && { echo "usage: scripts/rig run -- <command>" >&2; exit 2; }
     mkdir -p "$LOGDIR"
     LOGFILE="$LOGDIR/rig-$(stamp)-$$.log"
-    read_tree_state
     acquire "$*"
+    # AFTER acquire, deliberately: the wait for the previous holder can run tens of
+    # minutes, and the tree can change during it -- which is exactly the incident
+    # class this provenance instruments. Reading before the wait would stamp the
+    # run with a pre-wait state it did not execute against: a wrong certificate
+    # of cleanliness, worse than none. (PR #352 review, fix 2.)
+    read_tree_state
     printf '%s\n' "$LOGFILE" > "$LOCK/logfile"
     # In the lock so `rig status`/`ps` can answer "on what?", and at the head of the
     # log so the answer survives with the output it explains.
@@ -202,8 +207,11 @@ case "${1:-status}" in
     START="$(now)"
     # tee passes stdout through unchanged, so callers that parse output keep
     # working; PIPESTATUS keeps the command's own exit code (bash-only, which
-    # is why the shebang is bash and not sh).
-    "$@" 2>&1 | tee "$LOGFILE"; rc=${PIPESTATUS[0]}
+    # is why the shebang is bash and not sh). -a is load-bearing: the tree banner
+    # above already created this file, and a plain tee would truncate it away --
+    # the one recorded place that sits beside the output it explains would be the
+    # one place it never survived. (PR #352 review, fix 1.)
+    "$@" 2>&1 | tee -a "$LOGFILE"; rc=${PIPESTATUS[0]}
     # Appended at the END: `ps_view`'s awk reads $1..$6 positionally, and older lines
     # simply have no $7/$8 (awk yields empty, not an error).
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
