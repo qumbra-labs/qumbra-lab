@@ -129,23 +129,24 @@ pub fn render(pins: &Pins) -> String {
 mod tests {
     use super::*;
 
-    /// The boundary at 18,000 with 1,152-block epochs pins **15** whole epochs
-    /// (0..=14) and leaves epoch 15 straddling — the count the stamp corrected from
-    /// the ruling's "~5–9 epochs" estimate.
+    /// The boundary at 8,640 (re-stamped 2026-08-11 from 18,000, lab #299
+    /// [ruling](https://github.com/qumbra-labs/qumbra-lab/issues/299#issuecomment-5248469483))
+    /// with 1,152-block epochs pins **7** whole epochs (0..=6) and leaves epoch 7
+    /// straddling.
     #[test]
-    fn fifteen_whole_epochs_are_pinned_and_the_straddler_is_not() {
+    fn seven_whole_epochs_are_pinned_and_the_straddler_is_not() {
         let pins = compute();
-        assert_eq!(pins.epochs.len(), 15);
+        assert_eq!(pins.epochs.len(), 7);
         assert_eq!(pins.epochs[0].epoch, 0);
-        assert_eq!(pins.epochs[14].epoch, 14);
-        assert_eq!(pins.epochs[14].end_height, 17_279);
+        assert_eq!(pins.epochs[6].epoch, 6);
+        assert_eq!(pins.epochs[6].end_height, 8_063);
         assert!(
             pins.epochs.iter().all(|r| r.end_height <= RULE_BOUNDARY_HEIGHT),
             "a pinned epoch must lie wholly at or below the boundary"
         );
         assert!(
-            !pins.epochs.iter().any(|r| r.epoch == 15),
-            "epoch 15 straddles; its prefix is recorded, never pinned as a closed form"
+            !pins.epochs.iter().any(|r| r.epoch == 7),
+            "epoch 7 straddles; its prefix is recorded, never pinned as a closed form"
         );
     }
 
@@ -158,7 +159,7 @@ mod tests {
         assert_eq!(pins.s_atomic_at_boundary, qlab_node::emission::s_atomic_at_boundary());
         // Row-for-row against the attestation's own unpinned expected side.
         let ledger_rows = qlab_node::supply_by_epoch(
-            (0..=17_279u64).map(|height| {
+            (0..=8_063u64).map(|height| {
                 // Synthetic identities: the pins are a pure function of the
                 // schedule, so any contiguous chain shape witnesses them.
                 let mut hash = [0u8; 32];
@@ -178,7 +179,7 @@ mod tests {
             EPOCH_LENGTH_BLOCKS,
         )
         .expect("contiguous from genesis");
-        assert_eq!(ledger_rows.len(), 15);
+        assert_eq!(ledger_rows.len(), 7);
         for (row, pin) in ledger_rows.iter().zip(&pins.epochs) {
             assert_eq!(row.epoch, pin.epoch);
             assert_eq!(row.expected_coinbase, pin.expected_coinbase);
@@ -198,7 +199,7 @@ mod tests {
         assert!(text.contains(std::env::consts::OS));
         // The endpoints are emitted as fields, because they are part of the pin's key.
         assert!(
-            text.contains("EpochPin { epoch: 14, start_height: 16128, end_height: 17279,"),
+            text.contains("EpochPin { epoch: 6, start_height: 6912, end_height: 8063,"),
             "the last pinned epoch must appear with its range:\n{text}"
         );
     }

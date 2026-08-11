@@ -30,22 +30,24 @@
 //! 3. **Straddling the boundary — exactly one epoch, always.** An epoch ends at
 //!    `1152·N − 1`, which is always **odd**, while a legal halt height must be a
 //!    multiple of the checkpoint cadence (8). So no boundary can ever be an epoch
-//!    end and *some* epoch always straddles it — here, epoch 15 (`[17_280,
-//!    18_431]`, boundary at 18,000). That is rider 1 of the stamp: a finding, not an
-//!    oversight, and not worth a round trip trying to design away.
+//!    end and *some* epoch always straddles it — here, epoch 7 (`[8_064,
+//!    9_215]`, boundary at 8,640, re-stamped 2026-08-11 from 18,000 by
+//!    [Larry's ruling on lab #299](https://github.com/qumbra-labs/qumbra-lab/issues/299#issuecomment-5248469483)).
+//!    That is rider 1 of the stamp: a finding, not an oversight, and not worth a
+//!    round trip trying to design away.
 //!
 //! For the straddling row the expected side is **piecewise**: the recorded value of
 //! the pre-boundary prefix plus the *exact* walk of the suffix. It is emphatically
 //! not `s_atomic_exact` across the whole row — that would recompute heights the
 //! ruling forbids recomputing, and against a **zero-bessel** tolerance a single
-//! grandfathered ±1 in the prefix would raise a false DIVERGENT on epoch 15. This
+//! grandfathered ±1 in the prefix would raise a false DIVERGENT on epoch 7. This
 //! surface exists to make a supply violation legible; an alarm that fires on
 //! grandfathered history trains its reader to ignore red, which is exactly what
 //! #299 ruling item 2 forbids.
 //!
 //! **The honest cost of that, stated rather than buried:** because the prefix
 //! contributes `expected == measured` by construction, a genuine pre-boundary defect
-//! inside `17_280..=18_000` is invisible in epoch 15's row. It is visible in every
+//! inside `8_064..=8_640` is invisible in epoch 7's row. It is visible in every
 //! other pre-boundary epoch's row, and it is visible per-block to
 //! `qumbra-node audit-emission`, which is the instrument for per-block defects.
 //! Reported on #303 as the reading this baton took of rider 2.
@@ -81,14 +83,14 @@ pub struct EpochPin {
 /// the glibc fleet. Produce the literals on a Linux/glibc host with
 /// `qumbra-node emission-pins` and paste them here.
 ///
-/// The stamp puts the boundary at 18,000, so this covers **15 epochs** (0..=14),
-/// not the "~5–9" the ruling estimated at the time — six more literals and nothing
-/// else. Epoch 15 straddles and is handled piecewise; see the module docs.
+/// The stamp put the boundary at 18,000 (15 epochs, 0..=14); **re-stamped
+/// 2026-08-11 to 8,640** by [Larry's ruling on lab #299](https://github.com/qumbra-labs/qumbra-lab/issues/299#issuecomment-5248469483),
+/// which shrinks this to **7 epochs** (0..=6). Epoch 7 straddles and is handled
+/// piecewise; see the module docs.
 pub const PINNED_EPOCH_EXPECTED: &[EpochPin] = &[
-    // Activated 2026-08-10 (lab #299/#303): `qumbra-node emission-pins` on a
-    // linux/aarch64 host; epochs 0/1/2 cross-checked against issue #299's body
-    // and epoch 3 against an independent evaluation. Epoch 15 straddles the
-    // boundary (17_280..=18_431) and is handled piecewise — it is NOT pinned.
+    // Re-activated 2026-08-11 (lab #299/#303, re-stamp to 8,640): `qumbra-node
+    // emission-pins` on a linux/aarch64 host. Epoch 7 straddles the boundary
+    // (8_064..=9_215) and is handled piecewise — it is NOT pinned.
     EpochPin { epoch: 0, start_height: 0, end_height: 1151, expected_coinbase: 5752270395189 },
     EpochPin { epoch: 1, start_height: 1152, end_height: 2303, expected_coinbase: 5751809896394 },
     EpochPin { epoch: 2, start_height: 2304, end_height: 3455, expected_coinbase: 5746354576625 },
@@ -96,14 +98,6 @@ pub const PINNED_EPOCH_EXPECTED: &[EpochPin] = &[
     EpochPin { epoch: 4, start_height: 4608, end_height: 5759, expected_coinbase: 5735459454517 },
     EpochPin { epoch: 5, start_height: 5760, end_height: 6911, expected_coinbase: 5730019642369 },
     EpochPin { epoch: 6, start_height: 6912, end_height: 8063, expected_coinbase: 5724584989626 },
-    EpochPin { epoch: 7, start_height: 8064, end_height: 9215, expected_coinbase: 5719155491393 },
-    EpochPin { epoch: 8, start_height: 9216, end_height: 10367, expected_coinbase: 5713731142784 },
-    EpochPin { epoch: 9, start_height: 10368, end_height: 11519, expected_coinbase: 5708311938911 },
-    EpochPin { epoch: 10, start_height: 11520, end_height: 12671, expected_coinbase: 5702897874899 },
-    EpochPin { epoch: 11, start_height: 12672, end_height: 13823, expected_coinbase: 5697488945869 },
-    EpochPin { epoch: 12, start_height: 13824, end_height: 14975, expected_coinbase: 5692085146953 },
-    EpochPin { epoch: 13, start_height: 14976, end_height: 16127, expected_coinbase: 5686686473285 },
-    EpochPin { epoch: 14, start_height: 16128, end_height: 17279, expected_coinbase: 5681292920005 },
 ];
 
 /// The public accounting inputs from one canonical block.
@@ -546,7 +540,7 @@ mod tests {
     // --- the boundary: riders 1 and 2 of the #299/#303 stamp ------------------
 
     const EPOCH: u64 = qlab_devnet::params_devnet::EPOCH_LENGTH_BLOCKS;
-    /// The straddling epoch, derived rather than written: `18_000 / 1_152 = 15`.
+    /// The straddling epoch, derived rather than written: `8_640 / 1_152 = 7`.
     const STRADDLE_EPOCH: u64 = RULE_BOUNDARY_HEIGHT / EPOCH;
 
     /// An honest chain (every block commits the canonical schedule) up to `tip`,
@@ -558,14 +552,14 @@ mod tests {
     }
 
     /// **Rider 1, restated as a property of the parameters**: exactly one epoch
-    /// straddles the boundary, and it is epoch 15 — because no legal halt height can
+    /// straddles the boundary, and it is epoch 7 — because no legal halt height can
     /// ever be an epoch end.
     #[test]
-    fn exactly_one_epoch_straddles_the_boundary_and_it_is_epoch_15() {
-        assert_eq!(STRADDLE_EPOCH, 15);
+    fn exactly_one_epoch_straddles_the_boundary_and_it_is_epoch_7() {
+        assert_eq!(STRADDLE_EPOCH, 7);
         let start = STRADDLE_EPOCH * EPOCH;
         let end = start + EPOCH - 1;
-        assert_eq!((start, end), (17_280, 18_431));
+        assert_eq!((start, end), (8_064, 9_215));
         assert!(start <= RULE_BOUNDARY_HEIGHT && RULE_BOUNDARY_HEIGHT < end);
         // And the count is one, not "one so far": a row straddles iff its start is
         // at or below the boundary and its end is above it, which is one epoch.
@@ -580,24 +574,24 @@ mod tests {
 
     /// **Rider 2, the load-bearing test.** A grandfathered ±1 planted in the
     /// straddling epoch's PRE-boundary prefix must not move the row's divergence:
-    /// the prefix is recorded, not recomputed, so epoch 15 still reads zero bessel.
+    /// the prefix is recorded, not recomputed, so epoch 7 still reads zero bessel.
     ///
     /// Without the piecewise rule this row would read DIVERGENT ±1 — a false alarm
     /// on grandfathered history, which is the cry-wolf failure the attestation
     /// exists to avoid.
     #[test]
     fn a_planted_delta_in_the_straddle_prefix_still_reads_zero_bessel() {
-        let tip = (STRADDLE_EPOCH + 1) * EPOCH - 1; // 18,431, the epoch's own end
+        let tip = (STRADDLE_EPOCH + 1) * EPOCH - 1; // 9,215, the epoch's own end
         let mut blocks = honest_chain(tip);
-        // Two plants, opposite signs, both strictly inside 17,280..=18,000.
-        blocks[17_500].coinbase += 1;
-        blocks[18_000].coinbase -= 1;
+        // Two plants, opposite signs, both strictly inside 8_064..=8_640.
+        blocks[8_200].coinbase += 1;
+        blocks[8_640].coinbase -= 1;
         let rows = supply_by_epoch(blocks, EPOCH).expect("contiguous from genesis");
         let straddle = rows
             .iter()
             .find(|r| r.epoch == STRADDLE_EPOCH)
-            .expect("epoch 15 is covered");
-        assert_eq!((straddle.start_height, straddle.end_height), (17_280, 18_431));
+            .expect("epoch 7 is covered");
+        assert_eq!((straddle.start_height, straddle.end_height), (8_064, 9_215));
         assert_eq!(
             straddle.divergence_bessel(),
             0,
@@ -613,7 +607,7 @@ mod tests {
     fn a_planted_delta_above_the_boundary_is_caught_in_the_same_row() {
         let tip = (STRADDLE_EPOCH + 1) * EPOCH - 1;
         let mut blocks = honest_chain(tip);
-        blocks[18_001].coinbase += 7;
+        blocks[8_641].coinbase += 7;
         let rows = supply_by_epoch(blocks, EPOCH).unwrap();
         let straddle = rows.iter().find(|r| r.epoch == STRADDLE_EPOCH).unwrap();
         assert_eq!(straddle.divergence_bessel(), 7);
@@ -624,7 +618,7 @@ mod tests {
     /// nothing about it can depend on a float.
     #[test]
     fn a_wholly_post_boundary_epoch_audits_the_exact_schedule() {
-        let epoch = STRADDLE_EPOCH + 1; // 16 — starts at 18,432, above the boundary
+        let epoch = STRADDLE_EPOCH + 1; // 8 — starts at 9,216, above the boundary
         let tip = (epoch + 1) * EPOCH - 1;
         let rows = supply_by_epoch(honest_chain(tip), EPOCH).unwrap();
         let row = rows.iter().find(|r| r.epoch == epoch).unwrap();
@@ -664,17 +658,18 @@ mod tests {
         );
     }
 
-    /// **Activated 2026-08-10 (lab #299/#303).** The shipped table now carries the
-    /// 15 wholly-pre-boundary epochs (0..=14), generated by `qumbra-node
-    /// emission-pins` on a linux/aarch64 host. This locks the table's *shape* — 15
-    /// contiguous rows covering `0..=17_279`, every one strictly below
-    /// `RULE_BOUNDARY_HEIGHT` (epoch 15 straddles and is deliberately NOT pinned).
-    /// Values were coordinator-verified against issue #299's body (epochs 0/1/2)
-    /// and an independent evaluation (epoch 3); a regeneration that changes any
-    /// literal fails the golden below and demands re-review.
+    /// **Activated 2026-08-10 (lab #299/#303) at 18,000; re-stamped 2026-08-11 to
+    /// 8,640** by [Larry's ruling on lab #299](https://github.com/qumbra-labs/qumbra-lab/issues/299#issuecomment-5248469483).
+    /// The shipped table now carries the 7 wholly-pre-boundary epochs (0..=6),
+    /// generated by `qumbra-node emission-pins` on a linux/aarch64 host. This locks
+    /// the table's *shape* — 7 contiguous rows covering `0..=8_063`, every one
+    /// strictly below `RULE_BOUNDARY_HEIGHT` (epoch 7 straddles and is deliberately
+    /// NOT pinned). Values were coordinator-verified against issue #299's body
+    /// (epochs 0/1/2) and an independent evaluation (epoch 3); a regeneration that
+    /// changes any literal fails the golden below and demands re-review.
     #[test]
-    fn the_activated_pin_table_is_fifteen_contiguous_pre_boundary_epochs() {
-        assert_eq!(PINNED_EPOCH_EXPECTED.len(), 15, "epochs 0..=14 pin, epoch 15 straddles");
+    fn the_activated_pin_table_is_seven_contiguous_pre_boundary_epochs() {
+        assert_eq!(PINNED_EPOCH_EXPECTED.len(), 7, "epochs 0..=6 pin, epoch 7 straddles");
         assert_eq!(PINNED_EPOCH_EXPECTED[0].start_height, 0);
         for (i, p) in PINNED_EPOCH_EXPECTED.iter().enumerate() {
             assert_eq!(p.epoch, i as u64, "epochs in order");
@@ -685,7 +680,7 @@ mod tests {
         // Golden literals for the three the coordinator cross-checked independently.
         assert_eq!(PINNED_EPOCH_EXPECTED[0].expected_coinbase, 5752270395189);
         assert_eq!(PINNED_EPOCH_EXPECTED[1].expected_coinbase, 5751809896394);
-        assert_eq!(PINNED_EPOCH_EXPECTED[14].expected_coinbase, 5681292920005);
+        assert_eq!(PINNED_EPOCH_EXPECTED[6].expected_coinbase, 5724584989626);
     }
 
     /// **A PARTIAL row of a pinned epoch must not take the pin.** This is the shape a

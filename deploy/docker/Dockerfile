@@ -32,8 +32,8 @@ COPY . .
 #
 # NODE_FEATURES selects the emission-boundary variant of the MAIN binary
 # (lab #299/#303, docs/i299-emission-boundary-activation.md §3):
-#   empty (default)        → ARMED — halts at 18000 (the announcement image)
-#   rule-boundary-resume   → the post-boundary release that resumes past 18000
+#   empty (default)        → ARMED — halts at 8640 (the announcement image)
+#   rule-boundary-resume   → the post-boundary release that resumes past 8640
 # Two images from one Dockerfile, the main binary being the right variant, so a
 # fleet roll is the usual image-digest swap. The drill binaries below are unaffected.
 ARG NODE_FEATURES=""

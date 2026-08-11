@@ -19,7 +19,7 @@
 //!
 //! `RULE_BOUNDARY_HEIGHT` is a compiled-in constant (H1: never config, never
 //! genesis, no runtime override), so proving the handoff at a *test* boundary is the
-//! only way to do it without 18,000 blocks — hence
+//! only way to do it without 8,640 blocks — hence
 //! `check_scheduled_coinbase_above`, whose sole non-consensus caller is this file.
 //! Consensus calls `check_scheduled_coinbase`, which reads the real constant.
 //!
@@ -28,15 +28,15 @@
 //! The activation exercise at the real boundary is T-ops's, after merge, and the
 //! sequence is:
 //!
-//! 1. roll the default (armed) image to all four hosts **before** 18,000 — the
-//!    banner prints `halt plan: halts at 18000`, which is the check;
-//! 2. let the net reach 18,000 and halt there. It is a cadence multiple, so the
+//! 1. roll the default (armed) image to all four hosts **before** 8,640 — the
+//!    banner prints `halt plan: halts at 8640`, which is the check;
+//! 2. let the net reach 8,640 and halt there. It is a cadence multiple, so the
 //!    boundary is a *finalized* boundary; `fid` must agree across all four hosts
 //!    (`OPERATOR.md` §3) before anything else happens;
 //! 3. roll the `--features rule-boundary-resume` image. Its marker rewrite records
 //!    `v1.1-exact-emission` as in force, after which a pre-rule binary is refused
 //!    (`UndeclaredResume`) — the property this file's release half asserts offline;
-//! 4. `qumbra-node audit-emission --data-dir` over `18_001..` must report clean:
+//! 4. `qumbra-node audit-emission --data-dir` over `8_641..` must report clean:
 //!    every post-boundary block committed `coinbase_exact(height)`.
 //!
 //! Step 0, before any of it: run `qumbra-node emission-pins` on one host and paste
@@ -230,5 +230,5 @@ fn the_shipped_boundary_would_survive_the_startup_grid_check() {
         revision: Some(REVISION_V1_0),
         resumes_from: None,
     };
-    armed.validate().expect("18,000 = 8 x 2,250 is on the cadence grid");
+    armed.validate().expect("8,640 = 8 x 1,080 is on the cadence grid");
 }

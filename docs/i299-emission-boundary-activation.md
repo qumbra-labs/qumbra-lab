@@ -3,6 +3,17 @@
 **繁體中文版本**: [`i299-emission-boundary-activation-zh.md`](i299-emission-boundary-activation-zh.md)
 (EN is authoritative on technical detail.)
 
+> 🔴 **Re-stamped 2026-08-11: the boundary moves from 18,000 to 8,640.** Larry's
+> ruling on [issue #299](https://github.com/qumbra-labs/qumbra-lab/issues/299#issuecomment-5248469483):
+> the ten-day lead behind 18,000 existed to cover the activation work, that work was
+> discharged in ~10 hours on 2026-08-10, and what remained of the lead was pure wait
+> sitting directly on the T1 gate. 8,640 is the rotation-distant point of epoch 7
+> `[8_064, 9_215]` — 576 in, 575 to the end, the exact midpoint — the same criterion
+> that placed 18,000 at 720-into-epoch-15. Grid-legal: `8_640 = 8 × 1_080`. Everything
+> below is written for **8,640**; the fleet's prior arming at 18,000 (PR #336/#337) is
+> superseded and must be rebuilt and re-rolled per this procedure. See the R3 PR for
+> the code-side change and the re-derived pins.
+
 Audience: **T-ops**, plus the coordinator who accepts the roll. This is the live half
 of the emission-rule baton — the half a builder session cannot do, because it needs
 host access and a Linux/glibc machine.
@@ -19,29 +30,28 @@ convenient; nothing below depends on where it lives.
 
 ## 0. What is changing, in two sentences
 
-`RULE_BOUNDARY_HEIGHT = 18_000` is the **last block** mined and validated under the
-`binary64` emission schedule. From 18,001 the canonical schedule is the exact-decimal
+`RULE_BOUNDARY_HEIGHT = 8_640` is the **last block** mined and validated under the
+`binary64` emission schedule. From 8,641 the canonical schedule is the exact-decimal
 one (`qlab_devnet::emission_exact`) and `body.coinbase == coinbase_exact(height)` is a
 **validity rule** — a block that commits the wrong amount is rejected, and its sender
 is scored as a peer fault.
 
-Everything at or below 18,000 is grandfathered **as recorded**: the epoch-1 −4114
+Everything at or below 8,640 is grandfathered **as recorded**: the epoch-1 −4114
 block stays, every glibc-vs-exact ±1 stays, and nothing recomputes them.
 
-It is a **height, not a date.** At the cadence measured when it was stamped
-(~47.7 blocks/h) it arrives around 2026-08-20 ±½ day of PoW variance. Track the tip,
-never the calendar.
+It is a **height, not a date.** At the ~48 blk/h measured at the re-stamp it arrives
+around **2026-08-12**, ±PoW variance. Track the tip, never the calendar.
 
 ## 1. Preconditions
 
 | Check | How |
 |---|---|
 | The lab PR is merged and `main` carries `RULE_BOUNDARY_HEIGHT` | `grep -r RULE_BOUNDARY_HEIGHT crates/qlab-devnet/src/emission_exact.rs` |
-| The tip is **well below** 18,000 — at least ~2 days of margin | `curl -s https://explorer.qumbra.org/v1/health.json` |
+| The tip is **well below** 8,640 — margin per the ruling's abort line (§0 above, ~7 h at re-stamp pace) | `curl -s https://explorer.qumbra.org/v1/health.json` |
 | All four hosts are reachable and at the same `fid` | `OPERATOR.md` §3 cross-host check |
 | The resume image is **built and pushed** before the armed image is rolled | see §3 |
 
-🔴 **If the tip is within ~2 days of 18,000 and the fleet is not ready, ask for a
+🔴 **If the tip is within margin of 8,640 and the fleet is not ready, ask for a
 fresh stamp on lab #299 instead of racing the height.** Overshooting costs a few more
 days of an unenforced schedule; undershooting halts finality on a live net.
 Re-stamping is legal and cheap only until the images are built — the constant compiles
@@ -63,7 +73,7 @@ It prints three pasteable blocks and the host it ran on. Paste them into:
 
 - `crates/qlab-node/src/emission.rs` — `PINNED_S_ATOMIC_AT_BOUNDARY`,
   `PINNED_COMMITTEE_ACCRUAL_AT_BOUNDARY`
-- `crates/qlab-node/src/supply.rs` — `PINNED_EPOCH_EXPECTED` (15 rows, epochs 0..=14)
+- `crates/qlab-node/src/supply.rs` — `PINNED_EPOCH_EXPECTED` (7 rows, epochs 0..=6)
 
 The command is **pure** — no data dir, no network, no chain — so anyone can rerun it
 and compare. Verify the header line names `linux`; a pin produced on macOS is the one
@@ -86,38 +96,38 @@ Two binaries come out of the same source:
 ```sh
 # the ARMED announcement binary — this is the DEFAULT build
 cargo build --release -p qumbra-node
-#   banner: "halt plan: halts at 18000"
+#   banner: "halt plan: halts at 8640"
 
 # the RESUME binary — the one that goes past the boundary
 cargo build --release -p qumbra-node --features rule-boundary-resume
-#   banner: "resumes past: height 18000", revision v1.1-exact-emission
+#   banner: "resumes past: height 8640", revision v1.1-exact-emission
 ```
 
 🔴 **Build and push the resume image first.** The armed image halts the net at
-18,000; if the resume image does not exist at that moment, finality is stopped until
+8,640; if the resume image does not exist at that moment, finality is stopped until
 it does.
 
-## 4. Roll the armed image (before height 18,000)
+## 4. Roll the armed image (before height 8,640)
 
 One host at a time, per `OPERATOR.md`. On each host, read the banner back:
 
 ```
   release:      qumbra-node v1.0 (halts at the emission-rule boundary, lab #299/#303)
-  halt plan:    halts at 18000
+  halt plan:    halts at 8640
   revision:     v1.0
 ```
 
-If a host does not print `halts at 18000`, it did not get the new image — fix that
+If a host does not print `halts at 8640`, it did not get the new image — fix that
 before moving on. A mixed population is tolerated by design (§4 of
 `committee-and-governance`), but a host still on the old image will keep mining above
-18,000 on a branch the upgraded population refuses.
+8,640 on a branch the upgraded population refuses.
 
-## 5. Let the net halt at 18,000, then check the boundary is finalized
+## 5. Let the net halt at 8,640, then check the boundary is finalized
 
-18,000 is a checkpoint-cadence multiple (8 × 2,250) precisely so the boundary is a
+8,640 is a checkpoint-cadence multiple (8 × 1,080) precisely so the boundary is a
 **finalized** boundary. Before touching anything:
 
-- every host reports `final=18000` and the **same `fid`** (`OPERATOR.md` §3);
+- every host reports `final=8640` and the **same `fid`** (`OPERATOR.md` §3);
 - a `fid` split here is a 🔴 STOP, not a finding: do not roll the resume image, and
   report on lab #299.
 
@@ -138,20 +148,20 @@ that:
 - a future routine release carrying the same revision starts freely and reads its PoW
   rule domain off the marker (#81).
 
-Finality resumes above 18,000 once ≥⅔ of the committee keys are on the resume image.
+Finality resumes above 8,640 once ≥⅔ of the committee keys are on the resume image.
 
 ## 7. Verify the rule actually bound
 
 ```sh
-qumbra-node audit-emission --data-dir /opt/qumbra/data --from 18001
+qumbra-node audit-emission --data-dir /opt/qumbra/data --from 8641
 #   exit 0 = every post-boundary block committed coinbase_exact(height)
 ```
 
 Run it on all four hosts. Then, on the operator view:
 
-- epoch 15 straddles the boundary (`17_280..=18_431`) and its expected side is
+- epoch 7 straddles the boundary (`8_064..=9_215`) and its expected side is
   piecewise: the recorded pre-boundary prefix plus the exact walk above. It should
-  read `AGREED`, and **a ±1 of grandfathered history inside 17,280..=18,000 cannot
+  read `AGREED`, and **a ±1 of grandfathered history inside 8,064..=8,640 cannot
   make it read otherwise** — that is deliberate, and it means a per-block defect in
   that prefix must be found with `audit-emission`, not with the epoch row;
 - epoch 1 reads `KNOWN-SCAR −4114` with its #299 citation and does **not** raise the
@@ -159,8 +169,8 @@ Run it on all four hosts. Then, on the operator view:
 
 ## 8. What "done" looks like
 
-- all four hosts on the resume image, same `fid`, `final` advancing above 18,000;
-- `audit-emission --from 18001` exit 0 on all four;
+- all four hosts on the resume image, same `fid`, `final` advancing above 8,640;
+- `audit-emission --from 8641` exit 0 on all four;
 - the pins pasted and merged (or an explicit decision recorded on #299 to defer them
   past T1 — see §2 for what that leaves undone);
 - the T1 gate discharged: **the boundary is passed before public mining opens.**
