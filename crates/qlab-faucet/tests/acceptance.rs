@@ -6,6 +6,7 @@
 //! | the abuse control blocks what it claims | [`the_abuse_control_blocks_what_it_claims`] |
 //! | …and does **not** block normal requests | [`the_abuse_control_admits_ordinary_requests`] |
 //! | N consecutive grants do not wedge on "no spendable note" | [`consecutive_grants_do_not_wedge_and_the_wedge_is_named`] |
+//! | a one-real grant is indistinguishable from a two-real one (#292) | [`a_dummy_grant_is_indistinguishable_from_a_two_real_one`] |
 //! | an out-of-window proof is **rejected**, not silently accepted | [`an_aged_out_anchor_is_rejected_by_both_the_faucet_and_the_node`] |
 //!
 //! ## Two honest notes about the rig
@@ -214,8 +215,8 @@ fn requester(seed: u64) -> (Wallet, Address) {
     (w, a)
 }
 
-/// Fifty coinbase-sized notes' worth of value is irrelevant to the note budget;
-/// 50 QMB each is used because that is `coinbase(0)`.
+/// The seeded note value where a test wants a realistic one: 50 QMB, because that
+/// is `coinbase(0)` and coinbase is the faucet's only real inflow.
 const COINBASE_0: u64 = 50 * 100_000_000;
 
 // ---------------------------------------------------------------------------
@@ -233,7 +234,11 @@ fn end_to_end_grant_is_scanned_by_the_requester() {
     // 1. A request arrives with a valid ticket and is queued.
     let ticket = faucet.issue_ticket(1);
     assert_eq!(faucet.accept("203.0.113.7:44100", req_addr, Some(ticket), 0), Ok(1));
-    assert_eq!(faucet.inventory().grants_available(), 1, "two notes buy exactly one grant");
+    assert_eq!(
+        faucet.inventory().grants_available(DEFAULT_GRANT_BESSEL + fee()),
+        9,
+        "two 50 QMB notes are ~9 grants of value, whatever the note count"
+    );
 
     // 2. The faucet plans, fetches live witnesses, and produces a REAL proof.
     let (plan, request) = match faucet.dispense(&rig.rpc, &mut rng) {
@@ -441,65 +446,88 @@ fn the_abuse_control_admits_ordinary_requests() {
 #[test]
 fn consecutive_grants_do_not_wedge_and_the_wedge_is_named() {
     let _prover = prover_gate();
-    // The note-count conservation law, run for real: five seeded notes serve
-    // exactly four consecutive grants (count − 1), each a real proof accepted by the
-    // real verifier, and the fifth attempt reports a *named* out-of-notes state
-    // rather than stalling silently or panicking.
-    const SEEDED: usize = 5;
+    // The budget law, run for real. Three seeded notes serve THREE consecutive
+    // grants — two two-real ones (Δ−1 each) and then, from the single note they
+    // consolidate into, one more on the dummy path (Δ0). Each is a real proof
+    // accepted by the real verifier, and the fourth attempt reports a named
+    // *value* shortage rather than stalling silently or panicking.
+    //
+    // 🔴 **The third grant is issue #292's fix, and until 2026-08-11 it was a
+    // stall.** The old law was `count − 1`: with one note left the faucet refused
+    // `OutOfNotes` and that note could never be spent, at any value, ever. The
+    // wedge this test is named for has moved from the note count to the value.
+    //
+    // Note values are 1.2 × the outlay so the tail is exactly one grant long —
+    // three real proofs is the whole budget here, which keeps a 12 GB prover run
+    // inside what this rig will do (crate docs).
+    const SEEDED: usize = 3;
+    let need = DEFAULT_GRANT_BESSEL + fee();
+    let seed_value = need * 12 / 10;
     let mut rng = StdRng::from_seed([0xD1; 32]);
     let (mut rig, mut faucet, faucet_wallet) = funded_faucet(
-        &[COINBASE_0; SEEDED],
+        &[seed_value; SEEDED],
         FaucetLimits { ticket_policy: TicketPolicy::Disabled, ..FaucetLimits::unlimited() },
     );
     assert_eq!(faucet.inventory().len(), SEEDED);
-    assert_eq!(faucet.inventory().grants_available(), SEEDED - 1);
+    // The budget is value, and here it is exactly attained: 3 × 1.2 = 3.6 outlays.
+    assert_eq!(faucet.inventory().grants_available(need), 3);
 
     let mut served = 0usize;
     let mut prove_secs = Vec::new();
-    for i in 0..(SEEDED - 1) {
+    let mut shapes = Vec::new();
+    for i in 0..3 {
         let (_, addr) = requester(0x4000 + i as u64);
         faucet.accept("203.0.113.10", addr, None, i as u64 * 1_000).expect("open mode admits");
+        let held_before = faucet.inventory().len();
         let (plan, _req) = match faucet.dispense(&rig.rpc, &mut rng) {
             DispenseOutcome::Ready { plan, request } => (plan, request),
             other => panic!("grant {i} should be ready, got {other:?}"),
         };
         prove_secs.push(plan.prove_secs);
+        shapes.push(plan.used_dummy());
         assert!(matches!(rig.submit(&plan), SubmitOutcome::Accepted(_)), "grant {i} admitted");
         rig.mine(vec![plan.entry.clone()], &ConsensusVerifier);
         // Finality is what makes the change note spendable for the NEXT grant —
         // without it the faucet holds notes it cannot witness, which is the failure
         // this test is really watching for.
         rig.finalize_tip();
+        let dummy = plan.used_dummy();
         faucet.confirm(*plan);
         served += 1;
+        // The conservation law, checked per grant against the shape that was
+        // actually built: −1 for a pair, 0 for the dummy path.
         assert_eq!(
             faucet.inventory().len(),
-            SEEDED - served,
-            "after {served} grants the note count is seeded − served"
+            if dummy { held_before } else { held_before - 1 },
+            "grant {i} moved the note count by the wrong amount"
         );
     }
-    assert_eq!(served, SEEDED - 1, "count − 1 grants served without wedging");
+    assert_eq!(served, 3, "the value budget was served in full without wedging");
+    assert_eq!(shapes, vec![false, false, true], "two pairs, then the single-note tail");
     assert_eq!(faucet.stats().confirmed, served as u64);
     assert_eq!(faucet.stats().stalled, 0, "no grant stalled on the way");
 
-    // The change note of the last grant is still there and still anchored — the
-    // faucet is not wedged on *value*, only on the note count.
+    // One note still held — it is simply too small now. Under the old rule this
+    // same state was reported as running out of *notes*, which sent an operator
+    // looking for coinbase when the real answer was the same either way but the
+    // reason was not.
     assert_eq!(faucet.inventory().len(), 1);
-    assert!(faucet.inventory().total_value() > DEFAULT_GRANT_BESSEL + fee());
+    assert!(faucet.inventory().total_value() < need, "what is left cannot fund a grant");
+    assert_eq!(faucet.inventory().grants_available(need), 0);
 
-    // The fifth request: named, not silent.
+    // The fourth request: named, not silent.
     let (_, addr) = requester(0x4FFF);
     faucet.accept("203.0.113.10", addr, None, 99_000).expect("admitted");
     match faucet.dispense(&rig.rpc, &mut rng) {
         DispenseOutcome::Stalled(reason) => {
             let text = reason.to_string();
             assert!(
-                text.contains("out of spendable notes") && text.contains("1 held"),
-                "the stall must name the state: {text}"
+                text.contains("insufficient value") && text.contains(&need.to_string()),
+                "the stall must name the state and the outlay: {text}"
             );
             assert!(
-                text.contains("only coinbase refills"),
-                "…and name the only remedy: {text}"
+                text.contains(&faucet.inventory().total_value().to_string()),
+                "…and what it actually has, so the shortfall is computable: {text}"
             );
         }
         other => panic!("expected a named stall, got {other:?}"),
@@ -510,8 +538,8 @@ fn consecutive_grants_do_not_wedge_and_the_wedge_is_named() {
     assert_eq!(faucet.stats().stalled, 1);
 
     // One more note — what a won block would supply — and the same faucet serves
-    // again. That is the whole provisioning story: grants come from notes, notes
-    // come from coinbase.
+    // again. That is the whole provisioning story: grants come from value, value
+    // comes from coinbase.
     let fresh = rig.seed_notes(&faucet_wallet, Diversifier::default(), &[COINBASE_0]);
     for n in fresh {
         faucet.fund(n);
@@ -532,6 +560,99 @@ fn consecutive_grants_do_not_wedge_and_the_wedge_is_named() {
         prove_secs.iter().cloned().fold(0.0, f64::max),
     );
     assert!(mean > 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Acceptance 3b — the two input shapes are indistinguishable on the wire
+// ---------------------------------------------------------------------------
+
+/// 🔴 **The property the #292 fallback rests on, locked at the faucet layer.**
+///
+/// `build_bucket_dummy1` claims its program is byte-identical to the two-real
+/// one's, and `qlab-air` tests that claim about the *circuit*. This tests it about
+/// the **transaction a faucet actually emits**, which is the thing an observer sees
+/// and the thing a future refactor of `build_grant` would break — the two paths
+/// share every line below the input shape precisely so this holds, and nothing but
+/// a test stops someone from "optimising" one branch.
+///
+/// Note what is deliberately NOT asserted: that the two surfaces are *equal*. They
+/// are not — different notes give different nullifiers and commitments, as they
+/// must. What must be equal is everything an observer could use to sort grants into
+/// two buckets: the declared arity, the fee, the bucket, the proof size, and the
+/// canonical wire length.
+#[test]
+fn a_dummy_grant_is_indistinguishable_from_a_two_real_one() {
+    let _prover = prover_gate();
+    let need = DEFAULT_GRANT_BESSEL + fee();
+    let mut rng = StdRng::from_seed([0xD2; 32]);
+    // Two anchored notes ⇒ the first grant is a pair; it consolidates them into one
+    // change note, so the second grant is the dummy path. One rig, both shapes,
+    // two proofs.
+    let (mut rig, mut faucet, _w) = funded_faucet(
+        &[need * 12 / 10; 2],
+        FaucetLimits { ticket_policy: TicketPolicy::Disabled, ..FaucetLimits::unlimited() },
+    );
+
+    let mut built: Vec<(bool, TxEntry, usize)> = Vec::new();
+    for i in 0..2u64 {
+        let (_, addr) = requester(0x7000 + i);
+        faucet.accept("203.0.113.20", addr, None, i * 1_000).expect("open mode admits");
+        let plan = match faucet.dispense(&rig.rpc, &mut rng) {
+            DispenseOutcome::Ready { plan, .. } => plan,
+            other => panic!("grant {i} should be ready, got {other:?}"),
+        };
+        // Both shapes go through the real production verifier, on the submit path
+        // and again in the block — a one-real grant is not a thing the node treats
+        // specially, and that is half the property.
+        assert!(matches!(rig.submit(&plan), SubmitOutcome::Accepted(_)), "shape {i} admitted");
+        rig.mine(vec![plan.entry.clone()], &ConsensusVerifier);
+        rig.finalize_tip();
+        built.push((plan.used_dummy(), plan.entry.clone(), plan.proof_bytes));
+        faucet.confirm(*plan);
+    }
+
+    let (two_real, dummy) = (&built[0], &built[1]);
+    assert!(!two_real.0 && dummy.0, "the rig produced one of each shape");
+
+    // The declared surface: same arity, same bucket, same fee. A one-real spend
+    // still declares TWO nullifiers — `PV_NF2` is a real nullifier of an invented
+    // note, which is exactly why the arity does not leak.
+    for (label, (_, entry, _)) in [("two-real", two_real), ("dummy", dummy)] {
+        assert_eq!(entry.public.nullifiers.len(), 2, "{label}: two nullifiers declared");
+        assert_eq!(entry.public.commitments.len(), 2, "{label}: two commitments declared");
+        assert_eq!(entry.public.bucket, ArityBucket::TwoByTwo, "{label}");
+        assert_eq!(entry.public.fee, fee(), "{label}: the same posted price");
+    }
+    // …and the nullifiers are distinct, so the dummy slot is not a recognisable
+    // constant. This is what makes the test non-vacuous: a sentinel dummy would
+    // pass every assertion above and fail this one.
+    assert_ne!(
+        dummy.1.public.nullifiers[0], dummy.1.public.nullifiers[1],
+        "the dummy's nullifier must not be a sentinel"
+    );
+    assert!(
+        !two_real.1.public.nullifiers.iter().any(|nf| dummy.1.public.nullifiers.contains(nf)),
+        "no nullifier is shared between the two grants"
+    );
+
+    // The bytes. The proof is the frozen consensus wire in both cases — the dummy
+    // path costs nothing and saves nothing, which is the point.
+    assert_eq!(two_real.2, dummy.2, "proof sizes differ ⇒ the shape is visible");
+    assert_eq!(
+        two_real.2 as u64,
+        qumbra_node::genesis::CONSENSUS_WIRE_BYTES,
+        "and both are the frozen §4 wire size"
+    );
+    assert_eq!(
+        qlab_p2p::codec::encode_tx(&two_real.1).len(),
+        qlab_p2p::codec::encode_tx(&dummy.1).len(),
+        "canonical wire lengths differ ⇒ the shape is visible"
+    );
+    assert_eq!(
+        two_real.1.discovery.len(),
+        dummy.1.discovery.len(),
+        "the discovery group is two recipients either way"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -610,9 +731,15 @@ fn an_aged_out_anchor_is_rejected_by_both_the_faucet_and_the_node() {
     // And the faucet handles the refusal without losing the notes: the inputs come
     // back, so a re-plan against a fresh anchor is possible.
     let held_before = faucet.inventory().len();
-    let plan_value = aged.spent[0].value + aged.spent[1].value;
+    let plan_value = aged.spent.total_value();
+    let spent_count = aged.spent.as_slice().len();
+    assert_eq!(spent_count, 2, "two anchored notes ⇒ the ordinary two-real path");
     assert!(faucet.reject(*aged, aged_request), "the requester gets another attempt");
-    assert_eq!(faucet.inventory().len(), held_before + 2, "the spent inputs were restored");
+    assert_eq!(
+        faucet.inventory().len(),
+        held_before + spent_count,
+        "the spent inputs were restored — as many as the plan actually took"
+    );
     assert_eq!(faucet.stats().rejected, 1);
     assert!(faucet.inventory().total_value() >= plan_value);
 }

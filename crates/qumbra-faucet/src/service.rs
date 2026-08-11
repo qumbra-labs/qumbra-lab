@@ -13,8 +13,9 @@
 //! result in one call, so there is no seam at which a listener could hold the lock
 //! for the bookkeeping and release it for the proving. Splitting plan-from-prove is a
 //! change to the core, and this baton reports it instead of forking the core to get
-//! it. Against a 75 s block time and a note-count budget of one grant per won block,
-//! 2.3 s of admission latency is not the constraint on anything.
+//! it. Against a 75 s block time and a funding budget of a few grants per won block
+//! (`qlab_faucet::inventory`), 2.3 s of admission latency is not the constraint on
+//! anything.
 //!
 //! ## Receipts, and why they are the listener's and not the core's
 //!
@@ -359,8 +360,8 @@ impl FaucetService {
     /// node's own loop thread; serving the whole queue in one tick would stall the
     /// transport pump and mining for `queue_depth × 2.3 s` (up to 73 s at the 32-deep
     /// cap — one whole block interval). One per tick bounds the loop's worst
-    /// iteration at one proof, and the note-count budget means the sustainable rate
-    /// is one grant per won block anyway, so nothing is lost.
+    /// iteration at one proof, and the gate's refill window admits one grant per
+    /// block interval anyway (`qlab_faucet::FaucetLimits`), so nothing is lost.
     pub fn tick<N: FaucetNode, R: rand::CryptoRng>(
         &mut self,
         node: &mut N,

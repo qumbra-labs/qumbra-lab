@@ -37,8 +37,8 @@
 use std::time::Instant;
 
 use qlab_air::narrow::{
-    build_bucket_with_witnesses, derive_input, derive_output_rho, BucketInstance, MerkleWitness,
-    TxInput, TxOutput,
+    build_bucket_dummy1, build_bucket_with_witnesses, derive_input, derive_output_rho,
+    off_tree_witness, BucketInstance, MerkleWitness, TxInput, TxOutput,
 };
 use qlab_cbserver::tree::CommitmentTree;
 use qlab_consensus::{prove_bucket, Config, Proof, Val, LOG_HEIGHT};
@@ -54,7 +54,7 @@ use qlab_wallet::address::{Address, Diversifier};
 use qlab_wallet::Wallet;
 use rand::CryptoRng;
 
-use crate::inventory::OwnedNote;
+use crate::inventory::{OwnedNote, SpentInputs};
 use crate::view::ChainView;
 
 /// How long the faucet lets itself hold an anchor before re-planning.
@@ -150,7 +150,8 @@ pub enum GrantError {
     /// must survive its own bookkeeping being wrong.
     WitnessDoesNotResolve { cm: [u64; 4] },
     /// The chosen inputs do not cover `grant + fee` — a selection-layer bug if it
-    /// reaches here, since [`crate::Inventory::select_pair`] filters on exactly this.
+    /// reaches here, since [`crate::Inventory::select_inputs`] filters on exactly
+    /// this, for both input shapes.
     Unbalanced { inputs: u64, need: u64 },
 }
 
@@ -189,8 +190,9 @@ pub struct GrantPlan {
     pub grant_value: u64,
     /// Posted fee paid (frozen §5 2×2 price).
     pub fee: u64,
-    /// The two notes spent. Held so a refusal can restore them.
-    pub spent: [OwnedNote; 2],
+    /// The faucet's own notes spent — two, or one under the #292 dummy fallback.
+    /// Held so a refusal can restore them.
+    pub spent: SpentInputs,
     /// The change note the faucet gains — *held*, not yet *anchored*.
     pub change: OwnedNote,
     /// Wall-clock seconds spent inside [`prove_bucket`] for this grant.
@@ -211,6 +213,17 @@ impl GrantPlan {
         !self.lease.is_expired(view)
     }
 
+    /// Whether this grant took the one-real-note path (#219's latch, #292's
+    /// fallback) — i.e. whether it was note-count-neutral.
+    ///
+    /// **Operator-facing only.** It says nothing a chain observer can see: the two
+    /// paths' public surfaces are indistinguishable by construction, which is the
+    /// property `build_bucket_dummy1` exists to hold and this crate's acceptance
+    /// suite locks.
+    pub fn used_dummy(&self) -> bool {
+        self.spent.used_dummy()
+    }
+
     // `spends_coinbase()` is deleted (issue #102). It computed the list of
     // coinbase-note commitments a grant consumes, for `Mempool::admit`'s maturity
     // gate — and that list *is* the §6 privacy leak the gate was retired over: on a
@@ -229,6 +242,7 @@ impl std::fmt::Debug for GrantPlan {
             .field("fee", &self.fee)
             .field("anchor", &hex4(&self.lease.anchor))
             .field("lease_expires_at_tip", &self.lease.expires_at_tip())
+            .field("used_dummy", &self.used_dummy())
             .field("change_value", &self.change.value)
             .field("prove_secs", &self.prove_secs)
             .field("proof_bytes", &self.proof_bytes)
@@ -269,10 +283,20 @@ pub fn witness_for(
 
 /// Build and prove one grant.
 ///
-/// `inputs` are the two notes to spend (chosen by [`crate::Inventory::select_pair`]),
+/// `inputs` are the notes to spend (chosen by
+/// [`crate::Inventory::select_inputs`]) — two real notes, or one real note whose
+/// slot-1 partner is a prover-invented dummy (#219's latch, the #292 fallback).
 /// `recipient` is where the grant goes, and `change_d` is the faucet's own address
 /// diversifier for the change output. Returns the plan plus the proved instance the
 /// caller may verify locally.
+///
+/// **Everything below the input shape is common to both paths on purpose.** The
+/// balance, the derived ρ′, the two encrypted outputs, the declared surface and the
+/// discovery group are computed by one piece of code from `inst`, so a one-real
+/// grant cannot drift into looking different from a two-real one. The only branch
+/// is which `build_bucket_*` call produces `inst`, and those two produce
+/// byte-identical programs (`build_bucket_dummy1`'s docs) — `dv` is a witness, not
+/// a constraint constant.
 ///
 /// The change output is encrypted to the faucet's **own** address, not left
 /// unencrypted: `TxDiscovery` must describe every output commitment in order or the
@@ -285,13 +309,13 @@ pub fn build_grant<R: CryptoRng>(
     change_d: Diversifier,
     recipient: &Address,
     grant_value: u64,
-    inputs: [OwnedNote; 2],
+    inputs: SpentInputs,
     lease: AnchorLease,
     tree: &CommitmentTree,
     rng: &mut R,
 ) -> Result<(GrantPlan, BucketInstance, Vec<Val>, Proof<Config>), GrantError> {
     let fee = posted_fee(ArityBucket::TwoByTwo);
-    let in_total = inputs[0].value.saturating_add(inputs[1].value);
+    let in_total = inputs.total_value();
     let need = grant_value.saturating_add(fee);
     if in_total < need {
         return Err(GrantError::Unbalanced { inputs: in_total, need });
@@ -303,12 +327,14 @@ pub fn build_grant<R: CryptoRng>(
         .ok_or(GrantError::UnusableRecipientAddress)?;
 
     // Spend witnesses (the spend capability lives only on the wallet) and their
-    // live membership paths, both cut against the anchor's prefix.
-    let spend: [TxInput; 2] = [inputs[0].spend_input(wallet), inputs[1].spend_input(wallet)];
-    let witnesses: [MerkleWitness; 2] = [
-        witness_for(tree, lease.leaf_count, lease.anchor_lanes, &inputs[0].cm)?,
-        witness_for(tree, lease.leaf_count, lease.anchor_lanes, &inputs[1].cm)?,
-    ];
+    // live membership paths, both cut against the anchor's prefix. Slot 0 is a
+    // real note on both paths, so `nf_0` — which every output ρ′ is derived from
+    // below — has one derivation and not two.
+    let real: Vec<TxInput> = inputs.iter().map(|n| n.spend_input(wallet)).collect();
+    let real_witnesses: Vec<MerkleWitness> = inputs
+        .iter()
+        .map(|n| witness_for(tree, lease.leaf_count, lease.anchor_lanes, &n.cm))
+        .collect::<Result<_, _>>()?;
 
     // Output 0: the grant, to the requester's rkm. Output 1: change, to ours.
     //
@@ -325,7 +351,7 @@ pub fn build_grant<R: CryptoRng>(
     // Uniqueness is now structural rather than probabilistic: it is inherited
     // from the double-spend rule consensus already enforces on `nf_0`. `rseed`
     // stays a draw — it is the one field still carried in the AEAD payload.
-    let nf0 = derive_input(&spend[0]).1;
+    let nf0 = derive_input(&real[0]).1;
     let grant_rho = derive_output_rho(&nf0, 0);
     let change_rho = derive_output_rho(&nf0, 1);
     let grant_rseed = rand_lanes(rng);
@@ -341,14 +367,34 @@ pub fn build_grant<R: CryptoRng>(
         TxOutput { value: change_value, rkm: change_rkm, rho: change_rho, rseed: change_rseed },
     ];
 
-    let inst = build_bucket_with_witnesses(
-        LOG_HEIGHT,
-        &spend,
-        &outputs,
-        fee,
-        &witnesses,
-        lease.anchor_lanes,
-    );
+    // The one branch. `build_bucket_dummy1` asserts the dummy's value is 0 — the
+    // AIR enforces it too (`assert_zero(inj3e · L·dv · w4)`), so a nonzero value
+    // here would be an unprovable mint attempt rather than a silent one.
+    let inst = match (&real[..], &real_witnesses[..]) {
+        ([r0, r1], [w0, w1]) => build_bucket_with_witnesses(
+            LOG_HEIGHT,
+            &[r0.clone(), r1.clone()],
+            &outputs,
+            fee,
+            &[*w0, *w1],
+            lease.anchor_lanes,
+        ),
+        ([r0], [w0]) => build_bucket_dummy1(
+            LOG_HEIGHT,
+            r0,
+            w0,
+            &invented_dummy(rng),
+            &off_tree_witness(),
+            &outputs,
+            fee,
+            lease.anchor_lanes,
+        ),
+        // `SpentInputs` is a pair-or-single, so the slices are length 2 or 1 and
+        // this arm is unreachable — stated as a panic rather than a silent
+        // fallthrough, because reaching it would mean the type grew a variant and
+        // this seam was not revisited.
+        _ => unreachable!("SpentInputs yields exactly one or two real inputs"),
+    };
 
     let t = Instant::now();
     let (pvs, proof) = prove_bucket(&inst);
@@ -437,6 +483,31 @@ pub fn build_grant<R: CryptoRng>(
         proof_bytes,
     };
     Ok((plan, inst, pvs, proof))
+}
+
+/// A slot-1 input that is nobody's note: value 0, everything else drawn.
+///
+/// `PV_NF2` is therefore a **real nullifier of an invented note** — Orchard's
+/// construction, adopted at `transaction-model:61` — and still bound by
+/// `ROLE_BNF2`, so a relay cannot rewrite it. Drawing `sk`/`rho` fresh per grant
+/// is what keeps two dummy grants from colliding on a nullifier and being refused
+/// as a double-spend.
+///
+/// 🔴 **`qumbra_wallet::send` has a twin of this function and they are not
+/// shared.** The natural home would be `qlab_air::narrow`, beside
+/// [`off_tree_witness`] — but that crate's dependencies are exactly `p3-air`,
+/// `p3-field` and `p3-matrix`, and putting an RNG into the circuit crate to share
+/// six lines is a worse trade than two copies. If a third caller appears, move it
+/// into `qlab-note` (which already holds `rand`) rather than growing a third copy.
+fn invented_dummy<R: CryptoRng>(rng: &mut R) -> TxInput {
+    let d4 = rand_lanes(rng);
+    TxInput {
+        sk: rand_lanes(rng),
+        value: 0,
+        rho: rand_lanes(rng),
+        rseed: rand_lanes(rng),
+        d: [d4[0], d4[1]],
+    }
 }
 
 fn rand_lanes<R: CryptoRng>(rng: &mut R) -> [u64; 4] {

@@ -733,12 +733,20 @@ fn a_browser_request_becomes_a_real_grant_the_requester_detects() {
 
     // (1) funded, and only because the notes matured.
     funded(&mut node, &mut svc, &wallet);
-    {
+    // The budget is value, not count (lab #292): two matured coinbase notes are
+    // worth several grants, and the page below must quote the same figure this
+    // does — derived from the inventory rather than hard-coded, so the assertion
+    // survives the emission schedule moving under it.
+    let budget = {
         let g = svc.gate();
         let g = g.lock().unwrap();
         assert_eq!(g.faucet().inventory().len(), 2);
-        assert_eq!(g.faucet().inventory().grants_available(), 1, "two notes buy exactly one grant");
-    }
+        let need = g.faucet().need();
+        let budget = g.faucet().inventory().grants_available(need);
+        assert_eq!(budget, (g.faucet().inventory().total_value() / need) as usize);
+        assert!(budget > 1, "two 50 QMB notes are more than one grant of value: {budget}");
+        budget
+    };
 
     let gate = svc.gate();
     let server = FaucetServer::start("127.0.0.1:0", svc.gate(), svc.status()).expect("bind");
@@ -746,7 +754,7 @@ fn a_browser_request_becomes_a_real_grant_the_requester_detects() {
     // The page says it is ready before anyone asks — the honest state, rendered.
     let (status, _, page) = get(server.addr(), "/");
     assert_eq!(status, 200);
-    assert!(page.contains("ready — 1 grant of note budget available"), "{page}");
+    assert!(page.contains(&format!("ready — {budget} grants of value available")), "{page}");
 
     // (2) the browser exchange.
     let (req_wallet, req_addr) = requester(0xB0B0_0123);
