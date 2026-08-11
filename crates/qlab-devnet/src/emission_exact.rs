@@ -75,26 +75,33 @@ use crate::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
 ///
 /// Stamped 2026-08-10 by the coordinator (task book
 /// `docs/prompts/i299-emission-rule-builder-prompt.md` §*The boundary height,
-/// stamped*). Three properties are worth reading off the number:
+/// stamped*) at **18,000**, then **re-stamped to 8,640 on 2026-08-11** by Larry's
+/// ruling on [issue #299](https://github.com/qumbra-labs/qumbra-lab/issues/299#issuecomment-5248469483):
+/// the ten-day lead behind 18,000 existed to cover the activation work, that work
+/// was discharged in ~10 hours on 2026-08-10, and what remained of the lead was
+/// pure wait sitting directly on the T1 gate. Three properties are worth reading
+/// off the new number, by the same criteria the original stamp used:
 ///
-/// - **On the checkpoint-cadence grid** (`18_000 = 8 × 2_250`), asserted below at
+/// - **On the checkpoint-cadence grid** (`8_640 = 8 × 1_080`), asserted below at
 ///   compile time. `qumbra_node::release` refuses an off-grid halt height at
 ///   startup, because "the committee stops checkpointing at exactly that height"
 ///   is undefined off the grid — so the boundary would not be a *finalized*
 ///   boundary.
-/// - **Deliberately not a committee rotation.** `EPOCH_LENGTH_BLOCKS = 1_152` is
-///   FROZEN, so epoch 15 is `[17_280, 18_431]` and the boundary sits 720 blocks
-///   inside it. Landing an upgrade on a roster rotation puts two transitions in
-///   one window and buys nothing.
+/// - **Deliberately not a committee rotation, and rotation-distant.**
+///   `EPOCH_LENGTH_BLOCKS = 1_152` is FROZEN, so epoch 7 is `[8_064, 9_215]` and
+///   the boundary sits 576 blocks inside it — 575 to the epoch's end, the
+///   **exact midpoint**, the same criterion that placed 18,000 at
+///   720-into-epoch-15. Landing an upgrade on a roster rotation puts two
+///   transitions in one window and buys nothing.
 /// - **An epoch-aligned boundary is impossible, and that is a finding.** An epoch
 ///   ends at `1152·N − 1`, always **odd**, while the grid rule demands a multiple
 ///   of 8. So *exactly one epoch straddles the boundary whatever height is
-///   stamped* — here, epoch 15. `qlab_node::supply` handles the straddle
+///   stamped* — here, epoch 7. `qlab_node::supply` handles the straddle
 ///   piecewise; see its module docs.
 ///
-/// It is a **height, never a date**. (At the cadence measured at the stamp it
-/// arrives around 2026-08-20, which is lead time, not a deadline.)
-pub const RULE_BOUNDARY_HEIGHT: u64 = 18_000;
+/// It is a **height, never a date**. (At the ~48 blk/h measured at the re-stamp
+/// it arrives around 2026-08-12, which is lead time, not a deadline.)
+pub const RULE_BOUNDARY_HEIGHT: u64 = 8_640;
 
 // H2, the grid rule, as a compile-time refusal: an off-grid boundary cannot be
 // built, not merely rejected at startup.
@@ -525,11 +532,11 @@ mod tests {
     #[test]
     fn the_rule_boundary_is_grid_legal_and_mid_epoch() {
         use crate::params_devnet::EPOCH_LENGTH_BLOCKS;
-        assert_eq!(RULE_BOUNDARY_HEIGHT, 18_000);
+        assert_eq!(RULE_BOUNDARY_HEIGHT, 8_640);
         assert_eq!(RULE_BOUNDARY_HEIGHT % CHECKPOINT_CADENCE_BLOCKS, 0, "H2 grid rule");
-        // Not a rotation: the boundary is strictly inside epoch 15.
+        // Not a rotation: the boundary is strictly inside epoch 7.
         let epoch = RULE_BOUNDARY_HEIGHT / EPOCH_LENGTH_BLOCKS;
-        assert_eq!(epoch, 15);
+        assert_eq!(epoch, 7);
         assert!(RULE_BOUNDARY_HEIGHT > epoch * EPOCH_LENGTH_BLOCKS);
         assert!(RULE_BOUNDARY_HEIGHT < (epoch + 1) * EPOCH_LENGTH_BLOCKS - 1);
         // And the finding: no legal halt height can ever be an epoch END, because
@@ -587,9 +594,15 @@ mod tests {
         for h in &sample {
             bytes.extend_from_slice(&s_atomic_exact(*h).to_le_bytes());
         }
+        // Re-derived 2026-08-11: the sample vector includes RULE_BOUNDARY_HEIGHT and
+        // RULE_BOUNDARY_HEIGHT + 1 by name, so the re-stamp from 18,000 to 8,640
+        // (Larry's ruling: https://github.com/qumbra-labs/qumbra-lab/issues/299#issuecomment-5248469483)
+        // moved two of the sampled heights and hence this stream's hash, even though
+        // the schedule function itself is untouched (see the unchanged full-range
+        // golden in `census_reference_stream_hash_and_tie_guard` below).
         assert_eq!(
             hex32(&sha256(&bytes)),
-            "e8186aaf4e5844a12a80d023a29ed24c058038288e28b62c464b1844a0e1dcc4",
+            "60b0a40687664b3c894ba8d14ad86a706105655b9271bfcd56122476ae6ba44f",
             "sampled exact-schedule stream moved"
         );
     }
