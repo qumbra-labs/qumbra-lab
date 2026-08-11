@@ -1682,6 +1682,141 @@ mod tests {
 
     // ---- lab issue #309: the compact range is served in pages -----------------
 
+    /// Lab issue #350 decision lock. These are the complete request traces made
+    /// by the synchronous implementation before it is inverted into a driver.
+    /// They deliberately pin compact paging before any matched `/full` fetches,
+    /// the inclusive path vocabulary, the empty-response stop, and a fatal
+    /// compact failure after an earlier page made progress.
+    #[test]
+    fn request_path_sequences_are_golden_before_scan_driver_refactor() {
+        let cfg = ScanConfig { mode: ScanMode::FullFo, decoy: DecoyPolicy::Off };
+
+        // One compact page, followed by the two matching transactions in it.
+        let single = Devnet::generate(GenParams {
+            n_blocks: 1,
+            txs_per_block: 2,
+            ..GenParams::default()
+        });
+        let mut single_paths = Vec::new();
+        let mut single_fetch = |path: &str| {
+            single_paths.push(path.to_string());
+            crate::server::route(&single, path).map_err(|(c, m)| format!("{c} {m}"))
+        };
+        scan_over(
+            &mut single_fetch,
+            &single.our.dk,
+            1,
+            1,
+            cfg,
+            &mut StdRng::seed_from_u64(0x3501),
+        )
+        .expect("single-page golden scan");
+        drop(single_fetch);
+        assert_eq!(
+            single_paths,
+            [
+                "/v1/compact?from=1&to=1",
+                "/v1/block/1/tx/0/full",
+                "/v1/block/1/tx/1/full",
+            ]
+        );
+
+        // Five blocks served two at a time: collect every compact page first,
+        // then open each matching transaction in ascending chain order.
+        let multi = Devnet::generate(GenParams {
+            n_blocks: 5,
+            txs_per_block: 1,
+            ..GenParams::default()
+        });
+        let mut multi_paths = Vec::new();
+        let mut multi_fetch = |path: &str| {
+            multi_paths.push(path.to_string());
+            let bytes =
+                crate::server::route(&multi, path).map_err(|(c, m)| format!("{c} {m}"))?;
+            if path.starts_with("/v1/compact") {
+                let blocks = decode_compact_response(&bytes).expect("route serves compact wire");
+                return Ok(crate::codec::encode_compact_response(
+                    &blocks.into_iter().take(2).collect::<Vec<_>>(),
+                ));
+            }
+            Ok(bytes)
+        };
+        scan_over(
+            &mut multi_fetch,
+            &multi.our.dk,
+            1,
+            5,
+            cfg,
+            &mut StdRng::seed_from_u64(0x3502),
+        )
+        .expect("multi-page golden scan");
+        drop(multi_fetch);
+        assert_eq!(
+            multi_paths,
+            [
+                "/v1/compact?from=1&to=5",
+                "/v1/compact?from=3&to=5",
+                "/v1/compact?from=5&to=5",
+                "/v1/block/1/tx/0/full",
+                "/v1/block/2/tx/0/full",
+                "/v1/block/3/tx/0/full",
+                "/v1/block/4/tx/0/full",
+                "/v1/block/5/tx/0/full",
+            ]
+        );
+
+        // A range with no served blocks ends after its one empty compact page.
+        let mut empty_paths = Vec::new();
+        let mut empty_fetch = |path: &str| {
+            empty_paths.push(path.to_string());
+            crate::server::route(&single, path).map_err(|(c, m)| format!("{c} {m}"))
+        };
+        scan_over(
+            &mut empty_fetch,
+            &single.our.dk,
+            9,
+            9,
+            cfg,
+            &mut StdRng::seed_from_u64(0x3503),
+        )
+        .expect("empty-range golden scan");
+        drop(empty_fetch);
+        assert_eq!(empty_paths, ["/v1/compact?from=9&to=9"]);
+
+        // A transport failure on the second compact page is fatal at exactly
+        // that request; no opening request is issued from the partial range.
+        let mut failure_paths = Vec::new();
+        let mut failure_fetch = |path: &str| {
+            failure_paths.push(path.to_string());
+            if path == "/v1/compact?from=3&to=5" {
+                return Err("golden mid-range failure".to_string());
+            }
+            let bytes =
+                crate::server::route(&multi, path).map_err(|(c, m)| format!("{c} {m}"))?;
+            let blocks = decode_compact_response(&bytes).expect("route serves compact wire");
+            Ok(crate::codec::encode_compact_response(
+                &blocks.into_iter().take(2).collect::<Vec<_>>(),
+            ))
+        };
+        let err = match scan_over(
+            &mut failure_fetch,
+            &multi.our.dk,
+            1,
+            5,
+            cfg,
+            &mut StdRng::seed_from_u64(0x3504),
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("mid-range compact failure remains fatal"),
+        };
+        drop(failure_fetch);
+        assert_eq!(err, "golden mid-range failure");
+        assert_eq!(
+            failure_paths,
+            ["/v1/compact?from=1&to=5", "/v1/compact?from=3&to=5"]
+        );
+    }
+
     /// A fetch over `devnet` whose `/v1/compact` answers are bounded the way a
     /// deployed node's are (`qlab_node::rpc::MAX_COMPACT_BLOCKS`, shrunk here to
     /// `page_blocks`): every main-chain height in the asked range, ascending, up
