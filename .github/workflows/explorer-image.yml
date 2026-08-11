@@ -1,0 +1,230 @@
+# The explorer image: an alarm that is nearly free, and a build that is not.
+#
+# WHY THIS FILE EXISTS, measured rather than supposed:
+#
+# `explorer-api` on svc0 ran `sha-d48c7bc` from 2026-08-07 to 2026-08-11 because
+# NOTHING REBUILDS THIS IMAGE. That single hand-built version was the only one on
+# GHCR, so there was nothing to roll to. It was found by grepping the running
+# binary, which returned 0 for both `KNOWN_SCAR` and `s_atomic_exact` — i.e. it
+# carried none of PR #325. `qumbra-deploy/OPERATOR.md` had recorded the gap
+# ("neither repo has a working GHCR workflow today") on 2026-08-07 and recording
+# it was not enough.
+#
+# What it cost: the public page rendered the grandfathered height-1377 scar as a
+# plain red DIVERGENT — precisely what #299 ruling item 2 exists to prevent — and
+# the binary had no piecewise straddle branch, so at RULE_BOUNDARY_HEIGHT it could
+# have shown a FALSE DIVERGENT for the straddling epoch at the upgrade moment.
+#
+# THE TWO JOBS ARE DELIBERATELY ASYMMETRIC, because the failure mode and the
+# remedy have very different prices:
+#
+#   drift   the thing that was actually missing. Nobody knew. Seconds on
+#           `ubuntu-latest`, so it can run often.
+#   image   removes the "build it by hand from a laptop" step. Runs on the PAID
+#           `qumbra-arm64-8` (~$0.7/run against a $20/month cap with stop-usage
+#           on — docs/ci-runner-cost-decision.md §4), so it is `workflow_dispatch`
+#           ONLY. This file must not become a second recurring charge on the
+#           runner whose trigger §7 option B deliberately narrowed.
+#
+# WHAT `drift` CANNOT SEE, stated so nobody reads more into a green tick: it
+# compares the newest PUBLISHED image against this repo. It cannot reach svc0, so
+# "an image exists but the host was never rolled" is a different gap and this does
+# not close it. That one is `qumbra-deploy`'s to hold.
+name: explorer image
+
+on:
+  # Every push to main, but the comparison is against the newest commit that
+  # actually TOUCHED the explorer — not against HEAD. Comparing to HEAD would
+  # report lag for a docs commit and train readers to ignore the alarm, which is
+  # the same mistake #299 ruling item 2 is about.
+  push:
+    branches: [main]
+  # The backstop: the failure mode is "days pass and nobody notices", so a daily
+  # check bounds the blindness even if a push trigger is ever narrowed away.
+  schedule:
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "build" to spend runner minutes on an image build. Anything else runs only the free drift check.'
+        required: false
+        default: ""
+
+concurrency:
+  group: explorer-image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: is a published image current with the explorer's code?
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # merge-base and rev-list need history
+
+      - name: The newest commit that affects the explorer image
+        id: src
+        run: |
+          set -euo pipefail
+          # The paths whose change makes a published image stale. `qlab-node` is
+          # in here on purpose: the supply projection's expected side, the
+          # piecewise straddle branch and the emission schedule all live there,
+          # and that is exactly what went stale in the 2026-08-07..11 window.
+          # Paths written literally, never via an unquoted variable. `$PATHS`
+          # word-splits under bash and does NOT under zsh, so the same line means
+          # "six pathspecs" on the runner and "one pathspec that matches nothing"
+          # in a local zsh dry-run — which silently returned an empty SRC while
+          # this was being tested. Literal removes the class.
+          SRC=$(git log -1 --format=%H -- \
+            crates/qumbra-explorer crates/qlab-node crates/qlab-econ \
+            crates/qlab-devnet deploy/docker/Dockerfile Cargo.lock)
+          if [ -z "$SRC" ]; then
+            echo "::error::no commit found touching the explorer paths — pathspec is wrong"
+            exit 1
+          fi
+          echo "sha=$SRC" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short "$SRC")" >> "$GITHUB_OUTPUT"
+          echo "newest explorer-affecting commit: $SRC"
+          git log -1 --format='  %h %ad %s' --date=short "$SRC"
+
+      - name: The newest published image, and what it was built from
+        id: pub
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Tag convention is `sha-<short>` (deploy/docker/Dockerfile's build
+          # comment). Read tags, not config labels: an OCI index carries no
+          # labels, which cost this project a wrong provenance verdict on
+          # 2026-08-07.
+          TAGS=$(gh api "/orgs/${{ github.repository_owner }}/packages/container/qumbra-explorer/versions?per_page=50" \
+                   --jq '[.[].metadata.container.tags[]?] | map(select(startswith("sha-"))) | .[]' 2>/dev/null || true)
+          if [ -z "$TAGS" ]; then
+            echo "published=none" >> "$GITHUB_OUTPUT"
+            echo "NO published sha-* tag found"
+            exit 0
+          fi
+          echo "published sha-* tags:"; echo "$TAGS" | sed 's/^/  /'
+          # Newest by commit date among tags whose commit we still have.
+          BEST=""; BEST_TS=0
+          for t in $TAGS; do
+            c="${t#sha-}"
+            if git cat-file -e "$c^{commit}" 2>/dev/null; then
+              ts=$(git log -1 --format=%ct "$c")
+              if [ "$ts" -gt "$BEST_TS" ]; then BEST_TS=$ts; BEST=$c; fi
+            fi
+          done
+          echo "published=${BEST:-unknown}" >> "$GITHUB_OUTPUT"
+          echo "newest published build commit: ${BEST:-unknown}"
+
+      - name: Verdict
+        run: |
+          set -euo pipefail
+          SRC='${{ steps.src.outputs.sha }}'
+          PUB='${{ steps.pub.outputs.published }}'
+          if [ "$PUB" = "none" ] || [ "$PUB" = "unknown" ]; then
+            echo "::error::No published explorer image can be matched to a commit in this repo."
+            echo "Build one:  gh workflow run 'explorer image' -f confirm=build"
+            exit 1
+          fi
+          # Current when the published build contains the newest
+          # explorer-affecting commit — i.e. SRC is an ancestor of PUB, or equal.
+          if git merge-base --is-ancestor "$SRC" "$PUB"; then
+            echo "CURRENT — published $(git rev-parse --short "$PUB") contains $(git rev-parse --short "$SRC")"
+            exit 0
+          fi
+          BEHIND=$(git rev-list --count "$PUB..$SRC" -- \
+            crates/qumbra-explorer crates/qlab-node crates/qlab-econ crates/qlab-devnet deploy/docker/Dockerfile Cargo.lock)
+          echo "::error::STALE — the published explorer image predates $BEHIND explorer-affecting commit(s)."
+          echo "  published : $(git rev-parse --short "$PUB")  $(git log -1 --format=%ad --date=short "$PUB")"
+          echo "  needed    : $(git rev-parse --short "$SRC")  $(git log -1 --format=%ad --date=short "$SRC")"
+          echo ""
+          echo "Build:  gh workflow run 'explorer image' -f confirm=build"
+          echo "Then roll it in qumbra-deploy — this job cannot see svc0 and does not"
+          echo "claim the host is current. See OPERATOR.md 9.2a."
+          exit 1
+
+  image:
+    name: build + push the explorer image (manual, paid runner)
+    # Manual only. The runner is charged per minute and its trigger was narrowed
+    # for that reason; see the header.
+    if: github.event_name == 'workflow_dispatch' && inputs.confirm == 'build'
+    runs-on: qumbra-arm64-8
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: C++ toolchain for randomx-rs
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends cmake g++
+
+      - name: Provenance
+        run: |
+          echo "commit   $(git rev-parse HEAD)"
+          uname -m; nproc; free -g | head -2
+          docker --version; docker buildx version
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        id: build
+        run: |
+          set -euo pipefail
+          REV=$(git rev-parse HEAD); SHORT=$(git rev-parse --short HEAD)
+          echo "short=$SHORT" >> "$GITHUB_OUTPUT"
+          # --target runtime-explorer, and it MUST stay a separate stage from
+          # `builder`: adding the explorer's cargo build to `builder` would move
+          # the FLEET image's digest because a page's backend was compiled
+          # (deploy/docker/Dockerfile, the capitalised note at the stage).
+          # Native arm64 on an arm64 runner — no QEMU, no emulation tax.
+          docker build -f deploy/docker/Dockerfile --target runtime-explorer \
+            --platform linux/arm64 --load \
+            --build-arg GIT_REVISION="$REV" \
+            -t "ghcr.io/${{ github.repository_owner }}/qumbra-explorer:sha-$SHORT" .
+
+      - name: The binary is what we think it is, BEFORE publishing it
+        run: |
+          set -euo pipefail
+          T="ghcr.io/${{ github.repository_owner }}/qumbra-explorer:sha-${{ steps.build.outputs.short }}"
+          # Not a smoke test — a check that the build actually recompiled. A
+          # cached `build-explorer` layer produces a green build carrying an OLD
+          # binary, which is the shape that hid the 4-day staleness. Assert on
+          # symbols the current tree is known to contain.
+          docker run --rm --entrypoint sh "$T" -c '
+            set -e
+            for s in KNOWN_SCAR s_atomic_exact; do
+              n=$(grep -c "$s" /usr/local/bin/qumbra-explorer || true)
+              echo "  $s = ${n:-0}"
+              [ "${n:-0}" -ge 1 ] || { echo "::error::$s absent — the build did not include current source"; exit 1; }
+            done'
+
+      - name: Push
+        run: docker push "ghcr.io/${{ github.repository_owner }}/qumbra-explorer:sha-${{ steps.build.outputs.short }}"
+
+      - name: Read the provenance back from the registry
+        run: |
+          set -euo pipefail
+          T="ghcr.io/${{ github.repository_owner }}/qumbra-explorer:sha-${{ steps.build.outputs.short }}"
+          DIG=$(docker buildx imagetools inspect "$T" --format '{{.Manifest.Digest}}')
+          echo "digest: $DIG"
+          # Per-platform, never `{{json .}}`: an OCI index has no config labels,
+          # and reading the index made a good image look unlabelled on 2026-08-07.
+          docker buildx imagetools inspect "$T" --format '{{json .Image}}' \
+            | grep -o '"org.opencontainers.image.revision":"[0-9a-f]*"' | head -2 | sed 's/^/  /'
+          echo ""
+          echo "Pin this in qumbra-deploy/compose/docker-compose.svc-light.yml:"
+          echo "  image: ghcr.io/${{ github.repository_owner }}/qumbra-explorer@$DIG"
+          echo "Then roll svc0 per OPERATOR.md 9.2a — dump the outgoing container's"
+          echo "logs first, up -d explorer-api only, and read the epoch-1 verdict back."
