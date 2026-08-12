@@ -138,6 +138,77 @@ pub const MAX_RATE_KEYS: usize = 4096;
 /// `[devnet-placeholder]` testnet-tunable, NOT frozen.
 pub const CHECKPOINT_QUERY_SERVE_INTERVAL_MS: u64 = 5_000;
 
+// --------------------------------------------------------------------------
+// The body-serving posture (issue #371 S3) — every cap on serving block
+// bodies, named here in one place
+// --------------------------------------------------------------------------
+//
+// Serving history is free bandwidth for an attacker: a ~50 B `GetData(Block)`
+// item buys a whole body, which at FROZEN v1.0 sizes is ~145 KB per transaction
+// — the #91 amplifier shape, sustained. The caps, and where each lives:
+//
+// | cap | value | where |
+// |---|---|---|
+// | bodies per `GetData` answered whole | `crate::node::MAX_BODIES_PER_GETDATA` (16) | serve side |
+// | `GetData` items examined per message | [`MAX_GETDATA_ITEMS`] | serve side |
+// | body bytes per `GetData` answer | [`MAX_BODY_BYTES_PER_GETDATA`] | serve side |
+// | served body bytes per key, sustained | [`BODY_SERVE_BYTES_PER_SEC`] (burst [`BODY_SERVE_BYTE_BURST`]) | serve side |
+// | asks outstanding at once | `crate::node::MAX_BODIES_IN_FLIGHT` (16) | request side |
+// | re-ask pacing | `crate::node::BODY_REQUEST_TIMEOUT_MS` | request side |
+//
+// **A refusal on any of these is unscored and is never `NotFound`** — volume is
+// not a protocol fault (#91's law), and `NotFound` is itself scored by the
+// receiver on some paths. Over the whole-body caps the answer degrades to the
+// header, exactly the pre-#182 answer, which the requester already treats as
+// honest (unscored; its 15 s re-ask rotates to another peer).
+
+/// Most items of one `GetData` message that are **examined for serving** (issue
+/// #371 S3). Items past the cap are ignored in silence — not `NotFound`, which
+/// the receiver scores as a welshed inv on some paths, and not headers, which
+/// would leave "send one 8 MiB `GetData` naming ~250 k blocks" as a ~50 MB
+/// header-storm amplifier.
+///
+/// 256 = [`MSG_BURST`]: an honest requester's whole frame burst could each name
+/// one item and still be answered in full. The honest body path asks at most
+/// `crate::node::MAX_BODIES_IN_FLIGHT` (16) per message; tx and checkpoint asks
+/// are single-digit. Nothing honest reaches triple digits.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_GETDATA_ITEMS: usize = 256;
+
+/// Most **body bytes** one `GetData` message is answered with (issue #371 S3);
+/// items past it degrade to header-only, exactly as past
+/// `crate::node::MAX_BODIES_PER_GETDATA`.
+///
+/// 8 MiB = one second of the peer's own inbound byte budget
+/// ([`BYTE_REFILL_PER_SEC`]) and half its burst ([`BYTE_BURST`]) — the answer a
+/// single request may provoke can never exceed what the asker's inbound limiter
+/// admits in the second it arrives, so an honest server is never spending
+/// bandwidth on frames the asker's own throttle will drop. At T0 coinbase-only
+/// sizes this cap is unreachable (16 bodies ≈ 3 KB); at FROZEN v1.0 tx sizes it
+/// binds at ~55 single-tx bodies, still above the 16-body count cap.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_BODY_BYTES_PER_GETDATA: u64 = 8 * 1024 * 1024;
+
+/// Burst of **served body bytes** one rate key may draw at once (issue #371 S3).
+///
+/// Mirrors [`BYTE_BURST`] deliberately: the serve budget is sized to what the
+/// requester's inbound budget can accept, so an honest catch-up is never
+/// throttled by an honest server (the `GetAddr` precedent — serve limits looser
+/// than ask limits), while a key that asks faster than it could possibly ingest
+/// is degraded to headers.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const BODY_SERVE_BYTE_BURST: u64 = 16 * 1024 * 1024;
+
+/// Sustained **served body bytes** per rate key (issue #371 S3). Mirrors
+/// [`BYTE_REFILL_PER_SEC`] — see [`BODY_SERVE_BYTE_BURST`] for why the two sides
+/// are sized as a pair.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const BODY_SERVE_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
+
 /// Fraction of the key map dropped when it is full (oldest-first): `1/N`.
 pub const EVICT_FRACTION: usize = 4;
 
@@ -293,6 +364,10 @@ pub struct RateLimits {
     /// **`0` disables the serve limit**, same contract as
     /// `getaddr_serve_interval_ms`.
     pub cp_query_serve_interval_ms: u64,
+    /// Burst of served body bytes per key (issue #371 S3).
+    pub body_serve_byte_burst: u64,
+    /// Sustained served body bytes per key per second (issue #371 S3).
+    pub body_serve_bytes_per_sec: u64,
     pub max_keys: usize,
 }
 
@@ -305,6 +380,8 @@ impl Default for RateLimits {
             byte_refill_per_sec: BYTE_REFILL_PER_SEC,
             getaddr_serve_interval_ms: GETADDR_SERVE_INTERVAL_MS,
             cp_query_serve_interval_ms: CHECKPOINT_QUERY_SERVE_INTERVAL_MS,
+            body_serve_byte_burst: BODY_SERVE_BYTE_BURST,
+            body_serve_bytes_per_sec: BODY_SERVE_BYTES_PER_SEC,
             max_keys: MAX_RATE_KEYS,
         }
     }
@@ -322,6 +399,8 @@ impl RateLimits {
             byte_refill_per_sec: u64::MAX / 1000,
             getaddr_serve_interval_ms: 0,
             cp_query_serve_interval_ms: 0,
+            body_serve_byte_burst: u64::MAX / 1000,
+            body_serve_bytes_per_sec: u64::MAX / 1000,
             max_keys: MAX_RATE_KEYS,
         }
     }
@@ -356,6 +435,12 @@ pub struct RateStats {
     pub throttled_getaddr: u64,
     /// Finalized-checkpoint queries received but not answered (issue #204).
     pub throttled_cp_query: u64,
+    /// Whole bodies degraded to header-only because a serve budget was spent
+    /// (issue #371 S3) — the amplifier, muzzled, without a scored refusal.
+    pub throttled_body_serve: u64,
+    /// `GetData` items past [`MAX_GETDATA_ITEMS`] and ignored (issue #371 S3).
+    /// A silent cap reads as "covered everything"; this number says otherwise.
+    pub getdata_items_dropped: u64,
     /// Rate keys dropped to keep the map bounded.
     pub evicted_keys: u64,
     /// Rate keys currently tracked.
@@ -368,6 +453,7 @@ struct Entry {
     bytes: TokenBucket,
     getaddr: TokenBucket,
     cp_query: TokenBucket,
+    body_serve: TokenBucket,
     last_seen_ms: u64,
 }
 
@@ -424,6 +510,10 @@ impl RateLimiter {
                 0 => TokenBucket::per_sec(u64::MAX / 1000, u64::MAX / 1000),
                 ms => TokenBucket::every(ms),
             },
+            body_serve: TokenBucket::per_sec(
+                limits.body_serve_byte_burst,
+                limits.body_serve_bytes_per_sec,
+            ),
             last_seen_ms: now_ms,
         });
         e.last_seen_ms = now_ms;
@@ -486,6 +576,40 @@ impl RateLimiter {
             self.stats.throttled_cp_query += 1;
             false
         }
+    }
+
+    /// Whether `key` has ANY served-body-byte allowance left (issue #371 S3) —
+    /// the cheap pre-check that lets [`crate::node::P2pNode`] skip fetching and
+    /// encoding a body it would then refuse to send. Consumes nothing.
+    pub fn body_serve_has_budget(&mut self, key: RateKey, now_ms: u64) -> bool {
+        let e = self.entry(key, now_ms);
+        // `try_take(0)` refills and takes nothing: "is the bucket non-empty now".
+        e.body_serve.try_take(0, now_ms) && e.body_serve.available() > 0
+    }
+
+    /// Whether we may serve `bytes` of whole block body to `key` now (issue #371
+    /// S3). Consumes the allowance when it returns true; a refusal consumes
+    /// nothing (a later, smaller body may still fit).
+    ///
+    /// A refusal is degraded upstream to the header-only answer — the pre-#182
+    /// wire behaviour, which the requester already treats as honest: unscored,
+    /// and its 15 s re-ask rotates to another peer (#91's law — volume is not a
+    /// protocol fault, and a throttle is our limit, not the asker's fault).
+    pub fn may_serve_body_bytes(&mut self, key: RateKey, bytes: u64, now_ms: u64) -> bool {
+        let e = self.entry(key, now_ms);
+        if e.body_serve.try_take(bytes, now_ms) {
+            true
+        } else {
+            self.stats.throttled_body_serve += 1;
+            false
+        }
+    }
+
+    /// Record `GetData` items ignored past [`MAX_GETDATA_ITEMS`] (issue #371 S3),
+    /// so the cap is a counted fact rather than a silent one.
+    pub fn note_getdata_items_dropped(&mut self, n: usize) {
+        self.stats.getdata_items_dropped =
+            self.stats.getdata_items_dropped.saturating_add(n as u64);
     }
 }
 
