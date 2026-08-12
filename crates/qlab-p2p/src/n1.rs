@@ -264,6 +264,31 @@ pub trait ChainView {
         Vec::new()
     }
 
+    /// **Whether this node holds `hash`'s body in the pending-application buffer**
+    /// (issue #371 S2) — arrived, admitted, waiting only for the state tip to
+    /// reach its parent.
+    ///
+    /// This is the third of the three "do I have this body" questions, and the
+    /// joiner drill found the seam where the other two are the wrong ones:
+    /// `on_block_announce` clears an in-flight ask only when the body is *applied*
+    /// (or in the serving cache, which buffered historical bodies never enter), so
+    /// every body that arrives **out of order** — up to 15 of every 16-wide window,
+    /// since only one can be contiguous with the state tip — leaves its ask
+    /// "outstanding" for the full re-ask timeout. `request_missing_bodies` then
+    /// finds `room = 1` and **the pipeline's window collapses to a single ask in
+    /// flight** — `breq=1`, the exact shape #359 wall 2 prints. A buffered body IS
+    /// a satisfied ask: it will apply with no further wire traffic, and
+    /// [`Self::missing_body_hashes`] already excludes it for the same reason.
+    ///
+    /// Deliberately NOT a widening of [`Self::has_stored_body`] or
+    /// [`Self::held_body`] — those answer application and possession for the
+    /// serving/early-return paths, and #198 records why the predicates must stay
+    /// apart. Default `false`: a header-only node-state buffers nothing.
+    fn holds_body_buffered(&self, hash: &Hash32) -> bool {
+        let _ = hash;
+        false
+    }
+
     /// **Issue #200 — feed the duty-gate exemption the body-fetch facts it keys on.**
     ///
     /// Default is a no-op: a header-only node-state never has state lag (it applies

@@ -2023,7 +2023,24 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // the retry by up to 15 s, which is the same bound a *missing* answer already
         // pays and is the honest reading of both — we asked, and we still do not have
         // it.
-        if self.blocks.contains(&bh) || self.node.has_stored_body(&bh) {
+        //
+        // 🔴 **"Hold" includes the pending-application buffer (issue #371 S2), and
+        // the joiner drill is what proved the omission was the pipeline's collapse.**
+        // Historical bodies arrive out of order across peers, so only the one
+        // contiguous with the state tip applies at its own arrival check — the other
+        // ~15 of a full window buffer, this check read only "applied or in the
+        // serving cache", and their asks sat "outstanding" for the whole 15 s
+        // timeout. `request_missing_bodies` then found `room = 1`: the 16-wide
+        // window self-collapsed to one ask in flight — `breq=1`, #359 wall 2's
+        // exact shape, reproduced in-suite. A buffered body is a satisfied ask (it
+        // applies with no further wire traffic, and `missing_body_hashes` already
+        // excludes it), so it must not hold a window slot. The busy-loop reasoning
+        // above is untouched: a REFUSED body is neither applied nor buffered, so
+        // its retry stays paced by the timeout.
+        if self.blocks.contains(&bh)
+            || self.node.has_stored_body(&bh)
+            || self.node.holds_body_buffered(&bh)
+        {
             if self.body_reqs.remove(&bh).is_some() {
                 // Issue #200: a requested body is now held — that is progress.
                 self.body_fetch_progress = true;
