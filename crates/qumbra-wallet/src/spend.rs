@@ -199,10 +199,23 @@ pub fn select(
     on: &mut dyn FnMut(SendStep),
 ) -> Result<WitnessBundle, SendError> {
     let w = WalletDir::open(req.dir).map_err(|e| SendError::Refused(e.to_string()))?;
+    select_opened(req, on, &w)
+}
+
+/// Phase 1 using a wallet already authenticated by a platform seed provider.
+///
+/// The request directory still owns public caches and the local send log. Only
+/// seed loading is injected; scanning, spent-note subtraction, input selection,
+/// witness construction, and proving remain the core's decisions.
+pub fn select_opened(
+    req: &SendRequest<'_>,
+    on: &mut dyn FnMut(SendStep),
+    w: &WalletDir,
+) -> Result<WitnessBundle, SendError> {
     let wallet = w.wallet();
     let mut rng = os_rng();
 
-    select_with_rng(req, on, &w, &wallet, &mut rng)
+    select_with_rng(req, on, w, &wallet, &mut rng)
 }
 
 fn select_with_rng(
@@ -436,6 +449,23 @@ pub fn execute(
     on: &mut dyn FnMut(SendStep),
 ) -> Result<SendOutcome, SendError> {
     execute_with_phases(req, on, select, preflight, prove, submit)
+}
+
+/// Execute a send using a wallet already opened by a platform seed provider.
+/// This is otherwise byte-for-byte the same three-phase flow as [`execute`].
+pub fn execute_opened(
+    req: &SendRequest<'_>,
+    wallet: &WalletDir,
+    on: &mut dyn FnMut(SendStep),
+) -> Result<SendOutcome, SendError> {
+    execute_with_phases(
+        req,
+        on,
+        |req, on| select_opened(req, on, wallet),
+        preflight,
+        prove,
+        submit,
+    )
 }
 
 fn execute_with_phases<Select, Preflight, Prove, Submit>(
