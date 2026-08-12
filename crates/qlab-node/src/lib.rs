@@ -89,8 +89,8 @@ pub use telemetry::{
 };
 pub use persist::{read_records, LogRecord, Snapshot, BLOCK_LOG, FORMAT_VERSION, SNAPSHOT};
 pub use replay_progress::{
-    capture_progress, take_captured_progress, with_progress_capture,
-    REPLAY_PROGRESS_EVERY_RECORDS, REPLAY_PROGRESS_EVERY_SECS,
+    capture_progress, live_replay_position, take_captured_progress, with_progress_capture,
+    ReplayPosition, REPLAY_PROGRESS_EVERY_RECORDS, REPLAY_PROGRESS_EVERY_SECS,
 };
 pub use store::{
     ChainStore, CommitmentStore, Hash32, MemChainStore, MemCommitmentStore, MemNullifierStore,

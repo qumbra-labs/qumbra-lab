@@ -908,12 +908,24 @@ fn render_index(s: &ServiceStatus, outcome: Option<&RequestOutcome>) -> String {
     // Named for what it is. A grant proof binds to applied state, so this — not
     // the header tip — is the number that decides whether the faucet can serve;
     // #296 is explicit that showing the header tip *instead* would be worse.
-    row("applied height", s.chain.state_tip.to_string());
-    row("chain tip (headers)", s.chain.fork_choice_tip.to_string());
-    // `StateLag::blocks()` — the tree's one definition of the gap, the same call
-    // the node's duty gate and its `slag=` telemetry field make. Never a
-    // subtraction written out here.
-    row("behind by", format!("{} block(s)", s.chain.blocks()));
+    // Lab #365: three rows the faucet cannot answer before its node has opened.
+    // `UNAVAILABLE` is the token opview/wallet/explorer already use for exactly
+    // this — one grep covers four surfaces — and it is why these are not zeroes.
+    match &s.chain {
+        Some(chain) => {
+            row("applied height", chain.state_tip.to_string());
+            row("chain tip (headers)", chain.fork_choice_tip.to_string());
+            // `StateLag::blocks()` — the tree's one definition of the gap, the same
+            // call the node's duty gate and its `slag=` telemetry field make. Never
+            // a subtraction written out here.
+            row("behind by", format!("{} block(s)", chain.blocks()));
+        }
+        None => {
+            for k in ["applied height", "chain tip (headers)", "behind by"] {
+                row(k, "UNAVAILABLE (node not open yet)".to_string());
+            }
+        }
+    }
     row(
         "finalized",
         match s.finalized_height {
@@ -996,7 +1008,7 @@ mod tests {
 
     fn a_status(availability: crate::state::Availability) -> Arc<Mutex<ServiceStatus>> {
         Arc::new(Mutex::new(ServiceStatus {
-            chain: qlab_node::StateLag::new(200, 200),
+            chain: Some(qlab_node::StateLag::new(200, 200)),
             finalized_height: Some(200),
             peers: 3,
             availability,
@@ -1086,6 +1098,62 @@ mod tests {
             "{}",
             out.message()
         );
+    }
+
+    /// 🔴 **Lab #365 — the whole point of the fix, at the surface a user meets.**
+    ///
+    /// While the node replays, this page is what stands between a stranger and a
+    /// bare Cloudflare 502. It must: refuse (503, no ticket burned), say the
+    /// percentage, and publish **no chain numbers it has not measured** — the
+    /// `chain: None` case, which used to render as `applied height 0 / chain tip 0
+    /// / behind by 0` and read as a healthy, current, empty faucet.
+    #[test]
+    fn a_replaying_faucet_says_so_and_publishes_no_numbers_it_has_not_got() {
+        let gate = a_gate(TicketPolicy::Required);
+        let status = a_status(crate::state::Availability::Starting {
+            replayed: 1_644,
+            total: 3_287,
+        });
+        // Before the node opens there is no sampled chain view at all.
+        lock(&status).chain = None;
+        lock(&status).finalized_height = None;
+
+        let page = render_index(&snapshot(&status), None);
+        assert!(page.contains("1644 of 3287 records (50%)"), "{page}");
+        for row in ["applied height", "chain tip (headers)", "behind by"] {
+            assert!(page.contains(row), "the row is still present: {page}");
+        }
+        assert!(
+            page.matches("UNAVAILABLE (node not open yet)").count() == 3,
+            "all three chain rows must decline to answer, not render zeroes: {page}"
+        );
+        // Specifically: no zero stands in for a height this faucet has never read.
+        // (`notes maturing 0` and `grants confirmed 0` are legitimate — those are
+        // this process's own counters, which it does know.)
+        for row in ["applied height", "chain tip (headers)"] {
+            assert!(
+                !page.contains(&format!("<tr><td>{row}</td><td><code>0</code></td></tr>")),
+                "{row} rendered as 0 for a node that has never opened: {page}"
+            );
+        }
+        assert!(
+            !page.contains("<code>0 block(s)</code>"),
+            "`behind by 0` on an unopened node reads as caught-up: {page}"
+        );
+
+        // And a request in this state is refused without touching the gate.
+        let ticket = lock(&gate).issue_ticket(7).encode();
+        let out = handle_request(
+            &gate,
+            &status,
+            &form(&an_address().encode(), Some(&ticket)),
+            "203.0.113.9:1234",
+        );
+        assert_eq!(out.status(), 503);
+        assert!(out.message().contains("rebuilding its state from disk"), "{}", out.message());
+        let g = lock(&gate);
+        assert_eq!(g.faucet().gate_stats().tickets_spent, 0, "the ticket was never presented");
+        assert!(g.faucet().queue().is_empty(), "nothing may be queued against no anchor");
     }
 
     /// A request through the HTTP layer reaches `Faucet::accept`, and a gate refusal
@@ -1273,7 +1341,7 @@ mod tests {
     #[test]
     fn the_chain_rows_name_the_applied_height_and_the_gap() {
         let status = a_status(crate::state::Availability::Ready { grants: 2 });
-        lock(&status).chain = qlab_node::StateLag::new(1984, 4116);
+        lock(&status).chain = Some(qlab_node::StateLag::new(1984, 4116));
         let html = render_index(&lock(&status).clone(), None);
 
         assert!(html.contains("<td>applied height</td><td><code>1984</code>"), "{html}");
@@ -1302,7 +1370,7 @@ mod tests {
     #[test]
     fn a_caught_up_faucet_still_shows_the_gap_as_zero() {
         let status = a_status(crate::state::Availability::Ready { grants: 2 });
-        lock(&status).chain = qlab_node::StateLag::new(4116, 4116);
+        lock(&status).chain = Some(qlab_node::StateLag::new(4116, 4116));
         let html = render_index(&lock(&status).clone(), None);
         assert!(html.contains("<td>behind by</td><td><code>0 block(s)</code>"), "{html}");
         assert!(html.contains("<td>applied height</td><td><code>4116</code>"), "{html}");

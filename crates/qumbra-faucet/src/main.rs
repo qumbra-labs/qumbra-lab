@@ -33,7 +33,7 @@ use qlab_wallet::Wallet;
 
 use qumbra_faucet::config::FaucetServiceConfig;
 use qumbra_faucet::http::FaucetServer;
-use qumbra_faucet::service::FaucetService;
+use qumbra_faucet::service::{publish_starting, FaucetService};
 use qumbra_node::config::NodeConfig;
 use qumbra_node::genesis::GenesisFile;
 use qumbra_node::run::RunningNode;
@@ -239,16 +239,6 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let genesis = GenesisFile::load(&node_cfg.genesis_file)?;
 
     let (verifier, verifier_log) = select_verifier(has_flag(args, "--rehearsal-verifier"));
-    let mut node = RunningNode::start(&node_cfg, &genesis, RandomXPow::new(), verifier)?;
-    // The same two clock opt-ins the node binary makes: real wall-clock header
-    // timestamps so LWMA sees real solvetimes, and a wall-clock observation clock
-    // for round diagnostics.
-    node.set_mining_clock(MiningClock::WallClock);
-    node.set_obs_clock(ObsClock::WallClock);
-    if let Some(addr) = node_cfg.telemetry_addr.as_deref() {
-        let bound = node.start_telemetry_endpoint(addr)?;
-        println!("  node telemetry: http://{bound}/v1/telemetry");
-    }
 
     let limits = FaucetLimits {
         ticket_policy: if svc.tickets_required() {
@@ -270,8 +260,8 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         },
     );
     let mut service = FaucetService::new(faucet, wallet, faucet_d());
-    // Render once before binding, so the first request served is never a blank state.
-    service.refresh_status(&node);
+    // `FaucetService::new` seeds the snapshot as `Starting`, so the first request
+    // served is never a blank state and never a fabricated one (lab #365).
 
     // Lab #308: parse the trust set before binding so a bad CIDR refuses to
     // start rather than silently falling back to the empty (socket-only) posture.
@@ -280,12 +270,58 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     // 🔴 A failure to bind is FATAL. `?` and no fallback: a faucet its operator
     // believes is listening and which is not is discovered by a user who cannot get
     // funds and has no way to report it.
+    //
+    // 🔴 **The bind is BEFORE the node opens, and the order of everything above it
+    // is load-bearing** (lab #365). `Node::open` replays `blocks.log`, which took
+    // 2h33m on svc1 on 2026-08-12 and ~5 h on a snapshotless host (#359); binding
+    // after it meant `faucet.qumbra.org` served a bare Cloudflare 502 for the whole
+    // window, with the process healthy and the percentage sitting in its own log.
+    //
+    // What must NOT move above this line, because both are refusals that exist to
+    // fire before this process owns a port:
+    //   * `load()` — §6.2's keyless check and the payout check;
+    //   * `svc.trusted_proxies()` — #308's CIDR parse.
+    // Both are already done. A bind that happened before them would be a faucet
+    // holding a socket it was about to refuse to run on.
     let server = FaucetServer::start_with_trusted_proxies(
         &svc.listen_addr,
         service.gate(),
         service.status(),
         trusted.clone(),
     )?;
+    println!("qumbra-faucet listening on http://{}/ — opening the node…", server.addr());
+
+    // Now the expensive part, with the listener already answering `Starting`. The
+    // publisher thread lives exactly as long as the open: it reads the same
+    // counter #287 prints, so the page and the log cannot disagree.
+    let opening = Arc::new(AtomicBool::new(true));
+    let publisher = {
+        let opening = Arc::clone(&opening);
+        let status = service.status();
+        std::thread::spawn(move || {
+            while opening.load(Ordering::Relaxed) {
+                publish_starting(&status, qlab_node::live_replay_position());
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        })
+    };
+
+    let node_result = RunningNode::start(&node_cfg, &genesis, RandomXPow::new(), verifier);
+    opening.store(false, Ordering::Relaxed);
+    let _ = publisher.join();
+    let mut node = node_result?;
+    // The same two clock opt-ins the node binary makes: real wall-clock header
+    // timestamps so LWMA sees real solvetimes, and a wall-clock observation clock
+    // for round diagnostics.
+    node.set_mining_clock(MiningClock::WallClock);
+    node.set_obs_clock(ObsClock::WallClock);
+    if let Some(addr) = node_cfg.telemetry_addr.as_deref() {
+        let bound = node.start_telemetry_endpoint(addr)?;
+        println!("  node telemetry: http://{bound}/v1/telemetry");
+    }
+    // First real sample: from here the snapshot is node-derived and `chain` stops
+    // being `None`.
+    service.refresh_status(&node);
 
     println!("qumbra-faucet running");
     println!("  faucet:         http://{}/", server.addr());

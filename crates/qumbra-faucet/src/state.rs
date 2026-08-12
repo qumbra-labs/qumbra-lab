@@ -53,6 +53,19 @@ pub enum Availability {
     /// have no commitment-tree leaf yet, so no witness and no provable spend
     /// (issue #102). `matures_at` is the height the earliest one's leaf lands at.
     Maturing { held: usize, matures_at: u64, tip: u64 },
+    /// The process is up and the listener is bound, but the node is still
+    /// rebuilding its state from `blocks.log` — it has no chain view yet, so
+    /// nothing here can be answered from it (lab #365).
+    ///
+    /// `replayed`/`total` are the live walk position from
+    /// `qlab_node::replay_progress`; `total == 0` means a replay is known to be
+    /// running but its size is not published yet.
+    ///
+    /// This is deliberately **not** [`Availability::ColdChain`]. "The chain has
+    /// finalized nothing" is a claim about the chain; before the node opens, this
+    /// faucet has not looked at the chain at all, and saying otherwise is the #296
+    /// failure in a new place.
+    Starting { replayed: u64, total: u64 },
     /// Nothing is finalized, so there is no valid anchor and no proof can be bound.
     /// On a fresh net this is the cold start; the faucet may be fully funded.
     ColdChain,
@@ -70,7 +83,13 @@ impl Availability {
             Availability::Maturing { matures_at, tip, .. } => {
                 matures_at.saturating_sub(*tip) <= MAX_ADVERTISED_WAIT_BLOCKS
             }
-            Availability::ColdChain | Availability::Empty { .. } => false,
+            // Starting refuses for the same reason ColdChain does, and one more:
+            // a grant needs a finalized anchor, and this faucet cannot even name
+            // the chain yet. Queueing here would burn a ticket on a request it
+            // has no basis to promise — the #310 shape.
+            Availability::Starting { .. }
+            | Availability::ColdChain
+            | Availability::Empty { .. } => false,
         }
     }
 
@@ -85,7 +104,13 @@ impl Availability {
                 Some(qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS)
             }
             Availability::Maturing { matures_at, tip, .. } => Some(matures_at.saturating_sub(*tip)),
-            Availability::ColdChain | Availability::Empty { .. } => None,
+            // A replay's remaining time is not a block count and not predictable
+            // from here — it has been minutes and it has been five hours (#359).
+            // `None` makes the caller quote its one-block-interval default rather
+            // than this state inventing a completion time it cannot keep.
+            Availability::Starting { .. }
+            | Availability::ColdChain
+            | Availability::Empty { .. } => None,
         }
     }
 
@@ -113,6 +138,23 @@ impl Availability {
                      {} blocks (FROZEN §2 COINBASE_MATURITY_BLOCKS).",
                     blocks * 75 / 60,
                     qlab_node::COINBASE_MATURITY_BLOCKS,
+                )
+            }
+            Availability::Starting { replayed, total } => {
+                let progress = if *total == 0 {
+                    "reading its log".to_string()
+                } else {
+                    format!(
+                        "{replayed} of {total} records ({}%)",
+                        replayed.saturating_mul(100) / total
+                    )
+                };
+                format!(
+                    "starting — this faucet's node is rebuilding its state from disk, {progress}. \
+                     It replays every record it has after a restart, which takes minutes to hours \
+                     depending on how recent its last snapshot is. Nothing is wrong and nothing is \
+                     lost; requests are refused rather than queued until it can bind a grant to a \
+                     finalized anchor."
                 )
             }
             Availability::ColdChain => "the chain has finalized nothing yet, so no transaction \
@@ -154,7 +196,14 @@ pub struct ServiceStatus {
     /// `state_tip` stays the number every serving decision is made on — see
     /// [`classify`], which asks the [`qlab_faucet::ChainView`] directly and never
     /// reads this field.
-    pub chain: qlab_node::StateLag,
+    ///
+    /// `None` until the node has been opened and sampled once (lab #365). It was
+    /// `StateLag::default()` — two zeroes — which renders as `applied height 0 /
+    /// chain tip 0 / behind by 0`, i.e. a **funded-and-current-looking** page for a
+    /// faucet that has not yet read a single block. #296 is the standing rule that
+    /// this page does not publish numbers it has not got; an `Option` is how that
+    /// rule is made unrepresentable to break.
+    pub chain: Option<qlab_node::StateLag>,
     /// The finalized height of the **applied** view. `None` = nothing finalized.
     ///
     /// Left exactly as it was, deliberately: on a faucet whose applied state has
@@ -273,6 +322,33 @@ mod tests {
         assert!(text.contains("144"), "the frozen constant is named: {text}");
     }
 
+    /// Lab #365: the state a request meets while the node is replaying. It refuses,
+    /// it says the percentage, and it never promises a completion time it cannot
+    /// keep — a replay has been 2.5 hours and it has been five (#359).
+    #[test]
+    fn starting_refuses_and_reports_the_walk_rather_than_a_deadline() {
+        let mid = Availability::Starting { replayed: 1_644, total: 3_287 };
+        assert!(!mid.admits_requests(), "a replaying faucet must not queue a request");
+        assert_eq!(
+            mid.blocks_until_servable(),
+            None,
+            "a replay's remaining time is not a block count and must not be guessed"
+        );
+        let text = mid.explain();
+        assert!(text.contains("1644 of 3287 records (50%)"), "{text}");
+        assert!(text.contains("rebuilding its state from disk"), "{text}");
+        // …and the honest degradation when the walk's size is not published yet.
+        let early = Availability::Starting { replayed: 0, total: 0 };
+        assert!(early.explain().contains("reading its log"), "{}", early.explain());
+        assert!(!early.explain().contains("(0%)"), "no fabricated percentage: {}", early.explain());
+
+        // It is NOT ColdChain, and the difference is the point: ColdChain is a
+        // claim about the chain, which a faucet that has not opened its node
+        // cannot make (#296).
+        assert_ne!(mid.explain(), Availability::ColdChain.explain());
+        assert!(!mid.explain().contains("finalized nothing"), "{text}");
+    }
+
     /// The two states that refuse outright, and the two that queue.
     #[test]
     fn only_the_self_clearing_states_accept_requests() {
@@ -290,6 +366,8 @@ mod tests {
             Availability::Ready { grants: 0 },
             Availability::AwaitingFinality { held: 2, anchored: 1 },
             Availability::Maturing { held: 1, matures_at: 145, tip: 1 },
+            Availability::Starting { replayed: 1, total: 2 },
+            Availability::Starting { replayed: 0, total: 0 },
             Availability::ColdChain,
             Availability::Empty { held: 0 },
         ] {
