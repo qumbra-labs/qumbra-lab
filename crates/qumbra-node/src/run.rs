@@ -3090,9 +3090,15 @@ mod tests {
         assert!(line.contains(" final=- "), "nothing finalized on head #1: {line}");
         assert!(line.contains(" dfin=- "), "nor on head #3: {line}");
         assert!(
-            line.ends_with(" dfinbh=-"),
-            "the newest append is last, and it has no head to name: {line}"
+            line.contains(" dfinbh=- "),
+            "and it has no head to name: {line}"
         );
+        // #359: this rig snapshotted at height 0 before the restart, so the reopened
+        // node reads the height back off disk — and `snap=` is the tail now. (The
+        // `ends_with` above became a `contains` for that reason; the discipline it
+        // was checking is `telemetry_line_is_extended_at_the_end_and_nowhere_else`'s
+        // job, which asserts the whole key order rather than one field's position.)
+        assert!(line.ends_with(" snap=0"), "the durable snapshot survived too: {line}");
 
         let _ = std::fs::remove_dir_all(&base);
     }
