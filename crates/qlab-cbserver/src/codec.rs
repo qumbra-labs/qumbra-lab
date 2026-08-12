@@ -344,6 +344,129 @@ impl NullifierPage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// /v1/names (lab #367)
+// ---------------------------------------------------------------------------
+
+/// Page bound for `/v1/names`, `MAX_NULLIFIER_BLOCKS`'s reasoning verbatim:
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen — the framing carries
+/// `n_blocks` explicitly, so the bound can move without touching a golden.
+pub const MAX_NAMES_BLOCKS: usize = 1024;
+
+/// One block's name riders, verbatim from the committed body — **one entry
+/// per transaction including the absent `[0x00]`**, so `riders[i]` is tx `i`
+/// and the same-block tie rule (earliest reveal wins by tx order) survives
+/// the wire without a second numbering scheme.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockNames {
+    pub height: u64,
+    /// The committed rider bytes, block order. A rider-free block carries
+    /// `n_tx` one-byte entries; an EMPTY list means "no transactions", which
+    /// is a different fact and stays distinguishable.
+    pub riders: Vec<Vec<u8>>,
+}
+
+/// One page of the chain's per-block rider lists (`GET /v1/names?from=&to=`,
+/// lab #367) — the D2 bulk-sync surface: wallets replay these into a local
+/// registry and resolve locally.
+///
+/// 🔴 **Bulk per range, never a name query.** There is no `?name=alice` form
+/// of this route and there must never be one: asking a server to resolve a
+/// name tells the server whom the asker is about to pay — the correlation
+/// rule's fourth application (#315 nullifiers · tx-view D2 · explorer D2 ·
+/// here). Completeness comes from block coverage: a lying-by-omission server
+/// must omit whole blocks and be caught by the header chain.
+///
+/// Wire (the compact family's version byte, same reasoning as
+/// [`NullifierPage`]'s doc):
+///
+/// `version ‖ from(varint) ‖ to(varint) ‖ n_blocks(varint) ‖
+///  [height(varint) ‖ n_tx(varint) ‖ [len(varint) ‖ rider] × n_tx] × n_blocks`
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NamesPage {
+    /// Echo of the request's `from`.
+    pub from: u64,
+    /// Echo of the request's `to`.
+    pub to: u64,
+    /// Ascending by height; at most [`MAX_NAMES_BLOCKS`] entries.
+    pub blocks: Vec<BlockNames>,
+}
+
+impl NamesPage {
+    /// Build the page for `[from, to]` over an ascending per-block source —
+    /// the one implementation of the truncation arithmetic, `NullifierPage`'s
+    /// discipline.
+    pub fn page(blocks: impl IntoIterator<Item = BlockNames>, from: u64, to: u64) -> NamesPage {
+        let mut out = Vec::new();
+        for b in blocks {
+            if b.height < from || b.height > to {
+                continue;
+            }
+            if out.len() == MAX_NAMES_BLOCKS {
+                break;
+            }
+            out.push(b);
+        }
+        NamesPage { from, to, blocks: out }
+    }
+
+    /// The highest height this page carries — where a paging client resumes
+    /// from (`+ 1`).
+    pub fn last_height(&self) -> Option<u64> {
+        self.blocks.last().map(|b| b.height)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(WIRE_VERSION);
+        write_varint(&mut out, self.from);
+        write_varint(&mut out, self.to);
+        write_varint(&mut out, self.blocks.len() as u64);
+        for b in &self.blocks {
+            write_varint(&mut out, b.height);
+            write_varint(&mut out, b.riders.len() as u64);
+            for r in &b.riders {
+                write_varint(&mut out, r.len() as u64);
+                out.extend_from_slice(r);
+            }
+        }
+        out
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<NamesPage, CodecError> {
+        let mut pos = 0usize;
+        let ver = *b.get(pos).ok_or(CodecError::Truncated { what: "version" })?;
+        pos += 1;
+        if ver != WIRE_VERSION {
+            return Err(CodecError::BadVersion { got: ver });
+        }
+        let from = read_varint(b, &mut pos)?;
+        let to = read_varint(b, &mut pos)?;
+        let n_blocks = read_varint(b, &mut pos)?;
+        // Attacker-adjacent counts: cap every allocation by the bytes actually
+        // present (the NullifierPage rule).
+        let mut blocks = Vec::with_capacity((n_blocks as usize).min(b.len() / 2));
+        for _ in 0..n_blocks {
+            let height = read_varint(b, &mut pos)?;
+            let n_tx = read_varint(b, &mut pos)?;
+            let mut riders = Vec::with_capacity((n_tx as usize).min(b.len()));
+            for _ in 0..n_tx {
+                let len = read_varint(b, &mut pos)? as usize;
+                if b.len() < pos + len {
+                    return Err(CodecError::Truncated { what: "rider" });
+                }
+                riders.push(b[pos..pos + len].to_vec());
+                pos += len;
+            }
+            blocks.push(BlockNames { height, riders });
+        }
+        if pos != b.len() {
+            return Err(CodecError::TrailingBytes { remaining: b.len() - pos });
+        }
+        Ok(NamesPage { from, to, blocks })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

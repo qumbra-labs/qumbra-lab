@@ -61,6 +61,7 @@
 pub mod contacts;
 pub mod envelope;
 pub mod history;
+pub mod names;
 pub mod net;
 pub mod qr;
 pub mod scan;

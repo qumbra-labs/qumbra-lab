@@ -76,6 +76,10 @@ pub struct SendRequest<'a> {
     /// Skip the POST. The artifact is still returned, so a caller can keep the
     /// bytes; **discarding them is the failure this option exists to avoid.**
     pub no_submit: bool,
+    /// A name-service rider to carry (lab #367): `Some` on the two
+    /// registration steps and on renewals, `None` on every ordinary send. The
+    /// declared fee grows by the op's burned name fee; the proof is untouched.
+    pub name_op: Option<&'a qlab_devnet::names::NameOp>,
 }
 
 /// One thing that happened, as it happened.
@@ -269,7 +273,7 @@ pub fn execute(
     });
 
     on(SendStep::Proving);
-    let art = build_send(
+    let art = crate::send::build_send_with_rider(
         &wallet,
         &spendables,
         req.recipient,
@@ -277,6 +281,7 @@ pub fn execute(
         &synced.tree,
         anchor.count,
         &mut rng,
+        req.name_op,
     )
     .map_err(|e| SendError::Refused(e.to_string()))?;
     on(SendStep::Built {

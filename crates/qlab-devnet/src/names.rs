@@ -859,6 +859,70 @@ mod tests {
         assert_eq!(extended_expiry(Some(1_000), 5_000), 5_000 + NAME_TERM_BLOCKS);
     }
 
+    /// Stage-7 drill: GRAMMAR/CANONICITY FUZZ. A deterministic xorshift walk
+    /// (no rand dep enters consensus, and no `Math.random` enters a test that
+    /// must reproduce): every encodable op round-trips canonically, and every
+    /// random byte string either refuses or decodes to something that
+    /// re-encodes to itself — no second spelling survives, ever.
+    #[test]
+    fn drill_fuzz_no_second_spelling_survives() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for i in 0..2_000u32 {
+            // Half the walk: structured ops (round-trip must hold exactly).
+            if i % 2 == 0 {
+                let name_len = 1 + (next() as usize % MAX_NAME_LEN);
+                let name: Vec<u8> = (0..name_len)
+                    .map(|_| {
+                        let c = next() as usize % 37;
+                        match c {
+                            0..=25 => b'a' + c as u8,
+                            26..=35 => b'0' + (c - 26) as u8,
+                            _ => b'-',
+                        }
+                    })
+                    .collect();
+                let op = match next() % 3 {
+                    0 => NameOp::Commit {
+                        commit: core::array::from_fn(|_| next() as u8),
+                    },
+                    1 => NameOp::Reveal {
+                        record: NameRecord {
+                            kind: next() as u8,
+                            name: name.clone(),
+                            address: (0..(next() as usize % (L1_ADDRESS_LEN + 1)))
+                                .map(|_| next() as u8)
+                                .collect(),
+                        },
+                        salt: core::array::from_fn(|_| next() as u8),
+                    },
+                    _ => NameOp::Renew { name },
+                };
+                let bytes = encode_rider(Some(&op));
+                assert_eq!(decode_rider(&bytes), Ok(Some(op)), "round-trip @ {i}");
+                assert!(rider_is_canonical(&bytes), "canonical @ {i}");
+            } else {
+                // The other half: raw bytes. Decode may refuse; if it accepts,
+                // re-encoding MUST reproduce the input byte-for-byte.
+                let len = next() as usize % 96;
+                let bytes: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+                if let Ok(op) = decode_rider(&bytes) {
+                    assert_eq!(
+                        encode_rider(op.as_ref()),
+                        bytes,
+                        "a decoded rider must re-encode to itself @ {i}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn name_fee_for_charges_reveal_and_renew_never_commit() {
         assert_eq!(name_fee_for(&NameOp::Commit { commit: [0u8; 32] }), 0);

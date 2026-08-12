@@ -1419,6 +1419,94 @@ mod tests {
             .expect("rider-absent blocks stay valid above the boundary");
     }
 
+    /// Stage-7 drill: the FRONT-RUN RACE. An adversary watching the mempool
+    /// sees a reveal and races their own — but their commit is necessarily
+    /// young (they just learned the name), and a reveal whose commit is
+    /// younger than `COMMIT_MIN_AGE` is invalid, so **no miner can include
+    /// the front-runner's reveal at all**, ordering games included. The
+    /// victim's older commit wins by construction. The min-age window IS the
+    /// mutation check: weaken it to zero and the adversarial assertions here
+    /// fail.
+    #[test]
+    fn drill_front_run_race_the_young_commit_loses() {
+        use crate::names::{self, NameOp, NameRecord, COMMIT_MIN_AGE};
+        use std::collections::HashMap;
+
+        struct View {
+            commits: HashMap<Hash32, u64>,
+        }
+        impl names::NameView for View {
+            fn commit_included_in(&self, c: &Hash32, lo: u64, hi: u64) -> bool {
+                self.commits.get(c).is_some_and(|h| (lo..=hi).contains(h))
+            }
+            fn registration_expiry(&self, _: &[u8]) -> Option<u64> {
+                None
+            }
+        }
+
+        const B: u64 = 8_640;
+        let h = 10_000u64;
+        let record = |addr: u8| NameRecord {
+            kind: names::RECORD_KIND_L1_ADDRESS,
+            name: b"alice".to_vec(),
+            address: vec![addr; names::L1_ADDRESS_LEN],
+        };
+        // The victim committed 100 blocks ago; the adversary saw the reveal in
+        // the mempool and committed as fast as physically possible — last block.
+        let victim = (record(0xAA), [1u8; 32]);
+        let adversary = (record(0xEE), [2u8; 32]);
+        let view = View {
+            commits: [
+                (names::commit_hash(&victim.0, &victim.1), h - 100),
+                (names::commit_hash(&adversary.0, &adversary.1), h - 1),
+            ]
+            .into(),
+        };
+        let tx_for = |nf: u8, (r, salt): &(NameRecord, [u8; 32])| {
+            let mut tx = good_tx(nf).with_name_op(&NameOp::Reveal {
+                record: r.clone(),
+                salt: *salt,
+            });
+            tx.public.fee =
+                posted_fee(ArityBucket::TwoByTwo) + names::name_fee_bessel(5);
+            tx
+        };
+        let body_of = |txs: Vec<TxEntry>| BlockBody {
+            txs,
+            coinbase: coinbase_exact(h),
+            coinbase_rkm: MINER_RKM,
+        };
+        let at = |body: &BlockBody| BlockHeader {
+            height: h,
+            ..BlockHeader::child_of(
+                &BlockHeader::genesis(1, 0),
+                75,
+                1,
+                body.commitment_above(Some(B), h),
+            )
+        };
+
+        // A block carrying the front-runner's reveal is INVALID — even with
+        // the adversary's tx ordered first.
+        let raced = body_of(vec![tx_for(0x70, &adversary), tx_for(0x71, &victim)]);
+        assert!(
+            matches!(
+                validate_body_above(Some(B), &at(&raced), &raced, &MockVerifier, is_final, &view),
+                Err(BodyError::RiderRule {
+                    index: 0,
+                    err: crate::names::NameRuleError::CommitNotFound
+                })
+            ),
+            "a commit {} block old cannot satisfy the {}-block minimum",
+            1,
+            COMMIT_MIN_AGE
+        );
+        // The victim's block is valid.
+        let honest = body_of(vec![tx_for(0x71, &victim)]);
+        validate_body_above(Some(B), &at(&honest), &honest, &MockVerifier, is_final, &view)
+            .expect("the older commit registers");
+    }
+
     /// The rider is inside the v3 preimage and outside the v2 one: a
     /// registration and its rider-stripped twin commit identically under v2
     /// (which is why v2 must not survive above the boundary) and differently

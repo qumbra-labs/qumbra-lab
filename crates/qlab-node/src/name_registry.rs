@@ -324,6 +324,80 @@ mod tests {
         assert_eq!(t.fee, 1_000_000 + name_fee_bessel(5));
     }
 
+    /// Stage-7 drill: REORG ACROSS A REGISTRATION. The registry's reorg story
+    /// is "ride `apply_state`, get the rewind re-fold for free" — which is a
+    /// claim about determinism: folding a prefix and then a different suffix
+    /// must equal folding the winning chain fresh. A registration that
+    /// un-happens with its branch must leave no residue (the #325 SupplyLedger
+    /// gap, asserted against the shape that replaced it).
+    #[test]
+    fn drill_reorg_refold_leaves_no_residue_of_the_losing_branch() {
+        let r_alice = record();
+        let mut r_bob = record();
+        r_bob.name = b"bob".to_vec();
+        let salt = [7u8; 32];
+
+        let prefix = |reg: &mut NameRegistry| {
+            reg.apply_block_riders(
+                9_000,
+                &[tx_with(Some(&NameOp::Commit { commit: commit_hash(&r_alice, &salt) }))],
+            )
+            .unwrap();
+        };
+
+        // Branch A: alice reveals at 9_100 (this branch will LOSE).
+        let mut on_a = NameRegistry::default();
+        prefix(&mut on_a);
+        on_a.apply_block_riders(
+            9_100,
+            &[tx_with(Some(&NameOp::Reveal { record: r_alice.clone(), salt }))],
+        )
+        .unwrap();
+        assert!(on_a.entry(b"alice").is_some());
+
+        // The reorg: rewind to the prefix, re-fold the winning branch, where
+        // block 9_100 carries a DIFFERENT registration (bob's commit landed
+        // in the prefix too — fixture simplicity, same window).
+        let mut winning = NameRegistry::default();
+        winning
+            .apply_block_riders(
+                9_000,
+                &[
+                    tx_with(Some(&NameOp::Commit { commit: commit_hash(&r_alice, &salt) })),
+                    tx_with(Some(&NameOp::Commit { commit: commit_hash(&r_bob, &salt) })),
+                ],
+            )
+            .unwrap();
+        winning
+            .apply_block_riders(
+                9_100,
+                &[tx_with(Some(&NameOp::Reveal { record: r_bob.clone(), salt }))],
+            )
+            .unwrap();
+
+        // The re-fold (what rewind_to does: fresh from genesis + winning blocks).
+        let mut refolded = NameRegistry::default();
+        refolded
+            .apply_block_riders(
+                9_000,
+                &[
+                    tx_with(Some(&NameOp::Commit { commit: commit_hash(&r_alice, &salt) })),
+                    tx_with(Some(&NameOp::Commit { commit: commit_hash(&r_bob, &salt) })),
+                ],
+            )
+            .unwrap();
+        refolded
+            .apply_block_riders(
+                9_100,
+                &[tx_with(Some(&NameOp::Reveal { record: r_bob.clone(), salt }))],
+            )
+            .unwrap();
+
+        assert_eq!(winning, refolded, "fold is deterministic");
+        assert!(refolded.entry(b"alice").is_none(), "the losing branch's registration left no residue");
+        assert!(refolded.entry(b"bob").is_some());
+    }
+
     #[test]
     fn sidecar_round_trips_and_absence_is_the_empty_registry() {
         let dir = std::env::temp_dir().join(format!("qlab-names-i367-{}", std::process::id()));

@@ -58,7 +58,7 @@ use qlab_cbserver::codec::{
     committed_payloads_per_recipient, decode_committed_discovery, encode_committed_discovery,
     encode_compact_response, encode_full_response,
     read_varint, write_varint, BlockNullifiers, CodecError, CompactBlock, CompactGroup,
-    NullifierPage,
+    BlockNames, NamesPage, NullifierPage,
 };
 use qlab_cbserver::tree::Frontier;
 use qlab_devnet::body::{TxEntry, TxPublic, TxVerifier};
@@ -264,6 +264,12 @@ pub struct BlockDiscovery {
     /// answer *"this block spent nothing"* — see [`NullifierPage`] for why that
     /// must never be confused with "this block was not served".
     pub nullifiers: Vec<Hash32>,
+    /// Every transaction's committed name rider, verbatim, block order —
+    /// **including the absent `[0x00]`**, so `riders[i]` is tx `i` and the
+    /// same-block tie rule survives serving without a second numbering
+    /// (lab #367). Same no-encoder-between-block-and-served-bytes guarantee
+    /// as `groups`.
+    pub riders: Vec<Vec<u8>>,
 }
 
 impl BlockDiscovery {
@@ -276,6 +282,7 @@ impl BlockDiscovery {
             hash,
             groups: block.txs.iter().map(|t| t.discovery.clone()).collect(),
             nullifiers: block.txs.iter().flat_map(|t| t.nullifiers.iter().copied()).collect(),
+            riders: block.txs.iter().map(|t| t.rider.clone()).collect(),
         }
     }
 
@@ -941,6 +948,22 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
                 }
                 Ok(nullifier_page(&self.main_chain_discovery(), from, to).to_bytes())
             }
+            ["v1", "names"] => {
+                // Lab #367: the D2 bulk-sync surface — per-block rider lists a
+                // wallet replays into a LOCAL registry. Bulk over a range;
+                // resolve-by-name is refused BY NAME below, permanently
+                // (name-service-decision D2 — the correlation rule's fourth
+                // application after #315/tx-view/explorer).
+                if query_u64(query, "name").is_some() || query.contains("name=") {
+                    return Err((400, "no resolve-by-name exists, by design (D2): sync the range and resolve locally"));
+                }
+                let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'"))?;
+                let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'"))?;
+                if to < from {
+                    return Err((400, "'to' < 'from'"));
+                }
+                Ok(names_page(&self.main_chain_discovery(), from, to).to_bytes())
+            }
             ["v1", "tree", "leaves"] => {
                 // Issue #275 (decision brief B1): the witness source. Served here
                 // as well as by `qumbra-node`'s discovery server — stamp rider (2):
@@ -1312,6 +1335,18 @@ pub fn nullifier_page(blocks: &[BlockDiscovery], from: u64, to: u64) -> Nullifie
         blocks
             .iter()
             .map(|b| BlockNullifiers { height: b.height, nullifiers: b.nullifiers.clone() }),
+        from,
+        to,
+    )
+}
+
+/// The `/v1/names` projection step (lab #367) — `nullifier_page`'s twin, and
+/// for the same reason it lives here: one implementation of the bound, called
+/// by both servers, no drift. The riders come from [`BlockDiscovery::riders`]
+/// — `StoredTx`'s own section, cloned, no encoder in between.
+pub fn names_page(blocks: &[BlockDiscovery], from: u64, to: u64) -> NamesPage {
+    NamesPage::page(
+        blocks.iter().map(|b| BlockNames { height: b.height, riders: b.riders.clone() }),
         from,
         to,
     )

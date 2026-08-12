@@ -194,6 +194,10 @@ pub const TX_SUBMIT_PATH: &str = "/v1/tx";
 /// range. There is deliberately **no** per-nullifier form of it; see
 /// [`qlab_node::NullifierPage`].
 pub const NULLIFIERS_PATH: &str = "/v1/nullifiers";
+/// `GET /v1/names?from=&to=` — the per-block rider lists a wallet replays into
+/// a local registry (lab #367; D2's bulk-sync surface). No name-keyed form
+/// exists, by design, permanently.
+pub const NAMES_PATH: &str = "/v1/names";
 
 /// The most bytes `POST /v1/tx` will read as a body.
 ///
@@ -584,6 +588,15 @@ impl DiscoveryServer {
                         };
                         respond_nullifiers(&snapshot, query)
                     }
+                    NAMES_PATH => {
+                        // Same snapshot again (lab #367): riders are projected
+                        // with the block they were committed in.
+                        let snapshot = match view.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(p) => Arc::clone(&p.into_inner()),
+                        };
+                        respond_names(&snapshot, query)
+                    }
                     TREE_LEAVES_PATH => {
                         let snapshot = match leaves.lock() {
                             Ok(g) => Arc::clone(&g),
@@ -612,7 +625,7 @@ impl DiscoveryServer {
                         None => Err((
                             404,
                             format!(
-                                "not found: try {COMPACT_PATH}?from=&to=, {NULLIFIERS_PATH}?from=&to=, \
+                                "not found: try {COMPACT_PATH}?from=&to=, {NULLIFIERS_PATH}?from=&to=, {NAMES_PATH}?from=&to=, \
                                  {TREE_LEAVES_PATH}?from=, {ANCHORS_PATH}, {FULL_PATH_SHAPE}, or \
                                  POST {TX_SUBMIT_PATH}"
                             ),
@@ -690,6 +703,28 @@ pub fn respond_nullifiers(view: &DiscoveryView, query: &str) -> Result<Vec<u8>, 
         return Err((400, "'to' < 'from'".to_string()));
     }
     Ok(qlab_node::nullifier_page(&view.blocks, from, to).to_bytes())
+}
+
+/// The socket-free `/v1/names` core (lab #367) — `respond_nullifiers`'s twin
+/// over the same projection, same page arithmetic as the in-process route
+/// (`qlab_node::names_page`), so the two servers cannot disagree about a page
+/// boundary. The D2 refusal is route-level and named: a `name=` query is a
+/// 400 explaining that resolve-by-name does not exist, not a 404 that invites
+/// retrying elsewhere.
+pub fn respond_names(view: &DiscoveryView, query: &str) -> Result<Vec<u8>, (u16, String)> {
+    if query.split('&').any(|kv| kv.starts_with("name=")) {
+        return Err((
+            400,
+            "no resolve-by-name exists, by design (D2): sync the range and resolve locally"
+                .to_string(),
+        ));
+    }
+    let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'".to_string()))?;
+    let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'".to_string()))?;
+    if to < from {
+        return Err((400, "'to' < 'from'".to_string()));
+    }
+    Ok(qlab_node::names_page(&view.blocks, from, to).to_bytes())
 }
 
 /// The socket-free `/v1/tree/leaves` core: a `from` query against the leaves
@@ -878,7 +913,8 @@ mod tests {
     /// the serving core does not care how the bytes got there, only that they are
     /// the block's.
     fn projected(height: u64, hash: u8, groups: Vec<Vec<u8>>) -> BlockDiscovery {
-        BlockDiscovery { height, hash: [hash; 32], groups, nullifiers: vec![] }
+        let riders = groups.iter().map(|_| vec![0x00]).collect();
+        BlockDiscovery { height, hash: [hash; 32], groups, nullifiers: vec![], riders }
     }
 
     /// The same, spending `nullifiers` (lab issue #314).
@@ -888,7 +924,8 @@ mod tests {
         groups: Vec<Vec<u8>>,
         nullifiers: Vec<Hash32>,
     ) -> BlockDiscovery {
-        BlockDiscovery { height, hash: [hash; 32], groups, nullifiers }
+        let riders = groups.iter().map(|_| vec![0x00]).collect();
+        BlockDiscovery { height, hash: [hash; 32], groups, nullifiers, riders }
     }
 
     fn a_view() -> DiscoveryView {

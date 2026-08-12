@@ -450,7 +450,9 @@ fn read_response(stream: &mut dyn ReadWrite) -> std::io::Result<(u16, Vec<u8>)> 
 /// into `qlab-node`'s (and therefore the consensus node's) build graph. The
 /// duplication that delegation avoided is real, and the trade is stated on
 /// issue #297 rather than made quietly.
-fn http_get(base_url: &str, path_and_query: &str) -> std::io::Result<Vec<u8>> {
+/// One raw GET — public since lab #367 so the names sync loop can inject it
+/// (`names::sync_names` takes a fetch closure; TLS stays in this crate).
+pub fn http_get(base_url: &str, path_and_query: &str) -> std::io::Result<Vec<u8>> {
     use std::io::Write;
 
     let (mut stream, host) = connect(base_url)?;
