@@ -47,6 +47,7 @@ pub mod coinbase;
 pub mod emission;
 pub mod mempool;
 pub mod metrics;
+pub mod name_registry;
 mod node;
 mod persist;
 mod replay_progress;

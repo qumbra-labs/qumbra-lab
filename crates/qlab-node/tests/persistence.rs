@@ -735,7 +735,7 @@ fn a_snapshot_whose_log_implies_a_rewind_it_cannot_honour_opens_by_full_replay()
     let opened = MemNode::open(&dir, genesis.clone()).expect("open must NOT refuse (issue #225)");
 
     // (1) The snapshot was rejected, and the reason names the failure exactly.
-    let report = *opened.recovery_report();
+    let report = opened.recovery_report().clone();
     assert_eq!(report.snapshot_height, None, "the snapshot was not honoured");
     match report.snapshot_rejected {
         Some(qlab_node::SnapshotRejection::RewindRefused {
@@ -943,4 +943,56 @@ fn measure_the_cost_of_a_rewind() {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+// --- lab #367: the names.bin sidecar ----------------------------------------
+
+/// The registry sidecar rides every snapshot: written by `save_snapshot`,
+/// restored by `open`'s snapshot path, and — when it cannot be honoured beside
+/// its snapshot — the whole resume falls through to the full replay rather
+/// than guessing (the #225 fall-through discipline, applied to the new file).
+#[test]
+fn the_names_sidecar_rides_the_snapshot_and_a_mismatch_falls_through() {
+    let dir = temp_dir("names-sidecar");
+    build_chain(&dir);
+
+    // The sidecar exists (save_snapshot wrote it) and the reopened node
+    // carries an empty registry — no rider has ever existed on this chain,
+    // and absence-of-names is a fact here, not a default.
+    assert!(dir.join("names.bin").exists(), "save_snapshot writes the sidecar");
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    // Every open below runs inside a progress capture (discarded): the capture
+    // gate serialises against the #287 progress tests, whose assertions read a
+    // GLOBAL line stream that a concurrent replaying open would pollute.
+    let (node, _) =
+        qlab_node::with_progress_capture(|| MemNode::open(&dir, genesis.clone()).unwrap());
+    assert!(node.names().is_empty());
+    assert!(
+        node.recovery_report().snapshot_rejected.is_none(),
+        "a matching sidecar resumes cleanly: {}",
+        node.recovery_report()
+    );
+    drop(node);
+
+    // Corrupt the sidecar: the snapshot resume is REJECTED with the named
+    // reason and the node still opens — by full replay, which consults no
+    // sidecar and rebuilds the registry from the log.
+    std::fs::write(dir.join("names.bin"), b"not a sidecar").unwrap();
+    let (node, _) =
+        qlab_node::with_progress_capture(|| MemNode::open(&dir, genesis.clone()).unwrap());
+    assert!(node.names().is_empty(), "replay rebuilt the (empty) registry from the log");
+    match &node.recovery_report().snapshot_rejected {
+        Some(qlab_node::SnapshotRejection::NamesSidecarDisagreement { reason }) => {
+            assert!(reason.contains("does not decode"), "named reason: {reason}");
+        }
+        other => panic!("expected the sidecar fall-through, got {other:?}"),
+    }
+    drop(node);
+
+    // A deleted sidecar beside a live snapshot is the pre-#367 shape: exact
+    // empty, clean resume, no rejection.
+    std::fs::remove_file(dir.join("names.bin")).unwrap();
+    let (node, _) = qlab_node::with_progress_capture(|| MemNode::open(&dir, genesis).unwrap());
+    assert!(node.names().is_empty());
+    assert!(node.recovery_report().snapshot_rejected.is_none());
 }

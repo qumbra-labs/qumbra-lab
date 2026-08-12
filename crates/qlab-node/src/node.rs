@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
-use qlab_devnet::body::{validate_body, BlockBody, BodyError, TxVerifier};
+use qlab_devnet::body::{validate_body_with_names, BlockBody, BodyError, TxVerifier};
 use qlab_devnet::chain::{FinalizeMarkError, InsertError, RestoreFinalizedError};
 use qlab_devnet::committee::Checkpoint;
 use qlab_devnet::header::BlockHeader;
@@ -171,7 +171,7 @@ fn block_weight(block: &StoredBlock) -> usize {
 /// itself, and a node that recovers without saying so turns a finding into a
 /// startup that is merely slower than usual — which is how this defect would
 /// come back wearing a different hat.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotRejection {
     /// The reconstructed log prefix did not end on the tip the snapshot claims,
     /// so the snapshot's derived state is for a branch this log abandoned
@@ -194,6 +194,15 @@ pub enum SnapshotRejection {
         error: RewindError,
         above_snapshot: bool,
     },
+    /// The `names.bin` sidecar (lab #367) cannot be honoured beside this
+    /// snapshot: it exists but does not decode, carries an unknown version, or
+    /// records a different `applied_height` than the snapshot (the crash
+    /// window between the two writes — they rename atomically one at a time).
+    /// The full replay rebuilds the registry from the log and needs neither
+    /// file, so this is a fall-through, not a refusal. An ABSENT sidecar is
+    /// not this case: absence means the snapshot writer predates #367, whose
+    /// registry state is exactly empty.
+    NamesSidecarDisagreement { reason: String },
 }
 
 impl std::fmt::Display for SnapshotRejection {
@@ -228,6 +237,13 @@ impl std::fmt::Display for SnapshotRejection {
                     hex8(target)
                 )
             }
+            SnapshotRejection::NamesSidecarDisagreement { reason } => {
+                write!(
+                    f,
+                    "the names.bin sidecar cannot be honoured beside this snapshot ({reason}); \
+                     replaying from genesis rebuilds the registry from the log"
+                )
+            }
         }
     }
 }
@@ -244,7 +260,7 @@ impl std::fmt::Display for SnapshotRejection {
 /// was used), which is exactly why the two fields are separate: before issue
 /// #225 "no snapshot was used" and "the snapshot was unusable" were the same
 /// report.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
     pub snapshot_height: Option<u64>,
     pub replayed_records: usize,
@@ -562,6 +578,10 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// Recovery provenance for the startup banner. In-memory nodes carry the
     /// all-zero fresh report; disk-backed `open` replaces it before returning.
     recovery: RecoveryReport,
+    /// The name registry (lab #367) — derived state, mutated only in
+    /// `apply_state` (so rewinds rebuild it) and persisted as the `names.bin`
+    /// sidecar (so snapshots restore it). See `crate::name_registry`.
+    names: crate::name_registry::NameRegistry,
 }
 
 /// The outcome of [`MemNode::resume_from_snapshot`] — a node, or the reason this
@@ -654,6 +674,31 @@ impl MemNode {
     ) -> Result<SnapshotResume, NodeError> {
         let mut node = Self::from_genesis(genesis.clone(), Some(dir.to_path_buf()));
         node.restore_from_snapshot(snap);
+        // Lab #367: the registry sidecar rides the snapshot. Any problem with
+        // a PRESENT sidecar is a fall-through to the full replay (which
+        // rebuilds the registry from the log and consults no sidecar);
+        // absence is the exact empty registry (see the variant's doc).
+        match crate::name_registry::load_names_at(dir) {
+            Ok(None) => {}
+            Ok(Some((names, at_height))) => {
+                if at_height != snap.applied_height {
+                    return Ok(SnapshotResume::Rejected(
+                        SnapshotRejection::NamesSidecarDisagreement {
+                            reason: format!(
+                                "sidecar applied_height {at_height} != snapshot applied_height {}",
+                                snap.applied_height
+                            ),
+                        },
+                    ));
+                }
+                node.names = names;
+            }
+            Err(e) => {
+                return Ok(SnapshotResume::Rejected(
+                    SnapshotRejection::NamesSidecarDisagreement { reason: e.to_string() },
+                ));
+            }
+        }
 
         // First reconstruct the snapshot prefix's block store. Finality is
         // restored only after every prefix block exists, so the persisted
@@ -968,7 +1013,7 @@ impl MemNode {
                 .restore_finalized(hash, height)
                 .expect("rewind_path proved the retained tip descends from the finalized head");
         }
-        rebuilt.recovery = self.recovery;
+        rebuilt.recovery = self.recovery.clone();
         // Possession carries across the swap: what this node already held plus what
         // it is about to stop having applied.
         rebuilt.retained = std::mem::take(&mut self.retained);
@@ -1020,6 +1065,7 @@ impl MemNode {
             retained: RetainedBodies::default(),
             dir,
             recovery: RecoveryReport::default(),
+            names: crate::name_registry::NameRegistry::default(),
         }
     }
 
@@ -1073,7 +1119,12 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // committed to, checked before any other body work.
         {
             let anchor_ok = |root: &Hash32| self.is_valid_anchor(root);
-            validate_body(&header, &body, verifier, anchor_ok).map_err(NodeError::Body)?;
+            // Lab #367: the registry is the NameView. While the boundary is
+            // unset this is behaviourally identical to plain validate_body;
+            // once armed, rider rules read real state with no plumbing left
+            // to do.
+            validate_body_with_names(&header, &body, verifier, anchor_ok, &self.names)
+                .map_err(NodeError::Body)?;
         }
         let block = StoredBlock::from_parts(&header, &body);
         let hash = self.apply_state(&block)?;
@@ -1180,6 +1231,14 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
                 self.nullifiers_ordered.push(*nf);
             }
         }
+        // Lab #367: fold the block's riders into the name registry — the same
+        // funnel as everything above, so `open == replay` and rewind-refold
+        // both hold for names with nothing extra to maintain. A rider that
+        // fails to decode HERE means the block was never validated (or the
+        // log is corrupt): named, not ignored.
+        self.names
+            .apply_block_riders(block.header.height, &block.txs)
+            .map_err(|(index, err)| NodeError::Body(BodyError::RiderMalformed { index, err }))?;
         self.roots_by_height
             .insert(block.header.height, self.commitments.root_bytes());
         // Issue #198: a block back in the applied chain is servable from the applied
@@ -1251,7 +1310,17 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
             nullifiers: self.nullifiers_ordered.clone(),
             roots_by_height: self.roots_by_height.iter().map(|(h, r)| (*h, *r)).collect(),
         };
-        persist::save_snapshot(dir, &snap).map_err(NodeError::Io)
+        persist::save_snapshot(dir, &snap).map_err(NodeError::Io)?;
+        // Lab #367: the registry sidecar rides every snapshot write (its
+        // format note explains why it is not a Snapshot field).
+        crate::name_registry::save_names(dir, &self.names, self.chain.tip_height())
+            .map_err(NodeError::Io)
+    }
+
+    /// Borrow the name registry (lab #367) — the local-resolve surface and
+    /// the `NameView` behind block validation.
+    pub fn names(&self) -> &crate::name_registry::NameRegistry {
+        &self.names
     }
 
     /// Borrow the chain store.

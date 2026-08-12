@@ -292,7 +292,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // It is a fall-through now, and the fall-through is always correct — so the
     // only thing left to get wrong is letting it pass unnoticed. This says, at the
     // one moment an operator is reading, that the datadir's snapshot was unusable.
-    if let Some(why) = node.recovery_report().snapshot_rejected {
+    if let Some(why) = &node.recovery_report().snapshot_rejected {
         println!(
             "  ⚠️  THE SNAPSHOT IN THIS DATA DIR COULD NOT BE HONOURED against its own \
              blocks.log (issue #225)."

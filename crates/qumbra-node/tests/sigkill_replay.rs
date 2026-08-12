@@ -331,7 +331,7 @@ fn a_sigkilled_node_replays_the_log_past_a_stale_snapshot() {
 
     // ---- what the log actually replays to ------------------------------------
     let opened = MemNode::open(&data_dir, genesis.genesis_block.clone()).expect("open the killed data dir");
-    let report = *opened.recovery_report();
+    let report = opened.recovery_report().clone();
     assert_eq!(
         report.snapshot_height,
         Some(snap_height),
