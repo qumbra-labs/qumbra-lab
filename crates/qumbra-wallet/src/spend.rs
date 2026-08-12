@@ -435,9 +435,30 @@ pub fn execute(
     req: &SendRequest<'_>,
     on: &mut dyn FnMut(SendStep),
 ) -> Result<SendOutcome, SendError> {
-    let bundle = select(req, on)?;
-    let current = preflight(req)?;
-    let art = prove(&bundle, &current, on)?;
+    execute_with_phases(req, on, select, preflight, prove, submit)
+}
+
+fn execute_with_phases<Select, Preflight, Prove, Submit>(
+    req: &SendRequest<'_>,
+    on: &mut dyn FnMut(SendStep),
+    select_phase: Select,
+    preflight_phase: Preflight,
+    prove_phase: Prove,
+    submit_phase: Submit,
+) -> Result<SendOutcome, SendError>
+where
+    Select: FnOnce(&SendRequest<'_>, &mut dyn FnMut(SendStep)) -> Result<WitnessBundle, SendError>,
+    Preflight: FnOnce(&SendRequest<'_>) -> Result<ProveContext, SendError>,
+    Prove: FnOnce(
+        &WitnessBundle,
+        &ProveContext,
+        &mut dyn FnMut(SendStep),
+    ) -> Result<SendArtifact, SendError>,
+    Submit: FnOnce(&str, &[u8], &mut dyn FnMut(SendStep)) -> Result<SubmitAnswer, SendError>,
+{
+    let bundle = select_phase(req, on)?;
+    let current = preflight_phase(req)?;
+    let art = prove_phase(&bundle, &current, on)?;
 
     let outcome = |answer| SendOutcome {
         wire_bytes: art.wire_bytes.clone(),
@@ -467,7 +488,7 @@ pub fn execute(
         ))),
     }
 
-    let answer = submit(req.node_url, &art.wire_bytes, on)?;
+    let answer = submit_phase(req.node_url, &art.wire_bytes, on)?;
 
     // The cross-check the local derivation earns: a node naming a different
     // statement id means the record just written points at a transaction nobody
@@ -498,11 +519,15 @@ pub fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::rc::Rc;
 
     use qlab_air::narrow::derive_input;
     use qlab_cbserver::tree::CommitmentTree;
+    use qlab_devnet::body::{TxEntry, TxPublic};
+    use qlab_devnet::fees::ArityBucket;
     use qlab_wallet::seed::MasterSeed;
     use qlab_wallet::Wallet;
     use rand::rngs::StdRng;
@@ -626,6 +651,90 @@ mod tests {
             replay.body, "duplicate 010203",
             "the node's vocabulary is verbatim"
         );
+    }
+
+    /// Hazard (d): the public compatibility surface runs the three callable
+    /// phases in order and hands submit the exact bytes prove returned. The
+    /// real deterministic wire shell is golden-locked in
+    /// `send::tests::one_real_spend_builds_proves_and_binds_its_seams`.
+    #[test]
+    fn execute_is_exactly_select_prove_submit_and_preserves_the_wire_bytes() {
+        let bundle = bundle();
+        let recipient =
+            Wallet::from_master_seed(&MasterSeed::from_entropy([0x43; 32]), 0).address_at_index(0);
+        let req = SendRequest {
+            dir: std::path::Path::new("target/i351-composition-parent-does-not-exist/wallet"),
+            url: "unused-scan-url",
+            node_url: "phase-three-url",
+            recipient: &recipient,
+            contact_name: None,
+            amount: bundle.amount(),
+            scan_to: bundle.selected_at_tip(),
+            no_submit: false,
+        };
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let select_calls = Rc::clone(&calls);
+        let preflight_calls = Rc::clone(&calls);
+        let prove_calls = Rc::clone(&calls);
+        let submit_calls = Rc::clone(&calls);
+        let selected = bundle.clone();
+        let proved_wire = vec![0x51, 0x35, 0x31];
+        let expected_wire = proved_wire.clone();
+
+        let outcome = execute_with_phases(
+            &req,
+            &mut |_| {},
+            move |_, _| {
+                select_calls.borrow_mut().push("select");
+                Ok(selected)
+            },
+            move |_| {
+                preflight_calls.borrow_mut().push("preflight");
+                Ok(context(&bundle, true, Vec::new()))
+            },
+            move |selected, _, _| {
+                prove_calls.borrow_mut().push("prove");
+                Ok(SendArtifact {
+                    entry: TxEntry {
+                        proof: Vec::new(),
+                        public: TxPublic {
+                            anchor: selected.anchor(),
+                            nullifiers: vec![[0x11; 32], [0x12; 32]],
+                            commitments: vec![[0x21; 32], [0x22; 32]],
+                            bucket: ArityBucket::TwoByTwo,
+                            fee: selected.fee(),
+                        },
+                        discovery: vec![0],
+                    },
+                    wire_bytes: proved_wire,
+                    fee: selected.fee(),
+                    used_dummy: selected.used_dummy(),
+                    prove_secs: 1.25,
+                    change_value: selected.change_value(),
+                    pvs: Vec::new(),
+                    declared_anchor: [0; 4],
+                    declared_nf: [[0; 4]; 2],
+                    declared_cm: [[0; 4]; 2],
+                })
+            },
+            move |url, wire, _| {
+                submit_calls.borrow_mut().push("submit");
+                assert_eq!(url, "phase-three-url");
+                assert_eq!(wire, expected_wire);
+                Ok(SubmitAnswer {
+                    status: 200,
+                    body: "duplicate".into(),
+                })
+            },
+        )
+        .expect("duplicate is the safe retry outcome");
+
+        assert_eq!(
+            calls.borrow().as_slice(),
+            ["select", "preflight", "prove", "submit"]
+        );
+        assert_eq!(outcome.wire_bytes, [0x51, 0x35, 0x31]);
+        assert_eq!(outcome.answer.unwrap().class(), SubmitClass::Duplicate);
     }
 
     fn read_http_request(stream: &mut std::net::TcpStream) {
