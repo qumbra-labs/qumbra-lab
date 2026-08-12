@@ -232,6 +232,80 @@ pub fn load_snapshot(dir: &Path) -> io::Result<Option<Snapshot>> {
     }
 }
 
+/// **What a data dir's `snapshot.bin` says about itself** — issue #359 S3, the
+/// answer to *"can this host restart in minutes, or does it replay from genesis?"*
+/// without opening a node or replaying anything.
+///
+/// [`load_snapshot`] deliberately flattens three different situations into
+/// `Ok(None)`, because for its own caller — resume — they are one situation: the
+/// full replay is always correct. **For an operator they are not one situation**,
+/// and that flattening is why the question in issue #104 ("no `snapshot.bin` on
+/// any host despite SIGTERM") could only be answered by ssh + `ls`. A missing file
+/// and an undecodable one both cost a from-genesis replay, but they have different
+/// causes and different fixes: the first says a write never happened, the second
+/// says one happened under a different [`FORMAT_VERSION`] (or was truncated by
+/// something other than this writer — the write itself is atomic).
+///
+/// This reads and decodes the file. It is for the startup path and for one-shot
+/// operator commands, **not** for a per-sample telemetry read: the decode is
+/// O(state size). See `qumbra_node::run` for how the run loop caches it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotOnDisk {
+    /// No `snapshot.bin` in this data dir — node3's shape (issue #359). A restart
+    /// here replays the whole block log from genesis.
+    Absent,
+    /// Present, decodable, and at the current [`FORMAT_VERSION`]: a restart
+    /// resumes from this applied height and replays only the records past it.
+    At { applied_height: u64 },
+    /// Present but unusable — torn, or written at a different [`FORMAT_VERSION`].
+    /// Costs the same full replay as [`Self::Absent`] and is reported apart from
+    /// it because the cause is different.
+    Unreadable,
+}
+
+impl SnapshotOnDisk {
+    /// The applied height a restart would resume from, or `None` when this data
+    /// dir has no usable snapshot.
+    pub fn height(&self) -> Option<u64> {
+        match self {
+            Self::At { applied_height } => Some(*applied_height),
+            Self::Absent | Self::Unreadable => None,
+        }
+    }
+
+    /// The operator-facing token, shared by `TELEMETRY`'s `snap=` field and
+    /// `halt-status` so one grep covers both surfaces (the `UNAVAILABLE`
+    /// precedent from #136/#243): a height, `none`, or `bad`.
+    pub fn field(&self) -> String {
+        match self {
+            Self::At { applied_height } => applied_height.to_string(),
+            Self::Absent => "none".to_string(),
+            Self::Unreadable => "bad".to_string(),
+        }
+    }
+}
+
+/// Read what `dir`'s snapshot says about itself — see [`SnapshotOnDisk`].
+///
+/// An I/O error opening a file that `exists()` reported is returned rather than
+/// folded into [`SnapshotOnDisk::Unreadable`]: an unreadable *directory* is a
+/// different fault from an unusable snapshot, and telling them apart is the whole
+/// point of this function.
+pub fn snapshot_on_disk(dir: &Path) -> io::Result<SnapshotOnDisk> {
+    let path = dir.join(SNAPSHOT);
+    if !path.exists() {
+        return Ok(SnapshotOnDisk::Absent);
+    }
+    let mut bytes = Vec::new();
+    File::open(path)?.read_to_end(&mut bytes)?;
+    match bincode::deserialize::<Snapshot>(&bytes) {
+        Ok(s) if s.format_version == FORMAT_VERSION => {
+            Ok(SnapshotOnDisk::At { applied_height: s.applied_height })
+        }
+        _ => Ok(SnapshotOnDisk::Unreadable),
+    }
+}
+
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e.to_string())
 }

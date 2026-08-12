@@ -116,6 +116,32 @@ const MAINTAIN_INTERVAL: Duration = Duration::from_millis(DIAL_RETRY_INTERVAL_MS
 /// The persisted address book, under the node's data dir (issue #83 scope 7).
 const ADDRBOOK_FILE: &str = "peers.dat";
 
+/// **How often the run loop writes a snapshot** (issue #359 S2) — the cadence that
+/// makes `snapshot.bin` an invariant instead of an accident.
+///
+/// Before this, the binary had exactly ONE snapshot write: the graceful-shutdown
+/// flush at the bottom of [`RunningNode::run_until_with`]. So a host's snapshot
+/// existed if and only if that host had once been stopped *gracefully*, with the
+/// loop free to observe the flag and the write free to succeed — which SIGKILL, a
+/// wedged loop (#106's 53-minute stall) and a kill during startup replay each
+/// defeat. node3 took that branch twice and paid **4.6 hours of from-genesis
+/// replay**, then could not catch up at all (#359's Wall 2).
+///
+/// **300 s, and the trade is staleness against cost.** The loss window is what a
+/// SIGKILL costs: at the FROZEN 75 s block time, 300 s is **4 blocks** of replay
+/// on the next start — instantaneous next to the 11,751-record replay this exists
+/// to prevent. The cost is one `bincode` serialize + `fsync` + rename of the
+/// derived state per 4 blocks, i.e. under a percent of the work the node already
+/// does per block, and it is paid on the loop, never on the block-application
+/// path. Halving it would buy 2 blocks of window for double the writes; doubling
+/// it starts trading real replay time for a saving nobody measured.
+///
+/// **Testnet-tunable, NOT frozen**: no consensus rule reads it, two nodes running
+/// different values agree on everything, and `--snapshot-interval-secs` overrides
+/// it per host. It is a durability/IO knob in exactly the sense
+/// [`METRICS_REFRESH`] and [`TELEMETRY_REFRESH`] are observability knobs.
+const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(300);
+
 /// How often the `/metrics` snapshot is re-rendered (issue #87). Chosen under a
 /// typical 15 s Prometheus scrape interval so a scrape is never more than one
 /// refresh stale, while the node — not the scraper — sets the cost. Rendering is a
@@ -382,6 +408,23 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     last_sample: Instant,
     /// When the last discovery maintenance pass ran.
     last_maintain: Instant,
+    /// How often [`Self::maintain_snapshot`] may write (issue #359 S2). Defaults
+    /// to [`SNAPSHOT_INTERVAL`]; `--snapshot-interval-secs` overrides it.
+    snapshot_interval: Duration,
+    /// When the snapshot cadence last *fired* — the grid, not the last write: a
+    /// tick that finds nothing to do still costs the interval, so a replaying or
+    /// unchanged node is checked once per interval rather than every iteration.
+    last_snapshot_tick: Instant,
+    /// **What this process believes is in `snapshot.bin`** — seeded by one read at
+    /// startup, then advanced by this process's own writes.
+    ///
+    /// Cached rather than re-read because decoding a snapshot is O(state size) and
+    /// `TELEMETRY`'s `snap=` is printed every 30 s. The cache is exact under the
+    /// one assumption that holds by construction — **this process is the only
+    /// writer of this data dir's snapshot** (one node per data dir; the write is a
+    /// temp-file rename inside it). If something outside the process deletes the
+    /// file, `snap=` says what was last written, not what is on disk.
+    durable_snapshot: qlab_node::SnapshotOnDisk,
     /// Process start, the origin of the monotonic millisecond clock the discovery
     /// policy is driven by.
     started: Instant,
@@ -698,6 +741,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             sample_interval: Duration::from_secs(30),
             last_sample: Instant::now(),
             last_maintain: Instant::now(),
+            snapshot_interval: SNAPSHOT_INTERVAL,
+            last_snapshot_tick: Instant::now(),
+            // Issue #359: one read, at the one moment it is free — the node has
+            // just opened this data dir. A read error here is reported as
+            // `Unreadable` rather than failing the start: a node whose snapshot
+            // cannot be read is still a node, and it is about to write a new one.
+            durable_snapshot: qlab_node::snapshot_on_disk(&config.data_dir)
+                .unwrap_or(qlab_node::SnapshotOnDisk::Unreadable),
             mine_gate_latched: false,
             body_wait: BodyWaitJournal::new(),
             started: Instant::now(),
@@ -815,6 +866,19 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// Override the telemetry sampling cadence (tests / faster soaks).
     pub fn set_sample_interval(&mut self, d: Duration) {
         self.sample_interval = d;
+    }
+
+    /// Override the snapshot cadence (issue #359 S2) — `--snapshot-interval-secs`
+    /// for an operator, `Duration::ZERO` for a test that wants every iteration to
+    /// be a cadence tick. Durability only: no consensus rule reads it.
+    pub fn set_snapshot_interval(&mut self, d: Duration) {
+        self.snapshot_interval = d;
+    }
+
+    /// What this process last wrote to (or read from) `snapshot.bin` — issue #359
+    /// S3, the value behind `TELEMETRY`'s `snap=`.
+    pub fn durable_snapshot(&self) -> qlab_node::SnapshotOnDisk {
+        self.durable_snapshot
     }
 
     /// **The identity of the finalized checkpoint** (issue #84), or `None` when
@@ -1386,8 +1450,42 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // is not a gap size**. The fork point is a chain height, or `-` when the
         // walk returns nothing. Always printed, `0@-` included (the #130 (a) rule).
         let bask = node.ask_set_observation(self.p2p.body_requests(), self.mining).telemetry_field();
+        // Issue #359 S3: `snap=` is **appended at the end**, after `dfinbh=`, under
+        // the same rule as every addition since #87 — every pre-existing field keeps
+        // its name, position and meaning, and the `PRE_I84_FIELDS` prefix test passes
+        // unmodified (the #106 `mready=` precedent). **Touches TELEMETRY.**
+        //
+        // 🔴 **It is the field that turns "does this host have a snapshot" from an
+        // ssh + `ls` into a read of the instrument the operator already has.** On
+        // 2026-08-12 that question decided a day of committee liveness: node3
+        // restarted with no `snapshot.bin`, replayed 11,751 records over 4.6 h, and
+        // then could not close the gap at all — while node0, restarted three minutes
+        // earlier, resumed from a snapshot at height 4,719 and was back in about an
+        // hour. Nothing on this line, on `/metrics`, or in `halt-status` could tell
+        // the two hosts apart *before* the restart, which is the only moment the
+        // answer is worth anything. The OPERATOR §3 standing rule — read snapshot
+        // presence before planning a roll — is now readable from telemetry.
+        //
+        // Three tokens, sharing one vocabulary with `halt-status` so one grep covers
+        // both surfaces: **a height** (a restart resumes there and replays only past
+        // it), **`none`** (no `snapshot.bin` — node3's shape, a from-genesis replay
+        // on the next start), **`bad`** (a snapshot present but undecodable or at a
+        // different `FORMAT_VERSION` — the same full replay, a different cause).
+        // `none` and `bad` are both the alarm; they are kept apart because "a write
+        // never happened" and "a write happened under another format" are different
+        // repairs.
+        //
+        // Caliper: **the applied height in the snapshot this process last wrote or
+        // read**, not a fresh disk read — the decode is O(state size) and this line
+        // prints every 30 s. Seeded by one read at startup and advanced by this
+        // process's own writes (the cadence and the shutdown flush), which is exact
+        // while this process is the data dir's only snapshot writer, and it is. Read
+        // it against `stip=`: `snap=` far below `stip=` is a node whose next restart
+        // replays that difference, and `snap=none` next to any `stip=` at all is the
+        // host a roll must not be planned against.
+        let snap = self.durable_snapshot.field();
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={} unk={}/{} cpq={} dfin={} fdrop={} bask={} dfinbh={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={} unk={}/{} cpq={} dfin={} fdrop={} bask={} dfinbh={} snap={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1415,6 +1513,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             fdrop,
             bask,
             dfinbh,
+            snap,
         )
     }
 
@@ -2238,6 +2337,77 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         self.p2p.node().save_snapshot().map_err(RunError::Node)
     }
 
+    /// **The snapshot cadence** (issue #359 S2) — the loop's periodic write, and
+    /// the reason a host's `snapshot.bin` no longer depends on how its process
+    /// died.
+    ///
+    /// Four conditions, in the order they are cheapest to answer:
+    ///
+    /// 1. **The cadence has come round** ([`SNAPSHOT_INTERVAL`]). The tick is
+    ///    consumed whether or not a write follows, so the checks below cost one
+    ///    evaluation per interval and not one per loop iteration.
+    /// 2. **This node is not replaying.** `state_lag().blocks() == 0` — the #130
+    ///    (a) gap between the state machine's applied tip and fork choice's header
+    ///    tip. The from-genesis replay #359 measured happens inside
+    ///    `qlab_node::Node::open`, *before* this loop exists, so it needs no gate;
+    ///    what this gate covers is the runtime catch-up, where the node is walking
+    ///    historical bodies toward a tip it already knows.
+    ///
+    ///    🔴 **Two consequences worth naming rather than discovering.** A host
+    ///    catching up on a live chain writes nothing for the whole catch-up, so
+    ///    this cadence does **not** rescue node3's own shape — it prevents the
+    ///    *next* node3, by guaranteeing a healthy host carries a snapshot at most
+    ///    one interval old however it dies. And the #200 unobtainable-body
+    ///    exemption pins a healthy mining node at `slag > 0`, where it will also
+    ///    write nothing (`uex=1` on the same line is the tell). A snapshot written
+    ///    at `slag > 0` would be *consistent* either way — [`Self::save_snapshot`]
+    ///    serialises the state machine's own applied chain, not fork choice's — so
+    ///    this gate is the task book's cost/simplicity call, not a correctness
+    ///    one, and it is recorded on issue #359 as a disagreement with grounds.
+    /// 3. **The applied height differs from the durable one.** Idempotence: a
+    ///    quiet node rewrites nothing, which is what keeps the cadence free on a
+    ///    halted or stalled chain. It is `!=` and not `>` deliberately — a rewind
+    ///    lowers the applied height, and a snapshot pinned *above* the applied tip
+    ///    is precisely issue #225's shape (a snapshot its own log cannot honour,
+    ///    which costs a full replay at the next start). An absent or unreadable
+    ///    snapshot has no height and therefore always differs, so node3's shape is
+    ///    repaired on the first tick after it is synced.
+    /// 4. **The write succeeded**, before the cache advances. A failed write leaves
+    ///    `snap=` reporting the older snapshot that is still genuinely on disk —
+    ///    the atomic temp+rename means a failure never destroys the previous one,
+    ///    and issue #145's rule applies here as it does at shutdown: never claim a
+    ///    flush that did not happen.
+    ///
+    /// Not on the hot path: this runs on the loop, between the transport pump and
+    /// the idle sleep, like every other maintenance pass here.
+    fn maintain_snapshot(&mut self) {
+        if self.last_snapshot_tick.elapsed() < self.snapshot_interval {
+            return;
+        }
+        self.last_snapshot_tick = Instant::now();
+        // One read of the one definition of "how far behind is my state machine"
+        // (#130 (a)), shared with the telemetry line — a gate and a published field
+        // that could disagree about the same fact would be two definitions.
+        let lag = self.p2p.node().state_lag();
+        if lag.blocks() != 0 {
+            return;
+        }
+        let applied = lag.state_tip;
+        if self.durable_snapshot.height() == Some(applied) {
+            return;
+        }
+        match self.save_snapshot() {
+            Ok(()) => {
+                self.durable_snapshot = qlab_node::SnapshotOnDisk::At { applied_height: applied };
+            }
+            // Best-effort, exactly like the halt marker: a node that cannot write
+            // its snapshot is still a correct node — the block log is the source of
+            // truth and the next start replays it. Loud, because a host silently
+            // failing this write is a host quietly returning to node3's shape.
+            Err(e) => eprintln!("snapshot cadence write failed: {e}"),
+        }
+    }
+
     /// The event loop: pump the transport, mine on the cadence, and propose
     /// checkpoints, until `shutdown` is set. On exit performs the graceful-shutdown
     /// **snapshot flush** (item 1) and address-book write.
@@ -2338,6 +2508,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 self.maintain_peers(); // re-dial, auto-connect, ask for addresses (#83)
                 self.last_maintain = Instant::now();
             }
+            // Issue #359: the snapshot cadence. Its own interval check lives inside
+            // the method, with the three gates it guards, so the loop reads as one
+            // line and the rule has one home.
+            self.maintain_snapshot();
             // The co-resident hook (#123), last so it observes this iteration's
             // state rather than the previous one's.
             on_tick(self);
@@ -2355,7 +2529,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // them. Returning the snapshot outcome is what lets main not claim a flush
         // that failed.
         let snapshot_ok = match self.save_snapshot() {
-            Ok(()) => true,
+            Ok(()) => {
+                // Issue #359: the shutdown flush is still a snapshot write, so the
+                // cache it advances is the same one the cadence advances — one
+                // record of what is durable, updated wherever it changes.
+                self.durable_snapshot = qlab_node::SnapshotOnDisk::At {
+                    applied_height: self.p2p.node().state_lag().state_tip,
+                };
+                true
+            }
             Err(e) => {
                 eprintln!("snapshot flush on shutdown failed: {e}");
                 false
