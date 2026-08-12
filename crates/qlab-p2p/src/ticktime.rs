@@ -213,6 +213,10 @@ mod tests {
         }
         let per_call = started.elapsed() / N;
         assert!(sink > Duration::ZERO || sink == Duration::ZERO); // keep the loop
+        // Printed, not merely asserted: a bound is not a measurement, and the
+        // cost of this instrumentation is a number the PR has to carry with its
+        // basis rather than describe as "cheap".
+        println!("lap(): {per_call:?} per call, {N} calls, this rig, this build");
         assert!(
             per_call < Duration::from_micros(1),
             "one clock read cost {per_call:?}; the per-frame overhead is three of these, \
