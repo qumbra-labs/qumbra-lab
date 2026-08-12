@@ -330,6 +330,14 @@ pub trait CheckpointIngest {
     /// it. See [`VotesOutcome`].
     fn ingest_checkpoint_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> VotesOutcome;
 
+    /// Every vote-set variant tracked at `height` (checkpoint + accumulated set,
+    /// signer-ascending) — the re-push bridge for issue #362. Defaults to empty:
+    /// only a tally-holding node has anything to re-push, and every other
+    /// implementor keeps compiling unchanged.
+    fn checkpoint_variants_at(&self, _height: u64) -> Vec<(Checkpoint, Vec<Vote>)> {
+        Vec::new()
+    }
+
     /// Ingest a full checkpoint object (the finalized-set serving path). Delegates to
     /// [`Self::ingest_checkpoint_votes`]: a full quorum set finalizes in one call, a
     /// partial set accumulates and reports `insufficient quorum` (without penalty at

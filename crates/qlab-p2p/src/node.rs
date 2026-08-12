@@ -841,6 +841,20 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
     }
 
+    /// Re-push every stored vote-set variant at `slot` to every ready peer
+    /// (issue #362). The growth-gated relay fires once per growth; after
+    /// staggered restarts during a halt each process has fired exactly once —
+    /// usually before its peers reconnected — and the vote islands are stable
+    /// forever. Receiver-side signer-dedup makes repetition harmless, and the
+    /// run loop bounds the cadence. Returns the number of variants pushed.
+    pub fn repush_slot_votes(&mut self, slot: u64) -> usize {
+        let variants = self.node.checkpoint_variants_at(slot);
+        for (cp, votes) in &variants {
+            self.push_checkpoint_votes(cp, votes, None);
+        }
+        variants.len()
+    }
+
     /// Push a `CheckpointVotes` (0x0024) set to every ready peer except `except`
     /// (direct-push relay — the accumulated set converges the mesh to a quorum).
     fn push_checkpoint_votes(&self, cp: &Checkpoint, votes: &[Vote], except: Option<PeerId>) {
