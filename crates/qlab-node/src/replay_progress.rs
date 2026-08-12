@@ -29,6 +29,7 @@
 //! final `RECOVERY` line still reports records that actually advanced state.
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -41,6 +42,50 @@ pub const REPLAY_PROGRESS_EVERY_SECS: u64 = 15;
 /// Optional capture sink for tests. When set, every emitted line is also pushed
 /// here (and still printed to stdout, matching the operator path).
 static CAPTURE: Mutex<Option<Vec<String>>> = Mutex::new(None);
+
+/// The live walk position, published for readers that must answer **while
+/// `Node::open` is still running** (lab #365).
+///
+/// `LIVE_TOTAL == 0` means no replay is in flight — the same encoding
+/// [`ReplayProgress::start`] already uses to mean "nothing to walk", so there is
+/// no third state to keep consistent.
+///
+/// Why a process global rather than a handle threaded through `open`: the reader
+/// is a *different thread* that exists before `open` is called and must answer
+/// requests while it blocks. Passing a channel down would mean `Node::open` grows
+/// an observability parameter every caller has to thread, for a value that is
+/// already a single-writer counter. Writes are `Relaxed` — the reader wants a
+/// recent number, not a synchronised one, and `tick` already pays for an
+/// `Instant::elapsed` on every record.
+static LIVE_PROCESSED: AtomicU64 = AtomicU64::new(0);
+static LIVE_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// How far a replay currently in flight has walked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayPosition {
+    pub processed: u64,
+    pub total: u64,
+}
+
+impl ReplayPosition {
+    /// Walk position as whole percent, floored. `0` when the total is unknown.
+    pub fn percent(&self) -> u64 {
+        self.processed.saturating_mul(100).checked_div(self.total).unwrap_or(0)
+    }
+}
+
+/// The position of the replay in flight, or `None` when none is running.
+///
+/// **`None` does not mean "the node is up"** — it means no walk is in progress,
+/// which is equally true before `open` starts and after it returns. The caller
+/// owns that distinction; here it would be a guess.
+pub fn live_replay_position() -> Option<ReplayPosition> {
+    let total = LIVE_TOTAL.load(Ordering::Relaxed);
+    if total == 0 {
+        return None;
+    }
+    Some(ReplayPosition { processed: LIVE_PROCESSED.load(Ordering::Relaxed), total })
+}
 
 /// Serialises [`with_progress_capture`] so parallel test threads cannot steal
 /// each other's lines from the process-global sink.
@@ -109,6 +154,10 @@ impl ReplayProgress {
         if total > 0 {
             emit(format!("RECOVERY replaying {total} records {context}"));
         }
+        // Publish before the first record is walked, so a reader that arrives
+        // during the slowest part of startup sees `0/total` rather than nothing.
+        LIVE_PROCESSED.store(0, Ordering::Relaxed);
+        LIVE_TOTAL.store(total as u64, Ordering::Relaxed);
         Self {
             total,
             processed: 0,
@@ -123,6 +172,7 @@ impl ReplayProgress {
             return;
         }
         self.processed += 1;
+        LIVE_PROCESSED.store(self.processed as u64, Ordering::Relaxed);
         let by_count =
             self.processed.saturating_sub(self.last_emit_processed) >= REPLAY_PROGRESS_EVERY_RECORDS;
         let by_time = self.last_emit_at.elapsed().as_secs() >= REPLAY_PROGRESS_EVERY_SECS;
@@ -154,9 +204,50 @@ impl ReplayProgress {
     }
 }
 
+/// Retire the live position when the walk ends — including when it ends by `?`
+/// on a mid-replay error, which is exactly when a reader must not be left
+/// looking at a frozen percentage forever.
+impl Drop for ReplayProgress {
+    fn drop(&mut self) {
+        LIVE_TOTAL.store(0, Ordering::Relaxed);
+        LIVE_PROCESSED.store(0, Ordering::Relaxed);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lab #365: the live position is what a surface bound *before* `Node::open`
+    /// renders, so it must be published from the first record and retired when the
+    /// walk ends — including on the error path, where a frozen percentage would
+    /// outlive the process it described.
+    #[test]
+    fn the_live_position_tracks_the_walk_and_is_retired_after_it() {
+        let (_, _lines) = with_progress_capture(|| {
+            assert_eq!(live_replay_position(), None, "nothing in flight before start");
+
+            let mut p = ReplayProgress::start(4, "from genesis");
+            assert_eq!(
+                live_replay_position(),
+                Some(ReplayPosition { processed: 0, total: 4 }),
+                "published before the first record, not after it"
+            );
+            p.tick();
+            p.tick();
+            let at_half = live_replay_position().expect("in flight");
+            assert_eq!(at_half, ReplayPosition { processed: 2, total: 4 });
+            assert_eq!(at_half.percent(), 50);
+
+            drop(p);
+            assert_eq!(live_replay_position(), None, "retired when the walk ends");
+
+            // A zero-record resume never claims to be in flight.
+            let p0 = ReplayProgress::start(0, "from genesis");
+            assert_eq!(live_replay_position(), None);
+            drop(p0);
+        });
+    }
 
     #[test]
     fn zero_total_emits_nothing() {

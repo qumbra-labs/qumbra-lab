@@ -303,12 +303,14 @@ impl FaucetService {
     /// address), because that is the `rkm` the node was told to pay.
     pub fn new(faucet: Faucet, wallet: Wallet, d: Diversifier) -> FaucetService {
         let status = ServiceStatus {
-            // Nothing sampled yet: both views at genesis, so the page shows a zero
-            // gap rather than a fabricated one before the first `refresh_status`.
-            chain: qlab_node::StateLag::default(),
+            // Nothing sampled yet, and the page must say so rather than render two
+            // zeroes that read as "current" (lab #365).
+            chain: None,
             finalized_height: None,
             peers: 0,
-            availability: Availability::ColdChain,
+            // The honest first state: the process is up, the node is not. This is
+            // what the listener serves while `RunningNode::start` replays.
+            availability: Availability::Starting { replayed: 0, total: 0 },
             queued: 0,
             queue_capacity: faucet.queue().capacity(),
             wait_blocks: 1,
@@ -531,7 +533,7 @@ impl FaucetService {
             // `chain.state_tip` is the same `MemNode::tip_height()` this `view`
             // reads — `RunningNode::state()` and `state_lag()`'s left operand are
             // one object — so the two are not two samples that could disagree.
-            chain: node.chain_views(),
+            chain: Some(node.chain_views()),
             finalized_height: view.finalized_height(),
             peers: node.peers(),
             availability,
@@ -552,6 +554,31 @@ impl FaucetService {
         if let Ok(mut slot) = self.status.lock() {
             *slot = next;
         }
+    }
+}
+
+/// Publish the `Starting` state onto a shared snapshot while the node is still
+/// opening (lab #365).
+///
+/// A free function over the `Arc`, not a `FaucetService` method, because the one
+/// caller is a thread that runs *while the main thread is inside
+/// `RunningNode::start`* and therefore cannot hold the service. It is the single
+/// place that turns a replay position into an [`Availability`], so the page and
+/// `qlab_node`'s own progress line cannot drift apart.
+///
+/// `position: None` means no walk is in flight — before the node returns that is
+/// "opening, size not yet published", never "done"; the caller owns that
+/// distinction and this function does not guess it.
+pub fn publish_starting(
+    status: &Arc<Mutex<ServiceStatus>>,
+    position: Option<qlab_node::ReplayPosition>,
+) {
+    let (replayed, total) = match position {
+        Some(p) => (p.processed, p.total),
+        None => (0, 0),
+    };
+    if let Ok(mut slot) = status.lock() {
+        slot.availability = Availability::Starting { replayed, total };
     }
 }
 
