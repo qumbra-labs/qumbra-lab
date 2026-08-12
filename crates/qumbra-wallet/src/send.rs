@@ -405,6 +405,22 @@ mod tests {
         assert_eq!(art.entry.public.commitments.len(), 2);
         assert_eq!(art.entry.public.bucket, ArityBucket::TwoByTwo);
         assert!(!art.wire_bytes.is_empty());
+        // The proof itself is randomized inside the prover — the caller's
+        // seeded RNG does not reach it — so a full-wire golden would be a
+        // permanently-red test. Blank only that opaque field and lock every
+        // deterministic byte the spend split is capable of moving: public
+        // surface, discovery ciphertexts/payloads, and canonical field order.
+        let mut stable_entry = art.entry.clone();
+        stable_entry.proof.clear();
+        assert_eq!(
+            qlab_devnet::hash::keccak256(&qlab_p2p::codec::encode_tx(&stable_entry)),
+            [
+                0x36, 0x7c, 0xd3, 0xfe, 0xfb, 0xf5, 0x7d, 0x37, 0x21, 0xf0, 0x1a, 0x45, 0xc6,
+                0x2e, 0xaa, 0x37, 0xb1, 0xdc, 0xc1, 0xd5, 0xe4, 0x3a, 0x0c, 0x1b, 0xf7, 0x58,
+                0x80, 0x79, 0x6f, 0x20, 0xe5, 0x34,
+            ],
+            "the deterministic wire shell is the pre-split golden",
+        );
 
         // 🔴 The proof must verify against the DECLARED surface — exactly what
         // `qumbra_node::verifier` reconstructs on the wire path: PVs from the
