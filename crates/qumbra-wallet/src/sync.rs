@@ -248,8 +248,8 @@ impl std::fmt::Debug for SyncedTree {
 }
 
 /// A leaf count whose reconstructed root the node serves as a valid anchor.
-/// This `(tree, count)` pair is exactly what [`crate::send::build_send`] takes
-/// — the caller-owned correspondence its docs name, now actually established.
+/// This `(tree, count)` pair is exactly what [`crate::spend::select`] turns into
+/// a witness bundle — the caller-owned correspondence, now actually established.
 #[derive(Clone, Debug)]
 pub struct VerifiedAnchor {
     /// The leaf count to build the witness at (`anchor_count`).

@@ -68,12 +68,11 @@ use qumbra_node::discovery_server::{
 };
 use qumbra_node::verifier::ConsensusVerifier;
 use qumbra_wallet::history::{self, AddressScan, Event, Outgoing};
-use qumbra_wallet::net::{
-    submit_tx, HttpAnchorSource, HttpLeafSource, HttpNullifierSource, SubmitClass,
-};
-use qumbra_wallet::send::{build_send, Spendable};
+use qumbra_wallet::net::{HttpAnchorSource, HttpLeafSource, HttpNullifierSource, SubmitClass};
+use qumbra_wallet::spend::{preflight, prove, select, submit, SendRequest};
 use qumbra_wallet::sends::SendRecord;
 use qumbra_wallet::spent::{fetch_spent, note_nullifier, subtract_spent};
+use qumbra_wallet::store::WalletDir;
 use qumbra_wallet::sync::sync_and_select;
 use qumbra_wallet::view::SpentCoverage;
 use rand::rngs::StdRng;
@@ -196,7 +195,8 @@ fn a_first_spend_travels_the_whole_story_and_the_recipient_detects_it() {
     }
 
     // ---- the faucet funds the sender: a REAL grant, admitted and mined ----
-    let sender = Wallet::from_master_seed(&MasterSeed::from_entropy([21u8; 32]), 0);
+    let sender_seed = MasterSeed::from_entropy([21u8; 32]);
+    let sender = Wallet::from_master_seed(&sender_seed, 0);
     let sender_addr = sender.address_at_index(0);
     let recipient_wallet = Wallet::from_master_seed(&MasterSeed::from_entropy([22u8; 32]), 0);
     let recipient_addr = recipient_wallet.address_at_index(0);
@@ -259,17 +259,6 @@ fn a_first_spend_travels_the_whole_story_and_the_recipient_detects_it() {
     assert_eq!(found.notes.len(), 1, "the sender detects exactly the grant");
     assert_eq!(found.notes[0].detected.note.value, DEFAULT_GRANT_BESSEL);
     assert_eq!(found.notes[0].at().height, grant_height, "…where it was mined");
-    let spendables: Vec<Spendable> = found
-        .notes
-        .iter()
-        .map(|ln| Spendable {
-            div_index: 0,
-            value: ln.detected.note.value,
-            rho: ln.detected.note.rho,
-            rseed: ln.detected.note.rseed,
-        })
-        .collect();
-
     // ---- SYNC over GET /v1/tree/leaves, ANCHOR over GET /v1/anchors -------
     let wallet_dir = tmp("first_spend");
     let (synced, anchor) = sync_and_select(
@@ -315,17 +304,23 @@ fn a_first_spend_travels_the_whole_story_and_the_recipient_detects_it() {
         );
     }
 
-    // ---- build_send: unchanged, wired — one real prove --------------------
-    let art = build_send(
-        &sender,
-        &spendables,
-        &recipient_addr,
-        AMOUNT,
-        &synced.tree,
-        anchor.count,
-        &mut rng,
-    )
-    .expect("the wired path builds and proves");
+    // ---- select → prove: the serializable host seam, one real prove -------
+    WalletDir::create(&wallet_dir, sender_seed).expect("the sender wallet dir exists");
+    let req = SendRequest {
+        dir: &wallet_dir,
+        url: &base,
+        node_url: &node_url,
+        recipient: &recipient_addr,
+        contact_name: None,
+        amount: AMOUNT,
+        scan_to: tip.height,
+        no_submit: false,
+    };
+    let mut ignore = |_| {};
+    let bundle = select(&req, &mut ignore).expect("phase 1 selects and serializes a witness");
+    assert_eq!(bundle.anchor(), anchor.root, "the callable phase uses the same finalized anchor");
+    let current = preflight(&req).expect("fresh public chain facts are available");
+    let art = prove(&bundle, &current, &mut ignore).expect("the host phase proves from the bundle");
     assert!(art.used_dummy, "one grant note ⇒ the #219 dummy slot");
     assert_eq!(art.change_value, DEFAULT_GRANT_BESSEL - AMOUNT - art.fee);
 
@@ -334,7 +329,7 @@ fn a_first_spend_travels_the_whole_story_and_the_recipient_detects_it() {
     // thread while this one plays the run loop and drains the queue.
     let wire = art.wire_bytes.clone();
     let submit_url = node_url.clone();
-    let client = std::thread::spawn(move || submit_tx(&submit_url, &wire));
+    let client = std::thread::spawn(move || submit(&submit_url, &wire, &mut |_| {}));
 
     let request = submit_rx.recv().expect("the submission reaches the queue");
     let verdict = {

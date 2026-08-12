@@ -1,9 +1,17 @@
-//! The whole spend, as one flow — scan, select, sync, prove, record, submit.
+//! The spend flow, split at the one safe handoff: select → prove → submit.
+//!
+//! [`select`] owns the wallet/network work through finalized-anchor selection
+//! and produces a versioned [`crate::bundle::WitnessBundle`]. [`prove`] consumes
+//! that bundle plus freshly decoded public chain facts; it has no wallet dir,
+//! network, RNG or second key source. [`submit`] accepts canonical wire bytes and
+//! returns the node's typed answer. [`execute`] remains the CLI/desktop surface
+//! and is exactly their composition, with the local send record kept before the
+//! socket as required below.
 //!
 //! # Why this is separate from [`crate::send`]
 //!
-//! [`crate::send::build_send`] is the **builder**: notes and a tree in, a proved
-//! artifact out, no sockets. This module is the **flow** around it, and it is the
+//! [`crate::send`] is the **builder/prover core**: selected notes and a tree in,
+//! then a proved artifact out, no sockets. This module is the **flow** around it, and it is the
 //! part that touches the network, the local send log, and the clock. Keeping them
 //! apart keeps `send.rs` free of transport, which is the same boundary
 //! `qlab-cbserver` keeps for a harder reason.
@@ -47,13 +55,14 @@ use std::path::Path;
 use qlab_cbserver::client::{light_client_scan_with, Completeness, ScanConfig, ScanOutcome};
 use qlab_wallet::address::Address;
 
+use crate::bundle::WitnessBundle;
 use crate::net::{
     self, HttpAnchorSource, HttpLeafSource, HttpNullifierSource, SubmitAnswer, SubmitClass,
 };
-use crate::send::{build_send, os_rng, Spendable};
-use crate::spent::{fetch_spent, subtract_spent};
+use crate::send::{os_rng, prove_bundle, SendArtifact, Spendable};
+use crate::spent::{fetch_spent, subtract_spent, SpentSet};
 use crate::store::WalletDir;
-use crate::sync::{hex32, sync_and_select};
+use crate::sync::{hex32, sync_and_select, AnchorSource, Anchors};
 
 /// What the caller asked for. Separate from the flow so a surface can validate
 /// and present a request before anything touches the network.
@@ -90,10 +99,16 @@ pub struct SendRequest<'a> {
 #[derive(Debug, Clone)]
 pub enum SendStep {
     /// The recipient, resolved. Carries the contact name when there was one.
-    Resolved { recipient_short: String, contact: Option<String> },
+    Resolved {
+        recipient_short: String,
+        contact: Option<String>,
+    },
     /// Input selection finished. `skipped_spent` is notes this wallet owns whose
     /// nullifiers are already on the chain — reported, not silently dropped.
-    Selected { spendable: usize, skipped_spent: usize },
+    Selected {
+        spendable: usize,
+        skipped_spent: usize,
+    },
     /// The local tree caught up and an anchor was chosen.
     Tree {
         held: u64,
@@ -108,7 +123,13 @@ pub enum SendStep {
     },
     /// About to prove. **Seconds and gigabytes**; say so.
     Proving,
-    Built { amount: u64, fee: u64, change: u64, prove_secs: f64, used_dummy: bool },
+    Built {
+        amount: u64,
+        fee: u64,
+        change: u64,
+        prove_secs: f64,
+        used_dummy: bool,
+    },
     /// The local record went in — before the socket, per the module docs.
     Recorded,
     /// Something that must be SEEN but must not stop the spend. The money matters
@@ -116,7 +137,10 @@ pub enum SendStep {
     Warning(String),
     Submitting,
     /// The node's answer, verbatim. The refusal vocabulary is the node's to own.
-    Answered { status: u16, body: String },
+    Answered {
+        status: u16,
+        body: String,
+    },
 }
 
 /// A spend that got far enough to have bytes.
@@ -147,7 +171,12 @@ pub enum SendError {
     /// The proof was made and the POST did not complete.
     Incomplete { why: String, wire_bytes: Vec<u8> },
     /// The node answered, and the answer was not an acceptance.
-    Answered { class: SubmitClass, status: u16, body: String, wire_bytes: Vec<u8> },
+    Answered {
+        class: SubmitClass,
+        status: u16,
+        body: String,
+        wire_bytes: Vec<u8>,
+    },
 }
 
 impl std::fmt::Display for SendError {
@@ -162,22 +191,29 @@ impl std::fmt::Display for SendError {
 
 impl std::error::Error for SendError {}
 
-/// Build and (unless refused, and unless `no_submit`) submit a spend, reporting
-/// progress through `on`.
-///
-/// Every early return before [`SendStep::Proving`] is a **cheap** refusal, and
-/// that is the design: the expensive thing happens only once the wallet knows it
-/// is spending notes the chain still has.
-pub fn execute(
+/// Phase 1: scan, subtract spent notes, select inputs, sync the tree and choose
+/// a finalized anchor. The returned artifact is the complete prover handoff.
+pub fn select(
     req: &SendRequest<'_>,
     on: &mut dyn FnMut(SendStep),
-) -> Result<SendOutcome, SendError> {
+) -> Result<WitnessBundle, SendError> {
     let w = WalletDir::open(req.dir).map_err(|e| SendError::Refused(e.to_string()))?;
     let wallet = w.wallet();
     let mut rng = os_rng();
 
+    select_with_rng(req, on, &w, &wallet, &mut rng)
+}
+
+fn select_with_rng(
+    req: &SendRequest<'_>,
+    on: &mut dyn FnMut(SendStep),
+    w: &WalletDir,
+    wallet: &qlab_wallet::Wallet,
+    rng: &mut rand::rngs::StdRng,
+) -> Result<WitnessBundle, SendError> {
+    let recipient_short = req.recipient.short().encode();
     on(SendStep::Resolved {
-        recipient_short: req.recipient.short().encode(),
+        recipient_short: recipient_short.clone(),
         contact: req.contact_name.map(str::to_string),
     });
 
@@ -194,7 +230,7 @@ pub fn execute(
             0,
             req.scan_to,
             ScanConfig::default(),
-            &mut rng,
+            rng,
         )
         .map_err(|e| SendError::Refused(format!("scan never started for index {idx}: {e}")))?;
         match outcome.completeness() {
@@ -217,7 +253,8 @@ pub fn execute(
     // guessing: a spend built on "I could not check" is exactly that wasted proof.
     let outputs =
         crate::scan::widest_range(scanned.iter().map(|(_, o)| o.stats.compact_range_served));
-    let spent_set = fetch_spent(&HttpNullifierSource::new(req.url), 0, req.scan_to).map_err(|e| {
+    let spent_set =
+        fetch_spent(&HttpNullifierSource::new(req.url), 0, req.scan_to).map_err(|e| {
         SendError::Refused(format!(
             "{e} — refusing to select inputs this wallet may already have spent"
         ))
@@ -242,7 +279,10 @@ pub fn execute(
             });
         }
     }
-    on(SendStep::Selected { spendable: spendables.len(), skipped_spent: skipped });
+    on(SendStep::Selected {
+        spendable: spendables.len(),
+        skipped_spent: skipped,
+    });
 
     if spendables.is_empty() {
         return Err(SendError::Refused(format!(
@@ -272,25 +312,130 @@ pub fn execute(
         anchor_behind: anchor.leaves_behind_local,
     });
 
-    on(SendStep::Proving);
-    let art = crate::send::build_send_with_rider(
+    crate::send::build_bundle(
         &wallet,
         &spendables,
         req.recipient,
         req.amount,
         &synced.tree,
         anchor.count,
-        &mut rng,
+        anchor.tip_height,
+        recipient_short,
+        outputs,
+        spent_set.covered,
         req.name_op,
+        rng,
     )
+    .map_err(SendError::Refused)
+}
+
+/// Fresh public chain facts supplied to the pure prover phase. Fetching them is
+/// outside [`prove`]: the host receives values, never a URL or a socket.
+pub struct ProveContext {
+    pub anchors: Anchors,
+    pub spent: SpentSet,
+}
+
+/// Fetch the phase-2 preflight facts used by [`execute`]. A browser extension
+/// may obtain and decode the same two public surfaces itself, then pass the
+/// resulting values across its native boundary with the bundle.
+pub fn preflight(req: &SendRequest<'_>) -> Result<ProveContext, SendError> {
+    let anchors = HttpAnchorSource::new(req.node_url)
+        .anchors()
+        .map_err(|e| SendError::Refused(format!("anchor-preflight-unavailable: {e}")))?;
+    let spent = fetch_spent(&HttpNullifierSource::new(req.url), 0, anchors.tip_height).map_err(|e| {
+        SendError::Refused(format!(
+            "nullifier-preflight-unavailable: {e} — refusing to prove inputs the chain may already have consumed"
+        ))
+    })?;
+    Ok(ProveContext { anchors, spent })
+}
+
+/// Phase 2: current-state preflight followed by the real STARK. No wallet dir,
+/// network handle, RNG, or key source is reachable here; all witness/key bytes
+/// come from `bundle`, and current chain state arrives as decoded public data.
+pub fn prove(
+    bundle: &WitnessBundle,
+    current: &ProveContext,
+    on: &mut dyn FnMut(SendStep),
+) -> Result<SendArtifact, SendError> {
+    bundle
+        .validate()
     .map_err(|e| SendError::Refused(e.to_string()))?;
+    if !current.anchors.roots.contains(&bundle.anchor()) {
+        return Err(SendError::Refused(format!(
+            "anchor-no-longer-accepted: bundle anchor {} selected at tip {} is absent from the node's current valid-anchor set at tip {}",
+            hex32(&bundle.anchor()),
+            bundle.selected_at_tip(),
+            current.anchors.tip_height,
+        )));
+    }
+    let outputs = bundle.output_range().ok_or_else(|| {
+        SendError::Refused(
+            "witness-bundle-nullifier-coverage-missing: no scan output range was recorded".into(),
+        )
+    })?;
+    let current_range = Some((outputs.0, current.anchors.tip_height.max(outputs.1)));
+    current.spent.covers_outputs(current_range).map_err(|e| {
+        SendError::Refused(format!(
+            "nullifier-preflight-not-covered: {e} — refusing to prove inputs the chain may already have consumed"
+        ))
+    })?;
+    for nf in bundle.real_nullifiers() {
+        if current.spent.contains(&nf) {
+            return Err(SendError::Refused(format!(
+                "bundle-input-already-spent: selected nullifier {} is now on chain; refusing before proof",
+                hex32(&nf),
+            )));
+        }
+    }
+
+    on(SendStep::Proving);
+    let art = prove_bundle(bundle).map_err(SendError::Refused)?;
     on(SendStep::Built {
-        amount: req.amount,
+        amount: bundle.amount(),
         fee: art.fee,
         change: art.change_value,
         prove_secs: art.prove_secs,
         used_dummy: art.used_dummy,
     });
+    Ok(art)
+}
+
+/// Phase 3: canonical transaction bytes in, the node's typed answer out. A
+/// `duplicate` remains [`SubmitClass::Duplicate`] rather than being collapsed
+/// into a generic success or error.
+pub fn submit(
+    node_url: &str,
+    wire_bytes: &[u8],
+    on: &mut dyn FnMut(SendStep),
+) -> Result<SubmitAnswer, SendError> {
+    on(SendStep::Submitting);
+    let answer = net::submit_tx(node_url, wire_bytes).map_err(|e| SendError::Incomplete {
+        why: format!(
+            "POST /v1/tx never completed ({e}). This is NOT a refusal — the transaction may \
+             have landed. Resubmit the SAME bytes: an already-pending transaction answers \
+             `duplicate`, which is safe."
+        ),
+        wire_bytes: wire_bytes.to_vec(),
+    })?;
+    on(SendStep::Answered {
+        status: answer.status,
+        body: answer.body.clone(),
+    });
+    Ok(answer)
+}
+
+/// The original CLI/desktop surface, now exactly the composition of the three
+/// callable phases above. Every early return before [`SendStep::Proving`] is a
+/// cheap named refusal.
+pub fn execute(
+    req: &SendRequest<'_>,
+    on: &mut dyn FnMut(SendStep),
+) -> Result<SendOutcome, SendError> {
+    let bundle = select(req, on)?;
+    let current = preflight(req)?;
+    let art = prove(&bundle, &current, on)?;
 
     let outcome = |answer| SendOutcome {
         wire_bytes: art.wire_bytes.clone(),
@@ -308,9 +453,9 @@ pub fn execute(
     // ---- 🔴 The local record, written BEFORE the socket. See the module docs.
     let record = crate::sends::SendRecord::declared(
         &art.entry.public,
-        anchor.tip_height,
-        req.amount,
-        req.recipient.short().encode(),
+        bundle.selected_at_tip(),
+        bundle.amount(),
+        bundle.recipient_short().to_string(),
     );
     match crate::sends::SendLog::append(req.dir, &record) {
         Ok(()) => on(SendStep::Recorded),
@@ -320,18 +465,7 @@ pub fn execute(
         ))),
     }
 
-    on(SendStep::Submitting);
-    let answer = net::submit_tx(req.node_url, &art.wire_bytes).map_err(|e| {
-        SendError::Incomplete {
-            why: format!(
-                "POST /v1/tx never completed ({e}). This is NOT a refusal — the transaction may \
-                 have landed. Resubmit the SAME bytes: an already-pending transaction answers \
-                 `duplicate`, which is safe."
-            ),
-            wire_bytes: art.wire_bytes.clone(),
-        }
-    })?;
-    on(SendStep::Answered { status: answer.status, body: answer.body.clone() });
+    let answer = submit(req.node_url, &art.wire_bytes, on)?;
 
     // The cross-check the local derivation earns: a node naming a different
     // statement id means the record just written points at a transaction nobody
@@ -356,5 +490,164 @@ pub fn execute(
             body: answer.body,
             wire_bytes: art.wire_bytes,
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    use qlab_air::narrow::derive_input;
+    use qlab_cbserver::tree::CommitmentTree;
+    use qlab_wallet::seed::MasterSeed;
+    use qlab_wallet::Wallet;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    fn bundle() -> WitnessBundle {
+        let wallet = Wallet::from_master_seed(&MasterSeed::from_entropy([0x41; 32]), 0);
+        let recipient =
+            Wallet::from_master_seed(&MasterSeed::from_entropy([0x42; 32]), 0).address_at_index(0);
+        let note = Spendable {
+            div_index: 0,
+            value: 10_000_000,
+            rho: [7; 4],
+            rseed: [9; 4],
+        };
+        let input = wallet.spend_input(
+            note.value,
+            note.rho,
+            note.rseed,
+            wallet.diversifier_at_index(0),
+        );
+        let mut tree = CommitmentTree::new();
+        tree.append(derive_input(&input).2);
+        crate::send::build_bundle(
+            &wallet,
+            &[note],
+            &recipient,
+            4_000_000,
+            &tree,
+            tree.len(),
+            9,
+            recipient.short().encode(),
+            Some((2, 9)),
+            Some((0, 9)),
+            None,
+            &mut StdRng::seed_from_u64(0x351),
+        )
+        .expect("valid bundle")
+    }
+
+    fn context(bundle: &WitnessBundle, accepted: bool, spent_nfs: Vec<[u8; 32]>) -> ProveContext {
+        ProveContext {
+            anchors: Anchors {
+                tip_height: 9,
+                finalized_height: Some(8),
+                max_age_blocks: 64,
+                roots: vec![if accepted {
+                    bundle.anchor()
+                } else {
+                    [0xA5; 32]
+                }],
+            },
+            spent: SpentSet::from_parts(Some((0, 9)), spent_nfs.into_iter().map(|nf| (9, nf))),
+        }
+    }
+
+    /// Hazard (a): the freshness data is an argument, not a network call in
+    /// phase 2, and the named refusal happens before the Proving event.
+    #[test]
+    fn stale_anchor_is_refused_by_name_before_proving() {
+        let bundle = bundle();
+        let mut steps = Vec::new();
+        let err = prove(&bundle, &context(&bundle, false, Vec::new()), &mut |s| {
+            steps.push(s)
+        })
+        .err()
+        .expect("stale anchor refuses");
+        assert!(
+            err.to_string().contains("anchor-no-longer-accepted"),
+            "{err}"
+        );
+        assert!(!steps.iter().any(|s| matches!(s, SendStep::Proving)));
+    }
+
+    /// The delayed-bundle form of hazard (c): even a once-valid selection is
+    /// cheap-refused when a selected real nullifier appears before proving.
+    #[test]
+    fn bundle_whose_selected_note_was_consumed_since_selection_refuses_before_proving() {
+        let bundle = bundle();
+        let nfs = bundle.real_nullifiers();
+        let mut steps = Vec::new();
+        let err = prove(&bundle, &context(&bundle, true, nfs), &mut |s| {
+            steps.push(s)
+        })
+        .err()
+        .expect("consumed input refuses");
+        assert!(
+            err.to_string().contains("bundle-input-already-spent"),
+            "{err}"
+        );
+        assert!(!steps.iter().any(|s| matches!(s, SendStep::Proving)));
+    }
+
+    /// Hazard (b): retrying the SAME bytes carries the node's `duplicate`
+    /// vocabulary through the public phase-3 seam without flattening it.
+    #[test]
+    fn replaying_same_bundle_preserves_duplicate_vocabulary_end_to_end() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (status, body) in [(202, "accepted 010203"), (200, "duplicate 010203")] {
+                let (mut stream, _) = listener.accept().unwrap();
+                read_http_request(&mut stream);
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+
+        let wire = [0x51, 0x35, 0x31];
+        let first = submit(&base, &wire, &mut |_| {}).expect("first answer arrives");
+        let replay = submit(&base, &wire, &mut |_| {}).expect("replay answer arrives");
+        server.join().unwrap();
+        assert_eq!(first.class(), SubmitClass::Accepted);
+        assert_eq!(replay.class(), SubmitClass::Duplicate);
+        assert_eq!(replay.status, 200);
+        assert_eq!(
+            replay.body, "duplicate 010203",
+            "the node's vocabulary is verbatim"
+        );
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).unwrap();
+            assert!(n > 0, "client closed before its request completed");
+            bytes.extend_from_slice(&chunk[..n]);
+            let Some(header_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&bytes[..header_end]);
+            let content_len = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if bytes.len() >= header_end + 4 + content_len {
+                return;
+            }
+        }
     }
 }
