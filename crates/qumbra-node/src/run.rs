@@ -121,6 +121,11 @@ const ADDRBOOK_FILE: &str = "peers.dat";
 /// refresh stale, while the node — not the scraper — sets the cost. Rendering is a
 /// few dozen string appends over integer state; the run loop pays it, never a
 /// request handler. Observability only: it changes nothing but snapshot freshness.
+/// #362: how often a halted-unfinalized node re-pushes its stored boundary
+/// vote variants. Slow enough to be negligible traffic, fast enough that the
+/// island-merge cascade completes within a couple of minutes of connectivity.
+const BOUNDARY_REPUSH_INTERVAL: Duration = Duration::from_secs(60);
+
 const METRICS_REFRESH: Duration = Duration::from_secs(5);
 
 /// How often the `/v1/telemetry` snapshot is re-rendered (issue #117).
@@ -293,6 +298,8 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// tests set it to zero and drive [`Self::try_mine`] directly).
     mine_interval: Duration,
     last_mine: Instant,
+    /// #362: last boundary vote re-push, bounded to BOUNDARY_REPUSH_INTERVAL.
+    last_boundary_repush: Instant,
     /// Nonce salt for successive `BlockAnnounce`s.
     nonce: u64,
     /// Next checkpoint height to propose (cadence grid; only if we hold keys).
@@ -661,6 +668,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             mining: config.mining,
             mine_interval: Duration::from_secs(genesis.frozen.block_time_secs),
             last_mine: Instant::now(),
+            last_boundary_repush: Instant::now(),
             nonce: 0,
             next_checkpoint: 0, // finalize genesis first, then the cadence grid
             // The ledger's cursor starts at the first cadence slot: genesis is
@@ -2160,6 +2168,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         if let Some(h) = self.halt_at() {
             if self.tip_height() >= h && self.finalized_height() < Some(h) {
                 self.try_checkpoint();
+                // #362: signing alone is not enough. The relay is growth-gated
+                // and each restarted process fires its ONE push before its
+                // peers have reconnected, so quorum-worth of existing
+                // signatures can sit in disconnected islands forever (measured
+                // live at the 8,640 halt: 16 of 21 keys signed, no tally ever
+                // held 15). Re-push the stored variants on a slow cadence;
+                // receiver-side signer-dedup makes repetition harmless, and
+                // the halted-unfinalized condition dissolves at finalization.
+                if self.last_boundary_repush.elapsed() >= BOUNDARY_REPUSH_INTERVAL {
+                    let n = self.p2p.repush_slot_votes(h);
+                    if n > 0 {
+                        println!("REPUSH slot={h} variants={n} why=boundary-unfinalized");
+                    }
+                    self.last_boundary_repush = Instant::now();
+                }
             }
         }
     }

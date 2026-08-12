@@ -184,6 +184,19 @@ impl VoteTally {
         self.slots.len()
     }
 
+    /// Every variant tracked at `height`, each with its full accumulated vote set
+    /// (signer-ascending — the exact shape the relay pushes). The re-push bridge
+    /// for issue #362: after staggered restarts during a halt, the growth-gated
+    /// relay has nothing left to trigger it, and these stored sets are the only
+    /// way quorum-worth of existing signatures can ever meet in one tally.
+    pub fn variants_at(&self, height: u64) -> Vec<(Checkpoint, Vec<Vote>)> {
+        self.slots.get(&height).map_or_else(Vec::new, |vs| {
+            vs.iter()
+                .map(|v| (v.cp.clone(), v.votes.values().cloned().collect()))
+                .collect()
+        })
+    }
+
     /// Distinct accumulated signers for the exact checkpoint `cp` (test hook).
     pub fn total_for(&self, cp: &Checkpoint) -> usize {
         self.slots
@@ -206,6 +219,30 @@ mod tests {
     /// verify but the votes must be well-formed `Vote`s).
     fn votes(vals: &[Validator], c: &Checkpoint, idxs: &[usize]) -> Vec<Vote> {
         idxs.iter().map(|&i| vals[i].sign_checkpoint(c)).collect()
+    }
+
+    /// #362: the repush bridge reads back EVERY stored variant with its full
+    /// accumulated set — both variants of a contested slot, votes intact — so a
+    /// halted node can put quorum-worth of island-stranded signatures back on
+    /// the wire. (The live 8,640 halt had 16 of 21 keys signed across four
+    /// processes and no tally ever holding 15.)
+    #[test]
+    fn variants_at_returns_every_stored_set_for_the_repush_bridge() {
+        let (_c, vals) = devnet_committee(21);
+        let mut t = VoteTally::new();
+        let a = cp(8, 0xaa);
+        let b = cp(8, 0xbb);
+        t.add(&a, &votes(&vals, &a, &[6, 7, 8, 9, 10]), None, 8);
+        t.add(&a, &votes(&vals, &a, &[16, 17, 18, 19, 20]), None, 8);
+        t.add(&b, &votes(&vals, &b, &[11, 12, 13, 14, 15]), None, 8);
+
+        let variants = t.variants_at(8);
+        assert_eq!(variants.len(), 2, "both variants of the contested slot");
+        let for_a = variants.iter().find(|(c, _)| c == &a).expect("variant a");
+        let for_b = variants.iter().find(|(c, _)| c == &b).expect("variant b");
+        assert_eq!(for_a.1.len(), 10, "variant a carries its accumulated 10");
+        assert_eq!(for_b.1.len(), 5, "variant b carries its accumulated 5");
+        assert!(t.variants_at(16).is_empty(), "an untracked slot repushes nothing");
     }
 
     /// The core blocker-3 regression: distinct signers accumulate across separate
