@@ -4259,6 +4259,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// #359 REHEARSAL, then the standing regression lock for the transplant
+    /// path: a snapshotless host is rescued by transplanting a DONOR's
+    /// `snapshot.bin` + `blocks.log` while it keeps its OWN finalizer ledgers
+    /// and its OWN halt marker. `persist::Snapshot` is pure chain state (no
+    /// node identity), so this must work — this test is the proof the
+    /// production runbook cites before touching node3.
+    #[test]
+    fn a_snapshotless_host_rejoins_by_snapshot_transplant() {
+        // --- donor A: halted at DH, finalized, resumed past it, snapshotted.
+        let (cfg_a, gen_a, base_a) = rig("i359_donor", true);
+        let (a_tip, a_final) = {
+            let mut a = RunningNode::start_with_release(
+                &cfg_a, &gen_a, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+            )
+            .unwrap();
+            a.set_mine_interval(Duration::ZERO);
+            a.try_checkpoint();
+            mine_and_checkpoint(&mut a, DH);
+            assert!(a.is_halted());
+            a.maintain_boundary_checkpoint();
+            assert_eq!(a.finalized_height(), Some(DH));
+            a.maintain_halt_marker();
+            a.save_snapshot().unwrap();
+            drop(a);
+            let mut a = RunningNode::start_with_release(
+                &cfg_a, &gen_a, KeccakPow, DevnetRehearsalVerifier, resume_release(),
+            )
+            .unwrap();
+            a.set_mine_interval(Duration::ZERO);
+            assert_eq!(mine_and_checkpoint(&mut a, 2 * CHECKPOINT_CADENCE_BLOCKS), 2 * CHECKPOINT_CADENCE_BLOCKS);
+            a.maintain_halt_marker();
+            a.save_snapshot().unwrap();
+            (a.tip_height(), a.finalized_height())
+        };
+        assert!(a_tip > DH, "donor mined past the boundary");
+
+        // --- recipient B: its own walk to the halt — its own marker, its own
+        // finalizer ledgers, NO snapshot (node3's exact shape).
+        let (cfg_b, gen_b, base_b) = rig("i359_recipient", true);
+        {
+            let mut b = RunningNode::start_with_release(
+                &cfg_b, &gen_b, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+            )
+            .unwrap();
+            b.set_mine_interval(Duration::ZERO);
+            b.try_checkpoint();
+            mine_and_checkpoint(&mut b, DH);
+            assert!(b.is_halted());
+            b.maintain_boundary_checkpoint();
+            b.maintain_halt_marker();
+            // Deliberately NO save_snapshot: B is the snapshotless host.
+        }
+        assert!(!cfg_b.data_dir.join(qlab_node::SNAPSHOT).exists());
+
+        // --- the transplant: donor's two chain files; B keeps everything else.
+        std::fs::copy(
+            cfg_a.data_dir.join(qlab_node::SNAPSHOT),
+            cfg_b.data_dir.join(qlab_node::SNAPSHOT),
+        )
+        .unwrap();
+        std::fs::copy(
+            cfg_a.data_dir.join(qlab_node::BLOCK_LOG),
+            cfg_b.data_dir.join(qlab_node::BLOCK_LOG),
+        )
+        .unwrap();
+
+        // --- B opens on the resume release: marker rewritten, state == donor,
+        // and its own keys still sign.
+        let mut b = RunningNode::start_with_release(
+            &cfg_b, &gen_b, KeccakPow, DevnetRehearsalVerifier, resume_release(),
+        )
+        .unwrap();
+        b.set_mine_interval(Duration::ZERO);
+        assert_eq!(b.tip_height(), a_tip, "transplanted chain adopted");
+        assert_eq!(b.finalized_height(), a_final, "transplanted finality adopted");
+        let m = HaltMarker::load(&cfg_b.data_dir).unwrap().expect("marker present");
+        assert!(m.resumed, "B's own marker rewritten by the legitimate resume");
+        // The committee still works from B's OWN ledgers: one more block, one
+        // more checkpoint, finality advances.
+        assert_eq!(mine_and_checkpoint(&mut b, CHECKPOINT_CADENCE_BLOCKS), CHECKPOINT_CADENCE_BLOCKS);
+        assert!(b.finalized_height() > a_final, "post-transplant signing works");
+        let _ = std::fs::remove_dir_all(&base_a);
+        let _ = std::fs::remove_dir_all(&base_b);
+    }
+
     /// Issue #360: the loop's only mining-gated route to `try_checkpoint` never
     /// fires on a halted node, so the live boundary halted perfectly and then
     /// could not finalize — 21 keys present, zero proposals, forever. The test
