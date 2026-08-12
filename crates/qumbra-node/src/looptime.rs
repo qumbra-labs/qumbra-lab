@@ -270,18 +270,29 @@ impl LoopJournal {
     /// accumulator, so consecutive lines partition the run with no overlap and
     /// no gap.
     ///
-    /// `win=` is measured wall time rather than the sum of the iterations: the
-    /// difference between the two is the instrument's own blind spot, and a
-    /// reader is entitled to see it rather than be told it is small.
+    /// `win=` is measured wall time and `acct=` is the sum of the iterations,
+    /// so **`unacct=` is the instrument's own blind spot, reported rather than
+    /// asserted to be small**. Three things live in it, and the third is why it
+    /// is a field and not a footnote:
+    ///
+    /// 1. the loop condition and the clock reads themselves — nanoseconds;
+    /// 2. the `println!` of these very lines, which is deliberately outside
+    ///    every phase (a phase cannot time its own report);
+    /// 3. **anything that blocks stdout.** `println!` takes the stdout lock and
+    ///    writes to a pipe: under `docker logs` or a rate-limiting journald, a
+    ///    full pipe blocks the consensus loop for as long as the reader takes.
+    ///    Nothing in this issue's history has ever measured that, and a large
+    ///    `unacct` with small phases is exactly what it would look like.
     pub fn window_line(&mut self) -> String {
         let win = self.window_started.elapsed();
         let (phase, d) = self.worst.worst();
         let line = format!(
-            "LOOP kind=window unit=ms win={} iters={} busy={} acct={} maxiter={} maxphase={phase} maxphase_ms={} frames={} slow={} slowsup={} {}",
+            "LOOP kind=window unit=ms win={} iters={} busy={} acct={} unacct={} maxiter={} maxphase={phase} maxphase_ms={} frames={} slow={} slowsup={} {}",
             ms(win),
             self.iterations,
             ms(self.window.busy()),
             ms(self.window.total()),
+            ms(win.saturating_sub(self.window.total())),
             ms(self.worst.busy()),
             ms(d),
             self.window.tick.frames,
@@ -379,6 +390,25 @@ mod tests {
         // window's own totals.
         assert!(w.contains(" mine=75000.0 "), "50 × 1500 ms: {w}");
         assert!(w.contains(" iters=50 "), "{w}");
+    }
+
+    /// The residual is reported, and it is the field that would catch a
+    /// blocking `println!` — the one thing on this loop that no phase covers.
+    #[test]
+    fn the_unaccounted_residual_is_a_field_and_not_a_footnote() {
+        let mut j = LoopJournal::new();
+        // An iteration that claims 1 ms of work inside a window that really
+        // lasted longer: whatever the difference is, it is on the line.
+        j.note(&LoopPhases { pump: msd(1), ..Default::default() });
+        std::thread::sleep(msd(30));
+        let w = j.window_line();
+        let unacct: f64 = w
+            .split(" unacct=")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .and_then(|s| s.parse().ok())
+            .expect("unacct is on the line: {w}");
+        assert!(unacct >= 25.0, "the 30 ms nobody claimed is visible: {w}");
     }
 
     #[test]
