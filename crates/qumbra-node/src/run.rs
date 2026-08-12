@@ -2548,6 +2548,82 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     }
 }
 
+/// **`halt-status`'s snapshot section** (issue #359 S3) — the same question
+/// `TELEMETRY`'s `snap=` answers, asked of a data dir by a process that is not
+/// running the node.
+///
+/// This is the half of S3 that works when the node is *down*, which is the moment
+/// an operator planning a roll actually asks: `halt-status --config` is already
+/// how they read this host's release and marker before restarting it, so the
+/// snapshot answer belongs on the same output rather than behind an ssh + `ls`.
+/// It reads the file directly (a fresh, authoritative read — no cache to be stale,
+/// unlike the running node's, and no node to open).
+///
+/// **The `none` case is the one that must be legible**, because it is node3's
+/// shape and the whole cost of this issue: a bare blank line where a height should
+/// be would read as "nothing to report" rather than "this host replays the entire
+/// chain if you restart it". So the absent and unreadable cases each get the
+/// consequence spelled out, and only the present case is a single line.
+///
+/// Returns the rendered block (always ending in a newline) so it is testable
+/// without capturing stdout.
+pub fn snapshot_status_report(data_dir: &std::path::Path) -> String {
+    let mut out = String::new();
+    let state = match qlab_node::snapshot_on_disk(data_dir) {
+        Ok(s) => s,
+        // A data dir we cannot read at all is not the same as one with no
+        // snapshot, and saying "none" here would be a claim this call cannot
+        // support.
+        Err(e) => {
+            out.push_str(&format!("  snapshot:     UNAVAILABLE — cannot read {}: {e}\n", data_dir.display()));
+            return out;
+        }
+    };
+    match state {
+        qlab_node::SnapshotOnDisk::At { applied_height } => {
+            out.push_str(&format!(
+                "  snapshot:     height {applied_height} — a restart resumes here and replays \
+                 only the records past it\n"
+            ));
+        }
+        qlab_node::SnapshotOnDisk::Absent => {
+            out.push_str("  snapshot:     ⚠️  NONE — this data dir has no snapshot.bin.\n");
+            out.push_str(
+                "      A restart REPLAYS THE WHOLE BLOCK LOG FROM GENESIS (issue #359: 4.6 h for \
+                 an\n",
+            );
+            out.push_str(
+                "      11,751-record chain, and the replay cost grows superlinearly with chain \
+                 length).\n",
+            );
+            out.push_str(
+                "      On a live chain the node may then be unable to catch up at all. Do not \
+                 plan a\n",
+            );
+            out.push_str(
+                "      roll against this host without pricing that outage. A snapshot appears \
+                 once the\n",
+            );
+            out.push_str("      node runs synced for one snapshot interval, or at its next graceful stop.\n");
+        }
+        qlab_node::SnapshotOnDisk::Unreadable => {
+            out.push_str(
+                "  snapshot:     ⚠️  UNUSABLE — snapshot.bin is present but does not decode at \
+                 this\n",
+            );
+            out.push_str(&format!(
+                "      binary's on-disk format version ({}). It will be IGNORED and rewritten; \
+                 the\n",
+                qlab_node::FORMAT_VERSION
+            ));
+            out.push_str(
+                "      next restart costs the same from-genesis replay as having none at all.\n",
+            );
+        }
+    }
+    out
+}
+
 /// Render `bdrop=` from the count/last-height pair (issue #130 (b)):
 /// `<total>@<height>`, and `0@-` when this node has refused no body.
 ///
