@@ -28,7 +28,7 @@
 //!
 //! ## One derivation, not a second formula
 //!
-//! [`note_nullifier`] is the three lines [`crate::send::build_send`] runs to
+//! [`note_nullifier`] is the three lines [`crate::spend::select`] runs to
 //! build a spend: `wallet.spend_input(value, ρ, rseed, d)` →
 //! `qlab_air::narrow::derive_input(..).1` → `digest_bytes`. That is deliberate
 //! and it is the whole correctness argument: if the balance's notion of "this
@@ -316,7 +316,7 @@ pub fn fetch_spent(
 /// derivation**, not a second formula.
 ///
 /// `nf = H(nk ‖ ρ)` computed through `qlab_air::narrow::derive_input`, the same
-/// call `build_send` makes on the same `TxInput` when it builds the spend the
+/// call the spend builder makes on the same `TxInput` when it builds the bundle the
 /// chain then publishes, hashed to its 32-byte wire form by the same
 /// `digest_bytes` that `TxPublic::nullifiers` carries. `div_index` is the
 /// diversifier the note was received at: `nf` does not bind the diversifier, but
@@ -326,7 +326,7 @@ pub fn note_nullifier(wallet: &Wallet, div_index: u64, note: &Note) -> [u8; 32] 
     let inp = wallet.spend_input(note.value, note.rho, note.rseed, d);
     // `derive_input` returns (nk, nf, cm) — position matters, and getting it
     // wrong here is invisible to a test that derives its fixture the same wrong
-    // way. `.1` is what `build_send` and `qlab_faucet::grant` take.
+    // way. `.1` is what the spend bundle and `qlab_faucet::grant` take.
     let (_nk, nf, _cm) = derive_input(&inp);
     digest_bytes(&nf)
 }
@@ -616,7 +616,7 @@ mod tests {
     }
 
     /// 🔴 **The derivation is the spend path's.** `note_nullifier` runs
-    /// `derive_input` on the very `TxInput` `build_send` spends; this checks the
+    /// `derive_input` on the very `TxInput` the witness bundle spends; this checks the
     /// result against `qlab_wallet::keys::derive_nf`, the independent host mirror
     /// — two implementations agreeing, rather than one asserted against itself.
     #[test]

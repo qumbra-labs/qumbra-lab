@@ -3,11 +3,13 @@
 //! does not rewrite it" — C3's circuit half merged as lab PR #252, so this is
 //! written against the REAL latch, not a guess).
 //!
-//! What this module does: select inputs → build the frozen 2×2 bucket
+//! What this module does: select inputs → build a serializable witness bundle
+//! → build the frozen 2×2 bucket
 //! (via [`build_bucket_dummy1`] when one real note suffices — the #219
 //! mechanism) → **prove for real** (`qlab_consensus::prove_bucket`, ~2 s /
-//! ~12 GB release) → encrypt outputs to their owners (ML-KEM, the #188 (a)
-//! payloads) → assemble the [`TxEntry`] the wire commits to.
+//! ~12 GB release) → assemble the [`TxEntry`] the wire commits to. Output
+//! encryption happens while the bundle is prepared, so phase 2 needs no RNG or
+//! key source beyond the bundle.
 //!
 //! What it deliberately does NOT do: **submit.** This module ends at the
 //! canonical wire bytes (`qlab_p2p::codec::encode_tx`); getting them into the
@@ -27,12 +29,15 @@ use qlab_cbserver::tree::CommitmentTree;
 use qlab_consensus::{prove_bucket, LOG_HEIGHT};
 use qlab_devnet::body::{TxEntry, TxPublic};
 use qlab_devnet::fees::{posted_fee, ArityBucket};
+use qlab_note::compact::encode_committed_discovery;
 use qlab_note::hash::digest_bytes;
 use qlab_note::scan::encrypt_to_recipient;
 use qlab_wallet::address::Address;
 use qlab_wallet::Wallet;
 use rand::rngs::StdRng;
 use rand::{CryptoRng, SeedableRng};
+
+use crate::bundle::WitnessBundle;
 
 /// One note this wallet can spend: the plaintext plus the diversifier index it
 /// was received under (the `d` that made its `rkm`).
@@ -60,8 +65,9 @@ pub struct SendArtifact {
     pub declared_cm: [[u64; 4]; 2],
 }
 
-/// Build + PROVE a spend of `amount` to `recipient`, change to this wallet's
-/// address [0]. `tree` must be the chain's commitment tree at `anchor_count`
+/// Build the pre-proof witness bundle for a spend of `amount` to `recipient`,
+/// with change to this wallet's address [0]. `tree` must be the chain's
+/// commitment tree at `anchor_count`
 /// leaves, and `anchor_count`'s root must be one the network accepts as an
 /// **anchor** — the caller owns that correspondence.
 ///
@@ -71,37 +77,23 @@ pub struct SendArtifact {
 /// #276). Passing the freshly-synced tip count builds a perfectly valid proof
 /// of a statement the node will refuse as `anchor-not-valid`.
 #[allow(clippy::too_many_arguments)]
-pub fn build_send(
+pub(crate) fn build_bundle(
     wallet: &Wallet,
     notes: &[Spendable],
     recipient: &Address,
     amount: u64,
     tree: &CommitmentTree,
     anchor_count: u64,
-    rng: &mut StdRng,
-) -> Result<SendArtifact, String> {
-    build_send_with_rider(wallet, notes, recipient, amount, tree, anchor_count, rng, None)
-}
-
-/// [`build_send`] carrying a name-service rider (lab #367). The op raises the
-/// declared fee by its burned name-fee half — the fee is already a public
-/// input the proof binds, so a bigger fee is just more value the balance
-/// equation must cover: **zero circuit change**, in this function's own code
-/// as in the design. The rider itself is committed bytes on the entry; the
-/// proof neither sees nor needs it (N5).
-#[allow(clippy::too_many_arguments)]
-pub fn build_send_with_rider(
-    wallet: &Wallet,
-    notes: &[Spendable],
-    recipient: &Address,
-    amount: u64,
-    tree: &CommitmentTree,
-    anchor_count: u64,
-    rng: &mut StdRng,
+    anchor_tip_height: u64,
+    recipient_short: String,
+    output_range: Option<(u64, u64)>,
+    spent_covered: Option<(u64, u64)>,
     name_op: Option<&qlab_devnet::names::NameOp>,
-) -> Result<SendArtifact, String> {
+    rng: &mut StdRng,
+) -> Result<WitnessBundle, String> {
     let fee = posted_fee(ArityBucket::TwoByTwo)
-        + name_op.map_or(0, qlab_devnet::names::name_fee_for);
+        .checked_add(name_op.map_or(0, qlab_devnet::names::name_fee_for))
+        .ok_or("posted fee plus name fee overflows")?;
     let need = amount.checked_add(fee).ok_or("amount overflows")?;
 
     // Coin selection: fewest notes that cover amount+fee, largest first. The
@@ -109,23 +101,25 @@ pub fn build_send_with_rider(
     // first, and this refusal says so instead of silently spending wrong.
     let mut sorted: Vec<&Spendable> = notes.iter().collect();
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
-    let (chosen, used_dummy): (Vec<&Spendable>, bool) = if sorted
-        .first()
-        .is_some_and(|n| n.value >= need)
-    {
-        (vec![sorted[0]], true)
-    } else if sorted.len() >= 2 && sorted[0].value.checked_add(sorted[1].value).is_some_and(|s| s >= need)
-    {
-        (vec![sorted[0], sorted[1]], false)
-    } else {
-        let have: u64 = sorted.iter().map(|n| n.value).sum();
-        return Err(format!(
-            "cannot cover {need} bessel (amount {amount} + posted fee {fee}) from spendable \
+    let (chosen, used_dummy): (Vec<&Spendable>, bool) =
+        if sorted.first().is_some_and(|n| n.value >= need) {
+            (vec![sorted[0]], true)
+        } else if sorted.len() >= 2
+            && sorted[0]
+                .value
+                .checked_add(sorted[1].value)
+                .is_some_and(|s| s >= need)
+        {
+            (vec![sorted[0], sorted[1]], false)
+        } else {
+            let have: u64 = sorted.iter().map(|n| n.value).sum();
+            return Err(format!(
+                "cannot cover {need} bessel (amount {amount} + posted fee {fee}) from spendable \
              notes summing {have}. The frozen 2×2 bucket moves at most TWO notes per \
              transaction — if the total covers it but no two notes do, consolidate to \
              yourself first."
-        ));
-    };
+            ));
+        };
 
     // Real inputs + their tree witnesses.
     let mut inputs: Vec<TxInput> = Vec::with_capacity(2);
@@ -189,39 +183,21 @@ pub fn build_send_with_rider(
         },
     ];
 
-    // Build — the dummy path is the #219 mechanism, real since lab PR #252.
-    let inst = if used_dummy {
-        let dummy = invented_dummy(rng);
-        build_bucket_dummy1(
-            LOG_HEIGHT,
-            &inputs[0],
-            &witnesses[0],
-            &dummy,
-            &off_tree_witness(),
-            &outputs,
-            fee,
-            anchor_lanes,
-        )
-    } else {
-        build_bucket_with_witnesses(
-            LOG_HEIGHT,
-            &[inputs[0].clone(), inputs[1].clone()],
-            &outputs,
-            fee,
-            &[witnesses[0], witnesses[1]],
-            anchor_lanes,
-        )
-    };
+    // The serialized handoff carries a fixed two-input shape. Slot 1 is the
+    // #219 invented dummy exactly when one real note covered amount+fee.
+    if used_dummy {
+        inputs.push(invented_dummy(rng));
+        witnesses.push(off_tree_witness());
+    }
+    let inputs: [TxInput; 2] = inputs
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("the frozen bucket has two inputs"));
+    let witnesses: [MerkleWitness; 2] = witnesses
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("the frozen bucket has two witnesses"));
 
-    // PROVE. Real STARK — the desktop-class step (~2 s / ~12 GB release).
-    let t = std::time::Instant::now();
-    let (pvs, proof) = prove_bucket(&inst);
-    let prove_secs = t.elapsed().as_secs_f64();
-    let proof_bytes = bincode::serialize(&proof).map_err(|e| e.to_string())?;
-
-    // The cm seam, asserted at construction (the grant.rs lesson: assert, not
-    // debug_assert — a silent release-mode seam failure surfaces three layers
-    // later as DiscoveryDoesNotBind).
+    // The cm seam, asserted while the bundle is built (the grant.rs lesson:
+    // assert, not debug_assert — release is the acceptance build).
     let recipient_note = qlab_note::note::Note {
         value: amount,
         rkm: recipient.rkm_lanes(),
@@ -234,8 +210,6 @@ pub fn build_send_with_rider(
         rho: out_rho[1],
         rseed: out_rseed[1],
     };
-    assert_eq!(inst.cm_out[0], recipient_note.commitment(), "recipient cm seam");
-    assert_eq!(inst.cm_out[1], change_note.commitment(), "change cm seam");
 
     // Encrypt each output to its owner — the #188 (a) discovery payloads,
     // recipient-major, same order as `commitments`.
@@ -245,37 +219,104 @@ pub fn build_send_with_rider(
     let to_recipient = encrypt_to_recipient(&recipient_ek, &[recipient_note], rng);
     let self_ek = wallet.diversified_keypair(&change_d).ek;
     let to_self = encrypt_to_recipient(&self_ek, &[change_note], rng);
-
-    let entry = TxEntry::new(
-        proof_bytes,
-        TxPublic {
-            anchor: digest_bytes(&anchor_lanes),
-            nullifiers: vec![digest_bytes(&inst.nf[0]), digest_bytes(&inst.nf[1])],
-            commitments: vec![digest_bytes(&inst.cm_out[0]), digest_bytes(&inst.cm_out[1])],
-            bucket: ArityBucket::TwoByTwo,
-            fee,
-        },
+    let discovery = encode_committed_discovery(
         &[to_recipient.bundle.clone(), to_self.bundle.clone()],
         &[to_recipient.payloads, to_self.payloads].concat(),
     );
-    let entry = match name_op {
-        Some(op) => entry.with_name_op(op),
-        None => entry,
+    let bundle = WitnessBundle {
+        inputs,
+        witnesses,
+        outputs,
+        anchor: anchor_lanes,
+        discovery,
+        rider: qlab_devnet::names::encode_rider(name_op),
+        real_inputs: if used_dummy { 1 } else { 2 },
+        amount,
+        fee,
+        change_value,
+        anchor_tip_height,
+        recipient_short,
+        allowed_scan_verdicts_only: true,
+        output_range,
+        spent_covered,
+    };
+    bundle.validate().map_err(|e| e.to_string())?;
+    Ok(bundle)
+}
+
+/// The one proof implementation. Callers reach it through
+/// [`crate::spend::prove`], whose current-chain preflight runs before this
+/// function and makes a stale/consumed bundle a cheap named refusal.
+pub(crate) fn prove_bundle(bundle: &WitnessBundle) -> Result<SendArtifact, String> {
+    bundle.validate().map_err(|e| e.to_string())?;
+    let inst = if bundle.used_dummy() {
+        build_bucket_dummy1(
+            LOG_HEIGHT,
+            &bundle.inputs[0],
+            &bundle.witnesses[0],
+            &bundle.inputs[1],
+            &bundle.witnesses[1],
+            &bundle.outputs,
+            bundle.fee,
+            bundle.anchor,
+        )
+    } else {
+        build_bucket_with_witnesses(
+            LOG_HEIGHT,
+            &bundle.inputs,
+            &bundle.outputs,
+            bundle.fee,
+            &bundle.witnesses,
+            bundle.anchor,
+        )
+    };
+
+    let t = std::time::Instant::now();
+    let (pvs, proof) = prove_bucket(&inst);
+    let prove_secs = t.elapsed().as_secs_f64();
+    let proof_bytes = bincode::serialize(&proof).map_err(|e| e.to_string())?;
+
+    let declared_cm = [
+        output_commitment(&bundle.outputs[0]),
+        output_commitment(&bundle.outputs[1]),
+    ];
+    assert_eq!(inst.cm_out, declared_cm, "bundle output cm seam");
+    let entry = TxEntry {
+        proof: proof_bytes,
+        public: TxPublic {
+            anchor: digest_bytes(&bundle.anchor),
+            nullifiers: vec![digest_bytes(&inst.nf[0]), digest_bytes(&inst.nf[1])],
+            commitments: vec![digest_bytes(&inst.cm_out[0]), digest_bytes(&inst.cm_out[1])],
+            bucket: ArityBucket::TwoByTwo,
+            fee: bundle.fee,
+        },
+        discovery: bundle.discovery.clone(),
+        rider: bundle.rider.clone(),
     };
     let wire_bytes = qlab_p2p::codec::encode_tx(&entry);
 
     Ok(SendArtifact {
         entry,
         wire_bytes,
-        fee,
-        used_dummy,
+        fee: bundle.fee,
+        used_dummy: bundle.used_dummy(),
         prove_secs,
-        change_value,
+        change_value: bundle.change_value,
         pvs,
-        declared_anchor: anchor_lanes,
+        declared_anchor: bundle.anchor,
         declared_nf: [inst.nf[0], inst.nf[1]],
-        declared_cm: [inst.cm_out[0], inst.cm_out[1]],
+        declared_cm,
     })
+}
+
+fn output_commitment(output: &TxOutput) -> [u64; 4] {
+    qlab_note::note::Note {
+        value: output.value,
+        rkm: output.rkm,
+        rho: output.rho,
+        rseed: output.rseed,
+    }
+    .commitment()
 }
 
 /// A dummy input per the #219 ruling: prover-invented sk/ρ/rseed, value 0 —
@@ -315,6 +356,36 @@ mod tests {
     use super::*;
     use qlab_wallet::seed::MasterSeed;
 
+    /// Test-only composition for the low-level fixture tests in this module.
+    /// Production has no build+prove shortcut: it goes through
+    /// `spend::select` + current-chain `spend::prove`.
+    #[allow(clippy::too_many_arguments)]
+    fn build_send(
+        wallet: &Wallet,
+        notes: &[Spendable],
+        recipient: &Address,
+        amount: u64,
+        tree: &CommitmentTree,
+        anchor_count: u64,
+        rng: &mut StdRng,
+    ) -> Result<SendArtifact, String> {
+        let bundle = build_bundle(
+            wallet,
+            notes,
+            recipient,
+            amount,
+            tree,
+            anchor_count,
+            0,
+            recipient.short().encode(),
+            Some((0, 0)),
+            Some((0, 0)),
+            None,
+            rng,
+        )?;
+        prove_bundle(&bundle)
+    }
+
     /// A note whose block is not finalized yet is IN the local tree but OUTSIDE
     /// the anchor. Refused by name, before the prove — because `auth_path`
     /// would otherwise cut a path past `anchor_count` and produce a
@@ -329,8 +400,12 @@ mod tests {
         let recipient =
             Wallet::from_master_seed(&MasterSeed::from_entropy([32u8; 32]), 0).address_at_index(0);
 
-        let note =
-            Spendable { div_index: 0, value: 10_000_000, rho: [3, 3, 3, 3], rseed: [5, 5, 5, 5] };
+        let note = Spendable {
+            div_index: 0,
+            value: 10_000_000,
+            rho: [3, 3, 3, 3],
+            rseed: [5, 5, 5, 5],
+        };
         let d = wallet.diversifier_at_index(0);
         let inp = wallet.spend_input(note.value, note.rho, note.rseed, d);
         let (_nk, _nf, cm) = derive_input(&inp);
@@ -350,7 +425,10 @@ mod tests {
         assert!(err.contains("position 2"), "{err}");
         assert!(err.contains("outside the anchor at 2 leaves"), "{err}");
         assert!(err.contains("not finalized yet"), "{err}");
-        assert!(err.contains("not possible YET"), "the state is temporary and says so: {err}");
+        assert!(
+            err.contains("not possible YET"),
+            "the state is temporary and says so: {err}"
+        );
     }
 
     /// One real spend, end to end, through the merged post-mint circuit: build a
@@ -361,7 +439,10 @@ mod tests {
     /// `--release --test-threads=1`; a debug run would be minutes and is not
     /// what any consumer executes).
     #[test]
-    #[cfg_attr(debug_assertions, ignore = "real prove — release only, per the bench discipline")]
+    #[cfg_attr(
+        debug_assertions,
+        ignore = "real prove — release only, per the bench discipline"
+    )]
     fn one_real_spend_builds_proves_and_binds_its_seams() {
         let mut rng = StdRng::seed_from_u64(0x5E4D);
         let wallet = Wallet::from_master_seed(&MasterSeed::from_entropy([11u8; 32]), 0);
@@ -388,7 +469,13 @@ mod tests {
         let fee = posted_fee(ArityBucket::TwoByTwo);
         let amount = 4_000_000;
         let art = match build_send(
-            &wallet, &[note.clone()], &recipient, amount, &tree, count, &mut rng,
+            &wallet,
+            &[note.clone()],
+            &recipient,
+            amount,
+            &tree,
+            count,
+            &mut rng,
         ) {
             Ok(a) => a,
             Err(e) => panic!("a single covering note must spend via the dummy slot: {e}"),
@@ -397,7 +484,11 @@ mod tests {
         // The #219 mechanism is what made this legal at all.
         assert!(art.used_dummy, "one real note ⇒ slot 1 is the dummy");
         assert_eq!(art.fee, fee);
-        assert_eq!(art.change_value, note.value - amount - fee, "balance closes exactly");
+        assert_eq!(
+            art.change_value,
+            note.value - amount - fee,
+            "balance closes exactly"
+        );
         assert!(art.prove_secs > 0.0);
 
         // The wire object: two nullifiers, two commitments, the frozen bucket.
@@ -405,6 +496,22 @@ mod tests {
         assert_eq!(art.entry.public.commitments.len(), 2);
         assert_eq!(art.entry.public.bucket, ArityBucket::TwoByTwo);
         assert!(!art.wire_bytes.is_empty());
+        // The proof itself is randomized inside the prover — the caller's
+        // seeded RNG does not reach it — so a full-wire golden would be a
+        // permanently-red test. Blank only that opaque field and lock every
+        // deterministic byte the spend split is capable of moving: public
+        // surface, discovery ciphertexts/payloads, and canonical field order.
+        let mut stable_entry = art.entry.clone();
+        stable_entry.proof.clear();
+        assert_eq!(
+            qlab_devnet::hash::keccak256(&qlab_p2p::codec::encode_tx(&stable_entry)),
+            [
+                0x36, 0x7c, 0xd3, 0xfe, 0xfb, 0xf5, 0x7d, 0x37, 0x21, 0xf0, 0x1a, 0x45, 0xc6, 0x2e,
+                0xaa, 0x37, 0xb1, 0xdc, 0xc1, 0xd5, 0xe4, 0x3a, 0x0c, 0x1b, 0xf7, 0x58, 0x80, 0x79,
+                0x6f, 0x20, 0xe5, 0x34,
+            ],
+            "the deterministic wire shell is the pre-split golden",
+        );
 
         // 🔴 The proof must verify against the DECLARED surface — exactly what
         // `qumbra_node::verifier` reconstructs on the wire path: PVs from the
@@ -424,7 +531,10 @@ mod tests {
             .iter()
             .map(|v| <qlab_consensus::Val as p3_field::PrimeField32>::as_canonical_u32(v))
             .collect();
-        assert_eq!(declared_u32, proved_u32, "proved surface == declared surface");
+        assert_eq!(
+            declared_u32, proved_u32,
+            "proved surface == declared surface"
+        );
     }
 
     #[test]
@@ -434,7 +544,12 @@ mod tests {
         let recipient =
             Wallet::from_master_seed(&MasterSeed::from_entropy([4u8; 32]), 0).address_at_index(0);
         let tree = CommitmentTree::new();
-        let small = |v| Spendable { div_index: 0, value: v, rho: [1, 1, 1, 1], rseed: [2, 2, 2, 2] };
+        let small = |v| Spendable {
+            div_index: 0,
+            value: v,
+            rho: [1, 1, 1, 1],
+            rseed: [2, 2, 2, 2],
+        };
         let err = match build_send(
             &wallet,
             &[small(10), small(10), small(10_000_000)],

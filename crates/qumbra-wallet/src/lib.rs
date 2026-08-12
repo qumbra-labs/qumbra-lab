@@ -58,6 +58,7 @@
 //! wallet derives its own notes' nullifiers with the spend path's own
 //! derivation, and matches locally.
 
+pub mod bundle;
 pub mod contacts;
 pub mod envelope;
 pub mod history;
