@@ -2,7 +2,10 @@
 //!
 //! The value being attested is the block body's scheduled-emission counter:
 //! `Σ body.coinbase`. Fees are reported beside it but are not subtracted, because
-//! they are transfers paid to the miner and are never burned. In the current
+//! they are transfers paid to the miner. *(Corrected, lab #367: fees WERE never
+//! burned; the name-service fee split now burns the name-fee half of a
+//! registering tx's declared fee — reported as its own `burned` column below,
+//! still never entering the issuance comparison.)* In the current
 //! body format `body.coinbase` already excludes fees; subtracting them would make
 //! an honest fee-paying block look inflationary/deflationary.
 //!
@@ -114,6 +117,9 @@ pub struct SupplyBlock {
     pub coinbase: u64,
     /// Transaction fees in the block. Reported, never subtracted from issuance.
     pub fees: u64,
+    /// The burned name-fee portion of those fees (lab #367) —
+    /// `BlockBody::total_name_burn`. Zero on every pre-boundary block.
+    pub name_burn: u64,
 }
 
 /// One epoch's independently checkable supply relation.
@@ -128,8 +134,12 @@ pub struct SupplyEpoch {
     pub measured_coinbase: u64,
     /// Closed-form scheduled issuance over the same interval, in bessel.
     pub expected_coinbase: u64,
-    /// `Σ tx.fee`, in bessel. Fees are transfers, not issuance or burning.
+    /// `Σ tx.fee`, in bessel. Fees are transfers, not issuance — except the
+    /// burned column below, reported separately.
     pub fees: u64,
+    /// `Σ name_burn`, in bessel (lab #367): supply destroyed by name fees in
+    /// this epoch. Cumulative destruction = Σ over rows.
+    pub burned: u64,
 }
 
 /// One grandfathered supply scar this chain is **known** to carry, with its
@@ -370,6 +380,7 @@ impl SupplyLedger {
                 measured_coinbase: 0,
                 expected_coinbase: 0,
                 fees: 0,
+                burned: 0,
             });
             // The prefix accumulator belongs to the row being built, so it starts
             // over with every row. Only the row that straddles the boundary ever
@@ -385,6 +396,10 @@ impl SupplyLedger {
         row.fees = row
             .fees
             .checked_add(block.fees)
+            .ok_or(SupplyError::SumOverflow { epoch })?;
+        row.burned = row
+            .burned
+            .checked_add(block.name_burn)
             .ok_or(SupplyError::SumOverflow { epoch })?;
 
         if block.height <= RULE_BOUNDARY_HEIGHT {
@@ -482,6 +497,7 @@ mod tests {
             prev: if height == 0 { [0u8; 32] } else { h(branch, height - 1) },
             coinbase,
             fees,
+            name_burn: 0,
         }
     }
 
@@ -767,6 +783,7 @@ mod tests {
                 },
                 coinbase: if height == 0 { 0 } else { coinbase(height as u64) },
                 fees: 0,
+                name_burn: 0,
             }),
             epoch_length,
         )
@@ -826,6 +843,7 @@ mod tests {
             measured_coinbase: (expected as i128 + divergence) as u64,
             expected_coinbase: expected,
             fees: 0,
+            burned: 0,
         }
     }
 

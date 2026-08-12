@@ -323,9 +323,34 @@ impl BlockBody {
         buf
     }
 
-    /// Total fees in the body (posted prices; the miner earns these + coinbase).
+    /// Total fees in the body (posted prices; the miner earns these + coinbase
+    /// − the name burn below, lab #367).
     pub fn total_fees(&self) -> u64 {
         self.txs.iter().map(|t| t.public.fee).sum()
+    }
+
+    /// The burned name-fee portion of this body's declared fees (lab #367):
+    /// `Σ name_fee_for(rider op)` over every rider-carrying transaction. The
+    /// fee-split rule (`validate_body*`) made each declared fee equal
+    /// `posted_fee + name_fee`, and this is the sum of the second halves — the
+    /// part the miner must NOT collect (N2: a miner who collects registration
+    /// fees registers names for free).
+    ///
+    /// Total by construction: an undecodable rider contributes 0 rather than
+    /// an error, because every path that consumes this value
+    /// (`coinbase_value`, the supply ledger) runs on bodies `validate_body*`
+    /// already accepted, where every rider decodes — the error path exists
+    /// there, once, not in every downstream sum.
+    pub fn total_name_burn(&self) -> u64 {
+        self.txs
+            .iter()
+            .map(|t| {
+                crate::names::decode_rider(&t.rider)
+                    .ok()
+                    .flatten()
+                    .map_or(0, |op| crate::names::name_fee_for(&op))
+            })
+            .sum()
     }
 
     /// Whether this body mints issuance without naming a payee — a block that

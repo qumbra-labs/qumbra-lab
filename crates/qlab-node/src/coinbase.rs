@@ -72,8 +72,9 @@
 //! ## Value: what the note is worth, and one honest divergence
 //!
 //! [`coinbase_note_value`] is the miner's frozen §3 share (65 %, absorbing the
-//! rounding remainder) plus the block's fees, which are paid to the miner and
-//! never burned. The committee (15 %) and treasury (20 %) shares are **not**
+//! rounding remainder) plus the block's fees, which are paid to the miner —
+//! less the burned name-fee portion (lab #367), the one part of a declared
+//! fee that is NOT the miner's. The committee (15 %) and treasury (20 %) shares are **not**
 //! minted: no payout path for them exists (they are accrual accounting —
 //! `recovery::committee_accrual_finalized`), so minting them would require naming
 //! recipients this baton has none for. The consequence is stated rather than
@@ -131,11 +132,23 @@ pub fn coinbase_rseed(height: u64, rkm: &[u64; 4]) -> [u64; 4] {
 }
 
 /// The value the coinbase note carries: the miner's frozen §3 share of the
-/// block's scheduled emission plus the block's fees. See the module docs for why
-/// the committee/treasury shares are not minted and why the §6 weight penalty is
+/// block's scheduled emission plus the block's fees **minus the burned
+/// name-fee portion** (lab #367). See the module docs for why the
+/// committee/treasury shares are not minted and why the §6 weight penalty is
 /// not subtracted here.
+///
+/// The subtraction is the burn's whole mechanism: the fee-split rule made a
+/// registering tx declare `posted_fee + name_fee`, and the name half simply
+/// never enters any note — no burn address, no extra machinery, supply
+/// arithmetic only (N2). Rider-free bodies subtract zero, so every
+/// pre-boundary coinbase value — i.e. the entire live chain — is unchanged,
+/// and `value_is_the_miner_share_plus_fees` still passes untouched, which is
+/// the compat lock this seam wants.
 pub fn coinbase_note_value(body: &BlockBody) -> u64 {
-    RewardSplit::of(body.coinbase).miner.saturating_add(body.total_fees())
+    RewardSplit::of(body.coinbase)
+        .miner
+        .saturating_add(body.total_fees())
+        .saturating_sub(body.total_name_burn())
 }
 
 /// The coinbase note minted by `body` at `height`, or `None` if the block mints
@@ -370,6 +383,33 @@ mod tests {
         // And it is strictly less than the whole emission — the committee and
         // treasury shares are deliberately not minted (module docs).
         assert!(coinbase_note_value(&empty) < coinbase(h));
+    }
+
+    /// Lab #367: the burned name-fee portion never enters the coinbase note.
+    /// A registering tx declares `posted + name_fee`; the miner collects only
+    /// the posted half — and a rider-free body subtracts zero, which is why
+    /// the test above did not move.
+    #[test]
+    fn the_name_burn_never_enters_the_coinbase_note() {
+        use qlab_devnet::names::{self, NameOp, NameRecord};
+        let h = 700;
+        let mut body = body_at(h, RKM_A, 1);
+        let op = NameOp::Reveal {
+            record: NameRecord {
+                kind: names::RECORD_KIND_L1_ADDRESS,
+                name: b"alice".to_vec(),
+                address: vec![0xAB; names::L1_ADDRESS_LEN],
+            },
+            salt: [7; 32],
+        };
+        body.txs[0].rider = names::encode_rider(Some(&op));
+        body.txs[0].public.fee = posted_fee(ArityBucket::TwoByTwo) + names::name_fee_bessel(5);
+        assert_eq!(body.total_name_burn(), names::name_fee_bessel(5));
+        assert_eq!(
+            coinbase_note_value(&body),
+            RewardSplit::of(coinbase(h)).miner + posted_fee(ArityBucket::TwoByTwo),
+            "the miner's take is exactly what a rider-free tx would have paid"
+        );
     }
 
     /// A block that mints nothing mints no note — this is what exempts genesis,

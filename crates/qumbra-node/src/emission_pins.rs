@@ -174,6 +174,7 @@ mod tests {
                     prev,
                     coinbase: if height == 0 { 0 } else { qlab_node::coinbase(height) },
                     fees: 0,
+                    name_burn: 0,
                 }
             }),
             EPOCH_LENGTH_BLOCKS,

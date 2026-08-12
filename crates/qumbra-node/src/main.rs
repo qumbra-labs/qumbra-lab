@@ -39,6 +39,10 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("audit-emission") {
         return cmd_audit_emission(&args[1..]);
     }
+    // audit-names shares the same exit-code contract (lab #367).
+    if args.first().map(String::as_str) == Some("audit-names") {
+        return cmd_audit_names(&args[1..]);
+    }
     match dispatch(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -62,9 +66,9 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("halt-status") => halt_status(&args[1..]),
         Some("audit") => audit(&args[1..]),
         Some("emission-pins") => emission_pins(&args[1..]),
-        Some("audit-emission") => {
+        Some("audit-emission") | Some("audit-names") => {
             // Handled in main() for exit-code fidelity; unreachable via dispatch.
-            Err("audit-emission is dispatched from main".into())
+            Err("audit subcommands are dispatched from main".into())
         }
         Some("-h") | Some("--help") | None => {
             usage();
@@ -89,6 +93,7 @@ fn usage() {
          qumbra-node halt-status [--config F]   print this binary's halt schedule + revision digest (#74)\n  \
          qumbra-node audit [--out FILE]         emit the params_devnet ⟷ FROZEN v1.0 convergence audit\n  \
          qumbra-node audit-emission --data-dir DIR [--from H] [--to H]\n      \
+         qumbra-node audit-names --data-dir DIR [--from H] [--to H]\n      \
                                             walk the persisted main chain; report every height whose\n      \
                                             body.coinbase ≠ emission::coinbase(height) (lab #299 / QUM-82)\n      \
                                             exit 0 = clean, 1 = ≥1 mismatch, 2 = could not run\n  \
@@ -114,6 +119,27 @@ fn emission_pins(_args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// Exit codes are the operator contract, not free-form: 0 ran-clean, 1 ran-with-
 /// mismatches, 2 could-not-run (bad dir / unreadable log / interval beyond tip /
 /// usage). The report always ends with a summary line so a clean chain is never silent.
+fn cmd_audit_names(args: &[String]) -> ExitCode {
+    let (data_dir, from, to) = match qumbra_node::audit_names::parse_args(args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("qumbra-node audit-names: {e}");
+            usage();
+            return ExitCode::from(qumbra_node::audit_names::EXIT_CANNOT_RUN);
+        }
+    };
+    match qumbra_node::audit_names::audit_names(&data_dir, from, to) {
+        Ok(report) => {
+            print!("{}", report.format_output());
+            ExitCode::from(report.exit_code())
+        }
+        Err(e) => {
+            eprintln!("qumbra-node audit-names: {e}");
+            ExitCode::from(qumbra_node::audit_names::EXIT_CANNOT_RUN)
+        }
+    }
+}
+
 fn cmd_audit_emission(args: &[String]) -> ExitCode {
     let (data_dir, from, to) = match audit_emission::parse_args(args) {
         Ok(v) => v,
