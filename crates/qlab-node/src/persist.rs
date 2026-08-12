@@ -357,6 +357,52 @@ mod tests {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    /// Issue #359: [`snapshot_on_disk`] separates the three situations
+    /// [`load_snapshot`] flattens into `Ok(None)`, and the separation is the point
+    /// — an operator asking "why does this host replay from genesis" needs to know
+    /// whether a write never happened or happened under another format.
+    ///
+    /// The version-mismatch case is built by serialising a [`Snapshot`] with a
+    /// deliberately wrong `format_version` rather than by writing junk, because
+    /// those are different failures (undecodable vs decodable-and-refused) and
+    /// both must land on `Unreadable`.
+    #[test]
+    fn snapshot_on_disk_separates_absent_from_unusable() {
+        let dir = std::env::temp_dir().join(format!("qumbra-i359-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        assert_eq!(snapshot_on_disk(&dir).unwrap(), SnapshotOnDisk::Absent);
+        assert_eq!(snapshot_on_disk(&dir).unwrap().height(), None);
+        assert_eq!(snapshot_on_disk(&dir).unwrap().field(), "none");
+
+        // A real snapshot: the height a restart resumes from.
+        save_snapshot(&dir, &golden_snapshot()).unwrap();
+        assert_eq!(snapshot_on_disk(&dir).unwrap(), SnapshotOnDisk::At { applied_height: 7 });
+        assert_eq!(snapshot_on_disk(&dir).unwrap().field(), "7");
+        // The same file `load_snapshot` honours — one file, two readers, one answer.
+        assert_eq!(load_snapshot(&dir).unwrap().unwrap().applied_height, 7);
+
+        // Undecodable bytes.
+        fs::write(dir.join(SNAPSHOT), b"not a snapshot at all").unwrap();
+        assert_eq!(snapshot_on_disk(&dir).unwrap(), SnapshotOnDisk::Unreadable);
+        assert_eq!(snapshot_on_disk(&dir).unwrap().field(), "bad");
+        assert_eq!(snapshot_on_disk(&dir).unwrap().height(), None, "an unusable file has no height");
+        assert!(load_snapshot(&dir).unwrap().is_none(), "and resume still falls through");
+
+        // Decodable, but written by another on-disk format version.
+        let mut wrong = golden_snapshot();
+        wrong.format_version = FORMAT_VERSION + 1;
+        fs::write(dir.join(SNAPSHOT), bincode::serialize(&wrong).unwrap()).unwrap();
+        assert_eq!(
+            snapshot_on_disk(&dir).unwrap(),
+            SnapshotOnDisk::Unreadable,
+            "a version this binary cannot honour is unusable, not a height"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// 🔴 Issue #206's format question, answered by the bytes and not by argument.
     ///
     /// A **rename** of a `bincode`-serialised field is byte-neutral, so

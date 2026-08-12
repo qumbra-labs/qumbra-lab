@@ -3808,6 +3808,279 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// **Issue #359 S5 (a) — the invariant.** A node that has run past the cadence
+    /// with its applied height advanced has written a snapshot, *with no shutdown
+    /// anywhere in the story*.
+    ///
+    /// The assertion that carries the issue is made **inside the loop**, through
+    /// the `run_until_with` hook, before the exit path can run: until this baton
+    /// the only write was the post-loop flush, so a test that looked after
+    /// `run_until` returned could not tell the cadence from the flush and would
+    /// have passed on `main` unchanged. Here the snapshot must already be on disk
+    /// while the loop is still running.
+    #[test]
+    fn a_node_past_the_cadence_has_written_a_snapshot_without_stopping() {
+        let (config, genesis, base) = rig("i359_cadence", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.set_snapshot_interval(Duration::ZERO); // every iteration is a tick
+
+        // The starting state is node3's: a data dir that has never been stopped.
+        assert_eq!(
+            node.durable_snapshot(),
+            qlab_node::SnapshotOnDisk::Absent,
+            "a fresh data dir has no snapshot"
+        );
+        assert!(!config.data_dir.join(qlab_node::SNAPSHOT).exists());
+
+        let shutdown = AtomicBool::new(false);
+        let mut seen: Option<(u64, qlab_node::SnapshotOnDisk, bool)> = None;
+        node.run_until_with(&shutdown, |n| {
+            seen = Some((
+                n.p2p().node().state_lag().state_tip,
+                n.durable_snapshot(),
+                n.data_dir.join(qlab_node::SNAPSHOT).exists(),
+            ));
+            shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let (applied, snap, on_disk) = seen.expect("the per-iteration hook ran");
+        assert!(applied > 0, "the loop mined and applied a block this iteration");
+        assert!(on_disk, "🔴 the file exists while the loop is still running — not at exit");
+        assert_eq!(
+            snap,
+            qlab_node::SnapshotOnDisk::At { applied_height: applied },
+            "and the cadence recorded the height it wrote"
+        );
+        drop(node);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Issue #359 S5 (a), second half — idempotence.** A second tick on an
+    /// unchanged chain does not rewrite the snapshot. This is what keeps the
+    /// cadence free on a halted or stalled net, where the applied height can sit
+    /// still for hours.
+    ///
+    /// Proven by the file's modification time rather than by its contents: the
+    /// snapshot of an unchanged state is byte-identical, so comparing bytes could
+    /// not tell "did not write" from "wrote the same thing".
+    #[test]
+    fn the_cadence_does_not_rewrite_an_unchanged_snapshot() {
+        let (config, genesis, base) = rig("i359_idempotent", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.set_snapshot_interval(Duration::ZERO);
+        assert!(node.try_mine(), "one block, so the height has advanced");
+
+        node.maintain_snapshot();
+        let path = config.data_dir.join(qlab_node::SNAPSHOT);
+        let first = std::fs::metadata(&path).expect("written").modified().expect("mtime");
+        assert_eq!(node.durable_snapshot(), qlab_node::SnapshotOnDisk::At { applied_height: 1 });
+
+        // Enough separation that a rewrite would be visible even on a
+        // coarse-grained filesystem timestamp.
+        std::thread::sleep(Duration::from_millis(1100));
+        node.maintain_snapshot();
+        let second = std::fs::metadata(&path).expect("still there").modified().expect("mtime");
+        assert_eq!(first, second, "an unchanged applied height rewrites nothing");
+
+        // …and a changed one does write again.
+        assert!(node.try_mine());
+        node.maintain_snapshot();
+        assert_eq!(node.durable_snapshot(), qlab_node::SnapshotOnDisk::At { applied_height: 2 });
+        let third = std::fs::metadata(&path).expect("rewritten").modified().expect("mtime");
+        assert_ne!(second, third, "an advanced applied height does write");
+
+        drop(node);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Issue #359 S5 (b) — a replaying node writes none until synced.**
+    ///
+    /// B is the #106/#130 shape: it has taken the network's *headers* to height 3
+    /// and applied no body, so `stip=0 slag=3` — the run-loop state that stands in
+    /// for "replaying". Every cadence tick in that state must write nothing. Once
+    /// the bodies land and the gap closes, the very next tick writes.
+    ///
+    /// 🔴 What this test also pins, and what the PR body argues about: while B is
+    /// in this state it is accumulating exactly the replay a restart would have to
+    /// redo, and the gate means none of it is ever made durable. That is the
+    /// behaviour the task book specified and it is deliberate here, not accidental.
+    #[test]
+    fn a_replaying_node_writes_no_snapshot_until_it_is_synced() {
+        use qlab_p2p::n1::{BlockIngest, IngestOutcome};
+
+        let a_port = free_port();
+        let a_addr = format!("127.0.0.1:{a_port}");
+
+        // A is the established net: three blocks, dialable.
+        let (mut acfg, agen, abase) = rig("i359_net", true);
+        acfg.listen_addr = a_addr.clone();
+        acfg.advertise_addr = Some(a_addr.clone());
+        let mut a = RunningNode::start(&acfg, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        a.set_mine_interval(Duration::ZERO);
+        for _ in 0..3 {
+            assert!(a.try_mine());
+        }
+
+        // B joins with an empty data dir and syncs headers only.
+        let (mut bcfg, bgen, bbase) = rig("i359_joiner", true);
+        bcfg.dial_peers = vec![a_addr.clone()];
+        let mut b = RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        b.set_mine_interval(Duration::ZERO);
+        b.set_snapshot_interval(Duration::ZERO); // every call is a cadence tick
+        let snap_path = bcfg.data_dir.join(qlab_node::SNAPSHOT);
+
+        // The cadence is ticked ONLY while B is behind, and that is what makes this
+        // a test of the replaying gate rather than of the idempotence gate: with no
+        // snapshot on disk, the "applied height differs from the durable one" check
+        // is satisfied by any height at all, so the write can only be refused by the
+        // `slag != 0` gate. (A tick taken before B hears a header would write a
+        // legitimate height-0 snapshot and mask exactly that — B is genuinely
+        // synced-with-itself at that moment.)
+        let mut ticks_while_behind = 0;
+        for _ in 0..60 {
+            a.step_once();
+            b.step_once();
+            if b.p2p().node().state_lag().blocks() > 0 {
+                b.maintain_snapshot();
+                ticks_while_behind += 1;
+                assert!(
+                    !snap_path.exists(),
+                    "🔴 a node still applying history wrote a snapshot: slag={}",
+                    b.p2p().node().state_lag().blocks()
+                );
+                assert_eq!(b.durable_snapshot(), qlab_node::SnapshotOnDisk::Absent);
+            }
+            if b.p2p().sync_phase().is_synced() && b.tip_height() == 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(b.tip_height(), 3, "B took the network's header chain");
+        assert!(ticks_while_behind > 0, "the replaying window was genuinely exercised");
+        let line = b.telemetry_sample();
+        assert!(line.contains(" stip=0 slag=3"), "{line}");
+        assert!(line.contains(" snap=none"), "and the field says so on the line: {line}");
+
+        // The bodies arrive; the gap closes; the next tick writes.
+        let chain = a.p2p().node().chain();
+        let mined: Vec<_> =
+            (1..=3).map(|h| *chain.header(&chain.main_chain()[h]).expect("header")).collect();
+        for header in &mined {
+            let stored =
+                a.state().chain().block(&header.header_hash()).expect("A holds the body").clone();
+            assert_eq!(
+                b.p2p_mut().node_mut().ingest_block(*header, stored.body()),
+                IngestOutcome::Duplicate,
+                "the header was already held"
+            );
+        }
+        assert_eq!(b.p2p().node().state_lag().blocks(), 0, "caught up");
+        b.maintain_snapshot();
+        assert_eq!(
+            b.durable_snapshot(),
+            qlab_node::SnapshotOnDisk::At { applied_height: 3 },
+            "the first tick after catching up writes"
+        );
+        assert!(snap_path.exists());
+
+        drop(a);
+        drop(b);
+        let _ = std::fs::remove_dir_all(&abase);
+        let _ = std::fs::remove_dir_all(&bbase);
+    }
+
+    /// **Issue #359 S5 (c) — the telemetry field round-trips**, in all three of its
+    /// tokens, and the height it reports is the one a restart would resume from.
+    ///
+    /// The `none` case is asserted first because it is the one that matters: it is
+    /// node3's shape, and a field that only ever printed heights would have said
+    /// nothing at all about the host this issue is about.
+    #[test]
+    fn the_snap_field_round_trips_through_the_telemetry_line() {
+        let (config, genesis, base) = rig("i359_field", true);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.set_snapshot_interval(Duration::ZERO);
+
+        // (1) none — nothing has ever been written to this data dir.
+        assert_eq!(field(&node.telemetry_sample(), "snap"), "none");
+
+        // (2) a height — and it is the applied height, readable back as a number.
+        assert!(node.try_mine());
+        assert!(node.try_mine());
+        node.maintain_snapshot();
+        let line = node.telemetry_sample();
+        let reported: u64 = field(&line, "snap").parse().expect("a height parses back");
+        assert_eq!(reported, 2, "the applied height the snapshot carries: {line}");
+        assert_eq!(
+            reported,
+            qlab_node::snapshot_on_disk(&config.data_dir).unwrap().height().unwrap(),
+            "and the line agrees with the file itself"
+        );
+        // The #84 discipline: an addition may not disturb the fields before it.
+        assert!(line.contains(" stip=2 slag=0"), "{line}");
+        drop(node);
+
+        // (3) bad — a snapshot present but not decodable at this FORMAT_VERSION.
+        // Seeded before startup, because the field is seeded by the startup read.
+        std::fs::write(config.data_dir.join(qlab_node::SNAPSHOT), b"not a snapshot").unwrap();
+        let node = RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier)
+            .expect("an unusable snapshot is a full replay, not a refusal");
+        let line = node.telemetry_sample();
+        assert_eq!(field(&line, "snap"), "bad", "{line}");
+        assert!(line.contains(" stip=2 "), "and the log still replayed the real chain: {line}");
+
+        drop(node);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **Issue #359 S5 (d) — `halt-status` renders both cases, and the `none` case
+    /// is legible.** This is the read an operator makes with the node *down*, which
+    /// is the only moment the answer can still change a roll plan.
+    ///
+    /// The `none` assertions are on the consequence, not on the word: a section
+    /// that printed `snapshot: none` and stopped would satisfy a contains-"none"
+    /// test while telling the operator nothing about what it costs.
+    #[test]
+    fn halt_status_renders_the_snapshot_height_and_the_none_case() {
+        let (config, genesis, base) = rig("i359_haltstatus", true);
+
+        // (1) none — the data dir exists and has never been snapshotted.
+        let report = snapshot_status_report(&config.data_dir);
+        assert!(report.contains("NONE"), "{report}");
+        assert!(
+            report.contains("REPLAYS THE WHOLE BLOCK LOG FROM GENESIS"),
+            "the none case states the cost, not just the absence: {report}"
+        );
+        assert!(!report.contains("height 0"), "an absent snapshot is not height 0: {report}");
+
+        // (2) a height — after a real node writes one.
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.set_snapshot_interval(Duration::ZERO);
+        assert!(node.try_mine());
+        node.maintain_snapshot();
+        drop(node);
+        let report = snapshot_status_report(&config.data_dir);
+        assert!(report.contains("height 1"), "{report}");
+        assert!(!report.contains("NONE"), "{report}");
+
+        // (3) unusable — present, undecodable. A different cause, the same cost,
+        // and it must not be reported as an absence.
+        std::fs::write(config.data_dir.join(qlab_node::SNAPSHOT), b"not a snapshot").unwrap();
+        let report = snapshot_status_report(&config.data_dir);
+        assert!(report.contains("UNUSABLE"), "{report}");
+        assert!(!report.contains("NONE"), "a present-but-broken file is not an absent one: {report}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn preflight_validates_a_staged_node_without_binding() {
         // The deploy dry-run's per-node assertion: a laid-down config + genesis +
@@ -5120,6 +5393,8 @@ mod tests {
                 "bask",
                 // ── appended by #212, at the end ──
                 "dfinbh",
+                // ── appended by #359, at the end ──
+                "snap",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
@@ -5168,11 +5443,17 @@ mod tests {
         // derived quantities say "there is nothing to fetch and I know exactly where
         // I am". That is the healthy reading and it is a fact, not an absence.
         assert!(line.contains(" bask=0@1 "), "nothing wanted: {line}");
-        // #212: head #3's identity, and it is the LAST field. `dfin=0` above says how
-        // high the durable head is; this says WHAT it is, which is what a cross-host
-        // comparison needs and what `dfin=` alone cannot carry.
-        assert!(line.ends_with(&format!(" dfinbh={}", node.telemetry().durable.id_field())), "{line}");
+        // #212: head #3's identity. `dfin=0` above says how high the durable head is;
+        // this says WHAT it is, which is what a cross-host comparison needs and what
+        // `dfin=` alone cannot carry. No longer `ends_with`: #359 appended after it.
+        assert!(
+            line.contains(&format!(" dfinbh={} ", node.telemetry().durable.id_field())),
+            "{line}"
+        );
         assert_ne!(field(&line, "dfinbh"), "-", "a finalized durable head has an identity: {line}");
+        // #359: this rig has never stopped and never reached a cadence tick, so it is
+        // node3's shape and the field says so — and it is the LAST field.
+        assert!(line.ends_with(" snap=none"), "no snapshot, said plainly and last: {line}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
