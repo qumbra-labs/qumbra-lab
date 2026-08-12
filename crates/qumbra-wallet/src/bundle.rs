@@ -533,12 +533,16 @@ mod tests {
     use rand::SeedableRng;
 
     fn bundle() -> WitnessBundle {
+        bundle_with_name_op(None)
+    }
+
+    fn bundle_with_name_op(name_op: Option<&qlab_devnet::names::NameOp>) -> WitnessBundle {
         let wallet = Wallet::from_master_seed(&MasterSeed::from_entropy([0x31; 32]), 0);
         let recipient =
             Wallet::from_master_seed(&MasterSeed::from_entropy([0x32; 32]), 0).address_at_index(0);
         let note = crate::send::Spendable {
             div_index: 0,
-            value: 10_000_000,
+            value: 1_000_000_000,
             rho: [3; 4],
             rseed: [5; 4],
         };
@@ -561,7 +565,7 @@ mod tests {
             recipient.short().encode(),
             Some((2, 9)),
             Some((0, 9)),
-            None,
+            name_op,
             &mut StdRng::seed_from_u64(0x351),
         )
         .expect("a valid phase-1 bundle")
@@ -584,6 +588,40 @@ mod tests {
                 .expect("future version refuses"),
             BundleError::UnknownVersion(0x7f),
         );
+    }
+
+    #[test]
+    fn name_service_rider_is_selected_and_round_trips_with_its_fee() {
+        use qlab_devnet::names::{encode_rider, name_fee_for, NameOp};
+
+        let op = NameOp::Renew {
+            name: b"alice".to_vec(),
+        };
+        let bundle = bundle_with_name_op(Some(&op));
+        let expected_fee = posted_fee(ArityBucket::TwoByTwo) + name_fee_for(&op);
+        assert_eq!(bundle.fee, expected_fee);
+        assert_eq!(bundle.rider, encode_rider(Some(&op)));
+        assert_eq!(
+            bundle.outputs[1].value,
+            1_000_000_000 - bundle.amount - expected_fee,
+            "the rider fee changes phase-1 output construction"
+        );
+
+        let encoded = bundle.to_bytes();
+        let decoded = WitnessBundle::from_bytes(&encoded).expect("rider-carrying v1 decodes");
+        assert_eq!(
+            decoded.to_bytes(),
+            encoded,
+            "rider encoding stays canonical"
+        );
+        assert_eq!(decoded.rider, encode_rider(Some(&op)));
+
+        let mut mismatched = decoded;
+        mismatched.rider = qlab_devnet::names::encode_rider(None);
+        let err = WitnessBundle::from_bytes(&mismatched.to_bytes())
+            .err()
+            .expect("a rider and its selected fee cannot be separated");
+        assert!(err.to_string().contains("name-service fee"), "{err}");
     }
 
     #[test]

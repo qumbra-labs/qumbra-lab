@@ -315,6 +315,7 @@ fn a_first_spend_travels_the_whole_story_and_the_recipient_detects_it() {
         amount: AMOUNT,
         scan_to: tip.height,
         no_submit: false,
+        name_op: None,
     };
     let mut ignore = |_| {};
     let bundle = select(&req, &mut ignore).expect("phase 1 selects and serializes a witness");

@@ -671,6 +671,7 @@ mod tests {
             amount: bundle.amount(),
             scan_to: bundle.selected_at_tip(),
             no_submit: false,
+            name_op: None,
         };
         let calls = Rc::new(RefCell::new(Vec::new()));
         let select_calls = Rc::clone(&calls);
@@ -705,6 +706,7 @@ mod tests {
                             fee: selected.fee(),
                         },
                         discovery: vec![0],
+                        rider: TxEntry::absent_rider(),
                     },
                     wire_bytes: proved_wire,
                     fee: selected.fee(),
