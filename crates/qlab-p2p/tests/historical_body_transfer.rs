@@ -686,3 +686,83 @@ fn a_getdata_asking_for_more_bodies_than_the_cap_gets_headers_for_the_remainder(
     assert_eq!(headers, over - MAX_BODIES_PER_GETDATA, "the remainder, header-only as before");
     assert_eq!(not_found, 0, "over-asking is never answered with a scored refusal");
 }
+
+/// 🔴 **Issue #371 S2 — an out-of-order window must not collapse the ask set.**
+///
+/// The joiner drill found this: bodies fetched across several peers arrive out
+/// of order, so only the one contiguous with the state tip applies at its own
+/// arrival — the rest buffer in the pending-application window. The
+/// satisfaction check read only "applied or in the serving cache", so those
+/// asks sat "outstanding" for the whole 15 s re-ask timeout, and after every
+/// drain `request_missing_bodies` found `room = 1`: the 16-wide pipeline
+/// self-collapsed to one ask in flight — `breq=1`, #359 wall 2's exact shape,
+/// at drill scale. A buffered body is a satisfied ask: it applies with no
+/// further wire traffic, and `missing_body_hashes` already excludes it.
+///
+/// Three assertions, in the order the defect chained: a window served all but
+/// its frontier clears down to ONE outstanding ask; the frontier arriving
+/// drains the whole span; and the very next pass asks a full-width window
+/// again instead of one block.
+#[test]
+fn an_out_of_order_window_keeps_the_full_ask_width() {
+    let (mut server, mut behind, _hub) = pair();
+    let blocks = mine_chain(&mut server, 40);
+    lagging_at_one(&mut behind, &blocks);
+    server.add_peer(PeerId(2), None);
+    behind.add_peer(PeerId(1), None);
+    // Handshake only: the asks go out and the server never answers on its own —
+    // every body below is injected by hand, in exactly the order the test needs.
+    handshake_only(&mut server, &mut behind);
+    assert_eq!(behind.body_requests(), MAX_BODIES_IN_FLIGHT, "the full window is out");
+
+    // Serve the window BACKWARDS, withholding the frontier (height 2): heights
+    // 17 down to 3, none of which can apply — all of them buffer.
+    let mut now = 20;
+    for (h, body) in blocks[2..17].iter().rev() {
+        let ann = BlockAnnounce {
+            header: *h,
+            nonce: 0,
+            coinbase: body.coinbase,
+            coinbase_rkm: body.coinbase_rkm,
+            short_ids: Vec::new(),
+            prefilled: Vec::new(),
+        };
+        let frame = Envelope::new(MsgType::BlockAnnounce, encode_announce(&ann)).encode();
+        server.transport().send(PeerId(2), &frame).expect("send");
+        now += SIM_TICK_MS;
+        behind.tick(now);
+    }
+    assert_eq!(slag(&behind), 39, "nothing applied yet — the frontier is withheld");
+    assert_eq!(
+        behind.body_requests(),
+        1,
+        "15 buffered bodies are 15 satisfied asks; only the frontier is still owed \
+         (before the fix this read 16, and after a drain the window collapsed to 1)"
+    );
+
+    // The frontier arrives: the whole buffered span drains in one pass.
+    let (h2, b2) = &blocks[1];
+    let ann = BlockAnnounce {
+        header: *h2,
+        nonce: 0,
+        coinbase: b2.coinbase,
+        coinbase_rkm: b2.coinbase_rkm,
+        short_ids: Vec::new(),
+        prefilled: Vec::new(),
+    };
+    let frame = Envelope::new(MsgType::BlockAnnounce, encode_announce(&ann)).encode();
+    server.transport().send(PeerId(2), &frame).expect("send");
+    now += SIM_TICK_MS;
+    behind.tick(now);
+    assert_eq!(behind.node().state_lag().state_tip, 17, "one arrival closed a 16-gap");
+
+    // And the next pass opens a FULL window over the new frontier — the number
+    // that was 1 for fifteen seconds before the fix.
+    now += SIM_TICK_MS;
+    behind.tick(now);
+    assert_eq!(
+        behind.body_requests(),
+        MAX_BODIES_IN_FLIGHT,
+        "the pipeline is full-width again immediately, not after a timeout"
+    );
+}

@@ -440,6 +440,13 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// Rotation cursor for the peer a query is sent to, so one peer that cannot or
     /// will not answer costs one interval rather than the whole recovery.
     cp_query_rr: usize,
+    /// **The joiner drill's mutation switch** (issue #371 S5): when `false`,
+    /// `GetData(Block)` is answered header-only — byte-for-byte the pre-#182
+    /// wire behaviour — so the in-suite drill can demonstrate that with
+    /// historical serving absent a fresh joiner stalls exactly as the live net's
+    /// did (#84's law: the drill must detect the gap it drills). `true` in every
+    /// production construction; nothing in the binary flips it.
+    serve_historical_bodies: bool,
 }
 
 impl<T: Transport, N: NodeState> P2pNode<T, N> {
@@ -468,7 +475,17 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             body_fetch_progress: false,
             cp_queries: HashMap::new(),
             cp_query_rr: 0,
+            serve_historical_bodies: true,
         }
+    }
+
+    /// Flip the drill's serving switch (issue #371 S5) — see the field. Test
+    /// infrastructure: the one caller outside this crate is the joiner drill's
+    /// negative control, which needs the pre-#182 server behaviour reproducible
+    /// through the same code path so the stall it asserts is today's stall and
+    /// not a second implementation of it.
+    pub fn set_serve_historical_bodies(&mut self, on: bool) {
+        self.serve_historical_bodies = on;
     }
 
     // --- read-only accessors (tests / callers) ---
@@ -1448,9 +1465,24 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // for a block we cannot serve (see `request_missing_bodies`), and it is the
         // only answer expressible: `InvItem` cannot hold a kind we do not have.
         self.count_unknown_inv(&inv);
+        // Issue #371 S3: one 8 MiB `GetData` can name ~250 k items, and every
+        // item costs a lookup and an answer. Items past the cap are IGNORED —
+        // not `NotFound` (scored by the receiver on some paths), not headers
+        // (that answer is itself the ~50 MB header-storm amplifier). An honest
+        // requester never reaches the cap (see the constant); a capped one
+        // re-asks after its own timeout, unscored, exactly as for any
+        // unanswered item. Counted, never silent.
+        let item_cap = self.limiter.limits().max_getdata_items;
+        let body_byte_cap = self.limiter.limits().max_body_bytes_per_getdata;
+        let mut items = inv.items;
+        if items.len() > item_cap {
+            self.limiter.note_getdata_items_dropped(items.len() - item_cap);
+            items.truncate(item_cap);
+        }
         let mut not_found = Vec::new();
         let mut bodies_served = 0usize;
-        for it in inv.items {
+        let mut body_bytes_served = 0u64;
+        for it in items {
             match it.kind {
                 InvKind::Tx => match self.node.get_tx(&it.id) {
                     Some(tx) => self.send(from, MsgType::Tx, encode_tx(&tx)),
@@ -1486,23 +1518,46 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 // above stands unchanged for as long as any such host is running.
                 InvKind::Block => match self.node.header(&it.id) {
                     Some(h) => {
-                        let body = if bodies_served < MAX_BODIES_PER_GETDATA {
+                        // Issue #371 S3: every gate that can stop a WHOLE body
+                        // degrades to the same answer — the header, exactly the
+                        // pre-#182 wire — and none of them is `NotFound` (we do
+                        // have the object this inv named, and `NotFound` is
+                        // scored) or silence (an honest asker would burn its
+                        // 15 s re-ask on a peer that will refuse it again).
+                        // The gates, cheapest first: the drill's mutation
+                        // switch, the count cap, then a free-tokens pre-check
+                        // so a drained budget costs no body clone or encode.
+                        let body = if self.serve_historical_bodies
+                            && bodies_served < MAX_BODIES_PER_GETDATA
+                            && body_bytes_served < body_byte_cap
+                            && self.limiter.body_serve_has_budget(key.clone(), now_ms)
+                        {
                             self.body_for_serving(&it.id)
                         } else {
                             None
                         };
-                        match body {
-                            Some(b) => {
+                        let mut served = false;
+                        if let Some(b) = body {
+                            let ann = whole_block_announce(h, b);
+                            let bytes = encode_announce(&ann);
+                            let cost = bytes.len() as u64;
+                            // Charged at the encoded answer size — the number
+                            // the peer's inbound limiter will see — against
+                            // both the per-message bound and the per-key
+                            // sustained budget. A refusal consumes nothing.
+                            if body_bytes_served.saturating_add(cost) <= body_byte_cap
+                                && self.limiter.may_serve_body_bytes(key.clone(), cost, now_ms)
+                            {
                                 bodies_served += 1;
-                                let ann = whole_block_announce(h, b);
-                                self.send(from, MsgType::BlockAnnounce, encode_announce(&ann));
+                                body_bytes_served += cost;
+                                self.send(from, MsgType::BlockAnnounce, bytes);
+                                served = true;
                             }
-                            // No body held, or past the per-message cap: the header,
-                            // exactly as before. Never `NotFound` — we do have the
-                            // object this inv named, and `NotFound` is scored.
-                            None => {
-                                self.send(from, MsgType::Header, crate::codec::encode_header(&h))
-                            }
+                        }
+                        if !served {
+                            // No body held, past a cap, or over a budget: the
+                            // header, exactly as before.
+                            self.send(from, MsgType::Header, crate::codec::encode_header(&h))
                         }
                     }
                     None => not_found.push(it),
@@ -1968,7 +2023,24 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // the retry by up to 15 s, which is the same bound a *missing* answer already
         // pays and is the honest reading of both — we asked, and we still do not have
         // it.
-        if self.blocks.contains(&bh) || self.node.has_stored_body(&bh) {
+        //
+        // 🔴 **"Hold" includes the pending-application buffer (issue #371 S2), and
+        // the joiner drill is what proved the omission was the pipeline's collapse.**
+        // Historical bodies arrive out of order across peers, so only the one
+        // contiguous with the state tip applies at its own arrival check — the other
+        // ~15 of a full window buffer, this check read only "applied or in the
+        // serving cache", and their asks sat "outstanding" for the whole 15 s
+        // timeout. `request_missing_bodies` then found `room = 1`: the 16-wide
+        // window self-collapsed to one ask in flight — `breq=1`, #359 wall 2's
+        // exact shape, reproduced in-suite. A buffered body is a satisfied ask (it
+        // applies with no further wire traffic, and `missing_body_hashes` already
+        // excludes it), so it must not hold a window slot. The busy-loop reasoning
+        // above is untouched: a REFUSED body is neither applied nor buffered, so
+        // its retry stays paced by the timeout.
+        if self.blocks.contains(&bh)
+            || self.node.has_stored_body(&bh)
+            || self.node.holds_body_buffered(&bh)
+        {
             if self.body_reqs.remove(&bh).is_some() {
                 // Issue #200: a requested body is now held — that is progress.
                 self.body_fetch_progress = true;

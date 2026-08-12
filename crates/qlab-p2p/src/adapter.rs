@@ -2158,6 +2158,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         out
     }
 
+    fn holds_body_buffered(&self, hash: &Hash32) -> bool {
+        // The pending map is keyed `(height, hash)` for ascending drain order;
+        // the height comes from the header, which the buffer's admission gate
+        // guarantees this node holds.
+        self.chain
+            .header(hash)
+            .is_some_and(|h| self.pending_bodies.contains_key(&(h.height, *hash)))
+    }
+
     fn observe_body_fetch(
         &mut self,
         now_ms: u64,
