@@ -224,6 +224,15 @@ pub fn txid(entry: &TxEntry) -> TxId {
     buf.extend_from_slice(&entry.public.fee.to_le_bytes());
     buf.extend_from_slice(&(entry.proof.len() as u64).to_le_bytes());
     buf.extend_from_slice(&entry.proof);
+    // Lab #367: a non-absent rider is part of tx identity — without this, a
+    // rider-carrying registration and its rider-stripped twin share a txid and
+    // the pool dedups them as one, letting a stripped copy block the real
+    // registration at the mempool. Presence-conditional so every pre-#367
+    // txid is unchanged.
+    if entry.rider != qlab_devnet::names::RIDER_ABSENT {
+        buf.extend_from_slice(&(entry.rider.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&entry.rider);
+    }
     keccak256(&buf)
 }
 
@@ -236,7 +245,15 @@ pub fn tx_weight(entry: &TxEntry) -> u64 {
         + entry.public.commitments.len() * 32
         + 1
         + 8;
-    (entry.proof.len() + public) as u64
+    // Lab #367: rider bytes are body bytes and are priced like every other
+    // body byte (task book stage 1). Presence-conditional so a rider-free
+    // transaction's weight — i.e. every pre-#367 weight — is unchanged.
+    let rider = if entry.rider != qlab_devnet::names::RIDER_ABSENT {
+        8 + entry.rider.len()
+    } else {
+        0
+    };
+    (entry.proof.len() + public + rider) as u64
 }
 
 // `coinbase_note_commitment` was DELETED by issue #101, not deprecated. It

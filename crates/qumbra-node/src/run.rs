@@ -5640,6 +5640,7 @@ mod tests {
                     fee,
                 },
                 discovery,
+                rider: TxEntry::absent_rider(),
             }
         };
         let wire_ok = qlab_p2p::codec::encode_tx(&tx_for(1, fee, true));
