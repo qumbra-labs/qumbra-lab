@@ -298,8 +298,14 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// tests set it to zero and drive [`Self::try_mine`] directly).
     mine_interval: Duration,
     last_mine: Instant,
-    /// #362: last boundary vote re-push, bounded to BOUNDARY_REPUSH_INTERVAL.
+    /// #362: last boundary vote re-push, bounded to [`Self::repush_interval`].
     last_boundary_repush: Instant,
+    /// #362: spacing between boundary vote re-pushes. Initialised to the
+    /// production [`BOUNDARY_REPUSH_INTERVAL`] and only ever moved by
+    /// [`Self::set_repush_interval`], the same shape `mine_interval` has: the
+    /// binary never touches it, no config key reaches it, and the drill
+    /// (issue #369, D2) sets it to zero rather than waiting a minute per push.
+    repush_interval: Duration,
     /// Nonce salt for successive `BlockAnnounce`s.
     nonce: u64,
     /// Next checkpoint height to propose (cadence grid; only if we hold keys).
@@ -669,6 +675,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             mine_interval: Duration::from_secs(genesis.frozen.block_time_secs),
             last_mine: Instant::now(),
             last_boundary_repush: Instant::now(),
+            repush_interval: BOUNDARY_REPUSH_INTERVAL,
             nonce: 0,
             next_checkpoint: 0, // finalize genesis first, then the cadence grid
             // The ledger's cursor starts at the first cadence slot: genesis is
@@ -803,6 +810,20 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// Override the mining cadence (tests set 0 to mine every step).
     pub fn set_mine_interval(&mut self, d: Duration) {
         self.mine_interval = d;
+    }
+
+    /// Override the #362 boundary vote re-push cadence (tests set 0 to re-push on
+    /// every loop pass).
+    ///
+    /// The production default is [`BOUNDARY_REPUSH_INTERVAL`] — 60 s — and the
+    /// binary never calls this: it exists because the island-merge cascade
+    /// (issue #369, D2) is a *multi-push* property and a drill that waited a
+    /// real minute per push could not be in the suite at all. Deliberately the
+    /// same shape as [`Self::set_mine_interval`]: a method on the running node,
+    /// not a config key and not a mutable const, so the wire, the config file
+    /// and every deployed binary keep exactly one cadence.
+    pub fn set_repush_interval(&mut self, d: Duration) {
+        self.repush_interval = d;
     }
 
     /// Select the header-timestamp mining clock (item 0). The binary opts into
@@ -2176,7 +2197,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 // held 15). Re-push the stored variants on a slow cadence;
                 // receiver-side signer-dedup makes repetition harmless, and
                 // the halted-unfinalized condition dissolves at finalization.
-                if self.last_boundary_repush.elapsed() >= BOUNDARY_REPUSH_INTERVAL {
+                if self.last_boundary_repush.elapsed() >= self.repush_interval {
                     let n = self.p2p.repush_slot_votes(h);
                     if n > 0 {
                         println!("REPUSH slot={h} variants={n} why=boundary-unfinalized");
@@ -6055,5 +6076,630 @@ mod tests {
         const LINE_BUDGET_BYTES: u64 = 400;
         let bytes_per_day = rounds_per_day * LINE_BUDGET_BYTES;
         assert!(bytes_per_day <= 60_000, "round journal is {bytes_per_day} B/day");
+    }
+
+    // ================== issue #369: the committee-to-halt drill ==================
+    //
+    // 2026-08-12's live boundary (height 8,640) produced three consensus defects in
+    // one morning, and every offline drill this repo had was structurally blind to
+    // all three: the #74 drills exercise release/marker/validation seams on a SINGLE
+    // node, and every committee test — including the M10-T0-2 recovery e2e in
+    // `qlab_p2p::adapter` this drill was first pointed at — hand-drives
+    // `try_checkpoint` over an in-process, hand-relayed pair of adapters. A drill
+    // that hands the committee its own proposals cannot see a committee that never
+    // proposes, which is exactly how #360 stayed invisible until a real halt.
+    //
+    // These three cases run a committee TO a halt and through it, over the real TCP
+    // mesh harness the #83/#106 tests already use (`rig` + `free_port` + the real
+    // `run_until_with` loop), with the committee keys **split so that no node holds
+    // quorum** (stamp S1).
+    //
+    // **Nothing here calls `try_checkpoint` or `maintain_boundary_checkpoint`**
+    // (stamp S2). Every checkpoint in every case below is proposed by the production
+    // run loop; `spin` drives that loop and nothing else.
+
+    use qlab_p2p::n1::CheckpointIngest; // `checkpoint_variants_at` — the real tally
+
+    type DrillNode = RunningNode<KeccakPow, DevnetRehearsalVerifier>;
+
+    /// The deployed T0 key split — 6/5/5/5 over the genesis committee's 21 keys.
+    ///
+    /// **Stamp S1 is this array.** Quorum is 15; the largest share is 6; so no
+    /// single node can finalize anything on its own, and every finalization these
+    /// cases assert is a real cross-node accumulation over the wire. The 6 is on
+    /// index 1 rather than index 0 deliberately: index 0 is D1's miner, and putting
+    /// the *small* share on the one host whose mining-gated `try_checkpoint` still
+    /// fires makes D1's mutation check strictly harder to pass by accident.
+    const KEY_SHARES: [usize; 4] = [5, 6, 5, 5];
+
+    /// Drive `node`'s **real** run loop for exactly `iters` iterations.
+    ///
+    /// This is the whole point of the drill's driver: it is [`RunningNode::
+    /// run_until_with`] — the production event loop, with the production mining
+    /// branch, the production `maintain_boundary_checkpoint` call and the production
+    /// re-push cadence — stopped by its own `shutdown` flag from the per-iteration
+    /// hook. The drill therefore *pumps* the loop (which stamp S2 permits) and never
+    /// substitutes for it.
+    fn spin(node: &mut DrillNode, iters: usize) {
+        let stop = AtomicBool::new(false);
+        let mut n = 0usize;
+        node.run_until_with(&stop, |_| {
+            n += 1;
+            if n >= iters {
+                stop.store(true, Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// One bounded spin on every node, `rounds` times — the mesh's propagation pump.
+    fn spin_all(nodes: &mut [DrillNode], rounds: usize, iters: usize) {
+        for _ in 0..rounds {
+            for n in nodes.iter_mut() {
+                spin(n, iters);
+            }
+        }
+    }
+
+    /// Spin the mesh until `done` holds, or fail with `what` after `rounds` tries.
+    fn spin_until(
+        nodes: &mut [DrillNode],
+        rounds: usize,
+        what: &str,
+        done: impl Fn(&[DrillNode]) -> bool,
+    ) {
+        for _ in 0..rounds {
+            if done(nodes) {
+                return;
+            }
+            spin_all(nodes, 1, 2);
+        }
+        assert!(
+            done(nodes),
+            "{what} — tips {:?}, finalized {:?}",
+            nodes.iter().map(|n| n.tip_height()).collect::<Vec<_>>(),
+            nodes.iter().map(|n| n.finalized_height()).collect::<Vec<_>>(),
+        );
+    }
+
+    /// A drill rig for node `i`: [`rig`]'s temp dir + genesis + the 21 key files,
+    /// with only this node's SHARE of the keys configured and the mining cadence
+    /// parked so the drill — not the wall clock — decides who mines when.
+    ///
+    /// `peers` is written into `dial_peers`, so an empty slice is a node that starts
+    /// **into a not-yet-connected mesh** (D2's staging) and a full slice is the
+    /// mesh `deploy/deploy.sh` writes (D1's).
+    fn drill_node(
+        tag: &str,
+        i: usize,
+        listen: &str,
+        peers: &[String],
+        mining: bool,
+    ) -> (DrillNode, PathBuf) {
+        let (mut cfg, genesis, base) = rig(&format!("{tag}_{i}"), mining);
+        let lo: usize = KEY_SHARES[..i].iter().sum();
+        cfg.committee_key_paths = cfg.committee_key_paths[lo..lo + KEY_SHARES[i]].to_vec();
+        cfg.listen_addr = listen.to_string();
+        cfg.advertise_addr = Some(listen.to_string());
+        cfg.dial_peers = peers.to_vec();
+        let mut node = RunningNode::start_with_release(
+            &cfg, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+        )
+        .unwrap();
+        // Parked, not zero: the drill opens this gate for exactly one block at a
+        // time (see `mine_one`). A live net randomises the mining order; the drill
+        // fixes it, because the tip race is D3's subject and racing it in D1/D2
+        // would make them nondeterministic rather than realistic.
+        node.set_mine_interval(Duration::from_secs(3_600));
+        (node, base)
+    }
+
+    /// Four loopback addresses and the full mesh each node dials (everyone but
+    /// itself) — the shape `deploy/deploy.sh` writes onto the four T0 hosts.
+    fn mesh_addrs() -> (Vec<String>, Vec<Vec<String>>) {
+        let addrs: Vec<String> =
+            (0..4).map(|_| format!("127.0.0.1:{}", free_port())).collect();
+        let peers = (0..4)
+            .map(|i| {
+                addrs
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, a)| a.clone())
+                    .collect()
+            })
+            .collect();
+        (addrs, peers)
+    }
+
+    /// Open node `m`'s mining gate for **one** block and let the mesh catch up.
+    /// The checkpoint that block's miner proposes is proposed by the loop's own
+    /// mining branch — the drill never calls `try_checkpoint`.
+    fn mine_one(nodes: &mut [DrillNode], m: usize, height: u64) {
+        nodes[m].set_mine_interval(Duration::ZERO);
+        for _ in 0..40 {
+            if nodes[m].tip_height() >= height {
+                break;
+            }
+            spin(&mut nodes[m], 1);
+        }
+        nodes[m].set_mine_interval(Duration::from_secs(3_600));
+        assert_eq!(nodes[m].tip_height(), height, "node {m} mined block {height}");
+        spin_until(nodes, 60, &format!("block {height} reached the whole mesh"), |ns| {
+            ns.iter().all(|n| n.tip_height() == height)
+        });
+    }
+
+    /// Every node's committed variant at the boundary slot, read from the
+    /// never-double-sign LEDGERS (issue #84's `local_commitment`) — the record a
+    /// split forensic actually reads.
+    fn commitments(nodes: &[DrillNode]) -> Vec<Option<u64>> {
+        nodes.iter().map(|n| n.local_commitment().and_then(|c| c.id)).collect()
+    }
+
+    /// **DRILL D1 — committee to a halt, finalized by the LOOP path alone.**
+    ///
+    /// Four nodes over real loopback TCP, committee keys 5/6/5/5 so **no node holds
+    /// quorum** (15 of 21). The mesh mines to the drill boundary and stops there;
+    /// nothing in this test proposes a checkpoint, and the boundary still finalizes,
+    /// unanimously, from `maintain_boundary_checkpoint` plus gossip.
+    ///
+    /// **The mutation check (stamp S4).** Revert #361 — make
+    /// `maintain_boundary_checkpoint` a no-op — and this test fails at the boundary
+    /// assertion with `final=8`: the only slot-16 votes that exist are the 5 the
+    /// miner of block 16 cast through the still-reachable mining-gated route, and 5
+    /// is not 15. That residue is not an artifact of the fixture; it is the live
+    /// 8,640 halt in miniature (16 of 21 keys signed, no tally ever holding 15).
+    #[test]
+    fn d1_a_split_committee_mines_to_a_halt_and_the_loop_finalizes_the_boundary() {
+        let (addrs, peers) = mesh_addrs();
+        let mut bases = Vec::new();
+        let mut nodes: Vec<DrillNode> = Vec::new();
+        for i in 0..4 {
+            let (n, base) = drill_node("i369_d1", i, &addrs[i], &peers[i], true);
+            nodes.push(n);
+            bases.push(base);
+        }
+
+        // S1, asserted rather than assumed: the quorum is 15 and the largest share
+        // is 6, so no single node here can finalize anything by itself.
+        let quorum = GenesisFile::new_devnet_t0().frozen.quorum as usize;
+        assert_eq!(quorum, 15);
+        for (i, share) in KEY_SHARES.iter().enumerate() {
+            assert!(*share < quorum, "node {i} holds {share} keys, quorum is {quorum}");
+        }
+        assert_eq!(KEY_SHARES.iter().sum::<usize>(), 21, "the whole committee is placed");
+
+        // The mesh forms and every node clears the #106 readiness gate on a real
+        // claim (best_height 0 received, not defaulted).
+        spin_until(&mut nodes, 60, "the mesh handshakes", |ns| {
+            ns.iter().all(|n| n.mine_gate() == MineGate::Synced)
+        });
+
+        // Mine to the boundary, one block at a time, rotating the miner so every
+        // key-holder's mining-gated `try_checkpoint` fires on its own turn — which
+        // is how the sub-boundary cadence slots get votes from four separate hosts.
+        for h in 1..=DH {
+            mine_one(&mut nodes, ((h - 1) % 4) as usize, h);
+        }
+
+        // Sub-boundary finality formed ACROSS the split: slot 8 needed 15 keys and
+        // no node had more than 6, so this number could only have come off the wire.
+        spin_until(&mut nodes, 120, "slot 8 finalized across the split committee", |ns| {
+            ns.iter().all(|n| n.finalized_height() >= Some(CHECKPOINT_CADENCE_BLOCKS))
+        });
+
+        // Every node is halted at the boundary and no node mines again.
+        for (i, n) in nodes.iter_mut().enumerate() {
+            assert_eq!(n.tip_height(), DH, "node {i} at the boundary");
+            assert!(n.is_halted(), "node {i} halted");
+            n.set_mine_interval(Duration::ZERO);
+            assert!(!n.try_mine(), "node {i}: a halted node never mines again");
+            n.set_mine_interval(Duration::from_secs(3_600));
+        }
+
+        // 🔴 THE PROPERTY. Nothing below this line proposes a checkpoint: the loop's
+        // own `maintain_boundary_checkpoint` does, and gossip carries the rest.
+        spin_until(&mut nodes, 120, "the boundary finalized via the loop path", |ns| {
+            ns.iter().all(|n| n.finalized_height() == Some(DH))
+        });
+
+        let fid = nodes[0].finalized_checkpoint_id().expect("a finalized boundary");
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(n.finalized_height(), Some(DH), "node {i} finalized the boundary");
+            assert_eq!(n.finalized_checkpoint_id(), Some(fid), "node {i}: fid unanimous");
+            assert_eq!(n.finality_backing_field(), "local", "node {i} holds the block it finalized");
+            let line = n.telemetry_sample();
+            assert!(line.contains("regime=Halted"), "node {i}: {line}");
+        }
+        // …and the keys that DID commit at the boundary slot are quorum-many and
+        // all on the one variant.
+        //
+        // Not "all 21": the drill measured `have=16 need=15 absent=11..15` — the
+        // quorum formed from three hosts' shares and the fourth's
+        // `maintain_boundary_checkpoint` then correctly went inert, because the
+        // boundary it would have proposed for was already finalized. A drill that
+        // demanded 21 would be asserting a race it does not control.
+        let on_boundary: usize = nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| {
+                n.local_commitment().is_some_and(|c| c.slot == DH && c.id == Some(fid))
+            })
+            .map(|(i, _)| KEY_SHARES[i])
+            .sum();
+        assert!(on_boundary >= quorum, "{on_boundary} keys committed to the boundary variant");
+        for (i, n) in nodes.iter().enumerate() {
+            if let Some(c) = n.local_commitment() {
+                if c.slot == DH {
+                    assert_eq!(c.id, Some(fid), "node {i} committed to a DIFFERENT variant");
+                }
+            }
+        }
+
+        for (n, base) in nodes.into_iter().zip(bases) {
+            drop(n);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// Copy `donor`'s chain files into `dirs` — the transplant path that
+    /// `a_snapshotless_host_rejoins_by_snapshot_transplant` already locks
+    /// (`persist::Snapshot` is pure chain state, no node identity).
+    ///
+    /// D2 and D3 need four nodes standing at the boundary **without ever having
+    /// been connected to each other**, which is the one state a mesh cannot mine
+    /// itself into: propagation is what a mesh does. So the chain is mined once, by
+    /// a node that is genuinely alone, and handed to the others the way the #359
+    /// runbook hands one to a rescued host.
+    fn transplant(donor: &std::path::Path, dirs: &[std::path::PathBuf]) {
+        for d in dirs {
+            std::fs::create_dir_all(d).unwrap();
+            for f in [qlab_node::SNAPSHOT, qlab_node::BLOCK_LOG] {
+                std::fs::copy(donor.join(f), d.join(f)).unwrap();
+            }
+        }
+    }
+
+    /// Mine a lone chain to `to` and return its data dir + the temp base. The miner
+    /// holds NO committee keys, so nothing it does puts a vote anywhere.
+    fn lone_chain(tag: &str, to: u64, rkm: Option<&str>) -> (std::path::PathBuf, PathBuf) {
+        let (mut cfg, genesis, base) = rig(tag, true);
+        cfg.committee_key_paths = vec![]; // verify-only: mines, never signs
+        cfg.miner_rkm = rkm.map(|s| s.to_string());
+        assert!(cfg.dial_peers.is_empty(), "genuinely alone (#106's `Alone` branch)");
+        let mut n = RunningNode::start_with_release(
+            &cfg, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+        )
+        .unwrap();
+        n.set_mine_interval(Duration::ZERO);
+        for _ in 0..to {
+            assert!(n.try_mine(), "the lone miner extends its own chain");
+        }
+        assert_eq!(n.tip_height(), to);
+        n.save_snapshot().unwrap();
+        drop(n);
+        (cfg.data_dir, base)
+    }
+
+    /// Connect a set of already-running, unconnected nodes into a full mesh
+    /// **without restarting any of them** — the #83 learn + maintain path.
+    fn connect_mesh(nodes: &mut [DrillNode], addrs: &[String]) {
+        for (i, n) in nodes.iter_mut().enumerate() {
+            let others: Vec<String> = addrs
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, a)| a.clone())
+                .collect();
+            n.p2p.addrs_mut().learn(others);
+        }
+        // Outbound connects are asynchronous since #132: one `maintain` pass STARTS
+        // a dial (`DialStart::Pending`) and a later one finishes it, so the mesh
+        // needs several passes plus pumping in between — not one call.
+        for _ in 0..60 {
+            if nodes.iter().all(|n| n.p2p().addrs().dialable_count() >= 2) {
+                break;
+            }
+            for n in nodes.iter_mut() {
+                n.force_redial_ready();
+                n.maintain_peers();
+            }
+            spin_all(nodes, 1, 2);
+        }
+        // Two outbound edges per node is enough and is what this harness reliably
+        // produces: minimum degree 2 on four vertices is a CONNECTED graph, and the
+        // vote relay is transitive (a peer whose tally grows pushes onward), so
+        // every set reaches every node. Demanding a complete graph would be
+        // asserting a property of the dial scheduler, which is not what is on trial
+        // here — and the cascade assertion below fails loudly if reachability is in
+        // fact short.
+        for (i, n) in nodes.iter().enumerate() {
+            assert!(
+                n.p2p().addrs().dialable_count() >= 2,
+                "node {i} reached {} peers — the mesh is not connected",
+                n.p2p().addrs().dialable_count(),
+            );
+        }
+    }
+
+    /// **DRILL D2 — vote islands, and the REPUSH cadence that bridges them.**
+    ///
+    /// The #362 defect, staged as it happened: four halted processes come up one at
+    /// a time into a mesh that is not connected yet, each signs the boundary and
+    /// fires its ONE growth-gated push into the void, and the result is four stable
+    /// islands holding 21 signatures between them with no tally holding 15. The
+    /// mesh then connects and **nothing happens** — the relay is growth-gated and
+    /// nothing grows. Only the re-push cadence can move it.
+    ///
+    /// **The mutation check (stamp S4).** Stub `P2pNode::repush_slot_votes` to push
+    /// nothing (`return 0`) and this test fails at the cascade assertion: the
+    /// islands stay exactly where the first phase left them, which is the whole
+    /// finding — the live net sat in that state for hours with 16 of 21 keys signed.
+    #[test]
+    fn d2_restart_islands_are_bridged_by_the_boundary_repush_cascade() {
+        let (donor, donor_base) = lone_chain("i369_d2_donor", DH, None);
+        let (addrs, _) = mesh_addrs();
+
+        // Four hosts, each on the boundary chain, each with its own key share, each
+        // configured to dial NOBODY — the staggered-restart window, held open.
+        let mut bases = Vec::new();
+        let mut dirs = Vec::new();
+        let mut nodes: Vec<DrillNode> = Vec::new();
+        for i in 0..4 {
+            let (mut cfg, genesis, base) = rig(&format!("i369_d2_{i}"), true);
+            let lo: usize = KEY_SHARES[..i].iter().sum();
+            cfg.committee_key_paths = cfg.committee_key_paths[lo..lo + KEY_SHARES[i]].to_vec();
+            cfg.listen_addr = addrs[i].clone();
+            cfg.advertise_addr = Some(addrs[i].clone());
+            transplant(&donor, &[cfg.data_dir.clone()]);
+            let mut n = RunningNode::start_with_release(
+                &cfg, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+            )
+            .unwrap();
+            n.set_mine_interval(Duration::from_secs(3_600));
+            assert_eq!(n.tip_height(), DH, "node {i} opened on the transplanted boundary");
+            assert!(n.is_halted());
+            // Sequenced: this node runs its loop — signs the boundary, pushes to the
+            // zero peers it has — before the next one is even started.
+            spin(&mut n, 4);
+            dirs.push(cfg.data_dir.clone());
+            bases.push(base);
+            nodes.push(n);
+        }
+
+        // Each island holds exactly its own share, and 21 signatures exist in total
+        // with no tally anywhere holding 15.
+        let quorum = GenesisFile::new_devnet_t0().frozen.quorum as usize;
+        for (i, n) in nodes.iter().enumerate() {
+            let variants = n.p2p().node().checkpoint_variants_at(DH);
+            assert_eq!(variants.len(), 1, "node {i}: one variant, its own");
+            assert_eq!(variants[0].1.len(), KEY_SHARES[i], "node {i}: its own share, stranded");
+            assert!(variants[0].1.len() < quorum, "node {i} is an island, not a quorum");
+            assert_eq!(n.finalized_height(), None, "node {i}: the boundary is unfinalized");
+        }
+
+        // The mesh connects — and the islands do NOT merge, because the relay fires
+        // on tally GROWTH and nothing here grows. This is #362, reproduced.
+        connect_mesh(&mut nodes, &addrs);
+        spin_all(&mut nodes, 12, 3);
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(
+                n.p2p().node().checkpoint_variants_at(DH)[0].1.len(),
+                KEY_SHARES[i],
+                "🔴 node {i}: connectivity alone bridges nothing — the islands are stable",
+            );
+            assert_eq!(n.finalized_height(), None, "node {i}: still unfinalized after connecting");
+        }
+
+        // 🔴 THE PROPERTY. The #362 cadence, and nothing else, puts the stranded
+        // signatures back on the wire. (The seam is the drill's only production
+        // change — S3; at the shipped 60 s this same cascade takes minutes, which
+        // is what the live net measured.)
+        for n in nodes.iter_mut() {
+            n.set_repush_interval(Duration::ZERO);
+        }
+        spin_until(&mut nodes, 120, "the re-push cascade finalized the boundary", |ns| {
+            ns.iter().all(|n| n.finalized_height() == Some(DH))
+        });
+
+        let fid = nodes[0].finalized_checkpoint_id().expect("a finalized boundary");
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(n.finalized_checkpoint_id(), Some(fid), "node {i}: fid unanimous");
+            assert!(n.telemetry_sample().contains("regime=Halted"), "node {i}");
+        }
+        assert_eq!(commitments(&nodes), vec![Some(fid); 4], "one variant, 21 keys");
+
+        for (n, base) in nodes.into_iter().zip(bases) {
+            drop(n);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+        let _ = std::fs::remove_dir_all(&donor_base);
+    }
+
+    /// **DRILL D3 — the frozen tip tie at the boundary.**
+    ///
+    /// Two miners raced height 8,640 on the live net and the halt froze the race in
+    /// place: two valid blocks at the boundary, the committee split across them,
+    /// and no further block will ever break the tie because the chain is halted.
+    /// It resolved only because one host's pre-halt votes happened to be on the
+    /// winner. Nothing tested it.
+    ///
+    /// Deterministic mining cannot race itself (stamp S5), so the second variant is
+    /// **built and ingested**: the same parent, the same timestamp and difficulty,
+    /// a different payout key — so a different body commitment, a different header
+    /// hash, and exactly equal work. Both variants are ingested into every node,
+    /// in opposite orders on the two sides, so the split is first-seen fork choice
+    /// on a genuine tie rather than an arranged one.
+    #[test]
+    fn d3_a_boundary_tip_tie_finalizes_on_the_quorum_variant_and_never_on_the_loser() {
+        use qlab_node::recovery::SignRefusal;
+        use qlab_p2p::n1::BlockIngest;
+
+        // One chain to DH−1, then two different miners each build DH on it.
+        let (base_chain, base_chain_tmp) = lone_chain("i369_d3_chain", DH - 1, None);
+        let (a_dir, a_tmp) = ("i369_d3_va", "0101010101010101020202020202020203030303030303030404040404040404");
+        let (b_dir, b_tmp) = ("i369_d3_vb", "0505050505050505060606060606060607070707070707070808080808080808");
+
+        // Variant builders: each opens on the SAME parent chain and mines DH.
+        let variant = |tag: &str, rkm: &str| {
+            let (mut cfg, genesis, base) = rig(tag, true);
+            cfg.committee_key_paths = vec![];
+            cfg.miner_rkm = Some(rkm.to_string());
+            transplant(&base_chain, &[cfg.data_dir.clone()]);
+            let mut n = RunningNode::start_with_release(
+                &cfg, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+            )
+            .unwrap();
+            n.set_mine_interval(Duration::ZERO);
+            assert_eq!(n.tip_height(), DH - 1, "opened on the shared parent");
+            assert!(n.try_mine(), "{tag} mines the boundary block");
+            let hash = n.p2p().node().chain().main_chain()[DH as usize];
+            let header = *n.p2p().node().chain().header(&hash).expect("header");
+            let body = n.state().chain().block(&hash).expect("body").clone().body();
+            drop(n);
+            (header, body, base)
+        };
+        let (hdr_a, body_a, va_base) = variant(a_dir, a_tmp);
+        let (hdr_b, body_b, vb_base) = variant(b_dir, b_tmp);
+
+        // A genuine tie: same parent, same height, same work, different blocks.
+        assert_ne!(hdr_a.header_hash(), hdr_b.header_hash(), "two distinct boundary blocks");
+        assert_eq!(hdr_a.prev, hdr_b.prev, "on the same parent");
+        assert_eq!(hdr_a.height, hdr_b.height);
+        assert_eq!(hdr_a.difficulty, hdr_b.difficulty, "exactly equal work — nothing breaks this tie");
+
+        // Four halted hosts on the shared chain at DH−1, unconnected, split keys.
+        let (addrs, _) = mesh_addrs();
+        let mut bases = Vec::new();
+        let mut nodes: Vec<DrillNode> = Vec::new();
+        for i in 0..4 {
+            let (mut cfg, genesis, base) = rig(&format!("i369_d3_{i}"), false);
+            let lo: usize = KEY_SHARES[..i].iter().sum();
+            cfg.committee_key_paths = cfg.committee_key_paths[lo..lo + KEY_SHARES[i]].to_vec();
+            cfg.listen_addr = addrs[i].clone();
+            cfg.advertise_addr = Some(addrs[i].clone());
+            transplant(&base_chain, &[cfg.data_dir.clone()]);
+            let n = RunningNode::start_with_release(
+                &cfg, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+            )
+            .unwrap();
+            assert_eq!(n.tip_height(), DH - 1);
+            bases.push(base);
+            nodes.push(n);
+        }
+
+        // The race, staged by ingestion: nodes 0–2 see A first, node 3 sees B first.
+        // Both blocks reach every node, so every node judged a real tie.
+        for (i, n) in nodes.iter_mut().enumerate() {
+            let first_a = i != 3;
+            let order = if first_a {
+                [(hdr_a, body_a.clone()), (hdr_b, body_b.clone())]
+            } else {
+                [(hdr_b, body_b.clone()), (hdr_a, body_a.clone())]
+            };
+            for (h, b) in order {
+                n.p2p_mut().node_mut().ingest_block(h, b);
+            }
+            let held = n.p2p().node().chain().main_chain()[DH as usize];
+            let expect = if first_a { hdr_a.header_hash() } else { hdr_b.header_hash() };
+            assert_eq!(held, expect, "node {i}: first-seen holds under equal work");
+            assert!(n.is_halted(), "node {i} is halted at the boundary");
+        }
+
+        // Connect, and let the loop path do the rest.
+        connect_mesh(&mut nodes, &addrs);
+        for n in nodes.iter_mut() {
+            n.set_repush_interval(Duration::ZERO);
+        }
+        spin_until(&mut nodes, 200, "the quorum variant finalized", |ns| {
+            ns.iter().all(|n| n.finalized_height() == Some(DH))
+        });
+
+        // (1) **`variants=2` at the boundary slot** (stamp S5), read from the ROUND
+        //     journal rather than from the live tally — deliberately, and this is
+        //     the one measurement in the drill that had to move to find a caliper
+        //     that works: `VoteTally::on_finalized` drops the slot the instant
+        //     quorum lands, so *any* post-hoc tally read is 0 and would have turned
+        //     this assertion into a tautology. The round record is the operator's
+        //     own instrument (#87's `variants` field, whose documented question is
+        //     "is the committee split across conflicting checkpoints?") and it
+        //     survives in the retained ring after the journal line is emitted.
+        //
+        //     `any`, not `all`: a node whose quorum-completing message arrives
+        //     before the loser's set finalizes and never sees the second variant.
+        //     The 16/5 ledger split in (4) is the assertion that binds.
+        let split_seen: Vec<usize> = nodes
+            .iter()
+            .map(|n| {
+                n.p2p()
+                    .node()
+                    .rounds()
+                    .recent()
+                    .filter(|r| r.height == DH)
+                    .map(|r| r.variants)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        assert!(
+            split_seen.contains(&2),
+            "no node journalled a split boundary slot: variants per node {split_seen:?}",
+        );
+
+        // (2) The QUORUM variant finalized — A, carrying 16 of 21 keys — and it
+        //     finalized on every node including the one that voted against it.
+        let cp_a_id = {
+            let cp = qlab_devnet::committee::Checkpoint::new(
+                DH, hdr_a.header_hash(), hdr_a.header_hash(),
+            );
+            cp.identity()
+        };
+        for (i, n) in nodes.iter().enumerate() {
+            assert_eq!(n.finalized_checkpoint_id(), Some(cp_a_id), "node {i} finalized variant A");
+        }
+
+        // (3) Never-double-sign held per key, asserted as a REFUSAL and not as an
+        //     absence: node 3's keys are committed to B and refuse A by name, and
+        //     node 0's keys are committed to A and refuse B by name.
+        let cp_a = qlab_devnet::committee::Checkpoint::new(
+            DH, hdr_a.header_hash(), hdr_a.header_hash(),
+        );
+        let cp_b = qlab_devnet::committee::Checkpoint::new(
+            DH, hdr_b.header_hash(), hdr_b.header_hash(),
+        );
+        for (i, cp_own, cp_other) in [(0usize, cp_a, cp_b), (3usize, cp_b, cp_a)] {
+            for f in nodes[i].finalizers_mut() {
+                assert_eq!(f.state().signed_at(DH), Some(&cp_own), "node {i} key {}", f.index());
+                let refusal = f.sign(&cp_other);
+                assert!(
+                    matches!(
+                        refusal,
+                        Err(SignRefusal::WouldEquivocate { slot, already })
+                            if slot == DH && already == cp_own
+                    ),
+                    "node {i} key {}: the guard must REFUSE the other variant, got {:?}",
+                    f.index(),
+                    refusal.is_ok(),
+                );
+            }
+        }
+
+        // (4) The loser is unfinalizable — and structurally so, not merely
+        //     unfinalized: 16 of the 21 keys are permanently committed to A, which
+        //     leaves B a ceiling of 5 against a quorum of 15, forever.
+        let quorum = GenesisFile::new_devnet_t0().frozen.quorum as usize;
+        let on_b: usize = KEY_SHARES[3];
+        assert_eq!(21 - on_b, 16, "16 keys are committed to A");
+        assert!(on_b < quorum, "B's ceiling is {on_b} against a quorum of {quorum}");
+        assert_eq!(commitments(&nodes), vec![Some(cp_a_id), Some(cp_a_id), Some(cp_a_id), Some(cp_b.identity())],
+                   "the minority still finalizes the majority's checkpoint and differs only in its own ledger");
+
+        for (n, base) in nodes.into_iter().zip(bases) {
+            drop(n);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+        for base in [base_chain_tmp, va_base, vb_base] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }
