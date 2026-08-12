@@ -103,23 +103,23 @@ pub(crate) fn build_bundle(
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
     let (chosen, used_dummy): (Vec<&Spendable>, bool) =
         if sorted.first().is_some_and(|n| n.value >= need) {
-        (vec![sorted[0]], true)
+            (vec![sorted[0]], true)
         } else if sorted.len() >= 2
             && sorted[0]
                 .value
                 .checked_add(sorted[1].value)
                 .is_some_and(|s| s >= need)
-    {
-        (vec![sorted[0], sorted[1]], false)
-    } else {
-        let have: u64 = sorted.iter().map(|n| n.value).sum();
-        return Err(format!(
-            "cannot cover {need} bessel (amount {amount} + posted fee {fee}) from spendable \
+        {
+            (vec![sorted[0], sorted[1]], false)
+        } else {
+            let have: u64 = sorted.iter().map(|n| n.value).sum();
+            return Err(format!(
+                "cannot cover {need} bessel (amount {amount} + posted fee {fee}) from spendable \
              notes summing {have}. The frozen 2×2 bucket moves at most TWO notes per \
              transaction — if the total covers it but no two notes do, consolidate to \
              yourself first."
-        ));
-    };
+            ));
+        };
 
     // Real inputs + their tree witnesses.
     let mut inputs: Vec<TxInput> = Vec::with_capacity(2);

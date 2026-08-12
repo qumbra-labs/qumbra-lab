@@ -3,10 +3,11 @@
 //! [`select`] owns the wallet/network work through finalized-anchor selection
 //! and produces a versioned [`crate::bundle::WitnessBundle`]. [`prove`] consumes
 //! that bundle plus freshly decoded public chain facts; it has no wallet dir,
-//! network, RNG or second key source. [`submit`] accepts canonical wire bytes and
-//! returns the node's typed answer. [`execute`] remains the CLI/desktop surface
-//! and is exactly their composition, with the local send record kept before the
-//! socket as required below.
+//! network, caller-provided wallet RNG or second key source. (The prover itself
+//! remains randomized.) [`submit`] accepts canonical wire bytes and returns the
+//! node's typed answer. [`execute`] remains the CLI/desktop surface and is
+//! exactly their composition, with the local send record kept before the socket
+//! as required below.
 //!
 //! # Why this is separate from [`crate::send`]
 //!
@@ -255,10 +256,10 @@ fn select_with_rng(
         crate::scan::widest_range(scanned.iter().map(|(_, o)| o.stats.compact_range_served));
     let spent_set =
         fetch_spent(&HttpNullifierSource::new(req.url), 0, req.scan_to).map_err(|e| {
-        SendError::Refused(format!(
-            "{e} — refusing to select inputs this wallet may already have spent"
-        ))
-    })?;
+            SendError::Refused(format!(
+                "{e} — refusing to select inputs this wallet may already have spent"
+            ))
+        })?;
     spent_set.covers_outputs(outputs).map_err(|e| {
         SendError::Refused(format!(
             "{e} — refusing to select inputs this wallet may already have spent"
@@ -268,7 +269,7 @@ fn select_with_rng(
     let mut spendables: Vec<Spendable> = Vec::new();
     let mut skipped = 0usize;
     for (idx, outcome) in &scanned {
-        let report = subtract_spent(&wallet, *idx, &outcome.notes, &spent_set);
+        let report = subtract_spent(wallet, *idx, &outcome.notes, &spent_set);
         skipped += report.spent.len();
         for ln in &report.spendable {
             spendables.push(Spendable {
@@ -313,7 +314,7 @@ fn select_with_rng(
     });
 
     crate::send::build_bundle(
-        &wallet,
+        wallet,
         &spendables,
         req.recipient,
         req.amount,
@@ -352,8 +353,9 @@ pub fn preflight(req: &SendRequest<'_>) -> Result<ProveContext, SendError> {
 }
 
 /// Phase 2: current-state preflight followed by the real STARK. No wallet dir,
-/// network handle, RNG, or key source is reachable here; all witness/key bytes
-/// come from `bundle`, and current chain state arrives as decoded public data.
+/// network handle, caller-provided wallet RNG, or second key source is reachable
+/// here; all witness/key bytes come from `bundle`, and current chain state
+/// arrives as decoded public data. The prover's own randomness remains internal.
 pub fn prove(
     bundle: &WitnessBundle,
     current: &ProveContext,
@@ -361,7 +363,7 @@ pub fn prove(
 ) -> Result<SendArtifact, SendError> {
     bundle
         .validate()
-    .map_err(|e| SendError::Refused(e.to_string()))?;
+        .map_err(|e| SendError::Refused(e.to_string()))?;
     if !current.anchors.roots.contains(&bundle.anchor()) {
         return Err(SendError::Refused(format!(
             "anchor-no-longer-accepted: bundle anchor {} selected at tip {} is absent from the node's current valid-anchor set at tip {}",
