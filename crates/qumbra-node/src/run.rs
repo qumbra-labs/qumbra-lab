@@ -2143,6 +2143,27 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     }
 
     /// The height this node halts at, if its release carries one.
+    /// The boundary checkpoint, decoupled from mining (issue #360).
+    ///
+    /// The run loop's only other route to [`Self::try_checkpoint`] sits inside
+    /// `if self.try_mine()` — and a halted node refuses to mine, so on the day
+    /// the fleet first reached a live boundary (8,640, 2026-08-12) every armed
+    /// node held its keys silent and the "finalized boundary" the halt design
+    /// requires (activation doc §5) was structurally unreachable: 21 keys
+    /// present, zero proposals, forever. While halted with the boundary not
+    /// yet finalized, propose/sign directly. Calling this on the loop cadence
+    /// is safe: [`Self::try_checkpoint`] early-returns for keyless nodes, and
+    /// repetition is bounded by sign-hysteresis (#269) and the
+    /// never-double-sign guard. Once the boundary finalizes, the condition
+    /// goes false and this is inert.
+    fn maintain_boundary_checkpoint(&mut self) {
+        if let Some(h) = self.halt_at() {
+            if self.tip_height() >= h && self.finalized_height() < Some(h) {
+                self.try_checkpoint();
+            }
+        }
+    }
+
     pub fn halt_at(&self) -> Option<u64> {
         self.halt_at
     }
@@ -2255,6 +2276,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                     self.try_checkpoint();
                 }
             }
+            // #360: the call above is the loop's ONLY route to try_checkpoint,
+            // and it is unreachable on a halted node. See the method's doc.
+            self.maintain_boundary_checkpoint();
             if self.metrics_server.is_some() && self.last_metrics_render.elapsed() >= METRICS_REFRESH {
                 self.refresh_metrics();
                 self.last_metrics_render = Instant::now();
@@ -4209,6 +4233,43 @@ mod tests {
         // The committee proposed no slot above H.
         assert!(node.next_checkpoint <= DH + CHECKPOINT_CADENCE_BLOCKS);
         node.save_snapshot().unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Issue #360: the loop's only mining-gated route to `try_checkpoint` never
+    /// fires on a halted node, so the live boundary halted perfectly and then
+    /// could not finalize — 21 keys present, zero proposals, forever. The test
+    /// above reaches Halted only because it hand-drives `try_checkpoint`, which
+    /// is exactly how the gap stayed invisible. This one reaches the boundary
+    /// WITHOUT hand-driven checkpoints and asserts the loop's standalone
+    /// maintenance call finalizes it on its own.
+    #[test]
+    fn a_halted_node_finalizes_the_boundary_without_mining() {
+        let (config, genesis, base) = rig("halt_i360", true);
+        let mut node = RunningNode::start_with_release(
+            &config, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+        )
+        .unwrap();
+        node.set_mine_interval(Duration::ZERO);
+        node.try_checkpoint(); // finalize genesis, as a live net has
+        for _ in 0..DH {
+            assert!(node.try_mine(), "mines below the halt height");
+        }
+        assert!(node.is_halted());
+        assert!(node.finalized_height() < Some(DH), "boundary reached, not finalized");
+        // The defect: the mining-gated route is closed forever...
+        assert!(!node.try_mine(), "a halted node never mines again");
+        // ...and the fix is the loop's standalone maintenance call.
+        node.maintain_boundary_checkpoint();
+        assert_eq!(
+            node.finalized_height(),
+            Some(DH),
+            "the maintenance call finalizes the boundary without mining"
+        );
+        assert!(node.telemetry_sample().contains("regime=Halted"));
+        // Inert afterwards: nothing is proposed above H.
+        node.maintain_boundary_checkpoint();
+        assert!(node.next_checkpoint <= DH + CHECKPOINT_CADENCE_BLOCKS);
         let _ = std::fs::remove_dir_all(&base);
     }
 
