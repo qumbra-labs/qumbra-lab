@@ -64,6 +64,7 @@ fn ledger_over(node: &MemNode) -> (Vec<Hash32>, SupplyLedger) {
                 prev: block.header.prev,
                 coinbase: block.coinbase,
                 fees: block.txs.iter().map(|tx| tx.fee).sum(),
+                name_burn: 0,
             }
         })
         .collect();
@@ -119,6 +120,7 @@ fn a_reorg_re_derives_the_supply_row_and_cannot_manufacture_a_divergent() {
             prev: b2.header.prev,
             coinbase: b2.coinbase,
             fees: 0,
+            name_burn: 0,
         }),
         Err(SupplyError::ForkedFromLedgerHead {
             height: 2,

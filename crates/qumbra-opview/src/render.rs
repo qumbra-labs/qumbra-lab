@@ -756,6 +756,7 @@ mod tests {
             measured_coinbase: 5_000_000_000,
             expected_coinbase: 5_000_000_000,
             fees: 456,
+            burned: 0,
         };
         let wrong = SupplyEpoch {
             epoch: 1,
@@ -764,6 +765,7 @@ mod tests {
             measured_coinbase: 4_000_000_001,
             expected_coinbase: 4_000_000_000,
             fees: 789,
+            burned: 0,
         };
         let readings = vec![ok(
             "node0",
@@ -795,6 +797,7 @@ mod tests {
                 measured_coinbase: (expected as i128 + delta) as u64,
                 expected_coinbase: expected,
                 fees: 0,
+                burned: 0,
             }
         }
         let readings = vec![ok(
@@ -841,6 +844,7 @@ mod tests {
             measured_coinbase: 123_456_789,
             expected_coinbase: 123_456_789,
             fees: 17,
+            burned: 0,
         };
         let readings = vec![ok(
             "late-joiner",
@@ -890,6 +894,7 @@ mod tests {
             measured_coinbase: 5_000_000_000,
             expected_coinbase: 5_000_000_000,
             fees: 456,
+            burned: 0,
         };
         let lagging = vec![ok(
             "joining",

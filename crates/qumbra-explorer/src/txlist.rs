@@ -613,6 +613,7 @@ mod tests {
             fee,
             proof: vec![seed; proof_len],
             discovery: vec![0xdd; 16],
+            rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
         }
     }
 

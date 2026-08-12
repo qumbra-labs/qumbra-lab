@@ -97,6 +97,15 @@ pub struct StoredTx {
     /// transaction. Adding it is an incompatible on-disk change, hence
     /// `persist::FORMAT_VERSION = 3`.
     pub discovery: Vec<u8>,
+    /// The transaction's name-service rider (lab #367), committed above
+    /// `NAME_RULE_BOUNDARY_HEIGHT` — persisted for the same #77 reason as
+    /// `discovery`: a v3 block rebuilt without it fails its own binding.
+    ///
+    /// **NOT an on-disk break**: `bincode` is positional, so this field never
+    /// reaches a v3-era record — `persist` writes a rider-carrying block as
+    /// its own additive log variant and keeps the frozen legacy layout for
+    /// everything else. See `persist::WireRecord`.
+    pub rider: Vec<u8>,
 }
 
 fn bucket_from_actions(actions: u32) -> ArityBucket {
@@ -117,6 +126,7 @@ impl From<&TxEntry> for StoredTx {
             fee: t.public.fee,
             proof: t.proof.clone(),
             discovery: t.discovery.clone(),
+            rider: t.rider.clone(),
         }
     }
 }
@@ -126,6 +136,7 @@ impl From<&StoredTx> for TxEntry {
         TxEntry {
             proof: s.proof.clone(),
             discovery: s.discovery.clone(),
+            rider: s.rider.clone(),
             public: TxPublic {
                 anchor: s.anchor,
                 nullifiers: s.nullifiers.clone(),

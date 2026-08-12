@@ -40,6 +40,7 @@ pub mod hash;
 pub mod header;
 pub mod load;
 pub mod mining;
+pub mod names;
 pub mod net;
 pub mod node;
 pub mod params_devnet;

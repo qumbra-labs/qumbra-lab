@@ -303,6 +303,7 @@ mod tests {
             measured_coinbase: measured,
             expected_coinbase: expected,
             fees: 0,
+            burned: 0,
         }
     }
 
@@ -317,6 +318,7 @@ mod tests {
             measured_coinbase: (expected as i128 + delta) as u64,
             expected_coinbase: expected,
             fees: 0,
+            burned: 0,
         }
     }
 

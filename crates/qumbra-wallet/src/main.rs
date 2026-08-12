@@ -31,6 +31,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some("history") => history(&args[1..]),
         Some("miner-rkm") => miner_rkm(&args[1..]),
         Some("send") => send(&args[1..]),
+        Some("names") => names(&args[1..]),
         Some("-h") | Some("--help") | None => {
             usage();
             Ok(())
@@ -40,6 +41,219 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
             Err(format!("unknown command `{other}`").into())
         }
     }
+}
+
+/// `names` — the wallet's name layer (lab #367): sync/resolve/pin/register/renew.
+/// Registration is a resumable two-step (commit → reveal) driven by repeated
+/// invocations against the persisted `names-reg.v1` state; the salt is written
+/// BEFORE any tx posts.
+fn names(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use qumbra_wallet::names::*;
+    let sub = args.first().map(String::as_str);
+    match sub {
+        Some("sync") => {
+            let dir = dir_of(&args[1..])?;
+            let url = flag(&args[1..], "--url").ok_or("names sync requires --url")?;
+            let tip: u64 =
+                flag(&args[1..], "--to").ok_or("names sync requires --to HEIGHT")?.parse()?;
+            let mut reg = WalletRegistry::load(&dir)?.unwrap_or_default();
+            let before = reg.synced_to;
+            qumbra_wallet::names::sync_names(&mut reg, tip, |path| {
+                qumbra_wallet::net::http_get(url, path).map_err(|e| e.to_string())
+            })
+            .map_err(|e| -> Box<dyn Error> { e.into() })?;
+            reg.save(&dir)?;
+            println!(
+                "names: synced {} → {}; {} registration(s) known",
+                before,
+                reg.synced_to,
+                reg.len()
+            );
+            Ok(())
+        }
+        Some("resolve") => {
+            let name = args.get(1).ok_or("names resolve NAME --tip H")?;
+            let dir = dir_of(&args[2..])?;
+            let tip: u64 = flag(&args[2..], "--tip").ok_or("names resolve requires --tip")?.parse()?;
+            let reg = WalletRegistry::load(&dir)?
+                .ok_or("no synced name registry — run `names sync` first")?;
+            match reg.resolve(name, tip) {
+                Resolution::Active(e) => {
+                    let a = qlab_wallet::address::Address::from_raw_bytes(&e.address)
+                        .ok_or("entry does not decode")?;
+                    let pins = Pins::load(&dir)?;
+                    let pin = match pins.check(name, &e.address) {
+                        PinVerdict::Match => "pinned ✓".to_string(),
+                        PinVerdict::FirstUse { .. } => "NOT pinned — verify out of band".to_string(),
+                        PinVerdict::Rebind { pinned, .. } => {
+                            format!("🔴 REBIND (you pinned {pinned})")
+                        }
+                    };
+                    println!(
+                        "{name} → {}\n  fingerprint {}  [{pin}]\n  registered {}  expires {}",
+                        a.encode(),
+                        a.short().encode(),
+                        e.registered,
+                        e.expiry
+                    );
+                }
+                Resolution::Expiring { entry, reopens_at } => {
+                    let a = qlab_wallet::address::Address::from_raw_bytes(&entry.address)
+                        .ok_or("entry does not decode")?;
+                    println!(
+                        "{name} → {} (⚠ in grace; re-registrable at {reopens_at})",
+                        a.short().encode()
+                    );
+                }
+                Resolution::Unknown => println!("{name}: not registered (as of height {tip})"),
+            }
+            Ok(())
+        }
+        Some("pin") => {
+            let name = args.get(1).ok_or("names pin NAME FINGERPRINT")?;
+            let fp = args.get(2).ok_or("names pin NAME FINGERPRINT")?;
+            let dir = dir_of(&args[3..])?;
+            let mut pins = Pins::load(&dir)?;
+            if let Some(old) = pins.get(name) {
+                eprintln!("replacing pin {old} → {fp} (out-of-band re-confirmation is on you)");
+            }
+            pins.pin(name, fp);
+            pins.save(&dir)?;
+            println!("pinned {name} → {fp}");
+            Ok(())
+        }
+        Some("register") => names_register(&args[1..]),
+        Some("renew") => {
+            // Renewal: one ordinary self-send carrying the renew op — any
+            // payer may renew any name (N4).
+            let name = args.get(1).ok_or("names renew NAME --url … --node … --scan-to H")?;
+            let bare = name.strip_suffix(".qmb").unwrap_or(name).as_bytes().to_vec();
+            let op = qlab_devnet::names::NameOp::Renew { name: bare };
+            names_self_send(&args[2..], &op, &format!("renew {name}"))
+        }
+        _ => Err("names subcommands: sync | resolve | pin | register | renew".into()),
+    }
+}
+
+/// Drive one step of the resumable registration.
+fn names_register(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use qumbra_wallet::names::*;
+    let name = args.first().ok_or(
+        "names register NAME --dir … --url … --node … --scan-to H [--committed-at H]",
+    )?;
+    let bare = name.strip_suffix(".qmb").unwrap_or(name);
+    let dir = dir_of(&args[1..])?;
+
+    // Record an observed commit height (the operator reads it off the explorer
+    // or their node) — pure state transition, no network.
+    if let Some(h) = flag(&args[1..], "--committed-at") {
+        let mut st = RegisterState::load(&dir)?.ok_or("no registration in flight")?;
+        if st.name != bare {
+            return Err(format!("in-flight registration is for {}, not {bare}", st.name).into());
+        }
+        st.committed_at = Some(h.parse()?);
+        st.save(&dir)?;
+        println!("recorded commit height {h}; re-run `names register {bare} …` once the window opens (~10 min)");
+        return Ok(());
+    }
+
+    let st = match RegisterState::load(&dir)? {
+        Some(st) if st.name == bare => st,
+        Some(st) => return Err(format!("a registration for {} is already in flight", st.name).into()),
+        None => {
+            // Fresh start: allocate the DEDICATED diversified address (D3) and
+            // persist the salt BEFORE anything touches the network.
+            if !qlab_devnet::names::valid_name(bare.as_bytes()) {
+                return Err(format!("{bare:?} fails the v1 name grammar (a-z 0-9, interior hyphens, 1-63 bytes)").into());
+            }
+            let mut w = qumbra_wallet::store::WalletDir::open(&dir)?;
+            // D3: the name binds a FRESH dedicated diversified address — a new
+            // index off the cursor, used for nothing else.
+            let idx = w.allocate_next()?;
+            let address = w.wallet().address_at_index(idx).to_raw_bytes();
+            let mut salt = [0u8; 32];
+            use rand::Rng as _;
+            qumbra_wallet::send::os_rng().fill_bytes(&mut salt);
+            let record = qlab_devnet::names::NameRecord {
+                kind: qlab_devnet::names::RECORD_KIND_L1_ADDRESS,
+                name: bare.as_bytes().to_vec(),
+                address,
+            };
+            let st = RegisterState::new(bare, record, salt);
+            st.save(&dir)?;
+            st
+        }
+    };
+
+    let scan_to: u64 = flag(&args[1..], "--scan-to")
+        .ok_or("names register requires --scan-to HEIGHT")?
+        .parse()?;
+    match st.step(scan_to) {
+        RegisterStep::NeedsCommit => {
+            let op = st.commit_op();
+            names_self_send(&args[1..], &op, &format!("commit for {bare} (relay fee only)"))?;
+            println!(
+                "commit posted. Once mined at height H: `names register {bare} --committed-at H --dir …`"
+            );
+            Ok(())
+        }
+        RegisterStep::WaitForWindow { at } => {
+            Err(format!("the reveal window opens at height {at} (~10 min after the commit); re-run then").into())
+        }
+        RegisterStep::RevealNow { closes } => {
+            let op = st.reveal_op();
+            let fee = qlab_devnet::names::name_fee_for(&op);
+            eprintln!("revealing {bare} (window closes at {closes}); name fee {fee} bessel, BURNED");
+            names_self_send(&args[1..], &op, &format!("reveal for {bare}"))?;
+            RegisterState::clear(&dir)?;
+            println!("reveal posted — once mined, {bare}.qmb is yours for 365 epochs. Pin your own fingerprint for your records.");
+            Ok(())
+        }
+        RegisterStep::WindowClosed => {
+            RegisterState::clear(&dir)?;
+            Err("the reveal window closed unrevealed — the commit is dead and its salt will not \
+                 be reused. Start over: `names register` (a fresh salt costs one more relay fee)."
+                .into())
+        }
+    }
+}
+
+/// A minimal self-send carrying `op` — the vehicle both registration steps and
+/// renewals ride (brief §1: name ops ride the ordinary transaction).
+fn names_self_send(
+    args: &[String],
+    op: &qlab_devnet::names::NameOp,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    use qumbra_wallet::spend::{execute, SendRequest, SendStep};
+    let dir = dir_of(args)?;
+    let url = flag(args, "--url").ok_or("requires --url")?;
+    let node_url = flag(args, "--node").unwrap_or(url);
+    let scan_to: u64 = flag(args, "--scan-to").ok_or("requires --scan-to HEIGHT")?.parse()?;
+    let no_submit = has_flag(args, "--no-submit");
+
+    // Self-send: the recipient is this wallet's own next address; amount 0 —
+    // the whole value moves through change minus fees.
+    let w = qumbra_wallet::store::WalletDir::open(&dir)?;
+    let self_addr = w.wallet().address_at_index(0);
+    let mut sink = |step: SendStep| {
+        if let SendStep::Built { fee, prove_secs, .. } = step {
+            eprintln!("{label}: proved in {prove_secs:.2}s, declared fee {fee} bessel");
+        }
+    };
+    let req = SendRequest {
+        dir: &dir,
+        url,
+        node_url,
+        recipient: &self_addr,
+        contact_name: None,
+        amount: 0,
+        scan_to,
+        no_submit,
+        name_op: Some(op),
+    };
+    execute(&req, &mut sink).map_err(|e| -> Box<dyn Error> { e.to_string().into() })?;
+    Ok(())
 }
 
 fn usage() {
@@ -61,6 +275,13 @@ fn usage() {
          qumbra-wallet contact remove NAME --dir DIR     remove a local contact\n  \
          qumbra-wallet backup  --dir DIR --reveal        print the mnemonic (explicitly, once)\n  \
          qumbra-wallet scan    --dir DIR --url URL --to N [--from N]  balance via light-client scan\n  \
+         qumbra-wallet names sync --dir DIR --url URL --to HEIGHT   bulk-sync the name registry (D2)\n  \
+         qumbra-wallet names resolve NAME --dir DIR --tip HEIGHT    resolve LOCALLY + pin status\n  \
+         qumbra-wallet names pin NAME FINGERPRINT --dir DIR         pin an out-of-band-confirmed qs1…\n  \
+         qumbra-wallet names register NAME --dir DIR --url URL --node URL --scan-to N\n\
+                            resumable commit → reveal (re-run to advance; salt persisted first;\n\
+                            record the mined commit with --committed-at H). Name fee is BURNED\n  \
+         qumbra-wallet names renew NAME --dir DIR --url URL --node URL --scan-to N  anyone may renew\n  \
          qumbra-wallet history --dir DIR --url URL --to N [--from N]  this wallet's own ledger:\n\
                             every note received, every note spent, and the sends reconstructed\n\
                             from them. Chain-derived throughout; the recipient of a past send is\n\
@@ -68,7 +289,10 @@ fn usage() {
                             is labeled as such (a restored wallet never has one)\n  \
          qumbra-wallet miner-rkm --dir DIR [--index N]   the miner_rkm for a node config (coinbase payee)\n  \
          qumbra-wallet send --dir DIR --url URL --node URL --scan-to N\n  \
-                            (--to ADDR-or-qumbra:URI | --to-contact NAME) [--amount BESSEL]\n  \
+                            (--to ADDR-or-qumbra:URI-or-NAME.qmb | --to-contact NAME) [--amount BESSEL]\n  \
+                            --to NAME.qmb resolves LOCALLY against the synced registry (D2)\n\
+                            behind the pin gate: first use and any rebind refuse until the\n\
+                            fingerprint is confirmed out of band and pinned (`names pin`)\n  \
                             [--out FILE] [--no-submit]\n  \
                             --to also takes a qumbra: payment URI; its amount= prefills the\n\
                             send amount (in that case --amount may be omitted; if both are\n\
@@ -301,6 +525,64 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
         (None, None) => {
             return Err("send requires exactly one of --to ADDRESS or --to-contact NAME".into())
         }
+        // Lab #367: `NAME.qmb` resolves LOCALLY against the synced registry
+        // (D2 — no server is ever asked about one name) behind the N6 pin
+        // gate: first use and any rebind REFUSE until the fingerprint is
+        // confirmed out of band and pinned via `names pin`.
+        (Some(target), None) if target.ends_with(".qmb") => {
+            let reg = qumbra_wallet::names::WalletRegistry::load(&dir)?
+                .ok_or("no synced name registry — run `qumbra-wallet names sync` first")?;
+            let entry = match reg.resolve(target, scan_to) {
+                qumbra_wallet::names::Resolution::Active(e) => e,
+                qumbra_wallet::names::Resolution::Expiring { entry, reopens_at } => {
+                    eprintln!(
+                        "⚠ {target} is past expiry, inside its grace window (re-registrable at \
+                         height {reopens_at}) — its holder should renew"
+                    );
+                    entry
+                }
+                qumbra_wallet::names::Resolution::Unknown => {
+                    return Err(format!(
+                        "{target} is not registered as of height {scan_to} (registry synced to \
+                         {}). If it was registered recently, `names sync` further.",
+                        reg.synced_to
+                    )
+                    .into())
+                }
+            };
+            let pins = qumbra_wallet::names::Pins::load(&dir)?;
+            match pins.check(target, &entry.address) {
+                qumbra_wallet::names::PinVerdict::Match => {}
+                qumbra_wallet::names::PinVerdict::FirstUse { fingerprint } => {
+                    return Err(format!(
+                        "first payment to {target}: verify the fingerprint {fingerprint} with \
+                         the payee OUT OF BAND (a name that resolves is not a name that is \
+                         verified — D3), then pin it:\n  qumbra-wallet names pin {target} \
+                         {fingerprint} --dir …\nand re-run this send."
+                    )
+                    .into())
+                }
+                qumbra_wallet::names::PinVerdict::Rebind { pinned, resolved } => {
+                    return Err(format!(
+                        "🔴 REBIND ALARM: {target} now resolves to {resolved}, but you confirmed \
+                         {pinned}. This is either the name lapsing and being re-registered \
+                         (possibly by someone else!) or a records divergence. Do NOT pay until \
+                         you re-confirm the NEW fingerprint out of band; then: qumbra-wallet \
+                         names pin {target} {resolved} --dir …"
+                    )
+                    .into())
+                }
+            }
+            let address = qlab_wallet::address::Address::from_raw_bytes(&entry.address)
+                .ok_or("registry entry does not decode as an address — re-sync the registry")?;
+            eprintln!(
+                "{target} → {} (pinned ✓; registered at {}, expires {})",
+                address.short().encode(),
+                entry.registered,
+                entry.expiry
+            );
+            (address, Some(target.to_string()))
+        }
         // A bech32m address never contains `:`, so a colon means a URI — and
         // routing it through the URI parser gives a scheme-shaped mistake
         // (`bitcoin:…`) a typed refusal instead of "not a valid qaddr1…".
@@ -391,6 +673,7 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
         amount,
         scan_to,
         no_submit,
+        name_op: None,
     };
 
     // A proof that cost gigabytes should not be lost to a failed socket — so the

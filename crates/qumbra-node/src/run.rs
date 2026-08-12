@@ -77,6 +77,9 @@ fn supply_block_of(hash: qlab_devnet::header::Hash32, block: &qlab_node::StoredB
         prev: block.header.prev,
         coinbase: block.coinbase,
         fees: block.txs.iter().map(|tx| tx.fee).sum(),
+        // Lab #367: the burned name-fee portion, from the committed riders —
+        // zero on every rider-free (i.e. every pre-boundary) block.
+        name_burn: block.body().total_name_burn(),
     }
 }
 
@@ -5746,6 +5749,7 @@ mod tests {
                     fee,
                 },
                 discovery,
+                rider: TxEntry::absent_rider(),
             }
         };
         let wire_ok = qlab_p2p::codec::encode_tx(&tx_for(1, fee, true));

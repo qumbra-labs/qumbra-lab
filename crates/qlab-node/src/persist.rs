@@ -44,6 +44,16 @@ use crate::store::{Hash32, StoredBlock};
 /// header/body binding on restart. A v2 datadir is a full break for the same
 /// reason a v1 one was — and #188 changes the genesis hash anyway, so a v2
 /// datadir belongs to a different network and must not be resumed.
+///
+/// **Still 3 after lab #367 (name-service riders), and that is the point.**
+/// The rider reaches disk as an **additive log variant** ([`WireRecord`]),
+/// never as a field on the frozen v3 layouts — so every v3 datadir on the
+/// live fleet stays readable with no migration and no version bump. The two
+/// prior bumps each orphaned every datadir in existence; this one arrives on
+/// a running chain through a halt boundary, where that price is not payable.
+/// Forward-incompatibility is unchanged in kind: a pre-#367 binary reading a
+/// rider-carrying record refuses loudly through the same
+/// record-does-not-decode path as any other unknown future format.
 pub const FORMAT_VERSION: u32 = 3;
 
 /// The append-only log file name (source of truth: blocks + finalizations).
@@ -56,12 +66,127 @@ const SNAPSHOT_TMP: &str = "snapshot.bin.tmp";
 /// One record in the append-only log. Finalizations are logged alongside blocks
 /// so a from-genesis replay reconstructs the finalized head too (a block-only
 /// log could not — finalization is committee-driven, not derivable from blocks).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **Deliberately NOT `Serialize`/`Deserialize` since lab #367**: the on-disk
+/// encoding is [`WireRecord`]'s, and the only doors to it are
+/// [`append_record`] and [`read_records`]. A direct `bincode::serialize` of
+/// this enum would emit `StoredBlock`'s new positional layout under the old
+/// variant index — a byte stream no build ever reads — so the derive is
+/// removed rather than trusted to stay unused.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogRecord {
     /// An accepted block.
     Block(StoredBlock),
     /// A finalization of the block with this hash.
     Finalize(Hash32),
+}
+
+// ---------------------------------------------------------------------------
+// The on-disk encoding (lab #367)
+// ---------------------------------------------------------------------------
+
+/// Frozen positional layout of a v3-era stored transaction. `bincode` 1.x is
+/// positional, so this struct **is** the byte layout of every record written
+/// before lab #367 — and of every rider-free record written after it.
+///
+/// 🔴 **DO NOT add fields here.** `StoredTx`'s own history (#101, #188) is two
+/// demonstrations of what a field added to a positional layout does to every
+/// datadir in existence; this struct exists so the third field lands in a new
+/// [`WireRecord`] variant instead.
+#[derive(Serialize, Deserialize)]
+struct LegacyStoredTx {
+    anchor: Hash32,
+    nullifiers: Vec<Hash32>,
+    commitments: Vec<Hash32>,
+    bucket_actions: u32,
+    fee: u64,
+    proof: Vec<u8>,
+    discovery: Vec<u8>,
+}
+
+/// Frozen v3-era block layout. See [`LegacyStoredTx`].
+#[derive(Serialize, Deserialize)]
+struct LegacyStoredBlock {
+    header: crate::store::StoredHeader,
+    txs: Vec<LegacyStoredTx>,
+    coinbase: u64,
+    coinbase_rkm: [u64; 4],
+}
+
+/// What actually reaches disk. Variant indices are the compatibility contract:
+/// 0 and 1 are the pre-#367 stream byte-for-byte; 2 is additive, appears only
+/// for blocks carrying a non-absent rider (impossible below the name
+/// boundary), and makes a pre-#367 binary refuse through the ordinary
+/// record-does-not-decode path.
+#[derive(Serialize, Deserialize)]
+enum WireRecord {
+    /// Variant 0 — a rider-free block in the frozen v3 layout.
+    Block(LegacyStoredBlock),
+    /// Variant 1 — a finalization.
+    Finalize(Hash32),
+    /// Variant 2 — a rider-carrying block (lab #367), current layouts.
+    BlockV4(StoredBlock),
+}
+
+fn rider_free(b: &StoredBlock) -> bool {
+    b.txs.iter().all(|t| t.rider == qlab_devnet::names::RIDER_ABSENT)
+}
+
+impl From<&LogRecord> for WireRecord {
+    fn from(rec: &LogRecord) -> Self {
+        match rec {
+            LogRecord::Finalize(h) => WireRecord::Finalize(*h),
+            LogRecord::Block(b) if rider_free(b) => WireRecord::Block(LegacyStoredBlock {
+                header: b.header.clone(),
+                txs: b
+                    .txs
+                    .iter()
+                    .map(|t| LegacyStoredTx {
+                        anchor: t.anchor,
+                        nullifiers: t.nullifiers.clone(),
+                        commitments: t.commitments.clone(),
+                        bucket_actions: t.bucket_actions,
+                        fee: t.fee,
+                        proof: t.proof.clone(),
+                        discovery: t.discovery.clone(),
+                    })
+                    .collect(),
+                coinbase: b.coinbase,
+                coinbase_rkm: b.coinbase_rkm,
+            }),
+            LogRecord::Block(b) => WireRecord::BlockV4(b.clone()),
+        }
+    }
+}
+
+impl From<WireRecord> for LogRecord {
+    fn from(rec: WireRecord) -> Self {
+        match rec {
+            WireRecord::Finalize(h) => LogRecord::Finalize(h),
+            WireRecord::BlockV4(b) => LogRecord::Block(b),
+            WireRecord::Block(l) => LogRecord::Block(StoredBlock {
+                header: l.header,
+                txs: l
+                    .txs
+                    .into_iter()
+                    .map(|t| crate::store::StoredTx {
+                        anchor: t.anchor,
+                        nullifiers: t.nullifiers,
+                        commitments: t.commitments,
+                        bucket_actions: t.bucket_actions,
+                        fee: t.fee,
+                        proof: t.proof,
+                        discovery: t.discovery,
+                        // A legacy record structurally predates riders, so
+                        // absence is exact — a fact, not a migration guess.
+                        rider: qlab_devnet::names::RIDER_ABSENT.to_vec(),
+                    })
+                    .collect(),
+                coinbase: l.coinbase,
+                coinbase_rkm: l.coinbase_rkm,
+            }),
+        }
+    }
 }
 
 /// The derived node state at a given applied height — everything needed to
@@ -114,7 +239,7 @@ pub struct Snapshot {
 /// Append a record to the log (source of truth). Each record is a 4-byte LE
 /// length prefix followed by its `bincode`, flushed + fsync'd before returning.
 pub fn append_record(dir: &Path, rec: &LogRecord) -> io::Result<()> {
-    let bytes = bincode::serialize(rec).map_err(to_io)?;
+    let bytes = bincode::serialize(&WireRecord::from(rec)).map_err(to_io)?;
     let mut f = BufWriter::new(
         OpenOptions::new()
             .create(true)
@@ -167,8 +292,8 @@ pub fn read_records(dir: &Path) -> io::Result<Vec<LogRecord>> {
         if r.read_exact(&mut buf).is_err() {
             break; // torn trailing record from a crash mid-append
         }
-        match bincode::deserialize::<LogRecord>(&buf) {
-            Ok(rec) => out.push(rec),
+        match bincode::deserialize::<WireRecord>(&buf) {
+            Ok(rec) => out.push(LogRecord::from(rec)),
             Err(e) => {
                 // Tolerated only if nothing follows it (a crash mid-append).
                 let mut probe = [0u8; 1];
@@ -319,5 +444,94 @@ mod tests {
             h(0x11),
             "the field the rename touched reads back the same value it was written with"
         );
+    }
+
+    // --- lab #367: the rider's on-disk story --------------------------------
+
+    fn a_stored_block(rider: Vec<u8>) -> StoredBlock {
+        StoredBlock {
+            header: crate::store::StoredHeader {
+                prev: h(0x11),
+                height: 9_000,
+                timestamp: 675_000,
+                difficulty: 256,
+                nonce: 7,
+                tx_body_commitment: h(0x22),
+            },
+            txs: vec![crate::store::StoredTx {
+                anchor: h(0x33),
+                nullifiers: vec![h(0x44)],
+                commitments: vec![h(0x55)],
+                bucket_actions: 2,
+                fee: 1_000_000,
+                proof: vec![0xAB; 8],
+                discovery: vec![0x00],
+                rider,
+            }],
+            coinbase: 42,
+            coinbase_rkm: [1, 2, 3, 4],
+        }
+    }
+
+    /// A rider-free block reaches disk as **variant 0 in the frozen v3
+    /// layout** — no rider byte anywhere in the record — and a rider-carrying
+    /// block as the additive variant 2. `bincode` writes an enum's variant
+    /// index as the first 4 LE bytes, so the claim is checkable on the raw
+    /// stream rather than asserted about it.
+    #[test]
+    fn rider_free_blocks_keep_the_v3_layout_and_rider_carrying_ones_are_additive() {
+        let free = LogRecord::Block(a_stored_block(qlab_devnet::names::RIDER_ABSENT.to_vec()));
+        let free_bytes = bincode::serialize(&WireRecord::from(&free)).unwrap();
+        assert_eq!(&free_bytes[..4], &[0, 0, 0, 0], "rider-free ⇒ legacy variant 0");
+        // The frozen layout, independently: serialize the legacy struct alone
+        // and expect it verbatim after the variant index.
+        let LogRecord::Block(b) = &free else { unreachable!() };
+        let legacy = LegacyStoredBlock {
+            header: b.header.clone(),
+            txs: vec![LegacyStoredTx {
+                anchor: b.txs[0].anchor,
+                nullifiers: b.txs[0].nullifiers.clone(),
+                commitments: b.txs[0].commitments.clone(),
+                bucket_actions: b.txs[0].bucket_actions,
+                fee: b.txs[0].fee,
+                proof: b.txs[0].proof.clone(),
+                discovery: b.txs[0].discovery.clone(),
+            }],
+            coinbase: b.coinbase,
+            coinbase_rkm: b.coinbase_rkm,
+        };
+        assert_eq!(&free_bytes[4..], &bincode::serialize(&legacy).unwrap()[..]);
+
+        let carrying = LogRecord::Block(a_stored_block(qlab_devnet::names::encode_rider(Some(
+            &qlab_devnet::names::NameOp::Commit { commit: [0x5A; 32] },
+        ))));
+        let carrying_bytes = bincode::serialize(&WireRecord::from(&carrying)).unwrap();
+        assert_eq!(&carrying_bytes[..4], &[2, 0, 0, 0], "rider-carrying ⇒ additive variant 2");
+    }
+
+    /// Both shapes round-trip through the real append/read path, and a legacy
+    /// record reads back with the rider structurally absent — a fact of the
+    /// format, not a migration guess.
+    #[test]
+    fn both_record_shapes_round_trip_through_the_log() {
+        let dir = std::env::temp_dir().join(format!("qlab-persist-i367-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let free = LogRecord::Block(a_stored_block(qlab_devnet::names::RIDER_ABSENT.to_vec()));
+        let carrying = LogRecord::Block(a_stored_block(qlab_devnet::names::encode_rider(Some(
+            &qlab_devnet::names::NameOp::Commit { commit: [0x5A; 32] },
+        ))));
+        append_record(&dir, &free).unwrap();
+        append_record(&dir, &carrying).unwrap();
+        append_record(&dir, &LogRecord::Finalize(h(0x99))).unwrap();
+
+        let back = read_records(&dir).unwrap();
+        assert_eq!(back.len(), 3);
+        assert_eq!(back[0], free, "legacy round-trip: rider comes back absent");
+        assert_eq!(back[1], carrying, "additive round-trip: rider comes back verbatim");
+        assert_eq!(back[2], LogRecord::Finalize(h(0x99)));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

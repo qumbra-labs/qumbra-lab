@@ -80,7 +80,28 @@ pub fn build_send(
     anchor_count: u64,
     rng: &mut StdRng,
 ) -> Result<SendArtifact, String> {
-    let fee = posted_fee(ArityBucket::TwoByTwo);
+    build_send_with_rider(wallet, notes, recipient, amount, tree, anchor_count, rng, None)
+}
+
+/// [`build_send`] carrying a name-service rider (lab #367). The op raises the
+/// declared fee by its burned name-fee half — the fee is already a public
+/// input the proof binds, so a bigger fee is just more value the balance
+/// equation must cover: **zero circuit change**, in this function's own code
+/// as in the design. The rider itself is committed bytes on the entry; the
+/// proof neither sees nor needs it (N5).
+#[allow(clippy::too_many_arguments)]
+pub fn build_send_with_rider(
+    wallet: &Wallet,
+    notes: &[Spendable],
+    recipient: &Address,
+    amount: u64,
+    tree: &CommitmentTree,
+    anchor_count: u64,
+    rng: &mut StdRng,
+    name_op: Option<&qlab_devnet::names::NameOp>,
+) -> Result<SendArtifact, String> {
+    let fee = posted_fee(ArityBucket::TwoByTwo)
+        + name_op.map_or(0, qlab_devnet::names::name_fee_for);
     let need = amount.checked_add(fee).ok_or("amount overflows")?;
 
     // Coin selection: fewest notes that cover amount+fee, largest first. The
@@ -237,6 +258,10 @@ pub fn build_send(
         &[to_recipient.bundle.clone(), to_self.bundle.clone()],
         &[to_recipient.payloads, to_self.payloads].concat(),
     );
+    let entry = match name_op {
+        Some(op) => entry.with_name_op(op),
+        None => entry,
+    };
     let wire_bytes = qlab_p2p::codec::encode_tx(&entry);
 
     Ok(SendArtifact {

@@ -33,6 +33,7 @@ use crate::emission_exact::{coinbase_exact, RULE_BOUNDARY_HEIGHT};
 use crate::fees::{posted_fee, ArityBucket};
 use crate::hash::keccak256;
 use crate::header::{BlockHeader, Hash32};
+use crate::names;
 
 /// Domain tag leading the block-body preimage — **body format v2**, the
 /// body-bound-discovery format (issue #188 / `discovery-on-the-consensus-wire.md`).
@@ -57,6 +58,19 @@ use crate::header::{BlockHeader, Hash32};
 /// Format v1 (issue #101, `coinbase_rkm` appended) carried no tag; v2 is the
 /// first tagged format, so a v1 preimage can never be re-produced by accident.
 pub const BODY_PREIMAGE_DOMAIN: &[u8] = b"qumbra:body:v2";
+
+/// Domain tag for **body format v3** — the name-service rider format
+/// (lab #367), in force **above `NAME_RULE_BOUNDARY_HEIGHT` only**.
+///
+/// v3 appends `rider_len ‖ rider` at the end of each transaction's region,
+/// for **every** transaction including rider-absent ones. The unconditional
+/// append plus the new tag is what makes the encoding unambiguous: a
+/// presence-conditional append under the v2 tag would let a v2 body's
+/// `discovery` tail bytes be re-read as a v3 rider section (the cross-version
+/// second-spelling this project keeps paying for). Below the boundary the v2
+/// encoding is used **byte-exactly** — that is the live-chain compatibility
+/// property, and `golden_body_commitment_bytes` is its lock.
+pub const BODY_PREIMAGE_DOMAIN_V3: &[u8] = b"qumbra:body:v3";
 
 /// The public surface of a shielded transaction — everything consensus checks
 /// without opening the proof.
@@ -99,6 +113,17 @@ pub struct TxEntry {
     /// output commitments and an `n = 0` group is **invalid**, which is the
     /// whole sentence §1 exists to create.
     pub discovery: Vec<u8>,
+    /// The transaction's **name-service rider** (lab #367), as committed bytes
+    /// under `discovery`'s exact discipline: `crate::names` owns the codec, the
+    /// canonicity rule is byte-level, and **absence is `[0x00]`, not an empty
+    /// `Vec`** — same reasoning as the field above.
+    ///
+    /// Enters the body preimage only in the v3 encoding (above
+    /// `NAME_RULE_BOUNDARY_HEIGHT`); below the boundary a valid block carries
+    /// only absent riders and commits to the v2 bytes, unchanged. On the tx
+    /// wire the section is presence-conditional instead (`qlab-p2p::codec`
+    /// says why the two choices differ).
+    pub rider: Vec<u8>,
 }
 
 impl TxEntry {
@@ -114,6 +139,7 @@ impl TxEntry {
             proof,
             public,
             discovery: encode_committed_discovery(recipients, payloads),
+            rider: Self::absent_rider(),
         }
     }
 
@@ -122,7 +148,7 @@ impl TxEntry {
     /// using this outside a fixture.
     pub fn with_placeholder_discovery(proof: Vec<u8>, public: TxPublic) -> Self {
         let discovery = placeholder_discovery(&public.commitments);
-        Self { proof, public, discovery }
+        Self { proof, public, discovery, rider: Self::absent_rider() }
     }
 
     /// The canonical encoding of "this transaction attaches no discovery",
@@ -130,6 +156,18 @@ impl TxEntry {
     /// commitments; see [`TxEntry::discovery`].
     pub fn empty_discovery() -> Vec<u8> {
         encode_committed_discovery(&[], &[])
+    }
+
+    /// The canonical encoding of "this transaction carries no name op" —
+    /// see [`TxEntry::rider`] and [`crate::names::RIDER_ABSENT`].
+    pub fn absent_rider() -> Vec<u8> {
+        crate::names::RIDER_ABSENT.to_vec()
+    }
+
+    /// This transaction with `op` as its name rider (registration paths).
+    pub fn with_name_op(mut self, op: &crate::names::NameOp) -> Self {
+        self.rider = crate::names::encode_rider(Some(op));
+        self
     }
 
     /// Decode this transaction's committed discovery bytes (§4 rule 3).
@@ -224,9 +262,41 @@ impl BlockBody {
     ///
     /// The leading domain tag is [`BODY_PREIMAGE_DOMAIN`]; read its note before
     /// concluding it is decoration.
+    ///
+    /// 🔴 **This is the v2 form, and since lab #367 it is no longer the whole
+    /// rule**: above `NAME_RULE_BOUNDARY_HEIGHT` the body commits under the v3
+    /// encoding instead ([`BODY_PREIMAGE_DOMAIN_V3`] + a `rider_len ‖ rider`
+    /// tail per transaction). Consensus-path callers use
+    /// [`BlockBody::commitment_at`], which picks the form from the height;
+    /// calling this directly asserts "v2, regardless of height" and is correct
+    /// only for pre-boundary blocks, tests, and the compat golden.
     pub fn commitment(&self) -> Hash32 {
+        keccak256(&self.preimage(false))
+    }
+
+    /// The height-keyed body commitment — **the shipped rule** (lab #367).
+    /// Below or at [`crate::names::NAME_RULE_BOUNDARY_HEIGHT`] (or always,
+    /// while the boundary is `None`): the v2 bytes, unchanged. Above it: v3.
+    ///
+    /// Mirrors `check_scheduled_coinbase` / `…_above`: this constant-bound
+    /// form is the rule, the `_above` variant is the drill seam.
+    pub fn commitment_at(&self, height: u64) -> Hash32 {
+        self.commitment_above(crate::names::NAME_RULE_BOUNDARY_HEIGHT, height)
+    }
+
+    /// [`BlockBody::commitment_at`] with the boundary as an argument — the
+    /// **drill** seam, and nothing else.
+    pub fn commitment_above(&self, boundary: Option<u64>, height: u64) -> Hash32 {
+        let v3 = matches!(boundary, Some(b) if height > b);
+        keccak256(&self.preimage(v3))
+    }
+
+    /// The commitment preimage. `v3 = false` reproduces the v2 bytes exactly —
+    /// locked by `golden_body_commitment_bytes`, which is now the live-chain
+    /// compatibility lock rather than merely a format lock.
+    fn preimage(&self, v3: bool) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(BODY_PREIMAGE_DOMAIN);
+        buf.extend_from_slice(if v3 { BODY_PREIMAGE_DOMAIN_V3 } else { BODY_PREIMAGE_DOMAIN });
         for tx in &self.txs {
             buf.extend_from_slice(&tx.public.anchor);
             for nf in &tx.public.nullifiers {
@@ -241,17 +311,46 @@ impl BlockBody {
             buf.extend_from_slice(&tx.proof);
             buf.extend_from_slice(&(tx.discovery.len() as u64).to_le_bytes());
             buf.extend_from_slice(&tx.discovery);
+            if v3 {
+                buf.extend_from_slice(&(tx.rider.len() as u64).to_le_bytes());
+                buf.extend_from_slice(&tx.rider);
+            }
         }
         buf.extend_from_slice(&self.coinbase.to_le_bytes());
         for lane in &self.coinbase_rkm {
             buf.extend_from_slice(&lane.to_le_bytes());
         }
-        keccak256(&buf)
+        buf
     }
 
-    /// Total fees in the body (posted prices; the miner earns these + coinbase).
+    /// Total fees in the body (posted prices; the miner earns these + coinbase
+    /// − the name burn below, lab #367).
     pub fn total_fees(&self) -> u64 {
         self.txs.iter().map(|t| t.public.fee).sum()
+    }
+
+    /// The burned name-fee portion of this body's declared fees (lab #367):
+    /// `Σ name_fee_for(rider op)` over every rider-carrying transaction. The
+    /// fee-split rule (`validate_body*`) made each declared fee equal
+    /// `posted_fee + name_fee`, and this is the sum of the second halves — the
+    /// part the miner must NOT collect (N2: a miner who collects registration
+    /// fees registers names for free).
+    ///
+    /// Total by construction: an undecodable rider contributes 0 rather than
+    /// an error, because every path that consumes this value
+    /// (`coinbase_value`, the supply ledger) runs on bodies `validate_body*`
+    /// already accepted, where every rider decodes — the error path exists
+    /// there, once, not in every downstream sum.
+    pub fn total_name_burn(&self) -> u64 {
+        self.txs
+            .iter()
+            .map(|t| {
+                crate::names::decode_rider(&t.rider)
+                    .ok()
+                    .flatten()
+                    .map_or(0, |op| crate::names::name_fee_for(&op))
+            })
+            .sum()
     }
 
     /// Whether this body mints issuance without naming a payee — a block that
@@ -375,6 +474,26 @@ pub enum BodyError {
         /// length. `None` means the lengths differed.
         first_mismatch: Option<usize>,
     },
+
+    // --- lab #367: the name-service rider ----------------------------------
+    //
+    // The discovery lane's two-layer discipline, applied to the field that
+    // copied its byte discipline: *cannot parse* / *parses but breaks a rule*
+    // are separate answers, and the boundary gate is a third — a well-formed,
+    // rule-clean rider is still invalid on the wrong side of the boundary.
+    /// The tx at `index` carries rider bytes that do not decode. Note the
+    /// codec refuses trailing bytes and every non-canonical spelling, so
+    /// `RiderMalformed` also covers what `DiscoveryNotCanonical` needs a
+    /// separate variant for.
+    RiderMalformed { index: usize, err: crate::names::RiderError },
+    /// The tx at `index` carries a name op at a height where riders are not
+    /// yet valid (at/below `NAME_RULE_BOUNDARY_HEIGHT`, or anywhere while the
+    /// boundary is unset). The gate is `height > boundary` — the emission
+    /// rule's shape, structural genesis exemption included.
+    RiderBeforeBoundary { index: usize },
+    /// The tx at `index` carries a well-formed rider that violates a name
+    /// rule; `err` is the rule's own verdict, kept rather than flattened.
+    RiderRule { index: usize, err: crate::names::NameRuleError },
 }
 
 /// **The #299 scheduled-emission rule at the shipped boundary.**
@@ -427,8 +546,23 @@ pub fn check_scheduled_coinbase_above(
 /// chain.
 ///
 /// Called first by [`validate_body`], so no caller has to remember it.
+///
+/// Height-keyed since lab #367: the expected commitment is
+/// [`BlockBody::commitment_at`] at the header's own height, so a v3 body
+/// binds under the v3 form and every pre-boundary block binds under v2,
+/// byte-identically to before.
 pub fn check_body_binding(header: &BlockHeader, body: &BlockBody) -> Result<(), BodyError> {
-    let got = body.commitment();
+    check_body_binding_above(names::NAME_RULE_BOUNDARY_HEIGHT, header, body)
+}
+
+/// [`check_body_binding`] with the name boundary as an argument — the drill
+/// seam; see [`validate_body_above`].
+pub fn check_body_binding_above(
+    boundary: Option<u64>,
+    header: &BlockHeader,
+    body: &BlockBody,
+) -> Result<(), BodyError> {
+    let got = body.commitment_above(boundary, header.height);
     if header.tx_body_commitment != got {
         return Err(BodyError::CommitmentMismatch {
             expected: header.tx_body_commitment,
@@ -456,6 +590,12 @@ pub fn check_body_binding(header: &BlockHeader, body: &BlockBody) -> Result<(), 
 ///
 /// `is_anchor_final` is the anchors-from-finalized-only gate (§6) — pass
 /// `|r| tracker.is_root_final(r)` from the 棒 2 [`crate::finality::FinalityTracker`].
+///
+/// **Riders** (lab #367): this form validates under [`names::EmptyNameView`],
+/// which — combined with the boundary gate — refuses every non-absent rider.
+/// That is the exact shipped rule while `NAME_RULE_BOUNDARY_HEIGHT` is `None`
+/// and for every pre-boundary height once it is set; the armed node threads
+/// its registry through [`validate_body_with_names`] instead.
 pub fn validate_body<V, F>(
     header: &BlockHeader,
     body: &BlockBody,
@@ -466,7 +606,53 @@ where
     V: TxVerifier,
     F: Fn(&Hash32) -> bool,
 {
-    check_body_binding(header, body)?;
+    validate_body_with_names(header, body, verifier, is_anchor_final, &names::EmptyNameView)
+}
+
+/// [`validate_body`] with the name-rule state view injected — the armed form.
+/// See that function for everything else; the rider leg is documented at
+/// [`names::check_op`].
+pub fn validate_body_with_names<V, F, N>(
+    header: &BlockHeader,
+    body: &BlockBody,
+    verifier: &V,
+    is_anchor_final: F,
+    name_view: &N,
+) -> Result<(), BodyError>
+where
+    V: TxVerifier,
+    F: Fn(&Hash32) -> bool,
+    N: names::NameView,
+{
+    validate_body_above(
+        names::NAME_RULE_BOUNDARY_HEIGHT,
+        header,
+        body,
+        verifier,
+        is_anchor_final,
+        name_view,
+    )
+}
+
+/// [`validate_body_with_names`] with the name boundary as an argument — the
+/// **drill** seam (the emission rule's `_above` pattern), and nothing else.
+/// The boundary keys both the rider gate and the body-binding form, because a
+/// drill that armed one without the other would validate a chain no real
+/// binary ever runs.
+pub fn validate_body_above<V, F, N>(
+    boundary: Option<u64>,
+    header: &BlockHeader,
+    body: &BlockBody,
+    verifier: &V,
+    is_anchor_final: F,
+    name_view: &N,
+) -> Result<(), BodyError>
+where
+    V: TxVerifier,
+    F: Fn(&Hash32) -> bool,
+    N: names::NameView,
+{
+    check_body_binding_above(boundary, header, body)?;
     // A minting block must name a payee (issue #101). Second-cheapest check
     // after the binding, and it guards the block's whole issuance.
     if body.mints_without_payee() {
@@ -477,13 +663,31 @@ where
     // get paid", this asks "is that the amount the schedule owes".
     check_scheduled_coinbase(header.height, body.coinbase)?;
     let mut seen_nf: HashSet<Hash32> = HashSet::new();
+    // Names revealed earlier in this block — the same-block tie rule: earliest
+    // tx order wins (brief §1 step 4).
+    let mut pending_names: HashSet<Vec<u8>> = HashSet::new();
     for (i, tx) in body.txs.iter().enumerate() {
         if !is_anchor_final(&tx.public.anchor) {
             return Err(BodyError::AnchorNotFinal { index: i });
         }
-        let expected = posted_fee(tx.public.bucket);
+        // The rider decodes before the fee check because the fee rule depends
+        // on the op (the split: relay tier + burned name fee).
+        let op = crate::names::decode_rider(&tx.rider)
+            .map_err(|err| BodyError::RiderMalformed { index: i, err })?;
+        if op.is_some() && !crate::names::riders_active_above(boundary, header.height) {
+            return Err(BodyError::RiderBeforeBoundary { index: i });
+        }
+        let expected =
+            posted_fee(tx.public.bucket) + op.as_ref().map_or(0, crate::names::name_fee_for);
         if tx.public.fee != expected {
             return Err(BodyError::WrongFee { index: i, expected, got: tx.public.fee });
+        }
+        if let Some(op) = &op {
+            crate::names::check_op(name_view, header.height, op, &pending_names)
+                .map_err(|err| BodyError::RiderRule { index: i, err })?;
+            if let crate::names::NameOp::Reveal { record, .. } = op {
+                pending_names.insert(record.name.clone());
+            }
         }
         for nf in &tx.public.nullifiers {
             if !seen_nf.insert(*nf) {
@@ -658,7 +862,7 @@ mod tests {
             fee: posted_fee(ArityBucket::TwoByTwo),
         };
         let discovery = placeholder_discovery(&public.commitments);
-        TxEntry { proof: b"ok".to_vec(), public, discovery }
+        TxEntry { proof: b"ok".to_vec(), public, discovery, rider: TxEntry::absent_rider() }
     }
 
     fn ct_pattern(base: u8) -> [u8; CT_LEN] {
@@ -995,6 +1199,7 @@ mod tests {
                     fee: 0x0102_0304_0506_0708,
                 },
                 discovery: two_recipient_discovery(&[[0x44; 32], [0x55; 32]]),
+                rider: TxEntry::absent_rider(),
             }],
             coinbase: 0x1234_5678_9ABC_DEF0,
             coinbase_rkm: [
@@ -1056,6 +1261,289 @@ mod tests {
         assert_eq!(
             hex, "8ef00f318e7a4517107dfd538ed80b7d7ecf7caa71573085e8d5bdcfb5ad6cdc",
             "block-body commitment preimage changed — see this test's doc comment"
+        );
+    }
+
+    // --- lab #367: the v3 (name-rider) body form -----------------------------
+
+    /// **The inert-at-merge lock**: while `NAME_RULE_BOUNDARY_HEIGHT` is
+    /// `None`, the shipped `commitment_at` is the v2 commitment at every
+    /// height — merging this code changes nothing on the running chain.
+    #[test]
+    fn commitment_at_with_no_boundary_is_v2_everywhere() {
+        assert_eq!(crate::names::NAME_RULE_BOUNDARY_HEIGHT, None, "armed early — see lab #367");
+        let body = golden_body();
+        for h in [0u64, 1, 1_377, 8_640, 8_641, u64::MAX] {
+            assert_eq!(body.commitment_at(h), body.commitment(), "height {h}");
+        }
+    }
+
+    /// Below and AT a boundary the bytes are the v2 bytes; strictly above it
+    /// they are not — same comparison shape as the emission rule's.
+    #[test]
+    fn the_boundary_splits_v2_from_v3_exactly_like_the_emission_rule() {
+        let body = golden_body();
+        let b = 8_640u64;
+        assert_eq!(body.commitment_above(Some(b), b - 1), body.commitment());
+        assert_eq!(body.commitment_above(Some(b), b), body.commitment());
+        assert_ne!(
+            body.commitment_above(Some(b), b + 1),
+            body.commitment(),
+            "above the boundary the domain alone must move the commitment — \
+             a rider-free v3 body colliding with its v2 form would be the \
+             cross-version second-spelling the v3 domain exists to kill"
+        );
+    }
+
+    /// The v3 golden — same fixed body as [`golden_body`], riders absent,
+    /// committed under the v3 form. Locked so a later preimage change MUST
+    /// break a test, exactly as the v2 golden's doc comment demands.
+    #[test]
+    fn golden_body_commitment_bytes_v3() {
+        let hex: String = golden_body()
+            .commitment_above(Some(8_640), 8_641)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex, "f02dd727e204b3d0e8b55e420e55c311a6a6ab0f2d658866e57acf8ca5d46e25",
+            "v3 block-body commitment preimage changed — see golden_body_commitment_bytes"
+        );
+    }
+
+    /// Stage-2 integration: the rider leg of `validate_body_above`, end to
+    /// end — the boundary gate, the fee split, malformedness, the rules, and
+    /// the same-block tie, all through the real validation path with an
+    /// honestly-bound header.
+    #[test]
+    fn validate_body_rider_leg_end_to_end() {
+        use crate::names::{self, NameOp, NameRecord};
+        use std::collections::HashMap;
+
+        struct View {
+            commits: HashMap<Hash32, u64>,
+            names: HashMap<Vec<u8>, u64>,
+        }
+        impl names::NameView for View {
+            fn commit_included_in(&self, c: &Hash32, lo: u64, hi: u64) -> bool {
+                self.commits.get(c).is_some_and(|h| (lo..=hi).contains(h))
+            }
+            fn registration_expiry(&self, n: &[u8]) -> Option<u64> {
+                self.names.get(n).copied()
+            }
+        }
+
+        const B: u64 = 8_640;
+        let h = 10_000u64;
+        let record = NameRecord {
+            kind: names::RECORD_KIND_L1_ADDRESS,
+            name: b"alice".to_vec(),
+            address: vec![0xAB; names::L1_ADDRESS_LEN],
+        };
+        let salt = [7u8; 32];
+        let reveal = NameOp::Reveal { record: record.clone(), salt };
+        let view = View {
+            commits: [(names::commit_hash(&record, &salt), h - 100)].into(),
+            names: HashMap::new(),
+        };
+        // The reveal tx pays the split: relay tier + the 5-char name fee.
+        let mut tx = good_tx(0x60).with_name_op(&reveal);
+        tx.public.fee = posted_fee(ArityBucket::TwoByTwo) + names::name_fee_bessel(5);
+        // h sits above the EMISSION boundary too, so the body must mint the
+        // exact scheduled amount to a named payee — the fixture pays both
+        // rules, which is precisely what a real above-boundary block does.
+        let body_of =
+            |txs: Vec<TxEntry>| BlockBody { txs, coinbase: coinbase_exact(h), coinbase_rkm: MINER_RKM };
+        let at = |height: u64, body: &BlockBody| BlockHeader {
+            height,
+            ..BlockHeader::child_of(
+                &BlockHeader::genesis(1, 0),
+                75,
+                1,
+                body.commitment_above(Some(B), height),
+            )
+        };
+
+        // Happy path, above the boundary.
+        let body = body_of(vec![tx.clone()]);
+        validate_body_above(Some(B), &at(h, &body), &body, &MockVerifier, is_final, &view)
+            .expect("a fee-split reveal with an in-window commit is valid above the boundary");
+
+        // The same rider AT the boundary is early — the gate is strict.
+        assert!(matches!(
+            validate_body_above(Some(B), &at(B, &body), &body, &MockVerifier, is_final, &view),
+            Err(BodyError::RiderBeforeBoundary { index: 0 })
+        ));
+        // And under the SHIPPED rule (boundary None) it is early everywhere —
+        // the inert-at-merge property on the validation path.
+        assert!(matches!(
+            validate_body_with_names(&at(h, &body), &body, &MockVerifier, is_final, &view)
+                .unwrap_err(),
+            BodyError::CommitmentMismatch { .. } // v3-bound header under a v2 rule
+        ));
+
+        // Fee split enforced: paying only the relay tier is a WrongFee naming
+        // the full expected sum.
+        let mut cheap = tx.clone();
+        cheap.public.fee = posted_fee(ArityBucket::TwoByTwo);
+        let body = body_of(vec![cheap]);
+        assert!(matches!(
+            validate_body_above(Some(B), &at(h, &body), &body, &MockVerifier, is_final, &view),
+            Err(BodyError::WrongFee { index: 0, expected, .. })
+                if expected == posted_fee(ArityBucket::TwoByTwo) + names::name_fee_bessel(5)
+        ));
+
+        // Malformed rider bytes are a codec refusal, not a rule one.
+        let mut garbled = tx.clone();
+        garbled.rider = vec![0x01, 0x01, 0xEE]; // truncated commit
+        let body = body_of(vec![garbled]);
+        assert!(matches!(
+            validate_body_above(Some(B), &at(h, &body), &body, &MockVerifier, is_final, &view),
+            Err(BodyError::RiderMalformed { index: 0, .. })
+        ));
+
+        // Same-block tie: a second reveal of the same name in one block loses
+        // by tx order.
+        let mut second = good_tx(0x61).with_name_op(&reveal);
+        second.public.fee = posted_fee(ArityBucket::TwoByTwo) + names::name_fee_bessel(5);
+        let body = body_of(vec![tx.clone(), second]);
+        assert!(matches!(
+            validate_body_above(Some(B), &at(h, &body), &body, &MockVerifier, is_final, &view),
+            Err(BodyError::RiderRule { index: 1, err: names::NameRuleError::NameTaken { .. } })
+        ));
+
+        // And a plain (rider-absent) block validates above the boundary too —
+        // v3 is not "riders required", it is "riders possible".
+        let plain = body_of(vec![good_tx(0x62)]);
+        validate_body_above(Some(B), &at(h, &plain), &plain, &MockVerifier, is_final, &view)
+            .expect("rider-absent blocks stay valid above the boundary");
+    }
+
+    /// Stage-7 drill: the FRONT-RUN RACE. An adversary watching the mempool
+    /// sees a reveal and races their own — but their commit is necessarily
+    /// young (they just learned the name), and a reveal whose commit is
+    /// younger than `COMMIT_MIN_AGE` is invalid, so **no miner can include
+    /// the front-runner's reveal at all**, ordering games included. The
+    /// victim's older commit wins by construction. The min-age window IS the
+    /// mutation check: weaken it to zero and the adversarial assertions here
+    /// fail.
+    #[test]
+    fn drill_front_run_race_the_young_commit_loses() {
+        use crate::names::{self, NameOp, NameRecord, COMMIT_MIN_AGE};
+        use std::collections::HashMap;
+
+        struct View {
+            commits: HashMap<Hash32, u64>,
+        }
+        impl names::NameView for View {
+            fn commit_included_in(&self, c: &Hash32, lo: u64, hi: u64) -> bool {
+                self.commits.get(c).is_some_and(|h| (lo..=hi).contains(h))
+            }
+            fn registration_expiry(&self, _: &[u8]) -> Option<u64> {
+                None
+            }
+        }
+
+        const B: u64 = 8_640;
+        let h = 10_000u64;
+        let record = |addr: u8| NameRecord {
+            kind: names::RECORD_KIND_L1_ADDRESS,
+            name: b"alice".to_vec(),
+            address: vec![addr; names::L1_ADDRESS_LEN],
+        };
+        // The victim committed 100 blocks ago; the adversary saw the reveal in
+        // the mempool and committed as fast as physically possible — last block.
+        let victim = (record(0xAA), [1u8; 32]);
+        let adversary = (record(0xEE), [2u8; 32]);
+        let view = View {
+            commits: [
+                (names::commit_hash(&victim.0, &victim.1), h - 100),
+                (names::commit_hash(&adversary.0, &adversary.1), h - 1),
+            ]
+            .into(),
+        };
+        let tx_for = |nf: u8, (r, salt): &(NameRecord, [u8; 32])| {
+            let mut tx = good_tx(nf).with_name_op(&NameOp::Reveal {
+                record: r.clone(),
+                salt: *salt,
+            });
+            tx.public.fee =
+                posted_fee(ArityBucket::TwoByTwo) + names::name_fee_bessel(5);
+            tx
+        };
+        let body_of = |txs: Vec<TxEntry>| BlockBody {
+            txs,
+            coinbase: coinbase_exact(h),
+            coinbase_rkm: MINER_RKM,
+        };
+        let at = |body: &BlockBody| BlockHeader {
+            height: h,
+            ..BlockHeader::child_of(
+                &BlockHeader::genesis(1, 0),
+                75,
+                1,
+                body.commitment_above(Some(B), h),
+            )
+        };
+
+        // A block carrying the front-runner's reveal is INVALID — even with
+        // the adversary's tx ordered first.
+        let raced = body_of(vec![tx_for(0x70, &adversary), tx_for(0x71, &victim)]);
+        assert!(
+            matches!(
+                validate_body_above(Some(B), &at(&raced), &raced, &MockVerifier, is_final, &view),
+                Err(BodyError::RiderRule {
+                    index: 0,
+                    err: crate::names::NameRuleError::CommitNotFound
+                })
+            ),
+            "a commit {} block old cannot satisfy the {}-block minimum",
+            1,
+            COMMIT_MIN_AGE
+        );
+        // The victim's block is valid.
+        let honest = body_of(vec![tx_for(0x71, &victim)]);
+        validate_body_above(Some(B), &at(&honest), &honest, &MockVerifier, is_final, &view)
+            .expect("the older commit registers");
+    }
+
+    /// The rider is inside the v3 preimage and outside the v2 one: a
+    /// registration and its rider-stripped twin commit identically under v2
+    /// (which is why v2 must not survive above the boundary) and differently
+    /// under v3 (which is the binding D1 requires).
+    #[test]
+    fn v3_commits_to_the_rider_and_v2_does_not() {
+        let stripped = golden_body();
+        let mut registering = golden_body();
+        registering.txs[0].rider = crate::names::encode_rider(Some(&crate::names::NameOp::Commit {
+            commit: [0x5A; 32],
+        }));
+        assert_eq!(registering.commitment(), stripped.commitment(), "v2 is rider-blind");
+        assert_ne!(
+            registering.commitment_above(Some(8_640), 8_641),
+            stripped.commitment_above(Some(8_640), 8_641),
+            "v3 must bind the rider"
+        );
+    }
+
+    /// A rider-carrying body binds under v3 through the real validation path:
+    /// a header committing the v3 form passes `check_body_binding` above the
+    /// boundary and the same header/body pair would fail under a v2 reading.
+    #[test]
+    fn check_body_binding_is_height_keyed() {
+        let mut body = golden_body();
+        body.txs[0].rider =
+            crate::names::encode_rider(Some(&crate::names::NameOp::Commit { commit: [0x5A; 32] }));
+        // While the shipped boundary is None, binding expects v2 everywhere —
+        // the drill-seam variant is exercised via commitment_above directly.
+        let mut header = BlockHeader::genesis(1, 0);
+        header.height = 8_641;
+        header.tx_body_commitment = body.commitment_at(8_641);
+        check_body_binding(&header, &body).expect("binds under the shipped (None) boundary = v2");
+        assert_eq!(
+            header.tx_body_commitment,
+            body.commitment(),
+            "with no boundary the shipped rule IS v2 — the v3 path is locked by the goldens above"
         );
     }
 
@@ -1180,6 +1668,7 @@ mod tests {
                 fee: posted_fee(ArityBucket::TwoByTwo),
             },
             discovery: d,
+            rider: TxEntry::absent_rider(),
         };
         check_tx_discovery(0, &tx).expect("placeholder must be consensus-valid");
     }
@@ -1197,6 +1686,7 @@ mod tests {
                 fee: posted_fee(ArityBucket::TwoByTwo),
             },
             discovery: two_recipient_discovery(&cms),
+            rider: TxEntry::absent_rider(),
         };
         // 1. decode ∘ encode = id, on the bytes the body commits to.
         let (back, pls) = tx.discovery_parts(0).expect("discovery decodes");

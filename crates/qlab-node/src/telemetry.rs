@@ -1128,6 +1128,7 @@ impl Telemetry {
                 measured_coinbase: r.u64()?,
                 expected_coinbase: r.u64()?,
                 fees: r.u64()?,
+                burned: 0,
             });
         }
         // ---- issue #212: head #3 -----------------------------------------------
@@ -1382,6 +1383,7 @@ mod tests {
                 measured_coinbase: 1_234_567,
                 expected_coinbase: 1_234_567,
                 fees: 890,
+                burned: 0,
             }]);
         let bytes = t.to_bytes();
         assert_eq!(bytes[0], 0x05);
@@ -1420,6 +1422,7 @@ mod tests {
                 measured_coinbase: 123,
                 expected_coinbase: 123,
                 fees: 0,
+                burned: 0,
             }]);
         assert_eq!(
             partial.supply_coverage(),
@@ -1452,6 +1455,7 @@ mod tests {
                 measured_coinbase: 123,
                 expected_coinbase: 123,
                 fees: 0,
+                burned: 0,
             },
         ]);
         let lag = StateLag::new(4, 14);
@@ -1473,6 +1477,7 @@ mod tests {
                 measured_coinbase: 123,
                 expected_coinbase: 123,
                 fees: 0,
+                burned: 0,
             },
         ]);
         assert_eq!(complete.supply_lag(), Some(StateLag::new(14, 14)));
@@ -1972,6 +1977,7 @@ mod tests {
                     measured_coinbase: 1_234_567,
                     expected_coinbase: 1_234_567,
                     fees: 89,
+                    burned: 0,
                 }]),
             Some((2864, 0x63)),
         );

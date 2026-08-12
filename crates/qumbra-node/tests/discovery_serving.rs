@@ -329,6 +329,7 @@ fn the_payload_projection_is_golden_locked_against_a_hand_built_body() {
             hash: [0x99; 32],
             groups: vec![tx.discovery.clone()],
             nullifiers: vec![],
+            riders: vec![tx.rider.clone()],
         }],
     };
     let served = qlab_node::full_response(&view.blocks, 1, 0).expect("the projection answers");
@@ -369,6 +370,7 @@ fn the_payload_projection_is_golden_locked_against_a_hand_built_body() {
             hash: [0x99; 32],
             groups: vec![tampered_tx.discovery.clone()],
             nullifiers: vec![],
+            riders: vec![tampered_tx.rider.clone()],
         }],
     };
 
@@ -412,7 +414,7 @@ fn a_payment_that_attaches_no_discovery_cannot_reach_the_serving_path() {
     let (good, _notes) = payment_to(&recipient.ek, 2, 1, anchor, &mut rng);
     // The same payment with its group stripped to `n = 0`.
     let stripped =
-        TxEntry { proof: good.proof.clone(), public: good.public.clone(), discovery: TxEntry::empty_discovery() };
+        TxEntry { proof: good.proof.clone(), public: good.public.clone(), discovery: TxEntry::empty_discovery(), rider: TxEntry::absent_rider() };
 
     let tip = node.tip_hash();
     let parent = node.chain().block(&tip).expect("tip stored").header();

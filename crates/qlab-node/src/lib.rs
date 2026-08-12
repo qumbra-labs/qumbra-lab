@@ -47,6 +47,7 @@ pub mod coinbase;
 pub mod emission;
 pub mod mempool;
 pub mod metrics;
+pub mod name_registry;
 mod node;
 mod persist;
 mod replay_progress;
@@ -78,7 +79,7 @@ pub use recovery::{
 pub use rpc::{
     anchor_set, compact_response, full_response, main_chain_counts_of, main_chain_of,
     main_chain_roots_of, repeated_nullifier_in_tx, serve, AnchorSet, BlockDiscovery,
-    nullifier_page, CheckpointFacts, FullRefusal, MemNodeRpc, NetFacts, NodeRpc, NodeStatus,
+    names_page, nullifier_page, CheckpointFacts, FullRefusal, MemNodeRpc, NetFacts, NodeRpc, NodeStatus,
     RecipientDiscovery, RejectReason, RouteResult, RpcServerHandle, SubmitOutcome, TreeLeaves,
     TxDiscovery, MAX_COMPACT_BLOCKS, MAX_TREE_LEAVES, RPC_VERSION,
 };

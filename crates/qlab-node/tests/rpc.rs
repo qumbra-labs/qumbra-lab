@@ -273,3 +273,76 @@ fn per_height_frontiers_match_the_nodes_own_roots_across_the_maturity_delay() {
         assert!(rpc.node().is_valid_anchor(root), "published a root the node rejects");
     }
 }
+
+// --- lab #367: /v1/names -----------------------------------------------------
+
+/// The D2 bulk-sync route: per-block rider lists, verbatim, one entry per tx
+/// (absent `[0x00]` included, so tx order survives serving) — and the refusal
+/// that defines the route: resolve-by-name does not exist, BY NAME.
+#[test]
+fn v1_names_serves_bulk_and_refuses_resolve_by_name() {
+    use qlab_cbserver::codec::NamesPage;
+    use qlab_devnet::names::{encode_rider, NameOp};
+
+    let mut rng = StdRng::seed_from_u64(11);
+    let (mut rpc, our, _decoy, anchor) = setup(&mut rng);
+    let (tx0, d0) = real_tx(&our.ek, 2, 1, anchor, &mut rng);
+    // While the boundary is unset, apply_block correctly refuses any rider
+    // (the inert-at-merge rule — asserting that here keeps this test honest
+    // about what the live node serves today)…
+    let mut riding = tx0.clone();
+    riding.rider = encode_rider(Some(&NameOp::Commit { commit: [0x5A; 32] }));
+    let refused = {
+        use qlab_devnet::header::BlockHeader;
+        let body = qlab_devnet::body::BlockBody {
+            txs: vec![riding],
+            coinbase: 1,
+            coinbase_rkm: [1, 2, 3, 4],
+        };
+        let parent = rpc.node().chain().block(&rpc.node().tip_hash()).unwrap().header();
+        let header = BlockHeader::child_of(&parent, 75, 1, body.commitment());
+        rpc.node_mut().apply_block(header, body, &AcceptAll)
+    };
+    assert!(
+        matches!(
+            refused,
+            Err(qlab_node::NodeError::Body(
+                qlab_devnet::body::BodyError::RiderBeforeBoundary { .. }
+            ))
+        ),
+        "the shipped rule refuses riders while the boundary is None: {refused:?}"
+    );
+
+    // …so the applied chain carries ABSENT riders, and the route serves them
+    // verbatim, one per tx, alignment intact.
+    rpc.submit_tx(tx0.clone(), d0, &AcceptAll);
+    apply_block(rpc.node_mut(), vec![tx0.clone()]);
+
+    let bytes = rpc.route("/v1/names?from=0&to=5").unwrap();
+    let page = NamesPage::from_bytes(&bytes).expect("the page decodes");
+    assert_eq!(page.from, 0);
+    assert_eq!(page.to, 5);
+    let b1 = page.blocks.iter().find(|b| b.height == 1).expect("height 1 served");
+    assert_eq!(b1.riders.len(), 1);
+    assert_eq!(b1.riders[0], vec![0x00], "served bytes are the committed (absent) bytes");
+
+    // The rider-carrying serving path is a pure projection — tested at the
+    // page function against a synthetic projection (no consensus involved).
+    let synthetic = qlab_node::BlockDiscovery {
+        height: 7,
+        hash: [0x77; 32],
+        groups: vec![vec![0x00]],
+        nullifiers: vec![],
+        riders: vec![encode_rider(Some(&NameOp::Commit { commit: [0x5A; 32] }))],
+    };
+    let page = qlab_node::names_page(&[synthetic.clone()], 0, 10);
+    assert_eq!(page.blocks[0].riders, synthetic.riders, "projection is verbatim");
+
+    // The D2 refusal, named — not a 404, not a missing-param 400.
+    let err = rpc.route("/v1/names?name=alice").unwrap_err();
+    assert_eq!(err.0, 400);
+    assert!(err.1.contains("by design"), "the refusal explains itself: {}", err.1);
+    // And the ordinary bad-range refusals match the sibling routes.
+    assert_eq!(rpc.route("/v1/names?from=5&to=1").unwrap_err().0, 400);
+    assert_eq!(rpc.route("/v1/names").unwrap_err().0, 400);
+}

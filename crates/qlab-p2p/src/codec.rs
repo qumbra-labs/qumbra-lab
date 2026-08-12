@@ -117,6 +117,14 @@ impl<'a> Reader<'a> {
         }
         Ok(())
     }
+
+    /// Whether any bytes remain — the probe behind presence-conditional
+    /// sections (the tx rider, lab #367). Deliberately not a general peek:
+    /// the only honest question a conditional section can ask is "is there
+    /// more", never "what is next".
+    pub fn has_more(&self) -> bool {
+        self.pos < self.buf.len()
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -365,6 +373,22 @@ pub fn encode_tx(tx: &TxEntry) -> Vec<u8> {
     // tx payload — it is what makes the body change coherent on the wire.
     write_varint(&mut out, tx.discovery.len() as u64);
     out.extend_from_slice(&tx.discovery);
+    // Lab #367: the name rider travels the same way — but the section is
+    // PRESENCE-CONDITIONAL, unlike discovery's, and unlike the body preimage's
+    // unconditional v3 tail. The reason is the #181 lesson run forward: an
+    // unconditional tail here would make every tx from a #367 build unreadable
+    // to every pre-#367 peer — a relay partition on a wire that has no
+    // boundary to hide behind (riders only become *valid* above the name
+    // boundary, but transactions relay before and after it). A rider-absent tx
+    // therefore encodes byte-identically to a pre-#367 tx, and only a
+    // rider-carrying tx (which no pre-#367 build could include in a block
+    // anyway) grows the section. Canonicity: absence is spelled by OMISSION on
+    // this wire — an explicit `[0x00]` tail is refused at decode, so one tx
+    // has one encoding and `tx_id` stays collision-free.
+    if tx.rider != qlab_devnet::names::RIDER_ABSENT {
+        write_varint(&mut out, tx.rider.len() as u64);
+        out.extend_from_slice(&tx.rider);
+    }
     out
 }
 
@@ -392,11 +416,26 @@ pub fn decode_tx(buf: &[u8]) -> Result<TxEntry, DecodeError> {
     let proof = r.rest(proof_len, "tx.proof")?;
     let discovery_len = r.varint()? as usize;
     let discovery = r.rest(discovery_len, "tx.discovery")?;
+    // Lab #367: presence-conditional rider section — see encode_tx's note.
+    let rider = if r.has_more() {
+        let rider_len = r.varint()? as usize;
+        let rider = r.rest(rider_len, "tx.rider")?;
+        if rider == qlab_devnet::names::RIDER_ABSENT {
+            // Absence is spelled by omission on this wire; an explicit absent
+            // tail is a second encoding of the same tx and is refused so
+            // `tx_id` stays one-to-one.
+            return Err(DecodeError::Trailing { remaining: rider.len() });
+        }
+        rider
+    } else {
+        TxEntry::absent_rider()
+    };
     r.finish()?;
     Ok(TxEntry {
         proof,
         discovery,
         public: TxPublic { anchor, nullifiers, commitments, bucket, fee },
+        rider,
     })
 }
 
@@ -801,6 +840,63 @@ mod tests {
         stripped.discovery = TxEntry::empty_discovery();
         let mutated = BlockBody { txs: vec![stripped], coinbase: 7, coinbase_rkm: [1, 2, 3, 4] };
         assert_ne!(here.commitment(), mutated.commitment());
+    }
+
+    /// Lab #367: the tx wire's rider section, all four properties in one place:
+    ///   1. a rider-free tx encodes **byte-identically** to the pre-#367 wire —
+    ///      the no-relay-partition property (the #181 lesson);
+    ///   2. a rider-carrying tx round-trips verbatim;
+    ///   3. an explicit `[0x00]` tail is refused — absence is spelled by
+    ///      omission here, so one tx has one encoding and `tx_id` stays 1:1;
+    ///   4. a stripped rider changes `tx_id` — the pool cannot dedup a
+    ///      registration against its stripped twin.
+    #[test]
+    fn the_rider_wire_is_conditional_canonical_and_identity_bearing() {
+        let base = TxEntry::with_placeholder_discovery(vec![9u8; 40], TxPublic {
+            anchor: [1; 32],
+            nullifiers: vec![[2; 32]],
+            commitments: vec![],
+            bucket: ArityBucket::TwoByTwo,
+            fee: 1_000_000,
+        });
+
+        // (1) rider-free = the pre-#367 bytes: the encoding ends at discovery.
+        let wire = encode_tx(&base);
+        let mut pre367 = Vec::new();
+        pre367.extend_from_slice(&base.public.anchor);
+        write_varint(&mut pre367, 1);
+        pre367.extend_from_slice(&base.public.nullifiers[0]);
+        write_varint(&mut pre367, 0);
+        pre367.push(bucket_to_u8(base.public.bucket));
+        pre367.extend_from_slice(&base.public.fee.to_le_bytes());
+        write_varint(&mut pre367, base.proof.len() as u64);
+        pre367.extend_from_slice(&base.proof);
+        write_varint(&mut pre367, base.discovery.len() as u64);
+        pre367.extend_from_slice(&base.discovery);
+        assert_eq!(wire, pre367, "a rider-free tx must be byte-identical to the old wire");
+        assert_eq!(decode_tx(&wire).unwrap().rider, TxEntry::absent_rider());
+
+        // (2) a rider-carrying tx round-trips verbatim.
+        let registering = base.clone().with_name_op(&qlab_devnet::names::NameOp::Commit {
+            commit: [0x5A; 32],
+        });
+        let back = decode_tx(&encode_tx(&registering)).unwrap();
+        assert_eq!(back.rider, registering.rider, "rider bytes are carried verbatim");
+        assert_eq!(back.public, registering.public);
+        assert_eq!(back.proof, registering.proof);
+        assert_eq!(back.discovery, registering.discovery);
+
+        // (3) an explicit absent tail is a second spelling — refused.
+        let mut respelled = wire.clone();
+        write_varint(&mut respelled, 1);
+        respelled.push(0x00);
+        assert!(
+            matches!(decode_tx(&respelled), Err(DecodeError::Trailing { .. })),
+            "explicit [0x00] rider tail must be refused"
+        );
+
+        // (4) the rider is identity-bearing on this wire.
+        assert_ne!(tx_id(&base), tx_id(&registering));
     }
 
     #[test]
