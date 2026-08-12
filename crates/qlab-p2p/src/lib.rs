@@ -48,6 +48,7 @@ pub mod punish;
 pub mod ratelimit;
 pub mod sendstall;
 pub mod sync;
+pub mod ticktime;
 pub mod transport;
 pub mod varint;
 pub mod wire;
