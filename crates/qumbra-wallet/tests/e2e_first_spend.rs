@@ -407,7 +407,7 @@ fn a_first_spend_travels_the_whole_story_and_the_recipient_detects_it() {
     // discovery server, over the same real socket as everything else here.
     //
     // The nullifier being matched is not a fixture: `art.entry.public.nullifiers`
-    // is what `build_send` REALLY proved and the node REALLY admitted, so this
+    // is what the bundle prover REALLY proved and the node REALLY admitted, so this
     // asserts the balance's derivation against the spend path's own output
     // rather than against a second copy of the formula.
     refresh(&shared, &discovery_view, &leaves_view, &anchors_view);
