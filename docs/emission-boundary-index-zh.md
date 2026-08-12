@@ -1,6 +1,15 @@
 # 发行规则边界(高度 8,640,约 2026-08-12)—— 一页索引
 
 > [English](emission-boundary-index.md)
+> ✅ **边界已穿越 —— 2026-08-12。**08:20:55 +08 停机（四台同 tip）,**11:55:42 敲定**
+> （fid `7925d1de`,四票全）,12:16:51 链在精确调度下复活,§7 `audit-emission --from 8641`
+> 全舰 exit-0。issue #299 与 #303 已关闭。停机窗口内现场发现并修复三个缺陷——#360
+> （边界签名被挖矿门锁死）、#362（投票中继孤岛）、以及冻结的 tip 平局（败方收敛缺口
+> 立案为 #375）——完整叙事见
+> [`qumbra-deploy tasks/boundary-day-8640-2026-08-12.md`](https://github.com/qumbra-labs/qumbra-deploy/blob/main/tasks/boundary-day-8640-2026-08-12.md)
+> 与 #299 线程。**本页自此为历史档案**;下方的 go/no-go 程序按原样执行完毕
+> （执行中依 STOP 通告现场修正）,并保留为未来任何停机边界的模板。
+
 
 > 🔴 **2026-08-11 重新盖章:边界从 18,000 改为 8,640。** 见
 > [Larry 在 issue #299 的裁决](https://github.com/qumbra-labs/qumbra-lab/issues/299#issuecomment-5248469483)
