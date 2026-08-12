@@ -354,14 +354,24 @@ pub struct ProveContext {
 /// may obtain and decode the same two public surfaces itself, then pass the
 /// resulting values across its native boundary with the bundle.
 pub fn preflight(req: &SendRequest<'_>) -> Result<ProveContext, SendError> {
-    let anchors = HttpAnchorSource::new(req.node_url)
+    preflight_urls(req.url, req.node_url)
+}
+
+/// Fetch phase-2 facts without constructing a wallet send request. Native
+/// prover hosts use this entry point because their serialized witness bundle
+/// already fixes the recipient, amount, fee, and outputs; only the two public
+/// endpoints remain outside that artifact.
+pub fn preflight_urls(scan_url: &str, node_url: &str) -> Result<ProveContext, SendError> {
+    let anchors = HttpAnchorSource::new(node_url)
         .anchors()
         .map_err(|e| SendError::Refused(format!("anchor-preflight-unavailable: {e}")))?;
-    let spent = fetch_spent(&HttpNullifierSource::new(req.url), 0, anchors.tip_height).map_err(|e| {
-        SendError::Refused(format!(
-            "nullifier-preflight-unavailable: {e} — refusing to prove inputs the chain may already have consumed"
-        ))
-    })?;
+    let spent = fetch_spent(&HttpNullifierSource::new(scan_url), 0, anchors.tip_height).map_err(
+        |e| {
+            SendError::Refused(format!(
+                "nullifier-preflight-unavailable: {e} — refusing to prove inputs the chain may already have consumed"
+            ))
+        },
+    )?;
     Ok(ProveContext { anchors, spent })
 }
 
