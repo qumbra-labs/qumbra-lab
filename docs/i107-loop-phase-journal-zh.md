@@ -101,7 +101,7 @@ docker logs --tail 200 qumbra-node 2>&1 | grep '^TELEMETRY' | tail -1
 
 `wan-sampler.sh:63` 用 `--tail 20` 做同样的读取，需要同样的改动。**这两个脚本都不在本仓库，本 PR 也没有改动它们。**
 
-**开销**：每轮 13 次读时钟，另加每帧 3 次，每次数十纳秒（vDSO 读取，无系统调用）——由 `ticktime::tests::instrumentation_costs_tens_of_nanoseconds_per_frame` 实测，一旦读时钟涨到微秒级该测试即失败。
+**开销**：每轮 13 次读时钟，另加每帧 3 次。**每次 25-26 ns**——3 个样本、每样本 100,000 次调用，`cargo test` **debug**（未优化，因此 release 只会更低），Apple M5 Max / macOS 26.5.2，笔记本接电源、机器空闲。即每轮约 325 ns，每帧约 75 ns；按 20 ms 退避推出的约 50 轮/秒计算，每秒约 16 µs。该数字由 `ticktime::tests::instrumentation_costs_tens_of_nanoseconds_per_frame` 打印；一旦读时钟涨到微秒级，该测试即失败——那正是需要重新考虑「无条件开启」这一决定的门槛。
 
 ## 它回答不了什么
 

@@ -119,7 +119,7 @@ docker logs --tail 200 qumbra-node 2>&1 | grep '^TELEMETRY' | tail -1
 
 `wan-sampler.sh:63` runs the same read at `--tail 20` and needs the same change. **Neither script is in this repo and neither was touched by this PR.**
 
-**Cost**: 13 clock reads per iteration plus 3 per frame, tens of nanoseconds each (a vDSO read, no syscall) — measured by `ticktime::tests::instrumentation_costs_tens_of_nanoseconds_per_frame`, which fails if a clock read ever costs a microsecond.
+**Cost**: 13 clock reads per iteration plus 3 per frame. **25-26 ns per read** - 3 samples, 100,000 calls each, `cargo test` **debug** (unoptimized, so release is a ceiling on this), Apple M5 Max / macOS 26.5.2, laptop on AC, rig otherwise idle. That is ~325 ns per iteration plus ~75 ns per frame; at the ~50 iterations/s a quiescent 20 ms back-off implies, ~16 us of every second. Printed by `ticktime::tests::instrumentation_costs_tens_of_nanoseconds_per_frame`, which also fails if a clock read ever reaches a microsecond - the threshold at which running this unconditionally would need revisiting.
 
 ## What this does not answer
 
