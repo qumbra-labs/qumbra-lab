@@ -32,6 +32,15 @@
 #
 # arm64 deliberately: the rig is M3 and the four T0 hosts are AWS t4g.small
 # Graviton, so arm64 is the deployment architecture and not merely the dev one.
+#
+# THE OTHER LANE: `acceptance-graviton.yml` runs the same bar on an on-demand
+# AWS Graviton instance (start-on-job / stop-after, warm caches — deploy
+# #130). This hosted lane STAYS dispatchable as fallback/overflow (S6 there);
+# the default moves to `graviton-rig` only after the first live suite passes
+# on it, and the coordinator ratifies that flip, not either file. The two
+# lanes trigger on different labels (`verify` here, `verify-graviton` there)
+# so one label can never bill both. If the suite or reconciliation steps
+# change shape, change BOTH files in the same PR.
 name: suite (arm64)
 
 on:
