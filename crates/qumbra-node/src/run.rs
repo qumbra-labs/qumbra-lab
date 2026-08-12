@@ -298,8 +298,14 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// tests set it to zero and drive [`Self::try_mine`] directly).
     mine_interval: Duration,
     last_mine: Instant,
-    /// #362: last boundary vote re-push, bounded to BOUNDARY_REPUSH_INTERVAL.
+    /// #362: last boundary vote re-push, bounded to [`Self::repush_interval`].
     last_boundary_repush: Instant,
+    /// #362: spacing between boundary vote re-pushes. Initialised to the
+    /// production [`BOUNDARY_REPUSH_INTERVAL`] and only ever moved by
+    /// [`Self::set_repush_interval`], the same shape `mine_interval` has: the
+    /// binary never touches it, no config key reaches it, and the drill
+    /// (issue #369, D2) sets it to zero rather than waiting a minute per push.
+    repush_interval: Duration,
     /// Nonce salt for successive `BlockAnnounce`s.
     nonce: u64,
     /// Next checkpoint height to propose (cadence grid; only if we hold keys).
@@ -669,6 +675,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             mine_interval: Duration::from_secs(genesis.frozen.block_time_secs),
             last_mine: Instant::now(),
             last_boundary_repush: Instant::now(),
+            repush_interval: BOUNDARY_REPUSH_INTERVAL,
             nonce: 0,
             next_checkpoint: 0, // finalize genesis first, then the cadence grid
             // The ledger's cursor starts at the first cadence slot: genesis is
@@ -803,6 +810,20 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// Override the mining cadence (tests set 0 to mine every step).
     pub fn set_mine_interval(&mut self, d: Duration) {
         self.mine_interval = d;
+    }
+
+    /// Override the #362 boundary vote re-push cadence (tests set 0 to re-push on
+    /// every loop pass).
+    ///
+    /// The production default is [`BOUNDARY_REPUSH_INTERVAL`] — 60 s — and the
+    /// binary never calls this: it exists because the island-merge cascade
+    /// (issue #369, D2) is a *multi-push* property and a drill that waited a
+    /// real minute per push could not be in the suite at all. Deliberately the
+    /// same shape as [`Self::set_mine_interval`]: a method on the running node,
+    /// not a config key and not a mutable const, so the wire, the config file
+    /// and every deployed binary keep exactly one cadence.
+    pub fn set_repush_interval(&mut self, d: Duration) {
+        self.repush_interval = d;
     }
 
     /// Select the header-timestamp mining clock (item 0). The binary opts into
@@ -2176,7 +2197,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 // held 15). Re-push the stored variants on a slow cadence;
                 // receiver-side signer-dedup makes repetition harmless, and
                 // the halted-unfinalized condition dissolves at finalization.
-                if self.last_boundary_repush.elapsed() >= BOUNDARY_REPUSH_INTERVAL {
+                if self.last_boundary_repush.elapsed() >= self.repush_interval {
                     let n = self.p2p.repush_slot_votes(h);
                     if n > 0 {
                         println!("REPUSH slot={h} variants={n} why=boundary-unfinalized");
