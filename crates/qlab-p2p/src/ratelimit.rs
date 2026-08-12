@@ -368,6 +368,10 @@ pub struct RateLimits {
     pub body_serve_byte_burst: u64,
     /// Sustained served body bytes per key per second (issue #371 S3).
     pub body_serve_bytes_per_sec: u64,
+    /// Most `GetData` items examined for serving per message (issue #371 S3).
+    pub max_getdata_items: usize,
+    /// Most body bytes one `GetData` answer may carry (issue #371 S3).
+    pub max_body_bytes_per_getdata: u64,
     pub max_keys: usize,
 }
 
@@ -382,6 +386,8 @@ impl Default for RateLimits {
             cp_query_serve_interval_ms: CHECKPOINT_QUERY_SERVE_INTERVAL_MS,
             body_serve_byte_burst: BODY_SERVE_BYTE_BURST,
             body_serve_bytes_per_sec: BODY_SERVE_BYTES_PER_SEC,
+            max_getdata_items: MAX_GETDATA_ITEMS,
+            max_body_bytes_per_getdata: MAX_BODY_BYTES_PER_GETDATA,
             max_keys: MAX_RATE_KEYS,
         }
     }
@@ -401,6 +407,8 @@ impl RateLimits {
             cp_query_serve_interval_ms: 0,
             body_serve_byte_burst: u64::MAX / 1000,
             body_serve_bytes_per_sec: u64::MAX / 1000,
+            max_getdata_items: usize::MAX,
+            max_body_bytes_per_getdata: u64::MAX,
             max_keys: MAX_RATE_KEYS,
         }
     }
@@ -653,6 +661,48 @@ mod tests {
         // Refill is capped at the burst.
         assert!(b.try_take(10, 100_000));
         assert!(!b.try_take(1, 100_000), "never accrues past capacity");
+    }
+
+    /// Issue #371 S3 — the served-body-byte budget, both directions (#91's
+    /// acceptance rule: only testing the refusal would let the limit rot).
+    #[test]
+    fn body_serve_budget_spends_at_the_limit_refuses_over_it_and_refills() {
+        let mut rl = RateLimiter::new(RateLimits {
+            body_serve_byte_burst: 1_000,
+            body_serve_bytes_per_sec: 500,
+            ..RateLimits::default()
+        });
+        let k = RateKey::new(Some("203.0.113.9:9333"), PeerId(1));
+        // At the limit: the whole burst is servable.
+        assert!(rl.may_serve_body_bytes(k.clone(), 1_000, 0), "exactly the burst is granted");
+        // Over it: refused, counted, and the refusal consumes nothing…
+        assert!(!rl.may_serve_body_bytes(k.clone(), 1, 0), "the burst is spent");
+        assert_eq!(rl.stats().throttled_body_serve, 1);
+        // …so a smaller later body can still fit once the refill allows.
+        assert!(rl.may_serve_body_bytes(k.clone(), 250, 500), "500 ms refills 250 bytes");
+        // The cheap pre-check agrees with the budget and consumes nothing.
+        assert!(!rl.body_serve_has_budget(k.clone(), 500), "drained again");
+        assert!(rl.body_serve_has_budget(k.clone(), 1_000), "and refilled again");
+        assert_eq!(rl.stats().throttled_body_serve, 1, "pre-checks are not throttles");
+        // A different key draws on its own budget.
+        let other = RateKey::new(Some("203.0.113.10:9333"), PeerId(2));
+        assert!(rl.may_serve_body_bytes(other, 1_000, 0), "budgets are per key");
+    }
+
+    /// Issue #371 S3 — a reconnect must not refresh the served-body budget (the
+    /// same trap the whole module exists for).
+    #[test]
+    fn body_serve_budget_survives_a_reconnect() {
+        let mut rl = RateLimiter::new(RateLimits {
+            body_serve_byte_burst: 100,
+            body_serve_bytes_per_sec: 1,
+            ..RateLimits::default()
+        });
+        let first = RateKey::new(Some("203.0.113.7:41022"), PeerId(1));
+        assert!(rl.may_serve_body_bytes(first, 100, 0));
+        // Same host, new ephemeral port, new PeerId: the spent bucket.
+        let second = RateKey::new(Some("203.0.113.7:58913"), PeerId(99));
+        assert!(!rl.may_serve_body_bytes(second, 100, 1), "no fresh allowance for a redial");
     }
 
     #[test]

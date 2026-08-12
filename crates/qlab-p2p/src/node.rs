@@ -30,9 +30,7 @@ use crate::gossip::{
 };
 use crate::n1::{IngestOutcome, NodeState, VotesOutcome};
 use crate::peer::{NodeId, PeerId, PeerTable, VersionMsg};
-use crate::ratelimit::{
-    RateKey, RateLimiter, RateLimits, RateStats, MAX_BODY_BYTES_PER_GETDATA, MAX_GETDATA_ITEMS,
-};
+use crate::ratelimit::{RateKey, RateLimiter, RateLimits, RateStats};
 use crate::sendstall::stall_line;
 use crate::sync::{build_locator, answer_get_headers, SyncPhase, SyncState, MAX_HEADERS_PER_BATCH};
 use qlab_devnet::finality::next_checkpoint_height;
@@ -1474,10 +1472,12 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // requester never reaches the cap (see the constant); a capped one
         // re-asks after its own timeout, unscored, exactly as for any
         // unanswered item. Counted, never silent.
+        let item_cap = self.limiter.limits().max_getdata_items;
+        let body_byte_cap = self.limiter.limits().max_body_bytes_per_getdata;
         let mut items = inv.items;
-        if items.len() > MAX_GETDATA_ITEMS {
-            self.limiter.note_getdata_items_dropped(items.len() - MAX_GETDATA_ITEMS);
-            items.truncate(MAX_GETDATA_ITEMS);
+        if items.len() > item_cap {
+            self.limiter.note_getdata_items_dropped(items.len() - item_cap);
+            items.truncate(item_cap);
         }
         let mut not_found = Vec::new();
         let mut bodies_served = 0usize;
@@ -1529,7 +1529,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                         // so a drained budget costs no body clone or encode.
                         let body = if self.serve_historical_bodies
                             && bodies_served < MAX_BODIES_PER_GETDATA
-                            && body_bytes_served < MAX_BODY_BYTES_PER_GETDATA
+                            && body_bytes_served < body_byte_cap
                             && self.limiter.body_serve_has_budget(key.clone(), now_ms)
                         {
                             self.body_for_serving(&it.id)
@@ -1545,7 +1545,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                             // the peer's inbound limiter will see — against
                             // both the per-message bound and the per-key
                             // sustained budget. A refusal consumes nothing.
-                            if body_bytes_served.saturating_add(cost) <= MAX_BODY_BYTES_PER_GETDATA
+                            if body_bytes_served.saturating_add(cost) <= body_byte_cap
                                 && self.limiter.may_serve_body_bytes(key.clone(), cost, now_ms)
                             {
                                 bodies_served += 1;
