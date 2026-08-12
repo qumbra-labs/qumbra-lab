@@ -164,6 +164,47 @@ impl WalletDir {
         }
         let seed = MasterSeed::with_version(bytes[0], entropy);
 
+        Self::from_seed_and_cursor(dir, seed)
+    }
+
+    /// Open a wallet whose seed file is a registered wrapped envelope, using
+    /// seed material already authenticated and decrypted by its platform
+    /// provider.
+    ///
+    /// This is deliberately not a generic "override the seed" seam: a plain,
+    /// damaged, truncated, or unknown envelope is refused. The provider owns
+    /// ciphertext authentication and must only pass the plaintext recovered
+    /// from this directory's envelope. The core continues to own seed-version
+    /// validation, the address cursor, and all derivation.
+    pub fn open_wrapped(dir: &Path, seed: MasterSeed) -> Result<WalletDir, StoreError> {
+        let seed_path = dir.join(SEED_FILE);
+        if !seed_path.exists() {
+            return Err(StoreError::NoWallet(dir.to_path_buf()));
+        }
+        let bytes = std::fs::read(&seed_path)?;
+        if bytes.len() == 1 + ENTROPY_LEN {
+            return Err(StoreError::BadSeedFile(
+                "an external unwrap provider cannot override a plain seed file".to_string(),
+            ));
+        }
+        match crate::envelope::inspect(&bytes) {
+            crate::envelope::Verdict::Wrapped { .. } => {}
+            crate::envelope::Verdict::NotAnEnvelope
+            | crate::envelope::Verdict::TruncatedHeader { .. }
+            | crate::envelope::Verdict::Unknown { .. } => return Err(not_the_plain_format(&bytes)),
+        }
+        if seed.version() != qlab_wallet::seed::SEED_VERSION {
+            return Err(StoreError::BadSeedFile(format!(
+                "unwrapped version {} refused: this binary derives at version {} only",
+                seed.version(),
+                qlab_wallet::seed::SEED_VERSION
+            )));
+        }
+
+        Self::from_seed_and_cursor(dir, seed)
+    }
+
+    fn from_seed_and_cursor(dir: &Path, seed: MasterSeed) -> Result<WalletDir, StoreError> {
         let allocated = match std::fs::read_to_string(dir.join(ADDR_FILE)) {
             Ok(text) => parse_addresses(&text)?,
             // A missing cursor is not an error — it is index 0, the same state
@@ -171,7 +212,11 @@ impl WalletDir {
             Err(e) if e.kind() == io::ErrorKind::NotFound => vec![0],
             Err(e) => return Err(e.into()),
         };
-        Ok(WalletDir { dir: dir.to_path_buf(), seed, allocated })
+        Ok(WalletDir {
+            dir: dir.to_path_buf(),
+            seed,
+            allocated,
+        })
     }
 
     pub fn wallet(&self) -> Wallet {
@@ -442,6 +487,13 @@ mod tests {
         }
     }
 
+    fn open_wrapped_err(dir: &Path, seed: MasterSeed) -> StoreError {
+        match WalletDir::open_wrapped(dir, seed) {
+            Err(e) => e,
+            Ok(_) => panic!("the external seed provider must not open this seed file"),
+        }
+    }
+
     fn envelope_bytes(format: u8, protection: u8, payload_len: usize) -> Vec<u8> {
         let mut v = crate::envelope::MAGIC.to_vec();
         v.push(format);
@@ -507,6 +559,57 @@ mod tests {
             };
             assert!(e.to_string().contains(p), "the name must reach the message");
         }
+    }
+
+    #[test]
+    fn a_platform_provider_can_open_a_registered_envelope_without_duplicating_the_cursor() {
+        let d = tmp("i348_provider");
+        let seed = MasterSeed::from_entropy([0x42; ENTROPY_LEN]);
+        let mut plain = WalletDir::create(&d, seed.clone()).unwrap();
+        plain.allocate_next().unwrap();
+        let expected = plain.wallet().address_at_index(1).encode();
+        put_seed(&d, &envelope_bytes(0x01, 0x01, 96));
+
+        let wrapped = WalletDir::open_wrapped(&d, seed).unwrap();
+
+        assert_eq!(wrapped.allocated, vec![0, 1]);
+        assert_eq!(wrapped.wallet().address_at_index(1).encode(), expected);
+    }
+
+    #[test]
+    fn the_platform_provider_cannot_override_plain_or_unknown_seed_files() {
+        let plain = tmp("i348_provider_plain");
+        WalletDir::create(&plain, MasterSeed::from_entropy([1; ENTROPY_LEN])).unwrap();
+        let error = open_wrapped_err(&plain, MasterSeed::from_entropy([2; ENTROPY_LEN]));
+        assert!(
+            error
+                .to_string()
+                .contains("cannot override a plain seed file"),
+            "{error}"
+        );
+
+        let unknown =
+            wallet_dir_with_seed_bytes("i348_provider_unknown", &envelope_bytes(0x7f, 0x01, 96));
+        assert!(matches!(
+            open_wrapped_err(&unknown, MasterSeed::from_entropy([9; ENTROPY_LEN])),
+            StoreError::SeedFromNewerTool {
+                format: 0x7f,
+                protection: 0x01
+            }
+        ));
+    }
+
+    #[test]
+    fn the_platform_provider_cannot_bypass_the_seed_version_gate() {
+        let d =
+            wallet_dir_with_seed_bytes("i348_provider_version", &envelope_bytes(0x01, 0x02, 96));
+
+        let error = open_wrapped_err(&d, MasterSeed::with_version(2, [9; ENTROPY_LEN]));
+
+        assert!(
+            error.to_string().contains("unwrapped version 2 refused"),
+            "{error}"
+        );
     }
 
     /// ARM (c). A record from a registry this binary does not have. "Corrupt"
