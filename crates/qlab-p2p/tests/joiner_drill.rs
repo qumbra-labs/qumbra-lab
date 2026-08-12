@@ -131,9 +131,12 @@ fn joins_a_running_net_from_an_empty_data_dir() {
     assert_eq!(joiner_state.tip_height(), 0, "the data dir really is empty");
     let (mut servers, mut joiner) = wire(servers, joiner_state);
 
-    // Budget: minutes, not hours — and an order of magnitude over what the
-    // pipeline needs (2,500 bodies at 16 per round trip is ~157 round trips).
-    let budget = Duration::from_secs(120);
+    // Budget: minutes, not hours (#369 S7's scale rule). Measured 117 s in
+    // release on an otherwise-idle rig (JOINER_DRILL line, 2026-08-12), so 300 s
+    // is ~2.5× the observed cost — margin for a loaded rig, not slack for a
+    // regression: the pre-#371-S2 window collapse would not converge in any
+    // budget a suite could carry, and the stall mutation is its own test.
+    let budget = Duration::from_secs(300);
     let start = Instant::now();
     let mut refused_while_syncing = false;
     let converged = loop {
