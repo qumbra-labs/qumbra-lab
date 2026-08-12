@@ -1,6 +1,17 @@
 # The emission-rule boundary (height 8,640, ~2026-08-12) — one-page index
 
 > [中文版](emission-boundary-index-zh.md)
+> ✅ **THE BOUNDARY IS PASSED — 2026-08-12.** Halted 08:20:55 +08 (four hosts, one tip),
+> **finalized 11:55:42** (fid `7925d1de`, 4-of-4 unanimous), chain resumed 12:16:51 under the
+> exact schedule, §7 `audit-emission --from 8641` exit-0 across the fleet. Issues #299 + #303
+> are CLOSED. Three defects were found and fixed live inside the halt window — #360
+> (mining-gated boundary signing), #362 (vote-relay islands), and the frozen tip tie
+> (documented; its loser-convergence gap is #375) — full narrative in
+> [`qumbra-deploy tasks/boundary-day-8640-2026-08-12.md`](https://github.com/qumbra-labs/qumbra-deploy/blob/main/tasks/boundary-day-8640-2026-08-12.md)
+> and the #299 thread. **This page is now a historical record**; the go/no-go procedures
+> below were executed as written (amended live per the STOP notices) and remain the
+> template for any future halt boundary.
+
 
 > 🔴 **Re-stamped 2026-08-11: the boundary moves from 18,000 to 8,640.** See
 > [Larry's ruling on issue #299](https://github.com/qumbra-labs/qumbra-lab/issues/299#issuecomment-5248469483)
