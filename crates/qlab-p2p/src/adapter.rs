@@ -1955,6 +1955,30 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             | BodyError::DiscoveryMalformed { .. }
             | BodyError::DiscoveryNotCanonical { .. }
             | BodyError::DiscoveryDoesNotBind { .. } => BodyFault::Intrinsic("bad body"),
+            // Lab #367, the shape half: rider bytes that do not decode, and a
+            // rider on the wrong side of the boundary (a pure height compare),
+            // read nothing but the pair itself — intrinsic, like discovery's.
+            BodyError::RiderMalformed { .. } | BodyError::RiderBeforeBoundary { .. } => {
+                BodyFault::Intrinsic("bad body")
+            }
+            // Lab #367, the rule half — split by what the verdict reads:
+            BodyError::RiderRule { err, .. } => match err {
+                // Grammar, record kind and record size read only the revealed
+                // record's own bytes.
+                qlab_devnet::names::NameRuleError::Grammar
+                | qlab_devnet::names::NameRuleError::UnknownRecordKind { .. }
+                | qlab_devnet::names::NameRuleError::WrongRecordSize { .. } => {
+                    BodyFault::Intrinsic("bad body")
+                }
+                // Commit-window, uniqueness and renewal verdicts answer from
+                // THIS node's registry replay — a node that is behind answers
+                // "no" from its own position, exactly the #134 shape below.
+                qlab_devnet::names::NameRuleError::CommitNotFound
+                | qlab_devnet::names::NameRuleError::NameTaken { .. }
+                | qlab_devnet::names::NameRuleError::UnknownForRenewal => {
+                    BodyFault::Positional("bad body")
+                }
+            },
             // The one positional check (#134). `is_valid_anchor` answers from THIS
             // node's root index, finalized head and applied tip; a joiner replaying
             // history has none of the three at the height it is being served, so its

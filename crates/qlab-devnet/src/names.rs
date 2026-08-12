@@ -362,6 +362,162 @@ pub fn name_fee_for(op: &NameOp) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Consensus rules (validate_body's rider leg — lab #367 stage 2)
+// ---------------------------------------------------------------------------
+
+/// Whether riders are admissible at `height` under `boundary` — the same
+/// comparison shape as the emission rule's, and the same structural genesis
+/// exemption (no boundary is negative, so height 0 never passes).
+pub fn riders_active_above(boundary: Option<u64>, height: u64) -> bool {
+    matches!(boundary, Some(b) if height > b)
+}
+
+/// The height at which an expired registration's name re-opens: end of term
+/// plus the grace window. During grace the name still resolves (flagged
+/// wallet-side) and cannot be re-registered.
+pub fn reopens_at(expiry: u64) -> u64 {
+    expiry.saturating_add(NAME_GRACE_BLOCKS)
+}
+
+/// What rider rule-checking needs to know about chain state — injected into
+/// `validate_body` exactly like `is_anchor_final`, implemented by the node's
+/// registry (stage 3). Kept minimal on purpose: two questions, both answerable
+/// from a replay of committed riders.
+pub trait NameView {
+    /// Was a COMMIT rider carrying exactly `commit` included on the main chain
+    /// at some height in `[min_h, max_h]` (inclusive)?
+    fn commit_included_in(&self, commit: &Hash32, min_h: u64, max_h: u64) -> bool;
+
+    /// The current registration's expiry height (end of term, **excluding**
+    /// grace) for `name`, if it is registered at all. A name past
+    /// `reopens_at(expiry)` may report `None` — it is re-registrable either way.
+    fn registration_expiry(&self, name: &[u8]) -> Option<u64>;
+}
+
+/// A [`NameView`] over nothing: no commits, no registrations. This is the
+/// correct view for every pre-boundary height (there is nothing to know), and
+/// therefore the view behind the plain `validate_body`, where riders are
+/// refused before any rule needs state.
+pub struct EmptyNameView;
+
+impl NameView for EmptyNameView {
+    fn commit_included_in(&self, _commit: &Hash32, _min_h: u64, _max_h: u64) -> bool {
+        false
+    }
+    fn registration_expiry(&self, _name: &[u8]) -> Option<u64> {
+        None
+    }
+}
+
+/// Why a well-formed rider was refused by the rules. The codec layer's
+/// [`RiderError`] answers *cannot parse*; this answers *parses but violates a
+/// name rule* — two layers, two enums, the discovery lane's discipline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NameRuleError {
+    /// The name fails the N3 grammar.
+    Grammar,
+    /// The record kind is not one this rider version defines. 0x02 is the
+    /// reserved Annulet door and refuses like any other unknown — additive
+    /// kinds arrive at a later boundary, not by builder judgment.
+    UnknownRecordKind { kind: u8 },
+    /// The record's address length is wrong for its kind.
+    WrongRecordSize { kind: u8, expected: usize, got: usize },
+    /// No COMMIT rider carrying this reveal's hash sits in the window
+    /// `[h − COMMIT_MAX_AGE, h − COMMIT_MIN_AGE]` on the main chain.
+    CommitNotFound,
+    /// The name is registered, or expired but still inside its grace window.
+    /// `reopens_at` names the height at which registration becomes possible —
+    /// a refusal that says when, not just no.
+    NameTaken { reopens_at: u64 },
+    /// A renewal names a name with no current registration. Renewing into the
+    /// grace window is legal (that is the window's purpose); renewing a name
+    /// past grace is not — register it instead.
+    UnknownForRenewal,
+}
+
+/// Rule-check one decoded op at `height`, against the chain `view` plus the
+/// names already revealed **earlier in this block** (`pending` — the same-block
+/// tie rule: earliest tx order wins, brief §1 step 4).
+///
+/// Fee coverage is deliberately NOT here: the fee split is checked where the
+/// posted-fee rule already lives (`validate_body`), so the two fee rules
+/// cannot drift apart.
+pub fn check_op<V: NameView>(
+    view: &V,
+    height: u64,
+    op: &NameOp,
+    pending: &std::collections::HashSet<Vec<u8>>,
+) -> Result<(), NameRuleError> {
+    match op {
+        // A commit is checked only for shape (the codec did that): it reveals
+        // nothing, so there is nothing to rule on. Uniqueness of the hash is
+        // not required — re-committing burns the committer's own window.
+        NameOp::Commit { .. } => Ok(()),
+        NameOp::Reveal { record, salt } => {
+            if !valid_name(&record.name) {
+                return Err(NameRuleError::Grammar);
+            }
+            if record.kind != RECORD_KIND_L1_ADDRESS {
+                return Err(NameRuleError::UnknownRecordKind { kind: record.kind });
+            }
+            if record.address.len() != L1_ADDRESS_LEN {
+                return Err(NameRuleError::WrongRecordSize {
+                    kind: record.kind,
+                    expected: L1_ADDRESS_LEN,
+                    got: record.address.len(),
+                });
+            }
+            // The window: a commit at least COMMIT_MIN_AGE old and at most
+            // COMMIT_MAX_AGE old. Recompute the hash from the revealed record
+            // — the view is asked about the value the chain actually carried.
+            let commit = commit_hash(record, salt);
+            let min_h = height.saturating_sub(COMMIT_MAX_AGE);
+            let max_h = height.saturating_sub(COMMIT_MIN_AGE);
+            if height < COMMIT_MIN_AGE || !view.commit_included_in(&commit, min_h, max_h) {
+                return Err(NameRuleError::CommitNotFound);
+            }
+            if pending.contains(&record.name) {
+                // Same-block earlier reveal won; its expiry starts here.
+                return Err(NameRuleError::NameTaken {
+                    reopens_at: reopens_at(height + NAME_TERM_BLOCKS),
+                });
+            }
+            if let Some(expiry) = view.registration_expiry(&record.name) {
+                let reopen = reopens_at(expiry);
+                if height < reopen {
+                    return Err(NameRuleError::NameTaken { reopens_at: reopen });
+                }
+            }
+            Ok(())
+        }
+        NameOp::Renew { name } => {
+            if !valid_name(name) {
+                return Err(NameRuleError::Grammar);
+            }
+            if pending.contains(name) {
+                // Registered earlier in this very block — renewable at once
+                // (any payer, N4).
+                return Ok(());
+            }
+            match view.registration_expiry(name) {
+                // Renewal is legal through end of grace: a lapsed-but-in-grace
+                // name is exactly what the window exists to save.
+                Some(expiry) if height < reopens_at(expiry) => Ok(()),
+                _ => Err(NameRuleError::UnknownForRenewal),
+            }
+        }
+    }
+}
+
+/// The registration term granted or extended by an op applied at `height`:
+/// a reveal registers to `height + NAME_TERM_BLOCKS`; a renewal extends one
+/// term from `max(height, current expiry)` (brief §1 step 5). Registry-side
+/// arithmetic, kept next to the rules so stage 3 cannot re-derive it wrong.
+pub fn extended_expiry(current: Option<u64>, height: u64) -> u64 {
+    current.unwrap_or(height).max(height) + NAME_TERM_BLOCKS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -520,6 +676,187 @@ mod tests {
 
         assert_ne!(base, commit_hash(&r, &[4u8; 32]), "salt must be inside the preimage");
         assert_eq!(base, commit_hash(&r.clone(), &salt), "and the hash is deterministic");
+    }
+
+    // -- rules (stage 2) ------------------------------------------------------
+
+    /// A `NameView` over two maps — the mock the rule tests drive.
+    struct MockView {
+        commits: std::collections::HashMap<Hash32, u64>, // commit → included height
+        names: std::collections::HashMap<Vec<u8>, u64>,  // name → expiry
+    }
+
+    impl NameView for MockView {
+        fn commit_included_in(&self, commit: &Hash32, min_h: u64, max_h: u64) -> bool {
+            self.commits.get(commit).is_some_and(|h| (min_h..=max_h).contains(h))
+        }
+        fn registration_expiry(&self, name: &[u8]) -> Option<u64> {
+            self.names.get(name).copied()
+        }
+    }
+
+    fn no_pending() -> std::collections::HashSet<Vec<u8>> {
+        std::collections::HashSet::new()
+    }
+
+    /// A view holding the commit for (`record`, `salt`) at `committed_h`.
+    fn view_with_commit(record: &NameRecord, salt: &[u8; 32], committed_h: u64) -> MockView {
+        MockView {
+            commits: [(commit_hash(record, salt), committed_h)].into(),
+            names: Default::default(),
+        }
+    }
+
+    #[test]
+    fn riders_active_only_strictly_above_a_set_boundary() {
+        assert!(!riders_active_above(None, u64::MAX), "unset boundary = never");
+        assert!(!riders_active_above(Some(8_640), 8_640), "AT the boundary is before it");
+        assert!(riders_active_above(Some(8_640), 8_641));
+        assert!(!riders_active_above(Some(0), 0), "genesis is structurally exempt");
+    }
+
+    #[test]
+    fn a_reveal_needs_its_commit_inside_the_window() {
+        let r = sample_record();
+        let salt = [7u8; 32];
+        let h = 10_000u64;
+        let op = NameOp::Reveal { record: r.clone(), salt };
+
+        // In-window: exactly MIN_AGE old, exactly MAX_AGE old, and mid-window.
+        for age in [COMMIT_MIN_AGE, COMMIT_MAX_AGE, 100] {
+            let view = view_with_commit(&r, &salt, h - age);
+            assert_eq!(check_op(&view, h, &op, &no_pending()), Ok(()), "age {age}");
+        }
+        // Too young, too old, absent, and wrong salt.
+        for age in [COMMIT_MIN_AGE - 1, COMMIT_MAX_AGE + 1] {
+            let view = view_with_commit(&r, &salt, h - age);
+            assert_eq!(
+                check_op(&view, h, &op, &no_pending()),
+                Err(NameRuleError::CommitNotFound),
+                "age {age}"
+            );
+        }
+        let empty = MockView { commits: Default::default(), names: Default::default() };
+        assert_eq!(check_op(&empty, h, &op, &no_pending()), Err(NameRuleError::CommitNotFound));
+        let wrong_salt = view_with_commit(&r, &[8u8; 32], h - 100);
+        assert_eq!(
+            check_op(&wrong_salt, h, &op, &no_pending()),
+            Err(NameRuleError::CommitNotFound),
+            "the recomputed hash is what the chain is asked about"
+        );
+    }
+
+    #[test]
+    fn a_reveal_is_shape_checked_before_state_is_consulted() {
+        let salt = [7u8; 32];
+        let h = 10_000u64;
+        let mut bad_name = sample_record();
+        bad_name.name = b"-alice".to_vec();
+        let view = view_with_commit(&bad_name, &salt, h - 100);
+        assert_eq!(
+            check_op(&view, h, &NameOp::Reveal { record: bad_name, salt }, &no_pending()),
+            Err(NameRuleError::Grammar)
+        );
+
+        let mut annulet = sample_record();
+        annulet.kind = RECORD_KIND_RESERVED_ANNULET;
+        let view = view_with_commit(&annulet, &salt, h - 100);
+        assert_eq!(
+            check_op(&view, h, &NameOp::Reveal { record: annulet, salt }, &no_pending()),
+            Err(NameRuleError::UnknownRecordKind { kind: 0x02 }),
+            "the reserved Annulet kind refuses like any other unknown — its door is a later boundary"
+        );
+
+        let mut short = sample_record();
+        short.address = vec![0xAB; 100];
+        let view = view_with_commit(&short, &salt, h - 100);
+        assert_eq!(
+            check_op(&view, h, &NameOp::Reveal { record: short, salt }, &no_pending()),
+            Err(NameRuleError::WrongRecordSize {
+                kind: RECORD_KIND_L1_ADDRESS,
+                expected: L1_ADDRESS_LEN,
+                got: 100
+            })
+        );
+    }
+
+    #[test]
+    fn a_taken_name_refuses_until_grace_ends_and_reopens_after() {
+        let r = sample_record();
+        let salt = [7u8; 32];
+        let expiry = 500_000u64;
+        let op = NameOp::Reveal { record: r.clone(), salt };
+        let taken = |h: u64| MockView {
+            commits: [(commit_hash(&r, &salt), h - 100)].into(),
+            names: [(r.name.clone(), expiry)].into(),
+        };
+        // Active, and in-grace: refused, with the reopening height named.
+        for h in [expiry - 1, expiry + 1, reopens_at(expiry) - 1] {
+            assert_eq!(
+                check_op(&taken(h), h, &op, &no_pending()),
+                Err(NameRuleError::NameTaken { reopens_at: reopens_at(expiry) }),
+                "h {h}"
+            );
+        }
+        // At/after reopen: registrable again (the one legitimate rebinding, N6).
+        for h in [reopens_at(expiry), reopens_at(expiry) + 1] {
+            assert_eq!(check_op(&taken(h), h, &op, &no_pending()), Ok(()), "h {h}");
+        }
+    }
+
+    #[test]
+    fn same_block_tie_earliest_reveal_wins() {
+        let r = sample_record();
+        let salt = [7u8; 32];
+        let h = 10_000u64;
+        let view = view_with_commit(&r, &salt, h - 100);
+        let op = NameOp::Reveal { record: r.clone(), salt };
+        let mut pending = no_pending();
+        pending.insert(r.name.clone());
+        assert!(matches!(
+            check_op(&view, h, &op, &pending),
+            Err(NameRuleError::NameTaken { .. })
+        ));
+    }
+
+    #[test]
+    fn renewal_is_permissionless_and_bounded_by_grace() {
+        let name = b"alice".to_vec();
+        let expiry = 500_000u64;
+        let op = NameOp::Renew { name: name.clone() };
+        let view = MockView {
+            commits: Default::default(),
+            names: [(name.clone(), expiry)].into(),
+        };
+        // Active and in-grace: renewable by anyone.
+        for h in [expiry - 1_000, expiry + 1, reopens_at(expiry) - 1] {
+            assert_eq!(check_op(&view, h, &op, &no_pending()), Ok(()), "h {h}");
+        }
+        // Past grace: not renewable — register instead.
+        assert_eq!(
+            check_op(&view, reopens_at(expiry), &op, &no_pending()),
+            Err(NameRuleError::UnknownForRenewal)
+        );
+        // Never registered: same refusal.
+        let empty = MockView { commits: Default::default(), names: Default::default() };
+        assert_eq!(
+            check_op(&empty, 100, &op, &no_pending()),
+            Err(NameRuleError::UnknownForRenewal)
+        );
+        // Registered earlier in this block: renewable at once.
+        let mut pending = no_pending();
+        pending.insert(name);
+        assert_eq!(check_op(&empty, 100, &op, &pending), Ok(()));
+    }
+
+    #[test]
+    fn expiry_arithmetic_extends_from_max_of_now_and_current() {
+        // Fresh registration at h.
+        assert_eq!(extended_expiry(None, 1_000), 1_000 + NAME_TERM_BLOCKS);
+        // Renewal while active: from the current expiry.
+        assert_eq!(extended_expiry(Some(500_000), 1_000), 500_000 + NAME_TERM_BLOCKS);
+        // Renewal in grace (now past expiry): from now.
+        assert_eq!(extended_expiry(Some(1_000), 5_000), 5_000 + NAME_TERM_BLOCKS);
     }
 
     #[test]

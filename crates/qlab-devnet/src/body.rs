@@ -33,6 +33,7 @@ use crate::emission_exact::{coinbase_exact, RULE_BOUNDARY_HEIGHT};
 use crate::fees::{posted_fee, ArityBucket};
 use crate::hash::keccak256;
 use crate::header::{BlockHeader, Hash32};
+use crate::names;
 
 /// Domain tag leading the block-body preimage — **body format v2**, the
 /// body-bound-discovery format (issue #188 / `discovery-on-the-consensus-wire.md`).
@@ -448,6 +449,26 @@ pub enum BodyError {
         /// length. `None` means the lengths differed.
         first_mismatch: Option<usize>,
     },
+
+    // --- lab #367: the name-service rider ----------------------------------
+    //
+    // The discovery lane's two-layer discipline, applied to the field that
+    // copied its byte discipline: *cannot parse* / *parses but breaks a rule*
+    // are separate answers, and the boundary gate is a third — a well-formed,
+    // rule-clean rider is still invalid on the wrong side of the boundary.
+    /// The tx at `index` carries rider bytes that do not decode. Note the
+    /// codec refuses trailing bytes and every non-canonical spelling, so
+    /// `RiderMalformed` also covers what `DiscoveryNotCanonical` needs a
+    /// separate variant for.
+    RiderMalformed { index: usize, err: crate::names::RiderError },
+    /// The tx at `index` carries a name op at a height where riders are not
+    /// yet valid (at/below `NAME_RULE_BOUNDARY_HEIGHT`, or anywhere while the
+    /// boundary is unset). The gate is `height > boundary` — the emission
+    /// rule's shape, structural genesis exemption included.
+    RiderBeforeBoundary { index: usize },
+    /// The tx at `index` carries a well-formed rider that violates a name
+    /// rule; `err` is the rule's own verdict, kept rather than flattened.
+    RiderRule { index: usize, err: crate::names::NameRuleError },
 }
 
 /// **The #299 scheduled-emission rule at the shipped boundary.**
@@ -506,7 +527,17 @@ pub fn check_scheduled_coinbase_above(
 /// binds under the v3 form and every pre-boundary block binds under v2,
 /// byte-identically to before.
 pub fn check_body_binding(header: &BlockHeader, body: &BlockBody) -> Result<(), BodyError> {
-    let got = body.commitment_at(header.height);
+    check_body_binding_above(names::NAME_RULE_BOUNDARY_HEIGHT, header, body)
+}
+
+/// [`check_body_binding`] with the name boundary as an argument — the drill
+/// seam; see [`validate_body_above`].
+pub fn check_body_binding_above(
+    boundary: Option<u64>,
+    header: &BlockHeader,
+    body: &BlockBody,
+) -> Result<(), BodyError> {
+    let got = body.commitment_above(boundary, header.height);
     if header.tx_body_commitment != got {
         return Err(BodyError::CommitmentMismatch {
             expected: header.tx_body_commitment,
@@ -534,6 +565,12 @@ pub fn check_body_binding(header: &BlockHeader, body: &BlockBody) -> Result<(), 
 ///
 /// `is_anchor_final` is the anchors-from-finalized-only gate (§6) — pass
 /// `|r| tracker.is_root_final(r)` from the 棒 2 [`crate::finality::FinalityTracker`].
+///
+/// **Riders** (lab #367): this form validates under [`names::EmptyNameView`],
+/// which — combined with the boundary gate — refuses every non-absent rider.
+/// That is the exact shipped rule while `NAME_RULE_BOUNDARY_HEIGHT` is `None`
+/// and for every pre-boundary height once it is set; the armed node threads
+/// its registry through [`validate_body_with_names`] instead.
 pub fn validate_body<V, F>(
     header: &BlockHeader,
     body: &BlockBody,
@@ -544,7 +581,53 @@ where
     V: TxVerifier,
     F: Fn(&Hash32) -> bool,
 {
-    check_body_binding(header, body)?;
+    validate_body_with_names(header, body, verifier, is_anchor_final, &names::EmptyNameView)
+}
+
+/// [`validate_body`] with the name-rule state view injected — the armed form.
+/// See that function for everything else; the rider leg is documented at
+/// [`names::check_op`].
+pub fn validate_body_with_names<V, F, N>(
+    header: &BlockHeader,
+    body: &BlockBody,
+    verifier: &V,
+    is_anchor_final: F,
+    name_view: &N,
+) -> Result<(), BodyError>
+where
+    V: TxVerifier,
+    F: Fn(&Hash32) -> bool,
+    N: names::NameView,
+{
+    validate_body_above(
+        names::NAME_RULE_BOUNDARY_HEIGHT,
+        header,
+        body,
+        verifier,
+        is_anchor_final,
+        name_view,
+    )
+}
+
+/// [`validate_body_with_names`] with the name boundary as an argument — the
+/// **drill** seam (the emission rule's `_above` pattern), and nothing else.
+/// The boundary keys both the rider gate and the body-binding form, because a
+/// drill that armed one without the other would validate a chain no real
+/// binary ever runs.
+pub fn validate_body_above<V, F, N>(
+    boundary: Option<u64>,
+    header: &BlockHeader,
+    body: &BlockBody,
+    verifier: &V,
+    is_anchor_final: F,
+    name_view: &N,
+) -> Result<(), BodyError>
+where
+    V: TxVerifier,
+    F: Fn(&Hash32) -> bool,
+    N: names::NameView,
+{
+    check_body_binding_above(boundary, header, body)?;
     // A minting block must name a payee (issue #101). Second-cheapest check
     // after the binding, and it guards the block's whole issuance.
     if body.mints_without_payee() {
@@ -555,13 +638,31 @@ where
     // get paid", this asks "is that the amount the schedule owes".
     check_scheduled_coinbase(header.height, body.coinbase)?;
     let mut seen_nf: HashSet<Hash32> = HashSet::new();
+    // Names revealed earlier in this block — the same-block tie rule: earliest
+    // tx order wins (brief §1 step 4).
+    let mut pending_names: HashSet<Vec<u8>> = HashSet::new();
     for (i, tx) in body.txs.iter().enumerate() {
         if !is_anchor_final(&tx.public.anchor) {
             return Err(BodyError::AnchorNotFinal { index: i });
         }
-        let expected = posted_fee(tx.public.bucket);
+        // The rider decodes before the fee check because the fee rule depends
+        // on the op (the split: relay tier + burned name fee).
+        let op = crate::names::decode_rider(&tx.rider)
+            .map_err(|err| BodyError::RiderMalformed { index: i, err })?;
+        if op.is_some() && !crate::names::riders_active_above(boundary, header.height) {
+            return Err(BodyError::RiderBeforeBoundary { index: i });
+        }
+        let expected =
+            posted_fee(tx.public.bucket) + op.as_ref().map_or(0, crate::names::name_fee_for);
         if tx.public.fee != expected {
             return Err(BodyError::WrongFee { index: i, expected, got: tx.public.fee });
+        }
+        if let Some(op) = &op {
+            crate::names::check_op(name_view, header.height, op, &pending_names)
+                .map_err(|err| BodyError::RiderRule { index: i, err })?;
+            if let crate::names::NameOp::Reveal { record, .. } = op {
+                pending_names.insert(record.name.clone());
+            }
         }
         for nf in &tx.public.nullifiers {
             if !seen_nf.insert(*nf) {
@@ -1183,6 +1284,114 @@ mod tests {
             hex, "f02dd727e204b3d0e8b55e420e55c311a6a6ab0f2d658866e57acf8ca5d46e25",
             "v3 block-body commitment preimage changed — see golden_body_commitment_bytes"
         );
+    }
+
+    /// Stage-2 integration: the rider leg of `validate_body_above`, end to
+    /// end — the boundary gate, the fee split, malformedness, the rules, and
+    /// the same-block tie, all through the real validation path with an
+    /// honestly-bound header.
+    #[test]
+    fn validate_body_rider_leg_end_to_end() {
+        use crate::names::{self, NameOp, NameRecord};
+        use std::collections::HashMap;
+
+        struct View {
+            commits: HashMap<Hash32, u64>,
+            names: HashMap<Vec<u8>, u64>,
+        }
+        impl names::NameView for View {
+            fn commit_included_in(&self, c: &Hash32, lo: u64, hi: u64) -> bool {
+                self.commits.get(c).is_some_and(|h| (lo..=hi).contains(h))
+            }
+            fn registration_expiry(&self, n: &[u8]) -> Option<u64> {
+                self.names.get(n).copied()
+            }
+        }
+
+        const B: u64 = 8_640;
+        let h = 10_000u64;
+        let record = NameRecord {
+            kind: names::RECORD_KIND_L1_ADDRESS,
+            name: b"alice".to_vec(),
+            address: vec![0xAB; names::L1_ADDRESS_LEN],
+        };
+        let salt = [7u8; 32];
+        let reveal = NameOp::Reveal { record: record.clone(), salt };
+        let view = View {
+            commits: [(names::commit_hash(&record, &salt), h - 100)].into(),
+            names: HashMap::new(),
+        };
+        // The reveal tx pays the split: relay tier + the 5-char name fee.
+        let mut tx = good_tx(0x60).with_name_op(&reveal);
+        tx.public.fee = posted_fee(ArityBucket::TwoByTwo) + names::name_fee_bessel(5);
+        // h sits above the EMISSION boundary too, so the body must mint the
+        // exact scheduled amount to a named payee — the fixture pays both
+        // rules, which is precisely what a real above-boundary block does.
+        let body_of =
+            |txs: Vec<TxEntry>| BlockBody { txs, coinbase: coinbase_exact(h), coinbase_rkm: MINER_RKM };
+        let at = |height: u64, body: &BlockBody| BlockHeader {
+            height,
+            ..BlockHeader::child_of(
+                &BlockHeader::genesis(1, 0),
+                75,
+                1,
+                body.commitment_above(Some(B), height),
+            )
+        };
+
+        // Happy path, above the boundary.
+        let body = body_of(vec![tx.clone()]);
+        validate_body_above(Some(B), &at(h, &body), &body, &MockVerifier, is_final, &view)
+            .expect("a fee-split reveal with an in-window commit is valid above the boundary");
+
+        // The same rider AT the boundary is early — the gate is strict.
+        assert!(matches!(
+            validate_body_above(Some(B), &at(B, &body), &body, &MockVerifier, is_final, &view),
+            Err(BodyError::RiderBeforeBoundary { index: 0 })
+        ));
+        // And under the SHIPPED rule (boundary None) it is early everywhere —
+        // the inert-at-merge property on the validation path.
+        assert!(matches!(
+            validate_body_with_names(&at(h, &body), &body, &MockVerifier, is_final, &view)
+                .unwrap_err(),
+            BodyError::CommitmentMismatch { .. } // v3-bound header under a v2 rule
+        ));
+
+        // Fee split enforced: paying only the relay tier is a WrongFee naming
+        // the full expected sum.
+        let mut cheap = tx.clone();
+        cheap.public.fee = posted_fee(ArityBucket::TwoByTwo);
+        let body = body_of(vec![cheap]);
+        assert!(matches!(
+            validate_body_above(Some(B), &at(h, &body), &body, &MockVerifier, is_final, &view),
+            Err(BodyError::WrongFee { index: 0, expected, .. })
+                if expected == posted_fee(ArityBucket::TwoByTwo) + names::name_fee_bessel(5)
+        ));
+
+        // Malformed rider bytes are a codec refusal, not a rule one.
+        let mut garbled = tx.clone();
+        garbled.rider = vec![0x01, 0x01, 0xEE]; // truncated commit
+        let body = body_of(vec![garbled]);
+        assert!(matches!(
+            validate_body_above(Some(B), &at(h, &body), &body, &MockVerifier, is_final, &view),
+            Err(BodyError::RiderMalformed { index: 0, .. })
+        ));
+
+        // Same-block tie: a second reveal of the same name in one block loses
+        // by tx order.
+        let mut second = good_tx(0x61).with_name_op(&reveal);
+        second.public.fee = posted_fee(ArityBucket::TwoByTwo) + names::name_fee_bessel(5);
+        let body = body_of(vec![tx.clone(), second]);
+        assert!(matches!(
+            validate_body_above(Some(B), &at(h, &body), &body, &MockVerifier, is_final, &view),
+            Err(BodyError::RiderRule { index: 1, err: names::NameRuleError::NameTaken { .. } })
+        ));
+
+        // And a plain (rider-absent) block validates above the boundary too —
+        // v3 is not "riders required", it is "riders possible".
+        let plain = body_of(vec![good_tx(0x62)]);
+        validate_body_above(Some(B), &at(h, &plain), &plain, &MockVerifier, is_final, &view)
+            .expect("rider-absent blocks stay valid above the boundary");
     }
 
     /// The rider is inside the v3 preimage and outside the v2 one: a
