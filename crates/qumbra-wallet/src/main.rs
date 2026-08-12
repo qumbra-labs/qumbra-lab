@@ -127,8 +127,7 @@ fn names(args: &[String]) -> Result<(), Box<dyn Error>> {
             // Renewal: one ordinary self-send carrying the renew op — any
             // payer may renew any name (N4).
             let name = args.get(1).ok_or("names renew NAME --url … --node … --scan-to H")?;
-            let bare = name.strip_suffix(".qmb").unwrap_or(name).as_bytes().to_vec();
-            let op = qlab_devnet::names::NameOp::Renew { name: bare };
+            let op = qumbra_wallet::names::renewal_op(name)?;
             names_self_send(&args[2..], &op, &format!("renew {name}"))
         }
         _ => Err("names subcommands: sync | resolve | pin | register | renew".into()),
@@ -161,27 +160,8 @@ fn names_register(args: &[String]) -> Result<(), Box<dyn Error>> {
         Some(st) if st.name == bare => st,
         Some(st) => return Err(format!("a registration for {} is already in flight", st.name).into()),
         None => {
-            // Fresh start: allocate the DEDICATED diversified address (D3) and
-            // persist the salt BEFORE anything touches the network.
-            if !qlab_devnet::names::valid_name(bare.as_bytes()) {
-                return Err(format!("{bare:?} fails the v1 name grammar (a-z 0-9, interior hyphens, 1-63 bytes)").into());
-            }
-            let mut w = qumbra_wallet::store::WalletDir::open(&dir)?;
-            // D3: the name binds a FRESH dedicated diversified address — a new
-            // index off the cursor, used for nothing else.
-            let idx = w.allocate_next()?;
-            let address = w.wallet().address_at_index(idx).to_raw_bytes();
-            let mut salt = [0u8; 32];
-            use rand::Rng as _;
-            qumbra_wallet::send::os_rng().fill_bytes(&mut salt);
-            let record = qlab_devnet::names::NameRecord {
-                kind: qlab_devnet::names::RECORD_KIND_L1_ADDRESS,
-                name: bare.as_bytes().to_vec(),
-                address,
-            };
-            let st = RegisterState::new(bare, record, salt);
-            st.save(&dir)?;
-            st
+            let mut wallet = qumbra_wallet::store::WalletDir::open(&dir)?;
+            qumbra_wallet::names::prepare_registration(&mut wallet, bare)?
         }
     };
 
@@ -190,6 +170,9 @@ fn names_register(args: &[String]) -> Result<(), Box<dyn Error>> {
         .parse()?;
     match st.step(scan_to) {
         RegisterStep::NeedsCommit => {
+            let mut st = st;
+            st.commit_attempted = true;
+            st.save(&dir)?;
             let op = st.commit_op();
             names_self_send(&args[1..], &op, &format!("commit for {bare} (relay fee only)"))?;
             println!(

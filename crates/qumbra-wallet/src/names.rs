@@ -32,6 +32,8 @@ use qlab_cbserver::codec::NamesPage;
 use qlab_devnet::names::{decode_rider, extended_expiry, reopens_at, NameOp};
 use qlab_wallet::address::Address;
 
+use crate::store::WalletDir;
+
 pub const REGISTRY_FILE: &str = "names-registry.v1";
 pub const REGISTRY_HEADER: &str = "qumbra-wallet names-registry v1";
 pub const PINS_FILE: &str = "names-pins.v1";
@@ -338,7 +340,8 @@ impl Pins {
 // ---------------------------------------------------------------------------
 
 pub const REG_FILE: &str = "names-reg.v1";
-pub const REG_HEADER: &str = "qumbra-wallet names-reg v1";
+pub const REG_HEADER_V1: &str = "qumbra-wallet names-reg v1";
+pub const REG_HEADER: &str = "qumbra-wallet names-reg v2";
 
 /// One in-flight registration. **Persisted BEFORE the commit tx posts** (the
 /// #324 lesson: write the local record before the network can answer) — the
@@ -353,6 +356,10 @@ pub struct RegisterState {
     pub salt: [u8; 32],
     /// Height the commit tx was observed mined at; `None` until confirmed.
     pub committed_at: Option<u64>,
+    /// Set and persisted before the first commit transaction is built. Once
+    /// true, discarding this state could lose the only salt for an on-chain
+    /// commitment, so presentation layers must not offer an ordinary cancel.
+    pub commit_attempted: bool,
 }
 
 /// Where a registration stands at chain height `tip`.
@@ -372,7 +379,13 @@ pub enum RegisterStep {
 
 impl RegisterState {
     pub fn new(name: &str, record: qlab_devnet::names::NameRecord, salt: [u8; 32]) -> Self {
-        Self { name: name.to_string(), record, salt, committed_at: None }
+        Self {
+            name: name.to_string(),
+            record,
+            salt,
+            committed_at: None,
+            commit_attempted: false,
+        }
     }
 
     /// The op for step one. Pays relay tier only.
@@ -409,11 +422,12 @@ impl RegisterState {
         out.push_str(REG_HEADER);
         out.push('\n');
         out.push_str(&format!(
-            "{} {} {} {} {}\n",
+            "{} {} {} {} {} {}\n",
             self.name,
             self.record.kind,
             hex(&self.salt),
             self.committed_at.map_or("none".to_string(), |h| h.to_string()),
+            if self.commit_attempted { "attempted" } else { "prepared" },
             hex(&self.record.address),
         ));
         write_owner_only(&dir.join(REG_FILE), out.as_bytes())
@@ -427,16 +441,32 @@ impl RegisterState {
         let text = std::fs::read_to_string(&path)?;
         let bad = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("{REG_FILE}: {why}"));
         let mut lines = text.lines();
-        if lines.next() != Some(REG_HEADER) {
+        let header = lines.next();
+        if !matches!(header, Some(REG_HEADER | REG_HEADER_V1)) {
             return Err(bad("unknown header — an in-flight registration must never be guessed at"));
         }
         let Some(line) = lines.next() else { return Ok(None) };
         let mut f = line.split(' ');
-        let (Some(name), Some(kind), Some(salt), Some(committed), Some(addr)) =
-            (f.next(), f.next(), f.next(), f.next(), f.next())
+        let (Some(name), Some(kind), Some(salt), Some(committed)) =
+            (f.next(), f.next(), f.next(), f.next())
         else {
             return Err(bad("malformed record"));
         };
+        let (commit_attempted, addr) = if header == Some(REG_HEADER) {
+            let attempted = match f.next() {
+                Some("attempted") => true,
+                Some("prepared") => false,
+                _ => return Err(bad("bad commit-attempt state")),
+            };
+            (attempted, f.next().ok_or_else(|| bad("missing address"))?)
+        } else {
+            // A v1 record has no evidence that its commit was never posted.
+            // Fail closed: preserve its salt and require explicit recovery.
+            (true, f.next().ok_or_else(|| bad("missing address"))?)
+        };
+        if f.next().is_some() {
+            return Err(bad("unexpected trailing fields"));
+        }
         let salt_v = unhex(salt).filter(|v| v.len() == 32).ok_or_else(|| bad("bad salt"))?;
         let mut salt = [0u8; 32];
         salt.copy_from_slice(&salt_v);
@@ -452,6 +482,7 @@ impl RegisterState {
                 "none" => None,
                 v => Some(v.parse::<u64>().map_err(|_| bad("bad commit height"))?),
             },
+            commit_attempted,
         }))
     }
 
@@ -463,6 +494,52 @@ impl RegisterState {
         }
         Ok(())
     }
+}
+
+/// Prepare a resumable registration around a fresh dedicated address. This is
+/// the shared API used by native shells: validation, cursor allocation, salt
+/// generation, and the pre-network durable write all remain wallet rules.
+pub fn prepare_registration(wallet: &mut WalletDir, name: &str) -> Result<RegisterState, String> {
+    let bare = name.strip_suffix(".qmb").unwrap_or(name);
+    if !qlab_devnet::names::valid_name(bare.as_bytes()) {
+        return Err(format!(
+            "{bare:?} fails the v1 name grammar (a-z 0-9, interior hyphens, 1-63 bytes)"
+        ));
+    }
+    match RegisterState::load(&wallet.dir).map_err(|error| error.to_string())? {
+        Some(state) if state.name == bare => return Ok(state),
+        Some(state) => {
+            return Err(format!(
+                "a registration for {} is already in flight",
+                state.name
+            ))
+        }
+        None => {}
+    }
+    let index = wallet.allocate_next().map_err(|error| error.to_string())?;
+    let address = wallet.wallet().address_at_index(index).to_raw_bytes();
+    let mut salt = [0u8; 32];
+    use rand::Rng as _;
+    crate::send::os_rng().fill_bytes(&mut salt);
+    let record = qlab_devnet::names::NameRecord {
+        kind: qlab_devnet::names::RECORD_KIND_L1_ADDRESS,
+        name: bare.as_bytes().to_vec(),
+        address,
+    };
+    let state = RegisterState::new(bare, record, salt);
+    state.save(&wallet.dir).map_err(|error| error.to_string())?;
+    Ok(state)
+}
+
+/// Construct a renewal operation after applying the consensus name grammar.
+pub fn renewal_op(name: &str) -> Result<NameOp, String> {
+    let bare = name.strip_suffix(".qmb").unwrap_or(name);
+    if !qlab_devnet::names::valid_name(bare.as_bytes()) {
+        return Err(format!(
+            "{bare:?} fails the v1 name grammar (a-z 0-9, interior hyphens, 1-63 bytes)"
+        ));
+    }
+    Ok(NameOp::Renew { name: bare.as_bytes().to_vec() })
 }
 
 fn write_owner_only(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -630,11 +707,13 @@ mod tests {
             address: vec![0xAB; L1_ADDRESS_LEN],
         };
         let mut st = RegisterState::new("alice", record, [7u8; 32]);
+        assert!(!st.commit_attempted);
         // Persisted BEFORE any tx posts — the salt exists nowhere else.
         st.save(&dir).unwrap();
         assert_eq!(RegisterState::load(&dir).unwrap(), Some(st.clone()));
 
         assert_eq!(st.step(9_000), RegisterStep::NeedsCommit);
+        st.commit_attempted = true;
         st.committed_at = Some(9_000);
         st.save(&dir).unwrap();
         assert_eq!(
@@ -657,6 +736,37 @@ mod tests {
         assert_eq!(RegisterState::load(&dir).unwrap(), Some(st));
         RegisterState::clear(&dir).unwrap();
         assert_eq!(RegisterState::load(&dir).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn native_registration_api_allocates_once_and_legacy_state_fails_closed() {
+        use qlab_wallet::seed::MasterSeed;
+
+        let dir = std::env::temp_dir().join(format!("qw-reg-api-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut wallet = WalletDir::create(&dir, MasterSeed::from_entropy([0x51; 32])).unwrap();
+
+        let first = prepare_registration(&mut wallet, "alice.qmb").unwrap();
+        let second = prepare_registration(&mut wallet, "alice").unwrap();
+        assert_eq!(first, second, "reopening the same flow must not allocate again");
+        assert_eq!(wallet.allocated, vec![0, 1]);
+        assert_eq!(first.record.address, wallet.wallet().address_at_index(1).to_raw_bytes());
+        assert!(prepare_registration(&mut wallet, "UPPER").is_err());
+        assert!(prepare_registration(&mut wallet, "bob").is_err());
+
+        let legacy = format!(
+            "{REG_HEADER_V1}\nalice {} {} none {}\n",
+            RECORD_KIND_L1_ADDRESS,
+            hex(&first.salt),
+            hex(&first.record.address),
+        );
+        std::fs::write(dir.join(REG_FILE), legacy).unwrap();
+        let recovered = RegisterState::load(&dir).unwrap().unwrap();
+        assert!(
+            recovered.commit_attempted,
+            "v1 cannot prove its commit was never posted, so cancel must fail closed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
