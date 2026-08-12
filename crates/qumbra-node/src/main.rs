@@ -88,9 +88,11 @@ fn usage() {
          qumbra-node genesis init [--out DIR]   build the T0 genesis file + 21 committee key files\n  \
          qumbra-node run --config FILE          run a full node (TCP + RandomX + disk persistence)\n      \
            [--rehearsal-verifier]               opt in to the NO-OP rehearsal tx verifier (devnet only)\n      \
-           [--sample-interval-secs N]           telemetry sampling cadence (default 30; observability only)\n  \
+           [--sample-interval-secs N]           telemetry sampling cadence (default 30; observability only)\n      \
+           [--snapshot-interval-secs N]         snapshot write cadence (default 300; durability only, #359)\n  \
          qumbra-node check --config FILE        pre-flight a deployed config (genesis + keys), bind nothing\n  \
-         qumbra-node halt-status [--config F]   print this binary's halt schedule + revision digest (#74)\n  \
+         qumbra-node halt-status [--config F]   print this binary's halt schedule + revision digest (#74),\n      \
+                                            and — with --config — this data dir's snapshot height (#359)\n  \
          qumbra-node audit [--out FILE]         emit the params_devnet ⟷ FROZEN v1.0 convergence audit\n  \
          qumbra-node audit-emission --data-dir DIR [--from H] [--to H]\n      \
          qumbra-node audit-names --data-dir DIR [--from H] [--to H]\n      \
@@ -308,6 +310,26 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // Snapshot cadence (issue #359 S2) — DURABILITY ONLY. It changes how often the
+    // loop writes `snapshot.bin` and nothing else: not consensus, not the halt
+    // height, not any frozen value, and two nodes running different values agree on
+    // everything. Tunable per host because the trade it sets — replay time bought
+    // with write cost — depends on the host's disk and the chain's length, and
+    // neither is a protocol fact.
+    if let Some(v) = flag(args, "--snapshot-interval-secs") {
+        match v.parse::<u64>() {
+            Ok(secs) if secs > 0 => {
+                node.set_snapshot_interval(std::time::Duration::from_secs(secs));
+                println!("  snapshot cadence: every {secs} s (durability only)");
+            }
+            _ => {
+                return Err(
+                    format!("--snapshot-interval-secs needs a positive integer, got `{v}`").into()
+                )
+            }
+        }
+    }
+
     println!("qumbra-node running");
     println!("  listen:       {}", node.listen_addr());
     println!("  data dir:     {}", config.data_dir.display());
@@ -398,15 +420,26 @@ fn check_config(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// Works with or without a `--config`; with one it also reports the node's on-disk
 /// halt marker, i.e. whether this data dir has actually halted.
 fn halt_status(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let marker = match flag(args, "--config") {
+    // Issue #359 S3: the data dir is kept rather than dropped, because the
+    // snapshot section below reads the same directory the marker came from — and
+    // both are things an operator needs *before* restarting this host.
+    let (marker, data_dir) = match flag(args, "--config") {
         Some(p) => {
             let config = NodeConfig::load(p)?;
-            HaltMarker::load(&config.data_dir)?
+            (HaltMarker::load(&config.data_dir)?, Some(config.data_dir))
         }
-        None => None,
+        None => (None, None),
     };
     println!("qumbra-node halt-status (issue #74)");
     print!("{}", RELEASE.banner(marker.as_ref()));
+    // Issue #359 S3: without `--config` there is no data dir to ask, and saying
+    // "none" would be a claim about a directory this invocation never named.
+    match &data_dir {
+        Some(dir) => print!("{}", qumbra_node::run::snapshot_status_report(dir)),
+        None => println!(
+            "  snapshot:     not read — pass --config to report this data dir's snapshot (#359)"
+        ),
+    }
     println!("  frozen digest (recomputed from THIS binary's constants):");
     println!("    {}", own_frozen_digest_hex());
     match RELEASE.validate() {

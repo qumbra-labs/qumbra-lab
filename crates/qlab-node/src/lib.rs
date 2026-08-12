@@ -88,7 +88,10 @@ pub use telemetry::{
     StateLag, SupplyCoverage, Telemetry, APPLIED_TIP_OFF_MAIN, APPLIED_TIP_ON_MAIN,
     DURABLE_HEAD_SINCE_VERSION, LOCAL_COMMITMENT_SPLIT, READABLE_TELEMETRY_VERSIONS,
 };
-pub use persist::{read_records, LogRecord, Snapshot, BLOCK_LOG, FORMAT_VERSION, SNAPSHOT};
+pub use persist::{
+    read_records, snapshot_on_disk, LogRecord, Snapshot, SnapshotOnDisk, BLOCK_LOG, FORMAT_VERSION,
+    SNAPSHOT,
+};
 pub use replay_progress::{
     capture_progress, live_replay_position, take_captured_progress, with_progress_capture,
     ReplayPosition, REPLAY_PROGRESS_EVERY_RECORDS, REPLAY_PROGRESS_EVERY_SECS,
