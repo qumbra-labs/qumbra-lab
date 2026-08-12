@@ -14,12 +14,12 @@ Both go to stdout beside `TELEMETRY` and `ROUND` (the #87 rule: the container lo
 
 ### `LOOP kind=slow` — one iteration exceeded the threshold
 
-Emitted **on the spot**, as the iteration ends, carrying that iteration's whole breakdown. Silent on a healthy node. Capped at 20 per telemetry window; the suppressed count is carried on the window line.
+Emitted **on the spot**, as the iteration ends, carrying that iteration's whole breakdown. Silent on a healthy node. Capped at **8 per telemetry window** — see *Rolling it to one host* for where that number comes from — with the suppressed count carried on the window line.
 
 ```
 LOOP kind=slow unit=ms ms=131195.0 phase=pump.dispatch phase_ms=131170.0 frames=6 \
   pump=131174.0 journal=1.0 mine=0.0 boundary=0.0 metrics=0.0 discovery=0.0 submit=0.0 \
-  telemetry=0.0 sample=0.0 maintain=20.0 snapshot=0.0 hook=0.0 sleep=0.0 \
+  telsrv=0.0 sample=0.0 maintain=20.0 snapshot=0.0 hook=0.0 sleep=0.0 \
   dials=0.0 poll=2.0 ratelimit=0.0 decode=0.0 dispatch=131170.0 sync=0.0 send*=131165.0
 ```
 
@@ -47,7 +47,9 @@ LOOP kind=window unit=ms win=30012.0 iters=1482 busy=2210.0 acct=30000.0 unacct=
 | `slow` / `slowsup` | slow lines emitted / suppressed by the cap |
 | `frames` | frames the pump handled, throttled ones included |
 
-**Run-loop phases**, in the order the loop runs them: `pump` `journal` `mine` `boundary` `metrics` `discovery` `submit` `telemetry` `sample` `maintain` `snapshot` `hook`, then `sleep` (the 20 ms idle back-off, which is *not* work).
+**Run-loop phases**, in the order the loop runs them: `pump` `journal` `mine` `boundary` `metrics` `discovery` `submit` `telsrv` `sample` `maintain` `snapshot` `hook`, then `sleep` (the 20 ms idle back-off, which is *not* work).
+
+`telsrv` is the `/v1/telemetry` **snapshot render**; `sample` is the `TELEMETRY` **stdout line**. The field is deliberately not called `telemetry=`: every archived reader of these logs greps for the string `TELEMETRY`, and a case-insensitive grep anywhere in that chain would have matched this field and returned a `LOOP` line where a `TELEMETRY` line was expected.
 
 **Pump sub-phases**, inside `pump`: `dials` `poll` `ratelimit` `decode` `dispatch` `sync`.
 
@@ -97,7 +99,25 @@ The change is additive journal only:
 - **no config key and no new thread** — the threshold is a compile-time constant with a programmatic setter for tests;
 - **no decision reads any of it** — the timings are observation, the same rule `RateStats` and `UnknownStats` follow.
 
-**Volume, at the fleet's shape**: the window line is 1 per `TELEMETRY`, so ~2,880/day/host. Slow lines are silent on a healthy node except for mining, which is bounded by `mine_interval` (~1,150/day) — and on a degraded node they are capped at 20 per 30 s window, i.e. ≤57,600/day in the worst case, with the excess counted rather than printed. A node cannot be made to flood by a peer.
+**Volume, at the fleet's shape**: the window line is 1 per `TELEMETRY`, so ~2,880/day/host. Slow lines are silent on a healthy node except for mining, which is bounded by `mine_interval` (~1,150/day); on a degraded node they are capped at **8 per 30 s window**, with the excess counted rather than printed. A node cannot be made to flood by a peer.
+
+### The cap is set by the sampler, and this is the one thing to check before rolling
+
+`qumbra-ops/t0-sampler.sh` reads each host with
+
+```sh
+docker logs --tail 60 qumbra-node 2>&1 | grep TELEMETRY | tail -1
+```
+
+and an empty result is written to the log as `UNREACHABLE-OR-SILENT`. **Every line this node adds competes with `TELEMETRY` for that 60-line window, and a node that talks too much is reported as down** — a false alarm indistinguishable from the failure the sampler exists to catch. At a cap of 8, one window costs at most ~10 lines (8 slow + 1 window + 1 `TELEMETRY`), so `TELEMETRY` stays ~5 windows deep in the tail even while a node is degraded, with room for `ROUND` and `BODYWAIT`.
+
+That is a margin, not a guarantee, and the durable fix belongs in `qumbra-ops` rather than here: anchor the grep and widen the tail —
+
+```sh
+docker logs --tail 200 qumbra-node 2>&1 | grep '^TELEMETRY' | tail -1
+```
+
+`wan-sampler.sh:63` runs the same read at `--tail 20` and needs the same change. **Neither script is in this repo and neither was touched by this PR.**
 
 **Cost**: 13 clock reads per iteration plus 3 per frame, tens of nanoseconds each (a vDSO read, no syscall) — measured by `ticktime::tests::instrumentation_costs_tens_of_nanoseconds_per_frame`, which fails if a clock read ever costs a microsecond.
 

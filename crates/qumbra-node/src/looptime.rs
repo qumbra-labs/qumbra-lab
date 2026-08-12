@@ -67,7 +67,18 @@ pub const SLOW_ITERATION_MS: u64 = 1_000;
 /// Cap on `LOOP kind=slow` lines per telemetry window. Beyond this the count is
 /// carried on the window line as `slowsup=`, so the fact is kept and the volume
 /// is not.
-pub const MAX_SLOW_LINES_PER_WINDOW: u64 = 20;
+///
+/// **Eight, and the number comes from the live sampler rather than from taste.**
+/// `qumbra-ops/t0-sampler.sh` reads each host with
+/// `docker logs --tail 60 | grep TELEMETRY | tail -1`, and an empty result is
+/// logged as `UNREACHABLE-OR-SILENT` — so any line this node adds competes with
+/// `TELEMETRY` for that 60-line window, and a node that talked too much would
+/// be reported as *down*. At eight, one window costs at most ~10 lines
+/// (8 slow + 1 window + 1 `TELEMETRY`), so `TELEMETRY` stays five windows deep
+/// in the tail even while a node is degraded, with room left for `ROUND` and
+/// `BODYWAIT`. Eight consecutive slow iterations characterise a degraded node;
+/// the ninth is volume, and it is counted rather than printed.
+pub const MAX_SLOW_LINES_PER_WINDOW: u64 = 8;
 
 /// Per-phase durations for one iteration of the node's main loop.
 ///
@@ -91,7 +102,13 @@ pub struct LoopPhases {
     /// `drain_remote_submits` — the submitter queue.
     pub submit: Duration,
     /// `/v1/telemetry` snapshot render, when a listener is bound.
-    pub telemetry: Duration,
+    ///
+    /// The field is `telsrv=` on the wire, not `telemetry=`: every archived
+    /// reader of these logs greps for the string `TELEMETRY`, and one of them
+    /// (`qumbra-ops/t0-sampler.sh`) treats a miss as a node being down. A
+    /// case-insensitive grep anywhere in that chain would have matched this
+    /// field and returned a `LOOP` line where a `TELEMETRY` line was expected.
+    pub telsrv: Duration,
     /// The `TELEMETRY` line itself + overdue rounds + the halt marker.
     pub sample: Duration,
     /// `maintain_peers` — the dial pass (#83).
@@ -117,7 +134,7 @@ impl LoopPhases {
             ("metrics", self.metrics),
             ("discovery", self.discovery),
             ("submit", self.submit),
-            ("telemetry", self.telemetry),
+            ("telsrv", self.telsrv),
             ("sample", self.sample),
             ("maintain", self.maintain),
             ("snapshot", self.snapshot),
@@ -164,7 +181,7 @@ impl LoopPhases {
         self.metrics += o.metrics;
         self.discovery += o.discovery;
         self.submit += o.submit;
-        self.telemetry += o.telemetry;
+        self.telsrv += o.telsrv;
         self.sample += o.sample;
         self.maintain += o.maintain;
         self.snapshot += o.snapshot;
@@ -385,7 +402,7 @@ mod tests {
         assert_eq!(emitted, MAX_SLOW_LINES_PER_WINDOW, "the cap holds");
         let w = j.window_line();
         assert!(w.contains(&format!(" slow={MAX_SLOW_LINES_PER_WINDOW} ")), "{w}");
-        assert!(w.contains(" slowsup=30 "), "the 30 suppressed lines are counted: {w}");
+        assert!(w.contains(" slowsup=42 "), "the suppressed lines are counted, not lost: {w}");
         // Suppression drops the line, never the measurement: all 50 are in the
         // window's own totals.
         assert!(w.contains(" mine=75000.0 "), "50 × 1500 ms: {w}");
@@ -488,7 +505,7 @@ mod tests {
         let window = j.window_line();
         for key in [
             "pump=", "journal=", "mine=", "boundary=", "metrics=", "discovery=", "submit=",
-            "telemetry=", "sample=", "maintain=", "snapshot=", "hook=", "sleep=", "dials=",
+            "telsrv=", "sample=", "maintain=", "snapshot=", "hook=", "sleep=", "dials=",
             "poll=", "ratelimit=", "decode=", "dispatch=", "sync=", "send*=", "unit=ms",
         ] {
             assert!(slow.contains(key), "slow line is missing {key}: {slow}");

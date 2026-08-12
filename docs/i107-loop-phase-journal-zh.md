@@ -14,7 +14,7 @@
 
 ### `LOOP kind=slow`——某一轮超过阈值
 
-在该轮结束时**当场**输出，携带这一轮的完整分解。健康节点上保持沉默。每个遥测窗口最多 20 条，被抑制的条数计入窗口行。
+在该轮结束时**当场**输出，携带这一轮的完整分解。健康节点上保持沉默。每个遥测窗口**最多 8 条**（这个数字的来历见「上一台主机」一节），被抑制的条数计入窗口行。
 
 ```
 LOOP kind=slow unit=ms ms=131195.0 phase=pump.dispatch phase_ms=131170.0 frames=6 ...
@@ -43,7 +43,9 @@ LOOP kind=window unit=ms win=30012.0 iters=1482 busy=2210.0 acct=30000.0 unacct=
 | `slow` / `slowsup` | 已输出 / 被上限抑制的 slow 行数 |
 | `frames` | pump 处理的帧数，含被限流丢弃的 |
 
-**主循环阶段**（按执行顺序）：`pump` `journal` `mine` `boundary` `metrics` `discovery` `submit` `telemetry` `sample` `maintain` `snapshot` `hook`，然后是 `sleep`（20 ms 空闲退避，**不算工作**）。
+**主循环阶段**（按执行顺序）：`pump` `journal` `mine` `boundary` `metrics` `discovery` `submit` `telsrv` `sample` `maintain` `snapshot` `hook`，然后是 `sleep`（20 ms 空闲退避，**不算工作**）。
+
+`telsrv` 是 `/v1/telemetry` 的**快照渲染**，`sample` 是 `TELEMETRY` 的**标准输出行**。该字段刻意不叫 `telemetry=`：所有归档读取方都以字符串 `TELEMETRY` 做 grep，链路上任何一处大小写不敏感的 grep 都会命中这个字段，从而在期望 `TELEMETRY` 的地方拿回一条 `LOOP`。
 
 **pump 内部子阶段**：`dials` `poll` `ratelimit` `decode` `dispatch` `sync`。
 
@@ -79,7 +81,25 @@ grep -E 'TELEMETRY|LOOP kind=window' node.log | tail -20
 
 改动只是新增日志：**不接触共识**（`finality.rs`、`recovery.rs`、`committee.rs` 零改动）；**wire 零变化**（不升 `RPC_VERSION`，无新 `MsgType`，无载荷改动，`TELEMETRY` 字段不动）；**不新增配置项、不新增线程**；**没有任何决策读取这些数值**（与 `RateStats`、`UnknownStats` 同一条规则）。
 
-**日志量**：窗口行与 `TELEMETRY` 一一对应，约 2,880 条/天/主机。健康节点上 slow 行只在挖矿时出现，由 `mine_interval` 约束（约 1,150 条/天）；劣化节点上每 30 s 窗口至多 20 条（最坏约 57,600 条/天），超出部分只计数不打印。对端无法把节点刷爆。
+**日志量**：窗口行与 `TELEMETRY` 一一对应，约 2,880 条/天/主机。健康节点上 slow 行只在挖矿时出现，由 `mine_interval` 约束（约 1,150 条/天）；劣化节点上每 30 s 窗口**至多 8 条**，超出部分只计数不打印。对端无法把节点刷爆。
+
+### 上限由采样器决定，这也是上线前唯一必须先确认的事
+
+`qumbra-ops/t0-sampler.sh` 这样读每台主机：
+
+```sh
+docker logs --tail 60 qumbra-node 2>&1 | grep TELEMETRY | tail -1
+```
+
+结果为空时会写成 `UNREACHABLE-OR-SILENT`。**节点每多打印一行，就是在这 60 行窗口里和 `TELEMETRY` 抢位置；话太多的节点会被报成宕机**——这种误报与采样器本该捕捉的真实故障无法区分。上限取 8 时，一个窗口最多约 10 行（8 条 slow + 1 条 window + 1 条 `TELEMETRY`），即使节点处于劣化状态，`TELEMETRY` 仍能停留在 tail 约 5 个窗口的深度内，并给 `ROUND`、`BODYWAIT` 留出余量。
+
+这是余量，不是保证；真正的修复属于 `qumbra-ops` 而不是这里——把 grep 锚定并加大 tail：
+
+```sh
+docker logs --tail 200 qumbra-node 2>&1 | grep '^TELEMETRY' | tail -1
+```
+
+`wan-sampler.sh:63` 用 `--tail 20` 做同样的读取，需要同样的改动。**这两个脚本都不在本仓库，本 PR 也没有改动它们。**
 
 **开销**：每轮 13 次读时钟，另加每帧 3 次，每次数十纳秒（vDSO 读取，无系统调用）——由 `ticktime::tests::instrumentation_costs_tens_of_nanoseconds_per_frame` 实测，一旦读时钟涨到微秒级该测试即失败。
 

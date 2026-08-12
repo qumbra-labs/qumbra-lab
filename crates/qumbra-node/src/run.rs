@@ -2583,7 +2583,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             self.refresh_telemetry();
             self.last_telemetry_render = Instant::now();
         }
-        phases.telemetry = lap(&mut t);
+        phases.telsrv = lap(&mut t);
         let sampled = self.last_sample.elapsed() >= self.sample_interval;
         if sampled {
             println!("{}", self.telemetry_sample());
