@@ -674,6 +674,15 @@ pub struct HistoryReport {
     pub notes: Vec<String>,
 }
 
+/// The structured result of the history flow, before any terminal-oriented
+/// rendering. Native clients consume this so they can build accessible views
+/// without parsing [`HistoryReport::text`]. All accounting and `UNAVAILABLE`
+/// decisions remain in this crate.
+pub struct HistoryData {
+    pub ledger: Ledger,
+    pub notes: Vec<String>,
+}
+
 /// The whole `history` flow: the local send log if there is one, the two chain
 /// streams via [`crate::scan::gather`], and the rendered ledger.
 ///
@@ -695,6 +704,18 @@ pub fn report(
     from: u64,
     to: u64,
 ) -> HistoryReport {
+    let data = report_data(dir, w, url, from, to);
+    HistoryReport { text: render(&data.ledger, url), notes: data.notes }
+}
+
+/// Run the same history flow as [`report`], returning its typed ledger.
+pub fn report_data(
+    dir: &std::path::Path,
+    w: &crate::store::WalletDir,
+    url: &str,
+    from: u64,
+    to: u64,
+) -> HistoryData {
     use crate::sends::{SendLog, SENDS_FILE};
 
     let wallet = w.wallet();
@@ -724,7 +745,7 @@ pub fn report(
         .map(|(div_index, address_short, outcome)| AddressScan { div_index, address_short, outcome })
         .collect();
     let ledger = build(&wallet, &scans, set.as_ref(), &coverage, log.as_ref(), (from, to));
-    HistoryReport { text: render(&ledger, url), notes }
+    HistoryData { ledger, notes }
 }
 
 #[cfg(test)]
