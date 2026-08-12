@@ -6,6 +6,7 @@
 //! and identical over the socket.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use qlab_devnet::committee::{Checkpoint, Vote};
 use qlab_devnet::body::{BlockBody, TxEntry};
@@ -33,6 +34,7 @@ use crate::peer::{NodeId, PeerId, PeerTable, VersionMsg};
 use crate::ratelimit::{RateKey, RateLimiter, RateLimits, RateStats};
 use crate::sendstall::stall_line;
 use crate::sync::{build_locator, answer_get_headers, SyncPhase, SyncState, MAX_HEADERS_PER_BATCH};
+use crate::ticktime::{lap, TickTimings};
 use qlab_devnet::finality::next_checkpoint_height;
 use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
 use crate::transport::{DialCompletion, DialStart, Transport, TransportError};
@@ -447,6 +449,16 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// did (#84's law: the drill must detect the gap it drills). `true` in every
     /// production construction; nothing in the binary flips it.
     serve_historical_bodies: bool,
+    /// **Where the last [`Self::tick`] spent its time** (issue #107 S1).
+    /// Observation only — never read by any decision. See [`crate::ticktime`].
+    last_tick: TickTimings,
+    /// Nanoseconds spent inside `Transport::send` since the current tick began.
+    ///
+    /// A `Cell` because [`Self::send`] takes `&self` (it is called from `&self`
+    /// relay paths), and the alternative — threading `&mut` through every relay
+    /// — would change a dozen signatures to carry a counter. The node loop is
+    /// single-threaded by construction, so there is nothing to synchronise.
+    send_ns: std::cell::Cell<u64>,
 }
 
 impl<T: Transport, N: NodeState> P2pNode<T, N> {
@@ -476,6 +488,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             cp_queries: HashMap::new(),
             cp_query_rr: 0,
             serve_historical_bodies: true,
+            last_tick: TickTimings::default(),
+            send_ns: std::cell::Cell::new(0),
         }
     }
 
@@ -786,7 +800,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     // --- outbound framing helpers ---
     fn send(&self, to: PeerId, msg_type: MsgType, payload: Vec<u8>) {
         let frame = Envelope::new(msg_type, payload).encode();
+        // Issue #107 S1: the write is timed, not the encode. `TcpTransport::send`
+        // holds the `writers` mutex across the write and waits up to
+        // `SEND_WRITE_TIMEOUT_MS` for the kernel, so this is the one call on the
+        // pump path that can block on something outside this process.
+        let started = std::time::Instant::now();
         let _ = self.transport.send(to, &frame); // peer-gone is benign
+        self.send_ns
+            .set(self.send_ns.get().saturating_add(started.elapsed().as_nanos() as u64));
     }
 
     /// Announce one inventory item to every ready peer except `except`.
@@ -949,11 +970,21 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// including frames dropped by the rate limiter, which *were* handled: they
     /// arrived, were charged, and were discarded.
     pub fn tick(&mut self, now_ms: u64) -> usize {
+        // Issue #107 S1. The phase cursor: one clock read per boundary, folded
+        // into `self.last_tick` at the end. Observation only — see
+        // [`crate::ticktime`] for why the cuts are where they are.
+        let mut t = Instant::now();
+        let mut timings = TickTimings::default();
+        self.send_ns.set(0);
         self.finish_dials(now_ms);
+        timings.dials = lap(&mut t);
         let frames = self.transport.poll();
+        timings.poll = lap(&mut t);
         let n = frames.len();
+        timings.frames = n as u64;
         for (from, frame) in frames {
             if self.peers.is_banned(from) {
+                timings.ratelimit += lap(&mut t);
                 continue;
             }
             // Rate limiting comes BEFORE anything that costs us: before the peer
@@ -962,7 +993,12 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             // whose only sin is being fast is not a peer worth banning (#91
             // decision 2). The existing malformed/invalid penalties are untouched.
             let key = self.rate_key(from);
-            if !self.limiter.charge_frame(key.clone(), frame.len(), now_ms).allowed() {
+            let allowed = self.limiter.charge_frame(key.clone(), frame.len(), now_ms).allowed();
+            // Charged whether or not the frame survives: a dropped frame still
+            // cost this node the key lookup and the charge, and the point of the
+            // phase is what the loop PAID, not what it kept.
+            timings.ratelimit += lap(&mut t);
+            if !allowed {
                 continue;
             }
             if !self.peers.contains(from) {
@@ -981,7 +1017,13 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             // unknown-type case is `Ok(Frame::UnknownType)` and `WireError` has no
             // variant for it, so this branch cannot be re-merged by accident. See
             // `crate::wire::Frame`.
-            match Frame::decode(&frame) {
+            // The peer-table row above is charged to `decode` — it is one
+            // `HashMap` probe on the frame's own path, and giving it a phase of
+            // its own would be four more clock reads per frame for a number
+            // nobody would act on.
+            let decoded = Frame::decode(&frame);
+            timings.decode += lap(&mut t);
+            match decoded {
                 Ok(Frame::Known(env)) => self.dispatch(from, env, key, now_ms),
                 // "You are running a newer build than me." Not a fault, so not
                 // scored, not disconnected, and the connection carries on — the
@@ -1000,6 +1042,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                     self.peers.penalize(from, PENALTY_MALFORMED);
                 }
             }
+            timings.dispatch += lap(&mut t);
         }
         self.maybe_start_sync();
         self.request_missing_bodies(now_ms);
@@ -1012,7 +1055,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         self.body_fetch_progress = false;
         self.node
             .observe_body_fetch(now_ms, self.body_reqs.len(), progress);
+        timings.sync = lap(&mut t);
+        timings.send = Duration::from_nanos(self.send_ns.get());
+        self.last_tick = timings;
         n
+    }
+
+    /// **Where the last [`Self::tick`] spent its time** (issue #107 S1).
+    ///
+    /// The binary folds this into its own per-iteration record and journals it
+    /// as a `LOOP` line; nothing in this crate reads it. Zeroed until the first
+    /// tick, so a node that has never pumped reports zeros rather than noise.
+    pub fn last_tick_timings(&self) -> TickTimings {
+        self.last_tick
     }
 
     // --- issue #181: version skew is not misbehaviour -------------------------

@@ -14,6 +14,10 @@
 //!   bound to loopback; serving the committed body bytes, never a side table.
 //! - [`params_audit`] — the params_devnet-vs-FROZEN-v1.0 convergence audit
 //!   (the docs/ table's data, test-locked here).
+//! - [`looptime`] — the `LOOP` journal (issue #107 S1): every main-loop
+//!   iteration timed phase by phase, so a degraded loop period attributes
+//!   itself to a phase instead of being argued about from the gap between two
+//!   `TELEMETRY` lines.
 //! - [`run`] — composes the N7 stack over the REAL TCP transport + RandomXPow +
 //!   on-disk qlab-node stores, and runs it with graceful-shutdown snapshot flush.
 //! - [`audit_emission`] — read-only `audit-emission` subcommand: walk a data dir's
@@ -35,6 +39,7 @@ pub mod config;
 pub mod discovery_server;
 pub mod emission_pins;
 pub mod genesis;
+pub mod looptime;
 pub mod metrics_server;
 pub mod params_audit;
 pub mod release;

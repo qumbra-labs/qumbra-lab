@@ -55,6 +55,7 @@ use crate::discovery_server::{
     AnchorsView, DiscoveryServer, DiscoveryView, LeavesView, SubmitRequest, TxRefusal,
     TxSubmitOutcome, MAX_QUEUED_SUBMITS,
 };
+use crate::looptime::{LoopJournal, LoopPhases};
 use crate::metrics_server::MetricsServer;
 use crate::telemetry_server::TelemetryServer;
 
@@ -64,6 +65,7 @@ use qlab_p2p::bodywait::BodyWaitJournal;
 use qlab_p2p::node::BODY_REQUEST_TIMEOUT_MS;
 use qlab_p2p::n1::{ChainView, CommitteeControl};
 use qlab_p2p::sync::SyncPhase;
+use qlab_p2p::ticktime::lap;
 use qlab_p2p::transport::TcpTransport;
 use qlab_p2p::P2pNode;
 
@@ -417,6 +419,10 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     last_sample: Instant,
     /// When the last discovery maintenance pass ran.
     last_maintain: Instant,
+    /// **The `LOOP` journal** (issue #107 S1) — per-iteration phase timings,
+    /// emitted as a slow line on the spot and as a window aggregate on the
+    /// telemetry cadence. Observation only; see [`crate::looptime`].
+    loop_journal: LoopJournal,
     /// How often [`Self::maintain_snapshot`] may write (issue #359 S2). Defaults
     /// to [`SNAPSHOT_INTERVAL`]; `--snapshot-interval-secs` overrides it.
     snapshot_interval: Duration,
@@ -751,6 +757,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             sample_interval: Duration::from_secs(30),
             last_sample: Instant::now(),
             last_maintain: Instant::now(),
+            loop_journal: LoopJournal::new(),
             snapshot_interval: SNAPSHOT_INTERVAL,
             last_snapshot_tick: Instant::now(),
             // Issue #359: one read, at the one moment it is free — the node has
@@ -2472,76 +2479,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         println!("{}", self.telemetry_sample());
         self.last_sample = Instant::now();
         while !shutdown.load(Ordering::Relaxed) {
-            let n = self.step_once();
-            // Issue #87, in the order that keeps the record honest: accumulate the
-            // regime residency first (so the seconds land in the regime that was
-            // actually in force), then open any newly-reached slot, then emit the
-            // rounds that closed while we were away. All three are cheap and none
-            // touches consensus.
-            self.accumulate_regime();
-            self.note_slots_reached();
-            self.emit_rounds();
-            self.emit_rewinds();
-            self.emit_finalize_refusals();
-            // Issue #229. On the pump cadence like its two neighbours, and silent
-            // on every healthy node — the rate limit is inside the journal, not
-            // here, so the emission cadence and the reporting cadence stay two
-            // separate decisions.
-            self.emit_body_waits();
-            if self.mining && self.last_mine.elapsed() >= self.mine_interval {
-                if self.try_mine() {
-                    self.try_checkpoint();
-                }
-            }
-            // #360: the call above is the loop's ONLY route to try_checkpoint,
-            // and it is unreachable on a halted node. See the method's doc.
-            self.maintain_boundary_checkpoint();
-            if self.metrics_server.is_some() && self.last_metrics_render.elapsed() >= METRICS_REFRESH {
-                self.refresh_metrics();
-                self.last_metrics_render = Instant::now();
-            }
-            if self.discovery_server.is_some()
-                && self.last_discovery_refresh.elapsed() >= DISCOVERY_REFRESH
-            {
-                self.refresh_discovery();
-                self.refresh_leaves();
-                self.refresh_anchors();
-                self.last_discovery_refresh = Instant::now();
-            }
-            // Every iteration, not on the refresh cadence: a submitter is parked
-            // on a socket waiting for this, and an empty queue costs one
-            // `try_recv` (issue #275).
-            self.drain_remote_submits();
-            if self.telemetry_server.is_some()
-                && self.last_telemetry_render.elapsed() >= TELEMETRY_REFRESH
-            {
-                self.refresh_telemetry();
-                self.last_telemetry_render = Instant::now();
-            }
-            if self.last_sample.elapsed() >= self.sample_interval {
-                println!("{}", self.telemetry_sample());
-                // A stall's open rounds report themselves on the same cadence as the
-                // telemetry line they explain.
-                self.emit_overdue_rounds();
-                self.last_sample = Instant::now();
-                // Cheap and idempotent; sampled on the telemetry cadence so it costs
-                // nothing on a net that never halts.
-                self.maintain_halt_marker();
-            }
-            if self.last_maintain.elapsed() >= MAINTAIN_INTERVAL {
-                self.maintain_peers(); // re-dial, auto-connect, ask for addresses (#83)
-                self.last_maintain = Instant::now();
-            }
-            // Issue #359: the snapshot cadence. Its own interval check lives inside
-            // the method, with the three gates it guards, so the loop reads as one
-            // line and the rule has one home.
-            self.maintain_snapshot();
-            // The co-resident hook (#123), last so it observes this iteration's
-            // state rather than the previous one's.
-            on_tick(self);
-            if n == 0 {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            let _ = self.one_iteration(&mut on_tick);
         }
         // Any round still open at shutdown stays open: it is genuinely unfinished,
         // and inventing a close for it would put a fabricated verdict in the record.
@@ -2569,6 +2507,139 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         };
         self.save_addr_book();
         snapshot_ok
+    }
+
+    /// **One turn of the event loop, timed phase by phase** (issue #107 S1).
+    ///
+    /// Split out of [`Self::run_until_with`] so the instrument can be tested
+    /// against the loop it instruments rather than against a copy of it: a test
+    /// drives one real iteration and reads the real measurement back, with no
+    /// stdout capture and no second implementation of the loop body to drift
+    /// from this one.
+    ///
+    /// Returns the iteration's phase record **and the `LOOP` lines it emitted**
+    /// — already printed, returned for the same reason [`Self::emit_rounds`]
+    /// returns its lines: so a test can assert what the journal said without
+    /// capturing stdout or re-deriving it.
+    pub fn one_iteration<F: FnMut(&mut Self)>(
+        &mut self,
+        on_tick: &mut F,
+    ) -> (LoopPhases, Vec<String>) {
+        // One clock read per statement group. `lap` advances the cursor, so no
+        // phase is charged for its neighbour's clock read; see `crate::looptime`.
+        let mut phases = LoopPhases::default();
+        let mut t = Instant::now();
+        let n = self.step_once();
+        phases.pump = lap(&mut t);
+        phases.tick = self.p2p.last_tick_timings();
+        // Issue #87, in the order that keeps the record honest: accumulate the
+        // regime residency first (so the seconds land in the regime that was
+        // actually in force), then open any newly-reached slot, then emit the
+        // rounds that closed while we were away. All three are cheap and none
+        // touches consensus.
+        self.accumulate_regime();
+        self.note_slots_reached();
+        self.emit_rounds();
+        self.emit_rewinds();
+        self.emit_finalize_refusals();
+        // Issue #229. On the pump cadence like its two neighbours, and silent
+        // on every healthy node — the rate limit is inside the journal, not
+        // here, so the emission cadence and the reporting cadence stay two
+        // separate decisions.
+        self.emit_body_waits();
+        phases.journal = lap(&mut t);
+        if self.mining && self.last_mine.elapsed() >= self.mine_interval {
+            if self.try_mine() {
+                self.try_checkpoint();
+            }
+        }
+        phases.mine = lap(&mut t);
+        // #360: the call above is the loop's ONLY route to try_checkpoint,
+        // and it is unreachable on a halted node. See the method's doc.
+        self.maintain_boundary_checkpoint();
+        phases.boundary = lap(&mut t);
+        if self.metrics_server.is_some() && self.last_metrics_render.elapsed() >= METRICS_REFRESH {
+            self.refresh_metrics();
+            self.last_metrics_render = Instant::now();
+        }
+        phases.metrics = lap(&mut t);
+        if self.discovery_server.is_some()
+            && self.last_discovery_refresh.elapsed() >= DISCOVERY_REFRESH
+        {
+            self.refresh_discovery();
+            self.refresh_leaves();
+            self.refresh_anchors();
+            self.last_discovery_refresh = Instant::now();
+        }
+        phases.discovery = lap(&mut t);
+        // Every iteration, not on the refresh cadence: a submitter is parked
+        // on a socket waiting for this, and an empty queue costs one
+        // `try_recv` (issue #275).
+        self.drain_remote_submits();
+        phases.submit = lap(&mut t);
+        if self.telemetry_server.is_some()
+            && self.last_telemetry_render.elapsed() >= TELEMETRY_REFRESH
+        {
+            self.refresh_telemetry();
+            self.last_telemetry_render = Instant::now();
+        }
+        phases.telsrv = lap(&mut t);
+        let sampled = self.last_sample.elapsed() >= self.sample_interval;
+        if sampled {
+            println!("{}", self.telemetry_sample());
+            // A stall's open rounds report themselves on the same cadence as the
+            // telemetry line they explain.
+            self.emit_overdue_rounds();
+            self.last_sample = Instant::now();
+            // Cheap and idempotent; sampled on the telemetry cadence so it costs
+            // nothing on a net that never halts.
+            self.maintain_halt_marker();
+        }
+        phases.sample = lap(&mut t);
+        if self.last_maintain.elapsed() >= MAINTAIN_INTERVAL {
+            self.maintain_peers(); // re-dial, auto-connect, ask for addresses (#83)
+            self.last_maintain = Instant::now();
+        }
+        phases.maintain = lap(&mut t);
+        // Issue #359: the snapshot cadence. Its own interval check lives inside
+        // the method, with the three gates it guards, so the loop reads as one
+        // line and the rule has one home.
+        self.maintain_snapshot();
+        phases.snapshot = lap(&mut t);
+        // The co-resident hook (#123), last so it observes this iteration's
+        // state rather than the previous one's.
+        on_tick(self);
+        phases.hook = lap(&mut t);
+        if n == 0 {
+            std::thread::sleep(Duration::from_millis(20));
+            phases.sleep = lap(&mut t);
+        }
+        // Issue #107 S1: the iteration's own record. The slow line is
+        // emitted here rather than at the sample, so a loop that is about to
+        // spend two minutes in one phase has already said so by the time the
+        // gap it causes appears in the log — which is the difference between
+        // a journal that explains an incident and one that annotates it
+        // afterwards. The window line rides the telemetry cadence, so the
+        // aggregate and the `TELEMETRY` line it explains are adjacent.
+        let mut lines = Vec::new();
+        if let Some(line) = self.loop_journal.note(&phases) {
+            lines.push(line);
+        }
+        if sampled {
+            lines.push(self.loop_journal.window_line());
+        }
+        for line in &lines {
+            println!("{line}");
+        }
+        (phases, lines)
+    }
+
+    /// Re-tune the `LOOP kind=slow` threshold (issue #107 S1) — tests and
+    /// testnet, programmatic for the same reason the rate limits are: this
+    /// number should move because a measurement said so, not because a config
+    /// file was edited on one host.
+    pub fn set_loop_slow_threshold(&mut self, d: Duration) {
+        self.loop_journal.set_threshold(d);
     }
 }
 
@@ -3814,6 +3885,124 @@ mod tests {
     }
 
     /// Issue #145: `run_until` must return `false` when the snapshot flush fails,
+    /// **Issue #107 S1 — the instrument measures the loop, not a copy of it.**
+    ///
+    /// The unit tests in [`crate::looptime`] prove the line formats and the
+    /// attribution arithmetic against synthetic phases. This one proves the
+    /// wiring: a real iteration of the real loop, with a known cost injected
+    /// into a known phase, and the measurement read back off the same code path
+    /// the fleet runs. Without it, every phase could be assigned to the wrong
+    /// statement and every unit test would still pass.
+    #[test]
+    fn one_iteration_attributes_an_injected_cost_to_the_phase_that_paid_it() {
+        let (config, genesis, base) = rig("loopphase", false);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        // 120 ms is far above the loop's own floor and far below anything that
+        // would make the test slow; the threshold is lowered to match so the
+        // journal line is exercised too rather than only the record.
+        node.set_loop_slow_threshold(Duration::from_millis(50));
+        let mut hook = |_: &mut RunningNode<KeccakPow, DevnetRehearsalVerifier>| {
+            std::thread::sleep(Duration::from_millis(120))
+        };
+        let (phases, lines) = node.one_iteration(&mut hook);
+
+        assert!(
+            phases.hook >= Duration::from_millis(100),
+            "the hook's 120 ms is charged to the hook phase: {:?}",
+            phases.hook
+        );
+        let (name, d) = phases.worst();
+        assert_eq!(name, "hook", "and it is what the attribution names");
+        assert_eq!(d, phases.hook, "with the phase's own number");
+        // The cost lands in ONE phase: every other phase on a quiet node is
+        // sub-millisecond, so a mis-wired `lap` cursor (one that failed to
+        // advance, and so charged each phase for its predecessor's work) would
+        // show the 120 ms in `snapshot` as well.
+        assert!(
+            phases.snapshot < Duration::from_millis(50),
+            "the phase AFTER the hook is not charged for it: {:?}",
+            phases.snapshot
+        );
+        assert!(
+            phases.pump < Duration::from_millis(50),
+            "nor the phase before it: {:?}",
+            phases.pump
+        );
+        // And the record is internally consistent: busy covers the injected
+        // cost, and the idle back-off is accounted separately from work.
+        assert!(phases.busy() >= phases.hook);
+        assert_eq!(phases.total(), phases.busy() + phases.sleep);
+
+        // The journal said so too — this is the line an operator greps, taken
+        // off the loop rather than off a formatter called with made-up numbers.
+        assert_eq!(lines.len(), 1, "one slow line, no window line off-cadence: {lines:?}");
+        assert!(lines[0].starts_with("LOOP kind=slow unit=ms "), "{}", lines[0]);
+        assert!(lines[0].contains(" phase=hook "), "{}", lines[0]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// **The window line rides the telemetry cadence** (issue #107 S1): every
+    /// `TELEMETRY` line gets a `LOOP kind=window` beside it explaining what the
+    /// gap before it was made of, and off-cadence iterations emit neither.
+    ///
+    /// This is the half that matters for the degraded population in this issue,
+    /// which was *steadily* slow rather than spiking — a threshold-only
+    /// instrument would have been silent through all 53 samples.
+    #[test]
+    fn the_window_line_is_emitted_on_the_telemetry_cadence_and_not_otherwise() {
+        let (config, genesis, base) = rig("loopwindow", false);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let mut noop = |_: &mut RunningNode<KeccakPow, DevnetRehearsalVerifier>| {};
+
+        // Off-cadence: the default 30 s interval has not elapsed, so nothing.
+        let (_, quiet) = node.one_iteration(&mut noop);
+        assert!(quiet.is_empty(), "a healthy off-cadence iteration is silent: {quiet:?}");
+
+        // On-cadence: every iteration samples.
+        node.set_sample_interval(Duration::ZERO);
+        let (_, first) = node.one_iteration(&mut noop);
+        assert_eq!(first.len(), 1, "the window line, and no slow line: {first:?}");
+        let w = &first[0];
+        assert!(w.starts_with("LOOP kind=window unit=ms "), "{w}");
+        assert!(w.contains(" iters=2 "), "it covers the window since the last one: {w}");
+        assert!(w.contains(" slow=0 slowsup=0 "), "nothing was slow: {w}");
+
+        // ...and the next window starts empty rather than carrying the last one.
+        let (_, second) = node.one_iteration(&mut noop);
+        assert!(second[0].contains(" iters=1 "), "the window reset: {}", second[0]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The other half of the same wiring claim: a quiet iteration is dominated
+    /// by the idle back-off, and the *work* it did is sub-millisecond. This is
+    /// the baseline against which "the loop period is 131 s" is a finding at
+    /// all — and it is measured here rather than assumed.
+    #[test]
+    fn a_quiet_iteration_is_idle_rather_than_busy() {
+        let (config, genesis, base) = rig("loopquiet", false);
+        let mut node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let mut noop = |_: &mut RunningNode<KeccakPow, DevnetRehearsalVerifier>| {};
+        // The first iteration carries the startup sample; take the second.
+        let _ = node.one_iteration(&mut noop);
+        let (phases, lines) = node.one_iteration(&mut noop);
+        assert!(
+            phases.sleep >= Duration::from_millis(15),
+            "a quiescent pump ends in the 20 ms back-off: {:?}",
+            phases.sleep
+        );
+        assert!(
+            phases.busy() < Duration::from_millis(20),
+            "and the work it did is not what the period is made of: {:?}",
+            phases.busy()
+        );
+        assert_eq!(phases.tick.frames, 0, "no peers, no frames");
+        assert!(lines.is_empty(), "and it says nothing at all: {lines:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// so main does not print "snapshot flushed" after a failed write.
     #[test]
     fn run_until_returns_false_when_snapshot_flush_fails() {
