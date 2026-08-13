@@ -1555,7 +1555,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // makes a buffered-then-applied body durable (issue #104).
             match self.state.apply_block(header, body.clone(), &self.verifier) {
                 Ok(_) => {
-                    self.mempool.on_block_connected(&body, &self.state);
+                    // The registry read here is the post-apply one — `apply_block`
+                    // has already folded this body's own riders in, which is what
+                    // makes the name-eviction leg see the block that outraced a
+                    // pooled reveal (lab #387).
+                    self.mempool.on_block_connected(&body, &self.state, self.state.names());
                 }
                 // A body that fails at the funnel has mutated nothing (`apply_state`
                 // validates before it writes), and no peer is charged for it — the

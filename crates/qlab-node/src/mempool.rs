@@ -220,6 +220,16 @@ pub struct MempoolTx {
     pub entry: TxEntry,
     /// Serialized weight in bytes (proof + public surface).
     pub weight: u64,
+    /// The name op this tx's rider carries, as [`names_admit_op`] decoded it at
+    /// admission (lab #387). `None` is "no rider" — admission already refused
+    /// every rider that does not decode, so a pooled tx's rider is either absent
+    /// or a decoded op, and neither assembly nor eviction has to re-decode.
+    ///
+    /// It is a **cache of a pure function of `entry.rider`**, not independent
+    /// state: `decode_rider(&entry.rider)` recomputes it exactly. It is stored
+    /// because the two consumers below run per pooled tx per block, and because
+    /// re-decoding would be a second decoder to keep in step with the first.
+    pub name_op: Option<qlab_devnet::names::NameOp>,
 }
 
 /// Canonical Keccak-256 id of a transaction — the injective per-tx encoding the
@@ -479,14 +489,43 @@ impl Mempool {
         verifier: &V,
         names: &N,
     ) -> Result<TxId, MempoolError> {
+        self.admit_above(
+            qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT,
+            entry,
+            state,
+            verifier,
+            names,
+        )
+    }
+
+    /// [`Mempool::admit`] with the name boundary as an argument — the **drill**
+    /// seam, and nothing else (the `validate_body_above` pattern; see
+    /// [`qlab_devnet::names::names_admit_op_above`]).
+    ///
+    /// Below the shipped boundary every rider is refused, so the pool's
+    /// *armed* behaviour — which is what lab #387 is about — has no other way
+    /// to be exercised. Production calls [`Mempool::admit`].
+    pub fn admit_above<S: NodeState, V: TxVerifier, N: qlab_devnet::names::NameView>(
+        &mut self,
+        boundary: Option<u64>,
+        entry: TxEntry,
+        state: &S,
+        verifier: &V,
+        names: &N,
+    ) -> Result<TxId, MempoolError> {
         // 0. The name rider (lab #367), decoded first because the fee rule
         //    below depends on the op it carries. A malformed rider is a pure
         //    function of the tx, like the discovery decode — it can never
         //    become valid, so it is refused here exactly as block validation
         //    refuses it (`RiderMalformed`).
         let prospective_height = state.tip_height() + 1;
-        let op = qlab_devnet::names::names_admit_op(&entry, prospective_height, names)
-            .map_err(MempoolError::RiderInvalid)?;
+        let op = qlab_devnet::names::names_admit_op_above(
+            boundary,
+            &entry,
+            prospective_height,
+            names,
+        )
+        .map_err(MempoolError::RiderInvalid)?;
 
         // 1. Posted-price fee (protocol-spec §4, frozen §5) PLUS the burned
         //    name fee for any rider (the fee split — the reveal declares
@@ -557,7 +596,10 @@ impl Mempool {
             self.nf_index.insert(*nf, id);
         }
         let weight = tx_weight(&entry);
-        self.txs.insert(id, MempoolTx { txid: id, entry, weight });
+        // The decoded op rides with the tx (lab #387): assembly's per-template
+        // name dedup and the eviction re-check both need to know which pooled
+        // txs carry a rider, and neither may re-decode to find out.
+        self.txs.insert(id, MempoolTx { txid: id, entry, weight, name_op: op });
         Ok(id)
     }
 
@@ -583,7 +625,47 @@ impl Mempool {
     /// skipped once the state machine falls behind fork choice. Maturity must not
     /// depend on a call site that stops firing on a desynchronised node, and now
     /// it does not.
-    pub fn on_block_connected<S: NodeState>(&mut self, body: &BlockBody, state: &S) {
+    /// ## The name leg (lab #387)
+    ///
+    /// Nullifiers and anchors are not the only way a pooled tx can go stale. A
+    /// pooled REVEAL whose name someone else's mined tx just registered is
+    /// refused by `validate_body` from now until `reopens_at` — a tx no
+    /// template can mine, which nothing above evicts, i.e. exactly the #278
+    /// poison class the admit leg (PR #385) closed at the front door. So after
+    /// the nullifier/anchor pass, every pooled tx that carries a rider is
+    /// re-asked the admission question against the **new** registry view at the
+    /// **new** prospective height, and evicted if the answer is now no. Reusing
+    /// [`qlab_devnet::names::names_admit_op`] is what makes it the same
+    /// question: an outraced reveal, a renewal whose name lapsed past grace,
+    /// and a reveal whose commit window has aged out all fall out of one call.
+    ///
+    /// `names` is the view **after** the block was applied — this runs on
+    /// `apply_block`'s success arm, so the caller's registry already carries
+    /// the block's own registrations.
+    pub fn on_block_connected<S: NodeState, N: qlab_devnet::names::NameView>(
+        &mut self,
+        body: &BlockBody,
+        state: &S,
+        names: &N,
+    ) {
+        self.on_block_connected_above(
+            qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT,
+            body,
+            state,
+            names,
+        )
+    }
+
+    /// [`Mempool::on_block_connected`] with the name boundary as an argument —
+    /// the **drill** seam, and nothing else (see [`Mempool::admit_above`]).
+    /// Production calls [`Mempool::on_block_connected`].
+    pub fn on_block_connected_above<S: NodeState, N: qlab_devnet::names::NameView>(
+        &mut self,
+        boundary: Option<u64>,
+        body: &BlockBody,
+        state: &S,
+        names: &N,
+    ) {
         // Collect the nullifiers the block spent.
         let spent: HashSet<Hash32> =
             body.txs.iter().flat_map(|t| t.public.nullifiers.iter().copied()).collect();
@@ -602,6 +684,30 @@ impl Mempool {
         for id in doomed {
             self.remove(&id);
         }
+
+        // The name leg: re-ask the admission rider question for every surviving
+        // rider-carrying tx against the updated view. `name_op.is_some()` IS the
+        // rider test — no re-decode — so a rider-free pool (every pool on the
+        // chain as shipped) reaches no name code at all.
+        let prospective_height = state.tip_height() + 1;
+        let outraced: Vec<TxId> = self
+            .txs
+            .values()
+            .filter(|tx| tx.name_op.is_some())
+            .filter(|tx| {
+                qlab_devnet::names::names_admit_op_above(
+                    boundary,
+                    &tx.entry,
+                    prospective_height,
+                    names,
+                )
+                .is_err()
+            })
+            .map(|tx| tx.txid)
+            .collect();
+        for id in outraced {
+            self.remove(&id);
+        }
     }
 
     /// The hard block-weight cap for effective median `M` (frozen §6: `2 × M`). A
@@ -615,6 +721,12 @@ impl Mempool {
     /// healthy block pays no weight penalty), then compute the coinbase + split +
     /// fees. `effective_median` comes from the caller's [`WeightGovernor`] fed with
     /// recent block weights (see [`Mempool::effective_median`]).
+    ///
+    /// At most **one reveal per name** per template (lab #387) — see the fill
+    /// loop. No registry view is needed for it: the question is not "is this
+    /// name free on chain" (admission already asked that, and asks it again on
+    /// every block connect) but "did an earlier tx in *this* template already
+    /// take it", which is answerable from the template alone.
     pub fn assemble<S: NodeState>(
         &self,
         state: &S,
@@ -629,8 +741,34 @@ impl Mempool {
         });
         let mut chosen = Vec::new();
         let mut weight = 0u64;
+        // Names revealed earlier in THIS template (lab #387) — the assembly-side
+        // mirror of `validate_body`'s `pending_names`. Two reveals of one name
+        // both pass admit (the pool admits one tx at a time, so admission's
+        // pending set is empty by construction), and a template carrying both is
+        // refused by the miner's own block validation as `RiderRule(NameTaken)`
+        // — the node building itself an invalid block. First reveal in fee order
+        // takes the slot; the loser is skipped FOR THIS TEMPLATE ONLY and stays
+        // pooled to compete again next block, because it is a perfectly valid tx
+        // that merely lost a race.
+        let mut pending_names: HashSet<Vec<u8>> = HashSet::new();
         for tx in candidates {
+            // Only a Reveal claims a name. A Renew of a name revealed earlier in
+            // the same block is legal (`check_op`: any payer, N4) and a Commit
+            // reveals nothing, so neither is skipped here — the rule mirrors
+            // `validate_body`'s, which is the only rule that matters.
+            let claims = match &tx.name_op {
+                Some(qlab_devnet::names::NameOp::Reveal { record, .. }) => Some(&record.name),
+                _ => None,
+            };
+            if let Some(name) = claims {
+                if pending_names.contains(name) {
+                    continue;
+                }
+            }
             if weight + tx.weight <= effective_median {
+                if let Some(name) = claims {
+                    pending_names.insert(name.clone());
+                }
                 chosen.push(tx.entry.clone());
                 weight += tx.weight;
             }
@@ -645,6 +783,13 @@ impl Mempool {
     /// with [`AssemblyError::TemplateOverWeight`] if it exceeds the hard cap
     /// (frozen §6). This is the validity gate for a proposed/relayed block body:
     /// a set summing past `2 × M` is an invalid template.
+    ///
+    /// **Deliberately no name dedup here** (lab #387). [`Mempool::assemble`]
+    /// *chooses* a set and so owns the choice not to build an invalid one; this
+    /// path is handed a set someone else chose, and silently dropping a tx from
+    /// it would answer a different question than the caller asked. A selection
+    /// carrying a same-name pair is an invalid selection, and saying so is
+    /// `validate_body`'s job — one same-block tie rule, in one place.
     pub fn assemble_selection<S: NodeState>(
         &self,
         state: &S,
@@ -1128,7 +1273,7 @@ mod tests {
         let mined = mp.txs.get(&a).unwrap().entry.clone();
         let body =
             BlockBody { txs: vec![mined], coinbase: coinbase(201), coinbase_rkm: TEST_RKM };
-        mp.on_block_connected(&body, &st);
+        mp.on_block_connected(&body, &st, &qlab_devnet::names::EmptyNameView);
 
         // `a` is gone; `b` remains.
         assert!(!mp.contains(&a));
