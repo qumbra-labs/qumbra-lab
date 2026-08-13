@@ -583,19 +583,31 @@ impl Mempool {
     /// skipped once the state machine falls behind fork choice. Maturity must not
     /// depend on a call site that stops firing on a desynchronised node, and now
     /// it does not.
-    pub fn on_block_connected<S: NodeState>(&mut self, body: &BlockBody, state: &S) {
+    pub fn on_block_connected<S: NodeState, N: qlab_devnet::names::NameView>(
+        &mut self,
+        body: &BlockBody,
+        state: &S,
+        names: &N,
+    ) {
         // Collect the nullifiers the block spent.
         let spent: HashSet<Hash32> =
             body.txs.iter().flat_map(|t| t.public.nullifiers.iter().copied()).collect();
 
+        // The prospective height a pooled tx would now be mined at (assemble/admit use the same).
+        let prospective_height = state.tip_height() + 1;
+
         // Evict pooled txs that share any spent nullifier (mined, or now conflicting),
-        // or whose anchor is no longer valid.
+        // whose anchor is no longer valid, OR (lab #387) whose name rider check_op now
+        // fails against the updated registry: a pooled reveal whose name this block just
+        // registered (or whose commit window has since closed) is a tx no future template
+        // can mine, and nothing else evicts it. Re-uses names_admit_op.
         let doomed: Vec<TxId> = self
             .txs
             .values()
             .filter(|tx| {
                 tx.entry.public.nullifiers.iter().any(|nf| spent.contains(nf))
                     || !state.is_valid_anchor(&tx.entry.public.anchor)
+                    || qlab_devnet::names::names_admit_op(&tx.entry, prospective_height, names).is_err()
             })
             .map(|tx| tx.txid)
             .collect();
@@ -629,10 +641,27 @@ impl Mempool {
         });
         let mut chosen = Vec::new();
         let mut weight = 0u64;
+        // Lab #387: names claimed by a reveal already in this template. Two reveals of the
+        // SAME name both pass admit (empty pending set), so without this the greedy fill packs
+        // both and validate_body's same-block tie rule refuses the block. First reveal wins the
+        // slot; the loser stays pooled for a later template.
+        let mut claimed: HashSet<Vec<u8>> = HashSet::new();
         for tx in candidates {
+            let revealed_name = match qlab_devnet::names::decode_rider(&tx.entry.rider) {
+                Ok(Some(qlab_devnet::names::NameOp::Reveal { record, .. })) => Some(record.name),
+                _ => None,
+            };
+            if let Some(name) = &revealed_name {
+                if claimed.contains(name) {
+                    continue;
+                }
+            }
             if weight + tx.weight <= effective_median {
                 chosen.push(tx.entry.clone());
                 weight += tx.weight;
+                if let Some(name) = revealed_name {
+                    claimed.insert(name);
+                }
             }
         }
         // The fill guarantees `weight ≤ effective_median ≤ hard_cap`, so build
@@ -825,6 +854,89 @@ mod tests {
                 qlab_devnet::body::BodyError::RiderBeforeBoundary { .. }
             ))
         ));
+    }
+
+    /// Lab #387, path 1 — assembly packs a same-block tie the block rules refuse.
+    /// Two reveals of the SAME name both pool (each admits against an empty
+    /// pending set while the name is unregistered); a name-blind greedy fill
+    /// would pack both, and `validate_body` refuses that block (same-block tie).
+    /// The dedup makes the template carry exactly one. Direct pool insertion
+    /// bypasses admit's boundary gate — the dedup logic is boundary-independent
+    /// and is what must be correct once armed.
+    #[test]
+    fn assembly_dedups_two_same_name_reveals_into_one_template_slot() {
+        use qlab_devnet::names::{encode_rider, NameOp, NameRecord, L1_ADDRESS_LEN, RECORD_KIND_L1_ADDRESS};
+        let reveal = |nf: u8| {
+            let mut tx = good_tx(nf);
+            tx.rider = encode_rider(Some(&NameOp::Reveal {
+                record: NameRecord {
+                    kind: RECORD_KIND_L1_ADDRESS,
+                    name: b"alice".to_vec(),
+                    address: vec![0xAB; L1_ADDRESS_LEN],
+                },
+                // Distinct salts so the two are different transactions.
+                salt: [nf; 32],
+            }));
+            tx
+        };
+        let mut mp = Mempool::default();
+        for nf in [1u8, 2] {
+            let entry = reveal(nf);
+            let id = txid(&entry);
+            let weight = tx_weight(&entry);
+            mp.txs.insert(id, MempoolTx { txid: id, entry, weight });
+        }
+        assert_eq!(mp.len(), 2, "both same-name reveals are pooled");
+
+        let st = state_with_anchor();
+        let m = mp.effective_median(&[]); // genesis floor: both fit
+        let template = mp.assemble(&st, m, TEST_RKM);
+        let reveals_for_alice = template
+            .body
+            .txs
+            .iter()
+            .filter(|tx| matches!(
+                qlab_devnet::names::decode_rider(&tx.rider),
+                Ok(Some(NameOp::Reveal { record, .. })) if record.name == b"alice"
+            ))
+            .count();
+        assert_eq!(reveals_for_alice, 1, "the template carries exactly one reveal of the name");
+    }
+
+    /// Lab #387, path 2 — eviction re-checks pooled riders against the updated
+    /// registry on every block connect, so a rider a future template could not
+    /// mine is dropped rather than stranded as poison. Below the boundary
+    /// `names_admit_op` rejects every rider (before-boundary), which is exactly
+    /// the un-minable condition; a rider-free tx is untouched. This locks the
+    /// eviction wire; the armed name-taken path rides the same `names_admit_op`
+    /// and is exercised live by the #369 arming drill.
+    #[test]
+    fn eviction_rechecks_riders_and_spares_rider_free_txs() {
+        use qlab_devnet::names::{encode_rider, EmptyNameView, NameOp};
+        let mut mp = Mempool::default();
+
+        // A rider-carrying tx (a commit) and a plain tx, both force-pooled.
+        let mut rider_tx = good_tx(1);
+        rider_tx.rider = encode_rider(Some(&NameOp::Commit { commit: [0x5A; 32] }));
+        let plain_tx = good_tx(2);
+        for entry in [rider_tx.clone(), plain_tx.clone()] {
+            let id = txid(&entry);
+            let weight = tx_weight(&entry);
+            mp.txs.insert(id, MempoolTx { txid: id, entry, weight });
+        }
+        assert_eq!(mp.len(), 2);
+
+        // Connect an empty block: nothing spent, no anchors change — the only
+        // eviction is the rider re-check.
+        let st = state_with_anchor();
+        let empty = BlockBody { txs: vec![], coinbase: coinbase(st.tip + 1), coinbase_rkm: TEST_RKM };
+        mp.on_block_connected(&empty, &st, &EmptyNameView);
+
+        assert!(mp.get(&txid(&plain_tx)).is_some(), "the rider-free tx survives");
+        assert!(
+            mp.get(&txid(&rider_tx)).is_none(),
+            "the un-minable rider is evicted, not stranded as poison"
+        );
     }
 
     #[test]
@@ -1128,7 +1240,7 @@ mod tests {
         let mined = mp.txs.get(&a).unwrap().entry.clone();
         let body =
             BlockBody { txs: vec![mined], coinbase: coinbase(201), coinbase_rkm: TEST_RKM };
-        mp.on_block_connected(&body, &st);
+        mp.on_block_connected(&body, &st, &qlab_devnet::names::EmptyNameView);
 
         // `a` is gone; `b` remains.
         assert!(!mp.contains(&a));

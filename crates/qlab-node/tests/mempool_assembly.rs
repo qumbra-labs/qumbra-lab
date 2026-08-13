@@ -86,7 +86,7 @@ fn admitted_txs_assemble_into_a_block_the_node_accepts() {
 
     // Reconcile the pool: the mined txs are evicted. Nothing is recorded about the
     // coinbase note — the registry that used to hold it is deleted.
-    mp.on_block_connected(&template.body, &node);
+    mp.on_block_connected(&template.body, &node, &qlab_devnet::names::EmptyNameView);
     assert!(mp.is_empty(), "mined txs leave the pool");
 
     // The note exists and its commitment is known, but it is deliberately NOT a tree

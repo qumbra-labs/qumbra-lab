@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="EMPTY_MODULE" version="4">
+  <component name="NewModuleRootManager">
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-air/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-bench/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-cbserver/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-consensus/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-demo/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-demo/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-devnet/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-devnet/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-disclosure/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-econ/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-econ/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-faucet/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-faucet/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-node/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-node/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-note/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-p2p/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-p2p/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-pow/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-wallet/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qlab-wallet/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qumbra-explorer/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qumbra-explorer/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qumbra-faucet/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qumbra-faucet/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qumbra-node/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qumbra-node/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qumbra-opview/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qumbra-opview/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qumbra-wallet/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/qumbra-wallet/tests" isTestSource="true" />
+      <excludeFolder url="file://$MODULE_DIR$/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>
