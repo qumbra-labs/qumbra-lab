@@ -630,4 +630,64 @@ mod tests {
     fn hex(b: &[u8; 32]) -> String {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
+
+    /// Issue #386 S6 — the measured win. Not a suite test (timing on a shared
+    /// rig flakes); run explicitly:
+    ///
+    /// ```sh
+    /// cargo test -p qlab-cbserver --release i386_s6 -- --ignored --nocapture
+    /// ```
+    ///
+    /// Old per-block cost = one ground-truth `root_at(N)` walk (what `root()`
+    /// was before #386, linear in N). New per-block cost = one `append` + one
+    /// memoised `root()` (flat in N). The one assertion is deliberately loose
+    /// (10× at N = 50k, where the true gap is orders of magnitude) so shared-rig
+    /// noise cannot flip it.
+    #[test]
+    #[ignore = "S6 measurement; run explicitly with --ignored --nocapture"]
+    fn i386_s6_per_block_cost_flat_vs_linear() {
+        use std::time::Instant;
+        let sizes = [1_000u64, 10_000, 50_000];
+        println!("| N leaves | old per-block cost: root_at(N) walk, median of 3 | new per-block cost: append+root(), median of 5 |");
+        println!("|---|---|---|");
+        let mut t = CommitmentTree::new();
+        let mut n = 0u64;
+        let mut last: Option<(std::time::Duration, std::time::Duration)> = None;
+        for &target in &sizes {
+            while n + 1 < target {
+                n += 1;
+                t.append(rand_cm(0x56, n));
+            }
+            // New path: the last append + root, on clones so each sample times
+            // the same (N-1 → N) transition.
+            let mut news = Vec::new();
+            for _ in 0..5 {
+                let mut c = t.clone();
+                let start = Instant::now();
+                c.append(rand_cm(0x56, target));
+                let r = c.root();
+                news.push(start.elapsed());
+                std::hint::black_box(r);
+            }
+            news.sort();
+            n += 1;
+            t.append(rand_cm(0x56, n));
+            // Old path: the full walk root() used to delegate to.
+            let mut olds = Vec::new();
+            for _ in 0..3 {
+                let start = Instant::now();
+                let r = t.root_at(n);
+                olds.push(start.elapsed());
+                std::hint::black_box(r);
+            }
+            olds.sort();
+            println!("| {n} | {:?} | {:?} |", olds[1], news[2]);
+            last = Some((olds[1], news[2]));
+        }
+        let (old_50k, new_50k) = last.unwrap();
+        assert!(
+            new_50k < old_50k / 10,
+            "at N=50k the incremental per-block cost ({new_50k:?}) must be far below the walk ({old_50k:?})"
+        );
+    }
 }
