@@ -37,34 +37,94 @@ fn hash_node(left: &[u64; 4], right: &[u64; 4]) -> [u64; 4] {
 }
 
 /// `zeros[i]` = root of an all-empty subtree of height `i` (`zeros[0]` = the
-/// empty leaf). Computed once via qlab-air's node hash.
+/// empty leaf). Computed once via qlab-air's node hash (process-wide, #386 —
+/// the ladder was previously re-hashed on every call).
 pub fn zeros() -> [[u64; 4]; DEPTH + 1] {
-    let mut z = [[0u64; 4]; DEPTH + 1];
-    z[0] = EMPTY_LEAF;
-    for i in 1..=DEPTH {
-        z[i] = hash_node(&z[i - 1], &z[i - 1]);
-    }
-    z
+    static ZEROS: std::sync::OnceLock<[[u64; 4]; DEPTH + 1]> = std::sync::OnceLock::new();
+    *ZEROS.get_or_init(|| {
+        let mut z = [[0u64; 4]; DEPTH + 1];
+        z[0] = EMPTY_LEAF;
+        for i in 1..=DEPTH {
+            z[i] = hash_node(&z[i - 1], &z[i - 1]);
+        }
+        z
+    })
 }
 
 /// An append-only commitment tree. Stores all leaves (a reference devnet holds a
-/// modest set); root and frontier are derived over any prefix.
-#[derive(Clone, Default)]
+/// modest set — and `auth_path`/`position_of`/historical `root_at` need them);
+/// root and frontier are derived over any prefix.
+///
+/// The CURRENT root is incremental (#386): `append` folds the new leaf into the
+/// cached right-edge frontier in O(depth) node hashes and memoises the root, so
+/// `root()` is O(1) and per-block apply cost is flat in tree size. Historical
+/// prefixes (`root_at`, `auth_path`, `frontier_at` for `count < len`) keep the
+/// O(n) `subtree_root` walk — off the hot path, and `root_at` doubles as the
+/// ground truth the S1 byte-identity property test pins `root()` against.
+#[derive(Clone)]
 pub struct CommitmentTree {
     leaves: Vec<[u64; 4]>,
+    /// Right-edge frontier: `filled[i]` is the root of a COMPLETE subtree of
+    /// height `i` awaiting its right sibling — meaningful exactly where bit `i`
+    /// of `leaves.len()` is set (`filled[DEPTH]` only for the full tree). The
+    /// O(depth) state that lets `append` extend the root without walking leaves.
+    filled: [[u64; 4]; DEPTH + 1],
+    /// Memoised root over all appended leaves, maintained by `append`.
+    root: [u64; 4],
+}
+
+impl Default for CommitmentTree {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CommitmentTree {
     pub fn new() -> Self {
-        Self { leaves: Vec::new() }
+        Self { leaves: Vec::new(), filled: [[0u64; 4]; DEPTH + 1], root: zeros()[DEPTH] }
     }
 
     /// Append a note commitment (as qlab-air `[u64; 4]` lanes). Returns its leaf
-    /// position.
+    /// position. O(depth) node hashes (#386): a binary-counter carry into the
+    /// frontier, then one fold to refresh the memoised root.
     pub fn append(&mut self, cm: [u64; 4]) -> u64 {
         let pos = self.leaves.len() as u64;
+        assert!(pos < 1u64 << DEPTH, "depth-{DEPTH} commitment tree is full");
+        // Carry: while this node is a right child (bit set), merge with the
+        // completed left sibling below it; park it at the first empty level.
+        let mut node = cm;
+        let mut level = 0usize;
+        let mut idx = pos;
+        while idx & 1 == 1 {
+            node = hash_node(&self.filled[level], &node);
+            level += 1;
+            idx >>= 1;
+        }
+        self.filled[level] = node;
         self.leaves.push(cm);
+        self.root = self.fold_frontier_root();
         pos
+    }
+
+    /// Root over `leaves.len()` leaves from the frontier alone: fold up along
+    /// the path of the next empty slot `n` — where bit `i` of `n` is set the
+    /// left sibling is the complete subtree `filled[i]`, otherwise the right
+    /// sibling is the all-empty `zeros[i]`.
+    fn fold_frontier_root(&self) -> [u64; 4] {
+        let n = self.leaves.len() as u64;
+        if n == 1u64 << DEPTH {
+            return self.filled[DEPTH];
+        }
+        let z = zeros();
+        let mut node = z[0];
+        for i in 0..DEPTH {
+            node = if (n >> i) & 1 == 1 {
+                hash_node(&self.filled[i], &node)
+            } else {
+                hash_node(&node, &z[i])
+            };
+        }
+        node
     }
 
     /// Append from on-wire cm bytes (little-endian lanes).
@@ -81,16 +141,20 @@ impl CommitmentTree {
     }
 
     /// Ground-truth root over the first `count` leaves (rest empty). `count`
-    /// beyond the stored leaves is clamped.
+    /// beyond the stored leaves is clamped. Deliberately still the O(n)
+    /// `subtree_root` walk (#386): historical anchors are off the hot path, and
+    /// keeping this path untouched is what makes it the ground truth the S1
+    /// byte-identity test pins the incremental `root()` against.
     pub fn root_at(&self, count: u64) -> [u64; 4] {
         let z = zeros();
         let count = count.min(self.len());
         self.subtree_root(DEPTH, 0, count, &z)
     }
 
-    /// Current root over all appended leaves.
+    /// Current root over all appended leaves. O(1): the frontier-memoised value
+    /// (#386); byte-identity to `root_at(len)` at every count is S1's property.
     pub fn root(&self) -> [u64; 4] {
-        self.root_at(self.len())
+        self.root
     }
 
     fn subtree_root(&self, level: usize, offset: u64, count: u64, z: &[[u64; 4]; DEPTH + 1]) -> [u64; 4] {
