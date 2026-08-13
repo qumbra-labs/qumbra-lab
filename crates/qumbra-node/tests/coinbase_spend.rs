@@ -263,7 +263,7 @@ fn a_mined_coin_can_be_spent_after_maturity_with_a_real_proof() {
     // entirely on the proof verifying against an anchor that really does contain the
     // leaves — which is the enforcement, not a bypass of it.
     let mut mp = Mempool::default();
-    mp.admit(entry.clone(), &chain.node, &ConsensusVerifier)
+    mp.admit(entry.clone(), &chain.node, &ConsensusVerifier, &qlab_devnet::names::EmptyNameView)
         .expect("a matured, well-proved spend is admitted");
 
     let spend_body = BlockBody {
@@ -421,7 +421,7 @@ fn an_immature_coinbase_spend_is_unprovable_not_refused() {
         fee: posted_fee(ArityBucket::TwoByTwo),
         });
     assert_eq!(
-        mp.admit(candidate, &chain.node, &ConsensusVerifier),
+        mp.admit(candidate, &chain.node, &ConsensusVerifier, &qlab_devnet::names::EmptyNameView),
         Err(MempoolError::ProofInvalid),
         "an immature spend fails as unprovable, not as a policy refusal"
     );

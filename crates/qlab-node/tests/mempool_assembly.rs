@@ -51,8 +51,8 @@ fn admitted_txs_assemble_into_a_block_the_node_accepts() {
     let mut mp = Mempool::default();
 
     // Admit two txs against the real node state (anchor = finalized genesis root).
-    mp.admit(tx(g_root, 1), &node, &MockVerifier).expect("admit 1");
-    mp.admit(tx(g_root, 2), &node, &MockVerifier).expect("admit 2");
+    mp.admit(tx(g_root, 1), &node, &MockVerifier, &qlab_devnet::names::EmptyNameView).expect("admit 1");
+    mp.admit(tx(g_root, 2), &node, &MockVerifier, &qlab_devnet::names::EmptyNameView).expect("admit 2");
     assert_eq!(mp.len(), 2);
 
     // Genesis has no block-weight history ⇒ effective median = the 10 MB floor,
@@ -112,7 +112,7 @@ fn mempool_rejects_what_the_node_would_reject_unfinalized_anchor() {
     let g_root = node.commitment_root();
     assert!(!node.is_valid_anchor(&g_root));
     assert_eq!(
-        mp.admit(tx(g_root, 1), &node, &MockVerifier),
+        mp.admit(tx(g_root, 1), &node, &MockVerifier, &qlab_devnet::names::EmptyNameView),
         Err(MempoolError::AnchorNotValid)
     );
 }
@@ -133,7 +133,7 @@ fn mempool_rejects_a_tx_double_spending_an_already_applied_nullifier() {
     let mut mp = Mempool::default();
     // Anchor still valid (genesis root finalized); the double-spend is the reason.
     assert_eq!(
-        mp.admit(tx(g_root, 7), &node, &MockVerifier),
+        mp.admit(tx(g_root, 7), &node, &MockVerifier, &qlab_devnet::names::EmptyNameView),
         Err(MempoolError::AlreadySpent { nullifier: [7; 32] })
     );
 }

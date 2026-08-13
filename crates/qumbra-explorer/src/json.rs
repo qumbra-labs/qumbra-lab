@@ -184,6 +184,7 @@ fn supply(t: &Telemetry) -> String {
                     format!(
                         "{{\"epoch\":{},\"start_height\":{},\"end_height\":{},\
                          \"expected_coinbase\":{},\"measured_coinbase\":{},\"fees\":{},\
+                         \"burned\":{},\
                          \"delta\":{delta},\"verdict\":\"{verdict}\"}}",
                         e.epoch,
                         e.start_height,
@@ -191,6 +192,11 @@ fn supply(t: &Telemetry) -> String {
                         e.expected_coinbase,
                         e.measured_coinbase,
                         e.fees,
+                        // Lab #367 arming prep: name-fee supply destruction,
+                        // per epoch. Honest here and only here for now: this
+                        // page reads its OWN in-process node (always the
+                        // current wire), never a remote vintage.
+                        e.burned,
                         delta = delta,
                         // #299 ruling item 2: the grandfathered epoch-1 scar keeps its
                         // row and its delta, but it is NOT reported as a violation —
@@ -326,7 +332,7 @@ mod tests {
 
     /// Keccak-256 over the four golden serializations concatenated, in source so a
     /// blind file regeneration cannot make the goldens pass by itself.
-    const GOLDEN_DIGEST: &str = "838e671abb3e25687889b3cb974fa55db1d436e36bf511977fc813642b94cc50";
+    const GOLDEN_DIGEST: &str = "60782c21627e326fa4ad60e8a65f4690ad2223598aa9beebebeeb9b9ec6f7acb";
 
     fn hash32(first: u8) -> [u8; 32] {
         let mut h = [0u8; 32];
@@ -519,6 +525,11 @@ mod tests {
         assert_eq!(rows[0]["measured_coinbase"], 700);
         assert_eq!(rows[0]["start_height"], 1);
         assert_eq!(rows[0]["end_height"], 14);
+        // Lab #367 arming prep: the burn column rides every row. Zero is
+        // honest HERE (this page reads its own in-process node, current wire,
+        // and no name boundary is armed) — the remote-vintage honesty problem
+        // that kept this off the page lives in opview, not here.
+        assert_eq!(rows[0]["burned"], 0);
     }
 
     /// **#299 ruling item 2 on the public page.** The grandfathered epoch-1 scar keeps
