@@ -526,10 +526,29 @@ pub fn names_admit_op<V: NameView>(
     height: u64,
     view: &V,
 ) -> Result<Option<NameOp>, crate::body::BodyError> {
+    names_admit_op_above(NAME_RULE_BOUNDARY_HEIGHT, entry, height, view)
+}
+
+/// [`names_admit_op`] with the name boundary as an argument — the **drill**
+/// seam, and nothing else (the [`crate::body::validate_body_above`] pattern).
+///
+/// The shipped boundary is a compiled-in constant, so below it every rider is
+/// refused outright and no rider *rule* is reachable. A test that wants to
+/// exercise the pool's behaviour on an **armed** chain — two reveals racing one
+/// name, a pooled reveal outraced by a mined competitor — has to state the
+/// boundary explicitly, exactly as the block-validation drills do. Production
+/// calls [`names_admit_op`], which is the only caller that reads the real
+/// constant.
+pub fn names_admit_op_above<V: NameView>(
+    boundary: Option<u64>,
+    entry: &crate::body::TxEntry,
+    height: u64,
+    view: &V,
+) -> Result<Option<NameOp>, crate::body::BodyError> {
     let op = decode_rider(&entry.rider)
         .map_err(|err| crate::body::BodyError::RiderMalformed { index: 0, err })?;
     let Some(op) = op else { return Ok(None) };
-    if !riders_active_above(NAME_RULE_BOUNDARY_HEIGHT, height) {
+    if !riders_active_above(boundary, height) {
         return Err(crate::body::BodyError::RiderBeforeBoundary { index: 0 });
     }
     let pending = std::collections::HashSet::new();
