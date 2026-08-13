@@ -49,6 +49,10 @@ on:
         description: 'Type "build" to spend runner minutes on an image build. Anything else runs only the free drift check.'
         required: false
         default: ""
+      explorer_features:
+        description: 'Type "resume" to build the post-boundary variant that runs past RULE_BOUNDARY_HEIGHT. Empty builds the armed one.'
+        required: false
+        default: ""
 
 concurrency:
   group: explorer-image-${{ github.ref }}
@@ -189,9 +193,16 @@ jobs:
           # the FLEET image's digest because a page's backend was compiled
           # (deploy/docker/Dockerfile, the capitalised note at the stage).
           # Native arm64 on an arm64 runner — no QEMU, no emulation tax.
+          # EXPLORER_FEATURES: empty builds the armed variant, which is the safe
+          # default for a manual build. Pass `resume` at dispatch to cut the
+          # post-boundary one (deploy #127 -- the asymmetry that froze the page).
+          FEATS=""
+          [ "${{ inputs.explorer_features }}" = "resume" ] && FEATS="qumbra-node/rule-boundary-resume"
+          echo "EXPLORER_FEATURES=${FEATS:-<armed default>}"
           docker build -f deploy/docker/Dockerfile --target runtime-explorer \
             --platform linux/arm64 --load \
             --build-arg GIT_REVISION="$REV" \
+            --build-arg EXPLORER_FEATURES="$FEATS" \
             -t "ghcr.io/${{ github.repository_owner }}/qumbra-explorer:sha-$SHORT" .
 
       - name: The binary is what we think it is, BEFORE publishing it

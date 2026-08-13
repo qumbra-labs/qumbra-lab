@@ -100,9 +100,37 @@ RUN cargo build --release --locked -p qumbra-node --features drill-cancel \
 #
 #   docker build -f deploy/docker/Dockerfile --target runtime-explorer \
 #     --build-arg GIT_REVISION=$(git rev-parse HEAD) \
+#     --build-arg EXPLORER_FEATURES=qumbra-node/rule-boundary-resume \
 #     -t ghcr.io/qumbra-labs/qumbra-explorer:<tag> .
+# EXPLORER_FEATURES is the explorer's half of the NODE_FEATURES story above, and it
+# exists because the two were NOT symmetric and that cost a day of stale public page.
+#
+# `qumbra-explorer` composes `qumbra-node` (its Cargo.toml) and has no `[features]`
+# and no halt code of its own, so it inherits that crate's DEFAULT -- which
+# `qumbra-node/Cargo.toml` documents as "arming is the default and resuming is the
+# flag". `NODE_FEATURES` reached `-p qumbra-node` only, so every explorer image built
+# after lab #325 halted at RULE_BOUNDARY_HEIGHT permanently, with no build-arg able to
+# change it. On 2026-08-12 that froze explorer.qumbra.org at 8,640 while the chain ran
+# on past it (deploy #127); rolling to a newer explorer tag could not help, because
+# every tag was armed.
+#
+#   empty (default)                        → armed: halts at the boundary
+#   qumbra-node/rule-boundary-resume       → resumes past it
+#
+# The `dep/feature` form is used deliberately: it needs no `[features]` section in
+# `qumbra-explorer`, so this adds a build knob without adding a crate-level API.
+# Verified: `cargo check -p qumbra-explorer --features
+# qumbra-node/rule-boundary-resume` finishes clean with no Cargo.toml change.
+#
+# 🔴 Threading this is the small fix. Whether an OBSERVER should be halt-aware at all
+# is the open question (deploy #127): it participates in nothing and signs nothing,
+# and its only job is to keep describing the chain. Arming buys it the honest
+# `halting`/`halted` vocabulary during a halt and costs it a freeze afterwards. This
+# arg makes the choice expressible; it does not make it.
+ARG EXPLORER_FEATURES=""
 FROM builder AS build-explorer
-RUN cargo build --release --locked -p qumbra-explorer \
+ARG EXPLORER_FEATURES
+RUN cargo build --release --locked -p qumbra-explorer ${EXPLORER_FEATURES:+--features "$EXPLORER_FEATURES"} \
     && cp target/release/qumbra-explorer /usr/local/bin/qumbra-explorer
 
 FROM debian:bookworm-slim AS runtime-explorer
