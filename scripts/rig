@@ -203,8 +203,26 @@ case "${1:-status}" in
     # log so the answer survives with the output it explains.
     printf 'rev=%s dirty=%s\n' "$TREE_REV" "$TREE_N" > "$LOCK/tree"
     { echo "rig: cwd $(pwd)"; tree_banner; } | tee "$LOGFILE" >&2
-    trap release EXIT INT TERM
     START="$(now)"
+    CMD="$*"   # captured: $* inside the on_signal function would be the trap's args
+    # A signal (a pkill, a Ctrl-C, a Monitor timeout) is NOT a clean rc=0 run:
+    # without this, the trap fired `release`, bash resumed to the manifest write
+    # below, and PIPESTATUS reflected the interrupted/tee-succeeded state -- so a
+    # KILLED suite recorded `rc=0`, i.e. a failure read as a pass (found by the
+    # #351 baton whose suite this very pkill killed). Split the traps: a signal
+    # records a KILLED row with a non-zero rc and exits it; only a clean fall-off
+    # reaches the real-rc write below. EXIT still releases the lock either way.
+    on_signal() {
+      local sig=$1 rc=$2
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$START" "$(now)" "$WHO" "KILLED($sig,rc=$rc)" "$LOGFILE" "$CMD" "$TREE_REV" "$TREE_N" >> "$MANIFEST"
+      echo "rig: KILLED by $sig (rc=$rc) at $(now) -- NOT a clean run" >&2
+      release
+      exit "$rc"
+    }
+    trap release EXIT
+    trap 'on_signal INT 130'  INT
+    trap 'on_signal TERM 143' TERM
     # tee passes stdout through unchanged, so callers that parse output keep
     # working; PIPESTATUS keeps the command's own exit code (bash-only, which
     # is why the shebang is bash and not sh). -a is load-bearing: the tree banner
