@@ -332,7 +332,7 @@ mod tests {
 
     /// Keccak-256 over the four golden serializations concatenated, in source so a
     /// blind file regeneration cannot make the goldens pass by itself.
-    const GOLDEN_DIGEST: &str = "838e671abb3e25687889b3cb974fa55db1d436e36bf511977fc813642b94cc50";
+    const GOLDEN_DIGEST: &str = "60782c21627e326fa4ad60e8a65f4690ad2223598aa9beebebeeb9b9ec6f7acb";
 
     fn hash32(first: u8) -> [u8; 32] {
         let mut h = [0u8; 32];

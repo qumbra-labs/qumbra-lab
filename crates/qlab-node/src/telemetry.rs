@@ -1362,7 +1362,7 @@ mod tests {
         assert_eq!(base.sid_field(), "-");
         assert_eq!(Telemetry::from_bytes(&base.to_bytes()).unwrap(), base);
         assert_eq!(base.to_bytes()[0], RPC_VERSION);
-        assert_eq!(RPC_VERSION, 0x05, "the issue #275 route bump (payload unchanged from #212's 0x04)");
+        assert_eq!(RPC_VERSION, 0x06, "the lab #367 arming bump (burned tail appended after #212's durable tail)");
 
         // Fully populated: finalized identity + this node's own signed variant.
         let full = base
@@ -1959,9 +1959,9 @@ mod tests {
         ));
 
         // The readable set is bounded and named, and it is not a `>=` comparison:
-        // `0x02` and an unknown future `0x06` are both refused by BOTH paths.
+        // `0x02` and an unknown future `0x07` are both refused by BOTH paths.
         assert_eq!(READABLE_TELEMETRY_VERSIONS, &[0x03, 0x04, 0x05, 0x06]);
-        for refused in [0x00u8, 0x01, 0x02, 0x06, 0xff] {
+        for refused in [0x00u8, 0x01, 0x02, 0x07, 0xff] {
             let mut bytes = live.to_bytes();
             bytes[0] = refused;
             assert!(
@@ -2044,7 +2044,11 @@ mod tests {
                 }]),
             Some((2864, 0x63)),
         );
-        let new = t.to_bytes();
+        // Strip the lab #367 burned tail (one u64 per supply row) so this test
+        // stays about the 0x04 durable-tail append alone; the burned tail has
+        // its own append test.
+        let full = t.to_bytes();
+        let new = &full[..full.len() - 8 * t.supply.len()];
         let old = v3_payload(&t);
         assert_eq!(&new[1..old.len()], &old[1..], "0x04 appends, it does not reshuffle");
         assert_eq!(

@@ -1820,8 +1820,9 @@ mod tests {
         let digest = keccak256(&bytes);
         assert_eq!(
             hex32(&digest),
-            "d478d958e0ad64f706c67f8777c6653416f008c68c6894ec4d9f308c00ba828e",
-            "GOLDEN digest — update ONLY with an intentional, documented framing change"
+            "dfa1d3dcd5f6e51cf5dea217de8eb15eab224ebe67965c6501320459c352d8cd",
+            "GOLDEN digest — update ONLY with an intentional, documented framing change \
+             (lab #367: RPC_VERSION 0x05 -> 0x06, the leaf stream's version byte moved)"
         );
 
         assert_eq!(TreeLeaves::from_bytes(&bytes).unwrap(), page, "and it round-trips");
