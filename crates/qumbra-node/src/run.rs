@@ -2760,6 +2760,9 @@ fn mempool_refusal_token(e: &qlab_node::MempoolError) -> &'static str {
             "discovery-not-canonical"
         }
         MempoolError::DiscoveryInvalid(_) => "discovery-does-not-bind",
+        MempoolError::RiderInvalid(BodyError::RiderMalformed { .. }) => "rider-malformed",
+        MempoolError::RiderInvalid(BodyError::RiderBeforeBoundary { .. }) => "rider-before-boundary",
+        MempoolError::RiderInvalid(_) => "rider-rule",
         MempoolError::ProofInvalid => "proof-invalid",
     }
 }

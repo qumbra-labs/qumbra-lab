@@ -510,6 +510,34 @@ pub fn check_op<V: NameView>(
     }
 }
 
+/// The mempool's rider leg (lab #367) — the same rules `validate_body_above`
+/// runs, minus the same-block tie (the pool admits one tx at a time, so
+/// `pending` is empty), returning the decoded op so the caller can price the
+/// fee split. Refusals are `BodyError`'s own so an admit-time rejection names
+/// exactly what block validation would.
+///
+/// This exists so the mempool and block validation **cannot disagree about a
+/// rider**, the property the discovery leg already guarantees and that #278
+/// exists to enforce. `height` is the prospective mining height
+/// (`tip_height + 1`); the boundary gate uses it, and `check_op` reads the
+/// registry `view` at it.
+pub fn names_admit_op<V: NameView>(
+    entry: &crate::body::TxEntry,
+    height: u64,
+    view: &V,
+) -> Result<Option<NameOp>, crate::body::BodyError> {
+    let op = decode_rider(&entry.rider)
+        .map_err(|err| crate::body::BodyError::RiderMalformed { index: 0, err })?;
+    let Some(op) = op else { return Ok(None) };
+    if !riders_active_above(NAME_RULE_BOUNDARY_HEIGHT, height) {
+        return Err(crate::body::BodyError::RiderBeforeBoundary { index: 0 });
+    }
+    let pending = std::collections::HashSet::new();
+    check_op(view, height, &op, &pending)
+        .map_err(|err| crate::body::BodyError::RiderRule { index: 0, err })?;
+    Ok(Some(op))
+}
+
 /// The registration term granted or extended by an op applied at `height`:
 /// a reveal registers to `height + NAME_TERM_BLOCKS`; a renewal extends one
 /// term from `max(height, current expiry)` (brief §1 step 5). Registry-side

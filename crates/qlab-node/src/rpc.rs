@@ -479,6 +479,9 @@ pub enum RejectReason {
     /// says the committed bytes themselves are malformed, non-canonical, or do
     /// not bind the declared commitments.
     DiscoveryInvalid,
+    /// The tx carries a name rider block validation would refuse (lab #367):
+    /// malformed, before the boundary, wrong fee split, or a rule failure.
+    RiderInvalid,
     /// The proof failed to verify under the injected verifier.
     ProofInvalid,
     // NOTE (issue #102): `ImmatureCoinbase` is gone. Maturity is enforced by the
@@ -647,7 +650,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
         // frozen §2 rule unreachable from the wallet RPC. It is now enforced by the
         // commitment tree's append schedule, so there is nothing to pass and no way
         // for this path to skip it.
-        match self.mempool.admit(tx, &self.node, verifier) {
+        match self.mempool.admit(tx, &self.node, verifier, self.node.names()) {
             Ok(_body_id) => {
                 self.discovery.insert(txid, discovery);
                 SubmitOutcome::Accepted(txid)
@@ -670,6 +673,9 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             }
             Err(MempoolError::DiscoveryInvalid(_)) => {
                 SubmitOutcome::Rejected(RejectReason::DiscoveryInvalid)
+            }
+            Err(MempoolError::RiderInvalid(_)) => {
+                SubmitOutcome::Rejected(RejectReason::RiderInvalid)
             }
             Err(MempoolError::ProofInvalid) => SubmitOutcome::Rejected(RejectReason::ProofInvalid),
         }

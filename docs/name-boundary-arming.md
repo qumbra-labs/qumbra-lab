@@ -23,30 +23,36 @@ attestation's `burned` column. Below the boundary — the entire chain until
 arming day — nothing changes, which is the property `commitment_at_with_no_boundary_is_v2_everywhere`
 locks.
 
-## 1. Preconditions (all SIX, in order — none is a formality)
+## 1. Preconditions (all SEVEN, in order — none is a formality)
 
 1. **The T2 gate is open**: the [#370] checklist is discharged and T1 public
    mining has been running long enough that FCFS registration is fair — the
    fairness argument (pre-public registration is insider-only registration) is
    recorded in [#367]'s early-activation discussion and is a Larry call, not an
    ops judgment.
-2. **[#375] is fixed and its test merged** — the frozen-boundary tie's losing
+2. **The mempool rider leg is landed** (this PR): `Mempool::admit` runs the
+   same rider rules `validate_body` does, so a registration cannot be admitted
+   that block validation would refuse — the #278 detonator a rider introduced
+   (a commit's fee equals `posted_fee`, so the bare fee check waved it through
+   while validation refused it) is closed and mutation-locked. Without this, a
+   single wallet Post-Commit before arming poisons the mempool.
+3. **[#375] is fixed and its test merged** — the frozen-boundary tie's losing
    side finalizing a checkpoint it does not hold was found ON boundary day and
    must not attend the next one.
-3. **The [#369] standing drill exists and covers a BODY-FORMAT boundary** — the
+4. **The [#369] standing drill exists and covers a BODY-FORMAT boundary** — the
    8,640 halt changed a validation rule; this one changes the wire. The drill
    must run a committee to a halt across a v2→v3 body switch in-suite (the
    `validate_body_above` / `commitment_above` seams exist for exactly this).
-4. **The `0x06` telemetry wire is deployed fleet-wide** (this PR's bump: the
+5. **The `0x06` telemetry wire is deployed fleet-wide** (this PR's bump: the
    `burned` tail + explorer column). Roll it with any ordinary image refresh —
    it is inert data plumbing; `READABLE_TELEMETRY_VERSIONS` keeps opview sighted
    during the roll. Verify: `curl explorer/v1/health.json | jq '.supply.epochs[0].burned'`
    answers `0`, not `null`.
-5. **Larry stamps the boundary height on [#367]** — a halt-height comfortably
+6. **Larry stamps the boundary height on [#367]** — a halt-height comfortably
    ahead (the 8,640 re-stamp gave ~4.5 h of runway and it was enough only
    because three defects got fixed live; give this one ≥2 days), at an epoch
    boundary if convenient but nothing requires it.
-6. **Fee table re-ratified at the stamp** — the constants merged 2026-08-12
+7. **Fee table re-ratified at the stamp** — the constants merged 2026-08-12
    (1/32/128/512/2048 QMB by length, 365+90 epochs, 8/2,304 window). If QMB's
    purchasing reality moved since, this is the moment to restate or restamp;
    after arming they move only at later boundaries.
