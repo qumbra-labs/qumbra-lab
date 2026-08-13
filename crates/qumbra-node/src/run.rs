@@ -2377,24 +2377,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// 1. **The cadence has come round** ([`SNAPSHOT_INTERVAL`]). The tick is
     ///    consumed whether or not a write follows, so the checks below cost one
     ///    evaluation per interval and not one per loop iteration.
-    /// 2. **This node is not replaying.** `state_lag().blocks() == 0` — the #130
-    ///    (a) gap between the state machine's applied tip and fork choice's header
-    ///    tip. The from-genesis replay #359 measured happens inside
-    ///    `qlab_node::Node::open`, *before* this loop exists, so it needs no gate;
-    ///    what this gate covers is the runtime catch-up, where the node is walking
-    ///    historical bodies toward a tip it already knows.
+    /// 2. **Runtime catch-up is included.** `state_lag().blocks()` may be non-zero:
+    ///    [`Self::save_snapshot`] serialises the state machine's own applied chain,
+    ///    not fork choice's header tip, so the snapshot is a consistent prefix at
+    ///    `state_lag().state_tip`. This bounds runtime catch-up loss to one cadence
+    ///    interval instead of the whole catch-up, and also covers the #200
+    ///    unobtainable-body case where an otherwise healthy node can remain at
+    ///    `slag > 0` (`uex=1` is the tell).
     ///
-    ///    🔴 **Two consequences worth naming rather than discovering.** A host
-    ///    catching up on a live chain writes nothing for the whole catch-up, so
-    ///    this cadence does **not** rescue node3's own shape — it prevents the
-    ///    *next* node3, by guaranteeing a healthy host carries a snapshot at most
-    ///    one interval old however it dies. And the #200 unobtainable-body
-    ///    exemption pins a healthy mining node at `slag > 0`, where it will also
-    ///    write nothing (`uex=1` on the same line is the tell). A snapshot written
-    ///    at `slag > 0` would be *consistent* either way — [`Self::save_snapshot`]
-    ///    serialises the state machine's own applied chain, not fork choice's — so
-    ///    this gate is the task book's cost/simplicity call, not a correctness
-    ///    one, and it is recorded on issue #359 as a disagreement with grounds.
+    ///    🔴 **This does not cover `Node::open` replay.** The from-genesis replay
+    ///    #359 measured happens inside `qlab_node::Node::open`, before this loop
+    ///    and its cadence exist. Persisting progress during that startup replay is
+    ///    a separate fix; this rule only makes runtime catch-up prefixes durable.
     /// 3. **The applied height differs from the durable one.** Idempotence: a
     ///    quiet node rewrites nothing, which is what keeps the cadence free on a
     ///    halted or stalled chain. It is `!=` and not `>` deliberately — a rewind
@@ -2416,13 +2410,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             return;
         }
         self.last_snapshot_tick = Instant::now();
-        // One read of the one definition of "how far behind is my state machine"
-        // (#130 (a)), shared with the telemetry line — a gate and a published field
-        // that could disagree about the same fact would be two definitions.
+        // One read supplies the applied prefix this cadence makes durable. The
+        // snapshot is consistent even when the same value reports runtime lag:
+        // it serialises this state-machine tip, not fork choice's header tip.
         let lag = self.p2p.node().state_lag();
-        if lag.blocks() != 0 {
-            return;
-        }
         let applied = lag.state_tip;
         if self.durable_snapshot.height() == Some(applied) {
             return;
@@ -4119,19 +4110,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// **Issue #359 S5 (b) — a replaying node writes none until synced.**
+    /// **Issue #359 follow-up S3 — runtime catch-up writes a consistent prefix.**
     ///
-    /// B is the #106/#130 shape: it has taken the network's *headers* to height 3
-    /// and applied no body, so `stip=0 slag=3` — the run-loop state that stands in
-    /// for "replaying". Every cadence tick in that state must write nothing. Once
-    /// the bodies land and the gap closes, the very next tick writes.
-    ///
-    /// 🔴 What this test also pins, and what the PR body argues about: while B is
-    /// in this state it is accumulating exactly the replay a restart would have to
-    /// redo, and the gate means none of it is ever made durable. That is the
-    /// behaviour the task book specified and it is deliberate here, not accidental.
+    /// B has taken the network's headers to height 3 and applied only the body at
+    /// height 1, so `stip=1 slag=2`. A cadence tick must write height 1 while B is
+    /// still catching up. Restoring the old `lag.blocks() != 0` gate makes the
+    /// file-exists assertion fail, which mutation-checks the exact rule change.
     #[test]
-    fn a_replaying_node_writes_no_snapshot_until_it_is_synced() {
+    fn runtime_catch_up_writes_a_snapshot_of_its_applied_prefix() {
         use qlab_p2p::n1::{BlockIngest, IngestOutcome};
 
         let a_port = free_port();
@@ -4155,64 +4141,90 @@ mod tests {
         b.set_snapshot_interval(Duration::ZERO); // every call is a cadence tick
         let snap_path = bcfg.data_dir.join(qlab_node::SNAPSHOT);
 
-        // The cadence is ticked ONLY while B is behind, and that is what makes this
-        // a test of the replaying gate rather than of the idempotence gate: with no
-        // snapshot on disk, the "applied height differs from the durable one" check
-        // is satisfied by any height at all, so the write can only be refused by the
-        // `slag != 0` gate. (A tick taken before B hears a header would write a
-        // legitimate height-0 snapshot and mask exactly that — B is genuinely
-        // synced-with-itself at that moment.)
-        let mut ticks_while_behind = 0;
+        // First take only the header chain. Do not tick the cadence before B hears
+        // it: at that instant B is legitimately synced with itself and could write
+        // a height-0 snapshot, masking the catch-up case this test exists to pin.
         for _ in 0..60 {
             a.step_once();
             b.step_once();
-            if b.p2p().node().state_lag().blocks() > 0 {
-                b.maintain_snapshot();
-                ticks_while_behind += 1;
-                assert!(
-                    !snap_path.exists(),
-                    "🔴 a node still applying history wrote a snapshot: slag={}",
-                    b.p2p().node().state_lag().blocks()
-                );
-                assert_eq!(b.durable_snapshot(), qlab_node::SnapshotOnDisk::Absent);
-            }
             if b.p2p().sync_phase().is_synced() && b.tip_height() == 3 {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(b.tip_height(), 3, "B took the network's header chain");
-        assert!(ticks_while_behind > 0, "the replaying window was genuinely exercised");
-        let line = b.telemetry_sample();
-        assert!(line.contains(" stip=0 slag=3"), "{line}");
-        assert!(line.contains(" snap=none"), "and the field says so on the line: {line}");
+        assert_eq!(b.p2p().node().state_lag().blocks(), 3, "no body is applied yet");
+        assert_eq!(b.durable_snapshot(), qlab_node::SnapshotOnDisk::Absent);
 
-        // The bodies arrive; the gap closes; the next tick writes.
+        // Apply exactly one historical body. B is now actively catching up, with
+        // a non-zero applied prefix and a non-zero lag to the known header tip.
         let chain = a.p2p().node().chain();
-        let mined: Vec<_> =
-            (1..=3).map(|h| *chain.header(&chain.main_chain()[h]).expect("header")).collect();
-        for header in &mined {
-            let stored =
-                a.state().chain().block(&header.header_hash()).expect("A holds the body").clone();
-            assert_eq!(
-                b.p2p_mut().node_mut().ingest_block(*header, stored.body()),
-                IngestOutcome::Duplicate,
-                "the header was already held"
-            );
-        }
-        assert_eq!(b.p2p().node().state_lag().blocks(), 0, "caught up");
+        let header = *chain.header(&chain.main_chain()[1]).expect("height-1 header");
+        let stored =
+            a.state().chain().block(&header.header_hash()).expect("A holds the body").clone();
+        assert_eq!(
+            b.p2p_mut().node_mut().ingest_block(header, stored.body()),
+            IngestOutcome::Duplicate,
+            "the header was already held"
+        );
+        let lag = b.p2p().node().state_lag();
+        assert_eq!(lag.state_tip, 1, "one historical body is applied");
+        assert_eq!(lag.blocks(), 2, "B remains behind the known header tip");
+
+        // The cadence writes that consistent prefix despite the remaining lag.
         b.maintain_snapshot();
+        assert!(snap_path.exists(), "🔴 runtime catch-up must write before it is synced");
         assert_eq!(
             b.durable_snapshot(),
-            qlab_node::SnapshotOnDisk::At { applied_height: 3 },
-            "the first tick after catching up writes"
+            qlab_node::SnapshotOnDisk::At { applied_height: lag.state_tip },
+            "the durable height is the state machine's applied prefix"
         );
-        assert!(snap_path.exists());
+        assert_eq!(
+            qlab_node::snapshot_on_disk(&bcfg.data_dir).unwrap(),
+            qlab_node::SnapshotOnDisk::At { applied_height: lag.state_tip },
+            "the file on disk carries the same applied prefix"
+        );
+        let line = b.telemetry_sample();
+        assert!(line.contains(" stip=1 slag=2"), "the test exercised catch-up: {line}");
+        assert!(line.contains(" snap=1"), "the catch-up prefix is visible: {line}");
 
         drop(a);
         drop(b);
         let _ = std::fs::remove_dir_all(&abase);
         let _ = std::fs::remove_dir_all(&bbase);
+    }
+
+    /// **Issue #359 follow-up S2 — `Node::open` replay remains out of scope.**
+    ///
+    /// Reopening a snapshotless data dir replays its block log before the run loop
+    /// exists. The cadence therefore cannot fire there, and this follow-up does not
+    /// claim to persist progress during that startup replay.
+    #[test]
+    fn node_open_replay_still_writes_no_snapshot_before_the_loop_exists() {
+        let (config, genesis, base) = rig("i359_open_replay", true);
+        let snap_path = config.data_dir.join(qlab_node::SNAPSHOT);
+        {
+            let mut node =
+                RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+            node.set_mine_interval(Duration::ZERO);
+            for _ in 0..3 {
+                assert!(node.try_mine());
+            }
+            assert_eq!(node.tip_height(), 3);
+            assert!(!snap_path.exists(), "direct block application is not the cadence");
+        }
+
+        let reopened =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        assert_eq!(reopened.tip_height(), 3, "Node::open replayed the block log");
+        assert_eq!(reopened.durable_snapshot(), qlab_node::SnapshotOnDisk::Absent);
+        assert!(
+            !snap_path.exists(),
+            "Node::open replay happens before maintain_snapshot can run"
+        );
+
+        drop(reopened);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// **Issue #359 S5 (c) — the telemetry field round-trips**, in all three of its
