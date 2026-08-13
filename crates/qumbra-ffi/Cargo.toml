@@ -23,7 +23,7 @@ publish.workspace = true
 [lib]
 name = "qumbra_ffi"
 # staticlib for the xcframework; rlib so Rust tests can call the ABI.
-crate-type = ["staticlib", "rlib"]
+crate-type = ["staticlib", "cdylib", "rlib"]  # cdylib: the .wasm module (and later Android .so)
 
 [dependencies]
 qlab-wallet = { path = "../qlab-wallet" }
@@ -36,3 +36,9 @@ qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
 qlab-note = { path = "../qlab-note" }
 # The scan's decoy rng is seeded from bytes the platform passes in.
 rand = "0.10"
+
+# wasm32 (the browser-extension shell): getrandom needs the JS backend wired
+# explicitly (crypto.getRandomValues). Build with
+#   RUSTFLAGS='--cfg getrandom_backend="wasm_js"'
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }

@@ -42,6 +42,11 @@ qmb_wallet_t *qmb_wallet_from_parts(uint8_t version, const uint8_t *entropy32,
 void qmb_wallet_free(qmb_wallet_t *w);
 void qmb_string_free(char *s);
 
+/* Caller-side input buffers (the WASM host's only way to hand us a string).
+ * Pair qmb_alloc with qmb_dealloc; unrelated to qmb_string_free. */
+uint8_t *qmb_alloc(size_t len);
+void qmb_dealloc(uint8_t *p, size_t len);
+
 /* --- key material (explicit) -------------------------------------------- */
 
 /* The ONLY key-material return in this ABI — the explicit reveal. */
@@ -105,6 +110,35 @@ char *qmb_wallet_scan_report_over_fetch(const qmb_wallet_t *w,
                                         const uint64_t *indices, size_t n_indices,
                                         const uint8_t *rng_seed32,
                                         qmb_fetch_fn fetch, void *fetch_ctx);
+
+/* --- the pumpable scan (lab #395) ---------------------------------------- */
+
+/* The browser/WASM shell's scan. qmb_fetch_fn above is synchronous and a
+ * browser has no synchronous fetch to put behind it, so here the SHELL pumps:
+ * alternate qmb_scan_step with qmb_scan_supply / qmb_scan_supply_err from any
+ * async transport. Same one orchestration as both sync paths — what counts as
+ * detected/opened/unopened cannot drift.
+ *
+ * qmb_scan_step returns
+ *    1  NEED: *out is the path to fetch (a qmb_string_free string);
+ *    0  DONE: *out is the rendered report — crosses ONCE, then the handle
+ *       answers -1;
+ *   -1  NULL/finished handle or NULL out.
+ *
+ * Supplied bytes are COPIED — the caller keeps its buffer (a WASM host writes
+ * into qmb_alloc memory and qmb_dealloc's it afterwards; nothing here is the
+ * malloc/free contract of qmb_fetch_fn). A reason given to qmb_scan_supply_err
+ * survives into the report: UNAVAILABLE, never a zero. */
+typedef struct qmb_scan_t qmb_scan_t;
+
+qmb_scan_t *qmb_scan_new(const qmb_wallet_t *w, const char *source_label,
+                         uint64_t from, uint64_t to,
+                         const uint64_t *indices, size_t n_indices,
+                         const uint8_t *rng_seed32);
+int32_t qmb_scan_step(qmb_scan_t *s, char **out);
+void qmb_scan_supply(qmb_scan_t *s, const uint8_t *body, size_t len);
+void qmb_scan_supply_err(qmb_scan_t *s, const char *reason);
+void qmb_scan_free(qmb_scan_t *s);
 
 #ifdef __cplusplus
 }
