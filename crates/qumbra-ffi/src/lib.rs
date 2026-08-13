@@ -21,10 +21,10 @@
 
 pub mod report;
 
-use std::ffi::{c_char, CStr, CString};
+use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 
-use qlab_cbserver::client::{light_client_scan, ScanConfig};
+use qlab_cbserver::client::{light_client_scan, light_client_scan_with, ScanConfig};
 use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
 use qlab_wallet::Wallet;
 use rand::rngs::StdRng;
@@ -225,6 +225,131 @@ pub unsafe extern "C" fn qmb_wallet_address_short(
     out_string((*w).wallet.address_at_index(index).short().encode())
 }
 
+/// Fetch one scan path — **the transport the shell owns**.
+///
+/// Exists because the edge is https-only and this crate's socket path is
+/// plaintext-only, deliberately (issue #297: TLS in `qlab-cbserver` would link
+/// rustls into `qlab-node`, and so into the consensus node). Rather than give
+/// iOS its own rustls, the shell lends its transport: `URLSession` on iOS gets
+/// https and App Transport Security from the platform, exactly as
+/// `qmb_wallet_from_entropy` takes entropy from the platform instead of
+/// inventing it. Same argument, different resource.
+///
+/// Return `0` on success, having stored the body in `*out_body` / `*out_len`.
+/// Ownership **transfers to this crate**, which releases it with `free` — so
+/// the buffer must come from `malloc` (Swift: `malloc`, or
+/// `UnsafeMutableRawPointer.allocate` is NOT interchangeable here).
+///
+/// Return nonzero on failure, optionally storing a NUL-terminated reason in
+/// `*out_err` under the same `malloc`/`free` contract. A failed path is one
+/// `Err` inside the scan, which the report renders as UNAVAILABLE rather than
+/// as a zero — the whole point of the discipline this ABI serves.
+pub type QmbFetchFn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    path_and_query: *const c_char,
+    out_body: *mut *mut u8,
+    out_len: *mut usize,
+    out_err: *mut *mut c_char,
+) -> i32;
+
+// Declared rather than pulled in via the `libc` crate: this crate is a
+// hand-written ABI whose whole claim is that it can be read line by line, and
+// one symbol is cheaper to audit than a dependency edge. Same allocator as
+// Swift's `malloc` on every Apple platform.
+extern "C" {
+    fn free(p: *mut c_void);
+}
+
+/// The scan, over a caller-supplied transport. `source_label` is what the
+/// report NAMES as its source — this crate no longer knows the transport, so
+/// it cannot infer it, and a report must say where its numbers came from.
+///
+/// Otherwise identical to [`qmb_wallet_scan_report`], and provably so: both
+/// route into `light_client_scan_with`, so "detected", "opened" and
+/// "unopened" cannot drift between the two paths.
+///
+/// # Safety
+/// `w` live; `source_label` NUL-terminated UTF-8; `indices` points to
+/// `n_indices` u64s; `rng_seed32` points to 32 readable bytes; `fetch` obeys
+/// the contract on [`QmbFetchFn`].
+#[no_mangle]
+pub unsafe extern "C" fn qmb_wallet_scan_report_over_fetch(
+    w: *const WalletState,
+    source_label: *const c_char,
+    from: u64,
+    to: u64,
+    indices: *const u64,
+    n_indices: usize,
+    rng_seed32: *const u8,
+    fetch: Option<QmbFetchFn>,
+    fetch_ctx: *mut c_void,
+) -> *mut c_char {
+    if w.is_null() || source_label.is_null() || indices.is_null() || rng_seed32.is_null() {
+        return ptr::null_mut();
+    }
+    let Some(fetch) = fetch else { return ptr::null_mut() };
+    let label = match CStr::from_ptr(source_label).to_str() {
+        Ok(u) => u,
+        Err(_) => return ptr::null_mut(),
+    };
+    let idxs = std::slice::from_raw_parts(indices, n_indices);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(std::slice::from_raw_parts(rng_seed32, 32));
+    let mut rng = StdRng::from_seed(seed);
+
+    // Bridge the C callback to the closure `light_client_scan_with` wants. A
+    // failed fetch becomes an Err(String), which is exactly the contract the
+    // socket path produces — so the report cannot tell the two apart, and a
+    // transport failure never reads as an empty wallet.
+    let mut bridge = |path: &str| -> Result<Vec<u8>, String> {
+        let c_path = CString::new(path).map_err(|_| "path contains NUL".to_string())?;
+        let mut body: *mut u8 = ptr::null_mut();
+        let mut len: usize = 0;
+        let mut err: *mut c_char = ptr::null_mut();
+        let rc = fetch(fetch_ctx, c_path.as_ptr(), &mut body, &mut len, &mut err);
+        if rc != 0 {
+            let reason = if err.is_null() {
+                format!("fetch failed (rc {rc})")
+            } else {
+                let s = CStr::from_ptr(err).to_string_lossy().into_owned();
+                free(err as *mut c_void);
+                s
+            };
+            if !body.is_null() {
+                free(body as *mut c_void);
+            }
+            return Err(reason);
+        }
+        if body.is_null() {
+            return Err("fetch reported success with no body".to_string());
+        }
+        let out = std::slice::from_raw_parts(body, len).to_vec();
+        free(body as *mut c_void);
+        Ok(out)
+    };
+
+    let state = &*w;
+    let mut scans = Vec::with_capacity(n_indices);
+    for &idx in idxs {
+        let d = state.wallet.diversifier_at_index(idx);
+        let kp = state.wallet.diversified_keypair(&d);
+        let short = state.wallet.address_at_index(idx).short().encode();
+        match light_client_scan_with(&mut bridge, &kp.dk, from, to, ScanConfig::default(), &mut rng)
+        {
+            Ok(outcome) => scans.push(DivScan::from_outcome(idx, short, &outcome)),
+            Err(e) => scans.push(DivScan {
+                index: idx,
+                address_short: short,
+                completeness: qlab_cbserver::client::Completeness::Complete,
+                spendable_bessel: 0,
+                shadowed_bessel: 0,
+                never_started: Some(e.to_string()),
+            }),
+        }
+    }
+    out_string(report::render(&scans, (from, to), label))
+}
+
 /// Run the light-client scan for `indices` against `base_url` over
 /// `[from, to]` and return the rendered report ([`report::render`] — the
 /// UNAVAILABLE discipline, no partial totals). Blocking; the shell calls it
@@ -281,6 +406,146 @@ pub unsafe extern "C" fn qmb_wallet_scan_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The shell's side of the fetch contract, exercised for real: malloc'd
+    // buffers handed over to the library. Deliberately NOT CString::into_raw —
+    // that is Rust's allocator, and this library releases with free(), so
+    // mixing them would be undefined behaviour. Swift has the same trap
+    // (`malloc`, not `UnsafeMutableRawPointer.allocate`), which is why the
+    // header says so and why the test demonstrates it rather than describing it.
+    extern "C" {
+        fn malloc(n: usize) -> *mut c_void;
+    }
+
+    unsafe fn malloc_copy(bytes: &[u8]) -> *mut u8 {
+        let p = malloc(bytes.len().max(1)) as *mut u8;
+        assert!(!p.is_null());
+        ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+        p
+    }
+
+    /// A transport that always fails, the way a phone with no signal does.
+    unsafe extern "C" fn fetch_always_fails(
+        ctx: *mut c_void,
+        _path: *const c_char,
+        _out_body: *mut *mut u8,
+        _out_len: *mut usize,
+        out_err: *mut *mut c_char,
+    ) -> i32 {
+        if !ctx.is_null() {
+            *(ctx as *mut u32) += 1; // count the calls
+        }
+        let msg = b"the network is unreachable\0";
+        *out_err = malloc_copy(msg) as *mut c_char;
+        1
+    }
+
+    /// A transport that succeeds but answers with bytes that are not a compact
+    /// range — a wrong server, or an edge that returned an error page with 200.
+    unsafe extern "C" fn fetch_returns_garbage(
+        _ctx: *mut c_void,
+        _path: *const c_char,
+        out_body: *mut *mut u8,
+        out_len: *mut usize,
+        _out_err: *mut *mut c_char,
+    ) -> i32 {
+        let junk = b"<html>404 not found</html>";
+        *out_body = malloc_copy(junk);
+        *out_len = junk.len();
+        0
+    }
+
+    unsafe fn scan_over_fetch(f: QmbFetchFn, ctx: *mut c_void) -> String {
+        let entropy = [7u8; 32];
+        let w = qmb_wallet_from_entropy(entropy.as_ptr());
+        assert!(!w.is_null());
+        let label = CString::new("https://seed.example.org").unwrap();
+        let indices: [u64; 1] = [0];
+        let seed = [3u8; 32];
+        let out = qmb_wallet_scan_report_over_fetch(
+            w,
+            label.as_ptr(),
+            0,
+            10,
+            indices.as_ptr(),
+            1,
+            seed.as_ptr(),
+            Some(f),
+            ctx,
+        );
+        assert!(!out.is_null());
+        let s = CStr::from_ptr(out).to_str().unwrap().to_string();
+        qmb_string_free(out);
+        qmb_wallet_free(w);
+        s
+    }
+
+    /// A transport failure must reach the report as UNAVAILABLE carrying the
+    /// shell's own reason — never as a zero. This is the same guarantee the
+    /// socket path gives; routing through a caller-supplied transport must not
+    /// weaken it, because the shell's transport is the likelier one to fail.
+    #[test]
+    fn a_failed_shell_transport_renders_unavailable_and_never_a_zero() {
+        unsafe {
+            let mut calls: u32 = 0;
+            let report = scan_over_fetch(fetch_always_fails, &mut calls as *mut u32 as *mut c_void);
+
+            assert!(calls > 0, "the library must actually use the shell's transport");
+            assert!(report.contains("UNAVAILABLE"), "{report}");
+            assert!(
+                report.contains("the network is unreachable"),
+                "the shell's own reason must survive into the report: {report}"
+            );
+            assert!(
+                !report.contains("TOTAL spendable: 0"),
+                "a transport failure must never render as an empty wallet: {report}"
+            );
+            // And it must name where it was pointed, since the library can no
+            // longer infer the transport.
+            assert!(report.contains("https://seed.example.org"), "{report}");
+        }
+    }
+
+    /// 200-with-nonsense is the failure mode an https edge actually produces —
+    /// a captive portal, a proxy error page, the wrong host. It must refuse,
+    /// not decode into a confident zero.
+    #[test]
+    fn a_successful_fetch_of_garbage_is_refused_not_believed() {
+        unsafe {
+            let report = scan_over_fetch(fetch_returns_garbage, ptr::null_mut());
+            assert!(report.contains("UNAVAILABLE"), "{report}");
+            assert!(
+                !report.contains("TOTAL spendable: 0"),
+                "unparseable bytes must not become a zero balance: {report}"
+            );
+        }
+    }
+
+    /// A NULL callback is a programming error in the shell, not a reason to
+    /// scan nothing and report success.
+    #[test]
+    fn a_missing_transport_returns_null_rather_than_an_empty_report() {
+        unsafe {
+            let entropy = [7u8; 32];
+            let w = qmb_wallet_from_entropy(entropy.as_ptr());
+            let label = CString::new("http://unused").unwrap();
+            let indices: [u64; 1] = [0];
+            let seed = [3u8; 32];
+            let out = qmb_wallet_scan_report_over_fetch(
+                w,
+                label.as_ptr(),
+                0,
+                1,
+                indices.as_ptr(),
+                1,
+                seed.as_ptr(),
+                None,
+                ptr::null_mut(),
+            );
+            assert!(out.is_null(), "no transport means no report, not an empty one");
+            qmb_wallet_free(w);
+        }
+    }
 
     /// Call the ABI the way Swift will: raw pointers, C strings, explicit frees.
     #[test]
@@ -397,8 +662,12 @@ mod tests {
                     .chars()
                     .take_while(|c| c.is_alphanumeric() || *c == '_')
                     .collect();
+                // Types, not functions — a closed list on purpose. Widening
+                // this to a prefix match would let an undeclared function slip
+                // through, which is the one thing this half of the test is for.
+                const TYPES: [&str; 2] = ["qmb_wallet_t", "qmb_fetch_fn"];
                 assert!(
-                    exported.contains(&name.as_str()) || name == "qmb_wallet_t",
+                    exported.contains(&name.as_str()) || TYPES.contains(&name.as_str()),
                     "header declares `{name}` which lib.rs does not export"
                 );
             }
