@@ -58,12 +58,12 @@ use qlab_wallet::address::Address;
 
 use crate::bundle::WitnessBundle;
 use crate::net::{
-    self, HttpAnchorSource, HttpLeafSource, HttpNullifierSource, SubmitAnswer, SubmitClass,
+    self, HttpAnchorSource, HttpNullifierSource, SubmitAnswer, SubmitClass,
 };
-use crate::send::{os_rng, prove_bundle, SendArtifact, Spendable};
-use crate::spent::{fetch_spent, subtract_spent, SpentSet};
+use crate::send::{os_rng, prove_bundle, SendArtifact};
+use crate::spent::{fetch_spent, SpentSet};
 use crate::store::WalletDir;
-use crate::sync::{hex32, sync_and_select, AnchorSource, Anchors};
+use crate::sync::{hex32, AnchorSource, Anchors};
 
 /// What the caller asked for. Separate from the flow so a surface can validate
 /// and present a request before anything touches the network.
@@ -259,88 +259,50 @@ fn select_with_rng(
         scanned.push((idx, outcome));
     }
 
-    // ---- Selection skips what the chain already spent (lab #314). ------------
-    //
-    // Without this the wallet would pick a note it spent an hour ago, pay ~3 s
-    // and ~12 GB to prove a statement about it, and be refused `nullifier-spent`
-    // at the node. An UNAVAILABLE stream refuses the whole send rather than
-    // guessing: a spend built on "I could not check" is exactly that wasted proof.
-    let outputs =
-        crate::scan::widest_range(scanned.iter().map(|(_, o)| o.stats.compact_range_served));
-    let spent_set =
-        fetch_spent(&HttpNullifierSource::new(req.url), 0, req.scan_to).map_err(|e| {
-            SendError::Refused(format!(
-                "{e} — refusing to select inputs this wallet may already have spent"
-            ))
-        })?;
-    spent_set.covers_outputs(outputs).map_err(|e| {
-        SendError::Refused(format!(
-            "{e} — refusing to select inputs this wallet may already have spent"
-        ))
-    })?;
-
-    let mut spendables: Vec<Spendable> = Vec::new();
-    let mut skipped = 0usize;
-    for (idx, outcome) in &scanned {
-        let report = subtract_spent(wallet, *idx, &outcome.notes, &spent_set);
-        skipped += report.spent.len();
-        for ln in &report.spendable {
-            spendables.push(Spendable {
-                div_index: *idx,
-                value: ln.detected.note.value,
-                rho: ln.detected.note.rho,
-                rseed: ln.detected.note.rseed,
-            });
+    // ---- Everything after the scan is the ONE phase-1 orchestration — the
+    // caller-pumped driver (lab #399). This synchronous flow is its pump: the
+    // spent-subtraction (lab #314), the witness source's twin refusals (see
+    // `sync`'s module docs), the selection and the witness build all live in
+    // [`crate::driver::SelectDriver`], and there is no second copy to drift.
+    let leaves_path = req.dir.join(crate::sync::LEAVES_FILE);
+    let held =
+        crate::sync::load_cache(&leaves_path).map_err(|e| SendError::Refused(e.to_string()))?;
+    let mut driver = crate::driver::SelectDriver::new(
+        wallet.clone(),
+        req.recipient.clone(),
+        req.amount,
+        req.name_op.cloned(),
+        scanned,
+        held,
+        req.scan_to,
+    );
+    let mut persisted = false;
+    loop {
+        let step = driver.step(rng);
+        for ev in driver.take_events() {
+            on(ev);
+        }
+        // Persist the caught-up tree at the same point `sync_tree` used to —
+        // after the leaf stream completes, before the anchor fetch.
+        if !persisted {
+            if let Some(tree) = driver.tree() {
+                crate::sync::persist_cache(&leaves_path, tree)
+                    .map_err(|e| SendError::Refused(e.to_string()))?;
+                persisted = true;
+            }
+        }
+        match step {
+            crate::driver::SelectStep::Need { endpoint, path } => {
+                let base = match endpoint {
+                    crate::driver::SelectEndpoint::Scan => req.url,
+                    crate::driver::SelectEndpoint::Node => req.node_url,
+                };
+                driver.supply(net::http_get(base, &path).map_err(|e| e.to_string()));
+            }
+            crate::driver::SelectStep::Done(bundle) => return Ok(*bundle),
+            crate::driver::SelectStep::Failed(why) => return Err(SendError::Refused(why)),
         }
     }
-    on(SendStep::Selected {
-        spendable: spendables.len(),
-        skipped_spent: skipped,
-    });
-
-    if spendables.is_empty() {
-        return Err(SendError::Refused(format!(
-            "no spendable notes: the scan of 0..={} found nothing this wallet can spend \
-             ({skipped} note(s) it found are already spent). If you expect a coinbase, it is not \
-             spendable until it matures (frozen §2, COINBASE_MATURITY_BLOCKS in qlab-node); if \
-             you expect a received note, check that its address index is allocated here.",
-            req.scan_to
-        )));
-    }
-
-    // ---- The witness source. Both halves refuse by name and neither is
-    // skippable (see `sync`'s module docs). -----------------------------------
-    let (synced, anchor) = sync_and_select(
-        req.dir,
-        &HttpLeafSource::new(req.node_url),
-        &HttpAnchorSource::new(req.node_url),
-    )
-    .map_err(|e| SendError::Refused(e.to_string()))?;
-    on(SendStep::Tree {
-        held: synced.count,
-        fetched: synced.fetched,
-        anchor_count: anchor.count,
-        anchor_root: hex32(&anchor.root),
-        node_tip: anchor.tip_height,
-        finalized: anchor.finalized_height,
-        anchor_behind: anchor.leaves_behind_local,
-    });
-
-    crate::send::build_bundle(
-        wallet,
-        &spendables,
-        req.recipient,
-        req.amount,
-        &synced.tree,
-        anchor.count,
-        anchor.tip_height,
-        recipient_short,
-        outputs,
-        spent_set.covered,
-        req.name_op,
-        rng,
-    )
-    .map_err(SendError::Refused)
 }
 
 /// Fresh public chain facts supplied to the pure prover phase. Fetching them is
@@ -559,6 +521,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::send::Spendable;
     use std::cell::RefCell;
     use std::io::{Read, Write};
     use std::net::TcpListener;

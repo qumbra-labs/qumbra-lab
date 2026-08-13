@@ -60,6 +60,7 @@
 
 pub mod bundle;
 pub mod contacts;
+pub mod driver;
 pub mod envelope;
 pub mod history;
 pub mod names;
