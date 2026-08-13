@@ -44,7 +44,13 @@ RUN cargo build --release --locked -p qumbra-node ${NODE_FEATURES:+--features "$
 # graph — plonky3 and randomx-rs are already built for qumbra-node above — so this is
 # a cheap incremental build, not a second full one. `entrypoint.sh faucet` runs it
 # alongside the four nodes on a KEYLESS node of its own (testnet-plan.md §6.2).
-RUN cargo build --release --locked -p qumbra-faucet \
+# FAUCET_FEATURES is the faucet's half of the NODE_FEATURES story (issue #397):
+# qumbra-faucet embeds a keyless node, and without the resume feature that node
+# is ARMED and halts at the emission boundary forever — the public faucet sat at
+# 8640 for a day because this build had no features. Pass, for the resume image:
+#   --build-arg FAUCET_FEATURES=qumbra-node/rule-boundary-resume
+ARG FAUCET_FEATURES=""
+RUN cargo build --release --locked -p qumbra-faucet ${FAUCET_FEATURES:+--features "$FAUCET_FEATURES"} \
     && cp target/release/qumbra-faucet /usr/local/bin/qumbra-faucet
 
 # ── halt-height drill binaries (issue #74) ──────────────────────────────────
