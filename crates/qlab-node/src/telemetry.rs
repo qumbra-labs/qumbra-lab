@@ -102,6 +102,14 @@ const DURABLE_HEAD: u8 = 2;
 /// [`DurableView::Unavailable`] in it.
 pub const DURABLE_HEAD_SINCE_VERSION: u8 = 0x04;
 
+/// The first [`RPC_VERSION`] whose payload carries the per-epoch **burned**
+/// tail (lab #367 arming prep): one u64 per supply row, appended at the END of
+/// the payload so every earlier version's bytes are an exact prefix (the #212
+/// append discipline). Below it the tail is simply not there — a 0x05 host has
+/// no burn column, which is a different fact from "zero burned", and the
+/// version byte is what keeps the two apart on an operator's screen.
+pub const BURNED_SINCE_VERSION: u8 = 0x06;
+
 /// **The telemetry wire versions a READER in this build can decode**, newest last.
 ///
 /// 🔴 This is the answer to the roll problem, and it is deliberately narrow. `T0`
@@ -128,7 +136,11 @@ pub const DURABLE_HEAD_SINCE_VERSION: u8 = 0x04;
 /// it lets a forgotten host look healthy, which is the failure mode in the other
 /// direction. `0x04` (issue #275's route bump — the telemetry *payload* is
 /// byte-identical at `0x04` and `0x05`) leaves under the same rule.
-pub const READABLE_TELEMETRY_VERSIONS: &[u8] = &[0x03, 0x04, RPC_VERSION];
+/// `0x05` joined the list at the `0x06` bump (lab #367 arming prep): the whole
+/// fleet serves `0x05` today, so a reader without it would be blind to every
+/// host until the roll completes. It leaves under the standing rule — all
+/// hosts serving `0x06` or later.
+pub const READABLE_TELEMETRY_VERSIONS: &[u8] = &[0x03, 0x04, 0x05, RPC_VERSION];
 
 /// **An identity in the block-hash space**: the first [`CHECKPOINT_ID_BYTES`] of a
 /// block hash, big-endian, rendered at `fid`'s width through `fid`'s helper.
@@ -1045,6 +1057,13 @@ impl Telemetry {
                 out.extend_from_slice(&h.identity.bits().to_le_bytes());
             }
         }
+        // ---- lab #367: the burned tail (BURNED_SINCE_VERSION) ---------------
+        // One u64 per supply row, same order — appended LAST so every earlier
+        // version's payload is an exact byte prefix of this one (the #212
+        // discipline, which the wire-order test below locks per version).
+        for row in &self.supply {
+            out.extend_from_slice(&row.burned.to_le_bytes());
+        }
         out
     }
 
@@ -1154,6 +1173,15 @@ impl Telemetry {
         } else {
             DurableView::Unavailable
         };
+        // ---- lab #367: the burned tail ------------------------------------
+        // Absent below 0x06; the rows keep 0 and the VERSION the compat caller
+        // was handed is what renders that absence honestly (a 0x05 host has no
+        // burn column — not a zero one).
+        if version >= BURNED_SINCE_VERSION {
+            for row in supply.iter_mut() {
+                row.burned = r.u64()?;
+            }
+        }
         r.finish()?;
         Ok(Telemetry {
             finality_status,
@@ -1322,7 +1350,7 @@ mod tests {
     /// absent, present, and the `split` case where a node's own keys are committed
     /// to two variants at one slot.
     #[test]
-    fn telemetry_roundtrips_checkpoint_identity_at_0x05() {
+    fn telemetry_roundtrips_checkpoint_identity_at_0x06() {
         let base = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 2, MAX_LAG);
 
         // Nothing injected: the composition cannot see the identity. Fields render
@@ -1334,7 +1362,7 @@ mod tests {
         assert_eq!(base.sid_field(), "-");
         assert_eq!(Telemetry::from_bytes(&base.to_bytes()).unwrap(), base);
         assert_eq!(base.to_bytes()[0], RPC_VERSION);
-        assert_eq!(RPC_VERSION, 0x05, "the issue #275 route bump (payload unchanged from #212's 0x04)");
+        assert_eq!(RPC_VERSION, 0x06, "the lab #367 arming bump (burned tail appended after #212's durable tail)");
 
         // Fully populated: finalized identity + this node's own signed variant.
         let full = base
@@ -1373,7 +1401,7 @@ mod tests {
     /// committee aggregates round-trip at the current version, while an older wire
     /// is rejected on its version byte by the STRICT decoder.**
     #[test]
-    fn committee_aggregates_roundtrip_at_0x05_and_older_is_rejected() {
+    fn committee_aggregates_roundtrip_at_0x06_and_older_is_rejected() {
         let t = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 3, MAX_LAG)
             .with_committee(21, 19, 15)
             .with_supply(vec![SupplyEpoch {
@@ -1386,7 +1414,7 @@ mod tests {
                 burned: 0,
             }]);
         let bytes = t.to_bytes();
-        assert_eq!(bytes[0], 0x05);
+        assert_eq!(bytes[0], 0x06);
         assert_eq!(Telemetry::from_bytes(&bytes).unwrap(), t);
         assert_eq!(
             (t.epoch, t.committee_size, t.committee_active, t.committee_quorum),
@@ -1434,7 +1462,7 @@ mod tests {
 
         let decoded = Telemetry::from_bytes(&partial.to_bytes()).unwrap();
         assert_eq!(decoded.supply_coverage(), partial.supply_coverage());
-        assert_eq!(decoded.to_bytes()[0], 0x05, "coverage uses fields already on the wire");
+        assert_eq!(decoded.to_bytes()[0], 0x06, "coverage uses fields already on the wire");
     }
 
     /// **Acceptance (#130 (a)): `SupplyCoverage` and the state-lag figures are one
@@ -1898,7 +1926,7 @@ mod tests {
 
         // The rolled host: full fidelity, and the version says so.
         let (v, rolled) = Telemetry::from_bytes_compat(&live.to_bytes()).unwrap();
-        assert_eq!(v, 0x05);
+        assert_eq!(v, 0x06);
         assert_eq!(rolled, live);
         assert!(rolled.durable.is_available());
 
@@ -1931,9 +1959,9 @@ mod tests {
         ));
 
         // The readable set is bounded and named, and it is not a `>=` comparison:
-        // `0x02` and an unknown future `0x06` are both refused by BOTH paths.
-        assert_eq!(READABLE_TELEMETRY_VERSIONS, &[0x03, 0x04, 0x05]);
-        for refused in [0x00u8, 0x01, 0x02, 0x06, 0xff] {
+        // `0x02` and an unknown future `0x07` are both refused by BOTH paths.
+        assert_eq!(READABLE_TELEMETRY_VERSIONS, &[0x03, 0x04, 0x05, 0x06]);
+        for refused in [0x00u8, 0x01, 0x02, 0x07, 0xff] {
             let mut bytes = live.to_bytes();
             bytes[0] = refused;
             assert!(
@@ -1964,6 +1992,41 @@ mod tests {
     /// protects the log line, and this protects the wire. If a future edit inserts a
     /// field anywhere but the end, this fails before any consumer notices.
     #[test]
+    fn the_0x06_wire_appends_the_burned_tail_and_a_0x05_reader_stays_whole() {
+        let t = Telemetry::assemble(3776, Some(3776), 75, 0, 3, 2, MAX_LAG)
+            .with_committee(21, 21, 15)
+            .with_supply(vec![SupplyEpoch {
+                epoch: 3,
+                start_height: 3456,
+                end_height: 3776,
+                measured_coinbase: 1_234_567,
+                expected_coinbase: 1_234_567,
+                fees: 890,
+                burned: 77,
+            }]);
+        let new = t.to_bytes();
+        assert_eq!(new[0], 0x06);
+        // Round-trip at 0x06 carries the real value.
+        assert_eq!(Telemetry::from_bytes(&new).unwrap().supply[0].burned, 77);
+
+        // The append discipline, stated as bytes: strip the tail, restamp 0x05,
+        // and the compat reader decodes the whole snapshot — burned reads 0 and
+        // the VERSION is what carries the absence (a 0x05 host has no burn
+        // column, not a zero one).
+        let tail = 8 * t.supply.len();
+        let mut v5 = new[..new.len() - tail].to_vec();
+        v5[0] = 0x05;
+        let (v, old_read) = Telemetry::from_bytes_compat(&v5).unwrap();
+        assert_eq!(v, 0x05);
+        assert_eq!(old_read.supply[0].burned, 0);
+        assert_eq!(old_read.supply[0].fees, 890, "every pre-tail field survives");
+        // And a 0x05 payload that DOES carry a tail is trailing bytes, refused.
+        let mut bad = new.clone();
+        bad[0] = 0x05;
+        assert!(Telemetry::from_bytes_compat(&bad).is_err());
+    }
+
+    #[test]
     fn the_0x04_wire_appends_and_does_not_reshuffle() {
         let t = with_durable(
             Telemetry::assemble(2871, Some(2864), 75, 4, 3, 2, MAX_LAG)
@@ -1981,7 +2044,11 @@ mod tests {
                 }]),
             Some((2864, 0x63)),
         );
-        let new = t.to_bytes();
+        // Strip the lab #367 burned tail (one u64 per supply row) so this test
+        // stays about the 0x04 durable-tail append alone; the burned tail has
+        // its own append test.
+        let full = t.to_bytes();
+        let new = &full[..full.len() - 8 * t.supply.len()];
         let old = v3_payload(&t);
         assert_eq!(&new[1..old.len()], &old[1..], "0x04 appends, it does not reshuffle");
         assert_eq!(

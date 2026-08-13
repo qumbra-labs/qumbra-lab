@@ -2046,6 +2046,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
                 BodyError::DiscoveryNotCanonical { .. } => "discovery not canonical",
                 _ => "discovery does not bind",
             },
+            // Lab #367: the rider rules, named the way the discovery ones are —
+            // malformed / before-boundary are intrinsic (peer fault), the
+            // rule failures positional (a node behind on the registry). The
+            // string mirrors `body_fault_class`'s reading one layer up.
+            MempoolError::RiderInvalid(e) => match e {
+                BodyError::RiderMalformed { .. } => "rider malformed",
+                BodyError::RiderBeforeBoundary { .. } => "rider before boundary",
+                _ => "rider rule",
+            },
             MempoolError::ProofInvalid => "proof invalid",
         }
     }
@@ -2321,7 +2330,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             return Err(TxSubmitRefusal::StateLagging);
         }
         let wid = wire_tx_id(&tx);
-        match self.mempool.admit(tx, &self.state, &self.verifier) {
+        match self.mempool.admit(tx, &self.state, &self.verifier, self.state.names()) {
             Ok(id) => {
                 self.wire_ids.insert(wid, id);
                 Ok(id)

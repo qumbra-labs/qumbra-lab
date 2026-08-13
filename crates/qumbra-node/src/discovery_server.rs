@@ -353,6 +353,10 @@ fn render_refusal(refusal: &TxRefusal) -> (u16, String) {
             MempoolError::DiscoveryInvalid(e) => {
                 (400, format!("refused: discovery {e:?}"))
             }
+            // Lab #367: the rider rules — a name registration/renewal the pool
+            // refuses (malformed, before the boundary, wrong fee split, or a
+            // rule failure) reaches the wallet as a named 400.
+            MempoolError::RiderInvalid(e) => (400, format!("refused: rider {e:?}")),
             MempoolError::ProofInvalid => (400, "refused: proof-invalid".to_string()),
             // The loop maps DuplicateTx to `TxSubmitOutcome::Duplicate` before
             // wrapping; reaching here means that mapping broke.

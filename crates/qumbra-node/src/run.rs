@@ -2760,6 +2760,9 @@ fn mempool_refusal_token(e: &qlab_node::MempoolError) -> &'static str {
             "discovery-not-canonical"
         }
         MempoolError::DiscoveryInvalid(_) => "discovery-does-not-bind",
+        MempoolError::RiderInvalid(BodyError::RiderMalformed { .. }) => "rider-malformed",
+        MempoolError::RiderInvalid(BodyError::RiderBeforeBoundary { .. }) => "rider-before-boundary",
+        MempoolError::RiderInvalid(_) => "rider-rule",
         MempoolError::ProofInvalid => "proof-invalid",
     }
 }
@@ -5730,7 +5733,7 @@ mod tests {
         let served = t.to_bytes();
         assert_eq!(served[0], qlab_node::RPC_VERSION);
         let (version, decoded) = qlab_node::Telemetry::from_bytes_compat(&served).unwrap();
-        assert_eq!(version, 0x05, "the current wire (#275's route bump)");
+        assert_eq!(version, 0x06, "the current wire (lab #367 burned-tail bump)");
         assert_eq!(decoded, t);
         assert_eq!(decoded.durable, t.durable);
         assert_eq!(

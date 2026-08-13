@@ -132,7 +132,7 @@ use crate::telemetry::{LocalCommitment, Telemetry};
 /// reads every host of the current fleet. **This constant, and every strict
 /// `from_bytes`, are unchanged in their strictness** — the node still serves exactly
 /// one version and still refuses every other on its own decode paths.
-pub const RPC_VERSION: u8 = 0x05;
+pub const RPC_VERSION: u8 = 0x06;
 
 // ---------------------------------------------------------------------------
 // Transaction identity + note-discovery artifacts
@@ -479,6 +479,9 @@ pub enum RejectReason {
     /// says the committed bytes themselves are malformed, non-canonical, or do
     /// not bind the declared commitments.
     DiscoveryInvalid,
+    /// The tx carries a name rider block validation would refuse (lab #367):
+    /// malformed, before the boundary, wrong fee split, or a rule failure.
+    RiderInvalid,
     /// The proof failed to verify under the injected verifier.
     ProofInvalid,
     // NOTE (issue #102): `ImmatureCoinbase` is gone. Maturity is enforced by the
@@ -647,7 +650,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
         // frozen §2 rule unreachable from the wallet RPC. It is now enforced by the
         // commitment tree's append schedule, so there is nothing to pass and no way
         // for this path to skip it.
-        match self.mempool.admit(tx, &self.node, verifier) {
+        match self.mempool.admit(tx, &self.node, verifier, self.node.names()) {
             Ok(_body_id) => {
                 self.discovery.insert(txid, discovery);
                 SubmitOutcome::Accepted(txid)
@@ -670,6 +673,9 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
             }
             Err(MempoolError::DiscoveryInvalid(_)) => {
                 SubmitOutcome::Rejected(RejectReason::DiscoveryInvalid)
+            }
+            Err(MempoolError::RiderInvalid(_)) => {
+                SubmitOutcome::Rejected(RejectReason::RiderInvalid)
             }
             Err(MempoolError::ProofInvalid) => SubmitOutcome::Rejected(RejectReason::ProofInvalid),
         }
@@ -1803,7 +1809,7 @@ mod tests {
 
         // version(1) + from(8) + total(8) + n(1, varint) + 3 × leaf(32) = 114.
         assert_eq!(bytes.len(), 114, "golden total length");
-        assert_eq!(bytes[0], 0x05, "golden version — RPC_VERSION at issue #275");
+        assert_eq!(bytes[0], 0x06, "golden version — RPC_VERSION at the #367 arming bump");
         assert_eq!(&bytes[1..9], &2u64.to_le_bytes(), "golden from (LE)");
         assert_eq!(&bytes[9..17], &5u64.to_le_bytes(), "golden total (LE)");
         assert_eq!(bytes[17], 0x03, "golden n (varint)");
@@ -1814,8 +1820,9 @@ mod tests {
         let digest = keccak256(&bytes);
         assert_eq!(
             hex32(&digest),
-            "d478d958e0ad64f706c67f8777c6653416f008c68c6894ec4d9f308c00ba828e",
-            "GOLDEN digest — update ONLY with an intentional, documented framing change"
+            "dfa1d3dcd5f6e51cf5dea217de8eb15eab224ebe67965c6501320459c352d8cd",
+            "GOLDEN digest — update ONLY with an intentional, documented framing change \
+             (lab #367: RPC_VERSION 0x05 -> 0x06, the leaf stream's version byte moved)"
         );
 
         assert_eq!(TreeLeaves::from_bytes(&bytes).unwrap(), page, "and it round-trips");
@@ -2027,13 +2034,13 @@ mod tests {
     /// roll problem is that route's alone, and widening the compat window to routes
     /// nothing needs it on would be leniency bought for free.
     #[test]
-    fn status_and_anchors_moved_to_0x05_with_telemetry_and_reject_older_versions() {
+    fn status_and_anchors_moved_to_0x06_with_telemetry_and_reject_older_versions() {
         let (rpc, _) = rpc_with_finalized_genesis();
-        assert_eq!(RPC_VERSION, 0x05);
+        assert_eq!(RPC_VERSION, 0x06);
 
         for mut payload in [rpc.status().to_bytes(), rpc.anchors().to_bytes(), rpc.telemetry().to_bytes()] {
-            assert_eq!(payload[0], 0x05, "the node's own surfaces move as one");
-            for old in [0x01, 0x02, 0x03, 0x04] {
+            assert_eq!(payload[0], 0x06, "the node's own surfaces move as one");
+            for old in [0x01, 0x02, 0x03, 0x04, 0x05] {
                 payload[0] = old;
                 let as_status = NodeStatus::from_bytes(&payload);
                 let as_anchors = AnchorSet::from_bytes(&payload);

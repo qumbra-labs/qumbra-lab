@@ -175,6 +175,20 @@ pub enum MempoolError {
     /// names exactly what block validation would have named (only the
     /// `Discovery*` variants of [`BodyError`] can appear here, with `index: 0`).
     DiscoveryInvalid(BodyError),
+    /// The tx carries a name rider that block validation would refuse (lab
+    /// #367) — malformed bytes, a rider at a prospective height where riders
+    /// are not active, a fee that is not `posted + name_fee`, or a rule
+    /// failure. Carries `validate_body`'s own `BodyError` (only the `Rider*`
+    /// variants appear here) so admit names exactly what block validation
+    /// would.
+    ///
+    /// **This variant closes a #278 detonator introduced by #381**: a COMMIT
+    /// rider pays the relay tier only, so its declared fee *equals*
+    /// `posted_fee` and the bare fee check admitted it — while `validate_body`
+    /// refused it (rider before the boundary), leaving a poisoned tx that no
+    /// template can mine and nothing evicts. The mempool must run the same
+    /// rider rules the block does, exactly as it already does for discovery.
+    RiderInvalid(BodyError),
     /// The STARK proof does not verify against the public surface.
     ProofInvalid,
 }
@@ -458,15 +472,28 @@ impl Mempool {
     /// [`crate::coinbase::matures_coinbase_minted_at`], applied by
     /// `Node::apply_state`, and it binds every path into the node rather than
     /// this one.
-    pub fn admit<S: NodeState, V: TxVerifier>(
+    pub fn admit<S: NodeState, V: TxVerifier, N: qlab_devnet::names::NameView>(
         &mut self,
         entry: TxEntry,
         state: &S,
         verifier: &V,
+        names: &N,
     ) -> Result<TxId, MempoolError> {
-        // 1. Posted-price fee (protocol-spec §4, frozen §5). Cheapest — pure
-        //    function of the public bucket.
-        let expected = posted_fee(entry.public.bucket);
+        // 0. The name rider (lab #367), decoded first because the fee rule
+        //    below depends on the op it carries. A malformed rider is a pure
+        //    function of the tx, like the discovery decode — it can never
+        //    become valid, so it is refused here exactly as block validation
+        //    refuses it (`RiderMalformed`).
+        let prospective_height = state.tip_height() + 1;
+        let op = qlab_devnet::names::names_admit_op(&entry, prospective_height, names)
+            .map_err(MempoolError::RiderInvalid)?;
+
+        // 1. Posted-price fee (protocol-spec §4, frozen §5) PLUS the burned
+        //    name fee for any rider (the fee split — the reveal declares
+        //    `posted + name_fee`, and without this it was refused as WrongFee).
+        //    Cheapest — a pure function of the public bucket and the op.
+        let expected =
+            posted_fee(entry.public.bucket) + op.as_ref().map_or(0, qlab_devnet::names::name_fee_for);
         if entry.public.fee != expected {
             return Err(MempoolError::WrongFee { expected, got: entry.public.fee });
         }
@@ -728,7 +755,7 @@ mod tests {
     fn admits_a_well_formed_tx() {
         let mut mp = Mempool::default();
         let st = state_with_anchor();
-        let id = mp.admit(good_tx(1), &st, &MockVerifier).expect("admit");
+        let id = mp.admit(good_tx(1), &st, &MockVerifier, &qlab_devnet::names::EmptyNameView).expect("admit");
         assert_eq!(mp.len(), 1);
         assert!(mp.contains(&id));
     }
@@ -740,7 +767,7 @@ mod tests {
         let mut mp = Mempool::default();
         let st = state_with_anchor();
         let tx = good_tx(1);
-        let id = mp.admit(tx.clone(), &st, &MockVerifier).expect("admit");
+        let id = mp.admit(tx.clone(), &st, &MockVerifier, &qlab_devnet::names::EmptyNameView).expect("admit");
         let listed = mp.entries();
         assert_eq!(listed.len(), 1);
         assert_eq!(txid(&listed[0]), id);
@@ -750,6 +777,56 @@ mod tests {
 
     // ── admission negatives (the acceptance set) ─────────────────────────────
 
+    /// Lab #367 — the #278 detonator the wallet UI can now produce. A COMMIT
+    /// rider pays the relay tier only, so its declared fee EQUALS `posted_fee`
+    /// and the bare fee check admitted it — while `validate_body` refuses it
+    /// (rider before the boundary, which is `None` today). The mempool must
+    /// refuse it too, or it pools a tx no template can mine and nothing
+    /// evicts. Mutation check: delete the rider leg in `admit` and this test
+    /// admits the poison.
+    #[test]
+    fn a_rider_before_the_boundary_is_refused_at_admit_not_pooled_as_poison() {
+        use qlab_devnet::names::{EmptyNameView, NameOp};
+        let mut mp = Mempool::default();
+        let st = state_with_anchor();
+
+        // A commit rider: fee == posted (commits burn nothing), so the fee
+        // check alone would wave it through.
+        let commit = good_tx(1).with_name_op(&NameOp::Commit { commit: [0x5A; 32] });
+        assert_eq!(commit.public.fee, posted_fee(ArityBucket::TwoByTwo), "the trap: fee looks right");
+        assert!(matches!(
+            mp.admit(commit, &st, &MockVerifier, &EmptyNameView),
+            Err(MempoolError::RiderInvalid(
+                qlab_devnet::body::BodyError::RiderBeforeBoundary { .. }
+            ))
+        ));
+        assert_eq!(mp.len(), 0, "the poison never entered the pool");
+
+        // And a reveal, which declares posted + name_fee, is refused the same
+        // way (before the boundary) rather than as a WrongFee red herring.
+        let reveal = good_tx(2).with_name_op(&NameOp::Reveal {
+            record: qlab_devnet::names::NameRecord {
+                kind: qlab_devnet::names::RECORD_KIND_L1_ADDRESS,
+                name: b"alice".to_vec(),
+                address: vec![0xAB; qlab_devnet::names::L1_ADDRESS_LEN],
+            },
+            salt: [7; 32],
+        });
+        let reveal = TxEntry {
+            public: qlab_devnet::body::TxPublic {
+                fee: posted_fee(ArityBucket::TwoByTwo) + qlab_devnet::names::name_fee_bessel(5),
+                ..reveal.public.clone()
+            },
+            ..reveal
+        };
+        assert!(matches!(
+            mp.admit(reveal, &st, &MockVerifier, &EmptyNameView),
+            Err(MempoolError::RiderInvalid(
+                qlab_devnet::body::BodyError::RiderBeforeBoundary { .. }
+            ))
+        ));
+    }
+
     #[test]
     fn rejects_wrong_fee() {
         let mut mp = Mempool::default();
@@ -757,7 +834,7 @@ mod tests {
         let mut tx = good_tx(1);
         tx.public.fee += 1; // one bessel off the posted price → invalid (§4)
         assert_eq!(
-            mp.admit(tx, &st, &MockVerifier),
+            mp.admit(tx, &st, &MockVerifier, &qlab_devnet::names::EmptyNameView),
             Err(MempoolError::WrongFee {
                 expected: posted_fee(ArityBucket::TwoByTwo),
                 got: posted_fee(ArityBucket::TwoByTwo) + 1,
@@ -775,7 +852,7 @@ mod tests {
         tx.public.bucket = ArityBucket::FourByFour;
         tx.public.fee = posted_fee(ArityBucket::TwoByTwo);
         assert_eq!(
-            mp.admit(tx, &st, &MockVerifier),
+            mp.admit(tx, &st, &MockVerifier, &qlab_devnet::names::EmptyNameView),
             Err(MempoolError::WrongFee {
                 expected: posted_fee(ArityBucket::FourByFour),
                 got: posted_fee(ArityBucket::TwoByTwo),
@@ -789,7 +866,7 @@ mod tests {
         let st = state_with_anchor();
         let mut tx = good_tx(1);
         tx.public.anchor = [0xEE; 32]; // not a finalized/in-window root
-        assert_eq!(mp.admit(tx, &st, &MockVerifier), Err(MempoolError::AnchorNotValid));
+        assert_eq!(mp.admit(tx, &st, &MockVerifier, &qlab_devnet::names::EmptyNameView), Err(MempoolError::AnchorNotValid));
     }
 
     /// The mempool has **no opinion on coinbase maturity**, and that is the point
@@ -828,7 +905,7 @@ mod tests {
         // stands in for a proof; on a real net no such proof could be produced,
         // which is exactly the enforcement this pool is no longer responsible for.
         let st = state_with_anchor(); // tip 200
-        mp.admit(good_tx(1), &st, &MockVerifier).expect("admission is maturity-blind");
+        mp.admit(good_tx(1), &st, &MockVerifier, &qlab_devnet::names::EmptyNameView).expect("admission is maturity-blind");
         assert_eq!(mp.len(), 1);
 
         // And the commitment is nowhere in the pool's state: nothing records it, so
@@ -842,7 +919,7 @@ mod tests {
         let mut st = state_with_anchor();
         st.spent.insert([7; 32]); // nullifier already in the consensus set
         assert_eq!(
-            mp.admit(good_tx(7), &st, &MockVerifier),
+            mp.admit(good_tx(7), &st, &MockVerifier, &qlab_devnet::names::EmptyNameView),
             Err(MempoolError::AlreadySpent { nullifier: [7; 32] })
         );
     }
@@ -851,12 +928,12 @@ mod tests {
     fn rejects_in_pool_double_spend() {
         let mut mp = Mempool::default();
         let st = state_with_anchor();
-        mp.admit(good_tx(9), &st, &MockVerifier).expect("first admits");
+        mp.admit(good_tx(9), &st, &MockVerifier, &qlab_devnet::names::EmptyNameView).expect("first admits");
         // A different tx (distinct commitments) reusing the same nullifier.
         let mut tx2 = good_tx(9);
         tx2.public.commitments = vec![[200; 32]];
         assert_eq!(
-            mp.admit(tx2, &st, &MockVerifier),
+            mp.admit(tx2, &st, &MockVerifier, &qlab_devnet::names::EmptyNameView),
             Err(MempoolError::NullifierConflictInPool { nullifier: [9; 32] })
         );
         assert_eq!(mp.len(), 1);
@@ -866,9 +943,9 @@ mod tests {
     fn rejects_duplicate_tx() {
         let mut mp = Mempool::default();
         let st = state_with_anchor();
-        mp.admit(good_tx(3), &st, &MockVerifier).expect("first");
+        mp.admit(good_tx(3), &st, &MockVerifier, &qlab_devnet::names::EmptyNameView).expect("first");
         assert_eq!(
-            mp.admit(good_tx(3), &st, &MockVerifier),
+            mp.admit(good_tx(3), &st, &MockVerifier, &qlab_devnet::names::EmptyNameView),
             Err(MempoolError::DuplicateTx)
         );
     }
@@ -879,7 +956,7 @@ mod tests {
         let st = state_with_anchor();
         let mut tx = good_tx(1);
         tx.proof = b"forged".to_vec();
-        assert_eq!(mp.admit(tx, &st, &MockVerifier), Err(MempoolError::ProofInvalid));
+        assert_eq!(mp.admit(tx, &st, &MockVerifier, &qlab_devnet::names::EmptyNameView), Err(MempoolError::ProofInvalid));
     }
 
     // ── the §4 lone-tx rules (issue #278) ────────────────────────────────────
@@ -900,7 +977,7 @@ mod tests {
         let mut tx = good_tx(4);
         tx.public.nullifiers = vec![[4; 32], [4; 32]];
         assert_eq!(
-            mp.admit(tx, &st, &MockVerifier),
+            mp.admit(tx, &st, &MockVerifier, &qlab_devnet::names::EmptyNameView),
             Err(MempoolError::NullifierRepeatedInTx { nullifier: [4; 32] })
         );
         assert!(mp.is_empty(), "a self-double-spend must not enter the pool");
@@ -915,7 +992,7 @@ mod tests {
         let mut tx = good_tx(5);
         tx.discovery = qlab_devnet::body::placeholder_discovery(&[[0xEE; 32]]);
         assert_eq!(
-            mp.admit(tx, &st, &MockVerifier),
+            mp.admit(tx, &st, &MockVerifier, &qlab_devnet::names::EmptyNameView),
             Err(MempoolError::DiscoveryInvalid(BodyError::DiscoveryDoesNotBind {
                 index: 0,
                 expected: 1,
@@ -936,7 +1013,7 @@ mod tests {
         let mut tx = good_tx(6);
         tx.discovery = TxEntry::empty_discovery();
         assert_eq!(
-            mp.admit(tx, &st, &MockVerifier),
+            mp.admit(tx, &st, &MockVerifier, &qlab_devnet::names::EmptyNameView),
             Err(MempoolError::DiscoveryInvalid(BodyError::DiscoveryDoesNotBind {
                 index: 0,
                 expected: 1,
@@ -954,7 +1031,7 @@ mod tests {
         let mut tx = good_tx(7);
         tx.discovery = vec![0xFF; 7]; // not a §2 group encoding at all
         assert!(matches!(
-            mp.admit(tx, &st, &MockVerifier),
+            mp.admit(tx, &st, &MockVerifier, &qlab_devnet::names::EmptyNameView),
             Err(MempoolError::DiscoveryInvalid(BodyError::DiscoveryMalformed { .. }))
         ));
         assert!(mp.is_empty());
@@ -980,7 +1057,7 @@ mod tests {
         let mut mp = Mempool::default();
         let st = state_with_anchor(); // tip 200 ⇒ height 201
         for nf in 0..5u8 {
-            mp.admit(good_tx(nf), &st, &MockVerifier).unwrap();
+            mp.admit(good_tx(nf), &st, &MockVerifier, &qlab_devnet::names::EmptyNameView).unwrap();
         }
         // A tiny effective median so only a couple of ~135-byte mock txs fit free.
         let m = 2 * tx_weight(&good_tx(0)); // exactly two txs fit the free zone
@@ -1008,7 +1085,7 @@ mod tests {
         let st = state_with_anchor();
         let mut ids = Vec::new();
         for nf in 0..5u8 {
-            ids.push(mp.admit(good_tx(nf), &st, &MockVerifier).unwrap());
+            ids.push(mp.admit(good_tx(nf), &st, &MockVerifier, &qlab_devnet::names::EmptyNameView).unwrap());
         }
         let one = tx_weight(&good_tx(0));
         // Effective median so the hard cap (2·M) admits only 3 of the 5 txs.
@@ -1043,8 +1120,8 @@ mod tests {
     fn on_block_connected_evicts_mined_and_conflicting_txs() {
         let mut mp = Mempool::default();
         let st = state_with_anchor();
-        let a = mp.admit(good_tx(1), &st, &MockVerifier).unwrap();
-        let _b = mp.admit(good_tx(2), &st, &MockVerifier).unwrap();
+        let a = mp.admit(good_tx(1), &st, &MockVerifier, &qlab_devnet::names::EmptyNameView).unwrap();
+        let _b = mp.admit(good_tx(2), &st, &MockVerifier, &qlab_devnet::names::EmptyNameView).unwrap();
         assert_eq!(mp.len(), 2);
 
         // A block at height 201 mines tx `a` (spends nullifier [1;32]).

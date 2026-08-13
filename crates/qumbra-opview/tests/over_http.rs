@@ -263,8 +263,8 @@ fn a_node_speaking_the_old_0x02_wire_is_refused_with_a_reason() {
     assert_eq!(a.exit_code(), 0);
     let text = render::view(&readings, &a);
     assert!(
-        text.contains("this build reads wire versions [3, 4, 5]"),
-        "the reason names the readable set (0x05 = #275's route bump):\n{text}"
+        text.contains("this build reads wire versions [3, 4, 5, 6]"),
+        "the reason names the readable set (0x06 = lab #367's burned-tail bump):\n{text}"
     );
 }
 
@@ -297,7 +297,7 @@ fn a_mid_roll_net_is_fully_readable_over_sockets_and_says_which_hosts_predate_th
 
     // 🔴 The property: all four answered and all four decoded.
     assert!(readings.iter().all(|r| r.reading.is_reachable()), "every host readable mid-roll");
-    assert_eq!(readings[0].reading.wire_version(), Some(0x05), "the current wire (#275)");
+    assert_eq!(readings[0].reading.wire_version(), Some(0x06), "the current wire (lab #367 burned-tail bump)");
     assert!(readings[0].reading.wire_carries_durable_head());
     for r in &readings[1..] {
         assert_eq!(r.reading.wire_version(), Some(0x03));
