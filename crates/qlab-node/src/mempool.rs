@@ -972,6 +972,199 @@ mod tests {
         ));
     }
 
+    // ── the armed pool: assembly + eviction (lab #387) ───────────────────────
+    //
+    // The test above is the pool BELOW the boundary, where every rider is
+    // refused and none of this is reachable. These two are the pool ABOVE it —
+    // the state arming day puts the net in, and the only state in which the
+    // same-name race exists. Reaching it needs the boundary stated explicitly
+    // (`_above`, the `validate_body_above` convention); the shipped `None`
+    // constant would refuse the fixtures at admit and prove nothing.
+
+    /// The drill boundary these tests arm at. Below every fixture height, so
+    /// riders are active throughout, and never the shipped constant.
+    const DRILL_BOUNDARY: Option<u64> = Some(10);
+    /// The height the fixtures' COMMIT riders were mined at — inside
+    /// `[201 − COMMIT_MAX_AGE, 201 − COMMIT_MIN_AGE]`, so a reveal at the
+    /// prospective height 201 finds its commit in window.
+    const COMMIT_HEIGHT: u64 = 100;
+
+    /// A REVEAL of `name` (paying `posted + name_fee`, the split) together with
+    /// the COMMIT transaction whose on-chain inclusion it depends on. Distinct
+    /// `salt_byte`s make two reveals of ONE name two genuinely different
+    /// transactions, which is exactly the race: neither is malformed, neither is
+    /// a duplicate, and each is individually admissible.
+    fn reveal_pair(nf: u8, name: &[u8], salt_byte: u8) -> (TxEntry, TxEntry) {
+        use qlab_devnet::names::{
+            commit_hash, name_fee_bessel, NameOp, NameRecord, L1_ADDRESS_LEN,
+            RECORD_KIND_L1_ADDRESS,
+        };
+        let record = NameRecord {
+            kind: RECORD_KIND_L1_ADDRESS,
+            name: name.to_vec(),
+            address: vec![0xAB; L1_ADDRESS_LEN],
+        };
+        let salt = [salt_byte; 32];
+        let commit = good_tx(nf.wrapping_add(50))
+            .with_name_op(&NameOp::Commit { commit: commit_hash(&record, &salt) });
+        let reveal = good_tx(nf).with_name_op(&NameOp::Reveal { record, salt });
+        let reveal = TxEntry {
+            public: qlab_devnet::body::TxPublic {
+                fee: posted_fee(ArityBucket::TwoByTwo) + name_fee_bessel(name.len()),
+                ..reveal.public.clone()
+            },
+            ..reveal
+        };
+        (commit, reveal)
+    }
+
+    /// The **real** [`crate::name_registry::NameRegistry`] — the production
+    /// `NameView` — with `txs`' riders applied at `height`. A hand-rolled mock
+    /// view would let these tests agree with a registry that does not exist.
+    fn registry_with(height: u64, txs: &[TxEntry]) -> crate::name_registry::NameRegistry {
+        let mut reg = crate::name_registry::NameRegistry::default();
+        let stored: Vec<crate::store::StoredTx> =
+            txs.iter().map(crate::store::StoredTx::from).collect();
+        reg.apply_block_riders(height, &stored).expect("fixture riders decode");
+        reg
+    }
+
+    /// Lab #387 path 1 — **the node must not build itself an invalid block.**
+    ///
+    /// `names_admit_op` rule-checks with an EMPTY pending set (the pool admits
+    /// one tx at a time and says so), so two reveals of one unregistered name
+    /// both pass admit and both pool. A name-blind greedy fill packs both into
+    /// one template, and `validate_body`'s same-block tie rule then refuses that
+    /// block — the miner's own validation rejecting the miner's own template.
+    ///
+    /// Mutation check: delete the `pending_names` skip in `assemble` and this
+    /// test fails twice over — two reveals in the template, and the
+    /// `validate_body_above` assertion returns `RiderRule(NameTaken)`.
+    #[test]
+    fn a_template_carries_at_most_one_reveal_per_name_and_validates() {
+        use qlab_devnet::names::NameOp;
+        let mut mp = Mempool::default();
+        let st = state_with_anchor(); // tip 200 ⇒ prospective height 201
+
+        let (commit_a, reveal_a) = reveal_pair(1, b"alice", 0xA1);
+        let (commit_b, reveal_b) = reveal_pair(2, b"alice", 0xB2);
+        let reg = registry_with(COMMIT_HEIGHT, &[commit_a, commit_b]);
+
+        let id_a = mp
+            .admit_above(DRILL_BOUNDARY, reveal_a, &st, &MockVerifier, &reg)
+            .expect("the first reveal admits");
+        let id_b = mp
+            .admit_above(DRILL_BOUNDARY, reveal_b, &st, &MockVerifier, &reg)
+            .expect("and so does the second — admission's pending set is empty by construction");
+        assert_eq!(mp.len(), 2, "the race is real: both are individually valid");
+
+        // A median far above both weights, so nothing but the name rule can
+        // keep the second one out.
+        let t = mp.assemble(&st, 1_000_000, TEST_RKM);
+        let revealed: Vec<Vec<u8>> = t
+            .txs
+            .iter()
+            .filter_map(|tx| {
+                match qlab_devnet::names::decode_rider(&tx.rider).expect("template riders decode") {
+                    Some(NameOp::Reveal { record, .. }) => Some(record.name),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(revealed, vec![b"alice".to_vec()], "exactly one reveal of the name");
+        assert_eq!(t.txs.len(), 1, "the loser is not in the template at all");
+
+        // It is still POOLED: it lost a slot in one template, not its validity.
+        // Next block it competes again — and wins, once the winner is mined and
+        // this one is evicted by the name leg below, or if the winner is not.
+        assert_eq!(mp.len(), 2, "the loser stays pooled");
+        assert!(mp.contains(&id_a) && mp.contains(&id_b));
+
+        // The whole point: the template the node would mine passes the node's
+        // own block validation, under the same view and the same boundary.
+        let genesis = qlab_devnet::header::BlockHeader::genesis(1, 0);
+        let header = qlab_devnet::header::BlockHeader {
+            height: t.height,
+            ..qlab_devnet::header::BlockHeader::child_of(
+                &genesis,
+                75,
+                1,
+                t.body.commitment_above(DRILL_BOUNDARY, t.height),
+            )
+        };
+        assert_eq!(
+            qlab_devnet::body::validate_body_above(
+                DRILL_BOUNDARY,
+                &header,
+                &t.body,
+                &MockVerifier,
+                |r| *r == ANCHOR,
+                &reg,
+            ),
+            Ok(()),
+            "the assembled template is a block this node accepts"
+        );
+    }
+
+    /// Lab #387 path 2 — **an outraced reveal must not be stranded.**
+    ///
+    /// Eviction was nullifier- and anchor-keyed only, and a reveal whose name
+    /// someone else registers shares neither: it stays pooled, un-minable until
+    /// `reopens_at`, re-selected into every template — the #278 poison shape the
+    /// admit leg (PR #385) closed at the front door, arriving through the back.
+    ///
+    /// Note what the mined block does NOT do: it spends a different nullifier
+    /// and leaves the pooled tx's anchor valid, so both pre-#387 eviction legs
+    /// see nothing to do. Mutation check: delete the name leg in
+    /// `on_block_connected_above` and the pooled reveal survives — this fails.
+    #[test]
+    fn a_name_outraced_reveal_is_evicted_on_block_connect_not_stranded() {
+        let mut mp = Mempool::default();
+        let st = state_with_anchor();
+
+        let (my_commit, my_reveal) = reveal_pair(1, b"alice", 0xA1);
+        let (their_commit, their_reveal) = reveal_pair(2, b"alice", 0xB2);
+        let reg = registry_with(COMMIT_HEIGHT, &[my_commit, their_commit]);
+
+        let mine = mp
+            .admit_above(DRILL_BOUNDARY, my_reveal.clone(), &st, &MockVerifier, &reg)
+            .expect("my reveal admits — the name is free when I send it");
+        let plain = mp
+            .admit_above(DRILL_BOUNDARY, good_tx(3), &st, &MockVerifier, &reg)
+            .expect("a rider-free tx admits");
+        assert_eq!(mp.len(), 2);
+
+        // Someone else's reveal of the SAME name is mined at 201, and the
+        // registry the node now holds carries their registration.
+        let body = BlockBody {
+            txs: vec![their_reveal.clone()],
+            coinbase: coinbase(201),
+            coinbase_rkm: TEST_RKM,
+        };
+        let mut reg_after = reg.clone();
+        reg_after
+            .apply_block_riders(201, &[crate::store::StoredTx::from(&their_reveal)])
+            .expect("the mined rider applies");
+        let st_after = TestState { tip: 201, ..state_with_anchor() };
+
+        mp.on_block_connected_above(DRILL_BOUNDARY, &body, &st_after, &reg_after);
+
+        assert!(!mp.contains(&mine), "the outraced reveal is evicted, not left un-minable");
+        assert!(mp.contains(&plain), "and the rider-free tx beside it is untouched");
+        assert_eq!(mp.len(), 1);
+
+        // The cause, stated rather than inferred: the pooled reveal now fails
+        // the very check admission ran, which is why reusing `names_admit_op`
+        // is the whole of the eviction rule.
+        assert!(matches!(
+            qlab_devnet::names::names_admit_op_above(DRILL_BOUNDARY, &my_reveal, 202, &reg_after),
+            Err(qlab_devnet::body::BodyError::RiderRule {
+                err: qlab_devnet::names::NameRuleError::NameTaken { .. },
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn rejects_wrong_fee() {
         let mut mp = Mempool::default();
