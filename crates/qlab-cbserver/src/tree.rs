@@ -418,4 +418,152 @@ mod tests {
         // z[1] = H(0,0) via the consensus node hash.
         assert_eq!(zeros()[1], hash_node(&EMPTY_LEAF, &EMPTY_LEAF));
     }
+
+    /// Deterministic pseudo-random leaf (splitmix64 over a per-set seed) — a
+    /// randomised leaf set that is reproducible across runs and machines.
+    fn rand_cm(seed: u64, i: u64) -> [u64; 4] {
+        let mut x = seed ^ i.wrapping_mul(0x9e3779b97f4a7c15);
+        core::array::from_fn(|lane| {
+            x = x.wrapping_add(0x9e3779b97f4a7c15);
+            let mut z = x ^ (lane as u64).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+            z ^ (z >> 31)
+        })
+    }
+
+    /// Issue #386 S1 — THE acceptance spine. `root()` must be byte-identical to
+    /// the ground-truth `root_at(count)` (the `subtree_root` walk) at EVERY
+    /// count: `roots_by_height` is the anchor set every STARK verifies against,
+    /// and a single mismatch at a single count is a chain fork.
+    ///
+    /// Checks every count 0..=2048 over two independent randomised leaf sets,
+    /// then every power-of-two boundary ±1 out to 4097 — the counts where an
+    /// incremental frontier's carry logic can break.
+    #[test]
+    fn i386_s1_incremental_root_byte_identical_to_ground_truth_at_every_count() {
+        for seed in [0x51u64, 0xa5e2_1d0f_3b77_c4d9] {
+            let mut t = CommitmentTree::new();
+            assert_eq!(t.root(), t.root_at(0), "empty tree, seed {seed:#x}");
+            for n in 1..=2048u64 {
+                t.append(rand_cm(seed, n));
+                assert_eq!(
+                    t.root(),
+                    t.root_at(n),
+                    "root() != ground-truth root_at at count {n}, seed {seed:#x}"
+                );
+            }
+            // Boundary counts past the every-count range: 2^k - 1, 2^k, 2^k + 1.
+            let mut n = 2048u64;
+            for boundary in [4096u64] {
+                for target in [boundary - 1, boundary, boundary + 1] {
+                    while n < target {
+                        n += 1;
+                        t.append(rand_cm(seed, n));
+                    }
+                    assert_eq!(
+                        t.root(),
+                        t.root_at(n),
+                        "root() != ground-truth root_at at boundary count {n}, seed {seed:#x}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Issue #386 S3 — authentication paths verify against the CURRENT root
+    /// (`root()`, the incremental one after the swap) at every count, not just
+    /// against the ground-truth walk. The wallet/joiner serving path folds
+    /// `leaf → root()`; both roots are asserted so a cache that drifted from the
+    /// walk cannot hide behind S1's equality.
+    #[test]
+    fn i386_s3_auth_paths_fold_to_the_incremental_root_at_every_count() {
+        let mut t = CommitmentTree::new();
+        for n in 1..=70u64 {
+            t.append(rand_cm(0x53, n));
+            let live = t.root();
+            assert_eq!(live, t.root_at(n), "S1 precondition at count {n}");
+            for pos in 0..n {
+                let w = t.auth_path(pos, n);
+                assert_eq!(
+                    w.fold_root(&t.leaf(pos)),
+                    live,
+                    "auth_path({pos}) must fold to the live root at count {n}"
+                );
+            }
+        }
+    }
+
+    /// Issue #386 S4 — rewind (#162) survives. `Node::rewind_to` rebuilds state
+    /// from genesis through `apply_state` with a FRESH tree, so the property the
+    /// node relies on is: a fresh tree re-appending the retained prefix, then
+    /// appending the post-reorg suffix, reaches a root byte-identical to a tree
+    /// that never saw the rewound leaves — and to the original tree's
+    /// `root_at(prefix)` at the rewind point.
+    #[test]
+    fn i386_s4_rewind_rebuild_then_reappend_matches_never_rewound() {
+        let m = 100u64;
+        let mut big = CommitmentTree::new();
+        for n in 1..=m {
+            big.append(rand_cm(0x54, n));
+        }
+        for k in [0u64, 1, 31, 32, 33, 63, 64, 65, 99, 100] {
+            // The rewind: a fresh tree replaying the retained prefix (what
+            // rewind_to's from_genesis re-fold does).
+            let mut rewound = CommitmentTree::new();
+            for n in 1..=k {
+                rewound.append(rand_cm(0x54, n));
+            }
+            assert_eq!(rewound.root(), big.root_at(k), "rewound root at prefix {k}");
+            assert_eq!(rewound.len(), k);
+            // Re-append a DIFFERENT suffix (the winning branch), and check
+            // against a tree that never held the rewound leaves at all.
+            let mut never = CommitmentTree::new();
+            for n in 1..=k {
+                never.append(rand_cm(0x54, n));
+            }
+            for n in 1..=8u64 {
+                let cm = rand_cm(0xdead_beef ^ k, n);
+                rewound.append(cm);
+                never.append(cm);
+                assert_eq!(
+                    rewound.root(),
+                    never.root(),
+                    "rewound-then-reappended root diverged at prefix {k}, suffix {n}"
+                );
+                assert_eq!(rewound.root(), rewound.root_at(rewound.len()), "S1 on the reappended tree");
+            }
+        }
+    }
+
+    /// Golden roots, pinned as literals against the pre-#386 `subtree_root`
+    /// implementation. The S1 property test proves the two implementations agree
+    /// with each other; this pins them both to the values the live chain's
+    /// `roots_by_height` was built from, so a change that moved both together
+    /// could not pass silently.
+    #[test]
+    fn i386_golden_roots_are_pinned() {
+        let golden: [(u64, &str); 6] = [
+            (0, "27ae5ba08d7291c96c8cbddcc148bf48a6d68c7974b94356f53754ef6171d757"),
+            (1, "09e36c4e49e9ea817cec01b11f15581e40d412f6b37afda1be4df5cc8d50ee6d"),
+            (2, "0bfa97c71f9435568d3c123346d4f32964b3b906d6fd9447e7f30b99fc2fcfeb"),
+            (17, "01da78327eafdde23f430d7bd60ebeac6c6476435eb7e2812bc92d4a2fb5d89c"),
+            (256, "18c120383d6e357beba09be6a5f938387e00de462f6e81fcc9b254b64f4bc20c"),
+            (1000, "ca9fbec3265b264b946803e32a42790fbdda129712a88cfd04c6eb699f967e20"),
+        ];
+        let mut t = CommitmentTree::new();
+        let mut n = 0u64;
+        for (count, want) in golden {
+            while n < count {
+                n += 1;
+                t.append(cm(n));
+            }
+            let got = hex(&digest_bytes(&t.root()));
+            assert_eq!(got, want, "pinned root moved at count {count}");
+        }
+    }
+
+    fn hex(b: &[u8; 32]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
 }
