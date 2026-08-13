@@ -23,7 +23,7 @@ attestation's `burned` column. Below the boundary — the entire chain until
 arming day — nothing changes, which is the property `commitment_at_with_no_boundary_is_v2_everywhere`
 locks.
 
-## 1. Preconditions (all SEVEN, in order — none is a formality)
+## 1. Preconditions (all EIGHT, in order — none is a formality)
 
 1. **The T2 gate is open**: the [#370] checklist is discharged and T1 public
    mining has been running long enough that FCFS registration is fair — the
@@ -48,11 +48,22 @@ locks.
    it is inert data plumbing; `READABLE_TELEMETRY_VERSIONS` keeps opview sighted
    during the roll. Verify: `curl explorer/v1/health.json | jq '.supply.epochs[0].burned'`
    answers `0`, not `null`.
-6. **Larry stamps the boundary height on [#367]** — a halt-height comfortably
+6. **The same-name reveal race is closed
+   ([#387](https://github.com/qumbra-labs/qumbra-lab/issues/387))** — the admit
+   leg (precondition 2) checks each rider with an empty pending set, so two
+   reveals of one name can both pool; `Mempool::assemble` is name-blind and
+   packs both into one template, which `validate_body`'s same-block tie then
+   refuses — the node builds itself an invalid block. Eviction is name-blind
+   too (nullifiers/anchors only), so a reveal outraced by a mined competitor
+   stays pooled as exactly the un-minable poison precondition 2 closes at
+   admit. Unreachable below the boundary; arming day is a land-rush, the most
+   likely moment for same-name collisions — so it must be closed before the
+   stamp, not found by it.
+7. **Larry stamps the boundary height on [#367]** — a halt-height comfortably
    ahead (the 8,640 re-stamp gave ~4.5 h of runway and it was enough only
    because three defects got fixed live; give this one ≥2 days), at an epoch
    boundary if convenient but nothing requires it.
-7. **Fee table re-ratified at the stamp** — the constants merged 2026-08-12
+8. **Fee table re-ratified at the stamp** — the constants merged 2026-08-12
    (1/32/128/512/2048 QMB by length, 365+90 epochs, 8/2,304 window). If QMB's
    purchasing reality moved since, this is the moment to restate or restamp;
    after arming they move only at later boundaries.
