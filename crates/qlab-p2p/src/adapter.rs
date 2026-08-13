@@ -4006,6 +4006,113 @@ mod tests {
         assert_eq!(j.state().tip_height(), 0, "and not one body was applied");
     }
 
+    // --- lab #402: settled history is applied under the as-of-height anchor gate ---
+
+    /// 🔴 **ACCEPTANCE (lab #402): the joiner deadlock repro, and its resolution.**
+    ///
+    /// The live net's shape, at test scale: a chain whose every block carries a
+    /// transaction (T1 by construction), a joiner that has header-synced but
+    /// finalized nothing — and, the one new ingredient, the net's finalized
+    /// checkpoint learned during sync (the #204 query / vote gossip path), with a
+    /// real quorum over the real main-chain block, verified by the unchanged
+    /// tracker.
+    ///
+    /// **The mutation lock is the test above this one**:
+    /// `a_joiner_does_not_fault_a_peer_for_history_it_cannot_judge` runs the same
+    /// bodies WITHOUT the checkpoint and pins the pre-#402 outcome — nothing
+    /// applied, `Ignored(UNJUDGED_ANCHOR_REASON)` forever (the 81-asks wall,
+    /// measured on box 44.223.26.80). This test is the same joiner WITH the
+    /// checkpoint; together they pin that the settled-history gate activates on
+    /// quorum-verified finality and on nothing else.
+    #[test]
+    fn a_joiner_applies_settled_history_whose_anchors_outrun_its_own_finality() {
+        let blocks = transacting_proposer(6);
+        let mut j = follower_with_headers_only(&blocks);
+        assert_eq!(j.state().finalized_height(), None, "the joiner's own finality lags — the deadlock's premise");
+
+        // The net's finalized checkpoint: height 6, the REAL main-chain block, a
+        // real 5-of-7 quorum. `ingest_checkpoint` runs the unchanged verify path.
+        let cp_hash = blocks[5].0.header_hash();
+        let cp = Checkpoint::new(6, cp_hash, cp_hash);
+        let (_, validators) = committee7();
+        let votes: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        assert_eq!(j.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+
+        // Every historical body now applies — no fault, no wall. Before the fix
+        // this loop left the state tip at 0 with six unjudged refusals.
+        for (i, (header, body)) in blocks.iter().enumerate() {
+            let outcome = j.ingest_block(*header, body.clone());
+            assert!(!outcome.is_peer_fault(), "block {}: honest history is never a fault", i + 1);
+        }
+        assert_eq!(j.state().tip_height(), 6, "the deadlock is gone: settled history applied");
+        assert_eq!(j.state_lag().blocks(), 0, "the joiner caught its own chain up");
+        assert_eq!(
+            j.state().finalized_height(),
+            Some(6),
+            "and the durable head landed via sync_state_finality once the bodies did"
+        );
+        assert_eq!(
+            j.ingest_counters().unjudged_anchor,
+            0,
+            "nothing was excused as unjudgeable — every body was judged, at its own height"
+        );
+    }
+
+    /// **S1 (lab #402), at the adapter seam: the settled-history gate is a statement
+    /// about ONE chain — the finalized one — and a sibling block at a settled height
+    /// is not in it.**
+    ///
+    /// A sibling at height 1 (same parent, different body) sits at or below the
+    /// finalized pointer by *height*, but it is not the main-chain block at its
+    /// height, so `block_is_settled_history` refuses it and it stays on today's
+    /// paths: header learned, body unjudged, nothing applied from it. The
+    /// state-machine half of S1 — a root that is on NO chain this node applied is
+    /// refused even under the settled gate — is
+    /// `qlab-node/tests/historical_anchor.rs`.
+    #[test]
+    fn a_sibling_block_below_the_finalized_pointer_is_not_settled_history() {
+        let blocks = transacting_proposer(3);
+        let mut j = follower_with_headers_only(&blocks);
+
+        // A sibling of block 1: same parent (genesis), different tx ⇒ different
+        // header. Mined honestly on a fork this committee never finalized.
+        let sibling = {
+            let mut p = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+            let g = p.chain().genesis_block_hash();
+            p.state_mut().finalize(g).expect("finalize genesis");
+            let anchor = p.state().commitment_root();
+            assert_eq!(p.ingest_tx(tx_with(anchor, 0x77, b"ok")), IngestOutcome::Accepted);
+            let (h, b) = p.mine_block().expect("mine the sibling");
+            (h, b)
+        };
+        assert_ne!(sibling.0.header_hash(), blocks[0].0.header_hash(), "a genuine sibling");
+
+        // Finality lands on the MAIN chain's block 3.
+        let cp_hash = blocks[2].0.header_hash();
+        let cp = Checkpoint::new(3, cp_hash, cp_hash);
+        let (_, validators) = committee7();
+        let votes: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        assert_eq!(j.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+
+        // The main-chain block at height 1 is settled history; its sibling is not,
+        // by the ancestry clause — height alone does not admit it.
+        assert!(j.block_is_settled_history(&blocks[0].0));
+        assert!(!j.block_is_settled_history(&sibling.0));
+
+        // Serve the sibling: unjudged (its anchor answers from our position, and it
+        // is on no settled chain), never applied, and — #134 kept — not a fault.
+        let out = j.ingest_block(sibling.0, sibling.1.clone());
+        assert!(!out.is_peer_fault(), "an honest fork block is not a fault");
+        assert_eq!(j.state().tip_height(), 0, "nothing from the sibling branch was applied");
+
+        // And the settled main chain still applies around it.
+        for (header, body) in blocks.iter() {
+            let _ = j.ingest_block(*header, body.clone());
+        }
+        assert_eq!(j.state().tip_height(), 3);
+        assert_eq!(j.state().tip_hash(), blocks[2].0.header_hash(), "the finalized chain won");
+    }
+
     /// **The pending-body window is bounded on all three axes** (issue #130 (a)).
     ///
     /// #135 filed the unbounded twin of this map and made the argument this test
