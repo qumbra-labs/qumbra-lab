@@ -21,10 +21,15 @@
 
 pub mod report;
 
+use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::ptr;
 
-use qlab_cbserver::client::{light_client_scan, light_client_scan_with, ScanConfig};
+use qlab_note::kem::Dk;
+
+use qlab_cbserver::client::{
+    light_client_scan, light_client_scan_with, ScanConfig, ScanDriver, ScanDriverStep,
+};
 use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
 use qlab_wallet::Wallet;
 use rand::rngs::StdRng;
@@ -424,6 +429,204 @@ pub unsafe extern "C" fn qmb_wallet_scan_report(
     out_string(report::render(&scans, (from, to), url))
 }
 
+/* --- the pumpable scan (issue #395) --------------------------------------- */
+
+/// The caller-pumped scan behind `qmb_scan_*` — the browser/WASM shell's path.
+///
+/// #344's [`qmb_wallet_scan_report_over_fetch`] hands the transport to the
+/// shell but calls it SYNCHRONOUSLY, and a browser has no synchronous fetch to
+/// put behind that callback. This wrapper inverts control the rest of the way:
+/// it owns #350's sans-I/O [`ScanDriver`] (one per diversifier, created in
+/// index order) plus the caller-seeded [`StdRng`], and the shell alternates
+/// [`qmb_scan_step`] with [`qmb_scan_supply`]/[`qmb_scan_supply_err`] from any
+/// async transport. All three scan paths still route into the ONE
+/// orchestration, so detected/opened/unopened cannot drift.
+///
+/// A per-index driver failure folds to the same `never_started` verdict the
+/// sync paths produce — one diversifier's transport failure is its verdict,
+/// never the report's zero.
+pub struct ScanState {
+    label: String,
+    from: u64,
+    to: u64,
+    rng: StdRng,
+    queue: VecDeque<(u64, String, Dk)>,
+    current: Option<(u64, String, ScanDriver)>,
+    scans: Vec<DivScan>,
+    done: bool,
+}
+
+/// Start a pumped scan over `indices` in `[from, to]`. NULL on NULL/invalid
+/// args. `source_label` is what the report NAMES as its source (this library
+/// never sees the transport). `rng_seed32` seeds the decoy rng — 32
+/// platform-sourced bytes, as everywhere in this ABI.
+///
+/// # Safety
+/// `w` live; `source_label` NUL-terminated UTF-8; `indices` points to
+/// `n_indices` u64s; `rng_seed32` points to 32 readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_scan_new(
+    w: *const WalletState,
+    source_label: *const c_char,
+    from: u64,
+    to: u64,
+    indices: *const u64,
+    n_indices: usize,
+    rng_seed32: *const u8,
+) -> *mut ScanState {
+    if w.is_null() || source_label.is_null() || indices.is_null() || rng_seed32.is_null() {
+        return ptr::null_mut();
+    }
+    let label = match CStr::from_ptr(source_label).to_str() {
+        Ok(u) => u.to_string(),
+        Err(_) => return ptr::null_mut(),
+    };
+    let idxs = std::slice::from_raw_parts(indices, n_indices);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(std::slice::from_raw_parts(rng_seed32, 32));
+
+    let state = &*w;
+    let mut queue: VecDeque<(u64, String, Dk)> = idxs
+        .iter()
+        .map(|&idx| {
+            let d = state.wallet.diversifier_at_index(idx);
+            let kp = state.wallet.diversified_keypair(&d);
+            let short = state.wallet.address_at_index(idx).short().encode();
+            (idx, short, kp.dk)
+        })
+        .collect();
+    // The first driver exists from birth, so a response supplied before any
+    // step lands in the driver's own "without requesting a path" fault
+    // instead of vanishing.
+    let current = queue.pop_front().map(|(idx, short, dk)| {
+        (idx, short, ScanDriver::new(dk, from, to, ScanConfig::default()))
+    });
+    Box::into_raw(Box::new(ScanState {
+        label,
+        from,
+        to,
+        rng: StdRng::from_seed(seed),
+        queue,
+        current,
+        scans: Vec::new(),
+        done: false,
+    }))
+}
+
+/// Pump the scan one observation forward.
+///
+/// Returns `1` — NEED: `*out` is the path to fetch; answer it with
+/// [`qmb_scan_supply`] or [`qmb_scan_supply_err`], then step again. Returns
+/// `0` — DONE: `*out` is the rendered report and the handle answers `-1` from
+/// here on (the report crosses once). Returns `-1` on a NULL/finished handle
+/// or NULL `out`. `*out` strings are freed with `qmb_string_free`.
+///
+/// # Safety
+/// `s` live (or NULL); `out` writable (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_scan_step(s: *mut ScanState, out: *mut *mut c_char) -> i32 {
+    if s.is_null() || out.is_null() {
+        return -1;
+    }
+    let st = &mut *s;
+    if st.done {
+        return -1;
+    }
+    loop {
+        let step = match st.current.as_mut() {
+            None => match st.queue.pop_front() {
+                Some((idx, short, dk)) => {
+                    st.current =
+                        Some((idx, short, ScanDriver::new(dk, st.from, st.to, ScanConfig::default())));
+                    continue;
+                }
+                None => {
+                    st.done = true;
+                    *out = out_string(report::render(&st.scans, (st.from, st.to), &st.label));
+                    return 0;
+                }
+            },
+            Some((_, _, driver)) => driver.step(&mut st.rng),
+        };
+        match step {
+            ScanDriverStep::Need(path) => {
+                *out = out_string(path);
+                return 1;
+            }
+            ScanDriverStep::Done(outcome) => {
+                let (idx, short, _) = st.current.take().expect("stepped without a driver");
+                st.scans.push(DivScan::from_outcome(idx, short, &outcome));
+            }
+            ScanDriverStep::Failed(err) => {
+                let (idx, short, _) = st.current.take().expect("stepped without a driver");
+                st.scans.push(DivScan {
+                    index: idx,
+                    address_short: short,
+                    completeness: qlab_cbserver::client::Completeness::Complete,
+                    spendable_bessel: 0,
+                    shadowed_bessel: 0,
+                    never_started: Some(err),
+                });
+            }
+        }
+    }
+}
+
+/// Answer the outstanding NEED with the fetched bytes. The bytes are COPIED —
+/// the caller keeps ownership of its buffer (same inbound convention as
+/// `qmb_wallet_from_entropy`; a WASM host passes a `qmb_alloc` buffer and
+/// `qmb_dealloc`s it afterwards). A NULL body is folded to a transport error,
+/// never a decode of nothing.
+///
+/// # Safety
+/// `s` live (or NULL); `body` points to `len` readable bytes (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_scan_supply(s: *mut ScanState, body: *const u8, len: usize) {
+    if s.is_null() {
+        return;
+    }
+    let st = &mut *s;
+    let response = if body.is_null() {
+        Err("supplied body is NULL".to_string())
+    } else {
+        Ok(std::slice::from_raw_parts(body, len).to_vec())
+    };
+    if let Some((_, _, driver)) = st.current.as_mut() {
+        driver.supply(response);
+    }
+}
+
+/// Answer the outstanding NEED with a transport failure. The reason survives
+/// into the report (UNAVAILABLE discipline — a transport failure never reads
+/// as a zero balance).
+///
+/// # Safety
+/// `s` live (or NULL); `reason` NUL-terminated (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_scan_supply_err(s: *mut ScanState, reason: *const c_char) {
+    if s.is_null() {
+        return;
+    }
+    let st = &mut *s;
+    let reason = if reason.is_null() {
+        "transport failed with no reason".to_string()
+    } else {
+        CStr::from_ptr(reason).to_string_lossy().into_owned()
+    };
+    if let Some((_, _, driver)) = st.current.as_mut() {
+        driver.supply(Err(reason));
+    }
+}
+
+/// # Safety
+/// `s` must be a live handle from [`qmb_scan_new`]; never used after this call.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_scan_free(s: *mut ScanState) {
+    if !s.is_null() {
+        drop(Box::from_raw(s));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -659,6 +862,185 @@ mod tests {
         }
     }
 
+    /* --- the pumpable scan (issue #395) ---------------------------------- */
+
+    unsafe fn take_out(out: *mut c_char) -> String {
+        assert!(!out.is_null());
+        let s = CStr::from_ptr(out).to_str().unwrap().to_string();
+        qmb_string_free(out);
+        s
+    }
+
+    unsafe fn pump_new(w: *const WalletState, indices: &[u64]) -> *mut ScanState {
+        let label = CString::new("https://seed.example.org").unwrap();
+        let seed = [3u8; 32];
+        qmb_scan_new(w, label.as_ptr(), 0, 10, indices.as_ptr(), indices.len(), seed.as_ptr())
+    }
+
+    /// The pump's first NEED is the compact page — the same path vocabulary
+    /// #358's request-path goldens pin, now visible across the ABI.
+    #[test]
+    fn the_pump_first_asks_for_the_compact_page() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([7u8; 32].as_ptr());
+            let s = pump_new(w, &[0]);
+            assert!(!s.is_null());
+            let mut out: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_scan_step(s, &mut out), 1);
+            assert_eq!(take_out(out), "/v1/compact?from=0&to=10");
+            qmb_scan_free(s);
+            qmb_wallet_free(w);
+        }
+    }
+
+    /// A transport failure supplied by the pump must reach the report as
+    /// UNAVAILABLE carrying the shell's own reason — never as a zero. Same
+    /// guarantee as the sync paths; the pump must not weaken it.
+    #[test]
+    fn a_supplied_transport_failure_renders_unavailable_with_the_reason() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([7u8; 32].as_ptr());
+            let s = pump_new(w, &[0]);
+            let mut out: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_scan_step(s, &mut out), 1);
+            qmb_string_free(out);
+            let reason = CString::new("the network is unreachable").unwrap();
+            qmb_scan_supply_err(s, reason.as_ptr());
+            let mut rep: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_scan_step(s, &mut rep), 0);
+            let report = take_out(rep);
+            assert!(report.contains(report::UNAVAILABLE), "{report}");
+            assert!(
+                report.contains("the network is unreachable"),
+                "the shell's own reason must survive into the report: {report}"
+            );
+            assert!(report.contains("https://seed.example.org"), "{report}");
+            assert!(
+                !report.contains("TOTAL spendable: 0"),
+                "a transport failure must never render as an empty wallet: {report}"
+            );
+            qmb_scan_free(s);
+            qmb_wallet_free(w);
+        }
+    }
+
+    /// 200-with-nonsense — captive portal, proxy error page, wrong host — must
+    /// refuse, not decode into a confident zero.
+    #[test]
+    fn a_garbage_page_is_refused_not_believed() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([7u8; 32].as_ptr());
+            let s = pump_new(w, &[0]);
+            let mut out: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_scan_step(s, &mut out), 1);
+            qmb_string_free(out);
+            let junk = b"<html>404 not found</html>";
+            qmb_scan_supply(s, junk.as_ptr(), junk.len());
+            let mut rep: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_scan_step(s, &mut rep), 0);
+            let report = take_out(rep);
+            assert!(report.contains(report::UNAVAILABLE), "{report}");
+            assert!(
+                !report.contains("TOTAL spendable: 0"),
+                "unparseable bytes must not become a zero balance: {report}"
+            );
+            qmb_scan_free(s);
+            qmb_wallet_free(w);
+        }
+    }
+
+    /// One diversifier's transport failure is ITS verdict; the next index
+    /// still scans (its own compact page is asked for afresh), and the total
+    /// stays UNAVAILABLE rather than a partial figure.
+    #[test]
+    fn each_index_gets_its_own_verdict() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([7u8; 32].as_ptr());
+            let s = pump_new(w, &[0, 1]);
+            let mut out: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_scan_step(s, &mut out), 1);
+            qmb_string_free(out);
+            let reason = CString::new("index 0 went dark").unwrap();
+            qmb_scan_supply_err(s, reason.as_ptr());
+            // Index 1 gets its own compact request, not index 0's corpse.
+            let mut out2: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_scan_step(s, &mut out2), 1);
+            assert_eq!(take_out(out2), "/v1/compact?from=0&to=10");
+            qmb_scan_supply_err(s, reason.as_ptr());
+            let mut rep: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_scan_step(s, &mut rep), 0);
+            let report = take_out(rep);
+            assert!(report.contains("[0]") && report.contains("[1]"), "{report}");
+            assert!(report.contains(report::UNAVAILABLE), "{report}");
+            qmb_scan_free(s);
+            qmb_wallet_free(w);
+        }
+    }
+
+    /// NULL args are a programming error in the shell — no handle, no report.
+    #[test]
+    fn null_arguments_never_scan() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([7u8; 32].as_ptr());
+            let label = CString::new("x").unwrap();
+            let idx: [u64; 1] = [0];
+            let seed = [3u8; 32];
+            let null_w: *const WalletState = ptr::null();
+            assert!(qmb_scan_new(null_w, label.as_ptr(), 0, 1, idx.as_ptr(), 1, seed.as_ptr())
+                .is_null());
+            assert!(qmb_scan_new(w, ptr::null(), 0, 1, idx.as_ptr(), 1, seed.as_ptr()).is_null());
+            assert!(qmb_scan_new(w, label.as_ptr(), 0, 1, ptr::null(), 1, seed.as_ptr()).is_null());
+            assert!(qmb_scan_new(w, label.as_ptr(), 0, 1, idx.as_ptr(), 1, ptr::null()).is_null());
+            let mut out: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_scan_step(ptr::null_mut(), &mut out), -1);
+            let s = pump_new(w, &[0]);
+            assert_eq!(qmb_scan_step(s, ptr::null_mut()), -1);
+            qmb_scan_free(s);
+            qmb_wallet_free(w);
+        }
+    }
+
+    /// A response nobody asked for is a fault (the driver's own rule), not a
+    /// scan — and the fault is SAID in the report rather than swallowed.
+    #[test]
+    fn a_response_nobody_asked_for_is_a_fault_not_a_scan() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([7u8; 32].as_ptr());
+            let s = pump_new(w, &[0]);
+            let junk = b"unrequested";
+            qmb_scan_supply(s, junk.as_ptr(), junk.len());
+            let mut rep: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_scan_step(s, &mut rep), 0);
+            let report = take_out(rep);
+            assert!(report.contains("without requesting a path"), "{report}");
+            assert!(report.contains(report::UNAVAILABLE), "{report}");
+            qmb_scan_free(s);
+            qmb_wallet_free(w);
+        }
+    }
+
+    /// The report crosses once; a done pump answers -1, not a second report.
+    #[test]
+    fn the_report_is_returned_once() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([7u8; 32].as_ptr());
+            let s = pump_new(w, &[0]);
+            let mut out: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_scan_step(s, &mut out), 1);
+            qmb_string_free(out);
+            let reason = CString::new("down").unwrap();
+            qmb_scan_supply_err(s, reason.as_ptr());
+            let mut rep: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_scan_step(s, &mut rep), 0);
+            qmb_string_free(rep);
+            let mut again: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_scan_step(s, &mut again), -1);
+            assert!(again.is_null());
+            qmb_scan_free(s);
+            qmb_wallet_free(w);
+        }
+    }
+
     /// The hand-maintained header and this file must declare the same ABI.
     #[test]
     fn the_header_names_every_exported_function_and_nothing_else() {
@@ -687,7 +1069,7 @@ mod tests {
                 // Types, not functions — a closed list on purpose. Widening
                 // this to a prefix match would let an undeclared function slip
                 // through, which is the one thing this half of the test is for.
-                const TYPES: [&str; 2] = ["qmb_wallet_t", "qmb_fetch_fn"];
+                const TYPES: [&str; 3] = ["qmb_wallet_t", "qmb_fetch_fn", "qmb_scan_t"];
                 assert!(
                     exported.contains(&name.as_str()) || TYPES.contains(&name.as_str()),
                     "header declares `{name}` which lib.rs does not export"
