@@ -1548,12 +1548,25 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         while let Some(key) = self.next_applicable_body() {
             let (header, body) = self.pending_bodies.remove(&key).expect("just located");
             self.pending_bytes = self.pending_bytes.saturating_sub(body_weight(&body));
-            // `apply_block` is the authoritative gate and it re-validates the body
-            // against the tree it is actually being applied to — so nothing is ever
-            // folded in on the strength of an anchor answer computed from a stale
-            // tree. It also persists: the log append is inside it, which is what
-            // makes a buffered-then-applied body durable (issue #104).
-            match self.state.apply_block(header, body.clone(), &self.verifier) {
+            // `apply_block_gated` is the authoritative gate and it re-validates the
+            // body against the tree it is actually being applied to — so nothing is
+            // ever folded in on the strength of an anchor answer computed from a
+            // stale tree. It also persists: the log append is inside it, which is
+            // what makes a buffered-then-applied body durable (issue #104).
+            //
+            // The gate is chosen per block (lab #402): a block that is settled
+            // history — the main-chain block at its height under the quorum-verified
+            // finalized pointer — has its anchor rule evaluated as of its OWN
+            // height, because this node's live finality structurally lags its
+            // application while it replays (the #402 joiner deadlock). Everything
+            // else, including every block at or near the live tip, runs the live
+            // rule exactly as before.
+            let gate = if self.block_is_settled_history(&header) {
+                qlab_node::AnchorGate::SettledHistory
+            } else {
+                qlab_node::AnchorGate::Live
+            };
+            match self.state.apply_block_gated(header, body.clone(), &self.verifier, gate) {
                 Ok(_) => {
                     // The registry read here is the post-apply one — `apply_block`
                     // has already folded this body's own riders in, which is what
@@ -2030,6 +2043,35 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         )
     }
 
+    /// Whether `header` is **settled history** (lab #402): the main-chain block at
+    /// its own height, at or below the fork-choice finalized pointer.
+    ///
+    /// This is the predicate that authorises [`qlab_node::AnchorGate::SettledHistory`],
+    /// so both of its inputs are chosen for what they prove:
+    ///
+    /// - the finalized pointer read here is **`ChainState`'s** (head #2), not the
+    ///   tracker's: it has exactly one writer, the vote-tally path *after* the
+    ///   unchanged `FinalityTracker::try_finalize` verified a roster-checked quorum
+    ///   (`Self::ingest_checkpoint_votes`), and `ChainState::set_finalized` refuses a
+    ///   point that is not a known header descending from the previous one — so a
+    ///   height at or below it is committee-finalized AND on the header main chain;
+    /// - `main_chain()` at or below that pointer is immutable (no-reorg-past-finality,
+    ///   `chain.rs`), so "the main-chain hash at `header.height` is this header" is
+    ///   precisely "this block is an ancestor of the finalized checkpoint's block",
+    ///   proven from headers this node already holds.
+    ///
+    /// Nothing the sender says enters (the #134 property, kept): both inputs are this
+    /// node's own. A joiner that has not yet learned any finalized checkpoint answers
+    /// `false` for everything and stays on today's paths.
+    fn block_is_settled_history(&self, header: &BlockHeader) -> bool {
+        let Some(fin_height) = self.chain.finalized_height() else {
+            return false;
+        };
+        header.height <= fin_height
+            && self.chain.main_chain().get(header.height as usize).copied()
+                == Some(header.header_hash())
+    }
+
     fn reject_reason(err: &MempoolError) -> &'static str {
         match err {
             MempoolError::WrongFee { .. } => "wrong fee",
@@ -2224,6 +2266,24 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
             Ok(()) => {}
             Err(e) => match Self::body_fault_class(&e) {
                 BodyFault::Intrinsic(why) => return IngestOutcome::Rejected(why),
+                // Positional, but the block is SETTLED HISTORY (lab #402): the
+                // main-chain block at its own height under the quorum-verified
+                // finalized pointer. Our positional "no" is then a fact about our
+                // lagging replay, not about the block — the #402 deadlock was this
+                // arm's predecessor refusing the same canonical body forever (81
+                // served answers, applied tip pinned at 4912). Fall through to the
+                // header-submit + buffer path below: the binding already passed
+                // (it is checked before the anchor, so a buffered body is
+                // bit-exact the one its mined main-chain header committed to), and
+                // `drain_pending_bodies` re-validates EVERYTHING — proofs
+                // included — inside `apply_block_gated` at exactly the position
+                // the rule is defined at, under the as-of-height anchor gate.
+                //
+                // Checked BEFORE the authoritative arm on purpose: a node whose
+                // own state briefly lags the finalized pointer could otherwise
+                // stand at its tip, judge a canonical block by its stale live
+                // view, and charge the honest peer that served it.
+                BodyFault::Positional(_) if self.block_is_settled_history(&header) => {}
                 // Positional. Charged where our verdict IS the network's — the live
                 // path, where a bad anchor is a bad anchor and costs the sender
                 // exactly what it costs today.

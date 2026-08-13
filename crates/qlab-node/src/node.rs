@@ -1095,6 +1095,42 @@ impl MemNode {
     }
 }
 
+/// How [`Node::apply_block_gated`] evaluates the anchor-finality gate (lab #402).
+///
+/// The anchor rule has two inputs that are *temporal*: which roots were
+/// finalized, and how old the anchor is. [`NodeState::is_valid_anchor`] reads
+/// both from the node's **live** position (its own finalized head and applied
+/// tip) — correct at the tip, and wrong for a block being replayed from settled
+/// history, where the node's finality structurally lags its application (the
+/// #402 joiner deadlock: block 4913's anchor was finalized when 4913 was mined,
+/// and no syncing joiner can ever have it finalized *locally* before applying
+/// 4913).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorGate {
+    /// Today's rule, byte-identical: the anchor's height is at or below **this
+    /// node's** finalized head and within [`MAX_ANCHOR_AGE_BLOCKS`] of **this
+    /// node's** applied tip. The default — every live application, and the only
+    /// gate `apply_block` itself ever uses.
+    Live,
+    /// The block is **settled history** and the anchor rule is evaluated as of
+    /// the block's own height: the anchor root must be one this node's own
+    /// replay computed for an ancestor height `h < H`, with `H − h ≤`
+    /// [`MAX_ANCHOR_AGE_BLOCKS`] (see [`Node::is_valid_anchor_as_of`]).
+    ///
+    /// **Caller contract (security-load-bearing, lab #402):** pass this only
+    /// for a block that is the main-chain block at its own height **at or
+    /// below a quorum-verified finalized checkpoint** — i.e. an ancestor of a
+    /// checkpoint whose vote set passed the unchanged
+    /// `FinalityTracker::try_finalize`. That containment is what carries the
+    /// "was finalized as of H" component of the rule: a block whose anchor had
+    /// not been finalized when it was current would have been refused by every
+    /// honest node then, and so cannot be an ancestor of an honestly finalized
+    /// checkpoint. The structural components (the root is genuinely this
+    /// chain's, the age window, `h < H`) are still enforced here, from state
+    /// this node computed itself.
+    SettledHistory,
+}
+
 impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// Validate and apply a block at the tip, persisting it to the log if the
     /// node is disk-backed. Validation: it extends the tip; the body passes
@@ -1102,11 +1138,32 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// every proof verifies via `verifier`); and no nullifier is already spent.
     /// On success the commitment tree and nullifier set advance and the block
     /// hash is returned.
+    ///
+    /// The anchor gate is [`AnchorGate::Live`] — this is the live-path entry
+    /// point and its behaviour is unchanged by lab #402. A caller replaying
+    /// settled history under a verified finalized checkpoint uses
+    /// [`Self::apply_block_gated`].
     pub fn apply_block<V: TxVerifier>(
         &mut self,
         header: BlockHeader,
         body: BlockBody,
         verifier: &V,
+    ) -> Result<Hash32, NodeError> {
+        self.apply_block_gated(header, body, verifier, AnchorGate::Live)
+    }
+
+    /// [`Self::apply_block`], with the anchor-finality gate chosen by the caller
+    /// (lab #402). Everything else — the tip-extension check, the full body
+    /// validation including proofs, the state funnel, the log append — is
+    /// identical for both gates; the *only* difference is which temporal view
+    /// the anchor rule is evaluated against. See [`AnchorGate::SettledHistory`]
+    /// for the caller contract.
+    pub fn apply_block_gated<V: TxVerifier>(
+        &mut self,
+        header: BlockHeader,
+        body: BlockBody,
+        verifier: &V,
+        gate: AnchorGate,
     ) -> Result<Hash32, NodeError> {
         if header.prev != self.chain.tip_hash() {
             return Err(NodeError::NotExtendingTip {
@@ -1117,14 +1174,21 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // Read-only body validation (anchor closure borrows self immutably). The
         // header goes in too (issue #77): the body must be the one this header
         // committed to, checked before any other body work.
-        {
-            let anchor_ok = |root: &Hash32| self.is_valid_anchor(root);
-            // Lab #367: the registry is the NameView. While the boundary is
-            // unset this is behaviourally identical to plain validate_body;
-            // once armed, rider rules read real state with no plumbing left
-            // to do.
-            validate_body_with_names(&header, &body, verifier, anchor_ok, &self.names)
-                .map_err(NodeError::Body)?;
+        match gate {
+            AnchorGate::Live => {
+                let anchor_ok = |root: &Hash32| self.is_valid_anchor(root);
+                // Lab #367: the registry is the NameView. While the boundary is
+                // unset this is behaviourally identical to plain validate_body;
+                // once armed, rider rules read real state with no plumbing left
+                // to do.
+                validate_body_with_names(&header, &body, verifier, anchor_ok, &self.names)
+                    .map_err(NodeError::Body)?;
+            }
+            AnchorGate::SettledHistory => {
+                let anchor_ok = |root: &Hash32| self.is_valid_anchor_as_of(root, header.height);
+                validate_body_with_names(&header, &body, verifier, anchor_ok, &self.names)
+                    .map_err(NodeError::Body)?;
+            }
         }
         let block = StoredBlock::from_parts(&header, &body);
         let hash = self.apply_state(&block)?;
@@ -1366,6 +1430,34 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// [`crate::coinbase::CoinbaseMaturity`].
     pub fn coinbase_maturity(&self, minted_height: u64) -> crate::coinbase::CoinbaseMaturity {
         crate::coinbase::coinbase_maturity(minted_height, self.chain.tip_height())
+    }
+
+    /// The anchor rule evaluated **as of `block_height`** — the settled-history
+    /// form of [`NodeState::is_valid_anchor`] (lab #402), used only under
+    /// [`AnchorGate::SettledHistory`].
+    ///
+    /// `root` is valid iff this node's **own replay** recorded it as the
+    /// commitment root after some ancestor height `h` with `h < block_height`
+    /// and `block_height − h ≤ MAX_ANCHOR_AGE_BLOCKS` — the same
+    /// [`Self::apply_state`]-maintained index the live rule reads, so a forged
+    /// root, or a root that exists only on a sibling branch, is refused here
+    /// exactly as it is live: it is in no entry of `roots_by_height`, which is
+    /// computed from the blocks this node folded into its own state and never
+    /// taken from a peer.
+    ///
+    /// What this deliberately does **not** re-check is the temporal half of the
+    /// live rule — "`h` was at or below the finalized head when the block was
+    /// mined". That fact was never recorded anywhere (finalization timing is
+    /// per-node; headers carry none of it; `LogRecord::Finalize` is a bare hash)
+    /// and is irrecoverable for existing history. Its security content is
+    /// carried instead by the caller's contract: the block is an ancestor of a
+    /// quorum-verified finalized checkpoint, and a block that violated the live
+    /// rule while current would have been refused by every honest node then and
+    /// so could never have entered an honestly finalized prefix. See
+    /// [`AnchorGate::SettledHistory`] and lab #402.
+    pub fn is_valid_anchor_as_of(&self, root: &Hash32, block_height: u64) -> bool {
+        let floor = block_height.saturating_sub(MAX_ANCHOR_AGE_BLOCKS);
+        self.roots_by_height.range(floor..block_height).any(|(_, r)| r == root)
     }
 }
 
