@@ -625,6 +625,7 @@ impl Mempool {
     /// skipped once the state machine falls behind fork choice. Maturity must not
     /// depend on a call site that stops firing on a desynchronised node, and now
     /// it does not.
+    ///
     /// ## The name leg (lab #387)
     ///
     /// Nullifiers and anchors are not the only way a pooled tx can go stale. A
