@@ -346,18 +346,42 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
              blocks.log (issue #225)."
         );
         println!("      reason: {why}");
-        println!(
-            "      Recovered by a full replay from genesis — the log is the source of truth and \
-             this"
-        );
-        println!(
-            "      state is exactly what a from-genesis replay reaches. The stale snapshot is \
-             rewritten"
-        );
-        println!(
-            "      at the next graceful stop. If this repeats every start, the log is what to \
-             look at."
-        );
+        // Lab #408: the rejection no longer implies the genesis fold. When the
+        // log proves the snapshot's tip is on the finalized main chain, its
+        // state was honoured anyway and only the tail was replayed — say which
+        // of the two recoveries this start actually was.
+        if node.recovery_report().snapshot_height.is_some() {
+            println!(
+                "      Degraded to a NEAR-TIP resume (lab #408): the log's own finalizations \
+                 prove the"
+            );
+            println!(
+                "      snapshot's tip is on the finalized main chain, so its state was honoured \
+                 and only"
+            );
+            println!(
+                "      the records past it were replayed. State is exactly what a from-genesis \
+                 replay"
+            );
+            println!(
+                "      reaches. The snapshot is rewritten at the next graceful stop; if this \
+                 repeats"
+            );
+            println!("      every start, the log is what to look at.");
+        } else {
+            println!(
+                "      Recovered by a full replay from genesis — the log is the source of truth \
+                 and this"
+            );
+            println!(
+                "      state is exactly what a from-genesis replay reaches. The stale snapshot \
+                 is rewritten"
+            );
+            println!(
+                "      at the next graceful stop. If this repeats every start, the log is what \
+                 to look at."
+            );
+        }
     }
     println!("  genesis hash: {}", genesis.hash_hex());
     println!("  mining:       {}", config.mining);

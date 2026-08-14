@@ -203,6 +203,17 @@ pub enum SnapshotRejection {
     /// not this case: absence means the snapshot writer predates #367, whose
     /// registry state is exactly empty.
     NamesSidecarDisagreement { reason: String },
+    /// `snapshot.bin` is present but could not even be loaded — undecodable
+    /// bytes or a [`persist::FORMAT_VERSION`] mismatch (lab #408). Before #408
+    /// this was `load_snapshot`'s silent `Ok(None)`, indistinguishable from a
+    /// data dir that never had a snapshot.
+    NotLoadable { reject: persist::SnapshotLoadReject },
+    /// The snapshot decodes but hangs from a different genesis block than the
+    /// one this node was handed — a snapshot from another net (or another
+    /// mint). Also a silent fall-through before lab #408: the same
+    /// present-but-unusable class as the load rejections above, discarded by a
+    /// `filter()` with no record that a snapshot was ever there.
+    GenesisMismatch { snapshot_genesis: Hash32, our_genesis: Hash32 },
 }
 
 impl std::fmt::Display for SnapshotRejection {
@@ -244,6 +255,14 @@ impl std::fmt::Display for SnapshotRejection {
                      replaying from genesis rebuilds the registry from the log"
                 )
             }
+            SnapshotRejection::NotLoadable { reject } => write!(f, "{reject}"),
+            SnapshotRejection::GenesisMismatch { snapshot_genesis, our_genesis } => write!(
+                f,
+                "the snapshot hangs from genesis block {} but this node's genesis block is {} — \
+                 it belongs to a different net",
+                hex8(snapshot_genesis),
+                hex8(our_genesis)
+            ),
         }
     }
 }
@@ -254,12 +273,17 @@ impl std::fmt::Display for SnapshotRejection {
 /// blocks above its applied height plus finalizations that advanced beyond its
 /// restored finalized head. With no snapshot, every decoded record is replayed.
 ///
-/// `snapshot_rejected` is `Some` when a snapshot **was** on disk, decoded, and
-/// matched this genesis, but could not be honoured against the log — see
-/// [`SnapshotRejection`]. `snapshot_height` is `None` in that case (no snapshot
-/// was used), which is exactly why the two fields are separate: before issue
-/// #225 "no snapshot was used" and "the snapshot was unusable" were the same
-/// report.
+/// `snapshot_rejected` is `Some` when a snapshot **was** on disk but could not
+/// be honoured — see [`SnapshotRejection`]. `snapshot_height` is usually `None`
+/// in that case (no snapshot was used and the resume was a full replay), which
+/// is exactly why the two fields are separate: before issue #225 "no snapshot
+/// was used" and "the snapshot was unusable" were the same report.
+///
+/// **Both `Some` = the lab #408 near-tip degrade**: the snapshot was rejected,
+/// but the log itself proves its tip is on the finalized main chain, so its
+/// derived state was honoured anyway and only the tail was replayed. The
+/// rejection is still reported — a rejected snapshot is an operator event —
+/// but it no longer costs a from-genesis fold.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
     pub snapshot_height: Option<u64>,
@@ -273,6 +297,18 @@ impl std::fmt::Display for RecoveryReport {
         // The rejected case is checked first and worded loudly: it is the one
         // startup where the operator has something to do afterwards.
         if let Some(why) = &self.snapshot_rejected {
+            // Lab #408: rejected + a snapshot height = the near-tip degrade.
+            // The rejection stays in the line — it is still an event — but the
+            // resume it describes is the fast one, not the genesis fold.
+            if let Some(height) = self.snapshot_height {
+                return write!(
+                    f,
+                    "RECOVERY snapshot REJECTED ({why}) but its tip is on the finalized main \
+                     chain — near-tip resume from height {height}, replayed {} records, resumed \
+                     at tip {}",
+                    self.replayed_records, self.resumed_tip
+                );
+            }
             return write!(
                 f,
                 "RECOVERY snapshot DISCARDED ({why}), full replay from genesis, replayed {} \
@@ -610,9 +646,28 @@ impl MemNode {
 
         let records = persist::read_records(&dir).map_err(NodeError::Io)?;
         let genesis_block_hash = genesis.header().header_hash();
-        let snapshot = persist::load_snapshot(&dir)
-            .map_err(NodeError::Io)?
-            .filter(|snap| snap.genesis_block_hash == genesis_block_hash);
+        // Lab #408: `Ok(None)`-style flattening is gone. A present-but-unusable
+        // snapshot is a typed rejection that reaches the RECOVERY line exactly
+        // like the #225 resume-time rejections below — a rejected snapshot is
+        // an operator event, never a silent fallthrough to the genesis fold.
+        let mut snapshot_rejected = None;
+        let snapshot = match persist::load_snapshot(&dir).map_err(NodeError::Io)? {
+            persist::SnapshotLoad::Absent => None,
+            persist::SnapshotLoad::Rejected(reject) => {
+                snapshot_rejected = Some(SnapshotRejection::NotLoadable { reject });
+                None
+            }
+            persist::SnapshotLoad::Loaded(snap)
+                if snap.genesis_block_hash != genesis_block_hash =>
+            {
+                snapshot_rejected = Some(SnapshotRejection::GenesisMismatch {
+                    snapshot_genesis: snap.genesis_block_hash,
+                    our_genesis: genesis_block_hash,
+                });
+                None
+            }
+            persist::SnapshotLoad::Loaded(snap) => Some(snap),
+        };
 
         // Fast path: restore derived state (tree/nullifiers/roots) from the
         // snapshot, so log-prefix blocks only need to rebuild the chain store
@@ -626,11 +681,21 @@ impl MemNode {
         // version-mismatched snapshot. Issue #162 gave it a second way to happen,
         // and issue #225 a third — see [`Self::resume_from_snapshot`]. The reason
         // is carried into the [`RecoveryReport`] rather than dropped.
-        let mut snapshot_rejected = None;
         if let Some(snap) = snapshot.as_ref() {
             match Self::resume_from_snapshot(&dir, &genesis, snap, &records)? {
                 SnapshotResume::Resumed(node) => return Ok(node),
-                SnapshotResume::Rejected(why) => snapshot_rejected = Some(why),
+                SnapshotResume::Rejected(why) => {
+                    // Lab #408: before conceding the genesis fold, try the
+                    // near-tip degrade — honour the rejected snapshot anyway
+                    // when the log itself proves its tip is on the finalized
+                    // main chain. Any failure inside the attempt falls back to
+                    // the full replay, which stays the correctness anchor.
+                    if let Some(node) = Self::resume_near_tip(&dir, &genesis, snap, &records, &why)
+                    {
+                        return Ok(node);
+                    }
+                    snapshot_rejected = Some(why);
+                }
             }
         }
         Self::resume_by_replay(&dir, genesis, &records, snapshot_rejected)
@@ -847,6 +912,190 @@ impl MemNode {
             snapshot_rejected: None,
         };
         Ok(SnapshotResume::Resumed(node))
+    }
+
+    /// **The lab #408 near-tip degrade**: honour a REJECTED snapshot anyway,
+    /// when the log itself proves the snapshot's tip is the finalized main
+    /// chain's block at its height — so the rejection costs a tail replay, not
+    /// a from-genesis fold (~8 min on the live fleet post-#386, hours before).
+    ///
+    /// # Why a rejected snapshot can ever be trusted
+    ///
+    /// The #225 rejections are statements about the *reconstruction*, not
+    /// necessarily about the snapshot: the prefix loop sees only records at or
+    /// below `applied_height`, so an orphan the tail's fork choice later
+    /// abandoned can make an honest snapshot unreconstructable from the prefix
+    /// alone (`RewindRefused`), and a prefix that ends on a losing sibling
+    /// makes an honest snapshot look tip-disagreeing. What separates "honest
+    /// but unreconstructable" from "state of a branch this log abandoned" is
+    /// **finality**: if the log's own finalizations prove `snap.tip` is the
+    /// main-chain block at `applied_height`, then the canonical state at that
+    /// height is unique, deterministic, and exactly what the live node held
+    /// when it wrote the snapshot — the same trust an honoured snapshot gets.
+    /// A snapshot whose tip finality does NOT corroborate keeps today's full
+    /// replay: for a genuinely lost branch the fold is not waste, it is the
+    /// only correct answer.
+    ///
+    /// # The failure discipline
+    ///
+    /// `None` = "this attempt buys nothing safe" and the caller proceeds to
+    /// [`Self::resume_by_replay`] with the original rejection — including on
+    /// internal errors, because whatever the log's real problem is, the full
+    /// replay either survives it or refuses with its own, better reason. This
+    /// path can therefore never turn a loud refusal into a silent success: it
+    /// only ever *succeeds* on state identical to what the replay reaches
+    /// (open == replay stays the acceptance anchor, test-locked), or steps
+    /// aside entirely.
+    ///
+    /// [`SnapshotRejection::NamesSidecarDisagreement`] is excluded by
+    /// construction: the registry at `applied_height` is derived state this
+    /// path cannot re-derive without the very fold it exists to skip.
+    fn resume_near_tip(
+        dir: &Path,
+        genesis: &StoredBlock,
+        snap: &Snapshot,
+        records: &[LogRecord],
+        why: &SnapshotRejection,
+    ) -> Option<Self> {
+        match why {
+            SnapshotRejection::TipDisagreement { .. } | SnapshotRejection::RewindRefused { .. } => {}
+            _ => return None,
+        }
+        // A height-0 snapshot IS the genesis state; the "degrade" would be the
+        // full replay wearing a different name.
+        if snap.applied_height == 0 {
+            return None;
+        }
+
+        // (1) Prove `snap.tip` is the finalized main chain's block at
+        // `applied_height`, from headers and finalizations alone — no state
+        // fold. Finalizations are monotone along one chain (no-reorg-past-
+        // finality, enforced at every live `set_finalized`), so the LAST
+        // logged finalization's ancestry at `applied_height` is the proof.
+        let mut by_hash: HashMap<Hash32, &StoredBlock> = HashMap::new();
+        for rec in records {
+            if let LogRecord::Block(b) = rec {
+                by_hash.insert(b.header().header_hash(), b);
+            }
+        }
+        let fin_hash = records.iter().rev().find_map(|rec| match rec {
+            LogRecord::Finalize(h) if by_hash.contains_key(h) => Some(*h),
+            _ => None,
+        })?;
+        if by_hash[&fin_hash].header.height < snap.applied_height {
+            return None; // finality never reached the snapshot's height: no proof
+        }
+        let mut cursor = fin_hash;
+        while by_hash.get(&cursor)?.header.height > snap.applied_height {
+            cursor = by_hash[&cursor].header.prev;
+        }
+        if cursor != snap.tip || by_hash[&cursor].header.height != snap.applied_height {
+            return None; // the finalized main chain passes through a different block here
+        }
+
+        // (2) Derived state from the snapshot; the registry sidecar under the
+        // same rule the honoured path applies (absent = pre-#367 = empty).
+        let mut node = Self::from_genesis(genesis.clone(), Some(dir.to_path_buf()));
+        node.restore_from_snapshot(snap);
+        match crate::name_registry::load_names_at(dir) {
+            Ok(None) => {}
+            Ok(Some((names, at_height))) if at_height == snap.applied_height => node.names = names,
+            _ => return None,
+        }
+
+        // (3) The chain store, rebuilt along the proven ancestor path only —
+        // cheap `put_block` inserts in ascending order, no rewind inference
+        // needed because the path is linear by construction.
+        let genesis_block_hash = genesis.header().header_hash();
+        let mut path: Vec<&StoredBlock> = Vec::with_capacity(snap.applied_height as usize);
+        let mut cursor = snap.tip;
+        while cursor != genesis_block_hash {
+            // The cap is defensive: heights strictly descend on an honest
+            // chain, so a longer walk means a malformed log — the replay's
+            // problem to refuse, not this path's to interpret.
+            if path.len() > snap.applied_height as usize {
+                return None;
+            }
+            let block = by_hash.get(&cursor)?;
+            path.push(block);
+            cursor = block.header.prev;
+        }
+        path.reverse();
+        for block in path {
+            // The binding is still checked (issue #77): this path skips
+            // `apply_state`, so it would otherwise be the one door a corrupted
+            // log record enters by.
+            check_stored_binding(block).ok()?;
+            node.chain.put_block((*block).clone()).ok()?;
+        }
+        if node.chain.tip_hash() != snap.tip {
+            return None;
+        }
+
+        // (4) The snapshot's own finalized head, under the honoured path's
+        // exact discipline: provable against the store, and present in the
+        // log. A snapshot that fails either check steps aside — the replay
+        // decides what the datadir really is.
+        if let Some((hash, height)) = snap.finalized {
+            node.chain.restore_finalized(hash, height).ok()?;
+            if !records
+                .iter()
+                .any(|rec| matches!(rec, LogRecord::Finalize(logged) if *logged == hash))
+            {
+                return None;
+            }
+        }
+
+        // (5) The tail — the beyond-the-snapshot loop, with one new rule: a
+        // tail block whose rewind is refused forks below a point finality has
+        // sealed (its parent is not in the applied store, and the applied
+        // store holds the finalized chain through `snap.tip`), so it can never
+        // re-enter the applied chain. It is retained as a body — exactly what
+        // the full replay ends up doing with it (applied, undone by the
+        // winner's rewind, retained) — and skipped as state.
+        let tail_blocks = records
+            .iter()
+            .filter(|r| matches!(r, LogRecord::Block(b) if b.header.height > snap.applied_height))
+            .count();
+        let mut progress = ReplayProgress::start(
+            tail_blocks,
+            &format!("near-tip catch-up past rejected snapshot at height {}", snap.applied_height),
+        );
+        let mut replayed_records = 0usize;
+        for rec in records {
+            match rec {
+                LogRecord::Block(b) if b.header.height <= snap.applied_height => {
+                    // Prefix blocks off the proven path were applied and later
+                    // undone by the live node — retained-body parity with the
+                    // full replay (issue #198).
+                    if !node.chain.contains(&b.header().header_hash()) {
+                        node.retained.insert(b.clone());
+                    }
+                }
+                LogRecord::Block(b) => {
+                    match node.apply_logged_block(b) {
+                        Ok(()) => replayed_records += 1,
+                        Err(NodeError::Rewind(_)) => node.retained.insert(b.clone()),
+                        Err(_) => return None,
+                    }
+                    progress.tick();
+                }
+                LogRecord::Finalize(hash) => {
+                    if node.chain.set_finalized(*hash).is_ok() {
+                        replayed_records += 1;
+                    }
+                }
+            }
+        }
+
+        node.retained.prune_below(node.chain.tip_height());
+        node.recovery = RecoveryReport {
+            snapshot_height: Some(snap.applied_height),
+            replayed_records,
+            resumed_tip: node.chain.tip_height(),
+            snapshot_rejected: Some(why.clone()),
+        };
+        Some(node)
     }
 
     /// The from-genesis resume: every record replayed, no snapshot consulted.
