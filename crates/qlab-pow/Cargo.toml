@@ -19,4 +19,11 @@ publish.workspace = true
 [dependencies]
 # Rust FFI bindings to the reference RandomX implementation (tevador/RandomX).
 # Builds the C++ library at compile time (cmake + a C++ toolchain required).
-randomx-rs = "1.4.1"
+randomx-rs = { version = "1.4.1", optional = true }
+
+# The RandomX C++ chain is heavy and cannot cross-compile to wasm32 (lab #400);
+# lwma and keyblock are pure and stay unconditional. Default ON — every existing
+# consumer is unchanged; only the wallet-core/wasm graph opts out.
+[features]
+default = ["randomx"]
+randomx = ["dep:randomx-rs"]

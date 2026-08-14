@@ -27,6 +27,7 @@
 //! is a sim convenience, not a consensus rule proposal, and it is what LWMA-120
 //! (`qlab_pow::lwma`, wired in [`crate::validation`]) retargets.
 
+#[cfg(feature = "randomx")]
 use qlab_pow::RandomXHasher;
 
 use crate::header::{BlockHeader, Hash32};
@@ -70,10 +71,12 @@ impl PowEngine for KeccakPow {
 /// RandomX VM behind a `RefCell`); the multi-node [`crate::net::Network`] sims,
 /// which need `Clone`, stay on [`KeccakPow`]. A single [`crate::node::Node`] drives
 /// RandomX fine.
+#[cfg(feature = "randomx")]
 pub struct RandomXPow {
     hasher: RandomXHasher,
 }
 
+#[cfg(feature = "randomx")]
 impl RandomXPow {
     /// A RandomX engine using the platform's recommended flags.
     pub fn new() -> Self {
@@ -83,12 +86,14 @@ impl RandomXPow {
     }
 }
 
+#[cfg(feature = "randomx")]
 impl Default for RandomXPow {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "randomx")]
 impl PowEngine for RandomXPow {
     fn name(&self) -> &'static str {
         "randomx"

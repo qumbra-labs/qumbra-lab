@@ -1268,6 +1268,7 @@ name = "qumbra-wallet"
 version = "0.0.0"
 dependencies = [
  "bincode",
+ "getrandom 0.4.3",
  "p3-field",
  "qlab-air",
  "qlab-cbserver",

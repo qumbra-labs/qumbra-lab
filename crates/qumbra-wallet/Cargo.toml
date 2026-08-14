@@ -17,13 +17,14 @@ publish.workspace = true
 [[bin]]
 name = "qumbra-wallet"
 path = "src/main.rs"
+required-features = ["net", "prove"]
 
 [dependencies]
 # Key hierarchy, non-BIP-39 mnemonic (golden-frozen), diversified addresses.
 qlab-wallet = { path = "../qlab-wallet" }
 # The whole light-client scan flow and its honesty vocabulary (ScanOutcome,
 # Completeness) — reused, never reimplemented.
-qlab-cbserver = { path = "../qlab-cbserver" }
+qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
 # ML-KEM Keypair/Dk types the scan takes.
 qlab-note = { path = "../qlab-note" }
 # OS CSPRNG for seed entropy and the scan's decoy rng.
@@ -38,15 +39,15 @@ qrcode = { version = "0.14", default-features = false }
 # the REAL prover, tx body types + the posted-fee table, and the canonical tx
 # wire bytes.
 qlab-air = { path = "../qlab-air" }
-qlab-consensus = { path = "../qlab-consensus" }
-qlab-devnet = { path = "../qlab-devnet" }
-qlab-p2p = { path = "../qlab-p2p" }
+qlab-consensus = { path = "../qlab-consensus", optional = true }
+qlab-devnet = { path = "../qlab-devnet", default-features = false }
+qlab-p2p = { path = "../qlab-p2p", optional = true }
 # The served wires this wallet consumes, decoded by their OWN codecs, never a
 # second reading of them: `TreeLeaves` (golden-frozen by #275, stamp rider 1)
 # and `AnchorSet`. Adds NO crate to the build — qlab-p2p above already depends
 # on qlab-node, so this promotes a transitive dependency to a declared one.
 # The wallet still runs no node (the brief's A2 rejection): it uses the codecs.
-qlab-node = { path = "../qlab-node" }
+qlab-node = { path = "../qlab-node", default-features = false }
 bincode = "1"
 # Only for the send test's declared-surface comparison (PrimeField32 → u32),
 # same pin as qlab-consensus.
@@ -67,13 +68,13 @@ p3-field = "=0.6.1"
 # `rustls-pki-types` is deliberately NOT a direct dependency: `ServerName` comes
 # through `rustls::pki_types`, rustls' own public re-export, so there is one
 # version to keep in step instead of two. It is pinned in `Cargo.lock` either way.
-rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"], optional = true }
 # The Mozilla root program, compiled in. No `rustls-native-certs`: reading the
 # platform trust store makes the wallet's answer depend on the operator's
 # machine, and a wallet that trusts a locally-injected root is a wallet whose
 # server authentication — the ONLY property classical TLS buys us here — is
 # whatever the host says it is.
-webpki-roots = "1"
+webpki-roots = { version = "1", optional = true }
 
 # The first-spend e2e (issue #276) runs a REAL local devnet: a node the test
 # mines directly and serves over a real socket, the faucet that funds the
@@ -85,3 +86,22 @@ webpki-roots = "1"
 qlab-faucet = { path = "../qlab-faucet" }
 qumbra-faucet = { path = "../qumbra-faucet" }
 qumbra-node = { path = "../qumbra-node" }
+
+# wasm32 (the browser-extension shell, lab #400): getrandom needs the JS backend
+# wired explicitly (crypto.getRandomValues) — same block as qumbra-ffi's.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+# lab #400: the wallet CORE (seed/keys, scan helpers, spent subtraction, tree
+# catch-up, the select driver, the witness bundle) must compile to wasm32 for
+# the browser shell. Heavy halves are default-ON features — every existing
+# consumer is unchanged; qumbra-ffi opts down to the core.
+[features]
+default = ["net", "prove", "randomx"]
+# rustls under the hand-rolled HTTP/1.1 — everything that touches a socket.
+net = ["dep:rustls", "dep:webpki-roots"]
+# the REAL prover and the canonical tx wire — the host/CLI half of a spend.
+prove = ["dep:qlab-consensus", "dep:qlab-p2p"]
+# the RandomX C++ chain, via the qlab-devnet/qlab-node passthroughs.
+randomx = ["qlab-devnet/randomx", "qlab-node/randomx"]
+
