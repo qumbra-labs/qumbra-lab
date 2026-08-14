@@ -637,6 +637,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // to re-sync everything it already had on disk.
         let resumed = me.state.chain().chain().clone();
         me.chain = resumed;
+        // Rehydrate the derived settled-prefix cache once at startup. Body
+        // dispatch must remain a cache-only reader: rebuilding here keeps a
+        // restarted node's first historical body from paying an O(finalized
+        // height) walk inside `pump.dispatch` (QUM-111 live follow-up).
+        me.sync_settled_prefix();
         // The state-machine chain already restored and proved this durable point.
         // Rehydrate the committee tracker through its named recovery constructor:
         // startup is not a fresh quorum event and must never be routed through
@@ -2065,17 +2070,16 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     ///   point that is not a known header descending from the previous one — so a
     ///   height at or below it is committee-finalized AND on the header main chain;
     /// - [`Self::settled_prefix`] is derived from that finalized block's own `prev`
-    ///   links and only extended after finality advances. No-reorg-past-finality
-    ///   (`chain.rs`) makes every cached entry immutable, so "the finalized-prefix
-    ///   hash at `header.height` is this header" is precisely "this block is an
-    ///   ancestor of the finalized checkpoint's block", proven from headers this
-    ///   node already holds.
+    ///   links and extended at the finality transition (plus startup), never by this
+    ///   per-body reader. No-reorg-past-finality (`chain.rs`) makes every cached
+    ///   entry immutable, so "the finalized-prefix hash at `header.height` is this
+    ///   header" is precisely "this block is an ancestor of the finalized
+    ///   checkpoint's block", proven from headers this node already holds.
     ///
     /// Nothing the sender says enters (the #134 property, kept): both inputs are this
     /// node's own. A joiner that has not yet learned any finalized checkpoint answers
     /// `false` for everything and stays on today's paths.
-    fn block_is_settled_history(&mut self, header: &BlockHeader) -> bool {
-        self.sync_settled_prefix();
+    fn block_is_settled_history(&self, header: &BlockHeader) -> bool {
         usize::try_from(header.height)
             .ok()
             .and_then(|height| self.settled_prefix.get(height))
@@ -2084,7 +2088,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     }
 
     /// Bring [`Self::settled_prefix`] to the current quorum-verified finalized
-    /// head. The ordinary call is O(1): length + tail comparisons. A finality
+    /// head. Called only when that head advances, plus once at startup — never by
+    /// [`Self::block_is_settled_history`] or the per-body dispatch path. A finality
     /// advance walks only the newly-settled suffix once, so its total work across
     /// the life of a chain is O(finalized height), not O(blocks × header tip).
     ///
@@ -2652,7 +2657,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
                     // fork-choice head that declined to advance was byte-identical,
                     // on every surface, to one that did.
                     match self.chain.set_finalized(cp.block_hash) {
-                        Ok(()) => self.note_finalize_recorded("chain"),
+                        Ok(()) => {
+                            self.note_finalize_recorded("chain");
+                            // Maintain the derived prefix at the state transition
+                            // that invalidates it. Historical-body dispatch below
+                            // is then a single cache lookup, even when a joiner's
+                            // first checkpoint settles thousands of headers.
+                            self.sync_settled_prefix();
+                        }
                         Err(e) => {
                             // Issue #241: this head always held the typed refusal —
                             // it is the durable head that lost it. The rendering now
@@ -4189,6 +4201,34 @@ mod tests {
         assert!(j.block_is_settled_history(&blocks[5].0));
         assert_eq!(&j.settled_prefix[..first_prefix.len()], first_prefix.as_slice());
         assert_eq!(j.settled_prefix, j.chain().main_chain()[..=6]);
+    }
+
+    /// QUM-111 live-regression mutation lock: the predicate reached from
+    /// `ingest_block` is a cache-only read. In particular, it may not repair or
+    /// rebuild the prefix on a body frame — the live joiner paid that walk once per
+    /// dispatched frame while processing its first large checkpoint and wedged in
+    /// `pump.dispatch`.
+    #[test]
+    fn settled_history_body_lookup_never_rebuilds_the_prefix() {
+        let blocks = transacting_proposer(3);
+        let mut j = follower_with_headers_only(&blocks);
+        let (_, validators) = committee7();
+        let cp_hash = blocks[2].0.header_hash();
+        let cp = Checkpoint::new(3, cp_hash, cp_hash);
+        let votes: Vec<Vote> =
+            validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        assert_eq!(j.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+        assert!(j.block_is_settled_history(&blocks[2].0));
+
+        // Corrupt only the derived acceleration structure. A lookup must fail
+        // closed and leave it untouched; the explicit transition hook repairs it.
+        j.settled_prefix.clear();
+        assert!(!j.block_is_settled_history(&blocks[2].0));
+        assert!(j.settled_prefix.is_empty(), "a body lookup performed no rebuild");
+
+        j.sync_settled_prefix();
+        assert!(j.block_is_settled_history(&blocks[2].0));
+        assert_eq!(j.settled_prefix, j.chain().main_chain()[..=3]);
     }
 
     /// **S1 (lab #402), at the adapter seam: the settled-history gate is a statement
