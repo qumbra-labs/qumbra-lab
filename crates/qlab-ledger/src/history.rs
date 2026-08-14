@@ -62,7 +62,7 @@ use qlab_wallet::Wallet;
 
 use crate::sends::{SendLog, SendRecord};
 use crate::spent::{subtract_spent, SpentSet};
-use crate::view::{SpentCoverage, UNAVAILABLE};
+use crate::vocab::{SpentCoverage, UNAVAILABLE};
 
 /// One address's scan, as the CLI hands it over: `Err` means the scan never
 /// started for that key (the compact fetch or decode failed), which is a named

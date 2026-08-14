@@ -1,0 +1,30 @@
+[package]
+name = "qlab-ledger"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The wallet's own ledger — received notes, on-chain-nullifier spends, and send
+# events reconstructed from same-height co-occurrence (lab #324, #407).
+#
+# Extracted from `qumbra-wallet` so that shells which are not the CLI can render
+# it. The CLI crate's dependency graph includes `qlab-devnet`, which pulls
+# `qlab-pow` -> `randomx-rs`'s C++/cmake and therefore cannot cross-compile to
+# iOS; and reimplementing a money verdict in Swift is what "reused, never
+# reimplemented" forbids. So the ledger moves here and BOTH shells call it.
+#
+# Deliberately NO qlab-devnet dependency. Fee attribution arrives as a
+# caller-supplied closure (see `build`'s `fee_for`), the same shape #297 used for
+# `light_client_scan_with`: one implementation of the flow, the capability handed
+# in by whoever can carry it.
+
+[dependencies]
+# ScanOutcome / Completeness — the scan's own honesty vocabulary, reused.
+qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
+# The key hierarchy and diversified addresses.
+qlab-wallet = { path = "../qlab-wallet" }
+# `narrow::derive_input` for the nullifier — deliberately the SAME code the
+# circuit uses, so a wallet cannot disagree with consensus about what is spent.
+qlab-air = { path = "../qlab-air" }
+qlab-note = { path = "../qlab-note" }

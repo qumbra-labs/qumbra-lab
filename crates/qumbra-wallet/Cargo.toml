@@ -27,6 +27,9 @@ required-features = ["host"]
 [dependencies]
 # Key hierarchy, non-BIP-39 mnemonic (golden-frozen), diversified addresses.
 qlab-wallet = { path = "../qlab-wallet" }
+# The ledger, extracted so non-CLI shells can render it too (lab #407). This
+# crate supplies the fee table the ledger asks for via its `fee_for` seam.
+qlab-ledger = { path = "../qlab-ledger" }
 # The whole light-client scan flow and its honesty vocabulary (ScanOutcome,
 # Completeness) — reused, never reimplemented.
 qlab-cbserver = { path = "../qlab-cbserver", default-features = false }

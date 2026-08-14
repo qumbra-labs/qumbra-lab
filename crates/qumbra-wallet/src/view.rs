@@ -29,27 +29,10 @@
 
 use qlab_cbserver::client::{Completeness, ScanOutcome};
 
-use crate::spent::SpentReport;
-
-/// The stable refused-figures token — same spelling as opview's and the
-/// explorer's, deliberately.
-pub const UNAVAILABLE: &str = "UNAVAILABLE";
-
-/// How far the spend-subtraction reached — a report-level fact, because the
-/// nullifier stream is fetched once for the whole scan and covers every address
-/// in it (lab issue #314).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SpentCoverage {
-    /// The chain's nullifiers are in hand for `range`, so every figure below has
-    /// had this wallet's spends subtracted. `None` means the endpoint held **no**
-    /// main-chain block in the requested range at all — which is a covered state,
-    /// not a failed one, because a range with no blocks has no outputs in it
-    /// either.
-    Covered { range: Option<(u64, u64)> },
-    /// The stream could not be read or did not reach far enough. **No figure is
-    /// quotable** — carries the reason, verbatim.
-    Unavailable { why: String },
-}
+use qlab_ledger::spent::SpentReport;
+// The vocabulary moved to qlab-ledger with the ledger it serves; imported back
+// so there is exactly one spelling of UNAVAILABLE and one SpentCoverage.
+pub use qlab_ledger::vocab::{SpentCoverage, UNAVAILABLE};
 
 /// One diversifier's scan, reduced to what the report needs. A separate struct
 /// (rather than holding `ScanOutcome` whole) so render tests can construct

@@ -1127,6 +1127,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qlab-ledger"
+version = "0.0.0"
+dependencies = [
+ "qlab-air",
+ "qlab-cbserver",
+ "qlab-note",
+ "qlab-wallet",
+]
+
+[[package]]
 name = "qlab-node"
 version = "0.0.0"
 dependencies = [
@@ -1279,6 +1289,7 @@ dependencies = [
  "qlab-consensus",
  "qlab-devnet",
  "qlab-faucet",
+ "qlab-ledger",
  "qlab-node",
  "qlab-note",
  "qlab-p2p",
