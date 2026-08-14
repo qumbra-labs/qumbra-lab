@@ -640,6 +640,35 @@ pub unsafe extern "C" fn qmb_scan_free(s: *mut ScanState) {
 }
 
 
+
+/// The full address at `index`, as a QR code in SVG — for the Receive screen.
+/// Rendered by `qumbra_wallet::qr` (#342's one renderer: EC-L, capacity
+/// boundary test-locked; a full qaddr fits v40 with room). 🔴 The caller MUST
+/// show the `qs1…` fingerprint beside it — a QR that merely scans is not a
+/// verified address (#342 D3). NULL + `err_out` if the payload cannot fit.
+///
+/// # Safety
+/// `w` live; `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_address_qr_svg(
+    w: *const WalletState,
+    index: u64,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    if w.is_null() {
+        set_err(err_out, "wallet is NULL".into());
+        return ptr::null_mut();
+    }
+    let full = (*w).wallet.address_at_index(index).encode();
+    match qumbra_wallet::qr::render_svg(&full) {
+        Ok(svg) => out_string(svg),
+        Err(e) => {
+            set_err(err_out, format!("QR refused: {e:?}"));
+            ptr::null_mut()
+        }
+    }
+}
+
 /* --- the pumpable select + the witness bundle (lab #400) ------------------ */
 
 /// The caller-pumped phase 1 behind `qmb_select_*` — the browser shell's half
@@ -1300,6 +1329,21 @@ mod tests {
             assert_eq!(qmb_scan_step(s, &mut again), -1);
             assert!(again.is_null());
             qmb_scan_free(s);
+            qmb_wallet_free(w);
+        }
+    }
+
+    /// The Receive screen's QR: a real SVG of the full address, across the ABI.
+    #[test]
+    fn the_address_qr_renders_as_svg() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([7u8; 32].as_ptr());
+            let mut err: *mut c_char = ptr::null_mut();
+            let p = qmb_address_qr_svg(w, 0, &mut err);
+            assert!(!p.is_null(), "{:?}", err);
+            let svg = CStr::from_ptr(p).to_str().unwrap();
+            assert!(svg.starts_with("<svg") || svg.contains("<svg"), "{}", &svg[..60.min(svg.len())]);
+            qmb_string_free(p);
             qmb_wallet_free(w);
         }
     }

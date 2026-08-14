@@ -65,6 +65,11 @@ char *qmb_wallet_address(const qmb_wallet_t *w, uint64_t index);
 /* Short address (qs1…) — the human-facing default. */
 char *qmb_wallet_address_short(const qmb_wallet_t *w, uint64_t index);
 
+/* The full address as a QR code in SVG (#342's renderer, EC-L). Show the
+ * qs1… fingerprint BESIDE it: a QR that merely scans is not a verified
+ * address. NULL + *err_out if the payload cannot fit. */
+char *qmb_address_qr_svg(const qmb_wallet_t *w, uint64_t index, char **err_out);
+
 /* --- scan ---------------------------------------------------------------- */
 
 /* Light-client scan for the given indices against a cbserver base URL over
