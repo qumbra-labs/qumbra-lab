@@ -565,6 +565,15 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// `height → commitment root after applying that height's block`. The anchor
     /// set: a finalized entry within the age window is a valid anchor.
     roots_by_height: BTreeMap<u64, Hash32>,
+    /// The same anchor set indexed in the direction validation asks it:
+    /// `commitment root → ascending heights at which that root existed`.
+    ///
+    /// Lab #402's settled-history gate used to scan up to the whole 1,152-block
+    /// anchor window for every transaction in every replayed block. This derived
+    /// index makes the membership query two tree/binary searches instead. It is
+    /// rebuilt from `roots_by_height` on snapshot restore, so it changes neither
+    /// snapshot bytes nor the consensus source of truth.
+    anchor_heights_by_root: BTreeMap<Hash32, Vec<u64>>,
     /// Every appended commitment / spent nullifier, in application order — the
     /// deterministic material a snapshot serializes (a replay reproduces the
     /// exact order, so the on-disk form is stable).
@@ -1052,14 +1061,18 @@ impl MemNode {
         let commitments = MemCommitmentStore::default();
         let chain = MemChainStore::new(genesis);
         let mut roots_by_height = BTreeMap::new();
+        let mut anchor_heights_by_root = BTreeMap::new();
         // Genesis carries no outputs, so the tree is empty: record its root at
         // height 0 (the empty-tree root) as the base anchor entry.
-        roots_by_height.insert(0, commitments.root_bytes());
+        let genesis_root = commitments.root_bytes();
+        roots_by_height.insert(0, genesis_root);
+        anchor_heights_by_root.insert(genesis_root, vec![0]);
         Self {
             chain,
             nullifiers: MemNullifierStore::default(),
             commitments,
             roots_by_height,
+            anchor_heights_by_root,
             commitments_ordered: Vec::new(),
             nullifiers_ordered: Vec::new(),
             retained: RetainedBodies::default(),
@@ -1079,6 +1092,10 @@ impl MemNode {
         }
         self.nullifiers_ordered = snap.nullifiers.clone();
         self.roots_by_height = snap.roots_by_height.iter().copied().collect();
+        self.anchor_heights_by_root.clear();
+        for (&height, &root) in &self.roots_by_height {
+            self.anchor_heights_by_root.entry(root).or_default().push(height);
+        }
     }
 
     /// The checkpoint represented by the durable state-machine finalized head.
@@ -1303,8 +1320,11 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         self.names
             .apply_block_riders(block.header.height, &block.txs)
             .map_err(|(index, err)| NodeError::Body(BodyError::RiderMalformed { index, err }))?;
-        self.roots_by_height
-            .insert(block.header.height, self.commitments.root_bytes());
+        let root = self.commitments.root_bytes();
+        self.roots_by_height.insert(block.header.height, root);
+        let heights = self.anchor_heights_by_root.entry(root).or_default();
+        debug_assert!(heights.last().is_none_or(|height| *height < block.header.height));
+        heights.push(block.header.height);
         // Issue #198: a block back in the applied chain is servable from the applied
         // store again, so the archive copy is dropped — and the archive is pruned to
         // the depth a rewind could still reach from the new tip. Guarded on
@@ -1457,7 +1477,11 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// [`AnchorGate::SettledHistory`] and lab #402.
     pub fn is_valid_anchor_as_of(&self, root: &Hash32, block_height: u64) -> bool {
         let floor = block_height.saturating_sub(MAX_ANCHOR_AGE_BLOCKS);
-        self.roots_by_height.range(floor..block_height).any(|(_, r)| r == root)
+        let Some(heights) = self.anchor_heights_by_root.get(root) else {
+            return false;
+        };
+        let first_in_window = heights.partition_point(|height| *height < floor);
+        heights.get(first_in_window).is_some_and(|height| *height < block_height)
     }
 }
 
@@ -1556,6 +1580,70 @@ mod tests {
 
     fn child_committing_to(parent: &BlockHeader, body: &BlockBody) -> BlockHeader {
         BlockHeader::child_of(parent, parent.timestamp + 75, GENESIS_DIFFICULTY, body.commitment())
+    }
+
+    /// QUM-111 performance regression: the reverse anchor index is a derived
+    /// acceleration structure, so every indexed answer must remain identical to
+    /// the original height-range scan — including repeated roots across empty
+    /// blocks and after the snapshot fast path rebuilds the index.
+    #[test]
+    fn historical_anchor_index_matches_the_height_scan_after_snapshot_restore() {
+        let dir = temp_dir("historical-anchor-index");
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let g_header = genesis.header();
+        let mut node = MemNode::open(&dir, genesis.clone()).unwrap();
+        assert!(node.finalize(g_header.header_hash()).unwrap().is_recorded());
+
+        let mut parent = g_header;
+        for height in 1..=24u64 {
+            let body = if height % 6 == 1 {
+                BlockBody {
+                    txs: vec![tx(node.commitment_root(), height as u8)],
+                    coinbase: 0,
+                    coinbase_rkm: [0; 4],
+                }
+            } else {
+                BlockBody::default()
+            };
+            let header = child_committing_to(&parent, &body);
+            node.apply_block_gated(header, body, &MockVerifier, AnchorGate::SettledHistory)
+                .unwrap();
+            parent = header;
+        }
+        node.save_snapshot().unwrap();
+        drop(node);
+
+        let node = MemNode::open(&dir, genesis).unwrap();
+        let mut candidates: Vec<Hash32> = node.roots_by_height.values().copied().collect();
+        candidates.push([0xEE; 32]);
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        for block_height in 0..=node.tip_height() + 2 {
+            let floor = block_height.saturating_sub(MAX_ANCHOR_AGE_BLOCKS);
+            for root in &candidates {
+                let scanned = node
+                    .roots_by_height
+                    .range(floor..block_height)
+                    .any(|(_, candidate)| candidate == root);
+                assert_eq!(
+                    node.is_valid_anchor_as_of(root, block_height),
+                    scanned,
+                    "root {root:?} at H={block_height}"
+                );
+            }
+        }
+
+        for (root, heights) in &node.anchor_heights_by_root {
+            assert!(heights.windows(2).all(|pair| pair[0] < pair[1]));
+            let scanned: Vec<u64> = node
+                .roots_by_height
+                .iter()
+                .filter_map(|(height, candidate)| (candidate == root).then_some(*height))
+                .collect();
+            assert_eq!(heights, &scanned, "derived index for {root:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
