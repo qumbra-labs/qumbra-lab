@@ -117,14 +117,6 @@ fn wall_clock_secs() -> u64 {
 pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// Header chain + heaviest-chain fork-choice (finality-marked).
     chain: ChainState,
-    /// Quorum-finalized main-chain prefix, indexed by height.
-    ///
-    /// This is the memoised containment proof behind lab #402's settled-history
-    /// gate. The prefix only grows: `ChainState` forbids reorgs across finality,
-    /// and every extension is walked once from the newly verified finalized head
-    /// back to the old tail. A body lookup is therefore one vector access instead
-    /// of rebuilding the entire genesis-to-tip main chain for every dispatch.
-    settled_prefix: Vec<Hash32>,
     /// The PoW engine (N3).
     pow: P,
     /// The real state machine — commitment tree, nullifier set, anchors, snapshots.
@@ -637,11 +629,6 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // to re-sync everything it already had on disk.
         let resumed = me.state.chain().chain().clone();
         me.chain = resumed;
-        // Rehydrate the derived settled-prefix cache once at startup. Body
-        // dispatch must remain a cache-only reader: rebuilding here keeps a
-        // restarted node's first historical body from paying an O(finalized
-        // height) walk inside `pump.dispatch` (QUM-111 live follow-up).
-        me.sync_settled_prefix();
         // The state-machine chain already restored and proved this durable point.
         // Rehydrate the committee tracker through its named recovery constructor:
         // startup is not a fresh quorum event and must never be routed through
@@ -726,7 +713,6 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         let genesis = BlockHeader::genesis(sim.genesis_difficulty, 0);
         NodeAdapter {
             chain: ChainState::new(genesis),
-            settled_prefix: Vec::new(),
             pow,
             state,
             mempool: Mempool::default(),
@@ -1900,7 +1886,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         if !self.rules.may_checkpoint(height) {
             return None; // H2 — see `make_checkpoint_guarded`
         }
-        let block_hash = *self.chain.main_chain().get(height as usize)?;
+        let block_hash = self.chain.main_chain_hash_at(height)?;
         let cp = Checkpoint::new(height, block_hash, block_hash);
         let votes = validators.iter().map(|v| v.sign_checkpoint(&cp)).collect();
         Some((cp, votes))
@@ -1929,7 +1915,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         if !self.rules.may_checkpoint(height) {
             return None;
         }
-        let block_hash = *self.chain.main_chain().get(height as usize)?;
+        let block_hash = self.chain.main_chain_hash_at(height)?;
         let cp = Checkpoint::new(height, block_hash, block_hash);
         let votes = finalizers.iter_mut().filter_map(|f| f.sign(&cp).ok()).collect();
         Some((cp, votes))
@@ -2069,110 +2055,17 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     ///   (`Self::ingest_checkpoint_votes`), and `ChainState::set_finalized` refuses a
     ///   point that is not a known header descending from the previous one — so a
     ///   height at or below it is committee-finalized AND on the header main chain;
-    /// - [`Self::settled_prefix`] is derived from that finalized block's own `prev`
-    ///   links and extended at the finality transition (plus startup), never by this
-    ///   per-body reader. No-reorg-past-finality (`chain.rs`) makes every cached
-    ///   entry immutable, so "the finalized-prefix hash at `header.height` is this
-    ///   header" is precisely "this block is an ancestor of the finalized
-    ///   checkpoint's block", proven from headers this node already holds.
+    /// - [`ChainState::main_chain_hash_at`] reads the pure derived fork-choice index
+    ///   maintained when headers connect or a pre-finality reorg replaces a suffix.
+    ///   No-reorg-past-finality makes every indexed entry at or below the finalized
+    ///   pointer immutable.
     ///
     /// Nothing the sender says enters (the #134 property, kept): both inputs are this
     /// node's own. A joiner that has not yet learned any finalized checkpoint answers
     /// `false` for everything and stays on today's paths.
     fn block_is_settled_history(&self, header: &BlockHeader) -> bool {
-        usize::try_from(header.height)
-            .ok()
-            .and_then(|height| self.settled_prefix.get(height))
-            .copied()
-            == Some(header.header_hash())
-    }
-
-    /// Bring [`Self::settled_prefix`] to the current quorum-verified finalized
-    /// head. Called only when that head advances, plus once at startup — never by
-    /// [`Self::block_is_settled_history`] or the per-body dispatch path. A finality
-    /// advance walks only the newly-settled suffix once, so its total work across
-    /// the life of a chain is O(finalized height), not O(blocks × header tip).
-    ///
-    /// An empty cache (startup) is rebuilt by the same backwards walk. The
-    /// defensive reset handles an impossible cache/chain mismatch without turning
-    /// the acceleration structure into a source of consensus truth: the header
-    /// chain remains authoritative and the prefix is re-derived from it.
-    fn sync_settled_prefix(&mut self) {
-        let (Some(fin_hash), Some(fin_height)) =
-            (self.chain.finalized_hash(), self.chain.finalized_height())
-        else {
-            self.settled_prefix.clear();
-            return;
-        };
-
-        if usize::try_from(fin_height)
-            .ok()
-            .and_then(|height| height.checked_add(1))
-            .is_some_and(|expected_len| {
-                self.settled_prefix.len() == expected_len
-                    && self.settled_prefix.last().copied() == Some(fin_hash)
-            })
-        {
-            return;
-        }
-
-        if self.extend_settled_prefix(fin_hash, fin_height) {
-            return;
-        }
-
-        // A finalized prefix cannot legitimately regress or switch branches.
-        // Re-derive rather than trusting stale cache state if an internal caller
-        // nevertheless hands us that shape.
-        self.settled_prefix.clear();
-        assert!(
-            self.extend_settled_prefix(fin_hash, fin_height),
-            "known finalized head must trace back to genesis"
-        );
-    }
-
-    /// Extend the cached prefix to `fin_hash`; `false` means the existing cache is
-    /// not a prefix of that chain and the caller must rebuild from empty.
-    fn extend_settled_prefix(&mut self, fin_hash: Hash32, fin_height: u64) -> bool {
-        let Some(expected_len) = usize::try_from(fin_height).ok().and_then(|h| h.checked_add(1))
-        else {
-            return false;
-        };
-        if self.settled_prefix.len() > expected_len {
-            return false;
-        }
-
-        let cached_tail = self.settled_prefix.last().copied();
-        let cached_height = self.settled_prefix.len().checked_sub(1).map(|h| h as u64);
-        let mut reversed_suffix = Vec::with_capacity(expected_len - self.settled_prefix.len());
-        let mut cursor = fin_hash;
-
-        loop {
-            let Some(header) = self.chain.header(&cursor) else {
-                return false;
-            };
-            if let Some(base_height) = cached_height {
-                if header.height < base_height {
-                    return false;
-                }
-                if header.height == base_height {
-                    if cached_tail != Some(cursor) {
-                        return false;
-                    }
-                    break;
-                }
-            }
-
-            reversed_suffix.push(cursor);
-            if header.height == 0 {
-                break;
-            }
-            cursor = header.prev;
-        }
-
-        reversed_suffix.reverse();
-        self.settled_prefix.extend(reversed_suffix);
-        self.settled_prefix.len() == expected_len
-            && self.settled_prefix.last().copied() == Some(fin_hash)
+        self.chain.finalized_height().is_some_and(|height| header.height <= height)
+            && self.chain.main_chain_hash_at(header.height) == Some(header.header_hash())
     }
 
     fn reject_reason(err: &MempoolError) -> &'static str {
@@ -2223,7 +2116,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         self.chain.header(hash).copied()
     }
     fn main_chain_hash_at(&self, height: u64) -> Option<Hash32> {
-        self.chain.main_chain().get(height as usize).copied()
+        self.chain.main_chain_hash_at(height)
     }
     fn has_header(&self, hash: &Hash32) -> bool {
         self.chain.header(hash).is_some()
@@ -2659,11 +2552,6 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
                     match self.chain.set_finalized(cp.block_hash) {
                         Ok(()) => {
                             self.note_finalize_recorded("chain");
-                            // Maintain the derived prefix at the state transition
-                            // that invalidates it. Historical-body dispatch below
-                            // is then a single cache lookup, even when a joiner's
-                            // first checkpoint settles thousands of headers.
-                            self.sync_settled_prefix();
                         }
                         Err(e) => {
                             // Issue #241: this head always held the typed refusal —
@@ -4168,12 +4056,11 @@ mod tests {
         );
     }
 
-    /// QUM-111 performance acceptance: settled containment is memoised as the
-    /// finalized prefix and extends only by the newly-finalized suffix. Repeated
-    /// per-body lookups leave that cache byte-for-byte unchanged; a later quorum
-    /// extends it without rebuilding the already-proven prefix.
+    /// QUM-111 performance acceptance: settled containment reads the derived
+    /// fork-choice height index. Finality changes only the upper bound; it does not
+    /// build or own another ancestry cache in the adapter.
     #[test]
-    fn settled_history_lookup_uses_an_incremental_finalized_prefix() {
+    fn settled_history_lookup_uses_the_chain_height_index() {
         let blocks = transacting_proposer(6);
         let mut j = follower_with_headers_only(&blocks);
         let (_, validators) = committee7();
@@ -4189,46 +4076,47 @@ mod tests {
         finalize(&mut j, 3);
         assert!(j.block_is_settled_history(&blocks[2].0));
         assert!(!j.block_is_settled_history(&blocks[3].0));
-        let first_prefix = j.settled_prefix.clone();
-        assert_eq!(first_prefix, j.chain().main_chain()[..=3]);
-
-        for (header, _) in &blocks[..3] {
-            assert!(j.block_is_settled_history(header));
-        }
-        assert_eq!(j.settled_prefix, first_prefix, "lookups do not rebuild the prefix");
+        assert_eq!(j.chain().main_chain_hash_at(3), Some(blocks[2].0.header_hash()));
 
         finalize(&mut j, 6);
         assert!(j.block_is_settled_history(&blocks[5].0));
-        assert_eq!(&j.settled_prefix[..first_prefix.len()], first_prefix.as_slice());
-        assert_eq!(j.settled_prefix, j.chain().main_chain()[..=6]);
+        for (height, (header, _)) in blocks.iter().enumerate() {
+            assert_eq!(j.chain().main_chain_hash_at(height as u64 + 1), Some(header.header_hash()));
+            assert!(j.block_is_settled_history(header));
+        }
     }
 
-    /// QUM-111 live-regression mutation lock: the predicate reached from
-    /// `ingest_block` is a cache-only read. In particular, it may not repair or
-    /// rebuild the prefix on a body frame — the live joiner paid that walk once per
-    /// dispatched frame while processing its first large checkpoint and wedged in
-    /// `pump.dispatch`.
+    /// QUM-111 live-regression lock in the #402 shape: header sync is more than one
+    /// complete anchor window ahead of the historical body. The settled decision
+    /// still accepts it by its own height and performs only `finalized_height` plus
+    /// one O(1) `main_chain_hash_at` read — no adapter prefix exists to walk.
     #[test]
-    fn settled_history_body_lookup_never_rebuilds_the_prefix() {
-        let blocks = transacting_proposer(3);
+    fn far_ahead_header_sync_applies_settled_body_without_a_per_body_chain_walk() {
+        use qlab_devnet::params_devnet::MAX_ANCHOR_AGE_BLOCKS;
+
+        let mut proposer = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let genesis = proposer.chain().genesis_block_hash();
+        proposer.state_mut().finalize(genesis).expect("finalize genesis");
+        let anchor = proposer.state().commitment_root();
+        assert_eq!(proposer.ingest_tx(tx_with(anchor, 1, b"ok")), IngestOutcome::Accepted);
+
+        let far_tip = MAX_ANCHOR_AGE_BLOCKS + 2;
+        let blocks = mine_chain(&mut proposer, far_tip as usize);
+        let historical = blocks[0].clone();
+        assert!(far_tip.saturating_sub(0) > MAX_ANCHOR_AGE_BLOCKS);
+
         let mut j = follower_with_headers_only(&blocks);
         let (_, validators) = committee7();
-        let cp_hash = blocks[2].0.header_hash();
-        let cp = Checkpoint::new(3, cp_hash, cp_hash);
+        let cp_hash = blocks.last().expect("far tip").0.header_hash();
+        let cp = Checkpoint::new(far_tip, cp_hash, cp_hash);
         let votes: Vec<Vote> =
             validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
         assert_eq!(j.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
-        assert!(j.block_is_settled_history(&blocks[2].0));
-
-        // Corrupt only the derived acceleration structure. A lookup must fail
-        // closed and leave it untouched; the explicit transition hook repairs it.
-        j.settled_prefix.clear();
-        assert!(!j.block_is_settled_history(&blocks[2].0));
-        assert!(j.settled_prefix.is_empty(), "a body lookup performed no rebuild");
-
-        j.sync_settled_prefix();
-        assert!(j.block_is_settled_history(&blocks[2].0));
-        assert_eq!(j.settled_prefix, j.chain().main_chain()[..=3]);
+        assert_eq!(j.chain().tip_height(), far_tip);
+        assert!(j.block_is_settled_history(&historical.0));
+        let outcome = j.ingest_block(historical.0, historical.1);
+        assert!(!outcome.is_peer_fault(), "header-known history is not a peer fault");
+        assert_eq!(j.state().tip_height(), 1, "the far-ahead joiner crossed its first body");
     }
 
     /// **S1 (lab #402), at the adapter seam: the settled-history gate is a statement

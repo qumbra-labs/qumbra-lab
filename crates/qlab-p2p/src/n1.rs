@@ -512,7 +512,7 @@ impl ChainView for StubNode {
         self.chain.header(hash).copied()
     }
     fn main_chain_hash_at(&self, height: u64) -> Option<Hash32> {
-        self.chain.main_chain().get(height as usize).copied()
+        self.chain.main_chain_hash_at(height)
     }
     fn has_header(&self, hash: &Hash32) -> bool {
         self.chain.header(hash).is_some()
