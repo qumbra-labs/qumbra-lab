@@ -272,52 +272,85 @@ pub struct VerifiedAnchor {
 /// a refused sync costs nothing and can be retried.
 pub fn sync_tree(dir: &Path, source: &impl LeafSource) -> Result<SyncedTree, SyncRefusal> {
     let path = dir.join(LEAVES_FILE);
-    let mut tree = load_cache(&path)?;
-    let start = tree.len();
+    let mut catch = TreeCatchUp::new(load_cache(&path)?);
+    while let Some(from) = catch.want_from() {
+        let chunk = source.fetch_from(from).map_err(|why| SyncRefusal::Endpoint { why })?;
+        catch.supply(chunk)?;
+    }
+    let synced = catch.finish();
+    persist_cache(&path, &synced.tree)?;
+    Ok(synced)
+}
 
-    // Catch up. The endpoint's tree can grow between chunks; the loop chases
-    // the LAST claim it saw.
-    let mut claim = fetch_at(source, tree.len())?;
-    loop {
-        if claim.total < tree.len() {
-            return Err(SyncRefusal::StreamBehindLocal { served: claim.total, local: tree.len() });
+/// The chunk-accumulation half of [`sync_tree`], caller-pumped — **one copy of
+/// the catch-up protocol** (lab #399), shared by the synchronous pump above and
+/// the select driver. The endpoint's tree can grow between chunks; the catch-up
+/// chases the LAST claim it saw, and every check the pump ever made lives HERE:
+/// the wire's `from` echo, behind-local, overshoot, and no-progress.
+pub struct TreeCatchUp {
+    tree: CommitmentTree,
+    start: u64,
+    done: bool,
+}
+
+impl TreeCatchUp {
+    /// `tree` is whatever the caller already holds — the dir cache for the CLI,
+    /// storage-held leaves for a wasm host, or an empty tree on first sync.
+    pub fn new(tree: CommitmentTree) -> TreeCatchUp {
+        let start = tree.len();
+        TreeCatchUp { tree, start, done: false }
+    }
+
+    /// The leaf index to ask the endpoint for next, or `None` once caught up.
+    /// The first ask always happens: only the endpoint's own `total` claim can
+    /// say the cache is current.
+    pub fn want_from(&self) -> Option<u64> {
+        (!self.done).then(|| self.tree.len())
+    }
+
+    /// Feed one chunk.
+    pub fn supply(&mut self, chunk: LeafChunk) -> Result<(), SyncRefusal> {
+        if self.done {
+            return Err(SyncRefusal::Endpoint {
+                why: "a chunk was supplied after the catch-up completed".into(),
+            });
         }
-        if tree.len() + claim.leaves.len() as u64 > claim.total {
+        if chunk.from != self.tree.len() {
+            return Err(SyncRefusal::FromMismatch { asked: self.tree.len(), got: chunk.from });
+        }
+        if chunk.total < self.tree.len() {
+            return Err(SyncRefusal::StreamBehindLocal {
+                served: chunk.total,
+                local: self.tree.len(),
+            });
+        }
+        if self.tree.len() + chunk.leaves.len() as u64 > chunk.total {
             // A chunk that overshoots its own `total` claim is malformed.
             return Err(SyncRefusal::Endpoint {
                 why: format!(
                     "chunk of {} leaves from {} overshoots the endpoint's own claimed size {}",
-                    claim.leaves.len(),
-                    tree.len(),
-                    claim.total
+                    chunk.leaves.len(),
+                    self.tree.len(),
+                    chunk.total
                 ),
             });
         }
-        for cm in &claim.leaves {
-            tree.append_bytes(cm);
+        let empty = chunk.leaves.is_empty();
+        for cm in &chunk.leaves {
+            self.tree.append_bytes(cm);
         }
-        if claim.total == tree.len() {
-            break; // caught up with this claim
+        if chunk.total == self.tree.len() {
+            self.done = true; // caught up with this claim
+        } else if empty {
+            return Err(SyncRefusal::NoProgress { at: self.tree.len(), claimed: chunk.total });
         }
-        if claim.leaves.is_empty() {
-            return Err(SyncRefusal::NoProgress { at: tree.len(), claimed: claim.total });
-        }
-        claim = fetch_at(source, tree.len())?;
+        Ok(())
     }
 
-    persist_cache(&path, &tree)?;
-    let count = tree.len();
-    Ok(SyncedTree { tree, count, fetched: count - start })
-}
-
-/// One page, with the wire's own `from` echo checked before a single leaf is
-/// appended.
-fn fetch_at(source: &impl LeafSource, from: u64) -> Result<LeafChunk, SyncRefusal> {
-    let chunk = source.fetch_from(from).map_err(|why| SyncRefusal::Endpoint { why })?;
-    if chunk.from != from {
-        return Err(SyncRefusal::FromMismatch { asked: from, got: chunk.from });
+    pub fn finish(self) -> SyncedTree {
+        let count = self.tree.len();
+        SyncedTree { tree: self.tree, count, fetched: count - self.start }
     }
-    Ok(chunk)
 }
 
 /// Find the largest leaf count whose reconstructed root the node serves as a
@@ -369,7 +402,7 @@ pub fn sync_and_select(
 }
 
 /// Load the leaf cache, or an empty tree when none exists yet (first sync).
-fn load_cache(path: &Path) -> Result<CommitmentTree, SyncRefusal> {
+pub(crate) fn load_cache(path: &Path) -> Result<CommitmentTree, SyncRefusal> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(CommitmentTree::new()),
@@ -401,7 +434,7 @@ fn load_cache(path: &Path) -> Result<CommitmentTree, SyncRefusal> {
 /// never read back as a shorter-but-valid cache. Rewriting in full is a
 /// deliberate simplicity trade at devnet scale (32 B/leaf); the brief's §4
 /// overturn trigger owns the day this measures impractically large.
-fn persist_cache(path: &Path, tree: &CommitmentTree) -> Result<(), SyncRefusal> {
+pub(crate) fn persist_cache(path: &Path, tree: &CommitmentTree) -> Result<(), SyncRefusal> {
     let mut out = Vec::with_capacity(1 + tree.len() as usize * 32);
     out.push(LEAVES_FILE_VERSION);
     for pos in 0..tree.len() {

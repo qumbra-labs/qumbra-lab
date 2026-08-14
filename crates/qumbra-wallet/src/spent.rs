@@ -268,27 +268,64 @@ pub fn fetch_spent(
     from: u64,
     to: u64,
 ) -> Result<SpentSet, SpentRefusal> {
-    let mut set = SpentSet { covered: None, nullifiers: BTreeMap::new() };
-    let mut cursor = from;
-    loop {
-        let page = source
-            .fetch_range(cursor, to)
-            .map_err(|why| SpentRefusal::Endpoint { why })?;
-        if (page.from, page.to) != (cursor, to) {
+    let mut catch = SpentCatchUp::new(from, to);
+    while let Some((from, to)) = catch.want() {
+        let page = source.fetch_range(from, to).map_err(|why| SpentRefusal::Endpoint { why })?;
+        catch.supply(page)?;
+    }
+    Ok(catch.finish())
+}
+
+/// The page-accumulation half of [`fetch_spent`], caller-pumped — **one copy of
+/// the paging protocol** (lab #399), shared by the synchronous pump above and
+/// the select driver. Every check the pump ever made lives HERE, so no pump can
+/// skip one.
+pub struct SpentCatchUp {
+    set: SpentSet,
+    cursor: u64,
+    to: u64,
+    done: bool,
+}
+
+impl SpentCatchUp {
+    pub fn new(from: u64, to: u64) -> SpentCatchUp {
+        SpentCatchUp {
+            set: SpentSet { covered: None, nullifiers: BTreeMap::new() },
+            cursor: from,
+            to,
+            done: false,
+        }
+    }
+
+    /// The `(from, to)` range to ask the endpoint for next, or `None` once the
+    /// stream is complete.
+    pub fn want(&self) -> Option<(u64, u64)> {
+        (!self.done).then_some((self.cursor, self.to))
+    }
+
+    /// Feed one page — echo, in-range, ascending and gap-free checks included.
+    pub fn supply(&mut self, page: NullifierChunk) -> Result<(), SpentRefusal> {
+        if self.done {
+            return Err(SpentRefusal::Endpoint {
+                why: "a page was supplied after the stream completed".into(),
+            });
+        }
+        if (page.from, page.to) != (self.cursor, self.to) {
             return Err(SpentRefusal::RangeMismatch {
-                asked: (cursor, to),
+                asked: (self.cursor, self.to),
                 got: (page.from, page.to),
             });
         }
         if page.blocks.is_empty() {
-            break; // the endpoint holds nothing (further) in the range
+            self.done = true; // the endpoint holds nothing (further) in the range
+            return Ok(());
         }
         for (height, nfs) in &page.blocks {
             let height = *height;
-            if height < cursor || height > to {
-                return Err(SpentRefusal::OutOfRange { height, asked: (cursor, to) });
+            if height < self.cursor || height > self.to {
+                return Err(SpentRefusal::OutOfRange { height, asked: (self.cursor, self.to) });
             }
-            match set.covered {
+            match self.set.covered {
                 Some((_, prev)) if height <= prev => {
                     return Err(SpentRefusal::NotAscending { previous: prev, height })
                 }
@@ -299,17 +336,22 @@ pub fn fetch_spent(
             }
             for nf in nfs {
                 // First occurrence wins — see the field's doc comment.
-                set.nullifiers.entry(*nf).or_insert(height);
+                self.set.nullifiers.entry(*nf).or_insert(height);
             }
-            set.covered = Some((set.covered.map_or(height, |(f, _)| f), height));
+            self.set.covered = Some((self.set.covered.map_or(height, |(f, _)| f), height));
         }
-        let (_, last) = set.covered.expect("a non-empty page set it");
-        if last >= to {
-            break;
+        let (_, last) = self.set.covered.expect("a non-empty page set it");
+        if last >= self.to {
+            self.done = true;
+        } else {
+            self.cursor = last + 1;
         }
-        cursor = last + 1;
+        Ok(())
     }
-    Ok(set)
+
+    pub fn finish(self) -> SpentSet {
+        self.set
+    }
 }
 
 /// This note's nullifier, as the chain would see it — **the spend path's own
