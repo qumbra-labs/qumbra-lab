@@ -41,11 +41,9 @@ use crate::view::{DivScan, SpentCoverage};
 /// The union of the height ranges several scans' outputs came from — the range
 /// the nullifier stream must cover before any of their figures may be quoted
 /// (lab issue #314). `None` when no scan saw a block at all.
-pub fn widest_range(
-    ranges: impl IntoIterator<Item = Option<(u64, u64)>>,
-) -> Option<(u64, u64)> {
-    ranges.into_iter().flatten().reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
-}
+// Moved to qlab-ledger (#407) so the FFI asks it the same way; re-exported to
+// keep this module's callers and tests unchanged.
+pub use qlab_ledger::spent::widest_range;
 
 /// Everything a caller reads off the chain: one light-client scan per allocated
 /// address, then the nullifier stream over the range those outputs actually came
@@ -103,13 +101,12 @@ pub fn gather(w: &WalletDir, url: &str, from: u64, to: u64) -> Gathered {
     let outputs = widest_range(
         outcomes.iter().filter_map(|(_, _, o)| o.as_ref().ok()).map(|o| o.stats.compact_range_served),
     );
-    let (coverage, set) = match fetch_spent(&HttpNullifierSource::new(url), from, to) {
-        Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),
-        Ok(set) => match set.covers_outputs(outputs) {
-            Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),
-            Ok(()) => (SpentCoverage::Covered { range: set.covered }, Some(set)),
-        },
-    };
+    let (coverage, set) = qlab_ledger::spent::coverage_for(
+        &HttpNullifierSource::new(url),
+        from,
+        to,
+        outputs,
+    );
     Gathered { outcomes, coverage, set }
 }
 

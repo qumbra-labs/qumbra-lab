@@ -367,6 +367,36 @@ impl SpentCatchUp {
 /// `digest_bytes` that `TxPublic::nullifiers` carries. `div_index` is the
 /// diversifier the note was received at: `nf` does not bind the diversifier, but
 /// `spend_input` needs it and getting it wrong here would be invisible.
+/// The widest range a set of per-address served-ranges covers, or `None` when
+/// nothing was served. Lifted out of the CLI so both shells ask the question the
+/// same way (lab #407).
+pub fn widest_range(
+    ranges: impl IntoIterator<Item = Option<(u64, u64)>>,
+) -> Option<(u64, u64)> {
+    ranges.into_iter().flatten().reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
+}
+
+/// Fetch the nullifier stream and judge it against the range the outputs
+/// actually reached — the pairing of a figure with its caveat, in one place.
+///
+/// Lifted out of the CLI with [`widest_range`]: a second copy of this match is
+/// how one shell starts quoting a figure the other would refuse.
+pub fn coverage_for(
+    source: &impl NullifierSource,
+    from: u64,
+    to: u64,
+    outputs: Option<(u64, u64)>,
+) -> (crate::vocab::SpentCoverage, Option<SpentSet>) {
+    use crate::vocab::SpentCoverage;
+    match fetch_spent(source, from, to) {
+        Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),
+        Ok(set) => match set.covers_outputs(outputs) {
+            Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),
+            Ok(()) => (SpentCoverage::Covered { range: set.covered }, Some(set)),
+        },
+    }
+}
+
 pub fn note_nullifier(wallet: &Wallet, div_index: u64, note: &Note) -> [u8; 32] {
     let d = wallet.diversifier_at_index(div_index);
     let inp = wallet.spend_input(note.value, note.rho, note.rseed, d);

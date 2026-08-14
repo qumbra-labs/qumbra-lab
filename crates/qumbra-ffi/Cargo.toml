@@ -34,6 +34,10 @@ qlab-wallet = { path = "../qlab-wallet" }
 qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
 # ML-KEM Keypair/Dk types the scan takes.
 qlab-note = { path = "../qlab-note" }
+# The wallet's ledger, shared with the CLI so there is one implementation of a
+# money verdict (lab #407). Carries no qlab-devnet, which is why it is reachable
+# from here at all.
+qlab-ledger = { path = "../qlab-ledger" }
 # The scan's decoy rng is seeded from bytes the platform passes in.
 rand = "0.10"
 # lab #400: the selection core + witness bundle, LEAN — no rustls, no prover,

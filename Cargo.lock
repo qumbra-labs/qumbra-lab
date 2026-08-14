@@ -1241,6 +1241,7 @@ dependencies = [
  "getrandom 0.4.3",
  "qlab-cbserver",
  "qlab-devnet",
+ "qlab-ledger",
  "qlab-node",
  "qlab-note",
  "qlab-wallet",
