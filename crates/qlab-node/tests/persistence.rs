@@ -874,6 +874,56 @@ fn a_rejected_snapshot_on_the_finalized_main_chain_resumes_near_tip_not_from_gen
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// **The degrade's tail is the real beyond-the-snapshot loop, rewinds
+/// included** — fork churn ABOVE the snapshot replays through the same
+/// rewind-inference the honoured fast path uses, and lands on replay's state.
+///
+/// Shape: the near-tip shape above, plus a same-height sibling race past the
+/// snapshot (`B3` loses to `B3'`, then `B4` finalizes on the winner). The tail
+/// must skip the pre-snapshot orphan (`A3`), apply `B3`, follow the logged
+/// rewind back onto `B2`, and re-apply forward — any shortcut that only
+/// handles linear tails fails here.
+#[test]
+fn the_near_tip_degrade_replays_tail_rewinds_like_the_honoured_path() {
+    let dir = temp_dir("i408-degrade-tail-rewind");
+    let (mut node, g_header, root) = node_with_finalized_genesis(&dir);
+
+    let (p, p_hash) = apply_marked(&mut node, &g_header, root, 0xC1);
+    let (a2, _a2_hash) = apply_marked(&mut node, &p, root, 0xA2);
+    let (_a3, _a3_hash) = apply_marked(&mut node, &a2, root, 0xA3);
+    node.rewind_to(p_hash).expect("fork choice moves back to P");
+    let (b2, b2_hash) = apply_marked(&mut node, &p, root, 0xB2);
+    node.save_snapshot().expect("snapshot at B2");
+    // Churn ABOVE the snapshot: B3 loses a same-height race to B3'.
+    let (_b3, _b3_hash) = apply_marked(&mut node, &b2, root, 0xB3);
+    node.rewind_to(b2_hash).expect("fork choice moves back to B2");
+    let (b3p, _) = apply_marked(&mut node, &b2, root, 0xD3);
+    let (_b4, b4_hash) = apply_marked(&mut node, &b3p, root, 0xD4);
+    assert!(node.finalize(b4_hash).unwrap().is_recorded(), "B4 finalizes on the winner");
+    let live_tip = node.tip_hash();
+    let live_root = node.commitment_root();
+    drop(node);
+
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    let opened = MemNode::open(&dir, genesis.clone()).expect("open");
+    let report = opened.recovery_report().clone();
+    assert_eq!(report.snapshot_height, Some(2), "the degrade still fired");
+    assert!(report.snapshot_rejected.is_some());
+
+    let replayed = MemNode::replay(&dir, genesis).expect("replay");
+    assert_eq!(opened.tip_hash(), replayed.tip_hash(), "open == replay: tip");
+    assert_eq!(opened.commitment_root(), replayed.commitment_root(), "open == replay: tree");
+    assert_eq!(opened.nullifier_count(), replayed.nullifier_count());
+    assert_eq!(opened.finalized_height(), replayed.finalized_height());
+    assert_eq!(opened.tip_hash(), live_tip, "and equals what was live");
+    assert_eq!(opened.commitment_root(), live_root);
+    assert!(opened.is_spent(&[0xD3; 32]), "the winning sibling's spend is in");
+    assert!(!opened.is_spent(&[0xB3; 32]), "the losing sibling's is not");
+    assert!(!opened.is_spent(&[0xA3; 32]), "the pre-snapshot orphan's is not");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// **The degrade demands the finality proof — a rejected snapshot on a LOSING
 /// branch keeps the full replay even when finality exists past its height.**
 ///
