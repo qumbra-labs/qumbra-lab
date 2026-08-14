@@ -72,6 +72,16 @@ jobs:
       - name: cargo check --workspace --all-targets
         run: cargo check --workspace --all-targets --locked
 
+      # lab #400: the wallet core + the ffi kernel must stay wasm32-clean — the
+      # browser shell builds from exactly this graph, and the last time a wasm
+      # enablement lived only on a branch it silently rotted for nine days
+      # (#395's finding). Checked here so the rot is a red X, not an archaeology.
+      - name: wasm32 core stays buildable
+        run: |
+          rustup target add wasm32-unknown-unknown
+          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check -p qumbra-wallet --no-default-features --target wasm32-unknown-unknown --locked
+          RUSTFLAGS='--cfg getrandom_backend="wasm_js"' cargo check -p qumbra-ffi --target wasm32-unknown-unknown --locked
+
       # Reporting only, NOT failing. The tree has pre-existing warnings
       # (qlab-bench alone generated 37 on 2026-08-01). A gate that is red on
       # its first run teaches everyone to ignore it — the same failure as an

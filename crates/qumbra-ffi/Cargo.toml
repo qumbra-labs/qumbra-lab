@@ -36,9 +36,20 @@ qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
 qlab-note = { path = "../qlab-note" }
 # The scan's decoy rng is seeded from bytes the platform passes in.
 rand = "0.10"
+# lab #400: the selection core + witness bundle, LEAN — no rustls, no prover,
+# no RandomX chain (the wasm/iOS graphs must stay clean; features are additive,
+# so native workspace builds still unify to the full wallet).
+qumbra-wallet = { path = "../qumbra-wallet", default-features = false }
 
 # wasm32 (the browser-extension shell): getrandom needs the JS backend wired
 # explicitly (crypto.getRandomValues). Build with
 #   RUSTFLAGS='--cfg getrandom_backend="wasm_js"'
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
+
+# The select-ABI success path needs a real funded chain and the deployed
+# serving surface — native tests only; wasm/iOS release builds never see these.
+[dev-dependencies]
+qumbra-node = { path = "../qumbra-node" }
+qlab-devnet = { path = "../qlab-devnet" }
+qlab-node = { path = "../qlab-node" }

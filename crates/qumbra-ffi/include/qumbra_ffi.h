@@ -140,6 +140,43 @@ void qmb_scan_supply(qmb_scan_t *s, const uint8_t *body, size_t len);
 void qmb_scan_supply_err(qmb_scan_t *s, const char *reason);
 void qmb_scan_free(qmb_scan_t *s);
 
+/* --- the pumpable select + the witness bundle (lab #400) ------------------ */
+
+/* Phase 1 of a spend, pumped the same way the scan is — born from a FINISHED
+ * scan's outcomes (consumed; scan again for another select), finishing as the
+ * serialized witness bundle the native prover host takes.
+ *
+ * qmb_select_step returns
+ *    1  NEED from the SCAN endpoint: *out is the path (qmb_string_free);
+ *    2  NEED from the NODE endpoint: same contract, other host — one host
+ *       normally serves both, the code still names which wire it is;
+ *    0  DONE: take the bytes with qmb_select_take_bundle;
+ *   -2  FAILED by name: *out is the reason (qmb_string_free);
+ *   -1  NULL/invalid call.
+ *
+ * The bundle bytes carry SPENDING-KEY MATERIAL: hand them to the native
+ * prover host and nowhere else, discard once the transaction is accepted or
+ * known-duplicate. The buffer from qmb_select_take_bundle is released with
+ * qmb_dealloc(p, len); it crosses ONCE.
+ *
+ * qmb_bundle_review renders the approval text from DECODED bundle bytes —
+ * the popup's approval screen reads the artifact that will be proved, never
+ * form state. Undecodable or semantically-refused bundles answer NULL with
+ * the reason in *err_out. */
+typedef struct qmb_select_t qmb_select_t;
+
+qmb_select_t *qmb_select_new(const qmb_wallet_t *w, qmb_scan_t *scan,
+                             const char *recipient, uint64_t amount,
+                             const uint8_t *held_leaves, size_t held_len,
+                             const uint8_t *rng_seed32, char **err_out);
+int32_t qmb_select_step(qmb_select_t *s, char **out);
+void qmb_select_supply(qmb_select_t *s, const uint8_t *body, size_t len);
+void qmb_select_supply_err(qmb_select_t *s, const char *reason);
+uint8_t *qmb_select_take_bundle(qmb_select_t *s, size_t *out_len);
+void qmb_select_free(qmb_select_t *s);
+
+char *qmb_bundle_review(const uint8_t *bytes, size_t len, char **err_out);
+
 #ifdef __cplusplus
 }
 #endif
