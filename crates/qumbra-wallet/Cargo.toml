@@ -19,6 +19,11 @@ name = "qumbra-wallet"
 path = "src/main.rs"
 required-features = ["net", "prove"]
 
+[[bin]]
+name = "qumbra-prover-host"
+path = "src/bin/prover_host.rs"
+required-features = ["host"]
+
 [dependencies]
 # Key hierarchy, non-BIP-39 mnemonic (golden-frozen), diversified addresses.
 qlab-wallet = { path = "../qlab-wallet" }
@@ -75,6 +80,9 @@ rustls = { version = "0.23", default-features = false, features = ["std", "tls12
 # server authentication — the ONLY property classical TLS buys us here — is
 # whatever the host says it is.
 webpki-roots = { version = "1", optional = true }
+# The prover host's native-messaging frames are JSON (Chrome's contract, not
+# ours). Workspace precedent: qumbra-explorer. Optional, host-gated.
+serde_json = { version = "1", optional = true }
 
 # The first-spend e2e (issue #276) runs a REAL local devnet: a node the test
 # mines directly and serves over a real socket, the faucet that funds the
@@ -97,11 +105,14 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 # the browser shell. Heavy halves are default-ON features — every existing
 # consumer is unchanged; qumbra-ffi opts down to the core.
 [features]
-default = ["net", "prove", "randomx"]
+default = ["net", "prove", "randomx", "host"]
 # rustls under the hand-rolled HTTP/1.1 — everything that touches a socket.
 net = ["dep:rustls", "dep:webpki-roots"]
 # the REAL prover and the canonical tx wire — the host/CLI half of a spend.
 prove = ["dep:qlab-consensus", "dep:qlab-p2p"]
 # the RandomX C++ chain, via the qlab-devnet/qlab-node passthroughs.
 randomx = ["qlab-devnet/randomx", "qlab-node/randomx"]
+# the native-messaging prover host (lab #400 rung): prove + submit behind a
+# framed stdio pipe. In default so `cargo test` builds and exercises the bin.
+host = ["net", "prove", "dep:serde_json"]
 

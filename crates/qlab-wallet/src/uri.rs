@@ -332,7 +332,9 @@ pub fn bessel_to_qmb(bessel: u64) -> String {
 
 const B64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-fn b64url_encode(bytes: &[u8]) -> String {
+/// Public since lab #400's host rung: the prover host's frames carry the
+/// witness bundle base64url-encoded, and this is the one copy of the codec.
+pub fn b64url_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let mut buf = [0u8; 3];
@@ -347,7 +349,8 @@ fn b64url_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn b64url_decode(s: &str) -> Result<Vec<u8>, &'static str> {
+/// See [`b64url_encode`] — the decode half, same single-copy grounds.
+pub fn b64url_decode(s: &str) -> Result<Vec<u8>, &'static str> {
     let trimmed = s.trim_end_matches('=');
     if trimmed.len() < s.len() && (s.len() % 4 != 0 || s.len() - trimmed.len() > 2) {
         return Err("malformed base64 padding");

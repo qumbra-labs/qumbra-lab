@@ -1288,6 +1288,7 @@ dependencies = [
  "qumbra-node",
  "rand",
  "rustls",
+ "serde_json",
  "webpki-roots",
 ]
 
