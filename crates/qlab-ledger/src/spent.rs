@@ -72,7 +72,11 @@ pub struct NullifierChunk {
 }
 
 /// Where the per-block nullifier lists come from.
-/// [`crate::net::HttpNullifierSource`] serves it over `GET /v1/nullifiers`.
+///
+/// The CLI's `HttpNullifierSource` serves it over `GET /v1/nullifiers` on its
+/// own transport; a shell with a different transport implements this trait over
+/// that instead. Either way the WIRE is decoded by its owner —
+/// `qlab_cbserver::codec::NullifierPage::from_bytes` — never re-read here.
 pub trait NullifierSource {
     /// One bounded page for `[from, to]`. An `Err` is a transport/decode
     /// failure, verbatim — the caller turns it into the named refusal.
