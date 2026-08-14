@@ -57,10 +57,13 @@ use qlab_cbserver::client::{light_client_scan_with, Completeness, ScanConfig, Sc
 use qlab_wallet::address::Address;
 
 use crate::bundle::WitnessBundle;
+#[cfg(feature = "net")]
 use crate::net::{
     self, HttpAnchorSource, HttpNullifierSource, SubmitAnswer, SubmitClass,
 };
-use crate::send::{os_rng, prove_bundle, SendArtifact};
+use crate::send::os_rng;
+#[cfg(feature = "prove")]
+use crate::send::{prove_bundle, SendArtifact};
 use crate::spent::{fetch_spent, SpentSet};
 use crate::store::WalletDir;
 use crate::sync::{hex32, AnchorSource, Anchors};
@@ -146,6 +149,7 @@ pub enum SendStep {
 
 /// A spend that got far enough to have bytes.
 #[derive(Debug)]
+#[cfg(feature = "net")]
 pub struct SendOutcome {
     /// The canonical wire bytes. **Keep them.** A proof that cost gigabytes should
     /// survive a failed socket, and resubmitting the same bytes answers
@@ -172,6 +176,7 @@ pub enum SendError {
     /// The proof was made and the POST did not complete.
     Incomplete { why: String, wire_bytes: Vec<u8> },
     /// The node answered, and the answer was not an acceptance.
+    #[cfg(feature = "net")]
     Answered {
         class: SubmitClass,
         status: u16,
@@ -185,6 +190,7 @@ impl std::fmt::Display for SendError {
         match self {
             SendError::Refused(why) => write!(f, "{why}"),
             SendError::Incomplete { why, .. } => write!(f, "{why}"),
+            #[cfg(feature = "net")]
             SendError::Answered { body, .. } => write!(f, "{body}"),
         }
     }
@@ -194,6 +200,7 @@ impl std::error::Error for SendError {}
 
 /// Phase 1: scan, subtract spent notes, select inputs, sync the tree and choose
 /// a finalized anchor. The returned artifact is the complete prover handoff.
+#[cfg(feature = "net")]
 pub fn select(
     req: &SendRequest<'_>,
     on: &mut dyn FnMut(SendStep),
@@ -207,6 +214,7 @@ pub fn select(
 /// The request directory still owns public caches and the local send log. Only
 /// seed loading is injected; scanning, spent-note subtraction, input selection,
 /// witness construction, and proving remain the core's decisions.
+#[cfg(feature = "net")]
 pub fn select_opened(
     req: &SendRequest<'_>,
     on: &mut dyn FnMut(SendStep),
@@ -218,6 +226,7 @@ pub fn select_opened(
     select_with_rng(req, on, w, &wallet, &mut rng)
 }
 
+#[cfg(feature = "net")]
 fn select_with_rng(
     req: &SendRequest<'_>,
     on: &mut dyn FnMut(SendStep),
@@ -315,6 +324,7 @@ pub struct ProveContext {
 /// Fetch the phase-2 preflight facts used by [`execute`]. A browser extension
 /// may obtain and decode the same two public surfaces itself, then pass the
 /// resulting values across its native boundary with the bundle.
+#[cfg(feature = "net")]
 pub fn preflight(req: &SendRequest<'_>) -> Result<ProveContext, SendError> {
     preflight_urls(req.url, req.node_url)
 }
@@ -323,6 +333,7 @@ pub fn preflight(req: &SendRequest<'_>) -> Result<ProveContext, SendError> {
 /// prover hosts use this entry point because their serialized witness bundle
 /// already fixes the recipient, amount, fee, and outputs; only the two public
 /// endpoints remain outside that artifact.
+#[cfg(feature = "net")]
 pub fn preflight_urls(scan_url: &str, node_url: &str) -> Result<ProveContext, SendError> {
     let anchors = HttpAnchorSource::new(node_url)
         .anchors()
@@ -341,6 +352,7 @@ pub fn preflight_urls(scan_url: &str, node_url: &str) -> Result<ProveContext, Se
 /// network handle, caller-provided wallet RNG, or second key source is reachable
 /// here; all witness/key bytes come from `bundle`, and current chain state
 /// arrives as decoded public data. The prover's own randomness remains internal.
+#[cfg(feature = "prove")]
 pub fn prove(
     bundle: &WitnessBundle,
     current: &ProveContext,
@@ -392,6 +404,7 @@ pub fn prove(
 /// Phase 3: canonical transaction bytes in, the node's typed answer out. A
 /// `duplicate` remains [`SubmitClass::Duplicate`] rather than being collapsed
 /// into a generic success or error.
+#[cfg(feature = "net")]
 pub fn submit(
     node_url: &str,
     wire_bytes: &[u8],
@@ -416,6 +429,7 @@ pub fn submit(
 /// The original CLI/desktop surface, now exactly the composition of the three
 /// callable phases above. Every early return before [`SendStep::Proving`] is a
 /// cheap named refusal.
+#[cfg(all(feature = "net", feature = "prove"))]
 pub fn execute(
     req: &SendRequest<'_>,
     on: &mut dyn FnMut(SendStep),
@@ -425,6 +439,7 @@ pub fn execute(
 
 /// Execute a send using a wallet already opened by a platform seed provider.
 /// This is otherwise byte-for-byte the same three-phase flow as [`execute`].
+#[cfg(all(feature = "net", feature = "prove"))]
 pub fn execute_opened(
     req: &SendRequest<'_>,
     wallet: &WalletDir,
@@ -440,6 +455,7 @@ pub fn execute_opened(
     )
 }
 
+#[cfg(all(feature = "net", feature = "prove"))]
 fn execute_with_phases<Select, Preflight, Prove, Submit>(
     req: &SendRequest<'_>,
     on: &mut dyn FnMut(SendStep),
@@ -518,7 +534,7 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "net", feature = "prove"))]
 mod tests {
     use super::*;
     use crate::send::Spendable;

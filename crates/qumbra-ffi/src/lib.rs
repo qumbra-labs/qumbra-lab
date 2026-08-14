@@ -29,7 +29,13 @@ use qlab_note::kem::Dk;
 
 use qlab_cbserver::client::{
     light_client_scan, light_client_scan_with, ScanConfig, ScanDriver, ScanDriverStep,
+    ScanOutcome,
 };
+use qlab_cbserver::tree::CommitmentTree;
+use qlab_wallet::address::Address;
+use qlab_wallet::uri::bessel_to_qmb;
+use qumbra_wallet::bundle::WitnessBundle;
+use qumbra_wallet::driver::{SelectDriver, SelectEndpoint, SelectStep};
 use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
 use qlab_wallet::Wallet;
 use rand::rngs::StdRng;
@@ -453,6 +459,10 @@ pub struct ScanState {
     queue: VecDeque<(u64, String, Dk)>,
     current: Option<(u64, String, ScanDriver)>,
     scans: Vec<DivScan>,
+    // Completed outcomes, retained for a subsequent select (lab #400): the
+    // notes themselves, not just the rendered verdicts. `qmb_select_new`
+    // takes them (a select consumes the scan).
+    outcomes: Vec<(u64, ScanOutcome)>,
     done: bool,
 }
 
@@ -509,6 +519,7 @@ pub unsafe extern "C" fn qmb_scan_new(
         queue,
         current,
         scans: Vec::new(),
+        outcomes: Vec::new(),
         done: false,
     }))
 }
@@ -556,6 +567,7 @@ pub unsafe extern "C" fn qmb_scan_step(s: *mut ScanState, out: *mut *mut c_char)
             ScanDriverStep::Done(outcome) => {
                 let (idx, short, _) = st.current.take().expect("stepped without a driver");
                 st.scans.push(DivScan::from_outcome(idx, short, &outcome));
+                st.outcomes.push((idx, outcome));
             }
             ScanDriverStep::Failed(err) => {
                 let (idx, short, _) = st.current.take().expect("stepped without a driver");
@@ -625,6 +637,257 @@ pub unsafe extern "C" fn qmb_scan_free(s: *mut ScanState) {
     if !s.is_null() {
         drop(Box::from_raw(s));
     }
+}
+
+
+/* --- the pumpable select + the witness bundle (lab #400) ------------------ */
+
+/// The caller-pumped phase 1 behind `qmb_select_*` — the browser shell's half
+/// of a spend. Born from a FINISHED scan's outcomes (`qmb_select_new` consumes
+/// them), pumps `qumbra_wallet::driver::SelectDriver`, and finishes as the
+/// serialized `WitnessBundle` the native prover host takes. Key material stays
+/// inside the bundle bytes — the review below is the ONLY rendered view, and
+/// it exposes the named public facts and nothing else.
+pub struct SelectState {
+    driver: SelectDriver,
+    rng: StdRng,
+    bundle: Option<Vec<u8>>,
+}
+
+/// Start a select over the outcomes a finished `qmb_scan_t` holds. NULL +
+/// `err_out` on refusal — an unfinished or partially-failed scan is refused by
+/// name (a spend cannot be built on partial knowledge), and the scan handle's
+/// outcomes are CONSUMED (scan again for another select). `held_leaves` is the
+/// caller's cached commitment-tree leaves (concatenated 32-byte cms, append
+/// order; NULL/0 on first use); `recipient` is the full `qaddr1…` address.
+///
+/// # Safety
+/// `w` and `scan` live; `recipient` NUL-terminated UTF-8; `held_leaves` points
+/// to `held_len` readable bytes when non-NULL; `rng_seed32` points to 32
+/// readable bytes; `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_select_new(
+    w: *const WalletState,
+    scan: *mut ScanState,
+    recipient: *const c_char,
+    amount: u64,
+    held_leaves: *const u8,
+    held_len: usize,
+    rng_seed32: *const u8,
+    err_out: *mut *mut c_char,
+) -> *mut SelectState {
+    if w.is_null() || scan.is_null() || recipient.is_null() || rng_seed32.is_null() {
+        set_err(err_out, "NULL argument".into());
+        return ptr::null_mut();
+    }
+    if held_leaves.is_null() && held_len != 0 {
+        set_err(err_out, "held_leaves is NULL but held_len is not 0".into());
+        return ptr::null_mut();
+    }
+    if held_len % 32 != 0 {
+        set_err(err_out, format!("held_leaves length {held_len} is not a multiple of 32"));
+        return ptr::null_mut();
+    }
+    let scan_state = &mut *scan;
+    if !scan_state.done {
+        set_err(
+            err_out,
+            "the scan has not finished — pump it to DONE before selecting".into(),
+        );
+        return ptr::null_mut();
+    }
+    if let Some(failed) = scan_state.scans.iter().find(|d| d.never_started.is_some()) {
+        set_err(
+            err_out,
+            format!(
+                "index {}'s scan never started — a spend cannot be built on partial knowledge; \
+                 scan again",
+                failed.index
+            ),
+        );
+        return ptr::null_mut();
+    }
+    if scan_state.outcomes.is_empty() {
+        set_err(err_out, "the scan holds no outcomes — it was already consumed; scan again".into());
+        return ptr::null_mut();
+    }
+    let recipient = match CStr::from_ptr(recipient).to_str().ok().and_then(Address::decode) {
+        Some(a) => a,
+        None => {
+            set_err(err_out, "recipient address did not decode (a full qaddr1… is required)".into());
+            return ptr::null_mut();
+        }
+    };
+    let mut held = CommitmentTree::new();
+    if held_len > 0 {
+        for chunk in std::slice::from_raw_parts(held_leaves, held_len).chunks_exact(32) {
+            let mut cm = [0u8; 32];
+            cm.copy_from_slice(chunk);
+            held.append_bytes(&cm);
+        }
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(std::slice::from_raw_parts(rng_seed32, 32));
+
+    let outcomes = std::mem::take(&mut scan_state.outcomes);
+    let to = scan_state.to;
+    let driver =
+        SelectDriver::new((*w).wallet.clone(), recipient, amount, None, outcomes, held, to);
+    Box::into_raw(Box::new(SelectState {
+        driver,
+        rng: StdRng::from_seed(seed),
+        bundle: None,
+    }))
+}
+
+/// Pump the selection one observation forward.
+///
+/// Returns `1` — NEED from the SCAN endpoint (`*out` = path); `2` — NEED from
+/// the NODE endpoint (`*out` = path; one host normally serves both, the code
+/// still says which contract the path belongs to); `0` — DONE: take the bytes
+/// with `qmb_select_take_bundle`; `-2` — FAILED by name (`*out` = the reason);
+/// `-1` — NULL/invalid call. `*out` strings are freed with `qmb_string_free`.
+///
+/// # Safety
+/// `s` live (or NULL); `out` writable (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_select_step(s: *mut SelectState, out: *mut *mut c_char) -> i32 {
+    if s.is_null() || out.is_null() {
+        return -1;
+    }
+    let st = &mut *s;
+    if st.bundle.is_some() {
+        return 0;
+    }
+    match st.driver.step(&mut st.rng) {
+        SelectStep::Need { endpoint, path } => {
+            *out = out_string(path);
+            match endpoint {
+                SelectEndpoint::Scan => 1,
+                SelectEndpoint::Node => 2,
+            }
+        }
+        SelectStep::Done(bundle) => {
+            st.bundle = Some(bundle.to_bytes());
+            0
+        }
+        SelectStep::Failed(why) => {
+            *out = out_string(why);
+            -2
+        }
+    }
+}
+
+/// Answer the outstanding NEED with the fetched bytes (COPIED — the caller
+/// keeps its buffer, same convention as `qmb_scan_supply`).
+///
+/// # Safety
+/// `s` live (or NULL); `body` points to `len` readable bytes (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_select_supply(s: *mut SelectState, body: *const u8, len: usize) {
+    if s.is_null() {
+        return;
+    }
+    let response = if body.is_null() {
+        Err("supplied body is NULL".to_string())
+    } else {
+        Ok(std::slice::from_raw_parts(body, len).to_vec())
+    };
+    (*s).driver.supply(response);
+}
+
+/// Answer the outstanding NEED with a transport failure — it becomes the same
+/// named refusal the CLI produces.
+///
+/// # Safety
+/// `s` live (or NULL); `reason` NUL-terminated (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_select_supply_err(s: *mut SelectState, reason: *const c_char) {
+    if s.is_null() {
+        return;
+    }
+    let reason = if reason.is_null() {
+        "transport failed with no reason".to_string()
+    } else {
+        CStr::from_ptr(reason).to_string_lossy().into_owned()
+    };
+    (*s).driver.supply(Err(reason));
+}
+
+/// Take the serialized witness bundle after DONE — crosses ONCE; NULL before
+/// DONE or on a second take. The buffer is released with `qmb_dealloc(p, len)`.
+/// The bytes carry spending-key material: hand them to the native prover host
+/// and nowhere else, and discard them once the transaction is accepted or
+/// known-duplicate.
+///
+/// # Safety
+/// `s` live (or NULL); `out_len` writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_select_take_bundle(
+    s: *mut SelectState,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if s.is_null() || out_len.is_null() {
+        return ptr::null_mut();
+    }
+    match (*s).bundle.take() {
+        Some(bytes) => {
+            *out_len = bytes.len();
+            Box::into_raw(bytes.into_boxed_slice()) as *mut u8
+        }
+        None => {
+            *out_len = 0;
+            ptr::null_mut()
+        }
+    }
+}
+
+/// # Safety
+/// `s` must be a live handle from `qmb_select_new`; never used after this call.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_select_free(s: *mut SelectState) {
+    if !s.is_null() {
+        drop(Box::from_raw(s));
+    }
+}
+
+/// Render the approval review from DECODED bundle bytes — what the popup shows
+/// before "Approve" reads the artifact that will be proved, never form state
+/// (the task book's §1.5-2). NULL + `err_out` on a bundle that fails decode or
+/// its semantic checks, by name. Only the named public facts are rendered;
+/// witness and key bytes never cross.
+///
+/// # Safety
+/// `bytes` points to `len` readable bytes; `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_bundle_review(
+    bytes: *const u8,
+    len: usize,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    if bytes.is_null() {
+        set_err(err_out, "bundle bytes are NULL".into());
+        return ptr::null_mut();
+    }
+    let raw = std::slice::from_raw_parts(bytes, len);
+    let bundle = match WitnessBundle::from_bytes(raw) {
+        Ok(b) => b,
+        Err(e) => {
+            set_err(err_out, format!("witness bundle refused: {e:?}"));
+            return ptr::null_mut();
+        }
+    };
+    let inputs = if bundle.used_dummy() { "1 real + 1 dummy slot" } else { "2 real" };
+    out_string(format!(
+        "send {} QMB to {}\n  fee:    {} QMB\n  change: {} QMB (returns to this wallet)\n  \
+         inputs: {}\n  anchor: selected at chain tip {}\n",
+        bessel_to_qmb(bundle.amount()),
+        bundle.recipient_short(),
+        bessel_to_qmb(bundle.fee()),
+        bessel_to_qmb(bundle.change_value()),
+        inputs,
+        bundle.selected_at_tip(),
+    ))
 }
 
 #[cfg(test)]
@@ -1069,7 +1332,7 @@ mod tests {
                 // Types, not functions — a closed list on purpose. Widening
                 // this to a prefix match would let an undeclared function slip
                 // through, which is the one thing this half of the test is for.
-                const TYPES: [&str; 3] = ["qmb_wallet_t", "qmb_fetch_fn", "qmb_scan_t"];
+                const TYPES: [&str; 4] = ["qmb_wallet_t", "qmb_fetch_fn", "qmb_scan_t", "qmb_select_t"];
                 assert!(
                     exported.contains(&name.as_str()) || TYPES.contains(&name.as_str()),
                     "header declares `{name}` which lib.rs does not export"

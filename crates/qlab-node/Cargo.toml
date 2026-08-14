@@ -16,10 +16,11 @@ publish.workspace = true
 [dependencies]
 # Chain state / fork choice / finality, block header + body types, and the
 # body-validation rule (anchor-final + posted-fee + in-block double-spend).
-qlab-devnet = { path = "../qlab-devnet" }
+qlab-devnet = { path = "../qlab-devnet", default-features = false }
+
 # The depth-32 incremental commitment tree (the exact consensus tree the M3
 # bucket proves membership against).
-qlab-cbserver = { path = "../qlab-cbserver" }
+qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
 # [u64;4] ↔ [u8;32] digest lane conversions (protocol-spec §1 lane-major LE).
 qlab-note = { path = "../qlab-note" }
 # The closed-form emission curve (frozen B2 constants) — the coinbase(h) =
@@ -38,3 +39,9 @@ tiny_http = "=0.12.0"
 # Real ML-KEM note encryption + the cbserver light client, to prove the embedded
 # serving is byte-identical end-to-end (a reference wallet scans a live node).
 rand = "0.10"
+
+# Passthrough (lab #400): see qlab-devnet. This crate itself touches no RandomX
+# symbol — only codec/tree from qlab-cbserver and qlab-devnet's pure surface.
+[features]
+default = ["randomx"]
+randomx = ["qlab-devnet/randomx"]

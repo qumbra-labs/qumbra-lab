@@ -32,6 +32,7 @@
 
 use qlab_cbserver::client::{light_client_scan_with, ScanConfig, ScanOutcome};
 
+#[cfg(feature = "net")]
 use crate::net::{scan_fetch, HttpNullifierSource};
 use crate::spent::{fetch_spent, subtract_spent, SpentSet};
 use crate::store::WalletDir;
@@ -67,6 +68,7 @@ pub struct Gathered {
 /// only grows, so a node that advanced mid-scan gives the second fetch MORE
 /// coverage than the outputs need, never less. Fetching it first would turn an
 /// ordinary block arrival into a spurious `UNAVAILABLE`.
+#[cfg(feature = "net")]
 pub fn gather(w: &WalletDir, url: &str, from: u64, to: u64) -> Gathered {
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
@@ -121,6 +123,7 @@ pub fn gather(w: &WalletDir, url: &str, from: u64, to: u64) -> Gathered {
 /// because the honest report of four addresses where one endpoint hiccupped is
 /// three figures and one cannot-know — not an aborted command, and certainly not
 /// a zero.
+#[cfg(feature = "net")]
 pub fn scan_report(
     w: &WalletDir,
     url: &str,

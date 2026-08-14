@@ -28,7 +28,8 @@ qlab-note = { path = "../qlab-note" }
 # key-block rotation schedule (M9-N3). The `PowEngine` adapter (`pow::RandomXPow`)
 # and the difficulty wiring (`validation`) live here; qlab-pow is the reusable,
 # dependency-light primitives crate underneath.
-qlab-pow = { path = "../qlab-pow" }
+qlab-pow = { path = "../qlab-pow", default-features = false }
+
 
 # ML-DSA-65 finality-committee checkpoint votes (consensus §5). RustCrypto,
 # pure-Rust, FIPS-204-final, ACVP/Wycheproof KATs; UNAUDITED (self-declared),
@@ -41,3 +42,10 @@ ml-dsa = "=0.1.1"
 # Independent Keccak-256 authority to cross-check the local sponge (so a sponge
 # transcription bug can't self-validate) — same discipline as qlab-note.
 tiny-keccak = { version = "2", features = ["keccak"] }
+
+# Passthrough (lab #400): default ON so every existing consumer is byte-for-byte
+# unchanged; the wallet-core/wasm graph opts out. Gates ONLY the RandomX-backed
+# engine — lwma/keyblock and the KeccakPow placeholder stay unconditional.
+[features]
+default = ["randomx"]
+randomx = ["qlab-pow/randomx"]

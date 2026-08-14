@@ -26,6 +26,7 @@ use qlab_air::narrow::{
     off_tree_witness, MerkleWitness, TxInput, TxOutput,
 };
 use qlab_cbserver::tree::CommitmentTree;
+#[cfg(feature = "prove")]
 use qlab_consensus::{prove_bucket, LOG_HEIGHT};
 use qlab_devnet::body::{TxEntry, TxPublic};
 use qlab_devnet::fees::{posted_fee, ArityBucket};
@@ -49,6 +50,7 @@ pub struct Spendable {
     pub rseed: [u64; 4],
 }
 
+#[cfg(feature = "prove")]
 pub struct SendArtifact {
     pub entry: TxEntry,
     pub wire_bytes: Vec<u8>,
@@ -247,6 +249,7 @@ pub(crate) fn build_bundle(
 /// The one proof implementation. Callers reach it through
 /// [`crate::spend::prove`], whose current-chain preflight runs before this
 /// function and makes a stale/consumed bundle a cheap named refusal.
+#[cfg(feature = "prove")]
 pub(crate) fn prove_bundle(bundle: &WitnessBundle) -> Result<SendArtifact, String> {
     bundle.validate().map_err(|e| e.to_string())?;
     let inst = if bundle.used_dummy() {

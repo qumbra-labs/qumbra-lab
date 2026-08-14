@@ -697,6 +697,7 @@ pub struct HistoryData {
 /// The local record is **optional enrichment and must never stop a chain-derived
 /// ledger from rendering** — an unreadable file becomes a note and the ledger
 /// continues, chain-only.
+#[cfg(feature = "net")]
 pub fn report(
     dir: &std::path::Path,
     w: &crate::store::WalletDir,
@@ -709,6 +710,7 @@ pub fn report(
 }
 
 /// Run the same history flow as [`report`], returning its typed ledger.
+#[cfg(feature = "net")]
 pub fn report_data(
     dir: &std::path::Path,
     w: &crate::store::WalletDir,

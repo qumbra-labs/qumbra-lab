@@ -64,6 +64,7 @@ pub mod driver;
 pub mod envelope;
 pub mod history;
 pub mod names;
+#[cfg(feature = "net")]
 pub mod net;
 pub mod qr;
 pub mod scan;

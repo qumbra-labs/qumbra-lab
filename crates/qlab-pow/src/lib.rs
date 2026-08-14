@@ -32,8 +32,10 @@
 
 pub mod keyblock;
 pub mod lwma;
+#[cfg(feature = "randomx")]
 pub mod randomx;
 
 pub use keyblock::{key_seed_height, KeyBlockSchedule};
 pub use lwma::lwma_next_difficulty;
+#[cfg(feature = "randomx")]
 pub use randomx::RandomXHasher;
