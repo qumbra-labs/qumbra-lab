@@ -1132,8 +1132,10 @@ version = "0.0.0"
 dependencies = [
  "qlab-air",
  "qlab-cbserver",
+ "qlab-devnet",
  "qlab-note",
  "qlab-wallet",
+ "rand",
 ]
 
 [[package]]

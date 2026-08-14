@@ -748,7 +748,7 @@ fn history(args: &[String]) -> Result<(), Box<dyn Error>> {
     let from: u64 = flag(args, "--from").unwrap_or("0").parse()?;
 
     let w = WalletDir::open(&dir)?;
-    let report = qumbra_wallet::history::report(&dir, &w, url, from, to);
+    let report = qumbra_wallet::ledger_run::report(&dir, &w, url, from, to);
     // stderr, so a piped ledger stays a ledger — but never dropped: each note
     // names a reason a `recipient:` line below reads `not recorded`.
     for note in &report.notes {

@@ -21,7 +21,7 @@
 //! - **send events, reconstructed**: spent notes at height H grouped with the
 //!   notes this wallet received at the same H ⇒
 //!   `outgoing = inputs − change − posted_fee(bucket)`. The fee is public and is
-//!   read from the posted table ([`qlab_devnet::fees::posted_fee`]), never
+//!   read from the posted table, supplied by the caller (see `build`), never
 //!   stored.
 //!
 //! What the chain can **never** yield is the recipient — a transaction's
@@ -57,7 +57,6 @@
 //! (opview #136, explorer #235, wallet `scan`).
 
 use qlab_cbserver::client::{Completeness, ScanOutcome};
-use qlab_devnet::fees::{posted_fee, ArityBucket};
 use qlab_wallet::Wallet;
 
 use crate::sends::{SendLog, SendRecord};
@@ -197,6 +196,12 @@ pub fn build(
     coverage: &SpentCoverage,
     log: Option<&SendLog>,
     range: (u64, u64),
+    // The posted fee for the frozen 2x2 bucket. `None` means this platform
+    // cannot reach the table at all — `qlab-devnet` carries it and does not
+    // cross-compile to iOS (lab #407) — and in that case a send event refuses
+    // its figure instead of guessing one. One number rather than a table
+    // because the circuit is a fixed 2x2 shape, so there is exactly one arity.
+    posted_fee_2x2: Option<u64>,
 ) -> Ledger {
     let mut received: Vec<Received> = Vec::new();
     let mut spent: Vec<(u64, SpentInput, [u8; 32])> = Vec::new(); // (spent_height, input, nf)
@@ -320,8 +325,6 @@ pub fn build(
 
         let inputs_total: u128 = inputs.iter().map(|i| u128::from(i.value)).sum();
         let change_total: u128 = change.iter().map(|c| u128::from(c.value)).sum();
-        let fee = posted_fee(ArityBucket::TwoByTwo);
-
         let outgoing = if shadowed_here {
             Outgoing::Unavailable {
                 why: format!(
@@ -342,16 +345,33 @@ pub fn build(
             }
         } else if change.is_empty() {
             Outgoing::FeeInseparable { amount_and_fee: inputs_total }
-        } else if inputs_total < change_total + u128::from(fee) {
+        } else if posted_fee_2x2.is_none() {
+            // Refusing rather than degrading to FeeInseparable, on purpose. With
+            // change present, a FeeInseparable figure would leave the change
+            // both in `total_in` and outside `total_out`, and whether
+            // `in - out - fees == spendable` still closes is not something this
+            // arm can assert. An unprovable total is worse than an absent one.
+            Outgoing::Unavailable {
+                why: format!(
+                    "height {h} looks like a send with change, but the posted fee table is not \
+                     reachable on this platform, so the value that left cannot be separated from \
+                     the fee and no total is quotable"
+                ),
+            }
+        } else if inputs_total < change_total + u128::from(posted_fee_2x2.unwrap()) {
             Outgoing::Unavailable {
                 why: format!(
                     "at height {h} this wallet spent {inputs_total} bessel and received \
-                     {change_total} back, which the posted fee of {fee} cannot reconcile — the \
-                     note(s) received here are not this send's change"
+                     {change_total} back, which the posted fee of {} cannot reconcile — the \
+                     note(s) received here are not this send's change",
+                    posted_fee_2x2.unwrap()
                 ),
             }
         } else {
-            Outgoing::Exact { amount: inputs_total - change_total - u128::from(fee), fee }
+            Outgoing::Exact {
+                amount: inputs_total - change_total - u128::from(posted_fee_2x2.unwrap()),
+                fee: posted_fee_2x2.unwrap(),
+            }
         };
 
         // Only a group that reconciles has its receipts folded in as change; an
@@ -658,130 +678,8 @@ pub fn render(ledger: &Ledger, url: &str) -> String {
     out
 }
 
-/// A rendered ledger plus the caveats a caller must show beside it.
-///
-/// The notes are **data, not output**, because the two callers place them
-/// differently — the CLI writes them to stderr, a GUI has no stderr and must put
-/// them in the panel. Returning them as strings is what lets one flow serve
-/// both without either re-deriving the ledger.
-pub struct HistoryReport {
-    /// The ledger, already rendered.
-    pub text: String,
-    /// 🔴 **Show these.** Each one names a reason a `recipient:` line below reads
-    /// `not recorded`. Dropping them turns "this wallet has no local record of
-    /// who it paid" into an unexplained blank, which is the same class of lie as
-    /// a balance quoted without its coverage.
-    pub notes: Vec<String>,
-}
-
-/// The structured result of the history flow, before any terminal-oriented
-/// rendering. Native clients consume this so they can build accessible views
-/// without parsing [`HistoryReport::text`]. All accounting and `UNAVAILABLE`
-/// decisions remain in this crate.
-pub struct HistoryData {
-    pub ledger: Ledger,
-    pub notes: Vec<String>,
-}
-
-/// The whole `history` flow: the local send log if there is one, the two chain
-/// streams via [`crate::scan::gather`], and the rendered ledger.
-///
-/// 🔴 **One flow, every caller — the same rule [`crate::scan`] exists for.** This
-/// was ~20 lines in the CLI, and a shell that wanted the ledger would have had
-/// to copy them. That copy has been made before, three times, and each time it
-/// diverged on the axis nobody was watching (transport, then spent-note
-/// subtraction, then the shared types). The ledger is a worse thing to diverge
-/// than the balance: it is the wallet's account of its own past, and two of them
-/// disagreeing is not a stale number but a contradiction.
-///
-/// The local record is **optional enrichment and must never stop a chain-derived
-/// ledger from rendering** — an unreadable file becomes a note and the ledger
-/// continues, chain-only.
-#[cfg(feature = "net")]
-pub fn report(
-    dir: &std::path::Path,
-    w: &crate::store::WalletDir,
-    url: &str,
-    from: u64,
-    to: u64,
-) -> HistoryReport {
-    let data = report_data(dir, w, url, from, to);
-    HistoryReport { text: render(&data.ledger, url), notes: data.notes }
-}
-
-/// Run the same history flow as [`report`], returning its typed ledger.
-#[cfg(feature = "net")]
-pub fn report_data(
-    dir: &std::path::Path,
-    w: &crate::store::WalletDir,
-    url: &str,
-    from: u64,
-    to: u64,
-) -> HistoryData {
-    use crate::sends::{SendLog, SENDS_FILE};
-
-    let wallet = w.wallet();
-    let mut notes: Vec<String> = Vec::new();
-
-    let log = match SendLog::load(dir) {
-        Ok(log) => log,
-        Err(e) => {
-            notes.push(format!(
-                "{e} — the ledger below is chain-only, so every `recipient:` line reads \
-                 `not recorded`."
-            ));
-            None
-        }
-    };
-    if log.is_none() {
-        notes.push(format!(
-            "no {SENDS_FILE} in this wallet dir, so recipients are not shown. That file is \
-             written by `send` on this machine and is NEVER recoverable from a mnemonic; \
-             everything else below comes from the chain."
-        ));
-    }
-
-    let crate::scan::Gathered { outcomes, coverage, set } = crate::scan::gather(w, url, from, to);
-    let scans: Vec<AddressScan> = outcomes
-        .into_iter()
-        .map(|(div_index, address_short, outcome)| AddressScan { div_index, address_short, outcome })
-        .collect();
-    let ledger = build(&wallet, &scans, set.as_ref(), &coverage, log.as_ref(), (from, to));
-    HistoryData { ledger, notes }
-}
-
 #[cfg(test)]
 mod tests {
-    /// The local send log is optional enrichment; its absence is a NOTE, never a
-    /// missing ledger and never a silent blank.
-    ///
-    /// A restored wallet never has a `sends.v1` — it is written by `send` on one
-    /// machine and is not recoverable from a mnemonic — so this is the ordinary
-    /// state for anyone who moved wallets, not an edge case. The endpoint here is
-    /// dead as well, which is the harsher combination: no local record AND no
-    /// chain. Both facts must reach the caller.
-    #[test]
-    fn a_wallet_with_no_send_log_gets_a_note_and_still_gets_a_ledger() {
-        use crate::store::WalletDir;
-        use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
-        use rand::Rng;
-
-        let dir = std::env::temp_dir().join("qmb_history_report_no_log");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mut entropy = [0u8; ENTROPY_LEN];
-        rand::rng().fill_bytes(&mut entropy);
-        let w = WalletDir::create(&dir, MasterSeed::from_entropy(entropy)).expect("create wallet");
-
-        let out = super::report(&dir, &w, "http://127.0.0.1:1", 0, 8);
-
-        assert!(
-            out.notes.iter().any(|n| n.contains(crate::sends::SENDS_FILE)),
-            "the absent local record must be NAMED: {:?}",
-            out.notes
-        );
-        assert!(!out.text.is_empty(), "a chain-only ledger still renders");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     use super::*;
     use qlab_cbserver::client::{LocatedNote, ScanStats, ShadowedNote, UnopenedOutput};
@@ -852,7 +750,6 @@ mod tests {
     #[test]
     fn a_grant_then_a_send_is_exactly_two_events_that_reconcile() {
         let w = wallet();
-        assert_eq!(FEE, posted_fee(ArityBucket::TwoByTwo), "the posted table, not a copy");
         let grant = note(&w, 0, 1_000_000_000, 100);
         let change = note(&w, 0, 899_000_000, 200);
         let nf = crate::spent::note_nullifier(&w, 0, &grant);
@@ -863,7 +760,7 @@ mod tests {
             outcome(vec![located(&grant, 4), located(&change, 9)], (0, 12)),
         )];
         let set = SpentSet::from_parts(Some((0, 12)), [(9, nf)]);
-        let l = build(&w, &scans, Some(&set), &covered((0, 12)), None, (0, 12));
+        let l = build(&w, &scans, Some(&set), &covered((0, 12)), None, (0, 12), Some(FEE));
 
         assert!(l.gaps.is_empty(), "{:?}", l.gaps);
         assert_eq!(l.events.len(), 2, "the change is folded into its send, not a third event");
@@ -935,8 +832,8 @@ mod tests {
             }],
         };
 
-        let chain_only = build(&w, &scans, Some(&set), &covered((0, 12)), None, (0, 12));
-        let with_log = build(&w, &scans, Some(&set), &covered((0, 12)), Some(&log), (0, 12));
+        let chain_only = build(&w, &scans, Some(&set), &covered((0, 12)), None, (0, 12), Some(FEE));
+        let with_log = build(&w, &scans, Some(&set), &covered((0, 12)), Some(&log), (0, 12), Some(FEE));
         assert_eq!(chain_only.totals, with_log.totals, "local memory moves no chain figure");
         assert_eq!(chain_only.current_spendable, with_log.current_spendable);
         assert_eq!(with_log.unmatched_records, 0);
@@ -958,7 +855,7 @@ mod tests {
                 nullifiers: vec![[0x77; 32]],
             }],
         };
-        let l = build(&w, &scans, Some(&set), &covered((0, 12)), Some(&orphan), (0, 12));
+        let l = build(&w, &scans, Some(&set), &covered((0, 12)), Some(&orphan), (0, 12), Some(FEE));
         assert_eq!(l.unmatched_records, 1);
         assert!(render(&l, "http://e").contains("joined no event in this range"));
     }
@@ -972,7 +869,7 @@ mod tests {
         let nf = crate::spent::note_nullifier(&w, 0, &n);
         let scans = vec![scan_of(&w, 0, outcome(vec![located(&n, 2)], (0, 9)))];
         let set = SpentSet::from_parts(Some((0, 9)), [(6, nf)]);
-        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9));
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE));
 
         let send = match &l.events[1] {
             Event::Send(s) => s,
@@ -1004,7 +901,7 @@ mod tests {
         let coverage = SpentCoverage::Unavailable {
             why: "the nullifier stream could not be read (404)".into(),
         };
-        let l = build(&w, &scans, None, &coverage, None, (0, 9));
+        let l = build(&w, &scans, None, &coverage, None, (0, 9), Some(FEE));
 
         assert_eq!(l.events.len(), 1, "the receipt is still a chain fact");
         assert!(matches!(l.events[0], Event::Received(_)));
@@ -1041,7 +938,7 @@ mod tests {
         o.stats.detected_outputs = 2;
         let scans = vec![scan_of(&w, 0, o)];
         let set = SpentSet::from_parts(Some((0, 9)), []);
-        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9));
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE));
 
         assert_eq!(l.events.len(), 1);
         assert!(l.totals.is_none());
@@ -1062,7 +959,7 @@ mod tests {
             outcome: Err("connection refused".into()),
         }];
         let set = SpentSet::from_parts(Some((0, 9)), []);
-        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9));
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE));
         assert!(l.events.is_empty());
         assert!(l.totals.is_none());
         let text = render(&l, "http://down");
@@ -1097,7 +994,7 @@ mod tests {
                 (0, 9),
             ),
         )];
-        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9));
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE));
 
         let send = l
             .events
@@ -1139,7 +1036,7 @@ mod tests {
         o.stats.shadowed_outputs = 1;
         let scans = vec![scan_of(&w, 0, o)];
         let set = SpentSet::from_parts(Some((0, 9)), []);
-        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9));
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE));
 
         assert_eq!(l.shadowed_total, 40);
         assert_eq!(l.events.len(), 2);
@@ -1162,7 +1059,7 @@ mod tests {
             scan_of(&w, 0, outcome(vec![located(&early, 2)], (0, 9))),
         ];
         let set = SpentSet::from_parts(Some((0, 9)), []);
-        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9));
+        let l = build(&w, &scans, Some(&set), &covered((0, 9)), None, (0, 9), Some(FEE));
         let heights: Vec<u64> = l.events.iter().map(|e| e.height()).collect();
         assert_eq!(heights, vec![2, 9]);
     }

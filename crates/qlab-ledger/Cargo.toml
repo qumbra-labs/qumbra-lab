@@ -28,3 +28,11 @@ qlab-wallet = { path = "../qlab-wallet" }
 # circuit uses, so a wallet cannot disagree with consensus about what is spent.
 qlab-air = { path = "../qlab-air" }
 qlab-note = { path = "../qlab-note" }
+
+# Dev-only, and that distinction is load-bearing: dev-dependencies are NOT built
+# for a consumer of this crate, so `qumbra-ffi` still cross-compiles to iOS with
+# no randomx in sight. The fixtures these tests need (devnet notes, an rng) can
+# therefore live beside the code they test instead of being exiled to the CLI.
+[dev-dependencies]
+rand = "0.10"
+qlab-devnet = { path = "../qlab-devnet" }
