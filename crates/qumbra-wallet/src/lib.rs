@@ -75,3 +75,4 @@ pub mod spent;
 pub mod store;
 pub mod sync;
 pub mod view;
+pub mod words;
