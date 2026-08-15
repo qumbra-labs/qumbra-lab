@@ -60,7 +60,8 @@ pub mod telemetry;
 
 pub use coinbase::{
     coinbase_leaf_appears_at, coinbase_maturity, coinbase_note, coinbase_note_leaf,
-    coinbase_note_value, coinbase_rho, coinbase_rseed, matured_coinbase_leaf,
+    coinbase_note_parts, coinbase_note_value, coinbase_note_value_parts, coinbase_rho,
+    coinbase_rseed, matured_coinbase_leaf,
     matures_coinbase_minted_at, CoinbaseMaturity, COINBASE_RHO_DOMAIN, COINBASE_RSEED_DOMAIN,
 };
 pub use emission::{coinbase, s_atomic, RewardSplit, COINBASE_MATURITY_BLOCKS};
@@ -69,8 +70,8 @@ pub use mempool::{
     MempoolParams, MempoolTx, TxId,
 };
 pub use node::{
-    genesis_block, FinalizeOutcome, MemNode, Node, NodeError, NodeState, RecoveryReport,
-    RewindReport, SnapshotRejection,
+    genesis_block, AnchorGate, FinalizeOutcome, MemNode, Node, NodeError, NodeState,
+    RecoveryReport, RewindReport, SnapshotRejection,
 };
 pub use recovery::{
     catch_up_slot, committee_accrual_finalized, committee_accrual_for_span, Finalizer,
@@ -78,7 +79,7 @@ pub use recovery::{
 };
 pub use rpc::{
     anchor_set, compact_response, full_response, main_chain_counts_of, main_chain_of,
-    main_chain_roots_of, repeated_nullifier_in_tx, serve, AnchorSet, BlockDiscovery,
+    coinbase_page, main_chain_roots_of, repeated_nullifier_in_tx, serve, AnchorSet, BlockDiscovery,
     names_page, nullifier_page, CheckpointFacts, FullRefusal, MemNodeRpc, NetFacts, NodeRpc, NodeStatus,
     RecipientDiscovery, RejectReason, RouteResult, RpcServerHandle, SubmitOutcome, TreeLeaves,
     TxDiscovery, MAX_COMPACT_BLOCKS, MAX_TREE_LEAVES, RPC_VERSION,
@@ -89,7 +90,8 @@ pub use telemetry::{
     DURABLE_HEAD_SINCE_VERSION, LOCAL_COMMITMENT_SPLIT, READABLE_TELEMETRY_VERSIONS,
 };
 pub use persist::{
-    read_records, snapshot_on_disk, LogRecord, Snapshot, SnapshotOnDisk, BLOCK_LOG, FORMAT_VERSION,
+    read_records, snapshot_on_disk, LogRecord, Snapshot, SnapshotLoad, SnapshotLoadReject,
+    SnapshotOnDisk, BLOCK_LOG, FORMAT_VERSION,
     SNAPSHOT,
 };
 pub use replay_progress::{

@@ -76,6 +76,10 @@ pub struct ChainState {
     blocks: HashMap<Hash32, Entry>,
     genesis: Hash32,
     tip: Hash32,
+    /// Pure derived index of the current fork-choice main chain, genesis to tip.
+    /// `blocks` + `tip` remain authoritative. Direct extensions append in O(1);
+    /// pre-finality reorgs replace only the suffix after the fork point.
+    main_chain_by_height: Vec<Hash32>,
     /// The highest finalized block. Once set, every tip must descend from it.
     finalized: Option<FinalPoint>,
 }
@@ -96,6 +100,7 @@ impl ChainState {
             blocks,
             genesis: hash,
             tip: hash,
+            main_chain_by_height: vec![hash],
             finalized: None,
         }
     }
@@ -123,7 +128,7 @@ impl ChainState {
         // safety property — no reorg past a finalized checkpoint, EVER, no matter
         // how much work a competing branch carries. Ties keep the incumbent.
         if cumulative_work > self.tip_work() && self.descends_from_finalized(&hash) {
-            self.tip = hash;
+            self.adopt_tip(hash);
         }
         Ok(hash)
     }
@@ -145,7 +150,7 @@ impl ChainState {
         }
         self.finalized = Some(FinalPoint { hash, height });
         if !self.descends_from_finalized(&self.tip) {
-            self.tip = hash;
+            self.adopt_tip(hash);
         }
         Ok(())
     }
@@ -267,21 +272,54 @@ impl ChainState {
         self.blocks.contains_key(&cur).then_some(cur)
     }
 
+    /// Look up the current fork-choice main-chain hash at `height` in O(1).
+    pub fn main_chain_hash_at(&self, height: u64) -> Option<Hash32> {
+        usize::try_from(height)
+            .ok()
+            .and_then(|height| self.main_chain_by_height.get(height))
+            .copied()
+    }
+
     /// The main chain (heaviest), genesis → tip inclusive, as a Vec of hashes.
-    /// Walks back from the tip along parent links, then reverses.
+    /// Clones the maintained height index; single-height readers should use
+    /// [`Self::main_chain_hash_at`] to avoid allocating the whole chain.
     pub fn main_chain(&self) -> Vec<Hash32> {
-        let mut chain = Vec::with_capacity(self.tip_height() as usize + 1);
-        let mut cur = self.tip;
-        loop {
-            chain.push(cur);
-            let entry = &self.blocks[&cur];
-            if entry.header.height == 0 {
-                break;
-            }
-            cur = entry.header.prev;
+        self.main_chain_by_height.clone()
+    }
+
+    /// Change the fork-choice tip and update only the changed index suffix.
+    /// Ordinary connected headers append in O(1). A pre-finality reorg walks the
+    /// incoming branch only to its fork point, truncates the losing suffix, then
+    /// appends the winning suffix; it never rebuilds tip → genesis.
+    fn adopt_tip(&mut self, new_tip: Hash32) {
+        let new_header = self.blocks.get(&new_tip).expect("adopted tip is stored").header;
+        let new_height = usize::try_from(new_header.height).expect("stored height fits address space");
+        if new_header.prev == self.tip && new_height == self.main_chain_by_height.len() {
+            self.main_chain_by_height.push(new_tip);
+            self.tip = new_tip;
+            return;
         }
-        chain.reverse();
-        chain
+
+        let mut cursor = new_tip;
+        let mut reversed_suffix = Vec::new();
+        let fork_height = loop {
+            let header = self.blocks.get(&cursor).expect("main-chain candidate is stored").header;
+            let height = usize::try_from(header.height).expect("stored height fits address space");
+            if self.main_chain_by_height.get(height).copied() == Some(cursor) {
+                break height;
+            }
+            reversed_suffix.push(cursor);
+            assert!(header.height > 0, "every stored branch shares genesis");
+            cursor = header.prev;
+        };
+
+        self.main_chain_by_height.truncate(fork_height + 1);
+        reversed_suffix.reverse();
+        self.main_chain_by_height.extend(reversed_suffix);
+        self.tip = new_tip;
+
+        assert_eq!(self.main_chain_by_height.last().copied(), Some(new_tip));
+        assert_eq!(self.main_chain_by_height.len(), new_height + 1);
     }
 
     /// Number of blocks known to the store (across all forks).
@@ -400,6 +438,43 @@ mod tests {
         let b = BlockHeader::child_of(c.header(&a_hash).unwrap(), 4, 1_000, [2u8; 32]);
         let b_hash = c.insert_header(b).unwrap();
         assert_eq!(c.main_chain(), vec![g, a_hash, b_hash]);
+        assert_eq!(c.main_chain_hash_at(0), Some(g));
+        assert_eq!(c.main_chain_hash_at(1), Some(a_hash));
+        assert_eq!(c.main_chain_hash_at(2), Some(b_hash));
+        assert_eq!(c.main_chain_hash_at(3), None);
+    }
+
+    /// QUM-111 widened S5: a pre-finality reorg replaces exactly the losing
+    /// suffix in the derived O(1) height index; no stale hash remains addressable.
+    #[test]
+    fn main_chain_height_index_replaces_the_suffix_on_pre_finality_reorg() {
+        let mut c = ChainState::new(genesis());
+        let g = c.genesis_block_hash();
+        let gh = *c.header(&g).unwrap();
+
+        let a1 = c.insert_header(BlockHeader::child_of(&gh, 2, 1_000, [0xA1; 32])).unwrap();
+        let a1h = *c.header(&a1).unwrap();
+        let a2 = c.insert_header(BlockHeader::child_of(&a1h, 4, 1_000, [0xA2; 32])).unwrap();
+        let a2h = *c.header(&a2).unwrap();
+        let a3 = c.insert_header(BlockHeader::child_of(&a2h, 6, 1_000, [0xA3; 32])).unwrap();
+        assert_eq!(c.main_chain(), vec![g, a1, a2, a3]);
+
+        // B remains a side branch until B3 takes the cumulative-work lead.
+        let b1 = c.insert_header(BlockHeader::child_of(&gh, 2, 900, [0xB1; 32])).unwrap();
+        let b1h = *c.header(&b1).unwrap();
+        let b2 = c.insert_header(BlockHeader::child_of(&b1h, 4, 900, [0xB2; 32])).unwrap();
+        let b2h = *c.header(&b2).unwrap();
+        let b3 = c.insert_header(BlockHeader::child_of(&b2h, 6, 2_000, [0xB3; 32])).unwrap();
+
+        let expected = [g, b1, b2, b3];
+        assert_eq!(c.main_chain(), expected);
+        for (height, hash) in expected.into_iter().enumerate() {
+            assert_eq!(c.main_chain_hash_at(height as u64), Some(hash));
+        }
+        assert_eq!(c.main_chain_hash_at(4), None);
+        assert!(!c.main_chain().contains(&a1));
+        assert!(!c.main_chain().contains(&a2));
+        assert!(!c.main_chain().contains(&a3));
     }
 
     #[test]
@@ -476,6 +551,30 @@ mod tests {
         let b2h = *c.header(&b2).unwrap();
         let b3 = c.insert_header(BlockHeader::child_of(&b2h, 6, 1_000, [0xB3; 32])).unwrap();
         assert_eq!(c.set_finalized(b3), Err(FinalizeMarkError::NotDescendantOfFinalized));
+    }
+
+    /// The first finalized checkpoint may re-anchor an out-of-band fork-choice
+    /// tip to a known side branch. The derived index follows at that same mutation.
+    #[test]
+    fn first_finalized_side_branch_reanchors_the_main_chain_height_index() {
+        let mut c = ChainState::new(genesis());
+        let g = c.genesis_block_hash();
+        let gh = *c.header(&g).unwrap();
+        let a1 = c.insert_header(BlockHeader::child_of(&gh, 2, 1_000, [0xA1; 32])).unwrap();
+        let a1h = *c.header(&a1).unwrap();
+        let a2 = c.insert_header(BlockHeader::child_of(&a1h, 4, 1_000, [0xA2; 32])).unwrap();
+        let b1 = c.insert_header(BlockHeader::child_of(&gh, 2, 500, [0xB1; 32])).unwrap();
+        let b1h = *c.header(&b1).unwrap();
+        let b2 = c.insert_header(BlockHeader::child_of(&b1h, 4, 500, [0xB2; 32])).unwrap();
+        assert_eq!(c.tip_hash(), a2);
+
+        c.set_finalized(b2).unwrap();
+        assert_eq!(c.tip_hash(), b2);
+        assert_eq!(c.main_chain(), vec![g, b1, b2]);
+        assert_eq!(c.main_chain_hash_at(1), Some(b1));
+        assert_eq!(c.main_chain_hash_at(2), Some(b2));
+        assert!(!c.main_chain().contains(&a1));
+        assert!(!c.main_chain().contains(&a2));
     }
 
     #[test]

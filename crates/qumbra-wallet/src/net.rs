@@ -1,12 +1,15 @@
 //! The wallet's HTTP clients for the served send seams (issue #276, the wallet
 //! half of the stamped A1+B1 decision).
 //!
-//! Four endpoints on one `qumbra-node` discovery server:
+//! Five endpoints on one `qumbra-node` discovery server:
 //!
 //! - `GET /v1/nullifiers?from=&to=` — [`HttpNullifierSource`], the public
 //!   per-block nullifier lists a balance subtracts its own spent notes against
 //!   (lab issue #314). Bulk over a range, never a per-nullifier probe — see
 //!   [`crate::spent`].
+//! - `GET /v1/coinbase?from=&to=` — [`HttpCoinbaseSource`], the per-block
+//!   coinbase facts a mining wallet matches its own `rkm` against (lab #415).
+//!   Bulk over a range, never a per-key probe — see [`crate::coinbase`].
 //! - `GET /v1/tree/leaves?from=N` — [`HttpLeafSource`], the witness source (B1).
 //! - `GET /v1/anchors` — [`HttpAnchorSource`], which leaf count a witness may
 //!   legally be built at. See [`crate::sync`] for why the leaf stream alone
@@ -53,9 +56,10 @@
 //! exchange at the Cloudflare edge is outside the wallet's control, and this is
 //! testnet-tunable, revisited at T2.
 
-use qlab_cbserver::codec::NullifierPage;
+use qlab_cbserver::codec::{CoinbasePage, NullifierPage};
 use qlab_node::{AnchorSet, TreeLeaves};
 
+use crate::coinbase::{CoinbaseChunk, CoinbaseSource};
 use crate::spent::{NullifierChunk, NullifierSource};
 use crate::sync::{AnchorSource, Anchors, LeafChunk, LeafSource};
 
@@ -160,6 +164,39 @@ impl NullifierSource for HttpNullifierSource {
             to: page.to,
             blocks: page.blocks.into_iter().map(|b| (b.height, b.nullifiers)).collect(),
         })
+    }
+}
+
+/// The per-block coinbase stream as a [`CoinbaseSource`] — `GET
+/// /v1/coinbase?from=&to=`, decoded by the wire's own
+/// `qlab_cbserver::codec::CoinbasePage::from_bytes` (lab #415).
+///
+/// The paging loop lives in [`crate::coinbase::fetch_coinbase`]; this is one
+/// page. The server bounds a page at `MAX_COINBASE_BLOCKS` and names every
+/// height it carries, so a client that resumes from the last height + 1 is
+/// correct without knowing that bound.
+///
+/// This is the **scan** endpoint's route, like `/v1/nullifiers`: the coinbase
+/// facts and the discovery groups of one block are published by one snapshot
+/// swap, so a wallet asking the same host cannot be served a height's outputs
+/// without that height's coinbase.
+pub struct HttpCoinbaseSource {
+    base_url: String,
+}
+
+impl HttpCoinbaseSource {
+    pub fn new(base_url: impl Into<String>) -> HttpCoinbaseSource {
+        HttpCoinbaseSource { base_url: base_url.into() }
+    }
+}
+
+impl CoinbaseSource for HttpCoinbaseSource {
+    fn fetch_range(&self, from: u64, to: u64) -> Result<CoinbaseChunk, String> {
+        let path = format!("/v1/coinbase?from={from}&to={to}");
+        let bytes = http_get(&self.base_url, &path).map_err(|e| format!("GET {path}: {e}"))?;
+        let page = CoinbasePage::from_bytes(&bytes)
+            .map_err(|e| format!("GET {path} did not decode: {e:?}"))?;
+        Ok(CoinbaseChunk { from: page.from, to: page.to, blocks: page.blocks })
     }
 }
 

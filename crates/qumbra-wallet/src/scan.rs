@@ -32,11 +32,14 @@
 
 use qlab_cbserver::client::{light_client_scan_with, ScanConfig, ScanOutcome};
 
+use crate::coinbase::{match_mined, MinedChain, MinedReport};
 #[cfg(feature = "net")]
-use crate::net::{scan_fetch, HttpNullifierSource};
-use crate::spent::{fetch_spent, subtract_spent, SpentSet};
+use crate::coinbase::fetch_coinbase;
+#[cfg(feature = "net")]
+use crate::net::{scan_fetch, HttpCoinbaseSource, HttpNullifierSource};
+use crate::spent::{subtract_spent, SpentSet};
 use crate::store::WalletDir;
-use crate::view::{DivScan, SpentCoverage};
+use crate::view::{CoinbaseCoverage, DivScan, SpentCoverage};
 
 /// The union of the height ranges several scans' outputs came from — the range
 /// the nullifier stream must cover before any of their figures may be quoted
@@ -46,12 +49,19 @@ use crate::view::{DivScan, SpentCoverage};
 pub use qlab_ledger::spent::widest_range;
 
 /// Everything a caller reads off the chain: one light-client scan per allocated
-/// address, then the nullifier stream over the range those outputs actually came
-/// from.
+/// address, the coinbase stream, then the nullifier stream over the range those
+/// outputs actually came from.
 pub struct Gathered {
     pub outcomes: Vec<(u64, String, Result<ScanOutcome, String>)>,
     pub coverage: SpentCoverage,
     pub set: Option<SpentSet>,
+    /// How far the coinbase stream reached, or why it could not (lab #415).
+    /// **This is what decides whether the report may un-narrow PR #420's
+    /// verdict language**: a scan that did not fetch the route has not looked at
+    /// coinbase, and must keep saying so.
+    pub coinbase_coverage: CoinbaseCoverage,
+    /// The per-block coinbase facts, `None` when the route could not be read.
+    pub mined: Option<MinedChain>,
 }
 
 /// 🔴 **One gatherer, every caller.** `history` is a different rendering of
@@ -97,9 +107,27 @@ pub fn gather(w: &WalletDir, url: &str, from: u64, to: u64) -> Gathered {
         outcomes.push((idx, short, got));
     }
 
-    // ---- 2. The spends, over the range the outputs actually reached. -------
+    // ---- 2. The coinbase, over the same range (lab #415). ------------------
+    //
+    // Fetched BEFORE the nullifier stream and AFTER the scans, for the reason
+    // the ordering comment above gives: the chain only grows, so the spend
+    // stream fetched last covers at least what both of the other two reached.
+    // A mined note is spendable and can therefore be spent, so its heights must
+    // be inside the nullifier coverage exactly as an output's are — which is why
+    // the range below folds coinbase in rather than judging it separately.
+    let (coinbase_coverage, mined) =
+        match fetch_coinbase(&HttpCoinbaseSource::new(url), from, to) {
+            Err(e) => (CoinbaseCoverage::Unavailable { why: e.to_string() }, None),
+            Ok(chain) => (CoinbaseCoverage::Covered { range: chain.covered }, Some(chain)),
+        };
+
+    // ---- 3. The spends, over the range the outputs actually reached. -------
     let outputs = widest_range(
-        outcomes.iter().filter_map(|(_, _, o)| o.as_ref().ok()).map(|o| o.stats.compact_range_served),
+        outcomes
+            .iter()
+            .filter_map(|(_, _, o)| o.as_ref().ok())
+            .map(|o| o.stats.compact_range_served)
+            .chain(std::iter::once(mined.as_ref().and_then(|m| m.covered))),
     );
     let (coverage, set) = qlab_ledger::spent::coverage_for(
         &HttpNullifierSource::new(url),
@@ -107,7 +135,7 @@ pub fn gather(w: &WalletDir, url: &str, from: u64, to: u64) -> Gathered {
         to,
         outputs,
     );
-    Gathered { outcomes, coverage, set }
+    Gathered { outcomes, coverage, set, coinbase_coverage, mined }
 }
 
 /// The balance view over [`gather`] — the rows a caller renders with
@@ -121,14 +149,19 @@ pub fn gather(w: &WalletDir, url: &str, from: u64, to: u64) -> Gathered {
 /// three figures and one cannot-know — not an aborted command, and certainly not
 /// a zero.
 #[cfg(feature = "net")]
-pub fn scan_report(
-    w: &WalletDir,
-    url: &str,
-    from: u64,
-    to: u64,
-) -> (Vec<DivScan>, SpentCoverage) {
+pub fn scan_report(w: &WalletDir, url: &str, from: u64, to: u64) -> ScanReport {
     let wallet = w.wallet();
-    let Gathered { outcomes, coverage, set } = gather(w, url, from, to);
+    let Gathered { outcomes, coverage, set, coinbase_coverage, mined } =
+        gather(w, url, from, to);
+
+    // The mined half. A figure exists only where BOTH streams do, exactly as for
+    // transaction outputs: a coinbase note can be spent, so one that could not be
+    // checked against the nullifier stream is not quotable either (lab #314's
+    // rule, applied to the category lab #415 made visible).
+    let coinbase = match (&mined, &set) {
+        (Some(chain), Some(set)) => Some(match_mined(&wallet, &w.allocated, chain, set)),
+        _ => None,
+    };
 
     // A figure exists only where BOTH halves do.
     let scans: Vec<DivScan> = outcomes
@@ -151,7 +184,25 @@ pub fn scan_report(
         })
         .collect();
 
-    (scans, coverage)
+    ScanReport { scans, spent: coverage, coinbase, coinbase_coverage }
+}
+
+/// Everything [`crate::view::render`] needs, kept together for the reason the
+/// figure and its coverage always are: **a number and the caveat that makes it
+/// true travel as one value or they get separated.** The coinbase half is a
+/// second instance of exactly that pair.
+#[cfg(feature = "net")]
+pub struct ScanReport {
+    /// One row per allocated address — transaction outputs.
+    pub scans: Vec<DivScan>,
+    /// How far the spend-subtraction reached (lab #314).
+    pub spent: SpentCoverage,
+    /// This wallet's mined notes, `None` when they could not be established.
+    /// `Some` with an empty report is a real answer — "you mined nothing in this
+    /// range" — and is exactly what `None` must never be confused with.
+    pub coinbase: Option<MinedReport>,
+    /// How far the coinbase stream reached, or why it could not (lab #415).
+    pub coinbase_coverage: CoinbaseCoverage,
 }
 
 #[cfg(test)]
@@ -191,7 +242,13 @@ mod tests {
         rand::rng().fill_bytes(&mut entropy);
         let w = WalletDir::create(&dir, MasterSeed::from_entropy(entropy)).expect("create wallet");
 
-        let (scans, coverage) = scan_report(&w, "http://127.0.0.1:1", 0, 8);
+        let report = scan_report(&w, "http://127.0.0.1:1", 0, 8);
+        let (scans, coverage) = (report.scans, report.spent);
+        assert!(
+            matches!(report.coinbase_coverage, CoinbaseCoverage::Unavailable { .. }),
+            "an unreachable endpoint cannot have shown this wallet what it mined either"
+        );
+        assert!(report.coinbase.is_none(), "and there is no mined figure to print");
 
         assert!(!scans.is_empty(), "a fresh wallet has address 0 allocated");
         assert!(

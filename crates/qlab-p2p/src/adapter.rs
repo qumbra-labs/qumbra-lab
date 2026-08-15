@@ -65,7 +65,7 @@ use qlab_devnet::body::TxVerifier;
 
 use crate::bodywait::{AskSetObservation, MineDuty, RejoinGate};
 use crate::codec::{checkpoint_id, tx_id as wire_tx_id};
-use crate::node::MAX_BODIES_IN_FLIGHT;
+use crate::node::body_window_for;
 use crate::n1::{
     BlockIngest, ChainView, CheckpointIngest, CommitteeControl, IngestOutcome, TxPool, VotesOutcome,
 };
@@ -108,6 +108,16 @@ fn wall_clock_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// Unit-test caliper for the legacy tip-to-height main-chain walk. Dispatch-hot
+// readers must use `main_chain_hash_at`; any fallback to the walk is observable
+// without putting counters or branches in a production build.
+#[cfg(test)]
+std::thread_local! {
+    static MAIN_CHAIN_ANCESTOR_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 /// A real full-node node-state: consensus header chain + PoW, the qlab-node state
@@ -1207,7 +1217,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             lag: lag.blocks(),
             off_main,
             fork_point: self.state_fork_point().map(|(h, _)| h),
-            ask_set: self.missing_body_hashes(MAX_BODIES_IN_FLIGHT).len(),
+            // The window the requester would actually use this tick (QUM-115), not
+            // a fixed 16: reporting the steady width while a catch-up asks 128
+            // would make `ask_set` say the pipeline was full when it was not.
+            ask_set: self.missing_body_hashes(body_window_for(lag.blocks())).len(),
             in_flight,
             pending: self.pending_bodies.len(),
             gate: self.rejoin_gate_observed(),
@@ -1352,12 +1365,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
 
     /// The main-chain hash at `height`, walked back from the fork-choice tip.
     ///
-    /// `ChainView::main_chain_hash_at` answers the same question by materialising
-    /// the whole main chain — `O(tip)` allocation per call, which is fine for the
-    /// once-per-telemetry-line reader it was written for and is not fine on the
-    /// ingest path. This walks `tip − height` parent links instead, so the common
-    /// case (a body at or just below the tip) is a handful of map lookups.
+    /// Kept for the narrow rejoin transition seams that ask for `fork + 1`.
+    /// Dispatch-hot readers must use [`ChainView::main_chain_hash_at`], whose
+    /// maintained height index answers the same question in O(1).
     fn main_chain_ancestor(&self, height: u64) -> Option<Hash32> {
+        #[cfg(test)]
+        MAIN_CHAIN_ANCESTOR_CALLS.with(|calls| calls.set(calls.get() + 1));
         let tip_height = self.chain.tip_height();
         if height > tip_height {
             return None;
@@ -1371,10 +1384,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     ///
     /// When the applied tip is *on* the main chain — every node, almost always —
     /// this is the applied tip itself and the walk exits on its first comparison,
-    /// so the ordinary path pays one lookup. When the state machine is stranded on
-    /// a losing sibling it walks the abandoned branch down to the fork point, which
-    /// is what makes the strand measurable rather than merely visible: the walk
-    /// length **is** the depth of the divergence.
+    /// so the ordinary path pays one O(1) indexed lookup. When the state machine is
+    /// stranded on a losing sibling it walks the abandoned branch down to the fork
+    /// point, with one indexed lookup per divergent block: O(divergence depth), not
+    /// O(header tip − applied tip).
     ///
     /// The walk reads the STATE machine's own block store, not fork choice's: the
     /// abandoned branch is what it has applied, and that is the only side of the
@@ -1385,7 +1398,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         let mut hash = self.state.tip_hash();
         let mut height = self.state.tip_height();
         loop {
-            if self.main_chain_ancestor(height) == Some(hash) {
+            if self.main_chain_hash_at(height) == Some(hash) {
                 return Some((height, hash));
             }
             if height == 0 {
@@ -1548,12 +1561,25 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         while let Some(key) = self.next_applicable_body() {
             let (header, body) = self.pending_bodies.remove(&key).expect("just located");
             self.pending_bytes = self.pending_bytes.saturating_sub(body_weight(&body));
-            // `apply_block` is the authoritative gate and it re-validates the body
-            // against the tree it is actually being applied to — so nothing is ever
-            // folded in on the strength of an anchor answer computed from a stale
-            // tree. It also persists: the log append is inside it, which is what
-            // makes a buffered-then-applied body durable (issue #104).
-            match self.state.apply_block(header, body.clone(), &self.verifier) {
+            // `apply_block_gated` is the authoritative gate and it re-validates the
+            // body against the tree it is actually being applied to — so nothing is
+            // ever folded in on the strength of an anchor answer computed from a
+            // stale tree. It also persists: the log append is inside it, which is
+            // what makes a buffered-then-applied body durable (issue #104).
+            //
+            // The gate is chosen per block (lab #402): a block that is settled
+            // history — the main-chain block at its height under the quorum-verified
+            // finalized pointer — has its anchor rule evaluated as of its OWN
+            // height, because this node's live finality structurally lags its
+            // application while it replays (the #402 joiner deadlock). Everything
+            // else, including every block at or near the live tip, runs the live
+            // rule exactly as before.
+            let gate = if self.block_is_settled_history(&header) {
+                qlab_node::AnchorGate::SettledHistory
+            } else {
+                qlab_node::AnchorGate::Live
+            };
+            match self.state.apply_block_gated(header, body.clone(), &self.verifier, gate) {
                 Ok(_) => {
                     // The registry read here is the post-apply one — `apply_block`
                     // has already folded this body's own riders in, which is what
@@ -1696,6 +1722,31 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         }
     }
 
+    /// Insert a header whose validation gate has already succeeded, preserving the
+    /// ordinary epoch and block-interval side effects.
+    fn insert_validated_header(&mut self, header: BlockHeader) -> IngestOutcome {
+        let header_hash = header.header_hash();
+        // Chain-time gap to the parent, captured BEFORE the insert while the parent
+        // is unambiguous (issue #87). Observed only when this header becomes the tip,
+        // so the histogram describes the adopted chain rather than every side fork.
+        let parent_ts = self.chain.header(&header.prev).map(|p| p.timestamp);
+        let header_ts = header.timestamp;
+        match self.chain.insert_header(header) {
+            Ok(_) => {
+                self.advance_epoch();
+                if self.chain.tip_hash() == header_hash {
+                    let interval =
+                        parent_ts.filter(|&t| t > 0).map(|pts| header_ts.saturating_sub(pts));
+                    self.metrics.observe_block(interval);
+                }
+                IngestOutcome::Accepted
+            }
+            Err(InsertError::Duplicate) => IngestOutcome::Duplicate,
+            Err(InsertError::UnknownParent) => IngestOutcome::Orphan,
+            Err(InsertError::BadHeight) => IngestOutcome::Rejected("bad height"),
+        }
+    }
+
     /// Map a header-insert result to an [`IngestOutcome`], advancing the epoch on
     /// acceptance.
     fn submit_header(&mut self, header: BlockHeader) -> IngestOutcome {
@@ -1707,6 +1758,23 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         if !self.rules.accepts_height(header.height) {
             self.ingest_counters.halt_ignored += 1;
             return IngestOutcome::Ignored("above halt height");
+        }
+        // Lab #412: the validated header store is also the immutable PoW-verdict
+        // cache. Header-first sync deliberately learns a header before fetching its
+        // body, so the normal body path submits the exact same header again. The old
+        // order ran `validate_header_under` first — including RandomX and the two
+        // ancestor walks — and only then let `ChainState::insert_header` discover
+        // the duplicate. On a from-genesis join every historical body therefore
+        // re-ran memory-hard PoW in `pump.dispatch`.
+        //
+        // A hash present in `self.chain` got there through the validation below
+        // (apart from locally-constructed genesis), and the hash commits to every
+        // header field. Its verdict cannot change with later chain state. Check the
+        // release-height gate first so a halted binary keeps ignoring above-H input
+        // even if such a header was learned under a previous rule schedule.
+        let header_hash = header.header_hash();
+        if self.chain.header(&header_hash).is_some() {
+            return IngestOutcome::Duplicate;
         }
         // Real PoW + LWMA difficulty + key-seed validation (N3), under this
         // release's rules (the PoW VALUE is domain-separated above an upgrade
@@ -1736,34 +1804,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             }
             return IngestOutcome::Rejected(Self::header_reject_reason(&e));
         }
-        // Chain-time gap to the parent, captured BEFORE the insert while the parent
-        // is unambiguous (issue #87). Observed only when this header becomes the tip,
-        // so the histogram describes the main chain the issue measured, not every
-        // side branch that was ever offered.
-        let parent_ts = self.chain.header(&header.prev).map(|p| p.timestamp);
-        let header_hash = header.header_hash();
-        let header_ts = header.timestamp;
-        match self.chain.insert_header(header) {
-            Ok(_) => {
-                self.advance_epoch();
-                if self.chain.tip_hash() == header_hash {
-                    // A parent timestamp of 0 is the GENESIS PLACEHOLDER, not a time.
-                    // Differencing against it yields the whole Unix epoch (~1.78e9 s)
-                    // and poisons the histogram's sum and tail with one sample. The
-                    // genesis→first-block gap is not an interval; it is skipped, and
-                    // the guard is on the placeholder value rather than on the height
-                    // so a genesis that ever carries a real timestamp contributes
-                    // normally. (Same root cause as issue #73's `age_s`.)
-                    let interval =
-                        parent_ts.filter(|&t| t > 0).map(|pts| header_ts.saturating_sub(pts));
-                    self.metrics.observe_block(interval);
-                }
-                IngestOutcome::Accepted
-            }
-            Err(InsertError::Duplicate) => IngestOutcome::Duplicate,
-            Err(InsertError::UnknownParent) => IngestOutcome::Orphan,
-            Err(InsertError::BadHeight) => IngestOutcome::Rejected("bad height"),
-        }
+        self.insert_validated_header(header)
     }
 
     /// Choose the header timestamp for a block mined over `parent`, per the
@@ -1873,7 +1914,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         if !self.rules.may_checkpoint(height) {
             return None; // H2 — see `make_checkpoint_guarded`
         }
-        let block_hash = *self.chain.main_chain().get(height as usize)?;
+        let block_hash = self.chain.main_chain_hash_at(height)?;
         let cp = Checkpoint::new(height, block_hash, block_hash);
         let votes = validators.iter().map(|v| v.sign_checkpoint(&cp)).collect();
         Some((cp, votes))
@@ -1902,7 +1943,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         if !self.rules.may_checkpoint(height) {
             return None;
         }
-        let block_hash = *self.chain.main_chain().get(height as usize)?;
+        let block_hash = self.chain.main_chain_hash_at(height)?;
         let cp = Checkpoint::new(height, block_hash, block_hash);
         let votes = finalizers.iter_mut().filter_map(|f| f.sign(&cp).ok()).collect();
         Some((cp, votes))
@@ -2030,6 +2071,31 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         )
     }
 
+    /// Whether `header` is **settled history** (lab #402): the main-chain block at
+    /// its own height, at or below the fork-choice finalized pointer.
+    ///
+    /// This is the predicate that authorises [`qlab_node::AnchorGate::SettledHistory`],
+    /// so both of its inputs are chosen for what they prove:
+    ///
+    /// - the finalized pointer read here is **`ChainState`'s** (head #2), not the
+    ///   tracker's: it has exactly one writer, the vote-tally path *after* the
+    ///   unchanged `FinalityTracker::try_finalize` verified a roster-checked quorum
+    ///   (`Self::ingest_checkpoint_votes`), and `ChainState::set_finalized` refuses a
+    ///   point that is not a known header descending from the previous one — so a
+    ///   height at or below it is committee-finalized AND on the header main chain;
+    /// - [`ChainState::main_chain_hash_at`] reads the pure derived fork-choice index
+    ///   maintained when headers connect or a pre-finality reorg replaces a suffix.
+    ///   No-reorg-past-finality makes every indexed entry at or below the finalized
+    ///   pointer immutable.
+    ///
+    /// Nothing the sender says enters (the #134 property, kept): both inputs are this
+    /// node's own. A joiner that has not yet learned any finalized checkpoint answers
+    /// `false` for everything and stays on today's paths.
+    fn block_is_settled_history(&self, header: &BlockHeader) -> bool {
+        self.chain.finalized_height().is_some_and(|height| header.height <= height)
+            && self.chain.main_chain_hash_at(header.height) == Some(header.header_hash())
+    }
+
     fn reject_reason(err: &MempoolError) -> &'static str {
         match err {
             MempoolError::WrongFee { .. } => "wrong fee",
@@ -2078,7 +2144,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         self.chain.header(hash).copied()
     }
     fn main_chain_hash_at(&self, height: u64) -> Option<Hash32> {
-        self.chain.main_chain().get(height as usize).copied()
+        self.chain.main_chain_hash_at(height)
     }
     fn has_header(&self, hash: &Hash32) -> bool {
         self.chain.header(hash).is_some()
@@ -2133,8 +2199,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
     /// where the gap is, and an unbounded scan would walk the whole chain on a node
     /// that has been asked for one hash.
     ///
-    /// Cost: one `tip − top` ancestor walk plus `max` parent hops, so it does not
-    /// re-walk the chain per height the way repeated `main_chain_ancestor` calls would.
+    /// Cost: one O(1) indexed lookup at `top` plus at most `max` parent hops. The
+    /// distance from the header tip down to the applied tip is not part of the cost.
     fn missing_body_hashes(&self, max: usize) -> Vec<Hash32> {
         use qlab_node::ChainStore as _;
         if max == 0 {
@@ -2149,7 +2215,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         if top <= base {
             return Vec::new();
         }
-        let Some(mut hash) = self.chain.ancestor(&self.chain.tip_hash(), tip - top) else {
+        let Some(mut hash) = self.main_chain_hash_at(top) else {
             return Vec::new();
         };
         let mut height = top;
@@ -2192,11 +2258,71 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
     fn state_tip_mine_ready(&self) -> bool {
         NodeAdapter::state_tip_mine_ready(self)
     }
+
+    fn state_lag_blocks(&self) -> u64 {
+        self.state_lag().blocks()
+    }
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
     fn ingest_header(&mut self, header: BlockHeader) -> IngestOutcome {
         self.submit_header(header)
+    }
+
+    fn ingest_finalized_headers(&mut self, headers: &[BlockHeader]) -> IngestOutcome {
+        // The tracker only advances through the roster/signature/quorum gate. Its
+        // block may be ahead of our local chain on the explicit eager-fetch path;
+        // this span is admitted only when its hash chain lands exactly on that
+        // attested block.
+        let Some(checkpoint) = self.finality.latest().copied() else {
+            return IngestOutcome::Rejected("no verified finalized checkpoint");
+        };
+        let Some(first) = headers.first() else {
+            return IngestOutcome::Rejected("empty checkpoint header span");
+        };
+        let Some(last) = headers.last() else {
+            return IngestOutcome::Rejected("empty checkpoint header span");
+        };
+        if last.height != checkpoint.height || last.header_hash() != checkpoint.block_hash {
+            return IngestOutcome::Rejected("checkpoint header frontier mismatch");
+        }
+        if first.height == 0
+            || self.chain.main_chain_hash_at(first.height - 1) != Some(first.prev)
+        {
+            return IngestOutcome::Orphan;
+        }
+        let Some(mut parent) = self.chain.header(&first.prev).copied() else {
+            return IngestOutcome::Orphan;
+        };
+        for header in headers {
+            if !self.rules.accepts_height(header.height) {
+                return IngestOutcome::Ignored("above halt height");
+            }
+            if self.chain.header(&header.header_hash()).is_some() {
+                return IngestOutcome::Duplicate;
+            }
+            if header.prev != parent.header_hash() || header.height != parent.height + 1 {
+                return IngestOutcome::Rejected("non-contiguous checkpoint header span");
+            }
+            if header.timestamp < parent.timestamp {
+                return IngestOutcome::Rejected("non-monotonic checkpoint header timestamp");
+            }
+            parent = *header;
+        }
+
+        // Every fallible structural check ran above, before the validated chain was
+        // touched. Difficulty and nonce are intentionally not re-derived: the exact
+        // header bytes are transitively attested by the frontier hash and quorum.
+        for header in headers {
+            if !matches!(self.insert_validated_header(*header), IngestOutcome::Accepted) {
+                return IngestOutcome::Rejected("checkpoint header insertion failed");
+            }
+        }
+        if self.chain.set_finalized(checkpoint.block_hash).is_err() {
+            return IngestOutcome::Rejected("checkpoint finality mark failed");
+        }
+        self.sync_state_finality();
+        IngestOutcome::Accepted
     }
 
     fn ingest_block(&mut self, header: BlockHeader, body: BlockBody) -> IngestOutcome {
@@ -2224,6 +2350,24 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
             Ok(()) => {}
             Err(e) => match Self::body_fault_class(&e) {
                 BodyFault::Intrinsic(why) => return IngestOutcome::Rejected(why),
+                // Positional, but the block is SETTLED HISTORY (lab #402): the
+                // main-chain block at its own height under the quorum-verified
+                // finalized pointer. Our positional "no" is then a fact about our
+                // lagging replay, not about the block — the #402 deadlock was this
+                // arm's predecessor refusing the same canonical body forever (81
+                // served answers, applied tip pinned at 4912). Fall through to the
+                // header-submit + buffer path below: the binding already passed
+                // (it is checked before the anchor, so a buffered body is
+                // bit-exact the one its mined main-chain header committed to), and
+                // `drain_pending_bodies` re-validates EVERYTHING — proofs
+                // included — inside `apply_block_gated` at exactly the position
+                // the rule is defined at, under the as-of-height anchor gate.
+                //
+                // Checked BEFORE the authoritative arm on purpose: a node whose
+                // own state briefly lags the finalized pointer could otherwise
+                // stand at its tip, judge a canonical block by its stale live
+                // view, and charge the honest peer that served it.
+                BodyFault::Positional(_) if self.block_is_settled_history(&header) => {}
                 // Positional. Charged where our verdict IS the network's — the live
                 // path, where a bad anchor is a bad anchor and costs the sender
                 // exactly what it costs today.
@@ -2371,12 +2515,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> TxPool for NodeAdapter<P, V> {
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V> {
+    fn finalized_checkpoint(&self) -> Option<Checkpoint> {
+        self.finality.latest().copied()
+    }
+
     // #362: the real tally's stored variants — what the boundary re-push sends.
     fn checkpoint_variants_at(&self, height: u64) -> Vec<(Checkpoint, Vec<Vote>)> {
         self.tally.variants_at(height)
     }
 
-    fn ingest_checkpoint_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> VotesOutcome {
+    fn ingest_checkpoint_votes_from(
+        &mut self,
+        cp: &Checkpoint,
+        votes: &[Vote],
+        explicitly_requested: bool,
+    ) -> VotesOutcome {
         let id = checkpoint_id(cp);
         if self.seen_checkpoints.contains(&id) {
             return VotesOutcome::Stale; // already finalized this variant
@@ -2450,7 +2603,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
             (committee, cstate.quorum_threshold(), active_kept, excluded_idx, rejects)
         };
 
-        let added = self.tally.add(cp, &active_kept, finalized, tip);
+        let added = if explicitly_requested && active_kept.len() >= quorum {
+            self.tally.add_requested_complete(cp, &active_kept, quorum, finalized, tip)
+        } else {
+            self.tally.add(cp, &active_kept, finalized, tip)
+        };
         let variants = self.tally.variant_count(cp.height);
         if !added.grew {
             // Nothing new — still a message this round received, and the roster
@@ -2494,7 +2651,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
                     // fork-choice head that declined to advance was byte-identical,
                     // on every surface, to one that did.
                     match self.chain.set_finalized(cp.block_hash) {
-                        Ok(()) => self.note_finalize_recorded("chain"),
+                        Ok(()) => {
+                            self.note_finalize_recorded("chain");
+                        }
                         Err(e) => {
                             // Issue #241: this head always held the typed refusal —
                             // it is the durable head that lost it. The rendering now
@@ -2641,6 +2800,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> CommitteeControl for NodeAdapter<P, V>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use qlab_devnet::committee::devnet_committee;
     use qlab_devnet::fees::{posted_fee, ArityBucket};
     use qlab_devnet::params_devnet::BOND_AMOUNT;
@@ -2655,6 +2818,22 @@ mod tests {
     impl TxVerifier for MockVerifier {
         fn verify_tx(&self, entry: &TxEntry) -> bool {
             entry.proof == b"ok"
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingPow {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PowEngine for CountingPow {
+        fn name(&self) -> &'static str {
+            "counting-keccak"
+        }
+
+        fn pow_hash(&self, header: &BlockHeader, seed: &[u8]) -> Hash32 {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            KeccakPow.pow_hash(header, seed)
         }
     }
 
@@ -2951,6 +3130,112 @@ mod tests {
             .collect()
     }
 
+    /// QUM-115's trust boundary in one caliper: only the span whose frontier is
+    /// named by a locally verified quorum omits PoW. Above the checkpoint and on a
+    /// sibling below it, the ordinary verifier still runs; without a verified
+    /// quorum the special admission path is closed entirely.
+    #[test]
+    fn checkpoint_span_skips_only_attested_main_chain_pow() {
+        let (cstate, validators) = committee7();
+        let mut proposer =
+            NodeAdapter::new(cstate.clone(), KeccakPow, MockVerifier, easy_sim());
+        let blocks = mine_chain(&mut proposer, 4);
+        let checkpoint = Checkpoint::new(
+            3,
+            blocks[2].0.header_hash(),
+            blocks[2].0.header_hash(),
+        );
+        let votes: Vec<Vote> = validators[..5]
+            .iter()
+            .map(|validator| validator.sign_checkpoint(&checkpoint))
+            .collect();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut joiner = NodeAdapter::new(
+            cstate.clone(),
+            CountingPow { calls: Arc::clone(&calls) },
+            MockVerifier,
+            easy_sim(),
+        );
+        assert!(matches!(
+            joiner.ingest_requested_checkpoint_votes(&checkpoint, &votes),
+            VotesOutcome::Learned { finalized: true, .. }
+        ));
+        assert_eq!(joiner.chain().finalized_height(), None, "the block is not held yet");
+        assert_eq!(
+            joiner.ingest_finalized_headers(&blocks[..3].iter().map(|b| b.0).collect::<Vec<_>>()),
+            IngestOutcome::Accepted
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "PoW/LWMA/seed skipped below h_f");
+        assert_eq!(joiner.chain().finalized_height(), Some(3));
+
+        let mut wrong_body = blocks[0].1.clone();
+        wrong_body.coinbase = wrong_body.coinbase.saturating_add(1);
+        assert_eq!(
+            joiner.ingest_block(blocks[0].0, wrong_body),
+            IngestOutcome::Rejected("body does not match header commitment"),
+            "checkpoint admission does not weaken header/body binding"
+        );
+
+        assert_eq!(joiner.ingest_header(blocks[3].0), IngestOutcome::Accepted);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "above h_f runs full PoW");
+
+        let genesis = *joiner
+            .chain()
+            .header(&joiner.chain().genesis_block_hash())
+            .expect("genesis");
+        let mut sibling = BlockHeader::child_of(
+            &genesis,
+            genesis.timestamp + 2,
+            genesis.difficulty,
+            [0xA5; 32],
+        );
+        while qlab_devnet::pow::satisfies_target(
+            &KeccakPow.pow_hash(&sibling, &joiner.chain().genesis_block_hash()),
+            sibling.difficulty,
+        ) {
+            sibling.nonce = sibling.nonce.wrapping_add(1);
+        }
+        assert_eq!(
+            joiner.ingest_header(sibling),
+            IngestOutcome::Rejected("invalid header: pow"),
+            "a below-finality sibling is not checkpoint-amnestied"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "the sibling ran full PoW");
+        assert!(joiner.chain().header(&sibling.header_hash()).is_none());
+
+        let unverified_calls = Arc::new(AtomicUsize::new(0));
+        let mut unverified = NodeAdapter::new(
+            cstate,
+            CountingPow { calls: Arc::clone(&unverified_calls) },
+            MockVerifier,
+            easy_sim(),
+        );
+        let forged_checkpoint = Checkpoint::new(3, [0xEE; 32], [0xEE; 32]);
+        let forged_votes: Vec<Vote> = validators[..5]
+            .iter()
+            .map(|validator| validator.sign_checkpoint(&forged_checkpoint))
+            .collect();
+        assert!(
+            matches!(
+                unverified.ingest_requested_checkpoint_votes(&checkpoint, &forged_votes),
+                VotesOutcome::Invalid
+            ),
+            "quorum-many signatures over other bytes prove nothing"
+        );
+        assert_eq!(unverified.finalized_height(), None);
+        assert_eq!(
+            unverified.ingest_finalized_headers(&[blocks[0].0]),
+            IngestOutcome::Rejected("no verified finalized checkpoint")
+        );
+        assert_eq!(unverified.ingest_header(blocks[0].0), IngestOutcome::Accepted);
+        assert_eq!(
+            unverified_calls.load(Ordering::Relaxed),
+            1,
+            "without a quorum-verified checkpoint every header runs PoW"
+        );
+    }
+
     /// A follower that has synced HEADERS for `blocks` and applied no body — the
     /// state of every node that joins a running net, and of every node whose
     /// header-first sync ran ahead of a body announce.
@@ -2964,6 +3249,65 @@ mod tests {
         assert_eq!(f.chain().tip_height(), blocks.len() as u64);
         assert_eq!(f.state().tip_height(), 0, "no body has been applied");
         f
+    }
+
+    /// QUM-113's second live bottleneck, at the exact adapter seams from the perf
+    /// caller tree. A header-first joiner with an applied tip at genesis and a
+    /// fork-choice tip well beyond the 16-body window must find both its fork point
+    /// and its next ask set without falling back to a tip-to-height ancestor walk.
+    ///
+    /// The assertion is a deterministic call count, not a timing threshold: it
+    /// remains sharp on a loaded CI runner and fails if either reader is changed
+    /// back to `main_chain_ancestor`. The existing chain-index reorg test proves
+    /// that the indexed answer is replaced synchronously when fork choice changes.
+    #[test]
+    fn far_ahead_body_dispatch_uses_no_tip_to_height_main_chain_walk() {
+        const HEADER_TIP: usize = 128;
+        const BODY_WINDOW: usize = 16;
+
+        let mut proposer =
+            NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let blocks = mine_chain(&mut proposer, HEADER_TIP);
+        let joiner = follower_with_headers_only(&blocks);
+
+        MAIN_CHAIN_ANCESTOR_CALLS.with(|calls| calls.set(0));
+        assert_eq!(
+            joiner.state_fork_point(),
+            Some((0, joiner.chain().genesis_block_hash())),
+            "an on-main applied genesis is the fork point"
+        );
+        let asks = joiner.missing_body_hashes(BODY_WINDOW);
+        let expected: Vec<Hash32> = blocks[..BODY_WINDOW]
+            .iter()
+            .map(|(header, _)| header.header_hash())
+            .collect();
+        assert_eq!(
+            asks, expected,
+            "the indexed seed preserves the ascending ask window"
+        );
+        MAIN_CHAIN_ANCESTOR_CALLS.with(|calls| {
+            assert_eq!(
+                calls.get(),
+                0,
+                "dispatch readers must not walk header_tip - applied_tip parent links"
+            );
+        });
+
+        // Semantic and edge equivalence with the retired walk: both readers name
+        // the current fork-choice main-chain block, and both return None above tip.
+        for height in [
+            0,
+            1,
+            BODY_WINDOW as u64,
+            HEADER_TIP as u64,
+            HEADER_TIP as u64 + 1,
+        ] {
+            assert_eq!(
+                joiner.main_chain_hash_at(height),
+                joiner.main_chain_ancestor(height),
+                "indexed and walked main-chain answers differ at height {height}"
+            );
+        }
     }
 
     /// **Acceptance 1 (#130 (a)): a node whose state tip trails its fork-choice tip
@@ -3944,6 +4288,176 @@ mod tests {
             );
         }
         assert_eq!(j.state().tip_height(), 0, "and not one body was applied");
+    }
+
+    // --- lab #402: settled history is applied under the as-of-height anchor gate ---
+
+    /// 🔴 **ACCEPTANCE (lab #402): the joiner deadlock repro, and its resolution.**
+    ///
+    /// The live net's shape, at test scale: a chain whose every block carries a
+    /// transaction (T1 by construction), a joiner that has header-synced but
+    /// finalized nothing — and, the one new ingredient, the net's finalized
+    /// checkpoint learned during sync (the #204 query / vote gossip path), with a
+    /// real quorum over the real main-chain block, verified by the unchanged
+    /// tracker.
+    ///
+    /// **The mutation lock is the test above this one**:
+    /// `a_joiner_does_not_fault_a_peer_for_history_it_cannot_judge` runs the same
+    /// bodies WITHOUT the checkpoint and pins the pre-#402 outcome — nothing
+    /// applied, `Ignored(UNJUDGED_ANCHOR_REASON)` forever (the 81-asks wall,
+    /// measured on box 44.223.26.80). This test is the same joiner WITH the
+    /// checkpoint; together they pin that the settled-history gate activates on
+    /// quorum-verified finality and on nothing else.
+    #[test]
+    fn a_joiner_applies_settled_history_whose_anchors_outrun_its_own_finality() {
+        let blocks = transacting_proposer(6);
+        let mut j = follower_with_headers_only(&blocks);
+        assert_eq!(j.state().finalized_height(), None, "the joiner's own finality lags — the deadlock's premise");
+
+        // The net's finalized checkpoint: height 6, the REAL main-chain block, a
+        // real 5-of-7 quorum. `ingest_checkpoint` runs the unchanged verify path.
+        let cp_hash = blocks[5].0.header_hash();
+        let cp = Checkpoint::new(6, cp_hash, cp_hash);
+        let (_, validators) = committee7();
+        let votes: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        assert_eq!(j.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+
+        // Every historical body now applies — no fault, no wall. Before the fix
+        // this loop left the state tip at 0 with six unjudged refusals.
+        for (i, (header, body)) in blocks.iter().enumerate() {
+            let outcome = j.ingest_block(*header, body.clone());
+            assert!(!outcome.is_peer_fault(), "block {}: honest history is never a fault", i + 1);
+        }
+        assert_eq!(j.state().tip_height(), 6, "the deadlock is gone: settled history applied");
+        assert_eq!(j.state_lag().blocks(), 0, "the joiner caught its own chain up");
+        assert_eq!(
+            j.state().finalized_height(),
+            Some(6),
+            "and the durable head landed via sync_state_finality once the bodies did"
+        );
+        assert_eq!(
+            j.ingest_counters().unjudged_anchor,
+            0,
+            "nothing was excused as unjudgeable — every body was judged, at its own height"
+        );
+    }
+
+    /// QUM-111 performance acceptance: settled containment reads the derived
+    /// fork-choice height index. Finality changes only the upper bound; it does not
+    /// build or own another ancestry cache in the adapter.
+    #[test]
+    fn settled_history_lookup_uses_the_chain_height_index() {
+        let blocks = transacting_proposer(6);
+        let mut j = follower_with_headers_only(&blocks);
+        let (_, validators) = committee7();
+
+        let finalize = |j: &mut NodeAdapter<KeccakPow, MockVerifier>, height: usize| {
+            let hash = blocks[height - 1].0.header_hash();
+            let cp = Checkpoint::new(height as u64, hash, hash);
+            let votes: Vec<Vote> =
+                validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+            assert_eq!(j.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+        };
+
+        finalize(&mut j, 3);
+        assert!(j.block_is_settled_history(&blocks[2].0));
+        assert!(!j.block_is_settled_history(&blocks[3].0));
+        assert_eq!(j.chain().main_chain_hash_at(3), Some(blocks[2].0.header_hash()));
+
+        finalize(&mut j, 6);
+        assert!(j.block_is_settled_history(&blocks[5].0));
+        for (height, (header, _)) in blocks.iter().enumerate() {
+            assert_eq!(j.chain().main_chain_hash_at(height as u64 + 1), Some(header.header_hash()));
+            assert!(j.block_is_settled_history(header));
+        }
+    }
+
+    /// QUM-111 live-regression lock in the #402 shape: header sync is more than one
+    /// complete anchor window ahead of the historical body. The settled decision
+    /// still accepts it by its own height and performs only `finalized_height` plus
+    /// one O(1) `main_chain_hash_at` read — no adapter prefix exists to walk.
+    #[test]
+    fn far_ahead_header_sync_applies_settled_body_without_a_per_body_chain_walk() {
+        use qlab_devnet::params_devnet::MAX_ANCHOR_AGE_BLOCKS;
+
+        let mut proposer = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let genesis = proposer.chain().genesis_block_hash();
+        proposer.state_mut().finalize(genesis).expect("finalize genesis");
+        let anchor = proposer.state().commitment_root();
+        assert_eq!(proposer.ingest_tx(tx_with(anchor, 1, b"ok")), IngestOutcome::Accepted);
+
+        let far_tip = MAX_ANCHOR_AGE_BLOCKS + 2;
+        let blocks = mine_chain(&mut proposer, far_tip as usize);
+        let historical = blocks[0].clone();
+        assert!(far_tip.saturating_sub(0) > MAX_ANCHOR_AGE_BLOCKS);
+
+        let mut j = follower_with_headers_only(&blocks);
+        let (_, validators) = committee7();
+        let cp_hash = blocks.last().expect("far tip").0.header_hash();
+        let cp = Checkpoint::new(far_tip, cp_hash, cp_hash);
+        let votes: Vec<Vote> =
+            validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        assert_eq!(j.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+        assert_eq!(j.chain().tip_height(), far_tip);
+        assert!(j.block_is_settled_history(&historical.0));
+        let outcome = j.ingest_block(historical.0, historical.1);
+        assert!(!outcome.is_peer_fault(), "header-known history is not a peer fault");
+        assert_eq!(j.state().tip_height(), 1, "the far-ahead joiner crossed its first body");
+    }
+
+    /// **S1 (lab #402), at the adapter seam: the settled-history gate is a statement
+    /// about ONE chain — the finalized one — and a sibling block at a settled height
+    /// is not in it.**
+    ///
+    /// A sibling at height 1 (same parent, different body) sits at or below the
+    /// finalized pointer by *height*, but it is not the main-chain block at its
+    /// height, so `block_is_settled_history` refuses it and it stays on today's
+    /// paths: header learned, body unjudged, nothing applied from it. The
+    /// state-machine half of S1 — a root that is on NO chain this node applied is
+    /// refused even under the settled gate — is
+    /// `qlab-node/tests/historical_anchor.rs`.
+    #[test]
+    fn a_sibling_block_below_the_finalized_pointer_is_not_settled_history() {
+        let blocks = transacting_proposer(3);
+        let mut j = follower_with_headers_only(&blocks);
+
+        // A sibling of block 1: same parent (genesis), different tx ⇒ different
+        // header. Mined honestly on a fork this committee never finalized.
+        let sibling = {
+            let mut p = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+            let g = p.chain().genesis_block_hash();
+            p.state_mut().finalize(g).expect("finalize genesis");
+            let anchor = p.state().commitment_root();
+            assert_eq!(p.ingest_tx(tx_with(anchor, 0x77, b"ok")), IngestOutcome::Accepted);
+            let (h, b) = p.mine_block().expect("mine the sibling");
+            (h, b)
+        };
+        assert_ne!(sibling.0.header_hash(), blocks[0].0.header_hash(), "a genuine sibling");
+
+        // Finality lands on the MAIN chain's block 3.
+        let cp_hash = blocks[2].0.header_hash();
+        let cp = Checkpoint::new(3, cp_hash, cp_hash);
+        let (_, validators) = committee7();
+        let votes: Vec<Vote> = validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+        assert_eq!(j.ingest_checkpoint(cp, votes), IngestOutcome::Accepted);
+
+        // The main-chain block at height 1 is settled history; its sibling is not,
+        // by the ancestry clause — height alone does not admit it.
+        assert!(j.block_is_settled_history(&blocks[0].0));
+        assert!(!j.block_is_settled_history(&sibling.0));
+
+        // Serve the sibling: unjudged (its anchor answers from our position, and it
+        // is on no settled chain), never applied, and — #134 kept — not a fault.
+        let out = j.ingest_block(sibling.0, sibling.1.clone());
+        assert!(!out.is_peer_fault(), "an honest fork block is not a fault");
+        assert_eq!(j.state().tip_height(), 0, "nothing from the sibling branch was applied");
+
+        // And the settled main chain still applies around it.
+        for (header, body) in blocks.iter() {
+            let _ = j.ingest_block(*header, body.clone());
+        }
+        assert_eq!(j.state().tip_height(), 3);
+        assert_eq!(j.state().tip_hash(), blocks[2].0.header_hash(), "the finalized chain won");
     }
 
     /// **The pending-body window is bounded on all three axes** (issue #130 (a)).

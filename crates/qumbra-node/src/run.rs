@@ -1262,9 +1262,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // served*, which is a peer-side or version-skew problem and not this node's.
         //
         // Caliper: an instantaneous level, not a total — how many asks are in flight at
-        // the moment the line is printed, capped at
-        // `qlab_p2p::MAX_BODIES_IN_FLIGHT` (16). Always printed, zero included (the
-        // #130 (a) rule): a node always knows this number.
+        // the moment the line is printed, capped at `qlab_p2p::node::body_window_for`,
+        // which since QUM-115 is 16 near the tip and 128 while catching up. **A reader
+        // comparing `breq=` against a fixed 16 will be wrong on a joiner**, and the
+        // whole point of the wider window is that a joiner is where the number matters.
+        // Always printed, zero included (the #130 (a) rule): a node always knows this
+        // number.
         let body_reqs = self.p2p.body_requests();
         // Issue #85: `fback=` is appended after every existing field. It says
         // whether the exact checkpoint named by the finality tracker is backed by a
@@ -1477,9 +1480,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         //
         // Caliper: an instantaneous level computed at print time, the ask set the
         // requester itself would produce on this tick with the same `max`
-        // (`qlab_p2p::node::MAX_BODIES_IN_FLIGHT`, 16) — **so it saturates at 16 and
-        // is not a gap size**. The fork point is a chain height, or `-` when the
-        // walk returns nothing. Always printed, `0@-` included (the #130 (a) rule).
+        // (`qlab_p2p::node::body_window_for`, which since QUM-115 is 16 near the tip
+        // and 128 while catching up) — **so it saturates at that width and is not a
+        // gap size**. The fork point is a chain height, or `-` when the walk returns
+        // nothing. Always printed, `0@-` included (the #130 (a) rule).
         let bask = node.ask_set_observation(self.p2p.body_requests(), self.mining).telemetry_field();
         // Issue #359 S3: `snap=` is **appended at the end**, after `dfinbh=`, under
         // the same rule as every addition since #87 — every pre-existing field keeps
@@ -5030,6 +5034,12 @@ mod tests {
     /// and its OWN halt marker. `persist::Snapshot` is pure chain state (no
     /// node identity), so this must work — this test is the proof the
     /// production runbook cites before touching node3.
+    ///
+    /// Lab #375 adds a second named trigger: a **boundary-tie loser** that stays
+    /// halted with `FINALIZE refused ... why=not-held` after its finalized
+    /// checkpoint names the sibling of its applied tip. The normal near-tip body
+    /// exchange is primary; this transplant remains the fallback for a pre-#375
+    /// binary or when no reachable peer can serve the finalized sibling.
     #[test]
     fn a_snapshotless_host_rejoins_by_snapshot_transplant() {
         // --- donor A: halted at DH, finalized, resumed past it, snapshotted.
@@ -7449,6 +7459,168 @@ mod tests {
 
         for (n, base) in nodes.into_iter().zip(bases) {
             drop(n);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+        for base in [base_chain_tmp, va_base, vb_base] {
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    /// **DRILL D3-B — the boundary-tie loser fetches the finalized sibling and
+    /// converges while it remains halted (lab #375).**
+    ///
+    /// D3 above is the shape lock: 16 keys are permanently committed to A, five to
+    /// B, and every node finalizes A. This sibling removes A's BODY from node 3
+    /// while leaving its validated header in fork choice. At the instant quorum
+    /// lands, node 3 is therefore the exact wedge from #375: halted at H, finalized
+    /// checkpoint A, applied sibling B, one `not-held` durable-finality refusal.
+    ///
+    /// The cure uses only the existing near-tip body path. `missing_body_hashes`
+    /// names A after finality makes it the main-chain block at H; the normal
+    /// `GetData(Block)` request receives a whole `BlockAnnounce`; and the existing
+    /// `buffer_body` -> `rejoin_main_chain` -> `Node::rewind_to` ->
+    /// `apply_block_gated` funnel applies it. Keeping the peers disconnected, or
+    /// making `on_getdata` serve only the header, leaves the first assertion below
+    /// permanently wedged: that is the request/serve mutation direction. D3's
+    /// 16/5 ledger assertions are the opposite direction — the loser can never
+    /// finalize B.
+    #[test]
+    fn d3_b_boundary_tip_tie_loser_fetches_finalized_sibling_and_reopens_on_it() {
+        use qlab_p2p::n1::BlockIngest;
+
+        let (base_chain, base_chain_tmp) = lone_chain("i375_d3b_chain", DH - 1, None);
+        let (a_dir, a_tmp) =
+            ("i375_d3b_va", "1111111111111111222222222222222233333333333333334444444444444444");
+        let (b_dir, b_tmp) =
+            ("i375_d3b_vb", "5555555555555555666666666666666677777777777777778888888888888888");
+
+        let variant = |tag: &str, rkm: &str| {
+            let (mut cfg, genesis, base) = rig(tag, true);
+            cfg.committee_key_paths = vec![];
+            cfg.miner_rkm = Some(rkm.to_string());
+            transplant(&base_chain, &[cfg.data_dir.clone()]);
+            let mut n = RunningNode::start_with_release(
+                &cfg, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+            )
+            .unwrap();
+            n.set_mine_interval(Duration::ZERO);
+            assert!(n.try_mine(), "{tag} mines the boundary block");
+            let hash = n.p2p().node().chain().main_chain()[DH as usize];
+            let header = *n.p2p().node().chain().header(&hash).expect("header");
+            let body = n.state().chain().block(&hash).expect("body").clone().body();
+            drop(n);
+            (header, body, base)
+        };
+        let (hdr_a, body_a, va_base) = variant(a_dir, a_tmp);
+        let (hdr_b, body_b, vb_base) = variant(b_dir, b_tmp);
+        assert_ne!(hdr_a.header_hash(), hdr_b.header_hash());
+        assert_eq!(hdr_a.prev, hdr_b.prev);
+        assert_eq!(hdr_a.height, DH);
+        assert_eq!(hdr_a.difficulty, hdr_b.difficulty, "equal-work siblings");
+
+        let (addrs, _) = mesh_addrs();
+        let mut bases = Vec::new();
+        let mut nodes: Vec<DrillNode> = Vec::new();
+        let mut loser_reopen = None;
+        for i in 0..4 {
+            let (mut cfg, genesis, base) = rig(&format!("i375_d3b_{i}"), false);
+            let lo: usize = KEY_SHARES[..i].iter().sum();
+            cfg.committee_key_paths = cfg.committee_key_paths[lo..lo + KEY_SHARES[i]].to_vec();
+            cfg.listen_addr = addrs[i].clone();
+            cfg.advertise_addr = Some(addrs[i].clone());
+            transplant(&base_chain, &[cfg.data_dir.clone()]);
+            let mut n = RunningNode::start_with_release(
+                &cfg, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
+            )
+            .unwrap();
+
+            if i == 3 {
+                // B is applied first. A's HEADER is known, so quorum evidence for
+                // A can move fork choice, but A's BODY must cross the wire later.
+                n.p2p_mut().node_mut().ingest_block(hdr_b, body_b.clone());
+                n.p2p_mut().node_mut().ingest_header(hdr_a);
+                loser_reopen = Some((cfg.clone(), genesis));
+            } else {
+                n.p2p_mut().node_mut().ingest_block(hdr_a, body_a.clone());
+                n.p2p_mut().node_mut().ingest_block(hdr_b, body_b.clone());
+            }
+            assert_eq!(n.tip_height(), DH);
+            assert!(n.is_halted());
+            bases.push(base);
+            nodes.push(n);
+        }
+
+        connect_mesh(&mut nodes, &addrs);
+        for n in nodes.iter_mut() {
+            n.set_repush_interval(Duration::ZERO);
+        }
+        // `spin_until` checks the condition before starting the next mesh round.
+        // Node 3's finalizing tick may SEND its body request, but no serving peer
+        // gets another tick to answer it before this returns.
+        spin_until(&mut nodes, 200, "the quorum variant finalized", |ns| {
+            ns.iter().all(|n| n.finalized_height() == Some(DH))
+        });
+
+        let a_hash = hdr_a.header_hash();
+        let b_hash = hdr_b.header_hash();
+        assert_eq!(nodes[3].finalized_checkpoint_id(), Some(
+            qlab_devnet::committee::Checkpoint::new(DH, a_hash, a_hash).identity(),
+        ));
+        assert_eq!(nodes[3].p2p().node().applied_tip().hash, b_hash, "the loser is wedged on B");
+        assert!(nodes[3].p2p().body_requests() > 0, "the near-tip requester asks for A");
+        assert_eq!(
+            nodes[3].p2p().node().finalize_refused_total(),
+            1,
+            "one not-held transition; the production loop already emitted its journal line",
+        );
+        assert_eq!(nodes[3].p2p().node().durable_finalized_head(), None);
+
+        // Let the already-sent GetData(Block) traverse the same loop again. A peer
+        // serves the whole body; no special admission or validation path exists.
+        spin_until(&mut nodes, 120, "the halted loser applied finalized sibling A", |ns| {
+            let loser = ns[3].p2p().node();
+            loser.applied_tip().hash == a_hash
+                && loser.durable_finalized_head() == Some((DH, a_hash))
+        });
+        let loser = nodes[3].p2p().node();
+        assert_eq!(loser.applied_tip().height, DH);
+        assert_eq!(loser.applied_tip().hash, a_hash, "state tip == finalized A");
+        assert_eq!(loser.applied_tip().main_chain_hash, Some(a_hash), "the two views agree");
+        assert_eq!(loser.state_rewinds(), (1, 1), "one sibling rewind, logged once");
+        assert_eq!(loser.finalize_refused_total(), 1, "retries do not duplicate the event");
+        assert_eq!(nodes[3].p2p().body_requests(), 0, "the bounded request stops on convergence");
+        assert!(
+            nodes[3]
+                .p2p()
+                .peers()
+                .ready_peers()
+                .into_iter()
+                .all(|pid| nodes[3].p2p().peers().get(pid).is_some_and(|p| p.score >= 0)),
+            "serving the requested sibling never penalizes a peer",
+        );
+        assert_eq!(nodes[3].tip_height(), DH, "halt still admits nothing above H");
+        assert!(nodes[3].is_halted());
+
+        // Persistence leg: the normal apply funnel appended A and the finalize
+        // record. A fresh process on the same data dir reopens on A, not B.
+        let (loser_cfg, loser_genesis) = loser_reopen.expect("loser config retained");
+        for n in nodes {
+            drop(n);
+        }
+        let reopened = RunningNode::start_with_release(
+            &loser_cfg,
+            &loser_genesis,
+            KeccakPow,
+            DevnetRehearsalVerifier,
+            armed_release(),
+        )
+        .unwrap();
+        assert_eq!(reopened.p2p().node().applied_tip().hash, a_hash, "restart reopens on A");
+        assert_eq!(reopened.p2p().node().durable_finalized_head(), Some((DH, a_hash)));
+        assert_eq!(reopened.tip_height(), DH, "restart remains halted at H");
+        drop(reopened);
+
+        for base in bases {
             let _ = std::fs::remove_dir_all(&base);
         }
         for base in [base_chain_tmp, va_base, vb_base] {

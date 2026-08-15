@@ -9,6 +9,8 @@
 
 [#370]: https://github.com/qumbra-labs/qumbra-lab/issues/370
 [#367]: https://github.com/qumbra-labs/qumbra-lab/issues/367
+[#375]: https://github.com/qumbra-labs/qumbra-lab/issues/375
+[snapshot-transplant]: https://github.com/qumbra-labs/qumbra-lab/issues/359#issuecomment-5300960029
 
 ## 0. 两句话说清改的是什么
 
@@ -95,6 +97,16 @@ i299 §5–6 照抄，另加这次已预先合并的两个边界日修复（#360
 1. 网在盖章高度 halt；每台主机横幅确认。
 2. **协调者裁定边界 fid：至少 3/4、单一身份**——此处分裂即 R2，全停，保全
    现场。
+   **边界 tie 输方（boundary-tie loser）**是另一种可恢复形态：主机停在 H，
+   finalized checkpoint 指向 A，已应用 tip 却是 H 上的同胞块 B，并打印
+   `FINALIZE refused head=state ... why=not-held`。让主机保持 halt 且保持连接：
+   主路径会经有界 near-tip body 窗口重索 A，只 rewind 一次，再走正常 state
+   funnel 应用 A。用 `stip=H`、`dfin=H`、一致的 `stipid`/`dfinbh`、
+   `schain=main`、`breq=0` 确认恢复；少数派密钥账本的 `sid` 按设计仍是 B，
+   它是 never-double-sign 的取证记录。若没有可达 peer 能提供 A，则走
+   [snapshot-transplant] 程序——只复制 donor 的 `snapshot.bin` + `blocks.log`，
+   保留本机自己的 finalizer 账本、halt marker 与配置。代码路径是主路径；
+   transplant 是服务不可用或 pre-#375 binary 的后备路径。
 3. 按 §6 分波 resume（runbook 说可并行处并行），svc 主机在同一波次集合里。
 4. 链恢复；第一个边界后检查点在 v3 body 下 finalize。
 

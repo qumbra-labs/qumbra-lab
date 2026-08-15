@@ -11,6 +11,8 @@ belongs to.
 
 [#370]: https://github.com/qumbra-labs/qumbra-lab/issues/370
 [#367]: https://github.com/qumbra-labs/qumbra-lab/issues/367
+[#375]: https://github.com/qumbra-labs/qumbra-lab/issues/375
+[snapshot-transplant]: https://github.com/qumbra-labs/qumbra-lab/issues/359#issuecomment-5300960029
 
 ## 0. What is changing, in two sentences
 
@@ -113,6 +115,18 @@ pre-merged (#360 halted-proposal maintenance, #362 REPUSH cadence):
 1. Net halts at the stamped height; every host banners the halt.
 2. **Coordinator adjudicates the boundary fid: 3-of-4 minimum, one identity**
    — a split here is R2, stop everything, preserve state.
+   A **boundary-tie loser** is the separate, recoverable shape: a host is halted
+   at H, its finalized checkpoint names A, its applied tip is sibling B at H,
+   and it prints `FINALIZE refused head=state ... why=not-held`. Leave the host
+   halted and connected: the primary path re-requests A through the bounded
+   near-tip body window, rewinds once, and applies A through the normal state
+   funnel. Confirm recovery with `stip=H`, `dfin=H`, matching
+   `stipid`/`dfinbh`, `schain=main`, and `breq=0`; the minority key ledger's
+   `sid` remains B by design as the never-double-sign forensic record. If no
+   reachable peer can serve A, use the [snapshot-transplant] procedure — copy
+   only the donor's `snapshot.bin` + `blocks.log`, preserving this host's own
+   finalizer ledgers, halt marker, and config. The code path is primary; the
+   transplant is the fallback for unavailable serving or pre-#375 binaries.
 3. Resume waves per §6 (parallel where the runbook says so), svc hosts in the
    same wave set.
 4. Chain resumes; first post-boundary checkpoint finalizes under v3 bodies.

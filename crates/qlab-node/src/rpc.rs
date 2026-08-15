@@ -57,8 +57,8 @@ use std::thread::JoinHandle;
 use qlab_cbserver::codec::{
     committed_payloads_per_recipient, decode_committed_discovery, encode_committed_discovery,
     encode_compact_response, encode_full_response,
-    read_varint, write_varint, BlockNullifiers, CodecError, CompactBlock, CompactGroup,
-    BlockNames, NamesPage, NullifierPage,
+    read_varint, write_varint, BlockCoinbase, BlockNullifiers, CodecError, CoinbasePage,
+    CompactBlock, CompactGroup, BlockNames, NamesPage, NullifierPage,
 };
 use qlab_cbserver::tree::Frontier;
 use qlab_devnet::body::{TxEntry, TxPublic, TxVerifier};
@@ -270,19 +270,56 @@ pub struct BlockDiscovery {
     /// (lab #367). Same no-encoder-between-block-and-served-bytes guarantee
     /// as `groups`.
     pub riders: Vec<Vec<u8>>,
+    /// This block's coinbase payee — `body.coinbase_rkm`, verbatim (lab #415).
+    ///
+    /// ## Why it rides here too
+    ///
+    /// [`BlockDiscovery::nullifiers`] states the argument and it applies
+    /// unchanged: this type is "one main-chain block, as the serving surfaces
+    /// need it", and a second projection would mean a second main-chain walk and
+    /// a second incremental/reorg rule. The cost is 32 B + three integers per
+    /// block against a projection that is already ~1.2 KB per transaction.
+    ///
+    /// Unlike the two fields above, **a coinbase-only block is exactly where
+    /// this one is non-empty** — which is the point: the whole defect lab #415
+    /// records is that a chain of coinbase-only blocks projected to nothing a
+    /// wallet could read.
+    pub coinbase_rkm: [u64; 4],
+    /// `body.coinbase` — the issuance this block declared, verbatim. **Not the
+    /// coinbase note's value**; see [`crate::coinbase::coinbase_note_value_parts`].
+    pub coinbase: u64,
+    /// `body.total_fees()` — the declared fees, which are the miner's.
+    pub fees: u64,
+    /// `body.total_name_burn()` — the burned half that is not (lab #367),
+    /// computed by `qlab_devnet::names::burn_of_riders` over **this projection's
+    /// own `riders`**, i.e. the same function `BlockBody::total_name_burn` calls
+    /// on the same bytes.
+    pub name_burn: u64,
 }
 
 impl BlockDiscovery {
     /// Project a stored block. `hash` is the caller's — the chain store keys blocks
     /// by it, so re-hashing the header here would be a second derivation of a fact
     /// the caller already holds.
+    ///
+    /// The coinbase fields are read off the stored block rather than off
+    /// `StoredBlock::body()`: rebuilding the body would clone every proof in it
+    /// (~145 KB each) on a path that runs per request. `fees` is the same sum
+    /// `BlockBody::total_fees` is, over the same per-transaction field, and
+    /// `the_projections_coinbase_facts_are_the_bodys_own` pins the pair against a
+    /// real body rather than trusting the sentence.
     pub fn of(hash: Hash32, block: &StoredBlock) -> Self {
+        let riders: Vec<Vec<u8>> = block.txs.iter().map(|t| t.rider.clone()).collect();
         Self {
             height: block.header.height,
             hash,
             groups: block.txs.iter().map(|t| t.discovery.clone()).collect(),
             nullifiers: block.txs.iter().flat_map(|t| t.nullifiers.iter().copied()).collect(),
-            riders: block.txs.iter().map(|t| t.rider.clone()).collect(),
+            coinbase_rkm: block.coinbase_rkm,
+            coinbase: block.coinbase,
+            fees: block.txs.iter().map(|t| t.fee).sum(),
+            name_burn: qlab_devnet::names::burn_of_riders(riders.iter().map(|r| r.as_slice())),
+            riders,
         }
     }
 
@@ -954,6 +991,18 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeRpc<C, N, T> {
                 }
                 Ok(nullifier_page(&self.main_chain_discovery(), from, to).to_bytes())
             }
+            ["v1", "coinbase"] => {
+                // Lab #415: the per-block coinbase facts a mining wallet matches
+                // its own rkm against. Bulk over a range; there is no per-key
+                // form and there must never be one — see [`CoinbasePage`] for
+                // why this needs no privacy read while #188 (a) did.
+                let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'"))?;
+                let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'"))?;
+                if to < from {
+                    return Err((400, "'to' < 'from'"));
+                }
+                Ok(coinbase_page(&self.main_chain_discovery(), from, to).to_bytes())
+            }
             ["v1", "names"] => {
                 // Lab #367: the D2 bulk-sync surface — per-block rider lists a
                 // wallet replays into a LOCAL registry. Bulk over a range;
@@ -1341,6 +1390,37 @@ pub fn nullifier_page(blocks: &[BlockDiscovery], from: u64, to: u64) -> Nullifie
         blocks
             .iter()
             .map(|b| BlockNullifiers { height: b.height, nullifiers: b.nullifiers.clone() }),
+        from,
+        to,
+    )
+}
+
+/// The `/v1/coinbase` page for `[from, to]` over an **ascending** main-chain
+/// projection — the per-block coinbase facts a mining wallet matches its own
+/// `rkm` against (lab #415).
+///
+/// `nullifier_page`'s twin in every respect, and here for the same reason: one
+/// implementation of the bound, called by both this crate's router and
+/// `qumbra-node`'s discovery server over its snapshot, so there is nothing to
+/// drift. The facts come from [`BlockDiscovery`] — the block's own fields,
+/// cloned — so there is no encoder between the block and the served bytes.
+///
+/// 🔴 **What is deliberately NOT here: the note's value.** The route serves the
+/// three numbers the value is a function of and lets the holder run
+/// [`crate::coinbase::coinbase_note_parts`], which is the same call
+/// `apply_state` makes when it appends the leaf. Deriving it here would put a
+/// consensus rule on the serving path and would leave the `qlab-cbserver`
+/// reference server — which cannot depend on this crate — stating a rule of its
+/// own invention.
+pub fn coinbase_page(blocks: &[BlockDiscovery], from: u64, to: u64) -> CoinbasePage {
+    CoinbasePage::page(
+        blocks.iter().map(|b| BlockCoinbase {
+            height: b.height,
+            coinbase_rkm: b.coinbase_rkm,
+            coinbase: b.coinbase,
+            fees: b.fees,
+            name_burn: b.name_burn,
+        }),
         from,
         to,
     )
@@ -1902,6 +1982,165 @@ mod tests {
         // And there is no per-nullifier membership form of this route: an
         // unknown path stays a 404, so a probe cannot be answered by accident.
         assert!(matches!(rpc.route("/v1/nullifier?nf=00"), Err((404, _))));
+    }
+
+    // ---- the coinbase stream (`/v1/coinbase`, lab #415) ---------------------
+    //
+    // The wire, its goldens, its rejections and its page bound are
+    // `qlab_cbserver::codec`'s. What is this crate's, and is tested here, is the
+    // PROJECTION, the ROUTE, and the one property the whole route exists for:
+    // that what it serves reconstructs the note the node itself appended.
+
+    /// 🔴 **The property the route exists for: the served facts reconstruct the
+    /// leaf `apply_state` appended.**
+    ///
+    /// A wallet holding this page runs `coinbase_note_parts` — the same call
+    /// [`crate::coinbase::coinbase_note`] makes — and the commitment it derives
+    /// must be a leaf of the node's own tree. This is what makes the value
+    /// *checkable* rather than trusted: a server that lied about `coinbase` or
+    /// `fees` would produce a `cm` that is in no tree, and the spend would refuse
+    /// instead of proving something false.
+    ///
+    /// It is also the check that would have caught the task book's original
+    /// premise — "amount = the emission schedule's value at that height" — which
+    /// is neither the miner's share nor inclusive of the fees the block below
+    /// carries.
+    #[test]
+    fn the_served_coinbase_facts_reconstruct_the_leaf_the_node_appended() {
+        let (mut rpc, anchor) = rpc_with_finalized_genesis();
+        let fee = posted_fee(ArityBucket::TwoByTwo);
+        // A block with transactions, so `fees` is non-zero and the difference
+        // between "the schedule" and "what the miner took" is observable.
+        apply_block_with(rpc.node_mut(), vec![tx_with(anchor, &[1, 2], &[10, 11], fee)]);
+
+        let page = CoinbasePage::from_bytes(&rpc.route("/v1/coinbase?from=1&to=1").unwrap())
+            .expect("the served bytes are the wire");
+        let blk = &page.blocks[0];
+        assert_eq!(blk.fees, fee, "the block's own fees are on the wire");
+
+        // The stored block is the authority on all five facts.
+        let stored = {
+            let chain = rpc.node().chain();
+            let hash = chain.tip_hash();
+            chain.block(&hash).expect("the tip is stored").clone()
+        };
+        let body = stored.body();
+        assert_eq!(blk.coinbase_rkm, body.coinbase_rkm);
+        assert_eq!(blk.coinbase, body.coinbase);
+        assert_eq!(blk.fees, body.total_fees());
+        assert_eq!(blk.name_burn, body.total_name_burn());
+
+        // Reconstructed from the served facts alone — no body, as a wallet.
+        let note = crate::coinbase::coinbase_note_parts(
+            blk.height,
+            blk.coinbase_rkm,
+            blk.coinbase,
+            blk.fees,
+            blk.name_burn,
+        )
+        .expect("a minting block mints a note");
+        assert_eq!(
+            Some(&note),
+            crate::coinbase::coinbase_note(1, &body).as_ref(),
+            "the wallet's note IS the applier's note"
+        );
+
+        // 🔴 …and the schedule alone would NOT have produced it: the value is
+        // the miner's share plus this block's fees.
+        assert_eq!(note.value, crate::RewardSplit::of(body.coinbase).miner + fee);
+        assert_ne!(note.value, body.coinbase, "the whole emission is not the miner's");
+        assert_ne!(
+            note.value,
+            crate::RewardSplit::of(body.coinbase).miner,
+            "and the fees are part of it — the task book's rule would have been short by {fee}"
+        );
+
+        // The leaf is the node's own, once maturity puts it in the tree.
+        let leaf = digest_bytes(&note.commitment());
+        assert_eq!(leaf, crate::coinbase::coinbase_note_leaf(1, &body).expect("mints"));
+    }
+
+    /// Projection discipline, `route_serves_the_stored_blocks_nullifier_section_verbatim`'s
+    /// twin: every held height in range is present — **including a non-minting
+    /// block**, whose `[0; 4]` payee and zero coinbase are a real answer and not
+    /// an omission. A hole here is indistinguishable from "the payee was not you".
+    #[test]
+    fn the_coinbase_route_serves_every_held_height_including_the_non_minting_ones() {
+        let (mut rpc, _anchor) = rpc_with_finalized_genesis();
+        apply_block_with_shape(rpc.node_mut(), vec![], true); // height 1, mints
+        apply_block_with_shape(rpc.node_mut(), vec![], false); // height 2, mints nothing
+
+        let page = CoinbasePage::from_bytes(&rpc.route("/v1/coinbase?from=0&to=2").unwrap())
+            .unwrap();
+        assert_eq!((page.from, page.to), (0, 2));
+        assert_eq!(page.blocks.len(), 3, "genesis, the minting block, the non-minting one");
+        assert_eq!(page.blocks[0].height, 0);
+        assert_eq!(page.blocks[0].coinbase, 0, "genesis mints nothing");
+        assert_eq!(page.blocks[0].coinbase_rkm, [0; 4], "…and names no payee");
+        assert_eq!(page.blocks[1].coinbase_rkm, [1, 2, 3, 4], "the minting block's payee");
+        assert_eq!(page.blocks[2].height, 2);
+        assert_eq!(
+            page.blocks[2].coinbase_rkm,
+            [0; 4],
+            "a non-minting block is SERVED with the no-payee sentinel — never omitted"
+        );
+        assert!(!page.is_truncated(), "and the page reaches the `to` it echoes");
+        // Nothing is derivable from a non-minting block, and the shared
+        // derivation says so rather than minting a zero-value note.
+        assert!(crate::coinbase::coinbase_note_parts(2, [0; 4], 0, 0, 0).is_none());
+    }
+
+    /// The route's refusals are `/v1/nullifiers`' refusals, and there is no
+    /// per-key form: "did this rkm mine anything" would tell the server which
+    /// miner is asking, so the shape does not exist.
+    #[test]
+    fn the_coinbase_route_refuses_bad_bounds_and_has_no_per_key_form() {
+        let (rpc, _) = rpc_with_finalized_genesis();
+        assert_eq!(rpc.route("/v1/coinbase"), Err((400, "missing/invalid 'from'")));
+        assert_eq!(rpc.route("/v1/coinbase?from=0"), Err((400, "missing/invalid 'to'")));
+        assert_eq!(rpc.route("/v1/coinbase?from=zz&to=1"), Err((400, "missing/invalid 'from'")));
+        assert_eq!(rpc.route("/v1/coinbase?from=5&to=1"), Err((400, "'to' < 'from'")));
+        assert!(matches!(rpc.route("/v1/coinbase/deadbeef"), Err((404, _))));
+    }
+
+    /// The projection's coinbase facts are the body's own, including the two
+    /// sums — asserted against a real `BlockBody` rather than against the
+    /// sentence in `BlockDiscovery::of`'s doc comment, because `fees` is
+    /// computed there from the stored transactions instead of by rebuilding the
+    /// body (which would clone every proof).
+    #[test]
+    fn the_projections_coinbase_facts_are_the_bodys_own() {
+        let (mut rpc, anchor) = rpc_with_finalized_genesis();
+        let fee = posted_fee(ArityBucket::TwoByTwo);
+        apply_block_with(
+            rpc.node_mut(),
+            vec![
+                tx_with(anchor, &[1, 2], &[10, 11], fee),
+                tx_with(anchor, &[3, 4], &[12, 13], fee),
+            ],
+        );
+        let stored = {
+            let chain = rpc.node().chain();
+            let hash = chain.tip_hash();
+            chain.block(&hash).expect("stored").clone()
+        };
+        let body = stored.body();
+        let projected = BlockDiscovery::of(rpc.node().tip_hash(), &stored);
+
+        assert_eq!(projected.coinbase, body.coinbase);
+        assert_eq!(projected.coinbase_rkm, body.coinbase_rkm);
+        assert_eq!(projected.fees, body.total_fees(), "two transactions' worth of fee");
+        assert_eq!(projected.fees, 2 * fee);
+        assert_eq!(projected.name_burn, body.total_name_burn());
+        assert_eq!(
+            crate::coinbase::coinbase_note_value_parts(
+                projected.coinbase,
+                projected.fees,
+                projected.name_burn
+            ),
+            crate::coinbase::coinbase_note_value(&body),
+            "the projection and the body reach the same value through the same function"
+        );
     }
 
     /// The leaf wire rejects exactly like the node's other own wires: unknown

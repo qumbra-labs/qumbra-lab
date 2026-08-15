@@ -341,16 +341,12 @@ impl BlockBody {
     /// (`coinbase_value`, the supply ledger) runs on bodies `validate_body*`
     /// already accepted, where every rider decodes — the error path exists
     /// there, once, not in every downstream sum.
+    /// Delegates to [`crate::names::burn_of_riders`] so a projection that holds
+    /// the same rider bytes without the bodies around them (the serving surfaces'
+    /// `BlockDiscovery`, lab #415) computes the identical figure through the
+    /// identical code rather than a restatement of it.
     pub fn total_name_burn(&self) -> u64 {
-        self.txs
-            .iter()
-            .map(|t| {
-                crate::names::decode_rider(&t.rider)
-                    .ok()
-                    .flatten()
-                    .map_or(0, |op| crate::names::name_fee_for(&op))
-            })
-            .sum()
+        crate::names::burn_of_riders(self.txs.iter().map(|t| t.rider.as_slice()))
     }
 
     /// Whether this body mints issuance without naming a payee — a block that

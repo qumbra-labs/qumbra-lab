@@ -151,7 +151,21 @@ fn cmd_audit_emission(args: &[String]) -> ExitCode {
             return ExitCode::from(EXIT_CANNOT_RUN);
         }
     };
-    match audit_emission::audit_emission(&data_dir, from, to) {
+    // `--payee <64hex>`: attribution, not audit. Parsed with the SAME function the
+    // node uses for its own `miner_rkm` (`config::rkm_lanes_from_hex`), because a
+    // second copy of that lane-major arithmetic is exactly the wrong-in-the-detail
+    // this tool exists to settle.
+    let payee = match flag(args, "--payee") {
+        None => None,
+        Some(hex) => match qumbra_node::config::rkm_lanes_from_hex(hex) {
+            Ok(lanes) => Some(lanes),
+            Err(e) => {
+                eprintln!("qumbra-node audit-emission: --payee {e}");
+                return ExitCode::from(EXIT_CANNOT_RUN);
+            }
+        },
+    };
+    match audit_emission::audit_emission(&data_dir, from, to, payee) {
         Ok(report) => {
             println!("{}", report.format_output());
             ExitCode::from(report.exit_code())
@@ -346,18 +360,42 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
              blocks.log (issue #225)."
         );
         println!("      reason: {why}");
-        println!(
-            "      Recovered by a full replay from genesis — the log is the source of truth and \
-             this"
-        );
-        println!(
-            "      state is exactly what a from-genesis replay reaches. The stale snapshot is \
-             rewritten"
-        );
-        println!(
-            "      at the next graceful stop. If this repeats every start, the log is what to \
-             look at."
-        );
+        // Lab #408: the rejection no longer implies the genesis fold. When the
+        // log proves the snapshot's tip is on the finalized main chain, its
+        // state was honoured anyway and only the tail was replayed — say which
+        // of the two recoveries this start actually was.
+        if node.recovery_report().snapshot_height.is_some() {
+            println!(
+                "      Degraded to a NEAR-TIP resume (lab #408): the log's own finalizations \
+                 prove the"
+            );
+            println!(
+                "      snapshot's tip is on the finalized main chain, so its state was honoured \
+                 and only"
+            );
+            println!(
+                "      the records past it were replayed. State is exactly what a from-genesis \
+                 replay"
+            );
+            println!(
+                "      reaches. The snapshot is rewritten at the next graceful stop; if this \
+                 repeats"
+            );
+            println!("      every start, the log is what to look at.");
+        } else {
+            println!(
+                "      Recovered by a full replay from genesis — the log is the source of truth \
+                 and this"
+            );
+            println!(
+                "      state is exactly what a from-genesis replay reaches. The stale snapshot \
+                 is rewritten"
+            );
+            println!(
+                "      at the next graceful stop. If this repeats every start, the log is what \
+                 to look at."
+            );
+        }
     }
     println!("  genesis hash: {}", genesis.hash_hex());
     println!("  mining:       {}", config.mining);

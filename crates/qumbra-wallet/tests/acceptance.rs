@@ -14,7 +14,7 @@ use qlab_cbserver::client::{scan_local, Completeness, ScanConfig};
 use qlab_cbserver::data::{Devnet, GenParams};
 use qumbra_wallet::spent::SpentReport;
 use qumbra_wallet::store::{reveal_mnemonic, WalletDir};
-use qumbra_wallet::view::{render, DivScan, SpentCoverage, UNAVAILABLE};
+use qumbra_wallet::view::{render, CoinbaseCoverage, DivScan, SpentCoverage, UNAVAILABLE};
 
 const BIN: &str = env!("CARGO_BIN_EXE_qumbra-wallet");
 
@@ -268,6 +268,91 @@ fn a_real_wallet_binary_scans_its_own_payment_over_http() {
     assert!(!combined.contains(&mnemonic), "the mnemonic never leaves scan");
 }
 
+/// 🔴 **Lab #415's acceptance item (a), as a real process: a mining-only wallet
+/// reads NON-ZERO on a chain its own rkm mined, with the maturity split.**
+///
+/// Every step crosses the process boundary, like the payment test above:
+///
+/// 1. `keygen` runs as the real binary and writes a real wallet directory;
+/// 2. `miner-rkm` runs as the real binary and its printed hex is what a node
+///    operator would paste into `miner_rkm` — the *only* thing the chain below
+///    is told about this wallet;
+/// 3. a devnet whose every block pays that rkm and carries **no transactions**
+///    is served over a real socket — a mining-only wallet's actual world;
+/// 4. `scan` runs as the real binary and its **stdout** is the evidence.
+///
+/// Before this route existed the last step printed `spendable: 0 · complete`
+/// on exactly this chain, which is the whole of lab #415.
+#[test]
+fn a_real_mining_wallet_binary_reads_its_own_coinbase_over_http() {
+    use std::sync::Arc;
+
+    let dir = tmp("wallet_mining");
+    let d = dir.to_str().unwrap();
+    let (_, stderr, ok) = run(&["keygen", "--dir", d], None);
+    assert!(ok, "keygen failed: {stderr}");
+
+    // 2. The identity the NODE is configured with — through the CLI, so the
+    // test cannot pass with an rkm no operator could have produced.
+    let (rkm_out, _, ok) = run(&["miner-rkm", "--dir", d], None);
+    assert!(ok);
+    let printed_hex = rkm_out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("miner_rkm = "))
+        .map(|v| v.trim_matches('"').to_string())
+        .expect("miner-rkm prints the config line");
+
+    let w = WalletDir::open(&dir).expect("keygen wrote a readable wallet dir");
+    let wallet = w.wallet();
+    let div = wallet.diversifier_at_index(0);
+    let mine = wallet.rkm(div);
+    let mine_hex: String =
+        qlab_note::hash::digest_bytes(&mine).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(mine_hex, printed_hex, "the chain below pays what `miner-rkm` printed");
+
+    // 3. A chain this wallet mined every block of, and nothing else: no
+    // transactions, so every bessel in the report can only have come from
+    // coinbase.
+    let payee = wallet.diversified_keypair(&div);
+    let n_blocks = qlab_node::COINBASE_MATURITY_BLOCKS + 20;
+    let devnet = Devnet::generate_paying(
+        GenParams { n_blocks, txs_per_block: 0, miner_rkm: Some(mine), ..GenParams::default() },
+        payee,
+    );
+    let tip = devnet.tip_height();
+    let handle = qlab_cbserver::server::serve(Arc::new(devnet));
+    let url = handle.base_url();
+
+    // 4. scan, as the process, over HTTP.
+    let (out, err, ok) = run(&["scan", "--dir", d, "--url", &url, "--to", &tip.to_string()], None);
+    handle.shutdown();
+    assert!(ok, "scan failed: {err}\n{out}");
+
+    // 🔴 The headline: non-zero, from coinbase alone.
+    let total = out
+        .lines()
+        .find_map(|l| l.strip_prefix("TOTAL spendable: "))
+        .and_then(|t| t.split_whitespace().next())
+        .and_then(|n| n.parse::<u128>().ok())
+        .unwrap_or_else(|| panic!("no TOTAL spendable line in scan output:\n{out}"));
+    assert!(total > 0, "a mining-only wallet must read non-zero on a chain it mined:\n{out}");
+    assert!(out.contains("transactions 0 + mined "), "every bessel is mined:\n{out}");
+
+    // …and the maturity split, which is a miner's second question.
+    assert!(out.contains(&format!("blocks mined: {tip}")), "every block was ours:\n{out}");
+    assert!(out.contains("maturing:"), "the split is shown:\n{out}");
+    assert!(out.contains("tip reaches"), "with the height it changes at:\n{out}");
+
+    // The honest-reporting discipline holds: this scan could know both halves.
+    assert!(!out.contains(UNAVAILABLE), "nothing here is unknown:\n{out}");
+    // And the widened claim is available to a scan that actually fetched the
+    // route — the un-narrowing rule, observed through the binary.
+    assert!(!out.contains("could not read /v1/coinbase"), "{out}");
+
+    let mnemonic = reveal_mnemonic(&w);
+    assert!(!format!("{out}{err}").contains(&mnemonic), "the mnemonic never leaves scan");
+}
+
 /// `history` as a real process, against the reference server over a real
 /// socket: the ledger is chain-derived end to end, the wallet has no
 /// `sends.v1`, and the CLI says so rather than leaving the absence to be read
@@ -371,9 +456,25 @@ fn scan_against_the_reference_fixture_renders_a_complete_report() {
     let scan = DivScan::from_subtracted(0, "qmbs1fixture".into(), &outcome, &report_0);
     let spendable = scan.spendable_bessel.expect("a subtracted figure exists");
     assert!(spendable > 0, "the fixture pays its own key");
-    let report = render(&[scan], (0, tip), "in-process", &SpentCoverage::Covered { range: Some((1, tip)) });
+    // Lab #415: this reduction is the transaction half only, so the render is
+    // handed no mined report and a coinbase coverage that says the route was
+    // not read — which is what makes the TRANSACTIONS-ONLY label below correct
+    // rather than decorative.
+    let report = render(
+        &[scan],
+        (0, tip),
+        "in-process",
+        &SpentCoverage::Covered { range: Some((1, tip)) },
+        None,
+        &CoinbaseCoverage::Unavailable { why: "not fetched by this reduction".into() },
+    );
     assert!(report.contains(&format!("TOTAL spendable: {spendable} bessel")), "{report}");
-    assert!(!report.contains(UNAVAILABLE), "{report}");
+    assert!(report.contains("TRANSACTIONS ONLY"), "{report}");
+    assert!(
+        report.matches(UNAVAILABLE).count() == 1
+            && report.contains(&format!("mined (coinbase): {UNAVAILABLE}")),
+        "the only refusal is the mined half this reduction did not fetch: {report}"
+    );
 }
 
 /// The CLI surface issue #297 changes, as a real process: the help text states

@@ -350,6 +350,10 @@ fn the_answer_is_the_highest_finalized_checkpoint_at_or_below_the_height_asked_f
     asker.add_peer(PeerId(1), None);
     server.tick(10);
     asker.tick(10);
+    // QUM-115 sends one eager `u64::MAX` query before header sync. Service and
+    // drain that intentional bootstrap exchange so the direct query table below
+    // observes only the request each row injects.
+    server.tick(20);
     let _ = asker.transport().poll();
 
     // (asked height, expected answer height)

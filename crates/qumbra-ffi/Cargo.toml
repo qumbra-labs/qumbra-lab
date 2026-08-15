@@ -44,6 +44,9 @@ rand = "0.10"
 # no RandomX chain (the wasm/iOS graphs must stay clean; features are additive,
 # so native workspace builds still unify to the full wallet).
 qumbra-wallet = { path = "../qumbra-wallet", default-features = false }
+# AnchorSet::from_bytes — the /v1/anchors codec, one copy (tip height for the
+# browser scan's `to`). Lean: no randomx in the wasm/iOS graphs.
+qlab-node = { path = "../qlab-node", default-features = false }
 
 # wasm32 (the browser-extension shell): getrandom needs the JS backend wired
 # explicitly (crypto.getRandomValues). Build with

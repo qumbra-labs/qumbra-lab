@@ -782,6 +782,284 @@ fn a_snapshot_whose_log_implies_a_rewind_it_cannot_honour_opens_by_full_replay()
     std::fs::remove_dir_all(&dir).ok();
 }
 
+// ---------------------------------------------------------------------------
+// Lab #408 — a rejected snapshot on the finalized main chain degrades to a
+// near-tip resume, not a genesis fold; and every rejection is reported.
+// ---------------------------------------------------------------------------
+
+/// **Lab #408 item (d): a stale-but-on-finalized-chain snapshot does NOT
+/// replay from height 0.** The shape is exactly issue #225's (which stays the
+/// negative control just above: with no finalization at or past the
+/// snapshot's height, it still asserts the full replay), plus the one fact
+/// that changes the answer — the chain the snapshot sits on is finalized past
+/// it:
+///
+/// ```text
+/// apply P (h=1) · apply A2 (h=2) · apply A3 (h=3)
+/// rewind to P   · apply B2 (h=2)      <- same-height sibling
+/// save_snapshot()                     <- applied_height = 2, tip = B2
+/// apply B3 (h=3, prev = B2) · finalize B3
+/// ```
+///
+/// The resume still rejects the snapshot (A3 asks the beyond-the-snapshot
+/// loop for a rewind onto the dropped A2 — the #225 rejection, unchanged and
+/// still reported), but `Finalize(B3)` proves `snap.tip = B2` is the
+/// finalized main chain's block at height 2, so the snapshot's state is
+/// honoured and only the tail is replayed. `replayed_records` is the
+/// no-genesis-fold observable: 2 (B3 + its finalization), not the whole log.
+#[test]
+fn a_rejected_snapshot_on_the_finalized_main_chain_resumes_near_tip_not_from_genesis() {
+    let dir = temp_dir("i408-near-tip-degrade");
+    let (mut node, g_header, root) = node_with_finalized_genesis(&dir);
+
+    let (p, p_hash) = apply_marked(&mut node, &g_header, root, 0xC1);
+    let (a2, a2_hash) = apply_marked(&mut node, &p, root, 0xA2);
+    let (_a3, a3_hash) = apply_marked(&mut node, &a2, root, 0xA3);
+    node.rewind_to(p_hash).expect("fork choice moves the applied tip back to P");
+    let (b2, _b2_hash) = apply_marked(&mut node, &p, root, 0xB2);
+    node.save_snapshot().expect("the graceful stop writes the snapshot");
+    let (_b3, b3_hash) = apply_marked(&mut node, &b2, root, 0xB3);
+    assert!(node.finalize(b3_hash).unwrap().is_recorded(), "B3 finalizes past the snapshot");
+    let live_tip = node.tip_hash();
+    let live_root = node.commitment_root();
+    drop(node);
+
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    let opened = MemNode::open(&dir, genesis.clone()).expect("open");
+    let report = opened.recovery_report().clone();
+
+    // (1) The rejection is still an event — reported, with the #225 reason.
+    match &report.snapshot_rejected {
+        Some(qlab_node::SnapshotRejection::RewindRefused {
+            applied_height, at_height, target, above_snapshot, ..
+        }) => {
+            assert_eq!(*applied_height, 2);
+            assert_eq!(*at_height, 3, "A3 is still the record that asked for the rewind");
+            assert_eq!(*target, a2_hash);
+            assert!(above_snapshot);
+        }
+        other => panic!("the rejection must survive the degrade, got {other:?}"),
+    }
+
+    // (2) But the resume was near-tip, not the genesis fold: the snapshot's
+    // height was honoured and only the tail was replayed. A full replay of
+    // this log is 7 records; the degrade replays 2 (B3 + Finalize(B3)).
+    assert_eq!(report.snapshot_height, Some(2), "the rejected snapshot WAS honoured (lab #408)");
+    assert_eq!(
+        report.replayed_records, 2,
+        "only the records past the snapshot were folded — height 0..2 never was"
+    );
+    assert!(
+        report.to_string().contains("near-tip resume from height 2"),
+        "and the startup line says which recovery this was: {report}"
+    );
+
+    // (3) The state is the claim that matters: open == replay == what was live.
+    let replayed = MemNode::replay(&dir, genesis).expect("the log always replays");
+    assert_eq!(opened.tip_hash(), replayed.tip_hash(), "open == replay: tip");
+    assert_eq!(opened.commitment_root(), replayed.commitment_root(), "open == replay: tree");
+    assert_eq!(opened.commitment_count(), replayed.commitment_count());
+    assert_eq!(opened.nullifier_count(), replayed.nullifier_count());
+    assert_eq!(opened.finalized_height(), replayed.finalized_height());
+    assert_eq!(opened.restored_checkpoint(), replayed.restored_checkpoint());
+    assert_eq!(opened.tip_hash(), live_tip);
+    assert_eq!(opened.commitment_root(), live_root);
+    assert!(opened.is_spent(&[0xB2; 32]), "the finalized branch's spends are in");
+    assert!(opened.is_spent(&[0xB3; 32]));
+    assert!(!opened.is_spent(&[0xA2; 32]), "the abandoned branch's are not");
+    assert!(!opened.is_spent(&[0xA3; 32]));
+    assert!(!opened.chain().contains(&a3_hash), "the orphans are out of the applied store");
+    assert!(!opened.chain().contains(&a2_hash));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// **The degrade's tail is the real beyond-the-snapshot loop, rewinds
+/// included** — fork churn ABOVE the snapshot replays through the same
+/// rewind-inference the honoured fast path uses, and lands on replay's state.
+///
+/// Shape: the near-tip shape above, plus a same-height sibling race past the
+/// snapshot (`B3` loses to `B3'`, then `B4` finalizes on the winner). The tail
+/// must skip the pre-snapshot orphan (`A3`), apply `B3`, follow the logged
+/// rewind back onto `B2`, and re-apply forward — any shortcut that only
+/// handles linear tails fails here.
+#[test]
+fn the_near_tip_degrade_replays_tail_rewinds_like_the_honoured_path() {
+    let dir = temp_dir("i408-degrade-tail-rewind");
+    let (mut node, g_header, root) = node_with_finalized_genesis(&dir);
+
+    let (p, p_hash) = apply_marked(&mut node, &g_header, root, 0xC1);
+    let (a2, _a2_hash) = apply_marked(&mut node, &p, root, 0xA2);
+    let (_a3, _a3_hash) = apply_marked(&mut node, &a2, root, 0xA3);
+    node.rewind_to(p_hash).expect("fork choice moves back to P");
+    let (b2, b2_hash) = apply_marked(&mut node, &p, root, 0xB2);
+    node.save_snapshot().expect("snapshot at B2");
+    // Churn ABOVE the snapshot: B3 loses a same-height race to B3'.
+    let (_b3, _b3_hash) = apply_marked(&mut node, &b2, root, 0xB3);
+    node.rewind_to(b2_hash).expect("fork choice moves back to B2");
+    let (b3p, _) = apply_marked(&mut node, &b2, root, 0xD3);
+    let (_b4, b4_hash) = apply_marked(&mut node, &b3p, root, 0xD4);
+    assert!(node.finalize(b4_hash).unwrap().is_recorded(), "B4 finalizes on the winner");
+    let live_tip = node.tip_hash();
+    let live_root = node.commitment_root();
+    drop(node);
+
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    let opened = MemNode::open(&dir, genesis.clone()).expect("open");
+    let report = opened.recovery_report().clone();
+    assert_eq!(report.snapshot_height, Some(2), "the degrade still fired");
+    assert!(report.snapshot_rejected.is_some());
+
+    let replayed = MemNode::replay(&dir, genesis).expect("replay");
+    assert_eq!(opened.tip_hash(), replayed.tip_hash(), "open == replay: tip");
+    assert_eq!(opened.commitment_root(), replayed.commitment_root(), "open == replay: tree");
+    assert_eq!(opened.nullifier_count(), replayed.nullifier_count());
+    assert_eq!(opened.finalized_height(), replayed.finalized_height());
+    assert_eq!(opened.tip_hash(), live_tip, "and equals what was live");
+    assert_eq!(opened.commitment_root(), live_root);
+    assert!(opened.is_spent(&[0xD3; 32]), "the winning sibling's spend is in");
+    assert!(!opened.is_spent(&[0xB3; 32]), "the losing sibling's is not");
+    assert!(!opened.is_spent(&[0xA3; 32]), "the pre-snapshot orphan's is not");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// **The degrade demands the finality proof — a rejected snapshot on a LOSING
+/// branch keeps the full replay even when finality exists past its height.**
+///
+/// This is the mutation check for the ancestry walk: finalization at h=2
+/// exists (so a gate that only checks "is anything finalized at or past
+/// `applied_height`" would wrongly degrade), but the finalized chain's block
+/// at the snapshot's height is `w1`, not the snapshot's `l1` — the snapshot's
+/// derived state is for a branch finality has excluded, and honouring it
+/// would resurrect the losing branch's tree and nullifier set.
+#[test]
+fn the_near_tip_degrade_refuses_a_snapshot_off_the_finalized_chain() {
+    let dir = temp_dir("i408-losing-branch-stays-full-replay");
+    let (mut node, g_header, root) = node_with_finalized_genesis(&dir);
+
+    let (_l1, _l1_hash) = apply_marked(&mut node, &g_header, root, 0xB2);
+    node.save_snapshot().expect("snapshot on the branch that is about to lose");
+    node.rewind_to(g_header.header_hash()).expect("rewind");
+    let (w1, _) = apply_marked(&mut node, &g_header, root, 0xA1);
+    let (_w2, w2_hash) = apply_marked(&mut node, &w1, root, 0xA2);
+    assert!(node.finalize(w2_hash).unwrap().is_recorded(), "the WINNER finalizes past h=1");
+    drop(node);
+
+    let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+    let opened = MemNode::open(&dir, genesis.clone()).expect("open");
+    assert!(
+        matches!(
+            opened.recovery_report().snapshot_rejected,
+            Some(qlab_node::SnapshotRejection::TipDisagreement { applied_height: 1, .. })
+        ),
+        "still the #162 rejection: {:?}",
+        opened.recovery_report().snapshot_rejected
+    );
+    assert_eq!(
+        opened.recovery_report().snapshot_height,
+        None,
+        "and still the full replay — the finalized chain's block at h=1 is not the snapshot's tip"
+    );
+    assert!(!opened.is_spent(&[0xB2; 32]), "the losing branch's spend did not come back");
+
+    let replayed = MemNode::replay(&dir, genesis).expect("replay");
+    assert_eq!(opened.tip_hash(), replayed.tip_hash(), "open == replay");
+    assert_eq!(opened.commitment_root(), replayed.commitment_root());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// **Lab #408's load-side halves reach the operator**: an undecodable
+/// `snapshot.bin`, a version-mismatched one, and one hanging from a foreign
+/// genesis were all silent `Ok(None)` fall-throughs before — indistinguishable
+/// from a data dir that never had a snapshot. Each is now a typed, reported
+/// rejection, and the recovered state is still exactly the replay's.
+#[test]
+fn an_unusable_snapshot_file_is_a_reported_rejection_not_a_silent_absence() {
+    use qlab_node::{SnapshotLoadReject, SnapshotRejection};
+
+    // A healthy two-block datadir whose snapshot we then sabotage three ways.
+    let assert_full_replay_with = |tag: &str, sabotage: &dyn Fn(&PathBuf), check: &dyn Fn(&SnapshotRejection)| {
+        let dir = temp_dir(tag);
+        let (tip, ..) = build_chain(&dir);
+        sabotage(&dir);
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let opened = MemNode::open(&dir, genesis.clone()).expect("open never refuses over this");
+        let report = opened.recovery_report();
+        let why = report.snapshot_rejected.as_ref().unwrap_or_else(|| {
+            panic!("{tag}: the rejection must be reported, not read as absent")
+        });
+        check(why);
+        assert_eq!(report.snapshot_height, None, "{tag}: no snapshot state was honoured");
+        assert!(report.to_string().contains("snapshot DISCARDED"), "{tag}: {report}");
+        assert_eq!(opened.tip_hash(), tip, "{tag}: the full replay still lands on the tip");
+        assert_eq!(
+            opened.tip_hash(),
+            MemNode::replay(&dir, genesis).expect("replay").tip_hash(),
+            "{tag}: open == replay"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    };
+
+    assert_full_replay_with(
+        "i408-undecodable",
+        &|dir| std::fs::write(dir.join(qlab_node::SNAPSHOT), b"not a snapshot").unwrap(),
+        &|why| {
+            assert!(
+                matches!(
+                    why,
+                    SnapshotRejection::NotLoadable {
+                        reject: SnapshotLoadReject::Undecodable { .. }
+                    }
+                ),
+                "got {why:?}"
+            );
+        },
+    );
+
+    assert_full_replay_with(
+        "i408-version-mismatch",
+        &|dir| {
+            let path = dir.join(qlab_node::SNAPSHOT);
+            let mut snap: qlab_node::Snapshot =
+                bincode::deserialize(&std::fs::read(&path).unwrap()).unwrap();
+            snap.format_version = qlab_node::FORMAT_VERSION + 7;
+            std::fs::write(&path, bincode::serialize(&snap).unwrap()).unwrap();
+        },
+        &|why| {
+            assert_eq!(
+                *why,
+                SnapshotRejection::NotLoadable {
+                    reject: SnapshotLoadReject::VersionMismatch {
+                        found: qlab_node::FORMAT_VERSION + 7
+                    }
+                }
+            );
+        },
+    );
+
+    assert_full_replay_with(
+        "i408-genesis-mismatch",
+        &|dir| {
+            let path = dir.join(qlab_node::SNAPSHOT);
+            let mut snap: qlab_node::Snapshot =
+                bincode::deserialize(&std::fs::read(&path).unwrap()).unwrap();
+            snap.genesis_block_hash = [0xEE; 32];
+            std::fs::write(&path, bincode::serialize(&snap).unwrap()).unwrap();
+        },
+        &|why| {
+            assert!(
+                matches!(
+                    why,
+                    SnapshotRejection::GenesisMismatch { snapshot_genesis, .. }
+                        if *snapshot_genesis == [0xEE; 32]
+                ),
+                "got {why:?}"
+            );
+        },
+    );
+}
+
 /// **No stop point on a reorg-churning chain mints a datadir that refuses to
 /// start** (issue #225's property, the class rather than the one instance).
 ///

@@ -87,7 +87,10 @@ impl WitnessBundle {
         self.change_value
     }
 
-    pub(crate) fn real_nullifiers(&self) -> Vec<[u8; 32]> {
+    /// The REAL inputs' nullifiers — public since the extension's history
+    /// join (roadmap #4): these exact bytes go on-chain the moment the spend
+    /// lands, so reading them here leaks nothing the chain does not.
+    pub fn real_nullifiers(&self) -> Vec<[u8; 32]> {
         self.inputs[..usize::from(self.real_inputs)]
             .iter()
             .map(|input| digest_bytes(&derive_input(input).1))
