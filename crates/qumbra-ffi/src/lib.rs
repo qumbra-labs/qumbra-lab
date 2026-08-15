@@ -920,6 +920,39 @@ pub unsafe extern "C" fn qmb_bundle_review(
 }
 
 
+
+/// Decode a `/v1/anchors` response and return the node's TIP HEIGHT — so a
+/// scan's `to` can come from the chain instead of a human guessing it. The
+/// bytes are decoded by `qlab_node::AnchorSet::from_bytes`, the wire's own
+/// codec. Returns 0 with `*out_tip` set; -1 + `err_out` on refusal, by name.
+///
+/// # Safety
+/// `bytes` points to `len` readable bytes; `out_tip` writable; `err_out`
+/// NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_anchors_tip(
+    bytes: *const u8,
+    len: usize,
+    out_tip: *mut u64,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    if bytes.is_null() || out_tip.is_null() {
+        set_err(err_out, "NULL argument".into());
+        return -1;
+    }
+    let raw = std::slice::from_raw_parts(bytes, len);
+    match qlab_node::AnchorSet::from_bytes(raw) {
+        Ok(set) => {
+            *out_tip = set.tip_height;
+            0
+        }
+        Err(e) => {
+            set_err(err_out, format!("GET /v1/anchors did not decode: {e:?}"));
+            -1
+        }
+    }
+}
+
 /* --- payment URIs + the history join (roadmap #3/#4) ---------------------- */
 
 /// Parse a `qumbra:` payment URI (#342's codec — the one copy). Returns the
@@ -1548,6 +1581,30 @@ mod tests {
             assert!(again.is_null());
             qmb_scan_free(s);
             qmb_wallet_free(w);
+        }
+    }
+
+    /// The tip height crosses from a REAL AnchorSet encoding; garbage refuses.
+    #[test]
+    fn the_anchors_tip_reads_from_the_wire_codec() {
+        unsafe {
+            let set = qlab_node::AnchorSet {
+                tip_height: 12345,
+                finalized_height: Some(12000),
+                max_age_blocks: 64,
+                roots: vec![[7u8; 32]],
+            };
+            let bytes = set.to_bytes();
+            let mut tip: u64 = 0;
+            let mut err: *mut c_char = ptr::null_mut();
+            assert_eq!(qmb_anchors_tip(bytes.as_ptr(), bytes.len(), &mut tip, &mut err), 0);
+            assert_eq!(tip, 12345);
+            let junk = b"nope";
+            assert_eq!(qmb_anchors_tip(junk.as_ptr(), junk.len(), &mut tip, &mut err), -1);
+            assert!(!err.is_null());
+            let why = CStr::from_ptr(err).to_str().unwrap();
+            assert!(why.contains("did not decode"), "{why}");
+            qmb_string_free(err);
         }
     }
 
