@@ -565,6 +565,15 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// `height → commitment root after applying that height's block`. The anchor
     /// set: a finalized entry within the age window is a valid anchor.
     roots_by_height: BTreeMap<u64, Hash32>,
+    /// The same anchor set indexed in the direction validation asks it:
+    /// `commitment root → ascending heights at which that root existed`.
+    ///
+    /// Lab #402's settled-history gate used to scan up to the whole 1,152-block
+    /// anchor window for every transaction in every replayed block. This derived
+    /// index makes the membership query two tree/binary searches instead. It is
+    /// rebuilt from `roots_by_height` on snapshot restore, so it changes neither
+    /// snapshot bytes nor the consensus source of truth.
+    anchor_heights_by_root: BTreeMap<Hash32, Vec<u64>>,
     /// Every appended commitment / spent nullifier, in application order — the
     /// deterministic material a snapshot serializes (a replay reproduces the
     /// exact order, so the on-disk form is stable).
@@ -1052,14 +1061,18 @@ impl MemNode {
         let commitments = MemCommitmentStore::default();
         let chain = MemChainStore::new(genesis);
         let mut roots_by_height = BTreeMap::new();
+        let mut anchor_heights_by_root = BTreeMap::new();
         // Genesis carries no outputs, so the tree is empty: record its root at
         // height 0 (the empty-tree root) as the base anchor entry.
-        roots_by_height.insert(0, commitments.root_bytes());
+        let genesis_root = commitments.root_bytes();
+        roots_by_height.insert(0, genesis_root);
+        anchor_heights_by_root.insert(genesis_root, vec![0]);
         Self {
             chain,
             nullifiers: MemNullifierStore::default(),
             commitments,
             roots_by_height,
+            anchor_heights_by_root,
             commitments_ordered: Vec::new(),
             nullifiers_ordered: Vec::new(),
             retained: RetainedBodies::default(),
@@ -1079,6 +1092,10 @@ impl MemNode {
         }
         self.nullifiers_ordered = snap.nullifiers.clone();
         self.roots_by_height = snap.roots_by_height.iter().copied().collect();
+        self.anchor_heights_by_root.clear();
+        for (&height, &root) in &self.roots_by_height {
+            self.anchor_heights_by_root.entry(root).or_default().push(height);
+        }
     }
 
     /// The checkpoint represented by the durable state-machine finalized head.
@@ -1095,6 +1112,42 @@ impl MemNode {
     }
 }
 
+/// How [`Node::apply_block_gated`] evaluates the anchor-finality gate (lab #402).
+///
+/// The anchor rule has two inputs that are *temporal*: which roots were
+/// finalized, and how old the anchor is. [`NodeState::is_valid_anchor`] reads
+/// both from the node's **live** position (its own finalized head and applied
+/// tip) — correct at the tip, and wrong for a block being replayed from settled
+/// history, where the node's finality structurally lags its application (the
+/// #402 joiner deadlock: block 4913's anchor was finalized when 4913 was mined,
+/// and no syncing joiner can ever have it finalized *locally* before applying
+/// 4913).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorGate {
+    /// Today's rule, byte-identical: the anchor's height is at or below **this
+    /// node's** finalized head and within [`MAX_ANCHOR_AGE_BLOCKS`] of **this
+    /// node's** applied tip. The default — every live application, and the only
+    /// gate `apply_block` itself ever uses.
+    Live,
+    /// The block is **settled history** and the anchor rule is evaluated as of
+    /// the block's own height: the anchor root must be one this node's own
+    /// replay computed for an ancestor height `h < H`, with `H − h ≤`
+    /// [`MAX_ANCHOR_AGE_BLOCKS`] (see [`Node::is_valid_anchor_as_of`]).
+    ///
+    /// **Caller contract (security-load-bearing, lab #402):** pass this only
+    /// for a block that is the main-chain block at its own height **at or
+    /// below a quorum-verified finalized checkpoint** — i.e. an ancestor of a
+    /// checkpoint whose vote set passed the unchanged
+    /// `FinalityTracker::try_finalize`. That containment is what carries the
+    /// "was finalized as of H" component of the rule: a block whose anchor had
+    /// not been finalized when it was current would have been refused by every
+    /// honest node then, and so cannot be an ancestor of an honestly finalized
+    /// checkpoint. The structural components (the root is genuinely this
+    /// chain's, the age window, `h < H`) are still enforced here, from state
+    /// this node computed itself.
+    SettledHistory,
+}
+
 impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// Validate and apply a block at the tip, persisting it to the log if the
     /// node is disk-backed. Validation: it extends the tip; the body passes
@@ -1102,11 +1155,32 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     /// every proof verifies via `verifier`); and no nullifier is already spent.
     /// On success the commitment tree and nullifier set advance and the block
     /// hash is returned.
+    ///
+    /// The anchor gate is [`AnchorGate::Live`] — this is the live-path entry
+    /// point and its behaviour is unchanged by lab #402. A caller replaying
+    /// settled history under a verified finalized checkpoint uses
+    /// [`Self::apply_block_gated`].
     pub fn apply_block<V: TxVerifier>(
         &mut self,
         header: BlockHeader,
         body: BlockBody,
         verifier: &V,
+    ) -> Result<Hash32, NodeError> {
+        self.apply_block_gated(header, body, verifier, AnchorGate::Live)
+    }
+
+    /// [`Self::apply_block`], with the anchor-finality gate chosen by the caller
+    /// (lab #402). Everything else — the tip-extension check, the full body
+    /// validation including proofs, the state funnel, the log append — is
+    /// identical for both gates; the *only* difference is which temporal view
+    /// the anchor rule is evaluated against. See [`AnchorGate::SettledHistory`]
+    /// for the caller contract.
+    pub fn apply_block_gated<V: TxVerifier>(
+        &mut self,
+        header: BlockHeader,
+        body: BlockBody,
+        verifier: &V,
+        gate: AnchorGate,
     ) -> Result<Hash32, NodeError> {
         if header.prev != self.chain.tip_hash() {
             return Err(NodeError::NotExtendingTip {
@@ -1117,14 +1191,21 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // Read-only body validation (anchor closure borrows self immutably). The
         // header goes in too (issue #77): the body must be the one this header
         // committed to, checked before any other body work.
-        {
-            let anchor_ok = |root: &Hash32| self.is_valid_anchor(root);
-            // Lab #367: the registry is the NameView. While the boundary is
-            // unset this is behaviourally identical to plain validate_body;
-            // once armed, rider rules read real state with no plumbing left
-            // to do.
-            validate_body_with_names(&header, &body, verifier, anchor_ok, &self.names)
-                .map_err(NodeError::Body)?;
+        match gate {
+            AnchorGate::Live => {
+                let anchor_ok = |root: &Hash32| self.is_valid_anchor(root);
+                // Lab #367: the registry is the NameView. While the boundary is
+                // unset this is behaviourally identical to plain validate_body;
+                // once armed, rider rules read real state with no plumbing left
+                // to do.
+                validate_body_with_names(&header, &body, verifier, anchor_ok, &self.names)
+                    .map_err(NodeError::Body)?;
+            }
+            AnchorGate::SettledHistory => {
+                let anchor_ok = |root: &Hash32| self.is_valid_anchor_as_of(root, header.height);
+                validate_body_with_names(&header, &body, verifier, anchor_ok, &self.names)
+                    .map_err(NodeError::Body)?;
+            }
         }
         let block = StoredBlock::from_parts(&header, &body);
         let hash = self.apply_state(&block)?;
@@ -1239,8 +1320,11 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         self.names
             .apply_block_riders(block.header.height, &block.txs)
             .map_err(|(index, err)| NodeError::Body(BodyError::RiderMalformed { index, err }))?;
-        self.roots_by_height
-            .insert(block.header.height, self.commitments.root_bytes());
+        let root = self.commitments.root_bytes();
+        self.roots_by_height.insert(block.header.height, root);
+        let heights = self.anchor_heights_by_root.entry(root).or_default();
+        debug_assert!(heights.last().is_none_or(|height| *height < block.header.height));
+        heights.push(block.header.height);
         // Issue #198: a block back in the applied chain is servable from the applied
         // store again, so the archive copy is dropped — and the archive is pruned to
         // the depth a rewind could still reach from the new tip. Guarded on
@@ -1367,6 +1451,38 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
     pub fn coinbase_maturity(&self, minted_height: u64) -> crate::coinbase::CoinbaseMaturity {
         crate::coinbase::coinbase_maturity(minted_height, self.chain.tip_height())
     }
+
+    /// The anchor rule evaluated **as of `block_height`** — the settled-history
+    /// form of [`NodeState::is_valid_anchor`] (lab #402), used only under
+    /// [`AnchorGate::SettledHistory`].
+    ///
+    /// `root` is valid iff this node's **own replay** recorded it as the
+    /// commitment root after some ancestor height `h` with `h < block_height`
+    /// and `block_height − h ≤ MAX_ANCHOR_AGE_BLOCKS` — the same
+    /// [`Self::apply_state`]-maintained index the live rule reads, so a forged
+    /// root, or a root that exists only on a sibling branch, is refused here
+    /// exactly as it is live: it is in no entry of `roots_by_height`, which is
+    /// computed from the blocks this node folded into its own state and never
+    /// taken from a peer.
+    ///
+    /// What this deliberately does **not** re-check is the temporal half of the
+    /// live rule — "`h` was at or below the finalized head when the block was
+    /// mined". That fact was never recorded anywhere (finalization timing is
+    /// per-node; headers carry none of it; `LogRecord::Finalize` is a bare hash)
+    /// and is irrecoverable for existing history. Its security content is
+    /// carried instead by the caller's contract: the block is an ancestor of a
+    /// quorum-verified finalized checkpoint, and a block that violated the live
+    /// rule while current would have been refused by every honest node then and
+    /// so could never have entered an honestly finalized prefix. See
+    /// [`AnchorGate::SettledHistory`] and lab #402.
+    pub fn is_valid_anchor_as_of(&self, root: &Hash32, block_height: u64) -> bool {
+        let floor = block_height.saturating_sub(MAX_ANCHOR_AGE_BLOCKS);
+        let Some(heights) = self.anchor_heights_by_root.get(root) else {
+            return false;
+        };
+        let first_in_window = heights.partition_point(|height| *height < floor);
+        heights.get(first_in_window).is_some_and(|height| *height < block_height)
+    }
 }
 
 impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeState for Node<C, N, T> {
@@ -1464,6 +1580,70 @@ mod tests {
 
     fn child_committing_to(parent: &BlockHeader, body: &BlockBody) -> BlockHeader {
         BlockHeader::child_of(parent, parent.timestamp + 75, GENESIS_DIFFICULTY, body.commitment())
+    }
+
+    /// QUM-111 performance regression: the reverse anchor index is a derived
+    /// acceleration structure, so every indexed answer must remain identical to
+    /// the original height-range scan — including repeated roots across empty
+    /// blocks and after the snapshot fast path rebuilds the index.
+    #[test]
+    fn historical_anchor_index_matches_the_height_scan_after_snapshot_restore() {
+        let dir = temp_dir("historical-anchor-index");
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let g_header = genesis.header();
+        let mut node = MemNode::open(&dir, genesis.clone()).unwrap();
+        assert!(node.finalize(g_header.header_hash()).unwrap().is_recorded());
+
+        let mut parent = g_header;
+        for height in 1..=24u64 {
+            let body = if height % 6 == 1 {
+                BlockBody {
+                    txs: vec![tx(node.commitment_root(), height as u8)],
+                    coinbase: 0,
+                    coinbase_rkm: [0; 4],
+                }
+            } else {
+                BlockBody::default()
+            };
+            let header = child_committing_to(&parent, &body);
+            node.apply_block_gated(header, body, &MockVerifier, AnchorGate::SettledHistory)
+                .unwrap();
+            parent = header;
+        }
+        node.save_snapshot().unwrap();
+        drop(node);
+
+        let node = MemNode::open(&dir, genesis).unwrap();
+        let mut candidates: Vec<Hash32> = node.roots_by_height.values().copied().collect();
+        candidates.push([0xEE; 32]);
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        for block_height in 0..=node.tip_height() + 2 {
+            let floor = block_height.saturating_sub(MAX_ANCHOR_AGE_BLOCKS);
+            for root in &candidates {
+                let scanned = node
+                    .roots_by_height
+                    .range(floor..block_height)
+                    .any(|(_, candidate)| candidate == root);
+                assert_eq!(
+                    node.is_valid_anchor_as_of(root, block_height),
+                    scanned,
+                    "root {root:?} at H={block_height}"
+                );
+            }
+        }
+
+        for (root, heights) in &node.anchor_heights_by_root {
+            assert!(heights.windows(2).all(|pair| pair[0] < pair[1]));
+            let scanned: Vec<u64> = node
+                .roots_by_height
+                .iter()
+                .filter_map(|(height, candidate)| (candidate == root).then_some(*height))
+                .collect();
+            assert_eq!(heights, &scanned, "derived index for {root:?}");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
