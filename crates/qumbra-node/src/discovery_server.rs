@@ -14,7 +14,11 @@
 //!
 //! ## What it is, and what it deliberately is not
 //!
-//! Six routes — the deployed binary's whole wallet-facing surface:
+//! Eight routes — the deployed binary's whole wallet-facing surface. **Seven
+//! are listed below**: `GET /v1/names?from=&to=` (lab #367) is served and was
+//! never added to this list, and the count said "six" while seven existed. Noted
+//! rather than silently corrected, because a route list a reader trusts is the
+//! thing that made `/v1/coinbase`'s absence hard to see in the first place.
 //!
 //! - `GET /v1/compact?from=&to=` — [`qlab_node::compact_response`]'s bytes, the
 //!   same encoder, over the same projection, that `NodeRpc` serves in-process
@@ -34,6 +38,13 @@
 //!   block body to enforce the double-spend rule — so the bytes add nothing an
 //!   `Ivk` could not already fetch over `GetData(Block)`; a per-nullifier probe
 //!   would add the *question*, and the question is the leak.
+//! - `GET /v1/coinbase?from=&to=` — the per-block coinbase facts a mining
+//!   wallet matches its own `rkm` against ([`qlab_node::coinbase_page`], lab
+//!   #415). The compact wire carries no `coinbase_rkm` and is a wallet's only
+//!   other source, so before this route a mining-only wallet read `spendable: 0`
+//!   under `complete` on a chain it had mined every block of. Bulk over a
+//!   range; no per-key form, ever.
+//!
 //! - `GET /v1/tree/leaves?from=` — the commitment tree's leaves in authoritative
 //!   append order ([`qlab_node::TreeLeaves`], issue #275 / decision brief B1).
 //!   How a wallet builds the **witness** to spend: it replays the stream into a
@@ -198,6 +209,12 @@ pub const NULLIFIERS_PATH: &str = "/v1/nullifiers";
 /// a local registry (lab #367; D2's bulk-sync surface). No name-keyed form
 /// exists, by design, permanently.
 pub const NAMES_PATH: &str = "/v1/names";
+
+/// The per-block coinbase route (lab #415) — GET only, bulk over a range. There
+/// is no per-`rkm` form and there must never be one: the bytes are public (every
+/// block prints its own payee) but the *question* "did this key mine anything"
+/// is not, and it is the question that would leak.
+pub const COINBASE_PATH: &str = "/v1/coinbase";
 
 /// The most bytes `POST /v1/tx` will read as a body.
 ///
@@ -601,6 +618,17 @@ impl DiscoveryServer {
                         };
                         respond_names(&snapshot, query)
                     }
+                    COINBASE_PATH => {
+                        // Same snapshot once more (lab #415): a block's coinbase
+                        // facts are projected with the block, so a wallet is
+                        // never offered a height's outputs without the coinbase
+                        // of the same height.
+                        let snapshot = match view.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(p) => Arc::clone(&p.into_inner()),
+                        };
+                        respond_coinbase(&snapshot, query)
+                    }
                     TREE_LEAVES_PATH => {
                         let snapshot = match leaves.lock() {
                             Ok(g) => Arc::clone(&g),
@@ -630,8 +658,8 @@ impl DiscoveryServer {
                             404,
                             format!(
                                 "not found: try {COMPACT_PATH}?from=&to=, {NULLIFIERS_PATH}?from=&to=, {NAMES_PATH}?from=&to=, \
-                                 {TREE_LEAVES_PATH}?from=, {ANCHORS_PATH}, {FULL_PATH_SHAPE}, or \
-                                 POST {TX_SUBMIT_PATH}"
+                                 {COINBASE_PATH}?from=&to=, {TREE_LEAVES_PATH}?from=, {ANCHORS_PATH}, \
+                                 {FULL_PATH_SHAPE}, or POST {TX_SUBMIT_PATH}"
                             ),
                         )),
                     },
@@ -729,6 +757,24 @@ pub fn respond_names(view: &DiscoveryView, query: &str) -> Result<Vec<u8>, (u16,
         return Err((400, "'to' < 'from'".to_string()));
     }
     Ok(qlab_node::names_page(&view.blocks, from, to).to_bytes())
+}
+
+/// The socket-free `/v1/coinbase` core (lab #415) — `respond_nullifiers`'s twin
+/// over the same projection, with the same page arithmetic as the in-process
+/// route (`qlab_node::coinbase_page`), so the two servers cannot disagree about
+/// where a page ends.
+///
+/// Refusals are `/v1/compact`'s, for its reason: **never an empty success**. An
+/// empty page means "this node holds no main-chain height in that range", which
+/// is a fact a mining wallet reasons from, and it must not also mean "your
+/// request was malformed".
+pub fn respond_coinbase(view: &DiscoveryView, query: &str) -> Result<Vec<u8>, (u16, String)> {
+    let from = query_u64(query, "from").ok_or((400, "missing/invalid 'from'".to_string()))?;
+    let to = query_u64(query, "to").ok_or((400, "missing/invalid 'to'".to_string()))?;
+    if to < from {
+        return Err((400, "'to' < 'from'".to_string()));
+    }
+    Ok(qlab_node::coinbase_page(&view.blocks, from, to).to_bytes())
 }
 
 /// The socket-free `/v1/tree/leaves` core: a `from` query against the leaves
@@ -917,8 +963,30 @@ mod tests {
     /// the serving core does not care how the bytes got there, only that they are
     /// the block's.
     fn projected(height: u64, hash: u8, groups: Vec<Vec<u8>>) -> BlockDiscovery {
-        let riders = groups.iter().map(|_| vec![0x00]).collect();
-        BlockDiscovery { height, hash: [hash; 32], groups, nullifiers: vec![], riders }
+        projected_mined(height, hash, groups, [height, 2, 3, 4])
+    }
+
+    /// The same, mined by `coinbase_rkm` (lab #415). Every projected block mints
+    /// here, because a projection whose blocks all mint nothing cannot show the
+    /// difference between "not your block" and "not served".
+    fn projected_mined(
+        height: u64,
+        hash: u8,
+        groups: Vec<Vec<u8>>,
+        coinbase_rkm: [u64; 4],
+    ) -> BlockDiscovery {
+        let riders: Vec<Vec<u8>> = groups.iter().map(|_| vec![0x00]).collect();
+        BlockDiscovery {
+            height,
+            hash: [hash; 32],
+            groups,
+            nullifiers: vec![],
+            riders,
+            coinbase_rkm,
+            coinbase: 5_000 + height,
+            fees: 0,
+            name_burn: 0,
+        }
     }
 
     /// The same, spending `nullifiers` (lab issue #314).
@@ -928,8 +996,18 @@ mod tests {
         groups: Vec<Vec<u8>>,
         nullifiers: Vec<Hash32>,
     ) -> BlockDiscovery {
-        let riders = groups.iter().map(|_| vec![0x00]).collect();
-        BlockDiscovery { height, hash: [hash; 32], groups, nullifiers, riders }
+        let riders: Vec<Vec<u8>> = groups.iter().map(|_| vec![0x00]).collect();
+        BlockDiscovery {
+            height,
+            hash: [hash; 32],
+            groups,
+            nullifiers,
+            riders,
+            coinbase_rkm: [height, 2, 3, 4],
+            coinbase: 5_000 + height,
+            fees: 0,
+            name_burn: 0,
+        }
     }
 
     fn a_view() -> DiscoveryView {
@@ -1132,12 +1210,58 @@ mod tests {
         srv.shutdown();
     }
 
+    /// 🔴 **The deployed half of lab #415**: the per-block coinbase facts cross
+    /// a real socket, decode with the wallet's own decoder, and carry every held
+    /// height — the route without which a mining-only wallet reads `0` under
+    /// `complete` on a chain it mined every block of.
+    ///
+    /// The nullifier route's test one screen up is the model, and the shared
+    /// snapshot is the point of both: a wallet is never offered a height's
+    /// outputs without that height's coinbase, because one `Arc` swap publishes
+    /// both.
+    #[test]
+    fn serves_the_per_block_coinbase_facts_over_a_real_socket() {
+        let mine = [0x11u64, 0x22, 0x33, 0x44];
+        let view = Arc::new(Mutex::new(Arc::new(DiscoveryView {
+            blocks: vec![
+                projected_mined(0, 0, vec![], [0; 4]), // genesis: no payee
+                projected_mined(1, 1, vec![], mine),
+                projected_mined(2, 2, vec![], [9, 9, 9, 9]), // somebody else's block
+            ],
+        })));
+        let (srv, _submits) = serve(Arc::clone(&view), no_leaves());
+        let addr = srv.addr();
+
+        let (status, body) = get(addr, "/v1/coinbase?from=0&to=2");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        let page = qlab_cbserver::codec::CoinbasePage::from_bytes(&body)
+            .expect("the served bytes are the wallet's wire");
+        assert_eq!((page.from, page.to), (0, 2), "the echoes are the request's");
+        assert_eq!(page.blocks.len(), 3, "every held height in range, mined by whoever");
+        assert_eq!(page.blocks[0].coinbase_rkm, [0; 4], "the no-payee sentinel is served");
+        assert_eq!(page.blocks[1].coinbase_rkm, mine);
+        assert_eq!(page.blocks[2].coinbase_rkm, [9, 9, 9, 9], "another miner's block, present");
+        assert_eq!(page.blocks[1].coinbase, 5_001, "the block's own declared issuance");
+        assert!(!page.is_truncated(), "three of three reaches the `to` it echoes");
+
+        // The same Arc swap the compact and nullifier routes ride.
+        let mut later = (**view.lock().unwrap()).clone();
+        later.blocks.push(projected_mined(3, 3, vec![], mine));
+        *view.lock().unwrap() = Arc::new(later);
+        let (_, body2) = get(addr, "/v1/coinbase?from=0&to=99");
+        let page2 = qlab_cbserver::codec::CoinbasePage::from_bytes(&body2).unwrap();
+        assert_eq!(page2.blocks.len(), 4);
+        assert_eq!(page2.blocks[3].coinbase_rkm, mine);
+
+        srv.shutdown();
+    }
+
     /// Nothing else is served, and the refusals are the RPC's refusals — not a
     /// half-implemented wallet API. `/v1/tree/frontier` in particular stays a
     /// 404 (see the module docs), and the read routes stay GET-only even now
     /// that a write route exists beside them.
     #[test]
-    fn only_the_six_routes_are_served_and_methods_are_gated() {
+    fn only_the_eight_routes_are_served_and_methods_are_gated() {
         let view = Arc::new(Mutex::new(Arc::new(a_view())));
         let (srv, _submits) = serve(Arc::clone(&view), no_leaves());
         let addr = srv.addr();
@@ -1160,6 +1284,10 @@ mod tests {
             // answered by accident (lab issue #314).
             "/v1/nullifier?nf=a1a1",
             "/v1/nullifiers/a1a1",
+            // 🔴 And no per-key coinbase route, for the same reason one step
+            // out: the bytes are public, the QUESTION is not (lab #415).
+            "/v1/coinbase/a1a1",
+            "/v1/miner?rkm=a1a1",
             // Near-misses of the payload route's shape: a 404 by shape, never a
             // 400 (which would claim the route exists and the arguments are bad).
             "/v1/block/1/tx/0",
@@ -1183,6 +1311,12 @@ mod tests {
             "/v1/nullifiers?from=0",
             "/v1/nullifiers?to=3",
             "/v1/nullifiers?from=2&to=1",
+            // Lab #415: the coinbase route's bounds refuse identically. An
+            // empty success here would read as "you mined nothing".
+            "/v1/coinbase",
+            "/v1/coinbase?from=0",
+            "/v1/coinbase?to=3",
+            "/v1/coinbase?from=2&to=1",
             "/v1/tree/leaves",
             "/v1/tree/leaves?from=zzz",
             "/v1/block/zz/tx/0/full",
@@ -1200,6 +1334,8 @@ mod tests {
         let (status, _) = post(addr, "/v1/block/1/tx/0/full", b"");
         assert!(status.starts_with("HTTP/1.1 405"), "{status}");
         let (status, _) = post(addr, "/v1/nullifiers", b"");
+        assert!(status.starts_with("HTTP/1.1 405"), "{status}");
+        let (status, _) = post(addr, "/v1/coinbase", b"");
         assert!(status.starts_with("HTTP/1.1 405"), "{status}");
         // …and a read verb on the write route is a 405 too, not a 404: the
         // route exists and the answer says what it takes.
