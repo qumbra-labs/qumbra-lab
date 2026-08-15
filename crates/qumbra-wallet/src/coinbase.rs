@@ -715,6 +715,159 @@ mod tests {
         assert!(!after.spent[0].is_spendable(), "a spent note is not spendable");
     }
 
+    /// 🔴 **The spend leg (lab #415 task-book item 3), verified rather than
+    /// asserted: a detected coinbase note is locatable in the commitment tree
+    /// through the existing `/v1/tree/*` endpoints, and the pre-proof spend
+    /// path accepts it.**
+    ///
+    /// Nothing here is a fixture standing in for the chain. A real `MemNode`
+    /// mines real blocks paying this wallet's `rkm`; the coinbase leaf is
+    /// appended by `apply_state` on the frozen §2 schedule; both routes are
+    /// served by the **real** `NodeRpc::route` and decoded by the wallet's own
+    /// decoders; and the note is then handed to `send::build_bundle`, the same
+    /// function `SelectDriver` calls, which locates it by `position_of` and cuts
+    /// an `auth_path` against the anchor.
+    ///
+    /// What this establishes, exactly: the witness path is **not** coinbase-
+    /// specific — a mined note is an ordinary leaf of the ordinary tree, and
+    /// nothing between the route and the prover needs to know where it came
+    /// from. The value being right is load-bearing and is checked here in the
+    /// only way that matters: a wrong value would derive a `cm` that is in no
+    /// tree, and `build_bundle` would refuse.
+    ///
+    /// **What it does NOT establish, and the gap is filed rather than implied:**
+    /// `spend::select` still builds its `Spendable` set from `ScanOutcome::notes`
+    /// alone, so `qumbra-wallet send` will not choose a mined note however
+    /// spendable it is. That is leg 2's baton — a new driver phase with its own
+    /// refusal discipline for a 404 on this route — and it is reported on the PR
+    /// with this test as the evidence that it is small and known-feasible.
+    #[test]
+    fn a_mined_note_is_locatable_in_the_tree_and_the_spend_path_accepts_it() {
+        use qlab_cbserver::codec::CoinbasePage;
+        use qlab_devnet::body::{BlockBody, TxEntry, TxVerifier};
+        use qlab_devnet::header::BlockHeader;
+        use qlab_devnet::params_devnet::GENESIS_DIFFICULTY;
+        use qlab_node::{genesis_block, MemNode, NodeRpc, NodeState, TreeLeaves};
+        use qlab_wallet::seed::MasterSeed;
+
+        struct NoTx;
+        impl TxVerifier for NoTx {
+            fn verify_tx(&self, _: &TxEntry) -> bool {
+                unreachable!("this chain carries no transactions")
+            }
+        }
+
+        let w = Wallet::from_master_seed(&MasterSeed::from_entropy([0x5B; 32]), 0);
+        let mine = w.rkm(w.diversifier_at_index(0));
+
+        // ---- A real chain this wallet mined, past the maturity delay. -------
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let mut node = MemNode::in_memory(genesis.clone());
+        let mut tip = genesis.header();
+        let last = coinbase_leaf_appears_at(1) + 2;
+        for height in 1..=last {
+            let body = BlockBody {
+                txs: Vec::new(),
+                coinbase: qlab_node::coinbase(height),
+                coinbase_rkm: mine,
+            };
+            let header =
+                BlockHeader::child_of(&tip, height * 75, GENESIS_DIFFICULTY, body.commitment());
+            let hash = node.apply_block(header, body, &NoTx).expect("block applies");
+            node.finalize(hash).expect("finalize, so every root is a valid anchor");
+            tip = header;
+        }
+        let rpc = NodeRpc::new(node);
+
+        // ---- The wallet's side: both routes, its own decoders. --------------
+        struct RouteSource<'a>(&'a qlab_node::MemNodeRpc);
+        impl CoinbaseSource for RouteSource<'_> {
+            fn fetch_range(&self, from: u64, to: u64) -> Result<CoinbaseChunk, String> {
+                let bytes = self
+                    .0
+                    .route(&format!("/v1/coinbase?from={from}&to={to}"))
+                    .map_err(|(c, m)| format!("{c} {m}"))?;
+                let page = CoinbasePage::from_bytes(&bytes).map_err(|e| format!("{e:?}"))?;
+                Ok(CoinbaseChunk { from: page.from, to: page.to, blocks: page.blocks })
+            }
+        }
+        let chain = fetch_coinbase(&RouteSource(&rpc), 0, last).expect("the route answers");
+        assert!(chain.covers(Some((0, last))).is_ok());
+
+        let report = match_mined(&w, &[0], &chain, &SpentSet::default());
+        assert_eq!(report.blocks_mined() as u64, last, "this wallet mined every block");
+        assert!(!report.spendable.is_empty(), "and the early ones have matured");
+        let mined = report.spendable[0].clone();
+        assert_eq!(mined.minted_height, 1, "the oldest matured note is block 1's");
+
+        // The commitment tree, rebuilt from the served leaf stream — the same
+        // `/v1/tree/leaves` paging a spend uses, through the same accumulator.
+        let mut catch = crate::sync::TreeCatchUp::new(qlab_cbserver::tree::CommitmentTree::new());
+        while let Some(from) = catch.want_from() {
+            let bytes = rpc.route(&format!("/v1/tree/leaves?from={from}")).expect("served");
+            let page = TreeLeaves::from_bytes(&bytes).expect("the node's own wire");
+            catch
+                .supply(crate::sync::LeafChunk {
+                    from: page.from,
+                    total: page.total,
+                    leaves: page.leaves,
+                })
+                .expect("an honest stream");
+        }
+        let synced = catch.finish();
+
+        // 🔴 The property: the mined note's commitment IS a leaf of that tree.
+        let d = w.diversifier_at_index(mined.div_index);
+        let inp = w.spend_input(mined.note.value, mined.note.rho, mined.note.rseed, d);
+        let (_nk, _nf, cm) = qlab_air::narrow::derive_input(&inp);
+        let pos = synced
+            .tree
+            .position_of(&cm)
+            .expect("a mined note's commitment is a leaf of the served tree");
+
+        // …and the witness the spend path cuts folds to the anchor the node
+        // itself would accept.
+        let anchor_count = synced.tree.len();
+        assert!(pos < anchor_count);
+        assert_eq!(
+            qlab_note::hash::digest_bytes(&synced.tree.root_at(anchor_count)),
+            rpc.node().commitment_root(),
+            "the rebuilt tree IS the node's tree"
+        );
+
+        // The pre-proof spend path accepts it — one function, the one
+        // `SelectDriver` calls, with no coinbase-specific branch anywhere in it.
+        let recipient =
+            Wallet::from_master_seed(&MasterSeed::from_entropy([0x5C; 32]), 0).address_at_index(0);
+        let spendable = crate::send::Spendable {
+            div_index: mined.div_index,
+            value: mined.note.value,
+            rho: mined.note.rho,
+            rseed: mined.note.rseed,
+        };
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0x415);
+        let bundle = crate::send::build_bundle(
+            &w,
+            &[spendable],
+            &recipient,
+            mined.note.value / 4,
+            &synced.tree,
+            anchor_count,
+            last,
+            recipient.short().encode(),
+            Some((0, last)),
+            Some((0, last)),
+            None,
+            &mut rng,
+        )
+        .expect("the witness builds against the anchor — no proof is run here");
+        assert_eq!(
+            bundle.anchor(),
+            qlab_note::hash::digest_bytes(&synced.tree.root_at(anchor_count)),
+            "the bundle is anchored at the node's own finalized root"
+        );
+    }
+
     /// The maturity threshold is `qlab_node`'s own, at the exact block — not a
     /// copy of 144 here. One block short is `maturing` with the height it
     /// changes at; at the threshold it is spendable.
