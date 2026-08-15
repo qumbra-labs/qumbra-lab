@@ -339,6 +339,22 @@ fn from_genesis_joiner_converges_without_revalidating_known_headers() {
     for s in &servers {
         assert_eq!(s.rate_stats().throttled_body_serve, 0, "honest serving was never throttled");
     }
+    // 🔴 **QUM-115: and the JOINER never throttled the answers it asked for.**
+    //
+    // This was the drill's blind spot and the next wall behind the header one.
+    // The three servers share a host, so they share a rate key; a full window's
+    // answers used to outrun that one bucket, and the surplus was dropped ahead
+    // of decode — silently, unscored, and indistinguishable from a peer that did
+    // not reply. `stip` then advanced in ~260-block bursts separated by exactly
+    // BODY_REQUEST_TIMEOUT_MS of nothing (measured here: 15.9 blk/s, 59 dropped
+    // frames; with the joiner's budget lifted and nothing else changed, 77.6
+    // blk/s and zero). The requester now paces its asks against that budget, so
+    // the honest number is zero and any other number is the regression.
+    assert_eq!(
+        joiner.rate_stats().throttled_frames,
+        0,
+        "the joiner dropped answers to its own asks — the QUM-115 stall"
+    );
     // Nobody scored anybody: serving history and asking for it are both honest.
     for p in joiner.peers().all_peers() {
         assert_eq!(joiner.peers().get(p).expect("peer").score, 0);
