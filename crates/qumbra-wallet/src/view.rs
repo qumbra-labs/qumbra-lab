@@ -205,8 +205,10 @@ pub fn render(scans: &[DivScan], range: (u64, u64), url: &str, spent: &SpentCove
         out.push_str(&format!("TOTAL spendable: {total} bessel\n"));
         if total == 0 {
             out.push_str(
-                "(0 under a complete scan means nothing was paid to these addresses in this \
-                 range, on the chain's authority)\n",
+                "(0 under a complete scan means no TRANSACTION paid these addresses in \
+                 this range, on the chain's authority. Coinbase is not covered: the \
+                 compact wire carries no coinbase_rkm, so a mining wallet reads 0 here \
+                 whatever it earned — lab #415)\n",
             );
         }
     } else {
@@ -251,10 +253,22 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_zero_is_zero_on_the_chains_authority() {
+    fn a_complete_zero_is_zero_for_transactions_and_says_coinbase_is_outside_it() {
         let r = render(&[div(0, Completeness::Complete, 0, 0)], (0, 8), "http://x", &covered());
         assert!(r.contains("TOTAL spendable: 0 bessel"));
         assert!(r.contains("on the chain's authority"));
+        // lab #415: the sentence beside that phrase used to claim the chain's
+        // authority over a category the scan cannot see. Locked here because the
+        // wording change that fixed it broke NO test — the false claim had never
+        // been protected, so nothing would have stopped it coming back.
+        assert!(
+            r.contains("Coinbase is not covered"),
+            "a complete verdict must name coinbase as outside it: {r}"
+        );
+        assert!(
+            !r.contains("means nothing was paid to these addresses"),
+            "the unqualified claim must not return: {r}"
+        );
         assert!(!r.contains(UNAVAILABLE));
     }
 

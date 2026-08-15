@@ -94,8 +94,10 @@ pub fn render(scans: &[DivScan], range: (u64, u64), url: &str) -> String {
         out.push_str(&format!("TOTAL spendable: {total} bessel\n"));
         if total == 0 {
             out.push_str(
-                "(0 under a complete scan means nothing was paid to these addresses in this \
-                 range, on the chain's authority)\n",
+                "(0 under a complete scan means no TRANSACTION paid these addresses in \
+                 this range, on the chain's authority. Coinbase is not covered: the \
+                 compact wire carries no coinbase_rkm, so a mining wallet reads 0 here \
+                 whatever it earned — lab #415)\n",
             );
         }
     } else {
