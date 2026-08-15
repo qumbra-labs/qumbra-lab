@@ -334,6 +334,13 @@ fn v1_names_serves_bulk_and_refuses_resolve_by_name() {
         groups: vec![vec![0x00]],
         nullifiers: vec![],
         riders: vec![encode_rider(Some(&NameOp::Commit { commit: [0x5A; 32] }))],
+        // The coinbase facts (lab #415) are along for the ride here: this
+        // synthetic projection exists to check the NAME page's verbatim
+        // projection, and a commit rider burns nothing.
+        coinbase_rkm: [7, 7, 7, 7],
+        coinbase: 5_000,
+        fees: 0,
+        name_burn: 0,
     };
     let page = qlab_node::names_page(&[synthetic.clone()], 0, 10);
     assert_eq!(page.blocks[0].riders, synthetic.riders, "projection is verbatim");

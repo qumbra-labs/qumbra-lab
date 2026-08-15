@@ -10,6 +10,17 @@
 //! by name) with [`SelectDriver::supply`], from any transport, suspending as
 //! long as they like.
 //!
+//! 🔴 **What this driver still cannot select: a MINED note (lab #424).** Its
+//! input set comes from [`ScanOutcome::notes`], i.e. transaction outputs, and a
+//! coinbase note is not in that set by construction — it has no discovery group
+//! at all, which is the whole of lab #415. Since #415 landed, `scan` reports a
+//! matured coinbase as spendable and a `send` on the same wallet still refuses
+//! with "no spendable notes", so the gap is now a visible contradiction rather
+//! than a quiet absence. The witness path is already proved to work for such a
+//! note (`coinbase::tests::a_mined_note_is_locatable_in_the_tree_and_the_spend_path_accepts_it`);
+//! what it needs is a fourth phase here and a ruling on what a send does when
+//! `/v1/coinbase` 404s. Both are on lab #424.
+//!
 //! What deliberately does NOT move here:
 //!
 //! - **Scanning.** The caller supplies completed [`ScanOutcome`]s — the

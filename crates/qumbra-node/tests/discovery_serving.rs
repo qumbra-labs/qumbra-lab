@@ -330,6 +330,10 @@ fn the_payload_projection_is_golden_locked_against_a_hand_built_body() {
             groups: vec![tx.discovery.clone()],
             nullifiers: vec![],
             riders: vec![tx.rider.clone()],
+            coinbase_rkm: body.coinbase_rkm,
+            coinbase: body.coinbase,
+            fees: body.total_fees(),
+            name_burn: body.total_name_burn(),
         }],
     };
     let served = qlab_node::full_response(&view.blocks, 1, 0).expect("the projection answers");
@@ -371,6 +375,10 @@ fn the_payload_projection_is_golden_locked_against_a_hand_built_body() {
             groups: vec![tampered_tx.discovery.clone()],
             nullifiers: vec![],
             riders: vec![tampered_tx.rider.clone()],
+            coinbase_rkm: tampered_body.coinbase_rkm,
+            coinbase: tampered_body.coinbase,
+            fees: tampered_body.total_fees(),
+            name_burn: tampered_body.total_name_burn(),
         }],
     };
 
