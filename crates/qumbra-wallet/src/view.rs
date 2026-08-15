@@ -253,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn a_complete_zero_is_zero_for_TRANSACTIONS_and_says_coinbase_is_outside_it() {
+    fn a_complete_zero_is_zero_for_transactions_and_says_coinbase_is_outside_it() {
         let r = render(&[div(0, Completeness::Complete, 0, 0)], (0, 8), "http://x", &covered());
         assert!(r.contains("TOTAL spendable: 0 bessel"));
         assert!(r.contains("on the chain's authority"));
