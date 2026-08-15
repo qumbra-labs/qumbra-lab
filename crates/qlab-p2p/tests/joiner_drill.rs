@@ -28,12 +28,12 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use qlab_devnet::body::{BlockBody, TxEntry, TxVerifier};
-use qlab_devnet::committee::{devnet_committee, CommitteeState};
+use qlab_devnet::committee::{devnet_committee, Checkpoint, CommitteeState};
 use qlab_devnet::header::BlockHeader;
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::pow::{KeccakPow, PowEngine};
 use qlab_p2p::adapter::NodeAdapter;
-use qlab_p2p::n1::{BlockIngest, ChainView, IngestOutcome};
+use qlab_p2p::n1::{BlockIngest, ChainView, CheckpointIngest, IngestOutcome};
 use qlab_p2p::sync::SyncPhase;
 use qlab_p2p::transport::TcpTransport;
 use qlab_p2p::P2pNode;
@@ -148,6 +148,114 @@ fn wire<P: PowEngine>(
 
 const CHAIN_LEN: u64 = 2_500;
 
+/// QUM-115's fast path through the real sync driver: the joiner obtains a recent
+/// quorum checkpoint first, buffers the hash-linked span outside `ChainState`, and
+/// performs PoW only for the headers above the attested frontier.
+#[test]
+fn quorum_checkpoint_skips_historical_pow_below_its_frontier() {
+    const TIP: u64 = 72;
+    const FINALIZED: u64 = 64;
+    let servers = seeded_servers(TIP as usize);
+    let frontier = servers[0].main_chain_hash_at(FINALIZED).expect("frontier");
+    let checkpoint = Checkpoint::new(FINALIZED, frontier, frontier);
+    let (_, validators) = devnet_committee(7);
+    let votes = validators[..5]
+        .iter()
+        .map(|validator| validator.sign_checkpoint(&checkpoint))
+        .collect::<Vec<_>>();
+
+    let pow_calls = Arc::new(AtomicUsize::new(0));
+    let joiner_state = NodeAdapter::new(
+        committee(),
+        CountingPow { calls: Arc::clone(&pow_calls) },
+        MarkerVerifier,
+        easy_sim(),
+    );
+    let (mut servers, mut joiner) = wire(servers, joiner_state);
+    for server in &mut servers {
+        server.announce_checkpoint(checkpoint, votes.clone());
+        assert_eq!(server.node().finalized_height(), Some(FINALIZED));
+    }
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        let now_ms = start.elapsed().as_millis() as u64;
+        for server in &mut servers {
+            server.tick(now_ms);
+        }
+        joiner.tick(now_ms);
+        if joiner.node().state_lag().blocks() == 0 && joiner.node().tip_height() == TIP {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(joiner.node().tip_height(), TIP, "the header chain reached the fleet tip");
+    assert_eq!(joiner.node().state_lag().blocks(), 0, "bodies caught up too");
+    assert_eq!(joiner.node().finalized_height(), Some(FINALIZED));
+    assert_eq!(joiner.node().chain().finalized_height(), Some(FINALIZED));
+    assert_eq!(
+        pow_calls.load(Ordering::Relaxed),
+        (TIP - FINALIZED) as usize,
+        "only the eight above-checkpoint headers run PoW; the 64-header attested span does not"
+    );
+}
+
+/// Fleet-shaped ordering regression for QUM-115: another checkpoint path may
+/// verify the exact quorum checkpoint before the eager query response is handled.
+/// That response is `Stale` at the tally, but the ordinary TCP `GetHeaders`
+/// stream must still enter checkpoint buffering rather than `submit_header`.
+#[test]
+fn already_verified_checkpoint_still_routes_tcp_headers_through_the_skip_span() {
+    const TIP: u64 = 72;
+    const FINALIZED: u64 = 64;
+    let servers = seeded_servers(TIP as usize);
+    let frontier = servers[0].main_chain_hash_at(FINALIZED).expect("frontier");
+    let checkpoint = Checkpoint::new(FINALIZED, frontier, frontier);
+    let (_, validators) = devnet_committee(7);
+    let votes = validators[..5]
+        .iter()
+        .map(|validator| validator.sign_checkpoint(&checkpoint))
+        .collect::<Vec<_>>();
+
+    let pow_calls = Arc::new(AtomicUsize::new(0));
+    let mut joiner_state = NodeAdapter::new(
+        committee(),
+        CountingPow { calls: Arc::clone(&pow_calls) },
+        MarkerVerifier,
+        easy_sim(),
+    );
+    assert!(matches!(
+        joiner_state.ingest_requested_checkpoint_votes(&checkpoint, &votes),
+        qlab_p2p::n1::VotesOutcome::Learned { finalized: true, .. }
+    ));
+    let (mut servers, mut joiner) = wire(servers, joiner_state);
+    for server in &mut servers {
+        server.announce_checkpoint(checkpoint, votes.clone());
+    }
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        let now_ms = start.elapsed().as_millis() as u64;
+        for server in &mut servers {
+            server.tick(now_ms);
+        }
+        joiner.tick(now_ms);
+        if joiner.node().state_lag().blocks() == 0 && joiner.node().tip_height() == TIP {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(joiner.node().tip_height(), TIP);
+    assert_eq!(joiner.node().state_lag().blocks(), 0);
+    assert_eq!(
+        pow_calls.load(Ordering::Relaxed),
+        (TIP - FINALIZED) as usize,
+        "the exact already-verified checkpoint still owns the below-finality TCP header path"
+    );
+}
+
 /// 🔴 **THE DRILL** — empty data dir → running 3-node net → `slag=0` at the
 /// servers' tip, refusing duties the whole way down, durable at the end.
 #[test]
@@ -231,6 +339,22 @@ fn from_genesis_joiner_converges_without_revalidating_known_headers() {
     for s in &servers {
         assert_eq!(s.rate_stats().throttled_body_serve, 0, "honest serving was never throttled");
     }
+    // 🔴 **QUM-115: and the JOINER never throttled the answers it asked for.**
+    //
+    // This was the drill's blind spot and the next wall behind the header one.
+    // The three servers share a host, so they share a rate key; a full window's
+    // answers used to outrun that one bucket, and the surplus was dropped ahead
+    // of decode — silently, unscored, and indistinguishable from a peer that did
+    // not reply. `stip` then advanced in ~260-block bursts separated by exactly
+    // BODY_REQUEST_TIMEOUT_MS of nothing (measured here: 15.9 blk/s, 59 dropped
+    // frames; with the joiner's budget lifted and nothing else changed, 77.6
+    // blk/s and zero). The requester now paces its asks against that budget, so
+    // the honest number is zero and any other number is the regression.
+    assert_eq!(
+        joiner.rate_stats().throttled_frames,
+        0,
+        "the joiner dropped answers to its own asks — the QUM-115 stall"
+    );
     // Nobody scored anybody: serving history and asking for it are both honest.
     for p in joiner.peers().all_peers() {
         assert_eq!(joiner.peers().get(p).expect("peer").score, 0);

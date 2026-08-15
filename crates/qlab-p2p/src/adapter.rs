@@ -65,7 +65,7 @@ use qlab_devnet::body::TxVerifier;
 
 use crate::bodywait::{AskSetObservation, MineDuty, RejoinGate};
 use crate::codec::{checkpoint_id, tx_id as wire_tx_id};
-use crate::node::MAX_BODIES_IN_FLIGHT;
+use crate::node::body_window_for;
 use crate::n1::{
     BlockIngest, ChainView, CheckpointIngest, CommitteeControl, IngestOutcome, TxPool, VotesOutcome,
 };
@@ -1217,7 +1217,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             lag: lag.blocks(),
             off_main,
             fork_point: self.state_fork_point().map(|(h, _)| h),
-            ask_set: self.missing_body_hashes(MAX_BODIES_IN_FLIGHT).len(),
+            // The window the requester would actually use this tick (QUM-115), not
+            // a fixed 16: reporting the steady width while a catch-up asks 128
+            // would make `ask_set` say the pipeline was full when it was not.
+            ask_set: self.missing_body_hashes(body_window_for(lag.blocks())).len(),
             in_flight,
             pending: self.pending_bodies.len(),
             gate: self.rejoin_gate_observed(),
@@ -1719,6 +1722,31 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         }
     }
 
+    /// Insert a header whose validation gate has already succeeded, preserving the
+    /// ordinary epoch and block-interval side effects.
+    fn insert_validated_header(&mut self, header: BlockHeader) -> IngestOutcome {
+        let header_hash = header.header_hash();
+        // Chain-time gap to the parent, captured BEFORE the insert while the parent
+        // is unambiguous (issue #87). Observed only when this header becomes the tip,
+        // so the histogram describes the adopted chain rather than every side fork.
+        let parent_ts = self.chain.header(&header.prev).map(|p| p.timestamp);
+        let header_ts = header.timestamp;
+        match self.chain.insert_header(header) {
+            Ok(_) => {
+                self.advance_epoch();
+                if self.chain.tip_hash() == header_hash {
+                    let interval =
+                        parent_ts.filter(|&t| t > 0).map(|pts| header_ts.saturating_sub(pts));
+                    self.metrics.observe_block(interval);
+                }
+                IngestOutcome::Accepted
+            }
+            Err(InsertError::Duplicate) => IngestOutcome::Duplicate,
+            Err(InsertError::UnknownParent) => IngestOutcome::Orphan,
+            Err(InsertError::BadHeight) => IngestOutcome::Rejected("bad height"),
+        }
+    }
+
     /// Map a header-insert result to an [`IngestOutcome`], advancing the epoch on
     /// acceptance.
     fn submit_header(&mut self, header: BlockHeader) -> IngestOutcome {
@@ -1776,33 +1804,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             }
             return IngestOutcome::Rejected(Self::header_reject_reason(&e));
         }
-        // Chain-time gap to the parent, captured BEFORE the insert while the parent
-        // is unambiguous (issue #87). Observed only when this header becomes the tip,
-        // so the histogram describes the main chain the issue measured, not every
-        // side branch that was ever offered.
-        let parent_ts = self.chain.header(&header.prev).map(|p| p.timestamp);
-        let header_ts = header.timestamp;
-        match self.chain.insert_header(header) {
-            Ok(_) => {
-                self.advance_epoch();
-                if self.chain.tip_hash() == header_hash {
-                    // A parent timestamp of 0 is the GENESIS PLACEHOLDER, not a time.
-                    // Differencing against it yields the whole Unix epoch (~1.78e9 s)
-                    // and poisons the histogram's sum and tail with one sample. The
-                    // genesis→first-block gap is not an interval; it is skipped, and
-                    // the guard is on the placeholder value rather than on the height
-                    // so a genesis that ever carries a real timestamp contributes
-                    // normally. (Same root cause as issue #73's `age_s`.)
-                    let interval =
-                        parent_ts.filter(|&t| t > 0).map(|pts| header_ts.saturating_sub(pts));
-                    self.metrics.observe_block(interval);
-                }
-                IngestOutcome::Accepted
-            }
-            Err(InsertError::Duplicate) => IngestOutcome::Duplicate,
-            Err(InsertError::UnknownParent) => IngestOutcome::Orphan,
-            Err(InsertError::BadHeight) => IngestOutcome::Rejected("bad height"),
-        }
+        self.insert_validated_header(header)
     }
 
     /// Choose the header timestamp for a block mined over `parent`, per the
@@ -2256,11 +2258,71 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
     fn state_tip_mine_ready(&self) -> bool {
         NodeAdapter::state_tip_mine_ready(self)
     }
+
+    fn state_lag_blocks(&self) -> u64 {
+        self.state_lag().blocks()
+    }
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
     fn ingest_header(&mut self, header: BlockHeader) -> IngestOutcome {
         self.submit_header(header)
+    }
+
+    fn ingest_finalized_headers(&mut self, headers: &[BlockHeader]) -> IngestOutcome {
+        // The tracker only advances through the roster/signature/quorum gate. Its
+        // block may be ahead of our local chain on the explicit eager-fetch path;
+        // this span is admitted only when its hash chain lands exactly on that
+        // attested block.
+        let Some(checkpoint) = self.finality.latest().copied() else {
+            return IngestOutcome::Rejected("no verified finalized checkpoint");
+        };
+        let Some(first) = headers.first() else {
+            return IngestOutcome::Rejected("empty checkpoint header span");
+        };
+        let Some(last) = headers.last() else {
+            return IngestOutcome::Rejected("empty checkpoint header span");
+        };
+        if last.height != checkpoint.height || last.header_hash() != checkpoint.block_hash {
+            return IngestOutcome::Rejected("checkpoint header frontier mismatch");
+        }
+        if first.height == 0
+            || self.chain.main_chain_hash_at(first.height - 1) != Some(first.prev)
+        {
+            return IngestOutcome::Orphan;
+        }
+        let Some(mut parent) = self.chain.header(&first.prev).copied() else {
+            return IngestOutcome::Orphan;
+        };
+        for header in headers {
+            if !self.rules.accepts_height(header.height) {
+                return IngestOutcome::Ignored("above halt height");
+            }
+            if self.chain.header(&header.header_hash()).is_some() {
+                return IngestOutcome::Duplicate;
+            }
+            if header.prev != parent.header_hash() || header.height != parent.height + 1 {
+                return IngestOutcome::Rejected("non-contiguous checkpoint header span");
+            }
+            if header.timestamp < parent.timestamp {
+                return IngestOutcome::Rejected("non-monotonic checkpoint header timestamp");
+            }
+            parent = *header;
+        }
+
+        // Every fallible structural check ran above, before the validated chain was
+        // touched. Difficulty and nonce are intentionally not re-derived: the exact
+        // header bytes are transitively attested by the frontier hash and quorum.
+        for header in headers {
+            if !matches!(self.insert_validated_header(*header), IngestOutcome::Accepted) {
+                return IngestOutcome::Rejected("checkpoint header insertion failed");
+            }
+        }
+        if self.chain.set_finalized(checkpoint.block_hash).is_err() {
+            return IngestOutcome::Rejected("checkpoint finality mark failed");
+        }
+        self.sync_state_finality();
+        IngestOutcome::Accepted
     }
 
     fn ingest_block(&mut self, header: BlockHeader, body: BlockBody) -> IngestOutcome {
@@ -2453,12 +2515,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> TxPool for NodeAdapter<P, V> {
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V> {
+    fn finalized_checkpoint(&self) -> Option<Checkpoint> {
+        self.finality.latest().copied()
+    }
+
     // #362: the real tally's stored variants — what the boundary re-push sends.
     fn checkpoint_variants_at(&self, height: u64) -> Vec<(Checkpoint, Vec<Vote>)> {
         self.tally.variants_at(height)
     }
 
-    fn ingest_checkpoint_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> VotesOutcome {
+    fn ingest_checkpoint_votes_from(
+        &mut self,
+        cp: &Checkpoint,
+        votes: &[Vote],
+        explicitly_requested: bool,
+    ) -> VotesOutcome {
         let id = checkpoint_id(cp);
         if self.seen_checkpoints.contains(&id) {
             return VotesOutcome::Stale; // already finalized this variant
@@ -2532,7 +2603,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
             (committee, cstate.quorum_threshold(), active_kept, excluded_idx, rejects)
         };
 
-        let added = self.tally.add(cp, &active_kept, finalized, tip);
+        let added = if explicitly_requested && active_kept.len() >= quorum {
+            self.tally.add_requested_complete(cp, &active_kept, quorum, finalized, tip)
+        } else {
+            self.tally.add(cp, &active_kept, finalized, tip)
+        };
         let variants = self.tally.variant_count(cp.height);
         if !added.grew {
             // Nothing new — still a message this round received, and the roster
@@ -2725,6 +2800,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> CommitteeControl for NodeAdapter<P, V>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use qlab_devnet::committee::devnet_committee;
     use qlab_devnet::fees::{posted_fee, ArityBucket};
     use qlab_devnet::params_devnet::BOND_AMOUNT;
@@ -2739,6 +2818,22 @@ mod tests {
     impl TxVerifier for MockVerifier {
         fn verify_tx(&self, entry: &TxEntry) -> bool {
             entry.proof == b"ok"
+        }
+    }
+
+    #[derive(Clone)]
+    struct CountingPow {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PowEngine for CountingPow {
+        fn name(&self) -> &'static str {
+            "counting-keccak"
+        }
+
+        fn pow_hash(&self, header: &BlockHeader, seed: &[u8]) -> Hash32 {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            KeccakPow.pow_hash(header, seed)
         }
     }
 
@@ -3033,6 +3128,112 @@ mod tests {
                 (h, body)
             })
             .collect()
+    }
+
+    /// QUM-115's trust boundary in one caliper: only the span whose frontier is
+    /// named by a locally verified quorum omits PoW. Above the checkpoint and on a
+    /// sibling below it, the ordinary verifier still runs; without a verified
+    /// quorum the special admission path is closed entirely.
+    #[test]
+    fn checkpoint_span_skips_only_attested_main_chain_pow() {
+        let (cstate, validators) = committee7();
+        let mut proposer =
+            NodeAdapter::new(cstate.clone(), KeccakPow, MockVerifier, easy_sim());
+        let blocks = mine_chain(&mut proposer, 4);
+        let checkpoint = Checkpoint::new(
+            3,
+            blocks[2].0.header_hash(),
+            blocks[2].0.header_hash(),
+        );
+        let votes: Vec<Vote> = validators[..5]
+            .iter()
+            .map(|validator| validator.sign_checkpoint(&checkpoint))
+            .collect();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut joiner = NodeAdapter::new(
+            cstate.clone(),
+            CountingPow { calls: Arc::clone(&calls) },
+            MockVerifier,
+            easy_sim(),
+        );
+        assert!(matches!(
+            joiner.ingest_requested_checkpoint_votes(&checkpoint, &votes),
+            VotesOutcome::Learned { finalized: true, .. }
+        ));
+        assert_eq!(joiner.chain().finalized_height(), None, "the block is not held yet");
+        assert_eq!(
+            joiner.ingest_finalized_headers(&blocks[..3].iter().map(|b| b.0).collect::<Vec<_>>()),
+            IngestOutcome::Accepted
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 0, "PoW/LWMA/seed skipped below h_f");
+        assert_eq!(joiner.chain().finalized_height(), Some(3));
+
+        let mut wrong_body = blocks[0].1.clone();
+        wrong_body.coinbase = wrong_body.coinbase.saturating_add(1);
+        assert_eq!(
+            joiner.ingest_block(blocks[0].0, wrong_body),
+            IngestOutcome::Rejected("body does not match header commitment"),
+            "checkpoint admission does not weaken header/body binding"
+        );
+
+        assert_eq!(joiner.ingest_header(blocks[3].0), IngestOutcome::Accepted);
+        assert_eq!(calls.load(Ordering::Relaxed), 1, "above h_f runs full PoW");
+
+        let genesis = *joiner
+            .chain()
+            .header(&joiner.chain().genesis_block_hash())
+            .expect("genesis");
+        let mut sibling = BlockHeader::child_of(
+            &genesis,
+            genesis.timestamp + 2,
+            genesis.difficulty,
+            [0xA5; 32],
+        );
+        while qlab_devnet::pow::satisfies_target(
+            &KeccakPow.pow_hash(&sibling, &joiner.chain().genesis_block_hash()),
+            sibling.difficulty,
+        ) {
+            sibling.nonce = sibling.nonce.wrapping_add(1);
+        }
+        assert_eq!(
+            joiner.ingest_header(sibling),
+            IngestOutcome::Rejected("invalid header: pow"),
+            "a below-finality sibling is not checkpoint-amnestied"
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 2, "the sibling ran full PoW");
+        assert!(joiner.chain().header(&sibling.header_hash()).is_none());
+
+        let unverified_calls = Arc::new(AtomicUsize::new(0));
+        let mut unverified = NodeAdapter::new(
+            cstate,
+            CountingPow { calls: Arc::clone(&unverified_calls) },
+            MockVerifier,
+            easy_sim(),
+        );
+        let forged_checkpoint = Checkpoint::new(3, [0xEE; 32], [0xEE; 32]);
+        let forged_votes: Vec<Vote> = validators[..5]
+            .iter()
+            .map(|validator| validator.sign_checkpoint(&forged_checkpoint))
+            .collect();
+        assert!(
+            matches!(
+                unverified.ingest_requested_checkpoint_votes(&checkpoint, &forged_votes),
+                VotesOutcome::Invalid
+            ),
+            "quorum-many signatures over other bytes prove nothing"
+        );
+        assert_eq!(unverified.finalized_height(), None);
+        assert_eq!(
+            unverified.ingest_finalized_headers(&[blocks[0].0]),
+            IngestOutcome::Rejected("no verified finalized checkpoint")
+        );
+        assert_eq!(unverified.ingest_header(blocks[0].0), IngestOutcome::Accepted);
+        assert_eq!(
+            unverified_calls.load(Ordering::Relaxed),
+            1,
+            "without a quorum-verified checkpoint every header runs PoW"
+        );
     }
 
     /// A follower that has synced HEADERS for `blocks` and applied no body — the

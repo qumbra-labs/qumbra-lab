@@ -33,7 +33,10 @@ use crate::n1::{IngestOutcome, NodeState, VotesOutcome};
 use crate::peer::{NodeId, PeerId, PeerTable, VersionMsg};
 use crate::ratelimit::{RateKey, RateLimiter, RateLimits, RateStats};
 use crate::sendstall::stall_line;
-use crate::sync::{build_locator, answer_get_headers, SyncPhase, SyncState, MAX_HEADERS_PER_BATCH};
+use crate::sync::{
+    answer_get_headers, build_locator_with_frontier, SyncPhase, SyncState,
+    MAX_HEADERS_PER_BATCH,
+};
 use crate::ticktime::{lap, TickTimings};
 use qlab_devnet::finality::next_checkpoint_height;
 use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
@@ -146,6 +149,103 @@ pub const MAX_SERVED_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
 pub const MAX_BODIES_IN_FLIGHT: usize = 16;
 
+/// **The in-flight window a node uses while it is CATCHING UP** — more than
+/// [`CATCHUP_LAG_BLOCKS`] blocks of applied lag (lab #412 / QUM-115).
+///
+/// [`MAX_BODIES_IN_FLIGHT`]'s own arithmetic is for the steady state, and it
+/// says so: *"one request round completes in one round trip … 16 bodies against
+/// a block rate of one per 75 s"*. That ratio is what a node near the tip needs.
+/// A stranger joiner is not near the tip — after checkpoint sync it holds 12,400
+/// headers and no bodies — and there the same 16 is a ceiling on how much of the
+/// history can be in transit at once, so catch-up throughput is pinned to 16
+/// bodies per round trip no matter how much bandwidth, buffer or peer capacity
+/// is idle.
+///
+/// **96, and the number is the tightest of three caps rather than a guess.**
+/// Sized at the FROZEN v1.0 single-tx body (~145,754 B, #135's measurement),
+/// because a coinbase-only body makes every cap here unreachable and the
+/// interesting case is the chain that transacts:
+///
+/// | cap | value | a 96-body window |
+/// |---|---|---|
+/// | [`crate::adapter::MAX_PENDING_BODIES`] | 512 entries | 96, 19 % |
+/// | [`crate::adapter::MAX_PENDING_BODY_BYTES`] | 32 MiB | 14.0 MB, 58 % margin |
+/// | [`crate::ratelimit::BYTE_BURST`] (our own inbound) | 16 MiB | 14.0 MB, 16 % margin |
+///
+/// The third row is the binding one and it is the row this constant exists for.
+/// The requester paces itself on the FRAME axis (see
+/// [`P2pNode::request_missing_bodies`]), and a window whose answers could land
+/// inside one byte-burst would reintroduce the very defect that pacing fixes,
+/// one axis over: a body dropped for bytes is dropped exactly as silently as one
+/// dropped for frames. 16 MiB ÷ 145,754 B is 115 bodies, so 96 — the largest
+/// multiple of [`MAX_BODIES_PER_GETDATA`] that keeps real margin — is the
+/// answer, and 128 (18.7 MB) would have been over it.
+///
+/// The first two rows matter for a different reason: over a pending cap
+/// `buffer_body` evicts the HIGHEST held entry, i.e. exactly the bodies a
+/// catch-up just fetched, and the requester would re-ask for them — fetch, drop,
+/// re-fetch, forever. A full window cannot reach either cap by construction.
+///
+/// **Width is not what sets catch-up throughput** — the inbound frame budget is
+/// (see [`crate::ratelimit::MSG_REFILL_PER_SEC`], 64/s per rate key), so this
+/// number only has to be wide enough that the window is never the binding
+/// constraint. At the Phase B-WAN RTT baseline (68–223 ms) 96 bodies in flight
+/// is 430–1,400 bodies/s of capacity against a 4-peer budget of 256/s.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_BODIES_IN_FLIGHT_CATCHUP: usize = 96;
+
+/// **Applied lag above which the catch-up window replaces the steady one**
+/// (lab #412 / QUM-115).
+///
+/// 64 blocks is 80 minutes at the 75 s target block time — far past any lag
+/// ordinary relay jitter, a reorg, or a brief disconnect produces, and far short
+/// of the thousands a joiner carries. Below it a node is *keeping up* and
+/// [`MAX_BODIES_IN_FLIGHT`]'s reasoning applies unchanged; above it the node is
+/// *catching up*, which is a different job with a different bound.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const CATCHUP_LAG_BLOCKS: u64 = 64;
+
+/// **Inbound frames left unasked-for on each rate key** — the headroom the body
+/// requester never spends (lab #412 / QUM-115).
+///
+/// The requester paces its asks against its own inbound frame budget (see
+/// [`crate::ratelimit::RateLimiter::frame_headroom`]). Spending the budget down
+/// to zero would make bodies crowd out everything else arriving from that host —
+/// headers, announces, checkpoint votes, `Pong` — and those drops are exactly as
+/// silent. 32 frames is half a second of [`crate::ratelimit::MSG_REFILL_PER_SEC`]
+/// held back for traffic this node did not ask for.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const BODY_ASK_FRAME_HEADROOM: u64 = 32;
+
+/// The in-flight body window for a node whose applied state is `lag` blocks
+/// behind its own fork-choice tip — [`MAX_BODIES_IN_FLIGHT`] near the tip,
+/// [`MAX_BODIES_IN_FLIGHT_CATCHUP`] while catching up.
+///
+/// One function, read by the requester and by the `BODYWAIT` observation, so the
+/// window a node uses and the window its instrument reports cannot drift apart.
+/// One outstanding historical-body request: when it went out, and to whom.
+///
+/// The peer is not bookkeeping. The requester subtracts the asks a rate key
+/// already owes it from that key's remaining inbound frame budget, and without
+/// the peer on the record there is no way to attribute an in-flight ask to a
+/// key. See [`P2pNode::request_missing_bodies`].
+#[derive(Clone, Copy, Debug)]
+struct BodyReq {
+    sent_ms: u64,
+    peer: PeerId,
+}
+
+pub const fn body_window_for(lag: u64) -> usize {
+    if lag > CATCHUP_LAG_BLOCKS {
+        MAX_BODIES_IN_FLIGHT_CATCHUP
+    } else {
+        MAX_BODIES_IN_FLIGHT
+    }
+}
+
 /// **How long an unanswered body request is held before it may be re-asked**
 /// (issue #130 (c)).
 ///
@@ -170,7 +270,11 @@ pub const BODY_REQUEST_TIMEOUT_MS: u64 = 15_000;
 /// actively wrong, because the receiving side scores it ([`PENALTY_WELSHED_INV`]).
 ///
 /// Matched to [`MAX_BODIES_IN_FLIGHT`] so an honest requester at its own cap is
-/// never truncated by ours.
+/// never truncated by ours — and since QUM-115 that invariant is held from the
+/// REQUEST side too: a catch-up window of [`MAX_BODIES_IN_FLIGHT_CATCHUP`] is
+/// sent as several `GetData` messages of at most this many items each, never one
+/// oversize inv. That keeps this cap binding exactly as it did against every
+/// peer, including one running an image that predates the wider window.
 ///
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
 pub const MAX_BODIES_PER_GETDATA: usize = 16;
@@ -201,6 +305,17 @@ pub const CHECKPOINT_QUERY_INTERVAL_MS: u64 = 5_000;
 ///
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
 pub const MAX_CHECKPOINT_QUERIES_IN_FLIGHT: usize = 1;
+
+/// Maximum quorum-attested headers held outside [`crate::n1::ChainView`] while a
+/// joiner proves the span reaches its fetched finalized checkpoint.
+///
+/// A header is exactly 98 encoded bytes, so 65,536 entries cap canonical header
+/// bytes at 6,422,528 bytes (6.125 MiB), while covering more than seven times the
+/// 8,640-block live-history gate that motivated checkpoint sync. A checkpoint
+/// farther ahead falls back to ordinary full-PoW sync without allocating.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_CHECKPOINT_SYNC_HEADERS: usize = 65_536;
 
 /// **How far this node's own chain must run past a checkpoint slot it has not
 /// finalized before it asks the net about it** (issue #204), in blocks.
@@ -260,6 +375,81 @@ impl AskRecord {
         Self { first_ms: now_ms, last_ask_ms: now_ms, ..Self::default() }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointQueryKind {
+    CatchUp,
+    Eager,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CheckpointQuery {
+    sent_ms: u64,
+    peer: PeerId,
+    kind: CheckpointQueryKind,
+}
+
+/// A contiguous, structurally checked header span held outside the validated
+/// chain until its frontier hash matches the quorum-attested checkpoint.
+struct CheckpointSync {
+    checkpoint: Checkpoint,
+    /// Routing hint only — the peer whose bytes most recently extended the
+    /// frontier, preferred by [`P2pNode::tallest_ready_peer`] so one connection
+    /// keeps serving the span. Never a validation gate: the buffer is validated
+    /// by hash linkage, so ANY peer may extend it (the live 2026-08-15 run
+    /// proved a per-peer session just thrashes at `first=1` in a 4-peer mesh).
+    serving_peer: PeerId,
+    base_hash: Hash32,
+    base_height: u64,
+    base_timestamp: u64,
+    headers: Vec<BlockHeader>,
+    /// Consecutive zero-advance `Headers` batches; see
+    /// [`MAX_CHECKPOINT_SYNC_STALLED_BATCHES`].
+    stalled_batches: u32,
+}
+
+impl CheckpointSync {
+    fn frontier_hash(&self) -> Hash32 {
+        self.headers.last().map_or(self.base_hash, BlockHeader::header_hash)
+    }
+
+    fn frontier_height(&self) -> u64 {
+        self.headers.last().map_or(self.base_height, |header| header.height)
+    }
+
+    fn frontier_timestamp(&self) -> u64 {
+        self.headers.last().map_or(self.base_timestamp, |header| header.timestamp)
+    }
+}
+
+enum CheckpointHeaderOutcome {
+    /// Extended the buffered frontier (structural checks only; PoW deferred to
+    /// the span's admission).
+    Buffered,
+    /// The frontier reached the checkpoint height, hashed to the attested block,
+    /// and the whole span entered the validated chain PoW-skipped.
+    Admitted,
+    /// Not for the buffer and not for the validated chain: a duplicate, stale,
+    /// or non-linking header at or below the checkpoint height. Ignored without
+    /// penalty — honest peers produce these through async batch races (a second
+    /// peer answering an older locator, a replayed continuation).
+    Dropped,
+    /// Above the session's checkpoint: the ordinary full-validation path owns it.
+    AboveCheckpoint,
+    /// Checkpoint sync is over (admission failure, provable mismatch, or a
+    /// stalled-out session); the caller falls back to ordinary full-PoW ingest.
+    Fallback,
+}
+
+/// Consecutive `Headers` batches that carried at-or-below-checkpoint headers yet
+/// did not advance the buffered frontier before the session stalls out to the
+/// full-PoW fallback. A poisoned frontier (a crafted header that links but is not
+/// the finalized chain's block) makes every honest continuation non-linking — the
+/// mismatch only becomes provable at the checkpoint height, which such a feed
+/// never reaches, so convergence has to be enforced as progress-or-die. Honest
+/// async races cost one round each and reset on every advance; eight consecutive
+/// dead rounds is a feed that is not converging.
+const MAX_CHECKPOINT_SYNC_STALLED_BATCHES: u32 = 8;
 
 /// One cached body: the ordered txs, the coinbase counter and the payout key —
 /// all three are needed to rebuild the *exact* body (issue #101) — plus the
@@ -390,14 +580,14 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// connection, so dropping and redialling does not hand out a fresh budget.
     limiter: RateLimiter,
     /// **Historical body requests we have outstanding** (issue #130 (c)): block
-    /// hash → the `now_ms` the ask was sent at. Bounded by
-    /// [`MAX_BODIES_IN_FLIGHT`]; an entry older than [`BODY_REQUEST_TIMEOUT_MS`] is
-    /// dropped so the hash may be asked again, of a different peer.
+    /// hash → when the ask was sent and to whom. Bounded by [`body_window_for`];
+    /// an entry older than [`BODY_REQUEST_TIMEOUT_MS`] is dropped so the hash may
+    /// be asked again, of a different peer.
     ///
     /// It is also the list [`Self::on_not_found`] reads: an ask WE originated that a
     /// peer cannot serve is not a welshed inv, and without this set there is no way
     /// to tell those two apart.
-    body_reqs: HashMap<Hash32, u64>,
+    body_reqs: HashMap<Hash32, BodyReq>,
     /// **What each body request has been answered with, and for how long it has
     /// been wanted** (issue #229) — observation only, never read by any decision.
     ///
@@ -429,7 +619,7 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// the unobtainable-body exemption keys on exhaustion, not on lag alone.
     body_fetch_progress: bool,
     /// **Finalized-checkpoint queries we have outstanding** (issue #204): query id
-    /// → the `now_ms` the ask was sent at. Bounded by
+    /// → send time, peer, and whether this is checkpoint-sync's eager query. Bounded by
     /// [`MAX_CHECKPOINT_QUERIES_IN_FLIGHT`]; an entry older than
     /// [`CHECKPOINT_QUERY_INTERVAL_MS`] is dropped so the question may be asked
     /// again, of a different peer.
@@ -438,10 +628,21 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// a peer that holds nothing above our finalized head answers `NotFound`
     /// honestly, and so does every node running an image that predates this query.
     /// Scoring either would ban honest peers — #130 (c)'s finding, in a new place.
-    cp_queries: HashMap<Hash32, u64>,
+    cp_queries: HashMap<Hash32, CheckpointQuery>,
     /// Rotation cursor for the peer a query is sent to, so one peer that cannot or
     /// will not answer costs one interval rather than the whole recovery.
     cp_query_rr: usize,
+    /// Whether the one eager latest-checkpoint response for this sync run has
+    /// been answered. Silence is retried on the ordinary query cadence; any answer
+    /// completes the attempt, with stale/lower/refused evidence harmlessly leaving
+    /// a smaller (possibly empty) skip span and full PoW as the fallback.
+    eager_checkpoint_done: bool,
+    /// Quorum-attested headers waiting for their frontier match. This is outside
+    /// the node state's validated [`ChainView`] by construction.
+    checkpoint_sync: Option<CheckpointSync>,
+    /// Set after a frontier/structural failure so the same fetched checkpoint
+    /// cannot repeatedly re-arm buffering; subsequent headers take full PoW.
+    checkpoint_sync_fallback: bool,
     /// **The joiner drill's mutation switch** (issue #371 S5): when `false`,
     /// `GetData(Block)` is answered header-only — byte-for-byte the pre-#182
     /// wire behaviour — so the in-suite drill can demonstrate that with
@@ -487,6 +688,9 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             body_fetch_progress: false,
             cp_queries: HashMap::new(),
             cp_query_rr: 0,
+            eager_checkpoint_done: false,
+            checkpoint_sync: None,
+            checkpoint_sync_fallback: false,
             serve_historical_bodies: true,
             last_tick: TickTimings::default(),
             send_ns: std::cell::Cell::new(0),
@@ -1044,9 +1248,13 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             timings.dispatch += lap(&mut t);
         }
+        // Ask for a recent finalized checkpoint before the first header request.
+        // An honest peer then queues the quorum evidence ahead of its Headers
+        // response, letting a fresh joiner establish the checkpoint before it
+        // encounters the RandomX-heavy historical burst.
+        self.request_finalized_checkpoint(now_ms);
         self.maybe_start_sync();
         self.request_missing_bodies(now_ms);
-        self.request_finalized_checkpoint(now_ms);
         // Issue #200: after (re)issuing asks, hand the duty-gate exemption the
         // facts it keys on — outstanding asks + whether any ask was satisfied
         // this tick. Progress is cleared for the next tick so a single delivery
@@ -1132,9 +1340,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// answer; the short version is that a new `MsgType` would be banned on sight by
     /// every node running the current image.
     ///
-    /// Four bounds, all named constants:
+    /// Five bounds, all named constants:
     ///
-    /// 1. [`MAX_BODIES_IN_FLIGHT`] outstanding asks at once;
+    /// 1. [`body_window_for`] outstanding asks at once — [`MAX_BODIES_IN_FLIGHT`]
+    ///    near the tip, [`MAX_BODIES_IN_FLIGHT_CATCHUP`] while catching up;
     /// 2. one ask per hash per [`BODY_REQUEST_TIMEOUT_MS`];
     /// 3. the ask set itself is bounded and shrinking —
     ///    [`crate::n1::ChainView::missing_body_hashes`] returns only main-chain
@@ -1142,7 +1351,55 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     ///    held, so **it empties as the state machine advances and the node stops
     ///    asking**. That is the termination argument, and it is the node state's
     ///    guarantee rather than a timer here;
-    /// 4. nothing is asked with no ready peer to ask.
+    /// 4. nothing is asked with no ready peer to ask;
+    /// 5. 🔴 **nothing is asked that this node's own inbound limiter would then
+    ///    drop** — see below.
+    ///
+    /// ## Asking for no more than we can receive (lab #412 / QUM-115)
+    ///
+    /// [`crate::ratelimit`] sits ahead of decode in [`Self::tick`], by #91's
+    /// decision 2, and it does not know a frame is an answer to our own ask —
+    /// nothing does, that early. So a body we requested is dropped like any other
+    /// frame over budget: silently, unscored, and **indistinguishable from a peer
+    /// that never answered**. The ask then stands until [`BODY_REQUEST_TIMEOUT_MS`],
+    /// and because the window was full the requester has nothing else it may ask
+    /// for — the whole pipeline stops for a full re-ask interval.
+    ///
+    /// That is not a hypothesis. On the #371 joiner drill (2,500 blocks, three
+    /// loopback servers, which share ONE rate key because they share a host) the
+    /// applied tip advanced in ~260-block bursts separated by 15.0 s of nothing:
+    /// a 256-frame burst budget spent, ~12 answers dropped, then dead air until
+    /// the timeout. 15.9 blk/s. The same run with only the joiner's inbound frame
+    /// budget lifted: 77.6 blk/s, zero throttled frames, no dead air.
+    ///
+    /// The fix is on this side rather than in the limiter, and that is the point:
+    /// #91's budget stays exactly where it is, and the traffic it was dropping is
+    /// traffic this node now never asks for. Two terms are subtracted from a key's
+    /// [`crate::ratelimit::RateLimiter::frame_headroom`] before anything is asked
+    /// of the peers behind it:
+    ///
+    /// - [`BODY_ASK_FRAME_HEADROOM`], so bodies never crowd out the traffic this
+    ///   node did not ask for (headers, votes, announces);
+    /// - **the asks already owed by that key** — every in-flight request will
+    ///   consume a frame of the same budget when it lands. Without this term the
+    ///   requester re-reads an un-spent budget on every tick and over-asks by the
+    ///   number of ticks a round trip takes, which is the drop it is avoiding.
+    ///
+    /// Peers sharing a host share the key and therefore share the allowance,
+    /// which is correct: it is one bucket, and it is the bucket the answers will
+    /// be charged against.
+    ///
+    /// 🔴 **This paces the FRAME axis only.** [`Self::tick`] charges each frame
+    /// against a byte budget as well ([`crate::ratelimit::BYTE_BURST`] /
+    /// [`crate::ratelimit::BYTE_REFILL_PER_SEC`]), and a body dropped for bytes
+    /// is dropped exactly as silently. It is not paced here because the answer's
+    /// size is not known when the ask goes out — a body is anywhere from tens of
+    /// bytes to ~145 kB per transaction. It is handled instead by sizing the
+    /// window so a full one cannot fill the byte burst; the arithmetic is at
+    /// [`MAX_BODIES_IN_FLIGHT_CATCHUP`], and it is what makes that constant 96
+    /// rather than 128. A chain whose blocks carry several proof-bearing
+    /// transactions each would put the byte axis back in play, and the honest
+    /// place to fix that is here, with the observed body size.
     ///
     /// **No reply is not a fault.** A peer that never applied a block genuinely
     /// cannot serve it, and on a mixed-version net it will answer with a header
@@ -1151,7 +1408,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// body that does not match the header's `tx_body_commitment`.
     fn request_missing_bodies(&mut self, now_ms: u64) {
         self.body_reqs
-            .retain(|_, sent| now_ms.saturating_sub(*sent) < BODY_REQUEST_TIMEOUT_MS);
+            .retain(|_, req| now_ms.saturating_sub(req.sent_ms) < BODY_REQUEST_TIMEOUT_MS);
         // Issue #229, observation only: prune the ask ledger to what is either in
         // flight or within one full re-ask cycle of having been. The grace window is
         // what lets a record survive the expiry above and the re-insert below —
@@ -1159,7 +1416,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // every 15 s, which is exactly the number the incident needed and did not
         // have. Nothing here is read by the requester.
         self.prune_body_asks(now_ms);
-        let room = MAX_BODIES_IN_FLIGHT.saturating_sub(self.body_reqs.len());
+        let window = body_window_for(self.node.state_lag_blocks());
+        let room = window.saturating_sub(self.body_reqs.len());
         if room == 0 {
             return;
         }
@@ -1169,7 +1427,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
         let wanted: Vec<Hash32> = self
             .node
-            .missing_body_hashes(MAX_BODIES_IN_FLIGHT)
+            .missing_body_hashes(window)
             .into_iter()
             .filter(|h| !self.body_reqs.contains_key(h))
             .take(room)
@@ -1177,15 +1435,52 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         if wanted.is_empty() {
             return;
         }
+        // The rate key each candidate peer's answers will be charged against, and
+        // what each key already owes us. Both are read before the limiter is
+        // touched, because `rate_key` borrows the transport and `frame_headroom`
+        // borrows the limiter mutably.
+        let keys: Vec<RateKey> = peers.iter().map(|p| self.rate_key(*p)).collect();
+        let mut owed: HashMap<RateKey, u64> = HashMap::new();
+        for req in self.body_reqs.values() {
+            *owed.entry(self.rate_key(req.peer)).or_insert(0) += 1;
+        }
+        let mut allowance: HashMap<RateKey, u64> = HashMap::new();
+        for key in &keys {
+            if allowance.contains_key(key) {
+                continue; // peers sharing a host share the bucket, and the allowance
+            }
+            let free = self.limiter.frame_headroom(key, now_ms);
+            let owed_here = owed.get(key).copied().unwrap_or(0);
+            allowance.insert(
+                key.clone(),
+                free.saturating_sub(BODY_ASK_FRAME_HEADROOM).saturating_sub(owed_here),
+            );
+        }
         // Grouped through a peer-ordered Vec rather than a map: the send order must
         // be a function of the peer list alone, or the in-process sims stop being
         // reproducible byte-for-byte (the M9-N7 property).
         let n = peers.len();
         let mut batches: Vec<Vec<InvItem>> = vec![Vec::new(); n];
         for (i, id) in wanted.iter().enumerate() {
-            let slot = (self.body_rr + i) % n;
+            // The rotation is unchanged; what is new is stepping past a peer whose
+            // key has no allowance left. A hash that finds no peer with budget is
+            // simply not asked for this tick — it stays in the ask set, costs no
+            // in-flight slot, and is asked as soon as the bucket refills. Nothing
+            // is scored: a full bucket is our limit, not a peer's fault.
+            let mut chosen = None;
+            for step in 0..n {
+                let cand = (self.body_rr + i + step) % n;
+                if allowance.get(&keys[cand]).copied().unwrap_or(0) > 0 {
+                    chosen = Some(cand);
+                    break;
+                }
+            }
+            let Some(slot) = chosen else { break };
+            if let Some(left) = allowance.get_mut(&keys[slot]) {
+                *left -= 1;
+            }
             batches[slot].push(InvItem { kind: InvKind::Block, id: *id });
-            self.body_reqs.insert(*id, now_ms);
+            self.body_reqs.insert(*id, BodyReq { sent_ms: now_ms, peer: peers[slot] });
             // Issue #229: record WHICH peer this rung of the ladder went to, so an
             // unanswered ask is attributable to a peer rather than to the net. The
             // slot arithmetic is read, never changed — `peers` and `batches` are
@@ -1195,8 +1490,15 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
         self.body_rr = self.body_rr.wrapping_add(1);
         for (pid, items) in peers.into_iter().zip(batches) {
-            if !items.is_empty() {
-                self.send(pid, MsgType::GetData, encode_inv(&items));
+            // Chunked at [`MAX_BODIES_PER_GETDATA`] so a catch-up-width batch is
+            // never truncated by an honest server: that constant is the *serving*
+            // side's per-message cap, and items past it are answered header-only.
+            // Splitting keeps the invariant its doc states — "an honest requester
+            // at its own cap is never truncated by ours" — true for a requester
+            // whose window is now wider than one message, including against every
+            // peer running an image that predates this change.
+            for chunk in items.chunks(MAX_BODIES_PER_GETDATA) {
+                self.send(pid, MsgType::GetData, encode_inv(chunk));
             }
         }
     }
@@ -1304,11 +1606,24 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// this query. Nothing on this path is scored.
     fn request_finalized_checkpoint(&mut self, now_ms: u64) {
         self.cp_queries
-            .retain(|_, sent| now_ms.saturating_sub(*sent) < CHECKPOINT_QUERY_INTERVAL_MS);
+            .retain(|_, query| {
+                now_ms.saturating_sub(query.sent_ms) < CHECKPOINT_QUERY_INTERVAL_MS
+            });
         if self.cp_queries.len() >= MAX_CHECKPOINT_QUERIES_IN_FLIGHT {
             return;
         }
-        let Some(at_or_below) = self.checkpoint_query_target() else {
+        let best = self.peers.best_height();
+        let eager = !self.eager_checkpoint_done
+            && self.checkpoint_sync.is_none()
+            && !self.checkpoint_sync_fallback
+            && best.is_some_and(|height| height > self.node.tip_height());
+        let (at_or_below, kind) = if eager {
+            // Existing #204 query semantics: the maximum bound asks the peer for
+            // the latest finalized checkpoint it holds. No new codepoint or payload.
+            (u64::MAX, CheckpointQueryKind::Eager)
+        } else if let Some(target) = self.checkpoint_query_target() {
+            (target, CheckpointQueryKind::CatchUp)
+        } else {
             return;
         };
         let id = checkpoint_query_id(at_or_below);
@@ -1321,7 +1636,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
         let pid = peers[self.cp_query_rr % peers.len()];
         self.cp_query_rr = self.cp_query_rr.wrapping_add(1);
-        self.cp_queries.insert(id, now_ms);
+        self.cp_queries.insert(id, CheckpointQuery { sent_ms: now_ms, peer: pid, kind });
         self.send(pid, MsgType::GetData, encode_inv(&[InvItem { kind: InvKind::Checkpoint, id }]));
     }
 
@@ -1478,6 +1793,12 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         self.count_unknown_inv(&inv);
+        let eager_not_found = inv.items.iter().find_map(|item| {
+            self.cp_queries.get(&item.id).and_then(|query| {
+                (query.peer == from && query.kind == CheckpointQueryKind::Eager)
+                    .then_some(item.id)
+            })
+        });
         // Issue #229, before the scoring decision and independent of it: a
         // `NotFound` for a hash we asked for is **the peer's answer**, and it is one
         // of the three readings that separate layer (b) from (a) and (c). It says
@@ -1502,6 +1823,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             .any(|it| !self.body_reqs.contains_key(&it.id) && !self.cp_queries.contains_key(&it.id))
         {
             self.peers.penalize(from, PENALTY_WELSHED_INV);
+        }
+        if let Some(id) = eager_not_found {
+            self.cp_queries.remove(&id);
+            self.eager_checkpoint_done = true;
         }
     }
 
@@ -1719,6 +2044,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // out, which is what "nobody is serving me" and "nobody is answering me"
         // both look like.
         self.note_body_answer(&id, from, BodyAnswer::HeaderOnly);
+        // While a checkpoint-sync session accumulates, a relayed header at or
+        // below its checkpoint belongs to the buffer EXCLUSIVELY — the validated
+        // chain must not grow a competing below-finality path beside it. Above
+        // the checkpoint, the ordinary path (including its orphan sync-kick,
+        // which re-drives the GetHeaders loop) is unchanged.
+        if self.checkpoint_sync.is_some() {
+            match self.ingest_checkpoint_sync_header(from, header) {
+                CheckpointHeaderOutcome::Buffered
+                | CheckpointHeaderOutcome::Admitted
+                | CheckpointHeaderOutcome::Dropped => return,
+                CheckpointHeaderOutcome::Fallback | CheckpointHeaderOutcome::AboveCheckpoint => {}
+            }
+        }
         let outcome = self.node.ingest_header(header);
         if outcome.is_peer_fault() {
             self.peers.penalize(from, PENALTY_INVALID_OBJECT);
@@ -1753,7 +2091,25 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return;
             }
         };
-        self.absorb_votes(from, cp, votes);
+        // A Checkpoint response does not echo its GetData query id. Bind the
+        // ahead-of-tip bypass to the peer we explicitly asked; unsolicited
+        // checkpoint messages, including one racing from another peer, keep the
+        // ordinary tally window.
+        let eager_query = self
+            .cp_queries
+            .iter()
+            .find(|(_, query)| {
+                query.peer == from && query.kind == CheckpointQueryKind::Eager
+            })
+            .map(|(id, _)| *id);
+        if let Some(id) = eager_query {
+            self.cp_queries.remove(&id);
+            // One response completes the eager attempt. A stale/lower, partial,
+            // or invalid answer simply leaves header sync on full PoW; it must not
+            // turn into a repeated ~70 KiB query loop while the joiner is busy.
+            self.eager_checkpoint_done = true;
+        }
+        self.absorb_votes(from, cp, votes, eager_query.is_some());
     }
 
     /// Handle a `CheckpointVotes` (0x0024) partial set — the accumulation path
@@ -1767,19 +2123,41 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return;
             }
         };
-        self.absorb_votes(from, cp, votes);
+        self.absorb_votes(from, cp, votes, false);
     }
 
     /// Shared body for both checkpoint-vote message types: run equivocation
     /// observation, feed the tally, then relay/score by [`VotesOutcome`].
-    fn absorb_votes(&mut self, from: PeerId, cp: Checkpoint, votes: Vec<Vote>) {
+    fn absorb_votes(
+        &mut self,
+        from: PeerId,
+        cp: Checkpoint,
+        votes: Vec<Vote>,
+        explicitly_requested: bool,
+    ) {
         // Equivocation path: a set's votes may reveal a signer that already signed a
         // conflicting checkpoint at this slot. Detect it, tombstone locally, and gossip
         // the evidence BEFORE the tally counts, so a tombstoned vote cannot reach quorum.
         for ev in self.node.observe_votes(&cp, &votes) {
             self.punish_and_gossip_evidence(ev);
         }
-        match self.node.ingest_checkpoint_votes(&cp, &votes) {
+        let outcome = if explicitly_requested {
+            self.node.ingest_requested_checkpoint_votes(&cp, &votes)
+        } else {
+            self.node.ingest_checkpoint_votes(&cp, &votes)
+        };
+        // A live joiner can learn and quorum-verify this exact checkpoint before
+        // its eager query response is dispatched (for example through another
+        // ready peer). The response then reports `Stale`: true, but too coarse to
+        // mean "unverified". Arm checkpoint-sync whenever THIS requested object
+        // either finalized now or is byte-for-byte the checkpoint the authoritative
+        // finality tracker already accepted. Height-only equality would be unsafe
+        // in the presence of two variants at one slot.
+        let arm_checkpoint_sync = explicitly_requested
+            && (matches!(outcome, VotesOutcome::Learned { finalized: true, .. })
+                || (matches!(outcome, VotesOutcome::Stale)
+                    && self.node.finalized_checkpoint() == Some(cp)));
+        match outcome {
             VotesOutcome::Learned { finalized, accumulated } => {
                 // Relay the accumulated set onward (sender excluded) — direct-push
                 // gossip converges the mesh; a well-formed partial is never penalised.
@@ -1798,6 +2176,51 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 }
             }
         }
+        if arm_checkpoint_sync {
+            self.eager_checkpoint_done = true;
+            self.begin_checkpoint_sync(cp, from);
+        }
+    }
+
+    fn begin_checkpoint_sync(&mut self, checkpoint: Checkpoint, peer: PeerId) {
+        // ONE accumulating session. Arming is not idempotent by accident: on the
+        // live box several eager responses for the same checkpoint raced the
+        // stalled dispatch loop, and every re-arm rebuilt the buffer at
+        // base=tip — which is exactly the `begin base=0` thrash the 2026-08-15
+        // run recorded. A session in flight is never restarted.
+        if self.checkpoint_sync.is_some() {
+            return;
+        }
+        if self.checkpoint_sync_fallback || checkpoint.height <= self.node.tip_height() {
+            return;
+        }
+        let span = checkpoint.height.saturating_sub(self.node.tip_height());
+        let Ok(capacity) = usize::try_from(span) else {
+            self.checkpoint_sync_fallback = true;
+            return;
+        };
+        if capacity > MAX_CHECKPOINT_SYNC_HEADERS {
+            self.checkpoint_sync_fallback = true;
+            return;
+        }
+        let base_hash = self.node.tip_hash();
+        let Some(base) = self.node.header(&base_hash) else {
+            self.checkpoint_sync_fallback = true;
+            return;
+        };
+        self.checkpoint_sync = Some(CheckpointSync {
+            checkpoint,
+            serving_peer: peer,
+            base_hash,
+            base_height: base.height,
+            base_timestamp: base.timestamp,
+            headers: Vec::with_capacity(capacity),
+            stalled_batches: 0,
+        });
+        println!(
+            "CHECKPOINT_SYNC event=begin_checkpoint_sync peer={} base={} checkpoint={} headers_cap={}",
+            peer.0, base.height, checkpoint.height, capacity
+        );
     }
 
     // --- committee: equivocation evidence gossip (M9-N5) ---
@@ -1885,6 +2308,26 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     }
 
     fn tallest_ready_peer(&self) -> Option<PeerId> {
+        if let Some(sync) = &self.checkpoint_sync {
+            if self.peers.is_ready(sync.serving_peer) {
+                return Some(sync.serving_peer);
+            }
+        }
+        // The eager Checkpoint GetData and the first GetHeaders must use one
+        // connection. TCP then guarantees that the server handles the quorum
+        // evidence before the historical header burst. Picking independently
+        // among tied-height peers made that ordering a scheduler race: release
+        // CI could finish ordinary PoW sync from peer B before peer A's
+        // checkpoint response was observed.
+        if let Some(peer) = self
+            .cp_queries
+            .values()
+            .find(|query| query.kind == CheckpointQueryKind::Eager)
+            .map(|query| query.peer)
+            .filter(|peer| self.peers.is_ready(*peer))
+        {
+            return Some(peer);
+        }
         self.peers
             .ready_peers()
             .into_iter()
@@ -1897,10 +2340,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         if !self.peers.is_ready(peer) {
             return;
         }
-        let loc = build_locator(&self.node);
+        // A retarget (peer drop, orphan announce kick, taller-peer pick) keeps
+        // the accumulating session and simply asks the new peer to continue from
+        // the buffered frontier — the locator carries the frontier hash, so an
+        // honest peer serves the next span. Destroying and re-arming the session
+        // here is what reset the live joiner to `base=0` on every retarget.
+        let frontier = self.checkpoint_sync.as_ref().map(CheckpointSync::frontier_hash);
+        let loc = build_locator_with_frontier(&self.node, frontier);
         self.send(peer, MsgType::GetHeaders, encode_locator(&loc));
-        self.sync.phase =
-            SyncPhase::AwaitingHeaders { peer, from_height: self.node.tip_height() };
+        let from_height = self
+            .checkpoint_sync
+            .as_ref()
+            .map_or(self.node.tip_height(), CheckpointSync::frontier_height);
+        self.sync.phase = SyncPhase::AwaitingHeaders { peer, from_height };
     }
 
     fn on_get_headers(&mut self, from: PeerId, payload: &[u8]) {
@@ -1925,7 +2377,29 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         };
         let batch_len = batch.len();
         let mut accepted = 0;
+        let mut buffered = 0;
+        let mut dropped = 0;
         for h in batch {
+            if self.checkpoint_sync.is_some() {
+                match self.ingest_checkpoint_sync_header(from, h) {
+                    CheckpointHeaderOutcome::Buffered | CheckpointHeaderOutcome::Admitted => {
+                        accepted += 1;
+                        buffered += 1;
+                        continue;
+                    }
+                    // A stale/duplicate/non-linking sub-checkpoint header: skip
+                    // it and keep scanning — the rest of the batch may still
+                    // extend the frontier.
+                    CheckpointHeaderOutcome::Dropped => {
+                        dropped += 1;
+                        continue;
+                    }
+                    CheckpointHeaderOutcome::Fallback => break,
+                    // Above the session's checkpoint: fall through to the
+                    // ordinary full-validation path below.
+                    CheckpointHeaderOutcome::AboveCheckpoint => {}
+                }
+            }
             let id = h.header_hash();
             match self.node.ingest_header(h) {
                 IngestOutcome::Accepted => {
@@ -1945,6 +2419,35 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         }
 
+        // Progress-or-die for the accumulating session: a batch that carried
+        // sub-checkpoint headers but advanced nothing was an async race the first
+        // few times and a non-converging feed after that. Every advance resets
+        // the count, so an honest sync can race forever; only a feed that never
+        // extends the frontier stalls out (see the constant's note for why the
+        // poisoned-frontier case cannot be detected any earlier than this).
+        if let Some(sync) = self.checkpoint_sync.as_mut() {
+            if buffered > 0 {
+                sync.stalled_batches = 0;
+                println!(
+                    "CHECKPOINT_SYNC event=extend peer={} frontier={} checkpoint={}",
+                    from.0,
+                    sync.frontier_height(),
+                    sync.checkpoint.height
+                );
+            } else if dropped > 0 {
+                sync.stalled_batches += 1;
+                if sync.stalled_batches >= MAX_CHECKPOINT_SYNC_STALLED_BATCHES {
+                    let checkpoint = sync.checkpoint.height;
+                    self.checkpoint_sync = None;
+                    self.checkpoint_sync_fallback = true;
+                    println!(
+                        "CHECKPOINT_SYNC event=fallback reason=stalled peer={} checkpoint={}",
+                        from.0, checkpoint
+                    );
+                }
+            }
+        }
+
         // Advance the state machine. `best` is read once: the same `None`/`Some(0)`
         // conflation fixed in `maybe_start_sync` (issue #106) was here too — a peer
         // that dropped mid-batch left `unwrap_or(0)`, hence `still_behind == false`,
@@ -1953,16 +2456,112 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         let still_behind = best.is_some_and(|b| b > self.node.tip_height());
         if batch_len == MAX_HEADERS_PER_BATCH && still_behind && accepted > 0 {
             // Full batch and more to go → request the next one.
-            let loc = build_locator(&self.node);
+            let frontier = self.checkpoint_sync.as_ref().map(CheckpointSync::frontier_hash);
+            let loc = build_locator_with_frontier(&self.node, frontier);
             self.send(from, MsgType::GetHeaders, encode_locator(&loc));
-            self.sync.phase =
-                SyncPhase::AwaitingHeaders { peer: from, from_height: self.node.tip_height() };
+            let from_height = self
+                .checkpoint_sync
+                .as_ref()
+                .map_or(self.node.tip_height(), CheckpointSync::frontier_height);
+            self.sync.phase = SyncPhase::AwaitingHeaders { peer: from, from_height };
         } else {
             self.sync.phase = match best {
                 None => SyncPhase::Unknown,
                 Some(_) if still_behind => SyncPhase::Behind,
                 Some(_) => SyncPhase::Synced,
             };
+        }
+    }
+
+    fn ingest_checkpoint_sync_header(
+        &mut self,
+        from: PeerId,
+        header: BlockHeader,
+    ) -> CheckpointHeaderOutcome {
+        let Some(sync) = self.checkpoint_sync.as_mut() else {
+            return CheckpointHeaderOutcome::Fallback;
+        };
+        if header.height > sync.checkpoint.height {
+            return CheckpointHeaderOutcome::AboveCheckpoint;
+        }
+        // The buffer is validated by hash linkage, so WHO carried the bytes is
+        // irrelevant — any peer may extend the frontier, and a header that does
+        // not extend it is an async race, not an attack: a second peer answering
+        // an older locator re-serves passed heights, a replayed continuation
+        // re-serves the same batch. Dropping those silently (no penalty, no
+        // session loss) is what lets a 4-peer mesh feed ONE accumulating span;
+        // treating them as faults is what wedged the live joiner at `first=1`.
+        let expected_height = sync.frontier_height().saturating_add(1);
+        if header.height != expected_height || header.prev != sync.frontier_hash() {
+            return CheckpointHeaderOutcome::Dropped;
+        }
+        if header.timestamp < sync.frontier_timestamp() {
+            // A LINKING header with a timestamp regression is provably not the
+            // finalized chain's block at this height (finalized history is
+            // non-decreasing), so the sender is at fault — but the session
+            // survives: another peer can still supply the true header here.
+            self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+            return CheckpointHeaderOutcome::Dropped;
+        }
+        if sync.headers.len() >= MAX_CHECKPOINT_SYNC_HEADERS {
+            // Defensive only: capacity was bounded at arming and linking growth
+            // stops exactly at the checkpoint height, but the buffer must never
+            // grow unbounded under any future drift.
+            self.checkpoint_sync = None;
+            self.checkpoint_sync_fallback = true;
+            return CheckpointHeaderOutcome::Fallback;
+        }
+        if sync.headers.is_empty() {
+            println!(
+                "CHECKPOINT_SYNC event=buffer peer={} first={} checkpoint={}",
+                from.0, header.height, sync.checkpoint.height
+            );
+        }
+        sync.headers.push(header);
+        sync.serving_peer = from;
+        if header.height < sync.checkpoint.height {
+            return CheckpointHeaderOutcome::Buffered;
+        }
+
+        if header.header_hash() != sync.checkpoint.block_hash {
+            // A fully linked span landing on the wrong hash at the checkpoint
+            // height is a forged chain. Only the peer that delivered this
+            // provably-wrong frontier header is attributable — an honest prefix
+            // served by another peer looks identical from here — so it alone is
+            // scored, and the ruled fallback applies: drop the buffer, full-PoW
+            // ascending sync from the validated tip.
+            let checkpoint = sync.checkpoint.height;
+            self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+            self.checkpoint_sync = None;
+            self.checkpoint_sync_fallback = true;
+            println!(
+                "CHECKPOINT_SYNC event=fallback reason=frontier-mismatch peer={} checkpoint={}",
+                from.0, checkpoint
+            );
+            return CheckpointHeaderOutcome::Fallback;
+        }
+
+        let sync = self.checkpoint_sync.take().expect("present above");
+        let admitted = sync.headers.len();
+        match self.node.ingest_finalized_headers(&sync.headers) {
+            IngestOutcome::Accepted => {
+                for buffered in sync.headers {
+                    self.seen.insert(buffered.header_hash());
+                }
+                println!(
+                    "CHECKPOINT_SYNC event=admit peer={} checkpoint={} headers={} pow=skipped",
+                    from.0, sync.checkpoint.height, admitted
+                );
+                CheckpointHeaderOutcome::Admitted
+            }
+            other => {
+                self.checkpoint_sync_fallback = true;
+                println!(
+                    "CHECKPOINT_SYNC event=fallback reason=admission-refused outcome={other:?} checkpoint={}",
+                    sync.checkpoint.height
+                );
+                CheckpointHeaderOutcome::Fallback
+            }
         }
     }
 
@@ -2337,6 +2936,401 @@ mod tests {
     fn stub() -> StubNode {
         let (committee, _v) = devnet_committee(7);
         StubNode::new(genesis(), CommitteeState::new(committee, BOND_AMOUNT))
+    }
+
+    #[test]
+    fn checkpoint_frontier_mismatch_is_scored_and_falls_back_without_admission() {
+        let hub = InProcHub::new();
+        let mut joiner = P2pNode::new(
+            InProcTransport::new(PeerId(2), Arc::clone(&hub)),
+            stub(),
+            [2; 32],
+        );
+        joiner.add_peer(PeerId(1), None);
+
+        let (_, validators) = devnet_committee(7);
+        let checkpoint = Checkpoint::new(3, [0xCC; 32], [0xCC; 32]);
+        let votes = validators[..5]
+            .iter()
+            .map(|validator| validator.sign_checkpoint(&checkpoint))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            joiner.node_mut().ingest_requested_checkpoint_votes(&checkpoint, &votes),
+            VotesOutcome::Learned { finalized: true, .. }
+        ));
+        joiner.begin_checkpoint_sync(checkpoint, PeerId(1));
+
+        let mut parent = genesis();
+        let mut headers = Vec::new();
+        for height in 1..=3 {
+            let header = BlockHeader::child_of(
+                &parent,
+                height * 75,
+                1_000,
+                [height as u8; 32],
+            );
+            headers.push(header);
+            parent = header;
+        }
+        assert!(matches!(
+            joiner.ingest_checkpoint_sync_header(PeerId(1), headers[0]),
+            CheckpointHeaderOutcome::Buffered
+        ));
+        assert!(matches!(
+            joiner.ingest_checkpoint_sync_header(PeerId(1), headers[1]),
+            CheckpointHeaderOutcome::Buffered
+        ));
+        let before = joiner.peers().get(PeerId(1)).expect("peer row").score;
+        assert!(matches!(
+            joiner.ingest_checkpoint_sync_header(PeerId(1), headers[2]),
+            CheckpointHeaderOutcome::Fallback
+        ));
+        assert_eq!(joiner.node().tip_height(), 0, "the unproven span never entered ChainState");
+        assert!(joiner.checkpoint_sync.is_none());
+        assert!(joiner.checkpoint_sync_fallback);
+        assert!(joiner.peers().get(PeerId(1)).expect("peer row").score < before);
+
+        for header in headers {
+            assert_eq!(
+                joiner.node_mut().ingest_header(header),
+                IngestOutcome::Accepted,
+                "after fallback the ordinary per-header path remains usable"
+            );
+        }
+        assert_eq!(joiner.node().tip_height(), 3);
+        assert_eq!(
+            joiner.node().chain().finalized_height(),
+            None,
+            "the mismatched checkpoint never became ChainState finality"
+        );
+    }
+
+    #[test]
+    fn eager_checkpoint_query_peer_also_serves_the_first_header_batch() {
+        let (mut nodes, _hub) = mesh(3);
+        run(&mut nodes);
+
+        let eager_peer = PeerId(2);
+        nodes[0].cp_queries.insert(
+            checkpoint_query_id(u64::MAX),
+            CheckpointQuery {
+                sent_ms: 0,
+                peer: eager_peer,
+                kind: CheckpointQueryKind::Eager,
+            },
+        );
+
+        assert_eq!(nodes[0].tallest_ready_peer(), Some(eager_peer));
+    }
+
+    #[test]
+    fn eager_duplicate_of_the_exact_verified_checkpoint_arms_header_buffering() {
+        let hub = InProcHub::new();
+        let mut joiner = P2pNode::new(
+            InProcTransport::new(PeerId(2), Arc::clone(&hub)),
+            stub(),
+            [2; 32],
+        );
+        joiner.add_peer(PeerId(1), None);
+
+        let (_, validators) = devnet_committee(7);
+        let checkpoint = Checkpoint::new(3, [0x33; 32], [0x33; 32]);
+        let votes = validators[..5]
+            .iter()
+            .map(|validator| validator.sign_checkpoint(&checkpoint))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            joiner.node_mut().ingest_requested_checkpoint_votes(&checkpoint, &votes),
+            VotesOutcome::Learned { finalized: true, .. }
+        ));
+
+        joiner.cp_queries.insert(
+            checkpoint_query_id(u64::MAX),
+            CheckpointQuery {
+                sent_ms: 0,
+                peer: PeerId(1),
+                kind: CheckpointQueryKind::Eager,
+            },
+        );
+        joiner.on_checkpoint(PeerId(1), &encode_checkpoint_msg(&checkpoint, &votes));
+
+        let sync = joiner.checkpoint_sync.as_ref().expect(
+            "an eager response for the exact already-verified checkpoint must route live headers through the buffer",
+        );
+        assert_eq!(sync.checkpoint, checkpoint);
+        assert_eq!(sync.serving_peer, PeerId(1));
+    }
+
+    #[test]
+    fn eager_same_height_competing_checkpoint_does_not_arm_header_buffering() {
+        let hub = InProcHub::new();
+        let mut joiner = P2pNode::new(
+            InProcTransport::new(PeerId(2), Arc::clone(&hub)),
+            stub(),
+            [2; 32],
+        );
+        joiner.add_peer(PeerId(1), None);
+
+        let (_, validators) = devnet_committee(7);
+        let finalized = Checkpoint::new(3, [0x33; 32], [0x33; 32]);
+        let finalized_votes = validators[..5]
+            .iter()
+            .map(|validator| validator.sign_checkpoint(&finalized))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            joiner
+                .node_mut()
+                .ingest_requested_checkpoint_votes(&finalized, &finalized_votes),
+            VotesOutcome::Learned { finalized: true, .. }
+        ));
+
+        let competing = Checkpoint::new(3, [0x44; 32], [0x44; 32]);
+        let competing_votes = validators[..5]
+            .iter()
+            .map(|validator| validator.sign_checkpoint(&competing))
+            .collect::<Vec<_>>();
+        joiner.cp_queries.insert(
+            checkpoint_query_id(u64::MAX),
+            CheckpointQuery {
+                sent_ms: 0,
+                peer: PeerId(1),
+                kind: CheckpointQueryKind::Eager,
+            },
+        );
+        joiner.on_checkpoint(
+            PeerId(1),
+            &encode_checkpoint_msg(&competing, &competing_votes),
+        );
+
+        assert!(
+            joiner.checkpoint_sync.is_none(),
+            "height equality must not substitute a competing checkpoint identity for the finalized one"
+        );
+    }
+
+    /// A linear header chain of `n` blocks over genesis (the finalized history a
+    /// fleet peer would serve).
+    fn linear_span(n: u64) -> Vec<BlockHeader> {
+        let mut parent = genesis();
+        let mut headers = Vec::new();
+        for height in 1..=n {
+            let header =
+                BlockHeader::child_of(&parent, height * 75, 1_000, [height as u8; 32]);
+            headers.push(header);
+            parent = header;
+        }
+        headers
+    }
+
+    /// Quorum-verify a checkpoint over `span.last()` on `joiner` and arm a
+    /// checkpoint-sync session for it — the state every live-wedge regression
+    /// below starts from.
+    fn armed_session(
+        joiner: &mut InProcP2p,
+        span: &[BlockHeader],
+        peer: PeerId,
+    ) -> Checkpoint {
+        let last = span.last().expect("non-empty span");
+        let checkpoint = Checkpoint::new(last.height, last.header_hash(), [0x77; 32]);
+        let (_, validators) = devnet_committee(7);
+        let votes = validators[..5]
+            .iter()
+            .map(|validator| validator.sign_checkpoint(&checkpoint))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            joiner.node_mut().ingest_requested_checkpoint_votes(&checkpoint, &votes),
+            VotesOutcome::Learned { finalized: true, .. }
+        ));
+        joiner.begin_checkpoint_sync(checkpoint, peer);
+        assert!(joiner.checkpoint_sync.is_some(), "session armed");
+        checkpoint
+    }
+
+    /// Live-run regression (QUM-115, 2026-08-15): the box showed four
+    /// `begin_checkpoint_sync base=0` and every `buffer` event at `first=1` — a
+    /// sync retarget to another ready peer rebuilt the buffer from scratch. A
+    /// retarget must re-request from the frontier of the ONE accumulating
+    /// session, never restart it.
+    #[test]
+    fn peer_retarget_does_not_reset_an_accumulating_session() {
+        let (mut nodes, _hub) = mesh(3);
+        run(&mut nodes);
+        let span = linear_span(3);
+        let joiner = &mut nodes[0];
+        armed_session(joiner, &span, PeerId(2));
+        assert!(matches!(
+            joiner.ingest_checkpoint_sync_header(PeerId(2), span[0]),
+            CheckpointHeaderOutcome::Buffered
+        ));
+        joiner.start_sync_with(PeerId(3));
+        let sync = joiner
+            .checkpoint_sync
+            .as_ref()
+            .expect("a retarget must not drop the session");
+        assert_eq!(sync.frontier_height(), 1, "a retarget must not reset the buffered frontier");
+        assert!(!joiner.checkpoint_sync_fallback);
+    }
+
+    /// Live-run regression: eager checkpoint responses raced the stalled dispatch
+    /// loop, so several arrived for the same checkpoint — and every arm rebuilt
+    /// the buffer at base=tip, discarding the accumulated span.
+    #[test]
+    fn a_duplicate_arm_does_not_reset_an_accumulating_session() {
+        let hub = InProcHub::new();
+        let mut joiner = P2pNode::new(
+            InProcTransport::new(PeerId(9), Arc::clone(&hub)),
+            stub(),
+            [9; 32],
+        );
+        joiner.add_peer(PeerId(1), None);
+        let span = linear_span(3);
+        let checkpoint = armed_session(&mut joiner, &span, PeerId(1));
+        assert!(matches!(
+            joiner.ingest_checkpoint_sync_header(PeerId(1), span[0]),
+            CheckpointHeaderOutcome::Buffered
+        ));
+        joiner.begin_checkpoint_sync(checkpoint, PeerId(2));
+        let sync = joiner.checkpoint_sync.as_ref().expect("session survives");
+        assert_eq!(
+            sync.frontier_height(),
+            1,
+            "a duplicate arm must not clear buffered headers"
+        );
+    }
+
+    /// The buffer is validated by hash linkage, not by which connection carried
+    /// the bytes: any peer may extend the frontier, so a multi-peer mesh feeds
+    /// ONE accumulating session instead of thrashing per-peer.
+    #[test]
+    fn any_peer_may_extend_the_buffered_frontier() {
+        let (mut nodes, _hub) = mesh(3);
+        run(&mut nodes);
+        let span = linear_span(3);
+        let joiner = &mut nodes[0];
+        armed_session(joiner, &span, PeerId(2));
+        assert!(matches!(
+            joiner.ingest_checkpoint_sync_header(PeerId(2), span[0]),
+            CheckpointHeaderOutcome::Buffered
+        ));
+        let before = joiner.peers().get(PeerId(3)).expect("peer row").score;
+        assert!(matches!(
+            joiner.ingest_checkpoint_sync_header(PeerId(3), span[1]),
+            CheckpointHeaderOutcome::Buffered
+        ));
+        let sync = joiner.checkpoint_sync.as_ref().expect("session survives");
+        assert_eq!(sync.frontier_height(), 2);
+        assert!(!joiner.checkpoint_sync_fallback);
+        assert_eq!(
+            joiner.peers().get(PeerId(3)).expect("peer row").score,
+            before,
+            "an honest extension from a second peer is not a fault"
+        );
+    }
+
+    /// A second peer answering an older locator re-serves heights the frontier
+    /// has already passed. That is an async race, not an attack: the stale
+    /// header is dropped without a penalty and without touching the session.
+    #[test]
+    fn a_stale_header_is_dropped_without_killing_the_session() {
+        let (mut nodes, _hub) = mesh(3);
+        run(&mut nodes);
+        let span = linear_span(3);
+        let joiner = &mut nodes[0];
+        armed_session(joiner, &span, PeerId(2));
+        for header in &span[..2] {
+            assert!(matches!(
+                joiner.ingest_checkpoint_sync_header(PeerId(2), *header),
+                CheckpointHeaderOutcome::Buffered
+            ));
+        }
+        let before = joiner.peers().get(PeerId(3)).expect("peer row").score;
+        assert!(matches!(
+            joiner.ingest_checkpoint_sync_header(PeerId(3), span[0]),
+            CheckpointHeaderOutcome::Dropped
+        ));
+        let sync = joiner.checkpoint_sync.as_ref().expect("session survives");
+        assert_eq!(sync.frontier_height(), 2, "a stale header must not move the frontier");
+        assert!(!joiner.checkpoint_sync_fallback);
+        assert_eq!(joiner.peers().get(PeerId(3)).expect("peer row").score, before);
+    }
+
+    /// Live-run regression: every ~75 s the fleet mines a block and relays its
+    /// header. That header is above the session's checkpoint — it belongs to the
+    /// ordinary full-validation path (whose orphan sync-kick re-drives the
+    /// GetHeaders loop) and must leave the accumulating session intact.
+    #[test]
+    fn an_above_checkpoint_announce_leaves_the_session_intact() {
+        let (mut nodes, _hub) = mesh(3);
+        run(&mut nodes);
+        let span = linear_span(4);
+        let joiner = &mut nodes[0];
+        armed_session(joiner, &span[..3], PeerId(2));
+        assert!(matches!(
+            joiner.ingest_checkpoint_sync_header(PeerId(2), span[0]),
+            CheckpointHeaderOutcome::Buffered
+        ));
+        assert!(matches!(
+            joiner.ingest_checkpoint_sync_header(PeerId(3), span[3]),
+            CheckpointHeaderOutcome::AboveCheckpoint
+        ));
+        joiner.on_header(PeerId(3), &crate::codec::encode_header(&span[3]));
+        let sync = joiner
+            .checkpoint_sync
+            .as_ref()
+            .expect("an announced tip header must not drop the session");
+        assert_eq!(sync.frontier_height(), 1);
+        assert!(!joiner.checkpoint_sync_fallback);
+    }
+
+    /// A peer feeding batches that never extend the frontier cannot hold the
+    /// session open forever: after a bounded number of zero-advance batches the
+    /// session stalls out to the full-PoW fallback (the ruled mismatch behavior),
+    /// so a poisoned or non-converging feed degrades to correctness, not a wedge.
+    #[test]
+    fn a_non_converging_feed_stalls_out_to_full_pow_fallback() {
+        let (mut nodes, _hub) = mesh(3);
+        run(&mut nodes);
+        let span = linear_span(3);
+        let joiner = &mut nodes[0];
+        armed_session(joiner, &span, PeerId(2));
+        for header in &span[..2] {
+            assert!(matches!(
+                joiner.ingest_checkpoint_sync_header(PeerId(2), *header),
+                CheckpointHeaderOutcome::Buffered
+            ));
+        }
+        let replay = encode_headers(&span[..2]);
+        for round in 0..MAX_CHECKPOINT_SYNC_STALLED_BATCHES {
+            assert!(
+                joiner.checkpoint_sync.is_some(),
+                "session survives zero-advance batch {round}"
+            );
+            joiner.on_headers(PeerId(3), &replay);
+        }
+        assert!(joiner.checkpoint_sync.is_none(), "a non-converging feed must stall out");
+        assert!(joiner.checkpoint_sync_fallback);
+    }
+
+    /// The whole point, end to end over the real `Headers` handler: batches from
+    /// two different peers accumulate one span whose frontier lands on the
+    /// quorum-attested block, and the span is admitted PoW-skipped.
+    #[test]
+    fn alternating_peers_accumulate_one_span_to_admission() {
+        let (mut nodes, _hub) = mesh(3);
+        run(&mut nodes);
+        let span = linear_span(3);
+        let joiner = &mut nodes[0];
+        armed_session(joiner, &span, PeerId(2));
+        joiner.on_headers(PeerId(2), &encode_headers(&span[..2]));
+        assert_eq!(
+            joiner.checkpoint_sync.as_ref().expect("accumulating").frontier_height(),
+            2
+        );
+        joiner.on_headers(PeerId(3), &encode_headers(&span[2..]));
+        assert!(joiner.checkpoint_sync.is_none(), "admitted session is complete");
+        assert!(!joiner.checkpoint_sync_fallback);
+        assert_eq!(joiner.node().tip_height(), 3, "the admitted span is the chain");
+        assert_eq!(joiner.node().chain().finalized_height(), Some(3));
     }
 
     /// The header for a block over `parent` announcing `txs` + `coinbase` — it
@@ -3291,6 +4285,9 @@ mod tests {
         fn ingest_header(&mut self, header: BlockHeader) -> IngestOutcome {
             self.inner.ingest_header(header)
         }
+        fn ingest_finalized_headers(&mut self, headers: &[BlockHeader]) -> IngestOutcome {
+            self.inner.ingest_finalized_headers(headers)
+        }
         fn ingest_block(&mut self, header: BlockHeader, body: BlockBody) -> IngestOutcome {
             if qlab_devnet::body::check_body_binding(&header, &body).is_err() {
                 return IngestOutcome::Rejected("body does not match header commitment");
@@ -3321,8 +4318,13 @@ mod tests {
     }
 
     impl CheckpointIngest for StoreStub {
-        fn ingest_checkpoint_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> VotesOutcome {
-            self.inner.ingest_checkpoint_votes(cp, votes)
+        fn ingest_checkpoint_votes_from(
+            &mut self,
+            cp: &Checkpoint,
+            votes: &[Vote],
+            explicitly_requested: bool,
+        ) -> VotesOutcome {
+            self.inner.ingest_checkpoint_votes_from(cp, votes, explicitly_requested)
         }
         fn has_checkpoint(&self, id: &Hash32) -> bool {
             self.inner.has_checkpoint(id)

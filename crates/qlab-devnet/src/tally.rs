@@ -113,8 +113,45 @@ impl VoteTally {
         finalized: Option<u64>,
         tip: u64,
     ) -> AddOutcome {
+        self.add_inner(cp, active_votes, finalized, tip, false)
+    }
+
+    /// Accumulate a quorum-complete set returned by an explicit finalized-
+    /// checkpoint query even when its height is above the local tip window.
+    ///
+    /// This is deliberately a separate entry point rather than a wider window:
+    /// callers may use it only after verifying every vote and confirming that the
+    /// active set already meets the roster's quorum. Partial sets and gossip keep
+    /// the ordinary `(finalized, tip + slack]` bound, so an attacker cannot use
+    /// future-height variants to evict live tally slots.
+    pub fn add_requested_complete(
+        &mut self,
+        cp: &Checkpoint,
+        active_votes: &[Vote],
+        quorum: usize,
+        finalized: Option<u64>,
+        tip: u64,
+    ) -> AddOutcome {
+        if active_votes.len() < quorum {
+            return AddOutcome { grew: false, total: 0, accumulated: Vec::new() };
+        }
+        self.add_inner(cp, active_votes, finalized, tip, true)
+    }
+
+    fn add_inner(
+        &mut self,
+        cp: &Checkpoint,
+        active_votes: &[Vote],
+        finalized: Option<u64>,
+        tip: u64,
+        requested_complete: bool,
+    ) -> AddOutcome {
         self.prune(finalized, tip);
-        if !in_window(cp.height, finalized, tip) {
+        let above_floor = match finalized {
+            Some(height) => cp.height > height,
+            None => true,
+        };
+        if !above_floor || (!requested_complete && !in_window(cp.height, finalized, tip)) {
             return AddOutcome { grew: false, total: 0, accumulated: Vec::new() };
         }
 
@@ -286,6 +323,24 @@ mod tests {
         assert!(!t.add(&future, &votes(&vals, &future, &[0]), Some(8), 16).grew);
         let ok = cp(16, 16);
         assert!(t.add(&ok, &votes(&vals, &ok, &[0]), Some(8), 16).grew);
+    }
+
+    #[test]
+    fn only_requested_quorum_complete_sets_bypass_the_future_window() {
+        let (_c, vals) = devnet_committee(7);
+        let mut t = VoteTally::new();
+        let future = cp(64, 64);
+        let quorum = votes(&vals, &future, &[0, 1, 2, 3, 4]);
+        let partial = &quorum[..4];
+
+        assert!(!t.add(&future, &quorum, None, 0).grew, "gossip stays in-window");
+        assert!(
+            !t.add_requested_complete(&future, partial, 5, None, 0).grew,
+            "an explicitly requested partial set still cannot bypass"
+        );
+        let accepted = t.add_requested_complete(&future, &quorum, 5, None, 0);
+        assert!(accepted.grew);
+        assert_eq!(accepted.total, 5);
     }
 
     #[test]

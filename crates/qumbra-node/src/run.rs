@@ -1262,9 +1262,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // served*, which is a peer-side or version-skew problem and not this node's.
         //
         // Caliper: an instantaneous level, not a total — how many asks are in flight at
-        // the moment the line is printed, capped at
-        // `qlab_p2p::MAX_BODIES_IN_FLIGHT` (16). Always printed, zero included (the
-        // #130 (a) rule): a node always knows this number.
+        // the moment the line is printed, capped at `qlab_p2p::node::body_window_for`,
+        // which since QUM-115 is 16 near the tip and 128 while catching up. **A reader
+        // comparing `breq=` against a fixed 16 will be wrong on a joiner**, and the
+        // whole point of the wider window is that a joiner is where the number matters.
+        // Always printed, zero included (the #130 (a) rule): a node always knows this
+        // number.
         let body_reqs = self.p2p.body_requests();
         // Issue #85: `fback=` is appended after every existing field. It says
         // whether the exact checkpoint named by the finality tracker is backed by a
@@ -1477,9 +1480,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         //
         // Caliper: an instantaneous level computed at print time, the ask set the
         // requester itself would produce on this tick with the same `max`
-        // (`qlab_p2p::node::MAX_BODIES_IN_FLIGHT`, 16) — **so it saturates at 16 and
-        // is not a gap size**. The fork point is a chain height, or `-` when the
-        // walk returns nothing. Always printed, `0@-` included (the #130 (a) rule).
+        // (`qlab_p2p::node::body_window_for`, which since QUM-115 is 16 near the tip
+        // and 128 while catching up) — **so it saturates at that width and is not a
+        // gap size**. The fork point is a chain height, or `-` when the walk returns
+        // nothing. Always printed, `0@-` included (the #130 (a) rule).
         let bask = node.ask_set_observation(self.p2p.body_requests(), self.mining).telemetry_field();
         // Issue #359 S3: `snap=` is **appended at the end**, after `dfinbh=`, under
         // the same rule as every addition since #87 — every pre-existing field keeps

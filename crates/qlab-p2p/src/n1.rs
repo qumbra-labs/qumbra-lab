@@ -307,11 +307,36 @@ pub trait ChainView {
     fn state_tip_mine_ready(&self) -> bool {
         false
     }
+
+    /// **How many blocks the applied state is behind this node's own fork-choice
+    /// tip** — `slag`, the number that says whether this node is keeping up or
+    /// catching up (lab #412 / QUM-115).
+    ///
+    /// Read by the body requester to pick its in-flight window
+    /// ([`crate::node::body_window_for`]): near the tip a narrow window is right,
+    /// and it is the wrong bound for a joiner replaying thousands of blocks.
+    ///
+    /// Default `0` — a header-only node-state applies headers into both views
+    /// together and is never behind itself, so it keeps the steady window and
+    /// every in-process sim's traffic is byte-for-byte what it was.
+    fn state_lag_blocks(&self) -> u64 {
+        0
+    }
 }
 
 /// Ingest headers received from peers.
 pub trait BlockIngest {
     fn ingest_header(&mut self, header: BlockHeader) -> IngestOutcome;
+
+    /// Admit one contiguous header span whose final header is the block named by
+    /// a quorum-verified finalized checkpoint. Implementations must re-check the
+    /// checkpoint binding and every non-PoW structural rule before mutating their
+    /// validated chain; the caller's buffer is not trusted merely because it is
+    /// contiguous. PoW, LWMA difficulty, and seed derivation are the only checks
+    /// this path may omit.
+    fn ingest_finalized_headers(&mut self, _headers: &[BlockHeader]) -> IngestOutcome {
+        IngestOutcome::Ignored("checkpoint header admission unsupported")
+    }
 
     /// Ingest a full block (header + ordered body). Header-only node-states
     /// (sync/gossip only, e.g. [`StubNode`]) inherit the default, which checks the
@@ -347,13 +372,41 @@ pub trait TxPool {
 
 /// Ingest checkpoint-vote gossip (checkpoint + committee votes).
 pub trait CheckpointIngest {
+    /// The exact checkpoint most recently accepted by the authoritative quorum
+    /// gate. Height alone is insufficient here: two checkpoint variants can
+    /// occupy one height, and checkpoint-sync may only trust the variant whose
+    /// identity the finality tracker actually recorded.
+    fn finalized_checkpoint(&self) -> Option<Checkpoint> {
+        None
+    }
+
     /// Accumulate a (possibly partial) vote set for `cp` across messages (M10-T0-5).
     /// Verifies each vote against `cp`'s epoch roster, excludes tombstoned/jailed
     /// signers, de-duplicates by signer into the bounded tally, and finalizes through
     /// the unchanged `try_finalize` the moment the distinct-active count reaches
     /// quorum. This is THE accumulation path — [`Self::ingest_checkpoint`] delegates to
     /// it. See [`VotesOutcome`].
-    fn ingest_checkpoint_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> VotesOutcome;
+    fn ingest_checkpoint_votes_from(
+        &mut self,
+        cp: &Checkpoint,
+        votes: &[Vote],
+        explicitly_requested: bool,
+    ) -> VotesOutcome;
+
+    fn ingest_checkpoint_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> VotesOutcome {
+        self.ingest_checkpoint_votes_from(cp, votes, false)
+    }
+
+    /// Ingest the response to an explicit latest-finalized-checkpoint query.
+    /// Only a quorum-complete, fully verified set may bypass the ordinary
+    /// ahead-of-tip tally window; partial and unsolicited sets keep that bound.
+    fn ingest_requested_checkpoint_votes(
+        &mut self,
+        cp: &Checkpoint,
+        votes: &[Vote],
+    ) -> VotesOutcome {
+        self.ingest_checkpoint_votes_from(cp, votes, true)
+    }
 
     /// Every vote-set variant tracked at `height` (checkpoint + accumulated set,
     /// signer-ascending) — the re-push bridge for issue #362. Defaults to empty:
@@ -545,6 +598,50 @@ impl BlockIngest for StubNode {
             Err(InsertError::BadHeight) => IngestOutcome::Rejected("bad height"),
         }
     }
+
+    fn ingest_finalized_headers(&mut self, headers: &[BlockHeader]) -> IngestOutcome {
+        let Some(checkpoint) = self.finality.latest().copied() else {
+            return IngestOutcome::Rejected("no verified finalized checkpoint");
+        };
+        let Some(first) = headers.first() else {
+            return IngestOutcome::Rejected("empty checkpoint header span");
+        };
+        let Some(last) = headers.last() else {
+            return IngestOutcome::Rejected("empty checkpoint header span");
+        };
+        if last.height != checkpoint.height || last.header_hash() != checkpoint.block_hash {
+            return IngestOutcome::Rejected("checkpoint header frontier mismatch");
+        }
+        if first.height == 0
+            || self.chain.main_chain_hash_at(first.height - 1) != Some(first.prev)
+        {
+            return IngestOutcome::Orphan;
+        }
+        let Some(mut parent) = self.chain.header(&first.prev).copied() else {
+            return IngestOutcome::Orphan;
+        };
+        for header in headers {
+            if header.prev != parent.header_hash() || header.height != parent.height + 1 {
+                return IngestOutcome::Rejected("non-contiguous checkpoint header span");
+            }
+            if header.timestamp < parent.timestamp {
+                return IngestOutcome::Rejected("non-monotonic checkpoint header timestamp");
+            }
+            parent = *header;
+        }
+        for header in headers {
+            if self.chain.insert_header(*header).is_err() {
+                return IngestOutcome::Rejected("checkpoint header insertion failed");
+            }
+        }
+        let _ = self.chain.set_finalized(checkpoint.block_hash);
+        let before = self.committee.current_epoch();
+        self.committee.advance_to(self.chain.tip_height());
+        if self.committee.current_epoch() != before {
+            self.signing.reset();
+        }
+        IngestOutcome::Accepted
+    }
 }
 
 impl TxPool for StubNode {
@@ -568,7 +665,16 @@ impl TxPool for StubNode {
 }
 
 impl CheckpointIngest for StubNode {
-    fn ingest_checkpoint_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> VotesOutcome {
+    fn finalized_checkpoint(&self) -> Option<Checkpoint> {
+        self.finality.latest().copied()
+    }
+
+    fn ingest_checkpoint_votes_from(
+        &mut self,
+        cp: &Checkpoint,
+        votes: &[Vote],
+        explicitly_requested: bool,
+    ) -> VotesOutcome {
         let id = checkpoint_id(cp);
         if self.seen_checkpoints.contains(&id) {
             return VotesOutcome::Stale; // already finalized this variant
@@ -611,7 +717,11 @@ impl CheckpointIngest for StubNode {
             (committee, cstate.quorum_threshold(), active_kept)
         };
 
-        let added = self.tally.add(cp, &active_kept, finalized, tip);
+        let added = if explicitly_requested && active_kept.len() >= quorum {
+            self.tally.add_requested_complete(cp, &active_kept, quorum, finalized, tip)
+        } else {
+            self.tally.add(cp, &active_kept, finalized, tip)
+        };
         if !added.grew {
             return VotesOutcome::Stale;
         }
