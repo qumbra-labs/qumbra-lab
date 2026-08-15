@@ -284,8 +284,10 @@ fn usage() {
                             scan → sync the commitment tree → build + PROVE (real STARK,\n  \
                             ~3 s / ~12 GB) → POST /v1/tx, printing the node's typed outcome\n\n\
          --url  is the compact/scan endpoint (cbserver or a node's discovery server):\n\
-                /v1/compact, /v1/block/../full, and /v1/nullifiers (the spent-note\n\
-                subtraction — without it no balance is quotable)\n\
+                /v1/compact, /v1/block/../full, /v1/nullifiers (the spent-note\n\
+                subtraction — without it no balance is quotable) and /v1/coinbase\n\
+                (what this wallet's rkm MINED — a node that does not serve it makes\n\
+                the balance transactions-only, and the report says so)\n\
          --node is the node's discovery server: /v1/tree/leaves, /v1/anchors, POST /v1/tx\n\
                 (defaults to --url when omitted — one host usually serves both)\n\n\
          Both URLs accept http://host:PORT (port required, plaintext) and\n\

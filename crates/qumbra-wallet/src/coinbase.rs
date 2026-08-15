@@ -739,8 +739,8 @@ mod tests {
     /// `spend::select` still builds its `Spendable` set from `ScanOutcome::notes`
     /// alone, so `qumbra-wallet send` will not choose a mined note however
     /// spendable it is. That is leg 2's baton — a new driver phase with its own
-    /// refusal discipline for a 404 on this route — and it is reported on the PR
-    /// with this test as the evidence that it is small and known-feasible.
+    /// refusal discipline for a 404 on this route — and it is filed as **lab
+    /// #424** with this test as the evidence that it is small and known-feasible.
     #[test]
     fn a_mined_note_is_locatable_in_the_tree_and_the_spend_path_accepts_it() {
         use qlab_cbserver::codec::CoinbasePage;
