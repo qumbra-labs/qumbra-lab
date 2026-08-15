@@ -28,7 +28,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use qlab_devnet::body::{BlockBody, TxEntry, TxVerifier};
-use qlab_devnet::committee::{devnet_committee, CommitteeState};
+use qlab_devnet::committee::{devnet_committee, Checkpoint, CommitteeState};
 use qlab_devnet::header::BlockHeader;
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::pow::{KeccakPow, PowEngine};
@@ -147,6 +147,59 @@ fn wire<P: PowEngine>(
 }
 
 const CHAIN_LEN: u64 = 2_500;
+
+/// QUM-115's fast path through the real sync driver: the joiner obtains a recent
+/// quorum checkpoint first, buffers the hash-linked span outside `ChainState`, and
+/// performs PoW only for the headers above the attested frontier.
+#[test]
+fn quorum_checkpoint_skips_historical_pow_below_its_frontier() {
+    const TIP: u64 = 72;
+    const FINALIZED: u64 = 64;
+    let servers = seeded_servers(TIP as usize);
+    let frontier = servers[0].main_chain_hash_at(FINALIZED).expect("frontier");
+    let checkpoint = Checkpoint::new(FINALIZED, frontier, frontier);
+    let (_, validators) = devnet_committee(7);
+    let votes = validators[..5]
+        .iter()
+        .map(|validator| validator.sign_checkpoint(&checkpoint))
+        .collect::<Vec<_>>();
+
+    let pow_calls = Arc::new(AtomicUsize::new(0));
+    let joiner_state = NodeAdapter::new(
+        committee(),
+        CountingPow { calls: Arc::clone(&pow_calls) },
+        MarkerVerifier,
+        easy_sim(),
+    );
+    let (mut servers, mut joiner) = wire(servers, joiner_state);
+    for server in &mut servers {
+        server.announce_checkpoint(checkpoint, votes.clone());
+        assert_eq!(server.node().finalized_height(), Some(FINALIZED));
+    }
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        let now_ms = start.elapsed().as_millis() as u64;
+        for server in &mut servers {
+            server.tick(now_ms);
+        }
+        joiner.tick(now_ms);
+        if joiner.node().state_lag().blocks() == 0 && joiner.node().tip_height() == TIP {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(joiner.node().tip_height(), TIP, "the header chain reached the fleet tip");
+    assert_eq!(joiner.node().state_lag().blocks(), 0, "bodies caught up too");
+    assert_eq!(joiner.node().finalized_height(), Some(FINALIZED));
+    assert_eq!(joiner.node().chain().finalized_height(), Some(FINALIZED));
+    assert_eq!(
+        pow_calls.load(Ordering::Relaxed),
+        (TIP - FINALIZED) as usize,
+        "only the eight above-checkpoint headers run PoW; the 64-header attested span does not"
+    );
+}
 
 /// 🔴 **THE DRILL** — empty data dir → running 3-node net → `slag=0` at the
 /// servers' tip, refusing duties the whole way down, durable at the end.
