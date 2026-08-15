@@ -21,17 +21,21 @@
 //! hours. 2,500 blocks ≈ the shape of the live chain (~9 k) at 28 % scale; the
 //! measured rate is printed as a `JOINER_DRILL` line for #370 A4 (S6).
 
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use qlab_devnet::body::{BlockBody, TxEntry, TxVerifier};
 use qlab_devnet::committee::{devnet_committee, CommitteeState};
 use qlab_devnet::header::BlockHeader;
 use qlab_devnet::node::SimConfig;
-use qlab_devnet::pow::KeccakPow;
+use qlab_devnet::pow::{KeccakPow, PowEngine};
 use qlab_p2p::adapter::NodeAdapter;
 use qlab_p2p::n1::{BlockIngest, ChainView, IngestOutcome};
 use qlab_p2p::sync::SyncPhase;
-use qlab_p2p::transport::{TcpTransport, Transport};
+use qlab_p2p::transport::TcpTransport;
 use qlab_p2p::P2pNode;
 
 #[derive(Clone)]
@@ -44,6 +48,25 @@ impl TxVerifier for MarkerVerifier {
 
 type Adapter = NodeAdapter<KeccakPow, MarkerVerifier>;
 type Node = P2pNode<TcpTransport, Adapter>;
+
+/// Cheap stand-in for RandomX with an exact call counter. The drill is about
+/// whether dispatch invokes the PoW verifier, not the primitive's runtime; using
+/// Keccak underneath keeps the few-thousand-block reproduction CI-runnable.
+#[derive(Clone)]
+struct CountingPow {
+    calls: Arc<AtomicUsize>,
+}
+
+impl PowEngine for CountingPow {
+    fn name(&self) -> &'static str {
+        "counting-keccak"
+    }
+
+    fn pow_hash(&self, header: &BlockHeader, seed: &[u8]) -> [u8; 32] {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        KeccakPow.pow_hash(header, seed)
+    }
+}
 
 /// Fast blocks and trivial PoW: a 2,500-block chain is seconds of Keccak, and
 /// the drill measures the transfer pipeline, not the hash function.
@@ -100,7 +123,13 @@ fn seeded_servers(n: usize) -> Vec<Adapter> {
 
 /// Wire three servers and the joiner over real sockets; the joiner dials all
 /// three (a joiner knows only seed addresses — nobody dials a stranger).
-fn wire(servers: Vec<Adapter>, joiner: Adapter) -> (Vec<Node>, Node) {
+fn wire<P: PowEngine>(
+    servers: Vec<Adapter>,
+    joiner: NodeAdapter<P, MarkerVerifier>,
+) -> (
+    Vec<Node>,
+    P2pNode<TcpTransport, NodeAdapter<P, MarkerVerifier>>,
+) {
     let mut nodes = Vec::new();
     let mut addrs = Vec::new();
     for (i, a) in servers.into_iter().enumerate() {
@@ -122,12 +151,21 @@ const CHAIN_LEN: u64 = 2_500;
 /// 🔴 **THE DRILL** — empty data dir → running 3-node net → `slag=0` at the
 /// servers' tip, refusing duties the whole way down, durable at the end.
 #[test]
-fn joins_a_running_net_from_an_empty_data_dir() {
+fn from_genesis_joiner_converges_without_revalidating_known_headers() {
     let servers = seeded_servers(CHAIN_LEN as usize);
     let tip_hash = servers[0].tip_hash();
     let dir = temp_dir("joiner");
-    let joiner_state =
-        Adapter::open(&dir, committee(), KeccakPow, MarkerVerifier, easy_sim()).expect("open");
+    let pow_calls = Arc::new(AtomicUsize::new(0));
+    let joiner_state = NodeAdapter::open(
+        &dir,
+        committee(),
+        CountingPow {
+            calls: Arc::clone(&pow_calls),
+        },
+        MarkerVerifier,
+        easy_sim(),
+    )
+    .expect("open");
     assert_eq!(joiner_state.tip_height(), 0, "the data dir really is empty");
     let (mut servers, mut joiner) = wire(servers, joiner_state);
 
@@ -178,6 +216,16 @@ fn joins_a_running_net_from_an_empty_data_dir() {
     assert_eq!(joiner.node().tip_hash(), tip_hash, "the same block, not merely the same height");
     assert_eq!(*joiner.sync_phase(), SyncPhase::Synced);
     assert_eq!(joiner.body_requests(), 0, "and it has stopped asking");
+    assert_eq!(
+        pow_calls.load(Ordering::Relaxed),
+        CHAIN_LEN as usize,
+        "each distinct non-genesis header is PoW-checked exactly once; its later body reuses that verdict"
+    );
+    assert_eq!(
+        joiner.node().state_rewinds(),
+        (0, 0),
+        "three peers serving one canonical history cause no state-machine rewind"
+    );
     // An honest catch-up never trips the S3 serve budgets (S1's bound: the
     // response fits what #91's inbound budget assumes).
     for s in &servers {
