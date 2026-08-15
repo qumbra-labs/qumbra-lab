@@ -2050,6 +2050,21 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return Some(sync.peer);
             }
         }
+        // The eager Checkpoint GetData and the first GetHeaders must use one
+        // connection. TCP then guarantees that the server handles the quorum
+        // evidence before the historical header burst. Picking independently
+        // among tied-height peers made that ordering a scheduler race: release
+        // CI could finish ordinary PoW sync from peer B before peer A's
+        // checkpoint response was observed.
+        if let Some(peer) = self
+            .cp_queries
+            .values()
+            .find(|query| query.kind == CheckpointQueryKind::Eager)
+            .map(|query| query.peer)
+            .filter(|peer| self.peers.is_ready(*peer))
+        {
+            return Some(peer);
+        }
         self.peers
             .ready_peers()
             .into_iter()
@@ -2648,6 +2663,24 @@ mod tests {
             None,
             "the mismatched checkpoint never became ChainState finality"
         );
+    }
+
+    #[test]
+    fn eager_checkpoint_query_peer_also_serves_the_first_header_batch() {
+        let (mut nodes, _hub) = mesh(3);
+        run(&mut nodes);
+
+        let eager_peer = PeerId(2);
+        nodes[0].cp_queries.insert(
+            checkpoint_query_id(u64::MAX),
+            CheckpointQuery {
+                sent_ms: 0,
+                peer: eager_peer,
+                kind: CheckpointQueryKind::Eager,
+            },
+        );
+
+        assert_eq!(nodes[0].tallest_ready_peer(), Some(eager_peer));
     }
 
     /// The header for a block over `parent` announcing `txs` + `coinbase` — it
