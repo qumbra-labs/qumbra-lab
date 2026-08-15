@@ -69,6 +69,10 @@ committee_key_paths = [
 {keys}
 ]
 mining = false
+# Issue #411: opt out of the fixed default discovery port (127.0.0.1:9420) so a
+# stray node elsewhere on the machine cannot make this child exit at startup —
+# see sigkill_replay.rs's staged config for the full story.
+discovery_addr = "off"
 "#,
         data = data_dir.display(),
         genesis = base.join("genesis.qmb").display(),
@@ -135,6 +139,43 @@ fn wait_for_needle(buf: &Mutex<String>, needle: &str, timeout: Duration) {
     }
 }
 
+/// Startup wait with the child's liveness checked — the same failure-mode fix
+/// as `sigkill_replay.rs`'s `wait_for_needle_live` (issue #411): a child that
+/// exits before printing the needle panics NOW, with its stderr, instead of
+/// burning the full timeout on a process that can never print it.
+fn wait_for_startup(child: &mut Child, buf: &Mutex<String>, needle: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if buf.lock().unwrap().contains(needle) {
+            return;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            // A beat for the drain thread to flush what the child last wrote.
+            std::thread::sleep(Duration::from_millis(200));
+            if buf.lock().unwrap().contains(needle) {
+                return;
+            }
+            let mut stderr = String::new();
+            if let Some(mut err) = child.stderr.take() {
+                let _ = err.read_to_string(&mut stderr);
+            }
+            let stdout = buf.lock().unwrap().clone();
+            panic!(
+                "child exited ({status}) before printing `{needle}`;\n\
+                 --- captured stdout:\n{stdout}\n--- captured stderr:\n{stderr}"
+            );
+        }
+        if Instant::now() > deadline {
+            let captured = buf.lock().unwrap().clone();
+            panic!(
+                "timed out waiting for `{needle}` in child stdout (child still running); \
+                 captured so far:\n{captured}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn send_sigterm(pid: u32) {
     let kill_status = Command::new("kill")
         .args(["-TERM", &pid.to_string()])
@@ -181,7 +222,7 @@ fn sigterm_flushes_snapshot_and_peers_dat() {
     let stdout = child.stdout.take().expect("stdout piped");
     let buf = start_stdout_drain(stdout);
 
-    wait_for_needle(&buf, "qumbra-node running", START_TIMEOUT);
+    wait_for_startup(&mut child, &buf, "qumbra-node running", START_TIMEOUT);
 
     // Real SIGTERM — the same signal Docker `compose stop` and `systemctl stop`
     // send. This is the whole point of the test; a pre-set AtomicBool is not it.
@@ -239,7 +280,7 @@ fn sigterm_does_not_claim_flush_when_it_failed() {
     let stdout = child.stdout.take().expect("stdout piped");
     let buf = start_stdout_drain(stdout);
 
-    wait_for_needle(&buf, "qumbra-node running", START_TIMEOUT);
+    wait_for_startup(&mut child, &buf, "qumbra-node running", START_TIMEOUT);
 
     // Freeze the data dir so the atomic snapshot write cannot create its tmp file.
     let mut perms = std::fs::metadata(&data_dir).unwrap().permissions();
