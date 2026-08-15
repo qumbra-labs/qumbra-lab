@@ -145,10 +145,36 @@ pub fn coinbase_rseed(height: u64, rkm: &[u64; 4]) -> [u64; 4] {
 /// and `value_is_the_miner_share_plus_fees` still passes untouched, which is
 /// the compat lock this seam wants.
 pub fn coinbase_note_value(body: &BlockBody) -> u64 {
-    RewardSplit::of(body.coinbase)
+    coinbase_note_value_parts(body.coinbase, body.total_fees(), body.total_name_burn())
+}
+
+/// [`coinbase_note_value`]'s arithmetic over the three body facts it is a
+/// function of — **the one expression**, so a caller holding those facts without
+/// the body around them computes the same value rather than a copy of it.
+///
+/// ## Why this seam exists (lab #415)
+///
+/// A wallet is not a node, so it can never hold a `BlockBody`; before lab #415
+/// it could not see a coinbase note at all. The route that fixes that serves
+/// `(height, coinbase_rkm, coinbase, fees, name_burn)` — the block's own facts,
+/// no derivation on the serving path — and the wallet reconstructs the note by
+/// calling **this** function. That is deliberate and it is the whole correctness
+/// argument: a wallet whose idea of "what the miner took" drifted from the
+/// applier's would derive a different `cm`, and a different `cm` is not a leaf of
+/// the commitment tree — so the note would read as a wrong balance *and* be
+/// unspendable, with nothing pointing at the arithmetic.
+///
+/// 🔴 **The schedule alone is not this number.** `emission::coinbase(h)` is the
+/// whole issuance; the miner takes the frozen §3 share of it, **plus the block's
+/// fees**, less the burned name-fee portion (lab #367). A reader tempted to
+/// substitute `coinbase(height)` here should note that it is also wrong on this
+/// chain's own history at height 1377, whose committed coinbase is not the
+/// schedule's (#299's grandfathered scar, below `RULE_BOUNDARY_HEIGHT`).
+pub fn coinbase_note_value_parts(coinbase: u64, total_fees: u64, total_name_burn: u64) -> u64 {
+    RewardSplit::of(coinbase)
         .miner
-        .saturating_add(body.total_fees())
-        .saturating_sub(body.total_name_burn())
+        .saturating_add(total_fees)
+        .saturating_sub(total_name_burn)
 }
 
 /// The coinbase note minted by `body` at `height`, or `None` if the block mints
@@ -159,12 +185,35 @@ pub fn coinbase_note_value(body: &BlockBody) -> u64 {
 /// kept anyway so this function cannot mint an unspendable leaf even if it is
 /// ever called off that path.
 pub fn coinbase_note(height: u64, body: &BlockBody) -> Option<Note> {
-    if body.coinbase == 0 || body.coinbase_rkm == [0u64; 4] {
+    coinbase_note_parts(
+        height,
+        body.coinbase_rkm,
+        body.coinbase,
+        body.total_fees(),
+        body.total_name_burn(),
+    )
+}
+
+/// [`coinbase_note`] over the five block facts the note is a function of — the
+/// derivation a holder who is **not a node** runs (lab #415).
+///
+/// `qumbra-wallet` calls exactly this on the `(height, coinbase_rkm, coinbase,
+/// fees, name_burn)` tuples `GET /v1/coinbase` serves, so the note a wallet
+/// reconstructs is the note `apply_state` appended, by construction rather than
+/// by two implementations agreeing. Same `None` cases as [`coinbase_note`], and
+/// they are the same two lines: a block that mints nothing, or one with no payee.
+pub fn coinbase_note_parts(
+    height: u64,
+    rkm: [u64; 4],
+    coinbase: u64,
+    total_fees: u64,
+    total_name_burn: u64,
+) -> Option<Note> {
+    if coinbase == 0 || rkm == [0u64; 4] {
         return None;
     }
-    let rkm = body.coinbase_rkm;
     Some(Note {
-        value: coinbase_note_value(body),
+        value: coinbase_note_value_parts(coinbase, total_fees, total_name_burn),
         rkm,
         rho: coinbase_rho(height, &rkm),
         rseed: coinbase_rseed(height, &rkm),

@@ -467,6 +467,206 @@ impl NamesPage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// /v1/coinbase (lab #415)
+// ---------------------------------------------------------------------------
+
+/// Page bound for `/v1/coinbase`, [`MAX_NULLIFIER_BLOCKS`]'s reasoning verbatim:
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen — the framing carries
+/// `n_blocks` and every height explicitly, so the bound can move without
+/// touching a golden and without a client that knows nothing about it going
+/// wrong.
+pub const MAX_COINBASE_BLOCKS: usize = 1024;
+
+/// One block's coinbase, as the block committed it — the five facts the coinbase
+/// note is a function of, and **nothing derived** (lab #415).
+///
+/// `qlab_node::coinbase_note_parts(height, coinbase_rkm, coinbase, fees,
+/// name_burn)` turns these into the note `apply_state` appended. The derivation
+/// is deliberately NOT run on the serving side: this crate cannot reach it (the
+/// dependency runs `qlab-node → qlab-cbserver`, never back), and a served figure
+/// would be a consensus rule restated by whichever server answered rather than
+/// the block's own bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockCoinbase {
+    pub height: u64,
+    /// `body.coinbase_rkm` — the payee's raw `rkm` lanes, verbatim. `[0; 4]` is
+    /// the no-payee sentinel a non-minting block carries (genesis); a wallet's
+    /// own `rkm` is a hash output and never that, so matching cannot collide
+    /// with it, and a matcher must still never treat it as an identity.
+    pub coinbase_rkm: [u64; 4],
+    /// `body.coinbase` — the issuance this block declared. **Not the note's
+    /// value**: the miner takes the frozen §3 share of it plus the fees below.
+    pub coinbase: u64,
+    /// `body.total_fees()` — the block's declared fees, which are the miner's.
+    pub fees: u64,
+    /// `body.total_name_burn()` — the burned name-fee half of those fees, which
+    /// are not (lab #367). Zero on every rider-free block, i.e. everywhere on
+    /// this chain today.
+    pub name_burn: u64,
+}
+
+/// One page of the chain's per-block coinbase facts (`GET
+/// /v1/coinbase?from=&to=` — lab #415).
+///
+/// ## What this is for
+///
+/// `CompactBlock` is `{ height, groups }`: the compact wire carries no
+/// `coinbase_rkm`, and it is a wallet's only source, so **no wallet has ever
+/// been able to detect a coinbase note**. A mining-only wallet read
+/// `spendable: 0 · complete` forever, correctly and uselessly (lab #415; PR #420
+/// narrowed the verdict's claim, this route is what lets it be un-narrowed). The
+/// faucet finds its own coinbase by walking its node's main chain — it can,
+/// because it *is* a node; a wallet is not, and that is the design.
+///
+/// ## Why there is no privacy read here, unlike #188 (a)
+///
+/// 🔴 **This is public chain data in the strictest sense: every block prints its
+/// own `coinbase_rkm` in its body, and every node already serves those bodies to
+/// its peers.** #188 (a) needed a privacy read because a discovery group is
+/// *addressed* — it exists to tell one recipient that an output is theirs, and
+/// the question of who may see it is the whole design. A coinbase payee is
+/// published by consensus to everybody as the condition of the block being
+/// valid. Serving it in bulk adds no fact and no question: unlike
+/// `/v1/nullifiers`, where the bytes are public but a *per-nullifier probe*
+/// would leak which note is the asker's, there is nothing here for a probe to
+/// ask — the whole range is the answer, and the wallet matches locally.
+///
+/// Bulk per range anyway, and for the same reason the nullifier route is:
+/// `?rkm=<key>` would tell the server which miner is asking, so there is no such
+/// form and there must never be one.
+///
+/// ## Wire — the compact family's version byte, deliberately
+///
+/// ```text
+/// version ‖ from(varint) ‖ to(varint) ‖ n_blocks(varint) ‖
+///  [height(varint) ‖ coinbase_rkm(32 B, lane-major LE) ‖
+///   coinbase(varint) ‖ fees(varint) ‖ name_burn(varint)] × n_blocks
+/// ```
+///
+/// `NullifierPage`'s reasoning verbatim: it is `/v1/compact`'s sibling by every
+/// structural test (same projection, same `[from, to]` paging, same light
+/// client, served by both the reference server and a deployed `qumbra-node`),
+/// and adding a wire to the family does not move the family's version — every
+/// existing payload is byte-for-byte what it was, and an older server 404s,
+/// which the client renders as `UNAVAILABLE` **with the reason** (required
+/// behaviour, not a fallback).
+///
+/// ## Truncation must be structurally distinguishable (#309/#312)
+///
+/// `from`/`to` are echoed so a paging client cannot misattribute a page, and
+/// **every** height the server holds in range is present — including blocks that
+/// mint nothing. A page that stops below `to` is therefore visibly short: its
+/// last height is not `to`, and the client resumes from `last + 1`. There is no
+/// state in which "I served you page one" and "that is the whole range" produce
+/// the same bytes, which is the exact property the >1,024-block silent
+/// truncation of #309/#312 did not have.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoinbasePage {
+    /// Echo of the request's `from`.
+    pub from: u64,
+    /// Echo of the request's `to`.
+    pub to: u64,
+    /// Ascending by height; at most [`MAX_COINBASE_BLOCKS`] entries.
+    pub blocks: Vec<BlockCoinbase>,
+}
+
+impl CoinbasePage {
+    /// Build the page for `[from, to]` over an ascending per-block source — the
+    /// one implementation of the truncation arithmetic, [`NullifierPage::page`]'s
+    /// discipline, used by every server that serves this route.
+    pub fn page(
+        blocks: impl IntoIterator<Item = BlockCoinbase>,
+        from: u64,
+        to: u64,
+    ) -> CoinbasePage {
+        let mut out = Vec::new();
+        for b in blocks {
+            if b.height < from || b.height > to {
+                continue;
+            }
+            if out.len() == MAX_COINBASE_BLOCKS {
+                break;
+            }
+            out.push(b);
+        }
+        CoinbasePage { from, to, blocks: out }
+    }
+
+    /// The highest height this page carries — where a paging client resumes
+    /// from (`+ 1`).
+    pub fn last_height(&self) -> Option<u64> {
+        self.blocks.last().map(|b| b.height)
+    }
+
+    /// Whether this page is **known** to be short of the range it answers: it
+    /// carries blocks and the last of them is below `to`.
+    ///
+    /// 🔴 Named rather than left to each caller's arithmetic, because "did this
+    /// answer cover what I asked for" being a derived thought rather than a
+    /// stated one is precisely how #309/#312 happened. `false` for an empty page
+    /// is not a claim of completeness — an empty page means the server holds
+    /// nothing further in range, and what that costs is judged by the client's
+    /// coverage check, not here.
+    pub fn is_truncated(&self) -> bool {
+        self.last_height().is_some_and(|h| h < self.to)
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(WIRE_VERSION);
+        write_varint(&mut out, self.from);
+        write_varint(&mut out, self.to);
+        write_varint(&mut out, self.blocks.len() as u64);
+        for b in &self.blocks {
+            write_varint(&mut out, b.height);
+            // Lane-major little-endian, `qlab_note::hash::digest_bytes`' form —
+            // the same 32 bytes `qumbra-wallet miner-rkm` prints in hex and
+            // `NodeConfig::miner_rkm_lanes` parses, so an operator comparing the
+            // two by eye is comparing the same string.
+            out.extend_from_slice(&qlab_note::hash::digest_bytes(&b.coinbase_rkm));
+            write_varint(&mut out, b.coinbase);
+            write_varint(&mut out, b.fees);
+            write_varint(&mut out, b.name_burn);
+        }
+        out
+    }
+
+    pub fn from_bytes(b: &[u8]) -> Result<CoinbasePage, CodecError> {
+        let mut pos = 0usize;
+        let ver = *b.get(pos).ok_or(CodecError::Truncated { what: "version" })?;
+        pos += 1;
+        if ver != WIRE_VERSION {
+            return Err(CodecError::BadVersion { got: ver });
+        }
+        let from = read_varint(b, &mut pos)?;
+        let to = read_varint(b, &mut pos)?;
+        let n_blocks = read_varint(b, &mut pos)?;
+        // Attacker-adjacent count: cap the allocation by the bytes actually
+        // present, so a tiny payload claiming 2^60 blocks is a `Truncated`
+        // refusal and not a giant allocation (the NullifierPage rule). The
+        // smallest possible entry is 32 B of rkm plus four varints.
+        let mut blocks = Vec::with_capacity((n_blocks as usize).min(b.len() / 36));
+        for _ in 0..n_blocks {
+            let height = read_varint(b, &mut pos)?;
+            if b.len() < pos + 32 {
+                return Err(CodecError::Truncated { what: "coinbase_rkm" });
+            }
+            let rkm_bytes: [u8; 32] = b[pos..pos + 32].try_into().expect("32 bytes");
+            pos += 32;
+            let coinbase_rkm = qlab_note::hash::digest_from_bytes(&rkm_bytes);
+            let coinbase = read_varint(b, &mut pos)?;
+            let fees = read_varint(b, &mut pos)?;
+            let name_burn = read_varint(b, &mut pos)?;
+            blocks.push(BlockCoinbase { height, coinbase_rkm, coinbase, fees, name_burn });
+        }
+        if pos != b.len() {
+            return Err(CodecError::TrailingBytes { remaining: b.len() - pos });
+        }
+        Ok(CoinbasePage { from, to, blocks })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -982,6 +1182,163 @@ mod tests {
         let beyond = NullifierPage::page(all.iter().cloned(), 99_999, 100_000);
         assert!(beyond.blocks.is_empty(), "a range the source does not hold is empty, not an error");
         assert_eq!((beyond.from, beyond.to), (99_999, 100_000), "the echoes are the request's");
+    }
+
+    // ---- /v1/coinbase (lab #415) --------------------------------------------
+
+    fn cb(height: u64, rkm: u64, coinbase: u64, fees: u64, burn: u64) -> BlockCoinbase {
+        BlockCoinbase {
+            height,
+            coinbase_rkm: [rkm, rkm ^ 0xA5, rkm ^ 0x5A, rkm ^ 0xFF],
+            coinbase,
+            fees,
+            name_burn: burn,
+        }
+    }
+
+    /// GOLDEN BYTES — the coinbase framing. Same class as the two wires above:
+    /// a served wire a mining wallet's balance depends on, frozen deliberately.
+    ///
+    /// The non-minting entry (`rkm = [0; 4]`, `coinbase = 0`) is part of the
+    /// golden on purpose, for the reason the empty nullifier block is: a height
+    /// that mints nothing must be **present**, or a hole in the stream is
+    /// indistinguishable from a block whose payee this wallet simply is not.
+    #[test]
+    fn golden_bytes_lock_the_coinbase_framing() {
+        let page = CoinbasePage {
+            from: 4,
+            to: 6,
+            blocks: vec![
+                cb(4, 0x11, 300, 20, 5),
+                BlockCoinbase {
+                    height: 5,
+                    coinbase_rkm: [0; 4],
+                    coinbase: 0,
+                    fees: 0,
+                    name_burn: 0,
+                },
+                cb(6, 0x22, 1, 0, 0),
+            ],
+        };
+        let bytes = page.to_bytes();
+
+        // version(1) + from(1) + to(1) + n_blocks(1) = 4, then per block
+        //   height(1) + rkm(32) + coinbase(varint) + fees(1) + burn(1)
+        //   block 0: 1 + 32 + 2 + 1 + 1 = 37   (300 is a two-byte varint)
+        //   block 1: 1 + 32 + 1 + 1 + 1 = 36
+        //   block 2: 1 + 32 + 1 + 1 + 1 = 36
+        assert_eq!(bytes.len(), 4 + 37 + 36 + 36, "golden total length");
+        assert_eq!(
+            &bytes[..4],
+            &[0x01, 0x04, 0x06, 0x03],
+            "golden header — WIRE_VERSION, from, to, n_blocks"
+        );
+        assert_eq!(bytes[4], 0x04, "golden block 0 height");
+        assert_eq!(
+            &bytes[5..37],
+            &qlab_note::hash::digest_bytes(&[0x11, 0x11 ^ 0xA5, 0x11 ^ 0x5A, 0x11 ^ 0xFF]),
+            "golden block 0 rkm — lane-major LE, `miner-rkm`'s own bytes"
+        );
+        assert_eq!(&bytes[37..41], &[0xac, 0x02, 0x14, 0x05], "golden block 0 coinbase/fees/burn");
+        assert_eq!(bytes[41], 0x05, "golden block 1 height");
+        assert_eq!(&bytes[42..74], &[0u8; 32], "golden block 1 — the no-payee sentinel, SERVED");
+        assert_eq!(&bytes[74..77], &[0x00, 0x00, 0x00], "…minting nothing, with no fees");
+
+        let digest = keccak256_bytes(&bytes);
+        assert_eq!(
+            hex(&digest),
+            "1e3329b6c3238a6384eebc99b5d80b0c59c712e33866d3ee2089a072aab49d69",
+            "GOLDEN digest — update ONLY with an intentional, documented framing change"
+        );
+
+        assert_eq!(CoinbasePage::from_bytes(&bytes).unwrap(), page, "and it round-trips");
+
+        let empty = CoinbasePage { from: 9, to: 9, blocks: vec![] };
+        let ebytes = empty.to_bytes();
+        assert_eq!(ebytes, vec![0x01, 0x09, 0x09, 0x00], "golden empty page");
+        assert_eq!(CoinbasePage::from_bytes(&ebytes).unwrap(), empty);
+    }
+
+    /// The coinbase wire rejects exactly like its two siblings: unknown version,
+    /// trailing bytes, truncation mid-`rkm`, and a block count the bytes cannot
+    /// possibly hold.
+    #[test]
+    fn coinbase_wire_rejects_bad_version_trailing_truncation_and_count_lies() {
+        let good = CoinbasePage { from: 0, to: 1, blocks: vec![cb(1, 0x33, 9, 1, 0)] }.to_bytes();
+        assert_eq!(CoinbasePage::from_bytes(&good).unwrap().blocks.len(), 1);
+
+        let mut bad_v = good.clone();
+        bad_v[0] = 0x02;
+        assert_eq!(CoinbasePage::from_bytes(&bad_v), Err(CodecError::BadVersion { got: 2 }));
+
+        let mut extra = good.clone();
+        extra.push(0);
+        assert!(matches!(
+            CoinbasePage::from_bytes(&extra),
+            Err(CodecError::TrailingBytes { .. })
+        ));
+
+        // One byte short: the last varint cannot be read.
+        assert!(CoinbasePage::from_bytes(&good[..good.len() - 1]).is_err());
+
+        // Truncated inside the 32-byte rkm — named, not a panic.
+        assert_eq!(
+            CoinbasePage::from_bytes(&good[..10]),
+            Err(CodecError::Truncated { what: "coinbase_rkm" }),
+        );
+
+        // A count the bytes cannot hold is a refusal, not an allocation.
+        let mut lie = good.clone();
+        lie[3] = 0x7f; // n_blocks = 127 in four bytes of payload
+        assert!(matches!(CoinbasePage::from_bytes(&lie), Err(CodecError::Truncated { .. })));
+    }
+
+    /// 🔴 **Truncation is structurally distinguishable from completeness** — the
+    /// #309/#312 property, on the new route, stated as the acceptance item asks.
+    ///
+    /// Three things are checked, and the third is the one that matters: a full
+    /// page is the *bound* rather than the chain, the client resumes at
+    /// `last + 1` without knowing the bound, and the truncated page and the
+    /// complete page **differ in bytes a client already reads** — `to` is echoed
+    /// and the last height is present, so `is_truncated()` is an observation and
+    /// not an inference. A wire where those two answers could serialize
+    /// identically is the wire that produced `complete/0` on a 12,208-block
+    /// range.
+    #[test]
+    fn a_truncated_coinbase_page_is_structurally_distinguishable_from_a_complete_one() {
+        let all: Vec<BlockCoinbase> = (0..MAX_COINBASE_BLOCKS as u64 + 5)
+            .map(|h| cb(h, h, 5_000 + h, 0, 0))
+            .collect();
+        let to = MAX_COINBASE_BLOCKS as u64 + 4;
+
+        let p0 = CoinbasePage::page(all.iter().cloned(), 0, to);
+        assert_eq!(p0.blocks.len(), MAX_COINBASE_BLOCKS, "a full page is the bound, not the chain");
+        assert_eq!(p0.last_height(), Some(MAX_COINBASE_BLOCKS as u64 - 1));
+        assert!(p0.is_truncated(), "and it SAYS it is short of the range it answers");
+
+        // The client resumes from last + 1 knowing nothing about MAX_COINBASE_BLOCKS.
+        let p1 = CoinbasePage::page(all.iter().cloned(), p0.last_height().unwrap() + 1, to);
+        assert_eq!(p1.blocks.len(), 5, "the rest arrives on the next page");
+        assert_eq!(p1.blocks[0].height, MAX_COINBASE_BLOCKS as u64);
+        assert!(!p1.is_truncated(), "the page that reaches `to` does not claim to be short");
+
+        // 🔴 The bytes differ where a client looks: same `from`, same first
+        // block, different last height. A truncated answer cannot serialize as
+        // a complete one over the same range.
+        let complete = CoinbasePage::page(all.iter().take(3).cloned(), 0, 2);
+        let short = CoinbasePage::page(all.iter().take(1).cloned(), 0, 2);
+        assert_eq!((complete.from, complete.to), (short.from, short.to));
+        assert_ne!(complete.to_bytes(), short.to_bytes());
+        assert!(!complete.is_truncated() && short.is_truncated());
+        // …and both decode back to what they claim, so the distinction survives
+        // the wire rather than living only in the server's memory.
+        assert!(CoinbasePage::from_bytes(&short.to_bytes()).unwrap().is_truncated());
+        assert!(!CoinbasePage::from_bytes(&complete.to_bytes()).unwrap().is_truncated());
+
+        let beyond = CoinbasePage::page(all.iter().cloned(), 99_999, 100_000);
+        assert!(beyond.blocks.is_empty(), "a range the source does not hold is empty, not an error");
+        assert_eq!((beyond.from, beyond.to), (99_999, 100_000), "the echoes are the request's");
+        assert!(!beyond.is_truncated(), "an empty page makes no completeness claim either way");
     }
 
     // Local Keccak-256 (original pad10*1) over qlab-air's permutation, mirroring

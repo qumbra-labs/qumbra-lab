@@ -362,6 +362,28 @@ pub fn name_fee_for(op: &NameOp) -> u64 {
     }
 }
 
+/// The burned name-fee portion of a block, over that block's committed rider
+/// bytes in block order — **one statement of the sum**, shared by
+/// [`crate::body::BlockBody::total_name_burn`] and by the serving projections
+/// that hold the same riders without the bodies around them
+/// (`qlab_node::rpc::BlockDiscovery`, lab #415).
+///
+/// It exists because the coinbase note's value is a function of this figure, and
+/// lab #415 gave a second caller a reason to compute it: a wallet cannot see a
+/// coinbase note without knowing what the miner actually took, and the serving
+/// side holds riders but not bodies. Two sums that must agree is the drift this
+/// repo keeps paying for; one function called twice is not.
+///
+/// Total by construction for the reason [`crate::body::BlockBody::total_name_burn`]
+/// states: an undecodable rider contributes 0, because every consumer runs on
+/// bodies `validate_body*` already accepted.
+pub fn burn_of_riders<'a>(riders: impl IntoIterator<Item = &'a [u8]>) -> u64 {
+    riders
+        .into_iter()
+        .map(|r| decode_rider(r).ok().flatten().map_or(0, |op| name_fee_for(&op)))
+        .sum()
+}
+
 // ---------------------------------------------------------------------------
 // Consensus rules (validate_body's rider leg — lab #367 stage 2)
 // ---------------------------------------------------------------------------

@@ -29,7 +29,7 @@ use qlab_note::scan::{encrypt_to_recipient, EncryptedOutputs};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::codec::{BlockNullifiers, CompactBlock, CompactGroup};
+use crate::codec::{BlockCoinbase, BlockNullifiers, CompactBlock, CompactGroup};
 use crate::tree::CommitmentTree;
 
 /// One recipient bundle's encryption artifacts, stored for serving.
@@ -60,11 +60,17 @@ pub struct GenParams {
     /// PoW difficulty stamped on each header (fork-choice weight; not mined here).
     pub difficulty: u64,
     pub seed: u64,
+    /// Who every block's coinbase pays (lab #415). `None` keeps the original
+    /// per-height synthetic payee, so every existing fixture is byte-identical;
+    /// `Some(rkm)` makes this devnet a chain **one miner mined**, which is the
+    /// only way to express "a mining-only wallet reads its own coinbase" against
+    /// the reference server.
+    pub miner_rkm: Option<[u64; 4]>,
 }
 
 impl Default for GenParams {
     fn default() -> Self {
-        Self { n_blocks: 8, txs_per_block: 6, difficulty: 1_000, seed: 0xC0FFEE }
+        Self { n_blocks: 8, txs_per_block: 6, difficulty: 1_000, seed: 0xC0FFEE, miner_rkm: None }
     }
 }
 
@@ -206,7 +212,9 @@ impl Devnet {
             // A synthetic minting block needs a payee (issue #101): a body with
             // `coinbase > 0` and `coinbase_rkm == [0; 4]` is rejected, and this
             // fixture's headers must commit to bodies a node would accept.
-            let coinbase_rkm = [height, height ^ 0xA5, height ^ 0x5A, height ^ 0xFF];
+            let coinbase_rkm = params
+                .miner_rkm
+                .unwrap_or([height, height ^ 0xA5, height ^ 0x5A, height ^ 0xFF]);
             let body = BlockBody { txs: body_txs, coinbase: height, coinbase_rkm };
             let header = BlockHeader::child_of(&parent, height, params.difficulty, body.commitment());
             chain
@@ -319,6 +327,36 @@ impl Devnet {
                     .iter()
                     .flat_map(|t| t.public.nullifiers.iter().copied())
                     .collect(),
+            })
+            .collect()
+    }
+
+    /// The per-block coinbase facts for `[from, to]` — what `/v1/coinbase`
+    /// serves (lab #415).
+    ///
+    /// Read from the block's own body — `coinbase_rkm`, `coinbase`,
+    /// `total_fees()`, `total_name_burn()` — with **nothing derived**: the note's
+    /// value is `qlab_node::coinbase_note_value_parts`' to state, and this crate
+    /// cannot reach it (the dependency runs `qlab-node → qlab-cbserver`). That is
+    /// the point rather than a limitation: a reference server that computed a
+    /// miner's take would be a second statement of a consensus rule.
+    ///
+    /// Every height this devnet holds in range is present, **including blocks
+    /// that mint nothing**, for `nullifier_range`'s reason: an omitted height is
+    /// indistinguishable from an unserved one, and a client that cannot tell
+    /// those apart cannot honestly say whether it covered the range. Iterates
+    /// what this devnet holds and filters, so the cost is bounded by the chain
+    /// rather than by a client-chosen `to`.
+    pub fn coinbase_range(&self, from: u64, to: u64) -> Vec<BlockCoinbase> {
+        self.blocks
+            .iter()
+            .filter(|blk| blk.height >= from && blk.height <= to)
+            .map(|blk| BlockCoinbase {
+                height: blk.height,
+                coinbase_rkm: blk.body.coinbase_rkm,
+                coinbase: blk.body.coinbase,
+                fees: blk.body.total_fees(),
+                name_burn: blk.body.total_name_burn(),
             })
             .collect()
     }
