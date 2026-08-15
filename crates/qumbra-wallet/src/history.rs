@@ -741,7 +741,17 @@ pub fn report_data(
         ));
     }
 
-    let crate::scan::Gathered { outcomes, coverage, set } = crate::scan::gather(w, url, from, to);
+    // 🔴 `mined` and `coinbase_coverage` are deliberately dropped here (lab
+    // #415): this ledger's events are derived from transaction outputs and the
+    // nullifier stream, and a coinbase receipt is a different event shape (no
+    // tx, no recipient, a maturity date). Folding it in unexamined would put an
+    // event in this ledger that `history`'s own grouping rules were never
+    // written for. **The consequence is stated rather than hidden: a
+    // mining-only wallet's `history` is empty while its `scan` now reads
+    // non-zero**, which is reported as a known gap on the PR rather than
+    // discovered by a miner.
+    let crate::scan::Gathered { outcomes, coverage, set, .. } =
+        crate::scan::gather(w, url, from, to);
     let scans: Vec<AddressScan> = outcomes
         .into_iter()
         .map(|(div_index, address_short, outcome)| AddressScan { div_index, address_short, outcome })

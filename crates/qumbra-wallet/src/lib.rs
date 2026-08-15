@@ -47,8 +47,17 @@
 //! empty result under `Complete` is "no **transaction** paid this key **on the
 //! chain's authority**"; under anything else it is "this scan could not know".
 //!
-//! 🔴 **And `Complete` covers transactions only — coinbase is outside it by
-//! construction (lab #415).** The compact wire is `CompactBlock { height, groups }`
+//! 🔴 **`Complete` covers transactions only — coinbase is outside it by
+//! construction, and since lab #415 the wallet fetches the other half rather
+//! than only naming it.** [`coinbase`] pages `GET /v1/coinbase`, matches the
+//! served payees against this wallet's own `rkm` lanes locally, reconstructs
+//! each mined note through the applier's own derivation
+//! (`qlab_node::coinbase_note_parts`) and splits it spendable vs maturing per
+//! the frozen §2 delay. **The verdict language below un-narrows only for a scan
+//! that actually fetched that route to the same height** — against a node that
+//! does not serve it (every host older than #415) the refusal is named and the
+//! narrowed claim stands. What follows is why the claim had to be narrowed in
+//! the first place: The compact wire is `CompactBlock { height, groups }`
 //! with no `coinbase_rkm`, so no wallet has ever been able to detect a coinbase
 //! note; `qumbra-faucet` finds its own only because it walks its own node's main
 //! chain, which a wallet by design does not have. A mining-only wallet therefore
@@ -69,6 +78,7 @@
 //! derivation, and matches locally.
 
 pub mod bundle;
+pub mod coinbase;
 pub mod contacts;
 pub mod driver;
 pub mod envelope;

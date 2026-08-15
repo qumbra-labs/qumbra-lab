@@ -776,8 +776,18 @@ fn scan(args: &[String]) -> Result<(), Box<dyn Error>> {
     let from: u64 = flag(args, "--from").unwrap_or("0").parse()?;
 
     let w = WalletDir::open(&dir)?;
-    let (scans, coverage) = qumbra_wallet::scan::scan_report(&w, url, from, to);
-    print!("{}", view::render(&scans, (from, to), url, &coverage));
+    let report = qumbra_wallet::scan::scan_report(&w, url, from, to);
+    print!(
+        "{}",
+        view::render(
+            &report.scans,
+            (from, to),
+            url,
+            &report.spent,
+            report.coinbase.as_ref(),
+            &report.coinbase_coverage,
+        )
+    );
     Ok(())
 }
 
