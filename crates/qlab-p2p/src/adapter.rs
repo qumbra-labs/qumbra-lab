@@ -2508,6 +2508,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> TxPool for NodeAdapter<P, V> {
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V> {
+    fn finalized_checkpoint(&self) -> Option<Checkpoint> {
+        self.finality.latest().copied()
+    }
+
     // #362: the real tally's stored variants — what the boundary re-push sends.
     fn checkpoint_variants_at(&self, height: u64) -> Vec<(Checkpoint, Vec<Vote>)> {
         self.tally.variants_at(height)

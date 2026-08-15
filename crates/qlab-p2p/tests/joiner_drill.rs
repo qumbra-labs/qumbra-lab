@@ -33,7 +33,7 @@ use qlab_devnet::header::BlockHeader;
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::pow::{KeccakPow, PowEngine};
 use qlab_p2p::adapter::NodeAdapter;
-use qlab_p2p::n1::{BlockIngest, ChainView, IngestOutcome};
+use qlab_p2p::n1::{BlockIngest, ChainView, CheckpointIngest, IngestOutcome};
 use qlab_p2p::sync::SyncPhase;
 use qlab_p2p::transport::TcpTransport;
 use qlab_p2p::P2pNode;
@@ -198,6 +198,61 @@ fn quorum_checkpoint_skips_historical_pow_below_its_frontier() {
         pow_calls.load(Ordering::Relaxed),
         (TIP - FINALIZED) as usize,
         "only the eight above-checkpoint headers run PoW; the 64-header attested span does not"
+    );
+}
+
+/// Fleet-shaped ordering regression for QUM-115: another checkpoint path may
+/// verify the exact quorum checkpoint before the eager query response is handled.
+/// That response is `Stale` at the tally, but the ordinary TCP `GetHeaders`
+/// stream must still enter checkpoint buffering rather than `submit_header`.
+#[test]
+fn already_verified_checkpoint_still_routes_tcp_headers_through_the_skip_span() {
+    const TIP: u64 = 72;
+    const FINALIZED: u64 = 64;
+    let servers = seeded_servers(TIP as usize);
+    let frontier = servers[0].main_chain_hash_at(FINALIZED).expect("frontier");
+    let checkpoint = Checkpoint::new(FINALIZED, frontier, frontier);
+    let (_, validators) = devnet_committee(7);
+    let votes = validators[..5]
+        .iter()
+        .map(|validator| validator.sign_checkpoint(&checkpoint))
+        .collect::<Vec<_>>();
+
+    let pow_calls = Arc::new(AtomicUsize::new(0));
+    let mut joiner_state = NodeAdapter::new(
+        committee(),
+        CountingPow { calls: Arc::clone(&pow_calls) },
+        MarkerVerifier,
+        easy_sim(),
+    );
+    assert!(matches!(
+        joiner_state.ingest_requested_checkpoint_votes(&checkpoint, &votes),
+        qlab_p2p::n1::VotesOutcome::Learned { finalized: true, .. }
+    ));
+    let (mut servers, mut joiner) = wire(servers, joiner_state);
+    for server in &mut servers {
+        server.announce_checkpoint(checkpoint, votes.clone());
+    }
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(30) {
+        let now_ms = start.elapsed().as_millis() as u64;
+        for server in &mut servers {
+            server.tick(now_ms);
+        }
+        joiner.tick(now_ms);
+        if joiner.node().state_lag().blocks() == 0 && joiner.node().tip_height() == TIP {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    assert_eq!(joiner.node().tip_height(), TIP);
+    assert_eq!(joiner.node().state_lag().blocks(), 0);
+    assert_eq!(
+        pow_calls.load(Ordering::Relaxed),
+        (TIP - FINALIZED) as usize,
+        "the exact already-verified checkpoint still owns the below-finality TCP header path"
     );
 }
 

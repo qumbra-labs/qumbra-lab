@@ -1907,16 +1907,23 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         } else {
             self.node.ingest_checkpoint_votes(&cp, &votes)
         };
+        // A live joiner can learn and quorum-verify this exact checkpoint before
+        // its eager query response is dispatched (for example through another
+        // ready peer). The response then reports `Stale`: true, but too coarse to
+        // mean "unverified". Arm checkpoint-sync whenever THIS requested object
+        // either finalized now or is byte-for-byte the checkpoint the authoritative
+        // finality tracker already accepted. Height-only equality would be unsafe
+        // in the presence of two variants at one slot.
+        let arm_checkpoint_sync = explicitly_requested
+            && (matches!(outcome, VotesOutcome::Learned { finalized: true, .. })
+                || (matches!(outcome, VotesOutcome::Stale)
+                    && self.node.finalized_checkpoint() == Some(cp)));
         match outcome {
             VotesOutcome::Learned { finalized, accumulated } => {
                 // Relay the accumulated set onward (sender excluded) — direct-push
                 // gossip converges the mesh; a well-formed partial is never penalised.
                 self.push_checkpoint_votes(&cp, &accumulated, Some(from));
                 if finalized {
-                    if explicitly_requested {
-                        self.eager_checkpoint_done = true;
-                        self.begin_checkpoint_sync(cp, from);
-                    }
                     self.store_and_announce_finalized(cp, accumulated, Some(from));
                 }
             }
@@ -1929,6 +1936,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                     self.peers.penalize(from, PENALTY_INVALID_OBJECT);
                 }
             }
+        }
+        if arm_checkpoint_sync {
+            self.eager_checkpoint_done = true;
+            self.begin_checkpoint_sync(cp, from);
         }
     }
 
@@ -1958,6 +1969,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             base_timestamp: base.timestamp,
             headers: Vec::with_capacity(capacity),
         });
+        println!(
+            "CHECKPOINT_SYNC event=begin_checkpoint_sync peer={} base={} checkpoint={} headers_cap={}",
+            peer.0, base.height, checkpoint.height, capacity
+        );
     }
 
     // --- committee: equivocation evidence gossip (M9-N5) ---
@@ -2196,6 +2211,12 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             self.checkpoint_sync_fallback = true;
             return CheckpointHeaderOutcome::Fallback;
         }
+        if sync.headers.is_empty() {
+            println!(
+                "CHECKPOINT_SYNC event=buffer peer={} first={} checkpoint={}",
+                from.0, header.height, sync.checkpoint.height
+            );
+        }
         sync.headers.push(header);
         if header.height < sync.checkpoint.height {
             return CheckpointHeaderOutcome::Buffered;
@@ -2211,11 +2232,16 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
 
         let sync = self.checkpoint_sync.take().expect("present above");
+        let admitted = sync.headers.len();
         match self.node.ingest_finalized_headers(&sync.headers) {
             IngestOutcome::Accepted => {
                 for buffered in sync.headers {
                     self.seen.insert(buffered.header_hash());
                 }
+                println!(
+                    "CHECKPOINT_SYNC event=admit peer={} checkpoint={} headers={} pow=skipped",
+                    from.0, sync.checkpoint.height, admitted
+                );
                 CheckpointHeaderOutcome::Admitted
             }
             _ => {
@@ -2681,6 +2707,91 @@ mod tests {
         );
 
         assert_eq!(nodes[0].tallest_ready_peer(), Some(eager_peer));
+    }
+
+    #[test]
+    fn eager_duplicate_of_the_exact_verified_checkpoint_arms_header_buffering() {
+        let hub = InProcHub::new();
+        let mut joiner = P2pNode::new(
+            InProcTransport::new(PeerId(2), Arc::clone(&hub)),
+            stub(),
+            [2; 32],
+        );
+        joiner.add_peer(PeerId(1), None);
+
+        let (_, validators) = devnet_committee(7);
+        let checkpoint = Checkpoint::new(3, [0x33; 32], [0x33; 32]);
+        let votes = validators[..5]
+            .iter()
+            .map(|validator| validator.sign_checkpoint(&checkpoint))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            joiner.node_mut().ingest_requested_checkpoint_votes(&checkpoint, &votes),
+            VotesOutcome::Learned { finalized: true, .. }
+        ));
+
+        joiner.cp_queries.insert(
+            checkpoint_query_id(u64::MAX),
+            CheckpointQuery {
+                sent_ms: 0,
+                peer: PeerId(1),
+                kind: CheckpointQueryKind::Eager,
+            },
+        );
+        joiner.on_checkpoint(PeerId(1), &encode_checkpoint_msg(&checkpoint, &votes));
+
+        let sync = joiner.checkpoint_sync.as_ref().expect(
+            "an eager response for the exact already-verified checkpoint must route live headers through the buffer",
+        );
+        assert_eq!(sync.checkpoint, checkpoint);
+        assert_eq!(sync.peer, PeerId(1));
+    }
+
+    #[test]
+    fn eager_same_height_competing_checkpoint_does_not_arm_header_buffering() {
+        let hub = InProcHub::new();
+        let mut joiner = P2pNode::new(
+            InProcTransport::new(PeerId(2), Arc::clone(&hub)),
+            stub(),
+            [2; 32],
+        );
+        joiner.add_peer(PeerId(1), None);
+
+        let (_, validators) = devnet_committee(7);
+        let finalized = Checkpoint::new(3, [0x33; 32], [0x33; 32]);
+        let finalized_votes = validators[..5]
+            .iter()
+            .map(|validator| validator.sign_checkpoint(&finalized))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            joiner
+                .node_mut()
+                .ingest_requested_checkpoint_votes(&finalized, &finalized_votes),
+            VotesOutcome::Learned { finalized: true, .. }
+        ));
+
+        let competing = Checkpoint::new(3, [0x44; 32], [0x44; 32]);
+        let competing_votes = validators[..5]
+            .iter()
+            .map(|validator| validator.sign_checkpoint(&competing))
+            .collect::<Vec<_>>();
+        joiner.cp_queries.insert(
+            checkpoint_query_id(u64::MAX),
+            CheckpointQuery {
+                sent_ms: 0,
+                peer: PeerId(1),
+                kind: CheckpointQueryKind::Eager,
+            },
+        );
+        joiner.on_checkpoint(
+            PeerId(1),
+            &encode_checkpoint_msg(&competing, &competing_votes),
+        );
+
+        assert!(
+            joiner.checkpoint_sync.is_none(),
+            "height equality must not substitute a competing checkpoint identity for the finalized one"
+        );
     }
 
     /// The header for a block over `parent` announcing `txs` + `coinbase` — it

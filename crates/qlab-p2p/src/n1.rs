@@ -357,6 +357,14 @@ pub trait TxPool {
 
 /// Ingest checkpoint-vote gossip (checkpoint + committee votes).
 pub trait CheckpointIngest {
+    /// The exact checkpoint most recently accepted by the authoritative quorum
+    /// gate. Height alone is insufficient here: two checkpoint variants can
+    /// occupy one height, and checkpoint-sync may only trust the variant whose
+    /// identity the finality tracker actually recorded.
+    fn finalized_checkpoint(&self) -> Option<Checkpoint> {
+        None
+    }
+
     /// Accumulate a (possibly partial) vote set for `cp` across messages (M10-T0-5).
     /// Verifies each vote against `cp`'s epoch roster, excludes tombstoned/jailed
     /// signers, de-duplicates by signer into the bounded tally, and finalizes through
@@ -642,6 +650,10 @@ impl TxPool for StubNode {
 }
 
 impl CheckpointIngest for StubNode {
+    fn finalized_checkpoint(&self) -> Option<Checkpoint> {
+        self.finality.latest().copied()
+    }
+
     fn ingest_checkpoint_votes_from(
         &mut self,
         cp: &Checkpoint,
