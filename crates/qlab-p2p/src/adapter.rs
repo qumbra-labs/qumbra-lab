@@ -1721,6 +1721,23 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             self.ingest_counters.halt_ignored += 1;
             return IngestOutcome::Ignored("above halt height");
         }
+        // Lab #412: the validated header store is also the immutable PoW-verdict
+        // cache. Header-first sync deliberately learns a header before fetching its
+        // body, so the normal body path submits the exact same header again. The old
+        // order ran `validate_header_under` first — including RandomX and the two
+        // ancestor walks — and only then let `ChainState::insert_header` discover
+        // the duplicate. On a from-genesis join every historical body therefore
+        // re-ran memory-hard PoW in `pump.dispatch`.
+        //
+        // A hash present in `self.chain` got there through the validation below
+        // (apart from locally-constructed genesis), and the hash commits to every
+        // header field. Its verdict cannot change with later chain state. Check the
+        // release-height gate first so a halted binary keeps ignoring above-H input
+        // even if such a header was learned under a previous rule schedule.
+        let header_hash = header.header_hash();
+        if self.chain.header(&header_hash).is_some() {
+            return IngestOutcome::Duplicate;
+        }
         // Real PoW + LWMA difficulty + key-seed validation (N3), under this
         // release's rules (the PoW VALUE is domain-separated above an upgrade
         // boundary; at and below it, byte-identical to the v1.0 rules).
@@ -1754,7 +1771,6 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // so the histogram describes the main chain the issue measured, not every
         // side branch that was ever offered.
         let parent_ts = self.chain.header(&header.prev).map(|p| p.timestamp);
-        let header_hash = header.header_hash();
         let header_ts = header.timestamp;
         match self.chain.insert_header(header) {
             Ok(_) => {
