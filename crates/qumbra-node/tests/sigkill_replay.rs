@@ -127,6 +127,12 @@ committee_key_paths = [
 {keys}
 ]
 mining = true
+# Issue #411: discovery_addr defaults to the FIXED loopback port 9420, so any
+# other qumbra-node alive on this machine — a leaked child of an aborted run, a
+# dev node — makes this child exit at startup with EADDRINUSE on stderr, which
+# a stdout needle-wait then misreads as a silent hang. This test never reads
+# /v1/compact, so it opts out of the binary's one fixed-port default.
+discovery_addr = "off"
 "#,
         data = data_dir.display(),
         genesis = base.join("genesis.qmb").display(),
@@ -137,23 +143,52 @@ mining = true
     cfg_path
 }
 
+/// A spawned node that is KILLED WHEN DROPPED, so a panicking wait cannot leak
+/// a live mining node. Before this guard, any timed-out wait below left the
+/// child running forever — burning CPU and, before `discovery_addr = "off"`
+/// above, holding port 9420 so that every later run of this test failed at
+/// startup: issue #411's self-sustaining state.
+struct NodeProc(Child);
+
+impl Drop for NodeProc {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl std::ops::Deref for NodeProc {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for NodeProc {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
 /// Spawn the real binary with the **default (real M3) tx verifier** — no
 /// `--rehearsal-verifier`. A T0 chain mines coinbase-only blocks so the verifier
 /// is never called, and running the default keeps this test on the production
 /// startup path rather than beside it.
-fn spawn_node(cfg_path: &Path) -> Child {
-    Command::new(bin())
-        .args([
-            "run",
-            "--config",
-            cfg_path.to_str().unwrap(),
-            "--sample-interval-secs",
-            SAMPLE_SECS,
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn qumbra-node")
+fn spawn_node(cfg_path: &Path) -> NodeProc {
+    NodeProc(
+        Command::new(bin())
+            .args([
+                "run",
+                "--config",
+                cfg_path.to_str().unwrap(),
+                "--sample-interval-secs",
+                SAMPLE_SECS,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn qumbra-node"),
+    )
 }
 
 /// Drain a child pipe on a background thread into a shared buffer, so the test
@@ -177,6 +212,9 @@ fn start_drain<R: std::io::Read + Send + 'static>(pipe: R) -> Arc<Mutex<String>>
     buf
 }
 
+/// Wait for `needle` in a pipe buffer AFTER the child is known to have exited
+/// (the post-SIGTERM "shutdown complete" read). For a wait on a child that must
+/// still be alive, use [`wait_for_needle_live`].
 fn wait_for_needle(buf: &Mutex<String>, needle: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -191,11 +229,60 @@ fn wait_for_needle(buf: &Mutex<String>, needle: &str, timeout: Duration) {
     }
 }
 
+/// Wait for `needle` in the child's stdout, panicking IMMEDIATELY — with both
+/// pipes' contents — if the child exits first. A dead child can never print the
+/// needle, so burning the full timeout on one is pure disguise: issue #411
+/// spent two days as a "macOS hang" that was really an instant
+/// `Address already in use` exit, stated the whole time on a stderr that no
+/// panic message ever showed.
+fn wait_for_needle_live(
+    child: &mut Child,
+    out: &Mutex<String>,
+    err: &Mutex<String>,
+    needle: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if out.lock().unwrap().contains(needle) {
+            return;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            // A beat for the drain threads to flush what the child last wrote.
+            std::thread::sleep(Duration::from_millis(200));
+            if out.lock().unwrap().contains(needle) {
+                return;
+            }
+            let stdout = out.lock().unwrap().clone();
+            let stderr = err.lock().unwrap().clone();
+            panic!(
+                "child exited ({status}) before printing `{needle}`;\n\
+                 --- captured stdout:\n{stdout}\n--- captured stderr:\n{stderr}"
+            );
+        }
+        if Instant::now() > deadline {
+            let stdout = out.lock().unwrap().clone();
+            let stderr = err.lock().unwrap().clone();
+            panic!(
+                "timed out waiting for `{needle}` in child stdout (child still running);\n\
+                 --- captured stdout:\n{stdout}\n--- captured stderr:\n{stderr}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Wait until the node's own telemetry says it is at `height`. `tip=` is the
 /// first field on the line, so the trailing space makes `tip=3` unambiguous
 /// against `tip=30`.
-fn wait_for_tip(buf: &Mutex<String>, height: u64, timeout: Duration) {
-    wait_for_needle(buf, &format!("TELEMETRY tip={height} "), timeout);
+fn wait_for_tip(
+    child: &mut Child,
+    out: &Mutex<String>,
+    err: &Mutex<String>,
+    height: u64,
+    timeout: Duration,
+) {
+    wait_for_needle_live(child, out, err, &format!("TELEMETRY tip={height} "), timeout);
 }
 
 fn signal(pid: u32, sig: &str) {
@@ -263,10 +350,10 @@ fn a_sigkilled_node_replays_the_log_past_a_stale_snapshot() {
     let mut child = spawn_node(&cfg_path);
     let pid = child.id();
     let out = start_drain(child.stdout.take().expect("stdout piped"));
-    let _err = start_drain(child.stderr.take().expect("stderr piped"));
+    let err = start_drain(child.stderr.take().expect("stderr piped"));
 
-    wait_for_needle(&out, BANNER_END, START_TIMEOUT);
-    wait_for_tip(&out, 1, BLOCK_TIMEOUT);
+    wait_for_needle_live(&mut child, &out, &err, BANNER_END, START_TIMEOUT);
+    wait_for_tip(&mut child, &out, &err, 1, BLOCK_TIMEOUT);
     signal(pid, "-TERM");
     let status = wait_exit(&mut child, STOP_TIMEOUT, "SIGTERM");
     assert!(status.success(), "graceful stop must exit 0; got {status}");
@@ -287,9 +374,9 @@ fn a_sigkilled_node_replays_the_log_past_a_stale_snapshot() {
     let mut child = spawn_node(&cfg_path);
     let pid = child.id();
     let out2 = start_drain(child.stdout.take().expect("stdout piped"));
-    let _err2 = start_drain(child.stderr.take().expect("stderr piped"));
+    let err2 = start_drain(child.stderr.take().expect("stderr piped"));
 
-    wait_for_needle(&out2, BANNER_END, START_TIMEOUT);
+    wait_for_needle_live(&mut child, &out2, &err2, BANNER_END, START_TIMEOUT);
     // The CONTROL. This restart followed a graceful stop, so it is exactly the
     // reading issue #180 is about: a snapshot at the tip and nothing left to
     // replay. If this line ever stops being `0`, the contrast the test draws is
@@ -303,7 +390,7 @@ fn a_sigkilled_node_replays_the_log_past_a_stale_snapshot() {
         banner2.contains(&clean_restart),
         "a restart after a graceful stop must replay nothing (`{clean_restart}`); stdout:\n{banner2}"
     );
-    wait_for_tip(&out2, target_tip, BLOCK_TIMEOUT * 2);
+    wait_for_tip(&mut child, &out2, &err2, target_tip, BLOCK_TIMEOUT * 2);
 
     // SIGKILL: uncatchable, so no handler runs, no flush is attempted, and the
     // snapshot on disk is exactly the one the graceful stop in (1) wrote.
@@ -409,8 +496,8 @@ fn a_sigkilled_node_replays_the_log_past_a_stale_snapshot() {
     let mut child = spawn_node(&cfg_path);
     let pid = child.id();
     let out3 = start_drain(child.stdout.take().expect("stdout piped"));
-    let _err3 = start_drain(child.stderr.take().expect("stderr piped"));
-    wait_for_needle(&out3, BANNER_END, START_TIMEOUT);
+    let err3 = start_drain(child.stderr.take().expect("stderr piped"));
+    wait_for_needle_live(&mut child, &out3, &err3, BANNER_END, START_TIMEOUT);
     let captured3 = out3.lock().unwrap().clone();
     assert!(
         captured3.contains(&expected),
