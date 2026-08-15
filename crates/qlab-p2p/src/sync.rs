@@ -124,6 +124,23 @@ pub fn build_locator(view: &dyn ChainView) -> Locator {
     Locator { have, stop: ZERO_HASH }
 }
 
+/// Build a locator while a quorum-attested header span is buffered outside the
+/// validated chain. The buffered frontier goes first so an honest peer continues
+/// after it; the ordinary main-chain locator remains the fallback if that peer no
+/// longer recognizes the provisional frontier.
+pub fn build_locator_with_frontier(
+    view: &dyn ChainView,
+    buffered_frontier: Option<Hash32>,
+) -> Locator {
+    let mut locator = build_locator(view);
+    if let Some(frontier) = buffered_frontier {
+        if locator.have.first().copied() != Some(frontier) {
+            locator.have.insert(0, frontier);
+        }
+    }
+    locator
+}
+
 /// Answer a `GetHeaders`: find the highest locator hash that is on our main
 /// chain (fall back to genesis), then return up to `max` main-chain headers
 /// after it, ancestor-first, stopping at the locator's `stop` hash if reached.

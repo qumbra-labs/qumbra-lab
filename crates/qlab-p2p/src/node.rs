@@ -33,7 +33,10 @@ use crate::n1::{IngestOutcome, NodeState, VotesOutcome};
 use crate::peer::{NodeId, PeerId, PeerTable, VersionMsg};
 use crate::ratelimit::{RateKey, RateLimiter, RateLimits, RateStats};
 use crate::sendstall::stall_line;
-use crate::sync::{build_locator, answer_get_headers, SyncPhase, SyncState, MAX_HEADERS_PER_BATCH};
+use crate::sync::{
+    answer_get_headers, build_locator_with_frontier, SyncPhase, SyncState,
+    MAX_HEADERS_PER_BATCH,
+};
 use crate::ticktime::{lap, TickTimings};
 use qlab_devnet::finality::next_checkpoint_height;
 use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
@@ -202,6 +205,17 @@ pub const CHECKPOINT_QUERY_INTERVAL_MS: u64 = 5_000;
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
 pub const MAX_CHECKPOINT_QUERIES_IN_FLIGHT: usize = 1;
 
+/// Maximum quorum-attested headers held outside [`crate::n1::ChainView`] while a
+/// joiner proves the span reaches its fetched finalized checkpoint.
+///
+/// A header is exactly 98 encoded bytes, so 65,536 entries cap canonical header
+/// bytes at 6,422,528 bytes (6.125 MiB), while covering more than seven times the
+/// 8,640-block live-history gate that motivated checkpoint sync. A checkpoint
+/// farther ahead falls back to ordinary full-PoW sync without allocating.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_CHECKPOINT_SYNC_HEADERS: usize = 65_536;
+
 /// **How far this node's own chain must run past a checkpoint slot it has not
 /// finalized before it asks the net about it** (issue #204), in blocks.
 ///
@@ -259,6 +273,50 @@ impl AskRecord {
     fn new(now_ms: u64) -> Self {
         Self { first_ms: now_ms, last_ask_ms: now_ms, ..Self::default() }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointQueryKind {
+    CatchUp,
+    Eager,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CheckpointQuery {
+    sent_ms: u64,
+    peer: PeerId,
+    kind: CheckpointQueryKind,
+}
+
+/// A contiguous, structurally checked header span held outside the validated
+/// chain until its frontier hash matches the quorum-attested checkpoint.
+struct CheckpointSync {
+    checkpoint: Checkpoint,
+    peer: PeerId,
+    base_hash: Hash32,
+    base_height: u64,
+    base_timestamp: u64,
+    headers: Vec<BlockHeader>,
+}
+
+impl CheckpointSync {
+    fn frontier_hash(&self) -> Hash32 {
+        self.headers.last().map_or(self.base_hash, BlockHeader::header_hash)
+    }
+
+    fn frontier_height(&self) -> u64 {
+        self.headers.last().map_or(self.base_height, |header| header.height)
+    }
+
+    fn frontier_timestamp(&self) -> u64 {
+        self.headers.last().map_or(self.base_timestamp, |header| header.timestamp)
+    }
+}
+
+enum CheckpointHeaderOutcome {
+    Buffered,
+    Admitted,
+    Fallback,
 }
 
 /// One cached body: the ordered txs, the coinbase counter and the payout key —
@@ -429,7 +487,7 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// the unobtainable-body exemption keys on exhaustion, not on lag alone.
     body_fetch_progress: bool,
     /// **Finalized-checkpoint queries we have outstanding** (issue #204): query id
-    /// → the `now_ms` the ask was sent at. Bounded by
+    /// → send time, peer, and whether this is checkpoint-sync's eager query. Bounded by
     /// [`MAX_CHECKPOINT_QUERIES_IN_FLIGHT`]; an entry older than
     /// [`CHECKPOINT_QUERY_INTERVAL_MS`] is dropped so the question may be asked
     /// again, of a different peer.
@@ -438,10 +496,21 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// a peer that holds nothing above our finalized head answers `NotFound`
     /// honestly, and so does every node running an image that predates this query.
     /// Scoring either would ban honest peers — #130 (c)'s finding, in a new place.
-    cp_queries: HashMap<Hash32, u64>,
+    cp_queries: HashMap<Hash32, CheckpointQuery>,
     /// Rotation cursor for the peer a query is sent to, so one peer that cannot or
     /// will not answer costs one interval rather than the whole recovery.
     cp_query_rr: usize,
+    /// Whether the one eager latest-checkpoint response for this sync run has
+    /// been answered. Silence is retried on the ordinary query cadence; any answer
+    /// completes the attempt, with stale/lower/refused evidence harmlessly leaving
+    /// a smaller (possibly empty) skip span and full PoW as the fallback.
+    eager_checkpoint_done: bool,
+    /// Quorum-attested headers waiting for their frontier match. This is outside
+    /// the node state's validated [`ChainView`] by construction.
+    checkpoint_sync: Option<CheckpointSync>,
+    /// Set after a frontier/structural failure so the same fetched checkpoint
+    /// cannot repeatedly re-arm buffering; subsequent headers take full PoW.
+    checkpoint_sync_fallback: bool,
     /// **The joiner drill's mutation switch** (issue #371 S5): when `false`,
     /// `GetData(Block)` is answered header-only — byte-for-byte the pre-#182
     /// wire behaviour — so the in-suite drill can demonstrate that with
@@ -487,6 +556,9 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             body_fetch_progress: false,
             cp_queries: HashMap::new(),
             cp_query_rr: 0,
+            eager_checkpoint_done: false,
+            checkpoint_sync: None,
+            checkpoint_sync_fallback: false,
             serve_historical_bodies: true,
             last_tick: TickTimings::default(),
             send_ns: std::cell::Cell::new(0),
@@ -1044,9 +1116,13 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             timings.dispatch += lap(&mut t);
         }
+        // Ask for a recent finalized checkpoint before the first header request.
+        // An honest peer then queues the quorum evidence ahead of its Headers
+        // response, letting a fresh joiner establish the checkpoint before it
+        // encounters the RandomX-heavy historical burst.
+        self.request_finalized_checkpoint(now_ms);
         self.maybe_start_sync();
         self.request_missing_bodies(now_ms);
-        self.request_finalized_checkpoint(now_ms);
         // Issue #200: after (re)issuing asks, hand the duty-gate exemption the
         // facts it keys on — outstanding asks + whether any ask was satisfied
         // this tick. Progress is cleared for the next tick so a single delivery
@@ -1304,11 +1380,24 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// this query. Nothing on this path is scored.
     fn request_finalized_checkpoint(&mut self, now_ms: u64) {
         self.cp_queries
-            .retain(|_, sent| now_ms.saturating_sub(*sent) < CHECKPOINT_QUERY_INTERVAL_MS);
+            .retain(|_, query| {
+                now_ms.saturating_sub(query.sent_ms) < CHECKPOINT_QUERY_INTERVAL_MS
+            });
         if self.cp_queries.len() >= MAX_CHECKPOINT_QUERIES_IN_FLIGHT {
             return;
         }
-        let Some(at_or_below) = self.checkpoint_query_target() else {
+        let best = self.peers.best_height();
+        let eager = !self.eager_checkpoint_done
+            && self.checkpoint_sync.is_none()
+            && !self.checkpoint_sync_fallback
+            && best.is_some_and(|height| height > self.node.tip_height());
+        let (at_or_below, kind) = if eager {
+            // Existing #204 query semantics: the maximum bound asks the peer for
+            // the latest finalized checkpoint it holds. No new codepoint or payload.
+            (u64::MAX, CheckpointQueryKind::Eager)
+        } else if let Some(target) = self.checkpoint_query_target() {
+            (target, CheckpointQueryKind::CatchUp)
+        } else {
             return;
         };
         let id = checkpoint_query_id(at_or_below);
@@ -1321,7 +1410,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
         let pid = peers[self.cp_query_rr % peers.len()];
         self.cp_query_rr = self.cp_query_rr.wrapping_add(1);
-        self.cp_queries.insert(id, now_ms);
+        self.cp_queries.insert(id, CheckpointQuery { sent_ms: now_ms, peer: pid, kind });
         self.send(pid, MsgType::GetData, encode_inv(&[InvItem { kind: InvKind::Checkpoint, id }]));
     }
 
@@ -1478,6 +1567,12 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         self.count_unknown_inv(&inv);
+        let eager_not_found = inv.items.iter().find_map(|item| {
+            self.cp_queries.get(&item.id).and_then(|query| {
+                (query.peer == from && query.kind == CheckpointQueryKind::Eager)
+                    .then_some(item.id)
+            })
+        });
         // Issue #229, before the scoring decision and independent of it: a
         // `NotFound` for a hash we asked for is **the peer's answer**, and it is one
         // of the three readings that separate layer (b) from (a) and (c). It says
@@ -1502,6 +1597,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             .any(|it| !self.body_reqs.contains_key(&it.id) && !self.cp_queries.contains_key(&it.id))
         {
             self.peers.penalize(from, PENALTY_WELSHED_INV);
+        }
+        if let Some(id) = eager_not_found {
+            self.cp_queries.remove(&id);
+            self.eager_checkpoint_done = true;
         }
     }
 
@@ -1753,7 +1852,25 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return;
             }
         };
-        self.absorb_votes(from, cp, votes);
+        // A Checkpoint response does not echo its GetData query id. Bind the
+        // ahead-of-tip bypass to the peer we explicitly asked; unsolicited
+        // checkpoint messages, including one racing from another peer, keep the
+        // ordinary tally window.
+        let eager_query = self
+            .cp_queries
+            .iter()
+            .find(|(_, query)| {
+                query.peer == from && query.kind == CheckpointQueryKind::Eager
+            })
+            .map(|(id, _)| *id);
+        if let Some(id) = eager_query {
+            self.cp_queries.remove(&id);
+            // One response completes the eager attempt. A stale/lower, partial,
+            // or invalid answer simply leaves header sync on full PoW; it must not
+            // turn into a repeated ~70 KiB query loop while the joiner is busy.
+            self.eager_checkpoint_done = true;
+        }
+        self.absorb_votes(from, cp, votes, eager_query.is_some());
     }
 
     /// Handle a `CheckpointVotes` (0x0024) partial set — the accumulation path
@@ -1767,24 +1884,39 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return;
             }
         };
-        self.absorb_votes(from, cp, votes);
+        self.absorb_votes(from, cp, votes, false);
     }
 
     /// Shared body for both checkpoint-vote message types: run equivocation
     /// observation, feed the tally, then relay/score by [`VotesOutcome`].
-    fn absorb_votes(&mut self, from: PeerId, cp: Checkpoint, votes: Vec<Vote>) {
+    fn absorb_votes(
+        &mut self,
+        from: PeerId,
+        cp: Checkpoint,
+        votes: Vec<Vote>,
+        explicitly_requested: bool,
+    ) {
         // Equivocation path: a set's votes may reveal a signer that already signed a
         // conflicting checkpoint at this slot. Detect it, tombstone locally, and gossip
         // the evidence BEFORE the tally counts, so a tombstoned vote cannot reach quorum.
         for ev in self.node.observe_votes(&cp, &votes) {
             self.punish_and_gossip_evidence(ev);
         }
-        match self.node.ingest_checkpoint_votes(&cp, &votes) {
+        let outcome = if explicitly_requested {
+            self.node.ingest_requested_checkpoint_votes(&cp, &votes)
+        } else {
+            self.node.ingest_checkpoint_votes(&cp, &votes)
+        };
+        match outcome {
             VotesOutcome::Learned { finalized, accumulated } => {
                 // Relay the accumulated set onward (sender excluded) — direct-push
                 // gossip converges the mesh; a well-formed partial is never penalised.
                 self.push_checkpoint_votes(&cp, &accumulated, Some(from));
                 if finalized {
+                    if explicitly_requested {
+                        self.eager_checkpoint_done = true;
+                        self.begin_checkpoint_sync(cp, from);
+                    }
                     self.store_and_announce_finalized(cp, accumulated, Some(from));
                 }
             }
@@ -1798,6 +1930,34 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 }
             }
         }
+    }
+
+    fn begin_checkpoint_sync(&mut self, checkpoint: Checkpoint, peer: PeerId) {
+        if self.checkpoint_sync_fallback || checkpoint.height <= self.node.tip_height() {
+            return;
+        }
+        let span = checkpoint.height.saturating_sub(self.node.tip_height());
+        let Ok(capacity) = usize::try_from(span) else {
+            self.checkpoint_sync_fallback = true;
+            return;
+        };
+        if capacity > MAX_CHECKPOINT_SYNC_HEADERS {
+            self.checkpoint_sync_fallback = true;
+            return;
+        }
+        let base_hash = self.node.tip_hash();
+        let Some(base) = self.node.header(&base_hash) else {
+            self.checkpoint_sync_fallback = true;
+            return;
+        };
+        self.checkpoint_sync = Some(CheckpointSync {
+            checkpoint,
+            peer,
+            base_hash,
+            base_height: base.height,
+            base_timestamp: base.timestamp,
+            headers: Vec::with_capacity(capacity),
+        });
     }
 
     // --- committee: equivocation evidence gossip (M9-N5) ---
@@ -1885,6 +2045,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     }
 
     fn tallest_ready_peer(&self) -> Option<PeerId> {
+        if let Some(sync) = &self.checkpoint_sync {
+            if self.peers.is_ready(sync.peer) {
+                return Some(sync.peer);
+            }
+        }
         self.peers
             .ready_peers()
             .into_iter()
@@ -1897,10 +2062,18 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         if !self.peers.is_ready(peer) {
             return;
         }
-        let loc = build_locator(&self.node);
+        if self.checkpoint_sync.as_ref().is_some_and(|sync| sync.peer != peer) {
+            let checkpoint = self.checkpoint_sync.take().expect("checked above").checkpoint;
+            self.begin_checkpoint_sync(checkpoint, peer);
+        }
+        let frontier = self.checkpoint_sync.as_ref().map(CheckpointSync::frontier_hash);
+        let loc = build_locator_with_frontier(&self.node, frontier);
         self.send(peer, MsgType::GetHeaders, encode_locator(&loc));
-        self.sync.phase =
-            SyncPhase::AwaitingHeaders { peer, from_height: self.node.tip_height() };
+        let from_height = self
+            .checkpoint_sync
+            .as_ref()
+            .map_or(self.node.tip_height(), CheckpointSync::frontier_height);
+        self.sync.phase = SyncPhase::AwaitingHeaders { peer, from_height };
     }
 
     fn on_get_headers(&mut self, from: PeerId, payload: &[u8]) {
@@ -1926,6 +2099,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         let batch_len = batch.len();
         let mut accepted = 0;
         for h in batch {
+            if self.checkpoint_sync.is_some() {
+                match self.ingest_checkpoint_sync_header(from, h) {
+                    CheckpointHeaderOutcome::Buffered => {
+                        accepted += 1;
+                        continue;
+                    }
+                    CheckpointHeaderOutcome::Admitted => {
+                        accepted += 1;
+                        continue;
+                    }
+                    CheckpointHeaderOutcome::Fallback => break,
+                }
+            }
             let id = h.header_hash();
             match self.node.ingest_header(h) {
                 IngestOutcome::Accepted => {
@@ -1953,16 +2139,74 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         let still_behind = best.is_some_and(|b| b > self.node.tip_height());
         if batch_len == MAX_HEADERS_PER_BATCH && still_behind && accepted > 0 {
             // Full batch and more to go → request the next one.
-            let loc = build_locator(&self.node);
+            let frontier = self.checkpoint_sync.as_ref().map(CheckpointSync::frontier_hash);
+            let loc = build_locator_with_frontier(&self.node, frontier);
             self.send(from, MsgType::GetHeaders, encode_locator(&loc));
-            self.sync.phase =
-                SyncPhase::AwaitingHeaders { peer: from, from_height: self.node.tip_height() };
+            let from_height = self
+                .checkpoint_sync
+                .as_ref()
+                .map_or(self.node.tip_height(), CheckpointSync::frontier_height);
+            self.sync.phase = SyncPhase::AwaitingHeaders { peer: from, from_height };
         } else {
             self.sync.phase = match best {
                 None => SyncPhase::Unknown,
                 Some(_) if still_behind => SyncPhase::Behind,
                 Some(_) => SyncPhase::Synced,
             };
+        }
+    }
+
+    fn ingest_checkpoint_sync_header(
+        &mut self,
+        from: PeerId,
+        header: BlockHeader,
+    ) -> CheckpointHeaderOutcome {
+        let Some(sync) = self.checkpoint_sync.as_mut() else {
+            return CheckpointHeaderOutcome::Fallback;
+        };
+        if sync.peer != from {
+            self.checkpoint_sync = None;
+            self.checkpoint_sync_fallback = true;
+            return CheckpointHeaderOutcome::Fallback;
+        }
+        let expected_height = sync.frontier_height().saturating_add(1);
+        let expected_prev = sync.frontier_hash();
+        if header.height != expected_height
+            || header.prev != expected_prev
+            || header.timestamp < sync.frontier_timestamp()
+            || sync.headers.len() >= MAX_CHECKPOINT_SYNC_HEADERS
+        {
+            self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+            self.checkpoint_sync = None;
+            self.checkpoint_sync_fallback = true;
+            return CheckpointHeaderOutcome::Fallback;
+        }
+        sync.headers.push(header);
+        if header.height < sync.checkpoint.height {
+            return CheckpointHeaderOutcome::Buffered;
+        }
+
+        let checkpoint_matches = header.height == sync.checkpoint.height
+            && header.header_hash() == sync.checkpoint.block_hash;
+        if !checkpoint_matches {
+            self.peers.penalize(from, PENALTY_INVALID_OBJECT);
+            self.checkpoint_sync = None;
+            self.checkpoint_sync_fallback = true;
+            return CheckpointHeaderOutcome::Fallback;
+        }
+
+        let sync = self.checkpoint_sync.take().expect("present above");
+        match self.node.ingest_finalized_headers(&sync.headers) {
+            IngestOutcome::Accepted => {
+                for buffered in sync.headers {
+                    self.seen.insert(buffered.header_hash());
+                }
+                CheckpointHeaderOutcome::Admitted
+            }
+            _ => {
+                self.checkpoint_sync_fallback = true;
+                CheckpointHeaderOutcome::Fallback
+            }
         }
     }
 
@@ -2337,6 +2581,73 @@ mod tests {
     fn stub() -> StubNode {
         let (committee, _v) = devnet_committee(7);
         StubNode::new(genesis(), CommitteeState::new(committee, BOND_AMOUNT))
+    }
+
+    #[test]
+    fn checkpoint_frontier_mismatch_is_scored_and_falls_back_without_admission() {
+        let hub = InProcHub::new();
+        let mut joiner = P2pNode::new(
+            InProcTransport::new(PeerId(2), Arc::clone(&hub)),
+            stub(),
+            [2; 32],
+        );
+        joiner.add_peer(PeerId(1), None);
+
+        let (_, validators) = devnet_committee(7);
+        let checkpoint = Checkpoint::new(3, [0xCC; 32], [0xCC; 32]);
+        let votes = validators[..5]
+            .iter()
+            .map(|validator| validator.sign_checkpoint(&checkpoint))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            joiner.node_mut().ingest_requested_checkpoint_votes(&checkpoint, &votes),
+            VotesOutcome::Learned { finalized: true, .. }
+        ));
+        joiner.begin_checkpoint_sync(checkpoint, PeerId(1));
+
+        let mut parent = genesis();
+        let mut headers = Vec::new();
+        for height in 1..=3 {
+            let header = BlockHeader::child_of(
+                &parent,
+                height * 75,
+                1_000,
+                [height as u8; 32],
+            );
+            headers.push(header);
+            parent = header;
+        }
+        assert!(matches!(
+            joiner.ingest_checkpoint_sync_header(PeerId(1), headers[0]),
+            CheckpointHeaderOutcome::Buffered
+        ));
+        assert!(matches!(
+            joiner.ingest_checkpoint_sync_header(PeerId(1), headers[1]),
+            CheckpointHeaderOutcome::Buffered
+        ));
+        let before = joiner.peers().get(PeerId(1)).expect("peer row").score;
+        assert!(matches!(
+            joiner.ingest_checkpoint_sync_header(PeerId(1), headers[2]),
+            CheckpointHeaderOutcome::Fallback
+        ));
+        assert_eq!(joiner.node().tip_height(), 0, "the unproven span never entered ChainState");
+        assert!(joiner.checkpoint_sync.is_none());
+        assert!(joiner.checkpoint_sync_fallback);
+        assert!(joiner.peers().get(PeerId(1)).expect("peer row").score < before);
+
+        for header in headers {
+            assert_eq!(
+                joiner.node_mut().ingest_header(header),
+                IngestOutcome::Accepted,
+                "after fallback the ordinary per-header path remains usable"
+            );
+        }
+        assert_eq!(joiner.node().tip_height(), 3);
+        assert_eq!(
+            joiner.node().chain().finalized_height(),
+            None,
+            "the mismatched checkpoint never became ChainState finality"
+        );
     }
 
     /// The header for a block over `parent` announcing `txs` + `coinbase` — it
@@ -3291,6 +3602,9 @@ mod tests {
         fn ingest_header(&mut self, header: BlockHeader) -> IngestOutcome {
             self.inner.ingest_header(header)
         }
+        fn ingest_finalized_headers(&mut self, headers: &[BlockHeader]) -> IngestOutcome {
+            self.inner.ingest_finalized_headers(headers)
+        }
         fn ingest_block(&mut self, header: BlockHeader, body: BlockBody) -> IngestOutcome {
             if qlab_devnet::body::check_body_binding(&header, &body).is_err() {
                 return IngestOutcome::Rejected("body does not match header commitment");
@@ -3321,8 +3635,13 @@ mod tests {
     }
 
     impl CheckpointIngest for StoreStub {
-        fn ingest_checkpoint_votes(&mut self, cp: &Checkpoint, votes: &[Vote]) -> VotesOutcome {
-            self.inner.ingest_checkpoint_votes(cp, votes)
+        fn ingest_checkpoint_votes_from(
+            &mut self,
+            cp: &Checkpoint,
+            votes: &[Vote],
+            explicitly_requested: bool,
+        ) -> VotesOutcome {
+            self.inner.ingest_checkpoint_votes_from(cp, votes, explicitly_requested)
         }
         fn has_checkpoint(&self, id: &Hash32) -> bool {
             self.inner.has_checkpoint(id)
