@@ -182,6 +182,35 @@ void qmb_select_free(qmb_select_t *s);
 
 char *qmb_bundle_review(const uint8_t *bytes, size_t len, char **err_out);
 
+/* --- payment URIs + the history join (roadmap #3/#4) ---------------------- */
+
+/* Parse a qumbra: payment URI (#342's one codec). Returns the FULL qaddr1…;
+ * an amount, when present, lands in *out_amount_bessel with *out_has_amount=1
+ * (integer-exact bessel). Label/memo are display-only and do not cross in v1.
+ * NULL + *err_out on refusal, by name. */
+char *qmb_uri_parse(const char *uri, uint64_t *out_amount_bessel,
+                    uint8_t *out_has_amount, char **err_out);
+
+/* The bundle's REAL-input nullifiers, hex, newline-joined — the history join
+ * key: these bytes go on-chain when the spend lands, so a record keyed on
+ * them can later be marked CONFIRMED by the chain's own nullifier stream. */
+char *qmb_bundle_nullifiers(const uint8_t *bytes, size_t len, char **err_out);
+
+/* The bulk nullifier stream, caller-pumped (same vocabulary as scan/select;
+ * the accumulation checks are the ONE copy shared with the CLI and the select
+ * driver). qmb_spent_step: 1 NEED (*out = page path) · 0 DONE (query with
+ * qmb_spent_contains) · -2 FAILED by name (*out) · -1 invalid call.
+ * qmb_spent_contains after DONE: 1 on-chain, 0 not, -1 unanswerable
+ * (before DONE / malformed hex) — refused, never guessed. */
+typedef struct qmb_spent_t qmb_spent_t;
+
+qmb_spent_t *qmb_spent_new(uint64_t from, uint64_t to);
+int32_t qmb_spent_step(qmb_spent_t *s, char **out);
+void qmb_spent_supply(qmb_spent_t *s, const uint8_t *body, size_t len);
+void qmb_spent_supply_err(qmb_spent_t *s, const char *reason);
+int32_t qmb_spent_contains(const qmb_spent_t *s, const char *nf_hex);
+void qmb_spent_free(qmb_spent_t *s);
+
 #ifdef __cplusplus
 }
 #endif

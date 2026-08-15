@@ -919,6 +919,224 @@ pub unsafe extern "C" fn qmb_bundle_review(
     ))
 }
 
+
+/* --- payment URIs + the history join (roadmap #3/#4) ---------------------- */
+
+/// Parse a `qumbra:` payment URI (#342's codec — the one copy). Returns the
+/// FULL `qaddr1…` address; the amount, when the URI carries one, lands in
+/// `*out_amount_bessel` with `*out_has_amount = 1` (integer-exact bessel — no
+/// float near money). Label and memo are display-only and deliberately do not
+/// cross in v1. NULL + `err_out` on refusal, by name — including the
+/// short-address-unpayable case.
+///
+/// # Safety
+/// `uri` NUL-terminated UTF-8; `out_amount_bessel`/`out_has_amount` writable;
+/// `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_uri_parse(
+    uri: *const c_char,
+    out_amount_bessel: *mut u64,
+    out_has_amount: *mut u8,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    if uri.is_null() || out_amount_bessel.is_null() || out_has_amount.is_null() {
+        set_err(err_out, "NULL argument".into());
+        return ptr::null_mut();
+    }
+    let s = match CStr::from_ptr(uri).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_err(err_out, "URI is not UTF-8".into());
+            return ptr::null_mut();
+        }
+    };
+    match qlab_wallet::uri::parse(s) {
+        Ok(req) => {
+            *out_has_amount = u8::from(req.amount_bessel.is_some());
+            *out_amount_bessel = req.amount_bessel.unwrap_or(0);
+            out_string(req.address.encode())
+        }
+        Err(e) => {
+            set_err(err_out, format!("payment URI refused: {e:?}"));
+            ptr::null_mut()
+        }
+    }
+}
+
+/// The witness bundle's REAL-input nullifiers, hex, newline-joined — the
+/// history join key (roadmap #4): these exact bytes go on-chain when the
+/// spend lands, so a record keyed on them can later be marked CONFIRMED by
+/// the chain's own nullifier stream. NULL + `err_out` on an undecodable
+/// bundle, by name.
+///
+/// # Safety
+/// `bytes` points to `len` readable bytes; `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_bundle_nullifiers(
+    bytes: *const u8,
+    len: usize,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    if bytes.is_null() {
+        set_err(err_out, "bundle bytes are NULL".into());
+        return ptr::null_mut();
+    }
+    let raw = std::slice::from_raw_parts(bytes, len);
+    let bundle = match WitnessBundle::from_bytes(raw) {
+        Ok(b) => b,
+        Err(e) => {
+            set_err(err_out, format!("witness bundle refused: {e:?}"));
+            return ptr::null_mut();
+        }
+    };
+    let hex = |nf: [u8; 32]| nf.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    out_string(
+        bundle.real_nullifiers().into_iter().map(hex).collect::<Vec<_>>().join("\n"),
+    )
+}
+
+/// The bulk nullifier stream, caller-pumped — the confirmation half of the
+/// history join. Same pump vocabulary as scan/select; the accumulation checks
+/// are `qumbra_wallet::spent::SpentCatchUp`, the ONE copy shared with the CLI
+/// and the select driver.
+pub struct SpentState {
+    catch: Option<qumbra_wallet::spent::SpentCatchUp>,
+    set: Option<qumbra_wallet::spent::SpentSet>,
+    fatal: Option<String>,
+    pending: Option<(u64, u64)>,
+}
+
+/// # Safety
+/// Always safe; never NULL.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_spent_new(from: u64, to: u64) -> *mut SpentState {
+    Box::into_raw(Box::new(SpentState {
+        catch: Some(qumbra_wallet::spent::SpentCatchUp::new(from, to)),
+        set: None,
+        fatal: None,
+        pending: None,
+    }))
+}
+
+/// `1` NEED (*out = the page path) · `0` DONE (query with `qmb_spent_contains`)
+/// · `-2` FAILED by name (*out) · `-1` invalid call.
+///
+/// # Safety
+/// `s` live (or NULL); `out` writable (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_spent_step(s: *mut SpentState, out: *mut *mut c_char) -> i32 {
+    if s.is_null() || out.is_null() {
+        return -1;
+    }
+    let st = &mut *s;
+    if let Some(why) = &st.fatal {
+        *out = out_string(why.clone());
+        return -2;
+    }
+    if st.set.is_some() {
+        return 0;
+    }
+    let catch = st.catch.as_ref().expect("live until done");
+    match catch.want() {
+        Some((from, to)) => {
+            st.pending = Some((from, to));
+            *out = out_string(format!("/v1/nullifiers?from={from}&to={to}"));
+            1
+        }
+        None => {
+            st.set = Some(st.catch.take().expect("live until done").finish());
+            0
+        }
+    }
+}
+
+/// # Safety
+/// `s` live (or NULL); `body` points to `len` readable bytes (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_spent_supply(s: *mut SpentState, body: *const u8, len: usize) {
+    if s.is_null() {
+        return;
+    }
+    let st = &mut *s;
+    let Some((from, to)) = st.pending.take() else {
+        st.fatal = Some("a page was supplied without a request".into());
+        return;
+    };
+    if body.is_null() {
+        st.fatal = Some("supplied body is NULL".into());
+        return;
+    }
+    let raw = std::slice::from_raw_parts(body, len);
+    let path = format!("/v1/nullifiers?from={from}&to={to}");
+    let page = match qlab_cbserver::codec::NullifierPage::from_bytes(raw) {
+        Ok(p) => p,
+        Err(e) => {
+            st.fatal = Some(format!("GET {path} did not decode: {e:?}"));
+            return;
+        }
+    };
+    let chunk = qumbra_wallet::spent::NullifierChunk {
+        from: page.from,
+        to: page.to,
+        blocks: page.blocks.into_iter().map(|b| (b.height, b.nullifiers)).collect(),
+    };
+    if let Err(e) = st.catch.as_mut().expect("live until done").supply(chunk) {
+        st.fatal = Some(e.to_string());
+    }
+}
+
+/// # Safety
+/// `s` live (or NULL); `reason` NUL-terminated (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_spent_supply_err(s: *mut SpentState, reason: *const c_char) {
+    if s.is_null() {
+        return;
+    }
+    let st = &mut *s;
+    st.pending = None;
+    let reason = if reason.is_null() {
+        "transport failed with no reason".to_string()
+    } else {
+        CStr::from_ptr(reason).to_string_lossy().into_owned()
+    };
+    st.fatal = Some(reason);
+}
+
+/// After DONE: `1` if the hex nullifier is on the chain, `0` if not, `-1`
+/// before DONE or on malformed hex — an unanswerable question is refused,
+/// never guessed at.
+///
+/// # Safety
+/// `s` live (or NULL); `nf_hex` NUL-terminated (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_spent_contains(s: *const SpentState, nf_hex: *const c_char) -> i32 {
+    if s.is_null() || nf_hex.is_null() {
+        return -1;
+    }
+    let Some(set) = (*s).set.as_ref() else { return -1 };
+    let Ok(hexstr) = CStr::from_ptr(nf_hex).to_str() else { return -1 };
+    if hexstr.len() != 64 {
+        return -1;
+    }
+    let mut nf = [0u8; 32];
+    for i in 0..32 {
+        match u8::from_str_radix(&hexstr[i * 2..i * 2 + 2], 16) {
+            Ok(b) => nf[i] = b,
+            Err(_) => return -1,
+        }
+    }
+    i32::from(set.contains(&nf))
+}
+
+/// # Safety
+/// `s` must be a live handle from `qmb_spent_new`; never used after this call.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_spent_free(s: *mut SpentState) {
+    if !s.is_null() {
+        drop(Box::from_raw(s));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1333,6 +1551,43 @@ mod tests {
         }
     }
 
+    /// A payment URI round-trips: full address out, exact bessel out, and a
+    /// URI without an amount says so instead of inventing a zero.
+    #[test]
+    fn a_payment_uri_parses_across_the_abi() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([7u8; 32].as_ptr());
+            let full_ptr = qmb_wallet_address(w, 0);
+            let full = CStr::from_ptr(full_ptr).to_str().unwrap().to_string();
+            qmb_string_free(full_ptr);
+
+            let uri = CString::new(format!("qumbra:{full}?amount=1.5")).unwrap();
+            let mut amount: u64 = 0;
+            let mut has: u8 = 0;
+            let mut err: *mut c_char = ptr::null_mut();
+            let addr_ptr = qmb_uri_parse(uri.as_ptr(), &mut amount, &mut has, &mut err);
+            assert!(!addr_ptr.is_null());
+            assert_eq!(CStr::from_ptr(addr_ptr).to_str().unwrap(), full);
+            qmb_string_free(addr_ptr);
+            assert_eq!((has, amount), (1, 150_000_000), "1.5 QMB, integer-exact");
+
+            let bare = CString::new(format!("qumbra:{full}")).unwrap();
+            let addr2 = qmb_uri_parse(bare.as_ptr(), &mut amount, &mut has, &mut err);
+            assert!(!addr2.is_null());
+            qmb_string_free(addr2);
+            assert_eq!(has, 0, "no amount means no amount, not zero");
+
+            let junk = CString::new("bitcoin:1abc").unwrap();
+            let refused = qmb_uri_parse(junk.as_ptr(), &mut amount, &mut has, &mut err);
+            assert!(refused.is_null());
+            assert!(!err.is_null());
+            let why = CStr::from_ptr(err).to_str().unwrap();
+            assert!(why.contains("refused"), "{why}");
+            qmb_string_free(err);
+            qmb_wallet_free(w);
+        }
+    }
+
     /// The Receive screen's QR: a real SVG of the full address, across the ABI.
     #[test]
     fn the_address_qr_renders_as_svg() {
@@ -1376,7 +1631,7 @@ mod tests {
                 // Types, not functions — a closed list on purpose. Widening
                 // this to a prefix match would let an undeclared function slip
                 // through, which is the one thing this half of the test is for.
-                const TYPES: [&str; 4] = ["qmb_wallet_t", "qmb_fetch_fn", "qmb_scan_t", "qmb_select_t"];
+                const TYPES: [&str; 5] = ["qmb_wallet_t", "qmb_fetch_fn", "qmb_scan_t", "qmb_select_t", "qmb_spent_t"];
                 assert!(
                     exported.contains(&name.as_str()) || TYPES.contains(&name.as_str()),
                     "header declares `{name}` which lib.rs does not export"
