@@ -225,7 +225,7 @@ fn a_grant_and_a_spend_render_as_two_events_that_reconcile_to_the_bessel() {
         "the chain's own date for this spend, off the same wire the balance uses"
     );
     let coverage = SpentCoverage::Covered { range: set.covered };
-    let ledger = history::build(&sender, &scans, Some(&set), &coverage, None, (0, tip.height));
+    let ledger = history::build(&sender, &scans, Some(&set), &coverage, None, (0, tip.height), Some(qumbra_wallet::ledger_run::posted_fee_2x2()));
 
     assert!(ledger.gaps.is_empty(), "a fully accounted ledger: {:?}", ledger.gaps);
     assert_eq!(ledger.events.len(), 2, "exactly two: the receipt and the send");
@@ -298,7 +298,7 @@ fn a_grant_and_a_spend_render_as_two_events_that_reconcile_to_the_bessel() {
     let log = SendLog::load(&dir).expect("it reads back").expect("it is there");
 
     let labeled_ledger =
-        history::build(&sender, &scans, Some(&set), &coverage, Some(&log), (0, tip.height));
+        history::build(&sender, &scans, Some(&set), &coverage, Some(&log), (0, tip.height), Some(qumbra_wallet::ledger_run::posted_fee_2x2()));
     assert_eq!(
         labeled_ledger.totals, ledger.totals,
         "🔴 local memory labels; it never moves a chain figure"
@@ -336,8 +336,7 @@ fn a_grant_and_a_spend_render_as_two_events_that_reconcile_to_the_bessel() {
         None,
         &SpentCoverage::Unavailable { why: gap.to_string() },
         Some(&log),
-        (0, tip.height),
-    );
+        (0, tip.height), Some(qumbra_wallet::ledger_run::posted_fee_2x2()));
     assert!(refused.totals.is_none(), "🔴 no totals over an unaccounted span");
     assert_eq!(refused.current_spendable, None);
     assert!(
@@ -422,8 +421,7 @@ fn a_spend_with_nothing_coming_back_names_its_fee_as_unattributable() {
         Some(&set),
         &SpentCoverage::Covered { range: set.covered },
         None,
-        (0, tip.height),
-    );
+        (0, tip.height), Some(qumbra_wallet::ledger_run::posted_fee_2x2()));
 
     assert!(ledger.gaps.is_empty(), "{:?}", ledger.gaps);
     assert_eq!(ledger.events.len(), 2);
@@ -512,8 +510,7 @@ fn an_absent_sends_file_degrades_cleanly_and_an_unknown_one_is_refused() {
         Some(&SpentSet::from_parts(Some((0, 5)), [])),
         &SpentCoverage::Covered { range: Some((0, 5)) },
         Some(&log),
-        (0, 5),
-    );
+        (0, 5), Some(qumbra_wallet::ledger_run::posted_fee_2x2()));
     let text = history::render(&ledger, "http://edge");
     assert!(text.contains("no events"), "{text}");
     assert!(text.contains("joined no event in this range"), "the orphan record is stated: {text}");

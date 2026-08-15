@@ -109,6 +109,24 @@ typedef int32_t (*qmb_fetch_fn)(void *ctx, const char *path_and_query,
  * this and qmb_wallet_scan_report route into one scan flow, so what counts as
  * detected/opened/unopened cannot drift between them. Blocking — call off the
  * main thread. */
+/* The wallet's own LEDGER — received notes and the spends the chain published —
+ * rendered, over the same caller-supplied transport.
+ *
+ * Send events refuse their figures here by design: attributing a fee needs the
+ * posted table, which lives in a crate that cannot cross-compile to iOS, so such
+ * an event reports UNAVAILABLE with the reason. That is the honest state and not
+ * a placeholder — an unprovable total is worse than an absent one (lab #407).
+ * There is no local send record on this platform either, so an unmatched record
+ * cannot arise.
+ *
+ * Blocking — call off the main thread. */
+char *qmb_wallet_ledger_report_over_fetch(const qmb_wallet_t *w,
+                                          const char *source_label,
+                                          uint64_t from, uint64_t to,
+                                          const uint64_t *indices, size_t n_indices,
+                                          const uint8_t *rng_seed32,
+                                          qmb_fetch_fn fetch, void *fetch_ctx);
+
 char *qmb_wallet_scan_report_over_fetch(const qmb_wallet_t *w,
                                         const char *source_label,
                                         uint64_t from, uint64_t to,

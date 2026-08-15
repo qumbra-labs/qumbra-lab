@@ -82,17 +82,19 @@ pub mod coinbase;
 pub mod contacts;
 pub mod driver;
 pub mod envelope;
-pub mod history;
 pub mod names;
 #[cfg(feature = "net")]
 pub mod net;
 pub mod qr;
 pub mod scan;
 pub mod send;
-pub mod sends;
 pub mod spend;
-pub mod spent;
 pub mod store;
 pub mod sync;
 pub mod view;
+// Moved to qlab-ledger (#407); re-exported so this crate keeps one set of
+// paths and there is still exactly one implementation.
+pub use qlab_ledger::{history, sends, spent};
+pub mod ledger_run;
+pub mod sends_build;
 pub mod words;

@@ -292,6 +292,149 @@ extern "C" {
     fn free(p: *mut c_void);
 }
 
+/// Call the shell's fetch once, honouring the ownership contract in exactly one
+/// place: the buffers come from `malloc` and are released here with `free`.
+///
+/// Extracted when the ledger entry point arrived, because a second hand-written
+/// copy of a cross-allocator contract is how one of them drifts.
+///
+/// # Safety
+/// `fetch` obeys [`QmbFetchFn`]; `ctx` is whatever it expects.
+unsafe fn fetch_bytes(
+    fetch: QmbFetchFn,
+    ctx: *mut c_void,
+    path: &str,
+) -> Result<Vec<u8>, String> {
+    let c_path = CString::new(path).map_err(|_| "path contains NUL".to_string())?;
+    let mut body: *mut u8 = ptr::null_mut();
+    let mut len: usize = 0;
+    let mut err: *mut c_char = ptr::null_mut();
+    let rc = fetch(ctx, c_path.as_ptr(), &mut body, &mut len, &mut err);
+    if rc != 0 {
+        let reason = if err.is_null() {
+            format!("fetch failed (rc {rc})")
+        } else {
+            let s = CStr::from_ptr(err).to_string_lossy().into_owned();
+            free(err as *mut c_void);
+            s
+        };
+        if !body.is_null() {
+            free(body as *mut c_void);
+        }
+        return Err(reason);
+    }
+    if body.is_null() {
+        return Err("fetch reported success with no body".to_string());
+    }
+    let out = std::slice::from_raw_parts(body, len).to_vec();
+    free(body as *mut c_void);
+    Ok(out)
+}
+
+/// The nullifier stream over the shell's transport. `qlab-ledger` already asks
+/// for this as a trait, so nothing new is invented here — and the WIRE is
+/// decoded by its owner (`qlab_cbserver::codec::NullifierPage`), never re-read.
+struct ShellNullifiers {
+    fetch: QmbFetchFn,
+    ctx: *mut c_void,
+}
+
+impl qlab_ledger::spent::NullifierSource for ShellNullifiers {
+    fn fetch_range(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Result<qlab_ledger::spent::NullifierChunk, String> {
+        let path = format!("/v1/nullifiers?from={from}&to={to}");
+        let bytes = unsafe { fetch_bytes(self.fetch, self.ctx, &path) }
+            .map_err(|e| format!("GET {path}: {e}"))?;
+        let page = qlab_cbserver::codec::NullifierPage::from_bytes(&bytes)
+            .map_err(|e| format!("GET {path} did not decode: {e:?}"))?;
+        Ok(qlab_ledger::spent::NullifierChunk {
+            from: page.from,
+            to: page.to,
+            blocks: page.blocks.into_iter().map(|b| (b.height, b.nullifiers)).collect(),
+        })
+    }
+}
+
+/// The wallet's own ledger — received notes and spends the chain published —
+/// rendered, over a caller-supplied transport.
+///
+/// **Send events refuse their figures here, by design.** Fee attribution needs
+/// the posted table from `qlab-devnet`, which cannot cross-compile to iOS, so
+/// `None` is passed and such an event reports `UNAVAILABLE` with the reason.
+/// That is the honest state, not a placeholder: an unprovable total is worse
+/// than an absent one (lab #407).
+///
+/// There is no local send record on this platform either — `sends.v1` is written
+/// by the CLI on the machine that spent — so `log` is `None` and unmatched
+/// records cannot arise.
+///
+/// # Safety
+/// As [`qmb_wallet_scan_report_over_fetch`].
+#[no_mangle]
+pub unsafe extern "C" fn qmb_wallet_ledger_report_over_fetch(
+    w: *const WalletState,
+    source_label: *const c_char,
+    from: u64,
+    to: u64,
+    indices: *const u64,
+    n_indices: usize,
+    rng_seed32: *const u8,
+    fetch: Option<QmbFetchFn>,
+    fetch_ctx: *mut c_void,
+) -> *mut c_char {
+    if w.is_null() || source_label.is_null() || indices.is_null() || rng_seed32.is_null() {
+        return ptr::null_mut();
+    }
+    let Some(fetch) = fetch else { return ptr::null_mut() };
+    let label = match CStr::from_ptr(source_label).to_str() {
+        Ok(u) => u,
+        Err(_) => return ptr::null_mut(),
+    };
+    let idxs = std::slice::from_raw_parts(indices, n_indices);
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(std::slice::from_raw_parts(rng_seed32, 32));
+    let mut rng = StdRng::from_seed(seed);
+    let state = &*w;
+
+    let mut scans: Vec<qlab_ledger::history::AddressScan> = Vec::with_capacity(n_indices);
+    for &idx in idxs {
+        let d = state.wallet.diversifier_at_index(idx);
+        let kp = state.wallet.diversified_keypair(&d);
+        let short = state.wallet.address_at_index(idx).short().encode();
+        let mut bridge = |path: &str| fetch_bytes(fetch, fetch_ctx, path);
+        let outcome =
+            light_client_scan_with(&mut bridge, &kp.dk, from, to, ScanConfig::default(), &mut rng)
+                .map_err(|e| e.to_string());
+        scans.push(qlab_ledger::history::AddressScan {
+            div_index: idx,
+            address_short: short,
+            outcome,
+        });
+    }
+
+    // The spends, judged against the range the outputs actually reached — the
+    // CLI's own pairing, reused rather than re-matched here.
+    let outputs = qlab_ledger::spent::widest_range(
+        scans.iter().filter_map(|s| s.outcome.as_ref().ok()).map(|o| o.stats.compact_range_served),
+    );
+    let source = ShellNullifiers { fetch, ctx: fetch_ctx };
+    let (coverage, set) = qlab_ledger::spent::coverage_for(&source, from, to, outputs);
+
+    let ledger = qlab_ledger::history::build(
+        &state.wallet,
+        &scans,
+        set.as_ref(),
+        &coverage,
+        None,
+        (from, to),
+        None,
+    );
+    out_string(qlab_ledger::history::render(&ledger, label))
+}
+
 /// The scan, over a caller-supplied transport. `source_label` is what the
 /// report NAMES as its source — this crate no longer knows the transport, so
 /// it cannot infer it, and a report must say where its numbers came from.
@@ -333,32 +476,8 @@ pub unsafe extern "C" fn qmb_wallet_scan_report_over_fetch(
     // failed fetch becomes an Err(String), which is exactly the contract the
     // socket path produces — so the report cannot tell the two apart, and a
     // transport failure never reads as an empty wallet.
-    let mut bridge = |path: &str| -> Result<Vec<u8>, String> {
-        let c_path = CString::new(path).map_err(|_| "path contains NUL".to_string())?;
-        let mut body: *mut u8 = ptr::null_mut();
-        let mut len: usize = 0;
-        let mut err: *mut c_char = ptr::null_mut();
-        let rc = fetch(fetch_ctx, c_path.as_ptr(), &mut body, &mut len, &mut err);
-        if rc != 0 {
-            let reason = if err.is_null() {
-                format!("fetch failed (rc {rc})")
-            } else {
-                let s = CStr::from_ptr(err).to_string_lossy().into_owned();
-                free(err as *mut c_void);
-                s
-            };
-            if !body.is_null() {
-                free(body as *mut c_void);
-            }
-            return Err(reason);
-        }
-        if body.is_null() {
-            return Err("fetch reported success with no body".to_string());
-        }
-        let out = std::slice::from_raw_parts(body, len).to_vec();
-        free(body as *mut c_void);
-        Ok(out)
-    };
+    // One bridge, defined once (see `fetch_bytes`).
+    let mut bridge = |path: &str| fetch_bytes(fetch, fetch_ctx, path);
 
     let state = &*w;
     let mut scans = Vec::with_capacity(n_indices);
@@ -1294,6 +1413,47 @@ mod tests {
             assert!(
                 !report.contains("TOTAL spendable: 0"),
                 "unparseable bytes must not become a zero balance: {report}"
+            );
+        }
+    }
+
+    /// The ledger over a dead transport must refuse in the same vocabulary the
+    /// scan does — and must not render a zero. A wallet that cannot read the
+    /// chain does not know that nothing arrived.
+    #[test]
+    fn the_ledger_over_a_failed_transport_refuses_and_never_shows_a_zero() {
+        unsafe {
+            let entropy = [7u8; 32];
+            let w = qmb_wallet_from_entropy(entropy.as_ptr());
+            let label = CString::new("https://seed.example.org").unwrap();
+            let indices: [u64; 1] = [0];
+            let seed = [3u8; 32];
+            let mut calls: u32 = 0;
+            let out = qmb_wallet_ledger_report_over_fetch(
+                w,
+                label.as_ptr(),
+                0,
+                10,
+                indices.as_ptr(),
+                1,
+                seed.as_ptr(),
+                Some(fetch_always_fails),
+                &mut calls as *mut u32 as *mut c_void,
+            );
+            assert!(!out.is_null());
+            let report = CStr::from_ptr(out).to_str().unwrap().to_string();
+            qmb_string_free(out);
+            qmb_wallet_free(w);
+
+            assert!(calls > 0, "the ledger must use the shell's transport");
+            assert!(report.contains("UNAVAILABLE"), "{report}");
+            assert!(
+                report.contains("the network is unreachable"),
+                "the shell's own reason must survive: {report}"
+            );
+            assert!(
+                !report.contains("TOTAL spendable: 0"),
+                "an unreadable chain must not render as an empty wallet: {report}"
             );
         }
     }

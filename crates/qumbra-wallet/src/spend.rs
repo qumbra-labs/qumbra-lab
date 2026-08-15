@@ -492,7 +492,7 @@ where
     }
 
     // ---- 🔴 The local record, written BEFORE the socket. See the module docs.
-    let record = crate::sends::SendRecord::declared(
+    let record = crate::sends_build::declared_record(
         &art.entry.public,
         bundle.selected_at_tip(),
         bundle.amount(),

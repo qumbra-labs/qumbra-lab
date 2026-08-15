@@ -37,18 +37,16 @@ use crate::coinbase::{match_mined, MinedChain, MinedReport};
 use crate::coinbase::fetch_coinbase;
 #[cfg(feature = "net")]
 use crate::net::{scan_fetch, HttpCoinbaseSource, HttpNullifierSource};
-use crate::spent::{fetch_spent, subtract_spent, SpentSet};
+use crate::spent::{subtract_spent, SpentSet};
 use crate::store::WalletDir;
 use crate::view::{CoinbaseCoverage, DivScan, SpentCoverage};
 
 /// The union of the height ranges several scans' outputs came from — the range
 /// the nullifier stream must cover before any of their figures may be quoted
 /// (lab issue #314). `None` when no scan saw a block at all.
-pub fn widest_range(
-    ranges: impl IntoIterator<Item = Option<(u64, u64)>>,
-) -> Option<(u64, u64)> {
-    ranges.into_iter().flatten().reduce(|a, b| (a.0.min(b.0), a.1.max(b.1)))
-}
+// Moved to qlab-ledger (#407) so the FFI asks it the same way; re-exported to
+// keep this module's callers and tests unchanged.
+pub use qlab_ledger::spent::widest_range;
 
 /// Everything a caller reads off the chain: one light-client scan per allocated
 /// address, the coinbase stream, then the nullifier stream over the range those
@@ -131,13 +129,12 @@ pub fn gather(w: &WalletDir, url: &str, from: u64, to: u64) -> Gathered {
             .map(|o| o.stats.compact_range_served)
             .chain(std::iter::once(mined.as_ref().and_then(|m| m.covered))),
     );
-    let (coverage, set) = match fetch_spent(&HttpNullifierSource::new(url), from, to) {
-        Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),
-        Ok(set) => match set.covers_outputs(outputs) {
-            Err(e) => (SpentCoverage::Unavailable { why: e.to_string() }, None),
-            Ok(()) => (SpentCoverage::Covered { range: set.covered }, Some(set)),
-        },
-    };
+    let (coverage, set) = qlab_ledger::spent::coverage_for(
+        &HttpNullifierSource::new(url),
+        from,
+        to,
+        outputs,
+    );
     Gathered { outcomes, coverage, set, coinbase_coverage, mined }
 }
 
