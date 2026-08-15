@@ -245,6 +245,80 @@ fn the_abi_builds_a_bundle_and_renders_its_review() {
     }
 }
 
+/// The history join key: the bundle's real-input nullifiers cross as hex and
+/// the chain's own stream (pumped) answers whether they landed.
+#[test]
+fn bundle_nullifiers_cross_and_the_spent_pump_answers() {
+    unsafe {
+        let (url, to, _server) = serve_chain();
+        let w = qmb_wallet_from_entropy(SENDER_ENTROPY.as_ptr());
+        let scan = scan_to_done(w, &url, to);
+        let recipient = Wallet::from_master_seed(&MasterSeed::from_entropy([62u8; 32]), 0);
+        let c_addr = CString::new(recipient.address_at_index(0).encode()).unwrap();
+        let seed = [7u8; 32];
+        let mut err: *mut c_char = ptr::null_mut();
+        let sel =
+            qmb_select_new(w, scan, c_addr.as_ptr(), AMOUNT, ptr::null(), 0, seed.as_ptr(), &mut err);
+        assert!(!sel.is_null());
+        let bundle = loop {
+            let mut out: *mut c_char = ptr::null_mut();
+            match qmb_select_step(sel, &mut out) {
+                1 | 2 => {
+                    let path = CStr::from_ptr(out).to_str().unwrap().to_string();
+                    qmb_string_free(out);
+                    let body = get(&url, &path).expect("fixture serves");
+                    qmb_select_supply(sel, body.as_ptr(), body.len());
+                }
+                0 => {
+                    let mut len: usize = 0;
+                    let p = qmb_select_take_bundle(sel, &mut len);
+                    let bytes = std::slice::from_raw_parts(p, len).to_vec();
+                    qmb_dealloc(p, len);
+                    break bytes;
+                }
+                rc => panic!("select rc {rc}"),
+            }
+        };
+        qmb_select_free(sel);
+
+        let mut err2: *mut c_char = ptr::null_mut();
+        let nfs_ptr = qmb_bundle_nullifiers(bundle.as_ptr(), bundle.len(), &mut err2);
+        assert!(!nfs_ptr.is_null());
+        let nfs = CStr::from_ptr(nfs_ptr).to_str().unwrap().to_string();
+        qmb_string_free(nfs_ptr);
+        let lines: Vec<&str> = nfs.lines().collect();
+        assert_eq!(lines.len(), 1, "one real input: {nfs}");
+        assert_eq!(lines[0].len(), 64, "hex nullifier: {nfs}");
+
+        // The chain has NOT seen this spend — the pump must answer 0, not guess.
+        let sp = qmb_spent_new(0, to);
+        loop {
+            let mut out: *mut c_char = ptr::null_mut();
+            match qmb_spent_step(sp, &mut out) {
+                1 => {
+                    let path = CStr::from_ptr(out).to_str().unwrap().to_string();
+                    qmb_string_free(out);
+                    let body = get(&url, &path).expect("fixture serves");
+                    qmb_spent_supply(sp, body.as_ptr(), body.len());
+                }
+                0 => break,
+                rc => panic!("spent rc {rc}"),
+            }
+        }
+        let nf_hex = CString::new(lines[0]).unwrap();
+        assert_eq!(qmb_spent_contains(sp, nf_hex.as_ptr()), 0, "not landed yet");
+        // The grant tx's own (stranger) nullifier IS on chain: 0x61 repeated.
+        let stranger = CString::new("61".repeat(32)).unwrap();
+        assert_eq!(qmb_spent_contains(sp, stranger.as_ptr()), 1);
+        // Malformed hex is unanswerable, refused.
+        let bad = CString::new("zz").unwrap();
+        assert_eq!(qmb_spent_contains(sp, bad.as_ptr()), -1);
+        qmb_spent_free(sp);
+        qmb_scan_free(scan);
+        qmb_wallet_free(w);
+    }
+}
+
 unsafe fn err_text(err: *mut c_char) -> Option<String> {
     (!err.is_null()).then(|| {
         let s = CStr::from_ptr(err).to_str().unwrap().to_string();
