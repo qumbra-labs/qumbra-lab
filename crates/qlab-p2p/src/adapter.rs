@@ -110,6 +110,16 @@ fn wall_clock_secs() -> u64 {
         .unwrap_or(0)
 }
 
+// Unit-test caliper for the legacy tip-to-height main-chain walk. Dispatch-hot
+// readers must use `main_chain_hash_at`; any fallback to the walk is observable
+// without putting counters or branches in a production build.
+#[cfg(test)]
+std::thread_local! {
+    static MAIN_CHAIN_ANCESTOR_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 /// A real full-node node-state: consensus header chain + PoW, the qlab-node state
 /// machine, the N4 mempool, and the N5 committee machinery. Generic over the PoW
 /// engine `P` (KeccakPow for fast deterministic soaks, RandomXPow for the real-PoW
@@ -1352,12 +1362,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
 
     /// The main-chain hash at `height`, walked back from the fork-choice tip.
     ///
-    /// `ChainView::main_chain_hash_at` answers the same question by materialising
-    /// the whole main chain — `O(tip)` allocation per call, which is fine for the
-    /// once-per-telemetry-line reader it was written for and is not fine on the
-    /// ingest path. This walks `tip − height` parent links instead, so the common
-    /// case (a body at or just below the tip) is a handful of map lookups.
+    /// Kept for the narrow rejoin transition seams that ask for `fork + 1`.
+    /// Dispatch-hot readers must use [`ChainView::main_chain_hash_at`], whose
+    /// maintained height index answers the same question in O(1).
     fn main_chain_ancestor(&self, height: u64) -> Option<Hash32> {
+        #[cfg(test)]
+        MAIN_CHAIN_ANCESTOR_CALLS.with(|calls| calls.set(calls.get() + 1));
         let tip_height = self.chain.tip_height();
         if height > tip_height {
             return None;
@@ -1371,10 +1381,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     ///
     /// When the applied tip is *on* the main chain — every node, almost always —
     /// this is the applied tip itself and the walk exits on its first comparison,
-    /// so the ordinary path pays one lookup. When the state machine is stranded on
-    /// a losing sibling it walks the abandoned branch down to the fork point, which
-    /// is what makes the strand measurable rather than merely visible: the walk
-    /// length **is** the depth of the divergence.
+    /// so the ordinary path pays one O(1) indexed lookup. When the state machine is
+    /// stranded on a losing sibling it walks the abandoned branch down to the fork
+    /// point, with one indexed lookup per divergent block: O(divergence depth), not
+    /// O(header tip − applied tip).
     ///
     /// The walk reads the STATE machine's own block store, not fork choice's: the
     /// abandoned branch is what it has applied, and that is the only side of the
@@ -1385,7 +1395,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         let mut hash = self.state.tip_hash();
         let mut height = self.state.tip_height();
         loop {
-            if self.main_chain_ancestor(height) == Some(hash) {
+            if self.main_chain_hash_at(height) == Some(hash) {
                 return Some((height, hash));
             }
             if height == 0 {
@@ -2187,8 +2197,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
     /// where the gap is, and an unbounded scan would walk the whole chain on a node
     /// that has been asked for one hash.
     ///
-    /// Cost: one `tip − top` ancestor walk plus `max` parent hops, so it does not
-    /// re-walk the chain per height the way repeated `main_chain_ancestor` calls would.
+    /// Cost: one O(1) indexed lookup at `top` plus at most `max` parent hops. The
+    /// distance from the header tip down to the applied tip is not part of the cost.
     fn missing_body_hashes(&self, max: usize) -> Vec<Hash32> {
         use qlab_node::ChainStore as _;
         if max == 0 {
@@ -2203,7 +2213,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
         if top <= base {
             return Vec::new();
         }
-        let Some(mut hash) = self.chain.ancestor(&self.chain.tip_hash(), tip - top) else {
+        let Some(mut hash) = self.main_chain_hash_at(top) else {
             return Vec::new();
         };
         let mut height = top;
@@ -3038,6 +3048,65 @@ mod tests {
         assert_eq!(f.chain().tip_height(), blocks.len() as u64);
         assert_eq!(f.state().tip_height(), 0, "no body has been applied");
         f
+    }
+
+    /// QUM-113's second live bottleneck, at the exact adapter seams from the perf
+    /// caller tree. A header-first joiner with an applied tip at genesis and a
+    /// fork-choice tip well beyond the 16-body window must find both its fork point
+    /// and its next ask set without falling back to a tip-to-height ancestor walk.
+    ///
+    /// The assertion is a deterministic call count, not a timing threshold: it
+    /// remains sharp on a loaded CI runner and fails if either reader is changed
+    /// back to `main_chain_ancestor`. The existing chain-index reorg test proves
+    /// that the indexed answer is replaced synchronously when fork choice changes.
+    #[test]
+    fn far_ahead_body_dispatch_uses_no_tip_to_height_main_chain_walk() {
+        const HEADER_TIP: usize = 128;
+        const BODY_WINDOW: usize = 16;
+
+        let mut proposer =
+            NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        let blocks = mine_chain(&mut proposer, HEADER_TIP);
+        let joiner = follower_with_headers_only(&blocks);
+
+        MAIN_CHAIN_ANCESTOR_CALLS.with(|calls| calls.set(0));
+        assert_eq!(
+            joiner.state_fork_point(),
+            Some((0, joiner.chain().genesis_block_hash())),
+            "an on-main applied genesis is the fork point"
+        );
+        let asks = joiner.missing_body_hashes(BODY_WINDOW);
+        let expected: Vec<Hash32> = blocks[..BODY_WINDOW]
+            .iter()
+            .map(|(header, _)| header.header_hash())
+            .collect();
+        assert_eq!(
+            asks, expected,
+            "the indexed seed preserves the ascending ask window"
+        );
+        MAIN_CHAIN_ANCESTOR_CALLS.with(|calls| {
+            assert_eq!(
+                calls.get(),
+                0,
+                "dispatch readers must not walk header_tip - applied_tip parent links"
+            );
+        });
+
+        // Semantic and edge equivalence with the retired walk: both readers name
+        // the current fork-choice main-chain block, and both return None above tip.
+        for height in [
+            0,
+            1,
+            BODY_WINDOW as u64,
+            HEADER_TIP as u64,
+            HEADER_TIP as u64 + 1,
+        ] {
+            assert_eq!(
+                joiner.main_chain_hash_at(height),
+                joiner.main_chain_ancestor(height),
+                "indexed and walked main-chain answers differ at height {height}"
+            );
+        }
     }
 
     /// **Acceptance 1 (#130 (a)): a node whose state tip trails its fork-choice tip
