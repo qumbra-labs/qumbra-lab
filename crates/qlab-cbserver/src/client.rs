@@ -280,9 +280,22 @@ pub struct ShadowedNote {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Completeness {
     /// Every output detected in the committed discovery was opened and
-    /// authenticated, and no two of them claim the same nullifier. An empty
-    /// `notes` under this verdict means **nothing was paid to this key in this
-    /// range**, and says so on the chain's authority.
+    /// authenticated, and no two of them claim the same nullifier.
+    ///
+    /// 🔴 **Scope, and the previous sentence here overstated it (lab #415).** This
+    /// verdict speaks for **the committed discovery only** — i.e. transaction
+    /// outputs. **Coinbase is not in that set and cannot be**: `CompactBlock` is
+    /// `{ height, groups }` and carries no `coinbase_rkm`, so no compact-wire
+    /// consumer has ever been able to see a coinbase note. `qumbra-faucet` finds
+    /// its own by walking its node's main chain (`harvest.rs`) — it can, because it
+    /// IS a node; a wallet is not.
+    ///
+    /// So an empty `notes` under this verdict means **nothing was paid to this key
+    /// by a transaction in this range**. It does NOT mean nothing was paid: a
+    /// mining-only wallet reads empty here forever, correctly and uselessly. The
+    /// doc used to end "…nothing was paid to this key in this range, and says so on
+    /// the chain's authority", which is the confident-wrong-figure shape lab #314
+    /// removed one dimension of and this one removes another.
     Complete,
     /// `detected` outputs are this key's by the committed discovery, and only
     /// `opened` of them could be read. An empty `notes` under this verdict means

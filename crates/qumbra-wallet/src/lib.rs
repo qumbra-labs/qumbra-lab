@@ -44,8 +44,18 @@
 //!
 //! **A balance the scan could not establish is UNAVAILABLE, never 0.**
 //! [`qlab_cbserver::client::Completeness`] already says which is which — an
-//! empty result under `Complete` is "nothing was paid to this key **on the
+//! empty result under `Complete` is "no **transaction** paid this key **on the
 //! chain's authority**"; under anything else it is "this scan could not know".
+//!
+//! 🔴 **And `Complete` covers transactions only — coinbase is outside it by
+//! construction (lab #415).** The compact wire is `CompactBlock { height, groups }`
+//! with no `coinbase_rkm`, so no wallet has ever been able to detect a coinbase
+//! note; `qumbra-faucet` finds its own only because it walks its own node's main
+//! chain, which a wallet by design does not have. A mining-only wallet therefore
+//! reads `spendable: 0 · complete` forever. That is the same shape as lab #314 —
+//! a confident figure over a half nobody had — one dimension further out, and it
+//! is why the rendered line now names what it did not look at instead of claiming
+//! the chain's authority over it.
 //! [`view`] renders that distinction with the same stable token `qumbra-opview`
 //! and `qumbra-explorer` pin for refused supply figures, so one grep covers all
 //! three surfaces.
