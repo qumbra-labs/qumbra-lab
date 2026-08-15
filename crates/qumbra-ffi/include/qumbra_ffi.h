@@ -202,11 +202,14 @@ char *qmb_bundle_nullifiers(const uint8_t *bytes, size_t len, char **err_out);
  * qmb_spent_contains) · -2 FAILED by name (*out) · -1 invalid call.
  * qmb_spent_contains after DONE: 1 on-chain, 0 not, -1 unanswerable
  * (before DONE / malformed hex) — refused, never guessed. */
-/* Decode a /v1/anchors response and return the node's tip height — a scan's
- * `to` from the chain, not a human guess. 0 with *out_tip set; -1 + *err_out
- * on refusal, by name. */
-int32_t qmb_anchors_tip(const uint8_t *bytes, size_t len, uint64_t *out_tip,
-                        char **err_out);
+/* Decode a /v1/anchors response into the connection facts a wallet shows and
+ * scans by: tip height, plus the finalized height when the chain has one
+ * (*out_has_finalized = 0 means nothing-finalized — said, never guessed as
+ * height 0). Scanning to FINALIZED keeps a balance spendable-consistent.
+ * 0 on success; -1 + *err_out on refusal, by name. */
+int32_t qmb_anchors_facts(const uint8_t *bytes, size_t len, uint64_t *out_tip,
+                          uint8_t *out_has_finalized, uint64_t *out_finalized,
+                          char **err_out);
 
 typedef struct qmb_spent_t qmb_spent_t;
 
