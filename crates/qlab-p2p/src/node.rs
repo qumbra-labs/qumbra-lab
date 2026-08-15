@@ -161,19 +161,39 @@ pub const MAX_BODIES_IN_FLIGHT: usize = 16;
 /// bodies per round trip no matter how much bandwidth, buffer or peer capacity
 /// is idle.
 ///
-/// **128, and the number is the pending-body window's arithmetic, not a guess.**
-/// Every answered request lands in [`crate::adapter::MAX_PENDING_BODIES`] (512
-/// entries) / [`crate::adapter::MAX_PENDING_BODY_BYTES`] (32 MiB). A full
-/// catch-up window is 128 entries — a quarter of the entry cap — and at the
-/// FROZEN v1.0 single-tx body size (~145,754 B, #135's measurement) 128 bodies
-/// are 18.7 MB, inside the 32 MiB byte cap with 42 % margin. So a full window
-/// **cannot on its own trip either cap**, which matters more than it sounds:
-/// over the cap `buffer_body` evicts the HIGHEST held entry, i.e. exactly the
-/// bodies a catch-up just fetched, and the requester would re-ask for them —
-/// fetch, drop, re-fetch, forever. 128 makes that unreachable by construction.
+/// **96, and the number is the tightest of three caps rather than a guess.**
+/// Sized at the FROZEN v1.0 single-tx body (~145,754 B, #135's measurement),
+/// because a coinbase-only body makes every cap here unreachable and the
+/// interesting case is the chain that transacts:
+///
+/// | cap | value | a 96-body window |
+/// |---|---|---|
+/// | [`crate::adapter::MAX_PENDING_BODIES`] | 512 entries | 96, 19 % |
+/// | [`crate::adapter::MAX_PENDING_BODY_BYTES`] | 32 MiB | 14.0 MB, 58 % margin |
+/// | [`crate::ratelimit::BYTE_BURST`] (our own inbound) | 16 MiB | 14.0 MB, 16 % margin |
+///
+/// The third row is the binding one and it is the row this constant exists for.
+/// The requester paces itself on the FRAME axis (see
+/// [`P2pNode::request_missing_bodies`]), and a window whose answers could land
+/// inside one byte-burst would reintroduce the very defect that pacing fixes,
+/// one axis over: a body dropped for bytes is dropped exactly as silently as one
+/// dropped for frames. 16 MiB ÷ 145,754 B is 115 bodies, so 96 — the largest
+/// multiple of [`MAX_BODIES_PER_GETDATA`] that keeps real margin — is the
+/// answer, and 128 (18.7 MB) would have been over it.
+///
+/// The first two rows matter for a different reason: over a pending cap
+/// `buffer_body` evicts the HIGHEST held entry, i.e. exactly the bodies a
+/// catch-up just fetched, and the requester would re-ask for them — fetch, drop,
+/// re-fetch, forever. A full window cannot reach either cap by construction.
+///
+/// **Width is not what sets catch-up throughput** — the inbound frame budget is
+/// (see [`crate::ratelimit::MSG_REFILL_PER_SEC`], 64/s per rate key), so this
+/// number only has to be wide enough that the window is never the binding
+/// constraint. At the Phase B-WAN RTT baseline (68–223 ms) 96 bodies in flight
+/// is 430–1,400 bodies/s of capacity against a 4-peer budget of 256/s.
 ///
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
-pub const MAX_BODIES_IN_FLIGHT_CATCHUP: usize = 128;
+pub const MAX_BODIES_IN_FLIGHT_CATCHUP: usize = 96;
 
 /// **Applied lag above which the catch-up window replaces the steady one**
 /// (lab #412 / QUM-115).
@@ -1368,6 +1388,18 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// Peers sharing a host share the key and therefore share the allowance,
     /// which is correct: it is one bucket, and it is the bucket the answers will
     /// be charged against.
+    ///
+    /// 🔴 **This paces the FRAME axis only.** [`Self::tick`] charges each frame
+    /// against a byte budget as well ([`crate::ratelimit::BYTE_BURST`] /
+    /// [`crate::ratelimit::BYTE_REFILL_PER_SEC`]), and a body dropped for bytes
+    /// is dropped exactly as silently. It is not paced here because the answer's
+    /// size is not known when the ask goes out — a body is anywhere from tens of
+    /// bytes to ~145 kB per transaction. It is handled instead by sizing the
+    /// window so a full one cannot fill the byte burst; the arithmetic is at
+    /// [`MAX_BODIES_IN_FLIGHT_CATCHUP`], and it is what makes that constant 96
+    /// rather than 128. A chain whose blocks carry several proof-bearing
+    /// transactions each would put the byte axis back in play, and the honest
+    /// place to fix that is here, with the observed body size.
     ///
     /// **No reply is not a fault.** A peer that never applied a block genuinely
     /// cannot serve it, and on a mixed-version net it will answer with a header
