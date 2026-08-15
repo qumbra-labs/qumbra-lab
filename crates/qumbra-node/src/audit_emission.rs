@@ -58,6 +58,30 @@ pub struct AuditReport {
     /// Whether height 0 was requested and reported as skipped genesis.
     pub skipped_genesis: bool,
     pub mismatches: Vec<Mismatch>,
+    /// `--payee` tally, when one was asked for (`qumbra-deploy` #143).
+    ///
+    /// Separate from `mismatches` on purpose: a mismatch is a **defect**, this is an
+    /// **attribution**. A block paying an unexpected key is not wrong — the schedule
+    /// says how much, never to whom — so folding them would make one exit code mean
+    /// two things.
+    pub payee: Option<PayeeTally>,
+}
+
+/// How much of the audited interval a given `coinbase_rkm` was paid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PayeeTally {
+    /// The key asked about, as circuit lanes.
+    pub rkm: [u64; 4],
+    /// Canonical blocks in the interval whose `body.coinbase_rkm` is that key.
+    pub blocks: u64,
+    /// Their committed `body.coinbase` summed, in bessel. The MINER's share is a
+    /// fraction of this (`RewardSplit`), not this number — raw so the split stays
+    /// in one place.
+    pub coinbase_bessel: u128,
+    /// Canonical blocks in the interval, so `blocks` has a denominator. Without one,
+    /// "42 blocks" cannot be read as a share — and a share read without its
+    /// denominator is how #143 was argued wrongly twice.
+    pub blocks_in_interval: u64,
 }
 
 impl AuditReport {
@@ -98,6 +122,23 @@ impl AuditReport {
         }
         for m in &self.mismatches {
             lines.push(m.format_line());
+        }
+        if let Some(t) = &self.payee {
+            let hex: String =
+                t.rkm.iter().flat_map(|l| l.to_le_bytes()).map(|b| format!("{b:02x}")).collect();
+            lines.push(format!(
+                "payee {hex}: {} of {} canonical block(s) in {}..={} paid it, {} bessel committed",
+                t.blocks, t.blocks_in_interval, self.from, self.to, t.coinbase_bessel
+            ));
+            if t.blocks == 0 {
+                lines.push(
+                    "  0 here means NO canonical block in this interval carried that \
+                     coinbase_rkm — a fact about the chain, unlike a wallet scan's 0 (lab \
+                     #415: the compact wire carries no coinbase_rkm, so a wallet cannot see \
+                     coinbase at all)."
+                        .to_string(),
+                );
+            }
         }
         lines.push(self.format_summary());
         lines.join("\n")
@@ -162,6 +203,7 @@ pub fn audit_emission(
     data_dir: &Path,
     from: Option<u64>,
     to: Option<u64>,
+    payee: Option<[u64; 4]>,
 ) -> Result<AuditReport, AuditError> {
     if !data_dir.exists() {
         return Err(AuditError::BadDir {
@@ -225,6 +267,12 @@ pub fn audit_emission(
                 tip,
                 skipped_genesis: true,
                 mismatches: Vec::new(),
+                payee: payee.map(|rkm| PayeeTally {
+                    rkm,
+                    blocks: 0,
+                    coinbase_bessel: 0,
+                    blocks_in_interval: 0,
+                }),
             });
         }
         1
@@ -234,10 +282,21 @@ pub fn audit_emission(
 
     let chain = main_chain_of(&node);
     let mut mismatches = Vec::new();
+    let mut payee_blocks = 0u64;
+    let mut payee_bessel = 0u128;
+    let mut blocks_in_interval = 0u64;
     for block in &chain {
         let h = block.header.height;
         if h < audit_from || h > to_req {
             continue;
+        }
+        blocks_in_interval += 1;
+        if let Some(want) = payee {
+            let body = block.body();
+            if body.coinbase_rkm == want {
+                payee_blocks += 1;
+                payee_bessel += u128::from(body.coinbase);
+            }
         }
         if let Some(m) = mismatch_at(block) {
             mismatches.push(m);
@@ -245,6 +304,12 @@ pub fn audit_emission(
     }
 
     Ok(AuditReport {
+        payee: payee.map(|rkm| PayeeTally {
+            rkm,
+            blocks: payee_blocks,
+            coinbase_bessel: payee_bessel,
+            blocks_in_interval,
+        }),
         from: if skipped_genesis { 0 } else { audit_from },
         to: to_req,
         tip,
@@ -393,6 +458,43 @@ mod tests {
     }
 
     #[test]
+    fn payee_counts_the_blocks_that_paid_a_key_and_says_so_honestly_when_none_did() {
+        let dir = temp_dir("payee");
+        {
+            let mut node = open_fresh(&dir);
+            for h in 1..=5 {
+                extend(&mut node, coinbase(h));
+            }
+        }
+
+        // The key every fixture block pays: 5 of 5, with the denominator present so
+        // the number can be read as a share.
+        let hit = audit_emission(&dir, None, None, Some(RKM)).unwrap().payee.unwrap();
+        assert_eq!(hit.blocks, 5);
+        assert_eq!(hit.blocks_in_interval, 5);
+        assert_eq!(hit.coinbase_bessel, (1..=5).map(|h| u128::from(coinbase(h))).sum::<u128>());
+
+        // A key nothing paid. This zero is a FACT ABOUT THE CHAIN — the whole reason
+        // the flag exists (qumbra-deploy #143): a wallet scan's 0 could not be, since
+        // the compact wire carries no coinbase_rkm at all (lab #415).
+        let mut other = RKM;
+        other[0] ^= 1;
+        let miss = audit_emission(&dir, None, None, Some(other)).unwrap();
+        let t = miss.payee.unwrap();
+        assert_eq!(t.blocks, 0);
+        assert_eq!(t.blocks_in_interval, 5, "the denominator survives a zero");
+        assert_eq!(t.coinbase_bessel, 0);
+        let out = miss.format_output();
+        assert!(out.contains("NO canonical block"), "a zero must say what it means: {out}");
+        assert!(out.contains("#415"), "and point at why a wallet's 0 differs: {out}");
+
+        // Attribution never changes the audit's verdict: a key nobody paid is not a
+        // defect, and the exit code must not learn about payees.
+        assert_eq!(miss.exit_code(), EXIT_CLEAN);
+        assert!(miss.mismatches.is_empty());
+    }
+
+    #[test]
     fn clean_chain_reports_zero_mismatches_and_exit_0() {
         let dir = temp_dir("clean");
         {
@@ -402,7 +504,7 @@ mod tests {
             }
             // Drop the node so the log is fully flushed before re-open.
         }
-        let report = audit_emission(&dir, None, None).unwrap();
+        let report = audit_emission(&dir, None, None, None).unwrap();
         assert_eq!(report.tip, 5);
         assert_eq!(report.from, 1);
         assert_eq!(report.to, 5);
@@ -429,7 +531,7 @@ mod tests {
                 extend(&mut node, committed);
             }
         }
-        let report = audit_emission(&dir, None, None).unwrap();
+        let report = audit_emission(&dir, None, None, None).unwrap();
         assert_eq!(report.exit_code(), EXIT_MISMATCH);
         assert_eq!(report.mismatches.len(), 1);
         let m = &report.mismatches[0];
@@ -462,7 +564,7 @@ mod tests {
         }
         // Explicit --from 0: height 0 must be "skipped genesis", not a MISMATCH,
         // even though coinbase(0) = 5e9 while body.coinbase == 0.
-        let report = audit_emission(&dir, Some(0), None).unwrap();
+        let report = audit_emission(&dir, Some(0), None, None).unwrap();
         assert!(report.skipped_genesis);
         assert!(report.mismatches.is_empty());
         assert_eq!(report.exit_code(), EXIT_CLEAN);
@@ -471,7 +573,7 @@ mod tests {
         assert!(out.contains("0 mismatches"));
         assert!(!out.contains("MISMATCH"));
         // Interval exactly {0}:
-        let only0 = audit_emission(&dir, Some(0), Some(0)).unwrap();
+        let only0 = audit_emission(&dir, Some(0), Some(0), None).unwrap();
         assert!(only0.skipped_genesis);
         assert!(only0.mismatches.is_empty());
         assert_eq!(only0.exit_code(), EXIT_CLEAN);
@@ -485,7 +587,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&missing);
-        let err = audit_emission(&missing, None, None).unwrap_err();
+        let err = audit_emission(&missing, None, None, None).unwrap_err();
         assert_eq!(err.name(), "bad_dir");
         assert!(err.reason().contains("does not exist"));
     }
@@ -499,11 +601,11 @@ mod tests {
                 extend(&mut node, coinbase(h));
             }
         }
-        let err = audit_emission(&dir, Some(10), None).unwrap_err();
+        let err = audit_emission(&dir, Some(10), None, None).unwrap_err();
         assert_eq!(err.name(), "interval_beyond_tip");
         assert!(err.reason().contains("--from 10"));
 
-        let err = audit_emission(&dir, Some(1), Some(99)).unwrap_err();
+        let err = audit_emission(&dir, Some(1), Some(99), None).unwrap_err();
         assert_eq!(err.name(), "interval_beyond_tip");
         assert!(err.reason().contains("--to 99"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -513,7 +615,7 @@ mod tests {
     fn exit_2_unreadable_log_empty_dir_with_from_default() {
         // An empty data dir opens as tip=0; default --from 1 is beyond tip.
         let dir = temp_dir("empty");
-        let err = audit_emission(&dir, None, None).unwrap_err();
+        let err = audit_emission(&dir, None, None, None).unwrap_err();
         assert_eq!(err.name(), "interval_beyond_tip");
         let _ = std::fs::remove_dir_all(&dir);
     }

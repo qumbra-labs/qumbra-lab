@@ -151,7 +151,21 @@ fn cmd_audit_emission(args: &[String]) -> ExitCode {
             return ExitCode::from(EXIT_CANNOT_RUN);
         }
     };
-    match audit_emission::audit_emission(&data_dir, from, to) {
+    // `--payee <64hex>`: attribution, not audit. Parsed with the SAME function the
+    // node uses for its own `miner_rkm` (`config::rkm_lanes_from_hex`), because a
+    // second copy of that lane-major arithmetic is exactly the wrong-in-the-detail
+    // this tool exists to settle.
+    let payee = match flag(args, "--payee") {
+        None => None,
+        Some(hex) => match qumbra_node::config::rkm_lanes_from_hex(hex) {
+            Ok(lanes) => Some(lanes),
+            Err(e) => {
+                eprintln!("qumbra-node audit-emission: --payee {e}");
+                return ExitCode::from(EXIT_CANNOT_RUN);
+            }
+        },
+    };
+    match audit_emission::audit_emission(&data_dir, from, to, payee) {
         Ok(report) => {
             println!("{}", report.format_output());
             ExitCode::from(report.exit_code())
