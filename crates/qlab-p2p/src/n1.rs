@@ -307,6 +307,21 @@ pub trait ChainView {
     fn state_tip_mine_ready(&self) -> bool {
         false
     }
+
+    /// **How many blocks the applied state is behind this node's own fork-choice
+    /// tip** — `slag`, the number that says whether this node is keeping up or
+    /// catching up (lab #412 / QUM-115).
+    ///
+    /// Read by the body requester to pick its in-flight window
+    /// ([`crate::node::body_window_for`]): near the tip a narrow window is right,
+    /// and it is the wrong bound for a joiner replaying thousands of blocks.
+    ///
+    /// Default `0` — a header-only node-state applies headers into both views
+    /// together and is never behind itself, so it keeps the steady window and
+    /// every in-process sim's traffic is byte-for-byte what it was.
+    fn state_lag_blocks(&self) -> u64 {
+        0
+    }
 }
 
 /// Ingest headers received from peers.

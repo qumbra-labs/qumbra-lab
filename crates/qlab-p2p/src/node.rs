@@ -149,6 +149,83 @@ pub const MAX_SERVED_BODY_BYTES: usize = 8 * 1024 * 1024;
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
 pub const MAX_BODIES_IN_FLIGHT: usize = 16;
 
+/// **The in-flight window a node uses while it is CATCHING UP** — more than
+/// [`CATCHUP_LAG_BLOCKS`] blocks of applied lag (lab #412 / QUM-115).
+///
+/// [`MAX_BODIES_IN_FLIGHT`]'s own arithmetic is for the steady state, and it
+/// says so: *"one request round completes in one round trip … 16 bodies against
+/// a block rate of one per 75 s"*. That ratio is what a node near the tip needs.
+/// A stranger joiner is not near the tip — after checkpoint sync it holds 12,400
+/// headers and no bodies — and there the same 16 is a ceiling on how much of the
+/// history can be in transit at once, so catch-up throughput is pinned to 16
+/// bodies per round trip no matter how much bandwidth, buffer or peer capacity
+/// is idle.
+///
+/// **128, and the number is the pending-body window's arithmetic, not a guess.**
+/// Every answered request lands in [`crate::adapter::MAX_PENDING_BODIES`] (512
+/// entries) / [`crate::adapter::MAX_PENDING_BODY_BYTES`] (32 MiB). A full
+/// catch-up window is 128 entries — a quarter of the entry cap — and at the
+/// FROZEN v1.0 single-tx body size (~145,754 B, #135's measurement) 128 bodies
+/// are 18.7 MB, inside the 32 MiB byte cap with 42 % margin. So a full window
+/// **cannot on its own trip either cap**, which matters more than it sounds:
+/// over the cap `buffer_body` evicts the HIGHEST held entry, i.e. exactly the
+/// bodies a catch-up just fetched, and the requester would re-ask for them —
+/// fetch, drop, re-fetch, forever. 128 makes that unreachable by construction.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const MAX_BODIES_IN_FLIGHT_CATCHUP: usize = 128;
+
+/// **Applied lag above which the catch-up window replaces the steady one**
+/// (lab #412 / QUM-115).
+///
+/// 64 blocks is 80 minutes at the 75 s target block time — far past any lag
+/// ordinary relay jitter, a reorg, or a brief disconnect produces, and far short
+/// of the thousands a joiner carries. Below it a node is *keeping up* and
+/// [`MAX_BODIES_IN_FLIGHT`]'s reasoning applies unchanged; above it the node is
+/// *catching up*, which is a different job with a different bound.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const CATCHUP_LAG_BLOCKS: u64 = 64;
+
+/// **Inbound frames left unasked-for on each rate key** — the headroom the body
+/// requester never spends (lab #412 / QUM-115).
+///
+/// The requester paces its asks against its own inbound frame budget (see
+/// [`crate::ratelimit::RateLimiter::frame_headroom`]). Spending the budget down
+/// to zero would make bodies crowd out everything else arriving from that host —
+/// headers, announces, checkpoint votes, `Pong` — and those drops are exactly as
+/// silent. 32 frames is half a second of [`crate::ratelimit::MSG_REFILL_PER_SEC`]
+/// held back for traffic this node did not ask for.
+///
+/// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+pub const BODY_ASK_FRAME_HEADROOM: u64 = 32;
+
+/// The in-flight body window for a node whose applied state is `lag` blocks
+/// behind its own fork-choice tip — [`MAX_BODIES_IN_FLIGHT`] near the tip,
+/// [`MAX_BODIES_IN_FLIGHT_CATCHUP`] while catching up.
+///
+/// One function, read by the requester and by the `BODYWAIT` observation, so the
+/// window a node uses and the window its instrument reports cannot drift apart.
+/// One outstanding historical-body request: when it went out, and to whom.
+///
+/// The peer is not bookkeeping. The requester subtracts the asks a rate key
+/// already owes it from that key's remaining inbound frame budget, and without
+/// the peer on the record there is no way to attribute an in-flight ask to a
+/// key. See [`P2pNode::request_missing_bodies`].
+#[derive(Clone, Copy, Debug)]
+struct BodyReq {
+    sent_ms: u64,
+    peer: PeerId,
+}
+
+pub const fn body_window_for(lag: u64) -> usize {
+    if lag > CATCHUP_LAG_BLOCKS {
+        MAX_BODIES_IN_FLIGHT_CATCHUP
+    } else {
+        MAX_BODIES_IN_FLIGHT
+    }
+}
+
 /// **How long an unanswered body request is held before it may be re-asked**
 /// (issue #130 (c)).
 ///
@@ -173,7 +250,11 @@ pub const BODY_REQUEST_TIMEOUT_MS: u64 = 15_000;
 /// actively wrong, because the receiving side scores it ([`PENALTY_WELSHED_INV`]).
 ///
 /// Matched to [`MAX_BODIES_IN_FLIGHT`] so an honest requester at its own cap is
-/// never truncated by ours.
+/// never truncated by ours — and since QUM-115 that invariant is held from the
+/// REQUEST side too: a catch-up window of [`MAX_BODIES_IN_FLIGHT_CATCHUP`] is
+/// sent as several `GetData` messages of at most this many items each, never one
+/// oversize inv. That keeps this cap binding exactly as it did against every
+/// peer, including one running an image that predates the wider window.
 ///
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
 pub const MAX_BODIES_PER_GETDATA: usize = 16;
@@ -479,14 +560,14 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// connection, so dropping and redialling does not hand out a fresh budget.
     limiter: RateLimiter,
     /// **Historical body requests we have outstanding** (issue #130 (c)): block
-    /// hash → the `now_ms` the ask was sent at. Bounded by
-    /// [`MAX_BODIES_IN_FLIGHT`]; an entry older than [`BODY_REQUEST_TIMEOUT_MS`] is
-    /// dropped so the hash may be asked again, of a different peer.
+    /// hash → when the ask was sent and to whom. Bounded by [`body_window_for`];
+    /// an entry older than [`BODY_REQUEST_TIMEOUT_MS`] is dropped so the hash may
+    /// be asked again, of a different peer.
     ///
     /// It is also the list [`Self::on_not_found`] reads: an ask WE originated that a
     /// peer cannot serve is not a welshed inv, and without this set there is no way
     /// to tell those two apart.
-    body_reqs: HashMap<Hash32, u64>,
+    body_reqs: HashMap<Hash32, BodyReq>,
     /// **What each body request has been answered with, and for how long it has
     /// been wanted** (issue #229) — observation only, never read by any decision.
     ///
@@ -1239,9 +1320,10 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// answer; the short version is that a new `MsgType` would be banned on sight by
     /// every node running the current image.
     ///
-    /// Four bounds, all named constants:
+    /// Five bounds, all named constants:
     ///
-    /// 1. [`MAX_BODIES_IN_FLIGHT`] outstanding asks at once;
+    /// 1. [`body_window_for`] outstanding asks at once — [`MAX_BODIES_IN_FLIGHT`]
+    ///    near the tip, [`MAX_BODIES_IN_FLIGHT_CATCHUP`] while catching up;
     /// 2. one ask per hash per [`BODY_REQUEST_TIMEOUT_MS`];
     /// 3. the ask set itself is bounded and shrinking —
     ///    [`crate::n1::ChainView::missing_body_hashes`] returns only main-chain
@@ -1249,7 +1331,43 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     ///    held, so **it empties as the state machine advances and the node stops
     ///    asking**. That is the termination argument, and it is the node state's
     ///    guarantee rather than a timer here;
-    /// 4. nothing is asked with no ready peer to ask.
+    /// 4. nothing is asked with no ready peer to ask;
+    /// 5. 🔴 **nothing is asked that this node's own inbound limiter would then
+    ///    drop** — see below.
+    ///
+    /// ## Asking for no more than we can receive (lab #412 / QUM-115)
+    ///
+    /// [`crate::ratelimit`] sits ahead of decode in [`Self::tick`], by #91's
+    /// decision 2, and it does not know a frame is an answer to our own ask —
+    /// nothing does, that early. So a body we requested is dropped like any other
+    /// frame over budget: silently, unscored, and **indistinguishable from a peer
+    /// that never answered**. The ask then stands until [`BODY_REQUEST_TIMEOUT_MS`],
+    /// and because the window was full the requester has nothing else it may ask
+    /// for — the whole pipeline stops for a full re-ask interval.
+    ///
+    /// That is not a hypothesis. On the #371 joiner drill (2,500 blocks, three
+    /// loopback servers, which share ONE rate key because they share a host) the
+    /// applied tip advanced in ~260-block bursts separated by 15.0 s of nothing:
+    /// a 256-frame burst budget spent, ~12 answers dropped, then dead air until
+    /// the timeout. 15.9 blk/s. The same run with only the joiner's inbound frame
+    /// budget lifted: 77.6 blk/s, zero throttled frames, no dead air.
+    ///
+    /// The fix is on this side rather than in the limiter, and that is the point:
+    /// #91's budget stays exactly where it is, and the traffic it was dropping is
+    /// traffic this node now never asks for. Two terms are subtracted from a key's
+    /// [`crate::ratelimit::RateLimiter::frame_headroom`] before anything is asked
+    /// of the peers behind it:
+    ///
+    /// - [`BODY_ASK_FRAME_HEADROOM`], so bodies never crowd out the traffic this
+    ///   node did not ask for (headers, votes, announces);
+    /// - **the asks already owed by that key** — every in-flight request will
+    ///   consume a frame of the same budget when it lands. Without this term the
+    ///   requester re-reads an un-spent budget on every tick and over-asks by the
+    ///   number of ticks a round trip takes, which is the drop it is avoiding.
+    ///
+    /// Peers sharing a host share the key and therefore share the allowance,
+    /// which is correct: it is one bucket, and it is the bucket the answers will
+    /// be charged against.
     ///
     /// **No reply is not a fault.** A peer that never applied a block genuinely
     /// cannot serve it, and on a mixed-version net it will answer with a header
@@ -1258,7 +1376,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// body that does not match the header's `tx_body_commitment`.
     fn request_missing_bodies(&mut self, now_ms: u64) {
         self.body_reqs
-            .retain(|_, sent| now_ms.saturating_sub(*sent) < BODY_REQUEST_TIMEOUT_MS);
+            .retain(|_, req| now_ms.saturating_sub(req.sent_ms) < BODY_REQUEST_TIMEOUT_MS);
         // Issue #229, observation only: prune the ask ledger to what is either in
         // flight or within one full re-ask cycle of having been. The grace window is
         // what lets a record survive the expiry above and the re-insert below —
@@ -1266,7 +1384,8 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // every 15 s, which is exactly the number the incident needed and did not
         // have. Nothing here is read by the requester.
         self.prune_body_asks(now_ms);
-        let room = MAX_BODIES_IN_FLIGHT.saturating_sub(self.body_reqs.len());
+        let window = body_window_for(self.node.state_lag_blocks());
+        let room = window.saturating_sub(self.body_reqs.len());
         if room == 0 {
             return;
         }
@@ -1276,7 +1395,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
         let wanted: Vec<Hash32> = self
             .node
-            .missing_body_hashes(MAX_BODIES_IN_FLIGHT)
+            .missing_body_hashes(window)
             .into_iter()
             .filter(|h| !self.body_reqs.contains_key(h))
             .take(room)
@@ -1284,15 +1403,52 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         if wanted.is_empty() {
             return;
         }
+        // The rate key each candidate peer's answers will be charged against, and
+        // what each key already owes us. Both are read before the limiter is
+        // touched, because `rate_key` borrows the transport and `frame_headroom`
+        // borrows the limiter mutably.
+        let keys: Vec<RateKey> = peers.iter().map(|p| self.rate_key(*p)).collect();
+        let mut owed: HashMap<RateKey, u64> = HashMap::new();
+        for req in self.body_reqs.values() {
+            *owed.entry(self.rate_key(req.peer)).or_insert(0) += 1;
+        }
+        let mut allowance: HashMap<RateKey, u64> = HashMap::new();
+        for key in &keys {
+            if allowance.contains_key(key) {
+                continue; // peers sharing a host share the bucket, and the allowance
+            }
+            let free = self.limiter.frame_headroom(key, now_ms);
+            let owed_here = owed.get(key).copied().unwrap_or(0);
+            allowance.insert(
+                key.clone(),
+                free.saturating_sub(BODY_ASK_FRAME_HEADROOM).saturating_sub(owed_here),
+            );
+        }
         // Grouped through a peer-ordered Vec rather than a map: the send order must
         // be a function of the peer list alone, or the in-process sims stop being
         // reproducible byte-for-byte (the M9-N7 property).
         let n = peers.len();
         let mut batches: Vec<Vec<InvItem>> = vec![Vec::new(); n];
         for (i, id) in wanted.iter().enumerate() {
-            let slot = (self.body_rr + i) % n;
+            // The rotation is unchanged; what is new is stepping past a peer whose
+            // key has no allowance left. A hash that finds no peer with budget is
+            // simply not asked for this tick — it stays in the ask set, costs no
+            // in-flight slot, and is asked as soon as the bucket refills. Nothing
+            // is scored: a full bucket is our limit, not a peer's fault.
+            let mut chosen = None;
+            for step in 0..n {
+                let cand = (self.body_rr + i + step) % n;
+                if allowance.get(&keys[cand]).copied().unwrap_or(0) > 0 {
+                    chosen = Some(cand);
+                    break;
+                }
+            }
+            let Some(slot) = chosen else { break };
+            if let Some(left) = allowance.get_mut(&keys[slot]) {
+                *left -= 1;
+            }
             batches[slot].push(InvItem { kind: InvKind::Block, id: *id });
-            self.body_reqs.insert(*id, now_ms);
+            self.body_reqs.insert(*id, BodyReq { sent_ms: now_ms, peer: peers[slot] });
             // Issue #229: record WHICH peer this rung of the ladder went to, so an
             // unanswered ask is attributable to a peer rather than to the net. The
             // slot arithmetic is read, never changed — `peers` and `batches` are
@@ -1302,8 +1458,15 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
         self.body_rr = self.body_rr.wrapping_add(1);
         for (pid, items) in peers.into_iter().zip(batches) {
-            if !items.is_empty() {
-                self.send(pid, MsgType::GetData, encode_inv(&items));
+            // Chunked at [`MAX_BODIES_PER_GETDATA`] so a catch-up-width batch is
+            // never truncated by an honest server: that constant is the *serving*
+            // side's per-message cap, and items past it are answered header-only.
+            // Splitting keeps the invariant its doc states — "an honest requester
+            // at its own cap is never truncated by ours" — true for a requester
+            // whose window is now wider than one message, including against every
+            // peer running an image that predates this change.
+            for chunk in items.chunks(MAX_BODIES_PER_GETDATA) {
+                self.send(pid, MsgType::GetData, encode_inv(chunk));
             }
         }
     }

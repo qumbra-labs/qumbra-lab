@@ -153,7 +153,9 @@ pub const CHECKPOINT_QUERY_SERVE_INTERVAL_MS: u64 = 5_000;
 // | `GetData` items examined per message | [`MAX_GETDATA_ITEMS`] | serve side |
 // | body bytes per `GetData` answer | [`MAX_BODY_BYTES_PER_GETDATA`] | serve side |
 // | served body bytes per key, sustained | [`BODY_SERVE_BYTES_PER_SEC`] (burst [`BODY_SERVE_BYTE_BURST`]) | serve side |
-// | asks outstanding at once | `crate::node::MAX_BODIES_IN_FLIGHT` (16) | request side |
+// | asks outstanding at once | `crate::node::body_window_for` (16 near tip, 128 catching up) | request side |
+// | asks per `GetData` message | `crate::node::MAX_BODIES_PER_GETDATA` (16) | request side |
+// | asks against our own inbound budget | [`RateLimiter::frame_headroom`] − `crate::node::BODY_ASK_FRAME_HEADROOM` | request side |
 // | re-ask pacing | `crate::node::BODY_REQUEST_TIMEOUT_MS` | request side |
 //
 // **A refusal on any of these is unscored and is never `NotFound`** — volume is
@@ -170,8 +172,11 @@ pub const CHECKPOINT_QUERY_SERVE_INTERVAL_MS: u64 = 5_000;
 ///
 /// 256 = [`MSG_BURST`]: an honest requester's whole frame burst could each name
 /// one item and still be answered in full. The honest body path asks at most
-/// `crate::node::MAX_BODIES_IN_FLIGHT` (16) per message; tx and checkpoint asks
-/// are single-digit. Nothing honest reaches triple digits.
+/// `crate::node::MAX_BODIES_PER_GETDATA` (16) per message — a catch-up window
+/// wider than that is split across messages rather than sent as one oversize
+/// inv, precisely so this cap and the serve-side body cap keep binding on honest
+/// traffic exactly as they did; tx and checkpoint asks are single-digit. Nothing
+/// honest reaches triple digits.
 ///
 /// `[devnet-placeholder]`, testnet-tunable, NOT frozen.
 pub const MAX_GETDATA_ITEMS: usize = 256;
@@ -337,6 +342,13 @@ impl TokenBucket {
     /// Whole tokens currently available (ops / tests).
     pub fn available(&self) -> u64 {
         self.tokens_milli / 1000
+    }
+
+    /// Whole tokens available **as of `now_ms`** — [`Self::available`] after the
+    /// same time-based refill [`Self::try_take`] would do, spending nothing.
+    pub fn available_at(&mut self, now_ms: u64) -> u64 {
+        self.refill(now_ms);
+        self.available()
     }
 }
 
@@ -538,6 +550,34 @@ impl RateLimiter {
         for (_, k) in ages.into_iter().take(drop_n) {
             self.entries.remove(&k);
             self.stats.evicted_keys += 1;
+        }
+    }
+
+    /// **How many more inbound frames `key` may deliver right now** — this node's
+    /// view of its OWN budget, spending nothing (lab #412 / QUM-115).
+    ///
+    /// The requester needs this because [`Self::charge_frame`] sits ahead of
+    /// decode by design (#91 decision 2): a frame dropped there is dropped
+    /// *whatever it was*, including a body this node asked for, and the drop is
+    /// silent and unscored. The answer therefore never arrives, the in-flight
+    /// entry stands until [`crate::node::BODY_REQUEST_TIMEOUT_MS`], and the whole
+    /// catch-up pipeline pays a full re-ask interval of dead air. Measured on the
+    /// #371 joiner drill: three loopback servers share one key, a 256-frame burst
+    /// of body answers empties the bucket, and `stip` then does not move for
+    /// exactly 15 s — 15.9 blk/s against 77.6 blk/s for the same run with the
+    /// budget lifted.
+    ///
+    /// So the requester asks for no more than it can receive. That is strictly
+    /// better than widening the budget: the limit stays exactly where #91 put it,
+    /// and the traffic it was dropping is traffic this node now never asks for.
+    ///
+    /// A key with no entry yet has its whole burst available, and asking does
+    /// **not** create one — a caller polling this cannot grow the key map or
+    /// perturb [`MAX_RATE_KEYS`] eviction.
+    pub fn frame_headroom(&mut self, key: &RateKey, now_ms: u64) -> u64 {
+        match self.entries.get_mut(key) {
+            Some(e) => e.msgs.available_at(now_ms),
+            None => self.limits.msg_burst,
         }
     }
 

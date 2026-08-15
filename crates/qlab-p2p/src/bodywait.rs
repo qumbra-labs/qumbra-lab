@@ -67,11 +67,15 @@ pub const MAX_ANSWERS_PER_ASK: usize = 8;
 /// How many ask records are tracked at once, before the oldest by first-ask is
 /// dropped.
 ///
-/// `2 × MAX_BODIES_IN_FLIGHT`. The in-flight map is capped at 16 and this ledger
-/// is pruned against it every pass, so the cap is a backstop rather than a working
-/// bound — it exists so that a bug in the pruning cannot turn an observation
-/// ledger into a memory leak on a node that is already unwell.
-pub const MAX_TRACKED_ASKS: usize = 2 * crate::node::MAX_BODIES_IN_FLIGHT;
+/// `2 × MAX_BODIES_IN_FLIGHT_CATCHUP` — twice the WIDEST in-flight window a node
+/// can open ([`crate::node::body_window_for`]), which is the catch-up one since
+/// QUM-115. This ledger is pruned against the in-flight map every pass, so the
+/// cap is a backstop rather than a working bound — it exists so that a bug in the
+/// pruning cannot turn an observation ledger into a memory leak on a node that is
+/// already unwell. Sized against the steady 16 it would instead have evicted live
+/// records of a catch-up in progress, i.e. gone blind at exactly the moment #229
+/// was built to see.
+pub const MAX_TRACKED_ASKS: usize = 2 * crate::node::MAX_BODIES_IN_FLIGHT_CATCHUP;
 
 /// **What a peer answered when we asked it for a block body.**
 ///

@@ -65,7 +65,7 @@ use qlab_devnet::body::TxVerifier;
 
 use crate::bodywait::{AskSetObservation, MineDuty, RejoinGate};
 use crate::codec::{checkpoint_id, tx_id as wire_tx_id};
-use crate::node::MAX_BODIES_IN_FLIGHT;
+use crate::node::body_window_for;
 use crate::n1::{
     BlockIngest, ChainView, CheckpointIngest, CommitteeControl, IngestOutcome, TxPool, VotesOutcome,
 };
@@ -1217,7 +1217,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             lag: lag.blocks(),
             off_main,
             fork_point: self.state_fork_point().map(|(h, _)| h),
-            ask_set: self.missing_body_hashes(MAX_BODIES_IN_FLIGHT).len(),
+            // The window the requester would actually use this tick (QUM-115), not
+            // a fixed 16: reporting the steady width while a catch-up asks 128
+            // would make `ask_set` say the pipeline was full when it was not.
+            ask_set: self.missing_body_hashes(body_window_for(lag.blocks())).len(),
             in_flight,
             pending: self.pending_bodies.len(),
             gate: self.rejoin_gate_observed(),
@@ -2254,6 +2257,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
 
     fn state_tip_mine_ready(&self) -> bool {
         NodeAdapter::state_tip_mine_ready(self)
+    }
+
+    fn state_lag_blocks(&self) -> u64 {
+        self.state_lag().blocks()
     }
 }
 
