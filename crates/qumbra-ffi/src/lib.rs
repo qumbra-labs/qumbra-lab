@@ -921,22 +921,30 @@ pub unsafe extern "C" fn qmb_bundle_review(
 
 
 
-/// Decode a `/v1/anchors` response and return the node's TIP HEIGHT — so a
-/// scan's `to` can come from the chain instead of a human guessing it. The
-/// bytes are decoded by `qlab_node::AnchorSet::from_bytes`, the wire's own
-/// codec. Returns 0 with `*out_tip` set; -1 + `err_out` on refusal, by name.
+/// Decode a `/v1/anchors` response into the connection facts a wallet surface
+/// shows and scans by: TIP height, and the FINALIZED height when the chain
+/// has one (`*out_has_finalized = 0` means young-chain-nothing-finalized —
+/// said, never guessed as 0). The bytes are decoded by
+/// `qlab_node::AnchorSet::from_bytes`, the wire's own codec. Scanning to
+/// FINALIZED (the macOS shell's choice) keeps a balance spendable-consistent:
+/// a note above the finalized anchor cannot be spent yet anyway. Returns 0 on
+/// success; -1 + `err_out` on refusal, by name. (Supersedes `qmb_anchors_tip`,
+/// whose only consumer moved with it.)
 ///
 /// # Safety
-/// `bytes` points to `len` readable bytes; `out_tip` writable; `err_out`
-/// NULL or writable.
+/// `bytes` points to `len` readable bytes; `out_tip`/`out_has_finalized`/
+/// `out_finalized` writable; `err_out` NULL or writable.
 #[no_mangle]
-pub unsafe extern "C" fn qmb_anchors_tip(
+pub unsafe extern "C" fn qmb_anchors_facts(
     bytes: *const u8,
     len: usize,
     out_tip: *mut u64,
+    out_has_finalized: *mut u8,
+    out_finalized: *mut u64,
     err_out: *mut *mut c_char,
 ) -> i32 {
-    if bytes.is_null() || out_tip.is_null() {
+    if bytes.is_null() || out_tip.is_null() || out_has_finalized.is_null() || out_finalized.is_null()
+    {
         set_err(err_out, "NULL argument".into());
         return -1;
     }
@@ -944,6 +952,8 @@ pub unsafe extern "C" fn qmb_anchors_tip(
     match qlab_node::AnchorSet::from_bytes(raw) {
         Ok(set) => {
             *out_tip = set.tip_height;
+            *out_has_finalized = u8::from(set.finalized_height.is_some());
+            *out_finalized = set.finalized_height.unwrap_or(0);
             0
         }
         Err(e) => {
@@ -1584,9 +1594,11 @@ mod tests {
         }
     }
 
-    /// The tip height crosses from a REAL AnchorSet encoding; garbage refuses.
+    /// Tip AND finalized cross from a REAL AnchorSet encoding; a young chain's
+    /// nothing-finalized is SAID (has=0), never guessed as height 0; garbage
+    /// refuses by name.
     #[test]
-    fn the_anchors_tip_reads_from_the_wire_codec() {
+    fn the_anchors_facts_read_from_the_wire_codec() {
         unsafe {
             let set = qlab_node::AnchorSet {
                 tip_height: 12345,
@@ -1595,12 +1607,32 @@ mod tests {
                 roots: vec![[7u8; 32]],
             };
             let bytes = set.to_bytes();
-            let mut tip: u64 = 0;
+            let (mut tip, mut has, mut fin): (u64, u8, u64) = (0, 9, 9);
             let mut err: *mut c_char = ptr::null_mut();
-            assert_eq!(qmb_anchors_tip(bytes.as_ptr(), bytes.len(), &mut tip, &mut err), 0);
-            assert_eq!(tip, 12345);
+            assert_eq!(
+                qmb_anchors_facts(bytes.as_ptr(), bytes.len(), &mut tip, &mut has, &mut fin, &mut err),
+                0
+            );
+            assert_eq!((tip, has, fin), (12345, 1, 12000));
+
+            let young = qlab_node::AnchorSet {
+                tip_height: 3,
+                finalized_height: None,
+                max_age_blocks: 64,
+                roots: vec![],
+            };
+            let yb = young.to_bytes();
+            assert_eq!(
+                qmb_anchors_facts(yb.as_ptr(), yb.len(), &mut tip, &mut has, &mut fin, &mut err),
+                0
+            );
+            assert_eq!((tip, has), (3, 0), "nothing finalized is said, not zeroed");
+
             let junk = b"nope";
-            assert_eq!(qmb_anchors_tip(junk.as_ptr(), junk.len(), &mut tip, &mut err), -1);
+            assert_eq!(
+                qmb_anchors_facts(junk.as_ptr(), junk.len(), &mut tip, &mut has, &mut fin, &mut err),
+                -1
+            );
             assert!(!err.is_null());
             let why = CStr::from_ptr(err).to_str().unwrap();
             assert!(why.contains("did not decode"), "{why}");
