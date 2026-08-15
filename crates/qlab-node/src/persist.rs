@@ -13,8 +13,9 @@
 //!   O(blocks since the snapshot) instead of O(whole chain). It is written
 //!   **atomically** (temp file + fsync + rename), so a crash mid-write can never
 //!   leave a torn snapshot — the previous snapshot (or none) survives and the log
-//!   catches the node back up. A snapshot that fails to decode is treated as
-//!   absent, forcing a full, always-correct genesis replay.
+//!   catches the node back up. A snapshot that fails to decode is **rejected
+//!   with its reason** ([`SnapshotLoadReject`], lab #408) and the caller falls
+//!   back to a full, always-correct genesis replay — reported, not silent.
 //!
 //! Both files are self-describing via [`FORMAT_VERSION`]; a snapshot from a
 //! different format version is ignored (protocol-spec §0 versioning discipline).
@@ -341,19 +342,75 @@ pub fn save_snapshot(dir: &Path, snap: &Snapshot) -> io::Result<()> {
     Ok(())
 }
 
-/// Load the snapshot if present, valid, and of the current [`FORMAT_VERSION`].
-/// A missing, unreadable, undecodable, or version-mismatched snapshot returns
-/// `Ok(None)` — the caller then rebuilds from the log (always correct).
-pub fn load_snapshot(dir: &Path) -> io::Result<Option<Snapshot>> {
+/// Why a **present** `snapshot.bin` could not be loaded (lab #408).
+///
+/// Before this existed, both cases were folded into the same `Ok(None)` as a
+/// genuinely absent file — so a present-but-unusable snapshot silently cost a
+/// full genesis replay with nothing on the startup line saying why. The two
+/// reasons are kept apart because their fixes differ: undecodable bytes were
+/// truncated or written by something other than this writer (the write itself
+/// is atomic), a version mismatch is a binary rolled across a format bump.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotLoadReject {
+    /// The bytes do not decode as a [`Snapshot`] at all.
+    Undecodable { detail: String },
+    /// Decodes, but was written under a different [`FORMAT_VERSION`] than this
+    /// binary honours.
+    VersionMismatch { found: u32 },
+}
+
+impl std::fmt::Display for SnapshotLoadReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SnapshotLoadReject::Undecodable { detail } => {
+                write!(f, "{SNAPSHOT} is present but does not decode ({detail})")
+            }
+            SnapshotLoadReject::VersionMismatch { found } => write!(
+                f,
+                "{SNAPSHOT} was written at on-disk format version {found}; this binary honours \
+                 only {FORMAT_VERSION}"
+            ),
+        }
+    }
+}
+
+/// What [`load_snapshot`] found on disk. `Absent` means **genuinely absent** —
+/// no `snapshot.bin` in the data dir. A present-but-unusable file is
+/// [`Self::Rejected`], never `Absent` (lab #408): the two used to share one
+/// `Ok(None)`, which is exactly how a rejected snapshot's genesis replay
+/// became indistinguishable from a first start.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SnapshotLoad {
+    /// No `snapshot.bin` in this data dir.
+    Absent,
+    /// Present, decodable, and at the current [`FORMAT_VERSION`].
+    Loaded(Snapshot),
+    /// Present but unusable, with the reason.
+    Rejected(SnapshotLoadReject),
+}
+
+/// Load the snapshot. An I/O error reading a file that exists is still an
+/// `Err` (an unreadable *directory* is a different fault from an unusable
+/// snapshot); everything else is a [`SnapshotLoad`]. The caller decides what a
+/// rejection costs — for resume that is a fall-through to the log, but since
+/// lab #408 it is a *reported* fall-through, not a silent one.
+pub fn load_snapshot(dir: &Path) -> io::Result<SnapshotLoad> {
     let path = dir.join(SNAPSHOT);
     if !path.exists() {
-        return Ok(None);
+        return Ok(SnapshotLoad::Absent);
     }
     let mut bytes = Vec::new();
     File::open(path)?.read_to_end(&mut bytes)?;
     match bincode::deserialize::<Snapshot>(&bytes) {
-        Ok(s) if s.format_version == FORMAT_VERSION => Ok(Some(s)),
-        _ => Ok(None),
+        Ok(s) if s.format_version == FORMAT_VERSION => Ok(SnapshotLoad::Loaded(s)),
+        Ok(s) => {
+            Ok(SnapshotLoad::Rejected(SnapshotLoadReject::VersionMismatch {
+                found: s.format_version,
+            }))
+        }
+        Err(e) => {
+            Ok(SnapshotLoad::Rejected(SnapshotLoadReject::Undecodable { detail: e.to_string() }))
+        }
     }
 }
 
@@ -361,11 +418,10 @@ pub fn load_snapshot(dir: &Path) -> io::Result<Option<Snapshot>> {
 /// answer to *"can this host restart in minutes, or does it replay from genesis?"*
 /// without opening a node or replaying anything.
 ///
-/// [`load_snapshot`] deliberately flattens three different situations into
-/// `Ok(None)`, because for its own caller — resume — they are one situation: the
-/// full replay is always correct. **For an operator they are not one situation**,
-/// and that flattening is why the question in issue #104 ("no `snapshot.bin` on
-/// any host despite SIGTERM") could only be answered by ssh + `ls`. A missing file
+/// [`load_snapshot`] used to flatten three different situations into `Ok(None)`;
+/// this enum was the operator-facing separation of them, and since lab #408 the
+/// load path itself separates them too ([`SnapshotLoad`]) — this stays as the
+/// cheap operator token over the same decoder. A missing file
 /// and an undecodable one both cost a from-genesis replay, but they have different
 /// causes and different fixes: the first says a write never happened, the second
 /// says one happened under a different [`FORMAT_VERSION`] (or was truncated by
@@ -417,18 +473,13 @@ impl SnapshotOnDisk {
 /// different fault from an unusable snapshot, and telling them apart is the whole
 /// point of this function.
 pub fn snapshot_on_disk(dir: &Path) -> io::Result<SnapshotOnDisk> {
-    let path = dir.join(SNAPSHOT);
-    if !path.exists() {
-        return Ok(SnapshotOnDisk::Absent);
-    }
-    let mut bytes = Vec::new();
-    File::open(path)?.read_to_end(&mut bytes)?;
-    match bincode::deserialize::<Snapshot>(&bytes) {
-        Ok(s) if s.format_version == FORMAT_VERSION => {
-            Ok(SnapshotOnDisk::At { applied_height: s.applied_height })
-        }
-        _ => Ok(SnapshotOnDisk::Unreadable),
-    }
+    // One decoder, two readers (lab #408): this is [`load_snapshot`]'s verdict
+    // mapped onto the operator token, so the two surfaces cannot drift.
+    Ok(match load_snapshot(dir)? {
+        SnapshotLoad::Absent => SnapshotOnDisk::Absent,
+        SnapshotLoad::Loaded(s) => SnapshotOnDisk::At { applied_height: s.applied_height },
+        SnapshotLoad::Rejected(_) => SnapshotOnDisk::Unreadable,
+    })
 }
 
 fn to_io<E: std::fmt::Display>(e: E) -> io::Error {
@@ -506,14 +557,24 @@ mod tests {
         assert_eq!(snapshot_on_disk(&dir).unwrap(), SnapshotOnDisk::At { applied_height: 7 });
         assert_eq!(snapshot_on_disk(&dir).unwrap().field(), "7");
         // The same file `load_snapshot` honours — one file, two readers, one answer.
-        assert_eq!(load_snapshot(&dir).unwrap().unwrap().applied_height, 7);
+        assert_eq!(
+            load_snapshot(&dir).unwrap(),
+            SnapshotLoad::Loaded(golden_snapshot()),
+            "load_snapshot honours what snapshot_on_disk reports a height for"
+        );
 
         // Undecodable bytes.
         fs::write(dir.join(SNAPSHOT), b"not a snapshot at all").unwrap();
         assert_eq!(snapshot_on_disk(&dir).unwrap(), SnapshotOnDisk::Unreadable);
         assert_eq!(snapshot_on_disk(&dir).unwrap().field(), "bad");
         assert_eq!(snapshot_on_disk(&dir).unwrap().height(), None, "an unusable file has no height");
-        assert!(load_snapshot(&dir).unwrap().is_none(), "and resume still falls through");
+        assert!(
+            matches!(
+                load_snapshot(&dir).unwrap(),
+                SnapshotLoad::Rejected(SnapshotLoadReject::Undecodable { .. })
+            ),
+            "and load_snapshot now says WHY it falls through (lab #408)"
+        );
 
         // Decodable, but written by another on-disk format version.
         let mut wrong = golden_snapshot();
@@ -524,6 +585,53 @@ mod tests {
             SnapshotOnDisk::Unreadable,
             "a version this binary cannot honour is unusable, not a height"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Lab #408 items (a) and (c): `Ok(Absent)` means genuinely absent ONLY.
+    /// A present-but-unusable `snapshot.bin` is a typed rejection carrying its
+    /// reason — a version-mismatched file and an undecodable one are different
+    /// failures with different fixes, and neither may read as "no snapshot".
+    #[test]
+    fn a_present_but_unusable_snapshot_is_rejected_with_its_reason_not_absent() {
+        let dir = std::env::temp_dir().join(format!("qumbra-i408-load-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // (c) genuinely absent — no file — is still the quiet case.
+        assert_eq!(load_snapshot(&dir).unwrap(), SnapshotLoad::Absent);
+
+        // (a) a version-mismatched snapshot names the version it found.
+        let mut wrong = golden_snapshot();
+        wrong.format_version = FORMAT_VERSION + 1;
+        fs::write(dir.join(SNAPSHOT), bincode::serialize(&wrong).unwrap()).unwrap();
+        match load_snapshot(&dir).unwrap() {
+            SnapshotLoad::Rejected(reject) => {
+                assert_eq!(
+                    reject,
+                    SnapshotLoadReject::VersionMismatch { found: FORMAT_VERSION + 1 }
+                );
+                assert!(
+                    reject.to_string().contains(&format!("version {}", FORMAT_VERSION + 1)),
+                    "the reason an operator reads carries the found version: {reject}"
+                );
+            }
+            other => panic!("a version-mismatched snapshot must be Rejected, got {other:?}"),
+        }
+
+        // Undecodable bytes are the other rejection, kept apart from the
+        // version case (truncation-by-something-else vs a rolled binary).
+        fs::write(dir.join(SNAPSHOT), b"junk").unwrap();
+        assert!(matches!(
+            load_snapshot(&dir).unwrap(),
+            SnapshotLoad::Rejected(SnapshotLoadReject::Undecodable { .. })
+        ));
+
+        // And the healthy file still loads — the rejection is not a tightening
+        // of what a usable snapshot is.
+        save_snapshot(&dir, &golden_snapshot()).unwrap();
+        assert_eq!(load_snapshot(&dir).unwrap(), SnapshotLoad::Loaded(golden_snapshot()));
 
         let _ = fs::remove_dir_all(&dir);
     }

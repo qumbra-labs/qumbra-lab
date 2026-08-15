@@ -89,7 +89,8 @@ pub use telemetry::{
     DURABLE_HEAD_SINCE_VERSION, LOCAL_COMMITMENT_SPLIT, READABLE_TELEMETRY_VERSIONS,
 };
 pub use persist::{
-    read_records, snapshot_on_disk, LogRecord, Snapshot, SnapshotOnDisk, BLOCK_LOG, FORMAT_VERSION,
+    read_records, snapshot_on_disk, LogRecord, Snapshot, SnapshotLoad, SnapshotLoadReject,
+    SnapshotOnDisk, BLOCK_LOG, FORMAT_VERSION,
     SNAPSHOT,
 };
 pub use replay_progress::{
