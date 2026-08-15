@@ -246,33 +246,13 @@ impl NodeConfig {
 
     /// The configured payout key as circuit lanes, or an error describing why the
     /// string is not one. `Ok(None)` = not configured (see [`Self::miner_rkm`]).
+    ///
+    /// Thin over [`rkm_lanes_from_hex`] since lab #143's instrument gap: the same
+    /// string has to be parsed by `audit-emission --payee`, and a second copy of
+    /// this arithmetic is the wrong-in-the-detail this repo keeps paying for.
     pub fn miner_rkm_lanes(&self) -> Result<Option<[u64; 4]>, ConfigError> {
         let Some(hex) = self.miner_rkm.as_deref() else { return Ok(None) };
-        let hex = hex.trim();
-        if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(ConfigError::Parse(format!(
-                "miner_rkm must be 64 hex characters (32 bytes, lane-major LE); got {} chars",
-                hex.len()
-            )));
-        }
-        let mut lanes = [0u64; 4];
-        for (i, lane) in lanes.iter_mut().enumerate() {
-            let mut bytes = [0u8; 8];
-            for (j, b) in bytes.iter_mut().enumerate() {
-                let at = (i * 8 + j) * 2;
-                *b = u8::from_str_radix(&hex[at..at + 2], 16).expect("checked ascii hex");
-            }
-            *lane = u64::from_le_bytes(bytes);
-        }
-        if lanes == [0u64; 4] {
-            return Err(ConfigError::Parse(
-                "miner_rkm is all zero, which no wallet can derive and which every node \
-                 rejects (BodyError::MissingCoinbasePayee). Omit the key to mine to the \
-                 unconfigured burn address, or set a real one."
-                    .to_string(),
-            ));
-        }
-        Ok(Some(lanes))
+        rkm_lanes_from_hex(hex).map(Some)
     }
 
     /// Serialize back to TOML (used by tooling / tests).
@@ -420,4 +400,44 @@ mod tests {
         );
         assert!(matches!(err, Err(ConfigError::Parse(_))));
     }
+}
+
+/// Parse a 64-hex-character rkm into circuit lanes (32 bytes, **lane-major LE**) —
+/// byte-for-byte the form `qumbra-wallet miner-rkm` and `qumbra-faucet keygen`
+/// print and `miner_rkm` in a node config carries.
+///
+/// Free rather than a method because two callers need it and neither should own
+/// it: `NodeConfig::miner_rkm_lanes` (the running node's payout key) and
+/// `audit-emission --payee` (the question "which blocks paid this key", which had
+/// no read-only answer at all — `qumbra-deploy` #143).
+///
+/// All-zero is refused rather than accepted: `validate_body` rejects a block with
+/// `coinbase > 0 && coinbase_rkm == [0; 4]` (`BodyError::MissingCoinbasePayee`), so
+/// a caller asking about it is asking about a key no block can carry.
+pub fn rkm_lanes_from_hex(hex: &str) -> Result<[u64; 4], ConfigError> {
+    let hex = hex.trim();
+    if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ConfigError::Parse(format!(
+            "miner_rkm must be 64 hex characters (32 bytes, lane-major LE); got {} chars",
+            hex.len()
+        )));
+    }
+    let mut lanes = [0u64; 4];
+    for (i, lane) in lanes.iter_mut().enumerate() {
+        let mut bytes = [0u8; 8];
+        for (j, b) in bytes.iter_mut().enumerate() {
+            let at = (i * 8 + j) * 2;
+            *b = u8::from_str_radix(&hex[at..at + 2], 16).expect("checked ascii hex");
+        }
+        *lane = u64::from_le_bytes(bytes);
+    }
+    if lanes == [0u64; 4] {
+        return Err(ConfigError::Parse(
+            "miner_rkm is all zero, which no wallet can derive and which every node \
+             rejects (BodyError::MissingCoinbasePayee). Omit the key to mine to the \
+             unconfigured burn address, or set a real one."
+                .to_string(),
+        ));
+    }
+    Ok(lanes)
 }
