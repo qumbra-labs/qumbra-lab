@@ -470,6 +470,13 @@ fn halt_status(args: &[String]) -> Result<(), Box<dyn Error>> {
     };
     println!("qumbra-node halt-status (issue #74)");
     print!("{}", RELEASE.banner(marker.as_ref()));
+    // Lab #367: the name-service boundary is a second consensus boundary this
+    // binary carries — banner it beside the emission one so arming day reads
+    // one command, not two.
+    print!(
+        "{}",
+        qumbra_node::run::name_service_status_line(qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT)
+    );
     // Issue #359 S3: without `--config` there is no data dir to ask, and saying
     // "none" would be a claim about a directory this invocation never named.
     match &data_dir {
