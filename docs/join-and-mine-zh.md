@@ -2,8 +2,14 @@
 
 English: [`join-and-mine.md`](./join-and-mine.md) · **技术细节以英文版为准。**
 
-这是项目无法控制的参与者进入 T1 的操作路径。方括号中的文字刻意留待 T1 公告填写；不要用
-猜测的 URL、种子、digest 或 revision 替换它。
+这是项目无法控制的参与者进入 T1 的操作路径。
+
+> **数值已于 2026-08-16 作为 T1 公告包填入**(设计文档 `t1-sg-posture-decision`,顺序:
+> Gate A 复测 → 本包 → SG 开放)。它们读自已部署的 fleet,不是猜测:镜像 digest/revision
+> 来自 compose pin 及其 OCI 标签回读,种子是 SG 姿态决定的四个**开放**入口(node0 刻意
+> 不是入口)。**公告发布(Larry 放行)之前,这些种子监听的端口尚未对公网开放**——在那一刻
+> 之前连接被拒是姿态在起作用,不是地址写错。若 fleet 在填写与公告之间又滚了镜像,
+> digest/revision 两行在发布时重新核验。
 
 ## 1. 获取并验证发布版本
 
@@ -15,8 +21,8 @@ English: [`join-and-mine.md`](./join-and-mine.md) · **技术细节以英文版�
 [lab #224](https://github.com/qumbra-labs/qumbra-lab/issues/224) 的教训。
 
 ```sh
-IMAGE='ghcr.io/qumbra-labs/qumbra-node@sha256:[随 T1 公告发布]'
-EXPECTED_REV='[随 T1 公告发布]'
+IMAGE='ghcr.io/qumbra-labs/qumbra-node@sha256:c7b8b3340d35d7461daaa83acea6a8eef045bdba74d5173f9f059322ec18adbb'
+EXPECTED_REV='e0b624596e29dc8a95d1f6715ed061b4247a73e2'
 
 docker pull "$IMAGE"
 ACTUAL_REV="$(docker image inspect \
@@ -36,8 +42,10 @@ test "$ACTUAL_REV" = "$EXPECTED_REV" || {
 
 格式和哈希已在代码树中钉死
 ([`genesis.rs:68-77`](../crates/qumbra-node/src/genesis.rs#L68-L77)、
-[`genesis.rs:775-779`](../crates/qumbra-node/src/genesis.rs#L775-L779))。分发位置和种子列表
-**[将随 T1 公告发布]**；本文不暗示任何 URL。
+[`genesis.rs:775-779`](../crates/qumbra-node/src/genesis.rs#L775-L779))。分发:`genesis.qmb` 从
+**`https://seed.qumbra.org/genesis.qmb`** 下载(deploy PR #150)——务必按上方
+`expected_genesis_hash` 逐字节校验;`qumbra-node check` 与启动都会拒绝错误文件,被篡改的
+下载无法静默通过。种子列表即下方四个开放入口(`t1-sg-posture-decision`)。
 
 ## 2. 作为不挖矿的节点加入
 
@@ -46,7 +54,7 @@ test "$ACTUAL_REV" = "$EXPECTED_REV" || {
 ```toml
 data_dir = "/data"
 listen_addr = "0.0.0.0:9400"
-dial_peers = ["[随 T1 公告发布的种子地址]"]
+dial_peers = ["18.202.166.126:9444","18.141.177.109:9444","52.194.224.123:9444","52.5.0.21:9444"]
 genesis_file = "/config/genesis.qmb"
 expected_genesis_hash = "138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb"
 mining = false
