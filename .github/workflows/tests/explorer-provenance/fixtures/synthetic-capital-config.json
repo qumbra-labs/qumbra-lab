@@ -1,0 +1,25 @@
+{
+  "created": "2026-08-15T09:12:44.1189331Z",
+  "architecture": "arm64",
+  "os": "linux",
+  "Config": {
+    "Env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ],
+    "Entrypoint": [
+      "/usr/local/bin/qumbra-explorer"
+    ],
+    "Labels": {
+      "org.opencontainers.image.description": "Keyless observer node serving the chain-health projection at /v1/health.json.",
+      "org.opencontainers.image.revision": "1400269f8ace841f8d0492f4f9c6c7f305f95268",
+      "org.opencontainers.image.source": "https://github.com/qumbra-labs/qumbra-lab",
+      "org.opencontainers.image.title": "qumbra-explorer"
+    }
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": [
+      "sha256:02d17133b219680569cc1098d5be0bbd675b7ee8d12dd22a634fa3e116e0db8b"
+    ]
+  }
+}

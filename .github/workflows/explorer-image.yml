@@ -230,10 +230,72 @@ jobs:
           T="ghcr.io/${{ github.repository_owner }}/qumbra-explorer:sha-${{ steps.build.outputs.short }}"
           DIG=$(docker buildx imagetools inspect "$T" --format '{{.Manifest.Digest}}')
           echo "digest: $DIG"
+
+          # WHY THIS IS jq AND NOT grep, measured rather than supposed: the
+          # pattern here used to be '"...revision":"[0-9a-f]*"' -- no space
+          # after the colon. buildx renders `{{json .Image}}` through
+          # json.MarshalIndent, so the real bytes are `"...revision": "<sha>"`,
+          # two-space indented and newline-wrapped. The pattern matched
+          # NOTHING on a perfectly good image, and a green build+push then
+          # reported the whole workflow red.
+          #
+          # The `-e` in the default shell is NOT what failed it -- grep was
+          # not the last command in `grep | head | sed`, so `-e` saw sed's 0.
+          # It was `set -o pipefail` on the line above. Recorded because the
+          # obvious reading of this failure is the wrong one.
+          #
+          # The lesson generalised: a readback must ASSERT, never rely on a
+          # matcher's exit status to mean something. A tool that finds nothing
+          # and a tool that finds the wrong thing are different verdicts, and
+          # neither of them is "the pipeline exited non-zero".
+          command -v jq >/dev/null 2>&1 || sudo apt-get install -y --no-install-recommends jq
+
           # Per-platform, never `{{json .}}`: an OCI index has no config labels,
           # and reading the index made a good image look unlabelled on 2026-08-07.
-          docker buildx imagetools inspect "$T" --format '{{json .Image}}' \
-            | grep -o '"org.opencontainers.image.revision":"[0-9a-f]*"' | head -2 | sed 's/^/  /'
+          #
+          # `.Image` has TWO shapes and which one arrives is a property of the
+          # runner's image store, not of this repo: a single-platform manifest
+          # renders one config object (`.config.Labels`), while an index
+          # renders a MAP KEYED BY PLATFORM (`.["linux/arm64"].config.Labels`).
+          # Both were captured from real registries -- see
+          # `.github/workflows/tests/explorer-provenance/`. A reader pinned to
+          # `.config.Labels` returns empty against the map and would red a good
+          # push all over again, just one layer further in. Recursive descent
+          # reads either, and also absorbs the `.Config` casing some buildx
+          # versions emit.
+          IMG=$(docker buildx imagetools inspect "$T" --format '{{json .Image}}')
+          REVS=$(printf '%s' "$IMG" | jq -r '
+            [ .. | objects | .Labels? // empty | objects
+              | .["org.opencontainers.image.revision"]? // empty ]
+            | map(select(type == "string" and . != "")) | unique | .[]')
+
+          if [ -z "$REVS" ]; then
+            echo "::error::provenance unreadable -- the pushed image carries no org.opencontainers.image.revision label. This is NOT a mismatch verdict; the label could not be read at all."
+            printf '%s\n' "$IMG" | head -40
+            exit 1
+          fi
+          if [ "$(printf '%s\n' "$REVS" | wc -l)" -gt 1 ]; then
+            echo "::error::provenance mismatch -- platforms disagree on the revision label:"
+            printf '%s\n' "$REVS" | sed 's/^/  /'
+            exit 1
+          fi
+          GOT="$REVS"
+
+          # The Dockerfile stamps GIT_REVISION from `git rev-parse HEAD` in the
+          # Build step, so a full 40-hex label equal to $GITHUB_SHA is the
+          # normal path. An abbreviated label names the SAME commit, so it is
+          # accepted -- with a warning, because the Dockerfile is meant to
+          # stamp the full sha and a short one means something upstream changed.
+          # Refusing it would be a second false red of a good image.
+          if [ "$GOT" = "$GITHUB_SHA" ]; then
+            echo "provenance OK: revision=$GOT"
+          elif [ "${#GOT}" -ge 7 ] && [ "${GITHUB_SHA#"$GOT"}" != "$GITHUB_SHA" ]; then
+            echo "::warning::the revision label is abbreviated ('$GOT'). It does name $GITHUB_SHA, so provenance holds, but the Dockerfile is meant to stamp the full sha."
+            echo "provenance OK: revision=$GOT (abbreviated)"
+          else
+            echo "::error::provenance mismatch -- image revision '$GOT' != expected '$GITHUB_SHA'"
+            exit 1
+          fi
           echo ""
           echo "Pin this in qumbra-deploy/compose/docker-compose.svc-light.yml:"
           echo "  image: ghcr.io/${{ github.repository_owner }}/qumbra-explorer@$DIG"
