@@ -6997,6 +6997,102 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// **Lab #373 end to end**: over a prepared non-trivial `blocks.log`, the
+    /// three-phase startup answers `/v1/ready` (`starting` + the live walk
+    /// position) WHILE the replay is still running, 404s `/v1/telemetry` at that
+    /// same moment, and after the handover the SAME listener — one socket, no
+    /// rebind — answers `ready` and serves the versioned wire: the 404-then-200
+    /// transition this issue's acceptance names.
+    ///
+    /// Deterministic mid-replay capture: the walk is parked at a chosen record
+    /// by `qlab_node::hold_replay_at` (the test-only hold added with this
+    /// baton) rather than raced with a sleep.
+    #[test]
+    fn ready_route_answers_during_a_real_replay_and_telemetry_404s_until_handover() {
+        let (config, genesis, base) = rig("i373_ready", true);
+        {
+            let mut node =
+                RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+            node.set_mine_interval(Duration::ZERO);
+            for _ in 0..6 {
+                assert!(node.try_mine());
+            }
+            assert_eq!(node.tip_height(), 6);
+            // Deliberately NO save_snapshot: reopening replays the whole log —
+            // node3's snapshotless shape (#359), scaled down.
+        }
+
+        fn get(addr: std::net::SocketAddr, path: &str) -> (String, Vec<u8>) {
+            use std::io::{Read, Write};
+            let mut s = std::net::TcpStream::connect(addr).unwrap();
+            write!(s, "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+            let mut raw = Vec::new();
+            s.read_to_end(&mut raw).unwrap();
+            let sep = raw.windows(4).position(|w| w == b"\r\n\r\n").expect("header terminator");
+            let status =
+                String::from_utf8_lossy(&raw[..sep]).lines().next().unwrap_or_default().to_string();
+            (status, raw[sep + 4..].to_vec())
+        }
+
+        // Phase ①: everything that can refuse has refused. Nothing bound yet.
+        let prepared =
+            RunningNode::prepare(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+
+        // Phase ②: bind. The route answers from this moment — before any node
+        // exists, and honestly bare while no walk is in flight.
+        let srv = TelemetryServer::start("127.0.0.1:0").unwrap();
+        let addr = srv.addr();
+        let (status, body) = get(addr, "/v1/ready");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        assert_eq!(body, br#"{"state":"starting"}"#.to_vec(), "bound, no walk yet");
+        let (status, _) = get(addr, "/v1/telemetry");
+        assert!(status.starts_with("HTTP/1.1 404"), "no node, no telemetry: {status}");
+
+        // Phase ③, parked mid-walk: hold the replay at record 3 and open on
+        // another thread — the exact window node3 spent 3h34m in, frozen so the
+        // assertion is about a REPLAY IN PROGRESS, not about a finished one.
+        let hold = qlab_node::hold_replay_at(3);
+        let node = std::thread::scope(|scope| {
+            let opener = scope.spawn(move || prepared.open());
+            assert!(hold.wait_reached(Duration::from_secs(60)), "the replay reached record 3");
+
+            // A reader can now tell this host is healthy-and-replaying, not
+            // dead — the property this route exists to provide.
+            let (status, body) = get(addr, "/v1/ready");
+            assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+            let text = String::from_utf8(body).unwrap();
+            assert!(text.contains(r#""state":"starting""#), "{text}");
+            assert!(text.contains(r#""replayed":3"#), "the held walk position: {text}");
+            assert!(text.contains(r#""total":"#), "{text}");
+            let (status, _) = get(addr, "/v1/telemetry");
+            assert!(status.starts_with("HTTP/1.1 404"), "still 404 mid-replay: {status}");
+
+            hold.release();
+            opener.join().expect("open thread")
+        })
+        .unwrap();
+        let mut node = node;
+        assert_eq!(node.tip_height(), 6, "the released replay finished; state is whole");
+
+        // The handover: the SAME listener flips — no rebind, no second socket.
+        let bound = node.adopt_telemetry_server(srv);
+        assert_eq!(bound, addr);
+        let (status, body) = get(addr, "/v1/ready");
+        assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+        assert_eq!(
+            body,
+            br#"{"state":"ready"}"#.to_vec(),
+            "a ready node answers too — a stable probe, not a startup artifact"
+        );
+        let (status, body) = get(addr, "/v1/telemetry");
+        assert!(status.starts_with("HTTP/1.1 200"), "the 404-then-200 transition: {status}");
+        let served = Telemetry::from_bytes(&body).expect("the versioned wire decodes");
+        assert_eq!(served.tip_height, 6, "the served wire is the replayed node's state");
+
+        drop(node);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// **The always-on write-volume caliper, derived rather than asserted by hand.**
     /// The round rate is set by the CHECKPOINT CADENCE, not by the block rate — the
     /// number that makes "always on" affordable on a 2 vCPU host.
