@@ -14,6 +14,32 @@ belongs to.
 [#375]: https://github.com/qumbra-labs/qumbra-lab/issues/375
 [snapshot-transplant]: https://github.com/qumbra-labs/qumbra-lab/issues/359#issuecomment-5300960029
 
+> **Review — 2026-08-16 (against `main` @ 6703630).** Every code/mechanism this
+> runbook names still holds on main: the `commitment_at_with_no_boundary_is_v2_everywhere`
+> and `validate_body_rider_leg_end_to_end` tests, the `validate_body_above` /
+> `commitment_above` drill seams, `NAME_RULE_BOUNDARY_HEIGHT = None` (still inert),
+> and §5's boundary-tie telemetry (`schain=` / `stipid=` exist). **No procedure
+> change needed.** Precondition status has moved, though — the checklist below is
+> the plan, this is where each item stands today:
+>
+> | # | precondition | 2026-08-16 status |
+> |---|---|---|
+> | 1 | T2 gate open (T1 launch #370 discharged) | 🔴 open |
+> | 2 | mempool rider leg | ✅ #385/#390 |
+> | 3 | #375 boundary-tie loser fixed | ✅ **CLOSED — PR #416** (convergence lock + recovery docs; §5 step 2 now grounded) |
+> | 4 | #369 drill covers a body-format boundary | 🟡 in flight (`claude/i369-halt-drill`) |
+> | 5 | 0x06 telemetry fleet-wide | ✅ **verified live** — `explorer/v1/health.json` `supply.epochs[].burned` present (=0), not null |
+> | 6 | #387 same-name reveal race closed | ✅ **CLOSED — PR #390** |
+> | 7 | Larry stamps the boundary height | ⬜ his call, gated on 1 |
+> | 8 | fee-table re-ratified | ⬜ at the stamp |
+>
+> Two hard consensus blockers (3, 6) are closed; 4 is in flight. What remains is
+> the ordinary T2 gate: T1 launching (1) + Larry's stamp (7/8).
+>
+> **One confirmed-owed item, unchanged:** §2 step 0's `qumbra-node halt-status`
+> name-boundary banner still does not exist on main (grep-verified this review).
+> It is owed BEFORE arming-day images build, exactly as §2 already flags.
+
 ## 0. What is changing, in two sentences
 
 Above `NAME_RULE_BOUNDARY_HEIGHT`, transactions may carry a **name rider**
