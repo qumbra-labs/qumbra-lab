@@ -1,0 +1,94 @@
+{
+  "created": "2026-08-04T18:53:05.563042462Z",
+  "architecture": "arm64",
+  "os": "linux",
+  "config": {
+    "User": "10001:10001",
+    "ExposedPorts": {
+      "4317/tcp": {},
+      "4318/tcp": {},
+      "55679/tcp": {}
+    },
+    "Env": [
+      "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ],
+    "Entrypoint": [
+      "/otelcol"
+    ],
+    "Cmd": [
+      "--config",
+      "/etc/otelcol/config.yaml"
+    ],
+    "WorkingDir": "/",
+    "Labels": {
+      "org.opencontainers.image.created": "2026-08-04T18:48:58Z",
+      "org.opencontainers.image.licenses": "Apache-2.0",
+      "org.opencontainers.image.name": "opentelemetry-collector-releases",
+      "org.opencontainers.image.revision": "1400269f8ace841f8d0492f4f9c6c7f305f95268",
+      "org.opencontainers.image.source": "https://github.com/open-telemetry/opentelemetry-collector-releases",
+      "org.opencontainers.image.version": "0.158.0"
+    },
+    "ArgsEscaped": true
+  },
+  "rootfs": {
+    "type": "layers",
+    "diff_ids": [
+      "sha256:033dc797bd78d00a1aeaf6d755156efbf14457aa99f01d1ad967979177c25fa5",
+      "sha256:bc59dbb97ef3740574832cda8c7f02242b2f0459e722c339fc9a5ec8276ef251",
+      "sha256:a0fd0db12c344acbec9d7dd9719e2141b0c7fe3c12b2c76adbba85a7ade4b3d9"
+    ]
+  },
+  "history": [
+    {
+      "created": "2026-08-04T18:53:05.303126954Z",
+      "created_by": "ARG USER_UID=10001",
+      "comment": "buildkit.dockerfile.v0",
+      "empty_layer": true
+    },
+    {
+      "created": "2026-08-04T18:53:05.303126954Z",
+      "created_by": "ARG USER_GID=10001",
+      "comment": "buildkit.dockerfile.v0",
+      "empty_layer": true
+    },
+    {
+      "created": "2026-08-04T18:53:05.303126954Z",
+      "created_by": "USER 10001:10001",
+      "comment": "buildkit.dockerfile.v0",
+      "empty_layer": true
+    },
+    {
+      "created": "2026-08-04T18:53:05.303126954Z",
+      "created_by": "COPY /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt # buildkit",
+      "comment": "buildkit.dockerfile.v0"
+    },
+    {
+      "created": "2026-08-04T18:53:05.554897224Z",
+      "created_by": "COPY --chmod=755 otelcol /otelcol # buildkit",
+      "comment": "buildkit.dockerfile.v0"
+    },
+    {
+      "created": "2026-08-04T18:53:05.563042462Z",
+      "created_by": "COPY config.yaml /etc/otelcol/config.yaml # buildkit",
+      "comment": "buildkit.dockerfile.v0"
+    },
+    {
+      "created": "2026-08-04T18:53:05.563042462Z",
+      "created_by": "ENTRYPOINT [\"/otelcol\"]",
+      "comment": "buildkit.dockerfile.v0",
+      "empty_layer": true
+    },
+    {
+      "created": "2026-08-04T18:53:05.563042462Z",
+      "created_by": "CMD [\"--config\" \"/etc/otelcol/config.yaml\"]",
+      "comment": "buildkit.dockerfile.v0",
+      "empty_layer": true
+    },
+    {
+      "created": "2026-08-04T18:53:05.563042462Z",
+      "created_by": "EXPOSE [4317/tcp 4318/tcp 55679/tcp]",
+      "comment": "buildkit.dockerfile.v0",
+      "empty_layer": true
+    }
+  ]
+}
