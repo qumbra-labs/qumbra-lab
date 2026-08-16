@@ -896,6 +896,18 @@ pub unsafe extern "C" fn qmb_select_new(
 /// with `qmb_select_take_bundle`; `-2` — FAILED by name (`*out` = the reason);
 /// `-1` — NULL/invalid call. `*out` strings are freed with `qmb_string_free`.
 ///
+/// Since lab #424 the SCAN contract carries **two** streams — `/v1/nullifiers`
+/// and `/v1/coinbase` — because this wallet's own mined notes are inputs a
+/// spend may select. A host that answers the coinbase path with a transport
+/// error (every node older than lab #415 answers 404) does NOT fail the select:
+/// it proceeds on transaction notes only, per the 2026-08-16 ruling.
+///
+/// 🔴 **A host on this ABI cannot yet SEE that degradation.** The driver
+/// narrates it as `SendStep::CoinbaseUnavailable`, and this surface drains no
+/// events at all — it never has, for any step. Reported on lab #424; the fix is
+/// an events codepoint on this ABI, which is a decision this baton did not
+/// take.
+///
 /// # Safety
 /// `s` live (or NULL); `out` writable (or NULL).
 #[no_mangle]

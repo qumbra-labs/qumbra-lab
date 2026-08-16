@@ -48,6 +48,17 @@
 //! other, and a coinbase balance that could not subtract spends would re-open
 //! lab #314 on the category this module just made visible. Every refusal is
 //! named; none of them is a zero.
+//!
+//! ## Two callers, and they do NOT weigh a refusal the same way (lab #424)
+//!
+//! `scan` reads this module to print a figure, and a figure it cannot establish
+//! must not be printed — so a refusal there narrows the balance's claim.
+//! [`crate::driver::SelectDriver`] reads it to offer **inputs**, and a refusal
+//! there only ever shrinks the set it selects from, which fails safe. Larry's
+//! 2026-08-16 ruling on lab #424 takes that difference as the deciding argument:
+//! a `send` against a node that does not serve this route does not refuse, it
+//! proceeds on transaction notes and says [`TRANSACTIONS_ONLY`] out loud. The
+//! refusal vocabulary below is unchanged and shared by both.
 
 use qlab_cbserver::codec::BlockCoinbase;
 use qlab_node::{coinbase_leaf_appears_at, coinbase_maturity, CoinbaseMaturity};
@@ -743,12 +754,15 @@ mod tests {
     /// only way that matters: a wrong value would derive a `cm` that is in no
     /// tree, and `build_bundle` would refuse.
     ///
-    /// **What it does NOT establish, and the gap is filed rather than implied:**
-    /// `spend::select` still builds its `Spendable` set from `ScanOutcome::notes`
-    /// alone, so `qumbra-wallet send` will not choose a mined note however
-    /// spendable it is. That is leg 2's baton — a new driver phase with its own
-    /// refusal discipline for a 404 on this route — and it is filed as **lab
-    /// #424** with this test as the evidence that it is small and known-feasible.
+    /// **What it did not establish, and no longer needs to (lab #424, CLOSED):**
+    /// `spend::select` used to build its `Spendable` set from
+    /// `ScanOutcome::notes` alone, so `qumbra-wallet send` would not choose a
+    /// mined note however spendable it was. [`crate::driver::SelectDriver`] now
+    /// has the coinbase phase and the 404 posture that leg 2 needed; the pins
+    /// are `tests/select_driver.rs` (selection, the maturity boundary, the
+    /// degradations) and `tests/coinbase_spend.rs` (the same through the
+    /// production prove path). This test keeps its own job: the **witness** leg,
+    /// with no driver in the picture.
     #[test]
     fn a_mined_note_is_locatable_in_the_tree_and_the_spend_path_accepts_it() {
         use qlab_cbserver::codec::CoinbasePage;

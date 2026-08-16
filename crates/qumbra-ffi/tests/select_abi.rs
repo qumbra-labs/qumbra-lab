@@ -200,9 +200,14 @@ fn the_abi_builds_a_bundle_and_renders_its_review() {
                     let path = CStr::from_ptr(out).to_str().unwrap().to_string();
                     qmb_string_free(out);
                     // Both endpoints are the same fixture host here; the rc
-                    // still names which one the path belongs to.
+                    // still names which one the path belongs to. Since lab #424
+                    // the SCAN contract carries two streams — the nullifiers and
+                    // the coinbase facts — because a mined note is an input a
+                    // spend may select and the compact host is what serves it.
                     assert!(
-                        (rc == 1) == path.starts_with("/v1/nullifiers"),
+                        (rc == 1)
+                            == (path.starts_with("/v1/nullifiers")
+                                || path.starts_with("/v1/coinbase")),
                         "rc {rc} vs {path}"
                     );
                     let body = get(&url, &path).expect("fixture serves");
