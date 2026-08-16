@@ -8,7 +8,17 @@
 //! proxy, and asserts the request sequence phase by phase:
 //!
 //!   compact scan (paged) → full fetches (matched + decoys) → the bulk
-//!   nullifier stream → tree leaves → anchors — in that order, and nothing else.
+//!   nullifier stream → **the coinbase stream** → tree leaves → anchors — in
+//!   that order, and nothing else.
+//!
+//! 🔴 **The coinbase segment was added on purpose (lab #424, 2026-08-16), and
+//! this lock was updated rather than relaxed.** It is the one wire change since
+//! this file was written: `spend::select` now offers this wallet's MATURE mined
+//! notes as inputs, which needs `GET /v1/coinbase`, and it is fetched AFTER the
+//! nullifier stream because a mined note can be spent like any other and
+//! `match_mined` needs the nullifier set to say so. Every other segment is
+//! byte-identical to the pre-#399 lock. If a future change adds a fetch, this
+//! assertion is the thing that should fail.
 //!
 //! Decoy targets are random by design (a privacy mechanism), so the full-fetch
 //! segment is asserted by SHAPE (well-formed paths, bounded count, contains the
@@ -219,6 +229,10 @@ fn phase_1_request_sequence_and_bundle_facts_are_golden_before_the_driver_refact
         .iter()
         .position(|p| p.starts_with("/v1/nullifiers"))
         .expect("the bulk nullifier stream is fetched");
+    let cb_at = paths
+        .iter()
+        .position(|p| p.starts_with("/v1/coinbase"))
+        .expect("the coinbase stream is fetched (lab #424)");
     let leaves_at = paths
         .iter()
         .position(|p| p.starts_with("/v1/tree/leaves"))
@@ -228,8 +242,11 @@ fn phase_1_request_sequence_and_bundle_facts_are_golden_before_the_driver_refact
         .position(|p| p.as_str() == "/v1/anchors")
         .expect("the anchor set is fetched");
 
-    // Phase order is the lock: scan → nullifiers → leaves → anchors.
-    assert!(nf_at < leaves_at && leaves_at < anchors_at, "phase order: {paths:?}");
+    // Phase order is the lock: scan → nullifiers → coinbase → leaves → anchors.
+    assert!(
+        nf_at < cb_at && cb_at < leaves_at && leaves_at < anchors_at,
+        "phase order: {paths:?}"
+    );
     assert_eq!(anchors_at, paths.len() - 1, "anchors are the last fetch: {paths:?}");
 
     // Scan segment: the first request is the compact page for 0..=tip, and
@@ -256,13 +273,17 @@ fn phase_1_request_sequence_and_bundle_facts_are_golden_before_the_driver_refact
     );
     assert!(full_fetches >= 1, "the grant's group is actually fetched: {paths:?}");
 
-    // Nullifier and leaf streams: exact, single-page at this chain size.
+    // Nullifier, coinbase and leaf streams: exact, single-page at this chain
+    // size. The coinbase stream asks for the SAME 0..={t} range as the
+    // nullifier stream — anything narrower would be a mined note this send
+    // silently could not see.
     assert_eq!(paths[nf_at], format!("/v1/nullifiers?from=0&to={t}"), "{paths:?}");
+    assert_eq!(paths[cb_at], format!("/v1/coinbase?from=0&to={t}"), "{paths:?}");
     assert_eq!(paths[leaves_at], "/v1/tree/leaves?from=0", "{paths:?}");
     assert_eq!(
         paths[nf_at + 1..leaves_at]
             .iter()
-            .filter(|p| !p.starts_with("/v1/nullifiers"))
+            .filter(|p| !p.starts_with("/v1/nullifiers") && !p.starts_with("/v1/coinbase"))
             .count(),
         0,
         "nothing foreign between nullifiers and leaves: {paths:?}"

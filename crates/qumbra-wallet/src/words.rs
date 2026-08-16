@@ -29,8 +29,14 @@ pub fn word_for(step: &SendStep) -> String {
             Some(name) => format!("paying contact “{name}” → {recipient_short}"),
             None => format!("paying {recipient_short}"),
         },
-        S::Selected { spendable, skipped_spent } => {
+        // Lab #424: loud, and first — a user must never take a completed send as
+        // proof that their mined coins were in view.
+        S::CoinbaseUnavailable { why } => format!("🔴 {why}"),
+        S::Selected { spendable, skipped_spent, mined } => {
             let mut t = format!("{spendable} spendable note(s) selected");
+            if *mined > 0 {
+                t.push_str(&format!(", {mined} of them matured coinbase this wallet mined"));
+            }
             if *skipped_spent > 0 {
                 t.push_str(&format!(
                     "; {skipped_spent} already-spent skipped (their nullifiers are on the chain)"

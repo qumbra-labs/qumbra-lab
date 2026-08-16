@@ -614,11 +614,23 @@ fn send(args: &[String]) -> Result<(), Box<dyn Error>> {
                 eprintln!("→ {name} ({recipient_short})");
             }
         }
-        SendStep::Selected { skipped_spent, .. } if skipped_spent > 0 => eprintln!(
-            "note: {skipped_spent} already-spent note(s) skipped by input selection (their \
-             nullifiers are on the chain)"
-        ),
-        SendStep::Selected { .. } => {}
+        // 🔴 Loud by decision (lab #424): the send proceeds, and the one thing a
+        // user must not do is conclude they spent from a complete view.
+        SendStep::CoinbaseUnavailable { why } => eprintln!("🔴 {why}"),
+        SendStep::Selected { skipped_spent, mined, .. } => {
+            if skipped_spent > 0 {
+                eprintln!(
+                    "note: {skipped_spent} already-spent note(s) skipped by input selection \
+                     (their nullifiers are on the chain)"
+                );
+            }
+            if mined > 0 {
+                eprintln!(
+                    "note: {mined} matured coinbase note(s) this wallet mined are among the \
+                     candidate inputs"
+                );
+            }
+        }
         SendStep::Tree {
             held, fetched, anchor_count, anchor_root, node_tip, finalized, anchor_behind,
         } => {

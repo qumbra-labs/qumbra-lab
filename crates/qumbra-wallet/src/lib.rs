@@ -69,6 +69,15 @@
 //! and `qumbra-explorer` pin for refused supply figures, so one grep covers all
 //! three surfaces.
 //!
+//! 🔴 **And since lab #424 `send` spends them too.** [`driver`]'s phase 1 pages
+//! the same route and offers this wallet's MATURE mined notes as inputs — a
+//! maturing one never — so a mining-only wallet is no longer a balance that can
+//! be read and not spent. When that route cannot be read the send does **not**
+//! refuse (Larry's 2026-08-16 ruling): it proceeds on transaction notes and
+//! names the degradation with [`coinbase::TRANSACTIONS_ONLY`], the same token
+//! the scan's balance line prints. The nullifier path is untouched and stays
+//! fail-closed — the asymmetry is the ruling's whole argument.
+//!
 //! Since lab issue #314 that rule has a second half, and it is the one that was
 //! missing: **a balance that could not subtract SPENDS is UNAVAILABLE too.** A
 //! scan reads outputs, and the discovery wire carries no nullifier by design, so
