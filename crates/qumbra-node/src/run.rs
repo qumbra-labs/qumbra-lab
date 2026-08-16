@@ -2657,6 +2657,29 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
 ///
 /// Returns the rendered block (always ending in a newline) so it is testable
 /// without capturing stdout.
+/// The `halt-status` name-service line (lab #367) — banners the name boundary
+/// the way [`crate::release::Release::banner`] banners the emission one, so an
+/// operator reads BOTH consensus boundaries this binary carries from one
+/// command. Pure over the boundary constant so it is testable without a build
+/// per state; `halt_status` passes the real `qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT`.
+///
+/// Two states, and the wording keeps them a different sentence (the emission
+/// banner's discipline): `None` is the shipped inert build — riders are refused
+/// at every height, so there is nothing to arm accidentally; `Some(h)` is an
+/// armed build — the v3 rider format and the name-fee burn take effect strictly
+/// above `h`.
+pub fn name_service_status_line(boundary: Option<u64>) -> String {
+    match boundary {
+        None => "  name service: INERT — no boundary in this build; riders refused at \
+                 every height (#367)\n"
+            .to_string(),
+        Some(h) => format!(
+            "  name service: ARMED — v3 rider format + name-fee burn active above height {h} \
+             (#367)\n"
+        ),
+    }
+}
+
 pub fn snapshot_status_report(data_dir: &std::path::Path) -> String {
     let mut out = String::new();
     let state = match qlab_node::snapshot_on_disk(data_dir) {
@@ -2869,6 +2892,29 @@ mod tests {
     use super::*;
     use crate::genesis::GenesisFile;
     use qlab_devnet::pow::KeccakPow;
+
+    /// Lab #367: the halt-status name-service line reads inert on the shipped
+    /// build and armed once a boundary is stamped — the two states are a
+    /// different sentence, and the shipped constant is the inert one (this is
+    /// the halt-status half of the inert-at-merge property).
+    #[test]
+    fn name_service_status_line_distinguishes_inert_from_armed() {
+        // The shipped build: no boundary, inert.
+        assert_eq!(qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT, None);
+        let inert = name_service_status_line(qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT);
+        assert!(inert.contains("INERT"), "{inert}");
+        assert!(inert.contains("refused at"), "{inert}");
+        assert!(inert.ends_with('\n'));
+
+        // An armed build names the boundary height.
+        let armed = name_service_status_line(Some(9_000));
+        assert!(armed.contains("ARMED"), "{armed}");
+        assert!(armed.contains("above height 9000"), "{armed}");
+        assert!(armed.ends_with('\n'));
+
+        assert_ne!(inert, armed);
+    }
+
     use qlab_p2p::transport::Transport;
     use std::path::PathBuf;
 
