@@ -56,6 +56,14 @@ use qlab_wallet::Wallet;
 
 use crate::spent::{note_nullifier, SpentSet};
 
+/// The stable token every surface prints when it could not see coinbase — the
+/// scan's balance line, and since lab #424 the **send**'s input selection too.
+///
+/// It exists for the reason `UNAVAILABLE` does in [`crate::view`]: one grep has
+/// to cover every surface, or a degradation gets reworded on one of them and
+/// stops being findable. Never reword it in a caller; interpolate it.
+pub const TRANSACTIONS_ONLY: &str = "TRANSACTIONS ONLY";
+
 /// One bounded response from the coinbase stream — the wallet-side shape of
 /// [`qlab_cbserver::codec::CoinbasePage`], field for field, so there is no
 /// second reading of that framing here ([`crate::spent::NullifierChunk`]'s
@@ -117,7 +125,7 @@ impl std::fmt::Display for CoinbaseRefusal {
             CoinbaseRefusal::Endpoint { why } => write!(
                 f,
                 "the coinbase stream could not be read ({why}). This scan cannot see mined \
-                 coins — if this wallet mines, its balance below is TRANSACTIONS ONLY"
+                 coins — if this wallet mines, its balance below is {TRANSACTIONS_ONLY}"
             ),
             CoinbaseRefusal::RangeMismatch { asked, got } => write!(
                 f,

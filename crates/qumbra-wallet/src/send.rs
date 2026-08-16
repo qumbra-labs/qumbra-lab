@@ -67,6 +67,60 @@ pub struct SendArtifact {
     pub declared_cm: [[u64; 4]; 2],
 }
 
+/// Why [`build_bundle`] refused, typed rather than stringly — lab #424 needs
+/// exactly one of these distinguished by a caller.
+///
+/// 🔴 **[`BuildRefusal::CannotCover`] is the only one that means "not enough
+/// money".** The caller that knows what it could *see* when it selected inputs
+/// (the driver, which knows whether the coinbase stream answered) must be able
+/// to add that to this refusal and to no other — "your balance is too low" and
+/// "your balance is too low **as far as this send could see**" are different
+/// sentences, and a substring match on the message would tie them to wording.
+/// Every `Display` below reproduces the message this function has always
+/// produced, verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildRefusal {
+    /// The spendable set does not cover `amount + fee` in at most two notes.
+    CannotCover { need: u64, amount: u64, fee: u64, have: u64 },
+    /// A selected note's commitment is in no leaf of the supplied tree.
+    NotInTree,
+    /// The note is a leaf, but past the anchor — its block is not finalized yet.
+    OutsideAnchor { pos: u64, anchor_count: u64 },
+    /// Anything else, verbatim (arithmetic overflow, a recipient with no
+    /// encapsulation key).
+    Other(String),
+}
+
+impl std::fmt::Display for BuildRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildRefusal::CannotCover { need, amount, fee, have } => write!(
+                f,
+                "cannot cover {need} bessel (amount {amount} + posted fee {fee}) from spendable \
+             notes summing {have}. The frozen 2×2 bucket moves at most TWO notes per \
+             transaction — if the total covers it but no two notes do, consolidate to \
+             yourself first."
+            ),
+            BuildRefusal::NotInTree => write!(
+                f,
+                "a spendable note's commitment is not in the supplied tree — the tree and the \
+             scan disagree; refusing rather than proving against the wrong anchor"
+            ),
+            BuildRefusal::OutsideAnchor { pos, anchor_count } => write!(
+                f,
+                "this note is at tree position {pos}, which is outside the anchor at \
+                 {anchor_count} leaves — its block is not finalized yet. A witness can only be \
+                 built against a finalized anchor, so this spend is not possible YET; it becomes \
+                 possible with no action once finality advances past that block. Refusing here \
+                 rather than proving a statement the chain would reject."
+            ),
+            BuildRefusal::Other(why) => write!(f, "{why}"),
+        }
+    }
+}
+
+impl std::error::Error for BuildRefusal {}
+
 /// Build the pre-proof witness bundle for a spend of `amount` to `recipient`,
 /// with change to this wallet's address [0]. `tree` must be the chain's
 /// commitment tree at `anchor_count`
@@ -92,11 +146,13 @@ pub(crate) fn build_bundle(
     spent_covered: Option<(u64, u64)>,
     name_op: Option<&qlab_devnet::names::NameOp>,
     rng: &mut StdRng,
-) -> Result<WitnessBundle, String> {
+) -> Result<WitnessBundle, BuildRefusal> {
     let fee = posted_fee(ArityBucket::TwoByTwo)
         .checked_add(name_op.map_or(0, qlab_devnet::names::name_fee_for))
-        .ok_or("posted fee plus name fee overflows")?;
-    let need = amount.checked_add(fee).ok_or("amount overflows")?;
+        .ok_or_else(|| BuildRefusal::Other("posted fee plus name fee overflows".into()))?;
+    let need = amount
+        .checked_add(fee)
+        .ok_or_else(|| BuildRefusal::Other("amount overflows".into()))?;
 
     // Coin selection: fewest notes that cover amount+fee, largest first. The
     // frozen bucket moves AT MOST two real notes; more means consolidating
@@ -115,12 +171,7 @@ pub(crate) fn build_bundle(
             (vec![sorted[0], sorted[1]], false)
         } else {
             let have: u64 = sorted.iter().map(|n| n.value).sum();
-            return Err(format!(
-                "cannot cover {need} bessel (amount {amount} + posted fee {fee}) from spendable \
-             notes summing {have}. The frozen 2×2 bucket moves at most TWO notes per \
-             transaction — if the total covers it but no two notes do, consolidate to \
-             yourself first."
-            ));
+            return Err(BuildRefusal::CannotCover { need, amount, fee, have });
         };
 
     // Real inputs + their tree witnesses.
@@ -133,11 +184,7 @@ pub(crate) fn build_bundle(
         // wrong here is invisible to a test that builds its tree the same wrong
         // way (see the module test's history in the PR).
         let (_nk, _nf, cm) = derive_input(&inp);
-        let pos = tree.position_of(&cm).ok_or_else(|| {
-            "a spendable note's commitment is not in the supplied tree — the tree and the \
-             scan disagree; refusing rather than proving against the wrong anchor"
-                .to_string()
-        })?;
+        let pos = tree.position_of(&cm).ok_or(BuildRefusal::NotInTree)?;
         // The note is in the tree, but is it inside the ANCHOR? `auth_path`
         // would happily cut a path for a leaf past `anchor_count`, and the
         // result folds to something that is not the anchor root — a perfectly
@@ -147,13 +194,7 @@ pub(crate) fn build_bundle(
         // the chain has not finalized yet is in an ordinary, temporary state
         // and deserves to be told so (issue #276).
         if pos >= anchor_count {
-            return Err(format!(
-                "this note is at tree position {pos}, which is outside the anchor at \
-                 {anchor_count} leaves — its block is not finalized yet. A witness can only be \
-                 built against a finalized anchor, so this spend is not possible YET; it becomes \
-                 possible with no action once finality advances past that block. Refusing here \
-                 rather than proving a statement the chain would reject."
-            ));
+            return Err(BuildRefusal::OutsideAnchor { pos, anchor_count });
         }
         witnesses.push(tree.auth_path(pos, anchor_count));
         inputs.push(inp);
@@ -217,7 +258,9 @@ pub(crate) fn build_bundle(
     // recipient-major, same order as `commitments`.
     let recipient_ek = recipient
         .encapsulation_key()
-        .ok_or("recipient address carries no ML-KEM encapsulation key")?;
+        .ok_or_else(|| {
+            BuildRefusal::Other("recipient address carries no ML-KEM encapsulation key".into())
+        })?;
     let to_recipient = encrypt_to_recipient(&recipient_ek, &[recipient_note], rng);
     let self_ek = wallet.diversified_keypair(&change_d).ek;
     let to_self = encrypt_to_recipient(&self_ek, &[change_note], rng);
@@ -242,7 +285,7 @@ pub(crate) fn build_bundle(
         output_range,
         spent_covered,
     };
-    bundle.validate().map_err(|e| e.to_string())?;
+    bundle.validate().map_err(|e| BuildRefusal::Other(e.to_string()))?;
     Ok(bundle)
 }
 
@@ -385,7 +428,8 @@ mod tests {
             Some((0, 0)),
             None,
             rng,
-        )?;
+        )
+        .map_err(|e| e.to_string())?;
         prove_bundle(&bundle)
     }
 

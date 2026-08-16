@@ -107,11 +107,22 @@ pub enum SendStep {
         recipient_short: String,
         contact: Option<String>,
     },
+    /// 🔴 **The coinbase stream could not be read (lab #424), so selection ran
+    /// on TRANSACTION notes only.** Not a refusal — the 2026-08-16 ruling — but
+    /// it must be SEEN: a user must never think they spent from a complete view
+    /// when their mined coins were invisible. Carries
+    /// [`crate::coinbase::TRANSACTIONS_ONLY`], the token the scan's balance line
+    /// prints, so one grep covers both surfaces.
+    CoinbaseUnavailable { why: String },
     /// Input selection finished. `skipped_spent` is notes this wallet owns whose
     /// nullifiers are already on the chain — reported, not silently dropped.
+    /// `mined` is how many of `spendable` are MATURE coinbase notes (lab #424);
+    /// it is 0 both when this wallet mined nothing and when the stream could not
+    /// be read, which is why the event above is separate from this count.
     Selected {
         spendable: usize,
         skipped_spent: usize,
+        mined: usize,
     },
     /// The local tree caught up and an anchor was chosen.
     Tree {
