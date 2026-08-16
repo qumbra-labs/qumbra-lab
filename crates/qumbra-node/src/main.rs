@@ -30,6 +30,7 @@ use qumbra_node::params_audit;
 use qumbra_node::release::{HaltMarker, RELEASE};
 use qumbra_node::revision::own_frozen_digest_hex;
 use qumbra_node::run::RunningNode;
+use qumbra_node::telemetry_server::TelemetryServer;
 use qumbra_node::verifier::select_verifier;
 
 fn main() -> ExitCode {
@@ -240,12 +241,54 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("STARTUP RandomX engine init begin (light mode; cache builds lazily at first hash)");
     let pow = RandomXPow::new();
     println!("STARTUP RandomX engine init done");
-    println!(
-        "STARTUP node start begin (halt gates, genesis byte-verify, committee keys, data dir \
-         open/replay, listen bind, seed dial)"
-    );
-    let mut node = RunningNode::start(&config, &genesis, pow, verifier)?;
-    println!("STARTUP node start done");
+
+    // Lab #373 — startup is three phases now (the shape PR #372 gave the
+    // faucet), and the order is load-bearing in both directions. Lab #300's
+    // single node-start bracket splits around the phases (merge composition,
+    // PR #439 + PR #440) so a stall still names the stage it is in:
+    //
+    // ① everything that can refuse, refuses — the halt gates, the genesis
+    //   byte-verify + hash pin, the committee key checks. A bind BEFORE these
+    //   would hold a socket this process is about to refuse to run on.
+    println!("STARTUP node prepare begin (halt gates, genesis byte-verify, committee keys)");
+    let prepared = RunningNode::prepare(&config, &genesis, pow, verifier)?;
+    println!("STARTUP node prepare done");
+
+    // ② bind the telemetry listener. From this moment `GET /v1/ready` answers —
+    //   `starting`, with the live replay position once the walk begins — so a
+    //   healthy replaying host is distinguishable from a dead one for the whole
+    //   of the open (node3 spent 3h34m as `UNREACHABLE-OR-SILENT` for want of
+    //   this). `/v1/telemetry` 404s until the handover below. A bind AFTER the
+    //   open is the defect this ordering fixes.
+    let telemetry = match config.telemetry_addr.as_deref() {
+        Some(addr) => {
+            let srv = TelemetryServer::start(addr)?;
+            println!(
+                "  telemetry:    http://{}{} live (starting); {} serves after the node opens",
+                srv.addr(),
+                qumbra_node::telemetry_server::READY_PATH,
+                qumbra_node::telemetry_server::TELEMETRY_PATH,
+            );
+            if !srv.addr().ip().is_loopback() {
+                println!(
+                    "  ⚠️  telemetry is bound to a non-loopback address — it must be paired with a \
+                     SOURCE-RESTRICTED inbound rule to the operator's collector, not an open one."
+                );
+            }
+            Some(srv)
+        }
+        None => None,
+    };
+
+    // ③ open the node — Node::open replays blocks.log, hours on a large chain —
+    //   then hand the listener the live node.
+    println!("STARTUP node open begin (data dir open/replay, listen bind, seed dial)");
+    let mut node = prepared.open()?;
+    if let Some(srv) = telemetry {
+        let bound = node.adopt_telemetry_server(srv);
+        println!("  telemetry:    http://{bound}/v1/telemetry (versioned read wire, GET only)");
+    }
+    println!("STARTUP node open done");
 
     // Item 0: the binary mines on real wall-clock header timestamps (NOT the
     // deterministic 75 s counter the in-process sims/tests use), so LWMA sees real
@@ -275,20 +318,12 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         println!("  metrics:      not served (set metrics_addr in the config to enable)");
     }
 
-    // Issue #117 — the `/v1/telemetry` read endpoint, the wire the T0 operator
-    // agreement view polls. Same rule as `metrics_addr` and for the same reason:
-    // no `telemetry_addr`, no listener; a failure to bind is fatal rather than a
-    // node that its operator believes is readable and is not.
-    if let Some(addr) = config.telemetry_addr.as_deref() {
-        let bound = node.start_telemetry_endpoint(addr)?;
-        println!("  telemetry:    http://{bound}/v1/telemetry (versioned read wire, GET only)");
-        if !bound.ip().is_loopback() {
-            println!(
-                "  ⚠️  telemetry is bound to a non-loopback address — it must be paired with a \
-                 SOURCE-RESTRICTED inbound rule to the operator's collector, not an open one."
-            );
-        }
-    } else {
+    // Issue #117 — the `/v1/telemetry` read endpoint itself is bound in phase ②
+    // above (lab #373) and by now handed the live node. Same rule as
+    // `metrics_addr` and for the same reason: no `telemetry_addr`, no listener;
+    // a failure to bind is fatal rather than a node that its operator believes
+    // is readable and is not.
+    if config.telemetry_addr.is_none() {
         println!("  telemetry:    not served (set telemetry_addr in the config to enable)");
     }
 

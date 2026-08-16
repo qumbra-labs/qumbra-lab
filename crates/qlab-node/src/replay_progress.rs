@@ -29,9 +29,9 @@
 //! final `RECOVERY` line still reports records that actually advanced state.
 
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Emit a progress line after this many records since the last emission.
 pub const REPLAY_PROGRESS_EVERY_RECORDS: usize = 100;
@@ -85,6 +85,112 @@ pub fn live_replay_position() -> Option<ReplayPosition> {
         return None;
     }
     Some(ReplayPosition { processed: LIVE_PROCESSED.load(Ordering::Relaxed), total })
+}
+
+/// Test-only replay hold (lab #373): armed by [`hold_replay_at`], checked by
+/// [`ReplayProgress::tick`]. The `AtomicBool` is the fast path — production
+/// replays pay one relaxed load per record and never touch the mutex.
+///
+/// This exists because "answer `/v1/ready` while the replay is still running"
+/// is a property a test can only assert deterministically if it can stop the
+/// walk at a chosen record. A sleep race would assert it probabilistically,
+/// which on this repo's record (`#309`'s truncation, `#106`'s restart fork) is
+/// how a defect hides. Same posture as [`with_progress_capture`] and
+/// `RunningNode::start_with_release`: a Rust API for tests, reachable from no
+/// config, CLI or environment.
+static HOLD_ARMED: AtomicBool = AtomicBool::new(false);
+static REPLAY_HOLD: Mutex<Option<Arc<HoldInner>>> = Mutex::new(None);
+
+struct HoldInner {
+    /// The `processed` count at which the walking thread stops and waits.
+    at: u64,
+    state: Mutex<HoldState>,
+    cv: Condvar,
+}
+
+struct HoldState {
+    /// The walk arrived at `at` (set by the walking thread).
+    reached: bool,
+    /// The test let the walk continue (set by [`ReplayHold::release`] / `Drop`).
+    released: bool,
+}
+
+/// A held replay: the walk blocks when it reaches the armed record until this
+/// handle releases it. **Dropping releases** — a panicking test cannot leave
+/// the replay thread parked forever.
+pub struct ReplayHold {
+    inner: Arc<HoldInner>,
+}
+
+/// Test-only: arm a hold that blocks the next replay walk when its `processed`
+/// count reaches `at`, until the returned handle is released or dropped.
+///
+/// One hold at a time (arming replaces any previous one). If no walk ever
+/// reaches `at` — the log is shorter, or the walk was already past it — the
+/// hold is simply never reached and [`ReplayHold::wait_reached`] times out;
+/// the walk itself is never blocked at any other record.
+pub fn hold_replay_at(at: u64) -> ReplayHold {
+    let inner = Arc::new(HoldInner {
+        at,
+        state: Mutex::new(HoldState { reached: false, released: false }),
+        cv: Condvar::new(),
+    });
+    *REPLAY_HOLD.lock().expect("replay hold lock") = Some(Arc::clone(&inner));
+    HOLD_ARMED.store(true, Ordering::Release);
+    ReplayHold { inner }
+}
+
+impl ReplayHold {
+    /// Block until the walk has actually arrived at the held record, or
+    /// `timeout` passes. Returns whether it arrived — a test asserts `true`
+    /// so a hold that never fires is a loud failure, not a vacuous pass.
+    pub fn wait_reached(&self, timeout: Duration) -> bool {
+        let guard = self.inner.state.lock().expect("replay hold state");
+        let (state, _) = self
+            .inner
+            .cv
+            .wait_timeout_while(guard, timeout, |s| !s.reached)
+            .expect("replay hold state");
+        state.reached
+    }
+
+    /// Let the held walk continue. Idempotent; also disarms the global so
+    /// later replays in the same process run unimpeded.
+    pub fn release(&self) {
+        HOLD_ARMED.store(false, Ordering::Release);
+        if let Ok(mut slot) = REPLAY_HOLD.lock() {
+            *slot = None;
+        }
+        let mut state = self.inner.state.lock().expect("replay hold state");
+        state.released = true;
+        self.inner.cv.notify_all();
+    }
+}
+
+impl Drop for ReplayHold {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// The walking thread's side of the hold: called from [`ReplayProgress::tick`]
+/// only when [`HOLD_ARMED`] reads true. Parks until released when `processed`
+/// is the armed record; a non-matching count returns immediately.
+fn maybe_hold(processed: u64) {
+    let inner = match REPLAY_HOLD.lock() {
+        Ok(slot) => slot.clone(),
+        Err(_) => None,
+    };
+    let Some(inner) = inner else { return };
+    if processed != inner.at {
+        return;
+    }
+    let mut state = inner.state.lock().expect("replay hold state");
+    state.reached = true;
+    inner.cv.notify_all();
+    while !state.released {
+        state = inner.cv.wait(state).expect("replay hold state");
+    }
 }
 
 /// Serialises [`with_progress_capture`] so parallel test threads cannot steal
@@ -173,6 +279,10 @@ impl ReplayProgress {
         }
         self.processed += 1;
         LIVE_PROCESSED.store(self.processed as u64, Ordering::Relaxed);
+        // Lab #373's test hold — one relaxed-load no-op unless a test armed it.
+        if HOLD_ARMED.load(Ordering::Acquire) {
+            maybe_hold(self.processed as u64);
+        }
         let by_count =
             self.processed.saturating_sub(self.last_emit_processed) >= REPLAY_PROGRESS_EVERY_RECORDS;
         let by_time = self.last_emit_at.elapsed().as_secs() >= REPLAY_PROGRESS_EVERY_SECS;
@@ -246,6 +356,40 @@ mod tests {
             let p0 = ReplayProgress::start(0, "from genesis");
             assert_eq!(live_replay_position(), None);
             drop(p0);
+        });
+    }
+
+    /// Lab #373: the hold parks the walking thread at exactly the armed record,
+    /// the live position reads that record while parked, and release lets the
+    /// walk finish. A hold armed past the log's end never fires and never
+    /// blocks the walk.
+    #[test]
+    fn the_hold_parks_the_walk_at_the_armed_record_and_release_resumes_it() {
+        let (_, _lines) = with_progress_capture(|| {
+            let hold = hold_replay_at(2);
+            let walker = std::thread::spawn(|| {
+                let mut p = ReplayProgress::start(4, "from genesis");
+                for _ in 0..4 {
+                    p.tick();
+                }
+            });
+            assert!(hold.wait_reached(Duration::from_secs(10)), "the walk reached record 2");
+            assert_eq!(
+                live_replay_position(),
+                Some(ReplayPosition { processed: 2, total: 4 }),
+                "the held walk publishes exactly the held record"
+            );
+            hold.release();
+            walker.join().expect("released walk finishes");
+            assert_eq!(live_replay_position(), None, "retired after release + drop");
+
+            // A hold the walk never reaches blocks nothing.
+            let idle = hold_replay_at(99);
+            let mut p = ReplayProgress::start(3, "from genesis");
+            for _ in 0..3 {
+                p.tick();
+            }
+            assert!(!idle.wait_reached(Duration::from_millis(50)), "never reached, never parked");
         });
     }
 
