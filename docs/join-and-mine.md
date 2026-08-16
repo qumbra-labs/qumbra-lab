@@ -2,9 +2,16 @@
 
 中文：[`join-and-mine-zh.md`](./join-and-mine-zh.md) · **English is authoritative on technical detail.**
 
-This is the T1 path for a participant the project does not control. Text in square brackets is
-deliberately waiting for the T1 announcement; do not replace it with a guessed URL, seed, digest,
-or revision.
+This is the T1 path for a participant the project does not control.
+
+> **Values filled 2026-08-16 as the T1 announcement package** (design
+> `t1-sg-posture-decision`, sequence: Gate A remeasure → this package → SG open). They are
+> read from the deployed fleet, not guessed: image digest/revision from the compose pin and
+> its OCI label readback, seeds from the four OPEN entry points of the SG posture decision
+> (node0 is deliberately not an entry point). **Until the announcement is published (Larry's
+> go), the port these seeds listen on is not yet publicly open** — a connection refused before
+> that moment is the posture working, not a wrong address. If the fleet rolls between this
+> fill and the announcement, the digest/revision rows are re-verified at publication.
 
 ## 1. Obtain and verify the release
 
@@ -16,8 +23,8 @@ part of the runtime image ([`deploy/docker/Dockerfile:123-160`](../deploy/docker
 the readback requirement is the lesson of [lab #224](https://github.com/qumbra-labs/qumbra-lab/issues/224).
 
 ```sh
-IMAGE='ghcr.io/qumbra-labs/qumbra-node@sha256:[published alongside the T1 announcement]'
-EXPECTED_REV='[published alongside the T1 announcement]'
+IMAGE='ghcr.io/qumbra-labs/qumbra-node@sha256:c7b8b3340d35d7461daaa83acea6a8eef045bdba74d5173f9f059322ec18adbb'
+EXPECTED_REV='e0b624596e29dc8a95d1f6715ed061b4247a73e2'
 
 docker pull "$IMAGE"
 ACTUAL_REV="$(docker image inspect \
@@ -37,8 +44,11 @@ The announcement also publishes these network-identity inputs together:
 
 The format and hash are pinned in the tree
 ([`genesis.rs:68-77`](../crates/qumbra-node/src/genesis.rs#L68-L77),
-[`genesis.rs:775-779`](../crates/qumbra-node/src/genesis.rs#L775-L779)). The distribution location and
-seed list are **[to be published alongside the T1 announcement]**; no URL is implied here.
+[`genesis.rs:775-779`](../crates/qumbra-node/src/genesis.rs#L775-L779)). Distribution:
+`genesis.qmb` downloads from **`https://seed.qumbra.org/genesis.qmb`** (deploy PR #150) —
+always byte-verify it against `expected_genesis_hash` above; `qumbra-node check` and startup
+both refuse a wrong file, so a tampered download cannot pass silently. The seed list is the
+four open entry points below (`t1-sg-posture-decision`).
 
 ## 2. Join as a non-mining node
 
@@ -47,7 +57,7 @@ Put the downloaded `genesis.qmb` beside this minimal `node.toml`:
 ```toml
 data_dir = "/data"
 listen_addr = "0.0.0.0:9400"
-dial_peers = ["[seed address published alongside the T1 announcement]"]
+dial_peers = ["18.202.166.126:9444","18.141.177.109:9444","52.194.224.123:9444","52.5.0.21:9444"]
 genesis_file = "/config/genesis.qmb"
 expected_genesis_hash = "138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb"
 mining = false
