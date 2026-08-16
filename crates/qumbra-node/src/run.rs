@@ -4298,14 +4298,12 @@ mod tests {
     fn runtime_catch_up_writes_a_snapshot_of_its_applied_prefix() {
         use qlab_p2p::n1::{BlockIngest, IngestOutcome};
 
-        let a_port = free_port();
-        let a_addr = format!("127.0.0.1:{a_port}");
-
-        // A is the established net: three blocks, dialable.
-        let (mut acfg, agen, abase) = rig("i359_net", true);
-        acfg.listen_addr = a_addr.clone();
-        acfg.advertise_addr = Some(a_addr.clone());
+        // A is the established net: three blocks, dialable. Bound to a kernel-
+        // assigned port (the `rig` default) and read back — never predicted (#441).
+        let (acfg, agen, abase) = rig("i359_net", true);
         let mut a = RunningNode::start(&acfg, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let a_addr = a.listen_addr().to_string();
+        a.p2p.addrs_mut().set_self_advertise(Some(a_addr.clone()));
         a.set_mine_interval(Duration::ZERO);
         for _ in 0..3 {
             assert!(a.try_mine());
@@ -4559,14 +4557,11 @@ mod tests {
     /// connected is never dialed twice. (Partition-heal, the deferred B-lite §4 gate.)
     #[test]
     fn redial_reconnects_a_configured_peer_without_restart() {
-        // Reserve a free port, then release it so nothing is listening yet.
-        let port = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        };
-        let b_addr = format!("127.0.0.1:{port}");
+        // Reserve a free port, then release it so nothing is listening yet. A
+        // legitimate `free_port` use — the SUBJECT is a peer that is down first
+        // and comes up later on this exact address, so the number must be
+        // predicted; see `free_port`'s doc for the residual window (#441).
+        let b_addr = format!("127.0.0.1:{}", free_port());
 
         // Node A boots configured to dial B, but B is DOWN → no connection yet.
         let (mut acfg, agen, abase) = rig("redial_a", false);
@@ -4608,25 +4603,30 @@ mod tests {
     /// connection to each other host: `2 * (N - 1)` live connections.
     #[test]
     fn peer_process_restart_leaves_both_sides_at_the_live_connection_count() {
-        let (a_port, b_port) = (free_port(), free_port());
-        let (a_addr, b_addr) =
-            (format!("127.0.0.1:{a_port}"), format!("127.0.0.1:{b_port}"));
-
-        let (mut acfg, agen, abase) = rig("peer_restart_a", false);
-        acfg.listen_addr = a_addr.clone();
-        acfg.dial_peers = vec![b_addr.clone()];
+        // A binds first (kernel-assigned, read back — #441) and B dials the
+        // already-bound A, so the bring-up never dials a predicted number.
+        let (acfg, agen, abase) = rig("peer_restart_a", false);
         let mut a =
             RunningNode::start(&acfg, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let a_addr = a.listen_addr().to_string();
 
         let (mut bcfg, bgen, bbase) = rig("peer_restart_b", false);
-        bcfg.listen_addr = b_addr.clone();
         bcfg.dial_peers = vec![a_addr];
         let mut b =
             RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let b_addr = b.listen_addr().to_string();
+        // The restart below must come back on the SAME address — that is this
+        // test's subject — so B's read-back address becomes its pinned one from
+        // here on. This is the one place the test still carries `free_port`'s
+        // residual class: while B is down, A's redials to `b_addr` could in
+        // principle steal the port as an ephemeral source (see `free_port`).
+        bcfg.listen_addr = b_addr.clone();
 
-        // B connected out while A was already listening; make A's initially
-        // refused dial retry now that B is up. The two-host instance of
-        // `2 * (N - 1)` is two connections on each side.
+        // B connected out at start; A learns B's read-back address the same way
+        // a config seed lands (`run` applies `dial_peers` via `add_seed`) and the
+        // maintain pass below dials it. The two-host instance of `2 * (N - 1)`
+        // is two connections on each side.
+        a.p2p.addrs_mut().add_seed(b_addr.clone());
         pump(&mut [&mut a, &mut b], 5);
         a.force_redial_ready();
         a.maintain_peers();
@@ -4677,8 +4677,29 @@ mod tests {
 
     // ================= peer discovery over real TCP (issue #83) =================
 
-    /// Reserve a free loopback port and release it (the address is then free to
-    /// bind by a node we start next).
+    /// Reserve a loopback port by binding `127.0.0.1:0`, then release it and
+    /// return the number.
+    ///
+    /// ⚠️ **The number is only guaranteed free at the instant this returns
+    /// (issue #441).** Between the reservation and any later bind, ANY outbound
+    /// TCP connect in this process — including the calling test's own dials —
+    /// can be handed the number as its kernel-chosen ephemeral SOURCE port. The
+    /// later bind then dies `AddrInUse` (that killed a suite run at 1,550/1 in
+    /// `d3_a_boundary_tip_tie…`), and a dial aimed at the reserved port itself
+    /// can complete as a source==dest self-connect, making a "dead" address
+    /// answer.
+    ///
+    /// Therefore: **never use this for an address a node is about to bind.**
+    /// Bind `127.0.0.1:0` (the `rig` default), read the real address back with
+    /// [`RunningNode::listen_addr`], and hand THAT to peers — a kernel-assigned
+    /// bind cannot lose a race for a predicted number, so the race class is
+    /// gone rather than retried. The remaining legitimate uses are tests whose
+    /// SUBJECT is a predicted address, where the window is the semantics under
+    /// test and cannot be removed: a peer that must be down first and come up
+    /// later on the same address (`redial_reconnects_a_configured_peer_without_
+    /// restart`, the restart half of `peer_process_restart_leaves_both_sides_
+    /// at_the_live_connection_count`) and an address that must stay dead
+    /// (`the_gate_turns_on_one_configured_address_not_on_whether_it_answers`).
     fn free_port() -> u16 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let p = l.local_addr().unwrap().port();
@@ -4703,14 +4724,12 @@ mod tests {
     /// refuses to admit the address it is listening on when a peer gossips it back.
     #[test]
     fn node_without_advertise_addr_refuses_its_own_bound_address() {
-        let port = free_port();
-        let addr = format!("127.0.0.1:{port}");
-
-        let (mut cfg, gen, base) = rig("self_filter", false);
-        cfg.listen_addr = addr.clone();
-        cfg.advertise_addr = None; // the field is absent — the guard must still fire
+        // Kernel-assigned bind, read back (#441); `advertise_addr` stays rig's
+        // `None` — the field is absent and the guard must still fire.
+        let (cfg, gen, base) = rig("self_filter", false);
         let mut node =
             RunningNode::start(&cfg, &gen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let addr = node.listen_addr().to_string();
 
         assert!(node.p2p().addrs().self_advertise().is_none());
         assert!(
@@ -4753,20 +4772,19 @@ mod tests {
     /// gossiped and never enters anyone's book.
     #[test]
     fn seed_only_node_learns_the_net_and_an_undialable_one_is_never_gossiped() {
-        let (b_port, c_port) = (free_port(), free_port());
-        let (b_addr, c_addr) = (format!("127.0.0.1:{b_port}"), format!("127.0.0.1:{c_port}"));
-
-        // C listens and advertises; B listens, advertises, and seeds C.
-        let (mut ccfg, cgen, cbase) = rig("disc_c", false);
-        ccfg.listen_addr = c_addr.clone();
-        ccfg.advertise_addr = Some(c_addr.clone());
+        // C listens and advertises; B listens, advertises, and seeds C. Every
+        // address is read back from a live bind, never predicted (#441), so
+        // each dial's target already exists.
+        let (ccfg, cgen, cbase) = rig("disc_c", false);
         let mut c = RunningNode::start(&ccfg, &cgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let c_addr = c.listen_addr().to_string();
+        c.p2p.addrs_mut().set_self_advertise(Some(c_addr.clone()));
 
         let (mut bcfg, bgen, bbase) = rig("disc_b", false);
-        bcfg.listen_addr = b_addr.clone();
-        bcfg.advertise_addr = Some(b_addr.clone());
         bcfg.dial_peers = vec![c_addr.clone()];
         let mut b = RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let b_addr = b.listen_addr().to_string();
+        b.p2p.addrs_mut().set_self_advertise(Some(b_addr.clone()));
 
         // A knows only B, and declares no address of its own (outbound-only).
         let (mut acfg, agen, abase) = rig("disc_a", false);
@@ -4810,13 +4828,12 @@ mod tests {
     /// is configured with NO seeds at all, so everything it knows came off disk.
     #[test]
     fn the_address_book_survives_a_restart() {
-        let b_port = free_port();
-        let b_addr = format!("127.0.0.1:{b_port}");
-        let (mut bcfg, bgen, bbase) = rig("book_b", false);
-        bcfg.listen_addr = b_addr.clone();
-        bcfg.advertise_addr = Some(b_addr.clone());
+        // B's address is read back from its live bind, never predicted (#441).
+        let (bcfg, bgen, bbase) = rig("book_b", false);
         let mut b =
             RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let b_addr = b.listen_addr().to_string();
+        b.p2p.addrs_mut().set_self_advertise(Some(b_addr.clone()));
 
         let (mut acfg, agen, abase) = rig("book_a", false);
         acfg.dial_peers = vec![b_addr.clone()];
@@ -4883,14 +4900,12 @@ mod tests {
     fn a_cold_node_with_a_taller_peer_does_not_mine_until_it_has_synced() {
         use qlab_p2p::n1::{BlockIngest, IngestOutcome};
 
-        let a_port = free_port();
-        let a_addr = format!("127.0.0.1:{a_port}");
-
-        // A is the established net: three blocks, and dialable.
-        let (mut acfg, agen, abase) = rig("i106_net", true);
-        acfg.listen_addr = a_addr.clone();
-        acfg.advertise_addr = Some(a_addr.clone());
+        // A is the established net: three blocks, and dialable. Kernel-assigned
+        // bind, read back (#441).
+        let (acfg, agen, abase) = rig("i106_net", true);
         let mut a = RunningNode::start(&acfg, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let a_addr = a.listen_addr().to_string();
+        a.p2p.addrs_mut().set_self_advertise(Some(a_addr.clone()));
         a.set_mine_interval(Duration::ZERO);
         for _ in 0..3 {
             assert!(a.try_mine(), "A is genuinely alone and mines the net into being");
@@ -5011,7 +5026,9 @@ mod tests {
     #[test]
     fn the_gate_turns_on_one_configured_address_not_on_whether_it_answers() {
         // Reserve a port and release it: an address that is syntactically fine,
-        // known to the book, and answers nothing.
+        // known to the book, and answers nothing. A legitimate `free_port` use —
+        // the address must stay DEAD, so it can never be a read-back live bind;
+        // see `free_port`'s doc for the residual window (#441).
         let dead = format!("127.0.0.1:{}", free_port());
 
         let (zero_cfg, genesis, zbase) = rig("i106_zero", true);
@@ -5054,22 +5071,31 @@ mod tests {
     /// would have called itself `Synced` before the handshake landed.
     #[test]
     fn a_fresh_net_of_configured_peers_still_starts_from_genesis() {
-        let (p_port, q_port) = (free_port(), free_port());
-        let (p_addr, q_addr) = (format!("127.0.0.1:{p_port}"), format!("127.0.0.1:{q_port}"));
+        // deploy.sh predicts nothing — every host's address is a distinct fixed
+        // fact — but in one process a config-time full mesh would mean dialing a
+        // port that is not bound yet (#441). So P binds first (kernel-assigned,
+        // read back), Q gets P's real address as a config seed, and P learns Q's
+        // through `add_seed` — the exact entry type `dial_peers` lands as (`run`
+        // applies them via `add_seed`) — BEFORE the gate is ever read. Neither
+        // node ever holds an empty book at a gate evaluation, so neither can
+        // take the "nobody to ask" branch.
+        let (pcfg, pgen, pbase) = rig("i106_mesh_p", true);
+        let mut p =
+            RunningNode::start(&pcfg, &pgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let p_addr = p.listen_addr().to_string();
+        p.p2p.addrs_mut().set_self_advertise(Some(p_addr.clone()));
+        p.set_mine_interval(Duration::ZERO);
 
-        let mut nodes = Vec::new();
-        for (tag, listen, peer) in
-            [("i106_mesh_p", &p_addr, &q_addr), ("i106_mesh_q", &q_addr, &p_addr)]
-        {
-            let (mut cfg, genesis, base) = rig(tag, true);
-            cfg.listen_addr = listen.clone();
-            cfg.advertise_addr = Some(listen.clone());
-            cfg.dial_peers = vec![peer.clone()];
-            let mut n =
-                RunningNode::start(&cfg, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
-            n.set_mine_interval(Duration::ZERO);
-            nodes.push((n, base));
-        }
+        let (mut qcfg, qgen, qbase) = rig("i106_mesh_q", true);
+        qcfg.dial_peers = vec![p_addr];
+        let mut q =
+            RunningNode::start(&qcfg, &qgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let q_addr = q.listen_addr().to_string();
+        q.p2p.addrs_mut().set_self_advertise(Some(q_addr.clone()));
+        q.set_mine_interval(Duration::ZERO);
+        p.p2p.addrs_mut().add_seed(q_addr);
+
+        let mut nodes = vec![(p, pbase), (q, qbase)];
 
         // Cold, mesh-configured, nobody has answered yet: neither may mine.
         for (n, _) in nodes.iter() {
@@ -7123,8 +7149,9 @@ mod tests {
     // proposes, which is exactly how #360 stayed invisible until a real halt.
     //
     // These three cases run a committee TO a halt and through it, over the real TCP
-    // mesh harness the #83/#106 tests already use (`rig` + `free_port` + the real
-    // `run_until_with` loop), with the committee keys **split so that no node holds
+    // mesh harness the #83/#106 tests already use (`rig` + read-back bound
+    // addresses + the real `run_until_with` loop; #441 retired the predicted
+    // `free_port` addresses), with the committee keys **split so that no node holds
     // quorum** (stamp S1).
     //
     // **Nothing here calls `try_checkpoint` or `maintain_boundary_checkpoint`**
@@ -7198,26 +7225,25 @@ mod tests {
     /// with only this node's SHARE of the keys configured and the mining cadence
     /// parked so the drill — not the wall clock — decides who mines when.
     ///
-    /// `peers` is written into `dial_peers`, so an empty slice is a node that starts
-    /// **into a not-yet-connected mesh** (D2's staging) and a full slice is the
-    /// mesh `deploy/deploy.sh` writes (D1's).
-    fn drill_node(
-        tag: &str,
-        i: usize,
-        listen: &str,
-        peers: &[String],
-        mining: bool,
-    ) -> (DrillNode, PathBuf) {
+    /// The node binds `127.0.0.1:0` ([`rig`]'s default) and advertises the real
+    /// address read back from the live listener. Peers are injected only AFTER
+    /// every node in a mesh is bound — [`connect_mesh_as_seeds`] for D1's
+    /// `deploy/deploy.sh` shape, [`connect_mesh`] for D2/D3's staging — because
+    /// the old predict-four-ports `mesh_addrs()` helper was a TOCTOU (issue
+    /// #441): an already-running node's outbound dial could be handed a
+    /// reserved-but-not-yet-bound number as its ephemeral SOURCE port, and the
+    /// later node died `AddrInUse` at bind. A kernel-assigned bind cannot lose a
+    /// race for a predicted number, so no drill node's bind can fail that way.
+    fn drill_node(tag: &str, i: usize, mining: bool) -> (DrillNode, PathBuf) {
         let (mut cfg, genesis, base) = rig(&format!("{tag}_{i}"), mining);
         let lo: usize = KEY_SHARES[..i].iter().sum();
         cfg.committee_key_paths = cfg.committee_key_paths[lo..lo + KEY_SHARES[i]].to_vec();
-        cfg.listen_addr = listen.to_string();
-        cfg.advertise_addr = Some(listen.to_string());
-        cfg.dial_peers = peers.to_vec();
         let mut node = RunningNode::start_with_release(
             &cfg, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
         )
         .unwrap();
+        let self_addr = node.listen_addr().to_string();
+        node.p2p.addrs_mut().set_self_advertise(Some(self_addr));
         // Parked, not zero: the drill opens this gate for exactly one block at a
         // time (see `mine_one`). A live net randomises the mining order; the drill
         // fixes it, because the tip race is D3's subject and racing it in D1/D2
@@ -7226,22 +7252,63 @@ mod tests {
         (node, base)
     }
 
-    /// Four loopback addresses and the full mesh each node dials (everyone but
-    /// itself) — the shape `deploy/deploy.sh` writes onto the four T0 hosts.
-    fn mesh_addrs() -> (Vec<String>, Vec<Vec<String>>) {
-        let addrs: Vec<String> =
-            (0..4).map(|_| format!("127.0.0.1:{}", free_port())).collect();
-        let peers = (0..4)
-            .map(|i| {
-                addrs
-                    .iter()
-                    .enumerate()
-                    .filter(|(j, _)| *j != i)
-                    .map(|(_, a)| a.clone())
-                    .collect()
-            })
-            .collect();
-        (addrs, peers)
+    /// Every mesh node's REAL bound address, read back from its live listener —
+    /// the replacement for the predicted addresses `mesh_addrs()` used to hand
+    /// out (issue #441; see [`drill_node`] for the mechanism).
+    fn mesh_bound_addrs(nodes: &[DrillNode]) -> Vec<String> {
+        nodes.iter().map(|n| n.listen_addr().to_string()).collect()
+    }
+
+    /// **Issue #441 — the property that replaced the race.** The race itself
+    /// cannot be reproduced deterministically (the kernel's ephemeral-port
+    /// allocator cannot be scheduled), so this locks the seam's contract
+    /// instead: four drill nodes come up with four DISTINCT, concrete
+    /// kernel-assigned addresses — read back, never predicted, so no bind can
+    /// lose a reserve-then-rebind race that no longer exists — each advertises
+    /// exactly what it bound, and the post-bind seed injection wires them into
+    /// a connected mesh.
+    #[test]
+    fn i441_mesh_binds_kernel_assigned_addresses_distinct_and_connected() {
+        let mut bases = Vec::new();
+        let mut nodes: Vec<DrillNode> = Vec::new();
+        for i in 0..4 {
+            let (n, base) = drill_node("i441_prop", i, false);
+            nodes.push(n);
+            bases.push(base);
+        }
+
+        let addrs = mesh_bound_addrs(&nodes);
+        for (i, a) in addrs.iter().enumerate() {
+            let port: u16 = a.rsplit(':').next().unwrap().parse().unwrap();
+            assert_ne!(port, 0, "node {i} read back a concrete port, not the :0 wildcard");
+            assert_eq!(
+                nodes[i].p2p().addrs().self_advertise(),
+                Some(a.as_str()),
+                "node {i} advertises exactly the address it bound"
+            );
+        }
+        let distinct: std::collections::BTreeSet<&String> = addrs.iter().collect();
+        assert_eq!(distinct.len(), 4, "four nodes, four distinct bound addresses: {addrs:?}");
+
+        // `connect_mesh_as_seeds` itself asserts every node reaches ≥ 2 peers;
+        // on top of that, every node must know every OTHER node's real address
+        // and never its own (the #127 self-filter over a read-back identity).
+        connect_mesh_as_seeds(&mut nodes);
+        for (i, n) in nodes.iter().enumerate() {
+            let known = n.p2p().addrs().known();
+            for (j, a) in addrs.iter().enumerate() {
+                if i == j {
+                    assert!(!known.contains(a), "node {i} must not hold itself: {known:?}");
+                } else {
+                    assert!(known.contains(a), "node {i} is missing node {j}: {known:?}");
+                }
+            }
+        }
+
+        for (n, base) in nodes.into_iter().zip(bases) {
+            drop(n);
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 
     /// Open node `m`'s mining gate for **one** block and let the mesh catch up.
@@ -7284,11 +7351,10 @@ mod tests {
     /// 8,640 halt in miniature (16 of 21 keys signed, no tally ever holding 15).
     #[test]
     fn d1_a_split_committee_mines_to_a_halt_and_the_loop_finalizes_the_boundary() {
-        let (addrs, peers) = mesh_addrs();
         let mut bases = Vec::new();
         let mut nodes: Vec<DrillNode> = Vec::new();
         for i in 0..4 {
-            let (n, base) = drill_node("i369_d1", i, &addrs[i], &peers[i], true);
+            let (n, base) = drill_node("i369_d1", i, true);
             nodes.push(n);
             bases.push(base);
         }
@@ -7301,6 +7367,12 @@ mod tests {
             assert!(*share < quorum, "node {i} holds {share} keys, quorum is {quorum}");
         }
         assert_eq!(KEY_SHARES.iter().sum::<usize>(), 21, "the whole committee is placed");
+
+        // The full mesh lands as seeds AFTER all four nodes are bound (#441) —
+        // the same `add_seed` entries a config-time `dial_peers` list produces,
+        // and injected before any gate evaluation, so no node ever reads its
+        // gate over an empty book.
+        connect_mesh_as_seeds(&mut nodes);
 
         // The mesh forms and every node clears the #106 readiness gate on a real
         // claim (best_height 0 received, not defaulted).
@@ -7416,7 +7488,31 @@ mod tests {
 
     /// Connect a set of already-running, unconnected nodes into a full mesh
     /// **without restarting any of them** — the #83 learn + maintain path.
-    fn connect_mesh(nodes: &mut [DrillNode], addrs: &[String]) {
+    /// Addresses are read back from the live listeners (issue #441), so every
+    /// injected address is bound before anything can dial it.
+    fn connect_mesh(nodes: &mut [DrillNode]) {
+        connect_mesh_via(nodes, |n, others| {
+            n.p2p.addrs_mut().learn(others);
+        });
+    }
+
+    /// D1's staging: the full mesh lands as SEEDS — the entry type `dial_peers`
+    /// takes at start (`run` applies configured peers via `add_seed`) — so each
+    /// node's book matches the config-seeded net `deploy/deploy.sh` writes, one
+    /// step after every bind instead of one step before it (issue #441).
+    fn connect_mesh_as_seeds(nodes: &mut [DrillNode]) {
+        connect_mesh_via(nodes, |n, others| {
+            for a in others {
+                n.p2p.addrs_mut().add_seed(a);
+            }
+        });
+    }
+
+    fn connect_mesh_via(
+        nodes: &mut [DrillNode],
+        inject: impl Fn(&mut DrillNode, Vec<String>),
+    ) {
+        let addrs = mesh_bound_addrs(nodes);
         for (i, n) in nodes.iter_mut().enumerate() {
             let others: Vec<String> = addrs
                 .iter()
@@ -7424,7 +7520,7 @@ mod tests {
                 .filter(|(j, _)| *j != i)
                 .map(|(_, a)| a.clone())
                 .collect();
-            n.p2p.addrs_mut().learn(others);
+            inject(n, others);
         }
         // Outbound connects are asynchronous since #132: one `maintain` pass STARTS
         // a dial (`DialStart::Pending`) and a later one finishes it, so the mesh
@@ -7471,10 +7567,12 @@ mod tests {
     #[test]
     fn d2_restart_islands_are_bridged_by_the_boundary_repush_cascade() {
         let (donor, donor_base) = lone_chain("i369_d2_donor", DH, None);
-        let (addrs, _) = mesh_addrs();
 
         // Four hosts, each on the boundary chain, each with its own key share, each
-        // configured to dial NOBODY — the staggered-restart window, held open.
+        // configured to dial NOBODY — the staggered-restart window, held open. Each
+        // binds a kernel-assigned port and advertises the read-back address (#441);
+        // nobody's address is predicted, and `connect_mesh` below wires the mesh
+        // from the live listeners.
         let mut bases = Vec::new();
         let mut dirs = Vec::new();
         let mut nodes: Vec<DrillNode> = Vec::new();
@@ -7482,13 +7580,13 @@ mod tests {
             let (mut cfg, genesis, base) = rig(&format!("i369_d2_{i}"), true);
             let lo: usize = KEY_SHARES[..i].iter().sum();
             cfg.committee_key_paths = cfg.committee_key_paths[lo..lo + KEY_SHARES[i]].to_vec();
-            cfg.listen_addr = addrs[i].clone();
-            cfg.advertise_addr = Some(addrs[i].clone());
             transplant(&donor, &[cfg.data_dir.clone()]);
             let mut n = RunningNode::start_with_release(
                 &cfg, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
             )
             .unwrap();
+            let self_addr = n.listen_addr().to_string();
+            n.p2p.addrs_mut().set_self_advertise(Some(self_addr));
             n.set_mine_interval(Duration::from_secs(3_600));
             assert_eq!(n.tip_height(), DH, "node {i} opened on the transplanted boundary");
             assert!(n.is_halted());
@@ -7513,7 +7611,7 @@ mod tests {
 
         // The mesh connects — and the islands do NOT merge, because the relay fires
         // on tally GROWTH and nothing here grows. This is #362, reproduced.
-        connect_mesh(&mut nodes, &addrs);
+        connect_mesh(&mut nodes);
         spin_all(&mut nodes, 12, 3);
         for (i, n) in nodes.iter().enumerate() {
             assert_eq!(
@@ -7602,20 +7700,22 @@ mod tests {
         assert_eq!(hdr_a.difficulty, hdr_b.difficulty, "exactly equal work — nothing breaks this tie");
 
         // Four halted hosts on the shared chain at DH−1, unconnected, split keys.
-        let (addrs, _) = mesh_addrs();
+        // Kernel-assigned binds, read back (#441): this loop is where the old
+        // predicted ports died `AddrInUse` on 2026-08-16 and killed the suite at
+        // 1,550/1 — a bind of `127.0.0.1:0` cannot lose that race.
         let mut bases = Vec::new();
         let mut nodes: Vec<DrillNode> = Vec::new();
         for i in 0..4 {
             let (mut cfg, genesis, base) = rig(&format!("i369_d3_{i}"), false);
             let lo: usize = KEY_SHARES[..i].iter().sum();
             cfg.committee_key_paths = cfg.committee_key_paths[lo..lo + KEY_SHARES[i]].to_vec();
-            cfg.listen_addr = addrs[i].clone();
-            cfg.advertise_addr = Some(addrs[i].clone());
             transplant(&base_chain, &[cfg.data_dir.clone()]);
-            let n = RunningNode::start_with_release(
+            let mut n = RunningNode::start_with_release(
                 &cfg, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
             )
             .unwrap();
+            let self_addr = n.listen_addr().to_string();
+            n.p2p.addrs_mut().set_self_advertise(Some(self_addr));
             assert_eq!(n.tip_height(), DH - 1);
             bases.push(base);
             nodes.push(n);
@@ -7640,7 +7740,7 @@ mod tests {
         }
 
         // Connect, and let the loop path do the rest.
-        connect_mesh(&mut nodes, &addrs);
+        connect_mesh(&mut nodes);
         for n in nodes.iter_mut() {
             n.set_repush_interval(Duration::ZERO);
         }
@@ -7788,7 +7888,7 @@ mod tests {
         assert_eq!(hdr_a.height, DH);
         assert_eq!(hdr_a.difficulty, hdr_b.difficulty, "equal-work siblings");
 
-        let (addrs, _) = mesh_addrs();
+        // Kernel-assigned binds, read back (#441) — see D3a for the mechanism.
         let mut bases = Vec::new();
         let mut nodes: Vec<DrillNode> = Vec::new();
         let mut loser_reopen = None;
@@ -7796,13 +7896,13 @@ mod tests {
             let (mut cfg, genesis, base) = rig(&format!("i375_d3b_{i}"), false);
             let lo: usize = KEY_SHARES[..i].iter().sum();
             cfg.committee_key_paths = cfg.committee_key_paths[lo..lo + KEY_SHARES[i]].to_vec();
-            cfg.listen_addr = addrs[i].clone();
-            cfg.advertise_addr = Some(addrs[i].clone());
             transplant(&base_chain, &[cfg.data_dir.clone()]);
             let mut n = RunningNode::start_with_release(
                 &cfg, &genesis, KeccakPow, DevnetRehearsalVerifier, armed_release(),
             )
             .unwrap();
+            let self_addr = n.listen_addr().to_string();
+            n.p2p.addrs_mut().set_self_advertise(Some(self_addr));
 
             if i == 3 {
                 // B is applied first. A's HEADER is known, so quorum evidence for
@@ -7820,7 +7920,7 @@ mod tests {
             nodes.push(n);
         }
 
-        connect_mesh(&mut nodes, &addrs);
+        connect_mesh(&mut nodes);
         for n in nodes.iter_mut() {
             n.set_repush_interval(Duration::ZERO);
         }
