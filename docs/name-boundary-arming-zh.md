@@ -12,6 +12,30 @@
 [#375]: https://github.com/qumbra-labs/qumbra-lab/issues/375
 [snapshot-transplant]: https://github.com/qumbra-labs/qumbra-lab/issues/359#issuecomment-5300960029
 
+> **复核 —— 2026-08-16（对 `main` @ 6703630）。** 本 runbook 引用的每处代码/机制在
+> main 上仍成立:`commitment_at_with_no_boundary_is_v2_everywhere` 与
+> `validate_body_rider_leg_end_to_end` 测试、`validate_body_above` /
+> `commitment_above` 钻孔 seam、`NAME_RULE_BOUNDARY_HEIGHT = None`(仍惰性)、以及
+> §5 边界-tie 的 telemetry 字段(`schain=` / `stipid=` 都在)。**程序无需改动。** 但前置
+> 状态动了 —— 下面的清单是计划,这里是每条今天的实况:
+>
+> | # | 前置 | 2026-08-16 状态 |
+> |---|---|---|
+> | 1 | T2 门开(T1 上线 #370 清空) | 🔴 未过 |
+> | 2 | mempool rider leg | ✅ #385/#390 |
+> | 3 | #375 边界-tie 输方已修 | ✅ **CLOSED — PR #416**(convergence lock + 恢复文档;§5 step 2 已 grounded) |
+> | 4 | #369 演练覆盖 body-format 边界 | 🟡 在飞(`claude/i369-halt-drill`) |
+> | 5 | 0x06 telemetry 全舰队 | ✅ **live 已验** —— `explorer/v1/health.json` 的 `supply.epochs[].burned` 存在(=0),非 null |
+> | 6 | #387 同名 reveal 竞争已闭 | ✅ **CLOSED — PR #390** |
+> | 7 | Larry 盖边界高度 | ⬜ 你定,卡在 1 |
+> | 8 | 费用表复批 | ⬜ 盖章时 |
+>
+> 两条硬共识门(3、6)已闭,4 在飞。剩下的是普通 T2 门:T1 上线(1)+ 你盖章(7/8)。
+>
+> **一处确认仍欠(未变):** §2 step0 的 `qumbra-node halt-status` name-boundary 横幅
+> 在 main 上仍不存在(本次 grep 复核确认)。它欠在 arming 日镜像构建**之前**,正如
+> §2 已标。
+
 ## 0. 两句话说清改的是什么
 
 在 `NAME_RULE_BOUNDARY_HEIGHT` 之上：交易可以携带**名字 rider**（commit /
