@@ -395,43 +395,49 @@ impl SelectDriver {
 
         let mut mined = 0usize;
         if chain.covered.is_some() {
-            // The scanned indices ARE the allocated ones — an address that can
-            // receive is an address that can mine (`coinbase`'s own rule).
-            let indices: Vec<u64> = self.outcomes.iter().map(|(idx, _)| *idx).collect();
-            let report = match_mined(&self.wallet, &indices, chain, &spent);
-            self.skipped_spent += report.spent.len();
-            let mut unchecked = 0usize;
-            for n in &report.spendable {
-                // 🔴 A mined note can be spent like any other, so one at heights
-                // the NULLIFIER stream did not reach cannot be shown to be
-                // unspent. Dropped, and named — not folded into
-                // `covers_outputs` above, which would turn a coinbase-serving,
-                // nullifier-short node into a NEW hard refusal for wallets that
-                // never mined. Dropping only shrinks; widening the fail-closed
-                // check would not.
-                if !spent
-                    .covered
-                    .is_some_and(|(from, to)| from <= n.minted_height && to >= self.to)
-                {
-                    unchecked += 1;
-                    continue;
+            // 🔴 A mined note can be spent like any other, so the coinbase
+            // stream's range must be inside the NULLIFIER stream's before any of
+            // it may be selected — the exact question `covers_outputs` already
+            // answers for transaction outputs, asked through the same function
+            // rather than a second coverage formula.
+            //
+            // Where it differs is what a `no` costs: the coinbase notes are
+            // dropped and the gap is NAMED, while the check above stays a hard
+            // refusal. Folding the coinbase range INTO that check would make a
+            // coinbase-serving/nullifier-short node a brand-new hard refusal for
+            // wallets that have never mined — the failure mode the ruling
+            // rejected. Dropping only shrinks the set; widening the fail-closed
+            // check would not.
+            match spent.covers_outputs(chain.covered) {
+                Err(e) => {
+                    self.coinbase_gap = Some(format!(
+                        "the coinbase stream reached further than the nullifier stream ({e}), so \
+                         this send could not tell whether a mined note is already spent and left \
+                         every one of them out"
+                    ));
                 }
-                self.spendables.push(Spendable {
-                    div_index: n.div_index,
-                    value: n.note.value,
-                    rho: n.note.rho,
-                    rseed: n.note.rseed,
-                });
-                mined += 1;
+                Ok(()) => {
+                    // The scanned indices ARE the allocated ones — an address
+                    // that can receive is an address that can mine
+                    // (`coinbase`'s own rule).
+                    let indices: Vec<u64> = self.outcomes.iter().map(|(idx, _)| *idx).collect();
+                    let report = match_mined(&self.wallet, &indices, chain, &spent);
+                    self.skipped_spent += report.spent.len();
+                    // ONLY the matured half. `report.maturing` is real money this
+                    // wallet owns and cannot spend, and it must never reach a
+                    // witness — the leaf does not exist yet.
+                    for n in &report.spendable {
+                        self.spendables.push(Spendable {
+                            div_index: n.div_index,
+                            value: n.note.value,
+                            rho: n.note.rho,
+                            rseed: n.note.rseed,
+                        });
+                        mined += 1;
+                    }
+                    self.mined = Some(report);
+                }
             }
-            if unchecked > 0 {
-                self.coinbase_gap = Some(format!(
-                    "{unchecked} matured mined note(s) lie at heights the nullifier stream did \
-                     not cover, so this send could not tell whether they are already spent and \
-                     left them out"
-                ));
-            }
-            self.mined = Some(report);
         }
 
         // The degradation goes out BEFORE the selection line it explains.
