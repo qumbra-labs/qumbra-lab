@@ -96,8 +96,8 @@ pub use persist::{
 };
 pub use replay_progress::{
     capture_progress, hold_replay_at, live_replay_position, take_captured_progress,
-    with_progress_capture, ReplayHold, ReplayPosition, REPLAY_PROGRESS_EVERY_RECORDS,
-    REPLAY_PROGRESS_EVERY_SECS,
+    with_progress_capture, ReplayHold, ReplayPosition, ReplayProgress,
+    REPLAY_PROGRESS_EVERY_RECORDS, REPLAY_PROGRESS_EVERY_SECS,
 };
 pub use store::{
     ChainStore, CommitmentStore, Hash32, MemChainStore, MemCommitmentStore, MemNullifierStore,

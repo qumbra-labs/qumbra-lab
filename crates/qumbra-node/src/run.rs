@@ -521,11 +521,60 @@ impl MineGate {
     }
 }
 
+/// A node that has passed every startup refusal and not yet opened its data
+/// dir — lab #373's phase ① made a value.
+///
+/// Startup is three phases now (the shape PR #372 established for the faucet):
+///
+/// ```text
+/// ① everything that can refuse, refuses   RunningNode::prepare — halt gates,
+///                                          genesis byte-verify, committee keys
+/// ② bind the telemetry listener            TelemetryServer::start — /v1/ready
+///                                          answers from this moment
+/// ③ open the node                          PreparedNode::open — the blocks.log
+///                                          replay, hours on a large chain —
+///                                          then adopt_telemetry_server
+/// ```
+///
+/// The split exists so the binary can bind a listener BETWEEN the refusals and
+/// the replay: binding earlier would hold a socket the process is about to
+/// refuse to run on (the faucet's recorded anti-pattern), binding later is the
+/// defect itself — a replaying host indistinguishable from a dead one for the
+/// whole of a restart (node3, 3h34m of false 🔴 alerts, 2026-08-11).
+///
+/// [`RunningNode::start`] is unchanged for every caller that does not bind
+/// early: it is exactly `prepare` + `open`.
+pub struct PreparedNode<'a, P: PowEngine, V: TxVerifier + Clone> {
+    config: &'a NodeConfig,
+    genesis: &'a GenesisFile,
+    pow: P,
+    verifier: V,
+    release: Release,
+    /// The halt marker as it stands AFTER the #81 supersede rewrite.
+    marker: Option<HaltMarker>,
+    rules: qlab_devnet::halt::RuleSchedule,
+    committee: CommitteeState,
+    finalizers: Vec<Finalizer>,
+    sim: SimConfig,
+}
+
+impl<P: PowEngine, V: TxVerifier + Clone> PreparedNode<'_, P, V> {
+    /// Phase ③: open the data dir (the replay), bind the P2P listener, dial the
+    /// seeds. Everything that can refuse has already refused in `prepare`.
+    pub fn open(self) -> Result<RunningNode<P, V>, RunError> {
+        RunningNode::open_prepared(self)
+    }
+}
+
 impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// Start a node from a parsed config + loaded genesis file, using PoW engine
     /// `pow` and verifier `verifier`. Verifies the genesis (item 2: a wrong
     /// `expected_genesis_hash` refuses to start), builds the disk-backed adapter,
     /// binds the TCP listener, and dials the configured peers.
+    ///
+    /// Exactly [`Self::prepare`] + [`PreparedNode::open`] — the seam every
+    /// existing caller keeps; only a caller that wants to bind a listener
+    /// between the two (lab #373) takes the halves separately.
     pub fn start(
         config: &NodeConfig,
         genesis: &GenesisFile,
@@ -549,6 +598,33 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         verifier: V,
         release: Release,
     ) -> Result<Self, RunError> {
+        Self::prepare_with_release(config, genesis, pow, verifier, release)?.open()
+    }
+
+    /// Lab #373 phase ① — everything that can refuse, refuses: the halt gates,
+    /// the genesis byte-verify + hash pin, the committee key cross-checks. No
+    /// state is opened, no socket is bound, nothing is replayed. The returned
+    /// [`PreparedNode`] is the license to bind a listener and then
+    /// [`PreparedNode::open`] the node.
+    pub fn prepare<'a>(
+        config: &'a NodeConfig,
+        genesis: &'a GenesisFile,
+        pow: P,
+        verifier: V,
+    ) -> Result<PreparedNode<'a, P, V>, RunError> {
+        Self::prepare_with_release(config, genesis, pow, verifier, RELEASE)
+    }
+
+    /// [`Self::prepare`] against an explicit [`Release`] — the same
+    /// tests-only seam [`Self::start_with_release`] is (H1: no config, CLI or
+    /// environment path reaches this parameter).
+    pub fn prepare_with_release<'a>(
+        config: &'a NodeConfig,
+        genesis: &'a GenesisFile,
+        pow: P,
+        verifier: V,
+        release: Release,
+    ) -> Result<PreparedNode<'a, P, V>, RunError> {
         // (0) HALT GATES (issue #74), BEFORE anything else touches state:
         //     (a) the release's own constants must be startable — the cadence-grid
         //         rule (H2) and the revision digest describing this binary (H4);
@@ -624,6 +700,37 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             genesis_difficulty: genesis.genesis_difficulty,
             ..SimConfig::default()
         };
+
+        Ok(PreparedNode {
+            config,
+            genesis,
+            pow,
+            verifier,
+            release,
+            marker,
+            rules,
+            committee,
+            finalizers,
+            sim,
+        })
+    }
+
+    /// [`PreparedNode::open`]'s body — lab #373 phase ③: the `blocks.log`
+    /// replay and everything after it. Private; the public seam is
+    /// [`PreparedNode::open`].
+    fn open_prepared(prepared: PreparedNode<'_, P, V>) -> Result<Self, RunError> {
+        let PreparedNode {
+            config,
+            genesis,
+            pow,
+            verifier,
+            release,
+            marker,
+            rules,
+            committee,
+            finalizers,
+            sim,
+        } = prepared;
 
         // (5) Disk-backed adapter (restart-safe) + TCP transport + P2P node.
         //     `committee` above is always a fresh all-Active genesis roster, because
@@ -1665,12 +1772,33 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// [`Self::start_metrics_endpoint`], an unbindable address is an **error**, not
     /// a silent no-op: a node whose operator believes it is readable and which is
     /// not is the failure this endpoint exists to remove.
+    ///
+    /// Bind-after-open: the server is born and handed over in one call, so it
+    /// never serves a `starting` state. The binary does NOT use this — it binds
+    /// in phase ② and hands over via [`Self::adopt_telemetry_server`] (lab
+    /// #373); this seam remains for callers content to be unreadable during
+    /// their open (`qumbra-faucet`'s in-process node, whose own page already
+    /// answers during the replay, and this crate's tests).
     pub fn start_telemetry_endpoint(&mut self, addr: &str) -> std::io::Result<std::net::SocketAddr> {
-        self.refresh_telemetry(); // serve a real snapshot from the first read on
-        let srv = TelemetryServer::start(addr, Arc::clone(&self.telemetry_snapshot))?;
+        let srv = TelemetryServer::start(addr)?;
+        Ok(self.adopt_telemetry_server(srv))
+    }
+
+    /// Lab #373 phase ③ handover: hand a pre-bound listener the live node.
+    /// Returns the bound address.
+    ///
+    /// Ordering is load-bearing: the node adopts the server's snapshot slot and
+    /// renders a REAL snapshot into it BEFORE the ready latch flips, so the
+    /// first `/v1/telemetry` 200 ever served carries node state, never empty
+    /// bytes — the same "the first request served is never a blank state" care
+    /// the faucet takes, kept under the new ownership.
+    pub fn adopt_telemetry_server(&mut self, srv: TelemetryServer) -> std::net::SocketAddr {
+        self.telemetry_snapshot = srv.snapshot();
+        self.refresh_telemetry();
+        srv.mark_ready();
         let bound = srv.addr();
         self.telemetry_server = Some(srv);
-        Ok(bound)
+        bound
     }
 
     /// Re-encode the snapshot the `/v1/telemetry` endpoint serves.
