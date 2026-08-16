@@ -1,0 +1,337 @@
+# The fleet node image: an alarm that is nearly free, and a build that is not.
+#
+# WHY THIS FILE EXISTS: `ghcr.io/qumbra-labs/qumbra-node` — the image the four
+# CONSENSUS hosts run — has only ever been built by hand from a laptop. That is
+# the same gap that let `qumbra-explorer` go stale 2026-08-07..11 (see
+# explorer-image.yml's header), except here the binary carries the frozen
+# consensus config, so the failure mode is worse than a stale page: a hand build
+# has no machine check that its frozen digest is the fleet's frozen digest, and
+# no provenance trail from registry tag back to a commit.
+#
+# THE TWO JOBS ARE DELIBERATELY ASYMMETRIC, same shape and same reasons as
+# explorer-image.yml:
+#
+#   drift   free, runs often: "is the newest CI-PUBLISHED fleet image current
+#           with the consensus-affecting code?" Fails loudly when it is not.
+#   image   removes the "build it by hand from a laptop" step. Runs on the PAID
+#           `qumbra-arm64-8` (docs/ci-runner-cost-decision.md §4: measured
+#           ≈$0.014/min against a $20/month cap with stop-usage on; PR #191's
+#           "~$0.7/run" was the pre-measurement estimate for the 35-min suite —
+#           an image build is one release build of two leaf crates plus four
+#           leaf-feature recompiles, so expect the same order). It is
+#           `workflow_dispatch` ONLY and gated on typing `confirm=build`; this
+#           file must not become a second recurring charge on that runner.
+#
+# WHAT `drift` CANNOT SEE, so nobody reads more into a green tick: it compares
+# the newest CI-published image against this repo. It cannot reach the fleet
+# hosts, so "an image exists but a host was never rolled" is qumbra-deploy's
+# gap to hold (OPERATOR.md), not this file's. And it deliberately counts ONLY
+# tags this workflow's convention produces (`emission-resume-*` / `armed-*`
+# whose suffix is a commit in this repo): a hand-built image with some other
+# tag does not silence the alarm, because an image nothing can re-derive is
+# exactly what this alarm exists to end.
+name: node image
+
+on:
+  # Every push to main, but the comparison is against the newest commit that
+  # actually TOUCHED the node image's contents — not against HEAD. Comparing to
+  # HEAD would report lag for a docs commit and train readers to ignore the
+  # alarm (explorer-image.yml, same reasoning).
+  push:
+    branches: [main]
+  # The backstop: the failure mode is "days pass and nobody notices", so a daily
+  # check bounds the blindness even if the push trigger is ever narrowed away.
+  # 41 not 17: offset from explorer-image.yml's cron so the two free checks do
+  # not stack on the same minute.
+  schedule:
+    - cron: "41 1 * * *"
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "build" to spend paid runner minutes on an image build. Anything else runs only the free drift check.'
+        required: false
+        default: ""
+      variant:
+        description: 'Which release to cut. emission-resume is the RUNNING FLEET variant (v1.1-exact-emission, resumes past 8640); armed is the boundary-halt announcement variant (v1.0, halts at 8640).'
+        type: choice
+        options:
+          - emission-resume
+          - armed
+        default: emission-resume
+
+concurrency:
+  group: node-image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: is a published fleet image current with the node's code?
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # merge-base and rev-list need history
+
+      - name: The newest commit that affects the node image
+        id: src
+        run: |
+          set -euo pipefail
+          # The paths whose change makes a published image stale. This is what
+          # the runtime image actually CONTAINS, not a guess at "consensus-ish":
+          # the workspace path-dep closure of `qumbra-node` (qlab-air,
+          # qlab-cbserver, qlab-consensus, qlab-devnet, qlab-econ, qlab-node,
+          # qlab-note, qlab-p2p, qlab-pow) PLUS `qumbra-faucet`'s closure
+          # (qlab-faucet, qlab-wallet) — the image ships the faucet binary too,
+          # and issue #397 is the record of a faucet-side staleness freezing a
+          # public surface for a day — PLUS the Dockerfile, entrypoint.sh
+          # (COPYed into the image), Cargo.lock, and the root Cargo.toml
+          # (workspace dep versions and [profile.release] both change the
+          # binaries without necessarily touching any crate dir).
+          #
+          # Paths written literally, never via an unquoted variable: `$PATHS`
+          # word-splits under bash and does NOT under zsh, so a variable here
+          # means "one pathspec that matches nothing" in a local zsh dry-run —
+          # explorer-image.yml paid for that once already.
+          SRC=$(git log -1 --format=%H -- \
+            crates/qlab-air crates/qlab-cbserver crates/qlab-consensus \
+            crates/qlab-devnet crates/qlab-econ crates/qlab-faucet \
+            crates/qlab-node crates/qlab-note crates/qlab-p2p crates/qlab-pow \
+            crates/qlab-wallet crates/qumbra-faucet crates/qumbra-node \
+            deploy/docker/Dockerfile deploy/docker/entrypoint.sh \
+            Cargo.lock Cargo.toml)
+          if [ -z "$SRC" ]; then
+            echo "::error::no commit found touching the node-image paths — pathspec is wrong"
+            exit 1
+          fi
+          echo "sha=$SRC" >> "$GITHUB_OUTPUT"
+          echo "newest node-image-affecting commit: $SRC"
+          git log -1 --format='  %h %ad %s' --date=short "$SRC"
+
+      - name: The newest published image, and what it was built from
+        id: pub
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Read tags, not config labels: an OCI index carries no labels, which
+          # cost this project a wrong provenance verdict on 2026-08-07
+          # (explorer-image.yml header). Tag convention is this workflow's own:
+          # `emission-resume-<short-sha>` / `armed-<short-sha>`.
+          #
+          # The VERDICT keys on the emission-resume variant only. That is the
+          # variant the four consensus hosts run; `armed` is a boundary
+          # announcement artifact whose staleness endangers no running host, so
+          # it is reported below but never trips the alarm.
+          TAGS=$(gh api "/orgs/${{ github.repository_owner }}/packages/container/qumbra-node/versions?per_page=100" \
+                   --jq '[.[].metadata.container.tags[]?] | .[]' 2>/dev/null || true)
+          if [ -n "$TAGS" ]; then
+            echo "published tags:"; echo "$TAGS" | sed 's/^/  /'
+          else
+            echo "no published tags readable"
+          fi
+          best_for() { # $1 = tag prefix; prints newest matching build commit we still have
+            local BEST="" BEST_TS=0 t c ts
+            for t in $TAGS; do
+              case "$t" in "$1"-*) c="${t#"$1"-}";; *) continue;; esac
+              if git cat-file -e "$c^{commit}" 2>/dev/null; then
+                ts=$(git log -1 --format=%ct "$c")
+                if [ "$ts" -gt "$BEST_TS" ]; then BEST_TS=$ts; BEST=$c; fi
+              fi
+            done
+            echo "$BEST"
+          }
+          FLEET=$(best_for emission-resume)
+          ARMED=$(best_for armed)
+          echo "fleet=${FLEET:-none}" >> "$GITHUB_OUTPUT"
+          echo "newest published emission-resume build commit: ${FLEET:-none}"
+          echo "newest published armed build commit:           ${ARMED:-none} (informational only)"
+
+      - name: Verdict
+        run: |
+          set -euo pipefail
+          SRC='${{ steps.src.outputs.sha }}'
+          PUB='${{ steps.pub.outputs.fleet }}'
+          if [ "$PUB" = "none" ]; then
+            echo "::error::No CI-published emission-resume image can be matched to a commit in this repo."
+            echo "The fleet is running a hand-built image with no provenance trail — the exact state"
+            echo "this workflow exists to end. Build one:"
+            echo "  gh workflow run 'node image' -f confirm=build -f variant=emission-resume"
+            exit 1
+          fi
+          # Current when the published build contains the newest
+          # node-image-affecting commit — i.e. SRC is an ancestor of PUB, or equal.
+          if git merge-base --is-ancestor "$SRC" "$PUB"; then
+            echo "CURRENT — published $(git rev-parse --short "$PUB") contains $(git rev-parse --short "$SRC")"
+            exit 0
+          fi
+          BEHIND=$(git rev-list --count "$PUB..$SRC" -- \
+            crates/qlab-air crates/qlab-cbserver crates/qlab-consensus \
+            crates/qlab-devnet crates/qlab-econ crates/qlab-faucet \
+            crates/qlab-node crates/qlab-note crates/qlab-p2p crates/qlab-pow \
+            crates/qlab-wallet crates/qumbra-faucet crates/qumbra-node \
+            deploy/docker/Dockerfile deploy/docker/entrypoint.sh \
+            Cargo.lock Cargo.toml)
+          echo "::error::STALE — the published fleet image predates $BEHIND node-image-affecting commit(s)."
+          echo "  published : $(git rev-parse --short "$PUB")  $(git log -1 --format=%ad --date=short "$PUB")"
+          echo "  needed    : $(git rev-parse --short "$SRC")  $(git log -1 --format=%ad --date=short "$SRC")"
+          echo ""
+          echo "Build:  gh workflow run 'node image' -f confirm=build -f variant=emission-resume"
+          echo "Then roll it in qumbra-deploy — this job cannot see the fleet hosts and does"
+          echo "not claim any host is current. Rolling a signing node is a consensus event:"
+          echo "one host at a time per OPERATOR.md, banner read back on each."
+          exit 1
+
+  image:
+    name: build + push the node image (manual, paid runner)
+    # Manual only. The runner is charged per minute and its trigger was narrowed
+    # for that reason; see the header.
+    if: github.event_name == 'workflow_dispatch' && inputs.confirm == 'build'
+    runs-on: qumbra-arm64-8
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # No host C++ toolchain step, deliberately (explorer-image.yml carries
+      # one): the entire cargo build runs INSIDE the Dockerfile's rust:1.95
+      # builder stage, which installs cmake/clang itself, so the runner never
+      # compiles anything. jq is the one host tool the readback needs.
+      - name: jq for the provenance readback (lab #428)
+        run: command -v jq >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends jq)
+
+      - name: Provenance
+        run: |
+          echo "commit   $(git rev-parse HEAD)"
+          echo "variant  ${{ inputs.variant }}"
+          uname -m; nproc; free -g | head -2
+          docker --version; docker buildx version
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build
+        id: build
+        run: |
+          set -euo pipefail
+          REV=$(git rev-parse HEAD); SHORT=$(git rev-parse --short HEAD)
+          echo "rev=$REV" >> "$GITHUB_OUTPUT"
+          # Variant → build args. The resume image needs BOTH feature args:
+          # NODE_FEATURES reaches only `-p qumbra-node`, and issue #397 is the
+          # record of what a resume image with an armed faucet does — the public
+          # faucet sat frozen at 8640 for ~24 h because its embedded keyless
+          # node halts on its own compiled-in schedule. The task-book's recipe
+          # (NODE_FEATURES alone) predates that finding; the Dockerfile's own
+          # FAUCET_FEATURES comment is the binding recipe.
+          case "${{ inputs.variant }}" in
+            emission-resume)
+              NODE_FEATURES="rule-boundary-resume"
+              FAUCET_FEATURES="qumbra-node/rule-boundary-resume"
+              ;;
+            armed)
+              NODE_FEATURES=""
+              FAUCET_FEATURES=""
+              ;;
+            *) echo "::error::unknown variant '${{ inputs.variant }}'"; exit 1 ;;
+          esac
+          TAG="${{ inputs.variant }}-$SHORT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "NODE_FEATURES=${NODE_FEATURES:-<armed default>}  FAUCET_FEATURES=${FAUCET_FEATURES:-<armed default>}"
+          # --target runtime is today's default (last stage), passed explicitly
+          # so a stage appended after `runtime` can never silently change what
+          # this file ships. Native arm64 on an arm64 runner — no QEMU.
+          docker build -f deploy/docker/Dockerfile --target runtime \
+            --platform linux/arm64 --load \
+            --build-arg GIT_REVISION="$REV" \
+            --build-arg NODE_FEATURES="$NODE_FEATURES" \
+            --build-arg FAUCET_FEATURES="$FAUCET_FEATURES" \
+            -t "ghcr.io/${{ github.repository_owner }}/qumbra-node:$TAG" .
+
+      - name: Frozen-digest verification — the consensus gate, BEFORE the push
+        run: |
+          set -euo pipefail
+          T="ghcr.io/${{ github.repository_owner }}/qumbra-node:${{ steps.build.outputs.tag }}"
+          # THE LOAD-BEARING CHECK of this whole file. A node image whose frozen
+          # digest drifted from the fleet's frozen consensus config must never
+          # reach the registry: `halt-status` prints the digest the carried
+          # revision DECLARES and the digest recomputed from THIS binary's
+          # compiled-in constants, and both must equal the pin. This is stronger
+          # than explorer-image.yml's symbol grep on purpose — a consensus
+          # binary's "did it really recompile" question is "are its constants
+          # the consensus constants", and halt-status answers it exactly.
+          FROZEN_PIN="a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b"
+          # The rule domain is Revision::digest — keccak over the IDENTIFIER as
+          # well as the frozen digest (revision.rs, #81) — so the two variants
+          # differ here by design even though their frozen digests are equal:
+          # armed carries v1.0, resume carries v1.1-exact-emission.
+          case "${{ inputs.variant }}" in
+            emission-resume)
+              EXP_REVISION="v1.1-exact-emission"
+              EXP_DOMAIN="56447169ab09956fcb78e8fb79a7cf2b502bd42194960226f83da2fb64db20b0"
+              EXP_PLAN="resumes past: height 8640"
+              ;;
+            armed)
+              EXP_REVISION="v1.0"
+              EXP_DOMAIN="0fea450384b0b286e2400f0cfa38b13eb4cfb01a1379c84085217cc059a0cd10"
+              EXP_PLAN="ARMED — halts at height 8640"
+              ;;
+          esac
+          docker run --rm --entrypoint /usr/local/bin/qumbra-node "$T" halt-status | tee halt.txt
+          DECLARED=$(sed -n 's/^  frozen digest: //p' halt.txt | head -1)
+          RECOMPUTED=$(sed -n '/recomputed from THIS/{n;p;}' halt.txt | tr -d ' ')
+          REVISION=$(sed -n 's/^  revision:[[:space:]]*//p' halt.txt | head -1)
+          DOMAIN=$(sed -n 's/^  rule domain:[[:space:]]*//p' halt.txt | head -1)
+          [ "$DECLARED" = "$FROZEN_PIN" ] || { echo "::error::FROZEN DIGEST DRIFT — the revision declares '$DECLARED', the fleet runs $FROZEN_PIN. A consensus constant moved; this image must not be pushed."; exit 1; }
+          [ "$RECOMPUTED" = "$FROZEN_PIN" ] || { echo "::error::FROZEN DIGEST DRIFT — recomputed-from-constants is '$RECOMPUTED', declared/pinned is $FROZEN_PIN. The binary's compiled-in constants disagree with the revision it carries."; exit 1; }
+          [ "$REVISION" = "$EXP_REVISION" ] || { echo "::error::revision mismatch — got '$REVISION', want $EXP_REVISION for variant ${{ inputs.variant }}"; exit 1; }
+          [ "$DOMAIN" = "$EXP_DOMAIN" ] || { echo "::error::rule-domain mismatch — got '$DOMAIN', want $EXP_DOMAIN for variant ${{ inputs.variant }}"; exit 1; }
+          grep -qF "$EXP_PLAN" halt.txt || { echo "::error::halt-plan banner mismatch — expected to find '$EXP_PLAN'"; exit 1; }
+          grep -qE '^  validate: +OK' halt.txt || { echo "::error::halt-status validate did not report OK"; exit 1; }
+          # The faucet binary rides in this same image and has its own copy of
+          # the release constant (#397). The revision identifier is compiled in
+          # iff the resume feature reached `-p qumbra-faucet`, so its presence /
+          # absence is the variant check for the binary halt-status cannot ask.
+          docker run --rm -e VARIANT="${{ inputs.variant }}" --entrypoint sh "$T" -c '
+            set -e
+            n=$(grep -c "v1.1-exact-emission" /usr/local/bin/qumbra-faucet || true)
+            echo "faucet binary v1.1-exact-emission occurrences: ${n:-0}"
+            if [ "$VARIANT" = "emission-resume" ]; then
+              [ "${n:-0}" -ge 1 ] || { echo "::error::the faucet binary is ARMED inside a resume image — issue #397, do not push"; exit 1; }
+            else
+              [ "${n:-0}" -eq 0 ] || { echo "::error::the faucet binary carries the resume revision inside an armed image"; exit 1; }
+            fi'
+          echo "frozen-digest verification: OK (${{ inputs.variant }})"
+
+      - name: Push
+        run: docker push "ghcr.io/${{ github.repository_owner }}/qumbra-node:${{ steps.build.outputs.tag }}"
+
+      - name: Read the provenance back from the registry
+        run: |
+          set -euo pipefail
+          T="ghcr.io/${{ github.repository_owner }}/qumbra-node:${{ steps.build.outputs.tag }}"
+          DIG=$(docker buildx imagetools inspect "$T" --format '{{.Manifest.Digest}}')
+          echo "digest: $DIG"
+          # Per-platform `.Image`, never `{{json .}}`: an OCI index has no
+          # config labels (explorer-image.yml, 2026-08-07). And jq, never grep
+          # (lab #428): explorer's readback greps '"revision":"…"' with no space
+          # after the colon, and `{{json .Image}}` emits one — so it reds a GOOD
+          # push. jq reads the value, not the serialization.
+          GOT=$(docker buildx imagetools inspect "$T" --format '{{json .Image}}' \
+                | jq -r '.config.Labels["org.opencontainers.image.revision"] // .Config.Labels["org.opencontainers.image.revision"] // empty')
+          [ "$GOT" = "${{ steps.build.outputs.rev }}" ] || { echo "::error::provenance mismatch — registry says '$GOT', built from ${{ steps.build.outputs.rev }}"; exit 1; }
+          echo "provenance OK: $GOT"
+          echo ""
+          echo "Roll note — the asserts above all passed:"
+          echo "  image: ghcr.io/${{ github.repository_owner }}/qumbra-node@$DIG"
+          echo "Pin that digest in qumbra-deploy and roll ONE HOST AT A TIME per"
+          echo "OPERATOR.md — rolling a signing node is a consensus event. Read"
+          echo "the halt-status banner back on every host before the next one."
