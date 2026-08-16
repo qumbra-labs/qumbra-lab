@@ -45,5 +45,6 @@ pub mod params_audit;
 pub mod release;
 pub mod revision;
 pub mod run;
+pub mod startup;
 pub mod telemetry_server;
 pub mod verifier;
