@@ -90,6 +90,14 @@ cargo build --release -p qumbra-node --features rule-boundary-resume
 🔴 **先建好並推送 resume 映像。** armed 映像會讓網路在 8,640 停住；如果那一刻 resume 映像
 還不存在，finality 就會一直停到它存在為止。
 
+> **CI 路徑（2026-08-16 新增，QUM-119）**：上面的手動建置在*映像*產出上已由
+> `.github/workflows/node-image.yml` 取代 ——
+> `gh workflow run 'node image' -f confirm=build -f variant=emission-resume`（或
+> `variant=armed`）。它在付費 arm64 runner 上建置，推送**之前**先用映像自己的
+> `halt-status` 斷言 frozen digest / rule domain / revision，並用 jq 驗證 registry
+> 的 provenance。resume 變體會同時傳入 `NODE_FEATURES` 與 `FAUCET_FEATURES`
+>（issue #397 —— resume 映像若帶著 armed 的 faucet，公開 faucet 會凍結在邊界上）。
+
 ## 4. 滾 armed 映像（在高度 8,640 之前）
 
 依 `OPERATOR.md` 一台一台滾。每台主機都把 banner 讀回來：
