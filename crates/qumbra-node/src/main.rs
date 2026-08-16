@@ -218,15 +218,34 @@ fn genesis_init(args: &[String]) -> Result<(), Box<dyn Error>> {
 
 fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     let cfg_path = flag(args, "--config").ok_or("run requires --config FILE")?;
-    let config = NodeConfig::load(cfg_path)?;
+    // Lab #300: the entry line is the FIRST act — before config load, and so
+    // before everything downstream of it. A node that spends an hour computing
+    // before its banner is indistinguishable from a dead one; this line makes
+    // that silence structurally impossible (ordering locked in `startup`'s
+    // tests + tests/startup_entry.rs).
+    let config = qumbra_node::startup::announce_then_load(&mut std::io::stdout(), cfg_path)?;
+    println!("STARTUP loading genesis file {}", config.genesis_file.display());
     let genesis = GenesisFile::load(&config.genesis_file)?;
+    println!("STARTUP genesis file loaded");
 
     // Real RandomX (N3) is the default engine. The tx verifier defaults to the
     // REAL M3 verifier (qlab_consensus::verify_proof, frozen CONSENSUS_CFG);
     // `--rehearsal-verifier` opts into the NO-OP stand-in and logs loudly
     // (M10-T0-4, issue #68 — the named M11 gate, closed early).
     let (verifier, verifier_log) = select_verifier(has_flag(args, "--rehearsal-verifier"));
-    let mut node = RunningNode::start(&config, &genesis, RandomXPow::new(), verifier)?;
+    // Lab #300: bracket every pre-banner stage that can plausibly be expensive,
+    // so a stall names the stage it is in instead of presenting as silence. The
+    // RandomX constructor is lazy today (the ~256 MiB cache builds at first
+    // hash) — the bracket is there for when that stops being true.
+    println!("STARTUP RandomX engine init begin (light mode; cache builds lazily at first hash)");
+    let pow = RandomXPow::new();
+    println!("STARTUP RandomX engine init done");
+    println!(
+        "STARTUP node start begin (halt gates, genesis byte-verify, committee keys, data dir \
+         open/replay, listen bind, seed dial)"
+    );
+    let mut node = RunningNode::start(&config, &genesis, pow, verifier)?;
+    println!("STARTUP node start done");
 
     // Item 0: the binary mines on real wall-clock header timestamps (NOT the
     // deterministic 75 s counter the in-process sims/tests use), so LWMA sees real
