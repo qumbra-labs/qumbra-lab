@@ -36,9 +36,11 @@ belongs to.
 > Two hard consensus blockers (3, 6) are closed; 4 is in flight. What remains is
 > the ordinary T2 gate: T1 launching (1) + Larry's stamp (7/8).
 >
-> **One confirmed-owed item, unchanged:** §2 step 0's `qumbra-node halt-status`
-> name-boundary banner still does not exist on main (grep-verified this review).
-> It is owed BEFORE arming-day images build, exactly as §2 already flags.
+> **The one owed item is now landed:** §2 step 0's `qumbra-node halt-status`
+> name-boundary banner shipped in **PR #436** (2026-08-16) — halt-status prints a
+> `name service: INERT …` line beside `halt plan:`, reading `ARMED` once the
+> constant flips. No owed code items remain for arming; what is left is the T2
+> gate (T1 launch) and Larry's stamp.
 
 ## 0. What is changing, in two sentences
 
@@ -110,8 +112,11 @@ On a worktree from current `main`:
 - Re-derive the v3 body-commitment golden AT the stamped boundary (the
   drill-seam golden at `Some(8_640)` stays as the format lock; the shipped-rule
   golden moves once, legitimately, and is locked).
-- `qumbra-node halt-status` must banner the name boundary the way it banners
-  the emission one — if it does not, that seam is owed BEFORE images build.
+- `qumbra-node halt-status` banners the name boundary the way it banners the
+  emission one (landed PR #436): the `name service:` line reads `INERT` on the
+  shipped build and `ARMED — … above height {h}` once this step flips the
+  constant. Confirm it flips to `ARMED` at your stamped height as part of
+  step-0 acceptance.
 
 Acceptance for step 0 = the full suite on `suite-arm64` (heavy runs stay off
 the laptop — standing rule since 2026-08-12), arithmetic reconciled.

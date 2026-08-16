@@ -32,9 +32,10 @@
 >
 > 两条硬共识门(3、6)已闭,4 在飞。剩下的是普通 T2 门:T1 上线(1)+ 你盖章(7/8)。
 >
-> **一处确认仍欠(未变):** §2 step0 的 `qumbra-node halt-status` name-boundary 横幅
-> 在 main 上仍不存在(本次 grep 复核确认)。它欠在 arming 日镜像构建**之前**,正如
-> §2 已标。
+> **唯一欠的那项现已落地:** §2 step0 的 `qumbra-node halt-status` name-boundary
+> 横幅已随 **PR #436**(2026-08-16)落地 —— halt-status 在 `halt plan:` 旁印一行
+> `name service: INERT …`,常量翻转后读 `ARMED`。arming 已无欠的代码项;剩下的是
+> T2 门(T1 上线)+ Larry 盖章。
 
 ## 0. 两句话说清改的是什么
 
@@ -92,8 +93,9 @@ reveal / renew），区块 body 换 **v3 编码**承诺（第一次经由 halt �
   `CommitmentMismatch` 分支 → 武装态正路。
 - 在盖章边界处重推 v3 body 承诺 golden（`Some(8_640)` 的钻孔 golden 留作格式
   锁；出厂规则 golden 正当地移动一次并锁定）。
-- `qumbra-node halt-status` 必须像横幅排放边界那样横幅名字边界——若没有，
-  这个 seam 欠在镜像构建**之前**。
+- `qumbra-node halt-status` 已像横幅排放边界那样横幅名字边界(PR #436 落地):
+  `name service:` 行在出厂构建读 `INERT`,本步翻常量后读 `ARMED — … above
+  height {h}`。作为 step-0 验收的一部分,确认它在你盖章的高度翻成 `ARMED`。
 
 第 0 步的验收 = `suite-arm64` 上的全量套件（重负载不落笔记本——2026-08-12 起
 的常规），算术逐项对账。
