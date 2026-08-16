@@ -107,6 +107,15 @@ cargo build --release -p qumbra-node --features rule-boundary-resume
 8,640; if the resume image does not exist at that moment, finality is stopped until
 it does.
 
+> **CI path (added 2026-08-16, QUM-119):** the hand-build above is superseded for
+> *image* production by `.github/workflows/node-image.yml` —
+> `gh workflow run 'node image' -f confirm=build -f variant=emission-resume` (or
+> `variant=armed`). It builds on the paid arm64 runner, asserts the frozen digest /
+> rule domain / revision from the image's own `halt-status` **before** pushing, and
+> verifies registry provenance with jq. The resume variant passes **both**
+> `NODE_FEATURES` and `FAUCET_FEATURES` (issue #397 — a resume image with an armed
+> faucet freezes the public faucet at the boundary).
+
 ## 4. Roll the armed image (before height 8,640)
 
 One host at a time, per `OPERATOR.md`. On each host, read the banner back:
