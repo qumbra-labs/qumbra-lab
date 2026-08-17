@@ -3401,11 +3401,13 @@ mod tests {
             "and it has no head to name: {line}"
         );
         // #359: this rig snapshotted at height 0 before the restart, so the reopened
-        // node reads the height back off disk — and `snap=` is the tail now. (The
-        // `ends_with` above became a `contains` for that reason; the discipline it
-        // was checking is `telemetry_line_is_extended_at_the_end_and_nowhere_else`'s
-        // job, which asserts the whole key order rather than one field's position.)
-        assert!(line.ends_with(" snap=0"), "the durable snapshot survived too: {line}");
+        // node reads the height back off disk. (Position is not this test's
+        // subject — that is
+        // `telemetry_line_is_extended_at_the_end_and_nowhere_else`'s job, which
+        // asserts the whole key order rather than one field's place. #459 appended
+        // after `snap=`, so this went from `ends_with` to `contains` for the same
+        // reason the `dfinbh` assertion above did.)
+        assert!(line.contains(" snap=0 "), "the durable snapshot survived too: {line}");
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -4630,6 +4632,48 @@ mod tests {
         a.force_redial_ready();
         a.maintain_peers();
         assert_eq!(a.p2p().transport().peers().len(), 1, "no duplicate dial to a connected peer");
+
+        drop(b);
+        let _ = std::fs::remove_dir_all(&abase);
+        let _ = std::fs::remove_dir_all(&bbase);
+    }
+
+    /// **Issue #459 §2, on the real binary: `pin=`/`pout=` split `peers=` by who
+    /// opened the connection, and the split sums to it.**
+    ///
+    /// The bring-up is #172's fully-configured two-host mesh, where each side
+    /// holds exactly one connection of each direction — which is the case that
+    /// makes the point, because `peers=2` there described one inbound and one
+    /// outbound session and said nothing about either. On the T1 edge that
+    /// distinction is the whole question: `pin` moving off zero is the first
+    /// machine-readable evidence that somebody outside the fleet arrived.
+    #[test]
+    fn the_telemetry_line_splits_the_peer_count_by_direction() {
+        let (acfg, agen, abase) = rig("pinpout_a", false);
+        let mut a = RunningNode::start(&acfg, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let a_addr = a.listen_addr().to_string();
+
+        let (mut bcfg, bgen, bbase) = rig("pinpout_b", false);
+        bcfg.dial_peers = vec![a_addr];
+        let mut b = RunningNode::start(&bcfg, &bgen, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        let b_addr = b.listen_addr().to_string();
+
+        // One directed connection each way, exactly as #172 builds it.
+        a.p2p.addrs_mut().add_seed(b_addr);
+        pump(&mut [&mut a, &mut b], 5);
+        a.force_redial_ready();
+        a.maintain_peers();
+        pump(&mut [&mut a, &mut b], 5);
+
+        for (who, line) in [("A", a.telemetry_sample()), ("B", b.telemetry_sample())] {
+            let pin: u64 = field(&line, "pin").parse().expect("a number, not a dash");
+            let pout: u64 = field(&line, "pout").parse().expect("a number, not a dash");
+            let peers: u64 = field(&line, "peers").parse().unwrap();
+            assert_eq!(peers, 2, "{who} holds both directions: {line}");
+            assert_eq!((pin, pout), (1, 1), "{who} accepted one and dialed one: {line}");
+            // The invariant an operator's arithmetic depends on.
+            assert_eq!(pin + pout, peers, "{who}: {line}");
+        }
 
         drop(b);
         let _ = std::fs::remove_dir_all(&abase);
@@ -5938,8 +5982,18 @@ mod tests {
         );
         assert_ne!(field(&line, "dfinbh"), "-", "a finalized durable head has an identity: {line}");
         // #359: this rig has never stopped and never reached a cadence tick, so it is
-        // node3's shape and the field says so — and it is the LAST field.
-        assert!(line.ends_with(" snap=none"), "no snapshot, said plainly and last: {line}");
+        // node3's shape and the field says so. No longer `ends_with`: #459 appended
+        // after it.
+        assert!(line.contains(" snap=none"), "no snapshot, said plainly: {line}");
+        // #459: this rig holds no connections in either direction, and it says the
+        // zero rather than omitting the field (the #130 (a) rule). Numbers and not
+        // `-`, because the binary runs the TCP transport, which knows the answer.
+        assert!(line.ends_with(" pin=0 pout=0"), "the split, stated and last: {line}");
+        assert_eq!(
+            field(&line, "pin").parse::<u64>().unwrap() + field(&line, "pout").parse::<u64>().unwrap(),
+            field(&line, "peers").parse::<u64>().unwrap(),
+            "the split must sum to the number it splits: {line}"
+        );
         let _ = std::fs::remove_dir_all(&base);
     }
 

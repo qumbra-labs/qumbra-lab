@@ -40,9 +40,7 @@ use crate::sync::{
 use crate::ticktime::{lap, TickTimings};
 use qlab_devnet::finality::next_checkpoint_height;
 use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
-use crate::transport::{
-    CloseReason, ConnDirection, ConnEvent, DialCompletion, DialStart, Transport, TransportError,
-};
+use crate::transport::{ConnEvent, DialCompletion, DialStart, Transport, TransportError};
 use crate::wire::{Envelope, Frame, MsgType};
 
 /// Service-bits placeholder advertised in the handshake (`[devnet-placeholder]`).
@@ -3008,7 +3006,9 @@ fn build_announce_parts(txs: &[TxEntry], nonce: u64) -> (Vec<PrefilledTx>, Vec<[
 mod tests {
     use super::*;
     use crate::n1::{BlockIngest, ChainView, CheckpointIngest, CommitteeControl, StubNode, TxPool};
-    use crate::transport::{InProcHub, InProcTransport, TcpTransport};
+    use crate::transport::{
+        CloseReason, ConnDirection, InProcHub, InProcTransport, TcpTransport,
+    };
     use qlab_devnet::body::TxPublic;
     use qlab_devnet::committee::{devnet_committee, CommitteeState, MemberStatus, Validator};
     use qlab_devnet::ebbflow::{EquivocationEvidence, FinalityStatus};
