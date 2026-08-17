@@ -169,13 +169,57 @@ void qmb_scan_free(qmb_scan_t *s);
  * scan's outcomes (consumed; scan again for another select), finishing as the
  * serialized witness bundle the native prover host takes.
  *
- * qmb_select_step returns
+ * qmb_select_step_events returns
  *    1  NEED from the SCAN endpoint: *out is the path (qmb_string_free);
  *    2  NEED from the NODE endpoint: same contract, other host — one host
  *       normally serves both, the code still names which wire it is;
  *    0  DONE: take the bytes with qmb_select_take_bundle;
  *   -2  FAILED by name: *out is the reason (qmb_string_free);
  *   -1  NULL/invalid call.
+ *
+ * EVERY call also hands back the selection's narration (lab #432): the events
+ * the driver emitted since the last call land in *events_out / *events_len,
+ * released with qmb_dealloc(p, len). No events -> *events_out = NULL and
+ * *events_len = 0. NULL events_out/events_len is refused with -1 — narration
+ * rides the step return precisely so a send surface cannot skip it.
+ *
+ * 🔴 THE NARRATION CONTRACT (lab #424 guardrail 1 — visible degradation):
+ * a consumer MUST surface QMB_EVENT_WARNING and
+ * QMB_EVENT_COINBASE_UNAVAILABLE to its user. QMB_EVENT_COINBASE_UNAVAILABLE
+ * means this selection could NOT see the wallet's mined coins and proceeded
+ * on transaction notes only (the 2026-08-16 ruling): a user must never think
+ * they spent from a complete view when they did not. A shell that drops these
+ * events is violating this header's stated contract.
+ *
+ * Event encoding — tagged, length-prefixed, unknown-kind-skippable:
+ *
+ *    blob   := u32le record_count || record_count * record
+ *    record := u16le kind || u32le body_len || body_len bytes
+ *
+ * Integers little-endian; text UTF-8, NOT NUL-terminated (lengths are
+ * explicit). A record of a kind you do not know is SKIPPED by body_len and
+ * the rest of the blob still parses — a future event kind must not break a
+ * shipped shell. Kinds and bodies:
+ *
+ *    QMB_EVENT_OTHER                 0  UTF-8 display text (narration with no
+ *                                       dedicated shape yet; display it)
+ *    QMB_EVENT_SELECTED              1  u64le spendable || u64le skipped_spent
+ *                                       || u64le mined
+ *    QMB_EVENT_TREE                  2  u64le held || u64le fetched ||
+ *                                       u64le anchor_count || u64le node_tip ||
+ *                                       u8 has_finalized || u64le finalized ||
+ *                                       u64le anchor_behind || anchor_root
+ *                                       (UTF-8 hex, the rest of the body)
+ *    QMB_EVENT_WARNING               3  UTF-8 text — must be SEEN, must not
+ *                                       stop the spend
+ *    QMB_EVENT_COINBASE_UNAVAILABLE  4  UTF-8 text — the reason, verbatim
+ *
+ * No event payload ever carries key material, at any kind, ever.
+ *
+ * qmb_select_step is the pre-#432 pump, kept because this ABI is additive.
+ * It returns the same codes and drains NOTHING: events stay queued in the
+ * handle (deferred, never lost) until a qmb_select_step_events call returns
+ * them. Building a send surface on it violates the narration contract above.
  *
  * The bundle bytes carry SPENDING-KEY MATERIAL: hand them to the native
  * prover host and nowhere else, discard once the transaction is accepted or
@@ -188,11 +232,19 @@ void qmb_scan_free(qmb_scan_t *s);
  * the reason in *err_out. */
 typedef struct qmb_select_t qmb_select_t;
 
+#define QMB_EVENT_OTHER 0
+#define QMB_EVENT_SELECTED 1
+#define QMB_EVENT_TREE 2
+#define QMB_EVENT_WARNING 3
+#define QMB_EVENT_COINBASE_UNAVAILABLE 4
+
 qmb_select_t *qmb_select_new(const qmb_wallet_t *w, qmb_scan_t *scan,
                              const char *recipient, uint64_t amount,
                              const uint8_t *held_leaves, size_t held_len,
                              const uint8_t *rng_seed32, char **err_out);
 int32_t qmb_select_step(qmb_select_t *s, char **out);
+int32_t qmb_select_step_events(qmb_select_t *s, char **out,
+                               uint8_t **events_out, size_t *events_len);
 void qmb_select_supply(qmb_select_t *s, const uint8_t *body, size_t len);
 void qmb_select_supply_err(qmb_select_t *s, const char *reason);
 uint8_t *qmb_select_take_bundle(qmb_select_t *s, size_t *out_len);

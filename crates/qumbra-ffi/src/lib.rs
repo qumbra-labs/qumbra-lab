@@ -19,6 +19,7 @@
 //! - **The scan report crosses pre-rendered** ([`report`]) — Swift colors
 //!   words, it never re-derives a verdict.
 
+pub mod events;
 pub mod report;
 
 use std::collections::VecDeque;
@@ -902,11 +903,12 @@ pub unsafe extern "C" fn qmb_select_new(
 /// error (every node older than lab #415 answers 404) does NOT fail the select:
 /// it proceeds on transaction notes only, per the 2026-08-16 ruling.
 ///
-/// 🔴 **A host on this ABI cannot yet SEE that degradation.** The driver
-/// narrates it as `SendStep::CoinbaseUnavailable`, and this surface drains no
-/// events at all — it never has, for any step. Reported on lab #424; the fix is
-/// an events codepoint on this ABI, which is a decision this baton did not
-/// take.
+/// 🔴 **This entry point cannot SHOW that degradation** — it drains no events,
+/// and it is kept only because the ABI is additive (lab #432 closed the gap at
+/// [`qmb_select_step_events`], which every send surface must use instead). The
+/// driver's narration — `Selected`, `Tree`, `Warning`, `CoinbaseUnavailable` —
+/// stays QUEUED in the handle when this function pumps it: deferred, never
+/// lost, returned whole by the next `qmb_select_step_events` call.
 ///
 /// # Safety
 /// `s` live (or NULL); `out` writable (or NULL).
@@ -915,7 +917,12 @@ pub unsafe extern "C" fn qmb_select_step(s: *mut SelectState, out: *mut *mut c_c
     if s.is_null() || out.is_null() {
         return -1;
     }
-    let st = &mut *s;
+    select_step_inner(&mut *s, out)
+}
+
+/// The one step implementation behind both entry points — the return codes
+/// and the `*out` contract cannot drift between them.
+unsafe fn select_step_inner(st: &mut SelectState, out: *mut *mut c_char) -> i32 {
     if st.bundle.is_some() {
         return 0;
     }
@@ -936,6 +943,54 @@ pub unsafe extern "C" fn qmb_select_step(s: *mut SelectState, out: *mut *mut c_c
             -2
         }
     }
+}
+
+/// [`qmb_select_step`] plus the driver's narration — lab #432, closing lab
+/// #424's guardrail-1 gap on this ABI. Same return codes, same `*out`
+/// contract; additionally every call drains the events the driver has emitted
+/// (all events queued since the last drain, in order) into `*events_out` /
+/// `*events_len` as the tagged, length-prefixed encoding documented in
+/// `include/qumbra_ffi.h` and [`events`]. No events → `*events_out = NULL`,
+/// `*events_len = 0`.
+///
+/// The events ride the step return, not a separate pump codepoint, so a
+/// consumer of this function cannot forget to collect them — and NULL
+/// `events_out`/`events_len` is refused with `-1`, so it cannot opt out
+/// either. The buffer is released with `qmb_dealloc(p, len)` (same contract as
+/// `qmb_select_take_bundle`).
+///
+/// 🔴 **The narration contract (lab #424 guardrail 1):** a consumer MUST
+/// surface `QMB_EVENT_WARNING` and `QMB_EVENT_COINBASE_UNAVAILABLE` to its
+/// user. A shell that drops them ships a send surface whose user can spend
+/// from a degraded view and see nothing — the exact harm the ruling's visible-
+/// degradation guardrail exists to prevent. An event of an UNKNOWN kind is
+/// skipped by its length prefix, never a parse failure — a fifth kind must not
+/// break an old consumer.
+///
+/// # Safety
+/// `s` live (or NULL); `out`, `events_out`, `events_len` writable (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_select_step_events(
+    s: *mut SelectState,
+    out: *mut *mut c_char,
+    events_out: *mut *mut u8,
+    events_len: *mut usize,
+) -> i32 {
+    if s.is_null() || out.is_null() || events_out.is_null() || events_len.is_null() {
+        return -1;
+    }
+    let st = &mut *s;
+    let rc = select_step_inner(st, out);
+    let drained = st.driver.take_events();
+    if drained.is_empty() {
+        *events_out = ptr::null_mut();
+        *events_len = 0;
+    } else {
+        let blob = events::encode_events(&drained).into_boxed_slice();
+        *events_len = blob.len();
+        *events_out = Box::into_raw(blob) as *mut u8;
+    }
+    rc
 }
 
 /// Answer the outstanding NEED with the fetched bytes (COPIED — the caller
@@ -1899,5 +1954,58 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The #246 pin, extended to the event-kind values (lab #432): the header's
+    /// `#define QMB_EVENT_*` list and `events.rs`'s `pub const QMB_EVENT_*`
+    /// list must be the same set with the same values, in both directions. The
+    /// kind tags are ABI now — a tag that drifts between the two files is a
+    /// consumer decoding the wrong event.
+    #[test]
+    fn the_header_and_the_events_module_pin_the_same_kind_values() {
+        let header = include_str!("../include/qumbra_ffi.h");
+        let src = include_str!("events.rs");
+
+        let header_kinds: Vec<(String, u16)> = header
+            .lines()
+            .filter_map(|l| {
+                let rest = l.trim().strip_prefix("#define QMB_EVENT_")?;
+                let mut it = rest.split_whitespace();
+                let name = it.next()?.to_string();
+                let value = it.next()?.parse().ok()?;
+                Some((name, value))
+            })
+            .collect();
+        let src_kinds: Vec<(String, u16)> = src
+            .lines()
+            .filter_map(|l| {
+                let rest = l.trim().strip_prefix("pub const QMB_EVENT_")?;
+                let (name, tail) = rest.split_once(": u16 = ")?;
+                let value = tail.trim_end_matches(';').parse().ok()?;
+                Some((name.to_string(), value))
+            })
+            .collect();
+
+        assert!(!header_kinds.is_empty(), "the header declares no event kinds");
+        assert!(!src_kinds.is_empty(), "events.rs declares no event kinds");
+        for (name, value) in &header_kinds {
+            assert!(
+                src_kinds.contains(&(name.clone(), *value)),
+                "header declares QMB_EVENT_{name} = {value}, events.rs does not"
+            );
+        }
+        for (name, value) in &src_kinds {
+            assert!(
+                header_kinds.contains(&(name.clone(), *value)),
+                "events.rs declares QMB_EVENT_{name} = {value}, the header does not"
+            );
+        }
+        // And the values the ABI already shipped with, by number — a renumber
+        // that keeps both files in step is still a broken consumer.
+        assert_eq!(crate::events::QMB_EVENT_OTHER, 0);
+        assert_eq!(crate::events::QMB_EVENT_SELECTED, 1);
+        assert_eq!(crate::events::QMB_EVENT_TREE, 2);
+        assert_eq!(crate::events::QMB_EVENT_WARNING, 3);
+        assert_eq!(crate::events::QMB_EVENT_COINBASE_UNAVAILABLE, 4);
     }
 }
