@@ -844,9 +844,14 @@ mod tests {
 
     /// `header_for` at an arbitrary height. Only `height` and
     /// `tx_body_commitment` are read by `validate_body`, so overriding the height is
-    /// enough to put a body above or below the rule boundary.
+    /// enough to put a body above or below the rule boundary. The binding uses the
+    /// SHIPPED `commitment_at` — since the name boundary was stamped (19,008,
+    /// lab #367) an honest header above it commits the v3 form, and a helper
+    /// pinned to v2 would fabricate a header no honest producer emits.
     fn header_at(height: u64, body: &BlockBody) -> BlockHeader {
-        BlockHeader { height, ..header_for(body) }
+        let mut header = BlockHeader { height, ..header_for(body) };
+        header.tx_body_commitment = body.commitment_at(height);
+        header
     }
 
     fn good_tx(nf: u8) -> TxEntry {
@@ -1262,15 +1267,41 @@ mod tests {
 
     // --- lab #367: the v3 (name-rider) body form -----------------------------
 
-    /// **The inert-at-merge lock**: while `NAME_RULE_BOUNDARY_HEIGHT` is
-    /// `None`, the shipped `commitment_at` is the v2 commitment at every
-    /// height — merging this code changes nothing on the running chain.
+    /// RETIRED 2026-08-17: `commitment_at_with_no_boundary_is_v2_everywhere`
+    /// (the inert-at-merge lock: boundary `None` ⇒ v2 at every height) —
+    /// replaced by this boundary-split golden at the stamp (19,008, lab #367,
+    /// arming runbook step 0). Every real height the inert version asserted
+    /// (0, 1, 1_377, 8_640, 8_641) is still asserted v2 below; only
+    /// `u64::MAX` moved sides, which is the arming itself.
+    ///
+    /// **The shipped rule's boundary-split golden**: at/below the stamped
+    /// 19,008 the SHIPPED `commitment_at` is the v2 commitment — the live
+    /// chain's entire history keeps its identity through the flip. Strictly
+    /// above, it is the v3 form, locked to the same hex
+    /// `golden_body_commitment_bytes_v3` pins at the drill seam (the preimage
+    /// depends on the form, not on the boundary value — re-derived, and it
+    /// must stay equal). This golden moved once, legitimately, at the stamp;
+    /// it is now locked exactly like the v2 one.
     #[test]
-    fn commitment_at_with_no_boundary_is_v2_everywhere() {
-        assert_eq!(crate::names::NAME_RULE_BOUNDARY_HEIGHT, None, "armed early — see lab #367");
+    fn commitment_at_splits_v2_from_v3_at_the_stamped_boundary() {
+        assert_eq!(
+            crate::names::NAME_RULE_BOUNDARY_HEIGHT,
+            Some(19_008),
+            "the golden below is pinned to the stamp — lab #367"
+        );
         let body = golden_body();
-        for h in [0u64, 1, 1_377, 8_640, 8_641, u64::MAX] {
+        // The v2 side: the whole live chain, boundary height included.
+        for h in [0u64, 1, 1_377, 8_640, 8_641, 19_007, 19_008] {
             assert_eq!(body.commitment_at(h), body.commitment(), "height {h}");
+        }
+        // The v3 side: locked bytes, same literal as the drill-seam golden.
+        for h in [19_009u64, u64::MAX] {
+            let hex: String =
+                body.commitment_at(h).iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!(
+                hex, "f02dd727e204b3d0e8b55e420e55c311a6a6ab0f2d658866e57acf8ca5d46e25",
+                "height {h}: the shipped rule above the boundary must be the locked v3 form"
+            );
         }
     }
 
@@ -1370,12 +1401,54 @@ mod tests {
             validate_body_above(Some(B), &at(B, &body), &body, &MockVerifier, is_final, &view),
             Err(BodyError::RiderBeforeBoundary { index: 0 })
         ));
-        // And under the SHIPPED rule (boundary None) it is early everywhere —
-        // the inert-at-merge property on the validation path.
+        // RETIRED 2026-08-17: this case asserted the inert-at-merge property
+        // (shipped boundary None ⇒ a v3-bound rider block is early EVERYWHERE,
+        // refused as CommitmentMismatch). Replaced at the stamp (19,008 —
+        // lab #367, arming runbook step 0) by its armed dual: the SHIPPED
+        // happy path above the boundary, plus the same below-stamp refusal,
+        // which is all of the retired assertion that is still true.
+        //
+        // The armed happy path: the same fee-split reveal, through the real
+        // entry point (`validate_body_with_names`, real constant) above the
+        // stamped boundary. 19,100 also sits above the emission boundary, so
+        // the body must mint the exact schedule — a real armed block pays
+        // both rules, exactly like the drill-seam fixture at `h`.
+        let ha = 19_100u64;
+        let armed_view = View {
+            commits: [(names::commit_hash(&record, &salt), ha - 100)].into(),
+            names: HashMap::new(),
+        };
+        let armed_body = BlockBody {
+            txs: vec![tx.clone()],
+            coinbase: coinbase_exact(ha),
+            coinbase_rkm: MINER_RKM,
+        };
+        let armed_header = BlockHeader {
+            height: ha,
+            ..BlockHeader::child_of(
+                &BlockHeader::genesis(1, 0),
+                75,
+                1,
+                armed_body.commitment_at(ha), // the SHIPPED form, not the drill seam
+            )
+        };
+        validate_body_with_names(
+            &armed_header,
+            &armed_body,
+            &MockVerifier,
+            is_final,
+            &armed_view,
+        )
+        .expect(
+            "armed: a fee-split reveal with an in-window commit is valid above the \
+             stamped boundary through the shipped path",
+        );
+        // Below the stamp (h = 10_000 < 19_008) the shipped path still refuses
+        // the v3-bound rider block — the surviving half of the retired case.
         assert!(matches!(
             validate_body_with_names(&at(h, &body), &body, &MockVerifier, is_final, &view)
                 .unwrap_err(),
-            BodyError::CommitmentMismatch { .. } // v3-bound header under a v2 rule
+            BodyError::CommitmentMismatch { .. } // v3-bound header under the (still-)v2 rule
         ));
 
         // Fee split enforced: paying only the relay tier is a WrongFee naming

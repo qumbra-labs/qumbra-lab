@@ -3021,24 +3021,27 @@ mod tests {
     use crate::genesis::GenesisFile;
     use qlab_devnet::pow::KeccakPow;
 
-    /// Lab #367: the halt-status name-service line reads inert on the shipped
-    /// build and armed once a boundary is stamped — the two states are a
-    /// different sentence, and the shipped constant is the inert one (this is
-    /// the halt-status half of the inert-at-merge property).
+    /// Lab #367: the halt-status name-service line reads inert on a
+    /// boundary-less build and armed once a boundary is stamped — the two
+    /// states are a different sentence. Since 2026-08-17 (the stamp, arming
+    /// runbook step 0) the shipped constant is the ARMED one, so THIS build
+    /// must banner `ARMED — … above height 19008`; the inert sentence stays
+    /// exercised through the pure function (the retired shipped-state
+    /// assertion's surviving half).
     #[test]
     fn name_service_status_line_distinguishes_inert_from_armed() {
-        // The shipped build: no boundary, inert.
-        assert_eq!(qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT, None);
-        let inert = name_service_status_line(qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT);
+        // THIS build: stamped at 19,008 (lab #367), armed.
+        assert_eq!(qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT, Some(19_008));
+        let armed = name_service_status_line(qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT);
+        assert!(armed.contains("ARMED"), "{armed}");
+        assert!(armed.contains("above height 19008"), "{armed}");
+        assert!(armed.ends_with('\n'));
+
+        // A boundary-less build reads inert.
+        let inert = name_service_status_line(None);
         assert!(inert.contains("INERT"), "{inert}");
         assert!(inert.contains("refused at"), "{inert}");
         assert!(inert.ends_with('\n'));
-
-        // An armed build names the boundary height.
-        let armed = name_service_status_line(Some(9_000));
-        assert!(armed.contains("ARMED"), "{armed}");
-        assert!(armed.contains("above height 9000"), "{armed}");
-        assert!(armed.ends_with('\n'));
 
         assert_ne!(inert, armed);
     }

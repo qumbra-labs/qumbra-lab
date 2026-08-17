@@ -222,19 +222,26 @@ fn the_fee_split_is_enforced_above_the_boundary() {
 // Phase 3 — the shipped build is inert: the crossing is impossible on `main`
 // ---------------------------------------------------------------------------
 
-/// Through the SHIPPED path (`validate_body_with_names`, the real
-/// `NAME_RULE_BOUNDARY_HEIGHT = None`), a v3 rider block cannot exist: its
-/// header commits the v3 form, but the None rule expects v2 everywhere, so the
-/// header/body binding refuses it — the inert-at-merge property at the drill's
-/// own entry point, and the reason nothing arms by accident before the stamp.
+/// RETIRED name 2026-08-17: `the_shipped_boundary_makes_the_v3_crossing_impossible`
+/// — the inert-at-merge reading (shipped boundary `None` ⇒ the crossing is
+/// impossible at EVERY height). At the stamp (19,008, lab #367, arming runbook
+/// step 0) the same test carries the armed reading: through the SHIPPED path
+/// the v3 crossing stays impossible at every height at or below the stamped
+/// boundary — this drill's heights all are, so the refusal asserted here is
+/// exactly what the retired version asserted.
 #[test]
-fn the_shipped_boundary_makes_the_v3_crossing_impossible() {
-    assert_eq!(NAME_RULE_BOUNDARY_HEIGHT, None, "this drill assumes the shipped inert build");
+fn the_stamped_boundary_keeps_the_v3_crossing_impossible_below_it() {
+    assert!(
+        matches!(NAME_RULE_BOUNDARY_HEIGHT, Some(b) if B + 1 <= b),
+        "this drill's heights must sit at/below the stamped boundary \
+         (stamped: {NAME_RULE_BOUNDARY_HEIGHT:?})"
+    );
     let salt = [7u8; 32];
     let view = View { commits: [(commit_hash(&record(), &salt), B + 1 - 8)].into() };
     let body = body_of(vec![reveal_tx(0x62, salt)]);
-    // A header committing the v3 form (as an armed build would) validated under
-    // the shipped None rule: the binding is computed v2, so it mismatches.
+    // A header committing the v3 form (as a post-boundary block would) validated
+    // under the shipped rule at B + 1 ≤ 19,008: the binding is computed v2, so
+    // it mismatches — nothing below the stamp can smuggle a v3 block in.
     let v3_header = header_above(Some(B), B + 1, &body);
     assert!(matches!(
         validate_body_with_names(&v3_header, &body, &NoTx, is_final, &view),
@@ -242,14 +249,16 @@ fn the_shipped_boundary_makes_the_v3_crossing_impossible() {
     ));
 }
 
-/// A rider-free block crosses the shipped boundary unremarkably at every height
-/// — the whole point of inert: the running chain is untouched until the stamp.
+/// A rider-free block crosses the drill's test boundary unremarkably at every
+/// height — the property arming must preserve: below the stamped boundary the
+/// running chain is untouched.
 #[test]
 fn rider_free_blocks_validate_on_the_shipped_build_across_the_test_boundary() {
     let view = View { commits: HashMap::new() };
     for h in [B - 1, B, B + 1] {
         let body = body_of(vec![plain_tx(h as u8)]);
-        // The shipped rule commits v2 at every height, so a v2-bound header binds.
+        // The shipped rule commits v2 at/below the stamped 19,008 and all of
+        // this drill's heights sit below it, so a v2-bound header binds.
         let header = BlockHeader {
             height: h,
             ..BlockHeader::child_of(&BlockHeader::genesis(1, 0), 75, 1, body.commitment())

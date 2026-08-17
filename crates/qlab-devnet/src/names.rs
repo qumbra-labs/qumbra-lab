@@ -5,14 +5,17 @@
 //! dedicated diversified address · T2 placement) and `name-service-t2-brief.md`
 //! N1–N7. Task book: `docs/prompts/name-service-taskbook-DRAFT.md`.
 //!
-//! # INERT AT MERGE
+//! # INERT AT MERGE — ARMED 2026-08-17
 //!
-//! [`NAME_RULE_BOUNDARY_HEIGHT`] is `None` — the emission gate's pins-unset
-//! precedent. With no boundary, riders are invalid at every height, the body
-//! commitment is the v2 encoding everywhere, and this module changes nothing
-//! about the running chain. The boundary height is Larry's stamp at T2 arming
-//! time and arrives through the #74/#81 halt-marker machinery, exactly like
-//! `RULE_BOUNDARY_HEIGHT` did (D4's activation ordering, kept).
+//! [`NAME_RULE_BOUNDARY_HEIGHT`] merged as `None` (the emission gate's
+//! pins-unset precedent, PR #381): riders invalid at every height, the v2
+//! body commitment everywhere, zero behavior change on the running chain.
+//! **Armed 2026-08-17** (lab #367, Larry's stamp 10:25 +08, arming runbook
+//! step 0): the boundary is `Some(19_008)` — epoch 16.5's exact midpoint,
+//! the emission boundary's mid-epoch alignment precedent — and the fee table
+//! below was re-ratified exactly as merged. Below the boundary nothing
+//! changes; activation arrives through the #74/#81 halt-marker machinery,
+//! exactly like `RULE_BOUNDARY_HEIGHT` did (D4's activation ordering, kept).
 //!
 //! # What a rider is
 //!
@@ -42,12 +45,18 @@ use crate::header::Hash32;
 // ---------------------------------------------------------------------------
 
 /// The halt-height boundary above which riders become valid and the body
-/// commitment switches to its v3 encoding. **`None` = never** — merged inert.
+/// commitment switches to its v3 encoding.
+///
+/// **STAMPED `Some(19_008)`** — lab #367, Larry's ruling 2026-08-17 10:25 +08:
+/// epoch 16.5's exact midpoint (the emission boundary's mid-epoch alignment
+/// precedent), ≈4 days of runway at stamp time (tip 14,347 at ~48 blk/h).
+/// Merged `None` (inert) 2026-08-12 with PR #381; this flip is arming
+/// runbook step 0 (`docs/name-boundary-arming.md` §2).
 ///
 /// Mirrors `emission_exact::RULE_BOUNDARY_HEIGHT`'s role exactly; the
 /// `*_above` function variants are the drill seam, this constant is the
 /// shipped rule.
-pub const NAME_RULE_BOUNDARY_HEIGHT: Option<u64> = None;
+pub const NAME_RULE_BOUNDARY_HEIGHT: Option<u64> = Some(19_008);
 
 /// One bessel-denominated QMB (fees.rs precedent: 0.01 QMB = 10⁶ bessel).
 /// Cross-locked against `posted_fee` below rather than imported from a wallet
@@ -594,10 +603,16 @@ mod tests {
 
     // -- parameters ---------------------------------------------------------
 
+    // RETIRED 2026-08-17: `inert_at_merge_boundary_is_none` (the merge-day
+    // property: no boundary, no rule) — replaced by its armed dual
+    // `armed_boundary_is_the_stamped_height` below at the stamp (lab #367,
+    // arming runbook step 0).
     #[test]
-    fn inert_at_merge_boundary_is_none() {
-        // The load-bearing merge property (lab #367): no boundary, no rule.
-        assert_eq!(NAME_RULE_BOUNDARY_HEIGHT, None);
+    fn armed_boundary_is_the_stamped_height() {
+        // The load-bearing arming property (lab #367, stamped 2026-08-17
+        // 10:25 +08): the boundary is exactly Larry's stamp — 19,008, epoch
+        // 16.5's midpoint. Any other value is a different consensus rule.
+        assert_eq!(NAME_RULE_BOUNDARY_HEIGHT, Some(19_008));
     }
 
     #[test]
