@@ -1146,6 +1146,37 @@ mod tests {
         fresh.shutdown();
     }
 
+    /// Issue #459. The buffer between two node-loop drains is bounded, and the
+    /// bound is reachable: a connect flood on a public port is exactly the
+    /// condition it exists for, and it is also exactly the condition where a
+    /// silently dropped tail would read as *nothing happened*.
+    #[test]
+    fn an_overflowing_conn_journal_reports_its_own_truncation() {
+        let shared = bare_shared();
+        let over = 5;
+        for i in 0..(MAX_BUFFERED_CONN_EVENTS + over) {
+            shared.note_conn_event(ConnEvent::Accepted {
+                peer: PeerId(i as u64),
+                addr: Some(format!("10.0.0.1:{i}")),
+            });
+        }
+        let transport = TcpTransport {
+            shared: Arc::clone(&shared),
+            local_addr: "127.0.0.1:1".parse().unwrap(),
+            threads: Mutex::new(Vec::new()),
+        };
+        let drained = transport.poll_conn_events();
+        assert_eq!(drained.len(), MAX_BUFFERED_CONN_EVENTS + 1, "the cap plus one Lost record");
+        assert_eq!(
+            drained.last(),
+            Some(&ConnEvent::Lost { count: over as u64 }),
+            "the tail is counted, never silently dropped"
+        );
+        // The counter resets with the drain: the next report is about the next
+        // window, not a lifetime total an operator would double-count.
+        assert!(transport.poll_conn_events().is_empty());
+    }
+
     #[test]
     fn tcp_dial_counts_as_outbound_not_inbound() {
         let server = TcpTransport::bind("127.0.0.1:0").unwrap();

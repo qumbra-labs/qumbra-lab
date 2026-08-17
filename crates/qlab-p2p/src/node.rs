@@ -40,7 +40,9 @@ use crate::sync::{
 use crate::ticktime::{lap, TickTimings};
 use qlab_devnet::finality::next_checkpoint_height;
 use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
-use crate::transport::{ConnEvent, DialCompletion, DialStart, Transport, TransportError};
+use crate::transport::{
+    CloseReason, ConnDirection, ConnEvent, DialCompletion, DialStart, Transport, TransportError,
+};
 use crate::wire::{Envelope, Frame, MsgType};
 
 /// Service-bits placeholder advertised in the handshake (`[devnet-placeholder]`).
@@ -5067,6 +5069,87 @@ mod tests {
             line,
             "DIAL addr=10.0.0.7:9400 ms=127000 result=err err=\"transport io: connection timed out\""
         );
+    }
+
+    // ---- issue #459: the connection journal's line shapes -------------------
+
+    #[test]
+    fn the_accept_line_mirrors_dial_and_names_the_peer() {
+        // The census property in one assertion: an inbound session is greppable
+        // by the same address an operator would search for, in the same
+        // `key=value` shape `DIAL` established.
+        let line = conn_line(&ConnEvent::Accepted {
+            peer: PeerId(7),
+            addr: Some("66.96.196.8:41022".to_string()),
+        });
+        assert_eq!(line, "ACCEPT addr=66.96.196.8:41022 peer=7 dir=in result=ok");
+    }
+
+    #[test]
+    fn the_capped_out_reject_is_a_distinct_line_that_names_the_cap() {
+        // Distinct from an admitted accept (`result=capped`, no `peer=` — nothing
+        // was registered), and it carries the cap because that number is tunable
+        // at runtime, so "capped" alone would not say at what.
+        let line = conn_line(&ConnEvent::Capped {
+            addr: Some("66.96.196.8:41022".to_string()),
+            cap: 32,
+        });
+        assert_eq!(line, "ACCEPT addr=66.96.196.8:41022 dir=in result=capped cap=32");
+        assert!(!line.contains(" peer="));
+    }
+
+    #[test]
+    fn the_close_line_carries_direction_duration_and_reason() {
+        // §1's three close facts. `dir=out` is on the line too: `DIAL` records an
+        // outbound open and nothing recorded an outbound *close*, so the symmetry
+        // this issue asks for runs in both directions.
+        let inbound = conn_line(&ConnEvent::Closed {
+            peer: PeerId(7),
+            addr: Some("66.96.196.8:41022".to_string()),
+            dir: ConnDirection::In,
+            held_ms: 94_211,
+            why: CloseReason::Eof,
+        });
+        assert_eq!(inbound, "CLOSE addr=66.96.196.8:41022 peer=7 dir=in ms=94211 why=eof");
+
+        let evicted = conn_line(&ConnEvent::Closed {
+            peer: PeerId(3),
+            addr: Some("18.202.166.126:9444".to_string()),
+            dir: ConnDirection::Out,
+            held_ms: 121_000,
+            why: CloseReason::Evicted,
+        });
+        assert_eq!(evicted, "CLOSE addr=18.202.166.126:9444 peer=3 dir=out ms=121000 why=evicted");
+    }
+
+    #[test]
+    fn an_unknown_address_still_leaves_a_line() {
+        // `getpeername` can fail on a socket that died between accept and
+        // inspection. The line still exists — that is the whole property #459 is
+        // about — and the token is `stall_line`'s, so one grep habit covers both.
+        let line = conn_line(&ConnEvent::Accepted { peer: PeerId(9), addr: None });
+        assert_eq!(line, "ACCEPT addr=unknown peer=9 dir=in result=ok");
+    }
+
+    #[test]
+    fn a_truncated_journal_says_so_rather_than_reading_as_a_quiet_network() {
+        // Silent truncation presenting as completeness is a pattern this repo has
+        // paid for repeatedly. A bounded buffer that simply dropped its tail would
+        // make a connect flood — the exact condition the bound exists for — look
+        // like nobody connected.
+        let line = conn_line(&ConnEvent::Lost { count: 12 });
+        assert_eq!(line, "CONNLOST n=12");
+    }
+
+    #[test]
+    fn the_in_process_transport_reports_no_direction_rather_than_inventing_one() {
+        // The hub links two nodes symmetrically and its accepting side observes no
+        // event, so `pin=0` there would be a claim, not a measurement. `None`
+        // reaches the telemetry line as `-`.
+        let hub = InProcHub::new();
+        let t = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let n = P2pNode::new(t, stub(), [1; 32]);
+        assert_eq!(n.peer_directions(), None);
     }
 
     #[test]
