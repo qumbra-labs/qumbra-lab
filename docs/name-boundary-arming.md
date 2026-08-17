@@ -121,46 +121,53 @@ On a worktree from current `main`:
 Acceptance for step 0 = the full suite on `suite-arm64` (heavy runs stay off
 the laptop — standing rule since 2026-08-12), arithmetic reconciled.
 
-## 3. Build both images before rolling either
+## 3. Build ONE image — the resume/name-armed variant
 
-The i299 pattern verbatim (`deploy/docker`, `NODE_FEATURES` build-arg pattern
-if a feature split is used; otherwise two tags off the two commits):
+> **🔴 Superseded 2026-08-17 (ruling on [#367], option A — the original §3–§5
+> assumed a halt-mediated activation; Larry ruled NO HALT: the boundary is a
+> pure height function in the armed binary, and boundary day 8,640's three live
+> defects were all halt-machinery defects this route deliberately avoids. The
+> original halt choreography is preserved in git history at `3b6263b`; the
+> operative procedure is below.)**
 
-- **armed** — halts at the stamped height, banner says so;
-- **resume** — v3-capable past the boundary, banner says so.
-- **Push resume FIRST** (the i299 rule: the image you need in an emergency is
-  the one that must already be on GHCR).
+- Build the **`emission-resume` variant ONLY**, off the **straddle-drill-merged
+  commit** (the drill locks the live v2→v3 crossing in-suite; the published
+  image's commit must contain its own lock). Do **not** build the `armed`
+  variant for this boundary — it halts at the PASSED emission height 8,640 and
+  would halt on contact with today's chain.
+- The frozen-digest gate applies as always; `halt-status` must banner
+  `name service: ARMED — … above height 19008`.
+- The same commit feeds the public artifacts (prebuilt-binary release + GHCR):
+  strangers must be able to update to exactly what the fleet runs.
 
-## 4. Roll the armed image — ALL SIX hosts
+## 4. Roll it — ALL SIX hosts, hard deadline
 
 node0–3 **and svc0/svc1** (the 8,640 lesson: the svc hosts predate a boundary
-at their peril — the explorer observer stuck at `halted 8640` for a day was
-this exact omission). One host at a time, `slag=0` rejoin verified per host,
-R2 guard (same-height fid split) watched throughout — OPERATOR §3/§7 govern.
+at their peril). One host at a time, `slag=0` rejoin verified per host, R2
+guard (same-height fid split) watched throughout — OPERATOR §3/§7 govern. The
+§5 discard pricing block applies to THIS roll (28–30 min per discarding host,
+2–3 of six expected, 40 % a floor). **The deadline is hard: every consensus
+host must carry the armed rule WELL BEFORE the chain reaches 19,008** (~Aug 21
+at 48 blk/h) — an INERT host at the crossing forks, it does not halt. svc1's
+`telemetry_addr` fold-in + the grant-path check ride this roll.
 
-## 5. The halt, the boundary fid, the resume
+## 5. The crossing — live, no ceremony
 
-i299 §5–6 verbatim, plus the two boundary-day fixes this time arrive
-pre-merged (#360 halted-proposal maintenance, #362 REPUSH cadence):
+There is no halt, no resume wave, no boundary fid adjudication ceremony. The
+fleet crosses at height 19,009 (the boundary block itself commits v2; v3 is
+strictly above — `height > b`, locked by the boundary-split golden and the
+straddle drill). The coordinator holds the **crossing watch**:
 
-1. Net halts at the stamped height; every host banners the halt.
-2. **Coordinator adjudicates the boundary fid: 3-of-4 minimum, one identity**
-   — a split here is R2, stop everything, preserve state.
-   A **boundary-tie loser** is the separate, recoverable shape: a host is halted
-   at H, its finalized checkpoint names A, its applied tip is sibling B at H,
-   and it prints `FINALIZE refused head=state ... why=not-held`. Leave the host
-   halted and connected: the primary path re-requests A through the bounded
-   near-tip body window, rewinds once, and applies A through the normal state
-   funnel. Confirm recovery with `stip=H`, `dfin=H`, matching
-   `stipid`/`dfinbh`, `schain=main`, and `breq=0`; the minority key ledger's
-   `sid` remains B by design as the never-double-sign forensic record. If no
-   reachable peer can serve A, use the [snapshot-transplant] procedure — copy
-   only the donor's `snapshot.bin` + `blocks.log`, preserving this host's own
-   finalizer ledgers, halt marker, and config. The code path is primary; the
-   transplant is the fallback for unavailable serving or pre-#375 binaries.
-3. Resume waves per §6 (parallel where the runbook says so), svc hosts in the
-   same wave set.
-4. Chain resumes; first post-boundary checkpoint finalizes under v3 bodies.
+1. **R2 guard through 19,008±**: fid identity across the fleet, finality
+   advancing on cadence, no same-height fid split. A split here is R2 — stop
+   everything, preserve state.
+2. **First v3 block verified**: the first block above 19,008 commits v3 (the
+   explorer/opview view stays green; an INERT observer would refuse it — that
+   is the fork signature, on the WRONG side).
+3. Stranger-facing: any INERT peer walks off at 19,009 onto a dead v2 fork
+   (no committee keys, no finality). That is their update failure, not an R2 —
+   the update notice + public artifacts (§3) are the mitigation, and
+   `powrej`/peer counts may dip as INERT peers disconnect. Expected, priced.
 
 > **Measured pricing update (2026-08-17, coordinator, from T-ops's two restart
 > passes — [deploy PR #154](https://github.com/qumbra-labs/qumbra-deploy/pull/154)
