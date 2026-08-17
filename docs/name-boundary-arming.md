@@ -162,6 +162,40 @@ pre-merged (#360 halted-proposal maintenance, #362 REPUSH cadence):
    same wave set.
 4. Chain resumes; first post-boundary checkpoint finalizes under v3 bodies.
 
+> **Measured pricing update (2026-08-17, coordinator, from T-ops's two restart
+> passes — [deploy PR #154](https://github.com/qumbra-labs/qumbra-deploy/pull/154)
+> and [#156](https://github.com/qumbra-labs/qumbra-deploy/pull/156)): budget the
+> #225-class snapshot discard into every wave in this section.** Two passes,
+> ten recreates: **4 discarded to a from-genesis replay — but do not quote
+> that as one rate: split by host class it is fleet 2/8 and svc0-cbnode 2/2**
+> (T-ops's correction on [#286](https://github.com/qumbra-labs/qumbra-lab/issues/286);
+> cbnode's 2-for-2 is a flag not a finding at n=2, and it is the only
+> `mining=false`, volume-backed host — svc1 shares that compose shape, so
+> treat cbnode-class discards as expected there too). The fleet half is not
+> host-sticky (node1 restored then discarded; node2 the reverse), cannot be
+> pre-identified, and a graceful `restart` does not prevent it (pass 2's
+> fleet hosts were `restart`, node1 discarded anyway). **Mechanism, adjudicated
+> to its own issue [#453](https://github.com/qumbra-labs/qumbra-lab/issues/453):
+> the snapshot records an UNFINALIZED tip, so the discard probability tracks
+> the orphan rate at write time — and outreach opened today, so more miners
+> means MORE discards by boundary day, not fewer. Treat 40% as a floor.**
+> Measured cost at height 14.3k: **21 min**
+> (21,547 records, node1, watched live through `/v1/ready` — the surface's
+> first production validation). At H = 19,008 the log is ~40% longer:
+> **budget 28–30 min per discarding host, and expect 2–3 of the six.**
+>
+> Consequences, so nobody discovers them at H: the **armed roll (§4)
+> serializes** as written — ~2.5–3 h wall clock with the per-host gate. The
+> **resume wave here stays PARALLEL** (the i299 §6 model): it runs while the
+> chain is halted and the boundary fid already adjudicated, so a 30-min replay
+> is wall-clock, not liveness risk — but the wave's expected completion window
+> is **~30–35 min, not ~5**, and a host silent on `/v1/telemetry` for that
+> long while `/v1/ready` reports a live walk position is HEALTHY, not wedged
+> (every host serves `/v1/ready` since deploy #156; svc1 joins at the armed
+> roll's config fold-in). Root cause of the discard lottery is
+> [#286](https://github.com/qumbra-labs/qumbra-lab/issues/286)'s open lane —
+> this block prices the symptom, it does not explain it.
+
 ## 6. Verify the rule actually bound (the §7 discipline)
 
 - `qumbra-node audit-names --data-dir <dir> --from <boundary+1>` → **exit 0,
