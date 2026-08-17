@@ -253,7 +253,7 @@ jobs:
         run: |
           set -euo pipefail
           rustc -V; cargo -V; uname -m
-          ldd --version | head -1
+          ldd --version | sed -n 1p
           echo "lab revision: ${{ needs.preflight.outputs.rev }}"
 
       - name: Build the node — RESUME variant, and only the resume variant
@@ -319,7 +319,7 @@ jobs:
           # today; assert rather than assume, so an image change fails here by name
           # instead of inside a dependency's build script.
           command -v cmake >/dev/null || { echo "::error::cmake is missing from the macos-14 image — add a brew install step"; exit 1; }
-          cmake --version | head -1
+          cmake --version | sed -n 1p
 
       - name: Build the node — RESUME variant, and only the resume variant
         env:

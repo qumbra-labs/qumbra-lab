@@ -72,10 +72,10 @@ fi
 #    constants the consensus constants". A legitimate re-genesis WILL fail here
 #    until the pins in release-binaries.yml are updated — that is the point.
 # ---------------------------------------------------------------------------
-DECLARED=$(sed -n 's/^  frozen digest: //p' halt.txt | head -1)
+DECLARED=$(sed -n 's/^  frozen digest: //p' halt.txt | sed -n 1p)
 RECOMPUTED=$(sed -n '/recomputed from THIS/{n;p;}' halt.txt | tr -d ' ')
-REVISION=$(sed -n 's/^  revision:[[:space:]]*//p' halt.txt | head -1)
-DOMAIN=$(sed -n 's/^  rule domain:[[:space:]]*//p' halt.txt | head -1)
+REVISION=$(sed -n 's/^  revision:[[:space:]]*//p' halt.txt | sed -n 1p)
+DOMAIN=$(sed -n 's/^  rule domain:[[:space:]]*//p' halt.txt | sed -n 1p)
 
 [ "$DECLARED" = "$FROZEN_PIN" ] \
   || fail "FROZEN DIGEST DRIFT — the revision declares '$DECLARED', the fleet runs $FROZEN_PIN. A consensus constant moved; this binary must not be published."
@@ -95,15 +95,15 @@ grep -qE '^  validate: +OK' halt.txt \
 #    QUMBRA_BUILD_REV prints the `unstamped` sentence and must not ship as
 #    though it were stamped.
 # ---------------------------------------------------------------------------
-NODE_REV=$(sed -n 's/^  build rev:[[:space:]]*//p' halt.txt | head -1)
+NODE_REV=$(sed -n 's/^  build rev:[[:space:]]*//p' halt.txt | sed -n 1p)
 [ "$NODE_REV" = "$EXPECTED_BUILD_REV" ] \
   || fail "qumbra-node build stamp is '$NODE_REV', expected $EXPECTED_BUILD_REV. Either QUMBRA_BUILD_REV did not reach the build, or this is not the binary that was just built."
 
 echo "===== qumbra-wallet --help (header) ====="
 # The wallet prints its stamp on the first line of --help; --help exits 0.
-"$WALLET_BIN" --help 2>&1 | head -3 | tee wallet-help.txt
+"$WALLET_BIN" --help 2>&1 | sed -n '1,3p' | tee wallet-help.txt
 echo "========================================"
-WALLET_REV=$(sed -n 's/^build rev: //p' wallet-help.txt | head -1)
+WALLET_REV=$(sed -n 's/^build rev: //p' wallet-help.txt | sed -n 1p)
 [ "$WALLET_REV" = "$EXPECTED_BUILD_REV" ] \
   || fail "qumbra-wallet build stamp is '$WALLET_REV', expected $EXPECTED_BUILD_REV. The two binaries in one tarball must be from one revision — a wallet from a different build is precisely the confusion the stamp exists to prevent."
 
