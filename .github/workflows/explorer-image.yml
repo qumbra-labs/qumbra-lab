@@ -15,6 +15,16 @@
 # the binary had no piecewise straddle branch, so at RULE_BOUNDARY_HEIGHT it could
 # have shown a FALSE DIVERGENT for the straddling epoch at the upgrade moment.
 #
+# Lab #444 (2026-08-16): a second, independent defect — this workflow used to
+# publish an ARMED explorer by default (`inputs.explorer_features` empty), the
+# pre-push gate could not tell the variants apart (KNOWN_SCAR / s_atomic_exact
+# are present in BOTH), and the tag (`sha-<short>`) carried no variant. Caught
+# one edit away from re-arming the public health page ~5,000 blocks past the
+# boundary (would have been deploy #127 a third time). Fixed by mirroring
+# node-image.yml: explicit `variant` choice (safe default emission-resume),
+# pre-push assert on `v1.1-exact-emission` (present ⇔ resume), and the variant
+# in the tag (`emission-resume-*` / `armed-*`).
+#
 # THE TWO JOBS ARE DELIBERATELY ASYMMETRIC, because the failure mode and the
 # remedy have very different prices:
 #
@@ -29,7 +39,12 @@
 # WHAT `drift` CANNOT SEE, stated so nobody reads more into a green tick: it
 # compares the newest PUBLISHED image against this repo. It cannot reach svc0, so
 # "an image exists but the host was never rolled" is a different gap and this does
-# not close it. That one is `qumbra-deploy`'s to hold.
+# not close it. That one is `qumbra-deploy`'s to hold. And green means *current*,
+# never *correct variant*: for legacy `sha-*` tags the variant is not in the tag
+# (lab #444 table: sha-23e7330 was armed, sha-1651799 was resume). New tags carry
+# the variant; the alarm keys on `emission-resume-*` first (the running variant)
+# and still matches legacy `sha-*` so the currently-published pin does not go
+# invisible.
 name: explorer image
 
 on:
@@ -49,10 +64,13 @@ on:
         description: 'Type "build" to spend runner minutes on an image build. Anything else runs only the free drift check.'
         required: false
         default: ""
-      explorer_features:
-        description: 'Type "resume" to build the post-boundary variant that runs past RULE_BOUNDARY_HEIGHT. Empty builds the armed one.'
-        required: false
-        default: ""
+      variant:
+        description: 'Which explorer to cut. emission-resume is the RUNNING page variant (v1.1-exact-emission, past RULE_BOUNDARY_HEIGHT); armed is the boundary-halt announcement variant. Safe default is emission-resume — an unqualified build must never re-arm the public page (lab #444).'
+        type: choice
+        options:
+          - emission-resume
+          - armed
+        default: emission-resume
 
 concurrency:
   group: explorer-image-${{ github.ref }}
@@ -104,38 +122,68 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          # Tag convention is `sha-<short>` (deploy/docker/Dockerfile's build
-          # comment). Read tags, not config labels: an OCI index carries no
-          # labels, which cost this project a wrong provenance verdict on
-          # 2026-08-07.
-          TAGS=$(gh api "/orgs/${{ github.repository_owner }}/packages/container/qumbra-explorer/versions?per_page=50" \
-                   --jq '[.[].metadata.container.tags[]?] | map(select(startswith("sha-"))) | .[]' 2>/dev/null || true)
-          if [ -z "$TAGS" ]; then
-            echo "published=none" >> "$GITHUB_OUTPUT"
-            echo "NO published sha-* tag found"
-            exit 0
+          # Tag convention (lab #444): `emission-resume-<short>` / `armed-<short>`
+          # — the variant is in the tag, same shape as node-image.yml. Legacy
+          # `sha-<short>` tags (pre-#444) still match so the currently-published
+          # pin (svc0 runs sha-1651799 as of the issue) does not go invisible
+          # and falsely trip "no published image".
+          #
+          # The VERDICT keys on emission-resume first, then falls back to
+          # legacy sha-*. That is the variant the public page must run;
+          # `armed` is a boundary announcement artifact whose staleness
+          # endangers no running host, so it is reported but never trips the
+          # alarm. A legacy sha-* tag does not prove variant (lab #444 table),
+          # but it does prove "an image exists at this commit" — enough for
+          # the ancestry check until the next resume build lands a new tag.
+          TAGS=$(gh api "/orgs/${{ github.repository_owner }}/packages/container/qumbra-explorer/versions?per_page=100" \
+                   --jq '[.[].metadata.container.tags[]?] | .[]' 2>/dev/null || true)
+          if [ -n "$TAGS" ]; then
+            echo "published tags:"; echo "$TAGS" | sed 's/^/  /'
+          else
+            echo "no published tags readable"
           fi
-          echo "published sha-* tags:"; echo "$TAGS" | sed 's/^/  /'
-          # Newest by commit date among tags whose commit we still have.
-          BEST=""; BEST_TS=0
-          for t in $TAGS; do
-            c="${t#sha-}"
-            if git cat-file -e "$c^{commit}" 2>/dev/null; then
+          best_for() { # $1 = tag prefix; prints newest matching build commit we still have
+            local BEST="" BEST_TS=0 t c ts
+            for t in $TAGS; do
+              case "$t" in "$1"-*) c="${t#"$1"-}";; *) continue;; esac
+              if git cat-file -e "$c^{commit}" 2>/dev/null; then
+                ts=$(git log -1 --format=%ct "$c")
+                if [ "$ts" -gt "$BEST_TS" ]; then BEST_TS=$ts; BEST=$c; fi
+              fi
+            done
+            echo "$BEST"
+          }
+          # Newest among a list of prefixes (first non-empty wins for reporting
+          # which convention hit; for the fleet pin we take the absolute newest
+          # commit across resume + legacy so neither class goes invisible).
+          best_across() {
+            local BEST="" BEST_TS=0 p c ts
+            for p in "$@"; do
+              c=$(best_for "$p")
+              [ -n "$c" ] || continue
               ts=$(git log -1 --format=%ct "$c")
               if [ "$ts" -gt "$BEST_TS" ]; then BEST_TS=$ts; BEST=$c; fi
-            fi
-          done
-          echo "published=${BEST:-unknown}" >> "$GITHUB_OUTPUT"
-          echo "newest published build commit: ${BEST:-unknown}"
+            done
+            echo "$BEST"
+          }
+          FLEET=$(best_across emission-resume sha)
+          RESUME=$(best_for emission-resume)
+          LEGACY=$(best_for sha)
+          ARMED=$(best_for armed)
+          echo "fleet=${FLEET:-none}" >> "$GITHUB_OUTPUT"
+          echo "newest published fleet (emission-resume|sha-*) build commit: ${FLEET:-none}"
+          echo "  emission-resume: ${RESUME:-none}"
+          echo "  legacy sha-*:    ${LEGACY:-none}"
+          echo "newest published armed build commit: ${ARMED:-none} (informational only)"
 
       - name: Verdict
         run: |
           set -euo pipefail
           SRC='${{ steps.src.outputs.sha }}'
-          PUB='${{ steps.pub.outputs.published }}'
-          if [ "$PUB" = "none" ] || [ "$PUB" = "unknown" ]; then
-            echo "::error::No published explorer image can be matched to a commit in this repo."
-            echo "Build one:  gh workflow run 'explorer image' -f confirm=build"
+          PUB='${{ steps.pub.outputs.fleet }}'
+          if [ "$PUB" = "none" ]; then
+            echo "::error::No published explorer image (emission-resume-* or legacy sha-*) can be matched to a commit in this repo."
+            echo "Build one:  gh workflow run 'explorer image' -f confirm=build -f variant=emission-resume"
             exit 1
           fi
           # Current when the published build contains the newest
@@ -150,7 +198,7 @@ jobs:
           echo "  published : $(git rev-parse --short "$PUB")  $(git log -1 --format=%ad --date=short "$PUB")"
           echo "  needed    : $(git rev-parse --short "$SRC")  $(git log -1 --format=%ad --date=short "$SRC")"
           echo ""
-          echo "Build:  gh workflow run 'explorer image' -f confirm=build"
+          echo "Build:  gh workflow run 'explorer image' -f confirm=build -f variant=emission-resume"
           echo "Then roll it in qumbra-deploy — this job cannot see svc0 and does not"
           echo "claim the host is current. See OPERATOR.md 9.2a."
           exit 1
@@ -173,6 +221,7 @@ jobs:
       - name: Provenance
         run: |
           echo "commit   $(git rev-parse HEAD)"
+          echo "variant  ${{ inputs.variant }}"
           uname -m; nproc; free -g | head -2
           docker --version; docker buildx version
 
@@ -193,22 +242,32 @@ jobs:
           # the FLEET image's digest because a page's backend was compiled
           # (deploy/docker/Dockerfile, the capitalised note at the stage).
           # Native arm64 on an arm64 runner — no QEMU, no emulation tax.
-          # EXPLORER_FEATURES: empty builds the armed variant, which is the safe
-          # default for a manual build. Pass `resume` at dispatch to cut the
-          # post-boundary one (deploy #127 -- the asymmetry that froze the page).
-          FEATS=""
-          [ "${{ inputs.explorer_features }}" = "resume" ] && FEATS="qumbra-node/rule-boundary-resume"
-          echo "EXPLORER_FEATURES=${FEATS:-<armed default>}"
+          #
+          # Variant → EXPLORER_FEATURES (lab #444). emission-resume is the safe
+          # default at the input level; an unqualified confirm=build must never
+          # re-arm the public page. armed is the deliberate boundary-halt cut.
+          case "${{ inputs.variant }}" in
+            emission-resume)
+              FEATS="qumbra-node/rule-boundary-resume"
+              ;;
+            armed)
+              FEATS=""
+              ;;
+            *) echo "::error::unknown variant '${{ inputs.variant }}'"; exit 1 ;;
+          esac
+          TAG="${{ inputs.variant }}-$SHORT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "EXPLORER_FEATURES=${FEATS:-<armed default>}  tag=$TAG"
           docker build -f deploy/docker/Dockerfile --target runtime-explorer \
             --platform linux/arm64 --load \
             --build-arg GIT_REVISION="$REV" \
             --build-arg EXPLORER_FEATURES="$FEATS" \
-            -t "ghcr.io/${{ github.repository_owner }}/qumbra-explorer:sha-$SHORT" .
+            -t "ghcr.io/${{ github.repository_owner }}/qumbra-explorer:$TAG" .
 
       - name: The binary is what we think it is, BEFORE publishing it
         run: |
           set -euo pipefail
-          T="ghcr.io/${{ github.repository_owner }}/qumbra-explorer:sha-${{ steps.build.outputs.short }}"
+          T="ghcr.io/${{ github.repository_owner }}/qumbra-explorer:${{ steps.build.outputs.tag }}"
           # Not a smoke test — a check that the build actually recompiled. A
           # cached `build-explorer` layer produces a green build carrying an OLD
           # binary, which is the shape that hid the 4-day staleness. Assert on
@@ -220,14 +279,37 @@ jobs:
               echo "  $s = ${n:-0}"
               [ "${n:-0}" -ge 1 ] || { echo "::error::$s absent — the build did not include current source"; exit 1; }
             done'
+          # Variant gate (lab #444). KNOWN_SCAR / s_atomic_exact are present in
+          # BOTH variants, so they cannot tell armed from resume. The measured
+          # distinguisher is `v1.1-exact-emission`: present ⇔ resume, absent ⇔
+          # armed (issue #444 grep table). Same shape as node-image.yml's #397
+          # faucet-binary check. A mismatch fails BEFORE push and names both
+          # the asked-for and the detected variant.
+          docker run --rm -e VARIANT="${{ inputs.variant }}" --entrypoint sh "$T" -c '
+            set -e
+            n=$(grep -c "v1.1-exact-emission" /usr/local/bin/qumbra-explorer || true)
+            echo "  v1.1-exact-emission = ${n:-0}"
+            if [ "$VARIANT" = "emission-resume" ]; then
+              if [ "${n:-0}" -lt 1 ]; then
+                echo "::error::variant mismatch — asked for emission-resume, detected armed (v1.1-exact-emission absent). Do not push."
+                exit 1
+              fi
+              echo "variant OK: emission-resume (v1.1-exact-emission present)"
+            else
+              if [ "${n:-0}" -ge 1 ]; then
+                echo "::error::variant mismatch — asked for armed, detected emission-resume (v1.1-exact-emission present). Do not push."
+                exit 1
+              fi
+              echo "variant OK: armed (v1.1-exact-emission absent)"
+            fi'
 
       - name: Push
-        run: docker push "ghcr.io/${{ github.repository_owner }}/qumbra-explorer:sha-${{ steps.build.outputs.short }}"
+        run: docker push "ghcr.io/${{ github.repository_owner }}/qumbra-explorer:${{ steps.build.outputs.tag }}"
 
       - name: Read the provenance back from the registry
         run: |
           set -euo pipefail
-          T="ghcr.io/${{ github.repository_owner }}/qumbra-explorer:sha-${{ steps.build.outputs.short }}"
+          T="ghcr.io/${{ github.repository_owner }}/qumbra-explorer:${{ steps.build.outputs.tag }}"
           DIG=$(docker buildx imagetools inspect "$T" --format '{{.Manifest.Digest}}')
           echo "digest: $DIG"
 
@@ -299,5 +381,7 @@ jobs:
           echo ""
           echo "Pin this in qumbra-deploy/compose/docker-compose.svc-light.yml:"
           echo "  image: ghcr.io/${{ github.repository_owner }}/qumbra-explorer@$DIG"
+          echo "  (tag was: ${{ steps.build.outputs.tag }} — variant is in the tag)"
           echo "Then roll svc0 per OPERATOR.md 9.2a — dump the outgoing container's"
           echo "logs first, up -d explorer-api only, and read the epoch-1 verdict back."
+          echo "Before pinning, grep the binary for v1.1-exact-emission (lab #444)."
