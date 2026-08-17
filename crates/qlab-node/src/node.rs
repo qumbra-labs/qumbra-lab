@@ -2110,6 +2110,168 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// **The REPLAY half of the height-keyed funnel** (lab #367 / QUM-129) — the
+    /// implication PR #464 flagged as "the first thing I would test and the first
+    /// thing I would expect to surprise someone", and could not check.
+    ///
+    /// `check_stored_binding` runs on the disk-log replay path as well as on
+    /// fresh application, so height-keying it changes what an existing datadir
+    /// means. Two legs, one shared 19,008-block prefix:
+    ///
+    /// **(a) a datadir written by a FIXED armed binary above the boundary replays
+    /// correctly.** The record carries its own header height, so a v3-era block
+    /// recomputes v3 — `replay` and `open` both reproduce the live node's tip
+    /// hash and commitment root exactly.
+    ///
+    /// **(b) a datadir written by an INERT binary above the boundary, opened by a
+    /// fixed armed binary, is REFUSED at the first above-boundary block** —
+    /// loudly, naming the height, from `replay` and from `open` alike. It is NOT
+    /// the silent-fresh-start shape this repo has paid for before: the error is
+    /// `BodyCommitmentMismatch { height, expected, got }`, whose `Display` reads
+    /// `block at height 19009 does not match its header's body commitment: header
+    /// says …, body hashes to …`, and neither entry point returns a node.
+    ///
+    /// It also asserts the two layers **agree** on that block: the entry rule
+    /// (`qlab_devnet::body::check_body_binding`, which the p2p relay path and
+    /// `apply_block` both run) and this funnel produce the same
+    /// `expected`/`got` pair, v2 against v3. Before the fix they produced
+    /// opposite pairs, which is precisely what deadlocked the armed node.
+    ///
+    /// # Why it is `#[ignore]`d
+    ///
+    /// `persist::append_record` fsyncs every record, so writing the 19,008-block
+    /// prefix costs **67.6 s** (measured: `Instant::now()` around the build loop,
+    /// release, 1 sample, coordinator laptop under `scripts/rig`, ~3.5 ms/record)
+    /// against **0.21 s** for the identical chain in memory. That is a bench, not
+    /// a test, and the suite must not pay it for a property whose cheap half is
+    /// already covered — the in-memory crossing is
+    /// `qumbra-node/tests/name_boundary_drill.rs::the_live_v2_to_v3_crossing_applies_through_the_real_node`,
+    /// and the "replay refuses loudly with the height" shape is covered at low
+    /// heights by the two tamper tests above. What is only reachable here is the
+    /// v2/v3 *form* on the replay path, which needs a real above-boundary height.
+    ///
+    /// Run it deliberately:
+    /// `cargo test --release -p qlab-node --lib -- --ignored --nocapture name_boundary`
+    #[test]
+    #[ignore = "~70 s: 19k fsync'd log records. Run explicitly with --ignored (lab #367 replay legs)"]
+    fn a_v3_era_datadir_replays_and_an_inert_written_one_is_refused_at_the_boundary() {
+        use qlab_devnet::emission_exact::{coinbase_exact, RULE_BOUNDARY_HEIGHT};
+        use qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT;
+
+        const DRILL_RKM: [u64; 4] = [0xA1, 0xA2, 0xA3, 0xA4];
+        /// Empty body — no rider, no anchor, no fee, no proof — minting exactly
+        /// the schedule above the emission boundary so only the name format can
+        /// refuse it.
+        fn empty_body_at(height: u64) -> BlockBody {
+            if height > RULE_BOUNDARY_HEIGHT {
+                BlockBody { txs: vec![], coinbase: coinbase_exact(height), coinbase_rkm: DRILL_RKM }
+            } else {
+                BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [0; 4] }
+            }
+        }
+        /// The header an ARMED producer emits: committed at its own height.
+        fn honest_child(parent: &BlockHeader, body: &BlockBody) -> BlockHeader {
+            let h = BlockHeader::child_of(parent, parent.timestamp + 75, GENESIS_DIFFICULTY, [0; 32]);
+            BlockHeader { tx_body_commitment: body.commitment_at(h.height), ..h }
+        }
+
+        let b = NAME_RULE_BOUNDARY_HEIGHT
+            .expect("the boundary is stamped (lab #367 arming step 0, PR #455); with `None` this test proves nothing");
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let dir = temp_dir("name-boundary-replay-armed");
+
+        // ── the shared prefix: an ordinary v2 chain up to and including `b` ──
+        let mut node = MemNode::open(&dir, genesis.clone()).unwrap();
+        for h in 1..=b {
+            let body = empty_body_at(h);
+            let parent = node.chain.block(&node.tip_hash()).expect("tip is stored").header();
+            let header = honest_child(&parent, &body);
+            node.apply_block(header, body, &MockVerifier)
+                .unwrap_or_else(|e| panic!("honest block {h} at/below the boundary must apply: {e}"));
+        }
+        let tip_at_b = node.chain.block(&node.tip_hash()).expect("tip is stored").header();
+
+        // The INERT binary's datadir is the SAME chain up to here — it diverges
+        // only in what it writes above the boundary, so copy the log now.
+        let inert_dir = temp_dir("name-boundary-replay-inert");
+        std::fs::copy(dir.join(persist::BLOCK_LOG), inert_dir.join(persist::BLOCK_LOG)).unwrap();
+
+        // ── (a) the fixed armed binary crosses, and reads its own datadir back ──
+        let body = empty_body_at(b + 1);
+        let v3_header = honest_child(&tip_at_b, &body);
+        assert_ne!(v3_header.tx_body_commitment, body.commitment(), "b+1 commits v3");
+        node.apply_block(v3_header, body.clone(), &MockVerifier)
+            .expect("the crossing block applies on a fixed armed binary");
+        let (live_tip, live_hash, live_root, live_leaves) =
+            (node.tip_height(), node.tip_hash(), node.commitment_root(), node.commitment_count());
+        drop(node);
+
+        let replayed = MemNode::replay(&dir, genesis.clone())
+            .unwrap_or_else(|e| panic!("a v3-era datadir must replay on a fixed armed binary: {e}"));
+        assert_eq!(replayed.tip_height(), live_tip, "replay reached the crossing block");
+        assert_eq!(replayed.tip_hash(), live_hash, "…the same tip");
+        assert_eq!(replayed.commitment_root(), live_root, "…and the same state");
+        assert_eq!(replayed.commitment_count(), live_leaves);
+        let opened = MemNode::open(&dir, genesis.clone())
+            .unwrap_or_else(|e| panic!("`open` (no snapshot ⇒ same path) must agree: {e}"));
+        assert_eq!(opened.tip_hash(), live_hash);
+
+        // ── (b) the INERT binary's datadir, opened by a fixed armed binary ──
+        // What an inert build writes above the boundary: the v2 form at a v3
+        // height. It is a block its own binary applied happily.
+        let inert_header = BlockHeader {
+            tx_body_commitment: body.commitment(),
+            ..BlockHeader::child_of(&tip_at_b, tip_at_b.timestamp + 75, GENESIS_DIFFICULTY, [0; 32])
+        };
+        assert_eq!(inert_header.height, b + 1, "the first block above the boundary");
+        persist::append_record(
+            &inert_dir,
+            &LogRecord::Block(StoredBlock::from_parts(&inert_header, &body)),
+        )
+        .unwrap();
+
+        let err = match MemNode::replay(&inert_dir, genesis.clone()) {
+            Err(e) => e,
+            Ok(n) => panic!(
+                "an inert-written datadir must not be silently accepted: replay returned a node at tip {}",
+                n.tip_height()
+            ),
+        };
+        match &err {
+            NodeError::BodyCommitmentMismatch { height, expected, got } => {
+                assert_eq!(*height, b + 1, "refused at the FIRST above-boundary block");
+                assert_eq!(*expected, body.commitment(), "what the inert binary committed: v2");
+                assert_eq!(*got, body.commitment_at(b + 1), "what the armed rule requires: v3");
+                // Loud, and it names the height (this is the whole of 4(b)).
+                let msg = err.to_string();
+                assert!(
+                    msg.contains(&format!("height {}", b + 1)),
+                    "the refusal must name the height it refused at, got: {msg}"
+                );
+            }
+            other => panic!("expected the funnel's binding refusal, got {other}"),
+        }
+        // `open` refuses identically — no snapshot-shaped path recovers from it,
+        // and neither returns an empty node that would look like a fresh start.
+        assert!(matches!(
+            MemNode::open(&inert_dir, genesis),
+            Err(NodeError::BodyCommitmentMismatch { height, .. }) if height == b + 1
+        ));
+
+        // BOTH LAYERS AGREE on that block: the entry rule computes the same
+        // expected/got pair the funnel just reported (v2 committed, v3 required).
+        match qlab_devnet::body::check_body_binding(&inert_header, &body) {
+            Err(BodyError::CommitmentMismatch { expected, got }) => {
+                assert_eq!(expected, body.commitment(), "entry: same `expected` as the funnel");
+                assert_eq!(got, body.commitment_at(b + 1), "entry: same `got` as the funnel");
+            }
+            other => panic!("the entry rule must refuse the inert block too, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&inert_dir).ok();
+    }
+
     /// **A log that no path can honour still refuses, whichever loop notices
     /// first** — the load-bearing property of the #225 fall-through.
     ///
