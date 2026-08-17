@@ -23,8 +23,14 @@
 `TELEMETRY_REFRESH` 输出到 stdout。字段顺序就是 `run.rs:996` 那个 `format!`：
 
 ```
-TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= prest= uex= bdrop= unk=<n>/<n>
+TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= prest= uex= bdrop= unk=<n>/<n> cpq= dfin= fdrop= bask= dfinbh= snap= pin= pout=
 ```
+
+> **2026-08-17 更正（#459 这一棒）。** 这份清单此前止于 `unk=`，而且从写下来起就是如此：
+> `cpq`/`dfin`/`fdrop`（#204）、`bask`（#229）、`dfinbh`（#212）和 `snap`（#359）都在追加时
+> 没有更新它，所以任何拿实际输出来对照这一段的读者，都会得出「我的节点多输出了六个不该有的
+> 字段」这个结论。现在这份清单就是整行。**`snap`（#359）仍然没有自己的小节** —— 那个缺口
+> 是被上报的，不是在这里补的；§34 是本棒有资格新增的唯一一节。
 
 ⚠️ **上面是字段清单，不是一次采样。** 本文中作为「实测」引用的数值，只有标注了具体
 issue 或证据包出处的那些；其余全部由源码推导。拼一条「典型输出」出来就是一个没有口径的
@@ -361,6 +367,18 @@ node2/node3：**12 分钟涨 10 = 0.83 块/分钟**，而目标出块速率是�
 
 **在那之前：** 跨主机的 `peers=` 差异是一个**已知的、未诊断的**状态 —— 对着 #172 上报，
 不要当成新发现，也不要从这个数字向任何方向推断连通性健康。
+
+> **2026-08-17 附注（#459 这一棒）—— 上面那条「暂缓」已经过期，这一节现在是朝另一个方向
+> 陈旧了。** [`#172`](https://github.com/qumbra-labs/qumbra-lab/issues/172) **已于 2026-08-01
+> 关闭**：`6` 才是正确读数，`8` 是幸存主机上残留的死行；修复（`P2pNode::maintain` 会移除
+> 传输层已经没有句柄的那些 `PeerTable` 行）由
+> `peer_process_restart_leaves_both_sides_at_the_live_connection_count` 锁定，该测试同时钉住了
+> 期望值 —— **一个完整配置的 N 台主机网状网络，每台主机是 `2 × (N − 1)` 条活跃连接**，
+> 对每台其他主机各一条出站和一条入站。
+>
+> 本棒不会把它当初暂缓的那一整节补写出来；那是单独的一趟，说清楚这一点比写半节要便宜。
+> 但「跨主机的 `peers=` 差异是一个已知的、未诊断的状态」这句话已经不成立了，留着它会让运维
+> 对一个真实的分歧不采取行动。**下面的 §34 就是拆分这个数字的字段，而它是有文档的。**
 
 ---
 
@@ -1293,6 +1311,96 @@ FINALIZE refused head=<chain|state> h=<height> cp=<block-hash-prefix> why=<token
 `a_durable_head_that_refuses_is_counted_journalled_and_on_the_line` 与
 `the_fork_choice_head_refusing_is_reported_as_its_own_head`
 （`crates/qlab-p2p/tests/finalized_checkpoint_query.rs`）。
+
+---
+
+## 34. `pin` / `pout` —— 这些连接是谁开的（issue #459）
+
+**🟢 单独从不算告警。** 它告诉你下一步该问哪个问题，而不是自己回答一个问题。
+
+**它们说什么。** 把 `peers=`（§6）按**是哪一侧开的 socket** 拆开：
+
+- **`pin`** —— 连接由本节点**接受（accept）**的那些活跃 peer-table 行。
+- **`pout`** —— 其余部分：连接由本节点**主动拨出（dial）**的那些行。
+- **每一行上都有 `pin + pout == peers`，这是构造保证的** —— `pout` 是按余数算出来的，
+  所以三者不可能各说各话。如果你真的看到它们不相加，那是这个字段的缺陷，不是网络状态。
+
+**为什么要拆。** 一个正在被全网拨号的节点读 `peers=4`，和一个正在拨全网的节点读 `peers=4`，
+是同一个整数在描述两种相反的处境。2026-08-17 那天 node1/node2/node3/svc0 上的 9444 端口
+对 `0.0.0.0/0` 打开，而当时**没有任何一个字段会在陌生人到来时发生变化**：`peers=` 也会因
+我们自己拨号成功而变大，所以它回答不了*有没有人主动连过来*。
+
+**口径。** 打印那一刻的瞬时水位，来自传输层自己记录的「哪些句柄是我接受的」。不是计数器 ——
+它不累加，每一行都重新反映当下的真相。**不是入站连接的生命周期总数**；连上又离开的对端不在
+`pin` 里，它在 `ACCEPT`/`CLOSE` 日志里。
+
+🔴 **`-` 不是零。** `pin=- pout=-` 表示*这个传输层分不清方向* —— 仿真用的进程内传输是把两个
+节点对称地连起来的，接受的那一侧观察不到任何事件。所有已部署的节点跑的都是 TCP 传输，都会
+打印数字。真实主机上出现 `-`，那件事本身就是一个发现。
+
+🔴 **`pin` 刻意不计入的东西：已经被接受、但还没说过话的连接。** `PeerTable` 的行是由对端的
+**第一个帧**创建的，所以一个被接受之后一直沉默的 socket，既不在 `pin` 里也不在 `peers=` 里。
+这正是 `peers=` 一贯的含义，拆分与它保持一致。这样的连接并非不可见 —— 它有一条 `ACCEPT`
+行 —— 两个面回答的是不同问题：这个字段是*现在谁在跟我说话*，日志是*谁来过*。
+
+**正常值。** 在完整配置的 N 台主机网状网络上，`pin = pout = N − 1`（见 §6 的附注：每台主机
+`2 × (N − 1)` 条连接，对每个对端各一个方向）。当前四台主机的舰队就是 `pin=3 pout=3 peers=6`。
+
+| 读数 | 含义 |
+|---|---|
+| `pin=3 pout=3 peers=6` | 健康的四主机网状网络 |
+| `pin` 超过 `N − 1` | 有配置舰队之外的人连进来了 —— **这就是 T1 的信号**，不是故障 |
+| 有公网监听的主机上 `pin=0` | 本进程启动以来没有任何入站连接。安静的网络上很正常；在断定端口不可达之前，配合 `ACCEPT` 日志一起读 |
+| `pout=0` 而 `pin` 非零 | 本节点没有拨出任何连接 —— 交叉阅读 `dialable=<n>/<n>`（§17），那是地址簿，也是更直接的工具 |
+| `pin=- pout=-` | 不是 TCP 传输。出现在已部署主机上就要上报 |
+
+### 连接日志 —— `ACCEPT`、`CLOSE`、`CONNLOST`
+
+`pin`/`pout` 是水位，而这一行只承载水位。**事件**是三条 stdout 行，它们和 `DIAL` 共用
+`key=value` 的形状，以 `addr=` 作为共同的内容锚点 —— 所以 `grep addr=` 能覆盖两个方向上
+完整的连接生命周期，而每个前缀又都可以单独 grep：
+
+```
+DIAL   addr=54.83.100.21:9444 ms=68 result=ok                       # 我们开的（#137）
+ACCEPT addr=66.96.196.8:41022 peer=7 dir=in result=ok               # 它来了
+ACCEPT addr=66.96.196.8:41022 dir=in result=capped cap=32           # 在入站上限处被拒
+CLOSE  addr=66.96.196.8:41022 peer=7 dir=in ms=94211 why=eof        # 会话结束
+CONNLOST n=12                                                       # 缓冲区装不下的事件
+```
+
+- **`why=`** 取 `eof`（对端挂断）、`err`（重置、超时，或本构建拒绝的帧）或 `evicted`
+  （**我们**关的 —— 目前只有 #289 的停滞 socket 丢弃，那是一个存活性决策，从来不是对端的错）。
+- **`dir=`** 在 `CLOSE` 上也有，所以出站会话的结束和它的开始一样被记录。
+- **`result=capped`** 是自己独立的一行，因为一个到达入站上限的节点和一个根本没人拨号的节点
+  在日志上原本长得一模一样，而两者需要相反的处置。`cap=` 在行上，是因为上限可以在运行时调。
+- **`CONNLOST n=`** 在两次节点循环之间到达的事件超过 `MAX_BUFFERED_CONN_EVENTS`（256）时输出。
+  **它是这里唯一一条见到就值得上报的行**：在公网端口上，它意味着连接速率已经快到能跑赢日志，
+  它的存在就是为了让洪水不至于表现成寂静。
+
+**重建一个参与者是什么时候加入的。** `ACCEPT` 给出到达时刻；配对的 `CLOSE` 给出 `ms=`，
+也就是会话时长，于是整个区间只靠日志环就能还原 —— 这正是 `ss` 永远做不到的，因为它只回答
+*此刻谁连着*。
+
+**何时升级：** 出现 `CONNLOST`（上报）；本应安静的主机上 `pin` 持续攀升（上报 —— 它不是故障，
+它是好几个 issue 一直在等的那件事）。**以下情况绝不升级：** `pin=0`、一条 `CLOSE why=eof`、
+或单独一条 `result=capped`。
+
+**出处。** `conn_line` 与 `P2pNode::peer_directions`（`crates/qlab-p2p/src/node.rs`）；
+事件本身在 `crates/qlab-p2p/src/transport.rs`。
+
+**锁定于：** `an_established_inbound_connection_leaves_a_line_naming_the_peer`、
+`a_closed_inbound_session_leaves_a_close_line_with_duration_and_reason`、
+`a_capped_out_inbound_connection_is_its_own_distinct_line`、
+`a_connection_we_dropped_is_attributed_to_us`、
+`pin_and_pout_split_the_peer_count_by_who_opened_the_connection`
+（`crates/qlab-p2p/tests/inbound_journal.rs`）；
+`the_telemetry_line_splits_the_peer_count_by_direction`
+（`crates/qumbra-node/src/run.rs`）。
+
+**不在 wire 上。** `pin`/`pout` 只在 stdout 行上。把它们加到 `/v1/telemetry` 会改变一个既有
+surface 的字节，按 PR #315 的规则就要 bump `RPC_VERSION` —— 那意味着 `qumbra-opview`/
+`qumbra-explorer` 各要加一条 reader 列表项，外加一次全舰队滚动。所以 `qumbra-opview`
+**不**展示这个拆分；请到主机上读。
 
 ---
 

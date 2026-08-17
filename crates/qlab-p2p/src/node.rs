@@ -40,7 +40,7 @@ use crate::sync::{
 use crate::ticktime::{lap, TickTimings};
 use qlab_devnet::finality::next_checkpoint_height;
 use qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
-use crate::transport::{DialCompletion, DialStart, Transport, TransportError};
+use crate::transport::{ConnEvent, DialCompletion, DialStart, Transport, TransportError};
 use crate::wire::{Envelope, Frame, MsgType};
 
 /// Service-bits placeholder advertised in the handshake (`[devnet-placeholder]`).
@@ -59,6 +59,62 @@ fn dial_line(addr: &str, elapsed_ms: u64, result: &Result<PeerId, TransportError
         Ok(_) => format!("DIAL addr={addr} ms={elapsed_ms} result=ok"),
         Err(e) => format!("DIAL addr={addr} ms={elapsed_ms} result=err err=\"{e}\""),
     }
+}
+
+/// **The connection-lifecycle journal line** for one [`ConnEvent`] (issue #459).
+///
+/// 🔴 **The defect this closes.** `DIAL` is the record of a connection *we*
+/// opened, and until this existed there was no record of one that *arrived* —
+/// `66.96.196.8` held established 9444 sessions with node1, node2, node3 and
+/// svc0-cbnode on 2026-08-17 and its log-match count on every one of those hosts
+/// was **0**. On the day port 9444 opened to `0.0.0.0/0`, `ss` was the only
+/// inbound instrument and it answers *who is connected right now* with no
+/// history: a participant that connects and leaves between two manual checks
+/// left no trace at all, so "when did this peer first appear" was unanswerable.
+///
+/// **Three prefixes, one shape, one grep family.** `DIAL` (we opened it),
+/// `ACCEPT` (it arrived), `CLOSE` (either one ended) all carry `key=value` with
+/// `addr=` as the shared content anchor, so `grep addr=` covers the whole
+/// lifecycle in both directions while each prefix stays greppable on its own —
+/// the `^TELEMETRY` habit `deploy/docker/soak.sh` already uses keeps working
+/// unchanged.
+///
+/// **Why the capped-out refusal is its own line and not a silent drop.** A node
+/// sitting at [`crate::addrman::MAX_INBOUND`] and a node nobody is dialing emit
+/// exactly the same thing without it — nothing — and they want opposite operator
+/// responses. `cap=` is on the line because the number is tunable at runtime
+/// ([`crate::transport::TcpTransport::set_inbound_cap`]), so a line saying only
+/// "capped" would not say *at what*.
+///
+/// `addr=unknown` follows [`crate::sendstall::stall_line`]: `getpeername` can
+/// fail on a socket that died between accept and inspection, and the line still
+/// existing is the property this issue is about.
+fn conn_line(ev: &ConnEvent) -> String {
+    match ev {
+        ConnEvent::Accepted { peer, addr } => {
+            format!("ACCEPT addr={} peer={} dir=in result=ok", addr_token(addr), peer.0)
+        }
+        ConnEvent::Capped { addr, cap } => {
+            format!("ACCEPT addr={} dir=in result=capped cap={cap}", addr_token(addr))
+        }
+        ConnEvent::Closed { peer, addr, dir, held_ms, why } => format!(
+            "CLOSE addr={} peer={} dir={} ms={held_ms} why={}",
+            addr_token(addr),
+            peer.0,
+            dir.token(),
+            why.token()
+        ),
+        // Never a silent tail. The count is what the transport refused to buffer
+        // between two drains, which on a public port is the difference between
+        // "nothing happened" and "we stopped writing it down".
+        ConnEvent::Lost { count } => format!("CONNLOST n={count}"),
+    }
+}
+
+/// `addr=` rendering shared by every connection line — the `unknown` token is
+/// [`crate::sendstall::stall_line`]'s, so one grep habit covers both.
+fn addr_token(addr: &Option<String>) -> &str {
+    addr.as_deref().unwrap_or("unknown")
 }
 
 /// **How many distinct unknown envelope-type codes get a `WIRE` journal line
@@ -862,6 +918,9 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// Returns how many dials succeeded.
     pub fn maintain(&mut self, now_ms: u64) -> usize {
         let mut connected = self.finish_dials(now_ms);
+        // Issue #459, immediately after `DIAL` so the two halves of the same
+        // lifecycle land next to each other in the journal.
+        self.journal_conn_events();
         // Issue #289, and it must run BEFORE the live-handle reconcile below: a
         // connection dropped here has to be gone from `transport.peers()` by the
         // time `sync_live` runs, or the address stays "connected" in the book and
@@ -955,6 +1014,53 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             self.transport.disconnect(r.peer);
         }
         stalled.into_iter().map(|r| r.peer).collect()
+    }
+
+    /// **Journal every connection-lifecycle event the transport has recorded**
+    /// (issue #459), returning the lines emitted.
+    ///
+    /// Printed here rather than in the binary, and that is deliberate: `DIAL` is
+    /// printed from [`Self::finish_dials`] two lines above, and an inbound accept
+    /// that only appeared when a particular binary remembered to drain it would
+    /// be the same gap this issue reports, one layer up. [`Self::maintain`] calls
+    /// it, so every composition in the workspace gets the lines without wiring.
+    ///
+    /// The lines are also **returned**, because the acceptance property — *an
+    /// established inbound connection MUST leave a line* — has to be assertable,
+    /// and stdout is not. A caller that goes through `maintain` consumes the
+    /// events there; a test asserting on them calls this directly.
+    pub fn journal_conn_events(&mut self) -> Vec<String> {
+        let lines: Vec<String> =
+            self.transport.poll_conn_events().iter().map(conn_line).collect();
+        for line in &lines {
+            println!("{line}");
+        }
+        lines
+    }
+
+    /// **Established connections split by who opened them** — `(pin, pout)`,
+    /// issue #459 — or `None` when the transport cannot know.
+    ///
+    /// `peers=` has always been one number, so an operator watching it could not
+    /// tell a node the net is dialing from a node dialing the net: those are the
+    /// same integer and opposite situations, and on a public port the first is
+    /// the thing worth knowing.
+    ///
+    /// **The two numbers sum to `peers=` by construction** — `pin` is the live
+    /// peer-table rows the transport also calls inbound, and `pout` is the
+    /// remainder — so the three fields can never disagree on the same line.
+    ///
+    /// 🔴 **What `pin` deliberately does not count: an accepted socket that has
+    /// not spoken yet.** A peer-table row is created by a peer's *first frame*
+    /// (see [`Self::tick`]), so a connection that is accepted and then says
+    /// nothing is on its `ACCEPT` line and in no count at all. That is exactly
+    /// what `peers=` has always meant and this keeps the three consistent; the
+    /// `ACCEPT`/`CLOSE` pair is where a silent connection is visible.
+    pub fn peer_directions(&self) -> Option<(u64, u64)> {
+        let inbound: HashSet<PeerId> = self.transport.inbound_peers()?.into_iter().collect();
+        let total = self.peers.len() as u64;
+        let pin = self.peers.all_peers().iter().filter(|p| inbound.contains(p)).count() as u64;
+        Some((pin, total - pin))
     }
 
     /// Apply connector-thread results on the main loop. The completion timestamp
@@ -2900,7 +3006,9 @@ fn build_announce_parts(txs: &[TxEntry], nonce: u64) -> (Vec<PrefilledTx>, Vec<[
 mod tests {
     use super::*;
     use crate::n1::{BlockIngest, ChainView, CheckpointIngest, CommitteeControl, StubNode, TxPool};
-    use crate::transport::{InProcHub, InProcTransport, TcpTransport};
+    use crate::transport::{
+        CloseReason, ConnDirection, InProcHub, InProcTransport, TcpTransport,
+    };
     use qlab_devnet::body::TxPublic;
     use qlab_devnet::committee::{devnet_committee, CommitteeState, MemberStatus, Validator};
     use qlab_devnet::ebbflow::{EquivocationEvidence, FinalityStatus};
@@ -4961,6 +5069,87 @@ mod tests {
             line,
             "DIAL addr=10.0.0.7:9400 ms=127000 result=err err=\"transport io: connection timed out\""
         );
+    }
+
+    // ---- issue #459: the connection journal's line shapes -------------------
+
+    #[test]
+    fn the_accept_line_mirrors_dial_and_names_the_peer() {
+        // The census property in one assertion: an inbound session is greppable
+        // by the same address an operator would search for, in the same
+        // `key=value` shape `DIAL` established.
+        let line = conn_line(&ConnEvent::Accepted {
+            peer: PeerId(7),
+            addr: Some("66.96.196.8:41022".to_string()),
+        });
+        assert_eq!(line, "ACCEPT addr=66.96.196.8:41022 peer=7 dir=in result=ok");
+    }
+
+    #[test]
+    fn the_capped_out_reject_is_a_distinct_line_that_names_the_cap() {
+        // Distinct from an admitted accept (`result=capped`, no `peer=` — nothing
+        // was registered), and it carries the cap because that number is tunable
+        // at runtime, so "capped" alone would not say at what.
+        let line = conn_line(&ConnEvent::Capped {
+            addr: Some("66.96.196.8:41022".to_string()),
+            cap: 32,
+        });
+        assert_eq!(line, "ACCEPT addr=66.96.196.8:41022 dir=in result=capped cap=32");
+        assert!(!line.contains(" peer="));
+    }
+
+    #[test]
+    fn the_close_line_carries_direction_duration_and_reason() {
+        // §1's three close facts. `dir=out` is on the line too: `DIAL` records an
+        // outbound open and nothing recorded an outbound *close*, so the symmetry
+        // this issue asks for runs in both directions.
+        let inbound = conn_line(&ConnEvent::Closed {
+            peer: PeerId(7),
+            addr: Some("66.96.196.8:41022".to_string()),
+            dir: ConnDirection::In,
+            held_ms: 94_211,
+            why: CloseReason::Eof,
+        });
+        assert_eq!(inbound, "CLOSE addr=66.96.196.8:41022 peer=7 dir=in ms=94211 why=eof");
+
+        let evicted = conn_line(&ConnEvent::Closed {
+            peer: PeerId(3),
+            addr: Some("18.202.166.126:9444".to_string()),
+            dir: ConnDirection::Out,
+            held_ms: 121_000,
+            why: CloseReason::Evicted,
+        });
+        assert_eq!(evicted, "CLOSE addr=18.202.166.126:9444 peer=3 dir=out ms=121000 why=evicted");
+    }
+
+    #[test]
+    fn an_unknown_address_still_leaves_a_line() {
+        // `getpeername` can fail on a socket that died between accept and
+        // inspection. The line still exists — that is the whole property #459 is
+        // about — and the token is `stall_line`'s, so one grep habit covers both.
+        let line = conn_line(&ConnEvent::Accepted { peer: PeerId(9), addr: None });
+        assert_eq!(line, "ACCEPT addr=unknown peer=9 dir=in result=ok");
+    }
+
+    #[test]
+    fn a_truncated_journal_says_so_rather_than_reading_as_a_quiet_network() {
+        // Silent truncation presenting as completeness is a pattern this repo has
+        // paid for repeatedly. A bounded buffer that simply dropped its tail would
+        // make a connect flood — the exact condition the bound exists for — look
+        // like nobody connected.
+        let line = conn_line(&ConnEvent::Lost { count: 12 });
+        assert_eq!(line, "CONNLOST n=12");
+    }
+
+    #[test]
+    fn the_in_process_transport_reports_no_direction_rather_than_inventing_one() {
+        // The hub links two nodes symmetrically and its accepting side observes no
+        // event, so `pin=0` there would be a claim, not a measurement. `None`
+        // reaches the telemetry line as `-`.
+        let hub = InProcHub::new();
+        let t = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let n = P2pNode::new(t, stub(), [1; 32]);
+        assert_eq!(n.peer_directions(), None);
     }
 
     #[test]

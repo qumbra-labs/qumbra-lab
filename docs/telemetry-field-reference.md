@@ -28,8 +28,17 @@ The line is emitted to stdout every `TELEMETRY_REFRESH` interval by
 order is the `format!` at `run.rs:996`:
 
 ```
-TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= prest= uex= bdrop= unk=<n>/<n>
+TELEMETRY tip= final= stall= age_s= diff= peers= mempool= epoch= regime= halt= hignore= powrej= dialable=<n>/<n> rounds= rfail= fid= sslot= sid= rback= stip= slag= uanchor= mready= stipid= schain= breq= fback= prest= uex= bdrop= unk=<n>/<n> cpq= dfin= fdrop= bask= dfinbh= snap= pin= pout=
 ```
+
+> **Corrected 2026-08-17 (the #459 baton).** This list previously ended at
+> `unk=`, and had done since it was written: `cpq`/`dfin`/`fdrop` (#204),
+> `bask` (#229), `dfinbh` (#212) and `snap` (#359) all appended without it being
+> updated, so a reader checking a live line against this block would have
+> concluded their node was emitting six fields it should not. The list is now the
+> whole line. **`snap` (#359) still has no section of its own** — that gap is
+> reported, not filled here; §34 is the only new row this baton is entitled to
+> write.
 
 ⚠️ **That is the field list, not a capture.** The only values quoted in this
 document as observed are the ones attributed to a named issue or evidence pack;
@@ -426,6 +435,22 @@ visible. This section will be written when #172 lands.
 **Until then:** a cross-host `peers=` discrepancy is a **known, undiagnosed
 condition** — report it against #172, do not treat it as a new finding, and do
 not infer connectivity health from the number in either direction.
+
+> **Dated pointer, 2026-08-17 (the #459 baton) — the deferral above has expired
+> and this row is now stale in the other direction.** [`#172`
+> ](https://github.com/qumbra-labs/qumbra-lab/issues/172) **closed on
+> 2026-08-01**: `6` was the correct reading and `8` was the survivor holding dead
+> rows, and the fix (`P2pNode::maintain` removing a `PeerTable` row the transport
+> no longer has a handle for) is test-locked by
+> `peer_process_restart_leaves_both_sides_at_the_live_connection_count`, which
+> also pins the expected value — **a fully configured N-host mesh is `2 × (N − 1)`
+> live connections per host**, one outbound and one inbound to each other host.
+>
+> This baton is not writing the full row it deferred; that is a separate pass and
+> saying so is cheaper than a half-written one. But the sentence *"a cross-host
+> `peers=` discrepancy is a known, undiagnosed condition"* is no longer true, and
+> leaving it would tell an operator not to act on a real divergence. **§34 below
+> is the field that splits this number, and it is documented.**
 
 ---
 
@@ -1536,6 +1561,116 @@ the refusal it is reporting is `not-held`.**
 `a_durable_head_that_refuses_is_counted_journalled_and_on_the_line` and
 `the_fork_choice_head_refusing_is_reported_as_its_own_head`
 (`crates/qlab-p2p/tests/finalized_checkpoint_query.rs`).
+
+---
+
+## 34. `pin` / `pout` — who opened the connections (issue #459)
+
+**🟢 Never an alarm on its own.** It is the field that tells you *which* question
+to ask next, not one that answers a question by itself.
+
+**What they say.** `peers=` (§6) split by **which side opened the socket**:
+
+- **`pin`** — live peer-table rows whose connection this node **accepted**.
+- **`pout`** — the remainder: rows for connections this node **dialed**.
+- **`pin + pout == peers` on every line, by construction** — `pout` is computed as
+  the remainder, so the three cannot drift apart. If you ever see them not sum,
+  that is a defect in this field and not a network condition.
+
+**Why the split exists.** `peers=4` on a node the net is dialing and `peers=4` on
+a node dialing the net are the same integer describing opposite situations. On
+2026-08-17 port 9444 opened to `0.0.0.0/0` on node1/node2/node3/svc0 and there
+was no field anywhere that would move when a stranger arrived: `peers=` moves for
+our own successful dials too, so it could not answer *did anybody come to us*.
+
+**Caliper.** An instantaneous level at print time, computed from the transport's
+own record of which handles it accepted. Not a counter — it does not accumulate
+and it resets to the live truth on every line. **Not a lifetime total of inbound
+connections**; a peer that connected and left is not in `pin`, it is in the
+`ACCEPT`/`CLOSE` journal (below).
+
+🔴 **`-` is not zero.** `pin=- pout=-` means *this transport cannot tell the
+directions apart* — the in-process transport used by simulations links two nodes
+symmetrically and its accepting side observes no event. Every deployed node runs
+the TCP transport and prints numbers. A `-` on a real host would itself be the
+finding.
+
+🔴 **What `pin` deliberately does not count: a connection that has been accepted
+and has not spoken.** A `PeerTable` row is created by a peer's **first frame**, so
+a socket that is accepted and then stays silent is in neither `pin` nor `peers=`.
+That is what `peers=` has always meant and the split is kept consistent with it.
+The connection is not invisible — it has an `ACCEPT` line — and the two surfaces
+answer different questions: this field is *who is talking to me right now*, the
+journal is *who arrived*.
+
+**Normal value.** On a fully configured N-host mesh, `pin = pout = N − 1` (§6's
+dated pointer: `2 × (N − 1)` connections per host, one of each direction to each
+peer). On the current four-host fleet that is `pin=3 pout=3 peers=6`.
+
+| reading | what it means |
+|---|---|
+| `pin=3 pout=3 peers=6` | the healthy four-host mesh |
+| `pin` above `N − 1` | somebody outside the configured fleet is connecting in — **the T1 signal**, not a fault |
+| `pin=0` on a host with a public listener | nothing has connected in since this process started. Fine on a quiet net; read it with the `ACCEPT` journal before concluding the port is unreachable |
+| `pout=0` with `pin` nonzero | this node has dialed nothing — cross-read `dialable=<n>/<n>` (§17), which is the address book and the more direct instrument for that |
+| `pin=- pout=-` | not a TCP transport. On a deployed host, report it |
+
+### The connection journal — `ACCEPT`, `CLOSE`, `CONNLOST`
+
+`pin`/`pout` are levels, and this line carries only levels. The **events** are
+three stdout lines that share `DIAL`'s `key=value` shape, with `addr=` as the
+common content anchor — so `grep addr=` covers the whole connection lifecycle in
+both directions, and each prefix stays greppable on its own:
+
+```
+DIAL   addr=54.83.100.21:9444 ms=68 result=ok                       # we opened it (#137)
+ACCEPT addr=66.96.196.8:41022 peer=7 dir=in result=ok               # it arrived
+ACCEPT addr=66.96.196.8:41022 dir=in result=capped cap=32           # refused at the inbound cap
+CLOSE  addr=66.96.196.8:41022 peer=7 dir=in ms=94211 why=eof        # the session ended
+CONNLOST n=12                                                       # events the buffer could not hold
+```
+
+- **`why=`** is `eof` (the peer hung up), `err` (reset, timeout, or a frame this
+  build refused) or `evicted` (**we** closed it — today only #289's stalled-socket
+  drop, which is a liveness decision and never a peer fault).
+- **`dir=`** is on `CLOSE` too, so an outbound session's end is journalled as well
+  as its start.
+- **`result=capped`** is its own line because a node at its inbound cap and a node
+  nobody is dialing otherwise look identical, and want opposite responses. `cap=`
+  is on the line because the cap is tunable at runtime.
+- **`CONNLOST n=`** is emitted when more than `MAX_BUFFERED_CONN_EVENTS` (256)
+  events arrive between two node-loop passes. **It is the one line here that is
+  worth reporting on sight**: on a public port it means a connect rate high enough
+  to outrun the journal, and it exists so a flood cannot present as silence.
+
+**Reconstructing when a participant joined.** `ACCEPT` gives the arrival; the
+matching `CLOSE` gives `ms=`, the session's duration, so the interval is
+recoverable from the log ring alone — which is what `ss` could never do, since it
+answers only *who is connected right now*.
+
+**Escalate when:** `CONNLOST` appears (report); `pin` climbs and stays climbing on
+a host that should be quiet (report — it is not a fault, it is the thing several
+issues have been waiting for). **Never on:** `pin=0`, a `CLOSE why=eof`, or a
+`result=capped` line on its own.
+
+**Source.** `conn_line` and `P2pNode::peer_directions`
+(`crates/qlab-p2p/src/node.rs`); the events themselves
+(`crates/qlab-p2p/src/transport.rs`).
+
+**Locked by:** `an_established_inbound_connection_leaves_a_line_naming_the_peer`,
+`a_closed_inbound_session_leaves_a_close_line_with_duration_and_reason`,
+`a_capped_out_inbound_connection_is_its_own_distinct_line`,
+`a_connection_we_dropped_is_attributed_to_us`,
+`pin_and_pout_split_the_peer_count_by_who_opened_the_connection`
+(`crates/qlab-p2p/tests/inbound_journal.rs`);
+`the_telemetry_line_splits_the_peer_count_by_direction`
+(`crates/qumbra-node/src/run.rs`).
+
+**Not on the wire.** `pin`/`pout` are on the stdout line only. Adding them to
+`/v1/telemetry` would change an existing surface's bytes and so bump
+`RPC_VERSION` under the PR #315 rule — which costs a reader-list entry in
+`qumbra-opview`/`qumbra-explorer` and a fleet roll. `qumbra-opview` therefore does
+**not** show this split; read it on the host.
 
 ---
 

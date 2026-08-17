@@ -79,6 +79,97 @@ pub struct DialCompletion {
     pub result: Result<PeerId, TransportError>,
 }
 
+/// Which side opened a connection (issue #459).
+///
+/// **We dialed it** vs **it arrived**, decided by the socket that produced the
+/// handle and never re-derived afterwards. The distinction is the whole of #459:
+/// [`DialCompletion`] already journals every outbound open, and until this type
+/// existed there was no fact anywhere in the process that an inbound one had
+/// happened at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnDirection {
+    /// This node accepted the connection.
+    In,
+    /// This node dialed out.
+    Out,
+}
+
+impl ConnDirection {
+    /// The `dir=` token on the journal line.
+    pub fn token(self) -> &'static str {
+        match self {
+            ConnDirection::In => "in",
+            ConnDirection::Out => "out",
+        }
+    }
+}
+
+/// Why a session ended (issue #459) — the `why=` token on the close line.
+///
+/// Three outcomes and not two, because "the peer hung up" and "we dropped it"
+/// are different operational events and an operator reading a close line at 3am
+/// should not have to correlate it with a `SENDSTALL` line to tell them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseReason {
+    /// The remote closed cleanly — the socket returned end-of-file.
+    Eof,
+    /// The read failed: a reset, a timeout, or a frame this build refused
+    /// ([`read_frame`] fails the connection on a malformed header).
+    Err,
+    /// **We** closed it — [`Transport::disconnect`], which today has exactly one
+    /// caller ([`crate::node::P2pNode::drop_stalled_connections`], issue #289).
+    Evicted,
+}
+
+impl CloseReason {
+    /// The `why=` token on the journal line.
+    pub fn token(self) -> &'static str {
+        match self {
+            CloseReason::Eof => "eof",
+            CloseReason::Err => "err",
+            CloseReason::Evicted => "evicted",
+        }
+    }
+}
+
+/// **One connection-lifecycle fact the node loop has not journalled yet**
+/// (issue #459).
+///
+/// Same shape of contract as [`DialCompletion`]: the transport records the fact
+/// on whichever thread observed it (the acceptor, or a reader thread at EOF) and
+/// the *node loop* drains and prints it, so the ordering of the journal is the
+/// loop's and no log line is ever emitted from a socket thread.
+///
+/// `addr` is `Option` everywhere for one reason: `getpeername` can fail on a
+/// socket that died between accept and inspection. An unknown address is printed
+/// as `addr=unknown`, following [`crate::sendstall::stall_line`] — the line still
+/// exists, which is the property #459 is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnEvent {
+    /// An inbound connection the accept path admitted, past the inbound cap.
+    Accepted { peer: PeerId, addr: Option<String> },
+    /// An inbound connection **refused at the cap** — closed at accept, never
+    /// registered, no reader thread. Its own event because a node at its cap and
+    /// a node nobody is dialing look identical without it.
+    Capped { addr: Option<String>, cap: usize },
+    /// A session ended, in either direction.
+    Closed {
+        peer: PeerId,
+        addr: Option<String>,
+        dir: ConnDirection,
+        held_ms: u64,
+        why: CloseReason,
+    },
+    /// Events dropped because the buffer between two drains filled
+    /// ([`MAX_BUFFERED_CONN_EVENTS`]).
+    ///
+    /// 🔴 **Synthesised at drain time so a bounded buffer can never read as a
+    /// quiet network.** Silent truncation presenting as completeness is a pattern
+    /// this repo has been bitten by repeatedly (the light-client scan, #309/#312,
+    /// was the ninth instance and the first found by a user's real money).
+    Lost { count: u64 },
+}
+
 /// A frame mover. Send delivers one whole frame to a peer; poll drains all
 /// frames received since the last call (with the local peer handle they came
 /// from). Both are non-blocking.
@@ -104,6 +195,29 @@ pub trait Transport {
     /// [`Transport::dial`] and have nothing to report here.
     fn poll_dials(&self) -> Vec<DialCompletion> {
         Vec::new()
+    }
+
+    /// **Drain connection-lifecycle events** (issue #459) — accepts, capped-out
+    /// refusals, and session closes, for the node loop to journal.
+    ///
+    /// Exactly [`Transport::poll_dials`]'s contract, and for the same reason: the
+    /// facts happen on the acceptor and reader threads, and the journal is the
+    /// node loop's. A transport with no accept path reports nothing, which keeps
+    /// every deterministic in-process sim byte-identical in its output.
+    fn poll_conn_events(&self) -> Vec<ConnEvent> {
+        Vec::new()
+    }
+
+    /// **The live handles this transport ACCEPTED**, or `None` when it cannot
+    /// know (issue #459).
+    ///
+    /// `None` is the honest answer for [`InProcTransport`]: the hub links two
+    /// nodes symmetrically and the accepting side observes no event, so a
+    /// direction reported there would be invented. The caller must render that as
+    /// unknown rather than folding it into "outbound" — `pin=0` on a node holding
+    /// four inbound sessions is a worse lie than `pin=-`.
+    fn inbound_peers(&self) -> Option<Vec<PeerId>> {
+        None
     }
 
     /// The remote endpoint behind a local handle, if this transport knows one
@@ -430,10 +544,21 @@ struct TcpShared {
     /// Maximum simultaneous inbound connections; over it, a connection is closed
     /// at accept rather than absorbed.
     inbound_cap: AtomicU64,
-    /// Remote endpoint per handle (issue #91) — the accept path used to discard
-    /// this, which left an inbound connection with no stable identity to key a
-    /// rate budget on.
-    remote_addrs: Mutex<HashMap<PeerId, String>>,
+    /// What is known about each live connection: remote endpoint (issue #91 — the
+    /// accept path used to discard this, which left an inbound connection with no
+    /// stable identity to key a rate budget on), which side opened it, and when
+    /// (issue #459 — a close line without a duration cannot distinguish a peer
+    /// that stayed an hour from one that hung up on the handshake).
+    conns: Mutex<HashMap<PeerId, ConnMeta>>,
+    /// Handles [`Transport::disconnect`] closed, so the reader thread that is
+    /// about to observe the shutdown reports [`CloseReason::Evicted`] rather than
+    /// attributing our own decision to the peer. Written **before** the socket is
+    /// shut down, so the reader cannot lose the race.
+    evicting: Mutex<HashSet<PeerId>>,
+    /// Connection-lifecycle events awaiting the node loop (issue #459).
+    conn_events: Mutex<Vec<ConnEvent>>,
+    /// Events refused by [`MAX_BUFFERED_CONN_EVENTS`] since the last drain.
+    conn_events_lost: AtomicU64,
     /// Frames refused because the receive queue was full.
     dropped: AtomicU64,
     /// Addresses with a connector thread currently waiting in DNS/TCP setup.
@@ -450,9 +575,42 @@ struct TcpShared {
     stall_window_ms: AtomicU64,
 }
 
+/// What the transport knows about one live connection.
+struct ConnMeta {
+    /// The remote endpoint, when `getpeername` answered.
+    addr: Option<String>,
+    /// Which side opened it.
+    dir: ConnDirection,
+    /// [`TcpShared::now_ms`] at registration — the base for the close line's
+    /// `ms=`.
+    opened_ms: u64,
+}
+
+/// **How many connection events may wait between two node-loop drains**
+/// (issue #459). `[devnet-placeholder]`, testnet-tunable, NOT frozen.
+///
+/// The bound exists because the producer is the network and the consumer is one
+/// call per `maintain` pass, and the measured main-loop period on the deployed
+/// hosts has been as bad as 131 s (#107). 256 is ~2 events/s across a whole bad
+/// pass, comfortably past anything the four-peer mesh does and far short of what
+/// a connect flood on a public 9444 could do — which is why exceeding it emits
+/// [`ConnEvent::Lost`] instead of quietly dropping the tail.
+pub const MAX_BUFFERED_CONN_EVENTS: usize = 256;
+
 impl TcpShared {
     fn alloc_id(&self) -> PeerId {
         PeerId(self.next_id.fetch_add(1, Ordering::SeqCst))
+    }
+
+    /// Buffer one connection event for the node loop, or count it lost.
+    fn note_conn_event(&self, ev: ConnEvent) {
+        let mut buf = self.conn_events.lock().unwrap();
+        if buf.len() >= MAX_BUFFERED_CONN_EVENTS {
+            drop(buf);
+            self.conn_events_lost.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
+        buf.push(ev);
     }
 
     fn now_ms(&self) -> u64 {
@@ -506,7 +664,10 @@ impl TcpTransport {
             next_id: AtomicU64::new(1),
             inbound: Mutex::new(HashSet::new()),
             inbound_cap: AtomicU64::new(crate::addrman::MAX_INBOUND as u64),
-            remote_addrs: Mutex::new(HashMap::new()),
+            conns: Mutex::new(HashMap::new()),
+            evicting: Mutex::new(HashSet::new()),
+            conn_events: Mutex::new(Vec::new()),
+            conn_events_lost: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             dialing: Mutex::new(HashSet::new()),
             dial_completions: Mutex::new(Vec::new()),
@@ -522,14 +683,23 @@ impl TcpTransport {
             let handle = std::thread::spawn(move || {
                 while shared.running.load(Ordering::SeqCst) {
                     match listener.accept() {
-                        Ok((stream, _peer_addr)) => {
+                        Ok((stream, peer_addr)) => {
                             // Inbound cap (scope 6): at the limit the connection is
                             // CLOSED here — refused, not absorbed. No reader thread,
                             // no writer entry, no peer-table row.
+                            //
+                            // Issue #459: it does leave a record now. A node at its
+                            // cap and a node nobody is dialing produced identical
+                            // logs — which is to say, no log at all — and the two
+                            // want opposite operator responses.
                             let cap = shared.inbound_cap.load(Ordering::SeqCst) as usize;
                             if shared.inbound_live() >= cap {
                                 let _ = stream.shutdown(std::net::Shutdown::Both);
                                 drop(stream);
+                                shared.note_conn_event(ConnEvent::Capped {
+                                    addr: Some(peer_addr.to_string()),
+                                    cap,
+                                });
                                 continue;
                             }
                             TcpTransport::register_stream(&shared, stream, true);
@@ -673,29 +843,67 @@ impl TcpTransport {
         // peer address on the floor, so an inbound peer had no identity that
         // survived its socket — and a rate budget keyed on something that does not
         // survive the socket is reset by reconnecting.
-        if let Ok(peer) = stream.peer_addr() {
-            shared.remote_addrs.lock().unwrap().insert(id, peer.to_string());
+        let addr = stream.peer_addr().ok().map(|p| p.to_string());
+        let dir = if inbound { ConnDirection::In } else { ConnDirection::Out };
+        let opened_ms = shared.now_ms();
+        shared
+            .conns
+            .lock()
+            .unwrap()
+            .insert(id, ConnMeta { addr: addr.clone(), dir, opened_ms });
+        // Issue #459. Only the inbound half is announced here: an outbound open is
+        // already journalled by `DIAL`, from the completion the connector thread
+        // publishes, and a second line for the same event would double-count every
+        // dial in an operator's grep.
+        if inbound {
+            shared.note_conn_event(ConnEvent::Accepted { peer: id, addr });
         }
 
         let reader_shared = Arc::clone(shared);
         let mut read_stream = stream;
         let handle = std::thread::spawn(move || {
-            loop {
+            let why = loop {
                 match read_frame(&mut read_stream) {
                     Ok(frame) => {
                         if !reader_shared.running.load(Ordering::SeqCst) {
-                            break;
+                            break CloseReason::Eof;
                         }
                         reader_shared.queue_frame(id, frame);
                     }
-                    Err(_) => break, // EOF, shutdown, or malformed frame
+                    // EOF, shutdown, or malformed frame. `read_exact` reports a
+                    // clean hang-up as `UnexpectedEof`; everything else — reset,
+                    // timeout, a header this build refused — is a failure, and the
+                    // two are different enough operationally to keep apart.
+                    Err(e) => {
+                        break if e.kind() == io::ErrorKind::UnexpectedEof {
+                            CloseReason::Eof
+                        } else {
+                            CloseReason::Err
+                        };
+                    }
                 }
-            }
+            };
             // Connection gone: drop the write half so sends fail fast, and free
             // the inbound slot it held.
             reader_shared.writers.lock().unwrap().remove(&id);
             reader_shared.inbound.lock().unwrap().remove(&id);
-            reader_shared.remote_addrs.lock().unwrap().remove(&id);
+            let meta = reader_shared.conns.lock().unwrap().remove(&id);
+            // Our own `disconnect` beat the peer to it: report what we did, not
+            // what the socket looked like afterwards.
+            let why = if reader_shared.evicting.lock().unwrap().remove(&id) {
+                CloseReason::Evicted
+            } else {
+                why
+            };
+            if let Some(meta) = meta {
+                reader_shared.note_conn_event(ConnEvent::Closed {
+                    peer: id,
+                    addr: meta.addr,
+                    dir: meta.dir,
+                    held_ms: reader_shared.now_ms().saturating_sub(meta.opened_ms),
+                    why,
+                });
+            }
         });
         // The reader-thread handle is intentionally detached from `threads`: it
         // exits when the socket is shut down (see `shutdown`).
@@ -743,7 +951,25 @@ impl Transport for TcpTransport {
         std::mem::take(&mut *self.shared.dial_completions.lock().unwrap())
     }
     fn peer_addr(&self, id: PeerId) -> Option<String> {
-        self.shared.remote_addrs.lock().unwrap().get(&id).cloned()
+        self.shared.conns.lock().unwrap().get(&id).and_then(|c| c.addr.clone())
+    }
+    /// Issue #459. Anything the bound refused since the last drain is appended as
+    /// a [`ConnEvent::Lost`], so the journal reports its own truncation rather
+    /// than letting a dropped tail read as a quiet network.
+    fn poll_conn_events(&self) -> Vec<ConnEvent> {
+        let mut events = std::mem::take(&mut *self.shared.conn_events.lock().unwrap());
+        let lost = self.shared.conn_events_lost.swap(0, Ordering::SeqCst);
+        if lost > 0 {
+            events.push(ConnEvent::Lost { count: lost });
+        }
+        events
+    }
+    fn inbound_peers(&self) -> Option<Vec<PeerId>> {
+        let writers = self.shared.writers.lock().unwrap();
+        let mut v: Vec<PeerId> =
+            self.shared.inbound.lock().unwrap().iter().copied().filter(|id| writers.contains_key(id)).collect();
+        v.sort();
+        Some(v)
     }
     fn dropped_frames(&self) -> u64 {
         self.shared.dropped.load(Ordering::SeqCst)
@@ -771,6 +997,11 @@ impl Transport for TcpTransport {
     fn disconnect(&self, id: PeerId) {
         let writer = self.shared.writers.lock().unwrap().remove(&id);
         if let Some(w) = writer {
+            // Marked BEFORE the shutdown: the reader thread reads this flag on
+            // its way out, so the close is attributed to us and not to the peer
+            // (issue #459). Doing it after would be a race we would lose most of
+            // the time on a loopback socket.
+            self.shared.evicting.lock().unwrap().insert(id);
             // Unblocks the reader thread, which then clears the rest of this
             // handle's rows (inbound slot, remote address) exactly as it does for
             // a peer that hung up on us.
@@ -915,6 +1146,37 @@ mod tests {
         fresh.shutdown();
     }
 
+    /// Issue #459. The buffer between two node-loop drains is bounded, and the
+    /// bound is reachable: a connect flood on a public port is exactly the
+    /// condition it exists for, and it is also exactly the condition where a
+    /// silently dropped tail would read as *nothing happened*.
+    #[test]
+    fn an_overflowing_conn_journal_reports_its_own_truncation() {
+        let shared = bare_shared();
+        let over = 5;
+        for i in 0..(MAX_BUFFERED_CONN_EVENTS + over) {
+            shared.note_conn_event(ConnEvent::Accepted {
+                peer: PeerId(i as u64),
+                addr: Some(format!("10.0.0.1:{i}")),
+            });
+        }
+        let transport = TcpTransport {
+            shared: Arc::clone(&shared),
+            local_addr: "127.0.0.1:1".parse().unwrap(),
+            threads: Mutex::new(Vec::new()),
+        };
+        let drained = transport.poll_conn_events();
+        assert_eq!(drained.len(), MAX_BUFFERED_CONN_EVENTS + 1, "the cap plus one Lost record");
+        assert_eq!(
+            drained.last(),
+            Some(&ConnEvent::Lost { count: over as u64 }),
+            "the tail is counted, never silently dropped"
+        );
+        // The counter resets with the drain: the next report is about the next
+        // window, not a lifetime total an operator would double-count.
+        assert!(transport.poll_conn_events().is_empty());
+    }
+
     #[test]
     fn tcp_dial_counts_as_outbound_not_inbound() {
         let server = TcpTransport::bind("127.0.0.1:0").unwrap();
@@ -937,7 +1199,10 @@ mod tests {
             next_id: AtomicU64::new(1),
             inbound: Mutex::new(HashSet::new()),
             inbound_cap: AtomicU64::new(crate::addrman::MAX_INBOUND as u64),
-            remote_addrs: Mutex::new(HashMap::new()),
+            conns: Mutex::new(HashMap::new()),
+            evicting: Mutex::new(HashSet::new()),
+            conn_events: Mutex::new(Vec::new()),
+            conn_events_lost: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             dialing: Mutex::new(HashSet::new()),
             dial_completions: Mutex::new(Vec::new()),
