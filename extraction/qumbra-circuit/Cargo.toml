@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/qlab-air", "crates/qlab-consensus"]
+
+[workspace.package]
+edition = "2021"
+# Dual-licensed, the Rust-ecosystem norm. The private lab this was extracted
+# from carries `license = "UNLICENSED"`; that is the ONE license-metadata
+# difference between this tree and its origin, and it is deliberate.
+license = "MIT OR Apache-2.0"
+# Not published to crates.io yet — the names `qlab-air` / `qlab-consensus` are
+# unregistered and the API is prototype-grade. Flip this when the design
+# stabilises; nothing else here depends on it.
+publish = false
+
+[profile.release]
+# Left at cargo's defaults on purpose. Every proof size and timing quoted in
+# README.md was measured under the default release profile; a local override
+# here would silently invalidate them.

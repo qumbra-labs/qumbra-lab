@@ -1,0 +1,22 @@
+[package]
+name = "qlab-air"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Pinned exactly at 0.6.1, matching qlab-bench (bench discipline). `qlab-bench`
+# is the private lab's measurement harness and is NOT part of this extraction;
+# the pin it refers to is the `=0.6.1` below, which Cargo.lock resolves to the
+# same versions + checksums the lab's own lock does (README §"What this pins").
+p3-air = "=0.6.1"
+p3-field = "=0.6.1"
+p3-matrix = "=0.6.1"
+
+[dev-dependencies]
+# Published Keccak-f used as the authority the reference implementation
+# is cross-checked against.
+p3-keccak = "=0.6.1"
+p3-koala-bear = "=0.6.1"
+p3-symmetric = "=0.6.1"

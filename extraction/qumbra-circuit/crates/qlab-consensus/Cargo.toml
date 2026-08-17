@@ -1,0 +1,38 @@
+[package]
+name = "qlab-consensus"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Single source of truth for the Qumbra consensus STARK configuration — the
+# field/hash/FRI plumbing, the FROZEN consensus FriCfg (b16/q21/g22/fp16/a16),
+# and the prove/verify wrappers over the 2×2 bucket AIR. Extracted from the
+# qlab-bench binary (issue #38, F1 from the wallet demo) so qlab-bench, qlab-demo,
+# and the qlab-node stack all agree byte-for-byte instead of reconstructing it.
+
+[dependencies]
+qlab-air = { path = "../qlab-air" }
+
+# Plonky3, pinned exactly at 0.6.1 (bench discipline: the wire bytes are only
+# meaningful against a fixed prover — see Cargo.lock). Must match qlab-bench.
+p3-air = "=0.6.1"
+p3-challenger = "=0.6.1"
+p3-commit = "=0.6.1"
+p3-dft = "=0.6.1"
+p3-field = "=0.6.1"
+p3-fri = "=0.6.1"
+p3-keccak = "=0.6.1"
+p3-koala-bear = "=0.6.1"
+p3-matrix = "=0.6.1"
+p3-maybe-rayon = { version = "=0.6.1", features = ["parallel"] }
+p3-merkle-tree = "=0.6.1"
+p3-symmetric = "=0.6.1"
+p3-uni-stark = "=0.6.1"
+
+[dev-dependencies]
+# The byte-identical wire regression (148,625 B) serializes a real proof.
+# (This comment read 145,609 B in the lab — the pre-mint figure. The authority
+# is `consensus_wire_is_148625_bytes` in src/lib.rs, which the mint moved and
+# this comment did not; corrected here rather than shipped stale.)
+bincode = "1"
