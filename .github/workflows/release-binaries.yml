@@ -138,6 +138,15 @@ env:
   RULE_BOUNDARY_HEIGHT: "8640"
   PUBLIC_REPO: qumbra-labs/qumbra
 
+# Every run step assumes bash (`set -euo pipefail`). On ubuntu/macos runners bash
+# is the default, but inside a job `container:` the runner falls back to `sh`
+# (dash), which rejects `-o pipefail` — the first dispatch died exactly there
+# (run 31990079176, linux-aarch64 leg, before any build work). One default,
+# workflow-wide: bash exists in rust:1.95-bookworm and on every hosted runner.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   preflight:
     name: the free checks — secret, target repo, tag
