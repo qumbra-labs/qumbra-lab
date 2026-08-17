@@ -22,6 +22,14 @@
 # reads `$NODE_BIN halt-status` can be pointed at a captured fixture, and a step
 # buried in YAML on a paid runner cannot.
 #
+# 🔴 IF A THIRD BINARY EVER JOINS THE TARBALL, IT NEEDS ITS OWN CHECK HERE. This
+# gate interrogates `qumbra-node` for the resume variant and both binaries for the
+# build stamp — nothing more. #397 is precisely the shape of what gets missed: a
+# crate that COMPOSES qumbra-node (the faucet, the explorer) inherits its default,
+# which is ARMED, and no build arg aimed at `-p qumbra-node` reaches it. Adding
+# qumbra-explorer or qumbra-faucet to a release tarball without adding an assertion
+# for it would ship that same silent arming to strangers.
+#
 # Inputs, all required — no defaults, deliberately. A default pin is a pin nobody
 # notices going stale.
 set -euo pipefail
