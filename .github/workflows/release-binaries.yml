@@ -354,7 +354,7 @@ jobs:
           retention-days: 7
 
   publish:
-    name: publish to ${{ github.event.inputs.publish }} on the public repo
+    name: publish (${{ inputs.publish }}) to the public repo
     needs: [preflight, linux, macos]
     runs-on: ubuntu-latest
     timeout-minutes: 20
