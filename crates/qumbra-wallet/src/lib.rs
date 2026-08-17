@@ -86,6 +86,41 @@
 //! wallet derives its own notes' nullifiers with the spend path's own
 //! derivation, and matches locally.
 
+/// The source revision this binary was built from, stamped at compile time by the
+/// release lane (`.github/workflows/release-binaries.yml`) via `QUMBRA_BUILD_REV`.
+///
+/// The wallet ships in the same tarball as `qumbra-node` (lab #437) and a tarball
+/// carries no OCI label, so this is the only way a downloaded `qumbra-wallet` can
+/// say what it is. Deliberately the same env var and the same wording as
+/// `qumbra_node::release::BUILD_REV` (not a code dependency — this crate runs no
+/// node): a stranger comparing the two binaries in one archive should see one
+/// string, not two vocabularies. `None` is the honest answer for every build that
+/// is not a release build.
+pub const BUILD_REV: Option<&str> = option_env!("QUMBRA_BUILD_REV");
+
+/// The `--help` header's build-provenance line. Never empty; see [`BUILD_REV`].
+pub fn build_rev_line() -> String {
+    match BUILD_REV {
+        Some(rev) => rev.to_string(),
+        None => "unstamped — not built by the release lane".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod build_rev_tests {
+    /// The release lane greps this string out of `qumbra-wallet --help` to prove the
+    /// artifact matches the revision the release notes claim. A build that stopped
+    /// emitting it would turn that check into a grep that finds nothing.
+    #[test]
+    fn the_build_provenance_line_is_never_empty() {
+        assert!(!super::build_rev_line().is_empty());
+        match super::BUILD_REV {
+            None => assert!(super::build_rev_line().contains("unstamped")),
+            Some(rev) => assert_eq!(super::build_rev_line(), rev),
+        }
+    }
+}
+
 pub mod bundle;
 pub mod coinbase;
 pub mod contacts;

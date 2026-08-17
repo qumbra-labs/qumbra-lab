@@ -1,0 +1,14 @@
+qumbra-node halt-status (issue #74)
+  release:      qumbra-node v1.1 (exact-decimal emission, resumes past the rule boundary)
+  build rev:    BUILDREV
+  halt plan:    no halt scheduled
+  revision:     v1.1-exact-emission
+  frozen digest: 0000000000000000000000000000000000000000000000000000000000000000
+  rule domain:  56447169ab09956fcb78e8fb79a7cf2b502bd42194960226f83da2fb64db20b0
+  resumes past: height 8640 (post-halt rules apply above it)
+  halt marker:  none on disk (this node has never halted)
+  name service: INERT — no boundary in this build; riders refused at every height (#367)
+  snapshot:     not read — pass --config to report this data dir's snapshot (#359)
+  frozen digest (recomputed from THIS binary's constants):
+    a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b
+  validate:     OK — this release is startable
