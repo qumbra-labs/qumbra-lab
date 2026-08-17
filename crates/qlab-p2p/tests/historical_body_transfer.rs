@@ -733,11 +733,20 @@ fn an_out_of_order_window_keeps_the_full_ask_width() {
         behind.tick(now);
     }
     assert_eq!(slag(&behind), 39, "nothing applied yet — the frontier is withheld");
+    // Amended 2026-08-17 (lab #427): this read `1` — "15 buffered bodies are 15
+    // satisfied asks; only the frontier is still owed". The satisfaction half is
+    // unchanged and still load-bearing (the 15 asks WERE cleared — without that
+    // this window would still read 16). What changed is what the freed slots do:
+    // they refill AHEAD of the buffered span instead of idling behind the
+    // withheld frontier. The old `1` was the fossil of the applied-tip-anchored
+    // ask set, which is what held the live joiner to ~1.3 blk/s: every window's
+    // unserved residue parked the whole pipeline for one or more 15 s re-ask
+    // rungs. The test's own title is the property — the ask width stays FULL.
     assert_eq!(
         behind.body_requests(),
-        1,
-        "15 buffered bodies are 15 satisfied asks; only the frontier is still owed \
-         (before the fix this read 16, and after a drain the window collapsed to 1)"
+        MAX_BODIES_IN_FLIGHT,
+        "15 buffered bodies are 15 satisfied asks, and the freed slots refill \
+         ahead of the span: the frontier plus 15 fetch-ahead asks"
     );
 
     // The frontier arrives: the whole buffered span drains in one pass.
