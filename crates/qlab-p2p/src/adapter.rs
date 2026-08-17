@@ -1889,15 +1889,38 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// Mine a child of `parent_hash` (must be a known header). Shared by the
     /// healthy fork-choice path and the #200 state-tip path so the two cannot
     /// drift on timestamp / difficulty / seed selection.
+    ///
+    /// # The body commitment is keyed to the CANDIDATE's height (lab #367)
+    ///
+    /// `BlockBody::commitment()` is the "v2 regardless of height" form; above
+    /// `NAME_RULE_BOUNDARY_HEIGHT` an armed node's entry rule requires the v3
+    /// form, so a producer committing v2 there emits a header its own network
+    /// (and, since the funnel was height-keyed too, its own state machine)
+    /// refuses. PR #464 measured that deadlock; this is the producer half of
+    /// the fix. The height used is the candidate's — `parent.height + 1`, which
+    /// is exactly what [`BlockHeader::child_of`] assigns and what every
+    /// validator will read back off the mined header. It is asserted below
+    /// rather than assumed, because a divergence here is silent (a valid PoW
+    /// header nobody can apply) and free to check.
+    ///
+    /// Note the template's own `height` (`state.tip_height() + 1`) is NOT the
+    /// key: under the #200 state-tip exemption the parent may be the state tip
+    /// while fork choice is elsewhere, and the header's height is the only one
+    /// consensus reads.
     fn mine_on_parent(&mut self, parent_hash: Hash32) -> Option<(BlockHeader, BlockBody)> {
         let template =
             self.mempool.assemble(&self.state, SOAK_EFFECTIVE_MEDIAN, self.miner_rkm);
         let body = template.body;
-        let bc = body.commitment();
         let parent = *self.chain.header(&parent_hash)?;
+        let candidate_height = parent.height + 1;
+        let bc = body.commitment_at(candidate_height);
         let difficulty = expected_difficulty(&self.chain, &parent_hash, self.block_time)?;
         let timestamp = self.next_timestamp(&parent);
         let candidate = BlockHeader::child_of(&parent, timestamp, difficulty, bc);
+        assert_eq!(
+            candidate.height, candidate_height,
+            "the mined header's height must be the height its body commitment was keyed to"
+        );
         let seed = pow_seed(&self.chain, &parent_hash, candidate.height, self.schedule)?;
         let mined =
             mine_under(&self.pow, candidate, self.nonce_budget, &seed, &self.rules)?;

@@ -556,8 +556,33 @@ fn hex8(h: &Hash32) -> String {
 /// body commitment, so the exemption is deleted rather than special-cased and
 /// genesis is checked exactly like every other block — see
 /// `qlab_devnet::body::tests::genesis_header_binds_its_empty_body`.
+///
+/// # Height-keyed since lab #367 (PR #464's finding, fixed by QUM-129)
+///
+/// The recompute is [`qlab_devnet::body::BlockBody::commitment_at`] **at the
+/// block's own height**, not the bare `commitment()` — the "v2 regardless of
+/// height" form whose own doc comment reserves it for pre-boundary blocks,
+/// tests and the compat golden. While this seam was height-blind an ARMED node
+/// (`NAME_RULE_BOUNDARY_HEIGHT = Some(19_008)`) refused **every** block above
+/// the boundary, its own production included: the entry rule
+/// (`validate_body_with_names` → `check_body_binding`) demanded the v3
+/// commitment and this funnel demanded v2, so no block of any shape satisfied
+/// both. It cost nothing below the boundary and everything above it, which is
+/// how it survived the arming review.
+///
+/// The height is `block.header.height` — the same field the error below
+/// reports, and the same one `check_body_binding` reads on the entry side, so
+/// both layers now compute the identical expectation for the identical block.
+/// That agreement is asserted end-to-end by
+/// `qumbra-node/tests/name_boundary_drill.rs`.
+///
+/// **On replay this is what makes a v3-era datadir readable**: a logged block
+/// carries its own height, so a v3 block recomputes v3 and every pre-boundary
+/// block recomputes v2 byte-identically to before. A log written by an INERT
+/// binary above the boundary (v2 bytes at a v3 height) is refused here —
+/// loudly, naming the height — rather than silently starting fresh.
 fn check_stored_binding(block: &StoredBlock) -> Result<(), NodeError> {
-    let got = block.body().commitment();
+    let got = block.body().commitment_at(block.header.height);
     if block.header.tx_body_commitment != got {
         return Err(NodeError::BodyCommitmentMismatch {
             height: block.header.height,
