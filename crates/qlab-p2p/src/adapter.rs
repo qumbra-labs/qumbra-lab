@@ -6484,6 +6484,123 @@ mod tests {
     /// two places rather than a silent `off-finality`. What a test *can* pin is the
     /// output side — that the four tokens are distinct, non-empty, and that none of
     /// them is the word this issue exists to retire.
+    // --- lab #367 / QUM-129: the PRODUCER across the stamped name boundary ---
+
+    /// 🟢 **Producer symmetry: what this node mines above the boundary, this
+    /// node (and every armed peer) accepts** — asserted end-to-end, mine →
+    /// validate → apply, not by construction.
+    ///
+    /// PR #464 reported `mine_on_parent`'s height-blind `body.commitment()` **by
+    /// inspection** and said so plainly: "if you want the producer's behaviour
+    /// itself pinned, it is not pinned." This pins it. A real
+    /// [`NodeAdapter`] — the producer `qumbra-node` runs — is driven from
+    /// genesis to the **stamped** `NAME_RULE_BOUNDARY_HEIGHT` and across it:
+    ///
+    /// - the block it mines at `b + 1` commits `commitment_at(b + 1)`, the **v3**
+    ///   form, not the v2 form it emitted before the fix (both asserted, so a
+    ///   regression cannot pass by the two forms coinciding);
+    /// - `ingest_block` — the single insert/apply path, which runs the entry rule
+    ///   (`validate_body`) *and* then the `apply_state` funnel — accepts it;
+    /// - the consensus tip AND the state tip both reach `b + 1`, so neither layer
+    ///   is the one that refused;
+    /// - production continues above the boundary (`b + 2`, `b + 3`).
+    ///
+    /// **The committee/finality half** the QUM-128 dispatch wanted is here too,
+    /// at the scale this scaffolding supports: a real 7-member devnet committee
+    /// signs a checkpoint **below** the boundary and another **above** it, both
+    /// verified through the unchanged `ingest_checkpoint` quorum path, and the
+    /// node's finalized height advances *across* the format change. It is one
+    /// node's view of a committee, not a TCP mesh — the live multi-host crossing
+    /// is T-ops's roll, and `run.rs`'s D1/D2/D3 drills own the mesh side.
+    ///
+    /// Cheap enough for the suite because it is the **producer** that is
+    /// expensive to fake, not the PoW: `genesis_difficulty: 1` makes each mine a
+    /// single hash while leaving every consensus rule (emission exactness above
+    /// 8,640, payee, binding, fork choice) fully in force.
+    ///
+    /// Mutation checks: revert `mine_on_parent` to `body.commitment()` → the
+    /// `V3_FORM` assertion fails at `b + 1` (and, if it were removed, `ingest`
+    /// then rejects "bad body"); key it to `template.height` instead of the
+    /// candidate's height → identical here, which is why the code asserts the
+    /// two agree rather than relying on it.
+    #[test]
+    fn the_fixed_producer_mines_across_the_stamped_boundary_and_its_own_node_applies_it() {
+        use qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT;
+
+        let b = NAME_RULE_BOUNDARY_HEIGHT
+            .expect("the boundary is stamped (lab #367 arming step 0, PR #455); with `None` this test proves nothing");
+        assert!(b <= 200_000, "stamped boundary {b} is past this test's in-suite ceiling");
+
+        let (cstate, validators) = committee7();
+        // Difficulty 1: the PoW is not what is under test, the commitment form is.
+        let cfg = SimConfig { genesis_difficulty: 1, ..sim() };
+        let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, cfg);
+        a.set_miner_rkm([0xA1, 0xA2, 0xA3, 0xA4]);
+        let g = a.chain().genesis_block_hash();
+        a.state_mut().finalize(g).expect("finalize genesis");
+
+        // ── mine an ordinary chain up to and including the boundary block ──
+        for h in 1..=b {
+            let (header, body) = a.mine_block().unwrap_or_else(|| panic!("mine at {h}"));
+            assert_eq!(header.height, h);
+            assert_eq!(
+                header.tx_body_commitment,
+                body.commitment(),
+                "at/below the boundary the producer commits the v2 form — the live chain is untouched"
+            );
+            assert_eq!(a.ingest_block(header, body), IngestOutcome::Accepted, "block {h}");
+        }
+        assert_eq!(a.chain().tip_height(), b);
+        assert_eq!(a.state().tip_height(), b, "the state machine kept up");
+
+        // ── finality BELOW the boundary, through the real quorum path ──
+        let cp_below = Checkpoint::new(b, a.chain().tip_hash(), a.chain().tip_hash());
+        let votes_below: Vec<Vote> =
+            validators[..5].iter().map(|v| v.sign_checkpoint(&cp_below)).collect();
+        assert_eq!(a.ingest_checkpoint(cp_below, votes_below), IngestOutcome::Accepted);
+        assert_eq!(a.state().finalized_height(), Some(b), "finalized at the boundary block");
+
+        // ── the CROSSING, produced by this node ──
+        let (header, body) = a.mine_block().expect("the producer must mine above the boundary");
+        assert_eq!(header.height, b + 1);
+        // V3_FORM — the assertion the pre-fix producer fails.
+        assert_eq!(
+            header.tx_body_commitment,
+            body.commitment_at(b + 1),
+            "the producer must commit the form the rule requires at the candidate's height"
+        );
+        assert_ne!(
+            header.tx_body_commitment,
+            body.commitment(),
+            "…and above the boundary that form is NOT the v2 one — if these coincide \
+             this test cannot tell a fixed producer from the broken one"
+        );
+        // Entry rule AND funnel, in the one call the live node uses.
+        assert_eq!(
+            a.ingest_block(header, body),
+            IngestOutcome::Accepted,
+            "the node this block was mined by must accept it"
+        );
+        assert_eq!(a.chain().tip_height(), b + 1, "consensus tip crossed");
+        assert_eq!(a.state().tip_height(), b + 1, "…and so did the state machine");
+
+        // ── production continues, and finality crosses the format change ──
+        for h in (b + 2)..=(b + 3) {
+            let (header, body) = a.mine_block().unwrap_or_else(|| panic!("mine at {h}"));
+            assert_eq!(header.tx_body_commitment, body.commitment_at(h), "v3 above the boundary");
+            assert_eq!(a.ingest_block(header, body), IngestOutcome::Accepted, "block {h}");
+        }
+        let cp_above = Checkpoint::new(b + 3, a.chain().tip_hash(), a.chain().tip_hash());
+        let votes_above: Vec<Vote> =
+            validators[..5].iter().map(|v| v.sign_checkpoint(&cp_above)).collect();
+        assert_eq!(a.ingest_checkpoint(cp_above, votes_above), IngestOutcome::Accepted);
+        assert_eq!(
+            a.state().finalized_height(),
+            Some(b + 3),
+            "finality advanced ACROSS the v2→v3 boundary — no halt, no re-sync"
+        );
+    }
+
     #[test]
     fn no_refusal_token_is_a_placeholder_and_none_of_them_collide() {
         let all = [
