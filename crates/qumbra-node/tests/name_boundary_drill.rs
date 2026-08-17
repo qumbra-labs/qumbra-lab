@@ -65,9 +65,20 @@
 //! [`the_live_v2_to_v3_crossing_applies_through_the_real_node`], and the two
 //! flanking tests that pinned the deadlock and its blast radius are kept, with
 //! the deadlock one extended to assert **both layers now agree** on the same
-//! block instead of contradicting each other. Phase 5 adds the replay half the
-//! finding flagged and could not check: a datadir written across the boundary
-//! by a fixed armed binary, and one written above it by an INERT binary.
+//! block instead of contradicting each other.
+//!
+//! Two halves of that crossing live where their code lives, not here, because
+//! neither is reachable from an integration test in this crate:
+//!
+//! - the **producer** (mine → validate → apply at `b + 1`, plus a real
+//!   committee's finality advancing across the boundary) —
+//!   `qlab_p2p::adapter::tests::the_fixed_producer_mines_across_the_stamped_boundary_and_its_own_node_applies_it`
+//!   (`ingest_block` is a private inherent method);
+//! - the **replay** legs PR #464 flagged (a v3-era datadir replays; an
+//!   inert-written one is refused loudly at the first above-boundary block) —
+//!   `qlab_node::node::tests::a_v3_era_datadir_replays_and_an_inert_written_one_is_refused_at_the_boundary`,
+//!   `#[ignore]`d because writing a 19k-record log fsyncs every record
+//!   (`persist::append_record` is crate-private besides).
 //!
 //! Phases 1–3 above are untouched.
 
