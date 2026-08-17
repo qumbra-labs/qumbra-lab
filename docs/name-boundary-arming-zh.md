@@ -140,8 +140,15 @@ i299 §5–6 照抄，另加这次已预先合并的两个边界日修复（#360
 > [deploy PR #154](https://github.com/qumbra-labs/qumbra-deploy/pull/154) 与
 > [#156](https://github.com/qumbra-labs/qumbra-deploy/pull/156)):本节每一波都要把
 > #225 类快照弃用预算进去。**两轮共十次 recreate:**4 次弃用、退回从 genesis 重放
-> (约 40%),且不是同几台主机**(node1 前一晚恢复、当天弃用;node2 相反)——这个
-> 抽签不粘主机、无法预判,优雅 `restart` 也防不住。高度 14.3k 实测代价:**21 分钟**
+> ——但**不要引成一个总率:按主机类拆开是舰队 2/8、svc0-cbnode 2/2**(T-ops 在
+> [#286](https://github.com/qumbra-labs/qumbra-lab/issues/286) 的更正;cbnode 两中两
+> 在 n=2 下是旗标不是结论,但它是唯一 `mining=false`、volume 存储的主机——svc1 与它
+> compose 形状相同,那里出现 cbnode 类弃用应视为预期)。舰队半边确实不粘主机
+> (node1 前一晚恢复、当天弃用;node2 相反)、无法预判,优雅 `restart` 也防不住
+> (第二轮舰队走的就是 `restart`,node1 照样弃用)。**机制已裁决拆出独立 issue
+> [#453](https://github.com/qumbra-labs/qumbra-lab/issues/453):快照钉的是未终局
+> tip,弃用概率跟随写入时刻的孤块率——而外宣今天开了,矿工越多孤块率越高,
+> 到边界日弃用只会更多不会更少。把 40% 当下限看。**高度 14.3k 实测代价:**21 分钟**
 > (21,547 条记录,node1,全程经 `/v1/ready` 直播——该表面的首次生产验证)。到
 > H = 19,008 日志约长 40%:**每台弃用主机预算 28–30 分钟,六台预期中签 2–3 台。**
 >

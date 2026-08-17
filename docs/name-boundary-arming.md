@@ -166,10 +166,20 @@ pre-merged (#360 halted-proposal maintenance, #362 REPUSH cadence):
 > passes — [deploy PR #154](https://github.com/qumbra-labs/qumbra-deploy/pull/154)
 > and [#156](https://github.com/qumbra-labs/qumbra-deploy/pull/156)): budget the
 > #225-class snapshot discard into every wave in this section.** Two passes,
-> ten recreates: **4 discarded to a from-genesis replay (~40%), and NOT the
-> same hosts** (node1 restored then discarded; node2 the reverse) — the
-> lottery is not host-sticky, cannot be pre-identified, and a graceful
-> `restart` does not prevent it. Measured cost at height 14.3k: **21 min**
+> ten recreates: **4 discarded to a from-genesis replay — but do not quote
+> that as one rate: split by host class it is fleet 2/8 and svc0-cbnode 2/2**
+> (T-ops's correction on [#286](https://github.com/qumbra-labs/qumbra-lab/issues/286);
+> cbnode's 2-for-2 is a flag not a finding at n=2, and it is the only
+> `mining=false`, volume-backed host — svc1 shares that compose shape, so
+> treat cbnode-class discards as expected there too). The fleet half is not
+> host-sticky (node1 restored then discarded; node2 the reverse), cannot be
+> pre-identified, and a graceful `restart` does not prevent it (pass 2's
+> fleet hosts were `restart`, node1 discarded anyway). **Mechanism, adjudicated
+> to its own issue [#453](https://github.com/qumbra-labs/qumbra-lab/issues/453):
+> the snapshot records an UNFINALIZED tip, so the discard probability tracks
+> the orphan rate at write time — and outreach opened today, so more miners
+> means MORE discards by boundary day, not fewer. Treat 40% as a floor.**
+> Measured cost at height 14.3k: **21 min**
 > (21,547 records, node1, watched live through `/v1/ready` — the surface's
 > first production validation). At H = 19,008 the log is ~40% longer:
 > **budget 28–30 min per discarding host, and expect 2–3 of the six.**
