@@ -98,6 +98,11 @@ expect pass "a stamped resume build" halt-status-resume.txt "$BUILD_REV" "$BUILD
 # would do the same to every stranger who downloads it, with no operator able to fix it.
 expect fail "an ARMED build (a bare cargo build)" halt-status-armed.txt "$BUILD_REV" "$BUILD_REV"
 
+# The dual of the emission check since #367's no-halt crossing: a binary whose NAME
+# service is inert forks silently at 19,009 and must not ship (run 32011357820's
+# lesson inverted — "ARMED" on the name line is required, not poison).
+expect fail "a name-inert build (pre-135078c tree)" halt-status-name-inert.txt "$BUILD_REV" "$BUILD_REV"
+
 # Frozen-digest drift, both halves — the declared value and the one recomputed from
 # the binary's own constants. node-image.yml checks both because they fail
 # differently: a stale revision string vs constants that moved under it.
