@@ -1,0 +1,4 @@
+# Cargo.lock is COMMITTED here on purpose — see README §"Dependency pinning".
+# A fresh resolve silently moves p3-util off 0.6.1, and proof bytes are only
+# meaningful against a fixed prover.
+/target
