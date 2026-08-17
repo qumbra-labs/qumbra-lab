@@ -100,41 +100,43 @@ reveal / renew），区块 body 换 **v3 编码**承诺（第一次经由 halt �
 第 0 步的验收 = `suite-arm64` 上的全量套件（重负载不落笔记本——2026-08-12 起
 的常规），算术逐项对账。
 
-## 3. 滚动之前把两个镜像都建好
+## 3. 只构建一个镜像——resume/名字-armed 变体
 
-i299 模式照抄（`deploy/docker`；若用特性开关则走 `NODE_FEATURES` build-arg
-模式，否则两个提交出两个 tag）：
+> **🔴 2026-08-17 取代([#367] 裁决,选项 A——原 §3–§5 假定经 halt 激活;Larry 裁定
+> 不 halt:边界在 armed 二进制里是纯高度函数,且 8,640 边界日的三个活体缺陷全是
+> halt 机制自身的缺陷,本路线刻意绕开。原 halt 编排保留在 git 历史 `3b6263b`;
+> 现行程序见下。)**
 
-- **armed** —— 在盖章高度 halt，横幅写明；
-- **resume** —— 边界之后具备 v3 能力，横幅写明。
-- **先推 resume**（i299 规矩：紧急时刻需要的镜像必须已经在 GHCR 上）。
+- **只构建 `emission-resume` 变体**,基于**合入 straddle drill 的 commit**(该 drill
+  在套件内锁死不停机 v2→v3 交叉;发布镜像的 commit 必须自带这把锁)。**不要**为本
+  边界构建 `armed` 变体——它在已通过的排放高度 8,640 停机,碰到今天的链就会
+  halt-on-contact。
+- 冻结摘要门禁照旧;`halt-status` 必须横幅 `name service: ARMED — … above height 19008`。
+- 同一 commit 供给公开工件(预构建二进制 release + GHCR):陌生人必须能更新到与
+  舰队完全一致的东西。
 
-## 4. 滚 armed 镜像 —— 六台全滚
+## 4. 滚动——六台全部,硬截止
 
-node0–3 **加 svc0/svc1**（8,640 的教训：svc 主机晚于边界要付代价——explorer
-观察节点在 `halted 8640` 上卡了一天就是这个遗漏）。一次一台，逐台核验
-`slag=0` 归队，全程盯 R2 守卫（同高 fid 分裂）——OPERATOR §3/§7 管辖。
+node0–3 **加 svc0/svc1**(8,640 的教训:svc 主机赶不上边界会自食其果)。逐台,每台
+验证 `slag=0` 重入,全程 R2 守望(同高 fid 分裂)——OPERATOR §3/§7 管辖。§5 的弃用
+定价块适用于**本次滚动**(每台弃用主机 28–30 分钟,六台预期 2–3 台,40% 是下限)。
+**截止是硬的:每台共识主机必须在链到 19,008 之前(约 08-21,48 块/时)早早带上
+armed 规则**——交叉点上的 INERT 主机会分叉,不会停机。svc1 的 `telemetry_addr`
+fold-in + grant-path 检查随本次滚动。
 
-## 5. Halt、边界 fid、resume
+## 5. 交叉——活体,无仪式
 
-i299 §5–6 照抄，另加这次已预先合并的两个边界日修复（#360 停机提案维持、
-#362 REPUSH 节拍）：
+没有 halt、没有 resume 波、没有边界 fid 裁决仪式。舰队在高度 19,009 交叉(边界块
+本身提交 v2;严格之上才是 v3——`height > b`,由边界分割 golden 和 straddle drill
+锁定)。协调者持**交叉守望**:
 
-1. 网在盖章高度 halt；每台主机横幅确认。
-2. **协调者裁定边界 fid：至少 3/4、单一身份**——此处分裂即 R2，全停，保全
-   现场。
-   **边界 tie 输方（boundary-tie loser）**是另一种可恢复形态：主机停在 H，
-   finalized checkpoint 指向 A，已应用 tip 却是 H 上的同胞块 B，并打印
-   `FINALIZE refused head=state ... why=not-held`。让主机保持 halt 且保持连接：
-   主路径会经有界 near-tip body 窗口重索 A，只 rewind 一次，再走正常 state
-   funnel 应用 A。用 `stip=H`、`dfin=H`、一致的 `stipid`/`dfinbh`、
-   `schain=main`、`breq=0` 确认恢复；少数派密钥账本的 `sid` 按设计仍是 B，
-   它是 never-double-sign 的取证记录。若没有可达 peer 能提供 A，则走
-   [snapshot-transplant] 程序——只复制 donor 的 `snapshot.bin` + `blocks.log`，
-   保留本机自己的 finalizer 账本、halt marker 与配置。代码路径是主路径；
-   transplant 是服务不可用或 pre-#375 binary 的后备路径。
-3. 按 §6 分波 resume（runbook 说可并行处并行），svc 主机在同一波次集合里。
-4. 链恢复；第一个边界后检查点在 v3 body 下 finalize。
+1. **19,008± 的 R2 守望**:全舰队 fid 同一、终局性按节奏推进、无同高 fid 分裂。
+   此处分裂即 R2——全部停手,保存状态。
+2. **首个 v3 块验证**:19,008 之上第一块提交 v3(explorer/opview 视图保持绿;INERT
+   观察者会拒绝它——那是分叉签名,在错误的一侧)。
+3. 面向陌生人:任何 INERT peer 在 19,009 走上死的 v2 分叉(无委员会钥匙、无终局性)。
+   那是它的更新失败,不是 R2——缓解 = 更新公告 + 公开工件(§3),`powrej`/peer 数
+   可能随 INERT peer 断开而下探。预期内,已计价。
 
 > **实测定价更新(2026-08-17,协调者,依据 T-ops 的两轮重启批次——
 > [deploy PR #154](https://github.com/qumbra-labs/qumbra-deploy/pull/154) 与
