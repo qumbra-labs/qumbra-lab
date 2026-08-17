@@ -43,6 +43,22 @@
 //! `audit-names --from <boundary+1>` must report the registry AGREES. The
 //! committee finalize/tie/repush machinery under a halt is #374's live coverage;
 //! this file proves the v2→v3 format handoff those cases assume.
+//!
+//! # Phases 4–5 (added 2026-08-17, lab #367 option A / QUM-128) — and what they
+//! # are NOT
+//!
+//! The straddle-drill baton was commissioned to lock the **no-halt** route: a
+//! live committee crossing the boundary with finality advancing across it, no
+//! halt, no node diverging. **That property is not in this file, because on
+//! `main` it is false.** Phases 4 and 5 below are the finding that replaced it:
+//! at the stamped boundary an armed node refuses *every* block above 19,008 —
+//! not just rider-carrying ones, not just malformed ones, but an empty body
+//! with no transactions at all. See the #367 thread
+//! (`issues/367#issuecomment-5312633584`) for the report and
+//! [`the_apply_funnel_refuses_every_block_above_the_stamped_boundary`] for what
+//! must invert when the seam is fixed.
+//!
+//! Phases 1–3 above are untouched.
 
 use std::collections::HashMap;
 
@@ -50,12 +66,14 @@ use qlab_devnet::body::{
     validate_body_above, validate_body_with_names, BlockBody, BodyError, TxEntry, TxPublic,
     TxVerifier,
 };
+use qlab_devnet::emission_exact::{coinbase_exact, RULE_BOUNDARY_HEIGHT};
 use qlab_devnet::fees::{posted_fee, ArityBucket};
 use qlab_devnet::header::{BlockHeader, Hash32};
 use qlab_devnet::names::{
     self, commit_hash, name_fee_bessel, NameOp, NameRecord, NameView, L1_ADDRESS_LEN,
     NAME_RULE_BOUNDARY_HEIGHT, RECORD_KIND_L1_ADDRESS,
 };
+use qlab_node::{genesis_block, ChainStore, MemNode, NodeError, NodeState};
 
 /// A test name boundary, deliberately **below** the emission `RULE_BOUNDARY_HEIGHT`
 /// (8,640) so `check_scheduled_coinbase` grandfathers every coinbase and the
@@ -265,5 +283,199 @@ fn rider_free_blocks_validate_on_the_shipped_build_across_the_test_boundary() {
         };
         validate_body_with_names(&header, &body, &NoTx, is_final, &view)
             .unwrap_or_else(|e| panic!("rider-free block at {h} must validate on the shipped build: {e:?}"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — the LIVE crossing, through a real node's apply path, at the
+//           SHIPPED constant. 🔴 This is a DEFECT LOCK, not a property.
+// ---------------------------------------------------------------------------
+
+/// Beyond which stamped boundary this drill stops being an in-suite test. At
+/// 19,008 the whole file costs **0.21 s real / 26.5 MiB peak RSS** — basis:
+/// `/usr/bin/time -l` on the release test binary, `--test-threads=1`, 1 sample,
+/// this machine under `scripts/rig`, tree `a4719a2` + this file, all 8 tests.
+/// A re-stamp an order of magnitude higher wants a different mechanism, not a
+/// slower loop; the assertion below says so out loud rather than letting a
+/// future stamp quietly turn the suite into a bench.
+const IN_SUITE_BOUNDARY_CEILING: u64 = 200_000;
+
+/// The miner's payout key. Any non-zero value: a minting body must name a payee
+/// (issue #101), and above the emission boundary it must mint the scheduled
+/// amount (lab #299) — neither rule is under test here, both are satisfied so
+/// that the *name* format is the only thing that can refuse a block.
+const DRILL_RKM: [u64; 4] = [0xA1, 0xA2, 0xA3, 0xA4];
+
+/// A minimal honest body at `height`: **no transactions at all**. Empty is the
+/// point — with no tx there is no rider, no anchor, no fee and no proof, so a
+/// refusal cannot be blamed on the rider rules. Coinbase is 0 below the
+/// emission boundary and the exact schedule above it.
+fn empty_body_at(height: u64) -> BlockBody {
+    if height > RULE_BOUNDARY_HEIGHT {
+        BlockBody { txs: vec![], coinbase: coinbase_exact(height), coinbase_rkm: DRILL_RKM }
+    } else {
+        BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [0; 4] }
+    }
+}
+
+/// An honest header for `body` as a child of `parent` — one that commits the
+/// form the SHIPPED rule requires at its own height ([`BlockBody::commitment_at`]),
+/// which is what an armed producer must emit.
+fn honest_child(parent: &BlockHeader, body: &BlockBody) -> BlockHeader {
+    let header = BlockHeader::child_of(parent, parent.timestamp + 75, 1, [0; 32]);
+    BlockHeader { tx_body_commitment: body.commitment_at(header.height), ..header }
+}
+
+/// 🔴 **This test asserts a DEFECT. It is not the straddle property.**
+///
+/// A real [`qlab_node::MemNode`] — the state machine `qumbra-node` runs — is
+/// driven from genesis to the **stamped** name boundary and one block past it,
+/// on honest empty bodies and honest height-keyed headers. Every block up to
+/// and including the boundary applies. **The first block above it is refused**,
+/// and so is every block that could ever be built there:
+///
+/// | the header commits | `validate_body_with_names` | `Node::apply_block` |
+/// |---|---|---|
+/// | v3 — what the armed rule requires | `Ok(())` | 🔴 `BodyCommitmentMismatch` |
+/// | v2 — what `NodeAdapter::mine_on_parent` emits today | 🔴 `CommitmentMismatch` | never reached |
+///
+/// The cause is one line: `qlab_node::node::check_stored_binding`
+/// (`crates/qlab-node/src/node.rs:560`) computes `block.body().commitment()` —
+/// the "v2 regardless of height" form its own doc comment warns against — on
+/// the `apply_state` funnel every fresh application and every disk-log replay
+/// passes through. `block.header.height` is in scope; it is simply not used.
+/// The producer half is the same omission at
+/// `qlab_p2p::adapter::NodeAdapter::mine_on_parent`
+/// (`crates/qlab-p2p/src/adapter.rs:1896`, `let bc = body.commitment();`).
+///
+/// **Consequence for the no-halt route** (lab #367 ruling, 2026-08-17): an
+/// ARMED binary stops dead at the boundary — its own production and every
+/// peer's. An INERT binary (`NAME_RULE_BOUNDARY_HEIGHT = None`) is unaffected,
+/// which [`an_inert_build_is_untouched_by_the_boundary`] pins. So the armed
+/// fleet stops and the inert strangers keep the chain — the inverse of the
+/// failure the ruling priced.
+///
+/// **What must change when the seam is fixed (this test is the fix's mutation
+/// check, read in reverse).** Height-key the funnel
+/// (`body.commitment_at(block.header.height)`) and this test fails at
+/// `REFUSED_ABOVE` — block `b + 1` applies. That is the day to delete this test
+/// and write the straddle property it stands in for: a live committee crossing
+/// with finality advancing across the span, which needs a drill-boundary seam on
+/// the apply path that does not exist today.
+///
+/// Kept deliberately **rider-free and proof-free**: this is not "riders are
+/// broken above the boundary", it is "nothing can be applied above the
+/// boundary".
+#[test]
+fn the_apply_funnel_refuses_every_block_above_the_stamped_boundary() {
+    let b = NAME_RULE_BOUNDARY_HEIGHT
+        .expect("the boundary is stamped (lab #367 arming step 0, PR #455) — if it is `None` again this test proves nothing and must be re-derived");
+    assert!(
+        b <= IN_SUITE_BOUNDARY_CEILING,
+        "the stamped boundary moved to {b}, past this drill's in-suite ceiling \
+         {IN_SUITE_BOUNDARY_CEILING} — re-derive the mechanism, do not just wait longer"
+    );
+    let view = View { commits: HashMap::new() };
+
+    // ── below, and AT, the boundary: an ordinary chain, v2 throughout ────────
+    let mut node = MemNode::in_memory(genesis_block(1, 0));
+    for h in 1..=b {
+        let body = empty_body_at(h);
+        let parent = node.chain().block(&node.tip_hash()).expect("tip is stored").header();
+        let header = honest_child(&parent, &body);
+        assert_eq!(header.height, h);
+        node.apply_block(header, body, &NoTx)
+            .unwrap_or_else(|e| panic!("honest block {h} at/below the boundary must apply: {e:?}"));
+    }
+    assert_eq!(node.tip_height(), b, "the chain reached the boundary block itself");
+
+    // ── one block above: the honest v3 form ─────────────────────────────────
+    let body = empty_body_at(b + 1);
+    let parent = node.chain().block(&node.tip_hash()).expect("tip is stored").header();
+    let v3_header = honest_child(&parent, &body);
+    assert_ne!(
+        v3_header.tx_body_commitment,
+        body.commitment(),
+        "above the boundary the honest header commits v3, not the v2 form"
+    );
+
+    // The ENTRY point — the rule as designed — accepts it.
+    validate_body_with_names(&v3_header, &body, &NoTx, is_final, &view)
+        .expect("the armed validation rule accepts the honest v3 form above the boundary");
+
+    // 🔴 REFUSED_ABOVE — and the apply funnel refuses the very same block.
+    match node.apply_block(v3_header, body.clone(), &NoTx) {
+        Err(NodeError::BodyCommitmentMismatch { height, expected, got }) => {
+            assert_eq!(height, b + 1);
+            assert_eq!(expected, body.commitment_at(b + 1), "the header's honest v3 commitment");
+            assert_eq!(got, body.commitment(), "…against the funnel's unconditional v2 recompute");
+        }
+        other => panic!(
+            "🎉 the funnel accepted a v3 block at {} — the #367 seam is FIXED. \
+             Delete this defect lock and write the live straddle property in its place: {other:?}",
+            b + 1
+        ),
+    }
+    assert_eq!(node.tip_height(), b, "the refused block left the chain where it was");
+}
+
+/// The other spelling, refused at the other layer — together with
+/// [`the_apply_funnel_refuses_every_block_above_the_stamped_boundary`] this is
+/// the **deadlock**, not a one-sided outage.
+///
+/// A v2-committed body above the boundary is exactly what
+/// `NodeAdapter::mine_on_parent` builds today (it commits `body.commitment()`
+/// with no height), and it is also the task-book's phase-4 adversarial shape —
+/// the INERT stranger's block, asserted from the honest side. It never reaches
+/// the funnel: the entry point refuses it with `CommitmentMismatch`, mirror to
+/// the funnel's error above (expected and got swapped).
+///
+/// Mutation check: make `commitment_above` ignore its boundary (always v2) and
+/// this refusal becomes `Ok(())`.
+#[test]
+fn a_v2_committed_block_above_the_stamped_boundary_is_refused_at_the_entry_point() {
+    let b = NAME_RULE_BOUNDARY_HEIGHT.expect("stamped");
+    let view = View { commits: HashMap::new() };
+    let body = empty_body_at(b + 1);
+
+    let genesis = BlockHeader::genesis(1, 0);
+    let v2_header = BlockHeader {
+        height: b + 1,
+        ..BlockHeader::child_of(&genesis, 75, 1, body.commitment())
+    };
+    match validate_body_with_names(&v2_header, &body, &NoTx, is_final, &view) {
+        Err(BodyError::CommitmentMismatch { expected, got }) => {
+            assert_eq!(expected, body.commitment(), "what the v2 producer committed");
+            assert_eq!(got, body.commitment_at(b + 1), "…against the v3 form the rule requires");
+        }
+        other => panic!("a v2-committed block above the boundary must be refused: {other:?}"),
+    }
+}
+
+/// The blast radius, pinned from the other side: an **INERT** build — the one
+/// every stranger and every un-rolled host is running — is untouched. With the
+/// boundary `None`, `commitment_above` is the v2 form at every height, which is
+/// exactly what the unconditional funnel recomputes, so an inert node keeps
+/// applying blocks straight through 19,008.
+///
+/// This is why the finding's live outcome is the inverse of the one lab #367's
+/// ruling priced: the armed fleet is the side that stops.
+///
+/// Mutation check: make `commitment_above` treat `None` as "v3 above 0" and the
+/// first assertion fails.
+#[test]
+fn an_inert_build_is_untouched_by_the_boundary() {
+    let b = NAME_RULE_BOUNDARY_HEIGHT.expect("stamped");
+    for body in [empty_body_at(b + 1), body_of(vec![plain_tx(3)])] {
+        assert_eq!(
+            body.commitment_above(None, b + 1),
+            body.commitment(),
+            "an inert build commits v2 above the stamped height, so the funnel agrees with it"
+        );
+        assert_ne!(
+            body.commitment_at(b + 1),
+            body.commitment(),
+            "…and an armed build does not, which is the whole disagreement"
+        );
     }
 }
