@@ -659,6 +659,31 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// Bounded twice: pruned against `body_reqs` on every request pass, and capped
     /// at [`crate::bodywait::MAX_TRACKED_ASKS`].
     body_asks: HashMap<Hash32, AskRecord>,
+    /// **Peers that have DECLINED each outstanding body ask** (lab #427): a
+    /// header-only or `NotFound` answer to a `GetData(Block)` we sent is the peer
+    /// honestly saying "I do not possess this body", and before this ledger that
+    /// honesty cost exactly as much as silence — the ask sat until
+    /// [`BODY_REQUEST_TIMEOUT_MS`] and the re-ask rotation was free to land on the
+    /// same peer again. Measured on the live net (the #445 macOS joiner log):
+    /// ~2.6 ask-rounds per block at 15 s each, ~1.3 blk/s over a 13,7xx-block
+    /// catch-up, on hardware the rate did not depend on, because the clock was
+    /// this timeout and not the machine.
+    ///
+    /// Read by [`Self::request_missing_bodies`] to (a) skip declining peers when
+    /// choosing where an ask goes, and (b) re-ask IMMEDIATELY — next tick, not
+    /// next timeout — when the ask's own target declined and another ready peer
+    /// has not. When every ready peer has declined, the entry stays and the
+    /// timeout paces the retry exactly as before (the genuine "nobody has it"
+    /// case — #200's exemption feeds off that pacing, and the
+    /// `stall_without_historical_serving` drill locks it).
+    ///
+    /// **Deliberately NOT [`Self::body_asks`]**: that ledger is #229's instrument,
+    /// chartered observation-only ("nothing here changes what the node asks"), and
+    /// routing off it would put a decision on a surface whose whole value is that
+    /// it cannot perturb what it observes. Bounded like `body_reqs`: an entry is
+    /// dropped when its ask is satisfied or expires, and the map is cleared
+    /// outright past 2 × [`crate::bodywait::MAX_TRACKED_ASKS`] as a backstop.
+    body_declines: HashMap<Hash32, Vec<PeerId>>,
     /// Rotation cursor for spreading body requests across ready peers, so one silent
     /// peer costs a fraction of a batch rather than the whole of it, and so a re-ask
     /// after a timeout lands somewhere new.
@@ -738,6 +763,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             limiter: RateLimiter::default(),
             body_reqs: HashMap::new(),
             body_asks: HashMap::new(),
+            body_declines: HashMap::new(),
             body_rr: 0,
             unknown: UnknownStats::default(),
             unknown_types_seen: BTreeSet::new(),
@@ -853,6 +879,53 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             return;
         }
         rec.answers.insert(pid, answer);
+    }
+
+    /// **A peer declined a body ask** (lab #427): it answered our
+    /// `GetData(Block)` with a bare header or `NotFound` — the honest "I do not
+    /// possess this body". Record it, and if the decline came from the peer the
+    /// ask is currently parked on while another ready peer has NOT declined,
+    /// release the in-flight slot so the very next
+    /// [`Self::request_missing_bodies`] pass re-asks elsewhere — the answer
+    /// already arrived, and making it cost a [`BODY_REQUEST_TIMEOUT_MS`] wait
+    /// was the live net's ~1.3 blk/s serializer (see [`Self::body_declines`]).
+    ///
+    /// Three deliberate boundaries:
+    ///
+    /// - **A non-target decline records but never releases.** A gossiped header
+    ///   from a peer we did not park this ask on says nothing about whether the
+    ///   target will still serve it.
+    /// - **When every ready peer has declined, the slot is NOT released** — the
+    ///   entry stands and the timeout paces the retry, exactly the pre-#427
+    ///   behaviour. That keeps the genuinely-unobtainable case (#200, and the
+    ///   `stall_without_historical_serving` drill) byte-identical, and it is the
+    ///   busy-loop guard: each ready peer can be consulted at most once per
+    ///   ladder rung, so a decline cascade costs at most one `GetData` per peer
+    ///   per [`BODY_REQUEST_TIMEOUT_MS`], not a tick-rate loop.
+    /// - **Nothing is scored.** Declining is honest (#134's law, unchanged).
+    fn note_body_decline(&mut self, hash: &Hash32, from: PeerId) {
+        if !self.body_reqs.contains_key(hash) {
+            return; // not an ask of ours — ordinary gossip
+        }
+        // Backstop bound; unreachable through the pruning in
+        // `request_missing_bodies`, which drops an entry with its ask.
+        if self.body_declines.len() > 2 * crate::bodywait::MAX_TRACKED_ASKS {
+            self.body_declines.clear();
+        }
+        let declined = self.body_declines.entry(*hash).or_default();
+        if !declined.contains(&from) {
+            declined.push(from);
+        }
+        let target = self.body_reqs.get(hash).map(|req| req.peer);
+        if target != Some(from) {
+            return;
+        }
+        let declined = &self.body_declines[hash];
+        let someone_left =
+            self.peers.ready_peers().iter().any(|pid| !declined.contains(pid));
+        if someone_left {
+            self.body_reqs.remove(hash);
+        }
     }
 
     /// Finalized-checkpoint queries in flight right now (issue #204) — an
@@ -1513,8 +1586,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// on this path is the one that was already there, in `complete_block`, for a
     /// body that does not match the header's `tx_body_commitment`.
     fn request_missing_bodies(&mut self, now_ms: u64) {
-        self.body_reqs
-            .retain(|_, req| now_ms.saturating_sub(req.sent_ms) < BODY_REQUEST_TIMEOUT_MS);
+        // Lab #427: an expired ask surrenders its decline memory too, so the
+        // timeout-paced retry gets the full rotation again — the pre-#427
+        // semantics for the "every ready peer declined" case, preserved exactly.
+        let expired: Vec<Hash32> = self
+            .body_reqs
+            .iter()
+            .filter(|(_, req)| now_ms.saturating_sub(req.sent_ms) >= BODY_REQUEST_TIMEOUT_MS)
+            .map(|(hash, _)| *hash)
+            .collect();
+        for hash in &expired {
+            self.body_reqs.remove(hash);
+            self.body_declines.remove(hash);
+        }
         // Issue #229, observation only: prune the ask ledger to what is either in
         // flight or within one full re-ask cycle of having been. The grace window is
         // what lets a record survive the expiry above and the re-insert below —
@@ -1573,15 +1657,46 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             // simply not asked for this tick — it stays in the ask set, costs no
             // in-flight slot, and is asked as soon as the bucket refills. Nothing
             // is scored: a full bucket is our limit, not a peer's fault.
+            //
+            // Lab #427: also stepped past — a peer that already DECLINED this
+            // hash (header-only / `NotFound`). Asking it again inside the same
+            // ladder rung can only reproduce the answer we hold; the decline set
+            // resets when the ask expires, so a peer that later catches up gets
+            // asked again on the next rung.
+            let declined = self.body_declines.get(id);
             let mut chosen = None;
             for step in 0..n {
                 let cand = (self.body_rr + i + step) % n;
-                if allowance.get(&keys[cand]).copied().unwrap_or(0) > 0 {
+                if allowance.get(&keys[cand]).copied().unwrap_or(0) > 0
+                    && declined.is_none_or(|d| !d.contains(&peers[cand]))
+                {
                     chosen = Some(cand);
                     break;
                 }
             }
-            let Some(slot) = chosen else { break };
+            // Every peer with budget has declined this hash (the eligible peer
+            // can vanish between the decline that released the slot and this
+            // pass). Fall back to the pre-#427 allowance-only rotation: the ask
+            // goes to a decliner, and — because the entry then stands until the
+            // timeout, and a repeat decline from it cannot release the slot while
+            // the ready set is all-declined — the retry is timeout-paced, not a
+            // tick-rate loop. Without this arm the hash would never be asked
+            // again while the ready set stays inside its decline set.
+            if chosen.is_none() {
+                for step in 0..n {
+                    let cand = (self.body_rr + i + step) % n;
+                    if allowance.get(&keys[cand]).copied().unwrap_or(0) > 0 {
+                        chosen = Some(cand);
+                        break;
+                    }
+                }
+            }
+            // Lab #427: `continue`, not `break` — the skip is now per-hash (a
+            // hash every ready peer has declined has nowhere to go THIS rung),
+            // and it must not stop the hashes behind it from being asked. The
+            // out-of-allowance-everywhere case this used to `break` on now costs
+            // one n-step scan per remaining hash, bounded by the window width.
+            let Some(slot) = chosen else { continue };
             if let Some(left) = allowance.get_mut(&keys[slot]) {
                 *left -= 1;
             }
@@ -1619,6 +1734,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         self.body_asks.retain(|hash, rec| {
             reqs.contains_key(hash) || now_ms.saturating_sub(rec.last_ask_ms) < grace
         });
+        // Lab #427: decline memory for a hash that has left both ledgers (reorged
+        // away, satisfied through a path that predates the memory, …) is dead
+        // weight — same grace window, same pass.
+        let asks = &self.body_asks;
+        self.body_declines.retain(|hash, _| reqs.contains_key(hash) || asks.contains_key(hash));
         while self.body_asks.len() > MAX_TRACKED_ASKS {
             let Some(oldest) = self
                 .body_asks
@@ -1911,8 +2031,19 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // more than "unserved" — the peer does not hold the block at all, not even
         // its header, which is a different fact from the header-only answer a peer
         // that has the header but not the body gives.
+        // Lab #427: the welsh verdict below reads `body_reqs`, and the decline
+        // hook may REMOVE an entry from it (releasing the slot for an immediate
+        // re-ask). Decide "was this an ask of ours" first, on the pre-decline
+        // state, or the release would turn an honest `NotFound` into a welsh.
+        let welshed = inv
+            .items
+            .iter()
+            .any(|it| !self.body_reqs.contains_key(&it.id) && !self.cp_queries.contains_key(&it.id));
         for it in &inv.items {
             self.note_body_answer(&it.id, from, BodyAnswer::DontHave);
+            // Lab #427: same release-and-re-route as the header-only answer —
+            // `NotFound` is the other honest decline.
+            self.note_body_decline(&it.id, from);
         }
         // Charge once per message, not per item, matching the pre-#130 (c) behaviour
         // for a message this node did not originate as a body request.
@@ -1923,11 +2054,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // that predates the query and so holds no checkpoint under that id. On a
         // net that upgrades one host at a time the second is the common case, and
         // charging it would ban every peer that has not been rolled yet.
-        if inv
-            .items
-            .iter()
-            .any(|it| !self.body_reqs.contains_key(&it.id) && !self.cp_queries.contains_key(&it.id))
-        {
+        if welshed {
             self.peers.penalize(from, PENALTY_WELSHED_INV);
         }
         if let Some(id) = eager_not_found {
@@ -2150,6 +2277,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // out, which is what "nobody is serving me" and "nobody is answering me"
         // both look like.
         self.note_body_answer(&id, from, BodyAnswer::HeaderOnly);
+        // Lab #427: and it is a DECLINE, not merely an observation — release the
+        // in-flight slot so the re-ask goes to a peer that has not said no,
+        // without waiting out the timeout. (No-op unless the hash is an
+        // outstanding ask of ours.)
+        self.note_body_decline(&id, from);
         // While a checkpoint-sync session accumulates, a relayed header at or
         // below its checkpoint belongs to the buffer EXCLUSIVELY — the validated
         // chain must not grow a competing below-finality path beside it. Above
@@ -2755,6 +2887,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 // and after #229 it is progress this node actually made.
                 self.body_fetch_progress = true;
             }
+            self.body_declines.remove(&bh); // lab #427: a satisfied ask owes no memory
             return; // already applied — the ask is genuinely satisfied
         }
         let candidates = self.node.all_txs();
@@ -2805,6 +2938,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 // Issue #200: a requested body is now held — that is progress.
                 self.body_fetch_progress = true;
             }
+            self.body_declines.remove(&bh); // lab #427: a satisfied ask owes no memory
         }
     }
 

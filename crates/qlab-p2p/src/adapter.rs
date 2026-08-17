@@ -2194,13 +2194,35 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
     /// - **already held in the pending-body window** — it will drain on its own as the
     ///   tip advances, and re-fetching it would be pure duplicate traffic.
     ///
-    /// The scan is a window of `max` heights above the fork point rather than a search
-    /// for the first `max` missing ones: bodies drain ascending, so the frontier is
-    /// where the gap is, and an unbounded scan would walk the whole chain on a node
-    /// that has been asked for one hash.
+    /// **The scan finds the first `max` MISSING hashes, not the missing residue of
+    /// the first `max` heights** (lab #427). The pre-#427 shape — a window of `max`
+    /// heights above the fork point — anchored the whole fetch pipeline to the
+    /// applied tip: once most of that span was buffered, the ask set collapsed to
+    /// the unanswered residue (the live joiner's `bask=19@1135` against
+    /// `slag=12611`), and no new fetching could start until the residue landed.
+    /// Every unserved low ask therefore gated the pipeline for one or more full
+    /// [`crate::node::BODY_REQUEST_TIMEOUT_MS`] cycles, which is where the measured
+    /// ~1.3 blk/s came from: ~96 blocks per ~74 s of re-ask ladder, independent of
+    /// CPU and RTT. Scanning to the first `max` missing lets the fetch run ahead
+    /// while a residue waits, so a slow block costs itself, not the window.
     ///
-    /// Cost: one O(1) indexed lookup at `top` plus at most `max` parent hops. The
-    /// distance from the header tip down to the applied tip is not part of the cost.
+    /// The scan stays bounded on two axes, both #135-shaped (never ask for a body
+    /// this node would then drop):
+    ///
+    /// - **the admission horizon** — never past
+    ///   [`MAX_PENDING_BODY_HEIGHTS`] above the applied tip, the exact bound
+    ///   [`Self::is_body_worth_holding`] admits against;
+    /// - **buffer backpressure** — the scan extends past the classic `base + max`
+    ///   window only while `pending_bodies` has room for a whole in-flight window
+    ///   ([`crate::node::MAX_BODIES_IN_FLIGHT_CATCHUP`] entries) and its bytes are
+    ///   under half [`MAX_PENDING_BODY_BYTES`] (a full catch-up window of FROZEN
+    ///   v1.0 single-tx answers is ~14 MB — the #418 arithmetic — so half the cap
+    ///   plus one window still cannot trigger the evict-highest churn the old
+    ///   window bound existed to prevent).
+    ///
+    /// Cost: one O(1) indexed lookup at `top` plus at most
+    /// [`MAX_PENDING_BODY_HEIGHTS`] parent hops. The distance from the header tip
+    /// down to the applied tip is not part of the cost.
     fn missing_body_hashes(&self, max: usize) -> Vec<Hash32> {
         use qlab_node::ChainStore as _;
         if max == 0 {
@@ -2211,7 +2233,20 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
             .map(|(h, _)| h)
             .unwrap_or_else(|| self.state.tip_height());
         let tip = self.chain.tip_height();
-        let top = tip.min(base.saturating_add(max as u64));
+        // Fetch-ahead is admission-bounded and backpressure-gated; with no room it
+        // degrades to exactly the pre-#427 window, which #418's sizing proved safe.
+        let admit_top = self.state.tip_height().saturating_add(MAX_PENDING_BODY_HEIGHTS);
+        let room = self
+            .pending_bodies
+            .len()
+            .saturating_add(crate::node::MAX_BODIES_IN_FLIGHT_CATCHUP)
+            <= MAX_PENDING_BODIES
+            && self.pending_bytes < MAX_PENDING_BODY_BYTES / 2;
+        let top = if room {
+            tip.min(admit_top)
+        } else {
+            tip.min(base.saturating_add(max as u64))
+        };
         if top <= base {
             return Vec::new();
         }
@@ -2234,6 +2269,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
             height -= 1;
         }
         out.reverse(); // ascending — the order the state machine can apply them in
+        // The walk is top-down (parent hops), so the cut to `max` must happen after
+        // the reverse: the requester wants the LOWEST `max` missing — those are the
+        // ones that close the gap — not the highest.
+        out.truncate(max);
         out
     }
 
@@ -4533,6 +4572,69 @@ mod tests {
             b.pending_bodies().0 < 23 && b.pending_bodies().0 > 1,
             "the byte cap bound it, not the entry cap: {} entries",
             b.pending_bodies().0
+        );
+    }
+
+    /// **Lab #427 — the ask set slides past a buffered span to the first `max`
+    /// MISSING bodies.** The pre-#427 shape returned only the missing residue of
+    /// the first `max` heights, so once most of that span was buffered the whole
+    /// fetch pipeline idled behind the residue (the live joiner's `bask=19` against
+    /// `slag=12611`), and catch-up throughput collapsed to
+    /// ~window ÷ (re-ask rounds × 15 s) ≈ 1.3 blk/s.
+    #[test]
+    fn the_ask_set_slides_past_a_buffered_span_to_the_first_max_missing() {
+        let (cstate, _v) = committee7();
+        let mut proposer = NodeAdapter::new(cstate, KeccakPow, MockVerifier, easy_sim());
+        let blocks = mine_chain(&mut proposer, 200);
+
+        let mut joiner = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        for (h, _) in &blocks {
+            assert_eq!(joiner.ingest_header(*h), IngestOutcome::Accepted);
+        }
+        // Bodies 2..=97 are held; 1 is missing — the exact live shape: the span is
+        // nearly full and the residue holds the applied tip at 0.
+        for (h, b) in &blocks[1..97] {
+            joiner.buffer_body(*h, b.clone());
+        }
+
+        let missing = joiner.missing_body_hashes(96);
+        assert_eq!(missing.len(), 96, "the ask set is a full window, not the residue");
+        assert_eq!(missing[0], blocks[0].0.header_hash(), "the gap-closer is still first");
+        assert_eq!(
+            missing[1],
+            blocks[97].0.header_hash(),
+            "and the rest of the window is fetched AHEAD of the buffered span"
+        );
+        assert_eq!(missing[95], blocks[191].0.header_hash(), "ascending, first 96 missing");
+    }
+
+    /// **Lab #427, the bound the slide must keep (#135/#418's lesson): a
+    /// backpressured pending buffer collapses the ask set back to the classic
+    /// window.** Fetch-ahead must never ask for a body whose arrival would evict
+    /// what the buffer already holds — fetch, drop, re-fetch is the exact loop the
+    /// old window bound existed to prevent.
+    #[test]
+    fn a_backpressured_pending_buffer_collapses_the_ask_set_to_the_classic_window() {
+        let (cstate, _v) = committee7();
+        let mut proposer = NodeAdapter::new(cstate, KeccakPow, MockVerifier, easy_sim());
+        let blocks = mine_chain(&mut proposer, 600);
+
+        let mut joiner = NodeAdapter::new(committee7().0, KeccakPow, MockVerifier, easy_sim());
+        for (h, _) in &blocks {
+            assert_eq!(joiner.ingest_header(*h), IngestOutcome::Accepted);
+        }
+        // Fill pending past MAX_PENDING_BODIES − MAX_BODIES_IN_FLIGHT_CATCHUP
+        // (512 − 96): heights 2..=450 = 449 entries. Height 1 stays missing.
+        for (h, b) in &blocks[1..450] {
+            joiner.buffer_body(*h, b.clone());
+        }
+        assert!(joiner.pending_bodies().0 + crate::node::MAX_BODIES_IN_FLIGHT_CATCHUP > MAX_PENDING_BODIES);
+
+        let missing = joiner.missing_body_hashes(96);
+        assert_eq!(
+            missing,
+            vec![blocks[0].0.header_hash()],
+            "no room for a window of answers ⇒ only the classic window's residue is asked"
         );
     }
 
