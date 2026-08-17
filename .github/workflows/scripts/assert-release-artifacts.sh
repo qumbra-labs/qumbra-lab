@@ -61,9 +61,20 @@ grep -qFx "  halt plan:    no halt scheduled" halt.txt \
   || fail "this artifact is NOT the resume build — its halt plan is not 'no halt scheduled'. A bare \`cargo build -p qumbra-node\` is ARMED and halts at ${RULE_BOUNDARY_HEIGHT}; the release build needs --features rule-boundary-resume."
 grep -qFx "  resumes past: height ${RULE_BOUNDARY_HEIGHT} (post-halt rules apply above it)" halt.txt \
   || fail "this artifact does not declare that it resumes past height ${RULE_BOUNDARY_HEIGHT} — it cannot follow the live chain."
-if grep -q "ARMED" halt.txt; then
-  fail "the word ARMED appears in this artifact's halt-status. An armed binary published as a release hands every stranger a node that stops at ${RULE_BOUNDARY_HEIGHT} (issue #397)."
+# 2026-08-17: "ARMED" is no longer unambiguous — the name-service banner (PR #436)
+# legitimately prints "name service: ARMED … above height 19008" and that line is
+# REQUIRED in a post-#367 release (an inert binary forks silently at 19,009). So the
+# poison check anchors on the halt-plan line specifically, and the name line flips
+# from forbidden to asserted-present. First caught live: run 32011357820, where the
+# blunt grep rejected the exact release the name boundary needs.
+if grep -E "^  halt plan:" halt.txt | grep -q "ARMED"; then
+  fail "the halt-plan line says ARMED. An emission-armed binary published as a release hands every stranger a node that stops at ${RULE_BOUNDARY_HEIGHT} (issue #397)."
 fi
+
+# The name boundary must be ARMED in this and every later release (lab #367; the
+# no-halt crossing means an un-armed binary walks onto a dead fork at 19,009).
+grep -q "name service: ARMED" halt.txt \
+  || fail "this artifact's name service is NOT armed — it forks silently at the name boundary (lab #367). Build from a post-135078c tree."
 
 # ---------------------------------------------------------------------------
 # 2. It must carry the fleet's consensus constants. Verbatim from
