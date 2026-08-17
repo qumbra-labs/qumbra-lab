@@ -1626,8 +1626,43 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // replays that difference, and `snap=none` next to any `stip=` at all is the
         // host a roll must not be planned against.
         let snap = self.durable_snapshot.field();
+        // Issue #459: `pin=`/`pout=` are **appended at the end**, after `snap=`,
+        // under the same rule as every addition since #87 — every pre-existing
+        // field keeps its name, position and meaning, and `PRE_I84_FIELDS` passes
+        // unmodified. **Touches TELEMETRY.**
+        //
+        // 🔴 **`peers=` could not be split, only supplemented, and that is a
+        // property of the tests rather than a preference.** `peers` sits inside
+        // `PRE_I84_FIELDS`, which pins the pre-#84 fifteen by name *and position*
+        // — so redefining it (say, to `peers=3/1`) breaks the one lock that keeps
+        // an operator's existing grep honest across every future append. #459 asks
+        // to "split or supplement"; supplement is the only half that is buildable
+        // without retiring that lock.
+        //
+        // **Why the split is worth a field at all.** `peers=4` on a node the net
+        // is dialing and `peers=4` on a node dialing the net are the same integer
+        // and opposite situations, and the second is what an operator can act on:
+        // on the day 9444 opened to `0.0.0.0/0`, `pin` moving off zero is the
+        // first machine-readable evidence that anyone outside the fleet arrived.
+        //
+        // Caliper: an instantaneous level at print time. `pin` counts the live
+        // **peer-table rows** whose handle the transport accepted, `pout` is the
+        // remainder — so `pin + pout == peers` on every line, by construction. A
+        // socket that has been accepted but has not sent a frame is in neither:
+        // it is not in `peers=` either (a row is created by a peer's first frame),
+        // and its `ACCEPT` line is where it is visible.
+        //
+        // 🔴 **`-` is not zero.** The in-process transport links two nodes
+        // symmetrically and its accepting side observes no event, so it cannot
+        // answer at all; `pin=- pout=-` says the instrument is absent, where
+        // `pin=0` would claim nobody has connected. Every deployed node runs the
+        // TCP transport and prints numbers.
+        let (pin, pout) = match self.p2p.peer_directions() {
+            Some((i, o)) => (i.to_string(), o.to_string()),
+            None => ("-".to_string(), "-".to_string()),
+        };
         format!(
-            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={} unk={}/{} cpq={} dfin={} fdrop={} bask={} dfinbh={} snap={}",
+            "TELEMETRY tip={} final={} stall={} age_s={} diff={} peers={} mempool={} epoch={} regime={} halt={} hignore={} powrej={} dialable={}/{} rounds={} rfail={} fid={} sslot={} sid={} rback={} stip={} slag={} uanchor={} mready={} stipid={} schain={} breq={} fback={} prest={} uex={} bdrop={} unk={}/{} cpq={} dfin={} fdrop={} bask={} dfinbh={} snap={} pin={} pout={}",
             t.tip_height, final_str, t.stall_depth, age_str, t.tip_difficulty.unwrap_or(0),
             t.peer_count, t.mempool_size, t.epoch, regime, halt_str,
             ic.halt_ignored, ic.pow_rejected,
@@ -1656,6 +1691,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             bask,
             dfinbh,
             snap,
+            pin,
+            pout,
         )
     }
 
@@ -5842,6 +5879,8 @@ mod tests {
                 "dfinbh",
                 // ── appended by #359, at the end ──
                 "snap",
+                // ── appended by #459, at the end ──
+                "pin", "pout",
             ],
             "existing TELEMETRY fields must not move or be renamed: {line}"
         );
