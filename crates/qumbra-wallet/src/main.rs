@@ -240,6 +240,10 @@ fn names_self_send(
 }
 
 fn usage() {
+    // The build-provenance line (lab #437) sits in the header rather than behind a
+    // `--version` subcommand: a downloaded tarball carries no OCI label, and the
+    // first thing a stranger runs on an unfamiliar binary is `--help`.
+    eprintln!("build rev: {}", qumbra_wallet::build_rev_line());
     eprintln!(
         "qumbra-wallet — the end-user wallet CLI (issue #243)\n\n\
          USAGE:\n  \

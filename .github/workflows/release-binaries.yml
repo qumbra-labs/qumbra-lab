@@ -1,0 +1,443 @@
+# The prebuilt-binary release lane (lab #437 step 2b).
+#
+# WHY THIS FILE EXISTS: today a stranger's only path onto T1 is Docker. That is a
+# real adoption filter — Larry's own words on #437, "容器对很多用户有点难" — and the
+# native-macOS verification that unblocked this lane (40 accepted, finalized blocks
+# in ~100 minutes, #437) removed the last reason to keep the door container-only.
+# This workflow publishes `qumbra-node` + `qumbra-wallet` tarballs to the PUBLIC
+# repo's Releases so the path becomes download → verify → run.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT THIS FILE COSTS, STATED BEFORE ANYTHING ELSE
+#
+# `macos-14` is GitHub-hosted arm64 and bills PRIVATE-repo minutes at a 10x
+# multiplier. This repo's CI budget is a $20/month cap with `Stop usage: Yes`
+# (docs/ci-runner-cost-decision.md §4, measured 2026-08-02), and `qumbra-arm64-8`
+# already draws on it at ~$0.014/min. **Exhausting that cap stops `suite-arm64.yml`
+# too** — i.e. an expensive release cut can take the ACCEPTANCE BAR down with it,
+# which is a worse failure than a release that did not happen. Three consequences,
+# all deliberate:
+#
+#   1. `workflow_dispatch` ONLY, gated on typing `confirm=release`. This file has
+#      no push trigger, no schedule, and must never grow one. (node-image.yml took
+#      the same shape for the same reason and its header says so.)
+#   2. The **macOS leg runs only after both Linux legs are green** (`needs:`). A
+#      compile error, a drifted frozen digest or a dead genesis URL therefore costs
+#      zero macOS minutes. It costs wall-clock instead, which is the cheap side of
+#      that trade.
+#   3. The secret and the publish target are checked in a FREE `preflight` job
+#      before a single expensive minute is spent. Discovering a missing PAT after
+#      three platform builds is the shape of waste this ordering exists to prevent.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# THE LOAD-BEARING ASSERTION: every published node binary must be the RESUME build
+#
+# A bare `cargo build -p qumbra-node` is the ARMED variant — it halts at 8,640 and
+# cannot follow today's chain (`crates/qumbra-node/src/release.rs`, "arming is the
+# default and resuming is the flag"). #437's own preflight caught this on a human,
+# and #397 is the record of what it costs when it reaches a deployed artifact: the
+# public faucet sat frozen at the boundary for ~24 h. Publishing an ARMED tarball
+# would hand every stranger that same dead end, with no operator able to fix it.
+#
+# So each artifact is interrogated with `qumbra-node halt-status` AFTER it is built
+# and BEFORE anything is packaged, and the job fails on:
+#   - a `halt plan:` that is not `no halt scheduled`
+#   - a missing `resumes past: height 8640` line
+#   - the literal string `ARMED` appearing anywhere in the output
+#   - a frozen digest — declared OR recomputed-from-constants — that is not the pin
+#   - `validate:` not reporting OK
+# The frozen-digest half is borrowed verbatim from node-image.yml, and for the same
+# reason: a consensus binary's "did it really build what I think" question is "are
+# its constants the consensus constants". It is a pin, so a legitimate re-genesis
+# WILL fail this file until the pin is updated here — that is the intended cost.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# PROVENANCE, AND THE THING A TARBALL CANNOT DO
+#
+# The fleet image proves what it is through its `org.opencontainers.image.revision`
+# OCI label. **A tarball has no labels.** So lab #437 adds `QUMBRA_BUILD_REV`: both
+# binaries read it at compile time and print it — `qumbra-node halt-status` on the
+# `build rev:` line, `qumbra-wallet --help` in its header. This workflow stamps the
+# lab commit and then GREPS ITS OWN VALUE BACK OUT of each built binary, so a build
+# that ignored the env var cannot be published as though it had honoured it.
+#
+# What this lane does NOT claim: **the builds are not bit-reproducible** and no
+# attempt is made to make them so. "Reproducible provenance" here means an artifact
+# can be tied to a revision (stamp + SHA256SUMS + release notes), not that a third
+# party can rebuild the same bytes.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THE LINUX LEGS BUILD INSIDE `rust:1.95-bookworm` RATHER THAN ON THE RUNNER
+#
+# A binary built on the runner's own Ubuntu 24.04 image links against glibc 2.39
+# and then REFUSES TO START on Debian 12 (glibc 2.36) — which is what the fleet
+# runs, what deploy/README assumes, and a very likely stranger's box. Building in
+# the same `rust:1.95-bookworm` image `deploy/docker/Dockerfile` already uses puts
+# the floor at 2.36 and reuses a toolchain recipe this project has proven against
+# randomx-rs on both architectures. The artifact name says `-glibc` because these
+# are dynamically linked against it; no musl/static build is offered or implied.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# THE CROSS-REPO SECRET — [manual] Larry creates this, the workflow never skips
+#
+#   Secret name:  PUBLIC_RELEASE_TOKEN          (repository secret, on qumbra-lab)
+#   Kind:         fine-grained personal access token
+#   Repository:   qumbra-labs/qumbra   (the PUBLIC repo — NOT this one)
+#   Permission:   Contents: Read and write     (that is the only one needed)
+#
+# The source is private and the artifacts are public, so the publish hop crosses a
+# repo boundary that `GITHUB_TOKEN` cannot: its `permissions:` block is scoped to
+# THIS repository, and no amount of widening it here reaches qumbra-labs/qumbra.
+# When the secret is absent this workflow FAILS LOUDLY IN PREFLIGHT with the four
+# lines above — it does not skip the publish step and it does not "succeed with no
+# release", because a green run that published nothing is exactly the outcome
+# nobody would investigate.
+name: release binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "release" to spend paid runner minutes (incl. 10x-billed macOS) and publish to the PUBLIC repo. Anything else does nothing.'
+        required: true
+        default: ""
+      publish:
+        description: 'draft = assets attached, release invisible until a human clicks Publish (default). prerelease = immediately public, flagged pre-release.'
+        type: choice
+        options:
+          - draft
+          - prerelease
+        default: draft
+
+# One release cut at a time. NOT cancel-in-progress: a half-cancelled run that has
+# already created the release but not uploaded every asset leaves a public download
+# page with missing platforms, which is worse than a queued job.
+concurrency:
+  group: release-binaries
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # The four T1 entry points and the pinned genesis, from docs/join-and-mine.md §1-2.
+  # The smoke below is the preflight a real user runs first, so it uses the real
+  # published inputs — a smoke against a locally-minted genesis would prove the
+  # binary works against a file no stranger will ever have.
+  GENESIS_URL: https://seed.qumbra.org/genesis.qmb
+  GENESIS_HASH: 138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb
+  DIAL_PEERS: '["18.202.166.126:9444","18.141.177.109:9444","52.194.224.123:9444","52.5.0.21:9444"]'
+  # The frozen consensus config the fleet runs, and the resume release's identity.
+  # Same three pins node-image.yml asserts; kept as literals in both files on
+  # purpose — a shared value would have to live somewhere neither file owns.
+  FROZEN_PIN: a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b
+  EXPECTED_REVISION: v1.1-exact-emission
+  EXPECTED_DOMAIN: 56447169ab09956fcb78e8fb79a7cf2b502bd42194960226f83da2fb64db20b0
+  RULE_BOUNDARY_HEIGHT: "8640"
+  PUBLIC_REPO: qumbra-labs/qumbra
+
+jobs:
+  preflight:
+    name: the free checks — secret, target repo, tag
+    if: inputs.confirm == 'release'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      rev: ${{ steps.rev.outputs.rev }}
+      short: ${{ steps.rev.outputs.short }}
+      tag: ${{ steps.rev.outputs.tag }}
+      target_sha: ${{ steps.target.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Revision and tag
+        id: rev
+        run: |
+          set -euo pipefail
+          REV=$(git rev-parse HEAD)
+          SHORT=$(git rev-parse --short HEAD)
+          {
+            echo "rev=$REV"
+            echo "short=$SHORT"
+            echo "tag=t1-$SHORT"
+          } >> "$GITHUB_OUTPUT"
+          echo "lab revision : $REV"
+          echo "release tag  : t1-$SHORT"
+
+      - name: The cross-repo PAT must exist — fail loudly, never skip
+        env:
+          TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN:-}" ]; then
+            echo "::error::PUBLIC_RELEASE_TOKEN is not set on this repository, so nothing can be published."
+            echo ""
+            echo "[manual] Create it (Larry — this step is deliberately not automatable):"
+            echo "  1. github.com/settings/personal-access-tokens → Generate new token (fine-grained)"
+            echo "  2. Resource owner: qumbra-labs   Repository access: ONLY qumbra-labs/qumbra"
+            echo "  3. Repository permissions → Contents: Read and write   (nothing else is needed)"
+            echo "  4. Save the token as a repository secret on qumbra-labs/qumbra-lab named:"
+            echo ""
+            echo "       PUBLIC_RELEASE_TOKEN"
+            echo ""
+            echo "GITHUB_TOKEN cannot do this: its permissions are scoped to this repository and"
+            echo "the artifacts are published to a different one."
+            exit 1
+          fi
+          echo "PUBLIC_RELEASE_TOKEN is present (value never printed)."
+
+      - name: The token can actually see the public repo
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Reachability is a hard gate: an expired or wrong-owner token discovered
+          # here costs nothing, and discovered after three builds costs the run.
+          if ! OUT=$(gh api "repos/${PUBLIC_REPO}" 2>&1); then
+            echo "::error::PUBLIC_RELEASE_TOKEN cannot read ${PUBLIC_REPO} — expired, revoked, or scoped to the wrong repository. Nothing was built and nothing was published."
+            echo "$OUT"
+            exit 1
+          fi
+          PUSH=$(echo "$OUT" | jq -r '.permissions.push // false')
+          SHA=$(gh api "repos/${PUBLIC_REPO}/commits/$(echo "$OUT" | jq -r .default_branch)" --jq .sha)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "publish target: ${PUBLIC_REPO}@$SHA"
+          # Write access is WARNED, not failed. `permissions.push` is the clearest
+          # signal available without actually writing, but fine-grained tokens have
+          # been known to report it conservatively — and a false hard-fail here
+          # would block a legitimate release behind a workflow edit. The fatal case
+          # (token cannot see the repo at all) is caught above; this one is loud.
+          if [ "$PUSH" != "true" ]; then
+            echo "::warning::${PUBLIC_REPO} reports push=false for this token. If the publish step 403s, Contents: Read and write is the permission to add."
+          fi
+
+  linux:
+    name: build ${{ matrix.platform }}
+    needs: preflight
+    # A release needs all three platforms, so one dead leg means no release and
+    # cancelling its sibling is the cheap outcome. (This cannot reach the macOS
+    # job — that one is gated on `needs` instead, which is stronger.)
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux-x86_64-glibc
+            runner: ubuntu-latest
+          - platform: linux-aarch64-glibc
+            runner: qumbra-arm64-8
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: rust:1.95-bookworm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: C++ toolchain for randomx-rs
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y --no-install-recommends cmake clang libclang-dev build-essential ca-certificates curl jq
+      - name: Build provenance
+        run: |
+          set -euo pipefail
+          rustc -V; cargo -V; uname -m
+          ldd --version | head -1
+          echo "lab revision: ${{ needs.preflight.outputs.rev }}"
+
+      - name: Build the node — RESUME variant, and only the resume variant
+        env:
+          QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+        run: cargo build --release --locked -p qumbra-node --features rule-boundary-resume
+
+      - name: Build the wallet
+        env:
+          QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+        run: cargo build --release --locked -p qumbra-wallet
+
+      - name: Assert the artifacts — resume, frozen digest, build stamp
+        run: bash .github/workflows/scripts/assert-release-artifacts.sh
+        env:
+          NODE_BIN: target/release/qumbra-node
+          WALLET_BIN: target/release/qumbra-wallet
+          EXPECTED_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+
+      - name: Smoke — `check` against the PUBLISHED genesis, the way a joiner starts
+        run: bash .github/workflows/scripts/smoke-release-artifacts.sh
+        env:
+          NODE_BIN: target/release/qumbra-node
+
+      - name: Package
+        run: bash .github/workflows/scripts/package-release-artifacts.sh
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          LAB_REV: ${{ needs.preflight.outputs.rev }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qumbra-${{ needs.preflight.outputs.tag }}-${{ matrix.platform }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: build macos-arm64
+    # Gated on BOTH Linux legs passing. This is the 10x-billed leg, and every class
+    # of failure the Linux legs can find — compile error, frozen-digest drift, an
+    # unreachable genesis URL, a build stamp that did not take — is a failure this
+    # leg would find too, later and more expensively.
+    needs: [preflight, linux]
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain — pinned to the same rustc the Linux legs and the fleet use
+        run: |
+          set -euo pipefail
+          # `macos-14` ships whatever stable it shipped with; pinning 1.95 keeps one
+          # toolchain across all three artifacts of a single release, which is worth
+          # more than the few minutes the install costs.
+          rustup toolchain install 1.95 --profile minimal --no-self-update
+          rustup default 1.95
+          rustc -V; cargo -V; uname -m; sw_vers
+          # randomx-rs builds its C++ chain with cmake. Preinstalled on this image
+          # today; assert rather than assume, so an image change fails here by name
+          # instead of inside a dependency's build script.
+          command -v cmake >/dev/null || { echo "::error::cmake is missing from the macos-14 image — add a brew install step"; exit 1; }
+          cmake --version | head -1
+
+      - name: Build the node — RESUME variant, and only the resume variant
+        env:
+          QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+        run: cargo build --release --locked -p qumbra-node --features rule-boundary-resume
+
+      - name: Build the wallet
+        env:
+          QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+        run: cargo build --release --locked -p qumbra-wallet
+
+      - name: Assert the artifacts — resume, frozen digest, build stamp
+        run: bash .github/workflows/scripts/assert-release-artifacts.sh
+        env:
+          NODE_BIN: target/release/qumbra-node
+          WALLET_BIN: target/release/qumbra-wallet
+          EXPECTED_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+
+      # Acceptance item (c): the macos-arm64 artifact is smoke-run ON a macOS runner.
+      # #437's live verification was a hand-built binary on Larry's laptop; this is
+      # the same claim made by the lane that publishes it.
+      - name: Smoke — `check` against the PUBLISHED genesis, the way a joiner starts
+        run: bash .github/workflows/scripts/smoke-release-artifacts.sh
+        env:
+          NODE_BIN: target/release/qumbra-node
+
+      - name: Package
+        run: bash .github/workflows/scripts/package-release-artifacts.sh
+        env:
+          PLATFORM: macos-arm64
+          TAG: ${{ needs.preflight.outputs.tag }}
+          LAB_REV: ${{ needs.preflight.outputs.rev }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qumbra-${{ needs.preflight.outputs.tag }}-macos-arm64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish (${{ inputs.publish }}) to the public repo
+    needs: [preflight, linux, macos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: incoming
+          merge-multiple: true
+
+      - name: Assemble SHA256SUMS — and refuse a partial release
+        id: assemble
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find incoming -name '*.tar.gz' -exec mv {} release/ \;
+          find incoming -name '*.sha256' -exec mv {} release/ \;
+          cd release
+          # THREE platforms or nothing. A release page missing an architecture is
+          # the silent-truncation shape this project keeps paying for: it looks
+          # complete to everyone except the person whose platform is absent.
+          COUNT=$(ls -1 *.tar.gz | wc -l)
+          [ "$COUNT" -eq 3 ] || { echo "::error::expected 3 platform tarballs, found $COUNT — refusing to publish a partial release"; ls -la; exit 1; }
+          for p in linux-x86_64-glibc linux-aarch64-glibc macos-arm64; do
+            ls -1 *"$p".tar.gz >/dev/null || { echo "::error::no tarball for $p"; exit 1; }
+          done
+          # Re-verify each digest against the file that arrived, then concatenate.
+          # The per-platform .sha256 was computed on the machine that built it; this
+          # proves the artifact upload/download round trip did not alter it.
+          cat *.sha256 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          rm -f *.sha256
+          echo "--- SHA256SUMS ---"; cat SHA256SUMS
+
+      - name: Release notes
+        run: bash .github/workflows/scripts/release-notes.sh
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          LAB_REV: ${{ needs.preflight.outputs.rev }}
+          TARGET_SHA: ${{ needs.preflight.outputs.target_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TARGET_SHA: ${{ needs.preflight.outputs.target_sha }}
+          MODE: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          case "$MODE" in
+            draft)      FLAGS=(--draft) ;;
+            prerelease) FLAGS=(--prerelease) ;;
+            *) echo "::error::unknown publish mode '$MODE'"; exit 1 ;;
+          esac
+          # --target pins the tag to a commit read in preflight rather than to
+          # whatever the mirror's default branch happens to be seconds from now.
+          if ! gh release create "$TAG" \
+                --repo "$PUBLIC_REPO" \
+                --target "$TARGET_SHA" \
+                --title "Qumbra T1 — prebuilt binaries ($TAG)" \
+                --notes-file release-notes.md \
+                "${FLAGS[@]}" \
+                release/*.tar.gz release/SHA256SUMS; then
+            echo "::error::gh release create failed. If this was a 403, PUBLIC_RELEASE_TOKEN is missing Contents: Read and write on ${PUBLIC_REPO} (preflight warns about this and cannot prove it without writing)."
+            exit 1
+          fi
+          echo "published ($MODE): ${{ github.server_url }}/${PUBLIC_REPO}/releases/tag/$TAG"
+
+      - name: Read the release back
+        env:
+          GH_TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # The lesson of lab #224/#428, ported from images to files: what the API
+          # says is on the release is the only evidence that the upload landed.
+          gh release view "$TAG" --repo "$PUBLIC_REPO" --json isDraft,isPrerelease,assets \
+            --jq '{draft: .isDraft, prerelease: .isPrerelease, assets: [.assets[].name]}'
+          N=$(gh release view "$TAG" --repo "$PUBLIC_REPO" --json assets --jq '[.assets[].name] | length')
+          [ "$N" -eq 4 ] || { echo "::error::expected 4 assets (3 tarballs + SHA256SUMS) on the release, the API reports $N"; exit 1; }
+          echo ""
+          echo "Next, and it is a human step: the join doc's binary path quotes this tag and"
+          echo "these digests. Sync docs/join-and-mine{,-zh}.md to the public mirror, and tell"
+          echo "the announcement lane the download path is live."

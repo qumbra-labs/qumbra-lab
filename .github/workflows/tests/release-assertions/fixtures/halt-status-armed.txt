@@ -1,0 +1,13 @@
+qumbra-node halt-status (issue #74)
+  release:      qumbra-node v1.0 (halts at the emission-rule boundary, lab #299/#303)
+  build rev:    BUILDREV
+  halt plan:    ARMED — halts at height 8640
+  revision:     v1.0
+  frozen digest: a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b
+  rule domain:  0fea450384b0b286e2400f0cfa38b13eb4cfb01a1379c84085217cc059a0cd10
+  halt marker:  none on disk (this node has never halted)
+  name service: INERT — no boundary in this build; riders refused at every height (#367)
+  snapshot:     not read — pass --config to report this data dir's snapshot (#359)
+  frozen digest (recomputed from THIS binary's constants):
+    a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b
+  validate:     OK — this release is startable

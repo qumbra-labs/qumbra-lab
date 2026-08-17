@@ -321,6 +321,41 @@ impl From<RevisionError> for ReleaseError {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Build provenance — the tarball's answer to the image's OCI label (lab #437).
+// ---------------------------------------------------------------------------
+
+/// The source revision this binary was built from, stamped at compile time by the
+/// release lane (`.github/workflows/release-binaries.yml`) via `QUMBRA_BUILD_REV`.
+///
+/// # Why this exists, and why it is not the `Revision`
+///
+/// [`Revision`] names the **frozen parameter set's revision document** and is
+/// deliberately stable across ordinary releases — `release.rs`'s own "a routine
+/// release does not mint a new revision" rule. So it cannot answer *which build of
+/// the source is this*, and until #437 nothing in a bare binary could: the fleet's
+/// provenance lives in the image's `org.opencontainers.image.revision` OCI label
+/// (`deploy/docker/Dockerfile`), and **a downloaded tarball has no labels**. A
+/// stranger holding `qumbra-node` from a GitHub release otherwise has no way to ask
+/// the binary what it is, and `SHA256SUMS` only proves the file matches the release
+/// — not what the release was built from.
+///
+/// `None` is the honest answer for every build that is not a release build (every
+/// `cargo build`, every test, every image build today), and the banner says so in
+/// words rather than printing an empty field.
+pub const BUILD_REV: Option<&str> = option_env!("QUMBRA_BUILD_REV");
+
+/// The banner's build-provenance line. Never empty — an absent stamp is a sentence,
+/// not a blank, because a blank field reads as a tooling gap and an unstamped
+/// binary is a real and expected state (`deploy/docker/Dockerfile`'s `GIT_REVISION`
+/// took the same position with `unknown`).
+pub fn build_rev_line() -> String {
+    match BUILD_REV {
+        Some(rev) => rev.to_string(),
+        None => "unstamped — not built by the release lane".to_string(),
+    }
+}
+
 impl Release {
     /// Structural startup validation, independent of any on-disk state:
     /// grid rule (H2), the carried revision describes this binary (H4), and a
@@ -475,6 +510,7 @@ impl Release {
     pub fn banner(&self, marker: Option<&HaltMarker>) -> String {
         let mut s = String::new();
         s.push_str(&format!("  release:      {}\n", self.name));
+        s.push_str(&format!("  build rev:    {}\n", build_rev_line()));
         s.push_str(&format!("  halt plan:    {}\n", self.plan.describe()));
         match &self.revision {
             Some(r) => {
@@ -1270,6 +1306,27 @@ mod tests {
         assert!(passed.contains("PASSED the upgrade boundary at height 16"), "{passed}");
         assert!(passed.contains("revision in force `v1.0.1-drill`"), "{passed}");
         assert!(!passed.contains("HALTED at"), "{passed}");
+    }
+
+    /// The build-provenance line is **always present** (lab #437). The release lane
+    /// greps this line to prove the artifact it is about to publish was built from
+    /// the revision the release notes claim — so a build that silently stopped
+    /// emitting the line would turn that assertion into a grep that finds nothing,
+    /// which is the failure mode this project keeps paying for (a truncation that
+    /// reads as a pass). An unstamped build must still print a sentence.
+    #[test]
+    fn the_banner_always_carries_a_build_provenance_line() {
+        let b = armed().banner(None);
+        assert!(b.contains("  build rev:    "), "{b}");
+        assert!(!b.contains("  build rev:    \n"), "the line must never be blank: {b}");
+        // In-tree builds (this test included) are not release builds, and saying so
+        // is the honest answer — `unknown` with no explanation invites the reader to
+        // assume a tooling gap.
+        if BUILD_REV.is_none() {
+            assert!(b.contains("unstamped — not built by the release lane"), "{b}");
+        } else {
+            assert!(b.contains(BUILD_REV.unwrap()), "{b}");
+        }
     }
 
     #[test]
