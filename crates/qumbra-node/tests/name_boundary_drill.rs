@@ -44,19 +44,41 @@
 //! committee finalize/tie/repush machinery under a halt is #374's live coverage;
 //! this file proves the v2→v3 format handoff those cases assume.
 //!
-//! # Phases 4–5 (added 2026-08-17, lab #367 option A / QUM-128) — and what they
-//! # are NOT
+//! # Phase 4 — the LIVE CROSSING (added 2026-08-17 as a defect lock, INVERTED
+//! # 2026-08-17 by QUM-129 when the defect was fixed)
 //!
-//! The straddle-drill baton was commissioned to lock the **no-halt** route: a
-//! live committee crossing the boundary with finality advancing across it, no
-//! halt, no node diverging. **That property is not in this file, because on
-//! `main` it is false.** Phases 4 and 5 below are the finding that replaced it:
-//! at the stamped boundary an armed node refuses *every* block above 19,008 —
-//! not just rider-carrying ones, not just malformed ones, but an empty body
-//! with no transactions at all. See the #367 thread
-//! (`issues/367#issuecomment-5312633584`) for the report and
-//! [`the_apply_funnel_refuses_every_block_above_the_stamped_boundary`] for what
-//! must invert when the seam is fixed.
+//! The straddle-drill baton (PR #464) was commissioned to lock the **no-halt**
+//! route: a live crossing of the boundary with no halt and no node diverging.
+//! It could not, because on `main` the property was false — at the stamped
+//! boundary an armed node refused *every* block above 19,008, an empty body
+//! with no transactions included, because the apply funnel
+//! (`qlab_node::node::check_stored_binding`) and the producer
+//! (`qlab_p2p::adapter::NodeAdapter::mine_on_parent`) recomputed the body
+//! commitment height-blind while the entry rule demanded the v3 form. PR #464
+//! locked that finding as
+//! `the_apply_funnel_refuses_every_block_above_the_stamped_boundary`, a test
+//! that **asserted the defect** and whose own `else` arm said what to write in
+//! its place.
+//!
+//! QUM-129 height-keyed both call sites, so this file now carries the property
+//! rather than the finding: phase 4 is
+//! [`the_live_v2_to_v3_crossing_applies_through_the_real_node`], and the two
+//! flanking tests that pinned the deadlock and its blast radius are kept, with
+//! the deadlock one extended to assert **both layers now agree** on the same
+//! block instead of contradicting each other.
+//!
+//! Two halves of that crossing live where their code lives, not here, because
+//! neither is reachable from an integration test in this crate:
+//!
+//! - the **producer** (mine → validate → apply at `b + 1`, plus a real
+//!   committee's finality advancing across the boundary) —
+//!   `qlab_p2p::adapter::tests::the_fixed_producer_mines_across_the_stamped_boundary_and_its_own_node_applies_it`
+//!   (`ingest_block` is a private inherent method);
+//! - the **replay** legs PR #464 flagged (a v3-era datadir replays; an
+//!   inert-written one is refused loudly at the first above-boundary block) —
+//!   `qlab_node::node::tests::a_v3_era_datadir_replays_and_an_inert_written_one_is_refused_at_the_boundary`,
+//!   `#[ignore]`d because writing a 19k-record log fsyncs every record
+//!   (`persist::append_record` is crate-private besides).
 //!
 //! Phases 1–3 above are untouched.
 
@@ -70,10 +92,10 @@ use qlab_devnet::emission_exact::{coinbase_exact, RULE_BOUNDARY_HEIGHT};
 use qlab_devnet::fees::{posted_fee, ArityBucket};
 use qlab_devnet::header::{BlockHeader, Hash32};
 use qlab_devnet::names::{
-    self, commit_hash, name_fee_bessel, NameOp, NameRecord, NameView, L1_ADDRESS_LEN,
+    commit_hash, name_fee_bessel, NameOp, NameRecord, NameView, L1_ADDRESS_LEN,
     NAME_RULE_BOUNDARY_HEIGHT, RECORD_KIND_L1_ADDRESS,
 };
-use qlab_node::{genesis_block, ChainStore, MemNode, NodeError, NodeState};
+use qlab_node::{genesis_block, ChainStore, MemNode, NodeState};
 
 /// A test name boundary, deliberately **below** the emission `RULE_BOUNDARY_HEIGHT`
 /// (8,640) so `check_scheduled_coinbase` grandfathers every coinbase and the
@@ -288,13 +310,17 @@ fn rider_free_blocks_validate_on_the_shipped_build_across_the_test_boundary() {
 
 // ---------------------------------------------------------------------------
 // Phase 4 — the LIVE crossing, through a real node's apply path, at the
-//           SHIPPED constant. 🔴 This is a DEFECT LOCK, not a property.
+//           SHIPPED constant. Since QUM-129 this is the PROPERTY, not a
+//           defect lock: the chain crosses 19,008 and keeps producing.
 // ---------------------------------------------------------------------------
 
 /// Beyond which stamped boundary this drill stops being an in-suite test. At
 /// 19,008 the whole file costs **0.21 s real / 26.5 MiB peak RSS** — basis:
 /// `/usr/bin/time -l` on the release test binary, `--test-threads=1`, 1 sample,
-/// this machine under `scripts/rig`, tree `a4719a2` + this file, all 8 tests.
+/// the coordinator laptop under `scripts/rig`, tree `a4719a2` + PR #464, all 8
+/// tests. QUM-129's re-measurement of the same file is in that PR's body; the
+/// crossing test now applies three blocks past the boundary instead of failing
+/// at the first, which is three blocks of extra work, not a new order.
 /// A re-stamp an order of magnitude higher wants a different mechanism, not a
 /// slower loop; the assertion below says so out loud rather than letting a
 /// future stamp quietly turn the suite into a bench.
@@ -326,48 +352,53 @@ fn honest_child(parent: &BlockHeader, body: &BlockBody) -> BlockHeader {
     BlockHeader { tx_body_commitment: body.commitment_at(header.height), ..header }
 }
 
-/// 🔴 **This test asserts a DEFECT. It is not the straddle property.**
+/// 🟢 **The LIVE CROSSING — the property lab #367 option A rests on.**
+///
+/// This test is the inversion of PR #464's
+/// `the_apply_funnel_refuses_every_block_above_the_stamped_boundary`, which
+/// asserted the defect and named this test in its `else` arm. Read the two
+/// together: same node, same bodies, same stamped constant — the verdict at
+/// `b + 1` is what QUM-129 changed.
 ///
 /// A real [`qlab_node::MemNode`] — the state machine `qumbra-node` runs — is
-/// driven from genesis to the **stamped** name boundary and one block past it,
-/// on honest empty bodies and honest height-keyed headers. Every block up to
-/// and including the boundary applies. **The first block above it is refused**,
-/// and so is every block that could ever be built there:
+/// driven from genesis **through** the stamped name boundary on honest empty
+/// bodies and honest height-keyed headers:
 ///
-/// | the header commits | `validate_body_with_names` | `Node::apply_block` |
-/// |---|---|---|
-/// | v3 — what the armed rule requires | `Ok(())` | 🔴 `BodyCommitmentMismatch` |
-/// | v2 — what `NodeAdapter::mine_on_parent` emits today | 🔴 `CommitmentMismatch` | never reached |
+/// | height | body commits | entry rule | apply funnel |
+/// |---|---|---|---|
+/// | `1 ..= b` (19,008 blocks, incl. the boundary block itself) | v2 | `Ok` | applies |
+/// | `b + 1` | **v3** — the form changes mid-chain | `Ok` | **applies** |
+/// | `b + 2`, `b + 3` | v3 | `Ok` | applies — production continues |
 ///
-/// The cause is one line: `qlab_node::node::check_stored_binding`
-/// (`crates/qlab-node/src/node.rs:560`) computes `block.body().commitment()` —
-/// the "v2 regardless of height" form its own doc comment warns against — on
-/// the `apply_state` funnel every fresh application and every disk-log replay
-/// passes through. `block.header.height` is in scope; it is simply not used.
-/// The producer half is the same omission at
-/// `qlab_p2p::adapter::NodeAdapter::mine_on_parent`
-/// (`crates/qlab-p2p/src/adapter.rs:1896`, `let bc = body.commitment();`).
+/// The crossing is what makes it a straddle and not a boundary test: the same
+/// chain, the same node instance, carries a body-format change at 19,008 → 19,009
+/// with **no halt, no restart, no reorg** — and the tip keeps advancing after it.
 ///
-/// **Consequence for the no-halt route** (lab #367 ruling, 2026-08-17): an
-/// ARMED binary stops dead at the boundary — its own production and every
-/// peer's. An INERT binary (`NAME_RULE_BOUNDARY_HEIGHT = None`) is unaffected,
-/// which [`an_inert_build_is_untouched_by_the_boundary`] pins. So the armed
-/// fleet stops and the inert strangers keep the chain — the inverse of the
-/// failure the ruling priced.
+/// The two things it pins that a lower drill boundary could not:
+/// 1. the **shipped** constant (`NAME_RULE_BOUNDARY_HEIGHT`), not an `_above`
+///    seam — the funnel has no `_above` variant, so a drill boundary is blind
+///    to exactly the seam that was broken;
+/// 2. **both layers on the same block**: `validate_body_with_names` (entry) and
+///    `Node::apply_state`'s `check_stored_binding` (funnel) now compute the
+///    same expectation from the same height. Before the fix they computed
+///    opposite ones and no block of any shape satisfied both.
 ///
-/// **What must change when the seam is fixed (this test is the fix's mutation
-/// check, read in reverse).** Height-key the funnel
-/// (`body.commitment_at(block.header.height)`) and this test fails at
-/// `REFUSED_ABOVE` — block `b + 1` applies. That is the day to delete this test
-/// and write the straddle property it stands in for: a live committee crossing
-/// with finality advancing across the span, which needs a drill-boundary seam on
-/// the apply path that does not exist today.
+/// Kept deliberately **rider-free and proof-free** — empty bodies. What crosses
+/// here is the *format*, so an acceptance cannot be attributed to (or blamed on)
+/// the rider rules; phases 1–2 above cover riders.
 ///
-/// Kept deliberately **rider-free and proof-free**: this is not "riders are
-/// broken above the boundary", it is "nothing can be applied above the
-/// boundary".
+/// Mutation checks (each one line, each fails here):
+/// - revert the funnel to `block.body().commitment()` → `CROSSING` fails: block
+///   `b + 1` is refused with `BodyCommitmentMismatch` (this is PR #464's finding
+///   restored, and the panic message says so);
+/// - key the funnel to a constant height (`commitment_at(0)`) → the same failure;
+/// - `NAME_RULE_BOUNDARY_HEIGHT` → `None` → fails loudly at the `.expect` on the
+///   stamp rather than passing vacuously;
+/// - make `honest_child` commit `commitment()` → fails at the *entry* rule at
+///   `b + 1`, which is [`a_v2_committed_block_above_the_stamped_boundary_is_refused_at_the_entry_point`]'s
+///   subject seen from this side.
 #[test]
-fn the_apply_funnel_refuses_every_block_above_the_stamped_boundary() {
+fn the_live_v2_to_v3_crossing_applies_through_the_real_node() {
     let b = NAME_RULE_BOUNDARY_HEIGHT
         .expect("the boundary is stamped (lab #367 arming step 0, PR #455) — if it is `None` again this test proves nothing and must be re-derived");
     assert!(
@@ -384,51 +415,76 @@ fn the_apply_funnel_refuses_every_block_above_the_stamped_boundary() {
         let parent = node.chain().block(&node.tip_hash()).expect("tip is stored").header();
         let header = honest_child(&parent, &body);
         assert_eq!(header.height, h);
+        assert_eq!(
+            header.tx_body_commitment,
+            body.commitment(),
+            "at/below the boundary the honest form IS the v2 form — the live chain is untouched"
+        );
         node.apply_block(header, body, &NoTx)
             .unwrap_or_else(|e| panic!("honest block {h} at/below the boundary must apply: {e:?}"));
     }
     assert_eq!(node.tip_height(), b, "the chain reached the boundary block itself");
+    let root_at_boundary = node.commitment_root();
 
-    // ── one block above: the honest v3 form ─────────────────────────────────
+    // ── CROSSING: the first block above the boundary, in the honest v3 form ──
     let body = empty_body_at(b + 1);
     let parent = node.chain().block(&node.tip_hash()).expect("tip is stored").header();
     let v3_header = honest_child(&parent, &body);
     assert_ne!(
         v3_header.tx_body_commitment,
         body.commitment(),
-        "above the boundary the honest header commits v3, not the v2 form"
+        "above the boundary the honest header commits v3, not the v2 form — \
+         if these are equal the crossing below proves nothing"
     );
+    assert_eq!(v3_header.tx_body_commitment, body.commitment_at(b + 1));
 
-    // The ENTRY point — the rule as designed — accepts it.
+    // The ENTRY point — the rule as designed — accepts it…
     validate_body_with_names(&v3_header, &body, &NoTx, is_final, &view)
         .expect("the armed validation rule accepts the honest v3 form above the boundary");
 
-    // 🔴 REFUSED_ABOVE — and the apply funnel refuses the very same block.
-    match node.apply_block(v3_header, body.clone(), &NoTx) {
-        Err(NodeError::BodyCommitmentMismatch { height, expected, got }) => {
-            assert_eq!(height, b + 1);
-            assert_eq!(expected, body.commitment_at(b + 1), "the header's honest v3 commitment");
-            assert_eq!(got, body.commitment(), "…against the funnel's unconditional v2 recompute");
-        }
-        other => panic!(
-            "🎉 the funnel accepted a v3 block at {} — the #367 seam is FIXED. \
-             Delete this defect lock and write the live straddle property in its place: {other:?}",
-            b + 1
-        ),
+    // …and so does the APPLY funnel, which is the half PR #464 measured refusing.
+    node.apply_block(v3_header, body.clone(), &NoTx).unwrap_or_else(|e| panic!(
+        "🔴 the crossing is broken again: the funnel refused the honest v3 block at {} — \
+         this is PR #464's finding restored. Check `qlab_node::node::check_stored_binding` \
+         is still `commitment_at(block.header.height)`: {e:?}",
+        b + 1
+    ));
+    assert_eq!(node.tip_height(), b + 1, "the chain crossed the boundary");
+    assert_ne!(node.commitment_root(), root_at_boundary, "…and state moved with it");
+
+    // ── production continues above the boundary ─────────────────────────────
+    for h in (b + 2)..=(b + 3) {
+        let body = empty_body_at(h);
+        let parent = node.chain().block(&node.tip_hash()).expect("tip is stored").header();
+        let header = honest_child(&parent, &body);
+        assert_eq!(header.tx_body_commitment, body.commitment_at(h), "v3 above the boundary");
+        validate_body_with_names(&header, &body, &NoTx, is_final, &view)
+            .unwrap_or_else(|e| panic!("block {h} must pass the entry rule: {e:?}"));
+        node.apply_block(header, body, &NoTx)
+            .unwrap_or_else(|e| panic!("block {h} above the boundary must apply: {e:?}"));
     }
-    assert_eq!(node.tip_height(), b, "the refused block left the chain where it was");
+    assert_eq!(node.tip_height(), b + 3, "the chain keeps producing past the crossing");
 }
 
-/// The other spelling, refused at the other layer — together with
-/// [`the_apply_funnel_refuses_every_block_above_the_stamped_boundary`] this is
-/// the **deadlock**, not a one-sided outage.
+/// The **INERT stranger's block**, judged from the honest side: a v2-committed
+/// body above the boundary is refused at the entry point with
+/// `CommitmentMismatch`.
 ///
-/// A v2-committed body above the boundary is exactly what
-/// `NodeAdapter::mine_on_parent` builds today (it commits `body.commitment()`
-/// with no height), and it is also the task-book's phase-4 adversarial shape —
-/// the INERT stranger's block, asserted from the honest side. It never reaches
-/// the funnel: the entry point refuses it with `CommitmentMismatch`, mirror to
-/// the funnel's error above (expected and got swapped).
+/// Before QUM-129 this was one half of a *deadlock* — the entry rule refused
+/// the v2 spelling and the funnel refused the v3 one, so nothing could be
+/// applied at all. After the fix it is a one-sided refusal of a genuinely wrong
+/// block, and it is what an armed node does with a block an un-rolled peer
+/// mines above 19,008. `NodeAdapter::mine_on_parent` no longer emits this shape
+/// (it commits `commitment_at(parent.height + 1)`), which
+/// `qlab_p2p::adapter::tests::the_fixed_producer_mines_across_the_stamped_boundary_and_its_own_node_applies_it`
+/// mines end-to-end.
+///
+/// **Both layers agree on this block post-fix**, which is the property that
+/// replaced the deadlock: the entry rule below computes `commitment_at(b + 1)`
+/// (asserted here), and the funnel computes the identical value for the identical
+/// block — asserted where the funnel is reachable for a block the entry point
+/// never admits, i.e. on replay of a log an inert binary wrote:
+/// `qlab_node::node::tests::an_inert_written_log_above_the_boundary_is_refused_by_replay`.
 ///
 /// Mutation check: make `commitment_above` ignore its boundary (always v2) and
 /// this refusal becomes `Ok(())`.
@@ -458,8 +514,13 @@ fn a_v2_committed_block_above_the_stamped_boundary_is_refused_at_the_entry_point
 /// exactly what the unconditional funnel recomputes, so an inert node keeps
 /// applying blocks straight through 19,008.
 ///
-/// This is why the finding's live outcome is the inverse of the one lab #367's
-/// ruling priced: the armed fleet is the side that stops.
+/// Before QUM-129 this pinned *who the defect hit* — the armed fleet was the
+/// side that stopped, the inverse of the outcome lab #367's ruling priced. With
+/// the funnel and producer height-keyed, the armed fleet crosses
+/// ([`the_live_v2_to_v3_crossing_applies_through_the_real_node`]) and this test
+/// keeps the other half honest: an inert build still commits v2 above the
+/// stamped height, so it forks rather than follows. That is the
+/// `UPDATE-BEFORE-19,008` notice's whole subject, and it is unchanged by the fix.
 ///
 /// Mutation check: make `commitment_above` treat `None` as "v3 above 0" and the
 /// first assertion fails.
