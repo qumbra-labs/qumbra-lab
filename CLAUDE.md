@@ -130,6 +130,20 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
    publishable), and the local rig lock below still governs any deliberate local run. The lock is
    held by a zero-memory sleeper by default so a stray local suite queues instead of OOM-ing.
 
+   🔴 **Agent sessions (Multica batons and any non-coordinator automation): NO `cargo test`
+   on this machine AT ALL — not full-workspace, not crate-scoped, not one test (added
+   2026-08-19, Larry's explicit order after the second violation).** `cargo check` /
+   `cargo clippy` are the only local cargo verification an agent may run. Write the tests,
+   push the branch, apply the `verify` / `verify-graviton` label — the CI lane is the bar
+   and the ONLY place tests execute. Why crate-scoped is banned too: 2026-08-19 04:0x, a
+   baton ran a "targeted" crate test binary at default parallelism — 16 threads, 5.2 GB
+   RSS and climbing, no rig lock, on a crate whose tests contain real ~12 GB-peak prove
+   paths, beside a live miner on a shared laptop (the QUM-134 memory-exhaustion class,
+   second occurrence). A "small targeted run" is indistinguishable from a memory bomb
+   until it is one; the CI runner exists precisely so nobody has to make that judgment
+   locally. Coordinator/human sessions doing deliberate rig measurements still go through
+   `scripts/rig` per the paragraphs above.
+
    🔴 **Take the lock. It is not a courtesy queue — it is the only way any of the jobs finish.**
 
    ```sh
