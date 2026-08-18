@@ -554,6 +554,15 @@ fn check_config(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  listen:       {}", pf.listen_addr);
     println!("  dial peers:   {}", pf.dial_peers);
     println!("  mining:       {}", pf.mining);
+    // Lab #475: shown because `run`'s loud burn warning arrives too late to act
+    // on — by then the node is up and the operator has stopped reading.
+    match (&pf.miner_rkm, pf.mining) {
+        (Some(rkm), _) => println!("  miner_rkm:    {rkm}"),
+        (None, true) => println!(
+            "  miner_rkm:    ⚠️  UNSET with mining = true — every coin this node mines is BURNED"
+        ),
+        (None, false) => println!("  miner_rkm:    not set (this node does not mine)"),
+    }
     println!("  halt plan:    {}", RELEASE.plan.describe());
     Ok(())
 }
