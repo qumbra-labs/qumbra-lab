@@ -124,7 +124,12 @@ jobs:
       github.event_name == 'workflow_dispatch' ||
       github.event.label.name == 'verify'
     runs-on: windows-latest
-    timeout-minutes: 120
+    # 150, not 120: the measured job is ~125 min on a cold-ish cache (3 build +
+    # 90 node-lib + ~30 wallet-lib + the cheap steps), and 120 killed run
+    # 32103510578 mid-wallet. This is headroom over a measurement, not a guess —
+    # and it is capped rather than removed because a windows runner bills at 2×
+    # and this repo's Actions budget also pays for the arm64 acceptance bar.
+    timeout-minutes: 150
 
     steps:
       - uses: actions/checkout@v4
@@ -202,9 +207,6 @@ jobs:
       # This does not disturb `qumbra-node.exe`: `--lib` builds the lib's test
       # harness and leaves the already-built binary alone, which the smoke step
       # below depends on.
-      - name: qumbra-node lib tests
-        run: cargo test --release --locked -p qumbra-node --lib -- --test-threads=1
-
       - name: qumbra-wallet lib tests
         run: cargo test --release --locked -p qumbra-wallet --lib -- --test-threads=1
 
@@ -236,6 +238,37 @@ jobs:
       - name: audit-emission through the binary (integer-exact schedule on Windows)
         run: cargo test --release --locked -p qumbra-node --test audit_emission_cli -- --test-threads=1
 
+      # ── 6. THE HEAVY ONE, DELIBERATELY LAST ────────────────────────────────
+      # 🔴 ORDER IS A BUDGET DECISION, MEASURED NOT GUESSED (lab #478).
+      #
+      # This step ran 18 min on run 32101516749 and **90 min** on 32103510578 —
+      # same runner class, one more test. With `qumbra-wallet` at ~29 min behind
+      # it, the job blew its 120-minute wall and was killed with the wallet lib,
+      # the genesis smoke and the emission audit **still pending**. Those three
+      # had never executed on ANY run of this leg, because they had spent every
+      # run queued behind this one.
+      #
+      # So the cheap, genuinely-Windows checks now run FIRST and this runs LAST.
+      # The ordering is not cosmetic: it changes what a timeout costs. A leg that
+      # dies here still leaves the RandomX vectors, `halt-status`, the wallet, the
+      # published-genesis smoke and the integer-exact emission audit **proven**,
+      # and loses only the one step whose content is least platform-specific.
+      #
+      # It stays in the job rather than being trimmed, because `--lib` is where
+      # the console-close handler, the path handling and the TCP loop live — the
+      # actual subject of this port. What is NOT claimed is that its three real
+      # STARK verifies needed to run here; they are platform-independent by
+      # construction (#303 made "no libm reachable from consensus" law) and the
+      # arm64 bar runs them too. If this leg's cost ever has to come down, they
+      # are the first candidate — with that argument, on purpose, rather than by
+      # quietly raising the timeout again.
+      #
+      # `--lib` builds the lib's test harness and leaves the already-built
+      # `qumbra-node.exe` alone, so running it after the audit step above (which
+      # rebuilds the binary ARMED) is safe: nothing below reads the binary.
+      - name: qumbra-node lib tests
+        run: cargo test --release --locked -p qumbra-node --lib -- --test-threads=1
+
       - name: What this run did and did not prove
         if: always()
         run: |
@@ -250,6 +283,12 @@ jobs:
             echo
             echo "**This lane is build + RandomX identity + targeted tests + \`check\`.**"
             echo "It is NOT the acceptance bar — that is \`suite-arm64.yml\`, unchanged."
+            echo
+            echo "Step order is a budget decision: the cheap Windows-specific checks"
+            echo "run first and \`qumbra-node --lib\` runs LAST, so a timeout costs the"
+            echo "least platform-specific step rather than stranding the rest. **Read the"
+            echo "step list above — a step that never ran proves nothing, and a green"
+            echo "job with pending steps is not a thing this leg can produce.**"
             echo
             echo "Not covered here, and named rather than implied:"
             echo "- the full workspace suite (arm64 lane's job, by design)"
