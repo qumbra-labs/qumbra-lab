@@ -18,6 +18,13 @@
 //!   iteration timed phase by phase, so a degraded loop period attributes
 //!   itself to a phase instead of being argued about from the gap between two
 //!   `TELEMETRY` lines.
+//! - [`mine`] — `qumbra-node mine --dir DIR` (lab #475): the five manual steps a
+//!   stranger walked to start mining — wallet keygen, mnemonic backup, rkm
+//!   derivation, hand-written config, `run` — folded into one command, with the
+//!   T1 network identity baked, the genesis byte-verified before anything binds,
+//!   and a **backup gate** no auto-created wallet gets past. It writes an
+//!   ordinary `node.toml` and hands it to [`run`]; there is no second kind of
+//!   node here.
 //! - [`run`] — composes the N7 stack over the REAL TCP transport + RandomXPow +
 //!   on-disk qlab-node stores, and runs it with graceful-shutdown snapshot flush.
 //! - [`audit_emission`] — read-only `audit-emission` subcommand: walk a data dir's
@@ -41,6 +48,7 @@ pub mod emission_pins;
 pub mod genesis;
 pub mod looptime;
 pub mod metrics_server;
+pub mod mine;
 pub mod params_audit;
 pub mod release;
 pub mod revision;

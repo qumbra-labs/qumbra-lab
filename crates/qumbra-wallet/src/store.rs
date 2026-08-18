@@ -351,6 +351,77 @@ pub fn reveal_mnemonic(w: &WalletDir) -> String {
     w.seed.to_mnemonic()
 }
 
+/// What [`create_from_os_entropy_gated`] did: a wallet, or nothing at all.
+///
+/// `Refused` means the gate said no and **nothing was written** — not a wallet
+/// that exists and is unconfirmed. That distinction is the whole point of the
+/// gate: a seed file on disk whose mnemonic its owner never acknowledged is
+/// exactly the state Bitcoin Core's auto-`wallet.dat` era is remembered for.
+pub enum GatedCreate {
+    Created(WalletDir),
+    Refused,
+}
+
+/// Generate a wallet from OS entropy, show the caller its mnemonic, and write
+/// the seed **only if the gate returns `true`**.
+///
+/// 🔴 **The one place in this workspace that mints wallet key material.** Until
+/// lab #475 it lived in this crate's `main.rs`, so the "kernel" had no
+/// generation entry point at all and a second binary that wanted a wallet had
+/// to re-implement entropy → seed → address-0. `qumbra-node mine` is that
+/// second binary. Entropy, the `MasterSeed`, and the seed file stay inside this
+/// crate; a caller sees the mnemonic string (it must — showing it is the whole
+/// job) and the resulting [`WalletDir`], never the entropy.
+///
+/// The gate runs **before** the write for the same reason: an abort must leave
+/// no seed file behind. A mnemonic shown for a wallet that was then not written
+/// costs nothing — the phrase carries the whole seed, so restoring from it
+/// reproduces the same wallet — while an unacknowledged seed file costs the
+/// operator a wallet they do not know they own.
+///
+/// A failure of the OS CSPRNG is fatal rather than degraded: a seed from a weak
+/// source is a key somebody else can derive (the faucet's rule, kept).
+pub fn create_from_os_entropy_gated(
+    dir: &Path,
+    gate: impl FnOnce(&str) -> bool,
+) -> Result<GatedCreate, StoreError> {
+    use rand::Rng;
+
+    // Refuse before minting anything if a wallet is already here, so a caller
+    // cannot be shown a mnemonic for a wallet that was never going to be
+    // written. `WalletDir::create` refuses too; this is the earlier, quieter no.
+    let seed_path = dir.join(SEED_FILE);
+    if seed_path.exists() {
+        return Err(StoreError::SeedExists(seed_path));
+    }
+    let mut entropy = [0u8; ENTROPY_LEN];
+    rand::rng().fill_bytes(&mut entropy);
+    let seed = MasterSeed::from_entropy(entropy);
+    if !gate(&seed.to_mnemonic()) {
+        return Ok(GatedCreate::Refused);
+    }
+    Ok(GatedCreate::Created(WalletDir::create(dir, seed)?))
+}
+
+/// The `miner_rkm` a node config carries so a mining node's coinbase pays THIS
+/// wallet: 64 hex characters = 32 bytes, lane-major little-endian, the form
+/// `qumbra_node::config::rkm_lanes_from_hex` parses.
+///
+/// 🔴 **One derivation, not two** — lab #425's rule, one level out. This
+/// expression used to live in `qumbra-wallet`'s `main.rs`; `qumbra-node mine`
+/// (lab #475) needs the same value from the same seed, and a payout key is the
+/// worst possible place for two implementations that merely agree today. Both
+/// callers run this function, so the node's `miner_rkm` is the wallet's rkm by
+/// construction rather than by two expressions matching.
+///
+/// `index` is an **address index**, not a diversifier: the diversifier is
+/// index-deterministic ([`WalletDir`]'s cursor note), and index 0 is the
+/// identity this wallet already displays.
+pub fn miner_rkm_hex(wallet: &Wallet, index: u64) -> String {
+    let d = wallet.diversifier_at_index(index);
+    qlab_note::hash::digest_bytes(&wallet.rkm(d)).iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -687,5 +758,97 @@ mod tests {
         assert_eq!(re.seed.entropy(), &entropy);
         assert_eq!(re.seed.version(), qlab_wallet::seed::SEED_VERSION);
         assert_eq!(re.allocated, vec![0]);
+    }
+
+    // ── lab #475: the kernel's generation entry point + the one rkm derivation ──
+
+    /// 🔴 **A refused gate leaves NO seed file.** This is the property the whole
+    /// backup gate rests on: `qumbra-node mine` shows the mnemonic, and if the
+    /// operator does not confirm, the machine must be exactly as it was — not
+    /// holding a wallet nobody knows about.
+    #[test]
+    fn a_refused_gate_writes_nothing_at_all() {
+        let d = tmp("i475_refused");
+        let mut shown = String::new();
+        let outcome = create_from_os_entropy_gated(&d, |m| {
+            shown = m.to_string();
+            false
+        })
+        .expect("the refusal is not an error");
+        assert!(matches!(outcome, GatedCreate::Refused));
+        assert!(!shown.is_empty(), "the gate is shown the mnemonic before it decides");
+        assert!(!d.join(SEED_FILE).exists(), "a refused create must leave no seed file");
+        assert!(!d.join(ADDR_FILE).exists(), "and no address cursor either");
+    }
+
+    /// The accepting gate writes the wallet the mnemonic it was shown belongs
+    /// to — the phrase an operator writes down must restore THIS wallet.
+    #[test]
+    fn an_accepted_gate_writes_the_wallet_the_shown_mnemonic_restores() {
+        let d = tmp("i475_accepted");
+        let mut shown = String::new();
+        let w = match create_from_os_entropy_gated(&d, |m| {
+            shown = m.to_string();
+            true
+        })
+        .expect("create")
+        {
+            GatedCreate::Created(w) => w,
+            GatedCreate::Refused => panic!("the gate accepted"),
+        };
+        assert_eq!(reveal_mnemonic(&w), shown, "the shown phrase is this wallet's phrase");
+
+        let restored = tmp("i475_accepted_restored");
+        let seed = seed_from_phrase(&mut shown.as_bytes()).expect("the shown phrase restores");
+        let w2 = WalletDir::create(&restored, seed).expect("restore");
+        assert_eq!(
+            w2.wallet().address_at_index(0).encode(),
+            w.wallet().address_at_index(0).encode(),
+        );
+    }
+
+    /// Generation refuses an occupied dir BEFORE minting anything, so no caller
+    /// can be shown a mnemonic for a wallet that was never going to be written.
+    #[test]
+    fn generation_refuses_an_occupied_dir_without_showing_a_mnemonic() {
+        let d = tmp("i475_occupied");
+        WalletDir::create(&d, MasterSeed::from_entropy([5; ENTROPY_LEN])).unwrap();
+        let before = std::fs::read(d.join(SEED_FILE)).unwrap();
+        let mut gate_ran = false;
+        match create_from_os_entropy_gated(&d, |_| {
+            gate_ran = true;
+            true
+        }) {
+            Err(StoreError::SeedExists(_)) => {}
+            Err(other) => panic!("expected SeedExists, got {other:?}"),
+            Ok(_) => panic!("an occupied dir must never be re-keyed"),
+        }
+        assert!(!gate_ran, "the gate must not run for a dir that was never going to be written");
+        assert_eq!(std::fs::read(d.join(SEED_FILE)).unwrap(), before, "bytes untouched");
+    }
+
+    /// The node's `miner_rkm` is the wallet's rkm **by construction**: this test
+    /// re-derives it the long way and pins the shape the node config parses
+    /// (64 lowercase hex characters).
+    #[test]
+    fn miner_rkm_hex_is_the_wallet_kernels_own_derivation() {
+        let d = tmp("i475_rkm");
+        let w = WalletDir::create(&d, MasterSeed::from_entropy([9; ENTROPY_LEN])).unwrap();
+        let wallet = w.wallet();
+        for index in [0u64, 1, 7] {
+            let got = miner_rkm_hex(&wallet, index);
+            let want: String = qlab_note::hash::digest_bytes(
+                &wallet.rkm(wallet.diversifier_at_index(index)),
+            )
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+            assert_eq!(got, want);
+            assert_eq!(got.len(), 64, "the node config's form is 64 hex characters");
+            assert!(got.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        }
+        // Different indices are different payees — a copied constant would not
+        // have this property and would silently pay one address forever.
+        assert_ne!(miner_rkm_hex(&wallet, 0), miner_rkm_hex(&wallet, 1));
     }
 }

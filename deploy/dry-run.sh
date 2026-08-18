@@ -12,7 +12,10 @@
 #      cross-check against committee₀), reporting the same pinned genesis hash,
 #   5. the committee keys are laid down at 0700 on the DIRECTORY and 0600 on each
 #      FILE — asserted in the deployed tree, in the staging tree they were copied
-#      from, and again after a re-deploy over a deliberately loosened tree.
+#      from, and again after a re-deploy over a deliberately loosened tree,
+#   6. a per-host `miner_rkm` from the hosts file reaches that node's config,
+#      reaches ONLY that node, and SURVIVES REGENERATION (lab #475 acceptance
+#      (f) / the standing 🔴 of OPERATOR §9.5.1).
 #
 # Why (5) is three assertions and not one: the defect it guards against left every
 # key FILE correctly 0600 and only the enclosing DIRECTORY world-searchable, so a
@@ -89,14 +92,36 @@ if [[ ! -x "$BINARY" ]]; then
 fi
 
 # a 4-node LOCAL hosts spec (ssh target "-" = local dir)
+#
+# node1 carries a miner_rkm and the other three do not — the mixed fleet is the
+# case worth testing, because the defect this guards against (the field simply
+# not being emitted) looks identical to "this host has none" on any host that
+# legitimately has none.
 HOSTS="$BASE/hosts.local"
-cat > "$HOSTS" <<'EOF'
-# name  public_addr        ssh_target(-=local)
-node0   127.0.0.1:9401     -
-node1   127.0.0.1:9402     -
-node2   127.0.0.1:9403     -
+MINER_RKM="0100000000000000020000000000000003000000000000000400000000000000"
+cat > "$HOSTS" <<EOF
+# name  public_addr        ssh_target(-=local)   miner_rkm
+node0   127.0.0.1:9401     -                     -
+node1   127.0.0.1:9402     -                     $MINER_RKM
+node2   127.0.0.1:9403     -                     -
 node3   127.0.0.1:9404     -
 EOF
+
+# The three ways a config can be wrong about miner_rkm, as one assertion:
+# node1 must carry exactly this value, and no other node may carry the key at
+# all. `where` labels the pass so the deploy and the re-deploy are told apart.
+assert_miner_rkm() {
+  local where="$1" root name
+  for name in node0 node2 node3; do
+    root="$BASE/nodes/$name"
+    grep -q '^miner_rkm' "$root/node.toml" \
+      && fail "$where: $name has no miner_rkm in the hosts file but its config carries one"
+  done
+  root="$BASE/nodes/node1"
+  grep -q "^miner_rkm = \"$MINER_RKM\"\$" "$root/node.toml" \
+    || fail "$where: node1's miner_rkm did not reach its config (this is OPERATOR §9.5.1)"
+  pass "$where: miner_rkm present on node1 only, verbatim"
+}
 
 echo "== running deploy.sh (local mode) =="
 # --metrics-port exercises issue #87's scrape opt-in through the REAL config path:
@@ -184,6 +209,11 @@ for h in "${HASHES[@]}"; do
 done
 pass "all 4 nodes pinned to genesis $base_hash"
 
+# 6. the per-host payout key reached exactly the host that declared it. Asserted
+#    after the FIRST deploy so a failure here is unambiguous — the re-deploy
+#    below is what turns it into a round-trip claim.
+assert_miner_rkm "deployed"
+
 # ---- pass 2: the creation site, and a re-deploy over a loosened tree ---------
 #
 # Everything above inspects a COPY of the staging tree. Two failures it cannot see:
@@ -223,6 +253,23 @@ for i in "${!NODES[@]}"; do
   assert_key_modes "$STAGE/stage/$name/keys" "$name staged"
   assert_key_modes "$BASE/nodes/$name/keys" "$name re-deployed"
 done
+
+# 🔴 THE ROUND TRIP (lab #475 acceptance (f)). This is the assertion the whole
+# column exists for: OPERATOR §9.5.1's standing red was that a RE-RUN dropped
+# miner_rkm from every host that had it, so the generated config and the live
+# config diverged permanently and the field was restored by hand after every
+# deploy. On an unfixed script the first `assert_miner_rkm` already fails; this
+# second one is what proves regeneration is idempotent rather than merely
+# first-run-correct.
+assert_miner_rkm "re-deployed"
+
+# And it is still a config the node itself accepts — `preflight` parses
+# miner_rkm with the node's own parser since lab #475, so this is not a grep
+# agreeing with another grep.
+out="$("$BASE/nodes/node1/qumbra-node" check --config "$BASE/nodes/node1/node.toml")"
+echo "$out" | grep -q "miner_rkm:    $MINER_RKM" \
+  || fail "node1's regenerated config does not preflight with its payout key: $out"
+pass "node1's regenerated config preflights, payout key reported by the binary"
 
 echo "== DRY-RUN PASSED =="
 echo "genesis hash: $base_hash"

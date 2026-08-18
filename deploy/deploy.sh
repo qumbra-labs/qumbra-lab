@@ -19,9 +19,16 @@
 #   deploy.sh --hosts FILE [options]
 #
 #   --hosts FILE        Required. Node spec, one node per line (see hosts.example):
-#                         <node_name> <public_addr host:port> <ssh_target | ->
+#                         <node_name> <public_addr host:port> <ssh_target | -> [miner_rkm]
 #                       ssh_target "-" means LOCAL mode for that node (dry-run):
 #                       the payload is copied into <local-base>/<node_name>.
+#                       miner_rkm is OPTIONAL and per host: the 64-hex coinbase
+#                       payee that node mines to (`qumbra-wallet miner-rkm`).
+#                       Omit it (or write "-") and the generated config carries
+#                       no miner_rkm, exactly as before. This column exists so
+#                       the hosts file is the SOURCE OF TRUTH for the field:
+#                       before it, a re-run silently dropped miner_rkm from
+#                       every host that had it (OPERATOR §9.5.1).
 #   --local-base DIR    Root for LOCAL-mode nodes (default: ./t0-deploy). Each
 #                       local node lands in DIR/<node_name>/ (an absolute path is
 #                       baked into that node's config).
@@ -77,7 +84,7 @@ while [[ $# -gt 0 ]]; do
     --no-mining)   MINING="false"; shift ;;
     --metrics-port) METRICS_PORT="${2:?}"; shift 2 ;;
     --keep-stage)  KEEP_STAGE=1; shift ;;
-    -h|--help)     sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)     sed -n '2,49p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *)             die "unknown option: $1 (see --help)" ;;
   esac
 done
@@ -92,10 +99,22 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 abspath() { mkdir -p "$1"; (cd "$1" && pwd); }
 
 # ---- parse the hosts spec ---------------------------------------------------
-NAMES=(); ADDRS=(); SSH=()
-while read -r name addr ssh _rest; do
+NAMES=(); ADDRS=(); SSH=(); RKMS=()
+while read -r name addr ssh rkm _rest; do
   [[ -z "${name:-}" || "${name:0:1}" == "#" ]] && continue
-  NAMES+=("$name"); ADDRS+=("$addr"); SSH+=("$ssh")
+  # "-" is an explicit "this host has none", so a hosts file can keep its
+  # columns aligned when only some nodes mine to a wallet.
+  [[ "${rkm:-}" == "-" ]] && rkm=""
+  # Shape only, and deliberately not a second copy of the node's rules: the
+  # AUTHORITY is `qumbra-node check`, which parses this field with the node's
+  # own parser (and refuses an all-zero one) — the dry-run runs that check on
+  # every laid-down config. This catches the one error worth catching before a
+  # 4-host rsync, a truncated paste, and says which host it is on.
+  if [[ -n "${rkm:-}" && ! "$rkm" =~ ^[0-9a-fA-F]{64}$ ]]; then
+    die "host '$name': miner_rkm must be 64 hex characters (got ${#rkm}). \
+It is the value \`qumbra-wallet miner-rkm --dir DIR\` prints."
+  fi
+  NAMES+=("$name"); ADDRS+=("$addr"); SSH+=("$ssh"); RKMS+=("${rkm:-}")
 done < "$HOSTS_FILE"
 
 NODE_COUNT=${#NAMES[@]}
@@ -211,6 +230,21 @@ committee_key_paths = [$keys_csv]
 mining = $MINING
 expected_genesis_hash = "$GENESIS_HASH"
 EOF
+
+  # Per-host coinbase payee (OPERATOR §9.5.1, lab #475). Emitted ONLY when the
+  # hosts file carries one, so a fleet that does not mine to a wallet generates
+  # exactly the config it generated before. The point of the column is that this
+  # is now REGENERABLE: `deploy.sh` used to drop the field on every re-run, so
+  # the live hosts' configs and the config the tool produced had permanently
+  # diverged, and the fix was a hand edit after every deploy.
+  if [[ -n "${RKMS[$i]}" ]]; then
+    cat >> "$stage/node.toml" <<EOF
+# Coinbase payee for this host (issue #101). 64 hex characters, lane-major LE —
+# the value \`qumbra-wallet miner-rkm --dir DIR\` prints. Sourced from the
+# --hosts file, so it survives regeneration; edit it THERE, not on the host.
+miner_rkm = "${RKMS[$i]}"
+EOF
+  fi
 
   # /metrics scrape endpoint (issue #87). Absent unless --metrics-port was passed:
   # a node nobody scrapes listens on nothing extra, so this can never be left open

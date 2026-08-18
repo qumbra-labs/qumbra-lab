@@ -76,6 +76,31 @@ qlab-consensus = { path = "../qlab-consensus" }
 # the declared public surface (M10-T0-4, issue #68). Already built transitively
 # via qlab-consensus; named directly here for the verifier's reconstruction path.
 qlab-air = { path = "../qlab-air" }
+# The wallet KERNEL, for `mine` (lab #475). Two things come from here and
+# nothing else does:
+#
+#   store::create_from_os_entropy_gated  the ONLY place a wallet is minted, so
+#                                        `mine` never re-implements entropy →
+#                                        seed → seed file, and the seed is
+#                                        written by the wallet crate rather than
+#                                        held here. This process keeps the
+#                                        public rkm and nothing more.
+#   store::miner_rkm_hex                 lab #425's one-derivation rule: the
+#                                        `miner_rkm` this node mines to IS the
+#                                        wallet's rkm by construction.
+#
+# 🔴 `features = ["net"]` puts rustls in THIS BINARY's graph — deliberate, and
+# argued on lab #475 before it was built. `net.rs`'s own note records why TLS
+# was kept out of `qlab-cbserver` (issue #297): it would land in `qlab-node`'s
+# graph and therefore in the CONSENSUS library's. This is the leaf binary crate,
+# which nothing depends on, and it buys the one thing `mine` cannot do without —
+# fetching `https://seed.qumbra.org/genesis.qmb`. `default-features = false`
+# keeps `prove`/`randomx`/`host` out; the fetch is a hash-pinned artifact, so
+# TLS is transport hygiene here and not the thing the verification rests on.
+#
+# The reverse edge (`qumbra-wallet`'s dev-dependency on this crate) makes this a
+# dev-dependency cycle, which cargo resolves — checked, not assumed.
+qumbra-wallet = { path = "../qumbra-wallet", default-features = false, features = ["net"] }
 # ML-DSA-65 verifying-key encode/decode for committee₀ in the genesis file.
 ml-dsa = "=0.1.1"
 

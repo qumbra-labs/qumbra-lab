@@ -22,15 +22,23 @@
 //! A1 — `POST /v1/tx` on the stamped keyless public host (issues #275/#276).
 
 use qlab_air::narrow::{
-    build_bucket_dummy1, build_bucket_with_witnesses, derive_input, derive_output_rho,
-    off_tree_witness, MerkleWitness, TxInput, TxOutput,
+    derive_input, derive_output_rho, off_tree_witness, MerkleWitness, TxInput, TxOutput,
 };
 use qlab_cbserver::tree::CommitmentTree;
 #[cfg(feature = "prove")]
 use qlab_consensus::{prove_bucket, LOG_HEIGHT};
-use qlab_devnet::body::{TxEntry, TxPublic};
 use qlab_devnet::fees::{posted_fee, ArityBucket};
 use qlab_note::compact::encode_committed_discovery;
+// Reached only from the `prove` half of this module (the real prover and the
+// canonical tx wire). Gated since lab #475 gave this crate its first
+// `--no-default-features` consumer — `qumbra-node mine` takes `store` + `net`
+// and nothing else, and unconditional imports here were unused warnings in
+// every build of the node.
+#[cfg(feature = "prove")]
+use qlab_air::narrow::{build_bucket_dummy1, build_bucket_with_witnesses};
+#[cfg(feature = "prove")]
+use qlab_devnet::body::{TxEntry, TxPublic};
+#[cfg(feature = "prove")]
 use qlab_note::hash::digest_bytes;
 use qlab_note::scan::encrypt_to_recipient;
 use qlab_wallet::address::Address;

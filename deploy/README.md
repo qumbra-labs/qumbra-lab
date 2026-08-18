@@ -8,7 +8,9 @@ subset + a generated config) onto each host.
 - **`deploy.sh`** — the tool (build → genesis → per-node config → stage → push).
 - **`dry-run.sh`** — Phase-A: run the whole deploy against 4 **local directories**
   standing in for the hosts, then assert the layout is correct and startable.
-- **`hosts.example`** — the 4-node host spec (fill in real IPs for Phase B).
+- **`hosts.example`** — the 4-node host spec (fill in real IPs for Phase B). Since
+  lab #475 it carries an **optional 4th column, `miner_rkm`** — the per-host
+  coinbase payee — and it is the **source of truth** for that field.
 - **`qumbra-node.service.example`** — optional systemd unit for the VPS.
 
 ## The T0 topology (inline stamps, per the task-book)
@@ -105,7 +107,17 @@ and a re-run after T0-5 — budget roughly a week of uptime on four small instan
 
 ## Phase B — the real 4-VPS deploy ✅ executed 2026-07-26 (see `qumbra-deploy`)
 
-1. Edit `hosts.example` → `hosts` with the 4 VPS public addresses + ssh targets.
+1. Edit `hosts.example` → `hosts` with the 4 VPS public addresses + ssh targets,
+   and — for any host that should be paid what it mines — its `miner_rkm` in the
+   optional 4th column (`qumbra-wallet miner-rkm --dir DIR` prints the value; `-`
+   or an omitted column means that host carries none).
+
+   🔴 **Put it in the hosts file, never on the host.** Before lab #475 the
+   generator emitted no `miner_rkm` at all, so every re-run dropped the field
+   from each host that had one and it was restored by hand afterwards — the
+   standing red of `qumbra-deploy/OPERATOR.md` §9.5.1. A config edited on the
+   host is overwritten by the next deploy; the hosts file is what survives
+   regeneration, and `dry-run.sh` asserts exactly that.
 2. Build a **Linux** binary (see the cross-compile caveat below).
 3. Deploy:
    ```sh

@@ -105,6 +105,19 @@ cd qumbra-t1-<shortrev>-<platform>
 运行。请用 `curl` 下载，或显式清除该属性：
 `xattr -d com.apple.quarantine qumbra-node qumbra-wallet`。
 
+### Windows:用 WSL2(原生支持开发中)
+
+目前没有原生 Windows 二进制。**WSL2 是当下受支持的路径**,挖矿速度几乎无损(挖矿是纯
+CPU 活;WSL2 的开销在 IO):
+
+1. 管理员 PowerShell:`wsl --install`,然后重启(装的是 Ubuntu,glibc ≥ 2.36,达标)。
+2. 打开 Ubuntu 终端,从本文 §1 开始照走,用 `linux-x86_64-glibc` 那个 tarball;下文
+   所有步骤原样适用。
+3. 笔记本插电,并把 Windows 电源设置改为不休眠——睡着的主机不挖矿。
+
+原生 Windows 支持已派工跟踪;落地后 Releases 页会多一个 `windows-x86_64` 产物,本节
+缩成一行。
+
 ## 2. 作为不挖矿的节点加入
 
 把下载的 `genesis.qmb` 与以下最小 `node.toml` 放在同一目录：
@@ -193,6 +206,36 @@ curl -fsSL https://seed.qumbra.org/genesis.qmb -o genesis.qmb
   ([`run.rs:376-421`](../crates/qumbra-node/src/run.rs#L376-L421))。
 
 ## 3. 把已加入的节点改成矿工
+
+### 一条命令代替五条（2026-08-18 新增，lab #475）
+
+§2 和 §3 其余部分讲的每一件事——建钱包、备份助记词、导出收款密钥、手写
+`node.toml`、下载 genesis——都是 `qumbra-node mine` 替你做的事。节点是同一个节点，
+配置是同一份配置；区别只是五步变成一步：
+
+```sh
+./qumbra-node mine --dir ~/.qumbra-miner
+```
+
+在终端里运行、且该目录还没有钱包时，它会生成一个钱包，在红色横幅下**只打印一次**
+助记词，并且**等你按下回车**才继续。请在那一刻把助记词抄到纸上：它不会存放在任何
+你能再读回来的地方，而这个节点挖到的每一枚币都付给它。
+
+随后它下载 `genesis.qmb`（仅当目录里还没有时），在**绑定任何端口之前**用本二进制
+内置的哈希校验它，把一份普通的 `node.toml` 写进该目录，然后运行它。没有任何隐藏
+状态：事后打开 `~/.qumbra-miner/node.toml`，它就是 §2 和 §3 教你手写的那份文件。
+
+| 参数 | 用途 |
+|---|---|
+| `--yes-i-backed-up` | 无终端环境(systemd unit、容器)下的确认方式。**没有终端又没有这个参数时,`mine` 会拒绝创建钱包**,而不是悄悄创建一个——助记词需要你自己从命令输出里保存下来。 |
+| `--rkm <64 位十六进制>` | 付给你已经拥有的密钥。不读、不建、也不查找任何钱包;这就是上面几节讲的手动路径,原样不变。 |
+| `--seeds`、`--genesis-url`、`--listen`、`--index` | 覆盖内置默认值(§1 的四个种子节点、`https://seed.qumbra.org/genesis.qmb`、`0.0.0.0:9400`、地址索引 0)。非零的 `--index` 会在运行中被**分配**到钱包里,这样本节点挖到的币始终落在 `scan` 覆盖得到的范围内;上限为 1024,更高的索引请用 `qumbra-wallet address --new` 配合 `--rkm`。 |
+
+钱包落在 `~/.qumbra-miner/wallet`，所以 §4 的每条钱包命令都可以直接对它使用——
+`qumbra-wallet backup --dir ~/.qumbra-miner/wallet --reveal` 会再次显示助记词，
+`scan` 则读取这个节点挖到的东西。在已准备好的目录上重跑 `mine` 不会改变任何东西，
+只是启动节点；如果你手动改过 `node.toml`，它会拒绝而不是覆盖你的修改，并提示改用
+`run --config`。
 
 ### 平台边界——2026-08-17 已更正(原:只能用 Linux/glibc)
 
