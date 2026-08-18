@@ -58,6 +58,7 @@ use qlab_wallet::address::{Address, ADDR_HRP};
 
 use crate::service::{FaucetGate, RequestState};
 use crate::state::ServiceStatus;
+use crate::telemetry::{current_trace_id, FaucetMetrics, RequestLabels};
 
 // ---------------------------------------------------------------------------
 // Client identity for the rate limiter (lab #308)
@@ -322,6 +323,14 @@ pub const ADDR_SHOWN_CHARS: usize = 16;
 /// legitimate shape and refuses a body nobody meant to send.
 const MAX_BODY_BYTES: usize = 8 * 1024;
 
+/// The `route` label and span attribute for anything that did not match a route.
+///
+/// A single fixed string, deliberately: the alternative is putting the requested
+/// path on a metric label, and a scraped time series keyed by whatever a scanner
+/// asked for is both an unbounded-cardinality hazard and a record of what was
+/// probed. `/r/{receipt}` is collapsed for the same reason one level down.
+const UNMATCHED_ROUTE: &str = "{unmatched}";
+
 /// The brand mark, compiled in. **Copies** — `qumbra-design/brand/` is the source of
 /// truth and `assets/brand/README.md` records the rest, including why these are PNG
 /// when the canonical file is an SVG. They are `include_bytes!` rather than files on
@@ -424,6 +433,7 @@ pub struct FaucetServer {
     thread: Option<JoinHandle<()>>,
     served: Arc<AtomicU64>,
     journal: Arc<Mutex<Vec<String>>>,
+    metrics: Arc<FaucetMetrics>,
 }
 
 impl std::fmt::Debug for FaucetServer {
@@ -469,6 +479,24 @@ impl FaucetServer {
         status: Arc<Mutex<ServiceStatus>>,
         trusted: TrustedProxies,
     ) -> io::Result<FaucetServer> {
+        Self::start_with_telemetry(addr, gate, status, trusted, Arc::new(FaucetMetrics::new()))
+    }
+
+    /// [`Self::start_with_trusted_proxies`], with the process's shared metric
+    /// registry so the served requests land in the histogram the
+    /// [`crate::metrics_server`] endpoint encodes.
+    ///
+    /// This is the constructor `main` uses. The two above keep their signatures and
+    /// hand in a private registry: a caller that does not serve `/metrics` still
+    /// gets the same measurements taken, they simply go nowhere — which is what
+    /// keeps every existing test of this surface unchanged.
+    pub fn start_with_telemetry(
+        addr: &str,
+        gate: Arc<Mutex<FaucetGate>>,
+        status: Arc<Mutex<ServiceStatus>>,
+        trusted: TrustedProxies,
+        metrics: Arc<FaucetMetrics>,
+    ) -> io::Result<FaucetServer> {
         let server = tiny_http::Server::http(addr)
             .map_err(|e| io::Error::other(format!("listen_addr {addr}: {e}")))?;
         let server = Arc::new(server);
@@ -482,6 +510,7 @@ impl FaucetServer {
         let worker = Arc::clone(&server);
         let worker_served = Arc::clone(&served);
         let worker_journal = Arc::clone(&journal);
+        let worker_metrics = Arc::clone(&metrics);
         let thread = std::thread::spawn(move || {
             for mut request in worker.incoming_requests() {
                 worker_served.fetch_add(1, Ordering::Relaxed);
@@ -497,15 +526,35 @@ impl FaucetServer {
                     request.url().split('?').next().unwrap_or("/").trim_end_matches('/').to_string();
                 let path = if path.is_empty() { "/".to_string() } else { path };
 
-                let (status_code, body, extra_header) = match (&method, path.as_str()) {
+                // 🔴 Piece 1 of the kit: ONE span per request, opened at the accept
+                // seam and closed when the response has been handed to the socket.
+                //
+                // What is on it is chosen by the same redaction rule the journal
+                // line follows: the method, the **matched route** (never the raw
+                // URL — `/r/17` is a receipt somebody looked at), the status, and
+                // nothing that came from the requester. No client address, not even
+                // the subnet: a span is exported off-host, and the journal line an
+                // operator reads is not.
+                let span = tracing::info_span!(
+                    "faucet.request",
+                    otel.kind = "server",
+                    "http.request.method" = %method,
+                    "http.route" = tracing::field::Empty,
+                    "http.response.status_code" = tracing::field::Empty,
+                );
+                let _enter = span.enter();
+                let started = std::time::Instant::now();
+
+                let (route, status_code, body, extra_header) = match (&method, path.as_str()) {
                     (tiny_http::Method::Get, "/healthz") => {
-                        (200, Body::Text("ok\n".to_string()), None)
+                        ("/healthz", 200, Body::Text("ok\n".to_string()), None)
                     }
                     // The two brand icons, compiled in — see assets/brand/PROVENANCE.md
                     // for why they are copies and why they are PNG rather than the SVG.
                     // Cached hard: a favicon is refetched on every page load otherwise,
                     // and each fetch is another line in the access journal.
                     (tiny_http::Method::Get, "/favicon-32.png") => (
+                        "/favicon-32.png",
                         200,
                         Body::Png(FAVICON_32),
                         Some((
@@ -514,6 +563,7 @@ impl FaucetServer {
                         )),
                     ),
                     (tiny_http::Method::Get, "/favicon-16.png") => (
+                        "/favicon-16.png",
                         200,
                         Body::Png(FAVICON_16),
                         Some((
@@ -522,15 +572,16 @@ impl FaucetServer {
                         )),
                     ),
                     (tiny_http::Method::Get, "/") => {
-                        (200, Body::Html(render_index(&snapshot(&status), None)), None)
+                        ("/", 200, Body::Html(render_index(&snapshot(&status), None)), None)
                     }
                     (tiny_http::Method::Get, p) if p.starts_with("/r/") => {
                         let receipt = p.trim_start_matches("/r/").parse::<u64>().ok();
                         match receipt.and_then(|r| lock(&gate).state_of(r).map(|s| (r, s))) {
                             Some((r, state)) => {
-                                (200, Body::Html(render_receipt(r, &state)), None)
+                                ("/r/{receipt}", 200, Body::Html(render_receipt(r, &state)), None)
                             }
                             None => (
+                                "/r/{receipt}",
                                 404,
                                 Body::Html(page(
                                     "unknown receipt",
@@ -571,6 +622,7 @@ impl FaucetServer {
                             _ => None,
                         };
                         (
+                            "/request",
                             outcome.status(),
                             Body::Html(render_index(&snapshot(&status), Some(&outcome))),
                             retry.map(|s| ("Retry-After".to_string(), s.to_string())),
@@ -581,6 +633,7 @@ impl FaucetServer {
                     // route" are different facts and a 404 here would send an
                     // operator looking for a routing bug.
                     (tiny_http::Method::Get, "/request") => (
+                        "/request",
                         405,
                         Body::Html(page(
                             "method not allowed",
@@ -591,6 +644,7 @@ impl FaucetServer {
                         Some(("Allow".to_string(), "POST".to_string())),
                     ),
                     (tiny_http::Method::Get, _) => (
+                        UNMATCHED_ROUTE,
                         404,
                         Body::Html(page(
                             "not found",
@@ -600,6 +654,7 @@ impl FaucetServer {
                         None,
                     ),
                     _ => (
+                        UNMATCHED_ROUTE,
                         405,
                         Body::Html(page(
                             "method not allowed",
@@ -609,12 +664,47 @@ impl FaucetServer {
                     ),
                 };
 
+                span.record("http.route", route);
+                span.record("http.response.status_code", status_code);
+                let elapsed = started.elapsed().as_secs_f64();
+                // 🔴 Piece 2: one id, read once, used by both the log line and the
+                // exemplar — so a trace found from a log line and a trace found from
+                // a slow bucket are provably the same trace.
+                let trace_id = current_trace_id();
+                worker_metrics.observe_request(
+                    RequestLabels {
+                        method: method.to_string(),
+                        route: route.to_string(),
+                        status: status_code,
+                    },
+                    elapsed,
+                    trace_id.clone(),
+                );
+
                 // The access journal. Subnet, not client IP; no body, no ticket, and
                 // no address — see the module docs.
-                let line = format!(
-                    "FAUCET {method} {path} {status_code} subnet={}",
-                    subnet_label(&client)
-                );
+                //
+                // `trace_id=` is APPENDED rather than inserted: the four fields
+                // before it are what `the_access_log_carries_no_full_requester_address`
+                // and every operator's eye already read, and a field order change is
+                // a silent break of anything parsing them positionally.
+                //
+                // Omitted entirely when no tracer is installed, which is the case in
+                // unit tests that drive this surface directly. `trace_id=` followed
+                // by nothing usable would be worse than absent: Loki's derived-field
+                // regex `trace_id=([0-9a-f]{32})` would not match it either, and a
+                // reader would take zeros for a real trace. `main` installs a tracer
+                // before it binds, so the deployed binary always has one.
+                let line = match &trace_id {
+                    Some(id) => format!(
+                        "FAUCET {method} {path} {status_code} subnet={} trace_id={id}",
+                        subnet_label(&client)
+                    ),
+                    None => format!(
+                        "FAUCET {method} {path} {status_code} subnet={}",
+                        subnet_label(&client)
+                    ),
+                };
                 // Both, and the same string: an access log an operator cannot read is
                 // not an access log, and a redaction asserted against an in-memory
                 // copy that differs from what stdout gets is not a redaction. The
@@ -649,7 +739,7 @@ impl FaucetServer {
             }
         });
 
-        Ok(FaucetServer { addr: bound, server, thread: Some(thread), served, journal })
+        Ok(FaucetServer { addr: bound, server, thread: Some(thread), served, journal, metrics })
     }
 
     /// The bound address (useful when the config asked for port 0).
@@ -660,6 +750,11 @@ impl FaucetServer {
     /// Requests handled since start, including 404s and 405s.
     pub fn requests_served(&self) -> u64 {
         self.served.load(Ordering::Relaxed)
+    }
+
+    /// The metric registry this listener observes into.
+    pub fn metrics(&self) -> Arc<FaucetMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// The access journal, as written. Exposed so the redaction claim is a **test**
@@ -736,7 +831,32 @@ pub fn handle_request(
         .find(|(k, _)| k == "ticket")
         .and_then(|(_, v)| Ticket::decode(v.trim()));
 
-    match lock(gate).accept(client, address, ticket, now_ms()) {
+    // The `gate` stage as its own span: `Faucet::accept` is where the ticket MAC is
+    // checked and the token buckets are charged, and it is the one part of a request
+    // that can be slow for a reason an operator would want to see separated from the
+    // page render.
+    let gate_span = tracing::info_span!("faucet.gate");
+    let outcome = {
+        let _enter = gate_span.enter();
+        let mut g = lock(gate);
+        let accepted = g.accept(client, address, ticket, now_ms());
+        if let Ok((receipt, _)) = &accepted {
+            // 🔴 The seam that makes "request → grant stages" a real causal chain
+            // rather than a diagram. The grant does NOT happen inside this request —
+            // it happens later, on the node's own loop (`FaucetService::tick`), and
+            // pretending otherwise is what a naive child span here would do. So the
+            // request's span context is parked against the receipt, and the later
+            // `faucet.dispense` span carries a **link** to it. Two traces, one
+            // documented edge, and the ~2.3 s proof is a span in the one where it
+            // actually runs.
+            if let Some(cx) = crate::telemetry::current_span_context() {
+                g.remember_request_span(*receipt, cx);
+            }
+        }
+        accepted
+    };
+
+    match outcome {
         Ok((receipt, position)) => RequestOutcome::Queued { receipt, position },
         Err(AcceptError::Refused(r)) => RequestOutcome::Refused(r),
         Err(AcceptError::Queue(qlab_faucet::QueueError::Full { depth })) => {

@@ -33,7 +33,9 @@ use qlab_wallet::Wallet;
 
 use qumbra_faucet::config::FaucetServiceConfig;
 use qumbra_faucet::http::FaucetServer;
+use qumbra_faucet::metrics_server::MetricsServer;
 use qumbra_faucet::service::{publish_starting, FaucetService};
+use qumbra_faucet::telemetry::{FaucetMetrics, Telemetry};
 use qumbra_node::config::NodeConfig;
 use qumbra_node::genesis::GenesisFile;
 use qumbra_node::run::RunningNode;
@@ -50,22 +52,34 @@ fn faucet_d() -> Diversifier {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match dispatch(&args) {
+    // 🔴 Telemetry is initialised for EVERY subcommand, not just `run`, and the
+    // reason is the negative test rather than tidiness: "no `OTEL_EXPORTER_OTLP_ENDPOINT`
+    // ⇒ no exporter, no noise" is only checkable from outside if some cheap
+    // subcommand exercises the same initialisation path a long-running `run` does.
+    // `tests/otel_disabled.rs` drives `keygen` for exactly that. The cost when
+    // export is off is one tracer provider with no span processor.
+    let telemetry = Telemetry::init();
+    let code = match dispatch(&args, &telemetry) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("qumbra-faucet error: {e}");
             ExitCode::FAILURE
         }
-    }
+    };
+    // Flush before exit: a batch exporter that is dropped without a shutdown loses
+    // whatever it was holding, and the spans most worth having are the ones from
+    // the run that just ended.
+    telemetry.shutdown();
+    code
 }
 
-fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
+fn dispatch(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     match args.first().map(String::as_str) {
         Some("keygen") => keygen(&args[1..]),
         Some("address") => address(&args[1..]),
         Some("ticket") => ticket(&args[1..]),
         Some("check") => check(&args[1..]),
-        Some("run") => run(&args[1..]),
+        Some("run") => run(&args[1..], telemetry),
         Some("-h") | Some("--help") | None => {
             usage();
             Ok(())
@@ -222,6 +236,10 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  hd account:        {}", svc.hd_account());
     println!("  tickets required:  {}", svc.tickets_required());
     println!("  {}", trusted.posture_line());
+    println!(
+        "  metrics:           {}",
+        svc.metrics_addr.as_deref().unwrap_or("not served (set metrics_addr — loopback only)")
+    );
     println!("  miner_rkm:         {}", miner_rkm_hex(&wallet));
     if !svc.binds_loopback() {
         println!();
@@ -233,7 +251,7 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
+fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     let cfg_path = flag(args, "--config").ok_or("run requires --config FILE")?;
     let (svc, node_cfg, wallet, ticket_secret) = load(cfg_path)?;
     let genesis = GenesisFile::load(&node_cfg.genesis_file)?;
@@ -283,13 +301,33 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     //   * `svc.trusted_proxies()` — #308's CIDR parse.
     // Both are already done. A bind that happened before them would be a faucet
     // holding a socket it was about to refuse to run on.
-    let server = FaucetServer::start_with_trusted_proxies(
+    let metrics: Arc<FaucetMetrics> = telemetry.metrics();
+    let server = FaucetServer::start_with_telemetry(
         &svc.listen_addr,
         service.gate(),
         service.status(),
         trusted.clone(),
+        Arc::clone(&metrics),
     )?;
     println!("qumbra-faucet listening on http://{}/ — opening the node…", server.addr());
+
+    // The scrape endpoint binds here too, and for the same reason the faucet's own
+    // listener does: `Node::open` replays `blocks.log` and has taken hours on a
+    // snapshotless host (#359), and a scrape target that only appears after that is
+    // a scrape target that is down for the whole window an operator most wants it.
+    // Off unless `metrics_addr` is set; a non-loopback value was already refused at
+    // load, so this bind cannot be the first place an operator hears about it.
+    let metrics_server = match svc.metrics_addr.as_deref() {
+        Some(addr) => {
+            let m = MetricsServer::start(addr, Arc::clone(&metrics))?;
+            println!("  metrics:      http://{}/metrics (loopback only)", m.addr());
+            Some(m)
+        }
+        None => {
+            println!("  metrics:      not served (set metrics_addr in the config to enable)");
+            None
+        }
+    };
 
     // Now the expensive part, with the listener already answering `Starting`. The
     // publisher thread lives exactly as long as the open: it reads the same
@@ -334,6 +372,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  tickets:        {}", if svc.tickets_required() { "required" } else { "OPEN" });
     // Lab #308 / #296 honesty voice: name which client-id posture is active.
     println!("  {}", trusted.posture_line());
+    println!("  {}", telemetry.posture_line());
     println!("  {verifier_log}");
     if !server.addr().ip().is_loopback() {
         println!(
@@ -403,6 +442,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     });
 
     server.shutdown();
+    if let Some(m) = metrics_server {
+        m.shutdown();
+    }
     println!("shutdown complete");
     Ok(())
 }
