@@ -291,6 +291,10 @@ pub struct Preflight {
     pub dial_peers: usize,
     /// Whether this node would produce blocks.
     pub mining: bool,
+    /// The configured coinbase payee, if any. `None` means mined coins burn —
+    /// which `run` warns about loudly and which a pre-flight should therefore
+    /// be able to show *before* the node is started.
+    pub miner_rkm: Option<String>,
 }
 
 /// Validate a node's `config` against its `genesis` exactly as startup would — the
@@ -301,6 +305,13 @@ pub struct Preflight {
 pub fn preflight(config: &NodeConfig, genesis: &GenesisFile) -> Result<Preflight, RunError> {
     genesis.verify_startup(config.expected_genesis_hash.as_deref())?;
     let validators = genesis.load_validators(&config.committee_key_paths)?;
+    // Lab #475: the payout key is parsed HERE too, by the same parser startup
+    // uses. It was the one config field a pre-flight did not touch, so a
+    // truncated or all-zero paste passed `check` and was discovered one host at
+    // a time when each node refused to start. `deploy/deploy.sh` can now push a
+    // per-host `miner_rkm`, which makes this the difference between one caught
+    // typo and four hosts down.
+    config.miner_rkm_lanes().map_err(RunError::Config)?;
     Ok(Preflight {
         genesis_hash: genesis.hash_hex(),
         committee_size: genesis.frozen.committee_size,
@@ -309,6 +320,7 @@ pub fn preflight(config: &NodeConfig, genesis: &GenesisFile) -> Result<Preflight
         listen_addr: config.listen_addr.clone(),
         dial_peers: config.dial_peers.len(),
         mining: config.mining,
+        miner_rkm: config.miner_rkm.clone(),
     })
 }
 
@@ -4552,6 +4564,38 @@ mod tests {
             preflight(&bad, &genesis),
             Err(RunError::Genesis(GenesisError::WrongGenesisHash { .. }))
         ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Lab #475: the payout key is a pre-flight concern. Before this, a
+    /// malformed `miner_rkm` passed `check` cleanly and was discovered one host
+    /// at a time as each node refused to start — and `deploy/deploy.sh` can now
+    /// push one per host, so the blast radius of a truncated paste is the fleet.
+    #[test]
+    fn preflight_refuses_a_miner_rkm_the_node_could_not_start_with() {
+        let (mut config, genesis, base) = rig("preflight_rkm", true);
+
+        // Unset is not an error — it is the loud-burn-warning case, and the
+        // pre-flight reports it rather than refusing a legal config.
+        config.miner_rkm = None;
+        assert_eq!(preflight(&config, &genesis).expect("unset is legal").miner_rkm, None);
+
+        let good = "0100000000000000020000000000000003000000000000000400000000000000";
+        config.miner_rkm = Some(good.to_string());
+        assert_eq!(
+            preflight(&config, &genesis).expect("a real key preflights").miner_rkm.as_deref(),
+            Some(good)
+        );
+
+        // The two shapes an operator actually produces: a truncated paste, and
+        // the all-zero placeholder every node rejects at block validation.
+        for bad in ["dead".to_string(), "0".repeat(64)] {
+            config.miner_rkm = Some(bad.clone());
+            assert!(
+                matches!(preflight(&config, &genesis), Err(RunError::Config(_))),
+                "{bad} must not pass a pre-flight the node would refuse to start on"
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -220,6 +220,41 @@ Read successive `TELEMETRY` lines, not one isolated sample
 
 ## 3. Turn the joined node into a miner
 
+### One command instead of five (added 2026-08-18, lab #475)
+
+Everything in §2 and in the rest of §3 — a wallet, its backup, the payout key, a
+hand-written `node.toml`, the genesis download — is what `qumbra-node mine` does
+for you. It is the same node with the same config; the difference is that the
+five steps are one:
+
+```sh
+./qumbra-node mine --dir ~/.qumbra-miner
+```
+
+On a terminal, with no wallet in that directory, it generates one, prints its
+mnemonic **once** behind a red banner, and **waits for you to press Enter**
+before it goes any further. Write the phrase down at that moment: it is not
+stored anywhere you can read back, and every coin this node mines is paid to it.
+
+Then it downloads `genesis.qmb` (only if the directory does not already have
+one), verifies it against the hash this binary was built with **before anything
+binds a socket**, writes an ordinary `node.toml` into the directory, and runs it.
+Nothing is hidden: read `~/.qumbra-miner/node.toml` afterwards and it is the same
+file §2 and §3 tell you to write by hand.
+
+| flag | for |
+|---|---|
+| `--yes-i-backed-up` | the confirmation, for a run with no terminal (a systemd unit, a container). **Without a terminal and without this flag, `mine` refuses to create a wallet** rather than creating one silently — capture the mnemonic from the command's output yourself. |
+| `--rkm <64 hex>` | pay a key you already have. No wallet is read, created, or looked for; this is the manual path of the sections above, unchanged. |
+| `--seeds`, `--genesis-url`, `--listen`, `--index` | override the baked defaults (the four §1 seeds, `https://seed.qumbra.org/genesis.qmb`, `0.0.0.0:9400`, address index 0). |
+
+The wallet lands in `~/.qumbra-miner/wallet`, so every wallet command in §4 works
+against it — `qumbra-wallet backup --dir ~/.qumbra-miner/wallet --reveal` shows
+the phrase again, and `scan` reads what this node has mined. Re-running `mine` on
+a prepared directory changes nothing and just starts the node; if you have edited
+`node.toml` by hand it refuses rather than overwriting your edit, and tells you to
+use `run --config` instead.
+
 ### Platform boundary — CORRECTED 2026-08-17 (was: Linux/glibc only)
 
 > **Dated correction (2026-08-17, lab #437): native macOS mining is PERMITTED.** The original

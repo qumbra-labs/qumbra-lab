@@ -66,7 +66,10 @@ use crate::send::os_rng;
 use crate::send::{prove_bundle, SendArtifact};
 use crate::spent::{fetch_spent, SpentSet};
 use crate::store::WalletDir;
-use crate::sync::{hex32, AnchorSource, Anchors};
+use crate::sync::{AnchorSource, Anchors};
+// See the note in `send.rs`: used only from the `prove` half.
+#[cfg(feature = "prove")]
+use crate::sync::hex32;
 
 /// What the caller asked for. Separate from the flow so a surface can validate
 /// and present a request before anything touches the network.
