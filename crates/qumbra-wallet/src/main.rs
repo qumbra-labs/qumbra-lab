@@ -5,7 +5,6 @@ use std::error::Error;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use qlab_wallet::seed::{MasterSeed, ENTROPY_LEN};
 use qumbra_wallet::store::{seed_from_phrase, reveal_mnemonic, WalletDir};
 use qumbra_wallet::view;
 
@@ -316,13 +315,18 @@ fn dir_of(args: &[String]) -> Result<PathBuf, Box<dyn Error>> {
 }
 
 fn keygen(args: &[String]) -> Result<(), Box<dyn Error>> {
-    use rand::Rng;
     let dir = dir_of(args)?;
-    // The OS CSPRNG directly; a failure is fatal — a seed from a degraded
-    // source is a key somebody else can derive (the faucet's rule, kept).
-    let mut entropy = [0u8; ENTROPY_LEN];
-    rand::rng().fill_bytes(&mut entropy);
-    let w = WalletDir::create(&dir, MasterSeed::from_entropy(entropy))?;
+    // Entropy → seed → seed file is the library's job since lab #475
+    // (`create_from_os_entropy_gated`), so this binary and `qumbra-node mine`
+    // mint a wallet by the same code rather than by two copies of it. The gate
+    // is what `mine` uses for its backup confirmation; keygen prints no key
+    // material, so it has nothing to confirm and always proceeds.
+    let w = match qumbra_wallet::store::create_from_os_entropy_gated(&dir, |_mnemonic| true)? {
+        qumbra_wallet::store::GatedCreate::Created(w) => w,
+        qumbra_wallet::store::GatedCreate::Refused => {
+            unreachable!("keygen's gate always accepts")
+        }
+    };
     let addr = w.wallet().address_at_index(0);
     println!("qumbra-wallet keygen");
     println!("  seed:    {} (0600 — NEVER printed; back it up with `backup --reveal`)", dir.join(qumbra_wallet::store::SEED_FILE).display());
@@ -470,9 +474,9 @@ fn miner_rkm(args: &[String]) -> Result<(), Box<dyn Error>> {
              allocate it (`address --new`) so scans cover the coinbase identity."
         );
     }
-    let d = wallet.diversifier_at_index(idx);
-    let bytes = qlab_note::hash::digest_bytes(&wallet.rkm(d));
-    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    // The derivation itself lives in the library (lab #475): `qumbra-node mine`
+    // needs this exact value and a payout key must not have two expressions.
+    let hex = qumbra_wallet::store::miner_rkm_hex(&wallet, idx);
     println!("Put this in the NODE's config so it pays this wallet what it mines:");
     println!("  miner_rkm = \"{hex}\"");
     // Deliberately no copied number: the maturity constant lives in
