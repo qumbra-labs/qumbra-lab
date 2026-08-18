@@ -115,7 +115,33 @@ impl PowEngine for RandomXPow {
 
 /// Interpret a PoW hash's leading 8 bytes as a big-endian `u64` work value.
 pub fn hash_to_work_value(hash: &Hash32) -> u64 {
-    u64::from_be_bytes(hash[..8].try_into().expect("Hash32 has ≥ 8 bytes"))
+    hash_to_work_value_for(hash, GenesisForm::V4)
+}
+
+/// The work value under `form` (lab #490):
+///
+/// - **V4**: the leading 8 bytes, big-endian — byte-identical to what this
+///   function always was; the live T1 chain's predicate, locked by test.
+/// - **V5**: the trailing 8 bytes, little-endian (`hash[24..32]`) — the
+///   **Monero convention** (hash as a 256-bit LE integer; its top 64 bits are
+///   bytes 24..32), i.e. the exact bytes stock xmrig's share predicate reads
+///   (`CpuWorker.cpp`: `*reinterpret_cast<uint64_t*>(m_hash + 24)`). Route A
+///   (pool + unmodified xmrig) is why this is the v5 rule: under the v4 read a
+///   pool would reject ~100 % of honest shares and block finds would surface
+///   with probability ≈ share-target/2⁶⁴ (#490's finding).
+///
+/// Both reads are a uniform top-64-bit sample of a uniform hash, so
+/// difficulty/security semantics are identical — only WHICH bytes count moved,
+/// and only on v5.
+pub fn hash_to_work_value_for(hash: &Hash32, form: GenesisForm) -> u64 {
+    match form {
+        GenesisForm::V4 => {
+            u64::from_be_bytes(hash[..8].try_into().expect("Hash32 has ≥ 8 bytes"))
+        }
+        GenesisForm::V5 => {
+            u64::from_le_bytes(hash[24..32].try_into().expect("Hash32 has 32 bytes"))
+        }
+    }
 }
 
 /// The sim target threshold at `difficulty`: `u64::MAX / max(difficulty, 1)`.
@@ -126,7 +152,15 @@ pub fn target_threshold(difficulty: u64) -> u64 {
 
 /// Whether a PoW hash satisfies the target at `difficulty`.
 pub fn satisfies_target(hash: &Hash32, difficulty: u64) -> bool {
-    hash_to_work_value(hash) <= target_threshold(difficulty)
+    satisfies_target_for(hash, difficulty, GenesisForm::V4)
+}
+
+/// [`satisfies_target`] under `form` (lab #490). Consensus keeps `<=` on BOTH
+/// forms: changing v4's would be a rule change nobody ordered, and v5's `<=`
+/// vs xmrig's strict `<` only matters at a pool's SHARE filter — stage-1 pool
+/// code mirrors xmrig's strictness there; consensus does not move for it.
+pub fn satisfies_target_for(hash: &Hash32, difficulty: u64, form: GenesisForm) -> bool {
+    hash_to_work_value_for(hash, form) <= target_threshold(difficulty)
 }
 
 #[cfg(test)]

@@ -32,7 +32,7 @@ use crate::forms::ChainRules;
 use crate::halt::pow_value;
 use crate::header::{BlockHeader, Hash32};
 use crate::params_devnet::LWMA_WINDOW_BLOCKS;
-use crate::pow::{satisfies_target, PowEngine};
+use crate::pow::{satisfies_target_for, PowEngine};
 
 /// Why a header was rejected.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,7 +178,7 @@ pub fn validate_header_under<P: PowEngine>(
     // Issue #74: above an upgrade boundary the PoW value is domain-separated by the
     // active revision. At and below it, this is byte-identical to the v1.0 rule.
     let value = pow_value(pow.pow_hash(rules.form, header, &seed), header.height, &rules.halt);
-    if !satisfies_target(&value, header.difficulty) {
+    if !satisfies_target_for(&value, header.difficulty, rules.form) {
         return Err(ValidationError::PowUnsatisfied);
     }
     Ok(())
@@ -336,7 +336,10 @@ mod tests {
         let mut bad_pow = good;
         for nonce in 0..10_000u64 {
             bad_pow.nonce = nonce;
-            if !satisfies_target(&pow.pow_hash(crate::forms::GenesisForm::V4, &bad_pow, &[]), bad_pow.difficulty) {
+            if !crate::pow::satisfies_target(
+                &pow.pow_hash(crate::forms::GenesisForm::V4, &bad_pow, &[]),
+                bad_pow.difficulty,
+            ) {
                 break;
             }
         }
