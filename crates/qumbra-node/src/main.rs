@@ -3,6 +3,9 @@
 //! ```text
 //!   qumbra-node genesis init [--out DIR]   build the T0 genesis file + committee
 //!                                          key files; print the genesis hash
+//!   qumbra-node mine --dir DIR             zero-to-mining in one command (lab #475):
+//!                                          wallet (backup-gated) + T1 defaults +
+//!                                          verified genesis + node.toml, then `run`
 //!   qumbra-node run --config FILE          run a full node (TCP + RandomX + disk)
 //!   qumbra-node audit [--out FILE]         emit the params_devnet convergence audit
 //!   qumbra-node audit-emission --data-dir  walk a data dir's main chain and report
@@ -63,6 +66,7 @@ fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
             }
         },
         Some("run") => run_node(&args[1..]),
+        Some("mine") => mine_cmd(&args[1..]),
         Some("check") => check_config(&args[1..]),
         Some("halt-status") => halt_status(&args[1..]),
         Some("audit") => audit(&args[1..]),
@@ -87,6 +91,19 @@ fn usage() {
         "qumbra-node — Qumbra full node (M10-T0-1)\n\n\
          USAGE:\n  \
          qumbra-node genesis init [--out DIR]   build the T0 genesis file + 21 committee key files\n  \
+         qumbra-node mine --dir DIR             zero-to-mining in one command (lab #475). Finds or\n      \
+                                            CREATES a wallet (its mnemonic is printed ONCE and the\n      \
+                                            run waits for you to confirm), downloads + verifies\n      \
+                                            genesis against the pinned hash, writes an ordinary\n      \
+                                            node.toml into DIR, then runs it.\n      \
+           [--seeds a:1,b:2]                  override the four baked T1 seed addresses\n      \
+           [--genesis-url URL]                override https://seed.qumbra.org/genesis.qmb\n      \
+           [--rkm <64hex>]                    pay THIS key and never touch a wallet (manual path)\n      \
+           [--yes-i-backed-up]                the non-interactive backup confirmation. Without a\n      \
+                                            terminal and without this flag, `mine` REFUSES to\n      \
+                                            create a wallet rather than creating one silently.\n      \
+           [--index N]                        wallet address index the payout key derives at (0)\n      \
+           [--listen ADDR]                    P2P bind address (default 0.0.0.0:9400)\n  \
          qumbra-node run --config FILE          run a full node (TCP + RandomX + disk persistence)\n      \
            [--rehearsal-verifier]               opt in to the NO-OP rehearsal tx verifier (devnet only)\n      \
            [--sample-interval-secs N]           telemetry sampling cadence (default 30; observability only)\n      \
@@ -215,6 +232,39 @@ fn genesis_init(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  GENESIS HASH:   {hash}");
     println!("  self-verify:    OK");
     Ok(())
+}
+
+/// `mine` — lab #475: prepare `DIR`, then hand the config it wrote to the
+/// ORDINARY run path.
+///
+/// The last two lines are the whole design. Everything `mine` decided is a file
+/// in `DIR` by the time `run_node` is called, and `run_node` is called with the
+/// operator's own arguments still attached — so `mine --rehearsal-verifier` or
+/// `mine --snapshot-interval-secs 60` reach the run path exactly as they would
+/// have on `run`. There is no second node here, only a prepared directory.
+fn mine_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
+    use std::io::IsTerminal;
+
+    let plan = qumbra_node::mine::MineArgs::parse(args)?;
+    // Whether there is a human to show a mnemonic to is a property of THIS
+    // process's stdin, decided here and injected — `mine.rs` takes it as an
+    // argument so the whole backup gate is testable without a pty.
+    let stdin = std::io::stdin();
+    let interactive = stdin.is_terminal();
+    let mut input = stdin.lock();
+    let mut out = std::io::stdout();
+    let prepared = qumbra_node::mine::prepare(
+        &plan,
+        interactive,
+        qumbra_node::mine::http_fetch,
+        &mut input,
+        &mut out,
+    )?;
+
+    let mut run_args: Vec<String> =
+        vec!["--config".to_string(), prepared.config_path.display().to_string()];
+    run_args.extend_from_slice(args);
+    run_node(&run_args)
 }
 
 fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {

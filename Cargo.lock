@@ -1266,6 +1266,7 @@ dependencies = [
  "qlab-p2p",
  "qlab-pow",
  "qlab-wallet",
+ "qumbra-wallet",
  "rand",
  "serde",
  "tiny_http",
