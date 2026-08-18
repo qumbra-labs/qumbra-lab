@@ -229,7 +229,7 @@ curl -fsSL https://seed.qumbra.org/genesis.qmb -o genesis.qmb
 |---|---|
 | `--yes-i-backed-up` | 无终端环境(systemd unit、容器)下的确认方式。**没有终端又没有这个参数时,`mine` 会拒绝创建钱包**,而不是悄悄创建一个——助记词需要你自己从命令输出里保存下来。 |
 | `--rkm <64 位十六进制>` | 付给你已经拥有的密钥。不读、不建、也不查找任何钱包;这就是上面几节讲的手动路径,原样不变。 |
-| `--seeds`、`--genesis-url`、`--listen`、`--index` | 覆盖内置默认值(§1 的四个种子节点、`https://seed.qumbra.org/genesis.qmb`、`0.0.0.0:9400`、地址索引 0)。 |
+| `--seeds`、`--genesis-url`、`--listen`、`--index` | 覆盖内置默认值(§1 的四个种子节点、`https://seed.qumbra.org/genesis.qmb`、`0.0.0.0:9400`、地址索引 0)。非零的 `--index` 会在运行中被**分配**到钱包里,这样本节点挖到的币始终落在 `scan` 覆盖得到的范围内;上限为 1024,更高的索引请用 `qumbra-wallet address --new` 配合 `--rkm`。 |
 
 钱包落在 `~/.qumbra-miner/wallet`，所以 §4 的每条钱包命令都可以直接对它使用——
 `qumbra-wallet backup --dir ~/.qumbra-miner/wallet --reveal` 会再次显示助记词，
