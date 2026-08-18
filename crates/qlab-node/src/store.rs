@@ -108,11 +108,24 @@ pub struct StoredTx {
     pub rider: Vec<u8>,
 }
 
+/// The bucket a persisted `bucket_actions` value names. **Strict since lab
+/// #470 stage 3** (the #233-adjacent third spelling): the old arm silently
+/// coerced every unknown value to `TwoByTwo` — the empty-success pattern.
+/// The complete legitimate value set, enumerated from the WRITERS rather than
+/// assumed: the only producer is `From<&TxEntry> for StoredTx`, which writes
+/// `ArityBucket::logical_actions()` — total over the three variants, so
+/// {2, 4, 8} and nothing else, in every era (the #219 dummy latch never
+/// changed `logical_actions`; a dummy-masked 2×2 wrote 2 before and after the
+/// mint). `persist::read_records` refuses any other value BY NAME at datadir
+/// open, so this panic is a checked invariant, not a reachable data path.
 fn bucket_from_actions(actions: u32) -> ArityBucket {
     match actions {
+        2 => ArityBucket::TwoByTwo,
         4 => ArityBucket::FourByFour,
         8 => ArityBucket::EightByEight,
-        _ => ArityBucket::TwoByTwo,
+        other => unreachable!(
+            "bucket_actions {other} cannot come off a datadir: persist::read_records              refuses unknown values at open (lab #470 stage 3)"
+        ),
     }
 }
 

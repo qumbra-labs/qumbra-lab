@@ -385,20 +385,14 @@ pub fn evidence_id(ev: &EquivocationEvidence) -> Hash32 {
 // --------------------------------------------------------------------------
 
 fn bucket_to_u8(b: ArityBucket) -> u8 {
-    match b {
-        ArityBucket::TwoByTwo => 0,
-        ArityBucket::FourByFour => 1,
-        ArityBucket::EightByEight => 2,
-    }
+    // Since lab #470 stage 3 this IS the shared encoding (#233): the same
+    // `wire_discriminant` the v5 body preimage commits, so the codec byte and
+    // the committed byte are one function rather than two that agree.
+    b.wire_discriminant()
 }
 
 fn bucket_from_u8(v: u8) -> Result<ArityBucket, DecodeError> {
-    match v {
-        0 => Ok(ArityBucket::TwoByTwo),
-        1 => Ok(ArityBucket::FourByFour),
-        2 => Ok(ArityBucket::EightByEight),
-        got => Err(DecodeError::BadBucket { got }),
-    }
+    ArityBucket::from_wire_discriminant(v).ok_or(DecodeError::BadBucket { got: v })
 }
 
 /// Encode a transaction (public values + opaque proof).

@@ -2440,7 +2440,22 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         //    [`Self::anchor_verdict_is_authoritative`] for how a node decides which
         //    side of it it is standing on.
         let anchor_ok = |root: &Hash32| self.state.is_valid_anchor(root);
-        match validate_body(&header, &body, &self.verifier, anchor_ok) {
+        // The rule funnel keyed by the installed form (lab #470 stage 3): the
+        // v4 arm is byte-for-byte the old call; the v5 arm is the same loop
+        // under the v5 forms. EmptyNameView on both — this adapter is the
+        // relay-grade validator; the registry-armed funnel is the qlab-node
+        // state path (stage 4a threads its form).
+        let validate_result = match self.rules.form {
+            GenesisForm::V4 => validate_body(&header, &body, &self.verifier, anchor_ok),
+            GenesisForm::V5 => qlab_devnet::body::validate_body_v5(
+                &header,
+                &body,
+                &self.verifier,
+                anchor_ok,
+                &qlab_devnet::names::EmptyNameView,
+            ),
+        };
+        match validate_result {
             Ok(()) => {}
             Err(e) => match Self::body_fault_class(&e) {
                 BodyFault::Intrinsic(why) => return IngestOutcome::Rejected(why),

@@ -187,7 +187,7 @@ pub(crate) enum Role {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LeafTag {
-    /// Main-trace row opening (618 values) for query `q`.
+    /// Main-trace row opening (one value per trace column) for query `q`.
     Trace { q: usize },
     /// Quotient batch row opening (16 mats x 4 values) for query `q`.
     Quotient { q: usize },
@@ -385,7 +385,8 @@ pub(crate) struct Schedule {
     /// PZ group combinations (ascending fri_alpha powers over the observed
     /// zeta-opening groups).
     pub pz: [Ext; 3],
-    /// fri_alpha^618, fri_alpha^1236 (group offsets).
+    /// fri_alpha^width, fri_alpha^(2·width) (group offsets — derived from the
+    /// matrix, never a literal; #234).
     pub alpha_off: [Ext; 2],
     pub log_arities: Vec<usize>,
     /// The observation stream in native typed units (replay cross-check).
@@ -1374,7 +1375,7 @@ mod tests {
 
     use super::*;
 
-    /// The consensus proof is expensive (a full 2^18 x 618 prove at b16);
+    /// The consensus proof is expensive (a full 2^18 × trace-width prove at b16);
     /// share it across tests.
     pub(crate) fn shared() -> &'static (BucketInstance, Vec<Val>, Proof<Config>) {
         static CELL: OnceLock<(BucketInstance, Vec<Val>, Proof<Config>)> = OnceLock::new();
