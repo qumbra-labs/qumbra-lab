@@ -16,9 +16,10 @@ publish.workspace = true
 # exists.
 #
 # RandomX is NOT a runtime dep of this crate (qlab-devnet / qlab-pow are
-# taken with default-features = false). Share-validation's PoW predicate
-# is #490's export and lands in a later commit after that PR merges —
-# this crate must not re-mirror those bytes locally.
+# taken with default-features = false). Share-validation consumes
+# qlab_devnet::pow::hash_to_work_value_for (lab #490) and does not
+# re-mirror hash-byte selection here. RandomX re-hash of the blob is
+# still off this graph (claimed `result` is what the filter sees).
 
 [[bin]]
 name = "qumbra-pool"
@@ -26,9 +27,8 @@ path = "src/main.rs"
 
 [dependencies]
 qlab-stratum = { path = "../qlab-stratum" }
-# Header preimage + GenesisForm / ChainRules. default-features = false so
-# this crate does not pull the RandomX C++ chain (share-validation is
-# deferred to #490; template assembly only needs the header serializer).
+# Header preimage + GenesisForm / ChainRules + #490 work-value export.
+# default-features = false so this crate does not pull the RandomX C++ chain.
 qlab-devnet = { path = "../qlab-devnet", default-features = false }
 # Key-block schedule (seed_hash / next_seed_hash arithmetic). Same
 # default-features = false: we want keyblock only.

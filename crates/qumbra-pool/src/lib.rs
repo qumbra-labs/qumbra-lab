@@ -14,16 +14,13 @@
 //! One binary, two nets — the form arrives with the template (the genesis
 //! identity), never as a free-floating top-level switch (H1).
 //!
-//! ## Share validation is not in this commit series yet
+//! ## Share validation (lab #490, consumed — not remirrored)
 //!
-//! The share-PoW predicate is #490's form-keyed export
-//! (`GenesisForm::V5` ⇒ trailing-8-LE, strict `<` at the pool filter).
-//! That consensus PR is outside this baton's boundary. Submits are
-//! accepted **structurally** (job exists, session matches, windows
-//! intact, not stale/dup) and recorded as
-//! [`accounting::ShareStatus::AcceptedStructural`]. The follow-up
-//! commit after #490 merges consumes the exported predicate rather than
-//! re-mirroring bytes here.
+//! Work value comes from [`qlab_devnet::pow::hash_to_work_value_for`]
+//! (`GenesisForm::V5` ⇒ trailing-8-LE). The SHARE filter then applies
+//! xmrig's strict `<` against the job target. Consensus keeps `<=`
+//! ([`qlab_devnet::pow::satisfies_target_for`]); this crate does not
+//! change that, and it does not read `hash[24..32]` itself.
 //!
 //! Mapping authority: `docs/pool-stratum-mapping.md`. Tracker: lab #482.
 //! Multica: QUM-136.
@@ -34,6 +31,7 @@ pub mod endpoint;
 pub mod hexutil;
 pub mod jobs;
 pub mod pool;
+pub mod share;
 pub mod template;
 
 pub use accounting::{Ledger, ShareRecord, ShareStatus};

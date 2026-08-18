@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 
+use qlab_devnet::forms::GenesisForm;
+
 /// Per-connection extra-nonce. Starts at 1 so 0 stays the solo-shaped
 /// empty partition. Wraps; 0 is skipped on wrap.
 #[derive(Debug)]
@@ -39,6 +41,7 @@ pub struct IssuedJob {
     pub height: u64,
     pub seed_hash: [u8; 32],
     pub next_seed_hash: Option<[u8; 32]>,
+    pub form: GenesisForm,
     pub stale: bool,
 }
 
@@ -100,6 +103,7 @@ mod tests {
             height: 1,
             seed_hash: [0; 32],
             next_seed_hash: None,
+            form: GenesisForm::V5,
             stale: false,
         });
         assert!(!store.is_stale("j1"));

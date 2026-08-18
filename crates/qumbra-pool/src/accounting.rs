@@ -1,13 +1,12 @@
 //! Share accounting. Stage 1 records; stage 2 is the PPLNS window and
-//! payee-list assembly. A share that passed structural checks but has
-//! not been PoW-checked is [`ShareStatus::AcceptedStructural`] — the
-//! #490 predicate is not mirrored here.
+//! payee-list assembly.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShareStatus {
-    /// Structural checks passed. PoW target check is deferred to the
-    /// commit that consumes #490's exported predicate.
-    AcceptedStructural,
+    /// Structural checks + the form-keyed share filter (`hash_to_work_value_for` + strict `<`).
+    Accepted,
+    /// Work value ≥ job target (xmrig-shaped "Low difficulty share").
+    LowDifficulty,
     Stale,
     Duplicate,
     BadAlgo,
@@ -48,7 +47,7 @@ impl Ledger {
     ) -> impl Iterator<Item = &'a ShareRecord> + 'a {
         self.records
             .iter()
-            .filter(move |r| r.login == login && r.status == ShareStatus::AcceptedStructural)
+            .filter(move |r| r.login == login && r.status == ShareStatus::Accepted)
     }
 
     pub fn accepted_count(&self, login: &str) -> u64 {
@@ -60,9 +59,9 @@ impl Ledger {
     }
 
     pub fn has_duplicate(&self, job_id: &str, nonce: &[u8; 4]) -> bool {
-        self.records.iter().any(|r| {
-            r.job_id == job_id && r.nonce == *nonce && r.status == ShareStatus::AcceptedStructural
-        })
+        self.records
+            .iter()
+            .any(|r| r.job_id == job_id && r.nonce == *nonce && r.status == ShareStatus::Accepted)
     }
 }
 
@@ -86,10 +85,10 @@ mod tests {
     #[test]
     fn records_accepted_shares_and_sums_difficulty() {
         let mut l = Ledger::default();
-        l.record(rec("alice", "j1", 1, ShareStatus::AcceptedStructural));
+        l.record(rec("alice", "j1", 1, ShareStatus::Accepted));
         l.record(rec("alice", "j1", 1, ShareStatus::Duplicate));
-        l.record(rec("bob", "j2", 2, ShareStatus::AcceptedStructural));
-        l.record(rec("alice", "j3", 3, ShareStatus::AcceptedStructural));
+        l.record(rec("bob", "j2", 2, ShareStatus::Accepted));
+        l.record(rec("alice", "j3", 3, ShareStatus::Accepted));
         assert_eq!(l.accepted_count("alice"), 2);
         assert_eq!(l.accepted_difficulty_sum("alice"), 2048);
         assert_eq!(l.accepted_count("bob"), 1);

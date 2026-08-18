@@ -104,7 +104,7 @@ fn tcp_login_job_submit_round_trips() {
             id: result.id.clone(),
             job_id: result.job.job_id.clone(),
             nonce: "d0030040".into(),
-            result: "11".repeat(32),
+            result: "00".repeat(32),
             algo: Some("rx/0".into()),
         },
     )

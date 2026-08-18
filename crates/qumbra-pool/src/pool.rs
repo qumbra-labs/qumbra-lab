@@ -1,7 +1,8 @@
 //! Login / job / submit / keepalived state machine.
 //!
 //! No sockets here. The endpoint feeds lines in and writes [`Outgoing`]
-//! lines out. Share-PoW is structurally deferred — see [`crate`].
+//! lines out. Share-PoW consumes [`qlab_devnet::pow::hash_to_work_value_for`]
+//! and applies xmrig's strict `<` at the share filter only.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -17,12 +18,14 @@ use qlab_stratum::types::{
 use crate::accounting::{Ledger, ShareRecord, ShareStatus};
 use crate::hexutil;
 use crate::jobs::{ExtraNonceAllocator, IssuedJob, JobStore};
+use crate::share::share_meets_target;
 use crate::template::{next_seed_in_preload_window, Template, TemplateError, TemplateSource};
 
 /// xmrig-proxy-shaped error codes we actually emit.
 pub const ERR_INVALID: i64 = -1;
 pub const ERR_UNKNOWN_JOB: i64 = 20;
 pub const ERR_DUPLICATE: i64 = 21;
+pub const ERR_LOW_DIFF: i64 = 22;
 pub const ERR_UNAUTHORIZED: i64 = 23;
 pub const ERR_BAD_ALGO: i64 = 24;
 pub const ERR_UNCLEAN_V4: i64 = 25;
@@ -365,9 +368,29 @@ impl Pool {
         }
 
         // Prove the miner window is writable without touching extra-nonce.
-        // The #490 predicate is deliberately not applied here.
         let mut blob = job.blob.clone();
         apply_miner_nonce(&mut blob, &nonce).map_err(|e| PoolError::Codec(e.to_string()))?;
+
+        // Share filter: #490's work-value export + xmrig's strict `<`.
+        // We do not re-hash the blob here (RandomX stays off this crate's
+        // graph); the claimed `result` is what the miner already hashed.
+        if !share_meets_target(&result, job.target, job.form) {
+            g.ledger.record(ShareRecord {
+                login,
+                session_id: local.to_string(),
+                job_id: params.job_id.clone(),
+                height: job.height,
+                difficulty: job.difficulty,
+                nonce,
+                result,
+                status: ShareStatus::LowDifficulty,
+            });
+            return Ok(vec![Outgoing::Reply(StratumResponse::err(
+                rid,
+                ERR_LOW_DIFF,
+                "Low difficulty share",
+            ))]);
+        }
 
         g.ledger.record(ShareRecord {
             login,
@@ -377,7 +400,7 @@ impl Pool {
             difficulty: job.difficulty,
             nonce,
             result,
-            status: ShareStatus::AcceptedStructural,
+            status: ShareStatus::Accepted,
         });
         Ok(vec![Outgoing::Reply(StratumResponse::ok_status(rid, "OK"))])
     }
@@ -472,6 +495,7 @@ fn issue_job(
         height: template.header.height,
         seed_hash: template.seed_hash,
         next_seed_hash: next,
+        form: template.form,
         stale: false,
     };
     let job = Job {
@@ -553,14 +577,25 @@ mod tests {
         (sid, resp.parse_login_result().unwrap())
     }
 
-    fn submit_line(sid: &str, job_id: &str, nonce: &str, algo: Option<&str>) -> String {
+    /// All-zero hash: v5 tail-LE work value is 0, which is `<` any real target.
+    fn passing_result() -> String {
+        "00".repeat(32)
+    }
+
+    fn submit_line(
+        sid: &str,
+        job_id: &str,
+        nonce: &str,
+        result: &str,
+        algo: Option<&str>,
+    ) -> String {
         let req = StratumRequest::submit(
             2,
             &SubmitParams {
                 id: sid.into(),
                 job_id: job_id.into(),
                 nonce: nonce.into(),
-                result: "11".repeat(32),
+                result: result.into(),
                 algo: algo.map(str::to_string),
             },
         )
@@ -639,7 +674,7 @@ mod tests {
         let out = pool
             .handle_line(
                 &mut s,
-                &submit_line(&sid, &job_id, "d0030040", Some("rx/0")),
+                &submit_line(&sid, &job_id, "d0030040", &passing_result(), Some("rx/0")),
             )
             .unwrap();
         assert_eq!(reply_status(&out).1.as_deref(), Some("OK"));
@@ -648,7 +683,7 @@ mod tests {
         let out = pool
             .handle_line(
                 &mut s,
-                &submit_line(&sid, &job_id, "d0030040", Some("rx/0")),
+                &submit_line(&sid, &job_id, "d0030040", &passing_result(), Some("rx/0")),
             )
             .unwrap();
         assert_eq!(reply_status(&out).0, Some(ERR_DUPLICATE));
@@ -661,7 +696,7 @@ mod tests {
         let out = pool
             .handle_line(
                 &mut s,
-                &submit_line(&sid, &job_id, "aabbccdd", Some("rx/0")),
+                &submit_line(&sid, &job_id, "aabbccdd", &passing_result(), Some("rx/0")),
             )
             .unwrap();
         assert_eq!(reply_status(&out).0, Some(ERR_UNKNOWN_JOB));
@@ -678,7 +713,13 @@ mod tests {
         let out = pool
             .handle_line(
                 &mut s,
-                &submit_line("s-other", &job_id, "d0030040", Some("rx/0")),
+                &submit_line(
+                    "s-other",
+                    &job_id,
+                    "d0030040",
+                    &passing_result(),
+                    Some("rx/0"),
+                ),
             )
             .unwrap();
         assert_eq!(reply_status(&out).0, Some(ERR_UNAUTHORIZED));
@@ -686,7 +727,7 @@ mod tests {
         let out = pool
             .handle_line(
                 &mut s,
-                &submit_line(&sid, &job_id, "d0030040", Some("cn/r")),
+                &submit_line(&sid, &job_id, "d0030040", &passing_result(), Some("cn/r")),
             )
             .unwrap();
         assert_eq!(reply_status(&out).0, Some(ERR_BAD_ALGO));
@@ -718,5 +759,47 @@ mod tests {
         // encode_response is reachable for the endpoint; keep it compiling
         // against the login reply shape.
         let _ = encode_response(&StratumResponse::ok_status(1, "OK")).unwrap();
+    }
+
+    #[test]
+    fn submit_low_diff_is_named_and_uses_the_v5_window() {
+        let pool = pool_v5();
+        let (sid, result) = login_ok(&pool);
+        let sid = sid.unwrap();
+        let job_id = result.job.job_id.clone();
+        let mut s = Some(sid.clone());
+
+        // All-0xFF: v5 tail-LE is u64::MAX, which is not < any real target.
+        let out = pool
+            .handle_line(
+                &mut s,
+                &submit_line(&sid, &job_id, "01020304", &"ff".repeat(32), Some("rx/0")),
+            )
+            .unwrap();
+        assert_eq!(reply_status(&out).0, Some(ERR_LOW_DIFF));
+        assert_eq!(
+            pool.ledger_snapshot().records().last().unwrap().status,
+            ShareStatus::LowDifficulty
+        );
+        assert_eq!(pool.ledger_snapshot().accepted_count("alice"), 0);
+
+        // Tail-LE = 7, head = 0xFF: v5 accepts, proving the filter consumed
+        // hash_to_work_value_for(..., V5) rather than the v4 head-BE read.
+        let mut tail_wins = [0xFFu8; 32];
+        tail_wins[24..32].copy_from_slice(&7u64.to_le_bytes());
+        let out = pool
+            .handle_line(
+                &mut s,
+                &submit_line(
+                    &sid,
+                    &job_id,
+                    "05060708",
+                    &hexutil::encode(&tail_wins),
+                    Some("rx/0"),
+                ),
+            )
+            .unwrap();
+        assert_eq!(reply_status(&out).1.as_deref(), Some("OK"));
+        assert_eq!(pool.ledger_snapshot().accepted_count("alice"), 1);
     }
 }

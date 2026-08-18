@@ -44,7 +44,7 @@ fn usage() {
          qumbra-pool check --config FILE   validate config; bind nothing\n  \
          qumbra-pool run --config FILE     listen for stratum TCP\n\n\
          v4-compat: a v4 template refuses stock-xmrig login by name\n  \
-         (#356 UNCLEAN). Share-PoW waits for lab #490.\n"
+         (#356 UNCLEAN). Share filter: #490 hash_to_work_value_for + strict <.\n"
     );
 }
 
@@ -90,7 +90,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     if !pool.current_template().serves_stock_xmrig() {
         println!("  ⚠️  v4 template: stock-xmrig login will be refused (#356 UNCLEAN)");
     }
-    println!("  ⚠️  share-PoW deferred — waiting on lab #490; submits accepted structurally");
+    println!("  share filter: #490 hash_to_work_value_for + xmrig strict <");
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
