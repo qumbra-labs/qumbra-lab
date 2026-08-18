@@ -12,17 +12,32 @@ use qlab_devnet::body::{TxEntry, TxPublic};
 use qlab_devnet::committee::{Checkpoint, MemberSig, Vote};
 use qlab_devnet::ebbflow::EquivocationEvidence;
 use qlab_devnet::fees::ArityBucket;
+use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::hash::keccak256;
 use qlab_devnet::header::{
-    AggregateProofSlot, BlockHeader, EpochSupplyAttestation, Hash32,
+    AggregateProofSlot, BlockHeader, EpochSupplyAttestation, Hash32, HEADER_PREIMAGE_LEN_V4,
+    HEADER_PREIMAGE_LEN_V5, HEADER_VERSION_BYTE_V5,
 };
 
 use crate::varint::{read_varint, write_varint, CodecError};
 
-/// The fixed on-wire length of a block header = its 98-byte hash preimage
-/// (`prev(32) ‖ height(8) ‖ timestamp(8) ‖ difficulty(8) ‖ nonce(8) ‖
-/// tx_body_commitment(32) ‖ 0xA6 ‖ 0x59`).
-pub const HEADER_WIRE_LEN: usize = 98;
+/// The fixed on-wire length of a **v4** block header = its 98-byte hash
+/// preimage (`prev(32) ‖ height(8) ‖ timestamp(8) ‖ difficulty(8) ‖ nonce(8) ‖
+/// tx_body_commitment(32) ‖ 0xA6 ‖ 0x59`). Since lab #470 the wire length is
+/// form-keyed — see [`header_wire_len`]; this constant is the v4 value and the
+/// live T1 net's compat lock.
+pub const HEADER_WIRE_LEN: usize = HEADER_PREIMAGE_LEN_V4;
+
+/// The on-wire length of a block header under `form` (lab #470 stage 1). The
+/// two forms deliberately differ in length (98 vs 97), so a header of the
+/// other net's form is refused by [`DecodeError::WrongHeaderLen`] — by name,
+/// never misparsed.
+pub fn header_wire_len(form: GenesisForm) -> usize {
+    match form {
+        GenesisForm::V4 => HEADER_PREIMAGE_LEN_V4,
+        GenesisForm::V5 => HEADER_PREIMAGE_LEN_V5,
+    }
+}
 
 /// ML-DSA-65 signature length (frozen; [`MemberSig`] encodes to exactly this).
 pub const SIG_LEN: usize = 3309;
@@ -49,6 +64,13 @@ pub enum DecodeError {
     BadBucket { got: u8 },
     /// The ML-DSA signature bytes did not decode to a valid signature.
     BadSignature,
+    /// A block header's byte length is not this net's form length — the named
+    /// refusal a v4 header meets on a v5 net and vice versa (lab #470: the two
+    /// forms differ in length by construction, so cross-net headers are refused
+    /// here, never misparsed).
+    WrongHeaderLen { got: usize, want: usize },
+    /// A v5 block header's format-version byte (offset 32) was not 0x05.
+    BadHeaderVersion { got: u8 },
 }
 
 impl From<CodecError> for DecodeError {
@@ -131,31 +153,55 @@ impl<'a> Reader<'a> {
 // Block header
 // --------------------------------------------------------------------------
 
-/// Encode a block header as its canonical 98-byte hash preimage.
-pub fn encode_header(h: &BlockHeader) -> Vec<u8> {
-    // `preimage()` IS the canonical fixed-width wire form; reusing it keeps the
-    // wire byte-identical to the PoW / block-id input, so a header can never be
-    // relayed under a different identity than it hashes to.
-    h.preimage()
+/// Encode a block header as its canonical hash preimage under `form`.
+pub fn encode_header(form: GenesisForm, h: &BlockHeader) -> Vec<u8> {
+    // `preimage_for()` IS the canonical fixed-width wire form; reusing it keeps
+    // the wire byte-identical to the PoW / block-id input, so a header can
+    // never be relayed under a different identity than it hashes to.
+    h.preimage_for(form)
 }
 
-/// Decode a block header from its 98-byte preimage, checking the two frozen
-/// reserved-slot tag bytes (reject-unknown on the tags).
-pub fn decode_header(buf: &[u8]) -> Result<BlockHeader, DecodeError> {
+/// Decode a block header from its preimage bytes under this net's `form`,
+/// checking the exact form length first (a wrong-form header is refused by
+/// [`DecodeError::WrongHeaderLen`], by name), then — for v5 — the format
+/// version byte, then the two frozen reserved-slot tag bytes (reject-unknown).
+pub fn decode_header(form: GenesisForm, buf: &[u8]) -> Result<BlockHeader, DecodeError> {
+    let want = header_wire_len(form);
+    if buf.len() != want {
+        return Err(DecodeError::WrongHeaderLen { got: buf.len(), want });
+    }
     let mut r = Reader::new(buf);
     let prev = r.hash32("prev")?;
-    let height = r.u64_le("height")?;
-    let timestamp = r.u64_le("timestamp")?;
-    let difficulty = r.u64_le("difficulty")?;
-    let nonce = r.u64_le("nonce")?;
+    let (height, nonce, timestamp, difficulty, tag_pos) = match form {
+        GenesisForm::V4 => {
+            let height = r.u64_le("height")?;
+            let timestamp = r.u64_le("timestamp")?;
+            let difficulty = r.u64_le("difficulty")?;
+            let nonce = r.u64_le("nonce")?;
+            (height, nonce, timestamp, difficulty, 96usize)
+        }
+        GenesisForm::V5 => {
+            let version = r.u8("header_format_version")?;
+            if version != HEADER_VERSION_BYTE_V5 {
+                return Err(DecodeError::BadHeaderVersion { got: version });
+            }
+            let mut h6 = [0u8; 8];
+            h6[..6].copy_from_slice(&r.rest(6, "height_u48")?);
+            let height = u64::from_le_bytes(h6);
+            let nonce = r.u64_le("nonce")?;
+            let timestamp = r.u64_le("timestamp")?;
+            let difficulty = r.u64_le("difficulty")?;
+            (height, nonce, timestamp, difficulty, 95usize)
+        }
+    };
     let tx_body_commitment = r.hash32("tx_body_commitment")?;
     let tag_a = r.u8("aggregate_proof_tag")?;
     if tag_a != AggregateProofSlot::PREIMAGE_TAG {
-        return Err(DecodeError::BadHeaderTag { pos: 96, got: tag_a });
+        return Err(DecodeError::BadHeaderTag { pos: tag_pos, got: tag_a });
     }
     let tag_b = r.u8("epoch_supply_tag")?;
     if tag_b != EpochSupplyAttestation::PREIMAGE_TAG {
-        return Err(DecodeError::BadHeaderTag { pos: 97, got: tag_b });
+        return Err(DecodeError::BadHeaderTag { pos: tag_pos + 1, got: tag_b });
     }
     r.finish()?;
     Ok(BlockHeader {
@@ -591,28 +637,29 @@ pub fn decode_locator(buf: &[u8]) -> Result<Locator, DecodeError> {
 }
 
 /// Encode a `Headers` batch body (ancestor-first).
-pub fn encode_headers(headers: &[BlockHeader]) -> Vec<u8> {
+pub fn encode_headers(form: GenesisForm, headers: &[BlockHeader]) -> Vec<u8> {
     let mut out = Vec::new();
     write_varint(&mut out, headers.len() as u64);
     for h in headers {
-        out.extend_from_slice(&encode_header(h));
+        out.extend_from_slice(&encode_header(form, h));
     }
     out
 }
 
 /// Decode a `Headers` batch body.
-pub fn decode_headers(buf: &[u8]) -> Result<Vec<BlockHeader>, DecodeError> {
+pub fn decode_headers(form: GenesisForm, buf: &[u8]) -> Result<Vec<BlockHeader>, DecodeError> {
     let mut r = Reader::new(buf);
     // The count is attacker-controlled (peer wire): cap the pre-allocation by
     // what the remaining bytes could actually hold (each header is
     // HEADER_WIRE_LEN), so a tiny payload claiming 2^60 headers is a truncation
     // refusal on its first read and never a giant allocation. Same shape as
     // decode_tx (issue #275 / PR #277); remaining sites closed by issue #279.
+    let wire_len = header_wire_len(form);
     let n = r.varint()? as usize;
-    let mut headers = Vec::with_capacity(n.min(buf.len() / HEADER_WIRE_LEN));
+    let mut headers = Vec::with_capacity(n.min(buf.len() / wire_len));
     for _ in 0..n {
-        let raw = r.rest(HEADER_WIRE_LEN, "headers.item")?;
-        headers.push(decode_header(&raw)?);
+        let raw = r.rest(wire_len, "headers.item")?;
+        headers.push(decode_header(form, &raw)?);
     }
     r.finish()?;
     Ok(headers)
@@ -632,9 +679,9 @@ mod tests {
     #[test]
     fn header_round_trips_and_preserves_hash() {
         let h = sample_header();
-        let bytes = encode_header(&h);
+        let bytes = encode_header(GenesisForm::V4, &h);
         assert_eq!(bytes.len(), HEADER_WIRE_LEN);
-        let back = decode_header(&bytes).unwrap();
+        let back = decode_header(GenesisForm::V4, &bytes).unwrap();
         assert_eq!(back, h);
         // The wire form IS the hash preimage → identity is preserved.
         assert_eq!(back.header_hash(), h.header_hash());
@@ -642,16 +689,97 @@ mod tests {
 
     #[test]
     fn header_rejects_tampered_reserved_tag() {
-        let mut bytes = encode_header(&sample_header());
+        let mut bytes = encode_header(GenesisForm::V4, &sample_header());
         bytes[96] = 0x00; // clobber the aggregate-proof tag (0xA6)
-        assert!(matches!(decode_header(&bytes), Err(DecodeError::BadHeaderTag { pos: 96, .. })));
+        assert!(matches!(
+            decode_header(GenesisForm::V4, &bytes),
+            Err(DecodeError::BadHeaderTag { pos: 96, .. })
+        ));
     }
 
     #[test]
     fn header_rejects_trailing() {
-        let mut bytes = encode_header(&sample_header());
+        let mut bytes = encode_header(GenesisForm::V4, &sample_header());
         bytes.push(0x00);
-        assert!(matches!(decode_header(&bytes), Err(DecodeError::Trailing { .. })));
+        // Since lab #470 the exact-length gate fires before the positional
+        // reader, so trailing bytes are refused as WrongHeaderLen — one named
+        // refusal earlier than the old Trailing, never weaker.
+        assert!(matches!(
+            decode_header(GenesisForm::V4, &bytes),
+            Err(DecodeError::WrongHeaderLen { got: 99, want: 98 })
+        ));
+    }
+
+    // ── v5 header form (lab #470 stage 1) ───────────────────────────────────
+
+    #[test]
+    fn v5_header_round_trips_and_is_97_bytes() {
+        let h = sample_header();
+        let bytes = encode_header(GenesisForm::V5, &h);
+        assert_eq!(bytes.len(), header_wire_len(GenesisForm::V5));
+        assert_eq!(bytes.len(), 97);
+        let back = decode_header(GenesisForm::V5, &bytes).unwrap();
+        assert_eq!(back, h);
+        assert_eq!(back.header_hash_for(GenesisForm::V5), h.header_hash_for(GenesisForm::V5));
+    }
+
+    /// The adversarial contract of the C2 ruling: a v4 header presented to a
+    /// v5 net (and vice versa) is refused BY NAME, never misparsed. The two
+    /// forms differ in length by construction, so the refusal is structural.
+    #[test]
+    fn cross_form_headers_are_refused_by_name() {
+        let h = sample_header();
+        let v4_bytes = encode_header(GenesisForm::V4, &h);
+        let v5_bytes = encode_header(GenesisForm::V5, &h);
+        assert!(matches!(
+            decode_header(GenesisForm::V5, &v4_bytes),
+            Err(DecodeError::WrongHeaderLen { got: 98, want: 97 })
+        ));
+        assert!(matches!(
+            decode_header(GenesisForm::V4, &v5_bytes),
+            Err(DecodeError::WrongHeaderLen { got: 97, want: 98 })
+        ));
+    }
+
+    #[test]
+    fn v5_header_rejects_a_wrong_version_byte() {
+        let h = sample_header();
+        let mut bytes = encode_header(GenesisForm::V5, &h);
+        bytes[32] = 0x04; // not the v5 version byte
+        assert!(matches!(
+            decode_header(GenesisForm::V5, &bytes),
+            Err(DecodeError::BadHeaderVersion { got: 0x04 })
+        ));
+    }
+
+    #[test]
+    fn v5_header_rejects_tampered_reserved_tags_at_their_v5_offsets() {
+        let h = sample_header();
+        let mut bytes = encode_header(GenesisForm::V5, &h);
+        bytes[95] = 0x00;
+        assert!(matches!(
+            decode_header(GenesisForm::V5, &bytes),
+            Err(DecodeError::BadHeaderTag { pos: 95, .. })
+        ));
+        let mut bytes = encode_header(GenesisForm::V5, &h);
+        bytes[96] = 0x00;
+        assert!(matches!(
+            decode_header(GenesisForm::V5, &bytes),
+            Err(DecodeError::BadHeaderTag { pos: 96, .. })
+        ));
+    }
+
+    #[test]
+    fn v5_headers_batch_round_trips_on_the_v5_stride() {
+        let g = BlockHeader::genesis(1_000, 0);
+        let a = BlockHeader::child_of_for(GenesisForm::V5, &g, 1, 1_000, [1u8; 32]);
+        let b = BlockHeader::child_of_for(GenesisForm::V5, &a, 2, 1_000, [2u8; 32]);
+        let batch = vec![g, a, b];
+        let bytes = encode_headers(GenesisForm::V5, &batch);
+        assert_eq!(decode_headers(GenesisForm::V5, &bytes).unwrap(), batch);
+        // A v4 reader on the same bytes strides wrong and refuses; it can
+        // never silently yield headers.
+        assert!(decode_headers(GenesisForm::V4, &bytes).is_err());
     }
 
     #[test]
@@ -1035,8 +1163,8 @@ mod tests {
         let h1 = BlockHeader::child_of(&g, 75, 1000, [1; 32]);
         let h2 = BlockHeader::child_of(&h1, 150, 1000, [2; 32]);
         let batch = vec![g, h1, h2];
-        let bytes = encode_headers(&batch);
-        assert_eq!(decode_headers(&bytes).unwrap(), batch);
+        let bytes = encode_headers(GenesisForm::V4, &batch);
+        assert_eq!(decode_headers(GenesisForm::V4, &bytes).unwrap(), batch);
     }
 
     /// A tiny payload claiming 2^60 headers is a truncation refusal, never a
@@ -1047,6 +1175,6 @@ mod tests {
     fn headers_decode_refuses_a_count_the_bytes_cannot_hold_without_allocating() {
         let mut bytes = Vec::new();
         write_varint(&mut bytes, 1u64 << 60); // n_headers, a lie
-        assert!(matches!(decode_headers(&bytes), Err(DecodeError::Truncated { .. })));
+        assert!(matches!(decode_headers(GenesisForm::V4, &bytes), Err(DecodeError::Truncated { .. })));
     }
 }

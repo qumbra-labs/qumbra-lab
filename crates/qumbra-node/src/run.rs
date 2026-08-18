@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use qlab_devnet::body::{TxEntry, TxVerifier};
 use qlab_devnet::committee::CommitteeState;
 use qlab_devnet::ebbflow::FinalityStatus;
+use qlab_devnet::forms::ChainRules;
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::{
     CHECKPOINT_CADENCE_BLOCKS, CHECKPOINT_SIGN_HYSTERESIS_BLOCKS, DEGRADED_MODE_LAG_BLOCKS,
@@ -760,8 +761,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 );
             }
         }
-        // The release's halt/rule schedule, installed once. No runtime path (H1).
-        adapter.set_rule_schedule(rules);
+        // The chain rules, installed once — THE one selection point (lab #470):
+        // the form set from the genesis file's format_version (= the network
+        // identity, Q1 ruling), the halt schedule from the compile-time RELEASE
+        // + marker (#74/#81). No runtime path to either (H1).
+        adapter.set_chain_rules(ChainRules { form: genesis.form()?, halt: rules });
         let transport = TcpTransport::bind(&config.listen_addr).map_err(RunError::Io)?;
         let bound = transport.local_addr().to_string();
         let node_id = node_id_from_addr(&bound);

@@ -29,6 +29,8 @@
 //! schedule (stage 3), the v5 loader itself (stage 4). The coordinator reviews
 //! the keying design before stage 1 begins.
 
+use crate::halt::RuleSchedule;
+
 /// The consensus form set a genesis file selects. One value, chosen at genesis
 /// load, fanning out to header-form, body-form, coinbase-form and
 /// rule-schedule choices.
@@ -69,9 +71,62 @@ impl GenesisForm {
     }
 }
 
+/// The complete rule/form context a running node enforces — **the carrier of
+/// the one selection point** (lab #470 stage 1, coordinator ruling Q2: a
+/// sibling beside [`RuleSchedule`], not a widening of it).
+///
+/// Two fields, two sources, one installation:
+///
+/// - [`form`](Self::form) ← **the network identity**: the genesis file's
+///   `format_version`, inside the genesis hash, pinned by
+///   `expected_genesis_hash`. Selecting a form IS selecting a net.
+/// - [`halt`](Self::halt) ← **the release constant + the halt marker**
+///   (#74/#81), exactly as before — its semantics are untouched.
+///
+/// Assembled once in `qumbra-node`'s startup and handed to the node in the
+/// same act that installed [`RuleSchedule`] alone before; there is still no
+/// setter reachable from config, CLI, or environment (H1 — see the Q1 ruling
+/// on lab #470 for why a genesis-keyed form does not weaken it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ChainRules {
+    /// The genesis-format-keyed consensus form set. Defaults to [`GenesisForm::V4`]
+    /// so every existing sim/test — none of which loads a genesis file — keeps
+    /// today's forms by construction, the same way [`RuleSchedule::V1_0`] keeps
+    /// them on the v1.0 rules.
+    pub form: GenesisForm,
+    /// The halt/upgrade schedule (#74/#81), unchanged in meaning.
+    pub halt: RuleSchedule,
+}
+
+impl Default for GenesisForm {
+    fn default() -> Self {
+        GenesisForm::V4
+    }
+}
+
+impl ChainRules {
+    /// The v1.0 context: v4 forms, no halt scheduled, no post-halt domain —
+    /// what every in-process sim and test runs under.
+    pub const V1_0: ChainRules = ChainRules { form: GenesisForm::V4, halt: RuleSchedule::V1_0 };
+
+    /// A v4-form context over an explicit halt schedule — the shape every
+    /// pre-T2 caller (drills included) means.
+    pub fn v4(halt: RuleSchedule) -> Self {
+        ChainRules { form: GenesisForm::V4, halt }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_context_is_v4_v1_0() {
+        assert_eq!(ChainRules::default(), ChainRules::V1_0);
+        assert_eq!(ChainRules::V1_0.form, GenesisForm::V4);
+        assert_eq!(ChainRules::V1_0.halt, RuleSchedule::V1_0);
+        assert_eq!(ChainRules::v4(RuleSchedule::V1_0), ChainRules::V1_0);
+    }
 
     #[test]
     fn maps_exactly_v4_and_v5_and_nothing_else() {

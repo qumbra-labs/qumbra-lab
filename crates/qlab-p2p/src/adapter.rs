@@ -47,6 +47,7 @@ use qlab_devnet::params_devnet::{
     EPOCH_LENGTH_BLOCKS, JAIL_BLOCKS,
 };
 use qlab_devnet::pow::PowEngine;
+use qlab_devnet::forms::{ChainRules, GenesisForm};
 use qlab_devnet::halt::{regime as halt_regime, RuleSchedule};
 use qlab_devnet::validation::{
     expected_difficulty, pow_seed, validate_header_under, ValidationError,
@@ -161,12 +162,13 @@ pub struct NodeAdapter<P: PowEngine, V: TxVerifier + Clone> {
     /// How a mined block's header timestamp is chosen (item 0). Defaults to
     /// [`MiningClock::Deterministic`]; the binary opts into [`MiningClock::WallClock`].
     mining_clock: MiningClock,
-    /// The running release's halt/rule schedule (issue #74). Defaults to
-    /// [`RuleSchedule::V1_0`] — no halt, no post-halt rule domain — so every
-    /// in-process sim, soak and test behaves exactly as before. The binary installs
-    /// its compile-time release schedule once at startup via
-    /// [`Self::set_rule_schedule`]; there is no config/CLI/env path to it (H1).
-    rules: RuleSchedule,
+    /// The running chain rules: the genesis-keyed form set + the release's
+    /// halt/rule schedule (issue #74; form-keyed since lab #470). Defaults to
+    /// [`ChainRules::V1_0`] — v4 forms, no halt, no post-halt rule domain — so
+    /// every in-process sim, soak and test behaves exactly as before. The binary
+    /// installs the value once at startup via [`Self::set_chain_rules`] (the one
+    /// selection point); there is no config/CLI/env path to it (H1).
+    rules: ChainRules,
     /// Counters that attribute ingest refusals to a layer (issue #74 drill
     /// evidence). Surfaced in the binary's telemetry line so the docker drill can
     /// answer "which layer rejected the old branch?" from the logs rather than from
@@ -739,7 +741,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             nonce_budget: sim.mine_nonce_budget,
             clock: 0,
             mining_clock: MiningClock::default(),
-            rules: RuleSchedule::V1_0,
+            rules: ChainRules::V1_0,
             ingest_counters: IngestCounters::default(),
             rounds: RoundLedger::default(),
             metrics: Metrics::new(),
@@ -891,11 +893,30 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// the config file, the CLI, or the environment can reach it (H1), and the
     /// default is [`RuleSchedule::V1_0`].
     pub fn set_rule_schedule(&mut self, rules: RuleSchedule) {
-        self.rules = rules;
+        self.rules.halt = rules;
     }
 
-    /// The installed rule schedule.
+    /// Install the complete chain rules — the genesis-keyed form set plus the
+    /// halt schedule — in one act (lab #470: the one selection point's
+    /// installation; `qumbra-node` composes the value from the loaded genesis
+    /// file's `format_version` and the compile-time `RELEASE` + halt marker).
+    pub fn set_chain_rules(&mut self, rules: ChainRules) {
+        self.rules = rules;
+        // Block identities are the header hash under the net's form, and the
+        // chain was built (genesis-only) before the rules were installed — the
+        // startup ordering `open → set_chain_rules → run`. `rekey_genesis`
+        // panics if anything was inserted first, making that ordering a checked
+        // invariant instead of a comment.
+        self.chain.rekey_genesis(rules.form);
+    }
+
+    /// The installed rule schedule (the halt half of [`Self::chain_rules`]).
     pub fn rules(&self) -> &RuleSchedule {
+        &self.rules.halt
+    }
+
+    /// The installed chain rules (form + halt).
+    pub fn chain_rules(&self) -> &ChainRules {
         &self.rules
     }
 
@@ -906,14 +927,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
 
     /// The height this node halts at, if its release carries one.
     pub fn halt_at(&self) -> Option<u64> {
-        self.rules.halt_at()
+        self.rules.halt.halt_at()
     }
 
     /// Whether this node is at or past its halt height — i.e. whether the halt has
     /// actually engaged, as opposed to merely being scheduled. The run loop uses
     /// this to write the durable halt marker.
     pub fn is_halted_at_tip(&self) -> bool {
-        self.rules.halt_at().is_some_and(|h| self.chain.tip_height() >= h)
+        self.rules.halt.halt_at().is_some_and(|h| self.chain.tip_height() >= h)
     }
 
     // --- read-only accessors (harness / assertions) ---
@@ -1755,7 +1776,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // it is enforced here rather than inside `validate_header` — and the peer is
         // NOT penalised: a node still on the old binary offering post-H blocks is on
         // a different release, not misbehaving (the S5 discipline from #70).
-        if !self.rules.accepts_height(header.height) {
+        if !self.rules.halt.accepts_height(header.height) {
             self.ingest_counters.halt_ignored += 1;
             return IngestOutcome::Ignored("above halt height");
         }
@@ -1859,7 +1880,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // HALT (H2): an upgraded node stops mining above H. Un-upgraded miners will
         // not, and that is fine — §4's hybrid honesty note; the committee, not miner
         // unanimity, is what makes the upgrade clean.
-        if !self.rules.accepts_height(next_height) {
+        if !self.rules.halt.accepts_height(next_height) {
             return None;
         }
 
@@ -1916,7 +1937,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         let bc = body.commitment_at(candidate_height);
         let difficulty = expected_difficulty(&self.chain, &parent_hash, self.block_time)?;
         let timestamp = self.next_timestamp(&parent);
-        let candidate = BlockHeader::child_of(&parent, timestamp, difficulty, bc);
+        let candidate =
+            BlockHeader::child_of_for(self.rules.form, &parent, timestamp, difficulty, bc);
         assert_eq!(
             candidate.height, candidate_height,
             "the mined header's height must be the height its body commitment was keyed to"
@@ -1934,7 +1956,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         height: u64,
         validators: &[Validator],
     ) -> Option<(Checkpoint, Vec<Vote>)> {
-        if !self.rules.may_checkpoint(height) {
+        if !self.rules.halt.may_checkpoint(height) {
             return None; // H2 — see `make_checkpoint_guarded`
         }
         let block_hash = self.chain.main_chain_hash_at(height)?;
@@ -1963,7 +1985,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // produce the vote at all, rather than producing one that is later filtered.
         // The checkpoint *at* H is deliberately still produced — it is what makes the
         // upgrade boundary a finalized boundary.
-        if !self.rules.may_checkpoint(height) {
+        if !self.rules.halt.may_checkpoint(height) {
             return None;
         }
         let block_hash = self.chain.main_chain_hash_at(height)?;
@@ -2154,6 +2176,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
 }
 
 impl<P: PowEngine, V: TxVerifier + Clone> ChainView for NodeAdapter<P, V> {
+    fn genesis_form(&self) -> GenesisForm {
+        // The one installed source (lab #470): the P2P codec reads the form
+        // from the same ChainRules consensus runs under.
+        self.rules.form
+    }
+
     fn genesis_block_hash(&self) -> Hash32 {
         self.chain.genesis_block_hash()
     }
@@ -2357,7 +2385,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
             return IngestOutcome::Orphan;
         };
         for header in headers {
-            if !self.rules.accepts_height(header.height) {
+            if !self.rules.halt.accepts_height(header.height) {
                 return IngestOutcome::Ignored("above halt height");
             }
             if self.chain.header(&header.header_hash()).is_some() {
@@ -2599,7 +2627,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> CheckpointIngest for NodeAdapter<P, V>
         // HALT (issue #74, H2): a halted node must not FINALIZE above H either — it
         // would be finalizing a chain it refuses to accept. `Stale`, not `Invalid`:
         // the sender is on a different release, not misbehaving (S5).
-        if !self.rules.may_checkpoint(cp.height) {
+        if !self.rules.halt.may_checkpoint(cp.height) {
             return VotesOutcome::Stale;
         }
         let finalized = self.finality.finalized_height();
@@ -2850,7 +2878,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> CommitteeControl for NodeAdapter<P, V>
             self.chain.tip_height(),
             self.finality.finalized_height(),
             DEGRADED_MODE_LAG_BLOCKS,
-            self.rules.halt_at(),
+            self.rules.halt.halt_at(),
         )
     }
 
@@ -2893,9 +2921,9 @@ mod tests {
             "counting-keccak"
         }
 
-        fn pow_hash(&self, header: &BlockHeader, seed: &[u8]) -> Hash32 {
+        fn pow_hash(&self, form: GenesisForm, header: &BlockHeader, seed: &[u8]) -> Hash32 {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            KeccakPow.pow_hash(header, seed)
+            KeccakPow.pow_hash(form, header, seed)
         }
     }
 
@@ -3253,7 +3281,7 @@ mod tests {
             [0xA5; 32],
         );
         while qlab_devnet::pow::satisfies_target(
-            &KeccakPow.pow_hash(&sibling, &joiner.chain().genesis_block_hash()),
+            &KeccakPow.pow_hash(GenesisForm::V4, &sibling, &joiner.chain().genesis_block_hash()),
             sibling.difficulty,
         ) {
             sibling.nonce = sibling.nonce.wrapping_add(1);
@@ -6057,7 +6085,7 @@ mod tests {
                         &hdr,
                         easy_sim().block_time_secs,
                         KeyBlockSchedule::new(easy_sim().key_epoch_blocks, easy_sim().key_epoch_lag),
-                        up.rules(),
+                        up.chain_rules(),
                     ),
                     Err(ValidationError::PowUnsatisfied),
                     "the failing check is the PoW target under the post-halt domain — \

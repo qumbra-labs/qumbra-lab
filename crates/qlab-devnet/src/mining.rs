@@ -7,7 +7,8 @@
 //! a handful of iterations; a real RandomX-class engine slots in behind the same
 //! trait with no change here.
 
-use crate::halt::{pow_value, RuleSchedule};
+use crate::forms::ChainRules;
+use crate::halt::pow_value;
 use crate::header::BlockHeader;
 use crate::pow::{satisfies_target, PowEngine};
 
@@ -26,24 +27,26 @@ pub fn mine<P: PowEngine>(
     nonce_budget: u64,
     seed: &[u8],
 ) -> Option<BlockHeader> {
-    mine_under(pow, header, nonce_budget, seed, &RuleSchedule::V1_0)
+    mine_under(pow, header, nonce_budget, seed, &ChainRules::V1_0)
 }
 
-/// [`mine`] under an explicit [`RuleSchedule`] (issue #74). Above an upgrade
-/// boundary the miner searches for a nonce satisfying the **post-halt** PoW value
-/// ([`pow_value`]) — the same value the validator checks, so miner and validator
-/// can never disagree about which rules a height is under. At and below the
-/// boundary the two functions are byte-identical.
+/// [`mine`] under an explicit [`ChainRules`] (issue #74; form-keyed since lab
+/// #470). Above an upgrade boundary the miner searches for a nonce satisfying
+/// the **post-halt** PoW value ([`pow_value`]) — the same value the validator
+/// checks, so miner and validator can never disagree about which rules a height
+/// is under. At and below the boundary the two functions are byte-identical.
+/// The PoW message is the header preimage under `rules.form`, so miner and
+/// validator can never disagree about the layout either.
 pub fn mine_under<P: PowEngine>(
     pow: &P,
     mut header: BlockHeader,
     nonce_budget: u64,
     seed: &[u8],
-    rules: &RuleSchedule,
+    rules: &ChainRules,
 ) -> Option<BlockHeader> {
     for nonce in 0..nonce_budget {
         header.nonce = nonce;
-        let value = pow_value(pow.pow_hash(&header, seed), header.height, rules);
+        let value = pow_value(pow.pow_hash(rules.form, &header, seed), header.height, &rules.halt);
         if satisfies_target(&value, header.difficulty) {
             return Some(header);
         }
@@ -61,7 +64,10 @@ mod tests {
         let pow = KeccakPow;
         let header = BlockHeader::genesis(8, 0);
         let mined = mine(&pow, header, 1_000_000, &[]).expect("must mine at difficulty 8");
-        assert!(satisfies_target(&pow.pow_hash(&mined, &[]), mined.difficulty));
+        assert!(satisfies_target(
+            &pow.pow_hash(crate::forms::GenesisForm::V4, &mined, &[]),
+            mined.difficulty
+        ));
         // Difficulty and structural fields are untouched — only the nonce moved.
         assert_eq!(mined.difficulty, header.difficulty);
         assert_eq!(mined.height, header.height);

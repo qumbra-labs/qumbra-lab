@@ -673,8 +673,8 @@ fn a_pre_101_block_announcement_does_not_decode() {
         short_ids: Vec::new(),
         prefilled: Vec::new(),
     };
-    let bytes = encode_announce(&ann);
-    let round = decode_announce(&bytes).expect("current wire round-trips");
+    let bytes = encode_announce(qlab_devnet::forms::GenesisForm::V4, &ann);
+    let round = decode_announce(qlab_devnet::forms::GenesisForm::V4, &bytes).expect("current wire round-trips");
     assert_eq!(round.coinbase_rkm, [1, 2, 3, 4]);
 
     // The same frame as a pre-#101 peer would have sent it: everything except the
@@ -684,7 +684,7 @@ fn a_pre_101_block_announcement_does_not_decode() {
     old.extend_from_slice(&bytes[..bytes.len() - 32 - 2]); // …minus rkm and the two empty varints
     old.extend_from_slice(&bytes[bytes.len() - 2..]);
     assert!(
-        decode_announce(&old).is_err(),
+        decode_announce(qlab_devnet::forms::GenesisForm::V4, &old).is_err(),
         "a pre-#101 announcement must be refused, not reconstructed with a zero payout key"
     );
 }

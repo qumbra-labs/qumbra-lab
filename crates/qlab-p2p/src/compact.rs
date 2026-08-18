@@ -19,7 +19,8 @@ use qlab_devnet::body::TxEntry;
 use qlab_devnet::hash::keccak256;
 use qlab_devnet::header::{BlockHeader, Hash32};
 
-use crate::codec::{decode_header, encode_header, encode_tx, tx_id, DecodeError, Reader};
+use crate::codec::{decode_header, encode_header, encode_tx, header_wire_len, tx_id, DecodeError, Reader};
+use qlab_devnet::forms::GenesisForm;
 use crate::varint::write_varint;
 
 pub use qlab_cbserver::codec::{CompactBlock, CompactGroup};
@@ -109,9 +110,9 @@ pub struct BlockTxn {
 // --- BlockAnnounce ---
 
 /// Encode a `BlockAnnounce`.
-pub fn encode_announce(a: &BlockAnnounce) -> Vec<u8> {
+pub fn encode_announce(form: GenesisForm, a: &BlockAnnounce) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&encode_header(&a.header));
+    out.extend_from_slice(&encode_header(form, &a.header));
     out.extend_from_slice(&a.nonce.to_le_bytes());
     out.extend_from_slice(&a.coinbase.to_le_bytes());
     for lane in &a.coinbase_rkm {
@@ -132,10 +133,10 @@ pub fn encode_announce(a: &BlockAnnounce) -> Vec<u8> {
 }
 
 /// Decode a `BlockAnnounce`.
-pub fn decode_announce(buf: &[u8]) -> Result<BlockAnnounce, DecodeError> {
+pub fn decode_announce(form: GenesisForm, buf: &[u8]) -> Result<BlockAnnounce, DecodeError> {
     let mut r = Reader::new(buf);
-    let hdr_bytes = r.rest(crate::codec::HEADER_WIRE_LEN, "announce.header")?;
-    let header = decode_header(&hdr_bytes)?;
+    let hdr_bytes = r.rest(header_wire_len(form), "announce.header")?;
+    let header = decode_header(form, &hdr_bytes)?;
     let nonce = r.u64_le("announce.nonce")?;
     let coinbase = r.u64_le("announce.coinbase")?;
     let mut coinbase_rkm = [0u64; 4];
@@ -325,8 +326,8 @@ mod tests {
             short_ids: vec![short_id(0xDEADBEEF, &tx_id(&tx(2))), short_id(0xDEADBEEF, &tx_id(&tx(3)))],
             prefilled: vec![PrefilledTx { index: 0, tx: tx(1) }],
         };
-        let bytes = encode_announce(&a);
-        let back = decode_announce(&bytes).unwrap();
+        let bytes = encode_announce(GenesisForm::V4, &a);
+        let back = decode_announce(GenesisForm::V4, &bytes).unwrap();
         assert_eq!(back.header, a.header);
         assert_eq!(back.nonce, a.nonce);
         assert_eq!(back.short_ids, a.short_ids);
