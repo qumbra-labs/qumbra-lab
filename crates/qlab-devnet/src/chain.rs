@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 
+use crate::forms::GenesisForm;
 use crate::header::{BlockHeader, Hash32};
 
 /// A stored block: its header plus derived bookkeeping. 棒 0 is header-only; the
@@ -82,14 +83,26 @@ pub struct ChainState {
     main_chain_by_height: Vec<Hash32>,
     /// The highest finalized block. Once set, every tip must descend from it.
     finalized: Option<FinalPoint>,
+    /// The genesis form this chain's block identities are computed under (lab
+    /// #470): a block's hash is `header_hash_for(form)`, so a v5 net's links
+    /// (`prev` = the parent's v5 hash) resolve. Set at construction; defaults
+    /// to v4 through [`ChainState::new`], so every existing chain is unchanged.
+    form: GenesisForm,
 }
 
 impl ChainState {
     /// Start a chain from `genesis` (whose `prev` must be all-zero, `height` 0).
+    /// **v4 identities** — a v5 net starts via [`ChainState::new_for`].
     pub fn new(genesis: BlockHeader) -> Self {
+        Self::new_for(GenesisForm::V4, genesis)
+    }
+
+    /// [`ChainState::new`] under an explicit genesis form: every block identity
+    /// in this chain is its header hash **under that form**.
+    pub fn new_for(form: GenesisForm, genesis: BlockHeader) -> Self {
         assert_eq!(genesis.height, 0, "genesis height must be 0");
         assert_eq!(genesis.prev, [0u8; 32], "genesis prev must be ZERO_HASH");
-        let hash = genesis.header_hash();
+        let hash = genesis.header_hash_for(form);
         let entry = Entry {
             header: genesis,
             cumulative_work: genesis.difficulty as u128,
@@ -102,7 +115,31 @@ impl ChainState {
             tip: hash,
             main_chain_by_height: vec![hash],
             finalized: None,
+            form,
         }
+    }
+
+    /// The genesis form this chain's identities are keyed under.
+    pub fn form(&self) -> GenesisForm {
+        self.form
+    }
+
+    /// Re-key a **genesis-only** chain to `form` (lab #470): the one legal
+    /// moment is between construction and the first non-genesis insert — the
+    /// shape `set_chain_rules` needs, because the adapter builds its chain
+    /// before the binary installs the rules. Re-keying a chain that already
+    /// carries blocks would silently orphan them, so it panics instead.
+    pub fn rekey_genesis(&mut self, form: GenesisForm) {
+        if form == self.form {
+            return;
+        }
+        assert!(
+            self.blocks.len() == 1 && self.finalized.is_none(),
+            "rekey_genesis is only legal on a genesis-only chain (have {} blocks)",
+            self.blocks.len()
+        );
+        let genesis = self.blocks[&self.genesis].header;
+        *self = Self::new_for(form, genesis);
     }
 
     /// Insert a header, linking it to its parent and updating the tip if the new
@@ -111,7 +148,7 @@ impl ChainState {
     /// the new block's hash on success (a stored-but-not-adopted side block is
     /// still `Ok`).
     pub fn insert_header(&mut self, header: BlockHeader) -> Result<Hash32, InsertError> {
-        let hash = header.header_hash();
+        let hash = header.header_hash_for(self.form);
         if self.blocks.contains_key(&hash) {
             return Err(InsertError::Duplicate);
         }

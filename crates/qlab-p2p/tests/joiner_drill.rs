@@ -62,9 +62,9 @@ impl PowEngine for CountingPow {
         "counting-keccak"
     }
 
-    fn pow_hash(&self, header: &BlockHeader, seed: &[u8]) -> [u8; 32] {
+    fn pow_hash(&self, form: qlab_devnet::forms::GenesisForm, header: &BlockHeader, seed: &[u8]) -> [u8; 32] {
         self.calls.fetch_add(1, Ordering::Relaxed);
-        KeccakPow.pow_hash(header, seed)
+        KeccakPow.pow_hash(form, header, seed)
     }
 }
 

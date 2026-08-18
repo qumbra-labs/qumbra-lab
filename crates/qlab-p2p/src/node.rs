@@ -1235,7 +1235,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
 
     /// Ingest a locally-produced header and announce it.
     pub fn announce_header(&mut self, header: BlockHeader) {
-        let id = header.header_hash();
+        let id = header.header_hash_for(self.node.genesis_form());
         if self.node.ingest_header(header).should_relay() {
             self.seen.insert(id);
             self.relay_inv(InvItem { kind: InvKind::Block, id }, None);
@@ -1308,7 +1308,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         coinbase_rkm: [u64; 4],
         nonce: u64,
     ) {
-        let bh = header.header_hash();
+        let bh = header.header_hash_for(self.node.genesis_form());
         // Ingest first, and do not put on the wire what our own node rejects
         // (issue #77, the own-announce seam): a locally-produced header/body pair
         // that fails the binding is a local bug, and announcing it would make this
@@ -1334,7 +1334,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         let (prefilled, short_ids) = build_announce_parts(&txs, nonce);
         let ann =
             BlockAnnounce { header, nonce, coinbase, coinbase_rkm, short_ids, prefilled };
-        let payload = encode_announce(&ann);
+        let payload = encode_announce(self.node.genesis_form(), &ann);
         for pid in self.peers.ready_peers() {
             self.send(pid, MsgType::BlockAnnounce, payload.clone());
         }
@@ -2152,7 +2152,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                         let mut served = false;
                         if let Some(b) = body {
                             let ann = whole_block_announce(h, b);
-                            let bytes = encode_announce(&ann);
+                            let bytes = encode_announce(self.node.genesis_form(), &ann);
                             let cost = bytes.len() as u64;
                             // Charged at the encoded answer size — the number
                             // the peer's inbound limiter will see — against
@@ -2170,7 +2170,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                         if !served {
                             // No body held, past a cap, or over a budget: the
                             // header, exactly as before.
-                            self.send(from, MsgType::Header, crate::codec::encode_header(&h))
+                            self.send(from, MsgType::Header, crate::codec::encode_header(self.node.genesis_form(), &h))
                         }
                     }
                     None => not_found.push(it),
@@ -2259,14 +2259,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     }
 
     fn on_header(&mut self, from: PeerId, payload: &[u8]) {
-        let header = match crate::codec::decode_header(payload) {
+        let header = match crate::codec::decode_header(self.node.genesis_form(), payload) {
             Ok(h) => h,
             Err(_) => {
                 self.peers.penalize(from, PENALTY_MALFORMED);
                 return;
             }
         };
-        let id = header.header_hash();
+        let id = header.header_hash_for(self.node.genesis_form());
         // 🔴 **Issue #229 — the answer that was easiest to leave out.** A peer
         // answers `GetData(Block)` with a bare `Header` when it holds the header and
         // does **not possess the body** (`on_getdata`'s `None` arm; #199's honest
@@ -2602,11 +2602,11 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
         };
         let batch = answer_get_headers(&self.node, &loc, MAX_HEADERS_PER_BATCH);
-        self.send(from, MsgType::Headers, encode_headers(&batch));
+        self.send(from, MsgType::Headers, encode_headers(self.node.genesis_form(), &batch));
     }
 
     fn on_headers(&mut self, from: PeerId, payload: &[u8]) {
-        let batch = match decode_headers(payload) {
+        let batch = match decode_headers(self.node.genesis_form(), payload) {
             Ok(b) => b,
             Err(_) => {
                 self.peers.penalize(from, PENALTY_MALFORMED);
@@ -2638,7 +2638,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                     CheckpointHeaderOutcome::AboveCheckpoint => {}
                 }
             }
-            let id = h.header_hash();
+            let id = h.header_hash_for(self.node.genesis_form());
             match self.node.ingest_header(h) {
                 IngestOutcome::Accepted => {
                     accepted += 1;
@@ -2761,7 +2761,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             return CheckpointHeaderOutcome::Buffered;
         }
 
-        if header.header_hash() != sync.checkpoint.block_hash {
+        if header.header_hash_for(self.node.genesis_form()) != sync.checkpoint.block_hash {
             // A fully linked span landing on the wrong hash at the checkpoint
             // height is a forged chain. Only the peer that delivered this
             // provably-wrong frontier header is attributable — an honest prefix
@@ -2784,7 +2784,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         match self.node.ingest_finalized_headers(&sync.headers) {
             IngestOutcome::Accepted => {
                 for buffered in sync.headers {
-                    self.seen.insert(buffered.header_hash());
+                    self.seen.insert(buffered.header_hash_for(self.node.genesis_form()));
                 }
                 println!(
                     "CHECKPOINT_SYNC event=admit peer={} checkpoint={} headers={} pow=skipped",
@@ -2826,14 +2826,14 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
 
     // (2) §7 BIP-152 block relay.
     fn on_block_announce(&mut self, from: PeerId, payload: &[u8]) {
-        let ann = match decode_announce(payload) {
+        let ann = match decode_announce(self.node.genesis_form(), payload) {
             Ok(a) => a,
             Err(_) => {
                 self.peers.penalize(from, PENALTY_MALFORMED);
                 return;
             }
         };
-        let bh = ann.header.header_hash();
+        let bh = ann.header.header_hash_for(self.node.genesis_form());
         // Issue #229: the peer served the whole body. Recorded **before** the
         // satisfaction checks below, because the case that matters is the one where
         // the entry is NOT cleared — a body that arrived and was not applied leaves
@@ -3050,7 +3050,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         }
         self.blocks.insert(ann.header.height, bh, txs, ann.coinbase, ann.coinbase_rkm);
         self.seen.insert(bh);
-        let payload = encode_announce(&ann);
+        let payload = encode_announce(self.node.genesis_form(), &ann);
         for pid in self.peers.ready_peers() {
             if Some(pid) != except {
                 self.send(pid, MsgType::BlockAnnounce, payload.clone());
@@ -3515,7 +3515,7 @@ mod tests {
             joiner.ingest_checkpoint_sync_header(PeerId(3), span[3]),
             CheckpointHeaderOutcome::AboveCheckpoint
         ));
-        joiner.on_header(PeerId(3), &crate::codec::encode_header(&span[3]));
+        joiner.on_header(PeerId(3), &crate::codec::encode_header(qlab_devnet::forms::GenesisForm::V4, &span[3]));
         let sync = joiner
             .checkpoint_sync
             .as_ref()
@@ -3541,7 +3541,7 @@ mod tests {
                 CheckpointHeaderOutcome::Buffered
             ));
         }
-        let replay = encode_headers(&span[..2]);
+        let replay = encode_headers(qlab_devnet::forms::GenesisForm::V4, &span[..2]);
         for round in 0..MAX_CHECKPOINT_SYNC_STALLED_BATCHES {
             assert!(
                 joiner.checkpoint_sync.is_some(),
@@ -3563,12 +3563,12 @@ mod tests {
         let span = linear_span(3);
         let joiner = &mut nodes[0];
         armed_session(joiner, &span, PeerId(2));
-        joiner.on_headers(PeerId(2), &encode_headers(&span[..2]));
+        joiner.on_headers(PeerId(2), &encode_headers(qlab_devnet::forms::GenesisForm::V4, &span[..2]));
         assert_eq!(
             joiner.checkpoint_sync.as_ref().expect("accumulating").frontier_height(),
             2
         );
-        joiner.on_headers(PeerId(3), &encode_headers(&span[2..]));
+        joiner.on_headers(PeerId(3), &encode_headers(qlab_devnet::forms::GenesisForm::V4, &span[2..]));
         assert!(joiner.checkpoint_sync.is_none(), "admitted session is complete");
         assert!(!joiner.checkpoint_sync_fallback);
         assert_eq!(joiner.node().tip_height(), 3, "the admitted span is the chain");
@@ -4344,7 +4344,7 @@ mod tests {
             prefilled,
         };
         // Node 0 (PeerId 1) pushes it straight at node 1 (PeerId 2).
-        nodes[0].send(PeerId(2), MsgType::BlockAnnounce, encode_announce(&ann));
+        nodes[0].send(PeerId(2), MsgType::BlockAnnounce, encode_announce(qlab_devnet::forms::GenesisForm::V4, &ann));
         nodes[1].tick(0);
 
         assert!(
@@ -4649,7 +4649,7 @@ mod tests {
             short_ids,
             prefilled,
         };
-        a.send(PeerId(2), MsgType::BlockAnnounce, encode_announce(&ann));
+        a.send(PeerId(2), MsgType::BlockAnnounce, encode_announce(qlab_devnet::forms::GenesisForm::V4, &ann));
         b.tick(2_000);
         assert!(
             b.pending_blocks.is_empty(),

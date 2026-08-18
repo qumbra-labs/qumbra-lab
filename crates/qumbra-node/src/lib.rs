@@ -27,6 +27,11 @@
 //!   node here.
 //! - [`run`] — composes the N7 stack over the REAL TCP transport + RandomXPow +
 //!   on-disk qlab-node stores, and runs it with graceful-shutdown snapshot flush.
+//! - [`shutdown`] — the one seam that arms "the user asked this process to stop",
+//!   per platform: `ctrlc` + `termination` on unix (SIGINT/SIGTERM/SIGHUP, issue
+//!   #145), and this binary's own `SetConsoleCtrlHandler` on Windows — which
+//!   must additionally **hold the process alive** across a console-window close,
+//!   because Windows kills the process the moment that handler returns (lab #478).
 //! - [`audit_emission`] — read-only `audit-emission` subcommand: walk a data dir's
 //!   main chain via [`qlab_node::MemNode::open`] and report every height whose
 //!   `body.coinbase` differs from [`qlab_node::emission::coinbase`] (lab #299 /
@@ -53,6 +58,7 @@ pub mod params_audit;
 pub mod release;
 pub mod revision;
 pub mod run;
+pub mod shutdown;
 pub mod startup;
 pub mod telemetry_server;
 pub mod verifier;

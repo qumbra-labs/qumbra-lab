@@ -370,7 +370,7 @@ pub fn scenario_adversarial_peers() -> SoakResult {
     let orphan_parent = BlockHeader::genesis(256, 99);
     let orphan = BlockHeader::child_of(&BlockHeader::child_of(&orphan_parent, 75, 256, [8; 32]), 150, 256, [9; 32]);
     let tip_before = nodes[1].tip_hash();
-    inject!(MsgType::Header, encode_header(&orphan));
+    inject!(MsgType::Header, encode_header(qlab_devnet::forms::GenesisForm::V4, &orphan));
     let b_ok = nodes[1].tip_hash() == tip_before;
     ok &= b_ok;
     notes.push(format!("bad-header no-op:{b_ok}"));
@@ -394,7 +394,7 @@ pub fn scenario_adversarial_peers() -> SoakResult {
         short_ids: Vec::new(),
         prefilled: vec![PrefilledTx { index: 0, tx: bad_tx }],
     };
-    inject!(MsgType::BlockAnnounce, encode_announce(&ann));
+    inject!(MsgType::BlockAnnounce, encode_announce(qlab_devnet::forms::GenesisForm::V4, &ann));
     run(&mut nodes);
     let c_ok = {
         use qlab_node::NodeState as _;
@@ -420,7 +420,7 @@ pub fn scenario_adversarial_peers() -> SoakResult {
         short_ids: Vec::new(),
         prefilled: Vec::new(),
     };
-    inject!(MsgType::BlockAnnounce, encode_announce(&ann_empty));
+    inject!(MsgType::BlockAnnounce, encode_announce(qlab_devnet::forms::GenesisForm::V4, &ann_empty));
     run(&mut nodes);
     let c2_ok = {
         use qlab_node::NodeState as _;

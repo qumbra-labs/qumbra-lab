@@ -53,6 +53,36 @@ impl ArityBucket {
     /// Every bucket, smallest first — the protocol fee table's key set.
     pub const ALL: [ArityBucket; 3] =
         [ArityBucket::TwoByTwo, ArityBucket::FourByFour, ArityBucket::EightByEight];
+
+    /// **The one wire encoding of a bucket** (lab #470 stage 3, closing #233):
+    /// an injective discriminant, 0/1/2. Used by BOTH the P2P tx codec and the
+    /// v5 body-commitment preimage — one function, so the two spellings that
+    /// #233 found agreeing only by coincidence are now the same fact. The
+    /// v2/v3 body preimages keep writing [`Self::logical_actions`] — those
+    /// bytes are frozen history (the live T1 goldens).
+    ///
+    /// Injective over the VARIANTS, not the action counts: a future variant
+    /// sharing an action count with an existing one (the dummy-masked-2×2
+    /// shape #219 considered) gets its own discriminant here and stays
+    /// distinguishable in the v5 commitment — the exact confusion #233 filed.
+    pub fn wire_discriminant(self) -> u8 {
+        match self {
+            ArityBucket::TwoByTwo => 0,
+            ArityBucket::FourByFour => 1,
+            ArityBucket::EightByEight => 2,
+        }
+    }
+
+    /// Decode [`Self::wire_discriminant`]; `None` on unknown (reject-unknown —
+    /// the caller names its own error).
+    pub fn from_wire_discriminant(v: u8) -> Option<ArityBucket> {
+        match v {
+            0 => Some(ArityBucket::TwoByTwo),
+            1 => Some(ArityBucket::FourByFour),
+            2 => Some(ArityBucket::EightByEight),
+            _ => None,
+        }
+    }
 }
 
 /// The posted price for a bucket: `FEE_MARGINAL_UNITS × max(FEE_GRACE_ACTIONS,
@@ -105,4 +135,22 @@ mod tests {
             assert!(posted_fee(b) > 0);
         }
     }
+    /// Lab #470 stage 3 (#233): the ONE wire encoding — injective over the
+    /// variants, round-trips, rejects unknowns, and its values are PINNED to
+    /// the live v4 tx wire's 0/1/2 (the p2p codec has written these since M6;
+    /// changing them would break the frozen tx wire, so they are a compat
+    /// lock, not an arbitrary choice).
+    #[test]
+    fn wire_discriminant_is_the_one_pinned_encoding() {
+        assert_eq!(ArityBucket::TwoByTwo.wire_discriminant(), 0);
+        assert_eq!(ArityBucket::FourByFour.wire_discriminant(), 1);
+        assert_eq!(ArityBucket::EightByEight.wire_discriminant(), 2);
+        for b in ArityBucket::ALL {
+            assert_eq!(ArityBucket::from_wire_discriminant(b.wire_discriminant()), Some(b));
+        }
+        for v in [3u8, 4, 0xFF] {
+            assert_eq!(ArityBucket::from_wire_discriminant(v), None);
+        }
+    }
+
 }

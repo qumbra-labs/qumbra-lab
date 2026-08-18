@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use qlab_devnet::body::{TxEntry, TxVerifier};
 use qlab_devnet::committee::CommitteeState;
 use qlab_devnet::ebbflow::FinalityStatus;
+use qlab_devnet::forms::ChainRules;
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::{
     CHECKPOINT_CADENCE_BLOCKS, CHECKPOINT_SIGN_HYSTERESIS_BLOCKS, DEGRADED_MODE_LAG_BLOCKS,
@@ -749,7 +750,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         //     that is all the genesis file describes. `open` replays this data dir's
         //     committee-punishment ledger onto it (issue #133); a ledger it cannot
         //     honour is an error here and the node does not start.
-        let mut adapter = NodeAdapter::open(&config.data_dir, committee, pow, verifier, sim)?;
+        // Lab #470 stage 4a: the form is installed AT CONSTRUCTION — before
+        // the datadir replay — from the same genesis file the ChainRules
+        // install below reads. One source, two arrival points, both checked.
+        let mut adapter =
+            NodeAdapter::open_for(genesis.form()?, &config.data_dir, committee, pow, verifier, sim)?;
         // Issue #133's counter. Printed on EVERY start, zero included: the silence
         // after a restart is what made this class of defect invisible five times over,
         // because a node that restored nothing and a node that had nothing to restore
@@ -772,8 +777,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 );
             }
         }
-        // The release's halt/rule schedule, installed once. No runtime path (H1).
-        adapter.set_rule_schedule(rules);
+        // The chain rules, installed once — THE one selection point (lab #470):
+        // the form set from the genesis file's format_version (= the network
+        // identity, Q1 ruling), the halt schedule from the compile-time RELEASE
+        // + marker (#74/#81). No runtime path to either (H1).
+        adapter.set_chain_rules(ChainRules { form: genesis.form()?, halt: rules });
         let transport = TcpTransport::bind(&config.listen_addr).map_err(RunError::Io)?;
         let bound = transport.local_addr().to_string();
         let node_id = node_id_from_addr(&bound);
@@ -4230,6 +4238,24 @@ mod tests {
     }
 
     /// so main does not print "snapshot flushed" after a failed write.
+    ///
+    /// **How the failure is injected, and why it changed (lab #478).** This test
+    /// used to mark `data_dir` read-only. That is a unix concept: Windows stores
+    /// `FILE_ATTRIBUTE_READONLY` on a directory and then *ignores it for file
+    /// creation*, so the snapshot write succeeded, `run_until` returned `true`,
+    /// and the assertion below failed on the windows CI leg — the test's premise
+    /// never fired.
+    ///
+    /// The injection is now "there is already a **directory** where the snapshot's
+    /// temp file must be created", which makes `File::create` fail on every
+    /// platform (`EISDIR` on unix, `ERROR_ACCESS_DENIED` on Windows) with no
+    /// permission model involved at all.
+    ///
+    /// That is not merely a portability patch — it closes a latent hole in the
+    /// unix version too: a suite running as **root** ignores a read-only
+    /// directory, so the old injection would have silently stopped injecting and
+    /// the test would have passed while proving nothing. The failing path is now
+    /// reached for a structural reason rather than a privilege-dependent one.
     #[test]
     fn run_until_returns_false_when_snapshot_flush_fails() {
         let (config, genesis, base) = rig("shutdown_fail", true);
@@ -4237,19 +4263,25 @@ mod tests {
             RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
         node.set_mine_interval(Duration::ZERO);
         node.try_mine();
-        // Make the data dir unwritable so the atomic snapshot create (tmp + rename)
-        // cannot succeed. The return value is what main keys the status line on.
-        let mut perms = std::fs::metadata(&config.data_dir).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(&config.data_dir, perms.clone()).unwrap();
+        // Block the atomic snapshot's temp path with a directory. Named through
+        // `qlab_node::SNAPSHOT_TMP` rather than re-typed, so a rename of that file
+        // cannot turn this injection into a no-op that still passes.
+        let blocker = config.data_dir.join(qlab_node::SNAPSHOT_TMP);
+        std::fs::create_dir_all(&blocker).unwrap();
+
+        // Guard the premise: if the write ever starts succeeding again, this test
+        // must fail LOUDLY on the injection rather than quietly on the assertion.
+        assert!(
+            node.save_snapshot().is_err(),
+            "the injection did not take — the snapshot write still succeeds, so the assertion \
+             below would prove nothing (this is exactly how the read-only-dir injection failed \
+             on Windows)"
+        );
 
         let shutdown = AtomicBool::new(true);
         let ok = node.run_until(&shutdown);
         assert!(!ok, "snapshot flush failure must surface as false to the caller");
 
-        // Restore writability so cleanup can remove the tree.
-        perms.set_readonly(false);
-        std::fs::set_permissions(&config.data_dir, perms).unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -4654,10 +4686,28 @@ mod tests {
         acfg.dial_peers = vec![b_addr.clone()];
         let mut a = RunningNode::start(&acfg, &agen, KeccakPow, DevnetRehearsalVerifier).unwrap();
         assert_eq!(a.p2p().transport().peers().len(), 0, "B is down at boot → no peer");
-        pump(&mut [&mut a], 5);
+        // Wait for the refusal to be RECORDED, not for a fixed 100 ms. The dial
+        // runs on a worker thread since #132, so this is "the OS refused a connect
+        // and the loop collected the answer" — a fixed budget for that is a
+        // Linux-loopback assumption, and the windows leg is where it broke.
+        {
+            let addr = b_addr.clone();
+            pump_until(&mut [&mut a], PUMP_LIMIT, |ns| {
+                ns[0].p2p().addrs().entry(&addr).map(|e| e.failures >= 1).unwrap_or(false)
+            });
+        }
+        // If this fires now, it is no longer "the budget was too short" — the pump
+        // above waited PUMP_LIMIT for it. It means this platform never recorded a
+        // refused outbound dial at all, which would be a REAL behaviour gap (the
+        // backoff ladder and `dialable` accounting are both keyed on `failures`),
+        // not a slow test. The message says which, because the two need different
+        // people to look at them.
         assert!(
             a.p2p().addrs().entry(&b_addr).unwrap().failures >= 1,
-            "the refused startup dial completed before the heal"
+            "the refused startup dial was never recorded as a failure within {PUMP_LIMIT:?} — \
+             on a platform where a refused connect is not surfaced to the address book, the \
+             backoff ladder and `dialable` never learn a peer is down. This is a behaviour \
+             question, not a timing one; the timing one is already excluded by pump_until."
         );
 
         // B comes up on the same address.
@@ -4669,7 +4719,10 @@ mod tests {
         // Re-dial reconnects A to B with no restart.
         a.force_redial_ready();
         a.maintain_peers();
-        pump(&mut [&mut a, &mut b], 5);
+        // Same reasoning as above: the reconnect is a real handshake off-loop.
+        pump_until(&mut [&mut a, &mut b], PUMP_LIMIT, |ns| {
+            ns[0].p2p().transport().peers().len() == 1
+        });
         assert_eq!(a.p2p().transport().peers().len(), 1, "re-dial reconnected the healed peer");
 
         // A second re-dial does NOT open a duplicate connection to the live peer.
@@ -4758,7 +4811,13 @@ mod tests {
         pump(&mut [&mut a, &mut b], 5);
         a.force_redial_ready();
         a.maintain_peers();
-        pump(&mut [&mut a, &mut b], 5);
+        // Wait for both directed connections, not for 100 ms of clock — see
+        // `pump_until`. This test passed on the windows leg once and failed the
+        // next run at `left: 1, right: 2`, which is one handshake not yet landed
+        // rather than a connection that will never form.
+        pump_until(&mut [&mut a, &mut b], PUMP_LIMIT, |ns| {
+            ns[0].telemetry().peer_count == 2 && ns[1].telemetry().peer_count == 2
+        });
         assert_eq!(a.telemetry().peer_count, 2, "A sees both live directions");
         assert_eq!(b.telemetry().peer_count, 2, "B sees both live directions");
 
@@ -4787,7 +4846,9 @@ mod tests {
         pump(&mut [&mut a, &mut b], 5);
         a.force_redial_ready();
         a.maintain_peers();
-        pump(&mut [&mut a, &mut b], 5);
+        pump_until(&mut [&mut a, &mut b], PUMP_LIMIT, |ns| {
+            ns[0].telemetry().peer_count == 2 && ns[1].telemetry().peer_count == 2
+        });
 
         assert_eq!(
             a.telemetry().peer_count,
@@ -4893,6 +4954,48 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }
+
+    /// [`pump`], but bounded by an **outcome** instead of a round count — pump
+    /// until `done` is true, or give up after `limit` and let the caller's own
+    /// assertion produce the failure message.
+    ///
+    /// **Why this exists (lab #478).** `pump(n)` is a Linux-calibrated budget:
+    /// `n × 20 ms` plus the step time. Since #132 an outbound connect runs on a
+    /// worker thread rather than the loop, so anything asserting on a dial's
+    /// *result* is really asserting "the OS finished a TCP handshake, or refused
+    /// one, within ~100 ms, and a thread was scheduled to hand the answer back".
+    /// That holds on Linux loopback and did not hold on the windows CI leg, where
+    /// `redial_reconnects_a_configured_peer_without_restart` found the refusal
+    /// not yet recorded after 5 rounds.
+    ///
+    /// Waiting on the condition rather than on the clock is the portable fix, and
+    /// it removes a latent flake everywhere: a loaded runner can miss 100 ms on
+    /// any platform. It cannot mask a real regression — a dial that never
+    /// completes still fails, just after `limit` instead of after 100 ms.
+    fn pump_until(
+        nodes: &mut [&mut RunningNode<KeccakPow, DevnetRehearsalVerifier>],
+        limit: Duration,
+        mut done: impl FnMut(&mut [&mut RunningNode<KeccakPow, DevnetRehearsalVerifier>]) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + limit;
+        loop {
+            for n in nodes.iter_mut() {
+                n.step_once();
+            }
+            if done(nodes) {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// The budget `pump_until` calls are given. Generous on purpose: it is a
+    /// give-up bound, not an expected duration, and every one of these conditions
+    /// resolves in milliseconds when it resolves at all.
+    const PUMP_LIMIT: Duration = Duration::from_secs(30);
 
     /// ACCEPTANCE item 1 over the real socket — a node that knows ONE address ends
     /// up connected to the whole net; and ACCEPTANCE item 2's serving direction:

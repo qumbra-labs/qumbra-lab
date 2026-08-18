@@ -42,8 +42,14 @@ fn the_genesis_stage_line_follows_the_entry_line() {
     let cfg = dir.join("node.toml");
     std::fs::write(
         &cfg,
+        // TOML **literal** strings for the paths (lab #478). A basic string
+        // treats `\` as an escape, so on Windows this fixture's own temp path
+        // would make the config unparseable and the test would fail for a
+        // reason that has nothing to do with what it is testing. Latent today —
+        // the windows CI leg runs `--lib` only — and fixed here so it stays that
+        // way rather than waiting to be rediscovered.
         format!(
-            "data_dir = \"{}\"\nlisten_addr = \"127.0.0.1:0\"\ngenesis_file = \"{}\"\n",
+            "data_dir = '{}'\nlisten_addr = \"127.0.0.1:0\"\ngenesis_file = '{}'\n",
             dir.join("data").display(),
             dir.join("missing-genesis.qmb").display()
         ),

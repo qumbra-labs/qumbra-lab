@@ -22,8 +22,26 @@ set -euo pipefail
 
 fail() { echo "::error::$*"; exit 1; }
 
+# Two spellings of the same directory, and lab #478 is why they are two.
+#
+# `$WORK` is what THIS SCRIPT uses — a POSIX path, because everything below is
+# bash. `$WORK_NATIVE` is what goes INTO THE TOML, i.e. what `qumbra-node` will
+# hand to `std::fs`. On Linux and macOS they are the same string. On a Windows
+# runner they are not: bash reports `/d/a/qumbra-lab/...`, which a Windows binary
+# reads as a path on the *current drive* named `\d\a\...`, so the node would
+# create its datadir somewhere nobody looks and the smoke would pass while
+# testing the wrong thing. `cygpath -w` is the conversion, and it exists on the
+# runner precisely because Git for Windows is what provides bash there.
 WORK="$(pwd)/.release-smoke"
 rm -rf "$WORK"; mkdir -p "$WORK"
+if command -v cygpath >/dev/null 2>&1; then
+  WORK_NATIVE="$(cygpath -w "$WORK")"
+  PATHSEP='\'
+else
+  WORK_NATIVE="$WORK"
+  PATHSEP='/'
+fi
+echo "smoke workdir: $WORK  (as the node will see it: $WORK_NATIVE)"
 
 if ! curl -fsSL --retry 5 --retry-delay 5 --max-time 120 "$GENESIS_URL" -o "$WORK/genesis.qmb"; then
   fail "could not download $GENESIS_URL. This is an availability failure of the PUBLISHED genesis, not a verdict on the binary — but it is also exactly what a stranger following the join doc would hit right now."
@@ -33,11 +51,18 @@ ls -l "$WORK/genesis.qmb"
 # The minimal joiner config from docs/join-and-mine.md §2 — verify-only, no
 # committee keys, mining off. A public joiner holds no signing keys, and a smoke
 # that named one would be testing an operator's config rather than a stranger's.
+#
+# The two path values are TOML **literal** strings (single quotes) since lab
+# #478. A Windows path is full of backslashes and a TOML *basic* string treats
+# `\` as an escape introducer, so `data_dir = "C:\qumbra\data"` is either a parse
+# error or a different path — the first trap a Windows joiner hits, and the join
+# doc now says so. Literal strings take the bytes as written and are identical
+# TOML on every platform, so the Linux and macOS legs are unaffected.
 cat > "$WORK/node.toml" <<EOF
-data_dir = "$WORK/data"
+data_dir = '${WORK_NATIVE}${PATHSEP}data'
 listen_addr = "0.0.0.0:9400"
 dial_peers = $DIAL_PEERS
-genesis_file = "$WORK/genesis.qmb"
+genesis_file = '${WORK_NATIVE}${PATHSEP}genesis.qmb'
 expected_genesis_hash = "$GENESIS_HASH"
 mining = false
 EOF

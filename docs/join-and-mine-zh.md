@@ -19,7 +19,7 @@ English: [`join-and-mine.md`](./join-and-mine.md) · **技术细节以英文版�
 > (约 2026-08-21 早间 +08;高度精确,日期为估计)。这包括 release `t1-91bdee4` 及此前的
 > 全部节点镜像。故障是**静默的**:旧节点照常运行、照常挖矿,却走上一条没有 finality 的
 > 死叉——边界处不打印任何错误。**更新已就绪:release
-> [`t1-c5cfff8`](https://github.com/qumbra-labs/qumbra/releases/tag/t1-c5cfff8)**——边界前
+> [`t1-c5cfff8`](https://github.com/qumbra-labs/qumbra/releases/tag/t1-c5cfff8) 或更新——最新为 [`t1-84f6f4c`](https://github.com/qumbra-labs/qumbra/releases/tag/t1-84f6f4c)(新增原生 Windows + 一键 `mine`)**——边界前
 > 更新并重启。若不更新,你的节点将在 19,009 起以 `internal` 类错误拒绝所有诚实区块并走上
 > 死叉——那个签名的含义是"该更新了",不是"该调试了"。链的条款(费用表、激活高度、
 > commit–reveal)不变——这是软件更新期限,不是规则变更。
@@ -71,14 +71,17 @@ test "$ACTUAL_REV" = "$EXPECTED_REV" || {
 > ([`release-binaries.yml`](../.github/workflows/release-binaries.yml))，由人手动触发；
 > 一旦发布，T1 公告会给出对应的 tag。
 
-| tarball | 适用于 |
+| 压缩包 | 适用于 |
 |---|---|
 | `…-linux-x86_64-glibc.tar.gz` | Intel/AMD Linux，glibc 2.36+（Debian 12、Ubuntu 22.04+） |
 | `…-linux-aarch64-glibc.tar.gz` | arm64 Linux —— 测试网机队自己跑的就是它 |
 | `…-macos-arm64.tar.gz` | Apple Silicon，macOS 11+ |
+| `…-windows-x86_64.zip` | Windows 10/11 x64 —— **原生，不需要 WSL2**（lab #478 新增） |
 
-每个包内含 `qumbra-node`、`qumbra-wallet` 和一份 `PROVENANCE.txt`。**没有原生 Windows
-构建**——节点有仅限 unix 的依赖；在 WSL2 下，按 Linux 用户的方式使用 Linux x86_64 包即可。
+每个包内含 `qumbra-node`、`qumbra-wallet` 和一份 `PROVENANCE.txt`。Windows 那个包是 `.zip`
+而不是 `.tar.gz`，里面的二进制带 `.exe` 后缀；除此之外它和其他三个是同一条发布流水线构建、
+同一套断言把关的产物。**它从 2026-08-18 之后的第一次发布开始才有** —— release 页上更早的
+tag 只有三个包，那是版本新旧的区别，不是文件丢了。
 
 ```sh
 # 1 —— 从 release 页下载对应平台的 tarball 与 SHA256SUMS，然后：
@@ -105,18 +108,82 @@ cd qumbra-t1-<shortrev>-<platform>
 运行。请用 `curl` 下载，或显式清除该属性：
 `xattr -d com.apple.quarantine qumbra-node qumbra-wallet`。
 
-### Windows:用 WSL2(原生支持开发中)
+### Windows:原生(2026-08-18 新增,lab #478)
 
-目前没有原生 Windows 二进制。**WSL2 是当下受支持的路径**,挖矿速度几乎无损(挖矿是纯
-CPU 活;WSL2 的开销在 IO):
+`windows-x86_64.zip` 里是 `qumbra-node.exe` 和 `qumbra-wallet.exe`,目标三元组
+`x86_64-pc-windows-msvc`,用的是和其他平台完全相同的那份 RandomX C++ 实现。就链关心的
+所有意义上,它们和别的平台是同一个二进制:CI 会在 MSVC 构建上跑 RandomX 官方的四组
+参考向量,所以 Windows 矿工算出来的哈希就是全网的哈希,不是"差不多"。
 
-1. 管理员 PowerShell:`wsl --install`,然后重启(装的是 Ubuntu,glibc ≥ 2.36,达标)。
-2. 打开 Ubuntu 终端,从本文 §1 开始照走,用 `linux-x86_64-glibc` 那个 tarball;下文
-   所有步骤原样适用。
-3. 笔记本插电,并把 Windows 电源设置改为不休眠——睡着的主机不挖矿。
+从 §2 往下的内容全部照用——同一份 `genesis.qmb`、同样的 `node.toml` 字段、同样的种子
+节点。下面只写 Windows **不一样**的地方。
 
-原生 Windows 支持已派工跟踪;落地后 Releases 页会多一个 `windows-x86_64` 产物,本节
-缩成一行。
+**1. 下载与校验,在 PowerShell 里做。** Windows 没有 `sha256sum`:
+
+```powershell
+# 从 release 页下载:你平台对应的 zip,以及 SHA256SUMS
+Get-FileHash .\qumbra-t1-<shortrev>-windows-x86_64.zip -Algorithm SHA256
+# 把打印出来的哈希和 SHA256SUMS 里对应那行逐字对照——64 个字符都要对
+Expand-Archive .\qumbra-t1-<shortrev>-windows-x86_64.zip -DestinationPath .
+cd qumbra-t1-<shortrev>-windows-x86_64
+.\qumbra-node.exe halt-status
+```
+
+`halt-status` 的读法和上面 §1 一样:`build rev:` 要和 release notes 对得上,`halt plan:`
+必须是 `no halt scheduled`,不能是 **ARMED**。
+
+**2. 🔴 SmartScreen 会拦你,而且它拦得有道理。** 这些可执行文件**没有签名**——本项目没有
+代码签名证书,要不要买是另一件还没人拍板的事。第一次运行任一个二进制,都会看到
+*"Windows 已保护你的电脑"*。走法是 **更多信息 → 仍要运行**。Microsoft Defender 也可能仅
+凭"名声不够"就把一个 CPU 矿工程序标红。
+
+这里说的是实情,不是让你放心:一个来自私有仓库的未签名二进制,正是 SmartScreen 存在的
+理由;而"点掉安全警告"这种建议,你本来就该默认对它保持怀疑。让它在这里成立的唯一理由是
+你能自己核对——**先把 SHA-256 和 SHA256SUMS 对上,再点"仍要运行"**,不是反过来。
+
+**3. `node.toml` 里的路径要用单引号。** TOML 的双引号字符串把 `\` 当转义符,所以
+`data_dir = "C:\Users\you\qumbra-data"` 要么直接解析报错,要么变成另一个目录。请用 TOML
+的**字面量字符串**,或者干脆用正斜杠:
+
+```toml
+data_dir = 'C:\Users\you\qumbra-data'          # 字面量字符串——反斜杠就是反斜杠
+genesis_file = 'C:\Users\you\genesis.qmb'
+# 或者,在 Windows 上同样合法:
+# data_dir = "C:/Users/you/qumbra-data"
+```
+
+**4. 在你自己开的控制台里跑,用 Ctrl-C 停。** 打开 PowerShell 或 Windows Terminal,在里面
+执行 `.\qumbra-node.exe run --config node.toml`——不要双击。**Ctrl-C 才是能可靠触发快照
+落盘的停法。** 直接关控制台窗口也会触发落盘,但 Windows 在关窗后只给程序大约五秒,一个
+正卡在 RandomX 轮次里的节点可能赶不上。
+
+赶不上也不会丢东西:区块日志每条记录都 fsync,它才是真相来源,快照过期的节点下次启动会
+重放日志、到达完全相同的状态。漏掉一次落盘的代价是**下次启动的重放时间**,不是币,也不是
+历史。
+
+**5. Windows 上钱包种子文件不是"仅属主可读"。** 在 Linux 和 macOS 上,
+`qumbra-wallet keygen` 会把 `wallet.seed` 写成 `0600`。Windows 没有这个模式位,而本次构建
+也没有去设 ACL,所以该文件继承所在文件夹的权限——在你自己的用户目录下,通常是你**加上**
+SYSTEM 和 Administrators。`keygen` 会把这件事打印出来,而不是宣称一个它并不具备的保护。
+想把钱包目录改成仅属主可访问,执行一次:
+
+```powershell
+icacls "$env:USERPROFILE\.qumbra-wallet" /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F"
+```
+
+谁能读到这个文件,谁就拥有这个钱包里的每一枚币。
+
+**6. 别让机器睡着。** 把 Windows 电源设置改成不休眠,笔记本插电——睡着的主机不挖矿。
+
+**这次移植不包含**(写出来免得有人去找):没有 Windows 服务封装——想在注销后继续运行,把
+`run` 命令注册成一个"不管用户是否登录都运行"的计划任务,那超出本文范围;没有代码签名;
+没有 ARM Windows 构建。
+
+### Windows:WSL2
+
+仍然支持,内容不变:管理员 PowerShell 里 `wsl --install`,然后在 Ubuntu 里从本文 §1 开始
+照走,用 `linux-x86_64-glibc` 包。挖矿速度几乎无损。有了原生构建之后,WSL2 从"路径"变成
+"备选"。
 
 ## 2. 作为不挖矿的节点加入
 
@@ -237,7 +304,11 @@ curl -fsSL https://seed.qumbra.org/genesis.qmb -o genesis.qmb
 只是启动节点；如果你手动改过 `node.toml`，它会拒绝而不是覆盖你的修改，并提示改用
 `run --config`。
 
-### 平台边界——2026-08-17 已更正(原:只能用 Linux/glibc)
+在 Windows 上,这条命令是 PowerShell 里的
+`.\qumbra-node.exe mine --dir $HOME\.qumbra-miner`,而且它是原生路径里最短的一条——
+`node.toml` 由它自己写,所以 §1 Windows 一节里讲的 TOML 反斜杠坑根本碰不到你。
+
+### 平台边界——2026-08-17 已更正(原:只能用 Linux/glibc),2026-08-18 加入 Windows
 
 > **带日期更正(2026-08-17,lab #437):原生 macOS 挖矿已获准许。** 下方原红字边界的条件
 > 是"确定性发行边界尚未激活"——该边界已于 2026-08-12 激活(#299/#303 已关)。高度 8,640
@@ -245,6 +316,14 @@ curl -fsSL https://seed.qumbra.org/genesis.qmb -o genesis.qmb
 > libm,原生 macOS 矿工既算不出偏差 coinbase,也造不成历史伤痕。**已实测验证,不止是论证**:
 > 一个原生 macOS arm64 构建经公开入口加入 T1,同步后最初 ~100 分钟赢下 40 个被接受并
 > finalize 的块(lab #437)。容器仍是铺好的可复现路径;原生构建现在是受支持的替代路径。
+>
+> **原生 Windows x64 挖矿基于同样的理由获准许(2026-08-18,lab #478)**;而新矿工平台真正
+> 引出的"身份一致性"问题,这里用实测而不是论证来回答:每一条 windows CI 腿都会拿 RandomX
+> 官方的四组参考向量去比对 MSVC 构建出来的 C++,并且还有一项检查——推荐 flag 集(JIT +
+> 硬件 AES)必须与可移植的 `FLAG_DEFAULT` 结果一致,也就是说 Windows 矿工不会因为自己
+> CPU 支持什么而算出不同的哈希。🔴 **还不构成证据的部分:目前没有任何一台 Windows 机器
+> 在 T1 上挖出过块。** 这一行的断言是"能构建、哈希一致、对已发布 genesis 预检通过",不是
+> "已实测验证"——后者是 macOS 有而 Windows 还没有的,两者不该被当成同一个断言来读。
 >
 > **从源码构建时有一个 flag 性命攸关**:裸 `cargo build -p qumbra-node` 产出 ARMED 变体,
 > 会在 8,640 停机、无法跟上今天的链。必须带
@@ -318,6 +397,11 @@ miner payout: coinbase notes paid to the configured miner_rkm
 （`100,000,000` bessel = `1 QMB`；
 [`emission.rs:34-35`](../crates/qlab-node/src/emission.rs#L34-L35)）。
 第 3 条命令使用 `curl` 和 `jq`；完整命令参考请运行 `qumbra-wallet --help`。
+
+**在 Windows 上**，同样这五条命令在 PowerShell 里跑，把 `qumbra-wallet` 换成
+`.\qumbra-wallet.exe`；`--dir` 用 `$HOME` 或 `$env:USERPROFILE` 都可以。第 3 条需要换成
+PowerShell 的写法（默认没有 `jq`）：
+`$TIP = (Invoke-RestMethod https://explorer.qumbra.org/v1/health.json).chain.tip_height`。
 
 ```sh
 # 1 —— 创建钱包；命令会打印 address [0]

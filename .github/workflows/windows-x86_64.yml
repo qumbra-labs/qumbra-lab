@@ -1,0 +1,300 @@
+# The native-Windows leg (lab #478).
+#
+# WHAT THIS LANE IS, AND — MORE IMPORTANTLY — WHAT IT IS NOT
+#
+# It is **build + consensus identity + smoke** on `x86_64-pc-windows-msvc`. It is
+# NOT the acceptance bar and must never be described as one. The bar is the full
+# unfiltered workspace suite on the arm64 lane (`suite-arm64.yml`, CLAUDE.md §5),
+# and lab #478 says so in as many words: "Full workspace suite on Windows is NOT
+# the bar (the arm64 lane stays the bar); the windows leg is build+identity+smoke".
+#
+# The question this lane answers is the one no amount of reading answers: **does
+# the RandomX C++ chain, built by MSVC, produce the same hashes as everybody
+# else's?** A node that builds, runs, mines and hashes differently is not a
+# Windows port, it is a fork with a friendly installer. `matches_official_reference
+# _vectors` pins our binding to the four tevador/RandomX published vectors, so a
+# green run here is a statement about consensus identity on a new platform and not
+# about test coverage.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHAT IT COSTS, STATED BEFORE ANYTHING ELSE (same doctrine as release-binaries.yml)
+#
+# `windows-latest` is GitHub-hosted and bills PRIVATE-repo minutes at a **2x**
+# multiplier — cheaper than macos-14's 10x, dearer than ubuntu's 1x. This repo's
+# CI budget is a $20/month cap with `Stop usage: Yes`
+# (docs/ci-runner-cost-decision.md §4), and exhausting it stops `suite-arm64.yml`
+# too, i.e. an over-eager Windows lane can take the ACCEPTANCE BAR down with it.
+#
+# So the trigger is the same shape `suite-arm64.yml` settled on, for the same
+# measured reason (roughly half a month's spend once bought numbers nobody read):
+# the **`verify` label**, which is the coordinator's explicit "this is the tree",
+# plus `workflow_dispatch`. Not `synchronize` — a builder's intermediate push is a
+# number about a tree nobody will merge.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THE TESTS ARE THE ONES THEY ARE, AND WHAT IS DELIBERATELY ABSENT
+#
+# `windows-latest` is a 4-vCPU / 16 GB runner. The workspace holds real STARK
+# prove tests that peak around **12 GB each** (the mint's measured 12.21 GB), and
+# they are `#[cfg_attr(debug_assertions, ignore)]` — i.e. they RUN in `--release`,
+# which is the profile a meaningful RandomX number needs. So:
+#
+#   * every test step is `--test-threads=1`. Two 12 GB proves at once do not fit,
+#     and this is the workspace's standing rule anyway;
+#   * the `-p qumbra-wallet` and `-p qumbra-node` steps are `--lib` ONLY. Their
+#     integration binaries (`e2e_first_spend.rs`, `coinbase_spend.rs`) stand up
+#     local devnets AND prove, repeatedly, and are the arm64 lane's job;
+#   * `--lib` still includes one real prove in each crate (`send.rs`'s
+#     `one_real_spend_builds_proves_and_binds_its_seams`; `verifier.rs`'s three
+#     `real_verifier_*`). They are KEPT on purpose — "a real Qumbra spend proves
+#     on Windows" is worth a leg of its own — but they are also the most likely
+#     thing here to die of memory.
+#
+#   🔴 IF THIS LANE OOMs, THAT IS THE STEP. The narrowing fix, in order: add
+#      `--skip real_verifier --skip one_real_spend` to the two `--lib` steps and
+#      record the loss, rather than dropping the whole step or the whole lane.
+#      Do NOT "fix" it by removing `--test-threads=1`.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY THE C++ GENERATOR IS DISCOVERED AND NOT ASSUMED
+#
+# `randomx-rs`'s build script drives cmake, and the `cmake` crate refuses to guess
+# a generator it does not recognise ("couldn't determine visual studio generator")
+# — which is exactly how this port's first cross-check died on the laptop. On a
+# runner the VS install is real, but which VS it is changes with the image, so the
+# generator is derived (`scripts/windows-cmake-generator.sh`) rather than assumed.
+#
+# 🔴 IT WARNS, IT DOES NOT GATE, and this file's own first run is why. Run
+# 32096791616 died in that step because it carried a hardcoded `17 -> "Visual
+# Studio 17 2022"` map and **windows-latest ships Visual Studio 18 as of
+# 2026-08-18**. Worse, the pinned `cmake` crate already knows Vs18, so the build
+# would have succeeded on its own — the map turned a working configuration red on
+# the first run it ever made. The lesson is in the script's header: derive from
+# CMake's own generator list, and when derivation fails, get out of the way.
+#
+# It is also why this lane builds ON Windows rather than cross-compiling to it:
+# randomx-rs's `cfg!(target_os = "windows")` guard for `advapi32` evaluates the
+# **host** in a build script, so a cross-build from Linux would silently omit that
+# link. Host == target is not a convenience here, it is a correctness condition.
+name: windows x86_64
+
+on:
+  pull_request:
+    types: [labeled]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/windows-x86_64.yml"
+      - ".github/workflows/scripts/smoke-release-artifacts.sh"
+      - ".github/workflows/scripts/windows-cmake-generator.sh"
+  workflow_dispatch:
+
+# SECRETS POSTURE, copied from suite-arm64.yml because it is the same posture:
+# this workflow reads NO secret and must never need one. It builds a repo the
+# runner can already read and downloads one public file. If a change here appears
+# to need a credential, that is a STOP, not a widening.
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-x86_64-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # The published joiner inputs — the same four values release-binaries.yml uses,
+  # and for the same reason: a smoke against a locally minted genesis proves the
+  # binary agrees with itself.
+  GENESIS_URL: https://seed.qumbra.org/genesis.qmb
+  GENESIS_HASH: 138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb
+  DIAL_PEERS: '["18.202.166.126:9444","18.141.177.109:9444","52.194.224.123:9444","52.5.0.21:9444"]'
+
+jobs:
+  windows:
+    # The label gate. `types: [labeled]` fires for ANY label, so the name is
+    # checked here — otherwise adding an unrelated label would spend paid minutes
+    # at 2x. `workflow_dispatch` bypasses it deliberately.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'verify'
+    runs-on: windows-latest
+    # 150, not 120: the measured job is ~125 min on a cold-ish cache (3 build +
+    # 90 node-lib + ~30 wallet-lib + the cheap steps), and 120 killed run
+    # 32103510578 mid-wallet. This is headroom over a measurement, not a guess —
+    # and it is capped rather than removed because a windows runner bills at 2×
+    # and this repo's Actions budget also pays for the arm64 acceptance bar.
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain — the same rustc the other three platforms pin
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95 --profile minimal --no-self-update
+          rustup default 1.95
+          rustc -V; cargo -V
+          rustc -vV | sed -n 's/^host: /host triple: /p'
+          cmake --version | sed -n 1p
+
+      # The generator name is DERIVED, from two sources that both have to exist
+      # anyway, and it is an AID rather than a gate — see the header.
+      - name: The C++ generator, discovered rather than assumed
+        run: bash .github/workflows/scripts/windows-cmake-generator.sh
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: windows-x86_64-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: windows-x86_64-
+
+      # ── 1. IT BUILDS ────────────────────────────────────────────────────────
+      # The node is built RESUME, like every artifact this project publishes: a
+      # bare `cargo build -p qumbra-node` is ARMED and halts at the boundary
+      # (release.rs, "arming is the default and resuming is the flag"). Building
+      # the armed variant here would smoke-test a binary no user should ever run.
+      - name: Build qumbra-node.exe — RESUME variant
+        run: cargo build --release --locked -p qumbra-node --features rule-boundary-resume
+
+      - name: Build qumbra-wallet.exe
+        run: cargo build --release --locked -p qumbra-wallet
+
+      - name: Both executables exist, with the extension Windows needs
+        run: |
+          set -euo pipefail
+          ls -l target/release/qumbra-node.exe target/release/qumbra-wallet.exe
+          ./target/release/qumbra-node.exe halt-status | tee halt.txt
+          ./target/release/qumbra-wallet.exe --help | sed -n '1,3p'
+          # The same three readings release-binaries.yml makes, so a Windows
+          # artifact cannot be resume-on-Linux and armed here.
+          grep -qF "  halt plan:    no halt scheduled" halt.txt \
+            || { echo "::error::the Windows build is not the resume variant"; exit 1; }
+          grep -q "name service: ARMED" halt.txt \
+            || { echo "::error::the Windows build's name service is not armed — it forks at the name boundary (lab #367)"; exit 1; }
+          grep -qE '^  validate: +OK' halt.txt \
+            || { echo "::error::halt-status did not report validate: OK"; exit 1; }
+
+      # ── 2. CONSENSUS IDENTITY — the reason this lane exists ────────────────
+      # `matches_official_reference_vectors` compares our randomx-rs binding
+      # against the four published tevador/RandomX vectors. Its sibling
+      # `output_is_flag_independent` is in the same target and matters just as
+      # much on a new platform: it asserts the recommended flag set (JIT + hard
+      # AES on this runner) agrees with portable FLAG_DEFAULT, i.e. that a
+      # Windows miner's hardware feature detection cannot change consensus.
+      - name: RandomX official reference vectors (MSVC-built C++)
+        run: cargo test --release --locked -p qlab-pow --lib -- --test-threads=1 --nocapture
+
+      # ── 3. TARGETED TESTS ──────────────────────────────────────────────────
+      # See the header for what is in these and what is deliberately not.
+      # DEFAULT features here, NOT `rule-boundary-resume` — deliberately. The
+      # arm64 bar runs these tests against the default (armed) release, and
+      # `release.rs`'s 25 tests are about that release's own gates; testing a
+      # different variant than the bar does would make a green here mean
+      # something else than a green there. The resume variant is what the build
+      # step above produced and what `halt-status` was interrogated on, so both
+      # claims are made, each by the step that can actually make it.
+      #
+      # This does not disturb `qumbra-node.exe`: `--lib` builds the lib's test
+      # harness and leaves the already-built binary alone, which the smoke step
+      # below depends on.
+      - name: qumbra-wallet lib tests
+        run: cargo test --release --locked -p qumbra-wallet --lib -- --test-threads=1
+
+      # ── 4. SMOKE — the preflight a real Windows user runs first ─────────────
+      # The same script the release lane runs, against the same published genesis,
+      # so the Windows path is proven by the artifact-shaped check and not by a
+      # Windows-only variant of it. It is also what proves the TOML path handling
+      # works: the script writes a native Windows path into `node.toml` as a TOML
+      # literal string, which is the trap the join doc now warns about.
+      - name: qumbra-node check against the PUBLISHED genesis
+        run: bash .github/workflows/scripts/smoke-release-artifacts.sh
+        env:
+          NODE_BIN: target/release/qumbra-node.exe
+
+      # ── 5. EMISSION MATH, ON WINDOWS, THROUGH THE BINARY ───────────────────
+      # Lab #478 item 6: consensus emission is integer-exact since #299/#303, so
+      # there is no platform risk to find here — but "no risk" is a claim, and
+      # this is the check that turns it into a statement. `audit_emission_cli`
+      # builds a small real chain in a temp dir, runs `qumbra-node audit-emission`
+      # against it as a subprocess, and requires exit 0 with no MISMATCH line
+      # (plus the 1 and 2 refusals). Fixture-scale, no STARK, portable — it uses
+      # no unix-only trick to make its unreadable-log case.
+      #
+      # 🔴 IT RUNS LAST, AND THE ORDER IS LOAD-BEARING. This is an *integration*
+      # test, so cargo builds `qumbra-node.exe` for it — with DEFAULT features,
+      # i.e. the ARMED variant, overwriting the resume binary the steps above
+      # interrogated. Everything that reads that binary (`halt-status`, the smoke)
+      # is therefore above this line. Do not move this step up.
+      - name: audit-emission through the binary (integer-exact schedule on Windows)
+        run: cargo test --release --locked -p qumbra-node --test audit_emission_cli -- --test-threads=1
+
+      # ── 6. THE HEAVY ONE, DELIBERATELY LAST ────────────────────────────────
+      # 🔴 ORDER IS A BUDGET DECISION, MEASURED NOT GUESSED (lab #478).
+      #
+      # This step ran 18 min on run 32101516749 and **90 min** on 32103510578 —
+      # same runner class, one more test. With `qumbra-wallet` at ~29 min behind
+      # it, the job blew its 120-minute wall and was killed with the wallet lib,
+      # the genesis smoke and the emission audit **still pending**. Those three
+      # had never executed on ANY run of this leg, because they had spent every
+      # run queued behind this one.
+      #
+      # So the cheap, genuinely-Windows checks now run FIRST and this runs LAST.
+      # The ordering is not cosmetic: it changes what a timeout costs. A leg that
+      # dies here still leaves the RandomX vectors, `halt-status`, the wallet, the
+      # published-genesis smoke and the integer-exact emission audit **proven**,
+      # and loses only the one step whose content is least platform-specific.
+      #
+      # It stays in the job rather than being trimmed, because `--lib` is where
+      # the console-close handler, the path handling and the TCP loop live — the
+      # actual subject of this port. What is NOT claimed is that its three real
+      # STARK verifies needed to run here; they are platform-independent by
+      # construction (#303 made "no libm reachable from consensus" law) and the
+      # arm64 bar runs them too. If this leg's cost ever has to come down, they
+      # are the first candidate — with that argument, on purpose, rather than by
+      # quietly raising the timeout again.
+      #
+      # `--lib` builds the lib's test harness and leaves the already-built
+      # `qumbra-node.exe` alone, so running it after the audit step above (which
+      # rebuilds the binary ARMED) is safe: nothing below reads the binary.
+      - name: qumbra-node lib tests
+        run: cargo test --release --locked -p qumbra-node --lib -- --test-threads=1
+
+      - name: What this run did and did not prove
+        if: always()
+        run: |
+          {
+            echo "## windows x86_64 (\`${GITHUB_SHA:0:12}\`)"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| target | \`x86_64-pc-windows-msvc\` |"
+            echo "| generator | \`${CMAKE_GENERATOR:-(not set)}\` |"
+            echo "| rustc | \`$(rustc -V)\` |"
+            echo
+            echo "**This lane is build + RandomX identity + targeted tests + \`check\`.**"
+            echo "It is NOT the acceptance bar — that is \`suite-arm64.yml\`, unchanged."
+            echo
+            echo "Step order is a budget decision: the cheap Windows-specific checks"
+            echo "run first and \`qumbra-node --lib\` runs LAST, so a timeout costs the"
+            echo "least platform-specific step rather than stranding the rest. **Read the"
+            echo "step list above — a step that never ran proves nothing, and a green"
+            echo "job with pending steps is not a thing this leg can produce.**"
+            echo
+            echo "Not covered here, and named rather than implied:"
+            echo "- the full workspace suite (arm64 lane's job, by design)"
+            echo "- \`qumbra-node\`'s and \`qumbra-wallet\`'s integration binaries"
+            echo "- console-window close: Windows will not let CI deliver \`CTRL_CLOSE_EVENT\`"
+            echo "  (\`GenerateConsoleCtrlEvent\` can only send C and BREAK), so the handler's"
+            echo "  wait is unit-tested in \`qumbra-node::shutdown\` and the OS delivering it"
+            echo "  is untested. See that module's docs."
+          } >> "$GITHUB_STEP_SUMMARY"

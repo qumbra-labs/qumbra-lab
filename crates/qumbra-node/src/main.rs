@@ -19,8 +19,6 @@
 use std::error::Error;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use qlab_devnet::pow::RandomXPow;
 use qlab_node::round::ObsClock;
@@ -211,7 +209,9 @@ fn genesis_init(args: &[String]) -> Result<(), Box<dyn Error>> {
     let out = PathBuf::from(flag(args, "--out").unwrap_or("."));
     std::fs::create_dir_all(&out)?;
 
-    let gf = GenesisFile::new_devnet_t0();
+    // Lab #470 stage 4b: `--t2` mints the v5-format T2 genesis; the default
+    // stays the T1 file byte-for-byte.
+    let gf = if has_flag(args, "--t2") { GenesisFile::new_t2() } else { GenesisFile::new_devnet_t0() };
     let gpath = out.join("genesis.qmb");
     gf.write(&gpath)?;
     let key_dir = out.join("keys");
@@ -517,18 +517,19 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         println!("      blocks, and stop signing checkpoints above it. regime=Halting until the");
         println!("      boundary finalizes, then regime=Halted.");
     }
-    println!("(SIGINT/SIGTERM/SIGHUP to shut down — snapshot + peers.dat flushed on exit)");
+    println!("{}", qumbra_node::shutdown::stop_signals_line());
 
-    // ctrlc with the `termination` feature (Cargo.toml): SIGINT + SIGTERM + SIGHUP.
-    // The handler must stay async-signal-safe — only an AtomicBool store, nothing
-    // else. SIGHUP is accepted as graceful stop: this binary has no config-reload
-    // path, and a terminal hangup that would otherwise kill the process mid-loop
-    // is exactly the case where a flush is wanted (issue #145).
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let sig = Arc::clone(&shutdown);
-    ctrlc::set_handler(move || sig.store(true, Ordering::SeqCst))?;
+    // One seam, two platform mechanisms — see `shutdown.rs` for why Windows needs
+    // its own handler rather than ctrlc's (lab #478).
+    let shutdown = qumbra_node::shutdown::install()?;
 
-    if node.run_until(&shutdown) {
+    let flushed = node.run_until(&shutdown);
+    // Release any console handler blocked waiting for this (Windows only; a no-op
+    // on unix). It goes BEFORE the print: on a window-close the console is already
+    // going away, and the thing worth doing promptly is letting the OS have the
+    // process back now that the snapshot is on disk.
+    qumbra_node::shutdown::flush_complete();
+    if flushed {
         println!("shutdown complete (snapshot flushed)");
     } else {
         // Do not claim the flush when run_until already logged the failure.

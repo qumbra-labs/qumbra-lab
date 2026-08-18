@@ -1192,6 +1192,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "qlab-vask"
+version = "0.0.0"
+dependencies = [
+ "qlab-disclosure",
+]
+
+[[package]]
 name = "qlab-wallet"
 version = "0.0.0"
 dependencies = [
@@ -1206,6 +1213,16 @@ name = "qrcode"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
+name = "qumbra-credit-ref"
+version = "0.0.0"
+dependencies = [
+ "qlab-cbserver",
+ "qlab-note",
+ "qlab-vask",
+ "rand",
+]
 
 [[package]]
 name = "qumbra-explorer"
@@ -1279,6 +1296,7 @@ dependencies = [
  "serde",
  "tiny_http",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

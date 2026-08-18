@@ -70,7 +70,7 @@ pub use mempool::{
     MempoolParams, MempoolTx, TxId,
 };
 pub use node::{
-    genesis_block, AnchorGate, FinalizeOutcome, MemNode, Node, NodeError, NodeState,
+    genesis_block, genesis_block_for, AnchorGate, FinalizeOutcome, MemNode, Node, NodeError, NodeState,
     RecoveryReport, RewindReport, SnapshotRejection,
 };
 pub use recovery::{
@@ -92,7 +92,7 @@ pub use telemetry::{
 pub use persist::{
     read_records, snapshot_on_disk, LogRecord, Snapshot, SnapshotLoad, SnapshotLoadReject,
     SnapshotOnDisk, BLOCK_LOG, FORMAT_VERSION,
-    SNAPSHOT,
+    SNAPSHOT, SNAPSHOT_TMP,
 };
 pub use replay_progress::{
     capture_progress, hold_replay_at, live_replay_position, take_captured_progress,

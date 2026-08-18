@@ -22,6 +22,7 @@ use qlab_devnet::fees::ArityBucket;
 use qlab_devnet::header::BlockHeader;
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::pow::KeccakPow;
+use qlab_devnet::forms::GenesisForm;
 use qlab_p2p::adapter::NodeAdapter;
 use qlab_p2p::codec::{encode_inv, tx_id, InvItem, InvKind};
 use qlab_p2p::compact::{
@@ -355,7 +356,7 @@ fn a_served_body_that_does_not_match_the_header_commitment_is_charged_to_the_ser
         short_ids: Vec::new(),
         prefilled: Vec::new(),
     };
-    let frame = Envelope::new(MsgType::BlockAnnounce, encode_announce(&forged)).encode();
+    let frame = Envelope::new(MsgType::BlockAnnounce, encode_announce(GenesisForm::V4, &forged)).encode();
     server.transport().send(PeerId(2), &frame).expect("send");
     behind.tick(30);
 
@@ -552,7 +553,7 @@ fn a_whole_block_announce_reconstructs_against_an_empty_candidate_set() {
     };
 
     // Round-trip the real wire, then reconstruct with NO candidates.
-    let back = qlab_p2p::compact::decode_announce(&encode_announce(&ann)).expect("decode");
+    let back = qlab_p2p::compact::decode_announce(GenesisForm::V4, &encode_announce(GenesisForm::V4, &ann)).expect("decode");
     assert!(back.short_ids.is_empty(), "a served block carries no short ids");
     match reconstruct(&back, &[]) {
         Reconstruct::Complete(got) => {
@@ -609,7 +610,7 @@ fn a_served_block_uses_the_existing_announce_codec_and_no_new_msg_type() {
                 }),
         }],
     };
-    let frame = Envelope::new(MsgType::BlockAnnounce, encode_announce(&ann)).encode();
+    let frame = Envelope::new(MsgType::BlockAnnounce, encode_announce(GenesisForm::V4, &ann)).encode();
     let back = Frame::decode(&frame).expect("well-formed framing");
     let back = back.known().expect("a type every deployed node knows");
     assert_eq!(back.msg_type, MsgType::BlockAnnounce);
@@ -727,7 +728,7 @@ fn an_out_of_order_window_keeps_the_full_ask_width() {
             short_ids: Vec::new(),
             prefilled: Vec::new(),
         };
-        let frame = Envelope::new(MsgType::BlockAnnounce, encode_announce(&ann)).encode();
+        let frame = Envelope::new(MsgType::BlockAnnounce, encode_announce(GenesisForm::V4, &ann)).encode();
         server.transport().send(PeerId(2), &frame).expect("send");
         now += SIM_TICK_MS;
         behind.tick(now);
@@ -759,7 +760,7 @@ fn an_out_of_order_window_keeps_the_full_ask_width() {
         short_ids: Vec::new(),
         prefilled: Vec::new(),
     };
-    let frame = Envelope::new(MsgType::BlockAnnounce, encode_announce(&ann)).encode();
+    let frame = Envelope::new(MsgType::BlockAnnounce, encode_announce(GenesisForm::V4, &ann)).encode();
     server.transport().send(PeerId(2), &frame).expect("send");
     now += SIM_TICK_MS;
     behind.tick(now);

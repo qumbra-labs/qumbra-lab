@@ -1,0 +1,18 @@
+[package]
+name = "qlab-vask"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Exchange/VASP kit verifier lib — STAGE 0 SKELETON (lab #483, docs/
+# kit-stage0-survey.md §2). Verify-only by policy: wraps qlab-disclosure's
+# envelope parse + verify behind the kit's stable surface; re-exports no
+# prover entry point. Stage 1 adds the qvask C ABI + #246-pinned header.
+# The crate exists now to carry the stage-0 inventory's citation tests.
+
+[dependencies]
+# The disclosure STARK this kit verifies (statement, envelope, verifier —
+# survey §1.1). Verify-only surface is API policy, not compile graph:
+# p3-uni-stark ships prove+verify together (survey §2 dependency note).
+qlab-disclosure = { path = "../qlab-disclosure" }
