@@ -38,6 +38,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::blocks::{self, BlocksView};
 use crate::names::{self, NameEventsView};
 use crate::txlist::{self, TxListView};
 
@@ -50,6 +51,12 @@ pub const HEALTH_PATH: &str = "/v1/health.json";
 /// **Range-only.** There is no `/v1/txlist/<txid>` and no `?txid=` — D2 is
 /// structural here, not a check.
 pub const TXLIST_PATH: &str = "/v1/txlist";
+
+/// The block ticker / chart data route (lab #486 items 1 + 3). **Range-only**;
+/// there is no `/v1/blocks/<height>` and no `/v1/block/<hash>` — the D2 rule
+/// extends to every new route (a by-height ask is cheap to correlate too, and a
+/// range costs the asker nothing).
+pub const BLOCKS_PATH: &str = "/v1/blocks";
 
 /// The name-event feed (lab #486 scope item 6). **Range-only**, like every
 /// route here: no `/v1/names/<name>` arm exists, and a `name=` query parameter
@@ -74,8 +81,8 @@ pub const NAMES_EVENTS_PATH: &str = "/v1/names/events";
 fn not_found_body() -> String {
     format!(
         "{{\"refusal\":\"not_found\",\"detail\":\"This explorer serves {HEALTH_PATH}, \
-         {TXLIST_PATH}?from=&to=, {NAMES_EVENTS_PATH}?from=&to= and /healthz only. The \
-         transaction list and the name-event feed are bulk-only and matched client-side: \
+         {TXLIST_PATH}?from=&to=, {BLOCKS_PATH}?from=&to=, {NAMES_EVENTS_PATH}?from=&to= \
+         and /healthz only. The lists are bulk-only and matched client-side: \
          there is deliberately NO lookup by transaction id and NO lookup by name, because \
          asking this server about one thing tells it which thing you care about. There is \
          no address, balance or note lookup at all — Qumbra is a single shielded pool and \
@@ -131,6 +138,18 @@ pub fn respond_txlist(view: &TxListView, query: &str) -> Result<String, (u16, St
     Ok(txlist::document(&txlist::page(view, from, to)))
 }
 
+/// The socket-free `/v1/blocks` core — the txlist refusals verbatim.
+pub fn respond_blocks(view: &BlocksView, query: &str) -> Result<String, (u16, String)> {
+    let usage = "missing or unparseable bound. This route is bulk-only: GET \
+                 /v1/blocks?from=<height>&to=<height>";
+    let from = query_u64(query, "from").ok_or((400, bad_bounds(usage)))?;
+    let to = query_u64(query, "to").ok_or((400, bad_bounds(usage)))?;
+    if to < from {
+        return Err((400, bad_bounds("'to' is below 'from'")));
+    }
+    Ok(blocks::document(&blocks::page(view, from, to)))
+}
+
 /// The socket-free `/v1/names/events` core — the txlist refusals, plus the
 /// resolve-by-name refusal BY NAME (D2's fifth application; the node's own
 /// `/v1/names` precedent): a `name=` parameter must not be silently ignored,
@@ -164,6 +183,8 @@ pub struct Surfaces {
     pub health: Arc<RwLock<String>>,
     /// `/v1/txlist?from=&to=` — snapshot, encoded per request.
     pub txlist: Arc<Mutex<Arc<TxListView>>>,
+    /// `/v1/blocks?from=&to=` — snapshot, encoded per request.
+    pub blocks: Arc<Mutex<Arc<BlocksView>>>,
     /// `/v1/names/events?from=&to=` — snapshot, encoded per request.
     pub names: Arc<Mutex<Arc<NameEventsView>>>,
 }
@@ -189,7 +210,7 @@ impl ExplorerServer {
     /// it. Neither path touches node state, which is the property that keeps a
     /// hostile client off the consensus loop.
     pub fn start(addr: &str, surfaces: Surfaces) -> io::Result<ExplorerServer> {
-        let Surfaces { health: page, txlist, names } = surfaces;
+        let Surfaces { health: page, txlist, blocks, names } = surfaces;
         let server = tiny_http::Server::http(addr)
             .map_err(|e| io::Error::other(format!("listen_addr {addr}: {e}")))?;
         let server = Arc::new(server);
@@ -222,6 +243,20 @@ impl ExplorerServer {
                             Err(p) => Arc::clone(&p.into_inner()),
                         };
                         match respond_txlist(&snapshot, query) {
+                            Ok(doc) => {
+                                (200, doc, &b"application/json; charset=utf-8"[..], false)
+                            }
+                            Err((code, msg)) => {
+                                (code, msg, &b"application/json; charset=utf-8"[..], false)
+                            }
+                        }
+                    }
+                    (tiny_http::Method::Get, BLOCKS_PATH) => {
+                        let snapshot = match blocks.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(p) => Arc::clone(&p.into_inner()),
+                        };
+                        match respond_blocks(&snapshot, query) {
                             Ok(doc) => {
                                 (200, doc, &b"application/json; charset=utf-8"[..], false)
                             }
@@ -329,6 +364,7 @@ mod tests {
         Surfaces {
             health: Arc::new(RwLock::new(page.to_string())),
             txlist: Arc::new(Mutex::new(Arc::new(TxListView::default()))),
+            blocks: Arc::new(Mutex::new(Arc::new(BlocksView::default()))),
             names: Arc::new(Mutex::new(Arc::new(NameEventsView::default()))),
         }
     }
@@ -339,6 +375,7 @@ mod tests {
             Surfaces {
                 health: Arc::clone(&s.health),
                 txlist: Arc::clone(&s.txlist),
+                blocks: Arc::clone(&s.blocks),
                 names: Arc::clone(&s.names),
             },
         )
@@ -619,6 +656,53 @@ mod tests {
         );
         assert!(resp.starts_with("HTTP/1.1 405"), "{resp}");
         assert!(resp.contains("Allow: GET"), "{resp}");
+        server.shutdown();
+    }
+
+    // ---- the blocks route (lab #486 items 1 + 3) --------------------------------
+
+    #[test]
+    fn the_blocks_route_serves_the_document_over_a_real_socket() {
+        let s = surfaces("{}");
+        *s.blocks.lock().unwrap() = Arc::new(crate::blocks::BlocksView {
+            blocks: vec![crate::blocks::BlockFacts {
+                height: 42,
+                block_hash: [0xe0; 32],
+                timestamp: 1_787_039_600,
+                difficulty: 2_837,
+                body_commitment: [0xab; 32],
+                txs: 0,
+                coinbase: 4_979_012_345,
+            }],
+            tip_height: 42,
+            tip_hash: Some([0xfe; 32]),
+        });
+        let server = start(&s);
+        let resp = get(server.addr(), "/v1/blocks?from=42&to=42");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("JSON off the wire");
+        assert_eq!(v["v"], crate::blocks::BLOCKS_VERSION);
+        assert_eq!(v["blocks"][0]["difficulty"], 2_837);
+        assert_eq!(v["range"]["covered_to"], 42);
+        server.shutdown();
+    }
+
+    /// D2 extends to this route: no by-height path, no by-hash path, and bad
+    /// bounds are the named refusal.
+    #[test]
+    fn the_blocks_route_has_no_by_height_form_and_names_its_refusals() {
+        let s = surfaces("{}");
+        let server = start(&s);
+        for probe in ["/v1/blocks/42", "/v1/block/42", "/v1/blocks/by-hash/aabb"] {
+            let resp = get(server.addr(), probe);
+            assert!(resp.starts_with("HTTP/1.1 404"), "{probe}: {resp}");
+        }
+        for probe in ["/v1/blocks", "/v1/blocks?from=9&to=3"] {
+            let resp = get(server.addr(), probe);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{probe}: {resp}");
+            let v: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("JSON");
+            assert_eq!(v["refusal"], "bad_bounds", "{probe}");
+        }
         server.shutdown();
     }
 

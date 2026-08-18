@@ -22,6 +22,7 @@ use qlab_devnet::pow::RandomXPow;
 use qlab_node::round::ObsClock;
 use qlab_p2p::adapter::MiningClock;
 
+use qumbra_explorer::blocks::{self, BlocksView};
 use qumbra_explorer::config::ExplorerConfig;
 use qumbra_explorer::http::{self, ExplorerServer, Surfaces};
 use qumbra_explorer::json;
@@ -97,9 +98,11 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  mining:         false (enforced)");
     println!("  extra listeners: none (telemetry_addr/metrics_addr refused — §6.2)");
     println!(
-        "  routes:         {} + {}?from=&to= + {}?from=&to= + /healthz (no page, no write path)",
+        "  routes:         {} + {}?from=&to= + {}?from=&to= + {}?from=&to= + /healthz \
+         (no page, no write path)",
         http::HEALTH_PATH,
         http::TXLIST_PATH,
+        http::BLOCKS_PATH,
         http::NAMES_EVENTS_PATH
     );
     println!("  tx lookup:      none — bulk list only, matched client-side (D2)");
@@ -134,6 +137,11 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let txlist_view = Arc::new(Mutex::new(Arc::new(TxListView::default())));
     txlist::refresh_shared(&txlist_view, node.state().chain());
 
+    // The per-height block facts (ticker + charts), projected once pre-bind for
+    // the same first-read rule.
+    let blocks_view = Arc::new(Mutex::new(Arc::new(BlocksView::default())));
+    blocks::refresh_shared(&blocks_view, node.state().chain());
+
     // The name-event feed, projected once pre-bind for the same first-read rule.
     // Chain-derived from the persisted riders, so it BACKFILLS: an explorer
     // rolled after the 19,008 boundary still serves every event from the
@@ -147,6 +155,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         Surfaces {
             health: Arc::clone(&page),
             txlist: Arc::clone(&txlist_view),
+            blocks: Arc::clone(&blocks_view),
             names: Arc::clone(&names_view),
         },
     )?;
@@ -157,6 +166,11 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "  tx existence:   http://{}{}?from=&to=  (bulk only — no lookup by txid, by design)",
         server.addr(),
         http::TXLIST_PATH
+    );
+    println!(
+        "  blocks:         http://{}{}?from=&to=  (ticker + charts; range-only)",
+        server.addr(),
+        http::BLOCKS_PATH
     );
     println!(
         "  name events:    http://{}{}?from=&to=  (range-only — no resolve-by-name, by design)",
@@ -208,6 +222,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         // known-stale transaction list back for it would be a second staleness
         // rule nobody asked for.
         txlist::refresh_shared(&txlist_view, n.state().chain());
+        blocks::refresh_shared(&blocks_view, n.state().chain());
         names::refresh_shared(&names_view, n.state().chain());
     });
 

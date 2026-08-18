@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use qlab_devnet::pow::KeccakPow;
 use qumbra_explorer::config::ExplorerConfig;
 use qumbra_explorer::http::{ExplorerServer, Surfaces, HEALTH_PATH, TXLIST_PATH};
+use qumbra_explorer::blocks::BlocksView;
 use qumbra_explorer::names::NameEventsView;
 use qumbra_explorer::json;
 use qumbra_explorer::txlist::{self, BlockTxs, Next, TxFacts, TxListPage, TxListView};
@@ -106,6 +107,7 @@ fn a_real_observer_node_serves_the_projection_over_a_real_socket() {
         Surfaces {
             health: Arc::clone(&page),
             txlist: Arc::clone(&txlist_view),
+            blocks: Arc::new(Mutex::new(Arc::new(BlocksView::default()))),
             names: Arc::new(Mutex::new(Arc::new(NameEventsView::default()))),
         },
     )
@@ -269,6 +271,7 @@ fn the_client_pages_a_live_shaped_chain_off_a_real_socket_and_finds_a_pasted_id(
         Surfaces {
             health: page,
             txlist: Arc::clone(&slot),
+            blocks: Arc::new(Mutex::new(Arc::new(BlocksView::default()))),
             names: Arc::new(Mutex::new(Arc::new(NameEventsView::default()))),
         },
     )
