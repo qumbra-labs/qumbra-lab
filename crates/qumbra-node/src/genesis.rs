@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use qlab_consensus::{CONSENSUS_CFG, LOG_HEIGHT};
 use qlab_devnet::committee::{quorum_threshold, Committee, MemberKey, Validator};
 use qlab_devnet::fees::{posted_fee, ArityBucket};
+use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::header::Hash32;
 use qlab_devnet::params_devnet as pd;
 use qlab_node::emission as em;
@@ -513,6 +514,24 @@ impl GenesisFile {
         Self::from_bytes(&bytes)
     }
 
+    /// The consensus form set this file selects — the lab #470 T2 keying's
+    /// single mapping point: `format_version` → [`GenesisForm`], asked once at
+    /// load and threaded from there (never re-derived per call site).
+    ///
+    /// Stage 0: no caller consumes this yet, and [`Self::verify_startup`]
+    /// still refuses everything but v4 — a v5 file remains unloadable until
+    /// stage 4 mints one and flips that gate deliberately. The version this
+    /// maps and the version the startup gate accepts are the same fact in two
+    /// places on purpose: the gate is the refusal, this is the fan-out.
+    pub fn form(&self) -> Result<GenesisForm, GenesisError> {
+        GenesisForm::from_genesis_format_version(self.format_version).ok_or(
+            GenesisError::WrongFormatVersion {
+                got: self.format_version,
+                want: GENESIS_FORMAT_VERSION,
+            },
+        )
+    }
+
     /// committee₀ reconstructed from the baked verifying keys — the set a
     /// verify-only node validates checkpoints against.
     pub fn committee(&self) -> Result<Committee, GenesisError> {
@@ -932,6 +951,24 @@ mod tests {
             gf.verify_startup(None),
             Err(GenesisError::WrongCommitteeSize { got: 20, want: 21 })
         ));
+    }
+
+    /// The lab #470 keying's mapping point: the devnet (v4) file selects the
+    /// V4 form set; v5 maps (for the loader stage 4 builds); v1–v3 and
+    /// anything above 5 refuse with the same error the startup gate uses.
+    #[test]
+    fn form_maps_the_format_version_and_refuses_the_rest() {
+        let mut gf = GenesisFile::new_devnet_t0();
+        assert_eq!(gf.form().unwrap(), GenesisForm::V4);
+        gf.format_version = 5;
+        assert_eq!(gf.form().unwrap(), GenesisForm::V5);
+        for v in [0u32, 1, 2, 3, 6] {
+            gf.format_version = v;
+            assert!(
+                matches!(gf.form(), Err(GenesisError::WrongFormatVersion { got, .. }) if got == v),
+                "format_version {v} must refuse by name"
+            );
+        }
     }
 
     #[test]
