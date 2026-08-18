@@ -10,7 +10,7 @@
 use crate::forms::ChainRules;
 use crate::halt::pow_value;
 use crate::header::BlockHeader;
-use crate::pow::{satisfies_target, PowEngine};
+use crate::pow::{satisfies_target_for, PowEngine};
 
 /// Mine `header` in place-ish: try nonces `0..nonce_budget`, hashing under the
 /// key-block `seed`, and return the header with the first satisfying nonce set, or
@@ -47,7 +47,7 @@ pub fn mine_under<P: PowEngine>(
     for nonce in 0..nonce_budget {
         header.nonce = nonce;
         let value = pow_value(pow.pow_hash(rules.form, &header, seed), header.height, &rules.halt);
-        if satisfies_target(&value, header.difficulty) {
+        if satisfies_target_for(&value, header.difficulty, rules.form) {
             return Some(header);
         }
     }
@@ -64,7 +64,7 @@ mod tests {
         let pow = KeccakPow;
         let header = BlockHeader::genesis(8, 0);
         let mined = mine(&pow, header, 1_000_000, &[]).expect("must mine at difficulty 8");
-        assert!(satisfies_target(
+        assert!(crate::pow::satisfies_target(
             &pow.pow_hash(crate::forms::GenesisForm::V4, &mined, &[]),
             mined.difficulty
         ));
