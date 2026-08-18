@@ -20,7 +20,7 @@ contact** — those are stages 1–3.
 | No stratum/pool/extranonce code on `main` | lab #356: grep NOT FOUND; M9-N3 "in-node, solo, no template surface" | **HOLDS** — `find`/`grep` on this branch still empty before this PR |
 | v5 header offsets (nonce 39–46, version+u48 at 32–38) | pool-t1-brief §3 DECIDED; lab PR #472 `preimage_for(V5)` | **HOLDS** — constants in `qlab-stratum::blob` mirror PR #472; assert-against-merge owed when #472 lands |
 | rx/0 bit-identity | lab #356 CLOSED, IDENTICAL | **HOLDS** — layout-independent; not re-measured here |
-| Target model = leading-8-BE ≤ `u64::MAX/d` | lab #356 CLEAN; `qlab_devnet::pow::{target_threshold,hash_to_work_value}` | **HOLDS** — reimplemented as pure fns in `qlab-stratum::target` (no `qlab-devnet` dep) |
+| Target model = leading-8-BE ≤ `u64::MAX/d` | lab #356 CLEAN; `qlab_devnet::pow::{target_threshold,hash_to_work_value}` | **HOLDS on the scalar shape; 🔴 CORRECTED on byte selection** — see finding 6 / [#490](https://github.com/qumbra-labs/qumbra-lab/issues/490): stock xmrig compares `hash[24..32]` LE, our consensus `hash[0..8]` BE. Ruled: v5 nets move to trailing-8-LE. The pure fns in `qlab-stratum::target` (threshold arithmetic) are byte-selection-agnostic and stand |
 | Key-block cadence = Monero mask (2048/64) | `qlab-pow::keyblock`, test-locked | **HOLDS** — pool reuses the schedule; does not fork it |
 
 No row wants a header-layout change. No row says the convention structurally
@@ -65,7 +65,7 @@ Login success returns `{ id, job, status: "OK" }` with the first job embedded
 |---|---|---|---|
 | `blob` | hex hashing blob; miner writes nonce at offset 39 | **97-byte hex of `BlockHeader::preimage_for(V5)`**, with pool extra-nonce already written at 43–46 and miner window 39–42 zeroed (or prior). Length 97 ∈ xmrig `[43, 408)` | CLEAN under route A. **DEVIATION from Monero:** blob is our header preimage, not a CryptoNote block hashing blob — same stratum field, different bytes (named; required) |
 | `job_id` | opaque string | Pool-generated; ties submit → template | CLEAN |
-| `target` | hex; 4-byte compact *or* 8-byte raw | **8-byte LE hex of `u64::MAX / difficulty`** (pool share difficulty). xmrig accepts 8-byte raw; matches our leading-8-BE check | CLEAN. **FINDING:** Monero's common 4-byte compact target is *not* our native encoding — we do not emit it. Decoder accepts 4-byte as zero-extend for fixture inspection only (`target.rs`); never on a live Qumbra job |
+| `target` | hex; 4-byte compact *or* 8-byte raw | **8-byte LE hex of `u64::MAX / difficulty`** (pool share difficulty). xmrig accepts 8-byte raw; threshold scalar matches | CLEAN on encoding — **but see finding 6 (#490)**: the *hash bytes compared* against this target differ between stock xmrig and pre-#490 consensus. **FINDING:** Monero's common 4-byte compact target is *not* our native encoding — we do not emit it. Decoder accepts 4-byte as zero-extend for fixture inspection only (`target.rs`); never on a live Qumbra job |
 | `algo` | `"rx/0"` | Always `"rx/0"` | CLEAN (#356) |
 | `height` | block height | `header.height` (u48 on the wire inside the blob; u64 in the JSON field) | CLEAN |
 | `seed_hash` | 32-byte hex RandomX key | `pow_seed(...)` → 32-byte key-block header hash at `KeyBlockSchedule::seed_height(height)` | CLEAN (#356) |
@@ -102,8 +102,12 @@ Helper: `qlab_stratum::blob::assemble_nonce`.
 | `algo` | optional echo | Must be `rx/0` if present | CLEAN |
 
 Share validation (stage 1): rebuild blob with submit nonce, RandomX-hash under
-`seed_hash`, check leading-8-BE ≤ job target. Block candidate (stage 1/2): also
-≤ consensus difficulty, then assemble full block and submit to the node.
+`seed_hash`, check **trailing-8-LE `< job target`** — the [#490](https://github.com/qumbra-labs/qumbra-lab/issues/490)-ruled
+v5 predicate, and strict `<` to mirror xmrig's own filter (a `<=` validator would
+reject boundary shares xmrig never sends anyway, but mirroring removes the class).
+Block candidate (stage 1/2): also ≤ consensus difficulty under the same v5
+predicate, then assemble full block and submit to the node.
+*(Original stage-0 text said leading-8-BE; corrected 2026-08-18 per #490.)*
 
 ### 2.5 Job re-issue and template invalidation
 
@@ -141,8 +145,23 @@ event.
 5. **v4 nets remain UNCLEAN for stock xmrig** (lab #356). Stage 0 does not
    claim otherwise — see §5.
 
+6. **🔴 Work-value byte selection (found at coordinator stage-0 review, corrected
+   2026-08-18 — [#490](https://github.com/qumbra-labs/qumbra-lab/issues/490)).**
+   Stock xmrig's share predicate reads the RandomX hash's **trailing 8 bytes
+   little-endian** (`CpuWorker.cpp`: `*reinterpret_cast<uint64_t*>(m_hash + 24)`,
+   strict `<`); pre-#490 consensus read the **leading 8 bytes big-endian**
+   (`pow.rs::hash_to_work_value`). Same pass-probability, different hashes — a
+   pool would reject ~100 % of honest shares and block finds would never be
+   submitted. This row was marked CLEAN here and in #356 because both analyses
+   traced the scalar shape and the target-hex parse but never *which hash bytes*
+   the miner compares. **Ruling (#490): `GenesisForm::V5` nets use trailing-8-LE
+   (Monero-congruent); v4/T1 keeps leading-8-BE unchanged.** The consensus-side
+   form-keying of `satisfies_target` is #490's own PR, not this baton; stage 1's
+   share validator consumes it.
+
 No finding changes §3's premises. No finding wants a further header-layout
-change.
+change. Finding 6 changes a **consensus predicate** (ruled, #490) but no header
+byte, no genesis byte, no target encoding.
 
 ## 4. Measurement — fixture round-trip
 

@@ -22,7 +22,7 @@
 | `main` 上无 stratum/pool/extranonce 代码 | lab #356：grep NOT FOUND；M9-N3「节点内、solo、无模板面」 | **成立** — 本 PR 之前仍为空 |
 | v5 头偏移（nonce 39–46，version+u48 在 32–38） | pool-t1-brief §3 DECIDED；lab PR #472 `preimage_for(V5)` | **成立** — `qlab-stratum::blob` 常量对齐 PR #472；#472 合入后需 assert |
 | rx/0 比特同一 | lab #356 CLOSED，IDENTICAL | **成立** — 与布局无关；此处不重测 |
-| 目标模型 = 前 8 字节 BE ≤ `u64::MAX/d` | lab #356 CLEAN；`qlab_devnet::pow` | **成立** — 在 `qlab-stratum::target` 以纯函数镜像（不依赖 `qlab-devnet`） |
+| 目标模型 = 前 8 字节 BE ≤ `u64::MAX/d` | lab #356 CLEAN；`qlab_devnet::pow` | **标量形状成立；🔴 字节选择被更正** — 见发现 6 / [#490](https://github.com/qumbra-labs/qumbra-lab/issues/490)：stock xmrig 比较 `hash[24..32]` 小端，我们的共识比较 `hash[0..8]` 大端。已裁定：v5 网改用后 8 字节小端。`qlab-stratum::target` 的阈值算术与字节选择无关，仍然成立 |
 | key-block 节奏 = Monero 掩码（2048/64） | `qlab-pow::keyblock`，测试锁 | **成立** — 矿池复用该 schedule，不另起炉灶 |
 
 无一行要求改头布局。无一行说惯例在结构上扛不住 v5 头。**不对 #482 做 STOP-and-report。**
@@ -65,7 +65,7 @@
 |---|---|---|---|
 | `blob` | hex 哈希 blob；矿工在偏移 39 写 nonce | **`BlockHeader::preimage_for(V5)` 的 97 字节 hex**，池侧 extra-nonce 已写入 43–46，矿工窗口 39–42 清零（或保留前值）。长度 97 ∈ xmrig `[43, 408)` | route A 下 CLEAN。**相对 Monero 的偏差：** blob 是我们的头 preimage，不是 CryptoNote 块哈希 blob — 同一 stratum 字段，不同字节（点名；必需） |
 | `job_id` | 不透明字符串 | 矿池生成；把 submit 绑到模板 | CLEAN |
-| `target` | hex；4 字节 compact *或* 8 字节 raw | **`u64::MAX / difficulty` 的 8 字节 LE hex**（矿池 share 难度）。xmrig 接受 8 字节 raw；对齐我们的前 8 字节 BE 比较 | CLEAN。**FINDING：** Monero 常见的 4 字节 compact **不是**我们的原生编码 — 我们不发出它。解码器仅为 fixture 检视接受 4 字节零扩展（`target.rs`）；线上 Qumbra job 永不使用 |
+| `target` | hex；4 字节 compact *或* 8 字节 raw | **`u64::MAX / difficulty` 的 8 字节 LE hex**（矿池 share 难度）。xmrig 接受 8 字节 raw；阈值标量对齐 | 编码层面 CLEAN — **但见发现 6（#490）**：拿哪些哈希字节与该 target 比较，stock xmrig 与 #490 之前的共识并不一致。**FINDING：** Monero 常见的 4 字节 compact **不是**我们的原生编码 — 我们不发出它。解码器仅为 fixture 检视接受 4 字节零扩展（`target.rs`）；线上 Qumbra job 永不使用 |
 | `algo` | `"rx/0"` | 恒为 `"rx/0"` | CLEAN（#356） |
 | `height` | 块高 | `header.height`（blob 内 u48；JSON 字段 u64） | CLEAN |
 | `seed_hash` | 32 字节 hex RandomX key | `pow_seed(...)` → `KeyBlockSchedule::seed_height(height)` 处的 32 字节 key-block 头哈希 | CLEAN（#356） |
@@ -101,7 +101,7 @@
 | `result` | 32 字节 hex PoW 哈希 | 与 job target（share）比；若达块级再与共识难度比 | CLEAN |
 | `algo` | 可选回显 | 若有则必须是 `rx/0` | CLEAN |
 
-Share 校验（stage 1）：用 submit nonce 重建 blob，在 `seed_hash` 下 RandomX，检查前 8 字节 BE ≤ job target。块候选（stage 1/2）：同时 ≤ 共识难度，再组装整块提交给节点。
+Share 校验（stage 1）：用 submit nonce 重建 blob，在 `seed_hash` 下 RandomX，检查**后 8 字节 LE `< job target`** — [#490](https://github.com/qumbra-labs/qumbra-lab/issues/490) 裁定的 v5 谓词，且用严格 `<` 镜像 xmrig 自身的过滤（`<=` 校验器会拒掉 xmrig 反正不会提交的边界 share，镜像则消除这一类差异）。块候选（stage 1/2）：同样在 v5 谓词下 ≤ 共识难度，再组装整块提交给节点。*（stage 0 原文写的是前 8 字节 BE；2026-08-18 依 #490 更正。）*
 
 ### 2.5 Job 重发与模板失效
 
@@ -122,8 +122,19 @@ Share 校验（stage 1）：用 submit nonce 重建 blob，在 `seed_hash` 下 R
 3. **Extra-nonce 不是 JSON 字段。** 与 Monero 矿池相同（活在 blob 内）。我们的落在 header nonce\[4..8)，而非 coinbase 保留字节 — stratum 看不见，共识看得见。无惯例缺口。
 4. **`next_seed_hash` 由矿池计算。** 无 Qumbra 共识字段。不构成对惯例的 finding — 惯例本就视其为矿池供给。
 5. **v4 网对 stock xmrig 仍为 UNCLEAN**（lab #356）。Stage 0 不另作宣称 — 见 §5。
+6. **🔴 工作量字节选择（协调者 stage-0 评审发现，2026-08-18 更正 —
+   [#490](https://github.com/qumbra-labs/qumbra-lab/issues/490)）。**
+   stock xmrig 的 share 谓词读 RandomX 哈希的**后 8 字节小端**
+   （`CpuWorker.cpp`：`*reinterpret_cast<uint64_t*>(m_hash + 24)`，严格 `<`）；
+   #490 之前的共识读**前 8 字节大端**（`pow.rs::hash_to_work_value`）。通过概率相同、
+   命中的哈希不同 — 矿池会拒掉 ~100% 的诚实 share，真块解永远不会被提交。此行在本文与
+   #356 中都曾标 CLEAN：两次分析追了标量形状和 target hex 解析，但都没追**矿机比较的是
+   哪些哈希字节**。**裁决（#490）：`GenesisForm::V5` 网使用后 8 字节小端（与 Monero 同构）；
+   v4/T1 保持前 8 字节大端不变。**共识侧 `satisfies_target` 的 form 键控是 #490 自己的
+   PR，不属本棒；stage 1 的 share 校验器消费它。
 
-无 finding 改变 §3 前提。无 finding 要求进一步改头布局。
+无 finding 改变 §3 前提。无 finding 要求进一步改头布局。发现 6 改变一条**共识谓词**
+（已裁定，#490），但不动任何头字节、创世字节或 target 编码。
 
 ## 4. 测量 — fixture 往返
 
