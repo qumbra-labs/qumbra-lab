@@ -106,6 +106,37 @@ pub const DATA_SUBDIR: &str = "data";
 /// rather than about the machine.
 pub const BACKED_UP_FLAG: &str = "--yes-i-backed-up";
 
+/// The ceiling on a fetched `genesis.qmb`, headers included (review finding 1).
+///
+/// 🔴 **Why a node binary needs this and the wallet did not.** The fetch runs
+/// through `qumbra_wallet::net`, whose read was `read_to_end` with no bound —
+/// fine for a wallet talking to a server its operator picked, and not fine once
+/// the same read lives in the **consensus node binary**: whoever serves this URL
+/// could stream until the miner's process died, before any verification ran.
+///
+/// 4 MiB against a real genesis of ~41 KB is ~100× headroom, so this cannot
+/// refuse an artifact the chain actually publishes —
+/// `the_genesis_ceiling_has_two_orders_of_magnitude_of_headroom` holds that
+/// margin against the tree's own genesis rather than against a remembered
+/// number.
+///
+/// **This cannot become another truncation-reads-as-complete** (the pattern this
+/// repo has now paid for nine times): the ceiling produces a **refusal**, never a
+/// short body handed onward. Even if it somehow did, a clipped file cannot pass
+/// [`verify_genesis_bytes`] — the pinned hash is over the whole canonical
+/// encoding — so the failure mode on this path is a named stop, and there is no
+/// partial-success verdict available for it to be mistaken for.
+pub const MAX_GENESIS_BYTES: usize = 4 * 1024 * 1024;
+
+/// The largest `--index` `mine` will derive a payout key at (review finding 2).
+///
+/// `mine` allocates every index up to the one it is asked for, so an unbounded
+/// value is an unbounded write. The cap exists so that fixing one denial of
+/// service does not introduce another: `--index 18446744073709551615` is a typo,
+/// not a request. A miner who genuinely wants a high index allocates it with
+/// `qumbra-wallet address --new` and passes the key with `--rkm`.
+pub const MAX_MINE_INDEX: u64 = 1024;
+
 /// Why `mine` refused. Every variant names the file, URL or flag involved —
 /// a refusal an operator cannot act on is a refusal that gets worked around.
 #[derive(Debug)]
@@ -265,6 +296,17 @@ impl MineArgs {
                     index = v.parse().map_err(|_| {
                         MineError::Usage(format!("--index needs a number, got `{v}`"))
                     })?;
+                    // Bounded because `mine` ALLOCATES up to this index (see
+                    // `ensure_wallet`): unbounded here would be an unbounded
+                    // write, i.e. a second denial of service introduced while
+                    // closing the first.
+                    if index > MAX_MINE_INDEX {
+                        return Err(MineError::Usage(format!(
+                            "--index {index} is above the {MAX_MINE_INDEX} `mine` allocates up \
+                             to. Allocate the index you want with `qumbra-wallet address --new` \
+                             and pass its key with --rkm."
+                        )));
+                    }
                     i += 2;
                 }
                 "--listen" => {
@@ -370,7 +412,7 @@ pub fn ensure_wallet<R: BufRead, W: Write>(
     };
 
     if let Some(dir) = existing {
-        let w = qumbra_wallet::store::WalletDir::open(&dir)
+        let mut w = qumbra_wallet::store::WalletDir::open(&dir)
             .map_err(|e| MineError::Wallet(e.to_string()))?;
         let rkm_hex = qumbra_wallet::store::miner_rkm_hex(&w.wallet(), args.index);
         writeln!(
@@ -378,6 +420,7 @@ pub fn ensure_wallet<R: BufRead, W: Write>(
             "wallet:   {} (existing — nothing generated, nothing printed)",
             dir.display()
         )?;
+        allocate_payout_index(&mut w, args.index, out)?;
         return Ok(WalletOutcome::Existing { dir, rkm_hex });
     }
 
@@ -442,7 +485,7 @@ pub fn ensure_wallet<R: BufRead, W: Write>(
 
     match created {
         qumbra_wallet::store::GatedCreate::Refused => Err(MineError::NoBackupConfirmation),
-        qumbra_wallet::store::GatedCreate::Created(w) => {
+        qumbra_wallet::store::GatedCreate::Created(mut w) => {
             let rkm_hex = qumbra_wallet::store::miner_rkm_hex(&w.wallet(), args.index);
             writeln!(out, "wallet:   {} (NEW — back up the phrase above)", nested.display())?;
             writeln!(
@@ -450,9 +493,59 @@ pub fn ensure_wallet<R: BufRead, W: Write>(
                 "          read it again any time with: qumbra-wallet backup --dir {} --reveal",
                 nested.display()
             )?;
+            allocate_payout_index(&mut w, args.index, out)?;
             Ok(WalletOutcome::Created { dir: nested, rkm_hex })
         }
     }
+}
+
+/// Make sure the wallet has **allocated** the index its coinbase is paid at
+/// (review finding 2).
+///
+/// 🔴 **Structural rather than advisory, and that is the whole choice.**
+/// `qumbra-wallet miner-rkm` prints a note when the index is not in the
+/// allocated set — *"allocate it (`address --new`) so scans cover the coinbase
+/// identity"* — and `mine` reproduced the hazard it warns about with no note at
+/// all: a freshly created wallet has only index 0, so `mine --index 3` paid an
+/// identity **this wallet's own scan does not cover**. A miner would have found
+/// out by not finding their money.
+///
+/// Allocating costs nothing and changes nothing about the money: the diversifier
+/// is index-deterministic ([`qumbra_wallet::store::miner_rkm_hex`]'s note), so
+/// the payout key is byte-identical whether or not the index is allocated. This
+/// is the same write `qumbra-wallet address --new` performs, and it is
+/// idempotent — the default index 0 is always already allocated, so the ordinary
+/// path does not write at all.
+///
+/// The `--index` cap ([`MAX_MINE_INDEX`]) is what keeps this loop bounded.
+fn allocate_payout_index<W: Write>(
+    w: &mut qumbra_wallet::store::WalletDir,
+    index: u64,
+    out: &mut W,
+) -> Result<(), MineError> {
+    if w.allocated.contains(&index) {
+        return Ok(());
+    }
+    // Drive the cursor by its own rule — `allocate_next` allocates max+1 — and
+    // terminate on the MAX, never on containment. A hand-edited `addresses.v1`
+    // with a gap (`[0, 5]`, asked for 3) would spin forever on a
+    // `while !contains` loop, because max only ever climbs away from the hole.
+    while w.allocated.iter().max().copied().unwrap_or(0) < index {
+        w.allocate_next().map_err(|e| MineError::Wallet(e.to_string()))?;
+    }
+    if !w.allocated.contains(&index) {
+        return Err(MineError::Wallet(format!(
+            "this wallet's address cursor does not contain index {index} and cannot reach it — \
+             it has a gap, so it was not written by this tool. Allocate the index with \
+             `qumbra-wallet address --new`, or pass the payout key directly with --rkm."
+        )));
+    }
+    writeln!(
+        out,
+        "wallet:   allocated address index {index} — the coinbase identity is now inside what \
+         this wallet's own scan covers"
+    )?;
+    Ok(())
 }
 
 /// What the genesis step did.
@@ -693,7 +786,14 @@ pub fn http_fetch(url: &str) -> std::io::Result<Vec<u8>> {
         Some((a, p)) => (a, format!("/{p}")),
         None => (rest, "/".to_string()),
     };
-    qumbra_wallet::net::http_get(&format!("{scheme}://{authority}"), &path)
+    // Bounded (review finding 1): a node binary must not read an unbounded
+    // stream from whoever answers this URL. See [`MAX_GENESIS_BYTES`] for why
+    // the ceiling cannot become a silent truncation.
+    qumbra_wallet::net::http_get_limited(
+        &format!("{scheme}://{authority}"),
+        &path,
+        Some(MAX_GENESIS_BYTES),
+    )
 }
 
 #[cfg(test)]
@@ -732,6 +832,55 @@ mod tests {
     #[test]
     fn mine_bakes_the_hash_this_trees_genesis_actually_has() {
         assert_eq!(GenesisFile::new_devnet_t0().hash_hex(), T1_EXPECTED_GENESIS_HASH);
+    }
+
+    /// 🔴 **Review finding 3, closed at the axis that matters.** The baked
+    /// defaults are transcribed from `docs/join-and-mine.md`, and until this
+    /// test nothing compared them to it — the acceptance-(c) test below builds
+    /// its "hand-written" side in Rust, so a doc that drifted (or a
+    /// transcription typo made in the first place) was invisible.
+    ///
+    /// This reads the published guide itself and asserts the three values a
+    /// joiner copies out of it are the three this binary bakes. It cannot cover
+    /// the seeds *rotating on the fleet* — that needs a live peer and is named
+    /// in the PR — but it does cover this binary disagreeing with the document
+    /// strangers are told to follow.
+    #[test]
+    fn the_baked_defaults_are_the_values_the_join_docs_publish() {
+        const GUIDE: &str = include_str!("../../../docs/join-and-mine.md");
+
+        // The published joiner config lines, read as text: the doc is the
+        // source and this test is the reader, never the other way round.
+        let dial = GUIDE
+            .lines()
+            .find(|l| l.trim_start().starts_with("dial_peers ="))
+            .expect("the guide publishes a dial_peers line");
+        for seed in T1_SEEDS {
+            assert!(dial.contains(seed), "the guide's dial_peers omits the baked seed {seed}");
+        }
+        assert_eq!(
+            dial.matches(':').count(),
+            T1_SEEDS.len(),
+            "the guide lists exactly the four baked seeds and no fifth: {dial}"
+        );
+
+        let listen = GUIDE
+            .lines()
+            .find(|l| l.trim_start().starts_with("listen_addr ="))
+            .expect("the guide publishes a listen_addr line");
+        assert!(
+            listen.contains(DEFAULT_LISTEN_ADDR),
+            "the guide's listen_addr is not what mine binds: {listen}"
+        );
+
+        assert!(
+            GUIDE.contains(T1_EXPECTED_GENESIS_HASH),
+            "the guide does not publish the genesis hash this binary pins"
+        );
+        assert!(
+            GUIDE.contains(T1_GENESIS_URL),
+            "the guide does not publish the genesis URL this binary fetches"
+        );
     }
 
     /// The four T1 entry points, in the shape `dial_peers` needs. Not a
@@ -1139,13 +1288,21 @@ mod tests {
 
     /// 🔴 Acceptance (c) as an equality rather than a description. The task book
     /// asks for "byte-identical behavior to today's manual config"; for a config
-    /// that means every value the node reads, so this parses the hand-written
-    /// miner config from `docs/join-and-mine.md` §3 and the one `mine --rkm`
-    /// writes, and asserts the two `NodeConfig`s are equal. The files differ by
-    /// `mine`'s header comment, which `NodeConfig` never sees — and a test that
-    /// compared the FILES would be pinning a comment.
+    /// that means every value the node reads, so this writes out the miner
+    /// config `docs/join-and-mine.md` §3 describes — §2's joiner config with the
+    /// two mining fields added — and asserts it parses to the same `NodeConfig`
+    /// as the one `mine --rkm` generates. The files differ by `mine`'s header
+    /// comment, which `NodeConfig` never sees, and a test that compared the
+    /// FILES would be pinning a comment.
+    ///
+    /// **Renamed in the review follow-up.** It used to say
+    /// `…_from_the_join_docs`, which claimed more than it asserts: the
+    /// hand-written side is built here in Rust, not read from the guide, so doc
+    /// drift was invisible to it. That axis is covered on its own now by
+    /// `the_baked_defaults_are_the_values_the_join_docs_publish`; this test's
+    /// job is the equality, and its name now says only that.
     #[test]
-    fn the_rkm_config_equals_the_hand_written_one_from_the_join_docs() {
+    fn the_rkm_config_equals_an_equivalently_hand_written_config() {
         let rkm = "0100000000000000020000000000000003000000000000000400000000000000";
         let seeds: Vec<String> = T1_SEEDS.iter().map(|s| s.to_string()).collect();
 
@@ -1299,6 +1456,194 @@ mod tests {
     }
 
     // ── the URL split under the one HTTP client ──────────────────────────────
+
+    // ── review finding 1: the fetch is bounded, and bounded fail-closed ──────
+
+    /// The ceiling must be so far above the real artifact that it can never
+    /// refuse a genesis file this chain actually publishes. Held against the
+    /// tree's own genesis rather than against a number somebody wrote down: a
+    /// format change that grew the file 16× would fail here, while there is
+    /// still 6× of room left, instead of failing on every miner's first run.
+    #[test]
+    fn the_genesis_ceiling_has_two_orders_of_magnitude_of_headroom() {
+        let real = real_genesis_bytes().len();
+        assert!(real > 0);
+        assert!(
+            real * 16 < MAX_GENESIS_BYTES,
+            "genesis is {real} B against a {MAX_GENESIS_BYTES} B ceiling — the margin has \
+             eroded; raise the ceiling deliberately rather than discovering it on a miner"
+        );
+    }
+
+    /// 🔴 **The ceiling cannot re-enter the truncation-reads-as-complete class**
+    /// — the pattern this repo has paid for nine times (lab #312 found the ninth
+    /// with live money). Two independent reasons, and this test locks the
+    /// second, which is the one that survives a mistake in the first:
+    ///
+    /// 1. the ceiling **refuses**; it never hands a short body onward. There is
+    ///    no partial-success verdict on this path to be mistaken for a complete
+    ///    one — `ensure_genesis` gets an `Err` and the command stops;
+    /// 2. even if a truncated body somehow reached verification, it **cannot
+    ///    pass**: the pin is a hash over the whole canonical encoding, so every
+    ///    prefix of the real genesis is refused by name.
+    ///
+    /// That is what makes the bound safe to add. A cap on a *paged* wire would
+    /// be the dangerous shape; a cap on a hash-pinned single artifact is
+    /// fail-closed by construction.
+    #[test]
+    fn a_truncated_genesis_is_refused_by_the_pin_not_accepted_as_short() {
+        let full = real_genesis_bytes();
+        for cut in [1usize, 64, full.len() / 2, full.len() - 1] {
+            let err = verify_genesis_bytes(&full[..cut], T1_EXPECTED_GENESIS_HASH, "the probe")
+                .expect_err("no prefix of the genesis file is the genesis file");
+            // Undecodable or non-canonical — never Ok, and never a wrong-hash
+            // ACCEPT. Which of the two it is depends on where the cut lands.
+            assert!(
+                matches!(
+                    err,
+                    MineError::GenesisUndecodable { .. }
+                        | MineError::GenesisNotCanonical { .. }
+                        | MineError::GenesisWrongHash { .. }
+                ),
+                "cut at {cut} produced {err:?}"
+            );
+        }
+    }
+
+    /// An over-ceiling fetch surfaces as a *named* refusal that reaches the
+    /// operator with the URL attached, and — the property that matters — no
+    /// file is written for the next run to find and trust.
+    #[test]
+    fn an_over_ceiling_fetch_is_reported_against_its_url_and_writes_nothing() {
+        let d = tmp("fetch_ceiling");
+        std::fs::create_dir_all(&d).unwrap();
+        let path = d.join(GENESIS_FILE_NAME);
+        let mut out = Vec::new();
+
+        let err = ensure_genesis(
+            &path,
+            "https://hostile.invalid/genesis.qmb",
+            T1_EXPECTED_GENESIS_HASH,
+            |_| {
+                // What `net::http_get_limited` returns once the ceiling trips.
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("response exceeds this route's {MAX_GENESIS_BYTES}-byte ceiling"),
+                ))
+            },
+            &mut out,
+        )
+        .expect_err("an over-ceiling response must not become a genesis file");
+        let msg = err.to_string();
+        assert!(matches!(err, MineError::GenesisFetch { .. }), "{err:?}");
+        assert!(msg.contains("https://hostile.invalid/genesis.qmb"), "{msg}");
+        assert!(msg.contains("ceiling"), "the reason reaches the operator: {msg}");
+        assert!(!path.exists(), "nothing is written");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ── review finding 2: the payout index is allocated, not merely used ─────
+
+    /// 🔴 A non-zero `--index` used to pay an identity this wallet's own scan
+    /// does not cover, silently — the exact hazard `qumbra-wallet miner-rkm`
+    /// prints a note about, reproduced with no note. `mine` allocates it now,
+    /// and the payout key is unchanged by the allocation (the diversifier is
+    /// index-deterministic), which is what makes the fix free.
+    #[test]
+    fn a_non_zero_index_is_allocated_so_the_wallets_own_scan_covers_it() {
+        let d = tmp("index_alloc");
+        let mut args = args_for(&d);
+        args.backed_up = true;
+        args.index = 3;
+        let mut out = Vec::new();
+
+        let outcome = ensure_wallet(&args, false, &mut Cursor::new(Vec::new()), &mut out)
+            .expect("created + allocated");
+
+        let w = qumbra_wallet::store::WalletDir::open(&d.join(WALLET_SUBDIR)).expect("wallet");
+        assert!(w.allocated.contains(&3), "index 3 is allocated: {:?}", w.allocated);
+        assert_eq!(w.allocated, vec![0, 1, 2, 3], "and the cursor stayed contiguous");
+        assert_eq!(
+            outcome.rkm_hex(),
+            qumbra_wallet::store::miner_rkm_hex(&w.wallet(), 3),
+            "allocation does not move the payout key"
+        );
+        assert!(String::from_utf8_lossy(&out).contains("allocated address index 3"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The same for a wallet the operator already had, and the two things that
+    /// must NOT change while it happens: the seed is untouched, and index 0 —
+    /// the ordinary path — writes nothing at all.
+    #[test]
+    fn allocating_on_an_existing_wallet_leaves_the_seed_alone_and_index_zero_writes_nothing() {
+        let d = tmp("index_alloc_existing");
+        let wdir = d.join(WALLET_SUBDIR);
+        qumbra_wallet::store::WalletDir::create(
+            &wdir,
+            qlab_wallet::seed::MasterSeed::from_entropy([0x77; 32]),
+        )
+        .expect("fixture wallet");
+        let seed_before = std::fs::read(wdir.join(qumbra_wallet::store::SEED_FILE)).unwrap();
+        let cursor_before =
+            std::fs::read(wdir.join(qumbra_wallet::store::ADDR_FILE)).unwrap();
+
+        // index 0 is always already allocated: no write, and nothing said.
+        let args = args_for(&d);
+        let mut out = Vec::new();
+        ensure_wallet(&args, false, &mut Cursor::new(Vec::new()), &mut out).expect("existing");
+        assert_eq!(
+            std::fs::read(wdir.join(qumbra_wallet::store::ADDR_FILE)).unwrap(),
+            cursor_before,
+            "the default path must not touch the cursor"
+        );
+        assert!(!String::from_utf8_lossy(&out).contains("allocated address index"));
+
+        // index 2 allocates, and still never touches key material.
+        let mut args2 = args_for(&d);
+        args2.index = 2;
+        let mut out2 = Vec::new();
+        ensure_wallet(&args2, false, &mut Cursor::new(Vec::new()), &mut out2).expect("existing");
+        let w = qumbra_wallet::store::WalletDir::open(&wdir).expect("wallet");
+        assert!(w.allocated.contains(&2));
+        assert_eq!(
+            std::fs::read(wdir.join(qumbra_wallet::store::SEED_FILE)).unwrap(),
+            seed_before,
+            "the seed file is untouched by allocation"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The cap that keeps the fix from being a second denial of service: `mine`
+    /// allocates *up to* the index, so an unbounded `--index` is an unbounded
+    /// write. A typo is refused at parse, naming the escape hatch.
+    #[test]
+    fn an_index_above_the_cap_is_refused_at_parse_and_names_the_way_round_it() {
+        let at_cap = MineArgs::parse(&[
+            "--dir".into(),
+            "/tmp/x".into(),
+            "--index".into(),
+            MAX_MINE_INDEX.to_string(),
+        ])
+        .expect("the cap itself is allowed");
+        assert_eq!(at_cap.index, MAX_MINE_INDEX);
+
+        for over in [MAX_MINE_INDEX + 1, u64::MAX] {
+            let e = MineArgs::parse(&[
+                "--dir".into(),
+                "/tmp/x".into(),
+                "--index".into(),
+                over.to_string(),
+            ]);
+            match e {
+                Err(MineError::Usage(m)) => {
+                    assert!(m.contains("--rkm"), "the refusal names the escape hatch: {m}");
+                    assert!(m.contains(&MAX_MINE_INDEX.to_string()), "{m}");
+                }
+                other => panic!("--index {over} must be refused, got {other:?}"),
+            }
+        }
+    }
 
     /// `http_fetch` only splits a URL; the transport is `qumbra_wallet::net`.
     /// This pins the split, which is the part that can be wrong without a

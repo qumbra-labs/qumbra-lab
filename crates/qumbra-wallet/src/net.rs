@@ -439,8 +439,52 @@ fn connect(base_url: &str) -> std::io::Result<(Box<dyn ReadWrite>, String)> {
 /// Shared by both verbs so the chunked/`Content-Length`-less handling cannot
 /// drift between them.
 fn read_response(stream: &mut dyn ReadWrite) -> std::io::Result<(u16, Vec<u8>)> {
+    read_response_limited(stream, None)
+}
+
+/// [`read_response`] with an optional ceiling on the **whole** response —
+/// status line, headers and body together.
+///
+/// `None` is this module's historical behaviour and stays the default for every
+/// wallet route: those talk to a server the operator chose, page by page, with
+/// the server's own caps (`MAX_TREE_LEAVES`, `MAX_NULLIFIER_BLOCKS`,
+/// `MAX_COINBASE_BLOCKS`) bounding what a well-behaved peer returns.
+///
+/// `Some(n)` exists for lab #475's review finding 1: `qumbra-node mine` fetches
+/// `genesis.qmb` through this module, which put an **unbounded read inside the
+/// consensus node binary** for the first time. Whoever serves that URL could
+/// stream until the miner's process died, before any verification ran. A
+/// caller that knows the artifact's size states it here.
+///
+/// The read is `take(n + 1)`, so "exactly at the limit" and "truncated at the
+/// limit" are distinguishable and the refusal is unambiguous rather than a
+/// silently-clipped body.
+fn read_response_limited(
+    stream: &mut dyn ReadWrite,
+    limit: Option<usize>,
+) -> std::io::Result<(u16, Vec<u8>)> {
+    use std::io::Read;
+
     let mut raw = Vec::new();
-    if let Err(e) = stream.read_to_end(&mut raw) {
+    // `take(n + 1)`: reading one byte past the ceiling is what makes an
+    // over-limit response detectable instead of merely short.
+    let read = match limit {
+        None => stream.read_to_end(&mut raw),
+        Some(n) => stream.take(n as u64 + 1).read_to_end(&mut raw),
+    };
+    if let Some(n) = limit {
+        if raw.len() > n {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "response exceeds this route's {n}-byte ceiling and was refused before it \
+                     was parsed (read stopped at {} bytes)",
+                    raw.len()
+                ),
+            ));
+        }
+    }
+    if let Err(e) = read {
         // A TLS peer that closes the connection without a `close_notify` — and
         // plenty do — surfaces as `UnexpectedEof` *after* the response is
         // already in hand. Failing a complete response over the peer's
@@ -490,13 +534,28 @@ fn read_response(stream: &mut dyn ReadWrite) -> std::io::Result<(u16, Vec<u8>)> 
 /// One raw GET — public since lab #367 so the names sync loop can inject it
 /// (`names::sync_names` takes a fetch closure; TLS stays in this crate).
 pub fn http_get(base_url: &str, path_and_query: &str) -> std::io::Result<Vec<u8>> {
+    http_get_limited(base_url, path_and_query, None)
+}
+
+/// [`http_get`] with an optional ceiling on the whole response — see
+/// [`read_response_limited`] for why the ceiling exists and why `None` is still
+/// right for the wallet's own paged routes.
+///
+/// The caller states the bound because only the caller knows the artifact:
+/// `qumbra-node mine` fetches one fixed-size genesis file and can say so, while
+/// a scan page's size is the server's business.
+pub fn http_get_limited(
+    base_url: &str,
+    path_and_query: &str,
+    max_bytes: Option<usize>,
+) -> std::io::Result<Vec<u8>> {
     use std::io::Write;
 
     let (mut stream, host) = connect(base_url)?;
     let req = format!("GET {path_and_query} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes())?;
     stream.flush()?;
-    let (status, body) = read_response(stream.as_mut())?;
+    let (status, body) = read_response_limited(stream.as_mut(), max_bytes)?;
     if status != 200 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Other,
@@ -572,6 +631,59 @@ mod tests {
 
     fn answer(status: u16, body: &str) -> SubmitAnswer {
         SubmitAnswer { status, body: body.to_string() }
+    }
+
+    /// A whole HTTP/1.1 `Connection: close` response as one buffer, the shape
+    /// [`read_response_limited`] reads off a socket. `Cursor<Vec<u8>>` is both
+    /// `Read` and `Write`, so it satisfies `ReadWrite` without a mock type.
+    fn response_bytes(body_len: usize) -> std::io::Cursor<Vec<u8>> {
+        let mut raw = b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n".to_vec();
+        raw.extend(std::iter::repeat(b'g').take(body_len));
+        std::io::Cursor::new(raw)
+    }
+
+    /// Lab #475 review finding 1. Before this, `read_response` was
+    /// `read_to_end` with no ceiling, and `qumbra-node mine` reached it from
+    /// the **node** binary — so whoever served the genesis URL could stream
+    /// until the miner's process died, before any verification ran.
+    ///
+    /// The refusal names the ceiling and how far the read got, and it happens
+    /// before the response is parsed at all.
+    #[test]
+    fn an_over_limit_response_is_refused_by_name_and_never_parsed() {
+        let mut stream = response_bytes(4096);
+        let err = read_response_limited(&mut stream, Some(512))
+            .expect_err("a response past the ceiling must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("512"), "the refusal names the ceiling: {msg}");
+        assert!(msg.contains("refused"), "{msg}");
+    }
+
+    /// The ceiling must not cost the responses it is meant to admit: a body
+    /// under it parses exactly as it did before, and a body at **exactly** the
+    /// ceiling is admitted rather than refused off a `>=` slip. The `take(n+1)`
+    /// read is what makes that boundary expressible.
+    #[test]
+    fn a_response_at_or_under_the_ceiling_is_unaffected() {
+        let (status, body) = read_response_limited(&mut response_bytes(100), Some(4096))
+            .expect("well under the ceiling");
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), 100);
+
+        // Exactly at it: header + body is the whole ceiling, not one byte over.
+        let exact = response_bytes(100);
+        let total = exact.get_ref().len();
+        let (status, body) =
+            read_response_limited(&mut response_bytes(100), Some(total)).expect("exactly at it");
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), 100);
+
+        // And `None` is the historical behaviour every wallet route keeps.
+        let (status, body) =
+            read_response_limited(&mut response_bytes(9_000), None).expect("unbounded as before");
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), 9_000);
     }
 
     /// The four classes the server's pinned response wire actually produces,

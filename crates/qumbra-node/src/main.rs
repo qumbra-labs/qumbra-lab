@@ -102,7 +102,9 @@ fn usage() {
            [--yes-i-backed-up]                the non-interactive backup confirmation. Without a\n      \
                                             terminal and without this flag, `mine` REFUSES to\n      \
                                             create a wallet rather than creating one silently.\n      \
-           [--index N]                        wallet address index the payout key derives at (0)\n      \
+           [--index N]                        wallet address index the payout key derives at (0).\n      \
+                                            `mine` ALLOCATES the index so this wallet's own scan\n      \
+                                            covers what it mines; capped at 1024.\n      \
            [--listen ADDR]                    P2P bind address (default 0.0.0.0:9400)\n  \
          qumbra-node run --config FILE          run a full node (TCP + RandomX + disk persistence)\n      \
            [--rehearsal-verifier]               opt in to the NO-OP rehearsal tx verifier (devnet only)\n      \

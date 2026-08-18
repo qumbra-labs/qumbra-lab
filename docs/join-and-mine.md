@@ -246,7 +246,7 @@ file §2 and §3 tell you to write by hand.
 |---|---|
 | `--yes-i-backed-up` | the confirmation, for a run with no terminal (a systemd unit, a container). **Without a terminal and without this flag, `mine` refuses to create a wallet** rather than creating one silently — capture the mnemonic from the command's output yourself. |
 | `--rkm <64 hex>` | pay a key you already have. No wallet is read, created, or looked for; this is the manual path of the sections above, unchanged. |
-| `--seeds`, `--genesis-url`, `--listen`, `--index` | override the baked defaults (the four §1 seeds, `https://seed.qumbra.org/genesis.qmb`, `0.0.0.0:9400`, address index 0). |
+| `--seeds`, `--genesis-url`, `--listen`, `--index` | override the baked defaults (the four §1 seeds, `https://seed.qumbra.org/genesis.qmb`, `0.0.0.0:9400`, address index 0). A non-zero `--index` is **allocated** in the wallet as part of the run, so what this node mines stays inside what `scan` covers; it is capped at 1024, and a higher index is served by `qumbra-wallet address --new` plus `--rkm`. |
 
 The wallet lands in `~/.qumbra-miner/wallet`, so every wallet command in §4 works
 against it — `qumbra-wallet backup --dir ~/.qumbra-miner/wallet --reveal` shows
