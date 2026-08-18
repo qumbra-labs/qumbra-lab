@@ -5,7 +5,9 @@
 # preference that could desync from the node's genesis hash (H1).
 #
 # A v4 template makes login refuse stock-xmrig by name (#356 UNCLEAN).
-# Share-PoW is not wired yet — waits for lab #490.
+# Share-PoW: qlab_pow::RandomXHasher (feature randomx, default ON).
+# PPLNS window = 1024 accepted shares [devnet-placeholder].
+# V5 payee list is N=1 at birth (COINBASE_PAYEE_CAP_V5).
 
 listen_addr = "127.0.0.1:3333"
 share_difficulty = 1024

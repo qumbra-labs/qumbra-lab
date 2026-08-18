@@ -5,8 +5,7 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Lab #482 stage 1: the shipping pool binary — TCP stratum endpoint + job
-# lifecycle + share accounting + a template source keyed by ChainRules.form.
+# Lab #482 stage 2: share-PoW (RandomX composition), PPLNS, payee-list.
 #
 # Its own crate rather than a [[bin]] inside qlab-stratum, for the same
 # mechanical reason qumbra-faucet / qumbra-node argued: Cargo has no
@@ -15,23 +14,22 @@ publish.workspace = true
 # way: this crate depends on qlab-stratum; qlab-stratum does not know it
 # exists.
 #
-# RandomX is NOT a runtime dep of this crate (qlab-devnet / qlab-pow are
-# taken with default-features = false). Share-validation consumes
-# qlab_devnet::pow::hash_to_work_value_for (lab #490) and does not
-# re-mirror hash-byte selection here. RandomX re-hash of the blob is
-# still off this graph (claimed `result` is what the filter sees).
+# Hashing lives in qlab_pow::RandomXHasher. This crate composes it
+# behind feature `randomx` (default ON — a pool that cannot hash is
+# not a pool). Unit tests inject FixedHasher and do not construct
+# RandomXShareHasher. qlab-devnet stays default-features = false.
 
 [[bin]]
 name = "qumbra-pool"
 path = "src/main.rs"
 
+[features]
+default = ["randomx"]
+randomx = ["qlab-pow/randomx"]
+
 [dependencies]
 qlab-stratum = { path = "../qlab-stratum" }
-# Header preimage + GenesisForm / ChainRules + #490 work-value export.
-# default-features = false so this crate does not pull the RandomX C++ chain.
 qlab-devnet = { path = "../qlab-devnet", default-features = false }
-# Key-block schedule (seed_hash / next_seed_hash arithmetic). Same
-# default-features = false: we want keyblock only.
 qlab-pow = { path = "../qlab-pow", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
