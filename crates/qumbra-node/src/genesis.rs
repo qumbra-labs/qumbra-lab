@@ -675,12 +675,31 @@ impl GenesisFile {
             set_mode(&path, 0o600)?;
             paths.push(path);
         }
+        // Lab #478: on a platform without modes, `set_mode` above did nothing —
+        // 22 times, silently. That is fine for the joiner path (a public joiner
+        // holds no committee keys at all) and NOT fine for whoever mints a net,
+        // because these files land wherever the parent directory's ACL puts them.
+        // Warned once, after the loop, rather than 22 times inside it.
+        #[cfg(not(unix))]
+        eprintln!(
+            "⚠️  committee keys written WITHOUT owner-only permissions: this platform has no \
+             file modes and this build sets no ACL. {} key files in {} inherit that folder's \
+             permissions. If this is a net anyone will actually run, restrict the folder before \
+             the keys stop being derivable from the source (see the comment above this line).",
+            self.committee_keys.len(),
+            dir.display(),
+        );
         Ok(paths)
     }
 }
 
-/// Set a path's permission bits. No-op off Unix, where the concept does not apply
-/// and the deploy path (`rsync` over ssh to Debian hosts) does not exist either.
+/// Set a path's permission bits. No-op off Unix, where the concept does not
+/// apply and the deploy path (`rsync` over ssh to Debian hosts) does not exist
+/// either.
+///
+/// 🔴 Since lab #478 that no-op is REACHABLE — `qumbra-node genesis init` runs on
+/// Windows now. It is still a no-op (Windows protection is an ACL, not a mode),
+/// but its caller says so out loud rather than leaving the absence silent.
 #[cfg(unix)]
 fn set_mode(path: impl AsRef<std::path::Path>, mode: u32) -> Result<(), GenesisError> {
     use std::os::unix::fs::PermissionsExt;

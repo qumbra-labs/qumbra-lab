@@ -674,20 +674,60 @@ pub fn render_node_toml(i: &ConfigInputs) -> String {
         "# qumbra-node config — written by `qumbra-node mine` (lab #475).\n\
          # Ordinary node config: nothing here is special to `mine`, and\n\
          # `qumbra-node run --config <this file>` is what `mine` does next.\n\
-         data_dir = \"{data_dir}\"\n\
+         data_dir = {data_dir}\n\
          listen_addr = \"{listen}\"\n\
          dial_peers = [{peers}]\n\
-         genesis_file = \"{genesis}\"\n\
+         genesis_file = {genesis}\n\
          expected_genesis_hash = \"{hash}\"\n\
          mining = true\n\
          miner_rkm = \"{rkm}\"\n",
-        data_dir = i.data_dir.display(),
+        data_dir = toml_path(&i.data_dir),
         listen = i.listen_addr,
         peers = peers,
-        genesis = i.genesis_file.display(),
+        genesis = toml_path(&i.genesis_file),
         hash = i.expected_genesis_hash,
         rkm = i.miner_rkm,
     )
+}
+
+/// Render a filesystem path as a TOML string that survives being read back.
+///
+/// 🔴 **THIS IS A WINDOWS CORRECTNESS FIX, FOUND BY THE lab #478 CI LEG.**
+///
+/// `render_node_toml` used to interpolate paths into TOML *basic* strings
+/// (`data_dir = "…"`). A basic string treats `\` as an escape introducer, and a
+/// Windows path is nothing but backslashes — so
+/// `data_dir = "C:\Users\RUNNER~1\AppData\..."` made `\U` a unicode escape and
+/// the file `mine` had just written **failed to parse**:
+///
+/// ```text
+/// generated config does not parse: TOML parse error at line 4, column 17
+///   |
+/// 4 | data_dir = "C:\Users\RUNNER~1\AppData\Local\Temp\qmb_mine_prepare_fresh\data"
+///   |                 ^ invalid unicode 8-digit hex code
+/// ```
+///
+/// i.e. **`qumbra-node mine` could not work at all on Windows.** Not a test
+/// artifact — `prepare` writes the config and reads it back, and a real user's
+/// `%USERPROFILE%` path fails identically. It is the same trap the join doc warns
+/// human config-writers about; the generator walked straight into it.
+///
+/// A TOML **literal** string (single quotes) takes its bytes verbatim, which is
+/// exactly right for a path — and is identical TOML on every platform, so the
+/// unix output changes only its quote character.
+///
+/// The one thing a literal string cannot hold is a single quote (TOML gives it no
+/// escape), so a path containing `'` falls back to a basic string with `\` and
+/// `"` escaped. Rare, legal on both unix and Windows, and silently corrupting if
+/// unhandled.
+fn toml_path(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    if s.contains('\'') || s.chars().any(|c| c.is_control()) {
+        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        format!("'{s}'")
+    }
 }
 
 /// Write the config, or refuse to clobber a different one.
@@ -1331,6 +1371,63 @@ mod tests {
             NodeConfig::from_toml(&generated).expect("the generated config parses"),
             "a mine-born node must be indistinguishable from a hand-configured one"
         );
+    }
+
+    /// 🔴 **Lab #478, found by the windows CI leg: a generated config with a
+    /// Windows path did not parse, so `mine` could not work on Windows at all.**
+    ///
+    /// A TOML *basic* string treats `\` as an escape introducer, so
+    /// `data_dir = "C:\Users\..."` reads `\U` as a unicode escape and the file
+    /// `prepare` had just written was rejected by its own read-back.
+    ///
+    /// This test runs on **every** platform on purpose. The defect is a property
+    /// of the string the generator emits, not of the OS it runs on, so pinning it
+    /// only under `cfg(windows)` would leave the regression invisible to the
+    /// arm64 bar — which is exactly how it got here.
+    #[test]
+    fn a_windows_path_round_trips_through_the_generated_config() {
+        let rkm = "0100000000000000020000000000000003000000000000000400000000000000";
+        let seeds: Vec<String> = T1_SEEDS.iter().map(|s| s.to_string()).collect();
+        // The literal shape that failed on the runner, backslashes and all.
+        let data = r"C:\Users\RUNNER~1\AppData\Local\Temp\qmb_mine\data";
+        let genesis = r"C:\Users\RUNNER~1\AppData\Local\Temp\qmb_mine\genesis.qmb";
+
+        let generated = render_node_toml(&ConfigInputs {
+            data_dir: Path::new(data),
+            listen_addr: DEFAULT_LISTEN_ADDR,
+            seeds: &seeds,
+            genesis_file: Path::new(genesis),
+            expected_genesis_hash: T1_EXPECTED_GENESIS_HASH,
+            miner_rkm: rkm,
+        });
+        let cfg = NodeConfig::from_toml(&generated).unwrap_or_else(|e| {
+            panic!("a generated config must parse — that is the whole defect: {e}\n{generated}")
+        });
+        // Parsing is not enough: the bytes must survive, or `mine` would run
+        // against a *different* directory than the one it prepared.
+        assert_eq!(cfg.data_dir, Path::new(data), "the path must round-trip verbatim");
+        assert_eq!(cfg.genesis_file, Path::new(genesis));
+    }
+
+    /// The one input a TOML literal string cannot carry is a single quote, so the
+    /// generator falls back to an escaped basic string. Legal on both unix and
+    /// Windows, and silently corrupting if unhandled.
+    #[test]
+    fn a_path_containing_a_quote_still_round_trips() {
+        let rkm = "0100000000000000020000000000000003000000000000000400000000000000";
+        let seeds: Vec<String> = T1_SEEDS.iter().map(|s| s.to_string()).collect();
+        let data = r"/home/o'brien\odd/data";
+        let generated = render_node_toml(&ConfigInputs {
+            data_dir: Path::new(data),
+            listen_addr: DEFAULT_LISTEN_ADDR,
+            seeds: &seeds,
+            genesis_file: Path::new("/m/genesis.qmb"),
+            expected_genesis_hash: T1_EXPECTED_GENESIS_HASH,
+            miner_rkm: rkm,
+        });
+        let cfg = NodeConfig::from_toml(&generated)
+            .unwrap_or_else(|e| panic!("quoted-path config must parse: {e}\n{generated}"));
+        assert_eq!(cfg.data_dir, Path::new(data));
     }
 
     /// Re-running `mine` on its own directory is a no-op; re-running it over a

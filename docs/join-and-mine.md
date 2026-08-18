@@ -77,15 +77,18 @@ published as tarballs on the public repo's releases page:
 > path.** The release lane exists ([`release-binaries.yml`](../.github/workflows/release-binaries.yml))
 > and is dispatched by hand; the T1 announcement names the tag once one is published.
 
-| tarball | for |
+| archive | for |
 |---|---|
 | `…-linux-x86_64-glibc.tar.gz` | Intel/AMD Linux, glibc 2.36+ (Debian 12, Ubuntu 22.04+) |
 | `…-linux-aarch64-glibc.tar.gz` | arm64 Linux — what the testnet fleet itself runs |
 | `…-macos-arm64.tar.gz` | Apple Silicon, macOS 11+ |
+| `…-windows-x86_64.zip` | Windows 10/11 x64 — **native, no WSL2** (added by lab #478) |
 
-Each holds `qumbra-node`, `qumbra-wallet` and a `PROVENANCE.txt`. **There is no native
-Windows build** — the node has unix-only dependencies; under WSL2, use the Linux x86_64
-tarball exactly as a Linux user would.
+Each holds `qumbra-node`, `qumbra-wallet` and a `PROVENANCE.txt`. The Windows archive is a
+`.zip` rather than a `.tar.gz` and its binaries carry `.exe`; everything else about it is the
+same artifact, built and asserted by the same release lane. **It appears from the first
+release cut after 2026-08-18** — an older tag on the releases page has three archives, not
+four, and that is a vintage difference rather than a missing file.
 
 ```sh
 # 1 — download the tarball for your platform and SHA256SUMS from the release page, then:
@@ -113,19 +116,89 @@ binary from the release page would mean the artifact is not what it claims to be
 them and Gatekeeper refuses to run them. Fetch with `curl`, or clear the attribute:
 `xattr -d com.apple.quarantine qumbra-node qumbra-wallet`.
 
-### Windows: use WSL2 (native support is in progress)
+### Windows: native (added 2026-08-18, lab #478)
 
-There is no native Windows binary yet. **WSL2 is the supported path today**, and it mines at
-effectively native speed (mining is pure CPU; WSL2's overhead lives in IO):
+`windows-x86_64.zip` holds `qumbra-node.exe` and `qumbra-wallet.exe`, built for
+`x86_64-pc-windows-msvc` with the same RandomX C++ implementation every other platform uses.
+They are the same binaries in every sense that matters to the chain: CI runs RandomX's four
+official reference vectors on the MSVC build, so a Windows miner's hashes are the network's
+hashes, not a near-miss.
 
-1. Admin PowerShell: `wsl --install`, then reboot (installs Ubuntu, glibc ≥ 2.36 — fine).
-2. Inside the Ubuntu terminal, follow this document from §1 using the
-   `linux-x86_64-glibc` tarball. Everything below applies unchanged.
-3. Keep the laptop plugged in and set Windows power settings not to sleep — a sleeping
-   host mines nothing.
+Everything from §2 onward applies unchanged — same `genesis.qmb`, same `node.toml` fields,
+same seeds. What follows is only what is *different* about Windows.
 
-Native Windows support is dispatched and tracked; when it lands, the release page gains a
-`windows-x86_64` artifact and this section shrinks to one line.
+**1. Download and verify, in PowerShell.** Windows has no `sha256sum`:
+
+```powershell
+# from the release page: the zip for your platform, and SHA256SUMS
+Get-FileHash .\qumbra-t1-<shortrev>-windows-x86_64.zip -Algorithm SHA256
+# compare the printed hash against the matching line in SHA256SUMS — by eye, all 64 chars
+Expand-Archive .\qumbra-t1-<shortrev>-windows-x86_64.zip -DestinationPath .
+cd qumbra-t1-<shortrev>-windows-x86_64
+.\qumbra-node.exe halt-status
+```
+
+The `halt-status` reading is the same one §1 describes above: `build rev:` must match the
+release notes, and `halt plan:` must say `no halt scheduled` and not **ARMED**.
+
+**2. 🔴 SmartScreen will stop you, and it is right to.** These executables are **unsigned** —
+there is no code-signing certificate on this project, and buying one is a separate decision
+nobody has taken. The first run of either binary shows *"Windows protected your PC"*. The
+path through it is **More info → Run anyway**. Microsoft Defender may additionally flag a CPU
+miner on reputation alone.
+
+This is the honest position and not a reassurance: an unsigned binary from a private repo is
+exactly the shape of thing SmartScreen exists to warn about, and *"click through the security
+warning"* is advice you should be suspicious of by default. The only thing that makes it
+reasonable here is that you can check the download yourself — **verify the SHA-256 against
+SHA256SUMS before you click Run anyway**, not after.
+
+**3. Paths in `node.toml` need single quotes.** TOML's double-quoted strings treat `\` as an
+escape character, so `data_dir = "C:\Users\you\qumbra-data"` is either a parse error or a
+different directory than you meant. Use a TOML *literal* string, or forward slashes:
+
+```toml
+data_dir = 'C:\Users\you\qumbra-data'          # literal string — backslashes are literal
+genesis_file = 'C:\Users\you\genesis.qmb'
+# or, equally valid on Windows:
+# data_dir = "C:/Users/you/qumbra-data"
+```
+
+**4. Run it from a console you opened, and stop it with Ctrl-C.** Open PowerShell or Windows
+Terminal and run `.\qumbra-node.exe run --config node.toml` there — do not double-click it.
+**Ctrl-C is the stop that reliably flushes the snapshot.** Closing the console window flushes
+too, but Windows gives any program about five seconds after a window-close before killing it,
+and a node busy inside a RandomX round can miss that budget.
+
+Nothing is lost when it does: the block log is fsync'd per record and is the source of truth,
+so a node that missed its snapshot flush replays the log on next start and reaches exactly the
+same state. What a missed flush costs is **replay time**, not coins or history.
+
+**5. The wallet's seed file is not owner-only on Windows.** On Linux and macOS
+`qumbra-wallet keygen` writes `wallet.seed` with mode `0600`. Windows has no such mode and
+this build does not set an ACL, so the file inherits whatever the folder gives it — under your
+own profile that is normally you *plus* SYSTEM and Administrators. `keygen` prints this rather
+than claiming a protection it does not have. To make the wallet folder owner-only, run once:
+
+```powershell
+icacls "$env:USERPROFILE\.qumbra-wallet" /inheritance:r /grant:r "${env:USERNAME}:(OI)(CI)F"
+```
+
+Anyone who can read that file owns every coin the wallet holds.
+
+**6. Keep the machine awake.** Set Windows power settings not to sleep, and keep a laptop
+plugged in — a sleeping host mines nothing.
+
+**Not in this port** (named so nobody looks for it): no Windows service wrapper — to survive
+sign-out, register the `run` command as a Task Scheduler task with *"Run whether user is
+logged on or not"*, which is outside what this guide covers. No code signing. No ARM Windows
+build.
+
+### Windows: WSL2
+
+Still supported and unchanged: `wsl --install` from an admin PowerShell, then follow this
+document from §1 inside Ubuntu with the `linux-x86_64-glibc` tarball. It mines at effectively
+native speed. With a native build available, WSL2 is now the fallback rather than the path.
 
 ## 2. Join as a non-mining node
 
@@ -255,7 +328,11 @@ a prepared directory changes nothing and just starts the node; if you have edite
 `node.toml` by hand it refuses rather than overwriting your edit, and tells you to
 use `run --config` instead.
 
-### Platform boundary — CORRECTED 2026-08-17 (was: Linux/glibc only)
+On Windows this is `.\qumbra-node.exe mine --dir $HOME\.qumbra-miner` in PowerShell,
+and it is the shortest native path there is — it writes the `node.toml` itself, so
+the TOML backslash trap in §1's Windows section cannot bite you.
+
+### Platform boundary — CORRECTED 2026-08-17 (was: Linux/glibc only), Windows added 2026-08-18
 
 > **Dated correction (2026-08-17, lab #437): native macOS mining is PERMITTED.** The original
 > red boundary below was conditioned on the deterministic-emission boundary not yet being
@@ -266,6 +343,16 @@ use `run --config` instead.
 > macOS arm64 build joined T1 through the public entry points and won 40 accepted, finalized
 > blocks in its first ~100 minutes (lab #437). The container remains the paved, reproducible
 > path; a native build is now a supported alternative.
+>
+> **Native Windows x64 mining is permitted on the same grounds (2026-08-18, lab #478)**, and
+> the platform-identity question a new miner platform actually raises is answered by
+> measurement rather than by the argument above: CI runs RandomX's four official reference
+> vectors against the MSVC-built C++ on every windows leg, plus the check that the recommended
+> flag set (JIT + hardware AES) and portable `FLAG_DEFAULT` agree — i.e. a Windows miner cannot
+> hash differently because of what its CPU supports. 🔴 **What is NOT yet evidence: no Windows
+> machine has mined a block on T1.** The claim on this line is "builds, hashes identically,
+> preflights clean against the published genesis", not "verified live" — that is what the
+> macOS line has and Windows does not, and the two should not be read as the same claim.
 >
 > **If you build from source, one flag is load-bearing**: a bare `cargo build -p qumbra-node`
 > produces the ARMED variant, which halts at 8,640 and cannot follow today's chain. Build with
@@ -345,6 +432,11 @@ cover the shortest user journey; replace `RECIPIENT_QADDR` and keep in mind that
 **bessel** (`100,000,000` bessel = `1 QMB`;
 [`emission.rs:34-35`](../crates/qlab-node/src/emission.rs#L34-L35)).
 Command 3 uses `curl` and `jq`; `qumbra-wallet --help` gives the full command reference.
+
+**On Windows**, the same five commands run in PowerShell with `.\qumbra-wallet.exe` in place of
+`qumbra-wallet`; `$HOME` and `$env:USERPROFILE` both work for `--dir`. Command 3 needs a
+PowerShell equivalent, since `jq` is not present by default:
+`$TIP = (Invoke-RestMethod https://explorer.qumbra.org/v1/health.json).chain.tip_height`.
 
 ```sh
 # 1 — create the wallet; this prints address [0]
