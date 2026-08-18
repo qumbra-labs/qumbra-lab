@@ -62,7 +62,15 @@ pub const BLOCK_LOG: &str = "blocks.log";
 /// The snapshot file name (fast-restart derived state).
 pub const SNAPSHOT: &str = "snapshot.bin";
 /// The temp name a snapshot is written to before the atomic rename.
-const SNAPSHOT_TMP: &str = "snapshot.bin.tmp";
+///
+/// `pub` since lab #478, for one reason: a test that wants to make the snapshot
+/// write *fail* has to be able to name the file the write goes to. The previous
+/// way of failing it — marking the data dir read-only — is a unix-only concept
+/// and does nothing on Windows, so the test that depended on it asserted against
+/// a flush that had quietly succeeded. Blocking this exact path is portable, and
+/// naming the constant rather than re-typing the string is what keeps the
+/// injection from going vacuous if the file is ever renamed.
+pub const SNAPSHOT_TMP: &str = "snapshot.bin.tmp";
 
 /// One record in the append-only log. Finalizations are logged alongside blocks
 /// so a from-genesis replay reconstructs the finalized head too (a block-only
