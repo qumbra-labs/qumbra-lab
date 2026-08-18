@@ -791,4 +791,50 @@ mod tests {
         assert_eq!(g.state_of(r2), Some(RequestState::Queued { position: 1 }));
         assert_eq!(g.state_of(r3), Some(RequestState::Queued { position: 2 }));
     }
+
+    /// 🔴 The parked span contexts are a **bounded** map: one entry per live queued
+    /// request, taken back out at the terminal state. The failure this guards
+    /// against is a long-running faucet whose trace-link map grows by one entry per
+    /// request served, forever — a leak whose only symptom is memory.
+    #[test]
+    fn parked_request_span_contexts_do_not_accumulate() {
+        use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState};
+
+        let cx = |n: u128| {
+            SpanContext::new(
+                TraceId::from_bytes(n.to_be_bytes()),
+                SpanId::from_bytes((n as u64).to_be_bytes()),
+                TraceFlags::SAMPLED,
+                false,
+                TraceState::default(),
+            )
+        };
+
+        let mut g = gate();
+        assert_eq!(g.parked_request_spans(), 0, "nothing parked before a request");
+
+        let (r1, _) = g.accept("203.0.113.1", addr(1), None, 0).unwrap();
+        let (r2, _) = g.accept("203.0.113.2", addr(2), None, 1_000).unwrap();
+        g.remember_request_span(r1, cx(1));
+        g.remember_request_span(r2, cx(2));
+        assert_eq!(g.parked_request_spans(), 2);
+
+        // A peek is idempotent — a retried grant links on every attempt.
+        assert_eq!(g.peek_request_span(r1).map(|c| c.span_id()), Some(cx(1).span_id()));
+        assert_eq!(g.peek_request_span(r1).map(|c| c.span_id()), Some(cx(1).span_id()));
+        assert_eq!(g.parked_request_spans(), 2, "a peek must not consume");
+
+        // A take is what a terminal state does, and it happens exactly once.
+        assert_eq!(g.take_request_span(r1).map(|c| c.span_id()), Some(cx(1).span_id()));
+        assert_eq!(g.parked_request_spans(), 1);
+        assert!(g.take_request_span(r1).is_none(), "a second take finds nothing");
+        assert!(g.peek_request_span(r1).is_none());
+
+        assert!(g.take_request_span(r2).is_some());
+        assert_eq!(g.parked_request_spans(), 0, "nothing is left behind");
+
+        // A receipt that never had a context parked (no tracer installed) is not an
+        // error — it is the unit-test configuration, and it must be a plain miss.
+        assert!(g.take_request_span(9_999).is_none());
+    }
 }

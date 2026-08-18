@@ -177,6 +177,30 @@ impl Telemetry {
         Self::init_with_metrics(Arc::new(FaucetMetrics::new()))
     }
 
+    /// Build and install a tracer around a **caller-supplied** span exporter,
+    /// bypassing the environment gate entirely.
+    ///
+    /// This is the seam `tests/otel_spans.rs` uses: the span tree, the resource
+    /// attributes and the parent/child edges are asserted against an in-process
+    /// exporter rather than a live collector, and — the point — against *this*
+    /// function's resource and *this* function's `install`, not a copy of them
+    /// written in the test. A test that builds its own provider proves that the
+    /// test's provider works.
+    ///
+    /// `with_simple_exporter`, not batch: a test that has to sleep for a flush is a
+    /// test that is flaky on a loaded runner.
+    pub fn install_with_exporter<E>(exporter: E, metrics: Arc<FaucetMetrics>) -> Telemetry
+    where
+        E: opentelemetry_sdk::trace::SpanExporter + 'static,
+    {
+        let provider = SdkTracerProvider::builder()
+            .with_resource(resource())
+            .with_simple_exporter(exporter)
+            .build();
+        install(&provider);
+        Telemetry { provider, endpoint: Some("in-process exporter".to_string()), metrics }
+    }
+
     /// [`Telemetry::init`], with a metrics registry the caller already holds.
     pub fn init_with_metrics(metrics: Arc<FaucetMetrics>) -> Telemetry {
         let endpoint = std::env::var(OTLP_ENDPOINT_ENV)
@@ -184,12 +208,7 @@ impl Telemetry {
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let resource = Resource::builder()
-            .with_service_name(SERVICE_NAME)
-            .with_attributes([KeyValue::new("service.namespace", SERVICE_NAMESPACE)])
-            .build();
-
-        let mut builder = SdkTracerProvider::builder().with_resource(resource);
+        let mut builder = SdkTracerProvider::builder().with_resource(resource());
         let mut exporting = None;
         if let Some(ep) = endpoint.as_deref() {
             match opentelemetry_otlp::SpanExporter::builder()
@@ -251,6 +270,19 @@ impl Telemetry {
             eprintln!("qumbra-faucet: tracer shutdown: {e}");
         }
     }
+}
+
+/// The OTel resource every span this binary emits carries.
+///
+/// `Resource::builder` (not `builder_empty`) so `OTEL_RESOURCE_ATTRIBUTES` and the
+/// SDK's own `telemetry.sdk.*` still merge in — an operator can add
+/// `deployment.environment`; what they cannot do is rename the service out from
+/// under the correlation the plan's standards line pins.
+pub fn resource() -> Resource {
+    Resource::builder()
+        .with_service_name(SERVICE_NAME)
+        .with_attributes([KeyValue::new("service.namespace", SERVICE_NAMESPACE)])
+        .build()
 }
 
 /// Install `provider` as the process's `tracing` subscriber. Returns whether this

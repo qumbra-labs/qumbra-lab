@@ -835,6 +835,12 @@ pub fn handle_request(
     // checked and the token buckets are charged, and it is the one part of a request
     // that can be slow for a reason an operator would want to see separated from the
     // page render.
+    // Read the REQUEST span's context before opening the gate child — a link
+    // pointing at `faucet.gate` would still resolve to the same trace, but the
+    // question a reader asks of a grant is "which request caused this", and the
+    // answer to that is the request span, not the innermost stage of it.
+    let request_cx = crate::telemetry::current_span_context();
+
     let gate_span = tracing::info_span!("faucet.gate");
     let outcome = {
         let _enter = gate_span.enter();
@@ -849,7 +855,7 @@ pub fn handle_request(
             // `faucet.dispense` span carries a **link** to it. Two traces, one
             // documented edge, and the ~2.3 s proof is a span in the one where it
             // actually runs.
-            if let Some(cx) = crate::telemetry::current_span_context() {
+            if let Some(cx) = request_cx.clone() {
                 g.remember_request_span(*receipt, cx);
             }
         }
