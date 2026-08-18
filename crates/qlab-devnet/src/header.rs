@@ -210,6 +210,15 @@ impl BlockHeader {
     /// body it was not paired with is rejected at the first binding check, which
     /// is the whole point of deleting the exemption.
     pub fn genesis(difficulty: u64, timestamp: u64) -> Self {
+        Self::genesis_for(GenesisForm::V4, difficulty, timestamp)
+    }
+
+    /// [`Self::genesis`] under an explicit genesis form (lab #470 stage 4a):
+    /// the empty genesis body is bound under **that form's** commitment — on a
+    /// v5 net that is `BlockBody::default().commitment_v5()`, the value the
+    /// stage-3 golden pre-registered (`82c2707b…7ea5`) as what a v5 genesis
+    /// header must bind.
+    pub fn genesis_for(form: GenesisForm, difficulty: u64, timestamp: u64) -> Self {
         Self {
             prev: ZERO_HASH,
             height: 0,
@@ -217,8 +226,11 @@ impl BlockHeader {
             difficulty,
             nonce: 0,
             // The genesis body is the empty body — bound here, not exempted
-            // (issue #115).
-            tx_body_commitment: BlockBody::default().commitment(),
+            // (issue #115), under the net's form.
+            tx_body_commitment: match form {
+                GenesisForm::V4 => BlockBody::default().commitment(),
+                GenesisForm::V5 => BlockBody::default().commitment_v5(),
+            },
             aggregate_proof: AggregateProofSlot,
             epoch_supply_attestation: EpochSupplyAttestation,
         }
@@ -408,6 +420,21 @@ mod tests {
         let mut h = v5_fixture();
         h.height = V5_MAX_HEIGHT + 1;
         let _ = h.preimage_for(GenesisForm::V5);
+    }
+
+    /// The stage-3 pre-registered tripwire (lab #470): a v5 genesis header
+    /// binds the empty body's v5 commitment — `82c2707b…7ea5` — and the v4
+    /// constructor is byte-identical to what it always was.
+    #[test]
+    fn genesis_for_binds_each_forms_empty_body() {
+        let v4 = BlockHeader::genesis(1_000, 0);
+        assert_eq!(v4, BlockHeader::genesis_for(GenesisForm::V4, 1_000, 0));
+        let v5 = BlockHeader::genesis_for(GenesisForm::V5, 1_000, 0);
+        assert_eq!(v5.tx_body_commitment, BlockBody::default().commitment_v5());
+        let hex: String =
+            v5.tx_body_commitment.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "82c2707bdf9790b25ef44355cb44cfd7faa6aba28d5db184b57edf83e7ba7ea5");
+        assert_ne!(v5.tx_body_commitment, v4.tx_body_commitment);
     }
 
     #[test]

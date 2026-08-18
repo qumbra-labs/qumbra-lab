@@ -293,6 +293,28 @@ pub fn coinbase_note_leaf(height: u64, body: &BlockBody) -> Option<Hash32> {
     coinbase_note(height, body).map(|n| digest_bytes(&n.commitment()))
 }
 
+/// [`coinbase_note_leaf`] under an explicit genesis form (lab #470 stage 4a):
+/// the v5 leaf comes from the v5 note derivation (payee index 0 at the birth
+/// cap) — same value arithmetic, v5 lanes.
+pub fn coinbase_note_leaf_for(
+    form: qlab_devnet::forms::GenesisForm,
+    height: u64,
+    body: &BlockBody,
+) -> Option<Hash32> {
+    match form {
+        qlab_devnet::forms::GenesisForm::V4 => coinbase_note_leaf(height, body),
+        qlab_devnet::forms::GenesisForm::V5 => coinbase_note_parts_v5(
+            height,
+            0,
+            body.coinbase_rkm,
+            body.coinbase,
+            body.total_fees(),
+            body.total_name_burn(),
+        )
+        .map(|n| digest_bytes(&n.commitment())),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The maturity append schedule (issue #102, option (b))
 // ---------------------------------------------------------------------------
@@ -355,8 +377,20 @@ pub fn matured_coinbase_leaf<F>(height: u64, ancestor_body: F) -> Option<Hash32>
 where
     F: FnOnce(u64) -> Option<BlockBody>,
 {
+    matured_coinbase_leaf_for(qlab_devnet::forms::GenesisForm::V4, height, ancestor_body)
+}
+
+/// [`matured_coinbase_leaf`] under an explicit genesis form (lab #470 4a).
+pub fn matured_coinbase_leaf_for<F>(
+    form: qlab_devnet::forms::GenesisForm,
+    height: u64,
+    ancestor_body: F,
+) -> Option<Hash32>
+where
+    F: FnOnce(u64) -> Option<BlockBody>,
+{
     let minted_at = matures_coinbase_minted_at(height)?;
-    coinbase_note_leaf(minted_at, &ancestor_body(minted_at)?)
+    coinbase_note_leaf_for(form, minted_at, &ancestor_body(minted_at)?)
 }
 
 /// Whether a coinbase note minted at a given height has entered the commitment

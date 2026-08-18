@@ -738,7 +738,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         //     that is all the genesis file describes. `open` replays this data dir's
         //     committee-punishment ledger onto it (issue #133); a ledger it cannot
         //     honour is an error here and the node does not start.
-        let mut adapter = NodeAdapter::open(&config.data_dir, committee, pow, verifier, sim)?;
+        // Lab #470 stage 4a: the form is installed AT CONSTRUCTION — before
+        // the datadir replay — from the same genesis file the ChainRules
+        // install below reads. One source, two arrival points, both checked.
+        let mut adapter =
+            NodeAdapter::open_for(genesis.form()?, &config.data_dir, committee, pow, verifier, sim)?;
         // Issue #133's counter. Printed on EVERY start, zero included: the silence
         // after a restart is what made this class of defect invisible five times over,
         // because a node that restored nothing and a node that had nothing to restore

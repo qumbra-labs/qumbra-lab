@@ -350,10 +350,19 @@ pub struct MemChainStore {
 
 impl MemChainStore {
     /// Start from a genesis block (its header's `prev` must be ZERO, height 0).
+    /// **v4 identities** — a v5 net starts via [`MemChainStore::new_for`].
     pub fn new(genesis: StoredBlock) -> Self {
+        Self::new_for(qlab_devnet::forms::GenesisForm::V4, genesis)
+    }
+
+    /// [`MemChainStore::new`] under an explicit genesis form (lab #470 stage
+    /// 4a): the inner [`ChainState`] carries the form, and every later
+    /// `put_block` identity comes from it, so this is the store's ONE
+    /// identity-keying point.
+    pub fn new_for(form: qlab_devnet::forms::GenesisForm, genesis: StoredBlock) -> Self {
         let header = genesis.header();
-        let chain = ChainState::new(header);
-        let ghash = header.header_hash();
+        let chain = ChainState::new_for(form, header);
+        let ghash = header.header_hash_for(form);
         let mut blocks = HashMap::new();
         blocks.insert(ghash, genesis);
         Self { chain, blocks, genesis: ghash }

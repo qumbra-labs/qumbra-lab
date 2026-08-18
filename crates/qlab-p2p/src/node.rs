@@ -1235,7 +1235,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
 
     /// Ingest a locally-produced header and announce it.
     pub fn announce_header(&mut self, header: BlockHeader) {
-        let id = header.header_hash();
+        let id = header.header_hash_for(self.node.genesis_form());
         if self.node.ingest_header(header).should_relay() {
             self.seen.insert(id);
             self.relay_inv(InvItem { kind: InvKind::Block, id }, None);
@@ -1308,7 +1308,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         coinbase_rkm: [u64; 4],
         nonce: u64,
     ) {
-        let bh = header.header_hash();
+        let bh = header.header_hash_for(self.node.genesis_form());
         // Ingest first, and do not put on the wire what our own node rejects
         // (issue #77, the own-announce seam): a locally-produced header/body pair
         // that fails the binding is a local bug, and announcing it would make this
@@ -2266,7 +2266,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return;
             }
         };
-        let id = header.header_hash();
+        let id = header.header_hash_for(self.node.genesis_form());
         // 🔴 **Issue #229 — the answer that was easiest to leave out.** A peer
         // answers `GetData(Block)` with a bare `Header` when it holds the header and
         // does **not possess the body** (`on_getdata`'s `None` arm; #199's honest
@@ -2638,7 +2638,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                     CheckpointHeaderOutcome::AboveCheckpoint => {}
                 }
             }
-            let id = h.header_hash();
+            let id = h.header_hash_for(self.node.genesis_form());
             match self.node.ingest_header(h) {
                 IngestOutcome::Accepted => {
                     accepted += 1;
@@ -2761,7 +2761,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             return CheckpointHeaderOutcome::Buffered;
         }
 
-        if header.header_hash() != sync.checkpoint.block_hash {
+        if header.header_hash_for(self.node.genesis_form()) != sync.checkpoint.block_hash {
             // A fully linked span landing on the wrong hash at the checkpoint
             // height is a forged chain. Only the peer that delivered this
             // provably-wrong frontier header is attributable — an honest prefix
@@ -2784,7 +2784,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         match self.node.ingest_finalized_headers(&sync.headers) {
             IngestOutcome::Accepted => {
                 for buffered in sync.headers {
-                    self.seen.insert(buffered.header_hash());
+                    self.seen.insert(buffered.header_hash_for(self.node.genesis_form()));
                 }
                 println!(
                     "CHECKPOINT_SYNC event=admit peer={} checkpoint={} headers={} pow=skipped",
@@ -2833,7 +2833,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 return;
             }
         };
-        let bh = ann.header.header_hash();
+        let bh = ann.header.header_hash_for(self.node.genesis_form());
         // Issue #229: the peer served the whole body. Recorded **before** the
         // satisfaction checks below, because the case that matters is the one where
         // the entry is NOT cleared — a body that arrived and was not applied leaves

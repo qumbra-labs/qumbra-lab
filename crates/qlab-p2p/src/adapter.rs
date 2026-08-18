@@ -58,10 +58,8 @@ use qlab_node::metrics::Metrics;
 use qlab_node::recovery::Finalizer;
 use qlab_node::round::{ObsClock, RoundLedger, SlotContext, VoteRejects};
 use qlab_node::telemetry::{AppliedTip, StateLag};
-use qlab_node::{
-    genesis_block, FinalizeOutcome, MemNode, Mempool, MempoolError, NodeError, NodeState as _,
-    RecoveryReport, RewindReport,
-};
+use qlab_node::{genesis_block_for, genesis_block, FinalizeOutcome, MemNode, Mempool, MempoolError, NodeError, NodeState as _,
+    RecoveryReport, RewindReport,};
 use qlab_devnet::body::TxVerifier;
 
 use crate::bodywait::{AskSetObservation, MineDuty, RejoinGate};
@@ -604,7 +602,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// tests use a small epoch length to cross boundaries).
     pub fn with_epoch(committee: EpochCommittee, pow: P, verifier: V, sim: SimConfig) -> Self {
         let state = MemNode::in_memory(genesis_block(sim.genesis_difficulty, 0));
-        Self::assemble(committee, pow, verifier, sim, state)
+        Self::assemble(GenesisForm::V4, committee, pow, verifier, sim, state)
     }
 
     /// New **disk-backed** adapter (M10-T0-1, `qumbra-node` binary): the state
@@ -628,10 +626,25 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         verifier: V,
         sim: SimConfig,
     ) -> Result<Self, NodeError> {
+        Self::open_for(GenesisForm::V4, dir, committee, pow, verifier, sim)
+    }
+
+    /// [`Self::open`] under an explicit genesis form (lab #470 stage 4a) — the
+    /// binary's seam: the form comes off the loaded genesis file BEFORE the
+    /// datadir is replayed, so every replay identity, the stored-binding form
+    /// and this adapter's chain/rules are keyed consistently from one value.
+    pub fn open_for(
+        form: GenesisForm,
+        dir: impl AsRef<std::path::Path>,
+        committee: CommitteeState,
+        pow: P,
+        verifier: V,
+        sim: SimConfig,
+    ) -> Result<Self, NodeError> {
         let dir = dir.as_ref().to_path_buf();
         let ec = EpochCommittee::genesis(EpochSchedule::new(EPOCH_LENGTH_BLOCKS), committee);
-        let state = MemNode::open(&dir, genesis_block(sim.genesis_difficulty, 0))?;
-        let mut me = Self::assemble(ec, pow, verifier, sim, state);
+        let state = MemNode::open_for(form, &dir, genesis_block_for(form, sim.genesis_difficulty, 0))?;
+        let mut me = Self::assemble(form, ec, pow, verifier, sim, state);
         me.dir = Some(dir.clone());
         // Restart-resume the in-memory fork-choice header chain from the persisted
         // block log: the state machine is the durable source of truth, so on open
@@ -716,15 +729,16 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// Assemble the adapter around an already-built state machine (shared by the
     /// in-memory and disk-backed constructors).
     fn assemble(
+        form: GenesisForm,
         committee: EpochCommittee,
         pow: P,
         verifier: V,
         sim: SimConfig,
         state: MemNode,
     ) -> Self {
-        let genesis = BlockHeader::genesis(sim.genesis_difficulty, 0);
+        let genesis = BlockHeader::genesis_for(form, sim.genesis_difficulty, 0);
         NodeAdapter {
-            chain: ChainState::new(genesis),
+            chain: ChainState::new_for(form, genesis),
             pow,
             state,
             mempool: Mempool::default(),
@@ -741,7 +755,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             nonce_budget: sim.mine_nonce_budget,
             clock: 0,
             mining_clock: MiningClock::default(),
-            rules: ChainRules::V1_0,
+            rules: ChainRules { form, halt: qlab_devnet::halt::RuleSchedule::V1_0 },
             ingest_counters: IngestCounters::default(),
             rounds: RoundLedger::default(),
             metrics: Metrics::new(),
@@ -902,12 +916,19 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// file's `format_version` and the compile-time `RELEASE` + halt marker).
     pub fn set_chain_rules(&mut self, rules: ChainRules) {
         self.rules = rules;
-        // Block identities are the header hash under the net's form, and the
-        // chain was built (genesis-only) before the rules were installed — the
-        // startup ordering `open → set_chain_rules → run`. `rekey_genesis`
-        // panics if anything was inserted first, making that ordering a checked
-        // invariant instead of a comment.
-        self.chain.rekey_genesis(rules.form);
+        // Block identities are the header hash under the net's form. The
+        // binary's path arrives here with the form already installed at
+        // construction (`open_for`), so these are no-ops there; for an
+        // in-memory adapter built form-less, the one legal moment to re-key is
+        // before anything was inserted/applied — both re-keys panic otherwise,
+        // making install-before-run a checked invariant across BOTH identity
+        // holders (lab #470 stage 4a: the invariant extended to the state
+        // node, per the stage-1 ruling's condition).
+        self.state.rekey_genesis(rules.form);
+        // The fork-choice chain is re-adopted FROM the re-keyed state node —
+        // one source for the genesis identity and its re-bound header, exactly
+        // like `open`'s restart-resume does.
+        self.chain = self.state.chain().chain().clone();
     }
 
     /// The installed rule schedule (the halt half of [`Self::chain_rules`]).
@@ -1469,7 +1490,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         if header.height == 0 {
             return false;
         }
-        if self.state.chain().contains(&header.header_hash()) {
+        if self.state.chain().contains(&header.header_hash_for(self.rules.form)) {
             return false;
         }
         let state_tip = self.state.tip_height();
@@ -1489,7 +1510,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         if !self.is_body_worth_holding(&header) {
             return;
         }
-        let key = (header.height, header.header_hash());
+        let key = (header.height, header.header_hash_for(self.rules.form));
         let weight = body_weight(&body);
         if let Some((_, old)) = self.pending_bodies.insert(key, (header, body)) {
             // Re-announce of a body we already hold: replace, and do not double-count.
@@ -1746,7 +1767,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// Insert a header whose validation gate has already succeeded, preserving the
     /// ordinary epoch and block-interval side effects.
     fn insert_validated_header(&mut self, header: BlockHeader) -> IngestOutcome {
-        let header_hash = header.header_hash();
+        let header_hash = header.header_hash_for(self.rules.form);
         // Chain-time gap to the parent, captured BEFORE the insert while the parent
         // is unambiguous (issue #87). Observed only when this header becomes the tip,
         // so the histogram describes the adopted chain rather than every side fork.
@@ -1793,7 +1814,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         // header field. Its verdict cannot change with later chain state. Check the
         // release-height gate first so a halted binary keeps ignoring above-H input
         // even if such a header was learned under a previous rule schedule.
-        let header_hash = header.header_hash();
+        let header_hash = header.header_hash_for(self.rules.form);
         if self.chain.header(&header_hash).is_some() {
             return IngestOutcome::Duplicate;
         }
@@ -1934,7 +1955,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         let body = template.body;
         let parent = *self.chain.header(&parent_hash)?;
         let candidate_height = parent.height + 1;
-        let bc = body.commitment_at(candidate_height);
+        let bc = match self.rules.form {
+            GenesisForm::V4 => body.commitment_at(candidate_height),
+            GenesisForm::V5 => body.commitment_v5(),
+        };
         let difficulty = expected_difficulty(&self.chain, &parent_hash, self.block_time)?;
         let timestamp = self.next_timestamp(&parent);
         let candidate =
@@ -2142,7 +2166,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// `false` for everything and stays on today's paths.
     fn block_is_settled_history(&self, header: &BlockHeader) -> bool {
         self.chain.finalized_height().is_some_and(|height| header.height <= height)
-            && self.chain.main_chain_hash_at(header.height) == Some(header.header_hash())
+            && self.chain.main_chain_hash_at(header.height) == Some(header.header_hash_for(self.rules.form))
     }
 
     fn reject_reason(err: &MempoolError) -> &'static str {
@@ -2377,7 +2401,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
         let Some(last) = headers.last() else {
             return IngestOutcome::Rejected("empty checkpoint header span");
         };
-        if last.height != checkpoint.height || last.header_hash() != checkpoint.block_hash {
+        if last.height != checkpoint.height || last.header_hash_for(self.rules.form) != checkpoint.block_hash {
             return IngestOutcome::Rejected("checkpoint header frontier mismatch");
         }
         if first.height == 0
@@ -2392,10 +2416,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> BlockIngest for NodeAdapter<P, V> {
             if !self.rules.halt.accepts_height(header.height) {
                 return IngestOutcome::Ignored("above halt height");
             }
-            if self.chain.header(&header.header_hash()).is_some() {
+            if self.chain.header(&header.header_hash_for(self.rules.form)).is_some() {
                 return IngestOutcome::Duplicate;
             }
-            if header.prev != parent.header_hash() || header.height != parent.height + 1 {
+            if header.prev != parent.header_hash_for(self.rules.form) || header.height != parent.height + 1 {
                 return IngestOutcome::Rejected("non-contiguous checkpoint header span");
             }
             if header.timestamp < parent.timestamp {
@@ -6776,4 +6800,64 @@ mod tests {
             assert_eq!(all[i].to_string(), *t);
         }
     }
+    // ── lab #470 stage 4a: a v5 net, in memory, end to end ──────────────────
+
+    /// Two v5 adapters: one mines, the other ingests — the whole threaded
+    /// identity stack (v5 chain identities, v5 header PoW, v5 body binding,
+    /// v5 template minting the exact schedule, v5 funnel validation) in one
+    /// test. Also exercises the fresh-rekey seam (`set_chain_rules` on
+    /// untouched adapters re-keys chain AND state, the extended invariant).
+    #[test]
+    fn a_v5_net_mines_and_relays_in_memory() {
+        use qlab_devnet::forms::{ChainRules, GenesisForm};
+        let v5 = ChainRules { form: GenesisForm::V5, halt: RuleSchedule::V1_0 };
+        let mk = || {
+            let (cstate, _v) = committee7();
+            let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+            a.set_chain_rules(v5);
+            a.set_miner_rkm([7, 7, 7, 7]);
+            a
+        };
+        let mut miner = mk();
+        let mut peer = mk();
+        assert_eq!(miner.chain_rules().form, GenesisForm::V5);
+        assert_eq!(miner.state.form(), GenesisForm::V5, "the state node was re-keyed too");
+
+        let (header, body) = miner.mine_block().expect("v5 mining succeeds");
+        assert_eq!(
+            body.coinbase,
+            qlab_devnet::emission_exact::coinbase_exact(1),
+            "a v5 template mints the exact schedule natively"
+        );
+        assert_eq!(
+            header.tx_body_commitment,
+            body.commitment_v5(),
+            "a v5 template binds the v5 body form"
+        );
+        let id = header.header_hash_for(GenesisForm::V5);
+        assert!(matches!(
+            miner.ingest_block(header, body.clone()),
+            IngestOutcome::Accepted
+        ));
+        assert!(matches!(peer.ingest_block(header, body), IngestOutcome::Accepted));
+        assert_eq!(peer.chain().tip_hash(), id, "the peer adopted the v5 identity");
+        assert_eq!(peer.chain().tip_hash(), miner.chain().tip_hash());
+        assert_eq!(peer.chain().tip_height(), 1);
+    }
+
+    /// The extended install-before-run invariant: re-keying an adapter whose
+    /// chain already carries a block panics — replayed/advanced state must be
+    /// OPENED under its form, never re-keyed.
+    #[test]
+    #[should_panic(expected = "rekey_genesis is only legal")]
+    fn set_chain_rules_refuses_a_rekey_after_the_first_block() {
+        use qlab_devnet::forms::{ChainRules, GenesisForm};
+        let (cstate, _v) = committee7();
+        let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+        a.set_miner_rkm([7, 7, 7, 7]);
+        let (header, body) = a.mine_block().expect("v4 mining succeeds");
+        assert!(matches!(a.ingest_block(header, body), IngestOutcome::Accepted));
+        a.set_chain_rules(ChainRules { form: GenesisForm::V5, halt: RuleSchedule::V1_0 });
+    }
+
 }
