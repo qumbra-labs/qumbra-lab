@@ -4803,7 +4803,13 @@ mod tests {
         pump(&mut [&mut a, &mut b], 5);
         a.force_redial_ready();
         a.maintain_peers();
-        pump(&mut [&mut a, &mut b], 5);
+        // Wait for both directed connections, not for 100 ms of clock — see
+        // `pump_until`. This test passed on the windows leg once and failed the
+        // next run at `left: 1, right: 2`, which is one handshake not yet landed
+        // rather than a connection that will never form.
+        pump_until(&mut [&mut a, &mut b], PUMP_LIMIT, |ns| {
+            ns[0].telemetry().peer_count == 2 && ns[1].telemetry().peer_count == 2
+        });
         assert_eq!(a.telemetry().peer_count, 2, "A sees both live directions");
         assert_eq!(b.telemetry().peer_count, 2, "B sees both live directions");
 
@@ -4832,7 +4838,9 @@ mod tests {
         pump(&mut [&mut a, &mut b], 5);
         a.force_redial_ready();
         a.maintain_peers();
-        pump(&mut [&mut a, &mut b], 5);
+        pump_until(&mut [&mut a, &mut b], PUMP_LIMIT, |ns| {
+            ns[0].telemetry().peer_count == 2 && ns[1].telemetry().peer_count == 2
+        });
 
         assert_eq!(
             a.telemetry().peer_count,
