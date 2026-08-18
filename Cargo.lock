@@ -1308,6 +1308,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "qumbra-pool"
+version = "0.0.0"
+dependencies = [
+ "ctrlc",
+ "qlab-devnet",
+ "qlab-pow",
+ "qlab-stratum",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "qumbra-wallet"
 version = "0.0.0"
 dependencies = [
