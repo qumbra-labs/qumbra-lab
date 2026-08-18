@@ -109,10 +109,10 @@ jobs:
         env:
           INSTANCE_ID: ${{ vars.CI_RUNNER_INSTANCE_ID }}
         run: |
-          aws ec2 start-instances --instance-ids "$INSTANCE_ID"
-          aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
-          aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
-            --query 'Reservations[0].Instances[0].State.Name' --output text
+          aws ec2 start-instances --instance-ids $INSTANCE_ID # unquoted on purpose: the var may hold a space-separated LIST (two-runner topology, deploy #184)
+          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
+          aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+            --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text
 
       # WHY THERE IS NO "poll until the runner reports online" STEP, though
       # deploy #130 S2 asks for one: listing a repo's self-hosted runners
@@ -324,6 +324,6 @@ jobs:
         env:
           INSTANCE_ID: ${{ vars.CI_RUNNER_INSTANCE_ID }}
         run: |
-          aws ec2 stop-instances --instance-ids "$INSTANCE_ID"
-          aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
-            --query 'Reservations[0].Instances[0].State.Name' --output text
+          aws ec2 stop-instances --instance-ids $INSTANCE_ID # unquoted: space-separated list
+          aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+            --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text
