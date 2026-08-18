@@ -70,7 +70,7 @@ pub use mempool::{
     MempoolParams, MempoolTx, TxId,
 };
 pub use node::{
-    genesis_block, AnchorGate, FinalizeOutcome, MemNode, Node, NodeError, NodeState,
+    genesis_block, genesis_block_for, AnchorGate, FinalizeOutcome, MemNode, Node, NodeError, NodeState,
     RecoveryReport, RewindReport, SnapshotRejection,
 };
 pub use recovery::{

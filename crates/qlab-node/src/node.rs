@@ -24,6 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::body::{validate_body_with_names, BlockBody, BodyError, TxVerifier};
 use qlab_devnet::chain::{FinalizeMarkError, InsertError, RestoreFinalizedError};
 use qlab_devnet::committee::Checkpoint;
@@ -89,6 +90,9 @@ pub const MAX_RETAINED_BODY_BYTES: usize = 32 * 1024 * 1024;
 struct RetainedBodies {
     by_hash: HashMap<Hash32, StoredBlock>,
     bytes: usize,
+    /// The genesis form retained-block identities are computed under (lab
+    /// #470 stage 4a). Defaults to v4; set at node construction.
+    form: GenesisForm,
 }
 
 impl RetainedBodies {
@@ -112,7 +116,7 @@ impl RetainedBodies {
     }
 
     fn insert(&mut self, block: StoredBlock) {
-        let hash = block.header().header_hash();
+        let hash = block.header().header_hash_for(self.form);
         let weight = block_weight(&block);
         if let Some(old) = self.by_hash.insert(hash, block) {
             self.bytes = self.bytes.saturating_sub(block_weight(&old));
@@ -582,7 +586,17 @@ fn hex8(h: &Hash32) -> String {
 /// binary above the boundary (v2 bytes at a v3 height) is refused here —
 /// loudly, naming the height — rather than silently starting fresh.
 fn check_stored_binding(block: &StoredBlock) -> Result<(), NodeError> {
-    let got = block.body().commitment_at(block.header.height);
+    check_stored_binding_for(GenesisForm::V4, block)
+}
+
+/// [`check_stored_binding`] under an explicit genesis form (lab #470 4a): the
+/// v4 arm is the height-keyed v2/v3 rule exactly as before; the v5 arm binds
+/// under `commitment_v5`.
+fn check_stored_binding_for(form: GenesisForm, block: &StoredBlock) -> Result<(), NodeError> {
+    let got = match form {
+        GenesisForm::V4 => block.body().commitment_at(block.header.height),
+        GenesisForm::V5 => block.body().commitment_v5(),
+    };
     if block.header.tx_body_commitment != got {
         return Err(NodeError::BodyCommitmentMismatch {
             height: block.header.height,
@@ -596,6 +610,13 @@ fn check_stored_binding(block: &StoredBlock) -> Result<(), NodeError> {
 /// Read-only view of the node's consensus state — the interface tx admission
 /// (N2), RPC (N5), and the block pipeline (N3) read. Implemented by [`Node`].
 pub trait NodeState {
+    /// The genesis-format-keyed consensus form set this node runs (lab #470
+    /// stage 4a). Defaults to v4 so every stub keeps today's forms; the real
+    /// node overrides it from its installed form — the assembler reads this,
+    /// so a v5 node's templates mint the exact schedule and derive v5 leaves.
+    fn genesis_form(&self) -> GenesisForm {
+        GenesisForm::V4
+    }
     /// The fork-choice tip height.
     fn tip_height(&self) -> u64;
     /// The fork-choice tip hash.
@@ -652,6 +673,12 @@ pub struct Node<C: ChainStore, N: NullifierStore, T: CommitmentStore> {
     /// `apply_state` (so rewinds rebuild it) and persisted as the `names.bin`
     /// sidecar (so snapshots restore it). See `crate::name_registry`.
     names: crate::name_registry::NameRegistry,
+    /// The genesis form (lab #470 stage 4a): every block identity this node
+    /// computes — replay, snapshot resume, retained bodies, the stored-binding
+    /// check — is the header hash under this form. Set at construction
+    /// (`open_for` / `in_memory_for`), BEFORE any record is replayed; there is
+    /// no later setter (the install-before-run invariant, extended here).
+    form: GenesisForm,
 }
 
 /// The outcome of [`MemNode::resume_from_snapshot`] — a node, or the reason this
@@ -666,8 +693,14 @@ enum SnapshotResume {
 
 impl MemNode {
     /// An in-memory node from a genesis block, with no disk durability.
+    /// **v4 identities** — a v5 net starts via [`MemNode::in_memory_for`].
     pub fn in_memory(genesis: StoredBlock) -> Self {
-        Self::from_genesis(genesis, None)
+        Self::from_genesis(GenesisForm::V4, genesis, None)
+    }
+
+    /// [`MemNode::in_memory`] under an explicit genesis form (lab #470 4a).
+    pub fn in_memory_for(form: GenesisForm, genesis: StoredBlock) -> Self {
+        Self::from_genesis(form, genesis, None)
     }
 
     /// Open (or create) a disk-backed node at `dir`, resuming restart-safely:
@@ -675,11 +708,22 @@ impl MemNode {
     /// past it. A missing/torn/version-mismatched snapshot falls back to a full
     /// genesis replay of the log. `genesis` must match the log's genesis.
     pub fn open(dir: impl AsRef<Path>, genesis: StoredBlock) -> Result<Self, NodeError> {
+        Self::open_for(GenesisForm::V4, dir, genesis)
+    }
+
+    /// [`MemNode::open`] under an explicit genesis form (lab #470 stage 4a).
+    /// The form arrives BEFORE the log is replayed — replay identities, the
+    /// stored-binding form and the snapshot-resume walk all key off it.
+    pub fn open_for(
+        form: GenesisForm,
+        dir: impl AsRef<Path>,
+        genesis: StoredBlock,
+    ) -> Result<Self, NodeError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir).map_err(NodeError::Io)?;
 
         let records = persist::read_records(&dir).map_err(NodeError::Io)?;
-        let genesis_block_hash = genesis.header().header_hash();
+        let genesis_block_hash = genesis.header().header_hash_for(form);
         // Lab #408: `Ok(None)`-style flattening is gone. A present-but-unusable
         // snapshot is a typed rejection that reaches the RECOVERY line exactly
         // like the #225 resume-time rejections below — a rejected snapshot is
@@ -716,7 +760,7 @@ impl MemNode {
         // and issue #225 a third — see [`Self::resume_from_snapshot`]. The reason
         // is carried into the [`RecoveryReport`] rather than dropped.
         if let Some(snap) = snapshot.as_ref() {
-            match Self::resume_from_snapshot(&dir, &genesis, snap, &records)? {
+            match Self::resume_from_snapshot(form, &dir, &genesis, snap, &records)? {
                 SnapshotResume::Resumed(node) => return Ok(node),
                 SnapshotResume::Rejected(why) => {
                     // Lab #408: before conceding the genesis fold, try the
@@ -724,7 +768,7 @@ impl MemNode {
                     // when the log itself proves its tip is on the finalized
                     // main chain. Any failure inside the attempt falls back to
                     // the full replay, which stays the correctness anchor.
-                    if let Some(node) = Self::resume_near_tip(&dir, &genesis, snap, &records, &why)
+                    if let Some(node) = Self::resume_near_tip(form, &dir, &genesis, snap, &records, &why)
                     {
                         return Ok(node);
                     }
@@ -732,7 +776,7 @@ impl MemNode {
                 }
             }
         }
-        Self::resume_by_replay(&dir, genesis, &records, snapshot_rejected)
+        Self::resume_by_replay(form, &dir, genesis, &records, snapshot_rejected)
     }
 
     /// The snapshot-assisted resume. `Rejected` = this snapshot cannot be
@@ -766,12 +810,13 @@ impl MemNode {
     /// replay is what decides, and if the log is the problem the replay refuses
     /// with its own reason.
     fn resume_from_snapshot(
+        form: GenesisForm,
         dir: &Path,
         genesis: &StoredBlock,
         snap: &Snapshot,
         records: &[LogRecord],
     ) -> Result<SnapshotResume, NodeError> {
-        let mut node = Self::from_genesis(genesis.clone(), Some(dir.to_path_buf()));
+        let mut node = Self::from_genesis(form, genesis.clone(), Some(dir.to_path_buf()));
         node.restore_from_snapshot(snap);
         // Lab #367: the registry sidecar rides the snapshot. Any problem with
         // a PRESENT sidecar is a fall-through to the full replay (which
@@ -811,7 +856,7 @@ impl MemNode {
                     // one way a corrupted log record enters unchecked. It stays
                     // FIRST: a tampered record is refused outright, and must not
                     // be mistaken for the rewind below.
-                    check_stored_binding(b)?;
+                    check_stored_binding_for(node.form, b)?;
                     // Issue #162: the log is append-only but the applied chain is
                     // no longer append-only, so a prefix record whose parent is not
                     // the running tip is the live node's rewind, replayed here at
@@ -849,7 +894,7 @@ impl MemNode {
                         }
                     }
                     node.chain.put_block(b.clone()).map_err(NodeError::Chain)?;
-                    node.retained.forget(&b.header().header_hash());
+                    node.retained.forget(&b.header().header_hash_for(node.form));
                 }
             }
         }
@@ -985,6 +1030,7 @@ impl MemNode {
     /// construction: the registry at `applied_height` is derived state this
     /// path cannot re-derive without the very fold it exists to skip.
     fn resume_near_tip(
+        form: GenesisForm,
         dir: &Path,
         genesis: &StoredBlock,
         snap: &Snapshot,
@@ -1009,7 +1055,7 @@ impl MemNode {
         let mut by_hash: HashMap<Hash32, &StoredBlock> = HashMap::new();
         for rec in records {
             if let LogRecord::Block(b) = rec {
-                by_hash.insert(b.header().header_hash(), b);
+                by_hash.insert(b.header().header_hash_for(form), b);
             }
         }
         let fin_hash = records.iter().rev().find_map(|rec| match rec {
@@ -1029,7 +1075,7 @@ impl MemNode {
 
         // (2) Derived state from the snapshot; the registry sidecar under the
         // same rule the honoured path applies (absent = pre-#367 = empty).
-        let mut node = Self::from_genesis(genesis.clone(), Some(dir.to_path_buf()));
+        let mut node = Self::from_genesis(form, genesis.clone(), Some(dir.to_path_buf()));
         node.restore_from_snapshot(snap);
         match crate::name_registry::load_names_at(dir) {
             Ok(None) => {}
@@ -1040,7 +1086,7 @@ impl MemNode {
         // (3) The chain store, rebuilt along the proven ancestor path only —
         // cheap `put_block` inserts in ascending order, no rewind inference
         // needed because the path is linear by construction.
-        let genesis_block_hash = genesis.header().header_hash();
+        let genesis_block_hash = genesis.header().header_hash_for(node.form);
         let mut path: Vec<&StoredBlock> = Vec::with_capacity(snap.applied_height as usize);
         let mut cursor = snap.tip;
         while cursor != genesis_block_hash {
@@ -1059,7 +1105,7 @@ impl MemNode {
             // The binding is still checked (issue #77): this path skips
             // `apply_state`, so it would otherwise be the one door a corrupted
             // log record enters by.
-            check_stored_binding(block).ok()?;
+            check_stored_binding_for(node.form, block).ok()?;
             node.chain.put_block((*block).clone()).ok()?;
         }
         if node.chain.tip_hash() != snap.tip {
@@ -1138,12 +1184,13 @@ impl MemNode {
     /// runs the snapshot has already been discarded, and "there was no snapshot"
     /// and "the snapshot was unusable" are different things to tell an operator.
     fn resume_by_replay(
+        form: GenesisForm,
         dir: &Path,
         genesis: StoredBlock,
         records: &[LogRecord],
         snapshot_rejected: Option<SnapshotRejection>,
     ) -> Result<Self, NodeError> {
-        let mut node = Self::from_genesis(genesis, Some(dir.to_path_buf()));
+        let mut node = Self::from_genesis(form, genesis, Some(dir.to_path_buf()));
         // Lab #287: every record is applied, so walk total == final replayed_records.
         // `records` is already in memory from `open`; the total is free.
         let mut progress = ReplayProgress::start(records.len(), "from genesis");
@@ -1173,8 +1220,17 @@ impl MemNode {
     /// from-scratch correctness anchor `open` is checked against. Applies every
     /// block and replays every finalization.
     pub fn replay(dir: impl AsRef<Path>, genesis: StoredBlock) -> Result<Self, NodeError> {
+        Self::replay_for(GenesisForm::V4, dir, genesis)
+    }
+
+    /// [`MemNode::replay`] under an explicit genesis form (lab #470 4a).
+    pub fn replay_for(
+        form: GenesisForm,
+        dir: impl AsRef<Path>,
+        genesis: StoredBlock,
+    ) -> Result<Self, NodeError> {
         let dir = dir.as_ref().to_path_buf();
-        let mut node = Self::from_genesis(genesis, Some(dir.clone()));
+        let mut node = Self::from_genesis(form, genesis, Some(dir.clone()));
         for rec in persist::read_records(&dir).map_err(NodeError::Io)? {
             match rec {
                 LogRecord::Block(b) => {
@@ -1286,7 +1342,7 @@ impl MemNode {
 
         // Built beside the live state and swapped in only on success, so a failure
         // anywhere in the re-fold leaves the node exactly as it was.
-        let mut rebuilt = Self::from_genesis(kept[0].clone(), self.dir.clone());
+        let mut rebuilt = Self::from_genesis(self.form, kept[0].clone(), self.dir.clone());
         for block in &kept[1..] {
             rebuilt.apply_state(block)?;
         }
@@ -1307,7 +1363,7 @@ impl MemNode {
         // no second copy. (`apply_state` already forgets on the live node, so this
         // is belt-and-braces rather than the load-bearing path.)
         for block in &kept[1..] {
-            rebuilt.retained.forget(&block.header().header_hash());
+            rebuilt.retained.forget(&block.header().header_hash_for(rebuilt.form));
         }
         rebuilt.retained.prune_below(rebuilt.chain.tip_height());
         let report = RewindReport {
@@ -1320,20 +1376,23 @@ impl MemNode {
         Ok(report)
     }
 
-    fn from_genesis(genesis: StoredBlock, dir: Option<PathBuf>) -> Self {
+    fn from_genesis(form: GenesisForm, genesis: StoredBlock, dir: Option<PathBuf>) -> Self {
         assert_eq!(genesis.header.height, 0, "genesis height must be 0");
         // Issue #115: genesis is bound to its body like every other block, and
         // this is the one seam a genesis enters by without passing
         // `check_stored_binding` (it is put straight into the chain store).
         // Panicking matches the height assertion above — the genesis block is
         // locally built or operator-supplied, never network input.
+        let expected_binding = match form {
+            GenesisForm::V4 => genesis.body().commitment(),
+            GenesisForm::V5 => genesis.body().commitment_v5(),
+        };
         assert_eq!(
-            genesis.header.tx_body_commitment,
-            genesis.body().commitment(),
-            "genesis must bind its own body"
+            genesis.header.tx_body_commitment, expected_binding,
+            "genesis must bind its own body (under the net's form)"
         );
         let commitments = MemCommitmentStore::default();
-        let chain = MemChainStore::new(genesis);
+        let chain = MemChainStore::new_for(form, genesis);
         let mut roots_by_height = BTreeMap::new();
         let mut anchor_heights_by_root = BTreeMap::new();
         // Genesis carries no outputs, so the tree is empty: record its root at
@@ -1349,11 +1408,52 @@ impl MemNode {
             anchor_heights_by_root,
             commitments_ordered: Vec::new(),
             nullifiers_ordered: Vec::new(),
-            retained: RetainedBodies::default(),
+            retained: RetainedBodies { form, ..RetainedBodies::default() },
             dir,
             recovery: RecoveryReport::default(),
             names: crate::name_registry::NameRegistry::default(),
+            form,
         }
+    }
+
+    /// The genesis form this node's identities are keyed under (lab #470).
+    pub fn form(&self) -> GenesisForm {
+        self.form
+    }
+
+    /// Re-key a **fresh** node (genesis only, nothing applied, nothing
+    /// retained, no datadir records) to `form` — the one legal moment is
+    /// between construction and first use, mirroring
+    /// `ChainState::rekey_genesis`. Anything else panics: replayed state
+    /// cannot be re-keyed, it must be OPENED under its form (`open_for`).
+    pub fn rekey_genesis(&mut self, form: GenesisForm) {
+        if form == self.form {
+            return;
+        }
+        assert!(
+            self.chain.tip_height() == 0
+                && self.retained.is_empty()
+                && self.commitments_ordered.is_empty()
+                && self.nullifiers_ordered.is_empty(),
+            "rekey_genesis is only legal on a fresh node — open_for is the seam for replayed state"
+        );
+        let genesis = self
+            .chain
+            .block(&self.chain.genesis_block_hash())
+            .expect("a fresh node holds its genesis")
+            .clone();
+        // The genesis header BINDS its body under the old form; a re-keyed net
+        // needs it re-bound, so the standard empty-body genesis is REBUILT
+        // under the new form from its two real inputs. A custom genesis (a
+        // fixture with a hand-set commitment) cannot be re-bound blindly and
+        // refuses instead.
+        assert!(
+            genesis.txs.is_empty() && genesis.coinbase == 0,
+            "rekey_genesis only re-binds the standard empty-body genesis"
+        );
+        let rebuilt =
+            genesis_block_for(form, genesis.header.difficulty, genesis.header.timestamp);
+        *self = Self::from_genesis(form, rebuilt, self.dir.clone());
     }
 
     fn restore_from_snapshot(&mut self, snap: &Snapshot) {
@@ -1471,14 +1571,32 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
                 // Lab #367: the registry is the NameView. While the boundary is
                 // unset this is behaviourally identical to plain validate_body;
                 // once armed, rider rules read real state with no plumbing left
-                // to do.
-                validate_body_with_names(&header, &body, verifier, anchor_ok, &self.names)
-                    .map_err(NodeError::Body)?;
+                // to do. Lab #470 stage 4a: the funnel is selected by this
+                // node's installed form — the registry-armed twin of the
+                // adapter's relay-level selection.
+                match self.form {
+                    GenesisForm::V4 => {
+                        validate_body_with_names(&header, &body, verifier, anchor_ok, &self.names)
+                            .map_err(NodeError::Body)?
+                    }
+                    GenesisForm::V5 => qlab_devnet::body::validate_body_v5(
+                        &header, &body, verifier, anchor_ok, &self.names,
+                    )
+                    .map_err(NodeError::Body)?,
+                }
             }
             AnchorGate::SettledHistory => {
                 let anchor_ok = |root: &Hash32| self.is_valid_anchor_as_of(root, header.height);
-                validate_body_with_names(&header, &body, verifier, anchor_ok, &self.names)
-                    .map_err(NodeError::Body)?;
+                match self.form {
+                    GenesisForm::V4 => {
+                        validate_body_with_names(&header, &body, verifier, anchor_ok, &self.names)
+                            .map_err(NodeError::Body)?
+                    }
+                    GenesisForm::V5 => qlab_devnet::body::validate_body_v5(
+                        &header, &body, verifier, anchor_ok, &self.names,
+                    )
+                    .map_err(NodeError::Body)?,
+                }
             }
         }
         let block = StoredBlock::from_parts(&header, &body);
@@ -1515,7 +1633,7 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // The funnel guard (issue #77): every state mutation — fresh application
         // and disk-log replay alike — passes through here, so the header/body
         // binding is re-established before anything is folded into state.
-        check_stored_binding(block)?;
+        check_stored_binding_for(self.form, block)?;
         // Reject any nullifier already spent, or repeated within this block,
         // BEFORE mutating — so a rejected block leaves state untouched.
         let mut seen: Vec<Hash32> = Vec::new();
@@ -1565,9 +1683,10 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
         // fixed choice, and this is still the single funnel both fresh
         // application and log replay pass through, so `open == replay` holds by
         // construction.
-        let matured = crate::coinbase::matured_coinbase_leaf(block.header.height, |minted_at| {
-            self.ancestor_at(&block.header.prev, minted_at).map(|b| b.body())
-        });
+        let matured =
+            crate::coinbase::matured_coinbase_leaf_for(self.form, block.header.height, |minted_at| {
+                self.ancestor_at(&block.header.prev, minted_at).map(|b| b.body())
+            });
         let hash = self
             .chain
             .put_block(block.clone())
@@ -1760,6 +1879,10 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> Node<C, N, T> {
 }
 
 impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeState for Node<C, N, T> {
+    fn genesis_form(&self) -> GenesisForm {
+        self.form
+    }
+
     fn tip_height(&self) -> u64 {
         self.chain.tip_height()
     }
@@ -1795,7 +1918,17 @@ impl<C: ChainStore, N: NullifierStore, T: CommitmentStore> NodeState for Node<C,
 /// Build the genesis [`StoredBlock`] (empty body) at the given difficulty and
 /// timestamp — the base every node starts from.
 pub fn genesis_block(difficulty: u64, timestamp: u64) -> StoredBlock {
-    StoredBlock::from_parts(&BlockHeader::genesis(difficulty, timestamp), &BlockBody::default())
+    genesis_block_for(GenesisForm::V4, difficulty, timestamp)
+}
+
+/// [`genesis_block`] under an explicit genesis form (lab #470 stage 4a): the
+/// v5 genesis header binds the empty body's `commitment_v5` — the stage-3
+/// pre-registered golden `82c2707b…7ea5`.
+pub fn genesis_block_for(form: GenesisForm, difficulty: u64, timestamp: u64) -> StoredBlock {
+    StoredBlock::from_parts(
+        &BlockHeader::genesis_for(form, difficulty, timestamp),
+        &BlockBody::default(),
+    )
 }
 
 #[cfg(test)]
@@ -2536,4 +2669,89 @@ mod tests {
             assert!(BODY_REFUSAL_REASONS.contains(&reason), "{reason} is not declared");
         }
     }
+    // ── lab #470 stage 4a: the v5 identity plumbing, proven end to end ──────
+
+    /// A v5 node boots, applies, persists, and RESUMES under v5 identities —
+    /// the whole stage-4a plumbing in one lifecycle: `open_for(V5)` on a fresh
+    /// dir (genesis binding under `commitment_v5`), a block applied through
+    /// the real path, then a restart replay that must agree with itself.
+    #[test]
+    fn v5_node_boots_applies_and_resumes() {
+        let dir = std::env::temp_dir().join(format!("qmb-i470-v5-boot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let genesis = genesis_block_for(GenesisForm::V5, 8, 0);
+        let tip = {
+            let mut node = MemNode::open_for(GenesisForm::V5, &dir, genesis.clone()).unwrap();
+            assert_eq!(node.form(), GenesisForm::V5);
+            let parent = genesis.header();
+            // The v5 funnel enforces the exact schedule NATIVELY from height 1
+            // (this test's first draft paid coinbase=100 and was refused with
+            // WrongScheduledCoinbase{expected: 4_999_995_882} — the stage-3
+            // contrast rule biting on the very first v5 block, as designed).
+            let body = BlockBody {
+                txs: vec![],
+                coinbase: qlab_devnet::emission_exact::coinbase_exact(1),
+                coinbase_rkm: [1, 2, 3, 4],
+            };
+            let header = BlockHeader::child_of_for(
+                GenesisForm::V5,
+                &parent,
+                75,
+                8,
+                body.commitment_v5(),
+            );
+            node.apply_block(header, body, &MockVerifier).expect("v5 block applies");
+            node.tip_hash()
+        };
+        let node = MemNode::open_for(GenesisForm::V5, &dir, genesis).expect("v5 replay resumes");
+        assert_eq!(node.tip_hash(), tip, "the replayed v5 identity equals the live one");
+        assert_eq!(node.tip_height(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cross-form open refuses: the same datadir under the WRONG form is a
+    /// named error (the stored-binding check under the wrong form), never a
+    /// silent mis-keyed resume.
+    #[test]
+    fn a_v5_datadir_refuses_a_v4_open() {
+        let dir = std::env::temp_dir().join(format!("qmb-i470-xform-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let genesis5 = genesis_block_for(GenesisForm::V5, 8, 0);
+        {
+            let mut node = MemNode::open_for(GenesisForm::V5, &dir, genesis5.clone()).unwrap();
+            let body = BlockBody {
+                txs: vec![],
+                coinbase: qlab_devnet::emission_exact::coinbase_exact(1),
+                coinbase_rkm: [1, 2, 3, 4],
+            };
+            let header = BlockHeader::child_of_for(
+                GenesisForm::V5,
+                &genesis5.header(),
+                75,
+                8,
+                body.commitment_v5(),
+            );
+            node.apply_block(header, body, &MockVerifier).unwrap();
+        }
+        let genesis4 = genesis_block(8, 0);
+        assert!(
+            MemNode::open_for(GenesisForm::V4, &dir, genesis4).is_err(),
+            "a v5 log under a v4 open must refuse, not mis-key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The install-before-run invariant, extended to the state node (the
+    /// stage-1 ruling's condition): re-keying is legal only while fresh.
+    #[test]
+    #[should_panic(expected = "only legal on a fresh node")]
+    fn rekey_genesis_refuses_a_node_with_applied_state() {
+        let mut node = MemNode::in_memory(genesis_block(8, 0));
+        let body = BlockBody { txs: vec![], coinbase: 100, coinbase_rkm: [1, 2, 3, 4] };
+        let header =
+            BlockHeader::child_of(&genesis_block(8, 0).header(), 75, 8, body.commitment_at(1));
+        node.apply_block(header, body, &MockVerifier).unwrap();
+        node.rekey_genesis(GenesisForm::V5);
+    }
+
 }

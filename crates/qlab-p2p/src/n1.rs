@@ -174,6 +174,15 @@ pub trait ChainView {
     /// `expected_genesis_hash`. The file contains the block, so the two always
     /// differ. Named `genesis_hash` before #206.
     fn genesis_block_hash(&self) -> Hash32;
+
+    /// The genesis-format-keyed consensus form set this node runs (lab #470).
+    /// Defaults to v4 so every sim/stub — none of which loads a genesis file —
+    /// keeps today's forms; `NodeAdapter` overrides it from its installed
+    /// `ChainRules`, the one selection point. The P2P layer reads this for the
+    /// header wire codec, so codec form and consensus form cannot diverge.
+    fn genesis_form(&self) -> qlab_devnet::forms::GenesisForm {
+        qlab_devnet::forms::GenesisForm::V4
+    }
     fn tip_hash(&self) -> Hash32;
     fn tip_height(&self) -> u64;
     /// A header by its hash, if known (on any fork).

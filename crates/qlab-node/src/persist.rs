@@ -273,6 +273,37 @@ pub fn append_record(dir: &Path, rec: &LogRecord) -> io::Result<()> {
 /// not decode, or if a non-empty log yields no records at all, this returns
 /// [`io::ErrorKind::InvalidData`] and the caller refuses to open. Recovery is to
 /// re-sync the datadir, not to bump a constant.
+/// Refuse a decoded record naming an unknown `bucket_actions` value (lab #470
+/// stage 3). {2, 4, 8} is the complete set every writer in every era produces.
+fn check_record_buckets(rec: &WireRecord, record_index: usize) -> io::Result<()> {
+    match rec {
+        WireRecord::Finalize(_) => Ok(()),
+        WireRecord::Block(b) => {
+            check_bucket_values(b.txs.iter().map(|t| t.bucket_actions), record_index)
+        }
+        WireRecord::BlockV4(b) => {
+            check_bucket_values(b.txs.iter().map(|t| t.bucket_actions), record_index)
+        }
+    }
+}
+
+fn check_bucket_values(
+    values: impl Iterator<Item = u32>,
+    record_index: usize,
+) -> io::Result<()> {
+    for (i, v) in values.enumerate() {
+        if !matches!(v, 2 | 4 | 8) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{BLOCK_LOG}: record {record_index} tx {i} names bucket_actions {v}, which                      no writer of this format has ever produced (legitimate values: 2, 4, 8).                      This datadir is corrupt or foreign — re-sync it; do not start against it."
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub fn read_records(dir: &Path) -> io::Result<Vec<LogRecord>> {
     let path = dir.join(BLOCK_LOG);
     if !path.exists() {
@@ -294,7 +325,18 @@ pub fn read_records(dir: &Path) -> io::Result<Vec<LogRecord>> {
             break; // torn trailing record from a crash mid-append
         }
         match bincode::deserialize::<WireRecord>(&buf) {
-            Ok(rec) => out.push(LogRecord::from(rec)),
+            Ok(rec) => {
+                // Lab #470 stage 3: a record whose bucket_actions is not a
+                // value any legitimate writer ever produced ({2,4,8} — see
+                // store.rs::bucket_from_actions for the writer enumeration) is
+                // corrupt or foreign data. It DECODES (any u32 is bincode-
+                // valid), so the torn-tail tolerance below never applies to
+                // it: refuse by name, unconditionally — the old behavior was
+                // a silent coercion to TwoByTwo, i.e. a wrong body rebuilt
+                // from disk with nothing pointing at it.
+                check_record_buckets(&rec, out.len())?;
+                out.push(LogRecord::from(rec));
+            }
             Err(e) => {
                 // Tolerated only if nothing follows it (a crash mid-append).
                 let mut probe = [0u8; 1];
@@ -762,4 +804,50 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+    /// Lab #470 stage 3, the strictness rider's replay proof (coordinator
+    /// condition): every value a legitimate writer produces — {2, 4, 8}, the
+    /// range of `ArityBucket::logical_actions()` in every era including the
+    /// dummy-latch one, which never changed it — replays green through the
+    /// real writer (`append_record`) and the real reader (`read_records`).
+    #[test]
+    fn replay_accepts_every_writer_produced_bucket_value() {
+        let dir = std::env::temp_dir().join(format!("qmb-i470-bucket-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for actions in [2u32, 4, 8] {
+            let mut b = a_stored_block(qlab_devnet::names::RIDER_ABSENT.to_vec());
+            b.txs[0].bucket_actions = actions;
+            append_record(&dir, &LogRecord::Block(b)).unwrap();
+        }
+        let back = read_records(&dir).unwrap();
+        assert_eq!(back.len(), 3);
+        for (rec, want) in back.iter().zip([2u32, 4, 8]) {
+            match rec {
+                LogRecord::Block(b) => assert_eq!(b.txs[0].bucket_actions, want),
+                _ => panic!("expected blocks"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rider itself: a record naming bucket_actions = 3 — which DECODES
+    /// (any u32 is bincode-valid) and used to be silently coerced to TwoByTwo —
+    /// is refused BY NAME at datadir open, even as the last record (it is not
+    /// a torn tail; it is wrong data).
+    #[test]
+    fn replay_refuses_an_unknown_bucket_value_by_name() {
+        let dir = std::env::temp_dir().join(format!("qmb-i470-bucket-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut b = a_stored_block(qlab_devnet::names::RIDER_ABSENT.to_vec());
+        b.txs[0].bucket_actions = 3;
+        append_record(&dir, &LogRecord::Block(b)).unwrap();
+        let err = read_records(&dir).expect_err("bucket_actions 3 must refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(msg.contains("bucket_actions 3"), "the refusal names the value: {msg}");
+        assert!(msg.contains("record 0 tx 0"), "and the location: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

@@ -30,6 +30,7 @@
 #[cfg(feature = "randomx")]
 use qlab_pow::RandomXHasher;
 
+use crate::forms::GenesisForm;
 use crate::header::{BlockHeader, Hash32};
 
 /// The PoW algorithm, abstracted so mining/validation/fork-choice never name a
@@ -41,7 +42,13 @@ pub trait PowEngine {
     /// The PoW hash of `header` under RandomX key `seed` (the key-block hash;
     /// ignored by engines without a key, like [`KeccakPow`]). Mining varies
     /// `header.nonce` and re-hashes until [`satisfies_target`] holds.
-    fn pow_hash(&self, header: &BlockHeader, seed: &[u8]) -> Hash32;
+    ///
+    /// `form` selects the preimage layout (lab #470 stage 1): the PoW message
+    /// is the canonical header preimage **under the net's genesis form**, so
+    /// the engine cannot be fed one layout by the miner and another by the
+    /// validator — both receive the form from the one installed [`ChainRules`]
+    /// (`crate::forms::ChainRules`).
+    fn pow_hash(&self, form: GenesisForm, header: &BlockHeader, seed: &[u8]) -> Hash32;
 }
 
 /// DEVNET PLACEHOLDER PoW: Keccak-256 of the header preimage.
@@ -58,9 +65,9 @@ impl PowEngine for KeccakPow {
         "keccak-devnet-placeholder"
     }
 
-    fn pow_hash(&self, header: &BlockHeader, _seed: &[u8]) -> Hash32 {
+    fn pow_hash(&self, form: GenesisForm, header: &BlockHeader, _seed: &[u8]) -> Hash32 {
         // No key: the seed does not participate (documented placeholder behavior).
-        header.header_hash()
+        header.header_hash_for(form)
     }
 }
 
@@ -99,9 +106,10 @@ impl PowEngine for RandomXPow {
         "randomx"
     }
 
-    fn pow_hash(&self, header: &BlockHeader, seed: &[u8]) -> Hash32 {
-        // RandomX key = the key-block seed; message = the canonical header preimage.
-        self.hasher.hash(seed, &header.preimage())
+    fn pow_hash(&self, form: GenesisForm, header: &BlockHeader, seed: &[u8]) -> Hash32 {
+        // RandomX key = the key-block seed; message = the canonical header
+        // preimage under the net's form.
+        self.hasher.hash(seed, &header.preimage_for(form))
     }
 }
 
@@ -144,7 +152,7 @@ mod tests {
         let mut found = None;
         for nonce in 0..100_000u64 {
             h.nonce = nonce;
-            let hash = pow.pow_hash(&h, &[]);
+            let hash = pow.pow_hash(GenesisForm::V4, &h, &[]);
             if satisfies_target(&hash, h.difficulty) {
                 found = Some(nonce);
                 break;
@@ -152,7 +160,7 @@ mod tests {
         }
         let nonce = found.expect("must find a valid nonce at difficulty 4");
         h.nonce = nonce;
-        assert!(satisfies_target(&pow.pow_hash(&h, &[]), h.difficulty));
+        assert!(satisfies_target(&pow.pow_hash(GenesisForm::V4, &h, &[]), h.difficulty));
     }
 
     #[test]
@@ -161,7 +169,10 @@ mod tests {
         // what keeps every M6 test a valid regression guard.
         let h = BlockHeader::genesis(1_000, 0);
         let pow = KeccakPow;
-        assert_eq!(pow.pow_hash(&h, &[]), pow.pow_hash(&h, b"any seed at all"));
+        assert_eq!(
+            pow.pow_hash(GenesisForm::V4, &h, &[]),
+            pow.pow_hash(GenesisForm::V4, &h, b"any seed at all")
+        );
         assert!(pow.name().contains("placeholder"));
     }
 }

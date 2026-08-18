@@ -79,9 +79,45 @@ fn randomx_hash_depends_on_the_key_block_seed() {
     // makes key rotation a real consensus event, not a no-op.)
     let pow = RandomXPow::new();
     let header = qlab_devnet::header::BlockHeader::genesis(1_000, 0);
-    let a = pow.pow_hash(&header, &[1u8; 32]);
-    let b = pow.pow_hash(&header, &[2u8; 32]);
+    let a = pow.pow_hash(qlab_devnet::forms::GenesisForm::V4, &header, &[1u8; 32]);
+    let b = pow.pow_hash(qlab_devnet::forms::GenesisForm::V4, &header, &[2u8; 32]);
     assert_ne!(a, b, "RandomX output must depend on the key-block seed");
     // …and it is deterministic for a fixed (seed, header).
-    assert_eq!(a, pow.pow_hash(&header, &[1u8; 32]));
+    assert_eq!(a, pow.pow_hash(qlab_devnet::forms::GenesisForm::V4, &header, &[1u8; 32]));
+}
+
+/// 🔒 The **v5 PoW-input vector** (lab #470 stage 1): real RandomX over the
+/// pinned 97-byte v5 header preimage under a fixed key. Locks that the engine
+/// feeds RandomX exactly the v5 layout — the preimage bytes themselves are
+/// golden-locked in `tests/v5_header.rs::golden_v5_preimage_bytes`, and the
+/// PoW primitive's bit-identity to rx/0 is re-proven by qlab-pow's official
+/// vectors (`randomx.rs`) in every acceptance; this vector is the composition
+/// of the two.
+#[test]
+fn v5_pow_input_vector() {
+    use qlab_devnet::forms::GenesisForm;
+    use qlab_devnet::header::{AggregateProofSlot, BlockHeader, EpochSupplyAttestation};
+
+    let h = BlockHeader {
+        prev: [0x11; 32],
+        height: 0x0000_6655_4433_2211,
+        timestamp: 0x8877_6655_4433_2211,
+        difficulty: 0xAA99_8877_6655_4433,
+        nonce: 0xCCBB_AA99_8877_6655,
+        tx_body_commitment: [0x22; 32],
+        aggregate_proof: AggregateProofSlot,
+        epoch_supply_attestation: EpochSupplyAttestation,
+    };
+    let engine = RandomXPow::new();
+    let out = engine.pow_hash(GenesisForm::V5, &h, b"test key 000");
+    let hex: String = out.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(hex, "fad2770856d515eda2289ce493bbc6cd5c3196506b0b41c929afa34ea86113a5");
+    // And it is the RandomX of exactly the v5 preimage bytes, nothing else.
+    assert_eq!(
+        out,
+        qlab_pow::RandomXHasher::new().hash(b"test key 000", &h.preimage_for(GenesisForm::V5)),
+        "the engine must feed RandomX the v5 preimage verbatim"
+    );
+    // The v4 form of the same fields is a different PoW message entirely.
+    assert_ne!(out, engine.pow_hash(GenesisForm::V4, &h, b"test key 000"));
 }

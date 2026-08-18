@@ -337,7 +337,7 @@ mod tests {
         for i in 0u8..=255 {
             tampered.tx_body_commitment = [i; 32];
             if tampered.tx_body_commitment != good.tx_body_commitment
-                && !satisfies_target(&KeccakPow.pow_hash(&tampered, &[]), tampered.difficulty)
+                && !satisfies_target(&KeccakPow.pow_hash(crate::forms::GenesisForm::V4, &tampered, &[]), tampered.difficulty)
             {
                 break;
             }

@@ -668,6 +668,17 @@ impl HaltMarker {
 // ---------------------------------------------------------------------------
 // THE release constant — compile-time selected. Exactly one arm is live in any
 // given binary; there is no runtime path to any of the others.
+//
+// Since lab #470 this constant is one of TWO sources feeding the node's
+// installed `ChainRules`, split on purpose: the **halt/upgrade schedule** comes
+// from here (+ the on-disk halt marker, #74/#81) — compile-time, exactly as
+// stated above — while the **consensus form set** (header/body/coinbase forms,
+// rule natives) comes from the loaded genesis file's `format_version`, which is
+// inside the genesis hash = the network identity every config pins. Neither
+// source can express the other's choice: an operator still cannot make THE
+// SAME net behave differently from config/CLI/env (H1's substance), and a
+// release still cannot silently move a net between form sets — selecting a
+// form IS selecting a net (#470 Q1 ruling).
 // ---------------------------------------------------------------------------
 
 /// This binary's release (H1). Compile-time constant, no runtime override.
@@ -707,10 +718,13 @@ pub const RELEASE: Release = Release {
 
 /// **The post-boundary release**: the binary that resumes past
 /// [`RULE_BOUNDARY_HEIGHT`] under the exact-decimal schedule and the #299 validity
-/// rule. Built from the same source as the default arm — the schedule switch is a
-/// height comparison against a compiled-in constant, not a feature — so what this
-/// arm adds is the *declaration*: the revision in force above the boundary, and the
-/// PoW rule domain that keeps a pre-rule miner's branch from ever being valid there.
+/// rule. Built from the same source as the default arm — on a **v4-genesis net**
+/// the schedule switch is a height comparison against a compiled-in constant, not
+/// a feature (on a v5-genesis net there is no switch at all: the exact schedule
+/// is native from height 0, keyed off the genesis file — lab #470; the two
+/// sources are split, see the section comment above) — so what this arm adds is
+/// the *declaration*: the revision in force above the boundary, and the PoW rule
+/// domain that keeps a pre-rule miner's branch from ever being valid there.
 #[cfg(feature = "rule-boundary-resume")]
 pub const RELEASE: Release = Release {
     name: "qumbra-node v1.1 (exact-decimal emission, resumes past the rule boundary)",

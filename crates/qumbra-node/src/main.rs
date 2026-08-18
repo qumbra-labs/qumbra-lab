@@ -211,7 +211,9 @@ fn genesis_init(args: &[String]) -> Result<(), Box<dyn Error>> {
     let out = PathBuf::from(flag(args, "--out").unwrap_or("."));
     std::fs::create_dir_all(&out)?;
 
-    let gf = GenesisFile::new_devnet_t0();
+    // Lab #470 stage 4b: `--t2` mints the v5-format T2 genesis; the default
+    // stays the T1 file byte-for-byte.
+    let gf = if has_flag(args, "--t2") { GenesisFile::new_t2() } else { GenesisFile::new_devnet_t0() };
     let gpath = out.join("genesis.qmb");
     gf.write(&gpath)?;
     let key_dir = out.join("keys");

@@ -370,6 +370,7 @@ impl BlockTemplate {
     /// Assemble the accounting for a chosen transaction set at `height` against
     /// effective median `M`. Refuses if the set exceeds the hard cap (frozen §6).
     fn build(
+        form: qlab_devnet::forms::GenesisForm,
         height: u64,
         chosen: Vec<TxEntry>,
         total_weight: u64,
@@ -381,7 +382,16 @@ impl BlockTemplate {
         if !is_weight_admissible(total_weight, effective_median, &params.weight) {
             return Err(AssemblyError::TemplateOverWeight { weight: total_weight, hard_cap });
         }
-        let coinbase_total = coinbase(height);
+        // Lab #470 stage 4a: the template mints the schedule ITS NET runs —
+        // the v4 arm is the boundary-grandfathered function exactly as before;
+        // a v5 net mints the exact schedule natively (what validate_body_v5
+        // will demand of this very template).
+        let coinbase_total = match form {
+            qlab_devnet::forms::GenesisForm::V4 => coinbase(height),
+            qlab_devnet::forms::GenesisForm::V5 => {
+                qlab_devnet::emission_exact::coinbase_exact(height)
+            }
+        };
         let reward_split = RewardSplit::of(coinbase_total);
         let total_fees: u64 = chosen.iter().map(|t| t.public.fee).sum();
         let weight_penalty =
@@ -389,7 +399,7 @@ impl BlockTemplate {
         let miner_take = reward_split.miner.saturating_sub(weight_penalty) + total_fees;
         let body =
             BlockBody { txs: chosen.clone(), coinbase: coinbase_total, coinbase_rkm };
-        let coinbase_note = crate::coinbase::coinbase_note_leaf(height, &body);
+        let coinbase_note = crate::coinbase::coinbase_note_leaf_for(form, height, &body);
         Ok(Self {
             height,
             txs: chosen,
@@ -776,7 +786,15 @@ impl Mempool {
         }
         // The fill guarantees `weight ≤ effective_median ≤ hard_cap`, so build
         // never errors here.
-        BlockTemplate::build(height, chosen, weight, effective_median, &self.params, coinbase_rkm)
+        BlockTemplate::build(
+            state.genesis_form(),
+            height,
+            chosen,
+            weight,
+            effective_median,
+            &self.params,
+            coinbase_rkm,
+        )
             .expect("free-zone fill is always within the hard cap")
     }
 
@@ -806,7 +824,15 @@ impl Mempool {
             chosen.push(tx.entry.clone());
             weight += tx.weight;
         }
-        BlockTemplate::build(height, chosen, weight, effective_median, &self.params, coinbase_rkm)
+        BlockTemplate::build(
+            state.genesis_form(),
+            height,
+            chosen,
+            weight,
+            effective_median,
+            &self.params,
+            coinbase_rkm,
+        )
     }
 
     /// Compute the current §6 effective median `M` from a chain of recent block

@@ -28,7 +28,8 @@ use qlab_pow::keyblock::KeyBlockSchedule;
 use qlab_pow::lwma_next_difficulty;
 
 use crate::chain::ChainState;
-use crate::halt::{pow_value, RuleSchedule};
+use crate::forms::ChainRules;
+use crate::halt::pow_value;
 use crate::header::{BlockHeader, Hash32};
 use crate::params_devnet::LWMA_WINDOW_BLOCKS;
 use crate::pow::{satisfies_target, PowEngine};
@@ -126,10 +127,13 @@ pub fn validate_header<P: PowEngine>(
     target_block_time: u64,
     schedule: KeyBlockSchedule,
 ) -> Result<(), ValidationError> {
-    validate_header_under(chain, pow, header, target_block_time, schedule, &RuleSchedule::V1_0)
+    validate_header_under(chain, pow, header, target_block_time, schedule, &ChainRules::V1_0)
 }
 
-/// [`validate_header`] under an explicit [`RuleSchedule`] (issue #74).
+/// [`validate_header`] under an explicit [`ChainRules`] (issue #74; form-keyed
+/// since lab #470 — the header preimage the PoW hashes is the layout
+/// `rules.form` selects, so a v4 header on a v5 net fails PoW even before the
+/// codec refuses its bytes by length).
 ///
 /// The only difference from the v1.0 rules is the PoW **value**: above an upgrade
 /// boundary the engine's PoW hash is domain-separated by the active revision
@@ -147,7 +151,7 @@ pub fn validate_header_under<P: PowEngine>(
     header: &BlockHeader,
     target_block_time: u64,
     schedule: KeyBlockSchedule,
-    rules: &RuleSchedule,
+    rules: &ChainRules,
 ) -> Result<(), ValidationError> {
     let parent = chain
         .header(&header.prev)
@@ -173,7 +177,7 @@ pub fn validate_header_under<P: PowEngine>(
         pow_seed(chain, &header.prev, header.height, schedule).ok_or(ValidationError::UnknownSeed)?;
     // Issue #74: above an upgrade boundary the PoW value is domain-separated by the
     // active revision. At and below it, this is byte-identical to the v1.0 rule.
-    let value = pow_value(pow.pow_hash(header, &seed), header.height, rules);
+    let value = pow_value(pow.pow_hash(rules.form, header, &seed), header.height, &rules.halt);
     if !satisfies_target(&value, header.difficulty) {
         return Err(ValidationError::PowUnsatisfied);
     }
@@ -332,7 +336,7 @@ mod tests {
         let mut bad_pow = good;
         for nonce in 0..10_000u64 {
             bad_pow.nonce = nonce;
-            if !satisfies_target(&pow.pow_hash(&bad_pow, &[]), bad_pow.difficulty) {
+            if !satisfies_target(&pow.pow_hash(crate::forms::GenesisForm::V4, &bad_pow, &[]), bad_pow.difficulty) {
                 break;
             }
         }

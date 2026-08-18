@@ -109,6 +109,18 @@ pub const COINBASE_RHO_DOMAIN: &[u8] = b"qumbra:coinbase-note-rho:v1";
 /// Domain string for a coinbase note's `rseed`. See [`COINBASE_RHO_DOMAIN`].
 pub const COINBASE_RSEED_DOMAIN: &[u8] = b"qumbra:coinbase-note-rseed:v1";
 
+/// Domain string for a **v5-form** coinbase note's ρ (lab #470 stage 2). The
+/// v5 preimage carries the payee **index** so two payees sharing one `rkm` at
+/// one height still derive distinct ρ — the coordinator's condition: the index
+/// lands in the FORMAT now, while the birth cap is 1, so raising the cap stays
+/// a rule change forever. A fresh domain (not a length pun on the v1 string)
+/// so the two derivations can never be confused for each other.
+pub const COINBASE_RHO_DOMAIN_V5: &[u8] = b"qumbra:coinbase-note-rho:v2";
+
+/// Domain string for a v5-form coinbase note's `rseed`. See
+/// [`COINBASE_RHO_DOMAIN_V5`].
+pub const COINBASE_RSEED_DOMAIN_V5: &[u8] = b"qumbra:coinbase-note-rseed:v2";
+
 /// `H(domain ‖ height_le ‖ rkm_le)` as circuit lanes — the shared shape of both
 /// the ρ and the `rseed` rule.
 fn derive_lanes(domain: &[u8], height: u64, rkm: &[u64; 4]) -> [u64; 4] {
@@ -129,6 +141,31 @@ pub fn coinbase_rho(height: u64, rkm: &[u64; 4]) -> [u64; 4] {
 /// The coinbase note's `rseed` at `height` for payee `rkm`.
 pub fn coinbase_rseed(height: u64, rkm: &[u64; 4]) -> [u64; 4] {
     derive_lanes(COINBASE_RSEED_DOMAIN, height, rkm)
+}
+
+/// `H(domain ‖ height_le ‖ payee_index ‖ rkm_le)` — the v5 shape of
+/// [`derive_lanes`]: one extra byte, the payee index, between height and rkm.
+fn derive_lanes_v5(domain: &[u8], height: u64, payee_index: u8, rkm: &[u64; 4]) -> [u64; 4] {
+    let mut buf = Vec::with_capacity(domain.len() + 8 + 1 + 32);
+    buf.extend_from_slice(domain);
+    buf.extend_from_slice(&height.to_le_bytes());
+    buf.push(payee_index);
+    for lane in rkm {
+        buf.extend_from_slice(&lane.to_le_bytes());
+    }
+    digest_from_bytes(&keccak256(&buf))
+}
+
+/// The **v5-form** coinbase note ρ at `height` for the payee at `payee_index`
+/// (lab #470 stage 2). At the birth cap the index is always 0; the format
+/// carries it so per-height ρ uniqueness survives the cap raise.
+pub fn coinbase_rho_v5(height: u64, payee_index: u8, rkm: &[u64; 4]) -> [u64; 4] {
+    derive_lanes_v5(COINBASE_RHO_DOMAIN_V5, height, payee_index, rkm)
+}
+
+/// The v5-form coinbase note `rseed`. See [`coinbase_rho_v5`].
+pub fn coinbase_rseed_v5(height: u64, payee_index: u8, rkm: &[u64; 4]) -> [u64; 4] {
+    derive_lanes_v5(COINBASE_RSEED_DOMAIN_V5, height, payee_index, rkm)
 }
 
 /// The value the coinbase note carries: the miner's frozen §3 share of the
@@ -220,6 +257,32 @@ pub fn coinbase_note_parts(
     })
 }
 
+/// The **v5-form** coinbase note (lab #470 stage 2): identical VALUE arithmetic
+/// to [`coinbase_note_parts`] — literally the same
+/// [`coinbase_note_value_parts`] call, which is the provable-equivalence
+/// requirement of the payout-axis ruling ("the single-payee v5 block's
+/// semantics must be provably equivalent to today's single-rkm payout") — with
+/// the v5 ρ/rseed derivations, which carry the payee index. `None` cases
+/// unchanged.
+pub fn coinbase_note_parts_v5(
+    height: u64,
+    payee_index: u8,
+    rkm: [u64; 4],
+    coinbase: u64,
+    total_fees: u64,
+    total_name_burn: u64,
+) -> Option<Note> {
+    if coinbase == 0 || rkm == [0u64; 4] {
+        return None;
+    }
+    Some(Note {
+        value: coinbase_note_value_parts(coinbase, total_fees, total_name_burn),
+        rkm,
+        rho: coinbase_rho_v5(height, payee_index, &rkm),
+        rseed: coinbase_rseed_v5(height, payee_index, &rkm),
+    })
+}
+
 /// The commitment-tree leaf for `body`'s coinbase note at `height` — the real
 /// `note_commitment`, on-wire lane-major bytes, ready for
 /// `CommitmentStore::append`. `None` exactly when [`coinbase_note`] is `None`.
@@ -228,6 +291,28 @@ pub fn coinbase_note_parts(
 /// issue #102 those are different heights: see [`matures_coinbase_minted_at`].
 pub fn coinbase_note_leaf(height: u64, body: &BlockBody) -> Option<Hash32> {
     coinbase_note(height, body).map(|n| digest_bytes(&n.commitment()))
+}
+
+/// [`coinbase_note_leaf`] under an explicit genesis form (lab #470 stage 4a):
+/// the v5 leaf comes from the v5 note derivation (payee index 0 at the birth
+/// cap) — same value arithmetic, v5 lanes.
+pub fn coinbase_note_leaf_for(
+    form: qlab_devnet::forms::GenesisForm,
+    height: u64,
+    body: &BlockBody,
+) -> Option<Hash32> {
+    match form {
+        qlab_devnet::forms::GenesisForm::V4 => coinbase_note_leaf(height, body),
+        qlab_devnet::forms::GenesisForm::V5 => coinbase_note_parts_v5(
+            height,
+            0,
+            body.coinbase_rkm,
+            body.coinbase,
+            body.total_fees(),
+            body.total_name_burn(),
+        )
+        .map(|n| digest_bytes(&n.commitment())),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -292,8 +377,20 @@ pub fn matured_coinbase_leaf<F>(height: u64, ancestor_body: F) -> Option<Hash32>
 where
     F: FnOnce(u64) -> Option<BlockBody>,
 {
+    matured_coinbase_leaf_for(qlab_devnet::forms::GenesisForm::V4, height, ancestor_body)
+}
+
+/// [`matured_coinbase_leaf`] under an explicit genesis form (lab #470 4a).
+pub fn matured_coinbase_leaf_for<F>(
+    form: qlab_devnet::forms::GenesisForm,
+    height: u64,
+    ancestor_body: F,
+) -> Option<Hash32>
+where
+    F: FnOnce(u64) -> Option<BlockBody>,
+{
     let minted_at = matures_coinbase_minted_at(height)?;
-    coinbase_note_leaf(minted_at, &ancestor_body(minted_at)?)
+    coinbase_note_leaf_for(form, minted_at, &ancestor_body(minted_at)?)
 }
 
 /// Whether a coinbase note minted at a given height has entered the commitment
@@ -490,5 +587,43 @@ mod tests {
         // …but ρ is identical, and the nullifier is a function of (nk, ρ) alone.
         assert_eq!(a.rho, b.rho, "same height + same payee ⇒ same ρ");
         assert_eq!(a.rseed, b.rseed);
+    }
+
+    // ── the v5 form (lab #470 stage 2, C1) ──────────────────────────────────
+
+    /// The payout-axis ruling's provable-equivalence requirement, proven at
+    /// the value: a v5 single-payee note carries EXACTLY the value the v4
+    /// derivation pays for the same block facts — same miner share, same
+    /// fees, same burn — because both call the one `coinbase_note_value_parts`.
+    #[test]
+    fn v5_note_value_is_byte_equal_to_v4s() {
+        let (h, rkm, cb, fees, burn) = (7u64, [3u64, 1, 4, 1], 5_000_000_000u64, 123u64, 45u64);
+        let v4 = coinbase_note_parts(h, rkm, cb, fees, burn).unwrap();
+        let v5 = coinbase_note_parts_v5(h, 0, rkm, cb, fees, burn).unwrap();
+        assert_eq!(v4.value, v5.value, "the equivalence the ruling requires");
+        assert_eq!(v4.rkm, v5.rkm);
+        // …while the lane derivations are deliberately domain-separated:
+        assert_ne!(v4.rho, v5.rho, "v5 ρ is a different domain + carries the index");
+        assert_ne!(v4.rseed, v5.rseed);
+    }
+
+    /// The coordinator's stage-2 condition: the payee INDEX is in the v5
+    /// format now — two payees sharing one rkm at one height derive distinct
+    /// ρ and rseed, so the cap raise stays a rule change forever.
+    #[test]
+    fn v5_payee_index_separates_same_rkm_same_height() {
+        let rkm = [9u64, 9, 9, 9];
+        assert_ne!(coinbase_rho_v5(50, 0, &rkm), coinbase_rho_v5(50, 1, &rkm));
+        assert_ne!(coinbase_rseed_v5(50, 0, &rkm), coinbase_rseed_v5(50, 1, &rkm));
+        // And the index does not bleed across heights or keys.
+        assert_ne!(coinbase_rho_v5(50, 0, &rkm), coinbase_rho_v5(51, 0, &rkm));
+        assert_ne!(coinbase_rho_v5(50, 0, &rkm), coinbase_rho_v5(50, 0, &[9, 9, 9, 8]));
+    }
+
+    #[test]
+    fn v5_none_cases_match_v4s() {
+        // Mints nothing / names nobody — the same two refusals, both forms.
+        assert!(coinbase_note_parts_v5(7, 0, [1, 2, 3, 4], 0, 5, 0).is_none());
+        assert!(coinbase_note_parts_v5(7, 0, [0, 0, 0, 0], 100, 5, 0).is_none());
     }
 }

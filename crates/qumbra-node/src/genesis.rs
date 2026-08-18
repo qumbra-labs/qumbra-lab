@@ -40,6 +40,7 @@ use serde::{Deserialize, Serialize};
 use qlab_consensus::{CONSENSUS_CFG, LOG_HEIGHT};
 use qlab_devnet::committee::{quorum_threshold, Committee, MemberKey, Validator};
 use qlab_devnet::fees::{posted_fee, ArityBucket};
+use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::header::Hash32;
 use qlab_devnet::params_devnet as pd;
 use qlab_node::emission as em;
@@ -75,6 +76,14 @@ use qlab_node::{genesis_block, StoredBlock};
 /// recording 145,609. That is the "much worse error" #188's bump exists to
 /// prevent, and the same remedy applies.
 pub const GENESIS_FORMAT_VERSION: u32 = 4;
+
+/// **5 — the T2 genesis format** (lab #470): the version whose form set is
+/// [`GenesisForm::V5`] — stratum-compatible 97-byte header, one body form
+/// carrying the C3 hygiene batch, payee-list coinbase (cap 1 at birth), exact
+/// emission + the name rule native from height ≥ 1. One binary serves both
+/// formats; the loaded file's version selects the net (`GenesisFile::form`,
+/// the Q1 ruling). The devnet-placeholder shape note above applies unchanged.
+pub const GENESIS_FORMAT_VERSION_T2: u32 = 5;
 
 /// The FROZEN consensus wire size in bytes (qlab-consensus
 /// `consensus_wire_is_148625_bytes`; consensus-parameters §1). Baked so the
@@ -463,6 +472,34 @@ impl GenesisFile {
         }
     }
 
+    /// Build the **T2** genesis (lab #470 stage 4b): format v5, the v5-form
+    /// genesis block (its header binds the empty body's `commitment_v5` — the
+    /// stage-3 pre-registered `82c2707b…7ea5`), the SAME FrozenParams v1.0
+    /// table (nothing in this mint reaches the circuit; `CONSENSUS_WIRE_BYTES`
+    /// stays 148,625 and the fee rows carry the current values marked
+    /// *pending launch re-ratification* — C6 stamps at LAUNCH, not at merge),
+    /// and the same 21 rehearsal committee keys (C5 explicitly deferred; the
+    /// T-ops launch ceremony re-mints with real keys and the launch difficulty
+    /// — both `[devnet-placeholder]` here exactly as they were for T0).
+    pub fn new_t2() -> Self {
+        let n = pd::FROZEN_COMMITTEE_SIZE;
+        let committee_keys: Vec<Vec<u8>> = (0..n)
+            .map(|i| Validator::from_seed(i, committee_seed(i)).verifying_key().encode().to_vec())
+            .collect();
+        GenesisFile {
+            format_version: GENESIS_FORMAT_VERSION_T2,
+            network: "qumbra-t2".to_string(),
+            frozen: FrozenParams::v1_0(),
+            committee_keys,
+            genesis_difficulty: T0_GENESIS_DIFFICULTY,
+            genesis_block: qlab_node::genesis_block_for(
+                GenesisForm::V5,
+                T0_GENESIS_DIFFICULTY,
+                0,
+            ),
+        }
+    }
+
     /// The genesis hash: keccak256 over the file's canonical bincode. This is the
     /// value printed on `genesis init` and asserted on startup.
     ///
@@ -513,6 +550,24 @@ impl GenesisFile {
         Self::from_bytes(&bytes)
     }
 
+    /// The consensus form set this file selects — the lab #470 T2 keying's
+    /// single mapping point: `format_version` → [`GenesisForm`], asked once at
+    /// load and threaded from there (never re-derived per call site).
+    ///
+    /// Stage 0: no caller consumes this yet, and [`Self::verify_startup`]
+    /// still refuses everything but v4 — a v5 file remains unloadable until
+    /// stage 4 mints one and flips that gate deliberately. The version this
+    /// maps and the version the startup gate accepts are the same fact in two
+    /// places on purpose: the gate is the refusal, this is the fan-out.
+    pub fn form(&self) -> Result<GenesisForm, GenesisError> {
+        GenesisForm::from_genesis_format_version(self.format_version).ok_or(
+            GenesisError::WrongFormatVersion {
+                got: self.format_version,
+                want: GENESIS_FORMAT_VERSION,
+            },
+        )
+    }
+
     /// committee₀ reconstructed from the baked verifying keys — the set a
     /// verify-only node validates checkpoints against.
     pub fn committee(&self) -> Result<Committee, GenesisError> {
@@ -530,12 +585,11 @@ impl GenesisFile {
     /// and — if `expected_hex` is set — that the genesis hash matches (else the
     /// node refuses to start).
     pub fn verify_startup(&self, expected_hex: Option<&str>) -> Result<(), GenesisError> {
-        if self.format_version != GENESIS_FORMAT_VERSION {
-            return Err(GenesisError::WrongFormatVersion {
-                got: self.format_version,
-                want: GENESIS_FORMAT_VERSION,
-            });
-        }
+        // Lab #470 stage 4b: the gate accepts exactly the versions this tree
+        // serves — the same mapping `form()` fans out from. One binary, two
+        // nets; WHICH net is still pinned by `expected_genesis_hash`, so this
+        // widening moves no operator decision.
+        self.form()?;
         let want_n = self.frozen.committee_size;
         if self.committee_keys.len() != want_n as usize {
             return Err(GenesisError::WrongCommitteeSize {
@@ -931,6 +985,84 @@ mod tests {
         assert!(matches!(
             gf.verify_startup(None),
             Err(GenesisError::WrongCommitteeSize { got: 20, want: 21 })
+        ));
+    }
+
+    /// The lab #470 keying's mapping point: the devnet (v4) file selects the
+    /// V4 form set; v5 maps (for the loader stage 4 builds); v1–v3 and
+    /// anything above 5 refuse with the same error the startup gate uses.
+    #[test]
+    fn form_maps_the_format_version_and_refuses_the_rest() {
+        let mut gf = GenesisFile::new_devnet_t0();
+        assert_eq!(gf.form().unwrap(), GenesisForm::V4);
+        gf.format_version = 5;
+        assert_eq!(gf.form().unwrap(), GenesisForm::V5);
+        for v in [0u32, 1, 2, 3, 6] {
+            gf.format_version = v;
+            assert!(
+                matches!(gf.form(), Err(GenesisError::WrongFormatVersion { got, .. }) if got == v),
+                "format_version {v} must refuse by name"
+            );
+        }
+    }
+
+    /// 🔒 **The T2 genesis hash** (lab #470 stage 4b) — minted through the
+    /// real CLI (`genesis init --t2`), reproduced byte-identical twice by the
+    /// builder (file sha256 `682d50bd…`), coordinator reproduction owed at
+    /// acceptance. Beside — never instead of — the T1 pin below: two nets,
+    /// two identities, one tree.
+    #[test]
+    fn t2_genesis_hash_is_pinned() {
+        assert_eq!(
+            GenesisFile::new_t2().hash_hex(),
+            "0e55ccb316ea5dab39c16e0d7db056a1ccf06b167050244dc610a22ca1771df0",
+        );
+        assert_ne!(
+            GenesisFile::new_t2().hash_hex(),
+            GenesisFile::new_devnet_t0().hash_hex(),
+            "T2 and T1 are different networks"
+        );
+    }
+
+    #[test]
+    fn t2_genesis_is_deterministic_and_v5() {
+        let a = GenesisFile::new_t2();
+        let b = GenesisFile::new_t2();
+        assert_eq!(a.to_bytes(), b.to_bytes());
+        assert_eq!(a.form().unwrap(), GenesisForm::V5);
+        assert_eq!(a.format_version, GENESIS_FORMAT_VERSION_T2);
+        assert_eq!(a.network, "qumbra-t2");
+    }
+
+    /// The stage-3 pre-registered tripwire, discharged at the file level: the
+    /// baked T2 genesis header binds the empty body's v5 commitment.
+    #[test]
+    fn t2_genesis_binds_its_own_v5_body() {
+        let gf = GenesisFile::new_t2();
+        let g = &gf.genesis_block;
+        assert_eq!(g.header.height, 0);
+        assert_eq!(g.header.tx_body_commitment, g.body().commitment_v5());
+        let hex: String =
+            g.header.tx_body_commitment.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "82c2707bdf9790b25ef44355cb44cfd7faa6aba28d5db184b57edf83e7ba7ea5");
+        assert_ne!(
+            g.header.tx_body_commitment,
+            g.body().commitment(),
+            "the v5 binding is not the v2 one"
+        );
+    }
+
+    /// The widened startup gate: both served formats verify; the unserved
+    /// refuse by name exactly as before.
+    #[test]
+    fn verify_startup_accepts_both_formats_and_refuses_the_rest() {
+        assert!(GenesisFile::new_devnet_t0().verify_startup(None).is_ok());
+        assert!(GenesisFile::new_t2().verify_startup(None).is_ok());
+        let mut gf = GenesisFile::new_t2();
+        gf.format_version = 6;
+        assert!(matches!(
+            gf.verify_startup(None),
+            Err(GenesisError::WrongFormatVersion { got: 6, .. })
         ));
     }
 
