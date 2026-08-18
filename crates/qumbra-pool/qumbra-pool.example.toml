@@ -1,0 +1,22 @@
+# qumbra-pool example config (lab #482 stage 1).
+#
+# `form` lives on [template], not at the top level: it is a fact about
+# the tip this file describes (the genesis identity), not an operator
+# preference that could desync from the node's genesis hash (H1).
+#
+# A v4 template makes login refuse stock-xmrig by name (#356 UNCLEAN).
+# Share-PoW is not wired yet — waits for lab #490.
+
+listen_addr = "127.0.0.1:3333"
+share_difficulty = 1024
+
+[template]
+form = "v5"
+prev = "1111111111111111111111111111111111111111111111111111111111111111"
+height = 100
+timestamp = 1785000000
+difficulty = 256
+tx_body_commitment = "2222222222222222222222222222222222222222222222222222222222222222"
+seed_hash = "3333333333333333333333333333333333333333333333333333333333333333"
+# next_seed_hash is omitted unless the tip is inside the 64-block
+# preload window before a key-block rotation.
