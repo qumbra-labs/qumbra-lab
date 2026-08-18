@@ -94,6 +94,7 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  node listen:    {}", node.listen_addr);
     println!("  dial peers:     {}", node.dial_peers.len());
     println!("  genesis file hash: {}", genesis.hash_hex());
+    println!("  network:        {} (banner label source — served, never hardcoded)", genesis.network);
     println!("  committee keys: 0 (keyless — enforced)");
     println!("  mining:         false (enforced)");
     println!("  extra listeners: none (telemetry_addr/metrics_addr refused — §6.2)");
@@ -128,6 +129,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         &node.telemetry(),
         &genesis_hash,
         cfg.refresh_secs,
+        &genesis.network,
     )));
 
     // And project the transaction-existence view once for the same reason: the
@@ -209,7 +211,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         let t = n.telemetry();
         let seen = json::fingerprint(&t);
         if last_seen != Some(seen) || last_render.elapsed() >= refresh {
-            let body = json::health(&t, &genesis_hash, cfg.refresh_secs);
+            let body = json::health(&t, &genesis_hash, cfg.refresh_secs, &genesis.network);
             if let Ok(mut p) = page.write() {
                 *p = body;
             }

@@ -94,7 +94,7 @@ fn a_real_observer_node_serves_the_projection_over_a_real_socket() {
     // The binary's wiring, inlined: serialize once before binding, then serve.
     let genesis_hash = genesis.hash_hex();
     let live = node.telemetry();
-    let page = Arc::new(RwLock::new(json::health(&live, &genesis_hash, 30)));
+    let page = Arc::new(RwLock::new(json::health(&live, &genesis_hash, 30, &genesis.network)));
     // …including the transaction-existence projection, taken off this node's own
     // chain store through the same call `main.rs` makes.
     let txlist_view = Arc::new(Mutex::new(Arc::new(TxListView::default())));
@@ -140,7 +140,7 @@ fn a_real_observer_node_serves_the_projection_over_a_real_socket() {
     );
     assert_eq!(
         v["finality"]["head3"]["state"],
-        json::health(&live, "x", 30)
+        json::health(&live, "x", 30, &genesis.network)
             .parse::<serde_json::Value>()
             .map(|p| p["finality"]["head3"]["state"].clone())
             .unwrap_or_default(),
@@ -186,7 +186,7 @@ fn a_real_observer_node_serves_the_projection_over_a_real_socket() {
     );
 
     // 6. A re-serialization reaches readers through the swap the run loop performs.
-    *page.write().unwrap() = json::health(&node.telemetry(), &genesis_hash, 30);
+    *page.write().unwrap() = json::health(&node.telemetry(), &genesis_hash, 30, &genesis.network);
     assert!(get(addr, HEALTH_PATH).starts_with("HTTP/1.1 200"));
 
     // 7. 🔴 The transaction-existence view, off the SAME real node — and on a fresh
