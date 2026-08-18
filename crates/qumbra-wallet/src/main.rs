@@ -246,7 +246,9 @@ fn usage() {
     eprintln!(
         "qumbra-wallet — the end-user wallet CLI (issue #243)\n\n\
          USAGE:\n  \
-         qumbra-wallet keygen  --dir DIR                 new seed (0600) + address 0; prints NO key material\n  \
+         qumbra-wallet keygen  --dir DIR                 new seed + address 0; prints NO key material\n  \
+                            (the seed file's actual protection is printed by `keygen` — it is\n  \
+                            0600 on unix and an inherited ACL on Windows, lab #478)\n  \
          qumbra-wallet restore --dir DIR                 seed from a Qumbra mnemonic on STDIN\n  \
          qumbra-wallet address --dir DIR [--new|--index N]  show or allocate diversified addresses\n  \
                             [--uri] [--amount-qmb DECIMAL] [--label TEXT] [--qr] [--qr-svg FILE]\n\
@@ -329,10 +331,20 @@ fn keygen(args: &[String]) -> Result<(), Box<dyn Error>> {
     };
     let addr = w.wallet().address_at_index(0);
     println!("qumbra-wallet keygen");
-    println!("  seed:    {} (0600 — NEVER printed; back it up with `backup --reveal`)", dir.join(qumbra_wallet::store::SEED_FILE).display());
+    // The protection phrase is platform-derived (lab #478): this line said "0600"
+    // unconditionally, which is a false claim on Windows — there is no chmod there
+    // and the seed file inherits the folder's ACL instead.
+    println!(
+        "  seed:    {} ({} — NEVER printed; back it up with `backup --reveal`)",
+        dir.join(qumbra_wallet::store::SEED_FILE).display(),
+        qumbra_wallet::store::secret_file_protection(),
+    );
     println!("  address [0]:");
     println!("    {}", addr.encode());
     println!("    short: {}", addr.short().encode());
+    if let Some(note) = qumbra_wallet::store::secret_file_protection_note() {
+        println!("{note}");
+    }
     Ok(())
 }
 
@@ -348,6 +360,10 @@ fn restore(args: &[String]) -> Result<(), Box<dyn Error>> {
         "note: only index 0 is re-allocated; if you had more addresses, re-allocate with \
          `address --new` — funds are index-derived and unaffected."
     );
+    // Same seed file, same gap — a restore writes it too (lab #478).
+    if let Some(note) = qumbra_wallet::store::secret_file_protection_note() {
+        println!("{note}");
+    }
     Ok(())
 }
 

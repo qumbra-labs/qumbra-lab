@@ -111,14 +111,6 @@ bincode = "1"
 # TOML node config (data dir, listen addr, dial peers, committee-key paths,
 # mining on/off) — the issue's specified config format.
 toml = "0.8"
-# Graceful-shutdown signal handling = snapshot flush + peers.dat write.
-# Default ctrlc registers SIGINT only; `termination` also arms SIGTERM and
-# SIGHUP (issue #145). Docker `compose stop` / systemd `systemctl stop` send
-# SIGTERM to PID 1 — without this feature those paths never set the shutdown
-# flag and the post-loop flush is never attempted. Version + feature live in
-# `[workspace.dependencies]` since #238, so no composing crate can redeclare
-# the dep bare (tests/ctrlc_pairing.rs enforces it).
-ctrlc = { workspace = true }
 # The /metrics scrape endpoint (issue #87). Same minimal blocking HTTP/1.1 server,
 # and the same `=` pin, as qlab-node's RPC surface and qlab-cbserver's reference
 # server — one HTTP implementation in the tree, not three.
@@ -142,3 +134,31 @@ qlab-note = { path = "../qlab-note" }
 qlab-cbserver = { path = "../qlab-cbserver" }
 # CSPRNG for the acceptance test's ML-KEM keypairs and note material (workspace rev).
 rand = "0.10"
+
+# ── graceful shutdown: one seam, two platform mechanisms (src/shutdown.rs) ──
+#
+# unix — ctrlc with `termination`: SIGINT + SIGTERM + SIGHUP. Default ctrlc
+# registers SIGINT only; `termination` also arms SIGTERM and SIGHUP (issue
+# #145). Docker `compose stop` / systemd `systemctl stop` send SIGTERM to PID 1
+# — without this feature those paths never set the shutdown flag and the
+# post-loop flush is never attempted. Version + feature live in
+# `[workspace.dependencies]` since #238, so no composing crate can redeclare the
+# dep bare (tests/ctrlc_pairing.rs enforces it, and it reads target tables too).
+#
+# 🔴 SCOPED TO `cfg(unix)` SINCE LAB #478, AND THE SCOPING IS THE POINT. ctrlc
+# compiles on Windows, but its handler releases a semaphore and returns TRUE
+# immediately — and Windows terminates the process the moment a CTRL_CLOSE_EVENT
+# handler returns. Under ctrlc alone, closing the console window sets the flag
+# and then kills the process before the loop can read it, i.e. the snapshot
+# flush the task book requires to survive does not. Windows gets this binary's
+# own SetConsoleCtrlHandler instead (below), and running BOTH would be worse
+# than either: handlers fire most-recently-registered first and the first TRUE
+# ends the chain, so ctrlc's would be dead code with a thread parked on it.
+[target.'cfg(unix)'.dependencies]
+ctrlc = { workspace = true }
+
+# windows — SetConsoleCtrlHandler, hand-registered. Adds no package to the tree:
+# `windows-sys` is already in Cargo.lock as ctrlc's own Windows dependency, at
+# this version, with these features among the ones it asks for.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }

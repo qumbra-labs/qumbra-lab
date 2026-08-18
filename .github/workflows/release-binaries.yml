@@ -21,10 +21,13 @@
 #   1. `workflow_dispatch` ONLY, gated on typing `confirm=release`. This file has
 #      no push trigger, no schedule, and must never grow one. (node-image.yml took
 #      the same shape for the same reason and its header says so.)
-#   2. The **macOS leg runs only after both Linux legs are green** (`needs:`). A
-#      compile error, a drifted frozen digest or a dead genesis URL therefore costs
-#      zero macOS minutes. It costs wall-clock instead, which is the cheap side of
-#      that trade.
+#   2. The legs run **cheapest-first, each gating the next** (`needs:`). Linux is
+#      1x, Windows 2x, macOS 10x — so the order is linux → windows → macos, and a
+#      compile error, a drifted frozen digest or a dead genesis URL costs zero
+#      expensive minutes. It costs wall-clock instead, which is the cheap side of
+#      that trade. (Lab #478 added the Windows leg and put it here rather than in
+#      parallel with macOS for exactly this reason: parallel would mean a Windows
+#      compile error still burns a 10x macOS build.)
 #   3. The secret and the publish target are checked in a FREE `preflight` job
 #      before a single expensive minute is spent. Discovering a missing PAT after
 #      three platform builds is the shape of waste this ordering exists to prevent.
@@ -294,13 +297,101 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  windows:
+    name: build windows-x86_64
+    # Gated on both Linux legs (lab #478). 2x-billed, so it sits between the 1x
+    # Linux legs and the 10x macOS one — see the cost header.
+    #
+    # THREE THINGS ARE DIFFERENT HERE AND ALL THREE ARE FORCED BY THE PLATFORM:
+    #
+    #   1. It builds ON Windows and does not cross-compile TO it. randomx-rs's
+    #      build script guards its `advapi32` link with `cfg!(target_os =
+    #      "windows")`, which in a build script evaluates the HOST — a cross-build
+    #      from Linux would silently omit it.
+    #   2. The C++ generator is discovered from `vswhere` rather than assumed. The
+    #      `cmake` crate panics with "couldn't determine visual studio generator"
+    #      when it cannot recognise the install, and an opaque panic inside a
+    #      dependency is the worst place for this to surface.
+    #   3. The artifact is a **zip**, not a tar.gz, and the binaries carry `.exe`.
+    #      `package-release-artifacts.sh` derives both from `$PLATFORM`, so the two
+    #      cannot disagree, and it reads the finished archive back to prove the
+    #      layout is the one the join doc documents.
+    needs: [preflight, linux]
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain — pinned to the same rustc the other legs use
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.95 --profile minimal --no-self-update
+          rustup default 1.95
+          rustc -V; cargo -V
+          rustc -vV | sed -n 's/^host: /host triple: /p'
+          command -v cmake >/dev/null || { echo "::error::cmake is missing from the windows-latest image — randomx-rs cannot build"; exit 1; }
+          cmake --version | sed -n 1p
+
+      - name: The C++ generator, discovered rather than assumed
+        run: |
+          set -euo pipefail
+          VSWHERE="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
+          [ -x "$VSWHERE" ] || { echo "::error::vswhere.exe is not on this image at the documented path — no discoverable Visual Studio, so randomx-rs cannot build."; exit 1; }
+          VER=$("$VSWHERE" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion)
+          echo "visual studio: $VER"
+          case "${VER%%.*}" in
+            17) GEN="Visual Studio 17 2022" ;;
+            16) GEN="Visual Studio 16 2019" ;;
+            *)  echo "::error::Visual Studio major ${VER%%.*} is newer than anything this file maps. Add its generator name here (and to windows-x86_64.yml, which carries the same step) — do not delete the case."; exit 1 ;;
+          esac
+          echo "CMAKE_GENERATOR=$GEN" >> "$GITHUB_ENV"
+          echo "cmake generator: $GEN"
+
+      - name: Build the node — RESUME variant, and only the resume variant
+        env:
+          QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+        run: cargo build --release --locked -p qumbra-node --features rule-boundary-resume
+
+      - name: Build the wallet
+        env:
+          QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+        run: cargo build --release --locked -p qumbra-wallet
+
+      - name: Assert the artifacts — resume, frozen digest, build stamp
+        run: bash .github/workflows/scripts/assert-release-artifacts.sh
+        env:
+          NODE_BIN: target/release/qumbra-node.exe
+          WALLET_BIN: target/release/qumbra-wallet.exe
+          EXPECTED_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+
+      - name: Smoke — `check` against the PUBLISHED genesis, the way a joiner starts
+        run: bash .github/workflows/scripts/smoke-release-artifacts.sh
+        env:
+          NODE_BIN: target/release/qumbra-node.exe
+
+      - name: Package
+        run: bash .github/workflows/scripts/package-release-artifacts.sh
+        env:
+          PLATFORM: windows-x86_64
+          TAG: ${{ needs.preflight.outputs.tag }}
+          LAB_REV: ${{ needs.preflight.outputs.rev }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qumbra-${{ needs.preflight.outputs.tag }}-windows-x86_64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   macos:
     name: build macos-arm64
-    # Gated on BOTH Linux legs passing. This is the 10x-billed leg, and every class
-    # of failure the Linux legs can find — compile error, frozen-digest drift, an
-    # unreachable genesis URL, a build stamp that did not take — is a failure this
-    # leg would find too, later and more expensively.
-    needs: [preflight, linux]
+    # Gated on the Linux legs AND the Windows leg. This is the 10x-billed leg, and
+    # every class of failure the cheaper legs can find — compile error,
+    # frozen-digest drift, an unreachable genesis URL, a build stamp that did not
+    # take — is a failure this leg would find too, later and more expensively.
+    needs: [preflight, linux, windows]
     runs-on: macos-14
     timeout-minutes: 120
     steps:
@@ -364,7 +455,7 @@ jobs:
 
   publish:
     name: publish (${{ inputs.publish }}) to the public repo
-    needs: [preflight, linux, macos]
+    needs: [preflight, linux, windows, macos]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -381,16 +472,25 @@ jobs:
           set -euo pipefail
           mkdir -p release
           find incoming -name '*.tar.gz' -exec mv {} release/ \;
+          find incoming -name '*.zip'    -exec mv {} release/ \;
           find incoming -name '*.sha256' -exec mv {} release/ \;
           cd release
-          # THREE platforms or nothing. A release page missing an architecture is
-          # the silent-truncation shape this project keeps paying for: it looks
-          # complete to everyone except the person whose platform is absent.
-          COUNT=$(ls -1 *.tar.gz | wc -l)
-          [ "$COUNT" -eq 3 ] || { echo "::error::expected 3 platform tarballs, found $COUNT — refusing to publish a partial release"; ls -la; exit 1; }
+          # FOUR platforms or nothing (three until lab #478 added windows-x86_64).
+          # A release page missing an architecture is the silent-truncation shape
+          # this project keeps paying for: it looks complete to everyone except
+          # the person whose platform is absent.
+          #
+          # The Windows artifact is a `.zip` and the other three are `.tar.gz`, so
+          # the count is taken over BOTH extensions — a check that still only
+          # counted tarballs would read "3 of 3, fine" on a release whose Windows
+          # leg silently produced nothing, which is precisely the failure this
+          # block exists to refuse.
+          COUNT=$(ls -1 *.tar.gz *.zip 2>/dev/null | wc -l)
+          [ "$COUNT" -eq 4 ] || { echo "::error::expected 4 platform archives, found $COUNT — refusing to publish a partial release"; ls -la; exit 1; }
           for p in linux-x86_64-glibc linux-aarch64-glibc macos-arm64; do
             ls -1 *"$p".tar.gz >/dev/null || { echo "::error::no tarball for $p"; exit 1; }
           done
+          ls -1 *windows-x86_64.zip >/dev/null || { echo "::error::no zip for windows-x86_64"; exit 1; }
           # Re-verify each digest against the file that arrived, then concatenate.
           # The per-platform .sha256 was computed on the machine that built it; this
           # proves the artifact upload/download round trip did not alter it.
@@ -428,7 +528,7 @@ jobs:
                 --title "Qumbra T1 — prebuilt binaries ($TAG)" \
                 --notes-file release-notes.md \
                 "${FLAGS[@]}" \
-                release/*.tar.gz release/SHA256SUMS; then
+                release/*.tar.gz release/*.zip release/SHA256SUMS; then
             echo "::error::gh release create failed. If this was a 403, PUBLIC_RELEASE_TOKEN is missing Contents: Read and write on ${PUBLIC_REPO} (preflight warns about this and cannot prove it without writing)."
             exit 1
           fi
@@ -445,7 +545,7 @@ jobs:
           gh release view "$TAG" --repo "$PUBLIC_REPO" --json isDraft,isPrerelease,assets \
             --jq '{draft: .isDraft, prerelease: .isPrerelease, assets: [.assets[].name]}'
           N=$(gh release view "$TAG" --repo "$PUBLIC_REPO" --json assets --jq '[.assets[].name] | length')
-          [ "$N" -eq 4 ] || { echo "::error::expected 4 assets (3 tarballs + SHA256SUMS) on the release, the API reports $N"; exit 1; }
+          [ "$N" -eq 5 ] || { echo "::error::expected 5 assets (3 tarballs + 1 windows zip + SHA256SUMS) on the release, the API reports $N"; exit 1; }
           echo ""
           echo "Next, and it is a human step: the join doc's binary path quotes this tag and"
           echo "these digests. Sync docs/join-and-mine{,-zh}.md to the public mirror, and tell"

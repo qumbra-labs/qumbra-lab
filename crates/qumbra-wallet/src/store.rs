@@ -313,6 +313,48 @@ fn parse_addresses(text: &str) -> Result<Vec<u64>, StoreError> {
     Ok(out)
 }
 
+/// **What this platform actually did to the secret file** — one short phrase, so
+/// the CLI can state the truth instead of printing `0600` everywhere (lab #478).
+///
+/// Before the Windows port every surface said "0600" because every supported
+/// platform was a unix. On Windows that sentence is false: there is no mode bit,
+/// [`write_secret`]'s hardening step does not run, and the file gets whatever the
+/// parent directory's ACL hands down. A wallet that claims a protection it does
+/// not have is worse than one that names the gap, so this is a `const fn` and not
+/// a comment.
+pub const fn secret_file_protection() -> &'static str {
+    #[cfg(unix)]
+    {
+        "0600 — owner-only"
+    }
+    #[cfg(not(unix))]
+    {
+        "inherited NTFS ACL — this build sets NO explicit permission (see below)"
+    }
+}
+
+/// The long form of [`secret_file_protection`]'s gap, printed once at the moment
+/// the seed is created. `None` where the platform really does have owner-only
+/// modes, so unix output is byte-identical to what it always was.
+pub const fn secret_file_protection_note() -> Option<&'static str> {
+    #[cfg(unix)]
+    {
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        Some(
+            "⚠️  Windows has no chmod, and this build does not set a DACL on the seed file.\n\
+             \x20   Its protection is whatever it inherits from the folder you chose. Under your\n\
+             \x20   own profile (%USERPROFILE%\\.qumbra-wallet) that is normally you + SYSTEM +\n\
+             \x20   Administrators — NOT owner-only, and NOT what the unix builds get.\n\
+             \x20   To make it owner-only, run this once, in the same shell:\n\
+             \x20     icacls \"%USERPROFILE%\\.qumbra-wallet\" /inheritance:r /grant:r \"%USERNAME%:(OI)(CI)F\"\n\
+             \x20   Anyone who can read the seed file owns every coin this wallet holds.",
+        )
+    }
+}
+
 /// Write a file with owner-only permissions where the platform has them —
 /// the faucet's `write_secret`, kept identical on purpose.
 fn write_secret(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
@@ -325,6 +367,19 @@ fn write_secret(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
+    // 🔴 NOT-UNIX: THE ABSENCE IS DELIBERATE AND IS NOT SILENT (lab #478).
+    //
+    // Windows has no mode bits. The honest equivalents were both priced and both
+    // declined for this baton: a `SetNamedSecurityInfoW` DACL means hand-building
+    // an ACL in `unsafe` inside a wallet's key-writing path — the one function in
+    // this crate where a bug is unrecoverable — and shelling out to `icacls` puts
+    // a wallet's secret protection at the mercy of PATH. So the position taken is
+    // the task book's other option, stated rather than implied: the gap is
+    // *reported* by `secret_file_protection{,_note}` above, printed at creation
+    // by the CLI, and written into the join doc's Windows section.
+    //
+    // If this ever becomes a DACL, delete the note with it — a stale reassurance
+    // is the failure this block exists to prevent.
     Ok(())
 }
 
@@ -471,6 +526,37 @@ mod tests {
         let again = WalletDir::create(&d, MasterSeed::from_entropy([2; ENTROPY_LEN]));
         assert!(matches!(again, Err(StoreError::SeedExists(_))));
         drop(w);
+    }
+
+    /// Lab #478: what the CLI *says* about the seed file's protection must match
+    /// what this platform's `write_secret` actually does. The two used to be one
+    /// hard-coded "0600" on every platform, which the Windows port made false.
+    ///
+    /// The pairing is the test, in both directions: a unix build must claim the
+    /// mode it sets and must NOT print the Windows note; a non-unix build must
+    /// not claim a mode, and must print the note.
+    #[test]
+    fn the_stated_protection_matches_what_this_platform_actually_does() {
+        let claim = secret_file_protection();
+        let note = secret_file_protection_note();
+        #[cfg(unix)]
+        {
+            assert!(claim.contains("0600"), "unix must state the mode it sets: {claim:?}");
+            assert!(
+                note.is_none(),
+                "unix sets an owner-only mode, so there is no gap to narrate: {note:?}"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            assert!(
+                !claim.contains("0600"),
+                "this platform sets no mode — claiming 0600 is the defect this test exists for: \
+                 {claim:?}"
+            );
+            let note = note.expect("a platform with no owner-only mode must narrate the gap");
+            assert!(note.contains("icacls"), "the note must name the fix: {note:?}");
+        }
     }
 
     #[test]

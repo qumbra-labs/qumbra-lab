@@ -9,8 +9,15 @@
 //! status line is honest.
 //!
 //! Unix-only: the defect is specifically about POSIX SIGTERM (Docker/systemd).
-//! Windows maps ctrlc's termination feature differently and is not a T0 deploy
-//! target.
+//!
+//! ⚠️ The second half of that sentence used to read "Windows maps ctrlc's
+//! termination feature differently and is not a T0 deploy target", and lab #478
+//! made half of it wrong: Windows IS a supported joiner/miner platform now (it is
+//! still not a T0 *fleet* host, and that part stands). The accurate statement is
+//! that Windows has no SIGTERM at all — its stop events are console control
+//! events, `ctrlc` is not used there, and the mechanism plus what is and is not
+//! tested about it lives in `qumbra_node::shutdown`. This file stays unix-only
+//! because SIGTERM stays unix-only, not because Windows is out of scope.
 
 #![cfg(unix)]
 
