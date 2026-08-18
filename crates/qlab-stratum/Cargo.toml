@@ -1,0 +1,21 @@
+[package]
+name = "qlab-stratum"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Monero-convention stratum codec sketch for the Qumbra pool (lab #482 stage 0).
+# Protocol library only — no TCP listener, no accounting, no template source.
+# The shipping binary (`qumbra-pool`) arrives in stage 1+.
+#
+# Mapping authority: docs/pool-stratum-mapping.md (EN) / docs/pool-stratum-mapping-zh.md.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# Fixture round-trips assert the mapping is byte-for-byte implementable; no
+# RandomX / no qlab-devnet — those stay out of this crate's graph on purpose
+# (a protocol lib must not drag the node stack).
