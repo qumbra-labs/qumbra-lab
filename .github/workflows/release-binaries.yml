@@ -333,19 +333,7 @@ jobs:
           cmake --version | sed -n 1p
 
       - name: The C++ generator, discovered rather than assumed
-        run: |
-          set -euo pipefail
-          VSWHERE="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
-          [ -x "$VSWHERE" ] || { echo "::error::vswhere.exe is not on this image at the documented path — no discoverable Visual Studio, so randomx-rs cannot build."; exit 1; }
-          VER=$("$VSWHERE" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion)
-          echo "visual studio: $VER"
-          case "${VER%%.*}" in
-            17) GEN="Visual Studio 17 2022" ;;
-            16) GEN="Visual Studio 16 2019" ;;
-            *)  echo "::error::Visual Studio major ${VER%%.*} is newer than anything this file maps. Add its generator name here (and to windows-x86_64.yml, which carries the same step) — do not delete the case."; exit 1 ;;
-          esac
-          echo "CMAKE_GENERATOR=$GEN" >> "$GITHUB_ENV"
-          echo "cmake generator: $GEN"
+        run: bash .github/workflows/scripts/windows-cmake-generator.sh
 
       - name: Build the node — RESUME variant, and only the resume variant
         env:

@@ -61,10 +61,16 @@
 # `randomx-rs`'s build script drives cmake, and the `cmake` crate refuses to guess
 # a generator it does not recognise ("couldn't determine visual studio generator")
 # — which is exactly how this port's first cross-check died on the laptop. On a
-# runner the VS install is real, but which VS it is changes with the image. So the
-# generator is read out of `vswhere` and exported, and an unrecognised major
-# version fails BY NAME with the one-line fix, instead of surfacing as an opaque
-# panic inside a dependency's build script.
+# runner the VS install is real, but which VS it is changes with the image, so the
+# generator is derived (`scripts/windows-cmake-generator.sh`) rather than assumed.
+#
+# 🔴 IT WARNS, IT DOES NOT GATE, and this file's own first run is why. Run
+# 32096791616 died in that step because it carried a hardcoded `17 -> "Visual
+# Studio 17 2022"` map and **windows-latest ships Visual Studio 18 as of
+# 2026-08-18**. Worse, the pinned `cmake` crate already knows Vs18, so the build
+# would have succeeded on its own — the map turned a working configuration red on
+# the first run it ever made. The lesson is in the script's header: derive from
+# CMake's own generator list, and when derivation fails, get out of the way.
 #
 # It is also why this lane builds ON Windows rather than cross-compiling to it:
 # randomx-rs's `cfg!(target_os = "windows")` guard for `advapi32` evaluates the
@@ -81,6 +87,7 @@ on:
       - "Cargo.lock"
       - ".github/workflows/windows-x86_64.yml"
       - ".github/workflows/scripts/smoke-release-artifacts.sh"
+      - ".github/workflows/scripts/windows-cmake-generator.sh"
   workflow_dispatch:
 
 # SECRETS POSTURE, copied from suite-arm64.yml because it is the same posture:
@@ -131,20 +138,10 @@ jobs:
           rustc -vV | sed -n 's/^host: /host triple: /p'
           cmake --version | sed -n 1p
 
+      # The generator name is DERIVED, from two sources that both have to exist
+      # anyway, and it is an AID rather than a gate — see the header.
       - name: The C++ generator, discovered rather than assumed
-        run: |
-          set -euo pipefail
-          VSWHERE="/c/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe"
-          [ -x "$VSWHERE" ] || { echo "::error::vswhere.exe is not on this image at the documented path — this runner has no discoverable Visual Studio, and randomx-rs cannot build without one."; exit 1; }
-          VER=$("$VSWHERE" -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion)
-          echo "visual studio: $VER"
-          case "${VER%%.*}" in
-            17) GEN="Visual Studio 17 2022" ;;
-            16) GEN="Visual Studio 16 2019" ;;
-            *)  echo "::error::Visual Studio major ${VER%%.*} is newer than anything this file maps. Add its generator name to this step (and check that the pinned \`cmake\` crate knows it) — do not delete the case."; exit 1 ;;
-          esac
-          echo "CMAKE_GENERATOR=$GEN" >> "$GITHUB_ENV"
-          echo "cmake generator: $GEN"
+        run: bash .github/workflows/scripts/windows-cmake-generator.sh
 
       - uses: actions/cache@v4
         with:
