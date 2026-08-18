@@ -20,7 +20,20 @@ use qlab_devnet::hash::keccak256;
 use qlab_devnet::header::{BlockHeader, Hash32};
 
 use crate::codec::{decode_header, encode_header, encode_tx, header_wire_len, tx_id, DecodeError, Reader};
+use qlab_devnet::body::COINBASE_PAYEE_CAP_V5;
 use qlab_devnet::forms::GenesisForm;
+
+/// The (rkm, amount) payee list the v5 announce wire carries for a body whose
+/// in-memory shape is (coinbase, coinbase_rkm) — the same derivation as
+/// `BlockBody::coinbase_payees`, restated here over the two announce fields so
+/// the wire and the preimage tail can never disagree about the empty case.
+fn coinbase_payees_of(coinbase: u64, rkm: [u64; 4]) -> Vec<([u64; 4], u64)> {
+    if coinbase == 0 && rkm == [0u64; 4] {
+        Vec::new()
+    } else {
+        vec![(rkm, coinbase)]
+    }
+}
 use crate::varint::write_varint;
 
 pub use qlab_cbserver::codec::{CompactBlock, CompactGroup};
@@ -114,9 +127,27 @@ pub fn encode_announce(form: GenesisForm, a: &BlockAnnounce) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&encode_header(form, &a.header));
     out.extend_from_slice(&a.nonce.to_le_bytes());
-    out.extend_from_slice(&a.coinbase.to_le_bytes());
-    for lane in &a.coinbase_rkm {
-        out.extend_from_slice(&lane.to_le_bytes());
+    match form {
+        GenesisForm::V4 => {
+            // The v4 wire, byte-frozen: coinbase total ‖ rkm lanes.
+            out.extend_from_slice(&a.coinbase.to_le_bytes());
+            for lane in &a.coinbase_rkm {
+                out.extend_from_slice(&lane.to_le_bytes());
+            }
+        }
+        GenesisForm::V5 => {
+            // The v5 payee-list form (lab #470 stage 2): count ‖ [rkm ‖
+            // amount]×N, mirroring the v5 body-preimage tail — the total is
+            // Σ amounts and travels nowhere else on this wire either.
+            let payees = coinbase_payees_of(a.coinbase, a.coinbase_rkm);
+            out.push(payees.len() as u8);
+            for (rkm, amount) in payees {
+                for lane in &rkm {
+                    out.extend_from_slice(&lane.to_le_bytes());
+                }
+                out.extend_from_slice(&amount.to_le_bytes());
+            }
+        }
     }
     write_varint(&mut out, a.short_ids.len() as u64);
     for s in &a.short_ids {
@@ -138,11 +169,37 @@ pub fn decode_announce(form: GenesisForm, buf: &[u8]) -> Result<BlockAnnounce, D
     let hdr_bytes = r.rest(header_wire_len(form), "announce.header")?;
     let header = decode_header(form, &hdr_bytes)?;
     let nonce = r.u64_le("announce.nonce")?;
-    let coinbase = r.u64_le("announce.coinbase")?;
-    let mut coinbase_rkm = [0u64; 4];
-    for lane in coinbase_rkm.iter_mut() {
-        *lane = r.u64_le("announce.coinbase_rkm")?;
-    }
+    let (coinbase, coinbase_rkm) = match form {
+        GenesisForm::V4 => {
+            let coinbase = r.u64_le("announce.coinbase")?;
+            let mut coinbase_rkm = [0u64; 4];
+            for lane in coinbase_rkm.iter_mut() {
+                *lane = r.u64_le("announce.coinbase_rkm")?;
+            }
+            (coinbase, coinbase_rkm)
+        }
+        GenesisForm::V5 => {
+            let count = r.u8("announce.payee_count")? as usize;
+            if count > COINBASE_PAYEE_CAP_V5 {
+                // The birth cap, refused BY NAME at decode: an in-memory body
+                // cannot even represent an over-cap list, so an announce
+                // naming one is not a block this build can validate.
+                return Err(DecodeError::TooManyCoinbasePayees {
+                    got: count,
+                    cap: COINBASE_PAYEE_CAP_V5,
+                });
+            }
+            let mut coinbase = 0u64;
+            let mut coinbase_rkm = [0u64; 4];
+            if count == 1 {
+                for lane in coinbase_rkm.iter_mut() {
+                    *lane = r.u64_le("announce.payee_rkm")?;
+                }
+                coinbase = r.u64_le("announce.payee_amount")?;
+            }
+            (coinbase, coinbase_rkm)
+        }
+    };
     let n_short = r.varint()? as usize;
     let mut short_ids = Vec::with_capacity(n_short);
     for _ in 0..n_short {
@@ -392,4 +449,58 @@ mod tests {
             Reconstruct::Complete(_) => panic!("expected missing"),
         }
     }
+    // ── v5 payee-list announce (lab #470 stage 2) ───────────────────────────
+
+    fn sample_announce() -> BlockAnnounce {
+        BlockAnnounce {
+            header: header(),
+            nonce: 0xDEADBEEF,
+            coinbase: 5_000_000_000,
+            coinbase_rkm: [11, 22, 33, 44],
+            short_ids: vec![short_id(0xDEADBEEF, &tx_id(&tx(2)))],
+            prefilled: vec![PrefilledTx { index: 0, tx: tx(1) }],
+        }
+    }
+
+    #[test]
+    fn v5_announce_round_trips_the_payee_list() {
+        let mut a = sample_announce();
+        let bytes = encode_announce(GenesisForm::V5, &a);
+        let back = decode_announce(GenesisForm::V5, &bytes).unwrap();
+        assert_eq!(back.coinbase, a.coinbase);
+        assert_eq!(back.coinbase_rkm, a.coinbase_rkm);
+        assert_eq!(back.header, a.header);
+        // The mint-nothing shape carries a 0 count and round-trips too.
+        a.coinbase = 0;
+        a.coinbase_rkm = [0; 4];
+        let bytes = encode_announce(GenesisForm::V5, &a);
+        let back = decode_announce(GenesisForm::V5, &bytes).unwrap();
+        assert_eq!(back.coinbase, 0);
+        assert_eq!(back.coinbase_rkm, [0; 4]);
+    }
+
+    /// N > cap on the wire is refused BY NAME at decode — an in-memory body
+    /// cannot even represent an over-cap list.
+    #[test]
+    fn v5_announce_refuses_more_payees_than_the_cap_by_name() {
+        let a = sample_announce();
+        let good = encode_announce(GenesisForm::V5, &a);
+        // Hand-forge a 2-payee announce: bump the count byte and splice in a
+        // second (rkm ‖ amount) entry after the first.
+        let count_pos = 97 + 8; // header ‖ nonce ‖ count
+        assert_eq!(good[count_pos], 1, "fixture announce carries one payee");
+        let entry_start = count_pos + 1;
+        let entry_len = 32 + 8;
+        let mut forged = Vec::new();
+        forged.extend_from_slice(&good[..count_pos]);
+        forged.push(2);
+        forged.extend_from_slice(&good[entry_start..entry_start + entry_len]);
+        forged.extend_from_slice(&good[entry_start..entry_start + entry_len]);
+        forged.extend_from_slice(&good[entry_start + entry_len..]);
+        assert!(matches!(
+            decode_announce(GenesisForm::V5, &forged),
+            Err(DecodeError::TooManyCoinbasePayees { got: 2, cap: 1 })
+        ));
+    }
+
 }

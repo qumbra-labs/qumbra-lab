@@ -72,6 +72,50 @@ pub const BODY_PREIMAGE_DOMAIN: &[u8] = b"qumbra:body:v2";
 /// property, and `golden_body_commitment_bytes` is its lock.
 pub const BODY_PREIMAGE_DOMAIN_V3: &[u8] = b"qumbra:body:v3";
 
+/// Domain tag for **body format v5** — the T2 genesis-format-v5 body (lab
+/// #470; there is deliberately no "v4" body format: body format numbers now
+/// track the GENESIS format they belong to, so nobody has to remember an
+/// off-by-one between the two ladders forever).
+///
+/// The v5 body is one form from height 0 on a v5-genesis net. Relative to v3
+/// it (stage 2, C1) replaces the `coinbase(8 LE) ‖ coinbase_rkm(4×8 LE)` tail
+/// with a **payee list**: `payee_count(1) ‖ [rkm(4×8 LE) ‖ amount(8 LE)]×N` —
+/// the total is Σ amounts, carried nowhere else, so a redundant total that
+/// could disagree with its own list is unrepresentable. Stage 3 (C3) folds the
+/// arity counts and the unified bucket byte into the per-tx region; the v5
+/// golden is locked then, not before.
+pub const BODY_PREIMAGE_DOMAIN_V5: &[u8] = b"qumbra:body:v5";
+
+/// The v5 coinbase payee cap **at birth**: 1 (the pool-payout-axis ruling,
+/// DECIDED 2026-08-11 — "N = 1 enforced by consensus at birth, the cap raised
+/// later by halt-height rule change, never by body-format change"). The format
+/// carries a count byte, so raising this is a release + rule boundary, never a
+/// re-mint.
+pub const COINBASE_PAYEE_CAP_V5: usize = 1;
+
+/// The three body-commitment preimage forms. Internal: public callers go
+/// through `commitment` (v2), `commitment_at`/`commitment_above` (the
+/// height-keyed v2/v3 rule) and `commitment_v5`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyPreimageForm {
+    V2,
+    V3,
+    V5,
+}
+
+/// One coinbase payee in the v5 body form: a raw `rkm` and the amount it is
+/// paid. At the birth cap (N = 1) the single payee's amount IS the block's
+/// total mint; the per-payee split semantics unlock with the cap raise
+/// (payout-axis ruling: "(a)'s semantics unlock through that rule change").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CoinbasePayee {
+    /// The payee's raw re-randomized key material (same meaning as
+    /// [`BlockBody::coinbase_rkm`]).
+    pub rkm: [u64; 4],
+    /// The amount this payee is paid, in bessel.
+    pub amount: u64,
+}
+
 /// The public surface of a shielded transaction — everything consensus checks
 /// without opening the proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,8 +339,22 @@ impl BlockBody {
     /// locked by `golden_body_commitment_bytes`, which is now the live-chain
     /// compatibility lock rather than merely a format lock.
     fn preimage(&self, v3: bool) -> Vec<u8> {
+        self.preimage_form(if v3 { BodyPreimageForm::V3 } else { BodyPreimageForm::V2 })
+    }
+
+    /// The commitment preimage under one of the three body forms. v2 and v3
+    /// are byte-identical to what `preimage(bool)` always produced (their
+    /// goldens are the lock); v5 (lab #470 stage 2) shares the v3 per-tx
+    /// region for now — stage 3 folds the C3 batch into it — and replaces the
+    /// coinbase tail with the payee list.
+    fn preimage_form(&self, form: BodyPreimageForm) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.extend_from_slice(if v3 { BODY_PREIMAGE_DOMAIN_V3 } else { BODY_PREIMAGE_DOMAIN });
+        buf.extend_from_slice(match form {
+            BodyPreimageForm::V2 => BODY_PREIMAGE_DOMAIN,
+            BodyPreimageForm::V3 => BODY_PREIMAGE_DOMAIN_V3,
+            BodyPreimageForm::V5 => BODY_PREIMAGE_DOMAIN_V5,
+        });
+        let rider_tail = !matches!(form, BodyPreimageForm::V2);
         for tx in &self.txs {
             buf.extend_from_slice(&tx.public.anchor);
             for nf in &tx.public.nullifiers {
@@ -311,16 +369,45 @@ impl BlockBody {
             buf.extend_from_slice(&tx.proof);
             buf.extend_from_slice(&(tx.discovery.len() as u64).to_le_bytes());
             buf.extend_from_slice(&tx.discovery);
-            if v3 {
+            if rider_tail {
                 buf.extend_from_slice(&(tx.rider.len() as u64).to_le_bytes());
                 buf.extend_from_slice(&tx.rider);
             }
         }
-        buf.extend_from_slice(&self.coinbase.to_le_bytes());
-        for lane in &self.coinbase_rkm {
-            buf.extend_from_slice(&lane.to_le_bytes());
+        match form {
+            BodyPreimageForm::V2 | BodyPreimageForm::V3 => {
+                buf.extend_from_slice(&self.coinbase.to_le_bytes());
+                for lane in &self.coinbase_rkm {
+                    buf.extend_from_slice(&lane.to_le_bytes());
+                }
+            }
+            BodyPreimageForm::V5 => {
+                // The payee-list tail: count ‖ [rkm ‖ amount]×N. The total is
+                // Σ amounts and travels nowhere else — a redundant total that
+                // could disagree with its own list is unrepresentable.
+                let payees = self.coinbase_payees();
+                // A real check, not a debug_assert (#253 house rule): the bar
+                // is --release, and an encoder emitting an over-cap count
+                // would be committing a body no validator accepts.
+                assert!(payees.len() <= COINBASE_PAYEE_CAP_V5);
+                buf.push(payees.len() as u8);
+                for p in &payees {
+                    for lane in &p.rkm {
+                        buf.extend_from_slice(&lane.to_le_bytes());
+                    }
+                    buf.extend_from_slice(&p.amount.to_le_bytes());
+                }
+            }
         }
         buf
+    }
+
+    /// The **v5** body commitment (lab #470). Stage-2 state: not yet
+    /// golden-locked — stage 3 folds the C3 batch into the per-tx region and
+    /// locks the golden; nothing consensus-reachable selects this form until
+    /// the v5 loader (stage 4).
+    pub fn commitment_v5(&self) -> Hash32 {
+        keccak256(&self.preimage_form(BodyPreimageForm::V5))
     }
 
     /// Total fees in the body (posted prices; the miner earns these + coinbase
@@ -354,6 +441,24 @@ impl BlockBody {
     /// [`BodyError::MissingCoinbasePayee`].
     pub fn mints_without_payee(&self) -> bool {
         self.coinbase > 0 && self.coinbase_rkm == [0u64; 4]
+    }
+
+    /// This body's coinbase as a **v5 payee list** (lab #470 stage 2). The
+    /// in-memory body stays single-payee (the birth cap is 1, and every v4
+    /// consumer keeps reading `coinbase`/`coinbase_rkm` unchanged — the
+    /// provable-equivalence requirement); this derivation is the one place the
+    /// list shape comes from, so the two representations cannot drift.
+    ///
+    /// Empty exactly when the body mints nothing and names nobody (genesis);
+    /// otherwise one entry paying the whole mint. A minting body with a zero
+    /// payee stays representable (and refused) via
+    /// [`BodyError::MissingCoinbasePayee`], same as v2/v3.
+    pub fn coinbase_payees(&self) -> Vec<CoinbasePayee> {
+        if self.coinbase == 0 && self.coinbase_rkm == [0u64; 4] {
+            Vec::new()
+        } else {
+            vec![CoinbasePayee { rkm: self.coinbase_rkm, amount: self.coinbase }]
+        }
     }
 }
 
@@ -412,6 +517,11 @@ pub enum BodyError {
     /// boundary can be negative, so height 0 can never reach it — the exemption is a
     /// property of the comparison rather than a list of exceptions to maintain.
     WrongScheduledCoinbase { height: u64, expected: u64, got: u64 },
+    /// The v5 coinbase payee list is longer than the birth cap
+    /// ([`COINBASE_PAYEE_CAP_V5`]) — lab #470 stage 2. The cap is a
+    /// rule-change lever: the FORMAT carries a count byte, so a later release
+    /// raises this by halt-boundary rule change, never by re-mint.
+    TooManyCoinbasePayees { got: usize, cap: usize },
     /// The tx at `index` references an anchor that is not a finalized root (§6).
     AnchorNotFinal { index: usize },
     /// The tx at `index` pays the wrong fee for its arity bucket (§8).
@@ -524,11 +634,75 @@ pub fn check_scheduled_coinbase_above(
         // never compared against genesis's committed 0.
         return Ok(());
     }
+    check_committed_against_exact(height, committed)
+}
+
+/// The core of the scheduled-emission rule — ONE comparison against
+/// [`coinbase_exact`], shared by the v4 boundary form above and the v5 payee
+/// form below (lab #470 stage 2: "extend the seam, do not fork it").
+fn check_committed_against_exact(height: u64, committed: u64) -> Result<(), BodyError> {
     let expected = coinbase_exact(height);
     if committed != expected {
         return Err(BodyError::WrongScheduledCoinbase { height, expected, got: committed });
     }
     Ok(())
+}
+
+/// **The v5 scheduled-emission rule** (lab #470 stage 2, C1): on a v5-genesis
+/// net the exact schedule is native, so Σ(payee amounts) must equal
+/// [`coinbase_exact`]`(height)` for **every** height above genesis — no
+/// boundary, no grandfathering, no pins. Genesis stays structurally exempt
+/// the way it always was: it mints nothing, so its (empty) list must sum to 0.
+///
+/// This extends the same seam [`check_scheduled_coinbase`] owns — the actual
+/// comparison is the shared [`check_committed_against_exact`] — and adds the
+/// two payee-shape refusals the payout-axis ruling names:
+/// - more payees than the birth cap ([`COINBASE_PAYEE_CAP_V5`]) is
+///   [`BodyError::TooManyCoinbasePayees`];
+/// - a zero-payee (or otherwise short) list on a minting height fails the Σ
+///   comparison itself — Σ = 0 is not the schedule's coinbase, and the error
+///   names both numbers.
+///
+/// The Σ is computed in u128 so an adversarial list cannot wrap u64 into a
+/// passing total.
+pub fn check_scheduled_coinbase_payees(
+    height: u64,
+    payees: &[CoinbasePayee],
+) -> Result<(), BodyError> {
+    if payees.len() > COINBASE_PAYEE_CAP_V5 {
+        return Err(BodyError::TooManyCoinbasePayees {
+            got: payees.len(),
+            cap: COINBASE_PAYEE_CAP_V5,
+        });
+    }
+    let total: u128 = payees.iter().map(|p| p.amount as u128).sum();
+    if height == 0 {
+        // Genesis mints nothing; an empty (or all-zero) list is the only
+        // passing shape. coinbase_exact(0) is never consulted — same
+        // structural exemption the v4 boundary form has.
+        return if total == 0 {
+            Ok(())
+        } else {
+            Err(BodyError::WrongScheduledCoinbase {
+                height: 0,
+                expected: 0,
+                got: total.min(u64::MAX as u128) as u64,
+            })
+        };
+    }
+    let committed = match u64::try_from(total) {
+        Ok(v) => v,
+        Err(_) => {
+            // Σ overflows u64: it cannot equal any u64 schedule value; refuse
+            // with the saturated figure rather than wrapping.
+            return Err(BodyError::WrongScheduledCoinbase {
+                height,
+                expected: coinbase_exact(height),
+                got: u64::MAX,
+            });
+        }
+    };
+    check_committed_against_exact(height, committed)
 }
 
 /// Check that `body` is the body `header` committed to (issue #77).

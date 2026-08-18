@@ -2028,6 +2028,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             // (#101), the posted-price fee (§8), in-block nullifier uniqueness, and
             // the STARK proof. No node's chain position changes any of these answers.
             BodyError::MissingCoinbasePayee
+            // Lab #470 stage 2: the payee-list length is a fact of the body
+            // alone (and the birth cap a compiled constant) — as intrinsic as
+            // MissingCoinbasePayee, whose class it shares.
+            | BodyError::TooManyCoinbasePayees { .. }
             // Lab #299. `coinbase_exact(header.height)` is a pure function of the
             // height, evaluated identically on every conforming platform (#303) —
             // which is exactly what makes this intrinsic rather than positional. A

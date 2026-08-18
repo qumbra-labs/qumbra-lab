@@ -71,6 +71,11 @@ pub enum DecodeError {
     WrongHeaderLen { got: usize, want: usize },
     /// A v5 block header's format-version byte (offset 32) was not 0x05.
     BadHeaderVersion { got: u8 },
+    /// A v5 announce names more coinbase payees than the birth cap (lab #470
+    /// stage 2, `COINBASE_PAYEE_CAP_V5`) — refused by name at decode: the
+    /// in-memory body cannot represent an over-cap list, so this is a block
+    /// this build cannot validate (the same grounds as `BadBucket`).
+    TooManyCoinbasePayees { got: usize, cap: usize },
 }
 
 impl From<CodecError> for DecodeError {
