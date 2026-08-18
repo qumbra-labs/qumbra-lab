@@ -1137,6 +1137,45 @@ mod tests {
         assert_eq!(cfg.discovery_bind(), Some(crate::discovery_server::DEFAULT_DISCOVERY_ADDR));
     }
 
+    /// 🔴 Acceptance (c) as an equality rather than a description. The task book
+    /// asks for "byte-identical behavior to today's manual config"; for a config
+    /// that means every value the node reads, so this parses the hand-written
+    /// miner config from `docs/join-and-mine.md` §3 and the one `mine --rkm`
+    /// writes, and asserts the two `NodeConfig`s are equal. The files differ by
+    /// `mine`'s header comment, which `NodeConfig` never sees — and a test that
+    /// compared the FILES would be pinning a comment.
+    #[test]
+    fn the_rkm_config_equals_the_hand_written_one_from_the_join_docs() {
+        let rkm = "0100000000000000020000000000000003000000000000000400000000000000";
+        let seeds: Vec<String> = T1_SEEDS.iter().map(|s| s.to_string()).collect();
+
+        // `docs/join-and-mine.md` §3: §2's joiner config with the two mining
+        // fields changed, written by hand in whatever order the operator likes.
+        let hand = format!(
+            "mining = true\n\
+             miner_rkm = \"{rkm}\"\n\
+             data_dir = \"/m/data\"\n\
+             listen_addr = \"{DEFAULT_LISTEN_ADDR}\"\n\
+             dial_peers = [{peers}]\n\
+             genesis_file = \"/m/genesis.qmb\"\n\
+             expected_genesis_hash = \"{T1_EXPECTED_GENESIS_HASH}\"\n",
+            peers = seeds.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(","),
+        );
+        let generated = render_node_toml(&ConfigInputs {
+            data_dir: Path::new("/m/data"),
+            listen_addr: DEFAULT_LISTEN_ADDR,
+            seeds: &seeds,
+            genesis_file: Path::new("/m/genesis.qmb"),
+            expected_genesis_hash: T1_EXPECTED_GENESIS_HASH,
+            miner_rkm: rkm,
+        });
+        assert_eq!(
+            NodeConfig::from_toml(&hand).expect("the documented config parses"),
+            NodeConfig::from_toml(&generated).expect("the generated config parses"),
+            "a mine-born node must be indistinguishable from a hand-configured one"
+        );
+    }
+
     /// Re-running `mine` on its own directory is a no-op; re-running it over a
     /// hand-edited config REFUSES rather than destroying the edit.
     #[test]
