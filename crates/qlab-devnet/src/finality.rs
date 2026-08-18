@@ -198,6 +198,23 @@ impl FinalityTracker {
     pub fn count(&self) -> usize {
         self.finalized.len()
     }
+
+    /// The last `n` finalized checkpoints, ascending — the whole record when it
+    /// holds fewer than `n`.
+    ///
+    /// Additive read accessor for the explorer's checkpoint ticker (lab #486 R2,
+    /// coordinator-ruled seam): lab-internal Rust API, no wire, no consensus read.
+    /// Before this the record was **unenumerable** from outside — the public
+    /// surface answered `latest()`/`count()` and membership queries only — so the
+    /// alternative was a second copy of this Vec sampled from a run loop, which
+    /// could only ever see checkpoints that were the head at a loop tick.
+    ///
+    /// The caller's serving bound is the caller's; this returns a borrow and
+    /// copies nothing. (The devnet Vec itself is unbounded — the ~144-root bound
+    /// noted on the field is not implemented, pre-existing, #135-adjacent.)
+    pub fn finalized_tail(&self, n: usize) -> &[Checkpoint] {
+        &self.finalized[self.finalized.len().saturating_sub(n)..]
+    }
 }
 
 #[cfg(test)]
@@ -255,6 +272,31 @@ mod tests {
         assert_eq!(tracker.latest(), Some(&checkpoint));
         assert_eq!(tracker.finalized_height(), Some(8));
         assert_eq!(tracker.count(), 1);
+    }
+
+    /// The lab #486 R2 accessor: the tail is ascending, bounded by what is asked
+    /// for, whole when the record is shorter, and empty on a fresh tracker.
+    #[test]
+    fn finalized_tail_returns_the_last_n_ascending() {
+        let (committee, validators) = devnet_committee(7); // quorum = 5
+        let mut fin = FinalityTracker::new();
+        assert!(fin.finalized_tail(4).is_empty(), "nothing finalized yet");
+
+        for h in [8u64, 16, 24, 32] {
+            let cp = Checkpoint::new(h, [h as u8; 32], [h as u8; 32]);
+            let votes: Vec<Vote> =
+                validators[..5].iter().map(|v| v.sign_checkpoint(&cp)).collect();
+            fin.try_finalize(&cp, &votes, &committee).unwrap();
+        }
+
+        let tail = fin.finalized_tail(2);
+        assert_eq!(tail.iter().map(|c| c.height).collect::<Vec<_>>(), vec![24, 32]);
+        assert_eq!(
+            fin.finalized_tail(100).iter().map(|c| c.height).collect::<Vec<_>>(),
+            vec![8, 16, 24, 32],
+            "asking for more than the record holds returns the whole record"
+        );
+        assert!(fin.finalized_tail(0).is_empty());
     }
 
     #[test]
