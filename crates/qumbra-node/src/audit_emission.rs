@@ -378,9 +378,20 @@ pub fn parse_args(args: &[String]) -> Result<(PathBuf, Option<u64>, Option<u64>)
                 to = Some(parse_u64(v, "--to")?);
                 i += 2;
             }
+            // #422's flag is extracted by the CALLER (cmd_audit_emission, which
+            // parses the hex with the node's own rkm function). This parser must
+            // step over the pair, not reject it — rejecting here made `--payee`
+            // unreachable from the CLI since the day it merged: parse_args runs
+            // first and errored before the caller ever looked for the flag.
+            "--payee" => {
+                args.get(i + 1).ok_or_else(|| {
+                    AuditError::Usage("--payee requires a 64-hex key".into())
+                })?;
+                i += 2;
+            }
             other => {
                 return Err(AuditError::Usage(format!(
-                    "unknown argument `{other}` (expected --data-dir / --from / --to)"
+                    "unknown argument `{other}` (expected --data-dir / --from / --to / --payee)"
                 )));
             }
         }
@@ -618,6 +629,23 @@ mod tests {
         let err = audit_emission(&dir, None, None, None).unwrap_err();
         assert_eq!(err.name(), "interval_beyond_tip");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+        #[test]
+    fn parse_args_steps_over_payee_the_caller_extracts() {
+        // The defect this pins: --payee was rejected as unknown by THIS parser
+        // before cmd_audit_emission (which owns the flag) ever saw it — so the
+        // #422 feature was CLI-unreachable from merge day. Found live 2026-08-18
+        // trying to attribute hel1's first blocks.
+        let args: Vec<String> = ["--data-dir", "/tmp/x", "--payee", "ab", "--from", "7"]
+            .iter().map(|s| s.to_string()).collect();
+        let (dir, from, to) = parse_args(&args).expect("--payee must not be rejected here");
+        assert_eq!(dir, std::path::PathBuf::from("/tmp/x"));
+        assert_eq!(from, Some(7));
+        assert_eq!(to, None);
+        // and the missing-value shape still errors by name
+        let bad: Vec<String> = ["--data-dir", "/tmp/x", "--payee"].iter().map(|s| s.to_string()).collect();
+        assert!(parse_args(&bad).is_err());
     }
 
     #[test]
