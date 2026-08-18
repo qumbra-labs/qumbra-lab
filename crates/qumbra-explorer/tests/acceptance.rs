@@ -20,7 +20,8 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use qlab_devnet::pow::KeccakPow;
 use qumbra_explorer::config::ExplorerConfig;
-use qumbra_explorer::http::{ExplorerServer, HEALTH_PATH, TXLIST_PATH};
+use qumbra_explorer::http::{ExplorerServer, Surfaces, HEALTH_PATH, TXLIST_PATH};
+use qumbra_explorer::names::NameEventsView;
 use qumbra_explorer::json;
 use qumbra_explorer::txlist::{self, BlockTxs, Next, TxFacts, TxListPage, TxListView};
 use qumbra_node::config::NodeConfig;
@@ -100,8 +101,15 @@ fn a_real_observer_node_serves_the_projection_over_a_real_socket() {
         txlist::refresh_shared(&txlist_view, node.state().chain()),
         "the first projection runs against a real chain store"
     );
-    let server = ExplorerServer::start("127.0.0.1:0", Arc::clone(&page), Arc::clone(&txlist_view))
-        .expect("bind");
+    let server = ExplorerServer::start(
+        "127.0.0.1:0",
+        Surfaces {
+            health: Arc::clone(&page),
+            txlist: Arc::clone(&txlist_view),
+            names: Arc::new(Mutex::new(Arc::new(NameEventsView::default()))),
+        },
+    )
+    .expect("bind");
     let addr = server.addr();
 
     // 1. The projection, from a live node's own view.
@@ -256,7 +264,15 @@ fn the_client_pages_a_live_shaped_chain_off_a_real_socket_and_finds_a_pasted_id(
 
     let page = Arc::new(RwLock::new("{}".to_string()));
     let slot = Arc::new(Mutex::new(Arc::new(view)));
-    let server = ExplorerServer::start("127.0.0.1:0", page, Arc::clone(&slot)).expect("bind");
+    let server = ExplorerServer::start(
+        "127.0.0.1:0",
+        Surfaces {
+            health: page,
+            txlist: Arc::clone(&slot),
+            names: Arc::new(Mutex::new(Arc::new(NameEventsView::default()))),
+        },
+    )
+    .expect("bind");
     let addr = server.addr();
 
     // The client half: fetch, decode, decide, repeat.

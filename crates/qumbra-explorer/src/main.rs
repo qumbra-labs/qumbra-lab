@@ -23,8 +23,9 @@ use qlab_node::round::ObsClock;
 use qlab_p2p::adapter::MiningClock;
 
 use qumbra_explorer::config::ExplorerConfig;
-use qumbra_explorer::http::{self, ExplorerServer};
+use qumbra_explorer::http::{self, ExplorerServer, Surfaces};
 use qumbra_explorer::json;
+use qumbra_explorer::names::{self, NameEventsView};
 use qumbra_explorer::txlist::{self, TxListView};
 use qumbra_node::config::NodeConfig;
 use qumbra_node::genesis::GenesisFile;
@@ -96,11 +97,13 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  mining:         false (enforced)");
     println!("  extra listeners: none (telemetry_addr/metrics_addr refused — §6.2)");
     println!(
-        "  routes:         {} + {}?from=&to= + /healthz (no page, no write path)",
+        "  routes:         {} + {}?from=&to= + {}?from=&to= + /healthz (no page, no write path)",
         http::HEALTH_PATH,
-        http::TXLIST_PATH
+        http::TXLIST_PATH,
+        http::NAMES_EVENTS_PATH
     );
     println!("  tx lookup:      none — bulk list only, matched client-side (D2)");
+    println!("  name lookup:    none — event feed is range-only, resolve refused by name (D2)");
     Ok(())
 }
 
@@ -131,11 +134,21 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let txlist_view = Arc::new(Mutex::new(Arc::new(TxListView::default())));
     txlist::refresh_shared(&txlist_view, node.state().chain());
 
+    // The name-event feed, projected once pre-bind for the same first-read rule.
+    // Chain-derived from the persisted riders, so it BACKFILLS: an explorer
+    // rolled after the 19,008 boundary still serves every event from the
+    // boundary's first block (lab #486 stage-0 §4).
+    let names_view = Arc::new(Mutex::new(Arc::new(NameEventsView::default())));
+    names::refresh_shared(&names_view, node.state().chain());
+
     // A failure to bind is FATAL, same rule as the faucet's listener.
     let server = ExplorerServer::start(
         &cfg.listen_addr,
-        Arc::clone(&page),
-        Arc::clone(&txlist_view),
+        Surfaces {
+            health: Arc::clone(&page),
+            txlist: Arc::clone(&txlist_view),
+            names: Arc::clone(&names_view),
+        },
     )?;
 
     println!("qumbra-explorer running");
@@ -144,6 +157,11 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "  tx existence:   http://{}{}?from=&to=  (bulk only — no lookup by txid, by design)",
         server.addr(),
         http::TXLIST_PATH
+    );
+    println!(
+        "  name events:    http://{}{}?from=&to=  (range-only — no resolve-by-name, by design)",
+        server.addr(),
+        http::NAMES_EVENTS_PATH
     );
     println!("  page:           served separately (qumbra-explorer-web) — no / here");
     println!("  node listen:    {}", node.listen_addr());
@@ -190,6 +208,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         // known-stale transaction list back for it would be a second staleness
         // rule nobody asked for.
         txlist::refresh_shared(&txlist_view, n.state().chain());
+        names::refresh_shared(&names_view, n.state().chain());
     });
 
     server.shutdown();

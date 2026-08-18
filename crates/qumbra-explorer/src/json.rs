@@ -230,7 +230,7 @@ fn supply(t: &Telemetry) -> String {
 /// that its own input can break is a defect independent of who calls it, and
 /// `a_hostile_genesis_hash_cannot_break_the_document` is cheaper than the argument
 /// that no caller will ever change.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -280,7 +280,7 @@ fn agreement(t: &Telemetry) -> String {
 /// it is deliberately not used for a value the snapshot *refuses to state* — those
 /// keep their named string rendering (`age_s`, the identity fields), because a
 /// consumer's `|| 0` turns a null into a zero and a refusal into a lie.
-fn num(v: Option<u64>) -> String {
+pub(crate) fn num(v: Option<u64>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "null".into())
 }
 
