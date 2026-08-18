@@ -17,6 +17,15 @@
 //! so they share it through a `OnceLock` and each filters the recorder by the span
 //! attributes it created — which is also why the recorder is never reset.
 //!
+//! **And why they take a lock.** Sharing one recorder across threads makes any
+//! assertion about *what is not there* a race with whatever else is running. This
+//! file had exactly that bug for one commit: `an idle tick emits no spans` compared
+//! total recorder length before and after, and a concurrent test's request landing
+//! in between failed it about one run in ten. Two fixes, both kept, because either
+//! alone would leave the next test author to rediscover it: the tests run under a
+//! `serial()` mutex, AND the idle assertion counts only the span names that tick
+//! can produce.
+//!
 //! **No proof is run here, deliberately.** The grant tree is exercised on a faucet
 //! with no inventory, so `Faucet::dispense` stalls in microseconds and the span tree
 //! is identical in shape to the one a real grant produces. A real 2×2 proof is
@@ -85,6 +94,15 @@ impl SpanExporter for Recorder {
 struct Rig {
     recorder: Recorder,
     metrics: Arc<FaucetMetrics>,
+}
+
+/// The lock every test in this binary takes for its whole body. See the module
+/// docs: a shared recorder plus parallel tests is a race on every negative
+/// assertion. Poisoning is ignored — a panicking test has already failed, and
+/// wedging the rest behind it turns one failure into four.
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn rig() -> &'static Rig {
@@ -245,6 +263,7 @@ fn attr<'a>(span: &'a SpanData, key: &str) -> Option<&'a opentelemetry::Value> {
 /// resource the plan's standards line pins.
 #[test]
 fn a_request_produces_one_named_span_with_the_matched_route() {
+    let _serial = serial();
     let rig = rig();
     let service = open_service();
     let server = server_for(&service, Arc::clone(&rig.metrics));
@@ -291,6 +310,7 @@ fn a_request_produces_one_named_span_with_the_matched_route() {
 /// record of which receipts somebody went looking at.
 #[test]
 fn a_receipt_lookup_is_collapsed_to_a_route_template() {
+    let _serial = serial();
     let rig = rig();
     let service = open_service();
     let server = server_for(&service, Arc::clone(&rig.metrics));
@@ -330,6 +350,7 @@ fn a_receipt_lookup_is_collapsed_to_a_route_template() {
 /// with an empty queue emits nothing at all.
 #[test]
 fn the_grant_path_is_a_linked_span_tree_not_a_lie_about_nesting() {
+    let _serial = serial();
     let rig = rig();
     let mut service = open_service();
     let mut node = EmptyNode::new();
@@ -337,11 +358,26 @@ fn the_grant_path_is_a_linked_span_tree_not_a_lie_about_nesting() {
 
     // (0) An idle tick, BEFORE anything is queued: no spans, at 50 ticks a second
     // for the life of the process.
-    let before = rig.recorder.spans().len();
+    //
+    // Counted by NAME rather than by recorder length. Length is a claim about the
+    // whole process and this recorder is shared; the four names below are the only
+    // ones `tick` can produce, and nothing else in this binary produces them.
+    let tick_spans = |r: &Recorder| {
+        r.spans()
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.name.as_ref(),
+                    "faucet.grant" | "faucet.harvest" | "faucet.prove" | "faucet.submit"
+                )
+            })
+            .count()
+    };
+    let before = tick_spans(&rig.recorder);
     service.tick(&mut node, &mut rng);
     service.tick(&mut node, &mut rng);
     assert_eq!(
-        rig.recorder.spans().len(),
+        tick_spans(&rig.recorder),
         before,
         "an idle tick must emit NO spans — run_until_with calls it ~50x/s forever"
     );
@@ -423,6 +459,7 @@ fn the_grant_path_is_a_linked_span_tree_not_a_lie_about_nesting() {
 /// the plan buys is imaginary.
 #[test]
 fn the_log_line_and_the_exemplar_carry_the_same_trace_id() {
+    let _serial = serial();
     let rig = rig();
     let service = open_service();
     // A private registry for this test, so the exemplar assertion is about the one
