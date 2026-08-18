@@ -17,9 +17,9 @@ use qlab_devnet::header::{
     HEADER_VERSION_BYTE_V5,
 };
 use qlab_stratum::blob::{
-    apply_miner_nonce, assemble_nonce, check_v5_blob, extranonce_of, miner_nonce_of, set_extranonce,
-    V5_BLOB_LEN, V5_EXTRANONCE_LEN, V5_EXTRANONCE_OFF, V5_HEADER_VERSION, V5_MINER_NONCE_LEN,
-    V5_MINER_NONCE_OFF,
+    apply_miner_nonce, assemble_nonce, check_v5_blob, extranonce_of, miner_nonce_of,
+    set_extranonce, V5_BLOB_LEN, V5_EXTRANONCE_LEN, V5_EXTRANONCE_OFF, V5_HEADER_VERSION,
+    V5_MINER_NONCE_LEN, V5_MINER_NONCE_OFF,
 };
 
 #[test]
@@ -71,7 +71,10 @@ fn preimage_for_v5_is_byte_identical_to_stratum_blob_helpers() {
     check_v5_blob(&preimage).expect("devnet v5 preimage must pass the stratum blob check");
     assert_eq!(miner_nonce_of(&preimage).unwrap(), miner);
     assert_eq!(extranonce_of(&preimage).unwrap(), extra);
-    assert_eq!(&preimage[V5_MINER_NONCE_OFF..V5_MINER_NONCE_OFF + 4], &miner);
+    assert_eq!(
+        &preimage[V5_MINER_NONCE_OFF..V5_MINER_NONCE_OFF + 4],
+        &miner
+    );
     assert_eq!(&preimage[V5_EXTRANONCE_OFF..V5_EXTRANONCE_OFF + 4], &extra);
 
     // Rebuild from a zero-nonce preimage so we exercise set/apply
