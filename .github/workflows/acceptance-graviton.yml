@@ -83,6 +83,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       id-token: write   # OIDC only; no checkout, no contents
+      actions: read     # count this workflow's active runs for the queue-depth start
     steps:
       - name: The contract, or refuse by name
         env:
@@ -102,16 +103,35 @@ jobs:
           role-to-assume: ${{ vars.CI_RUNNER_ROLE_ARN }}
           aws-region: ${{ vars.CI_RUNNER_REGION }}
 
-      # Idempotent: on an already-running instance this is a no-op that
-      # reports the current state — which is exactly what a second
-      # concurrent PR wants.
-      - name: Start the instance and wait for `running`
+      # Queue-depth-proportional start (Larry's order, 2026-08-19): one
+      # active run needs one instance; the second wakes only when a second
+      # run is actually in the lane. Depth = this workflow's non-completed
+      # runs INCLUDING this one (queued/in_progress/waiting/pending all
+      # count — the same conservative direction as the stop guard, and the
+      # same asymmetry: an extra start costs cents, a missed one costs a
+      # queued wait). Idempotent per instance: starting a running instance
+      # is a no-op, so two concurrent runs computing depth=2 both starting
+      # both instances is harmless.
+      # Known trade vs start-them-all: if the ONE instance we start has a
+      # dead runner service, the suite sits queued (bounded: GitHub queue
+      # limit + the 2 h idle watchdog on the woken instance) where the old
+      # behavior might have been saved by the second box. Priced, accepted.
+      - name: Start as many instances as the queue needs
         env:
           INSTANCE_ID: ${{ vars.CI_RUNNER_INSTANCE_ID }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          aws ec2 start-instances --instance-ids $INSTANCE_ID # unquoted on purpose: the var may hold a space-separated LIST (two-runner topology, deploy #184)
-          aws ec2 wait instance-running --instance-ids $INSTANCE_ID
-          aws ec2 describe-instances --instance-ids $INSTANCE_ID \
+          active=$(gh api \
+            "repos/${{ github.repository }}/actions/workflows/acceptance-graviton.yml/runs?per_page=100" \
+            --jq '[.workflow_runs[] | select(.status != "completed")] | length')
+          [ "$active" -ge 1 ] || active=1
+          set -- $INSTANCE_ID   # unquoted on purpose: space-separated LIST (deploy #184)
+          want=$active; [ "$want" -gt $# ] && want=$#
+          to_start=$(printf '%s\n' "$@" | head -n "$want" | tr '\n' ' ')
+          echo "queue depth $active → starting $want of $# instance(s): $to_start"
+          aws ec2 start-instances --instance-ids $to_start
+          aws ec2 wait instance-running --instance-ids $to_start
+          aws ec2 describe-instances --instance-ids $to_start \
             --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output text
 
       # WHY THERE IS NO "poll until the runner reports online" STEP, though
