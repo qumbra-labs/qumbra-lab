@@ -497,6 +497,11 @@ pub struct StubNode {
     /// Cross-message vote accumulator: distinct verified active votes per checkpoint
     /// variant, until a quorum can be handed to `try_finalize` (M10-T0-5).
     tally: VoteTally,
+    /// The genesis-form this stub reports through [`ChainView::genesis_form`].
+    /// Defaults to V4 (the trait default every sim relied on before lab #474);
+    /// handshake tests that exercise the v5 net-id posture override it — the
+    /// same knob `NodeAdapter` gets from its installed `ChainRules`.
+    form: qlab_devnet::forms::GenesisForm,
 }
 
 impl StubNode {
@@ -523,12 +528,19 @@ impl StubNode {
             signing: SigningWindow::new(DOWNTIME_JAIL_WINDOW, DOWNTIME_JAIL_THRESHOLD_PCT),
             votes_seen: HashMap::new(),
             tally: VoteTally::new(),
+            form: qlab_devnet::forms::GenesisForm::V4,
         }
     }
 
     /// Override the downtime signing window (tests use a small window so it fills).
     pub fn set_signing_window(&mut self, window: usize, threshold_pct: u64) {
         self.signing = SigningWindow::new(window, threshold_pct);
+    }
+
+    /// Override the reported genesis form (lab #474 handshake-posture tests;
+    /// see the `form` field). Production nodes get theirs from `ChainRules`.
+    pub fn set_genesis_form(&mut self, form: qlab_devnet::forms::GenesisForm) {
+        self.form = form;
     }
 
     /// Read-only chain access (tests / assertions).
@@ -563,6 +575,9 @@ impl StubNode {
 impl ChainView for StubNode {
     fn genesis_block_hash(&self) -> Hash32 {
         self.chain.genesis_block_hash()
+    }
+    fn genesis_form(&self) -> qlab_devnet::forms::GenesisForm {
+        self.form
     }
     fn tip_hash(&self) -> Hash32 {
         self.chain.tip_hash()

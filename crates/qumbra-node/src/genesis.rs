@@ -26,13 +26,17 @@
 //! rather than special-cased, and the config pin is a second independent gate
 //! rather than the only one.
 //!
-//! ## Committee keys — the T0 rehearsal arrangement (item 4)
-//! Genesis committee₀ is the frozen N=21 / quorum 15. For the T0 rehearsal the
-//! 21 ML-DSA signing keys are derived from deterministic seeds (byte-identical to
+//! ## Committee keys — the T0/T2 rehearsal arrangement (item 4), plus the T2 launch path
+//! Genesis committee₀ is the frozen N=21 / quorum 15. For rehearsal the 21 ML-DSA
+//! signing keys are derived from deterministic seeds (byte-identical to
 //! `qlab_devnet::committee::devnet_committee(21)`) and distributed across the
 //! operator's nodes as key files — the honestly-labelled "federation-of-one"
-//! that mirrors M11. Real validators generate their own keys off-band; only the
-//! verifying keys are baked here.
+//! that mirrors M11. **Lab #506** adds `genesis init --t2 --launch`: same v5
+//! shape, but the 21 seeds come from OS randomness through the existing
+//! [`Validator::from_seed`] seam (so [`KeyFile`] still stores `seed_hex` and
+//! [`GenesisFile::load_validators`] is unchanged). Without `--launch` the
+//! rehearsal path is byte-identical to before. Real validators generate their
+//! own keys off-band; only the verifying keys are baked here.
 
 use ml_dsa::{EncodedVerifyingKey, MlDsa65, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -106,7 +110,112 @@ pub const CONSENSUS_WIRE_BYTES: u64 = 148_625;
 /// a real-RandomX rehearsal net mines on laptop hardware; the real launch
 /// difficulty is an open tokenomics/consensus question (params_devnet
 /// `GENESIS_DIFFICULTY`). Baked into the genesis block so every node agrees.
+///
+/// Lab #506: `--t2 --launch --difficulty <u64>` overrides this; the default
+/// **stays** this placeholder (coordinator ruling: LWMA fodder, not ceremony
+/// friction).
 pub const T0_GENESIS_DIFFICULTY: u64 = 256;
+
+/// Banner line for `genesis init --t2 --launch` (lab #506). A ceremony operator
+/// reading stdout must be able to tell this mint is **not** the pinned rehearsal.
+pub const LAUNCH_MODE_BANNER: &str = "LAUNCH — keys from OS randomness, hash NOT reproducible";
+
+/// Banner line for the rehearsal path (`genesis init` / `genesis init --t2`
+/// without `--launch`). The `[devnet-placeholder]` tag is the pre-#506 note.
+pub const REHEARSAL_MODE_BANNER: &str =
+    "rehearsal — deterministic committee seeds [devnet-placeholder]";
+
+/// [`KeyFile::note`] for rehearsal keys — **byte-identical** to the pre-#506
+/// string, so `--t2` without `--launch` writes the same files as today.
+pub const REHEARSAL_KEY_NOTE: &str =
+    "devnet T0 rehearsal key (deterministic seed) — NOT a real validator key";
+
+/// [`KeyFile::note`] for launch keys. The files are still seed-hex TOML (the
+/// existing load path); the note is what tells an operator these seeds are
+/// **not** `committee_seed(i)`.
+pub const LAUNCH_KEY_NOTE: &str =
+    "LAUNCH committee key (OS-random seed) — NOT recoverable from source";
+
+/// Which mode minted this genesis — the string printed on `genesis init`.
+pub fn mode_banner(launch: bool) -> &'static str {
+    if launch {
+        LAUNCH_MODE_BANNER
+    } else {
+        REHEARSAL_MODE_BANNER
+    }
+}
+
+/// Parsed `genesis init` flags (lab #506). Lives next to the constructors it
+/// selects so the CLI glue in `main.rs` stays a write + a banner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenesisInitPlan {
+    /// `--out DIR`, default `.`.
+    pub out: std::path::PathBuf,
+    /// `--t2` — mint the v5 T2 genesis rather than the T1 file.
+    pub t2: bool,
+    /// `--launch` — OS-random committee keys. Requires [`Self::t2`].
+    pub launch: bool,
+    /// `--difficulty <u64>`, default [`T0_GENESIS_DIFFICULTY`]. Honoured only
+    /// on the launch path; the parser refuses the flag without `--launch` so a
+    /// fat-finger cannot move the rehearsal pin.
+    pub difficulty: u64,
+}
+
+impl GenesisInitPlan {
+    /// Parse the args after `genesis init`. Unknown flags are skipped — today's
+    /// command only looked at `--out` / `--t2`, and refusing unknowns here would
+    /// turn every future additive flag into a surprise break of old scripts.
+    pub fn parse(args: &[String]) -> Result<Self, String> {
+        let mut out = std::path::PathBuf::from(".");
+        let mut t2 = false;
+        let mut launch = false;
+        let mut difficulty: Option<u64> = None;
+        let mut i = 0;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--out" => {
+                    let v = args.get(i + 1).ok_or("--out requires a directory")?;
+                    out = std::path::PathBuf::from(v);
+                    i += 2;
+                }
+                "--t2" => {
+                    t2 = true;
+                    i += 1;
+                }
+                "--launch" => {
+                    launch = true;
+                    i += 1;
+                }
+                "--difficulty" => {
+                    let v = args.get(i + 1).ok_or("--difficulty requires a u64")?;
+                    difficulty = Some(v.parse::<u64>().map_err(|_| {
+                        format!("--difficulty expects a non-negative integer, got `{v}`")
+                    })?);
+                    i += 2;
+                }
+                _ => i += 1,
+            }
+        }
+        if launch && !t2 {
+            return Err(
+                "`--launch` requires `--t2` (T1 genesis is a live network identity; launch is the T2 ceremony path)"
+                    .into(),
+            );
+        }
+        if difficulty.is_some() && !launch {
+            return Err(
+                "`--difficulty` requires `--launch` (rehearsal genesis stays byte-identical without it)"
+                    .into(),
+            );
+        }
+        Ok(Self {
+            out,
+            t2,
+            launch,
+            difficulty: difficulty.unwrap_or(T0_GENESIS_DIFFICULTY),
+        })
+    }
+}
 
 /// The frozen self-bond ramp (consensus-parameters §4), in **QMB**: at each
 /// epoch boundary the minimum self-bond steps up. `(epoch, bond_qmb)`.
@@ -394,21 +503,37 @@ pub enum GenesisError {
     /// TOML parse (key file) failed.
     Parse(String),
     /// Genesis format version is not [`GENESIS_FORMAT_VERSION`].
-    WrongFormatVersion { got: u32, want: u32 },
+    WrongFormatVersion {
+        got: u32,
+        want: u32,
+    },
     /// The committee-key count does not match the frozen committee size.
-    WrongCommitteeSize { got: usize, want: u32 },
+    WrongCommitteeSize {
+        got: usize,
+        want: u32,
+    },
     /// The baked quorum does not equal ⌊2N/3⌋+1.
-    WrongQuorum { got: u32, want: usize },
+    WrongQuorum {
+        got: u32,
+        want: usize,
+    },
     /// A committee verifying key failed to decode.
-    BadCommitteeKey { index: usize },
+    BadCommitteeKey {
+        index: usize,
+    },
     /// The genesis hash does not match the expected pin (node refuses to start).
-    WrongGenesisHash { got: String, want: String },
+    WrongGenesisHash {
+        got: String,
+        want: String,
+    },
     /// A key file's hex seed was malformed.
     BadHex,
     /// A key file's seed was not 32 bytes.
     BadSeedLen,
     /// A loaded signing key's verifying key does not match committee₀ at its index.
-    KeyDoesNotMatchCommittee { index: usize },
+    KeyDoesNotMatchCommittee {
+        index: usize,
+    },
 }
 
 impl std::fmt::Display for GenesisError {
@@ -430,7 +555,10 @@ impl std::fmt::Display for GenesisError {
                 write!(f, "committee key #{index} failed to decode")
             }
             GenesisError::WrongGenesisHash { got, want } => {
-                write!(f, "genesis hash {got} != expected {want} — refusing to start")
+                write!(
+                    f,
+                    "genesis hash {got} != expected {want} — refusing to start"
+                )
             }
             GenesisError::BadHex => write!(f, "key file: malformed hex seed"),
             GenesisError::BadSeedLen => write!(f, "key file: seed is not 32 bytes"),
@@ -460,7 +588,12 @@ impl GenesisFile {
     pub fn new_devnet_t0() -> Self {
         let n = pd::FROZEN_COMMITTEE_SIZE;
         let committee_keys: Vec<Vec<u8>> = (0..n)
-            .map(|i| Validator::from_seed(i, committee_seed(i)).verifying_key().encode().to_vec())
+            .map(|i| {
+                Validator::from_seed(i, committee_seed(i))
+                    .verifying_key()
+                    .encode()
+                    .to_vec()
+            })
             .collect();
         GenesisFile {
             format_version: GENESIS_FORMAT_VERSION,
@@ -484,20 +617,71 @@ impl GenesisFile {
     pub fn new_t2() -> Self {
         let n = pd::FROZEN_COMMITTEE_SIZE;
         let committee_keys: Vec<Vec<u8>> = (0..n)
-            .map(|i| Validator::from_seed(i, committee_seed(i)).verifying_key().encode().to_vec())
+            .map(|i| {
+                Validator::from_seed(i, committee_seed(i))
+                    .verifying_key()
+                    .encode()
+                    .to_vec()
+            })
             .collect();
+        Self::t2_from_committee_keys(committee_keys, T0_GENESIS_DIFFICULTY)
+    }
+
+    /// Shared T2 shape: format v5, network `qumbra-t2`, FrozenParams v1.0, v5
+    /// genesis block. Rehearsal and launch differ **only** in the 21 keys and
+    /// the difficulty baked into the file + header.
+    fn t2_from_committee_keys(committee_keys: Vec<Vec<u8>>, difficulty: u64) -> Self {
         GenesisFile {
             format_version: GENESIS_FORMAT_VERSION_T2,
             network: "qumbra-t2".to_string(),
             frozen: FrozenParams::v1_0(),
             committee_keys,
-            genesis_difficulty: T0_GENESIS_DIFFICULTY,
-            genesis_block: qlab_node::genesis_block_for(
-                GenesisForm::V5,
-                T0_GENESIS_DIFFICULTY,
-                0,
-            ),
+            genesis_difficulty: difficulty,
+            genesis_block: qlab_node::genesis_block_for(GenesisForm::V5, difficulty, 0),
         }
+    }
+
+    /// T2 genesis from caller-supplied 32-byte seeds, run through the existing
+    /// [`Validator::from_seed`] seam. Launch draws the seeds from OS randomness;
+    /// tests inject known-distinct seeds so the anti-determinism property is
+    /// locked without depending on the host CSPRNG happening to differ.
+    ///
+    /// Panics if `seeds.len()` is not the frozen committee size — a constructor
+    /// bug, not an operator input.
+    pub fn new_t2_with_committee_seeds(difficulty: u64, seeds: &[[u8; 32]]) -> Self {
+        let n = pd::FROZEN_COMMITTEE_SIZE;
+        assert_eq!(
+            seeds.len(),
+            n,
+            "T2 committee is frozen at N={n}; got {} seeds",
+            seeds.len()
+        );
+        let committee_keys: Vec<Vec<u8>> = seeds
+            .iter()
+            .enumerate()
+            .map(|(i, seed)| {
+                Validator::from_seed(i, *seed)
+                    .verifying_key()
+                    .encode()
+                    .to_vec()
+            })
+            .collect();
+        Self::t2_from_committee_keys(committee_keys, difficulty)
+    }
+
+    /// T2 **launch** genesis (lab #506): same v5 shape as [`Self::new_t2`], but
+    /// the 21 committee seeds come from the OS CSPRNG (`rand::rng()`, the house
+    /// OsRng-class path) through [`Validator::from_seed`]. Returns the seeds so
+    /// the caller can write key files that actually open this genesis — they
+    /// cannot be re-derived from `committee_seed`.
+    pub fn new_t2_launch(difficulty: u64) -> (Self, Vec<[u8; 32]>) {
+        use rand::Rng;
+        let n = pd::FROZEN_COMMITTEE_SIZE;
+        let mut seeds = vec![[0u8; 32]; n];
+        for seed in &mut seeds {
+            rand::rng().fill_bytes(seed);
+        }
+        (Self::new_t2_with_committee_seeds(difficulty, &seeds), seeds)
     }
 
     /// The genesis hash: keccak256 over the file's canonical bincode. This is the
@@ -599,14 +783,20 @@ impl GenesisFile {
         }
         let want_q = quorum_threshold(want_n as usize);
         if self.frozen.quorum as usize != want_q {
-            return Err(GenesisError::WrongQuorum { got: self.frozen.quorum, want: want_q });
+            return Err(GenesisError::WrongQuorum {
+                got: self.frozen.quorum,
+                want: want_q,
+            });
         }
         // Every committee key must decode (this also proves committee() succeeds).
         self.committee()?;
         if let Some(want) = expected_hex {
             let got = self.hash_hex();
             if !got.eq_ignore_ascii_case(want) {
-                return Err(GenesisError::WrongGenesisHash { got, want: want.to_string() });
+                return Err(GenesisError::WrongGenesisHash {
+                    got,
+                    want: want.to_string(),
+                });
             }
         }
         Ok(())
@@ -638,13 +828,42 @@ impl GenesisFile {
         Ok(out)
     }
 
-    /// Write the 21 T0 committee signing-key files into `dir` (item 4). Returns
-    /// their paths. Real validators would generate keys themselves; these are the
-    /// honestly-labelled deterministic rehearsal keys.
+    /// Write the 21 T0/T2 **rehearsal** committee signing-key files into `dir`
+    /// (item 4). Returns their paths. Seeds are `committee_seed(i)` — the same
+    /// bytes as before lab #506, so `--t2` without `--launch` is byte-identical.
     pub fn write_committee_key_files(
         &self,
         dir: impl AsRef<std::path::Path>,
     ) -> Result<Vec<std::path::PathBuf>, GenesisError> {
+        let seeds: Vec<[u8; 32]> = (0..self.committee_keys.len()).map(committee_seed).collect();
+        self.write_committee_key_files_from_seeds(dir, &seeds, REHEARSAL_KEY_NOTE)
+    }
+
+    /// Write committee signing-key files from caller-supplied seeds.
+    ///
+    /// Each seed is run through [`Validator::from_seed`] and the derived
+    /// verifying key **must** equal committee₀ at that index — so a launch
+    /// ceremony cannot write key files that do not open the genesis they just
+    /// minted. Verification runs **before** any write, so a mismatch leaves
+    /// `dir` untouched rather than half-populated.
+    pub fn write_committee_key_files_from_seeds(
+        &self,
+        dir: impl AsRef<std::path::Path>,
+        seeds: &[[u8; 32]],
+        note: &str,
+    ) -> Result<Vec<std::path::PathBuf>, GenesisError> {
+        if seeds.len() != self.committee_keys.len() {
+            return Err(GenesisError::WrongCommitteeSize {
+                got: seeds.len(),
+                want: self.committee_keys.len() as u32,
+            });
+        }
+        for (i, seed) in seeds.iter().enumerate() {
+            let v = Validator::from_seed(i, *seed);
+            if v.verifying_key().encode().to_vec() != self.committee_keys[i] {
+                return Err(GenesisError::KeyDoesNotMatchCommittee { index: i });
+            }
+        }
         let dir = dir.as_ref();
         std::fs::create_dir_all(dir).map_err(GenesisError::Io)?;
         // 0700 on the directory, 0600 on each file (below). `deploy.sh` moves these
@@ -652,20 +871,20 @@ impl GenesisFile {
         // here is the mode they land with on four public-IP hosts, and the default
         // from umask is 755/644.
         //
-        // Today's T0 keys are derived from a deterministic seed (`committee_seed`)
+        // Rehearsal keys are derived from a deterministic seed (`committee_seed`)
         // and each file says so in as many words, so a 644 mode is not the exposure
         // it looks like — anyone with the source regenerates them. **That is exactly
         // why this is worth fixing now rather than later:** the mode has to be right
-        // *before* the seeds stop being derivable, and a permission bug is hardest to
-        // notice in the window where it does not matter yet.
+        // *before* the seeds stop being derivable (lab #506 `--launch`), and a
+        // permission bug is hardest to notice in the window where it does not
+        // matter yet.
         set_mode(dir, 0o700)?;
         let mut paths = Vec::new();
-        for i in 0..self.committee_keys.len() {
+        for (i, seed) in seeds.iter().enumerate() {
             let kf = KeyFile {
                 index: i,
-                seed_hex: hex_encode(&committee_seed(i)),
-                note: "devnet T0 rehearsal key (deterministic seed) — NOT a real validator key"
-                    .to_string(),
+                seed_hex: hex_encode(seed),
+                note: note.to_string(),
             };
             let path = dir.join(format!("committee-{i:02}.key"));
             std::fs::write(&path, kf.to_toml()).map_err(GenesisError::Io)?;
@@ -703,8 +922,7 @@ impl GenesisFile {
 #[cfg(unix)]
 fn set_mode(path: impl AsRef<std::path::Path>, mode: u32) -> Result<(), GenesisError> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-        .map_err(GenesisError::Io)
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(GenesisError::Io)
 }
 
 #[cfg(not(unix))]
@@ -902,7 +1120,10 @@ mod tests {
 
         // (2) The block hash is the height-0 header's hash, and nothing else.
         let block_hash = gf.genesis_block.header().header_hash();
-        assert_eq!(gf.genesis_block.header.height, 0, "the baked block is genesis");
+        assert_eq!(
+            gf.genesis_block.header.height, 0,
+            "the baked block is genesis"
+        );
 
         // (3) They differ — and they differ *because* the file contains the block.
         assert_ne!(
@@ -1061,9 +1282,16 @@ mod tests {
         let g = &gf.genesis_block;
         assert_eq!(g.header.height, 0);
         assert_eq!(g.header.tx_body_commitment, g.body().commitment_v5());
-        let hex: String =
-            g.header.tx_body_commitment.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(hex, "82c2707bdf9790b25ef44355cb44cfd7faa6aba28d5db184b57edf83e7ba7ea5");
+        let hex: String = g
+            .header
+            .tx_body_commitment
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "82c2707bdf9790b25ef44355cb44cfd7faa6aba28d5db184b57edf83e7ba7ea5"
+        );
         assert_ne!(
             g.header.tx_body_commitment,
             g.body().commitment(),
@@ -1142,5 +1370,170 @@ mod tests {
             assert_eq!(v.verifying_key().encode().to_vec(), gf.committee_keys[i]);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn args(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// Lab #506: two independent launch mints MUST produce different hashes —
+    /// that is the whole point of OS randomness. Locked against two real
+    /// `new_t2_launch` draws, not injected seeds: a constructor that silently
+    /// fell back to `committee_seed` would fail this.
+    #[test]
+    fn t2_launch_two_runs_produce_distinct_hashes() {
+        let (a, a_seeds) = GenesisFile::new_t2_launch(T0_GENESIS_DIFFICULTY);
+        let (b, b_seeds) = GenesisFile::new_t2_launch(T0_GENESIS_DIFFICULTY);
+        assert_ne!(a.hash(), b.hash(), "launch hashes must not be reproducible");
+        assert_ne!(a_seeds, b_seeds, "two OsRng draws must not collide");
+        assert_ne!(
+            a.hash_hex(),
+            GenesisFile::new_t2().hash_hex(),
+            "a launch mint is not the rehearsal pin"
+        );
+    }
+
+    #[test]
+    fn t2_launch_verify_startup_accepts() {
+        let (gf, _) = GenesisFile::new_t2_launch(T0_GENESIS_DIFFICULTY);
+        assert!(gf.verify_startup(None).is_ok());
+        let h = gf.hash_hex();
+        assert!(gf.verify_startup(Some(&h)).is_ok());
+        assert_eq!(gf.form().unwrap(), GenesisForm::V5);
+        assert_eq!(gf.network, "qumbra-t2");
+        assert_eq!(gf.format_version, GENESIS_FORMAT_VERSION_T2);
+        assert_eq!(gf.genesis_difficulty, T0_GENESIS_DIFFICULTY);
+    }
+
+    /// Lab #506: launch key files parse back through the existing
+    /// [`KeyFile::validator`] / [`GenesisFile::load_validators`] path — same
+    /// seed-hex TOML, different seeds.
+    #[test]
+    fn t2_launch_key_files_parse_back_through_validator_load_path() {
+        let dir = std::env::temp_dir().join(format!("qmb_t2_launch_keys_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (gf, seeds) = GenesisFile::new_t2_launch(T0_GENESIS_DIFFICULTY);
+        let paths = gf
+            .write_committee_key_files_from_seeds(&dir, &seeds, LAUNCH_KEY_NOTE)
+            .expect("write launch keys");
+        assert_eq!(paths.len(), 21);
+        let validators = gf
+            .load_validators(&paths)
+            .expect("load through existing path");
+        assert_eq!(validators.len(), 21);
+        for (i, v) in validators.iter().enumerate() {
+            assert_eq!(v.verifying_key().encode().to_vec(), gf.committee_keys[i]);
+            let text = std::fs::read_to_string(&paths[i]).unwrap();
+            let kf = KeyFile::from_toml(&text).unwrap();
+            assert_eq!(kf.note, LAUNCH_KEY_NOTE);
+            assert_eq!(kf.seed().unwrap(), seeds[i]);
+            assert_eq!(
+                kf.validator().unwrap().verifying_key().encode().to_vec(),
+                gf.committee_keys[i]
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn t2_launch_is_v5_and_not_the_rehearsal_committee() {
+        let (gf, _) = GenesisFile::new_t2_launch(T0_GENESIS_DIFFICULTY);
+        let rehearsal = GenesisFile::new_t2();
+        assert_eq!(gf.form().unwrap(), GenesisForm::V5);
+        assert_ne!(gf.committee_keys, rehearsal.committee_keys);
+        for i in 0..gf.committee_keys.len() {
+            for j in (i + 1)..gf.committee_keys.len() {
+                assert_ne!(
+                    gf.committee_keys[i], gf.committee_keys[j],
+                    "launch committee keys {i} and {j} collided"
+                );
+            }
+        }
+        // Empty-body v5 commitment is independent of committee keys / difficulty.
+        assert_eq!(
+            gf.genesis_block.header.tx_body_commitment,
+            rehearsal.genesis_block.header.tx_body_commitment
+        );
+    }
+
+    #[test]
+    fn t2_launch_honours_difficulty() {
+        let seeds = [[0x5eu8; 32]; 21];
+        let gf = GenesisFile::new_t2_with_committee_seeds(7_777, &seeds);
+        assert_eq!(gf.genesis_difficulty, 7_777);
+        assert_eq!(gf.genesis_block.header.difficulty, 7_777);
+        assert_ne!(gf.hash_hex(), GenesisFile::new_t2().hash_hex());
+        // Same keys, default difficulty, is a different file from 7777.
+        let at_default = GenesisFile::new_t2_with_committee_seeds(T0_GENESIS_DIFFICULTY, &seeds);
+        assert_ne!(gf.hash(), at_default.hash());
+    }
+
+    #[test]
+    fn launch_key_write_refuses_seeds_that_do_not_match_committee() {
+        let dir =
+            std::env::temp_dir().join(format!("qmb_t2_launch_mismatch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let gf = GenesisFile::new_t2(); // rehearsal keys
+        let seeds = vec![[0x11u8; 32]; 21];
+        assert!(matches!(
+            gf.write_committee_key_files_from_seeds(&dir, &seeds, LAUNCH_KEY_NOTE),
+            Err(GenesisError::KeyDoesNotMatchCommittee { index: 0 })
+        ));
+        assert!(!dir.exists(), "a mismatch must not write any key file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn genesis_init_parse_launch_requires_t2() {
+        let err = GenesisInitPlan::parse(&args(&["--launch"])).unwrap_err();
+        assert!(err.contains("`--launch` requires `--t2`"), "{err}");
+    }
+
+    #[test]
+    fn genesis_init_parse_difficulty_requires_launch() {
+        let err = GenesisInitPlan::parse(&args(&["--t2", "--difficulty", "1"])).unwrap_err();
+        assert!(err.contains("`--difficulty` requires `--launch`"), "{err}");
+        // `--difficulty` without `--t2` is the same refusal: it would move T1.
+        let err = GenesisInitPlan::parse(&args(&["--difficulty", "1"])).unwrap_err();
+        assert!(err.contains("`--difficulty` requires `--launch`"), "{err}");
+    }
+
+    #[test]
+    fn genesis_init_parse_launch_defaults_placeholder_difficulty() {
+        let plan = GenesisInitPlan::parse(&args(&["--t2", "--launch"])).unwrap();
+        assert!(plan.t2 && plan.launch);
+        assert_eq!(plan.difficulty, T0_GENESIS_DIFFICULTY);
+        assert_eq!(plan.out, std::path::PathBuf::from("."));
+    }
+
+    #[test]
+    fn genesis_init_parse_launch_accepts_difficulty_and_out() {
+        let plan = GenesisInitPlan::parse(&args(&[
+            "--t2",
+            "--launch",
+            "--difficulty",
+            "4096",
+            "--out",
+            "/tmp/t2-ceremony",
+        ]))
+        .unwrap();
+        assert_eq!(plan.difficulty, 4096);
+        assert_eq!(plan.out, std::path::PathBuf::from("/tmp/t2-ceremony"));
+    }
+
+    #[test]
+    fn genesis_mode_banner_names_the_mode() {
+        assert_eq!(
+            mode_banner(true),
+            "LAUNCH — keys from OS randomness, hash NOT reproducible"
+        );
+        assert_eq!(
+            mode_banner(false),
+            "rehearsal — deterministic committee seeds [devnet-placeholder]"
+        );
+        // Rehearsal still carries the pre-#506 placeholder tag; launch does not
+        // pretend to be one.
+        assert!(mode_banner(false).contains("[devnet-placeholder]"));
+        assert!(!mode_banner(true).contains("[devnet-placeholder]"));
     }
 }

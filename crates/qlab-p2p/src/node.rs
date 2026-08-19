@@ -117,6 +117,60 @@ fn addr_token(addr: &Option<String>) -> &str {
     addr.as_deref().unwrap_or("unknown")
 }
 
+/// Why a handshake was refused at the net seam (lab #474). Carried so the
+/// journal line can say **what the peer claimed**, which is the operational
+/// difference between "a T2 node dialed us" and "a pre-cutover binary is still
+/// dialing its old seeds".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NetRefusal {
+    /// The peer named a net and it is not ours.
+    WrongNet { claimed: Hash32 },
+    /// The peer's `Version` carried no net id on a net that requires one
+    /// (v5-genesis nets — the T2 posture).
+    NoNetId,
+}
+
+/// The `NETREFUSE` journal line — one cross-net handshake refusal, `key=value`
+/// like `DIAL`/`ACCEPT`/`CLOSE` (same grep family, `addr=` anchor shared via
+/// [`addr_token`]). Full 64-hex nets, not prefixes: the reader of this line is
+/// deciding whether the claimed net is the OTHER net they operate or an unknown
+/// third, and a prefix cannot answer that. `claimed=none` is the legacy-vintage
+/// refusal (`reason=no-net-id`).
+///
+/// Emitted per refused `Version`, which is once per connection by construction —
+/// the connection is closed in the same breath, so this cannot become a
+/// per-frame flooding channel (the #181 journal concern does not arise).
+fn net_refuse_line(
+    peer: PeerId,
+    addr: Option<&str>,
+    ours: &Option<Hash32>,
+    refusal: &NetRefusal,
+) -> String {
+    let ours_hex = ours.map(|h| hex32(&h)).unwrap_or_else(|| "unset".to_string());
+    let owned;
+    let addr_owned = addr.map(|a| a.to_string());
+    let (claimed, reason) = match refusal {
+        NetRefusal::WrongNet { claimed } => {
+            owned = hex32(claimed);
+            (owned.as_str(), "wrong-net")
+        }
+        NetRefusal::NoNetId => ("none", "no-net-id"),
+    };
+    format!(
+        "NETREFUSE addr={} peer={} ours={} claimed={} reason={}",
+        addr_token(&addr_owned),
+        peer.0,
+        ours_hex,
+        claimed,
+        reason
+    )
+}
+
+/// Lowercase hex of a 32-byte hash (journal rendering; no hex dep in this crate).
+fn hex32(h: &Hash32) -> String {
+    h.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// **How many distinct unknown envelope-type codes get a `WIRE` journal line
 /// before this node goes quiet about them** (issue #181).
 ///
@@ -731,6 +785,11 @@ pub struct P2pNode<T: Transport, N: NodeState> {
     /// did (#84's law: the drill must detect the gap it drills). `true` in every
     /// production construction; nothing in the binary flips it.
     serve_historical_bodies: bool,
+    /// This node's net identity for the lab #474 handshake check: the
+    /// operational genesis **file** hash (`expected_genesis_hash`'s value), or
+    /// `None` when no genesis file was ever loaded (sims/stubs) — see
+    /// [`Self::set_net_id`] for why `None` disables the policy.
+    local_net_id: Option<Hash32>,
     /// **Where the last [`Self::tick`] spent its time** (issue #107 S1).
     /// Observation only — never read by any decision. See [`crate::ticktime`].
     last_tick: TickTimings,
@@ -776,7 +835,24 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             serve_historical_bodies: true,
             last_tick: TickTimings::default(),
             send_ns: std::cell::Cell::new(0),
+            local_net_id: None,
         }
+    }
+
+    /// Install this node's net identity — the operational genesis **file** hash
+    /// (`GenesisFile::hash()`, the value pinned as `expected_genesis_hash`; NOT
+    /// [`crate::n1::ChainView::genesis_block_hash`], issue #206) — enabling the
+    /// lab #474 cross-net handshake refusal. Unset (every sim/stub and any
+    /// composition that never loads a genesis file), the policy is inert: a node
+    /// that has not been told its net cannot police one, the same explicit-config
+    /// posture as `advertise_addr` (#127). `qumbra-node` sets it at startup.
+    pub fn set_net_id(&mut self, id: Hash32) {
+        self.local_net_id = Some(id);
+    }
+
+    /// The installed net identity, if any (tests / wiring assertions).
+    pub fn net_id(&self) -> Option<Hash32> {
+        self.local_net_id
     }
 
     /// Flip the drill's serving switch (issue #371 S5) — see the field. Test
@@ -1205,11 +1281,21 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
 
     fn ensure_version_sent(&mut self, to: PeerId) {
         if self.version_sent.insert(to) {
+            // Lab #474: only v5-genesis nets carry the net identifier on the
+            // wire. On a v4 net the encode stays byte-identical to the legacy
+            // `Version` even when this node knows its net id — every deployed
+            // T1 peer decodes with reject-trailing, so an appended field would
+            // get this node banned by the very net it is a member of.
+            let net_id = match self.node.genesis_form() {
+                qlab_devnet::forms::GenesisForm::V5 => self.local_net_id,
+                qlab_devnet::forms::GenesisForm::V4 => None,
+            };
             let v = VersionMsg {
                 node_id: self.node_id,
                 services: SERVICE_FULL,
                 tip_height: self.node.tip_height(),
                 user_agent: self.user_agent.clone(),
+                net_id,
             };
             self.send(to, MsgType::Version, v.encode());
         }
@@ -1956,9 +2042,63 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
 
     // --- handshake ---
 
+    /// Why a well-formed `Version` is refused at the handshake seam (lab #474).
+    /// `None` means the handshake proceeds.
+    ///
+    /// Policy, distinct from the codec on purpose (the codec must never reject
+    /// its own vintage):
+    ///
+    /// - **A peer naming a different net is refused whatever our form.** The
+    ///   check is definitional — two nodes pinning different genesis files are
+    ///   on different chains, and every payload after the handshake would be
+    ///   scored as malformed. Refusing here by name replaces that slow ban.
+    /// - **A `Version` without the field is refused only on a v5-genesis net.**
+    ///   Field required from v5 genesis nets — that is the rule, stated at the
+    ///   T2 cutover: the peer still dialing us without one is a v4-era binary
+    ///   (the four outside T1 miners), and it is *lost, not malicious*.
+    /// - **Inert until [`Self::set_net_id`]**: a node that has not been told its
+    ///   net cannot police one (see the setter).
+    fn net_refusal(&self, v: &VersionMsg) -> Option<NetRefusal> {
+        let ours = self.local_net_id?;
+        match v.net_id {
+            Some(theirs) if theirs != ours => Some(NetRefusal::WrongNet { claimed: theirs }),
+            None if self.node.genesis_form() == qlab_devnet::forms::GenesisForm::V5 => {
+                Some(NetRefusal::NoNetId)
+            }
+            _ => None,
+        }
+    }
+
+    /// Refuse a handshake **without scoring** (lab #474): a foreign-net peer is
+    /// not a protocol faulter (#181's peer-fault classification — it is lost,
+    /// not misbehaving), so this must leave no mark a ban would leave. The
+    /// connection is closed and every per-connection row is dropped, exactly as
+    /// [`Self::maintain`]'s disconnect reconcile would do a pass later — done
+    /// eagerly here so the peer is never counted, never a sync candidate, and
+    /// never sent our `Version` on the inbound path.
+    fn refuse_handshake(&mut self, from: PeerId) {
+        self.transport.disconnect(from);
+        self.addrs.on_disconnect(from);
+        self.peers.remove(from);
+        self.version_sent.remove(&from);
+    }
+
     fn on_version(&mut self, from: PeerId, payload: &[u8]) {
         match VersionMsg::decode(payload) {
             Ok(v) => {
+                // Lab #474: the net check runs BEFORE any handshake state moves —
+                // on the inbound path a cross-net peer gets neither our Version
+                // nor a VerAck, only a close (and, deliberately, no score: see
+                // `refuse_handshake`).
+                if let Some(refusal) = self.net_refusal(&v) {
+                    let addr = self.transport.peer_addr(from);
+                    println!(
+                        "{}",
+                        net_refuse_line(from, addr.as_deref(), &self.local_net_id, &refusal)
+                    );
+                    self.refuse_handshake(from);
+                    return;
+                }
                 self.peers.on_version(from, &v);
                 self.ensure_version_sent(from); // reply with our Version if new
                 self.send(from, MsgType::VerAck, vec![]);
@@ -3971,7 +4111,13 @@ mod tests {
         let mut n0 = P2pNode::new(t0, stub(), [1; 32]);
         let peer = sniffer(&hub, PeerId(2), "peer:9333");
         hub.link(PeerId(2), PeerId(1));
-        let v = VersionMsg { node_id: [2; 32], services: 1, tip_height: 0, user_agent: "p".into() };
+        let v = VersionMsg {
+            node_id: [2; 32],
+            services: 1,
+            tip_height: 0,
+            user_agent: "p".into(),
+            net_id: None,
+        };
         peer.send(PeerId(1), &Envelope::new(MsgType::Version, v.encode()).encode()).unwrap();
         peer.send(PeerId(1), &Envelope::new(MsgType::VerAck, vec![]).encode()).unwrap();
         n0.tick(0);
@@ -5371,6 +5517,165 @@ mod tests {
             .count()
     }
 
+    // --- lab #474: cross-net handshake refusal ---
+
+    /// A stub reporting the v5 genesis form — the net-id-required posture.
+    fn stub_v5() -> StubNode {
+        let mut s = stub();
+        s.set_genesis_form(qlab_devnet::forms::GenesisForm::V5);
+        s
+    }
+
+    /// A `P2pNode` under test plus a raw sniffer peer, with NO handshake done —
+    /// the #474 tests drive the handshake themselves.
+    fn node_and_raw_peer<N: NodeState>(
+        node_state: N,
+    ) -> (P2pNode<InProcTransport, N>, InProcTransport, Arc<InProcHub>) {
+        let hub = InProcHub::new();
+        let t0 = InProcTransport::new(PeerId(1), Arc::clone(&hub));
+        let n0 = P2pNode::new(t0, node_state, [1; 32]);
+        let peer = sniffer(&hub, PeerId(2), "peer:9333");
+        hub.link(PeerId(2), PeerId(1));
+        (n0, peer, hub)
+    }
+
+    fn version_from(net_id: Option<Hash32>) -> Vec<u8> {
+        let v = VersionMsg {
+            node_id: [2; 32],
+            services: 1,
+            tip_height: 0,
+            user_agent: "p".into(),
+            net_id,
+        };
+        Envelope::new(MsgType::Version, v.encode()).encode()
+    }
+
+    /// The first decoded `Version` payload among `frames`, if any.
+    fn first_version(frames: &[(PeerId, Vec<u8>)]) -> Option<VersionMsg> {
+        frames.iter().find_map(|(_, f)| {
+            let env = Frame::decode(f).ok()?.known().cloned()?;
+            (env.msg_type == MsgType::Version).then(|| VersionMsg::decode(&env.payload).unwrap())
+        })
+    }
+
+    /// Same net, v5 posture: the handshake is unchanged in shape and reaches
+    /// `Ready`, and this node's own `Version` reply carries its net id.
+    #[test]
+    fn i474_same_net_v5_handshake_reaches_ready_and_carries_the_net_id() {
+        let net = [0xAA; 32];
+        let (mut n0, peer, _hub) = node_and_raw_peer(stub_v5());
+        n0.set_net_id(net);
+        peer.send(PeerId(1), &version_from(Some(net))).unwrap();
+        peer.send(PeerId(1), &Envelope::new(MsgType::VerAck, vec![]).encode()).unwrap();
+        n0.tick(0);
+        assert!(n0.peers().is_ready(PeerId(2)), "same-net handshake completes");
+        assert_eq!(n0.peers().get(PeerId(2)).unwrap().score, 0, "and costs nothing");
+        let replies = peer.poll();
+        assert_eq!(count_msgs(&replies, MsgType::VerAck), 1, "we acked");
+        let ours = first_version(&replies).expect("we replied with our Version");
+        assert_eq!(ours.net_id, Some(net), "a v5 node names its net on the wire");
+    }
+
+    /// 🔴 **The #474 defect, inverted: a peer naming a DIFFERENT net never
+    /// reaches `Ready`** — it is refused by name at the handshake, with zero
+    /// score change and no ban, and on the inbound path it is not even answered.
+    /// Before this, the cross-net peer handshook to `Ready` and was then banned
+    /// frame by frame on peer-fault accumulation — the noisy slow ban the T2
+    /// cutover would have produced on every outside T1 miner.
+    #[test]
+    fn i474_a_cross_net_peer_is_refused_by_name_with_zero_score_change() {
+        let (mut n0, peer, _hub) = node_and_raw_peer(stub_v5());
+        n0.set_net_id([0xAA; 32]);
+        peer.send(PeerId(1), &version_from(Some([0xBB; 32]))).unwrap();
+        n0.tick(0);
+        // Refused-by-name is a REMOVAL, not a ban: no row survives to carry a
+        // score or a Banned state, which is exactly the "no mark a ban would
+        // leave" property (a lost miner is not a faulter).
+        assert!(n0.peers().get(PeerId(2)).is_none(), "the peer row is dropped, not scored");
+        assert!(!n0.peers().is_banned(PeerId(2)), "and nothing was banned");
+        assert_eq!(peer.poll(), vec![], "no Version, no VerAck — only the close");
+    }
+
+    /// The legacy vintage on a requiring net: a `Version` WITHOUT the field is
+    /// refused by name too on a v5-genesis net. **The field is required from v5
+    /// genesis nets — that is the rule.** (This is the T2 cutover's actual
+    /// traffic: the outside T1 miners' old binaries dialing the same seed IPs.)
+    #[test]
+    fn i474_a_legacy_version_is_refused_on_a_net_that_requires_the_field() {
+        let (mut n0, peer, _hub) = node_and_raw_peer(stub_v5());
+        n0.set_net_id([0xAA; 32]);
+        peer.send(PeerId(1), &version_from(None)).unwrap();
+        n0.tick(0);
+        assert!(n0.peers().get(PeerId(2)).is_none(), "legacy Version refused by name");
+        assert_eq!(peer.poll(), vec![], "unanswered — the lost miner's ledger stays clean too");
+    }
+
+    /// The v4 (live T1) posture: the field is tolerated-missing — today's peers
+    /// never send it — and this node's own `Version` stays byte-legacy even when
+    /// it knows its net id (an old peer's reject-trailing decode must keep
+    /// accepting us: the compat law).
+    #[test]
+    fn i474_a_v4_net_tolerates_legacy_peers_and_sends_the_legacy_wire() {
+        let (mut n0, peer, _hub) = node_and_raw_peer(stub());
+        n0.set_net_id([0xAA; 32]);
+        peer.send(PeerId(1), &version_from(None)).unwrap();
+        peer.send(PeerId(1), &Envelope::new(MsgType::VerAck, vec![]).encode()).unwrap();
+        n0.tick(0);
+        assert!(n0.peers().is_ready(PeerId(2)), "v4 handshake unchanged");
+        let ours = first_version(&peer.poll()).expect("replied");
+        assert_eq!(ours.net_id, None, "a v4 node's Version is the legacy wire, byte-identical");
+    }
+
+    /// …but naming a different net is refused on ANY form: two nodes pinning
+    /// different genesis files are on different chains, definitionally.
+    #[test]
+    fn i474_even_a_v4_node_refuses_a_peer_naming_another_net() {
+        let (mut n0, peer, _hub) = node_and_raw_peer(stub());
+        n0.set_net_id([0xAA; 32]);
+        peer.send(PeerId(1), &version_from(Some([0xBB; 32]))).unwrap();
+        n0.tick(0);
+        assert!(n0.peers().get(PeerId(2)).is_none(), "wrong-net refusal is form-independent");
+        assert_eq!(peer.poll(), vec![], "unanswered");
+    }
+
+    /// A node never told its net cannot police one: with `set_net_id` never
+    /// called the policy is inert on every vintage — which is what keeps every
+    /// existing sim, stub and bench composition exactly as it was.
+    #[test]
+    fn i474_the_policy_is_inert_until_a_net_id_is_installed() {
+        let (mut n0, peer, _hub) = node_and_raw_peer(stub_v5());
+        peer.send(PeerId(1), &version_from(None)).unwrap();
+        peer.send(PeerId(1), &Envelope::new(MsgType::VerAck, vec![]).encode()).unwrap();
+        n0.tick(0);
+        assert!(n0.peers().is_ready(PeerId(2)), "no local identity → no policing");
+    }
+
+    #[test]
+    fn i474_net_refuse_line_names_the_claimed_net_in_full() {
+        let line = net_refuse_line(
+            PeerId(7),
+            Some("203.0.113.9:9444"),
+            &Some([0x11; 32]),
+            &NetRefusal::WrongNet { claimed: [0x22; 32] },
+        );
+        assert_eq!(
+            line,
+            format!(
+                "NETREFUSE addr=203.0.113.9:9444 peer=7 ours={} claimed={} reason=wrong-net",
+                "11".repeat(32),
+                "22".repeat(32)
+            )
+        );
+        let legacy = net_refuse_line(PeerId(7), None, &Some([0x11; 32]), &NetRefusal::NoNetId);
+        assert_eq!(
+            legacy,
+            format!(
+                "NETREFUSE addr=unknown peer=7 ours={} claimed=none reason=no-net-id",
+                "11".repeat(32)
+            )
+        );
+    }
+
     #[test]
     fn getaddr_is_asked_once_per_peer_per_interval() {
         // Scope 2: the book grows without a flood.
@@ -5382,7 +5687,13 @@ mod tests {
 
         // Dial + handshake: the sniffer answers the Version so n0's peer goes Ready.
         n0.maintain(0);
-        let v = VersionMsg { node_id: [2; 32], services: 1, tip_height: 0, user_agent: "s".into() };
+        let v = VersionMsg {
+            node_id: [2; 32],
+            services: 1,
+            tip_height: 0,
+            user_agent: "s".into(),
+            net_id: None,
+        };
         sniff.send(PeerId(1), &Envelope::new(MsgType::Version, v.encode()).encode()).unwrap();
         sniff.send(PeerId(1), &Envelope::new(MsgType::VerAck, vec![]).encode()).unwrap();
         n0.tick(0);
