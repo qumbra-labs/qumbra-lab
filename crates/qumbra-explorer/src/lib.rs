@@ -98,3 +98,4 @@ pub mod http;
 pub mod json;
 pub mod names;
 pub mod txlist;
+pub mod vitals;

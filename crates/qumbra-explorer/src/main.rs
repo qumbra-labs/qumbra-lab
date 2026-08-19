@@ -29,6 +29,7 @@ use qumbra_explorer::http::{self, ExplorerServer, Surfaces};
 use qumbra_explorer::json;
 use qumbra_explorer::names::{self, NameEventsView};
 use qumbra_explorer::txlist::{self, TxListView};
+use qumbra_explorer::vitals;
 use qumbra_node::config::NodeConfig;
 use qumbra_node::genesis::GenesisFile;
 use qumbra_node::run::RunningNode;
@@ -100,13 +101,14 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  mining:         false (enforced)");
     println!("  extra listeners: none (telemetry_addr/metrics_addr refused — §6.2)");
     println!(
-        "  routes:         {} + {}?from=&to= + {}?from=&to= + {}?from=&to= + {} + /healthz \
-         (no page, no write path)",
+        "  routes:         {} + {}?from=&to= + {}?from=&to= + {}?from=&to= + {} + {} \
+         + /healthz (no page, no write path)",
         http::HEALTH_PATH,
         http::TXLIST_PATH,
         http::BLOCKS_PATH,
         http::NAMES_EVENTS_PATH,
-        http::CHECKPOINTS_PATH
+        http::CHECKPOINTS_PATH,
+        http::VITALS_PATH
     );
     println!("  tx lookup:      none — bulk list only, matched client-side (D2)");
     println!("  name lookup:    none — event feed is range-only, resolve refused by name (D2)");
@@ -161,6 +163,12 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         .expect("first render: no fingerprint seen yet");
     let checkpoints_page = Arc::new(RwLock::new(cp_first));
 
+    // The vitals ring (lab #486 item 4) — the run loop is its only writer, so
+    // the ring itself is unshared; readers see the pre-serialized document. It
+    // starts honestly empty (`since: null`) and fills at the sampling cadence.
+    let mut vitals_ring = vitals::VitalsRing::new();
+    let vitals_page = Arc::new(RwLock::new(vitals_ring.document()));
+
     // A failure to bind is FATAL, same rule as the faucet's listener.
     let server = ExplorerServer::start(
         &cfg.listen_addr,
@@ -168,6 +176,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             health: Arc::clone(&page),
             txlist: Arc::clone(&txlist_view),
             checkpoints: Arc::clone(&checkpoints_page),
+            vitals: Arc::clone(&vitals_page),
             blocks: Arc::clone(&blocks_view),
             names: Arc::clone(&names_view),
         },
@@ -195,6 +204,12 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
          and the document says where it begins)",
         server.addr(),
         http::CHECKPOINTS_PATH
+    );
+    println!(
+        "  vitals:         http://{}{}  (peers/mempool over 24 h, sampled every {} s)",
+        server.addr(),
+        http::VITALS_PATH,
+        vitals::SAMPLE_SECS
     );
     println!("  page:           served separately (qumbra-explorer-web) — no / here");
     println!("  node listen:    {}", node.listen_addr());
@@ -250,6 +265,16 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         {
             if let Ok(mut p) = checkpoints_page.write() {
                 *p = doc;
+            }
+        }
+        // One vitals sample per cadence interval (the rule lives in the
+        // library; this is the one place the wall clock is read — a clock the
+        // OS cannot answer samples nothing rather than fabricating a t).
+        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            if vitals_ring.maybe_push(vitals::sample_of(now.as_secs(), &t)) {
+                if let Ok(mut p) = vitals_page.write() {
+                    *p = vitals_ring.document();
+                }
             }
         }
     });
