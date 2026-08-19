@@ -786,6 +786,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         let bound = transport.local_addr().to_string();
         let node_id = node_id_from_addr(&bound);
         let mut p2p = P2pNode::new(transport, adapter, node_id);
+        // Lab #474: the net identity IS the genesis file hash — the same value
+        // `expected_genesis_hash` pins (issue #206's operational hash, not the
+        // genesis block-header hash). On a v5-genesis net the P2P layer sends it
+        // in `Version` and requires it of peers; on v4 it stays off the wire
+        // (legacy-compat) and only polices a peer that names a different net.
+        p2p.set_net_id(genesis.hash());
 
         // (6) Peer discovery (issue #83). The address book is restored from disk if a
         //     previous run persisted one, the configured `dial_peers` are (re-)applied
@@ -4640,6 +4646,19 @@ mod tests {
         let pf = preflight(&config, &genesis).expect("subset preflight ok");
         assert_eq!(pf.keys_held, 6);
         assert!(!pf.mining);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Lab #474 wiring: the running node's P2P layer carries the genesis FILE
+    /// hash — the very value `expected_genesis_hash` pins — as its net identity,
+    /// so the cross-net handshake refusal is armed on every real node (the
+    /// policy itself is locked by `qlab-p2p`'s `i474_*` tests).
+    #[test]
+    fn the_p2p_layer_learns_the_net_identity_from_the_genesis_file() {
+        let (config, genesis, base) = rig("netid", false);
+        let node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        assert_eq!(node.p2p().net_id(), Some(genesis.hash()));
         let _ = std::fs::remove_dir_all(&base);
     }
 

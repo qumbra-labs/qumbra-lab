@@ -41,13 +41,30 @@ pub enum PeerState {
 }
 
 /// The `Version` handshake payload (`[devnet-placeholder]`):
-/// `node_id(32) ‖ services(u64 LE) ‖ tip_height(u64 LE) ‖ ua_len(varint) ‖ ua`.
+/// `node_id(32) ‖ services(u64 LE) ‖ tip_height(u64 LE) ‖ ua_len(varint) ‖ ua
+/// [‖ net_id(32)]`.
+///
+/// `net_id` is the **presence-conditional net identifier** (lab #474): the
+/// operational genesis **file** hash (`GenesisFile::hash()`, the value every
+/// node already pins as `expected_genesis_hash` — NOT the genesis block-header
+/// hash, see issue #206), so cross-net peers can be refused by name at the
+/// handshake instead of handshaking to `Ready` and diverging at consensus
+/// payloads. The same additive shape as the #367 tx-wire rider: a legacy
+/// `Version` without the field decodes (`net_id: None`) — the codec never
+/// rejects its own vintage — and encoding `None` is byte-identical to the
+/// legacy wire. Whether a missing field is *refused* is handshake policy
+/// (`P2pNode::on_version`), not codec business: v5-genesis nets require it,
+/// the live v4 net never carries it (an old peer's reject-trailing decode
+/// would ban the sender).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VersionMsg {
     pub node_id: NodeId,
     pub services: u64,
     pub tip_height: u64,
     pub user_agent: String,
+    /// The sender's claimed net (genesis file hash), or `None` for the legacy
+    /// vintage of this payload (lab #474).
+    pub net_id: Option<Hash32>,
 }
 
 impl VersionMsg {
@@ -59,6 +76,9 @@ impl VersionMsg {
         let ua = self.user_agent.as_bytes();
         write_varint(&mut out, ua.len() as u64);
         out.extend_from_slice(ua);
+        if let Some(net) = &self.net_id {
+            out.extend_from_slice(net);
+        }
         out
     }
 
@@ -69,9 +89,14 @@ impl VersionMsg {
         let tip_height = r.u64_le("version.tip_height")?;
         let ua_len = r.varint()? as usize;
         let ua_bytes = r.rest(ua_len, "version.user_agent")?;
+        // Presence-conditional net id (lab #474): absent on the legacy vintage,
+        // exactly 32 bytes when present. `has_more` is the one honest probe
+        // (#367); anything that is neither empty nor a whole hash is trailing
+        // garbage and `finish()`/`hash32` still reject it.
+        let net_id = if r.has_more() { Some(r.hash32("version.net_id")?) } else { None };
         r.finish()?;
         let user_agent = String::from_utf8(ua_bytes).map_err(|_| DecodeError::Varint)?;
-        Ok(VersionMsg { node_id, services, tip_height, user_agent })
+        Ok(VersionMsg { node_id, services, tip_height, user_agent, net_id })
     }
 }
 
@@ -287,16 +312,74 @@ mod tests {
             services: 0x01,
             tip_height: 12345,
             user_agent: "qlab-p2p/0.0.0".to_string(),
+            net_id: None,
         };
         assert_eq!(VersionMsg::decode(&v.encode()).unwrap(), v);
     }
 
     #[test]
+    fn version_with_net_id_round_trips() {
+        // Lab #474: the presence-conditional net identifier survives the codec.
+        let v = VersionMsg {
+            node_id: [7; 32],
+            services: 0x01,
+            tip_height: 12345,
+            user_agent: "qlab-p2p/0.0.0".to_string(),
+            net_id: Some([0xE5; 32]),
+        };
+        assert_eq!(VersionMsg::decode(&v.encode()).unwrap(), v);
+    }
+
+    /// Lab #474 compat lock: encoding `net_id: None` is **byte-identical to the
+    /// legacy wire**, so a v4 node running this code is indistinguishable on the
+    /// live T1 net from one that predates the field — an old peer's
+    /// reject-trailing decode keeps accepting our `Version`. Hand-built bytes,
+    /// not encode-through-encode, so the layout cannot drift with the encoder.
+    #[test]
+    fn version_without_net_id_is_byte_identical_to_the_legacy_wire() {
+        let v = VersionMsg {
+            node_id: [7; 32],
+            services: 0x0102_0304_0506_0708,
+            tip_height: 12345,
+            user_agent: "x".to_string(),
+            net_id: None,
+        };
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&[7; 32]); // node_id
+        legacy.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes()); // services
+        legacy.extend_from_slice(&12345u64.to_le_bytes()); // tip_height
+        legacy.push(1); // ua_len varint
+        legacy.push(b'x'); // ua
+        assert_eq!(v.encode(), legacy);
+        // …and the legacy bytes decode on this vintage, as the field's absence.
+        let back = VersionMsg::decode(&legacy).unwrap();
+        assert_eq!(back, v);
+        assert_eq!(back.net_id, None);
+    }
+
+    #[test]
     fn version_rejects_trailing() {
-        let v = VersionMsg { node_id: [0; 32], services: 0, tip_height: 0, user_agent: String::new() };
+        let v = VersionMsg {
+            node_id: [0; 32],
+            services: 0,
+            tip_height: 0,
+            user_agent: String::new(),
+            net_id: None,
+        };
+        // One trailing byte is not a net id: a partial hash32 read fails.
         let mut b = v.encode();
         b.push(0);
         assert!(VersionMsg::decode(&b).is_err());
+        // A partial (non-empty, non-32) tail fails the same way.
+        let mut partial = v.encode();
+        partial.extend_from_slice(&[0; 31]);
+        assert!(VersionMsg::decode(&partial).is_err());
+        // And trailing bytes AFTER a whole net id are still rejected (lab #474 —
+        // the field is the one conditional section, not an open-ended tail).
+        let with = VersionMsg { net_id: Some([1; 32]), ..v };
+        let mut after = with.encode();
+        after.push(0);
+        assert!(VersionMsg::decode(&after).is_err());
     }
 
     #[test]
@@ -311,7 +394,13 @@ mod tests {
         let id = PeerId(1);
         t.add(id, Some("host:1".into()));
         assert_eq!(t.get(id).unwrap().state, PeerState::Connected);
-        let v = VersionMsg { node_id: [1; 32], services: 1, tip_height: 9, user_agent: "x".into() };
+        let v = VersionMsg {
+            node_id: [1; 32],
+            services: 1,
+            tip_height: 9,
+            user_agent: "x".into(),
+            net_id: None,
+        };
         t.on_version(id, &v);
         assert_eq!(t.get(id).unwrap().state, PeerState::VersionSent);
         assert_eq!(t.get(id).unwrap().tip_height, 9);
@@ -336,7 +425,13 @@ mod tests {
         // One peer that did claim, and the answer exists.
         let real = PeerId(2);
         t.add(real, None);
-        let v = VersionMsg { node_id: [2; 32], services: 1, tip_height: 7, user_agent: "x".into() };
+        let v = VersionMsg {
+            node_id: [2; 32],
+            services: 1,
+            tip_height: 7,
+            user_agent: "x".into(),
+            net_id: None,
+        };
         t.on_version(real, &v);
         t.on_verack(real);
         assert_eq!(t.best_height(), Some(7));
