@@ -1727,7 +1727,7 @@ dependencies = [
  "qlab-disclosure",
  "qlab-note",
  "qlab-wallet",
- "rand",
+ "rand 0.10.2",
 ]
 
 [[package]]
