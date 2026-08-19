@@ -16,7 +16,7 @@ fn main() -> ExitCode {
     match dispatch(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("qumbra-pool error: {e}");
+            qlab_devnet::jeprintln!("qumbra-pool error: {e}");
             ExitCode::FAILURE
         }
     }
@@ -101,12 +101,12 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     )?);
     let listener = TcpListener::bind(&listen)?;
     let bound = listener.local_addr()?;
-    println!("qumbra-pool listening on {bound}  form={form:?}  share_diff={share_difficulty}");
+    qlab_devnet::jprintln!("qumbra-pool listening on {bound}  form={form:?}  share_diff={share_difficulty}");
     if !pool.current_template().serves_stock_xmrig() {
-        println!("  ⚠️  v4 template: stock-xmrig login will be refused (#356 UNCLEAN)");
+        qlab_devnet::jprintln!("  ⚠️  v4 template: stock-xmrig login will be refused (#356 UNCLEAN)");
     }
-    println!("  share-PoW: qlab_pow::RandomXHasher + #490 strict <");
-    println!(
+    qlab_devnet::jprintln!("  share-PoW: qlab_pow::RandomXHasher + #490 strict <");
+    qlab_devnet::jprintln!(
         "  pplns window: {} shares [devnet-placeholder]",
         qumbra_pool::PPLNS_WINDOW_SHARES
     );
@@ -117,6 +117,6 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         stop2.store(true, Ordering::SeqCst);
     })?;
     serve(listener, pool, stop)?;
-    println!("qumbra-pool stopped");
+    qlab_devnet::jprintln!("qumbra-pool stopped");
     Ok(())
 }

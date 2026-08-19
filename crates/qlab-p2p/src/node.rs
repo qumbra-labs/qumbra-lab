@@ -1083,7 +1083,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             let addr = self.transport.peer_addr(r.peer);
             // The whole finding is that this is invisible from inside the node it
             // happens to, so the drop says what it saw.
-            println!("{}", stall_line(r.peer.0, addr.as_deref(), r.backlog, r.stalled_ms));
+            qlab_devnet::jprintln!("{}", stall_line(r.peer.0, addr.as_deref(), r.backlog, r.stalled_ms));
             self.transport.disconnect(r.peer);
         }
         stalled.into_iter().map(|r| r.peer).collect()
@@ -1106,7 +1106,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         let lines: Vec<String> =
             self.transport.poll_conn_events().iter().map(conn_line).collect();
         for line in &lines {
-            println!("{line}");
+            qlab_devnet::jprintln!("{line}");
         }
         lines
     }
@@ -1149,7 +1149,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     fn finish_dials(&mut self, now_ms: u64) -> usize {
         let mut connected = 0;
         for DialCompletion { addr, elapsed_ms, result } in self.transport.poll_dials() {
-            println!("{}", dial_line(&addr, elapsed_ms, &result));
+            qlab_devnet::jprintln!("{}", dial_line(&addr, elapsed_ms, &result));
             match result {
                 Ok(pid) => {
                     self.addrs.on_dial_success(&addr, pid);
@@ -1490,7 +1490,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         self.unknown_types_seen.insert(msg_type_raw);
         // `key=value` like `TELEMETRY` / `ROUND` / `DIAL`, so the same grep/awk
         // habits work. First sighting only — see the constant for the arithmetic.
-        println!(
+        qlab_devnet::jprintln!(
             "WIRE event=unknown_type type=0x{msg_type_raw:04x} bytes={payload_len} \
              peer={} action=ignored scored=no",
             from.0
@@ -2455,7 +2455,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             headers: Vec::with_capacity(capacity),
             stalled_batches: 0,
         });
-        println!(
+        qlab_devnet::jprintln!(
             "CHECKPOINT_SYNC event=begin_checkpoint_sync peer={} base={} checkpoint={} headers_cap={}",
             peer.0, base.height, checkpoint.height, capacity
         );
@@ -2666,7 +2666,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         if let Some(sync) = self.checkpoint_sync.as_mut() {
             if buffered > 0 {
                 sync.stalled_batches = 0;
-                println!(
+                qlab_devnet::jprintln!(
                     "CHECKPOINT_SYNC event=extend peer={} frontier={} checkpoint={}",
                     from.0,
                     sync.frontier_height(),
@@ -2678,7 +2678,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                     let checkpoint = sync.checkpoint.height;
                     self.checkpoint_sync = None;
                     self.checkpoint_sync_fallback = true;
-                    println!(
+                    qlab_devnet::jprintln!(
                         "CHECKPOINT_SYNC event=fallback reason=stalled peer={} checkpoint={}",
                         from.0, checkpoint
                     );
@@ -2750,7 +2750,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             return CheckpointHeaderOutcome::Fallback;
         }
         if sync.headers.is_empty() {
-            println!(
+            qlab_devnet::jprintln!(
                 "CHECKPOINT_SYNC event=buffer peer={} first={} checkpoint={}",
                 from.0, header.height, sync.checkpoint.height
             );
@@ -2772,7 +2772,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             self.peers.penalize(from, PENALTY_INVALID_OBJECT);
             self.checkpoint_sync = None;
             self.checkpoint_sync_fallback = true;
-            println!(
+            qlab_devnet::jprintln!(
                 "CHECKPOINT_SYNC event=fallback reason=frontier-mismatch peer={} checkpoint={}",
                 from.0, checkpoint
             );
@@ -2786,7 +2786,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
                 for buffered in sync.headers {
                     self.seen.insert(buffered.header_hash_for(self.node.genesis_form()));
                 }
-                println!(
+                qlab_devnet::jprintln!(
                     "CHECKPOINT_SYNC event=admit peer={} checkpoint={} headers={} pow=skipped",
                     from.0, sync.checkpoint.height, admitted
                 );
@@ -2794,7 +2794,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             }
             other => {
                 self.checkpoint_sync_fallback = true;
-                println!(
+                qlab_devnet::jprintln!(
                     "CHECKPOINT_SYNC event=fallback reason=admission-refused outcome={other:?} checkpoint={}",
                     sync.checkpoint.height
                 );

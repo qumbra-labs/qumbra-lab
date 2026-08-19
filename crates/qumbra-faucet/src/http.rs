@@ -710,7 +710,7 @@ impl FaucetServer {
                 // copy that differs from what stdout gets is not a redaction. The
                 // test reads `journal()`; the operator reads stdout; they are one
                 // `format!`.
-                println!("{line}");
+                qlab_devnet::jprintln!("{line}");
                 if let Ok(mut j) = worker_journal.lock() {
                     j.push(line);
                 }

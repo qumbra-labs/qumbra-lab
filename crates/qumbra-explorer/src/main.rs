@@ -49,7 +49,7 @@ fn main() -> ExitCode {
     let code = match dispatch(&args, &telemetry) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("qumbra-explorer error: {e}");
+            qlab_devnet::jeprintln!("qumbra-explorer error: {e}");
             ExitCode::FAILURE
         }
     };
@@ -146,7 +146,7 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// unqualified health, because some writer panicked to get here.
 fn note_poisoned(route: &str, degraded: &AtomicBool) {
     if !degraded.swap(true, Ordering::Relaxed) {
-        eprintln!(
+        qlab_devnet::jeprintln!(
             "🔴 {route}: a poisoned page lock was observed and written through — a writer \
              panicked at some point in this process's history. The document keeps serving; \
              /healthz now reports 503 degraded. (This line prints once.)"
@@ -236,54 +236,54 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
         None => None,
     };
 
-    println!("qumbra-explorer running");
-    println!("  projection:     http://{}{}", server.addr(), http::HEALTH_PATH);
-    println!(
+    qlab_devnet::jprintln!("qumbra-explorer running");
+    qlab_devnet::jprintln!("  projection:     http://{}{}", server.addr(), http::HEALTH_PATH);
+    qlab_devnet::jprintln!(
         "  tx existence:   http://{}{}?from=&to=  (bulk only — no lookup by txid, by design)",
         server.addr(),
         http::TXLIST_PATH
     );
-    println!(
+    qlab_devnet::jprintln!(
         "  blocks:         http://{}{}?from=&to=  (ticker + charts; range-only)",
         server.addr(),
         http::BLOCKS_PATH
     );
-    println!(
+    qlab_devnet::jprintln!(
         "  name events:    http://{}{}?from=&to=  (range-only — no resolve-by-name, by design)",
         server.addr(),
         http::NAMES_EVENTS_PATH
     );
-    println!(
+    qlab_devnet::jprintln!(
         "  checkpoints:    http://{}{}  (finality ticker; history is process-lifetime \
          and the document says where it begins)",
         server.addr(),
         http::CHECKPOINTS_PATH
     );
-    println!(
+    qlab_devnet::jprintln!(
         "  vitals:         http://{}{}  (peers/mempool over 24 h, sampled every {} s)",
         server.addr(),
         http::VITALS_PATH,
         vitals::SAMPLE_SECS
     );
-    println!("  page:           served separately (qumbra-explorer-web) — no / here");
+    qlab_devnet::jprintln!("  page:           served separately (qumbra-explorer-web) — no / here");
     match &metrics_server {
-        Some(m) => println!("  metrics:        http://{}/metrics (loopback only)", m.addr()),
-        None => println!("  metrics:        not served (set metrics_addr in the config to enable)"),
+        Some(m) => qlab_devnet::jprintln!("  metrics:        http://{}/metrics (loopback only)", m.addr()),
+        None => qlab_devnet::jprintln!("  metrics:        not served (set metrics_addr in the config to enable)"),
     }
-    println!("  {}", telemetry.posture_line());
-    println!("  node listen:    {}", node.listen_addr());
-    println!("  node data dir:  {}", node_cfg.data_dir.display());
-    println!("  genesis file hash: {genesis_hash}");
-    println!("  committee keys: 0 (keyless — §6.2 decision 1)");
-    println!("  mining:         false (observer)");
-    println!("  {verifier_log}");
+    qlab_devnet::jprintln!("  {}", telemetry.posture_line());
+    qlab_devnet::jprintln!("  node listen:    {}", node.listen_addr());
+    qlab_devnet::jprintln!("  node data dir:  {}", node_cfg.data_dir.display());
+    qlab_devnet::jprintln!("  genesis file hash: {genesis_hash}");
+    qlab_devnet::jprintln!("  committee keys: 0 (keyless — §6.2 decision 1)");
+    qlab_devnet::jprintln!("  mining:         false (observer)");
+    qlab_devnet::jprintln!("  {verifier_log}");
     if !server.addr().ip().is_loopback() {
-        println!(
+        qlab_devnet::jprintln!(
             "  ⚠️  the page is bound off-loopback. It holds no key and takes no input, \
              but put TLS and rate limiting in front before announcing the URL."
         );
     }
-    println!("(Ctrl-C / SIGTERM to shut down — the node's snapshot is flushed on exit)");
+    qlab_devnet::jprintln!("(Ctrl-C / SIGTERM to shut down — the node's snapshot is flushed on exit)");
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let sig = Arc::clone(&shutdown);
@@ -347,6 +347,6 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     if let Some(m) = metrics_server {
         m.shutdown();
     }
-    println!("shutdown complete");
+    qlab_devnet::jprintln!("shutdown complete");
     Ok(())
 }

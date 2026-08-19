@@ -225,7 +225,7 @@ impl Telemetry {
                 // misconfiguration, not a per-request event, so it does not violate
                 // the "no spam" rule and the alternative is a faucet that silently
                 // exports nothing while its config says it should.
-                Err(e) => eprintln!(
+                Err(e) => qlab_devnet::jeprintln!(
                     "qumbra-faucet: {OTLP_ENDPOINT_ENV}={ep} but the OTLP exporter could not be \
                      built ({e}). Spans are still generated; nothing is exported."
                 ),
@@ -267,7 +267,7 @@ impl Telemetry {
     /// a faucet must not fail to exit because a collector was unreachable.
     pub fn shutdown(self) {
         if let Err(e) = self.provider.shutdown() {
-            eprintln!("qumbra-faucet: tracer shutdown: {e}");
+            qlab_devnet::jeprintln!("qumbra-faucet: tracer shutdown: {e}");
         }
     }
 }
