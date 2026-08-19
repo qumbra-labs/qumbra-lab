@@ -12,10 +12,15 @@
 //!                          the name-event feed (lab #486 item 6), snapshot
 //!   GET  /v1/checkpoints   the finality ticker (lab #486 item 2, pre-serialized)
 //!   GET  /v1/vitals        net vitals over time (lab #486 item 4, pre-serialized)
-//!   GET  /healthz          "ok" — for a supervisor, no state
+//!   GET  /healthz          "ok" — for a supervisor; 503 "degraded" once a
+//!                          projection writer has observed a poisoned lock
 //!   GET  <anything>        404 JSON, and the body says why there is no /v1/tx/…
 //!   non-GET                405 with `Allow: GET`
 //! ```
+//!
+//! Every response carries `Cache-Control: no-store` — set at the source, so the
+//! property survives any proxy change (the 71-minute CDN-frozen `health.json`
+//! of lab #486 stage-0 finding (a)).
 //!
 //! 🔴 **`/v1/txlist/<txid>` is a 404 by shape, and that is D2** — the decision
 //! brief's refusal of a lookup-by-id, enforced by there being no arm that could
@@ -41,7 +46,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::blocks::{self, BlocksView};
@@ -113,6 +118,32 @@ fn not_found_body() -> String {
 /// request was malformed"* — the same rule `/v1/nullifiers` states for itself.
 fn bad_bounds(detail: &str) -> String {
     format!("{{\"refusal\":\"bad_bounds\",\"detail\":\"{detail}\"}}\n")
+}
+
+/// Publish a pre-serialized document into its slot, **writing through a
+/// poisoned lock** and reporting whether poison was observed.
+///
+/// This replaces the silent `if let Ok(mut p) = page.write()` swallow at the
+/// run loop (stage-0 finding (a)'s hardening, promoted to stage-1 scope by the
+/// stage-0 review): that shape darks a projection **forever, with no log
+/// line**, the first time any writer panics while holding the lock — while
+/// `/healthz` keeps answering `ok`. Writing through is safe here because the
+/// payload is a whole replacement `String` — there is no torn intermediate
+/// state a panic could have left that the overwrite does not erase. The
+/// caller's half of the contract: on `true`, say so LOUDLY and flip the
+/// [`Surfaces::degraded`] flag so `/healthz` stops attesting health it cannot
+/// vouch for.
+pub fn publish(slot: &RwLock<String>, body: String) -> bool {
+    match slot.write() {
+        Ok(mut p) => {
+            *p = body;
+            false
+        }
+        Err(poisoned) => {
+            *poisoned.into_inner() = body;
+            true
+        }
+    }
 }
 
 /// One `u64` query parameter, or `None` if it is missing or does not parse.
@@ -206,6 +237,13 @@ pub struct Surfaces {
     pub blocks: Arc<Mutex<Arc<BlocksView>>>,
     /// `/v1/names/events?from=&to=` — snapshot, encoded per request.
     pub names: Arc<Mutex<Arc<NameEventsView>>>,
+    /// Set by the run loop when [`publish`] observed a poisoned lock — a writer
+    /// panicked at some point in process history. The projections keep serving
+    /// (publish writes through), but `/healthz` answers **503 `degraded`**
+    /// instead of `ok`: a process that has eaten a panic in its serving path
+    /// must not keep attesting health it cannot vouch for (stage-0 finding
+    /// (a)'s exact complaint, inverted).
+    pub degraded: Arc<AtomicBool>,
 }
 
 impl Default for Surfaces {
@@ -224,6 +262,7 @@ impl Default for Surfaces {
             vitals: Arc::new(RwLock::new(crate::vitals::VitalsRing::new().document())),
             blocks: Arc::new(Mutex::new(Arc::new(BlocksView::default()))),
             names: Arc::new(Mutex::new(Arc::new(NameEventsView::default()))),
+            degraded: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -249,7 +288,8 @@ impl ExplorerServer {
     /// it. Neither path touches node state, which is the property that keeps a
     /// hostile client off the consensus loop.
     pub fn start(addr: &str, surfaces: Surfaces) -> io::Result<ExplorerServer> {
-        let Surfaces { health: page, txlist, checkpoints, vitals, blocks, names } = surfaces;
+        let Surfaces { health: page, txlist, checkpoints, vitals, blocks, names, degraded } =
+            surfaces;
         let server = tiny_http::Server::http(addr)
             .map_err(|e| io::Error::other(format!("listen_addr {addr}: {e}")))?;
         let server = Arc::new(server);
@@ -333,7 +373,19 @@ impl ExplorerServer {
                         }
                     }
                     (tiny_http::Method::Get, "/healthz") => {
-                        (200, "ok\n".to_string(), &b"text/plain; charset=utf-8"[..], false)
+                        if degraded.load(Ordering::Relaxed) {
+                            (
+                                503,
+                                "degraded: a projection writer observed a poisoned lock \
+                                 (a panic happened in this process); the documents still \
+                                 serve — see the process log\n"
+                                    .to_string(),
+                                &b"text/plain; charset=utf-8"[..],
+                                false,
+                            )
+                        } else {
+                            (200, "ok\n".to_string(), &b"text/plain; charset=utf-8"[..], false)
+                        }
                     }
                     (tiny_http::Method::Get, _) => {
                         (404, not_found_body(), &b"application/json; charset=utf-8"[..], false)
@@ -346,11 +398,25 @@ impl ExplorerServer {
                     ),
                 };
 
+                // 🔴 `Cache-Control: no-store` on EVERY response this listener
+                // emits, at the SOURCE. The live incident behind this (lab #486
+                // stage-0 finding (a), root-caused by T-ops): a CDN default-cached
+                // `/v1/health.json` for 71 minutes while its own body said
+                // `refresh_secs: 30` — every reader saw a frozen page and the only
+                // way to tell it from a wedged binary was host access. The proxy
+                // layer's copy of this header is the fast half; the binary owns the
+                // property so it survives any future proxy change. Uniform over
+                // refusals and `/healthz` too: a cached 404 or a cached `ok` is
+                // also a lie about the present.
                 let mut response = tiny_http::Response::from_string(body)
                     .with_status_code(code)
                     .with_header(
                         tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type)
                             .expect("static content type parses"),
+                    )
+                    .with_header(
+                        tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..])
+                            .expect("static cache-control parses"),
                     );
                 if allow {
                     if let Ok(h) = tiny_http::Header::from_bytes(&b"Allow"[..], &b"GET"[..]) {
@@ -427,6 +493,7 @@ mod tests {
                 vitals: Arc::clone(&s.vitals),
                 blocks: Arc::clone(&s.blocks),
                 names: Arc::clone(&s.names),
+                degraded: Arc::clone(&s.degraded),
             },
         )
         .expect("bind")
@@ -551,6 +618,81 @@ mod tests {
             v["detail"].as_str().expect("detail").contains("deliberately"),
             "the exclusion is stated, not implied"
         );
+    }
+
+    // ---- the loud swallow + degraded healthz (lab #486 stage-1 hardening) ------
+
+    /// 🔴 [`publish`] writes THROUGH a poisoned lock and reports it: the old
+    /// `if let Ok` swallow darked the projection forever with no log line; now
+    /// the poison is survived AND surfaced. The panicking writer here is a
+    /// stand-in for any writer panic in process history.
+    #[test]
+    fn publish_writes_through_a_poisoned_lock_and_reports_it() {
+        let slot = Arc::new(RwLock::new("before".to_string()));
+        assert!(!publish(&slot, "healthy".to_string()), "a healthy lock reports no poison");
+        assert_eq!(*slot.read().unwrap(), "healthy");
+
+        let poisoner = Arc::clone(&slot);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.write().unwrap();
+            panic!("a writer dies while holding the lock");
+        })
+        .join();
+        assert!(slot.write().is_err(), "the lock is genuinely poisoned");
+
+        assert!(publish(&slot, "after".to_string()), "poison is REPORTED, not swallowed");
+        let served = slot.read().map(|p| p.clone()).unwrap_or_else(|e| e.into_inner().clone());
+        assert_eq!(served, "after", "…and the projection is NOT dark: readers see the new body");
+    }
+
+    /// Once the degraded flag is set, `/healthz` stops attesting health: 503
+    /// with a body that names the condition — never `ok` from a process that
+    /// has eaten a panic in its serving path. The JSON routes keep serving.
+    #[test]
+    fn healthz_reports_degraded_after_a_poison_observation() {
+        let s = surfaces("{\"v\":1}");
+        let server = start(&s);
+        assert!(get(server.addr(), "/healthz").starts_with("HTTP/1.1 200"));
+
+        s.degraded.store(true, Ordering::Relaxed);
+        let resp = get(server.addr(), "/healthz");
+        assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
+        assert!(resp.contains("degraded"), "{resp}");
+        assert!(resp.contains("poisoned lock"), "the body names the condition: {resp}");
+        let health = get(server.addr(), HEALTH_PATH);
+        assert!(health.starts_with("HTTP/1.1 200"), "the documents still serve: {health}");
+        server.shutdown();
+    }
+
+    /// 🔴 Every response this listener emits carries `Cache-Control: no-store`
+    /// — the JSON documents, the refusals, `/healthz`, all of it. The lab #486
+    /// stage-0 live finding: a CDN default-cached `health.json` for 71 minutes
+    /// because nothing at the source said not to.
+    #[test]
+    fn every_response_carries_cache_control_no_store() {
+        let s = surfaces("{\"v\":1}");
+        let server = start(&s);
+        let addr = server.addr();
+        for probe in [
+            HEALTH_PATH,
+            "/v1/txlist?from=0&to=10",
+            "/v1/txlist",             // 400
+            CHECKPOINTS_PATH,
+            VITALS_PATH,
+            "/v1/blocks?from=0&to=10",
+            "/v1/names/events?from=0&to=10",
+            "/healthz",
+            "/v1/tx/abc",             // 404
+        ] {
+            let resp = get(addr, probe);
+            assert!(resp.contains("Cache-Control: no-store"), "{probe}: {resp}");
+        }
+        let post = exchange(
+            addr,
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        );
+        assert!(post.contains("Cache-Control: no-store"), "the 405 too: {post}");
+        server.shutdown();
     }
 
     #[test]

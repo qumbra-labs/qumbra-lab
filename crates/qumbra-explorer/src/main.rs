@@ -115,6 +115,22 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The loud half of the poisoned-lock contract (`http::publish` docs): log the
+/// observation ONCE — the flag latches, so a poisoned lock republished every
+/// tick does not flood the log — and leave /healthz answering `degraded` for
+/// the rest of the process's life. The lock is written through, so the route
+/// keeps serving fresh documents; what is lost is this process's claim to
+/// unqualified health, because some writer panicked to get here.
+fn note_poisoned(route: &str, degraded: &AtomicBool) {
+    if !degraded.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "🔴 {route}: a poisoned page lock was observed and written through — a writer \
+             panicked at some point in this process's history. The document keeps serving; \
+             /healthz now reports 503 degraded. (This line prints once.)"
+        );
+    }
+}
+
 fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let cfg_path = flag(args, "--config").ok_or("run requires --config FILE")?;
     let (cfg, node_cfg, genesis) = load(cfg_path)?;
@@ -169,6 +185,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let mut vitals_ring = vitals::VitalsRing::new();
     let vitals_page = Arc::new(RwLock::new(vitals_ring.document()));
 
+    // Latched by the loud-publish path below; served by /healthz as a 503.
+    let degraded = Arc::new(AtomicBool::new(false));
+
     // A failure to bind is FATAL, same rule as the faucet's listener.
     let server = ExplorerServer::start(
         &cfg.listen_addr,
@@ -179,6 +198,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             vitals: Arc::clone(&vitals_page),
             blocks: Arc::clone(&blocks_view),
             names: Arc::clone(&names_view),
+            degraded: Arc::clone(&degraded),
         },
     )?;
 
@@ -244,8 +264,13 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         let seen = json::fingerprint(&t);
         if last_seen != Some(seen) || last_render.elapsed() >= refresh {
             let body = json::health(&t, &genesis_hash, cfg.refresh_secs, &genesis.network);
-            if let Ok(mut p) = page.write() {
-                *p = body;
+            // 🔴 The loud swallow (lab #486 stage-1 scope): `publish` writes
+            // THROUGH a poisoned lock — the projection never darks — and a
+            // poison observation is logged once and latched into /healthz's
+            // degraded answer. The `if let Ok` this replaces could dark the
+            // page forever with no log line while /healthz kept saying ok.
+            if http::publish(&page, body) {
+                note_poisoned(http::HEALTH_PATH, &degraded);
             }
             last_seen = Some(seen);
             last_render = Instant::now();
@@ -263,18 +288,18 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         // for the same testability reason as `json::fingerprint`.
         if let Some(doc) = checkpoints::refreshed_document(&mut cp_last, n.p2p().node().finality())
         {
-            if let Ok(mut p) = checkpoints_page.write() {
-                *p = doc;
+            if http::publish(&checkpoints_page, doc) {
+                note_poisoned(http::CHECKPOINTS_PATH, &degraded);
             }
         }
         // One vitals sample per cadence interval (the rule lives in the
         // library; this is the one place the wall clock is read — a clock the
         // OS cannot answer samples nothing rather than fabricating a t).
         if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-            if vitals_ring.maybe_push(vitals::sample_of(now.as_secs(), &t)) {
-                if let Ok(mut p) = vitals_page.write() {
-                    *p = vitals_ring.document();
-                }
+            if vitals_ring.maybe_push(vitals::sample_of(now.as_secs(), &t))
+                && http::publish(&vitals_page, vitals_ring.document())
+            {
+                note_poisoned(http::VITALS_PATH, &degraded);
             }
         }
     });

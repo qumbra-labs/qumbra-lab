@@ -122,6 +122,10 @@ fn a_real_observer_node_serves_the_projection_over_a_real_socket() {
     let resp = get(addr, HEALTH_PATH);
     assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
     assert!(resp.contains("application/json"), "{resp}");
+    assert!(
+        resp.contains("Cache-Control: no-store"),
+        "the source forbids edge caching (the 71-minute CDN-frozen page, lab #486): {resp}"
+    );
     let v: serde_json::Value =
         serde_json::from_str(body_of(&resp)).expect("a live node's document parses");
     assert_eq!(v["v"], json::HEALTH_VERSION);
