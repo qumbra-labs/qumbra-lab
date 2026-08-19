@@ -505,6 +505,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
     println!("  genesis hash: {}", genesis.hash_hex());
     println!("  mining:       {}", config.mining);
+    println!("  template_serving: {}", config.template_serving);
     println!("  committee keys held: {}", config.committee_key_paths.len());
     println!("  {verifier_log}");
     // H4: the revision identifier + frozen-parameter digest are logged LOUDLY at

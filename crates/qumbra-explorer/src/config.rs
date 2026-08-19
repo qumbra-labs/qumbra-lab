@@ -244,6 +244,7 @@ mod tests {
             telemetry_addr: None,
             discovery_addr: None,
             miner_rkm: None,
+            template_serving: false,
         }
     }
 

@@ -185,6 +185,16 @@ pub struct NodeConfig {
     /// before this change. Ship the binary first, then the config.
     #[serde(default)]
     pub miner_rkm: Option<String>,
+    /// Serve `GET /v1/mine/template` and `POST /v1/mine/block` on the discovery
+    /// listener (lab #511). **Off by default** — this is a serving surface a
+    /// pool points at its own node, not something every node should expose.
+    ///
+    /// The issue wrote this as `mining.template_serving`. TOML cannot nest a
+    /// table under the existing `mining = true` bool without breaking every
+    /// deployed config, so the flag is a sibling. Same meaning: the mining
+    /// template RPC, gated, default off.
+    #[serde(default)]
+    pub template_serving: bool,
 }
 
 /// The serde default behind [`NodeConfig::discovery_addr`]: **on, loopback**.
@@ -342,9 +352,23 @@ mod tests {
         assert!(c.dial_peers.is_empty());
         assert!(c.committee_key_paths.is_empty());
         assert!(!c.mining);
+        assert!(!c.template_serving, "template RPC is off unless asked for");
         assert_eq!(c.expected_genesis_hash, None);
         assert_eq!(c.miner_rkm, None);
         assert_eq!(c.miner_rkm_lanes().expect("unset is fine"), None);
+    }
+
+    #[test]
+    fn template_serving_is_off_by_default_and_parses_when_set() {
+        let silent = NodeConfig::from_toml(SAMPLE).expect("parse");
+        assert!(
+            !SAMPLE.contains("template_serving"),
+            "the fixture must not mention the flag — that is the default"
+        );
+        assert!(!silent.template_serving);
+        let on = NodeConfig::from_toml(&format!("{SAMPLE}\ntemplate_serving = true\n"))
+            .expect("parse");
+        assert!(on.template_serving);
     }
 
     /// The payout key round-trips through the node's lane-major LE convention,

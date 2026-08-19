@@ -52,6 +52,7 @@ fn observer_rig(tag: &str) -> (NodeConfig, GenesisFile, PathBuf) {
         telemetry_addr: None,
         discovery_addr: None,
         miner_rkm: None,
+        template_serving: false,
     };
     (config, genesis, base)
 }
