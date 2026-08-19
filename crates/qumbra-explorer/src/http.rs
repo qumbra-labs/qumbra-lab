@@ -40,9 +40,26 @@
 //! split; only the route and the content type moved. Same `tiny_http` posture,
 //! bind-is-fatal rule and shutdown shape as `qumbra-faucet`'s listener.
 //!
-//! Deliberately absent: an access journal. The faucet logs (redacted) because a
-//! request carries a grant decision; this surface takes no input and makes no
-//! decisions, so the only thing a per-request log could record is readership.
+//! ## The journal line (OTel baton, §C.1 piece 2) — and what it still refuses
+//!
+//! This module used to say *"deliberately absent: an access journal"*, because
+//! the only thing a per-request log could record was readership. The OTel kit
+//! needs a `trace_id=` on a request log line — that is the Loki↔Tempo
+//! correlation the plan pins — so a journal line now exists, and the old
+//! refusal narrows to what it was actually protecting:
+//!
+//!   * **No client identity, ever.** Not the IP, not even the subnet the faucet
+//!     journals — the faucet logs subnets because it makes rate decisions; this
+//!     surface makes none, so a client field would be pure readership record.
+//!   * **The matched route, never the raw path.** Stricter than the faucet,
+//!     which logs the path: an unmatched probe here can carry exactly the thing
+//!     D2 refuses to learn (`/v1/names/larry` is *a name somebody cares about*),
+//!     so what lands in the journal is the route template — an unmatched path
+//!     logs as [`UNMATCHED_ROUTE`], and no requester-chosen byte reaches the
+//!     journal, a span attribute, or a metric label.
+//!
+//! What the line records: method, matched route, status, and `trace_id=` — the
+//! same id the span exports and the histogram exemplar carries, read once.
 
 use std::io;
 use std::net::SocketAddr;
@@ -51,7 +68,15 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::blocks::{self, BlocksView};
 use crate::names::{self, NameEventsView};
+use crate::telemetry::{current_trace_id, ExplorerMetrics, RequestLabels};
 use crate::txlist::{self, TxListView};
+
+/// The `route` label and span attribute for anything that did not match a route.
+///
+/// One fixed token for every miss, because the alternative — the raw path — is
+/// an unbounded-cardinality label AND a record of what somebody probed for,
+/// which on this surface can be a name (see the module docs' journal rules).
+pub const UNMATCHED_ROUTE: &str = "{unmatched}";
 
 /// The chain-health route. Caddy path-routes `/v1/*` here (issue #281); the prefix
 /// is shared with the node's own `/v1` surfaces by convention, not by code.
@@ -272,6 +297,7 @@ pub struct ExplorerServer {
     server: Arc<tiny_http::Server>,
     thread: Option<std::thread::JoinHandle<()>>,
     served: Arc<AtomicU64>,
+    journal: Arc<Mutex<Vec<String>>>,
 }
 
 impl ExplorerServer {
@@ -287,7 +313,22 @@ impl ExplorerServer {
     /// slow reader can never hold the snapshot while the run loop wants to replace
     /// it. Neither path touches node state, which is the property that keeps a
     /// hostile client off the consensus loop.
+    ///
+    /// Hands in a private metric registry: a caller that does not serve
+    /// `/metrics` still gets the same measurements taken, they simply go nowhere
+    /// — which is what keeps every existing test of this surface unchanged.
     pub fn start(addr: &str, surfaces: Surfaces) -> io::Result<ExplorerServer> {
+        Self::start_with_telemetry(addr, surfaces, Arc::new(ExplorerMetrics::new()))
+    }
+
+    /// [`Self::start`], with the process's shared metric registry so the served
+    /// requests land in the histogram the [`crate::metrics_server`] endpoint
+    /// encodes. This is the constructor `main` uses.
+    pub fn start_with_telemetry(
+        addr: &str,
+        surfaces: Surfaces,
+        metrics: Arc<ExplorerMetrics>,
+    ) -> io::Result<ExplorerServer> {
         let Surfaces { health: page, txlist, checkpoints, vitals, blocks, names, degraded } =
             surfaces;
         let server = tiny_http::Server::http(addr)
@@ -298,24 +339,50 @@ impl ExplorerServer {
             .to_ip()
             .ok_or_else(|| io::Error::other("explorer listener has no ip address"))?;
         let served = Arc::new(AtomicU64::new(0));
+        let journal = Arc::new(Mutex::new(Vec::new()));
 
         let worker = Arc::clone(&server);
         let worker_served = Arc::clone(&served);
+        let worker_journal = Arc::clone(&journal);
+        let worker_metrics = Arc::clone(&metrics);
         let thread = std::thread::spawn(move || {
             for request in worker.incoming_requests() {
                 worker_served.fetch_add(1, Ordering::Relaxed);
+                let method = request.method().clone();
                 let url = request.url().to_string();
                 let (raw_path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
                 let path = raw_path.trim_end_matches('/');
                 let path = if path.is_empty() { "/" } else { path };
 
-                let (code, body, content_type, allow) = match (request.method(), path) {
+                // 🔴 Piece 1 of the kit: ONE span per request, opened at the
+                // accept seam and closed when the response has been handed to the
+                // socket. What is on it follows the journal's own redaction rule
+                // (module docs): method, MATCHED route, status — never the raw
+                // URL, never anything about the client.
+                let span = tracing::info_span!(
+                    "explorer.request",
+                    otel.kind = "server",
+                    "http.request.method" = %method,
+                    "http.route" = tracing::field::Empty,
+                    "http.response.status_code" = tracing::field::Empty,
+                );
+                let _enter = span.enter();
+                let started = std::time::Instant::now();
+
+                let (route, code, body, content_type, allow) = match (&method, path) {
                     (tiny_http::Method::Get, HEALTH_PATH) => {
                         let body =
                             page.read().map(|p| p.clone()).unwrap_or_else(|e| e.into_inner().clone());
-                        (200, body, &b"application/json; charset=utf-8"[..], false)
+                        (HEALTH_PATH, 200, body, &b"application/json; charset=utf-8"[..], false)
                     }
                     (tiny_http::Method::Get, TXLIST_PATH) => {
+                        // The per-request "page build" — the range walk over the
+                        // snapshot plus the encode — as a CHILD of the request
+                        // span. This is the only real per-request stage this
+                        // surface has; the pre-serialized routes are one string
+                        // clone and get no child.
+                        let pb = tracing::info_span!("explorer.page_build", "http.route" = TXLIST_PATH);
+                        let _pb = pb.enter();
                         // Clone the Arc under the lock; encode with it released.
                         let snapshot = match txlist.lock() {
                             Ok(g) => Arc::clone(&g),
@@ -323,10 +390,10 @@ impl ExplorerServer {
                         };
                         match respond_txlist(&snapshot, query) {
                             Ok(doc) => {
-                                (200, doc, &b"application/json; charset=utf-8"[..], false)
+                                (TXLIST_PATH, 200, doc, &b"application/json; charset=utf-8"[..], false)
                             }
                             Err((code, msg)) => {
-                                (code, msg, &b"application/json; charset=utf-8"[..], false)
+                                (TXLIST_PATH, code, msg, &b"application/json; charset=utf-8"[..], false)
                             }
                         }
                     }
@@ -335,46 +402,62 @@ impl ExplorerServer {
                             .read()
                             .map(|p| p.clone())
                             .unwrap_or_else(|e| e.into_inner().clone());
-                        (200, body, &b"application/json; charset=utf-8"[..], false)
+                        (CHECKPOINTS_PATH, 200, body, &b"application/json; charset=utf-8"[..], false)
                     }
                     (tiny_http::Method::Get, VITALS_PATH) => {
                         let body = vitals
                             .read()
                             .map(|p| p.clone())
                             .unwrap_or_else(|e| e.into_inner().clone());
-                        (200, body, &b"application/json; charset=utf-8"[..], false)
+                        (VITALS_PATH, 200, body, &b"application/json; charset=utf-8"[..], false)
                     }
                     (tiny_http::Method::Get, BLOCKS_PATH) => {
+                        let pb = tracing::info_span!("explorer.page_build", "http.route" = BLOCKS_PATH);
+                        let _pb = pb.enter();
                         let snapshot = match blocks.lock() {
                             Ok(g) => Arc::clone(&g),
                             Err(p) => Arc::clone(&p.into_inner()),
                         };
                         match respond_blocks(&snapshot, query) {
                             Ok(doc) => {
-                                (200, doc, &b"application/json; charset=utf-8"[..], false)
+                                (BLOCKS_PATH, 200, doc, &b"application/json; charset=utf-8"[..], false)
                             }
                             Err((code, msg)) => {
-                                (code, msg, &b"application/json; charset=utf-8"[..], false)
+                                (BLOCKS_PATH, code, msg, &b"application/json; charset=utf-8"[..], false)
                             }
                         }
                     }
                     (tiny_http::Method::Get, NAMES_EVENTS_PATH) => {
+                        let pb = tracing::info_span!(
+                            "explorer.page_build",
+                            "http.route" = NAMES_EVENTS_PATH
+                        );
+                        let _pb = pb.enter();
                         let snapshot = match names.lock() {
                             Ok(g) => Arc::clone(&g),
                             Err(p) => Arc::clone(&p.into_inner()),
                         };
                         match respond_names(&snapshot, query) {
-                            Ok(doc) => {
-                                (200, doc, &b"application/json; charset=utf-8"[..], false)
-                            }
-                            Err((code, msg)) => {
-                                (code, msg, &b"application/json; charset=utf-8"[..], false)
-                            }
+                            Ok(doc) => (
+                                NAMES_EVENTS_PATH,
+                                200,
+                                doc,
+                                &b"application/json; charset=utf-8"[..],
+                                false,
+                            ),
+                            Err((code, msg)) => (
+                                NAMES_EVENTS_PATH,
+                                code,
+                                msg,
+                                &b"application/json; charset=utf-8"[..],
+                                false,
+                            ),
                         }
                     }
                     (tiny_http::Method::Get, "/healthz") => {
                         if degraded.load(Ordering::Relaxed) {
                             (
+                                "/healthz",
                                 503,
                                 "degraded: a projection writer observed a poisoned lock \
                                  (a panic happened in this process); the documents still \
@@ -384,19 +467,66 @@ impl ExplorerServer {
                                 false,
                             )
                         } else {
-                            (200, "ok\n".to_string(), &b"text/plain; charset=utf-8"[..], false)
+                            (
+                                "/healthz",
+                                200,
+                                "ok\n".to_string(),
+                                &b"text/plain; charset=utf-8"[..],
+                                false,
+                            )
                         }
                     }
-                    (tiny_http::Method::Get, _) => {
-                        (404, not_found_body(), &b"application/json; charset=utf-8"[..], false)
-                    }
+                    (tiny_http::Method::Get, _) => (
+                        UNMATCHED_ROUTE,
+                        404,
+                        not_found_body(),
+                        &b"application/json; charset=utf-8"[..],
+                        false,
+                    ),
                     _ => (
+                        UNMATCHED_ROUTE,
                         405,
                         "GET only.\n".to_string(),
                         &b"text/plain; charset=utf-8"[..],
                         true,
                     ),
                 };
+
+                span.record("http.route", route);
+                span.record("http.response.status_code", code);
+                let elapsed = started.elapsed().as_secs_f64();
+                // 🔴 Piece 2: one id, read once, used by both the journal line
+                // and the exemplar — so a trace found from a log line and a trace
+                // found from a slow bucket are provably the same trace.
+                let trace_id = current_trace_id();
+                worker_metrics.observe_request(
+                    RequestLabels {
+                        method: method.to_string(),
+                        route: route.to_string(),
+                        status: code,
+                    },
+                    elapsed,
+                    trace_id.clone(),
+                );
+
+                // The journal line — matched route only, no client identity (the
+                // module docs' rules). `trace_id=` is omitted entirely when no
+                // tracer is installed (unit tests driving this surface directly):
+                // `trace_id=` followed by nothing usable would not match the Loki
+                // derived-field regex either, and a reader would take zeros for a
+                // real trace. `main` installs a tracer before it binds, so the
+                // deployed binary always has one.
+                let line = match &trace_id {
+                    Some(id) => format!("EXPLORER {method} {route} {code} trace_id={id}"),
+                    None => format!("EXPLORER {method} {route} {code}"),
+                };
+                // Both, and the same string: the operator reads stdout, the test
+                // reads `journal()`, and they are one `format!` — the faucet's
+                // rule, kept.
+                println!("{line}");
+                if let Ok(mut j) = worker_journal.lock() {
+                    j.push(line);
+                }
 
                 // 🔴 `Cache-Control: no-store` on EVERY response this listener
                 // emits, at the SOURCE. The live incident behind this (lab #486
@@ -427,7 +557,7 @@ impl ExplorerServer {
             }
         });
 
-        Ok(ExplorerServer { addr: bound, server, thread: Some(thread), served })
+        Ok(ExplorerServer { addr: bound, server, thread: Some(thread), served, journal })
     }
 
     /// The bound address (useful when the config asked for port 0).
@@ -438,6 +568,12 @@ impl ExplorerServer {
     /// Requests handled since start, including 404s and 405s.
     pub fn requests_served(&self) -> u64 {
         self.served.load(Ordering::Relaxed)
+    }
+
+    /// The journal lines emitted so far — the same strings stdout got, in order.
+    /// Exists so the `trace_id=` claim is testable without capturing stdout.
+    pub fn journal(&self) -> Vec<String> {
+        self.journal.lock().map(|j| j.clone()).unwrap_or_default()
     }
 
     /// Stop serving and join the worker.

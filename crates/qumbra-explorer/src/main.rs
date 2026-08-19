@@ -27,7 +27,9 @@ use qumbra_explorer::checkpoints;
 use qumbra_explorer::config::ExplorerConfig;
 use qumbra_explorer::http::{self, ExplorerServer, Surfaces};
 use qumbra_explorer::json;
+use qumbra_explorer::metrics_server::MetricsServer;
 use qumbra_explorer::names::{self, NameEventsView};
+use qumbra_explorer::telemetry::Telemetry;
 use qumbra_explorer::txlist::{self, TxListView};
 use qumbra_explorer::vitals;
 use qumbra_node::config::NodeConfig;
@@ -37,19 +39,31 @@ use qumbra_node::verifier::select_verifier;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match dispatch(&args) {
+    // 🔴 Telemetry is initialised for EVERY subcommand, not just `run` — the
+    // faucet's rule, for the faucet's reason: "no OTEL_EXPORTER_OTLP_ENDPOINT ⇒
+    // no exporter, no noise" is only checkable from outside if a cheap
+    // invocation exercises the same initialisation path `run` does.
+    // `tests/otel_disabled.rs` drives the no-args usage path for exactly that.
+    // The cost when export is off is one tracer provider with no span processor.
+    let telemetry = Telemetry::init();
+    let code = match dispatch(&args, &telemetry) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("qumbra-explorer error: {e}");
             ExitCode::FAILURE
         }
-    }
+    };
+    // Flush before exit: a batch exporter dropped without a shutdown loses what
+    // it was holding, and the spans most worth having are from the run that just
+    // ended.
+    telemetry.shutdown();
+    code
 }
 
-fn dispatch(args: &[String]) -> Result<(), Box<dyn Error>> {
+fn dispatch(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     match args.first().map(String::as_str) {
         Some("check") => check(&args[1..]),
-        Some("run") => run(&args[1..]),
+        Some("run") => run(&args[1..], telemetry),
         Some("-h") | Some("--help") | None => {
             usage();
             Ok(())
@@ -99,7 +113,16 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  network:        {} (banner label source — served, never hardcoded)", genesis.network);
     println!("  committee keys: 0 (keyless — enforced)");
     println!("  mining:         false (enforced)");
-    println!("  extra listeners: none (telemetry_addr/metrics_addr refused — §6.2)");
+    println!(
+        "  extra listeners: telemetry_addr refused outright; metrics loopback-only \
+         (§6.2, OTel-baton ruling)"
+    );
+    println!(
+        "  metrics:        {}",
+        cfg.metrics_addr
+            .as_deref()
+            .unwrap_or("not served (set metrics_addr — loopback only)")
+    );
     println!(
         "  routes:         {} + {}?from=&to= + {}?from=&to= + {}?from=&to= + {} + {} \
          + /healthz (no page, no write path)",
@@ -131,7 +154,7 @@ fn note_poisoned(route: &str, degraded: &AtomicBool) {
     }
 }
 
-fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
+fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     let cfg_path = flag(args, "--config").ok_or("run requires --config FILE")?;
     let (cfg, node_cfg, genesis) = load(cfg_path)?;
 
@@ -189,7 +212,8 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let degraded = Arc::new(AtomicBool::new(false));
 
     // A failure to bind is FATAL, same rule as the faucet's listener.
-    let server = ExplorerServer::start(
+    let metrics = telemetry.metrics();
+    let server = ExplorerServer::start_with_telemetry(
         &cfg.listen_addr,
         Surfaces {
             health: Arc::clone(&page),
@@ -200,7 +224,17 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             names: Arc::clone(&names_view),
             degraded: Arc::clone(&degraded),
         },
+        Arc::clone(&metrics),
     )?;
+
+    // The scrape endpoint (§C.1 piece 3), off unless `metrics_addr` is set. A
+    // non-loopback value was already refused at load, so this bind cannot be
+    // the first place an operator hears about it; a bind failure is fatal, same
+    // rule as the listener above.
+    let metrics_server = match cfg.metrics_addr.as_deref() {
+        Some(addr) => Some(MetricsServer::start(addr, Arc::clone(&metrics))?),
+        None => None,
+    };
 
     println!("qumbra-explorer running");
     println!("  projection:     http://{}{}", server.addr(), http::HEALTH_PATH);
@@ -232,6 +266,11 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         vitals::SAMPLE_SECS
     );
     println!("  page:           served separately (qumbra-explorer-web) — no / here");
+    match &metrics_server {
+        Some(m) => println!("  metrics:        http://{}/metrics (loopback only)", m.addr()),
+        None => println!("  metrics:        not served (set metrics_addr in the config to enable)"),
+    }
+    println!("  {}", telemetry.posture_line());
     println!("  node listen:    {}", node.listen_addr());
     println!("  node data dir:  {}", node_cfg.data_dir.display());
     println!("  genesis file hash: {genesis_hash}");
@@ -305,6 +344,9 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     });
 
     server.shutdown();
+    if let Some(m) = metrics_server {
+        m.shutdown();
+    }
     println!("shutdown complete");
     Ok(())
 }

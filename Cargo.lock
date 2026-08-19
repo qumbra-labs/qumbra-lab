@@ -1766,6 +1766,10 @@ name = "qumbra-explorer"
 version = "0.0.0"
 dependencies = [
  "ctrlc",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "prometheus-client",
  "qlab-devnet",
  "qlab-node",
  "qlab-note",
@@ -1775,6 +1779,9 @@ dependencies = [
  "serde_json",
  "tiny_http",
  "toml",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
 ]
 
 [[package]]
