@@ -62,7 +62,7 @@ fn main() -> ExitCode {
     let code = match dispatch(&args, &telemetry) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            qlab_devnet::jeprintln!("qumbra-faucet error: {e}");
+            qlab_devnet::jeprintln!(ERROR, "qumbra-faucet error: {e}");
             ExitCode::FAILURE
         }
     };
@@ -256,7 +256,8 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     let (svc, node_cfg, wallet, ticket_secret) = load(cfg_path)?;
     let genesis = GenesisFile::load(&node_cfg.genesis_file)?;
 
-    let (verifier, verifier_log) = select_verifier(has_flag(args, "--rehearsal-verifier"));
+    let rehearsal_verifier = has_flag(args, "--rehearsal-verifier");
+    let (verifier, verifier_log) = select_verifier(rehearsal_verifier);
 
     let limits = FaucetLimits {
         ticket_policy: if svc.tickets_required() {
@@ -373,15 +374,21 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     // Lab #308 / #296 honesty voice: name which client-id posture is active.
     qlab_devnet::jprintln!("  {}", trusted.posture_line());
     qlab_devnet::jprintln!("  {}", telemetry.posture_line());
-    qlab_devnet::jprintln!("  {verifier_log}");
+    // The rehearsal banner is the ⚠️-class abnormality the #512 amendment
+    // names; the real-verifier line is nominal and carries no token.
+    if rehearsal_verifier {
+        qlab_devnet::jprintln!(WARN, "  {verifier_log}");
+    } else {
+        qlab_devnet::jprintln!("  {verifier_log}");
+    }
     if !server.addr().ip().is_loopback() {
-        qlab_devnet::jprintln!(
+        qlab_devnet::jprintln!(WARN,
             "  ⚠️  THE FAUCET IS BOUND OFF-LOOPBACK AND HOLDS A HOT SPENDING KEY. Pair this \
              with a source-restricted inbound rule."
         );
     }
     if !svc.tickets_required() {
-        qlab_devnet::jprintln!(
+        qlab_devnet::jprintln!(WARN,
             "  ⚠️  TICKETS ARE OFF. The only remaining controls are token buckets, which are an \
              anti-accident filter and not a defence: this faucet is saturable by roughly a \
              hundred distinct subnets."

@@ -65,21 +65,55 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (year, month, day)
 }
 
-/// `println!` with the journal stamp prefixed — the drop-in for every
-/// stdout journal site. The stamp and the line are one write, so concurrent
-/// writers cannot interleave a stamp with someone else's line.
+/// One journal line: stamp, then the optional severity token, then the body —
+/// a single `String` so the stamp, token and line are one write and concurrent
+/// writers cannot interleave them. The one format every journal line goes
+/// through; the macros below are thin wrappers over it.
+pub fn stamped_line(token: Option<&str>, body: std::fmt::Arguments<'_>) -> String {
+    match token {
+        Some(t) => format!("{} {t} {body}", utc_stamp()),
+        None => format!("{} {body}", utc_stamp()),
+    }
+}
+
+/// `println!` with the journal stamp prefixed — the drop-in for every stdout
+/// journal site.
+///
+/// **Severity tokens (lab #512 amendment, deliberately narrow):** an abnormal
+/// line — and only an abnormal line — names its severity as an ASCII token
+/// right after the timestamp: `jprintln!(WARN, "…")` for degraded-but-serving
+/// (the ⚠️-class), `jprintln!(ERROR, "…")` for the 🔴-class (swallowed-write
+/// reports, refusals that indicate operator action). This is NOT log leveling:
+/// the journal's line TYPE stays the house's level axis, nothing filters on
+/// the token, and a nominal line carries no token — **absence means nominal**.
+/// Existing emoji stay in the body for human eyes; the token is for grep/Loki.
+/// The token is orthogonal to the stream: severity does not move a line
+/// between stdout and stderr.
 #[macro_export]
 macro_rules! jprintln {
+    (WARN, $($arg:tt)*) => {
+        ::std::println!("{}", $crate::journal::stamped_line(Some("WARN"), ::std::format_args!($($arg)*)))
+    };
+    (ERROR, $($arg:tt)*) => {
+        ::std::println!("{}", $crate::journal::stamped_line(Some("ERROR"), ::std::format_args!($($arg)*)))
+    };
     ($($arg:tt)*) => {
-        ::std::println!("{} {}", $crate::journal::utc_stamp(), ::std::format_args!($($arg)*))
+        ::std::println!("{}", $crate::journal::stamped_line(None, ::std::format_args!($($arg)*)))
     };
 }
 
-/// `eprintln!` with the journal stamp prefixed — the stderr twin.
+/// `eprintln!` with the journal stamp prefixed — the stderr twin, same
+/// severity arms as [`jprintln!`].
 #[macro_export]
 macro_rules! jeprintln {
+    (WARN, $($arg:tt)*) => {
+        ::std::eprintln!("{}", $crate::journal::stamped_line(Some("WARN"), ::std::format_args!($($arg)*)))
+    };
+    (ERROR, $($arg:tt)*) => {
+        ::std::eprintln!("{}", $crate::journal::stamped_line(Some("ERROR"), ::std::format_args!($($arg)*)))
+    };
     ($($arg:tt)*) => {
-        ::std::eprintln!("{} {}", $crate::journal::utc_stamp(), ::std::format_args!($($arg)*))
+        ::std::eprintln!("{}", $crate::journal::stamped_line(None, ::std::format_args!($($arg)*)))
     };
 }
 
@@ -129,5 +163,35 @@ mod tests {
     fn pre_epoch_clock_degrades_to_epoch() {
         let before = UNIX_EPOCH - Duration::from_secs(1);
         assert_eq!(utc_stamp_at(before), "1970-01-01T00:00:00.000Z");
+    }
+
+    /// The severity token sits right after the timestamp, space-delimited on
+    /// both sides — the position an operator's `grep ' WARN '` / a Loki stage
+    /// keys on — and a nominal line carries nothing there (absence means
+    /// nominal, so the nominal shape must stay byte-identical to pre-token).
+    #[test]
+    fn severity_token_rides_right_after_the_stamp_and_only_when_abnormal() {
+        let warn = stamped_line(Some("WARN"), format_args!("thing degraded"));
+        assert_eq!(&warn[24..30], " WARN ", "{warn}");
+        assert!(warn.ends_with("thing degraded"), "{warn}");
+        let err = stamped_line(Some("ERROR"), format_args!("write failed"));
+        assert_eq!(&err[24..31], " ERROR ", "{err}");
+        let plain = stamped_line(None, format_args!("TELEMETRY tip=1"));
+        assert_eq!(&plain[24..25], " ", "{plain}");
+        assert!(plain.ends_with("TELEMETRY tip=1"), "{plain}");
+        assert!(!plain.contains(" WARN ") && !plain.contains(" ERROR "), "{plain}");
+    }
+
+    /// The acceptance-bar negatives grep `^error` (line-anchored, lowercase)
+    /// cannot match a journal `ERROR` line **by construction**: every journal
+    /// line begins with the stamp's year digit, and the token itself is
+    /// uppercase. Locked here so a future format change that breaks either
+    /// property announces itself.
+    #[test]
+    fn error_token_cannot_collide_with_the_ci_negatives_grep() {
+        let line = stamped_line(Some("ERROR"), format_args!("error: something failed"));
+        assert!(line.as_bytes()[0].is_ascii_digit(), "{line}");
+        assert!(!line.starts_with("error"), "{line}");
+        assert!(line.contains(" ERROR "), "{line}");
     }
 }

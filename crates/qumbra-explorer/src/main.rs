@@ -49,7 +49,7 @@ fn main() -> ExitCode {
     let code = match dispatch(&args, &telemetry) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            qlab_devnet::jeprintln!("qumbra-explorer error: {e}");
+            qlab_devnet::jeprintln!(ERROR, "qumbra-explorer error: {e}");
             ExitCode::FAILURE
         }
     };
@@ -146,7 +146,7 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
 /// unqualified health, because some writer panicked to get here.
 fn note_poisoned(route: &str, degraded: &AtomicBool) {
     if !degraded.swap(true, Ordering::Relaxed) {
-        qlab_devnet::jeprintln!(
+        qlab_devnet::jeprintln!(ERROR,
             "🔴 {route}: a poisoned page lock was observed and written through — a writer \
              panicked at some point in this process's history. The document keeps serving; \
              /healthz now reports 503 degraded. (This line prints once.)"
@@ -158,7 +158,8 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     let cfg_path = flag(args, "--config").ok_or("run requires --config FILE")?;
     let (cfg, node_cfg, genesis) = load(cfg_path)?;
 
-    let (verifier, verifier_log) = select_verifier(has_flag(args, "--rehearsal-verifier"));
+    let rehearsal_verifier = has_flag(args, "--rehearsal-verifier");
+    let (verifier, verifier_log) = select_verifier(rehearsal_verifier);
     let mut node = RunningNode::start(&node_cfg, &genesis, RandomXPow::new(), verifier)?;
     // The same two clock opt-ins every binary takes: real wall-clock header
     // timestamps for LWMA, and a wall-clock observation clock for diagnostics.
@@ -276,9 +277,15 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     qlab_devnet::jprintln!("  genesis file hash: {genesis_hash}");
     qlab_devnet::jprintln!("  committee keys: 0 (keyless — §6.2 decision 1)");
     qlab_devnet::jprintln!("  mining:         false (observer)");
-    qlab_devnet::jprintln!("  {verifier_log}");
+    // The rehearsal banner is the ⚠️-class abnormality the #512 amendment
+    // names; the real-verifier line is nominal and carries no token.
+    if rehearsal_verifier {
+        qlab_devnet::jprintln!(WARN, "  {verifier_log}");
+    } else {
+        qlab_devnet::jprintln!("  {verifier_log}");
+    }
     if !server.addr().ip().is_loopback() {
-        qlab_devnet::jprintln!(
+        qlab_devnet::jprintln!(WARN,
             "  ⚠️  the page is bound off-loopback. It holds no key and takes no input, \
              but put TLS and rate limiting in front before announcing the URL."
         );

@@ -766,7 +766,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             let restore = adapter.punishment_restore();
             qlab_devnet::jprintln!("{}", restore.summary_line());
             if restore.ledger_absent_on_populated_datadir {
-                qlab_devnet::jprintln!(
+                qlab_devnet::jprintln!(WARN,
                     "⚠️  this data dir already holds chain history but carried NO committee-\
                      punishment ledger, so it was written by a binary predating issue #133. \
                      Whether a punishment was ever applied against it is UNKNOWABLE — a \
@@ -796,7 +796,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         //     backoff ladder (the S9 re-dial behaviour moved there unchanged).
         let mut addrs = match std::fs::read(config.data_dir.join(ADDRBOOK_FILE)) {
             Ok(bytes) => AddrManager::from_bytes(&bytes).unwrap_or_else(|e| {
-                qlab_devnet::jeprintln!("address book unreadable ({e}); starting from seeds");
+                qlab_devnet::jeprintln!(WARN, "address book unreadable ({e}); starting from seeds");
                 AddrManager::new()
             }),
             Err(_) => AddrManager::new(),
@@ -828,7 +828,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 p2p.node_mut().set_miner_rkm(rkm);
                 qlab_devnet::jprintln!("miner payout: coinbase notes paid to the configured miner_rkm");
             }
-            None if config.mining => qlab_devnet::jprintln!(
+            None if config.mining => qlab_devnet::jprintln!(WARN,
                 "⚠️  NO miner_rkm CONFIGURED: this node mines valid blocks whose coinbase \
                  notes are paid to a fixed placeholder key that NOBODY can spend. Every \
                  coin this node mines is BURNED. Set `miner_rkm` (64 hex chars, your \
@@ -1139,7 +1139,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                     // (contiguous from genesis by construction), but if it ever did,
                     // serving a stale row is worse than serving none: `supply_lag`
                     // then reports the gap and consumers render UNAVAILABLE.
-                    Err(e) => qlab_devnet::jeprintln!("SUPPLY rebuild after reorg failed: {e:?}"),
+                    Err(e) => qlab_devnet::jeprintln!(ERROR, "SUPPLY rebuild after reorg failed: {e:?}"),
                 }
             }
             for height in ledger.next_height()..=state_chain.tip_height() {
@@ -2423,7 +2423,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         for f in &self.finalizers {
             let path = finalizer_state_path(&self.data_dir, f.index());
             if let Err(e) = write_file_durably(&path, &f.state().to_bytes()) {
-                qlab_devnet::jeprintln!("persist finalizer {} failed: {e}", f.index());
+                qlab_devnet::jeprintln!(ERROR, "persist finalizer {} failed: {e}", f.index());
             }
         }
     }
@@ -2460,7 +2460,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     pub fn save_addr_book(&self) {
         let path = self.data_dir.join(ADDRBOOK_FILE);
         if let Err(e) = write_file_durably(&path, &self.p2p.addrs().to_bytes()) {
-            qlab_devnet::jeprintln!("persist address book failed: {e}");
+            qlab_devnet::jeprintln!(ERROR, "persist address book failed: {e}");
         }
     }
 
@@ -2548,7 +2548,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                     );
                 }
             }
-            Err(e) => qlab_devnet::jeprintln!("halt marker write failed: {e}"),
+            Err(e) => qlab_devnet::jeprintln!(ERROR, "halt marker write failed: {e}"),
         }
     }
 
@@ -2615,7 +2615,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             // its snapshot is still a correct node — the block log is the source of
             // truth and the next start replays it. Loud, because a host silently
             // failing this write is a host quietly returning to node3's shape.
-            Err(e) => qlab_devnet::jeprintln!("snapshot cadence write failed: {e}"),
+            Err(e) => qlab_devnet::jeprintln!(ERROR, "snapshot cadence write failed: {e}"),
         }
     }
 
@@ -2681,7 +2681,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 true
             }
             Err(e) => {
-                qlab_devnet::jeprintln!("snapshot flush on shutdown failed: {e}");
+                qlab_devnet::jeprintln!(ERROR, "snapshot flush on shutdown failed: {e}");
                 false
             }
         };

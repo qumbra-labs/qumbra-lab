@@ -48,7 +48,7 @@ fn main() -> ExitCode {
     match dispatch(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            qlab_devnet::jeprintln!("qumbra-node error: {e}");
+            qlab_devnet::jeprintln!(ERROR, "qumbra-node error: {e}");
             ExitCode::FAILURE
         }
     }
@@ -285,7 +285,8 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // REAL M3 verifier (qlab_consensus::verify_proof, frozen CONSENSUS_CFG);
     // `--rehearsal-verifier` opts into the NO-OP stand-in and logs loudly
     // (M10-T0-4, issue #68 — the named M11 gate, closed early).
-    let (verifier, verifier_log) = select_verifier(has_flag(args, "--rehearsal-verifier"));
+    let rehearsal_verifier = has_flag(args, "--rehearsal-verifier");
+    let (verifier, verifier_log) = select_verifier(rehearsal_verifier);
     // Lab #300: bracket every pre-banner stage that can plausibly be expensive,
     // so a stall names the stage it is in instead of presenting as silence. The
     // RandomX constructor is lazy today (the ~256 MiB cache builds at first
@@ -322,7 +323,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
                 qumbra_node::telemetry_server::TELEMETRY_PATH,
             );
             if !srv.addr().ip().is_loopback() {
-                qlab_devnet::jprintln!(
+                qlab_devnet::jprintln!(WARN,
                     "  ⚠️  telemetry is bound to a non-loopback address — it must be paired with a \
                      SOURCE-RESTRICTED inbound rule to the operator's collector, not an open one."
                 );
@@ -361,7 +362,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         let bound = node.start_metrics_endpoint(addr)?;
         qlab_devnet::jprintln!("  metrics:      http://{bound}/metrics (Prometheus scrape target)");
         if !bound.ip().is_loopback() {
-            qlab_devnet::jprintln!(
+            qlab_devnet::jprintln!(WARN,
                 "  ⚠️  metrics is bound to a non-loopback address — it must be paired with a \
                  SOURCE-RESTRICTED inbound rule to the collector, not an open one."
             );
@@ -400,14 +401,14 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
             view.len_bytes()
         );
         if !bound.ip().is_loopback() {
-            qlab_devnet::jprintln!(
+            qlab_devnet::jprintln!(WARN,
                 "  ⚠️  discovery is bound to a non-loopback address — it must be paired with a \
                  SOURCE-RESTRICTED inbound rule, not an open one. The bytes are public chain \
                  data, but the listener is still an attack surface."
             );
         }
     } else {
-        qlab_devnet::jprintln!(
+        qlab_devnet::jprintln!(WARN,
             "  discovery:    ⚠️  NOT SERVED (discovery_addr = \"off\"). Recipients of any \
              transaction this node accepts cannot find their outputs here."
         );
@@ -461,43 +462,43 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // only thing left to get wrong is letting it pass unnoticed. This says, at the
     // one moment an operator is reading, that the datadir's snapshot was unusable.
     if let Some(why) = &node.recovery_report().snapshot_rejected {
-        qlab_devnet::jprintln!(
+        qlab_devnet::jprintln!(WARN,
             "  ⚠️  THE SNAPSHOT IN THIS DATA DIR COULD NOT BE HONOURED against its own \
              blocks.log (issue #225)."
         );
-        qlab_devnet::jprintln!("      reason: {why}");
+        qlab_devnet::jprintln!(WARN, "      reason: {why}");
         // Lab #408: the rejection no longer implies the genesis fold. When the
         // log proves the snapshot's tip is on the finalized main chain, its
         // state was honoured anyway and only the tail was replayed — say which
         // of the two recoveries this start actually was.
         if node.recovery_report().snapshot_height.is_some() {
-            qlab_devnet::jprintln!(
+            qlab_devnet::jprintln!(WARN,
                 "      Degraded to a NEAR-TIP resume (lab #408): the log's own finalizations \
                  prove the"
             );
-            qlab_devnet::jprintln!(
+            qlab_devnet::jprintln!(WARN,
                 "      snapshot's tip is on the finalized main chain, so its state was honoured \
                  and only"
             );
-            qlab_devnet::jprintln!(
+            qlab_devnet::jprintln!(WARN,
                 "      the records past it were replayed. State is exactly what a from-genesis \
                  replay"
             );
-            qlab_devnet::jprintln!(
+            qlab_devnet::jprintln!(WARN,
                 "      reaches. The snapshot is rewritten at the next graceful stop; if this \
                  repeats"
             );
-            qlab_devnet::jprintln!("      every start, the log is what to look at.");
+            qlab_devnet::jprintln!(WARN, "      every start, the log is what to look at.");
         } else {
-            qlab_devnet::jprintln!(
+            qlab_devnet::jprintln!(WARN,
                 "      Recovered by a full replay from genesis — the log is the source of truth \
                  and this"
             );
-            qlab_devnet::jprintln!(
+            qlab_devnet::jprintln!(WARN,
                 "      state is exactly what a from-genesis replay reaches. The stale snapshot \
                  is rewritten"
             );
-            qlab_devnet::jprintln!(
+            qlab_devnet::jprintln!(WARN,
                 "      at the next graceful stop. If this repeats every start, the log is what \
                  to look at."
             );
@@ -506,7 +507,13 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     qlab_devnet::jprintln!("  genesis hash: {}", genesis.hash_hex());
     qlab_devnet::jprintln!("  mining:       {}", config.mining);
     qlab_devnet::jprintln!("  committee keys held: {}", config.committee_key_paths.len());
-    qlab_devnet::jprintln!("  {verifier_log}");
+    // The rehearsal banner is the ⚠️-class abnormality the #512 amendment
+    // names; the real-verifier line is nominal and carries no token.
+    if rehearsal_verifier {
+        qlab_devnet::jprintln!(WARN, "  {verifier_log}");
+    } else {
+        qlab_devnet::jprintln!("  {verifier_log}");
+    }
     // H4: the revision identifier + frozen-parameter digest are logged LOUDLY at
     // every startup — that is what makes an undocumented parameter change show up
     // in every log rather than only in a review someone remembers to do.
@@ -521,9 +528,9 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         qlab_devnet::jprintln!("{line}");
     }
     if let Some(h) = node.halt_at() {
-        qlab_devnet::jprintln!("  ⚠️  THIS RELEASE HALTS AT HEIGHT {h} — it will stop mining, stop accepting");
-        qlab_devnet::jprintln!("      blocks, and stop signing checkpoints above it. regime=Halting until the");
-        qlab_devnet::jprintln!("      boundary finalizes, then regime=Halted.");
+        qlab_devnet::jprintln!(WARN, "  ⚠️  THIS RELEASE HALTS AT HEIGHT {h} — it will stop mining, stop accepting");
+        qlab_devnet::jprintln!(WARN, "      blocks, and stop signing checkpoints above it. regime=Halting until the");
+        qlab_devnet::jprintln!(WARN, "      boundary finalizes, then regime=Halted.");
     }
     qlab_devnet::jprintln!("{}", qumbra_node::shutdown::stop_signals_line());
 

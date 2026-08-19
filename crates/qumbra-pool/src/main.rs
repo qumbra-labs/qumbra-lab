@@ -16,7 +16,7 @@ fn main() -> ExitCode {
     match dispatch(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            qlab_devnet::jeprintln!("qumbra-pool error: {e}");
+            qlab_devnet::jeprintln!(ERROR, "qumbra-pool error: {e}");
             ExitCode::FAILURE
         }
     }
@@ -103,7 +103,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let bound = listener.local_addr()?;
     qlab_devnet::jprintln!("qumbra-pool listening on {bound}  form={form:?}  share_diff={share_difficulty}");
     if !pool.current_template().serves_stock_xmrig() {
-        qlab_devnet::jprintln!("  ⚠️  v4 template: stock-xmrig login will be refused (#356 UNCLEAN)");
+        qlab_devnet::jprintln!(WARN, "  ⚠️  v4 template: stock-xmrig login will be refused (#356 UNCLEAN)");
     }
     qlab_devnet::jprintln!("  share-PoW: qlab_pow::RandomXHasher + #490 strict <");
     qlab_devnet::jprintln!(
