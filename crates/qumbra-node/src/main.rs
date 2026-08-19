@@ -1,8 +1,11 @@
 //! `qumbra-node` — the deployable full-node binary + genesis tooling (M10-T0-1).
 //!
 //! ```text
-//!   qumbra-node genesis init [--out DIR]   build the T0 genesis file + committee
-//!                                          key files; print the genesis hash
+//!   qumbra-node genesis init [--out DIR] [--t2] [--launch] [--difficulty N]
+//!                                          build the T0/T2 genesis file + committee
+//!                                          key files; print the genesis hash.
+//!                                          `--t2 --launch` is the T2 ceremony path
+//!                                          (OS-random committee keys; lab #506).
 //!   qumbra-node mine --dir DIR             zero-to-mining in one command (lab #475):
 //!                                          wallet (backup-gated) + T1 defaults +
 //!                                          verified genesis + node.toml, then `run`
@@ -17,7 +20,6 @@
 //! snapshot and the learned address book.
 
 use std::error::Error;
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use qlab_devnet::pow::RandomXPow;
@@ -88,7 +90,12 @@ fn usage() {
     eprintln!(
         "qumbra-node — Qumbra full node (M10-T0-1)\n\n\
          USAGE:\n  \
-         qumbra-node genesis init [--out DIR]   build the T0 genesis file + 21 committee key files\n  \
+         qumbra-node genesis init [--out DIR] [--t2] [--launch] [--difficulty N]\n      \
+                                            build the genesis file + 21 committee key files.\n      \
+           --t2                             mint the v5 T2 genesis (rehearsal keys, pinned hash)\n      \
+           --launch                         T2 ceremony path: committee keys from OS randomness.\n      \
+                                            Requires --t2. Hash is NOT reproducible.\n      \
+           --difficulty N                   launch-only; default stays the current placeholder\n  \
          qumbra-node mine --dir DIR             zero-to-mining in one command (lab #475). Finds or\n      \
                                             CREATES a wallet (its mnemonic is printed ONCE and the\n      \
                                             run waits for you to confirm), downloads + verifies\n      \
@@ -130,7 +137,10 @@ fn usage() {
 /// Pure and read-only: no data dir, no network. See
 /// [`qumbra_node::emission_pins`] for why it exists as a command.
 fn emission_pins(_args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    print!("{}", qumbra_node::emission_pins::render(&qumbra_node::emission_pins::compute()));
+    print!(
+        "{}",
+        qumbra_node::emission_pins::render(&qumbra_node::emission_pins::compute())
+    );
     Ok(())
 }
 
@@ -197,7 +207,10 @@ fn cmd_audit_emission(args: &[String]) -> ExitCode {
 
 /// `--name VALUE` flag lookup.
 fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).map(String::as_str)
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
 }
 
 /// Presence-only flag lookup (`--name`).
@@ -206,16 +219,33 @@ fn has_flag(args: &[String], name: &str) -> bool {
 }
 
 fn genesis_init(args: &[String]) -> Result<(), Box<dyn Error>> {
-    let out = PathBuf::from(flag(args, "--out").unwrap_or("."));
-    std::fs::create_dir_all(&out)?;
+    let plan = qumbra_node::genesis::GenesisInitPlan::parse(args)?;
+    std::fs::create_dir_all(&plan.out)?;
 
     // Lab #470 stage 4b: `--t2` mints the v5-format T2 genesis; the default
     // stays the T1 file byte-for-byte.
-    let gf = if has_flag(args, "--t2") { GenesisFile::new_t2() } else { GenesisFile::new_devnet_t0() };
-    let gpath = out.join("genesis.qmb");
+    // Lab #506: `--t2 --launch` is the T2 ceremony path — same v5 shape, OS-random
+    // committee keys. Without `--launch` the rehearsal constructors are used
+    // unchanged (the pin tests are the compat lock).
+    let (gf, launch_seeds) = if plan.launch {
+        let (gf, seeds) = GenesisFile::new_t2_launch(plan.difficulty);
+        (gf, Some(seeds))
+    } else if plan.t2 {
+        (GenesisFile::new_t2(), None)
+    } else {
+        (GenesisFile::new_devnet_t0(), None)
+    };
+    let gpath = plan.out.join("genesis.qmb");
     gf.write(&gpath)?;
-    let key_dir = out.join("keys");
-    let keys = gf.write_committee_key_files(&key_dir)?;
+    let key_dir = plan.out.join("keys");
+    let keys = match &launch_seeds {
+        Some(seeds) => gf.write_committee_key_files_from_seeds(
+            &key_dir,
+            seeds,
+            qumbra_node::genesis::LAUNCH_KEY_NOTE,
+        )?,
+        None => gf.write_committee_key_files(&key_dir)?,
+    };
 
     // Self-verify: the file we just wrote must load, byte-verify, and re-hash to
     // the printed value (item 2 — genesis hash printed + asserted).
@@ -225,8 +255,18 @@ fn genesis_init(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     println!("qumbra-node genesis init");
     println!("  network:        {}", gf.network);
-    println!("  format version: {} (NOT frozen — [devnet-placeholder] shape)", gf.format_version);
-    println!("  committee:      N={} quorum={}", gf.frozen.committee_size, gf.frozen.quorum);
+    println!(
+        "  format version: {} (NOT frozen — [devnet-placeholder] shape)",
+        gf.format_version
+    );
+    println!(
+        "  mode:           {}",
+        qumbra_node::genesis::mode_banner(plan.launch)
+    );
+    println!(
+        "  committee:      N={} quorum={}",
+        gf.frozen.committee_size, gf.frozen.quorum
+    );
     println!("  block time:     {} s (FROZEN)", gf.frozen.block_time_secs);
     println!("  consensus FRI:  {}", gf.frozen.consensus_fri);
     println!("  genesis file:   {}", gpath.display());
@@ -263,8 +303,10 @@ fn mine_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
         &mut out,
     )?;
 
-    let mut run_args: Vec<String> =
-        vec!["--config".to_string(), prepared.config_path.display().to_string()];
+    let mut run_args: Vec<String> = vec![
+        "--config".to_string(),
+        prepared.config_path.display().to_string(),
+    ];
     run_args.extend_from_slice(args);
     run_node(&run_args)
 }
@@ -277,7 +319,10 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // that silence structurally impossible (ordering locked in `startup`'s
     // tests + tests/startup_entry.rs).
     let config = qumbra_node::startup::announce_then_load(&mut std::io::stdout(), cfg_path)?;
-    println!("STARTUP loading genesis file {}", config.genesis_file.display());
+    println!(
+        "STARTUP loading genesis file {}",
+        config.genesis_file.display()
+    );
     let genesis = GenesisFile::load(&config.genesis_file)?;
     println!("STARTUP genesis file loaded");
 
@@ -426,7 +471,11 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
                 node.set_sample_interval(std::time::Duration::from_secs(secs));
                 println!("  telemetry sampling: every {secs} s (observability only)");
             }
-            _ => return Err(format!("--sample-interval-secs needs a positive integer, got `{v}`").into()),
+            _ => {
+                return Err(
+                    format!("--sample-interval-secs needs a positive integer, got `{v}`").into(),
+                )
+            }
         }
     }
 
@@ -444,7 +493,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
             }
             _ => {
                 return Err(
-                    format!("--snapshot-interval-secs needs a positive integer, got `{v}`").into()
+                    format!("--snapshot-interval-secs needs a positive integer, got `{v}`").into(),
                 )
             }
         }
@@ -505,13 +554,19 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     }
     println!("  genesis hash: {}", genesis.hash_hex());
     println!("  mining:       {}", config.mining);
-    println!("  committee keys held: {}", config.committee_key_paths.len());
+    println!(
+        "  committee keys held: {}",
+        config.committee_key_paths.len()
+    );
     println!("  {verifier_log}");
     // H4: the revision identifier + frozen-parameter digest are logged LOUDLY at
     // every startup — that is what makes an undocumented parameter change show up
     // in every log rather than only in a review someone remembers to do.
     println!("-- halt-height upgrade status (issue #74) --");
-    print!("{}", RELEASE.banner(HaltMarker::load(&config.data_dir).ok().flatten().as_ref()));
+    print!(
+        "{}",
+        RELEASE.banner(HaltMarker::load(&config.data_dir).ok().flatten().as_ref())
+    );
     if let Some(h) = node.halt_at() {
         println!("  ⚠️  THIS RELEASE HALTS AT HEIGHT {h} — it will stop mining, stop accepting");
         println!("      blocks, and stop signing checkpoints above it. regime=Halting until the");
@@ -552,7 +607,10 @@ fn check_config(args: &[String]) -> Result<(), Box<dyn Error>> {
     RELEASE.check_against_marker(marker.as_ref())?;
     println!("qumbra-node check: OK ({cfg_path})");
     println!("  genesis hash: {}", pf.genesis_hash);
-    println!("  committee:    N={} quorum={}", pf.committee_size, pf.quorum);
+    println!(
+        "  committee:    N={} quorum={}",
+        pf.committee_size, pf.quorum
+    );
     println!("  keys held:    {}", pf.keys_held);
     println!("  listen:       {}", pf.listen_addr);
     println!("  dial peers:   {}", pf.dial_peers);
