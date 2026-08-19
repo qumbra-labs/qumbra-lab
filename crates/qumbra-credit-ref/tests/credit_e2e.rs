@@ -300,6 +300,14 @@ fn a_deposit_credits_once_after_finality_and_every_refusal_names_itself() {
     let dep2_height = node.tip_height();
     assert_eq!(dep2_height, slot1 + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS + 1);
     assert_eq!(node.finalized_height(), Some(slot1), "deposit 2 NOT finalized yet");
+    // The discovery endpoint serves projected views, re-projected by the run
+    // loop once per iteration (`run.rs`'s tick: refresh_discovery /
+    // refresh_leaves / refresh_anchors). This test drives the node by hand, so
+    // it re-projects the same three after moving the chain — otherwise the
+    // service scans a view frozen at bind time and cannot see this deposit.
+    assert!(node.refresh_discovery(), "moved tip re-projects discovery");
+    node.refresh_leaves();
+    assert!(node.refresh_anchors(), "moved tip re-projects anchors");
 
     let env2 = depositor_envelope(&exchange_addr, &dep2, txid2);
     let (st, body) = post(svc, "/v1/credit", &env2);
@@ -312,6 +320,9 @@ fn a_deposit_credits_once_after_finality_and_every_refusal_names_itself() {
     }
     node.try_checkpoint();
     assert_eq!(node.finalized_height(), Some(slot2), "committee catches up past the deposit");
+    assert!(node.refresh_discovery(), "moved tip re-projects discovery");
+    node.refresh_leaves();
+    assert!(node.refresh_anchors(), "moved finality re-projects anchors");
     let (st, body) = post(svc, "/v1/credit", &env2);
     assert_eq!(st, 200, "{body}");
     assert!(body.contains(&format!("\"height\":{dep2_height},")), "{body}");
