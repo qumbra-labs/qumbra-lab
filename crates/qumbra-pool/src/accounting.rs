@@ -13,6 +13,8 @@ pub enum ShareStatus {
     BadSession,
     /// Login refused: v4 net, stock xmrig is UNCLEAN (#356).
     UncleanV4,
+    /// Claimed `result` ≠ hasher(seed, blob).
+    BadHash,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

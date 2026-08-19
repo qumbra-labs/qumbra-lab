@@ -44,7 +44,7 @@ fn usage() {
          qumbra-pool check --config FILE   validate config; bind nothing\n  \
          qumbra-pool run --config FILE     listen for stratum TCP\n\n\
          v4-compat: a v4 template refuses stock-xmrig login by name\n  \
-         (#356 UNCLEAN). Share filter: #490 hash_to_work_value_for + strict <.\n"
+         (#356 UNCLEAN). Share-PoW: qlab_pow::RandomXHasher. PPLNS + N=1 payee list.\n"
     );
 }
 
@@ -83,14 +83,33 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let listen = cfg.listen_addr.clone();
     let share_difficulty = cfg.share_difficulty;
     let source = cfg.template_source()?;
-    let pool = Arc::new(Pool::new(share_difficulty, Box::new(source))?);
+    #[cfg(feature = "randomx")]
+    let hasher: Box<dyn qumbra_pool::ShareHasher> =
+        Box::new(qumbra_pool::RandomXShareHasher::new());
+    #[cfg(not(feature = "randomx"))]
+    {
+        return Err(
+            "qumbra-pool run requires feature `randomx` (default ON) — rebuild the binary".into(),
+        );
+    }
+    #[cfg(feature = "randomx")]
+    let pool = Arc::new(Pool::new_with_hasher(
+        share_difficulty,
+        Box::new(source),
+        hasher,
+        [9, 0, 0, 0],
+    )?);
     let listener = TcpListener::bind(&listen)?;
     let bound = listener.local_addr()?;
     println!("qumbra-pool listening on {bound}  form={form:?}  share_diff={share_difficulty}");
     if !pool.current_template().serves_stock_xmrig() {
         println!("  ⚠️  v4 template: stock-xmrig login will be refused (#356 UNCLEAN)");
     }
-    println!("  share filter: #490 hash_to_work_value_for + xmrig strict <");
+    println!("  share-PoW: qlab_pow::RandomXHasher + #490 strict <");
+    println!(
+        "  pplns window: {} shares [devnet-placeholder]",
+        qumbra_pool::PPLNS_WINDOW_SHARES
+    );
 
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);

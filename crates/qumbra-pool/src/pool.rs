@@ -16,8 +16,11 @@ use qlab_stratum::types::{
 };
 
 use crate::accounting::{Ledger, ShareRecord, ShareStatus};
+use crate::hasher::{FixedHasher, ShareHasher};
 use crate::hexutil;
 use crate::jobs::{ExtraNonceAllocator, IssuedJob, JobStore};
+use crate::payee::{assemble_coinbase, Accounts, AssembleError, AssembledCoinbase};
+use crate::pplns::{PplnsWindow, WindowShare};
 use crate::share::share_meets_target;
 use crate::template::{next_seed_in_preload_window, Template, TemplateError, TemplateSource};
 
@@ -29,6 +32,7 @@ pub const ERR_LOW_DIFF: i64 = 22;
 pub const ERR_UNAUTHORIZED: i64 = 23;
 pub const ERR_BAD_ALGO: i64 = 24;
 pub const ERR_UNCLEAN_V4: i64 = 25;
+pub const ERR_BAD_HASH: i64 = 26;
 
 const ALGO_RX0: &str = "rx/0";
 
@@ -42,6 +46,7 @@ pub enum PoolError {
     Codec(String),
     Template(TemplateError),
     Target(String),
+    Assemble(AssembleError),
 }
 
 impl std::fmt::Display for PoolError {
@@ -50,6 +55,7 @@ impl std::fmt::Display for PoolError {
             PoolError::Codec(s) => write!(f, "codec: {s}"),
             PoolError::Template(e) => write!(f, "template: {e}"),
             PoolError::Target(s) => write!(f, "target: {s}"),
+            PoolError::Assemble(e) => write!(f, "assemble: {e}"),
         }
     }
 }
@@ -71,6 +77,10 @@ struct Inner {
     job_seq: u64,
     session_seq: u64,
     schedule: KeyBlockSchedule,
+    hasher: Box<dyn ShareHasher>,
+    pplns: PplnsWindow,
+    accounts: Accounts,
+    pool_rkm: [u64; 4],
 }
 
 pub struct Pool {
@@ -78,9 +88,29 @@ pub struct Pool {
 }
 
 impl Pool {
+    /// Test constructor: [`FixedHasher::zeros`] so existing submits of an
+    /// all-zero `result` still match. Production uses
+    /// [`Self::new_with_hasher`] with [`crate::hasher::RandomXShareHasher`].
     pub fn new(share_difficulty: u64, source: Box<dyn TemplateSource>) -> Result<Self, PoolError> {
+        Self::new_with_hasher(
+            share_difficulty,
+            source,
+            Box::new(FixedHasher::zeros()),
+            [9, 0, 0, 0],
+        )
+    }
+
+    pub fn new_with_hasher(
+        share_difficulty: u64,
+        source: Box<dyn TemplateSource>,
+        hasher: Box<dyn ShareHasher>,
+        pool_rkm: [u64; 4],
+    ) -> Result<Self, PoolError> {
         if share_difficulty == 0 {
             return Err(PoolError::Target("share_difficulty must be ≥ 1".into()));
+        }
+        if pool_rkm == [0u64; 4] {
+            return Err(PoolError::Assemble(AssembleError::ZeroPoolRkm));
         }
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -93,8 +123,32 @@ impl Pool {
                 job_seq: 0,
                 session_seq: 0,
                 schedule: KeyBlockSchedule::default(),
+                hasher,
+                pplns: PplnsWindow::default(),
+                accounts: Accounts::default(),
+                pool_rkm,
             }),
         })
+    }
+
+    pub fn register_account(&self, login: impl Into<String>, rkm: [u64; 4]) {
+        self.inner
+            .lock()
+            .expect("pool mutex")
+            .accounts
+            .register(login, rkm);
+    }
+
+    /// Form-keyed coinbase for the current tip height.
+    pub fn assemble_now(&self) -> Result<AssembledCoinbase, PoolError> {
+        let g = self.inner.lock().expect("pool mutex");
+        let t = g.source.current();
+        assemble_coinbase(t.form, t.header.height, &g.pplns, &g.accounts, g.pool_rkm)
+            .map_err(PoolError::Assemble)
+    }
+
+    pub fn pplns_len(&self) -> usize {
+        self.inner.lock().expect("pool mutex").pplns.len()
     }
 
     pub fn handle_line(
@@ -371,9 +425,28 @@ impl Pool {
         let mut blob = job.blob.clone();
         apply_miner_nonce(&mut blob, &nonce).map_err(|e| PoolError::Codec(e.to_string()))?;
 
+        // Share-PoW execution: hasher(seed, blob) must equal the claimed result.
+        // Production injects RandomXShareHasher; tests inject FixedHasher.
+        let computed = g.hasher.hash(&job.seed_hash, &blob);
+        if computed != result {
+            g.ledger.record(ShareRecord {
+                login,
+                session_id: local.to_string(),
+                job_id: params.job_id.clone(),
+                height: job.height,
+                difficulty: job.difficulty,
+                nonce,
+                result,
+                status: ShareStatus::BadHash,
+            });
+            return Ok(vec![Outgoing::Reply(StratumResponse::err(
+                rid,
+                ERR_BAD_HASH,
+                "Invalid share hash",
+            ))]);
+        }
+
         // Share filter: #490's work-value export + xmrig's strict `<`.
-        // We do not re-hash the blob here (RandomX stays off this crate's
-        // graph); the claimed `result` is what the miner already hashed.
         if !share_meets_target(&result, job.target, job.form) {
             g.ledger.record(ShareRecord {
                 login,
@@ -392,6 +465,10 @@ impl Pool {
             ))]);
         }
 
+        g.pplns.push(WindowShare {
+            login: login.clone(),
+            difficulty: job.difficulty,
+        });
         g.ledger.record(ShareRecord {
             login,
             session_id: local.to_string(),
@@ -761,9 +838,21 @@ mod tests {
         let _ = encode_response(&StratumResponse::ok_status(1, "OK")).unwrap();
     }
 
+    fn pool_with_digest(digest: [u8; 32]) -> Pool {
+        Pool::new_with_hasher(
+            1024,
+            Box::new(HeldTemplateSource::new(template(GenesisForm::V5, 100))),
+            Box::new(crate::hasher::FixedHasher { digest }),
+            [9, 0, 0, 0],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn submit_low_diff_is_named_and_uses_the_v5_window() {
-        let pool = pool_v5();
+        // Hasher returns the claimed digest so this test isolates the target
+        // filter from the integrity check.
+        let pool = pool_with_digest([0xFF; 32]);
         let (sid, result) = login_ok(&pool);
         let sid = sid.unwrap();
         let job_id = result.job.job_id.clone();
@@ -787,6 +876,11 @@ mod tests {
         // hash_to_work_value_for(..., V5) rather than the v4 head-BE read.
         let mut tail_wins = [0xFFu8; 32];
         tail_wins[24..32].copy_from_slice(&7u64.to_le_bytes());
+        let pool = pool_with_digest(tail_wins);
+        let (sid, result) = login_ok(&pool);
+        let sid = sid.unwrap();
+        let job_id = result.job.job_id.clone();
+        let mut s = Some(sid.clone());
         let out = pool
             .handle_line(
                 &mut s,
@@ -801,5 +895,52 @@ mod tests {
             .unwrap();
         assert_eq!(reply_status(&out).1.as_deref(), Some("OK"));
         assert_eq!(pool.ledger_snapshot().accepted_count("alice"), 1);
+    }
+
+    #[test]
+    fn submit_bad_hash_is_named_and_does_not_score() {
+        let pool = pool_v5();
+        let (sid, result) = login_ok(&pool);
+        let sid = sid.unwrap();
+        let job_id = result.job.job_id.clone();
+        let mut s = Some(sid.clone());
+        // FixedHasher::zeros expects 00..00; ff..ff is a lie.
+        let out = pool
+            .handle_line(
+                &mut s,
+                &submit_line(&sid, &job_id, "11111111", &"ff".repeat(32), Some("rx/0")),
+            )
+            .unwrap();
+        assert_eq!(reply_status(&out).0, Some(ERR_BAD_HASH));
+        assert_eq!(
+            pool.ledger_snapshot().records().last().unwrap().status,
+            ShareStatus::BadHash
+        );
+        assert_eq!(pool.pplns_len(), 0);
+    }
+
+    #[test]
+    fn accepted_share_scores_pplns_and_assembles_v5_n1() {
+        let pool = pool_v5();
+        pool.register_account("alice", [1, 0, 0, 0]);
+        let (sid, result) = login_ok(&pool);
+        let sid = sid.unwrap();
+        let job_id = result.job.job_id.clone();
+        let mut s = Some(sid.clone());
+        let out = pool
+            .handle_line(
+                &mut s,
+                &submit_line(&sid, &job_id, "d0030040", &passing_result(), Some("rx/0")),
+            )
+            .unwrap();
+        assert_eq!(reply_status(&out).1.as_deref(), Some("OK"));
+        assert_eq!(pool.pplns_len(), 1);
+        match pool.assemble_now().unwrap() {
+            AssembledCoinbase::V5 { payees } => {
+                assert_eq!(payees.len(), 1);
+                assert_eq!(payees[0].rkm, [1, 0, 0, 0]);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

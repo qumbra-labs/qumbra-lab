@@ -3,9 +3,16 @@
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HexError {
-    OddLength { got: usize },
+    OddLength {
+        got: usize,
+    },
     BadDigit,
-    BadLength { got: usize, want: usize },
+    BadLength {
+        got: usize,
+        want: usize,
+    },
+    /// 64-hex rkm decoded to the all-zero key no body may carry.
+    ZeroRkm,
 }
 
 impl std::fmt::Display for HexError {
@@ -16,6 +23,7 @@ impl std::fmt::Display for HexError {
             HexError::BadLength { got, want } => {
                 write!(f, "hex decoded to {got} bytes; want {want}")
             }
+            HexError::ZeroRkm => write!(f, "rkm is all-zero (MissingCoinbasePayee)"),
         }
     }
 }
@@ -60,6 +68,21 @@ pub fn decode_exact<const N: usize>(s: &str) -> Result<[u8; N], HexError> {
     let mut out = [0u8; N];
     out.copy_from_slice(&v);
     Ok(out)
+}
+
+/// 64-hex → `[u64; 4]` lane-major LE, the node/faucet `miner_rkm` wire.
+pub fn rkm_lanes_from_hex(s: &str) -> Result<[u64; 4], HexError> {
+    let bytes = decode_exact::<32>(s)?;
+    let mut lanes = [0u64; 4];
+    for (i, lane) in lanes.iter_mut().enumerate() {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[i * 8..(i + 1) * 8]);
+        *lane = u64::from_le_bytes(buf);
+    }
+    if lanes == [0u64; 4] {
+        return Err(HexError::ZeroRkm);
+    }
+    Ok(lanes)
 }
 
 fn from_hex(b: u8) -> Option<u8> {
