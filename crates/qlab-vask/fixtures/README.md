@@ -22,15 +22,26 @@ for a verifiable envelope. Locked by `the_refusal_fixtures_refuse_by_name` /
 | `refuse-trailing.bin` | one byte past proof end | -2 QVASK_MALFORMED |
 | `refuse-varint-truncated.bin` | proof_len varint continuation byte, then EOF | -2 QVASK_MALFORMED |
 
-## The QVASK_OK fixture (minted on CI-class iron, NOT yet committed)
+## The QVASK_OK fixture (CI-minted, committed)
 
-`golden-envelope-v1.bin` + `golden-chain-cm-v1.bin`: a real envelope at the
-pinned `DISCLOSURE_V1_CFG` (b16/q20/g22) over the deterministic instance in
-`tests/golden_v1.rs`. Minting needs one prove of the disclosure STARK, which
-the memory guardrail keeps off developer machines — run
-`cargo test --release -p qlab-vask --test golden_v1 -- --ignored mint_golden_fixture_files`
-on CI-class iron (it writes both files here and prints their Keccak-256
-digests), commit the outputs, and un-ignore `committed_golden_fixture_verifies`
-in the same commit. Until then, CI's suite still proves the identical path:
-`golden_envelope_v1_end_to_end_over_the_abi` builds the same deterministic
-envelope in-test and drives it through the full C ABI.
+`golden-envelope-v1.bin` (150,695 B) + `golden-chain-cm-v1.bin` (32 B): a real
+envelope at the pinned `DISCLOSURE_V1_CFG` (b16/q20/g22/a16) over the
+deterministic instance in `tests/golden_v1.rs`.
+
+- **Provenance**: minted by the `--ignored` generator `mint_golden_fixture_files`
+  via `.github/workflows/kit-fixture-mint.yml` on the hosted arm64 lane
+  (`qumbra-arm64-8`, aarch64, rustc 1.97.1) — run 32205863216, 2026-08-19.
+  Keccak-256 as printed by the generator:
+  `golden-envelope-v1.bin` = `c03e8220495944ecde8a2f2d31dd59e5a843f320ee1f87b14b24eefaf823ac55`,
+  `golden-chain-cm-v1.bin` = `97669513557a58d6a8329410b3f5aa0148211d8fbc5ce5b72a483e5d3d0c1608`.
+- **Standing verification**: `committed_golden_fixture_verifies` runs the
+  committed bytes through the real C ABI verify in every suite pass, so a
+  drifted or corrupted fixture cannot survive an acceptance run.
+- **Re-mint** (a V2 config, a statement change): push a `mint/**` branch — the
+  workflow proves once and hands the files back as an artifact; commit them and
+  the digest block above in the same commit.
+- ⚠️ **Size note (basis matters)**: the envelope is 150,695 B — the widely
+  cited "~122 KB" is `docs/disclosure-run1.md`'s **bincode-fixed** proof size
+  (121.9 KB), but the §3 envelope serializes the proof with **postcard**
+  (141.7 KB in the same table, and this artifact's config carries a16 arity).
+  Reported at stage 2 for a design-side figure correction.

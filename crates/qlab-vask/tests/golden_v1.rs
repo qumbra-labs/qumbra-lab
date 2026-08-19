@@ -157,11 +157,10 @@ fn mint_golden_fixture_files() {
 }
 
 /// The committed fixture verifies through the ABI without any prover — the
-/// check a foreign consumer can replicate. `--ignored` until the fixture
-/// lands (see mint_golden_fixture_files); un-ignore in the commit that
-/// commits the files.
+/// check a foreign consumer can replicate. Un-ignored in the same commit
+/// that landed the fixture files (minted by `mint_golden_fixture_files` on
+/// the hosted arm64 lane, run 32205863216; digests in fixtures/README.md).
 #[test]
-#[ignore = "un-ignore in the commit that lands fixtures/golden-envelope-v1.bin"]
 fn committed_golden_fixture_verifies() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
     let bytes = std::fs::read(dir.join("golden-envelope-v1.bin"))
