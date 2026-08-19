@@ -1,5 +1,6 @@
 # 矿池 stratum 映射 — §4 阅读落地（lab #482 stage 0）
 
+> 完全不了解 stratum?两分钟入门:[stratum-primer-zh.md](stratum-primer-zh.md)。
 > [English](pool-stratum-mapping.md)
 
 **状态：STAGE-0 交付物。** 落地
