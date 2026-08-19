@@ -1,4 +1,4 @@
-//! `qumbra-pool` — the T2 pool binary (lab #482 stage 2).
+//! `qumbra-pool` — the T2 pool binary (lab #482 stage 3).
 //!
 //! TCP stratum + job lifecycle + share-PoW execution + PPLNS + payee-list
 //! assembly, keyed by [`qlab_devnet::forms::ChainRules::form`].
@@ -49,9 +49,14 @@ pub use config::PoolConfig;
 pub use hasher::{FixedHasher, ShareHasher};
 pub use jobs::{IssuedJob, JobStore};
 pub use payee::{assemble_coinbase, Accounts, AssembledCoinbase};
-pub use pool::{Outgoing, Pool, PoolError};
+pub use pool::{
+    Outgoing, Pool, PoolError, ERR_BAD_ALGO, ERR_BAD_HASH, ERR_DUPLICATE, ERR_LOW_DIFF,
+    ERR_UNAUTHORIZED, ERR_UNCLEAN_V4, ERR_UNKNOWN_JOB,
+};
 pub use pplns::{PplnsWindow, PPLNS_WINDOW_SHARES};
-pub use template::{HeldTemplateSource, Template, TemplateError, TemplateSource};
+pub use template::{
+    DevnetTemplateSource, HeldTemplateSource, Template, TemplateError, TemplateSource,
+};
 
 #[cfg(feature = "randomx")]
 pub use hasher::RandomXShareHasher;

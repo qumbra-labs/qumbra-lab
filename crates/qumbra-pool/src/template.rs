@@ -125,6 +125,45 @@ impl TemplateSource for HeldTemplateSource {
     }
 }
 
+/// In-process template built from `qlab_devnet` headers — genesis + one
+/// child. No node, no RPC, no mining. Stage 3's "devnet template source".
+pub struct DevnetTemplateSource {
+    current: Template,
+}
+
+impl DevnetTemplateSource {
+    /// A height-1 child of a v5 genesis. Seed is the genesis header hash
+    /// (key-block at height 0).
+    pub fn v5_tip(difficulty: u64) -> Self {
+        Self::from_form(GenesisForm::V5, difficulty)
+    }
+
+    /// Same shape on v4 — used to prove login is refused by name.
+    pub fn v4_tip(difficulty: u64) -> Self {
+        Self::from_form(GenesisForm::V4, difficulty)
+    }
+
+    fn from_form(form: GenesisForm, difficulty: u64) -> Self {
+        let genesis = BlockHeader::genesis_for(form, difficulty, 0);
+        let tip =
+            BlockHeader::child_of_for(form, &genesis, 75, difficulty, genesis.tx_body_commitment);
+        Self {
+            current: Template {
+                form,
+                header: tip,
+                seed_hash: genesis.header_hash_for(form),
+                next_seed_hash: None,
+            },
+        }
+    }
+}
+
+impl TemplateSource for DevnetTemplateSource {
+    fn current(&self) -> Template {
+        self.current.clone()
+    }
+}
+
 /// Preload window for `next_seed_hash`, in blocks. Equals Monero's lag
 /// so a miner can start the dataset reload one lag before the rotation
 /// (mapping doc §2.3 / §8). Pool policy, not a consensus field.

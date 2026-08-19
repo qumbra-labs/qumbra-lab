@@ -27,6 +27,8 @@ pub struct ShareRecord {
     pub nonce: [u8; 4],
     pub result: [u8; 32],
     pub status: ShareStatus,
+    /// True when the accepted hash also satisfies consensus `<=` (a block find).
+    pub block_candidate: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -81,6 +83,7 @@ mod tests {
             nonce: [nonce, 0, 0, 0],
             result: [0; 32],
             status,
+            block_candidate: false,
         }
     }
 

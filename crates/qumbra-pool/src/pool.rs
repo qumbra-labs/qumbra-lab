@@ -21,7 +21,7 @@ use crate::hexutil;
 use crate::jobs::{ExtraNonceAllocator, IssuedJob, JobStore};
 use crate::payee::{assemble_coinbase, Accounts, AssembleError, AssembledCoinbase};
 use crate::pplns::{PplnsWindow, WindowShare};
-use crate::share::share_meets_target;
+use crate::share::{is_block_candidate, share_meets_target};
 use crate::template::{next_seed_in_preload_window, Template, TemplateError, TemplateSource};
 
 /// xmrig-proxy-shaped error codes we actually emit.
@@ -240,6 +240,7 @@ impl Pool {
                     nonce: [0; 4],
                     result: [0; 32],
                     status: ShareStatus::BadAlgo,
+                    block_candidate: false,
                 });
                 return Ok(vec![Outgoing::Reply(StratumResponse::err(
                     rid,
@@ -261,6 +262,7 @@ impl Pool {
                 nonce: [0; 4],
                 result: [0; 32],
                 status: ShareStatus::UncleanV4,
+                block_candidate: false,
             });
             return Ok(vec![Outgoing::Reply(StratumResponse::err(
                 rid,
@@ -373,6 +375,7 @@ impl Pool {
                 nonce,
                 result,
                 status: ShareStatus::Stale,
+                block_candidate: false,
             });
             return Ok(vec![Outgoing::Reply(StratumResponse::err(
                 rid,
@@ -395,6 +398,7 @@ impl Pool {
                 nonce,
                 result,
                 status,
+                block_candidate: false,
             });
             let (code, msg) = if job.stale {
                 (ERR_UNKNOWN_JOB, "stale job")
@@ -413,6 +417,7 @@ impl Pool {
                 nonce,
                 result,
                 status: ShareStatus::Duplicate,
+                block_candidate: false,
             });
             return Ok(vec![Outgoing::Reply(StratumResponse::err(
                 rid,
@@ -438,6 +443,7 @@ impl Pool {
                 nonce,
                 result,
                 status: ShareStatus::BadHash,
+                block_candidate: false,
             });
             return Ok(vec![Outgoing::Reply(StratumResponse::err(
                 rid,
@@ -457,6 +463,7 @@ impl Pool {
                 nonce,
                 result,
                 status: ShareStatus::LowDifficulty,
+                block_candidate: false,
             });
             return Ok(vec![Outgoing::Reply(StratumResponse::err(
                 rid,
@@ -469,6 +476,7 @@ impl Pool {
             login: login.clone(),
             difficulty: job.difficulty,
         });
+        let block = is_block_candidate(&result, job.consensus_difficulty, job.form);
         g.ledger.record(ShareRecord {
             login,
             session_id: local.to_string(),
@@ -478,6 +486,7 @@ impl Pool {
             nonce,
             result,
             status: ShareStatus::Accepted,
+            block_candidate: block,
         });
         Ok(vec![Outgoing::Reply(StratumResponse::ok_status(rid, "OK"))])
     }
@@ -536,6 +545,7 @@ impl Pool {
             nonce,
             result,
             status,
+            block_candidate: false,
         });
         vec![Outgoing::Reply(StratumResponse::err(rid, code, msg))]
     }
@@ -573,6 +583,7 @@ fn issue_job(
         seed_hash: template.seed_hash,
         next_seed_hash: next,
         form: template.form,
+        consensus_difficulty: template.header.difficulty,
         stale: false,
     };
     let job = Job {
