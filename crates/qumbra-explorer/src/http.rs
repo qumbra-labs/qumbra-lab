@@ -1,4 +1,4 @@
-//! The projection's listener: `GET`-only, three routes, everything else refused.
+//! The projection's listener: `GET`-only, everything not named here refused.
 //!
 //! ```text
 //!   GET  /v1/health.json   the chain-health projection (pre-serialized, swapped by
@@ -6,6 +6,11 @@
 //!   GET  /v1/txlist?from=&to=
 //!                          the transaction-EXISTENCE list (issue #326, D1/D2/D3),
 //!                          encoded per request from the run loop's snapshot
+//!   GET  /v1/blocks?from=&to=
+//!                          per-height block facts (lab #486 items 1+3), snapshot
+//!   GET  /v1/names/events?from=&to=
+//!                          the name-event feed (lab #486 item 6), snapshot
+//!   GET  /v1/checkpoints   the finality ticker (lab #486 item 2, pre-serialized)
 //!   GET  /healthz          "ok" — for a supervisor, no state
 //!   GET  <anything>        404 JSON, and the body says why there is no /v1/tx/…
 //!   non-GET                405 with `Allow: GET`
@@ -52,6 +57,10 @@ pub const HEALTH_PATH: &str = "/v1/health.json";
 /// structural here, not a check.
 pub const TXLIST_PATH: &str = "/v1/txlist";
 
+/// The finality ticker route (lab #486 item 2). Parameterless — the run loop
+/// pre-serializes the bounded tail exactly as it does the health document.
+pub const CHECKPOINTS_PATH: &str = "/v1/checkpoints";
+
 /// The block ticker / chart data route (lab #486 items 1 + 3). **Range-only**;
 /// there is no `/v1/blocks/<height>` and no `/v1/block/<hash>` — the D2 rule
 /// extends to every new route (a by-height ask is cheap to correlate too, and a
@@ -81,8 +90,8 @@ pub const NAMES_EVENTS_PATH: &str = "/v1/names/events";
 fn not_found_body() -> String {
     format!(
         "{{\"refusal\":\"not_found\",\"detail\":\"This explorer serves {HEALTH_PATH}, \
-         {TXLIST_PATH}?from=&to=, {BLOCKS_PATH}?from=&to=, {NAMES_EVENTS_PATH}?from=&to= \
-         and /healthz only. The lists are bulk-only and matched client-side: \
+         {TXLIST_PATH}?from=&to=, {BLOCKS_PATH}?from=&to=, {NAMES_EVENTS_PATH}?from=&to=, \
+         {CHECKPOINTS_PATH} and /healthz only. The lists are bulk-only and matched client-side: \
          there is deliberately NO lookup by transaction id and NO lookup by name, because \
          asking this server about one thing tells it which thing you care about. There is \
          no address, balance or note lookup at all — Qumbra is a single shielded pool and \
@@ -183,10 +192,31 @@ pub struct Surfaces {
     pub health: Arc<RwLock<String>>,
     /// `/v1/txlist?from=&to=` — snapshot, encoded per request.
     pub txlist: Arc<Mutex<Arc<TxListView>>>,
+    /// `/v1/checkpoints` — pre-serialized.
+    pub checkpoints: Arc<RwLock<String>>,
     /// `/v1/blocks?from=&to=` — snapshot, encoded per request.
     pub blocks: Arc<Mutex<Arc<BlocksView>>>,
     /// `/v1/names/events?from=&to=` — snapshot, encoded per request.
     pub names: Arc<Mutex<Arc<NameEventsView>>>,
+}
+
+impl Default for Surfaces {
+    /// Empty-but-honest defaults for every surface — each pre-serialized slot
+    /// holds its document's real empty state, never a blank string, so a test
+    /// (the only caller that defaults; the binary always projects before it
+    /// binds) still serves parseable documents on the routes it is not
+    /// exercising.
+    fn default() -> Self {
+        Surfaces {
+            health: Arc::new(RwLock::new("{}".to_string())),
+            txlist: Arc::new(Mutex::new(Arc::new(TxListView::default()))),
+            checkpoints: Arc::new(RwLock::new(crate::checkpoints::document(
+                &crate::checkpoints::CheckpointsView::default(),
+            ))),
+            blocks: Arc::new(Mutex::new(Arc::new(BlocksView::default()))),
+            names: Arc::new(Mutex::new(Arc::new(NameEventsView::default()))),
+        }
+    }
 }
 
 pub struct ExplorerServer {
@@ -210,7 +240,7 @@ impl ExplorerServer {
     /// it. Neither path touches node state, which is the property that keeps a
     /// hostile client off the consensus loop.
     pub fn start(addr: &str, surfaces: Surfaces) -> io::Result<ExplorerServer> {
-        let Surfaces { health: page, txlist, blocks, names } = surfaces;
+        let Surfaces { health: page, txlist, checkpoints, blocks, names } = surfaces;
         let server = tiny_http::Server::http(addr)
             .map_err(|e| io::Error::other(format!("listen_addr {addr}: {e}")))?;
         let server = Arc::new(server);
@@ -250,6 +280,13 @@ impl ExplorerServer {
                                 (code, msg, &b"application/json; charset=utf-8"[..], false)
                             }
                         }
+                    }
+                    (tiny_http::Method::Get, CHECKPOINTS_PATH) => {
+                        let body = checkpoints
+                            .read()
+                            .map(|p| p.clone())
+                            .unwrap_or_else(|e| e.into_inner().clone());
+                        (200, body, &b"application/json; charset=utf-8"[..], false)
                     }
                     (tiny_http::Method::Get, BLOCKS_PATH) => {
                         let snapshot = match blocks.lock() {
@@ -361,12 +398,7 @@ mod tests {
 
     /// A full surface set with defaults, so a test builds only what it exercises.
     fn surfaces(page: &str) -> Surfaces {
-        Surfaces {
-            health: Arc::new(RwLock::new(page.to_string())),
-            txlist: Arc::new(Mutex::new(Arc::new(TxListView::default()))),
-            blocks: Arc::new(Mutex::new(Arc::new(BlocksView::default()))),
-            names: Arc::new(Mutex::new(Arc::new(NameEventsView::default()))),
-        }
+        Surfaces { health: Arc::new(RwLock::new(page.to_string())), ..Surfaces::default() }
     }
 
     fn start(s: &Surfaces) -> ExplorerServer {
@@ -375,6 +407,7 @@ mod tests {
             Surfaces {
                 health: Arc::clone(&s.health),
                 txlist: Arc::clone(&s.txlist),
+                checkpoints: Arc::clone(&s.checkpoints),
                 blocks: Arc::clone(&s.blocks),
                 names: Arc::clone(&s.names),
             },
@@ -754,6 +787,47 @@ mod tests {
         // And no by-name PATH exists either — 404 by shape, like every by-id form.
         let resp = get(server.addr(), "/v1/names/larry");
         assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+        server.shutdown();
+    }
+
+    // ---- the finality ticker route (lab #486 scope item 2) ---------------------
+
+    /// The checkpoints route serves the pre-serialized document, the default is
+    /// the honest empty state (parseable, versioned, empty list — never a blank),
+    /// and the run loop's swap reaches readers — the health.json seam, verbatim.
+    #[test]
+    fn the_checkpoints_route_serves_and_a_swap_is_visible() {
+        let s = surfaces("{}");
+        let server = start(&s);
+        let resp = get(server.addr(), CHECKPOINTS_PATH);
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains("application/json"), "{resp}");
+        let v: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("JSON off the wire");
+        assert_eq!(v["v"], crate::checkpoints::CHECKPOINTS_VERSION);
+        assert!(v["history_from_height"].is_null(), "fresh: no history, and it says so");
+        assert_eq!(v["checkpoints"].as_array().unwrap().len(), 0);
+
+        *s.checkpoints.write().unwrap() = crate::checkpoints::document(
+            &crate::checkpoints::view_of_tail(Some(16), None, &[]),
+        );
+        let after: serde_json::Value =
+            serde_json::from_str(body_of(&get(server.addr(), CHECKPOINTS_PATH))).unwrap();
+        assert_eq!(after["history_from_height"], 16, "the run loop's swap reaches readers");
+        server.shutdown();
+    }
+
+    /// Parameterless means parameterless: a query string is ignored (the document
+    /// has no range to bind), and no by-height or by-fid form exists — D2's shape
+    /// rule, same as every other route here.
+    #[test]
+    fn the_checkpoints_route_has_no_by_id_form() {
+        let s = surfaces("{}");
+        let server = start(&s);
+        for probe in ["/v1/checkpoints/15320", "/v1/checkpoint/15320", "/v1/checkpoints/by-fid/ab"]
+        {
+            let resp = get(server.addr(), probe);
+            assert!(resp.starts_with("HTTP/1.1 404"), "{probe}: {resp}");
+        }
         server.shutdown();
     }
 

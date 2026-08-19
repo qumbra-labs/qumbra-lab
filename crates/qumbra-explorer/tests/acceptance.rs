@@ -19,10 +19,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use qlab_devnet::pow::KeccakPow;
+use qumbra_explorer::checkpoints;
 use qumbra_explorer::config::ExplorerConfig;
-use qumbra_explorer::http::{ExplorerServer, Surfaces, HEALTH_PATH, TXLIST_PATH};
-use qumbra_explorer::blocks::BlocksView;
-use qumbra_explorer::names::NameEventsView;
+use qumbra_explorer::http::{ExplorerServer, Surfaces, CHECKPOINTS_PATH, HEALTH_PATH, TXLIST_PATH};
 use qumbra_explorer::json;
 use qumbra_explorer::txlist::{self, BlockTxs, Next, TxFacts, TxListPage, TxListView};
 use qumbra_node::config::NodeConfig;
@@ -102,13 +101,18 @@ fn a_real_observer_node_serves_the_projection_over_a_real_socket() {
         txlist::refresh_shared(&txlist_view, node.state().chain()),
         "the first projection runs against a real chain store"
     );
+    // …and the finality ticker off the same node, through the accessor chain the
+    // binary uses (`p2p().node().finality()` — the seam most likely to be wrong).
+    let mut cp_last: Option<checkpoints::Fingerprint> = None;
+    let cp_doc = checkpoints::refreshed_document(&mut cp_last, node.p2p().node().finality())
+        .expect("first render always fires");
     let server = ExplorerServer::start(
         "127.0.0.1:0",
         Surfaces {
             health: Arc::clone(&page),
             txlist: Arc::clone(&txlist_view),
-            blocks: Arc::new(Mutex::new(Arc::new(BlocksView::default()))),
-            names: Arc::new(Mutex::new(Arc::new(NameEventsView::default()))),
+            checkpoints: Arc::new(RwLock::new(cp_doc)),
+            ..Surfaces::default()
         },
     )
     .expect("bind");
@@ -171,6 +175,20 @@ fn a_real_observer_node_serves_the_projection_over_a_real_socket() {
 
     // 3. /healthz for a supervisor.
     assert!(get(addr, "/healthz").contains("ok"));
+
+    // 3b. The finality ticker off the real composition: a fresh net has finalized
+    // nothing, and the document says so honestly — null start, empty list, never
+    // an error and never a fabricated row (lab #486 item 2).
+    let resp = get(addr, CHECKPOINTS_PATH);
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    let v: serde_json::Value =
+        serde_json::from_str(body_of(&resp)).expect("a live node's checkpoints document parses");
+    assert_eq!(v["v"], checkpoints::CHECKPOINTS_VERSION);
+    assert!(
+        v["history_from_height"].is_null(),
+        "fresh net: nothing finalized, and the honesty field says so: {v}"
+    );
+    assert_eq!(v["checkpoints"].as_array().unwrap().len(), 0);
 
     // 4. Nothing tx-shaped exists — now probed under the real `/v1` prefix.
     for probe in ["/v1/tx/deadbeef", "/v1/address/qmb1x", "/tx/deadbeef"] {
@@ -268,12 +286,7 @@ fn the_client_pages_a_live_shaped_chain_off_a_real_socket_and_finds_a_pasted_id(
     let slot = Arc::new(Mutex::new(Arc::new(view)));
     let server = ExplorerServer::start(
         "127.0.0.1:0",
-        Surfaces {
-            health: page,
-            txlist: Arc::clone(&slot),
-            blocks: Arc::new(Mutex::new(Arc::new(BlocksView::default()))),
-            names: Arc::new(Mutex::new(Arc::new(NameEventsView::default()))),
-        },
+        Surfaces { health: page, txlist: Arc::clone(&slot), ..Surfaces::default() },
     )
     .expect("bind");
     let addr = server.addr();

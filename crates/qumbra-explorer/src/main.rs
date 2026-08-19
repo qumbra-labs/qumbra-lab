@@ -23,6 +23,7 @@ use qlab_node::round::ObsClock;
 use qlab_p2p::adapter::MiningClock;
 
 use qumbra_explorer::blocks::{self, BlocksView};
+use qumbra_explorer::checkpoints;
 use qumbra_explorer::config::ExplorerConfig;
 use qumbra_explorer::http::{self, ExplorerServer, Surfaces};
 use qumbra_explorer::json;
@@ -99,12 +100,13 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  mining:         false (enforced)");
     println!("  extra listeners: none (telemetry_addr/metrics_addr refused — §6.2)");
     println!(
-        "  routes:         {} + {}?from=&to= + {}?from=&to= + {}?from=&to= + /healthz \
+        "  routes:         {} + {}?from=&to= + {}?from=&to= + {}?from=&to= + {} + /healthz \
          (no page, no write path)",
         http::HEALTH_PATH,
         http::TXLIST_PATH,
         http::BLOCKS_PATH,
-        http::NAMES_EVENTS_PATH
+        http::NAMES_EVENTS_PATH,
+        http::CHECKPOINTS_PATH
     );
     println!("  tx lookup:      none — bulk list only, matched client-side (D2)");
     println!("  name lookup:    none — event feed is range-only, resolve refused by name (D2)");
@@ -151,12 +153,21 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let names_view = Arc::new(Mutex::new(Arc::new(NameEventsView::default())));
     names::refresh_shared(&names_view, node.state().chain());
 
+    // The finality ticker, pre-serialized once pre-bind for the same first-read
+    // rule — a fresh or just-restored tracker serves its honest (possibly empty)
+    // history rather than a blank (lab #486 item 2).
+    let mut cp_last: Option<checkpoints::Fingerprint> = None;
+    let cp_first = checkpoints::refreshed_document(&mut cp_last, node.p2p().node().finality())
+        .expect("first render: no fingerprint seen yet");
+    let checkpoints_page = Arc::new(RwLock::new(cp_first));
+
     // A failure to bind is FATAL, same rule as the faucet's listener.
     let server = ExplorerServer::start(
         &cfg.listen_addr,
         Surfaces {
             health: Arc::clone(&page),
             txlist: Arc::clone(&txlist_view),
+            checkpoints: Arc::clone(&checkpoints_page),
             blocks: Arc::clone(&blocks_view),
             names: Arc::clone(&names_view),
         },
@@ -178,6 +189,12 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "  name events:    http://{}{}?from=&to=  (range-only — no resolve-by-name, by design)",
         server.addr(),
         http::NAMES_EVENTS_PATH
+    );
+    println!(
+        "  checkpoints:    http://{}{}  (finality ticker; history is process-lifetime \
+         and the document says where it begins)",
+        server.addr(),
+        http::CHECKPOINTS_PATH
     );
     println!("  page:           served separately (qumbra-explorer-web) — no / here");
     println!("  node listen:    {}", node.listen_addr());
@@ -226,6 +243,15 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         txlist::refresh_shared(&txlist_view, n.state().chain());
         blocks::refresh_shared(&blocks_view, n.state().chain());
         names::refresh_shared(&names_view, n.state().chain());
+        // The finality ticker re-serializes only when the record moved — the
+        // decision rule lives in the library (`checkpoints::refreshed_document`)
+        // for the same testability reason as `json::fingerprint`.
+        if let Some(doc) = checkpoints::refreshed_document(&mut cp_last, n.p2p().node().finality())
+        {
+            if let Ok(mut p) = checkpoints_page.write() {
+                *p = doc;
+            }
+        }
     });
 
     server.shutdown();
