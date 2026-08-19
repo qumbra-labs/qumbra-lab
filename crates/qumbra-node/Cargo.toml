@@ -142,15 +142,12 @@ qlab-note = { path = "../qlab-note" }
 # reference decoder would not be testing the wire.
 qlab-cbserver = { path = "../qlab-cbserver" }
 # CSPRNG for the acceptance test's ML-KEM keypairs and note material (workspace rev).
-<<<<<<< HEAD
+# Also a [dependencies] entry since lab #506 (launch-mode committee keygen).
 rand = "0.10"
 # Lab #511 live-leg: login → job from a REAL node → share → POST → tip advances.
 # default-features = false so the test does not construct a RandomX VM.
 qumbra-pool = { path = "../qumbra-pool", default-features = false }
 qlab-stratum = { path = "../qlab-stratum" }
-=======
-# Also a [dependencies] entry since lab #506 (launch-mode committee keygen).
->>>>>>> origin/main
 
 # ── graceful shutdown: one seam, two platform mechanisms (src/shutdown.rs) ──
 #
