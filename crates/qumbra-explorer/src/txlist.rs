@@ -331,10 +331,22 @@ pub fn refresh_shared<C: ChainStore>(slot: &Mutex<Arc<TxListView>>, chain: &C) -
     if current.tip_hash == Some(chain.tip_hash()) {
         return false;
     }
+    // The walk as a span (OTel baton) — opened AFTER the cheap tip check above,
+    // so a steady chain costs one comparison and no span: the run loop calls
+    // this every iteration, and the faucet's idle-tick correction ("a span tree
+    // per tick is noise burying the spans anyone wants") applies verbatim. When
+    // no tracer is installed (every unit test of this module), the macro is a
+    // no-op and the function is unchanged.
+    let span = tracing::info_span!(
+        "explorer.txlist_walk",
+        "explorer.tip_height" = tracing::field::Empty,
+    );
+    let _walk = span.enter();
     let mut next = (*current).clone();
     if !next.refresh(chain) {
         return false;
     }
+    span.record("explorer.tip_height", next.tip_height);
     match slot.lock() {
         Ok(mut g) => *g = Arc::new(next),
         Err(p) => *p.into_inner() = Arc::new(next),

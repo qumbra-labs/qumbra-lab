@@ -140,10 +140,18 @@ pub fn refresh_shared<C: ChainStore>(slot: &Mutex<Arc<BlocksView>>, chain: &C) -
     if current.tip_hash == Some(chain.tip_hash()) {
         return false;
     }
+    // The walk as a span — after the cheap tip check, so a steady chain emits
+    // nothing; see `txlist::refresh_shared` for the full grounds.
+    let span = tracing::info_span!(
+        "explorer.blocks_walk",
+        "explorer.tip_height" = tracing::field::Empty,
+    );
+    let _walk = span.enter();
     let mut next = (*current).clone();
     if !next.refresh(chain) {
         return false;
     }
+    span.record("explorer.tip_height", next.tip_height);
     match slot.lock() {
         Ok(mut g) => *g = Arc::new(next),
         Err(p) => *p.into_inner() = Arc::new(next),

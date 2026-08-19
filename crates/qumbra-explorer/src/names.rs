@@ -214,10 +214,20 @@ pub fn refresh_shared<C: ChainStore>(slot: &Mutex<Arc<NameEventsView>>, chain: &
     if current.tip_hash == Some(chain.tip_hash()) {
         return false;
     }
+    // The R4 incremental walk as a span (OTel baton) — this is the walk the task
+    // book names by number: rider decode over every newly-walked block, and on a
+    // rolled or fresh explorer the BACKFILL walk to the boundary's first block.
+    // Opened after the cheap tip check; see `txlist::refresh_shared`.
+    let span = tracing::info_span!(
+        "explorer.names_walk",
+        "explorer.tip_height" = tracing::field::Empty,
+    );
+    let _walk = span.enter();
     let mut next = (*current).clone();
     if !next.refresh(chain) {
         return false;
     }
+    span.record("explorer.tip_height", next.tip_height);
     match slot.lock() {
         Ok(mut g) => *g = Arc::new(next),
         Err(p) => *p.into_inner() = Arc::new(next),

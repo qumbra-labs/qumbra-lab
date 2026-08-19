@@ -48,7 +48,10 @@
 //!   endpoints stay private. This binary learns chain state **over P2P like any
 //!   peer** and renders its own node's view; it never polls another node's
 //!   `/v1/telemetry`, and [`config::ExplorerConfig::check_observer`] refuses a
-//!   node config that would open telemetry/metrics listeners from this process.
+//!   node config that would open a telemetry listener — or a **public** metrics
+//!   listener — from this process. *(Loopback-only metrics became legal with the
+//!   OTel baton's coordinator ruling; see [`metrics_server`] for the ruling and
+//!   [`telemetry`] for the kit it serves.)*
 //! - **Not a writer.** The node holds no committee keys, mines nothing, and no
 //!   route mutates anything ([`http`] takes `GET` only). #275's `POST /v1/tx`
 //!   belongs to svc0's separate `cbnode`, never to this process.
@@ -96,6 +99,8 @@ pub mod checkpoints;
 pub mod config;
 pub mod http;
 pub mod json;
+pub mod metrics_server;
 pub mod names;
+pub mod telemetry;
 pub mod txlist;
 pub mod vitals;

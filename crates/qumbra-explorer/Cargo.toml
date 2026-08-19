@@ -45,6 +45,36 @@ tiny_http = "=0.12.0"
 # cannot recur here.
 ctrlc = { workspace = true }
 
+# ---------------------------------------------------------------------------
+# OTel adoption — the svc-lane three-piece kit (observability-plan §C.1), the
+# explorer's copy of the faucet's block (PR #498). Same crates, same `=` pins,
+# same confinement: **these lines are the entire dependency delta and no
+# `qlab-*` crate gains a dependency** — the instrumentation lives at this
+# binary's dispatch seam and its projection walks, both of which are this
+# crate's own code. The arrow keeps pointing one way.
+#
+# The pins are shared with `qumbra-faucet` deliberately: the OTel Rust stack
+# version-locks across five crates (`tracing-opentelemetry` 0.33 ↔
+# `opentelemetry` 0.32), so the two svc binaries must move in one commit or the
+# workspace holds two incompatible stacks. When these are bumped, bump both.
+tracing = "=0.1.44"
+# `registry` and nothing else — see the "no fmt layer, ever" decision in
+# `src/telemetry.rs`. A fmt layer would put an unreviewed rendering of every
+# span's fields on the operator's stdout next to the route-only journal line.
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["registry", "std"] }
+tracing-opentelemetry = { version = "=0.33.0", default-features = false }
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace"] }
+# `trace` only: no OTLP metrics and no OTLP logs — metrics are Prometheus-pull
+# on a loopback port (piece 3) and the journal line is the log. `internal-logs`
+# OFF on all three OTel crates, same grounds as the faucet's: no path from the
+# SDK to a file descriptor, so "zero noise when export is off" is structural.
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+# Piece 3: the exemplar-carrying histogram. OpenMetrics exemplar syntax is
+# exactly the part nobody should be hand-rendering (the faucet's argument,
+# unchanged here).
+prometheus-client = "=0.23.1"
+
 [dev-dependencies]
 # Parse-and-assert for the hand-rolled encoder, and **dev-only on purpose**
 # (issue #281): the encoder itself ships zero new runtime dependencies, and a
