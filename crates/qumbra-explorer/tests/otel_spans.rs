@@ -27,7 +27,7 @@ use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{SpanData, SpanExporter};
 use opentelemetry_sdk::Resource;
 use qlab_devnet::params_devnet::GENESIS_DIFFICULTY;
-use qlab_node::{genesis_block, MemNode};
+use qlab_node::{genesis_block, MemChainStore};
 use qumbra_explorer::http::{ExplorerServer, Surfaces, UNMATCHED_ROUTE};
 use qumbra_explorer::telemetry::{ExplorerMetrics, Telemetry};
 use qumbra_explorer::{blocks, names, txlist};
@@ -308,7 +308,9 @@ fn the_projection_walks_emit_spans_only_when_the_chain_moved() {
     let _serial = serial();
     let rig = rig();
 
-    let node = MemNode::in_memory(genesis_block(GENESIS_DIFFICULTY, 0));
+    // The same fixture the crate's own refresh tests prove the walk against: a
+    // chain store holding one genesis block.
+    let chain = MemChainStore::new(genesis_block(GENESIS_DIFFICULTY, 0));
     let txlist_slot = Arc::new(Mutex::new(Arc::new(txlist::TxListView::default())));
     let blocks_slot = Arc::new(Mutex::new(Arc::new(blocks::BlocksView::default())));
     let names_slot = Arc::new(Mutex::new(Arc::new(names::NameEventsView::default())));
@@ -319,9 +321,9 @@ fn the_projection_walks_emit_spans_only_when_the_chain_moved() {
 
     // First projection: the chain moved (from "never projected"), so each walk
     // runs and each emits exactly one span.
-    assert!(txlist::refresh_shared(&txlist_slot, node.chain()));
-    assert!(blocks::refresh_shared(&blocks_slot, node.chain()));
-    assert!(names::refresh_shared(&names_slot, node.chain()));
+    assert!(txlist::refresh_shared(&txlist_slot, &chain));
+    assert!(blocks::refresh_shared(&blocks_slot, &chain));
+    assert!(names::refresh_shared(&names_slot, &chain));
     for (i, n) in names_of.iter().enumerate() {
         assert_eq!(
             walk_count(&rig.recorder, n),
@@ -331,9 +333,9 @@ fn the_projection_walks_emit_spans_only_when_the_chain_moved() {
     }
 
     // Steady chain: the cheap tip check answers first — no walk, NO span.
-    assert!(!txlist::refresh_shared(&txlist_slot, node.chain()));
-    assert!(!blocks::refresh_shared(&blocks_slot, node.chain()));
-    assert!(!names::refresh_shared(&names_slot, node.chain()));
+    assert!(!txlist::refresh_shared(&txlist_slot, &chain));
+    assert!(!blocks::refresh_shared(&blocks_slot, &chain));
+    assert!(!names::refresh_shared(&names_slot, &chain));
     for (i, n) in names_of.iter().enumerate() {
         assert_eq!(
             walk_count(&rig.recorder, n),
