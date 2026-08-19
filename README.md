@@ -23,6 +23,7 @@ crates/         # 22 crates
   qlab-note/          # ML-KEM-768 + ChaCha20-Poly1305 note encryption
   qlab-cbserver/      # compact-block server (interop-spec §2 reference)
   qlab-disclosure/    # selective-disclosure STARK
+  qlab-vask/          # exchange/VASP kit: envelope verifier lib + qvask C ABI — crates/qlab-vask/README.md is the kit's front door (lab #483)
   qlab-econ/          # emission simulator
   qlab-demo/          # whole-stack composition
   qlab-faucet/        # the M11 faucet: a proof-generating wallet + off-chain anti-abuse
@@ -32,6 +33,7 @@ crates/         # 22 crates
   qumbra-explorer/    # the public chain-health JSON projection over its own keyless observer node (deliberately not an Etherscan; the page is qumbra-explorer-web, #281)
   qumbra-wallet/      # the end-user wallet CLI: keygen/restore/address/backup/scan/send (#276 wired send: tree sync + POST /v1/tx)
   qumbra-ffi/         # the wallet kernel over a hand C ABI, cross-compiled for iOS (rung A, #246)
+  qumbra-credit-ref/  # the exchange crediting-flow reference: POST /v1/credit over qlab-vask + the light-client scan (lab #483)
 docs/           # lab notes; polished results go to the design repo, not here
 ```
 
