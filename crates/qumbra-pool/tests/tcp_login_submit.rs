@@ -32,6 +32,7 @@ fn sample_template() -> Template {
         },
         seed_hash: [0x33; 32],
         next_seed_hash: None,
+        body: None,
     }
 }
 

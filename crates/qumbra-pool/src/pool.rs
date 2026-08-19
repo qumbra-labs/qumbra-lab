@@ -22,7 +22,23 @@ use crate::jobs::{ExtraNonceAllocator, IssuedJob, JobStore};
 use crate::payee::{assemble_coinbase, Accounts, AssembleError, AssembledCoinbase};
 use crate::pplns::{PplnsWindow, WindowShare};
 use crate::share::{is_block_candidate, share_meets_target};
-use crate::template::{next_seed_in_preload_window, Template, TemplateError, TemplateSource};
+use crate::template::{
+    next_seed_in_preload_window, Template, TemplateBody, TemplateError, TemplateSource,
+};
+
+/// Where a block-class share is submitted (lab #511). Production injects
+/// [`crate::node_rpc::NodeRpcClient`]; tests leave this unset and only
+/// record the ledger.
+pub trait BlockSubmitter: Send + Sync {
+    /// POST the completed header preimage + template body. Returns the
+    /// node's named verdict body (`accepted …` / `refused: …`).
+    fn submit_block(
+        &self,
+        form: qlab_devnet::forms::GenesisForm,
+        header_preimage: &[u8],
+        body: &TemplateBody,
+    ) -> Result<String, String>;
+}
 
 /// xmrig-proxy-shaped error codes we actually emit.
 pub const ERR_INVALID: i64 = -1;
@@ -81,6 +97,7 @@ struct Inner {
     pplns: PplnsWindow,
     accounts: Accounts,
     pool_rkm: [u64; 4],
+    submitter: Option<std::sync::Arc<dyn BlockSubmitter>>,
 }
 
 pub struct Pool {
@@ -127,8 +144,14 @@ impl Pool {
                 pplns: PplnsWindow::default(),
                 accounts: Accounts::default(),
                 pool_rkm,
+                submitter: None,
             }),
         })
+    }
+
+    /// Install the node-RPC submit path. A block-class share then POSTs.
+    pub fn set_submitter(&self, submitter: std::sync::Arc<dyn BlockSubmitter>) {
+        self.inner.lock().expect("pool mutex").submitter = Some(submitter);
     }
 
     pub fn register_account(&self, login: impl Into<String>, rkm: [u64; 4]) {
@@ -488,6 +511,30 @@ impl Pool {
             status: ShareStatus::Accepted,
             block_candidate: block,
         });
+        let pending_submit = if block {
+            job.body.clone().map(|body| {
+                (
+                    job.form,
+                    blob,
+                    body,
+                    g.submitter.clone(),
+                )
+            })
+        } else {
+            None
+        };
+        drop(g);
+        if let Some((form, preimage, body, submitter)) = pending_submit {
+            match submitter {
+                Some(sub) => match sub.submit_block(form, &preimage, &body) {
+                    Ok(msg) => eprintln!("pool block submit: {msg}"),
+                    Err(e) => eprintln!("pool block refused: {e}"),
+                },
+                None => {
+                    eprintln!("pool block candidate at height (no submitter installed; logged only)")
+                }
+            }
+        }
         Ok(vec![Outgoing::Reply(StratumResponse::ok_status(rid, "OK"))])
     }
 
@@ -585,6 +632,7 @@ fn issue_job(
         form: template.form,
         consensus_difficulty: template.header.difficulty,
         stale: false,
+        body: template.body.clone(),
     };
     let job = Job {
         blob: hexutil::encode(&blob),
@@ -628,6 +676,7 @@ mod tests {
             header: header(height),
             seed_hash: [0x33; 32],
             next_seed_hash: Some([0x44; 32]),
+            body: None,
         }
     }
 

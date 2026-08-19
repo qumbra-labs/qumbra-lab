@@ -38,6 +38,7 @@ pub mod endpoint;
 pub mod hasher;
 pub mod hexutil;
 pub mod jobs;
+pub mod node_rpc;
 pub mod payee;
 pub mod pool;
 pub mod pplns;
@@ -46,16 +47,18 @@ pub mod template;
 
 pub use accounting::{Ledger, ShareRecord, ShareStatus};
 pub use config::PoolConfig;
-pub use hasher::{FixedHasher, ShareHasher};
+pub use hasher::{FixedHasher, KeccakShareHasher, ShareHasher};
 pub use jobs::{IssuedJob, JobStore};
 pub use payee::{assemble_coinbase, Accounts, AssembledCoinbase};
+pub use node_rpc::{NodeRpcClient, NodeRpcTemplateSource};
 pub use pool::{
-    Outgoing, Pool, PoolError, ERR_BAD_ALGO, ERR_BAD_HASH, ERR_DUPLICATE, ERR_LOW_DIFF,
-    ERR_UNAUTHORIZED, ERR_UNCLEAN_V4, ERR_UNKNOWN_JOB,
+    BlockSubmitter, Outgoing, Pool, PoolError, ERR_BAD_ALGO, ERR_BAD_HASH, ERR_DUPLICATE,
+    ERR_LOW_DIFF, ERR_UNAUTHORIZED, ERR_UNCLEAN_V4, ERR_UNKNOWN_JOB,
 };
 pub use pplns::{PplnsWindow, PPLNS_WINDOW_SHARES};
 pub use template::{
-    DevnetTemplateSource, HeldTemplateSource, Template, TemplateError, TemplateSource,
+    DevnetTemplateSource, HeldTemplateSource, Template, TemplateBody, TemplateError,
+    TemplateSource,
 };
 
 #[cfg(feature = "randomx")]

@@ -44,6 +44,9 @@ pub struct IssuedJob {
     pub form: GenesisForm,
     pub consensus_difficulty: u64,
     pub stale: bool,
+    /// Body from the live node template, if any. A block-class share
+    /// POSTs this with the completed header.
+    pub body: Option<crate::template::TemplateBody>,
 }
 
 #[derive(Debug, Default)]
@@ -107,6 +110,7 @@ mod tests {
             form: GenesisForm::V5,
             consensus_difficulty: 1,
             stale: false,
+            body: None,
         });
         assert!(!store.is_stale("j1"));
         store.mark_all_stale();

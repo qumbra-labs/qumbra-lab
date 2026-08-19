@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use qumbra_pool::config::PoolConfig;
 use qumbra_pool::endpoint::serve;
@@ -58,31 +59,35 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     let path = PathBuf::from(flag(args, "--config").ok_or("missing --config FILE")?);
     let cfg = PoolConfig::load(&path)?;
-    let form = cfg.form()?;
-    let template = cfg.into_template()?;
     println!("qumbra-pool check: ok");
     println!("  listen:            {}", cfg.listen_addr);
     println!("  share_difficulty:  {}", cfg.share_difficulty);
-    println!("  form:              {form:?}");
-    println!(
-        "  stock-xmrig:       {}",
-        if template.serves_stock_xmrig() {
-            "yes (v5)"
-        } else {
-            "no — login will refuse v4-net-unclean-for-stock-xmrig"
-        }
-    );
-    println!("  height:            {}", template.header.height);
+    if let Some(url) = &cfg.node_rpc {
+        println!("  node_rpc:          {url}");
+        println!("  poll_ms:           {}", cfg.poll_ms.unwrap_or(1000));
+        println!("  template:          live (GET /v1/mine/template)");
+    } else {
+        let form = cfg.form()?;
+        let template = cfg.into_template()?;
+        println!("  form:              {form:?}");
+        println!(
+            "  stock-xmrig:       {}",
+            if template.serves_stock_xmrig() {
+                "yes (v5)"
+            } else {
+                "no — login will refuse v4-net-unclean-for-stock-xmrig"
+            }
+        );
+        println!("  height:            {}", template.header.height);
+    }
     Ok(())
 }
 
 fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let path = PathBuf::from(flag(args, "--config").ok_or("missing --config FILE")?);
     let cfg = PoolConfig::load(&path)?;
-    let form = cfg.form()?;
     let listen = cfg.listen_addr.clone();
     let share_difficulty = cfg.share_difficulty;
-    let source = cfg.template_source()?;
     #[cfg(feature = "randomx")]
     let hasher: Box<dyn qumbra_pool::ShareHasher> =
         Box::new(qumbra_pool::RandomXShareHasher::new());
@@ -92,16 +97,63 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             "qumbra-pool run requires feature `randomx` (default ON) — rebuild the binary".into(),
         );
     }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = Arc::clone(&stop);
+    ctrlc::set_handler(move || {
+        stop2.store(true, Ordering::SeqCst);
+    })?;
+
     #[cfg(feature = "randomx")]
-    let pool = Arc::new(Pool::new_with_hasher(
-        share_difficulty,
-        Box::new(source),
-        hasher,
-        [9, 0, 0, 0],
-    )?);
+    let pool = if let Some(url) = cfg.node_rpc.clone() {
+        let live = qumbra_pool::NodeRpcTemplateSource::connect(&url)?;
+        let client = live.client();
+        let initial = live.snapshot();
+        let form = initial.form;
+        let pool = Arc::new(Pool::new_with_hasher(
+            share_difficulty,
+            Box::new(qumbra_pool::HeldTemplateSource::new(initial)),
+            hasher,
+            [9, 0, 0, 0],
+        )?);
+        pool.set_submitter(Arc::new(client));
+        let poll = Duration::from_millis(cfg.poll_ms.unwrap_or(1000));
+        let pool_poll = Arc::clone(&pool);
+        let stop_poll = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop_poll.load(Ordering::SeqCst) {
+                std::thread::sleep(poll);
+                match live.poll() {
+                    Ok(true) => {
+                        let t = live.snapshot();
+                        if let Err(e) =
+                            pool_poll.replace_template(Box::new(qumbra_pool::HeldTemplateSource::new(t)))
+                        {
+                            eprintln!("pool template re-issue: {e}");
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(e) => eprintln!("pool template poll: {e}"),
+                }
+            }
+        });
+        println!("  node_rpc: {url}  poll_ms={}", cfg.poll_ms.unwrap_or(1000));
+        println!("  form: {form:?} (from live node)");
+        pool
+    } else {
+        let source = cfg.template_source()?;
+        let form = cfg.form()?;
+        println!("  form: {form:?} (static [template])");
+        Arc::new(Pool::new_with_hasher(
+            share_difficulty,
+            Box::new(source),
+            hasher,
+            [9, 0, 0, 0],
+        )?)
+    };
     let listener = TcpListener::bind(&listen)?;
     let bound = listener.local_addr()?;
-    println!("qumbra-pool listening on {bound}  form={form:?}  share_diff={share_difficulty}");
+    println!("qumbra-pool listening on {bound}  share_diff={share_difficulty}");
     if !pool.current_template().serves_stock_xmrig() {
         println!("  ⚠️  v4 template: stock-xmrig login will be refused (#356 UNCLEAN)");
     }
@@ -111,11 +163,6 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         qumbra_pool::PPLNS_WINDOW_SHARES
     );
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop2 = Arc::clone(&stop);
-    ctrlc::set_handler(move || {
-        stop2.store(true, Ordering::SeqCst);
-    })?;
     serve(listener, pool, stop)?;
     println!("qumbra-pool stopped");
     Ok(())
