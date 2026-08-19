@@ -103,6 +103,12 @@ qlab-air = { path = "../qlab-air" }
 qumbra-wallet = { path = "../qumbra-wallet", default-features = false, features = ["net"] }
 # ML-DSA-65 verifying-key encode/decode for committee₀ in the genesis file.
 ml-dsa = "=0.1.1"
+# CSPRNG for `genesis init --t2 --launch` (lab #506): 21 committee seeds from
+# OS randomness, then `Validator::from_seed` — the existing keygen seam, so
+# KeyFile still stores seed_hex and `load_validators` is unchanged. Same crate
+# the rest of the workspace uses; `rand::rng()` is the house OsRng-class path
+# (see qumbra-wallet `store.rs`). Tests also use it (was a dev-dep only).
+rand = "0.10"
 
 # Deterministic on-disk genesis-file encoding (same serde/bincode posture as the
 # qlab-node snapshot/log). The genesis hash is keccak256 over the bincode.
@@ -133,7 +139,7 @@ qlab-note = { path = "../qlab-note" }
 # reference decoder would not be testing the wire.
 qlab-cbserver = { path = "../qlab-cbserver" }
 # CSPRNG for the acceptance test's ML-KEM keypairs and note material (workspace rev).
-rand = "0.10"
+# Also a [dependencies] entry since lab #506 (launch-mode committee keygen).
 
 # ── graceful shutdown: one seam, two platform mechanisms (src/shutdown.rs) ──
 #
