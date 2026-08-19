@@ -1751,8 +1751,13 @@ name = "qumbra-credit-ref"
 version = "0.0.0"
 dependencies = [
  "qlab-cbserver",
+ "qlab-devnet",
+ "qlab-disclosure",
+ "qlab-node",
  "qlab-note",
  "qlab-vask",
+ "qlab-wallet",
+ "qumbra-node",
  "rand 0.10.2",
 ]
 
