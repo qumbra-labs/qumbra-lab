@@ -1,5 +1,6 @@
 # Pool stratum mapping — §4 reading executed (lab #482 stage 0)
 
+> New to stratum entirely? Two-minute primer: [stratum-primer.md](stratum-primer.md).
 > [中文版](pool-stratum-mapping-zh.md)
 
 **Status: STAGE-0 DELIVERABLE.** Executes the demand-gated stratum reading that
