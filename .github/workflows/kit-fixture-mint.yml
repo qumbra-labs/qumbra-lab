@@ -1,0 +1,74 @@
+# MINT THE KIT'S GOLDEN DISCLOSURE FIXTURE ON CI-CLASS IRON (lab #483 stage 2).
+#
+# The QVASK_OK fixture (crates/qlab-vask/fixtures/golden-envelope-v1.bin) is a
+# real ~122 KB envelope proven at the pinned DISCLOSURE_V1_CFG. Minting it is
+# one prove of the disclosure STARK — which the CLAUDE.md rule keeps off
+# developer machines entirely (agent sessions run NO local cargo test; the CI
+# lane is the only test executor). This workflow is that lane for the mint:
+# it runs the `--ignored` generator test and hands the files back as an
+# artifact, which a session then commits (un-ignoring
+# `committed_golden_fixture_verifies` in the same commit, per the #483
+# stage-2 release note).
+#
+# Trigger: push a branch named `mint/**` (workflow_dispatch is not usable for
+# a workflow that does not exist on the default branch yet). The branch is a
+# trigger vehicle, deleted after the artifact is downloaded.
+#
+# Runner: the hosted arm64 lane (`qumbra-arm64-8`, suite-arm64's runner), so
+# the fixture's provenance arch matches the acceptance lane that verifies it.
+# The job builds only qlab-vask's dependency graph in release (~minutes) and
+# proves once (~1 s measured on M5 Max at this config; docs/disclosure-run2.md).
+#
+# SECRETS POSTURE: none read, none needed — contents: read is the whole grant
+# (the acceptance-graviton file's S7 rule: a workflow change that appears to
+# need a secret is a stop, not a widening).
+#
+# Determinism cross-check: the generator prints the envelope's Keccak-256
+# digest; the suite's prove-class test `golden_envelope_v1_end_to_end_over_the_abi`
+# prints the same digest on the graviton lane, and the un-ignored
+# `committed_golden_fixture_verifies` cryptographically verifies the committed
+# bytes at every acceptance run thereafter — so a wrong or drifted fixture
+# cannot survive an acceptance pass even if nobody compares digests by hand.
+name: kit-fixture-mint
+
+on:
+  push:
+    branches:
+      - "mint/**"
+
+permissions:
+  contents: read
+
+jobs:
+  mint:
+    runs-on: qumbra-arm64-8
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Provenance
+        run: |
+          echo "commit   $(git rev-parse HEAD)"
+          uname -m; nproc
+          rustc --version; cargo --version
+
+      - name: Mint the golden fixture (one prove at DISCLOSURE_V1_CFG)
+        run: |
+          cargo test --release --locked -p qlab-vask --test golden_v1 -- \
+            --ignored --exact mint_golden_fixture_files --nocapture
+
+      - name: The minted files, by digest (for the job log)
+        run: |
+          ls -l crates/qlab-vask/fixtures/golden-*.bin
+          shasum -a 256 crates/qlab-vask/fixtures/golden-*.bin 2>/dev/null \
+            || sha256sum crates/qlab-vask/fixtures/golden-*.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qvask-golden-fixture-v1
+          path: crates/qlab-vask/fixtures/golden-*.bin
+          if-no-files-found: error
+          retention-days: 7
