@@ -5,22 +5,39 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Exchange crediting-flow reference service — STAGE 0 SKELETON (lab #483,
-# docs/kit-stage0-survey.md §2/§4). Own bin crate per the #117/#128
-# precedents: Cargo has no per-target deps, so this service's HTTP/runtime
-# graph must never land in qlab-vask's library dependencies. Stage 2 builds
-# the service; stage 0 reserves the crate and carries citation tests on the
-# existing seams the service will consume (survey §1.3).
+# Exchange crediting-flow reference service — STAGE 2 (lab #483,
+# docs/kit-stage0-survey.md §4 as ratified: out-of-band envelope delivery IS
+# the design of record). Own bin crate per the #117/#128 precedents: Cargo has
+# no per-target deps, so this service's HTTP/runtime graph must never land in
+# qlab-vask's library dependencies. The lib target carries the transport-
+# agnostic credit engine; the bin is the thin HTTP shell over it.
 
 [dependencies]
-# The kit verifier surface (stage 1 fills it).
+# The kit verifier: peek / verify under the pinned DISCLOSURE_V1_CFG.
 qlab-vask = { path = "../qlab-vask" }
-# The scan / full-fetch / payload seams the crediting flow reuses verbatim
-# (survey §1.3): light_client_scan_with, /v1/compact + /full codecs.
-qlab-cbserver = { path = "../qlab-cbserver" }
-# Dk / PAYLOAD_LEN — the types the scan seam takes and the wire constant the
-# survey's memo-gap finding cites.
+# The scan seam the crediting flow reuses verbatim (survey §1.3):
+# light_client_scan_with over a caller-supplied fetch — the #297 seam, so the
+# engine stays transport-agnostic. default-features off: this service needs
+# only the light-client scan, not the devnet fixture or the RandomX chain.
+qlab-cbserver = { path = "../qlab-cbserver", default-features = false }
+# Dk — the viewing-side key the scan takes.
 qlab-note = { path = "../qlab-note" }
+# The exchange's deposit address: Wallet/Diversifier/Address derivation.
+qlab-wallet = { path = "../qlab-wallet" }
+# packing::addr_commitment — the ONE implementation of the address-commitment
+# hash (regression-locked against qlab-wallet's layout); never re-derived here.
+qlab-disclosure = { path = "../qlab-disclosure" }
+# AnchorSet — the /v1/anchors codec, one copy (tip + finalized head for the
+# scan window and the finalized-is-creditable rule). Lean: no randomx.
+qlab-node = { path = "../qlab-node", default-features = false }
+# The scan signature takes a decoy rng; this service runs decoys OFF (it
+# talks to its own upstream node — there is no fetch pattern to hide from
+# yourself), so the rng is structurally unused.
+rand = "0.10"
 
 [dev-dependencies]
-rand = "0.10"
+# The e2e chassis (tests/credit_e2e.rs — prove-class, the CI lane's): a
+# RunningNode over its own admission path + miner + discovery endpoint, the
+# recipient_scan.rs composition.
+qumbra-node = { path = "../qumbra-node" }
+qlab-devnet = { path = "../qlab-devnet" }
