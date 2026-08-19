@@ -61,11 +61,23 @@ pub const HEALTH_VERSION: u32 = 1;
 /// reaches the reader after the page left this binary; without it the config knob
 /// would silently become dead.
 ///
+/// `network` is `GenesisFile::network` **verbatim** (lab #486 item 7): the
+/// TESTNET banner's label source. Chain-pinned — the node refuses to boot
+/// against a genesis-hash mismatch, so this label cannot drift from the net
+/// actually observed — and served here so the page never hardcodes it (and
+/// never infers it from a hostname, which naming-and-branding §7's tagged
+/// zones would make circular). **A pure addition: `v` stays 1** — the reader
+/// ignores unknown keys and rejects unknown `v`, the `burned` precedent; an
+/// ABSENT key on an older API is the page's fail-loud "unidentified net"
+/// banner state, never a hidden banner.
+///
 /// [`GenesisFile::hash_hex`]: qumbra_node::genesis::GenesisFile::hash_hex
-pub fn health(t: &Telemetry, genesis_file_hash: &str, refresh_secs: u64) -> String {
+/// [`GenesisFile::network`]: qumbra_node::genesis::GenesisFile::network
+pub fn health(t: &Telemetry, genesis_file_hash: &str, refresh_secs: u64, network: &str) -> String {
     format!(
         "{{\"v\":{HEALTH_VERSION},\
          \"genesis_file_hash\":\"{genesis}\",\
+         \"network\":\"{network}\",\
          \"refresh_secs\":{refresh_secs},\
          \"chain\":{{\
          \"tip_height\":{tip},\"tip_difficulty\":{diff},\"regime\":\"{regime}\",\
@@ -83,6 +95,7 @@ pub fn health(t: &Telemetry, genesis_file_hash: &str, refresh_secs: u64) -> Stri
          \"supply\":{supply}\
          }}",
         genesis = esc(genesis_file_hash),
+        network = esc(network),
         tip = t.tip_height,
         diff = num(t.tip_difficulty),
         regime = regime(t.finality_status),
@@ -230,7 +243,7 @@ fn supply(t: &Telemetry) -> String {
 /// that its own input can break is a defect independent of who calls it, and
 /// `a_hostile_genesis_hash_cannot_break_the_document` is cheaper than the argument
 /// that no caller will ever change.
-fn esc(s: &str) -> String {
+pub(crate) fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -280,7 +293,7 @@ fn agreement(t: &Telemetry) -> String {
 /// it is deliberately not used for a value the snapshot *refuses to state* — those
 /// keep their named string rendering (`age_s`, the identity fields), because a
 /// consumer's `|| 0` turns a null into a zero and a refusal into a lie.
-fn num(v: Option<u64>) -> String {
+pub(crate) fn num(v: Option<u64>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "null".into())
 }
 
@@ -332,7 +345,10 @@ mod tests {
 
     /// Keccak-256 over the four golden serializations concatenated, in source so a
     /// blind file regeneration cannot make the goldens pass by itself.
-    const GOLDEN_DIGEST: &str = "60782c21627e326fa4ad60e8a65f4690ad2223598aa9beebebeeb9b9ec6f7acb";
+    // Updated for the lab #486 item-7 additive `network` key (v stays 1 — the
+    // burned precedent); the same-baton web-fixture refresh rides this baton's
+    // qumbra-explorer-web PR, per the stage-0 binding rule.
+    const GOLDEN_DIGEST: &str = "ef0b68b20b36e6543aec64851ce8197fb5dbb7ed8040d2ff87cbe6828be7cef6";
 
     fn hash32(first: u8) -> [u8; 32] {
         let mut h = [0u8; 32];
@@ -351,7 +367,7 @@ mod tests {
         let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG)
             .with_checkpoint(Some(0xb682_3616), None)
             .with_durable_head(Some((1040, hash32(0x3f))));
-        let v = parse(&health(&t, "138e1524aabb", 30));
+        let v = parse(&health(&t, "138e1524aabb", 30, "qumbra-devnet-t0"));
 
         assert_eq!(v["v"], HEALTH_VERSION, "the projection is versioned");
         assert_eq!(v["genesis_file_hash"], "138e1524aabb");
@@ -372,13 +388,31 @@ mod tests {
         );
     }
 
+    /// Lab #486 item 7: the TESTNET banner's label source. The key is a **pure
+    /// addition** — `v` stays 1 (the `burned` precedent: reader ignores unknown
+    /// keys, rejects unknown `v`) — and the value is `GenesisFile.network`
+    /// verbatim, so the page renders whatever the chain-pinned genesis says and
+    /// hardcodes nothing.
+    #[test]
+    fn the_network_label_is_on_the_surface_and_v_stays_1() {
+        let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG);
+        let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
+        assert_eq!(v["network"], "qumbra-devnet-t0", "the genesis label, verbatim");
+        assert_eq!(v["v"], 1, "a pure addition does not bump the document version");
+
+        // And the encoder survives a hostile label — same grounds as the genesis
+        // hash: unreachable from the one caller, unbreakable anyway.
+        let v = parse(&health(&t, "aa", 30, "evil\"net\\name"));
+        assert_eq!(v["network"], "evil\"net\\name", "round-trips verbatim");
+    }
+
     /// The verdict is `Telemetry`'s, carried whole — token spelling included, so
     /// one grep still covers opview, the wallet CLI and this surface.
     #[test]
     fn a_tracker_ahead_of_the_durable_head_carries_the_lag_token_and_both_heights() {
         let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG)
             .with_durable_head(Some((1040, hash32(0x3f))));
-        let v = parse(&health(&t, "aa", 30));
+        let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
         let a = &v["finality"]["agreement"];
 
         assert_eq!(a["divergent"], true);
@@ -395,7 +429,7 @@ mod tests {
     #[test]
     fn a_finalized_tracker_over_no_durable_head_carries_the_absent_token() {
         let t = Telemetry::assemble(2900, Some(2864), 42, 0, 7, 0, MAX_LAG).with_durable_head(None);
-        let v = parse(&health(&t, "aa", 30));
+        let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
 
         assert_eq!(
             v["finality"]["head3"]["state"], "nothing",
@@ -411,7 +445,7 @@ mod tests {
     fn agreement_carries_no_token_at_all() {
         let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG)
             .with_durable_head(Some((1048, hash32(0x3f))));
-        let s = health(&t, "aa", 30);
+        let s = health(&t, "aa", 30, "qumbra-devnet-t0");
         let v = parse(&s);
 
         assert_eq!(v["finality"]["agreement"]["divergent"], false);
@@ -432,7 +466,7 @@ mod tests {
     fn an_unreadable_durable_head_is_a_named_state_and_never_an_alarm() {
         // `with_durable_head` never called: this composition does not read head #3.
         let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG);
-        let s = health(&t, "aa", 30);
+        let s = health(&t, "aa", 30, "qumbra-devnet-t0");
         let v = parse(&s);
 
         assert_eq!(v["finality"]["head3"]["state"], "unavailable");
@@ -448,7 +482,7 @@ mod tests {
     fn the_chain_block_carries_the_five_facts_and_the_regime_as_a_machine_name() {
         let t = Telemetry::assemble(1052, Some(1048), 42, 3, 7, 0, MAX_LAG)
             .with_tip_difficulty(Some(1_048_576));
-        let v = parse(&health(&t, "aa", 30));
+        let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
 
         assert_eq!(v["chain"]["tip_height"], 1052);
         assert_eq!(v["chain"]["tip_difficulty"], 1_048_576);
@@ -463,7 +497,7 @@ mod tests {
     #[test]
     fn a_missing_tip_difficulty_is_null_and_never_a_zero() {
         let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG);
-        let v = parse(&health(&t, "aa", 30));
+        let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
         assert!(v["chain"]["tip_difficulty"].is_null(), "absent, not 0");
     }
 
@@ -471,7 +505,7 @@ mod tests {
     fn the_committee_block_carries_the_three_aggregates_and_the_epoch() {
         let t =
             Telemetry::assemble(1052, Some(1048), 42, 0, 7, 4, MAX_LAG).with_committee(21, 20, 15);
-        let v = parse(&health(&t, "aa", 30));
+        let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
 
         assert_eq!(v["committee"]["epoch"], 4);
         assert_eq!(v["committee"]["roster"], 21);
@@ -485,7 +519,7 @@ mod tests {
     #[test]
     fn age_s_is_a_string_and_the_refusal_survives_as_such() {
         let stated = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG);
-        let v = parse(&health(&stated, "aa", 30));
+        let v = parse(&health(&stated, "aa", 30, "qumbra-devnet-t0"));
         assert_eq!(
             v["finality"]["head1"]["age_s"], "42",
             "a string, not the number 42"
@@ -494,7 +528,7 @@ mod tests {
         // Nothing finalized: `age_field` refuses, and the refusal reaches the reader
         // in the vocabulary every other Qumbra surface uses for it.
         let refused = Telemetry::assemble(0, None, 0, 0, 0, 0, MAX_LAG);
-        let v = parse(&health(&refused, "aa", 30));
+        let v = parse(&health(&refused, "aa", 30, "qumbra-devnet-t0"));
         assert_eq!(
             v["finality"]["head1"]["age_s"], "-",
             "the #73 refusal, verbatim"
@@ -505,7 +539,7 @@ mod tests {
     #[test]
     fn stall_depth_is_carried() {
         let t = Telemetry::assemble(1052, Some(1048), 42, 0, 7, 0, MAX_LAG);
-        let v = parse(&health(&t, "aa", 30));
+        let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
         assert_eq!(v["finality"]["head1"]["stall_depth"], 4);
     }
 
@@ -514,7 +548,7 @@ mod tests {
         let t = Telemetry::assemble(14, Some(8), 75, 0, 3, 1, MAX_LAG)
             .with_supply(vec![epoch_row(14, 700, 700)]);
         assert!(matches!(t.supply_coverage(), SupplyCoverage::Complete));
-        let v = parse(&health(&t, "aa", 30));
+        let v = parse(&health(&t, "aa", 30, "qumbra-devnet-t0"));
 
         assert_eq!(v["supply"]["coverage"], "COMPLETE");
         let rows = v["supply"]["epochs"]
@@ -541,7 +575,7 @@ mod tests {
     fn the_grandfathered_scar_is_named_and_a_neighbouring_total_is_not() {
         let t = Telemetry::assemble(2_303, Some(2_303), 75, 0, 3, 1, MAX_LAG)
             .with_supply(vec![epoch_one_scar_row(-4_114)]);
-        let s = health(&t, "aa", 30);
+        let s = health(&t, "aa", 30, "qumbra-devnet-t0");
         let row = &parse(&s)["supply"]["epochs"][0];
         assert_eq!(row["verdict"], KNOWN_SCAR);
         assert_eq!(row["delta"], -4_114, "the number is published, not hidden");
@@ -556,7 +590,7 @@ mod tests {
         for other in [-4_113i128, -4_115] {
             let t = Telemetry::assemble(2_303, Some(2_303), 75, 0, 3, 1, MAX_LAG)
                 .with_supply(vec![epoch_one_scar_row(other)]);
-            let s = health(&t, "aa", 30);
+            let s = health(&t, "aa", 30, "qumbra-devnet-t0");
             assert_eq!(parse(&s)["supply"]["epochs"][0]["verdict"], DIVERGENT, "{other}");
         }
     }
@@ -569,7 +603,7 @@ mod tests {
     fn a_divergent_supply_row_carries_the_stable_token_and_the_exact_delta() {
         let t = Telemetry::assemble(14, Some(8), 75, 0, 3, 1, MAX_LAG)
             .with_supply(vec![epoch_row(14, 700, 705)]);
-        let s = health(&t, "aa", 30);
+        let s = health(&t, "aa", 30, "qumbra-devnet-t0");
         let v = parse(&s);
         let row = &v["supply"]["epochs"][0];
 
@@ -582,7 +616,7 @@ mod tests {
     fn an_agreed_supply_row_carries_no_divergence_token() {
         let t = Telemetry::assemble(14, Some(8), 75, 0, 3, 1, MAX_LAG)
             .with_supply(vec![epoch_row(14, 700, 700)]);
-        let s = health(&t, "aa", 30);
+        let s = health(&t, "aa", 30, "qumbra-devnet-t0");
         assert_eq!(parse(&s)["supply"]["epochs"][0]["verdict"], "agreed");
         assert!(!s.contains(DIVERGENT), "no token on a healthy row: {s}");
     }
@@ -599,7 +633,7 @@ mod tests {
             t.supply_coverage(),
             SupplyCoverage::Unavailable { .. }
         ));
-        let s = health(&t, "aa", 30);
+        let s = health(&t, "aa", 30, "qumbra-devnet-t0");
         let v = parse(&s);
 
         assert_eq!(
@@ -698,12 +732,12 @@ mod tests {
             .with_supply(vec![epoch_row(4, 123_456_789, 123_456_789)])
             .with_durable_head(Some((8, hash32(0x11))));
         vec![
-            ("agreed", health(&agreed, "138e1524addb", 30)),
-            ("durable-lag", health(&lag, "138e1524addb", 30)),
-            ("durable-absent", health(&absent, "138e1524addb", 30)),
+            ("agreed", health(&agreed, "138e1524addb", 30, "qumbra-devnet-t0")),
+            ("durable-lag", health(&lag, "138e1524addb", 30, "qumbra-devnet-t0")),
+            ("durable-absent", health(&absent, "138e1524addb", 30, "qumbra-devnet-t0")),
             (
                 "coverage-unavailable",
-                health(&uncovered, "138e1524addb", 30),
+                health(&uncovered, "138e1524addb", 30, "qumbra-devnet-t0"),
             ),
         ]
     }
@@ -781,7 +815,7 @@ mod tests {
     #[test]
     fn a_hostile_genesis_hash_cannot_break_the_document() {
         let t = Telemetry::assemble(1, None, 0, 0, 0, 0, MAX_LAG);
-        let s = health(&t, "a\"b\\c\nd", 30);
+        let s = health(&t, "a\"b\\c\nd", 30, "qumbra-devnet-t0");
         let v = parse(&s); // would panic on malformed JSON
         assert_eq!(
             v["genesis_file_hash"], "a\"b\\c\nd",

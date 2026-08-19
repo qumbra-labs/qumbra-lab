@@ -1,4 +1,4 @@
-//! The projection's listener: `GET`-only, three routes, everything else refused.
+//! The projection's listener: `GET`-only, everything not named here refused.
 //!
 //! ```text
 //!   GET  /v1/health.json   the chain-health projection (pre-serialized, swapped by
@@ -6,10 +6,21 @@
 //!   GET  /v1/txlist?from=&to=
 //!                          the transaction-EXISTENCE list (issue #326, D1/D2/D3),
 //!                          encoded per request from the run loop's snapshot
-//!   GET  /healthz          "ok" — for a supervisor, no state
+//!   GET  /v1/blocks?from=&to=
+//!                          per-height block facts (lab #486 items 1+3), snapshot
+//!   GET  /v1/names/events?from=&to=
+//!                          the name-event feed (lab #486 item 6), snapshot
+//!   GET  /v1/checkpoints   the finality ticker (lab #486 item 2, pre-serialized)
+//!   GET  /v1/vitals        net vitals over time (lab #486 item 4, pre-serialized)
+//!   GET  /healthz          "ok" — for a supervisor; 503 "degraded" once a
+//!                          projection writer has observed a poisoned lock
 //!   GET  <anything>        404 JSON, and the body says why there is no /v1/tx/…
 //!   non-GET                405 with `Allow: GET`
 //! ```
+//!
+//! Every response carries `Cache-Control: no-store` — set at the source, so the
+//! property survives any proxy change (the 71-minute CDN-frozen `health.json`
+//! of lab #486 stage-0 finding (a)).
 //!
 //! 🔴 **`/v1/txlist/<txid>` is a 404 by shape, and that is D2** — the decision
 //! brief's refusal of a lookup-by-id, enforced by there being no arm that could
@@ -35,9 +46,11 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::blocks::{self, BlocksView};
+use crate::names::{self, NameEventsView};
 use crate::txlist::{self, TxListView};
 
 /// The chain-health route. Caddy path-routes `/v1/*` here (issue #281); the prefix
@@ -49,6 +62,27 @@ pub const HEALTH_PATH: &str = "/v1/health.json";
 /// **Range-only.** There is no `/v1/txlist/<txid>` and no `?txid=` — D2 is
 /// structural here, not a check.
 pub const TXLIST_PATH: &str = "/v1/txlist";
+
+/// The finality ticker route (lab #486 item 2). Parameterless — the run loop
+/// pre-serializes the bounded tail exactly as it does the health document.
+pub const CHECKPOINTS_PATH: &str = "/v1/checkpoints";
+
+/// The net-vitals series (lab #486 item 4). Parameterless and bounded (24 h of
+/// 60 s samples), pre-serialized by the run loop when a sample is appended.
+pub const VITALS_PATH: &str = "/v1/vitals";
+
+/// The block ticker / chart data route (lab #486 items 1 + 3). **Range-only**;
+/// there is no `/v1/blocks/<height>` and no `/v1/block/<hash>` — the D2 rule
+/// extends to every new route (a by-height ask is cheap to correlate too, and a
+/// range costs the asker nothing).
+pub const BLOCKS_PATH: &str = "/v1/blocks";
+
+/// The name-event feed (lab #486 scope item 6). **Range-only**, like every
+/// route here: no `/v1/names/<name>` arm exists, and a `name=` query parameter
+/// is refused BY NAME below (the node's own `/v1/names` precedent, #381) —
+/// silently serving the unfiltered range to a client that asked a filtered
+/// question would be worse than either answer.
+pub const NAMES_EVENTS_PATH: &str = "/v1/names/events";
 
 /// What a 404 explains, once, in the place a probe for `/v1/tx/…` or
 /// `/v1/address/…` actually lands (issue #235's exclusion, stated where it is
@@ -63,13 +97,19 @@ pub const TXLIST_PATH: &str = "/v1/txlist";
 /// deliberately no way to ask this server about one transaction. A 404 that still
 /// said "no transaction lookup of any kind" would be read as *"the list is not
 /// built yet"*, which is the opposite of the decision.
-const NOT_FOUND_BODY: &str = "{\"refusal\":\"not_found\",\"detail\":\"This explorer \
-serves /v1/health.json, /v1/txlist?from=&to= and /healthz only. The transaction \
-list is bulk-only and matched client-side: there is deliberately NO lookup by \
-transaction id, because asking this server about one transaction tells it which \
-transaction you care about. There is no address, balance or note lookup at all — \
-Qumbra is a single shielded pool and the chain carries none of it. The \
-human-readable page is served separately from these routes.\"}\n";
+fn not_found_body() -> String {
+    format!(
+        "{{\"refusal\":\"not_found\",\"detail\":\"This explorer serves {HEALTH_PATH}, \
+         {TXLIST_PATH}?from=&to=, {BLOCKS_PATH}?from=&to=, {NAMES_EVENTS_PATH}?from=&to=, \
+         {CHECKPOINTS_PATH}, {VITALS_PATH} and /healthz only. The lists are bulk-only and \
+         matched client-side: \
+         there is deliberately NO lookup by transaction id and NO lookup by name, because \
+         asking this server about one thing tells it which thing you care about. There is \
+         no address, balance or note lookup at all — Qumbra is a single shielded pool and \
+         the chain carries none of it. The human-readable page is served separately from \
+         these routes.\"}}\n"
+    )
+}
 
 /// A named bad-bounds refusal for [`TXLIST_PATH`], in the same typed shape.
 ///
@@ -78,6 +118,32 @@ human-readable page is served separately from these routes.\"}\n";
 /// request was malformed"* — the same rule `/v1/nullifiers` states for itself.
 fn bad_bounds(detail: &str) -> String {
     format!("{{\"refusal\":\"bad_bounds\",\"detail\":\"{detail}\"}}\n")
+}
+
+/// Publish a pre-serialized document into its slot, **writing through a
+/// poisoned lock** and reporting whether poison was observed.
+///
+/// This replaces the silent `if let Ok(mut p) = page.write()` swallow at the
+/// run loop (stage-0 finding (a)'s hardening, promoted to stage-1 scope by the
+/// stage-0 review): that shape darks a projection **forever, with no log
+/// line**, the first time any writer panics while holding the lock — while
+/// `/healthz` keeps answering `ok`. Writing through is safe here because the
+/// payload is a whole replacement `String` — there is no torn intermediate
+/// state a panic could have left that the overwrite does not erase. The
+/// caller's half of the contract: on `true`, say so LOUDLY and flip the
+/// [`Surfaces::degraded`] flag so `/healthz` stops attesting health it cannot
+/// vouch for.
+pub fn publish(slot: &RwLock<String>, body: String) -> bool {
+    match slot.write() {
+        Ok(mut p) => {
+            *p = body;
+            false
+        }
+        Err(poisoned) => {
+            *poisoned.into_inner() = body;
+            true
+        }
+    }
 }
 
 /// One `u64` query parameter, or `None` if it is missing or does not parse.
@@ -118,6 +184,89 @@ pub fn respond_txlist(view: &TxListView, query: &str) -> Result<String, (u16, St
     Ok(txlist::document(&txlist::page(view, from, to)))
 }
 
+/// The socket-free `/v1/blocks` core — the txlist refusals verbatim.
+pub fn respond_blocks(view: &BlocksView, query: &str) -> Result<String, (u16, String)> {
+    let usage = "missing or unparseable bound. This route is bulk-only: GET \
+                 /v1/blocks?from=<height>&to=<height>";
+    let from = query_u64(query, "from").ok_or((400, bad_bounds(usage)))?;
+    let to = query_u64(query, "to").ok_or((400, bad_bounds(usage)))?;
+    if to < from {
+        return Err((400, bad_bounds("'to' is below 'from'")));
+    }
+    Ok(blocks::document(&blocks::page(view, from, to)))
+}
+
+/// The socket-free `/v1/names/events` core — the txlist refusals, plus the
+/// resolve-by-name refusal BY NAME (D2's fifth application; the node's own
+/// `/v1/names` precedent): a `name=` parameter must not be silently ignored,
+/// because the unfiltered range answered to a filtered question reads as
+/// "this name has no events".
+pub fn respond_names(view: &NameEventsView, query: &str) -> Result<String, (u16, String)> {
+    if query.split('&').any(|kv| kv.split_once('=').is_some_and(|(k, _)| k == "name")) {
+        return Err((
+            400,
+            "{\"refusal\":\"no_resolve_by_name\",\"detail\":\"There is deliberately NO \
+             lookup by name (D2): sync the range and match locally. Asking this server \
+             about one name tells it which name you care about.\"}\n"
+                .to_string(),
+        ));
+    }
+    let usage = "missing or unparseable bound. This route is bulk-only: GET \
+                 /v1/names/events?from=<height>&to=<height>";
+    let from = query_u64(query, "from").ok_or((400, bad_bounds(usage)))?;
+    let to = query_u64(query, "to").ok_or((400, bad_bounds(usage)))?;
+    if to < from {
+        return Err((400, bad_bounds("'to' is below 'from'")));
+    }
+    Ok(names::document(&names::page(view, from, to)))
+}
+
+/// Every surface this listener serves, held the way its route needs: parameterless
+/// documents pre-serialized by the run loop, range routes encoded per request from
+/// an `Arc` snapshot the run loop swaps (see [`ExplorerServer::start`]).
+pub struct Surfaces {
+    /// `/v1/health.json` — pre-serialized.
+    pub health: Arc<RwLock<String>>,
+    /// `/v1/txlist?from=&to=` — snapshot, encoded per request.
+    pub txlist: Arc<Mutex<Arc<TxListView>>>,
+    /// `/v1/checkpoints` — pre-serialized.
+    pub checkpoints: Arc<RwLock<String>>,
+    /// `/v1/vitals` — pre-serialized.
+    pub vitals: Arc<RwLock<String>>,
+    /// `/v1/blocks?from=&to=` — snapshot, encoded per request.
+    pub blocks: Arc<Mutex<Arc<BlocksView>>>,
+    /// `/v1/names/events?from=&to=` — snapshot, encoded per request.
+    pub names: Arc<Mutex<Arc<NameEventsView>>>,
+    /// Set by the run loop when [`publish`] observed a poisoned lock — a writer
+    /// panicked at some point in process history. The projections keep serving
+    /// (publish writes through), but `/healthz` answers **503 `degraded`**
+    /// instead of `ok`: a process that has eaten a panic in its serving path
+    /// must not keep attesting health it cannot vouch for (stage-0 finding
+    /// (a)'s exact complaint, inverted).
+    pub degraded: Arc<AtomicBool>,
+}
+
+impl Default for Surfaces {
+    /// Empty-but-honest defaults for every surface — each pre-serialized slot
+    /// holds its document's real empty state, never a blank string, so a test
+    /// (the only caller that defaults; the binary always projects before it
+    /// binds) still serves parseable documents on the routes it is not
+    /// exercising.
+    fn default() -> Self {
+        Surfaces {
+            health: Arc::new(RwLock::new("{}".to_string())),
+            txlist: Arc::new(Mutex::new(Arc::new(TxListView::default()))),
+            checkpoints: Arc::new(RwLock::new(crate::checkpoints::document(
+                &crate::checkpoints::CheckpointsView::default(),
+            ))),
+            vitals: Arc::new(RwLock::new(crate::vitals::VitalsRing::new().document())),
+            blocks: Arc::new(Mutex::new(Arc::new(BlocksView::default()))),
+            names: Arc::new(Mutex::new(Arc::new(NameEventsView::default()))),
+            degraded: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 pub struct ExplorerServer {
     addr: SocketAddr,
     server: Arc<tiny_http::Server>,
@@ -138,11 +287,9 @@ impl ExplorerServer {
     /// slow reader can never hold the snapshot while the run loop wants to replace
     /// it. Neither path touches node state, which is the property that keeps a
     /// hostile client off the consensus loop.
-    pub fn start(
-        addr: &str,
-        page: Arc<RwLock<String>>,
-        txlist: Arc<Mutex<Arc<TxListView>>>,
-    ) -> io::Result<ExplorerServer> {
+    pub fn start(addr: &str, surfaces: Surfaces) -> io::Result<ExplorerServer> {
+        let Surfaces { health: page, txlist, checkpoints, vitals, blocks, names, degraded } =
+            surfaces;
         let server = tiny_http::Server::http(addr)
             .map_err(|e| io::Error::other(format!("listen_addr {addr}: {e}")))?;
         let server = Arc::new(server);
@@ -183,11 +330,65 @@ impl ExplorerServer {
                             }
                         }
                     }
+                    (tiny_http::Method::Get, CHECKPOINTS_PATH) => {
+                        let body = checkpoints
+                            .read()
+                            .map(|p| p.clone())
+                            .unwrap_or_else(|e| e.into_inner().clone());
+                        (200, body, &b"application/json; charset=utf-8"[..], false)
+                    }
+                    (tiny_http::Method::Get, VITALS_PATH) => {
+                        let body = vitals
+                            .read()
+                            .map(|p| p.clone())
+                            .unwrap_or_else(|e| e.into_inner().clone());
+                        (200, body, &b"application/json; charset=utf-8"[..], false)
+                    }
+                    (tiny_http::Method::Get, BLOCKS_PATH) => {
+                        let snapshot = match blocks.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(p) => Arc::clone(&p.into_inner()),
+                        };
+                        match respond_blocks(&snapshot, query) {
+                            Ok(doc) => {
+                                (200, doc, &b"application/json; charset=utf-8"[..], false)
+                            }
+                            Err((code, msg)) => {
+                                (code, msg, &b"application/json; charset=utf-8"[..], false)
+                            }
+                        }
+                    }
+                    (tiny_http::Method::Get, NAMES_EVENTS_PATH) => {
+                        let snapshot = match names.lock() {
+                            Ok(g) => Arc::clone(&g),
+                            Err(p) => Arc::clone(&p.into_inner()),
+                        };
+                        match respond_names(&snapshot, query) {
+                            Ok(doc) => {
+                                (200, doc, &b"application/json; charset=utf-8"[..], false)
+                            }
+                            Err((code, msg)) => {
+                                (code, msg, &b"application/json; charset=utf-8"[..], false)
+                            }
+                        }
+                    }
                     (tiny_http::Method::Get, "/healthz") => {
-                        (200, "ok\n".to_string(), &b"text/plain; charset=utf-8"[..], false)
+                        if degraded.load(Ordering::Relaxed) {
+                            (
+                                503,
+                                "degraded: a projection writer observed a poisoned lock \
+                                 (a panic happened in this process); the documents still \
+                                 serve — see the process log\n"
+                                    .to_string(),
+                                &b"text/plain; charset=utf-8"[..],
+                                false,
+                            )
+                        } else {
+                            (200, "ok\n".to_string(), &b"text/plain; charset=utf-8"[..], false)
+                        }
                     }
                     (tiny_http::Method::Get, _) => {
-                        (404, NOT_FOUND_BODY.to_string(), &b"application/json; charset=utf-8"[..], false)
+                        (404, not_found_body(), &b"application/json; charset=utf-8"[..], false)
                     }
                     _ => (
                         405,
@@ -197,11 +398,25 @@ impl ExplorerServer {
                     ),
                 };
 
+                // 🔴 `Cache-Control: no-store` on EVERY response this listener
+                // emits, at the SOURCE. The live incident behind this (lab #486
+                // stage-0 finding (a), root-caused by T-ops): a CDN default-cached
+                // `/v1/health.json` for 71 minutes while its own body said
+                // `refresh_secs: 30` — every reader saw a frozen page and the only
+                // way to tell it from a wedged binary was host access. The proxy
+                // layer's copy of this header is the fast half; the binary owns the
+                // property so it survives any future proxy change. Uniform over
+                // refusals and `/healthz` too: a cached 404 or a cached `ok` is
+                // also a lie about the present.
                 let mut response = tiny_http::Response::from_string(body)
                     .with_status_code(code)
                     .with_header(
                         tiny_http::Header::from_bytes(&b"Content-Type"[..], content_type)
                             .expect("static content type parses"),
+                    )
+                    .with_header(
+                        tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..])
+                            .expect("static cache-control parses"),
                     );
                 if allow {
                     if let Ok(h) = tiny_http::Header::from_bytes(&b"Allow"[..], &b"GET"[..]) {
@@ -263,21 +478,39 @@ mod tests {
         exchange(addr, &format!("GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
     }
 
+    /// A full surface set with defaults, so a test builds only what it exercises.
+    fn surfaces(page: &str) -> Surfaces {
+        Surfaces { health: Arc::new(RwLock::new(page.to_string())), ..Surfaces::default() }
+    }
+
+    fn start(s: &Surfaces) -> ExplorerServer {
+        ExplorerServer::start(
+            "127.0.0.1:0",
+            Surfaces {
+                health: Arc::clone(&s.health),
+                txlist: Arc::clone(&s.txlist),
+                checkpoints: Arc::clone(&s.checkpoints),
+                vitals: Arc::clone(&s.vitals),
+                blocks: Arc::clone(&s.blocks),
+                names: Arc::clone(&s.names),
+                degraded: Arc::clone(&s.degraded),
+            },
+        )
+        .expect("bind")
+    }
+
     fn server_with(page: &str) -> (ExplorerServer, Arc<RwLock<String>>) {
-        let (server, handle, _) = server_with_txlist(page, TxListView::default());
-        (server, handle)
+        let s = surfaces(page);
+        (start(&s), s.health)
     }
 
     fn server_with_txlist(
         page: &str,
         view: TxListView,
     ) -> (ExplorerServer, Arc<RwLock<String>>, Arc<Mutex<Arc<TxListView>>>) {
-        let handle = Arc::new(RwLock::new(page.to_string()));
-        let list = Arc::new(Mutex::new(Arc::new(view)));
-        let server =
-            ExplorerServer::start("127.0.0.1:0", Arc::clone(&handle), Arc::clone(&list))
-                .expect("bind");
-        (server, handle, list)
+        let s = surfaces(page);
+        *s.txlist.lock().unwrap() = Arc::new(view);
+        (start(&s), Arc::clone(&s.health), s.txlist)
     }
 
     /// A view shaped like the live chain: transaction blocks at 4913 and 5398,
@@ -385,6 +618,81 @@ mod tests {
             v["detail"].as_str().expect("detail").contains("deliberately"),
             "the exclusion is stated, not implied"
         );
+    }
+
+    // ---- the loud swallow + degraded healthz (lab #486 stage-1 hardening) ------
+
+    /// 🔴 [`publish`] writes THROUGH a poisoned lock and reports it: the old
+    /// `if let Ok` swallow darked the projection forever with no log line; now
+    /// the poison is survived AND surfaced. The panicking writer here is a
+    /// stand-in for any writer panic in process history.
+    #[test]
+    fn publish_writes_through_a_poisoned_lock_and_reports_it() {
+        let slot = Arc::new(RwLock::new("before".to_string()));
+        assert!(!publish(&slot, "healthy".to_string()), "a healthy lock reports no poison");
+        assert_eq!(*slot.read().unwrap(), "healthy");
+
+        let poisoner = Arc::clone(&slot);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.write().unwrap();
+            panic!("a writer dies while holding the lock");
+        })
+        .join();
+        assert!(slot.write().is_err(), "the lock is genuinely poisoned");
+
+        assert!(publish(&slot, "after".to_string()), "poison is REPORTED, not swallowed");
+        let served = slot.read().map(|p| p.clone()).unwrap_or_else(|e| e.into_inner().clone());
+        assert_eq!(served, "after", "…and the projection is NOT dark: readers see the new body");
+    }
+
+    /// Once the degraded flag is set, `/healthz` stops attesting health: 503
+    /// with a body that names the condition — never `ok` from a process that
+    /// has eaten a panic in its serving path. The JSON routes keep serving.
+    #[test]
+    fn healthz_reports_degraded_after_a_poison_observation() {
+        let s = surfaces("{\"v\":1}");
+        let server = start(&s);
+        assert!(get(server.addr(), "/healthz").starts_with("HTTP/1.1 200"));
+
+        s.degraded.store(true, Ordering::Relaxed);
+        let resp = get(server.addr(), "/healthz");
+        assert!(resp.starts_with("HTTP/1.1 503"), "{resp}");
+        assert!(resp.contains("degraded"), "{resp}");
+        assert!(resp.contains("poisoned lock"), "the body names the condition: {resp}");
+        let health = get(server.addr(), HEALTH_PATH);
+        assert!(health.starts_with("HTTP/1.1 200"), "the documents still serve: {health}");
+        server.shutdown();
+    }
+
+    /// 🔴 Every response this listener emits carries `Cache-Control: no-store`
+    /// — the JSON documents, the refusals, `/healthz`, all of it. The lab #486
+    /// stage-0 live finding: a CDN default-cached `health.json` for 71 minutes
+    /// because nothing at the source said not to.
+    #[test]
+    fn every_response_carries_cache_control_no_store() {
+        let s = surfaces("{\"v\":1}");
+        let server = start(&s);
+        let addr = server.addr();
+        for probe in [
+            HEALTH_PATH,
+            "/v1/txlist?from=0&to=10",
+            "/v1/txlist",             // 400
+            CHECKPOINTS_PATH,
+            VITALS_PATH,
+            "/v1/blocks?from=0&to=10",
+            "/v1/names/events?from=0&to=10",
+            "/healthz",
+            "/v1/tx/abc",             // 404
+        ] {
+            let resp = get(addr, probe);
+            assert!(resp.contains("Cache-Control: no-store"), "{probe}: {resp}");
+        }
+        let post = exchange(
+            addr,
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        );
+        assert!(post.contains("Cache-Control: no-store"), "the 405 too: {post}");
+        server.shutdown();
     }
 
     #[test]
@@ -540,6 +848,190 @@ mod tests {
         );
         assert!(resp.starts_with("HTTP/1.1 405"), "{resp}");
         assert!(resp.contains("Allow: GET"), "{resp}");
+        server.shutdown();
+    }
+
+    // ---- the blocks route (lab #486 items 1 + 3) --------------------------------
+
+    #[test]
+    fn the_blocks_route_serves_the_document_over_a_real_socket() {
+        let s = surfaces("{}");
+        *s.blocks.lock().unwrap() = Arc::new(crate::blocks::BlocksView {
+            blocks: vec![crate::blocks::BlockFacts {
+                height: 42,
+                block_hash: [0xe0; 32],
+                timestamp: 1_787_039_600,
+                difficulty: 2_837,
+                body_commitment: [0xab; 32],
+                txs: 0,
+                coinbase: 4_979_012_345,
+            }],
+            tip_height: 42,
+            tip_hash: Some([0xfe; 32]),
+        });
+        let server = start(&s);
+        let resp = get(server.addr(), "/v1/blocks?from=42&to=42");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("JSON off the wire");
+        assert_eq!(v["v"], crate::blocks::BLOCKS_VERSION);
+        assert_eq!(v["blocks"][0]["difficulty"], 2_837);
+        assert_eq!(v["range"]["covered_to"], 42);
+        server.shutdown();
+    }
+
+    /// D2 extends to this route: no by-height path, no by-hash path, and bad
+    /// bounds are the named refusal.
+    #[test]
+    fn the_blocks_route_has_no_by_height_form_and_names_its_refusals() {
+        let s = surfaces("{}");
+        let server = start(&s);
+        for probe in ["/v1/blocks/42", "/v1/block/42", "/v1/blocks/by-hash/aabb"] {
+            let resp = get(server.addr(), probe);
+            assert!(resp.starts_with("HTTP/1.1 404"), "{probe}: {resp}");
+        }
+        for probe in ["/v1/blocks", "/v1/blocks?from=9&to=3"] {
+            let resp = get(server.addr(), probe);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{probe}: {resp}");
+            let v: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("JSON");
+            assert_eq!(v["refusal"], "bad_bounds", "{probe}");
+        }
+        server.shutdown();
+    }
+
+    // ---- the name-event feed route (lab #486 scope item 6) --------------------
+
+    fn feed_view() -> crate::names::NameEventsView {
+        crate::names::NameEventsView {
+            events: vec![crate::names::NameEvent {
+                height: 19_012,
+                kind: crate::names::EventKind::Commit { commit: [0x9a; 32] },
+            }],
+            tip_height: 19_100,
+            tip_hash: Some([0xfe; 32]),
+        }
+    }
+
+    #[test]
+    fn the_names_events_route_serves_the_document_over_a_real_socket() {
+        let s = surfaces("{}");
+        *s.names.lock().unwrap() = Arc::new(feed_view());
+        let server = start(&s);
+        let resp = get(server.addr(), "/v1/names/events?from=19000&to=19100");
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        let v: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("JSON off the wire");
+        assert_eq!(v["v"], crate::names::NAMES_VERSION);
+        assert_eq!(v["events"][0]["kind"], "commit");
+        assert!(v.get("boundary_height").is_some(), "the dark-ship field rides every page");
+        server.shutdown();
+    }
+
+    /// 🔴 Resolve-by-name is refused BY NAME (D2, the node's `/v1/names`
+    /// precedent) — never a silently unfiltered answer, and never an echo of the
+    /// asked-about name.
+    #[test]
+    fn a_name_query_parameter_is_refused_by_name_and_not_echoed() {
+        let s = surfaces("{}");
+        *s.names.lock().unwrap() = Arc::new(feed_view());
+        let server = start(&s);
+        for probe in [
+            "/v1/names/events?name=larry",
+            "/v1/names/events?from=0&to=10&name=larry",
+        ] {
+            let resp = get(server.addr(), probe);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{probe}: {resp}");
+            let v: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("JSON");
+            assert_eq!(v["refusal"], "no_resolve_by_name", "{probe}");
+            assert!(!resp.contains("larry"), "the name is not echoed back: {resp}");
+        }
+        // And no by-name PATH exists either — 404 by shape, like every by-id form.
+        let resp = get(server.addr(), "/v1/names/larry");
+        assert!(resp.starts_with("HTTP/1.1 404"), "{resp}");
+        server.shutdown();
+    }
+
+    // ---- the finality ticker route (lab #486 scope item 2) ---------------------
+
+    /// The checkpoints route serves the pre-serialized document, the default is
+    /// the honest empty state (parseable, versioned, empty list — never a blank),
+    /// and the run loop's swap reaches readers — the health.json seam, verbatim.
+    #[test]
+    fn the_checkpoints_route_serves_and_a_swap_is_visible() {
+        let s = surfaces("{}");
+        let server = start(&s);
+        let resp = get(server.addr(), CHECKPOINTS_PATH);
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains("application/json"), "{resp}");
+        let v: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("JSON off the wire");
+        assert_eq!(v["v"], crate::checkpoints::CHECKPOINTS_VERSION);
+        assert!(v["history_from_height"].is_null(), "fresh: no history, and it says so");
+        assert_eq!(v["checkpoints"].as_array().unwrap().len(), 0);
+
+        *s.checkpoints.write().unwrap() = crate::checkpoints::document(
+            &crate::checkpoints::view_of_tail(Some(16), None, &[]),
+        );
+        let after: serde_json::Value =
+            serde_json::from_str(body_of(&get(server.addr(), CHECKPOINTS_PATH))).unwrap();
+        assert_eq!(after["history_from_height"], 16, "the run loop's swap reaches readers");
+        server.shutdown();
+    }
+
+    /// Parameterless means parameterless: a query string is ignored (the document
+    /// has no range to bind), and no by-height or by-fid form exists — D2's shape
+    /// rule, same as every other route here.
+    #[test]
+    fn the_checkpoints_route_has_no_by_id_form() {
+        let s = surfaces("{}");
+        let server = start(&s);
+        for probe in ["/v1/checkpoints/15320", "/v1/checkpoint/15320", "/v1/checkpoints/by-fid/ab"]
+        {
+            let resp = get(server.addr(), probe);
+            assert!(resp.starts_with("HTTP/1.1 404"), "{probe}: {resp}");
+        }
+        server.shutdown();
+    }
+
+    // ---- the vitals route (lab #486 scope item 4) ------------------------------
+
+    /// The vitals route serves the pre-serialized ring document, the default is
+    /// the honest empty state, and the run loop's swap reaches readers.
+    #[test]
+    fn the_vitals_route_serves_and_a_swap_is_visible() {
+        let s = surfaces("{}");
+        let server = start(&s);
+        let resp = get(server.addr(), VITALS_PATH);
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains("application/json"), "{resp}");
+        let v: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("JSON off the wire");
+        assert_eq!(v["v"], crate::vitals::VITALS_VERSION);
+        assert!(v["since"].is_null(), "fresh: nothing sampled, and it says so");
+        assert_eq!(v["samples"].as_array().unwrap().len(), 0);
+
+        let mut ring = crate::vitals::VitalsRing::new();
+        assert!(ring.maybe_push(crate::vitals::Sample {
+            t: 1_787_000_000,
+            peers: 5,
+            mempool: 0,
+            tip_height: 15_761,
+            stall_depth: 0,
+        }));
+        *s.vitals.write().unwrap() = ring.document();
+        let after: serde_json::Value =
+            serde_json::from_str(body_of(&get(server.addr(), VITALS_PATH))).unwrap();
+        assert_eq!(after["since"], 1_787_000_000u64, "the run loop's swap reaches readers");
+        assert_eq!(after["samples"][0]["peers"], 5);
+        server.shutdown();
+    }
+
+    #[test]
+    fn names_events_bad_bounds_are_a_named_refusal() {
+        let s = surfaces("{}");
+        let server = start(&s);
+        for probe in ["/v1/names/events", "/v1/names/events?from=5", "/v1/names/events?from=9&to=3"] {
+            let resp = get(server.addr(), probe);
+            assert!(resp.starts_with("HTTP/1.1 400"), "{probe}: {resp}");
+            let v: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("JSON");
+            assert_eq!(v["refusal"], "bad_bounds", "{probe}");
+        }
         server.shutdown();
     }
 }

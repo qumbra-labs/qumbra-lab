@@ -22,10 +22,14 @@ use qlab_devnet::pow::RandomXPow;
 use qlab_node::round::ObsClock;
 use qlab_p2p::adapter::MiningClock;
 
+use qumbra_explorer::blocks::{self, BlocksView};
+use qumbra_explorer::checkpoints;
 use qumbra_explorer::config::ExplorerConfig;
-use qumbra_explorer::http::{self, ExplorerServer};
+use qumbra_explorer::http::{self, ExplorerServer, Surfaces};
 use qumbra_explorer::json;
+use qumbra_explorer::names::{self, NameEventsView};
 use qumbra_explorer::txlist::{self, TxListView};
+use qumbra_explorer::vitals;
 use qumbra_node::config::NodeConfig;
 use qumbra_node::genesis::GenesisFile;
 use qumbra_node::run::RunningNode;
@@ -92,16 +96,39 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  node listen:    {}", node.listen_addr);
     println!("  dial peers:     {}", node.dial_peers.len());
     println!("  genesis file hash: {}", genesis.hash_hex());
+    println!("  network:        {} (banner label source — served, never hardcoded)", genesis.network);
     println!("  committee keys: 0 (keyless — enforced)");
     println!("  mining:         false (enforced)");
     println!("  extra listeners: none (telemetry_addr/metrics_addr refused — §6.2)");
     println!(
-        "  routes:         {} + {}?from=&to= + /healthz (no page, no write path)",
+        "  routes:         {} + {}?from=&to= + {}?from=&to= + {}?from=&to= + {} + {} \
+         + /healthz (no page, no write path)",
         http::HEALTH_PATH,
-        http::TXLIST_PATH
+        http::TXLIST_PATH,
+        http::BLOCKS_PATH,
+        http::NAMES_EVENTS_PATH,
+        http::CHECKPOINTS_PATH,
+        http::VITALS_PATH
     );
     println!("  tx lookup:      none — bulk list only, matched client-side (D2)");
+    println!("  name lookup:    none — event feed is range-only, resolve refused by name (D2)");
     Ok(())
+}
+
+/// The loud half of the poisoned-lock contract (`http::publish` docs): log the
+/// observation ONCE — the flag latches, so a poisoned lock republished every
+/// tick does not flood the log — and leave /healthz answering `degraded` for
+/// the rest of the process's life. The lock is written through, so the route
+/// keeps serving fresh documents; what is lost is this process's claim to
+/// unqualified health, because some writer panicked to get here.
+fn note_poisoned(route: &str, degraded: &AtomicBool) {
+    if !degraded.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "🔴 {route}: a poisoned page lock was observed and written through — a writer \
+             panicked at some point in this process's history. The document keeps serving; \
+             /healthz now reports 503 degraded. (This line prints once.)"
+        );
+    }
 }
 
 fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
@@ -122,6 +149,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         &node.telemetry(),
         &genesis_hash,
         cfg.refresh_secs,
+        &genesis.network,
     )));
 
     // And project the transaction-existence view once for the same reason: the
@@ -131,11 +159,47 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let txlist_view = Arc::new(Mutex::new(Arc::new(TxListView::default())));
     txlist::refresh_shared(&txlist_view, node.state().chain());
 
+    // The per-height block facts (ticker + charts), projected once pre-bind for
+    // the same first-read rule.
+    let blocks_view = Arc::new(Mutex::new(Arc::new(BlocksView::default())));
+    blocks::refresh_shared(&blocks_view, node.state().chain());
+
+    // The name-event feed, projected once pre-bind for the same first-read rule.
+    // Chain-derived from the persisted riders, so it BACKFILLS: an explorer
+    // rolled after the 19,008 boundary still serves every event from the
+    // boundary's first block (lab #486 stage-0 §4).
+    let names_view = Arc::new(Mutex::new(Arc::new(NameEventsView::default())));
+    names::refresh_shared(&names_view, node.state().chain());
+
+    // The finality ticker, pre-serialized once pre-bind for the same first-read
+    // rule — a fresh or just-restored tracker serves its honest (possibly empty)
+    // history rather than a blank (lab #486 item 2).
+    let mut cp_last: Option<checkpoints::Fingerprint> = None;
+    let cp_first = checkpoints::refreshed_document(&mut cp_last, node.p2p().node().finality())
+        .expect("first render: no fingerprint seen yet");
+    let checkpoints_page = Arc::new(RwLock::new(cp_first));
+
+    // The vitals ring (lab #486 item 4) — the run loop is its only writer, so
+    // the ring itself is unshared; readers see the pre-serialized document. It
+    // starts honestly empty (`since: null`) and fills at the sampling cadence.
+    let mut vitals_ring = vitals::VitalsRing::new();
+    let vitals_page = Arc::new(RwLock::new(vitals_ring.document()));
+
+    // Latched by the loud-publish path below; served by /healthz as a 503.
+    let degraded = Arc::new(AtomicBool::new(false));
+
     // A failure to bind is FATAL, same rule as the faucet's listener.
     let server = ExplorerServer::start(
         &cfg.listen_addr,
-        Arc::clone(&page),
-        Arc::clone(&txlist_view),
+        Surfaces {
+            health: Arc::clone(&page),
+            txlist: Arc::clone(&txlist_view),
+            checkpoints: Arc::clone(&checkpoints_page),
+            vitals: Arc::clone(&vitals_page),
+            blocks: Arc::clone(&blocks_view),
+            names: Arc::clone(&names_view),
+            degraded: Arc::clone(&degraded),
+        },
     )?;
 
     println!("qumbra-explorer running");
@@ -144,6 +208,28 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         "  tx existence:   http://{}{}?from=&to=  (bulk only — no lookup by txid, by design)",
         server.addr(),
         http::TXLIST_PATH
+    );
+    println!(
+        "  blocks:         http://{}{}?from=&to=  (ticker + charts; range-only)",
+        server.addr(),
+        http::BLOCKS_PATH
+    );
+    println!(
+        "  name events:    http://{}{}?from=&to=  (range-only — no resolve-by-name, by design)",
+        server.addr(),
+        http::NAMES_EVENTS_PATH
+    );
+    println!(
+        "  checkpoints:    http://{}{}  (finality ticker; history is process-lifetime \
+         and the document says where it begins)",
+        server.addr(),
+        http::CHECKPOINTS_PATH
+    );
+    println!(
+        "  vitals:         http://{}{}  (peers/mempool over 24 h, sampled every {} s)",
+        server.addr(),
+        http::VITALS_PATH,
+        vitals::SAMPLE_SECS
     );
     println!("  page:           served separately (qumbra-explorer-web) — no / here");
     println!("  node listen:    {}", node.listen_addr());
@@ -177,9 +263,14 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         let t = n.telemetry();
         let seen = json::fingerprint(&t);
         if last_seen != Some(seen) || last_render.elapsed() >= refresh {
-            let body = json::health(&t, &genesis_hash, cfg.refresh_secs);
-            if let Ok(mut p) = page.write() {
-                *p = body;
+            let body = json::health(&t, &genesis_hash, cfg.refresh_secs, &genesis.network);
+            // 🔴 The loud swallow (lab #486 stage-1 scope): `publish` writes
+            // THROUGH a poisoned lock — the projection never darks — and a
+            // poison observation is logged once and latched into /healthz's
+            // degraded answer. The `if let Ok` this replaces could dark the
+            // page forever with no log line while /healthz kept saying ok.
+            if http::publish(&page, body) {
+                note_poisoned(http::HEALTH_PATH, &degraded);
             }
             last_seen = Some(seen);
             last_render = Instant::now();
@@ -190,6 +281,27 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         // known-stale transaction list back for it would be a second staleness
         // rule nobody asked for.
         txlist::refresh_shared(&txlist_view, n.state().chain());
+        blocks::refresh_shared(&blocks_view, n.state().chain());
+        names::refresh_shared(&names_view, n.state().chain());
+        // The finality ticker re-serializes only when the record moved — the
+        // decision rule lives in the library (`checkpoints::refreshed_document`)
+        // for the same testability reason as `json::fingerprint`.
+        if let Some(doc) = checkpoints::refreshed_document(&mut cp_last, n.p2p().node().finality())
+        {
+            if http::publish(&checkpoints_page, doc) {
+                note_poisoned(http::CHECKPOINTS_PATH, &degraded);
+            }
+        }
+        // One vitals sample per cadence interval (the rule lives in the
+        // library; this is the one place the wall clock is read — a clock the
+        // OS cannot answer samples nothing rather than fabricating a t).
+        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            if vitals_ring.maybe_push(vitals::sample_of(now.as_secs(), &t))
+                && http::publish(&vitals_page, vitals_ring.document())
+            {
+                note_poisoned(http::VITALS_PATH, &degraded);
+            }
+        }
     });
 
     server.shutdown();

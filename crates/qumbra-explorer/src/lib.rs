@@ -91,7 +91,11 @@
 //!
 //! [issue #212]: https://github.com/qumbra-labs/qumbra-lab/issues/212
 
+pub mod blocks;
+pub mod checkpoints;
 pub mod config;
 pub mod http;
 pub mod json;
+pub mod names;
 pub mod txlist;
+pub mod vitals;

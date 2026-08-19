@@ -514,13 +514,25 @@ pub enum Next {
 /// lesson: a client that counts entries against a constant it compiled in stops
 /// working the day the server's bound moves, and stops working *silently*.
 pub fn next_after(p: &TxListPage, requested_to: u64) -> Next {
-    let Some(covered) = p.covered_to else {
+    next_from_coverage(p.from, p.covered_to, p.tip_height, requested_to)
+}
+
+/// The same rule over the bare coverage facts, so every range-served surface on
+/// this binary (`/v1/txlist`, `/v1/blocks`, `/v1/names/events`) pages by **one
+/// implementation** instead of three restatements that could drift apart.
+pub fn next_from_coverage(
+    from: u64,
+    covered_to: Option<u64>,
+    tip_height: u64,
+    requested_to: u64,
+) -> Next {
+    let Some(covered) = covered_to else {
         return Next::NoCoverage;
     };
-    if covered < p.from {
-        return Next::Stalled { at: p.from };
+    if covered < from {
+        return Next::Stalled { at: from };
     }
-    if covered >= requested_to.min(p.tip_height) {
+    if covered >= requested_to.min(tip_height) {
         return Next::Done;
     }
     Next::Fetch(covered + 1)

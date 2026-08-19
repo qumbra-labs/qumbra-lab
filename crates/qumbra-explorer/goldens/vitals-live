@@ -1,0 +1,1 @@
+{"v":1,"sample_secs":60,"since":1787000000,"samples":[{"t":1787000000,"peers":5,"mempool":0,"tip_height":15761,"stall_depth":0},{"t":1787000060,"peers":4,"mempool":1,"tip_height":15762,"stall_depth":7}]}
