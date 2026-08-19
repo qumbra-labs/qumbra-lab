@@ -39,6 +39,7 @@ use std::time::Duration;
 use qlab_devnet::body::{TxEntry, TxPublic};
 use qlab_devnet::fees::{posted_fee, ArityBucket};
 use qlab_devnet::header::Hash32;
+use qlab_devnet::params_devnet::{CHECKPOINT_CADENCE_BLOCKS, CHECKPOINT_SIGN_HYSTERESIS_BLOCKS};
 use qlab_devnet::pow::KeccakPow;
 use qlab_disclosure::air::build_disclosure;
 use qlab_disclosure::envelope::Envelope;
@@ -209,8 +210,23 @@ fn a_deposit_credits_once_after_finality_and_every_refusal_names_itself() {
     assert!(node.submit_local_tx(stx), "stranger's admitted");
     assert!(node.try_mine(), "mined");
     assert_eq!(node.tip_height(), 1);
+
+    // Finality advances on the checkpoint cadence grid, not per block: genesis
+    // (slot 0, waived as a bootstrap act) and then 8, 16, … — and a slot signs
+    // only once the tip clears the #269 sign-hysteresis. So the deposit's
+    // height finalizes when slot 8 does. Mine filler past the hysteresis, then
+    // let the committee catch up (the house idiom —
+    // `run.rs::restart_never_equivocates_through_the_run_path`).
+    let slot1 = CHECKPOINT_CADENCE_BLOCKS;
+    while node.tip_height() < slot1 + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS {
+        assert!(node.try_mine(), "filler mined");
+    }
     node.try_checkpoint();
-    assert_eq!(node.finalized_height(), Some(1), "deposit height finalized");
+    assert_eq!(
+        node.finalized_height(),
+        Some(slot1),
+        "deposit height finalized (slot 8 covers height 1)"
+    );
 
     // The depositor's envelope — the first of this test's two real proves.
     let env1 = depositor_envelope(&exchange_addr, &dep1, txid1);
@@ -231,9 +247,9 @@ fn a_deposit_credits_once_after_finality_and_every_refusal_names_itself() {
     assert!(body.contains("\"credited\""), "{body}");
     assert!(body.contains(&format!("\"value\":{}", dep1.value)), "{body}");
     assert!(body.contains(&format!("\"tx_ref\":\"{}\"", hex(&txid1))), "{body}");
-    assert!(body.contains("\"height\":1"), "{body}");
+    assert!(body.contains("\"height\":1,"), "{body}");
     assert!(body.contains(&format!("\"cm\":\"{}\"", hex(&digest_bytes(&dep1.commitment())))), "{body}");
-    assert!(body.contains("\"finalized_height\":1"), "{body}");
+    assert!(body.contains(&format!("\"finalized_height\":{slot1}")), "{body}");
 
     // (b) Replay: the same deposit credits once.
     let (st, body) = post(svc, "/v1/credit", &env1);
@@ -273,27 +289,33 @@ fn a_deposit_credits_once_after_finality_and_every_refusal_names_itself() {
 
     // (f) Finality is a gate, shown as a transition: a second deposit mined
     // ABOVE the finalized head refuses not-finalized, then credits once the
-    // committee finalizes its height. (The test's second and last prove.)
+    // committee's next cadence slot covers its height. (The test's second and
+    // last prove.)
     let anchor2 = node.state().commitment_root();
-    assert!(node.state().is_valid_anchor(&anchor2), "finalized root is an anchor");
+    assert!(node.state().is_valid_anchor(&anchor2), "current root is an anchor");
     let dep2 = Note { value: 33_000, rkm: exchange_addr.rkm_lanes(), rho: [9, 10, 11, 12], rseed: [13, 14, 15, 16] };
     let (tx2, txid2) = deposit_tx(&ek, std::slice::from_ref(&dep2), 0x61, anchor2, &mut rng);
     assert!(node.submit_local_tx(tx2), "second deposit admitted");
     assert!(node.try_mine(), "mined above finality");
-    assert_eq!(node.tip_height(), 2);
-    assert_eq!(node.finalized_height(), Some(1), "height 2 NOT finalized yet");
+    let dep2_height = node.tip_height();
+    assert_eq!(dep2_height, slot1 + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS + 1);
+    assert_eq!(node.finalized_height(), Some(slot1), "deposit 2 NOT finalized yet");
 
     let env2 = depositor_envelope(&exchange_addr, &dep2, txid2);
     let (st, body) = post(svc, "/v1/credit", &env2);
     assert_eq!(st, 409, "{body}");
     assert!(body.contains("\"refusal\":\"not-finalized\""), "{body}");
 
+    let slot2 = 2 * CHECKPOINT_CADENCE_BLOCKS;
+    while node.tip_height() < slot2 + CHECKPOINT_SIGN_HYSTERESIS_BLOCKS {
+        assert!(node.try_mine(), "filler mined");
+    }
     node.try_checkpoint();
-    assert_eq!(node.finalized_height(), Some(2), "committee catches up");
+    assert_eq!(node.finalized_height(), Some(slot2), "committee catches up past the deposit");
     let (st, body) = post(svc, "/v1/credit", &env2);
     assert_eq!(st, 200, "{body}");
-    assert!(body.contains("\"height\":2"), "{body}");
-    assert!(body.contains("\"finalized_height\":2"), "{body}");
+    assert!(body.contains(&format!("\"height\":{dep2_height},")), "{body}");
+    assert!(body.contains(&format!("\"finalized_height\":{slot2}")), "{body}");
 
     // (g) The status surface counts what happened.
     let (st, body) = get(svc, "/v1/status");
