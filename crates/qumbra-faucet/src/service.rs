@@ -39,6 +39,7 @@ use qlab_faucet::{
 use qlab_faucet::ChainView;
 use qlab_node::{MemNode, NodeState};
 use qlab_wallet::address::{Address, Diversifier};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use qlab_wallet::Wallet;
 // `NodeState::is_spent` is how a refused grant's inputs are diagnosed as stale.
 
@@ -188,6 +189,16 @@ pub struct FaucetGate {
     order: VecDeque<u64>,
     receipts: HashMap<u64, RequestState>,
     next_receipt: u64,
+    /// The trace/span context of the HTTP request that queued each receipt, so the
+    /// grant span this service later opens can **link** back to it.
+    ///
+    /// Not a parent: the grant is not inside the request, it is a consequence of it
+    /// minutes later on a different thread, and OTel's word for that edge is a link.
+    ///
+    /// Bounded by the queue: an entry is inserted only when `accept` admits (so at
+    /// most `RequestQueue`'s 32-deep cap are ever live) and removed the moment the
+    /// receipt reaches a terminal state or is served. Nothing accumulates.
+    request_spans: HashMap<u64, opentelemetry::trace::SpanContext>,
 }
 
 impl FaucetGate {
@@ -198,6 +209,7 @@ impl FaucetGate {
             order: VecDeque::new(),
             receipts: HashMap::new(),
             next_receipt: 1,
+            request_spans: HashMap::new(),
         }
     }
 
@@ -232,6 +244,39 @@ impl FaucetGate {
     /// A receipt's current state. `None` = never issued by this process.
     pub fn state_of(&self, receipt: u64) -> Option<RequestState> {
         self.receipts.get(&receipt).cloned()
+    }
+
+    /// Park the requesting span's context against `receipt`. Called by the HTTP
+    /// thread under the same lock that created the receipt.
+    pub fn remember_request_span(
+        &mut self,
+        receipt: u64,
+        cx: opentelemetry::trace::SpanContext,
+    ) {
+        self.request_spans.insert(receipt, cx);
+    }
+
+    /// Read the requesting span's context without consuming it. Used to link the
+    /// grant span on **every** attempt, including the retries that leave the receipt
+    /// queued; the entry is only consumed at a terminal state.
+    pub fn peek_request_span(&self, receipt: u64) -> Option<opentelemetry::trace::SpanContext> {
+        self.request_spans.get(&receipt).cloned()
+    }
+
+    /// Take the requesting span's context back out. **Take, not get** — one grant
+    /// attempt per queued request reaches a terminal state, and leaving the entry
+    /// behind is how a bounded map becomes an unbounded one.
+    pub fn take_request_span(
+        &mut self,
+        receipt: u64,
+    ) -> Option<opentelemetry::trace::SpanContext> {
+        self.request_spans.remove(&receipt)
+    }
+
+    /// The number of parked request span contexts. Exposed so the "nothing
+    /// accumulates" claim above is a test rather than a comment.
+    pub fn parked_request_spans(&self) -> usize {
+        self.request_spans.len()
     }
 
     /// The receipt at the head of the queue — the one `dispense` is about to serve.
@@ -371,8 +416,50 @@ impl FaucetService {
     ) -> ServeReport {
         let mut report = ServeReport::default();
 
+        // 🔴 **Spans are opened only on a tick that has a request to serve, and the
+        // gate for that is one `head()` under a lock this tick takes anyway.**
+        //
+        // This is the correction the baton's "child spans where the handler does
+        // real stages" needs to survive contact with the loop it lives on.
+        // `RunningNode::run_until_with` sleeps 20 ms per iteration, so this closure
+        // runs ~50x/s forever. A span tree per tick would be ~150 spans/s of "the
+        // queue was empty", permanently, on a service whose real traffic is a
+        // handful of grants an hour — a collector bill and a haystack, with the two
+        // spans anyone wants to look at buried in it.
+        //
+        // The cost of the rule is named rather than hidden: a tick that funds
+        // matured coinbase but has nothing queued emits no span. Funding is already
+        // reported through `ServeReport::harvest` and the operator's `FAUCET funded`
+        // line, and turning it into an event belongs with whoever wires the
+        // collector, not here.
+        let pending = self.lock_gate().head();
+        let grant_span = match pending {
+            Some(receipt) => {
+                let span = tracing::info_span!(
+                    "faucet.grant",
+                    "faucet.receipt" = receipt,
+                    "faucet.outcome" = tracing::field::Empty,
+                );
+                // The link back to the HTTP request that queued this receipt. A
+                // link, not a parent: the request answered 202 and closed its span
+                // long before this tick ran.
+                if let Some(cx) = self.lock_gate().peek_request_span(receipt) {
+                    span.add_link(cx);
+                }
+                span
+            }
+            None => tracing::Span::none(),
+        };
+        let _grant = grant_span.enter();
+
         // (1) Funding. The frozen §2 maturity gate is applied here — see `harvest`.
         {
+            let harvest_span = if pending.is_some() {
+                tracing::info_span!("faucet.harvest")
+            } else {
+                tracing::Span::none()
+            };
+            let _h = harvest_span.enter();
             // `self.gate` and `self.harvested` are disjoint fields, so the lock is
             // taken inline rather than through `lock_gate(&self)` — which would
             // borrow all of `self`.
@@ -385,7 +472,20 @@ impl FaucetService {
         self.maturing = report.harvest.maturing;
 
         // (2) Serve at most one request.
+        //
+        // The span is named `faucet.prove` and not `faucet.dispense` because what an
+        // operator is looking for in it is the ~2.3 s 2x2 STARK. `Faucet::dispense`
+        // plans, selects, proves and books in one call and takes `&mut self`, so
+        // there is no seam out here at which the proof could be spanned on its own —
+        // the module docs above record that, and this name inherits the caveat: the
+        // span is dispense's, and the proof is its dominant cost.
         let outcome = {
+            let prove_span = if pending.is_some() {
+                tracing::info_span!("faucet.prove")
+            } else {
+                tracing::Span::none()
+            };
+            let _p = prove_span.enter();
             let mut gate = self.lock_gate();
             let receipt = gate.head();
             let view = NodeView(node.chain_state());
@@ -393,22 +493,30 @@ impl FaucetService {
             (receipt, outcome)
         };
         match outcome {
-            (_, DispenseOutcome::Idle) => {}
+            (_, DispenseOutcome::Idle) => {
+                grant_span.record("faucet.outcome", "idle");
+            }
             (_, DispenseOutcome::Stalled(reason)) => {
+                grant_span.record("faucet.outcome", "stalled");
                 report.stalled = Some(stall_text(&reason));
             }
             (receipt, DispenseOutcome::Ready { plan, request }) => {
+                grant_span.record("faucet.outcome", "ready");
                 self.submit(node, *plan, request, receipt, &mut report);
             }
             (_, DispenseOutcome::Retrying { reason }) => {
+                grant_span.record("faucet.outcome", "retrying");
                 report.stalled = Some(format!("build failed, requeued: {reason}"));
             }
             (receipt, DispenseOutcome::Abandoned { request, reason }) => {
+                grant_span.record("faucet.outcome", "abandoned");
                 let _ = request; // never logged: it carries the recipient address
                 let mut gate = self.lock_gate();
                 gate.order.pop_front();
                 if let Some(r) = receipt {
                     gate.receipts.insert(r, RequestState::GaveUp { reason: reason.to_string() });
+                    // Terminal: the parked span context has nothing left to link to.
+                    gate.take_request_span(r);
                 }
                 gate.renumber();
                 report.gave_up = receipt;
@@ -430,6 +538,12 @@ impl FaucetService {
         receipt: Option<u64>,
         report: &mut ServeReport,
     ) {
+        let submit_span = tracing::info_span!(
+            "faucet.submit",
+            "faucet.submitted" = tracing::field::Empty,
+        );
+        let _s = submit_span.enter();
+
         // The faucet's own pre-submit re-check: the anchor lease may have run out
         // while the proof was being built. Declining here costs a proof; submitting
         // an expired one costs a proof AND a rejected transaction.
@@ -446,6 +560,7 @@ impl FaucetService {
 
         match outcome {
             LocalSubmit::Accepted => {
+                submit_span.record("faucet.submitted", true);
                 let mut gate = self.lock_gate();
                 let txid = qlab_node::txid(&plan.entry);
                 let value = plan.grant_value;
@@ -462,9 +577,14 @@ impl FaucetService {
                     );
                 }
                 gate.renumber();
+                if let Some(r) = receipt {
+                    // Terminal, the good way.
+                    gate.take_request_span(r);
+                }
                 report.granted = receipt;
             }
             LocalSubmit::Refused(refusal) => {
+                submit_span.record("faucet.submitted", false);
                 let reason = refusal.to_string();
                 report.refusal_reason = Some(reason.clone());
 
@@ -514,6 +634,8 @@ impl FaucetService {
                                     ),
                                 },
                             );
+                            // Terminal: nothing will link to this request again.
+                            gate.take_request_span(r);
                         }
                         report.gave_up = receipt;
                     }
@@ -668,5 +790,51 @@ mod tests {
         g.renumber();
         assert_eq!(g.state_of(r2), Some(RequestState::Queued { position: 1 }));
         assert_eq!(g.state_of(r3), Some(RequestState::Queued { position: 2 }));
+    }
+
+    /// 🔴 The parked span contexts are a **bounded** map: one entry per live queued
+    /// request, taken back out at the terminal state. The failure this guards
+    /// against is a long-running faucet whose trace-link map grows by one entry per
+    /// request served, forever — a leak whose only symptom is memory.
+    #[test]
+    fn parked_request_span_contexts_do_not_accumulate() {
+        use opentelemetry::trace::{SpanContext, SpanId, TraceFlags, TraceId, TraceState};
+
+        let cx = |n: u128| {
+            SpanContext::new(
+                TraceId::from_bytes(n.to_be_bytes()),
+                SpanId::from_bytes((n as u64).to_be_bytes()),
+                TraceFlags::SAMPLED,
+                false,
+                TraceState::default(),
+            )
+        };
+
+        let mut g = gate();
+        assert_eq!(g.parked_request_spans(), 0, "nothing parked before a request");
+
+        let (r1, _) = g.accept("203.0.113.1", addr(1), None, 0).unwrap();
+        let (r2, _) = g.accept("203.0.113.2", addr(2), None, 1_000).unwrap();
+        g.remember_request_span(r1, cx(1));
+        g.remember_request_span(r2, cx(2));
+        assert_eq!(g.parked_request_spans(), 2);
+
+        // A peek is idempotent — a retried grant links on every attempt.
+        assert_eq!(g.peek_request_span(r1).map(|c| c.span_id()), Some(cx(1).span_id()));
+        assert_eq!(g.peek_request_span(r1).map(|c| c.span_id()), Some(cx(1).span_id()));
+        assert_eq!(g.parked_request_spans(), 2, "a peek must not consume");
+
+        // A take is what a terminal state does, and it happens exactly once.
+        assert_eq!(g.take_request_span(r1).map(|c| c.span_id()), Some(cx(1).span_id()));
+        assert_eq!(g.parked_request_spans(), 1);
+        assert!(g.take_request_span(r1).is_none(), "a second take finds nothing");
+        assert!(g.peek_request_span(r1).is_none());
+
+        assert!(g.take_request_span(r2).is_some());
+        assert_eq!(g.parked_request_spans(), 0, "nothing is left behind");
+
+        // A receipt that never had a context parked (no tracer installed) is not an
+        // error — it is the unit-test configuration, and it must be a plain miss.
+        assert!(g.take_request_span(9_999).is_none());
     }
 }

@@ -78,6 +78,43 @@ rand = "0.10"
 # unification through the qumbra-node dependency above.
 ctrlc = { workspace = true }
 
+# ---------------------------------------------------------------------------
+# OTel adoption — the svc-lane three-piece kit (observability-plan §C.1).
+#
+# 🔴 **These five lines are the entire dependency delta, and they are confined to
+# this leaf binary on purpose.** No `qlab-*` crate gains a dependency: the
+# instrumentation lives at the dispatch seam and at the service tick, both of which
+# are this crate's. The arrow keeps pointing one way.
+#
+# Version-pinned with `=`, the same posture `tiny_http` takes above and for a
+# sharper reason: the OTel Rust stack version-locks across five crates
+# (`tracing-opentelemetry` 0.33 ↔ `opentelemetry` 0.32), so an unpinned minor bump
+# on any one of them is a build break rather than a nuisance. When these are bumped
+# they are bumped together.
+tracing = "=0.1.44"
+# `registry` and nothing else — see the "no fmt layer, ever" decision in
+# `src/telemetry.rs`. A fmt layer would put a second, unreviewed rendering of every
+# span's fields on the operator's stdout next to the redacted journal line.
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["registry", "std"] }
+tracing-opentelemetry = { version = "=0.33.0", default-features = false }
+opentelemetry = { version = "=0.32.0", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "=0.32.1", default-features = false, features = ["trace"] }
+# `trace` only: no OTLP metrics and no OTLP logs. Metrics are Prometheus-pull on a
+# loopback port (piece 3 of the kit) and logs are the existing journal line, so the
+# two other OTLP signals would be dependency weight with no consumer.
+#
+# `internal-logs` is OFF on all three OTel crates. That is what makes "no error/warn
+# spam when export is disabled" structural rather than remembered — there is no path
+# from the SDK to a file descriptor. The cost is named in the PR: a *failing* export
+# is currently silent, and surfacing it belongs with the transport baton that
+# actually has a collector to fail against.
+opentelemetry-otlp = { version = "=0.32.0", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+# Piece 3: the exemplar-carrying histogram. The official Prometheus Rust client —
+# `qumbra-node`'s `/metrics` hand-renders its exposition, which is right for a
+# snapshot with no exemplars and wrong here, because OpenMetrics exemplar syntax is
+# exactly the part nobody should be hand-rendering.
+prometheus-client = "=0.23.1"
+
 [dev-dependencies]
 # The acceptance suite drives the whole HTTP path to a REAL grant against a real
 # in-process node, and then has the requester scan the chain for it with the

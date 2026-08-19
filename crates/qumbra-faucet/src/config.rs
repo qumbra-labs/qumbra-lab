@@ -41,6 +41,14 @@
 //! # the header consulted, and only then by walking right-to-left past trusted
 //! # hops. Deploy-side values (compose bridge subnet, etc.) are the operator's.
 //! # trusted_proxy_cidrs = ["172.18.0.0/16"]
+//!
+//! # OPTIONAL — a Prometheus/OpenMetrics scrape endpoint. Default UNSET = no
+//! # listener at all, the same off-by-default posture `NodeConfig::metrics_addr`
+//! # takes and for the same reason: setting it opens a port. Unlike the node's,
+//! # a NON-LOOPBACK value here is REFUSED rather than warned about — this process
+//! # holds a hot spending key and `listen_addr` is its only reviewed public
+//! # surface (§6.2). See `crate::metrics_server` for the full argument.
+//! # metrics_addr = "127.0.0.1:9451"
 //! ```
 //!
 //! `deny_unknown_fields`, for the same reason `NodeConfig` has it: a typo'd key that
@@ -82,6 +90,11 @@ pub struct FaucetServiceConfig {
     /// honor. Default empty — see module docs and lab #308.
     #[serde(default)]
     pub trusted_proxy_cidrs: Vec<String>,
+    /// Where the OpenMetrics scrape endpoint binds. `None` = not served.
+    ///
+    /// Loopback only, enforced as a **startup refusal** in [`Self::validate`].
+    #[serde(default)]
+    pub metrics_addr: Option<String>,
 }
 
 fn default_listen_addr() -> String {
@@ -102,6 +115,9 @@ pub enum ConfigError {
     /// A secret file is not the expected 32 bytes. Refused rather than padded — a
     /// short seed is a weak key, and a long one is a paste error.
     SecretLength { path: PathBuf, len: usize },
+    /// `metrics_addr` names an address that is not obviously loopback. Refused
+    /// rather than warned about — see [`crate::metrics_server`].
+    PublicMetricsAddr(String),
     /// `mining = true` with no `miner_rkm`, or with one that is not this faucet's:
     /// the node would mine to a key the faucet cannot spend, so the faucet could
     /// never be funded and would never say why.
@@ -132,6 +148,9 @@ impl std::fmt::Display for ConfigError {
                  a short secret is a weak key and a long one is a paste error.",
                 path.display()
             ),
+            ConfigError::PublicMetricsAddr(addr) => {
+                write!(f, "{}", crate::metrics_server::non_loopback_refusal(addr))
+            }
             ConfigError::PayoutMismatch(msg) => write!(f, "{msg}"),
         }
     }
@@ -251,6 +270,16 @@ impl FaucetServiceConfig {
         if self.hd_account() == 0 {
             return Err(ConfigError::AccountZero);
         }
+        // 🔴 Checked HERE, at load, and not only at bind time. `check` validates a
+        // deployment without binding anything, and a `metrics_addr` this process
+        // would refuse to bind must fail that check too — otherwise `check` says
+        // "fine" and `run` refuses, which is the exact shape of the deployment
+        // surprise `deny_unknown_fields` exists to prevent one level up.
+        if let Some(addr) = self.metrics_addr.as_deref() {
+            if !crate::metrics_server::is_loopback_hostport(addr) {
+                return Err(ConfigError::PublicMetricsAddr(addr.to_string()));
+            }
+        }
         Ok(())
     }
 }
@@ -289,6 +318,33 @@ mod tests {
         // spoofable by a client that sets X-Forwarded-For.
         assert!(c.trusted_proxy_cidrs.is_empty(), "default trust set must be empty");
         assert!(c.trusted_proxies().expect("empty parses").is_empty());
+        // The scrape endpoint is OFF unless asked for — `NodeConfig::metrics_addr`'s
+        // posture, and the test that would fail if someone defaulted it to a port.
+        assert!(c.metrics_addr.is_none(), "metrics stays off unless asked for");
+        assert!(c.validate().is_ok());
+    }
+
+    /// 🔴 A non-loopback `metrics_addr` is refused at LOAD, so `check` and `run`
+    /// agree — and the refusal names the address and says why this binary is
+    /// stricter than the node.
+    #[test]
+    fn a_non_loopback_metrics_addr_is_refused_at_load() {
+        let with = |addr: &str| {
+            FaucetServiceConfig::from_toml(&format!("{MINIMAL}\nmetrics_addr = \"{addr}\"\n"))
+                .expect("parse")
+        };
+        for addr in ["0.0.0.0:9451", "[::]:9451", "203.0.113.10:9451", "faucet.example:9451"] {
+            let err = with(addr).validate().unwrap_err();
+            assert!(matches!(err, ConfigError::PublicMetricsAddr(_)), "{addr}");
+            let text = err.to_string();
+            assert!(text.contains(addr), "the refusal must name the address: {text}");
+            assert!(text.contains("hot spending key"), "{text}");
+        }
+        // The three loopback spellings pass, `localhost` included — a node-local
+        // agent is the supported scrape path and that is how compose spells it.
+        for addr in ["127.0.0.1:9451", "[::1]:9451", "localhost:9451"] {
+            assert!(with(addr).validate().is_ok(), "{addr} must be accepted");
+        }
     }
 
     /// A configured trusted-proxy CIDR parses, and a garbage one is refused.
