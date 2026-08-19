@@ -226,7 +226,9 @@ guard_rig() {
 # The latest TELEMETRY line a node has emitted (stdout, captured by docker logs).
 # `|| true`: a node with no telemetry yet (just wiped / not started) makes grep
 # exit non-zero, which would abort the script under `set -o pipefail`.
-latest() { dc logs --no-log-prefix "$1" 2>/dev/null | grep '^TELEMETRY' | tail -1 || true; }
+# Content-anchored, not `^`-anchored (lab #512): the line carries a native UTC
+# stamp now, and this pattern matches both the stamped and pre-#512 formats.
+latest() { dc logs --no-log-prefix "$1" 2>/dev/null | grep 'TELEMETRY tip=' | tail -1 || true; }
 
 # Extract key=value from a telemetry line.
 field() { sed -n "s/.* $2=\([^ ]*\).*/\1/p" <<<"$1"; }
@@ -566,7 +568,7 @@ advertise_mode_of() {
 # have been running longest, and it is a race, so it passes on a short log.
 advertise_node_said_none() {
   local hits
-  hits="$(dc logs --no-log-prefix "$1" 2>/dev/null | grep -c '^no advertise_addr:' || true)"
+  hits="$(dc logs --no-log-prefix "$1" 2>/dev/null | grep -c 'no advertise_addr:' || true)"
   [[ "${hits:-0}" -gt 0 ]] && echo yes || echo no
 }
 
@@ -1404,7 +1406,7 @@ case "$cmd" in
     { echo "=== full telemetry history + refusal reasons, $(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
       for n in "${NODES[@]}"; do
         echo "--- $n telemetry ---"
-        dc logs --no-log-prefix "$n" 2>/dev/null | grep '^TELEMETRY' || true
+        dc logs --no-log-prefix "$n" 2>/dev/null | grep 'TELEMETRY tip=' || true
         echo "--- $n halt/refusal lines ---"
         dc logs --no-log-prefix "$n" 2>/dev/null \
           | grep -E 'halt-height|HALT|halt plan|revision:|refus|above halt height|invalid header' || true

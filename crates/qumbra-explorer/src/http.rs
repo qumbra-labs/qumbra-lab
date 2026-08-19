@@ -522,7 +522,8 @@ impl ExplorerServer {
                 };
                 // Both, and the same string: the operator reads stdout, the test
                 // reads `journal()`, and they are one `format!` — the faucet's
-                // rule, kept.
+                // rule, kept. Stdout additionally carries the journal stamp prefix
+                // (lab #512): print-site metadata, not line content.
                 qlab_devnet::jprintln!("{line}");
                 if let Ok(mut j) = worker_journal.lock() {
                     j.push(line);

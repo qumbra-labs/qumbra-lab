@@ -245,27 +245,29 @@ cadence 8 × 75 s  = 每轮 600 s  =  144 轮/天
 找出所有没 finalize 的轮次及其原因：
 
 ```sh
-grep '^ROUND ' node.log | grep -vE 'why=(finalized|open)'
+grep 'ROUND slot=' node.log | grep -vE 'why=(finalized|open)'
+# （2026-08-19 更正，lab #512：日志行现携带原生 UTC 时间戳前缀，
+#   这些配方锚定行内 token（ROUND slot=），绝不锚定行首 ^。）
 ```
 
 在停滞发生的过程中盯着它（仍然开着的报告）：
 
 ```sh
-grep '^ROUND ' node.log | grep 'why=open'
+grep 'ROUND slot=' node.log | grep 'why=open'
 ```
 
 哪些成员缺席最多（对归档日志，全部轮次）：
 
 ```sh
-grep '^ROUND ' node.log | sed 's/.* absent=\([^ ]*\).*/\1/' | tr ',' '\n' \
+grep 'ROUND slot=' node.log | sed 's/.* absent=\([^ ]*\).*/\1/' | tr ',' '\n' \
   | grep -v '^-$' | sort -n | uniq -c | sort -rn | head
 ```
 
 这次停滞是延迟型还是参与度型？
 
 ```sh
-grep '^ROUND ' node.log | grep -c 'why=timeout'      # 延迟型
-grep '^ROUND ' node.log | grep -c 'why=votes_short'  # 参与度型
+grep 'ROUND slot=' node.log | grep -c 'why=timeout'      # 延迟型
+grep 'ROUND slot=' node.log | grep -c 'why=votes_short'  # 参与度型
 ```
 
 有抓取端之后的 PromQL：

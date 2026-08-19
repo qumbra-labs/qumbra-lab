@@ -47,8 +47,10 @@ use crate::wire::{Envelope, Frame, MsgType};
 pub const SERVICE_FULL: u64 = 0x01;
 
 /// The `DIAL` journal line for one completed outbound connect — `key=value` like
-/// `TELEMETRY`/`ROUND` so the same grep/awk habits work (readers key on the line
-/// prefix, e.g. `deploy/docker/soak.sh`'s `grep '^TELEMETRY'`).
+/// `TELEMETRY`/`ROUND` so the same grep/awk habits work. Readers key on the
+/// line's own tokens, never `^` (lab #512: every journal line now arrives
+/// behind a native UTC stamp, so e.g. `deploy/docker/soak.sh` greps
+/// `'TELEMETRY tip='`, not `'^TELEMETRY'`).
 ///
 /// The duration is logged on failures too, quoting the error last: a dial the
 /// kernel gave up on after its SYN retry ladder (127 s on the deployed hosts —
@@ -76,8 +78,8 @@ fn dial_line(addr: &str, elapsed_ms: u64, result: &Result<PeerId, TransportError
 /// `ACCEPT` (it arrived), `CLOSE` (either one ended) all carry `key=value` with
 /// `addr=` as the shared content anchor, so `grep addr=` covers the whole
 /// lifecycle in both directions while each prefix stays greppable on its own —
-/// the `^TELEMETRY` habit `deploy/docker/soak.sh` already uses keeps working
-/// unchanged.
+/// content-anchored, never `^`-anchored, because the journal stamp (lab #512)
+/// sits ahead of every prefix.
 ///
 /// **Why the capped-out refusal is its own line and not a silent drop.** A node
 /// sitting at [`crate::addrman::MAX_INBOUND`] and a node nobody is dialing emit

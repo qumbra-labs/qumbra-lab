@@ -274,6 +274,10 @@ finding.
 > `grep -c "ROUND slot="`, never `grep -c "^ROUND"`. A `^ROUND` reading of zero
 > was mistaken for a silent journal twice in one day and cost a whole issue
 > (`issue #165`).
+>
+> **Since 2026-08-19 (lab #512)** the binaries stamp every journal line
+> natively (`YYYY-MM-DDTHH:MM:SS.mmmZ `, always UTC), so the same rule now
+> holds on raw `docker logs` output too: content anchors, never `^`.
 
 **Locked by:** `a_live_round_that_genuinely_fails_still_increments_the_alarm`
 (`round.rs:1414`), `out_of_window_vote_sets_cannot_pump_the_alarm`

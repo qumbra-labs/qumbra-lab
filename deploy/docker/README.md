@@ -255,10 +255,17 @@ finalized, stall depth, chain-time age, tip difficulty, peers, mempool, epoch,
 finality regime — reusing the T0-2 `Telemetry` rule). Read it with:
 
 ```sh
-docker compose -f deploy/docker/docker-compose.yml logs -t -f node0   # wall-stamped
+docker compose -f deploy/docker/docker-compose.yml logs -f node0      # stamped natively
 deploy/docker/soak.sh status                                          # one snapshot/node
 deploy/docker/soak.sh sample 3600 60                                  # sample for an hour
 ```
+
+> **Corrected 2026-08-19 (lab #512):** journal lines carry a native UTC stamp
+> (`YYYY-MM-DDTHH:MM:SS.mmmZ `) from this image on, so `docker logs` without
+> `-t` already has a time axis, and archives and live greps see **one** string.
+> Adding `-t` now double-stamps the line (harmless, redundant). Grep by content
+> tokens (`TELEMETRY tip=`, `ROUND slot=`), never `^`-anchored — the house rule
+> `docs/telemetry-field-reference.md` records is now true of the raw log too.
 
 ### The cross-node agreement view (`qumbra-opview`, issue #117)
 

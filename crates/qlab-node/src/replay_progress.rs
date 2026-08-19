@@ -233,6 +233,8 @@ fn emit(line: String) {
     // Flush: docker logs / journald only show lines that have left the buffer,
     // and a silent multi-minute replay is exactly the failure mode this exists
     // to end. Swallow flush errors — a broken stdout must not abort recovery.
+    // The journal stamp (lab #512) rides only the stdout write; the captured
+    // copy below stays the bare line the tests assert on.
     qlab_devnet::jprintln!("{line}");
     let _ = io::stdout().flush();
     if let Ok(mut guard) = CAPTURE.lock() {
