@@ -1308,6 +1308,23 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         coinbase_rkm: [u64; 4],
         nonce: u64,
     ) {
+        let _ = self.announce_block_named(header, txs, coinbase, coinbase_rkm, nonce);
+    }
+
+    /// The own-mined ingest path with a named outcome (lab #511).
+    ///
+    /// Byte-identical to [`Self::announce_block`] except the caller learns
+    /// whether ingest accepted, duplicated, orphaned, rejected, or ignored.
+    /// POST `/v1/mine/block` is this method: same `ingest_block` then announce,
+    /// refusals named rather than swallowed.
+    pub fn announce_block_named(
+        &mut self,
+        header: BlockHeader,
+        txs: Vec<TxEntry>,
+        coinbase: u64,
+        coinbase_rkm: [u64; 4],
+        nonce: u64,
+    ) -> IngestOutcome {
         let bh = header.header_hash_for(self.node.genesis_form());
         // Ingest first, and do not put on the wire what our own node rejects
         // (issue #77, the own-announce seam): a locally-produced header/body pair
@@ -1326,7 +1343,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // `Orphan` deliberately still announces: it is not a refusal, and the orphan
         // sync-kick on the receiving side is how a gap gets closed.
         if matches!(outcome, IngestOutcome::Rejected(_) | IngestOutcome::Ignored(_)) {
-            return;
+            return outcome;
         }
         self.blocks.insert(header.height, bh, txs.clone(), coinbase, coinbase_rkm);
         self.seen.insert(bh);
@@ -1338,6 +1355,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         for pid in self.peers.ready_peers() {
             self.send(pid, MsgType::BlockAnnounce, payload.clone());
         }
+        outcome
     }
 
     // --- the driver ---
