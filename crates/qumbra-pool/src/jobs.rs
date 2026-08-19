@@ -42,6 +42,7 @@ pub struct IssuedJob {
     pub seed_hash: [u8; 32],
     pub next_seed_hash: Option<[u8; 32]>,
     pub form: GenesisForm,
+    pub consensus_difficulty: u64,
     pub stale: bool,
 }
 
@@ -104,6 +105,7 @@ mod tests {
             seed_hash: [0; 32],
             next_seed_hash: None,
             form: GenesisForm::V5,
+            consensus_difficulty: 1,
             stale: false,
         });
         assert!(!store.is_stale("j1"));
