@@ -436,10 +436,19 @@ impl MemChainStore {
     /// heaviest-chain tie-break keeps it as the incumbent tip.
     ///
     /// On refusal the store is untouched.
+    ///
+    /// The rebuild is keyed under **this store's own genesis form** (lab #521).
+    /// Until 2026-08-20 it used [`Self::new`] — hard-coded v4 identities — so on
+    /// a v5 net the fresh `ChainState` registered genesis under its v4 hash and
+    /// the very first re-insert (whose `prev` is the v5 genesis hash) failed
+    /// `UnknownParent` into the expect below: a T2 node could not reopen a
+    /// datadir it had itself written, the moment its snapshot prefix carried a
+    /// live rewind. On a v4 net `new_for(V4, …)` is what `new` did, byte for
+    /// byte.
     pub fn rewind_to(&mut self, target: Hash32) -> Result<Vec<StoredBlock>, RewindError> {
         let kept = self.rewind_path(&target)?;
         let finalized = self.chain.finalized_hash().zip(self.chain.finalized_height());
-        let mut rebuilt = Self::new(kept[0].clone());
+        let mut rebuilt = Self::new_for(self.chain.form(), kept[0].clone());
         for block in &kept[1..] {
             rebuilt
                 .put_block(block.clone())
@@ -696,5 +705,50 @@ mod tests {
 
         assert_eq!(store.finalized_hash(), Some(main[2]), "and none of them moved the head");
         assert_eq!(store.finalized_height(), Some(2));
+    }
+
+    /// 🔴 **Lab #521 — a v5 store's rewind rebuilds under v5 identities.**
+    ///
+    /// The rebuild inside [`MemChainStore::rewind_to`] used [`MemChainStore::new`]
+    /// — hard-coded v4 — so on a v5 chain the fresh `ChainState` registered
+    /// genesis under its v4 hash and the very first retained-path re-insert
+    /// (whose `prev` is the v5 genesis hash) hit `UnknownParent` inside the
+    /// `expect`: the T2 launch-day panic, a node unable to reopen a datadir it
+    /// had itself written. This is that panic at the layer it lives in; the
+    /// node-level lifecycle is pinned beside the other stage-4a tests.
+    #[test]
+    fn a_v5_store_rewinds_under_its_own_identities() {
+        use qlab_devnet::forms::GenesisForm;
+
+        fn block_v5(parent: &BlockHeader, marker: u64) -> StoredBlock {
+            let body = BlockBody { txs: vec![], coinbase: 0, coinbase_rkm: [marker; 4] };
+            let header = BlockHeader::child_of_for(
+                GenesisForm::V5,
+                parent,
+                parent.timestamp + 75,
+                GENESIS_DIFFICULTY,
+                body.commitment_v5(),
+            );
+            StoredBlock::from_parts(&header, &body)
+        }
+
+        let g = crate::node::genesis_block_for(GenesisForm::V5, GENESIS_DIFFICULTY, 0);
+        let g_header = g.header();
+        let mut store = MemChainStore::new_for(GenesisForm::V5, g);
+        let b1 = block_v5(&g_header, 0xA1);
+        let b2 = block_v5(&b1.header(), 0xA2);
+        let b2_again = b2.clone();
+        let b1_hash = store.put_block(b1).expect("v5 chain inserts");
+        store.put_block(b2).expect("v5 chain inserts");
+
+        // Pre-fix this line panicked `UnknownParent` at the re-insert expect.
+        store.rewind_to(b1_hash).expect("a v5 store rewinds its own retained path");
+        assert_eq!(store.tip_hash(), b1_hash, "the tip is the target");
+        assert_eq!(store.chain().form(), GenesisForm::V5, "the rebuilt store keeps its form");
+
+        // And the rebuilt store still links by v5 identities: the dropped block
+        // re-inserts (its `prev` is b1's v5 hash — under a mis-keyed rebuild this
+        // would be `UnknownParent` again).
+        store.put_block(b2_again).expect("re-application links under v5 identities");
     }
 }
