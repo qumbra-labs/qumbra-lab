@@ -121,8 +121,8 @@ intended contract, not because it is optional.)*
 ## Running one
 
 ```sh
-qumbra-pool check  --config pool.toml   # config, refusals, template source — no listener
-qumbra-pool        --config pool.toml   # serve
+qumbra-pool check --config pool.toml   # config, refusals, template source — no listener
+qumbra-pool run   --config pool.toml   # serve
 ```
 
 You also need a `qumbra-node` of your own with `template_serving = true`. The mine RPC is

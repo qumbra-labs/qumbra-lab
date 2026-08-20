@@ -109,8 +109,8 @@ Qumbra 的出块奖励是**写进共识的收款人列表**(`CoinbasePayee`,T2 �
 ## 怎么跑一个
 
 ```sh
-qumbra-pool check  --config pool.toml   # 检查配置、拒绝闸、模板源——不开监听
-qumbra-pool        --config pool.toml   # 开服
+qumbra-pool check --config pool.toml   # 检查配置、拒绝闸、模板源——不开监听
+qumbra-pool run   --config pool.toml   # 开服
 ```
 
 你还需要一个**自己的** `qumbra-node`,并打开 `template_serving = true`。mine RPC 按设计
