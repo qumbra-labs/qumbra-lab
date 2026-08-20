@@ -7,8 +7,9 @@
 //!                                          `--t2 --launch` is the T2 ceremony path
 //!                                          (OS-random committee keys; lab #506).
 //!   qumbra-node mine --dir DIR             zero-to-mining in one command (lab #475):
-//!                                          wallet (backup-gated) + T1 defaults +
-//!                                          verified genesis + node.toml, then `run`
+//!                                          wallet (backup-gated) + the built-for net's
+//!                                          defaults + verified genesis + node.toml, then
+//!                                          `run`. `mine --print-net` reports that net.
 //!   qumbra-node run --config FILE          run a full node (TCP + RandomX + disk)
 //!   qumbra-node audit [--out FILE]         emit the params_devnet convergence audit
 //!   qumbra-node audit-emission --data-dir  walk a data dir's main chain and report
@@ -99,9 +100,16 @@ fn usage() {
          qumbra-node mine --dir DIR             zero-to-mining in one command (lab #475). Finds or\n      \
                                             CREATES a wallet (its mnemonic is printed ONCE and the\n      \
                                             run waits for you to confirm), downloads + verifies\n      \
-                                            genesis against the pinned hash, writes an ordinary\n      \
-                                            node.toml into DIR, then runs it.\n      \
-           [--seeds a:1,b:2]                  override the four baked T1 seed addresses\n      \
+                                            genesis against the pin for the net this binary was\n      \
+                                            BUILT for, writes an ordinary node.toml into DIR, then\n      \
+                                            runs it.\n      \
+           [--net t1|t2]                      join a net other than the one this binary was\n      \
+                                            built for (`mine --print-net` says which that is)\n      \
+           [--genesis-hash <64hex>]           pin THIS genesis identity — the no-rebuild path\n      \
+                                            onto a net this binary predates\n      \
+           [--print-net]                      print the baked network identity and exit. Binds\n      \
+                                            nothing, writes nothing, needs no --dir.\n      \
+           [--seeds a:1,b:2]                  override the four baked public seed addresses\n      \
            [--genesis-url URL]                override https://seed.qumbra.org/genesis.qmb\n      \
            [--rkm <64hex>]                    pay THIS key and never touch a wallet (manual path)\n      \
            [--yes-i-backed-up]                the non-interactive backup confirmation. Without a\n      \
@@ -287,7 +295,17 @@ fn genesis_init(args: &[String]) -> Result<(), Box<dyn Error>> {
 fn mine_cmd(args: &[String]) -> Result<(), Box<dyn Error>> {
     use std::io::IsTerminal;
 
-    let plan = qumbra_node::mine::MineArgs::parse(args)?;
+    let plan = match qumbra_node::mine::parse_mine(args)? {
+        // `--print-net` answers "what net is this binary built for" and exits.
+        // It binds nothing, writes nothing and reads no wallet, which is what
+        // lets the release lane's artifact gate ask a freshly built binary the
+        // question that lab #527 had no way to ask the shipped one.
+        qumbra_node::mine::MinePlan::PrintNet(identity) => {
+            print!("{}", identity.report());
+            return Ok(());
+        }
+        qumbra_node::mine::MinePlan::Prepare(args) => *args,
+    };
     // Whether there is a human to show a mnemonic to is a property of THIS
     // process's stdin, decided here and injected — `mine.rs` takes it as an
     // argument so the whole backup gate is testable without a pty.

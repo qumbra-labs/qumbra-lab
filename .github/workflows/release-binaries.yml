@@ -297,6 +297,15 @@ jobs:
       - name: Build the node — RESUME variant, and only the resume variant
         env:
           QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+          # Lab #527: `qumbra-node mine` used to bake ONE net's genesis hash as a
+          # Rust literal, so the T2 release downloaded the correct T2 genesis and
+          # refused it. These two stamps are the same preflight outputs the smoke
+          # and the packaging already use — and `genesis_hash` is not read off a
+          # shelf, it is what select-release-net.sh keccak256'd off the file
+          # actually being served at GENESIS_URL. The artifact gate below greps
+          # it back out of the built binary.
+          QUMBRA_NET: ${{ needs.preflight.outputs.net }}
+          QUMBRA_GENESIS_HASH: ${{ needs.preflight.outputs.genesis_hash }}
         run: cargo build --release --locked -p qumbra-node --features rule-boundary-resume
 
       - name: Build the wallet
@@ -384,6 +393,15 @@ jobs:
       - name: Build the node — RESUME variant, and only the resume variant
         env:
           QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+          # Lab #527: `qumbra-node mine` used to bake ONE net's genesis hash as a
+          # Rust literal, so the T2 release downloaded the correct T2 genesis and
+          # refused it. These two stamps are the same preflight outputs the smoke
+          # and the packaging already use — and `genesis_hash` is not read off a
+          # shelf, it is what select-release-net.sh keccak256'd off the file
+          # actually being served at GENESIS_URL. The artifact gate below greps
+          # it back out of the built binary.
+          QUMBRA_NET: ${{ needs.preflight.outputs.net }}
+          QUMBRA_GENESIS_HASH: ${{ needs.preflight.outputs.genesis_hash }}
         run: cargo build --release --locked -p qumbra-node --features rule-boundary-resume
 
       - name: Build the wallet
@@ -460,6 +478,15 @@ jobs:
       - name: Build the node — RESUME variant, and only the resume variant
         env:
           QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+          # Lab #527: `qumbra-node mine` used to bake ONE net's genesis hash as a
+          # Rust literal, so the T2 release downloaded the correct T2 genesis and
+          # refused it. These two stamps are the same preflight outputs the smoke
+          # and the packaging already use — and `genesis_hash` is not read off a
+          # shelf, it is what select-release-net.sh keccak256'd off the file
+          # actually being served at GENESIS_URL. The artifact gate below greps
+          # it back out of the built binary.
+          QUMBRA_NET: ${{ needs.preflight.outputs.net }}
+          QUMBRA_GENESIS_HASH: ${{ needs.preflight.outputs.genesis_hash }}
         run: cargo build --release --locked -p qumbra-node --features rule-boundary-resume
 
       - name: Build the wallet

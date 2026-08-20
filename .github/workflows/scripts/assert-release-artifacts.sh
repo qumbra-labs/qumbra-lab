@@ -11,6 +11,13 @@
 #     declared OR recomputed (node-image.yml's check, ported to a bare binary).
 #   - a binary that ignored `QUMBRA_BUILD_REV`, i.e. an artifact that cannot be
 #     tied back to the revision the release notes will claim.
+#   - a binary baked for a DIFFERENT NET than the one being cut (lab #527). The
+#     T2 release shipped with T1's genesis hash compiled into `mine`, so the
+#     advertised one-command path downloaded the correct T2 genesis and refused
+#     it. Nothing here could see that: every other check in this file, and the
+#     smoke, exercise the CONFIG path, where the pin comes from a config this
+#     lane hand-writes. `mine --print-net` is the only way to ask the artifact
+#     what IT thinks the net is.
 #
 # WHY THIS IS A FILE AND NOT INLINE YAML, against this repo's usual habit: it runs
 # on THREE platforms (two Linux legs in a container, one macOS leg native) and the
@@ -42,6 +49,8 @@ set -euo pipefail
 : "${EXPECTED_REVISION:?EXPECTED_REVISION is required}"
 : "${EXPECTED_DOMAIN:?EXPECTED_DOMAIN is required}"
 : "${RULE_BOUNDARY_HEIGHT:?RULE_BOUNDARY_HEIGHT is required}"
+: "${NET:?NET (t1|t2, from the preflight) is required}"
+: "${GENESIS_HASH:?GENESIS_HASH — the preflight pin for NET — is required}"
 
 fail() { echo "::error::$*"; exit 1; }
 
@@ -128,4 +137,35 @@ echo "================================"
 grep -qF "qumbra-pool" pool-help.txt \
   || fail "qumbra-pool --help did not identify itself as qumbra-pool. Wrong binary in the slot, or the CLI usage line moved."
 
-echo "artifact assertions: OK (resume build, frozen digest pinned, node+wallet stamped $EXPECTED_BUILD_REV, pool present)"
+# ---------------------------------------------------------------------------
+# 4. Net identity (lab #527). THE ASSERTION THIS FILE WAS MISSING WHEN THE T2
+#    RELEASE WAS CUT.
+#
+#    Everything above, and the smoke, prove things about the binary's behaviour
+#    on a config THIS LANE WRITES. `mine` writes its own config from constants
+#    compiled into the binary, so no amount of config-path testing can see a
+#    stale one — which is exactly how a `t2-*` tarball shipped carrying T1's
+#    genesis hash and refused the T2 genesis it had just downloaded.
+#
+#    `mine --print-net` binds nothing, writes nothing and reads no wallet: it
+#    reports the identity the binary would enforce. Comparing that to the
+#    preflight's own pin closes the loop, because the preflight's pin is
+#    keccak256 of the genesis ACTUALLY BEING SERVED at GENESIS_URL
+#    (select-release-net.sh fetches it). So a green line here means: the binary
+#    in this tarball agrees with the file a stranger will download today.
+# ---------------------------------------------------------------------------
+echo "===== qumbra-node mine --print-net ====="
+"$NODE_BIN" mine --print-net | tee net.txt
+echo "======================================="
+
+BAKED_NET=$(sed -n 's/^net: *//p' net.txt | sed -n 1p)
+BAKED_HASH=$(sed -n 's/^genesis hash: *//p' net.txt | sed -n 1p)
+
+[ -n "$BAKED_NET" ] \
+  || fail "\`mine --print-net\` printed no 'net:' line. Either this binary predates lab #527 (in which case it bakes ONE net's genesis hash and must not be published) or the report's shape changed and this gate is now blind."
+[ "$BAKED_NET" = "$NET" ] \
+  || fail "this binary is baked for net '$BAKED_NET' and the lane is cutting '$NET'. A tag that says $NET on a binary that joins $BAKED_NET is lab #527 exactly."
+[ "$BAKED_HASH" = "$GENESIS_HASH" ] \
+  || fail "this binary pins genesis $BAKED_HASH and the genesis actually served at the published URL hashes to $GENESIS_HASH. \`qumbra-node mine\` would download the right file and refuse it — the failure that broke the advertised one-command path four hours into T2. Either QUMBRA_GENESIS_HASH did not reach the build, or this binary's net table is stale."
+
+echo "artifact assertions: OK (resume build, frozen digest pinned, node+wallet stamped $EXPECTED_BUILD_REV, pool present, node baked for net $BAKED_NET pinning $BAKED_HASH)"
