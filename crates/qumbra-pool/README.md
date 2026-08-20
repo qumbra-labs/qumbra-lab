@@ -19,16 +19,44 @@ merely written. Last updated 2026-08-20 16:5x +08.
 | Stock-XMRig-compatible work value (trailing-8-LE) | ✅ 2026-08-19 (lab PR #492, issue #490) |
 | Node mine RPC (`/v1/mine/template`, `/v1/mine/block`) + pool binary in the image | ✅ 2026-08-20 (lab PR #513, issue #511) |
 
-### Between here and a pool that pays — NOT DONE
+### Bring-up — COMPLETE as of 2026-08-21 00:56 +08
+
+| item | state |
+|---|---|
+| Refuse-to-mislead gate (static template / null payout) | ✅ 2026-08-20 (lab PR #523) |
+| svc1 config on `node_rpc`, entrypoint `pool` path, `template_serving` | ✅ 2026-08-21 (deploy #210, #213) |
+| **svc1 has its own `qumbra-node`** — the faucet has no mine RPC on any revision | ✅ 2026-08-21 (deploy #215, lab #519) |
+| Pool rolled onto svc1, `pool` profile enabled, SG opened on 3333 | ✅ 2026-08-21 |
+| **🎉 First real share accepted end-to-end from stock XMRig** | ✅ **2026-08-21 00:56 +08** |
+
+The share, from hel1, on the **unmodified** `xmrig-6.22.2-linux-static-x64` release tarball with a
+64-hex rkm as the login — so this is the **miner-payee** branch, not the pool's fallback:
+
+```
+[16:56:41.940]  net      new job from pool.qumbra.org:3333 diff 1024 algo rx/0 height 610
+[16:56:42.232]  cpu      READY threads 1/1 (1) huge pages 100% 1/1 memory 2048 KB
+[16:56:59.796]  cpu      accepted (1/0) diff 1024 (179 ms)
+```
+
+Eighteen seconds from `READY` to an accepted share, against the public endpoint, with nothing patched.
+
+### Between here and a pool anyone should be told about — NOT DONE
 
 | item | state | blocked on |
 |---|---|---|
-| Refuse-to-mislead gate (static template / null payout) | ⬜ PR #523 open, CI running | review |
-| svc1 config rewritten to `node_rpc` (not the static fixture) | ⬜ not started | lab #519 |
-| Entrypoint `pool` path used instead of overridden | ⬜ not started | lab #519 |
-| Pool rolled onto svc1, compose profile enabled | ⬜ not started | the two rows above |
-| **First real share accepted end-to-end from stock XMRig** | ⬜ | everything above |
-| Public announcement of the endpoint | ⬜ | the row above — the endpoint is announced only when it pays |
+| A block actually mined, and its payee read | ⬜ | hashrate and luck; the pool is running now |
+| Connection cap, line bound, rate limit on public stratum | ⬜ | **lab #544** |
+| Bounded staleness on the held template | ⬜ | **lab #545** |
+| Public announcement of the endpoint | ⬜ | the two rows above — **not** the first share |
+
+🔴 **The endpoint is reachable but deliberately unadvertised, and those two issues are why.**
+Public stratum has no connection cap, no line-length bound and a per-syscall rather than
+per-connection timeout (#544); and when the node refuses to assemble a template — which it
+correctly does while a tip is contested — the pool **keeps issuing jobs from its stale copy**, so
+miners hash a doomed tip instead of being told there is no work (#545). Neither is a risk to the
+chain or to any key; both are ways a miner burns electricity for nothing. **The window in which
+this endpoint is exposed and unprotected is one nobody has been told about, which makes it the
+cheapest time we will ever have to fix them.**
 
 ### Ruled out of scope for now — deliberately, not forgotten
 
