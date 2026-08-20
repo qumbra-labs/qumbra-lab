@@ -4,6 +4,12 @@
 //! Fixtures only — no mining software is installed or run. Named
 //! deviations from a live Monero capture: v5 header preimage as `blob`,
 //! 8-byte raw target. Adversarial shares are refused **by name**.
+//!
+//! Lab #511 live-node leg (login → job from a REAL node → share → POST →
+//! tip advances) lives in `qumbra-node/tests/mine_rpc_live.rs` —
+//! `e2e_live_node_login_job_submit_advances_tip`. That is the G4
+//! definition of done; this file stays the static-template adversarial
+//! suite so it does not pull `qumbra-node` into this crate's test graph.
 
 use qlab_devnet::forms::GenesisForm;
 use qlab_stratum::blob::{extranonce_of, miner_nonce_of, V5_BLOB_LEN};

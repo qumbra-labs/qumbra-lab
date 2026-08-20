@@ -60,3 +60,10 @@ mining = true
 # To serve nothing at all — and be told at startup that recipients cannot find
 # their outputs here — say so explicitly:
 # discovery_addr = "off"
+
+# ── pool live lane (lab #511) ────────────────────────────────────────────────
+#
+# Serve GET /v1/mine/template and POST /v1/mine/block on the discovery listener.
+# Off by default. A pool talks to ITS OWN node on the same host (loopback).
+# Not `mining.template_serving`: TOML cannot nest a table under `mining = true`.
+# template_serving = true

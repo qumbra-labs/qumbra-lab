@@ -542,6 +542,19 @@ impl DiscoveryServer {
         anchors: Arc<Mutex<Arc<AnchorsView>>>,
         submits: mpsc::SyncSender<SubmitRequest>,
     ) -> io::Result<Self> {
+        Self::start_with_mine(addr, view, leaves, anchors, submits, None)
+    }
+
+    /// [`Self::start`] plus the lab #511 mine-template / block-submit routes.
+    /// `mine = None` leaves those paths as 404 (the compact-only tests).
+    pub fn start_with_mine(
+        addr: &str,
+        view: Arc<Mutex<Arc<DiscoveryView>>>,
+        leaves: Arc<Mutex<Arc<LeavesView>>>,
+        anchors: Arc<Mutex<Arc<AnchorsView>>>,
+        submits: mpsc::SyncSender<SubmitRequest>,
+        mine: Option<crate::mine_rpc::MineServing>,
+    ) -> io::Result<Self> {
         let server = tiny_http::Server::http(addr).map_err(|e| {
             io::Error::other(format!(
                 "discovery_addr {addr}: {e} (set discovery_addr = \"{DISCOVERY_OFF}\" to serve nothing)"
@@ -566,6 +579,35 @@ impl DiscoveryServer {
                 // The one write route, method-gated first (the faucet's 405+Allow
                 // shape) and handed off before its body is read — see the method
                 // docs for why the GET worker must never block on a submitter.
+                if path == crate::mine_rpc::MINE_TEMPLATE_PATH {
+                    if *request.method() != tiny_http::Method::Get {
+                        let allow = tiny_http::Header::from_bytes(&b"Allow"[..], &b"GET"[..])
+                            .expect("static header parses");
+                        let _ = request.respond(
+                            tiny_http::Response::from_string("method not allowed: GET the assembled template")
+                                .with_status_code(405)
+                                .with_header(allow),
+                        );
+                        continue;
+                    }
+                    spawn_mine_template_handler(request, mine.clone());
+                    continue;
+                }
+                if path == crate::mine_rpc::MINE_BLOCK_PATH {
+                    if *request.method() != tiny_http::Method::Post {
+                        let allow = tiny_http::Header::from_bytes(&b"Allow"[..], &b"POST"[..])
+                            .expect("static header parses");
+                        let _ = request.respond(
+                            tiny_http::Response::from_string("method not allowed: POST a completed block")
+                                .with_status_code(405)
+                                .with_header(allow),
+                        );
+                        continue;
+                    }
+                    spawn_mine_block_handler(request, mine.clone());
+                    continue;
+                }
+
                 if path == TX_SUBMIT_PATH {
                     if *request.method() != tiny_http::Method::Post {
                         let allow = tiny_http::Header::from_bytes(&b"Allow"[..], &b"POST"[..])
@@ -870,6 +912,141 @@ fn spawn_submit_handler(
             .respond(tiny_http::Response::from_string(body).with_status_code(code));
         inflight.fetch_sub(1, Ordering::AcqRel);
     });
+}
+
+fn spawn_mine_template_handler(
+    request: tiny_http::Request,
+    mine: Option<crate::mine_rpc::MineServing>,
+) {
+    std::thread::spawn(move || {
+        let (code, body, json) = mine_template_verdict(mine);
+        if json {
+            let header = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"application/json"[..],
+            )
+            .expect("static header parses");
+            let _ = request.respond(
+                tiny_http::Response::from_string(body)
+                    .with_status_code(code)
+                    .with_header(header),
+            );
+        } else {
+            let _ = request.respond(
+                tiny_http::Response::from_string(body).with_status_code(code),
+            );
+        }
+    });
+}
+
+fn mine_template_verdict(
+    mine: Option<crate::mine_rpc::MineServing>,
+) -> (u16, String, bool) {
+    let Some(mine) = mine else {
+        return (
+            404,
+            "not found: template serving is not wired on this listener".into(),
+            false,
+        );
+    };
+    if !mine.enabled {
+        return (503, crate::mine_rpc::TEMPLATE_SERVING_DISABLED.into(), false);
+    }
+    let (tx, rx) = mpsc::sync_channel(1);
+    if mine
+        .templates
+        .try_send(crate::mine_rpc::TemplateRequest { reply: tx })
+        .is_err()
+    {
+        return (
+            503,
+            "unavailable: template-queue-full — retry".into(),
+            false,
+        );
+    }
+    match rx.recv_timeout(crate::mine_rpc::MINE_VERDICT_TIMEOUT) {
+        Ok(Ok(wire)) => match serde_json::to_string(&wire) {
+            Ok(s) => (200, s, true),
+            Err(e) => (500, format!("internal: encode {e}"), false),
+        },
+        Ok(Err(name)) => (503, format!("unavailable: {name}"), false),
+        Err(_) => (
+            503,
+            "unavailable: no-verdict-in-time — retry".into(),
+            false,
+        ),
+    }
+}
+
+fn spawn_mine_block_handler(
+    mut request: tiny_http::Request,
+    mine: Option<crate::mine_rpc::MineServing>,
+) {
+    std::thread::spawn(move || {
+        let (code, body) = mine_block_verdict(&mut request, mine);
+        let _ = request.respond(tiny_http::Response::from_string(body).with_status_code(code));
+    });
+}
+
+fn mine_block_verdict(
+    request: &mut tiny_http::Request,
+    mine: Option<crate::mine_rpc::MineServing>,
+) -> (u16, String) {
+    let Some(mine) = mine else {
+        return (
+            404,
+            "not found: block submit is not wired on this listener".into(),
+        );
+    };
+    if !mine.enabled {
+        return (503, crate::mine_rpc::TEMPLATE_SERVING_DISABLED.into());
+    }
+    if let Some(len) = request.body_length() {
+        if len > MAX_TX_WIRE_BYTES * 2 {
+            return (
+                413,
+                format!("refused: body-too-large ({len} > {} bytes)", MAX_TX_WIRE_BYTES * 2),
+            );
+        }
+    }
+    let mut raw = Vec::new();
+    {
+        use std::io::Read;
+        let cap = (MAX_TX_WIRE_BYTES * 2) as u64 + 1;
+        if request.as_reader().take(cap).read_to_end(&mut raw).is_err() {
+            return (400, "refused: body-unreadable".into());
+        }
+    }
+    if raw.len() > MAX_TX_WIRE_BYTES * 2 {
+        return (413, "refused: body-too-large".into());
+    }
+    let wire: crate::mine_rpc::MineBlockWire = match serde_json::from_slice(&raw) {
+        Ok(w) => w,
+        Err(e) => return (400, format!("refused: body-undecodable ({e})")),
+    };
+    let (_form, header, body) = match wire.decode() {
+        Ok(v) => v,
+        Err(e) => return (400, format!("refused: {e}")),
+    };
+    let (tx, rx) = mpsc::sync_channel(1);
+    if mine
+        .blocks
+        .try_send(crate::mine_rpc::BlockSubmitRequest {
+            header,
+            body,
+            reply: tx,
+        })
+        .is_err()
+    {
+        return (503, "unavailable: block-queue-full — retry".into());
+    }
+    match rx.recv_timeout(crate::mine_rpc::MINE_VERDICT_TIMEOUT) {
+        Ok(outcome) => {
+            let (code, text) = crate::mine_rpc::render_block_outcome(&outcome);
+            (code, text)
+        }
+        Err(_) => (503, "unavailable: no-verdict-in-time — retry".into()),
+    }
 }
 
 /// The submit handler's whole decision, as `(status, body)`.

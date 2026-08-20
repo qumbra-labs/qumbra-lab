@@ -9,6 +9,10 @@
 #   entrypoint.sh faucet        the T1 faucet listener on a KEYLESS node of its own
 #                               (issue #123) — mints its own key material once into
 #                               its data volume, mines to its own rkm, serves HTTP
+#   entrypoint.sh pool          the T2 pool (lab #511 / G4) — talks to ITS OWN
+#                               node on the same host via QUMBRA_NODE_RPC
+#                               (default http://127.0.0.1:9420). That node must
+#                               have template_serving = true.
 #
 # QUMBRA_BIN selects WHICH node binary runs (issue #74). The halt height is a
 # compile-time release constant with no runtime override (H1), so a "binary swap"
@@ -340,8 +344,37 @@ EOF
     exec qumbra-faucet run --config "$svc_cfg"
     ;;
 
+  pool)
+    # Lab #511: the pool talks to ITS OWN node on the same host. Default
+    # node_rpc is the discovery loopback the node binds when discovery is
+    # left at its default. Override QUMBRA_NODE_RPC if the node is bound
+    # elsewhere. Config path is /tmp/pool.toml (generated) unless
+    # QUMBRA_POOL_CONFIG points at an operator file.
+    if [[ -n "${QUMBRA_POOL_CONFIG:-}" ]]; then
+      echo "pool: using operator config $QUMBRA_POOL_CONFIG"
+      exec qumbra-pool run --config "$QUMBRA_POOL_CONFIG"
+    fi
+    listen="${QUMBRA_POOL_LISTEN:-0.0.0.0:3333}"
+    share="${QUMBRA_POOL_SHARE_DIFFICULTY:-1024}"
+    node_rpc="${QUMBRA_NODE_RPC:-http://127.0.0.1:9420}"
+    poll="${QUMBRA_POOL_POLL_MS:-1000}"
+    cfg=/tmp/pool.toml
+    cat > "$cfg" <<EOF
+# generated in-container by entrypoint.sh pool (lab #511)
+listen_addr = "$listen"
+share_difficulty = $share
+node_rpc = "$node_rpc"
+poll_ms = $poll
+EOF
+    cpu_budget_line pool
+    echo "== pool config =="
+    cat "$cfg"
+    qumbra-pool check --config "$cfg"
+    exec qumbra-pool run --config "$cfg"
+    ;;
+
   *)
-    echo "entrypoint: unknown command '${cmd:-}' (expected: init | run <idx> | faucet)" >&2
+    echo "entrypoint: unknown command '${cmd:-}' (expected: init | run <idx> | faucet | pool)" >&2
     exit 2
     ;;
 esac

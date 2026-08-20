@@ -12,6 +12,12 @@
 listen_addr = "127.0.0.1:3333"
 share_difficulty = 1024
 
+# Lab #511 live lane: point at this pool's own node (discovery listener).
+# When set, [template] is ignored and jobs come from GET /v1/mine/template.
+# The node must have template_serving = true.
+# node_rpc = "http://127.0.0.1:9420"
+# poll_ms = 1000
+
 [template]
 form = "v5"
 prev = "1111111111111111111111111111111111111111111111111111111111111111"

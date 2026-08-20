@@ -31,6 +31,18 @@ pub struct Template {
     /// Next key-block hash, when the source has one. The pool decides
     /// whether to put it on the job (preload window).
     pub next_seed_hash: Option<[u8; 32]>,
+    /// Assembled body from the node (lab #511). Static `[template]` files
+    /// leave this `None` and a block-class share is logged, not POSTed.
+    pub body: Option<TemplateBody>,
+}
+
+/// The body a completed header must carry. Opaque tx wires so this crate
+/// does not take `qlab-p2p`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TemplateBody {
+    pub coinbase: u64,
+    pub coinbase_rkm: [u64; 4],
+    pub txs: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,6 +165,7 @@ impl DevnetTemplateSource {
                 header: tip,
                 seed_hash: genesis.header_hash_for(form),
                 next_seed_hash: None,
+                body: None,
             },
         }
     }
@@ -245,6 +258,7 @@ mod tests {
             header: sample_header(height),
             seed_hash: [0x33; 32],
             next_seed_hash: Some([0x44; 32]),
+            body: None,
         }
     }
 

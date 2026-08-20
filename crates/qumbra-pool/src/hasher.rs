@@ -38,6 +38,17 @@ impl ShareHasher for FixedHasher {
     }
 }
 
+/// Keccak-256 of the blob, seed ignored — matches [`qlab_devnet::pow::KeccakPow`].
+/// Live-leg tests drive an in-process node on KeccakPow so share-PoW and
+/// consensus-PoW are the same function.
+pub struct KeccakShareHasher;
+
+impl ShareHasher for KeccakShareHasher {
+    fn hash(&self, _seed: &[u8], blob: &[u8]) -> Hash32 {
+        qlab_devnet::hash::keccak256(blob)
+    }
+}
+
 /// Production hasher. `RandomXHasher` is `!Send` (raw VM pointers), so
 /// the VM lives on a dedicated thread and this handle is a channel.
 #[cfg(feature = "randomx")]
