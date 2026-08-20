@@ -22,13 +22,13 @@
 # reads `$NODE_BIN halt-status` can be pointed at a captured fixture, and a step
 # buried in YAML on a paid runner cannot.
 #
-# 🔴 IF A THIRD BINARY EVER JOINS THE TARBALL, IT NEEDS ITS OWN CHECK HERE. This
-# gate interrogates `qumbra-node` for the resume variant and both binaries for the
-# build stamp — nothing more. #397 is precisely the shape of what gets missed: a
-# crate that COMPOSES qumbra-node (the faucet, the explorer) inherits its default,
-# which is ARMED, and no build arg aimed at `-p qumbra-node` reaches it. Adding
-# qumbra-explorer or qumbra-faucet to a release tarball without adding an assertion
-# for it would ship that same silent arming to strangers.
+# Lab #516 added `qumbra-pool` as the third binary. The pool does not compose
+# qumbra-node and does not carry a halt plan, so its check is "the binary we
+# just built is the one we are about to pack, and it answers --help as
+# qumbra-pool". It does not read QUMBRA_BUILD_REV today (workflow-only baton);
+# do not pretend it has a stamp. Adding qumbra-explorer or qumbra-faucet still
+# needs its own assertion: those DO compose qumbra-node and inherit ARMED
+# (#397).
 #
 # Inputs, all required — no defaults, deliberately. A default pin is a pin nobody
 # notices going stale.
@@ -36,6 +36,7 @@ set -euo pipefail
 
 : "${NODE_BIN:?NODE_BIN (path to the built qumbra-node) is required}"
 : "${WALLET_BIN:?WALLET_BIN (path to the built qumbra-wallet) is required}"
+: "${POOL_BIN:?POOL_BIN (path to the built qumbra-pool) is required}"
 : "${EXPECTED_BUILD_REV:?EXPECTED_BUILD_REV (the lab commit being released) is required}"
 : "${FROZEN_PIN:?FROZEN_PIN is required}"
 : "${EXPECTED_REVISION:?EXPECTED_REVISION is required}"
@@ -118,4 +119,13 @@ WALLET_REV=$(sed -n 's/^build rev: //p' wallet-help.txt | sed -n 1p)
 [ "$WALLET_REV" = "$EXPECTED_BUILD_REV" ] \
   || fail "qumbra-wallet build stamp is '$WALLET_REV', expected $EXPECTED_BUILD_REV. The two binaries in one tarball must be from one revision — a wallet from a different build is precisely the confusion the stamp exists to prevent."
 
-echo "artifact assertions: OK (resume build, frozen digest pinned, both binaries stamped $EXPECTED_BUILD_REV)"
+echo "===== qumbra-pool --help ====="
+# Pool usage is on stderr; --help exits 0. The check is identity, not a stamp:
+# this crate does not read QUMBRA_BUILD_REV (lab #516 is workflow-only).
+[ -f "$POOL_BIN" ] || fail "POOL_BIN '$POOL_BIN' is missing — the pool binary was supposed to ship beside the node (lab #516)."
+"$POOL_BIN" --help 2>&1 | sed -n '1,8p' | tee pool-help.txt
+echo "================================"
+grep -qF "qumbra-pool" pool-help.txt \
+  || fail "qumbra-pool --help did not identify itself as qumbra-pool. Wrong binary in the slot, or the CLI usage line moved."
+
+echo "artifact assertions: OK (resume build, frozen digest pinned, node+wallet stamped $EXPECTED_BUILD_REV, pool present)"

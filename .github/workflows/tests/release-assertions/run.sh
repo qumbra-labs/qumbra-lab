@@ -66,13 +66,26 @@ make_wallet_stub() { # $1 = build rev line value
   echo "$out"
 }
 
+make_pool_stub() {
+  local out="$TMP/qumbra-pool-stub"
+  {
+    echo '#!/usr/bin/env bash'
+    echo 'echo "qumbra-pool — the T2 pool listener (lab #482 stage 1)"'
+    echo 'echo "USAGE:"'
+    echo 'echo "  qumbra-pool check --config FILE"'
+  } > "$out"
+  chmod +x "$out"
+  echo "$out"
+}
+
 # expect <want:pass|fail> <name> <node-fixture> <node-rev> <wallet-rev>
 expect() {
   local want=$1 name=$2 fixture=$3 nrev=$4 wrev=$5
-  local node wallet out rc
+  local node wallet pool out rc
   node=$(make_node_stub "$FIX/$fixture" "$nrev")
   wallet=$(make_wallet_stub "$wrev")
-  out=$(cd "$TMP" && NODE_BIN="$node" WALLET_BIN="$wallet" \
+  pool=$(make_pool_stub)
+  out=$(cd "$TMP" && NODE_BIN="$node" WALLET_BIN="$wallet" POOL_BIN="$pool" \
         EXPECTED_BUILD_REV="$BUILD_REV" \
         FROZEN_PIN=a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b \
         EXPECTED_REVISION=v1.1-exact-emission \
@@ -148,6 +161,18 @@ pin "node-image.yml agrees on the frozen digest" "$NODE_IMAGE" \
     'FROZEN_PIN="a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b"'
 pin "node-image.yml agrees on the resume rule domain" "$NODE_IMAGE" \
     'EXP_DOMAIN="56447169ab09956fcb78e8fb79a7cf2b502bd42194960226f83da2fb64db20b0"'
+
+# Lab #516: the four T1-hardwired sites moved into select-release-net.sh. The
+# workflow must still mention that script, and the T2 pin must live in it.
+SELECT="$HERE/../../scripts/select-release-net.sh"
+pin "workflow dispatches on net" "$WORKFLOW" \
+    "id: pins"
+pin "T2 genesis pin lives in select-release-net.sh" "$SELECT" \
+    "T2_GENESIS_HASH=d1dad4ea2bc5bfc4880ecf25206d182cddeacc12b0f65eca1a1ce2f27a93e2f3"
+pin "T1 genesis pin still reachable" "$SELECT" \
+    "T1_GENESIS_HASH=138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb"
+pin "cutover refusal text" "$SELECT" \
+    "published genesis is still t1 — run this after the cutover"
 
 echo ""
 echo "passed $PASS, failed $FAIL"

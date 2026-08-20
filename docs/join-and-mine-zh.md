@@ -158,8 +158,8 @@ test "$ACTUAL_REV" = "$EXPECTED_REV" || {
 
 #### 预编译二进制，不用 Docker
 
-上面的容器仍是**可复现基线**。若 Docker 是障碍而非答案，同样的两个二进制
-（`qumbra-node`、`qumbra-wallet`，外加 `PROVENANCE.txt`）以归档形式发布在公开仓库的
+上面的容器仍是**可复现基线**。若 Docker 是障碍而非答案，同样的三个二进制
+（`qumbra-node`、`qumbra-wallet`、`qumbra-pool`，外加 `PROVENANCE.txt`）以归档形式发布在公开仓库的
 releases 页——**<https://github.com/qumbra-labs/qumbra/releases>**，tag 为
 `<T2_RELEASE_TAG — filled at announcement>`。早于 T2 公告的 release tag 都是 T1 产物；
 不要拿它们连 T2。
@@ -189,7 +189,7 @@ release 页这件事本身当作制品名不符实的证据（CI 拒绝发布这
 
 **仅 macOS：** 二进制未签名、未公证。浏览器下载会打上隔离标记，Gatekeeper 拒绝运行。
 用 `curl` 获取，或清除属性：
-`xattr -d com.apple.quarantine qumbra-node qumbra-wallet`。
+`xattr -d com.apple.quarantine qumbra-node qumbra-wallet qumbra-pool`。
 
 **若你从源码构建，有一个 flag 是承重的**：裸的 `cargo build -p qumbra-node` 产出 ARMED
 变体——一个 T1 升级期的产物，但其排定的停机在任何网上都会触发，T2 也不例外

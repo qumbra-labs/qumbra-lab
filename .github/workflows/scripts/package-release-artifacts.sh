@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Packaging for the release lane (lab #437). One tarball per platform, holding the
-# two binaries a joiner needs and a PROVENANCE.txt that keeps the archive
-# self-describing after it has been copied off the release page.
+# Packaging for the release lane (lab #437, pool added by lab #516). One archive
+# per platform, holding the three binaries a joiner needs (node, wallet, pool)
+# and a PROVENANCE.txt that keeps the archive self-describing after it has been
+# copied off the release page.
 #
 # The per-file digest is computed HERE, on the machine that built the binary, and
 # re-verified in the publish job after the artifact round trip — so a corrupted
@@ -14,6 +15,7 @@ set -euo pipefail
 : "${PLATFORM:?PLATFORM is required}"
 : "${TAG:?TAG is required}"
 : "${LAB_REV:?LAB_REV is required}"
+: "${NET:?NET (t1 or t2) is required}"
 
 # ── platform shape (lab #478) ────────────────────────────────────────────────
 # ONE input decides three things that must never disagree: the executable
@@ -28,12 +30,20 @@ esac
 
 NODE_BIN="${NODE_BIN:-target/release/qumbra-node${EXE}}"
 WALLET_BIN="${WALLET_BIN:-target/release/qumbra-wallet${EXE}}"
+POOL_BIN="${POOL_BIN:-target/release/qumbra-pool${EXE}}"
+
+case "$NET" in
+  t1) NET_LABEL=T1 ;;
+  t2) NET_LABEL=T2 ;;
+  *) echo "::error::NET must be t1 or t2, got '$NET'"; exit 1 ;;
+esac
 
 NAME="qumbra-${TAG}-${PLATFORM}"
 rm -rf dist; mkdir -p "dist/$NAME"
 cp "$NODE_BIN" "dist/$NAME/qumbra-node${EXE}"
 cp "$WALLET_BIN" "dist/$NAME/qumbra-wallet${EXE}"
-chmod +x "dist/$NAME/qumbra-node${EXE}" "dist/$NAME/qumbra-wallet${EXE}"
+cp "$POOL_BIN" "dist/$NAME/qumbra-pool${EXE}"
+chmod +x "dist/$NAME/qumbra-node${EXE}" "dist/$NAME/qumbra-wallet${EXE}" "dist/$NAME/qumbra-pool${EXE}"
 
 # The "your OS will refuse to run this" paragraph, built BEFORE the heredoc that
 # uses it. It is a variable and not a `$(case …)` inside PROVENANCE.txt because a
@@ -64,7 +74,7 @@ WIN
 macOS: these binaries are unsigned and un-notarized. Downloading the tarball with a
 browser sets the quarantine attribute and Gatekeeper will refuse to run them; fetch
 with curl, or clear it explicitly:
-  xattr -d com.apple.quarantine qumbra-node qumbra-wallet
+  xattr -d com.apple.quarantine qumbra-node qumbra-wallet qumbra-pool
 NIX
     ;;
 esac
@@ -73,23 +83,26 @@ esac
 # the fleet image's, and diverging here would mean the artifact strangers run is
 # not the artifact this project has operational experience with.
 cat > "dist/$NAME/PROVENANCE.txt" <<EOF
-Qumbra T1 prebuilt binaries
+Qumbra ${NET_LABEL} prebuilt binaries
 ===========================
 
   release tag   : ${TAG}
+  net           : ${NET_LABEL}
   source rev    : ${LAB_REV}          (qumbra-labs/qumbra-lab, private)
   platform      : ${PLATFORM}
   toolchain     : $(rustc -V 2>/dev/null || echo "unknown")
   built by      : the release lane, .github/workflows/release-binaries.yml
 
-Both binaries carry the source revision internally. Ask them, do not trust this file:
+Node and wallet carry the source revision internally. Ask them, do not trust this file:
 
   ./qumbra-node halt-status      -> "build rev:" must read ${LAB_REV}
   ./qumbra-wallet --help         -> "build rev:" must read ${LAB_REV}
+  ./qumbra-pool --help           -> identifies itself; no build-rev stamp (lab #516)
 
 qumbra-node in this archive is the RESUME build (--features rule-boundary-resume).
 Its halt-status says "no halt scheduled" and "resumes past: height 8640". A node
 that says ARMED cannot follow the live chain; CI refuses to publish one.
+qumbra-pool is the T2 pool listener (RandomX, same constraint as the node).
 
 These builds are NOT bit-reproducible and no such claim is made. Provenance here
 means the artifact can be tied to a revision (this stamp + SHA256SUMS + the release
@@ -134,7 +147,7 @@ case "$ARCHIVE" in
              | ForEach-Object { \$_.FullName }") ;;
 esac
 echo "--- archive entries ---"; echo "$ENTRIES"
-for want in "qumbra-node${EXE}" "qumbra-wallet${EXE}" "PROVENANCE.txt"; do
+for want in "qumbra-node${EXE}" "qumbra-wallet${EXE}" "qumbra-pool${EXE}" "PROVENANCE.txt"; do
   echo "$ENTRIES" | tr '\\' '/' | grep -qF "${NAME}/${want}" \
     || { echo "::error::${ARTIFACT} does not contain ${NAME}/${want} — the archive's layout is not the one the join doc documents"; exit 1; }
 done
