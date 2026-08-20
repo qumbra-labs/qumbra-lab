@@ -19,7 +19,7 @@ merely written. Last updated 2026-08-20 16:5x +08.
 | Stock-XMRig-compatible work value (trailing-8-LE) | ✅ 2026-08-19 (lab PR #492, issue #490) |
 | Node mine RPC (`/v1/mine/template`, `/v1/mine/block`) + pool binary in the image | ✅ 2026-08-20 (lab PR #513, issue #511) |
 
-### Bring-up — COMPLETE as of 2026-08-21 00:56 +08
+### Bring-up — the software ran in production, and then stopped working. 2026-08-21
 
 | item | state |
 |---|---|
@@ -39,6 +39,26 @@ The share, from hel1, on the **unmodified** `xmrig-6.22.2-linux-static-x64` rele
 ```
 
 Eighteen seconds from `READY` to an accepted share, against the public endpoint, with nothing patched.
+
+🔴 **AND THEN IT STOPPED, AND THE POOL IS STOPPED NOW.** That miner had **2 shares accepted and 38
+rejected**. After the second share the pool never issued another job — it builds them correctly on
+every tip change and discards them (**lab #545**) — so every share for the next eleven minutes was
+rejected by the pool's own `stale job` verdict, with no disconnect and no message.
+
+🔴 **THE POOL HAS PAID NOBODY. It has produced ZERO blocks.** Neither accepted share became one:
+both fall inside the 133-second gap between block 611 (16:57:00) and block 612 (16:59:13). Blocks
+on chain paying that miner's rkm came from **its own solo-mining node**, which has run since
+07:13 UTC — nine hours before the pool existed. **The payee alone cannot distinguish pool-paid from
+solo-mined, because the same rkm was used for both, and a tally that cannot separate them is not
+evidence about either.** A future test of this path must use a payout rkm **nothing else mines to**.
+
+🔴 **Three blocks on T2 pay the node template's placeholder `0111011101110111…`, which nobody can
+spend** (~15 QMB), and the pool's own rkm — the fallback `payee.rs` documents — took **zero of 61
+blocks** across a window where the PPLNS window was certainly empty (**lab #547**). The pool was
+stopped the moment this was seen and stays stopped.
+
+**What IS proven: the stratum leg.** Login, job, share accepted, ~264 ms round trip, unmodified
+stock XMRig against a public endpoint. **What is NOT proven: that this pool can pay a miner.**
 
 ### Between here and a pool anyone should be told about — NOT DONE
 
