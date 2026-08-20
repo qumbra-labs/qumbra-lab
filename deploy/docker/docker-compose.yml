@@ -146,14 +146,16 @@ services:
 
   # ── the T2 pool (lab #511 / G4) ───────────────────────────────────────────
   #
-  # Second binary in this image. Profile `pool` so an ordinary soak is unchanged:
+  # Second binary in this image. Profile `pool` keeps the stratum listener and
+  # RandomX load absent from an ordinary soak; node0's bridge-only mine RPC stays
+  # unpublished and idle until the pool profile is started:
   #
   #   docker compose -f deploy/docker/docker-compose.yml --profile pool up -d pool
   #
-  # The pool talks to ITS OWN node on the same host. Default node_rpc is
-  # http://127.0.0.1:9420 — that is the discovery loopback. For a sidecar
-  # talking to node0's published discovery, set QUMBRA_NODE_RPC and bind
-  # the node's discovery off loopback. Operator file: QUMBRA_POOL_CONFIG.
+  # The pool talks to node0 over this compose bridge by service DNS. node0's
+  # mine RPC binds 0.0.0.0 inside the bridge namespace, but 9420 is unpublished;
+  # pool publishes 3333 itself and does not share node0's network namespace.
+  # Operator file: QUMBRA_POOL_CONFIG.
   # Config path documented here (deploy #197's compose template is the
   # deploy-repo sibling; this is the lab-side copy).
   pool:
@@ -161,10 +163,11 @@ services:
     hostname: pool
     profiles: ["pool"]
     environment:
-      QUMBRA_NODE_RPC: ${QUMBRA_NODE_RPC:-http://127.0.0.1:9420}
+      QUMBRA_NODE_RPC: ${QUMBRA_NODE_RPC:-http://node0:9420}
       QUMBRA_POOL_LISTEN: ${QUMBRA_POOL_LISTEN:-0.0.0.0:3333}
       QUMBRA_POOL_SHARE_DIFFICULTY: ${QUMBRA_POOL_SHARE_DIFFICULTY:-1024}
       QUMBRA_POOL_POLL_MS: ${QUMBRA_POOL_POLL_MS:-1000}
+      QUMBRA_POOL_PAYOUT_RKM: ${QUMBRA_POOL_PAYOUT_RKM:-}
       QUMBRA_POOL_CONFIG: ${QUMBRA_POOL_CONFIG:-}
     ports:
       - "127.0.0.1:3333:3333"
@@ -181,6 +184,10 @@ services:
     environment:
       QUMBRA_BIN: ${NODE0_BIN:-qumbra-node}
       QUMBRA_SAMPLE_SECS: ${QUMBRA_SAMPLE_SECS:-30}
+      # Private-bridge-only mine RPC for the pool. Port 9420 is deliberately not
+      # published by node0; the pool reaches it as http://node0:9420.
+      QUMBRA_DISCOVERY_ADDR: 0.0.0.0:9420
+      QUMBRA_TEMPLATE_SERVING: "true"
       # auto (default) = this node advertises itself dialable, as every run before
       # 2026-07-30 did. none = the field is absent from its node.toml, which is what
       # the four T0 hosts run. Global for all four, or NODE0_ADVERTISE per node.

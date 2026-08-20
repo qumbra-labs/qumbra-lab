@@ -59,9 +59,11 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     let path = PathBuf::from(flag(args, "--config").ok_or("missing --config FILE")?);
     let cfg = PoolConfig::load(&path)?;
+    cfg.ensure_service_ready()?;
     println!("qumbra-pool check: ok");
     println!("  listen:            {}", cfg.listen_addr);
     println!("  share_difficulty:  {}", cfg.share_difficulty);
+    println!("  payout_rkm:        configured (non-zero)");
     if let Some(url) = &cfg.node_rpc {
         println!("  node_rpc:          {url}");
         println!("  poll_ms:           {}", cfg.poll_ms.unwrap_or(1000));
@@ -86,8 +88,10 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
 fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let path = PathBuf::from(flag(args, "--config").ok_or("missing --config FILE")?);
     let cfg = PoolConfig::load(&path)?;
+    cfg.ensure_service_ready()?;
     let listen = cfg.listen_addr.clone();
     let share_difficulty = cfg.share_difficulty;
+    let payout_rkm = cfg.payout_rkm_lanes()?;
     #[cfg(feature = "randomx")]
     let hasher: Box<dyn qumbra_pool::ShareHasher> =
         Box::new(qumbra_pool::RandomXShareHasher::new());
@@ -114,7 +118,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             share_difficulty,
             Box::new(qumbra_pool::HeldTemplateSource::new(initial)),
             hasher,
-            [9, 0, 0, 0],
+            payout_rkm,
         )?);
         pool.set_submitter(Arc::new(client));
         let poll = Duration::from_millis(cfg.poll_ms.unwrap_or(1000));
@@ -148,7 +152,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             share_difficulty,
             Box::new(source),
             hasher,
-            [9, 0, 0, 0],
+            payout_rkm,
         )?)
     };
     let listener = TcpListener::bind(&listen)?;
