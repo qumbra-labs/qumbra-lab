@@ -57,7 +57,7 @@ use qlab_faucet::{AcceptError, Refusal, Ticket};
 use qlab_wallet::address::{Address, ADDR_HRP};
 
 use crate::service::{FaucetGate, RequestState};
-use crate::state::ServiceStatus;
+use crate::state::{Availability, ServiceStatus};
 use crate::telemetry::{current_trace_id, FaucetMetrics, RequestLabels};
 
 // ---------------------------------------------------------------------------
@@ -1064,8 +1064,25 @@ fn render_index(s: &ServiceStatus, outcome: Option<&RequestOutcome>) -> String {
     row("peers", s.peers.to_string());
     row("queue", format!("{} of {}", s.queued, s.queue_capacity));
     row("estimated wait", format!("{} block(s) at the note-starved rate", s.wait_blocks));
-    row("notes spendable", s.notes_held.to_string());
+    // Lab #539: this row was labelled `notes spendable` while printing
+    // `inventory().len()` — every note *held*, selectable or not. On 2026-08-20 the
+    // page carried "notes spendable 113" under a banner saying the faucet could not
+    // pay: the label was the lie, not the number. The name now says what the number
+    // is, and the question the label was answering gets its own row, derived from
+    // the same `Availability` the banner renders so the two cannot disagree.
+    row("notes held", s.notes_held.to_string());
     row("notes maturing", s.notes_maturing.to_string());
+    row(
+        "spendable now",
+        match &s.availability {
+            Availability::Ready { grants } => {
+                format!("yes — {grants} grant{} of value", if *grants == 1 { "" } else { "s" })
+            }
+            // Not a second explanation — one word, and the state line above it is
+            // the explanation. `explain()` is the crate's single answer to why.
+            _ => "no — see the state line above".to_string(),
+        },
+    );
     row("grants confirmed (this process)", s.confirmed.to_string());
     body.push_str("</table>\n");
 
@@ -1196,6 +1213,40 @@ mod tests {
             assert!(!o.message().is_empty(), "{o:?} must say something");
         }
         assert_eq!(RequestOutcome::Queued { receipt: 1, position: 1 }.status(), 202);
+    }
+
+    /// 🔴 **Lab #539 — one page, one answer to "can this faucet pay?".** The live
+    /// page on 2026-08-20 put "notes spendable 113" in the table under a banner
+    /// saying the faucet could not pay at all. The table's number was the honest
+    /// `inventory().len()`; the *label* was the lie. So: no row claims spendability
+    /// while the banner refuses, and the row that answers the question is derived
+    /// from the same `Availability` the banner renders.
+    #[test]
+    fn no_row_claims_spendable_notes_while_the_banner_says_the_faucet_cannot_pay() {
+        let mut s = lock(&a_status(crate::state::Availability::Maturing {
+            held: 113,
+            maturing: 26,
+            matures_at: 472,
+            tip: 470,
+            shortage: crate::state::Shortage::NoWitness,
+        }))
+        .clone();
+        s.notes_held = 113;
+        s.notes_maturing = 26;
+        let page = render_index(&s, None);
+
+        assert!(!page.contains("notes spendable"), "the label that lied is gone: {page}");
+        assert!(page.contains("notes held"), "{page}");
+        assert!(page.contains("spendable now"), "{page}");
+        assert!(page.contains("no — see the state line above"), "{page}");
+        // The banner and the table now count the same two populations the same way.
+        assert!(page.contains("26 coinbase note(s) mature at height 472"), "{page}");
+        assert!(!page.contains("139"), "no surface publishes the sum: {page}");
+
+        // …and when it *can* pay, the same row says so with the banner's own figure.
+        let ready = lock(&a_status(crate::state::Availability::Ready { grants: 7 })).clone();
+        let page = render_index(&ready, None);
+        assert!(page.contains("yes — 7 grants of value"), "{page}");
     }
 
     /// 🔴 The unavailable path refuses **without consulting the gate**, so the
