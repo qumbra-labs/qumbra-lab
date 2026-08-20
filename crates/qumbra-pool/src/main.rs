@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use qumbra_pool::config::PoolConfig;
 use qumbra_pool::endpoint::serve;
-use qumbra_pool::Pool;
+use qumbra_pool::{JobOutbox, Pool, TemplateWatch};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -66,7 +66,12 @@ fn check(args: &[String]) -> Result<(), Box<dyn Error>> {
     println!("  payout_rkm:        configured (non-zero)");
     if let Some(url) = &cfg.node_rpc {
         println!("  node_rpc:          {url}");
-        println!("  poll_ms:           {}", cfg.poll_ms.unwrap_or(1000));
+        println!("  poll_ms:           {}", cfg.poll_interval_ms());
+        println!(
+            "  stall:             {} failed polls / {}ms without a good template",
+            cfg.stall_poll_failures(),
+            cfg.stall_age_ms()
+        );
         println!("  template:          live (GET /v1/mine/template)");
     } else {
         let form = cfg.form()?;
@@ -108,6 +113,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         stop2.store(true, Ordering::SeqCst);
     })?;
 
+    let outbox = Arc::new(JobOutbox::new());
     #[cfg(feature = "randomx")]
     let pool = if let Some(url) = cfg.node_rpc.clone() {
         let live = qumbra_pool::NodeRpcTemplateSource::connect(&url)?;
@@ -121,27 +127,82 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
             payout_rkm,
         )?);
         pool.set_submitter(Arc::new(client));
-        let poll = Duration::from_millis(cfg.poll_ms.unwrap_or(1000));
+        pool.set_outbox(Arc::clone(&outbox));
+        let poll = Duration::from_millis(cfg.poll_interval_ms());
+        let stall_failures = cfg.stall_poll_failures();
+        let stall_age = Duration::from_millis(cfg.stall_age_ms());
+        let watch = Arc::new(TemplateWatch::new(stall_failures, stall_age));
         let pool_poll = Arc::clone(&pool);
         let stop_poll = Arc::clone(&stop);
+        let watch_poll = Arc::clone(&watch);
+        let outbox_poll = Arc::clone(&outbox);
         std::thread::spawn(move || {
             while !stop_poll.load(Ordering::SeqCst) {
                 std::thread::sleep(poll);
                 match live.poll() {
-                    Ok(true) => {
-                        let t = live.snapshot();
-                        if let Err(e) =
-                            pool_poll.replace_template(Box::new(qumbra_pool::HeldTemplateSource::new(t)))
-                        {
-                            qlab_devnet::jeprintln!(WARN, "pool template re-issue: {e}");
+                    Ok(changed) => {
+                        let recovering = pool_poll.is_unavailable();
+                        watch_poll.record_ok();
+                        if changed || recovering {
+                            let t = live.snapshot();
+                            match pool_poll
+                                .replace_template(Box::new(qumbra_pool::HeldTemplateSource::new(t)))
+                            {
+                                Ok(jobs) => {
+                                    let snap = watch_poll.snapshot();
+                                    let why = if recovering {
+                                        "recovered"
+                                    } else {
+                                        "tip changed"
+                                    };
+                                    qlab_devnet::jprintln!(
+                                        "pool template: {why}; pushed {} job(s); poll_failures={} consecutive={} last_good_s={} jobs_pushed={}",
+                                        jobs.len(),
+                                        snap.template_poll_failures,
+                                        snap.consecutive_failures,
+                                        snap.seconds_since_last_good_template,
+                                        outbox_poll.jobs_pushed()
+                                    );
+                                }
+                                Err(e) => {
+                                    qlab_devnet::jeprintln!(WARN, "pool template re-issue: {e}");
+                                }
+                            }
                         }
                     }
-                    Ok(false) => {}
-                    Err(e) => qlab_devnet::jeprintln!(WARN, "pool template poll: {e}"),
+                    Err(e) => {
+                        if let Some(reason) = watch_poll.record_err() {
+                            pool_poll.suspend_work(&reason);
+                            let snap = watch_poll.snapshot();
+                            qlab_devnet::jeprintln!(
+                                WARN,
+                                "pool template poll: {e}; {reason}; poll_failures={} consecutive={} last_good_s={} jobs_pushed={}",
+                                snap.template_poll_failures,
+                                snap.consecutive_failures,
+                                snap.seconds_since_last_good_template,
+                                outbox_poll.jobs_pushed()
+                            );
+                        } else {
+                            let snap = watch_poll.snapshot();
+                            qlab_devnet::jeprintln!(
+                                WARN,
+                                "pool template poll: {e}; poll_failures={} consecutive={} last_good_s={} jobs_pushed={}",
+                                snap.template_poll_failures,
+                                snap.consecutive_failures,
+                                snap.seconds_since_last_good_template,
+                                outbox_poll.jobs_pushed()
+                            );
+                        }
+                    }
                 }
             }
         });
-        qlab_devnet::jprintln!("  node_rpc: {url}  poll_ms={}", cfg.poll_ms.unwrap_or(1000));
+        qlab_devnet::jprintln!(
+            "  node_rpc: {url}  poll_ms={} stall={}/{}ms",
+            cfg.poll_interval_ms(),
+            cfg.stall_poll_failures(),
+            cfg.stall_age_ms()
+        );
         qlab_devnet::jprintln!("  form: {form:?} (from live node)");
         pool
     } else {
@@ -159,7 +220,10 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let bound = listener.local_addr()?;
     qlab_devnet::jprintln!("qumbra-pool listening on {bound}  share_diff={share_difficulty}");
     if !pool.current_template().serves_stock_xmrig() {
-        qlab_devnet::jprintln!(WARN, "  ⚠️  v4 template: stock-xmrig login will be refused (#356 UNCLEAN)");
+        qlab_devnet::jprintln!(
+            WARN,
+            "  ⚠️  v4 template: stock-xmrig login will be refused (#356 UNCLEAN)"
+        );
     }
     qlab_devnet::jprintln!("  share-PoW: qlab_pow::RandomXHasher + #490 strict <");
     qlab_devnet::jprintln!(
@@ -167,7 +231,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         qumbra_pool::PPLNS_WINDOW_SHARES
     );
 
-    serve(listener, pool, stop)?;
+    serve(listener, pool, stop, outbox)?;
     qlab_devnet::jprintln!("qumbra-pool stopped");
     Ok(())
 }

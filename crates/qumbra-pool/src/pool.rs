@@ -5,15 +5,18 @@
 //! and applies xmrig's strict `<` at the share filter only.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use qlab_pow::KeyBlockSchedule;
 use qlab_stratum::blob::apply_miner_nonce;
 use qlab_stratum::codec::{decode_line, DecodedLine};
 use qlab_stratum::target::{encode_target_le_hex, target_from_difficulty};
 use qlab_stratum::types::{
-    Job, KeepalivedParams, LoginParams, LoginResult, StratumRequest, StratumResponse, SubmitParams,
+    job_notification, Job, KeepalivedParams, LoginParams, LoginResult, StratumRequest,
+    StratumResponse, SubmitParams,
 };
+
+use crate::outbox::JobOutbox;
 
 use crate::accounting::{Ledger, ShareRecord, ShareStatus};
 use crate::hasher::{FixedHasher, ShareHasher};
@@ -81,6 +84,7 @@ impl std::error::Error for PoolError {}
 struct Session {
     login: String,
     extra: [u8; 4],
+    latest_job_id: String,
 }
 
 struct Inner {
@@ -97,7 +101,18 @@ struct Inner {
     pplns: PplnsWindow,
     accounts: Accounts,
     pool_rkm: [u64; 4],
-    submitter: Option<std::sync::Arc<dyn BlockSubmitter>>,
+    submitter: Option<Arc<dyn BlockSubmitter>>,
+    outbox: Option<Arc<JobOutbox>>,
+    unavailable: Option<String>,
+    jobs_issued: u64,
+}
+
+/// Operator counters. Poll-failure / last-good-age live on
+/// [`crate::watch::TemplateWatch`] (the poll thread owns those).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolCounters {
+    pub jobs_issued: u64,
+    pub work_unavailable: Option<String>,
 }
 
 pub struct Pool {
@@ -145,13 +160,54 @@ impl Pool {
                 accounts: Accounts::default(),
                 pool_rkm,
                 submitter: None,
+                outbox: None,
+                unavailable: None,
+                jobs_issued: 0,
             }),
         })
     }
 
     /// Install the node-RPC submit path. A block-class share then POSTs.
-    pub fn set_submitter(&self, submitter: std::sync::Arc<dyn BlockSubmitter>) {
+    pub fn set_submitter(&self, submitter: Arc<dyn BlockSubmitter>) {
         self.inner.lock().expect("pool mutex").submitter = Some(submitter);
+    }
+
+    /// Install the job outbox the endpoint drains. [`Self::replace_template`]
+    /// deposits into it so a discarded `Ok` value cannot swallow the push.
+    pub fn set_outbox(&self, outbox: Arc<JobOutbox>) {
+        self.inner.lock().expect("pool mutex").outbox = Some(outbox);
+    }
+
+    /// Connection gone. Outstanding jobs for this session stay stale in
+    /// the store; they are not re-issued.
+    pub fn drop_session(&self, sid: &str) {
+        self.inner.lock().expect("pool mutex").sessions.remove(sid);
+    }
+
+    /// Stop issuing work and mark every outstanding job stale. Live
+    /// sessions are told via the outbox (named reason, then disconnect).
+    pub fn suspend_work(&self, reason: impl Into<String>) {
+        let mut g = self.inner.lock().expect("pool mutex");
+        let reason = reason.into();
+        g.unavailable = Some(reason.clone());
+        g.jobs.mark_all_stale();
+        let outbox = g.outbox.clone();
+        drop(g);
+        if let Some(outbox) = outbox {
+            outbox.unavailable_all(reason);
+        }
+    }
+
+    pub fn is_unavailable(&self) -> bool {
+        self.inner.lock().expect("pool mutex").unavailable.is_some()
+    }
+
+    pub fn counters(&self) -> PoolCounters {
+        let g = self.inner.lock().expect("pool mutex");
+        PoolCounters {
+            jobs_issued: g.jobs_issued,
+            work_unavailable: g.unavailable.clone(),
+        }
     }
 
     pub fn register_account(&self, login: impl Into<String>, rkm: [u64; 4]) {
@@ -201,17 +257,16 @@ impl Pool {
     }
 
     /// Replace the template source's current tip. Outstanding jobs become
-    /// stale; each live session gets a fresh job. The endpoint fans the
-    /// returned `(session_id, Job)` pairs out as `job` notifications.
-    ///
-    /// Stage 1's live binary holds a static template; tests call this to
-    /// prove the stale-job path.
+    /// stale; each live session gets a fresh job. The pairs are deposited
+    /// into the installed [`JobOutbox`] (if any) as well as returned, so
+    /// a caller that discards `Ok` still cannot swallow the push.
     pub fn replace_template(
         &self,
         source: Box<dyn TemplateSource>,
     ) -> Result<Vec<(String, Job)>, PoolError> {
         let mut g = self.inner.lock().expect("pool mutex");
         g.source = source;
+        g.unavailable = None;
         g.jobs.mark_all_stale();
         let template = g.source.current();
         if !template.serves_stock_xmrig() {
@@ -223,6 +278,11 @@ impl Pool {
             let extra = g.sessions[&sid].extra;
             let job = issue_job(&mut g, &sid, extra, &template)?;
             out.push((sid, job));
+        }
+        let outbox = g.outbox.clone();
+        drop(g);
+        if let Some(outbox) = outbox {
+            outbox.push_all(out.clone());
         }
         Ok(out)
     }
@@ -274,6 +334,13 @@ impl Pool {
         }
 
         let mut g = self.inner.lock().expect("pool mutex");
+        if let Some(reason) = g.unavailable.clone() {
+            return Ok(vec![Outgoing::Reply(StratumResponse::err(
+                rid,
+                ERR_INVALID,
+                reason,
+            ))]);
+        }
         let template = g.source.current();
         if !template.serves_stock_xmrig() {
             g.ledger.record(ShareRecord {
@@ -303,6 +370,7 @@ impl Pool {
             Session {
                 login: params.login,
                 extra,
+                latest_job_id: job.job_id.clone(),
             },
         );
         *session_id = Some(sid.clone());
@@ -400,11 +468,7 @@ impl Pool {
                 status: ShareStatus::Stale,
                 block_candidate: false,
             });
-            return Ok(vec![Outgoing::Reply(StratumResponse::err(
-                rid,
-                ERR_UNKNOWN_JOB,
-                "unknown job id",
-            ))]);
+            return Ok(stale_followup(&mut g, local, rid, "unknown job id"));
         };
         if job.stale || job.session_id != local {
             let status = if job.stale {
@@ -423,12 +487,14 @@ impl Pool {
                 status,
                 block_candidate: false,
             });
-            let (code, msg) = if job.stale {
-                (ERR_UNKNOWN_JOB, "stale job")
-            } else {
-                (ERR_UNAUTHORIZED, "job belongs to another session")
-            };
-            return Ok(vec![Outgoing::Reply(StratumResponse::err(rid, code, msg))]);
+            if job.stale {
+                return Ok(stale_followup(&mut g, local, rid, "stale job"));
+            }
+            return Ok(vec![Outgoing::Reply(StratumResponse::err(
+                rid,
+                ERR_UNAUTHORIZED,
+                "job belongs to another session",
+            ))]);
         }
         if g.ledger.has_duplicate(&params.job_id, &nonce) {
             g.ledger.record(ShareRecord {
@@ -512,14 +578,9 @@ impl Pool {
             block_candidate: block,
         });
         let pending_submit = if block {
-            job.body.clone().map(|body| {
-                (
-                    job.form,
-                    blob,
-                    body,
-                    g.submitter.clone(),
-                )
-            })
+            job.body
+                .clone()
+                .map(|body| (job.form, blob, body, g.submitter.clone()))
         } else {
             None
         };
@@ -531,7 +592,9 @@ impl Pool {
                     Err(e) => eprintln!("pool block refused: {e}"),
                 },
                 None => {
-                    eprintln!("pool block candidate at height (no submitter installed; logged only)")
+                    eprintln!(
+                        "pool block candidate at height (no submitter installed; logged only)"
+                    )
                 }
             }
         }
@@ -598,6 +661,67 @@ impl Pool {
     }
 }
 
+/// On a stale/unknown-job reject: if we have current work, piggyback a
+/// `job` notify so the miner is not left hashing something we will
+/// reject; if we do not, name why on the error itself.
+fn stale_followup(g: &mut Inner, sid: &str, rid: u64, msg: &str) -> Vec<Outgoing> {
+    if let Some(reason) = g.unavailable.clone() {
+        return vec![Outgoing::Reply(StratumResponse::err(
+            rid,
+            ERR_UNKNOWN_JOB,
+            format!("{msg}; {reason}"),
+        ))];
+    }
+    let fresh = g
+        .sessions
+        .get(sid)
+        .and_then(|s| g.jobs.get(&s.latest_job_id).cloned())
+        .filter(|j| !j.stale);
+    let job = if let Some(issued) = fresh {
+        Some(job_from_issued(&issued))
+    } else if let Some(extra) = g.sessions.get(sid).map(|s| s.extra) {
+        let template = g.source.current();
+        if template.serves_stock_xmrig() {
+            issue_job(g, sid, extra, &template).ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    match job {
+        Some(job) => {
+            let mut out = vec![Outgoing::Reply(StratumResponse::err(
+                rid,
+                ERR_UNKNOWN_JOB,
+                msg,
+            ))];
+            if let Ok(req) = job_notification(&job) {
+                out.push(Outgoing::Notify(req));
+            }
+            out
+        }
+        None => vec![Outgoing::Reply(StratumResponse::err(
+            rid,
+            ERR_UNKNOWN_JOB,
+            format!("{msg}; no-fresh-job"),
+        ))],
+    }
+}
+
+fn job_from_issued(issued: &IssuedJob) -> Job {
+    Job {
+        blob: hexutil::encode(&issued.blob),
+        job_id: issued.job_id.clone(),
+        target: encode_target_le_hex(issued.target),
+        algo: Some(ALGO_RX0.into()),
+        height: Some(issued.height),
+        seed_hash: Some(hexutil::encode(&issued.seed_hash)),
+        next_seed_hash: issued.next_seed_hash.map(|h| hexutil::encode(&h)),
+        id: Some(issued.session_id.clone()),
+    }
+}
+
 fn issue_job(
     g: &mut Inner,
     session_id: &str,
@@ -605,6 +729,7 @@ fn issue_job(
     template: &Template,
 ) -> Result<Job, PoolError> {
     g.job_seq += 1;
+    g.jobs_issued += 1;
     let job_id = format!("j{:08x}", g.job_seq);
     let blob = template
         .blob_with_extranonce(extra)
@@ -645,6 +770,9 @@ fn issue_job(
         id: Some(session_id.to_string()),
     };
     g.jobs.insert(issued);
+    if let Some(session) = g.sessions.get_mut(session_id) {
+        session.latest_job_id = job.job_id.clone();
+    }
     Ok(job)
 }
 
@@ -1002,5 +1130,95 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn stale_reject_piggybacks_the_fresh_job() {
+        let pool = pool_v5();
+        let (sid, first) = login_ok(&pool);
+        let sid = sid.unwrap();
+        let old = first.job.job_id.clone();
+        let new_jobs = pool
+            .replace_template(Box::new(HeldTemplateSource::new(template(
+                GenesisForm::V5,
+                101,
+            ))))
+            .unwrap();
+        assert_eq!(new_jobs[0].1.height, Some(101));
+
+        let mut s = Some(sid.clone());
+        let out = pool
+            .handle_line(
+                &mut s,
+                &submit_line(&sid, &old, "aabbccdd", &passing_result(), Some("rx/0")),
+            )
+            .unwrap();
+        assert_eq!(out.len(), 2, "stale reply + job notify, got {}", out.len());
+        assert_eq!(reply_status(&out).0, Some(ERR_UNKNOWN_JOB));
+        let Outgoing::Notify(req) = &out[1] else {
+            panic!("expected job notify after stale reject");
+        };
+        assert_eq!(req.method, "job");
+        let height = req.params.get("height").and_then(|v| v.as_u64());
+        assert_eq!(height, Some(101));
+        assert_ne!(
+            req.params.get("job_id").and_then(|v| v.as_str()),
+            Some(old.as_str())
+        );
+    }
+
+    #[test]
+    fn suspend_refuses_login_and_names_stale_reject() {
+        let pool = pool_v5();
+        let (sid, first) = login_ok(&pool);
+        let sid = sid.unwrap();
+        let issued = pool.counters().jobs_issued;
+        pool.suspend_work("template-unavailable: 3 consecutive poll failures (max 3) / 3000ms since last good template (max 3000ms)");
+        assert!(pool.is_unavailable());
+        assert!(pool
+            .counters()
+            .work_unavailable
+            .as_deref()
+            .unwrap()
+            .starts_with("template-unavailable:"));
+
+        let mut fresh = None;
+        let out = pool
+            .handle_line(&mut fresh, &login_line(Some(vec!["rx/0".into()])))
+            .unwrap();
+        assert!(fresh.is_none());
+        let Outgoing::Reply(resp) = &out[0] else {
+            panic!("expected reply");
+        };
+        let err = resp.error.as_ref().unwrap();
+        assert_eq!(err.code, ERR_INVALID);
+        assert!(err.message.starts_with("template-unavailable:"));
+        assert_eq!(
+            pool.counters().jobs_issued,
+            issued,
+            "a stall must not issue more jobs"
+        );
+
+        let mut s = Some(sid.clone());
+        let out = pool
+            .handle_line(
+                &mut s,
+                &submit_line(
+                    &sid,
+                    &first.job.job_id,
+                    "aabbccdd",
+                    &passing_result(),
+                    Some("rx/0"),
+                ),
+            )
+            .unwrap();
+        assert_eq!(out.len(), 1, "no job to piggyback while unavailable");
+        let Outgoing::Reply(resp) = &out[0] else {
+            panic!("expected reply");
+        };
+        let err = resp.error.as_ref().unwrap();
+        assert_eq!(err.code, ERR_UNKNOWN_JOB);
+        assert!(err.message.contains("stale job"));
+        assert!(err.message.contains("template-unavailable:"));
     }
 }
