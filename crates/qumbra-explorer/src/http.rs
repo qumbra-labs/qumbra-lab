@@ -1045,6 +1045,7 @@ mod tests {
             }],
             tip_height: 19_100,
             tip_hash: Some([0xfe; 32]),
+            name_boundary: qlab_devnet::names::NAME_RULE_BOUNDARY_HEIGHT,
         }
     }
 
