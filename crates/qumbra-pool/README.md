@@ -51,12 +51,14 @@ Eighteen seconds from `READY` to an accepted share, against the public endpoint,
 
 🔴 **The endpoint is reachable but deliberately unadvertised, and those two issues are why.**
 Public stratum has no connection cap, no line-length bound and a per-syscall rather than
-per-connection timeout (#544); and when the node refuses to assemble a template — which it
-correctly does while a tip is contested — the pool **keeps issuing jobs from its stale copy**, so
-miners hash a doomed tip instead of being told there is no work (#545). Neither is a risk to the
-chain or to any key; both are ways a miner burns electricity for nothing. **The window in which
-this endpoint is exposed and unprotected is one nobody has been told about, which makes it the
-cheapest time we will ever have to fix them.**
+per-connection timeout (#544). #545 is two defects, not one: the poll thread discarded the jobs
+`replace_template` already built, so a miner got work at login and never again (every later share
+came back `stale job`, connection up, no message); and a held template with no staleness bound
+would keep that last job live while the node is unreachable. The node's refusal to assemble on a
+contested tip is correct and is not in scope. Neither defect is a risk to the chain or to any key;
+both are ways a miner burns electricity for nothing. **The window in which this endpoint is
+exposed and unprotected is one nobody has been told about, which makes it the cheapest time we
+will ever have to fix them.** The board stays ⬜ until the coordinator accepts the software.
 
 ### Ruled out of scope for now — deliberately, not forgotten
 
@@ -127,7 +129,9 @@ fields that matter:
 | `listen_addr` | where stratum listens. `3333` is conventional. |
 | `share_difficulty` | the share target handed to miners; below chain difficulty by design |
 | `node_rpc` | your node's mine-RPC base URL. **This is the real template source.** |
-| `poll_ms` | how often to re-ask for a template (job re-issue follows tip changes) |
+| `poll_ms` | how often to re-ask the node for a template (default 1000). On a tip change the pool replaces the held template, marks outstanding jobs stale, and **pushes a `job` notification** to each live session |
+| `template_max_poll_failures` | consecutive failed polls before work is suspended (default 3) |
+| `template_max_age_ms` | wall-clock without a successful poll before work is suspended. Unset, this is `template_max_poll_failures × poll_ms` so the bound tracks the poll cadence rather than a second literal |
 | `payout_rkm` | the pool's own payout identity, from `qumbra-wallet miner-rkm` |
 | `[template]` | a **static fixture** for tests only — see the refusal below |
 
