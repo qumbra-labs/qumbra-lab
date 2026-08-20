@@ -9,6 +9,7 @@ remember to re-run.
 |---|---|
 | `t2-faucet-panic-0932Z/` | 🔴 **A store the product wrote and then could not reopen.** svc1's faucet node, healthy and serving at tip 248, was recreated by an ordinary `docker compose up -d --force-recreate`. It panicked on open, eleven times in a row. |
 | `t2-cbnode-healthy-0919Z/` | The control: svc0's cbnode, same host family, same chain, running normally at tip 233. Opens clean. |
+| `t2-guimine-panic-1357Z/` | 🔴 **The same panic from a different kind of node.** An hour-old store created by a user's own `qumbra-node mine` — the desktop wallet's child process — which panicked on the ordinary restart a person causes by quitting and reopening the app. Tip 467, `snapshot.bin` present. |
 
 ## The failure the panic fixture reproduces
 
@@ -52,3 +53,22 @@ and different moments, and the panic store's recreate also delivered new config
 had no config change at all. The defect plainly exists without a config change, but these
 two events are not byte-identical in their trigger — a fix validated against only one of
 them is validated against half the evidence.
+
+## Why the third fixture is not redundant
+
+The first two came from **long-lived fleet service nodes** on hosts we operate, so their
+shared provenance was a live confound: a reader could reasonably ask whether the defect
+belonged to fleet write patterns, uptime, or service-node workloads. This one was created
+about an hour before it died, by `qumbra-node mine` on an operator's laptop, mining to a
+wallet's own payout key — the path a stranger following the public guide takes. It carries
+**32 rewinds, the first at height 37**, which also says rewinds are ordinary rather than
+rare, so any running node accumulates them.
+
+It was captured the way the other two were: copied out of the wallet's node directory
+**before** anything could overwrite it, and a copy of that copy reproduces the panic on
+demand under the pre-fix binary while `claude/i-store-replay-panic` opens it clean
+(`RECOVERY restored snapshot at height 467, replayed 0 records, resumed at tip 467`).
+
+`peers.dat` dropped, per the rule above. There is no key material in a datadir: the payout
+identity is an `rkm`, a public payee key, and it lives in `node.toml`, which is not part of
+the capture.
