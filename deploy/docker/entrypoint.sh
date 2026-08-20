@@ -9,10 +9,9 @@
 #   entrypoint.sh faucet        the T1 faucet listener on a KEYLESS node of its own
 #                               (issue #123) — mints its own key material once into
 #                               its data volume, mines to its own rkm, serves HTTP
-#   entrypoint.sh pool          the T2 pool (lab #511 / G4) — talks to ITS OWN
-#                               node on the same host via QUMBRA_NODE_RPC
-#                               (default http://127.0.0.1:9420). That node must
-#                               have template_serving = true.
+#   entrypoint.sh pool          the T2 pool (lab #511 / G4) — talks to its node
+#                               over the compose bridge by service name. The node
+#                               must have template_serving = true.
 #
 # QUMBRA_BIN selects WHICH node binary runs (issue #74). The halt height is a
 # compile-time release constant with no runtime override (H1), so a "binary swap"
@@ -185,6 +184,24 @@ case "$cmd" in
     done
     peers="${peers%, }"
 
+    # The pool lane uses the same private compose bridge as P2P. A non-loopback
+    # discovery bind is internal-only unless compose publishes it; the lab pool
+    # reaches node0 by service DNS and no 9420 host port is published.
+    pool_rpc_lines=""
+    if [[ -n "${QUMBRA_DISCOVERY_ADDR:-}" ]]; then
+      pool_rpc_lines="discovery_addr = \"$QUMBRA_DISCOVERY_ADDR\""
+    fi
+    if [[ -n "${QUMBRA_TEMPLATE_SERVING:-}" ]]; then
+      case "$QUMBRA_TEMPLATE_SERVING" in
+        true|false) ;;
+        *)
+          echo "run: QUMBRA_TEMPLATE_SERVING must be 'true' or 'false', got '$QUMBRA_TEMPLATE_SERVING'" >&2
+          exit 2
+          ;;
+      esac
+      pool_rpc_lines+=$'\n'"template_serving = $QUMBRA_TEMPLATE_SERVING"
+    fi
+
     # Advertised address: present (default) or deliberately absent — see the header.
     # The `advertise_addr` line is assembled here rather than inside the heredoc so
     # that "absent" means the key is genuinely not in the file, not commented-out-but-
@@ -222,6 +239,7 @@ committee_key_paths = [$keys]
 mining = true
 expected_genesis_hash = "$ghash"
 telemetry_addr = "0.0.0.0:$TELEMETRY_PORT"
+$pool_rpc_lines
 EOF
     # A run whose configuration is not in its own output cannot be trusted
     # afterwards, so stamp BOTH modelled host properties this script knows about on
@@ -345,19 +363,20 @@ EOF
     ;;
 
   pool)
-    # Lab #511: the pool talks to ITS OWN node on the same host. Default
-    # node_rpc is the discovery loopback the node binds when discovery is
-    # left at its default. Override QUMBRA_NODE_RPC if the node is bound
-    # elsewhere. Config path is /tmp/pool.toml (generated) unless
-    # QUMBRA_POOL_CONFIG points at an operator file.
+    # Lab #519: the pool talks to its node over the compose bridge by service
+    # name and publishes 3333 itself. It never shares the node's netns.
+    # Config path is /tmp/pool.toml (generated) unless QUMBRA_POOL_CONFIG
+    # points at an operator file.
     if [[ -n "${QUMBRA_POOL_CONFIG:-}" ]]; then
       echo "pool: using operator config $QUMBRA_POOL_CONFIG"
+      qumbra-pool check --config "$QUMBRA_POOL_CONFIG"
       exec qumbra-pool run --config "$QUMBRA_POOL_CONFIG"
     fi
     listen="${QUMBRA_POOL_LISTEN:-0.0.0.0:3333}"
     share="${QUMBRA_POOL_SHARE_DIFFICULTY:-1024}"
-    node_rpc="${QUMBRA_NODE_RPC:-http://127.0.0.1:9420}"
+    node_rpc="${QUMBRA_NODE_RPC:-http://node0:9420}"
     poll="${QUMBRA_POOL_POLL_MS:-1000}"
+    payout="${QUMBRA_POOL_PAYOUT_RKM:-0000000000000000000000000000000000000000000000000000000000000000}"
     cfg=/tmp/pool.toml
     cat > "$cfg" <<EOF
 # generated in-container by entrypoint.sh pool (lab #511)
@@ -365,6 +384,7 @@ listen_addr = "$listen"
 share_difficulty = $share
 node_rpc = "$node_rpc"
 poll_ms = $poll
+payout_rkm = "$payout"
 EOF
     cpu_budget_line pool
     echo "== pool config =="
