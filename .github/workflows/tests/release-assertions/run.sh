@@ -41,10 +41,28 @@ FAIL=0
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-make_node_stub() { # $1 = fixture, $2 = build rev to substitute
+# $1 = fixture, $2 = build rev to substitute, $3 = baked net, $4 = baked genesis
+# hash. An EMPTY $3 stands for a binary from before lab #527: it has no
+# `--print-net` and refuses the flag, which is what every published binary up to
+# and including t2-644a129 does.
+make_node_stub() {
   local out="$TMP/qumbra-node-stub"
   {
     echo '#!/usr/bin/env bash'
+    echo "if [ \"\${1:-}\" = mine ] && [ \"\${2:-}\" = --print-net ]; then"
+    if [ -n "${3:-}" ]; then
+      echo "  echo 'qumbra-node mine — baked network identity'"
+      echo "  echo 'net: $3'"
+      echo "  echo 'genesis hash: $4'"
+      echo "  echo 'genesis url: https://seed.qumbra.org/genesis.qmb'"
+      echo "  echo 'seeds: 18.202.166.126:9444'"
+      echo "  echo 'pin source: stamped into this binary by the release lane for net $3'"
+      echo "  exit 0"
+    else
+      echo "  echo 'mine: unknown flag --print-net' >&2"
+      echo "  exit 1"
+    fi
+    echo "fi"
     echo "[ \"\${1:-}\" = halt-status ] || { echo \"stub: unexpected args: \$*\" >&2; exit 64; }"
     echo "sed 's/BUILDREV/$2/' '$1'"
     # A release that refuses to start exits non-zero from halt-status; the fixture
@@ -78,15 +96,28 @@ make_pool_stub() {
   echo "$out"
 }
 
+# The net the lane is cutting, and the hash its preflight measured off the
+# genesis actually being served. Same values as select-release-net.sh; the pin
+# checks at the bottom are what stop this copy going stale.
+CUT_NET=t2
+T1_HASH=138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb
+T2_HASH=d1dad4ea2bc5bfc4880ecf25206d182cddeacc12b0f65eca1a1ce2f27a93e2f3
+
 # expect <want:pass|fail> <name> <node-fixture> <node-rev> <wallet-rev>
+#        [baked-net] [baked-hash]
+# The last two default to a binary correctly baked for the net being cut; pass
+# them to describe a binary that is not, and pass an EMPTY baked-net for a
+# pre-lab-#527 binary that cannot answer the question at all.
 expect() {
   local want=$1 name=$2 fixture=$3 nrev=$4 wrev=$5
+  local bnet=${6-$CUT_NET} bhash=${7-$T2_HASH}
   local node wallet pool out rc
-  node=$(make_node_stub "$FIX/$fixture" "$nrev")
+  node=$(make_node_stub "$FIX/$fixture" "$nrev" "$bnet" "$bhash")
   wallet=$(make_wallet_stub "$wrev")
   pool=$(make_pool_stub)
   out=$(cd "$TMP" && NODE_BIN="$node" WALLET_BIN="$wallet" POOL_BIN="$pool" \
         EXPECTED_BUILD_REV="$BUILD_REV" \
+        NET="$CUT_NET" GENESIS_HASH="$T2_HASH" \
         FROZEN_PIN=a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b \
         EXPECTED_REVISION=v1.1-exact-emission \
         EXPECTED_DOMAIN=56447169ab09956fcb78e8fb79a7cf2b502bd42194960226f83da2fb64db20b0 \
@@ -127,6 +158,24 @@ expect fail "recomputed frozen digest drifted" halt-status-recomputed-drift.txt 
 expect fail "the node ignored QUMBRA_BUILD_REV" halt-status-unstamped.txt "$BUILD_REV" "$BUILD_REV"
 expect fail "the node carries a different revision" halt-status-resume.txt someotherrev "$BUILD_REV"
 expect fail "the wallet is from a different build" halt-status-resume.txt "$BUILD_REV" someotherrev
+
+# 🔴 Lab #527, reproduced at the gate. The T2 release shipped a binary whose
+# `mine` baked T1's genesis hash: it downloaded the correct T2 genesis and
+# refused it, breaking the path the public join guide advertises as THE
+# one-command solo route, four hours into T2. Every other assertion in this file
+# passed on that artifact, because every other assertion exercises the config
+# path and `mine` writes its own config from compiled-in constants.
+expect fail "the shipped T2 defect: mine baked for t1" halt-status-resume.txt \
+       "$BUILD_REV" "$BUILD_REV" t1 "$T1_HASH"
+# The same defect with the label right and only the number wrong — a build told
+# the net but not given QUMBRA_GENESIS_HASH, or whose net table went stale.
+expect fail "right net, wrong genesis pin" halt-status-resume.txt \
+       "$BUILD_REV" "$BUILD_REV" t2 "$T1_HASH"
+# A binary from before this check existed cannot answer the question, and an
+# unanswerable question is a refusal rather than a skip: every such binary bakes
+# exactly one net.
+expect fail "a pre-#527 binary with no --print-net" halt-status-resume.txt \
+       "$BUILD_REV" "$BUILD_REV" "" ""
 
 # `halt-status` exits non-zero when the release refuses to start. The gate must
 # carry that through `| tee` — this is a `pipefail` regression test, and the same
@@ -173,6 +222,25 @@ pin "T1 genesis pin still reachable" "$SELECT" \
     "T1_GENESIS_HASH=138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb"
 pin "cutover refusal text" "$SELECT" \
     "published genesis is still t1 — run this after the cutover"
+
+# Lab #527: the net must reach the BUILD, not just the smoke and the packaging.
+# Both stamps, because a hash with no net label cannot be checked back out, and
+# a net label with no hash is what the shipped T2 binary effectively had.
+pin "the build is stamped with the net" "$WORKFLOW" \
+    "QUMBRA_NET: \${{ needs.preflight.outputs.net }}"
+pin "the build is stamped with the genesis pin" "$WORKFLOW" \
+    "QUMBRA_GENESIS_HASH: \${{ needs.preflight.outputs.genesis_hash }}"
+
+# The node's own net table is the fourth copy of these pins, and the reason this
+# section exists. mine.rs's the_net_table_is_the_release_lanes_net_table asserts
+# the same agreement in Rust; this one costs no cargo, so it also covers the
+# tree where the table was edited and the suite was not run.
+MINE_RS="$HERE/../../../../crates/qumbra-node/src/mine.rs"
+GATE_SH="$HERE/../../scripts/assert-release-artifacts.sh"
+pin "mine.rs pins the same T2 genesis as the lane" "$MINE_RS" "$T2_HASH"
+pin "mine.rs pins the same T1 genesis as the lane" "$MINE_RS" "$T1_HASH"
+pin "mine.rs reads the net stamp" "$MINE_RS" "option_env!(\"QUMBRA_NET\")"
+pin "the gate asks the artifact what net it is" "$GATE_SH" "mine --print-net"
 
 echo ""
 echo "passed $PASS, failed $FAIL"
