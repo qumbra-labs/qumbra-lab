@@ -10,9 +10,11 @@
 //! node config keeps working.
 //!
 //! ```text
-//!   qumbra-node mine --dir DIR [--seeds a,b,…] [--genesis-url URL]
+//!   qumbra-node mine --dir DIR [--net t1|t2] [--genesis-hash 64hex]
+//!                              [--seeds a,b,…] [--genesis-url URL]
 //!                              [--rkm 64hex] [--yes-i-backed-up]
 //!                              [--index N] [--listen ADDR]
+//!   qumbra-node mine --print-net          what net is this binary built for?
 //! ```
 //!
 //! # The four things it does, and the rule each one bends around
@@ -28,12 +30,16 @@
 //! [`WalletOutcome`]). `--rkm` skips all of it — that is today's manual path,
 //! unchanged and untouched.
 //!
-//! **2. Network identity — baked, verified, overridable.** The four T1 seeds,
-//! the pinned genesis hash and the genesis URL are constants here
-//! ([`T1_SEEDS`], [`T1_EXPECTED_GENESIS_HASH`], [`T1_GENESIS_URL`]). Genesis is
-//! downloaded only if absent and is verified **before anything binds** — a
-//! wrong file is refused by name, by URL, and by both hashes, and is never
-//! written to disk. See [`verify_genesis_bytes`] for what "byte-verified"
+//! **2. Network identity — selected, verified, overridable.** The seeds, the
+//! genesis URL and the pinned genesis hash come from a [`NetProfile`]
+//! ([`NET_T1`], [`NET_T2`]) **selected** at build time by the release lane's own
+//! `NET` — never a hardwired constant of one net. That distinction is lab #527:
+//! the published T2 binary carried T1's pin, downloaded the correct T2 genesis
+//! and refused it. [`resolve_identity`] is the selection order and
+//! [`STAMPED_GENESIS_HASH`] is the path that needs no Rust literal at all.
+//! Genesis is downloaded only if absent and is verified **before anything
+//! binds** — a wrong file is refused by name, by URL, and by both hashes, and is
+//! never written to disk. See [`verify_genesis_bytes`] for what "byte-verified"
 //! means here, which is stricter than a hash comparison.
 //!
 //! **3. Config — transparent.** [`render_node_toml`] emits the same key set the
@@ -51,32 +57,317 @@ use std::path::{Path, PathBuf};
 use crate::config::{rkm_lanes_from_hex, NodeConfig};
 use crate::genesis::GenesisFile;
 
-/// The four **public** T1 entry points, from `t1-sg-posture-decision` via
+/// The four **public** entry points, from `t1-sg-posture-decision` via
 /// `docs/join-and-mine.md` §1 (node0 is deliberately not one of them).
+///
+/// **One list for both nets, and that is a fact about the fleet rather than a
+/// simplification.** The cutover repointed the bare service names; it did not
+/// move the hosts (`select-release-net.sh`'s `DIAL_PEERS_BOTH`, lab #516). They
+/// are still a field of [`NetProfile`] so that a net which *does* move them has
+/// somewhere to say so without another edit here.
 ///
 /// 🔴 **Baking these into the binary is a real coupling and it is worth saying
 /// out loud**: a fleet address change is now a rebuild, not a doc edit. That is
 /// the trade a defaults-in-the-binary command makes, and `--seeds` is the
 /// escape hatch for anyone who needs a different set before the next release.
-pub const T1_SEEDS: [&str; 4] =
+pub const PUBLIC_SEEDS: [&str; 4] =
     ["18.202.166.126:9444", "18.141.177.109:9444", "52.194.224.123:9444", "52.5.0.21:9444"];
-
-/// The T1 genesis hash — the value `expected_genesis_hash` carries in every
-/// config on the live net.
-///
-/// **The task book said "the tree already pins it"; it did not.** Before lab
-/// #475 this string existed only inside a `#[cfg(test)]` assertion
-/// (`genesis::tests::genesis_hash_is_pinned`), a commented-out line in
-/// `qumbra-node.example.toml`, and `release-binaries.yml`'s environment — no
-/// constant any code could read. `mine_bakes_the_hash_this_trees_genesis_actually_has`
-/// below is what keeps this literal and the tree's own genesis construction
-/// from drifting apart silently.
-pub const T1_EXPECTED_GENESIS_HASH: &str =
-    "138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb";
 
 /// Where `genesis.qmb` is fetched from when `DIR` does not already have one
 /// (`docs/join-and-mine.md` §1, deploy PR #150).
-pub const T1_GENESIS_URL: &str = "https://seed.qumbra.org/genesis.qmb";
+///
+/// One URL for both nets **because the bare name is what moved** at cutover
+/// (naming §7 as amended, and the reason `select-release-net.sh` must fetch this
+/// URL rather than trust it): the same address served T1's genesis before the
+/// cutover and T2's after. A binary that pins only the URL and not the hash
+/// would therefore silently change nets; that is exactly why the hash is pinned
+/// beside it.
+pub const PUBLISHED_GENESIS_URL: &str = "https://seed.qumbra.org/genesis.qmb";
+
+/// One net's public identity — everything a joiner must agree with before it
+/// binds a socket.
+///
+/// # Why this is a table and not three constants (lab #527)
+///
+/// It was three constants, all named `T1_*`, and the T2 release shipped
+/// carrying them: the published `t2-644a129` binary downloaded the correct T2
+/// genesis and refused it, naming T1's hash as what "this binary expects". The
+/// refusal was right — the *pin* was a compile-time constant of one net in a
+/// binary the release lane had already parameterised for two (lab #516
+/// parameterised the tag, the smoke and the dial peers; `mine` was not in that
+/// list).
+///
+/// The shape that fixes it is the one the release lane already has: an identity
+/// **selected** per net rather than hardwired, so an artifact tagged `t2-*`
+/// cannot carry T1 identity. See [`resolve_identity`] for the selection order
+/// and [`STAMPED_GENESIS_HASH`] for the path that needs no Rust literal at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetProfile {
+    /// The net's name, as the release lane spells it (`t1`, `t2`).
+    pub net: &'static str,
+    /// keccak256 over the canonical encoding of the genesis this net publishes.
+    pub genesis_hash: &'static str,
+    pub genesis_url: &'static str,
+    pub seeds: [&'static str; 4],
+}
+
+/// T1 — retired, kept reachable. `select-release-net.sh` can still cut a `t1-*`
+/// release and this is the identity such a binary must carry.
+pub const NET_T1: NetProfile = NetProfile {
+    net: "t1",
+    genesis_hash: "138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb",
+    genesis_url: PUBLISHED_GENESIS_URL,
+    seeds: PUBLIC_SEEDS,
+};
+
+/// T2 — the live net.
+///
+/// 🔴 **This value cannot be derived from anything in this tree, and that is the
+/// whole lesson of lab #527.** The live T2 genesis was minted at the launch
+/// ceremony from OS-random committee keys
+/// ([`GenesisFile::new_t2_with_committee_seeds`]), so the in-tree rehearsal mint
+/// [`GenesisFile::new_t2`] hashes to a *different* value — a third number that
+/// tracks neither this constant nor the live net. Any test that pins this to an
+/// in-tree mint is asserting a falsehood; the guard that keeps it honest is
+/// `the_net_table_is_the_release_lanes_net_table`, which compares it to
+/// `select-release-net.sh` — the one file in this repo that is checked against
+/// the file actually served at [`PUBLISHED_GENESIS_URL`], on every release cut.
+pub const NET_T2: NetProfile = NetProfile {
+    net: "t2",
+    genesis_hash: "d1dad4ea2bc5bfc4880ecf25206d182cddeacc12b0f65eca1a1ce2f27a93e2f3",
+    genesis_url: PUBLISHED_GENESIS_URL,
+    seeds: PUBLIC_SEEDS,
+};
+
+/// Every net this binary can name. Both directions of this list are checked
+/// against `select-release-net.sh`: a net the lane can cut and this table does
+/// not know is a failure, and so is the reverse.
+pub const KNOWN_NETS: [NetProfile; 2] = [NET_T1, NET_T2];
+
+/// The net a build that was **not** cut by the release lane targets.
+///
+/// Tied by test to `release-binaries.yml`'s own `net:` dispatch default, so a
+/// developer's `cargo build` and an unattended release cut cannot disagree about
+/// which net is current. A cutover changes this word here and there; the test is
+/// what makes forgetting either half loud.
+pub const DEFAULT_NET: &str = "t2";
+
+/// The net this binary was built for, stamped at compile time by the release
+/// lane (`.github/workflows/release-binaries.yml`) via `QUMBRA_NET` — the same
+/// `NET` its preflight resolved through `scripts/select-release-net.sh`.
+///
+/// Same mechanism as [`crate::release::BUILD_REV`], and for the same reason: the
+/// artifact must be able to say what it is. Absent ⇒ [`DEFAULT_NET`].
+pub const BUILT_FOR_NET: &str = match option_env!("QUMBRA_NET") {
+    Some(net) => net,
+    None => DEFAULT_NET,
+};
+
+/// The genesis hash the release lane stamped into this binary via
+/// `QUMBRA_GENESIS_HASH`.
+///
+/// 🔴 **This is the path on which a new net needs no Rust literal.** The lane's
+/// preflight does not read this hash off a shelf: `select-release-net.sh`
+/// downloads the genesis actually being served at [`PUBLISHED_GENESIS_URL`],
+/// keccak256s it, and refuses the cut by name unless it matches the pin for the
+/// selected net. So a stamped value is, transitively, the identity of the file
+/// every joiner will download — measured at cut time, not remembered from one.
+///
+/// `None` for every build that is not a release build, which is the honest
+/// answer and the one [`resolve_identity`] falls back from.
+pub const STAMPED_GENESIS_HASH: Option<&str> = option_env!("QUMBRA_GENESIS_HASH");
+
+/// Where the genesis pin this run enforces came from.
+///
+/// Carried and **printed**, not just used. The lab #527 reproduction was a
+/// stranger reading `this binary expects: 138e15…` with no way to ask *why* it
+/// expected that — the value had exactly one possible origin and the output
+/// still could not name it. Now the line above the refusal says which of four
+/// places the number came from, which is the difference between "this build is
+/// stale" and "I typo'd a flag".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinSource {
+    /// `--genesis-hash HEX` — the operator said so.
+    Flag,
+    /// `--net NAME` — this binary's table entry for a net named on the command line.
+    NetFlag,
+    /// `QUMBRA_GENESIS_HASH`, stamped by the release lane's preflight.
+    ReleaseStamp,
+    /// This binary's built-in table entry for [`BUILT_FOR_NET`].
+    BuiltInTable,
+}
+
+impl PinSource {
+    /// A sentence an operator can act on, naming the mechanism and the lever.
+    pub fn describe(&self, net: &str) -> String {
+        match self {
+            PinSource::Flag => "--genesis-hash on this command line".to_string(),
+            PinSource::NetFlag => format!("--net {net}, from this binary's net table"),
+            PinSource::ReleaseStamp => {
+                format!("stamped into this binary by the release lane for net {net}")
+            }
+            PinSource::BuiltInTable => format!(
+                "this binary's built-in table for net {net} (not a release build; \
+                 override with --net or --genesis-hash)"
+            ),
+        }
+    }
+}
+
+/// The network identity a `mine` run holds itself to, and where each half of it
+/// came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetIdentity {
+    pub net: String,
+    pub genesis_hash: String,
+    pub genesis_url: String,
+    pub seeds: Vec<String>,
+    pub pin_source: PinSource,
+}
+
+impl NetIdentity {
+    /// The `--print-net` report: what this binary is built for, in the shape the
+    /// release lane's artifact gate greps
+    /// (`.github/workflows/scripts/assert-release-artifacts.sh`).
+    pub fn report(&self) -> String {
+        format!(
+            "qumbra-node mine — baked network identity\n\
+             net: {net}\n\
+             genesis hash: {hash}\n\
+             genesis url: {url}\n\
+             seeds: {seeds}\n\
+             pin source: {src}\n",
+            net = self.net,
+            hash = self.genesis_hash,
+            url = self.genesis_url,
+            seeds = self.seeds.join(", "),
+            src = self.pin_source.describe(&self.net),
+        )
+    }
+}
+
+/// This binary's table entry for `net`, if it has one.
+pub fn profile_for(net: &str) -> Option<NetProfile> {
+    KNOWN_NETS.into_iter().find(|p| p.net == net)
+}
+
+/// The net names this binary knows, for a refusal that tells you what to type.
+pub fn known_net_names() -> String {
+    KNOWN_NETS.iter().map(|p| p.net).collect::<Vec<_>>().join(", ")
+}
+
+/// A 64-hex genesis hash, lowercased, or a usage error that says what was wrong.
+fn parse_genesis_hash(hex: &str) -> Result<String, MineError> {
+    let lowered = hex.to_ascii_lowercase();
+    if lowered.len() != 64 || !lowered.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(MineError::Usage(format!(
+            "--genesis-hash needs 64 hex characters (keccak256 over the genesis file's \
+             canonical encoding), got {} character(s)",
+            hex.len()
+        )));
+    }
+    Ok(lowered)
+}
+
+/// Resolve the net identity this run will enforce, highest precedence first.
+///
+/// 1. `--genesis-hash HEX` — an explicit operator pin. Wins over everything,
+///    including a release stamp: someone joining a net this binary predates has
+///    no other lever, and refusing them would recreate lab #527 from the other
+///    side.
+/// 2. `--net NAME` — this binary's table entry for a named net.
+/// 3. [`STAMPED_GENESIS_HASH`] — what the release lane measured off the
+///    published genesis at cut time.
+/// 4. This binary's table entry for [`BUILT_FOR_NET`].
+///
+/// # The one case that refuses
+///
+/// A release stamp for a net this table **also** knows, whose hashes disagree,
+/// is a tree whose Rust table and whose release lane describe different nets. It
+/// cannot be resolved here — either value is defensible from inside the process
+/// — so it is refused by name rather than silently preferred. It is also
+/// unreachable through the verify lane, because
+/// `the_net_table_is_the_release_lanes_net_table` is red for any tree in that
+/// state; this is the runtime half of that guard, for a build that never ran it.
+///
+/// A stamp for a net the table does **not** know is accepted, and is the path on
+/// which adding a net requires no Rust edit at all.
+pub fn resolve_identity(
+    net_flag: Option<&str>,
+    hash_flag: Option<&str>,
+) -> Result<NetIdentity, MineError> {
+    let (net, profile, mut genesis_hash, mut pin_source) = match net_flag {
+        Some(name) => {
+            let profile = profile_for(name).ok_or_else(|| {
+                MineError::Usage(format!(
+                    "--net {name} is not a net this binary knows (it knows: {}). Join it with \
+                     --genesis-hash <64hex> --genesis-url <URL> --seeds <host:port,…> instead — \
+                     no rebuild needed.",
+                    known_net_names()
+                ))
+            })?;
+            (name.to_string(), Some(profile), profile.genesis_hash.to_string(), PinSource::NetFlag)
+        }
+        None => {
+            let profile = profile_for(BUILT_FOR_NET);
+            match (STAMPED_GENESIS_HASH, profile) {
+                (Some(stamped), Some(p)) if !stamped.eq_ignore_ascii_case(p.genesis_hash) => {
+                    return Err(MineError::Usage(format!(
+                        "this binary is internally inconsistent about net {net}: the release \
+                         lane stamped {stamped} into it, and its own net table says {table}. One \
+                         of the two is describing a different net, and this command will not \
+                         guess which. Rebuild from a tree whose net table agrees with \
+                         .github/workflows/scripts/select-release-net.sh, or pass \
+                         --genesis-hash explicitly.",
+                        net = BUILT_FOR_NET,
+                        table = p.genesis_hash,
+                    )))
+                }
+                (Some(stamped), _) => (
+                    BUILT_FOR_NET.to_string(),
+                    profile,
+                    stamped.to_ascii_lowercase(),
+                    PinSource::ReleaseStamp,
+                ),
+                (None, Some(p)) => (
+                    BUILT_FOR_NET.to_string(),
+                    Some(p),
+                    p.genesis_hash.to_string(),
+                    PinSource::BuiltInTable,
+                ),
+                (None, None) => {
+                    return Err(MineError::Usage(format!(
+                        "this binary was built for net {BUILT_FOR_NET}, which it has no genesis \
+                         pin for: QUMBRA_NET was set at build time and QUMBRA_GENESIS_HASH was \
+                         not, and {BUILT_FOR_NET} is not in this binary's net table ({}). Pass \
+                         --net or --genesis-hash, or rebuild with both stamps.",
+                        known_net_names()
+                    )))
+                }
+            }
+        }
+    };
+
+    if let Some(hex) = hash_flag {
+        genesis_hash = parse_genesis_hash(hex)?;
+        pin_source = PinSource::Flag;
+    }
+
+    let (genesis_url, seeds) = match profile {
+        Some(p) => (
+            p.genesis_url.to_string(),
+            p.seeds.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        ),
+        // A net known only by its stamp still gets the published defaults; both
+        // are overridable and the URL is the one that moved at cutover anyway.
+        None => (
+            PUBLISHED_GENESIS_URL.to_string(),
+            PUBLIC_SEEDS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+        ),
+    };
+
+    Ok(NetIdentity { net, genesis_hash, genesis_url, seeds, pin_source })
+}
 
 /// The P2P listen address a `mine`-born config binds — the same one the joiner
 /// config in `docs/join-and-mine.md` §2 uses.
@@ -225,8 +516,17 @@ impl From<std::io::Error> for MineError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MineArgs {
     pub dir: PathBuf,
+    /// The net this run joins — resolved by [`resolve_identity`], never a
+    /// compile-time constant of one net (lab #527).
+    pub net: String,
     pub seeds: Vec<String>,
     pub genesis_url: String,
+    /// The genesis pin this run enforces, at the fetch **and** in the config it
+    /// writes. Both sites read this one field; before lab #527 they read the
+    /// same hardwired constant twice, and a fix that covered one would have left
+    /// the other wrong.
+    pub genesis_hash: String,
+    pub pin_source: PinSource,
     /// `Some` ⇒ the manual path: no wallet is read, created, or looked for.
     pub rkm: Option<String>,
     pub backed_up: bool,
@@ -234,117 +534,197 @@ pub struct MineArgs {
     pub listen_addr: String,
 }
 
-impl MineArgs {
-    /// Parse `mine`'s own flags. Unknown flags are refused rather than ignored,
-    /// the same posture `NodeConfig`'s `deny_unknown_fields` takes: a typo that
-    /// silently does nothing is worse than one that stops you.
-    pub fn parse(args: &[String]) -> Result<MineArgs, MineError> {
-        let mut dir: Option<PathBuf> = None;
-        let mut seeds: Option<Vec<String>> = None;
-        let mut genesis_url = T1_GENESIS_URL.to_string();
-        let mut rkm: Option<String> = None;
-        let mut backed_up = false;
-        let mut index: u64 = 0;
-        let mut listen_addr = DEFAULT_LISTEN_ADDR.to_string();
+/// What a `mine` command line asks for. `--print-net` is the one invocation that
+/// does not prepare a directory, so it is not a [`MineArgs`] with a field set —
+/// it does not have a `--dir` at all, and modelling it as one would mean either
+/// a fake path or an `Option` every other caller has to unwrap.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MinePlan {
+    /// `--print-net`: report the baked identity and exit. Binds nothing, writes
+    /// nothing, reads no wallet, touches no disk.
+    PrintNet(NetIdentity),
+    Prepare(Box<MineArgs>),
+}
 
-        let mut i = 0usize;
-        while i < args.len() {
-            let a = args[i].as_str();
-            // A value-taking flag with no value is a usage error, never a
-            // silent fall-through onto the next flag.
-            let value = |name: &str| -> Result<String, MineError> {
-                args.get(i + 1)
-                    .cloned()
-                    .filter(|v| !v.starts_with("--"))
-                    .ok_or_else(|| MineError::Usage(format!("{name} needs a value")))
-            };
-            match a {
-                "--dir" => {
-                    dir = Some(PathBuf::from(value("--dir")?));
-                    i += 2;
-                }
-                "--seeds" => {
-                    let raw = value("--seeds")?;
-                    let list: Vec<String> = raw
-                        .split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if list.is_empty() {
-                        return Err(MineError::Usage(
-                            "--seeds needs at least one host:port (comma-separated)".into(),
-                        ));
-                    }
-                    seeds = Some(list);
-                    i += 2;
-                }
-                "--genesis-url" => {
-                    genesis_url = value("--genesis-url")?;
-                    i += 2;
-                }
-                "--rkm" => {
-                    let hex = value("--rkm")?;
-                    // Refused HERE, by the node's own parser, rather than at
-                    // startup: a truncated paste is the likely operator error
-                    // and this is the moment they are still looking.
-                    rkm_lanes_from_hex(&hex).map_err(|e| MineError::Usage(format!("--rkm {e}")))?;
-                    rkm = Some(hex);
-                    i += 2;
-                }
-                "--index" => {
-                    let v = value("--index")?;
-                    index = v.parse().map_err(|_| {
-                        MineError::Usage(format!("--index needs a number, got `{v}`"))
-                    })?;
-                    // Bounded because `mine` ALLOCATES up to this index (see
-                    // `ensure_wallet`): unbounded here would be an unbounded
-                    // write, i.e. a second denial of service introduced while
-                    // closing the first.
-                    if index > MAX_MINE_INDEX {
-                        return Err(MineError::Usage(format!(
-                            "--index {index} is above the {MAX_MINE_INDEX} `mine` allocates up \
-                             to. Allocate the index you want with `qumbra-wallet address --new` \
-                             and pass its key with --rkm."
-                        )));
-                    }
-                    i += 2;
-                }
-                "--listen" => {
-                    listen_addr = value("--listen")?;
-                    i += 2;
-                }
-                BACKED_UP_FLAG => {
-                    backed_up = true;
-                    i += 1;
-                }
-                "--config" => {
+/// Everything a `mine` command line can say, before `--dir`'s requirement is
+/// applied — the shape both [`MineArgs::parse`] and [`parse_mine`] resolve from.
+struct RawArgs {
+    dir: Option<PathBuf>,
+    net_flag: Option<String>,
+    hash_flag: Option<String>,
+    seeds: Option<Vec<String>>,
+    genesis_url: Option<String>,
+    rkm: Option<String>,
+    backed_up: bool,
+    index: u64,
+    listen_addr: String,
+    print_net: bool,
+}
+
+impl MineArgs {
+    /// Parse `mine`'s own flags for a run that prepares a directory.
+    ///
+    /// `--print-net` is a usage error here by construction — it has no `--dir`
+    /// and produces no [`MineArgs`]. Callers that must accept it use
+    /// [`parse_mine`], which returns a [`MinePlan`].
+    pub fn parse(args: &[String]) -> Result<MineArgs, MineError> {
+        match parse_mine(args)? {
+            MinePlan::Prepare(a) => Ok(*a),
+            MinePlan::PrintNet(_) => Err(MineError::Usage(
+                "--print-net reports this binary's baked network identity and exits; it does not \
+                 prepare a directory"
+                    .into(),
+            )),
+        }
+    }
+}
+
+/// Parse `mine`'s own flags. Unknown flags are refused rather than ignored,
+/// the same posture `NodeConfig`'s `deny_unknown_fields` takes: a typo that
+/// silently does nothing is worse than one that stops you.
+pub fn parse_mine(args: &[String]) -> Result<MinePlan, MineError> {
+    let raw = parse_raw(args)?;
+    let identity = resolve_identity(raw.net_flag.as_deref(), raw.hash_flag.as_deref())?;
+
+    if raw.print_net {
+        // Deliberately permissive about the rest of the line: `--print-net`
+        // answers "what is this binary" and must not need a wallet, a dir, or a
+        // reachable network to answer it.
+        return Ok(MinePlan::PrintNet(identity));
+    }
+
+    Ok(MinePlan::Prepare(Box::new(MineArgs {
+        dir: raw.dir.ok_or_else(|| MineError::Usage("mine requires --dir DIR".into()))?,
+        net: identity.net,
+        seeds: raw.seeds.unwrap_or(identity.seeds),
+        genesis_url: raw.genesis_url.unwrap_or(identity.genesis_url),
+        genesis_hash: identity.genesis_hash,
+        pin_source: identity.pin_source,
+        rkm: raw.rkm,
+        backed_up: raw.backed_up,
+        index: raw.index,
+        listen_addr: raw.listen_addr,
+    })))
+}
+
+fn parse_raw(args: &[String]) -> Result<RawArgs, MineError> {
+    let mut raw = RawArgs {
+        dir: None,
+        net_flag: None,
+        hash_flag: None,
+        seeds: None,
+        genesis_url: None,
+        rkm: None,
+        backed_up: false,
+        index: 0,
+        listen_addr: DEFAULT_LISTEN_ADDR.to_string(),
+        print_net: false,
+    };
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        // A value-taking flag with no value is a usage error, never a
+        // silent fall-through onto the next flag.
+        let value = |name: &str| -> Result<String, MineError> {
+            args.get(i + 1)
+                .cloned()
+                .filter(|v| !v.starts_with("--"))
+                .ok_or_else(|| MineError::Usage(format!("{name} needs a value")))
+        };
+        match a {
+            "--dir" => {
+                raw.dir = Some(PathBuf::from(value("--dir")?));
+                i += 2;
+            }
+            "--net" => {
+                raw.net_flag = Some(value("--net")?);
+                i += 2;
+            }
+            "--genesis-hash" => {
+                // Validated here, by the parser, for the same reason `--rkm` is:
+                // this is the moment the operator is still looking at the paste.
+                raw.hash_flag = Some(parse_genesis_hash(&value("--genesis-hash")?)?);
+                i += 2;
+            }
+            "--print-net" => {
+                raw.print_net = true;
+                i += 1;
+            }
+            "--seeds" => {
+                let raw_seeds = value("--seeds")?;
+                let list: Vec<String> = raw_seeds
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if list.is_empty() {
                     return Err(MineError::Usage(
-                        "`mine` writes its own config into --dir; if you already have one, run \
-                         `qumbra-node run --config FILE` instead"
-                            .into(),
-                    ))
+                        "--seeds needs at least one host:port (comma-separated)".into(),
+                    ));
                 }
-                // The run path's own flags, forwarded verbatim by `main`.
-                "--rehearsal-verifier" => i += 1,
-                "--sample-interval-secs" | "--snapshot-interval-secs" => i += 2,
-                other => {
+                raw.seeds = Some(list);
+                i += 2;
+            }
+            "--genesis-url" => {
+                raw.genesis_url = Some(value("--genesis-url")?);
+                i += 2;
+            }
+            "--rkm" => {
+                let hex = value("--rkm")?;
+                // Refused HERE, by the node's own parser, rather than at
+                // startup: a truncated paste is the likely operator error
+                // and this is the moment they are still looking.
+                rkm_lanes_from_hex(&hex).map_err(|e| MineError::Usage(format!("--rkm {e}")))?;
+                raw.rkm = Some(hex);
+                i += 2;
+            }
+            "--index" => {
+                let v = value("--index")?;
+                raw.index = v
+                    .parse()
+                    .map_err(|_| MineError::Usage(format!("--index needs a number, got `{v}`")))?;
+                // Bounded because `mine` ALLOCATES up to this index (see
+                // `ensure_wallet`): unbounded here would be an unbounded
+                // write, i.e. a second denial of service introduced while
+                // closing the first.
+                if raw.index > MAX_MINE_INDEX {
                     return Err(MineError::Usage(format!(
-                        "unknown flag `{other}` for `mine` (see `qumbra-node --help`)"
-                    )))
+                        "--index {} is above the {MAX_MINE_INDEX} `mine` allocates up to. \
+                         Allocate the index you want with `qumbra-wallet address --new` and pass \
+                         its key with --rkm.",
+                        raw.index
+                    )));
                 }
+                i += 2;
+            }
+            "--listen" => {
+                raw.listen_addr = value("--listen")?;
+                i += 2;
+            }
+            BACKED_UP_FLAG => {
+                raw.backed_up = true;
+                i += 1;
+            }
+            "--config" => {
+                return Err(MineError::Usage(
+                    "`mine` writes its own config into --dir; if you already have one, run \
+                     `qumbra-node run --config FILE` instead"
+                        .into(),
+                ))
+            }
+            // The run path's own flags, forwarded verbatim by `main`.
+            "--rehearsal-verifier" => i += 1,
+            "--sample-interval-secs" | "--snapshot-interval-secs" => i += 2,
+            other => {
+                return Err(MineError::Usage(format!(
+                    "unknown flag `{other}` for `mine` (see `qumbra-node --help`)"
+                )))
             }
         }
-
-        Ok(MineArgs {
-            dir: dir.ok_or_else(|| MineError::Usage("mine requires --dir DIR".into()))?,
-            seeds: seeds.unwrap_or_else(|| T1_SEEDS.iter().map(|s| s.to_string()).collect()),
-            genesis_url,
-            rkm,
-            backed_up,
-            index,
-            listen_addr,
-        })
     }
+
+    Ok(raw)
 }
 
 /// What the wallet step did. The mnemonic is deliberately **not** a field here:
@@ -780,12 +1160,24 @@ pub fn prepare<R: BufRead, W: Write>(
 ) -> Result<Prepared, MineError> {
     std::fs::create_dir_all(&args.dir)?;
     writeln!(out, "qumbra-node mine — preparing {}", args.dir.display())?;
+    // Printed BEFORE the genesis step, so that a wrong-net refusal has the
+    // provenance of the number it refused on the line above it. Lab #527 was
+    // diagnosed in five minutes from a refusal that named both hashes; it would
+    // have been diagnosed in one from a refusal that also named where the
+    // expected hash came from.
+    writeln!(
+        out,
+        "net:      {} — genesis pinned to {}\n          (pin source: {})",
+        args.net,
+        args.genesis_hash,
+        args.pin_source.describe(&args.net)
+    )?;
 
     let wallet = ensure_wallet(args, interactive, input, out)?;
 
     let genesis_path = args.dir.join(GENESIS_FILE_NAME);
     let genesis =
-        ensure_genesis(&genesis_path, &args.genesis_url, T1_EXPECTED_GENESIS_HASH, fetch, out)?;
+        ensure_genesis(&genesis_path, &args.genesis_url, &args.genesis_hash, fetch, out)?;
 
     let data_dir = args.dir.join(DATA_SUBDIR);
     let rendered = render_node_toml(&ConfigInputs {
@@ -793,7 +1185,7 @@ pub fn prepare<R: BufRead, W: Write>(
         listen_addr: &args.listen_addr,
         seeds: &args.seeds,
         genesis_file: &genesis_path,
-        expected_genesis_hash: T1_EXPECTED_GENESIS_HASH,
+        expected_genesis_hash: &args.genesis_hash,
         miner_rkm: wallet.rkm_hex(),
     });
     // The config this command writes must be one this binary can read. A
@@ -847,11 +1239,21 @@ mod tests {
         d
     }
 
+    /// The fixture pins **T1** deliberately, and it is worth one sentence: T1 is
+    /// the only net whose live identity this tree can also *mint*
+    /// (`new_devnet_t0()`), so it is the only net whose end-to-end `prepare`
+    /// path can be exercised offline with bytes that actually verify. Every
+    /// test below that hands `real_genesis_bytes()` to `prepare` depends on
+    /// that, and `an_in_tree_mint_is_not_a_live_nets_identity` is the assertion
+    /// that stops anyone reading this coincidence as a general rule.
     fn args_for(dir: &Path) -> MineArgs {
         MineArgs {
             dir: dir.to_path_buf(),
-            seeds: T1_SEEDS.iter().map(|s| s.to_string()).collect(),
-            genesis_url: T1_GENESIS_URL.to_string(),
+            net: NET_T1.net.to_string(),
+            seeds: PUBLIC_SEEDS.iter().map(|s| s.to_string()).collect(),
+            genesis_url: PUBLISHED_GENESIS_URL.to_string(),
+            genesis_hash: NET_T1.genesis_hash.to_string(),
+            pin_source: PinSource::NetFlag,
             rkm: None,
             backed_up: false,
             index: 0,
@@ -863,16 +1265,180 @@ mod tests {
         GenesisFile::new_devnet_t0().to_bytes()
     }
 
-    // ── the baked defaults ───────────────────────────────────────────────────
+    // ── the net table, and what it is allowed to be checked against ─────────
 
-    /// 🔴 The constant this command bakes and the genesis this tree actually
-    /// builds are the same net. Without this, `T1_EXPECTED_GENESIS_HASH` is a
-    /// literal that can silently outlive the constants it describes — and the
-    /// only symptom would be every `mine` host refusing the real genesis file.
-    #[test]
-    fn mine_bakes_the_hash_this_trees_genesis_actually_has() {
-        assert_eq!(GenesisFile::new_devnet_t0().hash_hex(), T1_EXPECTED_GENESIS_HASH);
+    /// The release lane's net dispatch, read as text. `select-release-net.sh` is
+    /// the only file in this repo whose per-net genesis pin is checked against
+    /// the file **actually served** at the published URL — it downloads it,
+    /// keccak256s it, and refuses the cut by name on a mismatch. So it is the
+    /// closest thing to the live net that an offline test can reach, and this
+    /// parser is how the Rust table is held to it.
+    const SELECT_RELEASE_NET: &str =
+        include_str!("../../../.github/workflows/scripts/select-release-net.sh");
+
+    /// `T1_GENESIS_HASH=…` / `T2_GENESIS_HASH=…` → `("t1", "138e…")`.
+    fn script_net_pins() -> Vec<(String, String)> {
+        SELECT_RELEASE_NET
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .filter_map(|(k, v)| {
+                let name = k.strip_suffix("_GENESIS_HASH")?;
+                // `EXPECTED_HASH="$T1_GENESIS_HASH"` and friends are references,
+                // not definitions; only a bare 64-hex literal defines a pin.
+                let v = v.trim();
+                let is_pin = v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit());
+                is_pin.then(|| (name.to_ascii_lowercase(), v.to_string()))
+            })
+            .collect()
     }
+
+    /// 🔴 **This test replaces the one lab #527 proved could not fail.**
+    ///
+    /// The guard here used to be `assert_eq!(GenesisFile::new_devnet_t0()
+    /// .hash_hex(), T1_EXPECTED_GENESIS_HASH)` — a compiled-in constant compared
+    /// against an artifact this same tree mints. Both sides are in-tree, so both
+    /// move together or (as happened) neither moves while the live net moves
+    /// underneath them. It stayed green through the entire T1→T2 cutover and
+    /// through the release cut that shipped a T2 binary carrying T1's pin.
+    ///
+    /// What it is pinned to now is the release lane's own per-net table, in
+    /// **both directions**:
+    ///
+    /// - every net the lane can cut must exist here with the same hash — so a
+    ///   cutover that updates the script and forgets this file is red;
+    /// - every net here must exist in the script — so a hand-edited Rust literal
+    ///   for a net the lane has never heard of is also red.
+    ///
+    /// The remaining gap is stated rather than papered over: this is agreement
+    /// with a *script*, and the script's own agreement with the live net is
+    /// established at release time, not here. Closing that fully needs a network
+    /// fetch, which is `smoke-release-artifacts.sh`'s job and cannot be a unit
+    /// test. See the PR body.
+    #[test]
+    fn the_net_table_is_the_release_lanes_net_table() {
+        let script = script_net_pins();
+        assert!(
+            script.len() >= 2,
+            "parsed {} pins out of select-release-net.sh — the parser has lost the file's shape, \
+             which would make this test vacuous",
+            script.len()
+        );
+
+        for (net, hash) in &script {
+            let profile = profile_for(net).unwrap_or_else(|| {
+                panic!(
+                    "select-release-net.sh can cut net {net} and this binary's net table cannot \
+                     name it. A `mine` from such a build pins the wrong net's genesis — lab #527."
+                )
+            });
+            assert_eq!(
+                profile.genesis_hash, hash,
+                "net {net}: this binary pins {} and the release lane pins {hash}",
+                profile.genesis_hash
+            );
+        }
+
+        for profile in KNOWN_NETS {
+            assert!(
+                script.iter().any(|(net, _)| net == profile.net),
+                "this binary's net table names {} and select-release-net.sh does not — a pin \
+                 nothing checks against the published genesis is exactly the shape lab #527 was",
+                profile.net
+            );
+        }
+
+        // The URL and the seeds are the other two thirds of an identity, and the
+        // script is the same single source for both.
+        assert!(
+            SELECT_RELEASE_NET.contains(&format!("GENESIS_URL_DEFAULT={PUBLISHED_GENESIS_URL}")),
+            "the release lane's default genesis URL is not the one this binary fetches"
+        );
+        let peers = SELECT_RELEASE_NET
+            .lines()
+            .find(|l| l.starts_with("DIAL_PEERS_BOTH="))
+            .expect("the script defines DIAL_PEERS_BOTH");
+        for seed in PUBLIC_SEEDS {
+            assert!(peers.contains(seed), "the release lane's dial peers omit {seed}");
+        }
+        assert_eq!(
+            peers.matches(':').count(),
+            PUBLIC_SEEDS.len(),
+            "the lane lists exactly the seeds this binary bakes and no more: {peers}"
+        );
+    }
+
+    /// 🔴 **The tripwire that stops the old guard being restored.**
+    ///
+    /// `mine`'s pin for T1 happens to equal `GenesisFile::new_devnet_t0()
+    /// .hash_hex()`. That is a **coincidence of T1 having been deployed from the
+    /// mint in this tree**, and it is the entire reason the old guard looked
+    /// sound. T2 shows what it was worth: the live T2 genesis was minted at the
+    /// launch ceremony from OS-random committee keys (`new_t2_with_committee_
+    /// seeds`, lab #506), so the in-tree rehearsal mint `new_t2()` hashes to a
+    /// third value that tracks neither the live net nor this table.
+    ///
+    /// If this test ever fails, someone has re-minted `new_t2()` into agreement
+    /// with the live net — which cannot happen without the ceremony's secret
+    /// keys, so the likelier reading is that one of the two values was edited to
+    /// make a test pass.
+    #[test]
+    fn an_in_tree_mint_is_not_a_live_nets_identity() {
+        assert_eq!(
+            GenesisFile::new_devnet_t0().hash_hex(),
+            NET_T1.genesis_hash,
+            "T1 was deployed from this tree's own T0 mint — if this ever stops being true, the \
+             offline `prepare` tests that use real_genesis_bytes() need a different fixture"
+        );
+        assert_ne!(
+            GenesisFile::new_t2().hash_hex(),
+            NET_T2.genesis_hash,
+            "the in-tree T2 mint is the REHEARSAL mint; the live T2 genesis carries ceremony \
+             keys. A guard pinning mine's T2 constant to new_t2() would be asserting a \
+             falsehood — see this test's doc comment and lab #527."
+        );
+    }
+
+    /// The net a plain `cargo build` targets is the net the release lane cuts by
+    /// default. Two words in two files; this is what makes forgetting either
+    /// half loud instead of silent.
+    #[test]
+    fn the_default_net_is_the_net_the_release_lane_cuts_by_default() {
+        const WORKFLOW: &str = include_str!("../../../.github/workflows/release-binaries.yml");
+        assert!(
+            profile_for(DEFAULT_NET).is_some(),
+            "DEFAULT_NET is {DEFAULT_NET}, which this binary's net table cannot name"
+        );
+        // The `net:` dispatch input's default, read out of the workflow's own
+        // choice block rather than remembered here.
+        let net_input = WORKFLOW
+            .split("      net:\n")
+            .nth(1)
+            .expect("release-binaries.yml declares a `net:` dispatch input");
+        let default_line = net_input
+            .lines()
+            .find(|l| l.trim_start().starts_with("default:"))
+            .expect("the `net:` input declares a default");
+        assert!(
+            default_line.trim() == format!("default: {DEFAULT_NET}"),
+            "release-binaries.yml cuts `{}` by default and this binary defaults to {DEFAULT_NET}",
+            default_line.trim()
+        );
+    }
+
+    /// A build stamped with `QUMBRA_NET` for a net this table cannot name is
+    /// only safe if it was also stamped with the hash. Un-stamped builds — every
+    /// `cargo build`, every test — must land on a net this table knows.
+    #[test]
+    fn an_unstamped_build_resolves_to_a_net_it_can_name() {
+        if STAMPED_GENESIS_HASH.is_none() {
+            let id = resolve_identity(None, None).expect("an unstamped build must resolve");
+            assert_eq!(id.net, BUILT_FOR_NET);
+            assert_eq!(id.pin_source, PinSource::BuiltInTable);
+            assert_eq!(id.genesis_hash, profile_for(BUILT_FOR_NET).unwrap().genesis_hash);
+        }
+    }
+
+    // ── the baked defaults ───────────────────────────────────────────────────
 
     /// 🔴 **Review finding 3, closed at the axis that matters.** The baked
     /// defaults are transcribed from `docs/join-and-mine.md`, and until this
@@ -895,12 +1461,12 @@ mod tests {
             .lines()
             .find(|l| l.trim_start().starts_with("dial_peers ="))
             .expect("the guide publishes a dial_peers line");
-        for seed in T1_SEEDS {
+        for seed in PUBLIC_SEEDS {
             assert!(dial.contains(seed), "the guide's dial_peers omits the baked seed {seed}");
         }
         assert_eq!(
             dial.matches(':').count(),
-            T1_SEEDS.len(),
+            PUBLIC_SEEDS.len(),
             "the guide lists exactly the four baked seeds and no fifth: {dial}"
         );
 
@@ -913,13 +1479,36 @@ mod tests {
             "the guide's listen_addr is not what mine binds: {listen}"
         );
 
+        // 🔴 The **selected** net's hash, not a T1 constant. This assertion was
+        // red on `main` from 2026-08-19 (`2384283` rebased the guide on T2,
+        // leaving only the elided `138e1524…addb` in the retirement note) until
+        // this change — a guard whose two sides genuinely could disagree,
+        // disagreeing ~19 h before the T2 cut. It went red rather than blind;
+        // the shape was right and nothing read it.
+        let id = resolve_identity(None, None).expect("this build resolves an identity");
         assert!(
-            GUIDE.contains(T1_EXPECTED_GENESIS_HASH),
-            "the guide does not publish the genesis hash this binary pins"
+            GUIDE.contains(&id.genesis_hash),
+            "the guide does not publish the genesis hash this binary pins ({} for net {})",
+            id.genesis_hash,
+            id.net
         );
         assert!(
-            GUIDE.contains(T1_GENESIS_URL),
+            GUIDE.contains(&id.genesis_url),
             "the guide does not publish the genesis URL this binary fetches"
+        );
+
+        // The ZH half is a translation of the same operator instructions, and a
+        // joiner who reads it copies the same hash out of it. It carried the
+        // launch-ceremony placeholder for a day after the EN half was filled
+        // (#525 / #526 / #528), so "the EN one is checked" was not enough.
+        const GUIDE_ZH: &str = include_str!("../../../docs/join-and-mine-zh.md");
+        assert!(
+            GUIDE_ZH.contains(&id.genesis_hash),
+            "the ZH join guide does not publish the genesis hash this binary pins"
+        );
+        assert!(
+            GUIDE_ZH.contains(&id.genesis_url),
+            "the ZH join guide does not publish the genesis URL this binary fetches"
         );
     }
 
@@ -928,13 +1517,13 @@ mod tests {
     /// dial time on four hosts at once.
     #[test]
     fn the_baked_seeds_are_four_host_port_pairs() {
-        assert_eq!(T1_SEEDS.len(), 4);
-        for s in T1_SEEDS {
+        assert_eq!(PUBLIC_SEEDS.len(), 4);
+        for s in PUBLIC_SEEDS {
             let (host, port) = s.rsplit_once(':').unwrap_or_else(|| panic!("{s} has no port"));
             assert!(!host.is_empty(), "{s}");
             assert!(port.parse::<u16>().is_ok(), "{s} has a non-numeric port");
         }
-        let mut sorted = T1_SEEDS.to_vec();
+        let mut sorted = PUBLIC_SEEDS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), 4, "four DISTINCT seeds");
@@ -942,16 +1531,120 @@ mod tests {
 
     // ── argument parsing ─────────────────────────────────────────────────────
 
+    /// The defaults are **this build's** net, not a hardwired one. On an
+    /// un-stamped build that is `DEFAULT_NET`; on a release build it is whatever
+    /// the lane stamped, which is the whole point of lab #527.
     #[test]
-    fn defaults_are_the_t1_identity_and_dir_is_required() {
+    fn defaults_are_the_built_for_nets_identity_and_dir_is_required() {
         let a = MineArgs::parse(&["--dir".into(), "/tmp/x".into()]).expect("parse");
-        assert_eq!(a.seeds, T1_SEEDS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(a.genesis_url, T1_GENESIS_URL);
+        let id = resolve_identity(None, None).expect("this build resolves an identity");
+        assert_eq!(a.net, id.net);
+        assert_eq!(a.genesis_hash, id.genesis_hash);
+        assert_eq!(a.seeds, PUBLIC_SEEDS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(a.genesis_url, PUBLISHED_GENESIS_URL);
         assert_eq!(a.listen_addr, DEFAULT_LISTEN_ADDR);
         assert_eq!(a.index, 0);
         assert!(a.rkm.is_none());
         assert!(!a.backed_up);
         assert!(matches!(MineArgs::parse(&[]), Err(MineError::Usage(_))));
+    }
+
+    /// 🔴 **The lab #527 regression, at the parse layer.** `--net t2` must pin
+    /// T2's genesis and `--net t1` must pin T1's — the two must not be the same
+    /// number, which is the single assertion the shipped binary would have
+    /// failed.
+    #[test]
+    fn net_selects_the_pin_and_the_two_nets_are_not_the_same_pin() {
+        let t1 = MineArgs::parse(&["--dir".into(), "/tmp/x".into(), "--net".into(), "t1".into()])
+            .expect("parse t1");
+        let t2 = MineArgs::parse(&["--dir".into(), "/tmp/x".into(), "--net".into(), "t2".into()])
+            .expect("parse t2");
+        assert_eq!(t1.net, "t1");
+        assert_eq!(t1.genesis_hash, NET_T1.genesis_hash);
+        assert_eq!(t1.pin_source, PinSource::NetFlag);
+        assert_eq!(t2.net, "t2");
+        assert_eq!(t2.genesis_hash, NET_T2.genesis_hash);
+        assert_ne!(
+            t1.genesis_hash, t2.genesis_hash,
+            "a binary that pins the same genesis for both nets is the #527 defect itself"
+        );
+    }
+
+    /// An unknown net is refused by name and the refusal says what to type
+    /// instead — including the no-rebuild path, because "wait for a release" is
+    /// what #527 cost a stranger four hours of.
+    #[test]
+    fn an_unknown_net_is_refused_by_name_and_names_the_alternative() {
+        let e = MineArgs::parse(&["--dir".into(), "/tmp/x".into(), "--net".into(), "t9".into()]);
+        match e {
+            Err(MineError::Usage(m)) => {
+                assert!(m.contains("t9"), "{m}");
+                assert!(m.contains("t1, t2"), "{m}");
+                assert!(m.contains("--genesis-hash"), "{m}");
+            }
+            other => panic!("expected a usage refusal, got {other:?}"),
+        }
+    }
+
+    /// `--genesis-hash` outranks everything, so a binary can join a net it
+    /// predates without a rebuild. It is validated at parse, like `--rkm`.
+    #[test]
+    fn genesis_hash_overrides_every_baked_pin_and_is_validated_at_parse() {
+        let want = "a".repeat(64);
+        let a = MineArgs::parse(&[
+            "--dir".into(),
+            "/tmp/x".into(),
+            "--net".into(),
+            "t1".into(),
+            "--genesis-hash".into(),
+            want.to_uppercase(),
+        ])
+        .expect("parse");
+        assert_eq!(a.genesis_hash, want, "and it is lowercased");
+        assert_eq!(a.pin_source, PinSource::Flag);
+
+        for bad in ["dead", &"z".repeat(64), &"a".repeat(63)] {
+            assert!(
+                matches!(
+                    MineArgs::parse(&[
+                        "--dir".into(),
+                        "/tmp/x".into(),
+                        "--genesis-hash".into(),
+                        bad.into()
+                    ]),
+                    Err(MineError::Usage(_))
+                ),
+                "{bad} must be refused at parse"
+            );
+        }
+    }
+
+    /// `--print-net` needs no `--dir`, and it reports the net it would have
+    /// used. This is what `assert-release-artifacts.sh` greps, so the shape of
+    /// the report is load-bearing, not cosmetic.
+    #[test]
+    fn print_net_reports_the_baked_identity_without_a_dir() {
+        match parse_mine(&["--print-net".into()]).expect("parse") {
+            MinePlan::PrintNet(id) => {
+                let expected = resolve_identity(None, None).expect("resolves");
+                assert_eq!(id, expected);
+                let report = id.report();
+                assert!(report.contains(&format!("net: {}", id.net)), "{report}");
+                assert!(
+                    report.contains(&format!("genesis hash: {}", id.genesis_hash)),
+                    "{report}"
+                );
+                assert!(report.contains("pin source:"), "{report}");
+            }
+            MinePlan::Prepare(_) => panic!("--print-net must not prepare a directory"),
+        }
+        // …and it can still be asked about another net.
+        match parse_mine(&["--print-net".into(), "--net".into(), "t1".into()]).expect("parse") {
+            MinePlan::PrintNet(id) => assert_eq!(id.genesis_hash, NET_T1.genesis_hash),
+            MinePlan::Prepare(_) => panic!("--print-net must not prepare a directory"),
+        }
+        // `MineArgs::parse` is the prepare-only door and says so.
+        assert!(matches!(MineArgs::parse(&["--print-net".into()]), Err(MineError::Usage(_))));
     }
 
     #[test]
@@ -963,6 +1656,10 @@ mod tests {
             "1.2.3.4:9444, 5.6.7.8:9444".into(),
             "--genesis-url".into(),
             "http://example.invalid/g.qmb".into(),
+            "--net".into(),
+            "t1".into(),
+            "--genesis-hash".into(),
+            "b".repeat(64),
             "--listen".into(),
             "0.0.0.0:9999".into(),
             "--index".into(),
@@ -972,6 +1669,10 @@ mod tests {
         .expect("parse");
         assert_eq!(a.seeds, vec!["1.2.3.4:9444".to_string(), "5.6.7.8:9444".to_string()]);
         assert_eq!(a.genesis_url, "http://example.invalid/g.qmb");
+        // The identity's own two levers, overridden together: this is the
+        // no-rebuild path onto a net the binary has never heard of.
+        assert_eq!(a.genesis_hash, "b".repeat(64));
+        assert_eq!(a.net, "t1");
         assert_eq!(a.listen_addr, "0.0.0.0:9999");
         assert_eq!(a.index, 3);
         assert!(a.backed_up);
@@ -1168,7 +1869,7 @@ mod tests {
         let err = ensure_genesis(
             &path,
             "https://evil.invalid/genesis.qmb",
-            T1_EXPECTED_GENESIS_HASH,
+            NET_T1.genesis_hash,
             |_| Ok(bytes.clone()),
             &mut out,
         )
@@ -1176,7 +1877,7 @@ mod tests {
         match &err {
             MineError::GenesisWrongHash { source, got, want } => {
                 assert_eq!(source, "https://evil.invalid/genesis.qmb");
-                assert_eq!(want, T1_EXPECTED_GENESIS_HASH);
+                assert_eq!(want, NET_T1.genesis_hash);
                 assert_eq!(got, &other.hash_hex());
             }
             other => panic!("expected GenesisWrongHash, got {other:?}"),
@@ -1196,7 +1897,7 @@ mod tests {
         let mut bytes = real_genesis_bytes();
         let canonical_len = bytes.len();
         bytes.extend_from_slice(b"trailing");
-        let err = verify_genesis_bytes(&bytes, T1_EXPECTED_GENESIS_HASH, "the probe")
+        let err = verify_genesis_bytes(&bytes, NET_T1.genesis_hash, "the probe")
             .expect_err("padded bytes are not this file");
         match err {
             MineError::GenesisNotCanonical { got_len, canonical_len: c, .. } => {
@@ -1209,7 +1910,7 @@ mod tests {
 
     #[test]
     fn bytes_that_are_not_a_genesis_file_at_all_are_refused_by_source() {
-        let err = verify_genesis_bytes(b"<html>404</html>", T1_EXPECTED_GENESIS_HASH, "the URL")
+        let err = verify_genesis_bytes(b"<html>404</html>", NET_T1.genesis_hash, "the URL")
             .expect_err("an error page is not a genesis file");
         assert!(matches!(err, MineError::GenesisUndecodable { .. }));
         assert!(err.to_string().contains("the URL"), "{err}");
@@ -1226,8 +1927,8 @@ mod tests {
 
         let mut out = Vec::new();
         let first =
-            ensure_genesis(&path, T1_GENESIS_URL, T1_EXPECTED_GENESIS_HASH, |url| {
-                assert_eq!(url, T1_GENESIS_URL);
+            ensure_genesis(&path, PUBLISHED_GENESIS_URL, NET_T1.genesis_hash, |url| {
+                assert_eq!(url, PUBLISHED_GENESIS_URL);
                 Ok(bytes.clone())
             }, &mut out)
             .expect("the real file verifies");
@@ -1237,8 +1938,8 @@ mod tests {
         // Second run: no fetch at all. The closure panics if it is called.
         let second = ensure_genesis(
             &path,
-            T1_GENESIS_URL,
-            T1_EXPECTED_GENESIS_HASH,
+            PUBLISHED_GENESIS_URL,
+            NET_T1.genesis_hash,
             |_| panic!("a present genesis file must not be re-downloaded"),
             &mut out,
         )
@@ -1262,8 +1963,8 @@ mod tests {
         let mut out = Vec::new();
         let err = ensure_genesis(
             &path,
-            T1_GENESIS_URL,
-            T1_EXPECTED_GENESIS_HASH,
+            PUBLISHED_GENESIS_URL,
+            NET_T1.genesis_hash,
             |_| panic!("must not download over a file that is already there"),
             &mut out,
         )
@@ -1279,14 +1980,14 @@ mod tests {
     /// (nothing a hand-written miner config has that this one lacks).
     #[test]
     fn the_written_config_parses_and_carries_the_manual_paths_key_set() {
-        let seeds: Vec<String> = T1_SEEDS.iter().map(|s| s.to_string()).collect();
+        let seeds: Vec<String> = PUBLIC_SEEDS.iter().map(|s| s.to_string()).collect();
         let rkm = "0100000000000000020000000000000003000000000000000400000000000000";
         let text = render_node_toml(&ConfigInputs {
             data_dir: Path::new("/m/data"),
             listen_addr: DEFAULT_LISTEN_ADDR,
             seeds: &seeds,
             genesis_file: Path::new("/m/genesis.qmb"),
-            expected_genesis_hash: T1_EXPECTED_GENESIS_HASH,
+            expected_genesis_hash: NET_T1.genesis_hash,
             miner_rkm: rkm,
         });
         let cfg = NodeConfig::from_toml(&text).expect("mine writes a config this binary reads");
@@ -1294,7 +1995,7 @@ mod tests {
         assert_eq!(cfg.listen_addr, DEFAULT_LISTEN_ADDR);
         assert_eq!(cfg.dial_peers, seeds);
         assert_eq!(cfg.genesis_file, PathBuf::from("/m/genesis.qmb"));
-        assert_eq!(cfg.expected_genesis_hash.as_deref(), Some(T1_EXPECTED_GENESIS_HASH));
+        assert_eq!(cfg.expected_genesis_hash.as_deref(), Some(NET_T1.genesis_hash));
         assert!(cfg.mining);
         assert_eq!(cfg.miner_rkm.as_deref(), Some(rkm));
         assert_eq!(cfg.miner_rkm_lanes().unwrap(), Some([1, 2, 3, 4]));
@@ -1344,7 +2045,7 @@ mod tests {
     #[test]
     fn the_rkm_config_equals_an_equivalently_hand_written_config() {
         let rkm = "0100000000000000020000000000000003000000000000000400000000000000";
-        let seeds: Vec<String> = T1_SEEDS.iter().map(|s| s.to_string()).collect();
+        let seeds: Vec<String> = PUBLIC_SEEDS.iter().map(|s| s.to_string()).collect();
 
         // `docs/join-and-mine.md` §3: §2's joiner config with the two mining
         // fields changed, written by hand in whatever order the operator likes.
@@ -1355,15 +2056,16 @@ mod tests {
              listen_addr = \"{DEFAULT_LISTEN_ADDR}\"\n\
              dial_peers = [{peers}]\n\
              genesis_file = \"/m/genesis.qmb\"\n\
-             expected_genesis_hash = \"{T1_EXPECTED_GENESIS_HASH}\"\n",
+             expected_genesis_hash = \"{hash}\"\n",
             peers = seeds.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(","),
+            hash = NET_T1.genesis_hash,
         );
         let generated = render_node_toml(&ConfigInputs {
             data_dir: Path::new("/m/data"),
             listen_addr: DEFAULT_LISTEN_ADDR,
             seeds: &seeds,
             genesis_file: Path::new("/m/genesis.qmb"),
-            expected_genesis_hash: T1_EXPECTED_GENESIS_HASH,
+            expected_genesis_hash: NET_T1.genesis_hash,
             miner_rkm: rkm,
         });
         assert_eq!(
@@ -1387,7 +2089,7 @@ mod tests {
     #[test]
     fn a_windows_path_round_trips_through_the_generated_config() {
         let rkm = "0100000000000000020000000000000003000000000000000400000000000000";
-        let seeds: Vec<String> = T1_SEEDS.iter().map(|s| s.to_string()).collect();
+        let seeds: Vec<String> = PUBLIC_SEEDS.iter().map(|s| s.to_string()).collect();
         // The literal shape that failed on the runner, backslashes and all.
         let data = r"C:\Users\RUNNER~1\AppData\Local\Temp\qmb_mine\data";
         let genesis = r"C:\Users\RUNNER~1\AppData\Local\Temp\qmb_mine\genesis.qmb";
@@ -1397,7 +2099,7 @@ mod tests {
             listen_addr: DEFAULT_LISTEN_ADDR,
             seeds: &seeds,
             genesis_file: Path::new(genesis),
-            expected_genesis_hash: T1_EXPECTED_GENESIS_HASH,
+            expected_genesis_hash: NET_T1.genesis_hash,
             miner_rkm: rkm,
         });
         let cfg = NodeConfig::from_toml(&generated).unwrap_or_else(|e| {
@@ -1415,14 +2117,14 @@ mod tests {
     #[test]
     fn a_path_containing_a_quote_still_round_trips() {
         let rkm = "0100000000000000020000000000000003000000000000000400000000000000";
-        let seeds: Vec<String> = T1_SEEDS.iter().map(|s| s.to_string()).collect();
+        let seeds: Vec<String> = PUBLIC_SEEDS.iter().map(|s| s.to_string()).collect();
         let data = r"/home/o'brien\odd/data";
         let generated = render_node_toml(&ConfigInputs {
             data_dir: Path::new(data),
             listen_addr: DEFAULT_LISTEN_ADDR,
             seeds: &seeds,
             genesis_file: Path::new("/m/genesis.qmb"),
-            expected_genesis_hash: T1_EXPECTED_GENESIS_HASH,
+            expected_genesis_hash: NET_T1.genesis_hash,
             miner_rkm: rkm,
         });
         let cfg = NodeConfig::from_toml(&generated)
@@ -1469,7 +2171,7 @@ mod tests {
             &args,
             false,
             |url| {
-                assert_eq!(url, T1_GENESIS_URL);
+                assert_eq!(url, PUBLISHED_GENESIS_URL);
                 Ok(bytes.clone())
             },
             &mut Cursor::new(Vec::new()),
@@ -1484,8 +2186,8 @@ mod tests {
         assert!(cfg.mining, "a mine-born config mines");
         assert_eq!(cfg.miner_rkm.as_deref(), Some(want.as_str()), "the rkm is the wallet's");
         assert_eq!(prepared.wallet.rkm_hex(), want);
-        assert_eq!(cfg.dial_peers, T1_SEEDS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(cfg.expected_genesis_hash.as_deref(), Some(T1_EXPECTED_GENESIS_HASH));
+        assert_eq!(cfg.dial_peers, PUBLIC_SEEDS.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(cfg.expected_genesis_hash.as_deref(), Some(NET_T1.genesis_hash));
         assert_eq!(cfg.genesis_file, d.join(GENESIS_FILE_NAME));
         assert_eq!(cfg.data_dir, d.join(DATA_SUBDIR));
 
@@ -1591,7 +2293,7 @@ mod tests {
     fn a_truncated_genesis_is_refused_by_the_pin_not_accepted_as_short() {
         let full = real_genesis_bytes();
         for cut in [1usize, 64, full.len() / 2, full.len() - 1] {
-            let err = verify_genesis_bytes(&full[..cut], T1_EXPECTED_GENESIS_HASH, "the probe")
+            let err = verify_genesis_bytes(&full[..cut], NET_T1.genesis_hash, "the probe")
                 .expect_err("no prefix of the genesis file is the genesis file");
             // Undecodable or non-canonical — never Ok, and never a wrong-hash
             // ACCEPT. Which of the two it is depends on where the cut lands.
@@ -1620,7 +2322,7 @@ mod tests {
         let err = ensure_genesis(
             &path,
             "https://hostile.invalid/genesis.qmb",
-            T1_EXPECTED_GENESIS_HASH,
+            NET_T1.genesis_hash,
             |_| {
                 // What `net::http_get_limited` returns once the ceiling trips.
                 Err(std::io::Error::new(
