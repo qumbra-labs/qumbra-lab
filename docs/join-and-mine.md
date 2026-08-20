@@ -167,12 +167,16 @@ The announcement also publishes these network-identity inputs together:
 
 - `genesis.qmb` — **format v5, network `qumbra-t2`**
   ([`genesis.rs:630-636`](../crates/qumbra-node/src/genesis.rs#L630-L636));
-- `expected_genesis_hash` — `<T2_GENESIS_HASH — filled at ceremony>`;
-- the initial P2P seed addresses for `dial_peers` — `<T2_SEEDS — filled at announcement>`.
+- `expected_genesis_hash` — `d1dad4ea2bc5bfc4880ecf25206d182cddeacc12b0f65eca1a1ce2f27a93e2f3`;
+- the initial P2P seed addresses for `dial_peers` — `"18.202.166.126:9444", "18.141.177.109:9444", "52.194.224.123:9444", "52.5.0.21:9444"`.
 
 Distribution: `genesis.qmb` downloads from **`https://seed.qumbra.org/genesis.qmb`**
 (the bare service names moved from T1 to T2 at cutover; only `pool.qumbra.org` is new) —
-always byte-verify it against `expected_genesis_hash` above. `qumbra-node check` and
+verify it with **`qumbra-node check`**, the executable form of that check: put the hash
+in your config and `check` recomputes the genesis identity from the file and refuses a
+mismatch. **Do NOT compare the file's `sha256` to the hash above** — the pin is
+keccak256 over the canonical encoding, a different value from the file digest, so a
+plain `shasum` looks like a mismatch when nothing is wrong. `check` and
 startup both refuse a wrong file
 ([`genesis.rs:525-530`](../crates/qumbra-node/src/genesis.rs#L525-L530)), so a tampered
 download cannot pass silently.
@@ -272,9 +276,9 @@ Put the downloaded `genesis.qmb` beside this minimal `node.toml`:
 ```toml
 data_dir = "/data"
 listen_addr = "0.0.0.0:9400"
-dial_peers = ["<T2_SEEDS — filled at announcement>"]
+dial_peers = ["18.202.166.126:9444", "18.141.177.109:9444", "52.194.224.123:9444", "52.5.0.21:9444"]
 genesis_file = "/config/genesis.qmb"
-expected_genesis_hash = "<T2_GENESIS_HASH — filled at ceremony>"
+expected_genesis_hash = "d1dad4ea2bc5bfc4880ecf25206d182cddeacc12b0f65eca1a1ce2f27a93e2f3"
 mining = false
 ```
 
