@@ -64,7 +64,7 @@ pub use coinbase::{
     coinbase_rseed, matured_coinbase_leaf,
     matures_coinbase_minted_at, CoinbaseMaturity, COINBASE_RHO_DOMAIN, COINBASE_RSEED_DOMAIN,
 };
-pub use emission::{coinbase, s_atomic, RewardSplit, COINBASE_MATURITY_BLOCKS};
+pub use emission::{coinbase, coinbase_for, s_atomic, RewardSplit, COINBASE_MATURITY_BLOCKS};
 pub use mempool::{
     consensus_weight_params, tx_weight, txid, AssemblyError, BlockTemplate, Mempool, MempoolError,
     MempoolParams, MempoolTx, TxId,
@@ -104,5 +104,5 @@ pub use store::{
     NullifierStore, RewindError, StoredBlock, StoredHeader, StoredTx,
 };
 pub use supply::{
-    supply_by_epoch, SupplyBlock, SupplyEpoch, SupplyError, SupplyLedger,
+    supply_by_epoch, supply_by_epoch_for, SupplyBlock, SupplyEpoch, SupplyError, SupplyLedger,
 };

@@ -54,8 +54,25 @@
 //! other pre-boundary epoch's row, and it is visible per-block to
 //! `qumbra-node audit-emission`, which is the instrument for per-block defects.
 //! Reported on #303 as the reading this baton took of rider 2.
+//!
+//! # The expected side is now form-aware (lab #520)
+//!
+//! The three-case rule above is a **v4-only** concern. It encodes T1's mid-chain
+//! switch at [`RULE_BOUNDARY_HEIGHT`]. A v5-form net (T2) is born exact: consensus
+//! dispatches on [`GenesisForm`] to `check_scheduled_coinbase_payees`, which has
+//! no boundary at all — height 0 mints nothing, every height ≥ 1 is
+//! [`s_atomic_exact`]. The auditor must agree with that **by construction**, from
+//! the same [`GenesisForm`] consensus loaded out of genesis, never a config flag
+//! or a height heuristic. Without that, a T2 chain whose money is exact reads
+//! DIVERGENT against the float endpoints for ~8,640 blocks, and a permanently-red
+//! row cannot report a real divergence.
+//!
+//! The v4 paths are not deleted. T1's archived history still audits under the
+//! grandfathered rules (pins, `s_atomic_pre_boundary`, the 1377 `KNOWN_SCAR`).
+//! This is a fork in the expectation, not a replacement.
 
 use crate::emission::{s_atomic_exact, s_atomic_pre_boundary, RULE_BOUNDARY_HEIGHT};
+use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::header::Hash32;
 
 /// One activation pin: the expected issuance of an epoch that lies **wholly** at or
@@ -262,13 +279,18 @@ pub struct SupplyLedger {
     epoch_length: u64,
     next_height: u64,
     rows: Vec<SupplyEpoch>,
+    /// The genesis form this ledger audits under (lab #520). Same value
+    /// consensus dispatches on; v4 keeps the three-case boundary rule, v5 is
+    /// the exact schedule at every height ≥ 1.
+    form: GenesisForm,
     /// Activation pins for wholly-pre-boundary epochs. A field rather than a
     /// straight read of [`PINNED_EPOCH_EXPECTED`] so the pin *mechanism* is
     /// test-locked with synthetic literals before activation supplies real ones.
+    /// Consulted only on [`GenesisForm::V4`].
     pins: &'static [EpochPin],
     /// `Σ body.coinbase` over the straddling epoch's pre-boundary prefix. Exactly
     /// one epoch can straddle [`RULE_BOUNDARY_HEIGHT`] (see the module docs), so one
-    /// accumulator covers it.
+    /// accumulator covers it. Consulted only on [`GenesisForm::V4`].
     straddle_prefix: u64,
     /// The header hash of the highest block absorbed — the ledger's own view of
     /// which branch it is summing (#299 §4).
@@ -276,12 +298,37 @@ pub struct SupplyLedger {
 }
 
 impl SupplyLedger {
+    /// A v4 ledger — T1's grandfathered three-case rule. The live node never
+    /// calls this: it uses [`Self::new_for`] with the [`GenesisForm`] loaded
+    /// from genesis (lab #520). Existing tests and the pins generator stay here
+    /// because they *are* v4.
     pub fn new(epoch_length: u64) -> Result<Self, SupplyError> {
-        Self::with_pins(epoch_length, PINNED_EPOCH_EXPECTED)
+        Self::new_for(GenesisForm::V4, epoch_length)
+    }
+
+    /// [`Self::new`] keyed on the genesis form consensus dispatches on
+    /// (lab #520). A v5 ledger never consults pins or the emission boundary.
+    pub fn new_for(form: GenesisForm, epoch_length: u64) -> Result<Self, SupplyError> {
+        let pins = match form {
+            GenesisForm::V4 => PINNED_EPOCH_EXPECTED,
+            // V5 has no grandfathered history and no pins. An empty table
+            // makes a mistaken pin-read unrepresentable rather than ignored.
+            GenesisForm::V5 => &[],
+        };
+        Self::with_pins_for(form, epoch_length, pins)
     }
 
     /// [`Self::new`] with an explicit pin table — the seam the pin tests use.
     pub fn with_pins(
+        epoch_length: u64,
+        pins: &'static [EpochPin],
+    ) -> Result<Self, SupplyError> {
+        Self::with_pins_for(GenesisForm::V4, epoch_length, pins)
+    }
+
+    /// [`Self::with_pins`] under an explicit genesis form.
+    pub fn with_pins_for(
+        form: GenesisForm,
         epoch_length: u64,
         pins: &'static [EpochPin],
     ) -> Result<Self, SupplyError> {
@@ -292,6 +339,7 @@ impl SupplyLedger {
             epoch_length,
             next_height: 0,
             rows: Vec::new(),
+            form,
             pins,
             straddle_prefix: 0,
             head_hash: None,
@@ -302,11 +350,28 @@ impl SupplyLedger {
     where
         I: IntoIterator<Item = SupplyBlock>,
     {
-        let mut ledger = Self::new(epoch_length)?;
+        Self::from_blocks_for(GenesisForm::V4, blocks, epoch_length)
+    }
+
+    /// [`Self::from_blocks`] keyed on the genesis form (lab #520).
+    pub fn from_blocks_for<I>(
+        form: GenesisForm,
+        blocks: I,
+        epoch_length: u64,
+    ) -> Result<Self, SupplyError>
+    where
+        I: IntoIterator<Item = SupplyBlock>,
+    {
+        let mut ledger = Self::new_for(form, epoch_length)?;
         for block in blocks {
             ledger.push(block)?;
         }
         Ok(ledger)
+    }
+
+    /// The genesis form this ledger's expected side is computed under.
+    pub fn form(&self) -> GenesisForm {
+        self.form
     }
 
     /// The next canonical height this ledger expects.
@@ -402,7 +467,9 @@ impl SupplyLedger {
             .checked_add(block.name_burn)
             .ok_or(SupplyError::SumOverflow { epoch })?;
 
-        if block.height <= RULE_BOUNDARY_HEIGHT {
+        // The prefix accumulator is a v4-only input to the straddling case.
+        // A v5 net has no boundary and must not consult this number.
+        if self.form == GenesisForm::V4 && block.height <= RULE_BOUNDARY_HEIGHT {
             self.straddle_prefix = self
                 .straddle_prefix
                 .checked_add(block.coinbase)
@@ -411,8 +478,9 @@ impl SupplyLedger {
         self.head_hash = Some(block.hash);
         let straddle_prefix = self.straddle_prefix;
         let pins = self.pins;
+        let form = self.form;
         let row = self.rows.last_mut().expect("the epoch row was inserted above");
-        row.expected_coinbase = expected_for_row(row, pins, straddle_prefix);
+        row.expected_coinbase = expected_for_row(form, row, pins, straddle_prefix);
         Ok(())
     }
 }
@@ -429,34 +497,50 @@ fn pinned_expected(pins: &[EpochPin], row: &SupplyEpoch) -> Option<u64> {
         .map(|pin| pin.expected_coinbase)
 }
 
-/// The expected issuance of one epoch row — the three-case rule the module docs
-/// describe, in one place so no caller can pick the wrong case.
+/// The expected issuance of one epoch row — one function so no caller can pick
+/// the wrong case, and **form-keyed** so the auditor agrees with consensus by
+/// construction (lab #520).
 ///
 /// `straddle_prefix` is `Σ body.coinbase` over the row's pre-boundary prefix and is
-/// read **only** in the straddling case.
-fn expected_for_row(row: &SupplyEpoch, pins: &[EpochPin], straddle_prefix: u64) -> u64 {
+/// read **only** in the v4 straddling case.
+fn expected_for_row(
+    form: GenesisForm,
+    row: &SupplyEpoch,
+    pins: &[EpochPin],
+    straddle_prefix: u64,
+) -> u64 {
     // Genesis mints nothing and is inside epoch 0's range; the first mined block is
-    // height 1.
+    // height 1. Same exemption on both forms.
     let first_mint = row.start_height.max(1);
     if row.end_height < first_mint {
         return 0;
     }
-    if row.end_height <= RULE_BOUNDARY_HEIGHT {
-        // (1) Wholly grandfathered: the attested value, pinned or historical.
-        return pinned_expected(pins, row).unwrap_or_else(|| {
-            s_atomic_pre_boundary(row.end_height + 1) - s_atomic_pre_boundary(first_mint)
-        });
+    match form {
+        GenesisForm::V5 => {
+            // Born exact: no boundary, no pins, no scar. Exactly what
+            // `check_scheduled_coinbase_payees` enforces at every height ≥ 1.
+            s_atomic_exact(row.end_height + 1) - s_atomic_exact(first_mint)
+        }
+        GenesisForm::V4 => {
+            if row.end_height <= RULE_BOUNDARY_HEIGHT {
+                // (1) Wholly grandfathered: the attested value, pinned or historical.
+                return pinned_expected(pins, row).unwrap_or_else(|| {
+                    s_atomic_pre_boundary(row.end_height + 1) - s_atomic_pre_boundary(first_mint)
+                });
+            }
+            if first_mint > RULE_BOUNDARY_HEIGHT {
+                // (2) Wholly rule-bound: the exact schedule's endpoints, and this
+                // row is a real audit of a rule consensus enforces.
+                return s_atomic_exact(row.end_height + 1) - s_atomic_exact(first_mint);
+            }
+            // (3) The one straddling epoch: the recorded prefix plus the exact
+            // suffix. The prefix contributes `expected == measured`, so a
+            // grandfathered ±1 below the boundary cannot raise a false DIVERGENT
+            // on this row.
+            straddle_prefix
+                + (s_atomic_exact(row.end_height + 1) - s_atomic_exact(RULE_BOUNDARY_HEIGHT + 1))
+        }
     }
-    if first_mint > RULE_BOUNDARY_HEIGHT {
-        // (2) Wholly rule-bound: the exact schedule's endpoints, and this row is a
-        // real audit of a rule consensus enforces.
-        return s_atomic_exact(row.end_height + 1) - s_atomic_exact(first_mint);
-    }
-    // (3) The one straddling epoch: the recorded prefix plus the exact suffix. The
-    // prefix contributes `expected == measured`, so a grandfathered ±1 below the
-    // boundary cannot raise a false DIVERGENT on this row.
-    straddle_prefix
-        + (s_atomic_exact(row.end_height + 1) - s_atomic_exact(RULE_BOUNDARY_HEIGHT + 1))
 }
 
 /// Group a contiguous canonical chain into epoch attestations.
@@ -464,7 +548,8 @@ fn expected_for_row(row: &SupplyEpoch, pins: &[EpochPin], straddle_prefix: u64) 
 /// Genesis is part of epoch 0's covered range but contributes zero expected
 /// issuance: this implementation's genesis body is empty, and the first mined
 /// block is height 1. For a row covering `[start, end]`, expected issuance comes
-/// from [`expected_for_row`]'s three-case rule — see the module docs.
+/// from [`expected_for_row`] — v4's three-case rule, or v5's exact schedule.
+/// This wrapper is v4; the live node uses [`supply_by_epoch_for`].
 pub fn supply_by_epoch<I>(
     blocks: I,
     epoch_length: u64,
@@ -472,13 +557,26 @@ pub fn supply_by_epoch<I>(
 where
     I: IntoIterator<Item = SupplyBlock>,
 {
-    Ok(SupplyLedger::from_blocks(blocks, epoch_length)?.rows)
+    supply_by_epoch_for(GenesisForm::V4, blocks, epoch_length)
+}
+
+/// [`supply_by_epoch`] keyed on the genesis form consensus dispatches on
+/// (lab #520).
+pub fn supply_by_epoch_for<I>(
+    form: GenesisForm,
+    blocks: I,
+    epoch_length: u64,
+) -> Result<Vec<SupplyEpoch>, SupplyError>
+where
+    I: IntoIterator<Item = SupplyBlock>,
+{
+    Ok(SupplyLedger::from_blocks_for(form, blocks, epoch_length)?.rows)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emission::coinbase;
+    use crate::emission::{coinbase, coinbase_exact};
 
     /// A deterministic stand-in for a header hash: branch tag + height, so two
     /// branches at the same height are distinguishable and a child's `prev`
@@ -892,5 +990,129 @@ mod tests {
                 got: 3,
             }),
         );
+    }
+
+    // --- lab #520: the expected side is form-aware ----------------------------
+
+    /// An honest v5 chain: genesis mints nothing, every later block commits
+    /// `coinbase_exact(height)` — what `check_scheduled_coinbase_payees` demands.
+    fn honest_v5_chain(tip: u64) -> Vec<SupplyBlock> {
+        (0..=tip)
+            .map(|height| {
+                block_on(
+                    1,
+                    height,
+                    if height == 0 { 0 } else { coinbase_exact(height) },
+                    0,
+                )
+            })
+            .collect()
+    }
+
+    /// **#520, the missing regression.** A v5 chain of N blocks minted at the
+    /// exact schedule audits MATCH. T2's live explorer reported DIVERGENT at
+    /// tip 36 because the expected side still took the v4 float branch.
+    #[test]
+    fn a_v5_chain_minted_at_the_exact_schedule_audits_match() {
+        let tip = 36u64; // the live T2 height at the defect report
+        let blocks = honest_v5_chain(tip);
+        let rows = supply_by_epoch_for(GenesisForm::V5, blocks.clone(), EPOCH).unwrap();
+        assert_eq!(rows.len(), 1, "tip 36 is still epoch 0");
+        assert_eq!((rows[0].start_height, rows[0].end_height), (0, tip));
+        assert_eq!(
+            rows[0].expected_coinbase,
+            s_atomic_exact(tip + 1) - s_atomic_exact(1),
+            "v5 expected is the exact endpoints, genesis exempt"
+        );
+        assert!(rows[0].agrees(), "correct money must not read DIVERGENT");
+        assert_eq!(rows[0].divergence_bessel(), 0);
+        assert!(!rows[0].is_unexplained_divergence());
+
+        // The same chain under the v4 expectation is the false alarm T2 shipped.
+        // The residue is platform-dependent (the float side), so we assert only
+        // that the two schedules disagree — a MATCH here would mean the live
+        // bug was unobservable on this host, which is itself a finding.
+        let v4 = supply_by_epoch(blocks, EPOCH).unwrap();
+        let v4_expected =
+            s_atomic_pre_boundary(tip + 1) - s_atomic_pre_boundary(1);
+        assert_eq!(v4[0].expected_coinbase, v4_expected);
+        assert_ne!(
+            v4[0].expected_coinbase, rows[0].expected_coinbase,
+            "the v4 float endpoints and the exact schedule differ at T2's live heights — \
+             that difference is the false DIVERGENT"
+        );
+        assert!(!v4[0].agrees());
+    }
+
+    /// **#520, the teeth.** A v5 chain with one deliberately wrong coinbase
+    /// audits DIVERGENT with the right delta — the alarm must still fire, or we
+    /// have traded a false positive for a false negative.
+    #[test]
+    fn a_v5_chain_with_one_wrong_coinbase_audits_divergent_with_the_right_delta() {
+        let mut blocks = honest_v5_chain(10);
+        blocks[7].coinbase += 11;
+        let rows = supply_by_epoch_for(GenesisForm::V5, blocks, 4).unwrap();
+        assert!(rows[0].agrees(), "epoch 0 is clean");
+        assert_eq!(rows[1].divergence_bessel(), 11);
+        assert!(!rows[1].agrees());
+        assert!(
+            rows[1].is_unexplained_divergence(),
+            "a real v5 defect is not the T1 scar"
+        );
+        assert!(rows[2].agrees());
+    }
+
+    /// **#520, v4 must not regress.** A v4 chain below the boundary still audits
+    /// under the grandfathered expectation, and the 1377 scar stays annotated.
+    #[test]
+    fn a_v4_chain_below_the_boundary_still_audits_under_the_grandfathered_expectation() {
+        let rows = supply_by_epoch(honest_chain(10), 4).unwrap();
+        assert!(
+            rows.iter().all(SupplyEpoch::agrees),
+            "an honest v4 chain below the boundary matches the float endpoints"
+        );
+        // The scar annotation is unchanged — epoch, both endpoints, exact delta.
+        let scar = epoch_one_scar_row(-4_114);
+        assert!(!scar.agrees(), "the scar stays VISIBLE");
+        assert!(scar.known_scar().is_some());
+        assert!(!scar.is_unexplained_divergence());
+    }
+
+    /// **#520, genesis exemption.** Height 0 contributes 0 expected issuance on
+    /// both forms — genesis mints nothing, and `coinbase_exact(0)` is never
+    /// compared against the committed 0.
+    #[test]
+    fn genesis_contributes_zero_expected_on_both_forms() {
+        for form in [GenesisForm::V4, GenesisForm::V5] {
+            let rows = supply_by_epoch_for(form, [block_on(1, 0, 0, 0)], 4).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].expected_coinbase, 0, "{form:?}");
+            assert_eq!(rows[0].measured_coinbase, 0, "{form:?}");
+            assert!(rows[0].agrees(), "{form:?}");
+        }
+    }
+
+    /// Pins, the boundary, and the straddle prefix are v4 machinery. A v5
+    /// ledger with a planted pin table still audits the exact schedule.
+    #[test]
+    fn a_v5_ledger_does_not_consult_pins_or_the_boundary() {
+        const PINS: &[EpochPin] = &[EpochPin {
+            epoch: 0,
+            start_height: 0,
+            end_height: 3,
+            expected_coinbase: 1,
+        }];
+        let mut ledger = SupplyLedger::with_pins_for(GenesisForm::V5, 4, PINS).unwrap();
+        assert_eq!(ledger.form(), GenesisForm::V5);
+        for block in honest_v5_chain(3) {
+            ledger.push(block).unwrap();
+        }
+        let row = &ledger.rows()[0];
+        assert_ne!(row.expected_coinbase, 1, "the pin must not apply on v5");
+        assert_eq!(
+            row.expected_coinbase,
+            s_atomic_exact(4) - s_atomic_exact(1)
+        );
+        assert!(row.agrees());
     }
 }
