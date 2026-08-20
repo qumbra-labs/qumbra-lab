@@ -1428,14 +1428,21 @@ mod tests {
     /// half loud instead of silent.
     #[test]
     fn the_default_net_is_the_net_the_release_lane_cuts_by_default() {
-        const WORKFLOW: &str = include_str!("../../../.github/workflows/release-binaries.yml");
+        const WORKFLOW_RAW: &str = include_str!("../../../.github/workflows/release-binaries.yml");
+        // 🔴 Normalise line endings before matching. `include_str!` embeds the file
+        // as checked out, and a Windows checkout is CRLF by default — so a pattern
+        // ending in `\n` finds nothing there and this test panics on its own
+        // `expect` rather than on the property it guards. It did exactly that on
+        // the windows leg, invisibly, behind an unrelated red (2026-08-20).
+        let workflow = WORKFLOW_RAW.replace("\r\n", "\n");
+        let workflow = workflow.as_str();
         assert!(
             profile_for(DEFAULT_NET).is_some(),
             "DEFAULT_NET is {DEFAULT_NET}, which this binary's net table cannot name"
         );
         // The `net:` dispatch input's default, read out of the workflow's own
         // choice block rather than remembered here.
-        let net_input = WORKFLOW
+        let net_input = workflow
             .split("      net:\n")
             .nth(1)
             .expect("release-binaries.yml declares a `net:` dispatch input");
