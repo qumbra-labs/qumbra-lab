@@ -13,6 +13,13 @@
 # the announcement publish. If seed.qumbra.org is down, this job fails; that is a
 # true statement about a stranger's path today, not a false negative about the
 # binary. The error message below says which of the two happened.
+#
+# ORDERING CONSTRAINT (lab #516): this smoke verifies the PUBLISHED genesis, so a
+# T2 release can only be cut AFTER cutover has repointed the seed host. The
+# preflight job refuses earlier, by name, if the published file is still T1
+# ('published genesis is still t1 — run this after the cutover'). Do not weaken
+# that into a skip: a green T2 cut against a T1 genesis would publish binaries
+# that cannot join the net the announcement describes.
 set -euo pipefail
 
 : "${NODE_BIN:?NODE_BIN (path to the built qumbra-node) is required}"

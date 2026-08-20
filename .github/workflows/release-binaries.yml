@@ -4,8 +4,10 @@
 # real adoption filter — Larry's own words on #437, "容器对很多用户有点难" — and the
 # native-macOS verification that unblocked this lane (40 accepted, finalized blocks
 # in ~100 minutes, #437) removed the last reason to keep the door container-only.
-# This workflow publishes `qumbra-node` + `qumbra-wallet` tarballs to the PUBLIC
-# repo's Releases so the path becomes download → verify → run.
+# This workflow publishes `qumbra-node` + `qumbra-wallet` + `qumbra-pool`
+# archives to the PUBLIC repo's Releases so the path becomes download →
+# verify → run. `qumbra-pool` ships on every platform the node does (it needs
+# RandomX, the same constraint). Lab #516.
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # WHAT THIS FILE COSTS, STATED BEFORE ANYTHING ELSE
@@ -104,6 +106,13 @@ on:
         description: 'Type "release" to spend paid runner minutes (incl. 10x-billed macOS) and publish to the PUBLIC repo. Anything else does nothing.'
         required: true
         default: ""
+      net:
+        description: 'Which net to cut. t2 is the default (post-cutover). t1 stays reachable so an old T1 release can still be re-cut. A T2 cut BEFORE the seed host is repointed fails in preflight — see select-release-net.sh.'
+        type: choice
+        options:
+          - t2
+          - t1
+        default: t2
       publish:
         description: 'draft = assets attached, release invisible until a human clicks Publish (default). prerelease = immediately public, flagged pre-release.'
         type: choice
@@ -125,16 +134,18 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # The four T1 entry points and the pinned genesis, from docs/join-and-mine.md §1-2.
-  # The smoke below is the preflight a real user runs first, so it uses the real
-  # published inputs — a smoke against a locally-minted genesis would prove the
-  # binary works against a file no stranger will ever have.
-  GENESIS_URL: https://seed.qumbra.org/genesis.qmb
-  GENESIS_HASH: 138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb
-  DIAL_PEERS: '["18.202.166.126:9444","18.141.177.109:9444","52.194.224.123:9444","52.5.0.21:9444"]'
+  # Tag prefix, GENESIS_HASH, the smoke's pin, and DIAL_PEERS are NOT here.
+  # They were the four T1-hardwired sites (lab #516). They are selected by the
+  # `net` dispatch input in preflight (scripts/select-release-net.sh) and passed
+  # to later jobs as outputs. Default net is t2; T1's values stay reachable.
+  #
   # The frozen consensus config the fleet runs, and the resume release's identity.
   # Same three pins node-image.yml asserts; kept as literals in both files on
   # purpose — a shared value would have to live somewhere neither file owns.
+  # Re-checked against current main 2026-08-20 (lab #516 item 4): release.rs
+  # REVISION_V1_1_EXACT_EMISSION / REVISION_V1_0 frozen_digest_hex, revision.rs
+  # the same digest, node-image.yml FROZEN_PIN + resume EXP_DOMAIN, and
+  # qlab_devnet::emission_exact::RULE_BOUNDARY_HEIGHT = 8_640. Unchanged.
   FROZEN_PIN: a54e73ce3d1c4fe9984d06b08f99b7577ed1db452b87abd712cf85ce5f3e7b5b
   EXPECTED_REVISION: v1.1-exact-emission
   EXPECTED_DOMAIN: 56447169ab09956fcb78e8fb79a7cf2b502bd42194960226f83da2fb64db20b0
@@ -152,7 +163,7 @@ defaults:
 
 jobs:
   preflight:
-    name: the free checks — secret, target repo, tag
+    name: the free checks — net pin, secret, target repo, tag
     if: inputs.confirm == 'release'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -161,11 +172,29 @@ jobs:
       short: ${{ steps.rev.outputs.short }}
       tag: ${{ steps.rev.outputs.tag }}
       target_sha: ${{ steps.target.outputs.sha }}
+      net: ${{ steps.pins.outputs.net }}
+      genesis_url: ${{ steps.pins.outputs.genesis_url }}
+      genesis_hash: ${{ steps.pins.outputs.genesis_hash }}
+      dial_peers: ${{ steps.pins.outputs.dial_peers }}
     steps:
       - uses: actions/checkout@v4
 
+      # Lab #516: the smoke verifies the PUBLISHED genesis, so a T2 release can
+      # only be cut AFTER cutover has repointed seed.qumbra.org. This step is
+      # the cheap refusal — it fetches the file, keccak256s it, and dies with
+      # 'published genesis is still t1 — run this after the cutover' if the
+      # selected net is t2 and the host still serves T1. Paid runners never
+      # start. Dry-run: NET=t2 bash .github/workflows/scripts/select-release-net.sh
+      - name: Select net pins — refuse a pre-cutover T2
+        id: pins
+        env:
+          NET: ${{ inputs.net }}
+        run: bash .github/workflows/scripts/select-release-net.sh
+
       - name: Revision and tag
         id: rev
+        env:
+          TAG_PREFIX: ${{ steps.pins.outputs.tag_prefix }}
         run: |
           set -euo pipefail
           REV=$(git rev-parse HEAD)
@@ -173,10 +202,11 @@ jobs:
           {
             echo "rev=$REV"
             echo "short=$SHORT"
-            echo "tag=t1-$SHORT"
+            echo "tag=${TAG_PREFIX}-$SHORT"
           } >> "$GITHUB_OUTPUT"
           echo "lab revision : $REV"
-          echo "release tag  : t1-$SHORT"
+          echo "release tag  : ${TAG_PREFIX}-$SHORT"
+          echo "net          : ${{ inputs.net }}"
 
       - name: The cross-repo PAT must exist — fail loudly, never skip
         env:
@@ -244,6 +274,11 @@ jobs:
     container:
       image: rust:1.95-bookworm
     timeout-minutes: 90
+    env:
+      GENESIS_URL: ${{ needs.preflight.outputs.genesis_url }}
+      GENESIS_HASH: ${{ needs.preflight.outputs.genesis_hash }}
+      DIAL_PEERS: ${{ needs.preflight.outputs.dial_peers }}
+      NET: ${{ needs.preflight.outputs.net }}
     steps:
       - uses: actions/checkout@v4
 
@@ -269,11 +304,17 @@ jobs:
           QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
         run: cargo build --release --locked -p qumbra-wallet
 
+      - name: Build the pool — RandomX, same constraint as the node
+        env:
+          QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+        run: cargo build --release --locked -p qumbra-pool
+
       - name: Assert the artifacts — resume, frozen digest, build stamp
         run: bash .github/workflows/scripts/assert-release-artifacts.sh
         env:
           NODE_BIN: target/release/qumbra-node
           WALLET_BIN: target/release/qumbra-wallet
+          POOL_BIN: target/release/qumbra-pool
           EXPECTED_BUILD_REV: ${{ needs.preflight.outputs.rev }}
 
       - name: Smoke — `check` against the PUBLISHED genesis, the way a joiner starts
@@ -319,6 +360,11 @@ jobs:
     needs: [preflight, linux]
     runs-on: windows-latest
     timeout-minutes: 120
+    env:
+      GENESIS_URL: ${{ needs.preflight.outputs.genesis_url }}
+      GENESIS_HASH: ${{ needs.preflight.outputs.genesis_hash }}
+      DIAL_PEERS: ${{ needs.preflight.outputs.dial_peers }}
+      NET: ${{ needs.preflight.outputs.net }}
     steps:
       - uses: actions/checkout@v4
 
@@ -345,11 +391,17 @@ jobs:
           QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
         run: cargo build --release --locked -p qumbra-wallet
 
+      - name: Build the pool — RandomX, same constraint as the node
+        env:
+          QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+        run: cargo build --release --locked -p qumbra-pool
+
       - name: Assert the artifacts — resume, frozen digest, build stamp
         run: bash .github/workflows/scripts/assert-release-artifacts.sh
         env:
           NODE_BIN: target/release/qumbra-node.exe
           WALLET_BIN: target/release/qumbra-wallet.exe
+          POOL_BIN: target/release/qumbra-pool.exe
           EXPECTED_BUILD_REV: ${{ needs.preflight.outputs.rev }}
 
       - name: Smoke — `check` against the PUBLISHED genesis, the way a joiner starts
@@ -382,6 +434,11 @@ jobs:
     needs: [preflight, linux, windows]
     runs-on: macos-14
     timeout-minutes: 120
+    env:
+      GENESIS_URL: ${{ needs.preflight.outputs.genesis_url }}
+      GENESIS_HASH: ${{ needs.preflight.outputs.genesis_hash }}
+      DIAL_PEERS: ${{ needs.preflight.outputs.dial_peers }}
+      NET: ${{ needs.preflight.outputs.net }}
     steps:
       - uses: actions/checkout@v4
 
@@ -410,11 +467,17 @@ jobs:
           QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
         run: cargo build --release --locked -p qumbra-wallet
 
+      - name: Build the pool — RandomX, same constraint as the node
+        env:
+          QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+        run: cargo build --release --locked -p qumbra-pool
+
       - name: Assert the artifacts — resume, frozen digest, build stamp
         run: bash .github/workflows/scripts/assert-release-artifacts.sh
         env:
           NODE_BIN: target/release/qumbra-node
           WALLET_BIN: target/release/qumbra-wallet
+          POOL_BIN: target/release/qumbra-pool
           EXPECTED_BUILD_REV: ${{ needs.preflight.outputs.rev }}
 
       # Acceptance item (c): the macos-arm64 artifact is smoke-run ON a macOS runner.
@@ -494,6 +557,9 @@ jobs:
           LAB_REV: ${{ needs.preflight.outputs.rev }}
           TARGET_SHA: ${{ needs.preflight.outputs.target_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          NET: ${{ needs.preflight.outputs.net }}
+          GENESIS_HASH: ${{ needs.preflight.outputs.genesis_hash }}
+          GENESIS_URL: ${{ needs.preflight.outputs.genesis_url }}
 
       - name: Publish
         env:
@@ -501,6 +567,7 @@ jobs:
           TAG: ${{ needs.preflight.outputs.tag }}
           TARGET_SHA: ${{ needs.preflight.outputs.target_sha }}
           MODE: ${{ inputs.publish }}
+          NET: ${{ needs.preflight.outputs.net }}
         run: |
           set -euo pipefail
           case "$MODE" in
@@ -508,12 +575,17 @@ jobs:
             prerelease) FLAGS=(--prerelease) ;;
             *) echo "::error::unknown publish mode '$MODE'"; exit 1 ;;
           esac
+          case "$NET" in
+            t1) NET_LABEL=T1 ;;
+            t2) NET_LABEL=T2 ;;
+            *) echo "::error::unknown net '$NET'"; exit 1 ;;
+          esac
           # --target pins the tag to a commit read in preflight rather than to
           # whatever the mirror's default branch happens to be seconds from now.
           if ! gh release create "$TAG" \
                 --repo "$PUBLIC_REPO" \
                 --target "$TARGET_SHA" \
-                --title "Qumbra T1 — prebuilt binaries ($TAG)" \
+                --title "Qumbra ${NET_LABEL} — prebuilt binaries ($TAG)" \
                 --notes-file release-notes.md \
                 "${FLAGS[@]}" \
                 release/*.tar.gz release/*.zip release/SHA256SUMS; then

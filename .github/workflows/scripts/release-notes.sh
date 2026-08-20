@@ -10,13 +10,22 @@ set -euo pipefail
 : "${LAB_REV:?LAB_REV is required}"
 : "${TARGET_SHA:?TARGET_SHA is required}"
 : "${RUN_URL:?RUN_URL is required}"
+: "${NET:?NET (t1 or t2) is required}"
+: "${GENESIS_HASH:?GENESIS_HASH is required}"
+: "${GENESIS_URL:?GENESIS_URL is required}"
+
+case "$NET" in
+  t1) NET_LABEL=T1 ;;
+  t2) NET_LABEL=T2 ;;
+  *) echo "::error::NET must be t1 or t2, got '$NET'"; exit 1 ;;
+esac
 
 SUMS=$(cat release/SHA256SUMS)
 
 cat > release-notes.md <<EOF
-Prebuilt \`qumbra-node\` + \`qumbra-wallet\` for the T1 public testnet — no Docker required.
+Prebuilt \`qumbra-node\` + \`qumbra-wallet\` + \`qumbra-pool\` for the ${NET_LABEL} public testnet — no Docker required.
 
-**T1 is a testnet.** Coins have no value and will not survive the next re-genesis.
+**${NET_LABEL} is a testnet.** Coins have no value and will not survive the next re-genesis.
 
 ## Download and verify
 
@@ -48,16 +57,17 @@ ${SUMS}
 
 ## Provenance
 
-- Source revision: \`${LAB_REV}\` (\`qumbra-labs/qumbra-lab\`, private during T1).
+- Source revision: \`${LAB_REV}\` (\`qumbra-labs/qumbra-lab\`, private).
 - Build log, including every assertion below: ${RUN_URL}
-- This tag points at \`${TARGET_SHA}\` in *this* (mirror) repository. **The \`t1-\` suffix
+- This tag points at \`${TARGET_SHA}\` in *this* (mirror) repository. **The \`${NET}-\` suffix
   is the short SOURCE revision, from a different repository's history** — do not read the
   tag name as a commit here.
-- Both binaries carry the revision internally, so you can ask them rather than trust this page:
+- Node and wallet carry the revision internally, so you can ask them rather than trust this page:
 
 \`\`\`sh
 ./qumbra-node halt-status      # "build rev:" must read ${LAB_REV}
 ./qumbra-wallet --help         # "build rev:" must read ${LAB_REV}
+./qumbra-pool --help           # identifies itself (no build-rev stamp)
 \`\`\`
 
 **These builds are not bit-reproducible**, and no such claim is made. Provenance here means
@@ -72,10 +82,11 @@ Per artifact, on the platform it was built for:
   8,640 and cannot follow the chain. An ARMED artifact fails the release job outright.
 - The frozen consensus digest, both as declared and as recomputed from the binary's own
   compiled-in constants, equals the testnet's.
-- \`qumbra-node check\` against the genesis published at \`https://seed.qumbra.org/genesis.qmb\`
+- \`qumbra-node check\` against the genesis published at \`${GENESIS_URL}\`
   exits 0 and verifies it to
-  \`138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb\` — the same preflight the
-  join guide tells you to run first.
+  \`${GENESIS_HASH}\` — the same preflight the
+  join guide tells you to run first. A T2 cut is refused in preflight if that
+  URL still serves the T1 genesis.
 
 ## macOS
 
@@ -83,7 +94,7 @@ The binaries are unsigned and un-notarized. A browser download quarantines them 
 will refuse to run them. Fetch with \`curl\`, or clear the attribute explicitly:
 
 \`\`\`sh
-xattr -d com.apple.quarantine qumbra-node qumbra-wallet
+xattr -d com.apple.quarantine qumbra-node qumbra-wallet qumbra-pool
 \`\`\`
 
 Native macOS mining is supported as of 2026-08-17: above height 8,640 the coinbase rule is exact

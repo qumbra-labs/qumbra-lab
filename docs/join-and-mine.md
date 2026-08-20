@@ -180,8 +180,9 @@ download cannot pass silently.
 #### Prebuilt binaries, no Docker
 
 The container above stays the **reproducible baseline**. If Docker is the obstacle
-rather than the answer, the same two binaries (`qumbra-node`, `qumbra-wallet`, plus a
-`PROVENANCE.txt`) are published as archives on the public repo's releases page —
+rather than the answer, the same three binaries (`qumbra-node`, `qumbra-wallet`,
+`qumbra-pool`, plus a `PROVENANCE.txt`) are published as archives on the public repo's
+releases page —
 **<https://github.com/qumbra-labs/qumbra/releases>**, tag
 `<T2_RELEASE_TAG — filled at announcement>`. Release tags older than the T2 announcement
 are T1 artifacts; do not run them against T2.
@@ -213,7 +214,7 @@ not what it claims to be (CI refuses to publish one).
 
 **macOS only:** the binaries are unsigned and un-notarized. A browser download
 quarantines them and Gatekeeper refuses to run them. Fetch with `curl`, or clear the
-attribute: `xattr -d com.apple.quarantine qumbra-node qumbra-wallet`.
+attribute: `xattr -d com.apple.quarantine qumbra-node qumbra-wallet qumbra-pool`.
 
 **If you build from source, one flag is load-bearing**: a bare
 `cargo build -p qumbra-node` produces the ARMED variant — a T1-upgrade artifact whose
