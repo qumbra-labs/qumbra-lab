@@ -27,6 +27,13 @@ pub struct PoolConfig {
     /// How often to re-fetch the live template, milliseconds. Default 1000.
     #[serde(default)]
     pub poll_ms: Option<u64>,
+    /// Public coinbase-payee identity for pool fallback payouts, encoded as
+    /// 64 hex characters (32 bytes, lane-major little-endian).
+    ///
+    /// There is deliberately no usable default: a service that does not know
+    /// which wallet owns its coinbase must refuse before accepting miners.
+    #[serde(default)]
+    pub payout_rkm: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -50,6 +57,9 @@ pub enum ConfigError {
     Template(TemplateError),
     ZeroDifficulty,
     EmptyListen,
+    MissingPayoutRkm,
+    InvalidPayoutRkm(hexutil::HexError),
+    StaticTemplateSource,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -60,6 +70,19 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Template(e) => write!(f, "config template: {e}"),
             ConfigError::ZeroDifficulty => write!(f, "share_difficulty must be ≥ 1"),
             ConfigError::EmptyListen => write!(f, "listen_addr must be non-empty"),
+            ConfigError::MissingPayoutRkm => write!(
+                f,
+                "missing-payout-rkm: payout_rkm must name the wallet that can spend the pool's coinbase"
+            ),
+            ConfigError::InvalidPayoutRkm(hexutil::HexError::ZeroRkm) => write!(
+                f,
+                "all-zero-payout-rkm: payout_rkm must name a real wallet; an all-zero coinbase payee is unspendable"
+            ),
+            ConfigError::InvalidPayoutRkm(e) => write!(f, "invalid-payout-rkm: {e}"),
+            ConfigError::StaticTemplateSource => write!(
+                f,
+                "static-template-source-refused: a serving pool requires node_rpc; static [template] jobs can never track the live chain"
+            ),
         }
     }
 }
@@ -85,6 +108,7 @@ impl PoolConfig {
         if self.share_difficulty == 0 {
             return Err(ConfigError::ZeroDifficulty);
         }
+        let _ = self.payout_rkm_lanes()?;
         if self.node_rpc.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
             if self.template.is_none() {
                 return Err(ConfigError::Toml(
@@ -94,6 +118,30 @@ impl PoolConfig {
             let _ = self.template_source()?;
         }
         Ok(())
+    }
+
+    /// The first-service gate. Static templates remain parseable for fixtures,
+    /// but no CLI service path may accept miners over one.
+    pub fn ensure_service_ready(&self) -> Result<(), ConfigError> {
+        if self
+            .node_rpc
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+        {
+            return Err(ConfigError::StaticTemplateSource);
+        }
+        let _ = self.payout_rkm_lanes()?;
+        Ok(())
+    }
+
+    /// Decode the configured public payout identity into the coinbase lanes.
+    pub fn payout_rkm_lanes(&self) -> Result<[u64; 4], ConfigError> {
+        let value = self
+            .payout_rkm
+            .as_deref()
+            .ok_or(ConfigError::MissingPayoutRkm)?;
+        hexutil::rkm_lanes_from_hex(value).map_err(ConfigError::InvalidPayoutRkm)
     }
 
     pub fn form(&self) -> Result<GenesisForm, ConfigError> {
@@ -148,6 +196,7 @@ mod tests {
     const SAMPLE: &str = r#"
 listen_addr = "127.0.0.1:3333"
 share_difficulty = 1024
+payout_rkm = "0100000000000000020000000000000003000000000000000400000000000000"
 
 [template]
 form = "v5"
@@ -172,5 +221,42 @@ seed_hash = "3333333333333333333333333333333333333333333333333333333333333333"
             PoolConfig::from_toml(&bad),
             Err(ConfigError::ZeroDifficulty)
         ));
+    }
+
+    #[test]
+    fn serving_refuses_a_static_template_by_name() {
+        let cfg = PoolConfig::from_toml(SAMPLE).unwrap();
+        let err = cfg.ensure_service_ready().unwrap_err();
+        assert!(matches!(&err, ConfigError::StaticTemplateSource));
+        assert!(err.to_string().contains("static-template-source-refused"));
+    }
+
+    #[test]
+    fn serving_refuses_an_all_zero_payout_by_name() {
+        let live = r#"
+listen_addr = "127.0.0.1:3333"
+share_difficulty = 1024
+node_rpc = "http://node:9420"
+payout_rkm = "0000000000000000000000000000000000000000000000000000000000000000"
+"#;
+        let err = PoolConfig::from_toml(live).unwrap_err();
+        assert!(matches!(
+            &err,
+            ConfigError::InvalidPayoutRkm(hexutil::HexError::ZeroRkm)
+        ));
+        assert!(err.to_string().contains("all-zero-payout-rkm"));
+    }
+
+    #[test]
+    fn live_service_uses_the_configured_payout_lanes() {
+        let live = r#"
+listen_addr = "127.0.0.1:3333"
+share_difficulty = 1024
+node_rpc = "http://node:9420"
+payout_rkm = "0100000000000000020000000000000003000000000000000400000000000000"
+"#;
+        let cfg = PoolConfig::from_toml(live).unwrap();
+        cfg.ensure_service_ready().unwrap();
+        assert_eq!(cfg.payout_rkm_lanes().unwrap(), [1, 2, 3, 4]);
     }
 }

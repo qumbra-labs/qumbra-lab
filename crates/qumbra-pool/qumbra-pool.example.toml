@@ -1,10 +1,8 @@
 # qumbra-pool example config (lab #482 stage 1).
 #
-# `form` lives on [template], not at the top level: it is a fact about
-# the tip this file describes (the genesis identity), not an operator
-# preference that could desync from the node's genesis hash (H1).
-#
-# A v4 template makes login refuse stock-xmrig by name (#356 UNCLEAN).
+# A serving pool accepts jobs only from its own node's live RPC. Static
+# [template] tables remain test fixtures but are refused by the service gate:
+# they cannot track the live chain and would mislead miners.
 # Share-PoW: qlab_pow::RandomXHasher (feature randomx, default ON).
 # PPLNS window = 1024 accepted shares [devnet-placeholder].
 # V5 payee list is N=1 at birth (COINBASE_PAYEE_CAP_V5).
@@ -13,18 +11,11 @@ listen_addr = "127.0.0.1:3333"
 share_difficulty = 1024
 
 # Lab #511 live lane: point at this pool's own node (discovery listener).
-# When set, [template] is ignored and jobs come from GET /v1/mine/template.
+# In compose, use the node service name; do not share its network namespace.
 # The node must have template_serving = true.
-# node_rpc = "http://127.0.0.1:9420"
-# poll_ms = 1000
+node_rpc = "http://node:9420"
+poll_ms = 1000
 
-[template]
-form = "v5"
-prev = "1111111111111111111111111111111111111111111111111111111111111111"
-height = 100
-timestamp = 1785000000
-difficulty = 256
-tx_body_commitment = "2222222222222222222222222222222222222222222222222222222222222222"
-seed_hash = "3333333333333333333333333333333333333333333333333333333333333333"
-# next_seed_hash is omitted unless the tip is inside the 64-block
-# preload window before a key-block rotation.
+# Deliberately unusable placeholder: replace it with the public `rkm` from the
+# pool's dedicated wallet. Leaving it zero makes `check` and `run` refuse by name.
+payout_rkm = "0000000000000000000000000000000000000000000000000000000000000000"
