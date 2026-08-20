@@ -144,6 +144,34 @@ services:
       - shared:/shared
       - dataf:/data
 
+  # ── the T2 pool (lab #511 / G4) ───────────────────────────────────────────
+  #
+  # Second binary in this image. Profile `pool` so an ordinary soak is unchanged:
+  #
+  #   docker compose -f deploy/docker/docker-compose.yml --profile pool up -d pool
+  #
+  # The pool talks to ITS OWN node on the same host. Default node_rpc is
+  # http://127.0.0.1:9420 — that is the discovery loopback. For a sidecar
+  # talking to node0's published discovery, set QUMBRA_NODE_RPC and bind
+  # the node's discovery off loopback. Operator file: QUMBRA_POOL_CONFIG.
+  # Config path documented here (deploy #197's compose template is the
+  # deploy-repo sibling; this is the lab-side copy).
+  pool:
+    <<: *node-common
+    hostname: pool
+    profiles: ["pool"]
+    environment:
+      QUMBRA_NODE_RPC: ${QUMBRA_NODE_RPC:-http://127.0.0.1:9420}
+      QUMBRA_POOL_LISTEN: ${QUMBRA_POOL_LISTEN:-0.0.0.0:3333}
+      QUMBRA_POOL_SHARE_DIFFICULTY: ${QUMBRA_POOL_SHARE_DIFFICULTY:-1024}
+      QUMBRA_POOL_POLL_MS: ${QUMBRA_POOL_POLL_MS:-1000}
+      QUMBRA_POOL_CONFIG: ${QUMBRA_POOL_CONFIG:-}
+    ports:
+      - "127.0.0.1:3333:3333"
+    command: ["pool"]
+    volumes:
+      - shared:/shared
+
   node0:                    # de-facto bootstrap (all nodes full-mesh dial each other)
     <<: *node-common
     hostname: node0

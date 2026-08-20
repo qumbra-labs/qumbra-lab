@@ -16,7 +16,17 @@ pub struct PoolConfig {
     pub listen_addr: String,
     /// Assigned share difficulty. Encoded as 8-byte raw LE target.
     pub share_difficulty: u64,
-    pub template: TemplateFile,
+    /// Static `[template]` table. Required unless [`Self::node_rpc`] is set.
+    #[serde(default)]
+    pub template: Option<TemplateFile>,
+    /// `http://host:port` of this pool's own node (lab #511). When set,
+    /// jobs come from `GET /v1/mine/template` and block finds POST
+    /// `/v1/mine/block`. The static table is ignored.
+    #[serde(default)]
+    pub node_rpc: Option<String>,
+    /// How often to re-fetch the live template, milliseconds. Default 1000.
+    #[serde(default)]
+    pub poll_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -75,27 +85,42 @@ impl PoolConfig {
         if self.share_difficulty == 0 {
             return Err(ConfigError::ZeroDifficulty);
         }
-        let _ = self.template_source()?;
+        if self.node_rpc.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+            if self.template.is_none() {
+                return Err(ConfigError::Toml(
+                    "need [template] or node_rpc = \"http://host:port\"".into(),
+                ));
+            }
+            let _ = self.template_source()?;
+        }
         Ok(())
     }
 
     pub fn form(&self) -> Result<GenesisForm, ConfigError> {
-        parse_form(&self.template.form).map_err(ConfigError::Template)
+        let t = self
+            .template
+            .as_ref()
+            .ok_or_else(|| ConfigError::Toml("no [template] (live node_rpc has no static form)".into()))?;
+        parse_form(&t.form).map_err(ConfigError::Template)
     }
 
     pub fn into_template(&self) -> Result<Template, ConfigError> {
-        let form = self.form()?;
+        let t = self
+            .template
+            .as_ref()
+            .ok_or_else(|| ConfigError::Toml("no [template]".into()))?;
+        let form = parse_form(&t.form).map_err(ConfigError::Template)?;
         let header = header_from_parts(
-            &self.template.prev,
-            self.template.height,
-            self.template.timestamp,
-            self.template.difficulty,
-            &self.template.tx_body_commitment,
+            &t.prev,
+            t.height,
+            t.timestamp,
+            t.difficulty,
+            &t.tx_body_commitment,
         )
         .map_err(ConfigError::Template)?;
-        let seed_hash = hexutil::decode_exact(&self.template.seed_hash)
+        let seed_hash = hexutil::decode_exact(&t.seed_hash)
             .map_err(|e| ConfigError::Template(TemplateError::Hex(e)))?;
-        let next_seed_hash = match &self.template.next_seed_hash {
+        let next_seed_hash = match &t.next_seed_hash {
             Some(s) => Some(
                 hexutil::decode_exact(s)
                     .map_err(|e| ConfigError::Template(TemplateError::Hex(e)))?,
@@ -107,6 +132,7 @@ impl PoolConfig {
             header,
             seed_hash,
             next_seed_hash,
+            body: None,
         })
     }
 

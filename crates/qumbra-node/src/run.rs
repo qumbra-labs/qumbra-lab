@@ -56,6 +56,10 @@ use crate::discovery_server::{
     AnchorsView, DiscoveryServer, DiscoveryView, LeavesView, SubmitRequest, TxRefusal,
     TxSubmitOutcome, MAX_QUEUED_SUBMITS,
 };
+use crate::mine_rpc::{
+    outcome_from_ingest, BlockSubmitOutcome, BlockSubmitRequest, MineServing, MineTemplateWire,
+    TemplateRequest,
+};
 use crate::looptime::{LoopJournal, LoopPhases};
 use crate::metrics_server::MetricsServer;
 use crate::telemetry_server::TelemetryServer;
@@ -325,6 +329,15 @@ pub fn preflight(config: &NodeConfig, genesis: &GenesisFile) -> Result<Preflight
     })
 }
 
+/// Cached `GET /v1/mine/template` answer. Refreshed when the tip or the
+/// mempool length moves — not on every poll, because assembly advances
+/// the deterministic mining clock.
+struct CachedMineTemplate {
+    tip: qlab_devnet::header::Hash32,
+    mempool_len: usize,
+    wire: MineTemplateWire,
+}
+
 /// A composed, running full node: P2P + real node-state + PoW + committee, over
 /// TCP with disk persistence. Generic over the PoW engine `P` (KeccakPow in
 /// tests, RandomXPow in the binary) and the injected verifier `V`.
@@ -418,6 +431,17 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// ([`Self::drain_remote_submits`]). `None` until the discovery endpoint
     /// starts.
     submit_rx: Option<std::sync::mpsc::Receiver<SubmitRequest>>,
+    /// Lab #511: `GET /v1/mine/template` / `POST /v1/mine/block` rendezvous.
+    /// `None` until the discovery endpoint starts. The config gate lives in
+    /// [`Self::template_serving`]; a disabled gate still owns the channels so
+    /// the handler can answer UNAVAILABLE without a 404.
+    template_rx: Option<std::sync::mpsc::Receiver<TemplateRequest>>,
+    block_rx: Option<std::sync::mpsc::Receiver<BlockSubmitRequest>>,
+    /// Config gate for the two mine routes. Off by default.
+    template_serving: bool,
+    /// Last assembled template, keyed on tip + mempool length so a poll
+    /// does not advance the deterministic mining clock.
+    cached_mine_template: Option<CachedMineTemplate>,
     /// Incremental scheduled-issuance accounting. Rebuilt once from the persisted
     /// canonical bodies at startup, then advanced only for new heights.
     supply_ledger: Mutex<SupplyLedger>,
@@ -786,6 +810,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         let bound = transport.local_addr().to_string();
         let node_id = node_id_from_addr(&bound);
         let mut p2p = P2pNode::new(transport, adapter, node_id);
+        // Lab #474: the net identity IS the genesis file hash — the same value
+        // `expected_genesis_hash` pins (issue #206's operational hash, not the
+        // genesis block-header hash). On a v5-genesis net the P2P layer sends it
+        // in `Version` and requires it of peers; on v4 it stays off the wire
+        // (legacy-compat) and only polices a peer that names a different net.
+        p2p.set_net_id(genesis.hash());
 
         // (6) Peer discovery (issue #83). The address book is restored from disk if a
         //     previous run persisted one, the configured `dial_peers` are (re-)applied
@@ -875,6 +905,10 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             anchors_view: Arc::new(Mutex::new(Arc::new(AnchorsView::default()))),
             anchors_sig: None,
             submit_rx: None,
+            template_rx: None,
+            block_rx: None,
+            template_serving: config.template_serving,
+            cached_mine_template: None,
             supply_ledger: Mutex::new(supply_ledger),
             process_start_secs: unix_secs(),
             listen_addr: bound,
@@ -1883,16 +1917,26 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // The submit rendezvous (issue #275): the server holds the sender, this
         // loop drains the receiver once per iteration.
         let (submit_tx, submit_rx) = std::sync::mpsc::sync_channel(MAX_QUEUED_SUBMITS);
-        let srv = DiscoveryServer::start(
+        let (template_tx, template_rx) = std::sync::mpsc::sync_channel(MAX_QUEUED_SUBMITS);
+        let (block_tx, block_rx) = std::sync::mpsc::sync_channel(MAX_QUEUED_SUBMITS);
+        let mine = MineServing {
+            enabled: self.template_serving,
+            templates: template_tx,
+            blocks: block_tx,
+        };
+        let srv = DiscoveryServer::start_with_mine(
             addr,
             Arc::clone(&self.discovery_view),
             Arc::clone(&self.leaves_view),
             Arc::clone(&self.anchors_view),
             submit_tx,
+            Some(mine),
         )?;
         let bound = srv.addr();
         self.discovery_server = Some(srv);
         self.submit_rx = Some(submit_rx);
+        self.template_rx = Some(template_rx);
+        self.block_rx = Some(block_rx);
         Ok(bound)
     }
 
@@ -2066,6 +2110,78 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             }
             Err(e) => TxSubmitOutcome::Refused(TxRefusal::Submit(e)),
         }
+    }
+
+    /// Answer every mine-template / block-submit the discovery server queued
+    /// (lab #511). Same cadence as [`Self::drain_remote_submits`]: empty
+    /// queues cost two `try_recv`s.
+    pub fn drain_mine_rpc(&mut self) {
+        loop {
+            let req = match self.template_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(req)) => req,
+                _ => break,
+            };
+            let _ = req.reply.try_send(self.serve_mine_template());
+        }
+        loop {
+            let req = match self.block_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(req)) => req,
+                _ => break,
+            };
+            let outcome = self.submit_mined_block(req.header, req.body);
+            let _ = req.reply.try_send(outcome);
+        }
+    }
+
+    fn serve_mine_template(&mut self) -> Result<MineTemplateWire, String> {
+        if !self.template_serving {
+            return Err("template-serving-disabled".into());
+        }
+        let tip = self.p2p.node().tip_hash();
+        let mempool_len = self.p2p.node().mempool().len();
+        if let Some(cached) = &self.cached_mine_template {
+            if cached.tip == tip && cached.mempool_len == mempool_len {
+                return Ok(cached.wire.clone());
+            }
+        }
+        let assembled = self
+            .p2p
+            .node_mut()
+            .assemble_block()
+            .ok_or_else(|| "assemble-unavailable".to_string())?;
+        let wire = MineTemplateWire::from_candidate(&assembled);
+        self.cached_mine_template = Some(CachedMineTemplate {
+            tip,
+            mempool_len,
+            wire: wire.clone(),
+        });
+        Ok(wire)
+    }
+
+    fn submit_mined_block(
+        &mut self,
+        header: qlab_devnet::header::BlockHeader,
+        body: qlab_devnet::body::BlockBody,
+    ) -> BlockSubmitOutcome {
+        if !self.template_serving {
+            return BlockSubmitOutcome::Unavailable {
+                name: "template-serving-disabled".into(),
+            };
+        }
+        use qlab_p2p::n1::ChainView;
+        let form = self.p2p.node().genesis_form();
+        self.nonce = self.nonce.wrapping_add(1);
+        let outcome = self.p2p.announce_block_named(
+            header,
+            body.txs,
+            body.coinbase,
+            body.coinbase_rkm,
+            self.nonce,
+        );
+        // Refresh the template cache: a new tip (or a refusal that left the
+        // tip alone) must not keep serving a stale job as if it were live.
+        self.cached_mine_template = None;
+        outcome_from_ingest(form, &header, outcome)
     }
 
     /// Re-render the snapshot the scrape server serves.
@@ -2756,6 +2872,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // on a socket waiting for this, and an empty queue costs one
         // `try_recv` (issue #275).
         self.drain_remote_submits();
+        self.drain_mine_rpc();
         phases.submit = lap(&mut t);
         if self.telemetry_server.is_some()
             && self.last_telemetry_render.elapsed() >= TELEMETRY_REFRESH
@@ -3133,6 +3250,7 @@ mod tests {
             // default itself, from a config FILE, which is where it applies.
             discovery_addr: None,
             miner_rkm: None,
+            template_serving: false,
         };
         (config, genesis, base)
     }
@@ -4640,6 +4758,19 @@ mod tests {
         let pf = preflight(&config, &genesis).expect("subset preflight ok");
         assert_eq!(pf.keys_held, 6);
         assert!(!pf.mining);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Lab #474 wiring: the running node's P2P layer carries the genesis FILE
+    /// hash — the very value `expected_genesis_hash` pins — as its net identity,
+    /// so the cross-net handshake refusal is armed on every real node (the
+    /// policy itself is locked by `qlab-p2p`'s `i474_*` tests).
+    #[test]
+    fn the_p2p_layer_learns_the_net_identity_from_the_genesis_file() {
+        let (config, genesis, base) = rig("netid", false);
+        let node =
+            RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+        assert_eq!(node.p2p().net_id(), Some(genesis.hash()));
         let _ = std::fs::remove_dir_all(&base);
     }
 

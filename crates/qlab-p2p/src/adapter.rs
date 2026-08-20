@@ -98,6 +98,23 @@ pub enum MiningClock {
     WallClock,
 }
 
+/// An unground candidate: the node's own `mine_on_parent` assembly without
+/// `mine_under`. Lab #511 serves this on `GET /v1/mine/template`.
+#[derive(Clone)]
+pub struct AssembledCandidate {
+    /// The genesis form the header was assembled under.
+    pub form: GenesisForm,
+    /// Header with `nonce = 0` — the miner (or pool extra-nonce) owns the grind.
+    pub header: BlockHeader,
+    /// Body the header's `tx_body_commitment` binds. POST `/v1/mine/block`
+    /// must submit this body with the completed header.
+    pub body: BlockBody,
+    /// RandomX key-block hash at `seed_height(header.height)`.
+    pub seed_hash: Hash32,
+    /// Next key-block hash, when this branch already holds that seed block.
+    pub next_seed_hash: Option<Hash32>,
+}
+
 /// Real wall-clock time in whole seconds since the Unix epoch (the
 /// [`MiningClock::WallClock`] source). A clock reading before the epoch (never on a
 /// sane host) reads as 0 — the parent-clamp in [`NodeAdapter::next_timestamp`] then
@@ -1866,6 +1883,15 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         }
     }
 
+    /// The header+body a miner would grind, assembled by the same parent
+    /// selection and mempool path as [`Self::mine_block`] but **without**
+    /// `mine_under`. Lab #511: the template RPC must reuse this path
+    /// verbatim — a second assembly is a consensus-adjacent fork.
+    pub fn assemble_block(&mut self) -> Option<AssembledCandidate> {
+        let parent_hash = self.mining_parent_hash()?;
+        self.assemble_on_parent(parent_hash)
+    }
+
     /// Assemble + mine (but do NOT insert) the next block over the current tip.
     /// Returns `(mined_header, body)`; the caller ingests it via `announce_block`
     /// → `ingest_block`, which is the single insert/apply path. `None` if there is
@@ -1890,6 +1916,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
         let off_main = self.applied_tip().is_off_main_chain();
         let exempt = self.state_tip_mine_ready;
 
+        let parent_hash = self.mining_parent_hash()?;
+        let mined = self.mine_on_parent(parent_hash)?;
+        if exempt && (lagging || off_main) {
+            self.metrics.observe_state_tip_mine();
+        }
+        Some(mined)
+    }
+
+    /// Parent hash [`Self::mine_block`] / [`Self::assemble_block`] would extend.
+    /// Shared so the two cannot drift on halt / lag / #200 exemption.
+    fn mining_parent_hash(&mut self) -> Option<Hash32> {
+        let lagging = self.state_lag().is_lagging();
+        let off_main = self.applied_tip().is_off_main_chain();
+        let exempt = self.state_tip_mine_ready;
+
         // Parent height for the halt gate: under the exemption we extend the
         // *state* tip, so the height that must clear H2 is state_tip+1, not the
         // fork-choice tip the node cannot verify.
@@ -1905,27 +1946,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             return None;
         }
 
-        let parent_hash = if lagging {
+        if lagging {
             if !exempt {
                 self.refuse_for_lag("mine");
                 return None;
             }
             // #200: mine on the verified state tip.
-            self.state.tip_hash()
+            Some(self.state.tip_hash())
         } else if exempt && off_main {
             // Heights match but the applied tip is a sibling of the main-chain
             // block at that height (the equal-work incumbent still holds fork
             // choice). Keep extending the verified branch until it is heavier.
-            self.state.tip_hash()
+            Some(self.state.tip_hash())
         } else {
-            self.chain.tip_hash()
-        };
-
-        let mined = self.mine_on_parent(parent_hash)?;
-        if exempt && (lagging || off_main) {
-            self.metrics.observe_state_tip_mine();
+            Some(self.chain.tip_hash())
         }
-        Some(mined)
     }
 
     /// Mine a child of `parent_hash` (must be a known header). Shared by the
@@ -1950,6 +1985,21 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// while fork choice is elsewhere, and the header's height is the only one
     /// consensus reads.
     fn mine_on_parent(&mut self, parent_hash: Hash32) -> Option<(BlockHeader, BlockBody)> {
+        let assembled = self.assemble_on_parent(parent_hash)?;
+        let mined = mine_under(
+            &self.pow,
+            assembled.header,
+            self.nonce_budget,
+            &assembled.seed_hash,
+            &self.rules,
+        )?;
+        Some((mined, assembled.body))
+    }
+
+    /// The node's own `mine_on_parent` assembly, WITHOUT grinding. Lab #511
+    /// STOP-POINT: this is the same mempool / timestamp / difficulty / seed
+    /// path as a self-mined block. A fork here is a consensus-adjacent fork.
+    fn assemble_on_parent(&mut self, parent_hash: Hash32) -> Option<AssembledCandidate> {
         let template =
             self.mempool.assemble(&self.state, SOAK_EFFECTIVE_MEDIAN, self.miner_rkm);
         let body = template.body;
@@ -1968,9 +2018,41 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
             "the mined header's height must be the height its body commitment was keyed to"
         );
         let seed = pow_seed(&self.chain, &parent_hash, candidate.height, self.schedule)?;
-        let mined =
-            mine_under(&self.pow, candidate, self.nonce_budget, &seed, &self.rules)?;
-        Some((mined, body))
+        let mut seed_hash = [0u8; 32];
+        if seed.len() != 32 {
+            return None;
+        }
+        seed_hash.copy_from_slice(&seed);
+        let next_seed_hash = self.next_seed_hash_if_known(candidate.height, &parent_hash);
+        Some(AssembledCandidate {
+            form: self.rules.form,
+            header: candidate,
+            body,
+            seed_hash,
+            next_seed_hash,
+        })
+    }
+
+    /// Next key-block hash when this branch already holds the seed block of
+    /// the *next* rotation. Absent far from a rotation (the usual case) and
+    /// absent when that height has not been mined yet.
+    fn next_seed_hash_if_known(&self, height: u64, parent_hash: &Hash32) -> Option<Hash32> {
+        let epoch = self.schedule.epoch;
+        let lag = self.schedule.lag;
+        if epoch == 0 {
+            return None;
+        }
+        let first = epoch + lag + 1;
+        let rot = if height < first {
+            first
+        } else {
+            let current = self.schedule.seed_height(height);
+            current + epoch + lag + 1
+        };
+        let next_seed_h = self.schedule.seed_height(rot);
+        let parent = self.chain.header(parent_hash)?;
+        let depth = parent.height.checked_sub(next_seed_h)?;
+        self.chain.ancestor(parent_hash, depth)
     }
 
     /// Build a checkpoint for the main-chain block at `height` (devnet root

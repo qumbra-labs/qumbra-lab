@@ -53,6 +53,13 @@ ARG FAUCET_FEATURES=""
 RUN cargo build --release --locked -p qumbra-faucet ${FAUCET_FEATURES:+--features "$FAUCET_FEATURES"} \
     && cp target/release/qumbra-faucet /usr/local/bin/qumbra-faucet
 
+# Lab #511 (G4): the pool binary rides this image as a second binary — same
+# graph as the node (qlab-pow / qlab-devnet already built). `entrypoint.sh
+# pool` runs it. A forgotten `-p qumbra-pool` is how a pool-shaped image
+# ships without a pool.
+RUN cargo build --release --locked -p qumbra-pool \
+    && cp target/release/qumbra-pool /usr/local/bin/qumbra-pool
+
 # ── halt-height drill binaries (issue #74) ──────────────────────────────────
 #
 # H1: the halt height is a BINARY RELEASE CONSTANT with no runtime override, so the
@@ -190,6 +197,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /usr/local/bin/qumbra-node /usr/local/bin/qumbra-node
 COPY --from=builder /usr/local/bin/qumbra-faucet /usr/local/bin/qumbra-faucet
+COPY --from=builder /usr/local/bin/qumbra-pool /usr/local/bin/qumbra-pool
 COPY --from=builder /usr/local/bin/qumbra-node-armed /usr/local/bin/qumbra-node-armed
 COPY --from=builder /usr/local/bin/qumbra-node-resume /usr/local/bin/qumbra-node-resume
 COPY --from=builder /usr/local/bin/qumbra-node-norev /usr/local/bin/qumbra-node-norev

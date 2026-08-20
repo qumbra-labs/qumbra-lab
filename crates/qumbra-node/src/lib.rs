@@ -54,6 +54,7 @@ pub mod genesis;
 pub mod looptime;
 pub mod metrics_server;
 pub mod mine;
+pub mod mine_rpc;
 pub mod params_audit;
 pub mod release;
 pub mod revision;

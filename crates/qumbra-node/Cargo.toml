@@ -103,6 +103,12 @@ qlab-air = { path = "../qlab-air" }
 qumbra-wallet = { path = "../qumbra-wallet", default-features = false, features = ["net"] }
 # ML-DSA-65 verifying-key encode/decode for committee₀ in the genesis file.
 ml-dsa = "=0.1.1"
+# CSPRNG for `genesis init --t2 --launch` (lab #506): 21 committee seeds from
+# OS randomness, then `Validator::from_seed` — the existing keygen seam, so
+# KeyFile still stores seed_hex and `load_validators` is unchanged. Same crate
+# the rest of the workspace uses; `rand::rng()` is the house OsRng-class path
+# (see qumbra-wallet `store.rs`). Tests also use it (was a dev-dep only).
+rand = "0.10"
 
 # Deterministic on-disk genesis-file encoding (same serde/bincode posture as the
 # qlab-node snapshot/log). The genesis hash is keccak256 over the bincode.
@@ -111,6 +117,9 @@ bincode = "1"
 # TOML node config (data dir, listen addr, dial peers, committee-key paths,
 # mining on/off) — the issue's specified config format.
 toml = "0.8"
+# Lab #511: GET /v1/mine/template and POST /v1/mine/block are JSON over the
+# existing discovery listener (pure route addition, no RPC_VERSION bump).
+serde_json = "1"
 # The /metrics scrape endpoint (issue #87). Same minimal blocking HTTP/1.1 server,
 # and the same `=` pin, as qlab-node's RPC surface and qlab-cbserver's reference
 # server — one HTTP implementation in the tree, not three.
@@ -133,7 +142,12 @@ qlab-note = { path = "../qlab-note" }
 # reference decoder would not be testing the wire.
 qlab-cbserver = { path = "../qlab-cbserver" }
 # CSPRNG for the acceptance test's ML-KEM keypairs and note material (workspace rev).
+# Also a [dependencies] entry since lab #506 (launch-mode committee keygen).
 rand = "0.10"
+# Lab #511 live-leg: login → job from a REAL node → share → POST → tip advances.
+# default-features = false so the test does not construct a RandomX VM.
+qumbra-pool = { path = "../qumbra-pool", default-features = false }
+qlab-stratum = { path = "../qlab-stratum" }
 
 # ── graceful shutdown: one seam, two platform mechanisms (src/shutdown.rs) ──
 #
