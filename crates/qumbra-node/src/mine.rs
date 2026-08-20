@@ -269,6 +269,32 @@ fn parse_genesis_hash(hex: &str) -> Result<String, MineError> {
     Ok(lowered)
 }
 
+/// The one internally-inconsistent state a built binary can be in: the release
+/// lane stamped one genesis hash for [`BUILT_FOR_NET`] and this binary's own net
+/// table holds a different one.
+///
+/// Neither value can be preferred from inside the process — the stamp is the
+/// more recent measurement, the table is the more reviewed one — so it is a
+/// refusal. It is also unreachable through the verify lane, where
+/// `the_net_table_is_the_release_lanes_net_table` is red for any tree in this
+/// state; this is the runtime half, for a build that never ran it.
+fn stamp_disagreement() -> Option<MineError> {
+    let stamped = STAMPED_GENESIS_HASH?;
+    let table = profile_for(BUILT_FOR_NET)?;
+    if stamped.eq_ignore_ascii_case(table.genesis_hash) {
+        return None;
+    }
+    Some(MineError::Usage(format!(
+        "this binary is internally inconsistent about net {net}: the release lane stamped \
+         {stamped} into it, and its own net table says {table}. One of the two is describing a \
+         different net, and this command will not guess which. Rebuild from a tree whose net \
+         table agrees with .github/workflows/scripts/select-release-net.sh, or pass \
+         --genesis-hash explicitly.",
+        net = BUILT_FOR_NET,
+        table = table.genesis_hash,
+    )))
+}
+
 /// Resolve the net identity this run will enforce, highest precedence first.
 ///
 /// 1. `--genesis-hash HEX` — an explicit operator pin. Wins over everything,
@@ -296,6 +322,17 @@ pub fn resolve_identity(
     net_flag: Option<&str>,
     hash_flag: Option<&str>,
 ) -> Result<NetIdentity, MineError> {
+    // The internal-consistency refusal, applied once and to every path that
+    // would otherwise have to choose between the stamp and the table. `--net t1`
+    // on a t2 binary is exempt (nothing about t2 is being believed), and
+    // `--genesis-hash` is exempt because it supplies the answer the two
+    // disagreed about — which is what its refusal text promises.
+    if hash_flag.is_none() && net_flag.is_none_or(|n| n == BUILT_FOR_NET) {
+        if let Some(e) = stamp_disagreement() {
+            return Err(e);
+        }
+    }
+
     let (net, profile, mut genesis_hash, mut pin_source) = match net_flag {
         Some(name) => {
             let profile = profile_for(name).ok_or_else(|| {
@@ -311,18 +348,6 @@ pub fn resolve_identity(
         None => {
             let profile = profile_for(BUILT_FOR_NET);
             match (STAMPED_GENESIS_HASH, profile) {
-                (Some(stamped), Some(p)) if !stamped.eq_ignore_ascii_case(p.genesis_hash) => {
-                    return Err(MineError::Usage(format!(
-                        "this binary is internally inconsistent about net {net}: the release \
-                         lane stamped {stamped} into it, and its own net table says {table}. One \
-                         of the two is describing a different net, and this command will not \
-                         guess which. Rebuild from a tree whose net table agrees with \
-                         .github/workflows/scripts/select-release-net.sh, or pass \
-                         --genesis-hash explicitly.",
-                        net = BUILT_FOR_NET,
-                        table = p.genesis_hash,
-                    )))
-                }
                 (Some(stamped), _) => (
                     BUILT_FOR_NET.to_string(),
                     profile,
@@ -2178,6 +2203,15 @@ mod tests {
             &mut out,
         )
         .expect("prepare");
+
+        // Lab #527: the run says which net it is joining and where the pin came
+        // from, above the point where a wrong genesis would be refused. The
+        // reproduction on the shipped binary printed both hashes and no way to
+        // tell why the expected one was expected.
+        let text = String::from_utf8(out.clone()).expect("utf-8");
+        assert!(text.contains("net:      t1 — genesis pinned to"), "{text}");
+        assert!(text.contains(NET_T1.genesis_hash), "{text}");
+        assert!(text.contains("pin source:"), "{text}");
 
         let w = qumbra_wallet::store::WalletDir::open(&d.join(WALLET_SUBDIR)).expect("wallet");
         let want = qumbra_wallet::store::miner_rkm_hex(&w.wallet(), 0);
