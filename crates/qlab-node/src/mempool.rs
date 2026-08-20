@@ -95,7 +95,7 @@ use qlab_devnet::weight::{
 // `COINBASE_MATURITY_BLOCKS` is deliberately not imported here any more (issue
 // #102): this module no longer enforces maturity, and importing the constant would
 // invite a second, weaker gate to grow back beside the structural one.
-use crate::emission::{coinbase, RewardSplit};
+use crate::emission::{coinbase_for, RewardSplit};
 use crate::node::NodeState;
 use crate::store::Hash32;
 
@@ -382,16 +382,12 @@ impl BlockTemplate {
         if !is_weight_admissible(total_weight, effective_median, &params.weight) {
             return Err(AssemblyError::TemplateOverWeight { weight: total_weight, hard_cap });
         }
-        // Lab #470 stage 4a: the template mints the schedule ITS NET runs —
-        // the v4 arm is the boundary-grandfathered function exactly as before;
-        // a v5 net mints the exact schedule natively (what validate_body_v5
-        // will demand of this very template).
-        let coinbase_total = match form {
-            qlab_devnet::forms::GenesisForm::V4 => coinbase(height),
-            qlab_devnet::forms::GenesisForm::V5 => {
-                qlab_devnet::emission_exact::coinbase_exact(height)
-            }
-        };
+        // Lab #470 stage 4a / #520: the template mints the schedule ITS NET
+        // runs — the same form-keyed fork the auditor uses (`coinbase_for`),
+        // so assembler and attester cannot drift apart. v4 is the
+        // boundary-grandfathered function; v5 is exact natively (what
+        // validate_body_v5 will demand of this very template).
+        let coinbase_total = coinbase_for(form, height);
         let reward_split = RewardSplit::of(coinbase_total);
         let total_fees: u64 = chosen.iter().map(|t| t.public.fee).sum();
         let weight_penalty =
@@ -850,6 +846,7 @@ impl Mempool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::emission::coinbase;
     use qlab_devnet::fees::ArityBucket;
 
     /// A non-zero payout key for test bodies that mint (issue #101).

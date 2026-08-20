@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use qlab_devnet::body::{TxEntry, TxVerifier};
 use qlab_devnet::committee::CommitteeState;
 use qlab_devnet::ebbflow::FinalityStatus;
-use qlab_devnet::forms::ChainRules;
+use qlab_devnet::forms::{ChainRules, GenesisForm};
 use qlab_devnet::node::SimConfig;
 use qlab_devnet::params_devnet::{
     CHECKPOINT_CADENCE_BLOCKS, CHECKPOINT_SIGN_HYSTERESIS_BLOCKS, DEGRADED_MODE_LAG_BLOCKS,
@@ -96,11 +96,18 @@ fn supply_block_of(hash: qlab_devnet::header::Hash32, block: &qlab_node::StoredB
 /// One function for both, deliberately: a rebuild that differed from the startup
 /// build would be a second definition of the ledger, and the whole defect this
 /// closes is two views of the same chain disagreeing.
+///
+/// `form` is the [`GenesisForm`] loaded from genesis — the same value consensus
+/// dispatches on (lab #520). Passing it here is what makes the auditor agree
+/// with consensus by construction; a height heuristic or a config flag would
+/// re-introduce the T2 false DIVERGENT.
 fn rebuild_supply_ledger<C: ChainStore>(
+    form: GenesisForm,
     state_chain: &C,
     main_chain: &[qlab_devnet::header::Hash32],
 ) -> Result<SupplyLedger, qlab_node::SupplyError> {
-    SupplyLedger::from_blocks(
+    SupplyLedger::from_blocks_for(
+        form,
         main_chain.iter().map(|hash| {
             let block = state_chain
                 .block(hash)
@@ -873,7 +880,11 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         let supply_ledger = {
             let node = p2p.node();
             let state_chain = node.state().chain();
-            rebuild_supply_ledger(state_chain, &state_chain.chain().main_chain())?
+            rebuild_supply_ledger(
+                node.state().form(),
+                state_chain,
+                &state_chain.chain().main_chain(),
+            )?
         };
 
         Ok(RunningNode {
@@ -1167,7 +1178,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             // The cost is one O(chain) rebuild on a rare event — the same work the
             // startup path already does — against one hash comparison per sample.
             if !ledger.is_in_sync_with(&main_chain) {
-                match rebuild_supply_ledger(state_chain, &main_chain) {
+                match rebuild_supply_ledger(node.state().form(), state_chain, &main_chain) {
                     Ok(rebuilt) => *ledger = rebuilt,
                     // A rebuild cannot fail on a chain the state machine has applied
                     // (contiguous from genesis by construction), but if it ever did,

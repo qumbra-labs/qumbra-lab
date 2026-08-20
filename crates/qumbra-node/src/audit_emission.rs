@@ -1,6 +1,6 @@
 //! Read-only emission audit: walk a node's persisted main chain and report every
 //! height whose committed `body.coinbase` differs from the schedule
-//! ([`qlab_node::emission::coinbase`]).
+//! ([`qlab_node::emission::coinbase_for`] of the opened node's [`GenesisForm`]).
 //!
 //! This is the localization tool for lab issue #299 / QUM-82. It **observes**;
 //! it never changes consensus, never writes the data dir, and never reimplements
@@ -10,7 +10,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use qlab_node::emission::coinbase;
+use qlab_devnet::forms::GenesisForm;
+use qlab_node::emission::coinbase_for;
 use qlab_node::{genesis_block, main_chain_of, MemNode, NodeState, StoredBlock};
 
 use crate::genesis::T0_GENESIS_DIFFICULTY;
@@ -194,7 +195,7 @@ impl std::error::Error for AuditError {}
 
 /// Open `data_dir` the way the node does, walk the main chain over
 /// `[from, to]` (defaults: 1..=tip), and compare each committed coinbase to
-/// [`coinbase`].
+/// [`coinbase_for`] of the opened node's genesis form (lab #520).
 ///
 /// Height 0 is outside the audit by definition: genesis carries `coinbase == 0`
 /// while `coinbase(0) = 5×10⁹`. When the requested interval includes 0 it is
@@ -220,12 +221,29 @@ pub fn audit_emission(
 
     // Same genesis the T0 binary hands `NodeAdapter::open` (difficulty baked into
     // the genesis file). A foreign-net data dir fails open with a named reason.
+    // Form-aware comparison happens after open via `node.form()` (lab #520);
+    // the CLI still opens the v4 genesis block — a T2 data dir needs
+    // [`audit_emission_for`] with the genesis file consensus loaded.
     let genesis = genesis_block(T0_GENESIS_DIFFICULTY, 0);
-    let node = MemNode::open(data_dir, genesis).map_err(|e| AuditError::UnreadableLog {
+    audit_emission_for(GenesisForm::V4, genesis, data_dir, from, to, payee)
+}
+
+/// [`audit_emission`] under an explicit genesis form and genesis block
+/// (lab #520). The expected schedule is [`coinbase_for`] of `form` — v4 the
+/// boundary-grandfathered function, v5 `coinbase_exact` at every height ≥ 1
+/// — taken from the same [`GenesisForm`] consensus dispatches on.
+pub fn audit_emission_for(
+    form: GenesisForm,
+    genesis: qlab_node::StoredBlock,
+    data_dir: &Path,
+    from: Option<u64>,
+    to: Option<u64>,
+    payee: Option<[u64; 4]>,
+) -> Result<AuditReport, AuditError> {
+    let node = MemNode::open_for(form, data_dir, genesis).map_err(|e| AuditError::UnreadableLog {
         path: data_dir.to_path_buf(),
         reason: format!("could not open persisted chain at {}: {e}", data_dir.display()),
     })?;
-
     let tip = node.tip_height();
     let from_req = from.unwrap_or(1);
     let to_req = to.unwrap_or(tip);
@@ -298,7 +316,7 @@ pub fn audit_emission(
                 payee_bessel += u128::from(body.coinbase);
             }
         }
-        if let Some(m) = mismatch_at(block) {
+        if let Some(m) = mismatch_at(form, block) {
             mismatches.push(m);
         }
     }
@@ -318,13 +336,13 @@ pub fn audit_emission(
     })
 }
 
-fn mismatch_at(block: &StoredBlock) -> Option<Mismatch> {
+fn mismatch_at(form: GenesisForm, block: &StoredBlock) -> Option<Mismatch> {
     let height = block.header.height;
     if height == 0 {
         return None;
     }
     let committed = block.coinbase;
-    let expected = coinbase(height);
+    let expected = coinbase_for(form, height);
     if committed == expected {
         return None;
     }
@@ -414,8 +432,8 @@ mod tests {
 
     use qlab_devnet::body::{BlockBody, TxEntry, TxVerifier};
     use qlab_devnet::header::BlockHeader;
-    use qlab_node::emission::coinbase;
-    use qlab_node::{genesis_block, ChainStore, MemNode, NodeState};
+    use qlab_node::emission::{coinbase, coinbase_exact};
+    use qlab_node::{genesis_block, ChainStore, MemNode, NodeState, StoredBlock, StoredHeader};
 
     /// Any proof is accepted — this tool never exercises verification.
     struct AcceptAll;
@@ -671,5 +689,41 @@ mod tests {
     fn short_hash_is_eight_hex_plus_ellipsis() {
         let h = [0xabu8, 0x12, 0xcd, 0x34, 0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         assert_eq!(short_hash(&h), "ab12cd34…");
+    }
+
+    // --- lab #520: per-block expected is form-aware ---------------------------
+
+    fn stub_block(height: u64, committed: u64) -> StoredBlock {
+        StoredBlock {
+            header: StoredHeader {
+                prev: [0u8; 32],
+                height,
+                timestamp: 0,
+                difficulty: T0_GENESIS_DIFFICULTY,
+                nonce: 0,
+                tx_body_commitment: [0u8; 32],
+            },
+            txs: vec![],
+            coinbase: committed,
+            coinbase_rkm: RKM,
+        }
+    }
+
+    /// A v5 block minted at `coinbase_exact` is MATCH; a planted delta is
+    /// DIVERGENT with the right number. v4 below the boundary still uses the
+    /// grandfathered function.
+    #[test]
+    fn mismatch_at_is_form_aware_and_v5_exact_is_match() {
+        let exact = stub_block(7, coinbase_exact(7));
+        assert!(
+            mismatch_at(GenesisForm::V5, &exact).is_none(),
+            "a v5 block at the exact schedule must not mismatch"
+        );
+        let wrong = stub_block(7, coinbase_exact(7) + 3);
+        let m = mismatch_at(GenesisForm::V5, &wrong).expect("the alarm must still fire");
+        assert_eq!(m.height, 7);
+        assert_eq!(m.expected, coinbase_exact(7));
+        assert_eq!(m.delta, 3);
+        assert!(mismatch_at(GenesisForm::V4, &stub_block(7, coinbase(7))).is_none());
     }
 }

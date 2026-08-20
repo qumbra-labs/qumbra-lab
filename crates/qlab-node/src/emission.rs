@@ -59,6 +59,7 @@
 //! is the cumulative *at* the boundary plus the exact walk from there — not a
 //! second closed form. Test-locked.
 
+use qlab_devnet::forms::GenesisForm;
 use qlab_econ::model::{Family, Model};
 
 pub use qlab_devnet::emission_exact::{
@@ -200,6 +201,22 @@ pub fn coinbase(h: u64) -> u64 {
     }
 }
 
+/// **The form-aware block subsidy** (lab #520): the schedule *this net* mints.
+///
+/// Consensus already dispatches on [`GenesisForm`] — v4 is boundary-grandfathered
+/// ([`coinbase`]), v5 is exact at every height ([`coinbase_exact`]). The auditor
+/// and the assembler must use the same fork, from the same loaded genesis, or a
+/// v5 chain whose money is correct reads DIVERGENT against the float endpoints.
+///
+/// Height 0 is still `coinbase_exact(0) = 5×10⁹` / `coinbase(0) = 5×10⁹`; genesis
+/// is exempted by the callers (it commits 0), not by this function.
+pub fn coinbase_for(form: GenesisForm, h: u64) -> u64 {
+    match form {
+        GenesisForm::V4 => coinbase(h),
+        GenesisForm::V5 => coinbase_exact(h),
+    }
+}
+
 /// The 65/15/20 division of a block's coinbase (frozen §3). Committee and
 /// treasury take floored shares; the miner absorbs the rounding remainder (so
 /// the three parts sum to `total` exactly — no bessel is minted or lost).
@@ -248,6 +265,23 @@ mod tests {
         assert_eq!(BESSEL_PER_QMB, qlab_devnet::emission_exact::BESSEL_PER_QMB);
         // Likewise the tail: `TAIL_QMB` in coins here, `TAIL_BESSEL` in bessel there.
         assert_eq!(TAIL_BESSEL, (TAIL_QMB * BESSEL_PER_QMB as f64).round() as u64);
+    }
+
+    /// **lab #520:** the form-aware wrapper is the same fork consensus uses —
+    /// v4 is [`coinbase`], v5 is [`coinbase_exact`] even below the v4 boundary.
+    #[test]
+    fn coinbase_for_dispatches_on_form_and_v5_is_exact_below_the_v4_boundary() {
+        assert_eq!(coinbase_for(GenesisForm::V4, 1), coinbase(1));
+        assert_eq!(coinbase_for(GenesisForm::V5, 1), coinbase_exact(1));
+        let b = RULE_BOUNDARY_HEIGHT;
+        assert_eq!(coinbase_for(GenesisForm::V4, b), coinbase_pre_boundary(b));
+        assert_eq!(coinbase_for(GenesisForm::V5, b), coinbase_exact(b));
+        assert_eq!(
+            coinbase_for(GenesisForm::V4, b + 1),
+            coinbase_exact(b + 1),
+            "above the boundary both forms are exact"
+        );
+        assert_eq!(coinbase_for(GenesisForm::V5, b + 1), coinbase_exact(b + 1));
     }
 
     /// **The boundary seam** (#299 + #303): the last `f64` block is the boundary
