@@ -96,10 +96,14 @@ docker logs --tail 60 qumbra-node 2>&1 | grep TELEMETRY | tail -1
 这是余量，不是保证；真正的修复属于 `qumbra-ops` 而不是这里——把 grep 锚定并加大 tail：
 
 ```sh
-docker logs --tail 200 qumbra-node 2>&1 | grep '^TELEMETRY' | tail -1
+docker logs --tail 200 qumbra-node 2>&1 |  grep 'TELEMETRY tip=' | tail -1
 ```
 
 `wan-sampler.sh:63` 用 `--tail 20` 做同样的读取，需要同样的改动。**这两个脚本都不在本仓库，本 PR 也没有改动它们。**
+
+> **2026-08-19 更正（lab #512）：**上面的锚定改为内容锚定（`TELEMETRY tip=`），
+> 不再是 `^TELEMETRY` —— 日志行现携带原生 UTC 时间戳前缀，`^` 锚定的 grep
+> 在任何带戳日志上都会读到零。deploy 侧的采样脚本更新时需要同样的内容锚定。
 
 **开销**：每轮 13 次读时钟，另加每帧 3 次。**每次 25-26 ns**——3 个样本、每样本 100,000 次调用，`cargo test` **debug**（未优化，因此 release 只会更低），Apple M5 Max / macOS 26.5.2，笔记本接电源、机器空闲。即每轮约 325 ns，每帧约 75 ns；按 20 ms 退避推出的约 50 轮/秒计算，每秒约 16 µs。该数字由 `ticktime::tests::instrumentation_costs_tens_of_nanoseconds_per_frame` 打印；一旦读时钟涨到微秒级，该测试即失败——那正是需要重新考虑「无条件开启」这一决定的门槛。
 

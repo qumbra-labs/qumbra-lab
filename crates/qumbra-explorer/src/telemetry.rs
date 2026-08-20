@@ -214,7 +214,7 @@ impl Telemetry {
                 // misconfiguration, not a per-request event, so it does not
                 // violate the "no spam" rule; the alternative is an explorer that
                 // silently exports nothing while its config says it should.
-                Err(e) => eprintln!(
+                Err(e) => qlab_devnet::jeprintln!(WARN,
                     "qumbra-explorer: {OTLP_ENDPOINT_ENV}={ep} but the OTLP exporter could not \
                      be built ({e}). Spans are still generated; nothing is exported."
                 ),
@@ -256,7 +256,7 @@ impl Telemetry {
     /// the explorer must not fail to exit because a collector was unreachable.
     pub fn shutdown(self) {
         if let Err(e) = self.provider.shutdown() {
-            eprintln!("qumbra-explorer: tracer shutdown: {e}");
+            qlab_devnet::jeprintln!(WARN, "qumbra-explorer: tracer shutdown: {e}");
         }
     }
 }

@@ -62,7 +62,7 @@ fn main() -> ExitCode {
     let code = match dispatch(&args, &telemetry) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("qumbra-faucet error: {e}");
+            qlab_devnet::jeprintln!(ERROR, "qumbra-faucet error: {e}");
             ExitCode::FAILURE
         }
     };
@@ -256,7 +256,8 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     let (svc, node_cfg, wallet, ticket_secret) = load(cfg_path)?;
     let genesis = GenesisFile::load(&node_cfg.genesis_file)?;
 
-    let (verifier, verifier_log) = select_verifier(has_flag(args, "--rehearsal-verifier"));
+    let rehearsal_verifier = has_flag(args, "--rehearsal-verifier");
+    let (verifier, verifier_log) = select_verifier(rehearsal_verifier);
 
     let limits = FaucetLimits {
         ticket_policy: if svc.tickets_required() {
@@ -309,7 +310,7 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
         trusted.clone(),
         Arc::clone(&metrics),
     )?;
-    println!("qumbra-faucet listening on http://{}/ — opening the node…", server.addr());
+    qlab_devnet::jprintln!("qumbra-faucet listening on http://{}/ — opening the node…", server.addr());
 
     // The scrape endpoint binds here too, and for the same reason the faucet's own
     // listener does: `Node::open` replays `blocks.log` and has taken hours on a
@@ -320,11 +321,11 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     let metrics_server = match svc.metrics_addr.as_deref() {
         Some(addr) => {
             let m = MetricsServer::start(addr, Arc::clone(&metrics))?;
-            println!("  metrics:      http://{}/metrics (loopback only)", m.addr());
+            qlab_devnet::jprintln!("  metrics:      http://{}/metrics (loopback only)", m.addr());
             Some(m)
         }
         None => {
-            println!("  metrics:      not served (set metrics_addr in the config to enable)");
+            qlab_devnet::jprintln!("  metrics:      not served (set metrics_addr in the config to enable)");
             None
         }
     };
@@ -355,45 +356,51 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     node.set_obs_clock(ObsClock::WallClock);
     if let Some(addr) = node_cfg.telemetry_addr.as_deref() {
         let bound = node.start_telemetry_endpoint(addr)?;
-        println!("  node telemetry: http://{bound}/v1/telemetry");
+        qlab_devnet::jprintln!("  node telemetry: http://{bound}/v1/telemetry");
     }
     // First real sample: from here the snapshot is node-derived and `chain` stops
     // being `None`.
     service.refresh_status(&node);
 
-    println!("qumbra-faucet running");
-    println!("  faucet:         http://{}/", server.addr());
-    println!("  node listen:    {}", node.listen_addr());
-    println!("  node data dir:  {}", node_cfg.data_dir.display());
-    println!("  genesis hash:   {}", genesis.hash_hex());
-    println!("  committee keys: 0 (keyless — §6.2 decision 1)");
-    println!("  mining:         {} (payout → this faucet)", node_cfg.mining);
-    println!("  grant:          {} bessel", svc.grant_value());
-    println!("  tickets:        {}", if svc.tickets_required() { "required" } else { "OPEN" });
+    qlab_devnet::jprintln!("qumbra-faucet running");
+    qlab_devnet::jprintln!("  faucet:         http://{}/", server.addr());
+    qlab_devnet::jprintln!("  node listen:    {}", node.listen_addr());
+    qlab_devnet::jprintln!("  node data dir:  {}", node_cfg.data_dir.display());
+    qlab_devnet::jprintln!("  genesis hash:   {}", genesis.hash_hex());
+    qlab_devnet::jprintln!("  committee keys: 0 (keyless — §6.2 decision 1)");
+    qlab_devnet::jprintln!("  mining:         {} (payout → this faucet)", node_cfg.mining);
+    qlab_devnet::jprintln!("  grant:          {} bessel", svc.grant_value());
+    qlab_devnet::jprintln!("  tickets:        {}", if svc.tickets_required() { "required" } else { "OPEN" });
     // Lab #308 / #296 honesty voice: name which client-id posture is active.
-    println!("  {}", trusted.posture_line());
-    println!("  {}", telemetry.posture_line());
-    println!("  {verifier_log}");
+    qlab_devnet::jprintln!("  {}", trusted.posture_line());
+    qlab_devnet::jprintln!("  {}", telemetry.posture_line());
+    // The rehearsal banner is the ⚠️-class abnormality the #512 amendment
+    // names; the real-verifier line is nominal and carries no token.
+    if rehearsal_verifier {
+        qlab_devnet::jprintln!(WARN, "  {verifier_log}");
+    } else {
+        qlab_devnet::jprintln!("  {verifier_log}");
+    }
     if !server.addr().ip().is_loopback() {
-        println!(
+        qlab_devnet::jprintln!(WARN,
             "  ⚠️  THE FAUCET IS BOUND OFF-LOOPBACK AND HOLDS A HOT SPENDING KEY. Pair this \
              with a source-restricted inbound rule."
         );
     }
     if !svc.tickets_required() {
-        println!(
+        qlab_devnet::jprintln!(WARN,
             "  ⚠️  TICKETS ARE OFF. The only remaining controls are token buckets, which are an \
              anti-accident filter and not a defence: this faucet is saturable by roughly a \
              hundred distinct subnets."
         );
     }
-    println!(
+    qlab_devnet::jprintln!(
         "  maturity: coinbase this node wins is spendable {} blocks later (FROZEN §2), so a \
          fresh net cannot serve a grant for ~{} h.",
         qlab_node::COINBASE_MATURITY_BLOCKS,
         qlab_node::COINBASE_MATURITY_BLOCKS * 75 / 3600
     );
-    println!("(Ctrl-C to shut down — the node's snapshot is flushed on exit)");
+    qlab_devnet::jprintln!("(Ctrl-C to shut down — the node's snapshot is flushed on exit)");
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let sig = Arc::clone(&shutdown);
@@ -405,14 +412,14 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     node.run_until_with(&shutdown, |n| {
         let report = service.tick(n, &mut rng);
         if report.harvest.funded > 0 {
-            println!(
+            qlab_devnet::jprintln!(
                 "FAUCET funded {} matured coinbase note(s)",
                 report.harvest.funded
             );
         }
         if report.harvest.skipped_spent > 0 {
             // Lab #310: spent notes the restart walk would otherwise re-fund.
-            println!(
+            qlab_devnet::jprintln!(
                 "FAUCET harvest-skipped-spent {}",
                 report.harvest.skipped_spent
             );
@@ -420,23 +427,23 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
         if let Some(receipt) = report.granted {
             // The receipt, never the recipient: a grant line in a log rotation must
             // not be a record of who asked (PR #103's redaction, same rule).
-            println!("FAUCET granted receipt={receipt}");
+            qlab_devnet::jprintln!("FAUCET granted receipt={receipt}");
         }
         // Lab #310 / #241: one named reason per refused attempt, before any
         // gave-up line so the operator sees the fault that burned the budget.
         if let Some(reason) = &report.refusal_reason {
-            println!("FAUCET refuse reason={reason}");
+            qlab_devnet::jprintln!("FAUCET refuse reason={reason}");
         }
         if report.dropped_spent > 0 {
-            println!(
+            qlab_devnet::jprintln!(
                 "FAUCET dropped-spent {} (stale inventory; attempt not burned)",
                 report.dropped_spent
             );
         }
         if let Some(receipt) = report.gave_up {
             match &report.refusal_reason {
-                Some(reason) => println!("FAUCET gave-up receipt={receipt} reason={reason}"),
-                None => println!("FAUCET gave-up receipt={receipt}"),
+                Some(reason) => qlab_devnet::jprintln!("FAUCET gave-up receipt={receipt} reason={reason}"),
+                None => qlab_devnet::jprintln!("FAUCET gave-up receipt={receipt}"),
             }
         }
     });
@@ -445,6 +452,6 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     if let Some(m) = metrics_server {
         m.shutdown();
     }
-    println!("shutdown complete");
+    qlab_devnet::jprintln!("shutdown complete");
     Ok(())
 }

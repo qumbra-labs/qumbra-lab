@@ -50,7 +50,7 @@ fn main() -> ExitCode {
     match dispatch(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("qumbra-node error: {e}");
+            qlab_devnet::jeprintln!(ERROR, "qumbra-node error: {e}");
             ExitCode::FAILURE
         }
     }
@@ -319,25 +319,23 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // that silence structurally impossible (ordering locked in `startup`'s
     // tests + tests/startup_entry.rs).
     let config = qumbra_node::startup::announce_then_load(&mut std::io::stdout(), cfg_path)?;
-    println!(
-        "STARTUP loading genesis file {}",
-        config.genesis_file.display()
-    );
+    qlab_devnet::jprintln!("STARTUP loading genesis file {}", config.genesis_file.display());
     let genesis = GenesisFile::load(&config.genesis_file)?;
-    println!("STARTUP genesis file loaded");
+    qlab_devnet::jprintln!("STARTUP genesis file loaded");
 
     // Real RandomX (N3) is the default engine. The tx verifier defaults to the
     // REAL M3 verifier (qlab_consensus::verify_proof, frozen CONSENSUS_CFG);
     // `--rehearsal-verifier` opts into the NO-OP stand-in and logs loudly
     // (M10-T0-4, issue #68 — the named M11 gate, closed early).
-    let (verifier, verifier_log) = select_verifier(has_flag(args, "--rehearsal-verifier"));
+    let rehearsal_verifier = has_flag(args, "--rehearsal-verifier");
+    let (verifier, verifier_log) = select_verifier(rehearsal_verifier);
     // Lab #300: bracket every pre-banner stage that can plausibly be expensive,
     // so a stall names the stage it is in instead of presenting as silence. The
     // RandomX constructor is lazy today (the ~256 MiB cache builds at first
     // hash) — the bracket is there for when that stops being true.
-    println!("STARTUP RandomX engine init begin (light mode; cache builds lazily at first hash)");
+    qlab_devnet::jprintln!("STARTUP RandomX engine init begin (light mode; cache builds lazily at first hash)");
     let pow = RandomXPow::new();
-    println!("STARTUP RandomX engine init done");
+    qlab_devnet::jprintln!("STARTUP RandomX engine init done");
 
     // Lab #373 — startup is three phases now (the shape PR #372 gave the
     // faucet), and the order is load-bearing in both directions. Lab #300's
@@ -347,9 +345,9 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // ① everything that can refuse, refuses — the halt gates, the genesis
     //   byte-verify + hash pin, the committee key checks. A bind BEFORE these
     //   would hold a socket this process is about to refuse to run on.
-    println!("STARTUP node prepare begin (halt gates, genesis byte-verify, committee keys)");
+    qlab_devnet::jprintln!("STARTUP node prepare begin (halt gates, genesis byte-verify, committee keys)");
     let prepared = RunningNode::prepare(&config, &genesis, pow, verifier)?;
-    println!("STARTUP node prepare done");
+    qlab_devnet::jprintln!("STARTUP node prepare done");
 
     // ② bind the telemetry listener. From this moment `GET /v1/ready` answers —
     //   `starting`, with the live replay position once the walk begins — so a
@@ -360,14 +358,14 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     let telemetry = match config.telemetry_addr.as_deref() {
         Some(addr) => {
             let srv = TelemetryServer::start(addr)?;
-            println!(
+            qlab_devnet::jprintln!(
                 "  telemetry:    http://{}{} live (starting); {} serves after the node opens",
                 srv.addr(),
                 qumbra_node::telemetry_server::READY_PATH,
                 qumbra_node::telemetry_server::TELEMETRY_PATH,
             );
             if !srv.addr().ip().is_loopback() {
-                println!(
+                qlab_devnet::jprintln!(WARN,
                     "  ⚠️  telemetry is bound to a non-loopback address — it must be paired with a \
                      SOURCE-RESTRICTED inbound rule to the operator's collector, not an open one."
                 );
@@ -379,13 +377,13 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
 
     // ③ open the node — Node::open replays blocks.log, hours on a large chain —
     //   then hand the listener the live node.
-    println!("STARTUP node open begin (data dir open/replay, listen bind, seed dial)");
+    qlab_devnet::jprintln!("STARTUP node open begin (data dir open/replay, listen bind, seed dial)");
     let mut node = prepared.open()?;
     if let Some(srv) = telemetry {
         let bound = node.adopt_telemetry_server(srv);
-        println!("  telemetry:    http://{bound}/v1/telemetry (versioned read wire, GET only)");
+        qlab_devnet::jprintln!("  telemetry:    http://{bound}/v1/telemetry (versioned read wire, GET only)");
     }
-    println!("STARTUP node open done");
+    qlab_devnet::jprintln!("STARTUP node open done");
 
     // Item 0: the binary mines on real wall-clock header timestamps (NOT the
     // deterministic 75 s counter the in-process sims/tests use), so LWMA sees real
@@ -404,15 +402,15 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // failure this instrumentation exists to remove.
     if let Some(addr) = config.metrics_addr.as_deref() {
         let bound = node.start_metrics_endpoint(addr)?;
-        println!("  metrics:      http://{bound}/metrics (Prometheus scrape target)");
+        qlab_devnet::jprintln!("  metrics:      http://{bound}/metrics (Prometheus scrape target)");
         if !bound.ip().is_loopback() {
-            println!(
+            qlab_devnet::jprintln!(WARN,
                 "  ⚠️  metrics is bound to a non-loopback address — it must be paired with a \
                  SOURCE-RESTRICTED inbound rule to the collector, not an open one."
             );
         }
     } else {
-        println!("  metrics:      not served (set metrics_addr in the config to enable)");
+        qlab_devnet::jprintln!("  metrics:      not served (set metrics_addr in the config to enable)");
     }
 
     // Issue #117 — the `/v1/telemetry` read endpoint itself is bound in phase ②
@@ -421,7 +419,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // a failure to bind is fatal rather than a node that its operator believes
     // is readable and is not.
     if config.telemetry_addr.is_none() {
-        println!("  telemetry:    not served (set telemetry_addr in the config to enable)");
+        qlab_devnet::jprintln!("  telemetry:    not served (set telemetry_addr in the config to enable)");
     }
 
     // Issue #188 baton 2 — `/v1/compact`, the note-discovery endpoint a recipient
@@ -436,23 +434,23 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     if let Some(addr) = config.discovery_bind() {
         let bound = node.start_discovery_endpoint(addr)?;
         let view = node.discovery_view();
-        println!(
+        qlab_devnet::jprintln!(
             "  discovery:    http://{bound}/v1/compact?from=&to= (committed note discovery, GET only)"
         );
-        println!(
+        qlab_devnet::jprintln!(
             "                projected {} main-chain blocks, {} B of committed discovery",
             view.blocks.len(),
             view.len_bytes()
         );
         if !bound.ip().is_loopback() {
-            println!(
+            qlab_devnet::jprintln!(WARN,
                 "  ⚠️  discovery is bound to a non-loopback address — it must be paired with a \
                  SOURCE-RESTRICTED inbound rule, not an open one. The bytes are public chain \
                  data, but the listener is still an attack surface."
             );
         }
     } else {
-        println!(
+        qlab_devnet::jprintln!(WARN,
             "  discovery:    ⚠️  NOT SERVED (discovery_addr = \"off\"). Recipients of any \
              transaction this node accepts cannot find their outputs here."
         );
@@ -469,7 +467,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         match v.parse::<u64>() {
             Ok(secs) if secs > 0 => {
                 node.set_sample_interval(std::time::Duration::from_secs(secs));
-                println!("  telemetry sampling: every {secs} s (observability only)");
+                qlab_devnet::jprintln!("  telemetry sampling: every {secs} s (observability only)");
             }
             _ => {
                 return Err(
@@ -489,7 +487,7 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         match v.parse::<u64>() {
             Ok(secs) if secs > 0 => {
                 node.set_snapshot_interval(std::time::Duration::from_secs(secs));
-                println!("  snapshot cadence: every {secs} s (durability only)");
+                qlab_devnet::jprintln!("  snapshot cadence: every {secs} s (durability only)");
             }
             _ => {
                 return Err(
@@ -499,10 +497,10 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    println!("qumbra-node running");
-    println!("  listen:       {}", node.listen_addr());
-    println!("  data dir:     {}", config.data_dir.display());
-    println!("  {}", node.recovery_report());
+    qlab_devnet::jprintln!("qumbra-node running");
+    qlab_devnet::jprintln!("  listen:       {}", node.listen_addr());
+    qlab_devnet::jprintln!("  data dir:     {}", config.data_dir.display());
+    qlab_devnet::jprintln!("  {}", node.recovery_report());
     // Issue #225: before this, a snapshot that could not be honoured against its
     // own block log KILLED the process (`rewind refused: rewind target is not a
     // known block`, 19 times on a rolled T0 host, with no startup line at all).
@@ -510,70 +508,78 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // only thing left to get wrong is letting it pass unnoticed. This says, at the
     // one moment an operator is reading, that the datadir's snapshot was unusable.
     if let Some(why) = &node.recovery_report().snapshot_rejected {
-        println!(
+        qlab_devnet::jprintln!(WARN,
             "  ⚠️  THE SNAPSHOT IN THIS DATA DIR COULD NOT BE HONOURED against its own \
              blocks.log (issue #225)."
         );
-        println!("      reason: {why}");
+        qlab_devnet::jprintln!(WARN, "      reason: {why}");
         // Lab #408: the rejection no longer implies the genesis fold. When the
         // log proves the snapshot's tip is on the finalized main chain, its
         // state was honoured anyway and only the tail was replayed — say which
         // of the two recoveries this start actually was.
         if node.recovery_report().snapshot_height.is_some() {
-            println!(
+            qlab_devnet::jprintln!(WARN,
                 "      Degraded to a NEAR-TIP resume (lab #408): the log's own finalizations \
                  prove the"
             );
-            println!(
+            qlab_devnet::jprintln!(WARN,
                 "      snapshot's tip is on the finalized main chain, so its state was honoured \
                  and only"
             );
-            println!(
+            qlab_devnet::jprintln!(WARN,
                 "      the records past it were replayed. State is exactly what a from-genesis \
                  replay"
             );
-            println!(
+            qlab_devnet::jprintln!(WARN,
                 "      reaches. The snapshot is rewritten at the next graceful stop; if this \
                  repeats"
             );
-            println!("      every start, the log is what to look at.");
+            qlab_devnet::jprintln!(WARN, "      every start, the log is what to look at.");
         } else {
-            println!(
+            qlab_devnet::jprintln!(WARN,
                 "      Recovered by a full replay from genesis — the log is the source of truth \
                  and this"
             );
-            println!(
+            qlab_devnet::jprintln!(WARN,
                 "      state is exactly what a from-genesis replay reaches. The stale snapshot \
                  is rewritten"
             );
-            println!(
+            qlab_devnet::jprintln!(WARN,
                 "      at the next graceful stop. If this repeats every start, the log is what \
                  to look at."
             );
         }
     }
-    println!("  genesis hash: {}", genesis.hash_hex());
-    println!("  mining:       {}", config.mining);
-    println!("  template_serving: {}", config.template_serving);
-    println!(
-        "  committee keys held: {}",
-        config.committee_key_paths.len()
-    );
-    println!("  {verifier_log}");
+    qlab_devnet::jprintln!("  genesis hash: {}", genesis.hash_hex());
+    qlab_devnet::jprintln!("  mining:       {}", config.mining);
+    qlab_devnet::jprintln!("  template_serving: {}", config.template_serving);
+    qlab_devnet::jprintln!("  committee keys held: {}", config.committee_key_paths.len());
+    // The rehearsal banner is the ⚠️-class abnormality the #512 amendment
+    // names; the real-verifier line is nominal and carries no token.
+    if rehearsal_verifier {
+        qlab_devnet::jprintln!(WARN, "  {verifier_log}");
+    } else {
+        qlab_devnet::jprintln!("  {verifier_log}");
+    }
     // H4: the revision identifier + frozen-parameter digest are logged LOUDLY at
     // every startup — that is what makes an undocumented parameter change show up
     // in every log rather than only in a review someone remembers to do.
-    println!("-- halt-height upgrade status (issue #74) --");
-    print!(
-        "{}",
-        RELEASE.banner(HaltMarker::load(&config.data_dir).ok().flatten().as_ref())
-    );
-    if let Some(h) = node.halt_at() {
-        println!("  ⚠️  THIS RELEASE HALTS AT HEIGHT {h} — it will stop mining, stop accepting");
-        println!("      blocks, and stop signing checkpoints above it. regime=Halting until the");
-        println!("      boundary finalizes, then regime=Halted.");
+    qlab_devnet::jprintln!("-- halt-height upgrade status (issue #74) --");
+    // The banner is a multi-line string shared with the one-shot `halt-status`
+    // (which stays unstamped, like all one-shot command output); here on the
+    // run path each of its lines gets the journal stamp.
+    for line in RELEASE
+        .banner(HaltMarker::load(&config.data_dir).ok().flatten().as_ref())
+        .lines()
+    {
+        qlab_devnet::jprintln!("{line}");
     }
-    println!("{}", qumbra_node::shutdown::stop_signals_line());
+    if let Some(h) = node.halt_at() {
+        qlab_devnet::jprintln!(WARN, "  ⚠️  THIS RELEASE HALTS AT HEIGHT {h} — it will stop mining, stop accepting");
+        qlab_devnet::jprintln!(WARN, "      blocks, and stop signing checkpoints above it. regime=Halting until the");
+        qlab_devnet::jprintln!(WARN, "      boundary finalizes, then regime=Halted.");
+    }
+    qlab_devnet::jprintln!("{}", qumbra_node::shutdown::stop_signals_line());
 
     // One seam, two platform mechanisms — see `shutdown.rs` for why Windows needs
     // its own handler rather than ctrlc's (lab #478).
@@ -586,10 +592,10 @@ fn run_node(args: &[String]) -> Result<(), Box<dyn Error>> {
     // process back now that the snapshot is on disk.
     qumbra_node::shutdown::flush_complete();
     if flushed {
-        println!("shutdown complete (snapshot flushed)");
+        qlab_devnet::jprintln!("shutdown complete (snapshot flushed)");
     } else {
         // Do not claim the flush when run_until already logged the failure.
-        println!("shutdown complete (snapshot flush failed)");
+        qlab_devnet::jprintln!("shutdown complete (snapshot flush failed)");
     }
     Ok(())
 }

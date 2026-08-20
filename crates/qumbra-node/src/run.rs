@@ -692,7 +692,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             Some(m) if release.supersedes(&m) => {
                 let advanced = m.superseded_by(&release);
                 advanced.write(&config.data_dir)?;
-                println!(
+                qlab_devnet::jprintln!(
                     "HALT marker advanced: boundary height {} passed; revision in force is now \
                      `{}`. Later releases carrying this revision start without declaring the \
                      boundary (issue #81).",
@@ -788,9 +788,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // needs the evidence on chain, which is a payload change and out of scope.
         {
             let restore = adapter.punishment_restore();
-            println!("{}", restore.summary_line());
+            qlab_devnet::jprintln!("{}", restore.summary_line());
             if restore.ledger_absent_on_populated_datadir {
-                println!(
+                qlab_devnet::jprintln!(WARN,
                     "⚠️  this data dir already holds chain history but carried NO committee-\
                      punishment ledger, so it was written by a binary predating issue #133. \
                      Whether a punishment was ever applied against it is UNKNOWABLE — a \
@@ -826,7 +826,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         //     backoff ladder (the S9 re-dial behaviour moved there unchanged).
         let mut addrs = match std::fs::read(config.data_dir.join(ADDRBOOK_FILE)) {
             Ok(bytes) => AddrManager::from_bytes(&bytes).unwrap_or_else(|e| {
-                eprintln!("address book unreadable ({e}); starting from seeds");
+                qlab_devnet::jeprintln!(WARN, "address book unreadable ({e}); starting from seeds");
                 AddrManager::new()
             }),
             Err(_) => AddrManager::new(),
@@ -844,7 +844,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         }
         addrs.set_self_advertise(config.advertise_addr.clone());
         if config.advertise_addr.is_none() {
-            println!(
+            qlab_devnet::jprintln!(
                 "no advertise_addr: this node will sync, mine and transact but will \
                  not be gossiped to other peers (expected behind a router)"
             );
@@ -856,9 +856,9 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         match config.miner_rkm_lanes().map_err(RunError::Config)? {
             Some(rkm) => {
                 p2p.node_mut().set_miner_rkm(rkm);
-                println!("miner payout: coinbase notes paid to the configured miner_rkm");
+                qlab_devnet::jprintln!("miner payout: coinbase notes paid to the configured miner_rkm");
             }
-            None if config.mining => println!(
+            None if config.mining => qlab_devnet::jprintln!(WARN,
                 "⚠️  NO miner_rkm CONFIGURED: this node mines valid blocks whose coinbase \
                  notes are paid to a fixed placeholder key that NOBODY can spend. Every \
                  coin this node mines is BURNED. Set `miner_rkm` (64 hex chars, your \
@@ -1173,7 +1173,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                     // (contiguous from genesis by construction), but if it ever did,
                     // serving a stale row is worse than serving none: `supply_lag`
                     // then reports the gap and consumers render UNAVAILABLE.
-                    Err(e) => eprintln!("SUPPLY rebuild after reorg failed: {e:?}"),
+                    Err(e) => qlab_devnet::jeprintln!(ERROR, "SUPPLY rebuild after reorg failed: {e:?}"),
                 }
             }
             for height in ledger.next_height()..=state_chain.tip_height() {
@@ -2248,7 +2248,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         let closed = self.p2p.node_mut().drain_rounds();
         let lines: Vec<String> = closed.iter().map(|r| r.to_line()).collect();
         for line in &lines {
-            println!("{line}");
+            qlab_devnet::jprintln!("{line}");
         }
         lines
     }
@@ -2271,7 +2271,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             .map(|r| r.to_string())
             .collect();
         for line in &lines {
-            println!("{line}");
+            qlab_devnet::jprintln!("{line}");
         }
         lines
     }
@@ -2293,7 +2293,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             .map(|r| r.to_string())
             .collect();
         for line in &lines {
-            println!("{line}");
+            qlab_devnet::jprintln!("{line}");
         }
         lines
     }
@@ -2333,7 +2333,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         let lines =
             self.body_wait.report(&obs, &entries, now_ms, heartbeat, BODY_REQUEST_TIMEOUT_MS);
         for line in &lines {
-            println!("{line}");
+            qlab_devnet::jprintln!("{line}");
         }
         lines
     }
@@ -2350,7 +2350,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     pub fn emit_overdue_rounds(&mut self) -> Vec<String> {
         let lines = self.p2p.node_mut().rounds_mut().overdue_reports();
         for line in &lines {
-            println!("{line}");
+            qlab_devnet::jprintln!("{line}");
         }
         lines
     }
@@ -2432,7 +2432,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // may fail on PoW and this fact is about the decision, not the block.
         if !self.mine_gate_latched {
             self.mine_gate_latched = true;
-            println!(
+            qlab_devnet::jprintln!(
                 "MINEGATE ready=1 why={} tip={} best={}",
                 gate.field(),
                 self.tip_height(),
@@ -2539,7 +2539,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         for f in &self.finalizers {
             let path = finalizer_state_path(&self.data_dir, f.index());
             if let Err(e) = write_file_durably(&path, &f.state().to_bytes()) {
-                eprintln!("persist finalizer {} failed: {e}", f.index());
+                qlab_devnet::jeprintln!(ERROR, "persist finalizer {} failed: {e}", f.index());
             }
         }
     }
@@ -2576,7 +2576,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     pub fn save_addr_book(&self) {
         let path = self.data_dir.join(ADDRBOOK_FILE);
         if let Err(e) = write_file_durably(&path, &self.p2p.addrs().to_bytes()) {
-            eprintln!("persist address book failed: {e}");
+            qlab_devnet::jeprintln!(ERROR, "persist address book failed: {e}");
         }
     }
 
@@ -2614,7 +2614,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 if self.last_boundary_repush.elapsed() >= self.repush_interval {
                     let n = self.p2p.repush_slot_votes(h);
                     if n > 0 {
-                        println!("REPUSH slot={h} variants={n} why=boundary-unfinalized");
+                        qlab_devnet::jprintln!("REPUSH slot={h} variants={n} why=boundary-unfinalized");
                     }
                     self.last_boundary_repush = Instant::now();
                 }
@@ -2657,14 +2657,14 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             Ok(()) => {
                 if finalized {
                     self.marker_final_written = true;
-                    println!(
+                    qlab_devnet::jprintln!(
                         "HALT boundary height {h} is FINALIZED — regime=Halted, revision `{}`. \
                          It is now safe to swap binaries.",
                         marker.revision_id
                     );
                 }
             }
-            Err(e) => eprintln!("halt marker write failed: {e}"),
+            Err(e) => qlab_devnet::jeprintln!(ERROR, "halt marker write failed: {e}"),
         }
     }
 
@@ -2731,7 +2731,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             // its snapshot is still a correct node — the block log is the source of
             // truth and the next start replays it. Loud, because a host silently
             // failing this write is a host quietly returning to node3's shape.
-            Err(e) => eprintln!("snapshot cadence write failed: {e}"),
+            Err(e) => qlab_devnet::jeprintln!(ERROR, "snapshot cadence write failed: {e}"),
         }
     }
 
@@ -2772,7 +2772,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// byte-for-byte the behaviour it was (aside from the returned status).
     pub fn run_until_with<F: FnMut(&mut Self)>(&mut self, shutdown: &AtomicBool, mut on_tick: F) -> bool {
         // An initial sample at startup (height/finality as opened from disk).
-        println!("{}", self.telemetry_sample());
+        qlab_devnet::jprintln!("{}", self.telemetry_sample());
         self.last_sample = Instant::now();
         while !shutdown.load(Ordering::Relaxed) {
             let _ = self.one_iteration(&mut on_tick);
@@ -2797,7 +2797,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
                 true
             }
             Err(e) => {
-                eprintln!("snapshot flush on shutdown failed: {e}");
+                qlab_devnet::jeprintln!(ERROR, "snapshot flush on shutdown failed: {e}");
                 false
             }
         };
@@ -2883,7 +2883,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         phases.telsrv = lap(&mut t);
         let sampled = self.last_sample.elapsed() >= self.sample_interval;
         if sampled {
-            println!("{}", self.telemetry_sample());
+            qlab_devnet::jprintln!("{}", self.telemetry_sample());
             // A stall's open rounds report themselves on the same cadence as the
             // telemetry line they explain.
             self.emit_overdue_rounds();
@@ -2926,7 +2926,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             lines.push(self.loop_journal.window_line());
         }
         for line in &lines {
-            println!("{line}");
+            qlab_devnet::jprintln!("{line}");
         }
         (phases, lines)
     }

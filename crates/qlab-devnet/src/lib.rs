@@ -39,6 +39,7 @@ pub mod forms;
 pub mod halt;
 pub mod hash;
 pub mod header;
+pub mod journal;
 pub mod load;
 pub mod mining;
 pub mod names;

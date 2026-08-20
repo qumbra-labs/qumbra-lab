@@ -17,7 +17,7 @@ fn main() -> ExitCode {
     match dispatch(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("qumbra-pool error: {e}");
+            qlab_devnet::jeprintln!(ERROR, "qumbra-pool error: {e}");
             ExitCode::FAILURE
         }
     }
@@ -129,21 +129,21 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
                         if let Err(e) =
                             pool_poll.replace_template(Box::new(qumbra_pool::HeldTemplateSource::new(t)))
                         {
-                            eprintln!("pool template re-issue: {e}");
+                            qlab_devnet::jeprintln!(WARN, "pool template re-issue: {e}");
                         }
                     }
                     Ok(false) => {}
-                    Err(e) => eprintln!("pool template poll: {e}"),
+                    Err(e) => qlab_devnet::jeprintln!(WARN, "pool template poll: {e}"),
                 }
             }
         });
-        println!("  node_rpc: {url}  poll_ms={}", cfg.poll_ms.unwrap_or(1000));
-        println!("  form: {form:?} (from live node)");
+        qlab_devnet::jprintln!("  node_rpc: {url}  poll_ms={}", cfg.poll_ms.unwrap_or(1000));
+        qlab_devnet::jprintln!("  form: {form:?} (from live node)");
         pool
     } else {
         let source = cfg.template_source()?;
         let form = cfg.form()?;
-        println!("  form: {form:?} (static [template])");
+        qlab_devnet::jprintln!("  form: {form:?} (static [template])");
         Arc::new(Pool::new_with_hasher(
             share_difficulty,
             Box::new(source),
@@ -153,17 +153,17 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     };
     let listener = TcpListener::bind(&listen)?;
     let bound = listener.local_addr()?;
-    println!("qumbra-pool listening on {bound}  share_diff={share_difficulty}");
+    qlab_devnet::jprintln!("qumbra-pool listening on {bound}  share_diff={share_difficulty}");
     if !pool.current_template().serves_stock_xmrig() {
-        println!("  ⚠️  v4 template: stock-xmrig login will be refused (#356 UNCLEAN)");
+        qlab_devnet::jprintln!(WARN, "  ⚠️  v4 template: stock-xmrig login will be refused (#356 UNCLEAN)");
     }
-    println!("  share-PoW: qlab_pow::RandomXHasher + #490 strict <");
-    println!(
+    qlab_devnet::jprintln!("  share-PoW: qlab_pow::RandomXHasher + #490 strict <");
+    qlab_devnet::jprintln!(
         "  pplns window: {} shares [devnet-placeholder]",
         qumbra_pool::PPLNS_WINDOW_SHARES
     );
 
     serve(listener, pool, stop)?;
-    println!("qumbra-pool stopped");
+    qlab_devnet::jprintln!("qumbra-pool stopped");
     Ok(())
 }

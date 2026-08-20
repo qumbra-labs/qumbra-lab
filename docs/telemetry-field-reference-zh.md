@@ -228,6 +228,10 @@ open-round 上限把它挤出去了）。
 > 每行前面都有 RFC3339 时间戳前缀，所以**任何 `^` 锚定的模式都必然返回 0，与内容无关。**
 > 用 `grep -c "ROUND slot="`，绝不要用 `grep -c "^ROUND"`。一个 `^ROUND` 的零读数在同一天
 > 里两次被误认为「日志静默」，代价是一整个 issue（`issue #165`）。
+>
+> **自 2026-08-19（lab #512）起**，二进制自身为每条日志行加上原生时间戳
+> （`YYYY-MM-DDTHH:MM:SS.mmmZ `，恒为 UTC），所以同样的规则现在也适用于
+> 原始 `docker logs` 输出：内容锚定，绝不用 `^`。
 
 **由这些测试锁定：** `a_live_round_that_genuinely_fails_still_increments_the_alarm`
 （`round.rs:1414`）、`out_of_window_vote_sets_cannot_pump_the_alarm`（`round.rs:1469`）、

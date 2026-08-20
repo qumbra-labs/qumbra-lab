@@ -709,8 +709,10 @@ impl FaucetServer {
                 // not an access log, and a redaction asserted against an in-memory
                 // copy that differs from what stdout gets is not a redaction. The
                 // test reads `journal()`; the operator reads stdout; they are one
-                // `format!`.
-                println!("{line}");
+                // `format!` — stdout additionally carries the journal stamp prefix
+                // (lab #512), which is print-site metadata, not line content: every
+                // redaction-bearing byte is still the one string.
+                qlab_devnet::jprintln!("{line}");
                 if let Ok(mut j) = worker_journal.lock() {
                     j.push(line);
                 }

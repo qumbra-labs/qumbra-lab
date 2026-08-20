@@ -114,10 +114,15 @@ and an empty result is written to the log as `UNREACHABLE-OR-SILENT`. **Every li
 That is a margin, not a guarantee, and the durable fix belongs in `qumbra-ops` rather than here: anchor the grep and widen the tail —
 
 ```sh
-docker logs --tail 200 qumbra-node 2>&1 | grep '^TELEMETRY' | tail -1
+docker logs --tail 200 qumbra-node 2>&1 |  grep 'TELEMETRY tip=' | tail -1
 ```
 
 `wan-sampler.sh:63` runs the same read at `--tail 20` and needs the same change. **Neither script is in this repo and neither was touched by this PR.**
+
+> **Corrected 2026-08-19 (lab #512):** the anchor above is content-anchored
+> (`TELEMETRY tip=`) now, not `^TELEMETRY` — journal lines carry a native UTC
+> stamp prefix, so a `^`-anchored grep reads zero on any stamped log. The
+> deploy-side samplers need the same content anchor when they are updated.
 
 **Cost**: 13 clock reads per iteration plus 3 per frame. **25-26 ns per read** - 3 samples, 100,000 calls each, `cargo test` **debug** (unoptimized, so release is a ceiling on this), Apple M5 Max / macOS 26.5.2, laptop on AC, rig otherwise idle. That is ~325 ns per iteration plus ~75 ns per frame; at the ~50 iterations/s a quiescent 20 ms back-off implies, ~16 us of every second. Printed by `ticktime::tests::instrumentation_costs_tens_of_nanoseconds_per_frame`, which also fails if a clock read ever reaches a microsecond - the threshold at which running this unconditionally would need revisiting.
 

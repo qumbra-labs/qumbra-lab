@@ -56,7 +56,9 @@ where
     W: Write,
     F: FnOnce() -> Result<T, E>,
 {
-    let _ = writeln!(out, "{}", entry_line(config_path));
+    // The journal stamp rides at the write site (lab #512), keeping
+    // `entry_line` itself pure formatting over compile-time constants.
+    let _ = writeln!(out, "{} {}", qlab_devnet::journal::utc_stamp(), entry_line(config_path));
     let _ = out.flush();
     work()
 }

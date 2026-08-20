@@ -25,7 +25,7 @@ pub fn serve(listener: TcpListener, pool: Arc<Pool>, stop: Arc<AtomicBool>) -> s
                 let stop = Arc::clone(&stop);
                 thread::spawn(move || {
                     if let Err(e) = handle_conn(stream, pool, stop) {
-                        eprintln!("qumbra-pool conn: {e}");
+                        qlab_devnet::jeprintln!(WARN, "qumbra-pool conn: {e}");
                     }
                 });
             }

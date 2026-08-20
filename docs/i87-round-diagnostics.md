@@ -281,30 +281,35 @@ exposition per scrape and a 5 s render.
 
 ## 6. Recipes
 
+> **Corrected 2026-08-19 (lab #512):** every journal line now carries a native
+> UTC stamp prefix, so these recipes anchor on the line's own tokens
+> (`ROUND slot=`), never on line start — a `^ROUND` grep reads zero on any
+> stamped log.
+
 Find every round that did not finalize, with its cause:
 
 ```sh
-grep '^ROUND ' node.log | grep -vE 'why=(finalized|open)'
+grep 'ROUND slot=' node.log | grep -vE 'why=(finalized|open)'
 ```
 
 Watch a stall as it happens (the still-open reports):
 
 ```sh
-grep '^ROUND ' node.log | grep 'why=open'
+grep 'ROUND slot=' node.log | grep 'why=open'
 ```
 
 Which members are missing most often (over the archived log, all rounds):
 
 ```sh
-grep '^ROUND ' node.log | sed 's/.* absent=\([^ ]*\).*/\1/' | tr ',' '\n' \
+grep 'ROUND slot=' node.log | sed 's/.* absent=\([^ ]*\).*/\1/' | tr ',' '\n' \
   | grep -v '^-$' | sort -n | uniq -c | sort -rn | head
 ```
 
 Is the stall latency or participation?
 
 ```sh
-grep '^ROUND ' node.log | grep -c 'why=timeout'      # latency-shaped
-grep '^ROUND ' node.log | grep -c 'why=votes_short'  # participation-shaped
+grep 'ROUND slot=' node.log | grep -c 'why=timeout'      # latency-shaped
+grep 'ROUND slot=' node.log | grep -c 'why=votes_short'  # participation-shaped
 ```
 
 PromQL, once a collector is in place:

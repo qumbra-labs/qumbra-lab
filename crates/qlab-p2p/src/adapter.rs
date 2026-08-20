@@ -2972,7 +2972,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> CommitteeControl for NodeAdapter<P, V>
                             // write would trade a durability failure for a live one. What
                             // the operator needs to know is that it will not survive a
                             // restart.
-                            eprintln!(
+                            qlab_devnet::jeprintln!(ERROR,
                                 "⚠️  committee punishment for member {signer} APPLIED but NOT \
                                  PERSISTED ({e}): the tombstone is in force now and will be LOST \
                                  on restart. Fix the data dir before restarting this node."
