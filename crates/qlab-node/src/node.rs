@@ -2754,4 +2754,68 @@ mod tests {
         node.rekey_genesis(GenesisForm::V5);
     }
 
+    /// 🔴 **Lab #521 — the T2 launch-day reopen panic, end to end.**
+    ///
+    /// The preserved svc0 datadir's exact lifecycle: a v5 node applies a chain,
+    /// loses a same-height miner race (live rewind + sibling re-application —
+    /// the fork-choice sequence the 14:16 h=13 race wrote into the log), keeps
+    /// running, snapshots ABOVE the rewind, and is then reopened. The
+    /// snapshot-prefix loop replays the rewind through
+    /// `MemChainStore::rewind_to`, whose rebuild was keyed v4 regardless of the
+    /// store's own form — on a v5 chain the first retained re-insert panicked
+    /// `UnknownParent` at store.rs:446 and the node could not reopen a store it
+    /// had itself written. The full replay of the same log (snapshot absent)
+    /// always succeeded, which is how the datadir proves the log was never the
+    /// problem.
+    #[test]
+    fn a_v5_node_reopens_a_snapshot_whose_prefix_carries_a_live_rewind() {
+        let dir = std::env::temp_dir().join(format!("qmb-i521-v5-rewind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let genesis = genesis_block_for(GenesisForm::V5, 8, 0);
+
+        let v5_block = |parent: &BlockHeader, height: u64, ts: u64, marker: u64| {
+            let body = BlockBody {
+                txs: vec![],
+                coinbase: qlab_devnet::emission_exact::coinbase_exact(height),
+                coinbase_rkm: [marker; 4],
+            };
+            let header =
+                BlockHeader::child_of_for(GenesisForm::V5, parent, ts, 8, body.commitment_v5());
+            (header, body)
+        };
+
+        let live_tip = {
+            let mut node = MemNode::open_for(GenesisForm::V5, &dir, genesis.clone()).unwrap();
+            let (h1, b1) = v5_block(&genesis.header(), 1, 75, 0xA1);
+            node.apply_block(h1.clone(), b1, &MockVerifier).expect("b1 applies");
+            let b1_hash = node.tip_hash();
+
+            // The miner race: apply one h=2, then fork choice moves to its
+            // sibling — undo through the real rewind and re-apply, exactly
+            // what the live node logged.
+            let (h2a, b2a) = v5_block(&h1, 2, 150, 0xA2);
+            node.apply_block(h2a, b2a, &MockVerifier).expect("the losing sibling applies");
+            node.rewind_to(b1_hash).expect("the live rewind succeeds");
+            let (h2b, b2b) = v5_block(&h1, 2, 160, 0xB2);
+            node.apply_block(h2b.clone(), b2b, &MockVerifier).expect("the winner applies");
+            let (h3, b3) = v5_block(&h2b, 3, 235, 0xA3);
+            node.apply_block(h3, b3, &MockVerifier).expect("the chain extends on the winner");
+
+            node.save_snapshot().expect("snapshot written above the rewind");
+            node.tip_hash()
+        };
+        assert_eq!(
+            persist::snapshot_on_disk(&dir).unwrap(),
+            persist::SnapshotOnDisk::At { applied_height: 3 },
+            "the reopen below must take the snapshot-resume path, not the full replay"
+        );
+
+        // Pre-fix this open panicked `UnknownParent` at store.rs:446.
+        let node = MemNode::open_for(GenesisForm::V5, &dir, genesis)
+            .expect("a node reopens the store it wrote");
+        assert_eq!(node.tip_hash(), live_tip, "the resumed identity equals the live one");
+        assert_eq!(node.tip_height(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }
