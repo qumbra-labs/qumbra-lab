@@ -148,7 +148,7 @@ test "$ACTUAL_REV" = "$EXPECTED_REV" || {
 - `genesis.qmb`——**格式 v5，网络 `qumbra-t2`**
   （[`genesis.rs:630-636`](../crates/qumbra-node/src/genesis.rs#L630-L636)）；
 - `expected_genesis_hash`——`<T2_GENESIS_HASH — filled at ceremony>`；
-- `dial_peers` 的初始 P2P 种子地址——`<T2_SEEDS — filled at announcement>`。
+- `dial_peers` 的初始 P2P 种子地址——`"18.202.166.126:9444", "18.141.177.109:9444", "52.194.224.123:9444", "52.5.0.21:9444"`。
 
 分发：`genesis.qmb` 从 **`https://seed.qumbra.org/genesis.qmb`** 下载（裸服务名在
 切换时从 T1 移交给 T2；唯一新增的是 `pool.qumbra.org`）——务必对照上面的
@@ -239,7 +239,7 @@ Windows 上是 PowerShell 里的 `.\qumbra-node.exe mine --dir $HOME\.qumbra-min
 ```toml
 data_dir = "/data"
 listen_addr = "0.0.0.0:9400"
-dial_peers = ["<T2_SEEDS — filled at announcement>"]
+dial_peers = ["18.202.166.126:9444", "18.141.177.109:9444", "52.194.224.123:9444", "52.5.0.21:9444"]
 genesis_file = "/config/genesis.qmb"
 expected_genesis_hash = "<T2_GENESIS_HASH — filled at ceremony>"
 mining = false
