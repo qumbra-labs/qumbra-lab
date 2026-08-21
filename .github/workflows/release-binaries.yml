@@ -191,21 +191,88 @@ jobs:
           NET: ${{ inputs.net }}
         run: bash .github/workflows/scripts/select-release-net.sh
 
+      # ─────────────────────────────────────────────────────────────────────
+      # WHY THE TAG IS A DATE AND NOT THE COMMIT (changed 2026-08-21)
+      #
+      # It used to be `${TAG_PREFIX}-$SHORT`, e.g. `t2-a89dce6`. That named the
+      # source exactly — and named it a SECOND time, because the artifact
+      # already carries it: `QUMBRA_BUILD_REV` is stamped into both binaries at
+      # compile time, printed by `qumbra-node halt-status` on the `build rev:`
+      # line, and GREPPED BACK OUT of each built binary by this workflow, so a
+      # build that ignored the stamp cannot be published as though it had not.
+      #
+      # The tag's own job is different: it is the string a human PICKS FROM A
+      # LIST. `t2-a89dce6` versus `t2-3241275` tells nobody which is newer, and
+      # on 2026-08-20 we cut three releases in one day and could not order them
+      # by eye. A date can. So the tag now does the thing only it can do, and
+      # stops duplicating the thing the binary already proves.
+      # (`qumbra-design/derived-not-duplicated.md`.)
+      #
+      # 🔴 ZERO-PADDED, DELIBERATELY. `2026.8.9` sorts AFTER `2026.8.21` as a
+      # string, and tag lists, `sort` and `ls` are all string sorts — an unpadded
+      # date scheme loses the single property it was adopted for.
+      #
+      # 🔴 UTC, DELIBERATELY. GitHub stamps releases in UTC and shows that date
+      # beside the tag; a tag on the operator's local date would disagree with
+      # the timestamp printed next to it, which is precisely the confusion this
+      # change exists to remove.
+      #
+      # The serial `-N` is the Nth cut of that UTC day, read from the tags that
+      # already exist rather than remembered.
+      # ─────────────────────────────────────────────────────────────────────
       - name: Revision and tag
         id: rev
         env:
           TAG_PREFIX: ${{ steps.pins.outputs.tag_prefix }}
+          GH_TOKEN: ${{ secrets.PUBLIC_RELEASE_TOKEN }}
+          PUBLIC_REPO: ${{ vars.PUBLIC_REPO || 'qumbra-labs/qumbra' }}
         run: |
           set -euo pipefail
           REV=$(git rev-parse HEAD)
           SHORT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y.%m.%d)
+
+          # Nth cut of this UTC day. Read the published tags rather than guess;
+          # `|| true` so an empty release list (or a transient API failure that
+          # gh reports as no rows) does not abort — but see the guard below,
+          # which refuses a tag that already exists, so a miscount cannot
+          # silently overwrite a release.
+          EXISTING=$(gh release list --repo "$PUBLIC_REPO" --limit 200 \
+                       --json tagName --jq '.[].tagName' 2>/dev/null || true)
+          N=$(printf '%s\n' "$EXISTING" \
+                | sed -n "s/^${TAG_PREFIX}-${DATE}-\([0-9][0-9]*\)$/\1/p" \
+                | sort -n | tail -1)
+          N=$(( ${N:-0} + 1 ))
+          TAG="${TAG_PREFIX}-${DATE}-${N}"
+
+          # 🔴 Shape guard. A tag is a string somebody's code typed; nothing
+          # downstream validates it. If the scheme is ever edited by hand and
+          # loses its padding, this stops the release instead of publishing an
+          # artifact that sorts wrong forever.
+          case "$TAG" in
+            t[0-9]-[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-[0-9]*) : ;;
+            *)
+              echo "::error::computed tag '$TAG' is not t<net>-YYYY.MM.DD-N (zero-padded)" >&2
+              exit 1
+              ;;
+          esac
+
+          # 🔴 Never reuse a tag. If the serial was miscounted — an API hiccup,
+          # a release deleted by hand — this refuses rather than clobbering a
+          # published release whose SHA256SUMS are already in the world.
+          if printf '%s\n' "$EXISTING" | grep -qx "$TAG"; then
+            echo "::error::tag $TAG already exists on $PUBLIC_REPO — refusing to republish" >&2
+            exit 1
+          fi
+
           {
             echo "rev=$REV"
             echo "short=$SHORT"
-            echo "tag=${TAG_PREFIX}-$SHORT"
+            echo "tag=$TAG"
           } >> "$GITHUB_OUTPUT"
           echo "lab revision : $REV"
-          echo "release tag  : ${TAG_PREFIX}-$SHORT"
+          echo "release tag  : $TAG   (cut $N of $DATE UTC)"
+          echo "build rev    : $SHORT   — stamped into the binaries, not into the tag"
           echo "net          : ${{ inputs.net }}"
 
       - name: The cross-repo PAT must exist — fail loudly, never skip
@@ -612,7 +679,7 @@ jobs:
           if ! gh release create "$TAG" \
                 --repo "$PUBLIC_REPO" \
                 --target "$TARGET_SHA" \
-                --title "Qumbra ${NET_LABEL} — prebuilt binaries ($TAG)" \
+                --title "Qumbra ${NET_LABEL} — prebuilt binaries ($TAG · rev ${{ needs.preflight.outputs.short }})" \
                 --notes-file release-notes.md \
                 "${FLAGS[@]}" \
                 release/*.tar.gz release/*.zip release/SHA256SUMS; then

@@ -6,7 +6,7 @@
 //! |---|---|---|
 //! | [`Availability::Ready`] | an anchored note (or pair) covers the outlay | queue it |
 //! | [`Availability::AwaitingFinality`] | notes held, none witnessable by the current anchor | queue it — it clears on the checkpoint cadence |
-//! | [`Availability::Maturing`] | coinbase notes held, still inside the frozen §2 144-block gate | queue it **only** if it matures inside the wait the queue would quote; otherwise refuse, naming the height |
+//! | [`Availability::Maturing`] | coinbase is inside the frozen §2 144-block gate, and nothing already funded in can pay yet | queue it **only** if it matures inside the wait the queue would quote; otherwise refuse, naming the height |
 //! | [`Availability::ColdChain`] | nothing finalized, so no valid anchor exists | refuse |
 //! | [`Availability::Empty`] | nothing held that covers the outlay, and none coming | refuse |
 //!
@@ -38,6 +38,26 @@ use qlab_faucet::{Faucet, InventoryError, MAX_QUEUE_DEPTH};
 /// 40 minutes.
 pub const MAX_ADVERTISED_WAIT_BLOCKS: u64 = MAX_QUEUE_DEPTH as u64;
 
+/// Why the notes **already funded in** cannot pay, while coinbase is maturing.
+///
+/// Lab issue #539: [`Availability::Maturing`] is reached from two different
+/// `select_inputs` failures, and until this type existed both rendered as one
+/// sentence — "funded but not yet spendable … spendable once the chain reaches
+/// height H". On the value branch that sentence named a height at which the held
+/// notes still would not pay, and cited the maturity constant for a shortage that
+/// was not about maturity. The reason is carried so the message can be true for
+/// the branch it was actually reached from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shortage {
+    /// Nothing the current anchor can witness — the notes exist but no finalized
+    /// root contains them. Maturity is not what they are waiting on.
+    NoWitness,
+    /// Anchored notes exist and no legal input set reaches the outlay, so the
+    /// shortage is value. The figures are `InventoryError::InsufficientValue`'s,
+    /// in bessel, and the shortfall is `need - best_inputs`.
+    Value { need: u64, best_inputs: u64 },
+}
+
 /// Whether the faucet can serve a request, and if not, why and when that changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Availability {
@@ -49,10 +69,17 @@ pub enum Availability {
     /// the change note of a recent grant is in a block that is mined but not yet
     /// finalized. Self-clearing on the checkpoint cadence.
     AwaitingFinality { held: usize, anchored: usize },
-    /// Coinbase notes are held but still inside the frozen §2 maturity delay — they
-    /// have no commitment-tree leaf yet, so no witness and no provable spend
+    /// Coinbase notes are outstanding but still inside the frozen §2 maturity delay
+    /// — they have no commitment-tree leaf yet, so no witness and no provable spend
     /// (issue #102). `matures_at` is the height the earliest one's leaf lands at.
-    Maturing { held: usize, matures_at: u64, tip: u64 },
+    ///
+    /// The two counts are **not** summed (lab #539). `maturing` is the immature
+    /// coinbase this node mined — the population `matures_at` is about. `held` is
+    /// what is already funded in and still cannot pay, for the reason in
+    /// `shortage`. Their sum was published as one `held` figure until 2026-08-20,
+    /// which is how `faucet.qumbra.org` came to say "139 coinbase note(s) held"
+    /// over a table reading "113 / 26": one number that was neither of them.
+    Maturing { held: usize, maturing: usize, matures_at: u64, tip: u64, shortage: Shortage },
     /// The process is up and the listener is bound, but the node is still
     /// rebuilding its state from `blocks.log` — it has no chain view yet, so
     /// nothing here can be answered from it (lab #365).
@@ -129,16 +156,38 @@ impl Availability {
                  holding it finalizes (every {} blocks).",
                 qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS
             ),
-            Availability::Maturing { held, matures_at, tip } => {
+            Availability::Maturing { held, maturing, matures_at, tip, shortage } => {
                 let blocks = matures_at.saturating_sub(*tip);
-                format!(
-                    "funded but not yet spendable — {held} coinbase note(s) held, spendable once \
-                     the chain reaches height {matures_at}; it is at {tip}, so {blocks} more \
-                     block(s) (~{} min at the 75 s block time). New coin cannot be spent for \
-                     {} blocks (FROZEN §2 COINBASE_MATURITY_BLOCKS).",
+                // The `when`, which is the one thing a requester can act on, and it
+                // is about the maturing coinbase only — never about `held`.
+                let coming = format!(
+                    "{maturing} coinbase note(s) mature at height {matures_at}; the chain is at \
+                     {tip}, so {blocks} more block(s) (~{} min at the 75 s block time). New coin \
+                     cannot be spent for {} blocks (FROZEN §2 COINBASE_MATURITY_BLOCKS).",
                     blocks * 75 / 60,
                     qlab_node::COINBASE_MATURITY_BLOCKS,
-                )
+                );
+                // Lab #539: what `held` is waiting on decides the first clause. The
+                // value branch must not promise that these notes become spendable at
+                // `matures_at` — they are not immature, they are too small.
+                match shortage {
+                    Shortage::Value { need, best_inputs } => format!(
+                        "funded but short of a grant — the {held} note(s) already funded in reach \
+                         only {best_inputs} bessel of the {need} bessel one grant costs, so what \
+                         the wait buys is value, not those notes becoming spendable. {coming}"
+                    ),
+                    Shortage::NoWitness if *held == 0 => format!(
+                        "not yet spendable — nothing is funded in yet, so a grant waits on that \
+                         coinbase. {coming}"
+                    ),
+                    Shortage::NoWitness => format!(
+                        "funded but not yet spendable — the {held} note(s) already funded in are \
+                         not witnessable by the current anchor, so none of them can pay now; a \
+                         note becomes witnessable when the block holding it finalizes (every {} \
+                         blocks). {coming}",
+                        qlab_devnet::params_devnet::CHECKPOINT_CADENCE_BLOCKS
+                    ),
+                }
             }
             Availability::Starting { replayed, total } => {
                 let progress = if *total == 0 {
@@ -280,7 +329,13 @@ pub fn classify<V: qlab_faucet::ChainView>(
                 // if it ever were reachable.
                 Availability::AwaitingFinality { held, anchored }
             } else if let Some(matures_at) = next_maturity.filter(|m| *m > tip) {
-                Availability::Maturing { held: held + maturing_count, matures_at, tip }
+                Availability::Maturing {
+                    held,
+                    maturing: maturing_count,
+                    matures_at,
+                    tip,
+                    shortage: Shortage::NoWitness,
+                }
             } else if held >= 1 {
                 Availability::AwaitingFinality { held, anchored }
             } else {
@@ -289,14 +344,23 @@ pub fn classify<V: qlab_faucet::ChainView>(
         }
         // Anchored notes exist, but no legal input set covers the outlay. On this
         // chain that is a *value* shortage, and the only refill is coinbase — the
-        // same remedy as an empty inventory, so it is reported as one rather than as
-        // a fifth state a requester cannot act on differently.
-        Err(InventoryError::InsufficientValue { .. }) => match next_maturity.filter(|m| *m > tip) {
-            Some(matures_at) => {
-                Availability::Maturing { held: held + maturing_count, matures_at, tip }
+        // same remedy as an empty inventory, so it is not a fifth state a requester
+        // could act on differently. It is carried into `Maturing` as its own
+        // `Shortage` (lab #539) because the *sentence* differs even where the
+        // remedy does not: maturing coinbase is when more value arrives, not when
+        // these notes become spendable.
+        Err(InventoryError::InsufficientValue { need, best_inputs }) => {
+            match next_maturity.filter(|m| *m > tip) {
+                Some(matures_at) => Availability::Maturing {
+                    held,
+                    maturing: maturing_count,
+                    matures_at,
+                    tip,
+                    shortage: Shortage::Value { need, best_inputs },
+                },
+                None => Availability::Empty { held },
             }
-            None => Availability::Empty { held },
-        },
+        }
     }
 }
 
@@ -304,20 +368,75 @@ pub fn classify<V: qlab_faucet::ChainView>(
 mod tests {
     use super::*;
 
+    /// A witness-shortage `Maturing`, the state the tests below are about.
+    fn maturing(held: usize, matures_at: u64, tip: u64) -> Availability {
+        Availability::Maturing {
+            held,
+            maturing: 1,
+            matures_at,
+            tip,
+            shortage: Shortage::NoWitness,
+        }
+    }
+
+    /// 🔴 **Lab #539: the two populations are counted separately, and only the
+    /// maturing one is promised at `matures_at`.** The live page said "139 coinbase
+    /// note(s) held, spendable once the chain reaches height 472" over a table
+    /// reading 113 held / 26 maturing — the banner's figure was their sum, so it
+    /// matched neither surface and promised a height for notes that were not
+    /// waiting on one.
+    #[test]
+    fn the_banner_counts_the_maturing_coinbase_and_the_held_notes_apart() {
+        let live = Availability::Maturing {
+            held: 113,
+            maturing: 26,
+            matures_at: 472,
+            tip: 470,
+            shortage: Shortage::NoWitness,
+        };
+        let text = live.explain();
+        assert!(text.contains("26 coinbase note(s) mature at height 472"), "{text}");
+        assert!(text.contains("113 note(s) already funded in"), "{text}");
+        assert!(!text.contains("139"), "the sum of two populations is not a count: {text}");
+    }
+
+    /// 🔴 **A value shortage never promises that the held notes become spendable.**
+    /// It is reached from `InsufficientValue`, where the held notes are anchored and
+    /// mature and simply too small — so the maturity height is when *more value*
+    /// arrives, and the sentence has to say that and not the other thing.
+    #[test]
+    fn a_value_shortage_names_the_shortfall_rather_than_promising_maturity() {
+        let short = Availability::Maturing {
+            held: 4,
+            maturing: 1,
+            matures_at: 200,
+            tip: 190,
+            shortage: Shortage::Value { need: 100_000_000, best_inputs: 250 },
+        };
+        let text = short.explain();
+        assert!(text.contains("250 bessel of the 100000000 bessel"), "{text}");
+        assert!(text.contains("not those notes becoming spendable"), "{text}");
+        // The `when` survives — it is still the one actionable thing on the page.
+        assert!(text.contains("mature at height 200"), "{text}");
+        // …and the state is still self-clearing inside the advertised wait, because
+        // the remedy is the same one: coinbase.
+        assert!(short.admits_requests(), "10 blocks is inside the advertised wait");
+    }
+
     /// The queue-only-what-you-can-serve rule, at the boundary. 32 blocks is
     /// advertised; 33 is refused.
     #[test]
     fn maturity_inside_the_advertised_wait_is_queued_and_beyond_it_is_refused() {
-        let inside = Availability::Maturing { held: 2, matures_at: 132, tip: 100 };
+        let inside = maturing(2, 132, 100);
         assert_eq!(inside.blocks_until_servable(), Some(32));
         assert!(inside.admits_requests(), "32 blocks is exactly the wait the queue quotes");
 
-        let beyond = Availability::Maturing { held: 2, matures_at: 133, tip: 100 };
+        let beyond = maturing(2, 133, 100);
         assert_eq!(beyond.blocks_until_servable(), Some(33));
         assert!(!beyond.admits_requests(), "33 blocks is longer than the faucet will promise");
         // …and the refusal is actionable: it names the height and the interval.
         let text = beyond.explain();
-        assert!(text.contains("reaches height 133"), "{text}");
+        assert!(text.contains("mature at height 133"), "{text}");
         assert!(text.contains("41 min"), "{text}");
         assert!(text.contains("144"), "the frozen constant is named: {text}");
     }
@@ -365,7 +484,15 @@ mod tests {
         for a in [
             Availability::Ready { grants: 0 },
             Availability::AwaitingFinality { held: 2, anchored: 1 },
-            Availability::Maturing { held: 1, matures_at: 145, tip: 1 },
+            maturing(1, 145, 1),
+            maturing(0, 145, 1),
+            Availability::Maturing {
+                held: 3,
+                maturing: 1,
+                matures_at: 145,
+                tip: 1,
+                shortage: Shortage::Value { need: 1_000_000_000, best_inputs: 4_200 },
+            },
             Availability::Starting { replayed: 1, total: 2 },
             Availability::Starting { replayed: 0, total: 0 },
             Availability::ColdChain,

@@ -10,6 +10,15 @@ use serde::Deserialize;
 use crate::hexutil;
 use crate::template::{header_from_parts, parse_form, HeldTemplateSource, Template, TemplateError};
 
+/// Default template poll interval. The stall age default is derived from
+/// this × [`DEFAULT_TEMPLATE_STALL_POLLS`] so the two bounds cannot
+/// silently disagree.
+pub const DEFAULT_POLL_MS: u64 = 1000;
+/// Consecutive failed polls (and, when age is unset, the age bound in
+/// poll intervals) before work is suspended. Public-endpoint default:
+/// three seconds at the default poll cadence.
+pub const DEFAULT_TEMPLATE_STALL_POLLS: u64 = 3;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct PoolConfig {
     /// `host:port` the stratum TCP listener binds.
@@ -24,9 +33,18 @@ pub struct PoolConfig {
     /// `/v1/mine/block`. The static table is ignored.
     #[serde(default)]
     pub node_rpc: Option<String>,
-    /// How often to re-fetch the live template, milliseconds. Default 1000.
+    /// How often to re-fetch the live template, milliseconds.
+    /// Default [`DEFAULT_POLL_MS`].
     #[serde(default)]
     pub poll_ms: Option<u64>,
+    /// Consecutive failed template polls before work is suspended.
+    /// Default [`DEFAULT_TEMPLATE_STALL_POLLS`].
+    #[serde(default)]
+    pub template_max_poll_failures: Option<u64>,
+    /// Wall-clock milliseconds without a successful template poll before
+    /// work is suspended. When unset, derived as stall-polls × poll_ms.
+    #[serde(default)]
+    pub template_max_age_ms: Option<u64>,
     /// Public coinbase-payee identity for pool fallback payouts, encoded as
     /// 64 hex characters (32 bytes, lane-major little-endian).
     ///
@@ -109,7 +127,12 @@ impl PoolConfig {
             return Err(ConfigError::ZeroDifficulty);
         }
         let _ = self.payout_rkm_lanes()?;
-        if self.node_rpc.as_ref().map(|s| s.trim().is_empty()).unwrap_or(true) {
+        if self
+            .node_rpc
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+        {
             if self.template.is_none() {
                 return Err(ConfigError::Toml(
                     "need [template] or node_rpc = \"http://host:port\"".into(),
@@ -135,6 +158,28 @@ impl PoolConfig {
         Ok(())
     }
 
+    pub fn poll_interval_ms(&self) -> u64 {
+        self.poll_ms.unwrap_or(DEFAULT_POLL_MS).max(1)
+    }
+
+    pub fn stall_poll_failures(&self) -> u64 {
+        self.template_max_poll_failures
+            .unwrap_or(DEFAULT_TEMPLATE_STALL_POLLS)
+            .max(1)
+    }
+
+    /// Age bound in milliseconds. Unset → stall-polls × poll interval, so
+    /// the wall-clock bound tracks the poll cadence rather than a second
+    /// literal (`derived-not-duplicated.md` §4).
+    pub fn stall_age_ms(&self) -> u64 {
+        self.template_max_age_ms
+            .unwrap_or_else(|| {
+                self.poll_interval_ms()
+                    .saturating_mul(self.stall_poll_failures())
+            })
+            .max(1)
+    }
+
     /// Decode the configured public payout identity into the coinbase lanes.
     pub fn payout_rkm_lanes(&self) -> Result<[u64; 4], ConfigError> {
         let value = self
@@ -145,10 +190,9 @@ impl PoolConfig {
     }
 
     pub fn form(&self) -> Result<GenesisForm, ConfigError> {
-        let t = self
-            .template
-            .as_ref()
-            .ok_or_else(|| ConfigError::Toml("no [template] (live node_rpc has no static form)".into()))?;
+        let t = self.template.as_ref().ok_or_else(|| {
+            ConfigError::Toml("no [template] (live node_rpc has no static form)".into())
+        })?;
         parse_form(&t.form).map_err(ConfigError::Template)
     }
 
@@ -258,5 +302,36 @@ payout_rkm = "0100000000000000020000000000000003000000000000000400000000000000"
         let cfg = PoolConfig::from_toml(live).unwrap();
         cfg.ensure_service_ready().unwrap();
         assert_eq!(cfg.payout_rkm_lanes().unwrap(), [1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn stall_age_default_tracks_poll_cadence() {
+        let live = r#"
+listen_addr = "127.0.0.1:3333"
+share_difficulty = 1024
+node_rpc = "http://node:9420"
+poll_ms = 2000
+payout_rkm = "0100000000000000020000000000000003000000000000000400000000000000"
+"#;
+        let cfg = PoolConfig::from_toml(live).unwrap();
+        assert_eq!(cfg.poll_interval_ms(), 2000);
+        assert_eq!(cfg.stall_poll_failures(), DEFAULT_TEMPLATE_STALL_POLLS);
+        assert_eq!(
+            cfg.stall_age_ms(),
+            cfg.poll_interval_ms() * cfg.stall_poll_failures()
+        );
+
+        let explicit = r#"
+listen_addr = "127.0.0.1:3333"
+share_difficulty = 1024
+node_rpc = "http://node:9420"
+poll_ms = 2000
+template_max_poll_failures = 5
+template_max_age_ms = 15000
+payout_rkm = "0100000000000000020000000000000003000000000000000400000000000000"
+"#;
+        let cfg = PoolConfig::from_toml(explicit).unwrap();
+        assert_eq!(cfg.stall_poll_failures(), 5);
+        assert_eq!(cfg.stall_age_ms(), 15000);
     }
 }
