@@ -1071,7 +1071,16 @@ fn render_index(s: &ServiceStatus, outcome: Option<&RequestOutcome>) -> String {
     // is, and the question the label was answering gets its own row, derived from
     // the same `Availability` the banner renders so the two cannot disagree.
     row("notes held", s.notes_held.to_string());
-    row("notes maturing", s.notes_maturing.to_string());
+    // Lab #543: `0` here reads as "nothing is coming", which is a claim no harvest
+    // pass has made before the first one runs. Same token as the three chain rows
+    // above and the same reason (#365) — one grep covers four surfaces.
+    row(
+        "notes maturing",
+        match s.notes_maturing {
+            Some(n) => n.to_string(),
+            None => "UNAVAILABLE (no harvest pass yet)".to_string(),
+        },
+    );
     row(
         "spendable now",
         match &s.availability {
@@ -1165,7 +1174,7 @@ mod tests {
             confirmed: 0,
             refused: 0,
             notes_held: 2,
-            notes_maturing: 0,
+            notes_maturing: Some(0),
         }))
     }
 
@@ -1232,7 +1241,7 @@ mod tests {
         }))
         .clone();
         s.notes_held = 113;
-        s.notes_maturing = 26;
+        s.notes_maturing = Some(26);
         let page = render_index(&s, None);
 
         assert!(!page.contains("notes spendable"), "the label that lied is gone: {page}");
@@ -1247,6 +1256,20 @@ mod tests {
         let ready = lock(&a_status(crate::state::Availability::Ready { grants: 7 })).clone();
         let page = render_index(&ready, None);
         assert!(page.contains("yes — 7 grants of value"), "{page}");
+    }
+
+    /// 🔴 **Lab #543: the maturing row publishes no number until a pass has produced
+    /// one.** `0` there reads as "nothing is coming", and before the first harvest
+    /// that is a claim nobody has made — the #365 rule, applied to the last row that
+    /// still defaulted.
+    #[test]
+    fn the_maturing_row_says_unavailable_until_a_harvest_pass_has_run() {
+        let mut s = lock(&a_status(crate::state::Availability::Unharvested)).clone();
+        s.notes_maturing = None;
+        let page = render_index(&s, None);
+        assert!(page.contains("UNAVAILABLE (no harvest pass yet)"), "{page}");
+        assert!(page.contains("not answering yet"), "the banner says it too: {page}");
+        assert!(page.contains("no — see the state line above"), "{page}");
     }
 
     /// 🔴 The unavailable path refuses **without consulting the gate**, so the
