@@ -244,6 +244,14 @@ fn usage() {
     // `--version` subcommand: a downloaded tarball carries no OCI label, and the
     // first thing a stranger runs on an unfamiliar binary is `--help`.
     eprintln!("build rev: {}", qumbra_wallet::build_rev_line());
+    // Beside the build rev, and for the same reason it is there: so the artifact
+    // can be ASKED rather than assumed. The release gate greps this line back out
+    // of the built binary — a stamp nothing reads back is a stamp that can
+    // silently fail to apply, which is precisely how #581 shipped (lab #581).
+    eprintln!(
+        "built for net: {}",
+        BUILT_FOR_NET.unwrap_or("unstamped — --net decides, defaulting to t1")
+    );
     eprintln!(
         "qumbra-wallet — the end-user wallet CLI (issue #243)\n\n\
          USAGE:\n  \
@@ -296,13 +304,17 @@ fn usage() {
                 the balance transactions-only, and the report says so)\n\
          --node is the node's discovery server: /v1/tree/leaves, /v1/anchors, POST /v1/tx\n\
                 (defaults to --url when omitted — one host usually serves both)\n\
-         --net  t1|t2 — WHICH NET these endpoints serve (default t1). A coinbase\n\
-                note\'s derivation is genesis-form dependent, so a wallet that\n\
-                MINED on T2 and omits `--net t2` reconstructs commitments that are\n\
-                in no tree: `scan` reports a mined balance and `send` then refuses\n\
-                at the witness lookup (lab #566). Accepted by scan/send/history\n\
-                and by `names register`/`renew`. No effect on a wallet that only\n\
-                receives — transaction outputs are not form-dependent\n\n\
+         --net  t1|t2 — WHICH NET these endpoints serve. Defaults to the net this\n\
+                build was CUT for when it carries the release lane\'s stamp, and to\n\
+                t1 only for an unstamped build; the flag overrides either. A\n\
+                coinbase note\'s derivation is genesis-form dependent, so a wallet\n\
+                that MINED on T2 and derives under T1 reconstructs commitments\n\
+                that are in no tree: `scan` reports a mined balance and `send`\n\
+                then refuses at the witness lookup (lab #566). Accepted by\n\
+                scan/send/history and by `names register`/`renew`. No effect on a\n\
+                wallet that only receives — transaction outputs are not\n\
+                form-dependent. Every command that uses it prints the net it\n\
+                chose AND where that came from, so a default is never silent\n\n\
          Both URLs accept http://host:PORT (port required, plaintext) and\n\
          https://host[:port] (TLS, port defaults to 443, roots are the compiled-in\n\
          Mozilla set). There is no fallback from https to http: a TLS failure is\n\
@@ -338,28 +350,120 @@ fn has_flag(args: &[String], name: &str) -> bool {
 /// `/v1/tree/leaves`, `/v1/anchors` — carries a format version, so there is
 /// nothing here for a profile to verify the flag against.
 ///
-/// 🔴 **So this is an interim and its weakness is named rather than hidden: a T2
-/// wallet that omits the flag is silently wrong until it tries to spend.** The
-/// durable fix is for the served wire to carry the genesis format version, which
-/// is a wire change and a stop point this baton did not cross — it is asked on
-/// lab #566. What keeps the interim safe rather than merely small is that the
-/// wrong answer cannot produce a bad proof: the tree disagrees, and
-/// `sync`/`send` refuse and now name this flag when they do.
+/// 🔴 **The durable fix is still owed and is still a stop point**: the served
+/// wire carries no genesis format version, so nothing this wallet fetches can
+/// *verify* the answer. That is asked on lab #566. What keeps the interim safe
+/// rather than merely small is that a wrong answer cannot produce a bad proof —
+/// the tree disagrees, and `sync`/`send` refuse and name this flag when they do.
 ///
-/// Default `t1`, so every existing command on the live net behaves exactly as
-/// before.
+/// ## Where the default comes from (lab #581)
+///
+/// The flag used to default to `t1` unconditionally, and that was a footgun with
+/// a measurement behind it: on `t2-2026.08.21-1`, the first release in which a
+/// miner *can* spend what they mined, the default invocation still could not.
+/// A T2 miner who omitted the flag got #566's refusal on a build that had fixed
+/// #566.
+///
+/// The release lane already knows the answer. It stamps `QUMBRA_NET` into
+/// `qumbra-node` — that is what `qumbra-node mine --print-net` reports — and
+/// until #581 it stamped **nothing** into the `qumbra-wallet` shipped in the same
+/// tarball, so the flag was a second, hand-maintained copy of a fact the release
+/// already held, defaulting to the retired net. Resolution order is now:
+///
+/// 1. **`--net` on the command line** — always wins, including over a stamp, so a
+///    T2-stamped binary can still read a T1 endpoint.
+/// 2. **[`BUILT_FOR_NET`]**, stamped by the release lane for the net this
+///    artifact was cut for.
+/// 3. **`t1`** for an unstamped build — a plain `cargo build`, where no lane has
+///    an opinion. Unchanged from before, so no developer's command moves.
+///
+/// A stamp this wallet cannot name is a **release-lane defect, not user error**,
+/// and says so: it refuses rather than falling through to a default, because
+/// falling through is exactly how a T2 artifact would quietly behave as T1.
 ///
 /// [`NetProfile`]: https://github.com/qumbra-labs/qumbra-lab/blob/main/crates/qumbra-node/src/mine.rs
 fn genesis_form_of(args: &[String]) -> Result<qlab_devnet::forms::GenesisForm, Box<dyn Error>> {
+    let (form, source) = resolve_net(flag(args, "--net"), BUILT_FOR_NET)?;
+    // On stderr, so it never lands in output something is parsing. A default that
+    // nobody can see is the failure mode this whole block exists to end: say what
+    // was chosen and who chose it, every time.
+    eprintln!("net: {} ({})", net_name(form), source.describe());
+    Ok(form)
+}
+
+/// The flag spelling of a form, for the line above — not `Debug`, which would
+/// print `V4`/`V5` and make the user translate.
+fn net_name(form: qlab_devnet::forms::GenesisForm) -> &'static str {
     use qlab_devnet::forms::GenesisForm;
-    match flag(args, "--net") {
-        None | Some("t1") => Ok(GenesisForm::V4),
-        Some("t2") => Ok(GenesisForm::V5),
-        Some(other) => Err(format!(
-            "--net {other} is not a net this wallet knows (it knows: t1, t2). The net decides how \
-             a mined coinbase note is derived, so guessing it would produce notes with no leaf in \
-             any tree — refusing rather than picking one"
-        )
+    match form {
+        GenesisForm::V4 => "t1",
+        GenesisForm::V5 => "t2",
+    }
+}
+
+/// The net this artifact was cut for, stamped by the release lane
+/// (`.github/workflows/release-binaries.yml`) via `QUMBRA_NET` — the same
+/// variable, from the same preflight output, that stamps `qumbra-node`.
+///
+/// `None` for any build the lane did not produce.
+pub const BUILT_FOR_NET: Option<&str> = option_env!("QUMBRA_NET");
+
+/// What decided the net, so a surface can say so instead of leaving the user to
+/// infer it. A silent default is how [`genesis_form_of`]'s footgun stayed
+/// invisible for a day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetSource {
+    /// `--net` was given explicitly.
+    Flag,
+    /// Taken from [`BUILT_FOR_NET`].
+    Stamp,
+    /// Neither — an unstamped build with no flag.
+    Fallback,
+}
+
+impl NetSource {
+    /// The phrase that goes after the net name on a human-facing line.
+    fn describe(self) -> &'static str {
+        match self {
+            NetSource::Flag => "from --net",
+            NetSource::Stamp => "stamped into this build by the release lane",
+            NetSource::Fallback => "default for an unstamped build — pass --net to be explicit",
+        }
+    }
+}
+
+/// The whole decision, as a pure function of the two inputs, so it can be tested
+/// without a build stamp: `option_env!` is fixed at compile time and a test
+/// cannot vary it.
+fn resolve_net(
+    flag: Option<&str>,
+    stamped: Option<&str>,
+) -> Result<(qlab_devnet::forms::GenesisForm, NetSource), Box<dyn Error>> {
+    use qlab_devnet::forms::GenesisForm;
+
+    let (net, source) = match (flag, stamped) {
+        (Some(n), _) => (n, NetSource::Flag),
+        (None, Some(n)) => (n, NetSource::Stamp),
+        (None, None) => ("t1", NetSource::Fallback),
+    };
+
+    match net {
+        "t1" => Ok((GenesisForm::V4, source)),
+        "t2" => Ok((GenesisForm::V5, source)),
+        other => Err(match source {
+            NetSource::Stamp => format!(
+                "this build is stamped for net {other}, which this wallet cannot name (it knows: \
+                 t1, t2). That is a release-lane defect, not something you did — the binary and \
+                 the wallet were built from trees that disagree about which nets exist. Refusing \
+                 rather than falling back to a default, because falling back is how a T2 artifact \
+                 would quietly behave as T1"
+            ),
+            _ => format!(
+                "--net {other} is not a net this wallet knows (it knows: t1, t2). The net decides \
+                 how a mined coinbase note is derived, so guessing it would produce notes with no \
+                 leaf in any tree — refusing rather than picking one"
+            ),
+        }
         .into()),
     }
 }
@@ -908,7 +1012,52 @@ fn resolve_send_amount(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_send_amount;
+    use super::{resolve_net, resolve_send_amount, NetSource};
+    use qlab_devnet::forms::GenesisForm;
+
+    #[test]
+    fn net_resolution_precedence() {
+        // The flag wins over everything, including a stamp that disagrees — a
+        // T2-stamped wallet must still be able to read a T1 endpoint.
+        assert_eq!(resolve_net(Some("t1"), Some("t2")).unwrap(), (GenesisForm::V4, NetSource::Flag));
+        assert_eq!(resolve_net(Some("t2"), Some("t1")).unwrap(), (GenesisForm::V5, NetSource::Flag));
+
+        // No flag: the stamp decides. THIS is lab #581 — before it, both of these
+        // resolved to V4 and a T2 miner's own release derived under T1.
+        assert_eq!(resolve_net(None, Some("t2")).unwrap(), (GenesisForm::V5, NetSource::Stamp));
+        assert_eq!(resolve_net(None, Some("t1")).unwrap(), (GenesisForm::V4, NetSource::Stamp));
+
+        // Unstamped and unasked — a plain `cargo build`. Unchanged from before
+        // #581, so no developer's existing command moves.
+        assert_eq!(resolve_net(None, None).unwrap(), (GenesisForm::V4, NetSource::Fallback));
+    }
+
+    #[test]
+    fn an_unknown_net_refuses_and_says_whose_fault_it_is() {
+        // From the user: it is their flag, and the message names the flag.
+        let err = resolve_net(Some("t3"), None).unwrap_err().to_string();
+        assert!(err.contains("--net t3"), "{err}");
+        assert!(err.contains("t1, t2"), "{err}");
+
+        // From the lane: NOT user error, and it must not fall through to t1 —
+        // falling through is exactly how a T2 artifact would behave as T1.
+        let err = resolve_net(None, Some("t3")).unwrap_err().to_string();
+        assert!(err.contains("release-lane defect"), "{err}");
+        assert!(err.contains("not something you did"), "{err}");
+    }
+
+    #[test]
+    fn every_source_describes_itself_distinctly() {
+        // The line printed on every command is the only thing standing between a
+        // user and a silent default, so the three cases must not read alike.
+        let all = [NetSource::Flag, NetSource::Stamp, NetSource::Fallback];
+        for (i, a) in all.iter().enumerate() {
+            assert!(!a.describe().is_empty());
+            for b in &all[i + 1..] {
+                assert_ne!(a.describe(), b.describe());
+            }
+        }
+    }
 
     #[test]
     fn send_amount_resolution() {

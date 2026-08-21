@@ -394,6 +394,10 @@ jobs:
       - name: Build the wallet
         env:
           QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+          # lab #581: the same stamp the node gets, from the same preflight output.
+          # Without it `--net` defaults to t1 and a T2 miner's own release derives
+          # their coinbase under the retired net.
+          QUMBRA_NET: ${{ needs.preflight.outputs.net }}
         run: cargo build --release --locked -p qumbra-wallet
 
       - name: Build the pool — RandomX, same constraint as the node
@@ -490,6 +494,10 @@ jobs:
       - name: Build the wallet
         env:
           QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+          # lab #581: the same stamp the node gets, from the same preflight output.
+          # Without it `--net` defaults to t1 and a T2 miner's own release derives
+          # their coinbase under the retired net.
+          QUMBRA_NET: ${{ needs.preflight.outputs.net }}
         run: cargo build --release --locked -p qumbra-wallet
 
       - name: Build the pool — RandomX, same constraint as the node
@@ -579,6 +587,10 @@ jobs:
       - name: Build the wallet
         env:
           QUMBRA_BUILD_REV: ${{ needs.preflight.outputs.rev }}
+          # lab #581: the same stamp the node gets, from the same preflight output.
+          # Without it `--net` defaults to t1 and a T2 miner's own release derives
+          # their coinbase under the retired net.
+          QUMBRA_NET: ${{ needs.preflight.outputs.net }}
         run: cargo build --release --locked -p qumbra-wallet
 
       - name: Build the pool — RandomX, same constraint as the node
