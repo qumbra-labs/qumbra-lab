@@ -290,6 +290,86 @@ void qmb_spent_supply_err(qmb_spent_t *s, const char *reason);
 int32_t qmb_spent_contains(const qmb_spent_t *s, const char *nf_hex);
 void qmb_spent_free(qmb_spent_t *s);
 
+/* ── the paired-prover session ─────────────────────────────────────────────
+ *
+ * A phone cannot prove a Qumbra spend: the consensus config needs a 15.1 GB
+ * working set (self-proving-vs-proof-size.md, branch (b)). So a phone SELECTS
+ * and SIGNS locally and hands the witness bundle to the user's own Mac —
+ * qumbra-wallet-macos's `qumbra-paired-prover`, specified in that repo's
+ * docs/mobile-paired-prover.md. This is the client half of that channel.
+ *
+ * The kernel owns the protocol; the shell owns the socket and nothing else.
+ * That split is not a preference:
+ *
+ *   - frame reassembly, the frame counters and the AAD are the security core,
+ *     and a copy per shell is a second place to get them wrong;
+ *   - the spec's client obligation is to "verify byte length and SHA3-256
+ *     before exact-byte submission", and Apple's CryptoKit has no SHA-3, so an
+ *     iOS shell CANNOT discharge it. A shell that cannot verify the artifact is
+ *     not the thing that should decide whether the artifact is the transaction;
+ *   - the pairing secret never crosses this boundary. It is read from the URI
+ *     inside qmb_pair_new and dropped with the session.
+ *
+ * The wire, transcribed from the server implementation rather than its prose:
+ *
+ *    URI        qumbra-prover://HOST:PORT?v=1&secret=<64 hex>
+ *    handshake  "QMBPAIR\0" || version:u8 || server_nonce:16   (25 B, plaintext)
+ *    key        SHA3-256("qumbra-wallet/paired-prover/key/v1\0"
+ *                        || secret || server_nonce)
+ *    frame      counter:u64le || ciphertext_len:u32le || ChaCha20-Poly1305
+ *    nonce      direction:4 || counter:u64le
+ *    aad        magic:8 || version:u8 || server_nonce:16 || direction:4
+ *                        || counter:u64le
+ *    direction  client->Mac "MOBI"    Mac->client "DESK"
+ *
+ * Drive it as a pump, exactly like qmb_scan_new / qmb_scan_step /
+ * qmb_scan_supply. Named rather than wildcarded ON PURPOSE: the header-vs-source
+ * test scans every line of this file, comments included, for a function-shaped
+ * token, so a trailing-asterisk wildcard reads to it as an undeclared function.
+ * It caught exactly that on this PR's first verify run — and then caught the
+ * explanation of the fix, which had spelled the bare prefix out loud. Write the
+ * names.
+ *
+ *    s = qmb_pair_new(uri, id, op, bundle, len, scan_url, node_url, &err);
+ *    connect to qmb_pair_endpoint(s);
+ *    loop {
+ *      switch (qmb_pair_step(s, &out, &out_len, &err)) {
+ *        case 1: write(out, out_len); qmb_dealloc(out, out_len); break;
+ *        case 2: n = read(buf); qmb_pair_supply(s, buf, n);      break;
+ *        case 0: tx = qmb_pair_take_artifact(s, &tx_len);        break;
+ *        default: show err;                                      break;
+ *      }
+ *      show qmb_pair_take_notes(s);   // REQUIRED — see below
+ *    }
+ *
+ * 🔴 A shell MUST surface qmb_pair_take_notes. Proving runs seconds to minutes
+ * and a silent minute reads as a hang; the same obligation the select pump's
+ * event contract carries, for the same reason.
+ *
+ * ⚠️ TIMEOUTS: the Mac's 30-second socket timeout covers HANDSHAKE I/O, not
+ * proving. A shell that applies a 30 s read timeout while waiting for
+ * artifact_chunk frames will abandon a healthy prover mid-proof.
+ *
+ * The witness bundle passed in carries SPENDING-KEY MATERIAL, and so does the
+ * pairing secret in the URI: both are spend authority for exactly the
+ * transaction they prove. operation is 0 = inspect (decode and describe; no
+ * proving, no endpoints needed) or 1 = prove (scan_url and node_url REQUIRED —
+ * the host re-validates against live anchors before allocating STARK work).
+ *
+ * The artifact from qmb_pair_take_artifact has ALREADY been checked against the
+ * length and the SHA3-256 the prover announced. */
+typedef struct qmb_pair_t qmb_pair_t;
+
+qmb_pair_t *qmb_pair_new(const char *uri, const char *request_id, uint8_t operation,
+                         const uint8_t *bundle, size_t bundle_len,
+                         const char *scan_url, const char *node_url, char **err_out);
+char *qmb_pair_endpoint(const qmb_pair_t *p);
+void qmb_pair_supply(qmb_pair_t *p, const uint8_t *bytes, size_t len);
+int32_t qmb_pair_step(qmb_pair_t *p, uint8_t **out, size_t *out_len, char **err_out);
+char *qmb_pair_take_notes(qmb_pair_t *p);
+uint8_t *qmb_pair_take_artifact(qmb_pair_t *p, size_t *out_len);
+void qmb_pair_free(qmb_pair_t *p);
+
 #ifdef __cplusplus
 }
 #endif

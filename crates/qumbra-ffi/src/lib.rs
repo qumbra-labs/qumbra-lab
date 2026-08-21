@@ -20,6 +20,7 @@
 //!   words, it never re-derives a verdict.
 
 pub mod events;
+pub mod pairing;
 pub mod report;
 
 use std::collections::VecDeque;
@@ -1947,7 +1948,7 @@ mod tests {
                 // Types, not functions — a closed list on purpose. Widening
                 // this to a prefix match would let an undeclared function slip
                 // through, which is the one thing this half of the test is for.
-                const TYPES: [&str; 5] = ["qmb_wallet_t", "qmb_fetch_fn", "qmb_scan_t", "qmb_select_t", "qmb_spent_t"];
+                const TYPES: [&str; 6] = ["qmb_wallet_t", "qmb_fetch_fn", "qmb_scan_t", "qmb_select_t", "qmb_spent_t", "qmb_pair_t"];
                 assert!(
                     exported.contains(&name.as_str()) || TYPES.contains(&name.as_str()),
                     "header declares `{name}` which lib.rs does not export"
@@ -2007,5 +2008,218 @@ mod tests {
         assert_eq!(crate::events::QMB_EVENT_TREE, 2);
         assert_eq!(crate::events::QMB_EVENT_WARNING, 3);
         assert_eq!(crate::events::QMB_EVENT_COINBASE_UNAVAILABLE, 4);
+    }
+}
+
+// ── the paired-prover session (see `pairing`) ────────────────────────────────
+//
+// The pump a shell drives to have one spend proved by the user's own Mac. Same
+// shape as `qmb_scan_*`: the kernel owns the protocol, the shell owns the
+// socket. Every reason this split falls here rather than in Swift/TS is in
+// `pairing.rs`'s header; the load-bearing one is that the client's stated
+// obligation is a SHA3-256 check and CryptoKit has no SHA-3.
+
+/// Open a session for one bundle. `uri` is the scanned `qumbra-prover://…`.
+///
+/// `scan_url`/`node_url` may be NULL for `operation = 0` (inspect) and are
+/// REQUIRED for `operation = 1` (prove). Returns NULL with the reason in
+/// `*err_out` — a bad pairing URI is the common case and it names itself.
+///
+/// # Safety
+/// `uri`/`request_id` are NUL-terminated UTF-8; `bundle` has `bundle_len` bytes;
+/// `err_out` is writable (or NULL).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_pair_new(
+    uri: *const c_char,
+    request_id: *const c_char,
+    operation: u8,
+    bundle: *const u8,
+    bundle_len: usize,
+    scan_url: *const c_char,
+    node_url: *const c_char,
+    err_out: *mut *mut c_char,
+) -> *mut pairing::Session {
+    if uri.is_null() || request_id.is_null() || bundle.is_null() {
+        set_err(err_out, "NULL argument".into());
+        return ptr::null_mut();
+    }
+    let as_str = |p: *const c_char| -> Option<String> {
+        if p.is_null() {
+            None
+        } else {
+            CStr::from_ptr(p).to_str().ok().map(str::to_string)
+        }
+    };
+    let Some(uri) = as_str(uri) else {
+        set_err(err_out, "pairing URI is not UTF-8".into());
+        return ptr::null_mut();
+    };
+    let Some(request_id) = as_str(request_id) else {
+        set_err(err_out, "request_id is not UTF-8".into());
+        return ptr::null_mut();
+    };
+    let operation = match operation {
+        0 => pairing::Operation::Inspect,
+        1 => pairing::Operation::Prove,
+        other => {
+            set_err(err_out, format!("operation {other} is not inspect(0) or prove(1)"));
+            return ptr::null_mut();
+        }
+    };
+    let bundle = std::slice::from_raw_parts(bundle, bundle_len);
+    match pairing::Session::new(
+        &uri,
+        &request_id,
+        operation,
+        bundle,
+        as_str(scan_url).as_deref(),
+        as_str(node_url).as_deref(),
+    ) {
+        Ok(session) => Box::into_raw(Box::new(session)),
+        Err(reason) => {
+            set_err(err_out, reason);
+            ptr::null_mut()
+        }
+    }
+}
+
+/// `host:port` to connect to — parsed from the URI by the kernel, so no shell
+/// re-parses it and the secret never crosses this boundary at all.
+///
+/// # Safety
+/// `p` is a live session from [`qmb_pair_new`].
+#[no_mangle]
+pub unsafe extern "C" fn qmb_pair_endpoint(p: *const pairing::Session) -> *mut c_char {
+    if p.is_null() {
+        return ptr::null_mut();
+    }
+    out_string((*p).endpoint())
+}
+
+/// Hand the session whatever the socket produced — any length, including a
+/// partial frame. TCP splits and coalesces; the reassembly is on this side.
+///
+/// # Safety
+/// `p` live; `bytes` has `len` bytes (or `len` is 0).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_pair_supply(p: *mut pairing::Session, bytes: *const u8, len: usize) {
+    if p.is_null() {
+        return;
+    }
+    if bytes.is_null() || len == 0 {
+        return;
+    }
+    (*p).supply(std::slice::from_raw_parts(bytes, len));
+}
+
+/// Advance the session.
+///
+/// ```text
+///   1  SEND: write *out (*out_len bytes) to the socket, qmb_dealloc it, step again
+///   2  NEED: read from the socket, qmb_pair_supply it, step again
+///   0  DONE: take the transaction bytes with qmb_pair_take_artifact
+///  -2  FAILED by name: the reason is in *err_out (qmb_string_free)
+///  -1  NULL/invalid call
+/// ```
+///
+/// 🔴 A shell MUST show the narration `qmb_pair_take_notes` returns. Proving runs
+/// seconds to minutes and a silent minute reads as a hang — the same obligation
+/// the select pump's event contract states, for the same reason.
+///
+/// # Safety
+/// `p` live; `out`, `out_len`, `err_out` writable (or NULL for `err_out`).
+#[no_mangle]
+pub unsafe extern "C" fn qmb_pair_step(
+    p: *mut pairing::Session,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    if p.is_null() || out.is_null() || out_len.is_null() {
+        return -1;
+    }
+    *out = ptr::null_mut();
+    *out_len = 0;
+    match (*p).step() {
+        pairing::Step::Send(frame) => {
+            *out_len = frame.len();
+            *out = Box::into_raw(frame.into_boxed_slice()) as *mut u8;
+            1
+        }
+        pairing::Step::Need => 2,
+        pairing::Step::Done => 0,
+        pairing::Step::Failed(reason) => {
+            set_err(err_out, reason);
+            -2
+        }
+    }
+}
+
+/// The narration since the last call, as one UTF-8 text per line. NULL when
+/// there is none — never an empty string, so "nothing to say" and "said
+/// nothing" stay distinguishable.
+///
+/// # Safety
+/// `p` is a live session.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_pair_take_notes(p: *mut pairing::Session) -> *mut c_char {
+    if p.is_null() {
+        return ptr::null_mut();
+    }
+    let notes = (*p).take_notes();
+    if notes.is_empty() {
+        return ptr::null_mut();
+    }
+    let lines: Vec<String> = notes
+        .into_iter()
+        .map(|note| match note {
+            pairing::Note::Preflight => "checking anchors and nullifiers".to_string(),
+            pairing::Note::Progress(text) => text,
+            pairing::Note::Inspected(json) => json,
+            pairing::Note::ArtifactStart { bytes, chunks } => {
+                format!("receiving {bytes} bytes in {chunks} chunks")
+            }
+        })
+        .collect();
+    out_string(lines.join("\n"))
+}
+
+/// The transaction bytes, once [`qmb_pair_step`] returned 0.
+///
+/// 🔴 These bytes have already been checked against the length AND the SHA3-256
+/// the prover announced — that is this module's whole reason for existing on the
+/// ABI. Release with `qmb_dealloc(p, len)`. NULL with `*out_len = 0` when the
+/// operation was an inspect, or when they have already been taken.
+///
+/// # Safety
+/// `p` live; `out_len` writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_pair_take_artifact(
+    p: *mut pairing::Session,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if p.is_null() || out_len.is_null() {
+        return ptr::null_mut();
+    }
+    match (*p).take_artifact() {
+        Some(bytes) => {
+            *out_len = bytes.len();
+            Box::into_raw(bytes.into_boxed_slice()) as *mut u8
+        }
+        None => {
+            *out_len = 0;
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Drop the session. The pairing secret and the session key go with it.
+///
+/// # Safety
+/// `p` came from [`qmb_pair_new`] and is not used afterwards.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_pair_free(p: *mut pairing::Session) {
+    if !p.is_null() {
+        drop(Box::from_raw(p));
     }
 }
