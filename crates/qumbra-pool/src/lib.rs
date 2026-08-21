@@ -34,12 +34,11 @@
 //! Three T2 blocks (607, 610, 611) paid the node's
 //! [`payee::UNCONFIGURED_NODE_RKM`] placeholder — structurally valid,
 //! spendable by nobody. `coinbase_rkm` is committed by the header the
-//! miner grinds, so a payee cannot be substituted after a share arrives;
-//! the pool's only structural defence is refusal. [`payee::check_payee`]
-//! defines the accepted set (the configured `payout_rkm`, or an rkm owned
-//! by a login this pool knows) and it is enforced twice: at template
-//! intake, before a miner spends a hash, and again immediately before the
-//! block POST as a backstop.
+//! miner grinds, so lab #553 sends [`payee::assemble_coinbase`]'s list in
+//! the template request before issuing work. [`payee::check_payee`] defines
+//! the accepted set (the configured `payout_rkm`, or an rkm owned by a login
+//! this pool knows) and remains enforced at template intake and immediately
+//! before the block POST.
 //!
 //! Mapping authority: `docs/pool-stratum-mapping.md`. Tracker: lab #482.
 //! Multica: QUM-136.

@@ -154,11 +154,9 @@ impl Pool {
         }
         // The payee gate at the earliest point it can run (lab #547). No
         // account is registered and no session exists yet, so the only
-        // payee acceptable here is `pool_rkm` itself — which is the honest
-        // bar: on today's node RPC the template's payee is the node's own
-        // `miner_rkm`, so a pool whose node pays somewhere else can never
-        // submit a block it owns, and should say so at startup rather than
-        // discover it on a block find.
+        // payee acceptable here is `pool_rkm` itself. The first live template
+        // is explicitly requested for that key before any account/session can
+        // exist; a source that instead returns an unowned body is unsound.
         if let Some(body) = source.current().body.as_ref() {
             check_body_payee(body, pool_rkm, &Accounts::default(), std::iter::empty())
                 .map_err(PoolError::Payee)?;
@@ -242,6 +240,19 @@ impl Pool {
         let g = self.inner.lock().expect("pool mutex");
         let t = g.source.current();
         assemble_coinbase(t.form, t.header.height, &g.pplns, &g.accounts, g.pool_rkm)
+            .map_err(PoolError::Assemble)
+    }
+
+    /// Assemble for node-reported candidate facts. A live poll must use these
+    /// rather than the cached template height: immediately after the tip moves,
+    /// that cache still describes the preceding candidate.
+    pub fn assemble_for(
+        &self,
+        form: qlab_devnet::forms::GenesisForm,
+        height: u64,
+    ) -> Result<AssembledCoinbase, PoolError> {
+        let g = self.inner.lock().expect("pool mutex");
+        assemble_coinbase(form, height, &g.pplns, &g.accounts, g.pool_rkm)
             .map_err(PoolError::Assemble)
     }
 
@@ -921,8 +932,10 @@ mod tests {
 
     fn body(coinbase_rkm: [u64; 4]) -> TemplateBody {
         TemplateBody {
-            coinbase: 5_000,
-            coinbase_rkm,
+            coinbase_payees: vec![qlab_devnet::body::CoinbasePayee {
+                rkm: coinbase_rkm,
+                amount: 5_000,
+            }],
             txs: Vec::new(),
         }
     }
@@ -974,7 +987,7 @@ mod tests {
             self.payees
                 .lock()
                 .expect("recorder")
-                .push(body.coinbase_rkm);
+                .extend(body.coinbase_payees.iter().map(|p| p.rkm));
             Ok("accepted".into())
         }
     }
@@ -1481,11 +1494,8 @@ mod tests {
         assert!(!pool.is_unavailable());
     }
 
-    /// A registered miner's rkm is accepted — the branch that is dead on
-    /// today's node RPC (the template's payee is always the node's own
-    /// `miner_rkm`) and becomes live the moment the node accepts a
-    /// requested payee. Kept, and kept tested, because that is the whole
-    /// point of the custody-free path.
+    /// A registered miner's rkm is accepted through the #553 requested-payee
+    /// path; this is the custody-free branch rather than a guard-only fixture.
     #[test]
     fn a_registered_miners_payee_is_submitted() {
         let pool = Pool::new(

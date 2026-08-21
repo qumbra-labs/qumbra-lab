@@ -28,7 +28,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
-use qlab_devnet::body::{validate_body, BlockBody, BodyError, TxEntry};
+use qlab_devnet::body::{
+    check_scheduled_coinbase_payees, validate_body, BlockBody, BodyError, CoinbasePayee, TxEntry,
+};
 use qlab_devnet::chain::{ChainState, FinalizeMarkError, InsertError};
 use qlab_devnet::committee::{Checkpoint, CommitteeState, MemberStatus, Validator, Vote};
 use qlab_devnet::ebbflow::{
@@ -1889,7 +1891,49 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// verbatim — a second assembly is a consensus-adjacent fork.
     pub fn assemble_block(&mut self) -> Option<AssembledCandidate> {
         let parent_hash = self.mining_parent_hash()?;
-        self.assemble_on_parent(parent_hash)
+        self.assemble_on_parent(parent_hash, self.miner_rkm)
+    }
+
+    /// Form and height of the candidate [`Self::assemble_block`] would build,
+    /// without assembling a body or advancing the mining clock. The pool uses
+    /// this once at startup so its first template request carries a real payee
+    /// list; there is no payee-free compatibility request.
+    pub fn mine_template_context(&mut self) -> Option<(GenesisForm, u64)> {
+        let parent_hash = self.mining_parent_hash()?;
+        let parent = self.chain.header(&parent_hash)?;
+        Some((self.rules.form, parent.height + 1))
+    }
+
+    /// Assemble the same candidate as [`Self::assemble_block`], but pay the
+    /// caller-provided coinbase list (lab #553). The list is chosen before the
+    /// header is issued because the body commitment is in the hashing blob.
+    pub fn assemble_block_for_payees(
+        &mut self,
+        payees: &[CoinbasePayee],
+    ) -> Result<Option<AssembledCandidate>, String> {
+        let Some(parent_hash) = self.mining_parent_hash() else {
+            return Ok(None);
+        };
+        let parent = self.chain.header(&parent_hash).ok_or_else(|| "assemble-parent-unknown".to_string())?;
+        let height = parent.height + 1;
+        if payees.len() != 1 {
+            return Err(format!("coinbase-payee-count: got {}, want 1 at the current cap", payees.len()));
+        }
+        let payee = payees[0];
+        if payee.rkm == [0; 4] {
+            return Err("coinbase-payee-zero-rkm".into());
+        }
+        match self.rules.form {
+            GenesisForm::V5 => check_scheduled_coinbase_payees(height, payees)
+                .map_err(|e| format!("coinbase-payees: {e:?}"))?,
+            GenesisForm::V4 => {
+                let expected = qlab_node::emission::coinbase_for(GenesisForm::V4, height);
+                if payee.amount != expected {
+                    return Err(format!("coinbase-payee-amount: height {height} expected {expected}, got {}", payee.amount));
+                }
+            }
+        }
+        Ok(self.assemble_on_parent(parent_hash, payee.rkm))
     }
 
     /// Assemble + mine (but do NOT insert) the next block over the current tip.
@@ -1985,7 +2029,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// while fork choice is elsewhere, and the header's height is the only one
     /// consensus reads.
     fn mine_on_parent(&mut self, parent_hash: Hash32) -> Option<(BlockHeader, BlockBody)> {
-        let assembled = self.assemble_on_parent(parent_hash)?;
+        let assembled = self.assemble_on_parent(parent_hash, self.miner_rkm)?;
         let mined = mine_under(
             &self.pow,
             assembled.header,
@@ -1999,9 +2043,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> NodeAdapter<P, V> {
     /// The node's own `mine_on_parent` assembly, WITHOUT grinding. Lab #511
     /// STOP-POINT: this is the same mempool / timestamp / difficulty / seed
     /// path as a self-mined block. A fork here is a consensus-adjacent fork.
-    fn assemble_on_parent(&mut self, parent_hash: Hash32) -> Option<AssembledCandidate> {
-        let template =
-            self.mempool.assemble(&self.state, SOAK_EFFECTIVE_MEDIAN, self.miner_rkm);
+    fn assemble_on_parent(&mut self, parent_hash: Hash32, coinbase_rkm: [u64; 4]) -> Option<AssembledCandidate> {
+        let template = self.mempool.assemble(&self.state, SOAK_EFFECTIVE_MEDIAN, coinbase_rkm);
         let body = template.body;
         let parent = *self.chain.header(&parent_hash)?;
         let candidate_height = parent.height + 1;
@@ -6925,6 +6968,36 @@ mod tests {
         assert_eq!(peer.chain().tip_hash(), id, "the peer adopted the v5 identity");
         assert_eq!(peer.chain().tip_hash(), miner.chain().tip_hash());
         assert_eq!(peer.chain().tip_height(), 1);
+    }
+
+    /// Lab #553 acceptance: parameterising the RPC assembly path must not move
+    /// one byte of the node's own mining candidate.
+    #[test]
+    fn own_mining_candidate_is_byte_identical_to_its_parameterised_sibling() {
+        use qlab_devnet::forms::{ChainRules, GenesisForm};
+        let payout = [0xA1, 0xA2, 0xA3, 0xA4];
+        let mk = || {
+            let (cstate, _v) = committee7();
+            let mut a = NodeAdapter::new(cstate, KeccakPow, MockVerifier, sim());
+            a.set_chain_rules(ChainRules { form: GenesisForm::V5, halt: RuleSchedule::V1_0 });
+            a.set_miner_rkm(payout);
+            a
+        };
+        let mut native_node = mk();
+        let mut requested_node = mk();
+        let native = native_node.assemble_block().expect("native candidate");
+        let requested = requested_node
+            .assemble_block_for_payees(&native.body.coinbase_payees())
+            .expect("valid requested payee list")
+            .expect("requested candidate");
+        assert_eq!(requested.form, native.form);
+        assert_eq!(requested.header, native.header);
+        assert_eq!(requested.seed_hash, native.seed_hash);
+        assert_eq!(requested.next_seed_hash, native.next_seed_hash);
+        assert_eq!(requested.body.coinbase, native.body.coinbase);
+        assert_eq!(requested.body.coinbase_rkm, native.body.coinbase_rkm);
+        assert_eq!(requested.body.txs.len(), native.body.txs.len());
+        assert_eq!(requested.body.commitment_v5(), native.body.commitment_v5());
     }
 
     /// The extended install-before-run invariant: re-keying an adapter whose

@@ -57,8 +57,8 @@ use crate::discovery_server::{
     TxSubmitOutcome, MAX_QUEUED_SUBMITS,
 };
 use crate::mine_rpc::{
-    outcome_from_ingest, BlockSubmitOutcome, BlockSubmitRequest, MineServing, MineTemplateWire,
-    TemplateRequest,
+    outcome_from_ingest, BlockSubmitOutcome, BlockSubmitRequest, MineServing,
+    MineTemplateContextWire, MineTemplateWire, TemplateContextRequest, TemplateRequest,
 };
 use crate::looptime::{LoopJournal, LoopPhases};
 use crate::metrics_server::MetricsServer;
@@ -342,6 +342,7 @@ pub fn preflight(config: &NodeConfig, genesis: &GenesisFile) -> Result<Preflight
 struct CachedMineTemplate {
     tip: qlab_devnet::header::Hash32,
     mempool_len: usize,
+    payees: Vec<qlab_devnet::body::CoinbasePayee>,
     wire: MineTemplateWire,
 }
 
@@ -442,12 +443,13 @@ pub struct RunningNode<P: PowEngine, V: TxVerifier + Clone> {
     /// `None` until the discovery endpoint starts. The config gate lives in
     /// [`Self::template_serving`]; a disabled gate still owns the channels so
     /// the handler can answer UNAVAILABLE without a 404.
+    context_rx: Option<std::sync::mpsc::Receiver<TemplateContextRequest>>,
     template_rx: Option<std::sync::mpsc::Receiver<TemplateRequest>>,
     block_rx: Option<std::sync::mpsc::Receiver<BlockSubmitRequest>>,
     /// Config gate for the two mine routes. Off by default.
     template_serving: bool,
-    /// Last assembled template, keyed on tip + mempool length so a poll
-    /// does not advance the deterministic mining clock.
+    /// Last assembled template, keyed on tip + mempool length + requested
+    /// payees. The third key prevents one miner receiving another's payout.
     cached_mine_template: Option<CachedMineTemplate>,
     /// Incremental scheduled-issuance accounting. Rebuilt once from the persisted
     /// canonical bodies at startup, then advanced only for new heights.
@@ -916,6 +918,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
             anchors_view: Arc::new(Mutex::new(Arc::new(AnchorsView::default()))),
             anchors_sig: None,
             submit_rx: None,
+            context_rx: None,
             template_rx: None,
             block_rx: None,
             template_serving: config.template_serving,
@@ -1928,10 +1931,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         // The submit rendezvous (issue #275): the server holds the sender, this
         // loop drains the receiver once per iteration.
         let (submit_tx, submit_rx) = std::sync::mpsc::sync_channel(MAX_QUEUED_SUBMITS);
+        let (context_tx, context_rx) = std::sync::mpsc::sync_channel(MAX_QUEUED_SUBMITS);
         let (template_tx, template_rx) = std::sync::mpsc::sync_channel(MAX_QUEUED_SUBMITS);
         let (block_tx, block_rx) = std::sync::mpsc::sync_channel(MAX_QUEUED_SUBMITS);
         let mine = MineServing {
             enabled: self.template_serving,
+            contexts: context_tx,
             templates: template_tx,
             blocks: block_tx,
         };
@@ -1946,6 +1951,7 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         let bound = srv.addr();
         self.discovery_server = Some(srv);
         self.submit_rx = Some(submit_rx);
+        self.context_rx = Some(context_rx);
         self.template_rx = Some(template_rx);
         self.block_rx = Some(block_rx);
         Ok(bound)
@@ -2128,11 +2134,18 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
     /// queues cost two `try_recv`s.
     pub fn drain_mine_rpc(&mut self) {
         loop {
+            let req = match self.context_rx.as_ref().map(|rx| rx.try_recv()) {
+                Some(Ok(req)) => req,
+                _ => break,
+            };
+            let _ = req.reply.try_send(self.serve_mine_template_context());
+        }
+        loop {
             let req = match self.template_rx.as_ref().map(|rx| rx.try_recv()) {
                 Some(Ok(req)) => req,
                 _ => break,
             };
-            let _ = req.reply.try_send(self.serve_mine_template());
+            let _ = req.reply.try_send(self.serve_mine_template(&req.payees));
         }
         loop {
             let req = match self.block_rx.as_ref().map(|rx| rx.try_recv()) {
@@ -2144,26 +2157,36 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         }
     }
 
-    fn serve_mine_template(&mut self) -> Result<MineTemplateWire, String> {
+    fn serve_mine_template_context(&mut self) -> Result<MineTemplateContextWire, String> {
+        if !self.template_serving {
+            return Err("template-serving-disabled".into());
+        }
+        let (form, height) = self.p2p.node_mut().mine_template_context()
+            .ok_or_else(|| "assemble-unavailable".to_string())?;
+        Ok(MineTemplateContextWire { form: crate::mine_rpc::form_token(form), height })
+    }
+
+    fn serve_mine_template(&mut self, payees: &[qlab_devnet::body::CoinbasePayee]) -> Result<MineTemplateWire, String> {
         if !self.template_serving {
             return Err("template-serving-disabled".into());
         }
         let tip = self.p2p.node().tip_hash();
         let mempool_len = self.p2p.node().mempool().len();
         if let Some(cached) = &self.cached_mine_template {
-            if cached.tip == tip && cached.mempool_len == mempool_len {
+            if cached.tip == tip && cached.mempool_len == mempool_len && cached.payees == payees {
                 return Ok(cached.wire.clone());
             }
         }
         let assembled = self
             .p2p
             .node_mut()
-            .assemble_block()
+            .assemble_block_for_payees(payees)?
             .ok_or_else(|| "assemble-unavailable".to_string())?;
         let wire = MineTemplateWire::from_candidate(&assembled);
         self.cached_mine_template = Some(CachedMineTemplate {
             tip,
             mempool_len,
+            payees: payees.to_vec(),
             wire: wire.clone(),
         });
         Ok(wire)
@@ -6340,7 +6363,7 @@ mod tests {
         let served = t.to_bytes();
         assert_eq!(served[0], qlab_node::RPC_VERSION);
         let (version, decoded) = qlab_node::Telemetry::from_bytes_compat(&served).unwrap();
-        assert_eq!(version, 0x06, "the current wire (lab #367 burned-tail bump)");
+        assert_eq!(version, 0x07, "the current wire (lab #553 mine-payee bump)");
         assert_eq!(decoded, t);
         assert_eq!(decoded.durable, t.durable);
         assert_eq!(

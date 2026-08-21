@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use qumbra_pool::config::PoolConfig;
 use qumbra_pool::endpoint::serve;
-use qumbra_pool::{ConnGuard, JobOutbox, Pool, TemplateWatch};
+use qumbra_pool::{assemble_coinbase, Accounts, ConnGuard, JobOutbox, NodeRpcClient,
+    PplnsWindow, Pool, TemplateWatch};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -125,7 +126,17 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
     let guard = Arc::new(ConnGuard::new(cfg.listen_limits()));
     #[cfg(feature = "randomx")]
     let pool = if let Some(url) = cfg.node_rpc.clone() {
-        let live = qumbra_pool::NodeRpcTemplateSource::connect(&url)?;
+        // Learn only form/height, then make the first template request with an
+        // explicit pool-owned payee list. No payee-free template shim exists.
+        let context = NodeRpcClient::parse(&url)?.fetch_context()?;
+        let initial_payees = assemble_coinbase(
+            context.form,
+            context.height,
+            &PplnsWindow::default(),
+            &Accounts::default(),
+            payout_rkm,
+        )?.payees();
+        let live = qumbra_pool::NodeRpcTemplateSource::connect(&url, &initial_payees)?;
         let client = live.client();
         let initial = live.snapshot();
         let form = initial.form;
@@ -149,7 +160,12 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
         std::thread::spawn(move || {
             while !stop_poll.load(Ordering::SeqCst) {
                 std::thread::sleep(poll);
-                match live.poll() {
+                let polled = live.client().fetch_context()
+                    .and_then(|context| pool_poll
+                        .assemble_for(context.form, context.height)
+                        .map_err(|e| e.to_string()))
+                    .and_then(|coinbase| live.poll(&coinbase.payees()));
+                match polled {
                     Ok(changed) => {
                         let recovering = pool_poll.is_unavailable();
                         watch_poll.record_ok();

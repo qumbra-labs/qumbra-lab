@@ -1,10 +1,13 @@
 //! Mine-template / block-submit RPC (lab #511, launch gate G4).
 //!
-//! Two additive routes on the discovery listener (pure route addition — no
-//! `RPC_VERSION` bump, house rule at PR #315):
+//! Mine routes on the discovery listener. Lab #553 changes the existing
+//! template/block JSON bodies to carry a payee list, so this surface moves with
+//! the corresponding `RPC_VERSION` bump (house rule at PR #315):
 //!
+//! - `GET /v1/mine/context` — form + next candidate height, so a pool can
+//!   assemble its first payee list without a payee-free template request.
 //! - `GET /v1/mine/template` — the unground candidate [`NodeAdapter::assemble_block`]
-//!   produces (the `mine_on_parent` assembly path without `mine_under`).
+//!   produces for the required `payee=<rkm>:<amount>` query list.
 //! - `POST /v1/mine/block` — a completed header+body through
 //!   [`P2pNode::announce_block_named`] (the own-mined ingest path, refusals named).
 //!
@@ -14,7 +17,7 @@
 
 use std::sync::mpsc;
 
-use qlab_devnet::body::BlockBody;
+use qlab_devnet::body::{BlockBody, CoinbasePayee, COINBASE_PAYEE_CAP_V5};
 use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::header::BlockHeader;
 use qlab_p2p::adapter::AssembledCandidate;
@@ -26,6 +29,8 @@ use crate::genesis::{hex_decode, hex_encode};
 
 /// `GET /v1/mine/template`.
 pub const MINE_TEMPLATE_PATH: &str = "/v1/mine/template";
+/// `GET /v1/mine/context`.
+pub const MINE_CONTEXT_PATH: &str = "/v1/mine/context";
 /// `POST /v1/mine/block`.
 pub const MINE_BLOCK_PATH: &str = "/v1/mine/block";
 
@@ -37,7 +42,12 @@ pub const MINE_VERDICT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 
 /// One `GET /v1/mine/template` handed to the run loop.
 pub struct TemplateRequest {
+    pub payees: Vec<CoinbasePayee>,
     pub reply: mpsc::SyncSender<Result<MineTemplateWire, String>>,
+}
+
+pub struct TemplateContextRequest {
+    pub reply: mpsc::SyncSender<Result<MineTemplateContextWire, String>>,
 }
 
 /// One `POST /v1/mine/block` handed to the run loop (already decoded).
@@ -69,8 +79,7 @@ pub struct MineTemplateWire {
     pub tx_body_commitment: String,
     pub seed_hash: String,
     pub next_seed_hash: Option<String>,
-    pub coinbase: u64,
-    pub coinbase_rkm: String,
+    pub coinbase_payees: Vec<CoinbasePayeeWire>,
     pub txs: Vec<String>,
 }
 
@@ -79,15 +88,27 @@ pub struct MineTemplateWire {
 pub struct MineBlockWire {
     pub form: String,
     pub header: String,
-    pub coinbase: u64,
-    pub coinbase_rkm: String,
+    pub coinbase_payees: Vec<CoinbasePayeeWire>,
     pub txs: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoinbasePayeeWire {
+    pub rkm: String,
+    pub amount: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MineTemplateContextWire {
+    pub form: String,
+    pub height: u64,
 }
 
 /// Channels the discovery server uses to reach the run loop.
 #[derive(Clone)]
 pub struct MineServing {
     pub enabled: bool,
+    pub contexts: mpsc::SyncSender<TemplateContextRequest>,
     pub templates: mpsc::SyncSender<TemplateRequest>,
     pub blocks: mpsc::SyncSender<BlockSubmitRequest>,
 }
@@ -104,8 +125,7 @@ impl MineTemplateWire {
             tx_body_commitment: hex_encode(&c.header.tx_body_commitment),
             seed_hash: hex_encode(&c.seed_hash),
             next_seed_hash: c.next_seed_hash.map(|h| hex_encode(&h)),
-            coinbase: c.body.coinbase,
-            coinbase_rkm: rkm_hex(&c.body.coinbase_rkm),
+            coinbase_payees: payees_to_wire(&c.body.coinbase_payees()),
             txs: c.body.txs.iter().map(|tx| hex_encode(&encode_tx(tx))).collect(),
         }
     }
@@ -116,7 +136,10 @@ impl MineBlockWire {
         let form = parse_form(&self.form)?;
         let header_bytes = hex_decode(&self.header).ok_or_else(|| "header: bad hex".to_string())?;
         let header = decode_header(form, &header_bytes).map_err(|e| format!("header: {e:?}"))?;
-        let coinbase_rkm = rkm_from_hex(&self.coinbase_rkm)?;
+        let payees = payees_from_wire(&self.coinbase_payees)?;
+        if payees.len() != 1 {
+            return Err(format!("coinbase_payees: got {}, want 1 at the current cap", payees.len()));
+        }
         let mut txs = Vec::with_capacity(self.txs.len());
         for (i, t) in self.txs.iter().enumerate() {
             let bytes = hex_decode(t).ok_or_else(|| format!("tx[{i}]: bad hex"))?;
@@ -128,11 +151,47 @@ impl MineBlockWire {
             header,
             BlockBody {
                 txs,
-                coinbase: self.coinbase,
-                coinbase_rkm,
+                coinbase: payees[0].amount,
+                coinbase_rkm: payees[0].rkm,
             },
         ))
     }
+}
+
+pub fn payees_to_wire(payees: &[CoinbasePayee]) -> Vec<CoinbasePayeeWire> {
+    payees.iter().map(|p| CoinbasePayeeWire { rkm: rkm_hex(&p.rkm), amount: p.amount }).collect()
+}
+
+pub fn payees_from_wire(payees: &[CoinbasePayeeWire]) -> Result<Vec<CoinbasePayee>, String> {
+    if payees.len() > COINBASE_PAYEE_CAP_V5 {
+        return Err(format!("coinbase_payees: got {}, cap {}", payees.len(), COINBASE_PAYEE_CAP_V5));
+    }
+    payees.iter().enumerate().map(|(i, p)| Ok(CoinbasePayee {
+        rkm: rkm_from_hex(&p.rkm).map_err(|e| format!("coinbase_payees[{i}]: {e}"))?,
+        amount: p.amount,
+    })).collect()
+}
+
+/// Strict repeated-field grammar: `payee=<64-hex-rkm>:<u64-amount>`.
+pub fn payees_from_query(query: &str) -> Result<Vec<CoinbasePayee>, String> {
+    if query.is_empty() {
+        return Err("missing payee list".into());
+    }
+    let mut payees = Vec::new();
+    for field in query.split('&') {
+        let Some(value) = field.strip_prefix("payee=") else {
+            return Err(format!("unknown template query field `{field}`"));
+        };
+        let (rkm, amount) = value.split_once(':')
+            .ok_or_else(|| "payee: want <64-hex-rkm>:<u64-amount>".to_string())?;
+        let amount = amount.parse::<u64>()
+            .map_err(|_| format!("payee amount `{amount}` is not u64"))?;
+        payees.push(CoinbasePayee { rkm: rkm_from_hex(rkm)?, amount });
+    }
+    if payees.len() > COINBASE_PAYEE_CAP_V5 {
+        return Err(format!("coinbase payee count {} exceeds cap {}", payees.len(), COINBASE_PAYEE_CAP_V5));
+    }
+    Ok(payees)
 }
 
 /// Map the own-mined ingest outcome onto the HTTP vocabulary.
@@ -237,8 +296,7 @@ mod tests {
         let wire = MineBlockWire {
             form: "v5".into(),
             header: header_hex(GenesisForm::V5, &header),
-            coinbase: body.coinbase,
-            coinbase_rkm: rkm_hex(&body.coinbase_rkm),
+            coinbase_payees: payees_to_wire(&body.coinbase_payees()),
             txs: vec![],
         };
         let json = serde_json::to_string(&wire).unwrap();
@@ -249,6 +307,16 @@ mod tests {
         assert_eq!(b.coinbase, body.coinbase);
         assert_eq!(b.coinbase_rkm, body.coinbase_rkm);
         assert!(b.txs.is_empty());
+    }
+
+    #[test]
+    fn template_query_is_a_strict_ordered_payee_list() {
+        let query = format!("payee={}:41", rkm_hex(&[1, 2, 3, 4]));
+        assert_eq!(payees_from_query(&query).unwrap(), vec![CoinbasePayee {
+            rkm: [1, 2, 3, 4], amount: 41,
+        }]);
+        assert!(payees_from_query("").unwrap_err().contains("missing payee list"));
+        assert!(payees_from_query("other=x").unwrap_err().contains("unknown"));
     }
 
     #[test]
