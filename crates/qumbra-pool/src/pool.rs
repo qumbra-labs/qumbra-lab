@@ -22,7 +22,9 @@ use crate::accounting::{Ledger, ShareRecord, ShareStatus};
 use crate::hasher::{FixedHasher, ShareHasher};
 use crate::hexutil;
 use crate::jobs::{ExtraNonceAllocator, IssuedJob, JobStore};
-use crate::payee::{assemble_coinbase, Accounts, AssembleError, AssembledCoinbase};
+use crate::payee::{
+    assemble_coinbase, check_body_payee, Accounts, AssembleError, AssembledCoinbase, PayeeRefusal,
+};
 use crate::pplns::{PplnsWindow, WindowShare};
 use crate::share::{is_block_candidate, share_meets_target};
 use crate::template::{
@@ -66,6 +68,11 @@ pub enum PoolError {
     Template(TemplateError),
     Target(String),
     Assemble(AssembleError),
+    /// The template names a payee this pool will not let reach the chain
+    /// (lab #547). At construction this refuses startup: a service that
+    /// cannot name a spendable coinbase must refuse before accepting
+    /// miners, exactly as `payout_rkm` already does.
+    Payee(PayeeRefusal),
 }
 
 impl std::fmt::Display for PoolError {
@@ -75,6 +82,7 @@ impl std::fmt::Display for PoolError {
             PoolError::Template(e) => write!(f, "template: {e}"),
             PoolError::Target(s) => write!(f, "target: {s}"),
             PoolError::Assemble(e) => write!(f, "assemble: {e}"),
+            PoolError::Payee(e) => write!(f, "template payee: {e}"),
         }
     }
 }
@@ -143,6 +151,17 @@ impl Pool {
         }
         if pool_rkm == [0u64; 4] {
             return Err(PoolError::Assemble(AssembleError::ZeroPoolRkm));
+        }
+        // The payee gate at the earliest point it can run (lab #547). No
+        // account is registered and no session exists yet, so the only
+        // payee acceptable here is `pool_rkm` itself — which is the honest
+        // bar: on today's node RPC the template's payee is the node's own
+        // `miner_rkm`, so a pool whose node pays somewhere else can never
+        // submit a block it owns, and should say so at startup rather than
+        // discover it on a block find.
+        if let Some(body) = source.current().body.as_ref() {
+            check_body_payee(body, pool_rkm, &Accounts::default(), std::iter::empty())
+                .map_err(PoolError::Payee)?;
         }
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -269,6 +288,22 @@ impl Pool {
         g.unavailable = None;
         g.jobs.mark_all_stale();
         let template = g.source.current();
+        // Refuse the *template*, not just the block (lab #547). Gating here
+        // rather than only at submit is the difference between impossible
+        // and expensive: no miner spends a hash on work whose payout we
+        // would have to throw away. Named-unavailable rather than an error
+        // so live sessions are told why and the poller recovers on its own
+        // when a sound template arrives.
+        if let Err(refusal) = payee_gate(&g, &template) {
+            let reason = format!("work-unavailable: {refusal}");
+            g.unavailable = Some(reason.clone());
+            let outbox = g.outbox.clone();
+            drop(g);
+            if let Some(outbox) = outbox {
+                outbox.unavailable_all(reason);
+            }
+            return Ok(Vec::new());
+        }
         if !template.serves_stock_xmrig() {
             return Ok(Vec::new());
         }
@@ -584,7 +619,34 @@ impl Pool {
         } else {
             None
         };
+        // The last gate before a payee becomes permanent (lab #547). The
+        // intake gate should already have refused this template, so this is
+        // the backstop for a body that reached a job by another route — a
+        // source swapped without `replace_template`, a future caller, a
+        // template mutated in place. It re-checks against the window as it
+        // stands now, which is the set `assemble_coinbase` would draw a
+        // winner from at this height.
+        let payee_refusal = pending_submit.as_ref().and_then(|(_, _, body, _)| {
+            let logins = known_logins(&g);
+            check_body_payee(
+                body,
+                g.pool_rkm,
+                &g.accounts,
+                logins.iter().map(|s| s.as_str()),
+            )
+            .err()
+        });
         drop(g);
+        if let Some(refusal) = payee_refusal {
+            // The share is valid and the miner did nothing wrong — it keeps
+            // the Accepted record and the PPLNS credit taken above. What we
+            // refuse is *our own* block, and we stop issuing work rather
+            // than repeat the refusal on every find against this template.
+            let reason = format!("work-unavailable: {refusal}");
+            eprintln!("pool block NOT submitted, payee refused: {refusal}");
+            self.suspend_work(reason);
+            return Ok(vec![Outgoing::Reply(StratumResponse::ok_status(rid, "OK"))]);
+        }
         if let Some((form, preimage, body, submitter)) = pending_submit {
             match submitter {
                 Some(sub) => match sub.submit_block(form, &preimage, &body) {
@@ -707,6 +769,38 @@ fn stale_followup(g: &mut Inner, sid: &str, rid: u64, msg: &str) -> Vec<Outgoing
             format!("{msg}; no-fresh-job"),
         ))],
     }
+}
+
+/// Every login this pool currently knows: live sessions plus the PPLNS
+/// window. A miner whose connection dropped is still a legitimate payee
+/// while its shares are in the window, which is exactly the set
+/// [`assemble_coinbase`] draws a winner from.
+fn known_logins(g: &Inner) -> Vec<String> {
+    let mut out: Vec<String> = g.sessions.values().map(|s| s.login.clone()).collect();
+    for (login, _) in g.pplns.weights() {
+        if !out.contains(&login) {
+            out.push(login);
+        }
+    }
+    out
+}
+
+/// The payee gate over a template (lab #547).
+///
+/// `body == None` is a static `[template]` file: a block-class share is
+/// logged and never POSTed (see [`Template::body`]), so no payee can reach
+/// the chain from it and there is nothing to refuse.
+fn payee_gate(g: &Inner, template: &Template) -> Result<(), PayeeRefusal> {
+    let Some(body) = template.body.as_ref() else {
+        return Ok(());
+    };
+    let logins = known_logins(g);
+    check_body_payee(
+        body,
+        g.pool_rkm,
+        &g.accounts,
+        logins.iter().map(|s| s.as_str()),
+    )
 }
 
 fn job_from_issued(issued: &IssuedJob) -> Job {
