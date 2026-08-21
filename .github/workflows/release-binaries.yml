@@ -23,13 +23,29 @@
 #   1. `workflow_dispatch` ONLY, gated on typing `confirm=release`. This file has
 #      no push trigger, no schedule, and must never grow one. (node-image.yml took
 #      the same shape for the same reason and its header says so.)
-#   2. The legs run **cheapest-first, each gating the next** (`needs:`). Linux is
-#      1x, Windows 2x, macOS 10x — so the order is linux → windows → macos, and a
-#      compile error, a drifted frozen digest or a dead genesis URL costs zero
-#      expensive minutes. It costs wall-clock instead, which is the cheap side of
-#      that trade. (Lab #478 added the Windows leg and put it here rather than in
-#      parallel with macOS for exactly this reason: parallel would mean a Windows
-#      compile error still burns a 10x macOS build.)
+#   2. **Linux gates everything expensive; Windows and macOS then run in parallel**
+#      (`needs:`). Linux is 1x, Windows 2x, macOS 10x. A compile error, a drifted
+#      frozen digest or a dead genesis URL is caught on the 1x leg and costs zero
+#      expensive minutes — that is the protection worth having, and it is the one
+#      that has actually fired.
+#
+#      Windows used to gate macOS as well (lab #478), on the reasoning that a
+#      Windows compile error would otherwise still burn a 10x macOS build. That
+#      ordering was retired on Larry's call, 2026-08-21, and the grounds are worth
+#      recording because they are a measurement rather than a preference: the
+#      Windows-specific failures we have actually paid for — the CRLF split in
+#      `mine.rs` (#542) and the hard-coded T1 `GENESIS_HASH` in the Windows CI
+#      workflow — are **platform-specific defects that Linux cannot catch**, so
+#      Windows-gates-macOS only helps when the defect is Windows-only, which is
+#      exactly when it is *least* correlated with macOS succeeding. Meanwhile it
+#      cost a full Windows leg of wall-clock on every green cut, which is all of
+#      them but a handful.
+#
+#      What we now accept: a Windows-only failure can burn one 10x macOS build.
+#      What we get back: one leg of wall-clock on every release. If Windows starts
+#      failing often enough that the macOS bill is noticeable, put the gate back —
+#      the trade is a frequency question, not a principle, and the frequency is
+#      the thing to re-measure before reverting.
 #   3. The secret and the publish target are checked in a FREE `preflight` job
 #      before a single expensive minute is spent. Discovering a missing PAT after
 #      three platform builds is the shape of waste this ordering exists to prevent.
@@ -512,11 +528,15 @@ jobs:
 
   macos:
     name: build macos-arm64
-    # Gated on the Linux legs AND the Windows leg. This is the 10x-billed leg, and
-    # every class of failure the cheaper legs can find — compile error,
-    # frozen-digest drift, an unreachable genesis URL, a build stamp that did not
-    # take — is a failure this leg would find too, later and more expensively.
-    needs: [preflight, linux, windows]
+    # Gated on the Linux legs, and deliberately NOT on the Windows leg — it runs
+    # beside Windows, not after it. This is the 10x-billed leg, and every class of
+    # failure the *Linux* legs can find — compile error, frozen-digest drift, an
+    # unreachable genesis URL, a build stamp that did not take — is a failure this
+    # leg would find too, later and more expensively. What Windows finds that Linux
+    # does not is Windows-specific by construction, and gating on it bought little
+    # while costing a full leg of wall-clock on every green cut. See the header,
+    # item 2, for the measurement behind that call.
+    needs: [preflight, linux]
     runs-on: macos-14
     timeout-minutes: 120
     env:
