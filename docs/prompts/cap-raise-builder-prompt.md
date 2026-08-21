@@ -63,13 +63,14 @@ every existing golden must still pass unchanged, exactly as #381 kept the v2 bod
 
 ### Decisions you must take a position on
 
-1. **N.** My recommendation is **8**, and I want your disagreement if you have grounds. Each payee is
+1. **N = 8. RULED by Larry 2026-08-22 01:29 +08** ("按你推荐的"), so this is a decision, not a
+   proposal. **I still want your disagreement if you have grounds** — a ruling taken on my reasoning
+   is only as good as my reasoning, and the constant is inert until activation, so a grounded
+   objection is cheap to act on and expensive to skip. Each payee is
    a real coinbase note — a derivation, a commitment, a leaf in the tree — so N multiplies coinbase
    tree growth and every light client's scan cost per block. 8 splits a small pool meaningfully at
    8× the coinbase leaf rate. It is **not** a Monero-scale pool's answer, and it does not need to be:
-   the cap is a maximum, and a pool pays `min(N, window winners)`. **N is trivially changed before
-   activation** — the constant is inert until the boundary — so pick the defensible number and say
-   why, do not agonise.
+   the cap is a maximum, and a pool pays `min(N, window winners)`.
 2. **The boundary height.** Far enough ahead that the image can be cut and all six hosts rolled with
    room to spare. Propose it with the current block rate in the arithmetic. **Do not set it in this
    PR if the roll timing is not yours to know** — the pins-unset precedent (`None` at merge, stamped
