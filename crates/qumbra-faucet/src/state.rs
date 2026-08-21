@@ -7,6 +7,7 @@
 //! | [`Availability::Ready`] | an anchored note (or pair) covers the outlay | queue it |
 //! | [`Availability::AwaitingFinality`] | notes held, none witnessable by the current anchor | queue it — it clears on the checkpoint cadence |
 //! | [`Availability::Maturing`] | coinbase is inside the frozen §2 144-block gate, and nothing already funded in can pay yet | queue it **only** if it matures inside the wait the queue would quote; otherwise refuse, naming the height |
+//! | [`Availability::Unharvested`] | no harvest pass has run, so this faucet has not looked at its own inventory | refuse — and say so; do NOT answer for the inventory |
 //! | [`Availability::ColdChain`] | nothing finalized, so no valid anchor exists | refuse |
 //! | [`Availability::Empty`] | nothing held that covers the outlay, and none coming | refuse |
 //!
@@ -93,6 +94,25 @@ pub enum Availability {
     /// faucet has not looked at the chain at all, and saying otherwise is the #296
     /// failure in a new place.
     Starting { replayed: u64, total: u64 },
+    /// **No harvest pass has run since this process started**, so the faucet has
+    /// not walked its own chain and cannot say what it holds or what is maturing
+    /// (lab #543).
+    ///
+    /// Distinct from every state below it, and the distinction is the whole point:
+    /// `Empty` means *looked, and there is nothing coming*. Before a pass there is
+    /// no basis for the second half. `main.rs` used to render the first status
+    /// snapshot between opening the node and the first tick, when `next_maturity`
+    /// was still `None` and `maturing` still `0` — the values a pass reports for a
+    /// faucet with no immature coinbase — so a faucet whose entire stock was inside
+    /// the §2 maturity gate published *"out of funds … the only refill is a coinbase
+    /// note"* to a live listener, and refused requests it would have queued one tick
+    /// later.
+    ///
+    /// The first sample is a whole tick now, so this state is not reached in the
+    /// binary as it stands. It is kept, named and refusing, because the way that
+    /// defect happened was a caller rendering before harvesting — and the type is
+    /// what stops the next one from spelling it as a zero.
+    Unharvested,
     /// Nothing is finalized, so there is no valid anchor and no proof can be bound.
     /// On a fresh net this is the cold start; the faucet may be fully funded.
     ColdChain,
@@ -115,6 +135,7 @@ impl Availability {
             // the chain yet. Queueing here would burn a ticket on a request it
             // has no basis to promise — the #310 shape.
             Availability::Starting { .. }
+            | Availability::Unharvested
             | Availability::ColdChain
             | Availability::Empty { .. } => false,
         }
@@ -136,6 +157,9 @@ impl Availability {
             // `None` makes the caller quote its one-block-interval default rather
             // than this state inventing a completion time it cannot keep.
             Availability::Starting { .. }
+            // One loop iteration, not a block count — and a state that publishes no
+            // number is exactly the point of it.
+            | Availability::Unharvested
             | Availability::ColdChain
             | Availability::Empty { .. } => None,
         }
@@ -206,6 +230,11 @@ impl Availability {
                      finalized anchor."
                 )
             }
+            Availability::Unharvested => "not answering yet — this faucet has not walked \
+                 its own chain since it started, so it cannot say what it holds or what is \
+                 maturing. It refuses rather than reporting an inventory it has not read; the \
+                 next loop pass settles it."
+                .to_string(),
             Availability::ColdChain => "the chain has finalized nothing yet, so no transaction \
                  anchor exists. The faucet may be funded and still unable to pay — a grant proof \
                  must be bound to a finalized commitment root."
@@ -284,22 +313,35 @@ pub struct ServiceStatus {
     /// Notes held (anchored or not).
     pub notes_held: usize,
     /// Coinbase notes this node mined that are not yet mature, so not yet funded in.
-    pub notes_maturing: usize,
+    ///
+    /// `None` until a harvest pass has produced the number (lab #543) — the #365
+    /// rule applied to the one figure that still published an unmeasured zero. It
+    /// renders as `UNAVAILABLE`, because `0` here reads as *nothing is coming* and
+    /// that is a claim no pass has made yet.
+    pub notes_maturing: Option<usize>,
 }
 
 /// Classify what the faucet can do right now.
 ///
-/// `next_maturity` is the height at which the earliest **immature** coinbase note
-/// this node mined becomes spendable, if any is outstanding — i.e. the height its
-/// leaf is appended at (`minted + 144`, issue #102). It is passed in rather than
-/// derived here because only a caller walking its own node's main chain knows which
-/// blocks this faucet mined and at what heights.
+/// `harvest` is what the last pass over this node's own main chain found about
+/// coinbase that has not landed yet — the maturing count and the height the
+/// earliest of them becomes spendable at (`minted + 144`, issue #102). It is passed
+/// in rather than derived here because only a caller walking its own node's chain
+/// knows which blocks this faucet mined and at what heights.
+///
+/// 🔴 **`None` means no pass has run, and it is not the same as a pass that found
+/// nothing** (lab #543). Answering the inventory question without having looked is
+/// how the page came to publish `Empty` — *"none coming"* — for a faucet whose whole
+/// stock was maturing.
 pub fn classify<V: qlab_faucet::ChainView>(
     faucet: &Faucet,
     view: &V,
-    next_maturity: Option<u64>,
-    maturing_count: usize,
+    harvest: Option<crate::harvest::HarvestFacts>,
 ) -> Availability {
+    let Some(harvest) = harvest else {
+        return Availability::Unharvested;
+    };
+    let (next_maturity, maturing_count) = (harvest.next_maturity, harvest.maturing);
     let tip = view.tip_height();
     let held = faucet.inventory().len();
 
@@ -474,6 +516,9 @@ mod tests {
         assert!(Availability::Ready { grants: 1 }.admits_requests());
         assert!(Availability::AwaitingFinality { held: 3, anchored: 1 }.admits_requests());
         assert!(!Availability::ColdChain.admits_requests());
+        // Lab #543: a faucet that has not read its own inventory promises nothing.
+        assert!(!Availability::Unharvested.admits_requests());
+        assert_eq!(Availability::Unharvested.blocks_until_servable(), None);
         assert!(!Availability::Empty { held: 1 }.admits_requests());
     }
 
@@ -495,6 +540,7 @@ mod tests {
             },
             Availability::Starting { replayed: 1, total: 2 },
             Availability::Starting { replayed: 0, total: 0 },
+            Availability::Unharvested,
             Availability::ColdChain,
             Availability::Empty { held: 0 },
         ] {

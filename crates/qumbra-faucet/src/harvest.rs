@@ -101,6 +101,34 @@ pub struct HarvestReport {
     pub next_maturity: Option<u64>,
 }
 
+/// The two facts about coinbase that has **not** landed yet, and the only way to
+/// hold them: a value a harvest pass produced.
+///
+/// 🔴 **This type exists so "no pass has run yet" cannot be spelled the same way as
+/// "nothing is maturing"** (lab #543). `FaucetService` carried the pair as a bare
+/// `Option<u64>` + `usize` initialised to `None` + `0`, which are exactly the values
+/// a pass reports for a faucet with no immature coinbase — so a status render before
+/// the first harvest published `Empty`, i.e. *"out of funds … the only refill is a
+/// coinbase note"*, for a faucet whose entire stock was inside the §2 gate. An
+/// `Option<HarvestFacts>` makes the difference representable and forces the caller
+/// to say which one it has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HarvestFacts {
+    /// Immature coinbase notes outstanding — [`HarvestReport::maturing`].
+    pub maturing: usize,
+    /// The tip height the earliest of them becomes spendable at, if any —
+    /// [`HarvestReport::next_maturity`].
+    pub next_maturity: Option<u64>,
+}
+
+impl HarvestReport {
+    /// The forward-looking half of this pass, for the status surface and
+    /// [`crate::state::classify`].
+    pub fn facts(&self) -> HarvestFacts {
+        HarvestFacts { maturing: self.maturing, next_maturity: self.next_maturity }
+    }
+}
+
 /// Walk `node`'s main chain, fund every **matured, unspent** coinbase note paid to
 /// this wallet at `d` that the faucet does not already know about, and report what
 /// is still maturing.
@@ -298,11 +326,62 @@ mod tests {
         // not any refused request, is what this assertion pins: nobody had ever
         // asked this faucet for a grant (lab #559).
         let view = crate::view::NodeView(&node);
-        let availability = crate::state::classify(&faucet, &view, report.next_maturity, 0);
+        let availability = crate::state::classify(&faucet, &view, Some(report.facts()));
         assert!(
             matches!(availability, crate::state::Availability::Ready { grants } if grants >= 1),
             "a v5 faucet holding a matured, witnessable note must be servable, got \
              {availability:?}"
+        );
+    }
+
+    /// 🔴 **Lab #543: before the first pass, the page does not answer for the
+    /// inventory — and the defect is pinned beside the fix.**
+    ///
+    /// A faucet whose whole stock is inside the §2 gate, rendered before any harvest
+    /// pass: `None` must say *"has not looked"*, and the same state with a pass's
+    /// answer must say *maturity*. The third assertion is the bug itself — the pair
+    /// of defaults the service used to carry (`next_maturity: None`, `maturing: 0`)
+    /// answers `Empty`, i.e. "out of funds, none coming", which is why "no pass has
+    /// run" could not keep being spelled that way.
+    #[test]
+    fn a_render_before_the_first_harvest_does_not_answer_for_the_inventory() {
+        let wallet = Wallet::from_seed_lanes([0x1230_0000_0000_0009; 4]);
+        let d = Diversifier::default();
+        let genesis = genesis_block(GENESIS_DIFFICULTY, 0);
+        let mut node = MemNode::in_memory(genesis.clone());
+        let mut tip = genesis.header();
+        let mut faucet = faucet_for(&wallet);
+        let mut seen = HashSet::new();
+
+        // One block to the faucet, nowhere near maturity: stock exists, none of it
+        // spendable, and nothing funded in yet.
+        mine(&mut node, &mut tip, 1, wallet.rkm(d));
+        let view = crate::view::NodeView(&node);
+
+        let unharvested = crate::state::classify(&faucet, &view, None);
+        assert_eq!(unharvested, crate::state::Availability::Unharvested);
+        assert!(!unharvested.admits_requests(), "it cannot promise what it has not read");
+        assert_eq!(unharvested.blocks_until_servable(), None);
+        assert!(
+            !unharvested.explain().contains("out of funds"),
+            "a faucet that has not looked does not report an empty one: {}",
+            unharvested.explain()
+        );
+
+        let report = harvest_matured(&mut faucet, &node, &wallet, d, &mut seen);
+        assert_eq!(report.funded, 0, "the note is immature");
+        let after = crate::state::classify(&faucet, &view, Some(report.facts()));
+        assert!(
+            matches!(after, crate::state::Availability::Maturing { .. }),
+            "with a pass's answer the same state is the maturity wait, got {after:?}"
+        );
+
+        // 🔴 The defect, pinned: the old defaults are a *lie* about this state.
+        let as_it_was = crate::state::classify(&faucet, &view, Some(HarvestFacts::default()));
+        assert!(
+            matches!(as_it_was, crate::state::Availability::Empty { .. }),
+            "the pair of defaults must be what produced `Empty` — that is the whole \
+             reason `None` may not be spelled as them, got {as_it_was:?}"
         );
     }
 

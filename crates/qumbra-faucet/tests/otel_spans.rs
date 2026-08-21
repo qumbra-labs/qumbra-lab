@@ -236,7 +236,7 @@ fn admitting_status() -> Arc<Mutex<ServiceStatus>> {
         confirmed: 0,
         refused: 0,
         notes_held: 2,
-        notes_maturing: 0,
+        notes_maturing: Some(0),
     }))
 }
 
