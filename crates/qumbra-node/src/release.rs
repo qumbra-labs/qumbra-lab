@@ -181,7 +181,7 @@ pub const REVISION_V1_0: Revision = Revision {
 
 /// **The emission-rule revision** (lab #299 + #303): the parameter set in force
 /// above [`RULE_BOUNDARY_HEIGHT`], where `s_atomic` is the exact-decimal evaluation
-/// and `body.coinbase == coinbase(height)` is a validity rule.
+/// and `body.coinbase_total() == coinbase(height)` is a validity rule.
 ///
 /// # Why this mints a revision when the mint deliberately did not
 ///

@@ -13,7 +13,7 @@
 //!   qumbra-node run --config FILE          run a full node (TCP + RandomX + disk)
 //!   qumbra-node audit [--out FILE]         emit the params_devnet convergence audit
 //!   qumbra-node audit-emission --data-dir  walk a data dir's main chain and report
-//!     DIR [--from H] [--to H]              every body.coinbase ≠ schedule height
+//!     DIR [--from H] [--to H]              every body payee total ≠ schedule height
 //! ```
 //!
 //! All the testable logic lives in the library ([`qumbra_node`]); this is thin

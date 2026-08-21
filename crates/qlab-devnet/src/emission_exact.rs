@@ -70,7 +70,7 @@
 use crate::params_devnet::CHECKPOINT_CADENCE_BLOCKS;
 
 /// **The emission-rule boundary.** The last height mined and validated under the
-/// `binary64` schedule; the exact schedule and the `body.coinbase` validity rule
+/// `binary64` schedule; the exact schedule and the body-payee-total validity rule
 /// both bind from `RULE_BOUNDARY_HEIGHT + 1`.
 ///
 /// Stamped 2026-08-10 by the coordinator (task book
