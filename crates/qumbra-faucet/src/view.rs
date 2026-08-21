@@ -38,8 +38,8 @@ impl NodeView<'_> {
     /// `NodeRpc::main_chain_counts`, and it is the one issue #116 did not name: #116
     /// was written about the RPC, and this crate does not use the RPC. The duplicated
     /// **walk** is still duplicated — that is unavoidable here — but the **rule** is
-    /// not: `qlab_node::matured_coinbase_leaf` is called, so all three sites differ
-    /// only in how they resolve an ancestor. Restating a *sliding* rule a third time
+    /// not: `qlab_node::matured_coinbase_leaf_for` is called, so all three sites
+    /// differ only in how they resolve an ancestor. Restating a *sliding* rule a third time
     /// is how an off-by-144 gets published as an anchor nobody can witness against.
     fn main_chain_roots_newest_first(&self) -> Vec<Hash32> {
         let chain = self.0.chain();
@@ -55,10 +55,20 @@ impl NodeView<'_> {
         let mut out = Vec::new();
         for hash in hashes {
             let Some(block) = chain.block(&hash) else { continue };
-            let matured =
-                qlab_node::matured_coinbase_leaf(block.header.height, |minted_at| {
+            // Form-aware since lab #559, and the reason is prophylactic rather
+            // than a fix: only `.is_some()` is read here, and the v4/v5 `None`
+            // conditions are identical, so the count this produces was already
+            // right on both forms. What was wrong was relying on that — the same
+            // "one derivation, two forms" trap that made every note the faucet
+            // funded on v5 unwitnessable. The form is on the node; reading it
+            // costs nothing and removes the trap.
+            let matured = qlab_node::coinbase::matured_coinbase_leaf_for(
+                self.0.form(),
+                block.header.height,
+                |minted_at| {
                     by_height.get(&minted_at).and_then(|h| chain.block(h)).map(|b| b.body())
-                });
+                },
+            );
             if matured.is_some() {
                 count += 1;
             }
