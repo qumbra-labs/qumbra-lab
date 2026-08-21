@@ -2,10 +2,17 @@
 //! honoured.
 //!
 //! Since issue #101 a mined coinbase note is a real note with a real tree leaf, and
-//! `qlab_node::coinbase_note(height, body)` re-derives it **from chain data alone**
-//! — that is the deterministic ρ/rseed rule's whole purpose. So the faucet's funding
-//! needs no side channel: it walks its own node's main chain, and every block whose
-//! `coinbase_rkm` is the faucet's own `rkm` is one note it owns.
+//! `qlab_node::coinbase_note_for(form, height, body)` re-derives it **from chain data
+//! alone** — that is the deterministic ρ/rseed rule's whole purpose. So the faucet's
+//! funding needs no side channel: it walks its own node's main chain, and every block
+//! whose `coinbase_rkm` is the faucet's own `rkm` is one note it owns.
+//!
+//! **`form` is not decoration** (lab #559). v5 derives ρ and rseed under a `:v2`
+//! domain with the payee index in the preimage, so the v4 and v5 notes of one block
+//! carry the same value and different commitments. The form comes from the node whose
+//! chain is being walked, because that is the form its `apply_state` appended leaves
+//! under; deriving under any other one funds notes that have no leaf, and a note with
+//! no leaf has no witness and cannot be spent — at any height, by any wait.
 //!
 //! ## The maturity delay, and what this file still owes it
 //!
@@ -43,7 +50,7 @@
 use std::collections::HashSet;
 
 use qlab_faucet::{Faucet, OwnedNote};
-use qlab_node::{coinbase_note, coinbase_note_leaf, ChainStore, MemNode, NodeState};
+use qlab_node::{coinbase_note_for, coinbase_note_leaf_for, ChainStore, MemNode, NodeState};
 use qlab_wallet::address::Diversifier;
 use qlab_wallet::Wallet;
 // `NodeState::is_spent` is the chain's authority on spent-ness (lab #310).
@@ -127,6 +134,13 @@ pub fn harvest_matured(
 ) -> HarvestReport {
     let mine = wallet.rkm(d);
     let tip = node.tip_height();
+    // 🔴 **The form this node's identities are keyed under, read from the node**
+    // (lab #559). It is not a parameter and not a constant here: `apply_state`
+    // appends `matured_coinbase_leaf_for(self.form, …)`, so a holder deriving the
+    // same note under any other form computes a commitment the tree does not
+    // contain. On T2 (v5) that was every note this faucet ever funded — value it
+    // held, counted, and could never witness or spend.
+    let form = node.form();
     let chain = node.chain();
     let mut report = HarvestReport::default();
 
@@ -137,7 +151,7 @@ pub fn harvest_matured(
         if body.coinbase_rkm != mine {
             continue; // someone else's block, or an unconfigured burn payout
         }
-        let Some(leaf) = coinbase_note_leaf(height, &body) else {
+        let Some(leaf) = coinbase_note_leaf_for(form, height, &body) else {
             continue; // a non-minting block (genesis)
         };
         if seen.contains(&leaf) {
@@ -154,7 +168,7 @@ pub fn harvest_matured(
             report.next_maturity = Some(report.next_maturity.map_or(at, |m: u64| m.min(at)));
             continue;
         }
-        let Some(note) = coinbase_note(height, &body) else { continue };
+        let Some(note) = coinbase_note_for(form, height, &body) else { continue };
         // Lab #310: the chain knows which notes are spent. Derive the nullifier
         // the way a spend does, and skip any whose nf is already permanent.
         let nf = qlab_note::hash::digest_bytes(&wallet.nullifier(&note.rho));
@@ -177,6 +191,7 @@ mod tests {
     use qlab_devnet::header::BlockHeader;
     use qlab_devnet::params_devnet::GENESIS_DIFFICULTY;
     use qlab_faucet::{FaucetConfig, FaucetLimits, TicketPolicy, TicketSecret};
+    use qlab_devnet::forms::GenesisForm;
     use qlab_node::{coinbase, genesis_block, CommitmentStore, COINBASE_MATURITY_BLOCKS};
 
     struct NoTx;
@@ -212,6 +227,83 @@ mod tests {
             node.finalize(hash).expect("finalize");
             *tip = header;
         }
+    }
+
+    /// Mine `n` blocks on a **v5** chain paying `rkm`, finalizing each. The v4
+    /// helper above cannot be reused: v5 has its own header layout, its own body
+    /// commitment and the exact emission from height 0 (`GenesisForm::V5`).
+    fn mine_v5(node: &mut MemNode, tip: &mut BlockHeader, n: u64, rkm: [u64; 4]) {
+        for _ in 0..n {
+            let height = tip.height + 1;
+            let body = BlockBody {
+                txs: Vec::new(),
+                coinbase: qlab_node::coinbase_for(GenesisForm::V5, height),
+                coinbase_rkm: rkm,
+            };
+            let header = BlockHeader::child_of_for(
+                GenesisForm::V5,
+                tip,
+                height * 75,
+                GENESIS_DIFFICULTY,
+                body.commitment_v5(),
+            );
+            let hash = node.apply_block(header, body, &NoTx).expect("applies");
+            node.finalize(hash).expect("finalize");
+            *tip = header;
+        }
+    }
+
+    /// 🔴 **A harvested note's commitment must be the leaf the node appended — on
+    /// the net the faucet is actually deployed to.**
+    ///
+    /// Every other test in this module runs on `GenesisForm::V4`, which is why this
+    /// property has never been checked where it can fail. `apply_state` appends
+    /// `matured_coinbase_leaf_for(self.form, …)`, and v5's ρ/rseed derivations carry
+    /// the payee index under a `:v2` domain string — so on a v5 net the v4
+    /// derivation this module calls produces a commitment that is not in the tree.
+    /// The note is funded, counted as held, and can never be witnessed or spent.
+    #[test]
+    fn a_v5_chains_harvested_note_is_the_leaf_the_node_appended() {
+        let wallet = Wallet::from_seed_lanes([0x1230_0000_0000_0007; 4]);
+        let d = Diversifier::default();
+        let genesis = qlab_node::genesis_block_for(GenesisForm::V5, GENESIS_DIFFICULTY, 0);
+        let mut node = MemNode::in_memory_for(GenesisForm::V5, genesis.clone());
+        let mut tip = genesis.header();
+        let mut faucet = faucet_for(&wallet);
+        let mut seen = HashSet::new();
+
+        // Block 1 pays the faucet; grow to the height its leaf is appended at.
+        mine_v5(&mut node, &mut tip, 1, wallet.rkm(d));
+        let at = spendable_at_tip(1);
+        let to_mine = at - node.tip_height();
+        mine_v5(&mut node, &mut tip, to_mine, [0xBB; 4]);
+        assert_eq!(node.tip_height(), at);
+
+        let report = harvest_matured(&mut faucet, &node, &wallet, d, &mut seen);
+        assert_eq!(report.funded, 1, "the matured coinbase is funded: {report:?}");
+
+        let note = &faucet.inventory().notes()[0];
+        assert!(
+            node.commitments().tree().position_of(&note.cm).is_some(),
+            "the funded note's commitment is not a leaf of the v5 chain's tree — it \
+             can never be witnessed, so the faucet holds value it can never spend"
+        );
+
+        // …and the end the operator reads: the page says **ready**, not a maturity
+        // height that nothing clears. On T2 that height was a **horizon** — watched
+        // from outside the box on 2026-08-21, the chain reached the promised 1259 and
+        // the page immediately said 1261, then 1263, then 1266. Every pass harvested
+        // fresh coinbase that was also unusable, so the banner always named the
+        // newest note's maturity and the ETA it published was always wrong. That, and
+        // not any refused request, is what this assertion pins: nobody had ever
+        // asked this faucet for a grant (lab #559).
+        let view = crate::view::NodeView(&node);
+        let availability = crate::state::classify(&faucet, &view, report.next_maturity, 0);
+        assert!(
+            matches!(availability, crate::state::Availability::Ready { grants } if grants >= 1),
+            "a v5 faucet holding a matured, witnessable note must be servable, got \
+             {availability:?}"
+        );
     }
 
     /// 🔴 The gate: an immature note is counted and named, never funded. One block
@@ -324,7 +416,8 @@ mod tests {
             coinbase: coinbase(minted_at),
             coinbase_rkm: miner.rkm(d),
         };
-        let cb = coinbase_note_leaf(minted_at, &body).expect("a minting block");
+        let cb = coinbase_note_leaf_for(GenesisForm::V4, minted_at, &body)
+            .expect("a minting block");
         let cm = qlab_note::hash::digest_from_bytes(&cb);
 
         // The threshold this module funds at is the append schedule's, not a copy.

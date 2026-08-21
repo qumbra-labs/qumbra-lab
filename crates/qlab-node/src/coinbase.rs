@@ -221,6 +221,13 @@ pub fn coinbase_note_value_parts(coinbase: u64, total_fees: u64, total_name_burn
 /// rejects it (`BodyError::MissingCoinbasePayee`). The `rkm == [0; 4]` guard is
 /// kept anyway so this function cannot mint an unspendable leaf even if it is
 /// ever called off that path.
+///
+/// 🔴 **This is the v4 note. A holder reconstructing its own coinbase must call
+/// [`coinbase_note_for`] with the form its chain is keyed under** — v5 derives ρ
+/// and rseed under a `:v2` domain carrying the payee index, so the note this
+/// returns is not in a v5 chain's tree, has no witness, and cannot be spent. Lab
+/// #559 is what that costs: the T2 faucet funded its entire inventory this way
+/// and could not pay a single grant.
 pub fn coinbase_note(height: u64, body: &BlockBody) -> Option<Note> {
     coinbase_note_parts(
         height,
@@ -289,30 +296,64 @@ pub fn coinbase_note_parts_v5(
 ///
 /// **This is the leaf `height` *mints*, not the leaf `height` *appends*.** Since
 /// issue #102 those are different heights: see [`matures_coinbase_minted_at`].
+///
+/// 🔴 The **v4** leaf — see [`coinbase_note`]'s warning and use
+/// [`coinbase_note_leaf_for`] off the v4 path.
 pub fn coinbase_note_leaf(height: u64, body: &BlockBody) -> Option<Hash32> {
     coinbase_note(height, body).map(|n| digest_bytes(&n.commitment()))
+}
+
+/// The single payee a v5 body pays: the birth cap is 1, so the payee index of
+/// `body.coinbase_rkm` is 0 wherever a v5 coinbase note is derived (lab #470).
+///
+/// Named because it is the one number that has to be the same in the node's
+/// append path and in every holder's reconstruction — a literal `0` in two files
+/// is the shape lab #559 was.
+pub const V5_SINGLE_PAYEE_INDEX: u8 = 0;
+
+/// [`coinbase_note`] under an explicit genesis form — **the derivation a holder
+/// runs** (lab #559).
+///
+/// This exists because [`coinbase_note_leaf_for`] did not have a note
+/// counterpart, so a holder wanting the note itself had only the v4
+/// [`coinbase_note`] to call. `qumbra-faucet`'s harvest called exactly that, and
+/// on the v5 net it funded every note with a v4 ρ/rseed: same value, different
+/// commitment, no leaf in the tree, no witness, no spend — an inventory of value
+/// it could never move. The faucet page reported it as a maturity wait that
+/// nothing would clear.
+///
+/// So the form-aware note is the primitive and the leaf is derived **from it**
+/// below, rather than the two being computed side by side. There is one
+/// derivation per form and the leaf cannot drift from the note again.
+pub fn coinbase_note_for(
+    form: qlab_devnet::forms::GenesisForm,
+    height: u64,
+    body: &BlockBody,
+) -> Option<Note> {
+    match form {
+        qlab_devnet::forms::GenesisForm::V4 => coinbase_note(height, body),
+        qlab_devnet::forms::GenesisForm::V5 => coinbase_note_parts_v5(
+            height,
+            V5_SINGLE_PAYEE_INDEX,
+            body.coinbase_rkm,
+            body.coinbase,
+            body.total_fees(),
+            body.total_name_burn(),
+        ),
+    }
 }
 
 /// [`coinbase_note_leaf`] under an explicit genesis form (lab #470 stage 4a):
 /// the v5 leaf comes from the v5 note derivation (payee index 0 at the birth
 /// cap) — same value arithmetic, v5 lanes.
+///
+/// The leaf of [`coinbase_note_for`]'s note, since lab #559 — see there.
 pub fn coinbase_note_leaf_for(
     form: qlab_devnet::forms::GenesisForm,
     height: u64,
     body: &BlockBody,
 ) -> Option<Hash32> {
-    match form {
-        qlab_devnet::forms::GenesisForm::V4 => coinbase_note_leaf(height, body),
-        qlab_devnet::forms::GenesisForm::V5 => coinbase_note_parts_v5(
-            height,
-            0,
-            body.coinbase_rkm,
-            body.coinbase,
-            body.total_fees(),
-            body.total_name_burn(),
-        )
-        .map(|n| digest_bytes(&n.commitment())),
-    }
+    coinbase_note_for(form, height, body).map(|n| digest_bytes(&n.commitment()))
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +596,47 @@ mod tests {
             coinbase_note_value(&body),
             RewardSplit::of(coinbase(h)).miner + posted_fee(ArityBucket::TwoByTwo),
             "the miner's take is exactly what a rider-free tx would have paid"
+        );
+    }
+
+    /// 🔴 **One derivation per form, and the leaf is the note's own commitment**
+    /// (lab #559). The form-aware leaf used to be computed beside the form-aware
+    /// note instead of from it, and the note had no form-aware constructor at all —
+    /// which is how `qumbra-faucet` came to fund an entire v5 inventory under the v4
+    /// ρ/rseed: 268 notes held on T2, none of them a leaf of the tree, none
+    /// spendable, and a page reporting it as a maturity wait.
+    #[test]
+    fn the_form_aware_leaf_is_the_form_aware_notes_own_commitment() {
+        use qlab_devnet::forms::GenesisForm;
+        let body = body_at(700, RKM_A, 2);
+        for form in [GenesisForm::V4, GenesisForm::V5] {
+            let note = coinbase_note_for(form, 700, &body).expect("a minting block");
+            assert_eq!(
+                coinbase_note_leaf_for(form, 700, &body),
+                Some(digest_bytes(&note.commitment())),
+                "{form:?}: the leaf must be this form's note, not a second formula"
+            );
+        }
+    }
+
+    /// 🔴 **The two forms are different notes of the same money**, and that is why
+    /// deriving under the wrong one is unrecoverable rather than approximate: the
+    /// value is identical (the payout-axis ruling's provable-equivalence
+    /// requirement), the commitment is not — `:v2` domain plus the payee index in
+    /// the preimage. A holder on the wrong form holds notes the tree never had.
+    #[test]
+    fn v4_and_v5_agree_on_the_value_and_disagree_on_the_commitment() {
+        use qlab_devnet::forms::GenesisForm;
+        let body = body_at(700, RKM_A, 2);
+        let v4 = coinbase_note_for(GenesisForm::V4, 700, &body).expect("mints");
+        let v5 = coinbase_note_for(GenesisForm::V5, 700, &body).expect("mints");
+        assert_eq!(v4.value, v5.value, "the money is the same in both forms");
+        assert_ne!(v4.rho, v5.rho, "v5 ρ carries the payee index under a :v2 domain");
+        assert_ne!(v4.rseed, v5.rseed);
+        assert_ne!(
+            v4.commitment(),
+            v5.commitment(),
+            "so a v4-derived note is not a leaf of a v5 chain's tree"
         );
     }
 
