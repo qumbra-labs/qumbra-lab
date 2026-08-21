@@ -5,7 +5,7 @@
 
 use qlab_devnet::body::{
     check_scheduled_coinbase_above, check_scheduled_coinbase_payees, BlockBody, BodyError,
-    CoinbasePayee, COINBASE_PAYEE_CAP_V5,
+    CoinbasePayee, COINBASE_PAYEE_CAP_V5_AT_BIRTH,
 };
 use qlab_devnet::emission_exact::coinbase_exact;
 
@@ -98,7 +98,10 @@ fn more_payees_than_the_birth_cap_is_refused_by_name() {
     ];
     assert_eq!(
         check_scheduled_coinbase_payees(h, &payees),
-        Err(BodyError::TooManyCoinbasePayees { got: 2, cap: COINBASE_PAYEE_CAP_V5 })
+        Err(BodyError::TooManyCoinbasePayees {
+            got: 2,
+            cap: COINBASE_PAYEE_CAP_V5_AT_BIRTH,
+        })
     );
     let body = BlockBody::new(Vec::new(), payees.to_vec());
     assert_eq!(body.coinbase_payees, payees);

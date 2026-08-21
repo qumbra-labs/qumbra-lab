@@ -86,12 +86,38 @@ pub const BODY_PREIMAGE_DOMAIN_V3: &[u8] = b"qumbra:body:v3";
 /// golden is locked then, not before.
 pub const BODY_PREIMAGE_DOMAIN_V5: &[u8] = b"qumbra:body:v5";
 
-/// The v5 coinbase payee cap **at birth**: 1 (the pool-payout-axis ruling,
-/// DECIDED 2026-08-11 — "N = 1 enforced by consensus at birth, the cap raised
-/// later by halt-height rule change, never by body-format change"). The format
-/// carries a count byte, so raising this is a release + rule boundary, never a
-/// re-mint.
-pub const COINBASE_PAYEE_CAP_V5: usize = 1;
+/// The maximum v5 coinbase payee count after the cap rule activates.
+///
+/// Eight is the ruled pool split: large enough to reduce payout variance for a
+/// small pool without turning every block into an unbounded light-client scan
+/// multiplier. The v5 format already carries a count byte and a payee list, so
+/// this changes validity only; it does not introduce a new commitment form.
+pub const COINBASE_PAYEE_CAP_V5: usize = 8;
+
+/// The v5 coinbase payee cap before activation, including the network's birth.
+pub const COINBASE_PAYEE_CAP_V5_AT_BIRTH: usize = 1;
+
+/// Last height at which the birth cap remains in force.
+///
+/// Kept unset at merge: choosing an activation height requires the image-build
+/// and six-host rollout schedule, which this code baton does not own. As with
+/// the name-rule pins-unset precedent, `None` means the cap stays one at every
+/// height until a later, reviewed stamp sets this constant.
+pub const COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT: Option<u64> = None;
+
+/// The shipped v5 payee cap at `height`.
+pub fn coinbase_payee_cap_v5(height: u64) -> usize {
+    coinbase_payee_cap_v5_above(COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, height)
+}
+
+/// [`coinbase_payee_cap_v5`] with the boundary injected for boundary drills.
+pub fn coinbase_payee_cap_v5_above(boundary: Option<u64>, height: u64) -> usize {
+    if matches!(boundary, Some(b) if height > b) {
+        COINBASE_PAYEE_CAP_V5
+    } else {
+        COINBASE_PAYEE_CAP_V5_AT_BIRTH
+    }
+}
 
 /// The three body-commitment preimage forms. Internal: public callers go
 /// through `commitment` (v2), `commitment_at`/`commitment_above` (the
@@ -268,9 +294,8 @@ impl TxEntry {
 #[derive(Clone, Default)]
 pub struct BlockBody {
     pub txs: Vec<TxEntry>,
-    /// The block's coinbase payouts. The current consensus cap remains one;
-    /// representing more than one payee is deliberately separate from making
-    /// such a body valid (lab #593 / QUM-161).
+    /// The block's coinbase payouts. Representation is independent of the
+    /// height-keyed validity cap (lab #593 / QUM-161, then QUM-160).
     pub coinbase_payees: Vec<CoinbasePayee>,
 }
 
@@ -378,7 +403,10 @@ impl BlockBody {
     /// locked by `golden_body_commitment_bytes`, which is now the live-chain
     /// compatibility lock rather than merely a format lock.
     fn preimage(&self, v3: bool) -> Vec<u8> {
-        self.preimage_form(if v3 { BodyPreimageForm::V3 } else { BodyPreimageForm::V2 })
+        self.preimage_form(
+            if v3 { BodyPreimageForm::V3 } else { BodyPreimageForm::V2 },
+            COINBASE_PAYEE_CAP_V5_AT_BIRTH,
+        )
     }
 
     /// The commitment preimage under one of the three body forms. v2 and v3
@@ -386,7 +414,7 @@ impl BlockBody {
     /// goldens are the lock); v5 (lab #470 stage 2) shares the v3 per-tx
     /// region for now — stage 3 folds the C3 batch into it — and replaces the
     /// coinbase tail with the payee list.
-    fn preimage_form(&self, form: BodyPreimageForm) -> Vec<u8> {
+    fn preimage_form(&self, form: BodyPreimageForm, v5_payee_cap: usize) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(match form {
             BodyPreimageForm::V2 => BODY_PREIMAGE_DOMAIN,
@@ -451,7 +479,16 @@ impl BlockBody {
                 // A real check, not a debug_assert (#253 house rule): the bar
                 // is --release, and an encoder emitting an over-cap count
                 // would be committing a body no validator accepts.
-                assert!(self.coinbase_payees.len() <= COINBASE_PAYEE_CAP_V5);
+                //
+                // Unreachable from a peer: `validate_body_form` and
+                // `check_body_binding_v5_above` both reject the cap before
+                // hashing; compact announce and mine-RPC decoders reject the
+                // height-keyed count before constructing a body. Local pool
+                // assembly runs `check_scheduled_coinbase_payees` before it
+                // asks the node to construct this commitment. A failure here
+                // therefore names an internal caller that skipped its gate,
+                // not adversarial input that can panic a validating node.
+                assert!(self.coinbase_payees.len() <= v5_payee_cap);
                 buf.push(self.coinbase_payees.len() as u8);
                 for p in &self.coinbase_payees {
                     for lane in &p.rkm {
@@ -469,7 +506,20 @@ impl BlockBody {
     /// locks the golden; nothing consensus-reachable selects this form until
     /// the v5 loader (stage 4).
     pub fn commitment_v5(&self) -> Hash32 {
-        keccak256(&self.preimage_form(BodyPreimageForm::V5))
+        self.commitment_v5_at(0)
+    }
+
+    /// The v5 commitment at the block's height. The bytes do not change at the
+    /// cap boundary; height only selects the validity cap asserted before the
+    /// already-shipped `count ‖ [rkm ‖ amount]×N` encoding is emitted.
+    pub fn commitment_v5_at(&self, height: u64) -> Hash32 {
+        self.commitment_v5_above(COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, height)
+    }
+
+    /// [`BlockBody::commitment_v5_at`] with the boundary injected for drills.
+    pub fn commitment_v5_above(&self, boundary: Option<u64>, height: u64) -> Hash32 {
+        let cap = coinbase_payee_cap_v5_above(boundary, height);
+        keccak256(&self.preimage_form(BodyPreimageForm::V5, cap))
     }
 
     /// Total fees in the body (posted prices; the miner earns these + coinbase
@@ -562,10 +612,9 @@ pub enum BodyError {
     /// boundary can be negative, so height 0 can never reach it — the exemption is a
     /// property of the comparison rather than a list of exceptions to maintain.
     WrongScheduledCoinbase { height: u64, expected: u64, got: u64 },
-    /// The v5 coinbase payee list is longer than the birth cap
-    /// ([`COINBASE_PAYEE_CAP_V5`]) — lab #470 stage 2. The cap is a
-    /// rule-change lever: the FORMAT carries a count byte, so a later release
-    /// raises this by halt-boundary rule change, never by re-mint.
+    /// The v5 coinbase payee list is longer than the cap in force at this
+    /// height. The format already carries a count byte and payee list, so the
+    /// boundary changes validity without changing commitment bytes.
     TooManyCoinbasePayees { got: usize, cap: usize },
     /// The tx at `index` references an anchor that is not a finalized root (§6).
     AnchorNotFinal { index: usize },
@@ -702,7 +751,7 @@ fn check_committed_against_exact(height: u64, committed: u64) -> Result<(), Body
 /// This extends the same seam [`check_scheduled_coinbase`] owns — the actual
 /// comparison is the shared [`check_committed_against_exact`] — and adds the
 /// two payee-shape refusals the payout-axis ruling names:
-/// - more payees than the birth cap ([`COINBASE_PAYEE_CAP_V5`]) is
+/// - more payees than the height-keyed cap is
 ///   [`BodyError::TooManyCoinbasePayees`];
 /// - a zero-payee (or otherwise short) list on a minting height fails the Σ
 ///   comparison itself — Σ = 0 is not the schedule's coinbase, and the error
@@ -714,10 +763,25 @@ pub fn check_scheduled_coinbase_payees(
     height: u64,
     payees: &[CoinbasePayee],
 ) -> Result<(), BodyError> {
-    if payees.len() > COINBASE_PAYEE_CAP_V5 {
+    check_scheduled_coinbase_payees_above(
+        COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT,
+        height,
+        payees,
+    )
+}
+
+/// [`check_scheduled_coinbase_payees`] with the cap boundary injected for
+/// boundary drills. The schedule comparison and its u128 sum are unchanged.
+pub fn check_scheduled_coinbase_payees_above(
+    boundary: Option<u64>,
+    height: u64,
+    payees: &[CoinbasePayee],
+) -> Result<(), BodyError> {
+    let cap = coinbase_payee_cap_v5_above(boundary, height);
+    if payees.len() > cap {
         return Err(BodyError::TooManyCoinbasePayees {
             got: payees.len(),
-            cap: COINBASE_PAYEE_CAP_V5,
+            cap,
         });
     }
     let total: u128 = payees.iter().map(|p| p.amount as u128).sum();
@@ -790,7 +854,23 @@ pub fn check_body_binding_above(
 /// The v5-form header/body binding (lab #470): the header must commit to the
 /// body under [`BlockBody::commitment_v5`]. Same #77 property, v5 identity.
 pub fn check_body_binding_v5(header: &BlockHeader, body: &BlockBody) -> Result<(), BodyError> {
-    let got = body.commitment_v5();
+    check_body_binding_v5_above(COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT, header, body)
+}
+
+/// [`check_body_binding_v5`] with the cap boundary injected for drills.
+pub fn check_body_binding_v5_above(
+    boundary: Option<u64>,
+    header: &BlockHeader,
+    body: &BlockBody,
+) -> Result<(), BodyError> {
+    let cap = coinbase_payee_cap_v5_above(boundary, header.height);
+    if body.coinbase_payees.len() > cap {
+        return Err(BodyError::TooManyCoinbasePayees {
+            got: body.coinbase_payees.len(),
+            cap,
+        });
+    }
+    let got = body.commitment_v5_above(boundary, header.height);
     if header.tx_body_commitment != got {
         return Err(BodyError::CommitmentMismatch {
             expected: header.tx_body_commitment,
@@ -896,7 +976,7 @@ enum BodyRuleForm {
     /// emission and the name rule native from height ≥ 1 — no boundary, no
     /// grandfathering. Composes with (never edits) the v4 machinery: the v4
     /// consts are simply never consulted on this arm.
-    V5,
+    V5 { payee_boundary: Option<u64> },
 }
 
 /// **The v5 rule funnel** (lab #470 stage 3, C4): [`validate_body_above`]'s
@@ -916,7 +996,38 @@ where
     F: Fn(&Hash32) -> bool,
     N: names::NameView,
 {
-    validate_body_form(BodyRuleForm::V5, header, body, verifier, is_anchor_final, name_view)
+    validate_body_v5_above(
+        COINBASE_PAYEE_CAP_V5_BOUNDARY_HEIGHT,
+        header,
+        body,
+        verifier,
+        is_anchor_final,
+        name_view,
+    )
+}
+
+/// [`validate_body_v5`] with the payee-cap boundary injected for drills.
+pub fn validate_body_v5_above<V, F, N>(
+    payee_boundary: Option<u64>,
+    header: &BlockHeader,
+    body: &BlockBody,
+    verifier: &V,
+    is_anchor_final: F,
+    name_view: &N,
+) -> Result<(), BodyError>
+where
+    V: TxVerifier,
+    F: Fn(&Hash32) -> bool,
+    N: names::NameView,
+{
+    validate_body_form(
+        BodyRuleForm::V5 { payee_boundary },
+        header,
+        body,
+        verifier,
+        is_anchor_final,
+        name_view,
+    )
 }
 
 fn validate_body_form<V, F, N>(
@@ -932,19 +1043,28 @@ where
     F: Fn(&Hash32) -> bool,
     N: names::NameView,
 {
-    // Representation is no longer the cap. The rule still is: this migration
-    // makes N>1 storable but does not make it valid or define v2/v3 bytes for it.
-    if body.coinbase_payees.len() > COINBASE_PAYEE_CAP_V5 {
+    // Refuse the height-dependent cap before computing the commitment. This
+    // ordering is what makes the V5 preimage arm's assert unreachable from a
+    // peer-supplied body: validation cannot hash an over-cap list.
+    let payee_cap = match &form {
+        BodyRuleForm::V4 { .. } => COINBASE_PAYEE_CAP_V5_AT_BIRTH,
+        BodyRuleForm::V5 { payee_boundary } => {
+            coinbase_payee_cap_v5_above(*payee_boundary, header.height)
+        }
+    };
+    if body.coinbase_payees.len() > payee_cap {
         return Err(BodyError::TooManyCoinbasePayees {
             got: body.coinbase_payees.len(),
-            cap: COINBASE_PAYEE_CAP_V5,
+            cap: payee_cap,
         });
     }
     match &form {
         BodyRuleForm::V4 { name_boundary } => {
             check_body_binding_above(*name_boundary, header, body)?
         }
-        BodyRuleForm::V5 => check_body_binding_v5(header, body)?,
+        BodyRuleForm::V5 { payee_boundary } => {
+            check_body_binding_v5_above(*payee_boundary, header, body)?
+        }
     }
     // A minting block must name a payee (issue #101). Second-cheapest check
     // after the binding, and it guards the block's whole issuance.
@@ -957,7 +1077,11 @@ where
     // the Σ form of the SAME comparison (lab #470 stage 2) — native, unboundaried.
     match &form {
         BodyRuleForm::V4 { .. } => check_scheduled_coinbase(header.height, body.coinbase_total())?,
-        BodyRuleForm::V5 => check_scheduled_coinbase_payees(header.height, &body.coinbase_payees)?,
+        BodyRuleForm::V5 { payee_boundary } => check_scheduled_coinbase_payees_above(
+            *payee_boundary,
+            header.height,
+            &body.coinbase_payees,
+        )?,
     }
     let mut seen_nf: HashSet<Hash32> = HashSet::new();
     // Names revealed earlier in this block — the same-block tie rule: earliest
@@ -977,7 +1101,7 @@ where
             }
             // C4: names native from height ≥ 1 on a v5 net — same strictly-
             // above-genesis shape as `riders_active_above(Some(0), h)`.
-            BodyRuleForm::V5 => header.height > 0,
+            BodyRuleForm::V5 { .. } => header.height > 0,
         };
         if op.is_some() && !riders_active {
             return Err(BodyError::RiderBeforeBoundary { index: i });
@@ -2543,9 +2667,8 @@ mod tests {
         ));
     }
 
-    /// QUM-161 changes representation only: an N=2 body can now exist in
-    /// memory, but the unchanged current cap refuses it before any undefined
-    /// v2/v3 commitment form is consulted.
+    /// The stored N=2 representation remains invalid while the shipped
+    /// boundary is unset.
     #[test]
     fn list_representation_does_not_raise_the_current_coinbase_payee_cap() {
         let body = BlockBody::new(
@@ -2570,8 +2693,95 @@ mod tests {
             ),
             Err(BodyError::TooManyCoinbasePayees {
                 got: 2,
-                cap: COINBASE_PAYEE_CAP_V5,
+                cap: COINBASE_PAYEE_CAP_V5_AT_BIRTH,
             }),
+        );
+    }
+
+    #[test]
+    fn v5_payee_cap_boundary_is_inclusive_and_commitment_bytes_do_not_move() {
+        let boundary = 7;
+        assert_eq!(coinbase_payee_cap_v5_above(Some(boundary), boundary), 1);
+        assert_eq!(
+            coinbase_payee_cap_v5_above(Some(boundary), boundary + 1),
+            COINBASE_PAYEE_CAP_V5
+        );
+
+        let body = golden_body();
+        let old = body.commitment_v5();
+        assert_eq!(body.commitment_v5_above(Some(boundary), boundary), old);
+        assert_eq!(body.commitment_v5_above(Some(boundary), boundary + 1), old);
+    }
+
+    #[test]
+    fn v5_n_payees_validate_only_above_the_boundary_and_keep_the_exact_sum() {
+        let boundary = 7;
+        let height = boundary + 1;
+        let total = coinbase_exact(height);
+        let payees = vec![
+            CoinbasePayee { rkm: [1; 4], amount: total / 3 },
+            CoinbasePayee { rkm: [2; 4], amount: total - total / 3 },
+        ];
+        let body = BlockBody::new(Vec::new(), payees);
+        let header = BlockHeader {
+            height,
+            ..BlockHeader::child_of(
+                &BlockHeader::genesis(1, 0),
+                75,
+                1,
+                body.commitment_v5_above(Some(boundary), height),
+            )
+        };
+        validate_body_v5_above(
+            Some(boundary),
+            &header,
+            &body,
+            &MockVerifier,
+            is_final,
+            &names::EmptyNameView,
+        )
+        .expect("N=2 and the exact schedule sum validate above the boundary");
+
+        let below = BlockHeader { height: boundary, ..header };
+        assert_eq!(
+            validate_body_v5_above(
+                Some(boundary),
+                &below,
+                &body,
+                &MockVerifier,
+                is_final,
+                &names::EmptyNameView,
+            ),
+            Err(BodyError::TooManyCoinbasePayees { got: 2, cap: 1 })
+        );
+    }
+
+    #[test]
+    fn v5_over_cap_is_refused_by_name_above_the_boundary() {
+        let boundary = 7;
+        let height = boundary + 1;
+        let body = BlockBody::new(
+            Vec::new(),
+            (0..=COINBASE_PAYEE_CAP_V5)
+                .map(|i| CoinbasePayee {
+                    rkm: [i as u64 + 1; 4],
+                    amount: 0,
+                })
+                .collect(),
+        );
+        assert_eq!(
+            validate_body_v5_above(
+                Some(boundary),
+                &BlockHeader { height, ..BlockHeader::genesis(1, 0) },
+                &body,
+                &MockVerifier,
+                is_final,
+                &names::EmptyNameView,
+            ),
+            Err(BodyError::TooManyCoinbasePayees {
+                got: COINBASE_PAYEE_CAP_V5 + 1,
+                cap: COINBASE_PAYEE_CAP_V5,
+            })
         );
     }
 }
