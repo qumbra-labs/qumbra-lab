@@ -638,7 +638,10 @@ impl ServedBodies {
         txs: Vec<TxEntry>,
         coinbase_payees: Vec<CoinbasePayee>,
     ) {
-        let weight = crate::n1::txs_weight(&txs) + 1 + 40 * coinbase_payees.len().max(1);
+        // This is the retained body-surface meter, not the V5 wire length. The
+        // count byte is an encoding byte; `ServedBody` does not retain it.
+        let weight = crate::n1::txs_weight(&txs)
+            + crate::n1::coinbase_payees_weight(&coinbase_payees);
         let entry = ServedBody { height, txs, coinbase_payees, weight };
         if let Some(old) = self.by_hash.insert(hash, entry) {
             // Same hash re-completed (e.g. re-announce after restart): replace,
@@ -4663,6 +4666,34 @@ mod tests {
         for bh in &hashes[10..] {
             assert!(node.blocks.contains(bh), "the newest {MAX_SERVED_BODIES} still serve");
         }
+    }
+
+    #[test]
+    fn serving_cache_meter_keeps_the_legacy_floor_and_charges_each_payee() {
+        let mut c = ServedBodies::new();
+        c.insert(1, [1; 32], Vec::new(), Vec::new());
+        assert_eq!(c.bytes, 40, "an empty body keeps the shared legacy floor");
+
+        c.insert(
+            2,
+            [2; 32],
+            Vec::new(),
+            vec![CoinbasePayee { rkm: [2; 4], amount: 2 }],
+        );
+        assert_eq!(c.bytes, 80, "zero and one payee both meter 40 B");
+
+        c.insert(
+            3,
+            [3; 32],
+            Vec::new(),
+            (0..8)
+                .map(|i| CoinbasePayee {
+                    rkm: [i + 1; 4],
+                    amount: i + 1,
+                })
+                .collect(),
+        );
+        assert_eq!(c.bytes, 400, "the eight retained payees add 8 x 40 B");
     }
 
     /// A [`StubNode`] with an applied-body store bolted on — the smallest

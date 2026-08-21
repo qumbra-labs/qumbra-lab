@@ -557,13 +557,12 @@ enum BodyFault {
     Positional(&'static str),
 }
 
-/// The memory a held body actually costs: the proof bytes (which dominate — one 2×2
-/// proof is ~145 kB against a ~100-byte public surface) plus its declared surface.
-/// The memory a held body actually costs — [`crate::n1::txs_weight`] (the meter
-/// shared with the #135 serving cache, so the two byte budgets are comparable)
-/// plus the fixed part: coinbase counter + payout key + map overhead.
+/// The retained body-surface weight shared with the #135 serving cache, so the
+/// two byte budgets stay comparable. Fixed container/map overhead is bounded by
+/// the separate entry caps; the peer-controlled proof and payee data is metered.
 fn body_weight(body: &BlockBody) -> usize {
-    crate::n1::txs_weight(&body.txs) + 40
+    crate::n1::txs_weight(&body.txs)
+        + crate::n1::coinbase_payees_weight(&body.coinbase_payees)
 }
 
 /// The payout key a node mines to when no wallet has been configured (issue #101).
