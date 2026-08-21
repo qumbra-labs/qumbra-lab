@@ -177,6 +177,7 @@ mod tests {
     use qlab_devnet::header::BlockHeader;
     use qlab_devnet::params_devnet::GENESIS_DIFFICULTY;
     use qlab_faucet::{FaucetConfig, FaucetLimits, TicketPolicy, TicketSecret};
+    use qlab_devnet::forms::GenesisForm;
     use qlab_node::{coinbase, genesis_block, CommitmentStore, COINBASE_MATURITY_BLOCKS};
 
     struct NoTx;
@@ -212,6 +213,67 @@ mod tests {
             node.finalize(hash).expect("finalize");
             *tip = header;
         }
+    }
+
+    /// Mine `n` blocks on a **v5** chain paying `rkm`, finalizing each. The v4
+    /// helper above cannot be reused: v5 has its own header layout, its own body
+    /// commitment and the exact emission from height 0 (`GenesisForm::V5`).
+    fn mine_v5(node: &mut MemNode, tip: &mut BlockHeader, n: u64, rkm: [u64; 4]) {
+        for _ in 0..n {
+            let height = tip.height + 1;
+            let body = BlockBody {
+                txs: Vec::new(),
+                coinbase: qlab_node::coinbase_for(GenesisForm::V5, height),
+                coinbase_rkm: rkm,
+            };
+            let header = BlockHeader::child_of_for(
+                GenesisForm::V5,
+                tip,
+                height * 75,
+                GENESIS_DIFFICULTY,
+                body.commitment_v5(),
+            );
+            let hash = node.apply_block(header, body, &NoTx).expect("applies");
+            node.finalize(hash).expect("finalize");
+            *tip = header;
+        }
+    }
+
+    /// 🔴 **A harvested note's commitment must be the leaf the node appended — on
+    /// the net the faucet is actually deployed to.**
+    ///
+    /// Every other test in this module runs on `GenesisForm::V4`, which is why this
+    /// property has never been checked where it can fail. `apply_state` appends
+    /// `matured_coinbase_leaf_for(self.form, …)`, and v5's ρ/rseed derivations carry
+    /// the payee index under a `:v2` domain string — so on a v5 net the v4
+    /// derivation this module calls produces a commitment that is not in the tree.
+    /// The note is funded, counted as held, and can never be witnessed or spent.
+    #[test]
+    fn a_v5_chains_harvested_note_is_the_leaf_the_node_appended() {
+        let wallet = Wallet::from_seed_lanes([0x1230_0000_0000_0007; 4]);
+        let d = Diversifier::default();
+        let genesis = qlab_node::genesis_block_for(GenesisForm::V5, GENESIS_DIFFICULTY, 0);
+        let mut node = MemNode::in_memory_for(GenesisForm::V5, genesis.clone());
+        let mut tip = genesis.header();
+        let mut faucet = faucet_for(&wallet);
+        let mut seen = HashSet::new();
+
+        // Block 1 pays the faucet; grow to the height its leaf is appended at.
+        mine_v5(&mut node, &mut tip, 1, wallet.rkm(d));
+        let at = spendable_at_tip(1);
+        let to_mine = at - node.tip_height();
+        mine_v5(&mut node, &mut tip, to_mine, [0xBB; 4]);
+        assert_eq!(node.tip_height(), at);
+
+        let report = harvest_matured(&mut faucet, &node, &wallet, d, &mut seen);
+        assert_eq!(report.funded, 1, "the matured coinbase is funded: {report:?}");
+
+        let note = &faucet.inventory().notes()[0];
+        assert!(
+            node.commitments().tree().position_of(&note.cm).is_some(),
+            "the funded note's commitment is not a leaf of the v5 chain's tree — it \
+             can never be witnessed, so the faucet holds value it can never spend"
+        );
     }
 
     /// 🔴 The gate: an immature note is counted and named, never funded. One block
