@@ -72,7 +72,7 @@ fn expected_leaves(height: u64) -> u64 {
 /// transition, and finalize it. Returns the new header.
 fn mine_one(node: &mut MemNode, tip: &BlockHeader, rkm: [u64; 4]) -> BlockHeader {
     let height = tip.height + 1;
-    let body = BlockBody { txs: Vec::new(), coinbase: coinbase(height), coinbase_rkm: rkm };
+    let body = BlockBody::from_single_payee(Vec::new(), coinbase(height), rkm);
     let header = BlockHeader::child_of(tip, height * 75, GENESIS_DIFFICULTY, body.commitment());
     let hash = node.apply_block(header, body, &NoTxVerifier).expect("block applies");
     node.finalize(hash).expect("finalize");
@@ -109,7 +109,7 @@ fn a_coinbase_leaf_lands_exactly_one_maturity_delay_later() {
     let mut tip = genesis.header();
 
     // The note minted by block 1, computed the way the schedule computes it.
-    let body1 = BlockBody { txs: Vec::new(), coinbase: coinbase(1), coinbase_rkm: rkm };
+    let body1 = BlockBody::from_single_payee(Vec::new(), coinbase(1), rkm);
     let cm1 = digest_from_bytes(&coinbase_note_leaf(1, &body1).expect("a minting block"));
 
     for _ in 0..COINBASE_MATURITY_BLOCKS {
@@ -189,8 +189,8 @@ fn the_owed_leaf_follows_the_blocks_own_ancestry() {
         b.commitment_root(),
         "the leaf appended at 145 must be the one this chain's height 1 minted"
     );
-    let body_alice = BlockBody { txs: Vec::new(), coinbase: coinbase(1), coinbase_rkm: alice };
-    let body_bob = BlockBody { txs: Vec::new(), coinbase: coinbase(1), coinbase_rkm: bob };
+    let body_alice = BlockBody::from_single_payee(Vec::new(), coinbase(1), alice);
+    let body_bob = BlockBody::from_single_payee(Vec::new(), coinbase(1), bob);
     let cm_alice = digest_from_bytes(&coinbase_note_leaf(1, &body_alice).unwrap());
     let cm_bob = digest_from_bytes(&coinbase_note_leaf(1, &body_bob).unwrap());
     assert!(a.commitments().tree().position_of(&cm_alice).is_some());

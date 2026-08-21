@@ -154,11 +154,7 @@ mod tests {
         let mut node = MemNode::in_memory(genesis.clone());
         let mut tip = genesis.header();
         for height in 1..=height_max {
-            let body = BlockBody {
-                txs: Vec::new(),
-                coinbase: qlab_node::coinbase(height),
-                coinbase_rkm: [height, 2, 3, 4],
-            };
+            let body = BlockBody::from_single_payee(Vec::new(), qlab_node::coinbase(height), [height, 2, 3, 4]);
             let header =
                 BlockHeader::child_of(&tip, height * 75, GENESIS_DIFFICULTY, body.commitment());
             let hash = node.apply_block(header, body, &NoTx).expect("applies");

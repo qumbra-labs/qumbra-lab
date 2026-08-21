@@ -76,7 +76,7 @@ fn apply_block(node: &mut MemNode, txs: Vec<TxEntry>) {
     let tip = node.tip_hash();
     let parent = node.chain().block(&tip).expect("tip stored").header();
     let coinbase = parent.height + 1;
-    let body = BlockBody { txs, coinbase, coinbase_rkm: [coinbase, 2, 3, 4] };
+    let body = BlockBody::from_single_payee(txs, coinbase, [coinbase, 2, 3, 4]);
     let header = BlockHeader::child_of(&parent, parent.height + 1, 1_000, body.commitment());
     node.apply_block(header, body, &AcceptAll).expect("block applies");
 }
@@ -294,11 +294,7 @@ fn v1_names_serves_bulk_and_refuses_resolve_by_name() {
     riding.rider = encode_rider(Some(&NameOp::Commit { commit: [0x5A; 32] }));
     let refused = {
         use qlab_devnet::header::BlockHeader;
-        let body = qlab_devnet::body::BlockBody {
-            txs: vec![riding],
-            coinbase: 1,
-            coinbase_rkm: [1, 2, 3, 4],
-        };
+        let body = qlab_devnet::body::BlockBody::from_single_payee(vec![riding], 1, [1, 2, 3, 4]);
         let parent = rpc.node().chain().block(&rpc.node().tip_hash()).unwrap().header();
         let header = BlockHeader::child_of(&parent, 75, 1, body.commitment());
         rpc.node_mut().apply_block(header, body, &AcceptAll)

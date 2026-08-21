@@ -276,7 +276,8 @@ fn layer_c_bodies_arrive_and_the_rejoin_gate_still_does_not_pass() {
     // it, which is precisely the state a restarted relay is in. Done before the
     // handshake, so nothing is pushed at the asker unasked.
     for (h, b) in &won[1..] {
-        server.announce_block(*h, b.txs.clone(), b.coinbase, b.coinbase_rkm, 0);
+        let (coinbase, rkm) = b.single_payee_parts().expect("current-cap body");
+        server.announce_block(*h, b.txs.clone(), coinbase, rkm, 0);
     }
     let t = threshold_ms(&asker);
     asker.tick(0);
@@ -353,7 +354,8 @@ fn the_three_layers_do_not_print_the_same_line() {
         server.node_mut().ingest_header(*h);
     }
     for (h, b) in &won_c[1..] {
-        server.announce_block(*h, b.txs.clone(), b.coinbase, b.coinbase_rkm, 0);
+        let (coinbase, rkm) = b.single_payee_parts().expect("current-cap body");
+        server.announce_block(*h, b.txs.clone(), coinbase, rkm, 0);
     }
     asker_c.tick(0);
     asker_c.tick(t + 1_000);

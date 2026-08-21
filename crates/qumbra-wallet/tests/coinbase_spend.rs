@@ -91,7 +91,7 @@ fn mine<V: TxVerifier>(
     finalize: bool,
 ) -> u64 {
     let height = tip.height + 1;
-    let body = BlockBody { txs, coinbase: coinbase(height), coinbase_rkm: rkm };
+    let body = BlockBody::from_single_payee(txs, coinbase(height), rkm);
     let header = BlockHeader::child_of(tip, height * 75, GENESIS_DIFFICULTY, body.commitment());
     let mut g = shared.lock().unwrap();
     let node = g.node_mut();

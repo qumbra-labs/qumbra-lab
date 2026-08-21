@@ -176,7 +176,7 @@ pub fn harvest_matured(
         let Some(block) = chain.block(&hash) else { continue };
         let height = block.header.height;
         let body = block.body();
-        if body.coinbase_rkm != mine {
+        if !body.coinbase_payees.iter().any(|p| p.rkm == mine) {
             continue; // someone else's block, or an unconfigured burn payout
         }
         let Some(leaf) = coinbase_note_leaf_for(form, height, &body) else {
@@ -248,7 +248,7 @@ mod tests {
     fn mine(node: &mut MemNode, tip: &mut BlockHeader, n: u64, rkm: [u64; 4]) {
         for _ in 0..n {
             let height = tip.height + 1;
-            let body = BlockBody { txs: Vec::new(), coinbase: coinbase(height), coinbase_rkm: rkm };
+            let body = BlockBody::from_single_payee(Vec::new(), coinbase(height), rkm);
             let header =
                 BlockHeader::child_of(tip, height * 75, GENESIS_DIFFICULTY, body.commitment());
             let hash = node.apply_block(header, body, &NoTx).expect("applies");
@@ -263,11 +263,7 @@ mod tests {
     fn mine_v5(node: &mut MemNode, tip: &mut BlockHeader, n: u64, rkm: [u64; 4]) {
         for _ in 0..n {
             let height = tip.height + 1;
-            let body = BlockBody {
-                txs: Vec::new(),
-                coinbase: qlab_node::coinbase_for(GenesisForm::V5, height),
-                coinbase_rkm: rkm,
-            };
+            let body = BlockBody::from_single_payee(Vec::new(), qlab_node::coinbase_for(GenesisForm::V5, height), rkm);
             let header = BlockHeader::child_of_for(
                 GenesisForm::V5,
                 tip,
@@ -490,11 +486,7 @@ mod tests {
 
         mine(&mut node, &mut tip, 1, miner.rkm(d));
         let minted_at = 1u64;
-        let body = BlockBody {
-            txs: Vec::new(),
-            coinbase: coinbase(minted_at),
-            coinbase_rkm: miner.rkm(d),
-        };
+        let body = BlockBody::from_single_payee(Vec::new(), coinbase(minted_at), miner.rkm(d));
         let cb = coinbase_note_leaf_for(GenesisForm::V4, minted_at, &body)
             .expect("a minting block");
         let cm = qlab_note::hash::digest_from_bytes(&cb);
@@ -612,11 +604,7 @@ mod tests {
                     fee: qlab_devnet::fees::posted_fee(ArityBucket::TwoByTwo),
                 },
             );
-            let body = BlockBody {
-                txs: vec![fake],
-                coinbase: coinbase(height),
-                coinbase_rkm: [0xEE; 4],
-            };
+            let body = BlockBody::from_single_payee(vec![fake], coinbase(height), [0xEE; 4]);
             let header =
                 BlockHeader::child_of(&tip, height * 75, GENESIS_DIFFICULTY, body.commitment());
             let hash = node.apply_block(header, body, &AcceptAll).expect("applies");

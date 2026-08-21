@@ -124,7 +124,7 @@ fn mempool_rejects_a_tx_double_spending_an_already_applied_nullifier() {
     // Apply a block spending nullifier [7;32].
     let spent_tx = tx(g_root, 7);
     let body =
-        BlockBody { txs: vec![spent_tx], coinbase: coinbase(1), coinbase_rkm: MINER_RKM };
+        BlockBody::from_single_payee(vec![spent_tx], coinbase(1), MINER_RKM);
     let header = BlockHeader::child_of(&g_header, 1, GENESIS_DIFFICULTY, body.commitment());
     node.apply_block(header, body, &MockVerifier).unwrap();
     assert!(node.is_spent(&[7; 32]));

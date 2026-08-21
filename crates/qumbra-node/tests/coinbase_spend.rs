@@ -79,7 +79,7 @@ impl Chain {
     fn mine_to(&mut self, rkm: [u64; 4]) -> u64 {
         let height = self.tip.height + 1;
         let body =
-            BlockBody { txs: Vec::new(), coinbase: coinbase(height), coinbase_rkm: rkm };
+            BlockBody::from_single_payee(Vec::new(), coinbase(height), rkm);
         self.apply(body)
     }
 
@@ -266,11 +266,7 @@ fn a_mined_coin_can_be_spent_after_maturity_with_a_real_proof() {
     mp.admit(entry.clone(), &chain.node, &ConsensusVerifier, &qlab_devnet::names::EmptyNameView)
         .expect("a matured, well-proved spend is admitted");
 
-    let spend_body = BlockBody {
-        txs: vec![entry],
-        coinbase: coinbase(tip + 1),
-        coinbase_rkm: miner_rkm,
-    };
+    let spend_body = BlockBody::from_single_payee(vec![entry], coinbase(tip + 1), miner_rkm);
     let before = chain.node.commitment_count();
     chain.apply_with(spend_body, &ConsensusVerifier);
     assert!(chain.node.is_spent(&digest_bytes(&inst.nf[0])), "input 1 is nullified");
@@ -534,11 +530,7 @@ fn a_forged_anchor_carrying_a_real_proof_is_rejected_at_the_block_path() {
     );
 
     // 🔴 THE CLAIM: submitted as a block, with no mempool involved, it is rejected.
-    let body = BlockBody {
-        txs: vec![entry],
-        coinbase: coinbase(chain.tip.height + 1),
-        coinbase_rkm: miner_rkm,
-    };
+    let body = BlockBody::from_single_payee(vec![entry], coinbase(chain.tip.height + 1), miner_rkm);
     let verdict = chain.try_apply_with(body, &ConsensusVerifier);
     assert!(
         matches!(verdict, Err(qlab_node::NodeError::Body(BodyError::AnchorNotFinal { index: 0 }))),
@@ -623,7 +615,7 @@ fn a_minting_block_with_no_payout_key_is_rejected() {
     let mut chain = Chain::new();
     let height = chain.tip.height + 1;
     let body =
-        BlockBody { txs: Vec::new(), coinbase: coinbase(height), coinbase_rkm: [0; 4] };
+        BlockBody::from_single_payee(Vec::new(), coinbase(height), [0; 4]);
     let header =
         BlockHeader::child_of(&chain.tip, 75, GENESIS_DIFFICULTY, body.commitment());
     let err = chain.node.apply_block(header, body, &NoTxVerifier).unwrap_err();
@@ -642,10 +634,11 @@ fn a_redirected_payout_key_is_rejected_by_the_header_binding() {
     let mut chain = Chain::new();
     let height = chain.tip.height + 1;
     let honest =
-        BlockBody { txs: Vec::new(), coinbase: coinbase(height), coinbase_rkm: [0xAA; 4] };
+        BlockBody::from_single_payee(Vec::new(), coinbase(height), [0xAA; 4]);
     let header =
         BlockHeader::child_of(&chain.tip, 75, GENESIS_DIFFICULTY, honest.commitment());
-    let stolen = BlockBody { coinbase_rkm: [0xBB; 4], ..honest.clone() };
+    let stolen =
+        BlockBody::from_single_payee(honest.txs.clone(), honest.coinbase_total(), [0xBB; 4]);
     let err = chain.node.apply_block(header, stolen, &NoTxVerifier).unwrap_err();
     assert!(
         matches!(
@@ -722,7 +715,7 @@ fn replay_reproduces_the_coinbase_leaves() {
     let final_height = coinbase_leaf_appears_at(last_minter);
     for height in 1..=final_height {
         let coinbase_rkm = if height <= last_minter { rkm_at(height) } else { burn };
-        let body = BlockBody { txs: Vec::new(), coinbase: coinbase(height), coinbase_rkm };
+        let body = BlockBody::from_single_payee(Vec::new(), coinbase(height), coinbase_rkm);
         let header =
             BlockHeader::child_of(&tip, height * 75, GENESIS_DIFFICULTY, body.commitment());
         node.apply_block(header, body, &NoTxVerifier).expect("applies");
@@ -744,11 +737,7 @@ fn replay_reproduces_the_coinbase_leaves() {
     for height in 1..=last_minter {
         let leaf = coinbase_note_leaf(
             height,
-            &BlockBody {
-                txs: Vec::new(),
-                coinbase: coinbase(height),
-                coinbase_rkm: rkm_at(height),
-            },
+            &BlockBody::from_single_payee(Vec::new(), coinbase(height), rkm_at(height)),
         )
         .expect("minting");
         assert_eq!(

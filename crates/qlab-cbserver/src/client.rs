@@ -1174,7 +1174,7 @@ mod tests {
             }
 
             let coinbase_rkm = [height, height ^ 0xA5, height ^ 0x5A, height ^ 0xFF];
-            let body = BlockBody { txs: body_txs, coinbase: height, coinbase_rkm };
+            let body = BlockBody::from_single_payee(body_txs, height, coinbase_rkm);
             let header =
                 BlockHeader::child_of(&parent, height, DIFFICULTY, body.commitment());
             chain.insert_header(header).expect("chained child header inserts cleanly");

@@ -500,12 +500,12 @@ pub const MAX_COINBASE_BLOCKS: usize = 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BlockCoinbase {
     pub height: u64,
-    /// `body.coinbase_rkm` — the payee's raw `rkm` lanes, verbatim. `[0; 4]` is
+    /// The sole entry in `body.coinbase_payees` — raw `rkm` lanes, verbatim. `[0; 4]` is
     /// the no-payee sentinel a non-minting block carries (genesis); a wallet's
     /// own `rkm` is a hash output and never that, so matching cannot collide
     /// with it, and a matcher must still never treat it as an identity.
     pub coinbase_rkm: [u64; 4],
-    /// `body.coinbase` — the issuance this block declared. **Not the note's
+    /// `body.coinbase_total()` — the issuance this block declared. **Not the note's
     /// value**: the miner takes the frozen §3 share of it plus the fees below.
     pub coinbase: u64,
     /// `body.total_fees()` — the block's declared fees, which are the miner's.

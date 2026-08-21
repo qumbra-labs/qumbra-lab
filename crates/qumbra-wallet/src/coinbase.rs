@@ -739,11 +739,7 @@ mod tests {
             "the whole declared issuance is NOT the miner's"
         );
         // And the note is the one a node would have appended.
-        let body = qlab_devnet::body::BlockBody {
-            txs: vec![],
-            coinbase: 5_000,
-            coinbase_rkm: mine,
-        };
+        let body = qlab_devnet::body::BlockBody::from_single_payee(vec![], 5_000, mine);
         assert_eq!(
             Some(report.spendable[0].note.clone()),
             qlab_node::coinbase_note(1, &body),
@@ -862,11 +858,7 @@ mod tests {
         let mut tip = genesis.header();
         let last = coinbase_leaf_appears_at(1) + 2;
         for height in 1..=last {
-            let body = BlockBody {
-                txs: Vec::new(),
-                coinbase: qlab_node::coinbase(height),
-                coinbase_rkm: mine,
-            };
+            let body = BlockBody::from_single_payee(Vec::new(), qlab_node::coinbase(height), mine);
             let header =
                 BlockHeader::child_of(&tip, height * 75, GENESIS_DIFFICULTY, body.commitment());
             let hash = node.apply_block(header, body, &NoTx).expect("block applies");
@@ -1044,11 +1036,7 @@ mod tests {
         let mut tip = genesis.header();
         let last = coinbase_leaf_appears_at(1) + 2;
         for height in 1..=last {
-            let body = BlockBody {
-                txs: Vec::new(),
-                coinbase: qlab_node::coinbase_for(GenesisForm::V5, height),
-                coinbase_rkm: mine,
-            };
+            let body = BlockBody::from_single_payee(Vec::new(), qlab_node::coinbase_for(GenesisForm::V5, height), mine);
             let header = BlockHeader::child_of_for(
                 GenesisForm::V5,
                 &tip,

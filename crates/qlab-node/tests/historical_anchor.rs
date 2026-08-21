@@ -52,7 +52,7 @@ fn tx(anchor: Hash32, nullifiers: Vec<Hash32>, commitments: Vec<Hash32>) -> TxEn
 }
 
 fn one_tx_block(parent: &BlockHeader, tx: TxEntry) -> (BlockHeader, BlockBody) {
-    let body = BlockBody { txs: vec![tx], coinbase: 0, coinbase_rkm: [0; 4] };
+    let body = BlockBody::from_single_payee(vec![tx], 0, [0; 4]);
     let header =
         BlockHeader::child_of(parent, parent.height + 1, GENESIS_DIFFICULTY, body.commitment());
     (header, body)

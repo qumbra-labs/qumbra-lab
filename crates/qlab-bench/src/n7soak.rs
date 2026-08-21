@@ -121,7 +121,8 @@ impl FullNode {
     pub fn mine_and_announce(&mut self, nonce: u64) -> bool {
         match self.p2p.node_mut().mine_block() {
             Some((header, body)) => {
-                self.p2p.announce_block(header, body.txs, body.coinbase, body.coinbase_rkm, nonce);
+                let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
+                self.p2p.announce_block(header, body.txs, coinbase, rkm, nonce);
                 true
             }
             None => false,
@@ -383,7 +384,7 @@ pub fn scenario_adversarial_peers() -> SoakResult {
     // The header must commit to the body it announces (issue #77) — otherwise the
     // binding rejects it first and this case would no longer test what it claims.
     let bad_tx = soak_tx(anchor, 3, false);
-    let bad_body = qlab_devnet::body::BlockBody { txs: vec![bad_tx.clone()], coinbase: 0, coinbase_rkm: [0; 4] };
+    let bad_body = qlab_devnet::body::BlockBody::from_single_payee(vec![bad_tx.clone()], 0, [0; 4]);
     let bad_block_header =
         BlockHeader::child_of(&BlockHeader::genesis(256, 0), 75, 256, bad_body.commitment());
     let ann = BlockAnnounce {
@@ -409,7 +410,7 @@ pub fn scenario_adversarial_peers() -> SoakResult {
     //      penalized, and never applied.
     let score_c2 = peer_score(&nodes[1], PeerId(1));
     let honest_body =
-        qlab_devnet::body::BlockBody { txs: vec![soak_tx(anchor, 4, true)], coinbase: 0, coinbase_rkm: [0; 4] };
+        qlab_devnet::body::BlockBody::from_single_payee(vec![soak_tx(anchor, 4, true)], 0, [0; 4]);
     let honest_header =
         BlockHeader::child_of(&BlockHeader::genesis(256, 0), 75, 256, honest_body.commitment());
     let ann_empty = BlockAnnounce {
@@ -605,7 +606,7 @@ pub fn scenario_restart_reorg_partition(seed: u64) -> SoakResult {
     let mut disk = MemNode::open(&dir, genesis.clone()).unwrap();
     let mut parent = BlockHeader::genesis(256, 0);
     for h in 1..=3u64 {
-        let body = BlockBody { txs: Vec::new(), coinbase: 0, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(Vec::new(), 0, [0; 4]);
         let header = BlockHeader::child_of(&parent, h * 75, 256, body.commitment());
         disk.apply_block(header, body, &MarkerVerifier).unwrap();
         parent = header;

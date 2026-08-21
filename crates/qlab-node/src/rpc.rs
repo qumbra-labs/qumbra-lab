@@ -276,7 +276,7 @@ pub struct BlockDiscovery {
     /// (lab #367). Same no-encoder-between-block-and-served-bytes guarantee
     /// as `groups`.
     pub riders: Vec<Vec<u8>>,
-    /// This block's coinbase payee — `body.coinbase_rkm`, verbatim (lab #415).
+    /// This block's sole coinbase payee, projected from `body.coinbase_payees` (lab #415).
     ///
     /// ## Why it rides here too
     ///
@@ -291,7 +291,7 @@ pub struct BlockDiscovery {
     /// records is that a chain of coinbase-only blocks projected to nothing a
     /// wallet could read.
     pub coinbase_rkm: [u64; 4],
-    /// `body.coinbase` — the issuance this block declared, verbatim. **Not the
+    /// `body.coinbase_total()` — the issuance this block declared. **Not the
     /// coinbase note's value**; see [`crate::coinbase::coinbase_note_value_parts`].
     pub coinbase: u64,
     /// `body.total_fees()` — the declared fees, which are the miner's.
@@ -1693,7 +1693,7 @@ mod tests {
         let tip_hash = node.tip_hash();
         let parent = node.chain().block(&tip_hash).expect("tip block stored").header();
         let height = parent.height + 1;
-        let body = BlockBody { txs: vec![], coinbase: height, coinbase_rkm: [height, 2, 3, 4] };
+        let body = BlockBody::from_single_payee(vec![], height, [height, 2, 3, 4]);
         let header = BlockHeader::child_of(&parent, timestamp, 1_000, body.commitment());
         let hash = header.header_hash();
         node.apply_block(header, body, &OkVerifier).expect("block applies");
@@ -2060,8 +2060,9 @@ mod tests {
             chain.block(&hash).expect("the tip is stored").clone()
         };
         let body = stored.body();
-        assert_eq!(blk.coinbase_rkm, body.coinbase_rkm);
-        assert_eq!(blk.coinbase, body.coinbase);
+        let (body_coinbase, body_rkm) = body.single_payee_parts().expect("current-cap body");
+        assert_eq!(blk.coinbase_rkm, body_rkm);
+        assert_eq!(blk.coinbase, body_coinbase);
         assert_eq!(blk.fees, body.total_fees());
         assert_eq!(blk.name_burn, body.total_name_burn());
 
@@ -2085,11 +2086,11 @@ mod tests {
 
         // 🔴 …and the schedule alone would NOT have produced it: the value is
         // the miner's share plus this block's fees.
-        assert_eq!(note.value, crate::RewardSplit::of(body.coinbase).miner + fee);
-        assert_ne!(note.value, body.coinbase, "the whole emission is not the miner's");
+        assert_eq!(note.value, crate::RewardSplit::of(body.coinbase_total()).miner + fee);
+        assert_ne!(note.value, body.coinbase_total(), "the whole emission is not the miner's");
         assert_ne!(
             note.value,
-            crate::RewardSplit::of(body.coinbase).miner,
+            crate::RewardSplit::of(body.coinbase_total()).miner,
             "and the fees are part of it — the task book's rule would have been short by {fee}"
         );
 
@@ -2177,8 +2178,9 @@ mod tests {
         let body = stored.body();
         let projected = BlockDiscovery::of(rpc.node().tip_hash(), &stored);
 
-        assert_eq!(projected.coinbase, body.coinbase);
-        assert_eq!(projected.coinbase_rkm, body.coinbase_rkm);
+        let (body_coinbase, body_rkm) = body.single_payee_parts().expect("current-cap body");
+        assert_eq!(projected.coinbase, body_coinbase);
+        assert_eq!(projected.coinbase_rkm, body_rkm);
         assert_eq!(projected.fees, body.total_fees(), "two transactions' worth of fee");
         assert_eq!(projected.fees, 2 * fee);
         assert_eq!(projected.name_burn, body.total_name_burn());
@@ -2354,7 +2356,7 @@ mod tests {
         let height = parent.height + 1;
         let (coinbase, coinbase_rkm) =
             if minting { (height, [height, 2, 3, 4]) } else { (0, [0; 4]) };
-        let body = BlockBody { txs, coinbase, coinbase_rkm };
+        let body = BlockBody::from_single_payee(txs, coinbase, coinbase_rkm);
         // child_of's 2nd arg is the timestamp; height is derived from the parent.
         let header = BlockHeader::child_of(&parent, height, 1_000, body.commitment());
         node.apply_block(header, body, &OkVerifier).expect("block applies");

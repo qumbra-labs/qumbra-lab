@@ -1420,7 +1420,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
         // node the origin of the very object every peer must penalise.
         let outcome = self
             .node
-            .ingest_block(header, BlockBody { txs: txs.clone(), coinbase, coinbase_rkm });
+            .ingest_block(header, BlockBody::from_single_payee(txs.clone(), coinbase, coinbase_rkm));
         // Issue #134 widens this from `Rejected` to `Rejected | Ignored`. `Ignored` now
         // also covers a body whose anchors this node **could not evaluate**, and
         // announcing one would make this node the origin of an object it never
@@ -1984,11 +1984,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
     /// refuse them: see that method for the loop this closed on the live net.
     fn body_for_serving(&self, hash: &Hash32) -> Option<BlockBody> {
         if let Some(entry) = self.blocks.get(hash) {
-            return Some(BlockBody {
-                txs: entry.txs.clone(),
-                coinbase: entry.coinbase,
-                coinbase_rkm: entry.coinbase_rkm,
-            });
+            return Some(BlockBody::from_single_payee(entry.txs.clone(), entry.coinbase, entry.coinbase_rkm));
         }
         self.node.held_body(hash)
     }
@@ -3166,11 +3162,7 @@ impl<T: Transport, N: NodeState> P2pNode<T, N> {
             .node
             .ingest_block(
                 ann.header,
-                BlockBody {
-                    txs: txs.clone(),
-                    coinbase: ann.coinbase,
-                    coinbase_rkm: ann.coinbase_rkm,
-                },
+                BlockBody::from_single_payee(txs.clone(), ann.coinbase, ann.coinbase_rkm),
             );
         // Orphan-triggered sync kick (M10-T0-1, issue #62 item 6 — the N7 finding):
         // an announced block whose parent is unknown was previously dropped, and
@@ -3265,6 +3257,8 @@ where
 /// a pure function of the block, so two nodes serving the same block serve the
 /// same bytes.
 fn whole_block_announce(header: BlockHeader, body: BlockBody) -> BlockAnnounce {
+    let (coinbase, coinbase_rkm) =
+        body.single_payee_parts().expect("accepted body is at the current cap");
     let prefilled = body
         .txs
         .into_iter()
@@ -3274,8 +3268,8 @@ fn whole_block_announce(header: BlockHeader, body: BlockBody) -> BlockAnnounce {
     BlockAnnounce {
         header,
         nonce: 0,
-        coinbase: body.coinbase,
-        coinbase_rkm: body.coinbase_rkm,
+        coinbase,
+        coinbase_rkm,
         short_ids: Vec::new(),
         prefilled,
     }
@@ -3739,7 +3733,7 @@ mod tests {
     /// commits to exactly that body, which since issue #77 is what makes the
     /// announce ingestable at all.
     fn header_over(parent: &BlockHeader, ts: u64, txs: &[TxEntry], coinbase: u64) -> BlockHeader {
-        let body = BlockBody { txs: txs.to_vec(), coinbase, coinbase_rkm: [0; 4] };
+        let body = BlockBody::from_single_payee(txs.to_vec(), coinbase, [0; 4]);
         BlockHeader::child_of(parent, ts, 1000, body.commitment())
     }
 
@@ -6056,11 +6050,12 @@ mod tests {
             );
             let (header, body) = nodes[0].node_mut().mine_block().expect("mine");
             assert_eq!(body.txs.len(), 1, "the served block carries a transaction");
+            let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
             nodes[0].announce_block(
                 header,
                 body.txs.clone(),
-                body.coinbase,
-                body.coinbase_rkm,
+                coinbase,
+                rkm,
                 round,
             );
             drive(nodes, (round + 1) * 10_000);
@@ -6175,7 +6170,8 @@ mod tests {
             );
             let (header, body) = nodes[0].node_mut().mine_block().expect("mine");
             assert_eq!(body.txs.len(), 1);
-            nodes[0].announce_block(header, body.txs.clone(), body.coinbase, body.coinbase_rkm, 1);
+            let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
+            nodes[0].announce_block(header, body.txs.clone(), coinbase, rkm, 1);
             drive(&mut nodes, 50_000);
 
             assert_eq!(

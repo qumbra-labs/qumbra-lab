@@ -957,15 +957,15 @@ mod tests {
         let back = decode_tx(&encode_tx(&tx)).unwrap();
         assert_eq!(back.discovery, tx.discovery, "discovery bytes are carried verbatim");
 
-        let here = BlockBody { txs: vec![tx.clone()], coinbase: 7, coinbase_rkm: [1, 2, 3, 4] };
-        let there = BlockBody { txs: vec![back], coinbase: 7, coinbase_rkm: [1, 2, 3, 4] };
+        let here = BlockBody::from_single_payee(vec![tx.clone()], 7, [1, 2, 3, 4]);
+        let there = BlockBody::from_single_payee(vec![back], 7, [1, 2, 3, 4]);
         assert_eq!(here.commitment(), there.commitment());
 
         // And a peer that strips the group produces a different body — the
         // mutation this test exists to catch.
         let mut stripped = decode_tx(&encode_tx(&tx)).unwrap();
         stripped.discovery = TxEntry::empty_discovery();
-        let mutated = BlockBody { txs: vec![stripped], coinbase: 7, coinbase_rkm: [1, 2, 3, 4] };
+        let mutated = BlockBody::from_single_payee(vec![stripped], 7, [1, 2, 3, 4]);
         assert_ne!(here.commitment(), mutated.commitment());
     }
 

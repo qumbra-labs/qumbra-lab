@@ -40,7 +40,7 @@ impl TxVerifier for AnyTx {
 
 fn mine(node: &mut MemNode, tip: &mut BlockHeader, txs: Vec<TxEntry>) -> u64 {
     let height = tip.height + 1;
-    let body = BlockBody { txs, coinbase: coinbase(height), coinbase_rkm: [0xBE, 0xEF, 1, 2] };
+    let body = BlockBody::from_single_payee(txs, coinbase(height), [0xBE, 0xEF, 1, 2]);
     let header = BlockHeader::child_of(tip, height * 75, GENESIS_DIFFICULTY, body.commitment());
     let hash = node.apply_block(header, body, &AnyTx).expect("block applies");
     node.finalize(hash).expect("finalize");

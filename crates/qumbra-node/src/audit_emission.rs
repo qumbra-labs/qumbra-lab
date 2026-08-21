@@ -1,5 +1,5 @@
 //! Read-only emission audit: walk a node's persisted main chain and report every
-//! height whose committed `body.coinbase` differs from the schedule
+//! height whose committed payee total differs from the schedule
 //! ([`qlab_node::emission::coinbase_for`] of the opened node's [`GenesisForm`]).
 //!
 //! This is the localization tool for lab issue #299 / QUM-82. It **observes**;
@@ -73,9 +73,9 @@ pub struct AuditReport {
 pub struct PayeeTally {
     /// The key asked about, as circuit lanes.
     pub rkm: [u64; 4],
-    /// Canonical blocks in the interval whose `body.coinbase_rkm` is that key.
+    /// Canonical blocks in the interval whose payee list contains that key.
     pub blocks: u64,
-    /// Their committed `body.coinbase` summed, in bessel. The MINER's share is a
+    /// Their matching payee amounts summed, in bessel. The MINER's share is a
     /// fraction of this (`RewardSplit`), not this number — raw so the split stays
     /// in one place.
     pub coinbase_bessel: u128,
@@ -273,7 +273,7 @@ pub fn audit_emission_for(
         });
     }
 
-    // Genesis is never audited as a mismatch (issue #299): body.coinbase == 0 by
+    // Genesis is never audited as a mismatch (issue #299): the payee total is 0 by
     // construction while coinbase(0) = 5e9. Accept --from 0 and skip height 0.
     let skipped_genesis = from_req == 0;
     let audit_from = if skipped_genesis {
@@ -311,9 +311,9 @@ pub fn audit_emission_for(
         blocks_in_interval += 1;
         if let Some(want) = payee {
             let body = block.body();
-            if body.coinbase_rkm == want {
+            if let Some(paid) = body.coinbase_payees.iter().find(|p| p.rkm == want) {
                 payee_blocks += 1;
-                payee_bessel += u128::from(body.coinbase);
+                payee_bessel += u128::from(paid.amount);
             }
         }
         if let Some(m) = mismatch_at(form, block) {
@@ -472,11 +472,7 @@ mod tests {
             .expect("tip block")
             .header();
         let height = parent.height + 1;
-        let body = BlockBody {
-            txs: vec![],
-            coinbase: committed_coinbase,
-            coinbase_rkm: RKM,
-        };
+        let body = BlockBody::from_single_payee(vec![], committed_coinbase, RKM);
         let header = BlockHeader::child_of(
             &parent,
             height,
@@ -592,7 +588,7 @@ mod tests {
             extend(&mut node, coinbase(1));
         }
         // Explicit --from 0: height 0 must be "skipped genesis", not a MISMATCH,
-        // even though coinbase(0) = 5e9 while body.coinbase == 0.
+        // even though coinbase(0) = 5e9 while the body's payee total is 0.
         let report = audit_emission(&dir, Some(0), None, None).unwrap();
         assert!(report.skipped_genesis);
         assert!(report.mismatches.is_empty());

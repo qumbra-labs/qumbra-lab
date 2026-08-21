@@ -2205,11 +2205,12 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         use qlab_p2p::n1::ChainView;
         let form = self.p2p.node().genesis_form();
         self.nonce = self.nonce.wrapping_add(1);
+        let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
         let outcome = self.p2p.announce_block_named(
             header,
             body.txs,
-            body.coinbase,
-            body.coinbase_rkm,
+            coinbase,
+            rkm,
             self.nonce,
         );
         // Refresh the template cache: a new tip (or a refusal that left the
@@ -2480,7 +2481,8 @@ impl<P: PowEngine, V: TxVerifier + Clone> RunningNode<P, V> {
         match self.p2p.node_mut().mine_block() {
             Some((header, body)) => {
                 self.nonce = self.nonce.wrapping_add(1);
-                self.p2p.announce_block(header, body.txs, body.coinbase, body.coinbase_rkm, self.nonce);
+                let (coinbase, rkm) = body.single_payee_parts().expect("current-cap body");
+                self.p2p.announce_block(header, body.txs, coinbase, rkm, self.nonce);
                 self.last_mine = Instant::now();
                 true
             }

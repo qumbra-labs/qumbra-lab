@@ -125,7 +125,7 @@ impl MineTemplateWire {
             tx_body_commitment: hex_encode(&c.header.tx_body_commitment),
             seed_hash: hex_encode(&c.seed_hash),
             next_seed_hash: c.next_seed_hash.map(|h| hex_encode(&h)),
-            coinbase_payees: payees_to_wire(&c.body.coinbase_payees()),
+            coinbase_payees: payees_to_wire(&c.body.coinbase_payees),
             txs: c.body.txs.iter().map(|tx| hex_encode(&encode_tx(tx))).collect(),
         }
     }
@@ -146,15 +146,7 @@ impl MineBlockWire {
             let tx = decode_tx(&bytes).map_err(|e| format!("tx[{i}]: {e:?}"))?;
             txs.push(tx);
         }
-        Ok((
-            form,
-            header,
-            BlockBody {
-                txs,
-                coinbase: payees[0].amount,
-                coinbase_rkm: payees[0].rkm,
-            },
-        ))
+        Ok((form, header, BlockBody::new(txs, payees)))
     }
 }
 
@@ -288,15 +280,11 @@ mod tests {
     #[test]
     fn block_wire_round_trips_a_coinbase_only_v5_body() {
         let header = sample_header();
-        let body = BlockBody {
-            txs: Vec::new(),
-            coinbase: 5_000_000_000,
-            coinbase_rkm: [1, 2, 3, 4],
-        };
+        let body = BlockBody::from_single_payee(Vec::new(), 5_000_000_000, [1, 2, 3, 4]);
         let wire = MineBlockWire {
             form: "v5".into(),
             header: header_hex(GenesisForm::V5, &header),
-            coinbase_payees: payees_to_wire(&body.coinbase_payees()),
+            coinbase_payees: payees_to_wire(&body.coinbase_payees),
             txs: vec![],
         };
         let json = serde_json::to_string(&wire).unwrap();
@@ -304,8 +292,7 @@ mod tests {
         let (form, h, b) = back.decode().unwrap();
         assert_eq!(form, GenesisForm::V5);
         assert_eq!(h, header);
-        assert_eq!(b.coinbase, body.coinbase);
-        assert_eq!(b.coinbase_rkm, body.coinbase_rkm);
+        assert_eq!(b.coinbase_payees, body.coinbase_payees);
         assert!(b.txs.is_empty());
     }
 
