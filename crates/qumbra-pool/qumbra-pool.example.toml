@@ -20,6 +20,15 @@ poll_ms = 1000
 # template_max_poll_failures = 5
 # template_max_age_ms = 15000
 
+# Public-stratum guards (lab #544). Unset, per-IP is max(1, max_connections / 8)
+# so one peer cannot occupy the whole cap; connection timeout tracks request
+# timeout (first complete line from accept; after that, silence is a miner).
+# max_connections = 64
+# max_connections_per_ip = 8
+# max_line_bytes = 4096
+# request_timeout_ms = 10000
+# connection_timeout_ms = 10000
+
 # Deliberately unusable placeholder: replace it with the public `rkm` from the
 # pool's dedicated wallet. Leaving it zero makes `check` and `run` refuse by name.
 payout_rkm = "0000000000000000000000000000000000000000000000000000000000000000"
