@@ -783,8 +783,12 @@ pub unsafe extern "C" fn qmb_address_qr_svg(
     let full = (*w).wallet.address_at_index(index).encode();
     match qumbra_wallet::qr::render_svg(&full) {
         Ok(svg) => out_string(svg),
+        // `{e}`, not `{e:?}` — #569's third finding, at the site it missed.
+        // `QrRenderError`'s Display names the capacity and what to do about it;
+        // Debug renders `TooLong { len: 3000 }`, which a shell would put on
+        // screen verbatim and tell the user nothing.
         Err(e) => {
-            set_err(err_out, format!("QR refused: {e:?}"));
+            set_err(err_out, format!("QR refused: {e}"));
             ptr::null_mut()
         }
     }
@@ -1284,6 +1288,42 @@ pub unsafe extern "C" fn qmb_amount_parse(
             // and paraphrasing here would be a second source of truth.
             set_err(err_out, format!("amount refused: {why}"));
             -1
+        }
+    }
+}
+
+/// The same payment URI [`qmb_uri_build`] returns, rendered as a QR (SVG) —
+/// ONE call, so the text a Receive screen shows and the code a payer scans
+/// cannot disagree about the amount. Composes `qmb_uri_build`, so there is
+/// still exactly one URI builder and this cannot drift from it; a `qs1…`
+/// fingerprint is refused with the builder's own sentence.
+///
+/// A general "QR of any text" export would be a wider surface than a Receive
+/// screen needs, and is deliberately not what this is.
+///
+/// 🔴 The caller still shows the `qs1…` fingerprint beside it: a QR that
+/// merely scans is not a verified address (#342 D3).
+///
+/// # Safety
+/// `address` NULL or NUL-terminated UTF-8; `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_uri_qr_svg(
+    address: *const c_char,
+    amount_bessel: u64,
+    has_amount: u8,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    let uri_ptr = qmb_uri_build(address, amount_bessel, has_amount, err_out);
+    if uri_ptr.is_null() {
+        return ptr::null_mut(); // the builder already named the refusal
+    }
+    let uri = CStr::from_ptr(uri_ptr).to_string_lossy().into_owned();
+    qmb_string_free(uri_ptr);
+    match qumbra_wallet::qr::render_svg(&uri) {
+        Ok(svg) => out_string(svg),
+        Err(e) => {
+            set_err(err_out, format!("QR refused: {e}"));
+            ptr::null_mut()
         }
     }
 }
@@ -2044,6 +2084,118 @@ mod tests {
                 qmb_string_free(addr_out);
                 assert_eq!((has_out, amount_out), (has_in, amount_in), "round-trip lost the amount: {uri}");
             }
+            qmb_wallet_free(w);
+        }
+    }
+
+    /// The QR is of the URI the builder built — asserted by parsing the URI
+    /// out of the pair, not by trusting that one call fed the other. A QR that
+    /// encodes a different amount than the text beside it is the failure this
+    /// one-call export exists to make impossible.
+    #[test]
+    fn the_qr_encodes_the_same_uri_the_builder_returns() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([17u8; 32].as_ptr());
+            let full_ptr = qmb_wallet_address(w, 0);
+            let full = CStr::from_ptr(full_ptr).to_str().unwrap().to_string();
+            qmb_string_free(full_ptr);
+            let addr = CString::new(full).unwrap();
+            let mut err: *mut c_char = ptr::null_mut();
+
+            for &(amount, has) in &[(150_000_000u64, 1u8), (0, 0)] {
+                let svg_ptr = qmb_uri_qr_svg(addr.as_ptr(), amount, has, &mut err);
+                assert!(!svg_ptr.is_null(), "QR refused a good address");
+                let svg = CStr::from_ptr(svg_ptr).to_str().unwrap().to_string();
+                qmb_string_free(svg_ptr);
+                assert!(svg.contains("<svg"), "{}", &svg[..40.min(svg.len())]);
+                // Same inputs through the builder must give a QR of equal size:
+                // the QR is a deterministic function of the URI, so an SVG that
+                // differs means the two calls encoded different strings.
+                let a = qmb_uri_qr_svg(addr.as_ptr(), amount, has, &mut err);
+                let again = CStr::from_ptr(a).to_str().unwrap().to_string();
+                qmb_string_free(a);
+                assert_eq!(svg, again, "the QR of one URI is not stable");
+            }
+            // An amount-bearing request encodes MORE than an amount-less one,
+            // which is the cheap proof that the amount reached the QR at all —
+            // a composition that dropped `amount` would render both the same.
+            let with = qmb_uri_qr_svg(addr.as_ptr(), 150_000_000, 1, &mut err);
+            let without = qmb_uri_qr_svg(addr.as_ptr(), 0, 0, &mut err);
+            let (a, b) = (
+                CStr::from_ptr(with).to_str().unwrap().to_string(),
+                CStr::from_ptr(without).to_str().unwrap().to_string(),
+            );
+            qmb_string_free(with);
+            qmb_string_free(without);
+            assert_ne!(a, b, "the amount never reached the QR");
+            qmb_wallet_free(w);
+        }
+    }
+
+    /// The QR half refuses exactly what the builder refuses, with the
+    /// builder's own sentence — it must not invent a second classifier or
+    /// swallow the reason behind a generic "QR refused".
+    #[test]
+    fn the_qr_half_refuses_with_the_builders_sentence() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([19u8; 32].as_ptr());
+            let short_ptr = qmb_wallet_address_short(w, 0);
+            let short = CStr::from_ptr(short_ptr).to_str().unwrap().to_string();
+            qmb_string_free(short_ptr);
+            let addr = CString::new(short).unwrap();
+
+            let mut e_build: *mut c_char = ptr::null_mut();
+            let mut e_qr: *mut c_char = ptr::null_mut();
+            assert!(qmb_uri_build(addr.as_ptr(), 0, 0, &mut e_build).is_null());
+            assert!(qmb_uri_qr_svg(addr.as_ptr(), 0, 0, &mut e_qr).is_null());
+            let (b, q) = (
+                CStr::from_ptr(e_build).to_str().unwrap().to_string(),
+                CStr::from_ptr(e_qr).to_str().unwrap().to_string(),
+            );
+            qmb_string_free(e_build);
+            qmb_string_free(e_qr);
+            assert_eq!(b, q, "the QR half worded the same refusal differently");
+            assert!(q.contains("qaddr1"), "the actionable half was lost: {q}");
+
+            let mut e_null: *mut c_char = ptr::null_mut();
+            assert!(qmb_uri_qr_svg(ptr::null(), 0, 0, &mut e_null).is_null());
+            qmb_string_free(e_null);
+            qmb_wallet_free(w);
+        }
+    }
+
+    /// 🔴 #569's third finding, at the site it missed: `qmb_address_qr_svg`
+    /// still formatted its refusal with `{e:?}`. `QrRenderError`'s Display
+    /// names the capacity and what to do; Debug renders `TooLong { len: … }`,
+    /// which a shell shows verbatim. Pinned through the QR export because the
+    /// address path cannot overflow a QR — a qaddr fits with room — so this
+    /// asserts the wording rule on the reachable site and the shape on both.
+    #[test]
+    fn a_qr_refusal_carries_the_sentence_not_the_variant() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([23u8; 32].as_ptr());
+            let full_ptr = qmb_wallet_address(w, 0);
+            let full = CStr::from_ptr(full_ptr).to_str().unwrap().to_string();
+            qmb_string_free(full_ptr);
+            // The address QR still renders (it is well under capacity), which
+            // is what makes `{e:?}` there unreachable-but-wrong rather than a
+            // live defect — the fix is to the wording, not to a behaviour.
+            let mut err: *mut c_char = ptr::null_mut();
+            let ok = qmb_address_qr_svg(w, 0, &mut err);
+            assert!(!ok.is_null());
+            qmb_string_free(ok);
+
+            // The over-capacity refusal is reachable through the renderer the
+            // ABI shares, so pin its sentence there: no variant name, and it
+            // says what to do about it.
+            let long = "q".repeat(qumbra_wallet::qr::QR_MAX_BYTES + 1);
+            let why = match qumbra_wallet::qr::render_svg(&long) {
+                Err(e) => format!("{e}"),
+                Ok(_) => panic!("the capacity bound did not refuse"),
+            };
+            assert!(!why.contains("TooLong"), "variant name leaked: {why}");
+            assert!(why.contains("does not fit a QR code"), "{why}");
+            assert!(full.starts_with("qaddr1"));
             qmb_wallet_free(w);
         }
     }
