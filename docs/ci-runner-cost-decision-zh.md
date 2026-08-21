@@ -516,3 +516,50 @@ workflow,都跑 `ubuntu-latest`:`test.yml`(亚秒级)和 `image.yml`(纯 COPY �
 *2026-08-02 由协调者会话写下，起因是 Larry 的账单截图让花费第一次变得可见。§4 的测量可用 `gh run list`
 和组织账单页复现；$9.31 是其中唯一一个"取来的"而非"推导出来的"数字。§10 由评审者会话(Larry 指派)
 于 2026-08-03 在第二张账单截图之后补写;其数字取自 usage API 与 budgets API,均就地引用。*
+
+---
+
+## RETIRED 2026-08-21 — `suite-arm64.yml`, and what it cost to keep
+
+**Larry's order.** The workflow is deleted; the acceptance bar is now
+`acceptance-graviton.yml` (`verify-graviton`), and `CLAUDE.md` §5 has been repointed.
+
+**It finished the job it was built for.** Its own header said *"COLLECTING COMPARISON DATA.
+Still not the acceptance bar"* — it existed to compare the GitHub-hosted `qumbra-arm64-8`
+against the self-hosted Graviton lane, running a byte-identical
+`cargo test --release --workspace --locked`. The verdict is recorded above:
+**seven same-tree comparisons, seven agreements, zero disagreements.**
+
+**Why retiring beat moving it.** The obvious cost fix was to repoint its `runs-on` at
+`[self-hosted, graviton-rig]`. That would have made it compare Graviton against Graviton —
+paying the bill while deleting the reason. **A workflow whose purpose is comparison cannot be
+moved onto the thing it compares against.**
+
+**What it was costing.** Measured 2026-08-21 from the org budget page and the run history:
+
+| | |
+|---|---|
+| Actions total | **$62.26** of a $100 budget |
+| of which `Actions Linux ARM 8-core` | **$47.57** of an $80 SKU budget, `Stop usage: Yes` |
+| ARM SKU runs since 08-01 | **413** → ~$0.115/run |
+| `suite (arm64)` share | **152 runs**, the largest single consumer |
+
+🔴 And that SKU budget has a second edge: the workflow headers note that exhausting it
+**stops the other paid lanes with it** — an expensive month could take a release cut or an
+image build down as collateral.
+
+**Every paid runner in the org, for whoever asks next.** Only two repos spend at all:
+
+* `qumbra-lab` — `explorer-image` / `node-image` / `kit-fixture-mint` on the ARM SKU;
+  `release-binaries` (macOS 10x, Windows 2x); `windows-x86_64` (2x); `prefilter` (1x, 563
+  runs but the cheapest lane and the one that stops the expensive ones).
+* `qumbra-explorer-web` — two `ubuntu-latest` workflows, 17 runs. Negligible.
+
+Everything else is free: all four wallet workflows run on a self-hosted Mac, and
+`acceptance-graviton`'s suite job runs on the Graviton rigs.
+
+**Still on the ARM SKU after this retirement:** `explorer-image` (159 runs) and `node-image`
+(96). Both are Docker builds and **Docker is not installed on the Graviton rigs** — moving
+them needs `docker` + `buildx` in the module's `user_data` first, which is a `user_data`
+change and therefore carries the STOP/START hazard documented in
+`qumbra-deploy/terraform/ci-runner/README.md`.

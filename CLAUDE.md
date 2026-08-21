@@ -121,11 +121,19 @@ If a measurement contradicts a design-doc estimate, the doc gets a correction PR
    🔴 **The acceptance run's HOME is the CI lane now, not this machine (added 2026-08-13).**
    On 2026-08-12 overlapping local release suites exhausted the coordinator's 36 GiB and
    restarted the machine mid-review. Standing rule since: **the full workspace suite does NOT
-   run locally.** It runs on the org arm64 runner via `.github/workflows/suite-arm64.yml`,
-   triggered by the **`verify`** label on a PR (or `workflow_dispatch` on a branch). A green
-   `verify` run **is** the acceptance bar — pass/fail equivalence, reconciled counts in the job
-   summary. The on-demand Graviton lane (`acceptance-graviton.yml`, `verify-graviton` label) is
-   the same bar on cheaper iron once its instance is registered. **Measured NUMBERS still come
+   run locally.** It runs on the **on-demand Graviton lane**,
+   `.github/workflows/acceptance-graviton.yml`, triggered by the **`verify-graviton`** label on a
+   PR (or `workflow_dispatch` on a branch). A green run **is** the acceptance bar — pass/fail
+   equivalence, reconciled counts in the job summary.
+
+   *(Updated 2026-08-21. The bar used to be `suite-arm64.yml` on the GitHub-hosted
+   `qumbra-arm64-8`, with the Graviton lane named as "the same bar on cheaper iron once its
+   instance is registered". The instances have been registered since 2026-08-18 — three of them
+   since 08-21 — so that condition is long satisfied, and `suite-arm64.yml` is RETIRED. It
+   existed to collect comparison data between the two runners and it finished the job it was
+   built for: **seven same-tree comparisons, seven agreements, zero disagreements**. Keeping it
+   would have gone on paying the ARM 8-core SKU — 152 runs and the largest single line on the
+   bill — to re-answer a question already answered.)* **Measured NUMBERS still come
    from a pinned local rig** (bench discipline 1–3 — a shared CI runner's timings are not
    publishable), and the local rig lock below still governs any deliberate local run. The lock is
    held by a zero-memory sleeper by default so a stray local suite queues instead of OOM-ing.
