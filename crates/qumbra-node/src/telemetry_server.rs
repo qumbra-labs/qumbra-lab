@@ -438,13 +438,11 @@ mod tests {
     }
 
     /// House rule (ratified PR #315, recorded at `qlab_node::rpc`): a pure route
-    /// addition does not bump `RPC_VERSION`. `/v1/ready` is a pure addition, so
-    /// the constant must still hold `main`'s value at this baton's base — 0x06
-    /// (set by the #314 nullifier route wave). If this fails, either another
-    /// change legitimately moved the wire, or this change stopped being a pure
-    /// addition; both deserve a human look.
+    /// addition does not bump `RPC_VERSION`. `/v1/ready` remains a pure addition;
+    /// #553 legitimately moved the shared node-RPC release boundary to `0x07`
+    /// when the existing mine routes changed shape.
     #[test]
-    fn the_ready_route_is_a_pure_addition_and_rpc_version_did_not_move() {
-        assert_eq!(qlab_node::RPC_VERSION, 0x06);
+    fn the_ready_route_remains_a_pure_addition_at_the_current_rpc_version() {
+        assert_eq!(qlab_node::RPC_VERSION, 0x07);
     }
 }
