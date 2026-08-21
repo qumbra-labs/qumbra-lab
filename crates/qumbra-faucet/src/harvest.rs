@@ -290,8 +290,13 @@ mod tests {
         );
 
         // …and the end the operator reads: the page says **ready**, not a maturity
-        // height that nothing clears. This is the assertion the live T2 page failed
-        // for its whole life (lab #559): 268 notes held, `grants confirmed 0`.
+        // height that nothing clears. On T2 that height was a **horizon** — watched
+        // from outside the box on 2026-08-21, the chain reached the promised 1259 and
+        // the page immediately said 1261, then 1263, then 1266. Every pass harvested
+        // fresh coinbase that was also unusable, so the banner always named the
+        // newest note's maturity and the ETA it published was always wrong. That, and
+        // not any refused request, is what this assertion pins: nobody had ever
+        // asked this faucet for a grant (lab #559).
         let view = crate::view::NodeView(&node);
         let availability = crate::state::classify(&faucet, &view, report.next_maturity, 0);
         assert!(
