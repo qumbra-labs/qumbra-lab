@@ -35,6 +35,7 @@
 pub mod accounting;
 pub mod config;
 pub mod endpoint;
+pub mod guard;
 pub mod hasher;
 pub mod hexutil;
 pub mod jobs;
@@ -49,6 +50,11 @@ pub mod watch;
 
 pub use accounting::{Ledger, ShareRecord, ShareStatus};
 pub use config::{PoolConfig, DEFAULT_POLL_MS, DEFAULT_TEMPLATE_STALL_POLLS};
+pub use guard::{
+    ConnGuard, GuardSnapshot, ListenLimits, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_LINE_BYTES,
+    DEFAULT_REQUEST_TIMEOUT_MS, PER_IP_DIVISOR, REASON_CONNECTION_CAP, REASON_CONNECTION_TIMEOUT,
+    REASON_LINE_TOO_LONG, REASON_PER_IP, REASON_REQUEST_TIMEOUT,
+};
 pub use hasher::{FixedHasher, KeccakShareHasher, ShareHasher};
 pub use jobs::{IssuedJob, JobStore};
 pub use node_rpc::{NodeRpcClient, NodeRpcTemplateSource};
