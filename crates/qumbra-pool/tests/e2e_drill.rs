@@ -181,6 +181,11 @@ fn e2e_refuses_stale_by_name() {
         "stale must be named, got {}",
         reply_err_msg(&out)
     );
+    assert!(
+        out.iter().any(|item| matches!(item, Outgoing::Notify(_))),
+        "stale reject must piggyback a fresh job, got {} items",
+        out.len()
+    );
     assert_eq!(
         pool.ledger_snapshot().records().last().unwrap().status,
         ShareStatus::Stale

@@ -1428,26 +1428,38 @@ mod tests {
     /// half loud instead of silent.
     #[test]
     fn the_default_net_is_the_net_the_release_lane_cuts_by_default() {
-        const WORKFLOW_RAW: &str = include_str!("../../../.github/workflows/release-binaries.yml");
-        // 🔴 Normalise line endings before matching. `include_str!` embeds the file
-        // as checked out, and a Windows checkout is CRLF by default — so a pattern
-        // ending in `\n` finds nothing there and this test panics on its own
-        // `expect` rather than on the property it guards. It did exactly that on
-        // the windows leg, invisibly, behind an unrelated red (2026-08-20).
-        let workflow = WORKFLOW_RAW.replace("\r\n", "\n");
-        let workflow = workflow.as_str();
+        const WORKFLOW: &str = include_str!("../../../.github/workflows/release-binaries.yml");
         assert!(
             profile_for(DEFAULT_NET).is_some(),
             "DEFAULT_NET is {DEFAULT_NET}, which this binary's net table cannot name"
         );
         // The `net:` dispatch input's default, read out of the workflow's own
         // choice block rather than remembered here.
-        let net_input = workflow
-            .split("      net:\n")
-            .nth(1)
+//
+        // 🔴 NO HARDCODED LINE TERMINATOR, and no normalisation pass either.
+        // This used to split on the literal `"      net:\n"`. `include_str!`
+        // embeds the file *as checked out*, this repo has no `.gitattributes`,
+        // so a Windows checkout under git's default `autocrlf` gives
+        // `      net:\r\n` — the split found nothing and this test panicked on
+        // its own `expect`, on the windows leg of every PR, invisibly behind an
+        // unrelated red (2026-08-20).
+        //
+        // Two fixes were written independently for this: normalise `\r\n` to
+        // `\n` and keep the literal, or drop the literal. This is the second,
+        // because `str::lines()` already splits on either ending and strips the
+        // `\r` — so the terminator stops being something this code states and
+        // goes back to being something the library knows
+        // (`qumbra-design/derived-not-duplicated.md`). Comparing the WHOLE
+        // line keeps the six-space indent specific, which the normalising
+        // version also had and a `trim()` would have thrown away.
+        //
+        // The other two `include_str!` sites in this file hardcode no
+        // terminator. Neither should start.
+        let mut after_net = WORKFLOW.lines().skip_while(|l| l != &"      net:");
+        after_net
+            .next()
             .expect("release-binaries.yml declares a `net:` dispatch input");
-        let default_line = net_input
-            .lines()
+        let default_line = after_net
             .find(|l| l.trim_start().starts_with("default:"))
             .expect("the `net:` input declares a default");
         assert!(

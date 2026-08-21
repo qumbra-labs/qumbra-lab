@@ -163,8 +163,25 @@ test "$ACTUAL_REV" = "$EXPECTED_REV" || {
 
 上面的容器仍是**可复现基线**。若 Docker 是障碍而非答案，同样的三个二进制
 （`qumbra-node`、`qumbra-wallet`、`qumbra-pool`，外加 `PROVENANCE.txt`）以归档形式发布在公开仓库的
-releases 页——**<https://github.com/qumbra-labs/qumbra/releases>**，tag 为
-`<T2_RELEASE_TAG — filled at announcement>`。早于 T2 公告的 release tag 都是 T1 产物；
+releases 页——**<https://github.com/qumbra-labs/qumbra/releases/latest>**。这个链接永远
+指向当前版本,这正是你要的;把某个 tag 写进本页,下次切版本它就过期了。
+
+🔴 **有两种情况会让你拿到错的版本,而且两种在运行前都能检查:**
+
+* **早于 T2 公告的 release tag 都是 T1 产物。** T1 已退役,不要拿它连 T2。
+* **早于 `t2-a89dce6` 的 T2 版本带有一个缺陷:节点重启后打不开自己的数据目录**
+  (lab [#521](https://github.com/qumbra-labs/qumbra-lab/issues/521) /
+  [#524](https://github.com/qumbra-labs/qumbra-lab/issues/524))——**第一次跑没事,第二次
+  才 panic**。`t2-a89dce6` 及更新版本已修。如果你已经在跑更早的版本,**在有什么东西替你
+  触发重启之前先升级。**
+
+**别信这一页,去问那个二进制**——它知道自己是为哪张网构建的:
+
+```sh
+./qumbra-node mine --print-net     # 打印它所属的网和它钉住的创世哈希
+```
+
+早于 T2 公告的 release tag 都是 T1 产物；
 不要拿它们连 T2。
 
 | 归档 | 适用 |
@@ -177,8 +194,12 @@ releases 页——**<https://github.com/qumbra-labs/qumbra/releases>**，tag 为
 ```sh
 # 1 —— 从 release 页下载对应平台的归档与 SHA256SUMS，然后：
 sha256sum -c SHA256SUMS          # macOS 用：shasum -a 256 -c SHA256SUMS
-tar -xzf qumbra-<T2_RELEASE_TAG>-<platform>.tar.gz
-cd qumbra-<T2_RELEASE_TAG>-<platform>
+# TAG —— 从 releases 页设这一次,下面不再重复它
+TAG=t2-a89dce6                   # 或更新;见上面两条规则
+PLATFORM=linux-x86_64-glibc      # 或 macos-arm64、macos-x86_64…
+
+tar -xzf "qumbra-$TAG-$PLATFORM.tar.gz"
+cd "qumbra-$TAG-$PLATFORM"
 
 # 2 —— 问二进制它是什么：
 ./qumbra-node halt-status
@@ -374,10 +395,11 @@ MSVC 构建上跑 RandomX 的四个官方参考向量，所以 Windows 矿工的
 
 ```powershell
 # 从 release 页取：对应平台的 zip 和 SHA256SUMS
-Get-FileHash .\qumbra-<T2_RELEASE_TAG>-windows-x86_64.zip -Algorithm SHA256
+$TAG = "t2-a89dce6"   # 或更新;设这一次,下面不再重复
+Get-FileHash ".\qumbra-$TAG-windows-x86_64.zip" -Algorithm SHA256
 # 与 SHA256SUMS 中对应行逐字比对打印出的哈希——用眼睛，64 个字符全部对上
-Expand-Archive .\qumbra-<T2_RELEASE_TAG>-windows-x86_64.zip -DestinationPath .
-cd qumbra-<T2_RELEASE_TAG>-windows-x86_64
+Expand-Archive ".\qumbra-$TAG-windows-x86_64.zip" -DestinationPath .
+cd "qumbra-$TAG-windows-x86_64"
 .\qumbra-node.exe halt-status
 ```
 

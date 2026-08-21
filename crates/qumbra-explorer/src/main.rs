@@ -192,7 +192,17 @@ fn run(args: &[String], telemetry: &Telemetry) -> Result<(), Box<dyn Error>> {
     // Chain-derived from the persisted riders, so it BACKFILLS: an explorer
     // rolled after the 19,008 boundary still serves every event from the
     // boundary's first block (lab #486 stage-0 §4).
-    let names_view = Arc::new(Mutex::new(Arc::new(NameEventsView::default())));
+    //
+    // The served `boundary_height` is a fact of THIS net, read from the loaded
+    // genesis form and seeded before the first projection: a halt-keyed v4 (T1)
+    // net serves its height, a native-names v5 (T2) net serves `null` (names
+    // from height 0, no boundary). Seeded here and preserved through every
+    // re-projection, so the field never carries T1's 19,008 onto T2.
+    let name_boundary = genesis.form()?.name_boundary();
+    let names_view = Arc::new(Mutex::new(Arc::new(NameEventsView {
+        name_boundary,
+        ..NameEventsView::default()
+    })));
     names::refresh_shared(&names_view, node.state().chain());
 
     // The finality ticker, pre-serialized once pre-bind for the same first-read

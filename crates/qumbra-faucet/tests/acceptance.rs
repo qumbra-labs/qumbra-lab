@@ -532,7 +532,10 @@ fn an_unservable_faucet_refuses_and_keeps_the_requesters_ticket() {
     assert_eq!(status, 503, "{body}");
     assert!(head.contains("Retry-After"), "a 503 must say when to come back: {head}");
     // The refusal names the height at which the answer changes, and the constant.
-    assert!(body.contains("spendable once the chain reaches height"), "{body}");
+    // Lab #539: the height is named for the *maturing coinbase*, which is the
+    // population it is true of — not for a summed "held" count the page and the
+    // banner would then disagree about.
+    assert!(body.contains("coinbase note(s) mature at height"), "{body}");
     assert!(body.contains("144"), "the frozen §2 constant is named: {body}");
     // 🔴 …and the ticket survives the faucet's own shortage.
     {

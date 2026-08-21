@@ -69,6 +69,23 @@ impl GenesisForm {
             GenesisForm::V5 => 5,
         }
     }
+
+    /// The height at and above which the name-service rules are in force on this
+    /// form — the single honest source for the `boundary_height` an observer
+    /// serves.
+    ///
+    /// - **V4** (T1): the name rule is halt-keyed, active only above
+    ///   [`crate::names::NAME_RULE_BOUNDARY_HEIGHT`] — that constant, verbatim.
+    /// - **V5** (T2): the name rule is **native from height 0**; there is no
+    ///   boundary. `None` is the honest answer — the "future net" the explorer's
+    ///   `boundary_height` field was documented to render as `null`, never a
+    ///   fabricated height carried over from T1's lineage.
+    pub fn name_boundary(self) -> Option<u64> {
+        match self {
+            GenesisForm::V4 => crate::names::NAME_RULE_BOUNDARY_HEIGHT,
+            GenesisForm::V5 => None,
+        }
+    }
 }
 
 /// The complete rule/form context a running node enforces — **the carrier of
@@ -135,6 +152,15 @@ mod tests {
         for v in [0u32, 1, 2, 3, 6, 7, u32::MAX] {
             assert_eq!(GenesisForm::from_genesis_format_version(v), None, "v{v} must not map");
         }
+    }
+
+    #[test]
+    fn name_boundary_is_the_t1_constant_on_v4_and_native_on_v5() {
+        // V4 serves T1's halt-keyed boundary verbatim; V5 (T2, names native
+        // from height 0) has no boundary and must answer None so an observer
+        // renders `null`, never T1's 19,008 carried onto a native-names net.
+        assert_eq!(GenesisForm::V4.name_boundary(), crate::names::NAME_RULE_BOUNDARY_HEIGHT);
+        assert_eq!(GenesisForm::V5.name_boundary(), None);
     }
 
     #[test]
