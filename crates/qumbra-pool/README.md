@@ -6,7 +6,7 @@
 ## Status board
 
 Rows flip ⬜ → ✅ only when the coordinator has accepted the thing, never when it is
-merely written. Last updated 2026-08-20 16:5x +08.
+merely written. Last updated 2026-08-21 21:55 +08.
 
 ### The software — COMPLETE
 
@@ -29,6 +29,7 @@ merely written. Last updated 2026-08-20 16:5x +08.
 | Pool rolled onto svc1, `pool` profile enabled, SG opened on 3333 | ✅ 2026-08-21 |
 | **🎉 First real share accepted end-to-end from stock XMRig** | ✅ **2026-08-21 00:56 +08** |
 | **A miner paid by this pool** | 🔴 **NOT POSSIBLE YET** — lab #553; every block pays the pool's own address |
+| Public stratum on `pool.qumbra.org:3333` | ⏹ **stopped 2026-08-21 21:39 +08** — it cannot pay anyone; restarting means narrowing the SG first |
 
 The share, from hel1, on the **unmodified** `xmrig-6.22.2-linux-static-x64` release tarball with a
 64-hex rkm as the login — so this is the **miner-payee** branch, not the pool's fallback:
