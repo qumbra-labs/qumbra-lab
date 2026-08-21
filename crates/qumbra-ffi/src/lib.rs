@@ -1187,8 +1187,103 @@ pub unsafe extern "C" fn qmb_uri_parse(
             out_string(req.address.encode())
         }
         Err(e) => {
-            set_err(err_out, format!("payment URI refused: {e:?}"));
+            // `{e}`, not `{e:?}`: shells put this string in front of the
+            // person who pasted the URI, and `UriError`'s Display is written
+            // for them ("Ask the payee for their full qaddr1… address"), while
+            // its Debug renders the bare variant name and throws that away.
+            set_err(err_out, format!("payment URI refused: {e}"));
             ptr::null_mut()
+        }
+    }
+}
+
+/// Build a `qumbra:` payment URI — the encode half of the codec whose decode
+/// half is qmb_uri_parse, so a QR a wallet shows and a URI a wallet reads come
+/// from one implementation. `address` is a full `qaddr1…`; pass
+/// `has_amount = 0` for an amount-less request ("send me some"), which is a
+/// real and common shape. NULL + `err_out` on refusal, by name.
+///
+/// Label and memo do NOT cross in v1, deliberately: qmb_uri_parse does not
+/// return them, and a builder that could emit a key the parser drops would make
+/// an ABI round-trip lose data silently.
+///
+/// # Safety
+/// `address` NUL-terminated UTF-8; `err_out` NULL or writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_uri_build(
+    address: *const c_char,
+    amount_bessel: u64,
+    has_amount: u8,
+    err_out: *mut *mut c_char,
+) -> *mut c_char {
+    if address.is_null() {
+        set_err(err_out, "NULL argument".into());
+        return ptr::null_mut();
+    }
+    let s = match CStr::from_ptr(address).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_err(err_out, "address is not UTF-8".into());
+            return ptr::null_mut();
+        }
+    };
+    // Validated by running it through the ABI's OWN parser rather than a second
+    // address check here. A bare URI through `uri::parse` classifies exactly
+    // what qmb_uri_parse classifies, so the two halves cannot drift and a qs1…
+    // fingerprint is refused with the same sentence either way.
+    let bare = format!("{}:{s}", qlab_wallet::uri::URI_SCHEME);
+    let req = match qlab_wallet::uri::parse(&bare) {
+        Ok(req) => req,
+        Err(e) => {
+            set_err(err_out, format!("payment URI refused: {e}"));
+            return ptr::null_mut();
+        }
+    };
+    // Any nonzero is present: a C caller writing `1`, `true` or a bitfield all
+    // mean the same thing, and silently reading `2` as absent would drop an
+    // amount the caller asked for.
+    let amount = (has_amount != 0).then_some(amount_bessel);
+    out_string(qlab_wallet::uri::encode(&req.address, amount, None, None))
+}
+
+/// Parse a whole-coin decimal QMB string (`"1.5"`) to bessel, EXACTLY — the
+/// one decimal-money parser, so no shell has to write one. `0` and
+/// `*out_bessel` set on success; `-1` and `err_out` on refusal, by name.
+///
+/// 🔴 This exists so that a typed amount never goes through a float. `#303`
+/// makes money integer-exact with no float reachable; a shell parsing `"1.5"`
+/// itself is how a `Double` gets into a spend.
+///
+/// # Safety
+/// `decimal` NUL-terminated UTF-8; `out_bessel` writable; `err_out` NULL or
+/// writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_amount_parse(
+    decimal: *const c_char,
+    out_bessel: *mut u64,
+    err_out: *mut *mut c_char,
+) -> i32 {
+    if decimal.is_null() || out_bessel.is_null() {
+        set_err(err_out, "NULL argument".into());
+        return -1;
+    }
+    let s = match CStr::from_ptr(decimal).to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            set_err(err_out, "amount is not UTF-8".into());
+            return -1;
+        }
+    };
+    match qlab_wallet::uri::qmb_to_bessel(s) {
+        Ok(b) => {
+            *out_bessel = b;
+            0
+        }
+        Err(why) => {
+            // The core's wording verbatim: it already names the rule broken,
+            // and paraphrasing here would be a second source of truth.
+            set_err(err_out, format!("amount refused: {why}"));
+            -1
         }
     }
 }
@@ -1917,6 +2012,101 @@ mod tests {
             assert!(svg.starts_with("<svg") || svg.contains("<svg"), "{}", &svg[..60.min(svg.len())]);
             qmb_string_free(p);
             qmb_wallet_free(w);
+        }
+    }
+
+    /// The two halves of the codec meet: whatever the builder emits, the
+    /// parser reads back — with the amount integer-exact and an absent amount
+    /// still absent.
+    #[test]
+    fn a_built_uri_parses_back_to_what_went_in() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([11u8; 32].as_ptr());
+            let full_ptr = qmb_wallet_address(w, 0);
+            let full = CStr::from_ptr(full_ptr).to_str().unwrap().to_string();
+            qmb_string_free(full_ptr);
+            let addr = CString::new(full.clone()).unwrap();
+            let mut err: *mut c_char = ptr::null_mut();
+
+            for &(amount_in, has_in) in &[(150_000_000u64, 1u8), (1, 1), (0, 0), (0, 1)] {
+                let uri_ptr = qmb_uri_build(addr.as_ptr(), amount_in, has_in, &mut err);
+                assert!(!uri_ptr.is_null(), "build refused a good address");
+                let uri = CStr::from_ptr(uri_ptr).to_str().unwrap().to_string();
+                qmb_string_free(uri_ptr);
+                assert!(uri.starts_with("qumbra:"), "{uri}");
+
+                let back = CString::new(uri.clone()).unwrap();
+                let mut amount_out: u64 = 0;
+                let mut has_out: u8 = 0;
+                let addr_out = qmb_uri_parse(back.as_ptr(), &mut amount_out, &mut has_out, &mut err);
+                assert!(!addr_out.is_null(), "the parser refused our own URI: {uri}");
+                assert_eq!(CStr::from_ptr(addr_out).to_str().unwrap(), full);
+                qmb_string_free(addr_out);
+                assert_eq!((has_out, amount_out), (has_in, amount_in), "round-trip lost the amount: {uri}");
+            }
+            qmb_wallet_free(w);
+        }
+    }
+
+    /// 🔴 A refusal must carry the SENTENCE, not the variant name. Shells put
+    /// this string straight in front of the person who pasted the address, and
+    /// `ShortAddressUnpayable` tells them nothing about what to do next.
+    #[test]
+    fn a_short_address_is_refused_with_the_reason_a_person_can_act_on() {
+        unsafe {
+            let w = qmb_wallet_from_entropy([13u8; 32].as_ptr());
+            let short_ptr = qmb_wallet_address_short(w, 0);
+            let short = CStr::from_ptr(short_ptr).to_str().unwrap().to_string();
+            qmb_string_free(short_ptr);
+            assert!(short.starts_with("qs1"), "{short}");
+
+            let mut err: *mut c_char = ptr::null_mut();
+            let addr = CString::new(short.clone()).unwrap();
+            assert!(qmb_uri_build(addr.as_ptr(), 0, 0, &mut err).is_null());
+            let why = CStr::from_ptr(err).to_str().unwrap().to_string();
+            qmb_string_free(err);
+            assert!(why.contains("qaddr1"), "must say what to ask for instead: {why}");
+            assert!(!why.contains("ShortAddressUnpayable"), "variant name leaked: {why}");
+
+            // And the decode half words it the same way, because both go
+            // through the one classifier.
+            let mut err2: *mut c_char = ptr::null_mut();
+            let uri = CString::new(format!("qumbra:{short}")).unwrap();
+            let mut a: u64 = 0;
+            let mut h: u8 = 0;
+            assert!(qmb_uri_parse(uri.as_ptr(), &mut a, &mut h, &mut err2).is_null());
+            let why2 = CStr::from_ptr(err2).to_str().unwrap().to_string();
+            qmb_string_free(err2);
+            assert_eq!(why, why2, "the two halves must refuse in the same words");
+            qmb_wallet_free(w);
+        }
+    }
+
+    /// Typed decimal QMB, exact — and the refusals that keep a float out.
+    #[test]
+    fn a_decimal_amount_parses_exactly_or_is_refused_by_name() {
+        unsafe {
+            let mut out: u64 = 0;
+            let mut err: *mut c_char = ptr::null_mut();
+            for (text, expect) in [
+                ("1.5", 150_000_000u64),
+                ("0.00000001", 1),
+                ("1", 100_000_000),
+                ("0", 0),
+                ("184467440737.09551615", u64::MAX),
+            ] {
+                let c = CString::new(text).unwrap();
+                assert_eq!(qmb_amount_parse(c.as_ptr(), &mut out, &mut err), 0, "{text} refused");
+                assert_eq!(out, expect, "{text} parsed to the wrong bessel");
+            }
+            // Every one of these is a way a float or a surprise could get in.
+            for text in ["1e3", "-1", "+1", "1_000", "", ".", "1.", ".5", "1.234567891", " 1", "1 "] {
+                let c = CString::new(text).unwrap();
+                let mut e: *mut c_char = ptr::null_mut();
+                assert_eq!(qmb_amount_parse(c.as_ptr(), &mut out, &mut e), -1, "{text:?} accepted");
+                assert!(!e.is_null(), "{text:?} refused without saying why");
+                qmb_string_free(e);
+            }
         }
     }
 

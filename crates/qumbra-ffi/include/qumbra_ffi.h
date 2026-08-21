@@ -261,6 +261,34 @@ char *qmb_bundle_review(const uint8_t *bytes, size_t len, char **err_out);
 char *qmb_uri_parse(const char *uri, uint64_t *out_amount_bessel,
                     uint8_t *out_has_amount, char **err_out);
 
+/* Build a `qumbra:` payment URI — the encode half of the codec whose decode
+ * half is qmb_uri_parse, so a QR a wallet SHOWS and a URI a wallet READS come
+ * from one implementation. `address` is a full qaddr1... address; pass
+ * has_amount = 0 for an amount-less request, which is a real and common shape.
+ * Any nonzero has_amount means present.
+ *
+ * Label and memo do NOT cross in v1, deliberately: qmb_uri_parse does not
+ * return them, and a builder able to emit a key the parser drops would make a
+ * round-trip through this ABI lose data silently.
+ *
+ * Caller frees with qmb_string_free. NULL + *err_out on refusal, by name — a
+ * qs1... fingerprint is refused with the same sentence qmb_uri_parse gives.
+ */
+char *qmb_uri_build(const char *address, uint64_t amount_bessel,
+                    uint8_t has_amount, char **err_out);
+
+/* Parse a whole-coin decimal QMB string ("1.5") to bessel, EXACTLY — the one
+ * decimal-money parser, so no shell has to write one. Returns 0 and sets
+ * *out_bessel on success; -1 and *err_out on refusal, naming the rule broken.
+ *
+ * This exists so a typed amount never goes through a float: money is
+ * integer-exact and a shell parsing "1.5" itself is how a double gets into a
+ * spend. Accepts digits with at most one `.` and at most 8 fractional digits;
+ * exponents, signs and separators are refused.
+ */
+int32_t qmb_amount_parse(const char *decimal, uint64_t *out_bessel,
+                         char **err_out);
+
 /* The bundle's REAL-input nullifiers, hex, newline-joined — the history join
  * key: these bytes go on-chain when the spend lands, so a record keyed on
  * them can later be marked CONFIRMED by the chain's own nullifier stream. */
