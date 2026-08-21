@@ -98,7 +98,7 @@ jobs:
           exit $missing
 
       - name: Assume the runner-control role (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.CI_RUNNER_ROLE_ARN }}
           aws-region: ${{ vars.CI_RUNNER_REGION }}
@@ -160,7 +160,7 @@ jobs:
       CARGO_INCREMENTAL: 0
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # THE WARM CACHE LIVES OUTSIDE THE WORKSPACE, DELIBERATELY.
       # actions/checkout cleans the work tree (`git clean -ffdx`) on a
@@ -279,7 +279,7 @@ jobs:
           echo "=== 3. wall time ==="
           grep -E 'Elapsed \(wall clock\)' suite.log || true
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: suite-log-graviton
@@ -356,7 +356,7 @@ jobs:
 
       - name: Assume the runner-control role (OIDC)
         if: steps.lane.outputs.active == '0'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.CI_RUNNER_ROLE_ARN }}
           aws-region: ${{ vars.CI_RUNNER_REGION }}

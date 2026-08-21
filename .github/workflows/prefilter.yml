@@ -37,7 +37,7 @@ jobs:
     timeout-minutes: 30        # a runaway build must not bill indefinitely
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # randomx-rs builds a C++ library at compile time. cmake and g++ are
       # preinstalled on ubuntu-latest today; installing explicitly means a
@@ -56,7 +56,7 @@ jobs:
           cargo --version
           cmake --version | head -1
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
