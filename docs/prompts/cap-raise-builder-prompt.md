@@ -103,3 +103,67 @@ every existing golden must still pass unchanged, exactly as #381 kept the v2 bod
 7. **A round trip through `decode_announce` at N > 1 reconstructs a body whose commitment matches the
    header** — that is the property `compact.rs:98-103` says every announced block depends on, and at
    count > 1 today it silently reconstructs the wrong body.
+
+---
+
+# 🔴 CORRECTION BLOCK — 2026-08-22 02:32 +08, written after the baton refused this book
+
+**The QUM-160 baton read §2 above, checked it, found the premise false, and stopped without writing
+code. That was correct.** What follows corrects §2 and §3 in **both** directions. Read this block as
+authoritative wherever it disagrees with the text above; the original is kept because a task book
+that deletes its own wrong premise teaches nobody how the scope was misjudged.
+
+## Correction 1 — §2 was wrong pessimistically: `BlockBody` itself was flat
+
+§2 said *"the announce wire is already list-shaped, only the in-memory `BlockAnnounce` is flat."*
+**`BlockBody` was flat too** — `coinbase: u64` + `coinbase_rkm: [u64;4]`, with `coinbase_payees()`
+**manufacturing** a 0-or-1 vec. 172 construction sites, 363 `coinbase_rkm` references, 56 files.
+
+**How the error was made, because the shape of it matters more than the fact:** the scope came from
+three true observations — `check_scheduled_coinbase_payees` sums an arbitrary list in u128, the
+announce encoder loops over a payee list, `derive_lanes_v5` takes `payee_index: u8`. All true. **None
+answers "can a body hold N payees."** The encoder loops over `coinbase_payees_of(coinbase,
+coinbase_rkm)`, a function that *manufactures* the list. **A list-shaped view was read as evidence of
+a list-shaped source** — [the instrument and the question](https://github.com/qumbra-labs/qumbra-design/blob/main/the-instrument-and-the-question.md),
+adopted four minutes before this book was written.
+
+**Fixed by lab #593 / PR #594**, which is a prerequisite and lands first: `BlockBody` stores
+`coinbase_payees: Vec<CoinbasePayee>`, byte-identical commitment at `len() <= 1`, no rule change.
+
+## Correction 2 — and then I told you the opposite error: there is NO new commitment form
+
+On the issue I said *"above the boundary an N-payee body needs a new preimage encoding — a
+height-keyed rule change, this baton's hardest part."* **That is wrong. Do not build it.**
+
+The **V5 body preimage tail is already `count ‖ [rkm ‖ amount]×N` and is correct for any N**
+(`body.rs`, `BodyPreimageForm::V5` arm — the T2 mint built it list-shaped on purpose, lab #470 stage
+2, *"Σ-payees == schedule, extended not forked"*). **The commitment does not move when the cap rises.**
+The `.expect()` at the V2/V3 arm is not your problem either: a v4-form body has no payee list at all.
+
+**So there is no v3-style encoding change here, no second body form, and no golden to re-cut.** If you
+find yourself designing how N payees hash into a body, stop — it is already designed and shipped.
+
+## What QUM-160 actually is, after #594 lands
+
+| seam | what it needs |
+|---|---|
+| `qlab-p2p/src/compact.rs:88` `BlockAnnounce` | still flat — **give it the payee list** (this is the one thing §2 got right) |
+| `qlab-p2p/src/compact.rs:183` decode | `count > CAP` refusal, and `if count == 1` handling — **key both on `header.height`**, already decoded at `:170` |
+| `qlab-devnet/src/body.rs` `check_scheduled_coinbase_payees` | already takes `height` — make the cap height-keyed |
+| `body.rs` V5 preimage arm | `assert!(len <= CAP)` must become height-aware, **and it is a panic** — see below |
+| `qumbra-node/src/mine_rpc.rs:141`, `qlab-p2p/src/adapter.rs:1918` | the two `want 1 at the current cap` refusals — key them on the height-dependent cap |
+| `qumbra-pool/src/payee.rs:250` | the pool's own idea of the cap, plus assembling N winners rather than one |
+| the boundary constant | `None` at merge is acceptable and precedented (#367, #299 pins-unset) |
+
+🔴 **The `assert!` in the V5 preimage arm is a panic on a consensus path.** Today it is unreachable
+because every upstream path refuses over-cap first. **When the cap becomes height-dependent, satisfy
+yourself that it is still unreachable, and write the argument down.** A panic a peer can reach is a
+denial of service, not a bug. PR #594's review asked the same of its `.expect()`; the standard is the
+same here.
+
+## What has not changed
+
+**N = 8 is still ruled**, byte-exactness at and below the boundary is still the live-chain lock, the
+Σ-equals-schedule check still only ever gets stronger, and **you should still refuse this book if you
+find a premise false.** It has now been wrong twice, in opposite directions, and both times the
+correction came from checking rather than from review.
