@@ -12,6 +12,7 @@ use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use qlab_devnet::body::CoinbasePayee;
 use qlab_devnet::forms::GenesisForm;
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +23,11 @@ use crate::template::{
 };
 
 const TEMPLATE_PATH: &str = "/v1/mine/template";
+const CONTEXT_PATH: &str = "/v1/mine/context";
 const BLOCK_PATH: &str = "/v1/mine/block";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MineTemplateContextWire { form: String, height: u64 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct MineTemplateWire {
@@ -35,8 +40,7 @@ struct MineTemplateWire {
     tx_body_commitment: String,
     seed_hash: String,
     next_seed_hash: Option<String>,
-    coinbase: u64,
-    coinbase_rkm: String,
+    coinbase_payees: Vec<CoinbasePayeeWire>,
     txs: Vec<String>,
 }
 
@@ -44,10 +48,15 @@ struct MineTemplateWire {
 struct MineBlockWire {
     form: String,
     header: String,
-    coinbase: u64,
-    coinbase_rkm: String,
+    coinbase_payees: Vec<CoinbasePayeeWire>,
     txs: Vec<String>,
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CoinbasePayeeWire { rkm: String, amount: u64 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MineTemplateContext { pub form: GenesisForm, pub height: u64 }
 
 /// HTTP client for one node RPC base (`http://host:port`).
 #[derive(Clone, Debug)]
@@ -75,8 +84,22 @@ impl NodeRpcClient {
         Ok(Self { host, port })
     }
 
-    pub fn fetch_template(&self) -> Result<Template, String> {
-        let (status, body) = self.request("GET", TEMPLATE_PATH, None)?;
+    pub fn fetch_context(&self) -> Result<MineTemplateContext, String> {
+        let (status, body) = self.request("GET", CONTEXT_PATH, None)?;
+        if !status.contains("200") {
+            return Err(format!("context GET {status}: {body}"));
+        }
+        let wire: MineTemplateContextWire = serde_json::from_str(&body)
+            .map_err(|e| format!("context JSON: {e}"))?;
+        Ok(MineTemplateContext {
+            form: parse_form(&wire.form).map_err(|e| e.to_string())?,
+            height: wire.height,
+        })
+    }
+
+    pub fn fetch_template(&self, payees: &[CoinbasePayee]) -> Result<Template, String> {
+        let path = format!("{TEMPLATE_PATH}?{}", payee_query(payees));
+        let (status, body) = self.request("GET", &path, None)?;
         if !status.contains("200") {
             return Err(format!("template GET {status}: {body}"));
         }
@@ -136,8 +159,7 @@ impl BlockSubmitter for NodeRpcClient {
         let wire = MineBlockWire {
             form: form_s.into(),
             header: hexutil::encode(header_preimage),
-            coinbase: body.coinbase,
-            coinbase_rkm: rkm_hex(&body.coinbase_rkm),
+            coinbase_payees: payees_to_wire(&body.coinbase_payees),
             txs: body.txs.iter().map(|t| hexutil::encode(t)).collect(),
         };
         let json = serde_json::to_vec(&wire).map_err(|e| e.to_string())?;
@@ -159,9 +181,9 @@ pub struct NodeRpcTemplateSource {
 
 impl NodeRpcTemplateSource {
     /// Fetch once. Fails construction if the node is not serving.
-    pub fn connect(url: &str) -> Result<Self, String> {
+    pub fn connect(url: &str, payees: &[CoinbasePayee]) -> Result<Self, String> {
         let client = NodeRpcClient::parse(url)?;
-        let template = client.fetch_template()?;
+        let template = client.fetch_template(payees)?;
         Ok(Self {
             client,
             cached: Mutex::new(template),
@@ -178,8 +200,8 @@ impl NodeRpcTemplateSource {
     }
 
     /// Refresh. `Ok(true)` if the template moved (caller should re-issue jobs).
-    pub fn poll(&self) -> Result<bool, String> {
-        let next = self.client.fetch_template()?;
+    pub fn poll(&self, payees: &[CoinbasePayee]) -> Result<bool, String> {
+        let next = self.client.fetch_template(payees)?;
         let mut g = self.cached.lock().expect("template mutex");
         if *g == next {
             return Ok(false);
@@ -191,9 +213,6 @@ impl NodeRpcTemplateSource {
 
 impl TemplateSource for NodeRpcTemplateSource {
     fn current(&self) -> Template {
-        if let Ok(next) = self.client.fetch_template() {
-            *self.cached.lock().expect("template mutex") = next;
-        }
         self.cached.lock().expect("template mutex").clone()
     }
 }
@@ -213,7 +232,7 @@ fn template_from_wire(w: MineTemplateWire) -> Result<Template, TemplateError> {
         Some(s) if !s.is_empty() => Some(hexutil::decode_exact(&s)?),
         _ => None,
     };
-    let coinbase_rkm = hexutil::rkm_lanes_from_hex(&w.coinbase_rkm).unwrap_or([0; 4]);
+    let coinbase_payees = payees_from_wire(&w.coinbase_payees)?;
     let mut txs = Vec::with_capacity(w.txs.len());
     for t in w.txs {
         txs.push(hexutil::decode(&t)?);
@@ -224,11 +243,26 @@ fn template_from_wire(w: MineTemplateWire) -> Result<Template, TemplateError> {
         seed_hash,
         next_seed_hash,
         body: Some(TemplateBody {
-            coinbase: w.coinbase,
-            coinbase_rkm,
+            coinbase_payees,
             txs,
         }),
     })
+}
+
+fn payee_query(payees: &[CoinbasePayee]) -> String {
+    payees.iter().map(|p| format!("payee={}:{}", rkm_hex(&p.rkm), p.amount))
+        .collect::<Vec<_>>().join("&")
+}
+
+fn payees_to_wire(payees: &[CoinbasePayee]) -> Vec<CoinbasePayeeWire> {
+    payees.iter().map(|p| CoinbasePayeeWire { rkm: rkm_hex(&p.rkm), amount: p.amount }).collect()
+}
+
+fn payees_from_wire(payees: &[CoinbasePayeeWire]) -> Result<Vec<CoinbasePayee>, TemplateError> {
+    payees.iter().map(|p| Ok(CoinbasePayee {
+        rkm: hexutil::rkm_lanes_from_hex(&p.rkm).map_err(TemplateError::Hex)?,
+        amount: p.amount,
+    })).collect()
 }
 
 fn rkm_hex(rkm: &[u64; 4]) -> String {

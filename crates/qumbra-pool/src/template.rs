@@ -7,6 +7,7 @@
 //! UNCLEAN stands). Stage 2's N=1 fallback is accounting testability
 //! on v4, not "stock xmrig earns shares on T1".
 
+use qlab_devnet::body::CoinbasePayee;
 use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::header::{
     AggregateProofSlot, BlockHeader, EpochSupplyAttestation, HEADER_PREIMAGE_LEN_V4,
@@ -40,8 +41,7 @@ pub struct Template {
 /// does not take `qlab-p2p`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TemplateBody {
-    pub coinbase: u64,
-    pub coinbase_rkm: [u64; 4],
+    pub coinbase_payees: Vec<CoinbasePayee>,
     pub txs: Vec<Vec<u8>>,
 }
 

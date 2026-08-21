@@ -26,9 +26,10 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use qlab_devnet::body::CoinbasePayee;
 use qlab_devnet::forms::GenesisForm;
 use qlab_devnet::pow::{satisfies_target_for, KeccakPow, PowEngine};
 use qlab_p2p::codec::decode_header;
@@ -38,22 +39,18 @@ use qlab_stratum::types::{LoginParams, StratumRequest, SubmitParams};
 use qumbra_node::config::NodeConfig;
 use qumbra_node::genesis::GenesisFile;
 use qumbra_node::mine_rpc::{
-    header_hex, rkm_hex, MineBlockWire, MineTemplateWire, TEMPLATE_SERVING_DISABLED,
+    header_hex, rkm_hex, CoinbasePayeeWire, MineBlockWire, MineTemplateWire,
+    TEMPLATE_SERVING_DISABLED,
 };
 use qumbra_node::run::{DevnetRehearsalVerifier, RunningNode};
 use qumbra_pool::hasher::KeccakShareHasher;
 use qumbra_pool::pool::Outgoing;
-use qumbra_pool::template::HeldTemplateSource;
-use qumbra_pool::{NodeRpcClient, PayeeRefusal, Pool, PoolError};
+use qumbra_pool::template::{HeldTemplateSource, TemplateBody};
+use qumbra_pool::{BlockSubmitter, FixedHasher, NodeRpcClient, PayeeRefusal, Pool, PoolError};
 
-/// The one wallet this harness owns — the node's `miner_rkm` **and** the
-/// pool's `payout_rkm`.
-///
-/// `GET /v1/mine/template` has no payee parameter, so the body the pool
-/// receives always names the **node's** own `miner_rkm`. A pool configured
-/// to pay anywhere else cannot submit a block it owns, and since lab #547 it
-/// refuses to try — so one value for both fields is the only configuration
-/// in which this harness was ever meaningful.
+/// The pool's fallback payout wallet and the default requested payee in the
+/// node-only legs. Lab #553 no longer requires this to equal the node's own
+/// `miner_rkm`; the request is authoritative.
 ///
 /// Before this it was two: the node paid `[1,2,3,4]` and the pool's
 /// `payout_rkm` was the hardcoded `[9,0,0,0]` that #523 removed from
@@ -65,14 +62,38 @@ const RIG_RKM: [u64; 4] = [1, 2, 3, 4];
 
 /// A structurally fine key nobody here owns. Used only as the *wrong*
 /// `payout_rkm`, in
-/// [`a_payout_rkm_the_live_template_does_not_pay_refuses_at_startup`].
+/// [`a_requested_live_template_payee_the_pool_does_not_own_refuses_at_startup`].
 const STRANGER_RKM: [u64; 4] = [0xd2c0_2c7c, 2, 3, 4];
 
-/// Alice's PPLNS identity, and deliberately **not** [`RIG_RKM`]: on today's
-/// RPC the coinbase payee is the node's key whoever mined the share, so a
-/// miner's registered rkm is a share-accounting identity here and not a
-/// payee. Keeping the two distinct is what keeps that visible.
+/// Alice's PPLNS identity, deliberately distinct from the fallback wallet so
+/// the #553 test proves the requested miner payee actually travels.
 const ALICE_RKM: [u64; 4] = [1, 0, 0, 0];
+
+#[derive(Default)]
+struct RecordingSubmitter {
+    bodies: Mutex<Vec<TemplateBody>>,
+}
+
+impl BlockSubmitter for RecordingSubmitter {
+    fn submit_block(
+        &self,
+        _form: GenesisForm,
+        _header_preimage: &[u8],
+        body: &TemplateBody,
+    ) -> Result<String, String> {
+        self.bodies.lock().unwrap().push(body.clone());
+        Ok("recorded".into())
+    }
+}
+
+fn payee(rkm: [u64; 4], height: u64) -> CoinbasePayee {
+    CoinbasePayee { rkm, amount: qlab_devnet::emission_exact::coinbase_exact(height) }
+}
+
+fn template_path(rkm: [u64; 4], height: u64) -> String {
+    let p = payee(rkm, height);
+    format!("/v1/mine/template?payee={}:{}", rkm_hex(&p.rkm), p.amount)
+}
 
 fn rig_t2(tag: &str) -> (NodeConfig, GenesisFile, std::path::PathBuf) {
     let base = std::env::temp_dir().join(format!("qmb_mine_rpc_{tag}_{}", std::process::id()));
@@ -285,7 +306,7 @@ fn template_serving_off_is_unavailable_by_name() {
     let addr = node.start_discovery_endpoint("127.0.0.1:0").unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
     let leg = spawn_leg(&shutdown, move || {
-        let (status, body) = http_get(addr, "/v1/mine/template");
+        let (status, body) = http_get(addr, &template_path(RIG_RKM, 1));
         assert!(status.contains("503"), "{status}");
         let text = String::from_utf8_lossy(&body);
         assert!(
@@ -310,23 +331,19 @@ fn live_template_then_submit_advances_tip() {
     let addr = node.start_discovery_endpoint("127.0.0.1:0").unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
     let leg = spawn_leg(&shutdown, move || {
-        let (status, body) = http_get(addr, "/v1/mine/template");
+        let (status, body) = http_get(addr, &template_path(RIG_RKM, 1));
         assert!(status.contains("200"), "{status} {}", String::from_utf8_lossy(&body));
         let wire: MineTemplateWire = serde_json::from_slice(&body).unwrap();
         assert_eq!(wire.form, "v5");
         assert_eq!(wire.height, 1);
         assert_eq!(wire.nonce, 0);
-        assert_eq!(
-            wire.coinbase_rkm,
-            rkm_hex(&RIG_RKM),
-            "the served template pays the node's configured miner_rkm, not a placeholder"
-        );
+        assert_eq!(wire.coinbase_payees.len(), 1);
+        assert_eq!(wire.coinbase_payees[0].rkm, rkm_hex(&RIG_RKM));
         let (header, _) = grind_v5(&wire);
         let post = MineBlockWire {
             form: "v5".into(),
             header: header_hex(GenesisForm::V5, &header),
-            coinbase: wire.coinbase,
-            coinbase_rkm: wire.coinbase_rkm,
+            coinbase_payees: wire.coinbase_payees,
             txs: wire.txs,
         };
         let (status, text) = http_post(addr, "/v1/mine/block", &serde_json::to_vec(&post).unwrap());
@@ -335,6 +352,91 @@ fn live_template_then_submit_advances_tip() {
     });
     drive(&mut node, &shutdown, leg, "template → grind → POST");
     assert_eq!(node.tip_height(), 1, "POST must take the own-mined ingest path");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// Without the payee list in the cache key, the second caller silently gets
+/// the first caller's payout body at the same tip and mempool length.
+#[test]
+fn same_tip_requests_with_different_payees_get_different_committed_bodies() {
+    let (mut config, genesis, base) = rig_t2("payee-cache-key");
+    config.template_serving = true;
+    let mut node = RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+    node.set_mine_interval(Duration::from_secs(3600));
+    let addr = node.start_discovery_endpoint("127.0.0.1:0").unwrap();
+    let url = format!("http://{addr}");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let leg = spawn_leg(&shutdown, move || {
+        let rpc = NodeRpcClient::parse(&url).unwrap();
+        let context = rpc.fetch_context().expect("mining context");
+        assert_eq!((context.form, context.height), (GenesisForm::V5, 1));
+        let first = rpc.fetch_template(&[payee(RIG_RKM, 1)]).expect("first payee");
+        let second = rpc.fetch_template(&[payee(ALICE_RKM, 1)]).expect("second payee");
+        assert_eq!(first.body.as_ref().unwrap().coinbase_payees[0].rkm, RIG_RKM);
+        assert_eq!(second.body.as_ref().unwrap().coinbase_payees[0].rkm, ALICE_RKM);
+        assert_ne!(first.header.tx_body_commitment, second.header.tx_body_commitment,
+            "the miner hashes a body commitment, not a payee echo");
+    });
+    drive(&mut node, &shutdown, leg, "two payees at one tip");
+    assert_eq!(node.tip_height(), 0);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// The non-tautological pool payout proof: PPLNS assembly chooses Alice, that
+/// list crosses the real template request and `issue_job`, and the assertion is
+/// on the body handed to `BlockSubmitter` after the fresh job finds a block.
+#[test]
+fn pool_assembled_payee_reaches_the_body_handed_to_submit() {
+    let (mut config, genesis, base) = rig_t2("pool-payee-path");
+    config.template_serving = true;
+    let mut node = RunningNode::start(&config, &genesis, KeccakPow, DevnetRehearsalVerifier).unwrap();
+    node.set_mine_interval(Duration::from_secs(3600));
+    let addr = node.start_discovery_endpoint("127.0.0.1:0").unwrap();
+    let url = format!("http://{addr}");
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let leg = spawn_leg(&shutdown, move || {
+        let rpc = NodeRpcClient::parse(&url).unwrap();
+        let initial = rpc.fetch_template(&[payee(RIG_RKM, 1)]).expect("initial template");
+        let pool = Pool::new_with_hasher(
+            1,
+            Box::new(HeldTemplateSource::new(initial)),
+            Box::new(FixedHasher::zeros()),
+            RIG_RKM,
+        ).unwrap();
+        pool.register_account("alice", ALICE_RKM);
+        let recorder = Arc::new(RecordingSubmitter::default());
+        pool.set_submitter(Arc::clone(&recorder) as Arc<dyn BlockSubmitter>);
+
+        let login = encode_request(&StratumRequest::login(1, &LoginParams {
+            login: "alice".into(), pass: "x".into(), agent: None,
+            algo: Some(vec!["rx/0".into()]), rigid: None,
+        }).unwrap()).unwrap();
+        let mut sid = None;
+        let out = pool.handle_line(&mut sid, &login).unwrap();
+        let Outgoing::Reply(resp) = &out[0] else { panic!("login reply") };
+        let first_job = resp.parse_login_result().unwrap().job;
+        let sid_value = sid.clone().unwrap();
+        let submit = |job_id: String| encode_request(&StratumRequest::submit(2, &SubmitParams {
+            id: sid_value.clone(), job_id, nonce: "00000000".into(),
+            result: "00".repeat(32), algo: Some("rx/0".into()),
+        }).unwrap()).unwrap();
+
+        // This scores Alice into PPLNS. Its initial body pays the fallback.
+        pool.handle_line(&mut sid, &submit(first_job.job_id)).unwrap();
+        let requested = pool.assemble_now().unwrap().payees();
+        assert_eq!(requested[0].rkm, ALICE_RKM, "assemble_coinbase chose Alice");
+
+        let alice_template = rpc.fetch_template(&requested).expect("Alice template request");
+        let jobs = pool.replace_template(Box::new(HeldTemplateSource::new(alice_template))).unwrap();
+        assert_eq!(jobs.len(), 1, "issue_job reissued work to the live session");
+        pool.handle_line(&mut sid, &submit(jobs[0].1.job_id.clone())).unwrap();
+
+        let bodies = recorder.bodies.lock().unwrap();
+        let submitted = bodies.last().expect("body handed to submit");
+        assert_eq!(submitted.coinbase_payees, requested,
+            "assert the submitted body, not the template request echo");
+    });
+    drive(&mut node, &shutdown, leg, "assemble → request → issue_job → submit body");
     let _ = std::fs::remove_dir_all(&base);
 }
 
@@ -351,14 +453,13 @@ fn e2e_live_node_login_job_submit_advances_tip() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let leg = spawn_leg(&shutdown, move || {
         let rpc = NodeRpcClient::parse(&url).unwrap();
-        let template = rpc.fetch_template().expect("live template");
+        let template = rpc.fetch_template(&[payee(RIG_RKM, 1)]).expect("live template");
         assert_eq!(template.form, GenesisForm::V5);
         assert_eq!(template.header.height, 1);
         let body = template.body.as_ref().expect("live template carries the body");
         assert_eq!(
-            body.coinbase_rkm, RIG_RKM,
-            "the payee the pool is about to accept is the node's own miner_rkm — the fixture \
-             is only meaningful when that is also the pool's payout_rkm (lab #547)"
+            body.coinbase_payees[0].rkm, RIG_RKM,
+            "the pool requested its fallback payout before any PPLNS share existed"
         );
         let pool = Pool::new_with_hasher(
             1,
@@ -438,16 +539,11 @@ fn e2e_live_node_login_job_submit_advances_tip() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// 🔴 The mismatch this file itself carried, now asserted instead of hung
-/// (lab #547 review). A pool whose `payout_rkm` is not the payee the live
-/// node puts in the template refuses **at startup, by name** — before a
-/// listener is bound and before any miner spends a hash.
-///
-/// It lives here rather than in `qumbra-pool`'s unit tests because only a
-/// real node's template can show *which* key the gate is checking against:
-/// the node's own configured `miner_rkm`, not a value a fixture chose.
+/// The #547 guard still rejects a caller-requested template whose payee the
+/// pool does not own. The request parameter is authority to choose a payout,
+/// not authority to bypass the pool's ownership gate.
 #[test]
-fn a_payout_rkm_the_live_template_does_not_pay_refuses_at_startup() {
+fn a_requested_live_template_payee_the_pool_does_not_own_refuses_at_startup() {
     let (mut config, genesis, base) = rig_t2("payout-mismatch");
     config.template_serving = true;
     let mut node =
@@ -458,7 +554,7 @@ fn a_payout_rkm_the_live_template_does_not_pay_refuses_at_startup() {
     let shutdown = Arc::new(AtomicBool::new(false));
     let leg = spawn_leg(&shutdown, move || {
         let rpc = NodeRpcClient::parse(&url).unwrap();
-        let template = rpc.fetch_template().expect("live template");
+        let template = rpc.fetch_template(&[payee(RIG_RKM, 1)]).expect("live template");
         let Err(err) = Pool::new_with_hasher(
             1,
             Box::new(HeldTemplateSource::new(template)),
@@ -494,8 +590,7 @@ fn template_header_decodes_under_v5() {
         tx_body_commitment: "22".repeat(32),
         seed_hash: "33".repeat(32),
         next_seed_hash: None,
-        coinbase: 1,
-        coinbase_rkm: rkm_hex(&RIG_RKM),
+        coinbase_payees: vec![CoinbasePayeeWire { rkm: rkm_hex(&RIG_RKM), amount: 1 }],
         txs: vec![],
     };
     let header = qlab_devnet::header::BlockHeader {

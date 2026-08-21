@@ -12,18 +12,15 @@
 //! `coinbase_exact(height)`. Raising the cap is a rule change; this
 //! assembler already truncates to `cap` so the same function grows.
 //!
-//! ## 🔴 What [`assemble_coinbase`] is, and what it is not (lab #547)
+//! ## 🔴 The payout and refusal path (lab #547 + #553)
 //!
-//! **It is not on the submit path, and on today's node RPC it cannot be.**
-//! `coinbase_rkm` lives inside the body preimage that the header commits
-//! to through `tx_body_commitment` (`qlab_devnet::body`), so the payee is
-//! fixed *before* the miner grinds and cannot be substituted afterwards
-//! without invalidating the share. `GET /v1/mine/template` has no payee
-//! parameter, so the body the pool receives already names the **node's**
-//! own `miner_rkm`. `assemble_coinbase` therefore describes the payout
-//! this pool *would* choose, and its result reaches no block.
+//! `coinbase_rkm` lives inside the body preimage that the header commits to,
+//! so the payee is fixed *before* the miner grinds. Lab #553 puts this assembler
+//! on that path: every live-node poll calls it, sends its list to
+//! `GET /v1/mine/template`, and stores the returned committed body in the job
+//! that is later submitted.
 //!
-//! What this module can enforce is the negative: [`check_payee`] is the
+//! [`check_payee`] remains the negative backstop. It defines the
 //! set of payees the pool is willing to let reach the chain at all — the
 //! configured `payout_rkm`, or an rkm owned by a login we know. Everything
 //! else is refused **by name**, including the node's
@@ -174,9 +171,8 @@ where
 
 /// [`check_payee`] over a template body.
 ///
-/// A body that mints nothing and names nobody (`coinbase == 0 &&
-/// rkm == [0; 4]` — genesis's shape, and the only shape for which
-/// `BlockBody::coinbase_payees` is empty) has nothing at stake and passes.
+/// An empty list is the non-minting genesis shape. Every requested payee must
+/// be owned; checking only the first would become an escape when the cap rises.
 pub fn check_body_payee<'a, I>(
     body: &crate::template::TemplateBody,
     pool_rkm: [u64; 4],
@@ -186,16 +182,26 @@ pub fn check_body_payee<'a, I>(
 where
     I: IntoIterator<Item = &'a str>,
 {
-    if body.coinbase == 0 && body.coinbase_rkm == [0u64; 4] {
-        return Ok(());
+    let known: Vec<&str> = known_logins.into_iter().collect();
+    for payee in &body.coinbase_payees {
+        check_payee(payee.rkm, pool_rkm, accounts, known.iter().copied())?;
     }
-    check_payee(body.coinbase_rkm, pool_rkm, accounts, known_logins)
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssembledCoinbase {
     V5 { payees: Vec<CoinbasePayee> },
     V4 { rkm: [u64; 4], amount: u64 },
+}
+
+impl AssembledCoinbase {
+    pub fn payees(&self) -> Vec<CoinbasePayee> {
+        match self {
+            Self::V5 { payees } => payees.clone(),
+            Self::V4 { rkm, amount } => vec![CoinbasePayee { rkm: *rkm, amount: *amount }],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -532,16 +538,14 @@ mod tests {
     #[test]
     fn a_body_that_mints_nothing_and_names_nobody_passes() {
         let body = crate::template::TemplateBody {
-            coinbase: 0,
-            coinbase_rkm: [0; 4],
+            coinbase_payees: Vec::new(),
             txs: Vec::new(),
         };
         assert!(check_body_payee(&body, rkm(9), &Accounts::default(), std::iter::empty()).is_ok());
 
         // But minting to nobody is not the same thing.
         let minting = crate::template::TemplateBody {
-            coinbase: 1,
-            coinbase_rkm: [0; 4],
+            coinbase_payees: vec![CoinbasePayee { rkm: [0; 4], amount: 1 }],
             txs: Vec::new(),
         };
         assert_eq!(

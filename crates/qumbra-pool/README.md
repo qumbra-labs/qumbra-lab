@@ -28,7 +28,7 @@ merely written. Last updated 2026-08-21 21:55 +08.
 | **svc1 has its own `qumbra-node`** — the faucet has no mine RPC on any revision | ✅ 2026-08-21 (deploy #215, lab #519) |
 | Pool rolled onto svc1, `pool` profile enabled, SG opened on 3333 | ✅ 2026-08-21 |
 | **🎉 First real share accepted end-to-end from stock XMRig** | ✅ **2026-08-21 00:56 +08** |
-| **A miner paid by this pool** | 🔴 **NOT POSSIBLE YET** — lab #553; every block pays the pool's own address |
+| **A miner paid by this pool** | 🔴 **NOT YET OBSERVED** — lab #553 implements the path; acceptance, roll, and a live payout remain |
 | Public stratum on `pool.qumbra.org:3333` | ⏹ **stopped 2026-08-21 21:39 +08** — it cannot pay anyone; restarting means narrowing the SG first |
 
 The share, from hel1, on the **unmodified** `xmrig-6.22.2-linux-static-x64` release tarball with a
@@ -123,15 +123,13 @@ is accepted. **The pool never holds miner funds** — it decides the split and a
 the block, but the chain does the paying. A pool operator who disappears mid-round costs
 you the round, not your balance.
 
-🔴 **THAT IS THE DESIGN. IT IS NOT WHAT THIS POOL DOES TODAY.** `GET /v1/mine/template`
-**reports** a payee, it does not **accept** one — and the payee is bound into the header the
-miner grinds against, so it cannot be substituted once a share comes back. **Every block this
-pool can submit pays the poolnode's `miner_rkm`, whatever the PPLNS window says.**
-`payee::assemble_coinbase` — the winner selection, the empty-window fallback, the cap — is
-correct and is **not on the submit path**; its only consumers are a read-only accessor and two
-unit tests. **So the pool is custodial right now: it earns the coinbase to its own address and
-has no mechanism to pay anyone.** Tracked as [lab #553](https://github.com/qumbra-labs/qumbra-lab/issues/553),
-which is the gate on this endpoint being announced to anybody.
+🟡 **THE SOFTWARE PATH IS NOW IMPLEMENTED; A LIVE PAYOUT IS NOT YET EVIDENCE.** Lab #553 makes
+`GET /v1/mine/template` require a list-shaped payee request. The pool runs
+`payee::assemble_coinbase` before polling, the node commits that list into the hashing blob, and
+the same list-shaped body is retained through `issue_job` and `POST /v1/mine/block`. The current
+consensus cap remains one, so today the highest-weight PPLNS miner receives the whole coinbase;
+the later cap raise changes the rule boundary without changing this API. The public endpoint
+remains stopped until this code is accepted, rolled, and one miner-paid block is observed.
 
 **Measured, not inferred** (2026-08-21, first live session): a rig mining 29 accepted shares
 with a payout key **nothing else on the chain has ever mined to** was inside the PPLNS window
