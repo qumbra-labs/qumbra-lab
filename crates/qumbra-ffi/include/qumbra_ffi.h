@@ -258,6 +258,95 @@ char *qmb_bundle_review(const uint8_t *bytes, size_t len, char **err_out);
  * an amount, when present, lands in *out_amount_bessel with *out_has_amount=1
  * (integer-exact bessel). Label/memo are display-only and do not cross in v1.
  * NULL + *err_out on refusal, by name. */
+/* ── the ledger as DATA (lab #556) ────────────────────────────────────────
+ *
+ * qmb_wallet_ledger_data_over_fetch returns the SAME ledger that
+ * qmb_wallet_ledger_report_over_fetch renders, serialized as this ABI's tagged
+ * blob so a native client can build rows instead of displaying a paragraph.
+ * Both exports go through one internal build, so the rows and the paragraph
+ * cannot disagree about the same wallet.
+ *
+ *   blob   := u32le record_count || record_count x record
+ *   record := u16le kind || u32le body_len || body_len bytes
+ *
+ * Integers little-endian. u128 crosses as 16 bytes LE. Text is UTF-8 and NOT
+ * NUL-terminated. UNKNOWN KINDS MUST BE SKIPPED BY LENGTH, never treated as an
+ * error -- that is the property this shape was chosen for, so a shell built
+ * against these kinds keeps working when a later version adds one.
+ *
+ * Free the blob with qmb_dealloc(p, len).
+ *
+ * 🔴 THE RULE THAT MATTERS MORE THAN THE LAYOUT: a missing record is not a
+ * zero. QMB_LEDGER_TOTALS is emitted ONLY when the ledger has totals at all,
+ * so its ABSENCE means "this ledger could not account for everything" (the
+ * QMB_LEDGER_GAP records say why) and a shell that defaults it to zero reports
+ * a wallet that received nothing. The same applies inside bodies: the has_*
+ * bytes and the state tags exist so that "we could not tell" and "zero" stay
+ * different answers.
+ */
+#define QMB_LEDGER_OTHER     0   /* body: UTF-8. Anything this version cannot name. */
+#define QMB_LEDGER_RANGE     1   /* u64 from, u64 to, u8 has_served, u64 sfrom, u64 sto.
+                                  * has_served == 0: the compact stream served nothing
+                                  * across every address. Not the same as an empty range. */
+#define QMB_LEDGER_COVERAGE  2   /* u8 state, u8 has_range, u64 from, u64 to, UTF-8 why (tail).
+                                  * state 0 = covered (this wallet's spends were subtracted),
+                                  * 1 = unavailable (no figure is quotable; why says so).
+                                  * state 0 with has_range 0 is COVERED -- the endpoint held no
+                                  * main-chain block in the range, which has no outputs either. */
+#define QMB_LEDGER_RECEIVED  3   /* u64 height, u64 value, u64 div_index, u8 shadowed,
+                                  * UTF-8 address_short (tail).
+                                  * shadowed == 1: opened and authenticated but unspendable
+                                  * forever (another note claims its nullifier). REPORT it;
+                                  * never add it into a balance. */
+#define QMB_LEDGER_SEND      4   /* u64 height, u32 input_count, u128 inputs_total,
+                                  * u32 change_count, u128 change_total, u8 outgoing,
+                                  * u128 amount, u64 fee, u8 ambiguous_local, u8 has_local,
+                                  * UTF-8 why (tail).
+                                  * outgoing 0 = exact: amount and fee both mean what they say.
+                                  * outgoing 1 = fee inseparable: amount is the amount AND the
+                                  *   fee together (their sum is exact); fee is 0 and means
+                                  *   NOTHING.
+                                  * outgoing 2 = unavailable: no figure at all; why says why,
+                                  *   and amount/fee are 0 and mean NOTHING.
+                                  * BRANCH ON outgoing BEFORE READING amount. Reading it
+                                  * unconditionally turns "the fee cannot be separated" into a
+                                  * fee of zero.
+                                  * ambiguous_local == 1: more than one local record claimed
+                                  * this event and none was picked. */
+#define QMB_LEDGER_TOTALS    5   /* u128 total_in, u128 total_out, u128 fees_paid,
+                                  * u64 fee_inseparable_events.
+                                  * PRESENT ONLY WHEN TOTALS EXIST -- see the rule above. */
+#define QMB_LEDGER_GAP       6   /* body: UTF-8. One per thing the ledger could not account
+                                  * for. Their presence is why there is no totals record. */
+#define QMB_LEDGER_VERDICT   7   /* u64 div_index, u8 completeness, u64 detected, u64 opened,
+                                  * u64 spendable, u32 short_len, short, u32 why_len, why.
+                                  * completeness 0 = complete (no count means anything),
+                                  * 1 = incomplete (detected, opened), 2 = shadowed (opened,
+                                  * spendable), 3 = both (all three), 255 = a variant the
+                                  * encoder did not know, which crosses as an admission rather
+                                  * than a guess. The counts share one layout, so BRANCH ON
+                                  * completeness before reading them. */
+#define QMB_LEDGER_NOTE      8   /* body: UTF-8. Operator-facing prose, display only.
+                                  * Absent on this path: notes come from the CLI history flow,
+                                  * which needs a wallet directory. No records means there are
+                                  * none, not that they were dropped. */
+#define QMB_LEDGER_SUMMARY   9   /* u8 has_spendable, u128 current_spendable,
+                                  * u128 shadowed_total, u64 unmatched_records.
+                                  * has_spendable == 0: the scan's subtracted figure is not
+                                  * quotable -- distinct from a spendable balance of zero.
+                                  * unmatched_records: local send records that joined to no
+                                  * event in this range. They may have landed outside it or
+                                  * never landed; either way it is stated rather than left
+                                  * looking like a send that never happened. */
+
+uint8_t *qmb_wallet_ledger_data_over_fetch(const qmb_wallet_t *w,
+                                           const char *source_label,
+                                           uint64_t from, uint64_t to,
+                                           const uint64_t *indices, size_t n_indices,
+                                           const uint8_t *rng_seed32,
+                                           qmb_fetch_fn fetch, void *fetch_ctx,
+                                           size_t *out_len);
+
 char *qmb_uri_parse(const char *uri, uint64_t *out_amount_bessel,
                     uint8_t *out_has_amount, char **err_out);
 

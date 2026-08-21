@@ -20,6 +20,7 @@
 //!   words, it never re-derives a verdict.
 
 pub mod events;
+pub mod ledger_blob;
 pub mod pairing;
 pub mod report;
 
@@ -375,8 +376,26 @@ impl qlab_ledger::spent::NullifierSource for ShellNullifiers {
 ///
 /// # Safety
 /// As [`qmb_wallet_scan_report_over_fetch`].
-#[no_mangle]
-pub unsafe extern "C" fn qmb_wallet_ledger_report_over_fetch(
+/// The ledger, built once for both of its exports.
+///
+/// 🔴 Extracted rather than copied. This is ~40 lines of scan-per-address,
+/// widest-served-range pairing and `history::build`, and a second copy is
+/// exactly the drift `qumbra_wallet::report_data`'s own doc comment warns
+/// about ("this was ~20 lines in the CLI, and a shell that wanted the ledger
+/// would have had to copy them"). The rendered export and the data export must
+/// describe the SAME ledger or a shell showing rows and a shell showing the
+/// paragraph would disagree about the same wallet.
+///
+/// `None` on a NULL/invalid argument — the callers turn that into their own
+/// null return.
+///
+/// # Safety
+/// As the two exports that call it.
+// Nine arguments because it takes exactly what its two C-ABI callers take, and
+// bundling them into a struct here would mean building that struct twice at the
+// boundary for no reader's benefit.
+#[allow(clippy::too_many_arguments)]
+unsafe fn build_ledger_over_fetch(
     w: *const WalletState,
     source_label: *const c_char,
     from: u64,
@@ -386,15 +405,12 @@ pub unsafe extern "C" fn qmb_wallet_ledger_report_over_fetch(
     rng_seed32: *const u8,
     fetch: Option<QmbFetchFn>,
     fetch_ctx: *mut c_void,
-) -> *mut c_char {
+) -> Option<(qlab_ledger::history::Ledger, String)> {
     if w.is_null() || source_label.is_null() || indices.is_null() || rng_seed32.is_null() {
-        return ptr::null_mut();
+        return None;
     }
-    let Some(fetch) = fetch else { return ptr::null_mut() };
-    let label = match CStr::from_ptr(source_label).to_str() {
-        Ok(u) => u,
-        Err(_) => return ptr::null_mut(),
-    };
+    let fetch = fetch?;
+    let label = CStr::from_ptr(source_label).to_str().ok()?.to_string();
     let idxs = std::slice::from_raw_parts(indices, n_indices);
     let mut seed = [0u8; 32];
     seed.copy_from_slice(std::slice::from_raw_parts(rng_seed32, 32));
@@ -434,7 +450,90 @@ pub unsafe extern "C" fn qmb_wallet_ledger_report_over_fetch(
         (from, to),
         None,
     );
-    out_string(qlab_ledger::history::render(&ledger, label))
+    Some((ledger, label))
+}
+
+/// The wallet's own ledger — received notes and spends the chain published —
+/// rendered, over a caller-supplied transport.
+///
+/// **Send events refuse their figures here, by design.** Fee attribution needs
+/// the posted table from `qlab-devnet`, which cannot cross-compile to iOS, so
+/// `None` is passed and such an event reports `UNAVAILABLE` with the reason.
+/// That is the honest state, not a placeholder: an unprovable total is worse
+/// than an absent one (lab #407).
+///
+/// There is no local send record on this platform either — `sends.v1` is written
+/// by the CLI on the machine that spent — so `log` is `None` and unmatched
+/// records cannot arise.
+///
+/// # Safety
+/// As [`qmb_wallet_scan_report_over_fetch`].
+#[no_mangle]
+pub unsafe extern "C" fn qmb_wallet_ledger_report_over_fetch(
+    w: *const WalletState,
+    source_label: *const c_char,
+    from: u64,
+    to: u64,
+    indices: *const u64,
+    n_indices: usize,
+    rng_seed32: *const u8,
+    fetch: Option<QmbFetchFn>,
+    fetch_ctx: *mut c_void,
+) -> *mut c_char {
+    match build_ledger_over_fetch(
+        w, source_label, from, to, indices, n_indices, rng_seed32, fetch, fetch_ctx,
+    ) {
+        Some((ledger, label)) => out_string(qlab_ledger::history::render(&ledger, &label)),
+        None => ptr::null_mut(),
+    }
+}
+
+/// The same ledger as DATA — the tagged blob from [`crate::ledger_blob`], so a
+/// native client can build rows instead of displaying a paragraph (lab #556,
+/// shape ruled 2026-08-21).
+///
+/// Identical inputs and identical accounting to
+/// [`qmb_wallet_ledger_report_over_fetch`] — both go through one
+/// `build_ledger_over_fetch`, so the rows and the paragraph cannot disagree
+/// about the same wallet. Every `UNAVAILABLE` decision stays in `qlab-ledger`;
+/// this only serializes what it decided.
+///
+/// `notes` is empty on this path and that is structural rather than an
+/// omission: `HistoryData::notes` is produced by the CLI's history flow, which
+/// needs a wallet directory and its own networking. A shell reading this blob
+/// sees no `QMB_LEDGER_NOTE` records, which is the honest encoding of "there
+/// are none" — not of "they were dropped".
+///
+/// Returns the blob and writes its length to `out_len`; NULL with `*out_len = 0`
+/// on a NULL/invalid argument. Free with `qmb_dealloc(p, len)`.
+///
+/// # Safety
+/// As [`qmb_wallet_ledger_report_over_fetch`], plus `out_len` writable.
+#[no_mangle]
+pub unsafe extern "C" fn qmb_wallet_ledger_data_over_fetch(
+    w: *const WalletState,
+    source_label: *const c_char,
+    from: u64,
+    to: u64,
+    indices: *const u64,
+    n_indices: usize,
+    rng_seed32: *const u8,
+    fetch: Option<QmbFetchFn>,
+    fetch_ctx: *mut c_void,
+    out_len: *mut usize,
+) -> *mut u8 {
+    if out_len.is_null() {
+        return ptr::null_mut();
+    }
+    *out_len = 0;
+    let Some((ledger, _label)) = build_ledger_over_fetch(
+        w, source_label, from, to, indices, n_indices, rng_seed32, fetch, fetch_ctx,
+    ) else {
+        return ptr::null_mut();
+    };
+    let bytes = ledger_blob::encode_ledger(&ledger, &[]);
+    *out_len = bytes.len();
+    Box::into_raw(bytes.into_boxed_slice()) as *mut u8
 }
 
 /// The scan, over a caller-supplied transport. `source_label` is what the
@@ -2276,6 +2375,343 @@ mod tests {
                 qmb_string_free(e);
             }
         }
+    }
+
+    /// The same pin as the event kinds, for the ledger blob's kinds (lab #556).
+    /// A tag that drifts between the header and `ledger_blob.rs` is a consumer
+    /// decoding the wrong row — the failure that is silent until a balance is
+    /// wrong.
+    #[test]
+    fn the_header_and_the_ledger_blob_pin_the_same_kind_values() {
+        let header = include_str!("../include/qumbra_ffi.h");
+        let src = include_str!("ledger_blob.rs");
+
+        let header_kinds: Vec<(String, u16)> = header
+            .lines()
+            .filter_map(|l| {
+                let rest = l.trim().strip_prefix("#define QMB_LEDGER_")?;
+                let mut it = rest.split_whitespace();
+                let name = it.next()?.to_string();
+                let value = it.next()?.parse().ok()?;
+                Some((name, value))
+            })
+            .collect();
+        let src_kinds: Vec<(String, u16)> = src
+            .lines()
+            .filter_map(|l| {
+                let rest = l.trim().strip_prefix("pub const QMB_LEDGER_")?;
+                let (name, tail) = rest.split_once(": u16 = ")?;
+                let value = tail.trim_end_matches(';').parse().ok()?;
+                Some((name.to_string(), value))
+            })
+            .collect();
+
+        assert!(!header_kinds.is_empty(), "the header declares no ledger kinds");
+        assert!(!src_kinds.is_empty(), "ledger_blob.rs declares no ledger kinds");
+        // A floor on what the regexes matched, so a rename that makes BOTH
+        // sides match nothing cannot pass as agreement.
+        assert!(header_kinds.len() >= 10, "expected every ledger kind, got {}", header_kinds.len());
+        for (name, value) in &header_kinds {
+            assert!(
+                src_kinds.contains(&(name.clone(), *value)),
+                "header declares QMB_LEDGER_{name} = {value}, ledger_blob.rs does not"
+            );
+        }
+        for (name, value) in &src_kinds {
+            assert!(
+                header_kinds.contains(&(name.clone(), *value)),
+                "ledger_blob.rs declares QMB_LEDGER_{name} = {value}, the header does not"
+            );
+        }
+    }
+
+    /* ── the ledger blob's three-state discipline ─────────────────────────
+     *
+     * These decode the blob the way a shell must — walk records, skip by
+     * length — and assert the states that a careless encoder would flatten.
+     * Every one of them is a wrong balance if it regresses.
+     */
+
+    fn walk(blob: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let count = u32::from_le_bytes(blob[0..4].try_into().unwrap()) as usize;
+        let mut out = Vec::with_capacity(count);
+        let mut p = 4;
+        for _ in 0..count {
+            let kind = u16::from_le_bytes(blob[p..p + 2].try_into().unwrap());
+            let len = u32::from_le_bytes(blob[p + 2..p + 6].try_into().unwrap()) as usize;
+            out.push((kind, blob[p + 6..p + 6 + len].to_vec()));
+            p += 6 + len;
+        }
+        assert_eq!(p, blob.len(), "the record lengths must account for every byte");
+        out
+    }
+
+    fn empty_ledger() -> qlab_ledger::history::Ledger {
+        qlab_ledger::history::Ledger {
+            range: (10, 20),
+            outputs_served: Some((10, 18)),
+            events: Vec::new(),
+            coverage: qlab_ledger::vocab::SpentCoverage::Covered { range: Some((10, 20)) },
+            verdicts: Vec::new(),
+            gaps: Vec::new(),
+            totals: None,
+            current_spendable: None,
+            shadowed_total: 0,
+            unmatched_records: 0,
+        }
+    }
+
+    /// 🔴 The rule the whole encoding rests on: no totals means NO RECORD, and
+    /// a shell therefore cannot read a zero where the answer is unknown.
+    #[test]
+    fn a_ledger_without_totals_emits_no_totals_record() {
+        let mut led = empty_ledger();
+        led.gaps = vec!["one address never answered".into()];
+        let blob = ledger_blob::encode_ledger(&led, &[]);
+        let records = walk(&blob);
+
+        assert!(
+            !records.iter().any(|(k, _)| *k == ledger_blob::QMB_LEDGER_TOTALS),
+            "a ledger with a gap has no totals, so it must emit no totals record"
+        );
+        assert_eq!(
+            records.iter().filter(|(k, _)| *k == ledger_blob::QMB_LEDGER_GAP).count(),
+            1,
+            "and the gap that caused it must be there to say why"
+        );
+
+        // With the gap gone and totals present, the record appears — so the
+        // absence above is the encoder's decision and not a missing feature.
+        led.gaps.clear();
+        led.totals = Some(qlab_ledger::history::Totals {
+            total_in: 7,
+            total_out: 3,
+            fees_paid: 1,
+            fee_inseparable_events: 0,
+        });
+        let with = walk(&ledger_blob::encode_ledger(&led, &[]));
+        let body = with
+            .iter()
+            .find(|(k, _)| *k == ledger_blob::QMB_LEDGER_TOTALS)
+            .map(|(_, b)| b.clone())
+            .expect("totals exist, so the record must be emitted");
+        assert_eq!(u128::from_le_bytes(body[0..16].try_into().unwrap()), 7);
+        assert_eq!(u128::from_le_bytes(body[16..32].try_into().unwrap()), 3);
+        assert_eq!(u128::from_le_bytes(body[32..48].try_into().unwrap()), 1);
+    }
+
+    /// 🔴 Covered-with-no-range is a COVERED state, not a failure: the endpoint
+    /// held no main-chain block in the range, and a range with no blocks has no
+    /// outputs either. Flattening it into unavailable would tell a user their
+    /// balance is unknowable when it is simply empty.
+    #[test]
+    fn the_three_coverage_states_stay_three() {
+        use qlab_ledger::vocab::SpentCoverage;
+        let cases: Vec<(SpentCoverage, u8, u8)> = vec![
+            (SpentCoverage::Covered { range: Some((1, 2)) }, 0, 1),
+            (SpentCoverage::Covered { range: None }, 0, 0),
+            (SpentCoverage::Unavailable { why: "the stream stopped".into() }, 1, 0),
+        ];
+        for (coverage, want_state, want_has_range) in cases {
+            let mut led = empty_ledger();
+            led.coverage = coverage.clone();
+            let records = walk(&ledger_blob::encode_ledger(&led, &[]));
+            let body = records
+                .iter()
+                .find(|(k, _)| *k == ledger_blob::QMB_LEDGER_COVERAGE)
+                .map(|(_, b)| b.clone())
+                .expect("coverage always crosses");
+            assert_eq!(body[0], want_state, "state byte for {coverage:?}");
+            assert_eq!(body[1], want_has_range, "has_range for {coverage:?}");
+            if want_state == 1 {
+                let why = String::from_utf8(body[18..].to_vec()).unwrap();
+                assert_eq!(why, "the stream stopped", "the reason must cross verbatim");
+            }
+        }
+    }
+
+    /// 🔴 `FeeInseparable` is its own answer. Reading `amount` without the tag
+    /// turns "the amount and the fee cannot be separated, but their sum is
+    /// exact" into "the fee was zero", which is a lie about money.
+    #[test]
+    fn the_three_outgoing_states_stay_three() {
+        use qlab_ledger::history::{Event, Outgoing, SendEvent};
+        let cases: Vec<(Outgoing, u8, u128, u64)> = vec![
+            (Outgoing::Exact { amount: 500, fee: 7 }, 0, 500, 7),
+            (Outgoing::FeeInseparable { amount_and_fee: 507 }, 1, 507, 0),
+            (Outgoing::Unavailable { why: "ambiguous group".into() }, 2, 0, 0),
+        ];
+        for (outgoing, want_tag, want_amount, want_fee) in cases {
+            let mut led = empty_ledger();
+            led.events = vec![Event::Send(SendEvent {
+                height: 12,
+                inputs: Vec::new(),
+                inputs_total: 600,
+                change: Vec::new(),
+                change_total: 93,
+                outgoing: outgoing.clone(),
+                local: None,
+                ambiguous_local: false,
+            })];
+            let records = walk(&ledger_blob::encode_ledger(&led, &[]));
+            let body = records
+                .iter()
+                .find(|(k, _)| *k == ledger_blob::QMB_LEDGER_SEND)
+                .map(|(_, b)| b.clone())
+                .expect("a send event must cross");
+            // height(8) count(4) inputs_total(16) count(4) change_total(16) = 48
+            assert_eq!(body[48], want_tag, "tag for {outgoing:?}");
+            assert_eq!(
+                u128::from_le_bytes(body[49..65].try_into().unwrap()),
+                want_amount,
+                "amount for {outgoing:?}"
+            );
+            assert_eq!(
+                u64::from_le_bytes(body[65..73].try_into().unwrap()),
+                want_fee,
+                "fee for {outgoing:?}"
+            );
+            if want_tag == 2 {
+                assert_eq!(String::from_utf8(body[75..].to_vec()).unwrap(), "ambiguous group");
+            }
+        }
+    }
+
+    /// A shadowed note is reported and never summed, so the flag has to survive
+    /// the wire — a shell that cannot see it will add the note to a balance the
+    /// owner can never spend from.
+    #[test]
+    fn a_shadowed_received_note_crosses_as_shadowed() {
+        use qlab_ledger::history::{Event, Received};
+        let mut led = empty_ledger();
+        led.events = vec![
+            Event::Received(Received {
+                height: 11,
+                value: 100,
+                div_index: 0,
+                address_short: "qs1aaa".into(),
+                shadowed: false,
+            }),
+            Event::Received(Received {
+                height: 12,
+                value: 200,
+                div_index: 1,
+                address_short: "qs1bbb".into(),
+                shadowed: true,
+            }),
+        ];
+        let records = walk(&ledger_blob::encode_ledger(&led, &[]));
+        let rows: Vec<&Vec<u8>> = records
+            .iter()
+            .filter(|(k, _)| *k == ledger_blob::QMB_LEDGER_RECEIVED)
+            .map(|(_, b)| b)
+            .collect();
+        assert_eq!(rows.len(), 2, "both rows cross, in ledger order");
+        assert_eq!(rows[0][24], 0, "the first note is spendable");
+        assert_eq!(rows[1][24], 1, "the second is shadowed and must say so");
+        assert_eq!(u64::from_le_bytes(rows[1][8..16].try_into().unwrap()), 200);
+        assert_eq!(String::from_utf8(rows[1][25..].to_vec()).unwrap(), "qs1bbb");
+    }
+
+    /// An unquotable spendable figure is not a spendable figure of zero, and
+    /// `unmatched_records` must not be lost — an unjoined local record would
+    /// otherwise look like a send that never happened.
+    #[test]
+    fn the_summary_keeps_unquotable_apart_from_zero() {
+        let mut led = empty_ledger();
+        led.unmatched_records = 2;
+        led.shadowed_total = 40;
+        let none = walk(&ledger_blob::encode_ledger(&led, &[]));
+        let b = none
+            .iter()
+            .find(|(k, _)| *k == ledger_blob::QMB_LEDGER_SUMMARY)
+            .map(|(_, b)| b.clone())
+            .unwrap();
+        assert_eq!(b[0], 0, "no spendable figure is quotable");
+        assert_eq!(u128::from_le_bytes(b[17..33].try_into().unwrap()), 40, "shadowed_total");
+        assert_eq!(u64::from_le_bytes(b[33..41].try_into().unwrap()), 2, "unmatched_records");
+
+        led.current_spendable = Some(0);
+        let zero = walk(&ledger_blob::encode_ledger(&led, &[]));
+        let b2 = zero
+            .iter()
+            .find(|(k, _)| *k == ledger_blob::QMB_LEDGER_SUMMARY)
+            .map(|(_, b)| b.clone())
+            .unwrap();
+        assert_eq!(b2[0], 1, "a spendable balance of zero IS quotable");
+        assert_eq!(u128::from_le_bytes(b2[1..17].try_into().unwrap()), 0);
+        assert_ne!(b[0], b2[0], "unquotable and zero must be distinguishable");
+    }
+
+    /// Every verdict variant carries its own counts, and the counts a variant
+    /// does not have stay zero rather than borrowing a neighbour's.
+    #[test]
+    fn each_verdict_variant_carries_only_its_own_counts() {
+        use qlab_cbserver::client::Completeness;
+        let cases = vec![
+            (Completeness::Complete, 0u8, 0u64, 0u64, 0u64),
+            (Completeness::Incomplete { detected: 9, opened: 4 }, 1, 9, 4, 0),
+            (Completeness::Shadowed { opened: 6, spendable: 5 }, 2, 0, 6, 5),
+            (
+                Completeness::IncompleteAndShadowed { detected: 9, opened: 6, spendable: 5 },
+                3,
+                9,
+                6,
+                5,
+            ),
+        ];
+        for (c, tag, detected, opened, spendable) in cases {
+            let mut led = empty_ledger();
+            led.verdicts = vec![(3, "qs1ccc".to_string(), c, Some("why".to_string()))];
+            let records = walk(&ledger_blob::encode_ledger(&led, &[]));
+            let b = records
+                .iter()
+                .find(|(k, _)| *k == ledger_blob::QMB_LEDGER_VERDICT)
+                .map(|(_, b)| b.clone())
+                .expect("a verdict must cross");
+            assert_eq!(u64::from_le_bytes(b[0..8].try_into().unwrap()), 3, "div_index");
+            assert_eq!(b[8], tag, "tag for {c:?}");
+            assert_eq!(u64::from_le_bytes(b[9..17].try_into().unwrap()), detected, "detected {c:?}");
+            assert_eq!(u64::from_le_bytes(b[17..25].try_into().unwrap()), opened, "opened {c:?}");
+            assert_eq!(
+                u64::from_le_bytes(b[25..33].try_into().unwrap()),
+                spendable,
+                "spendable {c:?}"
+            );
+            // Two length-prefixed strings follow.
+            let short_len = u32::from_le_bytes(b[33..37].try_into().unwrap()) as usize;
+            assert_eq!(String::from_utf8(b[37..37 + short_len].to_vec()).unwrap(), "qs1ccc");
+        }
+    }
+
+    /// 🔴 An unknown kind must be skippable by length. This is the property the
+    /// blob was chosen for, so it is asserted from the CONSUMER's side: walking
+    /// with no knowledge of what a kind means must still reach the end exactly.
+    #[test]
+    fn an_unknown_kind_is_skippable_by_length() {
+        let mut led = empty_ledger();
+        led.gaps = vec!["a".into(), "bb".into()];
+        let mut blob = ledger_blob::encode_ledger(&led, &["a note".to_string()]);
+
+        // Forge a record with a kind from the future, appended, and bump the count.
+        let count = u32::from_le_bytes(blob[0..4].try_into().unwrap());
+        blob[0..4].copy_from_slice(&(count + 1).to_le_bytes());
+        blob.extend_from_slice(&9999u16.to_le_bytes());
+        blob.extend_from_slice(&5u32.to_le_bytes());
+        blob.extend_from_slice(b"hello");
+
+        let records = walk(&blob); // walk() asserts it accounts for every byte
+        assert_eq!(records.len() as u32, count + 1);
+        assert_eq!(records.last().unwrap().0, 9999);
+        // And the records a v1 shell DOES know are unaffected by its presence.
+        assert_eq!(
+            records.iter().filter(|(k, _)| *k == ledger_blob::QMB_LEDGER_GAP).count(),
+            2
+        );
+        assert_eq!(
+            records.iter().filter(|(k, _)| *k == ledger_blob::QMB_LEDGER_NOTE).count(),
+            1
+        );
     }
 
     /// The hand-maintained header and this file must declare the same ABI.
