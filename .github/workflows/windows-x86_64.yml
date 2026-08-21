@@ -108,11 +108,15 @@ defaults:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
-  # The published joiner inputs — the same four values release-binaries.yml uses,
-  # and for the same reason: a smoke against a locally minted genesis proves the
-  # binary agrees with itself.
+  # The published joiner inputs. GENESIS_HASH is deliberately NOT a constant here
+  # (lab #527's lesson, and the fifth site of it): this file hardcoded T1's hash,
+  # so from the T2 cutover at 14:20Z on 2026-08-20 the smoke downloaded the T2
+  # genesis, compared it against a T1 constant and failed every run — a red leg
+  # that said nothing about the code under test. The binary being smoked already
+  # knows which net it is (`mine --print-net`, added by #529), so the hash is
+  # derived from it below instead of restated here. A constant that names a net
+  # is a constant that goes stale at the next cutover.
   GENESIS_URL: https://seed.qumbra.org/genesis.qmb
-  GENESIS_HASH: 138e1524ba889bd49644f0eeafafa53533584caa2c0c851330cd27965223addb
   DIAL_PEERS: '["18.202.166.126:9444","18.141.177.109:9444","52.194.224.123:9444","52.5.0.21:9444"]'
 
 jobs:
@@ -217,7 +221,19 @@ jobs:
       # works: the script writes a native Windows path into `node.toml` as a TOML
       # literal string, which is the trap the join doc now warns about.
       - name: qumbra-node check against the PUBLISHED genesis
-        run: bash .github/workflows/scripts/smoke-release-artifacts.sh
+        run: |
+          set -euo pipefail
+          # Ask the artifact under test which net it was built for, rather than
+          # telling it. `--print-net` prints the pin the release lane stamped in.
+          GENESIS_HASH="$(target/release/qumbra-node.exe mine --print-net \
+            | sed -n 's/^genesis hash: //p' | sed -n 1p)"
+          case "$GENESIS_HASH" in
+            [0-9a-f][0-9a-f]*) : ;;
+            *) echo "::error::could not read a genesis hash out of --print-net"; exit 1 ;;
+          esac
+          echo "derived from the binary: $GENESIS_HASH"
+          export GENESIS_HASH
+          bash .github/workflows/scripts/smoke-release-artifacts.sh
         env:
           NODE_BIN: target/release/qumbra-node.exe
 

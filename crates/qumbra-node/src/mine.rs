@@ -1435,19 +1435,27 @@ mod tests {
         );
         // The `net:` dispatch input's default, read out of the workflow's own
         // choice block rather than remembered here.
+//
+        // 🔴 NO HARDCODED LINE TERMINATOR, and no normalisation pass either.
+        // This used to split on the literal `"      net:\n"`. `include_str!`
+        // embeds the file *as checked out*, this repo has no `.gitattributes`,
+        // so a Windows checkout under git's default `autocrlf` gives
+        // `      net:\r\n` — the split found nothing and this test panicked on
+        // its own `expect`, on the windows leg of every PR, invisibly behind an
+        // unrelated red (2026-08-20).
         //
-        // 🔴 Line-ending agnostic, DELIBERATELY. This used to split on the
-        // literal `"      net:\n"`, which embeds a LF. `include_str!` embeds the
-        // file *as checked out*, and this repo has no `.gitattributes`, so a
-        // Windows checkout under git's default `autocrlf` gives `      net:\r\n`
-        // — the split found nothing and this test panicked on the Windows leg of
-        // every PR while passing everywhere else. A hardcoded line terminator is
-        // a literal standing in for something the environment decides
-        // (`qumbra-design/derived-not-duplicated.md`); `str::lines()` already
-        // knows the answer, so ask it. The same applies to the other two
-        // `include_str!` sites in this file — neither hardcodes a terminator,
-        // and neither should start.
-        let mut after_net = WORKFLOW.lines().skip_while(|l| l.trim() != "net:");
+        // Two fixes were written independently for this: normalise `\r\n` to
+        // `\n` and keep the literal, or drop the literal. This is the second,
+        // because `str::lines()` already splits on either ending and strips the
+        // `\r` — so the terminator stops being something this code states and
+        // goes back to being something the library knows
+        // (`qumbra-design/derived-not-duplicated.md`). Comparing the WHOLE
+        // line keeps the six-space indent specific, which the normalising
+        // version also had and a `trim()` would have thrown away.
+        //
+        // The other two `include_str!` sites in this file hardcode no
+        // terminator. Neither should start.
+        let mut after_net = WORKFLOW.lines().skip_while(|l| l != &"      net:");
         after_net
             .next()
             .expect("release-binaries.yml declares a `net:` dispatch input");
